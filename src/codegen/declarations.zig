@@ -30,7 +30,7 @@ fn ffiCType(compiler: *LlvmCompiler, type_name: []const u8) types.LLVMTypeRef {
     return compiler.ptr_type;
 }
 
-pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool, is_release: bool, target_triple_opt: ?[]const u8, output_path: []const u8, coverage_enabled: bool, t6_split: bool) !void {
+pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool, is_release: bool, target_triple_opt: ?[]const u8, output_path: []const u8, coverage_enabled: bool, t6_split: bool, objs_out: ?*std.ArrayList([]const u8)) !void {
     var compiler = try LlvmCompiler.new(allocator, is_wasm, is_release, target_triple_opt, coverage_enabled);
 
     // F2 stage 3: hand sema's TypedIr to codegen for the SHADOW DIFF. Codegen still
@@ -1182,7 +1182,10 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
 
         // M3-R1: the erased body of a generic struct is a link-time fallback — give it internal linkage so
         // globalDCE can delete it when no retained body references it (external linkage would pin it).
-        if (func.erased_generic) core.LLVMSetLinkage(fn_val, types.LLVMLinkage.LLVMInternalLinkage);
+        // T6 split: an erased body may be REFERENCED from another file's object, so it cannot be internal
+        // (internal symbols are object-local) — leave it external; the per-clone globalDCE + the link-time
+        // dead-strip drop the dead ones instead.
+        if (func.erased_generic and !t6_split) core.LLVMSetLinkage(fn_val, types.LLVMLinkage.LLVMInternalLinkage);
 
         compiler.current_function_name = func.name;
         compiler.current_local_types = compiler.function_local_types.getPtr(func.name).?;
@@ -1501,7 +1504,93 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         }
     }
 
+    // T6 Phase 1b (increment 2): per-file object split. The whole program is already codegen'd into
+    // one module above; now emit ONE object PER SOURCE FILE by cloning that module and stripping the
+    // bodies that belong to other files (turning them into extern declarations). Shared globals are
+    // linkonce_odr so the linker dedups them. This reuses ALL the existing codegen — the split is a
+    // pure post-process. Falls back to the single object when off / not requested.
+    if (t6_split and !is_wasm) {
+        if (objs_out) |objs| {
+            try compileSplitEmit(&compiler, allocator, output_path, is_release, objs);
+            return;
+        }
+    }
+
     try emitModule(&compiler, allocator, compiler.module, output_path, is_wasm, is_release, "__nova_test.ll");
+}
+
+// T6 Phase 1b — clone-and-strip per-file emission. For each source file, clone the whole-program
+// module and delete the bodies of functions that belong to OTHER files (leaving them as extern
+// declarations resolved at link from the file that owns them). Each clone is finalized through the
+// same `emitModule` path (verify + CoroSplit + globalDCE + emit). Object paths are appended to `objs`.
+fn compileSplitEmit(
+    compiler: *LlvmCompiler,
+    allocator: std.mem.Allocator,
+    output_path: []const u8,
+    is_release: bool,
+    objs: *std.ArrayList([]const u8),
+) !void {
+    // (1) Make cross-object-shared globals linkonce_odr so every clone may define them and the linker
+    // dedups. `_vtable_*` (trait vtables) and `heap_ptr` are externally referenced; string literals and
+    // `__destruct_*` are already internal (object-local — each clone keeps its own copies, no clash).
+    {
+        var g = core.LLVMGetFirstGlobal(compiler.module);
+        while (g != null) : (g = core.LLVMGetNextGlobal(g)) {
+            const nm = std.mem.span(core.LLVMGetValueName(g));
+            if (std.mem.eql(u8, nm, "heap_ptr") or std.mem.startsWith(u8, nm, "_vtable_")) {
+                core.LLVMSetLinkage(g, types.LLVMLinkage.LLVMLinkOnceODRLinkage);
+            }
+        }
+    }
+
+    // (2) Group Nova-function symbol names by source file, and collect the set of ALL Nova-function
+    // symbols (so the strip touches only OUR functions — never runtime externs, intrinsics, or
+    // __destruct_*). `func_map[func.name]` carries the real emitted symbol name.
+    var all_syms = std.StringHashMap(void).init(allocator);
+    defer all_syms.deinit();
+    var file_syms = std.StringHashMap(std.StringHashMap(void)).init(allocator);
+    defer {
+        var it = file_syms.valueIterator();
+        while (it.next()) |v| v.deinit();
+        file_syms.deinit();
+    }
+    for (compiler.functions.items) |func| {
+        const v = compiler.func_map.get(func.name) orelse continue;
+        const sym = std.mem.span(core.LLVMGetValueName(v));
+        try all_syms.put(sym, {});
+        const file = if (func.source_file.len > 0) func.source_file else "<uncategorized>";
+        const gop = try file_syms.getOrPut(file);
+        if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap(void).init(allocator);
+        try gop.value_ptr.put(sym, {});
+    }
+
+    // (3) One object per file: clone → strip non-owner Nova-function bodies → finalize.
+    var idx: usize = 0;
+    var fit = file_syms.iterator();
+    while (fit.next()) |entry| : (idx += 1) {
+        const owner = entry.value_ptr;
+        const clone = core.LLVMCloneModule(compiler.module);
+
+        // Strip the body of every Nova function this file does NOT own → an extern declaration.
+        var f = core.LLVMGetFirstFunction(clone);
+        while (f != null) : (f = core.LLVMGetNextFunction(f)) {
+            const nm = std.mem.span(core.LLVMGetValueName(f));
+            if (!all_syms.contains(nm)) continue; // runtime extern / intrinsic / __destruct_ — leave it
+            if (owner.contains(nm)) continue; // this file owns it — keep the body
+            // Delete every basic block → the function becomes a declaration.
+            var bb = core.LLVMGetFirstBasicBlock(f);
+            while (bb != null) {
+                const next = core.LLVMGetNextBasicBlock(bb);
+                core.LLVMDeleteBasicBlock(bb);
+                bb = next;
+            }
+        }
+
+        const obj_path = try std.fmt.allocPrint(allocator, "{s}.{d}.o", .{ output_path, idx });
+        try emitModule(compiler, allocator, clone, obj_path, false, is_release, null);
+        try objs.append(allocator, obj_path);
+        core.LLVMDisposeModule(clone);
+    }
 }
 
 // Finalize ONE LLVM module → one object file: dump IR (debug), verify, strip `__destruct_*` to

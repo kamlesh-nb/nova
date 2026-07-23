@@ -73,7 +73,7 @@ fn linkNativeInProcessMacho(
     allocator: std.mem.Allocator,
     environ: anytype,
     io: std.Io,
-    obj_path: []const u8,
+    objs: []const []const u8,
     output_path: []const u8,
     shared_nova: []const u8,
     ffi_libs: []const []const u8,
@@ -87,13 +87,11 @@ fn linkNativeInProcessMacho(
         "-syslibroot",          sdk_path,
         "-lSystem",             "-lc++",
         // T6/Phase-2 dead-code strip: Mach-O atomises symbols, so ld64's -dead_strip drops every
-        // function/global unreferenced from the entry point — the whole program is one object, so a
-        // real app links only what it USES out of the stdlib. Measured 1.33MB → 390KB on the sample
-        // web app (~71% smaller), runs identically. Reachability follows vtable/fn-pointer refs, so
-        // trait dispatch, destructors, and mediator dispatch stay live.
+        // function/global unreferenced from the entry point — a real app links only what it USES out of
+        // the stdlib. Measured 1.33MB → 390KB on the sample web app (~71%), runs identically.
         "-dead_strip",
-        obj_path,
     });
+    for (objs) |o| try args.append(allocator, o); // T6 split: one or many object files
     const nova_lib = try std.fmt.allocPrint(allocator, "-L{s}/lib", .{shared_nova});
     try args.appendSlice(allocator, &.{ nova_lib, "-lnova_runtime", "-L/opt/homebrew/lib" });
     try appendWolfsslLink(&args, allocator, shared_nova, io);
@@ -1698,7 +1696,17 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
     const output_path = "__nova_test";
     const obj_path = try std.fmt.allocPrint(allocator, "{s}.o", .{output_path});
     defer allocator.free(obj_path);
-    try llvm_codegen.compile(allocator, program, is_wasm, false, null, obj_path, false, init.environ_map.get("NOVA_T6_SPLIT") != null);
+    const t6_split = init.environ_map.get("NOVA_T6_SPLIT") != null;
+    var split_objs = std.ArrayList([]const u8).empty;
+    defer {
+        for (split_objs.items) |o| {
+            Io.Dir.deleteFile(.cwd(), init.io, o) catch {};
+            allocator.free(o);
+        }
+        split_objs.deinit(allocator);
+    }
+    try llvm_codegen.compile(allocator, program, is_wasm, false, null, obj_path, false, t6_split, if (t6_split) &split_objs else null);
+    const link_objs: []const []const u8 = if (split_objs.items.len > 0) split_objs.items else &[_][]const u8{obj_path};
     sema_shadow.reportDiff();
     sema_shadow.reportTypeIdDiff();
     sema_shadow.reportF45();
@@ -1734,7 +1742,7 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
         try test_clang_args.append(allocator, "-fno-omit-frame-pointer");
     }
 
-    try test_clang_args.append(allocator, obj_path);
+    for (link_objs) |o| try test_clang_args.append(allocator, o); // T6 split: one or many object files
 
     // Link the prebuilt C++ runtime static lib + Boost (fiber concurrency).
     // BOOST_PREFIX/lib is the Homebrew macOS default; configurable per platform.
@@ -2013,7 +2021,7 @@ fn compileProgram(
     if (std.mem.eql(u8, target, "--wasm")) {
         const obj_path = try std.fmt.allocPrint(allocator, "{s}.o", .{output_path});
         defer allocator.free(obj_path);
-        try llvm_codegen.compile(allocator, program, true, is_release, target_triple_opt, obj_path, false, init.environ_map.get("NOVA_T6_SPLIT") != null);
+        try llvm_codegen.compile(allocator, program, true, is_release, target_triple_opt, obj_path, false, init.environ_map.get("NOVA_T6_SPLIT") != null, null);
 
         // In-process LLD: link the wasm module ourselves via wasm-ld, no clang shell-out.
         if (build_options.inprocess_lld) {
@@ -2049,7 +2057,19 @@ fn compileProgram(
         else
             try std.fmt.allocPrint(allocator, "{s}.o", .{output_path});
         defer allocator.free(obj_path);
-        try llvm_codegen.compile(allocator, program, false, is_release, target_triple_opt, obj_path, false, init.environ_map.get("NOVA_T6_SPLIT") != null);
+        // T6 Phase 1b: NOVA_T6_SPLIT emits one object PER SOURCE FILE (into `split_objs`) instead of
+        // the single `obj_path`; the link then feeds all of them to the linker. Off = single object.
+        const t6_split = init.environ_map.get("NOVA_T6_SPLIT") != null;
+        var split_objs = std.ArrayList([]const u8).empty;
+        defer {
+            for (split_objs.items) |o| {
+                if (init.environ_map.get("NOVA_KEEP_OBJ") == null and !build_mode) Io.Dir.deleteFile(.cwd(), init.io, o) catch {};
+                allocator.free(o);
+            }
+            split_objs.deinit(allocator);
+        }
+        try llvm_codegen.compile(allocator, program, false, is_release, target_triple_opt, obj_path, false, t6_split, if (t6_split) &split_objs else null);
+        const link_objs: []const []const u8 = if (split_objs.items.len > 0) split_objs.items else &[_][]const u8{obj_path};
         sema_shadow.reportResolution();
         sema_shadow.reportDiff();
     sema_shadow.reportTypeIdDiff();
@@ -2086,7 +2106,7 @@ fn compileProgram(
 
         // In-process LLD: link the executable ourselves, no clang/ld shell-out.
         if (build_options.inprocess_lld and builtin.target.os.tag == .macos and target_triple_opt == null) {
-            try linkNativeInProcessMacho(allocator, init.environ_map, init.io, obj_path, output_path, shared_nova, ffi_libs);
+            try linkNativeInProcessMacho(allocator, init.environ_map, init.io, link_objs, output_path, shared_nova, ffi_libs);
             // build_mode keeps the object in build/<profile>/obj/ (persistent); else delete it.
             if (init.environ_map.get("NOVA_KEEP_OBJ") == null and !build_mode)
                 Io.Dir.deleteFile(.cwd(), init.io, obj_path) catch {};
@@ -2102,7 +2122,7 @@ fn compileProgram(
         const shared_nova_arg = try std.fmt.allocPrint(allocator, "-I{s}", .{shared_nova});
         try clang_args.append(allocator, shared_nova_arg);
 
-        try clang_args.append(allocator, obj_path);
+        for (link_objs) |o| try clang_args.append(allocator, o); // T6 split: one or many object files
 
         // Link the prebuilt C++ runtime static lib + Boost (fiber concurrency).
         const nova_lib = try std.fmt.allocPrint(allocator, "-L{s}/lib", .{shared_nova});
