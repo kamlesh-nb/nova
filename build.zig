@@ -156,6 +156,8 @@ pub fn build(b: *std.Build) void {
     if (static_llvm and target.result.os.tag == .linux and b.graph.environ_map.get("NOVA_LLVM_PREFIX") == null) {
         if (target.result.cpu.arch == .aarch64) {
             llvm_linux_dep = b.lazyDependency("llvm_linux_aarch64", .{});
+        } else if (target.result.cpu.arch == .x86_64) {
+            llvm_linux_dep = b.lazyDependency("llvm_linux_x86_64", .{});
         }
     }
     configureLlvmLink(b, llvm_mod, static_llvm, target.result.os.tag, llvm_linux_dep);

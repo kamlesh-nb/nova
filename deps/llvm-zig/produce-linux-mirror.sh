@@ -18,6 +18,10 @@ G="/usr/lib/${ARCH}-linux-gnu"
 cp "$G/libz.a" "$G/libzstd.a" "$G/libxml2.a" "$G/liblzma.a" "$P/lib/"          # LLVM's C-lib deps (static)
 SO=$(find / -name libstdc++.so.6 | head -1); cp "$SO" "$P/lib/"; ln -sf libstdc++.so.6 "$P/lib/libstdc++.so"
 GS=$(find / -name libgcc_s.so.1 | head -1);  cp "$GS" "$P/lib/"; ln -sf libgcc_s.so.1  "$P/lib/libgcc_s.so"
-( cd "$P" && tar czf "/w/llvm-21-${TRIPLE}-linux.tar.gz" lib )
+# A second top-level entry beside lib/ so Zig's package unpack does NOT strip the single common
+# `lib/` prefix (GNU tar emits an explicit lib/ dir entry that Zig would otherwise strip, breaking
+# dep.path("lib")). With two top entries there's no common prefix to strip.
+echo "llvm-21 ${TRIPLE}-linux static mirror" > "$P/MIRROR.txt"
+( cd "$P" && tar czf "/w/llvm-21-${TRIPLE}-linux.tar.gz" lib MIRROR.txt )
 echo "wrote /w/llvm-21-${TRIPLE}-linux.tar.gz ($(du -h /w/llvm-21-${TRIPLE}-linux.tar.gz|cut -f1))"
 echo "then: zig fetch <tarball>  → put the printed hash in build.zig.zon"

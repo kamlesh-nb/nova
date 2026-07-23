@@ -18,7 +18,12 @@
         // (z/zstd/xml2/lzma) + libstdc++.so/libgcc_s.so (see deps/llvm-zig/README-linux-static.md).
         .llvm_linux_aarch64 = .{
             .url = "https://github.com/kamlesh-nb/llvm-dist/releases/download/llvm-21/llvm-21-aarch64-linux.tar.gz",
-            .hash = "N-V-__8AANkjKBWYVOOkOQ6J_8L_bfiQl9xAFEFmA1rAFx9y",
+            .hash = "N-V-__8AAKAkKBVcWIUadVpEprwbDN5DRB03WYKoenBWSlTF",
+            .lazy = true,
+        },
+        .llvm_linux_x86_64 = .{
+            .url = "https://github.com/kamlesh-nb/llvm-dist/releases/download/llvm-21/llvm-21-x86_64-linux.tar.gz",
+            .hash = "N-V-__8AAKmsaRbiOQVlbrSbyackbn-CfUt8FX4mxkcI4-nx",
             .lazy = true,
         },
     },
