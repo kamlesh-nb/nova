@@ -336,10 +336,11 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile) void {
         \\  echo "webview: built ($WEBVIEW_LIB)" || echo "webview: build failed (GUI FFI unavailable)"
         \\fi
         \\rsync -a --exclude=".git" deps/ "{[home]s}/.nova/deps/"
-        \\# Prebuild the C++ runtime ONCE into a static library (compile the heavy
-        \\# Boost.Fiber headers once here; `nova build` then just links this .a).
-        \\# BOOST_PREFIX is configurable per platform (macOS Homebrew default).
-        \\BOOST_PREFIX="${{BOOST_PREFIX:-/opt/homebrew}}"
+        \\# Prebuild the C++ runtime ONCE into a static library.
+        \\# Boost is the VENDORED Asio-only header subset (deps/boost/include, ~7MB, extracted
+        \\# by a lexical #include scan of boost/asio.hpp) — NO Homebrew/apt/system Boost. It is
+        \\# synced to ~/.nova/deps by the rsync above. BOOST_PREFIX overrides for a local full Boost.
+        \\BOOST_PREFIX="${{BOOST_PREFIX:-deps/boost}}"
         \\# M3-D-5: build the vendored wolfSSL static lib once (TLS via wolfSSL). If
         \\# libwolfssl.a is already built, skip. Enables real TLS with verify_peer.
         \\WOLF_LIB="deps/wolfssl/build/libwolfssl.a"
