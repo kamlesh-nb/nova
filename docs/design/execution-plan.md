@@ -94,7 +94,7 @@ toolchain/tooling (T1/T2/T4).
 | **S2** | regex engine (bytecode-VM backtracking) + foundational early-`return`-in-loop double-free fix | P4/Tier3 | ✅ | `92_regex`, `93_loop_early_return_arc` | `54e31b4` |
 | **S3** | decimal follow-ups: div/mod-by-zero TRAP + explicit `int↔decimal` conv | Tier3 | ✅ | `94_decimal_conv` | `8541922` |
 | **S4** | text→decimal128 parser (`decimal.fromString`) + 3 DB drivers switched to exact `.dec` | P3 dep | ✅ | `95_decimal_parse` | `4c5adcc` |
-| **T1** | Toolchain: bundled `.tbd` stubs + C++ runtime + ELF/Linux | P5 | ◑ | build (manual) | — |
+| **T1** | Toolchain + cross-compilation. **Cross-compile from macOS to Linux x86_64/arm64 (static ELF, runs) AND Windows x86_64 (PE32+, real ws2_32/mswsock imports) ✅** via bundled `zig c++` (crossLinkViaZig/mapCrossTarget). **Deps generalized off Homebrew ✅**: vendored Boost.Asio header subset (deps/boost, ~7MB) + static LLVM fetched from a self-hosted **lazy `build.zig.zon` mirror** (kamlesh-nb/llvm-dist) for linux-{aarch64,x86_64}=LLVM21 + macos-arm64=LLVM22 — static nova builds w/o NOVA_LLVM_PREFIX, `ldd`/`otool` show NO libLLVM. Windows COFF via `x86_64-pc-windows-gnu` triple + `-lws2_32 -lmswsock`. **Remaining:** UPLOAD the 3 tarballs to the mirror (go-live, needs GitHub); no-Xcode mac (`.tbd` stubs); x86_64-macos drop | ⭐user P5 | ● | cross build+run (Docker/colima) + CI `cross-compile` gate | `6f78008`,`a6eb6f1`,`33a2d29`,`de00b46`,`e5de3e5`,`441d738`,`286e263`,`b3c92de` |
 | **T2** | WASM pointer-width audit (modules run correctly) | P5 | ⬜ | `--wasm-run` | — |
 | **T3** | FFI (`extern("lib") fn`) — **keystone for W1/W2/W3** | ⭐P2 | ✅ v1 | `82_ffi_extern` | `97ba8ef` `1e31ad1` |
 | **T4** | Tooling: LSP FULL ✅ + package manager ✅ + `nova fmt` comment-preserving/idempotent ✅ (44→53 coverage); fmt construct long-tail remains | P5/6 | ◑ | `fmt-check.sh` + nls e2e + `pkg-manager-check.sh` | `4e4571c` |
@@ -124,13 +124,16 @@ right way — wolfSSL keeps all crypto + cert-verification (memory-BIO), only th
 concrete drivers now live in **`packages/nova-<name>`** (the `db` seam + generic `pool` stay in std). Also live:
 **timeouts + pooling + circuit-breaker + full auth + real server-side prepared statements on every engine**; error
 model (`try`/`catch`/`errdefer`) complete; `future<T>` first-class + `when_all`/`parallel_for`.
-✅ done (25): X1, X2, H1, H2, F1, F2, F5, C1, D1, **D2**, D3, D4, **D5**, **D6**, **E1**, **A1**, S1, S2, S3, S4,
-T3, T5, W1, W2, W3. ◑ partial (5 — remaining scope in the design below): F3 (overflow-trap deferred by design),
-F4 (Itanium mangling), T1 (ELF/Linux toolchain), T4 (fmt long-tail), T6 (Phase 1b).
+✅ done (27): X1, X2, H1, H2, F1, F2, F5, C1, D1, **D2**, D3, D4, **D5**, **D6**, **E1**, **A1**, S1, S2, S3, S4,
+T3, T5, **T6**, W1, W2, W3, and **T1 cross-compile** (Linux x86_64/arm64 + Windows x86_64 from macOS; deps off
+Homebrew via vendored Boost + self-hosted lazy LLVM mirror — only the mirror UPLOAD + no-Xcode-mac remain).
+◑ partial (3 — remaining scope in the design below): F3 (overflow-trap deferred by design), F4 (Itanium
+mangling), T4 (fmt long-tail).
 ⬜/🅱️
-not started (1): T2 (WASM pointer-width audit). The single largest deferred keystone is **T6 Phase 1b** — the
-per-file `.o` split, which now also absorbs **F4-6** (retiring the serde/mediator source-gen+reparse; relocated
-from S1 because it is behavior-neutral and only pays off with per-unit compilation).
+not started (1): T2 (WASM pointer-width audit — wasm plan dropped for now). **T6 Phase 1b DONE** (per-file `.o`
+split + content-hash cache + default-on; **F4-6 satisfied** — the generated serde/mediator units are their own
+cached objects, so no reparse-removal was needed). Only T6 Phase 3 (per-unit *checking*, gated on F2-6/F4/F5) is
+future work.
 
 ---
 

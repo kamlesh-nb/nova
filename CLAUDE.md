@@ -75,7 +75,9 @@ NOVA_ARC_AUDIT=1 nova test f    # per-run ARC audit ("ARC audit: clean" or survi
 
 ## Status
 
-See `docs/design/execution-plan.md` — the master table (25/31 items ✅). Recent: async fully closed; a
-web-framework perf ladder (keep-alive → response cache → cache-before-parse → zero-copy framing, ~108k
-rps); T6 per-file object split in progress (`NOVA_T6_SPLIT`). Depends on **BTreeDB** (separate repo) as a
-storage engine and pairs with **nls** (LSP) + the VSCode **extension**.
+See `docs/design/execution-plan.md` — the master table (27/31 items ✅). Recent: **T6 per-file `.o` split
+DONE** (default-on, content-hash cache, F4-6 satisfied); **T1 cross-compilation** — from macOS build Linux
+x86_64/arm64 (static ELF) + Windows x86_64 (PE32+) via bundled `zig c++`; **build deps generalized off
+Homebrew** — vendored Boost.Asio subset (`deps/boost`) + static LLVM from a self-hosted lazy `build.zig.zon`
+mirror (`kamlesh-nb/llvm-dist`; tarballs staged in `~/.nova-llvmdist`, upload pending). Depends on **BTreeDB**
+(separate repo) and pairs with **nls** (LSP) + the VSCode **extension**.
