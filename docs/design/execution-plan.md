@@ -883,10 +883,20 @@ public `db.dbDecimal(decimal.fromString(...))` seam. Corpus 119/119 functional, 
 
 # T1 — Toolchain self-sufficiency (remaining) (P5)
 
-**State:** static LLVM + in-process LLD (native+wasm) landed. **Remaining design:** bundle macOS `.tbd` SDK
-stubs (drop the CLT/Xcode SDK path lookup); build the C++20 runtime with the bundled toolchain; ELF/Linux link
-path (+ musl + CRT). **Invariant:** users deploy only `nova`. **DoD:** a machine with no Xcode/CLT builds+runs
-a nova native binary; Linux/ELF path builds+runs. **Deps:** none. **Tracking:** _pending (◑)_
+**State:** static LLVM + in-process LLD (native+wasm) landed. **CROSS-COMPILATION LANDED (Linux x86_64 + arm64).**
+Insight (user): the bundled **Zig toolchain** (`zig c++`) ships libc (musl/glibc) + CRT and cross-links ELF/COFF, so
+a macOS host can produce — and, via musl `-static`, run anywhere — a Linux binary. `nova build --target
+linux-x86_64|linux-arm64` now: (1) emits the Nova object for the triple (LLVM TargetMachine already honours it);
+(2) cross-builds the single-TU C++ runtime for the target ONCE via `zig c++ -target <t> -DNOVA_DROP_ARENA
+-I<boost>/include` (Boost.Asio is header-only here; cached at `~/.nova/lib/nova_runtime_<t>.o`, invalidated on
+`zig build`); (3) static-links via `zig c++ -target <t> -static`. `crossLinkViaZig`/`mapCrossTarget` in `main.zig`;
+`NOVA_KEEP_OBJ`/build-cache honoured. **PROVEN build+run under Docker** (busybox amd64 + arm64, colima): heap/ARC
+(structs), range loops, string interpolation all correct. **Windows:** the toolchain path is wired
+(`x86_64-windows-gnu`) but the runtime's raw POSIX socket layer (`sys/socket.h`/`netinet/in.h`/`arpa/inet.h`) needs
+a winsock2 port — a tracked follow-on (guarded `dlfcn.h`; a clear hint prints on the attempt). **Remaining design:**
+Windows winsock2 shim; TLS on cross targets (wolfSSL cross-build — today TLS is stubbed off-host); bundle Boost
+headers into `~/.nova` to drop the Homebrew dependency; bundle macOS SDK stubs. **DoD:** Linux/ELF builds+runs ✅
+(x86_64+arm64); no-Xcode mac build ◑. **Deps:** none. **Tracking:** ● 2026-07-24 Linux cross done.
 
 # T2 — WASM pointer-width audit (P5)
 

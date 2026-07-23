@@ -365,6 +365,10 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile) void {
         \\clang++ -std=c++20 -O2 -pthread -DNOVA_DROP_ARENA $WOLF_FLAGS -c -I"$BOOST_PREFIX/include" \
         \\    src/runtime/runtime.cpp -o "{[home]s}/.nova/lib/nova_runtime.o"
         \\ar rcs "{[home]s}/.nova/lib/libnova_runtime.a" "{[home]s}/.nova/lib/nova_runtime.o"
+        \\# T1: the cross-compilation cache (nova_runtime_<triple>.o, built lazily by `nova build
+        \\# --target ...`) is keyed only by triple, so it must be invalidated whenever the runtime
+        \\# source changes. Clear it here — triples contain dashes, so this glob spares nova_runtime_asan.o.
+        \\rm -f "{[home]s}/.nova/lib/nova_runtime_"*-*.o 2>/dev/null || true
         \\# NOVA_ASAN=1: additionally build an AddressSanitizer runtime. Opt-in because it
         \\# roughly doubles this step; `nova test` links it only when NOVA_ASAN=1 too.
         \\#

@@ -18,7 +18,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <dlfcn.h> // NOVA_ARC_DUMP: dladdr, to name a survivor's allocation site
+#ifndef _WIN32
+#include <dlfcn.h> // NOVA_ARC_DUMP: dladdr, to name a survivor's allocation site (POSIX only)
+#endif
 
 namespace {
 
@@ -452,9 +454,11 @@ void nova_arc_dump_survivors(void) {
     // This is §3.5.1's "survivors BY ALLOCATION SITE" — the count says how many, this
     // says WHERE, which is the difference between a finding and a guess.
     const char *site_name = "?";
+#ifndef _WIN32
     Dl_info dli;
     if (g_live[i].site && dladdr(g_live[i].site, &dli) && dli.dli_sname)
       site_name = dli.dli_sname;
+#endif
     if (printable) {
       std::memcpy(buf, p, n);
       buf[n] = '\0';

@@ -112,6 +112,86 @@ fn linkNativeInProcessMacho(
     }
 }
 
+// T1 — cross-compilation via the bundled Zig toolchain. `zig c++` ships libc (musl/glibc) + CRT and
+// cross-links ELF/COFF, so a macOS host can PRODUCE (and, given musl `-static`, run anywhere) a
+// Linux/Windows binary. Given the LLVM target triple, map it to a Zig target, cross-build the C++
+// runtime for that target ONCE (cached at `~/.nova/lib/nova_runtime_<zigtriple>.o`), and link the
+// Nova objects against it with `zig c++`. Returns true when it handled the link (a non-host target);
+// false to fall through to the host in-process-LLD / clang++ path. TLS is stubbed on cross targets
+// for now (the runtime is built without -DNOVA_HAVE_WOLFSSL — wolfSSL cross-build is a follow-on).
+const CrossTarget = struct { zig: []const u8, static: bool };
+fn mapCrossTarget(llvm_triple: []const u8) ?CrossTarget {
+    const has = struct {
+        fn f(h: []const u8, n: []const u8) bool {
+            return std.mem.indexOf(u8, h, n) != null;
+        }
+    }.f;
+    const arm = has(llvm_triple, "aarch64") or has(llvm_triple, "arm64");
+    if (has(llvm_triple, "linux"))
+        return .{ .zig = if (arm) "aarch64-linux-musl" else "x86_64-linux-musl", .static = true };
+    if (has(llvm_triple, "windows") or has(llvm_triple, "mingw") or has(llvm_triple, "w64"))
+        return .{ .zig = if (arm) "aarch64-windows-gnu" else "x86_64-windows-gnu", .static = false };
+    if (has(llvm_triple, "darwin") or has(llvm_triple, "apple")) {
+        // Native mac is handled by the host path; only take over when the arch differs from the host.
+        const host_arm = builtin.target.cpu.arch == .aarch64;
+        if (arm == host_arm) return null;
+        return .{ .zig = if (arm) "aarch64-macos" else "x86_64-macos", .static = false };
+    }
+    return null;
+}
+
+fn crossLinkViaZig(
+    allocator: std.mem.Allocator,
+    environ: anytype,
+    io: std.Io,
+    llvm_triple: []const u8,
+    objs: []const []const u8,
+    output_path: []const u8,
+    shared_nova: []const u8,
+    is_release: bool,
+) !bool {
+    const target = mapCrossTarget(llvm_triple) orelse return false;
+
+    // Cross-build the runtime for this target once, then cache it.
+    const rt_obj = try std.fmt.allocPrint(allocator, "{s}/lib/nova_runtime_{s}.o", .{ shared_nova, target.zig });
+    if (Io.Dir.access(.cwd(), io, rt_obj, .{})) |_| {} else |_| {
+        const boost = environ.get("BOOST_PREFIX") orelse "/opt/homebrew";
+        const boost_inc = try std.fmt.allocPrint(allocator, "-I{s}/include", .{boost});
+        const rt_src = try std.fmt.allocPrint(allocator, "{s}/src/runtime/runtime.cpp", .{shared_nova});
+        std.debug.print("[T1] cross-compiling the C++ runtime for {s} (one-time; caches to ~/.nova/lib) ...\n", .{target.zig});
+        const rc_args = [_][]const u8{ "zig", "c++", "-target", target.zig, "-std=c++20", "-O2", "-DNOVA_DROP_ARENA", boost_inc, "-c", rt_src, "-o", rt_obj };
+        var rc_child = try std.process.spawn(io, .{ .argv = &rc_args });
+        switch (try rc_child.wait(io)) {
+            .exited => |code| if (code != 0) {
+                std.debug.print("[T1] runtime cross-compile failed for {s} (code {d})\n", .{ target.zig, code });
+                if (std.mem.indexOf(u8, target.zig, "windows") != null)
+                    std.debug.print("[T1] Windows targets need the runtime's POSIX socket layer (sys/socket.h, netinet/in.h) ported to winsock2 — a tracked follow-on. Linux (x86_64/arm64) is fully supported today.\n", .{});
+                return error.LinkFailed;
+            },
+            else => return error.LinkFailed,
+        }
+    }
+
+    // Link the Nova objects + cross runtime via `zig c++`.
+    var args = std.ArrayList([]const u8).empty;
+    defer args.deinit(allocator);
+    try args.appendSlice(allocator, &.{ "zig", "c++", "-target", target.zig });
+    if (target.static) try args.append(allocator, "-static");
+    if (is_release) try args.append(allocator, "-O3");
+    for (objs) |o| try args.append(allocator, o); // T6 split: one or many object files
+    try args.append(allocator, rt_obj);
+    try args.appendSlice(allocator, &.{ "-o", output_path });
+    var child = try std.process.spawn(io, .{ .argv = args.items });
+    switch (try child.wait(io)) {
+        .exited => |code| if (code != 0) {
+            std.debug.print("[T1] cross-link failed for {s} (code {d})\n", .{ target.zig, code });
+            return error.LinkFailed;
+        },
+        else => return error.LinkFailed,
+    }
+    return true;
+}
+
 // Link `obj_path` into `output_path` (.wasm) with in-process wasm-ld. The wasm
 // target is freestanding (-nostdlib + host imports) so there is nothing to link
 // but the one object — the same args clang forwarded via -Wl,.
@@ -2111,6 +2191,24 @@ fn compileProgram(
         // T3 FFI: gather the distinct libraries named by `extern("lib") fn` decls; each
         // becomes a `-l<lib>` on the link line so the foreign symbols resolve.
         const ffi_libs = try collectFfiLibs(allocator, program);
+
+        // T1: an explicit NON-host target routes through the bundled Zig toolchain (cross ELF/COFF,
+        // bundled libc). Returns false for the native-host target, falling through to the paths below.
+        if (target_triple_opt) |triple| {
+            if (try crossLinkViaZig(allocator, init.environ_map, init.io, triple, link_objs, output_path, shared_nova, is_release)) {
+                if (init.environ_map.get("NOVA_KEEP_OBJ") == null and !build_mode)
+                    Io.Dir.deleteFile(.cwd(), init.io, obj_path) catch {};
+                if (build_mode) {
+                    const cur = std.fmt.allocPrint(allocator, "{x}", .{src_hash}) catch "";
+                    defer if (cur.len > 0) allocator.free(cur);
+                    _ = Io.Dir.writeFile(.cwd(), init.io, .{ .data = cur, .sub_path = build_hash_path, .flags = .{} }) catch {};
+                    std.debug.print("Built {s} ({s}, cross {s}).\n", .{ output_path, if (is_release) "release" else "debug", triple });
+                } else {
+                    std.debug.print("Native output written to {s} (cross {s})\n", .{ output_path, triple });
+                }
+                return;
+            }
+        }
 
         // In-process LLD: link the executable ourselves, no clang/ld shell-out.
         if (build_options.inprocess_lld and builtin.target.os.tag == .macos and target_triple_opt == null) {
