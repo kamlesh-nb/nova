@@ -1,0 +1,54 @@
+// Gates the §5/§6 KEEPER: a MODULE-QUALIFIED TYPE used inside a CLOSURE.
+//
+// `isNamespaceReceiver` decides whether `x` in `x.y` is a variable or a NAMESPACE. The capture
+// scan recurses into the receiver of a field access, so a module name was captured as a phantom
+// free variable: `url.decode` died with "Identifier 'url' not found", and `string.split` survived
+// only by accident (a `_string`-suffixed function made the scan skip it). The fix taught it that a
+// module-qualified MEMBER naming a TYPE (`response.Response`, a struct; an enum) is a namespace
+// too — not just a module FUNCTION.
+//
+// Gated here because `route-handling-via-mediator.md` §5 recorded that this "cannot be gated
+// standalone yet", blocking §6's keeper split. That turned out to be a MISDIAGNOSIS, found by
+// instrumenting rather than re-reading: the shapes below work today. What actually failed in the
+// original repro was a closure whose RETURN TYPE is a struct — `let f = () => { return
+// response.Response(...); }; f().body` fails with `StructTypeNotFound: struct='void'`, because the
+// closure types as `() -> void`. That is a closure-return-type bug (int and string returns are
+// fine), NOT a module-qualification bug — the module part works, as these cases pin.
+//
+// Still broken, deliberately NOT gated here (see route-handling-via-mediator.md §8):
+//   * a closure returning a STRUCT types as `void`      -> `f().body` fails
+//   * a LOCAL struct ctor inside a closure               -> "Identifier 'P' not found"
+//     (module-qualified works; the ROOT-module one does not — the reverse of §5's guess)
+//   * `Status.Ok.toCode()` — an enum METHOD inside a closure -> MethodOrFunctionNotFound
+import assert;
+import web.response;
+import web.status;
+
+// The construction AND the field read both happen INSIDE the closure, so the closure returns a
+// `string` — sidestepping the separate closure-returns-a-struct bug above. This is exactly the
+// shape `mediator.nova`'s pipeline closures use.
+@test
+fn test_module_struct_ctor_in_closure(): void {
+    let f = () => { return response.Response(Status.Ok, "hi").body; };
+    assert.equalStr(f(), "hi");
+}
+
+// A METHOD on a module-qualified struct, inside a closure — `response` must resolve as a
+// namespace here, not be captured as a free variable.
+@test
+fn test_module_struct_method_in_closure(): void {
+    let f = () => {
+        let r = response.Response(Status.Ok, "body");
+        r.setHeader("X-Test", "1");
+        return r.getHeader("X-Test") ?? "missing";
+    };
+    assert.equalStr(f(), "1");
+}
+
+// The regression this fix exists for: a module FUNCTION in a closure. `url.decode` died with
+// "Identifier 'url' not found" before it.
+@test
+fn test_module_fn_in_closure(): void {
+    let f = () => { return string.toUpperCase("hi"); };
+    assert.equalStr(f(), "HI");
+}

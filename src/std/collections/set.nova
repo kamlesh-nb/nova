@@ -1,0 +1,70 @@
+// set.nova — Generic set based on Map<K, V>
+import map;
+import bytes;
+import list;
+import assert;
+
+pub struct Set<T> {
+    pub map: map.Map<T, bool>,
+
+    init(initialCap: int, hashFn: (T) -> int) {
+        self.map = map.Map<T, bool>(initialCap, hashFn);
+    }
+
+    pub fn add(self: Set<T>, elem: T): void {
+        self.map.set(elem, true);
+    }
+
+    pub fn has(self: Set<T>, elem: T): bool {
+        return self.map.get(elem) != undefined;
+    }
+
+    pub fn remove(self: Set<T>, elem: T): void {
+        self.map.delete_key(elem);
+    }
+
+    pub fn size(self: Set<T>): int {
+        return self.map.size();
+    }
+
+    pub fn forEach(self: Set<T>, fn: (T) => void): void {
+        let keys = self.map.keys();
+        let keysLen = keys.size();
+        let i = 0;
+        while (i < keysLen) {
+            fn(keys.get(i));
+            i = i + 1;
+        }
+    }
+
+    pub fn toList(self: Set<T>): list.List<T> {
+        return self.map.keys();
+    }
+
+    pub fn delete(self: Set<T>): void {
+        self.map.delete();
+    }
+}
+
+pub fn i32Hash(val: int): int {
+    return val;
+}
+
+@test
+fn test_set(): void {
+    let set = Set<int>(16, i32Hash);
+    assert.equalInt(0, set.size());
+
+    set.add(10);
+    set.add(20);
+    set.add(10); // Duplicate
+    assert.equalInt(2, set.size());
+
+    assert.isTrue(set.has(10));
+    assert.isTrue(set.has(20));
+    assert.isFalse(set.has(30));
+
+    set.remove(10);
+    assert.equalInt(1, set.size());
+    assert.isFalse(set.has(10));
+}

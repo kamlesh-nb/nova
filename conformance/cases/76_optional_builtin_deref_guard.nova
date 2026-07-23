@@ -1,0 +1,34 @@
+// C1 (guard completeness): the spec (§3.4) says member access THROUGH an optional is memory-safe —
+// guarded, not a null-deref. The struct-field path was guarded, but two builtin paths were NOT and
+// crashed RAW on an absent optional: `.length` (read `0 - 4`) and index `s[i]` (read from address 0).
+// Both now route through guardOptionalDeref and trap with the located "narrow it first" message.
+// This gate verifies the HAPPY path (narrowed access) still works — the guard is a no-op when present.
+import assert;
+import list;
+
+@test
+fn test_narrowed_length(): void {
+    let xs = List<string>();
+    xs.push("hello");
+    let s = xs.get(0);
+    if (s != undefined) {
+        assert.equalInt(s.length, 5);   // narrowed → guard is a no-op
+    }
+}
+
+@test
+fn test_narrowed_index(): void {
+    let xs = List<string>();
+    xs.push("abc");
+    let s = xs.get(0);
+    if (s != undefined) {
+        assert.equalInt(s[0], 97);      // 'a' — narrowed index, guard is a no-op
+    }
+}
+
+@test
+fn test_present_length_direct(): void {
+    // A plain (non-optional) string is unaffected by the guard.
+    let s = "world";
+    assert.equalInt(s.length, 5);
+}

@@ -1,0 +1,73 @@
+// W3: circuit breaker for the outbound HTTP client. A failing upstream trips the breaker
+// (OPEN); calls then fail fast until a cooldown lets a probe through (HALF_OPEN); enough
+// successes close it. States: 0=CLOSED, 1=OPEN, 2=HALF_OPEN.
+import assert;
+import string;
+import web.status;
+import web.circuit_breaker;
+import resilience.breaker;
+
+@test
+fn test_opens_and_fast_fails(): void {
+    let b = breaker.CircuitBreaker(3, 2, 1000);
+    assert.isTrue(b.getState() == 0);       // CLOSED
+    assert.isTrue(b.shouldAllow());
+    b.recordFailure(); b.recordFailure();
+    assert.isTrue(b.getState() == 0);       // 2 < 3, still closed
+    b.recordFailure();                      // 3rd -> OPEN
+    assert.isTrue(b.getState() == 1);
+    assert.isTrue(!b.shouldAllow());        // fast-fail (cooldown 1000ms not elapsed)
+}
+
+@test
+fn test_half_open_recovery(): void {
+    // timeoutMs = 0 -> the cooldown is always "elapsed", so OPEN probes on the next call.
+    let b = breaker.CircuitBreaker(2, 2, 0);
+    b.recordFailure(); b.recordFailure();   // -> OPEN
+    assert.isTrue(b.getState() == 1);
+    assert.isTrue(b.shouldAllow());         // cooldown elapsed -> HALF_OPEN probe
+    assert.isTrue(b.getState() == 2);
+    b.recordSuccess();                      // 1/2
+    assert.isTrue(b.getState() == 2);
+    b.recordSuccess();                      // 2/2 -> CLOSED
+    assert.isTrue(b.getState() == 0);
+}
+
+@test
+fn test_failed_probe_reopens(): void {
+    let b = breaker.CircuitBreaker(1, 2, 0);
+    b.recordFailure();                      // -> OPEN
+    assert.isTrue(b.shouldAllow());         // -> HALF_OPEN
+    assert.isTrue(b.getState() == 2);
+    b.recordFailure();                      // failed probe -> OPEN again
+    assert.isTrue(b.getState() == 1);
+}
+
+@test
+fn test_success_clears_failures_when_closed(): void {
+    let b = breaker.CircuitBreaker(3, 2, 1000);
+    b.recordFailure(); b.recordFailure();   // 2 failures
+    b.recordSuccess();                      // clears the streak
+    b.recordFailure(); b.recordFailure();   // 2 again — not 4
+    assert.isTrue(b.getState() == 0);       // still closed (streak reset)
+}
+
+@test
+fn test_reset(): void {
+    let b = breaker.CircuitBreaker(1, 1, 1000);
+    b.recordFailure();
+    assert.isTrue(b.getState() == 1);
+    b.reset();
+    assert.isTrue(b.getState() == 0);
+}
+
+@test
+fn test_resilient_client_fast_fails_when_open(): void {
+    // Force the breaker OPEN, then a call must return 503 WITHOUT touching the network.
+    let rc = circuit_breaker.ResilientClient(1, 1, 1000);
+    rc.breaker.recordFailure();             // -> OPEN
+    assert.isTrue(rc.breaker.getState() == 1);
+    let res = rc.get("127.0.0.1", 9, "/");   // port 9 (discard) — never reached
+    assert.isTrue(Status.toCode(res.status) == 503);
+    assert.isTrue(string.indexOf(res.body, "Circuit open") != -1);
+}

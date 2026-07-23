@@ -1,0 +1,99 @@
+// Gates Atomic<T> — load/store/add/sub/compareAndSwap across int, long and bool.
+//
+// WHY THIS CASE EXISTS: nothing in the corpus imported `concurrency.atomic`, so every atomic
+// operation in the language was ungated. `nova_atomic_cas_i32` discarded the result of
+// __atomic_compare_exchange_n and returned `e` — the EXPECTED value, which the intrinsic
+// overwrites with the actual value on failure. Codegen truncates that to i1, so the caller
+// received the LOW BIT OF THE EXPECTED VALUE:
+//
+//     compareAndSwap(22, 30)  -> succeeded, returned 22, trunc(22)=0 -> reported FALSE
+//     compareAndSwap(22, 40)  -> failed,    returned 30, trunc(30)=0 -> reported FALSE
+//
+// so the failing CAS was "right" by accident and only an ODD expected value ever reported
+// success. test_odd_expected_value below is the shape that passed even when broken — it is here
+// so the case cannot be satisfied by a fix that only works for odd numbers.
+//
+// It also hid a SECOND bug: atomic.nova's own test_atomic_i32 aborted the suite (nova_test_fail
+// _Exit()s), so test_atomic_i64, test_atomic_bool and fiber.nova's test_fiber_execution NEVER
+// RAN — and the abort was misattributed to test_fiber_execution as an "atomic/closure-capture
+// bug" (runtime-cpp20-plan.md §6.6). The harness now names the failing test.
+// Fixed + gated 2026-07-17. See docs/beta-readiness-plan.md P1.
+import assert;
+import concurrency.atomic;
+
+@test
+fn test_int_load_store(): void {
+    let a = Atomic<int>(10);
+    assert.equalInt(a.load(), 10);
+    a.store(20);
+    assert.equalInt(a.load(), 20);
+    a.delete();
+}
+
+@test
+fn test_int_add_sub(): void {
+    let a = Atomic<int>(20);
+    assert.equalInt(a.add(5), 20);      // returns the PREVIOUS value
+    assert.equalInt(a.load(), 25);
+    assert.equalInt(a.sub(3), 25);
+    assert.equalInt(a.load(), 22);
+    a.delete();
+}
+
+// The regression gate. An EVEN expected value is the case the old code got wrong.
+@test
+fn test_cas_even_expected_value(): void {
+    let a = Atomic<int>(22);
+    assert.isTrue(a.compareAndSwap(22, 30));    // succeeds -> TRUE (returned false before)
+    assert.equalInt(a.load(), 30);
+    assert.isFalse(a.compareAndSwap(22, 40));   // 22 != 30 -> FALSE, value unchanged
+    assert.equalInt(a.load(), 30);
+    a.delete();
+}
+
+// The shape that passed even when the implementation was broken — pins that a fix
+// works for odd expected values too, rather than merely flipping the bug around.
+@test
+fn test_cas_odd_expected_value(): void {
+    let a = Atomic<int>(21);
+    assert.isTrue(a.compareAndSwap(21, 99));
+    assert.equalInt(a.load(), 99);
+    assert.isFalse(a.compareAndSwap(21, 7));
+    assert.equalInt(a.load(), 99);
+    a.delete();
+}
+
+@test
+fn test_long_atomics(): void {
+    let a = Atomic<long>(100);
+    assert.equalInt(a.load(), 100);
+    a.store(200);
+    assert.equalInt(a.load(), 200);
+    assert.isTrue(a.compareAndSwap(200, 300));
+    assert.equalInt(a.load(), 300);
+    assert.isFalse(a.compareAndSwap(200, 400));
+    a.delete();
+}
+
+// `desired` beyond 2^31: nova_atomic_cas_i64 declared it int32_t while codegen passes i64,
+// so this value was silently truncated. 5_000_000_000 does not fit in 32 bits.
+@test
+fn test_long_cas_above_2_31(): void {
+    let a = Atomic<long>(1);
+    assert.isTrue(a.compareAndSwap(1, 5000000000));
+    assert.equalInt(a.load(), 5000000000);
+    a.delete();
+}
+
+@test
+fn test_bool_atomics(): void {
+    let a = Atomic<bool>(false);
+    assert.isFalse(a.load());
+    a.store(true);
+    assert.isTrue(a.load());
+    assert.isTrue(a.compareAndSwap(true, false));
+    assert.isFalse(a.load());
+    assert.isFalse(a.compareAndSwap(true, true));
+    assert.isFalse(a.load());
+    a.delete();
+}

@@ -1,0 +1,10 @@
+// A7 / F3 §5 stage 5 (§6): a NARROWING integer conversion (wider → narrower) needs an
+// explicit `as` — it can lose value. `long` → `int` truncates 64 bits into 32, so it
+// must be written `big as int`. Widening (`int` → `long`) stays implicit. If this ever
+// compiles, the narrowing-cast enforcement has regressed.
+@test
+fn test_narrowing_rejected(): void {
+    let big: long = 100;
+    let small: int = big;   // long → int without a cast — rejected
+    assert.isTrue(small == small);
+}

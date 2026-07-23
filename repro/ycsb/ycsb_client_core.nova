@@ -1,0 +1,110 @@
+// ycsb_client_core.nova — ONE client's workload against a db.Connection, for the
+// multi-process concurrency-scaling benchmark (D5b). Each client is a separate OS
+// process with its own connection; the harness launches C of them at once and
+// aggregates. This is how pgbench/sysbench/memtier measure SERVER concurrency —
+// real OS-level parallelism, no in-process async needed.
+//
+// Config comes from the environment so the harness can parameterize each process:
+//   YCSB_MODE       "load" (create + insert `records` rows, then exit) | "run" (default)
+//   YCSB_RECORDS    keyspace size                                       (default 10000)
+//   YCSB_DURATION_MS fixed run window in ms                             (default 5000)
+//   YCSB_READPCT    percent of ops that are reads (rest are UPDATEs)    (default 100)
+//   YCSB_SEED       per-client RNG seed (so clients hit different keys) (default 1)
+//
+// A "run" client prints exactly one line: `RESULT ops=<n> ms=<m>` — the harness sums
+// `ops` across the C processes and divides by the wall window for aggregate ops/sec.
+
+import list;
+import string;
+import datetime;
+import env;
+import db;
+
+struct Rng {
+    pub state: long,
+    init(seed: long) { self.state = seed; }
+    pub fn nextU64(self: Rng): long {
+        self.state = self.state * 2862933555777941757 + 3037000493;
+        return self.state;
+    }
+    pub fn nextInt(self: Rng, n: int): int {
+        let v = self.nextU64();
+        if (v < 0) { v = 0 - v; }
+        return (v % (n as long)) as int;
+    }
+}
+
+fn genValue(size: int): string {
+    let s = "";
+    let i = 0;
+    while (i < size) { s = s + "x"; i = i + 1; }
+    return s;
+}
+
+// Zero-padded key so lexical order == numeric order (range scans work).
+fn keyName(k: int): string {
+    let s = `${k}`;
+    while (s.length < 8) { s = "0" + s; }
+    return `user${s}`;
+}
+
+fn envInt(name: string, def: int): int {
+    let s = env.get(name);
+    if (s.length == 0) { return def; }
+    return string.parseI64(s) as int;
+}
+
+fn envLong(name: string, def: long): long {
+    let s = env.get(name);
+    if (s.length == 0) { return def; }
+    return string.parseI64(s);
+}
+
+// Load phase: fresh table + `records` rows. Run ONCE by the harness before the sweep.
+fn load(conn: db.Connection, createTableSql: string, records: int): void {
+    let value = genValue(64);
+    conn.exec("DROP TABLE IF EXISTS ycsb_af", List<DbValue>());
+    conn.exec(createTableSql, List<DbValue>());
+    let i = 0;
+    while (i < records) {
+        conn.exec(`INSERT INTO ycsb_af (ykey, ydata) VALUES ('${keyName(i)}', '${value}')`, List<DbValue>());
+        i = i + 1;
+    }
+    console.log(`LOADED ${records} rows`);
+}
+
+// Run phase: fixed-duration mixed workload; print the op count this client completed.
+fn run(conn: db.Connection, records: int, durationMs: int, readPct: int, seed: long): void {
+    let value = genValue(64);
+    let rng = Rng(seed);
+    let start = datetime.nowNs();
+    let deadline = start + (durationMs as long) * 1000000;
+    let ops: long = 0;
+    while (datetime.nowNs() < deadline) {
+        let k = rng.nextInt(records);
+        let coin = rng.nextInt(100);
+        if (coin < readPct) {
+            let rs = conn.query(`SELECT ykey, ydata FROM ycsb_af WHERE ykey = '${keyName(k)}'`, List<DbValue>());
+        } else {
+            conn.exec(`UPDATE ycsb_af SET ydata = '${value}' WHERE ykey = '${keyName(k)}'`, List<DbValue>());
+        }
+        ops = ops + 1;
+    }
+    let ms = (datetime.nowNs() - start) / 1000000;
+    console.log(`RESULT ops=${ops} ms=${ms}`);
+}
+
+/// Entry point shared by every per-driver client: dispatch on YCSB_MODE.
+pub fn dispatch(conn: db.Connection, createTableSql: string): void {
+    let mode = env.get("YCSB_MODE");
+    let records = envInt("YCSB_RECORDS", 10000);
+    if (string.eql(mode, "load")) {
+        load(conn, createTableSql, records);
+    } else {
+        let durationMs = envInt("YCSB_DURATION_MS", 5000);
+        let readPct = envInt("YCSB_READPCT", 100);
+        let seed = envLong("YCSB_SEED", 1);
+        run(conn, records, durationMs, readPct, seed);
+    }
+    conn.close();
+}

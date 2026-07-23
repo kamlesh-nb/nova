@@ -1,0 +1,109 @@
+// The MySQL driver's wire CODEC (data/sql/mysql.nova) — gated OFFLINE against hand-built
+// packets matching the MySQL protocol (no MySQL server was available, so the connect/query
+// flow is spec-followed but not live-proven; the CODEC + auth here ARE verified). Covers:
+// packet framing (u24 LE len + seq), COM_QUERY, lenenc column-def + text-row decode incl
+// NULL, ERR packet, Handshake salt extraction, and the native_password auth scramble against
+// an independent (python hashlib) golden vector.
+import assert;
+import bytes;
+import string;
+import list;
+import db;
+import mysql;
+
+// little-endian + lenenc builders (mirror the server encoding)
+fn u16leb(v: int): string { let p = bytes.alloc(2); bytes.write_byte(p,0,v%256); bytes.write_byte(p,1,(v/256)%256); return p as string; }
+fn u32leb(v: int): string { let p = bytes.alloc(4); bytes.write_byte(p,0,v%256); bytes.write_byte(p,1,(v/256)%256); bytes.write_byte(p,2,(v/65536)%256); bytes.write_byte(p,3,(v/16777216)%256); return p as string; }
+fn b(v: int): string { let p = bytes.alloc(1); bytes.write_byte(p, 0, v); return p as string; }
+fn lstr(s: string): string { return b(s.length) + s; }   // lenenc-str (short form)
+
+@test
+fn test_comquery_framing(): void {
+    // [u24 len LE][seq][0x03][sql]. sql "Q" -> payload len 2; frame = 3+1+2.
+    let f = mysql.buildComQuery("Q");
+    assert.equalInt(f.length, 6);
+    assert.equalInt(f[0], 2);    // len low byte
+    assert.equalInt(f[1], 0);
+    assert.equalInt(f[2], 0);
+    assert.equalInt(f[3], 0);    // sequence id 0
+    assert.equalInt(f[4], 3);    // COM_QUERY
+    assert.equalInt(f[5], 81);   // 'Q'
+}
+
+@test
+fn test_column_def_decode(): void {
+    // catalog,schema,table,org_table,name,org_name (lenenc-str) + lenenc(0x0c) + charset(u16)
+    // + col_len(u32) + type(u8) ... type 3 = LONG -> Int4.
+    let cd = lstr("def") + lstr("db") + lstr("t") + lstr("t") + lstr("id") + lstr("id")
+        + b(12) + u16leb(63) + u32leb(11) + b(3);
+    let col = mysql.decodeColumnDef(cd);
+    assert.equalStr(col.name, "id");
+    assert.isTrue(col.type_oid == DbType.Int4);
+
+    // type 253 = VAR_STRING -> Text.
+    let cd2 = lstr("def") + lstr("db") + lstr("t") + lstr("t") + lstr("name") + lstr("name")
+        + b(12) + u16leb(45) + u32leb(255) + b(253);
+    assert.isTrue(mysql.decodeColumnDef(cd2).type_oid == DbType.Text);
+}
+
+@test
+fn test_text_row_decode(): void {
+    let cols = List<Column>();
+    cols.push(Column("id", DbType.Int4));
+    cols.push(Column("name", DbType.Text));
+    cols.push(Column("qty", DbType.Int4));
+
+    // Row: id="10", name="widget", qty="42" (all lenenc-str, text protocol).
+    let rp = lstr("10") + lstr("widget") + lstr("42");
+    let row = mysql.decodeTextRow(rp, cols);
+    assert.equalInt(row.getInt(0), 10);
+    assert.equalStr(row.getText(1), "widget");
+    assert.equalInt(row.getInt(2), 42);
+
+    // Row with NULL name: id="20", NULL (0xfb), qty="7".
+    let rp2 = lstr("20") + b(251) + lstr("7");
+    let row2 = mysql.decodeTextRow(rp2, cols);
+    assert.equalInt(row2.getInt(0), 20);
+    assert.isTrue(row2.isNull(1));
+    assert.equalInt(row2.getInt(2), 7);
+}
+
+@test
+fn test_err_packet_decode(): void {
+    // 0xff, error_code(u16), '#', sqlstate(5), message.
+    let ep = b(255) + u16leb(1146) + b(35) + "42S02" + "Table missing";
+    let err = mysql.decodeErr(ep);
+    assert.equalStr(err.code, "42S02");
+    assert.equalStr(err.message, "Table missing");
+}
+
+@test
+fn test_handshake_salt_extraction(): void {
+    // v10 handshake: proto(10), server-version cstr, conn-id(4), salt1(8), filler(0),
+    // cap-low(2), charset(1), status(2), cap-high(2), auth-len(1)=21, reserved(10),
+    // salt2(12), plugin cstr.
+    let hs = b(10) + "8.0.0" + b(0) + u32leb(7) + "AAAAAAAA" + b(0)
+        + u16leb(0) + b(45) + u16leb(2) + u16leb(0)
+        + b(21) + b(0)+b(0)+b(0)+b(0)+b(0)+b(0)+b(0)+b(0)+b(0)+b(0)
+        + "BBBBBBBBBBBB" + "mysql_native_password" + b(0);
+    let h = mysql.parseHandshake(hs);
+    assert.equalStr(h.salt, "AAAAAAAABBBBBBBBBBBB");   // salt1 ++ salt2 = 20 bytes
+    assert.equalStr(h.plugin, "mysql_native_password");
+}
+
+@test
+fn test_native_password_scramble_golden(): void {
+    // Independently verified with python hashlib:
+    //   scramble('secret', bytes(1..20)) = b3 2b b3 a5 83 e1 34 0c 0a 11 08 d5 8b 1b e4 97 81 ad 8c 2f
+    let sb = bytes.alloc(20);
+    let i = 0;
+    while (i < 20) { bytes.write_byte(sb, i, i + 1); i = i + 1; }
+    let salt = sb as string;
+    let out = mysql.mysqlNativeScramble("secret", salt);
+    assert.equalInt(out.length, 20);
+    let gp = out as ptr;
+    assert.equalInt(bytes.read_byte(gp, 0), 179);
+    assert.equalInt(bytes.read_byte(gp, 1), 43);
+    assert.equalInt(bytes.read_byte(gp, 2), 179);
+    assert.equalInt(bytes.read_byte(gp, 19), 47);
+}

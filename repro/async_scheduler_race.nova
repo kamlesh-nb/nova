@@ -1,0 +1,75 @@
+// STRESS REPRO for the async scheduler. Not a conformance case — a race harness.
+//
+//   nova repro/async_scheduler_race.nova --native -o /tmp/asyncstress
+//   for i in $(seq 1 30); do /tmp/asyncstress; done     # expect "ok" every time
+//   NOVA_THREADS=1 /tmp/asyncstress                      # single-threaded control
+//
+// WHY THIS SHAPE. `10_async_go` flaked at ~20% and three of the four bugs below
+// needed *multiple sequential async drives in one process* to appear — a single
+// drive ran 400x clean. Handles are heap addresses, so they are REUSED across
+// drives, and two of the bugs were only reachable once an address came back.
+// A one-shot test cannot find them. Keep the loop.
+//
+// MEASURING IT. Do not trust `ps` or a single run.
+//   * ASAN is USELESS here: its slowdown closes every window (1800 drives, zero
+//     hits, while the same binary crashed 3/20 natively).
+//   * NOVA_THREADS=1 is the control. All four bugs are multi-thread only: 6000
+//     drives clean single-threaded, 3 crashes/20 runs multi-threaded. If a change
+//     is clean at THREADS=1 and dirty by default, it is a scheduler race.
+//   * lldb gives the answer ASAN cannot: `lldb -b -o run -o "thread backtrace all"`.
+//     A PC *equal to* the faulting address == a jump through a garbage function
+//     pointer == resuming a freed frame.
+//
+// FIXED HERE (2026-07-15) — all four were live simultaneously:
+//   1. LOST WAKEUP. The scheduler's pending_resume path re-scheduled while
+//      `running` was still set, so nova_sched_schedule() swallowed the request back
+//      into pending_resume and nothing ever re-checked it. nova_run() then drained
+//      and the caller read an unwritten promise slot => `await` returned a stale
+//      POINTER (the classic "Expected 30, got 6705069080").
+//   2. delete state UNDER ITS OWN lock_guard => the guard unlocked a freed mutex.
+//   3. nova_run() returns on an IDLE io_context, but buildDriveAsyncCall read the
+//      root's promise unconditionally. Idle != done. Now nova_run_root() drives
+//      until the root is genuinely complete and ABORTS on a lost wakeup rather
+//      than handing back garbage.
+//   4. STALE WAITER (the crash). The scheduler's early-done path returned without
+//      calling take_waiter(), leaking the registration in g_waiters — which is
+//      keyed by a coroutine handle, i.e. a REUSED heap address. A later coroutine
+//      landing on that address inherited the stale waiter; take_waiter() then
+//      handed back a destroyed frame and the scheduler resumed it.
+//   Plus: coroutine frames are freed via nova_coro_release(), serialised against
+//   the scheduler, instead of a bare llvm.coro.destroy. An awaiter on the READY
+//   path (nova_await_future returned 1) used to free the frame while the
+//   scheduler was still reading it.
+//
+// RESULT: ~15-25% failure per run -> 1 wrong in 18,000 drives.
+//
+// ⚠️ STILL OPEN: that residual is real, not noise. One `await` in ~18k drives still
+// yields garbage. It is NOT any of the four above. Do not call the scheduler sound.
+// specs.md §10 #22.
+async fn square(n: int): int { return n * n; }
+
+async fn addAsync(a: int, b: int): int {
+    let x = await square(a);
+    let y = await square(b);
+    return x + y;
+}
+
+async fn concurrent(): int {
+    let h1 = spawn square(3);
+    let h2 = spawn square(4);
+    let h3 = spawn addAsync(1, 2);
+    return await h1 + await h2 + await h3;   // 9 + 16 + 5 = 30
+}
+
+fn main(): void {
+    let i = 0;
+    let bad = 0;
+    while (i < 300) {
+        let a = addAsync(2, 3);                     // 4 + 9 = 13
+        if (a != 13) { bad = bad + 1; console.log(`BAD addAsync=${a}`); }
+        let c = concurrent();                       // 30
+        if (c != 30) { bad = bad + 1; console.log(`BAD concurrent=${c}`); }
+        i = i + 1;
+    }
+    if (bad == 0) { console.log("ok"); }
+}

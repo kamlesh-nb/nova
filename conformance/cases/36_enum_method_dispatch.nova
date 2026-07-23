@@ -1,0 +1,74 @@
+// Gates methods on a PAYLOAD-LESS enum value — `E.A.code()` and `s.code()` where `s = E.A`.
+//
+// Surfaced as "enum method in a closure" (route-handling-via-mediator.md §8, §5's
+// `Status.Ok.toCode()`), but the closure was a red herring: `E.A.code()` failed OUTSIDE a
+// closure too. The real gap was typing a payload-less enum literal. `E.A` is a field access
+// whose OBJECT names the enum and whose FIELD names the variant; sema left it `.unresolved`, so:
+//   * `E.A.code()`  — the method receiver had no type, dispatch found no `E_code`
+//   * `let s = E.A; s.code()` — `s` inherited that non-type
+// The PAYLOAD form `E.N(3).code()` always worked, because `E.N(3)` is a CALL and the
+// enum-construction path types it — which is exactly why the bug looked variant-specific.
+//
+// Two fixes: sema now types `E.A` as its enum (infer.zig `.field_access`), and the method-call
+// site recovers the enum name from a literal receiver `E.A` (llvm_codegen, mirroring the
+// `module.Struct.method()` recovery beside it). Neither is about closures — the closure cases
+// below pass for the same reason the top-level ones do.
+import assert;
+
+enum Color {
+    Red,
+    Green,
+    Blue,
+    pub fn rank(self: Color): int {
+        switch (self) {
+            case Color.Red:   { return 1; }
+            case Color.Green: { return 2; }
+            case Color.Blue:  { return 3; }
+        }
+        return 0;
+    }
+}
+
+// Method on an enum LITERAL receiver — the shape that failed everywhere.
+@test
+fn test_method_on_enum_literal(): void {
+    assert.equalInt(Color.Green.rank(), 2);
+}
+
+// Method on a LOCAL holding a payload-less enum value.
+@test
+fn test_method_on_enum_local(): void {
+    let c = Color.Blue;
+    assert.equalInt(c.rank(), 3);
+}
+
+// A payload variant's method must still work — it took a different (call) path and must not
+// have regressed.
+enum Tagged {
+    N(int),
+    pub fn value(self: Tagged): int {
+        switch (self) {
+            case Tagged.N(v): { return v; }
+        }
+        return -1;
+    }
+}
+
+@test
+fn test_method_on_payload_variant(): void {
+    assert.equalInt(Tagged.N(42).value(), 42);
+}
+
+// §5's original: an enum method called INSIDE a closure — literal receiver.
+@test
+fn test_enum_method_in_closure_literal(): void {
+    let f = () => { return Color.Red.rank(); };
+    assert.equalInt(f(), 1);
+}
+
+// And on a local, inside a closure.
+@test
+fn test_enum_method_in_closure_local(): void {
+    let f = () => { let c = Color.Blue; return c.rank(); };
+    assert.equalInt(f(), 3);
+}

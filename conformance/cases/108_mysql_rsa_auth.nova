@@ -1,0 +1,43 @@
+// D6: MySQL caching_sha2_password FULL auth — the runtime RSA-OAEP primitive that encrypts the
+// (password XOR nonce) blob under the server's RSA public key. RSA-OAEP is randomized (fresh
+// padding each call) and cannot be decrypted without the private key, so the FULL correctness of
+// this path is proven LIVE (a real MySQL 9 server decrypted the blob and authenticated an
+// uncached caching_sha2 user). This gate locks, offline, the primitive's structural contract:
+// a valid key yields a modulus-sized ciphertext, two encryptions DIFFER (real OAEP, not ECB),
+// and malformed input fails closed to an empty string.
+import assert;
+import string;
+
+// The runtime RSA primitive is a bare extern; production always calls it through a typed Nova
+// wrapper (mysql's `rsaEncryptPassword`) so its owned-string return is adopted + freed. Mirror
+// that here — calling the bare extern directly wouldn't ARC-track the returned ciphertext.
+fn rsaEnc(pem: string, data: string, len: int): string {
+    return nova_rsa_oaep_encrypt(pem, data, len);
+}
+
+// A real 2048-bit RSA public key (SubjectPublicKeyInfo PEM). Modulus = 256 bytes.
+const PEM_KEY: string = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyMvPOj+bnx2O7uDUcPyn\nG8OGFD3QnLeLq1EJdHZod6GDin920Cnt98uwmQI1TYX/BkxaSDidZQw81XS2DrhU\ntD1RKAaN9lPV9SVTY8uHitEEvDSRZNdZ1nsLtSHHGyUjDTOgcuj00leZy9VwCszP\nO8HYabnpYOi+tCjRDySVJ3rl/pXoB353WxZrSWWqR8lB+Z01uF1guQr4zhWjWUsq\nWXBozZSVq/LUkLsDSthTBMMGEWQ5QEwQGLGc7fN4DfbnQkNCEcU1S/gMBLzNRpix\ndDIzWa6Kg8TrOYRTvAnpRTSvN61/hSk1G2yX6KOmMJ0BijIjcImk6NBvhyNSc+7O\nYwIDAQAB\n-----END PUBLIC KEY-----\n";
+
+@test
+fn test_oaep_ciphertext_is_modulus_sized(): void {
+    let ct = rsaEnc(PEM_KEY, "secret-blob", 11);
+    assert.equalInt(ct.length, 256);            // 2048-bit key -> 256-byte ciphertext
+}
+
+@test
+fn test_oaep_is_randomized(): void {
+    // Same plaintext, two calls -> different ciphertext (OAEP random seed). A textbook/ECB
+    // scheme would return identical bytes; this proves real padded RSA.
+    let a = rsaEnc(PEM_KEY, "secret-blob", 11);
+    let b = rsaEnc(PEM_KEY, "secret-blob", 11);
+    assert.equalInt(a.length, 256);
+    assert.equalInt(b.length, 256);
+    assert.isTrue(!string.eql(a, b));
+}
+
+@test
+fn test_oaep_bad_pem_fails_closed(): void {
+    // Not a PEM -> empty string (the driver treats empty as "cannot full-auth"), never a crash.
+    let ct = rsaEnc("not a valid pem key", "x", 1);
+    assert.equalInt(ct.length, 0);
+}

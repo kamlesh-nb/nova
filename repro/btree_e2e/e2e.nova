@@ -1,0 +1,28 @@
+// BTreeDB end-to-end: a Nova program driving a LIVE BTreeDB server over the
+// binary protocol — connect, DDL, insert, query, verify TYPED rows (int+text).
+import assert;
+import list;
+import string;
+import db;
+import btreedb;
+
+@test
+fn btree_e2e_crud(): void {
+    let drv = BTreeDriver();
+    let conn = drv.connect("127.0.0.1:3009");
+
+    conn.exec("CREATE TABLE nova_e2e (id INT PRIMARY KEY, name TEXT, age INT)", List<DbValue>());
+    conn.exec("INSERT INTO nova_e2e (id, name, age) VALUES (1, 'Alice', 25)", List<DbValue>());
+    conn.exec("INSERT INTO nova_e2e (id, name, age) VALUES (2, 'Bob', 19)", List<DbValue>());
+
+    let rs = conn.query("SELECT id, name, age FROM nova_e2e", List<DbValue>());
+    assert.equalInt(rs.rowCount(), 2);
+
+    // Typed decode: id (int), name (text), age (int).
+    let r0 = rs.row(0);
+    assert.equalInt(r0.getInt(0), 1);
+    assert.equalStr(r0.getText(1), "Alice");
+    assert.equalInt(r0.getInt(2), 25);
+
+    conn.close();
+}

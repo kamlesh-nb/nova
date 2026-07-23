@@ -1,0 +1,29 @@
+import assert;
+
+pub trait Executable {
+    fn run(self: Executable): void;
+}
+
+// `fiber.spawn` (retired) ran inline, so this is just an execution helper. Named `execute` (not `spawn`)
+// so it does not shadow the `spawn` concurrency keyword.
+pub fn execute(exe: Executable): void {
+    exe.run();
+}
+
+struct TestRunner {
+    pub val: int,
+    init() {
+        self.val = 0;
+    }
+    pub fn run(self: TestRunner): void {
+        self.val = 42;
+    }
+}
+
+@test
+fn test_traits_execution(): void {
+    let runner = TestRunner();
+    execute(runner);
+    assert.equalInt(42, runner.val);
+}
+

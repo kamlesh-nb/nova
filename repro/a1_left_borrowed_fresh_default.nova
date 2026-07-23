@@ -1,0 +1,27 @@
+import assert;
+import collections.map;
+import string;
+
+struct Box { pub v: string, }
+
+fn mk(): map.Map<string, Box> {
+    let m = map.Map<string, Box>(16, string.hash);
+    m.set("a", Box { v: "alpha" });
+    return m;
+}
+
+@test
+fn left_borrowed_fresh_default_present() {
+    let m = mk();
+    let h = m.get("a");          // borrowed owned LEFT
+    let r = h ?? Box { v: "d" }; // FRESH default (no dominance error path)
+    assert.equalStr(r.v, "alpha");
+}
+
+@test
+fn left_borrowed_fresh_default_absent() {
+    let m = mk();
+    let h = m.get("nope");
+    let r = h ?? Box { v: "d" };
+    assert.equalStr(r.v, "d");
+}

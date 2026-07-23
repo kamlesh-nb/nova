@@ -1,0 +1,66 @@
+// cors.nova — CORS Headers and Options Middleware
+import web.request;
+import web.response;
+import web.middleware;
+import web.status;
+import collections.list;
+
+pub struct CorsConfig {
+    pub allowOrigin: string,       // e.g. "*" or specific origin
+    pub allowOrigins: list.List,   // List<string>
+    pub allowMethods: string,
+    pub allowHeaders: string,
+    pub maxAge: string,
+    pub allowCredentials: bool,
+}
+
+pub struct CorsMiddleware impl Middleware {
+    pub config: CorsConfig,
+
+    init(config: CorsConfig) {
+        self.config = config;
+    }
+
+    pub fn execute(self: CorsMiddleware, req: request.Request, res: response.Response): MiddlewareAction {
+        let origin_header = req.headers.get("Origin") ?? req.headers.get("origin") ?? "";
+        let origin_resolved = "";
+
+        if (self.config.allowOrigins.size() > 0) {
+            let i = 0;
+            while (i < self.config.allowOrigins.size()) {
+                let allowed = self.config.allowOrigins.get(i);
+                if (allowed == "*" || allowed == origin_header) {
+                    origin_resolved = origin_header;
+                    break;
+                }
+                i = i + 1;
+            }
+        } else {
+            origin_resolved = self.config.allowOrigin;
+        }
+
+        if (origin_resolved != "") {
+            res.setHeader("Access-Control-Allow-Origin", origin_resolved);
+        }
+        if (self.config.allowOrigins.size() > 0) {
+            res.setHeader("Vary", "Origin");
+        }
+
+        res.setHeader("Access-Control-Allow-Methods", self.config.allowMethods);
+        res.setHeader("Access-Control-Allow-Headers", self.config.allowHeaders);
+        if (self.config.allowCredentials) {
+            res.setHeader("Access-Control-Allow-Credentials", "true");
+        }
+
+        if (req.method == "OPTIONS") {
+            res.setHeader("Access-Control-Max-Age", self.config.maxAge);
+            res.status = Status.NoContent;
+            return MiddlewareAction.Stop;
+        }
+
+        return MiddlewareAction.Next;
+    }
+
+    pub fn after(self: CorsMiddleware, req: request.Request, res: response.Response, matched: MatchedRoute): void {
+    }
+}

@@ -1,0 +1,28 @@
+// A3(e): an if-EXPRESSION whose branches are structs, in a trait-typed position, must widen EACH
+// branch to the trait object on its own edge — `let o: G = if (c) A{} else B{}` and
+// `return if (c) A{} else B{}`. Sema now types the if-expr as the trait when the expected type is a
+// trait and both branches are structs (the branch expressions keep their struct types for codegen);
+// codegen widens each branch per-edge and the phi owns the selected fat pointer. Prior: the if-expr
+// was `.unresolved` (two different structs) and a raw struct reached the trait slot → SEGV.
+import assert;
+
+trait G { fn v(self: G): int; }
+struct A impl G { fn v(self: A): int { return 3; } }
+struct B impl G { fn v(self: B): int { return 7; } }
+
+// Annotated let with a heterogeneous if-expr.
+@test
+fn test_annotated_let_if_expr(): void {
+    let ha: G = if (true) A{} else B{};
+    let hb: G = if (false) A{} else B{};
+    assert.equalInt(ha.v(), 3);
+    assert.equalInt(hb.v(), 7);
+}
+
+// Direct return of an if-expr as the trait.
+fn pick(hit: bool): G { return if (hit) A{} else B{}; }
+@test
+fn test_return_if_expr(): void {
+    assert.equalInt(pick(true).v(), 3);
+    assert.equalInt(pick(false).v(), 7);
+}

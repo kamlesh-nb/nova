@@ -1,0 +1,230 @@
+import assert;
+
+pub fn abs(val: int): int {
+    if (val < 0) {
+        return -val;
+    }
+    return val;
+}
+
+pub fn sqrt(val: int): int {
+    if (val < 0) {
+        return 0;
+    }
+    if (val == 0) {
+        return 0;
+    }
+    if (val == 1) {
+        return 1;
+    }
+    let start = 1;
+    let end = val;
+    let ans = 0;
+    while (start <= end) {
+        let mid = (start + end) / 2;
+        let sq = mid * mid;
+        if (sq == val) {
+            return mid;
+        }
+        if (sq < val) {
+            start = mid + 1;
+            ans = mid;
+        } else {
+            end = mid - 1;
+        }
+    }
+    return ans;
+}
+
+pub fn pow(base: int, exp: int): int {
+    let result = 1;
+    let i = 0;
+    while (i < exp) {
+        result = result * base;
+        i = i + 1;
+    }
+    return result;
+}
+
+pub fn min(a: int, b: int): int {
+    if (a < b) {
+        return a;
+    }
+    return b;
+}
+
+pub fn max(a: int, b: int): int {
+    if (a > b) {
+        return a;
+    }
+    return b;
+}
+
+pub fn clamp(val: int, min_val: int, max_val: int): int {
+    if (val < min_val) {
+        return min_val;
+    }
+    if (val > max_val) {
+        return max_val;
+    }
+    return val;
+}
+
+pub fn int_hash(val: int): int {
+    return val;
+}
+
+// ---------------------------------------------------------------------------
+// Floating-point (double) math (A4)
+// ---------------------------------------------------------------------------
+
+pub fn pi(): double { return 3.14159265358979323846; }
+pub fn e(): double { return 2.71828182845904523536; }
+
+pub fn fabs(x: double): double {
+    if (x < 0.0) { return 0.0 - x; }
+    return x;
+}
+
+pub fn fmin(a: double, b: double): double {
+    if (a < b) { return a; }
+    return b;
+}
+
+pub fn fmax(a: double, b: double): double {
+    if (a > b) { return a; }
+    return b;
+}
+
+pub fn fclamp(x: double, lo: double, hi: double): double {
+    if (x < lo) { return lo; }
+    if (x > hi) { return hi; }
+    return x;
+}
+
+/// Round toward negative infinity.
+pub fn ffloor(x: double): double {
+    let t = x as int;
+    let tf = t as double;
+    if (tf > x) { return (t - 1) as double; }
+    return tf;
+}
+
+/// Round toward positive infinity.
+pub fn fceil(x: double): double {
+    let t = x as int;
+    let tf = t as double;
+    if (tf < x) { return (t + 1) as double; }
+    return tf;
+}
+
+/// Round half away from zero.
+pub fn fround(x: double): double {
+    if (x < 0.0) { return fceil(x - 0.5); }
+    return ffloor(x + 0.5);
+}
+
+/// Square root via Newton's method.
+pub fn fsqrt(x: double): double {
+    if (x <= 0.0) { return 0.0; }
+    let guess = x;
+    let i = 0;
+    while (i < 30) {
+        guess = (guess + x / guess) / 2.0;
+        i = i + 1;
+    }
+    return guess;
+}
+
+/// Integer power for double base (non-negative exponent).
+pub fn fpow(base: double, exp: int): double {
+    let result = 1.0;
+    let i = 0;
+    while (i < exp) {
+        result = result * base;
+        i = i + 1;
+    }
+    return result;
+}
+
+pub fn ln2(): double { return 0.69314718055994530942; }
+
+/// Natural logarithm. Range-reduces x to m in [1,2) by halving (x = m * 2^k), then uses the
+/// fast-converging atanh series ln(m) = 2*(z + z^3/3 + z^5/5 + ...) with z = (m-1)/(m+1).
+/// Returns 0.0 for x <= 0 (Nova has no NaN/-inf literal to return).
+pub fn fln(x: double): double {
+    if (x <= 0.0) { return 0.0; }
+    let m = x;
+    let k = 0;
+    while (m >= 2.0) { m = m / 2.0; k = k + 1; }
+    while (m < 1.0) { m = m * 2.0; k = k - 1; }
+    let z = (m - 1.0) / (m + 1.0);
+    let z2 = z * z;
+    let term = z;
+    let sum = 0.0;
+    let n = 0;
+    while (n < 20) {
+        sum = sum + term / ((2.0 * (n as double)) + 1.0);
+        term = term * z2;
+        n = n + 1;
+    }
+    return (2.0 * sum) + ((k as double) * ln2());
+}
+
+/// e^x. Range-reduces by k = round(x / ln2) so the Taylor series runs on r in [-ln2/2, ln2/2],
+/// then scales by 2^k.
+pub fn fexp(x: double): double {
+    let k = fround(x / ln2());
+    let r = x - (k * ln2());
+    let term = 1.0;
+    let sum = 1.0;
+    let n = 1;
+    while (n < 18) {
+        term = term * r / (n as double);
+        sum = sum + term;
+        n = n + 1;
+    }
+    let ki = k as int;
+    let scale = 1.0;
+    while (ki > 0) { scale = scale * 2.0; ki = ki - 1; }
+    while (ki < 0) { scale = scale / 2.0; ki = ki + 1; }
+    return sum * scale;
+}
+
+/// base^exp for fractional exponents, via exp(exp * ln(base)). `fpow` only takes an int exponent;
+/// this is what distributions like Zipfian need (pow(i, theta) with theta ~= 0.99).
+pub fn fpowf(base: double, exp: double): double {
+    if (base <= 0.0) { return 0.0; }
+    return fexp(exp * fln(base));
+}
+
+@test
+fn test_float_math(): void {
+    assert.isTrue(fabs(0.0 - 3.5) > 3.4);
+    assert.isTrue(fabs(0.0 - 3.5) < 3.6);
+    assert.isTrue(ffloor(3.7) > 2.9);
+    assert.isTrue(ffloor(3.7) < 3.1);
+    assert.isTrue(fceil(3.2) > 3.9);
+    assert.isTrue(fceil(3.2) < 4.1);
+    assert.isTrue(fround(3.5) > 3.9);
+    assert.isTrue(fround(2.4) < 2.6);
+    assert.isTrue(fsqrt(16.0) > 3.9);
+    assert.isTrue(fsqrt(16.0) < 4.1);
+    assert.isTrue(fmin(1.5, 2.5) < 2.0);
+    assert.isTrue(fmax(1.5, 2.5) > 2.0);
+    assert.isTrue(fpow(2.0, 3) > 7.9);
+}
+
+@test
+fn test_math(): void {
+    assert.equalInt(5, abs(-5));
+    assert.equalInt(5, abs(5));
+    assert.equalInt(3, sqrt(9));
+    assert.equalInt(8, pow(2, 3));
+    assert.equalInt(3, min(3, 5));
+    assert.equalInt(5, max(3, 5));
+    assert.equalInt(5, clamp(3, 5, 10));
+    assert.equalInt(8, clamp(8, 5, 10));
+    assert.equalInt(10, clamp(12, 5, 10));
+}
+

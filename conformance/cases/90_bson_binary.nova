@@ -1,0 +1,40 @@
+// Gates BSON binary (type 0x05) + the ARC-owned embedded doc/array storage
+// (D3 needed both). Binary round-trips (NUL-safe), and nested docs/arrays survive
+// serialize -> deserialize while staying leak-free.
+import serde.bson;
+import list;
+import assert;
+
+fn doc(): bson.BsonDocument {
+    return bson.BsonDocument{ entries: list.List<bson.BsonEntry>() };
+}
+
+@test
+fn test_bson_binary_roundtrip(): void {
+    let d = doc();
+    d.entries.push(bson.entryString("mechanism", "SCRAM-SHA-256"));
+    d.entries.push(bson.entryBinary("payload", "n,,n=user,r=abc"));
+    // serialize returns an owned buffer; adopt it as a string so ARC frees it.
+    let wire: string = bson.serialize(d) as string;
+    let back = bson.deserialize(wire as ptr);
+    assert.equalStr(bson.docGetString(back, bson.docFind(back, "mechanism")), "SCRAM-SHA-256");
+    assert.equalStr(bson.docGetBinary(back, bson.docFind(back, "payload")), "n,,n=user,r=abc");
+}
+
+@test
+fn test_bson_embedded_doc(): void {
+    // { find: "users", filter: { name: "ada" } } — the embedded doc is stored as an
+    // ARC-owned byte string (was a leaking raw ptr).
+    let filter = doc();
+    filter.entries.push(bson.entryString("name", "ada"));
+    let cmd = doc();
+    cmd.entries.push(bson.entryString("find", "users"));
+    cmd.entries.push(bson.entryDoc("filter", bson.serialize(filter)));
+
+    let wire: string = bson.serialize(cmd) as string;
+    let back = bson.deserialize(wire as ptr);
+    assert.equalStr(bson.docGetString(back, bson.docFind(back, "find")), "users");
+    // The embedded filter comes back as bytes; re-deserialize and read its field.
+    let inner = bson.deserialize(bson.docGetDoc(back, bson.docFind(back, "filter")) as ptr);
+    assert.equalStr(bson.docGetString(inner, bson.docFind(inner, "name")), "ada");
+}

@@ -1,0 +1,45 @@
+// S1: exact decimal128 through YAML. A new `YamlValue.Decimal(decimal)` variant holds a fractional
+// or exponent scalar exactly; a bare integer still parses as `Number(long)`.
+//   yaml.decimalValue(d) -> a Decimal scalar
+//   yaml.asDecimal(v)     -> the exact decimal (undefined for non-decimal kinds)
+// The parser routes a fractional/exponent scalar to Decimal (isDecimalNumeric), integers to Number.
+import serde.yaml;
+import map;
+import string;
+import assert;
+
+@test
+fn test_encode_stringify_parse_decode(): void {
+    let m = Map<string, yaml.YamlValue>(8, string.hash);
+    m.set("rate", yaml.decimalValue(3.14m));
+    let text = yaml.stringify(yaml.object(m));
+    let back = yaml.parse(text);
+    let d = yaml.asDecimal(yaml.get(back, "rate")) ?? 0m;
+    assert.equalStr(`${d}`, "3.14");
+}
+
+@test
+fn test_parse_decimal_scalar(): void {
+    let v = yaml.parse("amount: 1.5e-3");
+    assert.equalStr(`${yaml.asDecimal(yaml.get(v, "amount")) ?? 0m}`, "0.0015");
+    let v2 = yaml.parse("price: 19.99");
+    assert.equalStr(`${yaml.asDecimal(yaml.get(v2, "price")) ?? 0m}`, "19.99");
+    let v3 = yaml.parse("neg: -0.1");
+    assert.equalStr(`${yaml.asDecimal(yaml.get(v3, "neg")) ?? 0m}`, "-0.1");
+}
+
+@test
+fn test_integer_stays_number(): void {
+    // a bare integer must remain Number(long), not become a Decimal.
+    let v = yaml.parse("count: 42");
+    assert.equalInt((yaml.asNumber(yaml.get(v, "count")) ?? 0) as int, 42);
+    assert.isTrue(yaml.asDecimal(yaml.get(v, "count")) == undefined);
+}
+
+@test
+fn test_exact_arithmetic(): void {
+    let v = yaml.parse("a: 0.1\nb: 0.2");
+    let a = yaml.asDecimal(yaml.get(v, "a")) ?? 0m;
+    let b = yaml.asDecimal(yaml.get(v, "b")) ?? 0m;
+    assert.equalStr(`${a + b}`, "0.3");   // exact, no f64 drift
+}

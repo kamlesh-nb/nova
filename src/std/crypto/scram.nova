@@ -1,0 +1,158 @@
+// crypto/scram.nova — SCRAM-SHA-256 client (RFC 5802 / RFC 7677), the SASL auth
+// used by PostgreSQL and MongoDB. Built on crypto/sha's raw-byte HMAC/SHA/PBKDF2
+// and crypto/base64. The key chain works on 32-byte binary blocks throughout:
+//
+//   SaltedPassword  = PBKDF2(password, salt, i)
+//   ClientKey       = HMAC(SaltedPassword, "Client Key")
+//   StoredKey       = SHA256(ClientKey)
+//   ClientSignature = HMAC(StoredKey, AuthMessage)
+//   ClientProof     = ClientKey XOR ClientSignature      <- the `^` operator
+//   ServerKey       = HMAC(SaltedPassword, "Server Key")
+//   ServerSignature = HMAC(ServerKey, AuthMessage)
+//
+// AuthMessage = client-first-bare + "," + server-first + "," + client-final-without-proof
+
+import bytes;
+import string;
+import list;
+import crypto.sha;
+import crypto.base64;
+import assert;
+
+/// XOR two equal-length raw byte strings (the ClientProof step).
+fn xorBytes(a: string, b: string): string {
+    let n = a.length;
+    let out = bytes.alloc(n);
+    let i = 0;
+    while (i < n) {
+        bytes.write_byte(out, i, bytes.read_byte(a, i) ^ bytes.read_byte(b, i));
+        i = i + 1;
+    }
+    return out as string;
+}
+
+// ---------------------------------------------------------------------------
+// Low-level primitives — each maps 1:1 to an RFC 5802 term. `salt` is RAW bytes
+// (already base64-decoded); all block outputs are 32 RAW bytes.
+// ---------------------------------------------------------------------------
+
+pub fn saltedPassword(password: string, salt: string, iterations: int): string {
+    return sha.pbkdf2HmacSha256(password, salt, iterations, 32);
+}
+
+pub fn clientKey(saltedPw: string): string {
+    return sha.hmacSha256Raw(saltedPw, "Client Key");
+}
+
+pub fn storedKey(ck: string): string {
+    return sha.sha256Raw(ck);
+}
+
+pub fn clientSignature(sk: string, authMessage: string): string {
+    return sha.hmacSha256Raw(sk, authMessage);
+}
+
+pub fn clientProof(ck: string, cs: string): string {
+    return xorBytes(ck, cs);
+}
+
+pub fn serverKey(saltedPw: string): string {
+    return sha.hmacSha256Raw(saltedPw, "Server Key");
+}
+
+pub fn serverSignature(servKey: string, authMessage: string): string {
+    return sha.hmacSha256Raw(servKey, authMessage);
+}
+
+/// The base64 ClientProof for a completed handshake. `salt` is RAW bytes.
+pub fn computeProofB64(password: string, salt: string, iterations: int, authMessage: string): string {
+    let sp = saltedPassword(password, salt, iterations);
+    let ck = clientKey(sp);
+    let sk = storedKey(ck);
+    let cs = clientSignature(sk, authMessage);
+    return base64.encode(clientProof(ck, cs));
+}
+
+/// The base64 ServerSignature the client uses to verify the server. `salt` is RAW.
+pub fn computeServerSigB64(password: string, salt: string, iterations: int, authMessage: string): string {
+    let sp = saltedPassword(password, salt, iterations);
+    let ss = serverSignature(serverKey(sp), authMessage);
+    return base64.encode(ss);
+}
+
+// ---------------------------------------------------------------------------
+// High-level client: drives the message exchange.
+// ---------------------------------------------------------------------------
+
+/// The value after `x=` in a `x=value` attribute, or "" if it doesn't match.
+fn attrValue(part: string, key: string): string {
+    if (string.startsWith(part, key)) {
+        return string.slice(part, key.length, part.length);
+    }
+    return "";
+}
+
+pub struct ScramClient {
+    pub username: string,
+    pub password: string,
+    pub clientNonce: string,
+
+    /// "n=<user>,r=<clientNonce>" — the client-first-bare.
+    pub fn clientFirstBare(self: ScramClient): string {
+        return `n=${self.username},r=${self.clientNonce}`;
+    }
+
+    /// The full client-first-message: GS2 header "n,," + client-first-bare.
+    pub fn clientFirstMessage(self: ScramClient): string {
+        return `n,,${self.clientFirstBare()}`;
+    }
+
+    /// Given the server-first-message ("r=<combined>,s=<saltB64>,i=<iters>"), compute
+    /// the client-final-message: "c=biws,r=<combined>,p=<proof>".
+    pub fn clientFinalMessage(self: ScramClient, serverFirst: string): string {
+        let combinedNonce = "";
+        let saltB64 = "";
+        let iters = 0;
+        let parts = string.split(serverFirst, ",");
+        for (p in parts) {
+            if (string.startsWith(p, "r=")) { combinedNonce = attrValue(p, "r="); }
+            if (string.startsWith(p, "s=")) { saltB64 = attrValue(p, "s="); }
+            if (string.startsWith(p, "i=")) { iters = string.parseI64(attrValue(p, "i=")) as int; }
+        }
+        let salt = base64.decode(saltB64);
+        let clientFinalNoProof = `c=biws,r=${combinedNonce}`;
+        let authMessage = `${self.clientFirstBare()},${serverFirst},${clientFinalNoProof}`;
+        let proof = computeProofB64(self.password, salt, iters, authMessage);
+        return `${clientFinalNoProof},p=${proof}`;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — RFC 7677 §3 reference exchange (user "user", password "pencil").
+// ---------------------------------------------------------------------------
+
+const RFC_AUTH: string =
+    "n=user,r=rOprNGfwEbeRWgbNEkqO,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096,c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0";
+
+@test
+fn test_scram_rfc7677_proof(): void {
+    let salt = base64.decode("W22ZaJ0SNY7soEsUEjb6gQ==");
+    assert.equalStr(computeProofB64("pencil", salt, 4096, RFC_AUTH),
+                    "dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=");
+    assert.equalStr(computeServerSigB64("pencil", salt, 4096, RFC_AUTH),
+                    "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=");
+}
+
+@test
+fn test_scram_client_exchange(): void {
+    // The high-level client, driven exactly as in RFC 7677.
+    let c = ScramClient{
+        username: "user",
+        password: "pencil",
+        clientNonce: "rOprNGfwEbeRWgbNEkqO",
+    };
+    assert.equalStr(c.clientFirstMessage(), "n,,n=user,r=rOprNGfwEbeRWgbNEkqO");
+    let serverFirst = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
+    assert.equalStr(c.clientFinalMessage(serverFirst),
+                    "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=");
+}

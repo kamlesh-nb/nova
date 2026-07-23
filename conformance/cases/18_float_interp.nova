@@ -1,0 +1,46 @@
+// A7 / F3 §5 stage 3 (observable): number → string in interpolation. `${x}` for a
+// float used to fall through to StringBuilder_append, which dereferences its argument
+// as a Nova string pointer — so a raw double's bits were read as a char*, segfaulting
+// (F3 §10 #2). This proves ${double}, ${float} and ${long} all format correctly and
+// leak nothing (the converted temporary is released after append).
+//
+// Formatting is shortest-round-trip: the fewest digits whose text parses back to the
+// exact same double. So 3.0 prints "3", 2.5 prints "2.5", not "3.000000".
+import assert;
+
+@test
+fn test_double_interp_whole(): void {
+    let x = 3.0;
+    assert.equalStr(`${x}`, "3");
+}
+
+@test
+fn test_double_interp_fraction(): void {
+    let x = 2.5;
+    assert.equalStr(`${x}`, "2.5");
+}
+
+@test
+fn test_double_interp_arith(): void {
+    // The classic float-div-not-int-div value, straight into interpolation.
+    let m = 10.0 / 4.0;              // 2.5
+    assert.equalStr(`val=${m}`, "val=2.5");
+}
+
+@test
+fn test_double_interp_negative(): void {
+    let x = 0.0 - 1.25;
+    assert.equalStr(`${x}`, "-1.25");
+}
+
+@test
+fn test_long_interp(): void {
+    let n: long = 5000000000;        // > 2^31, would truncate under __i32_to_string
+    assert.equalStr(`${n}`, "5000000000");
+}
+
+@test
+fn test_float_interp(): void {
+    let f: float = 1.5;
+    assert.equalStr(`${f}`, "1.5");
+}

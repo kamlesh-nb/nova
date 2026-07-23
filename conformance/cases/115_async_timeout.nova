@@ -1,0 +1,75 @@
+// A1 async-first seam: awaited-deadline recv timeouts. `setTimeout(ms)` on an AsyncStream bounds
+// every subsequent `recvInto` to `ms` milliseconds — the recv is raced against a timer (asio),
+// and if the deadline elapses first `recvInto` returns -2 instead of parking forever. This is the
+// non-blocking analog of the old blocking SO_RCVTIMEO seam, and it is what makes a DB
+// `Connection.setTimeout(ms)` real on the async transport (a hung server surfaces a timeout, not a
+// stuck coroutine). Self-contained + deterministic: a listening socket with NO writer never sends,
+// so a bounded recv MUST hit its deadline; a real reply under a generous deadline MUST arrive.
+import assert;
+import bytes;
+import string;
+import net.asyncio;
+
+fn toStr(buf: ptr, n: int): string {
+    if (n <= 0) { return ""; }
+    let out = bytes.alloc(n);
+    let i = 0;
+    while (i < n) { bytes.write_byte(out, i, bytes.read_byte(buf, i)); i = i + 1; }
+    return out as string;
+}
+
+// A silent peer: the port is listening (so connect succeeds via the kernel backlog) but nothing
+// is ever accepted or written — so a bounded recv can only end at its deadline.
+async fn recvWithDeadline(port: int, ms: int): int {
+    let srv = asyncio.serverListen(port);
+    if (srv == 0) { return -99; }
+    let s = await asyncio.asyncConnect("127.0.0.1", port);
+    let t = s.setTimeout(ms);                 // bound every recvInto to `ms`
+    let buf = bytes.alloc(32);
+    let n = await s.recvInto(buf as int, 32);  // no data ever arrives -> deadline fires
+    s.close();
+    asyncio.aclose(srv);
+    return n;
+}
+
+@test
+fn test_recv_deadline_fires(): void {
+    // 80ms deadline against a silent peer -> -2 (timed out), not a parked-forever coroutine.
+    assert.equalInt(recvWithDeadline(18601, 80), -2);
+}
+
+// Control: a real reply that arrives well within a generous deadline is delivered normally.
+async fn serveReply(srv: long): int {
+    let client = await asyncio.aaccept(srv);
+    let b = asyncio.AsyncStream(client);
+    let w = await b.sendStr("HI");
+    b.close();
+    return w;
+}
+async fn recvBeforeDeadline(port: int): string {
+    let srv = asyncio.serverListen(port);
+    if (srv == 0) { return "BIND-FAIL"; }
+    spawn serveReply(srv);
+    let s = await asyncio.asyncConnect("127.0.0.1", port);
+    let t = s.setTimeout(5000);               // generous 5s deadline
+    let buf = bytes.alloc(32);
+    let n = await s.recvInto(buf as int, 32);  // "HI" arrives quickly -> n = 2, no timeout
+    s.close();
+    asyncio.aclose(srv);
+    return toStr(buf, n);
+}
+
+@test
+fn test_data_before_deadline_delivered(): void {
+    assert.equalStr(recvBeforeDeadline(18603), "HI");
+}
+
+@test
+fn test_setTimeout_clears(): void {
+    // setTimeout(0) clears a previously-set deadline.
+    let s = asyncio.AsyncStream(0);
+    let a = s.setTimeout(500);
+    assert.equalInt(s.timeoutMs, 500);
+    let b = s.setTimeout(0);
+    assert.equalInt(s.timeoutMs, 0);
+}

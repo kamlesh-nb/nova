@@ -1,0 +1,35 @@
+// request_id.nova — Request ID tracing middleware
+import web.request;
+import web.response;
+import web.middleware;
+import datetime;
+
+pub struct RequestIdMiddleware impl Middleware {
+    pub headerName: string,
+    pub counter: int,
+
+    init() {
+        self.headerName = "X-Request-Id";
+        self.counter = 0;
+    }
+
+    pub fn execute(self: RequestIdMiddleware, req: request.Request, res: response.Response): MiddlewareAction {
+        let existing = req.headers.get(self.headerName) ?? req.headers.get("x-request-id") ?? "";
+
+        let id = "";
+        if (existing != "") {
+            id = existing;
+        } else {
+            self.counter = self.counter + 1;
+            let ts = datetime.now();
+            id = `req-${ts}-${self.counter}`;
+        }
+
+        req.headers.set(self.headerName, id);
+        res.setHeader(self.headerName, id);
+        return MiddlewareAction.Next;
+    }
+
+    pub fn after(self: RequestIdMiddleware, req: request.Request, res: response.Response, matched: MatchedRoute): void {
+    }
+}

@@ -1,0 +1,98 @@
+// actor.nova — the actor model over Nova's coroutines + async channels (A1).
+//
+// An actor is a coroutine that owns some state and processes messages from a MAILBOX one at a time.
+// Because exactly one coroutine ever touches the state, and it handles one message to completion
+// before the next, actor state needs no locks — sequential processing IS the concurrency model.
+//
+//   struct Counter impl Behavior<int> {
+//       pub total: int,
+//       init() { self.total = 0; }
+//       async fn receive(self: Counter, msg: int): void { self.total = self.total + msg; }
+//   }
+//   let mbox = Mailbox<int>();
+//   let cell = ActorCell<int>(mbox, Counter());
+//   spawn cell.run();                   // the actor loop, concurrent
+//   mbox.send(5); mbox.send(3);         // fire-and-forget; delivered in order
+//   mbox.stop();                        // drain + shut down
+//
+// The mailbox is a `List<M>` (so message ARC is handled correctly per message type) plus an async
+// channel used purely as a WAKEUP signal — one send per enqueued message, and a `0` sentinel to
+// stop. This is the cooperative-scheduler actor: send + the loop's dequeue never interleave
+// mid-operation (a coroutine runs until it awaits), so the mailbox needs no lock.
+import list;
+import concurrency.asyncchan;
+
+// How an actor handles ONE message. Implement `receive` on your actor struct; it may `await`
+// (call other actors, do async I/O) — the actor won't process the next message until it returns.
+pub trait Behavior<M> {
+    async fn receive(self, msg: M): void;
+}
+
+// The message queue + wakeup channel an actor reads from, and senders write to.
+pub struct Mailbox<M> {
+    pub queue: List<M>,
+    pub signal: long,     // async channel: one send (value 1) per message; 0 = stop sentinel
+    init() {
+        self.queue = List<M>();
+        self.signal = asyncchan.chanNew();
+    }
+
+    // Enqueue a message (non-blocking) and wake the actor. Delivery is FIFO.
+    pub fn send(self: Mailbox<M>, msg: M): void {
+        self.queue.push(msg);
+        asyncchan.chanSend(self.signal, 1);
+    }
+
+    // Ask the actor to stop once it has drained the messages already sent. Do not `send` after this.
+    pub fn stop(self: Mailbox<M>): void {
+        asyncchan.chanSend(self.signal, 0);
+    }
+}
+
+// An actor bound to its mailbox: the state (mailbox + behavior) an actor coroutine owns, with the
+// drain loop as its own async METHOD. Constructing an `ActorCell` and spawning `.run()` is the
+// primary way to start an actor — the cell co-owns both the mailbox (senders still hold their own
+// handle to it) and the behavior (a generic-trait object stored in a field), so nothing the loop
+// touches can be freed while the spawned coroutine is still running.
+//
+//   let counter = Counter();
+//   let mbox = Mailbox<int>();
+//   let cell = ActorCell<int>(mbox, counter);      // the cell owns mailbox + behavior
+//   let running = spawn cell.run();                // the actor loop, concurrent
+//   mbox.send(5); mbox.send(3);                    // senders keep using their own mbox handle
+//   mbox.stop();
+//   let processed = await running;
+pub struct ActorCell<M> {
+    pub mbox: Mailbox<M>,
+    pub behavior: Behavior<M>,     // the handler — a generic-trait object, dispatched per message
+    init(mbox: Mailbox<M>, behavior: Behavior<M>) {
+        self.mbox = mbox;
+        self.behavior = behavior;
+    }
+
+    // The actor loop: wake on each signal, dequeue one message, hand it to `behavior.receive`
+    // (awaited, so processing is strictly sequential), until the stop sentinel. Returns the number
+    // of messages processed. This is a GENERIC async method that AWAITS a trait dispatch on a
+    // generic-trait FIELD (`self.behavior.receive`) — the pattern that the generic-trait-field fix
+    // (gate 120) unblocked. `spawn cell.run()` runs it concurrently.
+    pub async fn run(self: ActorCell<M>): int {
+        let processed = 0;
+        while (true) {
+            let sig = await asyncchan.chanRecv(self.mbox.signal);
+            if (sig == 0) { break; }             // stop (queued messages before it are drained first)
+            if (self.mbox.queue.size() > 0) {
+                let msg = self.mbox.queue.at(0);
+                self.mbox.queue.remove(0);
+                await self.behavior.receive(msg);
+                processed = processed + 1;
+            }
+        }
+        return processed;
+    }
+}
+
+// NOTE — there is deliberately NO `runActor(mbox, behavior)` free-fn wrapper. Such a wrapper would
+// call `cell.run()` from a GENERIC (erased-M) context, and an erased generic async-METHOD body does
+// not survive CoroSplit (its `.resume`/`.destroy` are never emitted → a link error). A CONCRETE
+// `spawn cell.run()` routes to the monomorphized `ActorCell_i32_run`, which splits fine — so the
+// method IS the entry point. Bind an `ActorCell<M>` and spawn its `run()` directly.

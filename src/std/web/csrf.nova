@@ -1,0 +1,62 @@
+// csrf.nova — CSRF Protection Middleware
+import web.request;
+import web.response;
+import web.middleware;
+import web.status;
+import string;
+
+pub struct CsrfMiddleware impl Middleware {
+    pub headerName: string,
+    pub formField: string,
+
+    init() {
+        self.headerName = "X-CSRF-Token";
+        self.formField = "_csrf";
+    }
+
+    pub fn execute(self: CsrfMiddleware, req: request.Request, res: response.Response): MiddlewareAction {
+        if (req.method == "GET" || req.method == "HEAD" || req.method == "OPTIONS") {
+            let token = req.headers.get("X-Session-CSRF") ?? "";
+            if (token != "") {
+                res.setHeader(self.headerName, token);
+            }
+            return MiddlewareAction.Next;
+        }
+
+        let expected = req.headers.get("X-Session-CSRF") ?? "";
+        if (expected == "") {
+            return MiddlewareAction.Next; // No session active orelse CSRF not required
+        }
+
+        let clientToken = req.headers.get(self.headerName) ?? getFormField(req.body, self.formField);
+        if (clientToken == "" || clientToken != expected) {
+            res.status = Status.Forbidden;
+            res.body = "{\"error\":\"CSRF token validation failed\"}";
+            return MiddlewareAction.Stop;
+        }
+
+        res.setHeader(self.headerName, expected);
+        return MiddlewareAction.Next;
+    }
+
+    pub fn after(self: CsrfMiddleware, req: request.Request, res: response.Response, matched: MatchedRoute): void {
+    }
+}
+
+fn getFormField(body: string, name: string): string {
+    if (body.length == 0) return "";
+    let pairs = string.split(body, "&");
+    let i = 0;
+    while (i < pairs.len) {
+        let pair = pairs.get(i);
+        let eq = string.indexOf(pair, "=");
+        if (eq != -1) {
+            let key = string.slice(pair, 0, eq);
+            if (key == name) {
+                return string.slice(pair, eq + 1, pair.length);
+            }
+        }
+        i = i + 1;
+    }
+    return "";
+}

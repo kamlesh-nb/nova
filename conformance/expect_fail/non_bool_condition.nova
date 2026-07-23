@@ -1,0 +1,11 @@
+// NEGATIVE test: must FAIL to compile.
+// An if/while condition must be a bool, not an integer (A3 — resolver now types
+// comparisons as bool, so a bare int condition is caught).
+import assert;
+
+@test
+fn t(): void {
+    if (42) {
+        assert.isTrue(true);
+    }
+}

@@ -1,0 +1,30 @@
+// specs §3.1 / Stage 3: BSON decimal128 (type 0x13). A `decimal`'s 16 BID bytes ARE the BSON wire
+// format, so `bytes.write_decimal`/`read_decimal` and `bson.entryDecimal` round-trip it with no
+// conversion — the MongoDB-driver hook. Must be leak-free under --arc and clean under --asan.
+import assert;
+import bytes;
+import list;
+import serde.bson;
+
+@test
+fn test_decimal_bytes_roundtrip(): void {
+    // The raw primitive: decimal -> 16 bytes -> decimal, exact.
+    let a: decimal = 3.14159m;
+    let buf: ptr = bytes.alloc(32);
+    bytes.write_decimal(buf, 4, a);
+    let b: decimal = bytes.read_decimal(buf, 4);
+    assert.equalStr(`${b}`, "3.14159");
+    bytes.free(buf);
+}
+
+@test
+fn test_bson_document_decimal(): void {
+    // The high-level hook: a decimal128 field serialized into a BSON document.
+    let doc: bson.BsonDocument = bson.BsonDocument{ entries: List<bson.BsonEntry>() };
+    doc.entries.push(bson.entryDecimal("price", 9.99m));
+    let wire: ptr = bson.serialize(doc);
+    assert.equalInt(bytes.read_byte(wire, 4), 19);      // BSON type 0x13
+    let back: decimal = bytes.read_decimal(wire, 11);   // [4 size][1 type]["price\0"=6] -> 11
+    assert.equalStr(`${back}`, "9.99");
+    bytes.free(wire);
+}

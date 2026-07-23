@@ -1,0 +1,94 @@
+// session.nova — Generic Session Store and Middleware
+import map;
+import string;
+import datetime;
+import web.request;
+import web.response;
+import web.middleware;
+
+pub struct Session {
+    pub id: string,
+    pub data: Map<string, string>,
+    pub expiresAt: int,
+}
+
+pub struct SessionStore {
+    pub sessions: Map<string, Session>,
+    pub defaultTtl: int,
+    pub counter: int,
+
+    init() {
+        self.sessions = Map<string, Session>(16, string.hash);
+        self.defaultTtl = 604800; // 7 days in seconds
+        self.counter = 0;
+    }
+
+    pub fn createSession(self: SessionStore): Session {
+        self.counter = self.counter + 1;
+        let ts = datetime.now();
+        let id = `sess-${ts}-${self.counter}`;
+
+        let sess = Session{
+            id: id,
+            data: Map<string, string>(16, string.hash),
+            expiresAt: ts + self.defaultTtl,
+        };
+        self.sessions.set(id, sess);
+        return sess;
+    }
+
+    pub fn getSession(self: SessionStore, id: string): Session {
+        let ts = datetime.now();
+        let sess = self.sessions.get(id);
+        if (sess != undefined) {
+            if (ts > sess.expiresAt) {
+                self.sessions.delete_key(id); // expired!
+                return undefined;
+            }
+            // Touch/extend TTL
+            sess.expiresAt = ts + self.defaultTtl;
+            return sess;
+        }
+        return undefined;
+    }
+
+    pub fn destroySession(self: SessionStore, id: string): void {
+        self.sessions.delete_key(id);
+    }
+}
+
+pub struct SessionMiddleware impl Middleware {
+    pub store: SessionStore,
+    pub cookieName: string,
+
+    init(store: SessionStore) {
+        self.store = store;
+        self.cookieName = "session_id";
+    }
+
+    pub fn execute(self: SessionMiddleware, req: request.Request, res: response.Response): MiddlewareAction {
+        let sid = req.getCookie(self.cookieName) ?? "";
+        
+        let sess = self.store.getSession(sid);
+        if (sess == undefined) {
+            sess = self.store.createSession();
+            res.setCookie(self.cookieName, sess.id);
+        }
+
+        // Put active session ID to request headers so subsequent code/csrf check has access to it!
+        req.headers.set("X-Session-ID", sess.id);
+
+        // Put CSRF token generated for this session to request headers (e.g. if one doesn't exist, generate one)
+        let csrfToken = sess.data.get("csrf_token") ?? "";
+        if (csrfToken == "") {
+            sess.data.set("csrf_token", "csrf-" + sess.id);
+            csrfToken = "csrf-" + sess.id;
+        }
+        req.headers.set("X-Session-CSRF", csrfToken);
+
+        return MiddlewareAction.Next;
+    }
+
+    pub fn after(self: SessionMiddleware, req: request.Request, res: response.Response, matched: MatchedRoute): void {
+    }
+}

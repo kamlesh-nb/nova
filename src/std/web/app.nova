@@ -1,0 +1,614 @@
+// app.nova — Minimal-API web framework, MediatR-style, on async sockets.
+//
+//   let app = App();
+//   app.handle<GetUser>(GetUserHandler{});         // register a handler for the GetUser request
+//   app.get<GetUser>("/api/user/{id:int}");        // route: GET this path -> GetUser
+//   app.run(8080);
+//
+// Three responsibilities, cleanly separated (SRP):
+//   - get<T>/post<T>/... : REGISTRATION only. Record (method, path, type key). No dispatch.
+//   - App.dispatch(req)  : the ONE request→Response site. Match route -> mediator.send(key, src).
+//   - handler.handle(src): binds the request itself (visible, debuggable) and returns a Response.
+//
+// AppRoute and handler are linked by the request TYPE, not by a reference — that decoupling is what
+// makes this MediatR rather than Express-with-callbacks. The only compiler assist is
+// `serde.typeName<T>()`, which yields the type's name so the route key and the handler
+// registration agree by type instead of a hand-typed string.
+//
+// Depends on the trait-dispatch foundation (traits as values) and method monomorphization
+// (get<T> is a real generic method) — see conformance/cases/12_traits_dispatch.nova and
+// 68_generic_method_mono.nova.
+
+import net.asyncio;
+import web.request;
+import web.response;
+import web.status;
+import web.url;
+import web.multipart;
+import serde.source;
+import web.static_content;
+import string;
+import list;
+import map;
+import bytes;
+
+// The request model + parser is `web/request.nova`'s `Request` (method, path, query/headers/cookies
+// as parsed Maps, body, `fromString`/`getHeader`/`getCookie`). This file used to carry its own
+// weaker `HttpRequest` + `parseRequest` + `headerValue` — deleted; one request model for the whole
+// framework.
+
+// ===========================================================================
+// MessageHandler / AppMediator — the MediatR core (IRequestHandler), string-keyed by request type.
+// ===========================================================================
+
+/// Handles a request (IRequestHandler<TReq, Response>). The handler receives the raw request
+/// `ValueSource` and does its OWN binding — `GetUser{ id: src.getInt("id") }` — so binding is
+/// ordinary, VISIBLE, debuggable Nova you can step, log, and validate. No hidden compiler binder,
+/// no reflection, no `any` downcast.
+pub trait MessageHandler {
+    fn handle(self: MessageHandler, src: ValueSource): response.Response;
+}
+
+pub struct AppMediator {
+    pub handlers: Map<string, MessageHandler>,
+
+    init() {
+        self.handlers = Map<string, MessageHandler>(32, string.hash);
+    }
+
+    pub fn register(self: AppMediator, key: string, handler: MessageHandler): void {
+        self.handlers.set(key, handler);
+    }
+
+    // Resolve the handler for `key` (the request type name) and run it with the raw source.
+    // The handler binds and returns the Response — this is the one request→Response dispatch site.
+    pub fn send(self: AppMediator, key: string, src: ValueSource): response.Response {
+        let handler = self.handlers.get(key);
+        if (handler == undefined) {
+            return response.Response(Status.NotFound, "No handler for request: " + key);
+        }
+        return handler.handle(src);
+    }
+}
+
+// ===========================================================================
+// Router — {name:type} pattern segments with match-time coercion.
+// ===========================================================================
+pub struct Seg {
+    pub is_param: bool,
+    pub text: string,   // static text, or param name
+    pub ptype: string,  // "int" | "string" (params only)
+
+    init(is_param: bool, text: string, ptype: string) {
+        self.is_param = is_param;
+        self.text = text;
+        self.ptype = ptype;
+    }
+}
+
+pub struct AppRoute {
+    pub method: string,
+    pub segs: List<Seg>,
+    // The mediator key — the request type's name (`serde.typeName<TReq>()`). A AppRoute is PLAIN DATA:
+    // it maps method+path to a request type. It holds no handler and no dispatch logic; the handler
+    // is resolved from the mediator by this key at request time (`App.dispatch`).
+    pub key: string,
+
+    init(method: string, segs: List<Seg>, key: string) {
+        self.method = method;
+        self.segs = segs;
+        self.key = key;
+    }
+}
+
+fn parsePattern(path: string): List<Seg> {
+    let segs = List<Seg>();
+    let parts = string.split(path, "/");
+    let n = parts.size();
+    let i = 0;
+    while (i < n) {
+        let p = parts.get(i) ?? "";
+        if (p != "") {
+            if (string.startsWith(p, "{") && string.endsWith(p, "}")) {
+                let inner = string.slice(p, 1, p.length - 1);
+                let colon = string.indexOf(inner, ":");
+                if (colon == -1) {
+                    segs.push(Seg(true, inner, "string"));
+                } else {
+                    let nm = string.slice(inner, 0, colon);
+                    let ty = string.slice(inner, colon + 1, inner.length);
+                    segs.push(Seg(true, nm, ty));
+                }
+            } else {
+                segs.push(Seg(false, p, ""));
+            }
+        }
+        i = i + 1;
+    }
+    return segs;
+}
+
+fn pathSegs(path: string): List<string> {
+    let out = List<string>();
+    let parts = string.split(path, "/");
+    let n = parts.size();
+    let i = 0;
+    while (i < n) {
+        let p = parts.get(i) ?? "";
+        if (p != "") { out.push(p); }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn isAllDigits(s: string): bool {
+    let n = s.length;
+    if (n == 0) { return false; }
+    let i = 0;
+    while (i < n) {
+        let c = s[i];
+        if (c < 48 || c > 57) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ===========================================================================
+// Response helpers.
+// ===========================================================================
+pub fn text(body: string): response.Response {
+    let r = response.Response(Status.Ok, body);
+    r.setHeader("Content-Type", "text/plain; charset=utf-8");
+    return r;
+}
+
+pub fn json(body: string): response.Response {
+    let r = response.Response(Status.Ok, body);
+    r.setHeader("Content-Type", "application/json");
+    return r;
+}
+
+pub fn html(body: string): response.Response {
+    let r = response.Response(Status.Ok, body);
+    r.setHeader("Content-Type", "text/html; charset=utf-8");
+    return r;
+}
+
+// ===========================================================================
+// MultiMapSource — a flat string->[values] ValueSource, used for both
+// application/x-www-form-urlencoded and multipart/form-data bodies (repeated keys
+// become arrays). Files (multipart) are exposed as their raw data string for now.
+// ===========================================================================
+pub struct MultiMapSource impl ValueSource {
+    pub fields: Map<string, List<string>>,
+
+    init(fields: Map<string, List<string>>) { self.fields = fields; }
+
+    pub fn getString(self: MultiMapSource, key: string): string {
+        let l = self.fields.get(key);
+        if (l == undefined) { return ""; }
+        return (l ?? List<string>()).get(0) ?? "";
+    }
+    pub fn getInt(self: MultiMapSource, key: string): long { return string.parseI64(self.getString(key)); }
+    pub fn getBool(self: MultiMapSource, key: string): bool { return string.eql(self.getString(key), "true"); }
+    pub fn getFloat(self: MultiMapSource, key: string): double { return string.parseFloat(self.getString(key)); }
+    pub fn getDecimal(self: MultiMapSource, key: string): decimal { return decimal.fromString(self.getString(key)); }
+    pub fn getChild(self: MultiMapSource, key: string): ValueSource {
+        return MultiMapSource(Map<string, List<string>>(2, string.hash));
+    }
+    pub fn has(self: MultiMapSource, key: string): bool {
+        let l = self.fields.get(key);
+        if (l == undefined) { return false; }
+        return true;
+    }
+    pub fn arrayLen(self: MultiMapSource, key: string): int {
+        let l = self.fields.get(key);
+        if (l == undefined) { return 0; }
+        return (l ?? List<string>()).size();
+    }
+    pub fn itemString(self: MultiMapSource, key: string, i: int): string {
+        let l = self.fields.get(key);
+        if (l == undefined) { return ""; }
+        return (l ?? List<string>()).get(i) ?? "";
+    }
+    pub fn itemInt(self: MultiMapSource, key: string, i: int): long { return string.parseI64(self.itemString(key, i)); }
+    pub fn itemDecimal(self: MultiMapSource, key: string, i: int): decimal { return decimal.fromString(self.itemString(key, i)); }
+    pub fn itemChild(self: MultiMapSource, key: string, i: int): ValueSource {
+        return MultiMapSource(Map<string, List<string>>(2, string.hash));
+    }
+}
+
+fn mmPush(m: Map<string, List<string>>, key: string, val: string): void {
+    let existing = m.get(key);
+    if (existing == undefined) {
+        let lst = List<string>();
+        lst.push(val);
+        m.set(key, lst);
+    } else {
+        (existing ?? List<string>()).push(val);
+    }
+}
+
+/// application/x-www-form-urlencoded body -> ValueSource.
+pub fn formSource(body: string): MultiMapSource {
+    let m = Map<string, List<string>>(16, string.hash);
+    if (body != "") {
+        let pairs = string.split(body, "&");
+        let i = 0;
+        while (i < pairs.size()) {
+            let pair = pairs.get(i) ?? "";
+            if (pair != "") {
+                let eq = string.indexOf(pair, "=");
+                if (eq == -1) {
+                    mmPush(m, url.decode(pair), "");
+                } else {
+                    mmPush(m, url.decode(string.slice(pair, 0, eq)), url.decode(string.slice(pair, eq + 1, pair.length)));
+                }
+            }
+            i = i + 1;
+        }
+    }
+    return MultiMapSource(m);
+}
+
+/// multipart/form-data body -> ValueSource (text fields + file data by name).
+pub fn multipartSource(contentType: string, body: string): MultiMapSource {
+    let m = Map<string, List<string>>(16, string.hash);
+    let parts = multipart.parseMultipart(contentType, body);
+    let i = 0;
+    while (i < parts.size()) {
+        let p = parts.get(i) ?? multipart.Part{ name: "", filename: "", contentType: "", data: "" };
+        mmPush(m, p.name, p.data);
+        i = i + 1;
+    }
+    return MultiMapSource(m);
+}
+
+// ===========================================================================
+// App — facade + async serve loop.
+// ===========================================================================
+pub struct App {
+    pub routes: List<AppRoute>,
+    pub mediator: AppMediator,
+    pub static_mounts: List<static_content.StaticMount>,
+    // Response cache: path -> fully-serialized response bytes, for GET paths marked cacheable.
+    pub cache: Map<string, string>,
+    pub cacheable: Map<string, bool>,
+
+    init() {
+        self.routes = List<AppRoute>();
+        self.mediator = AppMediator();
+        self.static_mounts = List<static_content.StaticMount>();
+        self.cache = Map<string, string>(16, string.hash);
+        self.cacheable = Map<string, bool>(16, string.hash);
+    }
+
+    /// Mark a GET path as cacheable: after the first request, its FULLY-SERIALIZED response bytes
+    /// are memoized and served directly on subsequent requests — skipping route matching, mediator
+    /// dispatch, and serialization. Use ONLY for responses that do not vary by request (static
+    /// payloads, precomputed content). Dynamic/per-user responses must NOT be cached this way.
+    pub fn enableCache(self: App, path: string): void {
+        self.cacheable.set(path, true);
+    }
+
+    /// Response-cache lookup for a GET `path` — returns a fresh COPY of the memoized bytes, or
+    /// undefined on a miss. The copy keeps ownership trivial (the map keeps its entry; the caller
+    /// owns the return). The server's zero-copy loop extracts `path` straight from the receive
+    /// buffer, so a HIT never builds the request string or touches Request.fromString.
+    pub fn cachedCopy(self: App, path: string): string | undefined {
+        let hit = self.cache.get(path);
+        if (hit != undefined) {
+            let hv = hit ?? "";
+            return string.slice(hv, 0, hv.length);
+        }
+        return undefined;
+    }
+
+    /// The MISS path: parse the (already-materialized) request, dispatch, serialize, and — for a
+    /// cacheable GET — store a copy for next time. `method`/`path` are passed in (the server already
+    /// extracted them from the buffer) so we don't re-derive them.
+    pub fn respondMiss(self: App, raw: string, method: string, path: string): string {
+        let req = request.Request.fromString(raw);
+        let resp = self.dispatch(req);
+        let out = resp.serialize();
+        if (string.eql(method, "GET")) {
+            if (self.cacheable.get(path) != undefined) {
+                self.cache.set(path, string.slice(out, 0, out.length));
+            }
+        }
+        return out;
+    }
+
+    /// Serve static files under `prefix` from the filesystem `dir`, fronted by an LRU cache
+    /// (default 128 entries). GET requests that match no route fall through to these mounts.
+    ///
+    ///     app.useStatic("/static", "./wwwroot");
+    pub fn useStatic(self: App, prefix: string, dir: string): void {
+        self.static_mounts.push(static_content.StaticMount(prefix, dir, 128));
+    }
+
+    /// Register a handler for the request type `TReq` (MediatR IRequestHandler). The mediator key
+    /// is the type name, reified by the compiler via `serde.typeName<TReq>` — the SAME key
+    /// `get<TReq>`/`post<TReq>` dispatch to, so registration and routing always agree.
+    ///
+    ///     app.handle<GetUser>(GetUserHandler{});
+    pub fn handle<TReq>(self: App, handler: MessageHandler): void {
+        self.mediator.register(serde.typeName<TReq>(), handler);
+    }
+
+    // Verb methods do ONE thing: register a route (method + path) for the request type `TReq`. No
+    // dispatch, no binding, no send — just data. Each is a REAL generic method the compiler
+    // monomorphizes per TReq, so `serde.typeName<TReq>()` reifies the type name — the route key that
+    // matches the handler registered by `handle<TReq>`. The request→Response flow lives entirely in
+    // `dispatch` (below) and the handler.
+    pub fn get<TReq>(self: App, path: string): void {
+        self.routes.push(AppRoute("GET", parsePattern(path), serde.typeName<TReq>()));
+    }
+    pub fn post<TReq>(self: App, path: string): void {
+        self.routes.push(AppRoute("POST", parsePattern(path), serde.typeName<TReq>()));
+    }
+    pub fn put<TReq>(self: App, path: string): void {
+        self.routes.push(AppRoute("PUT", parsePattern(path), serde.typeName<TReq>()));
+    }
+    pub fn delete<TReq>(self: App, path: string): void {
+        self.routes.push(AppRoute("DELETE", parsePattern(path), serde.typeName<TReq>()));
+    }
+    pub fn patch<TReq>(self: App, path: string): void {
+        self.routes.push(AppRoute("PATCH", parsePattern(path), serde.typeName<TReq>()));
+    }
+
+    // Build the ValueSource for a request: JSON/form/multipart body for POST/PUT/PATCH, else the flat
+    // route-param source (GET/DELETE).
+    fn sourceFor(self: App, req: Request, params: Map<string, string>): ValueSource {
+        if (string.eql(req.method, "POST") || string.eql(req.method, "PUT") || string.eql(req.method, "PATCH")) {
+            let contentType = req.getHeader("content-type") ?? "";
+            let ct = string.toLowerCase(contentType);
+            if (string.indexOf(ct, "multipart/form-data") != -1) {
+                return multipartSource(contentType, req.body);
+            }
+            if (string.indexOf(ct, "x-www-form-urlencoded") != -1) {
+                return formSource(req.body);
+            }
+            return source.fromJson(req.body);
+        }
+        return source.ParamSource(params);
+    }
+
+    pub fn dispatch(self: App, req: Request): response.Response {
+        let segs = pathSegs(req.path);
+        let nseg = segs.size();
+        let nroutes = self.routes.size();
+        let path_matched = false;
+        let r = 0;
+        while (r < nroutes) {
+            let route = self.routes.at(r);
+            if (route.segs.size() == nseg) {
+                let params = Map<string, string>(8, string.hash);
+                let ok = true;
+                let typed_bad = false;
+                let i = 0;
+                while (i < nseg) {
+                    let pat = route.segs.at(i);
+                    let val = segs.get(i) ?? "";
+                    if (pat.is_param) {
+                        if (string.eql(pat.ptype, "int") && !isAllDigits(val)) {
+                            typed_bad = true;
+                            ok = false;
+                        } else {
+                            params.set(pat.text, val);
+                        }
+                    } else if (!string.eql(pat.text, val)) {
+                        ok = false;
+                    }
+                    i = i + 1;
+                }
+                if (ok) {
+                    path_matched = true;
+                    if (string.eql(route.method, req.method)) {
+                        // The one request→Response site: build the source, resolve the handler by the
+                        // route's type key, run it. `send` is HERE, once — not in the verb methods.
+                        let src = self.sourceFor(req, params);
+                        return self.mediator.send(route.key, src);
+                    }
+                } else if (typed_bad && string.eql(route.method, req.method)) {
+                    return response.Response(Status.BadRequest, "Bad Request: invalid path parameter");
+                }
+            }
+            r = r + 1;
+        }
+        if (path_matched) {
+            return response.Response(Status.MethodNotAllowed, "Method Not Allowed");
+        }
+        // No API route matched. For GET, try the static mounts (each serves under its URL
+        // prefix from disk + LRU cache); the first that produces a Response wins.
+        if (string.eql(req.method, "GET")) {
+            let m = 0;
+            let nm = self.static_mounts.size();
+            while (m < nm) {
+                let mount = self.static_mounts.at(m);
+                let served = mount.serve(req.path);
+                if (served != undefined) {
+                    return served ?? response.Response(Status.NotFound, "Not Found");
+                }
+                m = m + 1;
+            }
+        }
+        return response.Response(Status.NotFound, "Not Found");
+    }
+
+    pub fn run(self: App, port: int): void {
+        runServer(self, port);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Zero-copy framing helpers — operate DIRECTLY on the receive buffer (a raw address `buf`, a `long`
+// so pointer arithmetic stays 64-bit; `int` would TRUNCATE the address to 32 bits) via
+// bytes.read_byte / bytes.read_string, so the server loop can frame a request and look up the
+// response cache WITHOUT copying the request into a Nova string. On a cache hit the only string built
+// is the small `path` key; the full request is materialized only on a MISS.
+// ---------------------------------------------------------------------------
+
+// ASCII lowercase of one byte (for case-insensitive header-name matching on raw bytes).
+fn lowerByte(b: int): int {
+    if (b >= 65 && b <= 90) { return b + 32; }
+    return b;
+}
+
+// Offset of the CRLFCRLF header terminator in buf[start, end), or -1.
+fn bufFindHeaderEnd(buf: long, start: int, end: int): int {
+    let i = start;
+    while (i + 4 <= end) {
+        if (bytes.read_byte(buf, i) == 13 && bytes.read_byte(buf, i + 1) == 10 &&
+            bytes.read_byte(buf, i + 2) == 13 && bytes.read_byte(buf, i + 3) == 10) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Case-insensitive search for `needle` (already lowercase) in buf[start, end); returns its offset or -1.
+fn bufFindCI(buf: long, start: int, end: int, needle: string): int {
+    let nlen = needle.length;
+    if (nlen == 0) { return start; }
+    let i = start;
+    while (i + nlen <= end) {
+        let j = 0;
+        let matched = true;
+        while (j < nlen) {
+            if (lowerByte(bytes.read_byte(buf, i + j)) != (needle[j] as int)) { matched = false; break; }
+            j = j + 1;
+        }
+        if (matched) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Content-Length value from the header bytes in buf[start, hdrEnd); 0 if absent.
+fn bufContentLength(buf: long, start: int, hdrEnd: int): int {
+    let idx = bufFindCI(buf, start, hdrEnd, "content-length:");
+    if (idx == -1) { return 0; }
+    let p = idx + 15;
+    while (p < hdrEnd && bytes.read_byte(buf, p) == 32) { p = p + 1; }
+    let n = 0;
+    while (p < hdrEnd) {
+        let c = bytes.read_byte(buf, p);
+        if (c < 48 || c > 57) { break; }
+        n = n * 10 + (c - 48);
+        p = p + 1;
+    }
+    return n;
+}
+
+// Extract (method, path) from the request line in buf[0, len) — building only two small strings,
+// stripping any query. read_string(buf + off, k) copies `k` bytes from `buf + off` (64-bit add).
+fn bufMethodPath(buf: long, len: int): (string, string) {
+    let sp1 = -1;
+    let i = 0;
+    while (i < len) {
+        if (bytes.read_byte(buf, i) == 32) { sp1 = i; break; }
+        i = i + 1;
+    }
+    if (sp1 == -1) { return ("", ""); }
+    let method = bytes.read_string(buf, sp1);          // [0, sp1)
+    let ps = sp1 + 1;
+    let pe = ps;
+    while (pe < len) {
+        let c = bytes.read_byte(buf, pe);
+        if (c == 32 || c == 63) { break; }             // space or '?'
+        pe = pe + 1;
+    }
+    let path = bytes.read_string(buf + ps, pe - ps);
+    return (method, path);
+}
+
+async fn handleConn(app: App, client: long): int {
+    let cap = 65536;
+    let buf: long = bytes.alloc(cap);        // `long`: pointer arithmetic (buf + off) must stay 64-bit
+    // Zero-copy framing: bytes accumulate in `buf` (valid range [0, len)); requests are framed by
+    // scanning those bytes, never by building intermediate strings. HTTP/1.1 keep-alive — serve on
+    // this socket until the peer closes it or sends `Connection: close`. Leftover bytes past a request
+    // (a pipelined next request, or the next request arriving in the same read) are shifted to the
+    // front for the next iteration.
+    let len = 0;
+    let alive = true;
+    while (alive) {
+        // Accumulate until the full header block is present.
+        let hdrEnd = bufFindHeaderEnd(buf, 0, len);
+        while (hdrEnd == -1) {
+            if (len >= cap) { alive = false; break; }              // header block larger than the buffer
+            let hn = await asyncio.arecv(client, buf + len, cap - len);
+            if (hn <= 0) { alive = false; break; }
+            len = len + hn;
+            hdrEnd = bufFindHeaderEnd(buf, 0, len);
+        }
+        if (!alive) { break; }
+
+        // Honor `Expect: 100-continue` — acknowledge so the client sends the body.
+        if (bufFindCI(buf, 0, hdrEnd, "expect: 100-continue") != -1) {
+            await asyncio.asend(client, "HTTP/1.1 100 Continue\r\n\r\n");
+        }
+        // Accumulate the full body per Content-Length.
+        let bodyStart = hdrEnd + 4;
+        let need = bufContentLength(buf, 0, hdrEnd);
+        while (len - bodyStart < need) {
+            if (len >= cap) { alive = false; break; }
+            let bn = await asyncio.arecv(client, buf + len, cap - len);
+            if (bn <= 0) { alive = false; break; }
+            len = len + bn;
+        }
+        if (!alive) { break; }
+        let reqEnd = bodyStart + need;
+        let wantClose = bufFindCI(buf, 0, hdrEnd, "connection: close") != -1;
+
+        // FAST PATH: (method, path) straight off the buffer; a cacheable GET hit serves a copy of the
+        // memoized bytes with NO request string, NO parse, NO dispatch, NO serialize. Only a MISS
+        // materializes the request (read_string over the exact request bytes) and runs the pipeline.
+        // (Sending the cached string directly, borrowed, was tried — no throughput win and noisier at
+        // high concurrency, so the small copy stays; the ceiling is per-request IO/scheduling, not it.)
+        let (method, path) = bufMethodPath(buf, len);
+        let out = "";
+        let served = false;
+        if (string.eql(method, "GET")) {
+            let c = app.cachedCopy(path);
+            if (c != undefined) { out = c ?? ""; served = true; }
+        }
+        if (!served) {
+            let raw = bytes.read_string(buf, reqEnd);
+            out = app.respondMiss(raw, method, path);
+        }
+        await asyncio.asend(client, out);
+
+        // Shift any leftover bytes (a pipelined next request) to the front of the buffer.
+        let leftover = len - reqEnd;
+        if (leftover > 0) {
+            let k = 0;
+            while (k < leftover) {
+                bytes.write_byte(buf, k, bytes.read_byte(buf, reqEnd + k));
+                k = k + 1;
+            }
+        }
+        len = leftover;
+
+        if (wantClose) { alive = false; }
+    }
+    asyncio.aclose(client);
+    bytes.free(buf);
+    return 0;
+}
+
+async fn runServer(app: App, port: int): int {
+    let srv = asyncio.serverListen(port);
+    if (srv == 0) {
+        console.log("Nova web: failed to bind port (in use?)");
+        return -1;
+    }
+    console.log("Nova web server listening");
+    while (true) {
+        let client = await asyncio.aaccept(srv);
+        spawn handleConn(app, client);
+    }
+    return 0;
+}

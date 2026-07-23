@@ -1,0 +1,141 @@
+// mediator.nova — Mediator pattern implementation with Pipeline Behaviors and Exception Handling
+import map;
+import string;
+import list;
+import web.request;
+import web.response;
+import web.status;
+
+pub trait RequestTrait {}
+
+pub trait RequestHandler {
+    fn handle(self: RequestHandler, req: any): any;
+}
+
+pub trait PipelineBehavior {
+    fn handle(self: PipelineBehavior, req: any, next: () => any): any;
+}
+
+pub trait PreProcessor {
+    fn process(self: PreProcessor, req: any): void;
+}
+
+pub trait PostProcessor {
+    fn process(self: PostProcessor, req: any, res: any): any;
+}
+
+pub trait ExceptionHandler {
+    fn handle(self: ExceptionHandler, req: any, err: string): any;
+}
+
+pub struct Mediator {
+    pub handlers: Map<string, RequestHandler>,
+    pub behaviors: List<PipelineBehavior>,
+    pub pre_processors: List<PreProcessor>,
+    pub post_processors: List<PostProcessor>,
+    pub exception_handlers: List<ExceptionHandler>,
+
+    init() {
+        self.handlers = Map<string, RequestHandler>(16, string.hash);
+        self.behaviors = List<PipelineBehavior>();
+        self.pre_processors = List<PreProcessor>();
+        self.post_processors = List<PostProcessor>();
+        self.exception_handlers = List<ExceptionHandler>();
+    }
+
+    pub fn registerHandler(self: Mediator, name: string, handler: RequestHandler): void {
+        self.handlers.set(name, handler);
+    }
+
+    pub fn addBehavior(self: Mediator, behavior: PipelineBehavior): void {
+        self.behaviors.push(behavior);
+    }
+
+    pub fn addPreProcessor(self: Mediator, pre: PreProcessor): void {
+        self.pre_processors.push(pre);
+    }
+
+    pub fn addPostProcessor(self: Mediator, post: PostProcessor): void {
+        self.post_processors.push(post);
+    }
+
+    pub fn addExceptionHandler(self: Mediator, handler: ExceptionHandler): void {
+        self.exception_handlers.push(handler);
+    }
+
+    pub fn send(self: Mediator, name: string, req: any): any {
+        let handler = self.handlers.get(name);
+        if (handler == undefined) {
+            return response.Response(Status.NotFound, "Handler not found for: " + name);
+        }
+
+        // Execute pre-processors
+        let pre_len = self.pre_processors.len;
+        let i = 0;
+        while (i < pre_len) {
+            let pre = self.pre_processors.get(i);
+            pre.process(req);
+            i = i + 1;
+        }
+
+        let this = self;
+
+        // Define core handler invocation.
+        //
+        // The `try { return handler.handle(req); } catch (err) { ...exception_handlers... }`
+        // that was here is GONE with `throw` (specs §5.5, plan P2-12). Note what the catch
+        // block did with `err`: NOTHING. It passed the hardcoded string "Exception occurred
+        // during execution" to every exception handler — because the caught value could only
+        // ever be a meaningless i32 (`nova_throw` took a `long long`, the catch bound
+        // `zext(setjmp_res)`, so a thrown string arrived as e.g. `8472`). The pipeline was
+        // already routing around the fact that no error information survived the throw.
+        //
+        // It was also UB: this runs inside an async handler — a C++20 coroutine — and the
+        // implementation was setjmp/longjmp. And it leaked every frame it unwound.
+        //
+        // `exception_handlers` is retained on the struct: it gets its real customer when
+        // `handle` returns `TResponse | Error` (plan P2-13) and this dispatches on the error
+        // VALUE — with the message intact, which is exactly what the old code could not do.
+        let core_call = () => {
+            return handler.handle(req);
+        };
+
+        // Execute pipeline behaviors (chaining from end to start)
+        let current_next = core_call;
+        let behaviors_len = self.behaviors.len;
+        let idx = behaviors_len;
+        while (idx > 0) {
+            idx = idx - 1;
+            let behavior = self.behaviors.get(idx);
+            let saved_next = current_next;
+            current_next = () => {
+                return behavior.handle(req, saved_next);
+            };
+        }
+
+        let result_res = current_next();
+
+        // Execute post-processors
+        let post_len = self.post_processors.len;
+        let k = 0;
+        while (k < post_len) {
+            let post = self.post_processors.get(k);
+            result_res = post.process(req, result_res);
+            k = k + 1;
+        }
+
+        return result_res;
+    }
+}
+
+pub fn html(body: string): response.Response {
+    let res = response.Response.ok(body);
+    res.setHeader("Content-Type", "text/html");
+    return res;
+}
+
+pub fn json(body: string): response.Response {
+    let res = response.Response.ok(body);
+    res.setHeader("Content-Type", "application/json");
+    return res;
+}

@@ -1,0 +1,9 @@
+import assert;
+import e2mod.leaf;   // direct
+import e2mod.mid;    // transitive (mid also imports leaf)
+
+@test
+fn both_imports() {
+    assert.equalInt(leaf.leafValue(), 42);
+    assert.equalInt(mid.midValue(), 43);
+}

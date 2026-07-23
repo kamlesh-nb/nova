@@ -1,0 +1,14 @@
+.{
+    .name = .llvm_zig,
+    .version = "1.0.0",
+    .fingerprint = 0xbf48c74bc4247821,
+    .minimum_zig_version = "0.15.2",
+    // No dependencies: the upstream `test_runner` sub-dep was only for the
+    // dep's own test target, which this vendored copy drops.
+    .paths = .{
+        "src",
+        "build.zig",
+        "build.zig.zon",
+        "LICENSE",
+    },
+}

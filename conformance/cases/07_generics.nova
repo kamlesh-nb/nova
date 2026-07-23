@@ -1,0 +1,57 @@
+// A2 guard: user-defined generics (now that type params are carried through the
+// AST rather than discarded). Multi-parameter generic struct with mixed-type
+// fields, and a generic function.
+import assert;
+import string;
+
+struct Pair<A, B> {
+    pub first: A,
+    pub second: B,
+
+    init(a: A, b: B) {
+        self.first = a;
+        self.second = b;
+    }
+}
+
+fn identity<T>(x: T): T {
+    return x;
+}
+
+@test
+fn test_generic_struct(): void {
+    let p = Pair<int, string>(42, "hi");
+    assert.equalInt(p.first, 42);
+    assert.equalStr(p.second, "hi");
+}
+
+@test
+fn test_generic_fn(): void {
+    assert.equalInt(identity<int>(7), 7);
+}
+
+// F4 G3 (narrowed to destructors): `List<int>` and `List<string>` are distinct
+// types, so they must have distinct DESTRUCTORS — one must release its elements and
+// the other must not, and one body cannot do both. Before this, `getStructBaseName`
+// stripped `<...>` and every instantiation shared `__destruct_List`, which is why
+// List<string> leaks (~138 B/iter, repros/list_string_leak.md).
+//
+// F4 §4: "F4 alone fixes nothing at runtime; that is expected." This case pins the
+// PRECONDITION — that the two instantiations stay independent — not the leak. The
+// leak is F5's, and it has a measured before-figure waiting.
+@test
+fn test_instantiations_are_independent(): void {
+    let ints = List<int>();
+    ints.push(10);
+    ints.push(20);
+
+    let strs = List<string>();
+    strs.push("a");
+    strs.push("b");
+
+    // Distinct instantiations, distinct storage, no interference.
+    assert.equalInt(ints.size(), 2);
+    assert.equalInt(strs.size(), 2);
+    assert.equalInt(ints.get(0) ?? 0, 10);
+    assert.equalStr(strs.get(1) ?? "", "b");
+}

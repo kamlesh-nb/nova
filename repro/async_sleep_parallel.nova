@@ -1,0 +1,19 @@
+// Async concurrency via NON-BLOCKING timers: 8 `go` tasks each sleep 200ms.
+// With async timers on the io_context, even 1 thread runs them concurrently.
+import assert;
+import datetime;
+async fn work(ms: int): int { await fiber.sleep(ms); return ms; }
+async fn runAll(): int {
+    let h1 = spawn work(200); let h2 = spawn work(200); let h3 = spawn work(200); let h4 = spawn work(200);
+    let h5 = spawn work(200); let h6 = spawn work(200); let h7 = spawn work(200); let h8 = spawn work(200);
+    return await h1 + await h2 + await h3 + await h4 + await h5 + await h6 + await h7 + await h8;
+}
+@test
+fn t_sleep_parallel(): void {
+    let t0 = datetime.nowNs();
+    let total = runAll();
+    let ms = (datetime.nowNs() - t0) / 1000000;
+    console.log(`8x spawn work(200ms sleep): total=${total}ms  wall-clock=${ms}ms  (serial=1600ms)`);
+    assert.equalInt(total, 1600);
+    assert.isTrue(ms < 900);
+}

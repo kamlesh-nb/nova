@@ -1,0 +1,618 @@
+// yaml.nova — Tagged Union YAML serializer/deserializer
+import string;
+import list;
+import map;
+import bytes;
+import assert;
+
+pub enum YamlValue {
+    Null,
+    Bool(bool),
+    Number(long),
+    Decimal(decimal),   // S1: an EXACT decimal128 scalar (a fractional/exponent number)
+    String(string),
+    Array(List<YamlValue>),
+    Object(Map<string, YamlValue>),
+}
+
+// ---------------------------------------------------------------------------
+// Constructors
+// ---------------------------------------------------------------------------
+
+pub fn null(): YamlValue {
+    return YamlValue.Null;
+}
+
+pub fn bool(val: bool): YamlValue {
+    return YamlValue.Bool(val);
+}
+
+pub fn number(val: long): YamlValue {
+    return YamlValue.Number(val);
+}
+
+pub fn decimalValue(val: decimal): YamlValue {
+    return YamlValue.Decimal(val);
+}
+
+pub fn str(val: string): YamlValue {
+    return YamlValue.String(val);
+}
+
+pub fn array(val: List<YamlValue>): YamlValue {
+    return YamlValue.Array(val);
+}
+
+pub fn object(val: Map<string, YamlValue>): YamlValue {
+    return YamlValue.Object(val);
+}
+
+// ---------------------------------------------------------------------------
+// Extractors
+// ---------------------------------------------------------------------------
+
+pub fn isNull(val: YamlValue): bool {
+    switch (val) {
+        case YamlValue.Null: { return true; }
+        default: { return false; }
+    }
+}
+
+pub fn asBool(val: YamlValue): bool | undefined {
+    switch (val) {
+        case YamlValue.Bool(b): { return b; }
+        default: { return undefined; }
+    }
+}
+
+pub fn asNumber(val: YamlValue): long | undefined {
+    switch (val) {
+        case YamlValue.Number(n): { return n; }
+        default: { return undefined; }
+    }
+}
+
+pub fn asDecimal(val: YamlValue): decimal | undefined {
+    switch (val) {
+        case YamlValue.Decimal(d): { return d; }
+        default: { return undefined; }
+    }
+}
+
+pub fn asString(val: YamlValue): string | undefined {
+    switch (val) {
+        case YamlValue.String(s): { return s; }
+        default: { return undefined; }
+    }
+}
+
+pub fn asArray(val: YamlValue): List<YamlValue> | undefined {
+    switch (val) {
+        case YamlValue.Array(arr): { return arr; }
+        default: { return undefined; }
+    }
+}
+
+pub fn asObject(val: YamlValue): Map<string, YamlValue> | undefined {
+    switch (val) {
+        case YamlValue.Object(obj): { return obj; }
+        default: { return undefined; }
+    }
+}
+
+pub fn get(val: YamlValue, key: string): YamlValue {
+    switch (val) {
+        case YamlValue.Object(obj): {
+            let res = obj.get(key);
+            if (res == undefined) return YamlValue.Null;
+            return res;
+        }
+        default: { return YamlValue.Null; }
+    }
+}
+
+pub fn at(val: YamlValue, idx: int): YamlValue {
+    switch (val) {
+        case YamlValue.Array(arr): {
+            if (idx < 0 || idx >= arr.size()) return YamlValue.Null;
+            return arr.get(idx) ?? YamlValue.Null;
+        }
+        default: { return YamlValue.Null; }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Serialization (stringify)
+// ---------------------------------------------------------------------------
+
+pub fn stringify(val: YamlValue): string {
+    return stringifyIndent(val, 0);
+}
+
+fn stringifyIndent(val: YamlValue, indent: int): string {
+    switch (val) {
+        case YamlValue.Null: {
+            return "null";
+        }
+        case YamlValue.Bool(b): {
+            return if (b) "true" else "false";
+        }
+        case YamlValue.Number(n): {
+            return i64ToString(n);
+        }
+        case YamlValue.Decimal(d): {
+            return `${d}`;   // exact decimal text, unquoted (a YAML number)
+        }
+        case YamlValue.String(s): {
+            return quoteStringIfNeeded(s);
+        }
+        case YamlValue.Array(arr): {
+            if (arr.size() == 0) {
+                return "[]";
+            }
+            let lines = List<string>();
+            let spaces = makeIndent(indent);
+            
+            let i = 0;
+            while (i < arr.size()) {
+                let item = arr.get(i) ?? YamlValue.Null;
+                switch (item) {
+                    case YamlValue.Array(dummy): {
+                        let item_str = stringifyIndent(item, indent + 2);
+                        lines.push(spaces + "-\n" + item_str);
+                    }
+                    case YamlValue.Object(dummy): {
+                        let item_str = stringifyIndent(item, indent + 2);
+                        lines.push(spaces + "-\n" + item_str);
+                    }
+                    default: {
+                        let item_str = stringifyIndent(item, 0);
+                        lines.push(spaces + "- " + item_str);
+                    }
+                }
+                i = i + 1;
+            }
+            return string.join(lines, "\n");
+        }
+        case YamlValue.Object(obj): {
+            if (obj.keys().size() == 0) {
+                return "{}";
+            }
+            let lines = List<string>();
+            let spaces = makeIndent(indent);
+            
+            let keys = obj.keys();
+            let i = 0;
+            while (i < keys.size()) {
+                let key = keys.get(i) ?? "";
+                let item = obj.get(key) ?? YamlValue.Null;
+                switch (item) {
+                    case YamlValue.Array(dummy): {
+                        let item_str = stringifyIndent(item, indent + 2);
+                        lines.push(spaces + key + ":\n" + item_str);
+                    }
+                    case YamlValue.Object(dummy): {
+                        let item_str = stringifyIndent(item, indent + 2);
+                        lines.push(spaces + key + ":\n" + item_str);
+                    }
+                    default: {
+                        let item_str = stringifyIndent(item, 0);
+                        lines.push(spaces + key + ": " + item_str);
+                    }
+                }
+                i = i + 1;
+            }
+            return string.join(lines, "\n");
+        }
+        default: {
+            return "null";
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parsing
+// ---------------------------------------------------------------------------
+
+pub fn parse(yaml: string): YamlValue {
+    let raw_lines = string.split(yaml, "\n");
+    
+    let lines = List<string>();
+    
+    let i = 0;
+    while (i < raw_lines.size()) {
+        let line = raw_lines.get(i) ?? "";
+        let trimmed = trim(line);
+        if (trimmed.length == 0 || trimmed[0] == '#') {
+            i = i + 1;
+            continue;
+        }
+        
+        let indent = getIndent(line);
+        if (trimmed[0] == '-' && trimmed.length > 1 && trimmed[1] == ' ') {
+            let after_dash = string.slice(trimmed, 2, trimmed.length);
+            let colon_pos = string.indexOf(after_dash, ":");
+            if (colon_pos >= 0) {
+                let dash_spaces = makeIndent(indent);
+                lines.push(dash_spaces + "-");
+                
+                let child_spaces = makeIndent(indent + 2);
+                lines.push(child_spaces + after_dash);
+                
+                i = i + 1;
+                continue;
+            }
+        }
+        lines.push(line);
+        i = i + 1;
+    }
+    
+    if (lines.size() == 0) {
+        return YamlValue.Null;
+    }
+    
+    let first_line = lines.get(0) ?? "";
+    let initial_indent = getIndent(first_line);
+    
+    let (res, final_idx) = parseBlock(lines, 0, initial_indent);
+    return res;
+}
+
+fn parseBlock(lines: List<string>, start_idx: int, expected_indent: int): (YamlValue, int) {
+    let i = start_idx;
+    let is_arr = false;
+    while (i < lines.size()) {
+        let line = lines.get(i) ?? "";
+        let trimmed = trim(line);
+        if (trimmed.length > 0) {
+            if (trimmed[0] == '-') {
+                is_arr = true;
+            }
+            break;
+        }
+        i = i + 1;
+    }
+
+    if (is_arr) {
+        let arr = List<YamlValue>();
+        while (i < lines.size()) {
+            let line = lines.get(i) ?? "";
+            let indent = getIndent(line);
+            let trimmed = trim(line);
+            if (trimmed.length == 0) {
+                i = i + 1;
+                continue;
+            }
+            if (indent < expected_indent) {
+                break;
+            }
+            if (trimmed[0] == '-') {
+                let content = trim(string.slice(trimmed, 1, trimmed.length));
+                if (content.length == 0) {
+                    let next_indent = expected_indent + 2;
+                    let j = i + 1;
+                    while (j < lines.size()) {
+                        let nl = lines.get(j) ?? "";
+                        if (trim(nl).length > 0) {
+                            next_indent = getIndent(nl);
+                            break;
+                        }
+                        j = j + 1;
+                    }
+                    let (val, next_i) = parseBlock(lines, i + 1, next_indent);
+                    arr.push(val);
+                    i = next_i;
+                } else {
+                    arr.push(parseScalar(content));
+                    i = i + 1;
+                }
+            } else {
+                break;
+            }
+        }
+        return (YamlValue.Array(arr), i);
+    } else {
+        let obj = Map<string, YamlValue>(16, string.hash);
+        while (i < lines.size()) {
+            let line = lines.get(i) ?? "";
+            let indent = getIndent(line);
+            let trimmed = trim(line);
+            if (trimmed.length == 0) {
+                i = i + 1;
+                continue;
+            }
+            if (indent < expected_indent) {
+                break;
+            }
+            let colon_pos = string.indexOf(trimmed, ":");
+            if (colon_pos >= 0) {
+                let key = trim(string.slice(trimmed, 0, colon_pos));
+                let val_str = trim(string.slice(trimmed, colon_pos + 1, trimmed.length));
+                if (val_str.length == 0) {
+                    let next_indent = expected_indent + 2;
+                    let j = i + 1;
+                    while (j < lines.size()) {
+                        let nl = lines.get(j) ?? "";
+                        if (trim(nl).length > 0) {
+                            next_indent = getIndent(nl);
+                            break;
+                        }
+                        j = j + 1;
+                    }
+                    let (val, next_i) = parseBlock(lines, i + 1, next_indent);
+                    obj.set(key, val);
+                    i = next_i;
+                } else {
+                    obj.set(key, parseScalar(val_str));
+                    i = i + 1;
+                }
+            } else {
+                i = i + 1;
+            }
+        }
+        return (YamlValue.Object(obj), i);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn getIndent(s: string): int {
+    let i = 0;
+    while (i < s.length) {
+        if (s[i] != ' ') {
+            break;
+        }
+        i = i + 1;
+    }
+    return i;
+}
+
+fn trim(s: string): string {
+    let start = 0;
+    while (start < s.length && (s[start] == ' ' || s[start] == '\t' || s[start] == '\r' || s[start] == '\n')) {
+        start = start + 1;
+    }
+    let end = s.length;
+    while (end > start && (s[end - 1] == ' ' || s[end - 1] == '\t' || s[end - 1] == '\r' || s[end - 1] == '\n')) {
+        end = end - 1;
+    }
+    return string.slice(s, start, end);
+}
+
+fn makeIndent(n: int): string {
+    // ARC-correct string alloc (workstream A): data at ptr, length at [ptr-4].
+    let str_ptr = bytes.alloc(n);
+    let i = 0;
+    while (i < n) {
+        bytes.write_byte(str_ptr, i, ' ');
+        i = i + 1;
+    }
+    return str_ptr as string;
+}
+
+fn i64ToString(val: long): string {
+    if (val == 0) {
+        return "0";
+    }
+    let is_neg = false;
+    let temp = val;
+    if (temp < 0) {
+        is_neg = true;
+        temp = -temp;
+    }
+    let digits = getDigits(temp);
+    let len = if (is_neg) digits + 1 else digits;
+    // ARC-correct string alloc (workstream A): data at ptr, length at [ptr-4].
+    let str_ptr = bytes.alloc(len);
+    let i = len - 1;
+    while (temp > 0) {
+        bytes.write_byte(str_ptr, i, (temp % 10) + 48);
+        temp = temp / 10;
+        i = i - 1;
+    }
+    if (is_neg) {
+        bytes.write_byte(str_ptr, 0, '-');
+    }
+    return str_ptr as string;
+}
+
+fn getDigits(val: long): int {
+    let temp = val;
+    let count = 0;
+    while (temp > 0) {
+        count = count + 1;
+        temp = temp / 10;
+    }
+    return count;
+}
+
+fn quoteStringIfNeeded(s: string): string {
+    if (s.length == 0) {
+        return "\"\"";
+    }
+    if (s == "null" || s == "true" || s == "false") {
+        return "\"" + s + "\"";
+    }
+    if (isNumeric(s)) {
+        return "\"" + s + "\"";
+    }
+    let need_quote = false;
+    let i = 0;
+    while (i < s.length) {
+        let c = s[i];
+        if (c == ':' || c == '#' || c == '-' || c == '[' || c == ']' || c == '{' || c == '}' || c == '"' || c == '\'' || c == '\n' || c == '\r' || c == '\t') {
+            need_quote = true;
+            break;
+        }
+        i = i + 1;
+    }
+    if (need_quote) {
+        return quoteString(s);
+    }
+    return s;
+}
+
+fn isNumeric(s: string): bool {
+    if (s.length == 0) return false;
+    let i = 0;
+    if (s[0] == '-') {
+        if (s.length == 1) return false;
+        i = 1;
+    }
+    while (i < s.length) {
+        let c = s[i];
+        if (c < '0' || c > '9') return false;
+        i = i + 1;
+    }
+    return true;
+}
+
+// A number with a fractional and/or exponent part (e.g. "19.99", "-0.1", "1.5e-3") — held EXACTLY
+// as a decimal128, not truncated into a `long`. A bare integer stays `Number` (isNumeric wins first).
+fn isDecimalNumeric(s: string): bool {
+    if (s.length == 0) return false;
+    let i = 0;
+    if (s[0] == '-' || s[0] == '+') { i = 1; }
+    let digits = 0;
+    let dots = 0;
+    let exps = 0;
+    let frac_or_exp = false;
+    while (i < s.length) {
+        let c = s[i];
+        if (c >= '0' && c <= '9') {
+            digits = digits + 1;
+        } else if (c == '.') {
+            dots = dots + 1;
+            frac_or_exp = true;
+            if (dots > 1) return false;
+        } else if (c == 'e' || c == 'E') {
+            exps = exps + 1;
+            frac_or_exp = true;
+            if (exps > 1) return false;
+            if (i + 1 < s.length && (s[i + 1] == '-' || s[i + 1] == '+')) { i = i + 1; }  // exponent sign
+        } else {
+            return false;
+        }
+        i = i + 1;
+    }
+    return digits > 0 && frac_or_exp;
+}
+
+fn quoteString(s: string): string {
+    let len = s.length;
+    // ARC-correct string alloc (workstream A): worst-case buffer, data at ptr+0.
+    let result = bytes.alloc(len * 2 + 2);
+    let offset = 0;
+    bytes.write_byte(result, offset, '"');
+    offset = offset + 1;
+    let i = 0;
+    while (i < len) {
+        let c = s[i];
+        if (c == '"' || c == '\\') {
+            bytes.write_byte(result, offset, '\\');
+            offset = offset + 1;
+            bytes.write_byte(result, offset, c);
+            offset = offset + 1;
+        } else if (c == '\n') {
+            bytes.write_byte(result, offset, '\\');
+            offset = offset + 1;
+            bytes.write_byte(result, offset, 'n');
+            offset = offset + 1;
+        } else if (c == '\r') {
+            bytes.write_byte(result, offset, '\\');
+            offset = offset + 1;
+            bytes.write_byte(result, offset, 'r');
+            offset = offset + 1;
+        } else if (c == '\t') {
+            bytes.write_byte(result, offset, '\\');
+            offset = offset + 1;
+            bytes.write_byte(result, offset, 't');
+            offset = offset + 1;
+        } else {
+            bytes.write_byte(result, offset, c);
+            offset = offset + 1;
+        }
+        i = i + 1;
+    }
+    bytes.write_byte(result, offset, '"');
+    offset = offset + 1;
+    bytes.write_i32(result - 4, 0, offset); // correct length header to actual bytes
+    return result as string;
+}
+
+fn parseScalar(s: string): YamlValue {
+    let t = trim(s);
+    if (t.length == 0) {
+        return YamlValue.Null;
+    }
+    if (t == "~" || t == "null" || t == "Null" || t == "NULL") {
+        return YamlValue.Null;
+    }
+    if (t == "true" || t == "True" || t == "TRUE") {
+        return YamlValue.Bool(true);
+    }
+    if (t == "false" || t == "False" || t == "FALSE") {
+        return YamlValue.Bool(false);
+    }
+    if (isNumeric(t)) {
+        return YamlValue.Number(string.parseI64(t));
+    }
+    if (isDecimalNumeric(t)) {   // S1: a fractional/exponent number -> EXACT decimal128
+        return YamlValue.Decimal(decimal.fromString(t));
+    }
+    if (t.length >= 2 && (t[0] == '"' && t[t.length - 1] == '"' || t[0] == '\'' && t[t.length - 1] == '\'')) {
+        return YamlValue.String(string.slice(t, 1, t.length - 1));
+    }
+    return YamlValue.String(t);
+}
+
+@test
+fn test_yaml_serialization_and_parsing(): void {
+    let root_map = Map<string, YamlValue>(16, string.hash);
+    root_map.set("name", str("Alice"));
+    root_map.set("age", number(30));
+    
+    let tags_list = List<YamlValue>();
+    tags_list.push(str("dev"));
+    tags_list.push(str("qa"));
+    root_map.set("tags", array(tags_list));
+    
+    let address_map = Map<string, YamlValue>(16, string.hash);
+    address_map.set("city", str("Paris"));
+    address_map.set("zip", number(75001));
+    root_map.set("address", object(address_map));
+    
+    let root = object(root_map);
+    
+    let yaml_str = stringify(root);
+    console.log("Serialized YAML:");
+    console.log(yaml_str);
+    
+    let parsed = parse(yaml_str);
+    
+    assert.isTrue(parsed != YamlValue.Null);
+    
+    let name_val = get(parsed, "name");
+    assert.equalInt(1, if (asString(name_val) == "Alice") 1 else 0);
+    
+    let age_val = get(parsed, "age");
+    assert.equalInt(30, asNumber(age_val) ?? 0);
+    
+    let tags_val = get(parsed, "tags");
+    let tags_arr = asArray(tags_val);
+    assert.isTrue(tags_arr != undefined);
+    if (tags_arr != undefined) {
+        assert.equalInt(2, tags_arr.size());
+        assert.equalInt(1, if (asString(tags_arr.get(0) ?? YamlValue.Null) == "dev") 1 else 0);
+        assert.equalInt(1, if (asString(tags_arr.get(1) ?? YamlValue.Null) == "qa") 1 else 0);
+    }
+    
+    let address_val = get(parsed, "address");
+    let city_val = get(address_val, "city");
+    assert.equalInt(1, if (asString(city_val) == "Paris") 1 else 0);
+    
+    let zip_val = get(address_val, "zip");
+    assert.equalInt(75001, asNumber(zip_val) ?? 0);
+}

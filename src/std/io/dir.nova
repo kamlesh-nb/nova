@@ -1,0 +1,131 @@
+// io/dir.nova — Struct-based directory I/O for Nova
+// Wraps the C runtime dir functions (dir.c) with a clean struct API.
+//
+// Usage:
+//   import io.dir;
+//   import collections.list;
+//
+//   // Iterate directory entries
+//   let d = Dir.open("/tmp");
+//   let entries = d.entries();
+//   d.close();
+//
+//   // Static convenience helpers
+//   Dir.create("mydir", 0o755);
+//   Dir.chdir("mydir");
+//   let cwd = Dir.getCwd();
+
+import bytes;
+import mem.allocator;
+import collections.list;
+
+pub struct Dir {
+    pub handle: ptr,   // DIR* handle
+    pub path: string,
+    pub allocator: allocator.Allocator,
+
+    /// Open a directory for reading entries.
+    pub fn open(path: string): Dir {
+        let d = bytes.new_with_allocator<Dir>(allocator.globalAllocator());
+        d.allocator = allocator.globalAllocator();
+        d.path = path;
+        d.handle = nova_dir_open(path);
+        return d;
+    }
+
+    /// Read the next entry name. Returns undefined when exhausted.
+    pub fn read(self: Dir): string | undefined {
+        let entry = nova_dir_read(self.handle);
+        if (entry == 0) {
+            return undefined;
+        }
+        // Convert C string to Nova string
+        let clen = 0;
+        while (bytes.read_byte(entry, clen) != 0) {
+            clen = clen + 1;
+        }
+        // ARC-correct string alloc (workstream A): data at ptr, length at [ptr-4].
+        let buf = allocator.globalAllocator().alloc(clen);
+        let i = 0;
+        while (i < clen) {
+            bytes.write_byte(buf, i, bytes.read_byte(entry, i));
+            i = i + 1;
+        }
+        return buf as string;
+    }
+
+    /// Collect all entries into a List<string>.
+    pub fn entries(self: Dir): List<string> {
+        let result = List<string>();
+        while (true) {
+            let entry = self.read();
+            if (entry == undefined) {
+                break;
+            }
+            result.push(entry ?? "");
+        }
+        return result;
+    }
+
+    /// Close the directory handle.
+    pub fn close(self: Dir): void {
+        nova_dir_close(self.handle);
+        self.handle = 0;
+    }
+
+    // -------------------------------------------------------------------------
+    // Static helpers (associated functions)
+    // -------------------------------------------------------------------------
+
+    /// Create a directory with given mode (e.g., 0o755).
+    pub fn create(path: string, mode: int): int {
+        return nova_dir_create(path, mode);
+    }
+
+    /// Remove an empty directory.
+    pub fn remove(path: string): int {
+        return nova_dir_remove(path);
+    }
+
+    /// Rename/move a directory.
+    pub fn rename(oldPath: string, newPath: string): int {
+        return nova_dir_rename(oldPath, newPath);
+    }
+
+    /// Check if a path exists (file or directory).
+    pub fn exists(path: string): bool {
+        return nova_dir_exists(path) != 0;
+    }
+
+    /// Check if path is a directory.
+    pub fn isDir(path: string): bool {
+        return nova_dir_is_dir(path) != 0;
+    }
+
+    /// Get the current working directory.
+    pub fn getCwd(): string {
+        let ptr = nova_dir_getcwd();
+        if (ptr == 0) {
+            return "";
+        }
+        // ptr is a malloc'd C string — convert to Nova string
+        let clen = 0;
+        while (bytes.read_byte(ptr, clen) != 0) {
+            clen = clen + 1;
+        }
+        // ARC-correct string alloc (workstream A): data at ptr, length at [ptr-4].
+        let buf = allocator.globalAllocator().alloc(clen);
+        let i = 0;
+        while (i < clen) {
+            bytes.write_byte(buf, i, bytes.read_byte(ptr, i));
+            i = i + 1;
+        }
+        bytes.free(ptr);
+        return buf as string;
+    }
+
+    /// Change the current working directory.
+    pub fn chdir(path: string): int {
+        return nova_dir_chdir(path);
+    }
+}

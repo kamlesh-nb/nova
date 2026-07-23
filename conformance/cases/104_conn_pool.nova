@@ -1,0 +1,134 @@
+// D6: the connection Pool over the db.Driver/Connection seam. A counting mock driver proves
+// the pool's REUSE semantics deterministically (no live server): each `driver.connect` bumps a
+// shared counter, so we can assert that a release→acquire reuses a warm connection instead of
+// opening a new one, that two concurrent checkouts open two connections, and that `maxIdle`
+// bounds how many are kept (a release beyond it closes the surplus).
+//
+// The counter is a shared struct (Nova structs are ARC ref types) threaded through the driver
+// and every connection it opens, so the test holds one handle and observes opens/closes.
+import assert;
+import list;
+import db;
+import pool;
+
+struct Counter {
+    pub opens: int,
+    pub closes: int,
+    init() { self.opens = 0; self.closes = 0; }
+}
+
+struct CountingConn impl Connection {
+    pub id: int,
+    pub ctr: Counter,
+    pub prepared: List<string>,
+    init(id: int, ctr: Counter) { self.id = id; self.ctr = ctr; self.prepared = List<string>(); }
+
+    pub async fn exec(self, sql: string, params: List<DbValue>): ExecResult {
+        return ExecResult(1, "OK");
+    }
+    pub async fn query(self, sql: string, params: List<DbValue>): ResultSet {
+        let rs = ResultSet();
+        rs.columns.push(Column("n", DbType.Int4));
+        let r = Row();
+        r.cells.push(db.dbInt(self.id));
+        rs.rows.push(r);
+        rs.rows_affected = 1;
+        return rs;
+    }
+    pub fn close(self): void { self.ctr.closes = self.ctr.closes + 1; }
+    pub fn setTimeout(self, ms: int): int { return 0; }
+    pub async fn prepare(self, sql: string): int { self.prepared.push(sql); return self.prepared.size() - 1; }
+    pub async fn queryPrepared(self, stmt: int, params: List<DbValue>): ResultSet {
+        if (stmt < 0 || stmt >= self.prepared.size()) { return ResultSet(); }
+        return await self.query(self.prepared.get(stmt) ?? "", params);
+    }
+    pub async fn execPrepared(self, stmt: int, params: List<DbValue>): ExecResult {
+        if (stmt < 0 || stmt >= self.prepared.size()) { return ExecResult(0, ""); }
+        return await self.exec(self.prepared.get(stmt) ?? "", params);
+    }
+}
+
+struct CountingDriver impl Driver {
+    pub ctr: Counter,
+    init(ctr: Counter) { self.ctr = ctr; }
+
+    pub async fn connect(self, dsn: string): Connection {
+        let id = self.ctr.opens;
+        self.ctr.opens = self.ctr.opens + 1;
+        return CountingConn(id, self.ctr);
+    }
+}
+
+@test
+fn test_pool_reuses_warm_connection(): void {
+    let ctr = Counter();
+    let p = Pool(CountingDriver(ctr), "mock://x", 4);
+
+    let c1 = p.acquire();                 // opens #0
+    assert.equalInt(ctr.opens, 1);
+    assert.equalInt(p.idleCount(), 0);
+    p.release(c1);                        // back to idle
+    assert.equalInt(p.idleCount(), 1);
+
+    let c2 = p.acquire();                 // REUSE — no new open
+    assert.equalInt(ctr.opens, 1);
+    assert.equalInt(p.idleCount(), 0);
+    p.release(c2);
+}
+
+@test
+fn test_pool_opens_second_for_concurrent_checkout(): void {
+    let ctr = Counter();
+    let p = Pool(CountingDriver(ctr), "mock://x", 4);
+
+    let a = p.acquire();                  // opens #0
+    let b = p.acquire();                  // opens #1 (a still out)
+    assert.equalInt(ctr.opens, 2);
+    assert.equalInt(p.liveCount(), 2);
+    p.release(a);
+    p.release(b);
+    assert.equalInt(p.idleCount(), 2);
+}
+
+@test
+fn test_pool_maxIdle_closes_surplus(): void {
+    let ctr = Counter();
+    let p = Pool(CountingDriver(ctr), "mock://x", 1);   // keep at most 1 warm
+
+    let a = p.acquire();
+    let b = p.acquire();                  // 2 opened, 2 out
+    p.release(a);                         // idle now 1 (== maxIdle)
+    assert.equalInt(p.idleCount(), 1);
+    p.release(b);                         // surplus -> closed, not pooled
+    assert.equalInt(p.idleCount(), 1);
+    assert.equalInt(ctr.closes, 1);       // exactly one surplus close
+}
+
+@test
+fn test_pool_closeAll_drains(): void {
+    let ctr = Counter();
+    let p = Pool(CountingDriver(ctr), "mock://x", 8);
+
+    let a = p.acquire();
+    let b = p.acquire();
+    let c = p.acquire();
+    p.release(a);
+    p.release(b);
+    p.release(c);
+    assert.equalInt(p.idleCount(), 3);
+    p.closeAll();
+    assert.equalInt(p.idleCount(), 0);
+    assert.equalInt(ctr.closes, 3);       // all three idle conns closed
+}
+
+@test
+fn test_pool_query_through_pooled_conn(): void {
+    let ctr = Counter();
+    let p = Pool(CountingDriver(ctr), "mock://x", 2);
+    let c = p.acquire();
+    let rs = c.query("SELECT n", List<DbValue>());
+    assert.equalInt(rs.rowCount(), 1);
+    assert.equalInt(rs.row(0).getInt(0), 0);   // conn #0's id
+    p.release(c);
+    p.closeAll();
+}

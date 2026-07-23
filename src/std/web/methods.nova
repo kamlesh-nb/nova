@@ -1,0 +1,35 @@
+// methods.nova — HTTP Methods representation using refined enums with methods
+import bytes;
+import string;
+
+pub enum Method {
+    Get,
+    Post,
+    Put,
+    Delete,
+    Options,
+    Patch,
+
+    pub fn toString(self: Method): string {
+        switch (self) {
+            case Method.Get: { return "GET"; }
+            case Method.Post: { return "POST"; }
+            case Method.Put: { return "PUT"; }
+            case Method.Delete: { return "DELETE"; }
+            case Method.Options: { return "OPTIONS"; }
+            case Method.Patch: { return "PATCH"; }
+            default: { return "GET"; }
+        }
+    }
+
+    pub fn fromString(s: string): Method {
+        let upper = string.toUpperCase(s);
+        if (upper == "GET") return Method.Get;
+        if (upper == "POST") return Method.Post;
+        if (upper == "PUT") return Method.Put;
+        if (upper == "DELETE") return Method.Delete;
+        if (upper == "OPTIONS") return Method.Options;
+        if (upper == "PATCH") return Method.Patch;
+        return Method.Get;
+    }
+}

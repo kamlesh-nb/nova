@@ -1,0 +1,10 @@
+import assert;
+import collections.map;
+import string;
+struct Rec { pub v: string, }
+fn m(): map.Map<string, string> { let x = map.Map<string, string>(8, string.hash); return x; }
+fn mr(): map.Map<string, Rec> { let x = map.Map<string, Rec>(8, string.hash); return x; }
+@test
+fn deref_field() {
+    let r = mr().get("absent"); let v = r.v;
+}

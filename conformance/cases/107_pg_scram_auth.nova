@@ -1,0 +1,69 @@
+// D6: PostgreSQL SCRAM-SHA-256 auth. The full AuthenticationSASL exchange is verified LIVE
+// against a scram-configured PostgreSQL separately; this gate locks, offline:
+//  (1) the driver's SASL frame builders (SASLInitialResponse / SASLResponse wire shape), and
+//  (2) that the ScramClient drives the RFC 7677 exchange the driver feeds those builders
+//      (client-first-message + client-final-message proof).
+import assert;
+import string;
+import postgres;
+import crypto.scram;
+
+// --- (1) SASL frame shape -----------------------------------------------------
+
+@test
+fn test_sasl_initial_frame_shape(): void {
+    // SASLInitialResponse ('p'=112): [112][len i32][mech cstr][i32 cf-len][cf bytes].
+    let cf = "n,,n=user,r=abc";       // length 15
+    let f = postgres.buildSASLInitial("SCRAM-SHA-256", cf);
+    assert.equalInt(f[0], 112);
+    // payload = "SCRAM-SHA-256\0"(14) + i32(4) + cf(15) = 33; frame = 1+4+33 = 38
+    assert.equalInt(f.length, 38);
+    // length field (bytes 1..4) counts everything after the type byte = 37
+    let lenField = ((f[1] * 256 + f[2]) * 256 + f[3]) * 256 + f[4];
+    assert.equalInt(lenField, 37);
+    // mechanism begins at byte 5 with 'S'(83)
+    assert.equalInt(f[5], 83);
+    // the client-first length i32 sits right after the 14-byte mechanism cstr (bytes 19..22)
+    let cfLen = ((f[19] * 256 + f[20]) * 256 + f[21]) * 256 + f[22];
+    assert.equalInt(cfLen, 15);
+}
+
+@test
+fn test_sasl_response_frame_shape(): void {
+    // SASLResponse ('p'=112): [112][len i32][client-final bytes].
+    let final = "c=biws,r=abcdef,p=proof==";   // length 25
+    let f = postgres.buildSASLResponse(final);
+    assert.equalInt(f[0], 112);
+    assert.equalInt(f.length, 30);              // 1 + 4 + 25
+    let lenField = ((f[1] * 256 + f[2]) * 256 + f[3]) * 256 + f[4];
+    assert.equalInt(lenField, 29);
+    // payload tail equals the client-final message verbatim
+    assert.equalStr(string.slice(f, 5, f.length), final);
+}
+
+// --- (2) the exchange the driver runs (RFC 7677) ------------------------------
+
+@test
+fn test_scram_exchange_for_driver(): void {
+    // Same client the driver builds (struct-literal), driven with the RFC nonce so the proof
+    // is deterministic — this is exactly what connect() feeds buildSASLInitial/buildSASLResponse.
+    let c = ScramClient{
+        username: "user",
+        password: "pencil",
+        clientNonce: "rOprNGfwEbeRWgbNEkqO",
+    };
+    assert.equalStr(c.clientFirstMessage(), "n,,n=user,r=rOprNGfwEbeRWgbNEkqO");
+    let serverFirst = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
+    assert.equalStr(c.clientFinalMessage(serverFirst),
+        "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=");
+}
+
+@test
+fn test_sasl_initial_wraps_client_first(): void {
+    // End-to-end: the SASLInitial frame's payload tail is exactly the client-first-message.
+    let c = ScramClient{ username: "user", password: "pencil", clientNonce: "rOprNGfwEbeRWgbNEkqO" };
+    let cf = c.clientFirstMessage();
+    let f = postgres.buildSASLInitial("SCRAM-SHA-256", cf);
+    // tail (after 5 header bytes + 14 mech + 4 len = 23) == client-first
+    assert.equalStr(string.slice(f, 23, f.length), cf);
+}

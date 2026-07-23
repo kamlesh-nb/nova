@@ -1,0 +1,81 @@
+// Gates that an ERROR CARRIES ITS REASON to the caller — the whole point of the error model.
+//
+// WHY THIS CASE EXISTS. Three generations of the same defect, each reducing an error message to
+// an integer, each because nothing knew the value's TYPE:
+//
+//   1. `throw "DI Error: Service not registered: " + key`  ->  caught as  8472
+//      nova_throw took a `long long`; the catch bound `zext(setjmp_res)` — an i32 — so the string
+//      POINTER was truncated to 32 bits. `throw` is gone (specs §5.5).
+//   2. The interim after removal returned bare `undefined` — honest, but the caller learned nothing.
+//   3. `case E.NotFound(k): return "not found: " + k;`  ->  "not found: 4299572560"
+//      sema NEVER BOUND the payload name (`infer.zig`'s `.switch_stmt` inferred the case values but
+//      bound nothing), so `k` had no type and `+` fell back to integer concat — stringifying the
+//      ADDRESS. The value was right the whole time: `return k;` gave "Logger". Only `+` was blind.
+//
+// (3) is the same shape as `let (a,b) = f()` binding nothing: **sema does not bind, so nothing
+// downstream can type it, so codegen guesses.** Fixed 2026-07-17 by binding payload names to the
+// variant's declared payload type. Shown to fail before the change:
+//     FAIL test_concat: Expected "not found: Logger", got "not found: 4299572560"
+//
+// A payload enum + `switch` is what makes the reason survive — `T | Error` (specs §3.4b) is
+// ergonomics ON TOP of exactly this, not what makes it work.
+import assert;
+
+enum ResolveError {
+    NotRegistered(string),
+    Timeout(int),
+}
+
+fn reason(e: ResolveError): string {
+    switch (e) {
+        // The regression gate: CONCATENATING the payload. Returning it directly always worked;
+        // this is the line that printed an address.
+        case ResolveError.NotRegistered(k): { return "service not registered: " + k; }
+        case ResolveError.Timeout(ms):      { return "timed out"; }
+    }
+    return "unknown";
+}
+
+fn payload(e: ResolveError): string {
+    switch (e) {
+        case ResolveError.NotRegistered(k): { return k; }   // direct — worked even when broken
+        case ResolveError.Timeout(ms):      { return "?"; }
+    }
+    return "?";
+}
+
+@test
+fn test_string_payload_survives_concat(): void {
+    assert.equalStr(reason(ResolveError.NotRegistered("Logger")), "service not registered: Logger");
+}
+
+@test
+fn test_string_payload_direct(): void {
+    assert.equalStr(payload(ResolveError.NotRegistered("Logger")), "Logger");
+}
+
+// An INT payload must stay an int through the same path — a fix that made every payload a
+// string would pass the test above and be wrong.
+@test
+fn test_int_payload_is_not_a_pointer(): void {
+    let e: ResolveError = ResolveError.Timeout(250);
+    switch (e) {
+        case ResolveError.NotRegistered(k): { assert.fail("wrong arm"); }
+        case ResolveError.Timeout(ms):      { assert.equalInt(ms, 250); }
+    }
+}
+
+// The end-to-end shape a caller actually writes: the reason reaches the log with the key intact.
+// ⚠️ The binding MUST be annotated — `let e: ResolveError = ...` — because payload binding
+// silently fails when the switch discriminant is an UNANNOTATED local (it works for a parameter
+// or a call result). See route-handling-via-mediator.md §8.E.
+@test
+fn test_caller_learns_what_happened(): void {
+    let e: ResolveError = ResolveError.NotRegistered("Logger");
+    switch (e) {
+        case ResolveError.NotRegistered(k): {
+            assert.equalStr("[DI] service not registered: " + k, "[DI] service not registered: Logger");
+        }
+        case ResolveError.Timeout(ms): { assert.fail("wrong arm"); }
+    }
+}

@@ -1,0 +1,39 @@
+// Gates C1 crypto: PBKDF2-HMAC-SHA256 + SCRAM-SHA-256 (RFC 5802 / 7677), the SASL
+// auth used by PostgreSQL and MongoDB. The SCRAM proof exercises the whole raw-byte
+// key chain (PBKDF2 -> HMAC -> SHA256 -> XOR via `^` -> base64).
+import crypto.sha;
+import crypto.scram;
+import crypto.base64;
+import assert;
+
+@test
+fn test_scram_pbkdf2(): void {
+    // PBKDF2-HMAC-SHA256 published vectors.
+    assert.equalStr(sha.toHex(sha.pbkdf2HmacSha256("password", "salt", 1, 32)),
+                    "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b");
+    assert.equalStr(sha.toHex(sha.pbkdf2HmacSha256("password", "salt", 4096, 32)),
+                    "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a");
+}
+
+@test
+fn test_scram_rfc7677_exchange(): void {
+    // RFC 7677 §3: user "user", password "pencil".
+    let c = scram.ScramClient{
+        username: "user",
+        password: "pencil",
+        clientNonce: "rOprNGfwEbeRWgbNEkqO",
+    };
+    assert.equalStr(c.clientFirstMessage(), "n,,n=user,r=rOprNGfwEbeRWgbNEkqO");
+
+    let serverFirst = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
+    assert.equalStr(c.clientFinalMessage(serverFirst),
+                    "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=");
+}
+
+@test
+fn test_scram_server_signature(): void {
+    let salt = base64.decode("W22ZaJ0SNY7soEsUEjb6gQ==");
+    let auth = "n=user,r=rOprNGfwEbeRWgbNEkqO,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096,c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0";
+    assert.equalStr(scram.computeServerSigB64("pencil", salt, 4096, auth),
+                    "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=");
+}

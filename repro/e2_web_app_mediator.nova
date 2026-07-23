@@ -1,0 +1,9 @@
+import web.app;
+import web.mediator;
+
+@test
+fn imports_both() {
+    // Just importing both (app transitively uses mediator) used to collide at codegen.
+    assert_ok();
+}
+fn assert_ok(): void {}

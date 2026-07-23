@@ -1,0 +1,21 @@
+// EXPECT-FAIL: typecheck
+// A1 async-first seam: a trait method declared `async fn` MUST be implemented as `async fn`
+// (and vice versa). The async-ness determines the vtable-slot contract — an async slot holds a
+// coroutine ramp that dynamic dispatch drives/awaits; a sync impl there would be run as a
+// coroutine (crash). So a mismatch is a compile-time error, not a runtime failure.
+trait Source {
+    async fn load(self, x: int): int;
+}
+
+struct Bad impl Source {
+    init() {}
+    // NOT async — must be rejected against the trait's `async fn load`.
+    pub fn load(self: Bad, x: int): int { return x; }
+}
+
+@test
+fn t_mismatch(): void {
+    let b = Bad();
+    let s: Source = b;
+    let _ = s.load(1);
+}

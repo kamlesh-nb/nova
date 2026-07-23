@@ -1,0 +1,68 @@
+// Pins the F5 O4 "aggregate takes ownership" rule for FRESH (non-borrowed) owned elements, across
+// the three aggregate constructors: struct literal, nested struct literal, and tuple literal.
+//
+// The rule: a struct/tuple needs exactly ONE owning reference to each owned element.
+//   * a BORROWED element (an existing variable) -> RETAIN (make our own reference)
+//   * a FRESH element (a constructor result like List<T>(), or a struct literal like Inner{...})
+//     -> CONSUME its temporary (take the reference it already carries; a no-op if it is not a
+//        drainable temp, as a struct literal is)
+//
+// Two bugs hid here behind a green gate because the corpus only ever built such fields via
+// `init(){ self.x = List() }`, never a literal:
+//   1. is_r_var-only retain left a constructor TEMP unowned -> the end-of-statement drain freed it
+//      under the field -> use-after-free (only ASAN caught it; see case 41).
+//   2. a blanket retain then LEAKED a non-temp struct-literal element -> rc stuck at 1 (only --arc
+//      caught it). `Outer{ inner: Inner{...} }` leaked; `(P{n:1}, P{n:2})` leaked 2.
+// Consuming the fresh element is the single rule that balances all three. Run under --arc AND --asan.
+import assert;
+import list;
+
+struct Inner { pub items: List<string> }
+struct Outer { pub inner: Inner, pub tag: string }
+struct P { pub n: int }
+
+@test
+fn test_nested_struct_literal(): void {
+    let o = Outer{ inner: Inner{ items: List<string>() }, tag: "root" };
+    o.inner.items.push("deep");
+    o.inner.items.push("er");
+    assert.equalInt(o.inner.items.size(), 2);
+    assert.equalStr(o.inner.items.get(0), "deep");
+    assert.equalStr(o.tag, "root");
+}
+
+fn makePair(): (P, P) {
+    return (P{ n: 1 }, P{ n: 2 });
+}
+
+@test
+fn test_tuple_of_struct_literals(): void {
+    let (a, b) = makePair();
+    assert.equalInt(a.n, 1);
+    assert.equalInt(b.n, 2);
+}
+
+fn makeListPair(): (List<int>, List<string>) {
+    let xs = List<int>();
+    xs.push(7);
+    let ys = List<string>();
+    ys.push("seven");
+    return (xs, ys);
+}
+
+@test
+fn test_tuple_of_fresh_containers(): void {
+    let (xs, ys) = makeListPair();
+    assert.equalInt(xs.get(0), 7);
+    assert.equalStr(ys.get(0), "seven");
+}
+
+@test
+fn test_borrowed_element_still_retained(): void {
+    // the borrowed path: an existing variable stored into an aggregate must be retained, not consumed
+    let shared = List<string>();
+    shared.push("shared");
+    let holder = Inner{ items: shared };
+    assert.equalInt(holder.items.size(), 1);
+    assert.equalStr(shared.get(0), "shared");
+}

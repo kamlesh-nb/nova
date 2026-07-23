@@ -1,0 +1,26 @@
+// Typed lambda params — `(s: string) => ...` — now parse and type the body correctly
+// (previously §10 #19: only untyped params parsed, and they mistyped as int). A general
+// language win surfaced making the webview `bind((req: string) => ...)` idiom work.
+// (Module-qualified const access `webview.HINT_*` is verified via the webview path.)
+import assert;
+
+fn invokeStr(handler: (string) -> string, arg: string): string {
+    return nova_invoke_str_closure(handler, arg);
+}
+
+@test
+fn test_typed_lambda_param_string(): void {
+    let prefix = "got:";
+    let f = (s: string) => { return prefix + s; };     // s typed as string -> real concat
+    assert.equalStr(f("hi"), "got:hi");
+    assert.equalStr(invokeStr(f, "x"), "got:x");        // and invoked from C
+}
+
+@test
+fn test_typed_lambda_multi_param(): void {
+    let join = (a: string, b: string) => { return a + "|" + b; };
+    assert.equalStr(join("x", "y"), "x|y");
+    // expression-body typed lambda
+    let tag = (s: string) => "[" + s + "]";
+    assert.equalStr(tag("z"), "[z]");
+}

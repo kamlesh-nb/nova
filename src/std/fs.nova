@@ -1,0 +1,77 @@
+// fs.nova — File system watcher module for Nova
+// Exposes cooperative Watcher API to monitor filesystem modifications.
+
+import bytes;
+import mem.allocator;
+import io.dir;
+import io.file;
+import assert;
+
+pub struct Watcher {
+    pub handle: ptr,   // WatcherContext* pointer
+
+    /// Create a new Watcher monitoring the specified directory path.
+    init(path: string) {
+        self.handle = nova_fs_watcher_create(path);
+    }
+
+    /// Wait cooperatively for the next file modification event.
+    /// Returns the full path of the modified/created/deleted file.
+    pub fn nextEvent(self: Watcher): string {
+        return nova_fs_watcher_next_event(self.handle);
+    }
+
+    /// Close the watcher and free its descriptors/handles.
+    pub fn close(self: Watcher): void {
+        nova_fs_watcher_close(self.handle);
+        self.handle = 0;
+    }
+}
+
+fn writeFsFile(path: string, content: string): void {
+    io.file.File.writeText(path, content);
+}
+
+@test
+fn test_fs_watcher(): void {
+    let test_dir = "watch_test_dir";
+    io.dir.Dir.create(test_dir, 511); // 0o777 = 511 decimal
+
+    let watcher = Watcher(test_dir);
+
+    let d = io.dir.Dir.open(test_dir);
+    let count = d.entries().len;
+    d.close();
+
+    // Write the file the watcher should observe (was a fiber.spawn — which ran inline, so the write
+    // already happened before nextEvent(); the watcher queues the event either way).
+    writeFsFile(`watch_test_dir/changed_${count}.txt`, "content");
+
+    console.log("[test] Waiting for filesystem event...");
+    let event = watcher.nextEvent();
+    console.log("[test] Received filesystem event: " + event);
+
+    // Verify the event contains the expected filename
+    let contains_changed = false;
+    let i = 0;
+    let name = "changed_";
+    while (i <= event.length - name.length) {
+        let is_match = true;
+        let j = 0;
+        while (j < name.length) {
+            if (bytes.read_byte(event, i + j) != bytes.read_byte(name, j)) {
+                is_match = false;
+            }
+            j = j + 1;
+        }
+        if (is_match) {
+            contains_changed = true;
+        }
+        i = i + 1;
+    }
+
+    assert.isTrue(contains_changed);
+
+    // Clean up
+    watcher.close();
+}

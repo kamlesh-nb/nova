@@ -1,0 +1,14 @@
+// F1 module-scoped types: two modules each define `struct Widget` with DIFFERENT shapes and methods.
+// Each module's code resolves `Widget` to its OWN struct (findTypeInModule in sema + scopedStructName
+// in codegen key colliding structs by module). Before this, the bare-name struct table was last-wins,
+// so one Widget clobbered the other → a wrong-struct miscompile ("no such method" / field-not-found).
+// makeA uses A's Widget (int n → value()==10); makeB uses B's Widget (string label → size()==5).
+import scoped.widget_a;
+import scoped.widget_b;
+import assert;
+
+@test
+fn test_each_module_resolves_its_own_widget(): void {
+    assert.equalInt(widget_a.makeA(), 10);   // A's Widget.value() == self.n == 10
+    assert.equalInt(widget_b.makeB(), 5);    // B's Widget.size()  == "hello".length == 5
+}

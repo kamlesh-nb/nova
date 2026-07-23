@@ -1,0 +1,2 @@
+import e2mod.leaf;
+pub fn midValue(): int { return leaf.leafValue() + 1; }

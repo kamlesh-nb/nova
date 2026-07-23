@@ -1,0 +1,158 @@
+// response.nova — HTTP Response using refined enums
+import string;
+import list;
+import map;
+import bytes;
+import web.status;
+
+pub struct Response {
+    pub status: Status,
+    pub body: string,
+    pub headers: Map<string, string>,
+    pub cookies: Map<string, string>,
+
+    init(stat: Status, body: string) {
+        self.status = stat;
+        self.body = body;
+        self.headers = Map<string, string>(16, string.hash);
+        self.cookies = Map<string, string>(16, string.hash);
+    }
+
+    /// Create a 200 OK response with a body
+    pub fn ok(body: string): Response {
+        return Response(Status.Ok, body);
+    }
+
+    /// Create a response with custom status, body, headers, and cookies
+    pub fn withHeaders(stat: Status, body: string, headers: Map<string, string>): Response {
+        let cookies = Map<string, string>(16, string.hash);
+        return Response{
+            status: stat,
+            body: body,
+            headers: headers,
+            cookies: cookies,
+        };
+    }
+
+    /// Set a header on this response
+    pub fn setHeader(self: Response, key: string, value: string): Response {
+        self.headers.set(key, value);
+        return self;
+    }
+
+    /// Set a cookie on this response
+    pub fn setCookie(self: Response, name: string, value: string): Response {
+        self.cookies.set(name, value);
+        return self;
+    }
+
+    /// Get a header value (case-insensitive)
+    pub fn getHeader(self: Response, name: string): string | undefined {
+        let lower_name = string.toLowerCase(name);
+        let keys = self.headers.keys();
+        let keysLen = keys.size();
+        let i = 0;
+        while (i < keysLen) {
+            let key = keys.get(i) ?? "";
+            if (string.toLowerCase(key) == lower_name) {
+                return self.headers.get(key);
+            }
+            i = i + 1;
+        }
+        return undefined;
+    }
+
+    /// Serialize this response to an HTTP response string
+    pub fn serialize(self: Response): string {
+        let code = Status.toCode(self.status);
+        let code_str = intToStr(code);
+        let reason = Status.reasonPhrase(self.status);
+        let status_line = "HTTP/1.1 " + code_str + " " + reason + "\r\n";
+
+        // Set Content-Length if not already present
+        if (self.headers.get("Content-Length") == undefined) {
+            self.headers.set("Content-Length", intToStr(self.body.length));
+        }
+
+        // Build headers
+        let header_lines = List<string>();
+        self.headers.forEach((key, value) => {
+            header_lines.push(key + ": " + value);
+        });
+
+        // Add Set-Cookie headers
+        self.cookies.forEach((key, value) => {
+            header_lines.push("Set-Cookie: " + key + "=" + value + "; Path=/");
+        });
+
+        let headers_str = string.join(header_lines, "\r\n");
+        return status_line + headers_str + "\r\n\r\n" + self.body;
+    }
+
+    /// Parse an HTTP response string into a Response
+    pub fn parse(raw: string): Response {
+        let lines = string.split(raw, "\r\n");
+        if (lines.size() == 0) {
+            return Response(Status.Ok, "");
+        }
+
+        // Parse status line: "HTTP/1.1 200 OK"
+        let status_line = lines.get(0) ?? "";
+        let parts = string.split(status_line, " ");
+        let code = 200;
+        if (parts.size() >= 2) {
+            code = string.parseI64(parts.get(1) ?? "200");
+        }
+        let stat = Status.fromCode(code);
+
+        // Parse headers
+        let headers = Map<string, string>(16, string.hash);
+        let i = 1;
+        while (i < lines.size()) {
+            let line = lines.get(i) ?? "";
+            if (line == "") {
+                i = i + 1;
+                break;
+            }
+            let idx = string.indexOf(line, ": ");
+            if (idx != -1) {
+                let key = string.slice(line, 0, idx);
+                let val = string.slice(line, idx + 2, line.length);
+                headers.set(key, val);
+            }
+            i = i + 1;
+        }
+
+        // Remaining is body
+        let body_lines = List<string>();
+        while (i < lines.size()) {
+            body_lines.push(lines.get(i) ?? "");
+            i = i + 1;
+        }
+        let body = string.join(body_lines, "\r\n");
+
+        return Response.withHeaders(stat, body, headers);
+    }
+}
+
+// --- Private helpers ---
+
+fn intToStr(val: int): string {
+    if (val == 0) return "0";
+    let temp = val;
+    let digits = 0;
+    while (temp > 0) {
+        digits = digits + 1;
+        temp = temp / 10;
+    }
+    // ARC-correct string alloc (workstream A): data at ptr, length at [ptr-4].
+    let str_ptr = bytes.alloc(digits);
+    let i = digits - 1;
+    temp = val;
+    while (i >= 0) {
+        bytes.write_byte(str_ptr, i, (temp % 10) + 48);
+        temp = temp / 10;
+        i = i - 1;
+    }
+    return str_ptr as string;
+}

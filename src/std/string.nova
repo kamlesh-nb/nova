@@ -1,0 +1,600 @@
+// string.nova — Full string manipulation library
+//
+// All strings are UTF‑8 byte sequences stored in linear memory with a length prefix.
+// Functions return newly allocated strings (except `len` and predicates) and rely on
+// the per‑call arena reset (§9.2) for automatic memory reclamation.
+//
+// Public API:
+//   len(s: string): int
+//   concat(a: string, b: string): string
+//   split(s: string, sep: string): List<string>
+//   join(list: List<string>, sep: string): string
+//   slice(s: string, start: int, end: int): string
+//   trim(s: string): string
+//   replace(s: string, old: string, new: string): string
+//   to_lowercase(s: string): string
+//   to_uppercase(s: string): string
+//   starts_with(s: string, prefix: string): bool
+//   ends_with(s: string, suffix: string): bool
+//   contains(s: string, substr: string): bool
+//   index_of(s: string, substr: string): int
+//   eql(a: string, b: string): bool
+//   compare(a: string, b: string): int
+
+import list;   // List<T>
+import bytes;  // bytes.alloc, bytes.write_byte, bytes.write_i32, etc.
+
+// ---------------------------------------------------------------------------
+// Length
+// ---------------------------------------------------------------------------
+
+/// Return the length (in bytes) of the string.
+pub fn len(s: string): int {
+    return s.length;
+}
+
+fn allocString(len: int): string {
+    // ARC-correct string allocation (workstream A). nova_bytes_alloc writes the
+    // 8-byte object header (refcount @base+0, length=len @base+4) and returns
+    // base+8, so the result already satisfies the ARC layout: refcount at [ptr-8],
+    // length at [ptr-4], data at [ptr..]. (Previously this added a redundant 4-byte
+    // length prefix and returned ptr+4, misaligning the refcount — the arena's
+    // refcount-exemption hid the breakage.)
+    return bytes.alloc(len) as string;
+}
+
+// ---------------------------------------------------------------------------
+// Concatenation
+// ---------------------------------------------------------------------------
+
+/// Return a new string that is `a` followed by `b`.
+pub fn concat(a: string, b: string): string {
+    let len_a = a.length;
+    let len_b = b.length;
+    let total_len = len_a + len_b;
+    let ptr = allocString(total_len);
+    let i = 0;
+    while (i < len_a) {
+        bytes.write_byte(ptr, i, a[i]);
+        i = i + 1;
+    }
+    let j = 0;
+    while (j < len_b) {
+        bytes.write_byte(ptr, len_a + j, b[j]);
+        j = j + 1;
+    }
+    return ptr;
+}
+
+// ---------------------------------------------------------------------------
+// Split and Join
+// ---------------------------------------------------------------------------
+
+/// Split `s` into a list of substrings separated by `sep`.
+/// If `sep` is empty, returns a list of single‑character strings (UTF‑8 bytes).
+pub fn split(s: string, sep: string): List<string> {
+    let result = List<string>();
+    let s_len = s.length;
+    let sep_len = sep.length;
+
+    if (sep_len == 0) {
+        // Split into individual characters (UTF‑8 bytes).
+        let i = 0;
+        while (i < s_len) {
+            let char_len = 1; // In a real UTF‑8 implementation this would be variable.
+            let char_ptr = allocString(1);
+            bytes.write_byte(char_ptr, 0, s[i]);
+            result.push(char_ptr);
+            i = i + 1;
+        }
+        return result;
+    }
+
+    let start = 0;
+    while (true) {
+        let pos = indexOfFrom(s, sep, start);
+        if (pos == -1) {
+            // Append the remaining substring.
+            let remaining = slice(s, start, s_len);
+            result.push(remaining);
+            break;
+        }
+        // Append the substring before the separator.
+        let part = slice(s, start, pos);
+        result.push(part);
+        start = pos + sep_len;
+    }
+    return result;
+}
+
+/// Join a list of strings into a single string with `sep` between each element.
+pub fn join(list: List<string>, sep: string): string {
+    if (list.size() == 0) {
+        return "";
+    }
+    let sep_len = sep.length;
+    let list_len = list.size();
+    // Calculate total length.
+    let total_len = 0;
+    let idx = 0;
+    while (idx < list_len) {
+        let s = list.get(idx);
+        // `get` returns `string | undefined` (spec 3.4). The loop bound makes it
+        // present, but the type system cannot know that — and this is exactly the
+        // read that would load a length header through `undefined` if it were ever
+        // wrong. Narrowed per spec 3.4a.
+        if (s != undefined) {
+            total_len = total_len + s.length;
+        }
+        idx = idx + 1;
+    }
+    total_len = total_len + sep_len * (list_len - 1);
+
+    let ptr = allocString(total_len);
+    let offset = 0;
+    let i = 0;
+    while (i < list_len) {
+        let s = list.get(i);
+        if (s != undefined) {
+            let len_s = s.length;
+            let j = 0;
+            while (j < len_s) {
+                bytes.write_byte(ptr, offset + j, s[j]);
+                j = j + 1;
+            }
+            offset = offset + len_s;
+        }
+        if (i < list_len - 1) {
+            let k = 0;
+            while (k < sep_len) {
+                bytes.write_byte(ptr, offset + k, sep[k]);
+                k = k + 1;
+            }
+            offset = offset + sep_len;
+        }
+        i = i + 1;
+    }
+    return ptr;
+}
+
+// ---------------------------------------------------------------------------
+// Substrings and Slicing
+// ---------------------------------------------------------------------------
+
+/// Return a substring from `start` to `end` (exclusive). Bounds are clamped.
+pub fn slice(s: string, start: int, end: int): string {
+    let s_len = s.length;
+    let start_clamped = if (start < 0) 0 else if (start > s_len) s_len else start;
+    let end_clamped = if (end < start_clamped) start_clamped else if (end > s_len) s_len else end;
+    let len = end_clamped - start_clamped;
+    if (len <= 0) {
+        return "";
+    }
+    let ptr = allocString(len);
+    let i = 0;
+    while (i < len) {
+        bytes.write_byte(ptr, i, s[start_clamped + i]);
+        i = i + 1;
+    }
+    return ptr;
+}
+
+// ---------------------------------------------------------------------------
+// Trim (whitespace)
+// ---------------------------------------------------------------------------
+
+/// Return a new string with leading and trailing ASCII whitespace removed.
+pub fn trim(s: string): string {
+    let len = s.length;
+    let start = 0;
+    while (start < len) {
+        let c = s[start];
+        if (c != 32 && c != 9 && c != 10 && c != 13) {
+            break;
+        }
+        start = start + 1;
+    }
+    let end = len;
+    while (end > start) {
+        let c = s[end - 1];
+        if (c != 32 && c != 9 && c != 10 && c != 13) {
+            break;
+        }
+        end = end - 1;
+    }
+    return slice(s, start, end);
+}
+
+// ---------------------------------------------------------------------------
+// Replace
+// ---------------------------------------------------------------------------
+
+/// Replace all non‑overlapping occurrences of `old` with `new` in `s`.
+pub fn replace(s: string, old: string, new: string): string {
+    let s_len = s.length;
+    let old_len = old.length;
+    let new_len = new.length;
+
+    if (old_len == 0) {
+        // If old is empty, insert new before each character and at the end.
+        // This is a common definition in many languages.
+        let result = bytes.alloc(s_len * (new_len + 1) + new_len); // worst case
+        let offset = 0;
+        let i = 0;
+        while (i < s_len) {
+            // Insert new before each character.
+            let k = 0;
+            while (k < new_len) {
+                bytes.write_byte(result, offset + k, new[k]);
+                k = k + 1;
+            }
+            offset = offset + new_len;
+            bytes.write_byte(result, offset, s[i]);
+            offset = offset + 1;
+            i = i + 1;
+        }
+        // Insert new at the end.
+        let k = 0;
+        while (k < new_len) {
+            bytes.write_byte(result, offset + k, new[k]);
+            k = k + 1;
+        }
+        offset = offset + new_len;
+        // Slice the exact length.
+        return slice(result, 0, offset);
+    }
+
+    // Count occurrences.
+    let count = 0;
+    let pos = 0;
+    while (true) {
+        let idx = indexOfFrom(s, old, pos);
+        if (idx == -1) break;
+        count = count + 1;
+        pos = idx + old_len;
+    }
+
+    if (count == 0) {
+        return s; // no changes
+    }
+
+    let result_len = s_len + count * (new_len - old_len);
+    let result = allocString(result_len);
+    let offset = 0;
+    let search_start = 0;
+
+    while (true) {
+        let idx = indexOfFrom(s, old, search_start);
+        if (idx == -1) {
+            // Copy the remaining part.
+            let remaining_len = s_len - search_start;
+            let k = 0;
+            while (k < remaining_len) {
+                bytes.write_byte(result, offset + k, s[search_start + k]);
+                k = k + 1;
+            }
+            break;
+        }
+        // Copy the part before the match.
+        let before_len = idx - search_start;
+        let k = 0;
+        while (k < before_len) {
+            bytes.write_byte(result, offset + k, s[search_start + k]);
+            k = k + 1;
+        }
+        offset = offset + before_len;
+        // Copy the replacement.
+        let k = 0;
+        while (k < new_len) {
+            bytes.write_byte(result, offset + k, new[k]);
+            k = k + 1;
+        }
+        offset = offset + new_len;
+        search_start = idx + old_len;
+    }
+
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Case Conversion (ASCII only)
+// ---------------------------------------------------------------------------
+
+pub fn toLowerCase(s: string): string {
+    let len = s.length;
+    let ptr = allocString(len);
+    let i = 0;
+    while (i < len) {
+        let c = s[i];
+        if (c >= 65 && c <= 90) {
+            bytes.write_byte(ptr, i, c + 32);
+        } else {
+            bytes.write_byte(ptr, i, c);
+        }
+        i = i + 1;
+    }
+    return ptr;
+}
+
+pub fn toUpperCase(s: string): string {
+    let len = s.length;
+    let ptr = allocString(len);
+    let i = 0;
+    while (i < len) {
+        let c = s[i];
+        if (c >= 97 && c <= 122) {
+            bytes.write_byte(ptr, i, c - 32);
+        } else {
+            bytes.write_byte(ptr, i, c);
+        }
+        i = i + 1;
+    }
+    return ptr;
+}
+
+// ---------------------------------------------------------------------------
+// Predicates
+// ---------------------------------------------------------------------------
+
+pub fn startsWith(s: string, prefix: string): bool {
+    let s_len = s.length;
+    let p_len = prefix.length;
+    if (s_len < p_len) {
+        return false;
+    }
+    let i = 0;
+    while (i < p_len) {
+        if (s[i] != prefix[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fn endsWith(s: string, suffix: string): bool {
+    let s_len = s.length;
+    let suf_len = suffix.length;
+    if (s_len < suf_len) {
+        return false;
+    }
+    let i = 0;
+    while (i < suf_len) {
+        if (s[s_len - suf_len + i] != suffix[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fn contains(s: string, substr: string): bool {
+    let s_len = s.length;
+    let sub_len = substr.length;
+    if (s_len < sub_len) {
+        return false;
+    }
+    if (sub_len == 0) {
+        return true;
+    }
+    let i = 0;
+    while (i <= s_len - sub_len) {
+        let j = 0;
+        let is_match = true;
+        while (j < sub_len) {
+            if (s[i + j] != substr[j]) {
+                is_match = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if (is_match) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn indexOf(s: string, substr: string): int {
+    return indexOfFrom(s, substr, 0);
+}
+
+// Index of the LAST occurrence of substr, or -1. Scans from the right.
+pub fn lastIndexOf(s: string, substr: string): int {
+    let s_len = s.length;
+    let sub_len = substr.length;
+    if (s_len < sub_len) { return -1; }
+    if (sub_len == 0) { return s_len; }
+    let i = s_len - sub_len;
+    while (i >= 0) {
+        let j = 0;
+        let is_match = true;
+        while (j < sub_len) {
+            if (s[i + j] != substr[j]) { is_match = false; break; }
+            j = j + 1;
+        }
+        if (is_match) { return i; }
+        i = i - 1;
+    }
+    return -1;
+}
+
+// Private helper: search from a given start position.
+fn indexOfFrom(s: string, substr: string, start: int): int {
+    let s_len = s.length;
+    let sub_len = substr.length;
+    if (s_len < sub_len || start >= s_len) {
+        return -1;
+    }
+    if (sub_len == 0) {
+        return start;
+    }
+    let i = start;
+    while (i <= s_len - sub_len) {
+        let j = 0;
+        let is_match = true;
+        while (j < sub_len) {
+            if (s[i + j] != substr[j]) {
+                is_match = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if (is_match) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ---------------------------------------------------------------------------
+// Equality and Comparison
+// ---------------------------------------------------------------------------
+
+/// Byte‑wise equality.
+pub fn eql(a: string, b: string): bool {
+    if (a == undefined || b == undefined) {
+        return a == undefined && b == undefined;
+    }
+    let len_a = a.length;
+    let len_b = b.length;
+    if (len_a != len_b) {
+        return false;
+    }
+    let i = 0;
+    while (i < len_a) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Lexicographic order (byte‑wise).
+pub fn compare(a: string, b: string): int {
+    let len_a = a.length;
+    let len_b = b.length;
+    let min_len = len_a;
+    if (len_b < len_a) {
+        min_len = len_b;
+    }
+    let i = 0;
+    while (i < min_len) {
+        let char_a = a[i];
+        let char_b = b[i];
+        if (char_a < char_b) {
+            return -1;
+        }
+        if (char_a > char_b) {
+            return 1;
+        }
+        i = i + 1;
+    }
+    if (len_a < len_b) {
+        return -1;
+    }
+    if (len_a > len_b) {
+        return 1;
+    }
+    return 0;
+}
+
+pub fn hash(s: string): int {
+    let len = s.length;
+    let h = 5381;
+    let i = 0;
+    while (i < len) {
+        let c = s[i];
+        h = ((h << 5) + h) + c;
+        i = i + 1;
+    }
+    return h;
+}
+
+/// Parse a string to an integer. Returns 0 if invalid.
+pub fn parseI64(s: string): int {
+    let len = s.length;
+    if (len == 0) {
+        return 0;
+    }
+    let result = 0;
+    let i = 0;
+    let sign = 1;
+    if (s[0] == 45) { // '-'
+        sign = -1;
+        i = 1;
+    }
+    while (i < len) {
+        let c = s[i];
+        if (c >= 48 && c <= 57) {
+            result = result * 10 + (c - 48);
+        }
+        i = i + 1;
+    }
+    return result * sign;
+}
+
+/// Parse a decimal floating-point number: [-]digits[.digits]. Non-digit
+/// characters other than a leading '-' and a single '.' are ignored.
+pub fn parseFloat(s: string): double {
+    let len = s.length;
+    let i = 0;
+    let neg = false;
+    if (len > 0 && s[0] == 45) {   // '-'
+        neg = true;
+        i = 1;
+    }
+    let intPart = 0.0;
+    while (i < len && s[i] != 46) {   // until '.'
+        if (s[i] >= 48 && s[i] <= 57) {
+            intPart = intPart * 10.0 + ((s[i] - 48) as double);
+        }
+        i = i + 1;
+    }
+    let frac = 0.0;
+    let scale = 1.0;
+    if (i < len && s[i] == 46) {   // '.'
+        i = i + 1;
+        while (i < len) {
+            if (s[i] >= 48 && s[i] <= 57) {
+                scale = scale / 10.0;
+                frac = frac + ((s[i] - 48) as double) * scale;
+            }
+            i = i + 1;
+        }
+    }
+    let result = intPart + frac;
+    if (neg) {
+        result = 0.0 - result;
+    }
+    return result;
+}
+
+pub fn delete(self: string): void {
+}
+
+@test
+fn test_string_helpers(): void {
+    if (!startsWith("hello", "he")) { nova_test_fail("startsWith fail"); }
+    if (startsWith("hello", "lo")) { nova_test_fail("startsWith negative fail"); }
+    if (!endsWith("hello", "lo")) { nova_test_fail("endsWith fail"); }
+    if (endsWith("hello", "he")) { nova_test_fail("endsWith negative fail"); }
+    if (!contains("hello", "el")) { nova_test_fail("contains fail"); }
+    if (contains("hello", "world")) { nova_test_fail("contains negative fail"); }
+    
+    if (indexOf("hello", "e") != 1) { nova_test_fail("indexOf fail"); }
+    if (indexOf("hello", "z") != -1) { nova_test_fail("indexOf negative fail"); }
+
+    if (!eql("abc", "abc")) { nova_test_fail("eql fail"); }
+    if (eql("abc", "def")) { nova_test_fail("eql negative fail"); }
+
+    if (compare("abc", "def") != -1) { nova_test_fail("compare < fail"); }
+    if (compare("def", "abc") != 1) { nova_test_fail("compare > fail"); }
+    if (compare("abc", "abc") != 0) { nova_test_fail("compare == fail"); }
+
+    if (parseI64("1234") != 1234) { nova_test_fail("parseI64 positive fail"); }
+    if (parseI64("-56") != -56) { nova_test_fail("parseI64 negative fail"); }
+}

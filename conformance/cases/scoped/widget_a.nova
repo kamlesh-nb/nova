@@ -1,0 +1,7 @@
+// Module A's Widget — an int-shaped one. Same NAME as module B's Widget, different shape.
+pub struct Widget {
+    pub n: int
+    init(){ self.n = 10; }
+    pub fn value(self: Widget): int { return self.n; }
+}
+pub fn makeA(): int { let w = Widget(); return w.value(); }

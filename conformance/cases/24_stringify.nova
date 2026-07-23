@@ -1,0 +1,33 @@
+// Gates A8: the compiler-injected `__i32_to_string`/`__bool_to_string` are deleted;
+// string concat and `${}` interpolation stringify every primitive through the runtime
+// helpers (nova_i64_to_string / nova_bool_to_string / nova_f64_to_string). Covers the
+// three rewired codegen paths: `+` concat, `${}` interpolation, and bool/float.
+import assert;
+
+@test
+fn test_concat_stringifies_primitives(): void {
+    let n = 42;
+    let b = true;
+    assert.equalStr("count: " + n, "count: 42");
+    assert.equalStr("flag: " + b, "flag: true");
+    assert.equalStr("neg: " + (0 - 7), "neg: -7");
+    assert.equalStr(n + " items", "42 items");        // int on the left
+}
+
+@test
+fn test_interpolation_stringifies_primitives(): void {
+    let n = 100;
+    let b = false;
+    let f = 2.5;
+    let big: long = 5000000000;
+    assert.equalStr(`n=${n} b=${b} f=${f} big=${big}`, "n=100 b=false f=2.5 big=5000000000");
+}
+
+@test
+fn test_stringify_boundaries(): void {
+    // 32-bit int boundaries still stringify correctly after A7's narrowing.
+    let mx: int = 2147483647;
+    let mn: int = -2147483648;
+    assert.equalStr(`${mx}`, "2147483647");
+    assert.equalStr(`${mn}`, "-2147483648");
+}

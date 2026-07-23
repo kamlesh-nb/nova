@@ -1,0 +1,22 @@
+// Gates module-qualified constructor and instance-method calls — `module.Struct()` and
+// `let x = module.Struct(); x.method()`. Codegen built these, but sema didn't TYPE their
+// results, so `let w = module.Struct()` was untyped and `w.method()` failed with
+// MethodOrFunctionNotFound. This is the fix that unblocked the DB drivers, which do
+// `module.Struct()` + instance-method calls.
+//
+// Uses collections.string_builder's StringBuilder (a real module, self-contained, no
+// network) as the module-qualified-call vehicle.
+import string_builder;
+import assert;
+
+@test
+fn test_module_qualified_constructor_and_methods(): void {
+    // `string_builder.StringBuilder()` — module-qualified constructor; result must be typed
+    // StringBuilder so the instance-method calls below resolve.
+    let sb = string_builder.StringBuilder();
+    sb.append("hello");
+    sb.appendChar(32);      // ' '
+    sb.append("world");
+    assert.equalStr(sb.toString(), "hello world");
+    sb.delete();
+}

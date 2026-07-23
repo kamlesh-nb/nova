@@ -1,0 +1,23 @@
+.{
+    .name = .nova,
+    .version = "0.0.0",
+    .fingerprint = 0xfae65c8f2150b029,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // Vendored locally (deps/llvm-zig) so the toolchain has no GitHub-fetch
+        // dependency and the LLVM link can be statically wired to the LLVM 22
+        // drop from build.zig (P5 #20, "deploy only nova").
+        .llvm = .{
+            .path = "deps/llvm-zig",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "deps",
+        // For example...
+        //"LICENSE",
+        //"README.md",
+    },
+}

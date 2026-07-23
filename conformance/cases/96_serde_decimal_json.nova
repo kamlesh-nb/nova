@@ -1,0 +1,42 @@
+// S1: exact decimal128 through JSON. A JSON number is stored as raw text and re-emitted verbatim,
+// so a decimal survives encode -> stringify -> parse -> decode with NO binary-double drift.
+//   json.decimalValue(d) -> a number carrying the decimal's exact text
+//   json.asDecimal(v)     -> parse that text straight to BID (via decimal.fromString)
+import serde.json;
+import map;
+import string;
+import assert;
+
+@test
+fn test_encode_stringify_parse_decode(): void {
+    let obj = Map<string, json.JsonValue>(8, string.hash);
+    obj.set("price", json.decimalValue(19.99m));
+    let text = json.stringify(json.object(obj));      // {"price":19.99}
+    let back = json.parse(text);
+    let d = json.asDecimal(json.get(back, "price")) ?? 0m;
+    assert.equalStr(`${d}`, "19.99");
+    assert.equalStr(`${d + 0.01m}`, "20.00");         // real decimal arithmetic (scale preserved), not f64
+}
+
+@test
+fn test_parse_exact_fraction(): void {
+    // 0.1 has no exact binary double; as a JSON number-text it round-trips exactly.
+    let v = json.parse("{\"x\": 0.1, \"y\": 0.2}");
+    let x = json.asDecimal(json.get(v, "x")) ?? 0m;
+    let y = json.asDecimal(json.get(v, "y")) ?? 0m;
+    assert.equalStr(`${x}`, "0.1");
+    assert.equalStr(`${x + y}`, "0.3");               // 0.1 + 0.2 == 0.3 exactly
+}
+
+@test
+fn test_high_precision(): void {
+    let v = json.parse("{\"n\": 12345678901234567890123456789012.34}");
+    let d = json.asDecimal(json.get(v, "n")) ?? 0m;
+    assert.equalStr(`${d}`, "12345678901234567890123456789012.34");
+}
+
+@test
+fn test_asdecimal_wrong_kind(): void {
+    let v = json.parse("{\"s\": \"hello\"}");
+    assert.isTrue(json.asDecimal(json.get(v, "s")) == undefined);  // a string is not a number
+}

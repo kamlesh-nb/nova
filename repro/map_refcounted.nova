@@ -1,0 +1,17 @@
+import list;
+import assert;
+
+@test
+fn test_map_refcounted(): void {
+    let i = 0;
+    while (i < 100) {
+        let xs = list.List<int>();
+        xs.push(1);
+        xs.push(2);
+        xs.push(3);
+        let ys = xs.map((x) => `val${x}`);
+        assert.equalInt(ys.size(), 3);
+        assert.equalStr(ys.get(0) ?? "", "val1");
+        i = i + 1;
+    }
+}

@@ -1,0 +1,44 @@
+// A1: `future<T>` is a FIRST-CLASS type — the handle `spawn`/`go` yields. It can be stored in a
+// `List<future<T>>`, held in a local with an explicit annotation, and awaited out of a container.
+// This is the enabling keystone for concurrent "await-all" fan-out: spawn N tasks, collect their
+// handles, then await each. (A future is a scheduler-managed coroutine handle, NOT ARC-owned, so
+// a List of them is a list of plain machine words — verified ARC-clean.)
+// `spawn`/`await` are only legal inside an `async fn`; a sync @test BLOCK-DRIVES an async call.
+import list;
+import assert;
+
+async fn square(n: int): int { return n * n; }
+async fn addAsync(a: int, b: int): int { return a + b; }
+
+// Fan out: spawn every task, keep the futures, then await them all in order.
+async fn sumOfSquares(n: int): int {
+    let futures = List<future<int>>();
+    let i = 1;
+    while (i <= n) { futures.push(spawn square(i)); i = i + 1; }   // store futures in a List
+    let total = 0;
+    let j = 0;
+    while (j < futures.size()) { total = total + await futures.at(j); j = j + 1; }  // await from list
+    return total;
+}
+
+// Several concurrent tasks of the same result type, launched then joined.
+async fn heteroFanout(): int {
+    let fs = List<future<int>>();
+    fs.push(spawn square(3));       // 9
+    fs.push(spawn square(4));       // 16
+    fs.push(spawn addAsync(1, 2));  // 3
+    let total = 0;
+    let i = 0;
+    while (i < fs.size()) { total = total + await fs.at(i); i = i + 1; }
+    return total;
+}
+
+@test
+fn test_future_stored_and_awaited(): void {
+    assert.equalInt(sumOfSquares(4), 30);   // 1 + 4 + 9 + 16
+}
+
+@test
+fn test_heterogeneous_fanout(): void {
+    assert.equalInt(heteroFanout(), 28);    // 9 + 16 + 3
+}

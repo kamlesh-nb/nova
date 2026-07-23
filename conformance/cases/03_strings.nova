@@ -1,0 +1,44 @@
+// Pins current string behavior (ASCII-level ops).
+import assert;
+import string;
+import list;
+
+@test
+fn test_string_ops(): void {
+    let s = "hello world";
+    assert.equalInt(string.len(s), 11);
+    assert.isTrue(string.startsWith(s, "hello"));
+    assert.isTrue(string.endsWith(s, "world"));
+    assert.isTrue(string.contains(s, "o w"));
+    assert.equalStr(string.toUpperCase("abc"), "ABC");
+    assert.equalStr(string.concat("foo", "bar"), "foobar");
+}
+
+// string.join was UNCOVERED: the corpus compiled it (it is merged into every
+// program) but never CALLED it, so it stayed green through any change to it. It
+// was edited for optional-narrowing (specs.md 3.4a) on the strength of a 28/28
+// that could not have failed.
+//
+// join's narrowing matters more than most: `list.get(i)` is `string | undefined`,
+// and the `if (s != undefined)` guard now wraps the loop body that advances
+// `offset`. Get that wrong and the separator placement silently drifts, which no
+// type check would catch.
+@test
+fn test_string_join(): void {
+    let parts = List<string>();
+    parts.push("a");
+    parts.push("b");
+    parts.push("c");
+    assert.equalStr(string.join(parts, ", "), "a, b, c");
+    assert.equalStr(string.join(parts, ""), "abc");
+
+    // A separator longer than one byte — offset arithmetic, not just concatenation.
+    assert.equalStr(string.join(parts, " -- "), "a -- b -- c");
+
+    // Edge cases: one element takes no separator at all; empty takes the early return.
+    let one = List<string>();
+    one.push("solo");
+    assert.equalStr(string.join(one, ", "), "solo");
+    let none = List<string>();
+    assert.equalStr(string.join(none, ", "), "");
+}

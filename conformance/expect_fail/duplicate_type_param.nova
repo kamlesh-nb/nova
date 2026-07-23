@@ -1,0 +1,12 @@
+// NEGATIVE test: must FAIL to compile.
+// A generic declaration may not repeat a type parameter name
+// (A2 increment 2 — generic declaration validity).
+struct Bad<A, A> {
+    pub x: A,
+    init(v: A) { self.x = v; }
+}
+
+@test
+fn t(): void {
+    let b = Bad<int, int>(1);
+}

@@ -1,0 +1,91 @@
+// Gates `T | E` — the error model (specs §3.4b). Errors are VALUES you return.
+//
+// The road here, because each step is a regression this case must prevent:
+//   `throw "DI Error: " + key`  -> caught as 8472        (i32 truncation; throw removed, §5.5)
+//   return undefined            -> caller learns nothing
+//   "not found: " + k           -> "not found: 4299572560" (sema never bound the payload name)
+//   return E.NotFound(k)        -> boxed with the OK TAG   (sema never typed `E.Variant(x)`, so
+//                                  the return wrap asked "is this the error side?", got no type,
+//                                  and defaulted to "no" — an error silently became a success)
+//
+// Every one of those is the same defect: SOMETHING WAS NOT TYPED, SO CODEGEN GUESSED.
+//
+// Representation: a box `[ARC header][tag][payload]`, tag 0 = ok, 1 = err. Unlike `optional`
+// (a 0 sentinel) the error side is a real value, so the discriminant must be real. The box OWNS
+// its payload and releases it in `__destruct_ErrUnion_*`, branching on the tag — the rule the
+// tuple box had to learn the hard way.
+//
+// `try`/`catch` here are NOT exceptions: `try f()` returns f's error from the enclosing function;
+// `f() catch h` yields h on the error path. Both are branches on a value — nothing unwinds,
+// nothing leaks, no UB under coroutines. `try { ... }` remains a parse error (expect_fail).
+import assert;
+
+enum ConfigError {
+    NotFound(string),
+    BadPort(int),
+}
+
+fn readConfig(path: string): string | ConfigError {
+    if (path == "missing.toml") { return ConfigError.NotFound(path); }
+    return "8080";
+}
+
+fn reason(e: ConfigError): string {
+    switch (e) {
+        case ConfigError.NotFound(p): { return "config not found: " + p; }
+        case ConfigError.BadPort(n):  { return "bad port"; }
+    }
+    return "?";
+}
+
+// `try` — propagate the error to MY caller, unwrap on success.
+fn loadPort(path: string): string | ConfigError {
+    let raw = try readConfig(path);
+    return "port=" + raw;
+}
+
+@test
+fn test_catch_yields_default_on_error(): void {
+    assert.equalStr(readConfig("missing.toml") catch "fallback", "fallback");
+}
+
+@test
+fn test_catch_passes_ok_through(): void {
+    assert.equalStr(readConfig("app.toml") catch "fallback", "8080");
+}
+
+// THE REGRESSION GATE. `return E.NotFound(path)` must be boxed with the ERROR tag. When
+// `E.Variant(x)` was untyped it boxed as OK — so this read "8080" and the error vanished.
+@test
+fn test_error_side_is_actually_tagged_as_error(): void {
+    assert.notEqualStr(readConfig("missing.toml") catch "fallback", "8080");
+}
+
+// The payload must survive the union AND the concat — the `8472` / `4299572560` shape.
+@test
+fn test_catch_binds_error_with_message_intact(): void {
+    let msg = readConfig("missing.toml") catch (e) reason(e);
+    assert.equalStr(msg, "config not found: missing.toml");
+}
+
+@test
+fn test_try_propagates_the_error(): void {
+    let msg = loadPort("missing.toml") catch (e) reason(e);
+    assert.equalStr(msg, "config not found: missing.toml");
+}
+
+@test
+fn test_try_unwraps_on_success(): void {
+    assert.equalStr(loadPort("app.toml") catch "fallback", "port=8080");
+}
+
+// An INT payload must stay an int — a "fix" that made every payload a string would pass the
+// string tests above and be wrong.
+@test
+fn test_int_payload_round_trips(): void {
+    let e: ConfigError = ConfigError.BadPort(70000);
+    switch (e) {
+        case ConfigError.NotFound(p): { assert.fail("wrong arm"); }
+        case ConfigError.BadPort(n):  { assert.equalInt(n, 70000); }
+    }
+}

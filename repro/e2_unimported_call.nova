@@ -1,0 +1,4 @@
+@test
+fn calls_unimported() {
+    let x = leaf.leafValue();  // leaf NOT imported → must be a located error, not silent
+}

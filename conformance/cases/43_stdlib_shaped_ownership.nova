@@ -1,0 +1,88 @@
+// Coverage for stdlib-shaped ownership patterns that the corpus did not previously exercise. These
+// all pass clean under --arc AND --asan; they are here so a future ARC change that breaks one is
+// caught, and so the "green gate" actually reflects the patterns the stdlib will lean on. Found via
+// the 2026-07-18 coverage-probe pass. The patterns that DID break in that pass (struct literal as an
+// owned call argument -> leak; `try` returning an owned payload -> box leak) are NOT here — they are
+// documented known gaps in codegen/expressions.zig pending a uniform argument-ownership convention.
+import assert;
+import list;
+import map;
+import string;
+
+// Map whose VALUE is an owned container.
+@test
+fn test_map_of_lists(): void {
+    let m = map.Map<string, List<int>>(16, string.hash);
+    let l = List<int>();
+    l.push(1);
+    l.push(2);
+    m.set("nums", l);
+    assert.equalInt(m.at("nums").size(), 2);
+}
+
+// An optional container field, accessed after a presence guard (narrowing, no force-unwrap).
+struct Node { pub kids: List<int> | undefined }
+@test
+fn test_optional_container_field(): void {
+    let n = Node{ kids: List<int>() };
+    // A FIELD does not narrow (nothing stops it changing between the test and the use), so
+    // bind it to a local and narrow the local — the sound pattern for an optional field.
+    let kids = n.kids;
+    if (kids != undefined) {
+        kids.push(5);
+        kids.push(6);
+        assert.equalInt(kids.at(1), 6);
+    }
+}
+
+// An enum PAYLOAD that owns a container, bound in a switch.
+enum Val { Nums(List<int>), Empty }
+@test
+fn test_enum_payload_owns_container(): void {
+    let l = List<int>();
+    l.push(9);
+    let v = Val.Nums(l);
+    switch (v) {
+        case Val.Nums(xs): { assert.equalInt(xs.get(0), 9); }
+        case Val.Empty: { assert.fail("should be Nums"); }
+    }
+}
+
+// Reassigning an owned field: the old container must be released, the new one owned.
+struct Bag { pub items: List<string> }
+@test
+fn test_reassign_owned_field(): void {
+    let b = Bag{ items: List<string>() };
+    b.items.push("first");
+    b.items = List<string>();
+    b.items.push("second");
+    assert.equalInt(b.items.size(), 1);
+    assert.equalStr(b.items.get(0), "second");
+}
+
+// Passing an owned container into a fn (borrowed) and returning it.
+fn appendOne(xs: List<int>): List<int> {
+    xs.push(1);
+    return xs;
+}
+@test
+fn test_pass_and_return_container(): void {
+    let l = List<int>();
+    let r = appendOne(l);
+    assert.equalInt(r.size(), 1);
+}
+
+// A tuple of FRESH owned containers, returned and destructured.
+fn twoLists(): (List<int>, List<string>) {
+    let a = List<int>();
+    a.push(7);
+    let b = List<string>();
+    b.push("x");
+    return (a, b);
+}
+@test
+fn test_tuple_of_fresh_containers_returned(): void {
+    let (xs, ys) = twoLists();
+    assert.equalInt(xs.get(0), 7);
+    assert.equalStr(ys.get(0), "x");
+}

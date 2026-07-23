@@ -1,0 +1,161 @@
+// pool.nova — a connection pool over the `db.Driver` / `db.Connection` seam (D6).
+//
+// A `db.Connection` is a single socket; a concurrent app that opens one per request pays the
+// full connect + auth handshake every time and can exhaust server-side connection slots. A
+// `Pool` keeps a set of already-open connections and hands them out for reuse:
+//
+//   let pool = Pool(PgDriver(), "postgres://user@host/db", 8);
+//   let c = pool.acquire();        // reuse an idle conn, or open a new one
+//   let rs = c.query("SELECT 1", List<DbValue>());
+//   pool.release(c);               // return it for the next caller
+//   ...
+//   pool.closeAll();               // at shutdown
+//
+// The pool is driver-generic — it programs against the `Driver`/`Connection` traits, so the
+// same pool works for BTreeDB / Postgres / MySQL / MSSQL by swapping the driver passed to it.
+//
+// CONCURRENCY: the drivers are blocking, single-socket clients, so this pool is a *resource
+// cache*, not a lock-guarded shared structure. In the async/coroutine web app it lets one
+// process reuse connections across requests without a fresh handshake each time. `maxIdle`
+// bounds how many idle connections are kept warm; a `release` beyond that closes the surplus
+// connection instead of hoarding sockets.
+import db;
+import string;
+import resilience.breaker;
+
+pub struct Pool {
+    pub driver: Driver,
+    pub dsn: string,
+    pub idle: List<Connection>,
+    pub maxIdle: int,
+    pub opened: int,        // total connections ever opened by this pool (diagnostics)
+    pub live: int,          // currently-live connections (idle + checked-out)
+
+    init(driver: Driver, dsn: string, maxIdle: int) {
+        self.driver = driver;
+        self.dsn = dsn;
+        self.idle = List<Connection>();
+        self.maxIdle = if (maxIdle > 0) maxIdle else 1;
+        self.opened = 0;
+        self.live = 0;
+    }
+
+    // Hand out a connection: reuse the most-recently-released idle one (warm, LIFO for cache
+    // locality) or open a fresh one if none is idle. The returned connection is OWNED by the
+    // caller until `release`d (or `close`d). Apply a per-op timeout on it if desired via
+    // `c.setTimeout(ms)`.
+    // A1 async-first: `acquire` is async because opening a fresh connection AWAITS the driver's
+    // async connect. A pool inside a request coroutine `await`s this; a synchronous caller drives
+    // it. Reusing a warm idle connection does no I/O, but the method is uniformly async.
+    pub async fn acquire(self): Connection {
+        let n = self.idle.size();
+        if (n > 0) {
+            let c = self.idle.at(n - 1);   // trapping accessor; n>0 so in range (no async fallback)
+            self.idle.remove(n - 1);
+            return c;
+        }
+        return await self.newConn();
+    }
+
+    // Return a connection to the pool for reuse. If the idle set is already at `maxIdle`, the
+    // surplus connection is closed instead of pooled (bounds socket use). Pass a connection
+    // you got from `acquire`.
+    pub fn release(self, c: Connection): void {
+        if (self.idle.size() < self.maxIdle) {
+            self.idle.push(c);
+        } else {
+            c.close();
+            if (self.live > 0) { self.live = self.live - 1; }
+        }
+    }
+
+    // Open + count a brand-new connection (internal). Awaits the driver's async connect.
+    async fn newConn(self): Connection {
+        let c = await self.driver.connect(self.dsn);
+        self.opened = self.opened + 1;
+        self.live = self.live + 1;
+        return c;
+    }
+
+    // Throw away a connection instead of returning it (a broken/dead socket must NOT go back
+    // into the idle set). Closes it and decrements the live count.
+    pub fn discard(self, c: Connection): void {
+        c.close();
+        if (self.live > 0) { self.live = self.live - 1; }
+    }
+
+    pub fn idleCount(self): int { return self.idle.size(); }
+    pub fn openedCount(self): int { return self.opened; }
+    pub fn liveCount(self): int { return self.live; }
+
+    // Close every idle connection and empty the pool. Call at shutdown. Connections currently
+    // checked out (acquired, not released) are the caller's to close.
+    pub fn closeAll(self): void {
+        while (self.idle.size() > 0) {
+            let last = self.idle.size() - 1;
+            let c = self.idle.at(last);   // trapping; size>0 so in range (no async newConn needed)
+            self.idle.remove(last);
+            c.close();
+            if (self.live > 0) { self.live = self.live - 1; }
+        }
+    }
+}
+
+// ResilientPool — a Pool guarded by a circuit breaker (D6). Wraps every query/exec: when the
+// backend has failed `failThreshold` times in a row the breaker OPENs and calls fail fast
+// (returning a `CIRCUIT_OPEN`-tagged empty result) instead of paying the connect+timeout on a
+// server that is down; after `cooldownMs` one probe is let through (HALF_OPEN), and
+// `successThreshold` successes close it again. A failing call's connection is DISCARDED (not
+// returned to the idle set — it may be a dead socket). Failure is detected from the empty
+// command tag the drivers leave when no CommandComplete arrives (broken connection / error).
+//
+//   let rp = ResilientPool(PgDriver(), dsn, 8, /*fail*/5, /*success*/2, /*cooldownMs*/3000);
+//   let rs = rp.query("SELECT ...", params);   // fast-fails while the breaker is OPEN
+//   if (rp.isOpen()) { /* shed load / return 503 */ }
+pub struct ResilientPool {
+    pub pool: Pool,
+    pub breaker: breaker.CircuitBreaker,
+
+    init(driver: Driver, dsn: string, maxIdle: int, failThreshold: int, successThreshold: int, cooldownMs: long) {
+        self.pool = Pool(driver, dsn, maxIdle);
+        self.breaker = breaker.CircuitBreaker(failThreshold, successThreshold, cooldownMs);
+    }
+
+    pub async fn query(self, sql: string, params: List<DbValue>): ResultSet {
+        if (!self.breaker.shouldAllow()) {
+            let rs = ResultSet();
+            rs.tag = "CIRCUIT_OPEN";
+            return rs;
+        }
+        let c = await self.pool.acquire();
+        let rs = await c.query(sql, params);
+        if (string.eql(rs.tag, "")) {          // no CommandComplete => broken/failed
+            self.breaker.recordFailure();
+            self.pool.discard(c);
+        } else {
+            self.breaker.recordSuccess();
+            self.pool.release(c);
+        }
+        return rs;
+    }
+
+    pub async fn exec(self, sql: string, params: List<DbValue>): ExecResult {
+        if (!self.breaker.shouldAllow()) {
+            return ExecResult(0, "CIRCUIT_OPEN");
+        }
+        let c = await self.pool.acquire();
+        let ex = await c.exec(sql, params);
+        if (string.eql(ex.tag, "")) {
+            self.breaker.recordFailure();
+            self.pool.discard(c);
+        } else {
+            self.breaker.recordSuccess();
+            self.pool.release(c);
+        }
+        return ex;
+    }
+
+    pub fn state(self): int { return self.breaker.getState(); }
+    pub fn isOpen(self): bool { return self.breaker.getState() == breaker.STATE_OPEN; }
+    pub fn closeAll(self): void { self.pool.closeAll(); }
+}

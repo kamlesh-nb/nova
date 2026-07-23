@@ -1,0 +1,27 @@
+// Smoke test: assert mechanics + basic arithmetic/control flow.
+import assert;
+
+@test
+fn test_arithmetic(): void {
+    assert.equalInt(2 + 2, 4);
+    assert.equalInt(10 - 3, 7);
+    assert.equalInt(6 * 7, 42);
+    assert.equalInt(20 / 4, 5);
+}
+
+@test
+fn test_control_flow(): void {
+    let sum = 0;
+    let i = 0;
+    while (i < 5) {
+        sum = sum + i;
+        i = i + 1;
+    }
+    assert.equalInt(sum, 10);
+
+    if (sum > 5) {
+        assert.isTrue(true);
+    } else {
+        assert.fail("sum should be > 5");
+    }
+}

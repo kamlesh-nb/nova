@@ -1,0 +1,479 @@
+// datetime.nova — Production‑ready datetime library
+//
+// All timestamps are Unix seconds since 1970‑01‑01 00:00:00 UTC.
+// Functions are thread‑safe and side‑effect‑free (no mutable globals).
+//
+// Public API:
+//   now() -> int                      // returns current Unix timestamp (via host import)
+//   parse(s: string) -> int | undefined // parse ISO‑8601 or "YYYY-MM-DD HH:MM:SS"
+//   from_iso(s: string) -> int | undefined // alias for parse
+//   format(t: int, fmt: string) -> string
+//   to_iso(t: int) -> string          // ISO‑8601 string (UTC)
+//   add_days(t: int, days: int) -> int
+//   add_hours(t: int, hours: int) -> int
+//   add_minutes(t: int, minutes: int) -> int
+//   add_seconds(t: int, seconds: int) -> int
+//   diff(t1: int, t2: int) -> Duration
+//   is_leap_year(year: int) -> bool
+//   days_in_month(year: int, month: int) -> int
+
+import bytes;
+import string;
+import assert;
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const SECONDS_PER_MINUTE = 60;
+const MINUTES_PER_HOUR = 60;
+const HOURS_PER_DAY = 24;
+const SECONDS_PER_HOUR = SECONDS_PER_MINUTE * MINUTES_PER_HOUR;       // 3600
+const SECONDS_PER_DAY = SECONDS_PER_HOUR * HOURS_PER_DAY;             // 86400
+
+const MONTH_DAYS: int[12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+// ---------------------------------------------------------------------------
+// Duration struct
+// ---------------------------------------------------------------------------
+
+pub struct Duration {
+    pub days: int,
+    pub hours: int,
+    pub minutes: int,
+    pub seconds: int,
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+pub fn isLeapYear(year: int): bool {
+    if (year % 400 == 0) {
+        return true;
+    }
+    if (year % 100 == 0) {
+        return false;
+    }
+    return (year % 4 == 0);
+}
+
+pub fn daysInMonth(year: int, month: int): int {
+    if (month < 1 || month > 12) {
+        return 0;
+    }
+    let dim = MONTH_DAYS[month - 1];
+    if (month == 2 && isLeapYear(year)) {
+        dim = 29;
+    }
+    return dim;
+}
+
+// ---------------------------------------------------------------------------
+// Current time (host import)
+// ---------------------------------------------------------------------------
+
+/// Returns the current Unix timestamp in seconds.
+/// The host must provide `env.now` import.
+pub fn now(): int {
+    return nova_time_now();
+}
+
+/// Returns the current time in NANOSECONDS since the Unix epoch.
+/// `now()` only has one-second resolution, which cannot express a latency or a sub-second rate —
+/// use this for benchmarking and timing. Native only (the WASM `env.now` import is seconds).
+pub fn nowNs(): long {
+    return nova_time_now_ns();
+}
+
+// ---------------------------------------------------------------------------
+// Parsing
+// ---------------------------------------------------------------------------
+
+/// Parse a string in ISO‑8601 format: YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DD HH:MM:SS
+/// Returns undefined if parsing fails.
+pub fn parse(s: string): int | undefined {
+    return parseIso(s);
+}
+
+pub fn fromIso(s: string): int | undefined {
+    return parseIso(s);
+}
+
+fn parseIso(s: string): int | undefined {
+    let len = s.length;
+    if (len < 10) {
+        return undefined;
+    }
+
+    // Parse date part: YYYY-MM-DD
+    let year = parseInt(s, 0, 4);
+    if (year == undefined) return undefined;
+    if (s[4] != 45 && s[4] != 45) { // '-' 
+        // Actually we need to check for '-' at position 4, but we can also accept '/'
+        // For simplicity we'll enforce '-'.
+        if (s[4] != 45) return undefined;
+    }
+    let month = parseInt(s, 5, 7);
+    if (month == undefined) return undefined;
+    let day = parseInt(s, 8, 10);
+    if (day == undefined) return undefined;
+
+    // Validate date
+    if (month < 1 || month > 12) return undefined;
+    let dim = daysInMonth(year, month);
+    if (day < 1 || day > dim) return undefined;
+
+    // Time part: either 'T' or space or end
+    let hour: int = 0;
+    let minute: int = 0;
+    let second: int = 0;
+
+    if (len >= 11) {
+        let sep = s[10];
+        if (sep == 'T' || sep == 32) { // 'T' or space
+            if (len < 19) {
+                // Could be partial time, assume 00:00:00
+            } else {
+                hour = parseInt(s, 11, 13) ?? 0;
+                minute = parseInt(s, 14, 16) ?? 0;
+                second = parseInt(s, 17, 19) ?? 0;
+                // Validate ranges
+                if (hour < 0 || hour > 23) return undefined;
+                if (minute < 0 || minute > 59) return undefined;
+                if (second < 0 || second > 59) return undefined;
+            }
+        }
+        // If there is a 'Z' at the end, we treat as UTC
+        // We ignore timezone offsets for now.
+    }
+
+    // Convert to timestamp
+    let timestamp = dateToTimestamp(year, month, day, hour, minute, second);
+    return timestamp;
+}
+
+fn parseInt(s: string, start: int, end: int): int | undefined {
+    if (start < 0 || end > s.length || start >= end) {
+        return undefined;
+    }
+    let res = 0;
+    let i = start;
+    while (i < end) {
+        let c = s[i];
+        if (c < 48 || c > 57) {
+            return undefined;
+        }
+        res = res * 10 + (c - 48);
+        i = i + 1;
+    }
+    return res;
+}
+
+fn dateToTimestamp(year: int, month: int, day: int, hour: int, minute: int, second: int): int {
+    // Compute days since epoch (1970-01-01)
+    let days = 0;
+    let y = 1970;
+    while (y < year) {
+        days = days + 365 + (if isLeapYear(y) then 1 else 0);
+        y = y + 1;
+    }
+    let m = 1;
+    while (m < month) {
+        days = days + daysInMonth(year, m);
+        m = m + 1;
+    }
+    days = days + (day - 1);
+    return days * SECONDS_PER_DAY + hour * SECONDS_PER_HOUR + minute * SECONDS_PER_MINUTE + second;
+}
+
+// ---------------------------------------------------------------------------
+// Formatting
+// ---------------------------------------------------------------------------
+
+/// Format a timestamp using a custom format string.
+/// Placeholders:
+///   YYYY  - 4‑digit year
+///   YY    - 2‑digit year
+///   MM    - 2‑digit month
+///   M     - 1‑ or 2‑digit month (no leading zero)
+///   DD    - 2‑digit day
+///   D     - 1‑ or 2‑digit day (no leading zero)
+///   hh    - 2‑digit hour (24‑hour)
+///   h     - 1‑ or 2‑digit hour
+///   mm    - 2‑digit minute
+///   m     - 1‑ or 2‑digit minute
+///   ss    - 2‑digit second
+///   s     - 1‑ or 2‑digit second
+///   TZD   - timezone offset (UTC+HH:MM or UTC-HH:MM) – we ignore for now, return "Z"
+pub fn format(t: int, fmt: string): string {
+    let (year, month, day, hour, minute, second) = timestampToDate(t);
+    // ARC-correct string alloc (workstream A): worst-case buffer, data at ptr+0.
+    let result = bytes.alloc(fmt.length * 4 + 1); // worst case
+    let offset = 0;
+    let i = 0;
+    while (i < fmt.length) {
+        let c = fmt[i];
+        if (c == '%') {
+            if (i + 1 < fmt.length) {
+                let next_c = fmt[i+1];
+                if (next_c == 'Y') {
+                    offset = offset + writeNumber(result, offset, year, 4);
+                    i = i + 2;
+                    continue;
+                }
+                if (next_c == 'm') {
+                    offset = offset + writeNumber(result, offset, month, 2);
+                    i = i + 2;
+                    continue;
+                }
+                if (next_c == 'd') {
+                    offset = offset + writeNumber(result, offset, day, 2);
+                    i = i + 2;
+                    continue;
+                }
+                if (next_c == 'H') {
+                    offset = offset + writeNumber(result, offset, hour, 2);
+                    i = i + 2;
+                    continue;
+                }
+                if (next_c == 'M') {
+                    offset = offset + writeNumber(result, offset, minute, 2);
+                    i = i + 2;
+                    continue;
+                }
+                if (next_c == 'S') {
+                    offset = offset + writeNumber(result, offset, second, 2);
+                    i = i + 2;
+                    continue;
+                }
+                if (next_c == '%') {
+                    bytes.write_byte(result, offset, 37); // '%'
+                    offset = offset + 1;
+                    i = i + 2;
+                    continue;
+                }
+            }
+        }
+        if (c == 'Y') {
+            // YYYY or YY
+            if (i + 3 < fmt.length && fmt[i+1] == 'Y' && fmt[i+2] == 'Y' && fmt[i+3] == 'Y') {
+                offset = offset + writeNumber(result, offset, year, 4);
+                i = i + 4;
+                continue;
+            }
+            if (i + 1 < fmt.length && fmt[i+1] == 'Y') {
+                offset = offset + writeNumber(result, offset, year % 100, 2);
+                i = i + 2;
+                continue;
+            }
+        }
+        if (c == 'M') {
+            // MM or M
+            if (i + 1 < fmt.length && fmt[i+1] == 'M') {
+                offset = offset + writeNumber(result, offset, month, 2);
+                i = i + 2;
+                continue;
+            } else {
+                offset = offset + writeNumber(result, offset, month, 0); // no padding
+                i = i + 1;
+                continue;
+            }
+        }
+        if (c == 'D') {
+            if (i + 1 < fmt.length && fmt[i+1] == 'D') {
+                offset = offset + writeNumber(result, offset, day, 2);
+                i = i + 2;
+                continue;
+            } else {
+                offset = offset + writeNumber(result, offset, day, 0);
+                i = i + 1;
+                continue;
+            }
+        }
+        if (c == 'h') {
+            if (i + 1 < fmt.length && fmt[i+1] == 'h') {
+                offset = offset + writeNumber(result, offset, hour, 2);
+                i = i + 2;
+                continue;
+            } else {
+                offset = offset + writeNumber(result, offset, hour, 0);
+                i = i + 1;
+                continue;
+            }
+        }
+        if (c == 'm') {
+            if (i + 1 < fmt.length && fmt[i+1] == 'm') {
+                offset = offset + writeNumber(result, offset, minute, 2);
+                i = i + 2;
+                continue;
+            } else {
+                offset = offset + writeNumber(result, offset, minute, 0);
+                i = i + 1;
+                continue;
+            }
+        }
+        if (c == 's') {
+            if (i + 1 < fmt.length && fmt[i+1] == 's') {
+                offset = offset + writeNumber(result, offset, second, 2);
+                i = i + 2;
+                continue;
+            } else {
+                offset = offset + writeNumber(result, offset, second, 0);
+                i = i + 1;
+                continue;
+            }
+        }
+        if (c == 'T' && i + 2 < fmt.length && fmt[i+1] == 'Z' && fmt[i+2] == 'D') {
+            // Timezone offset - we'll just put "Z" for UTC
+            bytes.write_byte(result, offset, 'Z');
+            offset = offset + 1;
+            i = i + 3;
+            continue;
+        }
+        // literal character
+        bytes.write_byte(result, offset, c);
+        offset = offset + 1;
+        i = i + 1;
+    }
+    bytes.write_i32(result - 4, 0, offset); // correct length header to actual bytes
+    return result as string;
+}
+
+/// Write a number with optional zero‑padding.
+fn writeNumber(ptr: int, offset: int, val: int, min_digits: int): int {
+    // We'll compute digits and write from right to left.
+    let temp = val;
+    let digits = 0;
+    if (temp == 0) {
+        digits = 1;
+    } else {
+        while (temp > 0) {
+            digits = digits + 1;
+            temp = temp / 10;
+        }
+    }
+    let pad = 0;
+    if (digits < min_digits) {
+        pad = min_digits - digits;
+    }
+    let total = digits + pad;
+    let i = total - 1;
+    temp = val;
+    while (i >= 0) {
+        if (i < pad) {
+            bytes.write_byte(ptr, offset + i, 48);
+        } else {
+            bytes.write_byte(ptr, offset + i, (temp % 10) + 48);
+            temp = temp / 10;
+        }
+        i = i - 1;
+    }
+    return total;
+}
+
+/// Convert timestamp to date components (UTC).
+fn timestampToDate(t: int): (int, int, int, int, int, int) {
+    let total_sec = t;
+    let second = total_sec % SECONDS_PER_MINUTE;
+    let total_min = total_sec / SECONDS_PER_MINUTE;
+    let minute = total_min % MINUTES_PER_HOUR;
+    let total_hour = total_min / MINUTES_PER_HOUR;
+    let hour = total_hour % HOURS_PER_DAY;
+    let total_day = total_hour / HOURS_PER_DAY;
+
+    let year = 1970;
+    let days = total_day;
+    while (true) {
+        let days_in_year = 365 + (if isLeapYear(year) then 1 else 0);
+        if (days < days_in_year) {
+            break;
+        }
+        days = days - days_in_year;
+        year = year + 1;
+    }
+
+    let month = 1;
+    while (true) {
+        let dim = daysInMonth(year, month);
+        if (days < dim) {
+            break;
+        }
+        days = days - dim;
+        month = month + 1;
+    }
+    let day = days + 1;
+
+    return (year, month, day, hour, minute, second);
+}
+
+/// Return ISO‑8601 string (YYYY-MM-DDTHH:MM:SSZ).
+pub fn toIso(t: int): string {
+    return format(t, "YYYY-MM-DDThh:mm:ssTZD");
+}
+
+// ---------------------------------------------------------------------------
+// Arithmetic
+// ---------------------------------------------------------------------------
+
+pub fn addDays(t: int, days: int): int {
+    return t + days * SECONDS_PER_DAY;
+}
+
+pub fn addHours(t: int, hours: int): int {
+    return t + hours * SECONDS_PER_HOUR;
+}
+
+pub fn addMinutes(t: int, minutes: int): int {
+    return t + minutes * SECONDS_PER_MINUTE;
+}
+
+pub fn addSeconds(t: int, seconds: int): int {
+    return t + seconds;
+}
+
+// ---------------------------------------------------------------------------
+// Diff
+// ---------------------------------------------------------------------------
+
+pub fn dateDiff(t1: int, t2: int): Duration {
+    let total_sec = t2 - t1;
+    if (total_sec < 0) {
+        total_sec = -total_sec;
+    }
+    let days = total_sec / SECONDS_PER_DAY;
+    let rem = total_sec - (days * SECONDS_PER_DAY);
+    let hours = rem / SECONDS_PER_HOUR;
+    rem = rem - (hours * SECONDS_PER_HOUR);
+    let minutes = rem / SECONDS_PER_MINUTE;
+    let seconds = rem - (minutes * SECONDS_PER_MINUTE);
+
+    return Duration{
+        days: days,
+        hours: hours,
+        minutes: minutes,
+        seconds: seconds,
+    };
+}
+
+pub fn delete(self: Duration): void {
+}
+
+@test
+fn test_datetime(): void {
+    assert.isTrue(isLeapYear(2020));
+    assert.isFalse(isLeapYear(2021));
+    assert.isTrue(isLeapYear(2000));
+    assert.isFalse(isLeapYear(1900));
+
+    assert.equalInt(31, daysInMonth(2020, 1));
+    assert.equalInt(29, daysInMonth(2020, 2));
+    assert.equalInt(28, daysInMonth(2021, 2));
+
+    // Parse and ISO formatting test
+    let ts = parse("2024-03-15 12:30:00") ?? 0;
+    assert.isTrue(ts > 0);
+    let iso = toIso(ts);
+    // Verify that the formatted ISO string starts with 2024-03-15
+    assert.equalInt(1, if (string.startsWith(iso, "2024-03-15")) 1 else 0);
+}

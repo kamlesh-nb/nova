@@ -1,0 +1,5 @@
+import bytes;
+
+pub fn dealloc<T>(obj: T): void {
+    bytes.free(obj);
+}

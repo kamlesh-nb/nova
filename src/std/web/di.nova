@@ -1,0 +1,111 @@
+// di.nova — Standard Dependency Injection (DI) Container
+import map;
+
+pub trait Service {
+}
+
+/// What `resolve` returns: the service, or WHY it could not be produced.
+///
+/// This is the shape `T | Error` (specs §3.4b) will give you with less ceremony — the type-level
+/// half parses today, but the VALUE half (representation, `is`, `try`/`catch`) is not built, so
+/// this is written out longhand. It is not throwaway: `any | DiError` compiles into exactly this.
+///
+/// It exists because `resolve` used to `throw "DI Error: Service not registered: " + key`, and the
+/// caller received the integer **8472** — the string pointer truncated to i32 (§5.5). The key was
+/// destroyed at the throw. The interim after `throw` was removed returned bare `undefined`, which
+/// was honest but told the caller nothing. **A variant with a payload is what makes the reason
+/// survive** — the union is not what makes it survive, only what makes it ergonomic.
+pub enum Resolved {
+    Ok(any),
+    NotRegistered(string),
+}
+
+/// A human-readable reason, for logs and 500 bodies.
+///
+/// Hand-written for now. It SHOULD be derived: `@serializable` already generates
+/// `<Struct>__toJson` by emitting source and reparsing it (`main.zig:250`), and the same machinery
+/// can generate `<Enum>__toString` from the variant name + payload. Deriving matters more than it
+/// looks — an optional hand-written `toString` is one a developer forgets, and then the log says
+/// nothing and you are back to `8472` with extra steps. Tracked with the error model (P2-13).
+pub fn resolvedReason(r: Resolved): string {
+    switch (r) {
+        case Resolved.Ok(v): { return "ok"; }
+        case Resolved.NotRegistered(k): { return "service not registered: " + k; }
+    }
+    return "unknown";
+}
+
+pub struct ServiceProvider {
+    pub factories: Map<string, (ServiceProvider) -> any>,
+    pub singletons: Map<string, any>,
+    pub singleton_keys: Map<string, bool>,
+
+    init(factories: Map<string, (ServiceProvider) -> any>, singletons: Map<string, any>, singleton_keys: Map<string, bool>) {
+        self.factories = factories;
+        self.singletons = singletons;
+        self.singleton_keys = singleton_keys;
+    }
+
+    /// Resolve a service, or say why not.
+    ///
+    /// ⚠️ The caller MUST annotate the binding — `let r: Resolved = p.resolve(k);` — before
+    /// switching on it. Payload binding silently fails when the switch discriminant is an
+    /// UNANNOTATED local (it works for a parameter or a call result): `is_tagged_union` is computed
+    /// from `resolveExpressionTypeName(&ss.discriminant)` (`statements.zig`), and `let r = ...`
+    /// does not infer to `Resolved`, so the gate is false and the binding never happens — you get
+    /// `Identifier 'k' not found` at compile time. Loud, not silent, but real. Tracked as §8.E.
+    pub fn resolve(self: ServiceProvider, key: string): Resolved {
+        // 1. Check if it's already instantiated as a singleton
+        let cached = self.singletons.get(key);
+        if (cached != undefined) {
+            return Resolved.Ok(cached);
+        }
+
+        // 2. Fetch the factory
+        let factory = self.factories.get(key);
+        if (factory == undefined) {
+            // Was: `throw "DI Error: Service not registered: " + key;` — which the caller received
+            // as the integer 8472 (§5.5). Then, briefly, a bare `undefined` — honest, but it told
+            // the caller nothing. Now the KEY travels back to the caller inside the variant, so it
+            // can be logged, put in a 500 body, or both. That is the whole requirement.
+            return Resolved.NotRegistered(key);
+        }
+
+        // 3. Resolve the service
+        let instance = factory(self);
+
+        // 4. Cache if it's a singleton
+        let is_singleton = self.singleton_keys.get(key);
+        if (is_singleton == true) {
+            self.singletons.set(key, instance);
+        }
+
+        return Resolved.Ok(instance);
+    }
+}
+
+pub struct ServiceCollection {
+    pub factories: Map<string, (ServiceProvider) -> any>,
+    pub singletons: Map<string, any>,
+    pub singleton_keys: Map<string, bool>,
+
+    init() {
+        self.factories = Map<string, (ServiceProvider) -> any>(32, string.hash);
+        self.singletons = Map<string, any>(32, string.hash);
+        self.singleton_keys = Map<string, bool>(32, string.hash);
+    }
+
+    pub fn addSingleton(self: ServiceCollection, key: string, factory: (ServiceProvider) -> any): void {
+        self.factories.set(key, factory);
+        self.singleton_keys.set(key, true);
+    }
+
+    pub fn addTransient(self: ServiceCollection, key: string, factory: (ServiceProvider) -> any): void {
+        self.factories.set(key, factory);
+        self.singleton_keys.set(key, false);
+    }
+
+    pub fn buildServiceProvider(self: ServiceCollection): ServiceProvider {
+        return ServiceProvider(self.factories, self.singletons, self.singleton_keys);
+    }
+}

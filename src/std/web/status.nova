@@ -1,0 +1,120 @@
+// status.nova — HTTP Status Codes representation using refined enums with methods
+import bytes;
+
+pub enum Status {
+    Ok = 200,
+    Created = 201,
+    Accepted = 202,
+    NoContent = 204,
+    MovedPermanently = 301,
+    Found = 302,
+    NotModified = 304,
+    BadRequest = 400,
+    Unauthorized = 401,
+    Forbidden = 403,
+    NotFound = 404,
+    MethodNotAllowed = 405,
+    InternalServerError = 500,
+    BadGateway = 502,
+    ServiceUnavailable = 503,
+    PayloadTooLarge = 413,
+    TooManyRequests = 429,
+
+    pub fn toCode(self: Status): int {
+        switch (self) {
+            case Status.Ok: { return 200; }
+            case Status.Created: { return 201; }
+            case Status.Accepted: { return 202; }
+            case Status.NoContent: { return 204; }
+            case Status.MovedPermanently: { return 301; }
+            case Status.Found: { return 302; }
+            case Status.NotModified: { return 304; }
+            case Status.BadRequest: { return 400; }
+            case Status.Unauthorized: { return 401; }
+            case Status.Forbidden: { return 403; }
+            case Status.NotFound: { return 404; }
+            case Status.MethodNotAllowed: { return 405; }
+            case Status.InternalServerError: { return 500; }
+            case Status.BadGateway: { return 502; }
+            case Status.ServiceUnavailable: { return 503; }
+            case Status.PayloadTooLarge: { return 413; }
+            case Status.TooManyRequests: { return 429; }
+            default: { return 0; }
+        }
+    }
+
+    pub fn reasonPhrase(self: Status): string {
+        switch (self) {
+            case Status.Ok: { return "OK"; }
+            case Status.Created: { return "Created"; }
+            case Status.Accepted: { return "Accepted"; }
+            case Status.NoContent: { return "No Content"; }
+            case Status.MovedPermanently: { return "Moved Permanently"; }
+            case Status.Found: { return "Found"; }
+            case Status.NotModified: { return "Not Modified"; }
+            case Status.BadRequest: { return "Bad Request"; }
+            case Status.Unauthorized: { return "Unauthorized"; }
+            case Status.Forbidden: { return "Forbidden"; }
+            case Status.NotFound: { return "Not Found"; }
+            case Status.MethodNotAllowed: { return "Method Not Allowed"; }
+            case Status.InternalServerError: { return "Internal Server Error"; }
+            case Status.BadGateway: { return "Bad Gateway"; }
+            case Status.ServiceUnavailable: { return "Service Unavailable"; }
+            case Status.PayloadTooLarge: { return "Payload Too Large"; }
+            case Status.TooManyRequests: { return "Too Many Requests"; }
+            default: { return "Unknown"; }
+        }
+    }
+
+    pub fn fromCode(code: int): Status {
+        if (code == 200) return Status.Ok;
+        if (code == 201) return Status.Created;
+        if (code == 202) return Status.Accepted;
+        if (code == 204) return Status.NoContent;
+        if (code == 301) return Status.MovedPermanently;
+        if (code == 302) return Status.Found;
+        if (code == 304) return Status.NotModified;
+        if (code == 400) return Status.BadRequest;
+        if (code == 401) return Status.Unauthorized;
+        if (code == 403) return Status.Forbidden;
+        if (code == 404) return Status.NotFound;
+        if (code == 405) return Status.MethodNotAllowed;
+        if (code == 500) return Status.InternalServerError;
+        if (code == 502) return Status.BadGateway;
+        if (code == 503) return Status.ServiceUnavailable;
+        if (code == 413) return Status.PayloadTooLarge;
+        if (code == 429) return Status.TooManyRequests;
+        return Status.Ok; // fallback
+    }
+}
+
+pub fn stringifyStatus(status: int): string {
+    if (status == 0) return "0";
+    let temp = status;
+    let digits = 0;
+    while (temp > 0) {
+        digits = digits + 1;
+        temp = temp / 10;
+    }
+    // ARC-correct string alloc (workstream A): data at ptr, length at [ptr-4].
+    let str_ptr = bytes.alloc(digits);
+    let i = digits - 1;
+    temp = status;
+    while (i >= 0) {
+        bytes.write_byte(str_ptr, i, (temp % 10) + 48);
+        temp = temp / 10;
+        i = i - 1;
+    }
+    return str_ptr as string;
+}
+
+pub fn status_text(status: int): string {
+    if (status == 200) return "OK";
+    if (status == 201) return "Created";
+    if (status == 400) return "Bad Request";
+    if (status == 401) return "Unauthorized";
+    if (status == 403) return "Forbidden";
+    if (status == 404) return "Not Found";
+    if (status == 500) return "Internal Server Error";
+    return "Unknown";
+}

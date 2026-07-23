@@ -1,0 +1,70 @@
+// FLAGSHIP: the typed mediator routing DX, end-to-end through the real web.app framework, with
+// clean SRP — registration, dispatch, and binding each in their own place.
+//
+//   struct GetUserHandler impl MessageHandler { fn handle(self, src) { ...bind + respond... } }
+//   app.handle<GetUser>(GetUserHandler{});   // register the handler for the GetUser request type
+//   app.get<GetUser>("/api/user/{id:int}");  // route: GET path -> GetUser (registration only)
+//
+// `get<TReq>`/`post<TReq>`/`handle<TReq>` are REAL generic methods on `App` (visible in
+// web/app.nova), monomorphized per request type. `get<T>` ONLY registers a route; `App.dispatch`
+// is the one place `mediator.send` runs; the HANDLER binds the request itself (`src.getInt("id")`)
+// — visible, debuggable Nova, no hidden binder. The only compiler assist is `serde.typeName<T>()`,
+// which yields the type name so the route key and the handler registration agree by type.
+import assert;
+import web.app;
+import web.request;
+import web.response;
+import web.status;
+import serde.source;
+import string;
+import map;
+
+@serializable struct GetUser { pub id: int }
+@serializable struct CreateUser { pub name: string }
+
+struct GetUserHandler impl MessageHandler {
+    fn handle(self: GetUserHandler, src: ValueSource): Response {
+        let q = GetUser{ id: src.getInt("id") };   // binding is ordinary, visible, debuggable code
+        return json(`{"id":${q.id},"name":"Ada"}`);
+    }
+}
+
+struct CreateUserHandler impl MessageHandler {
+    fn handle(self: CreateUserHandler, src: ValueSource): Response {
+        let c = CreateUser{ name: src.getString("name") };
+        return json(`{"created":"${c.name}"}`);
+    }
+}
+
+fn makeApp(): App {
+    let a = App();
+    a.handle<GetUser>(GetUserHandler{});
+    a.handle<CreateUser>(CreateUserHandler{});
+    a.get<GetUser>("/api/user/{id:int}");
+    a.post<CreateUser>("/api/user");
+    return a;
+}
+
+@test
+fn test_typed_get_route(): void {
+    let a = makeApp();
+    let req = Request.fromString("GET /api/user/7 HTTP/1.1\r\nHost: x\r\n\r\n");
+    let resp = a.dispatch(req);
+    assert.equalStr(resp.body, `{"id":7,"name":"Ada"}`);
+}
+
+@test
+fn test_typed_post_route_binds_body(): void {
+    let a = makeApp();
+    let req = Request.fromString("POST /api/user HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"name\": \"Grace\"}");
+    let resp = a.dispatch(req);
+    assert.equalStr(resp.body, `{"created":"Grace"}`);
+}
+
+@test
+fn test_unmatched_route_404(): void {
+    let a = makeApp();
+    let req = Request.fromString("GET /nope HTTP/1.1\r\nHost: x\r\n\r\n");
+    let resp = a.dispatch(req);
+    assert.equalInt(resp.status.toCode(), 404);
+}

@@ -1,0 +1,34 @@
+// W1 webview demo — a native desktop window with two-way Nova <-> JS communication.
+// Build:  nova repro/webview_demo.nova --native -o /tmp/wvdemo
+// Run:    /tmp/wvdemo          (opens a window; needs an interactive GUI session)
+//
+import webview;
+
+fn main(): void {
+    let w = webview.Webview(true); // debug = true
+
+    // NSX/JSX renders to an HTML string — feed it straight to the webview.
+    let page = <html>
+        <body style="font-family:-apple-system;background:#0f172a;color:#e2e8f0;
+                     display:grid;place-items:center;height:100vh;margin:0">
+            <div style="text-align:center">
+                <h1>Nova Webview</h1>
+                <p>Native window, HTML from Nova, two-way calls.</p>
+                <button onclick="window.greet('Ada').then(r => document.querySelector('#out').textContent = r)">
+                    Call Nova
+                </button>
+                <p id="out"></p>
+            </div>
+        </body>
+    </html>;
+
+    w.setTitle("Nova — Webview Demo");
+    w.setSize(900, 640, webview.HINT_NONE);
+    // JS -> Nova via a typed lambda: `req` is a JSON array of the JS args, e.g. "[\"Ada\"]".
+    w.bind("greet", (req: string) => { return "\"Nova received: " + req + "\""; });
+    w.setHtml(page);
+    w.eval("console.log('nova -> js eval works')"); // Nova -> JS
+
+    w.run();     // blocks on the UI event loop until the window closes (main thread)
+    w.delete();
+}

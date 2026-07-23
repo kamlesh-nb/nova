@@ -1,0 +1,79 @@
+// Pins the if-expr ACQUISITION cutover (arc.md §7.2 / §9, RAII "constructor" per-edge drops): an
+// `if (c) a else b` EXPRESSION whose result type is managed is an owned producer — the phi that
+// selects a branch's value TAKES ownership of it, and the value owns exactly one reference on
+// whichever edge ran.
+//
+// Before the cutover this was a USE-AFTER-FREE, not merely a leak: an owned if-expr was classified
+// borrowed (never registered), so each branch's own temporary was drained at statement end while the
+// bind held the SELECTED (now-freed) branch value. `let x = if (c) mk("a") else mk("b")` returned
+// garbage (measured: `got \xff...`). The fix applies the store-into-aggregate move/dup rule
+// (takeOwnedElement) to each branch value IN its own block — retain a BORROWED branch, move a FRESH
+// one off the drain — so the retain/move runs only on the taken edge (a per-edge drop); the phi is
+// then registered as the owned result temp. Must pass AND be leak-free under --arc and clean --asan.
+//
+// (An if at STATEMENT position is an if-statement, not an if-expr, so an owned if-expr only ever
+// appears in a consuming position — bind, argument, operand — never truly orphaned.)
+import assert;
+
+fn mk(s: string): string { return s + "!"; }
+
+@test
+fn test_ifexpr_bound_fresh(): void {
+    // THE regression: both branches are fresh heap strings; before the fix `x` was freed garbage.
+    let c = 1;
+    let x = if (c > 0) mk("a") else mk("b");
+    assert.equalStr(x, "a!");
+}
+
+@test
+fn test_ifexpr_bound_borrow(): void {
+    // Both branches are borrowed variables — the phi must RETAIN the selected one (its own +1), and
+    // NOT corrupt the variables. Each var and the bind release once: balanced.
+    let a = mk("p");
+    let b = mk("q");
+    let c = 0;
+    let x = if (c > 0) a else b;
+    assert.equalStr(x, "q!");
+    assert.equalStr(a, "p!");
+    assert.equalStr(b, "q!");
+}
+
+@test
+fn test_ifexpr_mixed_branches(): void {
+    // One borrowed branch (retain on its edge), one fresh (move on its edge). The borrowed var must
+    // survive uncorrupted whichever edge runs.
+    let a = mk("kept");
+    let c = 0;
+    let x = if (c > 0) a else mk("fresh");
+    assert.equalStr(x, "fresh!");
+    assert.equalStr(a, "kept!");
+}
+
+@test
+fn test_ifexpr_in_loop(): void {
+    // A per-iteration owned if-expr: the box must be released each turn or the leak is unbounded.
+    let i = 0;
+    let last = "";
+    while (i < 4) {
+        let x = if (i % 2 == 0) mk("even") else mk("odd");
+        last = x;
+        i = i + 1;
+    }
+    assert.equalStr(last, "odd!");
+}
+
+@test
+fn test_ifexpr_nested_chain(): void {
+    // `if .. else if .. else ..` — the else branch is itself an owned if-expr; each level takes
+    // ownership of its selected value.
+    let n = 2;
+    let s = if (n == 0) mk("zero") else if (n == 1) mk("one") else mk("many");
+    assert.equalStr(s, "many!");
+}
+
+@test
+fn test_ifexpr_as_argument(): void {
+    // In argument position the if-expr result is a temporary consumed by the call's arg handling.
+    let c = 1;
+    assert.equalStr(if (c > 0) mk("arg") else mk("other"), "arg!");
+}

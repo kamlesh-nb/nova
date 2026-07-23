@@ -1,0 +1,70 @@
+// Gates two closure bugs, both surfaced while splitting the mediator working tree
+// (route-handling-via-mediator.md §8):
+//
+//  BUG 1 — a ROOT-module struct constructor inside a closure. `let f = () => { return P(7); }`
+//  died with "Identifier 'P' not found". The capture scan skips top-level FUNCTIONS (resolved
+//  by name at call time, not captured) but not TYPES — so `P` in `P(7)` was captured as a free
+//  variable and the lifted body compiled it down the ident path. Module-qualified `mod.P(...)`
+//  worked (its receiver is skipped by isNamespaceReceiver), so ONLY the bare form failed — the
+//  reverse of what §5 guessed. Fixed by skipping struct/enum names in the capture scan too.
+//
+//  BUG 2 — a braced closure returning a struct typed as `() -> void`. `let f = () => { return
+//  P(7); }; f().x` failed with "unknown struct type='void'": the block body's return type was
+//  hardcoded to void (only expression-body closures `() => P(7)` got a real type). Fixed by
+//  capturing the return type DURING the block walk — not by re-inferring after, which runs with
+//  the block's own locals already out of scope and mis-types `return r.field`.
+//
+// The `f().field` shape here is exactly §5's original repro (`response.Response(...)` returned
+// from a pipeline closure, then `.body` read). Both were long misdiagnosed as one
+// "module-qualified type in a closure" bug; neither is about module qualification.
+import assert;
+
+struct Point { pub x: int, pub y: int, init(x: int, y: int) { self.x = x; self.y = y; } }
+
+// BUG 1 + BUG 2: bare ctor inside the closure, struct return, field read on the call result.
+@test
+fn test_closure_returns_struct_field_read(): void {
+    let make = () => { return Point(3, 4); };
+    assert.equalInt(make().x, 3);
+    assert.equalInt(make().y, 4);
+}
+
+// The same, bound first — pins that the call result carries the struct type, not just that the
+// field expression happens to resolve inline.
+@test
+fn test_closure_struct_bind_then_read(): void {
+    let make = () => { return Point(7, 8); };
+    let p = make();
+    assert.equalInt(p.x, 7);
+}
+
+// BUG 1 in isolation: a local ctor used inside the closure, no struct return.
+@test
+fn test_local_ctor_inside_closure(): void {
+    let f = () => { let p = Point(5, 6); return p.x + p.y; };
+    assert.equalInt(f(), 11);
+}
+
+// A NESTED closure returning a different type than its parent — the return-type capture must
+// save/restore, or the inner return clobbers the outer's.
+@test
+fn test_nested_closures_distinct_return_types(): void {
+    let outer = () => {
+        let inner = () => { return "ab"; };   // returns string
+        return Point(inner().length, 0);      // returns Point
+    };
+    assert.equalInt(outer().x, 2);
+}
+
+// Controls: the paths that always worked must keep working.
+@test
+fn test_closure_returns_int(): void {
+    let f = () => { return 42; };
+    assert.equalInt(f(), 42);
+}
+
+@test
+fn test_closure_returns_string(): void {
+    let f = () => { return "hi"; };
+    assert.equalStr(f(), "hi");
+}

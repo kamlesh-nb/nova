@@ -1,0 +1,119 @@
+# ARC live-object baseline — one line per case: <case> <live_objects_at_exit>
+# Generated 2026-07-17 via: NOVA_ARC_AUDIT=1 nova test <case>
+#
+# Purpose: gate ARC REGRESSIONS without blocking on the last leaks. run.sh --arc
+# fails a case whose live count EXCEEDS its baseline. Lowering a number is always
+# welcome — the harness says so and you update the line.
+#
+# The floor is 3: the test harness's own console.log("Results: " + ..) temporaries.
+# F5's done-criteria target is 0 for the whole corpus under NOVA_DROP_ARENA.
+#
+# ✅ TUPLE LEAK FIXED 2026-07-17: 28_tuple_return_heap 68 -> 3 (the floor) and
+#    29_http_request_parse 46 -> 6. Corpus above-floor: ~118 -> ~6. The box now RETAINS
+#    its elements at construction and RELEASES them in __destruct_tuple_*; the box itself
+#    is drained as a temporary under destructuring. Historical note follows:
+# ⚠️ (WAS) 28_tuple_return_heap (68) and 29_http_request_parse (46) were the TUPLE LEAK:
+#    a tuple box never releases its elements (no tuple destructor — arc.zig:407),
+#    and every tuple leaks box+elements per call. Together they are ~108 of the
+#    ~118 above-floor objects in the corpus. See beta-readiness-plan.md P2-18 and
+#    route-handling-via-mediator.md §8.D. Fixing tuples collapses this table.
+00_smoke 0
+01_collections_list 0
+02_generics_destructor 0
+03_strings 0
+04_closures 0
+05_closures_capture 0
+06_closures_advanced 0
+07_generics 0
+08_floats 0
+09_float_stdlib 0
+10_async_go 0
+11_channels 0
+12_traits_dispatch 0
+13_serde 0
+14_collections_map 0
+15_name_resolution 0
+16_block_scope 0
+17_ptr 0
+18_float_interp 0
+19_int_overflow 0
+21_new_with_allocator 0
+22_static_methods 0
+23_module_qualified_calls 0
+24_stringify 0
+25_crypto 0
+26_utf8 0
+27_closure_builtins 0
+28_tuple_return_heap 0
+29_http_request_parse 0
+30_optional_member_access 0
+31_atomics 0
+32_error_payloads 0
+33_error_union 0
+34_module_type_in_closure 0
+35_closure_returns_struct 0
+36_enum_method_dispatch 0
+37_serde_composite_source 0
+38_optional_deref_guard 0
+39_declared_type_ownership 0
+40_map_refcounted_closure 0
+41_struct_literal_owned_field 0
+42_nested_owned_aggregates 0
+43_stdlib_shaped_ownership 0
+44_downcast_and_struct_literal_args 0
+45_try_returns_owned 0
+46_orphaned_tuple 0
+47_ifexpr_owned 0
+48_template_borrowed_part 0
+49_closure_interpolation 0
+50_decimal 0
+51_bson_decimal 0
+52_decimal_arith 0
+53_for_loops 0
+54_process_args 0
+55_generic_traits 0
+56_typed_mediator 0
+57_mediator_discovery 0
+58_typed_routing 0
+59_route_params 0
+60_router_serve 0
+61_nested_owned_list 0
+62_socket_send_n 0
+63_db_seam 0
+64_db_connection 0
+65_btreedb_codec 0
+66_postgres_codec 0
+67_mysql_codec 0
+68_generic_method_mono 0
+69_app_typed_routing 0
+70_container_trait_arc 0
+71_tuple_element_typed_ops 0
+91_optional_soundness 0
+92_regex 0
+93_loop_early_return_arc 0
+94_decimal_conv 0
+95_decimal_parse 0
+96_serde_decimal_json 0
+97_serde_decimal_yaml 0
+98_serde_json_yaml_coimport 0
+99_serde_struct_decimal 0
+100_mssql_codec 0
+101_errdefer 0
+102_future_first_class 0
+103_async_when_all 0
+104_conn_pool 0
+105_prepared_statements 0
+106_resilient_pool 0
+107_pg_scram_auth 0
+108_mysql_rsa_auth 0
+109_mysql_binary_protocol 0
+110_mssql_prepared 0
+111_async_trait_methods 0
+112_trait_widen_arc 0
+113_async_stream_io 0
+114_async_tls 0
+115_async_timeout 0
+116_select 0
+117_whole_query_deadline 0
+118_actor 0
+119_generic_return 0

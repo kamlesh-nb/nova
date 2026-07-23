@@ -1,0 +1,138 @@
+// io/file.nova — Struct-based File I/O for Nova
+// Wraps the C runtime file functions with a clean struct API.
+//
+// Usage:
+//   import io.file;
+//
+//   let f = File.open("hello.txt", "w");
+//   f.writeAll("Hello, Nova!\n");
+//   f.close();
+//
+//   // Convenience statics
+//   let content = File.readText("config.json");
+//   File.writeText("out.txt", content);
+
+import bytes;
+import mem.allocator;
+import string;
+
+pub struct File {
+    pub handle: ptr,   // OS handle (FILE* / DIR* / watcher), a pointer
+    pub path: string,
+    pub allocator: allocator.Allocator,
+
+    /// Open a file. mode is "r", "w", "a", "r+", "w+", etc.
+    pub fn open(path: string, mode: string): File {
+        let f = bytes.new_with_allocator<File>(allocator.globalAllocator());
+        f.allocator = allocator.globalAllocator();
+        f.path = path;
+        f.handle = nova_file_open(path, mode);
+        return f;
+    }
+
+    /// Read up to `size` bytes into `buf`. Returns bytes read.
+    pub fn read(self: File, buf: ptr, size: int): int {
+        return nova_file_read(self.handle, buf, size);
+    }
+
+    /// Read exactly `size` bytes, blocking until done or EOF.
+    pub fn readAll(self: File, buf: ptr, size: int): int {
+        return nova_file_read_all(self.handle, buf, size);
+    }
+
+    /// Write `size` bytes from `buf`. Returns bytes written.
+    pub fn write(self: File, buf: ptr, size: int): int {
+        return nova_file_write(self.handle, buf, size);
+    }
+
+    /// Write all `size` bytes, retrying until done.
+    pub fn writeAll(self: File, buf: ptr, size: int): int {
+        return nova_file_write_all(self.handle, buf, size);
+    }
+
+    /// Write a string to the file.
+    pub fn writeString(self: File, s: string): int {
+        return nova_file_write(self.handle, s, s.length);
+    }
+
+    /// Seek to position. whence: 0=SEEK_SET, 1=SEEK_CUR, 2=SEEK_END.
+    /// A7/F3 §6: `offset` is `long` — files exceed 2GB, so a 32-bit offset would truncate.
+    pub fn seek(self: File, offset: long, whence: int): int {
+        return nova_file_seek(self.handle, offset, whence);
+    }
+
+    /// Return current file position (`long` — a >2GB position needs 64 bits).
+    pub fn tell(self: File): long {
+        return nova_file_tell(self.handle);
+    }
+
+    /// Return 1 if at end of file.
+    pub fn eof(self: File): bool {
+        return nova_file_eof(self.handle) != 0;
+    }
+
+    /// Flush buffered writes to disk.
+    pub fn flush(self: File): int {
+        return nova_file_flush(self.handle);
+    }
+
+    /// Close the file handle.
+    pub fn close(self: File): void {
+        nova_file_close(self.handle);
+        self.handle = 0;
+    }
+
+    // -------------------------------------------------------------------------
+    // Static convenience helpers (associated functions)
+    // -------------------------------------------------------------------------
+
+    /// Check if a file exists.
+    pub fn exists(path: string): bool {
+        return nova_file_exists(path) != 0;
+    }
+
+    /// Read entire file as a string. Caller owns the returned string.
+    pub fn readText(path: string): string {
+        let fp = nova_file_open(path, "r");
+        if (fp == 0) {
+            return "";
+        }
+        // Seek to end to get size
+        nova_file_seek(fp, 0, 2);
+        let size = nova_file_tell(fp);
+        nova_file_seek(fp, 0, 0);
+        if (size <= 0) {
+            nova_file_close(fp);
+            return "";
+        }
+        // ARC-correct string alloc (workstream A): bytes.alloc returns base+8 with
+        // the header already written. Allocate size+1 (keep a trailing NUL byte for
+        // C interop), but correct the length header to `size` (the content length),
+        // since nova_bytes_alloc would otherwise record size+1.
+        let data_ptr = allocator.globalAllocator().alloc(size + 1);
+        bytes.write_i32(data_ptr - 4, 0, size);
+        nova_file_read_all(fp, data_ptr, size);
+        nova_file_close(fp);
+        return data_ptr as string;
+    }
+
+    /// Write a string to a file (truncates if exists).
+    pub fn writeText(path: string, content: string): void {
+        let fp = nova_file_open(path, "w");
+        if (fp == 0) {
+            return;
+        }
+        nova_file_write(fp, content, content.length);
+        nova_file_close(fp);
+    }
+
+    /// Append a string to a file.
+    pub fn appendText(path: string, content: string): void {
+        let fp = nova_file_open(path, "a");
+        if (fp == 0) {
+            return;
+        }
+        nova_file_write(fp, content, content.length);
+        nova_file_close(fp);
+    }
+}

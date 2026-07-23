@@ -1,0 +1,29 @@
+// Pins current List<T> behavior (push/get/set/size).
+import assert;
+import list;
+
+@test
+fn test_list_basic(): void {
+    let xs = List<int>();
+    assert.equalInt(xs.size(), 0);
+    xs.push(10);
+    xs.push(20);
+    xs.push(30);
+    assert.equalInt(xs.size(), 3);
+    assert.equalInt(xs.get(0), 10);
+    assert.equalInt(xs.get(2), 30);
+    xs.set(1, 99);
+    assert.equalInt(xs.get(1), 99);
+}
+
+@test
+fn test_list_grow(): void {
+    let xs = List<int>();
+    let i = 0;
+    while (i < 100) {
+        xs.push(i);
+        i = i + 1;
+    }
+    assert.equalInt(xs.size(), 100);
+    assert.equalInt(xs.get(99), 99);
+}

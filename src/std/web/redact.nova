@@ -1,0 +1,30 @@
+// redact.nova — Sensitive header values redaction for safe logging
+import string;
+import assert;
+
+pub fn isSensitiveHeader(name: string): bool {
+    let lower = string.toLowerCase(name);
+    return lower == "authorization" || lower == "cookie" || lower == "set-cookie" || lower == "x-api-key";
+}
+
+pub fn redactHeaderValue(name: string, value: string): string {
+    if (isSensitiveHeader(name)) {
+        let lower = string.toLowerCase(name);
+        if (lower == "authorization" && string.startsWith(value, "Bearer ")) {
+            return "Bearer ***";
+        }
+        return "***";
+    }
+    return value;
+}
+
+@test
+fn test_header_redaction(): void {
+    assert.isTrue(isSensitiveHeader("Authorization"));
+    assert.isTrue(isSensitiveHeader("Cookie"));
+    assert.isFalse(isSensitiveHeader("Content-Type"));
+
+    assert.equalStr("Bearer ***", redactHeaderValue("Authorization", "Bearer my-secret-token"));
+    assert.equalStr("***", redactHeaderValue("Cookie", "session=123"));
+    assert.equalStr("application/json", redactHeaderValue("Content-Type", "application/json"));
+}

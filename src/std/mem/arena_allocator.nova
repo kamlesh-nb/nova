@@ -1,0 +1,68 @@
+// arena_allocator.nova
+import bytes;
+import mem.allocator;
+import assert;
+
+fn arenaAllocFn(ctx: ptr, size: int): ptr {
+    if (ctx != 0) {
+        let arena: ArenaAllocator = ctx as ArenaAllocator;
+        let alignedSize = (size + 7) & -8;
+        if (arena.current + alignedSize > arena.end) {
+            return 0;
+        }
+        let res = arena.current;
+        arena.current = arena.current + alignedSize;
+        return res;
+    }
+    return bytes.alloc(size);
+}
+
+fn arenaFreeFn(ctx: ptr, ptr: ptr): void {
+    // No-op
+}
+
+pub struct ArenaAllocator {
+    pub start: ptr,
+    pub current: ptr,
+    pub end: ptr,
+
+    init(size: int) {
+        let buf = bytes.alloc_persistent(size);
+        self.start = buf;
+        self.current = buf;
+        self.end = buf + size;
+    }
+
+    pub fn delete(self: ArenaAllocator): void {
+        bytes.free(self.start);
+    }
+
+    pub fn allocator(self: ArenaAllocator): allocator.Allocator {
+        return allocator.Allocator {
+            kind: 0,
+            ctx: self,
+            allocFn: arenaAllocFn,
+            freeFn: arenaFreeFn,
+        };
+    }
+}
+
+pub fn arenaAllocator(): allocator.Allocator {
+    return allocator.Allocator {
+        kind: 0,
+        ctx: 0,
+        allocFn: arenaAllocFn,
+        freeFn: arenaFreeFn,
+    };
+}
+
+@test
+fn test_arena_allocator(): void {
+    let arena = ArenaAllocator(1024);
+    let alloc = arena.allocator();
+    let ptr1 = alloc.alloc(10);
+    assert.isTrue(ptr1 != 0);
+    let ptr2 = alloc.alloc(20);
+    assert.isTrue(ptr2 != 0);
+    arena.delete();
+}

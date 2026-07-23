@@ -1,0 +1,93 @@
+// Pins the F5 task-#14 fix: `try f()` where f returns an OWNED payload (a container, a struct) must
+// balance — no leak, no double-free. Before the fix this was a leaked 16-byte error-union box that
+// MASKED a real payload double-free: the payload was registered as a temporary TWICE (the .try_expr
+// arm manually + the producesOwnedTemporary auto-registration), so a caller-side drain released it
+// once too many, and a return-path band-aid retained the box to convert that double-free into a leak.
+// The box now owns its payload (buildErrUnion retains, __destruct_ErrUnion releases), the payload is
+// registered exactly once, and the box transfers to the caller unretained. Run under --arc AND --asan
+// (the double-free reads CLEAN under --arc — the freed-sentinel absorbs it — and is a UAF under asan).
+import assert;
+import list;
+import map;
+import string;
+
+enum Err { NotFound }
+
+// f returns an owned List via a bare `return l` (auto-wrapped into the ok side of the error union).
+fn getList(ok: bool): List<string> | Err {
+    if (ok) {
+        let l = List<string>();
+        l.push("alpha");
+        l.push("beta");
+        return l;
+    }
+    return Err.NotFound;
+}
+
+fn useList(): int {
+    let l = try getList(true);
+    return l.size();
+}
+
+@test
+fn test_try_returns_owned_list(): void {
+    assert.equalInt(useList(), 2);
+}
+
+// The same, but the caller keeps and reads the unwrapped payload across statements.
+fn firstOf(): string {
+    let l = try getList(true);
+    l.push("gamma");
+    return l.get(2);
+}
+
+@test
+fn test_try_owned_payload_used(): void {
+    assert.equalStr(firstOf(), "gamma");
+}
+
+// An owned STRUCT payload through try.
+struct Config { pub name: string, pub port: int }
+
+fn getConfig(ok: bool): Config | Err {
+    if (ok) {
+        return Config{ name: "web", port: 8080 };
+    }
+    return Err.NotFound;
+}
+
+fn readPort(): int {
+    let c = try getConfig(true);
+    return c.port;
+}
+
+fn readName(): string {
+    let c = try getConfig(true);
+    return c.name;
+}
+
+@test
+fn test_try_returns_owned_struct(): void {
+    assert.equalInt(readPort(), 8080);
+    assert.equalStr(readName(), "web");
+}
+
+// A Map payload through try (owned container with owned values).
+fn getMap(ok: bool): Map<string, string> | Err {
+    if (ok) {
+        let m = map.Map<string, string>(8, string.hash);
+        m.set("k", "v");
+        return m;
+    }
+    return Err.NotFound;
+}
+
+fn mapValue(): string {
+    let m = try getMap(true);
+    return m.get("k");
+}
+
+@test
+fn test_try_returns_owned_map(): void {
+    assert.equalStr(mapValue(), "v");
+}

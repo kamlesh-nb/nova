@@ -1,0 +1,25 @@
+// M3-D-6: async channels + `go`. A producer task sends into a channel; the consumer
+// `await chanRecv`s (parking until values arrive). Deterministic (no timing).
+import assert;
+import concurrency.asyncchan;
+
+async fn producer(ch: long): int {
+    asyncchan.chanSend(ch, 40);
+    asyncchan.chanSend(ch, 2);
+    return 0;
+}
+
+async fn consumer(): int {
+    let ch = asyncchan.chanNew();
+    let h = spawn producer(ch);
+    let a = await asyncchan.chanRecv(ch);   // parks if empty; woken by chanSend
+    let b = await asyncchan.chanRecv(ch);
+    let done = await h;
+    asyncchan.chanFree(ch);
+    return a + b;                            // 42
+}
+
+@test
+fn t_channels(): void {
+    assert.equalInt(consumer(), 42);
+}

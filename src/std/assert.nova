@@ -1,0 +1,133 @@
+// assert.nova — Minimal test assertion module for Nova
+// Used with @test attributed functions.
+//
+// Usage:
+//   import assert;
+//
+//   @test
+//   fn testMyFeature(): void {
+//       assert.equal(1 + 1, 2);
+//       assert.isTrue(someCondition());
+//       assert.notEqual("hello", "world");
+//   }
+
+import string;
+import bytes;
+
+// Fail the current test with a message
+pub fn fail(msg: string): void {
+    nova_test_fail(msg);
+}
+
+// Assert that a boolean is true
+pub fn isTrue(val: bool): void {
+    if (!val) {
+        nova_test_fail("Expected true, got false");
+    }
+}
+
+// Assert that a boolean is false
+pub fn isFalse(val: bool): void {
+    if (val) {
+        nova_test_fail("Expected false, got true");
+    }
+}
+
+// Assert that two int values are equal
+pub fn equalInt(actual: int, expected: int): void {
+    if (actual != expected) {
+        let msg = "Expected " + expected + ", got " + actual;
+        nova_test_fail(msg);
+    }
+}
+
+// Assert that two int values are not equal
+pub fn notEqualInt(actual: int, expected: int): void {
+    if (actual == expected) {
+        let msg = "Expected values to differ, both were " + actual;
+        nova_test_fail(msg);
+    }
+}
+
+// Assert that two strings are equal
+pub fn equalStr(actual: string, expected: string): void {
+    if (!string.eql(actual, expected)) {
+        let msg = "Expected \"" + expected + "\", got \"" + actual + "\"";
+        nova_test_fail(msg);
+    }
+}
+
+// Assert that two strings are not equal
+pub fn notEqualStr(actual: string, expected: string): void {
+    if (string.eql(actual, expected)) {
+        let msg = "Expected strings to differ, both were \"" + actual + "\"";
+        nova_test_fail(msg);
+    }
+}
+
+// Assert that a string contains a substring
+pub fn contains(haystack: string, needle: string): void {
+    if (string.indexOf(haystack, needle) == -1) {
+        let msg = "Expected \"" + haystack + "\" to contain \"" + needle + "\"";
+        nova_test_fail(msg);
+    }
+}
+
+// Assert that a value is not zero / not null
+pub fn notZero(val: int): void {
+    if (val == 0) {
+        nova_test_fail("Expected non-zero value, got 0");
+    }
+}
+
+// Assert that an int value is zero
+pub fn zero(val: int): void {
+    if (val != 0) {
+        let msg = "Expected 0, got " + val;
+        nova_test_fail(msg);
+    }
+}
+
+// Assert that a > b
+pub fn gt(a: int, b: int): void {
+    if (a <= b) {
+        let msg = "Expected " + a + " > " + b;
+        nova_test_fail(msg);
+    }
+}
+
+// Assert that a >= b
+pub fn gte(a: int, b: int): void {
+    if (a < b) {
+        let msg = "Expected " + a + " >= " + b;
+        nova_test_fail(msg);
+    }
+}
+
+// Assert that a < b
+pub fn lt(a: int, b: int): void {
+    if (a >= b) {
+        let msg = "Expected " + a + " < " + b;
+        nova_test_fail(msg);
+    }
+}
+
+// Assert that a <= b
+pub fn lte(a: int, b: int): void {
+    if (a > b) {
+        let msg = "Expected " + a + " <= " + b;
+        nova_test_fail(msg);
+    }
+}
+
+@test
+fn test_assert_mechanics(): void {
+    isTrue(true);
+    isFalse(false);
+    equalInt(42, 42);
+    notEqualInt(42, 43);
+    gt(10, 5);
+    gte(10, 10);
+    lt(5, 10);
+    lte(10, 10);
+}

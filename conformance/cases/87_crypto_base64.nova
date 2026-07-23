@@ -1,0 +1,28 @@
+// Gates X2 crypto/base64 — RFC 4648 encode/decode over bytes, standard + URL-safe.
+import crypto.base64;
+import assert;
+
+@test
+fn test_b64_rfc4648_encode(): void {
+    assert.equalStr(base64.encode(""), "");
+    assert.equalStr(base64.encode("f"), "Zg==");
+    assert.equalStr(base64.encode("fo"), "Zm8=");
+    assert.equalStr(base64.encode("foo"), "Zm9v");
+    assert.equalStr(base64.encode("foob"), "Zm9vYg==");
+    assert.equalStr(base64.encode("fooba"), "Zm9vYmE=");
+    assert.equalStr(base64.encode("foobar"), "Zm9vYmFy");
+}
+
+@test
+fn test_b64_decode_roundtrip(): void {
+    assert.equalStr(base64.decode("Zm9vYmFy"), "foobar");
+    assert.equalStr(base64.decode("Zg=="), "f");
+    assert.equalStr(base64.decode(base64.encode("the quick brown fox")), "the quick brown fox");
+}
+
+@test
+fn test_b64_url_safe(): void {
+    let e = base64.encodeUrl("fooba");
+    assert.equalStr(e, "Zm9vYmE");          // '-'/'_' alphabet, no padding
+    assert.equalStr(base64.decode(e), "fooba");
+}

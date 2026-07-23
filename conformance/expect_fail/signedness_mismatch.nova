@@ -1,0 +1,11 @@
+// A7 / F3 §5 stage 5 (§6): a same-width signedness change (int ↔ uint) reinterprets the
+// bits — the same 32 bits mean a different value — so it needs an explicit `as`. A signed
+// -1 stored into a uint would silently become 4294967295. Widening and integer LITERALS
+// (which are polymorphic) are exempt; a signed VARIABLE into an unsigned one is not. If
+// this ever compiles, the cross-signedness rule has regressed.
+@test
+fn test_signedness_rejected(): void {
+    let s: int = -1;
+    let u: uint = s;   // int → uint without a cast — rejected
+    assert.isTrue(u == u);
+}

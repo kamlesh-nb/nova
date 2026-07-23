@@ -1,0 +1,50 @@
+// A1 repro: `??` unwrap of an OWNED struct/trait value.
+// Per the register: `let h = m.get(k); h ?? d` and inline `(m.get(k) ?? d)`,
+// key present OR absent, was heap-use-after-free / double-free.
+import assert;
+import collections.map;
+import string;
+
+struct Box {
+    pub v: string,
+}
+
+fn makeMap(): map.Map<string, Box> {
+    let m = map.Map<string, Box>(16, string.hash);
+    m.set("a", Box { v: "alpha" });
+    return m;
+}
+
+@test
+fn coalesce_present_via_local() {
+    let m = makeMap();
+    let d = Box { v: "default" };
+    let h = m.get("a");        // key PRESENT, owned Box
+    let r = h ?? d;            // unwrap owned
+    assert.equalStr(r.v, "alpha");
+}
+
+@test
+fn coalesce_absent_via_local() {
+    let m = makeMap();
+    let d = Box { v: "default" };
+    let h = m.get("missing");  // key ABSENT
+    let r = h ?? d;
+    assert.equalStr(r.v, "default");
+}
+
+@test
+fn coalesce_inline_present() {
+    let m = makeMap();
+    let d = Box { v: "default" };
+    let r = m.get("a") ?? d;   // inline unwrap
+    assert.equalStr(r.v, "alpha");
+}
+
+@test
+fn coalesce_inline_absent() {
+    let m = makeMap();
+    let d = Box { v: "default" };
+    let r = m.get("zzz") ?? d;
+    assert.equalStr(r.v, "default");
+}

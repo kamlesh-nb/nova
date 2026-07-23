@@ -1,0 +1,61 @@
+// Regression gate for the two SERDE-YAML bugs (both fixed):
+//  #1 CO-IMPORT CRASH — importing serde.json AND serde.yaml together crashed under ASAN because a
+//     bare `str`/`number`/`object` (defined in BOTH modules) was TYPED against the wrong module's
+//     same-named function, so a YamlValue temp was released through `__destruct_JsonValue`. Fixed by
+//     resolving a bare call's return type MODULE-SCOPED first (sema), matching codegen's dispatch.
+//  #2 NESTED-ENUM LEAK — a recursive `switch`-based traversal (yaml stringify) over a map with a
+//     container value leaked the container subtree: the switch-case destructure retained the payload
+//     but relied on function-exit release, so in a loop every iteration but the last leaked. Fixed by
+//     releasing the retained payload at case-body exit. (Also: payload-less enum-variant construction
+//     `V.Null` no longer over-retains / under-drains.)
+// Must be ASAN clean AND leak-free (`--arc`), which is the whole point.
+import serde.json;
+import serde.yaml;
+import map;
+import list;
+import string;
+import assert;
+
+@test
+fn test_json_nested_roundtrip(): void {
+    let obj = Map<string, json.JsonValue>(8, string.hash);
+    obj.set("name", json.str("Alice"));
+    let tags = List<json.JsonValue>();
+    tags.push(json.str("dev"));
+    tags.push(json.str("qa"));
+    obj.set("tags", json.array(tags));
+    let text = json.stringify(json.object(obj));
+    let back = json.parse(text);
+    assert.equalStr(json.asString(json.get(back, "name")) ?? "", "Alice");
+}
+
+@test
+fn test_yaml_nested_roundtrip(): void {
+    // The exact shape that leaked: a map with BOTH an array value and a nested-object value.
+    let root_map = Map<string, YamlValue>(16, string.hash);
+    root_map.set("name", yaml.str("Alice"));
+    let tags = List<YamlValue>();
+    tags.push(yaml.str("dev"));
+    tags.push(yaml.str("qa"));
+    root_map.set("tags", yaml.array(tags));
+    let addr = Map<string, YamlValue>(16, string.hash);
+    addr.set("city", yaml.str("Paris"));
+    root_map.set("address", yaml.object(addr));
+    let root = yaml.object(root_map);
+
+    let text = yaml.stringify(root);
+    let parsed = yaml.parse(text);
+    assert.isTrue(parsed != YamlValue.Null);
+    let tags_arr = yaml.asArray(yaml.get(parsed, "tags"));
+    assert.isTrue(tags_arr != undefined);
+    if (tags_arr != undefined) { assert.equalInt(2, tags_arr.size()); }
+}
+
+@test
+fn test_both_modules_coexist(): void {
+    // Build values from BOTH modules in one function — the co-import path that crashed.
+    let jv = json.number(42);
+    let yv = yaml.number(42);
+    assert.equalInt((json.asNumber(jv) ?? 0) as int, 42);
+    assert.equalInt((yaml.asNumber(yv) ?? 0) as int, 42);
+}

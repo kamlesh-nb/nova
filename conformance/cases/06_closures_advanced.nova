@@ -1,0 +1,84 @@
+// A1 regression guards: real per-instance heap-environment closures.
+// These all FAILED under the old captured_globals scheme (closures shared a
+// single promoted global) and now pass with per-closure environments.
+import assert;
+import list;
+import string;
+
+// Capturing a reference-typed value (string): the env snapshots the pointer,
+// so distinct closures keep distinct captured strings.
+fn make_greeter(name: string): (int) => string {
+    return (x) => string.concat("hi ", name);
+}
+
+@test
+fn test_capture_string(): void {
+    let g = make_greeter("bob");
+    let h = make_greeter("amy");
+    assert.equalStr(g(0), "hi bob");
+    assert.equalStr(h(0), "hi amy");
+}
+
+fn make_adder(n: int): (int) => int {
+    return (x) => x + n;
+}
+
+// Returned closures must be independent (the original A1 bug: add5 wrongly
+// saw n=9 and returned 10).
+@test
+fn test_returned_closures_are_independent(): void {
+    let add5 = make_adder(5);
+    let add9 = make_adder(9);
+    assert.equalInt(add5(1), 6);
+    assert.equalInt(add9(1), 10);
+}
+
+// Closures created in a loop each snapshot their own captured value, even when
+// stored in a List<(int)=>int>.
+@test
+fn test_loop_capture_independent(): void {
+    let fns = List<(int) => int>();
+    let i = 0;
+    while (i < 3) {
+        let k = i;
+        fns.push((x) => x + k);
+        i = i + 1;
+    }
+    let f0 = fns.get(0);
+    let f1 = fns.get(1);
+    let f2 = fns.get(2);
+    assert.equalInt(f0(10), 10);
+    assert.equalInt(f1(10), 11);
+    assert.equalInt(f2(10), 12);
+}
+
+// Multiple captured variables in one closure.
+fn make_affine(a: int, b: int): (int) => int {
+    return (x) => a * x + b;
+}
+
+@test
+fn test_multi_capture(): void {
+    let f = make_affine(3, 7);
+    let g = make_affine(10, 1);
+    assert.equalInt(f(2), 13);
+    assert.equalInt(g(2), 21);
+}
+
+// §3.4j inc4: capturing a HEAP (non-literal) ref-counted value. The env must RETAIN
+// the captured string, or it dangles when the creating scope releases it — a
+// use-after-free, not a leak. The other capture tests bind their param to a string
+// LITERAL (sentinel refcount, never freed), so they passed by luck; this one binds it
+// to `string.concat(..)`, a real heap string.
+fn make_wrapper(inner: string): (int) => string {
+    return (x) => string.concat("[", inner);
+}
+
+@test
+fn test_capture_heap_string(): void {
+    let w = make_wrapper(string.concat("a", "b"));
+    assert.equalStr(w(0), "[ab");
+    let v = make_wrapper(string.concat("c", "d"));
+    assert.equalStr(v(0), "[cd");
+    assert.equalStr(w(0), "[ab");
+}

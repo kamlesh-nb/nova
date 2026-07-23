@@ -1,0 +1,39 @@
+// Gates the `bytes.new_with_allocator<T>()` typing fix. Sema used to type the result as
+// the builtin's erased `ptr`, so `n.field = ...` on it was a codegen error
+// (FieldAccessObjectNotStruct) — which blocked io/file, io/dir, and net/tcp/server from
+// compiling at all. Now `new<T>`/`new_persistent<T>`/`new_with_allocator<T>` are typed
+// as `T`, so field access on a heap-allocated struct works.
+import bytes;
+import mem.allocator;
+import assert;
+
+struct Node {
+    pub val: int,
+    pub tag: string,
+    pub flag: bool,
+}
+
+fn makeNode(v: int, t: string): Node {
+    let n = bytes.new_with_allocator<Node>(allocator.globalAllocator());
+    n.val = v;         // field WRITE on a new_with_allocator<T> result
+    n.tag = t;
+    n.flag = true;
+    return n;
+}
+
+@test
+fn test_new_with_allocator_fields(): void {
+    let n = makeNode(42, "answer");
+    assert.equalInt(42, n.val);        // field READ
+    assert.equalStr(n.tag, "answer");
+    assert.isTrue(n.flag);
+}
+
+@test
+fn test_new_persistent_fields(): void {
+    let n = bytes.new_persistent<Node>();
+    n.val = 7;
+    n.tag = "seven";
+    assert.equalInt(7, n.val);
+    assert.equalStr(n.tag, "seven");
+}

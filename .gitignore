@@ -1,0 +1,21 @@
+# Zig build
+zig-out/
+.zig-cache/
+zig-pkg/
+# nova build output
+build/
+# vendored deps: keep source, ignore their build artifacts
+deps/*/build/
+deps/*/.zig-cache/
+deps/*/zig-out/
+deps/*/build_*/
+# test/debug artifacts
+__nova_test
+__nova_test.ll
+*.dSYM/
+*.o
+# local scratch
+my_app/
+recovered/
+.DS_Store
+*.log

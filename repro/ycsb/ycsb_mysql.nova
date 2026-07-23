@@ -1,0 +1,15 @@
+// YCSB A–F against MySQL, via the driver-generic core (D5).
+// Run: with a running MySQL/MariaDB, then
+//   ./zig-out/bin/nova test --release repro/ycsb/ycsb_mysql.nova
+// MySQL TEXT can't be a PRIMARY KEY without a prefix length -> VARCHAR(64).
+import ycsb_core;
+import db;
+import mysql;
+
+@test
+fn ycsb_mysql_suite(): void {
+    let conn = MyDriver().connect("mysql://ycsb:ycsbpass@127.0.0.1:3306/ycsbtest");
+    ycsb_core.runSuite("MySQL", conn,
+        "CREATE TABLE ycsb_af (ykey VARCHAR(64) PRIMARY KEY, ydata TEXT)",
+        10000, 5000, 0.99, false);
+}

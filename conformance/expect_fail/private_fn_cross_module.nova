@@ -1,0 +1,17 @@
+// EXPECT-FAIL: typecheck
+// F1-4 (E1): a non-`pub` function must NOT be callable from another module. This was the
+// multi-segment-import VISIBILITY HOLE: the import spelling separates segments with '/'
+// (`serde/json`), while module paths use '.' — so findModuleByImportName never matched a
+// multi-segment import, no import edge was recorded, and every such call fell back to the
+// global segment search, which skipped the visibility check that types/consts already had.
+// (bson.getDocSize is a genuinely-private internal helper — the module's public API is `pub`.)
+import assert;
+import list;
+import serde.bson;
+
+@test
+fn t(): void {
+    let doc: bson.BsonDocument = bson.BsonDocument{ entries: List<bson.BsonEntry>() };
+    let n: int = bson.getDocSize(doc);   // private helper — must be rejected across modules
+    assert.equalInt(n, n);
+}

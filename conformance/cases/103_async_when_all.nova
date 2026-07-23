@@ -1,0 +1,73 @@
+// A1: the `when_all` / `parallel_for` async utilities over `future<T>`. Launch many async tasks
+// with `spawn` (concurrent), then join them with `when_all` (await all, collect in order). The
+// spawn-loop + when_all IS the parallel-for / parallel-map pattern. Generic async (`when_all<T>`
+// is an `async fn` generic) — the runtime ramps the module-qualified generic call so the
+// coroutine actually schedules (else the await falls to the handle path → "lost wakeup").
+//
+// NOTE ON VALUES: these tasks intentionally produce NON-ZERO results. `when_all<T>` is a *generic*
+// free function, and generic free-function bodies are still type-ERASED (no per-T monomorphization
+// — the F4 call-site mono-routing gap). Inside the erased body, `List<T>.get` returns `T?` using a
+// 0 = null sentinel, so a genuine value of 0 would read back as null. That is a general erased-
+// generic limitation (a non-async `fn idlist<T>` shows the same), NOT an async defect — so the
+// tasks here stay away from 0 to test the async join semantics in isolation.
+import concurrency.async_util;
+import list;
+import assert;
+
+async fn square(n: int): int { return n * n; }
+async fn dbl(n: int): int { return n + n; }
+
+// parallel-map: spawn work(i) for i in [1,n], then when_all -> results in order.
+async fn parallel_squares(n: int): List<int> {
+    let fs = List<future<int>>();
+    let i = 1;
+    while (i <= n) { fs.push(spawn square(i)); i = i + 1; }
+    return await async_util.when_all<int>(fs);
+}
+
+@test
+fn test_when_all_collects_in_order(): void {
+    let r = parallel_squares(5);        // [1,4,9,16,25]
+    assert.equalInt(r.size(), 5);
+    assert.equalInt(r.get(0) ?? -1, 1);
+    assert.equalInt(r.get(2) ?? -1, 9);
+    assert.equalInt(r.get(4) ?? -1, 25);
+}
+
+@test
+fn test_when_all_sum(): void {
+    let r = parallel_squares(4);        // 1+4+9+16 = 30
+    let total = 0;
+    let i = 0;
+    while (i < r.size()) { total = total + (r.get(i) ?? 0); i = i + 1; }
+    assert.equalInt(total, 30);
+}
+
+// when_first_n bounded join.
+async fn barrierAndBounded(): int {
+    let fs = List<future<int>>();
+    fs.push(spawn dbl(10));
+    fs.push(spawn dbl(20));
+    fs.push(spawn dbl(30));
+    let firstTwo = await async_util.when_first_n<int>(fs, 2);  // [20, 40]
+    return (firstTwo.get(0) ?? 0) + (firstTwo.get(1) ?? 0);
+}
+
+@test
+fn test_when_first_n(): void {
+    assert.equalInt(barrierAndBounded(), 60);   // 20 + 40
+}
+
+// mixed task types (same result type) joined together.
+async fn mixedFanout(): int {
+    let fs = List<future<int>>();
+    fs.push(spawn square(6));   // 36
+    fs.push(spawn dbl(7));      // 14
+    let rs = await async_util.when_all<int>(fs);
+    return (rs.get(0) ?? 0) + (rs.get(1) ?? 0);
+}
+
+@test
+fn test_mixed_fanout(): void {
+    assert.equalInt(mixedFanout(), 50);   // 36 + 14
+}

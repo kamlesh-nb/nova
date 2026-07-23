@@ -1,0 +1,7 @@
+import assert;
+@test
+fn t(): void {
+    let f = (x) => `n${x}`;
+    let r = f(5);
+    assert.equalStr(r, "n5");
+}

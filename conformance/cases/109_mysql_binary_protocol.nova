@@ -1,0 +1,111 @@
+// D6: MySQL server-side prepared statements — the binary protocol codec (COM_STMT_PREPARE /
+// COM_STMT_EXECUTE + binary result rows). The full flow is verified LIVE against MySQL 9
+// (prepare/execute with params, typed int/double/string/decimal decode, NULL params, multi-row);
+// this gate locks the codec offline: the command frames' wire shape, and the binary ROW decoder
+// over hand-crafted rows (signed ints, IEEE double, string, and a NULL via the offset-by-2 bitmap).
+import assert;
+import bytes;
+import string;
+import list;
+import db;
+import mysql;
+
+// Build a raw binary-row payload byte-by-byte: [0x00 header][null bitmap][values...].
+fn b(vals: List<int>): string {
+    let p = bytes.alloc(vals.size());
+    let i = 0;
+    while (i < vals.size()) { bytes.write_byte(p, i, (vals.get(i) ?? 0) % 256); i = i + 1; }
+    return p as string;
+}
+
+@test
+fn test_stmt_prepare_frame(): void {
+    // packet = [u24 len][seq 0][0x16 COM_STMT_PREPARE][sql]
+    let f = mysql.buildStmtPrepare("SELECT 1");
+    // payload length = 1 (cmd) + 8 (sql) = 9
+    assert.equalInt(f[0], 9);            // u24 low byte
+    assert.equalInt(f[3], 0);            // seq
+    assert.equalInt(f[4], 22);           // 0x16 COM_STMT_PREPARE
+}
+
+@test
+fn test_stmt_execute_frame_no_params(): void {
+    // [len][seq][0x17][stmt_id u32][flags 0][iter u32=1]  -> payload 10 bytes
+    let f = mysql.buildStmtExecute(7, List<DbValue>());
+    assert.equalInt(f[4], 23);           // 0x17 COM_STMT_EXECUTE
+    assert.equalInt(f[5], 7);            // stmt_id low byte
+    assert.equalInt(f[9], 0);            // flags
+    assert.equalInt(f[10], 1);           // iteration_count low byte
+}
+
+@test
+fn test_stmt_execute_binds_params(): void {
+    // With 2 params: after the 10-byte prefix -> null bitmap (1) + new-bound(1) + 2*type(2) + values.
+    let p = List<DbValue>();
+    p.push(db.dbInt(5));
+    p.push(db.dbText("hi"));
+    let f = mysql.buildStmtExecute(1, p);
+    // Layout: [len 3][seq 1][cmd 1][stmt_id 4][flags 1][iter 4] = 14 header bytes, then:
+    //   null bitmap (1) at 14, new_params_bound (1) at 15, param types (2 each) at 16..
+    assert.equalInt(f[14], 0);           // null bitmap (no nulls)
+    assert.equalInt(f[15], 1);           // new_params_bound_flag
+    assert.equalInt(f[16], 253);         // first param type = VAR_STRING
+    assert.equalInt(f[17], 0);           // unsigned flag
+}
+
+@test
+fn test_binary_row_decode_int_and_string(): void {
+    // 2 columns: LONG(type 3)=42, VAR_STRING(253)="hi", no NULLs.
+    // payload = [0x00][bitmap 0x00][42,0,0,0][2,'h','i']
+    let raw = List<int>();
+    raw.push(0);           // header
+    raw.push(0);           // null bitmap (1 byte; bits offset by 2, none set)
+    raw.push(42); raw.push(0); raw.push(0); raw.push(0);   // LONG 42 LE
+    raw.push(2); raw.push(104); raw.push(105);             // lenenc "hi"
+    let cols = List<Column>();
+    cols.push(Column("n", DbType.Int4));
+    cols.push(Column("s", DbType.Text));
+    let types = List<int>();
+    types.push(3);         // LONG
+    types.push(253);       // VAR_STRING
+    let payload = b(raw);
+    let row = mysql.decodeBinaryRow(payload, cols, types);
+    assert.equalInt(row.getLong(0), 42);
+    assert.equalStr(row.getText(1), "hi");
+}
+
+@test
+fn test_binary_row_decode_signed_negative(): void {
+    // TINY(type 1) = -1 (byte 0xff, sign-extended).
+    let raw = List<int>();
+    raw.push(0);           // header
+    raw.push(0);           // bitmap
+    raw.push(255);         // TINY 0xff
+    let cols = List<Column>();
+    cols.push(Column("t", DbType.Int4));
+    let types = List<int>();
+    types.push(1);         // TINY, signed (no unsigned bit)
+    let payload = b(raw);
+    let row = mysql.decodeBinaryRow(payload, cols, types);
+    assert.equalInt(row.getInt(0), -1);
+}
+
+@test
+fn test_binary_row_decode_null_via_bitmap(): void {
+    // 2 columns, column 0 NULL. Null bit for col i is at position i+2, so col 0 -> bit 2 -> 0x04.
+    // payload = [0x00][bitmap 0x04][value for col1 only: lenenc "ok"]
+    let raw = List<int>();
+    raw.push(0);           // header
+    raw.push(4);           // bitmap: bit 2 set -> col 0 is NULL
+    raw.push(2); raw.push(111); raw.push(107);   // lenenc "ok" for col 1
+    let cols = List<Column>();
+    cols.push(Column("a", DbType.Text));
+    cols.push(Column("b", DbType.Text));
+    let types = List<int>();
+    types.push(253);
+    types.push(253);
+    let payload = b(raw);
+    let row = mysql.decodeBinaryRow(payload, cols, types);
+    assert.isTrue(row.isNull(0));
+    assert.equalStr(row.getText(1), "ok");
+}

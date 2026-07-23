@@ -1,0 +1,166 @@
+// source.nova — ValueSource: a format-agnostic reader that generated struct binders
+// read fields from. The compiler emits `<Struct>__bind(src: ValueSource): <Struct>`
+// for every @serializable struct (recursive over nested structs / lists); the runtime
+// picks the concrete source by Content-Type (JsonSource today; Form/Multipart later).
+
+import serde.json;
+import string;
+import list;
+import map;
+
+pub trait ValueSource {
+    fn getString(self: ValueSource, key: string): string;
+    fn getInt(self: ValueSource, key: string): long;
+    fn getBool(self: ValueSource, key: string): bool;
+    fn getFloat(self: ValueSource, key: string): double;
+    fn getDecimal(self: ValueSource, key: string): decimal;     // S1: exact decimal128 (not lossy f64)
+    fn getChild(self: ValueSource, key: string): ValueSource;   // nested object -> recurse
+    fn has(self: ValueSource, key: string): bool;
+    fn arrayLen(self: ValueSource, key: string): int;
+    fn itemString(self: ValueSource, key: string, i: int): string;
+    fn itemInt(self: ValueSource, key: string, i: int): long;
+    fn itemDecimal(self: ValueSource, key: string, i: int): decimal; // S1: decimal array element
+    fn itemChild(self: ValueSource, key: string, i: int): ValueSource; // array of objects
+}
+
+// JSON-backed source over a parsed json.JsonValue.
+pub struct JsonSource impl ValueSource {
+    pub node: json.JsonValue,
+
+    init(node: json.JsonValue) { self.node = node; }
+
+    pub fn getString(self: JsonSource, key: string): string {
+        return json.asString(json.get(self.node, key)) ?? "";
+    }
+    pub fn getInt(self: JsonSource, key: string): long {
+        return json.asNumber(json.get(self.node, key)) ?? 0;
+    }
+    pub fn getBool(self: JsonSource, key: string): bool {
+        return json.asBool(json.get(self.node, key)) ?? false;
+    }
+    pub fn getFloat(self: JsonSource, key: string): double {
+        return json.asFloat(json.get(self.node, key)) ?? 0.0;
+    }
+    pub fn getDecimal(self: JsonSource, key: string): decimal {
+        return json.asDecimal(json.get(self.node, key)) ?? 0m;   // exact — JSON numbers are raw text
+    }
+    pub fn getChild(self: JsonSource, key: string): ValueSource {
+        return JsonSource(json.get(self.node, key));
+    }
+    pub fn has(self: JsonSource, key: string): bool {
+        return json.has(self.node, key);
+    }
+    pub fn arrayLen(self: JsonSource, key: string): int {
+        return json.size(json.get(self.node, key));
+    }
+    pub fn itemString(self: JsonSource, key: string, i: int): string {
+        return json.asString(json.at(json.get(self.node, key), i)) ?? "";
+    }
+    pub fn itemInt(self: JsonSource, key: string, i: int): long {
+        return json.asNumber(json.at(json.get(self.node, key), i)) ?? 0;
+    }
+    pub fn itemDecimal(self: JsonSource, key: string, i: int): decimal {
+        return json.asDecimal(json.at(json.get(self.node, key), i)) ?? 0m;
+    }
+    pub fn itemChild(self: JsonSource, key: string, i: int): ValueSource {
+        return JsonSource(json.at(json.get(self.node, key), i));
+    }
+}
+
+// Convenience: build a JSON source from a raw body string.
+pub fn fromJson(body: string): JsonSource {
+    return JsonSource(json.parse(body));
+}
+
+// Flat string-keyed source over route params + query (GET/DELETE binding). No nesting
+// or arrays — those come from a body source.
+pub struct ParamSource impl ValueSource {
+    pub params: Map<string, string>,
+
+    init(params: Map<string, string>) { self.params = params; }
+
+    pub fn getString(self: ParamSource, key: string): string {
+        return self.params.get(key) ?? "";
+    }
+    pub fn getInt(self: ParamSource, key: string): long {
+        return string.parseI64(self.params.get(key) ?? "0");
+    }
+    pub fn getBool(self: ParamSource, key: string): bool {
+        return string.eql(self.params.get(key) ?? "", "true");
+    }
+    pub fn getFloat(self: ParamSource, key: string): double {
+        return string.parseFloat(self.params.get(key) ?? "0");
+    }
+    pub fn getDecimal(self: ParamSource, key: string): decimal {
+        return decimal.fromString(self.params.get(key) ?? "0");
+    }
+    pub fn getChild(self: ParamSource, key: string): ValueSource {
+        return ParamSource(Map<string, string>(2, string.hash));
+    }
+    pub fn has(self: ParamSource, key: string): bool {
+        let r = self.params.get(key);
+        if (r == undefined) { return false; }
+        return true;
+    }
+    pub fn arrayLen(self: ParamSource, key: string): int { return 0; }
+    pub fn itemString(self: ParamSource, key: string, i: int): string { return ""; }
+    pub fn itemInt(self: ParamSource, key: string, i: int): long { return 0; }
+    pub fn itemDecimal(self: ParamSource, key: string, i: int): decimal { return 0m; }
+    pub fn itemChild(self: ParamSource, key: string, i: int): ValueSource {
+        return ParamSource(Map<string, string>(2, string.hash));
+    }
+}
+
+pub struct CompositeSource impl ValueSource {
+    pub route: ParamSource,
+    pub body: ValueSource,
+
+    init(route: ParamSource, body: ValueSource) {
+        self.route = route;
+        self.body = body;
+    }
+
+    pub fn getString(self: CompositeSource, key: string): string {
+        if (self.route.has(key)) { return self.route.getString(key); }
+        return self.body.getString(key);
+    }
+    pub fn getInt(self: CompositeSource, key: string): long {
+        if (self.route.has(key)) { return self.route.getInt(key); }
+        return self.body.getInt(key);
+    }
+    pub fn getBool(self: CompositeSource, key: string): bool {
+        if (self.route.has(key)) { return self.route.getBool(key); }
+        return self.body.getBool(key);
+    }
+    pub fn getFloat(self: CompositeSource, key: string): double {
+        if (self.route.has(key)) { return self.route.getFloat(key); }
+        return self.body.getFloat(key);
+    }
+    pub fn getDecimal(self: CompositeSource, key: string): decimal {
+        if (self.route.has(key)) { return self.route.getDecimal(key); }
+        return self.body.getDecimal(key);
+    }
+    // Nested objects and arrays only ever come from the body — route params are flat.
+    pub fn getChild(self: CompositeSource, key: string): ValueSource {
+        return self.body.getChild(key);
+    }
+    pub fn has(self: CompositeSource, key: string): bool {
+        if (self.route.has(key)) { return true; }
+        return self.body.has(key);
+    }
+    pub fn arrayLen(self: CompositeSource, key: string): int {
+        return self.body.arrayLen(key);
+    }
+    pub fn itemString(self: CompositeSource, key: string, i: int): string {
+        return self.body.itemString(key, i);
+    }
+    pub fn itemInt(self: CompositeSource, key: string, i: int): long {
+        return self.body.itemInt(key, i);
+    }
+    pub fn itemDecimal(self: CompositeSource, key: string, i: int): decimal {
+        return self.body.itemDecimal(key, i);
+    }
+    pub fn itemChild(self: CompositeSource, key: string, i: int): ValueSource {
+        return self.body.itemChild(key, i);
+    }
+}

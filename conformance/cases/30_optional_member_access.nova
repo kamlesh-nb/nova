@@ -1,0 +1,46 @@
+// Gates member access THROUGH an optional. `List<T>.get(i)` / `Map<K,V>.get(k)` return
+// `T | undefined`, and until now the only usable form was `xs.get(i) ?? default` — the
+// nullish-coalesce coalesced the optional away. A bare `let x = xs.get(i); x.field` /
+// `x.method()` failed to resolve x's type (unresolved optional), so codegen rejected the
+// member access with MethodOrFunctionNotFound. Now fieldType/methodReturn see through a
+// leading `.optional` to the underlying type. The runtime handle is identical for `T` and
+// `T | undefined` (undefined == null == 0), so this only lets the member type resolve — the
+// deref-if-actually-null risk is the caller's, exactly as before. This unblocked the whole
+// web/app.nova dispatch loop (`let route = self.routes.get(r); route.segs.size()`).
+import list;
+import assert;
+
+struct Seg { pub kids: List<int>, init() { self.kids = List<int>(); } }
+struct Item { pub segs: List<Seg>, init() { self.segs = List<Seg>(); } }
+
+@test
+fn test_get_then_field_method(): void {
+    let items = List<Item>();
+    let item = Item();
+    item.segs.push(Seg());
+    items.push(item);
+
+    // items.get(0) : Item | undefined  -> member access sees through to Item
+    let it = items.at(0);
+    assert.equalInt(it.segs.size(), 1);
+
+    // chained through a second optional: it.segs.get(0) : Seg | undefined
+    let seg = it.segs.at(0);
+    assert.equalInt(seg.kids.size(), 0);
+}
+
+@test
+fn test_optional_in_loop(): void {
+    // The exact shape web/app.nova's router uses: index-bounded get + field.method().
+    let items = List<Item>();
+    items.push(Item());
+    items.push(Item());
+    let total = 0;
+    let i = 0;
+    while (i < items.size()) {
+        let it = items.at(i);
+        total = total + it.segs.size();
+        i = i + 1;
+    }
+    assert.equalInt(total, 0);
+}

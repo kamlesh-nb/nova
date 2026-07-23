@@ -1,0 +1,51 @@
+// Flagship framework layer: the TYPED mediator pipeline, on generic traits.
+// A `RequestHandler<TReq, TResp>` (MediatR's IRequestHandler, but fully typed —
+// no `any`, no downcast) binds a request from a ValueSource via the compiler-
+// generated `TReq__bind`, dispatches through the generic-trait `handle`, and
+// serializes the response via `TResp__toJson`. This is exactly what `get<T>`
+// will generate at each route; shown explicitly here to gate the pipeline.
+import assert;
+import serde.source;
+
+trait RequestHandler<TReq, TResp> {
+    fn handle(self, req: TReq): TResp;
+}
+
+@serializable struct GetUser { pub id: int }
+@serializable struct UserDto { pub id: int, pub name: string }
+
+struct GetUserHandler impl RequestHandler<GetUser, UserDto> {
+    fn handle(self, req: GetUser): UserDto {
+        return UserDto{ id: req.id, name: "Ada" };
+    }
+}
+
+@serializable struct AddReq { pub a: int, pub b: int }
+@serializable struct SumDto { pub sum: int }
+
+struct AddHandler impl RequestHandler<AddReq, SumDto> {
+    fn handle(self, req: AddReq): SumDto {
+        return SumDto{ sum: req.a + req.b };
+    }
+}
+
+// The generic pipeline a typed `get<GetUser>` route runs: bind → handle →
+// serialize. Written out per-type because binder/serializer names are reified
+// from the concrete type (what the get<T> codegen will do automatically).
+@test
+fn test_typed_getuser_pipeline(): void {
+    let h = GetUserHandler{};
+    let req = GetUser__bind(source.fromJson("{\"id\": 7}"));
+    let resp = h.handle(req);
+    let json = UserDto__toJson(resp);
+    assert.equalStr(json, "{\"id\":7,\"name\":\"Ada\"}");
+}
+
+@test
+fn test_typed_add_pipeline(): void {
+    let h = AddHandler{};
+    let req = AddReq__bind(source.fromJson("{\"a\": 20, \"b\": 22}"));
+    let resp = h.handle(req);
+    assert.equalInt(resp.sum, 42);
+    assert.equalStr(SumDto__toJson(resp), "{\"sum\":42}");
+}

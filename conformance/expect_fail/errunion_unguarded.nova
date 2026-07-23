@@ -1,0 +1,19 @@
+// EXPECT-FAIL: typecheck
+// E1/H2: a bare member access on a `T | E` (error-union) value is a hard compile error —
+// the value might BE the error. `find(-1)` is `Box | MyErr`; `.v` on it (without `try`/`catch`)
+// must be REJECTED at compile time with a LOCATED diagnostic (not a codegen "unknown struct
+// type" without a source span). Handle it first: `try find(k)` or `find(k) catch fallback`.
+
+enum MyErr { Bad }
+struct Box { pub v: int, init(n: int) { self.v = n; } }
+
+fn find(k: int): Box | MyErr {
+    if (k < 0) { return MyErr.Bad; }
+    return Box(k);
+}
+
+@test
+fn t_unguarded_errunion_access(): void {
+    let x = find(0 - 1);
+    console.log(x.v);
+}

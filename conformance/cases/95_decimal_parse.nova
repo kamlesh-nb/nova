@@ -1,0 +1,52 @@
+// S4: EXACT string -> decimal128 parsing (`decimal.fromString(s)`). The same BID parser the
+// literal path uses, exposed for RUNTIME strings — the shared dependency that unblocks exact
+// decimals from DB numeric/DECIMAL columns and JSON/BSON serde (no lossy f64 round-trip).
+// Handles sign, integer/fraction, and `e`/`E` exponents; round-half-even to 34 significant digits.
+import assert;
+import db;
+
+@test
+fn test_driver_numeric_column_path(): void {
+    // Exactly what postgres/mysql/btreedb decodeCell now build for a numeric/DECIMAL column:
+    // parse the wire text into an EXACT decimal and carry it in DbValue.dec (asDecimal()).
+    let cell = db.dbDecimal(decimal.fromString("19.99"));
+    assert.isTrue(cell.kind == DbType.Decimal);
+    assert.equalStr(`${cell.asDecimal()}`, "19.99");
+    // exact arithmetic straight off two decoded numeric cells (no lossy f64 hop)
+    let sum = db.dbDecimal(decimal.fromString("0.1") + decimal.fromString("0.2"));
+    assert.equalStr(`${sum.asDecimal()}`, "0.3");
+}
+
+@test
+fn test_basic(): void {
+    assert.equalStr(`${decimal.fromString("3.14")}`, "3.14");
+    assert.equalStr(`${decimal.fromString("-0.1")}`, "-0.1");
+    assert.equalStr(`${decimal.fromString("100")}`, "100");
+    assert.equalStr(`${decimal.fromString("0.001")}`, "0.001");
+    assert.equalStr(`${decimal.fromString("-42")}`, "-42");
+    assert.equalStr(`${decimal.fromString("0")}`, "0");
+}
+
+@test
+fn test_exponents(): void {
+    assert.equalStr(`${decimal.fromString("1e10")}`, "10000000000");
+    assert.equalStr(`${decimal.fromString("1.5e-3")}`, "0.0015");
+    assert.equalStr(`${decimal.fromString("1.23e4")}`, "12300");
+    assert.equalStr(`${decimal.fromString("-2E2")}`, "-200");
+}
+
+@test
+fn test_exact_no_f64_roundtrip(): void {
+    // 0.1 + 0.2 has no exact binary double; parsed as decimal it is EXACT.
+    assert.equalStr(`${decimal.fromString("0.1") + decimal.fromString("0.2")}`, "0.3");
+    // A money column: 19.99 + 0.01 = 20.00 (decimal preserves scale on addition).
+    assert.equalStr(`${decimal.fromString("19.99") + decimal.fromString("0.01")}`, "20.00");
+}
+
+@test
+fn test_parse_then_convert(): void {
+    assert.equalInt(decimal.toInt(decimal.fromString("123.99")), 123); // truncates toward zero
+    // full 34-significant-digit precision survives text -> decimal.
+    assert.equalStr(`${decimal.fromString("12345678901234567890123456789012.34")}`,
+                    "12345678901234567890123456789012.34");
+}

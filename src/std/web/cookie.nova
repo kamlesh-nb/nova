@@ -1,0 +1,63 @@
+// cookie.nova — HTTP Cookie serialization and definition
+import collections.string_builder;
+import assert;
+
+pub struct Cookie {
+    pub name: string,
+    pub value: string,
+    pub path: string,
+    pub domain: string,
+    pub maxAge: int, // -1 if not set
+    pub secure: bool,
+    pub httpOnly: bool,
+    pub sameSite: string, // "", "Strict", "Lax", "None"
+}
+
+pub fn serialize(cookie: Cookie): string {
+    let sb = string_builder.StringBuilder();
+    sb.append(cookie.name);
+    sb.append("=");
+    sb.append(cookie.value);
+    
+    if (cookie.path != "") {
+        sb.append("; Path=");
+        sb.append(cookie.path);
+    }
+    if (cookie.domain != "") {
+        sb.append("; Domain=");
+        sb.append(cookie.domain);
+    }
+    if (cookie.maxAge >= 0) {
+        sb.append("; Max-Age=");
+        sb.append(`${cookie.maxAge}`);
+    }
+    if (cookie.secure) {
+        sb.append("; Secure");
+    }
+    if (cookie.httpOnly) {
+        sb.append("; HttpOnly");
+    }
+    if (cookie.sameSite != "") {
+        sb.append("; SameSite=");
+        sb.append(cookie.sameSite);
+    }
+    let res = sb.toString();
+    sb.delete();
+    return res;
+}
+
+@test
+fn test_cookie_serialization(): void {
+    let cookie = Cookie{
+        name: "session",
+        value: "xyz123",
+        path: "/",
+        domain: "example.com",
+        maxAge: 3600,
+        secure: true,
+        httpOnly: true,
+        sameSite: "Lax",
+    };
+    let s = serialize(cookie);
+    assert.isTrue(s == "session=xyz123; Path=/; Domain=example.com; Max-Age=3600; Secure; HttpOnly; SameSite=Lax");
+}

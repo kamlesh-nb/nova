@@ -1,0 +1,95 @@
+// rate_limit.nova — IP-based Token Bucket Rate Limiting Middleware
+import web.request;
+import web.response;
+import web.middleware;
+import web.status;
+import map;
+import string;
+import datetime;
+
+pub struct TokenBucket {
+    pub capacity: int,
+    pub tokens: int,
+    pub refillRate: int,
+    pub lastRefill: int,
+}
+
+fn minInt(a: int, b: int): int {
+    if (a < b) return a;
+    return b;
+}
+
+pub fn tryConsume(bucket: TokenBucket, now: int): bool {
+    let elapsed = now - bucket.lastRefill;
+    bucket.tokens = minInt(bucket.capacity, bucket.tokens + elapsed * bucket.refillRate);
+    bucket.lastRefill = now;
+
+    if (bucket.tokens >= 1000) {
+        bucket.tokens = bucket.tokens - 1000;
+        return true;
+    }
+    return false;
+}
+
+pub struct RateLimiter {
+    pub capacity: int,
+    pub refillRate: int,
+    pub buckets: Map<string, TokenBucket>,
+
+    init(requestsPerMinute: int) {
+        self.capacity = requestsPerMinute * 1000;
+        // Refill rate per second (in millitokens)
+        self.refillRate = (requestsPerMinute * 1000) / 60;
+        self.buckets = Map<string, TokenBucket>(16, string.hash);
+    }
+
+    pub fn isAllowed(self: RateLimiter, ip: string): bool {
+        let now = datetime.now();
+        let bucket = self.buckets.get(ip);
+        if (bucket == undefined) {
+            let newBucket = TokenBucket{
+                capacity: self.capacity,
+                tokens: self.capacity - 1000,
+                refillRate: self.refillRate,
+                lastRefill: now,
+            };
+            self.buckets.set(ip, newBucket);
+            return true;
+        }
+
+        let allowed = tryConsume(bucket, now);
+        // Put the modified bucket back into the map
+        self.buckets.set(ip, bucket);
+        return allowed;
+    }
+}
+
+pub struct RateLimitMiddleware impl Middleware {
+    pub limiter: RateLimiter,
+
+    init(limiter: RateLimiter) {
+        self.limiter = limiter;
+    }
+
+    pub fn execute(self: RateLimitMiddleware, req: request.Request, res: response.Response): MiddlewareAction {
+        let ip = req.headers.get("X-Forwarded-For") ?? req.headers.get("X-Real-IP") ?? "127.0.0.1";
+        
+        // Handle potential comma-separated list in X-Forwarded-For
+        let comma = string.indexOf(ip, ",");
+        if (comma != -1) {
+            ip = string.trim(string.slice(ip, 0, comma));
+        }
+
+        if (!self.limiter.isAllowed(ip)) {
+            res.status = Status.fromCode(429); // Too Many Requests
+            res.setHeader("Retry-After", "60");
+            res.body = "{\"error\":\"Rate limit exceeded\"}";
+            return MiddlewareAction.Stop;
+        }
+
+        return MiddlewareAction.Next;
+    }
+
+    pub fn after(self: RateLimitMiddleware, req: request.Request, res: response.Response, matched: MatchedRoute): void {
+    }
+}

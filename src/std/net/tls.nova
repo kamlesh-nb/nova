@@ -1,0 +1,72 @@
+// tls.nova — TLS/HTTPS secure socket client
+import net.tcp.socket;
+import bytes;
+import net.tcp.client;
+
+pub struct TlsStream {
+    pub stream: socket.TcpStream,
+    pub ctx: ptr,   // TlsContext* pointer
+
+    init(stream: socket.TcpStream, hostname: string) {
+        self.stream = stream;
+        self.ctx = nova_tls_new(stream.fd, hostname);
+    }
+
+    pub fn handshake(self: TlsStream): int {
+        return nova_tls_handshake(self.ctx);
+    }
+
+    pub fn write(self: TlsStream, data: string): int {
+        return nova_tls_write(self.ctx, data);
+    }
+
+    pub fn read(self: TlsStream, max_len: int): string {
+        let buf = bytes.alloc(max_len);
+        let n = nova_tls_read(self.ctx, buf, max_len);
+        if (n <= 0) {
+            bytes.free(buf);
+            return "";
+        }
+        // ARC-correct string alloc (workstream A): data at ptr, length at [ptr-4].
+        let str_ptr = bytes.alloc(n);
+        let i = 0;
+        while (i < n) {
+            bytes.write_byte(str_ptr, i, bytes.read_byte(buf, i));
+            i = i + 1;
+        }
+        bytes.free(buf);
+        return str_ptr as string;
+    }
+
+    pub fn close(self: TlsStream): void {
+        if (self.ctx != 0) {
+            nova_tls_free(self.ctx);
+            self.ctx = 0;
+        }
+        self.stream.close();
+    }
+
+    pub fn delete(self: TlsStream): void {
+        self.close();
+    }
+}
+
+@test
+fn test_tls_handshake(): void {
+    console.log("TLS TEST: starting");
+    let tcp_stream = client.TcpClient.connect("example.com", 443);
+    console.log("TLS TEST: TCP connected");
+    let tls_stream = TlsStream(tcp_stream, "example.com");
+    let res = tls_stream.handshake();
+    console.log(`TLS TEST: handshake result = ${res}`);
+    
+    tls_stream.write("GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n");
+    console.log("TLS TEST: request written");
+    
+    let resp = tls_stream.read(1024);
+    console.log(`TLS TEST: read ${resp.length} bytes:`);
+    console.log(resp);
+    
+    tls_stream.close();
+    console.log("TLS TEST: done");
+}

@@ -1,0 +1,12 @@
+// One BTreeDB client process for the concurrency-scaling harness.
+import ycsb_client_core;
+import db;
+import btreedb;
+import env;
+
+fn main(): void {
+    let dsn = env.get("YCSB_DSN");
+    if (dsn.length == 0) { dsn = "127.0.0.1:3009"; }
+    let conn = BTreeDriver().connect(dsn);
+    ycsb_client_core.dispatch(conn, "CREATE TABLE ycsb_af (ykey TEXT PRIMARY KEY, ydata TEXT)");
+}

@@ -1,0 +1,53 @@
+// W2: static file serving — an LRU cache in front of a filesystem directory, mounted on
+// the web App. `app.useStatic(prefix, dir)` serves files under the URL prefix, deriving
+// Content-Type from the extension, rejecting path traversal, and caching hot files.
+import assert;
+import string;
+import io.file;
+import web.app;
+import web.request;
+import web.status;
+import web.static_content;
+
+@test
+fn test_lru_eviction_and_stats(): void {
+    let c = static_content.LruCache(2);
+    c.put("a", "1");
+    c.put("b", "2");
+    assert.equalStr(c.get("a") ?? "?", "1"); // a -> MRU
+    c.put("c", "3");                          // evicts LRU (b)
+    assert.isTrue(c.get("b") == undefined);   // evicted
+    assert.equalStr(c.get("a") ?? "?", "1");
+    assert.equalStr(c.get("c") ?? "?", "3");
+    assert.isTrue(c.hits > 0);
+    assert.isTrue(c.misses > 0);
+}
+
+@test
+fn test_static_serve_through_app(): void {
+    // Write two files the mount will serve.
+    file.File.writeText("/tmp/nova_static_gate_index.html", "<h1>Static OK</h1>");
+    file.File.writeText("/tmp/nova_static_gate_app.css", "body{color:red}");
+
+    let a = app.App();
+    a.useStatic("/s", "/tmp");
+
+    // HTML content + Content-Type.
+    let r1 = a.dispatch(request.Request.fromString("GET /s/nova_static_gate_index.html HTTP/1.1\r\nHost:x\r\n\r\n"));
+    assert.isTrue(string.indexOf(r1.body, "Static OK") != -1);
+    assert.equalStr(r1.headers.get("Content-Type") ?? "?", "text/html");
+
+    // CSS mime; second request is an LRU hit (same body).
+    let r2 = a.dispatch(request.Request.fromString("GET /s/nova_static_gate_app.css HTTP/1.1\r\nHost:x\r\n\r\n"));
+    assert.equalStr(r2.headers.get("Content-Type") ?? "?", "text/css");
+    let r2b = a.dispatch(request.Request.fromString("GET /s/nova_static_gate_app.css HTTP/1.1\r\nHost:x\r\n\r\n"));
+    assert.isTrue(string.indexOf(r2b.body, "color:red") != -1);
+
+    // Path traversal -> 403.
+    let rbad = a.dispatch(request.Request.fromString("GET /s/../etc/passwd HTTP/1.1\r\nHost:x\r\n\r\n"));
+    assert.isTrue(Status.toCode(rbad.status) == 403);
+
+    // Missing file -> 404.
+    let rmiss = a.dispatch(request.Request.fromString("GET /s/nope.txt HTTP/1.1\r\nHost:x\r\n\r\n"));
+    assert.isTrue(Status.toCode(rmiss.status) == 404);
+}

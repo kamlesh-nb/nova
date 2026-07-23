@@ -1,0 +1,27 @@
+// A3(d): assigning a struct to a trait-typed FIELD (`self.g = A{}`) must widen it to the trait object.
+// This is the stdlib's actual field-init pattern (constructor init() bodies, and setters). The A3(a)
+// reassignment fix covered a trait VARIABLE (`g = B{}`); this covers the field-access assignment LHS.
+// Prior to the fix: a raw struct in the trait field slot → garbage vtable → SEGV.
+import assert;
+
+trait G { fn v(self: G): int; }
+struct A impl G { fn v(self: A): int { return 3; } }
+struct B impl G { fn v(self: B): int { return 7; } }
+
+// Constructor init() body assigns a struct to a trait field.
+struct Holder { pub g: G  init(){ self.g = A{}; } }
+@test
+fn test_init_body_field_assign(): void {
+    let h = Holder();
+    assert.equalInt(h.g.v(), 3);
+}
+
+// A setter method reassigns the trait field to a different struct.
+struct Box { pub g: G  init(){ self.g = A{}; } fn setB(self: Box): void { self.g = B{}; } }
+@test
+fn test_method_field_reassign(): void {
+    let x = Box();
+    assert.equalInt(x.g.v(), 3);
+    x.setB();
+    assert.equalInt(x.g.v(), 7);
+}

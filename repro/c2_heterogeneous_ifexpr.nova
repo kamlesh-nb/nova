@@ -1,0 +1,20 @@
+import assert;
+
+trait Greeter { fn greet(self: Greeter): string; }
+struct Ada impl Greeter { fn greet(self: Ada): string { return "ada"; } }
+struct Cat impl Greeter { fn greet(self: Cat): string { return "cat"; } }
+
+fn pick(c: bool): Greeter {
+    let o = if (c) Ada{} else Cat{};   // unannotated, heterogeneous — LUB = Greeter
+    return o;
+}
+
+@test
+fn heterogeneous_ifexpr_true() {
+    assert.equalStr(pick(true).greet(), "ada");
+}
+
+@test
+fn heterogeneous_ifexpr_false() {
+    assert.equalStr(pick(false).greet(), "cat");
+}

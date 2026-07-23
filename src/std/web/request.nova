@@ -1,0 +1,192 @@
+// request.nova — HTTP Request parsing
+import string;
+import list;
+import map;
+import bytes;
+import web.url;
+
+pub struct Request {
+    pub method: string,        // GET, POST, etc.
+    pub path: string,          // /path/to/resource
+    pub query: Map<string, string>, // query parameters
+    pub headers: Map<string, string>,
+    pub cookies: Map<string, string>,
+    pub body: string,
+
+    /// Parse an HTTP request from a raw string
+    pub fn fromString(raw: string): Request {
+        let boundary = string.indexOf(raw, "\r\n\r\n");
+        if (boundary == -1) {
+            return Request.empty();
+        }
+
+        let headers_part = string.slice(raw, 0, boundary);
+        let body = string.slice(raw, boundary + 4, raw.length);
+
+        let lines = string.split(headers_part, "\r\n");
+        if (lines.size() == 0) {
+            return Request.empty();
+        }
+
+        let request_line = lines.get(0) ?? "";
+        let parts = string.split(request_line, " ");
+        let method = parts.get(0) ?? "";
+        let full_path = parts.get(1) ?? "";
+        let (path, query) = splitPathQuery(full_path);
+
+        let headers = Map<string, string>(16, string.hash);
+        let i = 1;
+        while (i < lines.size()) {
+            let line = lines.get(i) ?? "";
+            if (line != "") {
+                let (key, value) = parseHeader(line);
+                if (key != "") {
+                    headers.set(key, value);
+                }
+            }
+            i = i + 1;
+        }
+
+        // Parse Cookies
+        let cookies = Map<string, string>(16, string.hash);
+        let cookie_str = findHeaderVal(headers, "Cookie");
+        if (cookie_str != "") {
+            let pairs = string.split(cookie_str, ";");
+            let j = 0;
+            while (j < pairs.size()) {
+                let pair = pairs.get(j) ?? "";
+                let trimmed_pair = trimWhitespace(pair);
+                let eq_idx = string.indexOf(trimmed_pair, "=");
+                if (eq_idx != -1) {
+                    let k = string.slice(trimmed_pair, 0, eq_idx);
+                    let v = string.slice(trimmed_pair, eq_idx + 1, trimmed_pair.length);
+                    cookies.set(k, v);
+                }
+                j = j + 1;
+            }
+        }
+
+        return Request{
+            method: method,
+            path: path,
+            query: query,
+            headers: headers,
+            cookies: cookies,
+            body: body,
+        };
+    }
+
+    /// Parse from a raw memory pointer
+    pub fn parse(ptr: int, len: int): Request {
+        let raw = bytes.read_string(ptr, len);
+        return Request.fromString(raw);
+    }
+
+    /// Create an empty request
+    pub fn empty(): Request {
+        return Request{
+            method: "",
+            path: "",
+            query: Map<string, string>(16, string.hash),
+            headers: Map<string, string>(16, string.hash),
+            cookies: Map<string, string>(16, string.hash),
+            body: "",
+        };
+    }
+
+    /// Get a header value by name (case-insensitive)
+    pub fn getHeader(self: Request, name: string): string | undefined {
+        let lower_name = string.toLowerCase(name);
+        let keys = self.headers.keys();
+        let keysLen = keys.size();
+        let i = 0;
+        while (i < keysLen) {
+            let key = keys.get(i) ?? "";
+            if (string.toLowerCase(key) == lower_name) {
+                return self.headers.get(key);
+            }
+            i = i + 1;
+        }
+        return undefined;
+    }
+
+    /// Get a cookie value by name
+    pub fn getCookie(self: Request, name: string): string | undefined {
+        return self.cookies.get(name);
+    }
+}
+
+// --- Private helpers ---
+
+fn splitPathQuery(full_path: string): (string, Map<string, string>) {
+    let idx = string.indexOf(full_path, "?");
+    if (idx == -1) {
+        return (full_path, Map<string, string>(16, string.hash));
+    }
+    let path = string.slice(full_path, 0, idx);
+    let query_str = string.slice(full_path, idx + 1, full_path.length);
+    let query = parseQuery(query_str);
+    return (path, query);
+}
+
+pub fn parseQuery(query_str: string): Map<string, string> {
+    // Percent-decode keys and values (`%20`→space, `+`→space). Also used for
+    // application/x-www-form-urlencoded bodies, so decoding here fixes both.
+    let result = Map<string, string>(16, string.hash);
+    let pairs = string.split(query_str, "&");
+    pairs.forEach((pair) => {
+        let parts = string.split(pair, "=");
+        let key = url.decode(parts.get(0) ?? "");
+        let val = url.decode(parts.get(1) ?? "");
+        result.set(key, val);
+    });
+    return result;
+}
+
+fn trimWhitespace(s: string): string {
+    let len = s.length;
+    let start = 0;
+    while (start < len) {
+        let c = s[start];
+        if (c != 32 && c != 9 && c != 10 && c != 13) {
+            break;
+        }
+        start = start + 1;
+    }
+    let end = len;
+    while (end > start) {
+        let c = s[end - 1];
+        if (c != 32 && c != 9 && c != 10 && c != 13) {
+            break;
+        }
+        end = end - 1;
+    }
+    if (start >= end) {
+        return "";
+    }
+    return string.slice(s, start, end);
+}
+
+fn parseHeader(line: string): (string, string) {
+    let idx = string.indexOf(line, ":");
+    if (idx == -1) {
+        return ("", "");
+    }
+    let key = trimWhitespace(string.slice(line, 0, idx));
+    let val = trimWhitespace(string.slice(line, idx + 1, line.length));
+    return (key, val);
+}
+
+fn findHeaderVal(headers: Map<string, string>, name: string): string {
+    let lower_name = string.toLowerCase(name);
+    let keys = headers.keys();
+    let i = 0;
+    while (i < keys.size()) {
+        let key = keys.get(i) ?? "";
+        if (string.toLowerCase(key) == lower_name) {
+            return headers.get(key) ?? "";
+        }
+        i = i + 1;
+    }
+    return "";
+}

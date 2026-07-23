@@ -1,0 +1,31 @@
+// A4 guard: float stdlib — math functions (floor/ceil/round/sqrt/abs/min/max)
+// and string.parseFloat.
+import assert;
+import math;
+import string;
+
+@test
+fn test_float_math_fns(): void {
+    assert.isTrue(math.fsqrt(25.0) > 4.9);
+    assert.isTrue(math.fsqrt(25.0) < 5.1);
+    assert.isTrue(math.ffloor(9.9) > 8.9);
+    assert.isTrue(math.ffloor(9.9) < 9.1);
+    assert.isTrue(math.fceil(9.1) > 9.9);
+    assert.isTrue(math.fround(9.5) > 9.9);
+    assert.isTrue(math.fabs(0.0 - 7.0) > 6.9);
+    assert.isTrue(math.pi() > 3.14);
+    assert.isTrue(math.pi() < 3.15);
+}
+
+@test
+fn test_parse_float(): void {
+    let a = string.parseFloat("3.5");
+    assert.isTrue(a > 3.4);
+    assert.isTrue(a < 3.6);
+    let b = string.parseFloat("-2.25");
+    assert.isTrue(b < 0.0);
+    assert.isTrue(b > -2.3);
+    let c = string.parseFloat("42");
+    assert.isTrue(c > 41.9);
+    assert.isTrue(c < 42.1);
+}

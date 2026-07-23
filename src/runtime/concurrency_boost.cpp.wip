@@ -1,0 +1,73 @@
+// concurrency.cpp — Nova C++20 runtime: multi-threaded fiber concurrency and the
+// program entry point.
+//
+// Built on Boost.Fiber (a multi-threaded, work-stealing scheduler on top of
+// Boost.Context stackful fibers) — race-free by design, so the old C runtime's
+// "same fiber on two threads" park/wake bug cannot occur. Cross-platform:
+// Boost.Context uses fcontext on POSIX and Win64 fibers on Windows.
+//
+// spawn -> a detached fiber; sleep -> fiber-aware yield; channels -> fiber-aware
+// buffered channels. Sockets/TLS (async) will integrate Asio with this scheduler
+// in a later step.
+#include "nova_abi.h"
+#include <boost/fiber/all.hpp>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+
+namespace fibers = boost::fibers;
+
+extern "C" void __nova_main(void);
+
+extern "C" {
+
+void nova_concurrency_spawn(long long closure) {
+    if (!closure) return;
+    long long *box = reinterpret_cast<long long *>(closure);
+    long long fn_ptr = box[0];
+    long long env = box[1];
+    fibers::fiber([fn_ptr, env] {
+        reinterpret_cast<void (*)(long long)>(fn_ptr)(env);
+    }).detach();
+}
+
+void nova_concurrency_sleep(long long ms) {
+    boost::this_fiber::sleep_for(std::chrono::milliseconds(ms));
+}
+
+// ===== Channels (fiber-aware buffered channels) ============================
+// boost::fibers::buffered_channel requires capacity >= 2 and a power of two.
+long long nova_channel_create(int capacity) {
+    std::size_t cap = 2;
+    std::size_t want = (capacity > 0 ? (std::size_t)capacity : 1) + 1;
+    while (cap < want) cap <<= 1;
+    return (long long)new fibers::buffered_channel<long long>(cap);
+}
+void nova_channel_send(long long h, long long val) {
+    if (!h) return;
+    reinterpret_cast<fibers::buffered_channel<long long> *>(h)->push(val);
+}
+long long nova_channel_recv(long long h) {
+    if (!h) return 0;
+    long long v = 0;
+    reinterpret_cast<fibers::buffered_channel<long long> *>(h)->pop(v);
+    return v;
+}
+void nova_channel_destroy(long long h) {
+    auto *c = reinterpret_cast<fibers::buffered_channel<long long> *>(h);
+    if (c) { c->close(); delete c; }
+}
+
+// ===== Program entry =======================================================
+// v1: single-threaded fiber scheduler (default round-robin). Multi-threaded
+// work-stealing (with a startup barrier) is added next once this is verified.
+int main(int /*argc*/, char ** /*argv*/) {
+    fibers::fiber([] { __nova_main(); }).join();
+    // Terminate immediately: running static destructors here can deadlock in the
+    // Boost.Fiber scheduler teardown (esp. with detached fibers still alive).
+    std::fflush(stdout);
+    std::fflush(stderr);
+    std::_Exit(0);
+}
+
+} // extern "C"

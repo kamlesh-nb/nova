@@ -1,0 +1,36 @@
+// allocator.nova — Explicit Allocator standard library
+import bytes;
+
+pub struct Allocator {
+    pub kind: int, // 0 = Arena/custom, 1 = C/Persistent
+    pub ctx: ptr,                        // context address (ArenaAllocator*, or 0)
+    pub allocFn: (ptr, int) -> ptr,      // (ctx-addr, size) -> address
+    pub freeFn: (ptr, ptr) -> void,      // (ctx-addr, block-addr)
+
+    pub fn alloc(self: Allocator, size: int): ptr {
+        let f = self.allocFn;
+        return f(self.ctx, size);
+    }
+
+    pub fn free(self: Allocator, ptr: ptr): void {
+        let f = self.freeFn;
+        f(self.ctx, ptr);
+    }
+}
+
+fn cAllocFn(ctx: ptr, size: int): ptr {
+    return bytes.alloc_persistent(size);
+}
+
+fn cFreeFn(ctx: ptr, ptr: ptr): void {
+    bytes.free(ptr);
+}
+
+pub fn globalAllocator(): Allocator {
+    return Allocator {
+        kind: 1,
+        ctx: 0,
+        allocFn: cAllocFn,
+        freeFn: cFreeFn,
+    };
+}

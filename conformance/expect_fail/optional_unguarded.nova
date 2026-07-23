@@ -1,0 +1,14 @@
+// EXPECT-FAIL: typecheck
+// H2 optionals soundness: a bare member access on a `T | undefined` value is a hard
+// compile error (specs §3.4). `l.get(5)` is `int | undefined`; `.length` on it (unguarded)
+// must be REJECTED at compile time — not a runtime segfault, not a see-through. The fix is
+// `l.at(5)` / `l.get(5) ?? 0` / `l.get(5)?.length` / narrow with `if (x != undefined)`.
+import list;
+
+@test
+fn t_unguarded_optional_access(): void {
+    let l = List<int>();
+    l.push(10);
+    let x = l.get(5);
+    console.log(x.length);
+}

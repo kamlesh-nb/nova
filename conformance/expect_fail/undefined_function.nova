@@ -1,0 +1,14 @@
+// EXPECT-FAIL: typecheck
+// ✅ F2-5 (2026-07-18): an undefined identifier is now a SEMA error (end-of-sema fatal),
+//    not a codegen 'Identifier not found'. Moved earlier as the DEBT note asked.
+//    (Was `compiler-crash`: an unhandled Zig error printed a compiler backtrace.
+//     Fixed 2026-07-17 via main.zig's userErrorHint. Plan P0-5.)
+// NEGATIVE test: must FAIL to compile.
+// Calling an undefined function is a compile error (FunctionNotFound).
+import assert;
+
+@test
+fn t(): void {
+    let x = no_such_function_xyz(3);
+    assert.equalInt(x, 3);
+}

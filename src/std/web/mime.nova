@@ -1,0 +1,56 @@
+// mime.nova — HTTP MIME types representation using refined enums with methods
+import bytes;
+import string;
+
+pub enum MimeType {
+    TextPlain,
+    TextHtml,
+    TextCss,
+    ApplicationJson,
+    ApplicationJavascript,
+    ApplicationXml,
+    ApplicationOctetStream,
+    ImagePng,
+    ImageJpeg,
+    ImageGif,
+    ImageSvgXml,
+
+    pub fn toString(self: MimeType): string {
+        switch (self) {
+            case MimeType.TextPlain: { return "text/plain"; }
+            case MimeType.TextHtml: { return "text/html"; }
+            case MimeType.TextCss: { return "text/css"; }
+            case MimeType.ApplicationJson: { return "application/json"; }
+            case MimeType.ApplicationJavascript: { return "application/javascript"; }
+            case MimeType.ApplicationXml: { return "application/xml"; }
+            case MimeType.ApplicationOctetStream: { return "application/octet-stream"; }
+            case MimeType.ImagePng: { return "image/png"; }
+            case MimeType.ImageJpeg: { return "image/jpeg"; }
+            case MimeType.ImageGif: { return "image/gif"; }
+            case MimeType.ImageSvgXml: { return "image/svg+xml"; }
+            default: { return "application/octet-stream"; }
+        }
+    }
+
+    pub fn fromExtension(ext: string): MimeType {
+        let lower = string.toLowerCase(ext);
+        if (lower == "txt") return MimeType.TextPlain;
+        if (lower == "html" || lower == "htm") return MimeType.TextHtml;
+        if (lower == "css") return MimeType.TextCss;
+        if (lower == "json") return MimeType.ApplicationJson;
+        if (lower == "js") return MimeType.ApplicationJavascript;
+        if (lower == "xml") return MimeType.ApplicationXml;
+        if (lower == "png") return MimeType.ImagePng;
+        if (lower == "jpg" || lower == "jpeg") return MimeType.ImageJpeg;
+        if (lower == "gif") return MimeType.ImageGif;
+        if (lower == "svg") return MimeType.ImageSvgXml;
+        return MimeType.ApplicationOctetStream;
+    }
+}
+
+// Content-Type string for a file extension (no dot), e.g. "html" -> "text/html".
+// A free function so callers in OTHER modules get the mime string without invoking an
+// enum method cross-module (the enum method call stays inside this module).
+pub fn contentType(ext: string): string {
+    return MimeType.fromExtension(ext).toString();
+}

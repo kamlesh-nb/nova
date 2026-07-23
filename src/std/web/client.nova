@@ -1,0 +1,80 @@
+// client.nova — HttpClient: sends HTTP requests and parses responses
+import bytes;
+import mem.allocator;
+import string;
+import list;
+import map;
+import net.tcp.client;
+import net.tcp.socket;
+import web.request;
+import web.response;
+import web.status;
+
+pub struct HttpClient {
+
+    /// Send a GET request
+    pub fn get(host: string, port: int, path: string): response.Response {
+        let headers = Map<string, string>(16, string.hash);
+        headers.set("Host", host);
+        let req = request.Request{
+            method: "GET",
+            path: path,
+            query: Map<string, string>(16, string.hash),
+            headers: headers,
+            cookies: Map<string, string>(16, string.hash),
+            body: "",
+        };
+        return HttpClient.send(host, port, req);
+    }
+
+    /// Send a POST request with a body
+    pub fn post(host: string, port: int, path: string, body: string): response.Response {
+        let headers = Map<string, string>(16, string.hash);
+        headers.set("Host", host);
+        headers.set("Content-Length", `${body.length}`);
+        let req = request.Request{
+            method: "POST",
+            path: path,
+            query: Map<string, string>(16, string.hash),
+            headers: headers,
+            cookies: Map<string, string>(16, string.hash),
+            body: body,
+        };
+        return HttpClient.send(host, port, req);
+    }
+
+    /// Send a request and return the response
+    pub fn send(host: string, port: int, req: request.Request): response.Response {
+        let stream = client.TcpClient.connect(host, port);
+        if (stream.fd < 0) {
+            return response.Response(Status.InternalServerError, "Connection failed");
+        }
+
+        // Build the HTTP request
+        let request_line = req.method + " " + req.path + " HTTP/1.1\r\n";
+
+        // Ensure Host header
+        if (req.headers.get("Host") == undefined) {
+            req.headers.set("Host", host);
+        }
+        // Ensure Connection: close for simple request/response
+        req.headers.set("Connection", "close");
+
+        // Build headers string
+        let header_lines = List<string>();
+        req.headers.forEach((key, value) => {
+            header_lines.push(key + ": " + value);
+        });
+        let headers_str = string.join(header_lines, "\r\n");
+
+        let full_request = request_line + headers_str + "\r\n\r\n" + req.body;
+        stream.write(full_request);
+
+        // Read the full response
+        let raw_response = stream.readAll(65536);
+        stream.close();
+
+        // Parse the HTTP response
+        return response.Response.parse(raw_response);
+    }
+}

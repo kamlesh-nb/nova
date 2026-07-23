@@ -1,0 +1,135 @@
+// static_content.nova — static file serving for the web App (W2).
+//
+// An LRU cache in front of a filesystem directory: `app.useStatic("/static", "./wwwroot")`
+// serves files under the URL prefix from disk, caching hot files (bounded, with hit/miss
+// stats). Path-traversal (`..`) is rejected; `/` maps to `index.html`; the Content-Type is
+// derived from the extension.
+//
+// Reimplemented in Nova (not bound from Zig) so it is portable (wasm-ready) and dogfoods
+// the collections + io + mime stdlib.
+import string;
+import map;
+import list;
+import io.file;
+import web.mime;
+import web.response;
+import web.status;
+
+/// A bounded least-recently-used cache: key -> content, evicting the least-recently-used
+/// entry when full. `order` holds keys front=LRU .. back=MRU. Small capacities only (the
+/// order scan is linear), which is exactly the hot-static-file use case.
+pub struct LruCache {
+    pub capacity: int,
+    pub store: map.Map<string, string>,
+    pub order: list.List<string>,
+    pub hits: long,
+    pub misses: long,
+
+    init(cap: int) {
+        self.capacity = cap;
+        self.store = map.Map<string, string>(cap * 2, string.hash);
+        self.order = list.List<string>();
+        self.hits = 0;
+        self.misses = 0;
+    }
+
+    // Move `key` to the most-recently-used position (remove where present, append to back).
+    fn touch(self: LruCache, key: string): void {
+        let n = self.order.size();
+        let i = 0;
+        while (i < n) {
+            let k = self.order.get(i) ?? "";
+            if (string.eql(k, key)) {
+                self.order.remove(i);
+                i = n; // done
+            } else {
+                i = i + 1;
+            }
+        }
+        self.order.push(key);
+    }
+
+    pub fn get(self: LruCache, key: string): string | undefined {
+        if (self.store.has(key)) {
+            self.hits = self.hits + 1;
+            self.touch(key);
+            return self.store.get(key);
+        }
+        self.misses = self.misses + 1;
+        return undefined;
+    }
+
+    pub fn put(self: LruCache, key: string, value: string): void {
+        if (self.store.has(key)) {
+            self.store.set(key, value);
+            self.touch(key);
+            return;
+        }
+        if (self.store.size() >= self.capacity) {
+            let lru = self.order.get(0) ?? "";
+            self.order.remove(0);
+            self.store.delete_key(lru);
+        }
+        self.store.set(key, value);
+        self.order.push(key);
+    }
+
+    pub fn hitRate(self: LruCache): double {
+        let total = self.hits + self.misses;
+        if (total == 0) { return 0.0; }
+        return (self.hits as double) / (total as double);
+    }
+}
+
+// Extension of a path WITHOUT the leading dot ("" if none).
+fn fileExt(path: string): string {
+    let dot = string.lastIndexOf(path, ".");
+    if (dot == -1) { return ""; }
+    return string.slice(path, dot + 1, path.length);
+}
+
+
+/// A static mount: URL `prefix` -> filesystem `dir`, fronted by an LRU cache.
+pub struct StaticMount {
+    pub prefix: string,
+    pub dir: string,
+    pub cache: LruCache,
+
+    init(prefix: string, dir: string, cacheCap: int) {
+        self.prefix = prefix;
+        self.dir = dir;
+        self.cache = LruCache(cacheCap);
+    }
+
+    /// Serve `reqPath` if it falls under this mount, else undefined (caller 404s). Returns a
+    /// 403 for path traversal. Content-Type is set from the file extension.
+    pub fn serve(self: StaticMount, reqPath: string): response.Response | undefined {
+        if (!string.startsWith(reqPath, self.prefix)) {
+            return undefined;
+        }
+        let rel = string.slice(reqPath, self.prefix.length, reqPath.length);
+        if (string.indexOf(rel, "..") != -1) {
+            return response.Response(Status.Forbidden, "Forbidden");
+        }
+        if (string.eql(rel, "") || string.eql(rel, "/")) {
+            rel = "/index.html";
+        }
+        let fsPath = self.dir + rel;
+
+        let content = "";
+        let cached = self.cache.get(fsPath);
+        if (cached == undefined) {
+            if (!file.File.exists(fsPath)) {
+                return undefined; // not found under this mount -> let dispatch 404
+            }
+            content = file.File.readText(fsPath);
+            self.cache.put(fsPath, content);
+        } else {
+            content = cached ?? "";
+        }
+
+        let mimeType = mime.contentType(fileExt(rel));
+        let resp = response.Response(Status.Ok, content);
+        return resp.setHeader("Content-Type", mimeType);
+    }
+}

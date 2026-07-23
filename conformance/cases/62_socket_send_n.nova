@@ -1,0 +1,51 @@
+// nova_socket_send_n / TcpStream.writeBytes — length-aware BINARY socket send, the
+// primitive every binary DB/network driver (BTreeDB, Postgres, MySQL, …) sends wire
+// frames through. Unlike `write` (string-header length, stops at the allocation size),
+// send_n transmits exactly `len` raw bytes — embedded NULs and all.
+//
+// Deterministic single-threaded localhost loopback: bind+listen, connect (the handshake
+// completes into the accept backlog on loopback), then accept returns the server fd
+// immediately — no threads/fibers needed.
+//
+// Also guards the recv-returns-int fix: `nova_socket_recv` returns the INT byte-count,
+// not a string; when it was mis-typed `.string` the codegen ARC-released the integer
+// count as an owned string pointer and read() segfaulted on teardown.
+import assert;
+import bytes;
+import net.tcp.server;
+import net.tcp.client;
+import net.tcp.socket;
+
+@test
+fn test_send_n_is_binary_safe(): void {
+    // 5-byte payload with two embedded NULs: A \0 B \0 C
+    let payload = bytes.alloc(5);
+    bytes.write_byte(payload, 0, 65);  // 'A'
+    bytes.write_byte(payload, 1, 0);   // NUL — `write` would be fine too (header len=5),
+    bytes.write_byte(payload, 2, 66);  // 'B'   but a driver frames its own length, so
+    bytes.write_byte(payload, 3, 0);   // NUL   send_n must honor `len`, not the header.
+    bytes.write_byte(payload, 4, 67);  // 'C'
+
+    let listener = server.TcpListener.bind(54871);
+    let clientStream = client.TcpClient.connect("127.0.0.1", 54871);
+    let serverStream = listener.accept();
+
+    let sent = clientStream.writeBytes(payload, 5);
+    assert.equalInt(sent, 5);
+
+    let got = serverStream.read(64);
+    assert.equalInt(got.length, 5);   // no truncation at the first NUL
+
+    // Every byte survived intact, NULs included.
+    let gp = got as ptr;
+    assert.equalInt(bytes.read_byte(gp, 0), 65);
+    assert.equalInt(bytes.read_byte(gp, 1), 0);
+    assert.equalInt(bytes.read_byte(gp, 2), 66);
+    assert.equalInt(bytes.read_byte(gp, 3), 0);
+    assert.equalInt(bytes.read_byte(gp, 4), 67);
+
+    clientStream.close();
+    serverStream.close();
+    listener.close();
+    bytes.free(payload);
+}

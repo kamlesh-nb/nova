@@ -1,0 +1,57 @@
+// specs §3.1 Stage 2: decimal128 arithmetic (`+ - * / %`) and comparison, done in base-10 on the
+// decoded (sign, coefficient, exponent) triple with round-half-even to 34 significant digits. The
+// point is EXACTNESS — `0.1m + 0.2m` is exactly `0.3` (a binary double gives 0.30000000000000004) —
+// and correct rounding/preferred-exponent behaviour. Every result is a fresh ARC heap decimal, so
+// the suite must be leak-free under --arc and clean under --asan.
+import assert;
+
+@test
+fn test_add_exact(): void {
+    // The canonical binary-float failure: 0.1 + 0.2. decimal128 is exact.
+    assert.equalStr(`${0.1m + 0.2m}`, "0.3");
+    assert.equalStr(`${100m + 0.001m}`, "100.001"); // exponent alignment
+    assert.equalStr(`${5m + -8m}`, "-3");            // opposite signs
+}
+
+@test
+fn test_sub(): void {
+    assert.equalStr(`${10.5m - 3.25m}`, "7.25");
+    assert.equalStr(`${3m - 10m}`, "-7");
+}
+
+@test
+fn test_mul(): void {
+    assert.equalStr(`${1.5m * 2m}`, "3.0");                 // preferred exp keeps the .0
+    assert.equalStr(`${-2.5m * 4m}`, "-10.0");
+    assert.equalStr(`${123456789.123m * 1000m}`, "123456789123.000");
+}
+
+@test
+fn test_div(): void {
+    assert.equalStr(`${1m / 4m}`, "0.25");   // exact: stripped to preferred exponent
+    assert.equalStr(`${-1m / 8m}`, "-0.125");
+    // Repeating: rounded to 34 significant digits.
+    assert.equalStr(`${10m / 3m}`, "3.333333333333333333333333333333333");
+}
+
+@test
+fn test_mod(): void {
+    assert.equalStr(`${10m % 3m}`, "1");
+    assert.equalStr(`${10.5m % 2m}`, "0.5");
+}
+
+@test
+fn test_compare(): void {
+    let a: decimal = 0.1m;
+    let b: decimal = 0.2m;
+    assert.isTrue(a < b);
+    assert.isFalse(a > b);
+    assert.isTrue(a == a);
+    assert.isTrue(a != b);
+    assert.isTrue(a <= a);
+    assert.isTrue(b >= a);
+    assert.isTrue(a + b == 0.3m); // exact arithmetic then exact compare
+    // Negative ordering: larger magnitude is smaller.
+    assert.isTrue(-5m < -3m);
+    assert.isTrue(-0m == 0m);
+}

@@ -1,0 +1,57 @@
+// logger.nova — File-based Logger and HTTP Logging Middleware
+import io.file;
+import web.request;
+import web.response;
+import web.middleware;
+import web.di;
+
+pub struct Logger impl Service {
+    pub filepath: string,
+
+    init(filepath: string) {
+        self.filepath = filepath;
+    }
+
+    pub fn log(self: Logger, level: string, message: string): void {
+        let log_line = "[" + level + "] " + message + "\n";
+        io.file.File.appendText(self.filepath, log_line);
+        if (level == "ERROR") {
+            console.err(message);
+        } else if (level == "DEBUG") {
+            console.debug(message);
+        } else if (level == "INFO") {
+            console.info(message);
+        } else {
+            console.log(message);
+        }
+    }
+
+    pub fn info(self: Logger, message: string): void {
+        self.log("INFO", message);
+    }
+
+    pub fn debug(self: Logger, message: string): void {
+        self.log("DEBUG", message);
+    }
+
+    pub fn err(self: Logger, message: string): void {
+        self.log("ERROR", message);
+    }
+}
+
+pub struct LoggerMiddleware impl Middleware, Service {
+    pub logger: Logger,
+
+    init(logger: Logger) {
+        self.logger = logger;
+    }
+
+    pub fn execute(self: LoggerMiddleware, req: request.Request, res: response.Response): MiddlewareAction {
+        self.logger.info("Incoming request: " + req.method + " " + req.path);
+        return MiddlewareAction.Next;
+    }
+
+    pub fn after(self: LoggerMiddleware, req: request.Request, res: response.Response, matched: MatchedRoute): void {
+        self.logger.info(`Response sent: status=${res.status as int} for ${req.method} ${req.path}`);
+    }
+}

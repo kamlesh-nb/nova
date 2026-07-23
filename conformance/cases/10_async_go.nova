@@ -1,0 +1,31 @@
+// M3-D: async/await + `go` concurrent launch (Future) end-to-end.
+// Exercises coroutine lowering, the Asio scheduler, `go` (concurrent task launch),
+// and `await <future>` (including the already-complete "ready" path).
+import assert;
+
+async fn square(n: int): int {
+    return n * n;
+}
+
+async fn addAsync(a: int, b: int): int {
+    let x = await square(a);   // child await
+    let y = await square(b);
+    return x + y;
+}
+
+async fn concurrent(): int {
+    let h1 = spawn square(3);     // launched concurrently
+    let h2 = spawn square(4);
+    let h3 = spawn addAsync(1, 2); // 1 + 4 = 5
+    return await h1 + await h2 + await h3;  // 9 + 16 + 5 = 30
+}
+
+@test
+fn t_await(): void {
+    assert.equalInt(addAsync(2, 3), 13);   // 4 + 9
+}
+
+@test
+fn t_go(): void {
+    assert.equalInt(concurrent(), 30);
+}

@@ -1,0 +1,80 @@
+// Pins the F5 task-#13 fix: trait-downcast retain + struct literals as drainable temporaries, landed
+// together (docs/design/F5-downcast-struct_init-plan.md). Every test here was a leak or a
+// use-after-free before the fix, and NONE was covered by the corpus — which is why the defect hid.
+// Run under --arc AND --asan (a downcast UAF reports CLEAN under --arc; only --asan catches it).
+import assert;
+import list;
+import map;
+import string;
+
+// --- struct literal as an OWNED call argument the callee stores (was LEAK) ---
+struct User { pub name: string, pub age: int }
+
+@test
+fn test_struct_literal_pushed(): void {
+    let xs = List<User>();
+    xs.push(User{ name: "Alice", age: 30 });
+    xs.push(User{ name: "Bob", age: 25 });
+    assert.equalInt(xs.size(), 2);
+    assert.equalStr(xs.at(1).name, "Bob");
+}
+
+@test
+fn test_struct_literal_map_value(): void {
+    let m = map.Map<string, User>(16, string.hash);
+    m.set("a", User{ name: "Alice", age: 30 });
+    assert.equalStr(m.at("a").name, "Alice");
+    assert.equalInt(m.size(), 1);
+}
+
+// --- trait downcast of a struct-literal trait argument (was UAF via __destruct_trait) ---
+trait Message { fn name(self: Message): string; }
+struct Doubling impl Message {
+    pub val: int,
+    pub fn name(self: Doubling): string { return "Doubling"; }
+}
+
+fn double(msg: Message): int {
+    let m = msg as Doubling;   // downcast: trait -> concrete
+    return m.val * 2;
+}
+
+@test
+fn test_downcast_struct_literal_arg(): void {
+    assert.equalInt(double(Doubling{ val: 21 }), 42);
+}
+
+fn doubleInline(msg: Message): int {
+    return (msg as Doubling).val * 2;   // downcast used inline, unbound (drains as a temp)
+}
+
+@test
+fn test_downcast_inline_unbound(): void {
+    assert.equalInt(doubleInline(Doubling{ val: 50 }), 100);
+}
+
+// --- downcast of a NON-temp trait (a variable): the retain must balance c's scope release ---
+@test
+fn test_downcast_of_variable(): void {
+    let s: Message = Doubling{ val: 9 };
+    let c = s as Doubling;
+    assert.equalInt(c.val, 9);
+}
+
+// --- trait binding / factory return with a struct LITERAL (corpus only had the constructor form) ---
+trait Speaker { fn speak(self: Speaker): int; }
+struct Cat impl Speaker { pub v: int, pub fn speak(self: Cat): int { return self.v; } }
+
+fn makeSpeaker(): Speaker { return Cat{ v: 5 }; }
+
+@test
+fn test_let_trait_struct_literal(): void {
+    let s: Speaker = Cat{ v: 7 };
+    assert.equalInt(s.speak(), 7);
+}
+
+@test
+fn test_return_trait_struct_literal(): void {
+    let s = makeSpeaker();
+    assert.equalInt(s.speak(), 5);
+}

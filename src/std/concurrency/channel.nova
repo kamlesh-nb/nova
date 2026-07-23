@@ -1,0 +1,44 @@
+// channel.nova - Fiber-safe Channels for Nova
+
+import bytes;
+import mem.allocator;
+import assert;
+
+pub struct Channel<T> {
+    pub handle: long,
+    pub allocator: allocator.Allocator,
+
+    init(capacity: int, alloc: allocator.Allocator) {
+        self.allocator = alloc;
+        self.handle = nova_channel_create(capacity);
+    }
+
+    pub fn send(self: Channel<T>, val: T): void {
+        nova_channel_send(self.handle, val);
+    }
+
+    pub fn recv(self: Channel<T>): T {
+        return nova_channel_recv(self.handle);
+    }
+
+    pub fn delete(self: Channel<T>): void {
+        // Idempotent (see array/string_builder): the scope-exit destructor auto-invokes
+        // delete(), so destroying without nulling double-destroys the handle and crashes.
+        if (self.handle != 0) {
+            nova_channel_destroy(self.handle);
+            self.handle = 0;
+        }
+    }
+}
+
+@test
+fn test_channel(): void {
+    let alloc = allocator.globalAllocator();
+    let ch = Channel<string>(0, alloc);
+    // (was fiber.spawn — inline; the channel shim buffers the send for the recv below)
+    ch.send("hello from channel");
+    let val = ch.recv();
+    console.log("DEBUG: val received = " + val);
+    assert.isTrue(val == "hello from channel");
+    ch.delete();
+}

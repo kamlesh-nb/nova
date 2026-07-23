@@ -1,0 +1,520 @@
+// bson.nova — BSON Serialization / Deserialization with dynamic entries
+import string;
+import list;   // List<T> comes from the standard library
+import assert;
+
+// ---------------------------------------------------------------------------
+// Core structs
+// ---------------------------------------------------------------------------
+
+pub struct BsonEntry {
+    pub type_id: int,
+    pub key: string,
+    pub str_val: string,
+    pub int_val: long,   // dual-purpose: an int value OR a document/array address (width-safe)
+    pub int_val2: int,
+    pub dec_val: decimal, // type 0x13 decimal128 (16 BID bytes); `0m` for every other entry kind
+}
+
+pub struct BsonDocument {
+    pub entries: List<BsonEntry>,
+}
+
+// ---------------------------------------------------------------------------
+// Entry constructors — ergonomic helpers for building documents
+// ---------------------------------------------------------------------------
+
+pub fn entryString(key: string, val: string): BsonEntry {
+    return BsonEntry{ type_id: 2, key: key, str_val: val, int_val: 0, int_val2: 0, dec_val: 0m };
+}
+
+/// BSON binary (type 0x05), subtype 0x00 (generic). `data` is the raw bytes,
+/// stored in `str_val` (Nova strings are byte buffers — NULs are fine). Needed by
+/// e.g. MongoDB SCRAM `saslStart`/`saslContinue` payloads.
+pub fn entryBinary(key: string, data: string): BsonEntry {
+    return BsonEntry{ type_id: 5, key: key, str_val: data, int_val: 0, int_val2: 0, dec_val: 0m };
+}
+
+pub fn entryInt(key: string, val: int): BsonEntry {
+    return BsonEntry{ type_id: 16, key: key, str_val: "", int_val: val, int_val2: 0, dec_val: 0m };
+}
+
+pub fn entryBool(key: string, val: int): BsonEntry {
+    return BsonEntry{ type_id: 8, key: key, str_val: "", int_val: val, int_val2: 0, dec_val: 0m };
+}
+
+pub fn entryNull(key: string): BsonEntry {
+    return BsonEntry{ type_id: 10, key: key, str_val: "", int_val: 0, int_val2: 0, dec_val: 0m };
+}
+
+// The embedded document/array's serialized bytes are ADOPTED as an ARC-owned
+// string in `str_val` (a serialized BSON doc IS a self-delimiting byte block, its
+// own length in the first int32). Storing the raw `ptr` in int_val instead leaked
+// it — a `ptr` is a value type ARC never frees. Owning the string means the sub-doc
+// is released exactly when the entry is.
+pub fn entryDoc(key: string, doc_ptr: ptr): BsonEntry {
+    return BsonEntry{ type_id: 3, key: key, str_val: doc_ptr as string, int_val: 0, int_val2: 0, dec_val: 0m };
+}
+
+pub fn entryArray(key: string, arr_ptr: ptr): BsonEntry {
+    return BsonEntry{ type_id: 4, key: key, str_val: arr_ptr as string, int_val: 0, int_val2: 0, dec_val: 0m };
+}
+
+pub fn entryInt64(key: string, hi: int, lo: int): BsonEntry {
+    return BsonEntry{ type_id: 18, key: key, str_val: "", int_val: hi, int_val2: lo, dec_val: 0m };
+}
+
+pub fn entryDouble(key: string, hi: int, lo: int): BsonEntry {
+    return BsonEntry{ type_id: 1, key: key, str_val: "", int_val: hi, int_val2: lo, dec_val: 0m };
+}
+
+// BSON decimal128 (type 0x13 = 19): the value's 16 BID bytes ARE the wire format. specs §3.1.
+pub fn entryDecimal(key: string, val: decimal): BsonEntry {
+    return BsonEntry{ type_id: 19, key: key, str_val: "", int_val: 0, int_val2: 0, dec_val: val };
+}
+
+// ---------------------------------------------------------------------------
+// Low-level byte helpers (unchanged)
+// ---------------------------------------------------------------------------
+
+fn writeCstring(ptr: ptr, offset: int, s: string): int {
+    let len = s.length;
+    let i = 0;
+    while (i < len) {
+        bytes.write_byte(ptr, offset + i, s[i]);
+        i = i + 1;
+    }
+    bytes.write_byte(ptr, offset + len, 0);
+    return len + 1;
+}
+
+fn readCstring(ptr: ptr, offset: int, max_len: int): string {
+    let len = 0;
+    while (len < max_len) {
+        if (bytes.read_byte(ptr, offset + len) == 0) {
+            break;
+        }
+        len = len + 1;
+    }
+    // ARC-correct string alloc (workstream A): data at ptr, length at [ptr-4].
+    let s_ptr = bytes.alloc(len);
+    let i = 0;
+    while (i < len) {
+        bytes.write_byte(s_ptr, i, bytes.read_byte(ptr, offset + i));
+        i = i + 1;
+    }
+    return s_ptr as string;
+}
+
+// ---------------------------------------------------------------------------
+// Document size calculation (iterate over List)
+// ---------------------------------------------------------------------------
+
+fn getDocSize(doc: BsonDocument): int {
+    let size = 5; // 4-byte size header + 1-byte terminal 0x00
+    let count = doc.entries.size();
+    let i = 0;
+    while (i < count) {
+        let entry = doc.entries.at(i);
+        let key_len = entry.key.length;
+        let t = entry.type_id;
+
+        if (t == 2) {
+            size = size + 1 + key_len + 1 + 4 + entry.str_val.length + 1;
+        }
+        if (t == 5) {
+            // type + key + NUL + int32 len + subtype byte + data
+            size = size + 1 + key_len + 1 + 4 + 1 + entry.str_val.length;
+        }
+        if (t == 16) {
+            size = size + 1 + key_len + 1 + 4;
+        }
+        if (t == 8) {
+            size = size + 1 + key_len + 1 + 1;
+        }
+        if (t == 10) {
+            size = size + 1 + key_len + 1;
+        }
+        if (t == 1) {
+            size = size + 1 + key_len + 1 + 8;
+        }
+        if (t == 18) {
+            size = size + 1 + key_len + 1 + 8;
+        }
+        if (t == 19) {
+            size = size + 1 + key_len + 1 + 16;
+        }
+        if (t == 3) {
+            size = size + 1 + key_len + 1 + entry.str_val.length;
+        }
+        if (t == 4) {
+            size = size + 1 + key_len + 1 + entry.str_val.length;
+        }
+
+        i = i + 1;
+    }
+    return size;
+}
+
+// ---------------------------------------------------------------------------
+// Serialize (iterate over List)
+// ---------------------------------------------------------------------------
+
+pub fn serialize(doc: BsonDocument): ptr {
+    let total_size = getDocSize(doc);
+    let ptr = bytes.alloc(total_size);
+    bytes.write_i32(ptr, 0, total_size);
+
+    let offset = 4;
+    let count = doc.entries.size();
+    let i = 0;
+
+    while (i < count) {
+        let entry = doc.entries.at(i);
+        let t = entry.type_id;
+
+        if (t == 2) {
+            bytes.write_byte(ptr, offset, 2);
+            offset = offset + 1;
+            offset = offset + writeCstring(ptr, offset, entry.key);
+            let val_len = entry.str_val.length;
+            bytes.write_i32(ptr, offset, val_len + 1);
+            offset = offset + 4;
+            offset = offset + writeCstring(ptr, offset, entry.str_val);
+        }
+        if (t == 5) {
+            bytes.write_byte(ptr, offset, 5);
+            offset = offset + 1;
+            offset = offset + writeCstring(ptr, offset, entry.key);
+            let data_len = entry.str_val.length;
+            bytes.write_i32(ptr, offset, data_len);
+            offset = offset + 4;
+            bytes.write_byte(ptr, offset, 0); // subtype 0x00 (generic)
+            offset = offset + 1;
+            let j = 0;
+            while (j < data_len) {
+                bytes.write_byte(ptr, offset + j, bytes.read_byte(entry.str_val, j));
+                j = j + 1;
+            }
+            offset = offset + data_len;
+        }
+        if (t == 16) {
+            bytes.write_byte(ptr, offset, 16);
+            offset = offset + 1;
+            offset = offset + writeCstring(ptr, offset, entry.key);
+            bytes.write_i32(ptr, offset, entry.int_val);
+            offset = offset + 4;
+        }
+        if (t == 8) {
+            bytes.write_byte(ptr, offset, 8);
+            offset = offset + 1;
+            offset = offset + writeCstring(ptr, offset, entry.key);
+            bytes.write_byte(ptr, offset, if (entry.int_val != 0) 1 else 0);
+            offset = offset + 1;
+        }
+        if (t == 10) {
+            bytes.write_byte(ptr, offset, 10);
+            offset = offset + 1;
+            offset = offset + writeCstring(ptr, offset, entry.key);
+        }
+        if (t == 1) {
+            bytes.write_byte(ptr, offset, 1);
+            offset = offset + 1;
+            offset = offset + writeCstring(ptr, offset, entry.key);
+            bytes.write_i32(ptr, offset, entry.int_val2);
+            offset = offset + 4;
+            bytes.write_i32(ptr, offset, entry.int_val);
+            offset = offset + 4;
+        }
+        if (t == 18) {
+            bytes.write_byte(ptr, offset, 18);
+            offset = offset + 1;
+            offset = offset + writeCstring(ptr, offset, entry.key);
+            bytes.write_i32(ptr, offset, entry.int_val2);
+            offset = offset + 4;
+            bytes.write_i32(ptr, offset, entry.int_val);
+            offset = offset + 4;
+        }
+        if (t == 19) {
+            bytes.write_byte(ptr, offset, 19);
+            offset = offset + 1;
+            offset = offset + writeCstring(ptr, offset, entry.key);
+            bytes.write_decimal(ptr, offset, entry.dec_val); // 16 BID bytes = the BSON wire form
+            offset = offset + 16;
+        }
+        if (t == 3) {
+            bytes.write_byte(ptr, offset, 3);
+            offset = offset + 1;
+            offset = offset + writeCstring(ptr, offset, entry.key);
+            let embedded_size = entry.str_val.length;
+            let j = 0;
+            while (j < embedded_size) {
+                bytes.write_byte(ptr, offset + j, bytes.read_byte(entry.str_val, j));
+                j = j + 1;
+            }
+            offset = offset + embedded_size;
+        }
+        if (t == 4) {
+            bytes.write_byte(ptr, offset, 4);
+            offset = offset + 1;
+            offset = offset + writeCstring(ptr, offset, entry.key);
+            let arr_size = entry.str_val.length;
+            let j = 0;
+            while (j < arr_size) {
+                bytes.write_byte(ptr, offset + j, bytes.read_byte(entry.str_val, j));
+                j = j + 1;
+            }
+            offset = offset + arr_size;
+        }
+
+        i = i + 1;
+    }
+
+    bytes.write_byte(ptr, offset, 0);
+    return ptr;
+}
+
+// ---------------------------------------------------------------------------
+// Deserialize (build a List dynamically)
+// ---------------------------------------------------------------------------
+
+pub fn deserialize(ptr: ptr): BsonDocument {
+    let doc = BsonDocument{ entries: List<BsonEntry>() };
+
+    let total_size = bytes.read_i32(ptr, 0);
+    if (total_size < 5) {
+        console.log("bson: invalid document size");
+        return doc;
+    }
+
+    let offset = 4;
+
+    while (offset < total_size - 1) {
+        let type_byte = bytes.read_byte(ptr, offset);
+        offset = offset + 1;
+
+        if (type_byte == 0) break;
+
+        let remaining = total_size - offset;
+        let key = readCstring(ptr, offset, remaining);
+        offset = offset + key.length + 1;
+
+        if (type_byte == 2) {
+            let str_len = bytes.read_i32(ptr, offset);
+            offset = offset + 4;
+            let val_remaining = total_size - offset;
+            let val = readCstring(ptr, offset, val_remaining);
+            offset = offset + str_len;
+            doc.entries.push(entryString(key, val));
+        }
+        if (type_byte == 5) {
+            let bin_len = bytes.read_i32(ptr, offset);
+            offset = offset + 4;
+            offset = offset + 1; // skip the subtype byte
+            let buf = bytes.alloc(if (bin_len > 0) bin_len else 1);
+            let j = 0;
+            while (j < bin_len) {
+                bytes.write_byte(buf, j, bytes.read_byte(ptr, offset + j));
+                j = j + 1;
+            }
+            offset = offset + bin_len;
+            // Adopt the buffer directly in the struct literal (as entryDoc does) so
+            // ARC owns it exactly once — a `buf as string` call-site temp leaks.
+            doc.entries.push(BsonEntry{ type_id: 5, key: key, str_val: buf as string, int_val: 0, int_val2: 0, dec_val: 0m });
+        }
+        if (type_byte == 16) {
+            let val = bytes.read_i32(ptr, offset);
+            offset = offset + 4;
+            doc.entries.push(entryInt(key, val));
+        }
+        if (type_byte == 8) {
+            let b = bytes.read_byte(ptr, offset);
+            offset = offset + 1;
+            doc.entries.push(entryBool(key, b));
+        }
+        if (type_byte == 10) {
+            doc.entries.push(entryNull(key));
+        }
+        if (type_byte == 1) {
+            let lo = bytes.read_i32(ptr, offset);
+            offset = offset + 4;
+            let hi = bytes.read_i32(ptr, offset);
+            offset = offset + 4;
+            doc.entries.push(entryDouble(key, hi, lo));
+        }
+        if (type_byte == 18) {
+            let lo = bytes.read_i32(ptr, offset);
+            offset = offset + 4;
+            let hi = bytes.read_i32(ptr, offset);
+            offset = offset + 4;
+            doc.entries.push(entryInt64(key, hi, lo));
+        }
+        if (type_byte == 3) {
+            let embedded_size = bytes.read_i32(ptr, offset);
+            let doc_copy = bytes.alloc(embedded_size);
+            let j = 0;
+            while (j < embedded_size) {
+                bytes.write_byte(doc_copy, j, bytes.read_byte(ptr, offset + j));
+                j = j + 1;
+            }
+            offset = offset + embedded_size;
+            doc.entries.push(entryDoc(key, doc_copy));
+        }
+        if (type_byte == 4) {
+            let arr_size = bytes.read_i32(ptr, offset);
+            let arr_copy = bytes.alloc(arr_size);
+            let j = 0;
+            while (j < arr_size) {
+                bytes.write_byte(arr_copy, j, bytes.read_byte(ptr, offset + j));
+                j = j + 1;
+            }
+            offset = offset + arr_size;
+            doc.entries.push(entryArray(key, arr_copy));
+        }
+    }
+
+    return doc;
+}
+
+// ---------------------------------------------------------------------------
+// Accessors (remain the same, but use List indexing)
+// ---------------------------------------------------------------------------
+
+pub fn docFind(doc: BsonDocument, key: string): int {
+    let i = 0;
+    while (i < doc.entries.size()) {
+        if (eql(doc.entries.at(i).key, key)) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub fn docGetType(doc: BsonDocument, index: int): int {
+    if (index < 0 || index >= doc.entries.size()) return 0;
+    return doc.entries.at(index).type_id;
+}
+
+pub fn docGetString(doc: BsonDocument, index: int): string {
+    if (index < 0 || index >= doc.entries.size()) return "";
+    let entry = doc.entries.at(index);
+    if (entry.type_id != 2) return "";
+    return entry.str_val;
+}
+
+/// The raw bytes of a binary (type 0x05) entry, or "" if it isn't binary.
+pub fn docGetBinary(doc: BsonDocument, index: int): string {
+    if (index < 0 || index >= doc.entries.size()) return "";
+    let entry = doc.entries.at(index);
+    if (entry.type_id != 5) return "";
+    return entry.str_val;
+}
+
+pub fn docGetInt(doc: BsonDocument, index: int): int {
+    if (index < 0 || index >= doc.entries.size()) return 0;
+    let entry = doc.entries.at(index);
+    if (entry.type_id != 16) return 0;
+    return entry.int_val;
+}
+
+pub fn docGetBool(doc: BsonDocument, index: int): int {
+    if (index < 0 || index >= doc.entries.size()) return 0;
+    let entry = doc.entries.at(index);
+    if (entry.type_id != 8) return 0;
+    return entry.int_val;
+}
+
+pub fn docIsNull(doc: BsonDocument, index: int): int {
+    if (index < 0 || index >= doc.entries.size()) return 0;
+    return (doc.entries.at(index).type_id == 10) ? 1 : 0;
+}
+
+/// The embedded document's serialized bytes (deserialize with `deserialize(x as ptr)`).
+pub fn docGetDoc(doc: BsonDocument, index: int): string {
+    if (index < 0 || index >= doc.entries.size()) return "";
+    let entry = doc.entries.at(index);
+    if (entry.type_id != 3) return "";
+    return entry.str_val;
+}
+
+/// The embedded array's serialized bytes (a BSON doc keyed by decimal indices).
+pub fn docGetArray(doc: BsonDocument, index: int): string {
+    if (index < 0 || index >= doc.entries.size()) return "";
+    let entry = doc.entries.at(index);
+    if (entry.type_id != 4) return "";
+    return entry.str_val;
+}
+
+// Convenience finders (unchanged)
+pub fn findString(doc: BsonDocument, key: string): string {
+    let idx = docFind(doc, key);
+    return docGetString(doc, idx);
+}
+
+pub fn findInt(doc: BsonDocument, key: string): int {
+    let idx = docFind(doc, key);
+    return docGetInt(doc, idx);
+}
+
+pub fn findBool(doc: BsonDocument, key: string): int {
+    let idx = docFind(doc, key);
+    return docGetBool(doc, idx);
+}
+
+pub fn findIsNull(doc: BsonDocument, key: string): int {
+    let idx = docFind(doc, key);
+    return docIsNull(doc, idx);
+}
+
+pub fn findDoc(doc: BsonDocument, key: string): string {
+    let idx = docFind(doc, key);
+    return docGetDoc(doc, idx);
+}
+
+// ---------------------------------------------------------------------------
+// Validation (unchanged)
+// ---------------------------------------------------------------------------
+
+pub fn validate(ptr: ptr, buf_len: int): int {
+    if (buf_len < 5) return 0;
+    let declared_size = bytes.read_i32(ptr, 0);
+    if (declared_size < 5) return 0;
+    if (declared_size > buf_len) return 0;
+    if (bytes.read_byte(ptr, declared_size - 1) != 0) return 0;
+
+    let offset = 4;
+    while (offset < declared_size - 1) {
+        let tb = bytes.read_byte(ptr, offset);
+        offset = offset + 1;
+        if (tb == 0) break;
+        while (offset < declared_size) {
+            if (bytes.read_byte(ptr, offset) == 0) {
+                offset = offset + 1;
+                break;
+            }
+            offset = offset + 1;
+        }
+        if (tb == 1) offset = offset + 8;
+        if (tb == 2) {
+            if (offset + 4 > declared_size) return 0;
+            let slen = bytes.read_i32(ptr, offset);
+            offset = offset + 4 + slen;
+        }
+        if (tb == 3) {
+            if (offset + 4 > declared_size) return 0;
+            let dlen = bytes.read_i32(ptr, offset);
+            offset = offset + dlen;
+        }
+        if (tb == 4) {
+            if (offset + 4 > declared_size) return 0;
+            let alen = bytes.read_i32(ptr, offset);
+            offset = offset + alen;
+        }
+        if (tb == 8) offset = offset + 1;
+        if (tb == 16) offset = offset + 4;
+        if (tb == 18) offset = offset + 8;
+    }
+    return (offset <= declared_size) ? 1 : 0;
+}
+

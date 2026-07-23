@@ -1,0 +1,13 @@
+import list;
+import assert;
+
+@test
+fn test_chained_map(): void {
+    let xs = list.List<int>();
+    xs.push(1);
+    xs.push(2);
+    xs.push(3);
+    let ys = xs.map((x) => `v${x}`).map((s) => `[${s}]`);
+    assert.equalInt(ys.size(), 3);
+    assert.equalStr(ys.get(0) ?? "", "[v1]");
+}

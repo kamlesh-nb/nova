@@ -1,0 +1,83 @@
+// process.nova — Subprocess execution management
+import list;
+import bytes;
+
+import assert;
+
+pub struct Process {
+    pub ctx: ptr,   // ProcessContext* pointer
+
+    pub fn spawn(cmd: string, args: list.List<string>): Process {
+        let args_str = "";
+        let i = 0;
+        let count = args.size();
+        while (i < count) {
+            if (i > 0) {
+                args_str = args_str + "\n";
+            }
+            args_str = args_str + args.get(i);
+            i = i + 1;
+        }
+
+        let ctx = nova_process_spawn(cmd, args_str);
+        return Process{
+            ctx: ctx,
+        };
+    }
+
+    pub fn write(self: Process, data: string): int {
+        return nova_process_write_stdin(self.ctx, data);
+    }
+
+    pub fn read(self: Process, max_len: int): string {
+        let buf = bytes.alloc(max_len);
+        let n = nova_process_read_stdout(self.ctx, buf, max_len);
+        if (n <= 0) {
+            bytes.free(buf);
+            return "";
+        }
+        // ARC-correct string alloc (workstream A): bytes.alloc writes the header and
+        // returns base+8; data starts at the returned pointer, length at [ptr-4].
+        let str_ptr = bytes.alloc(n);
+        let i = 0;
+        while (i < n) {
+            bytes.write_byte(str_ptr, i, bytes.read_byte(buf, i));
+            i = i + 1;
+        }
+        bytes.free(buf);
+        return str_ptr as string;
+    }
+
+    pub fn wait(self: Process): int {
+        return nova_process_wait(self.ctx);
+    }
+
+    pub fn close(self: Process): void {
+        if (self.ctx != 0) {
+            nova_process_free(self.ctx);
+            self.ctx = 0;
+        }
+    }
+
+    pub fn delete(self: Process): void {
+        self.close();
+    }
+}
+
+@test
+fn test_process_spawn(): void {
+    let args = list.List<string>();
+    args.push("-c");
+    args.push("printf 'hello from child process'");
+
+    let p = Process.spawn("/bin/sh", args);
+    let output = p.read(1024);
+    console.log("PROCESS OUTPUT: " + output);
+    assert.isTrue(output == "hello from child process");
+
+    let exit_code = p.wait();
+    console.log(`PROCESS EXIT CODE: ${exit_code}`);
+    assert.isTrue(exit_code == 0);
+
+    p.close();
+}

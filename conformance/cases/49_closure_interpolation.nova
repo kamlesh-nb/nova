@@ -1,0 +1,87 @@
+// Pins the closure string-interpolation family: no SIGSEGV, correct values, no leaks — across an
+// int-param interpolation (the crash), a string-param interpolation (the mis-format regression), the
+// bound-then-called shape, and map/chained-map (owned closure box + result).
+//
+// Two bugs converged here:
+//   1. CRASH: a closure param's type comes from the CALL SITE, not the body (`(x) => `n${x}`` cannot
+//      pin x). For the bound-then-called shape `let g = <closure>; g(5)` the call-site resolver did
+//      not run, so `${x}` had no type and `append` derefed the raw int as a string pointer — a
+//      SIGSEGV. Fixed by resolving the param from the actual call ARGUMENT type + the interpolation
+//      falling back to that type.
+//   2. LEAK: a closure with an un-pinnable param was typed `.unresolved`, so its box and its call
+//      result were not owned (both leaked). Fixed by typing the closure from its known RETURN.
+// Must PASS and be leak-free under --arc and clean under --asan.
+import list;
+import assert;
+
+fn mk(s: string): string { return s + "!"; }
+
+@test
+fn test_closure_int_interp_bound_called(): void {
+    // THE crash: bound-then-called closure interpolating an int param.
+    let g = (x) => `n${x}`;
+    let r = g(5);
+    assert.equalStr(r, "n5");
+}
+
+@test
+fn test_closure_string_interp_bound_called(): void {
+    // THE mis-format regression: interpolating a string param must print the string, not its pointer.
+    let f = (s) => `<${s}>`;
+    let a = mk("x");
+    let r = f(a);
+    assert.equalStr(r, "<x!>");
+    assert.equalStr(a, "x!");   // borrowed arg survives
+}
+
+@test
+fn test_closure_box_and_result_released(): void {
+    // The closure box AND its string result are owned locals — released at scope exit (no leak).
+    let g = (x) => `v${x}`;
+    let r1 = g(1);
+    let r2 = g(2);
+    assert.equalStr(r1, "v1");
+    assert.equalStr(r2, "v2");
+}
+
+@test
+fn test_map_int_interp(): void {
+    // The common case: a closure passed directly to map, interpolating the element.
+    let xs = list.List<int>();
+    xs.push(3); xs.push(7);
+    let ys = xs.map((z) => `v${z}`);
+    assert.equalStr(ys.get(0) ?? "", "v3");
+    assert.equalStr(ys.get(1) ?? "", "v7");
+}
+
+@test
+fn test_closure_called_in_nested_block(): void {
+    // The bound closure's call is inside an `if` body — the param-typing scan must be FUNCTION-wide,
+    // not block-local, or `${s}` mis-formats (prints the pointer) for a string param.
+    let g = (s) => `<${s}>`;
+    let c = 1;
+    if (c > 0) {
+        let r = g(mk("a"));
+        assert.equalStr(r, "<a!>");
+    }
+}
+
+@test
+fn test_closure_call_nested_in_args(): void {
+    // `wrap(g(x))` — the bound closure's call is nested inside another call's arguments.
+    let g = (s) => `<${s}>`;
+    let r = mk(g(mk("q")));
+    assert.equalStr(r, "<q!>!");
+}
+
+@test
+fn test_chained_map_owned_elements(): void {
+    // Chained map over heap-string intermediates — the intermediate list + its elements must all be
+    // released (this was the "chained-map leak").
+    let xs = list.List<int>();
+    xs.push(1); xs.push(2); xs.push(3);
+    let ys = xs.map((x) => `v${x}`).map((s) => `[${s}]`);
+    assert.equalInt(ys.size(), 3);
+    assert.equalStr(ys.get(0) ?? "", "[v1]");
+    assert.equalStr(ys.get(2) ?? "", "[v3]");
+}

@@ -1,0 +1,91 @@
+// spawn (fan-OUT) + when_all (fan-IN), proven to OVERLAP — deterministically, with no wall-clock.
+//
+// The live timer demo (301ms for 8×300ms vs 2409ms serial) shows the speedup but is timing-based.
+// This gate proves the same fact with a channel rendezvous, so it holds under ASAN's slowdown and on
+// a single scheduler thread:
+//
+//   Each worker parks on ITS OWN gate channel and cannot finish until released. Every release happens
+//   AFTER the whole spawn loop. If `spawn` were a blocking call (ran the worker to completion inline),
+//   worker 0 would park on an un-fed channel and the spawn loop would never reach the releases — a
+//   deadlock. The test returning at all proves `spawn` FORKS (returns a running future immediately) and
+//   that all N coroutines were alive SIMULTANEOUSLY. `when_all` then joins them, results in input order.
+import assert;
+import list;
+import concurrency.async_util;
+import concurrency.asyncchan;
+
+// Blocks on its own gate until released, then returns whatever value the release carried.
+async fn gatedWorker(gate: long): int {
+    return await asyncchan.chanRecv(gate);
+}
+
+// Spawn N workers each parked on a fresh channel; return (gates, futures) via two out-lists.
+async fn spawnGated(n: int, gates: List<long>, fs: List<future<int>>): int {
+    let i = 0;
+    while (i < n) {
+        let g = asyncchan.chanNew();
+        gates.push(g);
+        fs.push(spawn gatedWorker(g));   // parks on g, returns immediately — the fork
+        i = i + 1;
+    }
+    return n;
+}
+
+fn freeGates(gates: List<long>): void {
+    let i = 0;
+    while (i < gates.size()) { asyncchan.chanFree(gates.at(i)); i = i + 1; }
+}
+
+// PROOF A — ALL-IN-FLIGHT. Release worker k with value 100+k, in spawn order. `when_all` returns the
+// results in SPAWN order, so results[j] must be 100+j. Returns the count that matched (== n iff every
+// worker was concurrently parked, released, and its result collected in input order).
+async fn fanoutBarrier(n: int): int {
+    let gates = List<long>();
+    let fs = List<future<int>>();
+    let started = await spawnGated(n, gates, fs);   // all N now parked (none can have finished)
+    let k = 0;
+    while (k < n) { asyncchan.chanSend(gates.at(k), 100 + k); k = k + 1; }
+    let results = await async_util.when_all<int>(fs);
+    let ok = 0; let j = 0;
+    while (j < n) { if (results.at(j) == 100 + j) { ok = ok + 1; } j = j + 1; }
+    freeGates(gates);
+    return ok;
+}
+
+// PROOF B — INTERLEAVE. Same fan-out, but release in REVERSE spawn order: at rank r (0 = first
+// released) release worker (n-1-r), handing it the value r. So worker j is released at rank n-1-j and
+// returns n-1-j. `when_all` still hands back results in SPAWN order, so results[j] == n-1-j: the
+// workers COMPLETED in the reverse of the order they are COLLECTED. That can only happen if all N were
+// concurrently in flight and released out of spawn order — genuine interleaving, with when_all
+// preserving input order regardless of completion order.
+async fn fanoutInterleave(n: int): int {
+    let gates = List<long>();
+    let fs = List<future<int>>();
+    let started = await spawnGated(n, gates, fs);
+    let r = 0;
+    while (r < n) {
+        let worker = n - 1 - r;                 // release last-spawned first
+        asyncchan.chanSend(gates.at(worker), r);
+        r = r + 1;
+    }
+    let results = await async_util.when_all<int>(fs);
+    let ok = 0; let j = 0;
+    while (j < n) { if (results.at(j) == n - 1 - j) { ok = ok + 1; } j = j + 1; }
+    freeGates(gates);
+    return ok;
+}
+
+@test
+fn test_fanout_all_in_flight(): void {
+    assert.equalInt(fanoutBarrier(8), 8);       // 8 workers concurrently parked; all collected in order
+}
+
+@test
+fn test_fanout_interleave_reverse(): void {
+    assert.equalInt(fanoutInterleave(8), 8);    // completed in reverse of collection order → interleaved
+}
+
+@test
+fn test_fanout_scales(): void {
+    assert.equalInt(fanoutBarrier(64), 64);     // 64 coroutines alive at once, one scheduler thread
+}

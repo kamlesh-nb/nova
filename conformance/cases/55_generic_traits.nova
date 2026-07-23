@@ -1,0 +1,39 @@
+// Flagship: generic traits — `trait T<Q, R>` with type-parameterised method
+// signatures, `impl T<Concrete, Concrete>`, dispatched through a trait value.
+// The impl-conformance check substitutes the trait's type params (Q, R) with the
+// impl's type args before comparing signatures; codegen is type-erased so the
+// call site is identical to any other trait dispatch.
+import assert;
+
+trait Handler<Q, R> {
+    fn handle(self, req: Q): R;
+}
+
+struct GetUser { pub id: int }
+struct UserDto { pub id: int, pub name: string }
+
+struct GetUserHandler impl Handler<GetUser, UserDto> {
+    fn handle(self, req: GetUser): UserDto {
+        return UserDto{ id: req.id, name: "Ada" };
+    }
+}
+
+// A second instantiation of the SAME generic trait with different type args —
+// proves one trait definition serves many concrete (Q, R) pairs.
+struct Doubler impl Handler<int, int> {
+    fn handle(self, n: int): int { return n + n; }
+}
+
+@test
+fn test_generic_handler_dispatch(): void {
+    let h = GetUserHandler{};
+    let dto = h.handle(GetUser{ id: 7 });
+    assert.equalInt(dto.id, 7);
+    assert.equalStr(dto.name, "Ada");
+}
+
+@test
+fn test_second_instantiation(): void {
+    let d = Doubler{};
+    assert.equalInt(d.handle(21), 42);
+}

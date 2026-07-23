@@ -1,0 +1,65 @@
+// Trait dynamic dispatch: vtable calls, trait-typed bindings, factory returns,
+// trait->struct downcast, and the string-keyed mediator (MediatR) pattern.
+import assert;
+import map;
+import string;
+
+trait Speaker { fn speak(self: Speaker): int; }
+struct Dog impl Speaker { pub fn speak(self: Dog): int { return 5; } }
+struct Cat impl Speaker { pub fn speak(self: Cat): int { return 7; } }
+
+fn callSpeaker(s: Speaker): int { return s.speak(); }
+fn makeDog(): Speaker { return Dog(); }
+
+@test
+fn test_direct_dispatch(): void {
+    let d = Dog();
+    assert.equalInt(callSpeaker(d), 5);
+    assert.equalInt(callSpeaker(Cat()), 7);
+}
+
+@test
+fn test_trait_binding(): void {
+    let s: Speaker = Cat();
+    assert.equalInt(s.speak(), 7);
+}
+
+@test
+fn test_factory_return(): void {
+    let s = makeDog();
+    assert.equalInt(s.speak(), 5);
+}
+
+// ---- Mediator (MediatR) pattern: Message + MessageHandler, string-keyed ----
+trait Message { fn name(self: Message): string; }
+trait MessageHandler { fn handle(self: MessageHandler, msg: Message): int; }
+
+struct Doubling impl Message {
+    pub val: int,
+    pub fn name(self: Doubling): string { return "Doubling"; }
+}
+struct DoublingHandler impl MessageHandler {
+    pub fn handle(self: DoublingHandler, msg: Message): int {
+        let m = msg as Doubling;   // trait -> concrete downcast
+        return m.val * 2;
+    }
+}
+
+struct Mediator {
+    pub handlers: Map<string, MessageHandler>,
+    init() { self.handlers = Map<string, MessageHandler>(8, string.hash); }
+    pub fn register(self: Mediator, key: string, h: MessageHandler): void { self.handlers.set(key, h); }
+    pub fn send(self: Mediator, msg: Message): int {
+        let h = self.handlers.get(msg.name());
+        if (h == undefined) { return -1; }
+        return h.handle(msg);
+    }
+}
+
+@test
+fn test_mediator_roundtrip(): void {
+    let m = Mediator();
+    m.register("Doubling", DoublingHandler());
+    assert.equalInt(m.send(Doubling{ val: 21 }), 42);
+    assert.equalInt(m.send(Doubling{ val: 50 }), 100);
+}

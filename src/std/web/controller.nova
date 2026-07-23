@@ -1,0 +1,6 @@
+// controller.nova — Standard Controller Interface
+import web.router;
+
+pub trait Controller {
+    fn registerRoutes(self: Controller, router: CtrlRouter): void;
+}

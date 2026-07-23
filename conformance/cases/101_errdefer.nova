@@ -1,0 +1,73 @@
+// E1: `errdefer e` runs `e` ONLY when the enclosing function returns on the ERROR path of its
+// error union — an explicit error-side return OR a `try` that propagates. Plain `defer` runs at
+// every scope exit; `errdefer` is the error-only twin (cleanup that unwinds a half-built resource
+// only when the operation failed). LIFO across the active scope stack, before locals drain.
+import list;
+import assert;
+
+enum E { Fail }
+
+// `log` records what ran, in order: 10 = entered, 99 = errdefer fired.
+fn work(fail: bool, log: List<int>): int | E {
+    log.push(10);
+    errdefer log.push(99);
+    if (fail) { return E.Fail; }   // error return -> errdefer fires
+    return 5;                      // ok return -> errdefer skipped
+}
+
+// Nested: outer's errdefer fires when `try work(...)` propagates work's error.
+fn outer(fail: bool, log: List<int>): int | E {
+    errdefer log.push(88);
+    let v = try work(fail, log);
+    return v + 1;
+}
+
+@test
+fn test_errdefer_fires_on_error_return(): void {
+    let log = List<int>();
+    let r = work(true, log) catch 0;
+    assert.equalInt(r, 0);
+    assert.equalInt(log.size(), 2);        // 10 then 99
+    assert.equalInt(log.get(0) ?? 0, 10);
+    assert.equalInt(log.get(1) ?? 0, 99);
+}
+
+@test
+fn test_errdefer_skipped_on_ok_return(): void {
+    let log = List<int>();
+    let r = work(false, log) catch 0;
+    assert.equalInt(r, 5);
+    assert.equalInt(log.size(), 1);        // only the entry marker; errdefer did NOT run
+}
+
+@test
+fn test_errdefer_fires_on_try_propagation(): void {
+    let log = List<int>();
+    let r = outer(true, log) catch 0;
+    assert.equalInt(r, 0);
+    assert.equalInt(log.size(), 3);        // work: 10, 99 ; then outer's errdefer: 88
+    assert.equalInt(log.get(2) ?? 0, 88);
+}
+
+@test
+fn test_errdefer_skipped_on_ok_chain(): void {
+    let log = List<int>();
+    let r = outer(false, log) catch 0;
+    assert.equalInt(r, 6);
+    assert.equalInt(log.size(), 1);        // no errdefers fire on the all-ok path
+}
+
+@test
+fn test_multiple_errdefers_are_lifo(): void {
+    let log = List<int>();
+    let r = twoDefers(log) catch 0;
+    assert.equalInt(r, 0);
+    // registered 1 then 2; on error they run LIFO: 2 then 1.
+    assert.equalInt(log.get(0) ?? 0, 2);
+    assert.equalInt(log.get(1) ?? 0, 1);
+}
+fn twoDefers(log: List<int>): int | E {
+    errdefer log.push(1);
+    errdefer log.push(2);
+    return E.Fail;
+}

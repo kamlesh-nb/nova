@@ -1,0 +1,168 @@
+// routing.nova — typed mediator routing (the flagship framework layer).
+//
+// A `RequestHandler<TReq, TResp>` is MediatR's IRequestHandler, fully typed — no
+// `any`, no downcast. Register a route with `router.get<TReq>(path)`: the compiler
+// discovers the handler for TReq and lowers the call to a name-keyed route. On
+// dispatch the Router matches the request path against each route's PATTERN
+// (`/user/{id:int}`), extracts the route params, overlays them on the request body
+// via a CompositeSource (@fromRoute over @fromBody), then runs the generated
+// `__mediator_dispatch_by_name`: bind (TReq__bind) → handle → serialize (TResp__toJson).
+//
+//   @serializable struct GetUser { pub id: int }
+//   @serializable struct UserDto { pub id: int, pub name: string }
+//   struct GetUserHandler impl RequestHandler<GetUser, UserDto> {
+//       fn handle(self, req: GetUser): UserDto { return UserDto{ id: req.id, name: "Ada" }; }
+//   }
+//
+//   let app = Router();
+//   app.get<GetUser>("/api/user/{id:int}");                 // path param -> req.id
+//   let body = app.dispatch("GET", "/api/user/7", src);     // {"id":7,"name":".."}
+import string;
+import list;
+import map;
+import serde.source;
+import web.request;
+import web.response;
+import web.status;
+
+/// IRequestHandler<TRequest, TResponse> — a typed message handler. The impl
+/// supplies concrete types; the compiler substitutes them (generic traits).
+pub trait RequestHandler<TReq, TResp> {
+    fn handle(self, req: TReq): TResp;
+}
+
+// A pattern segment: static text, or a `{name}` route parameter.
+struct RouteSeg {
+    is_param: bool,
+    text: string,   // static text, or the param name
+    init(is_param: bool, text: string) { self.is_param = is_param; self.text = text; }
+}
+
+// The stored route: method + parsed pattern + request-type name. The pattern is parsed
+// ONCE at registration into a `List<RouteSeg>` — so `List<TypedRoute>` is a List of
+// structs that each own a List. That nested-owned-List teardown was a compiler ARC bug
+// (destructor instantiation context leaked; fixed 2026-07-20, gate 61_nested_owned_list),
+// which is why this used to keep the pattern as a string and re-parse per dispatch.
+struct TypedRoute {
+    method: string,
+    pattern: List<RouteSeg>,
+    typeName: string,
+    init(method: string, pattern: List<RouteSeg>, typeName: string) {
+        self.method = method;
+        self.pattern = pattern;
+        self.typeName = typeName;
+    }
+}
+
+// The outcome of routing a request: an HTTP status (200 matched / 404 no path /
+// 405 path matched but method didn't) plus the response body. Owns only an int and
+// a string, so it's ARC-safe (unlike a struct that owns a List — see TypedRoute).
+struct DispatchResult {
+    pub status: int,
+    pub body: string,
+    init(status: int, body: string) { self.status = status; self.body = body; }
+}
+
+// Split a path into non-empty segments.
+fn routeSplit(path: string): List<string> {
+    let out = List<string>();
+    let parts = string.split(path, "/");
+    for (p in parts) { if (p != "") { out.push(p); } }
+    return out;
+}
+
+// Parse a route pattern: `{name:type}` / `{name}` -> param seg; else static seg.
+fn parsePattern(path: string): List<RouteSeg> {
+    let segs = List<RouteSeg>();
+    let splits = routeSplit(path);
+    let pi = 0;
+    while (pi < splits.size()) {
+        let p = splits.at(pi);   // `at`: element is always present -> `string`, not optional
+        if (string.startsWith(p, "{") && string.endsWith(p, "}")) {
+            let inner = string.slice(p, 1, p.length - 1);
+            let colon = string.indexOf(inner, ":");
+            let name = colon == -1 ? inner : string.slice(inner, 0, colon);
+            segs.push(RouteSeg(true, name));
+        } else {
+            segs.push(RouteSeg(false, p));
+        }
+        pi = pi + 1;
+    }
+    return segs;
+}
+
+/// The route table + dispatcher. `get<T>`/`post<T>`/… are compiler-lowered to
+/// `__addRoute("METHOD", path, "<T>")`.
+pub struct Router {
+    routes: List<TypedRoute>,
+
+    init() {
+        self.routes = List<TypedRoute>();
+    }
+
+    // Compiler-lowering target for `router.<verb><T>(path)`. Not called directly.
+    pub fn __addRoute(self: Router, method: string, path: string, typeName: string): void {
+        self.routes.push(TypedRoute(method, parsePattern(path), typeName));
+    }
+
+    /// Route a request to a status + body. Matches the request path against each
+    /// route's pattern (ignoring method first, so we can tell 404 from 405): a param
+    /// segment captures, a static segment must equal. On a path+method match the
+    /// route params are overlaid on `body` (route wins — @fromRoute over @fromBody)
+    /// and the handler binds → handles → serializes. Path matched but no method →
+    /// 405; nothing matched → 404.
+    pub fn route(self: Router, method: string, path: string, body: ValueSource): DispatchResult {
+        let reqSegs = routeSplit(path);
+        let pathMatched = false;
+        let ri = 0;
+        while (ri < self.routes.size()) {
+            let route = self.routes.at(ri);   // `at`: element always present -> `Route`, not optional
+            let segs = route.pattern;   // parsed once at registration
+            if (segs.size() == reqSegs.size()) {
+                let params = Map<string, string>(4, string.hash);
+                let matched = true;
+                let i = 0;
+                let n = segs.size();
+                while (i < n) {
+                    let seg = segs.get(i) ?? RouteSeg(false, "");
+                    let req = reqSegs.get(i) ?? "";
+                    if (seg.is_param) {
+                        params.set(seg.text, req);
+                    } else {
+                        if (!string.eql(seg.text, req)) { matched = false; }
+                    }
+                    i = i + 1;
+                }
+                if (matched) {
+                    pathMatched = true;
+                    if (string.eql(route.method, method)) {
+                        let composite = CompositeSource(ParamSource(params), body);
+                        return DispatchResult(200, __mediator_dispatch_by_name(route.typeName, composite));
+                    }
+                }
+            }
+            ri = ri + 1;
+        }
+        if (pathMatched) { return DispatchResult(405, "405"); }
+        return DispatchResult(404, "404");
+    }
+
+    /// Body-only form used by the gates: returns the response body, or "404"/"405".
+    pub fn dispatch(self: Router, method: string, path: string, body: ValueSource): string {
+        let r = self.route(method, path, body);
+        return r.body;
+    }
+
+    /// Bridge to the async HTTP server: adapts an HTTP Request to a Response so a
+    /// server can run `server.listen(port, app.serve)`. The JSON request body is the
+    /// @fromBody source; path params overlay it. 404/405 map to the right status.
+    pub fn serve(self: Router, req: request.Request): response.Response {
+        let raw = req.body;
+        let jsonBody = raw == "" ? "{}" : raw;
+        let src = source.fromJson(jsonBody);
+        let r = self.route(req.method, req.path, src);
+        let resp = response.Response(Status.fromCode(r.status), r.body);
+        resp.setHeader("Content-Type", "application/json");
+        return resp;
+    }
+}

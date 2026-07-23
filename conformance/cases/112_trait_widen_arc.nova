@@ -1,0 +1,63 @@
+// Regression: ARC accounting when a trait object is widened from an EXISTING LOCAL, then the
+// trait object is used across multiple method calls — all under the @test harness (which runs
+// full scope cleanup, unlike `main` which exits before it).
+//
+// The bug (pre-existing, surfaced while building the async-first DB seam): the `let t: Trait =
+// local` widening unconditionally released the struct's construction ref. That release is only
+// correct when the RHS is a FRESH temporary (`let t: Trait = Cat()`) whose +1 is orphaned by
+// the widen. When the RHS is a borrow of a named local, that local still owns the ref and
+// releases it at scope exit — so releasing here too dropped the struct to rc 0 early and the
+// scope-exit releases (`local` + `__destruct_trait`) then double-freed it. The fix gates the
+// release on the RHS disposition (owned = release, borrowed = leave it to the real owner).
+//
+// Both directions must hold: the borrow-widen must NOT double-free, AND the fresh-temp widen
+// must NOT leak. This gate is verified under AddressSanitizer (`run.sh --asan`).
+import assert;
+import list;
+
+trait Speaker {
+    fn say(self): int;
+    fn tag(self): int;
+}
+
+struct Cat impl Speaker {
+    pub vals: List<int>,          // an OWNED heap field, so a leak or double-free is detectable
+    init(seed: int) { self.vals = List<int>(); self.vals.push(seed); }
+    pub fn say(self: Cat): int { return self.vals.get(0) ?? -1; }
+    pub fn tag(self: Cat): int { return 42; }
+}
+
+@test
+fn test_borrow_widen_no_double_free(): void {
+    // `let s: Speaker = c` — c is a NAMED local; the widen must not release the struct's ref.
+    let c = Cat(9);
+    let s: Speaker = c;
+    // Multiple dispatches on the widened trait object — each is a borrow of the receiver.
+    assert.equalInt(s.say(), 9);
+    assert.equalInt(s.tag(), 42);
+    assert.equalInt(s.say(), 9);
+    // Scope exit releases BOTH `c` and `s` (__destruct_trait) — balanced, no double-free.
+}
+
+@test
+fn test_fresh_temp_widen_no_leak(): void {
+    // `let s: Speaker = Cat()` — fresh temp; its orphaned +1 MUST be released by the widen.
+    let s: Speaker = Cat(5);
+    assert.equalInt(s.say(), 5);
+}
+
+@test
+fn test_trait_objects_in_list(): void {
+    // A List of trait objects widened from fresh temps — no leak, no double-free.
+    let xs = List<Speaker>();
+    xs.push(Cat(1));
+    xs.push(Cat(2));
+    let sum = 0;
+    let i = 0;
+    while (i < xs.size()) {
+        let e = xs.get(i) ?? Cat(0);
+        sum = sum + e.say();
+        i = i + 1;
+    }
+    assert.equalInt(sum, 3);
+}

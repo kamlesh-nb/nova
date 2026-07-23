@@ -1,0 +1,27 @@
+// client.nova — TcpClient: connects to a remote host
+import bytes;
+import net.tcp.socket;
+
+pub struct TcpClient {
+    pub fn connect(host: string, port: int): socket.TcpStream {
+        let fd = nova_socket_connect(host, port);
+        if (fd < 0) {
+            let dummy: socket.TcpStream = undefined;
+            return dummy;
+        }
+        return socket.TcpStream(fd);
+    }
+
+    // D6: connect with a wall-clock deadline (milliseconds). A blocking connect to a
+    // black-hole/firewalled host can hang for the OS default (~75s+); this returns a
+    // stream with fd == -1 if the peer doesn't accept within `timeoutMs`. `timeoutMs <= 0`
+    // falls back to the plain blocking connect.
+    pub fn connectTimeout(host: string, port: int, timeoutMs: int): socket.TcpStream {
+        let fd = nova_socket_connect_timeout(host, port, timeoutMs);
+        if (fd < 0) {
+            let dummy: socket.TcpStream = undefined;
+            return dummy;
+        }
+        return socket.TcpStream(fd);
+    }
+}

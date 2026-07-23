@@ -1,0 +1,5 @@
+// exception.nova — Exception stack trace helpers
+
+pub fn getStackTrace(): string {
+    return nova_get_stacktrace();
+}

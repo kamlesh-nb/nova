@@ -1,0 +1,79 @@
+// string_builder.nova
+import bytes;
+import assert;
+
+pub struct StringBuilder {
+    pub buf: ptr,
+    pub len: int,
+    pub cap: int,
+
+    init() {
+        self.cap = 16;
+        self.len = 0;
+        self.buf = bytes.alloc_persistent(16);
+    }
+
+    pub fn append(self: StringBuilder, s: string): void {
+        let slen = s.length;
+        if (slen == 0) return;
+        self.ensureCapacity(self.len + slen);
+        let i = 0;
+        while (i < slen) {
+            bytes.write_byte(self.buf, self.len + i, bytes.read_byte(s, i));
+            i = i + 1;
+        }
+        self.len = self.len + slen;
+    }
+
+    pub fn appendChar(self: StringBuilder, c: int): void {
+        self.ensureCapacity(self.len + 1);
+        bytes.write_byte(self.buf, self.len, c);
+        self.len = self.len + 1;
+    }
+
+    pub fn toString(self: StringBuilder): string {
+        if (self.len == 0) return "";
+        // ARC-correct string alloc (workstream A): data at ptr, length at [ptr-4].
+        let sptr = bytes.alloc_persistent(self.len);
+        let i = 0;
+        while (i < self.len) {
+            bytes.write_byte(sptr, i, bytes.read_byte(self.buf, i));
+            i = i + 1;
+        }
+        return sptr as string;
+    }
+
+    fn ensureCapacity(self: StringBuilder, minCap: int): void {
+        if (minCap <= self.cap) return;
+        let newCap = self.cap * 2;
+        if (newCap < minCap) newCap = minCap;
+        let newBuf = bytes.alloc_persistent(newCap);
+        let i = 0;
+        while (i < self.len) {
+            bytes.write_byte(newBuf, i, bytes.read_byte(self.buf, i));
+            i = i + 1;
+        }
+        if (self.buf != 0) {
+            bytes.free(self.buf);
+        }
+        self.buf = newBuf;
+        self.cap = newCap;
+    }
+
+    pub fn delete(self: StringBuilder): void {
+        if (self.buf != 0) {
+            bytes.free(self.buf);
+            self.buf = 0;
+        }
+    }
+}
+
+@test
+fn test_string_builder(): void {
+    let sb = StringBuilder();
+    sb.append("hello");
+    sb.append(" ");
+    sb.append("world");
+    let res = sb.toString();
+    assert.isTrue(res == "hello world");
+}

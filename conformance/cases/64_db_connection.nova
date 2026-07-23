@@ -1,0 +1,111 @@
+// The DB seam's Connection/Driver traits — proves a backend can be programmed against
+// abstractly: typed params (List<DbValue>) in, typed ResultSet out, via trait dispatch.
+// Uses a mock in-memory backend (no live server) so the SEAM is gated independently of any
+// real driver; a real BTreeDB/Postgres driver implements the same two traits.
+import assert;
+import list;
+import string;
+import db;
+
+// A trivial in-memory table: SELECT returns its rows; anything else is an exec that counts.
+struct MockConn impl Connection {
+    pub rows: List<Row>,
+    pub prepared: List<string>,
+    init() { self.rows = List<Row>(); self.prepared = List<string>(); }
+
+    pub fn seed(self: MockConn, id: int, name: string): void {
+        let r = Row();
+        r.cells.push(db.dbInt(id));
+        r.cells.push(db.dbText(name));
+        self.rows.push(r);
+    }
+
+    pub async fn exec(self, sql: string, params: List<DbValue>): ExecResult {
+        // Pretend the statement affected as many rows as it had bound params.
+        return ExecResult(params.size(), "OK");
+    }
+
+    pub async fn query(self, sql: string, params: List<DbValue>): ResultSet {
+        let rs = ResultSet();
+        rs.columns.push(Column("id", DbType.Int4));
+        rs.columns.push(Column("name", DbType.Text));
+        // Echo the seeded rows; ignore SQL (this is a mock).
+        let i = 0;
+        let n = self.rows.size();
+        while (i < n) {
+            let src = self.rows.get(i) ?? Row();
+            let copy = Row();
+            copy.cells.push(db.dbInt(src.getInt(0)));
+            copy.cells.push(db.dbText(src.getText(1)));
+            rs.rows.push(copy);
+            i = i + 1;
+        }
+        let rc = rs.rowCount();
+        rs.tag = `SELECT ${rc}`;
+        rs.rows_affected = rs.rowCount();
+        return rs;
+    }
+
+    pub fn close(self): void {}
+
+    pub fn setTimeout(self, ms: int): int { return 0; }   // D6 trait method (mock)
+
+    pub async fn prepare(self, sql: string): int { self.prepared.push(sql); return self.prepared.size() - 1; }
+    pub async fn queryPrepared(self, stmt: int, params: List<DbValue>): ResultSet {
+        if (stmt < 0 || stmt >= self.prepared.size()) { return ResultSet(); }
+        return self.query(self.prepared.get(stmt) ?? "", params);
+    }
+    pub async fn execPrepared(self, stmt: int, params: List<DbValue>): ExecResult {
+        if (stmt < 0 || stmt >= self.prepared.size()) { return ExecResult(0, ""); }
+        return self.exec(self.prepared.get(stmt) ?? "", params);
+    }
+}
+
+struct MockDriver impl Driver {
+    pub async fn connect(self, dsn: string): Connection {
+        let c = MockConn();
+        c.seed(1, "planck");
+        c.seed(2, "nova");
+        return c;
+    }
+}
+
+// Program entirely against the seam — `conn` is a Connection trait object, no backend type.
+fn firstName(conn: Connection): string {
+    let params = List<DbValue>();
+    let rs = conn.query("SELECT id, name FROM t", params);
+    return rs.row(0).getText(1);
+}
+
+@test
+fn test_query_through_trait(): void {
+    let drv = MockDriver();
+    let conn = drv.connect("mock://localhost");
+    let params = List<DbValue>();
+    let rs = conn.query("SELECT id, name FROM t", params);
+    assert.equalInt(rs.rowCount(), 2);
+    assert.equalInt(rs.row(0).getInt(0), 1);
+    assert.equalStr(rs.row(1).getText(1), "nova");
+    assert.equalStr(rs.tag, "SELECT 2");
+}
+
+@test
+fn test_abstracted_over_seam(): void {
+    // firstName never names MockConn — only the Connection trait.
+    let drv = MockDriver();
+    let conn = drv.connect("mock://localhost");
+    assert.equalStr(firstName(conn), "planck");
+}
+
+@test
+fn test_exec_with_typed_params(): void {
+    let drv = MockDriver();
+    let conn = drv.connect("mock://localhost");
+    let params = List<DbValue>();
+    params.push(db.dbInt(10));
+    params.push(db.dbText("x"));
+    params.push(db.dbDecimal(3.5m));
+    let res = conn.exec("INSERT INTO t VALUES ($1,$2,$3)", params);
+    assert.equalInt(res.rows_affected as int, 3);
+    assert.equalStr(res.tag, "OK");
+}

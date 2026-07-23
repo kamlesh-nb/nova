@@ -1,0 +1,22 @@
+import assert;
+import list;
+
+trait Shape { fn area(self: Shape): int; }
+struct Sq impl Shape { pub s: string, fn area(self: Sq): int { return 4; } }
+struct Ci impl Shape { pub s: string, fn area(self: Ci): int { return 3; } }
+
+// Generic container erases the element type; the trait objects must still be
+// destroyed via their vtable slot-0 destructor (value-witness) at list drop.
+fn build(): List<Shape> {
+    let xs = List<Shape>();
+    xs.push(Sq { s: "a-square-owns-this-string" });
+    xs.push(Ci { s: "a-circle-owns-this-string" });
+    return xs;
+}
+
+@test
+fn erased_trait_destroy() {
+    let xs = build();
+    assert.equalInt(xs.get(0).area(), 4);
+    assert.equalInt(xs.get(1).area(), 3);
+}

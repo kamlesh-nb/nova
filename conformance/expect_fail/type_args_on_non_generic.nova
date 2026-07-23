@@ -1,0 +1,12 @@
+// NEGATIVE test: must FAIL to compile.
+// Passing type arguments to a non-generic type is an error
+// (A2 increment 2c — generic arity checking, zero-param case).
+struct Plain {
+    x: int,
+    init() { self.x = 0; }
+}
+
+@test
+fn t(): void {
+    let p = Plain<int>();
+}

@@ -1,0 +1,28 @@
+// Pins current closure/lambda behavior via List.map/filter/reduce.
+// NOTE: closures currently capture via global promotion (captured_globals);
+// this case documents present behavior and will guard the A1 rewrite to
+// real per-closure environments.
+import assert;
+import list;
+
+@test
+fn test_map(): void {
+    let xs = List<int>();
+    xs.push(1);
+    xs.push(2);
+    xs.push(3);
+    let doubled = xs.map((x) => x * 2);
+    assert.equalInt(doubled.get(0), 2);
+    assert.equalInt(doubled.get(2), 6);
+}
+
+@test
+fn test_reduce(): void {
+    let xs = List<int>();
+    xs.push(1);
+    xs.push(2);
+    xs.push(3);
+    xs.push(4);
+    let sum = xs.reduce(0, (acc, x) => acc + x);
+    assert.equalInt(sum, 10);
+}

@@ -1,0 +1,9 @@
+// EXPECT-FAIL: parse
+// `var` is removed — Nova has exactly two binding keywords: `let` (mutable variable) and `const`
+// (immutable constant). A `var` declaration is a parse error with a directed message ("`var` is not
+// a Nova keyword — use `let` … or `const` …"). specs §5.1.
+@test
+fn t(): void {
+    var x = 5;
+    x = 6;
+}

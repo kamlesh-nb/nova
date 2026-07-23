@@ -1,0 +1,41 @@
+// Guards `List<int>.map` producing a REFCOUNTED element type (`List<string>`).
+//
+// This is the map<U> residual the string→TypeId migration exposed: the closure
+// `(x) => `val${x}`` has no annotation on `x`, so inferring it in a vacuum left
+// its param `.unresolved`, the method type-param `U` never solved, and the call
+// typed as `List<U>` (erased). The erased `List_i32_map` body pushes without
+// retaining, so every string element leaked (measured: 303 over 100 iterations).
+//
+// The fix (infer.zig) hands the declared `(T) -> U` down as the EXPECTED type
+// when probing the closure arg, so its param pins, its body types, and `U`
+// solves to `string`. The result is a real `List<string>`: an owned value the
+// caller releases, balancing the un-retained pushes. Values are correct and the
+// case sits at the harness floor (arc-baseline 3).
+import assert;
+import list;
+
+@test
+fn test_map_to_strings(): void {
+    let xs = List<int>();
+    xs.push(1);
+    xs.push(2);
+    xs.push(3);
+    let ys = xs.map((x) => `val${x}`);
+    assert.equalInt(ys.size(), 3);
+    assert.equalStr(ys.get(0) ?? "", "val1");
+    assert.equalStr(ys.get(2) ?? "", "val3");
+}
+
+// The leak was per-map, so a loop is the sharp test: without the fix this is
+// 3 leaked strings PER iteration; with it, the loop stays at the floor.
+@test
+fn test_map_to_strings_loop(): void {
+    let i = 0;
+    while (i < 50) {
+        let xs = List<int>();
+        xs.push(i);
+        let ys = xs.map((x) => `n${x}`);
+        assert.equalInt(ys.size(), 1);
+        i = i + 1;
+    }
+}

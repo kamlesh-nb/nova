@@ -1,0 +1,9 @@
+import assert;
+fn mk(s: string): string { return s + "!"; }
+@test
+fn t(): void {
+    let f = (s) => `<${s}>`;
+    let arg = mk("x");
+    let r = f(arg);
+    assert.equalStr(r, "<x!>");
+}

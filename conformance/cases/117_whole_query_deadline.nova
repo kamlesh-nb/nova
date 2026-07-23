@@ -1,0 +1,78 @@
+// A1 async-first seam: WHOLE-operation deadline via select(future, timer). Unlike a per-recv
+// timeout, `withTimeout(fut, ms)` bounds the ENTIRE future: it races `fut` against an `ms`-ms timer
+// (runtime nova_when_any_deadline — no separate timer coroutine to leak) and returns 0 if `fut`
+// completed in time (its value still readable via `await fut`) or -2 on timeout. `selectTimeout` is
+// the N-future form. This is the substrate for a DB query timeout:
+//   let f = spawn conn.query(...); if (await withTimeout(f, ms) == 0) { rs = await f } else { discard+drain }
+//
+// Deterministic: the "slow" futures are gated on a channel never fed until after the deadline; the
+// "fast" future returns immediately. Timed-out futures are released + drained so no frame leaks.
+import assert;
+import list;
+import concurrency.async_util;
+import concurrency.asyncchan;
+
+async fn fast(v: int): int { return v; }
+async fn gated(ch: long): int { return await asyncchan.chanRecv(ch); }
+
+// fut completes within a generous deadline -> 0, and the winner's value is still readable.
+async fn scenarioCompletes(): int {
+    let f = spawn fast(123);
+    let r = await async_util.withTimeout<int>(f, 10000);
+    if (r != 0) { return -100; }
+    return await f;               // not consumed by the select -> reads 123
+}
+
+// fut blocked past a short deadline -> -2; then released + drained.
+async fn scenarioTimesOut(): int {
+    let gate = asyncchan.chanNew();
+    let f = spawn gated(gate);
+    let r = await async_util.withTimeout<int>(f, 60);
+    asyncchan.chanSend(gate, 9);  // release
+    let d = await f;              // drain the abandoned future (frame freed)
+    asyncchan.chanFree(gate);
+    return r;                     // -2
+}
+
+// selectTimeout over N: the immediate future wins well within the deadline.
+async fn scenarioSelectWinner(): int {
+    let gate = asyncchan.chanNew();
+    let fs = List<future<int>>();
+    fs.push(spawn gated(gate));   // 0 blocked
+    fs.push(spawn fast(55));      // 1 immediate
+    fs.push(spawn gated(gate));   // 2 blocked
+    let idx = await async_util.selectTimeout<int>(fs, 5000);
+    asyncchan.chanSend(gate, 0);
+    asyncchan.chanSend(gate, 0);
+    let a = await fs.at(0);
+    let b = await fs.at(2);
+    asyncchan.chanFree(gate);
+    return idx;                   // 1
+}
+
+// selectTimeout where none completes in time -> -2.
+async fn scenarioSelectTimesOut(): int {
+    let gate = asyncchan.chanNew();
+    let fs = List<future<int>>();
+    fs.push(spawn gated(gate));
+    fs.push(spawn gated(gate));
+    let idx = await async_util.selectTimeout<int>(fs, 60);
+    asyncchan.chanSend(gate, 0);
+    asyncchan.chanSend(gate, 0);
+    let a = await fs.at(0);
+    let b = await fs.at(1);
+    asyncchan.chanFree(gate);
+    return idx;                   // -2
+}
+
+@test
+fn test_completes_within_deadline(): void { assert.equalInt(scenarioCompletes(), 123); }
+
+@test
+fn test_times_out(): void { assert.equalInt(scenarioTimesOut(), -2); }
+
+@test
+fn test_selectTimeout_winner(): void { assert.equalInt(scenarioSelectWinner(), 1); }
+
+@test
+fn test_selectTimeout_all_slow(): void { assert.equalInt(scenarioSelectTimesOut(), -2); }

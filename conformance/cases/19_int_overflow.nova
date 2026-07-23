@@ -1,0 +1,47 @@
+// A7 / F3 §5 stage 5: `int` is honestly 32-bit — arithmetic WRAPS at 2³¹, the same on
+// native and wasm. `long` is 64-bit and does not wrap at the same point. This is the
+// observable heart of the narrowing: before stage 5 `int` was secretly 64-bit, so none
+// of these wrapped. Also checks unsigned comparison uses unsigned opcodes.
+import assert;
+
+@test
+fn test_int_add_overflow_wraps(): void {
+    let max: int = 2147483647;        // i32 max
+    let wrapped = max + 1;            // wraps to i32 min
+    assert.equalInt(wrapped, -2147483648);
+}
+
+@test
+fn test_int_mul_overflow_wraps(): void {
+    let a: int = 100000;
+    let b: int = 100000;
+    let p = a * b;                    // 10^10 mod 2^32, as signed i32 = 1410065408
+    assert.equalInt(p, 1410065408);
+}
+
+@test
+fn test_long_does_not_wrap_at_32(): void {
+    // The same product in `long` (64-bit) is the true value — proving the width split.
+    let a: long = 100000;
+    let b: long = 100000;
+    let p = a * b;
+    assert.isTrue(p > 9999999999);   // 10^10, not wrapped
+    assert.isTrue(p < 10000000001);
+}
+
+@test
+fn test_int_sub_underflow_wraps(): void {
+    let min: int = -2147483648;
+    let wrapped = min - 1;           // wraps to i32 max
+    assert.equalInt(wrapped, 2147483647);
+}
+
+@test
+fn test_unsigned_compare(): void {
+    // A large uint has its top bit set; as SIGNED it would look negative and compare
+    // less than 1, but UNSIGNED it is a big positive number. `>` must use the unsigned
+    // opcode for uint operands.
+    let big: uint = 4000000000;      // > 2^31, top bit set
+    let small: uint = 1;
+    assert.isTrue(big > small);
+}

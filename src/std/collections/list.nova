@@ -1,0 +1,163 @@
+// list.nova — Generic List implementation
+import bytes;
+
+// `allocCopy` is gone. It heap-allocated a one-word BOX per element, so `data[i]`
+// was a pointer to a box rather than the value — and nothing ever freed the boxes:
+// exactly one leaked object per push (repros/list_string_leak.md). A `Storage<T>`
+// slot holds T directly (specs.md §3.8), so there is no box to leak and one fewer
+// indirection on every get.
+
+pub struct List<T> {
+    // `Storage<T>`, not a raw `int`: ARC releases a TYPED field, and the generated
+    // `__destruct_Storage_T` releases the slots. That is what makes `delete()`
+    // unnecessary — and `delete()` was both the ARC hook AND hand-called in 17
+    // places, surviving only because it was idempotent.
+    pub data: Storage<T>,
+    pub len: int,
+    pub cap: int,
+
+    init() {
+        self.data = Storage<T>(4);
+        self.len = 0;
+        self.cap = 4;
+    }
+
+    pub fn push(self: List<T>, value: T): void {
+        self.grow();
+        self.data.set(self.len, value);
+        self.len = self.len + 1;
+    }
+
+    // Growth is LIBRARY policy — capacity 4, doubling — which is why it lives here
+    // and not in the compiler (F5 §3.3a). `Storage<T>` supplies only the one thing a
+    // library cannot: releasing slots whose type it does not know.
+    fn grow(self: List<T>): void {
+        if (self.len < self.cap) {
+            return;
+        }
+        let newCap = if (self.cap == 0) 4 else self.cap * 2;
+        let newData = Storage<T>(newCap);
+        let i = 0;
+        while (i < self.len) {
+            newData.set(i, self.data.get(i));
+            i = i + 1;
+        }
+        self.data = newData;
+        self.cap = newCap;
+    }
+
+    pub fn get(self: List<T>, index: int): T | undefined {
+        if (index < 0 || index >= self.len) {
+            return undefined;
+        }
+        return self.data.get(index);
+    }
+
+    /// Indexed access that returns `T` directly (not `T | undefined`). Use this when the
+    /// index is known valid — `get` requires guarding every access with `?.`/`??`, which is
+    /// noise in a bounded loop. Out of bounds is a LOUD located abort (never a silent read),
+    /// exactly like Rust's `vec[i]` / Swift's `arr[i]`. For a maybe-absent element, use `get`.
+    pub fn at(self: List<T>, index: int): T {
+        if (index < 0 || index >= self.len) {
+            nova_panic("List.at: index out of bounds");
+        }
+        return self.data.get(index);
+    }
+
+    pub fn set(self: List<T>, index: int, value: T): void {
+        if (index < 0 || index >= self.len) {
+            return;
+        }
+        self.data.set(index, value);
+    }
+
+    pub fn insert(self: List<T>, index: int, value: T): void {
+        if (index < 0 || index > self.len) {
+            return;
+        }
+        self.grow();
+        let i = self.len;
+        while (i > index) {
+            self.data.set(i, self.data.get(i - 1));
+            i = i - 1;
+        }
+        self.data.set(index, value);
+        self.len = self.len + 1;
+    }
+
+    pub fn remove(self: List<T>, index: int): void {
+        if (index < 0 || index >= self.len) {
+            return;
+        }
+        let i = index;
+        while (i < self.len - 1) {
+            self.data.set(i, self.data.get(i + 1));
+            i = i + 1;
+        }
+        self.len = self.len - 1;
+    }
+
+    pub fn size(self: List<T>): int {
+        return self.len;
+    }
+
+    pub fn forEach(self: List<T>, fn: (T) => void): void {
+        let i = 0;
+        while (i < self.len) {
+            let val = self.data.get(i);
+            fn(val);
+            i = i + 1;
+        }
+    }
+
+    pub fn map<U>(self: List<T>, fn: (T) => U): List<U> {
+        let result = List<U>();
+        let i = 0;
+        while (i < self.len) {
+            let val = self.data.get(i);
+            let mapped = fn(val);
+            result.push(mapped);
+            i = i + 1;
+        }
+        return result;
+    }
+
+    pub fn filter(self: List<T>, pred: (T) => bool): List<T> {
+        let result = List<T>();
+        let i = 0;
+        while (i < self.len) {
+            let val = self.data.get(i);
+            if (pred(val)) {
+                result.push(val);
+            }
+            i = i + 1;
+        }
+        return result;
+    }
+
+    pub fn reduce<U>(self: List<T>, acc: U, fn: (U, T) => U): U {
+        let result = acc;
+        let i = 0;
+        while (i < self.len) {
+            let val = self.data.get(i);
+            result = fn(result, val);
+            i = i + 1;
+        }
+        return result;
+    }
+
+}
+
+@test
+fn test_list(): void {
+    let list = List<int>();
+    if (list.size() != 0) { nova_test_fail("list.size != 0"); }
+    
+    list.push(10);
+    list.push(20);
+    list.push(30);
+    if (list.size() != 3) { nova_test_fail("list.size != 3"); }
+    if (list.get(0) != 10) { nova_test_fail("list[0] != 10"); }
+    if (list.get(1) != 20) { nova_test_fail("list[1] != 20"); }
+    if (list.get(2) != 30) { nova_test_fail("list[2] != 30"); }
+}

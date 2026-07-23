@@ -1,0 +1,129 @@
+// multipart.nova — Multipart payload parser (multipart/form-data)
+import collections.list;
+import string;
+import assert;
+
+pub struct Part {
+    pub name: string,
+    pub filename: string,
+    pub contentType: string,
+    pub data: string,
+}
+
+fn extractBoundary(contentType: string): string {
+    let idx = string.indexOf(contentType, "boundary=");
+    if (idx == -1) return "";
+    let boundary = string.slice(contentType, idx + 9, contentType.length);
+    if (boundary.length > 0 && boundary[0] == 34) { // '"'
+        let endIdx = string.indexOf(string.slice(boundary, 1, boundary.length), "\"");
+        if (endIdx != -1) {
+            boundary = string.slice(boundary, 1, endIdx + 1);
+        }
+    }
+    return string.trim(boundary);
+}
+
+fn extractParam(header: string, paramName: string): string {
+    let search = paramName + "=";
+    let idx = string.indexOf(header, search);
+    if (idx == -1) return "";
+    let start = idx + search.length;
+    if (start < header.length && header[start] == 34) { // '"'
+        let end = string.indexOf(string.slice(header, start + 1, header.length), "\"");
+        if (end != -1) {
+            return string.slice(header, start + 1, start + 1 + end);
+        }
+    }
+    return "";
+}
+
+pub fn parseMultipart(contentType: string, body: string): List<Part> {
+    let result = List<Part>();
+    let boundary = extractBoundary(contentType);
+    if (boundary == "") return result;
+
+    let sep = "--" + boundary;
+    let rawParts = string.split(body, sep);
+    let i = 0;
+    while (i < rawParts.len) {
+        let partStr = rawParts.at(i);
+        // Clean trailing/leading dashes for final part orelse preamble
+        if (string.startsWith(partStr, "--") || partStr == "" || partStr == "\r\n" || partStr == "\n") {
+            i = i + 1;
+            continue;
+        }
+
+        let headerEnd = string.indexOf(partStr, "\r\n\r\n");
+        let dataStart = 4;
+        if (headerEnd == -1) {
+            headerEnd = string.indexOf(partStr, "\n\n");
+            dataStart = 2;
+        }
+
+        if (headerEnd != -1) {
+            let headers = string.slice(partStr, 0, headerEnd);
+            let rawData = string.slice(partStr, headerEnd + dataStart, partStr.length);
+            
+            // Clean leading/trailing newlines from data
+            if (string.startsWith(rawData, "\r\n")) {
+                rawData = string.slice(rawData, 2, rawData.length);
+            } else if (string.startsWith(rawData, "\n")) {
+                rawData = string.slice(rawData, 1, rawData.length);
+            }
+            if (string.endsWith(rawData, "\r\n")) {
+                rawData = string.slice(rawData, 0, rawData.length - 2);
+            } else if (string.endsWith(rawData, "\n")) {
+                rawData = string.slice(rawData, 0, rawData.length - 1);
+            }
+
+            let name = "";
+            let filename = "";
+            let fileType = "";
+
+            let headerLines = string.split(headers, "\r\n");
+            let j = 0;
+            while (j < headerLines.len) {
+                let line = headerLines.at(j);
+                if (string.startsWith(string.toLowerCase(line), "content-disposition:")) {
+                    name = extractParam(line, "name");
+                    filename = extractParam(line, "filename");
+                } else if (string.startsWith(string.toLowerCase(line), "content-type:")) {
+                    fileType = string.trim(string.slice(line, 13, line.length));
+                }
+                j = j + 1;
+            }
+
+            if (name != "") {
+                let part = Part{
+                    name: name,
+                    filename: filename,
+                    contentType: fileType,
+                    data: rawData,
+                };
+                result.push(part);
+            }
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+@test
+fn test_multipart_parsing(): void {
+    let contentType = "multipart/form-data; boundary=WebKitFormBoundary";
+    let body = "--WebKitFormBoundary\r\nContent-Disposition: form-data; name=\"action\"\r\n\r\ndeploy-binary\r\n--WebKitFormBoundary\r\nContent-Disposition: form-data; name=\"binary\"; filename=\"app.bin\"\r\nContent-Type: application/octet-stream\r\n\r\nbin-data\r\n--WebKitFormBoundary--\r\n";
+    
+    let parts = parseMultipart(contentType, body);
+    assert.isTrue(parts.len == 2);
+    
+    let p1 = parts.at(0);
+    assert.equalStr("action", p1.name);
+    assert.equalStr("deploy-binary", p1.data);
+    assert.equalStr("", p1.filename);
+
+    let p2 = parts.at(1);
+    assert.equalStr("binary", p2.name);
+    assert.equalStr("app.bin", p2.filename);
+    assert.equalStr("application/octet-stream", p2.contentType);
+    assert.equalStr("bin-data", p2.data);
+}

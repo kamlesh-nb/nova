@@ -1,0 +1,27 @@
+// Closure capture cases that PASS today — regression guards so the A1
+// heap-environment rewrite doesn't break the forms that already work.
+import assert;
+
+@test
+fn test_var_lambda(): void {
+    let f = (x) => x + 1;
+    assert.equalInt(f(5), 6);
+}
+
+@test
+fn test_capture_local(): void {
+    let n = 10;
+    let add_n = (x) => x + n;
+    assert.equalInt(add_n(5), 15);
+    assert.equalInt(add_n(0), 10);
+}
+
+@test
+fn test_two_distinct_captures(): void {
+    let a = 100;
+    let fa = (x) => x + a;
+    let b = 200;
+    let fb = (x) => x + b;
+    assert.equalInt(fa(1), 101);
+    assert.equalInt(fb(1), 201);
+}

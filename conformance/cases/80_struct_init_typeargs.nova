@@ -1,0 +1,12 @@
+import assert;
+struct Box<T> { pub v: T, }
+@test
+fn explicit_typeargs_literal() {
+    let b = Box<int>{ v: 7 };       // struct-init literal with explicit type args
+    assert.equalInt(b.v, 7);
+}
+@test
+fn explicit_typeargs_str() {
+    let b = Box<string>{ v: "hi" };
+    assert.equalStr(b.v, "hi");
+}

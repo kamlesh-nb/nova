@@ -1,0 +1,47 @@
+// Pins the F5 O4 fix for STRUCT-LITERAL initialization of an OWNED field.
+//
+// `Bag{ items: List<string>() }` stores a freshly-CONSTRUCTED owned value into a field. Before the
+// fix, the struct-literal path retained the field only when it was a BORROWED variable (`is_r_var`);
+// a constructed temporary was left unretained, so the end-of-statement temp-drain freed it (rc 1->0)
+// while the field still pointed at it, and the struct destructor released it again — a use-after-free.
+// ASAN caught it (heap-use-after-free in nova_release); ARC-audit did NOT (the object was freed, just
+// one step too early, so nothing was "still live"). The corpus never tripped it because every other
+// case initialises container fields via `init() { self.x = List() }` (assignment consumes the temp).
+//
+// The fix retains an owned field UNCONDITIONALLY at construction, matching the tuple O4 path, so the
+// temp balances (retain 2 -> drain 1 -> destructor 0). This case exercises the struct-literal form
+// directly, at several owned field types, so the pattern is covered — run under --asan and --arc.
+import assert;
+import list;
+
+struct Bag { pub items: List<string> }
+struct Pair { pub a: List<int>, pub b: List<string> }
+struct Holder<T> { pub items: List<T> }
+
+@test
+fn test_struct_literal_owned_container_field(): void {
+    let b: Bag = Bag{ items: List<string>() };
+    b.items.push("alpha");
+    b.items.push("beta");
+    assert.equalInt(b.items.size(), 2);
+    assert.equalStr(b.items.get(0), "alpha");
+}
+
+@test
+fn test_struct_literal_multiple_owned_fields(): void {
+    let p: Pair = Pair{ a: List<int>(), b: List<string>() };
+    p.a.push(7);
+    p.b.push("seven");
+    assert.equalInt(p.a.get(0), 7);
+    assert.equalStr(p.b.get(0), "seven");
+}
+
+@test
+fn test_generic_struct_literal_owned_field(): void {
+    let h: Holder<string> = Holder<string>{ items: List<string>() };
+    h.items.push("x");
+    h.items.push("y");
+    h.items.push("z");
+    assert.equalInt(h.items.size(), 3);
+    assert.equalStr(h.items.get(2), "z");
+}

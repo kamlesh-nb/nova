@@ -1,0 +1,51 @@
+// A user struct that OWNS a generic `List<T>` field.
+//
+// Originally a regression test for a link bug: `Bag.delete()` called
+// `self.items.delete()`, which forced codegen to synthesize
+// __destruct_Bag -> Bag_delete and reference List_delete across import paths
+// ("undefined symbol _List_delete").
+//
+// `delete()` NO LONGER EXISTS (specs.md §3.8). It was both the ARC deinit hook and
+// hand-called in 17 places, surviving only because every one was idempotent. With
+// `data: Storage<T>` the generated destructor frees the buffer and releases the
+// slots, so there is nothing left for a hook to do — and a link bug about
+// `List_delete` cannot recur when there is no `List_delete`.
+//
+// What this case now pins is the ownership CHAIN, which is what mattered all along:
+//   __destruct_Bag -> release items (a typed field)
+//     -> __destruct_List_i32 -> release data (a typed field)
+//       -> __destruct_Storage_i32 -> the slots
+// Nobody writes any of that.
+import assert;
+import list;
+
+struct Bag {
+    pub items: List<int>,
+
+    init() {
+        self.items = List<int>();
+    }
+
+    pub fn add(self: Bag, v: int): void {
+        self.items.push(v);
+    }
+
+    pub fn total(self: Bag): int {
+        let sum = 0;
+        let i = 0;
+        while (i < self.items.size()) {
+            sum = sum + self.items.get(i);
+            i = i + 1;
+        }
+        return sum;
+    }
+}
+
+@test
+fn test_owning_struct(): void {
+    let b = Bag();
+    b.add(1);
+    b.add(2);
+    b.add(3);
+    assert.equalInt(b.total(), 6);
+}

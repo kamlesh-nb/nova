@@ -1,0 +1,16 @@
+// YCSB A–F against Microsoft SQL Server, via the driver-generic core (D5).
+// Run: with a running SQL Server (TDS 1433), then
+//   ./zig-out/bin/nova test --release repro/ycsb/ycsb_mssql.nova
+// MSSQL dialect: NVARCHAR(64) PK + NVARCHAR(256) data; the scan uses `SELECT TOP n ... ORDER BY`
+// (last runSuite arg = true) since MSSQL has no LIMIT. Add `?encrypt=true` to the DSN for TLS.
+import ycsb_core;
+import db;
+import mssql;
+
+@test
+fn ycsb_mssql_suite(): void {
+    let conn = MssqlDriver().connect("mssql://sa:L1v3rpool@127.0.0.1:1433/master");
+    ycsb_core.runSuite("MSSQL", conn,
+        "CREATE TABLE ycsb_af (ykey NVARCHAR(64) PRIMARY KEY, ydata NVARCHAR(256))",
+        10000, 5000, 0.99, true);
+}

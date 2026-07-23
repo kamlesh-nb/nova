@@ -1,0 +1,48 @@
+// Regression gate: an early `return` inside a loop must not double-free a block-scoped
+// owned local declared TEXTUALLY AFTER the return. `current_local_types` is pre-populated
+// with every local, so the return's function-drain (`releaseLocalVariables`) would load and
+// release the PRIOR iteration's already-freed pointer — a double free ASAN caught while
+// building the regex engine (the SPLIT backtrack path). Fixed by nulling an owned local's
+// slot after a block-scope release (`releaseLocalByName`), making the later release a no-op.
+// This case exists to catch a regression FUNCtionally + under `run.sh --asan`.
+import list;
+import assert;
+
+// while(true) + early return, owned List local after the return.
+fn sum_until(n: int): int {
+    let p = 0;
+    let acc = 0;
+    while (true) {
+        if (p >= n) { return acc; }         // returns before `hold` is (re)assigned this iteration
+        let hold = List<int>();
+        hold.push(p);
+        acc = acc + hold.at(0);
+        p = p + 1;
+    }
+    return 0 - 1;
+}
+
+// bounded while + early return, same shape.
+fn count_until(n: int): int {
+    let p = 0;
+    while (p < 1000) {
+        if (p >= n) { return p; }
+        let scratch = List<int>();
+        scratch.push(p);
+        p = p + 1;
+    }
+    return p;
+}
+
+@test
+fn test_while_true_early_return(): void {
+    assert.equalInt(sum_until(4), 6);   // 0+1+2+3
+    assert.equalInt(sum_until(0), 0);   // returns on iteration 0, `hold` never assigned
+    assert.equalInt(sum_until(1), 0);
+}
+
+@test
+fn test_bounded_while_early_return(): void {
+    assert.equalInt(count_until(5), 5);
+    assert.equalInt(count_until(0), 0);
+}

@@ -1,0 +1,33 @@
+// EXPECT-FAIL: typecheck
+// ✅ NOW A TYPECHECK ERROR WITH A SOURCE SPAN (F1-3b / F1 §3.1 N2, 2026-07-18): the
+//    ambiguity was detected in codegen's func_map suffix SCAN and reported span-less;
+//    it now fires in the type_checker (file:line:col), which is what let the scan be
+//    deleted. The checker already knew `contains` was ambiguous (two decls share the
+//    bare name); the locality rule (a file that DEFINES the name resolves it locally,
+//    like `contains` inside string.nova) keeps this from over-firing.
+//    (History: was `codegen`, and before that `compiler-crash` — a Zig backtrace.)
+// NEGATIVE test: must FAIL to compile (design/F1 §3.1 N2).
+//
+// A bare `contains(...)` names two functions — `string.contains` and `assert.contains`
+// — and the caller's file defines neither, so which one is meant is undecidable.
+//
+// N2: **ambiguity is a compile error, never a silent pick.**
+//
+// Why this is worth a case even though nothing was miscompiling: F1 stage 2
+// measured the scan across four real programs — reached up to 49 times, ambiguous
+// ZERO times. So the scan was a landmine that had not gone off. It detonates the
+// day someone adds a colliding name, and the failure lands nowhere near the edit,
+// because the pick is not random — it is arbitrary and STABLE, and flips only when
+// unrelated code changes the insertion order or grows the map. This turns that
+// landmine into a tripwire: it rejects nothing that compiled before (corpus green
+// when it landed) and refuses to guess from now on.
+import assert;
+import string;
+
+@test
+fn t_ambiguous_bare_call(): void {
+    // `string.contains(...)` or `assert.contains(...)` would both be fine.
+    // Unqualified, the compiler must refuse to choose.
+    let ok = contains("haystack", "hay");
+    assert.isTrue(ok);
+}

@@ -1,0 +1,19 @@
+// middleware.nova — HTTP Middleware pipeline for request interception and post-processing
+import web.request;
+import web.response;
+import web.methods;
+
+pub enum MiddlewareAction {
+    Next,
+    Stop,
+}
+
+pub struct MatchedRoute {
+    pub method: Method,
+    pub pattern: string,
+}
+
+pub trait Middleware {
+    fn execute(self: Middleware, req: request.Request, res: response.Response): MiddlewareAction;
+    fn after(self: Middleware, req: request.Request, res: response.Response, matched: MatchedRoute): void;
+}

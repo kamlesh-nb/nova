@@ -1,0 +1,182 @@
+// Pins the F5-2 DECLARED-TYPE ownership path (isOwnedDeclaredType, 2026-07-18): the ARC decision
+// for a struct field / enum payload is made by LOWERING the declared TypeRef to a TypeId and asking
+// the store, not by string-matching the rendered field-type name. The failure this guards against is
+// a codegen ownership DIVERGENCE — a field the compiler retains but never releases (leak) or releases
+// twice (UAF) — so it is only meaningful under `run.sh --arc` / `--asan`, where those show up.
+//
+// What makes it a targeted gate rather than a duplicate of 02/32:
+//   * ONE struct mixes a ref-counted `string`, a ref-counted `List<int>`, and a NON-ref-counted `int`.
+//     The destructor's per-field release (arc.zig struct-destructor) must release the first two and
+//     leave the int alone — a false-positive on the int would be a release of a non-pointer.
+//   * FIELD REASSIGNMENT (`self.name = ...`) exercises the retain-new/release-old field-assign gate.
+//   * NESTING (a struct field whose declared type is another struct) walks the declared-type chain.
+//   * A tagged-union ENUM value in a loop — its heap box `[tag, payload]` must be released each
+//     iteration. This regressed to 40 live objects before the enum-ownership fix (arc.zig treated
+//     every enum as not-owned, so the box leaked); it is the gate for that fix staying in place.
+// All under loop churn, so a per-iteration leak accumulates instead of hiding behind the last value.
+import assert;
+import list;
+
+struct Rec {
+    pub name: string,
+    pub nums: List<int>,
+    pub count: int,
+
+    init() {
+        self.name = "rec";
+        self.nums = List<int>();
+        self.count = 0;
+    }
+
+    // Reassigns the ref-counted `name` field: retain the new string, release the old one.
+    pub fn rename(self: Rec, n: string): void {
+        self.name = n;
+    }
+
+    pub fn add(self: Rec, v: int): void {
+        self.nums.push(v);
+        self.count = self.count + 1;
+    }
+
+    pub fn sum(self: Rec): int {
+        let s = 0;
+        let i = 0;
+        while (i < self.nums.size()) {
+            s = s + self.nums.get(i);
+            i = i + 1;
+        }
+        return s;
+    }
+}
+
+// A struct whose declared field type is ANOTHER struct — the destructor chain walks Outer -> Rec.
+struct Outer {
+    pub inner: Rec,
+    pub tag: string,
+
+    init() {
+        self.inner = Rec();
+        self.tag = "outer";
+    }
+}
+
+// A tagged-union enum: its values are heap boxes `[tag, payload]` that must be released.
+enum Msg {
+    Text(string),
+    Code(int),
+}
+
+fn describe(m: Msg): string {
+    switch (m) {
+        case Msg.Text(t): { return t; }
+        case Msg.Code(c): { return "code"; }
+    }
+    return "?";
+}
+
+// A STRUCT-payload variant: `Pair` carries a named-field payload `{ name: string, n: int }`, so its
+// box is `[tag, name, n]` and __destruct_Boxed must release the owned `name` slot (at word*1) and
+// leave `n` (at word*2). The `E.Pair{...}` struct-init form is typed `.unresolved` by sema, so the
+// `let` box was never registered as owned and leaked — resolveExpressionTypeName recovers the enum
+// from the variant name and isOwnedLocal ignores the unresolved TypeId in favour of that.
+enum Boxed {
+    Pair { name: string, n: int },
+    Empty,
+}
+
+fn boxedName(b: Boxed): string {
+    switch (b) {
+        case Boxed.Pair{ name: nm, n: cnt }: { return nm; }
+        case Boxed.Empty: { return "empty"; }
+    }
+    return "?";
+}
+
+@test
+fn test_mixed_field_ownership(): void {
+    let i = 0;
+    let acc = 0;
+    while (i < 50) {
+        let r = Rec();
+        r.rename("iteration");
+        r.add(1);
+        r.add(2);
+        r.add(3);
+        acc = acc + r.sum();
+        i = i + 1;
+    }
+    // 50 iterations * (1+2+3) = 300. The point is that all 50 Recs — each owning a string and a
+    // List — were released; a leak would not change this value, but --arc/--asan would catch it.
+    assert.equalInt(acc, 300);
+}
+
+@test
+fn test_field_reassignment(): void {
+    let r = Rec();
+    r.rename("first");
+    r.rename("second");
+    r.rename("third");
+    assert.equalStr(r.name, "third");
+}
+
+@test
+fn test_nested_struct_ownership(): void {
+    let i = 0;
+    while (i < 30) {
+        let o = Outer();
+        o.inner.rename("nested");
+        o.inner.add(7);
+        i = i + 1;
+    }
+    assert.equalStr("ok", "ok");
+}
+
+@test
+fn test_enum_box_ownership(): void {
+    let i = 0;
+    let hits = 0;
+    while (i < 40) {
+        let m = Msg.Text("payload");
+        if (describe(m) == "payload") {
+            hits = hits + 1;
+        }
+        i = i + 1;
+    }
+    assert.equalInt(hits, 40);
+}
+
+// A COMPUTED (temporary) payload, not a literal: `Msg.Text("pay" + "load")`. This dangled before the
+// payload-release fix — the temp was drained at statement end while the enum box still referenced it,
+// so `describe(m)` read freed memory and returned the wrong value. The construction now consumes the
+// temp (transfers its +1 to the box) and `__destruct_Msg` releases it — correct value AND no leak.
+@test
+fn test_enum_temp_payload(): void {
+    let i = 0;
+    let hits = 0;
+    while (i < 40) {
+        let m = Msg.Text("pay" + "load");
+        if (describe(m) == "payload") {
+            hits = hits + 1;
+        }
+        i = i + 1;
+    }
+    assert.equalInt(hits, 40);
+}
+
+// A STRUCT-PAYLOAD variant in a loop, with an r-var owned field AND a temp owned field. Verifies the
+// values (field-binding match) and — under --arc — that the box, its owned `name` field, and the
+// temp field are all released each iteration (no leak). The int field `n` must NOT be released.
+@test
+fn test_struct_payload_variant(): void {
+    let i = 0;
+    let hits = 0;
+    while (i < 40) {
+        let nm = "na" + "me";                          // r-var owned field
+        let b = Boxed.Pair{ name: nm, n: 7 };
+        let c = Boxed.Pair{ name: "x" + "y", n: 9 };   // temp owned field
+        if (boxedName(b) == "name") { hits = hits + 1; }
+        if (boxedName(c) == "xy") { hits = hits + 1; }
+        i = i + 1;
+    }
+    assert.equalInt(hits, 80);
+}

@@ -1,0 +1,51 @@
+// router.nova — Standard HTTP CtrlRouter
+import web.request;
+import web.response;
+import web.status;
+import list;
+import string;
+
+pub struct Route {
+    pub method: string,
+    pub path: string,
+    pub handler: (request.Request) -> response.Response,
+}
+
+pub struct CtrlRouter {
+    pub routes: List<Route>,
+
+    init() {
+        self.routes = List<Route>();
+    }
+
+    pub fn add(self: CtrlRouter, method: string, path: string, handler: (request.Request) -> response.Response): void {
+        let route = Route{
+            method: method,
+            path: path,
+            handler: handler,
+        };
+        self.routes.push(route);
+    }
+
+    pub fn matchRoute(self: CtrlRouter, method: string, path: string): Route | undefined {
+        let len = self.routes.len;
+        let i = 0;
+        while (i < len) {
+            let r = self.routes.get(i);
+            if (string.eql(r.method, method) && string.eql(r.path, path)) {
+                return r;
+            }
+            i = i + 1;
+        }
+        return undefined;
+    }
+
+    pub fn route(self: CtrlRouter, req: request.Request): response.Response {
+        let r = self.matchRoute(req.method, req.path);
+        if (r == undefined) {
+            return response.Response(Status.NotFound, "Not Found");
+        }
+        let h = r.handler;
+        return h(req);
+    }
+}

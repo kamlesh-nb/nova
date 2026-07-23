@@ -1,0 +1,7 @@
+// Module B's Widget — a string-shaped one. Same NAME as module A's Widget, different fields/methods.
+pub struct Widget {
+    pub label: string
+    init(){ self.label = "hello"; }
+    pub fn size(self: Widget): int { return self.label.length; }
+}
+pub fn makeB(): int { let w = Widget(); return w.size(); }

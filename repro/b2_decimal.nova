@@ -1,0 +1,8 @@
+import assert;
+@test
+fn decimal_literals() {
+    let a: decimal = 3.14;
+    let b: decimal = 2.86;
+    let c = a + b;
+    assert.equalStr(c.toString(), "6.00");
+}
