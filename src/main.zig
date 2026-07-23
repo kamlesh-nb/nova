@@ -1705,7 +1705,7 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
         }
         split_objs.deinit(allocator);
     }
-    try llvm_codegen.compile(allocator, program, is_wasm, false, null, obj_path, false, t6_split, if (t6_split) &split_objs else null);
+    try llvm_codegen.compile(allocator, program, is_wasm, false, null, obj_path, false, t6_split, if (t6_split) &split_objs else null, null, init.io);
     const link_objs: []const []const u8 = if (split_objs.items.len > 0) split_objs.items else &[_][]const u8{obj_path};
     sema_shadow.reportDiff();
     sema_shadow.reportTypeIdDiff();
@@ -2021,7 +2021,7 @@ fn compileProgram(
     if (std.mem.eql(u8, target, "--wasm")) {
         const obj_path = try std.fmt.allocPrint(allocator, "{s}.o", .{output_path});
         defer allocator.free(obj_path);
-        try llvm_codegen.compile(allocator, program, true, is_release, target_triple_opt, obj_path, false, init.environ_map.get("NOVA_T6_SPLIT") != null, null);
+        try llvm_codegen.compile(allocator, program, true, is_release, target_triple_opt, obj_path, false, init.environ_map.get("NOVA_T6_SPLIT") != null, null, null, init.io);
 
         // In-process LLD: link the wasm module ourselves via wasm-ld, no clang shell-out.
         if (build_options.inprocess_lld) {
@@ -2068,7 +2068,7 @@ fn compileProgram(
             }
             split_objs.deinit(allocator);
         }
-        try llvm_codegen.compile(allocator, program, false, is_release, target_triple_opt, obj_path, false, t6_split, if (t6_split) &split_objs else null);
+        try llvm_codegen.compile(allocator, program, false, is_release, target_triple_opt, obj_path, false, t6_split, if (t6_split) &split_objs else null, if (build_mode) build_obj_dir else null, init.io);
         const link_objs: []const []const u8 = if (split_objs.items.len > 0) split_objs.items else &[_][]const u8{obj_path};
         sema_shadow.reportResolution();
         sema_shadow.reportDiff();

@@ -30,7 +30,7 @@ fn ffiCType(compiler: *LlvmCompiler, type_name: []const u8) types.LLVMTypeRef {
     return compiler.ptr_type;
 }
 
-pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool, is_release: bool, target_triple_opt: ?[]const u8, output_path: []const u8, coverage_enabled: bool, t6_split: bool, objs_out: ?*std.ArrayList([]const u8)) !void {
+pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool, is_release: bool, target_triple_opt: ?[]const u8, output_path: []const u8, coverage_enabled: bool, t6_split: bool, objs_out: ?*std.ArrayList([]const u8), cache_dir: ?[]const u8, io: std.Io) !void {
     var compiler = try LlvmCompiler.new(allocator, is_wasm, is_release, target_triple_opt, coverage_enabled);
 
     // F2 stage 3: hand sema's TypedIr to codegen for the SHADOW DIFF. Codegen still
@@ -1511,7 +1511,7 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
     // pure post-process. Falls back to the single object when off / not requested.
     if (t6_split and !is_wasm) {
         if (objs_out) |objs| {
-            try compileSplitEmit(&compiler, allocator, output_path, is_release, objs);
+            try compileSplitEmit(&compiler, allocator, output_path, is_release, objs, cache_dir, io);
             return;
         }
     }
@@ -1529,6 +1529,8 @@ fn compileSplitEmit(
     output_path: []const u8,
     is_release: bool,
     objs: *std.ArrayList([]const u8),
+    cache_dir: ?[]const u8,
+    io: std.Io,
 ) !void {
     // (1) Make cross-object-shared globals linkonce_odr so every clone may define them and the linker
     // dedups. `_vtable_*` (trait vtables) and `heap_ptr` are externally referenced; string literals and
@@ -1565,11 +1567,21 @@ fn compileSplitEmit(
     }
 
     // (3) One object per file: clone → strip non-owner Nova-function bodies → finalize.
+    // T6 Stage B — per-file object CACHE (build_mode only, `cache_dir` set): a clone's IR is a pure
+    // function of the source, and emitModule is deterministic, so identical clone IR ⟹ identical
+    // object. Hash the stripped clone's IR; if `<cache_dir>/nova_split_<hash>.o` already exists, REUSE
+    // it and skip the expensive emit (LLVM passes + object codegen). A body edit strips other files'
+    // functions to signature-only declarations, so their clone IR — and their object — is unchanged;
+    // only the edited file (and anything whose IR actually changed) re-emits. Never stale: a hit means
+    // byte-identical IR.
     var idx: usize = 0;
+    var hits: usize = 0;
+    var misses: usize = 0;
     var fit = file_syms.iterator();
     while (fit.next()) |entry| : (idx += 1) {
         const owner = entry.value_ptr;
         const clone = core.LLVMCloneModule(compiler.module);
+        defer core.LLVMDisposeModule(clone);
 
         // Strip the body of every Nova function this file does NOT own → an extern declaration.
         var f = core.LLVMGetFirstFunction(clone);
@@ -1586,10 +1598,39 @@ fn compileSplitEmit(
             }
         }
 
-        const obj_path = try std.fmt.allocPrint(allocator, "{s}.{d}.o", .{ output_path, idx });
-        try emitModule(compiler, allocator, clone, obj_path, false, is_release, null);
-        try objs.append(allocator, obj_path);
-        core.LLVMDisposeModule(clone);
+        if (cache_dir) |cdir| {
+            // Minimize the clone before hashing: globaldce drops the internal globals (string literals,
+            // etc.) this file does NOT reference, so a string/body edit in ANOTHER file no longer
+            // changes THIS file's clone IR — the difference between "1 object rebuilt" and "all 26". The
+            // pass is deterministic and idempotent (emitModule re-runs it), so the object is unchanged.
+            {
+                const opts = transform.LLVMCreatePassBuilderOptions();
+                defer transform.LLVMDisposePassBuilderOptions(opts);
+                const perr = transform.LLVMRunPasses(clone, "globaldce", compiler.target_machine, opts);
+                if (perr != null) errors.LLVMConsumeError(perr);
+            }
+            // Content-hash the minimized clone IR → cache key.
+            const ir_c = core.LLVMPrintModuleToString(clone);
+            const ir = std.mem.span(ir_c);
+            const key = std.hash.Wyhash.hash(if (is_release) 1 else 0, ir);
+            core.LLVMDisposeMessage(ir_c);
+            const obj_path = try std.fmt.allocPrint(allocator, "{s}/nova_split_{x}.o", .{ cdir, key });
+            if (std.Io.Dir.access(.cwd(), io, obj_path, .{})) |_| {
+                hits += 1; // cache hit — reuse the existing object, skip emit
+            } else |_| {
+                misses += 1;
+                try emitModule(compiler, allocator, clone, obj_path, false, is_release, null);
+            }
+            try objs.append(allocator, obj_path);
+        } else {
+            // No cache (e.g. `nova test`): throwaway object next to the output.
+            const obj_path = try std.fmt.allocPrint(allocator, "{s}.{d}.o", .{ output_path, idx });
+            try emitModule(compiler, allocator, clone, obj_path, false, is_release, null);
+            try objs.append(allocator, obj_path);
+        }
+    }
+    if (cache_dir != null) {
+        std.debug.print("[T6] per-file objects: {d} total, {d} cached (reused), {d} rebuilt\n", .{ idx, hits, misses });
     }
 }
 
