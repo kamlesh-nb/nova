@@ -167,8 +167,6 @@ fn crossLinkViaZig(
         switch (try rc_child.wait(io)) {
             .exited => |code| if (code != 0) {
                 std.debug.print("[T1] runtime cross-compile failed for {s} (code {d})\n", .{ target.zig, code });
-                if (std.mem.indexOf(u8, target.zig, "windows") != null)
-                    std.debug.print("[T1] Windows targets need the runtime's POSIX socket layer (sys/socket.h, netinet/in.h) ported to winsock2 — a tracked follow-on. Linux (x86_64/arm64) is fully supported today.\n", .{});
                 return error.LinkFailed;
             },
             else => return error.LinkFailed,
@@ -183,6 +181,11 @@ fn crossLinkViaZig(
     if (is_release) try args.append(allocator, "-O3");
     for (objs) |o| try args.append(allocator, o); // T6 split: one or many object files
     try args.append(allocator, rt_obj);
+    // Windows: the runtime + Boost.Asio use winsock2 (WSAStartup/socket/select via ws2_32) and Asio's
+    // IOCP backend needs mswsock. The `#pragma comment(lib, ...)` in io.cpp isn't honored by lld-link
+    // here, so link the system import libs explicitly.
+    if (std.mem.indexOf(u8, target.zig, "windows") != null)
+        try args.appendSlice(allocator, &.{ "-lws2_32", "-lmswsock" });
     try args.appendSlice(allocator, &.{ "-o", output_path });
     var child = try std.process.spawn(io, .{ .argv = args.items });
     switch (try child.wait(io)) {
@@ -2502,7 +2505,10 @@ fn mainInner(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, ct, "macos-x86_64")) {
             target_triple_opt = "x86_64-apple-darwin";
         } else if (std.mem.eql(u8, ct, "windows-x86_64")) {
-            target_triple_opt = "x86_64-w64-mingw32";
+            // Use the windows-gnu OS triple, NOT *-w64-mingw32: modern LLVM treats "mingw32" as an
+            // unknown OS and defaults the object format to ELF, which lld-link then rejects. The
+            // pc-windows-gnu triple selects COFF (what the mingw/lld-link toolchain expects).
+            target_triple_opt = "x86_64-pc-windows-gnu";
         } else {
             std.debug.print("Unsupported target switch: {s}\n", .{ct});
             return error.UnsupportedTarget;
