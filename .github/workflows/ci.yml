@@ -1,0 +1,132 @@
+name: CI
+
+# Build the Nova compiler and run the 148-case conformance corpus across a native
+# OS/arch matrix, and cross-produce Linux binaries via the bundled Zig toolchain (T1).
+#
+# HONEST STATUS (2026-07-24): only the macOS/arm64 cell is green today — it is the
+# platform the toolchain is developed on. Every other cell is `experimental` (allow-fail)
+# until real porting lands; each is annotated below with WHAT blocks it, so a future fix
+# knows exactly what to unblock. The `cross-linux` job IS green and produces usable Linux
+# x86_64 + arm64 binaries from the macOS build.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: build+corpus (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # GREEN — the development platform.
+          - { name: macos-arm64, os: macos-14, experimental: false }
+          # macOS x86_64: blocked by the vendored ARM64-only deps/zstd/libzstd.a and
+          # deps/wolfssl/build/libwolfssl.a (arch mismatch at link). Needs x86_64 (or fat)
+          # vendored static libs, or a build.zig that builds/locates them per-arch.
+          - { name: macos-x86_64, os: macos-13, experimental: true }
+          # Linux x86_64/arm64: the compiler links dynamic LLVM fine, but the build vendors
+          # the ARM64 Mach-O deps/zstd/libzstd.a (won't link ELF) and the runtime install
+          # script (build.zig) hardcodes Homebrew paths + assumes clang++/rsync. Needs a
+          # Linux-portable runtime build + a Linux zstd.
+          - { name: linux-x86_64, os: ubuntu-24.04, experimental: true }
+          - { name: linux-arm64, os: ubuntu-24.04-arm, experimental: true }
+          # Windows: the runtime's raw POSIX socket layer (sys/socket.h, netinet/in.h,
+          # arpa/inet.h) needs a winsock2 port, and the sh-based install step is POSIX-only.
+          - { name: windows-x86_64, os: windows-latest, experimental: true }
+          - { name: windows-arm64, os: windows-11-arm, experimental: true }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig 0.16.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install deps (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm@21 boost cmake
+          echo "NOVA_LLVM_PREFIX=$(brew --prefix llvm@21)" >> "$GITHUB_ENV"
+          echo "BOOST_PREFIX=$(brew --prefix boost)" >> "$GITHUB_ENV"
+
+      - name: Install deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 21
+          sudo apt-get install -y llvm-21-dev libclang-21-dev clang-21 libboost-all-dev cmake zlib1g-dev
+          sudo ln -sf "$(command -v clang++-21)" /usr/local/bin/clang++
+          echo "NOVA_LLVM_PREFIX=/usr/lib/llvm-21" >> "$GITHUB_ENV"
+          echo "BOOST_PREFIX=/usr" >> "$GITHUB_ENV"
+
+      - name: Install deps (Windows, best-effort)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          choco install llvm cmake -y || true
+          echo "NOVA_LLVM_PREFIX=C:/Program Files/LLVM" >> "$GITHUB_ENV"
+
+      - name: Build nova
+        run: zig build
+
+      - name: Conformance corpus (148 cases)
+        shell: bash
+        run: bash conformance/run.sh
+
+  # GREEN — the real Linux story: cross-compile Linux x86_64 + arm64 binaries from the
+  # macOS/arm64 build via the bundled Zig toolchain (T1), and upload them as artifacts.
+  cross-linux:
+    name: cross-compile Linux artifacts (T1)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig 0.16.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install deps (macOS)
+        run: |
+          brew install llvm@21 boost cmake
+          echo "NOVA_LLVM_PREFIX=$(brew --prefix llvm@21)" >> "$GITHUB_ENV"
+          echo "BOOST_PREFIX=$(brew --prefix boost)" >> "$GITHUB_ENV"
+
+      - name: Build nova
+        run: zig build
+
+      - name: Cross-compile a sample to Linux x86_64 + arm64
+        run: |
+          cat > /tmp/hello.nova <<'NOVA'
+          struct Point { pub x: int, pub y: int }
+          fn dist2(p: Point): int { return p.x * p.x + p.y * p.y; }
+          fn main(): void {
+              let total = 0;
+              for (i in 1..=100) { total = total + i; }
+              console.log(`sum 1..100 = ${total}`);
+              let p = Point { x: 3, y: 4 };
+              console.log(`dist2(3,4) = ${dist2(p)}`);
+          }
+          NOVA
+          mkdir -p dist
+          "$HOME/.nova/bin/nova" /tmp/hello.nova --target linux-x86_64 -o dist/nova-hello-linux-x86_64
+          "$HOME/.nova/bin/nova" /tmp/hello.nova --target linux-arm64 -o dist/nova-hello-linux-arm64
+          file dist/*
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nova-linux-samples
+          path: dist/
