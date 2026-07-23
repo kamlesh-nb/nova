@@ -23,9 +23,16 @@ const llvm_libs_linux = @embedFile("deps/llvm-zig/llvm-libs-linux.txt");
 // Wire LLVM into `m` (the `llvm` binding module). The vendored deps/llvm-zig
 // build.zig deliberately does NO LLVM linking — it happens here so this repo
 // owns the toolchain paths and the dynamic/static choice.
-fn configureLlvmLink(b: *std.Build, m: *std.Build.Module, static: bool, os_tag: std.Target.Os.Tag) void {
-    const lib_dir = b.pathJoin(&.{ llvmPrefix(b, static), "lib" });
-    m.addLibraryPath(.{ .cwd_relative = lib_dir });
+// `linux_dep`, when non-null, is the fetched per-platform LLVM mirror package (build.zig.zon
+// `llvm_linux_aarch64`); its `lib/` supplies the archives + libstdc++.so/libgcc_s.so. When null
+// (NOVA_LLVM_PREFIX override, or a non-static/non-linux build) the paths come from `llvmPrefix`.
+fn configureLlvmLink(b: *std.Build, m: *std.Build.Module, static: bool, os_tag: std.Target.Os.Tag, linux_dep: ?*std.Build.Dependency) void {
+    if (linux_dep) |dep| {
+        m.addLibraryPath(dep.path("lib"));
+    } else {
+        const lib_dir = b.pathJoin(&.{ llvmPrefix(b, static), "lib" });
+        m.addLibraryPath(.{ .cwd_relative = lib_dir });
+    }
 
     if (!static) {
         // Default: dynamic link (fast dev builds), matching the original dep.
@@ -68,9 +75,13 @@ fn configureLlvmLink(b: *std.Build, m: *std.Build.Module, static: bool, os_tag: 
         // bypassing zig's -l normalization. libstdc++.so.6 + glibc are on every Linux, so the binary is
         // still "deploy only nova" in practice (the real win — no libLLVM.so dep — is preserved). Target
         // must be *-linux-gnu. The .so lives in the mirror prefix lib dir alongside libLLVM*.a.
-        m.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ llvmPrefix(b, static), "lib", "libstdc++.so" }) });
-        // libstdc++ pulls the libgcc_s unwinder (_Unwind_*); also passed as a positional .so.
-        m.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ llvmPrefix(b, static), "lib", "libgcc_s.so" }) });
+        if (linux_dep) |dep| {
+            m.addObjectFile(dep.path("lib/libstdc++.so"));
+            m.addObjectFile(dep.path("lib/libgcc_s.so")); // libgcc_s unwinder (_Unwind_*)
+        } else {
+            m.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ llvmPrefix(b, static), "lib", "libstdc++.so" }) });
+            m.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ llvmPrefix(b, static), "lib", "libgcc_s.so" }) });
+        }
     } else {
         // zstd: llvm-config bakes in a Homebrew path; use the vendored static copy.
         m.addLibraryPath(b.path("deps/zstd"));
@@ -138,7 +149,16 @@ pub fn build(b: *std.Build) void {
     // archives are native; the LLVM.org 22 drop is LTO bitcode (not linkable by
     // Zig's linker) — see deps/llvm-zig/README-static-llvm.md.
     const static_llvm = b.option(bool, "static-llvm", "Static-link LLVM into nova (self-contained delivery binary; default: dynamic)") orelse false;
-    configureLlvmLink(b, llvm_mod, static_llvm, target.result.os.tag);
+    // For a STATIC Linux build, fetch the LLVM libraries from the self-hosted mirror (lazy — only when
+    // this branch runs). NOVA_LLVM_PREFIX overrides with a local tree (skips the fetch). `lazyDependency`
+    // returns null on the first pass while it downloads, then zig re-runs build() with it available.
+    var llvm_linux_dep: ?*std.Build.Dependency = null;
+    if (static_llvm and target.result.os.tag == .linux and b.graph.environ_map.get("NOVA_LLVM_PREFIX") == null) {
+        if (target.result.cpu.arch == .aarch64) {
+            llvm_linux_dep = b.lazyDependency("llvm_linux_aarch64", .{});
+        }
+    }
+    configureLlvmLink(b, llvm_mod, static_llvm, target.result.os.tag, llvm_linux_dep);
 
     // P5 #20: link LLD into nova so it links its output executables in-process
     // (no clang/ld shell-out). Requires -Dstatic-llvm (needs the native liblld*.a

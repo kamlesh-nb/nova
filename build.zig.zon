@@ -10,6 +10,17 @@
         .llvm = .{
             .path = "deps/llvm-zig",
         },
+        // T1/deps generalization: the LLVM libraries for the STATIC self-contained build are fetched
+        // per-platform from the self-hosted mirror (github.com/kamlesh-nb/llvm-dist), NOT Homebrew.
+        // LAZY so only the host/target's tree is downloaded, and only for `-Dstatic-llvm`. The tree
+        // is content-hashed, so the same tarball validates from cache (a local `zig fetch`) or the
+        // mirror URL. Each holds `lib/` = 226 native libLLVM*.a + LLVM's static C-lib deps
+        // (z/zstd/xml2/lzma) + libstdc++.so/libgcc_s.so (see deps/llvm-zig/README-linux-static.md).
+        .llvm_linux_aarch64 = .{
+            .url = "https://github.com/kamlesh-nb/llvm-dist/releases/download/llvm-21/llvm-21-aarch64-linux.tar.gz",
+            .hash = "N-V-__8AANkjKBWYVOOkOQ6J_8L_bfiQl9xAFEFmA1rAFx9y",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",
