@@ -19,6 +19,11 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Installed by direct tarball download from ziglang.org (see the "Install Zig" steps) rather
+  # than a marketplace action — the method proven in plancks/.github/workflows/release.yaml.
+  ZIG_VERSION: "0.16.0"
+
 jobs:
   build-test:
     name: build+corpus (${{ matrix.name }})
@@ -47,10 +52,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Zig 0.16.0
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
+      - name: Install Zig (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64)   ZIG_ARCH="x86_64-linux" ;;
+            Linux-aarch64)  ZIG_ARCH="aarch64-linux" ;;
+            Darwin-arm64)   ZIG_ARCH="aarch64-macos" ;;
+            Darwin-x86_64)  ZIG_ARCH="x86_64-macos" ;;
+          esac
+          curl -sL "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz" | tar xJ
+          echo "$(pwd)/zig-${ZIG_ARCH}-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: Install Zig (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
+          $url = "https://ziglang.org/download/${env:ZIG_VERSION}/zig-${arch}-windows-${env:ZIG_VERSION}.zip"
+          Invoke-WebRequest -Uri $url -OutFile zig.zip
+          Expand-Archive zig.zip -DestinationPath .
+          "$(Get-Location)\zig-${arch}-windows-${env:ZIG_VERSION}" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Verify Zig
+        run: zig version
 
       - name: Install deps (macOS)
         if: runner.os == 'macOS'
@@ -93,10 +119,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Zig 0.16.0
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
+      - name: Install Zig
+        shell: bash
+        run: |
+          curl -sL "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-macos-${ZIG_VERSION}.tar.xz" | tar xJ
+          echo "$(pwd)/zig-aarch64-macos-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: Verify Zig
+        run: zig version
 
       - name: Install deps (macOS)
         run: |
