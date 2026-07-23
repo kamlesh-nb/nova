@@ -111,10 +111,10 @@ jobs:
         shell: bash
         run: bash conformance/run.sh
 
-  # GREEN — the real Linux story: cross-compile Linux x86_64 + arm64 binaries from the
-  # macOS/arm64 build via the bundled Zig toolchain (T1), and upload them as artifacts.
-  cross-linux:
-    name: cross-compile Linux artifacts (T1)
+  # GREEN — the real cross-compile story: from the macOS/arm64 build, produce Linux x86_64 + arm64
+  # binaries AND a Windows x86_64 .exe via the bundled Zig toolchain (T1), and upload them as artifacts.
+  cross-compile:
+    name: cross-compile Linux + Windows artifacts (T1)
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -137,7 +137,7 @@ jobs:
       - name: Build nova
         run: zig build
 
-      - name: Cross-compile a sample to Linux x86_64 + arm64
+      - name: Cross-compile a sample to Linux x86_64 + arm64 and Windows x86_64
         run: |
           cat > /tmp/hello.nova <<'NOVA'
           struct Point { pub x: int, pub y: int }
@@ -151,12 +151,18 @@ jobs:
           }
           NOVA
           mkdir -p dist
-          "$HOME/.nova/bin/nova" /tmp/hello.nova --target linux-x86_64 -o dist/nova-hello-linux-x86_64
-          "$HOME/.nova/bin/nova" /tmp/hello.nova --target linux-arm64 -o dist/nova-hello-linux-arm64
+          nova="$HOME/.nova/bin/nova"
+          "$nova" /tmp/hello.nova --target linux-x86_64   -o dist/nova-hello-linux-x86_64
+          "$nova" /tmp/hello.nova --target linux-arm64    -o dist/nova-hello-linux-arm64
+          "$nova" /tmp/hello.nova --target windows-x86_64 -o dist/nova-hello-windows-x86_64.exe
           file dist/*
+          # Assert the formats are what we expect (fail the job if a target silently regresses).
+          file dist/nova-hello-linux-x86_64        | grep -q "ELF 64-bit LSB.*x86-64"
+          file dist/nova-hello-linux-arm64         | grep -q "ELF 64-bit LSB.*ARM aarch64"
+          file dist/nova-hello-windows-x86_64.exe  | grep -q "PE32+ executable.*x86-64"
 
-      - name: Upload Linux artifacts
+      - name: Upload cross-compiled artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: nova-linux-samples
+          name: nova-cross-samples
           path: dist/
