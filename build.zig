@@ -15,10 +15,15 @@ fn llvmPrefix(b: *std.Build, static: bool) []const u8 {
         (if (static) static_llvm_prefix else dynamic_llvm_prefix);
 }
 
+// The static LLVM component set differs per OS (the apt Linux drop is 226 native-ELF archives; the
+// converted macOS-22 drop is 211). Committed lists let the static link pick the right names by target.
+const llvm_libs_macos = @embedFile("deps/llvm-zig/llvm-libs.txt");
+const llvm_libs_linux = @embedFile("deps/llvm-zig/llvm-libs-linux.txt");
+
 // Wire LLVM into `m` (the `llvm` binding module). The vendored deps/llvm-zig
 // build.zig deliberately does NO LLVM linking — it happens here so this repo
 // owns the toolchain paths and the dynamic/static choice.
-fn configureLlvmLink(b: *std.Build, m: *std.Build.Module, static: bool) void {
+fn configureLlvmLink(b: *std.Build, m: *std.Build.Module, static: bool, os_tag: std.Target.Os.Tag) void {
     const lib_dir = b.pathJoin(&.{ llvmPrefix(b, static), "lib" });
     m.addLibraryPath(.{ .cwd_relative = lib_dir });
 
@@ -36,7 +41,7 @@ fn configureLlvmLink(b: *std.Build, m: *std.Build.Module, static: bool) void {
     // Regenerate for a different prefix with:
     //   ls <prefix>/lib/libLLVM*.a | xargs -n1 basename | sed 's/^lib//;s/\.a$//' \
     //     | sort > deps/llvm-zig/llvm-libs.txt
-    const llvm_libs = @embedFile("deps/llvm-zig/llvm-libs.txt");
+    const llvm_libs = if (os_tag == .linux) llvm_libs_linux else llvm_libs_macos;
     var lines = std.mem.tokenizeScalar(u8, llvm_libs, '\n');
     var count: usize = 0;
     while (lines.next()) |raw| {
@@ -45,18 +50,37 @@ fn configureLlvmLink(b: *std.Build, m: *std.Build.Module, static: bool) void {
         m.linkSystemLibrary(comp, .{ .preferred_link_mode = .static, .use_pkg_config = .no });
         count += 1;
     }
-    if (count == 0) std.debug.panic("configureLlvmLink: empty llvm-libs.txt", .{});
+    if (count == 0) std.debug.panic("configureLlvmLink: empty llvm-libs list", .{});
 
-    // zstd: llvm-config bakes in a Homebrew path; use the vendored static copy.
-    m.addLibraryPath(b.path("deps/zstd"));
-    m.linkSystemLibrary("zstd", .{ .preferred_link_mode = .static, .use_pkg_config = .no });
-
-    // Other externals LLVM references — the macOS SDK provides these dynamically.
-    m.linkSystemLibrary("z", .{});
-    m.linkSystemLibrary("xml2", .{});
-
-    // LLVM static archives are C++ objects → need the C++ runtime.
-    m.link_libcpp = true;
+    // Externals LLVM's static archives reference (zstd, zlib, libxml2). These live IN the LLVM
+    // prefix's own lib dir for a self-contained mirror drop; on macOS z/xml2 fall back to SDK dylibs
+    // and zstd is the vendored copy. Link them static so `nova` stays self-contained.
+    if (os_tag == .linux) {
+        // The Linux mirror artifact bundles LLVM's C-lib deps as static archives alongside libLLVM*.a
+        // (apt's LLVM was built against them). xml2 in turn needs lzma. Resolve from the prefix lib dir.
+        for (&[_][]const u8{ "z", "zstd", "xml2", "lzma" }) |lib|
+            m.linkSystemLibrary(lib, .{ .preferred_link_mode = .static, .use_pkg_config = .no });
+        // Prebuilt Linux LLVM is compiled against libstdc++ (the std::__cxx11 / GLIBCXX ABI), NOT
+        // libc++. It must link libstdc++.so — but `linkSystemLibrary("stdc++")` gets ALIASED by zig
+        // to its own `-lc++` (libc++, wrong ABI → every std:: sym undefined), and a static libstdc++.a
+        // hits ld.lld's archive-cycle limit (macOS ld auto-resolves cycles; ld.lld needs --start-group,
+        // which zig-build can't emit). So pass the SHARED libstdc++.so as an explicit positional input,
+        // bypassing zig's -l normalization. libstdc++.so.6 + glibc are on every Linux, so the binary is
+        // still "deploy only nova" in practice (the real win — no libLLVM.so dep — is preserved). Target
+        // must be *-linux-gnu. The .so lives in the mirror prefix lib dir alongside libLLVM*.a.
+        m.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ llvmPrefix(b, static), "lib", "libstdc++.so" }) });
+        // libstdc++ pulls the libgcc_s unwinder (_Unwind_*); also passed as a positional .so.
+        m.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ llvmPrefix(b, static), "lib", "libgcc_s.so" }) });
+    } else {
+        // zstd: llvm-config bakes in a Homebrew path; use the vendored static copy.
+        m.addLibraryPath(b.path("deps/zstd"));
+        m.linkSystemLibrary("zstd", .{ .preferred_link_mode = .static, .use_pkg_config = .no });
+        // z/xml2 resolve against the macOS SDK dylibs.
+        m.linkSystemLibrary("z", .{});
+        m.linkSystemLibrary("xml2", .{});
+        // LLVM static archives are C++ objects → need the C++ runtime (LLVM's libc++ on macOS).
+        m.link_libcpp = true;
+    }
 }
 
 // LLVM/LLD C++ headers for compiling the in-process-LLD shim. The native tree
@@ -114,7 +138,7 @@ pub fn build(b: *std.Build) void {
     // archives are native; the LLVM.org 22 drop is LTO bitcode (not linkable by
     // Zig's linker) — see deps/llvm-zig/README-static-llvm.md.
     const static_llvm = b.option(bool, "static-llvm", "Static-link LLVM into nova (self-contained delivery binary; default: dynamic)") orelse false;
-    configureLlvmLink(b, llvm_mod, static_llvm);
+    configureLlvmLink(b, llvm_mod, static_llvm, target.result.os.tag);
 
     // P5 #20: link LLD into nova so it links its output executables in-process
     // (no clang/ld shell-out). Requires -Dstatic-llvm (needs the native liblld*.a
