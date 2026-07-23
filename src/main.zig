@@ -2057,9 +2057,17 @@ fn compileProgram(
         else
             try std.fmt.allocPrint(allocator, "{s}.o", .{output_path});
         defer allocator.free(obj_path);
-        // T6 Phase 1b: NOVA_T6_SPLIT emits one object PER SOURCE FILE (into `split_objs`) instead of
-        // the single `obj_path`; the link then feeds all of them to the linker. Off = single object.
-        const t6_split = init.environ_map.get("NOVA_T6_SPLIT") != null;
+        // T6 Phase 1b/Stage C: per-file object split emits one object PER SOURCE FILE (into
+        // `split_objs`), linked together, so a one-file edit rebuilds one object (the rest come from
+        // the content-hash cache in build/<profile>/obj). It is now the DEFAULT for `nova build`
+        // (build_mode) — that's where the persistent cache lives and dev iteration benefits.
+        // `NOVA_T6_NOSPLIT=1` forces the single-module path (useful for a one-shot cold/CI build,
+        // ~18% faster cold since it skips per-file clone+emit+link). For throwaway `--native`
+        // single-file compiles (no cache dir) the split has no upside, so it stays opt-in there.
+        const t6_split = if (build_mode)
+            init.environ_map.get("NOVA_T6_NOSPLIT") == null
+        else
+            init.environ_map.get("NOVA_T6_SPLIT") != null;
         var split_objs = std.ArrayList([]const u8).empty;
         defer {
             for (split_objs.items) |o| {

@@ -102,7 +102,7 @@ toolchain/tooling (T1/T2/T4).
 | **W1** | Webview in the runtime (desktop GUI over HTML/JS/NSX) | ⭐P3 | ✅ | `webview_*` (manual) + `83`/`84` | `513ecf2`+`29a1f07` |
 | **W2** | `App.useStatic(...)` — static content store + LRU cache | ⭐P3 | ✅ | `85_static_content` | `ddd2c08` |
 | **W3** | Circuit breaker for the OUTBOUND TCP/TLS client (external calls) | ⭐P4 | ✅ | `86_circuit_breaker` | `a63ffa4` |
-| **T6** | Phase 1a ✅ (`nova build` + `build/<profile>/{obj,bin}` + content-hash cache + debug/release); **Phase 2 dead-code strip ✅ (`-dead_strip`/`--gc-sections`, 71% smaller binaries)**; **Phase 1b (per-file `.o` split) IN PROGRESS** — increment 1 (per-file fn partition, `NOVA_T6_SPLIT`, 0 uncategorized) ✅ + increment 2 step 1 (`emitModule` extraction) ✅; remaining: the per-file emission loop (+ F4-6 reparse removal, landed together) | ⭐user P5 | ◑ | `nova build` (manual e2e); `NOVA_T6_SPLIT` partition | `1b85154`,`af4932a`,`4d1bb61` |
+| **T6** | Phase 1a ✅ (`nova build` + `build/<profile>/{obj,bin}` + content-hash cache); Phase 2 dead-strip ✅ (71% smaller); **Phase 1b per-file `.o` split ✅ DONE** — clone-and-strip emission loop + per-file content-hash cache (globaldce-before-hash) + default-on (`NOVA_T6_NOSPLIT` escape hatch); one-file-body edit → 25/26 objects cached. **F4-6 satisfied** (generated serde/mediator units are their own cached `.o`; no reparse-removal needed). Remaining: Phase 3 per-unit checking (gated on F2-6/F4/F5) | ⭐user P5 | ● | `nova build` split default; corpus 148/148 + 270/270 ASAN under split; 25/26 incremental | `1b85154`,`af4932a`,`4d1bb61`,`7077596`,`0e19e62` |
 
 Legend for the "◑" rows: partially landed; the *remaining* scope is the design below.
 
@@ -1279,13 +1279,27 @@ common win (no-change rebuild = instant) at whole-program granularity; per-file 
 recompile only that object) needs the codegen split + external-decl emission. Sequenced after the codebase is
 past sound-beta.
 
-- [ ] **Phase 1b:** one `.o` per source file into `build/<profile>/obj/`; per-file cache invalidation.
-- [ ] **Phase 2:** link-time dead-code (`--gc-sections` + `internal` linkage), dep-signature-hash in the key.
+- [x] **Phase 1b DONE** — one `.o` per source file into `build/<profile>/obj/` via **clone-and-strip**
+  (`compileSplitEmit` in `codegen/declarations.zig`: `LLVMCloneModule` the whole program, delete the basic
+  blocks of functions a file doesn't own → extern decl; shared globals `heap_ptr`/`_vtable_*` linkonce_odr).
+  **Stage A** (emission loop, commit `7077596`): flag-gated, corpus 148/148 + 270/270 ASAN under split, behavior
+  byte-identical. **Stage B** (per-file content-hash cache, commit `0e19e62`): each clone keyed by a hash of its
+  IR, minimised by `globaldce` BEFORE hashing so an edit in file X doesn't invalidate file Y's object. **Stage C**
+  (default-on): split is now the DEFAULT for `nova build`; `NOVA_T6_NOSPLIT=1` forces single-module (~18% faster
+  cold). Measured: one-handler-body edit → **25/26 objects cached, 1 rebuilt**, correct output.
+  - [x] **F4-6 SATISFIED (via option b) — no reparse removal needed.** The plan offered "build the AST directly
+    OR emit the generated units as their own cacheable `.o`". The split does the latter: `<serde-generated>` and
+    `<mediator-generated>` are their own partition buckets → their own cached objects. Proven: editing a mediator
+    handler's BODY keeps BOTH generated objects cached (they hold the handler as an extern decl, so its body change
+    doesn't alter their IR). The reparse still runs at the front-end but it is cheap; the expensive part (codegen of
+    the generated units) is now cached. The risky mediator-AST rewrite is thus avoided, exactly as the plan intended.
+- [ ] **Phase 2 (partial):** dead-code strip DONE (`-dead_strip`/`--gc-sections`, 71% smaller). Remaining:
+  `internal` linkage for non-exported fns + dep-signature-hash in the cache key.
 - [ ] **Phase 3:** true per-unit checking (interface extraction + cross-TU mono) — gated on F2-6/F4/F5.
 
-**Deps:** Phase 1a landed (nothing new). Phase 3 depends on F2-6 typed IR + F4 mono + F5 scoping. **Tracking:**
-◑ 2026-07-22 · Phase 1a done (`nova build`, `build/<profile>/{obj,bin}`, content-hash cache, debug/release,
-merged.nova retired, init .gitignore); per-file split (1b) deferred as a codegen refactor.
+**Deps:** Phase 1a+1b landed. Phase 3 depends on F2-6 typed IR + F4 mono + F5 scoping. **Tracking:**
+● 2026-07-24 · Phase 1b DONE (per-file `.o` split, content-hash cache, default-on, F4-6 satisfied). Phase 1a done
+2026-07-22 (`nova build`, `build/<profile>/{obj,bin}`, content-hash cache, debug/release, merged.nova retired).
 
 ---
 
