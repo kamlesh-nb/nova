@@ -1,0 +1,32 @@
+// 160 — direct `serde.bind<Concrete>(src)` at a top-level call site, bound to a `let`. Regression:
+// the reify manually registered the +1 result as a temporary, but it already returns from the OUTER
+// `serde.bind<T>(...)` generic_call node (which carries an ExprId), so ordinary disposition tracking
+// owned it too — `let a = serde.bind<Dto>(src)` released the struct twice → UAF (garbage `a.id`).
+// (The generic-type-param form `fn f<T>(){ serde.bind<T> }` was never affected — it returns through the
+// wrapping fn, whose call site owns the result.) Covers all three shapes below.
+import assert;
+import serde.source;
+
+@serializable struct Dto { pub id: int, pub name: string }
+
+@test
+fn test_let_bound_jsonsource(): void {
+    let js = source.fromJson("{\"id\": 7, \"name\": \"Ada\"}");
+    let a = serde.bind<Dto>(js);          // JsonSource ident, widened to ValueSource in-reify
+    assert.equalInt(a.id, 7);
+    assert.equalStr(a.name, "Ada");
+}
+
+@test
+fn test_let_bound_valuesource(): void {
+    let vs: ValueSource = source.fromJson("{\"id\": 0, \"name\": \"Zero\"}");
+    let a = serde.bind<Dto>(vs);          // already-widened ValueSource; present-0 survives (V1 boxing)
+    assert.equalInt(a.id, 0);
+    assert.equalStr(a.name, "Zero");
+}
+
+@test
+fn test_immediate_use(): void {
+    let js = source.fromJson("{\"id\": 42, \"name\": \"Grace\"}");
+    assert.equalInt(serde.bind<Dto>(js).id, 42);   // discarded temp must not leak (drains at stmt end)
+}

@@ -2526,25 +2526,37 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 if (fa.object.kind == .ident and std.mem.eql(u8, fa.object.kind.ident, "serde") and
                     std.mem.eql(u8, fa.field, "bind") and gc.type_args.len == 1)
                 {
-                    // Reify to a normal `<T>__bind(src)` call and compile it through the ordinary
-                    // call path — that path already handles the ValueSource fat pointer, ARC, and
-                    // retain-on-return exactly as `GetUser__bind(source.fromJson(...))` does today.
-                    const rendered = try self.resolveReifyTypeName(gc.type_args[0]);                    const binder_name = try std.fmt.allocPrint(self.allocator, "{s}__bind", .{rendered});
-                    const callee = try self.allocator.create(ast.Expression);
-                    callee.* = .{ .kind = .{ .ident = binder_name } };
-                    const call_expr = ast.Expression{ .kind = .{ .call = .{
-                        .callee = callee,
-                        .args = gc.args,
-                        .span = gc.span,
-                    } } };
-                    const bound = try self.compileExpression(call_expr);
-                    // Register the +1 result as a releasable temporary — the synthesized call node has
-                    // no ExprId, so the normal choke-point tracking skips it, and the owned struct
-                    // would leak when used-and-discarded (`serde.bind<T>(s).id`). A `let x = ...`
-                    // consumes it back out; an immediate use drains it at statement end.
-                    if (self.structs.contains(rendered)) {
-                        try self.registerTemporary(bound, rendered);
+                    // Reify `serde.bind<T>(src)` to `<T>__bind(src)`. Compile the source arg and WIDEN it
+                    // to the `ValueSource` trait object HERE — a concrete source (`source.fromJson(...)` →
+                    // `JsonSource`, an `orm.RowSource`) reaches `__bind`'s `src: ValueSource` param as a raw
+                    // struct otherwise, and `__bind`'s first `src.getInt(...)` reads a garbage vtable. (When
+                    // the arg is ALREADY a `ValueSource` — e.g. a method/fn param — it is not a struct, so no
+                    // widening; passed through unchanged. This is why `serde.bind<T>` worked inside a generic
+                    // method whose `src` param was already `ValueSource`, but NOT `serde.bind<Dto>(fromJson())`
+                    // at a direct call site.)
+                    const rendered = try self.resolveReifyTypeName(gc.type_args[0]);
+                    const binder_name = try std.fmt.allocPrint(self.allocator, "{s}__bind", .{rendered});
+                    defer self.allocator.free(binder_name);
+                    const resolved_binder = try self.resolveCalleeName(binder_name);
+                    const fn_val = self.func_map.get(resolved_binder) orelse self.func_map.get(binder_name) orelse {
+                        std.debug.print("serde.bind: binder '{s}' not found\n", .{binder_name});
+                        return error.FunctionNotFound;
+                    };
+                    var arg_val = try self.compileCallArgument(gc.args[0]);
+                    {
                     }
+                    if (try self.resolveExpressionTypeName(&gc.args[0])) |sname| {
+                        if (self.structs.contains(sname)) {
+                            arg_val = try self.constructTraitObject(arg_val, sname, "ValueSource");
+                        }
+                    }
+                    var bargs = [_]types.LLVMValueRef{arg_val};
+                    const bound = try self.buildCallWithCasts(fn_val, &bargs);
+                    // No manual registerTemporary here: unlike the old synthesized-`.call` (which had no
+                    // ExprId), this returns from the OUTER `serde.bind<T>(...)` generic_call node, which DOES
+                    // carry an ExprId — so the ordinary disposition/temp tracking owns it. A `let x = ...`
+                    // consumes it; an immediate use drains it at statement end. Registering it again here
+                    // double-counted, so `let a = serde.bind<Dto>(src)` released the bound struct twice → UAF.
                     return bound;
                 }
                 // F4-5: `serde.typeName<T>()` -> the concrete type's name as a string literal.
