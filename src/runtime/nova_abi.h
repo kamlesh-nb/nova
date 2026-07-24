@@ -44,6 +44,18 @@ void      nova_bytes_free(long long ptr_val);
 void      nova_retain(long long ptr_val);
 void      nova_release(long long ptr_val, void (*destructor)(long long));
 
+// Boxed `any` — an owned dynamic value: [payload:i64][dtor:i64] in an ARC object.
+// box: MOVE payload's +1 into the box; unbox: read payload (borrow); box_dtor:
+// release the inner value via its carried destructor when the box is freed.
+long long nova_any_box(long long payload, long long dtor);
+long long nova_any_unbox(long long box);
+void      nova_any_box_dtor(long long box);
+
+// Value-type optionals (V1) — a value-optional is a pointer to a boxed value, or null for `undefined`.
+// Present-`0` becomes a non-null box, so it is distinguishable from absent (uniform across all widths).
+long long nova_valopt_box(long long value);
+long long nova_valopt_unbox(long long box);
+
 // ===== Number -> string (interpolation / concat) ===========================
 char *nova_i64_to_string(long long v); // fresh Nova string (+1)
 char *nova_f64_to_string(double v);    // fresh Nova string (+1), shortest round-trip

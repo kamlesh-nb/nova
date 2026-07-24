@@ -196,8 +196,21 @@ pub const Lowerer = struct {
                         };
                     }
                 }
-                // `any` is a recognised primitive today (§3.5) with no type-system
-                // meaning. It is honestly unresolved rather than quietly an int.
+                // `any` is the opaque, word-sized, dynamically-typed value (§3.5). Lower it to `.ptr`
+                // — the honest "opaque, explicitly UNOWNED word" — NOT `.unresolved`. Two reasons:
+                // (1) As `.unresolved` it could not be a CONTAINER ELEMENT: `Map<string, any>` →
+                //     `Storage<any>` gave a `.unresolved` element, and the storage slot-release ownership
+                //     decision (arc.zig `buildStorageSlotReleaseByTypeId` → isOwnedTypeId) hit the F2-5
+                //     `.unresolved` tripwire and ABORTED the compile (even a bare construct+set did).
+                // (2) The ownership answer is IDENTICAL either way — an opaque value is non-owned (a
+                //     container can't ARC a value whose type it can't see; whoever downcasts it with
+                //     `v as T` owns it). So `.ptr` (explicitly non-owned) matches the old `.unresolved`
+                //     fallback exactly, while being a RESOLVED type the ownership tripwire accepts.
+                // `.ptr` is NOT an int, so the original "not quietly an int" intent is preserved.
+                if (std.mem.eql(u8, name, "any")) {
+                    self.stats.lowered += 1;
+                    return self.store.ptrT();
+                }
                 return self.unresolved(name);
             },
             .optional => |inner| {

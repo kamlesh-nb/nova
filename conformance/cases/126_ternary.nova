@@ -1,0 +1,49 @@
+// 126 — the ternary conditional operator `cond ? a : b` (C-style / C#-style). It desugars to Nova's
+// `if`-expression, so it shares its heterogeneous-branch typing (79) and is a pure syntax convenience.
+// Disambiguated from `??` (null-coalescing) and `?.` (optional chaining), which also start with `?`.
+import assert;
+import string;
+
+@test
+fn test_basic_ternary(): void {
+    let x = 5;
+    assert.equalInt(100, x > 3 ? 100 : 200);
+    assert.equalInt(200, x > 10 ? 100 : 200);
+}
+
+@test
+fn test_ternary_strings(): void {
+    let n = 5;
+    assert.equalStr("five", n == 5 ? "five" : "other");
+    assert.equalStr("other", n == 6 ? "five" : "other");
+}
+
+@test
+fn test_nested_ternary(): void {
+    // right-associative chaining, the idiomatic sign() form
+    let a = 0;
+    let s = a > 0 ? "pos" : (a == 0 ? "zero" : "neg");
+    assert.equalStr("zero", s);
+    let b = -3;
+    let s2 = b > 0 ? "pos" : (b == 0 ? "zero" : "neg");
+    assert.equalStr("neg", s2);
+}
+
+@test
+fn test_ternary_disambiguation_with_coalesce(): void {
+    // `?` (ternary) must not be confused with `??` (coalesce). Here the condition uses `??` and the
+    // whole thing is a ternary.
+    let opt = "hi";
+    let cond = (opt ?? "") == "hi";
+    assert.equalStr("yes", cond ? "yes" : "no");
+}
+
+@test
+fn test_ternary_in_expression(): void {
+    // usable anywhere an expression is — as a call arg, in interpolation, etc.
+    let x = 7;
+    let msg = `value is ${x > 5 ? "big" : "small"}`;
+    assert.equalStr("value is big", msg);
+    let total = 10 + (x > 5 ? 1 : 0);
+    assert.equalInt(11, total);
+}

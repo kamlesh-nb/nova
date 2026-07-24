@@ -1200,7 +1200,21 @@ pub const Inferer = struct {
                         // `map<U>(fn: (T) => U)` claimed to be `(int) -> U`, and
                         // solving U against U learns nothing. The whole point of
                         // inferring U from the closure is that the body knows it.
-                        const ret = if (self.store.get(body_t) != .unresolved) body_t else ft.ret;
+                        // The params come from the expectation; the RETURN normally comes from the
+                        // BODY (so a generic `U` in `map<U>(fn:(T)=>U)` is solved FROM the body, not
+                        // reported back verbatim). EXCEPTION: when the expected return is a TRAIT and
+                        // the body yields a concrete impl, the closure's return type is the TRAIT —
+                        // exactly like a named `fn f(): Trait { return Impl(); }`. The body value then
+                        // widens to the fat pointer at the return (statements.zig return-widening).
+                        // Without this the closure recorded its body-concrete type, so codegen left the
+                        // return UNWIDENED (a raw struct) and any downcast of the produced trait object
+                        // crashed — the di-factory `(sp) => ServiceImpl()` case.
+                        const ret = if (self.store.get(ft.ret) == .trait_ and self.store.get(body_t) != .unresolved)
+                            ft.ret
+                        else if (self.store.get(body_t) != .unresolved)
+                            body_t
+                        else
+                            ft.ret;
                         return self.ok(try self.store.intern(.{ .func = .{ .params = ft.params, .ret = ret } }));
                     }
                 }
@@ -1275,7 +1289,20 @@ pub const Inferer = struct {
                 }
                 _ = try self.inferExpr(g.callee);
                 self.stats.typed -|= 1;
-                for (g.args) |*a| _ = try self.inferExpr(a);
+                // Propagate DECLARED parameter types to the arguments for a METHOD call on a value
+                // receiver, so a CLOSURE argument gets its parameter types from the method signature —
+                // `app.handleFrom<T>((sp) => sp.require("Db"))` types `sp` as `ServiceProvider`. Without
+                // this a closure arg to a GENERIC method was inferred with NO expected type, leaving its
+                // params unresolved, and any method call through them ("no such method or function")
+                // failed. This mirrors the `.call` arm's `calleeParamTypes` propagation; it is scoped to
+                // field-access (method) callees so generic constructors/free-functions are unaffected.
+                var gwant: ?[]TypeId = null;
+                if (g.callee.kind == .field_access) gwant = self.calleeParamTypes(g.callee) catch null;
+                defer if (gwant) |w| self.allocator.free(w);
+                for (g.args, 0..) |*a, i| {
+                    const exp: ?TypeId = if (gwant) |w| (if (i < w.len) w[i] else null) else null;
+                    _ = try self.inferExprExpecting(a, exp);
+                }
                 // `bytes.new<T>()` / `new_persistent<T>()` / `new_with_allocator<T>()`
                 // allocate a `T` and return it — Nova structs are reference-semantic
                 // (an i64 handle), so the EXPRESSION's type is `T`, not the builtin's
@@ -1948,9 +1975,20 @@ pub const Inferer = struct {
         // construct; let the caller fall through to its unresolved path.
         if (fd.type_params.len == 0 or fd.type_params.len != type_args.len) return null;
         out_sym.* = mid;
-        // Infer the value args too, so their subexpressions are recorded in the IR (the
-        // generic_call arm otherwise records only the callee).
-        for (args) |*a| _ = try self.inferExpr(a);
+        // Infer the value args too, so their subexpressions are recorded in the IR — WITH each arg's
+        // declared parameter type as the expected type, so a CLOSURE argument gets its parameter types
+        // from the method signature (`app.handleFrom<T>((sp) => sp.require(..))` types `sp` as
+        // `ServiceProvider`). Plain `inferExpr(a)` here re-inferred with NO expectation and OVERWROTE
+        // the generic_call arm's propagation, leaving the closure params unresolved and a method call
+        // through them (`sp.require`) failing at codegen. Mirrors `calleeParamTypes` for non-generic
+        // calls. (Params that reference the method's OWN type args are the uncommon case; here they
+        // lower with those params unsubstituted, which is no worse than the prior no-expectation walk.)
+        const pts = self.paramTypesOf(fd, t.struct_) catch null;
+        defer if (pts) |p| self.allocator.free(p);
+        for (args, 0..) |*a, i| {
+            const exp: ?TypeId = if (pts) |p| (if (i < p.len) p[i] else null) else null;
+            _ = try self.inferExprExpecting(a, exp);
+        }
 
         const ret = fd.ret_type orelse return try self.store.voidT();
         const solved = try self.allocator.alloc(TypeId, fd.type_params.len);

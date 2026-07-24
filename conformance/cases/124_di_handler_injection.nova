@@ -1,0 +1,101 @@
+// 124 — Dependency injection through `App`: a mediator handler receives its collaborators via its
+// CONSTRUCTOR, resolved from the App-owned DI container, instead of being a field-less `H{}`.
+//
+//   services.addSingleton("Counter", (sp) => { return Counter(); });   // register services
+//   app.useServices(services);                                          // App OWNS the provider
+//   app.handle<Hit>(HitHandler(app.provider.require("Counter") as Counter));  // inject via ctor
+//   app.get<Hit>("/hit");
+//
+// The App owns the `ServiceProvider` (`useServices` / `app.provider`); the handler is constructed with
+// its dependencies resolved from it and registered. Services are stored as owned `Service` trait
+// objects, so a heap service persists in the container's cache (the reason `Service` replaced `any`) —
+// the injected singleton keeps its state across requests.
+import assert;
+import web.app;
+import web.di;
+import web.request;
+import web.response;
+import web.status;
+import serde.source;
+import string;
+import map;
+
+// A stateful SINGLETON service — the shared collaborator the handler depends on.
+struct Counter impl Service {
+    pub count: int,
+    init() { self.count = 0; }
+    pub fn next(self: Counter): int { self.count = self.count + 1; return self.count; }
+}
+
+// A stateless service the handler also depends on (proves multi-dependency injection).
+struct Greeter impl Service {
+    pub prefix: string,
+    init(p: string) { self.prefix = p; }
+    pub fn greet(self: Greeter, name: string): string { return self.prefix + ", " + name + "!"; }
+}
+
+@serializable struct Hit { pub name: string }
+
+// The handler holds its dependencies as FIELDS, injected through its constructor — not a field-less
+// `Hit{}`. `handle` uses them: the injected Counter (shared) + the injected Greeter (stateless).
+struct HitHandler impl MessageHandler {
+    counter: Counter,
+    greeter: Greeter,
+    init(c: Counter, g: Greeter) { self.counter = c; self.greeter = g; }
+    fn handle(self: HitHandler, src: ValueSource): Response {
+        let q = Hit{ name: src.getString("name") };
+        let n = self.counter.next();
+        let msg = self.greeter.greet(q.name);
+        return json(`{"n":${n},"msg":"${msg}"}`);
+    }
+}
+
+fn makeApp(): App {
+    let services = ServiceCollection();
+    services.addSingleton("Counter", (sp) => { return Counter(); });
+    services.addSingleton("Greeter", (sp) => { return Greeter("Hello"); });
+
+    let a = App();
+    a.useServices(services);
+    // The handler is constructed with its two dependencies resolved from the App-owned provider.
+    a.handle<Hit>(HitHandler(a.provider.require("Counter") as Counter, a.provider.require("Greeter") as Greeter));
+    a.get<Hit>("/hit/{name}");
+    return a;
+}
+
+// (1) A dispatched request runs the handler with its injected collaborators.
+@test
+fn test_di_injected_handler_runs(): void {
+    let a = makeApp();
+    let req = Request.fromString("GET /hit/Ada HTTP/1.1\r\nHost: x\r\n\r\n");
+    let resp = a.dispatch(req);
+    // First hit → counter == 1; greeter produced the message from the injected prefix.
+    assert.equalStr(resp.body, `{"n":1,"msg":"Hello, Ada!"}`);
+}
+
+// (2) The injected SINGLETON dependency persists across requests (shared state) — the counter advances
+//     1 → 2 → 3 across three dispatches on one App (the same injected Counter, held by the handler).
+@test
+fn test_di_singleton_persists_across_requests(): void {
+    let a = makeApp();
+    let r1 = a.dispatch(Request.fromString("GET /hit/A HTTP/1.1\r\nHost: x\r\n\r\n"));
+    let r2 = a.dispatch(Request.fromString("GET /hit/B HTTP/1.1\r\nHost: x\r\n\r\n"));
+    let r3 = a.dispatch(Request.fromString("GET /hit/C HTTP/1.1\r\nHost: x\r\n\r\n"));
+    assert.equalStr(r1.body, `{"n":1,"msg":"Hello, A!"}`);
+    assert.equalStr(r2.body, `{"n":2,"msg":"Hello, B!"}`);
+    assert.equalStr(r3.body, `{"n":3,"msg":"Hello, C!"}`);
+}
+
+// (3) The instance path (`handle<T>(H{})`) still works alongside DI — additive, no regression.
+struct PingHandler impl MessageHandler {
+    fn handle(self: PingHandler, src: ValueSource): Response { return json(`{"pong":true}`); }
+}
+@serializable struct Ping { pub x: int }
+@test
+fn test_instance_path_still_works(): void {
+    let a = App();
+    a.handle<Ping>(PingHandler{});
+    a.get<Ping>("/ping/{x:int}");
+    let resp = a.dispatch(Request.fromString("GET /ping/1 HTTP/1.1\r\nHost: x\r\n\r\n"));
+    assert.equalStr(resp.body, `{"pong":true}`);
+}

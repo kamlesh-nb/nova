@@ -1,0 +1,88 @@
+// 125 — DI lifetimes + per-request scope + transient handler factories + type-keyed generics.
+//
+// Proves the full ASP.NET-style DI surface wired into `App`:
+//   * `addScoped` / `addSingleton` / `addTransient` lifetimes,
+//   * a per-request `ServiceScope` (a SCOPED service is one instance per request; a SINGLETON persists),
+//   * `handleFrom<T>` — a handler BUILT PER REQUEST from the scope, deps injected via its constructor,
+//   * type-keyed generic registration/resolution (`addSingletonType<T>` / `resolveType<T>`).
+import assert;
+import web.app;
+import web.di;
+import web.request;
+import web.response;
+import web.status;
+import serde.source;
+import string;
+import map;
+
+// A stateful service: `inc()` advances a per-INSTANCE counter, so the value reveals whether callers
+// share an instance (same counter) or got fresh ones.
+struct SCount impl Service { pub v: int, init() { self.v = 0; } pub fn inc(self: SCount): int { self.v = self.v + 1; return self.v; } }
+struct GCount impl Service { pub v: int, init() { self.v = 0; } pub fn inc(self: GCount): int { self.v = self.v + 1; return self.v; } }
+
+@serializable struct Req { pub x: int }
+
+// Built per request via `handleFrom`; holds a SCOPED and a SINGLETON service, injected through its ctor.
+struct H impl MessageHandler {
+    scoped: SCount,
+    singleton: GCount,
+    init(a: SCount, b: GCount) { self.scoped = a; self.singleton = b; }
+    fn handle(self: H, src: ValueSource): Response {
+        return json(`{"scoped":${self.scoped.inc()},"singleton":${self.singleton.inc()}}`);
+    }
+}
+
+fn makeApp(): App {
+    let services = ServiceCollection();
+    services.addScoped("SCount", (sp) => { return SCount(); });        // one per request scope
+    services.addSingleton("GCount", (sp) => { return GCount(); });     // one for the whole app
+    let a = App();
+    a.useServices(services);
+    // `sp` is the per-request ServiceScope; requiring the scoped service yields the per-request instance.
+    a.handleFrom<Req>((sp) => { return H(sp.require("SCount") as SCount, sp.require("GCount") as GCount); });
+    a.get<Req>("/r/{x:int}");
+    return a;
+}
+
+// (1) SCOPED resets per request (a fresh scope → a fresh SCount → 1 each time); SINGLETON persists
+//     across requests (the same GCount → 1, then 2).
+@test
+fn test_scoped_vs_singleton_lifetimes(): void {
+    let a = makeApp();
+    let r1 = a.dispatch(Request.fromString("GET /r/1 HTTP/1.1\r\nHost: x\r\n\r\n"));
+    let r2 = a.dispatch(Request.fromString("GET /r/1 HTTP/1.1\r\nHost: x\r\n\r\n"));
+    assert.equalStr(r1.body, `{"scoped":1,"singleton":1}`);
+    assert.equalStr(r2.body, `{"scoped":1,"singleton":2}`);
+}
+
+// (2) Within ONE scope, a SCOPED service resolves to the SAME instance (its counter advances 1→2),
+//     while a TRANSIENT service is a FRESH instance every resolve (each starts at 1).
+@test
+fn test_scope_sharing_and_transient(): void {
+    let services = ServiceCollection();
+    services.addScoped("S", (sp) => { return SCount(); });
+    services.addTransient("T", (sp) => { return SCount(); });
+    let p = services.buildServiceProvider();
+    let scope = p.createScope();
+    let a = scope.require("S") as SCount;   // scoped: builds + caches in the scope
+    let b = scope.require("S") as SCount;   // scoped: SAME instance
+    assert.equalInt(1, a.inc());
+    assert.equalInt(2, b.inc());            // same counter → 2 (a and b are the same object)
+    let t1 = scope.require("T") as SCount;  // transient: fresh
+    let t2 = scope.require("T") as SCount;  // transient: another fresh
+    assert.equalInt(1, t1.inc());
+    assert.equalInt(1, t2.inc());           // independent counters → each 1
+}
+
+// (3) Type-keyed generic registration + resolution — the key is derived from the TYPE, so
+//     registration and resolution agree without a hand-written string.
+@test
+fn test_type_keyed_generics(): void {
+    let services = ServiceCollection();
+    services.addSingletonType<GCount>((sp) => { return GCount(); });
+    let p = services.buildServiceProvider();
+    let c1 = p.resolveType<GCount>() as GCount;
+    assert.equalInt(1, c1.inc());
+    let c2 = p.resolveType<GCount>() as GCount;   // same singleton instance
+    assert.equalInt(2, c2.inc());
+}

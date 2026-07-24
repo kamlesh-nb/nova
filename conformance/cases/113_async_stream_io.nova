@@ -24,13 +24,13 @@ fn bufToStr(buf: ptr, n: int): string {
 async fn serveOnce(srv: long): int {
     let client = await asyncio.aaccept(srv);
     let buf = bytes.alloc(64);
-    let n = await asyncio.arecv(client, buf as int, 64);
+    let n = await asyncio.async_read(client, buf as int, 64);
     let got = bufToStr(buf, n);
     // Reply depends on what we received, proving the recv actually delivered the bytes.
     if (string.eql(got, "PING")) {
-        await asyncio.asend(client, "PONG");
+        await asyncio.async_write(client, "PONG");
     } else {
-        await asyncio.asend(client, "ERR");
+        await asyncio.async_write(client, "ERR");
     }
     asyncio.aclose(client);
     return n;

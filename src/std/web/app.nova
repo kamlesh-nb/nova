@@ -27,6 +27,7 @@ import web.url;
 import web.multipart;
 import serde.source;
 import web.static_content;
+import web.di;
 import string;
 import list;
 import map;
@@ -50,24 +51,53 @@ pub trait MessageHandler {
 }
 
 pub struct AppMediator {
+    // Two registration paths, both keyed by the request type name:
+    //   * `handlers`  — a pre-built INSTANCE (the simple, zero-dependency case, `app.handle<T>(H{})`).
+    //   * `factories` — a `(ServiceProvider) -> MessageHandler` invoked PER REQUEST to build the handler,
+    //     resolving its constructor dependencies from the DI container (`app.handleFrom<T>(...)`). A
+    //     factory takes precedence over an instance for the same key; running it per request means a
+    //     scoped/transient dependency is honored (a fresh handler each time).
     pub handlers: Map<string, MessageHandler>,
+    pub factories: Map<string, (ServiceScope) -> MessageHandler>,
 
     init() {
         self.handlers = Map<string, MessageHandler>(32, string.hash);
+        self.factories = Map<string, (ServiceScope) -> MessageHandler>(32, string.hash);
     }
 
     pub fn register(self: AppMediator, key: string, handler: MessageHandler): void {
         self.handlers.set(key, handler);
     }
 
-    // Resolve the handler for `key` (the request type name) and run it with the raw source.
-    // The handler binds and returns the Response — this is the one request→Response dispatch site.
-    pub fn send(self: AppMediator, key: string, src: ValueSource): response.Response {
+    pub fn registerFactory(self: AppMediator, key: string, factory: (ServiceScope) -> MessageHandler): void {
+        self.factories.set(key, factory);
+    }
+
+    // Resolve the handler for `key` (the request type name) and run it with the raw source. A factory
+    // (DI) is preferred: a fresh per-request `ServiceScope` is opened, the handler is BUILT from it
+    // (so its scoped dependencies are per-request), and it runs. Else a pre-built instance; else 404.
+    // The handler binds and returns the Response — the one request→Response dispatch site.
+    pub fn send(self: AppMediator, key: string, provider: ServiceProvider, src: ValueSource): response.Response {
+        let factory = self.factories.get(key);
+        if (factory != undefined) {
+            let scope = provider.createScope();
+            let build = factory ?? ((sc) => { return NoHandler{}; });
+            let handler = build(scope);
+            return handler.handle(src);
+        }
         let handler = self.handlers.get(key);
         if (handler == undefined) {
             return response.Response(Status.NotFound, "No handler for request: " + key);
         }
         return handler.handle(src);
+    }
+}
+
+// The unreachable default for the factory `??` in `send` (a closure default may not capture `self`).
+// Never invoked: the factory is present whenever this branch is reached.
+struct NoHandler impl MessageHandler {
+    fn handle(self: NoHandler, src: ValueSource): response.Response {
+        return response.Response(Status.NotFound, "No handler");
     }
 }
 
@@ -274,6 +304,9 @@ pub struct App {
     // Response cache: path -> fully-serialized response bytes, for GET paths marked cacheable.
     pub cache: Map<string, string>,
     pub cacheable: Map<string, bool>,
+    // The DI container. `App()` starts with an empty provider; `app.useServices(sc)` installs a
+    // configured one. Factory-registered handlers (`handleFrom<T>`) resolve their dependencies from it.
+    pub provider: ServiceProvider,
 
     init() {
         self.routes = List<AppRoute>();
@@ -281,6 +314,19 @@ pub struct App {
         self.static_mounts = List<static_content.StaticMount>();
         self.cache = Map<string, string>(16, string.hash);
         self.cacheable = Map<string, bool>(16, string.hash);
+        self.provider = ServiceCollection().buildServiceProvider();
+    }
+
+    /// Install the DI container. Register services in a `ServiceCollection`, then hand it to the App;
+    /// handlers registered with `handleFrom<T>` resolve their constructor dependencies from it.
+    ///
+    ///     let services = ServiceCollection();
+    ///     services.addSingleton("Logger", (sp) => { return ConsoleLogger(); });
+    ///     let app = App();
+    ///     app.useServices(services);
+    ///     app.handleFrom<GetUser>((sp) => { return GetUserHandler(sp.require("Logger") as Logger); });
+    pub fn useServices(self: App, sc: ServiceCollection): void {
+        self.provider = sc.buildServiceProvider();
     }
 
     /// Mark a GET path as cacheable: after the first request, its FULLY-SERIALIZED response bytes
@@ -335,6 +381,18 @@ pub struct App {
     pub fn handle<TReq>(self: App, handler: MessageHandler): void {
         self.mediator.register(serde.typeName<TReq>(), handler);
     }
+
+    /// Register a handler for `TReq` built from the DI container: the factory receives the App's
+    /// `ServiceProvider` and constructs the handler, resolving its constructor dependencies. Call
+    /// `useServices` first. This is the dependency-injection form of `handle`.
+    ///
+    ///     app.handleFrom<GetUser>((sp) => {
+    ///         return GetUserHandler(sp.require("Db") as Db, sp.require("Logger") as Logger);
+    ///     });
+    pub fn handleFrom<TReq>(self: App, factory: (ServiceScope) -> MessageHandler): void {
+        self.mediator.registerFactory(serde.typeName<TReq>(), factory);
+    }
+
 
     // Verb methods do ONE thing: register a route (method + path) for the request type `TReq`. No
     // dispatch, no binding, no send — just data. Each is a REAL generic method the compiler
@@ -408,7 +466,7 @@ pub struct App {
                         // The one request→Response site: build the source, resolve the handler by the
                         // route's type key, run it. `send` is HERE, once — not in the verb methods.
                         let src = self.sourceFor(req, params);
-                        return self.mediator.send(route.key, src);
+                        return self.mediator.send(route.key, self.provider, src);
                     }
                 } else if (typed_bad && string.eql(route.method, req.method)) {
                     return response.Response(Status.BadRequest, "Bad Request: invalid path parameter");
@@ -539,7 +597,7 @@ async fn handleConn(app: App, client: long): int {
         let hdrEnd = bufFindHeaderEnd(buf, 0, len);
         while (hdrEnd == -1) {
             if (len >= cap) { alive = false; break; }              // header block larger than the buffer
-            let hn = await asyncio.arecv(client, buf + len, cap - len);
+            let hn = await asyncio.async_read(client, buf + len, cap - len);
             if (hn <= 0) { alive = false; break; }
             len = len + hn;
             hdrEnd = bufFindHeaderEnd(buf, 0, len);
@@ -548,14 +606,14 @@ async fn handleConn(app: App, client: long): int {
 
         // Honor `Expect: 100-continue` — acknowledge so the client sends the body.
         if (bufFindCI(buf, 0, hdrEnd, "expect: 100-continue") != -1) {
-            await asyncio.asend(client, "HTTP/1.1 100 Continue\r\n\r\n");
+            await asyncio.async_write(client, "HTTP/1.1 100 Continue\r\n\r\n");
         }
         // Accumulate the full body per Content-Length.
         let bodyStart = hdrEnd + 4;
         let need = bufContentLength(buf, 0, hdrEnd);
         while (len - bodyStart < need) {
             if (len >= cap) { alive = false; break; }
-            let bn = await asyncio.arecv(client, buf + len, cap - len);
+            let bn = await asyncio.async_read(client, buf + len, cap - len);
             if (bn <= 0) { alive = false; break; }
             len = len + bn;
         }
@@ -579,7 +637,7 @@ async fn handleConn(app: App, client: long): int {
             let raw = bytes.read_string(buf, reqEnd);
             out = app.respondMiss(raw, method, path);
         }
-        await asyncio.asend(client, out);
+        await asyncio.async_write(client, out);
 
         // Shift any leftover bytes (a pipelined next request) to the front of the buffer.
         let leftover = len - reqEnd;

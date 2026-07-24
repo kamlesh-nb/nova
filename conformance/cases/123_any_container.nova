@@ -1,0 +1,106 @@
+// 123 — `any` as a resolved, container-usable type.
+//
+// Regression gate for the `any`→`.unresolved` bug: `any` used to lower to `.unresolved`, so
+// `Map<string, any>` (→ `Storage<any>`) had a `.unresolved` element. The storage slot-release
+// ownership decision then hit the F2-5 `.unresolved` tripwire and ABORTED the compile — even a
+// bare construct+set did. The SAME root cause made a closure returning into a `(T)->any` map fail
+// to link (a missing symbol). Fix: `any` lowers to `.ptr` (opaque, word-sized, explicitly UNOWNED)
+// — a RESOLVED, non-owned type. Importing `web.di` (which is built on `Map<string, any>`) used to
+// abort the compile; it now works.
+//
+// KNOWN LIMITATION (documented, follow-up — NOT tested here because it is unsafe today): because
+// `any` is non-owned (`.ptr`), a HEAP value (a struct) stored into a container AS `any` is not
+// retained by the container, so once the original binding is released the container holds a dangling
+// pointer. Storing an `int` (value, test 1) is safe; using an `any` immediately from a factory call
+// (test 4, the real DI resolve path) is safe; a direct `any`→downcast of a live binding (test 2) is
+// safe. A proper fix for "heap value parked in a container as `any`" needs a design decision — box
+// value types, or give `any` owned-retain semantics — and is tracked as follow-up (W4 / `any` model).
+import assert;
+import map;
+import web.di;
+
+// `impl Service` so it can be DI-registered — the container stores services as owned `Service`
+// trait objects (di.nova), which is why a heap service survives in the singleton cache.
+struct Logger impl Service { pub tag: int, init(t: int) { self.tag = t; } }
+
+// (1) Map<string, any> with a VALUE element — construct + set + get + narrow + downcast.
+//     (Used to crash the compiler at the storage ownership decision.)
+@test
+fn test_any_map_value(): void {
+    let m = Map<string, any>(8, string.hash);
+    m.set("k", 42);
+    let c = m.get("k");
+    if (c != undefined) {
+        assert.equalInt(42, (c ?? 0) as int);
+    } else {
+        assert.fail("key should be present");
+    }
+}
+
+// (2) A struct through `any` and back, on a LIVE binding (no container lifetime gap).
+@test
+fn test_any_struct_roundtrip_live(): void {
+    let boxed: any = Logger(7);
+    let lg = boxed as Logger;
+    assert.equalInt(7, lg.tag);
+}
+
+// (3) A closure returning into a `(int) -> any` map (used to fail at LINK time — same root cause).
+struct FnBox {
+    pub f: Map<string, (int) -> any>,
+    init() { self.f = Map<string, (int) -> any>(8, string.hash); }
+    pub fn add(self: FnBox, k: string, g: (int) -> any): void { self.f.set(k, g); }
+}
+@test
+fn test_closure_into_any_map(): void {
+    let b = FnBox();
+    b.add("mk", (n) => { return 42; });
+    assert.isTrue(true);
+}
+
+// (4) The DI container (now `Service`-based, di.nova): register a singleton factory → build → resolve
+//     → downcast. The factory `(sp) => Logger(9)` returns a concrete impl that widens to `Service`
+//     automatically (the closure-return trait-widening fix). `v as Logger` recovers the concrete.
+@test
+fn test_di_singleton_roundtrip(): void {
+    let sc = ServiceCollection();
+    sc.addSingleton("Logger", (sp) => { return Logger(9); });
+    let p = sc.buildServiceProvider();
+    let r: Resolved = p.resolve("Logger");
+    switch (r) {
+        case Resolved.Ok(v): { let lg = v as Logger; assert.equalInt(9, lg.tag); }
+        case Resolved.NotRegistered(k): { assert.fail("Logger should be registered"); }
+    }
+}
+
+// (4b) The singleton CACHE re-resolve — the case that was BROKEN when services were unowned `any`
+//      (the cached heap service dangled on the second resolve). With owned `Service` trait objects
+//      the container retains the cached instance, so a second resolve returns it intact.
+@test
+fn test_di_singleton_cached_reresolve(): void {
+    let sc = ServiceCollection();
+    sc.addSingleton("Logger", (sp) => { return Logger(11); });
+    let p = sc.buildServiceProvider();
+    let first: Resolved = p.resolve("Logger");   // builds + caches
+    switch (first) {
+        case Resolved.Ok(v): { assert.equalInt(11, (v as Logger).tag); }
+        case Resolved.NotRegistered(k): { assert.fail("first resolve"); }
+    }
+    let second: Resolved = p.resolve("Logger");  // served from the cache (owned, not dangling)
+    switch (second) {
+        case Resolved.Ok(v): { assert.equalInt(11, (v as Logger).tag); }
+        case Resolved.NotRegistered(k): { assert.fail("cached resolve"); }
+    }
+}
+
+// (5) A not-registered miss — the reason travels back inside the variant (di.nova's whole point).
+@test
+fn test_di_miss_carries_key(): void {
+    let sc = ServiceCollection();
+    let p = sc.buildServiceProvider();
+    let miss: Resolved = p.resolve("Nope");
+    switch (miss) {
+        case Resolved.Ok(v): { assert.fail("should miss"); }
+        case Resolved.NotRegistered(k): { assert.equalStr("Nope", k); }
+    }
+}

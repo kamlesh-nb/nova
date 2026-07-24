@@ -8,6 +8,7 @@ const sema_types = @import("../types.zig");
 const LlvmCompiler = @import("llvm_codegen.zig").LlvmCompiler;
 const FunctionInfo = @import("llvm_codegen.zig").FunctionInfo;
 const Scope = @import("llvm_codegen.zig").Scope;
+const cg_types = @import("types.zig"); // codegen type helpers (isPrimitiveTypeName)
 
 /// F5 O4 "scope exit | release every owned local" — for the exits that JUMP.
 ///
@@ -429,6 +430,29 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
         },
         .return_stmt => |rs| {
             var ret_val_opt = if (rs.value) |v| try self.compileExpression(v) else null;
+
+            // V1 (flag-gated): produce-BOX a value-type optional return. A function returning `T | undefined`
+            // for a VALUE type `T` (e.g. `Map<K,int>.get`'s `return value`) boxes the value, so a present `0`
+            // is a NON-NULL box distinguishable from absent; `return undefined` stays `0`/null. Detected from
+            // the DECLARED return TypeRef (`func.return_type` STRING erases the optional to its inner);
+            // `typeRefToString` substitutes the method's own type params (`V`→`int`) via the installed subst.
+            if (self.valopt_box) {
+                if (rs.value) |*v| {
+                    const is_undef_lit = v.kind == .literal and (v.kind.literal == .null or v.kind.literal == .undefined);
+                    if (!is_undef_lit) {
+                        if (func.ret_type_ref) |rt| {
+                            if (rt == .optional) {
+                                const inner_str = self.typeRefToString(rt.optional.*) catch "";
+                                if (cg_types.isPrimitiveTypeName(inner_str) and
+                                    !std.mem.eql(u8, inner_str, "void") and !std.mem.eql(u8, inner_str, "any"))
+                                {
+                                    if (ret_val_opt) |rv| ret_val_opt = try self.buildValoptBox(rv);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             // Coerce a concrete struct to a trait object when the function's declared
             // return type is a trait (`fn make(): Speaker { return Dog(); }`).

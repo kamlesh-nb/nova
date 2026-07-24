@@ -547,9 +547,9 @@ pub fn awaitAsyncIoCall(self: *LlvmCompiler, operand: ast.Expression) ?ast.CallE
         (std.mem.eql(u8, name, "socketAcceptAsync") and call.args.len == 1) or
         (std.mem.eql(u8, name, "aaccept") and call.args.len == 1) or
         (std.mem.eql(u8, name, "aconnect") and call.args.len == 2) or
-        (std.mem.eql(u8, name, "arecv") and call.args.len == 3) or
-        (std.mem.eql(u8, name, "arecvDeadline") and call.args.len == 4) or
-        (std.mem.eql(u8, name, "asend") and call.args.len == 2))
+        (std.mem.eql(u8, name, "async_read") and call.args.len == 3) or
+        (std.mem.eql(u8, name, "async_read_deadline") and call.args.len == 4) or
+        (std.mem.eql(u8, name, "async_write") and call.args.len == 2))
     {
         return call;
     }
@@ -566,7 +566,7 @@ pub fn buildAsyncIo(self: *LlvmCompiler, call: ast.CallExpr) anyerror!types.LLVM
         .field_access => |fa| fa.field,
         else => unreachable,
     };
-    if (std.mem.eql(u8, name, "arecvDeadline")) {
+    if (std.mem.eql(u8, name, "async_read_deadline")) {
         // true-async recv WITH a deadline: (sock, buf, max, ms) + self → nova_arecv_deadline.
         const a0 = try self.compileExpression(call.args[0]);
         const a1 = try self.compileExpression(call.args[1]);
@@ -576,17 +576,17 @@ pub fn buildAsyncIo(self: *LlvmCompiler, call: ast.CallExpr) anyerror!types.LLVM
         const t = core.LLVMGlobalGetValueType(f);
         var a = [_]types.LLVMValueRef{ a0, a1, a2, a3, self_hi };
         _ = core.LLVMBuildCall2(self.builder, t, f, &a, 5, "");
-    } else if (std.mem.eql(u8, name, "socketRecvAsync") or std.mem.eql(u8, name, "arecv")) {
-        // offload recv (fd) OR true-async arecv (socket handle): same 3 args.
+    } else if (std.mem.eql(u8, name, "socketRecvAsync") or std.mem.eql(u8, name, "async_read")) {
+        // offload recv (fd) OR true-async async_read (socket handle): same 3 args.
         const a0 = try self.compileExpression(call.args[0]);
         const a1 = try self.compileExpression(call.args[1]);
         const a2 = try self.compileExpression(call.args[2]);
-        const fname = if (std.mem.eql(u8, name, "arecv")) "nova_arecv" else "nova_io_recv_async";
+        const fname = if (std.mem.eql(u8, name, "async_read")) "nova_arecv" else "nova_io_recv_async";
         const f = self.func_map.get(fname).?;
         const t = core.LLVMGlobalGetValueType(f);
         var a = [_]types.LLVMValueRef{ a0, a1, a2, self_hi };
         _ = core.LLVMBuildCall2(self.builder, t, f, &a, 4, "");
-    } else if (std.mem.eql(u8, name, "asend")) {
+    } else if (std.mem.eql(u8, name, "async_write")) {
         const sock = try self.compileExpression(call.args[0]);
         const data = try self.compileExpression(call.args[1]);
         const f = self.func_map.get("nova_asend").?;
@@ -3524,14 +3524,36 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             // A float operand now arrives as a real `double`; reinterpret it to i64 bits
             // here (the merge is a boundary) so the ICmp and the phi stay well-typed.
             // A no-op for the refcounted pointers the ownership logic below tracks.
+            // V1 (flag-gated): is the LEFT a VALUE-type optional (a boxed pointer)? If so the surviving
+            // present value must be UNBOXED before the merge (the phi yields the inner value, matching the
+            // RHS default). The `!= 0` null-check is unchanged (a present box is non-null). Detected from
+            // the checker's type for `nc.left` (`.optional(.prim)`), which is reliable at the caller.
+            const vopt_left = self.valopt_box and blk: {
+                if (self.typed_ir) |ir| {
+                    if (ir.typeOf(nc.left)) |t| break :blk self.valueOptionalInner(t) != null;
+                }
+                break :blk false;
+            };
             const left_val = self.coerceToSlotType(try self.compileExpression(nc.left.*), self.val_type);
             const left_bb_end = core.LLVMGetInsertBlock(self.builder);
 
             const rhs_bb = core.LLVMAppendBasicBlock(current_fn, "nc_rhs");
+            const present_bb = if (vopt_left) core.LLVMAppendBasicBlock(current_fn, "nc_present") else null;
             const merge_bb = core.LLVMAppendBasicBlock(current_fn, "nc_merge");
 
             const cond_i1 = core.LLVMBuildICmp(self.builder, types.LLVMIntPredicate.LLVMIntNE, left_val, core.LLVMConstInt(self.val_type, 0, 0), "is_not_null");
-            _ = core.LLVMBuildCondBr(self.builder, cond_i1, merge_bb, rhs_bb);
+            _ = core.LLVMBuildCondBr(self.builder, cond_i1, if (present_bb) |p| p else merge_bb, rhs_bb);
+
+            // The value the LEFT contributes to the merge phi, and the block it comes from. For a value
+            // optional, unbox in a dedicated present block; otherwise the left value flows straight in.
+            var left_incoming = left_val;
+            var left_incoming_bb = left_bb_end;
+            if (present_bb) |p| {
+                core.LLVMPositionBuilderAtEnd(self.builder, p);
+                left_incoming = try self.buildValoptUnbox(left_val);
+                _ = core.LLVMBuildBr(self.builder, merge_bb);
+                left_incoming_bb = core.LLVMGetInsertBlock(self.builder);
+            }
 
             // Compile RHS branch
             core.LLVMPositionBuilderAtEnd(self.builder, rhs_bb);
@@ -3566,8 +3588,8 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             // Merge block
             core.LLVMPositionBuilderAtEnd(self.builder, merge_bb);
             const phi = core.LLVMBuildPhi(self.builder, self.val_type, "nc_phi");
-            var incoming_vals = [_]types.LLVMValueRef{ left_val, rhs_val };
-            var incoming_bbs = [_]types.LLVMBasicBlockRef{ left_bb_end, rhs_bb_end };
+            var incoming_vals = [_]types.LLVMValueRef{ left_incoming, rhs_val };
+            var incoming_bbs = [_]types.LLVMBasicBlockRef{ left_incoming_bb, rhs_bb_end };
             core.LLVMAddIncoming(phi, &incoming_vals, &incoming_bbs, 2);
 
             // F5 §3.4b: OWNERSHIP FLOWS THROUGH THE PHI. `a ?? b` yields whichever

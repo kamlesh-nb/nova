@@ -312,6 +312,64 @@ long long nova_bytes_alloc(long long size) {
   return (long long)(curr + NOVA_OBJ_HEADER_SIZE);
 }
 
+// ===== Boxed `any` (owned dynamic value) ===================================
+// `any` is a boxed, owned value so a heap payload parked in a container (e.g.
+// `Map<string, any>`) is RETAINED by the container and freed with it — fixing the
+// dangling-pointer gap of the old unowned `.ptr` representation. Layout of the box
+// (a normal ARC object from nova_bytes_alloc, rc=1, 8-byte header at [ptr-8]):
+//     [payload: i64][dtor: i64]
+// `payload` is the value word (an int inline, or a pointer to a heap object).
+// `dtor` is the payload's destructor fn-pointer (0 for immediates / non-owned
+// payloads). When the box is released, nova_any_box_dtor releases the inner value
+// via that destructor, then the box's own bytes are freed by the nova_release that
+// called it. Boxing MOVES the payload's +1 into the box (no extra retain).
+extern "C" void nova_release(long long ptr_val, void (*destructor)(long long));
+
+extern "C" long long nova_any_box(long long payload, long long dtor) {
+  long long box = nova_bytes_alloc(16);
+  if (box == 0) return 0;
+  ((long long *)box)[0] = payload;
+  ((long long *)box)[1] = dtor;
+  return box;
+}
+
+extern "C" long long nova_any_unbox(long long box) {
+  if (box == 0) return 0; // an absent/undefined `any` unboxes to 0
+  return ((long long *)box)[0];
+}
+
+// The box's own destructor (passed to nova_release when the box is freed): release
+// the inner value if it carries a destructor, then return — the caller frees the box.
+extern "C" void nova_any_box_dtor(long long box) {
+  if (box == 0) return;
+  long long payload = ((long long *)box)[0];
+  long long dtor = ((long long *)box)[1];
+  if (dtor != 0)
+    nova_release(payload, (void (*)(long long))dtor);
+}
+
+// ===== Value-type optionals (V1: boxed presence) ===========================
+// A value-type optional (`int | undefined`, `long?`, `float?`, `double?`, `bool?`) is a POINTER to a
+// heap cell holding the value, or null (0) for `undefined`. This is Nova's `Nullable<T>` (C#-inspired
+// EXPLICIT presence): a stored `0`/`0.0`/`false` becomes a NON-NULL box, so it is distinguishable from
+// absent — fixing the value-0-reads-as-undefined soundness bug uniformly across all value widths (a
+// sentinel could not: `long`/`double` use all 64 bits). Pointer/`decimal` optionals are already
+// heap-null-representable and are UNCHANGED. See docs/design/value-optional-boxing.md.
+//
+// The box is a plain ARC object (nova_bytes_alloc, rc=1) holding one word; it carries no nested owned
+// value, so its destructor is null — releasing it just frees the 8 bytes.
+extern "C" long long nova_valopt_box(long long value) {
+  long long box = nova_bytes_alloc(8);
+  if (box == 0) return 0;
+  *(long long *)box = value;
+  return box;
+}
+
+extern "C" long long nova_valopt_unbox(long long box) {
+  if (box == 0) return 0; // null/undefined unboxes to 0; callers null-check FIRST (`?? `/`!= undefined`)
+  return *(long long *)box;
+}
+
 // ===== Coroutine frame allocation (M3-C) ===================================
 // Plain malloc/free — a coroutine frame is opaque LLVM-managed storage, NOT a
 // Nova ARC object, so no 8-byte header and no arena. A per-task pool can replace

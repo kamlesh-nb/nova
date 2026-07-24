@@ -52,11 +52,24 @@ pub fn unescapeString(allocator: std.mem.Allocator, input: []const u8) ![]const 
     return try result.toOwnedSlice(allocator);
 }
 
+/// V1 value-optional boxing — DEFAULT OFF. Set from `NOVA_VALOPT_BOX` in `main.zig` before codegen.
+/// When true, codegen represents value-type optionals (`.optional(.prim)`) as BOXED pointers (produce
+/// boxes, consume unboxes) so a present `0`/`0.0`/`false` is a non-null box, distinguishable from
+/// absent. OFF = today's behavior (undefined=0 collides with value 0). Copied into `LlvmCompiler.valopt_box`
+/// at `new()`. This flag exists ONLY to develop the pervasive wiring corpus-green; delete it once the
+/// wiring is complete and the default is flipped. See docs/design/value-optional-boxing.md.
+pub var valopt_box_enabled: bool = false;
+
 pub const FunctionInfo = struct {
     name: []const u8,
     param_count: usize,
     param_names: []const []const u8,
     return_type: []const u8,
+    /// V1 value-optional boxing: the DECLARED return TypeRef, un-erased. `return_type` (a string) is
+    /// `typeRefToString`, which flattens `int | undefined` → `"int"` — so it cannot tell a value-type
+    /// optional return from a plain value. This carries the real AST type so `return`-site produce-boxing
+    /// can detect `.optional(.prim)`. Null for lambdas/specializations/void (they don't return value-opts).
+    ret_type_ref: ?ast.TypeRef = null,
     body: ast.Block,
     // M3-C: async fns are lowered to LLVM coroutines. Defaults false so closure/
     // block synthetic FunctionInfos (which are never async) need no change.
@@ -248,6 +261,8 @@ pub const LlvmCompiler = struct {
     /// resolveExpressionTypeName; this exists so the two answers can be compared
     /// on every real expression before stage 4 makes the IR authoritative.
     /// Null unless NOVA_SEMA_SHADOW=1.
+    /// V1: value-optional boxing enabled for this compilation (copied from `valopt_box_enabled` at `new`).
+    valopt_box: bool = false,
     typed_ir: ?*const sema_infer.TypedIr = null,
     /// F2 stage 4b: read types from sema instead of re-deriving (NOVA_F2_TYPES=1).
     f2_types: bool = false,
@@ -403,6 +418,7 @@ pub const LlvmCompiler = struct {
             .closure_lambdas = .{},
             .current_saved_captures = std.StringHashMap(types.LLVMValueRef).init(allocator),
             .is_wasm = is_wasm,
+            .valopt_box = valopt_box_enabled,
             .coverage_enabled = coverage_enabled,
             .cov_registry = if (coverage_enabled) CoverageRegistry.init(allocator) else null,
             .current_string_builder = null,
@@ -639,6 +655,53 @@ pub const LlvmCompiler = struct {
         const fn_t = core.LLVMGlobalGetValueType(alloc_fn);
         var args = [_]types.LLVMValueRef{size};
         return core.LLVMBuildCall2(self.builder, fn_t, alloc_fn, &args, 1, "alloc_persistent_tmp");
+    }
+
+    // ===== V1: value-type optional boxing =====================================================
+    // A value-type optional (`.optional(.prim)` — int/long/float/double/bool) is represented as a
+    // BOXED pointer (or null = `undefined`), so a present `0`/`0.0`/`false` is a non-null box and thus
+    // distinguishable from absent. `!= undefined` stays a `!= 0` null-check (present is non-null);
+    // producers box the value, consumers (`??`/narrowing/`at`) unbox it. Pointer/decimal optionals are
+    // already heap-null-representable and are NOT boxed. See docs/design/value-optional-boxing.md.
+
+    /// If `tid` is a VALUE-TYPE optional (`.optional` whose inner is a `.prim`), return the inner
+    /// TypeId (the type to box/unbox); else null (pointer/decimal/struct optionals are unchanged).
+    pub fn valueOptionalInner(self: *LlvmCompiler, tid: sema_types.TypeId) ?sema_types.TypeId {
+        const st = self.type_store orelse return null;
+        const info = st.get(tid);
+        if (info != .optional) return null;
+        return switch (st.get(info.optional)) {
+            .prim => info.optional, // int/long/float/double/bool — a value type: box it
+            else => null, // string/decimal/struct/trait/ptr/enum: already pointer/null-representable
+        };
+    }
+
+    /// Box a value into a value-optional (present). `nova_valopt_box(value)` → non-null pointer.
+    pub fn buildValoptBox(self: *LlvmCompiler, value: types.LLVMValueRef) anyerror!types.LLVMValueRef {
+        const f = if (self.func_map.get("nova_valopt_box")) |g| g else blk: {
+            var at = [_]types.LLVMTypeRef{self.val_type};
+            const ft = core.LLVMFunctionType(self.val_type, &at, 1, 0);
+            const g = core.LLVMAddFunction(self.module, "nova_valopt_box", ft);
+            try self.func_map.put("nova_valopt_box", g);
+            break :blk g;
+        };
+        const ft = core.LLVMGlobalGetValueType(f);
+        var args = [_]types.LLVMValueRef{value};
+        return core.LLVMBuildCall2(self.builder, ft, f, &args, 1, "valopt_box");
+    }
+
+    /// Unbox a value-optional (assumes non-null; callers null-check first). `nova_valopt_unbox`.
+    pub fn buildValoptUnbox(self: *LlvmCompiler, box: types.LLVMValueRef) anyerror!types.LLVMValueRef {
+        const f = if (self.func_map.get("nova_valopt_unbox")) |g| g else blk: {
+            var at = [_]types.LLVMTypeRef{self.val_type};
+            const ft = core.LLVMFunctionType(self.val_type, &at, 1, 0);
+            const g = core.LLVMAddFunction(self.module, "nova_valopt_unbox", ft);
+            try self.func_map.put("nova_valopt_unbox", g);
+            break :blk g;
+        };
+        const ft = core.LLVMGlobalGetValueType(f);
+        var args = [_]types.LLVMValueRef{box};
+        return core.LLVMBuildCall2(self.builder, ft, f, &args, 1, "valopt_unbox");
     }
 
     // A1 heap-environment closures ------------------------------------------
@@ -2167,7 +2230,30 @@ pub const LlvmCompiler = struct {
                     },
                 };
 
-                const lambda_return_type: []const u8 = if (is_void_lambda) "void" else "i32";
+                var lambda_return_type: []const u8 = if (is_void_lambda) "void" else "i32";
+                // If the checker typed this closure (from its expected context — a
+                // `(ServiceProvider) -> Service` factory slot) as returning a TRAIT, carry that trait
+                // name as the lambda's return type. The hardcoded "i32" otherwise left
+                // `self.traits.contains(func.return_type)` FALSE in the return-statement trait-widening
+                // (statements.zig), so a lambda returning a concrete impl was returned UNWIDENED (a raw
+                // struct, not the fat pointer) and the caller's `x as Concrete` downcast crashed. Named
+                // fns already carry their real return type; this closes the lambda-only gap. Pairs with
+                // the infer.zig fix that records the closure's return AS the trait. Strictly additive:
+                // falls back to "i32" when the closure's type is unknown or non-trait.
+                if (!is_void_lambda) {
+                    if (self.typed_ir) |ir| {
+                        if (self.type_store) |st| {
+                            if (ir.typeOf(&expr)) |tid| {
+                                const info = st.get(tid);
+                                if (info == .func and st.get(info.func.ret) == .trait_) {
+                                    if (sema_shadow.renderLegacy(self.allocator, st, info.func.ret)) |tn| {
+                                        lambda_return_type = tn;
+                                    } else |_| {}
+                                }
+                            }
+                        }
+                    }
+                }
 
                 const lambda_name = try std.fmt.allocPrint(self.allocator, "__lambda_{d}", .{self.next_lambda_id});
                 self.next_lambda_id += 1;
@@ -2276,6 +2362,15 @@ pub const LlvmCompiler = struct {
             .block_expr => |be| {
                 try self.collectClosuresFromBlock(be);
             },
+            // `??` — a closure literal on either side (a default factory
+            // `map.get(k) ?? ((sp) => ServiceImpl())`) must be collected, else it is never
+            // registered and compiling it raises LambdaNotFound. This arm was missing.
+            .nullish_coalesce => |nc| {
+                try self.collectClosuresFromExpr(nc.left.*);
+                try self.collectClosuresFromExpr(nc.right.*);
+            },
+            // A closure inside a cast (`(() => ...) as T`).
+            .cast => |c| try self.collectClosuresFromExpr(c.expr.*),
             else => {},
         }
     }
@@ -2642,6 +2737,9 @@ pub const LlvmCompiler = struct {
                                     .param_count = if (is_constructor) fn_decl.params.len + 1 else fn_decl.params.len,
                                     .param_names = param_names,
                                     .return_type = spec_ret,
+                                    // The ORIGINAL `V | undefined` TypeRef; the installed `method_subst`
+                                    // substitutes V→concrete when the return site lowers it (V1 produce-box).
+                                    .ret_type_ref = fn_decl.ret_type,
                                     .body = fn_decl.body,
                                     .is_async = fn_decl.is_async,
                                     .instantiation = inst_opt,
@@ -2664,6 +2762,7 @@ pub const LlvmCompiler = struct {
                                 .param_count = if (is_constructor) fn_decl.params.len + 1 else fn_decl.params.len,
                                 .param_names = param_names,
                                 .return_type = if (fn_decl.ret_type) |ret| try self.typeRefToString(ret) else "void",
+                                .ret_type_ref = fn_decl.ret_type,
                                 .body = fn_decl.body,
                                 .is_async = fn_decl.is_async,
                                 .instantiation = inst_opt,
@@ -2703,6 +2802,7 @@ pub const LlvmCompiler = struct {
                         .param_count = if (is_constructor) fn_decl.params.len + 1 else fn_decl.params.len,
                         .param_names = param_names,
                         .return_type = if (fn_decl.ret_type) |ret| try self.typeRefToString(ret) else "void",
+                        .ret_type_ref = fn_decl.ret_type,
                         .body = fn_decl.body,
                         .is_async = fn_decl.is_async,
                         .source_file = fn_decl.span.file,
@@ -2744,6 +2844,7 @@ pub const LlvmCompiler = struct {
                     .param_count = fn_decl.params.len,
                     .param_names = param_names,
                     .return_type = if (fn_decl.ret_type) |ret| try self.typeRefToString(ret) else "void",
+                    .ret_type_ref = fn_decl.ret_type,
                     .body = fn_decl.body,
                     .is_async = fn_decl.is_async,
                     .source_file = fn_decl.span.file,

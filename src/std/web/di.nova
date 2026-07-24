@@ -1,32 +1,32 @@
-// di.nova — Standard Dependency Injection (DI) Container
+// di.nova — Standard Dependency Injection (DI) Container (ASP.NET-style)
 import map;
 
+/// The marker every DI-registrable service implements. The container stores services as `Service`
+/// trait OBJECTS — a fat pointer `{struct_ptr, vtable}` that is OWNED (ARC co-owns the wrapped
+/// struct; its destructor releases it). This is why the container correctly RETAINS a heap service
+/// parked in its singleton cache and frees it with the provider. A concrete service is widened to
+/// `Service` automatically when passed/returned where `Service` is expected; recover it with a
+/// downcast: `let db = svc as PgConnection;`.
 pub trait Service {
 }
 
-/// What `resolve` returns: the service, or WHY it could not be produced.
-///
-/// This is the shape `T | Error` (specs §3.4b) will give you with less ceremony — the type-level
-/// half parses today, but the VALUE half (representation, `is`, `try`/`catch`) is not built, so
-/// this is written out longhand. It is not throwaway: `any | DiError` compiles into exactly this.
-///
-/// It exists because `resolve` used to `throw "DI Error: Service not registered: " + key`, and the
-/// caller received the integer **8472** — the string pointer truncated to i32 (§5.5). The key was
-/// destroyed at the throw. The interim after `throw` was removed returned bare `undefined`, which
-/// was honest but told the caller nothing. **A variant with a payload is what makes the reason
-/// survive** — the union is not what makes it survive, only what makes it ergonomic.
+// Lifetime of a registration. SINGLETON: one instance for the whole provider. SCOPED: one instance
+// per request scope (see `ServiceScope`). TRANSIENT: a fresh instance on every resolve.
+// Codes are 1-based on purpose: a value of 0 stored in `Map<string, int>` reads back as `undefined`
+// (the value-type optional uses 0 as its absent sentinel), so 0 must never be a real code.
+pub const LIFETIME_SINGLETON: int = 1;
+pub const LIFETIME_SCOPED: int = 2;
+pub const LIFETIME_TRANSIENT: int = 3;
+
+/// What `resolve` returns: the service, or WHY it could not be produced. The `T | Error` shape
+/// (specs §3.4b) written out longhand — a variant with a payload so the reason survives back to the
+/// caller (a bare `throw`/`undefined` lost the key).
 pub enum Resolved {
-    Ok(any),
+    Ok(Service),
     NotRegistered(string),
 }
 
 /// A human-readable reason, for logs and 500 bodies.
-///
-/// Hand-written for now. It SHOULD be derived: `@serializable` already generates
-/// `<Struct>__toJson` by emitting source and reparsing it (`main.zig:250`), and the same machinery
-/// can generate `<Enum>__toString` from the variant name + payload. Deriving matters more than it
-/// looks — an optional hand-written `toString` is one a developer forgets, and then the log says
-/// nothing and you are back to `8472` with extra steps. Tracked with the error model (P2-13).
 pub fn resolvedReason(r: Resolved): string {
     switch (r) {
         case Resolved.Ok(v): { return "ok"; }
@@ -35,77 +35,162 @@ pub fn resolvedReason(r: Resolved): string {
     return "unknown";
 }
 
-pub struct ServiceProvider {
-    pub factories: Map<string, (ServiceProvider) -> any>,
-    pub singletons: Map<string, any>,
-    pub singleton_keys: Map<string, bool>,
+// The unreachable fallback for the `require` trap path (a trait return needs a concrete value even on
+// the dead branch, exactly as `Map.at` returns a dummy after `nova_panic`).
+struct NullService impl Service {
+}
 
-    init(factories: Map<string, (ServiceProvider) -> any>, singletons: Map<string, any>, singleton_keys: Map<string, bool>) {
+pub struct ServiceProvider {
+    pub factories: Map<string, (ServiceProvider) -> Service>,
+    pub singletons: Map<string, Service>,   // the singleton cache (one instance per key)
+    pub lifetimes: Map<string, int>,        // key -> LIFETIME_*
+
+    init(factories: Map<string, (ServiceProvider) -> Service>, singletons: Map<string, Service>, lifetimes: Map<string, int>) {
         self.factories = factories;
         self.singletons = singletons;
-        self.singleton_keys = singleton_keys;
+        self.lifetimes = lifetimes;
     }
 
-    /// Resolve a service, or say why not.
-    ///
-    /// ⚠️ The caller MUST annotate the binding — `let r: Resolved = p.resolve(k);` — before
-    /// switching on it. Payload binding silently fails when the switch discriminant is an
-    /// UNANNOTATED local (it works for a parameter or a call result): `is_tagged_union` is computed
-    /// from `resolveExpressionTypeName(&ss.discriminant)` (`statements.zig`), and `let r = ...`
-    /// does not infer to `Resolved`, so the gate is false and the binding never happens — you get
-    /// `Identifier 'k' not found` at compile time. Loud, not silent, but real. Tracked as §8.E.
+    /// Resolve a service, or say why not. ⚠️ Annotate the binding — `let r: Resolved = p.resolve(k);`
+    /// — before switching on it (an unannotated `let r = ...` does not infer to `Resolved`). SCOPED
+    /// services resolved through the root provider (no scope) behave as TRANSIENT — use a
+    /// `ServiceScope` (`createScope`) for real per-request lifetime.
     pub fn resolve(self: ServiceProvider, key: string): Resolved {
-        // 1. Check if it's already instantiated as a singleton
         let cached = self.singletons.get(key);
         if (cached != undefined) {
             return Resolved.Ok(cached);
         }
-
-        // 2. Fetch the factory
         let factory = self.factories.get(key);
         if (factory == undefined) {
-            // Was: `throw "DI Error: Service not registered: " + key;` — which the caller received
-            // as the integer 8472 (§5.5). Then, briefly, a bare `undefined` — honest, but it told
-            // the caller nothing. Now the KEY travels back to the caller inside the variant, so it
-            // can be logged, put in a 500 body, or both. That is the whole requirement.
             return Resolved.NotRegistered(key);
         }
-
-        // 3. Resolve the service
         let instance = factory(self);
-
-        // 4. Cache if it's a singleton
-        let is_singleton = self.singleton_keys.get(key);
-        if (is_singleton == true) {
+        let lt = self.lifetimes.get(key) ?? LIFETIME_TRANSIENT;
+        if (lt == LIFETIME_SINGLETON) {
             self.singletons.set(key, instance);
         }
-
         return Resolved.Ok(instance);
+    }
+
+    /// Resolve a service the caller KNOWS is registered, returning it directly (no `Resolved` to
+    /// unwrap) — the ergonomic form for constructor injection: `GetUserHandler(sp.require("Db") as Db)`.
+    /// A missing registration is a configuration bug, so this TRAPS (loud located abort).
+    pub fn require(self: ServiceProvider, key: string): Service {
+        let r: Resolved = self.resolve(key);
+        switch (r) {
+            case Resolved.Ok(v): { return v; }
+            case Resolved.NotRegistered(k): { nova_panic("DI: required service not registered"); }
+        }
+        return NullService{}; // unreachable — nova_panic exits; satisfies the Service return type
+    }
+
+    /// Resolve by TYPE — the type-keyed form, keyed on `serde.typeName<T>()` (the same key
+    /// `addSingleton<T>`/`app.get<T>` use): `let db = sp.resolveType<Db>() as Db;`.
+    pub fn resolveType<T>(self: ServiceProvider): Service {
+        return self.require(serde.typeName<T>());
+    }
+
+    /// Open a per-request scope. SCOPED services resolve to one instance per scope; singletons still
+    /// come from the root; transients are always fresh.
+    pub fn createScope(self: ServiceProvider): ServiceScope {
+        return ServiceScope(self);
+    }
+}
+
+/// A per-request resolution scope. SCOPED services are built once per scope and cached here;
+/// singletons resolve from (and cache in) the root provider; transients are always fresh. Drop the
+/// scope at end of request to release its scoped instances.
+pub struct ServiceScope {
+    pub root: ServiceProvider,
+    pub scoped: Map<string, Service>,
+
+    init(root: ServiceProvider) {
+        self.root = root;
+        self.scoped = Map<string, Service>(16, string.hash);
+    }
+
+    pub fn resolve(self: ServiceScope, key: string): Resolved {
+        let s = self.scoped.get(key);
+        if (s != undefined) {
+            return Resolved.Ok(s);
+        }
+        let cached = self.root.singletons.get(key);
+        if (cached != undefined) {
+            return Resolved.Ok(cached);
+        }
+        let factory = self.root.factories.get(key);
+        if (factory == undefined) {
+            return Resolved.NotRegistered(key);
+        }
+        let instance = factory(self.root);
+        let lt = self.root.lifetimes.get(key) ?? LIFETIME_TRANSIENT;
+        if (lt == LIFETIME_SINGLETON) {
+            self.root.singletons.set(key, instance);
+        } else if (lt == LIFETIME_SCOPED) {
+            self.scoped.set(key, instance);
+        }
+        return Resolved.Ok(instance);
+    }
+
+    pub fn require(self: ServiceScope, key: string): Service {
+        let r: Resolved = self.resolve(key);
+        switch (r) {
+            case Resolved.Ok(v): { return v; }
+            case Resolved.NotRegistered(k): { nova_panic("DI: required service not registered"); }
+        }
+        return NullService{};
+    }
+
+    pub fn resolveType<T>(self: ServiceScope): Service {
+        return self.require(serde.typeName<T>());
     }
 }
 
 pub struct ServiceCollection {
-    pub factories: Map<string, (ServiceProvider) -> any>,
-    pub singletons: Map<string, any>,
-    pub singleton_keys: Map<string, bool>,
+    pub factories: Map<string, (ServiceProvider) -> Service>,
+    pub singletons: Map<string, Service>,
+    pub lifetimes: Map<string, int>,
 
     init() {
-        self.factories = Map<string, (ServiceProvider) -> any>(32, string.hash);
-        self.singletons = Map<string, any>(32, string.hash);
-        self.singleton_keys = Map<string, bool>(32, string.hash);
+        self.factories = Map<string, (ServiceProvider) -> Service>(32, string.hash);
+        self.singletons = Map<string, Service>(32, string.hash);
+        self.lifetimes = Map<string, int>(32, string.hash);
     }
 
-    pub fn addSingleton(self: ServiceCollection, key: string, factory: (ServiceProvider) -> any): void {
+    // ---- string-keyed registration (the low-level form) -------------------------------------------
+
+    pub fn addSingleton(self: ServiceCollection, key: string, factory: (ServiceProvider) -> Service): void {
         self.factories.set(key, factory);
-        self.singleton_keys.set(key, true);
+        self.lifetimes.set(key, LIFETIME_SINGLETON);
     }
 
-    pub fn addTransient(self: ServiceCollection, key: string, factory: (ServiceProvider) -> any): void {
+    pub fn addScoped(self: ServiceCollection, key: string, factory: (ServiceProvider) -> Service): void {
         self.factories.set(key, factory);
-        self.singleton_keys.set(key, false);
+        self.lifetimes.set(key, LIFETIME_SCOPED);
+    }
+
+    pub fn addTransient(self: ServiceCollection, key: string, factory: (ServiceProvider) -> Service): void {
+        self.factories.set(key, factory);
+        self.lifetimes.set(key, LIFETIME_TRANSIENT);
+    }
+
+    // ---- type-keyed registration (the ergonomic form) ---------------------------------------------
+    // The key is derived from `serde.typeName<T>()` — the SAME key `sp.resolveType<T>()` and
+    // `app.get<T>` use — so registration and resolution always agree by type.
+
+    pub fn addSingletonType<T>(self: ServiceCollection, factory: (ServiceProvider) -> Service): void {
+        self.addSingleton(serde.typeName<T>(), factory);
+    }
+
+    pub fn addScopedType<T>(self: ServiceCollection, factory: (ServiceProvider) -> Service): void {
+        self.addScoped(serde.typeName<T>(), factory);
+    }
+
+    pub fn addTransientType<T>(self: ServiceCollection, factory: (ServiceProvider) -> Service): void {
+        self.addTransient(serde.typeName<T>(), factory);
     }
 
     pub fn buildServiceProvider(self: ServiceCollection): ServiceProvider {
-        return ServiceProvider(self.factories, self.singletons, self.singleton_keys);
+        return ServiceProvider(self.factories, self.singletons, self.lifetimes);
     }
 }
