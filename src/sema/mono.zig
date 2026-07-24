@@ -148,6 +148,47 @@ pub fn noteMethodInst(
     method_insts.append(a, .{ .inst_name = inst_name, .method = a.dupe(u8, method) catch return, .params = pbuf, .args = abuf }) catch {};
 }
 
+/// A FREE generic function called with concrete type-args — `maybe<int>(..)`. The direct analogue of
+/// `MethodInst` but with NO receiver: keyed on `(fn_name, args)`. Codegen emits one specialized body
+/// per entry (`maybe__int`) with `current_method_subst = {param->arg}`, so a value-representation-
+/// dependent return (`T | undefined` where T is a value type → BOXED, V1) is compiled correctly — the
+/// erased single body cannot, because it doesn't know whether T is a value or a pointer.
+pub const FreeFnInst = struct {
+    fn_name: []const u8, // "maybe"  (the free fn's source name, as codegen matches fn_decl.name)
+    params: []const []const u8, // ["T"]      (the fn's own type-params)
+    args: []const []const u8, // ["int"]    (solved concrete, positional with params)
+};
+pub var free_fn_insts: std.ArrayListUnmanaged(FreeFnInst) = .empty;
+
+/// Record a free generic fn instantiation from the checker's `.generic_call` arm (infer.zig), where
+/// the fn name, its type-params, and the solved concrete args are all in hand. Mirrors `noteMethodInst`
+/// (dedup on (fn_name, args); page-allocator, worklist-lifetime dupes).
+pub fn noteFreeFnInst(
+    store: *types.TypeStore,
+    fn_name: []const u8,
+    params: []const []const u8,
+    args: []const TypeId,
+) void {
+    const a = std.heap.page_allocator;
+    const abuf = a.alloc([]const u8, args.len) catch return;
+    for (args, 0..) |at, i| {
+        const ar = render.renderLegacy(a, store, at) catch return;
+        abuf[i] = a.dupe(u8, ar) catch return;
+    }
+    for (free_fn_insts.items) |fi| {
+        if (!std.mem.eql(u8, fi.fn_name, fn_name)) continue;
+        if (fi.args.len != abuf.len) continue;
+        var same = true;
+        for (fi.args, abuf) |old, new| {
+            if (!std.mem.eql(u8, old, new)) same = false;
+        }
+        if (same) return; // already recorded
+    }
+    const pbuf = a.alloc([]const u8, params.len) catch return;
+    for (params, 0..) |p, i| pbuf[i] = a.dupe(u8, p) catch return;
+    free_fn_insts.append(a, .{ .fn_name = a.dupe(u8, fn_name) catch return, .params = pbuf, .args = abuf }) catch {};
+}
+
 /// Monomorphization is NOT OPTIONAL, and there is deliberately no way to switch it off.
 ///
 /// It shipped behind `NOVA_F4_MONO=1` while it was only an optimisation of ARC's

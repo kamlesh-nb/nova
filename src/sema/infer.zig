@@ -1376,7 +1376,15 @@ pub const Inferer = struct {
                             self.lowerer.param_scopes = &scope;
                             const raw = try self.lowerer.lower(ret);
                             const sub = try subst.substitute(self.store, raw, fid, args);
-                            if (self.store.get(sub) != .unresolved) return self.ok(sub);
+                            if (self.store.get(sub) != .unresolved) {
+                                // Record the free-fn instantiation so codegen emits a specialized body
+                                // (`maybe__int`) with T→concrete — needed for value-representation-
+                                // dependent returns (`T | undefined`, V1 boxing) the erased body can't do.
+                                if (fd.type_params.len > 0 and args.len == fd.type_params.len) {
+                                    mono.noteFreeFnInst(self.store, n, fd.type_params, args);
+                                }
+                                return self.ok(sub);
+                            }
                         }
                     }
                 }

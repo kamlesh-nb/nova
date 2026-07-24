@@ -52,3 +52,15 @@ fn test_optional_return_substituted(): void {
     let none = maybe<int>(5, false) ?? -1;
     assert.equalInt(none, -1);
 }
+
+@test
+fn test_generic_optional_value_zero(): void {
+    // FREE-FN MONOMORPHIZATION + V1: a generic free fn returning `T | undefined` is now specialized
+    // per type-arg (`maybe__int`), so a value-typed optional return is BOXED — a present `0` is
+    // distinct from `undefined`. Before free-fn mono the erased body collapsed them (present-0 read
+    // as absent). Present-0 must survive; a real miss must still be absent.
+    assert.zero(maybe<int>(0, true) ?? 99);          // present 0 → 0, NOT the default
+    assert.equalInt(maybe<int>(0, false) ?? 99, 99); // genuine miss → default
+    let got = maybe<int>(0, true);
+    if (got != undefined) { assert.zero(got); } else { assert.fail("present-0 wrongly absent"); }
+}

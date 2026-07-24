@@ -79,12 +79,15 @@ arithmetic — `int? % int = int?` — even though the VALUE is already raw):
   boxes are retained/released by the existing machinery, freed once — no leak (audited).
 - NULL-CHECK (`!= undefined`/`== undefined`) is unchanged: present box is non-null, absent is 0.
 
-**Known limitation (pre-existing erasure, NOT a V1 regression):** a FREE generic fn returning
-`T | undefined` (e.g. `maybe<T>`) is type-ERASED — one body for all `T`, so it cannot box a value-typed
-return, and it collapses a present `0` with `undefined` internally. V1 treats such a `.generic_call`
-result as a RAW value (no unbox, no crash); non-zero present values and `undefined` are correct, only a
-present `0` from such a fn reads as absent. The monomorphized container methods (`Map`/`List.get`) — the
-actual soundness fix — are `.call` and fully correct. Closing this needs free-fn monomorphization.
+**Erasure gap — CLOSED (2026-07-24, follow-up).** A FREE generic fn returning `T | undefined`
+(`maybe<T>`) was type-erased — one body for all `T`, so it couldn't box a value-typed return and
+collapsed present-`0` with `undefined`. **Fixed by free-fn monomorphization** (mirrors struct-method
+mono): a new `sema_mono.free_fn_insts` worklist (recorded at the checker's free-fn `.generic_call` arm,
+`infer.zig`), a Pass-2 emission loop that emits `maybe__int` per instantiation with `method_subst`
+{T→concrete} + `ret_type_ref`, and a call-site resolver in the `.generic_call` arm that prefers the
+spec. Now the spec body boxes (`T | undefined` renders `int | undefined` under the subst → value-optional
+→ box), and `exprYieldsValoptBox` treats a `.generic_call` as box-yielding again. Gate:
+`119_generic_return::test_generic_optional_value_zero` (present-0 survives). Corpus 153/153, ASAN 280/280.
 
 ---
 

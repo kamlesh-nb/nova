@@ -719,15 +719,13 @@ pub const LlvmCompiler = struct {
         const tid = self.typeOfExprConcrete(e) orelse return false;
         if (self.valueOptionalInner(tid) == null) return false;
         return switch (e.kind) {
-            // A `.call`/`.index`/`.field`/`.ident` that is a value-optional materializes a BOX (its
-            // producer boxed the return, or the slot/field holds one). A `.generic_call` does NOT:
-            // free generic fns are type-ERASED (one body for all T, no per-instantiation boxing), so a
-            // `maybe<int>(..): T | undefined` returns the RAW word — treating it as a box would unbox a
-            // raw value and `nova_release` it as a pointer. (The present-`0`-vs-`undefined` collapse for
-            // such erased generic returns is a pre-existing erasure limitation, not a V1 regression; the
-            // monomorphized container methods — Map/List `.get`, the real soundness fix — are `.call`.)
-            .ident, .field_access, .call, .index, .optional_chaining => true,
-            else => false, // generic_call / binary / unary / cast / ?? / if-expr / literal: already raw
+            // A value-optional-typed LEAF materializes a BOX: a `.call`/`.generic_call` boxed its return
+            // (container methods `Map`/`List.get` are `.call`; a monomorphized generic free fn `maybe<int>`
+            // is `.generic_call` and now ALSO boxes — free-fn mono), or an ident/field/index slot holds one.
+            // A COMPOUND expression (`x % 2`, `a ?? b`, cast) yields a RAW value even when the checker types
+            // it `int?` (optionality propagates through arithmetic) — unboxing it would deref a raw int.
+            .ident, .field_access, .call, .generic_call, .index, .optional_chaining => true,
+            else => false, // binary / unary / cast / ?? / if-expr / literal: already raw
         };
     }
 
@@ -2940,6 +2938,59 @@ pub const LlvmCompiler = struct {
                     .source_file = fn_decl.span.file,
                 };
                 try self.functions.append(self.allocator, info);
+
+                // FREE-FN MONOMORPHIZATION: for a generic free fn, emit one SPECIALIZED body per recorded
+                // (fn × concrete-args) instantiation — `maybe__int` — exactly as struct methods do (Pass 1
+                // above). The erased base stays (inferred-arg `.call`s still route to it, DCE drops it if
+                // dead). Inside each spec, `current_method_subst` binds T→concrete, so a value-representation-
+                // dependent return (`T | undefined` → BOXED when T is a value type, V1) compiles correctly —
+                // which the erased single body cannot (it doesn't know if T is a value or a pointer).
+                if (fn_decl.type_params.len > 0) {
+                    for (sema_mono.free_fn_insts.items) |fi| {
+                        if (!std.mem.eql(u8, fi.fn_name, fn_decl.name)) continue;
+                        if (fi.params.len != fn_decl.type_params.len) continue;
+
+                        const subst = try self.allocator.alloc(MethodParamBinding, fi.params.len);
+                        for (fi.params, fi.args, 0..) |pn, an, i| {
+                            subst[i] = .{ .name = pn, .concrete = an };
+                        }
+
+                        // Specialized symbol: `<emitted base name>` ++ "__" ++ mangled args (mirrors the
+                        // struct-method spec name AND the call-site resolver in the `.generic_call` arm).
+                        var nb = std.ArrayListUnmanaged(u8).empty;
+                        try nb.appendSlice(self.allocator, name);
+                        for (fi.args) |an| {
+                            const ma = try types_mod.mangleTypeName(self.allocator, an);
+                            defer self.allocator.free(ma);
+                            try nb.appendSlice(self.allocator, "__");
+                            try nb.appendSlice(self.allocator, ma);
+                        }
+                        const spec_name = try nb.toOwnedSlice(self.allocator);
+
+                        const spec_params = try self.allocator.alloc([]const u8, fn_decl.params.len);
+                        for (fn_decl.params, 0..) |p, i| spec_params[i] = p.name;
+
+                        // Render the return type with method_subst installed so `T | undefined` → the
+                        // concrete `int | undefined` string (the `.optional` is erased by typeRefToString,
+                        // but the return SITE reads `ret_type_ref` + the subst, so boxing still fires).
+                        const prev_ms = self.current_method_subst;
+                        self.current_method_subst = subst;
+                        const spec_ret = if (fn_decl.ret_type) |ret| try self.typeRefToString(ret) else "void";
+                        self.current_method_subst = prev_ms;
+
+                        try self.functions.append(self.allocator, .{
+                            .name = spec_name,
+                            .param_count = fn_decl.params.len,
+                            .param_names = spec_params,
+                            .return_type = spec_ret,
+                            .ret_type_ref = fn_decl.ret_type,
+                            .body = fn_decl.body,
+                            .is_async = fn_decl.is_async,
+                            .method_subst = subst,
+                            .source_file = fn_decl.span.file,
+                        });
+                    }
+                }
             }
         }
     }

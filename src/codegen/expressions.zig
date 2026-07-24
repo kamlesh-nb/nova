@@ -2925,16 +2925,42 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 }
 
                 const resolved_name = try self.resolveCalleeName(name);
-                const fn_val = self.func_map.get(resolved_name) orelse {
-                    std.debug.print("Function '{s}' not found\n", .{resolved_name});
+                // FREE-FN MONOMORPHIZATION: prefer the specialized body `maybe__int` when it exists (built
+                // the same way the emission loop names it — `<resolved base>__<mangled type-arg>`), so a
+                // generic free fn compiles with T→concrete (value-optional returns box correctly, V1).
+                // Falls back to the erased base when no spec was emitted (inferred-arg / non-generic).
+                var callee_name = resolved_name;
+                var spec_buf: ?[]const u8 = null;
+                defer if (spec_buf) |s| self.allocator.free(s);
+                if (gc.type_args.len > 0) {
+                    var nb = std.ArrayListUnmanaged(u8).empty;
+                    errdefer nb.deinit(self.allocator);
+                    try nb.appendSlice(self.allocator, resolved_name);
+                    for (gc.type_args) |ta| {
+                        const rendered = try self.typeRefToString(ta);
+                        const ma = try types_mod.mangleTypeName(self.allocator, rendered);
+                        defer self.allocator.free(ma);
+                        try nb.appendSlice(self.allocator, "__");
+                        try nb.appendSlice(self.allocator, ma);
+                    }
+                    const cand = try nb.toOwnedSlice(self.allocator);
+                    if (self.func_map.contains(cand)) {
+                        spec_buf = cand;
+                        callee_name = cand;
+                    } else {
+                        self.allocator.free(cand);
+                    }
+                }
+                const fn_val = self.func_map.get(callee_name) orelse {
+                    std.debug.print("Function '{s}' not found\n", .{callee_name});
                     return error.FunctionNotFound;
                 };
 
-                // Compile arguments
+                // Compile arguments (compileCallArgument applies the V1 value-optional consume-unbox).
                 const args = try self.allocator.alloc(types.LLVMValueRef, gc.args.len);
                 defer self.allocator.free(args);
                 for (gc.args, 0..) |arg, idx| {
-                    args[idx] = try self.compileExpression(arg);
+                    args[idx] = try self.compileCallArgument(arg);
                 }
 
                 return try self.buildCallWithCasts(fn_val, args);
