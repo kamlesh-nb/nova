@@ -3773,6 +3773,62 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             self.consumeTemporary(hv);
             return result;
         },
+        .optional_chaining => |oc| {
+            // `a?.b` — short-circuit field access: if `a` is `undefined` (0) the whole thing is
+            // `undefined`, else load `a.b`. Result is `TypeOf(b) | undefined`. `a` is evaluated ONCE
+            // (a call `f()?.x` must not run `f` twice). Chains `a?.b?.c` nest: `oc.object` is itself an
+            // optional_chaining, compiled recursively into a box-or-null.
+            const current_fn = core.LLVMGetBasicBlockParent(core.LLVMGetInsertBlock(self.builder));
+            const obj_raw = self.coerceToSlotType(try self.compileExpression(oc.object.*), self.val_type);
+            // A value-optional object arrives BOXED; unwrap to the underlying pointer for the null test
+            // and field load. A struct-typed optional is already a plain pointer-or-null.
+            const obj_ptr = if (self.exprYieldsValoptBox(oc.object)) try self.buildValoptUnbox(obj_raw) else obj_raw;
+
+            const field_bb = core.LLVMAppendBasicBlock(current_fn, "oc_field");
+            const null_bb = core.LLVMAppendBasicBlock(current_fn, "oc_null");
+            const merge_bb = core.LLVMAppendBasicBlock(current_fn, "oc_merge");
+            const present = core.LLVMBuildICmp(self.builder, types.LLVMIntPredicate.LLVMIntNE, obj_ptr, core.LLVMConstInt(self.val_type, 0, 0), "oc_present");
+            _ = core.LLVMBuildCondBr(self.builder, present, field_bb, null_bb);
+
+            // present: load the field off the (non-null) object
+            core.LLVMPositionBuilderAtEnd(self.builder, field_bb);
+            const obj_type = (try self.resolveExpressionTypeName(oc.object)) orelse return error.StructTypeNotFound;
+            const base_struct = getStructBaseName(obj_type);
+            var field_type_ref = ast.TypeRef{ .ident = "i32" };
+            if (self.structs.get(base_struct)) |s| {
+                for (s.fields) |field| {
+                    if (std.mem.eql(u8, field.name, oc.field)) {
+                        field_type_ref = field.type_name;
+                        break;
+                    }
+                }
+            }
+            const offset = try self.getFieldOffset(base_struct, oc.field);
+            const addr = core.LLVMBuildAdd(self.builder, obj_ptr, core.LLVMConstInt(self.val_type, offset, 0), "oc_addr");
+            const llvm_ft = self.toLLVMType(field_type_ref);
+            const fptr = core.LLVMBuildIntToPtr(self.builder, addr, core.LLVMPointerType(llvm_ft, 0), "oc_fptr");
+            const raw = core.LLVMBuildLoad2(self.builder, llvm_ft, fptr, "oc_val");
+            var field_val = self.coerceToSlotType(self.castToValType(raw, field_type_ref), self.val_type);
+            // V1: a VALUE-typed field must be BOXED so a present 0 is distinct from absent (0). The
+            // consumer (`??`, `let x: T? = ...`) unboxes — exprYieldsValoptBox already lists .optional_chaining.
+            const oc_tid = if (self.typed_ir) |ir| ir.typeOf(&expr) else null;
+            if (oc_tid) |t| {
+                if (self.valueOptionalInner(t) != null) field_val = try self.buildValoptBox(field_val);
+            }
+            _ = core.LLVMBuildBr(self.builder, merge_bb);
+            const field_bb_end = core.LLVMGetInsertBlock(self.builder);
+
+            // absent: the whole chain is undefined (0)
+            core.LLVMPositionBuilderAtEnd(self.builder, null_bb);
+            _ = core.LLVMBuildBr(self.builder, merge_bb);
+
+            core.LLVMPositionBuilderAtEnd(self.builder, merge_bb);
+            const phi = core.LLVMBuildPhi(self.builder, self.val_type, "oc_phi");
+            var iv = [_]types.LLVMValueRef{ field_val, core.LLVMConstInt(self.val_type, 0, 0) };
+            var ib = [_]types.LLVMBasicBlockRef{ field_bb_end, null_bb };
+            core.LLVMAddIncoming(phi, &iv, &ib, 2);
+            return phi;
+        },
         .nullish_coalesce => |nc| {
             const current_fn = core.LLVMGetBasicBlockParent(core.LLVMGetInsertBlock(self.builder));
             // A7 / F3 §5 stage 4: the null check and the phi are on the i64 ABI word.

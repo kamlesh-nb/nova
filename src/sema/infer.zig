@@ -1000,7 +1000,28 @@ pub const Inferer = struct {
                 return self.unresolved("field_access");
             },
             .optional_chaining => |o| {
-                _ = try self.inferExpr(o.object);
+                // `a?.b` — sees THROUGH an optional `a`: unwrap `T | undefined` → `T`, resolve field `b`
+                // on `T`, and re-wrap the result optional (absent `a` ⇒ absent result). Result type
+                // `TypeOf(b) | undefined`; a VALUE-typed `b` boxes via V1 (exprYieldsValoptBox already
+                // lists `.optional_chaining`), so a present `0` is distinct from absent.
+                const obj_t = try self.inferExpr(o.object);
+                self.stats.typed -|= 1;
+                var struct_tid = obj_t;
+                if (self.store.get(obj_t) == .optional) struct_tid = self.store.get(obj_t).optional;
+                const st = self.store.get(struct_tid);
+                if (st == .struct_) {
+                    const sym = self.symtab.symbolAt(st.struct_.decl);
+                    if (sym.decl == .struct_) {
+                        for (sym.decl.struct_.fields) |f| {
+                            if (std.mem.eql(u8, f.name, o.field)) {
+                                const ft = try self.lowerInStructScope(st.struct_, f.type_name);
+                                // Idempotent: an already-optional field stays single-wrapped.
+                                if (self.store.get(ft) == .optional) return self.ok(ft);
+                                return self.ok(try self.store.intern(.{ .optional = ft }));
+                            }
+                        }
+                    }
+                }
                 return self.unresolved("optional_chaining");
             },
             .nullish_coalesce => |n| {

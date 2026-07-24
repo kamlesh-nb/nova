@@ -284,7 +284,12 @@ fn principledDisposition(self: *LlvmCompiler, expr: *const ast.Expression) Dispo
         // Acquired by their OWN compile arm (or ownership handled by another lowering) — must
         // not be auto-registered too, or the +1 is released twice (the `.try_expr`/`.cast`
         // double-register hazard the whitelist comment documents).
-        .try_expr, .cast, .await_expr, .go_expr, .optional_chaining => return .borrowed,
+        .try_expr, .cast, .await_expr, .go_expr => return .borrowed,
+        // `a?.b`: a REFERENCE field is borrowed from the object (releasing it would double-free the
+        // object's field). But a VALUE field is BOXED (V1, `nova_valopt_box`, a fresh rc=1 ARC object)
+        // so a present 0 is distinct from absent — that box is OWNED and must be drained (null dtor:
+        // the drain's nova_release just frees the 8 bytes). Mirrors the value-optional `.call` (Map.get).
+        .optional_chaining => return if (self.exprYieldsValoptBox(expr)) .owned else .borrowed,
         // `.if_expr` IS an owned producer when its result type is managed: the phi SELECTS one
         // branch's value and that value becomes the result temp. The per-edge move/dup is done in
         // the if_expr arm (each branch calls `takeOwnedElement` on its own value — retain a borrowed
