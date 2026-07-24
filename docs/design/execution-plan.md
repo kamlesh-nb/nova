@@ -1708,15 +1708,21 @@ tracking, no migrations (those are explicit non-goals, roadmap §6).
   papering over their absence.
 
 **Definition of Done:**
-- [ ] `RowSource`/`DocSource impl ValueSource`; `conn.query<T>(sql, params): List<T>` materializes typed rows via the
-      existing `<T>__bind` (SQL, prepared/parameterized — no string interpolation).
-- [ ] Mongo `find<T>(filter): List<T>` materializes typed docs from BSON (cursor-backed once M2 lands).
-- [ ] Write-side `__toParams`/`__toBson` binds struct fields as out-of-band parameters (injection-safe); a gate
-      proves a `$where`/operator-injection attempt via a user value cannot execute.
-- [ ] Gate `NNN_micro_orm` (round-trip a typed struct through a live driver read + a parameterized write) + ASAN clean.
+- [x] **READ SIDE DONE** (`src/std/data/orm.nova`): `RowSource impl ValueSource` (column name→index→DbValue,
+      case-insensitive) + `queryAs<T>(conn, sql, params): List<T>` / `queryOne<T>(...): T | undefined` materialize
+      typed rows via the existing `<T>__bind`, params bound out-of-band (no string interpolation). Gate
+      `159_micro_orm` (mock Connection → typed rows; present-0 survives). Corpus 159/159, ASAN 289/289.
+      Enabling compiler fixes: trait-widening at module-qualified generic-free-fn call sites (`getFunctionParamType`
+      bare-name match) + `<serde-generated>` exempt from the F4 duplicate-fn check.
+- [ ] Mongo `find<T>(filter): List<T>` (DocSource over BSON) — cursor-backed once D7-M2 lands. DEFERRED.
+- [ ] Write-side `__toParams`/`__toBson` (injection-safe struct→params) + an injection gate. DEFERRED.
+- [ ] Live-driver round-trip gate (read + parameterized write vs a running DB). DEFERRED (mock proves the shape;
+      the seam is identical).
+- [ ] Known serde quirk (separate): direct `serde.bind<ConcreteType>(src)` at a top-level call site mis-binds;
+      the generic-type-param form (what `queryAs` uses) is correct. Tracked.
 
-**Dependencies:** serde `__bind`/`ValueSource` (done), D6 prepared statements (done). **Sequenced after** D7 M2–M5
-for the full layer; **read-side prototype has no blocker.** **Tracking:** _pending._
+**Dependencies:** serde `__bind`/`ValueSource` (done), D6 prepared statements (done). **Read side DONE**; write
+side + Mongo + live gate sequenced after D7 M2–M5. **Tracking:** read-side landed 2026-07-24.
 
 ---
 
