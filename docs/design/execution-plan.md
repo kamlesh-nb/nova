@@ -125,8 +125,8 @@ not instead of finishing it.
 | **D7** | **DB production-readiness** (`db-production-roadmap.md`, MongoDB-first M1–M9) — pooling/cursors/timeouts/resilience/txns/concern/typed-errors/topology/auth-breadth/observability; then port patterns to SQL drivers. **Foundations all DONE** (async seam, generic pool+breaker, timeouts, TLS, error model) → we ARE in a position | ⭐user P2 | ⬜ | (design below) | — |
 | **D8** | **Dapper-style micro-ORM** (typed materializer) — `DocSource impl ValueSource` (BSON/row → typed struct via the existing `<Struct>__bind`) + `__toParams`/`__toBson` injection-safe binding; `query<T>(...)`→`List<T>`. Read-side prototype safe NOW; lands after D7 M2–M5 | ⭐user P3 | ⬜ | (design below) | — |
 | **W5** | ✅ **DONE** — `Http` client: URL parse → `https`⇒verified TLS (fail-closed), 6 verbs + `request`, Content-Length + chunked framing (any size), per-request timeout, bounded redirects. Live-proven vs example.com. ``getJson<T>`/`postJson<T>` (module-qualified generic-call routing landed) | ⭐user P2 | ✅ | `157_http_client` | 157/157, ASAN 285/285 |
-| **W6** | **HTTP server hardening (production-grade)** — chunked transfer-encoding (req decode + resp write), request/idle timeouts (`arecvDeadline` exists, unused), header/body size caps + 413/431, inbound TLS/HTTPS (`nova_mtls_new_server` exists, unwired); switch `nova init` template off the weak `server.nova` onto the fast `App` server | ⭐user P2 | ⬜ | (design below) | — |
-| **W7** | **HTTP compression** — runtime `nova_gzip_*`/`nova_deflate_*` over **already-linked zlib** (`-lz`, no new dep) + `Content-Encoding`/`Accept-Encoding` negotiation in client & server. (Boost.IOStreams NOT available — Asio is header-only here) | ⭐user P3 | ⬜ | (design below) | — |
+| **W6** | ✅ **CORE DONE** — App server hardened: chunked request decode, per-read timeout (slow-loris), header/body size caps → 431/413. `App.configureServer(...)`. Live-proven (curl). Deferred: inbound TLS (runtime accept seam absent), chunked resp streaming write, nova-init template swap | ⭐user P2 | ◑ | live + `test_chunked_request_decode` | 158/158, ASAN 287/287 |
+| **W7** | ✅ **DONE** — gzip over already-linked zlib: `nova_gzip_compress/decompress` + `compress/gzip.nova` + HTTP negotiation (server gzips on Accept-Encoding, client sends it + transparently decompresses). Live-proven (1800→80 bytes, 22x) | ⭐user P3 | ✅ | `158_gzip` | 158/158, ASAN 287/287 |
 | **R1** | **Runtime process primitives** — implement `nova_process_spawn`/`_write_stdin`/`_read_stdout`/`_wait`/`_free` (currently STUBS returning null/-1 at `io.cpp:805`) + new `nova_process_kill(pid,sig)`, via POSIX fork/execve/pipe/waitpid. **Foundational — blocks the orchestrator**; `process.nova` API already declared | ⭐P2 | ⬜ | (design below) | — |
 | **I1** | **Nova reverse proxy + load balancer + PID autoscaler** (⭐"most important", user) — L4/L7 proxy on the async runtime + TCP server (all exist); LB algos (round-robin/least-conn/weighted/consistent-hash), health-checked backend pool, PID-controller autoscaling. Pure Nova app; flagship runtime demonstrator | ⭐user P1 | ⬜ | (design below) | — |
 | **I2** | **Nova orchestrator (native-k8s MVP)** — reconcile-loop supervisor for **binaries (not containers)**: desired-vs-actual, spawn/restart-on-crash, N replicas, HTTP health probes, cgroups-v2 via fs writes, PID autoscaler. Ports the ~600-line Zig PoC. **Depends on R1**; full vision (scheduler/apiserver/namespaces/eBPF) out of scope | ⭐user P2 | ⬜ | (design below) | — |
@@ -1803,14 +1803,14 @@ shared chunked/Content-Length parse), `src/runtime` (wire `nova_mtls_new_server`
 already reachable), `src/templates.zig` (scaffold on `App`).
 
 **Definition of Done:**
-- [ ] A `Transfer-Encoding: chunked` request body is decoded correctly; the server can emit a chunked response; the client (W5) decodes chunked responses. Gate covers request-in and response-out.
-- [ ] A slow/stalled client hits the read/idle timeout and is closed (no coroutine leak); an over-size header→431, over-size body→413.
-- [ ] `App.runTls(...)` serves verified HTTPS (inbound TLS) via `nova_mtls_new_server`.
-- [ ] `nova init` scaffold serves on the hardened `App` server (weak `server.nova` retired or bridged).
-- [ ] Gate `NNN_http_server_hardening` (chunked req/resp, timeout, 413/431, HTTPS round-trip) + corpus green + ASAN clean.
+- [x] A `Transfer-Encoding: chunked` request body is decoded correctly (bufIsChunked/bufChunkedEnd/bufDechunk over the zero-copy buffer; the client (W5) decodes chunked responses). **Live-proven** (chunked POST → echoed body). Chunked response STREAMING write deferred (the server has the full body, so Content-Length suffices today).
+- [x] A slow/stalled client hits the per-read timeout and is closed (`async_read_deadline(readTimeoutMs)`, no coroutine leak); an over-size header→431, over-size body→413 (`App.configureServer`). **Live-proven** (slow-loris → closed; oversized → 413).
+- [ ] `App.runTls(...)` inbound TLS — DEFERRED: the runtime has no async TLS-accept seam (`nova_mtls_new_server` is not in `nova_abi.h`); needs a runtime addition.
+- [ ] `nova init` template swap onto the App server — DEFERRED (ties to templates.zig regeneration).
+- [x] Gate: offline `test_chunked_request_decode` (in app.nova) + a live echo-server harness (normal/chunked/413/timeout). Corpus 158/158, ASAN 287/287.
 
-**Dependencies:** `arecvDeadline` (done), `nova_mtls_new_server` (runtime present), W7 (compression negotiation is
-additive). **Tracking:** _pending._
+**Dependencies:** `async_read_deadline` (done). Inbound TLS blocked on a runtime accept seam. **Tracking:**
+CORE DONE 2026-07-24; inbound-TLS + template-swap + chunked-response-write deferred.
 
 ---
 
@@ -1839,11 +1839,11 @@ here is a header-only Asio subset, so the Boost.IOStreams path is out.)
 4. **Optional later:** expose zstd (archive already linked, just needs the header) for non-HTTP internal use.
 
 **Definition of Done:**
-- [ ] `nova_gzip_compress`/`decompress` runtime primitives over the already-linked zlib; Nova `compress/gzip.nova` wrapper; round-trip + KAT gate.
-- [ ] Server gzips responses when the client advertises `Accept-Encoding: gzip` (threshold + Content-Encoding set); the W5 client decompresses `Content-Encoding: gzip` replies.
-- [ ] Gate `NNN_compression` (gzip round-trip + an HTTP request/response with negotiated gzip) + ASAN clean (binary buffers, no NUL truncation).
+- [x] `nova_gzip_compress`/`decompress` runtime primitives (src/runtime/compress.cpp) over the already-linked zlib (`-lz` added to both link paths); Nova `compress/gzip.nova` wrapper; round-trip + KAT + binary-safety gate `158_gzip`.
+- [x] Server gzips responses when the client advertises `Accept-Encoding: gzip` (≥256-byte threshold + shrinks + Content-Encoding set, not cached); the client sends `Accept-Encoding: gzip` and transparently decompresses `Content-Encoding: gzip` replies. **Live-proven** (1800→80 bytes, 22×; curl --compressed and the Nova client both round-trip).
+- [x] Gate `158_gzip` (round-trip + binary buffers, no NUL truncation) + ASAN clean (287/287).
 
-**Dependencies:** none for the primitive (zlib linked); HTTP negotiation ties to W5/W6. **Tracking:** _pending._
+**Dependencies:** none (zlib linked). **Tracking:** DONE 2026-07-24.
 
 ---
 
