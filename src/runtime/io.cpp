@@ -23,12 +23,15 @@ using socklen_t = int;
 static inline int nova_close_fd(int fd) { return ::closesocket(fd); }
 #else
 #include <arpa/inet.h>
+#include <csignal>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 static inline int nova_close_fd(int fd) { return ::close(fd); }
 #endif
@@ -801,28 +804,164 @@ int nova_mtls_read(void *p, char *buf, int max) { (void)p; (void)buf; (void)max;
 void nova_mtls_free(void *p) { (void)p; }
 #endif
 
-// ===== Process / filesystem watcher (STUBS) ================================
+// ===== Process primitives (R1) =============================================
+// The dumb, identity-free exec layer the orchestrator/reverse-proxy build on: spawn a BINARY, talk to
+// its stdio, wait, signal it. Identity here is the kernel PID (unique by construction) — no names, no
+// pools, no scaling logic (that all lives up in the Nova "service" tier). POSIX fork/execvp/pipe/waitpid;
+// Windows gets stubs (the orchestrator targets Linux).
+struct ProcessContext {
+  long pid;      // child PID (long, not the 32-bit `int` — a PID must never truncate). 0 after reap.
+  int in_fd;     // parent's WRITE end of the child's stdin (-1 if closed)
+  int out_fd;    // parent's READ end of the child's stdout (-1 if closed)
+  int exit_code; // cached WEXITSTATUS once reaped
+  bool reaped;   // wait() already collected the exit status
+};
+
+#ifndef _WIN32
+// Split the newline-joined args_str (process.nova builds it) into a NUL-terminated argv, with cmd as
+// argv[0]. Returned pointers borrow `storage` (which owns the byte copies) — keep it alive until execvp.
+static std::vector<char *> nova_build_argv(const char *cmd, const char *args_str,
+                                           std::vector<std::string> &storage) {
+  storage.clear();
+  storage.emplace_back(cmd ? cmd : "");
+  if (args_str && *args_str) {
+    std::string cur;
+    for (const char *p = args_str; *p; ++p) {
+      if (*p == '\n') {
+        storage.emplace_back(cur);
+        cur.clear();
+      } else {
+        cur.push_back(*p);
+      }
+    }
+    storage.emplace_back(cur); // trailing arg (no terminating '\n')
+  }
+  std::vector<char *> argv;
+  argv.reserve(storage.size() + 1);
+  for (auto &s : storage)
+    argv.push_back(const_cast<char *>(s.c_str()));
+  argv.push_back(nullptr);
+  return argv;
+}
+
 ProcessContext *nova_process_spawn(const char *cmd, const char *args_str) {
-  (void)cmd;
-  (void)args_str;
-  return nullptr;
+  char *c_cmd = nova_to_cstr(cmd);
+  char *c_args = nova_to_cstr(args_str);
+
+  int in_pipe[2] = {-1, -1};  // parent writes -> child stdin
+  int out_pipe[2] = {-1, -1}; // child stdout -> parent reads
+  if (::pipe(in_pipe) != 0 || ::pipe(out_pipe) != 0) {
+    if (in_pipe[0] >= 0) ::close(in_pipe[0]);
+    if (in_pipe[1] >= 0) ::close(in_pipe[1]);
+    if (out_pipe[0] >= 0) ::close(out_pipe[0]);
+    if (out_pipe[1] >= 0) ::close(out_pipe[1]);
+    nova_free_cstr(cmd, c_cmd);
+    nova_free_cstr(args_str, c_args);
+    return nullptr;
+  }
+
+  pid_t pid = ::fork();
+  if (pid < 0) {
+    ::close(in_pipe[0]); ::close(in_pipe[1]);
+    ::close(out_pipe[0]); ::close(out_pipe[1]);
+    nova_free_cstr(cmd, c_cmd);
+    nova_free_cstr(args_str, c_args);
+    return nullptr;
+  }
+
+  if (pid == 0) {
+    // Child: wire stdin/stdout to the pipes, close every stray fd, exec the binary.
+    ::dup2(in_pipe[0], STDIN_FILENO);
+    ::dup2(out_pipe[1], STDOUT_FILENO);
+    ::close(in_pipe[0]); ::close(in_pipe[1]);
+    ::close(out_pipe[0]); ::close(out_pipe[1]);
+    std::vector<std::string> storage;
+    std::vector<char *> argv = nova_build_argv(c_cmd, c_args, storage);
+    ::execvp(argv[0], argv.data());
+    _exit(127); // execvp only returns on failure (matches shell "command not found")
+  }
+
+  // Parent: keep the write-to-child and read-from-child ends; close the child's copies.
+  ::close(in_pipe[0]);
+  ::close(out_pipe[1]);
+  nova_free_cstr(cmd, c_cmd);
+  nova_free_cstr(args_str, c_args);
+
+  ProcessContext *ctx = new ProcessContext{(long)pid, in_pipe[1], out_pipe[0], 0, false};
+  return ctx;
 }
+
 int nova_process_write_stdin(ProcessContext *ctx, const char *data) {
-  (void)ctx;
-  (void)data;
-  return -1;
+  if (!ctx || ctx->in_fd < 0 || !data)
+    return -1;
+  int len = *reinterpret_cast<const int *>(data - 4); // canonical Nova string length (binary-safe)
+  if (len < 0 || len > 64 * 1024 * 1024)
+    len = (int)std::strlen(data); // fallback for a non-canonical/C string
+  ssize_t n = ::write(ctx->in_fd, data, (size_t)len);
+  return (int)n;
 }
+
 int nova_process_read_stdout(ProcessContext *ctx, char *buf, int max_len) {
-  (void)ctx;
-  (void)buf;
-  (void)max_len;
-  return -1;
+  if (!ctx || ctx->out_fd < 0 || !buf || max_len <= 0)
+    return -1;
+  ssize_t n = ::read(ctx->out_fd, buf, (size_t)max_len); // blocks until data or EOF (0)
+  return (int)n;
 }
+
 int nova_process_wait(ProcessContext *ctx) {
-  (void)ctx;
-  return -1;
+  if (!ctx)
+    return -1;
+  if (ctx->reaped)
+    return ctx->exit_code;
+  // Closing the child's stdin first lets a filter that reads-to-EOF finish instead of deadlocking.
+  if (ctx->in_fd >= 0) { ::close(ctx->in_fd); ctx->in_fd = -1; }
+  int status = 0;
+  pid_t r;
+  do {
+    r = ::waitpid((pid_t)ctx->pid, &status, 0);
+  } while (r < 0 && errno == EINTR);
+  if (r < 0)
+    return -1;
+  ctx->reaped = true;
+  ctx->exit_code = WIFEXITED(status) ? WEXITSTATUS(status)
+                   : WIFSIGNALED(status) ? 128 + WTERMSIG(status) // shell convention
+                                         : -1;
+  return ctx->exit_code;
 }
+
+// R1 addition: signal the child (SIGTERM=15 graceful, SIGKILL=9 hard). The scale-down / restart-on-crash
+// primitive the orchestrator needs. Returns 0 on success, -1 on error.
+int nova_process_kill(ProcessContext *ctx, int sig) {
+  if (!ctx || ctx->pid <= 0)
+    return -1;
+  return ::kill((pid_t)ctx->pid, sig) == 0 ? 0 : -1;
+}
+
+void nova_process_free(ProcessContext *ctx) {
+  if (!ctx)
+    return;
+  if (ctx->in_fd >= 0) ::close(ctx->in_fd);
+  if (ctx->out_fd >= 0) ::close(ctx->out_fd);
+  // Best-effort reap so a finished child does not linger as a zombie (non-blocking — never stalls free).
+  if (!ctx->reaped && ctx->pid > 0) {
+    int status = 0;
+    ::waitpid((pid_t)ctx->pid, &status, WNOHANG);
+  }
+  delete ctx;
+}
+#else
+// Windows: process control is unimplemented (the orchestrator targets Linux). Stubs keep the PE build linking.
+ProcessContext *nova_process_spawn(const char *cmd, const char *args_str) {
+  (void)cmd; (void)args_str; return nullptr;
+}
+int nova_process_write_stdin(ProcessContext *ctx, const char *data) { (void)ctx; (void)data; return -1; }
+int nova_process_read_stdout(ProcessContext *ctx, char *buf, int max_len) {
+  (void)ctx; (void)buf; (void)max_len; return -1;
+}
+int nova_process_wait(ProcessContext *ctx) { (void)ctx; return -1; }
+int nova_process_kill(ProcessContext *ctx, int sig) { (void)ctx; (void)sig; return -1; }
 void nova_process_free(ProcessContext *ctx) { (void)ctx; }
+#endif
 WatcherContext *nova_fs_watcher_create(const char *path) {
   (void)path;
   return nullptr;

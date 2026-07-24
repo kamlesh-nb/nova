@@ -1,0 +1,47 @@
+// 163 — R1 process primitives: spawn a real BINARY, exchange stdio, collect its exit code, signal it.
+// The dumb, identity-free exec layer (kernel PID = identity) the orchestrator/reverse-proxy build on.
+// POSIX-only; uses /bin/sh which is present on every macOS/Linux host.
+import assert;
+import list;
+import process;
+
+fn shArgs(script: string): list.List<string> {
+    let a = list.List<string>();
+    a.push("-c");
+    a.push(script);
+    return a;
+}
+
+@test
+fn test_spawn_read_exit(): void {
+    let p = process.Process.spawn("/bin/sh", shArgs("printf 'hello from child'"));
+    let out = p.read(1024);
+    assert.isTrue(out == "hello from child");
+    assert.equalInt(p.wait(), 0);           // clean exit
+    p.close();
+}
+
+@test
+fn test_exit_code_propagates(): void {
+    let p = process.Process.spawn("/bin/sh", shArgs("exit 7"));
+    assert.equalInt(p.wait(), 7);           // WEXITSTATUS surfaces
+    p.close();
+}
+
+@test
+fn test_stdin_to_stdout_roundtrip(): void {
+    let p = process.Process.spawn("/bin/sh", shArgs("cat"));  // echoes stdin -> stdout
+    p.write("ping-pong");
+    assert.isTrue(p.read(64) == "ping-pong");
+    p.forceKill();
+    let _ = p.wait();
+    p.close();
+}
+
+@test
+fn test_kill_reports_signal(): void {
+    let p = process.Process.spawn("/bin/sh", shArgs("sleep 30"));
+    assert.equalInt(p.forceKill(), 0);      // SIGKILL delivered
+    assert.equalInt(p.wait(), 137);         // 128 + SIGKILL(9), shell convention
+    p.close();
+}

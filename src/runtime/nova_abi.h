@@ -273,6 +273,7 @@ ProcessContext* nova_process_spawn(const char *cmd, const char *args_str);
 int  nova_process_write_stdin(ProcessContext *ctx, const char *data);
 int  nova_process_read_stdout(ProcessContext *ctx, char *buf, int max_len);
 int  nova_process_wait(ProcessContext *ctx);
+int  nova_process_kill(ProcessContext *ctx, int sig);
 void nova_process_free(ProcessContext *ctx);
 typedef struct WatcherContext WatcherContext;
 WatcherContext* nova_fs_watcher_create(const char *path);

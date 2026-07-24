@@ -52,6 +52,22 @@ pub struct Process {
         return nova_process_wait(self.ctx);
     }
 
+    // Signal the child. `sig` is a POSIX signal number (15 = SIGTERM, 9 = SIGKILL, 2 = SIGINT, 1 = SIGHUP).
+    // Returns 0 on success, -1 on error. The scale-down / restart primitive the orchestrator drives.
+    pub fn kill(self: Process, sig: int): int {
+        return nova_process_kill(self.ctx, sig);
+    }
+
+    // Graceful stop (SIGTERM) — lets the child run its shutdown path. Follow with `wait` to reap it.
+    pub fn terminate(self: Process): int {
+        return nova_process_kill(self.ctx, 15);
+    }
+
+    // Hard stop (SIGKILL) — uninterceptable; use only when a terminate + grace period expired.
+    pub fn forceKill(self: Process): int {
+        return nova_process_kill(self.ctx, 9);
+    }
+
     pub fn close(self: Process): void {
         if (self.ctx != 0) {
             nova_process_free(self.ctx);
