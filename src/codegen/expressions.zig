@@ -2784,8 +2784,19 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                         if (try self.findNamespacedSpec(cfa.object.kind.ident, cfa.field, gc.type_args)) |fn_val| {
                             const args = try self.allocator.alloc(types.LLVMValueRef, gc.args.len);
                             defer self.allocator.free(args);
-                            for (gc.args, 0..) |arg, idx| {
-                                args[idx] = try self.compileCallArgument(arg);
+                            for (gc.args, 0..) |*arg, idx| {
+                                var val = try self.compileCallArgument(arg.*);
+                                // Trait-widen a concrete struct arg to a trait param (see the ident path).
+                                if (self.getFunctionParamType(cfa.field, idx)) |expected_type| {
+                                    if (self.traits.contains(getStructBaseName(expected_type))) {
+                                        if (try self.resolveExpressionTypeName(arg)) |struct_name| {
+                                            if (self.structs.contains(struct_name)) {
+                                                val = try self.constructTraitObject(val, struct_name, expected_type);
+                                            }
+                                        }
+                                    }
+                                }
+                                args[idx] = val;
                             }
                             return try self.buildCallWithCasts(fn_val, args);
                         }
@@ -2996,10 +3007,25 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 };
 
                 // Compile arguments (compileCallArgument applies the V1 value-optional consume-unbox).
+                // TRAIT-WIDENING: a concrete struct arg passed to a TRAIT-typed param must become a fat
+                // pointer {struct, vtable} — exactly as the non-generic call path does. Without it, a
+                // `readId<T>(src: ValueSource)` monomorphized call receives a raw struct where the body
+                // expects {ptr, vtable} → garbage vtable → SEGV on the first trait dispatch. Param types
+                // come from the BASE fn (`name`); the spec shares them (only the type-params substitute).
                 const args = try self.allocator.alloc(types.LLVMValueRef, gc.args.len);
                 defer self.allocator.free(args);
-                for (gc.args, 0..) |arg, idx| {
-                    args[idx] = try self.compileCallArgument(arg);
+                for (gc.args, 0..) |*arg, idx| {
+                    var val = try self.compileCallArgument(arg.*);
+                    if (self.getFunctionParamType(name, idx)) |expected_type| {
+                        if (self.traits.contains(getStructBaseName(expected_type))) {
+                            if (try self.resolveExpressionTypeName(arg)) |struct_name| {
+                                if (self.structs.contains(struct_name)) {
+                                    val = try self.constructTraitObject(val, struct_name, expected_type);
+                                }
+                            }
+                        }
+                    }
+                    args[idx] = val;
                 }
 
                 return try self.buildCallWithCasts(fn_val, args);

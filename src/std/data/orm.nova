@@ -1,0 +1,89 @@
+// orm.nova — D8 micro-ORM (Dapper point): SQL/params in, typed structs out. NO query generation,
+// NO change tracking, NO migrations — just a typed materializer over the injection-safe driver seam.
+//
+// The whole read side is a `ValueSource` ADAPTER over a decoded `Row` — it reuses the compiler's
+// existing `<Struct>__bind(src: ValueSource)` deserializer (source-gen, zero reflection). So:
+//
+//     let users = orm.queryAs<UserDto>(conn, "SELECT id, name FROM users WHERE id = $1", [db.dbInt(id)]);
+//
+// binds `id` OUT OF BAND (never string-interpolated → injection-safe) and materializes each row into
+// a `UserDto` with the same compiler machinery that binds JSON. Column lookup is by NAME (the struct
+// field name must match the SELECT column name), case-insensitively.
+import serde.source;
+import data.db;
+import map;
+import list;
+import string;
+import assert;
+
+/// A decoded SQL `Row` viewed as a `ValueSource`, so `<T>__bind` can read struct fields from it by
+/// column NAME. Scalars map through `DbValue`'s typed accessors; a missing column reads as NULL/0/""
+/// (never a trap). Flat rows have no nested objects or arrays, so `getChild`/array methods return the
+/// empty/zero case — nested DTOs would need a JOIN-shaping layer (out of the micro-ORM's scope).
+pub struct RowSource impl ValueSource {
+    pub row: Row,
+    pub index: Map<string, int>, // lowercase column name → position
+
+    init(row: Row, columns: List<Column>) {
+        self.row = row;
+        self.index = Map<string, int>(16, string.hash);
+        let i = 0;
+        while (i < columns.size()) {
+            let c = columns.get(i) ?? Column("", DbType.Null);
+            self.index.set(string.toLowerCase(c.name), i);
+            i = i + 1;
+        }
+    }
+
+    fn cell(self: RowSource, key: string): DbValue {
+        let i = self.index.get(string.toLowerCase(key));
+        if (i == undefined) { return db.dbNull(); }
+        return self.row.get(i ?? 0);
+    }
+
+    pub fn getString(self: RowSource, key: string): string { return self.cell(key).asText(); }
+    pub fn getInt(self: RowSource, key: string): long { return self.cell(key).asLong(); }
+    pub fn getBool(self: RowSource, key: string): bool { return self.cell(key).asBool(); }
+    pub fn getFloat(self: RowSource, key: string): double { return self.cell(key).asDouble(); }
+    pub fn getDecimal(self: RowSource, key: string): decimal { return self.cell(key).asDecimal(); }
+
+    // NOTE: method order MUST match the `ValueSource` trait exactly (getChild BEFORE has) — Nova's
+    // trait vtable is position-based, so a reordered impl dispatches to the wrong slot.
+    // Flat rows carry no nested objects/arrays; return the empty/zero cases (a nested @serializable
+    // field then binds to its defaults). A JOIN-shaping adapter would override these.
+    pub fn getChild(self: RowSource, key: string): ValueSource { return self; }
+    pub fn has(self: RowSource, key: string): bool {
+        let i = self.index.get(string.toLowerCase(key));
+        if (i == undefined) { return false; }
+        return !self.cell(key).isNull();
+    }
+    pub fn arrayLen(self: RowSource, key: string): int { return 0; }
+    pub fn itemString(self: RowSource, key: string, i: int): string { return ""; }
+    pub fn itemInt(self: RowSource, key: string, i: int): long { return 0; }
+    pub fn itemDecimal(self: RowSource, key: string, i: int): decimal { return 0m; }
+    pub fn itemChild(self: RowSource, key: string, i: int): ValueSource { return self; }
+}
+
+/// Run a parameterized SELECT and materialize every row into a `T` (via the compiler's `<T>__bind`).
+/// Params are bound out-of-band by the driver — the SQL is never string-interpolated. `T`'s fields
+/// are matched to result columns by name.
+pub fn queryAs<T>(conn: Connection, sql: string, params: List<DbValue>): List<T> {
+    let rs = conn.query(sql, params);
+    let out = List<T>();
+    let i = 0;
+    while (i < rs.rows.size()) {
+        let row = rs.rows.get(i) ?? Row();
+        let src = RowSource(row, rs.columns);
+        out.push(serde.bind<T>(src));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Materialize a SINGLE typed row (the first), or `undefined` if the query returned none.
+pub fn queryOne<T>(conn: Connection, sql: string, params: List<DbValue>): T | undefined {
+    let rs = conn.query(sql, params);
+    if (rs.rows.size() == 0) { return undefined; }
+    let row = rs.rows.get(0) ?? Row();
+    return serde.bind<T>(RowSource(row, rs.columns));
+}

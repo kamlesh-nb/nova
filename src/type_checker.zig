@@ -248,10 +248,18 @@ pub const TypeChecker = struct {
                 // still coexist (module-prefixed symbols never collide). A recurrence at the SAME line
                 // is a benign double-inclusion of one decl (proven: 0 different-line recurrences across
                 // the corpus), so only a DIFFERENT line is a genuine second definition.
+                // GENERATED code is exempt: the compiler emits `<Struct>__bind`/`__toJson` into the single
+                // `<serde-generated>` pseudo-file, so two same-named `@serializable` structs in DIFFERENT
+                // user modules produce two identical-named binders there — a benign collision (the binder
+                // is a pure function of the struct's fields), NOT a user redefinition. Only real source
+                // files are checked. (helpers/test_harness are likewise synthetic.)
+                const gen_file = std.mem.eql(u8, decl.fn_decl.span.file, "<serde-generated>") or
+                    std.mem.eql(u8, decl.fn_decl.span.file, "helpers.nova") or
+                    std.mem.eql(u8, decl.fn_decl.span.file, "test_harness.nova");
                 const key = try std.fmt.allocPrint(self.allocator, "{s}\x00{s}", .{ decl.fn_decl.span.file, decl.fn_decl.name });
                 if (self.fn_def_sites.contains(key)) {
                     if (self.fn_first_line.get(key)) |ln| {
-                        if (ln != decl.fn_decl.span.line) {
+                        if (!gen_file and ln != decl.fn_decl.span.line) {
                             self.addError(decl.fn_decl.span, "duplicate function '{s}' — already defined at line {d} in this module (Nova has no overloading)", .{ decl.fn_decl.name, ln });
                         }
                     }
