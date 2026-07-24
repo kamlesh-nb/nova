@@ -946,6 +946,38 @@ fn buildClosureCleanup(self: *LlvmCompiler, lambda_name: []const u8, span: ast.S
 /// `+1` and register it for the statement drain; `.borrowed` → nothing. The rendered type
 /// name is still resolved here for the drain's destructor lookup, and an unresolvable name
 /// falls back to no-registration (behavior-identical to when the decision lived inline).
+/// The no-init default constructor `S()` zero-fills, so a heap CONTAINER field (`List<T>`) lands as a
+/// NULL handle and `S().field.push(..)` derefs null. Nova structs have no field defaults, so initialize
+/// each List field to an empty container — the "zero value" of a container is empty, not null. (Map/Set
+/// take constructor args — capacity, a hash fn — so they can't be defaulted this way; a struct using them
+/// must supply its own `init`.) Called only on the NO-`init` constructor path; an explicit init owns field
+/// setup. ARC: the fresh `List<T>()` temp is CONSUMED into the field (same O4 rule as struct_init), so the
+/// field holds the sole reference and the end-of-statement drain doesn't free it underneath.
+pub fn initDefaultContainerFields(self: *LlvmCompiler, struct_name: []const u8, instance_ptr: types.LLVMValueRef, span: ast.Span) anyerror!void {
+    const sd = self.structs.get(struct_name) orelse return;
+    for (sd.fields) |f| {
+        const params = switch (f.type_name) {
+            .generic => |g| if (std.mem.eql(u8, g.name, "List")) g.params else continue,
+            else => continue,
+        };
+        var callee_expr = ast.Expression{ .kind = .{ .ident = "List" } };
+        const list_ctor = ast.Expression{ .kind = .{ .generic_call = .{
+            .callee = &callee_expr,
+            .type_args = params,
+            .args = &[_]ast.Expression{},
+            .span = span,
+        } } };
+        const fv = try self.compileExpression(list_ctor);
+        try self.takeOwnedElement(list_ctor.kind, fv);
+        const offset = try self.getFieldOffset(struct_name, f.name);
+        const offset_val = core.LLVMConstInt(self.val_type, offset, 0);
+        const addr = core.LLVMBuildAdd(self.builder, instance_ptr, offset_val, "cf_addr");
+        const llvm_ft = self.toLLVMType(f.type_name);
+        const fptr = core.LLVMBuildIntToPtr(self.builder, addr, core.LLVMPointerType(llvm_ft, 0), "cf_ptr");
+        _ = core.LLVMBuildStore(self.builder, self.castFromValType(fv, llvm_ft), fptr);
+    }
+}
+
 pub fn compileExpression(self: *LlvmCompiler, expr: ast.Expression) anyerror!types.LLVMValueRef {
     const val = try compileExpressionInner(self, expr);
     switch (self.acquisitionDisposition(&expr)) {
@@ -2315,6 +2347,8 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                         }
 
                         _ = try self.buildCallWithCasts(fn_val, args);
+                    } else {
+                        try self.initDefaultContainerFields(resolved_struct_name, instance_ptr, call.span);
                     }
                     return instance_ptr;
                 }
@@ -2998,6 +3032,8 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                         }
 
                         _ = try self.buildCallWithCasts(fn_val, args);
+                    } else {
+                        try self.initDefaultContainerFields(resolved_struct_name, instance_ptr, gc.span);
                     }
                     return instance_ptr;
                 }

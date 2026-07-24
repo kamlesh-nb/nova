@@ -3480,6 +3480,7 @@ pub const LlvmCompiler = struct {
     pub const runErrdefers = statements_mod.runErrdefers;
 
     pub const compileExpression = expressions_mod.compileExpression;
+    pub const initDefaultContainerFields = expressions_mod.initDefaultContainerFields;
     pub const consumeTemporary = expressions_mod.consumeTemporary;
     pub const atomicCell = expressions_mod.atomicCell;
     pub const guardOptionalDeref = expressions_mod.guardOptionalDeref;

@@ -1,0 +1,37 @@
+// 164 — the no-init default constructor `S()` initializes List fields to empty containers (not null).
+// Nova structs have no field defaults; `S()` zero-fills, so a `List<T>` field used to land as a NULL
+// handle and `S().field.push(..)` dereferenced null → crash. Now `S()` fills each List field with an
+// empty list. Covers: single/multi List fields, a generic struct, and that an explicit `init` still
+// wins (no double-init / no ARC regression). ARC-gated via the harness.
+import assert;
+import list;
+
+struct Bag { pub id: int, pub tags: List<string>, pub nums: List<int> }   // no init
+struct Box<T> { pub items: List<T> }                                     // generic, no init
+struct Seeded { pub xs: List<string>, init() { self.xs = List<string>(); self.xs.push("seed"); } }
+
+@test
+fn test_default_ctor_fills_lists(): void {
+    let b = Bag();                    // no-init default ctor — fields were null before the fix
+    b.tags.push("a");
+    b.tags.push("b");
+    b.nums.push(9);
+    assert.equalInt(b.tags.size(), 2);
+    assert.equalStr(b.tags.get(0) ?? "", "a");
+    assert.equalInt(b.nums.size(), 1);
+    assert.equalInt(b.id, 0);         // scalar still zero-inits
+}
+
+@test
+fn test_generic_default_ctor(): void {
+    let bx = Box<int>();
+    bx.items.push(42);
+    assert.equalInt(bx.items.get(0) ?? -1, 42);
+}
+
+@test
+fn test_explicit_init_unchanged(): void {
+    let s = Seeded();                 // explicit init owns field setup; the default-fill must NOT run
+    assert.equalInt(s.xs.size(), 1);
+    assert.equalStr(s.xs.get(0) ?? "", "seed");
+}
