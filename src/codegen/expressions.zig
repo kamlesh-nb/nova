@@ -3524,36 +3524,14 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             // A float operand now arrives as a real `double`; reinterpret it to i64 bits
             // here (the merge is a boundary) so the ICmp and the phi stay well-typed.
             // A no-op for the refcounted pointers the ownership logic below tracks.
-            // V1 (flag-gated): is the LEFT a VALUE-type optional (a boxed pointer)? If so the surviving
-            // present value must be UNBOXED before the merge (the phi yields the inner value, matching the
-            // RHS default). The `!= 0` null-check is unchanged (a present box is non-null). Detected from
-            // the checker's type for `nc.left` (`.optional(.prim)`), which is reliable at the caller.
-            const vopt_left = self.valopt_box and blk: {
-                if (self.typed_ir) |ir| {
-                    if (ir.typeOf(nc.left)) |t| break :blk self.valueOptionalInner(t) != null;
-                }
-                break :blk false;
-            };
             const left_val = self.coerceToSlotType(try self.compileExpression(nc.left.*), self.val_type);
             const left_bb_end = core.LLVMGetInsertBlock(self.builder);
 
             const rhs_bb = core.LLVMAppendBasicBlock(current_fn, "nc_rhs");
-            const present_bb = if (vopt_left) core.LLVMAppendBasicBlock(current_fn, "nc_present") else null;
             const merge_bb = core.LLVMAppendBasicBlock(current_fn, "nc_merge");
 
             const cond_i1 = core.LLVMBuildICmp(self.builder, types.LLVMIntPredicate.LLVMIntNE, left_val, core.LLVMConstInt(self.val_type, 0, 0), "is_not_null");
-            _ = core.LLVMBuildCondBr(self.builder, cond_i1, if (present_bb) |p| p else merge_bb, rhs_bb);
-
-            // The value the LEFT contributes to the merge phi, and the block it comes from. For a value
-            // optional, unbox in a dedicated present block; otherwise the left value flows straight in.
-            var left_incoming = left_val;
-            var left_incoming_bb = left_bb_end;
-            if (present_bb) |p| {
-                core.LLVMPositionBuilderAtEnd(self.builder, p);
-                left_incoming = try self.buildValoptUnbox(left_val);
-                _ = core.LLVMBuildBr(self.builder, merge_bb);
-                left_incoming_bb = core.LLVMGetInsertBlock(self.builder);
-            }
+            _ = core.LLVMBuildCondBr(self.builder, cond_i1, merge_bb, rhs_bb);
 
             // Compile RHS branch
             core.LLVMPositionBuilderAtEnd(self.builder, rhs_bb);
@@ -3588,8 +3566,8 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             // Merge block
             core.LLVMPositionBuilderAtEnd(self.builder, merge_bb);
             const phi = core.LLVMBuildPhi(self.builder, self.val_type, "nc_phi");
-            var incoming_vals = [_]types.LLVMValueRef{ left_incoming, rhs_val };
-            var incoming_bbs = [_]types.LLVMBasicBlockRef{ left_incoming_bb, rhs_bb_end };
+            var incoming_vals = [_]types.LLVMValueRef{ left_val, rhs_val };
+            var incoming_bbs = [_]types.LLVMBasicBlockRef{ left_bb_end, rhs_bb_end };
             core.LLVMAddIncoming(phi, &incoming_vals, &incoming_bbs, 2);
 
             // F5 §3.4b: OWNERSHIP FLOWS THROUGH THE PHI. `a ?? b` yields whichever

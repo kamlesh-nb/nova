@@ -52,24 +52,11 @@ pub fn unescapeString(allocator: std.mem.Allocator, input: []const u8) ![]const 
     return try result.toOwnedSlice(allocator);
 }
 
-/// V1 value-optional boxing — DEFAULT OFF. Set from `NOVA_VALOPT_BOX` in `main.zig` before codegen.
-/// When true, codegen represents value-type optionals (`.optional(.prim)`) as BOXED pointers (produce
-/// boxes, consume unboxes) so a present `0`/`0.0`/`false` is a non-null box, distinguishable from
-/// absent. OFF = today's behavior (undefined=0 collides with value 0). Copied into `LlvmCompiler.valopt_box`
-/// at `new()`. This flag exists ONLY to develop the pervasive wiring corpus-green; delete it once the
-/// wiring is complete and the default is flipped. See docs/design/value-optional-boxing.md.
-pub var valopt_box_enabled: bool = false;
-
 pub const FunctionInfo = struct {
     name: []const u8,
     param_count: usize,
     param_names: []const []const u8,
     return_type: []const u8,
-    /// V1 value-optional boxing: the DECLARED return TypeRef, un-erased. `return_type` (a string) is
-    /// `typeRefToString`, which flattens `int | undefined` → `"int"` — so it cannot tell a value-type
-    /// optional return from a plain value. This carries the real AST type so `return`-site produce-boxing
-    /// can detect `.optional(.prim)`. Null for lambdas/specializations/void (they don't return value-opts).
-    ret_type_ref: ?ast.TypeRef = null,
     body: ast.Block,
     // M3-C: async fns are lowered to LLVM coroutines. Defaults false so closure/
     // block synthetic FunctionInfos (which are never async) need no change.
@@ -261,8 +248,6 @@ pub const LlvmCompiler = struct {
     /// resolveExpressionTypeName; this exists so the two answers can be compared
     /// on every real expression before stage 4 makes the IR authoritative.
     /// Null unless NOVA_SEMA_SHADOW=1.
-    /// V1: value-optional boxing enabled for this compilation (copied from `valopt_box_enabled` at `new`).
-    valopt_box: bool = false,
     typed_ir: ?*const sema_infer.TypedIr = null,
     /// F2 stage 4b: read types from sema instead of re-deriving (NOVA_F2_TYPES=1).
     f2_types: bool = false,
@@ -418,7 +403,6 @@ pub const LlvmCompiler = struct {
             .closure_lambdas = .{},
             .current_saved_captures = std.StringHashMap(types.LLVMValueRef).init(allocator),
             .is_wasm = is_wasm,
-            .valopt_box = valopt_box_enabled,
             .coverage_enabled = coverage_enabled,
             .cov_registry = if (coverage_enabled) CoverageRegistry.init(allocator) else null,
             .current_string_builder = null,
@@ -2737,9 +2721,6 @@ pub const LlvmCompiler = struct {
                                     .param_count = if (is_constructor) fn_decl.params.len + 1 else fn_decl.params.len,
                                     .param_names = param_names,
                                     .return_type = spec_ret,
-                                    // The ORIGINAL `V | undefined` TypeRef; the installed `method_subst`
-                                    // substitutes V→concrete when the return site lowers it (V1 produce-box).
-                                    .ret_type_ref = fn_decl.ret_type,
                                     .body = fn_decl.body,
                                     .is_async = fn_decl.is_async,
                                     .instantiation = inst_opt,
@@ -2762,7 +2743,6 @@ pub const LlvmCompiler = struct {
                                 .param_count = if (is_constructor) fn_decl.params.len + 1 else fn_decl.params.len,
                                 .param_names = param_names,
                                 .return_type = if (fn_decl.ret_type) |ret| try self.typeRefToString(ret) else "void",
-                                .ret_type_ref = fn_decl.ret_type,
                                 .body = fn_decl.body,
                                 .is_async = fn_decl.is_async,
                                 .instantiation = inst_opt,
@@ -2802,7 +2782,6 @@ pub const LlvmCompiler = struct {
                         .param_count = if (is_constructor) fn_decl.params.len + 1 else fn_decl.params.len,
                         .param_names = param_names,
                         .return_type = if (fn_decl.ret_type) |ret| try self.typeRefToString(ret) else "void",
-                        .ret_type_ref = fn_decl.ret_type,
                         .body = fn_decl.body,
                         .is_async = fn_decl.is_async,
                         .source_file = fn_decl.span.file,
@@ -2844,7 +2823,6 @@ pub const LlvmCompiler = struct {
                     .param_count = fn_decl.params.len,
                     .param_names = param_names,
                     .return_type = if (fn_decl.ret_type) |ret| try self.typeRefToString(ret) else "void",
-                    .ret_type_ref = fn_decl.ret_type,
                     .body = fn_decl.body,
                     .is_async = fn_decl.is_async,
                     .source_file = fn_decl.span.file,

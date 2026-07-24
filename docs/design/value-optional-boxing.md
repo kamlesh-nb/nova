@@ -60,46 +60,47 @@ decision below MUST be driven by the **typed IR** (`typeOf(expr)` → `valueOpti
 **⚠️ KEY CONSTRAINT (found while wiring, 2026-07-24): the wiring is ALL-OR-NOTHING per type — NOT partially
 landable.** The moment produce boxes an `int?`, EVERY consume site that isn't wired (narrowing, `at`, `as`,
 arithmetic, arg-passing) reads the box pointer as garbage → corpus reds. So "produce + `??`" alone is unsafe; the
-real unit is **produce + ALL consume + ARC, corpus-green in one coherent change.** **Approach = default-OFF flag**
-(like T6-split): thread a `compiler.valopt_box: bool` from `NOVA_VALOPT_BOX` (computed in `main.zig` from
-`environ_map`, passed through `compile()` like `t6_split`); gate EVERY produce/consume behind it. Corpus runs with it
-OFF → green (zero regression); develop + gate the boxing path with it ON (`NOVA_VALOPT_BOX=1 nova test <case>` +
-`value_optional_zero`); flip the default ON only when the flag-ON corpus + ASAN are green. Then delete the flag.
+real unit is **produce + ALL consume + ARC, corpus-green in ONE coherent atomic change.**
 
-**Exact plumbing identified:**
-- `FunctionInfo.ret_type_ref: ?ast.TypeRef = null` (defaulted) — `typeRefToString` ERASES the optional (`int? →
-  "int"`, `types.zig:392`), so `func.return_type` can't detect it. Populate `.ret_type_ref = fn_decl.ret_type` at the
-  3 real-function construction sites (`llvm_codegen.zig` ~2741 / ~2780 / ~2821); lambdas/specializations leave null.
-- Consume-`??` detection is RELIABLE via `typeOf(nc.left)` at the caller (the checker types `m.get(k)` as
-  `.optional(int)`), so no plumbing needed there — use `valueOptionalInner(typeOf(nc.left))`.
+**Approach = one ATOMIC change on a branch (NO dev flag).** A trial env flag (`NOVA_VALOPT_BOX`) was wired then
+REMOVED — no shipped language exposes such a switch, and gating a representation change incrementally is exactly what
+the all-or-nothing constraint forbids. The conventional path: do the whole wiring on a branch; the corpus is RED
+mid-way (a half-changed representation is invalid), GREEN when complete; then merge. Present values are untouched, so
+the diff is confined to the produce/consume BOUNDARY sites below.
 
-### WIRING PROGRESS (2026-07-24 — flag `NOVA_VALOPT_BOX`, default OFF, corpus 152/152 green with it OFF)
+**Exact plumbing identified (RE-ADD when doing the atomic pass — it was reverted with the flag):**
+- `FunctionInfo.ret_type_ref: ?ast.TypeRef` — `typeRefToString` ERASES the optional (`int? → "int"`, `types.zig:392`),
+  so `func.return_type` can't detect it. Populate `.ret_type_ref = fn_decl.ret_type` at ALL real-function
+  construction sites (`llvm_codegen.zig` — 3 fn sites + the specialization site).
+- Consume detection is RELIABLE via `typeOf(expr)` at the site (the checker types `m.get(k)` as `.optional(int)`) —
+  use `valueOptionalInner(typeOf(expr))`.
 
-✅ **Flag infrastructure** — `llvm_codegen.valopt_box_enabled` (module var) → `compiler.valopt_box` (field, set in
-`new()`); set from `NOVA_VALOPT_BOX` in `main.zig` (both codegen entry paths). Default OFF.
-✅ **`FunctionInfo.ret_type_ref`** — added + populated at ALL real-function construction sites (llvm_codegen.zig
-~2760/~2799/~2841 + the specialization ~2742). Needed because `typeRefToString` erases the optional.
-✅ **Produce-box at `return`** (`statements.zig` return_stmt) — a value-type-prim optional return (`.optional` with
-`isPrimitiveTypeName` inner, type-params substituted) boxes the value; `undefined` stays 0. VERIFIED firing (debug
-showed `inner=i32 isprim=true` → box for `fn f(): int | undefined`).
-✅ **Consume-unbox at `??`** (`expressions.zig` nullish_coalesce) — value-optional left (via `typeOf(nc.left)` +
-`valueOptionalInner`) unboxes on the present edge; `!= undefined` unchanged (box non-null).
+### WIRING STATUS (2026-07-24 — flag + partial wiring REVERTED; foundation KEPT, flag-free)
 
-⚠️ **EMPIRICALLY CONFIRMED: the wiring is ALL-OR-NOTHING and flag-ON is NOT testable until EVERY consume site is
-wired.** With the flag ON, an IMPORTED `list` test failed (`list[0] != 10`) — produce-boxed value-optionals reach a
-consume site (here a binary comparison / index on a value-optional) that isn't unboxing yet, so it reads the box
-pointer as garbage. Because imported stdlib uses value-optionals via index/comparison/narrowing, NO flag-ON case runs
-until those are wired. This is the confirmed reason it can't be gated incrementally.
+Corpus 152/152, ASAN 276/276 — clean with NO flag. What survives in-tree is the **foundation only**:
+✅ Runtime `nova_valopt_box`/`nova_valopt_unbox` (`alloc.cpp` + `nova_abi.h`).
+✅ Codegen `buildValoptBox`/`buildValoptUnbox`/`valueOptionalInner` (`llvm_codegen.zig`) — unused until the pass.
 
-**REMAINING consume sites to wire (the bulk — each unboxes a value-optional used AS its inner value):**
-- **binary ops** (comparison `x != 10`, arithmetic `x + 1`) — unbox a value-optional operand. [first, per the failure]
-- **index** `list[i]` used as a value; **arg-passing** `f(x)` where param is the value type; **assign/let** `let y:
-  int = x`; **narrowed use** `if (x != undefined) { … x … }`.
-- **`at()`** — returns V directly (traps on absent); no unbox needed there.
-Then **ARC-own the box** (`isOwned(.optional .prim)` → true, free-only dtor) so boxes don't leak (`--arc`/ASAN), and
-**extend + verify all widths**, then **flip the default + delete the flag**.
+REVERTED (were incomplete; unconditional they red the corpus, and a flag is not the right vehicle):
+- The `NOVA_VALOPT_BOX` flag (module var + `compiler` field + `main.zig` wiring).
+- `FunctionInfo.ret_type_ref` + its population sites.
+- Produce-box at `return` (`statements.zig`) and consume-unbox at `??` (`expressions.zig`).
 
-Suggested increments (all behind the flag, landed together for corpus-green):
+**EMPIRICALLY CONFIRMED all-or-nothing:** with produce boxing an `int?`, an IMPORTED `list` test failed
+(`list[0] != 10`) — a value-optional reached a consume site (comparison/index) not yet unboxing, reading the box
+pointer as garbage. Imported stdlib uses value-optionals via index/comparison/narrowing, so NO case runs until EVERY
+consume site is wired. Hence: one atomic pass, not increments.
+
+**The atomic pass wires (all together, corpus red→green):**
+- **Produce** at `return` / `let`/assign / arg-passing when the target type is a value-optional and the RHS is the
+  inner value (`undefined` literal stays 0 = null box).
+- **Consume-unbox** at `??` (present edge), **binary ops** (`x != 10`, `x + 1`), **index used as value**,
+  **narrowed use** (`if (x != undefined) { … x … }`), **assign/arg** where the target is the inner value type.
+  `at()` returns V directly (traps on absent) — no unbox.
+- **ARC-own the box** (`isOwned(.optional .prim)` → true, free-only dtor) so boxes don't leak (`--arc`/ASAN).
+- **All widths** — int/long/uint/ulong/short/byte/bool/float/double, one uniform rule.
+
+Reference increment order (do them in ONE change, not separate commits):
 1. **Consume `??`** (`expressions.zig:3521`): if `valueOptionalInner(typeOf(nc.left))` — on the present edge
    (`left != 0`) feed the phi `buildValoptUnbox(left)` instead of the raw box; the RHS default is already unboxed.
 2. **Produce at `let`/assign**: when the declared/target type is a value-optional and the RHS is the inner value (not

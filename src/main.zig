@@ -1746,7 +1746,6 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
     // own type inference on every build is unusable. Building and reporting are
     // different decisions — conflating them is what kept sema off by default.
     sema_shadow.report_enabled = init.environ_map.get("NOVA_SEMA_SHADOW") != null;
-    llvm_codegen.valopt_box_enabled = init.environ_map.get("NOVA_VALOPT_BOX") != null; // V1 dev flag (default OFF)
     sema_shadow.trace_resolution = sema_shadow.report_enabled; // the DIFF costs; opt-in
     sema_shadow.f2_types_enabled = true; // no legacy to fall back to (4d)
 
@@ -2074,7 +2073,6 @@ fn compileProgram(
     // own type inference on every build is unusable. Building and reporting are
     // different decisions — conflating them is what kept sema off by default.
     sema_shadow.report_enabled = init.environ_map.get("NOVA_SEMA_SHADOW") != null;
-    llvm_codegen.valopt_box_enabled = init.environ_map.get("NOVA_VALOPT_BOX") != null; // V1 dev flag (default OFF)
     sema_shadow.trace_resolution = sema_shadow.report_enabled; // the DIFF costs; opt-in
     sema_shadow.f2_types_enabled = true; // no legacy to fall back to (4d)
 
