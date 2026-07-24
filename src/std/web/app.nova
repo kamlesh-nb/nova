@@ -32,6 +32,7 @@ import string;
 import list;
 import map;
 import bytes;
+import assert;
 
 // The request model + parser is `web/request.nova`'s `Request` (method, path, query/headers/cookies
 // as parsed Maps, body, `fromString`/`getHeader`/`getCookie`). This file used to carry its own
@@ -308,6 +309,13 @@ pub struct App {
     // configured one. Factory-registered handlers (`handleFrom<T>`) resolve their dependencies from it.
     pub provider: ServiceProvider,
 
+    // W6 hardening knobs (per-connection). A read that stalls past `readTimeoutMs` closes the socket
+    // (slow-loris protection); a header block over `maxHeaderBytes` → 431, a body over `maxBodyBytes` →
+    // 413 — bounded so a peer cannot exhaust memory. Defaults are sane; tune via `configureServer`.
+    pub readTimeoutMs: int,
+    pub maxHeaderBytes: int,
+    pub maxBodyBytes: int,
+
     init() {
         self.routes = List<AppRoute>();
         self.mediator = AppMediator();
@@ -315,6 +323,16 @@ pub struct App {
         self.cache = Map<string, string>(16, string.hash);
         self.cacheable = Map<string, bool>(16, string.hash);
         self.provider = ServiceCollection().buildServiceProvider();
+        self.readTimeoutMs = 30000; // 30s per-read deadline
+        self.maxHeaderBytes = 32768; // 32 KB header block
+        self.maxBodyBytes = 1048576; // 1 MB body
+    }
+
+    /// W6: tune the per-connection hardening limits. `readTimeoutMs<=0` disables the read deadline.
+    pub fn configureServer(self: App, readTimeoutMs: int, maxHeaderBytes: int, maxBodyBytes: int): void {
+        self.readTimeoutMs = readTimeoutMs;
+        self.maxHeaderBytes = maxHeaderBytes;
+        self.maxBodyBytes = maxBodyBytes;
     }
 
     /// Install the DI container. Register services in a `ServiceCollection`, then hand it to the App;
@@ -560,6 +578,84 @@ fn bufContentLength(buf: long, start: int, hdrEnd: int): int {
     return n;
 }
 
+// W6 chunked-request support (over the zero-copy buffer). A request with `Transfer-Encoding: chunked`
+// carries no Content-Length; its body is a series of [hex-size CRLF][size bytes CRLF] frames ending in
+// a 0-size chunk (`0\r\n\r\n`). We accumulate until that terminator, then decode the frames into the
+// real body bytes for the request pipeline.
+
+fn bufIsChunked(buf: long, start: int, hdrEnd: int): bool {
+    return bufFindCI(buf, start, hdrEnd, "transfer-encoding: chunked") != -1;
+}
+
+// Index of the next CRLF at/after `from` within [from, len), or -1.
+fn bufFindCRLF(buf: long, from: int, len: int): int {
+    let p = from;
+    while (p + 1 < len) {
+        if (bytes.read_byte(buf, p) == 13 && bytes.read_byte(buf, p + 1) == 10) { return p; }
+        p = p + 1;
+    }
+    return -1;
+}
+
+// Parse a hex chunk-size from buf[from, to) (stops at ';' extension or any non-hex digit).
+fn bufParseHex(buf: long, from: int, to: int): int {
+    let v = 0;
+    let p = from;
+    while (p < to) {
+        let c = bytes.read_byte(buf, p);
+        let d = -1;
+        if (c >= 48 && c <= 57) { d = c - 48; }
+        else if (c >= 97 && c <= 102) { d = c - 97 + 10; }
+        else if (c >= 65 && c <= 70) { d = c - 65 + 10; }
+        if (d < 0) { break; }
+        v = v * 16 + d;
+        p = p + 1;
+    }
+    return v;
+}
+
+// The index just PAST the terminating 0-size chunk (`0\r\n\r\n`) within buf[start, len), or -1 if the
+// chunked body is not yet fully present (need to read more).
+fn bufChunkedEnd(buf: long, start: int, len: int): int {
+    let p = start;
+    while (p < len) {
+        let lineEnd = bufFindCRLF(buf, p, len);
+        if (lineEnd == -1) { return -1; }
+        let size = bufParseHex(buf, p, lineEnd);
+        let dataStart = lineEnd + 2;
+        if (size == 0) {
+            if (dataStart + 2 <= len) { return dataStart + 2; } // past the final CRLF
+            return -1;
+        }
+        let next = dataStart + size + 2;
+        if (next > len) { return -1; }
+        p = next;
+    }
+    return -1;
+}
+
+// Decode the chunk frames in buf[start, len) into the concatenated body bytes.
+fn bufDechunk(buf: long, start: int, len: int): string {
+    let out = List<string>();
+    let p = start;
+    while (p < len) {
+        let lineEnd = bufFindCRLF(buf, p, len);
+        if (lineEnd == -1) { break; }
+        let size = bufParseHex(buf, p, lineEnd);
+        let dataStart = lineEnd + 2;
+        if (size == 0) { break; }
+        if (dataStart + size > len) { break; }
+        out.push(bytes.read_string(buf + dataStart, size));
+        p = dataStart + size + 2;
+    }
+    return string.join(out, "");
+}
+
+// A minimal fixed HTTP error response (W6: 413/431 caps, or a bad request), always closing.
+fn errResponse(code: int, reason: string): string {
+    return `HTTP/1.1 ${code} ${reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`;
+}
+
 // Extract (method, path) from the request line in buf[0, len) — building only two small strings,
 // stripping any query. read_string(buf + off, k) copies `k` bytes from `buf + off` (64-bit add).
 fn bufMethodPath(buf: long, len: int): (string, string) {
@@ -592,13 +688,19 @@ async fn handleConn(app: App, client: long): int {
     // front for the next iteration.
     let len = 0;
     let alive = true;
+    let tmo = app.readTimeoutMs;
     while (alive) {
-        // Accumulate until the full header block is present.
+        // Accumulate until the full header block is present — bounded by `maxHeaderBytes` (→ 431) and a
+        // per-read deadline (a stalled peer is closed, never parked forever — slow-loris protection).
         let hdrEnd = bufFindHeaderEnd(buf, 0, len);
         while (hdrEnd == -1) {
-            if (len >= cap) { alive = false; break; }              // header block larger than the buffer
-            let hn = await asyncio.async_read(client, buf + len, cap - len);
-            if (hn <= 0) { alive = false; break; }
+            if (len >= app.maxHeaderBytes || len >= cap) {
+                await asyncio.async_write(client, errResponse(431, "Request Header Fields Too Large"));
+                alive = false;
+                break;
+            }
+            let hn = await asyncio.async_read_deadline(client, buf + len, cap - len, tmo);
+            if (hn <= 0) { alive = false; break; }   // -2 deadline, -1 error, 0 EOF
             len = len + hn;
             hdrEnd = bufFindHeaderEnd(buf, 0, len);
         }
@@ -608,33 +710,68 @@ async fn handleConn(app: App, client: long): int {
         if (bufFindCI(buf, 0, hdrEnd, "expect: 100-continue") != -1) {
             await asyncio.async_write(client, "HTTP/1.1 100 Continue\r\n\r\n");
         }
-        // Accumulate the full body per Content-Length.
+
         let bodyStart = hdrEnd + 4;
-        let need = bufContentLength(buf, 0, hdrEnd);
-        while (len - bodyStart < need) {
-            if (len >= cap) { alive = false; break; }
-            let bn = await asyncio.async_read(client, buf + len, cap - len);
-            if (bn <= 0) { alive = false; break; }
-            len = len + bn;
+        let reqEnd = bodyStart;
+        let chunkedBody = "";
+        let usedChunked = false;
+
+        if (bufIsChunked(buf, 0, hdrEnd)) {
+            // Chunked request: read until the 0-size terminator, bounded by `maxBodyBytes` (→ 413),
+            // then decode the frames into the real body for the pipeline.
+            let cend = bufChunkedEnd(buf, bodyStart, len);
+            while (cend == -1) {
+                if ((len - bodyStart) >= app.maxBodyBytes) {
+                    await asyncio.async_write(client, errResponse(413, "Payload Too Large"));
+                    alive = false;
+                    break;
+                }
+                if (len >= cap) { alive = false; break; }
+                let bn = await asyncio.async_read_deadline(client, buf + len, cap - len, tmo);
+                if (bn <= 0) { alive = false; break; }
+                len = len + bn;
+                cend = bufChunkedEnd(buf, bodyStart, len);
+            }
+            if (!alive) { break; }
+            chunkedBody = bufDechunk(buf, bodyStart, len);
+            reqEnd = cend;
+            usedChunked = true;
+        } else {
+            // Content-Length framing. Reject an over-cap body up front (→ 413).
+            let need = bufContentLength(buf, 0, hdrEnd);
+            if (need > app.maxBodyBytes) {
+                await asyncio.async_write(client, errResponse(413, "Payload Too Large"));
+                alive = false;
+                break;
+            }
+            while (len - bodyStart < need) {
+                if (len >= cap) { alive = false; break; }
+                let bn = await asyncio.async_read_deadline(client, buf + len, cap - len, tmo);
+                if (bn <= 0) { alive = false; break; }
+                len = len + bn;
+            }
+            if (!alive) { break; }
+            reqEnd = bodyStart + need;
         }
-        if (!alive) { break; }
-        let reqEnd = bodyStart + need;
         let wantClose = bufFindCI(buf, 0, hdrEnd, "connection: close") != -1;
 
         // FAST PATH: (method, path) straight off the buffer; a cacheable GET hit serves a copy of the
         // memoized bytes with NO request string, NO parse, NO dispatch, NO serialize. Only a MISS
         // materializes the request (read_string over the exact request bytes) and runs the pipeline.
-        // (Sending the cached string directly, borrowed, was tried — no throughput win and noisier at
-        // high concurrency, so the small copy stays; the ceiling is per-request IO/scheduling, not it.)
         let (method, path) = bufMethodPath(buf, len);
         let out = "";
         let served = false;
-        if (string.eql(method, "GET")) {
+        if (string.eql(method, "GET") && !usedChunked) {
             let c = app.cachedCopy(path);
             if (c != undefined) { out = c ?? ""; served = true; }
         }
         if (!served) {
-            let raw = bytes.read_string(buf, reqEnd);
+            // A chunked request is re-presented as a plain header block + DECODED body so the pipeline
+            // (which parses `raw`) sees the real bytes; a Content-Length request slices the buffer.
+            let raw = if (usedChunked)
+                bytes.read_string(buf, hdrEnd) + "\r\n\r\n" + chunkedBody
+            else
+                bytes.read_string(buf, reqEnd);
             out = app.respondMiss(raw, method, path);
         }
         await asyncio.async_write(client, out);
@@ -669,4 +806,20 @@ async fn runServer(app: App, port: int): int {
         spawn handleConn(app, client);
     }
     return 0;
+}
+
+// ---- W6 hardening: offline unit tests for the chunked-request codec ----------------------------
+@test
+fn test_chunked_request_decode(): void {
+    // "Wiki" + "pedia" over two chunks, then the 0-size terminator.
+    let s = "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+    let n = s.length;
+    let buf: long = bytes.alloc(n);
+    let i = 0;
+    while (i < n) { bytes.write_byte(buf, i, s[i]); i = i + 1; }
+    assert.equalInt(bufChunkedEnd(buf, 0, n), n);       // complete → past the terminator
+    assert.equalStr(bufDechunk(buf, 0, n), "Wikipedia");
+    assert.equalInt(bufChunkedEnd(buf, 0, n - 4), -1);  // truncated → not yet complete
+    assert.equalInt(bufParseHex(buf, 0, 1), 4);         // hex size line parse
+    bytes.free(buf);
 }
