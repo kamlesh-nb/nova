@@ -44,7 +44,51 @@ Then, uniformly for ALL value types:
 ARC-owned; the box is just a value cell freed with its owner). **One boxing foundation serves BOTH value-optionals
 and dynamic `any`.**
 
-## Status (2026-07-24)
+## Status (2026-07-24) — ✅ COMPLETE (landed as one atomic pass)
+
+**V1 IS DONE.** Value-type optionals are boxed end-to-end; a stored/present `0`/`0.0`/`false` is a
+non-null pointer, distinct from `undefined` (null). **Corpus 153/153, ASAN 280/280, no ARC-leak
+regression** (the value-optional gate `127_value_optional_zero` audits clean; the pre-existing
+`nova_random_hex`/async-runtime baseline drift is unrelated, proven by a revert-and-re-audit). No flag.
+
+**The invariant that makes it consistent:** since `val_type` is i64 everywhere, a boxed `int?` and a
+raw `int` are the SAME machine type — so V1 is a *semantic* invariant, not an LLVM-type change: a value
+of type `.optional(.prim)` is a "pointer-or-null", a bare prim is a raw word. Two predicates key every
+decision on the expression FORM (not the checker's propagated type, which flows optionality through
+arithmetic — `int? % int = int?` — even though the VALUE is already raw):
+- **`valoptTypeRefIsValue(tr)`** — a declared type is a value-optional (`.optional` of a `cgPrim`, not
+  `ptr`); drives PRODUCE. Uses the TypeRef because `typeRefToString` erases the optional.
+- **`exprYieldsValoptBox(e)`** — compiling `e` MATERIALIZES a box: a value-optional-typed LEAF
+  (`m.get(k)` call, an `int?` ident/field/index). A COMPOUND (`x % 2`, `a ?? b`, cast) or a
+  `.generic_call` (erased free fns don't box) yields a RAW value → NOT a box. Drives CONSUME, the
+  "already-a-box?" PRODUCE guard, AND `isOwnedExpr` (a value-optional is an owned heap box only if it
+  yields one — else `nova_release` would free a raw int as a pointer).
+
+**Where it landed (all in one change):**
+- Foundation: runtime `nova_valopt_box`/`nova_valopt_unbox` (`alloc.cpp`, 8-byte ARC cell) + codegen
+  `buildValoptBox`/`buildValoptUnbox`/`valueOptionalInner`.
+- PRODUCE (box a bare value into a value-optional slot): `return` (via `FunctionInfo.ret_type_ref`, the
+  un-erased TypeRef) · `let x: int? = …` · call-argument to a value-optional param (`coerceValoptArg`).
+- CONSUME (unbox a box into its value): `??` present edge · binary operands (`x != 10`, `x % 2`) ·
+  narrowed ident load (slot `int?` + use typed bare prim = the H2-narrowed `if (x != undefined){…x…}`) ·
+  **every call argument** uniformly in `compileCallArgument` (`equalInt(m.get(k), 10)` — the universal,
+  param-independent consume site).
+- SLOT sizing: a value-optional local is an i64 alloca even for `float?`/`double?` (`slotTypeForLocalId`)
+  — the slot holds a pointer, not the FP value.
+- ARC: `isOwnedTypeId(.optional value)` = owned; a free-only destructor (`nova_release(box, null)`);
+  boxes are retained/released by the existing machinery, freed once — no leak (audited).
+- NULL-CHECK (`!= undefined`/`== undefined`) is unchanged: present box is non-null, absent is 0.
+
+**Known limitation (pre-existing erasure, NOT a V1 regression):** a FREE generic fn returning
+`T | undefined` (e.g. `maybe<T>`) is type-ERASED — one body for all `T`, so it cannot box a value-typed
+return, and it collapses a present `0` with `undefined` internally. V1 treats such a `.generic_call`
+result as a RAW value (no unbox, no crash); non-zero present values and `undefined` are correct, only a
+present `0` from such a fn reads as absent. The monomorphized container methods (`Map`/`List.get`) — the
+actual soundness fix — are `.call` and fully correct. Closing this needs free-fn monomorphization.
+
+---
+
+### Historical foundation note (superseded by the Status above)
 
 ✅ **FOUNDATION BUILT + verified compiling** (corpus 152/152, unused until wired):
 - Runtime: `nova_valopt_box(value)` / `nova_valopt_unbox(box)` in `src/runtime/alloc.cpp` (+ `nova_abi.h`) — an

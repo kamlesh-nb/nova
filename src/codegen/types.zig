@@ -284,6 +284,18 @@ pub fn toLLVMType(self: *LlvmCompiler, type_ref: ast.TypeRef) types.LLVMTypeRef 
 /// "sandwich". Everything else stays `val_type` (i64) until stage 5 narrows integers;
 /// refcounted/struct/unknown are word-sized handles and stay `val_type` too.
 pub fn slotTypeForLocal(self: *LlvmCompiler, type_name: ?[]const u8) types.LLVMTypeRef {
+    return self.slotTypeForLocalId(type_name, null);
+}
+
+/// Like `slotTypeForLocal`, but a `type_id` (when known) OVERRIDES the string for the one case the
+/// string cannot express: a V1 value-type optional (`double? | float? | int? …`). Its slot holds a
+/// boxed POINTER (i64), NOT the inner value — so a `double?`/`float?` local must be an i64 alloca, not
+/// a `double` one, or the box pointer is stored through an FP slot and its low bits are mangled. Every
+/// non-optional case is unchanged (a bare `double` still gets a `double` slot).
+pub fn slotTypeForLocalId(self: *LlvmCompiler, type_name: ?[]const u8, type_id: ?typesys.TypeId) types.LLVMTypeRef {
+    if (type_id) |tid| {
+        if (self.valueOptionalInner(tid) != null) return self.val_type; // boxed → pointer-sized slot
+    }
     if (type_name) |tn| {
         if (cgPrim(tn)) |p| {
             if (p.repr == .f64 or p.repr == .f32) return core.LLVMDoubleType();
@@ -504,6 +516,14 @@ pub fn isOptionalExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool
 pub fn isOwnedExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool {
     const ir = self.typed_ir orelse return false;
     const st = self.type_store orelse return false;
+    // V1 value-optional boxing: a value-optional expression OWNS a box (a heap cell to free) only if it
+    // actually YIELDS one — a box-producing leaf (`m.get(k)`, an `int?` ident/field). A COMPOUND value-
+    // optional (`x % 2`, `a ?? b`), though the checker types it `int?`, evaluates to a RAW value; treating
+    // it as an owned temp would `nova_release` a raw integer as a pointer (the `for (x in xs){x%2}` SEGV).
+    // So ownership of a value-optional is keyed on the expression FORM, not the propagated type.
+    if (self.typeOfExprConcrete(expr_ptr)) |ct| {
+        if (self.valueOptionalInner(ct) != null) return self.exprYieldsValoptBox(expr_ptr);
+    }
     // F4 keystoneSubst removal: inside a MONOMORPHIZED body, read the checker's per-instantiation
     // CONCRETE type (inst_disp.zig) and decide from it directly — no substitution in codegen. This is
     // byte-identical to `isOwnedTypeId(type_param)`→keystoneSubst (both resolve to the same concrete
@@ -640,7 +660,12 @@ pub fn isOwnedTypeId(self: *LlvmCompiler, t: typesys.TypeId) bool {
         // (the `[enum-mismatch]` shadow probe reported 0), the same license the keystone cutover used.
         // `.trait_` similarly moved to `else` once `isOwned(.trait_)` became correct (§3.4f).
         .enum_ => st.isOwned(t),
-        .optional => |inner| self.isOwnedTypeId(inner),
+        // V1 value-optional boxing: a `.optional(.prim)` (`int?`, `double?`, …) is now a heap BOX
+        // (present = non-null pointer, absent = null) — an OWNED cell that must be freed or it leaks.
+        // Its destructor is free-only (the inner is a value, nothing nested to release — see
+        // getOrCreateDestructorByTypeId's `.optional` arm). A pointer/decimal/struct optional keeps
+        // the old rule: the inner type decides (a `string?` is owned iff `string` is).
+        .optional => |inner| if (self.valueOptionalInner(t) != null) true else self.isOwnedTypeId(inner),
         // Everything else agrees with the string path (measured): string / struct / array / tuple /
         // storage / error_union / func -> owned; prim / ptr / future -> not.
         else => st.isOwned(t),
@@ -687,7 +712,7 @@ pub fn isOwnedLocal(self: *LlvmCompiler, name: []const u8, type_string: []const 
 /// compiling a monomorphized body, else the recorded (possibly erased) type. Projections (err-union arm,
 /// storage element, tuple element) start from this so they project a CONCRETE inner type and never reach
 /// `isOwnedTypeId(.type_param)` -> keystoneSubst.
-fn typeOfExprConcrete(self: *LlvmCompiler, expr_ptr: *const ast.Expression) ?typesys.TypeId {
+pub fn typeOfExprConcrete(self: *LlvmCompiler, expr_ptr: *const ast.Expression) ?typesys.TypeId {
     const ir = self.typed_ir orelse return null;
     if (self.current_instantiation_id) |inst| {
         if (ir.typeOfInst(expr_ptr.id, inst)) |ct| return ct;

@@ -1,0 +1,73 @@
+// 127 — V1 value-type optional boxing: a present `0`/`0.0`/`false` is DISTINCT from `undefined`.
+//
+// The bug this proves fixed (nova-value-optional-zero-bug): a value-type optional had no runtime
+// representation for `undefined` — `undefined` was the literal `0`, so a STORED `0` read back as
+// absent. Boxing gives present values a non-null pointer, so `0` is present and only a genuine miss
+// is `undefined`. Covered uniformly across widths: int / long / float / double / bool.
+import assert;
+import map;
+import string;
+
+// ---- Map<string,int> storing 0 -----------------------------------------------------------------
+fn test_map_int_zero() {
+    let m = Map<string, int>(8, string.hash);
+    m.set("zero", 0);
+    m.set("five", 5);
+
+    // Present-0 is NOT undefined.
+    assert.isTrue(m.get("zero") != undefined);
+    assert.isTrue(m.get("five") != undefined);
+    // A genuine miss IS undefined.
+    assert.isTrue(m.get("absent") == undefined);
+
+    // `??` yields the STORED value, even when it is 0.
+    assert.zero(m.get("zero") ?? 99);      // present-0 → 0, not the default
+    assert.equalInt(m.get("five") ?? 99, 5);
+    assert.equalInt(m.get("absent") ?? 99, 99);
+}
+
+// ---- narrowed use: `if (x != undefined) { ... x ... }` -----------------------------------------
+fn test_narrowed_zero() {
+    let m = Map<string, int>(8, string.hash);
+    m.set("k", 0);
+    let got = m.get("k");
+    if (got != undefined) {
+        // narrowed to `int` — the value is the stored 0, and arithmetic on it works.
+        assert.zero(got);
+        assert.equalInt(got + 7, 7);
+    } else {
+        assert.fail("present-0 wrongly narrowed as absent");
+    }
+}
+
+// ---- local value-optionals of each width -------------------------------------------------------
+fn test_local_widths() {
+    let i: int | undefined = 0;
+    assert.isTrue(i != undefined);
+    assert.zero(i ?? 42);
+
+    let l: long | undefined = 0;
+    assert.isTrue(l != undefined);
+
+    let b: bool | undefined = false;
+    assert.isTrue(b != undefined);
+    assert.isFalse(b ?? true);
+
+    let f: float | undefined = 0.0;
+    assert.isTrue(f != undefined);
+
+    let d: double | undefined = 0.0;
+    assert.isTrue(d != undefined);
+
+    // undefined stays undefined.
+    let u: int | undefined = undefined;
+    assert.isTrue(u == undefined);
+    assert.equalInt(u ?? 7, 7);
+}
+
+@test
+fn run() {
+    test_map_int_zero();
+    test_narrowed_zero();
+    test_local_widths();
+}

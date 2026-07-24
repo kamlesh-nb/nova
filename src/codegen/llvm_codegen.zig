@@ -57,6 +57,12 @@ pub const FunctionInfo = struct {
     param_count: usize,
     param_names: []const []const u8,
     return_type: []const u8,
+    /// V1 value-optional boxing: the DECLARED return TypeRef, kept alongside the rendered
+    /// `return_type` string because `typeRefToString` ERASES the optional (`int | undefined`
+    /// → `"int"`, types.zig:392). The return statement needs the un-erased TypeRef to decide
+    /// whether to BOX a value-type-optional return (`Map<K,int>.get`'s `return value`). Null
+    /// for lambdas/synthetic bodies (their returns are never value-optionals in practice).
+    ret_type_ref: ?ast.TypeRef = null,
     body: ast.Block,
     // M3-C: async fns are lowered to LLVM coroutines. Defaults false so closure/
     // block synthetic FunctionInfos (which are never async) need no change.
@@ -688,6 +694,48 @@ pub const LlvmCompiler = struct {
         return core.LLVMBuildCall2(self.builder, ft, f, &args, 1, "valopt_unbox");
     }
 
+    /// V1 PRODUCE predicate: is `tr` a value-type optional (`int | undefined`, boxable)? The
+    /// TypeRef is used because `typeRefToString` ERASES the optional; the inner name is rendered
+    /// WITH the active mono/method subst installed, so `V | undefined` in `Map<_,int>.get` renders
+    /// `"int"`. Kept in exact agreement with `valueOptionalInner` (store `.prim`): `ptr` lowers to
+    /// `.ptr` (NOT `.prim`) so it is excluded here too — a `ptr?` is a null-representable address.
+    pub fn valoptTypeRefIsValue(self: *LlvmCompiler, tr: ast.TypeRef) bool {
+        if (tr != .optional) return false;
+        const inner = self.typeRefToString(tr.optional.*) catch return false;
+        if (std.mem.eql(u8, inner, "ptr")) return false;
+        return types_mod.cgPrim(inner) != null;
+    }
+
+    /// V1 CONSUME predicate: does compiling `e` YIELD A BOX at runtime (so a consumer must unbox)?
+    /// A value-optional box is materialized only by a value-optional-typed LEAF — an ident whose slot
+    /// holds a box (a non-narrowed value-optional local; a narrowed one loads UNBOXED, so its use type
+    /// is the bare prim and this is false), a value-optional FIELD, or a call/index/`?.` that returns a
+    /// value-optional (its producer boxed the return). COMPOUND expressions (`x % 2`, `x + 1`, `-x`,
+    /// `a ?? b`, a cast) already unbox their own leaves and yield a RAW value — even though the checker
+    /// propagates the optional type through arithmetic (`int? % int = int?`). Unboxing THOSE a second
+    /// time dereferences a raw integer as a pointer (the `for (x in xs) { x % 2 }` SEGV). So the box
+    /// property is keyed on the expression FORM, not on the (propagated) type alone.
+    pub fn exprYieldsValoptBox(self: *LlvmCompiler, e: *const ast.Expression) bool {
+        const tid = self.typeOfExprConcrete(e) orelse return false;
+        if (self.valueOptionalInner(tid) == null) return false;
+        return switch (e.kind) {
+            // A `.call`/`.index`/`.field`/`.ident` that is a value-optional materializes a BOX (its
+            // producer boxed the return, or the slot/field holds one). A `.generic_call` does NOT:
+            // free generic fns are type-ERASED (one body for all T, no per-instantiation boxing), so a
+            // `maybe<int>(..): T | undefined` returns the RAW word — treating it as a box would unbox a
+            // raw value and `nova_release` it as a pointer. (The present-`0`-vs-`undefined` collapse for
+            // such erased generic returns is a pre-existing erasure limitation, not a V1 regression; the
+            // monomorphized container methods — Map/List `.get`, the real soundness fix — are `.call`.)
+            .ident, .field_access, .call, .index, .optional_chaining => true,
+            else => false, // generic_call / binary / unary / cast / ?? / if-expr / literal: already raw
+        };
+    }
+
+    /// V1: the `undefined`/`null` literal in a value-optional context stays `0` (null box) — never boxed.
+    pub fn isUndefinedLiteralExpr(e: *const ast.Expression) bool {
+        return e.kind == .literal and (e.kind.literal == .undefined or e.kind.literal == .null);
+    }
+
     // A1 heap-environment closures ------------------------------------------
     pub fn valSlotSize(self: *LlvmCompiler) usize {
         _ = self;
@@ -1047,6 +1095,7 @@ pub const LlvmCompiler = struct {
     pub const castToValType = types_mod.castToValType;
     pub const castFromValType = types_mod.castFromValType;
     pub const slotTypeForLocal = types_mod.slotTypeForLocal;
+    pub const slotTypeForLocalId = types_mod.slotTypeForLocalId;
     pub const coerceToSlotType = types_mod.coerceToSlotType;
 
     pub fn getFieldOffset(self: *LlvmCompiler, struct_name: []const u8, field_name: []const u8) anyerror!u32 {
@@ -1190,6 +1239,63 @@ pub const LlvmCompiler = struct {
             }
         }
         return null;
+    }
+
+    /// V1: like `getFunctionParamType` but returns the un-erased param TypeRef (so a `int | undefined`
+    /// param is distinguishable from `int` — `typeRefToString` erases the optional). Used to decide
+    /// box/unbox of a call argument at the value ↔ value-optional boundary. Mirrors the fn_decl and
+    /// struct-method resolution; returns null when the callee/param can't be resolved (→ no coercion).
+    pub fn getFunctionParamTypeRef(self: *LlvmCompiler, func_name: []const u8, param_idx: usize) ?ast.TypeRef {
+        for (self.program.declarations) |decl| {
+            switch (decl) {
+                .fn_decl => |f| {
+                    var name = f.name;
+                    if (self.getModulePrefix(f.span)) |mod_prefix| {
+                        if (!LlvmCompiler.isAlreadyNamespaced(f.name)) {
+                            name = std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ mod_prefix, f.name }) catch return null;
+                        }
+                    }
+                    if (std.mem.eql(u8, name, func_name)) {
+                        if (param_idx < f.params.len) return f.params[param_idx].type_name;
+                        return null;
+                    }
+                },
+                .struct_decl => |s| {
+                    for (s.methods) |m| {
+                        const insts = self.instantiationsOf(s) catch continue;
+                        for (insts) |inst_opt| {
+                            const owner = inst_opt orelse s.name;
+                            const full_name = self.methodSymbol(owner, m.decl.name) catch continue;
+                            if (!std.mem.eql(u8, full_name, func_name)) continue;
+                            if (param_idx == 0) return null; // receiver
+                            const is_constructor = std.mem.eql(u8, m.decl.name, "init") or std.mem.eql(u8, m.decl.name, "new");
+                            const actual_idx = if (is_constructor) param_idx - 1 else param_idx;
+                            if (actual_idx < m.decl.params.len) return m.decl.params[actual_idx].type_name;
+                            return null;
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    /// V1 value-optional boxing — the PRODUCE half at a CALL ARGUMENT: a bare value passed to a
+    /// value-optional parameter (`f(5)` where `f(x: int | undefined)`) must be BOXED. The CONSUME half
+    /// (a value-optional arg → bare-value param) is handled uniformly in `compileCallArgument`, so this
+    /// only boxes. `undefined`/an already-optional arg is untouched; a null/unknown param TypeRef is a
+    /// no-op. Nova has no concrete value-optional params in the stdlib today, so this is a forward-
+    /// looking completeness path — the value flows unchanged everywhere it currently matters.
+    pub fn coerceValoptArg(self: *LlvmCompiler, val: types.LLVMValueRef, arg: *const ast.Expression, param_tr_opt: ?ast.TypeRef) anyerror!types.LLVMValueRef {
+        const param_tr = param_tr_opt orelse return val;
+        if (self.valoptTypeRefIsValue(param_tr) and
+            !LlvmCompiler.isUndefinedLiteralExpr(arg) and
+            !self.exprYieldsValoptBox(arg))
+        {
+            return try self.buildValoptBox(self.coerceToSlotType(val, self.val_type));
+        }
+        return val;
     }
 
     fn getGlobalVTable(self: *LlvmCompiler, struct_name: []const u8, trait_name: []const u8) !types.LLVMValueRef {
@@ -2721,6 +2827,9 @@ pub const LlvmCompiler = struct {
                                     .param_count = if (is_constructor) fn_decl.params.len + 1 else fn_decl.params.len,
                                     .param_names = param_names,
                                     .return_type = spec_ret,
+                                    // V1: keep the un-erased TypeRef; the return site substitutes
+                                    // V→concrete via the installed `method_subst` when it renders it.
+                                    .ret_type_ref = fn_decl.ret_type,
                                     .body = fn_decl.body,
                                     .is_async = fn_decl.is_async,
                                     .instantiation = inst_opt,
@@ -2743,6 +2852,7 @@ pub const LlvmCompiler = struct {
                                 .param_count = if (is_constructor) fn_decl.params.len + 1 else fn_decl.params.len,
                                 .param_names = param_names,
                                 .return_type = if (fn_decl.ret_type) |ret| try self.typeRefToString(ret) else "void",
+                                .ret_type_ref = fn_decl.ret_type, // V1 value-optional boxing
                                 .body = fn_decl.body,
                                 .is_async = fn_decl.is_async,
                                 .instantiation = inst_opt,
@@ -2782,6 +2892,7 @@ pub const LlvmCompiler = struct {
                         .param_count = if (is_constructor) fn_decl.params.len + 1 else fn_decl.params.len,
                         .param_names = param_names,
                         .return_type = if (fn_decl.ret_type) |ret| try self.typeRefToString(ret) else "void",
+                        .ret_type_ref = fn_decl.ret_type, // V1 value-optional boxing
                         .body = fn_decl.body,
                         .is_async = fn_decl.is_async,
                         .source_file = fn_decl.span.file,
@@ -2823,6 +2934,7 @@ pub const LlvmCompiler = struct {
                     .param_count = fn_decl.params.len,
                     .param_names = param_names,
                     .return_type = if (fn_decl.ret_type) |ret| try self.typeRefToString(ret) else "void",
+                    .ret_type_ref = fn_decl.ret_type, // V1 value-optional boxing
                     .body = fn_decl.body,
                     .is_async = fn_decl.is_async,
                     .source_file = fn_decl.span.file,
@@ -3256,6 +3368,7 @@ pub const LlvmCompiler = struct {
     pub const scopedStructName = types_mod.scopedStructName;
     pub const isCollidingStruct = types_mod.isCollidingStruct;
     pub const isOptionalExpr = types_mod.isOptionalExpr;
+    pub const typeOfExprConcrete = types_mod.typeOfExprConcrete;
     pub const isOwnedExpr = types_mod.isOwnedExpr;
     pub const isOwnedTypeId = types_mod.isOwnedTypeId;
     pub const isOwnedLocal = types_mod.isOwnedLocal;

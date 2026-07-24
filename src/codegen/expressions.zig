@@ -437,6 +437,8 @@ pub fn awaitedCallHandle(self: *LlvmCompiler, operand: ast.Expression, is_spawn:
     if (recv_expr) |re| args[0] = try self.compileCallArgument(re.*);
     for (call_args, 0..) |*arg, idx| {
         var val = try self.compileCallArgument(arg.*);
+        // V1: value ↔ value-optional boundary on async-call args.
+        val = try self.coerceValoptArg(val, arg, self.getFunctionParamTypeRef(resolved, idx + recv_off));
         // Trait widening — same as the synchronous call path. When the awaited coroutine's
         // parameter is a TRAIT and the argument is a concrete struct, coerce it to a fat
         // pointer here. Without this, `await f(concreteStruct)` for `f(x: SomeTrait)` passes a
@@ -1285,7 +1287,31 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     core.LLVMGetAllocatedType(alloca_val)
                 else
                     self.val_type;
-                return core.LLVMBuildLoad2(self.builder, slot_ty, alloca_val, "");
+                const loaded = core.LLVMBuildLoad2(self.builder, slot_ty, alloca_val, "");
+                // V1 value-optional boxing (CONSUME — narrowed read): the SLOT holds a boxed value
+                // optional (`int?`), but if the checker narrowed THIS use to the bare inner value
+                // (`if (x != undefined) { … x … }` rebinds `x` to `int`, infer.zig:2037), the use type
+                // is a `.prim` while the slot is `.optional(.prim)`. That desync IS the T?→T transition:
+                // unbox. Every other read of a value-optional local (null-check `x != undefined`, `??`
+                // left, a copy into another `int?`) keeps the use typed `.optional`, so it is NOT
+                // unboxed here and stays a box. This one rule covers narrowing, narrowed arithmetic
+                // (`x + 1`), and narrowed arg-passing — H2 forbids UNguarded value use of an optional.
+                if (self.current_local_type_ids) |ids| {
+                    if (ids.get(name)) |slot_tid| {
+                        if (self.type_store) |st| {
+                            if (self.valueOptionalInner(slot_tid) != null) {
+                                const use_is_bare_prim = if (self.typeOfExprConcrete(&expr)) |ut|
+                                    st.get(ut) == .prim
+                                else
+                                    false;
+                                if (use_is_bare_prim) {
+                                    return try self.buildValoptUnbox(self.coerceToSlotType(loaded, self.val_type));
+                                }
+                            }
+                        }
+                    }
+                }
+                return loaded;
             } else if (self.constants.get(name)) |val| {
                 return try self.compileExpression(val);
             } else {
@@ -1512,6 +1538,24 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
 
             var l_val = try self.compileExpression(bin.left.*);
             var r_val = try self.compileExpression(bin.right.*);
+
+            // V1 value-optional boxing (CONSUME — bare comparison / arithmetic): `list.get(0) != 10`,
+            // `opt + 1`. An operand whose type is a value-type optional is a BOXED pointer; used against
+            // a REAL value it must be UNBOXED first, or the box pointer is compared/added as a raw
+            // integer (the `list[0] != 10` failure). A NULL-CHECK is excluded: when the OTHER operand is
+            // the `undefined`/`null` literal, the box-vs-`0` compare IS the presence test — leave the box.
+            // (Absent unboxes to 0, matching the pre-boxing behavior of a bare comparison; presence is
+            // still recoverable via `== undefined`, which this exclusion preserves.)
+            {
+                const l_is_undef = bin.left.kind == .literal and (bin.left.kind.literal == .undefined or bin.left.kind.literal == .null);
+                const r_is_undef = bin.right.kind == .literal and (bin.right.kind.literal == .undefined or bin.right.kind.literal == .null);
+                if (!r_is_undef and self.exprYieldsValoptBox(bin.left)) {
+                    l_val = try self.buildValoptUnbox(self.coerceToSlotType(l_val, self.val_type));
+                }
+                if (!l_is_undef and self.exprYieldsValoptBox(bin.right)) {
+                    r_val = try self.buildValoptUnbox(self.coerceToSlotType(r_val, self.val_type));
+                }
+            }
 
             // decimal128 arithmetic (specs §3.1 Stage 2): operands are heap decimals; route each
             // operator to its runtime BID op. `+ - * / %` allocate a FRESH result decimal (an owned
@@ -2256,6 +2300,8 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                         const actual_fn_name = if (mono_init) |mi| mi else if (self.func_map.get(init_name) != null) init_name else new_name;
                         for (call.args, 0..) |*arg, idx| {
                             var val = try self.compileCallArgument(arg.*);
+                            // V1: value ↔ value-optional boundary on constructor args.
+                            val = try self.coerceValoptArg(val, arg, self.getFunctionParamTypeRef(actual_fn_name, idx + 1));
                             if (self.getFunctionParamType(actual_fn_name, idx + 1)) |expected_type| {
                                 if (self.traits.contains(getStructBaseName(expected_type))) {
                                     if (try self.resolveExpressionTypeName(arg)) |struct_name| {
@@ -2369,6 +2415,8 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 defer self.allocator.free(args);
                 for (call.args, 0..) |*arg, idx| {
                     var val = try self.compileCallArgument(arg.*);
+                    // V1: box/unbox at the value ↔ value-optional argument boundary (`equalInt(m.get(k), 10)`).
+                    val = try self.coerceValoptArg(val, arg, self.getFunctionParamTypeRef(resolved_name, idx));
                     if (self.getFunctionParamType(resolved_name, idx)) |expected_type| {
                         if (self.traits.contains(getStructBaseName(expected_type))) {
                             if (try self.resolveExpressionTypeName(arg)) |struct_name| {
@@ -3525,6 +3573,17 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             // here (the merge is a boundary) so the ICmp and the phi stay well-typed.
             // A no-op for the refcounted pointers the ownership logic below tracks.
             const left_val = self.coerceToSlotType(try self.compileExpression(nc.left.*), self.val_type);
+            // V1 value-optional boxing (CONSUME): when the left is a value-type optional (`int?`, …)
+            // it is a BOXED pointer. The null-check below (`left_val != 0`) still decides present vs
+            // absent, but the phi must carry the UNBOXED value on the present edge — `left_present`.
+            // A present box is non-null, so unboxing here (in left_bb, before the branch) is always on
+            // a real box on the taken edge; `nova_valopt_unbox(0)` returns 0 harmlessly on the other.
+            // The box's OWN lifetime is untouched: a fresh producer box (`m.get(k) ?? d`) stays on the
+            // statement drain and is freed at statement end (value already extracted); a borrowed box
+            // (`x ?? d`) is owned by its local. So the pointer-ownership dance below is SKIPPED for a
+            // value-optional (the phi is a non-owned prim, not the box).
+            const nc_is_valopt = self.exprYieldsValoptBox(nc.left);
+            const left_present = if (nc_is_valopt) try self.buildValoptUnbox(left_val) else left_val;
             const left_bb_end = core.LLVMGetInsertBlock(self.builder);
 
             const rhs_bb = core.LLVMAppendBasicBlock(current_fn, "nc_rhs");
@@ -3557,7 +3616,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             // dominates the merge and retain(0) is a no-op on the null-and-take-rhs edge) fails LLVM
             // dominance — rhs_val is undefined on the left-survived edge — AND would wrongly retain the
             // default when the left survived. A FRESH producer default is consumed at the merge instead.
-            if (namesExistingOwner(nc.right.kind) and self.isOwnedExpr(nc.right)) {
+            if (!nc_is_valopt and namesExistingOwner(nc.right.kind) and self.isOwnedExpr(nc.right)) {
                 try self.compileRetain(rhs_val);
             }
             _ = core.LLVMBuildBr(self.builder, merge_bb);
@@ -3566,7 +3625,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             // Merge block
             core.LLVMPositionBuilderAtEnd(self.builder, merge_bb);
             const phi = core.LLVMBuildPhi(self.builder, self.val_type, "nc_phi");
-            var incoming_vals = [_]types.LLVMValueRef{ left_val, rhs_val };
+            var incoming_vals = [_]types.LLVMValueRef{ left_present, rhs_val };
             var incoming_bbs = [_]types.LLVMBasicBlockRef{ left_bb_end, rhs_bb_end };
             core.LLVMAddIncoming(phi, &incoming_vals, &incoming_bbs, 2);
 
@@ -3589,17 +3648,23 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             // (a plain consume was a no-op on the borrow, so nothing balanced the phi's release).
             // NOTE: this is the ONE ownership mechanism for `??`; the old `return x ?? default`
             // retain-on-return special case is REMOVED (statements.zig) so it no longer doubles this.
-            if (namesExistingOwner(nc.left.kind) and self.isOwnedExpr(nc.left)) {
-                // left_val dominates the merge (defined in left_bb, a predecessor); retain(0) is a no-op on
-                // the null-and-take-rhs edge, so retaining here counts +1 exactly when the left survives.
-                try self.compileRetain(left_val);
-            } else {
-                self.consumeTemporary(left_val);
-            }
-            // The BORROWED-owner right was already retained in rhs_bb (dominance + only-when-selected). A
-            // FRESH producer right is a pending temp the phi takes over, so consume it here.
-            if (!(namesExistingOwner(nc.right.kind) and self.isOwnedExpr(nc.right))) {
-                self.consumeTemporary(rhs_val);
+            // V1: a value-optional `??` yields a NON-owned prim (the phi is the unboxed value, not the
+            // box). The left box's lifetime is handled outside this dance — a fresh producer box is
+            // freed by the statement drain, a borrowed box by its owning local — and the right default
+            // is a bare value. So NONE of the pointer retain/consume applies; skip it entirely.
+            if (!nc_is_valopt) {
+                if (namesExistingOwner(nc.left.kind) and self.isOwnedExpr(nc.left)) {
+                    // left_val dominates the merge (defined in left_bb, a predecessor); retain(0) is a no-op on
+                    // the null-and-take-rhs edge, so retaining here counts +1 exactly when the left survives.
+                    try self.compileRetain(left_val);
+                } else {
+                    self.consumeTemporary(left_val);
+                }
+                // The BORROWED-owner right was already retained in rhs_bb (dominance + only-when-selected). A
+                // FRESH producer right is a pending temp the phi takes over, so consume it here.
+                if (!(namesExistingOwner(nc.right.kind) and self.isOwnedExpr(nc.right))) {
+                    self.consumeTemporary(rhs_val);
+                }
             }
 
             return phi;

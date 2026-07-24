@@ -106,6 +106,16 @@ pub fn isUntypeablePlaceholder(name: []const u8) bool {
 
 pub fn compileCallArgument(self: *LlvmCompiler, arg: ast.Expression) anyerror!types.LLVMValueRef {
     const val = try self.compileExpression(arg);
+    // V1 value-optional boxing (CONSUME at the argument boundary): if the argument's OWN type is a
+    // value-type optional (a boxed `int?`/`double?`/… passed DIRECTLY, e.g. `equalInt(xs.get(0), 10)`),
+    // unbox it to the inner value before it crosses into the callee. Nova has no concrete value-optional
+    // parameters (a param is a bare value, a pointer type, or a generic `T`), so a value-optional
+    // argument is always consumed AS its value — this is the universal, param-independent consume site,
+    // reached by EVERY call form. An arg that was already unboxed upstream (a narrowed ident, `x ?? d`,
+    // `x + 1`) is typed as the bare prim here, so `exprYieldsValoptBox` is false and it is left alone.
+    if (self.exprYieldsValoptBox(&arg)) {
+        return try self.buildValoptUnbox(self.coerceToSlotType(val, self.val_type));
+    }
     return val;
 }
 
@@ -778,6 +788,16 @@ pub fn getOrCreateDestructorByTypeId(self: *LlvmCompiler, t: typesys.TypeId) any
         .error_union => return try getOrCreateErrUnionDestructorByTypeId(self, t),
         .struct_ => return try getOrCreateStructDestructorByTypeId(self, t),
         .storage => return try getOrCreateStorageDestructorByTypeId(self, t),
+        // V1 value-optional boxing: a value-type optional box (`int?`, `double?`, …) is a plain heap
+        // cell holding one raw word — nothing nested to release. A null (free-only) destructor makes
+        // `nova_release(box, null)` just free it. Pointer/decimal/struct optionals fall through to the
+        // string path below, which delegates to the inner type's destructor (a `string?` releases the
+        // string), exactly as before.
+        .optional => {
+            if (self.valueOptionalInner(t) != null) return null;
+            const name = sema_shadow.renderLegacy(self.allocator, st, t) catch return null;
+            return try self.getOrCreateDestructor(name);
+        },
         // enum / optional / string / decimal / type_param / future: delegate to the string path
         // (byte-identical by construction) until each is TypeId-keyed. (enum is intentionally NOT twinned —
         // enums aren't parameterized, so its builder reads the AST decl and there is no string parser to

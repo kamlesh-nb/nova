@@ -1289,7 +1289,10 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
             // incoming param is i64 (the uniform ABI edge); coerce it once here, then
             // every load inside the body is honest `double`. Captured/global-backed
             // params stay val_type (a global is always i64).
-            var slot_ty = compiler.slotTypeForLocal(if (compiler.current_local_types) |lt| lt.get(arg_name) else null);
+            var slot_ty = compiler.slotTypeForLocalId(
+                if (compiler.current_local_types) |lt| lt.get(arg_name) else null,
+                if (compiler.current_local_type_ids) |ids| ids.get(arg_name) else null,
+            );
             const key = try std.fmt.allocPrint(allocator, "{s}_{s}", .{func.name, arg_name});
             defer allocator.free(key);
             if (compiler.captured_globals.get(key)) |global_var| {
@@ -1320,7 +1323,10 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
             var alloca_val: types.LLVMValueRef = undefined;
             // A7 / F3 §5 stage 4: honest slot type — a float local becomes `alloca
             // double`. Captured/global-backed locals stay val_type (i64).
-            var slot_ty = compiler.slotTypeForLocal(if (compiler.current_local_types) |lt| lt.get(name) else null);
+            var slot_ty = compiler.slotTypeForLocalId(
+                if (compiler.current_local_types) |lt| lt.get(name) else null,
+                if (compiler.current_local_type_ids) |ids| ids.get(name) else null,
+            );
             const key = try std.fmt.allocPrint(allocator, "{s}_{s}", .{func.name, name});
             defer allocator.free(key);
             if (compiler.captured_globals.get(key)) |global_var| {

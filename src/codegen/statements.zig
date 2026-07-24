@@ -250,6 +250,28 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
                         }
                     }
 
+                    // V1 value-optional boxing (PRODUCE): `let x: int? = 5` stores a BOXED value so a
+                    // present `0` is a non-null pointer, distinct from `undefined` (0). Box only a BARE
+                    // value: `undefined` stays 0, and an RHS that is already an optional (`let x: int? =
+                    // m.get(k)`, `let y: int? = other_opt`) is already a box — never double-box it (that
+                    // case is a borrow/move handled by the co-own retain above). Slot type from the
+                    // parallel TypeId map (the string erases the optional).
+                    if (self.current_local_type_ids) |ids| {
+                        if (ids.get(ls.name)) |slot_tid| {
+                            // Box when the slot is a value-optional AND the RHS yields a RAW value —
+                            // `undefined` stays 0, and an RHS that already YIELDS A BOX (`m.get(k)`, an
+                            // `int?` ident) is copied as-is. A compound RHS typed `int?` but yielding raw
+                            // (`x % 2`, `a ?? b`) IS boxed: `exprYieldsValoptBox` (form-based), not
+                            // a form-based test (not merely the propagated type) is the correct "already a box?" test.
+                            if (self.valueOptionalInner(slot_tid) != null and
+                                !LlvmCompiler.isUndefinedLiteralExpr(init_ptr) and
+                                !self.exprYieldsValoptBox(init_ptr))
+                            {
+                                val = try self.buildValoptBox(self.coerceToSlotType(val, self.val_type));
+                            }
+                        }
+                    }
+
                     // A7 / F3 §5 stage 4: coerce to the slot's honest type — a float
                     // local is `alloca double`, so an i64-ABI value (e.g. a call result)
                     // is reinterpreted to double here; a `double` value stores directly.
@@ -429,6 +451,25 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
         },
         .return_stmt => |rs| {
             var ret_val_opt = if (rs.value) |v| try self.compileExpression(v) else null;
+
+            // V1 value-optional boxing (PRODUCE): when the declared return type is a value-type
+            // optional (`int | undefined`, `long?`, `float?`, …) and the returned value is a bare
+            // value — not `undefined` (stays null=0) and not ALREADY an optional (`return m.get(k)`
+            // in an `int?` fn is already a box) — box it, so a present `0` is a non-null pointer
+            // distinct from absent. This is THE producer that fixes `Map<K,int>.get`'s `return value`.
+            // Driven by the un-erased `ret_type_ref` because `func.return_type` renders `int?` as `int`.
+            if (rs.value) |*v| {
+                if (ret_val_opt) |rv| {
+                    if (func.ret_type_ref) |rtr| {
+                        if (self.valoptTypeRefIsValue(rtr) and
+                            !LlvmCompiler.isUndefinedLiteralExpr(v) and
+                            !self.exprYieldsValoptBox(v))
+                        {
+                            ret_val_opt = try self.buildValoptBox(self.coerceToSlotType(rv, self.val_type));
+                        }
+                    }
+                }
+            }
 
             // Coerce a concrete struct to a trait object when the function's declared
             // return type is a trait (`fn make(): Speaker { return Dog(); }`).
