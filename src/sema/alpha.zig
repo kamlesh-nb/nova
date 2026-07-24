@@ -84,8 +84,18 @@ pub const Renamer = struct {
         var i = self.scopes.items.len;
         while (i > 0) {
             i -= 1;
-            for (self.scopes.items[i].items) |b| {
-                if (std.mem.eql(u8, b.src, name)) return b.renamed;
+            // Search a scope's bindings MOST-RECENT-FIRST. Bindings are appended in program order as the
+            // walker reaches each `let`, so when a name is re-bound in the SAME scope (`let k = 0; …;
+            // let k = 5`) the shadow (`k$5`) is the later entry — references after it must resolve to the
+            // shadow, not the original. Forward iteration returned the FIRST binding, so post-shadow reads
+            // still saw the old slot: the value silently kept its pre-shadow value (the `string.replace`
+            // loop-counter-never-resets bug). References BEFORE the re-bind are rewritten earlier in the
+            // walk, when only the original is bound, so they still resolve correctly.
+            const items = self.scopes.items[i].items;
+            var j = items.len;
+            while (j > 0) {
+                j -= 1;
+                if (std.mem.eql(u8, items[j].src, name)) return items[j].renamed;
             }
         }
         return null;

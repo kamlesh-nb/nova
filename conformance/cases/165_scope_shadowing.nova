@@ -1,0 +1,42 @@
+// 165 — same-scope `let` re-binding (shadowing) resolves references to the MOST-RECENT binding.
+// The alpha-renaming pass renames a shadowing `let k` to `k$N`, but its `lookup` returned the FIRST
+// same-scope binding, so reads after the re-bind still resolved to the ORIGINAL slot — the value
+// silently kept its pre-shadow value. That's the `string.replace` bug (a `let k = 0` reused as a
+// second loop counter never reset, so the tail of each copy was dropped). Fix: search a scope's
+// bindings most-recent-first.
+import assert;
+import string;
+
+@test
+fn test_rebind_resets_value(): void {
+    let k = 0;
+    while (k < 3) { k = k + 1; }
+    assert.equalInt(k, 3);
+    let k = 0;                      // re-bind in the SAME scope — must reset, not keep 3
+    assert.equalInt(k, 0);
+    while (k < 2) { k = k + 1; }
+    assert.equalInt(k, 2);
+}
+
+@test
+fn test_rebind_reads_new_binding(): void {
+    let v = 10;
+    assert.equalInt(v, 10);
+    let v = v + 5;                  // the RHS `v` reads the OLD binding (10); the new binding is 15
+    assert.equalInt(v, 15);        // reads after resolve to the NEW binding
+}
+
+@test
+fn test_nested_block_shadow_unaffected(): void {
+    let x = 1;
+    { let x = 2; assert.equalInt(x, 2); }   // inner block shadows
+    assert.equalInt(x, 1);                   // outer restored on block exit
+}
+
+@test
+fn test_string_replace_all_occurrences(): void {
+    // Directly exercises the two-loop-counter pattern that regressed: replace must hit EVERY match.
+    assert.equalStr(string.replace("aXbXcX", "X", "-"), "a-b-c-");
+    assert.equalStr(string.replace("hello world", "o", "0"), "hell0 w0rld");
+    assert.equalStr(string.replace("no-match", "Z", "Q"), "no-match");
+}
