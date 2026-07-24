@@ -634,7 +634,31 @@ void nova_chan_free(long long ch) {
 // the scheduler responsive; full asio non-blocking I/O for massive connection counts
 // is a later architectural refinement.)
 namespace {
-boost::asio::thread_pool &g_io_pool = *new boost::asio::thread_pool(64);
+// The blocking-offload I/O pool is created LAZILY, on first use. A `boost::asio::thread_pool(N)`
+// spawns all N OS threads in its constructor, so an EAGER global here cost 64 idle threads in EVERY
+// process — even the common case (an HTTP server using the non-blocking aaccept/arecv path, which
+// never touches this pool). That inflated a plain web server's thread count to ~72 (8 scheduler + 64
+// idle). Sizing from NOVA_THREADS (× a small blocking-fan-out factor, capped) keeps the offload path
+// working for whoever DOES use it, without paying for threads a non-blocking app never runs.
+boost::asio::thread_pool &io_pool() {
+    static boost::asio::thread_pool *pool = [] {
+        unsigned n = 8;
+        if (const char *e = std::getenv("NOVA_THREADS")) {
+            int v = std::atoi(e);
+            if (v > 0) n = static_cast<unsigned>(v);
+        } else {
+            unsigned hc = std::thread::hardware_concurrency();
+            if (hc > 0) n = hc;
+        }
+        // Blocking ops can fan out beyond the scheduler width, but keep it bounded — this pool exists
+        // only for the legacy syscall-offload path, not the hot non-blocking loop.
+        unsigned size = n * 4;
+        if (size < 4) size = 4;
+        if (size > 64) size = 64;
+        return new boost::asio::thread_pool(size);
+    }();
+    return *pool;
+}
 std::mutex &g_ioresult_mu = *new std::mutex();
 std::unordered_map<long long, long long> &g_ioresults = *new std::unordered_map<long long, long long>();
 
@@ -656,7 +680,7 @@ long long nova_io_take_result(long long self) {
 // Offload a blocking recv; the worker fills `buf` (a stable heap buffer, not the coro
 // frame — safe to write across the suspend) and reschedules `self` with the count.
 void nova_io_recv_async(long long fd, long long buf, long long max_len, long long self) {
-    boost::asio::post(g_io_pool, [fd, buf, max_len, self]() {
+    boost::asio::post(io_pool(), [fd, buf, max_len, self]() {
         long long n = nova_socket_recv((int)fd, reinterpret_cast<char *>(buf), (int)max_len);
         stash_io_result(self, n);
         nova_sched_schedule(self);
@@ -665,7 +689,7 @@ void nova_io_recv_async(long long fd, long long buf, long long max_len, long lon
 
 // Offload a blocking accept; result is the client fd (or -1).
 void nova_io_accept_async(long long server_fd, long long self) {
-    boost::asio::post(g_io_pool, [server_fd, self]() {
+    boost::asio::post(io_pool(), [server_fd, self]() {
         long long fd = nova_socket_accept((int)server_fd);
         stash_io_result(self, fd);
         nova_sched_schedule(self);
