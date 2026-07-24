@@ -2136,13 +2136,13 @@ Ordered by the **Priority policy** (language > framework/data > infra). Pick fro
 its section above. Items already ✅ are omitted. **Next pick: V1** (a real soundness bug — the language-first choice).
 
 ### 🥇 Tier 1 — Language soundness & foundation (do these first)
-1. **V1 — value-type-optional `0` bug** ⚠️ NEW, silent corruption — `Map<K,int>`/`long?`/`float?`/`double?`/`bool?`
-   storing `0`/`0.0`/`false` reads back as `undefined` (`undefined` = handle 0 collides). Sentinel REJECTED (can't be
-   uniform — `long`/`double` use all 64 bits). **Design DECIDED = box value-type optionals** (Nova's `Nullable<T>`,
-   C#-inspired: pointer-to-boxed-value or null=absent; uniform across int/long/float/double; `decimal`/refs already
-   pointers, unaffected; reuses the `nova_any_box` foundation shared with boxed-`any`). Full design +
-   incremental/gated plan in **`docs/design/value-optional-boxing.md`**. Foundational, boxed-`any`-class — implement
-   in gated increments. **`nova-value-optional-zero-bug`.**
+1. **V1 — value-type-optional `0` bug** ✅ **DONE 2026-07-24 (commit f9bfc60).** Value-type optionals
+   (`int|undefined`/`long?`/`float?`/`double?`/`bool?`) are now BOXED (non-null=present even for 0/0.0/false,
+   null=absent), so `Map<K,int>`/`List<int>` storing `0` is correct. Landed as one atomic pass (no flag). Corpus
+   153/153, ASAN 280/280, value-optional ARC audit clean. Gate `127_value_optional_zero`. Design (marked COMPLETE) +
+   the exact box/unbox/own wiring in **`docs/design/value-optional-boxing.md`**. **`nova-value-optional-zero-bug`**.
+   Known pre-existing erasure gap (non-crashing): a FREE generic fn returning `T|undefined` (`maybe<T>`) is type-erased
+   and can't box — a present `0` from it still reads absent; needs free-fn monomorphization.
 2. **F4** — F1-6 Itanium name mangling (overloadable symbols don't collide cross-module) + confirm F1-7 unresolved-call
    is a hard error. Foundation; negative gate `unresolved_call`.
 3. **H3** — test infrastructure: a first-class project-wide `@test` runner (the engine exists) + relocate corpus cases
