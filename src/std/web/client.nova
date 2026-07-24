@@ -13,6 +13,7 @@ import map;
 import net.tcp.client;
 import net.tcp.socket;
 import net.url;
+import serde.source;
 import web.request;
 import web.response;
 import web.status;
@@ -342,4 +343,21 @@ fn test_frame_chunked(): void {
     let r = frame(raw);
     assert.equalInt(r.code, 200);
     assert.equalStr(r.body, "Wikipedia");
+}
+
+// ---- typed JSON convenience (reuses the serde `__bind` machinery) ----------------------------
+// `getJson<T>(url)` GETs and deserializes the JSON response into `T`. `postJson<T>(url, jsonBody)`
+// POSTs a JSON string (Content-Type: application/json) and deserializes the JSON response into `T`.
+pub fn getJson<T>(urlStr: string): T {
+    let r = Http.get(urlStr);
+    let src = source.fromJson(r.body);
+    return serde.bind<T>(src);
+}
+
+pub fn postJson<T>(urlStr: string, jsonBody: string): T {
+    let hdrs = Map<string, string>(4, string.hash);
+    hdrs.set("Content-Type", "application/json");
+    let r = Http.request("POST", urlStr, hdrs, jsonBody);
+    let src = source.fromJson(r.body);
+    return serde.bind<T>(src);
 }

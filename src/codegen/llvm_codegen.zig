@@ -1296,6 +1296,36 @@ pub const LlvmCompiler = struct {
         return val;
     }
 
+    /// Find the monomorphized specialization of a MODULE-QUALIFIED generic FREE fn — `client.getJson<Info>`
+    /// → `web_client_getJson__Info`. Builds the call-site name `<obj>_<field>__<mangled args>` and matches
+    /// it against `func_map`: exactly, or (since the emitted symbol carries the FILE's module prefix, e.g.
+    /// `web_client_…`) by the `_<name>` suffix — the same scan the non-generic namespaced-fn path uses.
+    /// Returns null when no spec exists (the caller then falls through to the ordinary namespaced path).
+    pub fn findNamespacedSpec(self: *LlvmCompiler, obj: []const u8, field: []const u8, type_args: []const ast.TypeRef) anyerror!?types.LLVMValueRef {
+        var nb = std.ArrayListUnmanaged(u8).empty;
+        defer nb.deinit(self.allocator);
+        try nb.appendSlice(self.allocator, obj);
+        try nb.append(self.allocator, '_');
+        try nb.appendSlice(self.allocator, field);
+        for (type_args) |ta| {
+            const r = try self.typeRefToString(ta);
+            const ma = try types_mod.mangleTypeName(self.allocator, r);
+            defer self.allocator.free(ma);
+            try nb.appendSlice(self.allocator, "__");
+            try nb.appendSlice(self.allocator, ma);
+        }
+        const spec_target = nb.items; // e.g. "client_getJson__Info"
+        if (self.func_map.get(spec_target)) |v| return v;
+        var it = self.func_map.keyIterator();
+        while (it.next()) |k| {
+            const key = k.*;
+            if (key.len > spec_target.len + 1 and key[key.len - spec_target.len - 1] == '_' and std.mem.endsWith(u8, key, spec_target)) {
+                return self.func_map.get(key);
+            }
+        }
+        return null;
+    }
+
     fn getGlobalVTable(self: *LlvmCompiler, struct_name: []const u8, trait_name: []const u8) !types.LLVMValueRef {
         const base_name = try std.fmt.allocPrint(self.allocator, "_vtable_{s}_{s}", .{ struct_name, trait_name });
         defer self.allocator.free(base_name);

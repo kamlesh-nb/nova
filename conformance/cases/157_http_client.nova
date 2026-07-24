@@ -31,4 +31,12 @@ fn run(): void {
     // A connection to an unreachable host fails CLOSED with a 5xx, never a crash or a bogus 200.
     let r = client.Http.requestTimeout("GET", "http://127.0.0.1:9/", Map<string, string>(4, string.hash), "", 300);
     assert.equalInt(r.status.toCode(), 500);
+
+    // `getJson<T>` — a MODULE-QUALIFIED generic free fn — monomorphizes + routes to its spec and
+    // deserializes via serde. Hermetic: the unreachable host yields an empty body → a default `T`,
+    // never a crash. (The LIVE typed round-trip vs an HTTPS JSON API is proven separately.)
+    let info = client.getJson<Ping>("http://127.0.0.1:9/");
+    assert.equalInt(info.url.length, 0);
 }
+
+@serializable struct Ping { pub url: string }

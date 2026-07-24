@@ -2752,6 +2752,45 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                         }
                     }
                 }
+                // MODULE-QUALIFIED generic FREE fn: `client.getJson<Info>(args)` → the monomorphized spec
+                // `web_client_getJson__Info`. Parallel to the generic-constructor hook above and the bare-
+                // ident generic-call routing below. Guard: the object is a MODULE (an untyped ident), the
+                // field is NOT a struct type (that's the constructor case), there ARE type args, and a spec
+                // actually exists. Without this, `compileMethodOrNamespacedCall` drops the type args and
+                // looks for the erased base — which a sync generic free fn no longer emits.
+                {
+                    const cfa = gc.callee.kind.field_access;
+                    // ASYNC generic fns keep their erased base and are dispatched via the coroutine ramp
+                    // (or the no-await synchronous-completion path), NOT a synchronous spec call — routing
+                    // `async_util.selectAny<int>(fs)` to `..._selectAny__int` here would return a raw future
+                    // instead of running it. Skip the hook when the field names an async fn.
+                    var isAsyncField = false;
+                    {
+                        var it = self.async_fns.keyIterator();
+                        while (it.next()) |k| {
+                            const key = k.*;
+                            if (std.mem.endsWith(u8, key, cfa.field) and
+                                (key.len == cfa.field.len or key[key.len - cfa.field.len - 1] == '_'))
+                            {
+                                isAsyncField = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!isAsyncField and gc.type_args.len > 0 and cfa.object.kind == .ident and
+                        !self.isStructType(cfa.field) and
+                        (try self.resolveExpressionTypeName(cfa.object)) == null)
+                    {
+                        if (try self.findNamespacedSpec(cfa.object.kind.ident, cfa.field, gc.type_args)) |fn_val| {
+                            const args = try self.allocator.alloc(types.LLVMValueRef, gc.args.len);
+                            defer self.allocator.free(args);
+                            for (gc.args, 0..) |arg, idx| {
+                                args[idx] = try self.compileCallArgument(arg);
+                            }
+                            return try self.buildCallWithCasts(fn_val, args);
+                        }
+                    }
+                }
                 return try self.compileMethodOrNamespacedCall(gc.callee.kind.field_access, gc.args);
             }
             if (gc.callee.kind == .ident) {
