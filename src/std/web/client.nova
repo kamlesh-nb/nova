@@ -13,6 +13,7 @@ import map;
 import net.tcp.client;
 import net.tcp.socket;
 import net.url;
+import compress.gzip;
 import serde.source;
 import web.request;
 import web.response;
@@ -204,7 +205,19 @@ fn frame(raw: string): RawResp {
         }
         hi = hi + 1;
     }
-    let body = if (chunked) dechunk(bodyRaw) else bodyRaw;
+    let dechunked = if (chunked) dechunk(bodyRaw) else bodyRaw;
+    // W7: transparently decompress a `Content-Encoding: gzip` body (case-insensitive header lookup).
+    let body = dechunked;
+    let ci = 0;
+    while (ci < hk.size()) {
+        let k = hk.get(ci) ?? "";
+        if (string.toLowerCase(k) == "content-encoding") {
+            if (string.contains(string.toLowerCase(headers.get(k) ?? ""), "gzip")) {
+                body = gzip.decompress(dechunked);
+            }
+        }
+        ci = ci + 1;
+    }
     return RawResp{ code: code, headers: headers, body: body };
 }
 
@@ -242,6 +255,7 @@ pub struct Http {
         let hdrs = List<string>();
         hdrs.push("Host: " + u.host);
         hdrs.push("Connection: close");
+        hdrs.push("Accept-Encoding: gzip"); // W7: advertise gzip; `frame` transparently decompresses
         if (body.length > 0) { hdrs.push(`Content-Length: ${body.length}`); }
         let sawUA = false;
         headers.forEach((k, v) => {

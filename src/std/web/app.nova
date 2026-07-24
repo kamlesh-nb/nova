@@ -28,6 +28,7 @@ import web.multipart;
 import serde.source;
 import web.static_content;
 import web.di;
+import compress.gzip;
 import string;
 import list;
 import map;
@@ -374,8 +375,24 @@ pub struct App {
     pub fn respondMiss(self: App, raw: string, method: string, path: string): string {
         let req = request.Request.fromString(raw);
         let resp = self.dispatch(req);
+
+        // W7 content negotiation: if the client advertises `Accept-Encoding: gzip` and the body is
+        // worth compressing (≥ 256 bytes and actually shrinks), gzip it and set `Content-Encoding: gzip`.
+        // A gzipped response is client-specific, so it is NOT cached (only the plain form is).
+        let ae = req.getHeader("accept-encoding") ?? "";
+        let didGzip = false;
+        if (string.contains(ae, "gzip") && resp.body.length >= 256) {
+            let packed = gzip.compress(resp.body);
+            if (packed.length > 0 && packed.length < resp.body.length) {
+                resp.body = packed;
+                resp.headers.set("Content-Encoding", "gzip");
+                resp.headers.set("Content-Length", `${packed.length}`);
+                didGzip = true;
+            }
+        }
+
         let out = resp.serialize();
-        if (string.eql(method, "GET")) {
+        if (string.eql(method, "GET") && !didGzip) {
             if (self.cacheable.get(path) != undefined) {
                 self.cache.set(path, string.slice(out, 0, out.length));
             }

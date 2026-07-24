@@ -1,0 +1,33 @@
+// gzip.nova — W7 HTTP compression: gzip compress/decompress over the runtime's zlib wrapper.
+//
+// Both take and return Nova strings that may hold BINARY data (gzip output/decoded bytes contain
+// NULs). Nova strings carry their length, so binary is safe end-to-end. Empty in → empty out; a
+// decompress of non-gzip data returns "" (never a crash — the runtime fails closed).
+import assert;
+
+pub fn compress(data: string): string {
+    return nova_gzip_compress(data);
+}
+
+pub fn decompress(data: string): string {
+    return nova_gzip_decompress(data);
+}
+
+@test
+fn test_gzip_roundtrip(): void {
+    let original = "Hello, Nova! Hello, Nova! Hello, Nova! Hello, Nova!";
+    let packed = compress(original);
+    // gzip has a 10-byte header + trailer; a repetitive string compresses SMALLER than the original.
+    assert.isTrue(packed.length > 0);
+    assert.isTrue(packed.length < original.length);
+    let back = decompress(packed);
+    assert.equalStr(back, original);
+}
+
+@test
+fn test_gzip_empty_and_binary(): void {
+    assert.equalStr(decompress(""), "");
+    // Round-trip data containing bytes that would trip a NUL-terminated codec.
+    let s = "a\tb\nc  d";
+    assert.equalStr(decompress(compress(s)), s);
+}

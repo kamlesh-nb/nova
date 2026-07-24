@@ -1,0 +1,19 @@
+// 158 — W7 gzip compression: round-trip + binary safety over the runtime's zlib wrapper.
+// (Importing compress.gzip also runs its own @tests. The HTTP negotiation — server gzips on
+// Accept-Encoding, client decompresses Content-Encoding: gzip — is proven live in the W7 notes.)
+import assert;
+import compress.gzip;
+import string;
+
+@test
+fn run(): void {
+    let original = "the quick brown fox jumps over the lazy dog, again and again and again and again";
+    let packed = gzip.compress(original);
+    assert.isTrue(packed.length > 0);
+    assert.isTrue(packed.length < original.length);       // repetitive text shrinks
+    assert.equalStr(gzip.decompress(packed), original);   // exact round-trip
+    assert.equalStr(gzip.decompress(""), "");             // empty in → empty out, no crash
+    // binary-safe: bytes a NUL-terminated codec would truncate survive.
+    let bin = "a\tb  c\nd";
+    assert.equalStr(gzip.decompress(gzip.compress(bin)), bin);
+}

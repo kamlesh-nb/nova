@@ -93,7 +93,7 @@ fn linkNativeInProcessMacho(
     });
     for (objs) |o| try args.append(allocator, o); // T6 split: one or many object files
     const nova_lib = try std.fmt.allocPrint(allocator, "-L{s}/lib", .{shared_nova});
-    try args.appendSlice(allocator, &.{ nova_lib, "-lnova_runtime", "-L/opt/homebrew/lib" });
+    try args.appendSlice(allocator, &.{ nova_lib, "-lnova_runtime", "-lz", "-L/opt/homebrew/lib" });
     try appendWolfsslLink(&args, allocator, shared_nova, io);
     for (ffi_libs) |lib| {
         try appendFfiLib(&args, allocator, shared_nova, io, lib);
@@ -265,7 +265,7 @@ fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocator: 
         const sub = module_name[4..];
         return try std.fmt.allocPrint(allocator, "src/std/{s}.nova", .{sub});
     }
-    const std_modules = [_][]const u8{ "net/tcp/socket", "net/tcp/server", "net/tcp/client", "net/tls", "net/url", "net/asyncio", "net/asynctls", "web/request", "web/response", "web/mime", "web/status", "web/methods", "web/server", "web/client", "web/mediator", "web/routing", "web/middleware", "web/url", "web/cookie", "web/cors", "web/request_id", "web/redact", "web/secure_headers", "web/body_limit", "web/recovery", "web/rate_limit", "web/multipart", "web/session", "web/csrf", "web/di", "web/controller", "web/router", "web/app", "web/logger", "concurrency/fiber", "concurrency/channel", "concurrency/asyncchan", "concurrency/atomic", "concurrency/async_util", "concurrency/actor", "io/file", "io/dir", "collections/list", "collections/map", "collections/set", "collections/string_builder", "serde/json", "serde/source", "serde/bson", "serde/yaml", "mem/allocator", "mem/arena_allocator", "mem/memory", "string", "datetime", "math", "assert", "traits", "env", "crypto/sha", "crypto/md5", "crypto/base64", "crypto/random", "crypto/scram", "process", "fs", "exception", "data/db", "data/sql/pool", "text/utf8", "text/regex", "webview", "web/static_content", "web/circuit_breaker", "resilience/breaker" };
+    const std_modules = [_][]const u8{ "net/tcp/socket", "net/tcp/server", "net/tcp/client", "net/tls", "net/url", "net/asyncio", "net/asynctls", "web/request", "web/response", "web/mime", "web/status", "web/methods", "web/server", "web/client", "web/mediator", "web/routing", "web/middleware", "web/url", "web/cookie", "web/cors", "web/request_id", "web/redact", "web/secure_headers", "web/body_limit", "web/recovery", "web/rate_limit", "web/multipart", "web/session", "web/csrf", "web/di", "web/controller", "web/router", "web/app", "web/logger", "concurrency/fiber", "concurrency/channel", "concurrency/asyncchan", "concurrency/atomic", "concurrency/async_util", "concurrency/actor", "io/file", "io/dir", "collections/list", "collections/map", "collections/set", "collections/string_builder", "serde/json", "serde/source", "serde/bson", "serde/yaml", "mem/allocator", "mem/arena_allocator", "mem/memory", "string", "datetime", "math", "assert", "traits", "env", "crypto/sha", "crypto/md5", "crypto/base64", "crypto/random", "crypto/scram", "process", "fs", "exception", "data/db", "data/sql/pool", "text/utf8", "text/regex", "webview", "web/static_content", "web/circuit_breaker", "resilience/breaker", "compress/gzip" };
     for (std_modules) |m| {
         if (std.mem.eql(u8, module_name, m)) {
             return try std.fmt.allocPrint(allocator, "src/std/{s}.nova", .{module_name});
@@ -1838,6 +1838,7 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
     // libnova_runtime.a would leave the allocator uninstrumented, which is the half that
     // matters here (nova_release reads the header of a freed block).
     try test_clang_args.append(allocator, if (asan) "-lnova_runtime_asan" else "-lnova_runtime");
+    try test_clang_args.append(allocator, "-lz"); // W7 gzip (zlib)
     // M3-D: Boost.Asio is header-only; the abandoned Boost.Fiber attempt is not
     // compiled, so no -lboost_* is needed. Keep -L for any transitive boost_system.
     try test_clang_args.append(allocator, "-L/opt/homebrew/lib");
@@ -2240,6 +2241,7 @@ fn compileProgram(
         const nova_lib = try std.fmt.allocPrint(allocator, "-L{s}/lib", .{shared_nova});
         try clang_args.append(allocator, nova_lib);
         try clang_args.append(allocator, "-lnova_runtime");
+        try clang_args.append(allocator, "-lz"); // W7 gzip (zlib)
         try clang_args.append(allocator, "-L/opt/homebrew/lib");
         try appendWolfsslLink(&clang_args, allocator, shared_nova, init.io);
         for (ffi_libs) |lib| {

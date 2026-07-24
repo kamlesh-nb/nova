@@ -19,3 +19,5 @@
 // crypto.cpp (wolfCrypt) AFTER io.cpp so wolfSSL's options.h/ssl.h are already
 // sequenced relative to Asio.
 #include "crypto.cpp"
+// compress.cpp (zlib gzip) AFTER io.cpp — it uses io.cpp's inline nova_str_len.
+#include "compress.cpp"

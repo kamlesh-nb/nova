@@ -565,6 +565,11 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         try compiler.func_map.put("nova_hmac_sha256_raw", hmac_raw_fn);
         const sha256_raw_fn = core.LLVMAddFunction(compiler.module, "nova_sha256_raw", core.LLVMFunctionType(compiler.ptr_type, &one_param_ptr, 1, 0));
         try compiler.func_map.put("nova_sha256_raw", sha256_raw_fn);
+        // W7 gzip (over the already-linked zlib): (ptr in) -> ptr (length-prefixed binary buffer).
+        const gzc_fn = core.LLVMAddFunction(compiler.module, "nova_gzip_compress", core.LLVMFunctionType(compiler.ptr_type, &one_param_ptr, 1, 0));
+        try compiler.func_map.put("nova_gzip_compress", gzc_fn);
+        const gzd_fn = core.LLVMAddFunction(compiler.module, "nova_gzip_decompress", core.LLVMFunctionType(compiler.ptr_type, &one_param_ptr, 1, 0));
+        try compiler.func_map.put("nova_gzip_decompress", gzd_fn);
         // nova_pbkdf2_hmac_sha256 (ptr password, ptr salt, i64 iters, i64 dklen) -> ptr (raw bytes)
         var pbkdf2_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.ptr_type, compiler.val_type, compiler.val_type };
         const pbkdf2_fn = core.LLVMAddFunction(compiler.module, "nova_pbkdf2_hmac_sha256", core.LLVMFunctionType(compiler.ptr_type, &pbkdf2_params, 4, 0));
