@@ -121,6 +121,7 @@ pub const TypeChecker = struct {
     // `contains` inside string.nova is string's own). So N2 fires only when the caller's file does
     // NOT define the name. Keys owned by allocator.
     fn_def_sites: std.StringHashMap(void),
+    fn_first_line: std.StringHashMap(usize) = undefined,
     current_struct: ?[]const u8,
     current_ret_type: ?ast.TypeRef = null,
     // M3-B: function coloring — true while checking the body of an `async fn`.
@@ -140,6 +141,7 @@ pub const TypeChecker = struct {
             .functions = std.StringHashMap(ast.FunctionDecl).init(allocator),
             .ambiguous_fns = std.StringHashMap(void).init(allocator),
             .fn_def_sites = std.StringHashMap(void).init(allocator),
+            .fn_first_line = std.StringHashMap(usize).init(allocator),
             .current_struct = null,
         };
     }
@@ -238,8 +240,26 @@ pub const TypeChecker = struct {
                 }
                 try self.functions.put(decl.fn_decl.name, decl.fn_decl);
                 // F1-3b N2: record that this file defines this fn name (locality).
+                // F4/F1-6: Nova has NO function overloading (specs.md §"No ... overloading"), so two
+                // functions with the SAME name in the SAME module (file) are a REDEFINITION, not an
+                // overload set — and codegen would silently dedup them by name (declarations.zig),
+                // dropping one, so calls resolve to the survivor and produce garbage. Reject it here as
+                // a located error. Keyed on (file, name) so same-named functions in DIFFERENT modules
+                // still coexist (module-prefixed symbols never collide). A recurrence at the SAME line
+                // is a benign double-inclusion of one decl (proven: 0 different-line recurrences across
+                // the corpus), so only a DIFFERENT line is a genuine second definition.
                 const key = try std.fmt.allocPrint(self.allocator, "{s}\x00{s}", .{ decl.fn_decl.span.file, decl.fn_decl.name });
-                if (self.fn_def_sites.contains(key)) self.allocator.free(key) else try self.fn_def_sites.put(key, {});
+                if (self.fn_def_sites.contains(key)) {
+                    if (self.fn_first_line.get(key)) |ln| {
+                        if (ln != decl.fn_decl.span.line) {
+                            self.addError(decl.fn_decl.span, "duplicate function '{s}' — already defined at line {d} in this module (Nova has no overloading)", .{ decl.fn_decl.name, ln });
+                        }
+                    }
+                    self.allocator.free(key);
+                } else {
+                    try self.fn_def_sites.put(key, {});
+                    try self.fn_first_line.put(try std.fmt.allocPrint(self.allocator, "{s}\x00{s}", .{ decl.fn_decl.span.file, decl.fn_decl.name }), decl.fn_decl.span.line);
+                }
             }
         }
 
@@ -1035,6 +1055,15 @@ pub const TypeChecker = struct {
         self.current_struct = s.name;
         defer self.current_struct = null;
         self.checkDuplicateTypeParams(s.name, s.type_params, s.span);
+        // F4/F1-6: no overloading — two methods with the same name on one struct are a redefinition
+        // (codegen would emit a colliding `<Owner>_<method>` symbol). Reject, like trait methods do.
+        for (s.methods, 0..) |m1, i| {
+            for (s.methods[i + 1 ..]) |m2| {
+                if (std.mem.eql(u8, m1.decl.name, m2.decl.name)) {
+                    self.addError(m2.decl.span, "duplicate method '{s}' in '{s}' — Nova has no overloading", .{ m2.decl.name, s.name });
+                }
+            }
+        }
         for (s.fields) |f| self.rejectUnimplementedType(f.type_name, f.span);
         for (s.methods) |m| {
             self.variables.clearRetainingCapacity();

@@ -1,0 +1,14 @@
+// EXPECT-FAIL: codegen
+// F4/F1-7 (N3): a call that resolves to NOTHING is a hard error, never a silent no-op or a guess.
+// Here a method that does not exist on the receiver type — the checker/codegen rejects the call
+// ("no such method or function") rather than emitting a call to a phantom symbol.
+import assert;
+
+struct P { pub x: int, init() { self.x = 0; } }
+
+@test
+fn run(): void {
+    let p = P();
+    let y = p.noSuchMethod(3);
+    assert.equalInt(y, 3);
+}

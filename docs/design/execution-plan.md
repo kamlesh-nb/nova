@@ -95,7 +95,7 @@ not instead of finishing it.
 | **F1** | F4-1: type args survive parse — explicit `Foo<int>{}` + generic-trait impl | P0.5 | ✅ | `80_struct_init_typeargs` | (verified) |
 | **F2** | Module-qualified type inside a closure | P0.5 | ✅ | `34_module_type_in_closure` | (verified) |
 | **F3** | F3-5: honest i32 slots ✅ (out-of-range literal rejected); overflow WRAPS (defined) — trap deferrable | found | ◑ | `int_overflow_trap` | (verified) |
-| **F4** | F1-7: unresolved-call is a hard error ✅ (F2-5); F1-6 Itanium mangling still open | found | ◑ | `undefined_function` | (verified) |
+| **F4** | ✅ F1-7 unresolved-call = hard error (F2-5); F1-6 → spec forbids overloading, so REJECT same-module duplicate fns/methods (mangling unneeded) | found | ✅ | `unresolved_call` `duplicate_function` `duplicate_method` | 156/156 |
 | **F5** | F1-4: function-visibility across multi-segment imports | found | ✅ | `private_fn_cross_module` | (verified) |
 | **C1** | crypto expansion: PBKDF2 + SCRAM-SHA-256 primitives | P4 | ✅ | `89_crypto_scram` (RFC 7677) | (this session) |
 | **D1** | MySQL live verification (MySQL 9, caching_sha2 auth) | P3 | ✅ | live via `ycsb_mysql` (A–F) | (this session) |
@@ -447,11 +447,31 @@ schedule deliberately.
 
 **State (verified 2026-07-22):** honest i32 slots are DONE — an out-of-range literal (`let x: int = 5000000000`) is rejected at compile time ("out of range for 'int' — use 'long'"). Arithmetic overflow currently WRAPS two's-complement (`i32max + 1 == i32min`) — DEFINED behavior, not UB, so it is memory-safe. A trap-on-overflow is a footgun-preventer, NOT a soundness hole, and it CONFLICTS with the energy-efficiency goal (checks cost cycles) AND with the stdlib's intentional wrapping (the LCG/PRNG/hashing use `long`/`ulong` wrap on purpose). Recommended: DEFER; if taken, use the Rust model (checked in debug/test, wrap in release so energy-critical release binaries pay nothing) + explicit `wrapping_*` for intentional wrap. **Tracking:** ◑ verified — honest slots done; overflow-trap deferred by design.
 
-# F4 — F1-6/F1-7: mangling + unresolved-call-is-error (foundation)
+# F4 — F1-6/F1-7: no-overloading collision safety + unresolved-call-is-error (foundation) ✅
 
-**Design:** F1-7 makes an unresolved call at end-of-sema a hard error (N3); F1-6 adds Itanium name mangling
-for overloadable symbols. **DoD:** negative gate `unresolved_call` (rejected with diagnostic); mangled
-symbols don't collide across modules; full suite green. **Deps:** H1. **Tracking:** _pending_
+**Design (reconciled with the spec):** F1-7 makes an unresolved call a hard error (N3). F1-6 was framed as
+"Itanium mangling for overloadable symbols" — but **specs.md explicitly forbids overloading**, so
+signature-mangling to disambiguate overloads is unnecessary. The real gap F1-6 addressed is that two
+same-name functions in one module SILENTLY collided (codegen dedups by symbol name → the wrong body runs →
+garbage). The correct fix under "no overloading" is to REJECT the redefinition.
+
+**What landed (2026-07-24, commit pending):**
+- **F1-7 already satisfied** by F2-5: an unresolved/undefined call is a located hard error
+  (`undefined identifier ... (F2-5)`), never a silent no-op.
+- **Duplicate free function** (same name, same module/file) → located `duplicate function '<f>' — already
+  defined at line N` error (`type_checker.zig` check(), module-scoped on `(file, name)`; a same-line
+  recurrence is a benign double-inclusion — proven 0 different-line recurrences across the corpus, so only a
+  DIFFERENT line is a real second definition).
+- **Duplicate method** (same name on one struct) → `duplicate method '<m>' in '<S>'` (mirrors the existing
+  trait-method / enum-variant checks).
+- **Cross-module same-name functions still coexist** (module-prefixed symbols never collide) — exercised
+  pervasively by the stdlib (`hash`, `get`, …), corpus green.
+- **Itanium mangling itself: closed as unnecessary** — the `<module>_<name>` / `<Owner>_<method>__<args>`
+  scheme + no-overloading + duplicate-rejection make symbols collision-free.
+
+**DoD:** negative gates `unresolved_call` (codegen), `duplicate_function` (typecheck),
+`duplicate_method` (typecheck) — all rejected for the declared reason. Corpus 156/156, ASAN 283/283.
+**Deps:** H1. **Tracking:** DONE.
 
 # F5 — F1-4 finish + function-visibility multi-segment-import hole (foundation)
 
@@ -2143,8 +2163,10 @@ its section above. Items already ✅ are omitted. **Next pick: V1** (a real soun
    the exact box/unbox/own wiring in **`docs/design/value-optional-boxing.md`**. **`nova-value-optional-zero-bug`**.
    Known pre-existing erasure gap (non-crashing): a FREE generic fn returning `T|undefined` (`maybe<T>`) is type-erased
    and can't box — a present `0` from it still reads absent; needs free-fn monomorphization.
-2. **F4** — F1-6 Itanium name mangling (overloadable symbols don't collide cross-module) + confirm F1-7 unresolved-call
-   is a hard error. Foundation; negative gate `unresolved_call`.
+2. **F4** ✅ **DONE 2026-07-24.** F1-7 unresolved-call is a hard error (was already satisfied by F2-5) +
+   F1-6: since the spec FORBIDS overloading, the real fix is rejecting same-module duplicate functions/methods
+   (they silently collided → garbage). Itanium mangling is unnecessary (module-prefix scheme is collision-free).
+   Gates `unresolved_call`/`duplicate_function`/`duplicate_method`. Corpus 156/156, ASAN 283/283.
 3. **H3** — test infrastructure: a first-class project-wide `@test` runner (the engine exists) + relocate corpus cases
    into their owning stdlib modules; **all db-driver tests → their `packages/nova-<driver>/tests/`**. See H3 design.
 4. **F3** — overflow-trap: DEFERRED by design (wrapping is defined/energy-cheap); revisit only if we adopt the Rust
