@@ -404,6 +404,27 @@ long long nova_f64_bits(double d) {
 
 // Crypto (nova_sha256/md5/sha512/hmac/random) lives in crypto.cpp — real wolfCrypt.
 
+// Spinlock — for TINY critical sections in the async hot path (e.g. the reverse-proxy connection
+// pool's list push/pop). A std::mutex there is pathological: when contended it futex-BLOCKS the io_context
+// worker thread, so under N threads the whole event loop convoys and throughput collapses (measured:
+// 8 threads ~70x slower than 1). A spinlock holds the thread ~nanoseconds and never deschedules it, so
+// the loop keeps flowing. Backed by std::atomic_flag; the section MUST be lock-free (no await while held).
+long long nova_spin_create(void) { return (long long)new std::atomic_flag{}; }
+void nova_spin_lock(long long h) {
+  if (!h) return;
+  auto *f = reinterpret_cast<std::atomic_flag *>(h);
+  while (f->test_and_set(std::memory_order_acquire)) {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    asm volatile("yield");
+#endif
+  }
+}
+void nova_spin_unlock(long long h) {
+  if (h) reinterpret_cast<std::atomic_flag *>(h)->clear(std::memory_order_release);
+}
+
 // ===== Sync: mutex / condvar / rwlock (handles) ============================
 long long nova_mutex_create(void) { return (long long)new std::mutex(); }
 void nova_mutex_lock(long long h) {

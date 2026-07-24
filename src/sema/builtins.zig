@@ -105,6 +105,20 @@ pub const externs = [_]Builtin{
     .{ .receiver = "", .name = "nova_file_read_all", .ret = .int },
     // double's raw IEEE-754 bits as a long (bit_cast), for binary wire formats (BSON double).
     .{ .receiver = "", .name = "nova_f64_bits", .ret = .long },
+    // Mutex handles (std::mutex) — guard a shared structure across coroutine threads (e.g. the proxy's
+    // idle-connection pool). create → opaque long handle; lock/unlock take it.
+    .{ .receiver = "", .name = "nova_mutex_create", .ret = .long },
+    .{ .receiver = "", .name = "nova_mutex_lock", .ret = .void_ },
+    .{ .receiver = "", .name = "nova_mutex_unlock", .ret = .void_ },
+    // Per-thread lock-free structures: current io_context worker index [0,N) + N. The proxy pool keys
+    // its idle lists by nova_thread_id() so each is touched by ONE worker only (HAProxy idle_conn_srv).
+    .{ .receiver = "", .name = "nova_thread_id", .ret = .long },
+    .{ .receiver = "", .name = "nova_worker_count", .ret = .long },
+    // Spinlock — tiny async-hot-path critical sections (proxy pool). A blocking mutex there convoys the
+    // io_context threads; the spinlock holds the thread ~ns and never deschedules it.
+    .{ .receiver = "", .name = "nova_spin_create", .ret = .long },
+    .{ .receiver = "", .name = "nova_spin_lock", .ret = .void_ },
+    .{ .receiver = "", .name = "nova_spin_unlock", .ret = .void_ },
     .{ .receiver = "", .name = "nova_socket_send", .ret = .int },
     .{ .receiver = "", .name = "nova_socket_send_n", .ret = .int },
     // recv returns the INT byte-count received (its only caller uses it as `bytes.alloc(n)`

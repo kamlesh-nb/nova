@@ -526,12 +526,22 @@ unsigned nova_thread_count() {
 // join and restart() for the next top-level drive. (The pool is per-drive for now —
 // block-drive is a rare sync→async boundary, not a hot path; a persistent pool is a
 // later optimization.)
+// Worker-thread index [0, N). Set once per io_context worker; every coroutine resumed on that thread
+// reads it via nova_thread_id(). This is what lets Nova code keep PER-THREAD, LOCK-FREE structures
+// (the reverse-proxy connection pool): a per-thread slot is only ever touched by its own worker (a
+// thread runs one coroutine at a time, and Nova's pool critical sections have no await), so no lock is
+// needed — the HAProxy `idle_conn_srv[tid]` model. The main thread is 0; pool threads 1..N-1.
+static thread_local int g_nova_tid = 0;
+long long nova_thread_id(void) { return g_nova_tid; }
+long long nova_worker_count(void) { return (long long)nova_thread_count(); }
+
 void nova_run(void) {
     const unsigned n = nova_thread_count();
     std::vector<std::thread> pool;
     if (n > 1) pool.reserve(n - 1);
     for (unsigned i = 1; i < n; ++i)
-        pool.emplace_back([] { g_io.run(); });
+        pool.emplace_back([i] { g_nova_tid = (int)i; g_io.run(); });
+    g_nova_tid = 0;
     g_io.run();
     for (auto &t : pool) t.join();
     g_io.restart();

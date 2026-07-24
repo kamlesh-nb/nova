@@ -104,6 +104,8 @@ long long nova_sched_next(void);
 // coroutines (and pending timers/sockets) complete; nova_io_context exposes the
 // context for timer/socket awaitables.
 void      nova_run(void);
+long long nova_thread_id(void);      // current io_context worker index [0, N)
+long long nova_worker_count(void);   // N (NOVA_THREADS / hardware)
 // Drives the loop until `root` actually completes (not merely until the context
 // is idle). Aborts loudly on a genuinely lost wakeup rather than letting the
 // caller read an unwritten promise slot.
@@ -155,6 +157,9 @@ long long nova_channel_recv(long long channel_handle);
 void      nova_channel_destroy(long long channel_handle);
 
 // ===== Sync primitives (long long handles) =================================
+long long nova_spin_create(void);
+void      nova_spin_lock(long long h);
+void      nova_spin_unlock(long long h);
 long long nova_mutex_create(void);
 void      nova_mutex_lock(long long h);
 void      nova_mutex_unlock(long long h);

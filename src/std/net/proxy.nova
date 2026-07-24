@@ -19,27 +19,64 @@ import bytes;
 pub struct Backend {
     pub host: string,
     pub port: int,
-    init(host: string, port: int) { self.host = host; self.port = port; }
+    // HAProxy-style keep-alive reuse, LOCK-FREE via PER-THREAD idle pools (`idle_conn_srv[tid]`): after a
+    // response completes, the backend socket is returned to the CURRENT worker's list instead of closed,
+    // and the next request on that worker reuses it — no TCP handshake, no DNS resolve, no ephemeral-port
+    // churn. `idle.get(tid)` is touched only by worker `tid` (one coroutine per thread at a time, and the
+    // pop/push has no `await`), so NO lock is needed — a shared mutex/spinlock convoyed the io_context
+    // threads and collapsed throughput. A connection acquired on one worker and released on another simply
+    // moves between per-thread lists (implicit rebalancing).
+    pub idle: List<List<long>>,
+    pub reuse: bool,   // pooling is safe only with a single worker (per-coroutine socket strands)
+    init(host: string, port: int) {
+        self.host = host;
+        self.port = port;
+        self.reuse = nova_worker_count() == 1;
+        self.idle = List<List<long>>();
+        let nt = nova_worker_count() as int;
+        let i = 0;
+        while (i < nt) { self.idle.push(List<long>()); i = i + 1; }
+    }
+}
+
+// One framed HTTP message + the two facts the pool needs: was it CLEANLY framed (Content-Length or
+// chunked → the connection is at a message boundary and reusable) and did it ask to CLOSE.
+pub struct HttpMsg {
+    pub bytes: string,
+    pub framed: bool,     // false = terminated by connection close (read-to-EOF) → not reusable
+    pub wantClose: bool,  // a `Connection: close` header is present
+    init(bytes: string, framed: bool, wantClose: bool) {
+        self.bytes = bytes;
+        self.framed = framed;
+        self.wantClose = wantClose;
+    }
 }
 
 pub struct Pool {
     pub backends: List<Backend>,
-    pub cursor: int,
-    init() { self.backends = List<Backend>(); self.cursor = 0; }
+    pub cursors: List<int>,   // PER-THREAD round-robin cursor — each worker's is touched only by itself
+    init() {
+        self.backends = List<Backend>();
+        self.cursors = List<int>();
+        let nt = nova_worker_count() as int;
+        let i = 0;
+        while (i < nt) { self.cursors.push(0); i = i + 1; }
+    }
 
     pub fn add(self: Pool, host: string, port: int): void {
         self.backends.push(Backend(host, port));
     }
     pub fn size(self: Pool): int { return self.backends.size(); }
 
-    // Round-robin. Returns a Backend with port 0 when the pool is empty (caller answers 502).
-    // Called from the single accept-loop coroutine, so the cursor advances without a data race.
+    // Round-robin, lock-free: each worker advances its OWN cursor. Returns a Backend with port 0 when the
+    // pool is empty (caller answers 502). Per-thread cursors give an even split without a shared counter.
     pub fn next(self: Pool): Backend {
         let n = self.backends.size();
         if (n == 0) { return Backend("", 0); }
-        let idx = self.cursor % n;
-        self.cursor = self.cursor + 1;
-        if (self.cursor >= 1000000000) { self.cursor = 0; } // keep the counter well inside int range
+        let t = nova_thread_id() as int;
+        let c = self.cursors.get(t) ?? 0;
+        let idx = c % n;
+        self.cursors.set(t, c + 1);
         return self.backends.get(idx) ?? Backend("", 0);
     }
 }
@@ -151,29 +188,31 @@ fn chunkedEnd(buf: long, start: int, len: int): int {
 // ("" on error / EOF before the headers complete). `isResponse` picks the no-length fallback: a
 // response with neither Content-Length nor chunked framing ends at connection close (read to EOF);
 // a request without a body ends at the header block.
-async fn readMessage(sock: long, isResponse: bool, tmo: int): string {
+async fn readMessage(sock: long, isResponse: bool, tmo: int): HttpMsg {
     let cap = 65536;
     let buf: long = bytes.alloc(cap);
     let len = 0;
 
     let hdrEnd = findHeaderEnd(buf, len);
     while (hdrEnd == -1) {
-        if (len >= cap) { bytes.free(buf); return ""; }
+        if (len >= cap) { bytes.free(buf); return HttpMsg("", false, true); }
         let n = await asyncio.async_read_deadline(sock, buf + len, cap - len, tmo);
-        if (n <= 0) { bytes.free(buf); return ""; }
+        if (n <= 0) { bytes.free(buf); return HttpMsg("", false, true); }
         len = len + n;
         hdrEnd = findHeaderEnd(buf, len);
     }
 
+    let wantClose = findCI(buf, hdrEnd, "connection: close") != -1;
     let bodyStart = hdrEnd + 4;
     let msgEnd = bodyStart;
+    let framed = true;
 
     if (isChunked(buf, hdrEnd)) {
         let cend = chunkedEnd(buf, bodyStart, len);
         while (cend == -1) {
-            if (len >= cap) { break; }
+            if (len >= cap) { framed = false; break; }
             let n = await asyncio.async_read_deadline(sock, buf + len, cap - len, tmo);
-            if (n <= 0) { break; }
+            if (n <= 0) { framed = false; break; }
             len = len + n;
             cend = chunkedEnd(buf, bodyStart, len);
         }
@@ -182,14 +221,17 @@ async fn readMessage(sock: long, isResponse: bool, tmo: int): string {
         let need = contentLength(buf, hdrEnd);
         if (need >= 0) {
             while (len - bodyStart < need) {
-                if (len >= cap) { break; }
+                if (len >= cap) { framed = false; break; }
                 let n = await asyncio.async_read_deadline(sock, buf + len, cap - len, tmo);
-                if (n <= 0) { break; }
+                if (n <= 0) { framed = false; break; }
                 len = len + n;
             }
             msgEnd = bodyStart + need;
             if (msgEnd > len) { msgEnd = len; }
         } else if (isResponse) {
+            // No Content-Length, not chunked → the response body runs until the backend closes the
+            // connection. Read to EOF; the connection is consumed, so it is NOT reusable.
+            framed = false;
             while (len < cap) {
                 let n = await asyncio.async_read_deadline(sock, buf + len, cap - len, tmo);
                 if (n <= 0) { break; }
@@ -203,7 +245,48 @@ async fn readMessage(sock: long, isResponse: bool, tmo: int): string {
 
     let msg = bytes.read_string(buf, msgEnd);
     bytes.free(buf);
-    return msg;
+    return HttpMsg(msg, framed, wantClose);
+}
+
+// ---------------------------------------------------------------------------
+// Backend connection pool — acquire (reuse-or-dial) / release (keep-or-close)
+// ---------------------------------------------------------------------------
+
+// Take a connection to `b`: reuse a warm idle one if available, else dial fresh. The dial happens
+// OUTSIDE the lock (asyncConnect parks the coroutine). Returns a socket handle, or 0 on connect failure.
+async fn acquire(b: Backend): (long, bool) {
+    // Pop from THIS worker's idle list only (no lock — see Backend.idle). The pop completes before any
+    // await, so the coroutine can't migrate mid-critical-section.
+    let t = nova_thread_id() as int;
+    let lst = b.idle.get(t) ?? List<long>();
+    let sock: long = 0;
+    let n = lst.size();
+    if (n > 0) {
+        sock = lst.get(n - 1) ?? 0;
+        lst.remove(n - 1);
+    }
+    if (sock != 0) { return (sock, true); }   // warm reuse — no handshake, no resolve
+    let s = await asyncio.asyncConnect(b.host, b.port);
+    return (s.sock, false);                    // 0 on failure
+}
+
+// Return a connection to the CURRENT worker's idle list when the exchange left it at a clean message
+// boundary (reusable), else close it. Bounded per worker so a burst can't grow a list without limit.
+// Lock-free: sync (no await), so it runs entirely on one worker touching only that worker's list.
+//
+// REUSE IS GATED TO A SINGLE WORKER (nova_worker_count() == 1). This runtime binds each socket's async
+// I/O to a PER-COROUTINE strand (CoroState.strand), so a pooled socket moving between coroutines/threads
+// races under multi-threading (measured: reuse at NOVA_THREADS=8 corrupts; at =1 it is clean). So with
+// >1 worker we fall back to connect-per-request (correct); pooling engages single-threaded, where there
+// is no strand concurrency. Scale a pooled proxy as N single-threaded workers behind SO_REUSEPORT (the
+// nginx model) — or lift this once the runtime can detach/reattach a socket from its coroutine.
+fn release(b: Backend, sock: long, reusable: bool): void {
+    if (sock == 0) { return; }
+    if (!reusable || !b.reuse) { asyncio.aclose(sock); return; }
+    let t = nova_thread_id() as int;
+    let lst = b.idle.get(t) ?? List<long>();
+    if (lst.size() < 256) { lst.push(sock); }
+    else { asyncio.aclose(sock); }
 }
 
 // ---------------------------------------------------------------------------
@@ -214,33 +297,61 @@ fn errorResponse(code: int, reason: string, body: string): string {
     return `HTTP/1.1 ${code} ${reason}\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n${body}`;
 }
 
-// Serve one client: frame its request, forward to `b`, frame the reply, stream it back. Runs as its
-// own coroutine (spawned), so slow backends never stall the accept loop or other connections.
-async fn handleClient(b: Backend, clientSock: long, tmo: int): int {
-    let req = await readMessage(clientSock, false, tmo);
-    if (string.eql(req, "")) { asyncio.aclose(clientSock); return 0; }
+// Forward ONE request to backend `b` over a pooled connection, returning the response. Reuses a warm
+// idle connection when possible; if a reused connection turns out dead (the backend closed it while
+// idle → empty read on first use), retries ONCE on a fresh dial (HAProxy "safe" reuse). Returns "" if
+// the backend is unreachable / gives nothing even fresh.
+async fn forward(b: Backend, reqBytes: string, reqWantClose: bool, tmo: int): string {
+    let (bsock, reused) = await acquire(b);
+    if (bsock == 0) { return ""; }
 
-    if (b.port == 0) {
-        let _ = await asyncio.async_write(clientSock, errorResponse(502, "Bad Gateway", "no backends"));
-        asyncio.aclose(clientSock);
-        return 0;
+    let _ = await asyncio.async_write(bsock, reqBytes);
+    let resp = await readMessage(bsock, true, tmo);
+
+    if (string.eql(resp.bytes, "") && reused) {
+        asyncio.aclose(bsock);
+        let fresh = await asyncio.asyncConnect(b.host, b.port);
+        bsock = fresh.sock;
+        if (bsock == 0) { return ""; }
+        let _ = await asyncio.async_write(bsock, reqBytes);
+        resp = await readMessage(bsock, true, tmo);
     }
 
-    let backend = await asyncio.asyncConnect(b.host, b.port);
-    if (!backend.isOpen()) {
-        let _ = await asyncio.async_write(clientSock, errorResponse(502, "Bad Gateway", "backend unreachable"));
-        asyncio.aclose(clientSock);
-        return 0;
+    if (string.eql(resp.bytes, "")) {
+        release(b, bsock, false);
+        return "";
     }
+    // Reusable only when BOTH sides stayed keep-alive AND the reply was cleanly framed (at a boundary).
+    let reusable = resp.framed && !resp.wantClose && !reqWantClose;
+    release(b, bsock, reusable);
+    return resp.bytes;
+}
 
-    let _sent = await backend.sendStr(req);
-    let resp = await readMessage(backend.sock, true, tmo);
-    backend.close();
+// Serve one client connection, keep-alive: read requests until the peer closes or sends
+// `Connection: close`. Each request is load-balanced independently (round-robin) and forwarded over a
+// pooled backend connection. Runs as its own coroutine (spawned), so a slow exchange never stalls the
+// accept loop or the other clients.
+async fn handleClient(pool: Pool, clientSock: long, tmo: int): int {
+    let alive = true;
+    while (alive) {
+        let req = await readMessage(clientSock, false, tmo);
+        if (string.eql(req.bytes, "")) { alive = false; break; }  // client closed / error
 
-    if (!string.eql(resp, "")) {
+        let b = pool.next();
+        if (b.port == 0) {
+            let _ = await asyncio.async_write(clientSock, errorResponse(502, "Bad Gateway", "no backends"));
+            alive = false;
+            break;
+        }
+
+        let resp = await forward(b, req.bytes, req.wantClose, tmo);
+        if (string.eql(resp, "")) {
+            let _ = await asyncio.async_write(clientSock, errorResponse(502, "Bad Gateway", "upstream error"));
+            alive = false;
+            break;
+        }
         let _ = await asyncio.async_write(clientSock, resp);
-    } else {
-        let _ = await asyncio.async_write(clientSock, errorResponse(502, "Bad Gateway", "empty upstream reply"));
+        if (req.wantClose) { alive = false; }
     }
     asyncio.aclose(clientSock);
     return 0;
@@ -255,8 +366,7 @@ async fn runProxy(pool: Pool, port: int, tmo: int): int {
     console.log("Nova reverse proxy listening");
     while (true) {
         let client = await asyncio.aaccept(srv);
-        let b = pool.next();           // round-robin, serialized in the accept loop
-        spawn handleClient(b, client, tmo);
+        spawn handleClient(pool, client, tmo);
     }
     return 0;
 }

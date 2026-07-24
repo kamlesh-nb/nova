@@ -818,6 +818,19 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         const mutex_create_fn = core.LLVMAddFunction(compiler.module, "nova_mutex_create", mutex_create_type);
         try compiler.func_map.put("nova_mutex_create", mutex_create_fn);
 
+        // nova_thread_id / nova_worker_count — current io_context worker index + count, for per-thread
+        // lock-free structures (the HAProxy-style reverse-proxy connection pool).
+        try compiler.func_map.put("nova_thread_id", core.LLVMAddFunction(compiler.module, "nova_thread_id", mutex_create_type));
+        try compiler.func_map.put("nova_worker_count", core.LLVMAddFunction(compiler.module, "nova_worker_count", mutex_create_type));
+
+        // nova_spin_create/lock/unlock — spinlock for async-hot-path critical sections (proxy pool)
+        const spin_create_fn = core.LLVMAddFunction(compiler.module, "nova_spin_create", mutex_create_type);
+        try compiler.func_map.put("nova_spin_create", spin_create_fn);
+        var spin_p = [_]types.LLVMTypeRef{val_type};
+        const spin_lu_type = core.LLVMFunctionType(void_type, &spin_p, 1, 0);
+        try compiler.func_map.put("nova_spin_lock", core.LLVMAddFunction(compiler.module, "nova_spin_lock", spin_lu_type));
+        try compiler.func_map.put("nova_spin_unlock", core.LLVMAddFunction(compiler.module, "nova_spin_unlock", spin_lu_type));
+
         // nova_mutex_lock
         var one_val_param = [_]types.LLVMTypeRef{val_type};
         const mutex_lock_type = core.LLVMFunctionType(void_type, &one_val_param, 1, 0);
