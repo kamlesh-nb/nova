@@ -1192,7 +1192,12 @@ pub const LlvmCompiler = struct {
                             name = std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ mod_prefix, f.name }) catch return null;
                         }
                     }
-                    if (std.mem.eql(u8, name, func_name)) {
+                    // Match the module-prefixed emitted name OR the BARE source name: a module-qualified
+                    // generic free-fn call (`orm.queryAs<T>`) reaches the spec-routing hook with just the
+                    // field `queryAs`, which never equals `data_orm_queryAs` — so param-type lookups (for
+                    // trait-widening) must also accept the bare `f.name`. Param TYPES are the same across
+                    // any same-named fn, so a bare-name match is safe for this use.
+                    if (std.mem.eql(u8, name, func_name) or std.mem.eql(u8, f.name, func_name)) {
                         if (param_idx < f.params.len) {
                             if (f.params[param_idx].type_name) |t| {
                                 return self.typeRefToString(t) catch null;
