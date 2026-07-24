@@ -1,0 +1,39 @@
+// 162 — a @serializable struct with List<T> fields and NO explicit constructor binds correctly.
+// Regression: the generated `<S>__bind` constructs `obj` via the no-init default ctor `S()`, which
+// zero-fills — so a List field landed as a NULL handle and the binder's `obj.field.push(...)` crashed.
+// Nova structs have no field defaults, so the binder must initialize every List field it fills.
+// Covers primitive, int, and struct element types, over both the direct and generic-param reify paths.
+import assert;
+import serde.source;
+import list;
+
+@serializable struct Item { pub sku: string, pub qty: int }
+// No `init` — every field is filled by the generated binder alone.
+@serializable struct Order { pub id: int, pub tags: List<string>, pub nums: List<int>, pub items: List<Item> }
+
+fn materialize<T>(vs: ValueSource): T { return serde.bind<T>(vs); }
+
+@test
+fn test_direct_bind(): void {
+    let js: ValueSource = source.fromJson(
+        "{\"id\": 7, \"tags\": [\"a\", \"b\"], \"nums\": [1, 2, 3], \"items\": [{\"sku\": \"X\", \"qty\": 5}]}");
+    let o = serde.bind<Order>(js);          // direct concrete
+    assert.equalInt(o.id, 7);
+    assert.equalInt(o.tags.size(), 2);
+    assert.equalStr(o.tags.get(0) ?? "", "a");
+    assert.equalInt(o.nums.size(), 3);
+    assert.equalInt(o.nums.get(2) ?? 0, 3);
+    assert.equalInt(o.items.size(), 1);
+    let it = o.items.get(0) ?? Item{ sku: "", qty: 0 };
+    assert.equalStr(it.sku, "X");
+    assert.equalInt(it.qty, 5);
+}
+
+@test
+fn test_generic_bind_and_empty(): void {
+    let js: ValueSource = source.fromJson("{\"id\": 1, \"tags\": [], \"nums\": [9], \"items\": []}");
+    let o = materialize<Order>(js);         // generic-param path
+    assert.equalInt(o.tags.size(), 0);      // empty array binds to an empty (non-null) list
+    assert.equalInt(o.nums.size(), 1);
+    assert.equalInt(o.items.size(), 0);
+}

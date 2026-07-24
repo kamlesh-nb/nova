@@ -609,6 +609,14 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
                 },
                 .generic => |g| {
                     if (std.mem.eql(u8, g.name, "List") and g.params.len == 1) {
+                        // Initialize the List FIELD to an empty container first: `obj` comes from the
+                        // no-init default constructor `{S}()`, which zero-fills — a List field lands as a
+                        // NULL handle, so the `obj.{field}.push(...)` below would deref null and crash.
+                        // (Nova structs have no field defaults; the binder must init every field it fills.)
+                        switch (g.params[0]) {
+                            .ident => |en| try serdeAppendf(&src, allocator, "    obj.{s} = List<{s}>();\n", .{ fname, en }),
+                            else => {},
+                        }
                         try serdeAppendf(&src, allocator, "    {{ let __n = src.arrayLen(\"{s}\"); let __i = 0; while (__i < __n) {{ ", .{fname});
                         switch (g.params[0]) {
                             .ident => |en| {
