@@ -198,6 +198,12 @@ pub const LlvmCompiler = struct {
     /// erased `List_U_push` (which does not — the chained-map leak). A list of {param-name, concrete}
     /// pairs, applied AFTER the struct subst in `substTypeParams`. Null everywhere else.
     current_method_subst: ?[]const MethodParamBinding = null,
+    /// Recursion guard for `initDefaultContainerFields` — a no-init struct field that is ITSELF a
+    /// no-init struct is default-constructed recursively, so a cyclic non-optional shape (A has B, B
+    /// has A) would recurse forever at codegen. Capped: past the cap, deeper struct fields stay null
+    /// (same as before the fix), which only bites a degenerate cycle that can't be literal-constructed
+    /// either. Containers/strings are unaffected (they don't recurse).
+    default_ctor_depth: u32 = 0,
     /// F5-2: a rendered-name → TypeId reverse index, lazily built once from the store. Lets the
     /// name-only DECISION sites (destructor/box generators that receive `"ErrUnion(...)"` /
     /// `"(string,int)"` type-NAME strings, never an expr) recover the TypeId and ask `isOwnedTypeId`

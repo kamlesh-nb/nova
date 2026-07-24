@@ -946,29 +946,59 @@ fn buildClosureCleanup(self: *LlvmCompiler, lambda_name: []const u8, span: ast.S
 /// `+1` and register it for the statement drain; `.borrowed` → nothing. The rendered type
 /// name is still resolved here for the drain's destructor lookup, and an unresolvable name
 /// falls back to no-registration (behavior-identical to when the decision lived inline).
-/// The no-init default constructor `S()` zero-fills, so a heap CONTAINER field (`List<T>`) lands as a
-/// NULL handle and `S().field.push(..)` derefs null. Nova structs have no field defaults, so initialize
-/// each List field to an empty container — the "zero value" of a container is empty, not null. (Map/Set
-/// take constructor args — capacity, a hash fn — so they can't be defaulted this way; a struct using them
-/// must supply its own `init`.) Called only on the NO-`init` constructor path; an explicit init owns field
-/// setup. ARC: the fresh `List<T>()` temp is CONSUMED into the field (same O4 rule as struct_init), so the
-/// field holds the sole reference and the end-of-statement drain doesn't free it underneath.
+/// The no-init default constructor `S()` zero-fills, so heap-typed fields land as NULL handles and the
+/// first use (`S().field.push(..)`, `S().name + x`, `S().inner.field`) derefs null. Nova structs have no
+/// field defaults, so give each field its true ZERO VALUE here:
+///   * `List<T>`  → an empty list
+///   * `string`   → the empty string "" (concat / length on null crash)
+///   * a no-init STRUCT field → recursively default-constructed (depth-capped; see default_ctor_depth)
+/// Scalars/bools already zero-fill correctly; `Map`/`Set` take ctor args (capacity, a hash fn) so they
+/// can't be defaulted this way — a struct using them must supply its own `init`; optionals stay
+/// undefined. Called ONLY on the NO-`init` path (an explicit init owns field setup). ARC: each fresh
+/// value is CONSUMED into the field (same O4 rule as struct_init) so the field holds the sole reference
+/// and the end-of-statement drain doesn't free it underneath.
 pub fn initDefaultContainerFields(self: *LlvmCompiler, struct_name: []const u8, instance_ptr: types.LLVMValueRef, span: ast.Span) anyerror!void {
     const sd = self.structs.get(struct_name) orelse return;
+    if (self.default_ctor_depth > 24) return; // cyclic non-optional struct shape — stop recursing
+    self.default_ctor_depth += 1;
+    defer self.default_ctor_depth -= 1;
+
     for (sd.fields) |f| {
-        const params = switch (f.type_name) {
-            .generic => |g| if (std.mem.eql(u8, g.name, "List")) g.params else continue,
-            else => continue,
+        // Build the field's zero-value expression, or skip the field (scalar/Map/Set/optional/trait).
+        var callee_expr: ast.Expression = undefined;
+        const zero_expr: ?ast.Expression = switch (f.type_name) {
+            .generic => |g| blk: {
+                if (!std.mem.eql(u8, g.name, "List")) break :blk null; // Map/Set need ctor args
+                callee_expr = ast.Expression{ .kind = .{ .ident = "List" } };
+                break :blk ast.Expression{ .kind = .{ .generic_call = .{
+                    .callee = &callee_expr,
+                    .type_args = g.params,
+                    .args = &[_]ast.Expression{},
+                    .span = span,
+                } } };
+            },
+            .ident => |tn| blk: {
+                if (std.mem.eql(u8, tn, "string")) {
+                    break :blk ast.Expression{ .kind = .{ .literal = .{ .string = "" } } };
+                }
+                // A no-init struct field → default-construct it. Skip traits (no concrete ctor) and any
+                // struct whose init/new REQUIRES args (can't synthesize `S2()` for it — leave it null).
+                if (self.structs.contains(tn) and !self.traits.contains(tn) and structHasNoArgCtor(self, tn)) {
+                    callee_expr = ast.Expression{ .kind = .{ .ident = tn } };
+                    break :blk ast.Expression{ .kind = .{ .call = .{
+                        .callee = &callee_expr,
+                        .args = &[_]ast.Expression{},
+                        .span = span,
+                    } } };
+                }
+                break :blk null;
+            },
+            else => null,
         };
-        var callee_expr = ast.Expression{ .kind = .{ .ident = "List" } };
-        const list_ctor = ast.Expression{ .kind = .{ .generic_call = .{
-            .callee = &callee_expr,
-            .type_args = params,
-            .args = &[_]ast.Expression{},
-            .span = span,
-        } } };
-        const fv = try self.compileExpression(list_ctor);
-        try self.takeOwnedElement(list_ctor.kind, fv);
+        const ze = zero_expr orelse continue;
+
+        const fv = try self.compileExpression(ze);
+        try self.takeOwnedElement(ze.kind, fv);
         const offset = try self.getFieldOffset(struct_name, f.name);
         const offset_val = core.LLVMConstInt(self.val_type, offset, 0);
         const addr = core.LLVMBuildAdd(self.builder, instance_ptr, offset_val, "cf_addr");
@@ -976,6 +1006,22 @@ pub fn initDefaultContainerFields(self: *LlvmCompiler, struct_name: []const u8, 
         const fptr = core.LLVMBuildIntToPtr(self.builder, addr, core.LLVMPointerType(llvm_ft, 0), "cf_ptr");
         _ = core.LLVMBuildStore(self.builder, self.castFromValType(fv, llvm_ft), fptr);
     }
+}
+
+/// A struct is default-constructible via `S()` iff it has no `init`/`new`, or one whose only param is the
+/// implicit `self` (a zero-user-arg constructor). An init taking real args can't be synthesized blindly.
+fn structHasNoArgCtor(self: *LlvmCompiler, struct_name: []const u8) bool {
+    const sd = self.structs.get(struct_name) orelse return false;
+    for (sd.methods) |*m| {
+        if (std.mem.eql(u8, m.decl.name, "init") or std.mem.eql(u8, m.decl.name, "new")) {
+            var user_params: usize = 0;
+            for (m.decl.params) |p| {
+                if (!std.mem.eql(u8, p.name, "self")) user_params += 1;
+            }
+            return user_params == 0; // an init taking real args can't be synthesized as `S2()`
+        }
+    }
+    return true; // no init/new at all → the zero-fill default ctor
 }
 
 pub fn compileExpression(self: *LlvmCompiler, expr: ast.Expression) anyerror!types.LLVMValueRef {

@@ -1,14 +1,19 @@
-// 164 — the no-init default constructor `S()` initializes List fields to empty containers (not null).
-// Nova structs have no field defaults; `S()` zero-fills, so a `List<T>` field used to land as a NULL
-// handle and `S().field.push(..)` dereferenced null → crash. Now `S()` fills each List field with an
-// empty list. Covers: single/multi List fields, a generic struct, and that an explicit `init` still
-// wins (no double-init / no ARC regression). ARC-gated via the harness.
+// 164 — the no-init default constructor `S()` gives each field its true ZERO VALUE, not a null handle.
+// Nova structs have no field defaults; `S()` zero-fills, so heap fields used to land NULL and the first
+// use crashed: `List<T>` field → `.push` on null, `string` field → concat/length on null, a nested
+// no-init STRUCT field → `.field` on null. Now `S()` fills List→empty, string→"", struct→S2()
+// (recursively, depth-capped for cycles). Covers those plus a generic struct and that an explicit `init`
+// still wins (no double-init / no ARC regression). ARC-gated via the harness.
 import assert;
 import list;
+import string;
 
 struct Bag { pub id: int, pub tags: List<string>, pub nums: List<int> }   // no init
 struct Box<T> { pub items: List<T> }                                     // generic, no init
 struct Seeded { pub xs: List<string>, init() { self.xs = List<string>(); self.xs.push("seed"); } }
+struct Named { pub label: string, pub items: List<string> }              // string + list, no init
+struct Inner { pub x: int, pub tag: string }                            // no init
+struct Outer { pub id: int, pub inner: Inner }                          // nested no-init struct field
 
 @test
 fn test_default_ctor_fills_lists(): void {
@@ -34,4 +39,22 @@ fn test_explicit_init_unchanged(): void {
     let s = Seeded();                 // explicit init owns field setup; the default-fill must NOT run
     assert.equalInt(s.xs.size(), 1);
     assert.equalStr(s.xs.get(0) ?? "", "seed");
+}
+
+@test
+fn test_default_ctor_string_field(): void {
+    let n = Named();                  // label was null before the fix — concat/length crashed
+    assert.equalInt(string.len(n.label), 0);
+    let joined = n.label + "hi";
+    assert.equalStr(joined, "hi");
+    n.items.push("a");
+    assert.equalInt(n.items.size(), 1);
+}
+
+@test
+fn test_default_ctor_nested_struct(): void {
+    let o = Outer();                  // inner was null before the fix — o.inner.x crashed
+    assert.equalInt(o.inner.x, 0);    // nested struct default-constructed
+    assert.equalInt(string.len(o.inner.tag), 0); // ...recursively (its string field is "" too)
+    assert.equalInt(o.id, 0);
 }
