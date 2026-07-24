@@ -23,6 +23,20 @@ pub trait ValueSource {
     fn itemChild(self: ValueSource, key: string, i: int): ValueSource; // array of objects
 }
 
+// ValueSink — the write-side mirror of ValueSource: a format-agnostic *writer* that generated
+// struct dumpers emit into. The compiler emits `<Struct>__dump(obj: <Struct>, sink: ValueSink): void`
+// for every @serializable struct (scalar fields today; symmetric with the flat `__bind` read path).
+// The runtime picks the concrete sink: `orm.ParamSink` (→ out-of-band SQL params, injection-safe) or
+// a BSON sink for document stores. Field VALUES flow through `put*` as typed data — they are NEVER
+// interpolated into a query string, so a value carrying SQL/operator metacharacters stays inert.
+pub trait ValueSink {
+    fn putString(self: ValueSink, key: string, val: string): void;
+    fn putInt(self: ValueSink, key: string, val: long): void;
+    fn putBool(self: ValueSink, key: string, val: bool): void;
+    fn putFloat(self: ValueSink, key: string, val: double): void;
+    fn putDecimal(self: ValueSink, key: string, val: decimal): void;
+}
+
 // JSON-backed source over a parsed json.JsonValue.
 pub struct JsonSource impl ValueSource {
     pub node: json.JsonValue,

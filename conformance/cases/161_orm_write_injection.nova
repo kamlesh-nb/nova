@@ -1,0 +1,77 @@
+// 161 — D8 micro-ORM WRITE side + injection safety. A @serializable struct flattens into out-of-band
+// SQL params (`toParams`/`insert`) or typed BSON leaves (`toBson`) via the compiler-generated
+// `<T>__dump(obj, sink: ValueSink)` — the write mirror of `<T>__bind(src: ValueSource)`. The whole
+// point is INJECTION SAFETY BY CONSTRUCTION: a field VALUE never touches the query string. Only the
+// column/field NAMES (compile-known struct-field identifiers) are concatenated.
+import assert;
+import data.orm;
+import data.db;
+import serde.bson;
+import list;
+import string;
+
+@serializable struct UserDto { pub id: int, pub name: string, pub active: bool, pub balance: decimal }
+
+// Captures the SQL + params it was asked to run, so a test can prove the malicious value never
+// entered the SQL string — it arrived as a bound parameter.
+struct RecordingConn impl Connection {
+    pub lastSql: string,
+    pub lastParams: List<DbValue>,
+    init() { self.lastSql = ""; self.lastParams = List<DbValue>(); }
+    async fn exec(self: RecordingConn, sql: string, params: List<DbValue>): ExecResult {
+        self.lastSql = sql;
+        self.lastParams = params;
+        return ExecResult(1, "INSERT 0 1");
+    }
+    async fn query(self: RecordingConn, sql: string, params: List<DbValue>): ResultSet { return ResultSet(); }
+    fn close(self: RecordingConn): void {}
+    fn setTimeout(self: RecordingConn, ms: int): int { return 0; }
+    async fn prepare(self: RecordingConn, sql: string): int { return 0; }
+    async fn queryPrepared(self: RecordingConn, stmt: int, params: List<DbValue>): ResultSet { return ResultSet(); }
+    async fn execPrepared(self: RecordingConn, stmt: int, params: List<DbValue>): ExecResult { return ExecResult(0, ""); }
+}
+
+@test
+fn test_toparams_flattens_struct(): void {
+    let u = UserDto{ id: 7, name: "Ada", active: true, balance: 12.50m };
+    let p = orm.toParams<UserDto>(u);
+    assert.equalInt(p.cols.size(), 4);
+    assert.equalStr(p.cols.get(0) ?? "", "id");
+    assert.equalStr(p.cols.get(1) ?? "", "name");
+    assert.equalInt((p.vals.get(0) ?? db.dbNull()).asLong() as int, 7);
+    assert.equalStr((p.vals.get(1) ?? db.dbNull()).asText(), "Ada");
+    assert.isTrue((p.vals.get(2) ?? db.dbNull()).asBool());
+}
+
+@test
+fn test_insert_binds_value_out_of_band(): void {
+    let conn = RecordingConn();
+    let evil = "Robert'); DROP TABLE students;--";      // Bobby Tables
+    let u = UserDto{ id: 7, name: evil, active: true, balance: 12.50m };
+    let r = orm.insert<UserDto>(conn, "users", u);
+    assert.equalInt(r.rows_affected as int, 1);
+
+    // The generated SQL is fixed column names + `$N` placeholders — the malicious value is NOT in it.
+    assert.equalStr(conn.lastSql, "INSERT INTO users (id, name, active, balance) VALUES ($1, $2, $3, $4)");
+    assert.isFalse(string.contains(conn.lastSql, "DROP TABLE"));
+
+    // The value is carried verbatim as a bound param — data, not SQL. That is the injection barrier.
+    assert.equalInt(conn.lastParams.size(), 4);
+    assert.equalStr((conn.lastParams.get(1) ?? db.dbNull()).asText(), evil);
+}
+
+@test
+fn test_tobson_stores_leaf_values(): void {
+    // A user value that WOULD be a Mongo query operator if spliced into a query DOCUMENT — here it
+    // lands as a plain BSON string leaf, never parsed as an operator ($where/$gt injection is inert).
+    let evil = "{\"$gt\": \"\"}";
+    let d = UserDto{ id: 0, name: evil, active: false, balance: 9.99m };  // present-0 id survives (V1)
+    let wire: ptr = bson.serialize(orm.toBson<UserDto>(d));  // a raw ptr — ARC won't reclaim it
+    let back = bson.deserialize(wire);
+
+    assert.equalInt(bson.findInt(back, "id"), 0);
+    assert.equalStr(bson.findString(back, "name"), evil);   // stored as a STRING value, not an operator
+    assert.equalInt(bson.findBool(back, "active"), 0);
+    assert.isTrue(bson.docFind(back, "balance") >= 0);
+    bytes.free(wire);
+}

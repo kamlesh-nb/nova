@@ -103,6 +103,8 @@ pub const externs = [_]Builtin{
     // (releasing address 21 for a 21-byte read) → SIGSEGV — the same trap flagged for recv
     // below. File.readText discards the count and reads into its own buffer.
     .{ .receiver = "", .name = "nova_file_read_all", .ret = .int },
+    // double's raw IEEE-754 bits as a long (bit_cast), for binary wire formats (BSON double).
+    .{ .receiver = "", .name = "nova_f64_bits", .ret = .long },
     .{ .receiver = "", .name = "nova_socket_send", .ret = .int },
     .{ .receiver = "", .name = "nova_socket_send_n", .ret = .int },
     // recv returns the INT byte-count received (its only caller uses it as `bytes.alloc(n)`

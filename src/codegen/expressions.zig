@@ -2543,8 +2543,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                         return error.FunctionNotFound;
                     };
                     var arg_val = try self.compileCallArgument(gc.args[0]);
-                    {
-                    }
                     if (try self.resolveExpressionTypeName(&gc.args[0])) |sname| {
                         if (self.structs.contains(sname)) {
                             arg_val = try self.constructTraitObject(arg_val, sname, "ValueSource");
@@ -2558,6 +2556,30 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     // consumes it; an immediate use drains it at statement end. Registering it again here
                     // double-counted, so `let a = serde.bind<Dto>(src)` released the bound struct twice → UAF.
                     return bound;
+                }
+                // Write-side mirror: `serde.dump<T>(obj, sink)` -> `<T>__dump(obj, sink)`. `obj` is a
+                // concrete `T` struct (passed as-is); `sink` is widened to `ValueSink` here for the same
+                // vtable reason as `serde.bind`'s src. Returns void.
+                if (fa.object.kind == .ident and std.mem.eql(u8, fa.object.kind.ident, "serde") and
+                    std.mem.eql(u8, fa.field, "dump") and gc.type_args.len == 1 and gc.args.len == 2)
+                {
+                    const rendered = try self.resolveReifyTypeName(gc.type_args[0]);
+                    const dumper_name = try std.fmt.allocPrint(self.allocator, "{s}__dump", .{rendered});
+                    defer self.allocator.free(dumper_name);
+                    const resolved_dumper = try self.resolveCalleeName(dumper_name);
+                    const fn_val = self.func_map.get(resolved_dumper) orelse self.func_map.get(dumper_name) orelse {
+                        std.debug.print("serde.dump: dumper '{s}' not found\n", .{dumper_name});
+                        return error.FunctionNotFound;
+                    };
+                    const obj_val = try self.compileCallArgument(gc.args[0]);
+                    var sink_val = try self.compileCallArgument(gc.args[1]);
+                    if (try self.resolveExpressionTypeName(&gc.args[1])) |sname| {
+                        if (self.structs.contains(sname)) {
+                            sink_val = try self.constructTraitObject(sink_val, sname, "ValueSink");
+                        }
+                    }
+                    var dargs = [_]types.LLVMValueRef{ obj_val, sink_val };
+                    return try self.buildCallWithCasts(fn_val, &dargs);
                 }
                 // F4-5: `serde.typeName<T>()` -> the concrete type's name as a string literal.
                 if (fa.object.kind == .ident and std.mem.eql(u8, fa.object.kind.ident, "serde") and

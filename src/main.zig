@@ -685,6 +685,33 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
             }
         }
         try src.appendSlice(allocator, "    out = out + \"}\";\n    return out;\n}\n\n");
+
+        // --- <S>__dump(obj, sink): void  (write-side mirror of __bind; scalar fields only) ---
+        // Each field's VALUE flows through a typed `put*` — never string-interpolated — so a value
+        // carrying SQL/operator metacharacters cannot escape into a query. Nested structs / lists are
+        // out of the flat write path's scope (same flat shape as the RowSource read side).
+        try serdeAppendf(&src, allocator, "fn {s}__dump(obj: {s}, sink: ValueSink): void {{\n", .{ s.name, s.name });
+        for (s.fields) |f| {
+            const fname = f.name;
+            switch (f.type_name) {
+                .ident => |tn| {
+                    if (std.mem.eql(u8, tn, "string")) {
+                        try serdeAppendf(&src, allocator, "    sink.putString(\"{s}\", obj.{s});\n", .{ fname, fname });
+                    } else if (std.mem.eql(u8, tn, "bool")) {
+                        try serdeAppendf(&src, allocator, "    sink.putBool(\"{s}\", obj.{s});\n", .{ fname, fname });
+                    } else if (serdeIsInt(tn)) {
+                        try serdeAppendf(&src, allocator, "    sink.putInt(\"{s}\", obj.{s});\n", .{ fname, fname });
+                    } else if (std.mem.eql(u8, tn, "decimal")) {
+                        try serdeAppendf(&src, allocator, "    sink.putDecimal(\"{s}\", obj.{s});\n", .{ fname, fname });
+                    } else if (serdeIsFloat(tn)) {
+                        try serdeAppendf(&src, allocator, "    sink.putFloat(\"{s}\", obj.{s});\n", .{ fname, fname });
+                    }
+                    // nested @serializable structs skipped (flat write path)
+                },
+                else => {}, // List<T> skipped (flat write path)
+            }
+        }
+        try src.appendSlice(allocator, "}\n\n");
     }
 
     if (src.items.len == 0) return;

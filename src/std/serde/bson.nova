@@ -68,6 +68,16 @@ pub fn entryDouble(key: string, hi: int, lo: int): BsonEntry {
     return BsonEntry{ type_id: 1, key: key, str_val: "", int_val: hi, int_val2: lo, dec_val: 0m };
 }
 
+// Build a type-0x01 double entry from an actual `double` value (splitting its IEEE-754 bits into the
+// two little-endian int32 halves the wire format stores). `entryDouble` above takes pre-split halves
+// (used by the deserializer); this is the producer for write paths (e.g. orm.BsonSink).
+pub fn entryDoubleVal(key: string, val: double): BsonEntry {
+    let bits: long = nova_f64_bits(val);
+    let hi: int = (bits >> 32) as int;
+    let lo: int = bits as int;
+    return BsonEntry{ type_id: 1, key: key, str_val: "", int_val: hi, int_val2: lo, dec_val: 0m };
+}
+
 // BSON decimal128 (type 0x13 = 19): the value's 16 BID bytes ARE the wire format. specs §3.1.
 pub fn entryDecimal(key: string, val: decimal): BsonEntry {
     return BsonEntry{ type_id: 19, key: key, str_val: "", int_val: 0, int_val2: 0, dec_val: val };
@@ -348,6 +358,13 @@ pub fn deserialize(ptr: ptr): BsonDocument {
             let hi = bytes.read_i32(ptr, offset);
             offset = offset + 4;
             doc.entries.push(entryInt64(key, hi, lo));
+        }
+        if (type_byte == 19) {
+            // decimal128 (0x13): the 16 BID bytes ARE the value. Without this branch the offset never
+            // advanced past a decimal entry, desyncing every following field.
+            let d = bytes.read_decimal(ptr, offset);
+            offset = offset + 16;
+            doc.entries.push(entryDecimal(key, d));
         }
         if (type_byte == 3) {
             let embedded_size = bytes.read_i32(ptr, offset);

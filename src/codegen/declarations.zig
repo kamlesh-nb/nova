@@ -172,6 +172,11 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         var ieee_p = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.i32_type };
         try compiler.func_map.put("nova_ieee_le_to_str", core.LLVMAddFunction(compiler.module, "nova_ieee_le_to_str", core.LLVMFunctionType(compiler.ptr_type, &ieee_p, 2, 0)));
 
+        // double's raw IEEE-754 bits -> long (bit_cast, not a value convert), for binary wire formats
+        // (BSON type-0x01 double). See nova_f64_bits.
+        var f64bits_p = [_]types.LLVMTypeRef{core.LLVMDoubleType()};
+        try compiler.func_map.put("nova_f64_bits", core.LLVMAddFunction(compiler.module, "nova_f64_bits", core.LLVMFunctionType(compiler.val_type, &f64bits_p, 1, 0)));
+
         var bool_p = [_]types.LLVMTypeRef{compiler.val_type};
         const bool_t = core.LLVMFunctionType(compiler.val_type, &bool_p, 1, 0);
         try compiler.func_map.put("nova_bool_to_string", core.LLVMAddFunction(compiler.module, "nova_bool_to_string", bool_t));

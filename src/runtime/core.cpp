@@ -391,6 +391,17 @@ char *nova_ieee_le_to_str(const char *data, int len) {
   return nova_f64_to_string(len == 8 ? d : 0.0);
 }
 
+// Reinterpret a double's 64 IEEE-754 bits as a long (bit_cast, NOT a numeric convert). Nova's `as`
+// between numeric types truncates the VALUE; a binary wire format (BSON double, network float) needs
+// the raw bit pattern. `hi = (bits >> 32) & 0xFFFFFFFF`, `lo = bits & 0xFFFFFFFF` split it into the
+// two little-endian int32 halves BSON's type-0x01 encoding stores. The inverse of the memcpy in
+// nova_ieee_le_to_str.
+long long nova_f64_bits(double d) {
+  long long bits;
+  std::memcpy(&bits, &d, sizeof(bits));
+  return bits;
+}
+
 // Crypto (nova_sha256/md5/sha512/hmac/random) lives in crypto.cpp — real wolfCrypt.
 
 // ===== Sync: mutex / condvar / rwlock (handles) ============================

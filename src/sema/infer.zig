@@ -1285,6 +1285,11 @@ pub const Inferer = struct {
                         if (std.mem.eql(u8, sfa.field, "typeName")) {
                             return self.ok(try self.store.stringT());
                         }
+                        if (std.mem.eql(u8, sfa.field, "dump")) {
+                            // write-side mirror of `bind`: `serde.dump<T>(obj, sink)` -> void
+                            for (g.args) |*a| _ = try self.inferExpr(a);
+                            return self.ok(try self.store.voidT());
+                        }
                     }
                 }
                 _ = try self.inferExpr(g.callee);
@@ -1380,7 +1385,19 @@ pub const Inferer = struct {
                                 // Record the free-fn instantiation so codegen emits a specialized body
                                 // (`maybe__int`) with T→concrete — needed for value-representation-
                                 // dependent returns (`T | undefined`, V1 boxing) the erased body can't do.
-                                if (fd.type_params.len > 0 and args.len == fd.type_params.len) {
+                                // SKIP when a type arg is itself an abstract type parameter: a generic fn
+                                // calling ANOTHER generic fn with its own `T` (`insert<T>` → `toParams<T>`)
+                                // is NOT an instantiation — recording `toParams__T` would emit a body whose
+                                // reifies (`serde.dump<T>`) have no concrete T → `T__dump not found`. The
+                                // real `toParams__UserDto` is recorded at the concrete call site.
+                                var all_concrete = fd.type_params.len > 0 and args.len == fd.type_params.len;
+                                for (args) |a| {
+                                    switch (self.store.get(a)) {
+                                        .type_param, .unresolved => all_concrete = false,
+                                        else => {},
+                                    }
+                                }
+                                if (all_concrete) {
                                     mono.noteFreeFnInst(self.store, n, fd.type_params, args);
                                 }
                                 return self.ok(sub);
