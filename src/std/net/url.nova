@@ -1,0 +1,88 @@
+// url.nova — a small URL parser for the HTTP client (W5).
+//
+// Splits `scheme://host[:port]/path[?query]` into its parts and infers the transport:
+//   * scheme `https` ⇒ TLS, default port 443;  `http` (or none) ⇒ plaintext, default port 80.
+// An explicit `:port` always wins. A missing path becomes `/`. The query (if any) is kept ON the
+// path (the request line sends `path?query` verbatim), and also exposed split out for convenience.
+import string;
+import assert;
+
+pub struct Url {
+    pub scheme: string, // "http" | "https"
+    pub host: string, // "api.example.com"
+    pub port: int, // 80 / 443 / explicit
+    pub path: string, // "/v1/x?a=1" — path WITH query, ready for the request line (never empty → "/")
+    pub query: string, // "a=1" (without the '?'), or ""
+    pub secure: bool, // scheme == "https"
+}
+
+pub fn parse(raw: string): Url {
+    let s = raw;
+    let scheme = "http";
+
+    // scheme://
+    let schemeIdx = string.indexOf(s, "://");
+    if (schemeIdx != -1) {
+        scheme = string.toLowerCase(string.slice(s, 0, schemeIdx));
+        s = string.slice(s, schemeIdx + 3, s.length);
+    }
+    let secure = scheme == "https";
+
+    // s is now `host[:port]/path?query`. The path starts at the first '/'.
+    let hostport = s;
+    let path = "/";
+    let pathIdx = string.indexOf(s, "/");
+    if (pathIdx != -1) {
+        hostport = string.slice(s, 0, pathIdx);
+        path = string.slice(s, pathIdx, s.length);
+    }
+
+    // host[:port]
+    let host = hostport;
+    let port = if (secure) 443 else 80;
+    let colonIdx = string.indexOf(hostport, ":");
+    if (colonIdx != -1) {
+        host = string.slice(hostport, 0, colonIdx);
+        port = string.parseI64(string.slice(hostport, colonIdx + 1, hostport.length));
+    }
+
+    // Split the query off the path (the path field keeps `?query` for the request line).
+    let query = "";
+    let qIdx = string.indexOf(path, "?");
+    if (qIdx != -1) {
+        query = string.slice(path, qIdx + 1, path.length);
+    }
+
+    return Url{
+        scheme: scheme,
+        host: host,
+        port: port,
+        path: path,
+        query: query,
+        secure: secure,
+    };
+}
+
+@test
+fn test_url_parse(): void {
+    let a = parse("https://api.example.com/v1/users?limit=10");
+    assert.equalStr(a.scheme, "https");
+    assert.equalStr(a.host, "api.example.com");
+    assert.equalInt(a.port, 443);
+    assert.equalStr(a.path, "/v1/users?limit=10");
+    assert.equalStr(a.query, "limit=10");
+    assert.isTrue(a.secure);
+
+    let b = parse("http://localhost:8080/health");
+    assert.equalStr(b.scheme, "http");
+    assert.equalStr(b.host, "localhost");
+    assert.equalInt(b.port, 8080);
+    assert.equalStr(b.path, "/health");
+    assert.isFalse(b.secure);
+
+    // no scheme, no path → http, port 80, "/"
+    let c = parse("example.com");
+    assert.equalStr(c.host, "example.com");
+    assert.equalInt(c.port, 80);
+    assert.equalStr(c.path, "/");
+}

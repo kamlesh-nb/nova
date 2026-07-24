@@ -124,7 +124,7 @@ not instead of finishing it.
 | **T7** | **Rename async socket primitives** — `arecv`→`async_read`, `asend`→`async_write` (user said `awrite`; the write side is `asend`), `arecvDeadline`→`async_read_deadline` | ⭐user P5 | ✅ | corpus 148/148 + 270/270 ASAN | (this session) |
 | **D7** | **DB production-readiness** (`db-production-roadmap.md`, MongoDB-first M1–M9) — pooling/cursors/timeouts/resilience/txns/concern/typed-errors/topology/auth-breadth/observability; then port patterns to SQL drivers. **Foundations all DONE** (async seam, generic pool+breaker, timeouts, TLS, error model) → we ARE in a position | ⭐user P2 | ⬜ | (design below) | — |
 | **D8** | **Dapper-style micro-ORM** (typed materializer) — `DocSource impl ValueSource` (BSON/row → typed struct via the existing `<Struct>__bind`) + `__toParams`/`__toBson` injection-safe binding; `query<T>(...)`→`List<T>`. Read-side prototype safe NOW; lands after D7 M2–M5 | ⭐user P3 | ⬜ | (design below) | — |
-| **W5** | **HTTP REST client with auto-TLS** — URL parser → `https://`⇒verified TLS (`asynctls.tlsConnect` exists), full verbs (GET/POST/PUT/DELETE/PATCH/HEAD), JSON convenience, keep-alive, timeouts, chunked+large-response decode, redirects. TLS plumbing DONE (verify-peer/SNI); this is wiring | ⭐user P2 | ⬜ | (design below) | — |
+| **W5** | ✅ **CORE DONE** — `Http` client: URL parse → `https`⇒verified TLS (fail-closed), 6 verbs + `request`, Content-Length + chunked framing (any size), per-request timeout, bounded redirects. Live-proven vs example.com. `getJson<T>`/`postJson<T>` deferred (needs module-qualified generic-call spec routing) | ⭐user P2 | ◑ | `157_http_client` | 157/157, ASAN 285/285 |
 | **W6** | **HTTP server hardening (production-grade)** — chunked transfer-encoding (req decode + resp write), request/idle timeouts (`arecvDeadline` exists, unused), header/body size caps + 413/431, inbound TLS/HTTPS (`nova_mtls_new_server` exists, unwired); switch `nova init` template off the weak `server.nova` onto the fast `App` server | ⭐user P2 | ⬜ | (design below) | — |
 | **W7** | **HTTP compression** — runtime `nova_gzip_*`/`nova_deflate_*` over **already-linked zlib** (`-lz`, no new dep) + `Content-Encoding`/`Accept-Encoding` negotiation in client & server. (Boost.IOStreams NOT available — Asio is header-only here) | ⭐user P3 | ⬜ | (design below) | — |
 | **R1** | **Runtime process primitives** — implement `nova_process_spawn`/`_write_stdin`/`_read_stdout`/`_wait`/`_free` (currently STUBS returning null/-1 at `io.cpp:805`) + new `nova_process_kill(pid,sig)`, via POSIX fork/execve/pipe/waitpid. **Foundational — blocks the orchestrator**; `process.nova` API already declared | ⭐P2 | ⬜ | (design below) | — |
@@ -1753,13 +1753,15 @@ The client just never calls them.
 (chunked/Content-Length response framing — shared with W6), `web/circuit_breaker.nova` (unchanged surface).
 
 **Definition of Done:**
-- [ ] `client.get("https://api.example.com/v1/x")` performs a **verified** TLS call with zero manual TLS setup; `http://…` stays plaintext; port inferred from scheme.
-- [ ] All six verbs + generic `request(...)`; `getJson<T>`/`postJson<…>` round-trip typed structs.
-- [ ] Response framing handles Content-Length AND chunked; > 64 KB bodies stream; a per-request timeout aborts a stalled call; bounded redirect following.
-- [ ] Gate `NNN_http_client_tls` (live GET to an HTTPS endpoint + a chunked response + a timeout) + ASAN clean.
+- [x] `client.Http.get("https://api.example.com/v1/x")` performs a **verified** TLS call with zero manual TLS setup (`nova_tls_new` = VERIFY_PEER + system-CA + SNI + hostname check, fail-closed); `http://…` stays plaintext; port inferred from scheme. **Live-proven** vs `https://example.com`.
+- [x] All six verbs (`get`/`post`/`put`/`patch`/`del`/`head`) + generic `request(...)` / `requestTimeout(...)`.
+- [x] Response framing handles Content-Length (read-to-EOF) AND **chunked** decode; any body size (string-accumulation, no 64 KB cap); a per-request timeout aborts a stalled call (`nova_socket_connect_timeout` + `set_timeout`); **bounded redirect following** (301/302/303/307/308, hop cap, 303/301/302→GET, 307/308 preserve method).
+- [x] Gate `157_http_client` (hermetic: URL parse + auto-TLS routing + chunked/Content-Length framing @tests + a fail-closed connection error) + ASAN clean (285/285). Live verified-TLS GET proven manually.
+- [ ] **`getJson<T>`/`postJson<T>` — DEFERRED (follow-up).** Blocked on module-qualified generic-CALL spec routing: `client.Http.getJson<T>()` / `client.getJson<T>()` don't route to the free-fn/static-method monomorphized spec (the sync `.generic_call` field-access path drops type-args). Free-fn mono itself is done (`serde.bind<T>` works in a bare generic free fn); the gap is the module/namespace-qualified call site. Small, well-scoped.
 
-**Dependencies:** `asynctls.tlsConnect` (done), `withTimeout` (done), serde (done), W6 chunked codec (shared).
-**Tracking:** _pending._
+**Implementation:** synchronous over the blocking, VERIFIED transports (`net/tls.nova` for https, `net/tcp` for http) — simpler and correct, no async context needed. `net/url.nova` (parser), `web/client.nova` (`Http` struct + `HttpConn` transport shim + `frame`/`dechunk`). Async-over-`AsyncIO` is a future enhancement. Files: `net/url.nova`, `web/client.nova`; `main.zig` std_modules += `net/url`.
+
+**Dependencies:** blocking verified TLS (done), serde (for the deferred JSON convenience). **Tracking:** CORE DONE 2026-07-24; JSON convenience deferred.
 
 ---
 

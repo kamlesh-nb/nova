@@ -1,0 +1,34 @@
+// 157 — W5 HTTP REST client: URL parsing + auto-TLS scheme routing + response framing.
+//
+// This gate is HERMETIC (no network). Importing `web.client` also runs its offline @tests
+// (`test_dechunk`, `test_frame_content_length`, `test_frame_chunked`) which cover chunked decoding
+// and Content-Length framing. The LIVE verified-TLS GET (`https://…` → 200) is proven separately
+// (manual, network-dependent) and documented in the W5 design; it stays out of the hermetic corpus.
+import assert;
+import web.client; // pulls in the client + its offline framing @tests
+import net.url;
+import string;
+
+@test
+fn run(): void {
+    // Auto-TLS by scheme + explicit port + query preserved on the path.
+    let a = url.parse("https://api.example.com:8443/v1/users?limit=10");
+    assert.isTrue(a.secure);
+    assert.equalStr(a.host, "api.example.com");
+    assert.equalInt(a.port, 8443);
+    assert.equalStr(a.path, "/v1/users?limit=10");
+
+    // http defaults: port 80, plaintext, path "/".
+    let b = url.parse("http://localhost/");
+    assert.isFalse(b.secure);
+    assert.equalInt(b.port, 80);
+
+    // https default port 443 when none given.
+    let c = url.parse("https://example.com/x");
+    assert.equalInt(c.port, 443);
+    assert.isTrue(c.secure);
+
+    // A connection to an unreachable host fails CLOSED with a 5xx, never a crash or a bogus 200.
+    let r = client.Http.requestTimeout("GET", "http://127.0.0.1:9/", Map<string, string>(4, string.hash), "", 300);
+    assert.equalInt(r.status.toCode(), 500);
+}

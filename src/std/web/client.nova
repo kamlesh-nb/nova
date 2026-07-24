@@ -1,11 +1,18 @@
-// client.nova — HttpClient: sends HTTP requests and parses responses
+// client.nova — HTTP client.
+//   * `Http` (W5): the modern REST client — takes a URL, auto-selects transport by scheme
+//     (`https` ⇒ verified TLS, SNI + system-CA + hostname check, fail-closed; `http` ⇒ plaintext),
+//     full verb set, robust response framing (Content-Length via read-to-EOF + chunked decode,
+//     any body size), per-request timeout, bounded redirect following.
+//   * `HttpClient` (legacy): the plaintext `(host, port, path)` client the circuit breaker wraps.
 import bytes;
+import assert;
 import mem.allocator;
 import string;
 import list;
 import map;
 import net.tcp.client;
 import net.tcp.socket;
+import net.url;
 import web.request;
 import web.response;
 import web.status;
@@ -77,4 +84,262 @@ pub struct HttpClient {
         // Parse the HTTP response
         return response.Response.parse(raw_response);
     }
+}
+
+// ============================================================================================
+// W5 — modern REST client: URL in, verified TLS automatic, robust framing.
+// ============================================================================================
+
+// A scheme-aware transport: plaintext TCP, or verified TLS over the same fd. `tlsCtx == 0` ⇒ plaintext.
+struct HttpConn {
+    pub secure: bool,
+    pub fd: int,
+    pub tlsCtx: ptr, // TlsContext*; 0 for plaintext
+
+    fn writeStr(self: HttpConn, data: string): int {
+        if (self.tlsCtx != 0) { return nova_tls_write(self.tlsCtx, data); }
+        return nova_socket_send(self.fd, data);
+    }
+
+    // One recv (up to `max` bytes). Returns "" on EOF/error — the read loop stops there.
+    fn recv(self: HttpConn, max: int): string {
+        let buf = bytes.alloc(max);
+        let n = 0;
+        if (self.tlsCtx != 0) { n = nova_tls_read(self.tlsCtx, buf, max); }
+        else { n = nova_socket_recv(self.fd, buf, max); }
+        if (n <= 0) { bytes.free(buf); return ""; }
+        let sp = bytes.alloc(n);
+        let i = 0;
+        while (i < n) { bytes.write_byte(sp, i, bytes.read_byte(buf, i)); i = i + 1; }
+        bytes.free(buf);
+        return sp as string;
+    }
+
+    fn close(self: HttpConn): void {
+        if (self.tlsCtx != 0) { nova_tls_free(self.tlsCtx); self.tlsCtx = 0; }
+        if (self.fd >= 0) { nova_close(self.fd); self.fd = -1; }
+    }
+}
+
+// The framed pieces of a raw HTTP response — kept as ints/strings so the redirect logic can read the
+// numeric status BEFORE a `Response` (Status enum) is built.
+struct RawResp {
+    pub code: int,
+    pub headers: Map<string, string>,
+    pub body: string,
+}
+
+// Parse a hex chunk-size line (may carry `;ext` — stop at ';' or any non-hex digit).
+fn parseHex(s: string): int {
+    let v = 0;
+    let i = 0;
+    while (i < s.length) {
+        let c = s[i];
+        let d = -1;
+        if (c >= 48 && c <= 57) { d = c - 48; }            // 0-9
+        else if (c >= 97 && c <= 102) { d = c - 97 + 10; } // a-f
+        else if (c >= 65 && c <= 70) { d = c - 65 + 10; }  // A-F
+        if (d < 0) { break; }
+        v = v * 16 + d;
+        i = i + 1;
+    }
+    return v;
+}
+
+// Decode a `Transfer-Encoding: chunked` body: repeat [hex-size CRLF][size bytes CRLF] until size 0.
+fn dechunk(s: string): string {
+    let out = List<string>();
+    let pos = 0;
+    while (pos < s.length) {
+        let rest = string.slice(s, pos, s.length);
+        let nl = string.indexOf(rest, "\r\n");
+        if (nl == -1) { break; }
+        let sizeLine = string.slice(s, pos, pos + nl);
+        let size = parseHex(sizeLine);
+        pos = pos + nl + 2; // past the size line CRLF
+        if (size == 0) { break; } // last chunk
+        if (pos + size > s.length) { break; } // truncated
+        out.push(string.slice(s, pos, pos + size));
+        pos = pos + size + 2; // past the chunk data + its trailing CRLF
+    }
+    return string.join(out, "");
+}
+
+// Frame a raw response: split at the header/body boundary, parse the status line + headers, and
+// dechunk the body when the response is chunked.
+fn frame(raw: string): RawResp {
+    let headers = Map<string, string>(16, string.hash);
+    let sep = string.indexOf(raw, "\r\n\r\n");
+    let headPart = if (sep == -1) raw else string.slice(raw, 0, sep);
+    let bodyRaw = if (sep == -1) "" else string.slice(raw, sep + 4, raw.length);
+
+    let lines = string.split(headPart, "\r\n");
+    let code = 0;
+    if (lines.size() > 0) {
+        let statusLine = lines.get(0) ?? "";
+        let sp = string.split(statusLine, " ");
+        if (sp.size() >= 2) { code = string.parseI64(sp.get(1) ?? "0"); }
+    }
+    let i = 1;
+    while (i < lines.size()) {
+        let line = lines.get(i) ?? "";
+        let idx = string.indexOf(line, ": ");
+        if (idx != -1) {
+            let key = string.slice(line, 0, idx);
+            let val = string.slice(line, idx + 2, line.length);
+            headers.set(key, val);
+        }
+        i = i + 1;
+    }
+
+    // Case-insensitive Transfer-Encoding lookup (servers vary the header case).
+    let chunked = false;
+    let hk = headers.keys();
+    let hi = 0;
+    while (hi < hk.size()) {
+        let k = hk.get(hi) ?? "";
+        if (string.toLowerCase(k) == "transfer-encoding") {
+            if (string.contains(string.toLowerCase(headers.get(k) ?? ""), "chunked")) { chunked = true; }
+        }
+        hi = hi + 1;
+    }
+    let body = if (chunked) dechunk(bodyRaw) else bodyRaw;
+    return RawResp{ code: code, headers: headers, body: body };
+}
+
+pub struct Http {
+    // The one true entry point: perform `method url` with optional headers/body, following redirects.
+    // A per-request `timeoutMs` (<= 0 = none) bounds connect + every recv. Verified TLS for `https`.
+    pub fn request(method: string, urlStr: string, headers: Map<string, string>, body: string): response.Response {
+        return Http.doRequest(method, urlStr, headers, body, 0, 5);
+    }
+
+    pub fn requestTimeout(method: string, urlStr: string, headers: Map<string, string>, body: string, timeoutMs: int): response.Response {
+        return Http.doRequest(method, urlStr, headers, body, timeoutMs, 5);
+    }
+
+    fn doRequest(method: string, urlStr: string, headers: Map<string, string>, body: string, timeoutMs: int, hopsLeft: int): response.Response {
+        let u = url.parse(urlStr);
+
+        // Connect (with optional deadline) and, for https, wrap in a verified TLS session.
+        let fd = if (timeoutMs > 0) nova_socket_connect_timeout(u.host, u.port, timeoutMs) else nova_socket_connect(u.host, u.port);
+        if (fd < 0) {
+            return response.Response(Status.InternalServerError, "connection failed");
+        }
+        if (timeoutMs > 0) { nova_socket_set_timeout(fd, timeoutMs); }
+        let conn = HttpConn{ secure: false, fd: fd, tlsCtx: 0 };
+        if (u.secure) {
+            conn.tlsCtx = nova_tls_new(fd, u.host);
+            if (nova_tls_handshake(conn.tlsCtx) != 0) {
+                conn.close();
+                return response.Response(Status.InternalServerError, "TLS handshake failed");
+            }
+        }
+
+        // Build the request. Host is mandatory in HTTP/1.1; Connection: close lets us read to EOF.
+        let reqLine = method + " " + u.path + " HTTP/1.1\r\n";
+        let hdrs = List<string>();
+        hdrs.push("Host: " + u.host);
+        hdrs.push("Connection: close");
+        if (body.length > 0) { hdrs.push(`Content-Length: ${body.length}`); }
+        let sawUA = false;
+        headers.forEach((k, v) => {
+            hdrs.push(k + ": " + v);
+            if (string.toLowerCase(k) == "user-agent") { sawUA = true; }
+        });
+        if (!sawUA) { hdrs.push("User-Agent: nova-http/1.0"); }
+        let full = reqLine + string.join(hdrs, "\r\n") + "\r\n\r\n" + body;
+        conn.writeStr(full);
+
+        // Read the whole response (any size — accumulate until EOF), then frame + dechunk it.
+        let parts = List<string>();
+        while (true) {
+            let chunk = conn.recv(65536);
+            if (chunk.length == 0) { break; }
+            parts.push(chunk);
+        }
+        conn.close();
+        let framed = frame(string.join(parts, ""));
+
+        // Redirect following (301/302/303/307/308) — bounded hop count. 303 and a 301/302 on a
+        // non-GET both degrade to GET (per RFC 7231); 307/308 preserve the method + body.
+        if ((framed.code == 301 || framed.code == 302 || framed.code == 303 || framed.code == 307 || framed.code == 308) && hopsLeft > 0) {
+            let loc = "";
+            let lk = framed.headers.keys();
+            let li = 0;
+            while (li < lk.size()) {
+                let k = lk.get(li) ?? "";
+                if (string.toLowerCase(k) == "location") { loc = framed.headers.get(k) ?? ""; }
+                li = li + 1;
+            }
+            if (loc.length > 0) {
+                let nextUrl = Http.resolveLocation(u, loc);
+                let keepMethod = framed.code == 307 || framed.code == 308;
+                let nextMethod = if (keepMethod) method else "GET";
+                let nextBody = if (keepMethod) body else "";
+                return Http.doRequest(nextMethod, nextUrl, headers, nextBody, timeoutMs, hopsLeft - 1);
+            }
+        }
+
+        return response.Response.withHeaders(Status.fromCode(framed.code), framed.body, framed.headers);
+    }
+
+    // Resolve a redirect target: an absolute URL is used as-is; a root-relative path is rebased onto
+    // the current scheme+host+port.
+    fn resolveLocation(base: url.Url, loc: string): string {
+        if (string.contains(loc, "://")) { return loc; }
+        let origin = base.scheme + "://" + base.host + ":" + `${base.port}`;
+        if (string.startsWith(loc, "/")) { return origin + loc; }
+        return origin + "/" + loc;
+    }
+
+    fn emptyHeaders(): Map<string, string> {
+        return Map<string, string>(8, string.hash);
+    }
+
+    pub fn get(urlStr: string): response.Response {
+        return Http.request("GET", urlStr, Http.emptyHeaders(), "");
+    }
+    pub fn post(urlStr: string, body: string): response.Response {
+        return Http.request("POST", urlStr, Http.emptyHeaders(), body);
+    }
+    pub fn put(urlStr: string, body: string): response.Response {
+        return Http.request("PUT", urlStr, Http.emptyHeaders(), body);
+    }
+    pub fn patch(urlStr: string, body: string): response.Response {
+        return Http.request("PATCH", urlStr, Http.emptyHeaders(), body);
+    }
+    pub fn del(urlStr: string): response.Response {
+        return Http.request("DELETE", urlStr, Http.emptyHeaders(), "");
+    }
+    pub fn head(urlStr: string): response.Response {
+        return Http.request("HEAD", urlStr, Http.emptyHeaders(), "");
+    }
+}
+
+// ---- offline unit tests (no network) --------------------------------------------------------
+@test
+fn test_dechunk(): void {
+    // "Wiki" + "pedia in \r\n\r\nchunks." over two chunks, then the 0-terminator.
+    let raw = "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+    assert.equalStr(dechunk(raw), "Wikipedia");
+    assert.equalInt(parseHex("1a"), 26);
+    assert.equalInt(parseHex("ff;name=x"), 255);
+}
+
+@test
+fn test_frame_content_length(): void {
+    let raw = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
+    let r = frame(raw);
+    assert.equalInt(r.code, 200);
+    assert.equalStr(r.body, "hello");
+    assert.equalStr(r.headers.get("Content-Type") ?? "", "text/plain");
+}
+
+@test
+fn test_frame_chunked(): void {
+    let raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+    let r = frame(raw);
+    assert.equalInt(r.code, 200);
+    assert.equalStr(r.body, "Wikipedia");
 }

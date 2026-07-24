@@ -2937,14 +2937,20 @@ pub const LlvmCompiler = struct {
                     .is_async = fn_decl.is_async,
                     .source_file = fn_decl.span.file,
                 };
-                try self.functions.append(self.allocator, info);
 
-                // FREE-FN MONOMORPHIZATION: for a generic free fn, emit one SPECIALIZED body per recorded
-                // (fn × concrete-args) instantiation — `maybe__int` — exactly as struct methods do (Pass 1
-                // above). The erased base stays (inferred-arg `.call`s still route to it, DCE drops it if
-                // dead). Inside each spec, `current_method_subst` binds T→concrete, so a value-representation-
-                // dependent return (`T | undefined` → BOXED when T is a value type, V1) compiles correctly —
-                // which the erased single body cannot (it doesn't know if T is a value or a pointer).
+                // FREE-FN MONOMORPHIZATION: emit the erased base only for NON-generic or ASYNC fns. A SYNC
+                // generic free fn never needs its T-erased base: Nova has no free-fn type-arg INFERENCE, so
+                // every call carries explicit args and routes to a specialization (`maybe__int`), and an
+                // uncalled one is dead. Skipping it is also NECESSARY — a generic body may contain reify
+                // intrinsics (`serde.bind<T>` → `<T>__bind`) or value-representation-dependent code that only
+                // compiles with a concrete T (exactly why struct methods skip their base). ASYNC generic fns
+                // (`when_all<T>`) are the exception: the coroutine RAMP resolves to the base symbol, so it
+                // must survive — and their bodies use no reify intrinsics.
+                if (fn_decl.type_params.len == 0 or fn_decl.is_async) try self.functions.append(self.allocator, info);
+
+                // Emit one SPECIALIZED body per recorded (fn × concrete-args) instantiation — `maybe__int`
+                // — exactly as struct methods do (Pass 1 above). Inside each spec `current_method_subst`
+                // binds T→concrete, so `T | undefined` boxes correctly (V1) and reifies resolve.
                 if (fn_decl.type_params.len > 0) {
                     for (sema_mono.free_fn_insts.items) |fi| {
                         if (!std.mem.eql(u8, fi.fn_name, fn_decl.name)) continue;
