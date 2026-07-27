@@ -63,7 +63,26 @@ void *nova_file_open(const char *path, const char *mode) {
 }
 int nova_file_close(void *fp) { return fp ? std::fclose((FILE *)fp) : -1; }
 int nova_file_read(void *fp, char *buf, int size) {
-  return fp ? (int)std::fread(buf, 1, (size_t)size, (FILE *)fp) : -1;
+  if (!fp)
+    return -1;
+  // EINTR-safe: a signal (e.g. SIGCHLD when a supervised child dies) can make fread return short with
+  // ferror/EINTR. Retry from where it left off so a manifest read isn't silently truncated mid-reconcile.
+  FILE *f = (FILE *)fp;
+  size_t total = 0;
+  while (total < (size_t)size) {
+    size_t n = std::fread(buf + total, 1, (size_t)size - total, f);
+    total += n;
+    if (n == 0) {
+      if (std::feof(f))
+        break;
+      if (std::ferror(f) && errno == EINTR) {
+        clearerr(f);
+        continue;
+      }
+      break;
+    }
+  }
+  return (int)total;
 }
 int nova_file_read_all(void *fp, char *buf, int size) {
   return nova_file_read(fp, buf, size);
@@ -925,6 +944,34 @@ int nova_process_wait(ProcessContext *ctx) {
   ctx->reaped = true;
   ctx->exit_code = WIFEXITED(status) ? WEXITSTATUS(status)
                    : WIFSIGNALED(status) ? 128 + WTERMSIG(status) // shell convention
+                                         : -1;
+  return ctx->exit_code;
+}
+
+// R1/I2 addition: NON-BLOCKING exit poll (waitpid WNOHANG). Returns the exit code if the child has
+// exited (reaping it so it never becomes a zombie), -2 if it is still running, or -1 on error / no such
+// child. This is what the orchestrator's async reconcile loop needs — kill(pid,0) can't tell a live
+// process from an unreaped zombie, and nova_process_wait blocks. Exit-code convention matches
+// nova_process_wait (128+signal for a killed child).
+int nova_process_try_wait(ProcessContext *ctx) {
+  if (!ctx)
+    return -1;
+  if (ctx->reaped)
+    return ctx->exit_code;
+  if (ctx->pid <= 0)
+    return -1;
+  int status = 0;
+  pid_t r;
+  do {
+    r = ::waitpid((pid_t)ctx->pid, &status, WNOHANG);
+  } while (r < 0 && errno == EINTR);
+  if (r == 0)
+    return -2; // still running
+  if (r < 0)
+    return -1; // error (e.g. ECHILD)
+  ctx->reaped = true;
+  ctx->exit_code = WIFEXITED(status) ? WEXITSTATUS(status)
+                   : WIFSIGNALED(status) ? 128 + WTERMSIG(status)
                                          : -1;
   return ctx->exit_code;
 }

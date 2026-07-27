@@ -136,6 +136,8 @@ pub const externs = [_]Builtin{
     .{ .receiver = "", .name = "nova_socket_connect_timeout", .ret = .int },
     .{ .receiver = "", .name = "nova_socket_set_timeout", .ret = .int },
     .{ .receiver = "", .name = "nova_close", .ret = .void_ },
+    // I2 orchestrator: non-blocking child-exit poll (-2 running, -1 error, else exit code).
+    .{ .receiver = "", .name = "nova_process_try_wait", .ret = .int },
     // TDS-tunneled TLS (MSSQL driver): opaque ctx as ptr; handshake/write/read return int.
     .{ .receiver = "", .name = "nova_tds_tls_new", .ret = .ptr },
     .{ .receiver = "", .name = "nova_tds_tls_handshake", .ret = .int },

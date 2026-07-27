@@ -1,0 +1,115 @@
+// 181 — I2 native orchestrator: the offline-testable core. Spec JSON parsing, specsEqual change
+// detection, restart-policy decision, and the reconcile DIFF (start new / replace changed / drop
+// removed) exercised in memory with manageProcesses=false. The live process lifecycle (spawn N replicas,
+// restart on crash, graceful stop, manifest watch) is proven end-to-end separately.
+import assert;
+import list;
+import orch.spec;
+import orch.nativelet;
+import orch.supervisor;
+
+@test
+fn test_parse_spec(): void {
+    let json = "{\"name\":\"web\",\"binaryPath\":\"/opt/app\",\"args\":[\"--port\",\"8080\"],"
+             + "\"restartPolicy\":\"always\",\"replicas\":3,\"cpuMilli\":500,\"pidsMax\":128,"
+             + "\"probe\":{\"port\":8080,\"path\":\"/healthz\",\"periodMs\":1500}}";
+    let s = spec.parseSpec(json);
+    assert.equalStr(s.name, "web");
+    assert.equalStr(s.binaryPath, "/opt/app");
+    assert.equalInt(s.replicas, 3);
+    assert.equalStr(s.restartPolicy, "always");
+    assert.equalInt(s.args.size(), 2);
+    assert.equalStr(s.args.get(0) ?? "", "--port");
+    assert.equalStr(s.args.get(1) ?? "", "8080");
+    assert.equalInt(s.cpuMilli, 500);
+    assert.equalInt(s.pidsMax, 128);
+    assert.equalInt(s.probePort, 8080);
+    assert.equalStr(s.probePath, "/healthz");
+    assert.equalInt(s.probePeriodMs, 1500);
+}
+
+@test
+fn test_parse_spec_defaults(): void {
+    let s = spec.parseSpec("{\"name\":\"x\",\"binaryPath\":\"/bin/x\"}");
+    assert.equalInt(s.replicas, 1);              // default
+    assert.equalStr(s.restartPolicy, "never");   // default
+    assert.equalInt(s.args.size(), 0);
+    assert.equalInt(s.probePort, 0);             // no probe
+    // replicas floored at 1
+    let z = spec.parseSpec("{\"name\":\"z\",\"binaryPath\":\"/bin/z\",\"replicas\":0}");
+    assert.equalInt(z.replicas, 1);
+}
+
+@test
+fn test_specs_equal(): void {
+    let a = spec.parseSpec("{\"name\":\"w\",\"binaryPath\":\"/a\",\"replicas\":2,\"args\":[\"-p\",\"1\"]}");
+    let b = spec.parseSpec("{\"name\":\"w\",\"binaryPath\":\"/a\",\"replicas\":2,\"args\":[\"-p\",\"1\"]}");
+    assert.isTrue(spec.specsEqual(a, b));
+    // different replica count → not equal
+    let c = spec.parseSpec("{\"name\":\"w\",\"binaryPath\":\"/a\",\"replicas\":3,\"args\":[\"-p\",\"1\"]}");
+    assert.isTrue(!spec.specsEqual(a, c));
+    // different args → not equal
+    let d = spec.parseSpec("{\"name\":\"w\",\"binaryPath\":\"/a\",\"replicas\":2,\"args\":[\"-p\",\"2\"]}");
+    assert.isTrue(!spec.specsEqual(a, d));
+    // different binary → not equal
+    let e = spec.parseSpec("{\"name\":\"w\",\"binaryPath\":\"/b\",\"replicas\":2,\"args\":[\"-p\",\"1\"]}");
+    assert.isTrue(!spec.specsEqual(a, e));
+}
+
+@test
+fn test_restart_policy(): void {
+    assert.isTrue(spec.shouldRestart("always", 0));       // always → yes even on clean exit
+    assert.isTrue(spec.shouldRestart("always", 1));
+    assert.isTrue(!spec.shouldRestart("on-failure", 0));  // clean exit → no
+    assert.isTrue(spec.shouldRestart("on-failure", 1));   // failure → yes
+    assert.isTrue(spec.shouldRestart("on-failure", -1));  // spawn/poll error → yes
+    assert.isTrue(!spec.shouldRestart("never", 0));
+    assert.isTrue(!spec.shouldRestart("never", 1));
+}
+
+// Reconcile diff in memory (manageProcesses off): new spec → job, changed → replaced, removed → dropped.
+@test
+fn test_reconcile_diff(): void {
+    let n = nativelet.Nativelet("/tmp/unused");
+    n.manageProcesses = false;
+
+    // round 1: two workloads appear
+    let d1 = list.List<spec.Spec>();
+    d1.push(spec.parseSpec("{\"name\":\"api\",\"binaryPath\":\"/api\",\"replicas\":2}"));
+    d1.push(spec.parseSpec("{\"name\":\"web\",\"binaryPath\":\"/web\",\"replicas\":1}"));
+    n.reconcileWith(d1);
+    assert.equalInt(n.jobs.size(), 2);
+
+    // round 2: 'api' unchanged, 'web' removed, 'db' added
+    let d2 = list.List<spec.Spec>();
+    d2.push(spec.parseSpec("{\"name\":\"api\",\"binaryPath\":\"/api\",\"replicas\":2}"));
+    d2.push(spec.parseSpec("{\"name\":\"db\",\"binaryPath\":\"/db\",\"replicas\":1}"));
+    n.reconcileWith(d2);
+    assert.equalInt(n.jobs.size(), 2);
+    assert.equalInt(n.findJobIdx("api"), 0);      // 'api' kept in place
+    assert.isTrue(n.findJobIdx("web") < 0);       // 'web' dropped
+    assert.isTrue(n.findJobIdx("db") >= 0);       // 'db' added
+
+    // round 3: everything removed
+    n.reconcileWith(list.List<spec.Spec>());
+    assert.equalInt(n.jobs.size(), 0);
+}
+
+// A changed spec replaces the job (new desired recorded).
+@test
+fn test_reconcile_replaces_changed(): void {
+    let n = nativelet.Nativelet("/tmp/unused");
+    n.manageProcesses = false;
+    let d1 = list.List<spec.Spec>();
+    d1.push(spec.parseSpec("{\"name\":\"svc\",\"binaryPath\":\"/svc\",\"replicas\":1}"));
+    n.reconcileWith(d1);
+    let idx = n.findJobIdx("svc");
+    assert.equalInt((n.jobs.get(idx) ?? nativelet.Job("", supervisor.Supervisor(spec.Spec("", "")), spec.Spec("", ""))).desired.replicas, 1);
+
+    let d2 = list.List<spec.Spec>();
+    d2.push(spec.parseSpec("{\"name\":\"svc\",\"binaryPath\":\"/svc\",\"replicas\":4}"));
+    n.reconcileWith(d2);
+    assert.equalInt(n.jobs.size(), 1);
+    let idx2 = n.findJobIdx("svc");
+    assert.equalInt((n.jobs.get(idx2) ?? nativelet.Job("", supervisor.Supervisor(spec.Spec("", "")), spec.Spec("", ""))).desired.replicas, 4);  // spec updated
+}

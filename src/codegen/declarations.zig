@@ -612,6 +612,11 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         const process_wait_fn = core.LLVMAddFunction(compiler.module, "nova_process_wait", process_wait_type);
         try compiler.func_map.put("nova_process_wait", process_wait_fn);
 
+        // nova_process_try_wait: (ptr) -> i32   (non-blocking exit poll; -2 running, -1 error, else code)
+        const process_trywait_type = core.LLVMFunctionType(compiler.i32_type, &one_param_ptr, 1, 0);
+        const process_trywait_fn = core.LLVMAddFunction(compiler.module, "nova_process_try_wait", process_trywait_type);
+        try compiler.func_map.put("nova_process_try_wait", process_trywait_fn);
+
         // nova_process_kill: (ptr, i32) -> i32
         var process_kill_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.i32_type };
         const process_kill_type = core.LLVMFunctionType(compiler.i32_type, &process_kill_params, 2, 0);

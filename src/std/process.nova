@@ -52,6 +52,18 @@ pub struct Process {
         return nova_process_wait(self.ctx);
     }
 
+    // Non-blocking exit poll (waitpid WNOHANG): the exit code if the child has exited (reaped so it never
+    // zombifies), -2 if still running, -1 on error. The orchestrator's async reconcile loop uses this
+    // instead of the blocking `wait` — `kill(0)` can't tell a live process from an unreaped zombie.
+    pub fn tryWait(self: Process): int {
+        return nova_process_try_wait(self.ctx);
+    }
+
+    // Convenience: is the child still running? (false once it has exited — and reaps it if so.)
+    pub fn isRunning(self: Process): bool {
+        return nova_process_try_wait(self.ctx) == -2;
+    }
+
     // Signal the child. `sig` is a POSIX signal number (15 = SIGTERM, 9 = SIGKILL, 2 = SIGINT, 1 = SIGHUP).
     // Returns 0 on success, -1 on error. The scale-down / restart primitive the orchestrator drives.
     pub fn kill(self: Process, sig: int): int {

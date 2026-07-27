@@ -1,0 +1,109 @@
+// orch/spec.nova — workload manifest for the I2 native orchestrator (native-k8s MVP).
+//
+// A Spec describes a workload to run as native processes (NOT containers): the binary, its args, a
+// replica count, a restart policy, optional cgroups-v2 resource limits, and an optional HTTP health
+// probe. Parsed from JSON manifests dropped in the watch directory (see orch/nativelet). Mirrors the Zig
+// PoC's spec.zig, plus `replicas` and the HTTP probe fields the PoC lacked.
+
+import serde.json;
+import list;
+import string;
+
+pub struct Spec {
+    pub name: string,           // unique workload key
+    pub binaryPath: string,     // native executable to exec
+    pub args: List<string>,     // argv (excluding the binary itself)
+    pub restartPolicy: string,  // "always" | "on-failure" | "never"
+    pub replicas: int,          // how many copies to keep running (>=1)
+    // cgroups-v2 limits (Linux only; 0 = unset). cpuMax is milli-CPU (500 = 0.5 core).
+    pub cpuMilli: int,
+    pub memMaxBytes: long,
+    pub pidsMax: int,
+    // Optional HTTP readiness/liveness probe (probePort 0 = no probe). An unhealthy probe restarts.
+    pub probePort: int,
+    pub probePath: string,
+    pub probePeriodMs: int,
+    init(name: string, binaryPath: string) {
+        self.name = name;
+        self.binaryPath = binaryPath;
+        self.args = List<string>();
+        self.restartPolicy = "never";
+        self.replicas = 1;
+        self.cpuMilli = 0;
+        self.memMaxBytes = 0;
+        self.pidsMax = 0;
+        self.probePort = 0;
+        self.probePath = "/healthz";
+        self.probePeriodMs = 2000;
+    }
+}
+
+// Parse a JSON manifest into a Spec. Unknown fields are ignored; missing fields take the Spec defaults.
+// Shape:
+//   { "name":"web", "binaryPath":"/opt/app", "args":["--port","8080"], "restartPolicy":"always",
+//     "replicas":3, "cpuMilli":500, "memMaxBytes":268435456, "pidsMax":128,
+//     "probe":{ "port":8080, "path":"/healthz", "periodMs":2000 } }
+pub fn parseSpec(text: string): Spec {
+    let root = json.parse(text);
+    let name = json.asString(json.get(root, "name")) ?? "";
+    let bin = json.asString(json.get(root, "binaryPath")) ?? "";
+    let s = Spec(name, bin);
+
+    s.restartPolicy = json.asString(json.get(root, "restartPolicy")) ?? "never";
+    let reps = (json.asNumber(json.get(root, "replicas")) ?? 1) as int;
+    s.replicas = if (reps < 1) 1 else reps;
+
+    // args — iterate the array value directly (avoids naming List<JsonValue> across modules)
+    if (json.has(root, "args")) {
+        let av = json.get(root, "args");
+        let n = json.size(av);
+        let i = 0;
+        while (i < n) {
+            s.args.push(json.asString(json.at(av, i)) ?? "");
+            i = i + 1;
+        }
+    }
+
+    s.cpuMilli = (json.asNumber(json.get(root, "cpuMilli")) ?? 0) as int;
+    s.memMaxBytes = json.asNumber(json.get(root, "memMaxBytes")) ?? 0;
+    s.pidsMax = (json.asNumber(json.get(root, "pidsMax")) ?? 0) as int;
+
+    if (json.has(root, "probe")) {
+        let pr = json.get(root, "probe");
+        s.probePort = (json.asNumber(json.get(pr, "port")) ?? 0) as int;
+        s.probePath = json.asString(json.get(pr, "path")) ?? "/healthz";
+        s.probePeriodMs = (json.asNumber(json.get(pr, "periodMs")) ?? 2000) as int;
+    }
+    return s;
+}
+
+// Two specs are "the same workload" (no restart needed) when the run-affecting fields all match. The
+// name is the key, so it's assumed equal. Mirrors the PoC's specsEqual, extended with replicas + probe.
+pub fn specsEqual(a: Spec, b: Spec): bool {
+    if (!string.eql(a.binaryPath, b.binaryPath)) { return false; }
+    if (!string.eql(a.restartPolicy, b.restartPolicy)) { return false; }
+    if (a.replicas != b.replicas) { return false; }
+    if (a.cpuMilli != b.cpuMilli) { return false; }
+    if (a.memMaxBytes != b.memMaxBytes) { return false; }
+    if (a.pidsMax != b.pidsMax) { return false; }
+    if (a.probePort != b.probePort) { return false; }
+    if (!string.eql(a.probePath, b.probePath)) { return false; }
+    if (a.args.size() != b.args.size()) { return false; }
+    let i = 0;
+    while (i < a.args.size()) {
+        if (!string.eql(a.args.get(i) ?? "", b.args.get(i) ?? "")) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Restart decision for a replica that just exited with `exitCode` (-1 = spawn/poll error, >=0 = real
+// exit status, 128+sig for a killed child). Pure, so it is directly unit-testable.
+//   always     → always restart
+//   on-failure → restart unless it exited cleanly (code 0)
+//   never      → never restart
+pub fn shouldRestart(policy: string, exitCode: int): bool {
+    if (string.eql(policy, "always")) { return true; }
+    if (string.eql(policy, "on-failure")) { return exitCode != 0; }
+    return false;
+}
