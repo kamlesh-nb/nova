@@ -638,8 +638,9 @@ async fn healthCheckLoop(pool: Pool): int {
 // One reactor's front-end accept loop: bind a SO_REUSEPORT acceptor on THIS reactor, then accept +
 // spawn a handler per client. Handlers stay on the accepting reactor, so their backend connections are
 // acquired/pooled/reused on the same reactor's per-reactor idle list (safe, lock-free).
-async fn proxyAcceptLoop(pool: Pool, port: int, tmo: int): int {
-    let srv = asyncio.serverListen(port);
+async fn proxyAcceptLoop(pool: Pool, host: string, port: int, tmo: int): int {
+    // Empty host ⇒ INADDR_ANY (ordinary proxy); a non-empty host binds a specific Service VIP (I3).
+    let srv = if (string.eql(host, "")) asyncio.serverListen(port) else asyncio.serverListenAddr(host, port);
     if (srv == 0) {
         console.log("proxy: failed to bind front port (in use?)");
         return -1;
@@ -653,7 +654,7 @@ async fn proxyAcceptLoop(pool: Pool, port: int, tmo: int): int {
 
 // P5 share-nothing fan-out: one accept loop per reactor (SO_REUSEPORT; the kernel load-balances clients
 // across reactors on Linux). Mirrors App.run — reactors 1..N-1 spawned + pinned, reactor 0 inline.
-async fn runProxy(pool: Pool, port: int, tmo: int): int {
+async fn runProxy(pool: Pool, host: string, port: int, tmo: int): int {
     // One health-check sweep coroutine on reactor 0 (the single writer of every backend's `up`).
     if (pool.hcEnabled) {
         asyncio.pinNextCoro(0);
@@ -663,18 +664,23 @@ async fn runProxy(pool: Pool, port: int, tmo: int): int {
     let i = 1;
     while (i < n) {
         asyncio.pinNextCoro(i);
-        spawn proxyAcceptLoop(pool, port, tmo);
+        spawn proxyAcceptLoop(pool, host, port, tmo);
         i = i + 1;
     }
     console.log("Nova reverse proxy listening (share-nothing)");
-    return await proxyAcceptLoop(pool, port, tmo);
+    return await proxyAcceptLoop(pool, host, port, tmo);
 }
 
 // Public entry to the share-nothing accept fan-out (the body of Proxy.run, minus holdReactors). Lets
 // another module — e.g. the PID autoscaler — spawn the proxy alongside its own control loop under one
 // block-drive: `holdReactors(); spawn autoscaleLoop(a); let _ = proxy.serve(pool, port, tmo);`.
 pub async fn serve(pool: Pool, port: int, tmo: int): int {
-    return await runProxy(pool, port, tmo);
+    return await runProxy(pool, "", port, tmo);
+}
+
+// I3: like serve(), but binds a SPECIFIC address (a Service VIP such as "127.0.0.2"). Empty host ⇒ any.
+pub async fn serveAddr(pool: Pool, host: string, port: int, tmo: int): int {
+    return await runProxy(pool, host, port, tmo);
 }
 
 pub struct Proxy {
@@ -690,6 +696,6 @@ pub struct Proxy {
     // so the per-reactor accept fan-out lands on live reactors (share-nothing, like App.run).
     pub fn run(self: Proxy): void {
         asyncio.holdReactors();
-        let _ = runProxy(self.pool, self.port, self.timeoutMs);
+        let _ = runProxy(self.pool, "", self.port, self.timeoutMs);
     }
 }

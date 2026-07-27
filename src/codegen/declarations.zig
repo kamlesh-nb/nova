@@ -2002,6 +2002,10 @@ fn setupCoroutineSupport(compiler: *LlvmCompiler) !void {
     const listen_fn = core.LLVMAddFunction(compiler.module, "nova_aserver_listen", listen_type);
     try compiler.func_map.put("nova_aserver_listen", listen_fn);
     var two_val_c = [_]types.LLVMTypeRef{ compiler.val_type, compiler.val_type };
+    // I3: bind+listen on a specific address (Service VIP): (host_ptr, port) -> handle
+    const listen_addr_type = core.LLVMFunctionType(compiler.val_type, &two_val_c, 2, 0);
+    const listen_addr_fn = core.LLVMAddFunction(compiler.module, "nova_aserver_listen_addr", listen_addr_type);
+    try compiler.func_map.put("nova_aserver_listen_addr", listen_addr_fn);
     const aaccept_type = core.LLVMFunctionType(compiler.void_type, &two_val_c, 2, 0);
     const aaccept_fn = core.LLVMAddFunction(compiler.module, "nova_aaccept", aaccept_type);
     try compiler.func_map.put("nova_aaccept", aaccept_fn);

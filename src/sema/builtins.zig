@@ -139,6 +139,7 @@ pub const externs = [_]Builtin{
     // I2 orchestrator: non-blocking child-exit poll (-2 running, -1 error, else exit code).
     .{ .receiver = "", .name = "nova_process_try_wait", .ret = .int },
     .{ .receiver = "", .name = "nova_process_pid", .ret = .long },   // child kernel PID (cgroup attach)
+    .{ .receiver = "", .name = "nova_aserver_listen_addr", .ret = .long }, // I3: bind a Service VIP → acceptor handle
     // TDS-tunneled TLS (MSSQL driver): opaque ctx as ptr; handshake/write/read return int.
     .{ .receiver = "", .name = "nova_tds_tls_new", .ret = .ptr },
     .{ .receiver = "", .name = "nova_tds_tls_handshake", .ret = .int },

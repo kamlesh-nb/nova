@@ -139,6 +139,7 @@ long long nova_io_take_result(long long self);
 // thread). listen/close are synchronous; aaccept/arecv/asend park `self` and resume
 // via nova_io_take_result. Handles are opaque pointers.
 long long nova_aserver_listen(long long port);
+long long nova_aserver_listen_addr(long long host, long long port);
 void      nova_aconnect(long long host, long long port, long long self);
 void      nova_aaccept(long long server, long long self);
 void      nova_coro_hold_arg(long long coro, long long ptr, void (*dtor)(long long));

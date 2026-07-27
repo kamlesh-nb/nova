@@ -1,0 +1,122 @@
+// net/service.nova — k8s-Service-style virtual endpoints (I3 Tier 1, userspace).
+//
+// A Service is a STABLE front address (a fixed port, optionally on a dedicated VIP) that load-balances to
+// a dynamic set of backend REPLICAS which bind ephemeral host ports. Callers reach the Service by name /
+// stable address and never see which ports the replicas actually landed on — exactly k8s ClusterIP. The
+// data plane IS the I1 proxy (Pool + LB + health-gated membership); this module adds the Service model,
+// a registry for name→endpoint discovery, and (optionally) a per-Service VIP bind. The kernel tier
+// (netns / veth / bridge / IPVS / eBPF) is DEFERRED — this is the pure-userspace path.
+//
+//   let reg = service.ServiceRegistry("services.txt");
+//   let api = service.Service("api", "", 8080);          // stable :8080, LB to replicas
+//   api.addBackend("127.0.0.1", 9101); api.addBackend("127.0.0.1", 9102);
+//   reg.register(api);
+//   // in an async entry after holdReactors(): spawn api.serveInto();  (one per Service)
+//   let ep = reg.resolve("api");                          // "127.0.0.1:8080" — hand to callers
+
+import net.proxy;
+import net.asyncio;
+import io.file;
+import list;
+import string;
+
+pub struct Service {
+    pub name: string,
+    pub vip: string,        // "" ⇒ bind INADDR_ANY (port-per-service); else a VIP like "127.0.0.2"
+    pub port: int,          // the STABLE front port
+    pub pool: proxy.Pool,   // backend replica endpoints (the I1 proxy pool)
+    pub timeoutMs: int,
+    init(name: string, vip: string, port: int) {
+        self.name = name;
+        self.vip = vip;
+        self.port = port;
+        self.pool = proxy.Pool();
+        self.pool.setStrategy(proxy.LbStrategy.LeastConn);   // spread by live load across replicas
+        self.timeoutMs = 15000;
+    }
+
+    // Turn on health-gated membership: unhealthy replicas are drained from the LB set automatically and
+    // rejoin on recovery (reuses the I1 health checker). `path` empty ⇒ TCP-connect probe.
+    pub fn enableHealth(self: Service, path: string, intervalMs: int): void {
+        self.pool.enableHealthChecks(intervalMs, 1000, 2, 3);
+        self.pool.setHealthPath(path);
+    }
+
+    // Choose the LB strategy across replicas (default LeastConn). RoundRobin gives an even split even
+    // for sequential non-overlapping requests (LeastConn ties to the lowest index when all are idle).
+    pub fn setStrategy(self: Service, s: proxy.LbStrategy): void { self.pool.setStrategy(s); }
+
+    pub fn addBackend(self: Service, host: string, port: int): void { self.pool.add(host, port); }
+    pub fn backendCount(self: Service): int { return self.pool.size(); }
+
+    // The stable endpoint callers use ("host:port"). An empty VIP resolves to loopback for local callers.
+    pub fn endpoint(self: Service): string {
+        let h = if (string.eql(self.vip, "")) "127.0.0.1" else self.vip;
+        return h + ":" + self.port;
+    }
+
+    // Serve this Service forever: accept on vip:port and LB to the healthy backends. Spawn one per
+    // Service (each pins to a reactor via the proxy fan-out). Call under a held-reactors block-drive.
+    pub async fn serveInto(self: Service): int {
+        return await proxy.serveAddr(self.pool, self.vip, self.port, self.timeoutMs);
+    }
+}
+
+// A name → Service registry with optional file-based discovery (the "/etc/hosts for services" of option
+// (ii) in the design). Apps resolve a peer by reading the registry file — no new primitive, works across
+// processes. In-process callers use resolve() directly.
+pub struct ServiceRegistry {
+    pub services: list.List<Service>,
+    pub registryFile: string,   // "" ⇒ in-memory only (no discovery file written)
+    init(registryFile: string) {
+        self.services = list.List<Service>();
+        self.registryFile = registryFile;
+    }
+
+    pub fn register(self: ServiceRegistry, svc: Service): void {
+        self.services.push(svc);
+        self.flush();
+    }
+
+    // Resolve a service name to its stable "host:port", or "" if unknown.
+    pub fn resolve(self: ServiceRegistry, name: string): string {
+        let i = 0;
+        while (i < self.services.size()) {
+            let s = self.services.get(i) ?? Service("", "", 0);
+            if (string.eql(s.name, name)) { return s.endpoint(); }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    // Serialize the registry to `name=host:port\n` lines so out-of-process apps can discover peers.
+    fn flush(self: ServiceRegistry): void {
+        if (string.eql(self.registryFile, "")) { return; }
+        let text = "";
+        let i = 0;
+        while (i < self.services.size()) {
+            let s = self.services.get(i) ?? Service("", "", 0);
+            text = text + s.name + "=" + s.endpoint() + "\n";
+            i = i + 1;
+        }
+        file.File.writeText(self.registryFile, text);
+    }
+}
+
+// Out-of-process discovery: read a registry file written by ServiceRegistry.flush and resolve `name` to
+// its "host:port" (or "" if absent). This is how a spawned app finds its peers without a new primitive.
+pub fn resolveFrom(registryFile: string, name: string): string {
+    if (!file.File.exists(registryFile)) { return ""; }
+    let text = file.File.readText(registryFile);
+    let needle = name + "=";
+    let lines = string.split(text, "\n");
+    let i = 0;
+    while (i < lines.size()) {
+        let ln = lines.get(i) ?? "";
+        if (string.startsWith(ln, needle)) {
+            return string.slice(ln, string.len(needle), string.len(ln));
+        }
+        i = i + 1;
+    }
+    return "";
+}

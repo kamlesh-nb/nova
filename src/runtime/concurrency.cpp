@@ -833,8 +833,16 @@ void nova_io_accept_async(long long server_fd, long long self) {
 namespace {
 struct NovaAcceptor {
     boost::asio::ip::tcp::acceptor acc;
-    NovaAcceptor(boost::asio::io_context &io, unsigned short port) : acc(io) {
+    // `host` empty ⇒ bind INADDR_ANY (v4, any interface); non-empty ⇒ bind that specific IPv4 address
+    // (an I3 Service VIP, e.g. a 127.0.0.x loopback alias). An unparseable host falls back to any.
+    NovaAcceptor(boost::asio::io_context &io, const std::string &host, unsigned short port) : acc(io) {
         boost::asio::ip::tcp::endpoint ep(boost::asio::ip::tcp::v4(), port);
+        if (!host.empty()) {
+            boost::system::error_code aec;
+            auto a = boost::asio::ip::make_address(host, aec);
+            if (!aec)
+                ep = boost::asio::ip::tcp::endpoint(a, port);
+        }
         acc.open(ep.protocol());
         acc.set_option(boost::asio::socket_base::reuse_address(true));
 #ifdef SO_REUSEPORT
@@ -855,10 +863,23 @@ struct NovaSocket {
 };
 } // namespace
 
-// Bind+listen on `port`; returns an acceptor handle (0 on failure, e.g. port in use).
+// Bind+listen on `port` (INADDR_ANY); returns an acceptor handle (0 on failure, e.g. port in use).
 long long nova_aserver_listen(long long port) {
     try {
-        return reinterpret_cast<long long>(new NovaAcceptor(g_reactors[g_reactor_id]->io, (unsigned short)port));
+        return reinterpret_cast<long long>(new NovaAcceptor(g_reactors[g_reactor_id]->io, "", (unsigned short)port));
+    } catch (...) {
+        return 0;
+    }
+}
+
+// I3: bind+listen on a SPECIFIC address:port (a Service VIP). `host` is a Nova string (length at
+// host-4). Empty/unparseable host ⇒ INADDR_ANY. Returns an acceptor handle (0 on failure).
+long long nova_aserver_listen_addr(long long host, long long port) {
+    const char *h = reinterpret_cast<const char *>(host);
+    int hlen = h ? *reinterpret_cast<const int *>(h - 4) : 0;
+    std::string host_s(h ? h : "", hlen < 0 ? 0 : hlen);
+    try {
+        return reinterpret_cast<long long>(new NovaAcceptor(g_reactors[g_reactor_id]->io, host_s, (unsigned short)port));
     } catch (...) {
         return 0;
     }

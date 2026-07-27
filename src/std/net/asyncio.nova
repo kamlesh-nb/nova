@@ -36,9 +36,16 @@ pub fn socketAcceptAsync(fd: int): int {
 //       return 0;
 //   }
 
-// Bind + listen; returns an acceptor handle (0 = failure, e.g. port already in use).
+// Bind + listen on INADDR_ANY; returns an acceptor handle (0 = failure, e.g. port already in use).
 pub fn serverListen(port: int): long {
     return nova_aserver_listen(port);
+}
+
+// Bind + listen on a SPECIFIC address (an I3 Service VIP, e.g. "127.0.0.2"); empty host ⇒ INADDR_ANY.
+// The VIP must already exist on the host (a loopback alias / configured address) — that OS setup is
+// outside Nova. Returns an acceptor handle (0 = failure).
+pub fn serverListenAddr(host: string, port: int): long {
+    return nova_aserver_listen_addr(host, port);
 }
 
 // P4c (share-nothing accept fan-out): the number of reactors (= cores-1 / NOVA_THREADS). A server
