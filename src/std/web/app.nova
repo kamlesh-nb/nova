@@ -530,6 +530,9 @@ pub struct App {
     }
 
     pub fn run(self: App, port: int): void {
+        // P4c share-nothing: hold all reactors alive BEFORE the block-drive so the per-reactor accept
+        // loops (fanned out inside runServer) land on live reactors. The block-drive then never returns.
+        asyncio.holdReactors();
         runServer(self, port);
     }
 }
@@ -811,18 +814,37 @@ async fn handleConn(app: App, client: long): int {
     return 0;
 }
 
-async fn runServer(app: App, port: int): int {
+// One reactor's accept loop: bind a SO_REUSEPORT acceptor on THIS reactor (the runtime routes the
+// acceptor + accepted sockets to the current reactor), then accept + spawn a handler per connection.
+// Handlers stay on the accepting reactor → its per-reactor connection pools reuse safely.
+async fn acceptLoop(app: App, port: int): int {
     let srv = asyncio.serverListen(port);
     if (srv == 0) {
         console.log("Nova web: failed to bind port (in use?)");
         return -1;
     }
-    console.log("Nova web server listening");
     while (true) {
         let client = await asyncio.aaccept(srv);
         spawn handleConn(app, client);
     }
     return 0;
+}
+
+// P4c share-nothing accept fan-out: one accept loop per reactor. ASYNC (so it can `spawn`); reached
+// via app.run's block-drive AFTER holdReactors has kept all reactors alive. Reactors 1..N-1 each get a
+// spawned accept loop pinned to them; reactor 0 runs its accept loop INLINE (never returns → the whole
+// server stays live). The kernel load-balances new connections across the N per-reactor SO_REUSEPORT
+// acceptors (nginx model) → real multi-core, no cross-reactor socket sharing.
+async fn runServer(app: App, port: int): int {
+    let n = asyncio.reactorCount();
+    let i = 1;
+    while (i < n) {
+        asyncio.pinNextCoro(i);        // the next spawn lands on reactor i
+        spawn acceptLoop(app, port);
+        i = i + 1;
+    }
+    console.log("Nova web server listening (share-nothing)");
+    return await acceptLoop(app, port); // reactor 0's accept loop, inline — never returns
 }
 
 // ---- W6 hardening: offline unit tests for the chunked-request codec ----------------------------

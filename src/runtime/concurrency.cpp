@@ -109,6 +109,10 @@ std::vector<Reactor *> &g_reactors = *new std::vector<Reactor *>{new Reactor(0)}
 // DISTINCT from g_nova_tid (the thread index used by per-thread lock-free pools) — in P0/P1 N
 // threads share reactor 0 so tids span 0..N-1 while reactor_id is 0; in P3 they coincide.
 thread_local int g_reactor_id = 0;
+// P4c: one-shot "pin the NEXT coroutine created on this thread to reactor N" hint (-1 = none).
+// Set by nova_pin_next_coro right before a `spawn`, so each per-reactor accept loop lands on its
+// reactor; consumed by the next CoroState construction. This is the codegen-free `spawnOn`.
+thread_local int g_pin_next = -1;
 // The historical name, now bound to reactor 0. Every existing use routes through the pool.
 boost::asio::io_context &g_io = g_reactors[0]->io;
 
@@ -180,7 +184,12 @@ struct CoroState {
     // threads without a strand. Once P3 makes each reactor single-threaded the strand is a free
     // no-op (no contention on a one-thread io_context); dropping it then is an optional optimization.
     boost::asio::strand<boost::asio::io_context::executor_type> strand;
-    CoroState() : reactor_id(g_reactor_id), strand(boost::asio::make_strand(g_reactors[reactor_id]->io)) {}
+    // reactor_id = the one-shot pin if set (P4c spawnOn), else the creating thread's reactor.
+    CoroState()
+        : reactor_id(g_pin_next >= 0 ? g_pin_next : g_reactor_id),
+          strand(boost::asio::make_strand(g_reactors[reactor_id]->io)) {
+        if (g_pin_next >= 0) g_pin_next = -1; // consume the one-shot hint
+    }
 };
 std::mutex &g_corostates_mu = *new std::mutex();
 std::unordered_map<long long, std::shared_ptr<CoroState>> &g_corostates =
@@ -568,6 +577,11 @@ void ensure_reactors(int n) {
 static thread_local int g_nova_tid = 0;
 long long nova_thread_id(void) { return g_nova_tid; }
 long long nova_worker_count(void) { return (long long)nova_thread_count(); }
+// P4c: pin the NEXT coroutine created on THIS thread to reactor `rid` (one-shot). Nova sets it right
+// before `spawn acceptLoop()` so each per-reactor accept loop lands on its reactor. Consumed by the
+// next CoroState construction (get_coro_state, reached via nova_sched_schedule). The codegen-free
+// `spawnOn`: no new spawn form, just a thread-local hint the scheduler stamps onto the fresh state.
+void nova_pin_next_coro(long long rid) { g_pin_next = (int)rid; }
 
 void nova_run(void) {
     // P3 (share-nothing): N = cores-1 reactors, each an INDEPENDENT io_context driven by ONE pinned
@@ -591,6 +605,24 @@ void nova_run(void) {
     g_reactors[0]->io.run();
     for (auto &t : pool) t.join();
     for (int i = 0; i < n; ++i) g_reactors[i]->io.restart();
+}
+
+// P4c: hold ALL reactors alive for a server's lifetime, WITHOUT touching the transient nova_run
+// (which compute/tests/async-gates use and which returns on idle — left untouched). A server calls
+// this BEFORE its (async, block-driven) runServer: it installs a leaked work_guard per reactor so each
+// reactor's run() BLOCKS instead of returning on the momentary idle. Then the ordinary block-drive
+// (nova_run inside nova_run_root) starts the N pinned reactor threads — now all persist — and runServer
+// (which IS async, so it can `spawn`) fans out one accept loop per reactor onto the live reactors. The
+// guards are never released, so nova_run never returns → the server runs for the process lifetime; a
+// program that never calls this keeps the exact transient behavior. Installing the guards BEFORE the
+// threads start is what avoids the empty-reactor early-exit race.
+std::vector<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>> &g_server_guards =
+    *new std::vector<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>>();
+void nova_hold_all_reactors(void) {
+    const int n = static_cast<int>(nova_thread_count());
+    ensure_reactors(n);
+    for (int i = 0; i < n; ++i)
+        g_server_guards.push_back(boost::asio::make_work_guard(g_reactors[i]->io));
 }
 
 // Drive the loop until `root` has ACTUALLY COMPLETED, not merely until the

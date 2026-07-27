@@ -830,6 +830,11 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         const spin_lu_type = core.LLVMFunctionType(void_type, &spin_p, 1, 0);
         try compiler.func_map.put("nova_spin_lock", core.LLVMAddFunction(compiler.module, "nova_spin_lock", spin_lu_type));
         try compiler.func_map.put("nova_spin_unlock", core.LLVMAddFunction(compiler.module, "nova_spin_unlock", spin_lu_type));
+        // P4c: nova_pin_next_coro(rid) — pin the next spawned coroutine to reactor rid (share-nothing accept fan-out)
+        try compiler.func_map.put("nova_pin_next_coro", core.LLVMAddFunction(compiler.module, "nova_pin_next_coro", spin_lu_type));
+        // P4c: nova_serve_forever() — persistent share-nothing server drive (separate from nova_run)
+        const void_noarg_type = core.LLVMFunctionType(void_type, null, 0, 0);
+        try compiler.func_map.put("nova_hold_all_reactors", core.LLVMAddFunction(compiler.module, "nova_hold_all_reactors", void_noarg_type));
 
         // nova_mutex_lock
         var one_val_param = [_]types.LLVMTypeRef{val_type};

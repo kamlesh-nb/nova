@@ -40,6 +40,28 @@ pub fn socketAcceptAsync(fd: int): int {
 pub fn serverListen(port: int): long {
     return nova_aserver_listen(port);
 }
+
+// P4c (share-nothing accept fan-out): the number of reactors (= cores-1 / NOVA_THREADS). A server
+// launches one accept loop per reactor so the kernel load-balances connections across cores.
+pub fn reactorCount(): int {
+    return nova_worker_count() as int;
+}
+// Pin the NEXT `spawn`ed coroutine to reactor `rid` (one-shot). Call IMMEDIATELY before
+// `spawn acceptLoop(...)` so that accept loop runs on reactor `rid`, binds a SO_REUSEPORT acceptor
+// there, and handles its connections on that reactor's thread — no cross-reactor socket sharing.
+pub fn pinNextCoro(rid: int): void {
+    nova_pin_next_coro(rid);
+}
+// Hold ALL reactors alive for a server's lifetime. Call ONCE, BEFORE the (async, block-driven) accept
+// fan-out. Installs a work_guard per reactor so no reactor exits on idle; the ordinary block-drive then
+// keeps every reactor running (and never returns → server runs forever). Separate from the transient
+// drive compute/tests use (a program that never calls this keeps the exact transient behavior).
+// Standard server shape:
+//   asyncio.holdReactors();          // BEFORE the block-drive
+//   // in an async fn: for each reactor i>0 { pinNextCoro(i); spawn acceptLoop(port); } + reactor-0 inline
+pub fn holdReactors(): void {
+    nova_hold_all_reactors();
+}
 // Awaitable client connect: `await aconnect(host, port)` → a socket handle (0 =
 // failure). Resolves + connects without holding a thread. Use async_read/async_write/aclose on
 // the returned handle. Direct call is a stub.

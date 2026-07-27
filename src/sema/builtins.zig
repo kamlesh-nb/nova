@@ -114,6 +114,10 @@ pub const externs = [_]Builtin{
     // its idle lists by nova_thread_id() so each is touched by ONE worker only (HAProxy idle_conn_srv).
     .{ .receiver = "", .name = "nova_thread_id", .ret = .long },
     .{ .receiver = "", .name = "nova_worker_count", .ret = .long },
+    // P4c: pin the next spawned coroutine to a reactor (share-nothing per-reactor accept fan-out).
+    .{ .receiver = "", .name = "nova_pin_next_coro", .ret = .void_ },
+    // P4c: persistent share-nothing server drive (blocks forever; call after spawning per-reactor accept loops).
+    .{ .receiver = "", .name = "nova_hold_all_reactors", .ret = .void_ },
     // Spinlock — tiny async-hot-path critical sections (proxy pool). A blocking mutex there convoys the
     // io_context threads; the spinlock holds the thread ~ns and never deschedules it.
     .{ .receiver = "", .name = "nova_spin_create", .ret = .long },

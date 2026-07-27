@@ -80,12 +80,30 @@ reactors are single-threaded (P3) would race. So P1 only adds the *affinity*, an
   green across reactors; ASAN clean. Benchmark note: **separate hosts** — single-box proxy+backends+load
   is too noisy (run-to-run 77↔3700 rps observed).
 
-### P4 — SO_REUSEPORT accept fan-out
-- Server listen path: each reactor binds its own `tcp::acceptor` with `SO_REUSEPORT` on the port; each runs
-  its own accept loop; accepted conn's coroutine gets that reactor's id.
-- `App.configureServer` / the listen entrypoint sets up N listeners.
-- **Prove:** live server accepts across reactors (log the accepting reactor id per connection); an existing
-  server gate stays green.
+### P4 — SO_REUSEPORT accept fan-out ✅ (P4a + P4c)
+**P4a** (`c21a179`): acceptor sets reuse_address + SO_REUSEPORT (POSIX-guarded); async socket/acceptor/
+resolver constructed on the owning coroutine's reactor io_context (not global g_io). Identical at
+reactor 0. Native 177/177, ASAN 324/324.
+
+**P4c** (this): the accept fan-out, isolated from the transient scheduler (option 3 — nova_run UNTOUCHED).
+- `spawnOn` = a thread-local one-shot pin: `nova_pin_next_coro(rid)` (asyncio.pinNextCoro) stamps the next
+  spawned coroutine's reactor in its lazily-created CoroState. No codegen change, no new spawn form.
+- Persistence WITHOUT touching nova_run: `nova_hold_all_reactors` (asyncio.holdReactors) installs a leaked
+  work_guard per reactor so each reactor's run() blocks instead of returning on idle. `App.run` calls it
+  BEFORE the block-drive, so when nova_run starts the N reactor threads they all persist (no empty-reactor
+  early-exit race), then the (async, so it can `spawn`) `runServer` fans out one accept loop per reactor
+  (pinNextCoro + spawn for reactors 1..N-1; reactor 0's loop inline). The block-drive never returns.
+- **KEY INSIGHT that made option-3 clean:** `spawn` is checker-gated to async fns, so the launcher stays
+  async + block-driven; persistence is external state (guards), so the transient nova_run and all 177
+  gates + 324 ASAN are untouched.
+- **Proven functional (live, macOS):** the fan-out server binds per-reactor SO_REUSEPORT acceptors,
+  accepts, and responds correctly; native 177/177 (transient path + gates unchanged).
+- **⚠️ DISTRIBUTION IS LINUX-ONLY:** `SO_REUSEPORT` load-balances new connections across the per-reactor
+  acceptors on **Linux** (the deploy target, since 3.9). **macOS/BSD `SO_REUSEPORT` delivers to ONE
+  socket** (no LB; needs FreeBSD's `SO_REUSEPORT_LB`, absent on macOS) — so on the dev machine all
+  connections land on one reactor even though every reactor bound successfully. The mechanism is correct;
+  observing multi-core distribution requires Linux (verify via Docker/colima). This is the "verification
+  reality" caveat — the multi-core proof is Linux-only, unlike the ASAN/gate proofs.
 
 ### P5 — Lift the pooling reuse gate
 - `src/std/net/proxy.nova`: `Backend.reuse = true` unconditionally (per-reactor pools are single-threaded);
