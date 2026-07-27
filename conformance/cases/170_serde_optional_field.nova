@@ -1,0 +1,64 @@
+// A `@serializable` struct with an OPTIONAL field (`age: int | undefined`) silently dropped that
+// field in BOTH directions:
+//   * BIND (deserialize): the generated `<S>__bind` switched on the field TypeRef and handled only
+//     `.ident` and `.generic` (List) — an `.optional` field fell through to `else` and was NEVER
+//     assigned, so a present value read back as `undefined` (data loss on every request DTO with an
+//     optional field). Fix: an `.optional` arm emitting a `has()`-guarded scalar read (the
+//     value-optional field store then boxes it, so a present 0 stays 0, not `undefined`).
+//   * TOJSON (serialize): `<S>__toJson` used a COMPILE-TIME comma flag and skipped optional fields
+//     entirely, so a present optional never appeared in the output. Fix: a RUNTIME `__sep` flag
+//     (byte-identical output for non-optional structs) + an optional arm that emits `"key":value`
+//     only when present (guard bound to a block-local so `!= undefined` narrows and unboxes it).
+
+import assert;
+import serde.source;
+import serde.json;
+import string;
+
+@serializable
+struct User {
+    pub name: string,
+    pub age: int | undefined,
+    pub nick: string | undefined,
+    init() { self.name = ""; self.age = undefined; self.nick = undefined; }
+}
+
+@test
+fn test_bind_present_including_zero(): void {
+    let u = User__bind(source.fromJson("{\"name\":\"amy\",\"age\":30,\"nick\":\"a\"}"));
+    assert.equalStr(u.name, "amy");
+    assert.equalInt(u.age ?? -1, 30);
+    assert.equalStr(u.nick ?? "?", "a");
+
+    let z = User__bind(source.fromJson("{\"name\":\"z\",\"age\":0}"));
+    assert.equalInt(z.age ?? -1, 0);        // present ZERO must not read as absent (boxing composes)
+    assert.equalStr(z.nick ?? "none", "none");
+}
+
+@test
+fn test_bind_absent(): void {
+    let u = User__bind(source.fromJson("{\"name\":\"no\"}"));
+    assert.equalInt(u.age ?? -1, -1);       // missing optional -> undefined
+    assert.equalStr(u.nick ?? "none", "none");
+}
+
+@test
+fn test_tojson_present_serializes(): void {
+    let u = User__bind(source.fromJson("{\"name\":\"amy\",\"age\":30,\"nick\":\"a\"}"));
+    assert.equalStr(User__toJson(u), "{\"name\":\"amy\",\"age\":30,\"nick\":\"a\"}");
+}
+
+@test
+fn test_tojson_absent_omits_with_correct_commas(): void {
+    let u = User__bind(source.fromJson("{\"name\":\"amy\"}"));
+    assert.equalStr(User__toJson(u), "{\"name\":\"amy\"}");   // both optionals omitted, no stray comma
+
+    let mid = User__bind(source.fromJson("{\"name\":\"amy\",\"nick\":\"a\"}"));
+    assert.equalStr(User__toJson(mid), "{\"name\":\"amy\",\"nick\":\"a\"}");  // age omitted, comma correct
+}
+
+@test
+fn test_roundtrip_symmetric(): void {
+    let raw = "{\"name\":\"amy\",\"age\":7,\"nick\":\"a\"}";
+    assert.equalStr(User__toJson(User__bind(source.fromJson(raw))), raw);
+}

@@ -607,6 +607,29 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
                         try serdeAppendf(&src, allocator, "    obj.{s} = {s}__bind(src.getChild(\"{s}\"));\n", .{ fname, tn, fname });
                     }
                 },
+                .optional => |inner| {
+                    // An OPTIONAL field (`age: int | undefined`) was neither `.ident` nor `.generic`,
+                    // so it hit the `else` below and was NEVER bound — a present value silently read
+                    // back as `undefined` (data loss on deserialize). Emit a presence-guarded read:
+                    // when the key is present, assign the scalar (the value-optional field store boxes
+                    // it, so a present 0 stays 0); when absent, leave the ctor's `undefined` default.
+                    if (inner.* == .ident) {
+                        const itn = inner.ident;
+                        if (std.mem.eql(u8, itn, "string")) {
+                            try serdeAppendf(&src, allocator, "    if (src.has(\"{s}\")) {{ obj.{s} = src.getString(\"{s}\"); }}\n", .{ fname, fname, fname });
+                        } else if (serdeIsInt(itn)) {
+                            try serdeAppendf(&src, allocator, "    if (src.has(\"{s}\")) {{ obj.{s} = src.getInt(\"{s}\"); }}\n", .{ fname, fname, fname });
+                        } else if (std.mem.eql(u8, itn, "bool")) {
+                            try serdeAppendf(&src, allocator, "    if (src.has(\"{s}\")) {{ obj.{s} = src.getBool(\"{s}\"); }}\n", .{ fname, fname, fname });
+                        } else if (std.mem.eql(u8, itn, "decimal")) {
+                            try serdeAppendf(&src, allocator, "    if (src.has(\"{s}\")) {{ obj.{s} = src.getDecimal(\"{s}\"); }}\n", .{ fname, fname, fname });
+                        } else if (serdeIsFloat(itn)) {
+                            try serdeAppendf(&src, allocator, "    if (src.has(\"{s}\")) {{ obj.{s} = src.getFloat(\"{s}\"); }}\n", .{ fname, fname, fname });
+                        } else if (serializable.contains(itn)) {
+                            try serdeAppendf(&src, allocator, "    if (src.has(\"{s}\")) {{ obj.{s} = {s}__bind(src.getChild(\"{s}\")); }}\n", .{ fname, fname, itn, fname });
+                        }
+                    }
+                },
                 .generic => |g| {
                     if (std.mem.eql(u8, g.name, "List") and g.params.len == 1) {
                         // Initialize the List FIELD to an empty container first: `obj` comes from the
@@ -641,28 +664,49 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
         try src.appendSlice(allocator, "    return obj;\n}\n\n");
 
         // --- <S>__toJson(obj): string  (symmetric serializer; string-concat based) ---
-        try serdeAppendf(&src, allocator, "fn {s}__toJson(obj: {s}): string {{\n    let out = \"{{\";\n", .{ s.name, s.name });
-        var first = true;
+        // A RUNTIME `__sep` flag (not a compile-time comma) so an OPTIONAL field can OMIT itself when
+        // absent without stranding a comma. Output is byte-identical for structs with no optionals
+        // (first emitted field sees __sep="", the rest ","), so the existing exact-string round-trip
+        // gates are unaffected. `__sep = ","` runs only inside each field's emit, so a skipped optional
+        // leaves it untouched and the next present field is treated as first.
+        try serdeAppendf(&src, allocator, "fn {s}__toJson(obj: {s}): string {{\n    let out = \"{{\";\n    let __sep = \"\";\n", .{ s.name, s.name });
         for (s.fields) |f| {
             const fname = f.name;
-            const comma = if (first) "" else ",";
             switch (f.type_name) {
                 .ident => |tn| {
                     if (std.mem.eql(u8, tn, "string")) {
-                        try serdeAppendf(&src, allocator, "    out = out + \"{s}\\\"{s}\\\":\" + json.quote(obj.{s});\n", .{ comma, fname, fname });
-                        first = false;
+                        try serdeAppendf(&src, allocator, "    out = out + __sep + \"\\\"{s}\\\":\" + json.quote(obj.{s}); __sep = \",\";\n", .{ fname, fname });
                     } else if (serdeIsInt(tn) or std.mem.eql(u8, tn, "bool")) {
-                        try serdeAppendf(&src, allocator, "    out = out + \"{s}\\\"{s}\\\":\" + obj.{s};\n", .{ comma, fname, fname });
-                        first = false;
+                        try serdeAppendf(&src, allocator, "    out = out + __sep + \"\\\"{s}\\\":\" + obj.{s}; __sep = \",\";\n", .{ fname, fname });
                     } else if (std.mem.eql(u8, tn, "decimal")) {
                         // Exact decimal as an UNQUOTED JSON number (`${}` gives its BID text, no f64 hop).
-                        try serdeAppendf(&src, allocator, "    out = out + \"{s}\\\"{s}\\\":\" + `${{obj.{s}}}`;\n", .{ comma, fname, fname });
-                        first = false;
+                        try serdeAppendf(&src, allocator, "    out = out + __sep + \"\\\"{s}\\\":\" + `${{obj.{s}}}`; __sep = \",\";\n", .{ fname, fname });
                     } else if (serializable.contains(tn)) {
-                        try serdeAppendf(&src, allocator, "    out = out + \"{s}\\\"{s}\\\":\" + {s}__toJson(obj.{s});\n", .{ comma, fname, tn, fname });
-                        first = false;
+                        try serdeAppendf(&src, allocator, "    out = out + __sep + \"\\\"{s}\\\":\" + {s}__toJson(obj.{s}); __sep = \",\";\n", .{ fname, tn, fname });
                     }
                     // f32/f64 float fields skipped (f64 stringify gap); decimal handled above
+                },
+                .optional => |inner| {
+                    // Symmetric with the `.optional` bind arm: emit `"key":value` only when PRESENT,
+                    // else omit the key entirely (matches the has()-based read). The value is bound to a
+                    // block-local `__v` first so the `!= undefined` guard NARROWS it to the bare inner
+                    // value (field access does not narrow; a plain local does) → it unboxes correctly.
+                    if (inner.* == .ident) {
+                        const itn = inner.ident;
+                        var vexpr: ?[]const u8 = null;
+                        if (std.mem.eql(u8, itn, "string")) {
+                            vexpr = "json.quote(__v)";
+                        } else if (serdeIsInt(itn) or std.mem.eql(u8, itn, "bool")) {
+                            vexpr = "__v";
+                        } else if (std.mem.eql(u8, itn, "decimal")) {
+                            vexpr = "`${__v}`";
+                        } else if (serializable.contains(itn)) {
+                            vexpr = try std.fmt.allocPrint(allocator, "{s}__toJson(__v)", .{itn});
+                        }
+                        if (vexpr) |ve| {
+                            try serdeAppendf(&src, allocator, "    {{ let __v = obj.{s}; if (__v != undefined) {{ out = out + __sep + \"\\\"{s}\\\":\" + {s}; __sep = \",\"; }} }}\n", .{ fname, fname, ve });
+                        }
+                    }
                 },
                 .generic => |g| {
                     if (std.mem.eql(u8, g.name, "List") and g.params.len == 1) {
@@ -682,10 +726,9 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
                             else => {},
                         }
                         if (item) |itemexpr| {
-                            try serdeAppendf(&src, allocator, "    out = out + \"{s}\\\"{s}\\\":[\";\n", .{ comma, fname });
+                            try serdeAppendf(&src, allocator, "    out = out + __sep + \"\\\"{s}\\\":[\"; __sep = \",\";\n", .{fname});
                             try serdeAppendf(&src, allocator, "    {{ let __i = 0; while (__i < obj.{s}.size()) {{ if (__i > 0) {{ out = out + \",\"; }} out = out + {s}; __i = __i + 1; }} }}\n", .{ fname, itemexpr });
                             try src.appendSlice(allocator, "    out = out + \"]\";\n");
-                            first = false;
                         }
                     }
                 },
