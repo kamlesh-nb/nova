@@ -22,22 +22,30 @@ let failed = false, failMsg = '';
 const u8 = () => new Uint8Array(memory.buffer);
 const view = () => new DataView(memory.buffer);
 
+// wasm32 ABI: a pointer is 32-bit, but nova's universal value handle is i64 (it must hold an f64).
+// A pointer therefore travels in the LOW 32 bits of that i64; the high bits are don't-care (inside
+// wasm, `inttoptr i64->ptr` truncates to i32, so memory access is correct even when they are dirty —
+// e.g. a re-entrant alloc leaves stack garbage there). But a HOST import receives the full i64, so it
+// MUST mask to 32 bits before using it as a linear-memory offset. This is the wasm32 pointer ABI, not
+// a workaround: every offset above is < 4GB, so the low 32 bits are the whole address.
+const ptr32 = (x) => Number((typeof x === 'bigint' ? x : BigInt(x)) & 0xffffffffn);
+
 // Read a nova string (byte ptr; length at [ptr-4]).
 function readStr(ptr) {
-  ptr = Number(ptr);
+  ptr = ptr32(ptr);
   if (ptr === 0) return '';
   const len = view().getInt32(ptr - 4, true);
   return new TextDecoder().decode(u8().subarray(ptr, ptr + len));
 }
 // Read `len` raw bytes at ptr (for log, which is given the length).
 function readN(ptr, len) {
-  ptr = Number(ptr); len = Number(len);
+  ptr = ptr32(ptr); len = Number(len);
   return new TextDecoder().decode(u8().subarray(ptr, ptr + len));
 }
 // Allocate a nova string via the module allocator, return its byte ptr (BigInt).
 function makeStr(s) {
   const b = new TextEncoder().encode(s);
-  const ptr = Number(exports.nova_bytes_alloc(BigInt(b.length)));
+  const ptr = ptr32(exports.nova_bytes_alloc(BigInt(b.length)));
   u8().set(b, ptr);
   return BigInt(ptr);
 }
@@ -52,18 +60,18 @@ function bitsToF64(bits) {
 // i64 values are BigInts. CAS returns a *bool* (1 if swapped, 0 if not) — nova's
 // compareAndSwap(expected, desired): bool — NOT the old value.
 const atomicRW = {
-  load_i32: (p) => view().getInt32(p, true),
-  load_i64: (p) => view().getBigInt64(p, true),
-  load_bool: (p) => (u8()[p] ? 1 : 0),
-  store_i32: (p, v) => { view().setInt32(p, v, true); },
-  store_i64: (p, v) => { view().setBigInt64(p, v, true); },
-  store_bool: (p, v) => { u8()[p] = v ? 1 : 0; },
-  add_i32: (p, v) => { const o = view().getInt32(p, true); view().setInt32(p, o + v, true); return o; },
-  add_i64: (p, v) => { const o = view().getBigInt64(p, true); view().setBigInt64(p, o + v, true); return o; },
-  sub_i32: (p, v) => { const o = view().getInt32(p, true); view().setInt32(p, o - v, true); return o; },
-  cas_i32: (p, e, d) => { const o = view().getInt32(p, true); if (o === e) { view().setInt32(p, d, true); return 1; } return 0; },
-  cas_i64: (p, e, d) => { const o = view().getBigInt64(p, true); if (o === e) { view().setBigInt64(p, d, true); return 1; } return 0; },
-  cas_bool: (p, e, d) => { const o = u8()[p] ? 1 : 0; if (o === e) { u8()[p] = d ? 1 : 0; return 1; } return 0; },
+  load_i32: (p) => view().getInt32(ptr32(p), true),
+  load_i64: (p) => view().getBigInt64(ptr32(p), true),
+  load_bool: (p) => (u8()[ptr32(p)] ? 1 : 0),
+  store_i32: (p, v) => { view().setInt32(ptr32(p), v, true); },
+  store_i64: (p, v) => { view().setBigInt64(ptr32(p), v, true); },
+  store_bool: (p, v) => { u8()[ptr32(p)] = v ? 1 : 0; },
+  add_i32: (p, v) => { p = ptr32(p); const o = view().getInt32(p, true); view().setInt32(p, o + v, true); return o; },
+  add_i64: (p, v) => { p = ptr32(p); const o = view().getBigInt64(p, true); view().setBigInt64(p, o + v, true); return o; },
+  sub_i32: (p, v) => { p = ptr32(p); const o = view().getInt32(p, true); view().setInt32(p, o - v, true); return o; },
+  cas_i32: (p, e, d) => { p = ptr32(p); const o = view().getInt32(p, true); if (o === e) { view().setInt32(p, d, true); return 1; } return 0; },
+  cas_i64: (p, e, d) => { p = ptr32(p); const o = view().getBigInt64(p, true); if (o === e) { view().setBigInt64(p, d, true); return 1; } return 0; },
+  cas_bool: (p, e, d) => { p = ptr32(p); const o = u8()[p] ? 1 : 0; if (o === e) { u8()[p] = d ? 1 : 0; return 1; } return 0; },
 };
 
 const env = {
@@ -76,14 +84,15 @@ const env = {
   // cell holding one i64 word; null/0 = undefined. Mirror alloc.cpp's nova_valopt_box/unbox exactly,
   // allocating in the module's own linear memory via its exported allocator.
   nova_valopt_box: (value) => {
-    const ptr = exports.nova_bytes_alloc(8n);
-    if (ptr === 0n) return 0n;
-    view().setBigInt64(Number(ptr), BigInt.asIntN(64, value), true);
-    return ptr;
+    const ptr = ptr32(exports.nova_bytes_alloc(8n));
+    if (ptr === 0) return 0n;
+    view().setBigInt64(ptr, BigInt.asIntN(64, value), true);   // `value` is the boxed word — NOT a ptr, no mask
+    return BigInt(ptr);
   },
   nova_valopt_unbox: (box) => {
-    if (box === 0n) return 0n;
-    return view().getBigInt64(Number(box), true);
+    const p = ptr32(box);
+    if (p === 0) return 0n;
+    return view().getBigInt64(p, true);
   },
 
   nova_i64_to_string: (n) => makeStr(BigInt.asIntN(64, n).toString()),
