@@ -1,0 +1,58 @@
+// 185 — the async request→DB chain the web framework relies on: an async fn awaits an async TRAIT
+// method (dynamic dispatch) which itself awaits a lower async method, returning a STRUCT the whole way
+// up. This is the shape of App.respondMiss -> App.dispatch -> AppMediator.send -> MessageHandler.handle
+// -> repo.query, all `async fn`, awaited end to end so a request is served on ONE coroutine with no
+// nested block-drive. Runs here from a sync @test (top-level drive, depth 0 — the supported seam).
+import assert;
+import string;
+
+pub struct Product {
+    pub id: int,
+    pub name: string,
+    init(id: int, name: string) { self.id = id; self.name = name; }
+}
+
+// The "connection" seam — an async trait method returning a struct via dynamic dispatch.
+trait Repo {
+    async fn load(self, id: int): Product;
+}
+
+struct MockRepo impl Repo {
+    init() {}
+    // async, and it AWAITS a lower async step — proving multi-level await, not just one hop.
+    pub async fn load(self: MockRepo, id: int): Product {
+        let nm = await self.name_of(id);
+        return Product(id, nm);
+    }
+    async fn name_of(self: MockRepo, id: int): string {
+        if (id == 7) { return "Widget"; }
+        return "Unknown";
+    }
+}
+
+// The "handler" — async, awaits the repo through the trait object (dynamic dispatch).
+async fn handle(r: Repo, id: int): Product {
+    return await r.load(id);
+}
+
+// The "dispatch" level — async, awaits the handler. Mirrors App.dispatch -> AppMediator.send.
+async fn dispatch(r: Repo, id: int): Product {
+    return await handle(r, id);
+}
+
+@test
+fn test_async_chain_returns_struct(): void {
+    let r = MockRepo();
+    // Top-level drive from a sync @test: the whole async chain runs to completion.
+    let p = dispatch(r, 7);
+    assert.equalInt(p.id, 7);
+    assert.equalStr(p.name, "Widget");
+}
+
+@test
+fn test_async_chain_fallback(): void {
+    let r = MockRepo();
+    let p = dispatch(r, 1);
+    assert.equalInt(p.id, 1);
+    assert.equalStr(p.name, "Unknown");
+}

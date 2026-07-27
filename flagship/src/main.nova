@@ -18,7 +18,10 @@ fn buildApp(): App {
     app.handle<CreateProduct>(CreateProductHandler{});
     app.post<CreateProduct>("/api/products");
 
-    app.handle<GetProductById>(GetProductByIdHandler{});
+    // The GetProductById handler holds a repository backed by the fetched nova-postgres driver, so it
+    // runs a REAL per-request DB query (awaited on the request coroutine — no block-drive, no deadlock).
+    let repo = ProductRepository("postgresql://postgres@127.0.0.1:5432/appdb");
+    app.handle<GetProductById>(GetProductByIdHandler{ repo: repo });
     app.get<GetProductById>("/api/products/{id:int}");
 
     // Serve static assets (wwwroot/) for any unmatched GET.
@@ -27,13 +30,10 @@ fn buildApp(): App {
 }
 
 fn main(): void {
-    // Startup: exercise the nova get-fetched nova-postgres driver through the db seam — a REAL query,
-    // driven synchronously here (where a live DB would seed a cache). Degrades gracefully when no
-    // database is running (a failed connect now returns cleanly instead of crashing), so the app boots
-    // either way. This is a fetched package dependency executing inside the flagship.
-    let repo = ProductRepository("postgresql://postgres@127.0.0.1:5432/appdb");
-    console.log("[startup] product #1 via fetched nova-postgres driver: " + repo.productName(1));
-
+    // DB access now happens PER REQUEST inside GetProductByIdHandler (awaited on the request coroutine
+    // through the nova get-fetched nova-postgres driver) — no startup block-drive needed. GET
+    // /api/products/{id} runs a live `SELECT name FROM products WHERE id = $1`, degrading gracefully
+    // to a fallback name when the database is offline, so the app serves either way.
     let app = buildApp();
     console.log("Listening on http://127.0.0.1:8080");
     app.run(8080);

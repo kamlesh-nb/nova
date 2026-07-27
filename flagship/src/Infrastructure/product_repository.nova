@@ -15,13 +15,15 @@ pub struct ProductRepository {
         self.dsn = dsn;
     }
 
-    // Look up a product name by id. Uses the fetched Postgres driver through the db seam.
-    pub fn productName(self: ProductRepository, id: int): string {
+    // Look up a product name by id. Uses the fetched Postgres driver through the db seam. `async fn`:
+    // the connect + query PARK the request coroutine (non-blocking) instead of block-driving — so this
+    // is safe to `await` from inside a request handler (no nested nova_run_root, no deadlock).
+    pub async fn productName(self: ProductRepository, id: int): string {
         let driver = PgDriver();
-        let conn = driver.connect(self.dsn);
+        let conn = await driver.connect(self.dsn);
         let params = List<DbValue>();
         params.push(dbInt(id));
-        let rs = conn.query("SELECT name FROM products WHERE id = $1", params);
+        let rs = await conn.query("SELECT name FROM products WHERE id = $1", params);
         conn.close();
         if (rs.rowCount() > 0) {
             return rs.row(0).getText(0);

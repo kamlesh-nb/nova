@@ -38,7 +38,7 @@ struct MockConn impl Connection {
     fn setTimeout(self: MockConn, ms: int): int { return 0; }
     async fn prepare(self: MockConn, sql: string): int { return 0; }
     async fn queryPrepared(self: MockConn, stmt: int, params: List<DbValue>): ResultSet {
-        return self.query("", params);
+        return await self.query("", params);
     }
     async fn execPrepared(self: MockConn, stmt: int, params: List<DbValue>): ExecResult {
         return ExecResult(0, "MOCK");

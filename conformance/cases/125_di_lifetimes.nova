@@ -27,7 +27,7 @@ struct H impl MessageHandler {
     scoped: SCount,
     singleton: GCount,
     init(a: SCount, b: GCount) { self.scoped = a; self.singleton = b; }
-    fn handle(self: H, src: ValueSource): Response {
+    async fn handle(self: H, src: ValueSource): Response {
         return json(`{"scoped":${self.scoped.inc()},"singleton":${self.singleton.inc()}}`);
     }
 }

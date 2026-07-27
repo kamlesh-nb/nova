@@ -23,14 +23,14 @@ import map;
 @serializable struct CreateUser { pub name: string }
 
 struct GetUserHandler impl MessageHandler {
-    fn handle(self: GetUserHandler, src: ValueSource): Response {
+    async fn handle(self: GetUserHandler, src: ValueSource): Response {
         let q = GetUser{ id: src.getInt("id") };   // binding is ordinary, visible, debuggable code
         return json(`{"id":${q.id},"name":"Ada"}`);
     }
 }
 
 struct CreateUserHandler impl MessageHandler {
-    fn handle(self: CreateUserHandler, src: ValueSource): Response {
+    async fn handle(self: CreateUserHandler, src: ValueSource): Response {
         let c = CreateUser{ name: src.getString("name") };
         return json(`{"created":"${c.name}"}`);
     }

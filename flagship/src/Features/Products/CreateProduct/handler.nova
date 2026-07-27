@@ -6,7 +6,7 @@ import Features.Products.CreateProduct.validator;
 
 // Handles CreateProduct: bind the command (visible, debuggable), validate, respond.
 pub struct CreateProductHandler impl MessageHandler {
-    fn handle(self: CreateProductHandler, src: ValueSource): Response {
+    async fn handle(self: CreateProductHandler, src: ValueSource): Response {
         let cmd = CreateProduct{ name: src.getString("name"), price: src.getInt("price") as int };
         let err = validateCreateProduct(cmd);
         if (err.length != 0) {

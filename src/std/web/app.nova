@@ -49,7 +49,12 @@ import assert;
 /// ordinary, VISIBLE, debuggable Nova you can step, log, and validate. No hidden compiler binder,
 /// no reflection, no `any` downcast.
 pub trait MessageHandler {
-    fn handle(self: MessageHandler, src: ValueSource): response.Response;
+    // `handle` is `async fn`: a handler may `await` async work (a DB query, an outbound HTTP call)
+    // directly on the request coroutine — it PARKS, it does not block-drive. The whole dispatch chain
+    // above it (`AppMediator.send` -> `App.dispatch` -> `App.respondMiss` -> the async `handleConn`
+    // accept-loop coroutine) is async too, so the request is awaited end to end with no nested
+    // `nova_run_root`. A pure-compute handler with no `await` simply completes at first resume.
+    async fn handle(self: MessageHandler, src: ValueSource): response.Response;
 }
 
 pub struct AppMediator {
@@ -79,26 +84,26 @@ pub struct AppMediator {
     // (DI) is preferred: a fresh per-request `ServiceScope` is opened, the handler is BUILT from it
     // (so its scoped dependencies are per-request), and it runs. Else a pre-built instance; else 404.
     // The handler binds and returns the Response — the one request→Response dispatch site.
-    pub fn send(self: AppMediator, key: string, provider: ServiceProvider, src: ValueSource): response.Response {
+    pub async fn send(self: AppMediator, key: string, provider: ServiceProvider, src: ValueSource): response.Response {
         let factory = self.factories.get(key);
         if (factory != undefined) {
             let scope = provider.createScope();
             let build = factory ?? ((sc) => { return NoHandler{}; });
             let handler = build(scope);
-            return handler.handle(src);
+            return await handler.handle(src);
         }
         let handler = self.handlers.get(key);
         if (handler == undefined) {
             return response.Response(Status.NotFound, "No handler for request: " + key);
         }
-        return handler.handle(src);
+        return await handler.handle(src);
     }
 }
 
 // The unreachable default for the factory `??` in `send` (a closure default may not capture `self`).
 // Never invoked: the factory is present whenever this branch is reached.
 struct NoHandler impl MessageHandler {
-    fn handle(self: NoHandler, src: ValueSource): response.Response {
+    async fn handle(self: NoHandler, src: ValueSource): response.Response {
         return response.Response(Status.NotFound, "No handler");
     }
 }
@@ -372,9 +377,9 @@ pub struct App {
     /// The MISS path: parse the (already-materialized) request, dispatch, serialize, and — for a
     /// cacheable GET — store a copy for next time. `method`/`path` are passed in (the server already
     /// extracted them from the buffer) so we don't re-derive them.
-    pub fn respondMiss(self: App, raw: string, method: string, path: string): string {
+    pub async fn respondMiss(self: App, raw: string, method: string, path: string): string {
         let req = request.Request.fromString(raw);
-        let resp = self.dispatch(req);
+        let resp = await self.dispatch(req);
 
         // W7 content negotiation: if the client advertises `Accept-Encoding: gzip` and the body is
         // worth compressing (≥ 256 bytes and actually shrinks), gzip it and set `Content-Encoding: gzip`.
@@ -467,7 +472,7 @@ pub struct App {
         return source.ParamSource(params);
     }
 
-    pub fn dispatch(self: App, req: Request): response.Response {
+    pub async fn dispatch(self: App, req: Request): response.Response {
         let segs = pathSegs(req.path);
         let nseg = segs.size();
         let nroutes = self.routes.size();
@@ -501,7 +506,7 @@ pub struct App {
                         // The one request→Response site: build the source, resolve the handler by the
                         // route's type key, run it. `send` is HERE, once — not in the verb methods.
                         let src = self.sourceFor(req, params);
-                        return self.mediator.send(route.key, self.provider, src);
+                        return await self.mediator.send(route.key, self.provider, src);
                     }
                 } else if (typed_bad && string.eql(route.method, req.method)) {
                     return response.Response(Status.BadRequest, "Bad Request: invalid path parameter");
@@ -792,7 +797,7 @@ async fn handleConn(app: App, client: long): int {
                 bytes.read_string(buf, hdrEnd) + "\r\n\r\n" + chunkedBody
             else
                 bytes.read_string(buf, reqEnd);
-            out = app.respondMiss(raw, method, path);
+            out = await app.respondMiss(raw, method, path);
         }
         await asyncio.async_write(client, out);
 

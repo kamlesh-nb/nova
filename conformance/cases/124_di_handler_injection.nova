@@ -42,7 +42,7 @@ struct HitHandler impl MessageHandler {
     counter: Counter,
     greeter: Greeter,
     init(c: Counter, g: Greeter) { self.counter = c; self.greeter = g; }
-    fn handle(self: HitHandler, src: ValueSource): Response {
+    async fn handle(self: HitHandler, src: ValueSource): Response {
         let q = Hit{ name: src.getString("name") };
         let n = self.counter.next();
         let msg = self.greeter.greet(q.name);
@@ -88,7 +88,7 @@ fn test_di_singleton_persists_across_requests(): void {
 
 // (3) The instance path (`handle<T>(H{})`) still works alongside DI — additive, no regression.
 struct PingHandler impl MessageHandler {
-    fn handle(self: PingHandler, src: ValueSource): Response { return json(`{"pong":true}`); }
+    async fn handle(self: PingHandler, src: ValueSource): Response { return json(`{"pong":true}`); }
 }
 @serializable struct Ping { pub x: int }
 @test

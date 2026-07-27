@@ -127,6 +127,10 @@ pub const TypeChecker = struct {
     // M3-B: function coloring — true while checking the body of an `async fn`.
     // `await` is only legal when this is set.
     in_async: bool = false,
+    // True while checking the DIRECT operand of `await`/`spawn`. A call reached with this set is
+    // "consumed" (awaited or spawned), so it is NOT flagged as a bare async call. The `.call`/
+    // `.generic_call` arms read-and-clear it (args/callee are not themselves awaited).
+    in_awaited: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, file_sources: *std.StringHashMap([]const u8)) TypeChecker {
         return TypeChecker{
@@ -566,6 +570,11 @@ pub const TypeChecker = struct {
     fn checkExpr(self: *TypeChecker, expr: ast.Expression) anyerror!void {
         switch (expr.kind) {
             .generic_call => |gc| {
+                const awaited_here = self.in_awaited;
+                self.in_awaited = false;
+                if (self.in_async and !awaited_here and self.callTargetsAsync(gc.callee.*)) {
+                    self.addError(gc.span, "async call must be 'await'ed (or 'spawn'ed) inside an 'async fn' — a bare call block-drives the coroutine and would deadlock the event loop", .{});
+                }
                 if (gc.callee.kind == .ident) {
                     const name = gc.callee.kind.ident;
                     var expected: ?usize = null;
@@ -595,6 +604,19 @@ pub const TypeChecker = struct {
                 for (gc.args) |a| try self.checkExpr(a);
             },
             .call => |c| {
+                // Function coloring (call side): a call reached as the direct operand of
+                // `await`/`spawn` is consumed. Read-and-clear so the callee/args below are
+                // checked as ordinary (non-awaited) positions.
+                const awaited_here = self.in_awaited;
+                self.in_awaited = false;
+                // Inside an `async fn`, an async call MUST be `await`ed (or `spawn`ed). A bare call
+                // block-drives (nova_run_root) from within the event loop → nested drive → deadlock
+                // (the runtime now aborts loudly on it). Reject it at compile time instead. Note this
+                // fires ONLY in async context: a sync `main`/`@test`/top-level driving an async fn is
+                // the supported seam and stays legal.
+                if (self.in_async and !awaited_here and self.callTargetsAsync(c.callee.*)) {
+                    self.addError(c.span, "async call must be 'await'ed (or 'spawn'ed) inside an 'async fn' — a bare call block-drives the coroutine and would deadlock the event loop", .{});
+                }
                 // Arg-count check for a plain top-level function call, but only
                 // when unambiguous (no cross-module name collision) and not a
                 // locally-shadowed name (a closure-valued variable). Conservative
@@ -705,14 +727,20 @@ pub const TypeChecker = struct {
                 if (!self.in_async) {
                     self.addError(aw.span, "'await' is only allowed inside an 'async fn'", .{});
                 }
+                const saved = self.in_awaited;
+                self.in_awaited = true; // the operand call is consumed by this await
                 try self.checkExpr(aw.operand.*);
+                self.in_awaited = saved;
             },
             .go_expr => |g| {
-                // `go <async-call>` launches a concurrent task; only legal in async.
+                // `go`/`spawn <async-call>` launches a concurrent task; only legal in async.
                 if (!self.in_async) {
                     self.addError(g.span, "'go' is only allowed inside an 'async fn'", .{});
                 }
+                const saved = self.in_awaited;
+                self.in_awaited = true; // the operand call is consumed by this spawn
                 try self.checkExpr(g.operand.*);
+                self.in_awaited = saved;
             },
             else => {},
         }
@@ -868,6 +896,47 @@ pub const TypeChecker = struct {
             }
         }
         return false;
+    }
+
+    // True if `callee` names an `async fn` (free function or method). Used to reject a bare
+    // (non-await/spawn) async call inside an `async fn`. Conservative: an unresolved callee
+    // (module-qualified free fn, closure value, builtin) returns false → no false positive.
+    fn callTargetsAsync(self: *TypeChecker, callee: ast.Expression) bool {
+        switch (callee.kind) {
+            .ident => |name| {
+                // A locally-shadowed name is a closure value, not the free fn.
+                if (self.variables.contains(name)) return false;
+                if (self.functions.get(name)) |f| return f.is_async;
+                return false;
+            },
+            .field_access => |fa| {
+                // Builtin receivers (`bytes`, `console`, ...) are never async.
+                if (fa.object.kind == .ident) {
+                    if (builtins.find(fa.object.kind.ident, fa.field) != null) return false;
+                }
+                const obj_type = self.resolveExprType(fa.object.*) orelse return false;
+                const tname: []const u8 = switch (obj_type) {
+                    .ident => |n| n,
+                    .generic => |g| g.name, // trait object / generic instance: match on the base name
+                    else => return false,
+                };
+                if (self.structs.get(tname)) |s| {
+                    for (s.methods) |m| {
+                        if (std.mem.eql(u8, m.decl.name, fa.field)) return m.decl.is_async;
+                    }
+                } else if (self.traits.get(tname)) |t| {
+                    for (t.methods) |tm| {
+                        if (std.mem.eql(u8, tm.name, fa.field)) return tm.is_async;
+                    }
+                } else if (self.enums.get(tname)) |e| {
+                    for (e.methods) |m| {
+                        if (std.mem.eql(u8, m.decl.name, fa.field)) return m.decl.is_async;
+                    }
+                }
+                return false;
+            },
+            else => return false,
+        }
     }
 
     fn resolveExprType(self: *TypeChecker, expr: ast.Expression) ?ast.TypeRef {

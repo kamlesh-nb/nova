@@ -2,12 +2,18 @@ import web.response;
 import web.status;
 import serde.source;
 import Features.Products.GetProductById.query;
+import Infrastructure.product_repository;
 
 pub struct GetProductByIdHandler impl MessageHandler {
-    fn handle(self: GetProductByIdHandler, src: ValueSource): Response {
+    pub repo: ProductRepository,
+
+    // `handle` is `async fn` (the MessageHandler trait now declares it so), so it can `await` the
+    // repository's async DB query DIRECTLY on the request coroutine — a genuine PER-REQUEST database
+    // read through the `nova get`-fetched nova-postgres driver. The query PARKS this coroutine while the
+    // socket round-trips; it does not block-drive. Degrades gracefully when the DB is offline.
+    async fn handle(self: GetProductByIdHandler, src: ValueSource): Response {
         let q = GetProductById{ id: src.getInt("id") as int };
-        // Product data is loaded from the database at startup (see main.nova → ProductRepository, backed by
-        // the nova get-fetched nova-postgres driver). The request path stays non-blocking.
-        return json(`{"id":${q.id},"name":"Sample Product"}`);
+        let name = await self.repo.productName(q.id);
+        return json(`{"id":${q.id},"name":"${name}"}`);
     }
 }

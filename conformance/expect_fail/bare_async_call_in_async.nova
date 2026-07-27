@@ -1,0 +1,28 @@
+// EXPECT-FAIL: typecheck
+// Function coloring (call side): inside an `async fn`, an async call MUST be `await`ed (or `spawn`ed).
+// A BARE call block-drives the callee to completion via nova_run_root — and when the enclosing async fn
+// is itself running as a coroutine (a request handler, an actor), that re-enters the event loop on a
+// context that never goes idle under a live server → the coroutine DEADLOCKS. The runtime now aborts
+// loudly on the nested drive; the checker rejects the shape up front so it never gets that far.
+//
+// This is DISTINCT from a sync `main`/`@test` driving an async fn at the top level (depth 0), which is
+// the supported seam and stays legal — see conformance/cases/111_async_trait_methods.nova.
+
+import assert;
+
+async fn fetch(): int {
+    return 42;
+}
+
+async fn caller(): int {
+    // BARE async call inside an `async fn` — must be rejected. The fix is `await fetch()`.
+    let x = fetch();
+    return x;
+}
+
+@test
+fn t_bare_async(): void {
+    // caller() itself is driven from this sync @test (depth 0) — that part is fine; the error is the
+    // un-awaited fetch() INSIDE caller.
+    assert.equalInt(caller(), 42);
+}

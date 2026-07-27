@@ -53,11 +53,11 @@ struct MockConn impl Connection {
     pub async fn prepare(self, sql: string): int { self.prepared.push(sql); return self.prepared.size() - 1; }
     pub async fn queryPrepared(self, stmt: int, params: List<DbValue>): ResultSet {
         if (stmt < 0 || stmt >= self.prepared.size()) { return ResultSet(); }
-        return self.query(self.prepared.get(stmt) ?? "", params);
+        return await self.query(self.prepared.get(stmt) ?? "", params);
     }
     pub async fn execPrepared(self, stmt: int, params: List<DbValue>): ExecResult {
         if (stmt < 0 || stmt >= self.prepared.size()) { return ExecResult(0, ""); }
-        return self.exec(self.prepared.get(stmt) ?? "", params);
+        return await self.exec(self.prepared.get(stmt) ?? "", params);
     }
 }
 

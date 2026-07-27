@@ -616,6 +616,14 @@ void ensure_reactors(int n) {
 // needed — the HAProxy `idle_conn_srv[tid]` model. The main thread is 0; pool threads 1..N-1.
 static thread_local int g_nova_tid = 0;
 long long nova_thread_id(void) { return g_nova_tid; }
+
+// Per-thread depth of active `io.run()` frames. >0 means THIS thread is currently
+// executing inside the event loop (a coroutine resumed by io.run()). Block-driving an
+// async call (nova_run_root) from that state re-enters io.run() on a context that never
+// goes idle under a live server (work-guards held) → the outer coroutine wedges forever.
+// We use this to turn that silent DEADLOCK into a loud, precise abort. Incremented around
+// every io.run() below; checked at nova_run_root's entry.
+static thread_local int g_run_depth = 0;
 long long nova_worker_count(void) { return (long long)nova_thread_count(); }
 // P4c: pin the NEXT coroutine created on THIS thread to reactor `rid` (one-shot). Nova sets it right
 // before `spawn acceptLoop()` so each per-reactor accept loop lands on its reactor. Consumed by the
@@ -638,11 +646,15 @@ void nova_run(void) {
         pool.emplace_back([i] {
             g_nova_tid = i;
             g_reactor_id = i;
+            ++g_run_depth;
             g_reactors[i]->io.run();
+            --g_run_depth;
         });
     g_nova_tid = 0;
     g_reactor_id = 0;
+    ++g_run_depth;
     g_reactors[0]->io.run();
+    --g_run_depth;
     for (auto &t : pool) t.join();
     for (int i = 0; i < n; ++i) g_reactors[i]->io.restart();
 }
@@ -682,6 +694,21 @@ void nova_hold_all_reactors(void) {
 // lost, and that must fail LOUDLY here rather than hand the caller an unwritten
 // promise. A crash naming the cause beats a plausible wrong number.
 void nova_run_root(long long root) {
+    // Nested block-drive detection. If we're already inside io.run() on this thread (depth>0),
+    // this call was reached from within a running coroutine — a SYNC function block-driving an
+    // async call from inside the event loop. Under a live server that never returns (held
+    // work-guards), the re-entered io.run() would never go idle → the coroutine deadlocks
+    // silently. Fail LOUDLY and precisely instead: this only fires when genuinely nested, so a
+    // sync `main`/`@test` driving async at the top level (depth 0 — the tested, supported seam)
+    // is unaffected. The fix in Nova code is to make the caller `async fn` and `await` the call.
+    if (g_run_depth > 0) {
+        std::fprintf(stderr,
+                     "nova: fatal — an async call was block-driven from inside the event loop "
+                     "(a sync function awaiting async work while running as a coroutine). This "
+                     "would deadlock. Make the calling function `async fn` and `await` the call, "
+                     "or move the work off the request path.\n");
+        std::abort();
+    }
     nova_run();
     if (!root) return;
     for (int i = 0; i < 10000 && !raw_coro_done(root); ++i) {
