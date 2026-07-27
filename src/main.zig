@@ -161,8 +161,13 @@ fn crossLinkViaZig(
         else
             try std.fmt.allocPrint(allocator, "-I{s}/deps/boost/include", .{shared_nova});
         const rt_src = try std.fmt.allocPrint(allocator, "{s}/src/runtime/runtime.cpp", .{shared_nova});
+        // T1 zlib gap fix: the runtime pulls in compress.cpp → `<zlib.h>`. The host `-lz`/`-L/opt/homebrew`
+        // is macOS-only, and `zig c++` for musl-linux/windows ships no zlib. Point at the VENDORED zlib
+        // headers (deps/zlib, synced to ~/.nova/deps) so the cross-compile resolves the header; the zlib
+        // .c sources are compiled + linked in below (so the symbols resolve too — no host zlib).
+        const zlib_inc = try std.fmt.allocPrint(allocator, "-I{s}/deps/zlib", .{shared_nova});
         std.debug.print("[T1] cross-compiling the C++ runtime for {s} (one-time; caches to ~/.nova/lib) ...\n", .{target.zig});
-        const rc_args = [_][]const u8{ "zig", "c++", "-target", target.zig, "-std=c++20", "-O2", "-DNOVA_DROP_ARENA", boost_inc, "-c", rt_src, "-o", rt_obj };
+        const rc_args = [_][]const u8{ "zig", "c++", "-target", target.zig, "-std=c++20", "-O2", "-DNOVA_DROP_ARENA", boost_inc, zlib_inc, "-c", rt_src, "-o", rt_obj };
         var rc_child = try std.process.spawn(io, .{ .argv = &rc_args });
         switch (try rc_child.wait(io)) {
             .exited => |code| if (code != 0) {
@@ -181,6 +186,14 @@ fn crossLinkViaZig(
     if (is_release) try args.append(allocator, "-O3");
     for (objs) |o| try args.append(allocator, o); // T6 split: one or many object files
     try args.append(allocator, rt_obj);
+    // T1 zlib gap fix: compile + link the VENDORED zlib sources for the target (the runtime .o above has
+    // unresolved deflate/inflate from compress.cpp). `zig c++` builds each .c for the target; they include
+    // their own headers via quotes, so no -I is needed. Replaces the host-only `-lz -L/opt/homebrew/lib`.
+    // Only the IN-MEMORY subset — compress.cpp uses deflate/inflate/compress, never the gz* FILE API
+    // (gzopen/gzread), whose read/lseek/close need POSIX feature macros the bare musl cross-compile lacks.
+    const zlib_srcs = [_][]const u8{ "adler32", "compress", "crc32", "deflate", "infback", "inffast", "inflate", "inftrees", "trees", "uncompr", "zutil" };
+    for (zlib_srcs) |name|
+        try args.append(allocator, try std.fmt.allocPrint(allocator, "{s}/deps/zlib/{s}.c", .{ shared_nova, name }));
     // Windows: the runtime + Boost.Asio use winsock2 (WSAStartup/socket/select via ws2_32) and Asio's
     // IOCP backend needs mswsock. The `#pragma comment(lib, ...)` in io.cpp isn't honored by lld-link
     // here, so link the system import libs explicitly.
