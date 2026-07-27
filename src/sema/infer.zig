@@ -977,6 +977,21 @@ pub const Inferer = struct {
                         }
                     }
                 }
+                // `mod.Enum.Variant` — the MODULE-QUALIFIED payload-less enum variant. `fa.object` is a
+                // field_access `mod.Enum`; the qualifier is decorative — the imported enum is resolvable
+                // by its bare last-segment name exactly like the unqualified `Enum.Variant` above. Guard
+                // on the inner object being a MODULE (an ident that is not a local var), so a genuine
+                // `structVar.field.sub` chain is never hijacked when `field` happens to name an enum.
+                if (fa.object.kind == .field_access) {
+                    const inner = fa.object.kind.field_access;
+                    if (inner.object.kind == .ident and self.lookup(inner.object.kind.ident) == null) {
+                        if (self.symtab.findTypeInModule(inner.field, self.current_module)) |sid| {
+                            if (self.symtab.symbolAt(sid).decl == .enum_) {
+                                return self.ok(try self.store.intern(.{ .enum_ = sid }));
+                            }
+                        }
+                    }
+                }
                 // F2-6 stage 0: `console.log` / `assert.x` — an access ON a not-a-value receiver (a
                 // module/builtin ident that is not a local). The access itself is namespace routing,
                 // not a value whose type sema failed to find.

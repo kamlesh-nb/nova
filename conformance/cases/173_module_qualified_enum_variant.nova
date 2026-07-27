@@ -1,0 +1,36 @@
+// Module-qualified access to a payload-less enum VARIANT — `mod.Enum.Variant` — failed with
+// "undefined identifier 'mod'": only the 2-level `Enum.Variant` (object is the enum ident) was
+// handled, while `mod.Enum.Variant` parses as a 3-level field-access chain (object is itself the
+// field-access `mod.Enum`). The unqualified form worked, so this was a papercut with a workaround,
+// but the two forms disagreed. Fix: resolve the enum by the inner field-access's LAST SEGMENT
+// (the qualifier is decorative — imported enums are keyed by bare name) in BOTH sema (infer) and
+// codegen, guarded so a genuine `structVar.field.sub` chain is never hijacked. Uses real stdlib
+// module-qualified enums (web.middleware.MiddlewareAction, web.status.Status).
+
+import assert;
+import web.middleware;
+import web.status;
+import web.response;
+
+@test
+fn test_qualified_variant_value_and_compare(): void {
+    let a = middleware.MiddlewareAction.Next;                       // mod.Enum.Variant as a value
+    assert.isTrue(a == middleware.MiddlewareAction.Next);           // ... and in a comparison (RHS qualified)
+    assert.isTrue((a == middleware.MiddlewareAction.Stop) == false);
+    let b = middleware.MiddlewareAction.Stop;                       // the tag-1 variant too
+    assert.isTrue(b == middleware.MiddlewareAction.Stop);
+}
+
+@test
+fn test_qualified_variant_assigned_to_field(): void {
+    let r = response.Response.ok("");
+    r.status = status.Status.Forbidden;                             // qualified variant into a struct field
+    assert.isTrue(r.status == status.Status.Forbidden);
+    assert.isTrue((r.status == status.Status.Ok) == false);
+}
+
+@test
+fn test_unqualified_still_works(): void {
+    let a = MiddlewareAction.Next;                                  // regression guard: bare form intact
+    assert.isTrue(a == MiddlewareAction.Next);
+}

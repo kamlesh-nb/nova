@@ -3334,8 +3334,17 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             return struct_ptr_val;
         },
         .field_access => |fa| {
-            if (fa.object.kind == .ident) {
-                const obj_name = fa.object.kind.ident;
+            // The enum name for `Enum.Variant`: either the object ident directly, or — for the
+            // MODULE-QUALIFIED form `mod.Enum.Variant` — the LAST SEGMENT of the inner field_access
+            // (`mod.Enum` → "Enum"). Enums are keyed by bare name, so the qualifier is decorative
+            // (sema already resolved the same way). Guarded on the inner object being a non-variable
+            // ident (a module), so a real `structVar.field.sub` chain is not hijacked.
+            const enum_obj_name: ?[]const u8 = switch (fa.object.kind) {
+                .ident => |n| n,
+                .field_access => |inner| if (inner.object.kind == .ident and !self.identNamesVariable(inner.object.kind.ident)) inner.field else null,
+                else => null,
+            };
+            if (enum_obj_name) |obj_name| {
                 if (self.enums.get(obj_name)) |enum_decl| {
                     var is_tagged = false;
                     for (enum_decl.variants) |v| {
