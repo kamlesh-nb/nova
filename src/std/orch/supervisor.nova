@@ -11,6 +11,7 @@ import process;
 import list;
 import string;
 import orch.spec;
+import orch.isolation;
 
 pub struct Supervisor {
     pub spec: spec.Spec,
@@ -30,6 +31,8 @@ pub struct Supervisor {
     fn spawnOne(self: Supervisor): void {
         if (!self.manageProcesses) { return; }
         let p = process.Process.spawn(self.spec.binaryPath, self.spec.args);
+        // Apply cgroups-v2 limits (Linux; best-effort no-op elsewhere) to the freshly-spawned child.
+        let _ = isolation.applyLimits(self.spec, p.pid());
         self.procs.push(p);
     }
 

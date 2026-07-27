@@ -280,6 +280,7 @@ ProcessContext* nova_process_spawn(const char *cmd, const char *args_str);
 int  nova_process_write_stdin(ProcessContext *ctx, const char *data);
 int  nova_process_read_stdout(ProcessContext *ctx, char *buf, int max_len);
 int  nova_process_wait(ProcessContext *ctx);
+long long nova_process_pid(ProcessContext *ctx);
 int  nova_process_try_wait(ProcessContext *ctx);
 int  nova_process_kill(ProcessContext *ctx, int sig);
 void nova_process_free(ProcessContext *ctx);

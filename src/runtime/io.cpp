@@ -948,6 +948,11 @@ int nova_process_wait(ProcessContext *ctx) {
   return ctx->exit_code;
 }
 
+// I2 addition: the child's kernel PID (for cgroup.procs attach + observability). 0 if none.
+long long nova_process_pid(ProcessContext *ctx) {
+  return ctx ? (long long)ctx->pid : 0;
+}
+
 // R1/I2 addition: NON-BLOCKING exit poll (waitpid WNOHANG). Returns the exit code if the child has
 // exited (reaping it so it never becomes a zombie), -2 if it is still running, or -1 on error / no such
 // child. This is what the orchestrator's async reconcile loop needs — kill(pid,0) can't tell a live
@@ -1006,6 +1011,8 @@ int nova_process_read_stdout(ProcessContext *ctx, char *buf, int max_len) {
   (void)ctx; (void)buf; (void)max_len; return -1;
 }
 int nova_process_wait(ProcessContext *ctx) { (void)ctx; return -1; }
+long long nova_process_pid(ProcessContext *ctx) { (void)ctx; return 0; }
+int nova_process_try_wait(ProcessContext *ctx) { (void)ctx; return -1; }
 int nova_process_kill(ProcessContext *ctx, int sig) { (void)ctx; (void)sig; return -1; }
 void nova_process_free(ProcessContext *ctx) { (void)ctx; }
 #endif

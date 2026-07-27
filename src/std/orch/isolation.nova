@@ -1,0 +1,50 @@
+// orch/isolation.nova — cgroups-v2 resource limits for supervised workloads (I2).
+//
+// On Linux, applies a Spec's CPU / memory / PID limits by writing the unified cgroup-v2 files under
+// /sys/fs/cgroup/nova/<name>/ and attaching the child PID, exactly like the Zig PoC's isolation.zig
+// (the same "just write the files" trick — no libcgroup, no FFI). On macOS / anywhere without cgroup-v2
+// the writes simply fail and are ignored (best-effort), so the orchestrator still runs, just unlimited.
+//
+// cgroup-v2 must be mounted at /sys/fs/cgroup and the daemon must have write access (root, or a
+// delegated sub-tree). Detection is by the presence of /sys/fs/cgroup/cgroup.controllers.
+
+import io.file;
+import io.dir;
+import string;
+import orch.spec;
+
+// Is a writable cgroup-v2 hierarchy present? (Linux with cgroup-v2 mounted.)
+pub fn available(): bool {
+    return file.File.exists("/sys/fs/cgroup/cgroup.controllers");
+}
+
+fn cgroupDir(name: string): string {
+    return "/sys/fs/cgroup/nova/" + name;
+}
+
+// Apply the Spec's cgroups-v2 limits to an already-running child `pid`. Best-effort: on any platform
+// without cgroup-v2 (or without permission) this is a no-op. Returns true if the hierarchy was present
+// and the attach was attempted, false if skipped.
+//   cpuMilli  → cpu.max "quota period" (quota = cpuMilli/1000 · 100000us period)
+//   memMax    → memory.max (bytes)
+//   pidsMax   → pids.max (fork-bomb guard)
+pub fn applyLimits(sp: spec.Spec, pid: long): bool {
+    if (!available()) { return false; }
+    let d = cgroupDir(sp.name);
+    let _ = dir.Dir.create(d, 493);              // mkdir 0755; ignore "already exists"
+
+    if (sp.cpuMilli > 0) {
+        let period = 100000;
+        let quota = (sp.cpuMilli * period) / 1000;
+        file.File.writeText(d + "/cpu.max", "" + quota + " " + period + "\n");
+    }
+    if (sp.memMaxBytes > 0) {
+        file.File.writeText(d + "/memory.max", "" + sp.memMaxBytes + "\n");
+    }
+    if (sp.pidsMax > 0) {
+        file.File.writeText(d + "/pids.max", "" + sp.pidsMax + "\n");
+    }
+    // Attach the process LAST (writing cgroup.procs moves it into the constrained group).
+    file.File.writeText(d + "/cgroup.procs", "" + pid + "\n");
+    return true;
+}

@@ -64,6 +64,11 @@ pub struct Process {
         return nova_process_try_wait(self.ctx) == -2;
     }
 
+    // The child's kernel PID (0 if not spawned). Needed to attach it to a cgroup (write to cgroup.procs).
+    pub fn pid(self: Process): long {
+        return nova_process_pid(self.ctx);
+    }
+
     // Signal the child. `sig` is a POSIX signal number (15 = SIGTERM, 9 = SIGKILL, 2 = SIGINT, 1 = SIGHUP).
     // Returns 0 on success, -1 on error. The scale-down / restart primitive the orchestrator drives.
     pub fn kill(self: Process, sig: int): int {

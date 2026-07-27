@@ -7,6 +7,19 @@ import list;
 import orch.spec;
 import orch.nativelet;
 import orch.supervisor;
+import orch.isolation;
+
+// cgroups-v2 isolation is a safe no-op where the hierarchy isn't present (macOS / non-Linux / no perms):
+// available() is false and applyLimits() returns false without touching anything. (On Linux with
+// cgroup-v2 mounted, these drive real cpu.max/memory.max/pids.max writes — proven there, not in this
+// gate, which must pass on the macOS host too.)
+@test
+fn test_isolation_noop_without_cgroups(): void {
+    let sp = spec.parseSpec("{\"name\":\"x\",\"binaryPath\":\"/bin/x\",\"cpuMilli\":500,\"pidsMax\":64}");
+    if (!isolation.available()) {
+        assert.isTrue(!isolation.applyLimits(sp, 12345));
+    }
+}
 
 @test
 fn test_parse_spec(): void {

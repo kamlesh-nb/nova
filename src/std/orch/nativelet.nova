@@ -12,9 +12,13 @@ import orch.spec;
 import orch.supervisor;
 import io.dir;
 import io.file;
+import bytes;
 import list;
 import string;
 import net.asyncio;
+
+// How many consecutive failed HTTP probes drain a workload's patience before it is restarted.
+const PROBE_FAIL_LIMIT = 3;
 
 // One scanned manifest file: its filename-stem key, the parsed spec, and whether the parse succeeded.
 // valid=false means the file exists but couldn't be read/parsed THIS tick (keep, don't delete).
@@ -33,10 +37,12 @@ pub struct Job {
     pub name: string,
     pub sup: supervisor.Supervisor,
     pub desired: spec.Spec,     // the spec this supervisor was started from (for change detection)
+    pub probeFails: int,        // consecutive failed HTTP probes (→ restart at PROBE_FAIL_LIMIT)
     init(name: string, sup: supervisor.Supervisor, desired: spec.Spec) {
         self.name = name;
         self.sup = sup;
         self.desired = desired;
+        self.probeFails = 0;
     }
 }
 
@@ -184,6 +190,49 @@ pub struct Nativelet {
             self.jobs.remove(idx);
         }
     }
+
+    // HTTP-probe every workload that configured one and RESTART any that fails PROBE_FAIL_LIMIT probes in
+    // a row (rise/fall-style hysteresis: a single blip doesn't bounce it). A healthy probe resets the
+    // counter. Non-blocking (async connect + read). Called by the daemon loop after each reconcile.
+    pub async fn probeAndHeal(self: Nativelet): int {
+        let j = 0;
+        while (j < self.jobs.size()) {
+            let job = self.jobs.get(j) ?? Job("", supervisor.Supervisor(spec.Spec("", "")), spec.Spec("", ""));
+            if (job.desired.probePort > 0 && job.sup.running() > 0) {
+                let ok = await httpProbe("127.0.0.1", job.desired.probePort, job.desired.probePath, 1000);
+                if (ok) {
+                    job.probeFails = 0;
+                } else {
+                    job.probeFails = job.probeFails + 1;
+                    if (job.probeFails >= PROBE_FAIL_LIMIT) {
+                        job.sup.stopAll();          // unhealthy → restart the whole workload
+                        job.sup.start();
+                        job.probeFails = 0;
+                    }
+                }
+            }
+            j = j + 1;
+        }
+        return 0;
+    }
+}
+
+// One-shot async HTTP GET liveness probe: connect, send GET, read the status line, accept 2xx/3xx.
+// Any connect/read failure or a >=400 status is unhealthy. Fully non-blocking.
+async fn httpProbe(host: string, port: int, path: string, tmo: int): bool {
+    let s = await asyncio.asyncConnect(host, port);
+    if (s.sock == 0) { return false; }
+    let req = `GET ${path} HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`;
+    let _ = await asyncio.async_write(s.sock, req);
+    let cap = 512;
+    let buf = bytes.alloc(cap);
+    let n = await asyncio.async_read_deadline(s.sock, buf, cap, tmo);
+    asyncio.aclose(s.sock);
+    if (n <= 12) { bytes.free(buf); return false; }   // need at least "HTTP/1.1 xxx"
+    // status code is the 3 bytes after the first space (offset 9 in "HTTP/1.1 200")
+    let c0 = bytes.read_byte(buf, 9);
+    bytes.free(buf);
+    return c0 == 50 || c0 == 51;                       // '2' (2xx) or '3' (3xx)
 }
 
 fn nameIn(names: list.List<string>, target: string): bool {
@@ -200,6 +249,7 @@ fn nameIn(names: list.List<string>, target: string): bool {
 pub async fn run(n: Nativelet, intervalMs: int): int {
     while (true) {
         n.reconcile();
+        let _ = await n.probeAndHeal();
         let _ = await asyncio.sleep(intervalMs);
     }
     return 0;
