@@ -8,6 +8,35 @@ import orch.spec;
 import orch.nativelet;
 import orch.supervisor;
 import orch.isolation;
+import orch.autoscaler;
+
+// PID autoscaler for a workload: reuses the I1 controller to drive spec.replicas from a metric
+// (default: cgroup CPU%). decide() is deterministic; tick() actuates spec.replicas + ensureReplicas.
+@test
+fn test_workload_autoscaler(): void {
+    let sp = spec.parseSpec("{\"name\":\"w\",\"binaryPath\":\"/bin/x\",\"replicas\":1}");
+    let sup = supervisor.Supervisor(sp);
+    sup.manageProcesses = false;                 // no real spawns; just exercise the scaling math
+    let ws = autoscaler.WorkloadScaler(sup, 1, 6, 50.0);   // target 50% CPU, band 1..6
+    // Kp 0.5, direct-acting: metric 90 → err 40 → out 20 → clamp[1,6] = 6
+    assert.equalInt(ws.decide(90.0, 1.0), 6);
+    // metric 52 → err 2 → out 1 → 1
+    let ws2 = autoscaler.WorkloadScaler(sup, 1, 6, 50.0);
+    assert.equalInt(ws2.decide(52.0, 1.0), 1);
+    // metric 62 → err 12 → out 6 → clamp = 6
+    let ws3 = autoscaler.WorkloadScaler(sup, 1, 6, 50.0);
+    assert.equalInt(ws3.decide(62.0, 1.0), 6);
+    // tick drives spec.replicas
+    let ws4 = autoscaler.WorkloadScaler(sup, 1, 6, 50.0);
+    let t = ws4.tick(90.0, 1.0);
+    assert.equalInt(t, 6);
+    assert.equalInt(sup.spec.replicas, 6);
+    // tickCpu returns the current replica count when no cgroup metric is available (non-Linux)
+    if (!isolation.available()) {
+        let held = ws4.tickCpu(1.0);
+        assert.equalInt(held, sup.spec.replicas);   // held, not changed
+    }
+}
 
 // cgroups-v2 isolation is a safe no-op where the hierarchy isn't present (macOS / non-Linux / no perms):
 // available() is false and applyLimits() returns false without touching anything. (On Linux with

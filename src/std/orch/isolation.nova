@@ -48,3 +48,20 @@ pub fn applyLimits(sp: spec.Spec, pid: long): bool {
     file.File.writeText(d + "/cgroup.procs", "" + pid + "\n");
     return true;
 }
+
+// Cumulative CPU time (microseconds) a workload's cgroup has consumed — the "usage_usec" line of
+// cpu.stat. The autoscaler samples this each tick and divides the delta by the interval to get CPU
+// utilisation. Returns -1 if unavailable (non-Linux / no cgroup / not yet created).
+pub fn cpuUsageUsec(name: string): long {
+    let path = cgroupDir(name) + "/cpu.stat";
+    if (!file.File.exists(path)) { return -1; }
+    let text = file.File.readText(path);
+    // find "usage_usec <n>" (first line of cpu.stat)
+    let key = "usage_usec ";
+    let at = string.indexOf(text, key);
+    if (at < 0) { return -1; }
+    let rest = string.slice(text, at + string.len(key), string.len(text));
+    let nl = string.indexOf(rest, "\n");
+    let numStr = if (nl < 0) rest else string.slice(rest, 0, nl);
+    return string.parseI64(numStr);
+}
