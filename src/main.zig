@@ -759,6 +759,31 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
                     }
                     // nested @serializable structs skipped (flat write path)
                 },
+                .optional => |inner| {
+                    // An OPTIONAL scalar field was skipped by the `else` below, so a PRESENT value
+                    // was silently dropped from the write (INSERT/BSON) — the write-side sibling of
+                    // the bind/toJson optional fix. Emit `put` only when present (bind to a block-local
+                    // so `!= undefined` narrows+unboxes the value-optional); absent → column omitted
+                    // (ValueSink has no putNull; the DB uses its default/NULL).
+                    if (inner.* == .ident) {
+                        const itn = inner.ident;
+                        var sink_fn: ?[]const u8 = null;
+                        if (std.mem.eql(u8, itn, "string")) {
+                            sink_fn = "putString";
+                        } else if (std.mem.eql(u8, itn, "bool")) {
+                            sink_fn = "putBool";
+                        } else if (serdeIsInt(itn)) {
+                            sink_fn = "putInt";
+                        } else if (std.mem.eql(u8, itn, "decimal")) {
+                            sink_fn = "putDecimal";
+                        } else if (serdeIsFloat(itn)) {
+                            sink_fn = "putFloat";
+                        }
+                        if (sink_fn) |sf| {
+                            try serdeAppendf(&src, allocator, "    {{ let __v = obj.{s}; if (__v != undefined) {{ sink.{s}(\"{s}\", __v); }} }}\n", .{ fname, sf, fname });
+                        }
+                    }
+                },
                 else => {}, // List<T> skipped (flat write path)
             }
         }
