@@ -13,8 +13,33 @@ import list;
 import bytes;
 
 // ---------------------------------------------------------------------------
-// Backend pool + round-robin selection
+// Backend pool + load-balancing selection (round-robin / weighted / least-conn / consistent-hash)
 // ---------------------------------------------------------------------------
+
+// I1 load-balancing strategies. All lock-free under share-nothing: RoundRobin/Weighted advance a
+// PER-REACTOR cursor, LeastConn reads PER-REACTOR in-flight counts, ConsistentHash is pure.
+pub enum LbStrategy {
+    RoundRobin,
+    Weighted,
+    LeastConn,
+    ConsistentHash,
+}
+
+// Non-negative 31-bit hash of a string (string.hash may be negative; mask the sign bit).
+fn hashKey(s: string): int {
+    return string.hash(s) & 2147483647;
+}
+
+// Extract the request PATH from a raw HTTP message ("METHOD PATH HTTP/1.1..."). Used as the
+// ConsistentHash key so the same URL routes to the same backend (cache affinity). "/" on any oddity.
+fn reqKey(raw: string): string {
+    let sp1 = string.indexOf(raw, " ");
+    if (sp1 < 0) { return "/"; }
+    let rest = string.slice(raw, sp1 + 1, string.len(raw));
+    let sp2 = string.indexOf(rest, " ");
+    if (sp2 < 0) { return "/"; }
+    return string.slice(rest, 0, sp2);
+}
 
 pub struct Backend {
     pub host: string,
@@ -28,10 +53,13 @@ pub struct Backend {
     // reactor — so a backend socket is created, used, pooled, and reused ALL on the same single-threaded
     // reactor. That is what makes cross-request reuse SAFE at any reactor count (see below).
     pub idle: List<List<long>>,
+    pub weight: int,           // Weighted LB (default 1)
+    pub active: List<int>,     // PER-REACTOR in-flight request count (LeastConn), lock-free like `idle`
     pub reuse: bool,
     init(host: string, port: int) {
         self.host = host;
         self.port = port;
+        self.weight = 1;
         // P5: reuse is now safe UNCONDITIONALLY. It was gated to a single worker because the old
         // work-stealing model let a coroutine migrate threads, so a pooled socket could be touched from
         // two io_context threads (per-coroutine strands papered over the async ops but reuse across
@@ -39,9 +67,25 @@ pub struct Backend {
         // is per-reactor, so the pooled socket is only ever touched by its own reactor's one thread.
         self.reuse = true;
         self.idle = List<List<long>>();
+        self.active = List<int>();
         let nt = nova_worker_count() as int;
         let i = 0;
-        while (i < nt) { self.idle.push(List<long>()); i = i + 1; }
+        while (i < nt) { self.idle.push(List<long>()); self.active.push(0); i = i + 1; }
+    }
+    // Per-reactor in-flight counters for LeastConn — touched only by the owning reactor (one coroutine
+    // per reactor at a time, no await between read+write), so lock-free like the idle pool.
+    pub fn acquireConn(self: Backend): void {
+        let t = nova_thread_id() as int;
+        self.active.set(t, (self.active.get(t) ?? 0) + 1);
+    }
+    pub fn releaseConn(self: Backend): void {
+        let t = nova_thread_id() as int;
+        let v = (self.active.get(t) ?? 0) - 1;
+        self.active.set(t, if (v < 0) 0 else v);
+    }
+    pub fn activeConns(self: Backend): int {
+        let t = nova_thread_id() as int;
+        return self.active.get(t) ?? 0;
     }
 }
 
@@ -60,31 +104,106 @@ pub struct HttpMsg {
 
 pub struct Pool {
     pub backends: List<Backend>,
-    pub cursors: List<int>,   // PER-THREAD round-robin cursor — each worker's is touched only by itself
+    pub cursors: List<int>,   // PER-REACTOR round-robin cursor — each reactor's is touched only by itself
+    pub strategy: LbStrategy,
+    pub wexpanded: List<int>, // Weighted: backend indices repeated by weight (rebuilt on add)
+    pub ringHash: List<int>,  // ConsistentHash ring: parallel (hash, backendIdx), UNSORTED (scanned)
+    pub ringIdx: List<int>,
     init() {
         self.backends = List<Backend>();
         self.cursors = List<int>();
+        self.strategy = LbStrategy.RoundRobin;
+        self.wexpanded = List<int>();
+        self.ringHash = List<int>();
+        self.ringIdx = List<int>();
         let nt = nova_worker_count() as int;
         let i = 0;
         while (i < nt) { self.cursors.push(0); i = i + 1; }
     }
 
-    pub fn add(self: Pool, host: string, port: int): void {
-        self.backends.push(Backend(host, port));
+    pub fn setStrategy(self: Pool, s: LbStrategy): void { self.strategy = s; }
+
+    pub fn add(self: Pool, host: string, port: int): void { self.addWeighted(host, port, 1); }
+
+    // Add a backend with a weight (>=1). Rebuilds the Weighted expansion (idx repeated `weight` times) and
+    // adds 40 ConsistentHash virtual nodes for even ring spread.
+    pub fn addWeighted(self: Pool, host: string, port: int, weight: int): void {
+        let b = Backend(host, port);
+        b.weight = if (weight > 0) weight else 1;
+        let idx = self.backends.size();
+        self.backends.push(b);
+        let w = 0;
+        while (w < b.weight) { self.wexpanded.push(idx); w = w + 1; }
+        let v = 0;
+        while (v < 40) {
+            self.ringHash.push(hashKey(host + ":" + port + "#" + v));
+            self.ringIdx.push(idx);
+            v = v + 1;
+        }
     }
+
     pub fn size(self: Pool): int { return self.backends.size(); }
 
-    // Round-robin, lock-free: each worker advances its OWN cursor. Returns a Backend with port 0 when the
-    // pool is empty (caller answers 502). Per-thread cursors give an even split without a shared counter.
-    pub fn next(self: Pool): Backend {
+    // Select a backend by the active strategy. `key` is used ONLY by ConsistentHash (a stable per-request
+    // string — the request path); the others ignore it. Returns a Backend with port 0 when empty (caller
+    // answers 502). Lock-free: RR/Weighted advance a PER-REACTOR cursor; LeastConn reads PER-REACTOR active
+    // counts; ConsistentHash is pure.
+    pub fn select(self: Pool, key: string): Backend {
         let n = self.backends.size();
         if (n == 0) { return Backend("", 0); }
         let t = nova_thread_id() as int;
-        let c = self.cursors.get(t) ?? 0;
-        let idx = c % n;
-        self.cursors.set(t, c + 1);
-        return self.backends.get(idx) ?? Backend("", 0);
+
+        switch (self.strategy) {
+            case LbStrategy.RoundRobin: {
+                // each reactor advances its OWN cursor — even split, no shared counter.
+                let c = self.cursors.get(t) ?? 0;
+                self.cursors.set(t, c + 1);
+                return self.backends.get(c % n) ?? Backend("", 0);
+            }
+            case LbStrategy.Weighted: {
+                let m = self.wexpanded.size();
+                let c = self.cursors.get(t) ?? 0;
+                self.cursors.set(t, c + 1);
+                let idx = if (m == 0) (c % n) else (self.wexpanded.get(c % m) ?? 0);
+                return self.backends.get(idx) ?? Backend("", 0);
+            }
+            case LbStrategy.LeastConn: {
+                // Fewest in-flight on THIS reactor; ties → lowest index. Per-reactor least-conn (each
+                // reactor balances its own subset) is the correct share-nothing semantics.
+                let best = 0;
+                let bestA = (self.backends.get(0) ?? Backend("", 0)).activeConns();
+                let i = 1;
+                while (i < n) {
+                    let a = (self.backends.get(i) ?? Backend("", 0)).activeConns();
+                    if (a < bestA) { bestA = a; best = i; }
+                    i = i + 1;
+                }
+                return self.backends.get(best) ?? Backend("", 0);
+            }
+            case LbStrategy.ConsistentHash: {
+                // hash(key) → first ring node with hash >= h (wrapping to the global-min node). Stable
+                // under add/remove (only ~1/N keys remap). Ring is small, so a linear scan is fine.
+                let h = hashKey(key);
+                let ring = self.ringHash.size();
+                let bestGE = -1; let bestGEH = 0;
+                let gmin = -1; let gminH = 0;
+                let i = 0;
+                while (i < ring) {
+                    let rh = self.ringHash.get(i) ?? 0;
+                    if (gmin == -1 || rh < gminH) { gmin = i; gminH = rh; }
+                    if (rh >= h && (bestGE == -1 || rh < bestGEH)) { bestGE = i; bestGEH = rh; }
+                    i = i + 1;
+                }
+                let pick = if (bestGE != -1) bestGE else gmin;
+                let idx = if (pick != -1) (self.ringIdx.get(pick) ?? 0) else 0;
+                return self.backends.get(idx) ?? Backend("", 0);
+            }
+        }
+        return self.backends.get(0) ?? Backend("", 0);   // unreachable (switch is exhaustive)
     }
+
+    // Back-compat: round-robin under the default strategy (proxies that never set a strategy).
+    pub fn next(self: Pool): Backend { return self.select(""); }
 }
 
 // ---------------------------------------------------------------------------
@@ -343,14 +462,16 @@ async fn handleClient(pool: Pool, clientSock: long, tmo: int): int {
         let req = await readMessage(clientSock, false, tmo);
         if (string.eql(req.bytes, "")) { alive = false; break; }  // client closed / error
 
-        let b = pool.next();
+        let b = pool.select(reqKey(req.bytes));   // key used only by ConsistentHash; others ignore it
         if (b.port == 0) {
             let _ = await asyncio.async_write(clientSock, errorResponse(502, "Bad Gateway", "no backends"));
             alive = false;
             break;
         }
 
+        b.acquireConn();                          // LeastConn in-flight accounting (per-reactor, lock-free)
         let resp = await forward(b, req.bytes, req.wantClose, tmo);
+        b.releaseConn();
         if (string.eql(resp, "")) {
             let _ = await asyncio.async_write(clientSock, errorResponse(502, "Bad Gateway", "upstream error"));
             alive = false;

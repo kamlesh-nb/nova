@@ -1,0 +1,74 @@
+// 178 — I1 load-balancing strategies on the backend Pool: Weighted, LeastConn, ConsistentHash (the
+// offline-testable selection surface; RoundRobin is covered by 167). Each strategy's selection is pure
+// given per-reactor state, so we exercise it single-reactor (nova test runs on reactor 0) without a
+// live socket.
+import assert;
+import net.proxy;
+
+// Weighted: a backend added with weight W is picked W× as often per cursor cycle. With weights (3,1)
+// the expansion is [A,A,A,B] → 4-cycle picks A,A,A,B.
+@test
+fn test_weighted_expansion(): void {
+    let p = proxy.Pool();
+    p.setStrategy(proxy.LbStrategy.Weighted);
+    p.addWeighted("10.0.0.1", 5001, 3);
+    p.addWeighted("10.0.0.2", 5002, 1);
+    assert.equalInt(p.select("").port, 5001);
+    assert.equalInt(p.select("").port, 5001);
+    assert.equalInt(p.select("").port, 5001);
+    assert.equalInt(p.select("").port, 5002);
+    assert.equalInt(p.select("").port, 5001);   // wraps
+}
+
+// LeastConn: picks the backend with the fewest in-flight requests on THIS reactor; ties → lowest index.
+@test
+fn test_least_conn_picks_idlest(): void {
+    let p = proxy.Pool();
+    p.setStrategy(proxy.LbStrategy.LeastConn);
+    p.add("10.0.0.1", 5001);
+    p.add("10.0.0.2", 5002);
+    // both idle → tie → index 0
+    let a = p.select("");
+    assert.equalInt(a.port, 5001);
+    // load up 5001 → next pick should swing to 5002
+    a.acquireConn();
+    a.acquireConn();
+    assert.equalInt(p.select("").port, 5002);
+    // load 5002 heavier → back to 5001
+    let b = p.backends.get(1) ?? proxy.Backend("", 0);
+    b.acquireConn();
+    b.acquireConn();
+    b.acquireConn();
+    assert.equalInt(p.select("").port, 5001);
+    // drain 5001 accounting so we don't leak state assumptions
+    a.releaseConn();
+    a.releaseConn();
+}
+
+// ConsistentHash: the same key always maps to the same backend (stability); different keys spread.
+@test
+fn test_consistent_hash_stable(): void {
+    let p = proxy.Pool();
+    p.setStrategy(proxy.LbStrategy.ConsistentHash);
+    p.add("10.0.0.1", 5001);
+    p.add("10.0.0.2", 5002);
+    p.add("10.0.0.3", 5003);
+    let first = p.select("/users/42").port;
+    // same key → same backend, every time
+    assert.equalInt(p.select("/users/42").port, first);
+    assert.equalInt(p.select("/users/42").port, first);
+    // a picked port must be one of the real backends (never the 0 sentinel)
+    assert.equalInt(first != 0, true);
+}
+
+// Empty pool still yields the port-0 sentinel under any strategy (caller answers 502).
+@test
+fn test_empty_pool_sentinel_all_strategies(): void {
+    let p = proxy.Pool();
+    p.setStrategy(proxy.LbStrategy.ConsistentHash);
+    assert.equalInt(p.select("/x").port, 0);
+    p.setStrategy(proxy.LbStrategy.LeastConn);
+    assert.equalInt(p.select("").port, 0);
+    p.setStrategy(proxy.LbStrategy.Weighted);
+    assert.equalInt(p.select("").port, 0);
+}
