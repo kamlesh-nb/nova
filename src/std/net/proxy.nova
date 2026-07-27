@@ -19,19 +19,25 @@ import bytes;
 pub struct Backend {
     pub host: string,
     pub port: int,
-    // HAProxy-style keep-alive reuse, LOCK-FREE via PER-THREAD idle pools (`idle_conn_srv[tid]`): after a
-    // response completes, the backend socket is returned to the CURRENT worker's list instead of closed,
-    // and the next request on that worker reuses it — no TCP handshake, no DNS resolve, no ephemeral-port
-    // churn. `idle.get(tid)` is touched only by worker `tid` (one coroutine per thread at a time, and the
-    // pop/push has no `await`), so NO lock is needed — a shared mutex/spinlock convoyed the io_context
-    // threads and collapsed throughput. A connection acquired on one worker and released on another simply
-    // moves between per-thread lists (implicit rebalancing).
+    // HAProxy-style keep-alive reuse, LOCK-FREE via PER-REACTOR idle pools (`idle_conn_srv[tid]`): after a
+    // response completes, the backend socket is returned to the CURRENT reactor's list instead of closed,
+    // and the next request on that reactor reuses it — no TCP handshake, no DNS resolve, no ephemeral-port
+    // churn. `idle.get(tid)` is touched only by reactor `tid` (one coroutine per reactor at a time, and the
+    // pop/push has no `await`), so NO lock is needed. Under SHARE-NOTHING (Path A) a coroutine and the
+    // socket it owns live entirely on ONE reactor and never migrate, and this pool is keyed by that
+    // reactor — so a backend socket is created, used, pooled, and reused ALL on the same single-threaded
+    // reactor. That is what makes cross-request reuse SAFE at any reactor count (see below).
     pub idle: List<List<long>>,
-    pub reuse: bool,   // pooling is safe only with a single worker (per-coroutine socket strands)
+    pub reuse: bool,
     init(host: string, port: int) {
         self.host = host;
         self.port = port;
-        self.reuse = nova_worker_count() == 1;
+        // P5: reuse is now safe UNCONDITIONALLY. It was gated to a single worker because the old
+        // work-stealing model let a coroutine migrate threads, so a pooled socket could be touched from
+        // two io_context threads (per-coroutine strands papered over the async ops but reuse across
+        // coroutines raced). Share-nothing removes migration: each reactor is single-threaded and the pool
+        // is per-reactor, so the pooled socket is only ever touched by its own reactor's one thread.
+        self.reuse = true;
         self.idle = List<List<long>>();
         let nt = nova_worker_count() as int;
         let i = 0;
@@ -357,18 +363,34 @@ async fn handleClient(pool: Pool, clientSock: long, tmo: int): int {
     return 0;
 }
 
-async fn runProxy(pool: Pool, port: int, tmo: int): int {
+// One reactor's front-end accept loop: bind a SO_REUSEPORT acceptor on THIS reactor, then accept +
+// spawn a handler per client. Handlers stay on the accepting reactor, so their backend connections are
+// acquired/pooled/reused on the same reactor's per-reactor idle list (safe, lock-free).
+async fn proxyAcceptLoop(pool: Pool, port: int, tmo: int): int {
     let srv = asyncio.serverListen(port);
     if (srv == 0) {
         console.log("proxy: failed to bind front port (in use?)");
         return -1;
     }
-    console.log("Nova reverse proxy listening");
     while (true) {
         let client = await asyncio.aaccept(srv);
         spawn handleClient(pool, client, tmo);
     }
     return 0;
+}
+
+// P5 share-nothing fan-out: one accept loop per reactor (SO_REUSEPORT; the kernel load-balances clients
+// across reactors on Linux). Mirrors App.run — reactors 1..N-1 spawned + pinned, reactor 0 inline.
+async fn runProxy(pool: Pool, port: int, tmo: int): int {
+    let n = asyncio.reactorCount();
+    let i = 1;
+    while (i < n) {
+        asyncio.pinNextCoro(i);
+        spawn proxyAcceptLoop(pool, port, tmo);
+        i = i + 1;
+    }
+    console.log("Nova reverse proxy listening (share-nothing)");
+    return await proxyAcceptLoop(pool, port, tmo);
 }
 
 pub struct Proxy {
@@ -380,6 +402,10 @@ pub struct Proxy {
     // Per-upstream I/O deadline (ms); a hung backend then fails the request instead of parking forever.
     pub fn setTimeout(self: Proxy, ms: int): void { self.timeoutMs = if (ms > 0) ms else 0; }
 
-    // Bind the front port and serve forever (sync → async drives the runtime, like App.run).
-    pub fn run(self: Proxy): void { let _ = runProxy(self.pool, self.port, self.timeoutMs); }
+    // Bind the front port and serve forever. holdReactors keeps all reactors alive BEFORE the block-drive
+    // so the per-reactor accept fan-out lands on live reactors (share-nothing, like App.run).
+    pub fn run(self: Proxy): void {
+        asyncio.holdReactors();
+        let _ = runProxy(self.pool, self.port, self.timeoutMs);
+    }
 }

@@ -110,7 +110,7 @@ reactor 0. Native 177/177, ASAN 324/324.
   This is the "verification
   reality" caveat — the multi-core proof is Linux-only, unlike the ASAN/gate proofs.
 
-### P5 — Lift the pooling reuse gate
+### P5 — Lift the pooling reuse gate ✅
 - `src/std/net/proxy.nova`: `Backend.reuse = true` unconditionally (per-reactor pools are single-threaded);
   remove the `nova_worker_count() == 1` guard. Add a gate: multi-reactor keep-alive reuse across requests
   on the same reactor (round-robin A,B,A with reuse, N>1). This is the payoff — multi-core pooled proxy.
