@@ -72,7 +72,7 @@ reactors are single-threaded (P3) would race. So P1 only adds the *affinity*, an
   note; do NOT destruct maps that pending I/O still touches). This is the highest-ASAN-risk phase → land it
   alone.
 
-### P3 — Multi-reactor drive: N = cores − 1
+### P3 — Multi-reactor drive: N = cores − 1 ✅
 - `nova_run()` starts N reactors, each `io.run()` on its pinned thread (`g_nova_tid = reactor id`); the
   main thread drives reactor 0 (or joins). `nova_worker_count()` = N.
 - Block-drive (`nova_run` for the sync→async boundary) drives all N until drained.

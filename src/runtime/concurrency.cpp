@@ -525,8 +525,9 @@ void nova_sched_schedule_detached(long long handle) {
     nova_sched_schedule(handle);
 }
 
-// M3-D-3: worker-thread count — NOVA_THREADS env override, else hardware
-// concurrency (capped). 1 = single-threaded.
+// P3: the REACTOR count (share-nothing = one pinned thread per reactor, so this is also the worker
+// count). NOVA_THREADS overrides; else **cores − 1** (leave a core for the OS / block-drive caller),
+// capped at 16, min 1. NOVA_THREADS=1 ⇒ one reactor ⇒ exactly the pre-share-nothing behavior.
 namespace {
 unsigned nova_thread_count() {
     if (const char *e = std::getenv("NOVA_THREADS")) {
@@ -534,9 +535,16 @@ unsigned nova_thread_count() {
         if (n > 0) return static_cast<unsigned>(n);
     }
     unsigned n = std::thread::hardware_concurrency();
-    if (n == 0) n = 1;
+    if (n <= 1) return 1;
+    n -= 1; // cores - 1
     if (n > 16) n = 16;
     return n;
+}
+// Grow the reactor pool to `n` (idempotent; called single-threaded from nova_run BEFORE any reactor
+// thread starts, so no lock is needed). Reactor 0 already exists from static init.
+void ensure_reactors(int n) {
+    while (static_cast<int>(g_reactors.size()) < n)
+        g_reactors.push_back(new Reactor(static_cast<int>(g_reactors.size())));
 }
 } // namespace
 
@@ -559,15 +567,27 @@ long long nova_thread_id(void) { return g_nova_tid; }
 long long nova_worker_count(void) { return (long long)nova_thread_count(); }
 
 void nova_run(void) {
-    const unsigned n = nova_thread_count();
+    // P3 (share-nothing): N = cores-1 reactors, each an INDEPENDENT io_context driven by ONE pinned
+    // thread — thread i sets g_reactor_id = g_nova_tid = i and runs reactor i. A coroutine (and the
+    // socket it owns) lives entirely on its reactor; strands are now free no-ops on a one-thread loop.
+    // (Until P4's per-reactor SO_REUSEPORT accept distributes connections, every coroutine traces back
+    // to reactor 0, so reactors 1..N-1 are idle infrastructure here — gate-clean but single-core; P4
+    // lights them up.) NOVA_THREADS=1 ⇒ one reactor ⇒ old behavior exactly.
+    const int n = static_cast<int>(nova_thread_count());
+    ensure_reactors(n);
     std::vector<std::thread> pool;
-    if (n > 1) pool.reserve(n - 1);
-    for (unsigned i = 1; i < n; ++i)
-        pool.emplace_back([i] { g_nova_tid = (int)i; g_io.run(); });
+    if (n > 1) pool.reserve(static_cast<size_t>(n - 1));
+    for (int i = 1; i < n; ++i)
+        pool.emplace_back([i] {
+            g_nova_tid = i;
+            g_reactor_id = i;
+            g_reactors[i]->io.run();
+        });
     g_nova_tid = 0;
-    g_io.run();
+    g_reactor_id = 0;
+    g_reactors[0]->io.run();
     for (auto &t : pool) t.join();
-    g_io.restart();
+    for (int i = 0; i < n; ++i) g_reactors[i]->io.restart();
 }
 
 // Drive the loop until `root` has ACTUALLY COMPLETED, not merely until the
