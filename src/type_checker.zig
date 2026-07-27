@@ -853,6 +853,23 @@ pub const TypeChecker = struct {
         }
     }
 
+    /// A method that IMPLEMENTS a trait method is part of that trait's PUBLIC contract, so it is
+    /// callable wherever the trait is — even if the `impl` block did not repeat `pub` (the trait
+    /// method's visibility governs, and trait methods are the public API). Without this, calling
+    /// `h.handle(req)` on a `struct H impl RequestHandler { fn handle(...) ... }` was rejected as
+    /// "private" whenever `h`'s type resolved to the struct — which happens for CALL-form
+    /// construction (`H()`) bound to a `let`, while BRACE-form (`H{}`) skipped the check and hid
+    /// the inconsistency (see conformance/cases/56, which uses the brace form).
+    fn methodIsTraitContract(self: *TypeChecker, s: ast.StructDecl, method_name: []const u8) bool {
+        for (s.impls) |impl| {
+            const td = self.traits.get(impl.name) orelse continue;
+            for (td.methods) |tm| {
+                if (std.mem.eql(u8, tm.name, method_name)) return true;
+            }
+        }
+        return false;
+    }
+
     fn resolveExprType(self: *TypeChecker, expr: ast.Expression) ?ast.TypeRef {
         switch (expr.kind) {
             .ident => |name| {
@@ -989,7 +1006,7 @@ pub const TypeChecker = struct {
                                     if (std.mem.eql(u8, m.decl.name, fa.field)) {
                                         if (!m.is_public) {
                                             const in_same_struct = if (self.current_struct) |curr| std.mem.eql(u8, curr, struct_name) else false;
-                                            if (!in_same_struct) {
+                                            if (!in_same_struct and !self.methodIsTraitContract(s, fa.field)) {
                                                 self.addError(fa.span, "Method '{s}' of struct '{s}' is private", .{ fa.field, struct_name });
                                             }
                                         }

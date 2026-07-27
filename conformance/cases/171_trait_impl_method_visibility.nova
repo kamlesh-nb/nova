@@ -1,0 +1,44 @@
+// A method that IMPLEMENTS a trait method is part of the trait's PUBLIC contract and must be
+// callable wherever the trait is — even when the `impl` block does not repeat `pub` (the trait
+// method's visibility governs). The type checker rejected `h.handle(req)` as "Method 'handle' of
+// struct 'H' is private" whenever `h`'s type resolved to the concrete struct — which happens for
+// CALL-form construction (`H()`) whose result is bound to a `let`. BRACE-form construction (`H{}`)
+// skipped the visibility check entirely (a resolution hole), so gate 56 passed and masked the bug.
+// Fix: methodIsTraitContract — a non-pub method whose name matches a method of any trait the struct
+// implements is treated as public. A GENUINELY private helper (not a trait method) still errors.
+
+import assert;
+
+trait Handler<TReq, TResp> {
+    fn handle(self, req: TReq): TResp;
+}
+
+struct Q { pub id: int, init() { self.id = 0; } }
+struct R { pub id: int, init() { self.id = 0; } }
+
+// `handle` is NOT marked `pub`, but it implements the trait method → callable externally.
+struct GetHandler impl Handler<Q, R> {
+    fn handle(self, req: Q): R { let r = R(); r.id = req.id + 1; return r; }
+}
+
+@test
+fn test_call_form_construction_then_let_bind(): void {
+    let h = GetHandler();            // CALL-form construction (the form that used to fail)
+    let q = Q(); q.id = 7;
+    let resp = h.handle(q);          // result bound to a `let` (the trigger)
+    assert.equalInt(resp.id, 8);
+}
+
+@test
+fn test_brace_form_still_works(): void {
+    let h = GetHandler{};            // BRACE-form (always worked)
+    let q = Q(); q.id = 10;
+    assert.equalInt(h.handle(q).id, 11);
+}
+
+@test
+fn test_inline_call_works(): void {
+    let h = GetHandler();
+    let q = Q(); q.id = 3;
+    assert.equalInt(h.handle(q).id, 4);   // inline call, no let-bind
+}
