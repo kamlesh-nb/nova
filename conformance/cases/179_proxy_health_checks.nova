@@ -1,0 +1,142 @@
+// 179 — I1 health-checked backend pool: the OFFLINE-testable surface (rise/fall hysteresis, drained
+// backends excluded from every LB strategy, all-drained → 502 sentinel, HTTP status classification).
+// The live probe sweep (TCP-connect / HTTP-GET against real backends) is proven end-to-end separately;
+// here we lock in the pure decision logic the sweep drives.
+import assert;
+import net.proxy;
+
+// Hysteresis: a backend flips DOWN only after `fall` consecutive failures and back UP after `rise`
+// consecutive successes — a single blip neither drains nor restores it.
+@test
+fn test_rise_fall_hysteresis(): void {
+    let b = proxy.Backend("10.0.0.1", 5001);
+    assert.equalInt(b.isUp(), true);         // starts in rotation
+
+    // fall = 3: two failures don't drain it, the third does
+    b.observe(false, 2, 3);
+    assert.equalInt(b.isUp(), true);
+    b.observe(false, 2, 3);
+    assert.equalInt(b.isUp(), true);
+    b.observe(false, 2, 3);
+    assert.equalInt(b.isUp(), false);        // drained after 3 consecutive fails
+
+    // a single success does NOT restore it (rise = 2)
+    b.observe(true, 2, 3);
+    assert.equalInt(b.isUp(), false);
+    b.observe(true, 2, 3);
+    assert.equalInt(b.isUp(), true);         // restored after 2 consecutive oks
+
+    // a blip mid-streak resets the fail counter
+    b.observe(false, 2, 3);
+    b.observe(false, 2, 3);
+    b.observe(true, 2, 3);                    // resets failStreak
+    b.observe(false, 2, 3);
+    b.observe(false, 2, 3);
+    assert.equalInt(b.isUp(), true);         // only 2 fails since the reset → still up
+}
+
+// A drained backend is skipped by RoundRobin: over a full sweep the drained port NEVER appears and
+// both healthy ports do. (The absolute sequence depends on the reactor's cursor start, so we assert
+// the invariant, not a fixed order.)
+@test
+fn test_round_robin_skips_drained(): void {
+    let p = proxy.Pool();
+    p.add("10.0.0.1", 5001);
+    p.add("10.0.0.2", 5002);
+    p.add("10.0.0.3", 5003);
+    // drain the middle backend
+    let mid = p.backends.get(1) ?? proxy.Backend("", 0);
+    mid.up = 0;
+    let saw5001 = false;
+    let saw5003 = false;
+    let saw5002 = false;
+    let i = 0;
+    while (i < 12) {
+        let port = p.select("").port;
+        if (port == 5001) { saw5001 = true; }
+        if (port == 5002) { saw5002 = true; }   // drained → must never appear
+        if (port == 5003) { saw5003 = true; }
+        i = i + 1;
+    }
+    assert.equalInt(saw5002, false);             // drained backend never selected
+    assert.equalInt(saw5001, true);
+    assert.equalInt(saw5003, true);
+}
+
+// LeastConn only considers healthy backends: drain the idlest and it picks the next-idlest.
+@test
+fn test_least_conn_skips_drained(): void {
+    let p = proxy.Pool();
+    p.setStrategy(proxy.LbStrategy.LeastConn);
+    p.add("10.0.0.1", 5001);
+    p.add("10.0.0.2", 5002);
+    // both idle → tie → index 0 normally
+    assert.equalInt(p.select("").port, 5001);
+    // drain 5001 → must pick 5002 even though it has equal (zero) load
+    let a = p.backends.get(0) ?? proxy.Backend("", 0);
+    a.up = 0;
+    assert.equalInt(p.select("").port, 5002);
+}
+
+// ConsistentHash skips a drained backend deterministically (same key → same fallback).
+@test
+fn test_consistent_hash_skips_drained(): void {
+    let p = proxy.Pool();
+    p.setStrategy(proxy.LbStrategy.ConsistentHash);
+    p.add("10.0.0.1", 5001);
+    p.add("10.0.0.2", 5002);
+    p.add("10.0.0.3", 5003);
+    let chosen = p.select("/cart/7").port;
+    assert.equalInt(chosen != 0, true);
+    // drain whichever backend that key maps to → the SAME key must now route stably to a different, up one
+    let i = 0;
+    while (i < 3) {
+        let bk = p.backends.get(i) ?? proxy.Backend("", 0);
+        if (bk.port == chosen) { bk.up = 0; }
+        i = i + 1;
+    }
+    let after = p.select("/cart/7").port;
+    assert.equalInt(after != 0, true);
+    assert.equalInt(after != chosen, true);       // rehomed off the drained backend
+    assert.equalInt(p.select("/cart/7").port, after);  // and stable thereafter
+}
+
+// Every backend drained → port-0 sentinel under every strategy (caller answers 503/502).
+@test
+fn test_all_drained_sentinel(): void {
+    let p = proxy.Pool();
+    p.add("10.0.0.1", 5001);
+    p.add("10.0.0.2", 5002);
+    let i = 0;
+    while (i < 2) {
+        let bk = p.backends.get(i) ?? proxy.Backend("", 0);
+        bk.up = 0;
+        i = i + 1;
+    }
+    p.setStrategy(proxy.LbStrategy.RoundRobin);
+    assert.equalInt(p.select("").port, 0);
+    p.setStrategy(proxy.LbStrategy.Weighted);
+    assert.equalInt(p.select("").port, 0);
+    p.setStrategy(proxy.LbStrategy.LeastConn);
+    assert.equalInt(p.select("").port, 0);
+    p.setStrategy(proxy.LbStrategy.ConsistentHash);
+    assert.equalInt(p.select("/x").port, 0);
+}
+
+// enableHealthChecks flips the pool into checked mode and clamps its knobs.
+@test
+fn test_enable_health_checks_config(): void {
+    let p = proxy.Pool();
+    assert.equalInt(p.hcEnabled, false);          // off by default
+    p.enableHealthChecks(3000, 500, 2, 4);
+    assert.equalInt(p.hcEnabled, true);
+    assert.equalInt(p.hcIntervalMs, 3000);
+    assert.equalInt(p.hcTimeoutMs, 500);
+    assert.equalInt(p.hcRise, 2);
+    assert.equalInt(p.hcFall, 4);
+    // non-positive knobs fall back to safe minimums
+    p.enableHealthChecks(0, 0, 0, 0);
+    assert.equalInt(p.hcIntervalMs, 2000);
+    assert.equalInt(p.hcRise, 1);
+    assert.equalInt(p.hcFall, 1);
+}

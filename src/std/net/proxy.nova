@@ -56,10 +56,21 @@ pub struct Backend {
     pub weight: int,           // Weighted LB (default 1)
     pub active: List<int>,     // PER-REACTOR in-flight request count (LeastConn), lock-free like `idle`
     pub reuse: bool,
+    // Health state. `up` is written ONLY by the single health-check coroutine (on reactor 0) and read by
+    // selection on EVERY reactor — a benign, eventually-consistent cross-reactor race on one aligned
+    // 4-byte word (no torn read on x86/ARM64; a selection may use a stale up/down for at most one probe
+    // interval, which is exactly HAProxy's cross-thread health semantics). `okStreak`/`failStreak` are
+    // touched ONLY by that one checker coroutine (single-writer), so they need no synchronization.
+    pub up: int,               // 1 = in rotation, 0 = drained out (health checks removed it)
+    pub okStreak: int,         // consecutive successful probes (→ mark up after `rise`)
+    pub failStreak: int,       // consecutive failed probes (→ mark down after `fall`)
     init(host: string, port: int) {
         self.host = host;
         self.port = port;
         self.weight = 1;
+        self.up = 1;           // backends start IN rotation (health checks can only remove them)
+        self.okStreak = 0;
+        self.failStreak = 0;
         // P5: reuse is now safe UNCONDITIONALLY. It was gated to a single worker because the old
         // work-stealing model let a coroutine migrate threads, so a pooled socket could be touched from
         // two io_context threads (per-coroutine strands papered over the async ops but reuse across
@@ -87,6 +98,22 @@ pub struct Backend {
         let t = nova_thread_id() as int;
         return self.active.get(t) ?? 0;
     }
+    pub fn isUp(self: Backend): bool { return self.up != 0; }
+
+    // Fold one probe result into the rise/fall hysteresis (HAProxy-style): a backend only flips DOWN
+    // after `fall` consecutive failures and back UP after `rise` consecutive successes, so a single
+    // blip neither drains nor restores it. Single-writer (the health-check coroutine), so no locking.
+    pub fn observe(self: Backend, ok: bool, rise: int, fall: int): void {
+        if (ok) {
+            self.okStreak = self.okStreak + 1;
+            self.failStreak = 0;
+            if (self.up == 0 && self.okStreak >= rise) { self.up = 1; }
+        } else {
+            self.failStreak = self.failStreak + 1;
+            self.okStreak = 0;
+            if (self.up != 0 && self.failStreak >= fall) { self.up = 0; }
+        }
+    }
 }
 
 // One framed HTTP message + the two facts the pool needs: was it CLEANLY framed (Content-Length or
@@ -109,6 +136,14 @@ pub struct Pool {
     pub wexpanded: List<int>, // Weighted: backend indices repeated by weight (rebuilt on add)
     pub ringHash: List<int>,  // ConsistentHash ring: parallel (hash, backendIdx), UNSORTED (scanned)
     pub ringIdx: List<int>,
+    // Active health checking (all default so an unconfigured Pool behaves exactly as before — every
+    // backend stays up=1, so healthyFrom is a no-op passthrough and selection is unchanged).
+    pub hcEnabled: bool,
+    pub hcIntervalMs: int,    // gap between probe sweeps
+    pub hcTimeoutMs: int,     // per-probe deadline
+    pub hcRise: int,          // consecutive OK probes to return a drained backend to rotation
+    pub hcFall: int,          // consecutive failed probes to drain a backend out
+    pub hcPath: string,       // "" = TCP-connect probe; non-empty = HTTP GET this path, expect 2xx/3xx
     init() {
         self.backends = List<Backend>();
         self.cursors = List<int>();
@@ -116,12 +151,45 @@ pub struct Pool {
         self.wexpanded = List<int>();
         self.ringHash = List<int>();
         self.ringIdx = List<int>();
+        self.hcEnabled = false;
+        self.hcIntervalMs = 2000;
+        self.hcTimeoutMs = 1000;
+        self.hcRise = 2;
+        self.hcFall = 3;
+        self.hcPath = "";
         let nt = nova_worker_count() as int;
         let i = 0;
         while (i < nt) { self.cursors.push(0); i = i + 1; }
     }
 
     pub fn setStrategy(self: Pool, s: LbStrategy): void { self.strategy = s; }
+
+    // Turn on active health checking. `path` empty = a bare TCP-connect probe (is the port accepting?);
+    // a path like "/healthz" = an HTTP GET whose 2xx/3xx status marks the backend healthy. The probe
+    // sweep runs as one coroutine on reactor 0 (spawned by runProxy), draining/restoring backends via
+    // the rise/fall hysteresis so a flapping backend doesn't thrash the rotation.
+    pub fn enableHealthChecks(self: Pool, intervalMs: int, timeoutMs: int, rise: int, fall: int): void {
+        self.hcEnabled = true;
+        self.hcIntervalMs = if (intervalMs > 0) intervalMs else 2000;
+        self.hcTimeoutMs = if (timeoutMs > 0) timeoutMs else 1000;
+        self.hcRise = if (rise > 0) rise else 1;
+        self.hcFall = if (fall > 0) fall else 1;
+    }
+    pub fn setHealthPath(self: Pool, path: string): void { self.hcPath = path; }
+
+    // First IN-ROTATION backend at or after `start` (wrapping). Returns -1 when EVERY backend is drained.
+    // With health checks off, backend 0..n all have up=1, so this returns `start` unchanged (no-op).
+    fn healthyFrom(self: Pool, start: int): int {
+        let n = self.backends.size();
+        if (n == 0) { return -1; }
+        let k = 0;
+        while (k < n) {
+            let idx = (start + k) % n;
+            if ((self.backends.get(idx) ?? Backend("", 0)).isUp()) { return idx; }
+            k = k + 1;
+        }
+        return -1;
+    }
 
     pub fn add(self: Pool, host: string, port: int): void { self.addWeighted(host, port, 1); }
 
@@ -155,34 +223,45 @@ pub struct Pool {
 
         switch (self.strategy) {
             case LbStrategy.RoundRobin: {
-                // each reactor advances its OWN cursor — even split, no shared counter.
+                // each reactor advances its OWN cursor — even split, no shared counter. Skip forward
+                // past any drained backend (healthyFrom is a no-op passthrough when health checks are off).
                 let c = self.cursors.get(t) ?? 0;
                 self.cursors.set(t, c + 1);
-                return self.backends.get(c % n) ?? Backend("", 0);
+                let idx = self.healthyFrom(c % n);
+                if (idx < 0) { return Backend("", 0); }
+                return self.backends.get(idx) ?? Backend("", 0);
             }
             case LbStrategy.Weighted: {
                 let m = self.wexpanded.size();
                 let c = self.cursors.get(t) ?? 0;
                 self.cursors.set(t, c + 1);
-                let idx = if (m == 0) (c % n) else (self.wexpanded.get(c % m) ?? 0);
+                let raw = if (m == 0) (c % n) else (self.wexpanded.get(c % m) ?? 0);
+                let idx = self.healthyFrom(raw);
+                if (idx < 0) { return Backend("", 0); }
                 return self.backends.get(idx) ?? Backend("", 0);
             }
             case LbStrategy.LeastConn: {
-                // Fewest in-flight on THIS reactor; ties → lowest index. Per-reactor least-conn (each
-                // reactor balances its own subset) is the correct share-nothing semantics.
-                let best = 0;
-                let bestA = (self.backends.get(0) ?? Backend("", 0)).activeConns();
-                let i = 1;
+                // Fewest in-flight on THIS reactor AMONG HEALTHY backends; ties → lowest index. Per-reactor
+                // least-conn (each reactor balances its own subset) is the correct share-nothing semantics.
+                let best = -1;
+                let bestA = 0;
+                let i = 0;
                 while (i < n) {
-                    let a = (self.backends.get(i) ?? Backend("", 0)).activeConns();
-                    if (a < bestA) { bestA = a; best = i; }
+                    let bk = self.backends.get(i) ?? Backend("", 0);
+                    if (bk.isUp()) {
+                        let a = bk.activeConns();
+                        if (best < 0 || a < bestA) { bestA = a; best = i; }
+                    }
                     i = i + 1;
                 }
+                if (best < 0) { return Backend("", 0); }
                 return self.backends.get(best) ?? Backend("", 0);
             }
             case LbStrategy.ConsistentHash: {
                 // hash(key) → first ring node with hash >= h (wrapping to the global-min node). Stable
-                // under add/remove (only ~1/N keys remap). Ring is small, so a linear scan is fine.
+                // under add/remove (only ~1/N keys remap). Ring is small, so a linear scan is fine. If the
+                // chosen backend is drained, fall forward deterministically (same key → same fallback), so
+                // affinity stays stable across drains.
                 let h = hashKey(key);
                 let ring = self.ringHash.size();
                 let bestGE = -1; let bestGEH = 0;
@@ -195,7 +274,9 @@ pub struct Pool {
                     i = i + 1;
                 }
                 let pick = if (bestGE != -1) bestGE else gmin;
-                let idx = if (pick != -1) (self.ringIdx.get(pick) ?? 0) else 0;
+                let raw = if (pick != -1) (self.ringIdx.get(pick) ?? 0) else 0;
+                let idx = self.healthyFrom(raw);
+                if (idx < 0) { return Backend("", 0); }
                 return self.backends.get(idx) ?? Backend("", 0);
             }
         }
@@ -484,6 +565,59 @@ async fn handleClient(pool: Pool, clientSock: long, tmo: int): int {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Active health checking (I1): one background coroutine sweeps every backend and drains/restores it.
+// ---------------------------------------------------------------------------
+
+// True if `raw` (an HTTP response) has a 2xx or 3xx status line ("HTTP/1.1 <code> ..."). 4xx/5xx or an
+// unparseable line = unhealthy. Used only for the HTTP-GET probe (hcPath set).
+fn healthyStatus(raw: string): bool {
+    let sp = string.indexOf(raw, " ");
+    if (sp < 0) { return false; }
+    let rest = string.slice(raw, sp + 1, string.len(raw));
+    let sp2 = string.indexOf(rest, " ");
+    let codeStr = if (sp2 < 0) rest else string.slice(rest, 0, sp2);
+    let code = string.parseI64(codeStr) as int;
+    return code >= 200 && code < 400;
+}
+
+// Probe ONE backend: a bare TCP connect (path empty) proves the port is accepting; otherwise an HTTP
+// GET of `path` whose 2xx/3xx status proves the app is serving. Fully non-blocking (parks the checker
+// coroutine, never a thread). Returns whether the probe succeeded.
+async fn probeBackend(b: Backend, timeoutMs: int, path: string): bool {
+    let s = await asyncio.asyncConnect(b.host, b.port);
+    if (s.sock == 0) { return false; }
+    if (string.len(path) == 0) {
+        asyncio.aclose(s.sock);
+        return true;                           // TCP connect succeeded
+    }
+    let req = `GET ${path} HTTP/1.1\r\nHost: ${b.host}\r\nConnection: close\r\n\r\n`;
+    let _ = await asyncio.async_write(s.sock, req);
+    let resp = await readMessage(s.sock, true, timeoutMs);
+    asyncio.aclose(s.sock);
+    if (string.eql(resp.bytes, "")) { return false; }
+    return healthyStatus(resp.bytes);
+}
+
+// The health-check sweep: probe every backend in turn, fold each result into its rise/fall hysteresis,
+// then sleep `hcIntervalMs` and repeat. Runs as ONE coroutine on reactor 0 (single-writer of every
+// `up`), so the drain/restore decisions are race-free even though selection reads `up` from every
+// reactor. Never returns (lives for the process).
+async fn healthCheckLoop(pool: Pool): int {
+    while (true) {
+        let n = pool.backends.size();
+        let i = 0;
+        while (i < n) {
+            let b = pool.backends.get(i) ?? Backend("", 0);
+            let ok = await probeBackend(b, pool.hcTimeoutMs, pool.hcPath);
+            b.observe(ok, pool.hcRise, pool.hcFall);
+            i = i + 1;
+        }
+        let _ = await asyncio.sleep(pool.hcIntervalMs);
+    }
+    return 0;
+}
+
 // One reactor's front-end accept loop: bind a SO_REUSEPORT acceptor on THIS reactor, then accept +
 // spawn a handler per client. Handlers stay on the accepting reactor, so their backend connections are
 // acquired/pooled/reused on the same reactor's per-reactor idle list (safe, lock-free).
@@ -503,6 +637,11 @@ async fn proxyAcceptLoop(pool: Pool, port: int, tmo: int): int {
 // P5 share-nothing fan-out: one accept loop per reactor (SO_REUSEPORT; the kernel load-balances clients
 // across reactors on Linux). Mirrors App.run — reactors 1..N-1 spawned + pinned, reactor 0 inline.
 async fn runProxy(pool: Pool, port: int, tmo: int): int {
+    // One health-check sweep coroutine on reactor 0 (the single writer of every backend's `up`).
+    if (pool.hcEnabled) {
+        asyncio.pinNextCoro(0);
+        spawn healthCheckLoop(pool);
+    }
     let n = asyncio.reactorCount();
     let i = 1;
     while (i < n) {

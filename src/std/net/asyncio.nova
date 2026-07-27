@@ -150,3 +150,9 @@ pub async fn asyncConnect(host: string, port: int): AsyncStream {
     let s = await aconnect(host, port);
     return AsyncStream(s);
 }
+
+// Non-blocking async delay: `await asyncio.sleep(ms)` arms a steady_timer and suspends the calling
+// coroutine — the reactor runs OTHER coroutines meanwhile (unlike a blocking sleep). The body is a
+// stub: codegen intercepts the `await …sleep(ms)` form and lowers it to nova_await_timer, so this is
+// never actually called. Use ONLY as `await asyncio.sleep(ms)` inside an async fn.
+pub fn sleep(ms: int): int { return 0; }
