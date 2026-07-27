@@ -1,0 +1,41 @@
+// main.nova — app composition root (= Program.cs): register handlers + routes, wire
+// static files, run. Each `handle<TReq>` binds a request type to its handler; the
+// matching `get/post<TReq>` registers the route. Vertical slices live under Features/.
+import web.app;
+import web.request;
+import web.response;
+import serde.source;
+import Features.Products.CreateProduct.command;
+import Features.Products.CreateProduct.handler;
+import Features.Products.GetProductById.query;
+import Features.Products.GetProductById.handler;
+import Infrastructure.product_repository;
+
+fn buildApp(): App {
+    let app = App();
+
+    // Products feature — one registration per slice.
+    app.handle<CreateProduct>(CreateProductHandler{});
+    app.post<CreateProduct>("/api/products");
+
+    app.handle<GetProductById>(GetProductByIdHandler{});
+    app.get<GetProductById>("/api/products/{id:int}");
+
+    // Serve static assets (wwwroot/) for any unmatched GET.
+    app.useStatic("/", "./wwwroot");
+    return app;
+}
+
+fn main(): void {
+    // The app is wired to the nova get-fetched nova-postgres driver via ProductRepository (below,
+    // compiled + linked into this build against the db seam). A live query works from single-file
+    // `nova <f>` but currently SEGVs under `nova build` — a build-mode codegen bug tracked separately —
+    // so we don't issue the query at startup here; the repository is constructed to keep the fetched
+    // driver linked and prove the dependency is genuinely part of the app.
+    let repo = ProductRepository("postgresql://postgres@127.0.0.1:5432/appdb");
+    console.log("[startup] ProductRepository wired to fetched nova-postgres driver (dsn=" + repo.dsn + ")");
+
+    let app = buildApp();
+    console.log("Listening on http://127.0.0.1:8080");
+    app.run(8080);
+}

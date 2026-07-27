@@ -1,0 +1,4 @@
+// The query: fetch a product by id. Bound from the route param `{id:int}`.
+@serializable pub struct GetProductById {
+    pub id: int,
+}

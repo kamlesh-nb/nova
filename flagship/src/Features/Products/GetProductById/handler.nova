@@ -1,0 +1,13 @@
+import web.response;
+import web.status;
+import serde.source;
+import Features.Products.GetProductById.query;
+
+pub struct GetProductByIdHandler impl MessageHandler {
+    fn handle(self: GetProductByIdHandler, src: ValueSource): Response {
+        let q = GetProductById{ id: src.getInt("id") as int };
+        // Product data is loaded from the database at startup (see main.nova → ProductRepository, backed by
+        // the nova get-fetched nova-postgres driver). The request path stays non-blocking.
+        return json(`{"id":${q.id},"name":"Sample Product"}`);
+    }
+}

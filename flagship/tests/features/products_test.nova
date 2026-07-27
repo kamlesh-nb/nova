@@ -1,0 +1,34 @@
+import assert;
+import web.app;
+import web.request;
+import web.response;
+import serde.source;
+import Features.Products.CreateProduct.command;
+import Features.Products.CreateProduct.handler;
+import Features.Products.GetProductById.query;
+import Features.Products.GetProductById.handler;
+
+fn testApp(): App {
+    let app = App();
+    app.handle<CreateProduct>(CreateProductHandler{});
+    app.post<CreateProduct>("/api/products");
+    app.handle<GetProductById>(GetProductByIdHandler{});
+    app.get<GetProductById>("/api/products/{id:int}");
+    return app;
+}
+
+@test
+fn test_get_product(): void {
+    let app = testApp();
+    let req = Request.fromString("GET /api/products/7 HTTP/1.1\r\nHost: x\r\n\r\n");
+    let res = app.dispatch(req);
+    assert.isTrue(string.indexOf(res.body, "\"id\":7") != -1);
+}
+
+@test
+fn test_create_product(): void {
+    let app = testApp();
+    let req = Request.fromString("POST /api/products HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"name\":\"Widget\",\"price\":9}");
+    let res = app.dispatch(req);
+    assert.isTrue(string.indexOf(res.body, "Widget") != -1);
+}

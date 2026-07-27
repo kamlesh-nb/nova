@@ -1,0 +1,12 @@
+{
+  "name": "flagship",
+  "version": "0.1.0",
+  "type": "web",
+  "dependencies": [
+    "https://github.com/kamlesh-nb/nova-postgres",
+    "https://github.com/kamlesh-nb/nova-mysql",
+    "https://github.com/kamlesh-nb/nova-mssql",
+    "https://github.com/kamlesh-nb/nova-btreedb",
+    "https://github.com/kamlesh-nb/nova-mongodb"
+  ]
+}

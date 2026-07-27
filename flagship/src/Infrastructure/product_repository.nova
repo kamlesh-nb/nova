@@ -1,0 +1,31 @@
+// Infrastructure — a repository backed by a REAL database driver fetched via `nova get`
+// (nova-postgres, declared in project.json). Programs against the `db` seam (Driver/Connection), so the
+// backend is swappable for any declared driver (nova-mysql / nova-mssql / nova-btreedb / nova-mongodb).
+// Degrades gracefully: if the database is offline the query returns nothing and we fall back, so the app
+// runs with or without a live DB.
+
+import db;
+import postgres;
+import list;
+import string;
+
+pub struct ProductRepository {
+    pub dsn: string,
+    init(dsn: string) {
+        self.dsn = dsn;
+    }
+
+    // Look up a product name by id. Uses the fetched Postgres driver through the db seam.
+    pub fn productName(self: ProductRepository, id: int): string {
+        let driver = PgDriver();
+        let conn = driver.connect(self.dsn);
+        let params = List<DbValue>();
+        params.push(dbInt(id));
+        let rs = conn.query("SELECT name FROM products WHERE id = $1", params);
+        conn.close();
+        if (rs.rowCount() > 0) {
+            return rs.row(0).getText(0);
+        }
+        return "Sample Product (database offline — fallback)";
+    }
+}

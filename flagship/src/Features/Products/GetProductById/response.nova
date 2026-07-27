@@ -1,0 +1,4 @@
+@serializable pub struct ProductDto {
+    pub id: int,
+    pub name: string,
+}
