@@ -2113,12 +2113,34 @@ fn getFileMtime(io: Io, path: []const u8) !i96 {
     return stat.mtime.nanoseconds;
 }
 
+// A stamp for the linked static libraries the Nova sources are NOT — the prebuilt C++ runtime (and
+// wolfSSL). A source-content hash alone misses a RUNTIME-only change: edit `src/runtime/`, `zig build`
+// re-syncs `~/.nova/lib/libnova_runtime.a`, but the .nova sources are byte-identical, so the T6 cache
+// would report "up to date" and keep the OLD runtime linked in. Folding each lib's mtime into the cache
+// key makes a runtime change invalidate the cache and force a relink. Missing lib → 0 (no effect).
+fn linkLibsStamp(allocator: std.mem.Allocator, init: std.process.Init) u64 {
+    const home = init.environ_map.get("HOME") orelse init.environ_map.get("USERPROFILE") orelse "/";
+    const libs = [_][]const u8{
+        "/.nova/lib/libnova_runtime.a",
+        "/.nova/deps/wolfssl/build/libwolfssl.a",
+    };
+    var acc: u64 = 0;
+    for (libs) |suffix| {
+        const path = std.fmt.allocPrint(allocator, "{s}{s}", .{ home, suffix }) catch continue;
+        defer allocator.free(path);
+        const mt = getFileMtime(init.io, path) catch continue; // absent lib → skip (0 contribution)
+        acc ^= @as(u64, @bitCast(@as(i64, @truncate(mt))));
+    }
+    return acc;
+}
+
 // T6 cache key: an order-independent digest of every input file's (path + content), folded with
-// the profile and a CACHE_VERSION. XOR of per-file hashes is order-independent (the file set is a
-// hashmap). Bump CACHE_VERSION when codegen changes in a way an unchanged source must rebuild for.
+// the profile, a CACHE_VERSION, and the linked-runtime stamp. XOR of per-file hashes is
+// order-independent (the file set is a hashmap). Bump CACHE_VERSION when codegen changes in a way an
+// unchanged source must rebuild for.
 const CACHE_VERSION: u64 = 1;
-fn sourcesHash(file_sources: *std.StringHashMap([]const u8), is_release: bool) u64 {
-    var acc: u64 = CACHE_VERSION ^ (if (is_release) @as(u64, 0x9e3779b97f4a7c15) else 0);
+fn sourcesHash(file_sources: *std.StringHashMap([]const u8), is_release: bool, link_stamp: u64) u64 {
+    var acc: u64 = CACHE_VERSION ^ link_stamp ^ (if (is_release) @as(u64, 0x9e3779b97f4a7c15) else 0);
     var it = file_sources.iterator();
     while (it.next()) |e| {
         var h = std.hash.Wyhash.init(0);
@@ -2184,7 +2206,7 @@ fn compileProgram(
     // output binary (so a deleted binary rebuilds).
     var src_hash: u64 = 0;
     if (build_mode) {
-        src_hash = sourcesHash(&file_sources, is_release);
+        src_hash = sourcesHash(&file_sources, is_release, linkLibsStamp(allocator, init));
         const cur = std.fmt.allocPrint(allocator, "{x}", .{src_hash}) catch "";
         defer if (cur.len > 0) allocator.free(cur);
         if (Io.Dir.readFileAlloc(.cwd(), init.io, build_hash_path, allocator, .unlimited)) |prev| {
