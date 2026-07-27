@@ -1,0 +1,59 @@
+// A @serializable struct with a payload-LESS enum field silently dropped that field in every
+// direction — the generator had zero enum handling. Fixed: an enum field serializes as its variant
+// NAME (a string, `"status":"Active"` — chosen over the integer tag for idiomatic/stable JSON).
+// The compiler generates `<Enum>__name` (tag→name) and `<Enum>__fromName` (name→tag, default = first
+// variant) for each payload-less enum referenced by a serde field, and the bind/toJson/dump arms use
+// them (scalar + optional inner). A payload-CARRYING enum can't round-trip through a name alone and is
+// still skipped (not in the generated set), so it never crashes — verified by the Tok case.
+
+import assert;
+import serde.source;
+import serde.json;
+import data.orm;
+import data.db;
+import string;
+import list;
+
+enum Status { Active, Inactive, Pending }
+
+@serializable
+struct Account {
+    pub id: int,
+    pub status: Status,
+    pub prev: Status | undefined,
+    init() { self.id = 0; self.status = Status.Active; self.prev = undefined; }
+}
+
+@test
+fn test_bind_and_tojson_roundtrip(): void {
+    let a = Account__bind(source.fromJson("{\"id\":5,\"status\":\"Inactive\",\"prev\":\"Pending\"}"));
+    assert.equalInt(a.id, 5);
+    assert.equalStr(Status__name(a.status), "Inactive");        // bound from the name
+    assert.equalStr(Status__name(a.prev ?? Status.Active), "Pending");
+    assert.equalStr(Account__toJson(a), "{\"id\":5,\"status\":\"Inactive\",\"prev\":\"Pending\"}");
+}
+
+@test
+fn test_optional_enum_absent_omitted(): void {
+    let a = Account__bind(source.fromJson("{\"id\":1,\"status\":\"Active\"}"));
+    assert.equalStr(Status__name(a.status), "Active");
+    assert.isTrue(a.prev == undefined);
+    assert.equalStr(Account__toJson(a), "{\"id\":1,\"status\":\"Active\"}");   // prev omitted
+}
+
+@test
+fn test_fromName_default_is_first_variant(): void {
+    let a = Account__bind(source.fromJson("{\"id\":9,\"status\":\"Bogus\"}"));   // unknown name
+    assert.equalStr(Status__name(a.status), "Active");          // → first variant
+}
+
+@test
+fn test_write_side_enum_as_name(): void {
+    let m = Account();
+    m.id = 7; m.status = Status.Pending;
+    let ps = orm.toParams<Account>(m);
+    // id + status written; prev (undefined) omitted
+    assert.equalInt(ps.cols.size(), 2);
+    assert.isTrue(string.eql(ps.cols.at(1), "status"));
+    assert.isTrue(string.eql(ps.vals.at(1).asText(), "Pending"));
+}

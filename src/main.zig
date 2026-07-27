@@ -561,6 +561,14 @@ fn serdeIsFloat(n: []const u8) bool {
     return false;
 }
 
+/// A payload-LESS enum (all bare variants) can serialize by its variant NAME — a string. A
+/// payload-carrying enum cannot round-trip through a name alone, so serde skips it.
+fn serdeEnumPayloadless(e: ast.EnumDecl) bool {
+    for (e.variants) |v| {
+        if (v.type_name != null or v.fields != null) return false;
+    }
+    return true;
+}
 fn serdeAppendf(list: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
     const s = try std.fmt.allocPrint(allocator, fmt, args);
     try list.appendSlice(allocator, s);
@@ -581,7 +589,51 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
     }
     if (serializable.count() == 0) return;
 
+    // All payload-less enums, so a serde field of enum type can serialize by variant NAME (a string).
+    var enums = std.StringHashMap(ast.EnumDecl).init(allocator);
+    defer enums.deinit();
+    for (declarations.items) |decl| {
+        if (decl == .enum_decl and serdeEnumPayloadless(decl.enum_decl)) {
+            try enums.put(decl.enum_decl.name, decl.enum_decl);
+        }
+    }
+
     var src = std.ArrayList(u8).empty; // leaked on purpose — the reparsed AST references it
+
+    // Which payload-less enums are actually referenced by a serde field (scalar or optional inner)?
+    // Generate `<Enum>__name`/`<Enum>__fromName` for exactly those, so an enum field round-trips as its
+    // variant NAME (`"status":"Active"`). Emitted BEFORE the struct binders that call them.
+    var needed_enums = std.StringHashMap(void).init(allocator);
+    defer needed_enums.deinit();
+    for (declarations.items) |decl| {
+        if (decl != .struct_decl) continue;
+        if (!serializable.contains(decl.struct_decl.name)) continue;
+        for (decl.struct_decl.fields) |f| {
+            const en: ?[]const u8 = switch (f.type_name) {
+                .ident => |tn| tn,
+                .optional => |inner| if (inner.* == .ident) inner.ident else null,
+                else => null,
+            };
+            if (en) |name| if (enums.contains(name)) try needed_enums.put(name, {});
+        }
+    }
+    {
+        var it = needed_enums.keyIterator();
+        while (it.next()) |k| {
+            const en = enums.get(k.*).?;
+            // <Enum>__name(e): the variant name; <Enum>__fromName(s): name -> variant (default = first).
+            try serdeAppendf(&src, allocator, "fn {s}__name(e: {s}): string {{\n    switch (e) {{\n", .{ en.name, en.name });
+            for (en.variants) |v| {
+                try serdeAppendf(&src, allocator, "        case {s}.{s}: {{ return \"{s}\"; }}\n", .{ en.name, v.name, v.name });
+            }
+            try serdeAppendf(&src, allocator, "    }}\n    return \"\";\n}}\n", .{});
+            try serdeAppendf(&src, allocator, "fn {s}__fromName(s: string): {s} {{\n", .{ en.name, en.name });
+            for (en.variants) |v| {
+                try serdeAppendf(&src, allocator, "    if (string.eql(s, \"{s}\")) {{ return {s}.{s}; }}\n", .{ v.name, en.name, v.name });
+            }
+            try serdeAppendf(&src, allocator, "    return {s}.{s};\n}}\n", .{ en.name, en.variants[0].name });
+        }
+    }
 
     for (declarations.items) |decl| {
         if (decl != .struct_decl) continue;
@@ -605,6 +657,9 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
                         try serdeAppendf(&src, allocator, "    obj.{s} = src.getFloat(\"{s}\");\n", .{ fname, fname });
                     } else if (serializable.contains(tn)) {
                         try serdeAppendf(&src, allocator, "    obj.{s} = {s}__bind(src.getChild(\"{s}\"));\n", .{ fname, tn, fname });
+                    } else if (enums.contains(tn)) {
+                        // Enum field: bind from its variant NAME (getString "" → first variant default).
+                        try serdeAppendf(&src, allocator, "    obj.{s} = {s}__fromName(src.getString(\"{s}\"));\n", .{ fname, tn, fname });
                     }
                 },
                 .optional => |inner| {
@@ -627,6 +682,8 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
                             try serdeAppendf(&src, allocator, "    if (src.has(\"{s}\")) {{ obj.{s} = src.getFloat(\"{s}\"); }}\n", .{ fname, fname, fname });
                         } else if (serializable.contains(itn)) {
                             try serdeAppendf(&src, allocator, "    if (src.has(\"{s}\")) {{ obj.{s} = {s}__bind(src.getChild(\"{s}\")); }}\n", .{ fname, fname, itn, fname });
+                        } else if (enums.contains(itn)) {
+                            try serdeAppendf(&src, allocator, "    if (src.has(\"{s}\")) {{ obj.{s} = {s}__fromName(src.getString(\"{s}\")); }}\n", .{ fname, fname, itn, fname });
                         }
                     }
                 },
@@ -683,6 +740,9 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
                         try serdeAppendf(&src, allocator, "    out = out + __sep + \"\\\"{s}\\\":\" + `${{obj.{s}}}`; __sep = \",\";\n", .{ fname, fname });
                     } else if (serializable.contains(tn)) {
                         try serdeAppendf(&src, allocator, "    out = out + __sep + \"\\\"{s}\\\":\" + {s}__toJson(obj.{s}); __sep = \",\";\n", .{ fname, tn, fname });
+                    } else if (enums.contains(tn)) {
+                        // Enum field serialized as its QUOTED variant name (`"status":"Active"`).
+                        try serdeAppendf(&src, allocator, "    out = out + __sep + \"\\\"{s}\\\":\" + json.quote({s}__name(obj.{s})); __sep = \",\";\n", .{ fname, tn, fname });
                     }
                     // f32/f64 float fields skipped (f64 stringify gap); decimal handled above
                 },
@@ -702,6 +762,8 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
                             vexpr = "`${__v}`";
                         } else if (serializable.contains(itn)) {
                             vexpr = try std.fmt.allocPrint(allocator, "{s}__toJson(__v)", .{itn});
+                        } else if (enums.contains(itn)) {
+                            vexpr = try std.fmt.allocPrint(allocator, "json.quote({s}__name(__v))", .{itn});
                         }
                         if (vexpr) |ve| {
                             try serdeAppendf(&src, allocator, "    {{ let __v = obj.{s}; if (__v != undefined) {{ out = out + __sep + \"\\\"{s}\\\":\" + {s}; __sep = \",\"; }} }}\n", .{ fname, fname, ve });
@@ -756,6 +818,9 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
                         try serdeAppendf(&src, allocator, "    sink.putDecimal(\"{s}\", obj.{s});\n", .{ fname, fname });
                     } else if (serdeIsFloat(tn)) {
                         try serdeAppendf(&src, allocator, "    sink.putFloat(\"{s}\", obj.{s});\n", .{ fname, fname });
+                    } else if (enums.contains(tn)) {
+                        // Enum field written as its variant NAME (string), symmetric with bind/toJson.
+                        try serdeAppendf(&src, allocator, "    sink.putString(\"{s}\", {s}__name(obj.{s}));\n", .{ fname, tn, fname });
                     }
                     // nested @serializable structs skipped (flat write path)
                 },
@@ -781,6 +846,8 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
                         }
                         if (sink_fn) |sf| {
                             try serdeAppendf(&src, allocator, "    {{ let __v = obj.{s}; if (__v != undefined) {{ sink.{s}(\"{s}\", __v); }} }}\n", .{ fname, sf, fname });
+                        } else if (enums.contains(itn)) {
+                            try serdeAppendf(&src, allocator, "    {{ let __v = obj.{s}; if (__v != undefined) {{ sink.putString(\"{s}\", {s}__name(__v)); }} }}\n", .{ fname, fname, itn });
                         }
                     }
                 },
