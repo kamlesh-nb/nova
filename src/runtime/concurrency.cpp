@@ -11,6 +11,9 @@
 // investigation before it can be switched on. Once fixed, swap it back in here.
 #include "nova_abi.h"
 #include <boost/asio.hpp>
+#ifndef _WIN32
+#include <sys/socket.h> // P4: SO_REUSEPORT / setsockopt
+#endif
 #include <cstdio>
 #include <chrono>
 #include <condition_variable>
@@ -758,8 +761,21 @@ void nova_io_accept_async(long long server_fd, long long self) {
 namespace {
 struct NovaAcceptor {
     boost::asio::ip::tcp::acceptor acc;
-    NovaAcceptor(boost::asio::io_context &io, unsigned short port)
-        : acc(io, boost::asio::ip::tcp::endpoint(boost::asio::ip::tcp::v4(), port)) {}
+    NovaAcceptor(boost::asio::io_context &io, unsigned short port) : acc(io) {
+        boost::asio::ip::tcp::endpoint ep(boost::asio::ip::tcp::v4(), port);
+        acc.open(ep.protocol());
+        acc.set_option(boost::asio::socket_base::reuse_address(true));
+#ifdef SO_REUSEPORT
+        // P4: SO_REUSEPORT lets EVERY reactor bind the SAME port; the kernel load-balances new
+        // connections across the per-reactor acceptors (nginx / share-nothing model). Each reactor
+        // then accepts and handles its own connections on its own thread — no cross-reactor socket
+        // sharing. Guarded: Windows has no SO_REUSEPORT (reuse_address above is the closest analog).
+        int one = 1;
+        ::setsockopt(acc.native_handle(), SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+#endif
+        acc.bind(ep);
+        acc.listen();
+    }
 };
 struct NovaSocket {
     boost::asio::ip::tcp::socket sock;
@@ -770,7 +786,7 @@ struct NovaSocket {
 // Bind+listen on `port`; returns an acceptor handle (0 on failure, e.g. port in use).
 long long nova_aserver_listen(long long port) {
     try {
-        return reinterpret_cast<long long>(new NovaAcceptor(g_io, (unsigned short)port));
+        return reinterpret_cast<long long>(new NovaAcceptor(g_reactors[g_reactor_id]->io, (unsigned short)port));
     } catch (...) {
         return 0;
     }
@@ -781,7 +797,7 @@ long long nova_aserver_listen(long long port) {
 void nova_aaccept(long long server, long long self) {
     auto *a = reinterpret_cast<NovaAcceptor *>(server);
     auto state = get_coro_state(self);
-    auto *ns = new NovaSocket(g_io);
+    auto *ns = new NovaSocket(g_reactors[state->reactor_id]->io);
     a->acc.async_accept(ns->sock, boost::asio::bind_executor(state->strand, [self, ns](const boost::system::error_code &ec) {
         long long result;
         if (ec) { delete ns; result = 0; }
@@ -801,8 +817,8 @@ void nova_aconnect(long long host, long long port, long long self) {
     int hlen = h ? *reinterpret_cast<const int *>(h - 4) : 0;
     auto host_s = std::make_shared<std::string>(h ? h : "", hlen < 0 ? 0 : hlen);
     auto port_s = std::make_shared<std::string>(std::to_string(port));
-    auto ns = new NovaSocket(g_io);
-    auto resolver = std::make_shared<boost::asio::ip::tcp::resolver>(g_io);
+    auto ns = new NovaSocket(g_reactors[state->reactor_id]->io);
+    auto resolver = std::make_shared<boost::asio::ip::tcp::resolver>(g_reactors[state->reactor_id]->io);
     resolver->async_resolve(*host_s, *port_s,
         boost::asio::bind_executor(state->strand,
             [self, ns, resolver, host_s, port_s](const boost::system::error_code &ec,
