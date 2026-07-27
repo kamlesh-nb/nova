@@ -1562,6 +1562,19 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                                     }
                                 }
 
+                                // V1: assigning a value (prim or payload-less enum) into a value-optional
+                                // FIELD (`self.cur = St.A` where `cur: St | undefined`) must BOX it, or a
+                                // present tag-0 (`St.A`) stores as 0 and reads back as `undefined` (the
+                                // struct-field sibling of the `??`/local boxing already at let/return sites).
+                                // `undefined` stays the null box; an RHS that already yields a box (another
+                                // value-optional) is not re-boxed.
+                                if (self.valoptTypeRefIsValue(field_type_ref) and
+                                    !LlvmCompiler.isUndefinedLiteralExpr(bin.right) and
+                                    !self.exprYieldsValoptBox(bin.right))
+                                {
+                                    stored_r = try self.buildValoptBox(self.coerceToSlotType(stored_r, self.val_type));
+                                }
+
                                 const casted_r_val = self.castFromValType(stored_r, llvm_field_type);
                                 _ = core.LLVMBuildStore(self.builder, casted_r_val, ptr);
                                 return stored_r;
@@ -3298,6 +3311,17 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 // --asan/--arc gate — see conformance/cases/41 and 42.
                 if (!widened_field and self.isOwnedDeclaredType(field_type_ref, f_type_str)) {
                     try self.takeOwnedElement(f_init.value.kind, field_val);
+                }
+
+                // V1: a struct-LITERAL value-optional field (`Lit { n: 0 }`, `Box { cur: St.A }`)
+                // must BOX a present value (prim or payload-less enum), or a present 0 / tag-0 stores
+                // as 0 and reads back as `undefined`. Mirrors the `.assign` field path above and the
+                // let/return sites. `undefined` stays the null box; an already-boxed RHS is not re-boxed.
+                if (!widened_field and self.valoptTypeRefIsValue(field_type_ref) and
+                    !LlvmCompiler.isUndefinedLiteralExpr(&f_init.value) and
+                    !self.exprYieldsValoptBox(&f_init.value))
+                {
+                    field_val = try self.buildValoptBox(self.coerceToSlotType(field_val, self.val_type));
                 }
 
                 const addr = core.LLVMBuildAdd(self.builder, struct_ptr_val, offset_val, "field_addr");
