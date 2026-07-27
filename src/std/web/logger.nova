@@ -14,7 +14,7 @@ pub struct Logger impl Service {
 
     pub fn log(self: Logger, level: string, message: string): void {
         let log_line = "[" + level + "] " + message + "\n";
-        io.file.File.appendText(self.filepath, log_line);
+        file.File.appendText(self.filepath, log_line);
         if (level == "ERROR") {
             console.err(message);
         } else if (level == "DEBUG") {

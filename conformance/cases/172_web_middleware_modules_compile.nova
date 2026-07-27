@@ -1,0 +1,67 @@
+// Five stdlib web modules did not COMPILE — because no conformance case imported them, their
+// latent errors (all surfaced by the optionals-soundness checker + trait/visibility rules) hid:
+//   * web/csrf    — getFormField iterated with `.get(i)` (returns `T | undefined`) then did
+//                   `pair.length` (unguarded optional); `.len` instead of `.size()`.
+//   * web/logger  — `io.file.File.appendText(...)` (full module path) — `io` is undefined; the
+//                   working idiom is the last segment `file.File` (as web/static_content uses).
+//   * web/recovery— `impl PipelineBehavior` with concrete `handle(req: Request, ...): Response`
+//                   instead of the trait's `handle(req: any, next: () => any): any`.
+//   * web/mediator— pre/behavior/post loops used `.get(i)` then called `.process`/`.handle` on the
+//                   optional; `.len` instead of `.size()`.
+//   * web/router  — matchRoute used `.get(i)` then `r.method`/`r.path` on the optional.
+// This case IMPORTS all five (so they are type-checked in the corpus forever) and exercises the
+// pure-logic ones (csrf token validation, router matching) so the behavior — not just compilation
+// — is gated.
+
+import assert;
+import string;
+import web.csrf;
+import web.logger;
+import web.recovery;
+import web.mediator;
+import web.router;
+import web.middleware;
+import web.request;
+import web.response;
+
+// --- CSRF token validation (the security-critical path) ---
+@test
+fn test_csrf_get_passes(): void {
+    let m = csrf.CsrfMiddleware();
+    let req = request.Request.fromString("GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    let res = response.Response.ok("");
+    assert.isTrue(m.execute(req, res) == MiddlewareAction.Next);
+}
+
+@test
+fn test_csrf_post_token_mismatch_stops(): void {
+    let m = csrf.CsrfMiddleware();
+    let req = request.Request.fromString(
+        "POST /f HTTP/1.1\r\nHost: x\r\nX-Session-CSRF: secret123\r\nX-CSRF-Token: wrong\r\n\r\n");
+    let res = response.Response.ok("");
+    assert.isTrue(m.execute(req, res) == MiddlewareAction.Stop);   // mismatch → blocked
+}
+
+@test
+fn test_csrf_post_token_match_passes(): void {
+    let m = csrf.CsrfMiddleware();
+    let req = request.Request.fromString(
+        "POST /f HTTP/1.1\r\nHost: x\r\nX-Session-CSRF: secret123\r\nX-CSRF-Token: secret123\r\n\r\n");
+    let res = response.Response.ok("");
+    assert.isTrue(m.execute(req, res) == MiddlewareAction.Next);   // match → allowed
+}
+
+// --- Router matching (the fixed .get→.at loop) ---
+@test
+fn test_router_match_hit_and_miss(): void {
+    let rt = router.CtrlRouter();
+    rt.add("GET", "/users", (req: request.Request) => response.Response.ok("users"));
+    rt.add("POST", "/users", (req: request.Request) => response.Response.ok("created"));
+
+    let hit = rt.matchRoute("GET", "/users");
+    assert.isTrue(hit != undefined);
+    assert.isTrue(string.eql((hit ?? router.Route{ method: "", path: "", handler: (r: request.Request) => response.Response.ok("") }).path, "/users"));
+
+    let miss = rt.matchRoute("DELETE", "/nope");
+    assert.isTrue(miss == undefined);
+}

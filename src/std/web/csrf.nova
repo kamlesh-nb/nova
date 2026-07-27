@@ -47,9 +47,9 @@ fn getFormField(body: string, name: string): string {
     if (body.length == 0) return "";
     let pairs = string.split(body, "&");
     let i = 0;
-    while (i < pairs.len) {
-        let pair = pairs.get(i);
-        let eq = string.indexOf(pair, "=");
+    while (i < pairs.size()) {
+        let pair = pairs.at(i);                 // .at is trapping (string); .get returns an OPTIONAL,
+        let eq = string.indexOf(pair, "=");     // whose later `pair.length` is an unguarded-optional error
         if (eq != -1) {
             let key = string.slice(pair, 0, eq);
             if (key == name) {

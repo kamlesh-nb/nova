@@ -37,7 +37,11 @@ import web.status;
 import web.mediator;
 
 pub struct PanicRecoveryBehavior impl PipelineBehavior {
-    pub fn handle(self: PanicRecoveryBehavior, req: request.Request, next: () => response.Response): response.Response {
+    // Signature MUST match the trait `PipelineBehavior.handle(self, req: any, next: () => any): any`
+    // — the impl previously used concrete `request.Request`/`response.Response` types, a trait
+    // signature mismatch that never compiled (no test imported this module). The pass-through
+    // returns whatever `next()` yields.
+    pub fn handle(self: PanicRecoveryBehavior, req: any, next: () => any): any {
         // Pass-through until `T | Error` lands (plan P2-13). Do not add a `try` here —
         // there is no `throw` to catch, by design.
         return next();

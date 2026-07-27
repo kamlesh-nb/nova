@@ -28,10 +28,10 @@ pub struct CtrlRouter {
     }
 
     pub fn matchRoute(self: CtrlRouter, method: string, path: string): Route | undefined {
-        let len = self.routes.len;
+        let len = self.routes.size();
         let i = 0;
         while (i < len) {
-            let r = self.routes.get(i);
+            let r = self.routes.at(i);          // .at is trapping (Route); .get returns an OPTIONAL,
             if (string.eql(r.method, method) && string.eql(r.path, path)) {
                 return r;
             }
