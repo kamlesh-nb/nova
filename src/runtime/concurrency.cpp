@@ -101,7 +101,11 @@ struct Reactor {
     explicit Reactor(int i) : id(i) {}
 };
 std::vector<Reactor *> &g_reactors = *new std::vector<Reactor *>{new Reactor(0)};
-// (accessors reactor_at/reactor_count arrive in P1 when coroutine→reactor affinity uses them.)
+// P1: the reactor the CURRENT worker thread serves. In P0/P1 every thread serves the single
+// reactor 0, so this stays 0; P3 (one pinned thread per reactor) sets it per reactor thread.
+// DISTINCT from g_nova_tid (the thread index used by per-thread lock-free pools) — in P0/P1 N
+// threads share reactor 0 so tids span 0..N-1 while reactor_id is 0; in P3 they coincide.
+thread_local int g_reactor_id = 0;
 // The historical name, now bound to reactor 0. Every existing use routes through the pool.
 boost::asio::io_context &g_io = g_reactors[0]->io;
 
@@ -161,14 +165,19 @@ struct CoroState {
     // inside raw_coro_resume() / still reading the frame. The scheduler performs
     // the destroy once it is done. See nova_coro_release().
     bool destroy_when_idle = false;
-    // M3-D-7: per-coroutine strand. All of this coroutine's resumes are posted here,
-    // and its async socket-op completions are bound here, so every operation on the
-    // socket it owns runs serially (never concurrently on two io_context threads).
-    // This is Asio's thread-safety requirement — a single tcp::socket must not be
-    // touched from multiple threads without a strand (each connection = one coroutine
-    // = one socket, so a per-coroutine strand is exactly a per-socket strand).
+    // P1: this coroutine's REACTOR AFFINITY — captured at creation from the creating thread's
+    // g_reactor_id and never changed. A coroutine (and the socket it owns) lives entirely on this
+    // reactor. In P0/P1 there is one reactor so this is 0; P3 makes it meaningful. A `spawn`ed
+    // child's CoroState is created on the parent's thread, so the child inherits the parent's reactor.
+    int reactor_id;
+    // M3-D-7: per-coroutine strand, now built from THIS coroutine's reactor (identical to the old
+    // `make_strand(g_io)` while there is one reactor). All of this coroutine's resumes are posted
+    // here and its async socket-op completions are bound here, so every operation on the socket it
+    // owns runs serially. Asio requires this: a single tcp::socket must not be touched from multiple
+    // threads without a strand. Once P3 makes each reactor single-threaded the strand is a free
+    // no-op (no contention on a one-thread io_context); dropping it then is an optional optimization.
     boost::asio::strand<boost::asio::io_context::executor_type> strand;
-    CoroState() : strand(boost::asio::make_strand(g_io)) {}
+    CoroState() : reactor_id(g_reactor_id), strand(boost::asio::make_strand(g_reactors[reactor_id]->io)) {}
 };
 std::mutex &g_corostates_mu = *new std::mutex();
 std::unordered_map<long long, std::shared_ptr<CoroState>> &g_corostates =

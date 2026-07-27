@@ -48,13 +48,22 @@ Introduce `struct Reactor { io_context io; int id; }` and a `g_reactors` vector;
 `g_reactors[0].io` instead of `g_io`. Keep N=1. **Prove:** full suite + ASAN identical. This is pure
 plumbing — isolates the mechanical `g_io → reactor.io` substitution from any semantic change.
 
-### P1 — Coroutine → reactor affinity + drop strands
-- `CoroState` gains `int reactor_id` (set at creation to the creating thread's reactor; the block-drive
-  caller uses reactor 0). Replace `strand` with `reactors[reactor_id].io.get_executor()`; `bind_executor`
-  / `post` targets that. A coroutine never changes `reactor_id`.
-- `spawn` (child coroutine) inherits the **parent's** `reactor_id` (same core, no cross-core spawn).
-- **Prove:** with N=1 still identical; async gates green. (Migration is now forbidden but N=1 never
-  migrated anyway — this de-risks before going multi-reactor.)
+### P1 — Coroutine → reactor affinity (strands STAY) ✅
+CORRECTION found while implementing: strands **cannot be dropped at P1**. Today N threads share ONE
+io_context and the strand is what serializes each coroutine's ops across those threads; dropping it before
+reactors are single-threaded (P3) would race. So P1 only adds the *affinity*, and routes the strand
+**through the reactor**:
+- `thread_local int g_reactor_id` (the reactor the current worker serves; 0 in P0/P1; per-reactor in P3).
+  Distinct from `g_nova_tid` (thread index) — they coincide only in P3 (one thread per reactor).
+- `CoroState` gains `int reactor_id = g_reactor_id` (captured at creation, never changed); the strand is
+  built from `g_reactors[reactor_id]->io` instead of `g_io` — identical while there is one reactor.
+- `spawn`'s child CoroState is created on the parent's thread, so it **inherits the parent's reactor**
+  automatically (no cross-core spawn).
+- The 9 `bind_executor(state->strand, …)` sites are unchanged — they already route through the strand,
+  which now comes from the right reactor.
+- Once P3 makes each reactor single-threaded, a strand on a one-thread io_context is a **free no-op**;
+  *dropping* it is then an optional micro-opt, not a correctness step.
+- **Proven:** N=1 identical — native 177/177, ASAN clean.
 
 ### P2 — Per-reactor thread_local state maps; delete global mutexes
 - `g_corostates`, `g_waiters`, `g_heldargs` → `thread_local` per reactor thread. Delete `g_corostates_mu`,
