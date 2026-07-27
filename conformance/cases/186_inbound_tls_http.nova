@@ -1,0 +1,69 @@
+// 186 — W6 inbound TLS: an in-process HTTPS request/response. A server coroutine terminates a
+// server-side TLS handshake over an accepted socket (exactly what App does when useTls is set), reads
+// an HTTP request over the encrypted TlsStream, and writes an HTTP response; a client coroutine
+// TLS-connects and checks the response body. This proves HTTP framing works over TLS through the
+// `AsyncIO.recvInto(buf: long, ...)` seam (widened from int so a 64-bit heap buffer address is not
+// truncated). Deterministic + self-contained (loopback, embedded self-signed cert). ASAN-clean.
+import assert;
+import bytes;
+import string;
+import net.asyncio;
+import net.asynctls;
+
+const TEST_CERT = "-----BEGIN CERTIFICATE-----\nMIIDCTCCAfGgAwIBAgIUXYJILGOsiiYsDjHOvZ1Xb1c3EUkwDQYJKoZIhvcNAQEL\nBQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDcyMzA1MDMzMloXDTM2MDcy\nMDA1MDMzMlowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF\nAAOCAQ8AMIIBCgKCAQEAlBQkJXZPisGMG8h3N963wGpDxkeonjabG6HLFbzRAV+n\n28cBvwmpOwpkKP1oNDjUltaEl+wodZ0PJLBx971Bnpsg8wKc2vIuoCJ8kOCyceF9\nt23X9SQZDixKu9JkSS0PauRYj+Es3aqsosqncdIMY9dAkqimHNQ9VnUbyyzfmLYz\nyR+cjYKEsP5WMhahQH5YTIknQ6gMYVMxgJGQgToUcdDzQbk6nuujbCCeLsg4u97p\nhGoUkqlzVrP65RHHnLFyYLaBlx2B3cEuagbBjrxdPLZAzk7wgfQ/Tc/6uB6xXL6M\ntoiPB/JDfcsG6jAtjO5+vEbSvYC9FOsvFWM69eFiOwIDAQABo1MwUTAdBgNVHQ4E\nFgQURsvKK8ITIsnGGpc+Qg6QxKh/WFIwHwYDVR0jBBgwFoAURsvKK8ITIsnGGpc+\nQg6QxKh/WFIwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEABGd7\nat1U5T+os28HCqYJjnoy3CvzRg/Cn20UyhJUs8G7J4CJY/50qohLAoornDWX/Eit\n/IcsXchSC0c35meMdoKQjibWK/g4w4pI/uqvySZC6bA0ei875y86dsx+/vY2SSyb\n0xDYfmkUrSqSvOqJy0w6Tjn+WCZFdFCG7uz7NG+TENRiJpnxcxY5sQtiOCT2/K/2\nrGBp7q85HyWSVdA7ANTiHBOQxD58/VwIXZuLMPR+jhvP1vN61KDDr8tjPHDhV5m7\n6zj28YJgx7e7AX5CNjTylyXLAxE3jtQGpvLr6dPL0o2SY2Nc+SWinlTxjeboQnFl\nBvrhdLSBEwYcdKQyEg==\n-----END CERTIFICATE-----\n";
+const TEST_KEY = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCUFCQldk+KwYwb\nyHc33rfAakPGR6ieNpsbocsVvNEBX6fbxwG/Cak7CmQo/Wg0ONSW1oSX7Ch1nQ8k\nsHH3vUGemyDzApza8i6gInyQ4LJx4X23bdf1JBkOLEq70mRJLQ9q5FiP4Szdqqyi\nyqdx0gxj10CSqKYc1D1WdRvLLN+YtjPJH5yNgoSw/lYyFqFAflhMiSdDqAxhUzGA\nkZCBOhRx0PNBuTqe66NsIJ4uyDi73umEahSSqXNWs/rlEcecsXJgtoGXHYHdwS5q\nBsGOvF08tkDOTvCB9D9Nz/q4HrFcvoy2iI8H8kN9ywbqMC2M7n68RtK9gL0U6y8V\nYzr14WI7AgMBAAECggEADv+TQbAgEl/UPyQo3yHR3s1km/q6G3xQbZYPqd38FXWI\n3PvlM2JZH7/HsVcpbNCsx7Jmr7SdzHviAsdUY9FpihUQW0zScmLBUjrr/wijSmGa\niC+6BfxoBUV7NFb1DWxg+WSzi681Cia1Ya/BEghCdQJiafhnCth8dftam1OqOh9i\n1mWZID/jDZZ8V0fhAU3sf/e8Aht8JY4lTD1Yf/P339tumPpU6f+dIL+wM5pAmbd8\nWgH6CV6v2wLz8GHfeGKX0OSfh3OrTJ+lmVxd8S0dfoq2/lUvgd8JPI2cFsiFMMKj\n7Vt42RoWJRZJN+7EkaWApgzEaaEo/CoN0rHUnX9gIQKBgQDMap7CeQGseLnVRRrO\nk5HI4nvom50RCM0n5jKq7AEGQ+2SjcYmekdJ7hC4wJIA55bDRezaLt4Cn0q0Tc2X\nbhsxkQste7/MFj9itkNoI/4QAghtAzA9+6gJaeHz3oFA/u+YyTyrhgORMy7ORDaR\nYNTdKYM8XrZHnxXn+pvs7CdaUwKBgQC5chP12nYStLLhvCaeuGF/1n1lJrZviwiW\nqXaztKyusm1ZSFCkwJT0+dOyZY43rRh6uQnqHvcgbxuRR6x51TBav0znMbAihhAY\nVQv1AlfsDnl5C9OTyRKgqAsA5VDFZK39uQY7G2Ns+2Ega6n9ppUbiSUkH3tzyhkT\ntL8nzn1reQKBgQCx1eQOPeW13UWWg8shgoJm6Jpxr8fCRQzuNDdKOY1enQP25r5H\nRUP1zlXf1TBv9wpTEedPnUxprZj5KWK95f1kbtHxnOIsNAKq5vPXitCBrrMT251B\nn0j9/46icaWzHNbm7dOJSUqbLJMAwZlTepFVYsMYZzFfN8iAC6dRQ9WsnwKBgCY2\n1Ngn4YbvR6FuxUKV2jmeuI5ckOGhc+6gEz7q7168k/3/AedBbDCjPrWXadwdRlsb\nwGhHY0OCwdqJO4iLnwBERZOq0JH8sFpjRCiECBwzy2JfRoVAvR7wIfxYRPG4UoZj\nV15cwXtWvegRZ6FGb5mSBF5SQn1U2yANcgrA6WV5AoGAGU9279SsfUt/26AAtoYW\n0zKbkYiSY2is79xp4sDFiLgzmAAsEr6jJBqxeFY0l7CIymDEt/zxY70Euf7JwQb1\nkRefhMOY8IGJbrvEy+98vXTYEAq8zI754/1ZiM7h2MIfrcceN42h/UA5HluCVYFX\nY2tfjS5SorpgKNIHAbvKGPM=\n-----END PRIVATE KEY-----\n";
+
+fn toStr(buf: long, n: int): string {
+    if (n <= 0) { return ""; }
+    let out = bytes.alloc(n);
+    let i = 0;
+    while (i < n) { bytes.write_byte(out, i, bytes.read_byte(buf, i)); i = i + 1; }
+    return out as string;
+}
+
+async fn httpsServer(srv: long): int {
+    let client = await asyncio.aaccept(srv);
+    let base = asyncio.AsyncStream(client);
+    let ts = await asynctls.tlsAccept(base, TEST_CERT, TEST_KEY);
+    if (!ts.ok()) { ts.close(); return -1; }
+    let buf: long = bytes.alloc(1024);              // long: the recv address must NOT truncate
+    let n = await ts.recvInto(buf, 1024);           // pass the 64-bit address directly (widened seam)
+    let req = toStr(buf, n);
+    bytes.free(buf);
+    let ok = string.startsWith(req, "GET /ping");
+    let body = if (ok) "{\"ok\":true}" else "{\"ok\":false}";
+    let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + `${body.length}` + "\r\nConnection: close\r\n\r\n" + body;
+    let w = await ts.sendStr(resp);
+    ts.close();
+    return n;
+}
+
+async fn httpsClient(port: int): string {
+    let ts = await asynctls.tlsConnect("localhost", port, false);
+    if (!ts.ok()) { return "HS-FAIL"; }
+    let w = await ts.sendStr("GET /ping/7 HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let buf: long = bytes.alloc(1024);
+    let n = await ts.recvInto(buf, 1024);
+    let resp = toStr(buf, n);
+    bytes.free(buf);
+    ts.close();
+    // Return just the body (after the header terminator) for a clean assert.
+    let idx = string.indexOf(resp, "\r\n\r\n");
+    if (idx == -1) { return resp; }
+    return string.slice(resp, idx + 4, resp.length);
+}
+
+async fn httpsRoundtrip(port: int): string {
+    let srv = asyncio.serverListen(port);
+    if (srv == 0) { return "BIND-FAIL"; }
+    spawn httpsServer(srv);
+    let reply = await httpsClient(port);
+    asyncio.aclose(srv);
+    return reply;
+}
+
+@test
+fn test_inbound_tls_http(): void {
+    // A full HTTPS request -> HTTP response over an async TLS session.
+    assert.equalStr(httpsRoundtrip(18486), "{\"ok\":true}");
+}

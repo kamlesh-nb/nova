@@ -20,6 +20,8 @@
 // 68_generic_method_mono.nova.
 
 import net.asyncio;
+import net.asynctls;
+import io.file;
 import web.request;
 import web.response;
 import web.status;
@@ -322,6 +324,13 @@ pub struct App {
     pub maxHeaderBytes: int,
     pub maxBodyBytes: int,
 
+    // W6 inbound TLS: when enabled, each accepted connection is wrapped in a server-side TLS session
+    // (wolfSSL memory-BIO, pumped by Nova async) before the HTTP framing loop runs — HTTPS termination
+    // in-process, no external proxy. cert/key are PEM text loaded from disk by `useTls`.
+    pub tlsEnabled: bool,
+    pub tlsCert: string,
+    pub tlsKey: string,
+
     init() {
         self.routes = List<AppRoute>();
         self.mediator = AppMediator();
@@ -332,6 +341,23 @@ pub struct App {
         self.readTimeoutMs = 30000; // 30s per-read deadline
         self.maxHeaderBytes = 32768; // 32 KB header block
         self.maxBodyBytes = 1048576; // 1 MB body
+        self.tlsEnabled = false;
+        self.tlsCert = "";
+        self.tlsKey = "";
+    }
+
+    /// W6: terminate TLS in-process. `certPath`/`keyPath` are PEM files (server certificate + private
+    /// key); once set, `run` serves HTTPS — every accepted connection completes a server-side TLS
+    /// handshake (wolfSSL, pumped by Nova async) before the HTTP pipeline. Empty/unreadable files leave
+    /// TLS disabled (plaintext). All crypto stays in wolfSSL; only the record pump is Nova async.
+    pub fn useTls(self: App, certPath: string, keyPath: string): void {
+        let cert = File.readText(certPath);
+        let key = File.readText(keyPath);
+        if (cert.length > 0 && key.length > 0) {
+            self.tlsCert = cert;
+            self.tlsKey = key;
+            self.tlsEnabled = true;
+        }
     }
 
     /// W6: tune the per-connection hardening limits. `readTimeoutMs<=0` disables the read deadline.
@@ -703,7 +729,11 @@ fn bufMethodPath(buf: long, len: int): (string, string) {
     return (method, path);
 }
 
-async fn handleConn(app: App, client: long): int {
+// One connection's HTTP/1.1 keep-alive loop, over ANY async transport (`io`): a plaintext
+// `AsyncStream` or a TLS `TlsStream` — both impl `AsyncIO`, so plaintext and HTTPS share this exact
+// framing loop (the recv/send are trait calls; the zero-copy buffer scanning is identical). `io` owns
+// its socket; `io.close()` shuts it down.
+async fn handleConn(app: App, io: AsyncIO): int {
     let cap = 65536;
     let buf: long = bytes.alloc(cap);        // `long`: pointer arithmetic (buf + off) must stay 64-bit
     // Zero-copy framing: bytes accumulate in `buf` (valid range [0, len)); requests are framed by
@@ -714,17 +744,19 @@ async fn handleConn(app: App, client: long): int {
     let len = 0;
     let alive = true;
     let tmo = app.readTimeoutMs;
+    // Per-recv deadline (slow-loris): recvInto applies the stream's timeout on every read.
+    let _ = io.setTimeout(tmo);
     while (alive) {
         // Accumulate until the full header block is present — bounded by `maxHeaderBytes` (→ 431) and a
         // per-read deadline (a stalled peer is closed, never parked forever — slow-loris protection).
         let hdrEnd = bufFindHeaderEnd(buf, 0, len);
         while (hdrEnd == -1) {
             if (len >= app.maxHeaderBytes || len >= cap) {
-                await asyncio.async_write(client, errResponse(431, "Request Header Fields Too Large"));
+                await io.sendStr(errResponse(431, "Request Header Fields Too Large"));
                 alive = false;
                 break;
             }
-            let hn = await asyncio.async_read_deadline(client, buf + len, cap - len, tmo);
+            let hn = await io.recvInto(buf + len, cap - len);
             if (hn <= 0) { alive = false; break; }   // -2 deadline, -1 error, 0 EOF
             len = len + hn;
             hdrEnd = bufFindHeaderEnd(buf, 0, len);
@@ -733,7 +765,7 @@ async fn handleConn(app: App, client: long): int {
 
         // Honor `Expect: 100-continue` — acknowledge so the client sends the body.
         if (bufFindCI(buf, 0, hdrEnd, "expect: 100-continue") != -1) {
-            await asyncio.async_write(client, "HTTP/1.1 100 Continue\r\n\r\n");
+            await io.sendStr("HTTP/1.1 100 Continue\r\n\r\n");
         }
 
         let bodyStart = hdrEnd + 4;
@@ -747,12 +779,12 @@ async fn handleConn(app: App, client: long): int {
             let cend = bufChunkedEnd(buf, bodyStart, len);
             while (cend == -1) {
                 if ((len - bodyStart) >= app.maxBodyBytes) {
-                    await asyncio.async_write(client, errResponse(413, "Payload Too Large"));
+                    await io.sendStr(errResponse(413, "Payload Too Large"));
                     alive = false;
                     break;
                 }
                 if (len >= cap) { alive = false; break; }
-                let bn = await asyncio.async_read_deadline(client, buf + len, cap - len, tmo);
+                let bn = await io.recvInto(buf + len, cap - len);
                 if (bn <= 0) { alive = false; break; }
                 len = len + bn;
                 cend = bufChunkedEnd(buf, bodyStart, len);
@@ -765,13 +797,13 @@ async fn handleConn(app: App, client: long): int {
             // Content-Length framing. Reject an over-cap body up front (→ 413).
             let need = bufContentLength(buf, 0, hdrEnd);
             if (need > app.maxBodyBytes) {
-                await asyncio.async_write(client, errResponse(413, "Payload Too Large"));
+                await io.sendStr(errResponse(413, "Payload Too Large"));
                 alive = false;
                 break;
             }
             while (len - bodyStart < need) {
                 if (len >= cap) { alive = false; break; }
-                let bn = await asyncio.async_read_deadline(client, buf + len, cap - len, tmo);
+                let bn = await io.recvInto(buf + len, cap - len);
                 if (bn <= 0) { alive = false; break; }
                 len = len + bn;
             }
@@ -799,7 +831,7 @@ async fn handleConn(app: App, client: long): int {
                 bytes.read_string(buf, reqEnd);
             out = await app.respondMiss(raw, method, path);
         }
-        await asyncio.async_write(client, out);
+        await io.sendStr(out);
 
         // Shift any leftover bytes (a pipelined next request) to the front of the buffer.
         let leftover = len - reqEnd;
@@ -814,7 +846,7 @@ async fn handleConn(app: App, client: long): int {
 
         if (wantClose) { alive = false; }
     }
-    asyncio.aclose(client);
+    io.close();
     bytes.free(buf);
     return 0;
 }
@@ -830,9 +862,31 @@ async fn acceptLoop(app: App, port: int): int {
     }
     while (true) {
         let client = await asyncio.aaccept(srv);
-        spawn handleConn(app, client);
+        if (app.tlsEnabled) {
+            spawn handleConnTls(app, client);
+        } else {
+            spawn handleConnPlain(app, client);
+        }
     }
     return 0;
+}
+
+// Plaintext: wrap the accepted socket in an AsyncStream (an AsyncIO) and serve.
+async fn handleConnPlain(app: App, client: long): int {
+    return await handleConn(app, asyncio.AsyncStream(client));
+}
+
+// TLS (W6): complete a server-side TLS handshake over the accepted socket, then serve HTTP over the
+// encrypted TlsStream (also an AsyncIO — same framing loop). A failed handshake closes and drops the
+// connection. wolfSSL owns the crypto; only the record pump is Nova async.
+async fn handleConnTls(app: App, client: long): int {
+    let base = asyncio.AsyncStream(client);
+    let tls = await asynctls.tlsAccept(base, app.tlsCert, app.tlsKey);
+    if (!tls.ok()) {
+        tls.close();
+        return -1;
+    }
+    return await handleConn(app, tls);
 }
 
 // P4c share-nothing accept fan-out: one accept loop per reactor. ASYNC (so it can `spawn`); reached

@@ -53,7 +53,7 @@ pub struct TlsStream impl AsyncIO {
 
     // Pull ciphertext from the socket and feed it to wolfSSL (parks on recv). <=0 = closed/error.
     pub async fn pumpIn(self: TlsStream): int {
-        let n = await self.base.recvInto(self.scratch as int, self.cap);
+        let n = await self.base.recvInto(self.scratch as long, self.cap);
         if (n <= 0) { nova_mtls_mark_closed(self.ctx); return n; }
         nova_mtls_feed(self.ctx, self.scratch, n);
         return n;
@@ -82,7 +82,7 @@ pub struct TlsStream impl AsyncIO {
 
     // Decrypt into `buf` (up to `max`); parks pumping ciphertext until a record is ready.
     // Returns plaintext bytes (>0), 0 = peer closed, -1 = error.
-    pub async fn recvInto(self: TlsStream, buf: int, max: int): int {
+    pub async fn recvInto(self: TlsStream, buf: long, max: int): int {
         while (true) {
             let n = nova_mtls_read(self.ctx, buf, max);
             if (n > 0) { return n; }

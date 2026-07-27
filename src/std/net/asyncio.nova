@@ -116,7 +116,10 @@ pub fn aclose(sock: long): void {
 // (encrypted, net/asynctls), so a driver picks plaintext-vs-TLS at connect time WITHOUT
 // touching its read/write code — the reader just holds an `AsyncIO`.
 pub trait AsyncIO {
-    async fn recvInto(self, buf: int, max: int): int;
+    // `buf` is a raw heap address — MUST be `long` (64-bit). Passing it as `int` truncates the
+    // pointer (LLVM inttoptr on an i32) → SIGSEGV for any address above 2GB. An `int` argument still
+    // widens cleanly, so this is backward-compatible with existing `as int` call sites.
+    async fn recvInto(self, buf: long, max: int): int;
     async fn sendStr(self, data: string): int;
     fn close(self): void;
     // Bound every subsequent `recvInto` to `ms` milliseconds (an awaited per-recv deadline; a
@@ -133,7 +136,7 @@ pub struct AsyncStream impl AsyncIO {
     // Await bytes into `buf` (a raw pointer as int, capacity `max`). Returns bytes read
     // (0 = peer closed, -1 = error, -2 = deadline elapsed when a timeout is set). Parks the
     // coroutine until data arrives (or the deadline fires).
-    pub async fn recvInto(self: AsyncStream, buf: int, max: int): int {
+    pub async fn recvInto(self: AsyncStream, buf: long, max: int): int {
         if (self.timeoutMs > 0) { return await async_read_deadline(self.sock, buf, max, self.timeoutMs); }
         return await async_read(self.sock, buf, max);
     }
