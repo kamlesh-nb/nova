@@ -24,6 +24,31 @@ An item is **never** ✅ on "it compiles" or "the happy path works" — only on 
 
 ---
 
+## ✅ Recently completed (2026-07-28 session) — async soundness + orchestrator perf (branch `async-coloring-deadlock-fix`, PR #2)
+
+- **A2 — async function-coloring soundness + the sync→async deadlock fixed ✅** (`dd2a9ea`). A sync web
+  request handler that drove an `async fn` DB call NESTED-block-drive-DEADLOCKED (silent hang) under a live
+  server. Fixed in three coordinated parts: (1) **runtime nested-block-drive guard** — a thread-local
+  run-depth counter around every `io.run()`; `nova_run_root` aborts LOUDLY (SIGABRT) instead of hanging when
+  a block-drive is attempted from inside the event loop; (2) **call-side function coloring** — a bare
+  (non-`await`/`spawn`) call to an `async fn` inside an `async fn` is now a typecheck error (the `await`-in-
+  sync half already existed); deliberately narrower than "forbid all sync→async" so the tested sync-top-level
+  drive (case 111) stays legal. It immediately caught **2 real latent block-drive bugs** (missing `await` in
+  `queryPrepared`/`execPrepared`, cases 64 & 159); (3) **async web handler chain** — `MessageHandler.handle`
+  → `AppMediator.send` → `App.dispatch` → `App.respondMiss` are all `async fn` now, awaited from the async
+  accept-loop coroutine, so **per-request DB works** (flagship: real `await repo.productName(id)` through the
+  fetched nova-postgres driver — the flow that used to hang). Gates `185_async_handler_chain` +
+  expect_fail `bare_async_call_in_async`; specs.md §9 documents coloring. Native **179/179**, ASAN **327/327**.
+- **`nova build` relink-on-runtime-change ✅** (`1973cf5`) — the T6 cache keyed only on `.nova` source
+  content, so a runtime-only edit (re-synced `~/.nova/lib/libnova_runtime.a`) left the hash unchanged and
+  kept the OLD runtime linked (`rm -rf build` workaround). `linkLibsStamp` now folds the linked static libs'
+  mtimes into the cache key → a runtime change forces a relink; unchanged sources still cache-hit.
+- **Orchestrator perf test (flagship in orch) ✅** — flagship behind `nova-orchestrator`'s `net.proxy` Pool
+  (round-robin) over 3 replicas (`NOVA_PORT` added for multi-replica runs). 8-core mac, release: **~47.6k
+  rps** `GET /` through the proxy vs ~48.9k direct (near-zero LB overhead, 100% success); **~10.2k rps** on
+  the per-request DB path (each request opens a real TCP connect). LB verified **20/20/20** perfect
+  round-robin across replicas.
+
 ## ✅ Recently completed (2026-07-27 session) — network stack + hardening (all pushed, origin/main `561d9de`)
 
 - **N1 — Network I/O stack: share-nothing thread-per-core on Asio (Path A), P0→P5 + P2 ✅.** Decided over
@@ -128,6 +153,7 @@ not instead of finishing it.
 | **D6** | Driver **hardening + completeness DONE**: timeouts + pooling + circuit-breaker + **all auth** (MySQL fast **& RSA full**, **PG SCRAM**) + **real server-side prepared statements on all 4 engines** (PG extended-query, MySQL COM_STMT binary, MSSQL sp_prepare RPC, BTreeDB); live on all. Async-recv now DONE under A1 (async-first seam → drivers non-blocking) | P3 | ✅ | `104`–`110` + driver gates + live | (this session) |
 | **E1** | Error model `T \| Error` — `try`/`catch`/`catch (e)` + **`errdefer`** ✅; unguarded `.field` on `T\|E` = located typecheck error; `throw` removed (two-register-return = deferred perf opt) | P4 | ✅ | `32`/`33`/`45`/`101_errdefer` + `errunion_unguarded` | (this session) |
 | **A1** | async: **`future<T>` first-class** ✅ + **`when_all`/`parallel_for` fan-out/join** ✅ + **async METHODS + async TRAIT methods w/ dynamic dispatch** ✅ + **AsyncStream (parking socket I/O)** ✅ + **non-blocking TLS** (wolfSSL memory-BIO pumped by Nova async; crypto stays in wolfSSL) ✅ + **AsyncIO trait** ✅ + **async-first `Connection` seam — ALL 5 drivers non-blocking** ✅ (PG+MySQL LIVE-PROVEN: 5 concurrent server-side sleeps on ONE scheduler thread overlap ~0.3–0.7s vs ~1.5s serial; MSSQL TDS-tunneled async TLS; MongoDB async live) + **async `Driver.connect` → pooling works INSIDE coroutines** ✅ (live: concurrent handlers each `await pool.acquire()`+query+release, second wave reuses idle conns) + **awaited-deadline recv timeouts** ✅ (`Connection.setTimeout` real on the async transport — recv raced against a timer, `nova_arecv_deadline`; live: `pg_sleep(1)` under 150ms → empty in ~0.15s) + **`select` over futures** ✅ (`selectAny<T>` — await first of N, non-consuming) + **whole-query deadline** ✅ (`withTimeout<T>`/`selectTimeout<T>`; live: `pg_sleep(2)` bounded to 300ms) + **actor stdlib layer** ✅ (`Mailbox<M>`+`Behavior<M>` trait+`runActor<M>`; required **generic trait objects**, also fixed) + **generic-return typecheck** ✅ (`foo<int>()` result resolves `T`→`int`, `List<T>`→`List<int>`, etc.). **A1 COMPLETE** | P4 | ✅ | `102_future_first_class`, `103_async_when_all`, `111`–`119` (async_trait / stream / tls / timeout / select / whole_query_deadline / actor / generic_return) | `e645bb7`,`bdf60f2`,(this session) |
+| **A2** | **async function-coloring soundness + sync→async deadlock FIXED** ✅ — (1) runtime nested-block-drive guard (thread-local `io.run()` depth; `nova_run_root` aborts LOUD instead of hanging); (2) call-side coloring: a bare (non-`await`/`spawn`) async call inside an `async fn` is a typecheck error (caught 2 real latent bugs); (3) async web handler chain (`handle`/`send`/`dispatch`/`respondMiss` all async) → **per-request DB works** (flagship real query, was a hang). Narrower than "forbid all sync→async" so the sync-top-level drive (case 111) stays legal | P0 soundness | ✅ | `185_async_handler_chain` + `bare_async_call_in_async` | `dd2a9ea` (PR #2) |
 | **S1** | serde completeness — exact decimal in JSON/YAML via manual API **and** `@serializable` structs ✅ + 2 pre-existing yaml ARC/co-import bugs fixed ✅ (F4-6 reparse-removal relocated to T6-1b; streaming = future enhancement) | P4 | ✅ | `96`–`99` (`serde_decimal_json/yaml`, `coimport`, `struct_decimal`) | `92b507f`, `9d7553a`, `0f41faa` |
 | **S2** | regex engine (bytecode-VM backtracking) + foundational early-`return`-in-loop double-free fix | P4/Tier3 | ✅ | `92_regex`, `93_loop_early_return_arc` | `54e31b4` |
 | **S3** | decimal follow-ups: div/mod-by-zero TRAP + explicit `int↔decimal` conv | Tier3 | ✅ | `94_decimal_conv` | `8541922` |
@@ -140,7 +166,7 @@ not instead of finishing it.
 | **W1** | Webview in the runtime (desktop GUI over HTML/JS/NSX) | ⭐P3 | ✅ | `webview_*` (manual) + `83`/`84` | `513ecf2`+`29a1f07` |
 | **W2** | `App.useStatic(...)` — static content store + LRU cache | ⭐P3 | ✅ | `85_static_content` | `ddd2c08` |
 | **W3** | Circuit breaker for the OUTBOUND TCP/TLS client (external calls) | ⭐P4 | ✅ | `86_circuit_breaker` | `a63ffa4` |
-| **T6** | Phase 1a ✅ (`nova build` + `build/<profile>/{obj,bin}` + content-hash cache); Phase 2 dead-strip ✅ (71% smaller); **Phase 1b per-file `.o` split ✅ DONE** — clone-and-strip emission loop + per-file content-hash cache (globaldce-before-hash) + default-on (`NOVA_T6_NOSPLIT` escape hatch); one-file-body edit → 25/26 objects cached. **F4-6 satisfied** (generated serde/mediator units are their own cached `.o`; no reparse-removal needed). Remaining: Phase 3 per-unit checking (gated on F2-6/F4/F5) | ⭐user P5 | ● | `nova build` split default; corpus 148/148 + 270/270 ASAN under split; 25/26 incremental | `1b85154`,`af4932a`,`4d1bb61`,`7077596`,`0e19e62` |
+| **T6** | Phase 1a ✅ (`nova build` + `build/<profile>/{obj,bin}` + content-hash cache); Phase 2 dead-strip ✅ (71% smaller); **Phase 1b per-file `.o` split ✅ DONE** — clone-and-strip emission loop + per-file content-hash cache (globaldce-before-hash) + default-on (`NOVA_T6_NOSPLIT` escape hatch); one-file-body edit → 25/26 objects cached. **F4-6 satisfied** (generated serde/mediator units are their own cached `.o`; no reparse-removal needed). Remaining: Phase 3 per-unit checking (gated on F2-6/F4/F5). **Relink-on-runtime-change FIXED** (`1973cf5`): `linkLibsStamp` folds libnova_runtime.a + libwolfssl.a mtimes into the cache key so a runtime-only edit forces a relink (was `rm -rf build`) | ⭐user P5 | ● | `nova build` split default; corpus 148/148 + 270/270 ASAN under split; 25/26 incremental | `1b85154`,`af4932a`,`4d1bb61`,`7077596`,`0e19e62`,`1973cf5` |
 | **W4** | **DI through `App` + constructor injection — ✅ COMPLETE (100%).** di.nova stores services as owned **`Service`** trait objects; `App` owns a `ServiceProvider` (`useServices`/`app.provider`); **all 3 lifetimes** `addSingleton`/`addScoped`/`addTransient` + **per-request `ServiceScope`** (`createScope`); **type-keyed generics** `addSingletonType<T>`/`addScopedType<T>`/`addTransientType<T>` + `resolveType<T>`; **`handleFrom<T>((sp) => H(sp.require("Db") as Db))`** builds the handler PER REQUEST from the scope with ctor-injected deps (+ the plain `handle<T>(instance)` path). Gates `123`/`124`/`125` (scoped-vs-singleton, per-request scope, transient, generics; ARC-clean). Enabled by **3 general compiler fixes** (closure-return trait widening; closure-collection recursion into `??`/`.cast`; **closure-arg param typing for GENERIC method calls**) | ⭐user P2 | ✅ | `123`/`124`/`125` di gates + 151/151 + 276/276 ASAN | (this session) |
 | **H3** | **Test infrastructure** — consolidate the project-wide `@test` runner (`nova test` already scans/collects across files; add suite UX + docs) + **relocate corpus cases into their owning stdlib modules** (compiler/language-only tests stay in `conformance/`) | ⭐user P3 | ⬜ | (design below) | — |
 | **T7** | **Rename async socket primitives** — `arecv`→`async_read`, `asend`→`async_write` (user said `awrite`; the write side is `asend`), `arecvDeadline`→`async_read_deadline` | ⭐user P5 | ✅ | corpus 148/148 + 270/270 ASAN | (this session) |
@@ -159,6 +185,12 @@ not instead of finishing it.
 | **Z1** | **Docs: technical architecture (Nova / BTreeDB / orchestrator) + contributor onboarding guides** — architecture deep-dives per project + "how to add a feature" onboarding (compiler+LLVM flagship, btree, orchestrator). Onboarding v1 authored 2026-07-24 (`docs/onboarding/`); architecture deep-dives pending | P3 | 🔨 | onboarding v1 done | — |
 
 Legend for the "◑" rows: partially landed; the *remaining* scope is the design below.
+
+**Latest (2026-07-28):** corpus **179/179 functional, 327/327 ASAN** clean; ARC-audit at floor. **~38 of 48
+items ✅** (A2 added: async coloring/deadlock; N1/R1/I1/I2/I3/I4 infra all done). Partial (5): F3
+(overflow-trap by design), F4 (Itanium mangling only), T1 (LLVM-mirror upload), T6 (Phase-3 checking),
+W6 (inbound TLS). Not started (4): **T2** (WASM audit), **H3** (test-infra consolidation), **D7** (DB
+production-readiness), **BT1** (BTreeDB concurrency, separate repo). Docs: **Z1** 🔨 (onboarding v1 done).
 
 **Current state (2026-07-24):** corpus **151/151 functional, 276/276 ASAN** clean; ARC-audit at floor. **29 of 46
 items ✅** (3 ◑ partial, 1 🔨 [Z1-onboarding], 13 not started). **This session (autonomous, language-first):** T7
