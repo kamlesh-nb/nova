@@ -29,17 +29,17 @@ pub struct Watcher {
 }
 
 fn writeFsFile(path: string, content: string): void {
-    io.file.File.writeText(path, content);
+    file.File.writeText(path, content);
 }
 
 @test
 fn test_fs_watcher(): void {
     let test_dir = "watch_test_dir";
-    io.dir.Dir.create(test_dir, 511); // 0o777 = 511 decimal
+    dir.Dir.create(test_dir, 511); // 0o777 = 511 decimal
 
     let watcher = Watcher(test_dir);
 
-    let d = io.dir.Dir.open(test_dir);
+    let d = dir.Dir.open(test_dir);
     let count = d.entries().len;
     d.close();
 
