@@ -936,8 +936,21 @@ void nova_aconnect(long long host, long long port, long long self) {
 
 // Async read up to max_len bytes into buf; parks self, resumes with the byte count
 // (0 = EOF/peer closed, -1 = error).
+// A null socket handle (0) reaches here when a caller does I/O on a FAILED connection (asyncConnect
+// returns 0 on refuse/timeout) without checking — e.g. a DB driver that sends its handshake before
+// testing the connect result. Dereferencing `s->sock` would SEGV the whole process; instead resume the
+// awaiting coroutine with an error (-1), so the `await` returns an error the caller can handle. (nova_aclose
+// already guards this way; asend/arecv/arecv_deadline must too.)
+static inline bool nova_io_bad_socket(NovaSocket *s, long long self) {
+    if (s) return false;
+    stash_io_result(self, -1);
+    nova_sched_schedule(self);
+    return true;
+}
+
 void nova_arecv(long long sock, long long buf, long long max_len, long long self) {
     auto *s = reinterpret_cast<NovaSocket *>(sock);
+    if (nova_io_bad_socket(s, self)) return;
     auto state = get_coro_state(self);
     s->sock.async_read_some(
         boost::asio::buffer(reinterpret_cast<char *>(buf), (size_t)max_len),
@@ -955,6 +968,7 @@ void nova_arecv(long long sock, long long buf, long long max_len, long long self
 // an indeterminate state — the caller should discard it.
 void nova_arecv_deadline(long long sock, long long buf, long long max_len, long long ms, long long self) {
     auto *s = reinterpret_cast<NovaSocket *>(sock);
+    if (nova_io_bad_socket(s, self)) return;
     auto state = get_coro_state(self);
     auto done = std::make_shared<bool>(false);
     auto timer = std::make_shared<boost::asio::steady_timer>(g_io);
@@ -983,6 +997,7 @@ void nova_arecv_deadline(long long sock, long long buf, long long max_len, long 
 // coroutine holds `data` across the suspend.
 void nova_asend(long long sock, long long data, long long self) {
     auto *s = reinterpret_cast<NovaSocket *>(sock);
+    if (nova_io_bad_socket(s, self)) return;
     auto state = get_coro_state(self);
     const char *p = reinterpret_cast<const char *>(data);
     int len = p ? *reinterpret_cast<const int *>(p - 4) : 0;

@@ -27,13 +27,12 @@ fn buildApp(): App {
 }
 
 fn main(): void {
-    // The app is wired to the nova get-fetched nova-postgres driver via ProductRepository (below,
-    // compiled + linked into this build against the db seam). A live query works from single-file
-    // `nova <f>` but currently SEGVs under `nova build` — a build-mode codegen bug tracked separately —
-    // so we don't issue the query at startup here; the repository is constructed to keep the fetched
-    // driver linked and prove the dependency is genuinely part of the app.
+    // Startup: exercise the nova get-fetched nova-postgres driver through the db seam — a REAL query,
+    // driven synchronously here (where a live DB would seed a cache). Degrades gracefully when no
+    // database is running (a failed connect now returns cleanly instead of crashing), so the app boots
+    // either way. This is a fetched package dependency executing inside the flagship.
     let repo = ProductRepository("postgresql://postgres@127.0.0.1:5432/appdb");
-    console.log("[startup] ProductRepository wired to fetched nova-postgres driver (dsn=" + repo.dsn + ")");
+    console.log("[startup] product #1 via fetched nova-postgres driver: " + repo.productName(1));
 
     let app = buildApp();
     console.log("Listening on http://127.0.0.1:8080");
