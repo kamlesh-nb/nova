@@ -1884,6 +1884,23 @@ pub const Inferer = struct {
             if (std.mem.eql(u8, fa.field, "set")) return try self.store.voidT();
             return null;
         }
+        // An ENUM instance receiver: `let v = Shape.Circle; v.name()`. methodReturn only
+        // handled `.struct_`, so an enum-method call on a VALUE (as opposed to the static
+        // `Shape.name(x)` form, which staticMethodReturn resolves) fell through to null —
+        // the return type was lost and a `+`-concatenated `string` result was numToString'd
+        // as its pointer address (same class as gate 122 BUG 1, but the instance form).
+        // findMethod already keys enum methods by the enum's name.
+        if (t == .enum_) {
+            const owner = self.symtab.symbolAt(t.enum_);
+            const mid = self.symtab.findMethod(owner.name, fa.field) orelse return null;
+            out_sym.* = mid;
+            const m = self.symtab.symbolAt(mid);
+            if (m.decl != .function) return null;
+            const ret = m.decl.function.ret_type orelse return try self.store.voidT();
+            const lowered = try self.lowerer.lower(ret);
+            if (self.store.get(lowered) == .unresolved) return null;
+            return lowered;
+        }
         if (t != .struct_) return null;
         const owner = self.symtab.symbolAt(t.struct_.decl);
         const mid = self.symtab.findMethod(owner.name, fa.field) orelse return null;

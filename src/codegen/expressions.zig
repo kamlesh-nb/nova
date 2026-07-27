@@ -1378,11 +1378,14 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     if (ids.get(name)) |slot_tid| {
                         if (self.type_store) |st| {
                             if (self.valueOptionalInner(slot_tid) != null) {
-                                const use_is_bare_prim = if (self.typeOfExprConcrete(&expr)) |ut|
-                                    st.get(ut) == .prim
-                                else
-                                    false;
-                                if (use_is_bare_prim) {
+                                // Narrowed to the bare inner VALUE: a `.prim` (int/float/…) or a
+                                // payload-LESS enum (an immediate tag, boxed by valueOptionalInner).
+                                // A payload-carrying enum is a heap box (owned) and was never boxed.
+                                const use_is_bare_value = if (self.typeOfExprConcrete(&expr)) |ut| blk: {
+                                    const uk = st.get(ut);
+                                    break :blk uk == .prim or (uk == .enum_ and !st.isOwned(ut));
+                                } else false;
+                                if (use_is_bare_value) {
                                     return try self.buildValoptUnbox(self.coerceToSlotType(loaded, self.val_type));
                                 }
                             }

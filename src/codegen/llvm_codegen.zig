@@ -668,7 +668,12 @@ pub const LlvmCompiler = struct {
         if (info != .optional) return null;
         return switch (st.get(info.optional)) {
             .prim => info.optional, // int/long/float/double/bool — a value type: box it
-            else => null, // string/decimal/struct/trait/ptr/enum: already pointer/null-representable
+            // A payload-LESS enum is an immediate integer tag: variant tag 0 collides with the
+            // null sentinel, so it must be boxed like a prim (agrees with the PRODUCE-side
+            // `valoptTypeRefIsValue`). A payload-CARRYING enum is a non-null heap box (owned) —
+            // leave it null-representable. `isOwned(.enum_)` IS the payload-carrying flag.
+            .enum_ => if (st.isOwned(info.optional)) null else info.optional,
+            else => null, // string/decimal/struct/trait/ptr: already pointer/null-representable
         };
     }
 
@@ -709,7 +714,15 @@ pub const LlvmCompiler = struct {
         if (tr != .optional) return false;
         const inner = self.typeRefToString(tr.optional.*) catch return false;
         if (std.mem.eql(u8, inner, "ptr")) return false;
-        return types_mod.cgPrim(inner) != null;
+        if (types_mod.cgPrim(inner) != null) return true;
+        // A payload-LESS enum is an immediate integer tag (a value, not a heap box), so its
+        // variant tag 0 (`Color.Red`) collides with the null/undefined sentinel of a bare
+        // pointer optional — `maybe(Color.Red) ?? default` always took the default. It must be
+        // BOXED like a prim. A payload-CARRYING enum is already a non-null heap box, so 0 = null
+        // works and it stays a reference optional (leave it out to avoid double-boxing).
+        const base = getStructBaseName(inner);
+        if (self.enums.contains(base) and !arc_mod.enumIsTaggedUnion(self, base)) return true;
+        return false;
     }
 
     /// V1 CONSUME predicate: does compiling `e` YIELD A BOX at runtime (so a consumer must unbox)?

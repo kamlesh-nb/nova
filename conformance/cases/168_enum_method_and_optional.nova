@@ -1,0 +1,80 @@
+// Two enum bugs found by a language-correctness sweep, both silent-wrong (no crash, wrong value):
+//
+// BUG 1 — an enum INSTANCE method's return type was not inferred. methodReturn only handled a
+// `.struct_` receiver, so `let v = Shape.Circle; v.name()` fell through to null (the static
+// `Shape.name(x)` form went through staticMethodReturn and worked). The lost `string` return
+// type made a `+` concat numToString the string RESULT as its pointer address ("it=4340006944").
+// Same class as gate 122 BUG 1, but the instance form. Fix: an `.enum_` branch in methodReturn.
+//
+// BUG 2 — a PAYLOAD-LESS enum optional collided variant tag 0 with the undefined sentinel. A
+// payload-less enum is an immediate integer tag (not a heap box), so `Color.Red` (tag 0) was
+// indistinguishable from `undefined` (also 0) in a `T | undefined`: `maybe(Color.Red) ?? default`
+// ALWAYS took the default. Same zero/undefined collision the V1 value-optional boxing fixed for
+// `int`, but enums were never covered. Fix: box payload-less enum optionals (valoptTypeRefIsValue
+// PRODUCE + valueOptionalInner CONSUME + narrowed-read unbox), exactly like a prim. A
+// payload-carrying enum is already a non-null heap box and stays a plain pointer optional.
+
+import assert;
+import list;
+import map;
+
+enum Color {
+    Red,                                    // tag 0 — the sentinel collision
+    Blue,
+    Green,
+    pub fn hex(self: Color): string {
+        switch (self) {
+            case Color.Red: { return "f00"; }
+            case Color.Blue: { return "00f"; }
+            case Color.Green: { return "0f0"; }
+        }
+        return "?";
+    }
+}
+
+fn maybe(present: bool): Color | undefined {
+    if (present) { return Color.Red; }      // present tag-0 value
+    return undefined;
+}
+
+// BUG 1: an enum-instance method result concatenates as a STRING, not its pointer.
+@test
+fn test_enum_instance_method_return_concats(): void {
+    let v = Color.Blue;
+    let a = v.hex();                         // instance method call on an enum VALUE
+    assert.isTrue(string.eql("hex=" + a, "hex=00f"));
+    assert.isTrue(string.eql("inline=" + Color.Green.hex(), "inline=0f0"));
+}
+
+// BUG 2: `??` over a payload-less enum optional keeps a PRESENT tag-0 value.
+@test
+fn test_payloadless_enum_optional_tag0(): void {
+    let c = maybe(true) ?? Color.Green;      // present Red(tag 0) — must NOT fall to Green
+    assert.isTrue(string.eql(c.hex(), "f00"));
+    let d = maybe(false) ?? Color.Green;     // genuinely absent — takes Green
+    assert.isTrue(string.eql(d.hex(), "0f0"));
+}
+
+// BUG 2: narrowing a payload-less enum optional unboxes to the bare tag.
+@test
+fn test_enum_optional_narrowing(): void {
+    let x = maybe(true);                     // Color | undefined, present tag-0
+    if (x != undefined) {
+        assert.isTrue(string.eql(x.hex(), "f00"));
+    } else {
+        assert.isTrue(false);                // must not reach — present value read as absent was the bug
+    }
+}
+
+// BUG 2: enum optionals stored in and read back from containers.
+@test
+fn test_enum_optional_in_containers(): void {
+    let m = Map<string, Color>(8, string.hash);
+    m.set("k", Color.Red);                   // tag-0 into a Map
+    assert.isTrue(string.eql((m.get("k") ?? Color.Green).hex(), "f00"));
+    assert.isTrue(string.eql((m.get("miss") ?? Color.Green).hex(), "0f0"));
+
+    let xs = List<Color>();
+    xs.push(Color.Red);
+    assert.isTrue(string.eql((xs.get(0) ?? Color.Green).hex(), "f00"));
+}
