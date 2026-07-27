@@ -70,6 +70,21 @@ const env = {
   log: () => {},                       // stdout suppressed for the gate
   nova_test_fail: (p) => { failed = true; failMsg = readStr(p); },
   nova_optional_deref_fail: (p) => { failed = true; failMsg = 'optional-deref: ' + readStr(p); },
+  nova_panic: (p) => { failed = true; failMsg = 'panic: ' + readStr(p); },
+
+  // Value-optional boxing (fixes the value-0-reads-as-undefined bug): a box is a plain 8-byte ARC
+  // cell holding one i64 word; null/0 = undefined. Mirror alloc.cpp's nova_valopt_box/unbox exactly,
+  // allocating in the module's own linear memory via its exported allocator.
+  nova_valopt_box: (value) => {
+    const ptr = exports.nova_bytes_alloc(8n);
+    if (ptr === 0n) return 0n;
+    view().setBigInt64(Number(ptr), BigInt.asIntN(64, value), true);
+    return ptr;
+  },
+  nova_valopt_unbox: (box) => {
+    if (box === 0n) return 0n;
+    return view().getBigInt64(Number(box), true);
+  },
 
   nova_i64_to_string: (n) => makeStr(BigInt.asIntN(64, n).toString()),
   // f64_to_string receives the f64 DIRECTLY (a JS Number), not i64 bits. nova

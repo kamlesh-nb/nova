@@ -131,6 +131,11 @@ pub const TypeChecker = struct {
     // "consumed" (awaited or spawned), so it is NOT flagged as a bare async call. The `.call`/
     // `.generic_call` arms read-and-clear it (args/callee are not themselves awaited).
     in_awaited: bool = false,
+    // T2 target-capability gate. When compiling to wasm, native-only features (async/await/spawn —
+    // there is no coroutine runtime, and sockets/threads/TLS live in the native runtime) are rejected
+    // with a clean, located error instead of crashing deep in codegen. Guard native code with
+    // `@native { ... }` (and provide a wasm path with `@wasm { ... }`).
+    is_wasm: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, file_sources: *std.StringHashMap([]const u8)) TypeChecker {
         return TypeChecker{
@@ -332,6 +337,9 @@ pub const TypeChecker = struct {
         }
         if (func.ret_type) |rt| self.rejectUnimplementedType(rt, func.span);
 
+        if (self.is_wasm and func.is_async) {
+            self.addError(func.span, "'async fn {s}' is not available on the wasm target — async has no coroutine runtime in wasm. Move it into a `@native {{ ... }}` block (and provide a synchronous or host-imported `@wasm {{ ... }}` alternative).", .{func.name});
+        }
         const prev_ret = self.current_ret_type;
         self.current_ret_type = func.ret_type;
         defer self.current_ret_type = prev_ret;
@@ -723,6 +731,9 @@ pub const TypeChecker = struct {
             },
             .block_expr => |be| try self.checkBlock(be),
             .await_expr => |aw| {
+                if (self.is_wasm) {
+                    self.addError(aw.span, "'await' is not available on the wasm target — async/await has no coroutine runtime in wasm. Guard native code with `@native {{ ... }}` and provide a wasm path with `@wasm {{ ... }}`.", .{});
+                }
                 // Function coloring: `await` is only legal inside an `async fn`.
                 if (!self.in_async) {
                     self.addError(aw.span, "'await' is only allowed inside an 'async fn'", .{});
@@ -733,6 +744,9 @@ pub const TypeChecker = struct {
                 self.in_awaited = saved;
             },
             .go_expr => |g| {
+                if (self.is_wasm) {
+                    self.addError(g.span, "'spawn'/'go' is not available on the wasm target — there is no coroutine runtime in wasm. Guard native code with `@native {{ ... }}`.", .{});
+                }
                 // `go`/`spawn <async-call>` launches a concurrent task; only legal in async.
                 if (!self.in_async) {
                     self.addError(g.span, "'go' is only allowed inside an 'async fn'", .{});
@@ -1181,6 +1195,9 @@ pub const TypeChecker = struct {
             // body, exactly like an async free fn (checkFunction). Without this the method
             // body is checked with in_async=false and every await is rejected.
             const prev_async = self.in_async;
+            if (self.is_wasm and m.decl.is_async) {
+                self.addError(m.decl.span, "async method '{s}' is not available on the wasm target (no coroutine runtime). Guard native code with `@native {{ ... }}`.", .{m.decl.name});
+            }
             self.in_async = m.decl.is_async;
             try self.checkBlock(m.decl.body);
             self.in_async = prev_async;
@@ -1280,6 +1297,9 @@ pub const TypeChecker = struct {
             const prev_ret = self.current_ret_type;
             self.current_ret_type = m.decl.ret_type;
             const prev_async = self.in_async;
+            if (self.is_wasm and m.decl.is_async) {
+                self.addError(m.decl.span, "async method '{s}' is not available on the wasm target (no coroutine runtime). Guard native code with `@native {{ ... }}`.", .{m.decl.name});
+            }
             self.in_async = m.decl.is_async;
             try self.checkBlock(m.decl.body);
             self.in_async = prev_async;

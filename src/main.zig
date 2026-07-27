@@ -1924,6 +1924,7 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
 
     var tc = type_checker.TypeChecker.init(allocator, &file_sources);
     defer tc.deinit();
+    tc.is_wasm = is_wasm;
     try tc.check(program);
 
     // F1/F2 shadow, mirroring the `nova <file>` path at ~:1330. It lives in BOTH
@@ -2277,6 +2278,7 @@ fn compileProgram(
 
     var tc = type_checker.TypeChecker.init(allocator, &file_sources);
     defer tc.deinit();
+    tc.is_wasm = is_wasm;
     try tc.check(program);
 
     // F1 stage 1: build the symbol table alongside legacy resolution and diff them.

@@ -2458,7 +2458,11 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     break :resolve try self.resolveCalleeName(name);
                 };
                 const fn_val = self.func_map.get(resolved_name) orelse {
-                    std.debug.print("Function '{s}' not found\n", .{resolved_name});
+                    if (self.is_wasm) {
+                        std.debug.print("error: '{s}' is native-only and not available on the wasm target (it resolves to a native runtime symbol with no wasm host import). Guard native code with `@native {{ ... }}`, or provide a `@wasm {{ ... }}` alternative.\n", .{resolved_name});
+                    } else {
+                        std.debug.print("Function '{s}' not found\n", .{resolved_name});
+                    }
                     return error.FunctionNotFound;
                 };
 
@@ -3134,7 +3138,11 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     }
                 }
                 const fn_val = self.func_map.get(callee_name) orelse {
-                    std.debug.print("Function '{s}' not found\n", .{callee_name});
+                    if (self.is_wasm) {
+                        std.debug.print("error: '{s}' is native-only and not available on the wasm target (native runtime symbol / FFI extern with no wasm host import). Guard native code with `@native {{ ... }}`.\n", .{callee_name});
+                    } else {
+                        std.debug.print("Function '{s}' not found\n", .{callee_name});
+                    }
                     return error.FunctionNotFound;
                 };
 
