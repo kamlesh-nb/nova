@@ -310,9 +310,11 @@ fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocator: 
     }
     const dir_end = std.mem.lastIndexOfScalar(u8, base_path, '/') orelse 0;
     const dir = if (dir_end == 0) "" else base_path[0..dir_end];
-    if (dir.len == 0) {
-        return try std.fmt.allocPrint(allocator, "{s}.nova", .{module_name});
-    }
+    // NOTE: an importing file at the project ROOT (no '/' in base_path) has an empty `dir`. Do NOT
+    // early-return `{module}.nova` here — that used to short-circuit the project-root fallback AND the
+    // package-cache lookup, so a consumer whose main.nova sits at its root could never resolve a
+    // `nova get`-fetched dependency. Fall through: the walk-up loop is simply skipped (dir empty), and
+    // resolution continues to the project-root + cache stages below.
 
     var current_len = dir.len;
     while (current_len > 0) {
@@ -359,7 +361,10 @@ fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocator: 
         return cache_hit;
     }
 
-    // Default fallback: direct join relative to base_path's dir
+    // Default fallback: direct join relative to base_path's dir (bare `<module>.nova` at the root).
+    if (dir.len == 0) {
+        return try std.fmt.allocPrint(allocator, "{s}.nova", .{module_name});
+    }
     return try std.fmt.allocPrint(allocator, "{s}/{s}.nova", .{ dir, module_name });
 }
 
