@@ -129,27 +129,60 @@ inline bool raw_coro_done(long long h) {
 // RESUMER *after* the child's resume fully returns — never while the child is still
 // executing its epilogue. This closes a multi-thread use-after-free where a parent
 // could resume on another core and coro.destroy the child mid-epilogue.
+// g_waiters is NOT striped: select/whenAny arm+disarm `self` across a SET of futures under ONE lock
+// (atomic waiter-set swap), which striping (per-handle mutex) would break. It's also cold (await/select
+// only), so it stays a single mutex. The HOT map (g_corostates, hit on every schedule) and g_heldargs
+// ARE striped below — both are single-handle-keyed with no cross-handle atomicity requirement.
 std::mutex &g_waiters_mu = *new std::mutex();
 std::unordered_map<long long, long long> &g_waiters = *new std::unordered_map<long long, long long>();
+
+// P2 (share-nothing contention relief): a lock-STRIPED map. Coroutine bookkeeping is keyed by a frame
+// handle; under N reactor threads a single global mutex convoys them, so hash the handle into
+// NSTRIPES independent {mutex, map} stripes — N reactor threads mostly hit different stripes → ~N-fold
+// less contention, and correctness is UNCHANGED (each key is still fully mutex-protected; no
+// single-thread reasoning). Chosen over per-reactor thread_local (which would need the maps to be
+// touched by exactly one reactor thread — not true across the fan-out spawn / cross-reactor wakeups).
+// extern "C++": this whole TU is inside `extern "C"` (for the ABI entry points), but a TEMPLATE must
+// have C++ linkage — so scope the striped-map infra in a C++-linkage block.
+extern "C++" {
+constexpr size_t NSTRIPES = 64; // power of 2; >= the 16-reactor cap for good spread
+inline size_t stripe_of(long long handle) {
+    unsigned long long x = static_cast<unsigned long long>(handle);
+    x ^= x >> 16;
+    x *= 0x9E3779B97F4A7C15ULL; // fibonacci hash mix (frames are aligned; low bits alone collide)
+    x ^= x >> 32;
+    return static_cast<size_t>(x & (NSTRIPES - 1));
+}
+template <typename V>
+struct StripedMap {
+    struct Stripe {
+        std::mutex mu;
+        std::unordered_map<long long, V> map;
+    };
+    Stripe *stripes;
+    StripedMap() : stripes(new Stripe[NSTRIPES]) {}
+    Stripe &at(long long handle) { return stripes[stripe_of(handle)]; }
+};
+} // extern "C++"
 
 // Owned arguments to release when a SPAWNED coroutine completes. A spawn reads its arguments
 // asynchronously — after the spawning statement has drained its temporaries — so an owned-temporary
 // argument (e.g. a trait object freshly widened for the call) must outlive that drain and be
 // released when the coroutine finishes. buildGo retains such an arg and registers {ptr, dtor} here;
 // nova_coro_release_held (called on completion) releases it, exactly as the statement drain would.
-std::mutex &g_heldargs_mu = *new std::mutex();
-std::unordered_map<long long, std::vector<std::pair<long long, void (*)(long long)>>> &g_heldargs =
-    *new std::unordered_map<long long, std::vector<std::pair<long long, void (*)(long long)>>>();
+StripedMap<std::vector<std::pair<long long, void (*)(long long)>>> &g_heldargs =
+    *new StripedMap<std::vector<std::pair<long long, void (*)(long long)>>>();
 
 // Release a completed coroutine's held args (call with NO held-args lock; it takes it itself).
 static void nova_coro_release_held(long long coro) {
     std::vector<std::pair<long long, void (*)(long long)>> held;
     {
-        std::lock_guard<std::mutex> lk(g_heldargs_mu);
-        auto it = g_heldargs.find(coro);
-        if (it == g_heldargs.end()) return;
+        auto &s = g_heldargs.at(coro);
+        std::lock_guard<std::mutex> lk(s.mu);
+        auto it = s.map.find(coro);
+        if (it == s.map.end()) return;
         held = std::move(it->second);
-        g_heldargs.erase(it);
+        s.map.erase(it);
     }
     for (auto &h : held) nova_release(h.first, h.second);
 }
@@ -191,22 +224,24 @@ struct CoroState {
         if (g_pin_next >= 0) g_pin_next = -1; // consume the one-shot hint
     }
 };
-std::mutex &g_corostates_mu = *new std::mutex();
-std::unordered_map<long long, std::shared_ptr<CoroState>> &g_corostates =
-    *new std::unordered_map<long long, std::shared_ptr<CoroState>>();
+// STRIPED (P2): the hottest map — get_coro_state runs on every schedule. Its per-key mutex is the
+// stripe's mutex, so the load-bearing lock-ordering below (stripe mutex released before state->mu) is
+// preserved; only the contention is spread across NSTRIPES.
+StripedMap<std::shared_ptr<CoroState>> &g_corostates = *new StripedMap<std::shared_ptr<CoroState>>();
 
 // Returns a shared_ptr, not a raw pointer, and that is load-bearing: the caller
-// releases g_corostates_mu before it locks state->mu, so with a raw pointer the
+// releases the stripe mutex before it locks state->mu, so with a raw pointer the
 // owning lambda could erase+delete the state in that window and the caller would
 // lock a freed mutex. Sharing ownership makes the state outlive every holder --
 // the "fiber on two threads" use-after-free. The map's entry is dropped by erase();
 // the object dies when the last in-flight holder releases it.
 std::shared_ptr<CoroState> get_coro_state(long long handle) {
-    std::lock_guard<std::mutex> lk(g_corostates_mu);
-    auto it = g_corostates.find(handle);
-    if (it == g_corostates.end()) {
+    auto &s = g_corostates.at(handle);
+    std::lock_guard<std::mutex> lk(s.mu);
+    auto it = s.map.find(handle);
+    if (it == s.map.end()) {
         auto state = std::make_shared<CoroState>();
-        g_corostates[handle] = state;
+        s.map[handle] = state;
         return state;
     }
     return it->second;
@@ -361,8 +396,9 @@ long long nova_await_future(long long future, long long waiter) {
 // the file-local namespace above; this wrapper just exposes the insert with external linkage.
 void nova_coro_hold_arg(long long coro, long long ptr, void (*dtor)(long long)) {
     if (!coro || !ptr) return;
-    std::lock_guard<std::mutex> lk(g_heldargs_mu);
-    g_heldargs[coro].push_back({ptr, dtor});
+    auto &s = g_heldargs.at(coro);
+    std::lock_guard<std::mutex> lk(s.mu);
+    s.map[coro].push_back({ptr, dtor});
 }
 
 void nova_sched_schedule(long long handle) {
@@ -395,8 +431,9 @@ void nova_sched_schedule(long long handle) {
             // Drop the map's reference; any in-flight holder keeps the state
             // alive via its own shared_ptr (see get_coro_state).
             {
-                std::lock_guard<std::mutex> glk(g_corostates_mu);
-                g_corostates.erase(handle);
+                auto &cs = g_corostates.at(handle);
+                std::lock_guard<std::mutex> glk(cs.mu);
+                cs.map.erase(handle);
             }
             // take_waiter is MANDATORY here, exactly as in the post-resume path.
             // Omitting it leaked the registration in g_waiters forever — and
@@ -456,8 +493,9 @@ void nova_sched_schedule(long long handle) {
         // state->mu is released above before the map entry is dropped.
         if (finished) {
             {
-                std::lock_guard<std::mutex> glk(g_corostates_mu);
-                g_corostates.erase(handle);
+                auto &cs = g_corostates.at(handle);
+                std::lock_guard<std::mutex> glk(cs.mu);
+                cs.map.erase(handle);
             }
 
             nova_coro_release_held(handle);
@@ -498,9 +536,10 @@ void nova_coro_release(long long handle) {
     if (!handle) return;
     std::shared_ptr<CoroState> state;
     {
-        std::lock_guard<std::mutex> glk(g_corostates_mu);
-        auto it = g_corostates.find(handle);
-        if (it != g_corostates.end()) state = it->second;
+        auto &cs = g_corostates.at(handle);
+        std::lock_guard<std::mutex> glk(cs.mu);
+        auto it = cs.map.find(handle);
+        if (it != cs.map.end()) state = it->second;
     }
     if (state) {
         {
@@ -515,8 +554,9 @@ void nova_coro_release(long long handle) {
         // Drop the entry before freeing the frame: g_corostates is keyed by the
         // handle, and the address is reused once the frame is gone. A leftover
         // entry would hand the next coroutine at that address a stale state.
-        std::lock_guard<std::mutex> glk(g_corostates_mu);
-        g_corostates.erase(handle);
+        auto &cs = g_corostates.at(handle);
+        std::lock_guard<std::mutex> glk(cs.mu);
+        cs.map.erase(handle);
     }
     // No state (never scheduled, or the scheduler already finished and erased it)
     // or not running: nobody else can touch the frame.

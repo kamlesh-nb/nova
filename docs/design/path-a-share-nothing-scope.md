@@ -65,12 +65,20 @@ reactors are single-threaded (P3) would race. So P1 only adds the *affinity*, an
   *dropping* it is then an optional micro-opt, not a correctness step.
 - **Proven:** N=1 identical — native 177/177, ASAN clean.
 
-### P2 — Per-reactor thread_local state maps; delete global mutexes
-- `g_corostates`, `g_waiters`, `g_heldargs` → `thread_local` per reactor thread. Delete `g_corostates_mu`,
-  `g_waiters_mu`, `g_heldargs_mu`, and the per-`CoroState` mutex (a state is only touched by its reactor).
-- **Prove:** N=1 identical + ASAN clean (thread_local teardown ordering — mind the "OS reclaims on exit"
-  note; do NOT destruct maps that pending I/O still touches). This is the highest-ASAN-risk phase → land it
-  alone.
+### P2 — Contention relief via LOCK STRIPING (not thread_local) ✅
+DECISION (user, 2026-07-27): the scoped "thread_local + delete mutexes" was assessed HIGH-RISK and
+UNVERIFIABLE by our tools — the mutexes guard documented races the code says "vanish under
+NOVA_THREADS=1 and under ASAN" (ASAN catches memory errors, NOT races — that's TSAN), and making the
+maps thread_local would need every state touched by exactly one reactor thread, which is FALSE across
+the fan-out spawn / cross-reactor wakeups (would cascade into a bootstrap-post + timer-routing rewrite).
+Chose the VERIFIABLE variant instead: **hash-stripe** the maps into NSTRIPES=64 independent {mutex, map}
+stripes (`StripedMap<V>`, key = frame handle → fibonacci-hash → stripe). N reactor threads mostly hit
+different stripes → ~N-fold less contention, **correctness UNCHANGED** (each key still fully
+mutex-protected; the load-bearing lock-ordering stripe-mutex→state->mu is preserved). Striped the HOT
+map `g_corostates` (every schedule) + `g_heldargs`; left `g_waiters` on its single mutex (select/whenAny
+arm+disarm a SET of handles under ONE lock — striping would break that atomicity; also cold). The
+`StripedMap` template lives in an `extern "C++"` block (the TU is `extern "C"`; templates need C++
+linkage). **Proven:** native 177/177, ASAN 324/324, live fan-out server 30/30 at NOVA_THREADS=6.
 
 ### P3 — Multi-reactor drive: N = cores − 1 ✅
 - `nova_run()` starts N reactors, each `io.run()` on its pinned thread (`g_nova_tid = reactor id`); the
