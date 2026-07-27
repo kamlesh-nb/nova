@@ -1,0 +1,201 @@
+// autoscale.nova — PID-controller autoscaling for the I1 reverse proxy.
+//
+// Two pieces:
+//   • PidController — a textbook PID (Kp/Ki/Kd) with anti-windup on the integral term and a clamp on the
+//     output. Pure arithmetic over `double`, so it is fully unit-testable (KAT step response).
+//   • Autoscaler — a control loop that samples a live load metric off the proxy Pool, runs the PID toward
+//     a setpoint, and drives the backend REPLICA COUNT: spawning backend processes via R1 (process.nova)
+//     when scaling up and SIGTERM-ing them when scaling down. Managed replicas occupy the first N slots
+//     of the pool; a drained slot's `up=0` already excludes it from every LB strategy (see net/proxy).
+//
+// Standalone driver shape (proxy + autoscaler under one block-drive):
+//   asyncio.holdReactors();
+//   let a = autoscale.Autoscaler(pool, "/path/backend", "127.0.0.1", 9101, 1, 8);
+//   a.pid.setOutputLimits(1.0, 8.0);
+//   let _ = autoscale.runWithProxy(a, 9100, 3000, 500);   // 500ms control interval
+
+import net.proxy;
+import net.asyncio;
+import process;
+import list;
+import math;
+import string;
+
+// ---------------------------------------------------------------------------
+// PID controller
+// ---------------------------------------------------------------------------
+
+pub struct PidController {
+    pub kp: double,
+    pub ki: double,
+    pub kd: double,
+    pub setpoint: double,
+    pub integral: double,      // accumulated error·dt, clamped for anti-windup
+    pub prevError: double,
+    pub outMin: double,        // output clamp (e.g. [minReplicas, maxReplicas])
+    pub outMax: double,
+    pub iMin: double,          // anti-windup clamp on the integral term
+    pub iMax: double,
+    // Direct-acting: error = measured − setpoint (output RISES as the measured load exceeds the setpoint —
+    // the correct sign for autoscaling, where more load ⇒ more replicas). Reverse-acting (the textbook
+    // default, false) uses error = setpoint − measured.
+    pub directActing: bool,
+    init(kp: double, ki: double, kd: double, setpoint: double) {
+        self.kp = kp;
+        self.ki = ki;
+        self.kd = kd;
+        self.setpoint = setpoint;
+        self.integral = 0.0;
+        self.prevError = 0.0;
+        self.outMin = -1000000.0;
+        self.outMax = 1000000.0;
+        self.iMin = -1000000.0;
+        self.iMax = 1000000.0;
+        self.directActing = false;
+    }
+
+    pub fn setOutputLimits(self: PidController, lo: double, hi: double): void {
+        self.outMin = lo; self.outMax = hi;
+    }
+    // Anti-windup bounds on the integral accumulator. Keep these near the output range so a long overshoot
+    // doesn't wind the integral up past what the clamped output can ever express (the classic windup bug).
+    pub fn setIntegralLimits(self: PidController, lo: double, hi: double): void {
+        self.iMin = lo; self.iMax = hi;
+    }
+    pub fn setDirectActing(self: PidController, v: bool): void { self.directActing = v; }
+    pub fn reset(self: PidController): void { self.integral = 0.0; self.prevError = 0.0; }
+
+    // One control step: fold in the measured process variable over elapsed `dt` seconds, return the
+    // clamped control output. dt<=0 skips the derivative (avoids a divide-by-zero on the first tick).
+    pub fn update(self: PidController, measured: double, dt: double): double {
+        let error = if (self.directActing) (measured - self.setpoint) else (self.setpoint - measured);
+        self.integral = math.fclamp(self.integral + (error * dt), self.iMin, self.iMax);
+        let deriv = if (dt > 0.0) ((error - self.prevError) / dt) else 0.0;
+        self.prevError = error;
+        let out = (self.kp * error) + (self.ki * self.integral) + (self.kd * deriv);
+        return math.fclamp(out, self.outMin, self.outMax);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Autoscaler
+// ---------------------------------------------------------------------------
+
+pub struct Autoscaler {
+    pub pool: proxy.Pool,
+    pub pid: PidController,
+    pub cmd: string,               // backend binary to (re)spawn per replica
+    pub host: string,              // host the spawned backends listen on (added to the pool)
+    pub basePort: int,             // replica slot i listens on basePort + i
+    pub minReplicas: int,
+    pub maxReplicas: int,
+    pub current: int,              // number of replicas currently in rotation (slots 0..current-1)
+    pub procs: list.List<process.Process>,  // running replica processes, one per active slot (len == current)
+    // When false (tests), scaleTo only flips pool slots — it does NOT spawn/kill real processes. Live use
+    // leaves it true so the controller actually starts/stops backends.
+    pub manageProcesses: bool,
+    init(pool: proxy.Pool, cmd: string, host: string, basePort: int, minReplicas: int, maxReplicas: int) {
+        self.pool = pool;
+        // Sensible autoscaling defaults: gentle proportional gain + integral for a steady base count, no
+        // derivative (load samples are noisy). Direct-acting; output clamped to the replica range.
+        self.pid = PidController(0.5, 0.1, 0.0, 0.0);
+        self.pid.setDirectActing(true);
+        self.cmd = cmd;
+        self.host = host;
+        self.basePort = basePort;
+        self.minReplicas = if (minReplicas < 1) 1 else minReplicas;
+        self.maxReplicas = if (maxReplicas < self.minReplicas) self.minReplicas else maxReplicas;
+        self.current = 0;
+        self.procs = list.List<process.Process>();
+        self.manageProcesses = true;
+        // Pre-register maxReplicas backend slots, all DRAINED (up=0). The LB ring/weight expansion include
+        // them but healthyFrom skips any drained slot, so an idle slot is simply invisible until scaled in.
+        let i = 0;
+        while (i < self.maxReplicas) {
+            pool.add(host, basePort + i);
+            let b = pool.backends.get(i) ?? proxy.Backend("", 0);
+            b.up = 0;
+            i = i + 1;
+        }
+    }
+
+    // Set the load setpoint (target value of the sampled metric) and the PID gains.
+    pub fn configure(self: Autoscaler, kp: double, ki: double, kd: double, setpoint: double): void {
+        self.pid.kp = kp; self.pid.ki = ki; self.pid.kd = kd; self.pid.setpoint = setpoint;
+        self.pid.setOutputLimits(self.minReplicas as double, self.maxReplicas as double);
+        self.pid.setIntegralLimits(0.0, self.maxReplicas as double);
+    }
+
+    // Bring the running-replica count to `n` (clamped to [min,max]). Scaling UP spawns a backend process
+    // (if managed) and un-drains its pool slot; scaling DOWN drains the slot and SIGTERM+reaps the process.
+    // Contiguous: slots 0..current-1 are the live replicas, so this only touches the boundary.
+    pub fn scaleTo(self: Autoscaler, n: int): void {
+        let target = math.clamp(n, self.minReplicas, self.maxReplicas);
+        while (self.current < target) {
+            let slot = self.current;
+            if (self.manageProcesses) {
+                let args = list.List<string>();
+                args.push("" + (self.basePort + slot));
+                let p = process.Process.spawn(self.cmd, args);
+                self.procs.push(p);
+            }
+            let b = self.pool.backends.get(slot) ?? proxy.Backend("", 0);
+            b.up = 1;                          // slot enters LB rotation
+            self.current = self.current + 1;
+        }
+        while (self.current > target) {
+            let slot = self.current - 1;
+            let b = self.pool.backends.get(slot) ?? proxy.Backend("", 0);
+            b.up = 0;                          // slot leaves rotation BEFORE the process dies (no 502s)
+            if (self.manageProcesses) {
+                let idx = self.procs.size() - 1;
+                if (idx >= 0) {
+                    let p = self.procs.get(idx) ?? process.Process.spawn("/bin/true", list.List<string>());
+                    let _ = p.terminate();     // SIGTERM — graceful
+                    let _ = p.wait();          // reap (avoid a zombie); backends exit fast on SIGTERM
+                    p.close();
+                    self.procs.remove(idx);
+                }
+            }
+            self.current = slot;
+        }
+    }
+
+    // Spawn the minimum replica set. Call once before the control loop starts serving.
+    pub fn start(self: Autoscaler): void { self.scaleTo(self.minReplicas); }
+
+    // One control decision: run the PID over the measured metric + elapsed `dt` (seconds) and return the
+    // desired replica count (rounded, clamped). Separated from actuation so it is deterministic/testable.
+    pub fn decide(self: Autoscaler, measured: double, dt: double): int {
+        let out = self.pid.update(measured, dt);
+        let r = math.fround(out) as int;
+        return math.clamp(r, self.minReplicas, self.maxReplicas);
+    }
+
+    // Sample the live metric (total in-flight requests across the pool) and actuate one scaling step.
+    pub fn tick(self: Autoscaler, dt: double): void {
+        let load = self.pool.totalActive() as double;
+        self.scaleTo(self.decide(load, dt));
+    }
+}
+
+// The autoscaler's background control loop: every `intervalMs` sample the metric and rescale. Runs as one
+// coroutine (spawn it on reactor 0). Never returns.
+pub async fn autoscaleLoop(a: Autoscaler, intervalMs: int): int {
+    let dt = (intervalMs as double) / 1000.0;
+    while (true) {
+        let _ = await asyncio.sleep(intervalMs);
+        a.tick(dt);
+    }
+    return 0;
+}
+
+// Run the proxy and the autoscaler together under a single block-drive: spawn the control loop on reactor
+// 0, then serve the front port with the share-nothing accept fan-out. Caller must have called
+// asyncio.holdReactors() first (so the fan-out lands on live reactors), exactly like Proxy.run.
+pub async fn runWithProxy(a: Autoscaler, port: int, tmo: int, intervalMs: int): int {
+    a.start();                                 // spawn the minimum replicas
+    asyncio.pinNextCoro(0);
+    spawn autoscaleLoop(a, intervalMs);
+    return await proxy.serve(a.pool, port, tmo);
+}

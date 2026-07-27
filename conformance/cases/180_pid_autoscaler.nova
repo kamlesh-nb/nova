@@ -1,0 +1,123 @@
+// 180 — I1 PID-controller autoscaling: the pure, offline-testable core. The PidController KATs pin its
+// step response, anti-windup, output clamp, and derivative; the Autoscaler tests pin pre-registration,
+// scale up/down slot management, and the load→replica decision — all with manageProcesses=false so no
+// real backend processes are spawned. The live spawn/kill loop is proven end-to-end separately.
+import assert;
+import math;
+import net.autoscale;
+import net.proxy;
+
+fn near(a: double, b: double): bool { return math.fabs(a - b) < 0.0001; }
+
+// Proportional step response (reverse-acting default: error = setpoint − measured).
+@test
+fn test_pid_proportional_step(): void {
+    let pid = autoscale.PidController(2.0, 0.0, 0.0, 100.0);
+    assert.isTrue(near(pid.update(0.0, 1.0), 200.0));    // error 100 · Kp 2
+    assert.isTrue(near(pid.update(100.0, 1.0), 0.0));    // on setpoint → 0
+    assert.isTrue(near(pid.update(150.0, 1.0), -100.0)); // overshoot → negative
+}
+
+// Integral accumulates over time AND is clamped for anti-windup (integral can't exceed iMax even under a
+// sustained error the output can never clear).
+@test
+fn test_pid_integral_antiwindup(): void {
+    let pid = autoscale.PidController(0.0, 1.0, 0.0, 10.0);
+    pid.setIntegralLimits(0.0, 5.0);
+    assert.isTrue(near(pid.update(0.0, 1.0), 5.0));      // integral 10 clamped to 5
+    assert.isTrue(near(pid.update(0.0, 1.0), 5.0));      // stays clamped (no windup)
+    assert.isTrue(near(pid.update(0.0, 1.0), 5.0));
+}
+
+// Output is clamped to the configured range (the replica band).
+@test
+fn test_pid_output_clamp(): void {
+    let pid = autoscale.PidController(1.0, 0.0, 0.0, 0.0);
+    pid.setDirectActing(true);                            // error = measured − setpoint
+    pid.setOutputLimits(1.0, 4.0);
+    assert.isTrue(near(pid.update(100.0, 1.0), 4.0));    // huge positive → clamp hi
+    assert.isTrue(near(pid.update(-100.0, 1.0), 1.0));   // huge negative → clamp lo
+}
+
+// Derivative reacts to the RATE of error change; dt<=0 skips it (no divide-by-zero on the first tick).
+@test
+fn test_pid_derivative_and_zero_dt(): void {
+    let pid = autoscale.PidController(0.0, 0.0, 1.0, 0.0);
+    assert.isTrue(near(pid.update(0.0, 1.0), 0.0));      // error 0, no change
+    assert.isTrue(near(pid.update(10.0, 1.0), -10.0));   // error −10, d(error)/dt = −10
+    let pid2 = autoscale.PidController(0.0, 0.0, 1.0, 0.0);
+    assert.isTrue(near(pid2.update(5.0, 0.0), 0.0));     // dt=0 → derivative skipped, no trap
+}
+
+// The autoscaler pre-registers maxReplicas pool slots, ALL drained (invisible to LB until scaled in).
+@test
+fn test_autoscaler_pre_registers_drained(): void {
+    let pool = proxy.Pool();
+    let a = autoscale.Autoscaler(pool, "/bin/true", "127.0.0.1", 9101, 1, 4);
+    a.manageProcesses = false;
+    assert.equalInt(pool.size(), 4);
+    assert.equalInt(a.current, 0);
+    let i = 0;
+    while (i < 4) {
+        assert.equalInt((pool.backends.get(i) ?? proxy.Backend("", 0)).up, 0);
+        i = i + 1;
+    }
+    // all drained → LB has nothing → port-0 sentinel
+    assert.equalInt(pool.select("").port, 0);
+}
+
+// scaleTo brings the first N slots into rotation and drains the rest; start() spawns the minimum.
+@test
+fn test_autoscaler_scale_up_down(): void {
+    let pool = proxy.Pool();
+    let a = autoscale.Autoscaler(pool, "/bin/true", "127.0.0.1", 9101, 1, 4);
+    a.manageProcesses = false;
+
+    a.start();                                            // → minReplicas = 1
+    assert.equalInt(a.current, 1);
+    assert.equalInt((pool.backends.get(0) ?? proxy.Backend("", 0)).up, 1);
+    assert.equalInt((pool.backends.get(1) ?? proxy.Backend("", 0)).up, 0);
+
+    a.scaleTo(3);                                         // grow to 3
+    assert.equalInt(a.current, 3);
+    assert.equalInt((pool.backends.get(2) ?? proxy.Backend("", 0)).up, 1);
+    assert.equalInt((pool.backends.get(3) ?? proxy.Backend("", 0)).up, 0);
+
+    a.scaleTo(1);                                         // shrink back to 1
+    assert.equalInt(a.current, 1);
+    assert.equalInt((pool.backends.get(1) ?? proxy.Backend("", 0)).up, 0);
+    assert.equalInt((pool.backends.get(2) ?? proxy.Backend("", 0)).up, 0);
+}
+
+// scaleTo clamps to [minReplicas, maxReplicas].
+@test
+fn test_autoscaler_scale_clamps(): void {
+    let pool = proxy.Pool();
+    let a = autoscale.Autoscaler(pool, "/bin/true", "127.0.0.1", 9101, 2, 5);
+    a.manageProcesses = false;
+    a.scaleTo(99);
+    assert.equalInt(a.current, 5);                        // clamped to max
+    a.scaleTo(0);
+    assert.equalInt(a.current, 2);                        // clamped to min
+}
+
+// decide() turns a load sample into a clamped replica count via the PID.
+@test
+fn test_autoscaler_decide(): void {
+    let pool = proxy.Pool();
+    let a = autoscale.Autoscaler(pool, "/bin/true", "127.0.0.1", 9101, 1, 4);
+    a.manageProcesses = false;
+    // Kp 0.5, setpoint 10, direct-acting: load 30 → error 20 → out 10 → clamp[1,4] = 4
+    a.configure(0.5, 0.0, 0.0, 10.0);
+    assert.equalInt(a.decide(30.0, 1.0), 4);
+    // load 12 → error 2 → out 1.0 → clamp = 1
+    let a2 = autoscale.Autoscaler(proxy.Pool(), "/bin/true", "127.0.0.1", 9200, 1, 4);
+    a2.manageProcesses = false;
+    a2.configure(0.5, 0.0, 0.0, 10.0);
+    assert.equalInt(a2.decide(12.0, 1.0), 1);            // round(1.0)=1
+    // load 16 → error 6 → out 3.0 → 3
+    let a3 = autoscale.Autoscaler(proxy.Pool(), "/bin/true", "127.0.0.1", 9300, 1, 4);
+    a3.manageProcesses = false;
+    a3.configure(0.5, 0.0, 0.0, 10.0);
+    assert.equalInt(a3.decide(16.0, 1.0), 3);
+}
