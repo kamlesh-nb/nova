@@ -595,6 +595,16 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         const process_spawn_fn = core.LLVMAddFunction(compiler.module, "nova_process_spawn", process_spawn_type);
         try compiler.func_map.put("nova_process_spawn", process_spawn_fn);
 
+        // I4: nova_process_spawn_isolated: (cmd_ptr, args_ptr, ns_flags:i64, rootfs_ptr, host_ptr,
+        //     drop_caps:i32, no_new_privs:i32, seccomp:i32) -> ptr
+        var process_iso_params = [_]types.LLVMTypeRef{
+            compiler.ptr_type, compiler.ptr_type, compiler.i64_type, compiler.ptr_type,
+            compiler.ptr_type, compiler.i32_type, compiler.i32_type, compiler.i32_type,
+        };
+        const process_iso_type = core.LLVMFunctionType(compiler.ptr_type, &process_iso_params, 8, 0);
+        const process_iso_fn = core.LLVMAddFunction(compiler.module, "nova_process_spawn_isolated", process_iso_type);
+        try compiler.func_map.put("nova_process_spawn_isolated", process_iso_fn);
+
         // nova_process_write_stdin: (ptr, ptr) -> i32
         var process_write_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.ptr_type };
         const process_write_type = core.LLVMFunctionType(compiler.i32_type, &process_write_params, 2, 0);

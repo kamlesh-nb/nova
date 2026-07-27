@@ -36,6 +36,36 @@ static inline int nova_close_fd(int fd) { return ::closesocket(fd); }
 static inline int nova_close_fd(int fd) { return ::close(fd); }
 #endif
 
+// I4: container-grade isolation via native Linux kernel primitives (namespaces / rootfs / caps /
+// seccomp). ALL Linux-only — guarded by __linux__; on macOS/Windows the isolated spawn degrades to a
+// plain spawn (documented: isolation unsupported off Linux).
+#if defined(__linux__)
+#include <linux/sched.h>   // CLONE_NEW* (also in sched.h with _GNU_SOURCE)
+#include <sched.h>         // clone, unshare
+#include <sys/mman.h>      // mmap/munmap for the clone child stack
+#include <sys/mount.h>     // mount, MS_*, MNT_DETACH
+#include <sys/prctl.h>     // prctl, PR_SET_NO_NEW_PRIVS, PR_CAPBSET_DROP
+#include <sys/syscall.h>   // SYS_pivot_root, SYS_seccomp
+#include <linux/filter.h>  // sock_filter / sock_fprog (seccomp BPF)
+#include <linux/seccomp.h> // SECCOMP_SET_MODE_FILTER, SECCOMP_RET_*
+#include <linux/audit.h>   // AUDIT_ARCH_*
+#include <linux/capability.h> // __user_cap_header/data_struct + _LINUX_CAPABILITY_VERSION_3 (kernel, not libcap)
+#ifndef _LINUX_CAPABILITY_VERSION_3
+#define _LINUX_CAPABILITY_VERSION_3 0x20080522
+#endif
+#endif
+
+// Isolation namespace/flags bitmask (mirrors std/os/isolation.nova). Independent of CLONE_* values so the
+// Nova side needn't know kernel constants; the runtime maps them.
+enum NovaIsoNs {
+  NOVA_NS_PID  = 1,
+  NOVA_NS_MOUNT = 2,
+  NOVA_NS_UTS  = 4,
+  NOVA_NS_IPC  = 8,
+  NOVA_NS_NET  = 16,
+  NOVA_NS_USER = 32,
+};
+
 // wolfSSL is optional at compile time: build.zig defines NOVA_HAVE_WOLFSSL and adds
 // the include/link when the vendored deps/wolfssl is built. Without it, TLS stays
 // stubbed (sockets still work). options.h MUST precede any other wolfSSL header.
@@ -910,6 +940,168 @@ ProcessContext *nova_process_spawn(const char *cmd, const char *args_str) {
   return ctx;
 }
 
+// ===== I4: isolated spawn (Linux namespaces / rootfs / caps / seccomp) ======
+#if defined(__linux__)
+// Everything the cloned child needs, prepared by the parent BEFORE clone (no post-clone malloc reliance
+// for the essentials — though without CLONE_VM the child has a private copy of memory, so it's fork-safe).
+struct IsoChildArgs {
+  char **argv;
+  int in_fd, out_fd;      // child ends of the stdio pipes
+  long ns_flags;
+  const char *rootfs;     // may be empty
+  const char *hostname;   // may be empty
+  int drop_caps, no_new_privs, seccomp_deny;
+};
+
+// Drop ALL capabilities from the bounding set + clear the permitted/effective/inheritable sets. Combined
+// with PR_SET_NO_NEW_PRIVS this makes the execed process unprivileged even if it started as root.
+static void iso_drop_caps() {
+  for (int cap = 0; cap <= 63; ++cap)
+    ::prctl(PR_CAPBSET_DROP, cap, 0, 0, 0); // ignore EINVAL past the last valid cap
+  struct __user_cap_header_struct hdr = {_LINUX_CAPABILITY_VERSION_3, 0};
+  struct __user_cap_data_struct data[2];
+  std::memset(data, 0, sizeof(data));
+  ::syscall(SYS_capset, &hdr, data); // empty sets → no caps
+}
+
+// Install a small default-allow seccomp-bpf filter that DENIES (EPERM) the dangerous namespace/mount
+// escape syscalls — a demonstrable Level-3 hardening. A sandboxed process calling unshare()/setns()/
+// mount()/pivot_root() then gets EPERM instead of escaping.
+static int iso_install_seccomp() {
+#if defined(SECCOMP_SET_MODE_FILTER) && defined(AUDIT_ARCH_X86_64)
+  struct sock_filter filter[] = {
+    // load syscall nr
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+#define DENY(NR) \
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (NR), 0, 1), \
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+    DENY(SYS_unshare)
+    DENY(SYS_setns)
+    DENY(SYS_mount)
+    DENY(SYS_pivot_root)
+#ifdef SYS_ptrace
+    DENY(SYS_ptrace)
+#endif
+#undef DENY
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+  };
+  struct sock_fprog prog = {(unsigned short)(sizeof(filter) / sizeof(filter[0])), filter};
+  return (int)::syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog);
+#else
+  return -1;
+#endif
+}
+
+// pivot into `rootfs` as the new / (private-mount-namespace only). Standard bind→pivot_root→detach dance.
+static int iso_setup_rootfs(const char *rootfs) {
+  if (::mount("", "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) return -1; // don't leak mounts to host
+  if (::mount(rootfs, rootfs, nullptr, MS_BIND | MS_REC, nullptr) != 0) return -1; // pivot needs a mountpoint
+  if (::chdir(rootfs) != 0) return -1;
+  ::mkdir(".old_root", 0700);
+  if (::syscall(SYS_pivot_root, ".", ".old_root") != 0) return -1;
+  if (::chdir("/") != 0) return -1;
+  ::umount2("/.old_root", MNT_DETACH);
+  ::rmdir("/.old_root");
+  return 0;
+}
+
+// The cloned child's entry: it runs (as PID 1 if a PID ns was requested) in the new namespaces, sets up
+// the sandbox in order, then execve's the target. Never returns on success.
+static int iso_child_entry(void *arg) {
+  IsoChildArgs *a = reinterpret_cast<IsoChildArgs *>(arg);
+  ::dup2(a->in_fd, STDIN_FILENO);
+  ::dup2(a->out_fd, STDOUT_FILENO);
+  ::close(a->in_fd);
+  ::close(a->out_fd);
+
+  if ((a->ns_flags & NOVA_NS_UTS) && a->hostname && a->hostname[0])
+    ::sethostname(a->hostname, std::strlen(a->hostname));
+
+  if (a->ns_flags & NOVA_NS_MOUNT) {
+    if (a->rootfs && a->rootfs[0]) {
+      if (iso_setup_rootfs(a->rootfs) != 0) _exit(125); // rootfs failure is fatal (would leak host FS)
+    } else {
+      ::mount("", "/", nullptr, MS_REC | MS_PRIVATE, nullptr);
+    }
+    // A fresh /proc so a PID-namespaced process sees ONLY its own tree (and `ps` works inside).
+    if (a->ns_flags & NOVA_NS_PID)
+      ::mount("proc", "/proc", "proc", 0, nullptr);
+  }
+
+  if (a->no_new_privs) ::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+  if (a->drop_caps) iso_drop_caps();
+  if (a->seccomp_deny) iso_install_seccomp(); // AFTER no_new_privs (required without CAP_SYS_ADMIN)
+
+  ::execvp(a->argv[0], a->argv);
+  _exit(127);
+}
+#endif // __linux__
+
+// I4: spawn `cmd` under container-grade isolation. On Linux, clone() into the requested namespaces with
+// a private rootfs / dropped caps / seccomp per the flags; the returned ProcessContext is a normal child
+// (waitpid/kill/pid all work). On non-Linux, isolation is unsupported → degrade to a plain spawn.
+ProcessContext *nova_process_spawn_isolated(const char *cmd, const char *args_str, long ns_flags,
+                                            const char *rootfs, const char *hostname, int drop_caps,
+                                            int no_new_privs, int seccomp_deny) {
+#if defined(__linux__)
+  char *c_cmd = nova_to_cstr(cmd);
+  char *c_args = nova_to_cstr(args_str);
+  char *c_rootfs = nova_to_cstr(rootfs);
+  char *c_host = nova_to_cstr(hostname);
+
+  int in_pipe[2] = {-1, -1}, out_pipe[2] = {-1, -1};
+  if (::pipe(in_pipe) != 0 || ::pipe(out_pipe) != 0) {
+    if (in_pipe[0] >= 0) { ::close(in_pipe[0]); ::close(in_pipe[1]); }
+    if (out_pipe[0] >= 0) { ::close(out_pipe[0]); ::close(out_pipe[1]); }
+    nova_free_cstr(cmd, c_cmd); nova_free_cstr(args_str, c_args);
+    nova_free_cstr(rootfs, c_rootfs); nova_free_cstr(hostname, c_host);
+    return nullptr;
+  }
+
+  // Build argv now (parent side); the child copies memory (no CLONE_VM), so it stays valid.
+  static thread_local std::vector<std::string> storage;
+  std::vector<char *> argv = nova_build_argv(c_cmd ? c_cmd : "", c_args, storage);
+
+  int clone_flags = SIGCHLD; // so the parent can waitpid the child
+  if (ns_flags & NOVA_NS_PID)   clone_flags |= CLONE_NEWPID;
+  if (ns_flags & NOVA_NS_MOUNT) clone_flags |= CLONE_NEWNS;
+  if (ns_flags & NOVA_NS_UTS)   clone_flags |= CLONE_NEWUTS;
+  if (ns_flags & NOVA_NS_IPC)   clone_flags |= CLONE_NEWIPC;
+  if (ns_flags & NOVA_NS_NET)   clone_flags |= CLONE_NEWNET;
+  if (ns_flags & NOVA_NS_USER)  clone_flags |= CLONE_NEWUSER;
+
+  IsoChildArgs cargs{argv.data(), in_pipe[0], out_pipe[1], ns_flags,
+                     c_rootfs ? c_rootfs : "", c_host ? c_host : "",
+                     drop_caps, no_new_privs, seccomp_deny};
+
+  const size_t STACK = 1 << 20; // 1 MiB child stack
+  void *stack = ::mmap(nullptr, STACK, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+  pid_t pid = -1;
+  if (stack != MAP_FAILED)
+    pid = ::clone(iso_child_entry, (char *)stack + STACK, clone_flags, &cargs);
+
+  if (pid < 0) {
+    if (stack != MAP_FAILED) ::munmap(stack, STACK);
+    ::close(in_pipe[0]); ::close(in_pipe[1]); ::close(out_pipe[0]); ::close(out_pipe[1]);
+    nova_free_cstr(cmd, c_cmd); nova_free_cstr(args_str, c_args);
+    nova_free_cstr(rootfs, c_rootfs); nova_free_cstr(hostname, c_host);
+    return nullptr;
+  }
+
+  // Parent: keep the stdio ends the parent talks on; close the child's copies.
+  ::close(in_pipe[0]);
+  ::close(out_pipe[1]);
+  nova_free_cstr(cmd, c_cmd); nova_free_cstr(args_str, c_args);
+  nova_free_cstr(rootfs, c_rootfs); nova_free_cstr(hostname, c_host);
+  // (stack is intentionally leaked for the child's lifetime; a per-child free would need a reaping hook.)
+  return new ProcessContext{(long)pid, in_pipe[1], out_pipe[0], 0, false};
+#else
+  (void)ns_flags; (void)rootfs; (void)hostname; (void)drop_caps; (void)no_new_privs; (void)seccomp_deny;
+  return nova_process_spawn(cmd, args_str); // isolation unsupported off Linux → plain supervision
+#endif
+}
+
 int nova_process_write_stdin(ProcessContext *ctx, const char *data) {
   if (!ctx || ctx->in_fd < 0 || !data)
     return -1;
@@ -1005,6 +1197,12 @@ void nova_process_free(ProcessContext *ctx) {
 // Windows: process control is unimplemented (the orchestrator targets Linux). Stubs keep the PE build linking.
 ProcessContext *nova_process_spawn(const char *cmd, const char *args_str) {
   (void)cmd; (void)args_str; return nullptr;
+}
+ProcessContext *nova_process_spawn_isolated(const char *cmd, const char *args_str, long ns_flags,
+                                            const char *rootfs, const char *hostname, int drop_caps,
+                                            int no_new_privs, int seccomp_deny) {
+  (void)cmd; (void)args_str; (void)ns_flags; (void)rootfs; (void)hostname;
+  (void)drop_caps; (void)no_new_privs; (void)seccomp_deny; return nullptr;
 }
 int nova_process_write_stdin(ProcessContext *ctx, const char *data) { (void)ctx; (void)data; return -1; }
 int nova_process_read_stdout(ProcessContext *ctx, char *buf, int max_len) {

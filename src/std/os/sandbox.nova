@@ -1,0 +1,73 @@
+// os/sandbox.nova — container-grade isolation spec for spawning native binaries (I4).
+//
+// Describes the Linux kernel isolation to apply to a workload (namespaces / private rootfs / dropped
+// capabilities / seccomp), and spawns it via the runtime shim (nova_process_spawn_isolated → clone()).
+// The isolation is a DIAL — Level 0 (none) → 1 ("looks like a container": PID/mount/UTS/IPC ns + rootfs
+// + drop caps) → 3 (hardened: + user ns / seccomp / no_new_privs). ALL Linux-only; on macOS/Windows the
+// runtime degrades to a plain spawn (isolation unsupported — documented), so orchestration still works.
+//
+//   let spec = sandbox.level1("/var/lib/nova/rootfs/web", "web-pod");
+//   let p = sandbox.spawn("/app", args, spec);   // isolated on Linux, plain elsewhere
+
+import process;
+import list;
+
+// Namespace bits (mirror the runtime's NovaIsoNs). OR them together for nsFlags.
+pub const NS_PID: int = 1;      // own PID view (becomes PID 1); host PIDs invisible
+pub const NS_MOUNT: int = 2;    // private mount table (needed for rootfs / private /proc)
+pub const NS_UTS: int = 4;      // own hostname
+pub const NS_IPC: int = 8;      // private SysV IPC / POSIX message queues
+pub const NS_NET: int = 16;     // private network stack (I3 Tier-2 territory)
+pub const NS_USER: int = 32;    // user namespace → rootless (uid/gid maps)
+
+pub struct IsolationSpec {
+    pub nsFlags: int,       // OR of NS_* bits
+    pub rootfs: string,     // private root to pivot_root into ("" = keep host FS view, just private mounts)
+    pub hostname: string,   // set inside a UTS ns ("" = inherit)
+    pub dropCaps: bool,     // drop all capabilities + clear bounding set
+    pub noNewPrivs: bool,   // PR_SET_NO_NEW_PRIVS (exec can't gain privileges)
+    pub seccomp: bool,      // install the deny-dangerous-syscalls seccomp filter
+    init() {
+        self.nsFlags = 0;
+        self.rootfs = "";
+        self.hostname = "";
+        self.dropCaps = false;
+        self.noNewPrivs = false;
+        self.seccomp = false;
+    }
+}
+
+// Level 0 — no isolation (cgroups only, applied separately). Trusted first-party workloads.
+pub fn level0(): IsolationSpec { return IsolationSpec(); }
+
+// Level 1 — "looks like a container": PID + mount + UTS + IPC namespaces, a private rootfs, dropped
+// capabilities, no_new_privs. Filesystem + process-visibility isolation; NO network ns yet. Covers most
+// of what "Docker isolation" means. `rootfs` "" keeps the host FS (private mounts only).
+pub fn level1(rootfs: string, hostname: string): IsolationSpec {
+    let s = IsolationSpec();
+    s.nsFlags = NS_PID | NS_MOUNT | NS_UTS | NS_IPC;
+    s.rootfs = rootfs;
+    s.hostname = hostname;
+    s.dropCaps = true;
+    s.noNewPrivs = true;
+    return s;
+}
+
+// Level 3 — hardened: Level 1 + a seccomp filter (deny unshare/setns/mount/pivot_root/ptrace) + a user
+// namespace (rootless). Docker-with-hardening / gVisor-adjacent.
+pub fn level3(rootfs: string, hostname: string): IsolationSpec {
+    let s = level1(rootfs, hostname);
+    s.nsFlags = s.nsFlags | NS_USER;
+    s.seccomp = true;
+    return s;
+}
+
+fn b2i(v: bool): int { return if (v) 1 else 0; }
+
+// Spawn `cmd` with the given isolation. On Linux the runtime clone()s into the namespaces and applies
+// rootfs/caps/seccomp; elsewhere it degrades to a plain spawn. Returns a Process the orchestrator
+// supervises identically (wait/kill/pid).
+pub fn spawn(cmd: string, args: list.List<string>, spec: IsolationSpec): process.Process {
+    return process.Process.spawnIsolated(cmd, args, spec.nsFlags, spec.rootfs, spec.hostname,
+                                         b2i(spec.dropCaps), b2i(spec.noNewPrivs), b2i(spec.seccomp));
+}

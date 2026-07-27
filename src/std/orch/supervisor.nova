@@ -12,6 +12,7 @@ import list;
 import string;
 import orch.spec;
 import orch.isolation;
+import os.sandbox;
 
 pub struct Supervisor {
     pub spec: spec.Spec,
@@ -30,7 +31,14 @@ pub struct Supervisor {
 
     fn spawnOne(self: Supervisor): void {
         if (!self.manageProcesses) { return; }
-        let p = process.Process.spawn(self.spec.binaryPath, self.spec.args);
+        // I4: isolationLevel>0 clone()s the child into namespaces + rootfs + dropped caps (+ seccomp at
+        // level 3); level 0 is a plain spawn. Linux-only — degrades to a plain spawn elsewhere.
+        let p = if (self.spec.isolationLevel <= 0)
+                    process.Process.spawn(self.spec.binaryPath, self.spec.args)
+                else if (self.spec.isolationLevel >= 3)
+                    sandbox.spawn(self.spec.binaryPath, self.spec.args, sandbox.level3(self.spec.rootfs, self.spec.name))
+                else
+                    sandbox.spawn(self.spec.binaryPath, self.spec.args, sandbox.level1(self.spec.rootfs, self.spec.name));
         // Apply cgroups-v2 limits (Linux; best-effort no-op elsewhere) to the freshly-spawned child.
         let _ = isolation.applyLimits(self.spec, p.pid());
         self.procs.push(p);

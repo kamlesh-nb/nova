@@ -23,6 +23,11 @@ pub struct Spec {
     pub probePort: int,
     pub probePath: string,
     pub probePeriodMs: int,
+    // I4 container-grade isolation dial: 0 = none (plain spawn), 1 = "looks like a container"
+    // (PID/mount/UTS/IPC ns + rootfs + drop caps), 3 = hardened (+ user ns / seccomp). Linux-only;
+    // degrades to a plain spawn elsewhere. `rootfs` = the private root to pivot into ("" = host FS).
+    pub isolationLevel: int,
+    pub rootfs: string,
     init(name: string, binaryPath: string) {
         self.name = name;
         self.binaryPath = binaryPath;
@@ -35,6 +40,8 @@ pub struct Spec {
         self.probePort = 0;
         self.probePath = "/healthz";
         self.probePeriodMs = 2000;
+        self.isolationLevel = 0;
+        self.rootfs = "";
     }
 }
 
@@ -64,6 +71,8 @@ pub fn parseSpec(text: string): Spec {
         }
     }
 
+    s.isolationLevel = (json.asNumber(json.get(root, "isolationLevel")) ?? 0) as int;
+    s.rootfs = json.asString(json.get(root, "rootfs")) ?? "";
     s.cpuMilli = (json.asNumber(json.get(root, "cpuMilli")) ?? 0) as int;
     s.memMaxBytes = json.asNumber(json.get(root, "memMaxBytes")) ?? 0;
     s.pidsMax = (json.asNumber(json.get(root, "pidsMax")) ?? 0) as int;
@@ -88,6 +97,8 @@ pub fn specsEqual(a: Spec, b: Spec): bool {
     if (a.pidsMax != b.pidsMax) { return false; }
     if (a.probePort != b.probePort) { return false; }
     if (!string.eql(a.probePath, b.probePath)) { return false; }
+    if (a.isolationLevel != b.isolationLevel) { return false; }
+    if (!string.eql(a.rootfs, b.rootfs)) { return false; }
     if (a.args.size() != b.args.size()) { return false; }
     let i = 0;
     while (i < a.args.size()) {

@@ -282,6 +282,9 @@ int  nova_process_write_stdin(ProcessContext *ctx, const char *data);
 int  nova_process_read_stdout(ProcessContext *ctx, char *buf, int max_len);
 int  nova_process_wait(ProcessContext *ctx);
 long long nova_process_pid(ProcessContext *ctx);
+ProcessContext *nova_process_spawn_isolated(const char *cmd, const char *args_str, long ns_flags,
+                                            const char *rootfs, const char *hostname, int drop_caps,
+                                            int no_new_privs, int seccomp_deny);
 int  nova_process_try_wait(ProcessContext *ctx);
 int  nova_process_kill(ProcessContext *ctx, int sig);
 void nova_process_free(ProcessContext *ctx);

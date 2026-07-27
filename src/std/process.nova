@@ -25,6 +25,25 @@ pub struct Process {
         };
     }
 
+    // I4: spawn `cmd` under container-grade isolation (Linux namespaces / rootfs / caps / seccomp). The
+    // flags/rootfs/hostname come from an os.isolation IsolationSpec (see std/os/isolation.nova). On
+    // non-Linux this degrades to a plain spawn (the runtime handles the fallback). Returns a Process the
+    // orchestrator supervises exactly like a plain one (wait/kill/pid all work on the isolated child).
+    pub fn spawnIsolated(cmd: string, args: list.List<string>, nsFlags: int, rootfs: string,
+                         hostname: string, dropCaps: int, noNewPrivs: int, seccomp: int): Process {
+        let args_str = "";
+        let i = 0;
+        let count = args.size();
+        while (i < count) {
+            if (i > 0) { args_str = args_str + "\n"; }
+            args_str = args_str + args.get(i);
+            i = i + 1;
+        }
+        let ctx = nova_process_spawn_isolated(cmd, args_str, nsFlags, rootfs, hostname,
+                                              dropCaps, noNewPrivs, seccomp);
+        return Process{ ctx: ctx };
+    }
+
     pub fn write(self: Process, data: string): int {
         return nova_process_write_stdin(self.ctx, data);
     }
