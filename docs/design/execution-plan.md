@@ -96,6 +96,11 @@ ordering:
 2. **Framework / data layer** — the HTTP stack (W5/W6/W7), D7 driver production-readiness.
 3. **Infrastructure (rides on a stable language, last tier)** — R1 process primitives, I1 proxy, I2 orchestrator,
    I3 virtual network, I4 isolation, and BT1 (separate btree repo).
+   **⚠️ RELOCATED (2026-07-28):** I1–I4 are APPLICATIONS built on the language, NOT stdlib. They now ship as
+   a separate package `packages/nova-orchestrator/` (net.proxy/autoscale/service, orch.*, os.sandbox) with its
+   own `tests/` (gates 167/178–183) + `run-tests.sh`, resolved like the DB drivers. Only the runtime SEAMS
+   stay in the language: `nova_process_{try_wait,pid,spawn_isolated}`, `nova_aserver_listen_addr`,
+   `asyncio.sleep`, and R1's `process` module. The stdlib is pure language again.
 
 Rule of thumb: **if an item would pull focus off the language and it isn't unblocking a language feature, it waits.**
 The infra epics (I1–I4) are the *demonstration* that the language is ready — they are built ON a finished language,

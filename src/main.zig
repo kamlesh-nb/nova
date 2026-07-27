@@ -278,7 +278,7 @@ fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocator: 
         const sub = module_name[4..];
         return try std.fmt.allocPrint(allocator, "src/std/{s}.nova", .{sub});
     }
-    const std_modules = [_][]const u8{ "net/tcp/socket", "net/tcp/server", "net/tcp/client", "net/tls", "net/url", "net/asyncio", "net/asynctls", "net/proxy", "net/autoscale", "net/service", "orch/spec", "orch/isolation", "orch/supervisor", "orch/nativelet", "orch/autoscaler", "os/sandbox", "web/request", "web/response", "web/mime", "web/status", "web/methods", "web/server", "web/client", "web/mediator", "web/routing", "web/middleware", "web/url", "web/cookie", "web/cors", "web/request_id", "web/redact", "web/secure_headers", "web/body_limit", "web/recovery", "web/rate_limit", "web/multipart", "web/session", "web/csrf", "web/di", "web/controller", "web/router", "web/app", "web/logger", "concurrency/fiber", "concurrency/channel", "concurrency/asyncchan", "concurrency/atomic", "concurrency/async_util", "concurrency/actor", "io/file", "io/dir", "collections/list", "collections/map", "collections/set", "collections/string_builder", "serde/json", "serde/source", "serde/bson", "serde/yaml", "mem/allocator", "mem/arena_allocator", "mem/memory", "string", "datetime", "math", "assert", "traits", "env", "crypto/sha", "crypto/md5", "crypto/base64", "crypto/random", "crypto/scram", "process", "fs", "exception", "data/db", "data/sql/pool", "text/utf8", "text/regex", "webview", "web/static_content", "web/circuit_breaker", "resilience/breaker", "compress/gzip", "data/orm" };
+    const std_modules = [_][]const u8{ "net/tcp/socket", "net/tcp/server", "net/tcp/client", "net/tls", "net/url", "net/asyncio", "net/asynctls", "web/request", "web/response", "web/mime", "web/status", "web/methods", "web/server", "web/client", "web/mediator", "web/routing", "web/middleware", "web/url", "web/cookie", "web/cors", "web/request_id", "web/redact", "web/secure_headers", "web/body_limit", "web/recovery", "web/rate_limit", "web/multipart", "web/session", "web/csrf", "web/di", "web/controller", "web/router", "web/app", "web/logger", "concurrency/fiber", "concurrency/channel", "concurrency/asyncchan", "concurrency/atomic", "concurrency/async_util", "concurrency/actor", "io/file", "io/dir", "collections/list", "collections/map", "collections/set", "collections/string_builder", "serde/json", "serde/source", "serde/bson", "serde/yaml", "mem/allocator", "mem/arena_allocator", "mem/memory", "string", "datetime", "math", "assert", "traits", "env", "crypto/sha", "crypto/md5", "crypto/base64", "crypto/random", "crypto/scram", "process", "fs", "exception", "data/db", "data/sql/pool", "text/utf8", "text/regex", "webview", "web/static_content", "web/circuit_breaker", "resilience/breaker", "compress/gzip", "data/orm" };
     for (std_modules) |m| {
         if (std.mem.eql(u8, module_name, m)) {
             return try std.fmt.allocPrint(allocator, "src/std/{s}.nova", .{module_name});
@@ -400,12 +400,30 @@ fn resolveFromPackageCache(module_name: []const u8, allocator: std.mem.Allocator
 /// Returns an owned path on the first hit, else null; the installed path stays the package cache.
 fn resolveFromLocalPackages(module_name: []const u8, allocator: std.mem.Allocator, io: std.Io) ?[]const u8 {
     const roots = [_][]const u8{ "packages", "../packages" };
+    // 1. The single-module convention: `import postgres` → packages/nova-postgres/src/postgres.nova.
     for (roots) |root| {
         const candidate = std.fmt.allocPrint(allocator, "{s}/nova-{s}/src/{s}.nova", .{ root, module_name, module_name }) catch continue;
         if (Io.Dir.access(.cwd(), io, candidate, .{})) |_| {
             return candidate;
         } else |_| {
             allocator.free(candidate);
+        }
+    }
+    // 2. MULTI-module packages (e.g. nova-orchestrator holds net/proxy, orch/*, os/sandbox): scan every
+    //    local package's src/ for `<module_name>.nova` (dotted names arrive as slashes). Mirrors the
+    //    package-cache resolver so a dev checkout resolves a package's dotted modules from anywhere.
+    for (roots) |root| {
+        const dir = Io.Dir.openDir(.cwd(), io, root, .{ .iterate = true }) catch continue;
+        defer Io.Dir.close(dir, io);
+        var it = Io.Dir.iterate(dir);
+        while (it.next(io) catch null) |entry| {
+            if (entry.kind != .directory) continue;
+            const candidate = std.fmt.allocPrint(allocator, "{s}/{s}/src/{s}.nova", .{ root, entry.name, module_name }) catch continue;
+            if (Io.Dir.access(.cwd(), io, candidate, .{})) |_| {
+                return candidate;
+            } else |_| {
+                allocator.free(candidate);
+            }
         }
     }
     return null;
