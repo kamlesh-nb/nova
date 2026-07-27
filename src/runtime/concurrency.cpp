@@ -89,7 +89,21 @@ namespace {
 // static-destruction-order fiasco: background threads (the pool / scheduler) can
 // still post to the io_context and touch these mutexes/maps during teardown, and
 // destructing them first crashes with "mutex lock failed". The OS reclaims on exit.
-boost::asio::io_context &g_io = *new boost::asio::io_context();
+// P0 (share-nothing, docs/design/path-a-share-nothing-scope.md): the reactor pool. A Reactor
+// is one io_context that will (P3) own a pinned thread and share nothing with its peers. For P0
+// there is exactly ONE reactor and `g_io` ALIASES it, so behavior is byte-identical to the old
+// single shared io_context — this phase lands ONLY the abstraction (the struct + the pool + the
+// accessors) that P1 (coroutine→reactor affinity) and P3 (N = cores-1) build on. Leaked like
+// every runtime singleton (no static-destruction-order fiasco).
+struct Reactor {
+    boost::asio::io_context io;
+    int id;
+    explicit Reactor(int i) : id(i) {}
+};
+std::vector<Reactor *> &g_reactors = *new std::vector<Reactor *>{new Reactor(0)};
+// (accessors reactor_at/reactor_count arrive in P1 when coroutine→reactor affinity uses them.)
+// The historical name, now bound to reactor 0. Every existing use routes through the pool.
+boost::asio::io_context &g_io = g_reactors[0]->io;
 
 using nova_coro_fn = void (*)(void *);
 inline void raw_coro_resume(long long h) {
