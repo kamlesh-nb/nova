@@ -43,7 +43,7 @@ pub fn parse(raw: string): Url {
     let colonIdx = string.indexOf(hostport, ":");
     if (colonIdx != -1) {
         host = string.slice(hostport, 0, colonIdx);
-        port = string.parseI64(string.slice(hostport, colonIdx + 1, hostport.length));
+        port = string.parseI64(string.slice(hostport, colonIdx + 1, hostport.length)) as int;
     }
 
     // Split the query off the path (the path field keeps `?query` for the request line).

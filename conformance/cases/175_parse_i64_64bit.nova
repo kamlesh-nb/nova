@@ -1,0 +1,30 @@
+// `string.parseI64` — named for 64-bit — returned `int` (32-bit) and accumulated in an `int`, so any
+// value >= 2^31 OVERFLOWED and wrapped (`parseI64("2147483648")` → -2147483648). Callers that return
+// `long` and route through it silently corrupted large numbers: MultiMapSource.getInt / itemInt
+// (query/form binding), json.asNumber, serde ParamSource.getInt, yaml numbers. Fix: accumulate and
+// return `long`; the few callers that assign to an `int` (URL port, HTTP status code) cast `as int`.
+
+import assert;
+import string;
+
+@test
+fn test_values_at_and_beyond_int32(): void {
+    assert.isTrue(string.parseI64("2147483647") == 2147483647);     // int32 max — was already ok
+    assert.isTrue(string.parseI64("2147483648") == 2147483648);     // int32 max + 1 — WRAPPED before
+    assert.isTrue(string.parseI64("9999999999") == 9999999999);     // 10 digits
+    assert.isTrue(string.parseI64("1000000000000") == 1000000000000);
+}
+
+@test
+fn test_negatives_and_edges(): void {
+    assert.isTrue(string.parseI64("-5000000000") == -5000000000);   // large negative, no wrap
+    assert.isTrue(string.parseI64("-17") == -17);
+    assert.isTrue(string.parseI64("0") == 0);
+    assert.isTrue(string.parseI64("") == 0);                        // empty → 0 (graceful)
+}
+
+@test
+fn test_small_values_unchanged(): void {
+    assert.isTrue(string.parseI64("42") == 42);
+    assert.isTrue(string.parseI64("200") == 200);                   // HTTP-code-sized still fine
+}

@@ -101,7 +101,7 @@ pub struct Response {
         let parts = string.split(status_line, " ");
         let code = 200;
         if (parts.size() >= 2) {
-            code = string.parseI64(parts.get(1) ?? "200");
+            code = string.parseI64(parts.get(1) ?? "200") as int;
         }
         let stat = Status.fromCode(code);
 

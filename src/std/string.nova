@@ -515,14 +515,17 @@ pub fn hash(s: string): int {
 }
 
 /// Parse a string to an integer. Returns 0 if invalid.
-pub fn parseI64(s: string): int {
+pub fn parseI64(s: string): long {
+    // Accumulate at 64-bit: the name says I64, but `result` was an `int` (32-bit), so any value
+    // >= 2^31 overflowed and wrapped (a large query-param / DB number silently corrupted, since
+    // callers like MultiMapSource.getInt / json.asNumber return `long`). result/sign are `long`.
     let len = s.length;
     if (len == 0) {
         return 0;
     }
-    let result = 0;
+    let result: long = 0;
     let i = 0;
-    let sign = 1;
+    let sign: long = 1;
     if (s[0] == 45) { // '-'
         sign = -1;
         i = 1;
@@ -530,7 +533,7 @@ pub fn parseI64(s: string): int {
     while (i < len) {
         let c = s[i];
         if (c >= 48 && c <= 57) {
-            result = result * 10 + (c - 48);
+            result = result * 10 + ((c - 48) as long);
         }
         i = i + 1;
     }
