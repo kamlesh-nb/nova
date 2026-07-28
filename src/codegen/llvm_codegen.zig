@@ -2034,7 +2034,7 @@ pub const LlvmCompiler = struct {
                     },
                 };
 
-                var lambda_return_type: []const u8 = if (is_void_lambda) "void" else "i32";
+                var lambda_return_type: []const u8 = if (is_void_lambda) (if (self.is_wasm) "i32" else "void") else "i32";
 
                 if (!is_void_lambda) {
                     if (self.typed_ir) |ir| {
@@ -3011,6 +3011,7 @@ pub const LlvmCompiler = struct {
     pub const buildClosureCall = expressions_mod.buildClosureCall;
     pub const buildBareFnBox = expressions_mod.buildBareFnBox;
     pub const fnBoxReturn = expressions_mod.fnBoxReturn;
+    pub const fnRefInt = expressions_mod.fnRefInt;
     pub const identNamesVariable = expressions_mod.identNamesVariable;
     pub const widenBranchToTrait = expressions_mod.widenBranchToTrait;
     pub const buildDriveAsyncCall = expressions_mod.buildDriveAsyncCall;

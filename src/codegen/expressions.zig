@@ -84,23 +84,39 @@ pub fn buildBareFnBox(self: *LlvmCompiler, fn_val: types.LLVMValueRef) anyerror!
     }
 
     const i32_t = self.i32_type;
-    const payload_t = core.LLVMArrayType(self.val_type, 2);
-    var box_fields = [_]types.LLVMTypeRef{ i32_t, i32_t, payload_t };
-    const box_t = core.LLVMStructType(&box_fields, 3, 1);
     const box_name = try std.fmt.allocPrintSentinel(self.allocator, "__fnbox_{s}", .{fn_name}, 0);
     defer self.allocator.free(box_name);
-    const box_g = core.LLVMAddGlobal(self.module, box_t, box_name);
-    var slots = [_]types.LLVMValueRef{
-
-        if (self.is_wasm) core.LLVMConstInt(self.val_type, 0, 0) else core.LLVMConstPtrToInt(thunk, self.val_type),
-        core.LLVMConstInt(self.val_type, 0, 0),
+    const box_g = blk: {
+        if (self.is_wasm) {
+            var box_fields = [_]types.LLVMTypeRef{ i32_t, i32_t, self.ptr_type, i32_t, self.val_type };
+            const box_t = core.LLVMStructType(&box_fields, 5, 1);
+            const g = core.LLVMAddGlobal(self.module, box_t, box_name);
+            var box_init = [_]types.LLVMValueRef{
+                core.LLVMConstInt(i32_t, 100000000, 0),
+                core.LLVMConstInt(i32_t, 16, 0),
+                thunk,
+                core.LLVMConstInt(i32_t, 0, 0),
+                core.LLVMConstInt(self.val_type, 0, 0),
+            };
+            core.LLVMSetInitializer(g, core.LLVMConstStruct(&box_init, 5, 1));
+            break :blk g;
+        }
+        const payload_t = core.LLVMArrayType(self.val_type, 2);
+        var box_fields = [_]types.LLVMTypeRef{ i32_t, i32_t, payload_t };
+        const box_t = core.LLVMStructType(&box_fields, 3, 1);
+        const g = core.LLVMAddGlobal(self.module, box_t, box_name);
+        var slots = [_]types.LLVMValueRef{
+            core.LLVMConstPtrToInt(thunk, self.val_type),
+            core.LLVMConstInt(self.val_type, 0, 0),
+        };
+        var box_init = [_]types.LLVMValueRef{
+            core.LLVMConstInt(i32_t, 100000000, 0),
+            core.LLVMConstInt(i32_t, 16, 0),
+            core.LLVMConstArray(self.val_type, &slots, 2),
+        };
+        core.LLVMSetInitializer(g, core.LLVMConstStruct(&box_init, 3, 1));
+        break :blk g;
     };
-    var box_init = [_]types.LLVMValueRef{
-        core.LLVMConstInt(i32_t, 100000000, 0),
-        core.LLVMConstInt(i32_t, 16, 0),
-        core.LLVMConstArray(self.val_type, &slots, 2),
-    };
-    core.LLVMSetInitializer(box_g, core.LLVMConstStruct(&box_init, 3, 1));
     core.LLVMSetGlobalConstant(box_g, 0);
     core.LLVMSetLinkage(box_g, .LLVMInternalLinkage);
 
@@ -111,17 +127,25 @@ pub fn buildBareFnBox(self: *LlvmCompiler, fn_val: types.LLVMValueRef) anyerror!
 pub fn fnBoxReturn(self: *LlvmCompiler, box_g: types.LLVMValueRef, fn_name: []const u8) anyerror!types.LLVMValueRef {
     const base = core.LLVMBuildPtrToInt(self.builder, box_g, self.val_type, "fnbox_base");
     const ptr = core.LLVMBuildAdd(self.builder, base, core.LLVMConstInt(self.val_type, 8, 0), "fnbox_ptr");
-    if (self.is_wasm) {
-        const thunk_name = try std.fmt.allocPrintSentinel(self.allocator, "__fnbox_thunk_{s}", .{fn_name}, 0);
-        defer self.allocator.free(thunk_name);
-        const thunk = core.LLVMGetNamedFunction(self.module, thunk_name);
-        if (thunk != null) {
-            const slot = core.LLVMBuildIntToPtr(self.builder, ptr, self.ptr_type, "fnbox_slot");
-            const thunk_addr = core.LLVMBuildPtrToInt(self.builder, thunk, self.val_type, "thunk_addr");
-            _ = core.LLVMBuildStore(self.builder, thunk_addr, slot);
-        }
-    }
+    _ = fn_name;
     return ptr;
+}
+
+pub fn fnRefInt(self: *LlvmCompiler, fn_val: types.LLVMValueRef, name: []const u8) anyerror!types.LLVMValueRef {
+    if (!self.is_wasm) return core.LLVMBuildPtrToInt(self.builder, fn_val, self.val_type, "fn_ref_int");
+    const gname = try std.fmt.allocPrintSentinel(self.allocator, "__fnref_{s}", .{name}, 0);
+    defer self.allocator.free(gname);
+    const g = core.LLVMGetNamedGlobal(self.module, gname.ptr) orelse blk: {
+        var fields = [_]types.LLVMTypeRef{ self.ptr_type, self.i32_type };
+        const gty = core.LLVMStructType(&fields, 2, 1);
+        const ng = core.LLVMAddGlobal(self.module, gty, gname.ptr);
+        var init = [_]types.LLVMValueRef{ fn_val, core.LLVMConstInt(self.i32_type, 0, 0) };
+        core.LLVMSetInitializer(ng, core.LLVMConstStruct(&init, 2, 1));
+        core.LLVMSetGlobalConstant(ng, 1);
+        core.LLVMSetLinkage(ng, .LLVMInternalLinkage);
+        break :blk ng;
+    };
+    return core.LLVMBuildLoad2(self.builder, self.val_type, g, "fnref_raw");
 }
 
 pub fn buildClosureCall(self: *LlvmCompiler, box_val: types.LLVMValueRef, call_args: []const ast.Expression) anyerror!types.LLVMValueRef {
@@ -698,7 +722,7 @@ fn buildClosureCleanup(self: *LlvmCompiler, lambda_name: []const u8, span: ast.S
     const name = try std.fmt.allocPrintSentinel(self.allocator, "__clocleanup_{s}", .{lambda_name}, 0);
     defer self.allocator.free(name);
     if (core.LLVMGetNamedFunction(self.module, name.ptr)) |existing| {
-        return core.LLVMBuildPtrToInt(self.builder, existing, self.val_type, "cleanup_ptr");
+        return try self.fnRefInt(existing, name);
     }
 
     const es = self.valSlotSize();
@@ -734,7 +758,7 @@ fn buildClosureCleanup(self: *LlvmCompiler, lambda_name: []const u8, span: ast.S
     _ = core.LLVMBuildRetVoid(self.builder);
     if (saved_ip) |sip| core.LLVMPositionBuilderAtEnd(self.builder, sip);
 
-    return core.LLVMBuildPtrToInt(self.builder, clean_fn, self.val_type, "cleanup_ptr");
+    return try self.fnRefInt(clean_fn, name);
 }
 
 pub fn initDefaultContainerFields(self: *LlvmCompiler, struct_name: []const u8, instance_ptr: types.LLVMValueRef, span: ast.Span) anyerror!void {
@@ -2866,7 +2890,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 break :blk self.closure_lambdas.get(base_key) orelse return error.LambdaNotFound;
             };
             const fn_val = self.func_map.get(lambda_name) orelse return error.LambdaValueNotFound;
-            const fn_ptr_int = core.LLVMBuildPtrToInt(self.builder, fn_val, self.val_type, "lambda_ptr_int");
+            const fn_ptr_int = try self.fnRefInt(fn_val, lambda_name);
 
             const es = self.valSlotSize();
 

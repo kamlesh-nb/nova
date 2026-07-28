@@ -88,4 +88,5 @@
 93_loop_early_return_arc.nova
 94_decimal_conv.nova
 95_decimal_parse.nova
+98_serde_json_yaml_coimport.nova
 99_serde_struct_decimal.nova
