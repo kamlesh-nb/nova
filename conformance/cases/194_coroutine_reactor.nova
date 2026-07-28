@@ -1,0 +1,60 @@
+// Phase 4 milestone 3: an LLVM coroutine driven directly by the Nova event loop, with NO Asio.
+// The handler is a normal `async fn` that registers its own coroutine handle with the reactor and
+// yields (coroSuspend); when the fd is ready the reactor resumes it (nova_reactor_resume), it reads
+// and echoes, and returns. This is the coroutine-integration step: real async handlers on the
+// self-hosted loop, single reactor thread so no scheduler state and no lock (the lockless
+// per-reactor model). Deterministic and offline via a socketpair. macOS/BSD.
+import assert;
+import bytes;
+import os.sys;
+import net.reactor;
+
+async fn echoOnce(r: reactor.Reactor, fd: int): void {
+    r.addRead(fd, currentCoro());   // register self on the reactor
+    coroSuspend();                  // yield until the fd is readable
+    let buf = r.getBuffer();
+    let n = sys.read(fd, buf, 4096);
+    if (n > 0) {
+        sys.write(fd, buf, n);      // echo
+    }
+    r.putBuffer(buf);
+}
+
+@test
+fn test_coroutine_reactor_echo(): void {
+    let (client, server) = sys.newSocketPair(sys.AF_UNIX, sys.SOCK_STREAM);
+    let r = reactor.Reactor(16, 4096, 8);
+
+    // Start the handler coroutine unscheduled: it runs to its first coroSuspend (registering
+    // read-interest on server), then returns its handle. No Asio involved.
+    let h = coroStart(echoOnce(r, server));
+    assert.isTrue(h != 0);
+
+    // Client sends "ping".
+    let out = bytes.alloc(4);
+    bytes.write_byte(out, 0, 112);
+    bytes.write_byte(out, 1, 105);
+    bytes.write_byte(out, 2, 110);
+    bytes.write_byte(out, 3, 103);
+    assert.isTrue(sys.write(client, out, 4) == 4);
+
+    // The reactor: poll, then resume the ready coroutine. It reads, echoes, and finishes.
+    let n = r.poll(1000);
+    assert.equalInt(n, 1);
+    let tok = r.readyToken(0);
+    assert.isTrue(tok != 0);
+    let done = nova_reactor_resume(tok);
+    assert.equalInt(done as int, 1);   // the coroutine ran to completion and was reaped
+
+    // The client gets its echo.
+    let inb = bytes.alloc(16);
+    assert.isTrue(sys.read(client, inb, 16) == 4);
+    assert.equalInt(bytes.read_byte(inb, 0) as int, 112);
+    assert.equalInt(bytes.read_byte(inb, 3) as int, 103);
+
+    bytes.free(out);
+    bytes.free(inb);
+    assert.equalInt(sys.close(client), 0);
+    assert.equalInt(sys.close(server), 0);
+    r.destroy();
+}

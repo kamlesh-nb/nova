@@ -73,6 +73,11 @@ pub const externs = [_]Builtin{
 
     .{ .receiver = "", .name = "nova_pin_next_coro", .ret = .void_ },
 
+    .{ .receiver = "", .name = "currentCoro", .ret = .long },
+    .{ .receiver = "", .name = "coroSuspend", .ret = .void_ },
+    .{ .receiver = "", .name = "coroStart", .ret = .long },
+    .{ .receiver = "", .name = "nova_reactor_resume", .ret = .long },
+
     .{ .receiver = "", .name = "nova_hold_all_reactors", .ret = .void_ },
 
     .{ .receiver = "", .name = "nova_spin_create", .ret = .long },

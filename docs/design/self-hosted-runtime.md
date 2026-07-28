@@ -230,9 +230,23 @@ Each phase ends with a measurement or a conformance gate, so we never fly blind 
   no TLS. A real finding en route: `fcntl` is variadic and a non-variadic FFI declaration mispasses
   its third argument on arm64 (varargs go on the stack), which silently left the listener blocking;
   fixed with a tiny runtime shim `nova_set_nonblock` (the general lesson for variadic syscalls until
-  first-class variadic FFI lands). **Still open in phase 4:** driving LLVM coroutines directly from
-  the reactor (the coroutine-integration step, verified under `--tsan`); share-nothing multi-core
-  via SO_REUSEPORT across N reactor threads; the Linux epoll backend behind the same `Reactor` shape.
+  first-class variadic FFI lands). **Milestone 3 DONE (2026-07-28): LLVM coroutines driven directly
+  by the reactor, no Asio.** A normal `async fn` handler registers its own coroutine handle with the
+  reactor and yields; the reactor resumes it on readiness. Three ADDITIVE primitives (they do not
+  touch any existing `await` path, so the whole async stack is unaffected): `coroStart(asyncCall)`
+  creates a coroutine WITHOUT scheduling it on Asio (spawn is exactly `awaitedCallHandle` plus a
+  separable `nova_sched_schedule`, so omitting the schedule yields an Asio-free handle) and kicks it
+  once past the async initial-suspend so its body registers; `currentCoro()` returns the running
+  coroutine's handle to use as the reactor token; `coroSuspend()` yields to the reactor (reusing the
+  existing `buildAwaitSuspend`). The runtime `nova_reactor_resume(h)` resumes via `raw_coro_resume`
+  and reaps the frame when the coroutine finishes; single reactor thread, so no CoroState and no
+  mutex, which is the lockless per-reactor drive we could not safely retrofit onto Asio. Proven by
+  `conformance/cases/194` (a coroutine echo over a socketpair), clean under `--tsan`. Native 188/188,
+  ASAN 345/345, TSan subset 193/193, case 194 zero races. **Still open in phase 4:** wiring the
+  coroutine handler into the standalone reactor server (one async handler per accepted connection,
+  then re-measure); share-nothing multi-core via SO_REUSEPORT across N reactor threads (where the
+  no-lock CoroState holds because each coroutine lives on exactly one reactor); the Linux epoll
+  backend behind the same `Reactor` shape.
 - **Phase 5. Zero-copy HTTP/1 parser** (picohttpparser model), replacing the per-request maps.
 - **Phase 6. Port the `App` server** onto the Nova reactor. Re-run the head-to-head. Target is
   parity within about 1.2x to 1.5x of Go and Kestrel, which the profile says is reachable.

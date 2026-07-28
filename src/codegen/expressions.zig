@@ -1938,6 +1938,36 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             if (call.callee.kind == .ident) {
                 const name = call.callee.kind.ident;
 
+                // Coroutine-reactor primitives (self-hosted runtime, phase 4). These let a Nova
+                // reactor drive LLVM coroutines directly, with no Asio.
+                if (std.mem.eql(u8, name, "currentCoro")) {
+                    // The current coroutine's handle, to register with the reactor before suspending.
+                    if (self.current_async_hdl) |h| {
+                        return core.LLVMBuildPtrToInt(self.builder, h, self.val_type, "cur_coro");
+                    }
+                    return core.LLVMConstInt(self.val_type, 0, 0);
+                }
+                if (std.mem.eql(u8, name, "coroSuspend")) {
+                    // Yield to the reactor; resumed by nova_reactor_resume when the fd is ready.
+                    try self.buildAwaitSuspend();
+                    return core.LLVMConstInt(self.val_type, 0, 0);
+                }
+                if (std.mem.eql(u8, name, "coroStart")) {
+                    // Create a coroutine from an async call WITHOUT scheduling it on Asio. Async fns
+                    // have an initial suspend, so kick it once (nova_reactor_resume) to run its body
+                    // to the first coroSuspend, where it registers itself with the reactor. Returns
+                    // the handle for the reactor to drive thereafter.
+                    if (call.args.len == 1) {
+                        if (try self.awaitedCallHandle(call.args[0], true)) |h| {
+                            const resume_fn = self.func_map.get("nova_reactor_resume").?;
+                            var ra = [_]types.LLVMValueRef{h};
+                            _ = try self.buildCallWithCasts(resume_fn, &ra);
+                            return h;
+                        }
+                    }
+                    return core.LLVMConstInt(self.val_type, 0, 0);
+                }
+
                 var resolved_struct_name = name;
                 if (self.isCollidingStruct(name)) {
                     if (try self.resolveExpressionTypeName(&expr)) |rt| {

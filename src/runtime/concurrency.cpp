@@ -381,6 +381,23 @@ void nova_sched_schedule(long long handle) {
     });
 }
 
+// Drive a coroutine directly from a Nova-owned reactor loop, bypassing Asio entirely (the
+// self-hosted runtime, docs/design/self-hosted-runtime.md phase 4). The coroutine was created
+// unscheduled (coroStart) and registered its fd with the reactor before suspending (coroSuspend);
+// when the fd is ready, the reactor calls this with the coroutine handle. Returns 1 if the
+// coroutine finished (its frame is reaped here), 0 if it suspended again. Single reactor thread,
+// so no CoroState, no mutex: this is the lockless per-reactor drive.
+extern "C" long long nova_reactor_resume(long long h) {
+    if (!h || raw_coro_done(h)) return 1;
+    raw_coro_resume(h);
+    if (raw_coro_done(h)) {
+        nova_coro_release_held(h);
+        reinterpret_cast<nova_coro_fn *>(h)[1](reinterpret_cast<void *>(h));
+        return 1;
+    }
+    return 0;
+}
+
 void nova_coro_release(long long handle) {
     if (!handle) return;
     std::shared_ptr<CoroState> state;
