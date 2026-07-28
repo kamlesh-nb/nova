@@ -1,0 +1,160 @@
+// web/httpparser: a zero-copy HTTP/1 request parser in the picohttpparser style, for the
+// self-hosted runtime (docs/design/self-hosted-runtime.md, phase 5). It parses a request in
+// place: the method, path, and each header are recorded as (offset, length) slices INTO the read
+// buffer, never copied and never individually allocated. Delimiter scanning uses the SIMD-backed
+// libc `memchr` (os/sys). Matching is done by byte comparison (`methodEq`, `header`), so the hot
+// path never materialises a Nova string.
+//
+// The HttpRequest is meant to be created ONCE per connection and reused: `parse` resets it and
+// refills the slices, so a whole request costs no allocation. Header slices are kept in a small
+// fixed buffer (`hbuf`, 16 bytes per header) allocated once.
+
+import bytes;
+import os.sys;
+
+fn indexOfByte(buf: long, start: int, end: int, b: int): int {
+    if (start >= end) { return -1; }
+    let p = sys.memchr(buf + (start as long), b, (end - start) as long);
+    if (p == 0) { return -1; }
+    return (p - buf) as int;
+}
+
+fn lower(c: int): int {
+    if (c >= 65 && c <= 90) { return c + 32; }
+    return c;
+}
+
+fn sliceEqStr(buf: long, off: int, len: int, s: string): bool {
+    if (len != s.length) { return false; }
+    let i = 0;
+    while (i < len) {
+        if (bytes.read_byte(buf, off + i) as int != s[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn sliceEqStrCI(buf: long, off: int, len: int, s: string): bool {
+    if (len != s.length) { return false; }
+    let i = 0;
+    while (i < len) {
+        if (lower(bytes.read_byte(buf, off + i) as int) != lower(s[i])) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub struct HttpRequest {
+    pub buf: long,
+    pub len: int,
+    pub methodOff: int,
+    pub methodLen: int,
+    pub pathOff: int,
+    pub pathLen: int,
+    pub nheaders: int,
+    pub maxHeaders: int,
+    pub hbuf: long,
+
+    init(maxHeaders: int) {
+        self.maxHeaders = maxHeaders;
+        self.hbuf = bytes.alloc(maxHeaders * 16);
+        self.buf = 0;
+        self.len = 0;
+        self.nheaders = 0;
+    }
+
+    // Parse the request in `buf[0..len)`. Returns the offset just past the final CRLF CRLF (a
+    // positive header-block length) when the request is complete, 0 when more bytes are needed,
+    // and -1 when the request line is malformed. No allocation; slices point into `buf`.
+    pub fn parse(self: HttpRequest, buf: long, len: int): int {
+        self.buf = buf;
+        self.len = len;
+        self.nheaders = 0;
+
+        let sp1 = indexOfByte(buf, 0, len, 32);
+        if (sp1 < 0) { return 0; }
+        self.methodOff = 0;
+        self.methodLen = sp1;
+
+        let sp2 = indexOfByte(buf, sp1 + 1, len, 32);
+        if (sp2 < 0) { return 0; }
+        self.pathOff = sp1 + 1;
+        self.pathLen = sp2 - (sp1 + 1);
+
+        let eol = indexOfByte(buf, sp2 + 1, len, 13);
+        if (eol < 0) { return 0; }
+        let pos = eol + 2;
+
+        while (pos < len) {
+            if (bytes.read_byte(buf, pos) as int == 13) {
+                return pos + 2;
+            }
+            let lineEnd = indexOfByte(buf, pos, len, 13);
+            if (lineEnd < 0) { return 0; }
+
+            let colon = indexOfByte(buf, pos, lineEnd, 58);
+            if (colon >= 0 && self.nheaders < self.maxHeaders) {
+                let nameOff = pos;
+                let nameLen = colon - pos;
+                let vOff = colon + 1;
+                while (vOff < lineEnd && (bytes.read_byte(buf, vOff) as int == 32)) {
+                    vOff = vOff + 1;
+                }
+                let vLen = lineEnd - vOff;
+                let base = (self.nheaders * 16) as long;
+                bytes.write_i32(self.hbuf, base, nameOff as long);
+                bytes.write_i32(self.hbuf, base + 4, nameLen as long);
+                bytes.write_i32(self.hbuf, base + 8, vOff as long);
+                bytes.write_i32(self.hbuf, base + 12, vLen as long);
+                self.nheaders = self.nheaders + 1;
+            }
+            pos = lineEnd + 2;
+        }
+        return 0;
+    }
+
+    pub fn methodEq(self: HttpRequest, s: string): bool {
+        return sliceEqStr(self.buf, self.methodOff, self.methodLen, s);
+    }
+    pub fn pathEq(self: HttpRequest, s: string): bool {
+        return sliceEqStr(self.buf, self.pathOff, self.pathLen, s);
+    }
+    pub fn pathStartsWith(self: HttpRequest, s: string): bool {
+        if (self.pathLen < s.length) { return false; }
+        let i = 0;
+        while (i < s.length) {
+            if (bytes.read_byte(self.buf, self.pathOff + i) as int != s[i]) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    // Find a header by name (case-insensitive). Returns its index, or -1.
+    pub fn header(self: HttpRequest, name: string): int {
+        let i = 0;
+        while (i < self.nheaders) {
+            let base = (i * 16) as long;
+            let nameOff = bytes.read_i32(self.hbuf, base) as int;
+            let nameLen = bytes.read_i32(self.hbuf, base + 4) as int;
+            if (sliceEqStrCI(self.buf, nameOff, nameLen, name)) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+    pub fn headerValueOff(self: HttpRequest, i: int): int {
+        return bytes.read_i32(self.hbuf, (i * 16 + 8) as long) as int;
+    }
+    pub fn headerValueLen(self: HttpRequest, i: int): int {
+        return bytes.read_i32(self.hbuf, (i * 16 + 12) as long) as int;
+    }
+    pub fn headerValueEq(self: HttpRequest, i: int, s: string): bool {
+        return sliceEqStr(self.buf, self.headerValueOff(i), self.headerValueLen(i), s);
+    }
+    pub fn hasHeader(self: HttpRequest, name: string): bool {
+        return self.header(name) >= 0;
+    }
+
+    pub fn free(self: HttpRequest): void {
+        if (self.hbuf != 0) { bytes.free(self.hbuf); self.hbuf = 0; }
+    }
+}

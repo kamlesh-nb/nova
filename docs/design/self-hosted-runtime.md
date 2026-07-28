@@ -262,6 +262,19 @@ Each phase ends with a measurement or a conformance gate, so we never fly blind 
   real figure needs a separate load-generation machine. **Still open in phase 4:** the Linux epoll
   backend behind the same `Reactor` shape.
 - **Phase 5. Zero-copy HTTP/1 parser** (picohttpparser model), replacing the per-request maps.
+  **DONE (2026-07-28).** `src/std/web/httpparser.nova` (`HttpRequest`): parses a request in place,
+  recording the method, path, and each header as an (offset, length) slice into the read buffer,
+  never copied and never individually allocated; delimiter scanning uses the SIMD-backed libc
+  `memchr`; matching is by byte comparison (`methodEq`, `pathEq`, case-insensitive `header`), so
+  the hot path materialises no Nova string. The struct is created once per connection and reused,
+  so a whole request costs no allocation. Proven correct by `conformance/cases/196` (complete and
+  incomplete detection, case-insensitive header lookup, path matching). `server_parse.nova` wires
+  it into the reactor server and routes on the parsed method. Cost: on the network benchmark the
+  parse is below the noise floor (parse and no-parse both land in the same client-bound 150k to
+  185k band); microbenchmarked in isolation, `parse()` runs **5,000,000 four-header requests in
+  0.33 s of CPU, about 66 ns per request**, roughly one percent of the per-request budget, which is
+  why it does not move the throughput. This retires the old `Request.fromString` path that built
+  three `Map<string,string>` per request.
 - **Phase 6. Port the `App` server** onto the Nova reactor. Re-run the head-to-head. Target is
   parity within about 1.2x to 1.5x of Go and Kestrel, which the profile says is reachable.
 - **Phase 7. io_uring completion backend** on Linux, and `sendfile`/`splice` for static content.

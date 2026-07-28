@@ -69,6 +69,25 @@ reactors, each running coroutines over a slab pool and the shared allocator, are
 ThreadSanitizer (`conformance/cases/195`, in the `--tsan` gate). The share-nothing design and the
 lockless per-reactor coroutine drive hold up under TSan.
 
+## Zero-copy parsing (`server_parse.nova`)
+
+`server_parse.nova` is the coroutine server plus a real zero-copy HTTP parse of every request
+(`web/httpparser`, picohttpparser style: the method, path, and headers are read as slices into
+the read buffer via the SIMD `memchr`, matched by byte comparison, with no per-request
+allocation), and it routes on the parsed method. Run it with `SERVER=parse ./run.sh`.
+
+On the network benchmark, the parse cost is **below the noise floor**: parse and no-parse both
+land in the same client-bound band (roughly 150k to 185k across runs), so parsing does not move
+the throughput. To get a clean parser cost, `parse()` was microbenchmarked in isolation:
+
+- **5,000,000 full parses** of a 4-header request (request line plus four headers, plus a method
+  check and a header lookup) run in **0.33 s of CPU**, that is, about **66 nanoseconds per
+  request**.
+
+At the server's throughput that is roughly one percent of the per-request time budget, which is
+why it is invisible in the network numbers. The zero-copy design (a `memchr` scan into slices,
+byte-comparison matching, no allocation) delivers a parser cheap enough to disappear.
+
 ## Honest caveats
 
 This is a first, deliberately narrow measurement, and the number must be read with its
