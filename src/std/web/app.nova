@@ -4,7 +4,6 @@ import net.asynctls;
 import net.reactor;
 import net.reactorio;
 import os.sys;
-import env;
 import io.file;
 import web.request;
 import web.response;
@@ -444,15 +443,9 @@ pub struct App {
     }
 
     pub fn run(self: App, port: int): void {
-        // Default to the Nova reactor (no Asio): share-nothing across the available cores, TLS
-        // included (the reactor now runs inbound TLS via serveReactorConn). NOVA_ASIO=1 forces the
-        // Asio server (an escape hatch while the reactor path settles).
-        let forceAsio = env.get("NOVA_ASIO").length > 0;
-        if (forceAsio) {
-            asyncio.holdReactors();
-            runServer(self, port);
-            return;
-        }
+        // The web server runs on the Nova reactor, share-nothing across the available cores, TLS
+        // included (serveReactorConn tlsAccepts when useTls is set). No Asio: the previous NOVA_ASIO
+        // fallback is retired now that the reactor path carries the whole server (M4).
         let workers = asyncio.reactorCount();
         let n = if (workers < 1) 1 else workers;
         self.runReactorMC(port, n);
@@ -701,36 +694,6 @@ async fn handleConn(app: App, io: AsyncIO): int {
     return 0;
 }
 
-async fn acceptLoop(app: App, port: int): int {
-    let srv = asyncio.serverListen(port);
-    if (srv == 0) {
-        console.log("Nova web: failed to bind port (in use?)");
-        return -1;
-    }
-    while (true) {
-        let client = await asyncio.aaccept(srv);
-        if (app.tlsEnabled) {
-            spawn handleConnTls(app, client);
-        } else {
-            spawn handleConnPlain(app, client);
-        }
-    }
-    return 0;
-}
-
-async fn handleConnPlain(app: App, client: long): int {
-    return await handleConn(app, asyncio.AsyncStream(client));
-}
-
-async fn handleConnTls(app: App, client: long): int {
-    let base = asyncio.AsyncStream(client);
-    let tls = await asynctls.tlsAccept(base, app.tlsCert, app.tlsKey);
-    if (!tls.ok()) {
-        tls.close();
-        return -1;
-    }
-    return await handleConn(app, tls);
-}
 
 // Handle one connection on the Nova reactor (M2 of the C++ runtime retirement plan): wrap the
 // accepted fd in a reactor-native AsyncStream (kq set) and run the same request pipeline as the
@@ -858,18 +821,6 @@ pub fn runReactor(self: App, port: int): void {
             i = i + 1;
         }
     }
-}
-
-async fn runServer(app: App, port: int): int {
-    let n = asyncio.reactorCount();
-    let i = 1;
-    while (i < n) {
-        asyncio.pinNextCoro(i);
-        spawn acceptLoop(app, port);
-        i = i + 1;
-    }
-    console.log("Nova web server listening (share-nothing)");
-    return await acceptLoop(app, port);
 }
 
 @test
