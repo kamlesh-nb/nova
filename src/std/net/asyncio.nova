@@ -1,12 +1,3 @@
-// asyncio.nova — M3-D-6 non-blocking (offloaded) socket I/O for coroutines.
-//
-// The blocking recv/accept runs on a dedicated I/O thread pool, so the calling
-// coroutine PARKS instead of holding a scheduler thread. Use via `await`:
-//   let n = await socketRecvAsync(fd, buf, max);      // bytes read into buf
-//   let client = await socketAcceptAsync(serverFd);   // client fd
-//
-// Called directly (not via `await`) these are stubs returning 0 — the compiler
-// lowers the `await` form to the real parking offload.
 
 pub fn socketRecvAsync(fd: int, buf: int, max: int): int {
     return 0;
@@ -16,83 +7,42 @@ pub fn socketAcceptAsync(fd: int): int {
     return 0;
 }
 
-// ---------------------------------------------------------------------------
-// Scalable async server (M3-D-7): true non-blocking asio. A pending accept/recv/send
-// holds NO thread (registered with kqueue/epoll), so a few scheduler threads serve
-// tens of thousands of connections — each connection is a cheap `go` coroutine.
-//
-//   async fn serve(port: int): int {
-//       let srv = serverListen(port);
-//       while (true) {
-//           let client = await aaccept(srv);   // parks; no thread held
-//           spawn handle(client);                  // one coroutine per connection
-//       }
-//   }
-//   async fn handle(client: long): int {
-//       let buf = bytes.alloc(4096);
-//       let n = await async_read(client, buf, 4096);
-//       await async_write(client, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
-//       aclose(client);
-//       return 0;
-//   }
-
-// Bind + listen on INADDR_ANY; returns an acceptor handle (0 = failure, e.g. port already in use).
 pub fn serverListen(port: int): long {
     return nova_aserver_listen(port);
 }
 
-// Bind + listen on a SPECIFIC address (an I3 Service VIP, e.g. "127.0.0.2"); empty host ⇒ INADDR_ANY.
-// The VIP must already exist on the host (a loopback alias / configured address) — that OS setup is
-// outside Nova. Returns an acceptor handle (0 = failure).
 pub fn serverListenAddr(host: string, port: int): long {
     return nova_aserver_listen_addr(host, port);
 }
 
-// P4c (share-nothing accept fan-out): the number of reactors (= cores-1 / NOVA_THREADS). A server
-// launches one accept loop per reactor so the kernel load-balances connections across cores.
 pub fn reactorCount(): int {
     return nova_worker_count() as int;
 }
-// Pin the NEXT `spawn`ed coroutine to reactor `rid` (one-shot). Call IMMEDIATELY before
-// `spawn acceptLoop(...)` so that accept loop runs on reactor `rid`, binds a SO_REUSEPORT acceptor
-// there, and handles its connections on that reactor's thread — no cross-reactor socket sharing.
+
 pub fn pinNextCoro(rid: int): void {
     nova_pin_next_coro(rid);
 }
-// Hold ALL reactors alive for a server's lifetime. Call ONCE, BEFORE the (async, block-driven) accept
-// fan-out. Installs a work_guard per reactor so no reactor exits on idle; the ordinary block-drive then
-// keeps every reactor running (and never returns → server runs forever). Separate from the transient
-// drive compute/tests use (a program that never calls this keeps the exact transient behavior).
-// Standard server shape:
-//   asyncio.holdReactors();          // BEFORE the block-drive
-//   // in an async fn: for each reactor i>0 { pinNextCoro(i); spawn acceptLoop(port); } + reactor-0 inline
+
 pub fn holdReactors(): void {
     nova_hold_all_reactors();
 }
-// Awaitable client connect: `await aconnect(host, port)` → a socket handle (0 =
-// failure). Resolves + connects without holding a thread. Use async_read/async_write/aclose on
-// the returned handle. Direct call is a stub.
+
 pub fn aconnect(host: string, port: int): long {
     return 0;
 }
-// Awaitable: `await aaccept(srv)` → next client socket handle (parks until a
-// connection arrives). Direct call is a stub.
+
 pub fn aaccept(server: long): long {
     return 0;
 }
-// Awaitable: `await async_read(sock, buf, max)` → bytes read (0 = peer closed, -1 = error).
-// `buf` is a `long` — a 64-bit address (nova_arecv takes `long long`); an `int` param would truncate
-// a computed buffer address like `buf + offset` to 32 bits.
+
 pub fn async_read(sock: long, buf: long, max: int): int {
     return 0;
 }
-// Awaitable recv WITH a deadline: `await async_read_deadline(sock, buf, max, ms)` → bytes read
-// (0 = peer closed, -1 = error, -2 = the `ms`-ms deadline elapsed first). Non-blocking analog of
-// SO_RCVTIMEO — races the recv against a timer, cancelling the loser. Direct call is a stub.
+
 pub fn async_read_deadline(sock: long, buf: long, max: int, ms: int): int {
     return 0;
 }
-// Awaitable: `await async_write(sock, data)` → bytes written (-1 = error).
+
 pub fn async_write(sock: long, data: string): int {
     return 0;
 }
@@ -100,42 +50,20 @@ pub fn aclose(sock: long): void {
     nova_aclose(sock);
 }
 
-// ---------------------------------------------------------------------------
-// AsyncStream (A1 async-first seam): a connected socket over the TRUE-async asio layer.
-// Its recv/send are `async fn` — `await`-ing them PARKS the calling coroutine (registered
-// with kqueue/epoll, holding NO scheduler thread) instead of blocking on a syscall. This is
-// what lets a DB driver's socket I/O stop blocking the scheduler thread: the driver reads via
-// `await stream.recvInto(...)`, so tens of thousands of connections share a few threads.
-//
-//   let s = await asyncConnect("127.0.0.1", 5432);   // parks until connected
-//   let n = await s.recvInto(buf, 4096);             // parks until bytes arrive
-//   await s.sendStr(frame);                          // parks until written
-//   s.close();
-// The non-blocking byte-stream seam a DB driver's reader is written against: `await`-ing
-// recvInto/sendStr parks the coroutine. Implemented by AsyncStream (plaintext) AND TlsStream
-// (encrypted, net/asynctls), so a driver picks plaintext-vs-TLS at connect time WITHOUT
-// touching its read/write code — the reader just holds an `AsyncIO`.
 pub trait AsyncIO {
-    // `buf` is a raw heap address — MUST be `long` (64-bit). Passing it as `int` truncates the
-    // pointer (LLVM inttoptr on an i32) → SIGSEGV for any address above 2GB. An `int` argument still
-    // widens cleanly, so this is backward-compatible with existing `as int` call sites.
+
     async fn recvInto(self, buf: long, max: int): int;
     async fn sendStr(self, data: string): int;
     fn close(self): void;
-    // Bound every subsequent `recvInto` to `ms` milliseconds (an awaited per-recv deadline; a
-    // hung server then surfaces a timeout, `recvInto` -> -2, instead of parking forever). `ms<=0`
-    // clears it. Returns 0. This is the async-first analog of the old blocking SO_RCVTIMEO seam.
+
     fn setTimeout(self, ms: int): int;
 }
 
 pub struct AsyncStream impl AsyncIO {
-    pub sock: long,       // NovaSocket handle (0 = not connected / closed)
-    pub timeoutMs: int,   // per-recv deadline in ms (0 = block until data / EOF / error)
+    pub sock: long,
+    pub timeoutMs: int,
     init(sock: long) { self.sock = sock; self.timeoutMs = 0; }
 
-    // Await bytes into `buf` (a raw pointer as int, capacity `max`). Returns bytes read
-    // (0 = peer closed, -1 = error, -2 = deadline elapsed when a timeout is set). Parks the
-    // coroutine until data arrives (or the deadline fires).
     pub async fn recvInto(self: AsyncStream, buf: long, max: int): int {
         if (self.timeoutMs > 0) { return await async_read_deadline(self.sock, buf, max, self.timeoutMs); }
         return await async_read(self.sock, buf, max);
@@ -144,7 +72,7 @@ pub struct AsyncStream impl AsyncIO {
         self.timeoutMs = if (ms > 0) ms else 0;
         return 0;
     }
-    // Await sending `data` (length-headed, binary-safe). Returns bytes written (-1 = error).
+
     pub async fn sendStr(self: AsyncStream, data: string): int {
         return await async_write(self.sock, data);
     }
@@ -154,15 +82,9 @@ pub struct AsyncStream impl AsyncIO {
     }
 }
 
-// Awaitable connect → an AsyncStream (sock 0 on failure). Resolves + connects without
-// holding a thread.
 pub async fn asyncConnect(host: string, port: int): AsyncStream {
     let s = await aconnect(host, port);
     return AsyncStream(s);
 }
 
-// Non-blocking async delay: `await asyncio.sleep(ms)` arms a steady_timer and suspends the calling
-// coroutine — the reactor runs OTHER coroutines meanwhile (unlike a blocking sleep). The body is a
-// stub: codegen intercepts the `await …sleep(ms)` form and lowers it to nova_await_timer, so this is
-// never actually called. Use ONLY as `await asyncio.sleep(ms)` inside an async fn.
 pub fn sleep(ms: int): int { return 0; }

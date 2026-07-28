@@ -1,13 +1,13 @@
-// atomic.nova — Generic atomic operations for lock-free concurrency.
+
 import bytes;
 
 import assert;
 
 pub struct Atomic<T> {
-    pub ptr: ptr,   // address of the heap-allocated atomic cell
+    pub ptr: ptr,
 
     init(initial: T) {
-        // Handled specially by the compiler, but defined here for type signature
+
     }
 
     pub fn load(self: Atomic<T>): T {
@@ -40,24 +40,24 @@ pub struct Atomic<T> {
 @test
 fn test_atomic_i32(): void {
     let counter = Atomic<int>(10);
-    
+
     assert.equalInt(counter.load(), 10);
-    
+
     counter.store(20);
     assert.equalInt(counter.load(), 20);
-    
+
     let old = counter.add(5);
     assert.equalInt(old, 20);
     assert.equalInt(counter.load(), 25);
-    
+
     let old2 = counter.sub(3);
     assert.equalInt(old2, 25);
     assert.equalInt(counter.load(), 22);
-    
+
     let cas_success = counter.compareAndSwap(22, 30);
     assert.isTrue(cas_success);
     assert.equalInt(counter.load(), 30);
-    
+
     let cas_fail = counter.compareAndSwap(22, 40);
     assert.isFalse(cas_fail);
     assert.equalInt(counter.load(), 30);
@@ -66,16 +66,16 @@ fn test_atomic_i32(): void {
 @test
 fn test_atomic_i64(): void {
     let counter = Atomic<long>(100);
-    
+
     if (counter.load() != 100) {
         assert.fail("load fail for long");
     }
-    
+
     counter.store(200);
     if (counter.load() != 200) {
         assert.fail("store/load fail for long");
     }
-    
+
     let old = counter.add(50);
     if (old != 200) {
         assert.fail("add fail for long");
@@ -83,7 +83,7 @@ fn test_atomic_i64(): void {
     if (counter.load() != 250) {
         assert.fail("load post-add fail for long");
     }
-    
+
     let cas_success = counter.compareAndSwap(250, 300);
     assert.isTrue(cas_success);
     if (counter.load() != 300) {
@@ -94,12 +94,12 @@ fn test_atomic_i64(): void {
 @test
 fn test_atomic_bool(): void {
     let flag = Atomic<bool>(false);
-    
+
     assert.isFalse(flag.load());
-    
+
     flag.store(true);
     assert.isTrue(flag.load());
-    
+
     let cas_success = flag.compareAndSwap(true, false);
     assert.isTrue(cas_success);
     assert.isFalse(flag.load());

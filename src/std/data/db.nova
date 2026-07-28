@@ -1,21 +1,7 @@
-// db.nova — the backend-agnostic database seam.
-//
-// The redesign of the old `data/btree/driver.nova` interface, which was "too naive":
-// string-only params, `any`/`undefined`-stub typed decode, a raw fn-pointer decoder hack,
-// no column metadata, no NULL, no error type. This seam is what BTreeDB, the SQL drivers
-// (Postgres/MySQL/MSSQL), and later Mongo all speak — designed ONCE from the BTreeDB work.
-//
-// The shared vocabulary is a single typed cell, `DbValue`, used BOTH as a bound query
-// parameter and as a decoded result value. Everything above it — Row, ResultSet, Column,
-// ExecResult, DbError — is plain data over that cell.
+
 import list;
 import string;
 
-/// Column / value type tags — mirror the BTreeDB binary-protocol OIDs (btree proto/wire.zig:
-/// bool=1, int4=2, int8=3, uint4=4, uint8=5, float4=6, float8=7, timestamp=8, text=9,
-/// blob=10, decimal=11) so a driver maps a column OID straight to a DbType, plus `Null` for
-/// the wire's length=-1 NULL sentinel. Payload-LESS enum on purpose: the value rides in the
-/// DbValue struct's typed fields — an enum-with-payload crashes on f64/container payloads.
 pub enum DbType {
     Null,
     Bool,
@@ -31,15 +17,6 @@ pub enum DbType {
     Decimal,
 }
 
-/// A single typed cell — a bound query parameter OR a decoded result value. Tag-discriminated
-/// struct (NOT enum-with-payload — that path corrupts memory for f64/container payloads); `kind`
-/// says which field is live:
-///   Bool/Int4/Int8/Uint4/Uint8/Timestamp -> `i`   (long, width-safe for all integer widths)
-///   Float4/Float8                        -> `f`   (double)
-///   Decimal                              -> `dec` (128-bit BID, exact)
-///   Text/Blob                            -> `s`   (a Nova string is a length-headed byte
-///                                                   buffer, so it is binary-safe for Blob too)
-///   Null                                 -> none live
 pub struct DbValue {
     pub kind: DbType,
     pub i: long,
@@ -64,8 +41,6 @@ pub struct DbValue {
     pub fn asText(self: DbValue): string { return self.s; }
 }
 
-// Constructors — the normal way to build a bound parameter. A driver decoding a result row
-// builds DbValues the same way from the wire bytes.
 pub fn dbNull(): DbValue { return DbValue(DbType.Null, 0, 0.0, 0m, ""); }
 pub fn dbBool(b: bool): DbValue { return DbValue(DbType.Bool, b ? 1 : 0, 0.0, 0m, ""); }
 pub fn dbInt(n: int): DbValue { return DbValue(DbType.Int4, n, 0.0, 0m, ""); }
@@ -75,7 +50,6 @@ pub fn dbDecimal(d: decimal): DbValue { return DbValue(DbType.Decimal, 0, 0.0, d
 pub fn dbText(s: string): DbValue { return DbValue(DbType.Text, 0, 0.0, 0m, s); }
 pub fn dbBlob(s: string): DbValue { return DbValue(DbType.Blob, 0, 0.0, 0m, s); }
 
-/// Result column metadata — name + declared type.
 pub struct Column {
     pub name: string,
     pub type_oid: DbType,
@@ -85,8 +59,6 @@ pub struct Column {
     }
 }
 
-/// One result row: typed cells, positional, with typed accessors. `get(i)` on an out-of-range
-/// index yields a NULL DbValue rather than trapping, so decode bugs surface as NULL not crashes.
 pub struct Row {
     pub cells: List<DbValue>,
     init() { self.cells = List<DbValue>(); }
@@ -102,9 +74,6 @@ pub struct Row {
     pub fn getText(self: Row, i: int): string { return self.get(i).asText(); }
 }
 
-/// A SELECT result: column metadata + rows + the command-complete tag. NOTE this is a
-/// `List<Row>` where `Row` owns a `List<DbValue>` — a nested owned List, the exact shape the
-/// ARC destructor-context fix (61_nested_owned_list) made safe.
 pub struct ResultSet {
     pub columns: List<Column>,
     pub rows: List<Row>,
@@ -123,7 +92,6 @@ pub struct ResultSet {
     pub fn row(self: ResultSet, i: int): Row { return self.rows.get(i) ?? Row(); }
 }
 
-/// A non-SELECT result (INSERT/UPDATE/DELETE/DDL): affected-row count + the tag.
 pub struct ExecResult {
     pub rows_affected: long,
     pub tag: string,
@@ -133,7 +101,6 @@ pub struct ExecResult {
     }
 }
 
-/// A structured driver error — replaces the old "console.log it and signal via rows=-1".
 pub struct DbError {
     pub code: string,
     pub message: string,
@@ -147,45 +114,20 @@ pub struct DbError {
 
 pub fn noError(): DbError { return DbError("", ""); }
 
-/// The connection seam every backend implements — typed params in, typed rows out.
-///   exec  — a statement with no row result (INSERT/UPDATE/DELETE/DDL) -> affected count + tag
-///   query — a row-returning statement (SELECT) -> ResultSet of typed cells
-///   close — release the connection
-/// Params are `List<DbValue>` (positional `$1..$N`); a driver encodes each cell by its `kind`.
 pub trait Connection {
-    // A1 async-first seam: the row/exec methods are `async fn` — a driver's socket recv PARKS the
-    // coroutine (asio arecv / non-blocking TLS pump) instead of blocking the scheduler thread. A
-    // caller inside an `async fn` `await`s them (non-blocking); a synchronous caller invokes them
-    // directly and the coroutine is DRIVEN to completion (backward-compatible). `close`/`setTimeout`
-    // stay synchronous (no row I/O to park on).
+
     async fn exec(self, sql: string, params: List<DbValue>): ExecResult;
     async fn query(self, sql: string, params: List<DbValue>): ResultSet;
     fn close(self): void;
-    // D6: bound every subsequent query/exec's socket recv+send to `ms` milliseconds, so a
-    // hung-but-not-closed server surfaces a timeout (empty result / broken frame) instead of
-    // blocking the caller forever. `ms <= 0` clears it. Returns 0 on success, -1 on error.
+
     fn setTimeout(self, ms: int): int;
 
-    // D6 prepared statements (handle-based, so no connection alias escapes into a statement
-    // object — all state stays on the connection). `prepare(sql)` returns an int HANDLE for a
-    // parameterized statement (`$1`..`$N`), deduplicated per connection: preparing the same SQL
-    // twice returns the same handle without a second round-trip. `queryPrepared`/`execPrepared`
-    // run it with bound params. A backend that speaks an extended/binary protocol (Postgres)
-    // parses + plans ONCE server-side and reuses it; a backend without one falls back to the
-    // same client-side param substitution as `query`/`exec` (same API + injection-safety, no
-    // server-side plan caching). A handle < 0 or out of range runs as an empty statement.
     async fn prepare(self, sql: string): int;
     async fn queryPrepared(self, stmt: int, params: List<DbValue>): ResultSet;
     async fn execPrepared(self, stmt: int, params: List<DbValue>): ExecResult;
 }
 
-/// A backend entry point: open a connection from a DSN. Lets callers program against the seam
-/// and swap BTreeDB / Postgres / MySQL / … without touching call sites.
 pub trait Driver {
-    // A1 async-first seam: `connect` is `async fn` — it awaits the socket connect + auth
-    // handshake, so it can be called from INSIDE a coroutine (e.g. a pool opening a connection
-    // on-demand within a request handler). A synchronous caller invokes it directly and the
-    // coroutine is DRIVEN to completion. (A sync `connect` that drove its own async internals
-    // would deadlock nova_run_root if awaited from another coroutine — the reason for this.)
+
     async fn connect(self, dsn: string): Connection;
 }

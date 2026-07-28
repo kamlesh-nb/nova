@@ -1,4 +1,4 @@
-// arena_allocator.nova
+
 import bytes;
 import mem.allocator;
 import assert;
@@ -18,7 +18,7 @@ fn arenaAllocFn(ctx: ptr, size: int): ptr {
 }
 
 fn arenaFreeFn(ctx: ptr, ptr: ptr): void {
-    // No-op
+
 }
 
 pub struct ArenaAllocator {

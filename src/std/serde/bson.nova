@@ -1,36 +1,25 @@
-// bson.nova — BSON Serialization / Deserialization with dynamic entries
-import string;
-import list;   // List<T> comes from the standard library
-import assert;
 
-// ---------------------------------------------------------------------------
-// Core structs
-// ---------------------------------------------------------------------------
+import string;
+import list;
+import assert;
 
 pub struct BsonEntry {
     pub type_id: int,
     pub key: string,
     pub str_val: string,
-    pub int_val: long,   // dual-purpose: an int value OR a document/array address (width-safe)
+    pub int_val: long,
     pub int_val2: int,
-    pub dec_val: decimal, // type 0x13 decimal128 (16 BID bytes); `0m` for every other entry kind
+    pub dec_val: decimal,
 }
 
 pub struct BsonDocument {
     pub entries: List<BsonEntry>,
 }
 
-// ---------------------------------------------------------------------------
-// Entry constructors — ergonomic helpers for building documents
-// ---------------------------------------------------------------------------
-
 pub fn entryString(key: string, val: string): BsonEntry {
     return BsonEntry{ type_id: 2, key: key, str_val: val, int_val: 0, int_val2: 0, dec_val: 0m };
 }
 
-/// BSON binary (type 0x05), subtype 0x00 (generic). `data` is the raw bytes,
-/// stored in `str_val` (Nova strings are byte buffers — NULs are fine). Needed by
-/// e.g. MongoDB SCRAM `saslStart`/`saslContinue` payloads.
 pub fn entryBinary(key: string, data: string): BsonEntry {
     return BsonEntry{ type_id: 5, key: key, str_val: data, int_val: 0, int_val2: 0, dec_val: 0m };
 }
@@ -47,11 +36,6 @@ pub fn entryNull(key: string): BsonEntry {
     return BsonEntry{ type_id: 10, key: key, str_val: "", int_val: 0, int_val2: 0, dec_val: 0m };
 }
 
-// The embedded document/array's serialized bytes are ADOPTED as an ARC-owned
-// string in `str_val` (a serialized BSON doc IS a self-delimiting byte block, its
-// own length in the first int32). Storing the raw `ptr` in int_val instead leaked
-// it — a `ptr` is a value type ARC never frees. Owning the string means the sub-doc
-// is released exactly when the entry is.
 pub fn entryDoc(key: string, doc_ptr: ptr): BsonEntry {
     return BsonEntry{ type_id: 3, key: key, str_val: doc_ptr as string, int_val: 0, int_val2: 0, dec_val: 0m };
 }
@@ -68,9 +52,6 @@ pub fn entryDouble(key: string, hi: int, lo: int): BsonEntry {
     return BsonEntry{ type_id: 1, key: key, str_val: "", int_val: hi, int_val2: lo, dec_val: 0m };
 }
 
-// Build a type-0x01 double entry from an actual `double` value (splitting its IEEE-754 bits into the
-// two little-endian int32 halves the wire format stores). `entryDouble` above takes pre-split halves
-// (used by the deserializer); this is the producer for write paths (e.g. orm.BsonSink).
 pub fn entryDoubleVal(key: string, val: double): BsonEntry {
     let bits: long = nova_f64_bits(val);
     let hi: int = (bits >> 32) as int;
@@ -78,14 +59,9 @@ pub fn entryDoubleVal(key: string, val: double): BsonEntry {
     return BsonEntry{ type_id: 1, key: key, str_val: "", int_val: hi, int_val2: lo, dec_val: 0m };
 }
 
-// BSON decimal128 (type 0x13 = 19): the value's 16 BID bytes ARE the wire format. specs §3.1.
 pub fn entryDecimal(key: string, val: decimal): BsonEntry {
     return BsonEntry{ type_id: 19, key: key, str_val: "", int_val: 0, int_val2: 0, dec_val: val };
 }
-
-// ---------------------------------------------------------------------------
-// Low-level byte helpers (unchanged)
-// ---------------------------------------------------------------------------
 
 fn writeCstring(ptr: ptr, offset: int, s: string): int {
     let len = s.length;
@@ -106,7 +82,7 @@ fn readCstring(ptr: ptr, offset: int, max_len: int): string {
         }
         len = len + 1;
     }
-    // ARC-correct string alloc (workstream A): data at ptr, length at [ptr-4].
+
     let s_ptr = bytes.alloc(len);
     let i = 0;
     while (i < len) {
@@ -116,12 +92,8 @@ fn readCstring(ptr: ptr, offset: int, max_len: int): string {
     return s_ptr as string;
 }
 
-// ---------------------------------------------------------------------------
-// Document size calculation (iterate over List)
-// ---------------------------------------------------------------------------
-
 fn getDocSize(doc: BsonDocument): int {
-    let size = 5; // 4-byte size header + 1-byte terminal 0x00
+    let size = 5;
     let count = doc.entries.size();
     let i = 0;
     while (i < count) {
@@ -133,7 +105,7 @@ fn getDocSize(doc: BsonDocument): int {
             size = size + 1 + key_len + 1 + 4 + entry.str_val.length + 1;
         }
         if (t == 5) {
-            // type + key + NUL + int32 len + subtype byte + data
+
             size = size + 1 + key_len + 1 + 4 + 1 + entry.str_val.length;
         }
         if (t == 16) {
@@ -166,10 +138,6 @@ fn getDocSize(doc: BsonDocument): int {
     return size;
 }
 
-// ---------------------------------------------------------------------------
-// Serialize (iterate over List)
-// ---------------------------------------------------------------------------
-
 pub fn serialize(doc: BsonDocument): ptr {
     let total_size = getDocSize(doc);
     let ptr = bytes.alloc(total_size);
@@ -199,7 +167,7 @@ pub fn serialize(doc: BsonDocument): ptr {
             let data_len = entry.str_val.length;
             bytes.write_i32(ptr, offset, data_len);
             offset = offset + 4;
-            bytes.write_byte(ptr, offset, 0); // subtype 0x00 (generic)
+            bytes.write_byte(ptr, offset, 0);
             offset = offset + 1;
             let j = 0;
             while (j < data_len) {
@@ -249,7 +217,7 @@ pub fn serialize(doc: BsonDocument): ptr {
             bytes.write_byte(ptr, offset, 19);
             offset = offset + 1;
             offset = offset + writeCstring(ptr, offset, entry.key);
-            bytes.write_decimal(ptr, offset, entry.dec_val); // 16 BID bytes = the BSON wire form
+            bytes.write_decimal(ptr, offset, entry.dec_val);
             offset = offset + 16;
         }
         if (t == 3) {
@@ -284,10 +252,6 @@ pub fn serialize(doc: BsonDocument): ptr {
     return ptr;
 }
 
-// ---------------------------------------------------------------------------
-// Deserialize (build a List dynamically)
-// ---------------------------------------------------------------------------
-
 pub fn deserialize(ptr: ptr): BsonDocument {
     let doc = BsonDocument{ entries: List<BsonEntry>() };
 
@@ -320,7 +284,7 @@ pub fn deserialize(ptr: ptr): BsonDocument {
         if (type_byte == 5) {
             let bin_len = bytes.read_i32(ptr, offset);
             offset = offset + 4;
-            offset = offset + 1; // skip the subtype byte
+            offset = offset + 1;
             let buf = bytes.alloc(if (bin_len > 0) bin_len else 1);
             let j = 0;
             while (j < bin_len) {
@@ -328,8 +292,7 @@ pub fn deserialize(ptr: ptr): BsonDocument {
                 j = j + 1;
             }
             offset = offset + bin_len;
-            // Adopt the buffer directly in the struct literal (as entryDoc does) so
-            // ARC owns it exactly once — a `buf as string` call-site temp leaks.
+
             doc.entries.push(BsonEntry{ type_id: 5, key: key, str_val: buf as string, int_val: 0, int_val2: 0, dec_val: 0m });
         }
         if (type_byte == 16) {
@@ -360,8 +323,7 @@ pub fn deserialize(ptr: ptr): BsonDocument {
             doc.entries.push(entryInt64(key, hi, lo));
         }
         if (type_byte == 19) {
-            // decimal128 (0x13): the 16 BID bytes ARE the value. Without this branch the offset never
-            // advanced past a decimal entry, desyncing every following field.
+
             let d = bytes.read_decimal(ptr, offset);
             offset = offset + 16;
             doc.entries.push(entryDecimal(key, d));
@@ -393,10 +355,6 @@ pub fn deserialize(ptr: ptr): BsonDocument {
     return doc;
 }
 
-// ---------------------------------------------------------------------------
-// Accessors (remain the same, but use List indexing)
-// ---------------------------------------------------------------------------
-
 pub fn docFind(doc: BsonDocument, key: string): int {
     let i = 0;
     while (i < doc.entries.size()) {
@@ -420,7 +378,6 @@ pub fn docGetString(doc: BsonDocument, index: int): string {
     return entry.str_val;
 }
 
-/// The raw bytes of a binary (type 0x05) entry, or "" if it isn't binary.
 pub fn docGetBinary(doc: BsonDocument, index: int): string {
     if (index < 0 || index >= doc.entries.size()) return "";
     let entry = doc.entries.at(index);
@@ -447,7 +404,6 @@ pub fn docIsNull(doc: BsonDocument, index: int): int {
     return (doc.entries.at(index).type_id == 10) ? 1 : 0;
 }
 
-/// The embedded document's serialized bytes (deserialize with `deserialize(x as ptr)`).
 pub fn docGetDoc(doc: BsonDocument, index: int): string {
     if (index < 0 || index >= doc.entries.size()) return "";
     let entry = doc.entries.at(index);
@@ -455,7 +411,6 @@ pub fn docGetDoc(doc: BsonDocument, index: int): string {
     return entry.str_val;
 }
 
-/// The embedded array's serialized bytes (a BSON doc keyed by decimal indices).
 pub fn docGetArray(doc: BsonDocument, index: int): string {
     if (index < 0 || index >= doc.entries.size()) return "";
     let entry = doc.entries.at(index);
@@ -463,7 +418,6 @@ pub fn docGetArray(doc: BsonDocument, index: int): string {
     return entry.str_val;
 }
 
-// Convenience finders (unchanged)
 pub fn findString(doc: BsonDocument, key: string): string {
     let idx = docFind(doc, key);
     return docGetString(doc, idx);
@@ -488,10 +442,6 @@ pub fn findDoc(doc: BsonDocument, key: string): string {
     let idx = docFind(doc, key);
     return docGetDoc(doc, idx);
 }
-
-// ---------------------------------------------------------------------------
-// Validation (unchanged)
-// ---------------------------------------------------------------------------
 
 pub fn validate(ptr: ptr, buf_len: int): int {
     if (buf_len < 5) return 0;
@@ -534,4 +484,3 @@ pub fn validate(ptr: ptr, buf_len: int): int {
     }
     return (offset <= declared_size) ? 1 : 0;
 }
-

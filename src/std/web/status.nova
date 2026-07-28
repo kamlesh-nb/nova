@@ -1,4 +1,4 @@
-// status.nova — HTTP Status Codes representation using refined enums with methods
+
 import bytes;
 
 pub enum Status {
@@ -84,7 +84,7 @@ pub enum Status {
         if (code == 503) return Status.ServiceUnavailable;
         if (code == 413) return Status.PayloadTooLarge;
         if (code == 429) return Status.TooManyRequests;
-        return Status.Ok; // fallback
+        return Status.Ok;
     }
 }
 
@@ -96,7 +96,7 @@ pub fn stringifyStatus(status: int): string {
         digits = digits + 1;
         temp = temp / 10;
     }
-    // ARC-correct string alloc (workstream A): data at ptr, length at [ptr-4].
+
     let str_ptr = bytes.alloc(digits);
     let i = digits - 1;
     temp = status;

@@ -1,4 +1,4 @@
-// string_builder.nova
+
 import bytes;
 import assert;
 
@@ -33,7 +33,7 @@ pub struct StringBuilder {
 
     pub fn toString(self: StringBuilder): string {
         if (self.len == 0) return "";
-        // ARC-correct string alloc (workstream A): data at ptr, length at [ptr-4].
+
         let sptr = bytes.alloc_persistent(self.len);
         let i = 0;
         while (i < self.len) {

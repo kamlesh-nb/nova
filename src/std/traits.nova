@@ -4,8 +4,6 @@ pub trait Executable {
     fn run(self: Executable): void;
 }
 
-// `fiber.spawn` (retired) ran inline, so this is just an execution helper. Named `execute` (not `spawn`)
-// so it does not shadow the `spawn` concurrency keyword.
 pub fn execute(exe: Executable): void {
     exe.run();
 }
@@ -26,4 +24,3 @@ fn test_traits_execution(): void {
     execute(runner);
     assert.equalInt(42, runner.val);
 }
-

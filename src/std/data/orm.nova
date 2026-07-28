@@ -1,14 +1,4 @@
-// orm.nova — D8 micro-ORM (Dapper point): SQL/params in, typed structs out. NO query generation,
-// NO change tracking, NO migrations — just a typed materializer over the injection-safe driver seam.
-//
-// The whole read side is a `ValueSource` ADAPTER over a decoded `Row` — it reuses the compiler's
-// existing `<Struct>__bind(src: ValueSource)` deserializer (source-gen, zero reflection). So:
-//
-//     let users = orm.queryAs<UserDto>(conn, "SELECT id, name FROM users WHERE id = $1", [db.dbInt(id)]);
-//
-// binds `id` OUT OF BAND (never string-interpolated → injection-safe) and materializes each row into
-// a `UserDto` with the same compiler machinery that binds JSON. Column lookup is by NAME (the struct
-// field name must match the SELECT column name), case-insensitively.
+
 import serde.source;
 import serde.bson;
 import data.db;
@@ -17,13 +7,9 @@ import list;
 import string;
 import assert;
 
-/// A decoded SQL `Row` viewed as a `ValueSource`, so `<T>__bind` can read struct fields from it by
-/// column NAME. Scalars map through `DbValue`'s typed accessors; a missing column reads as NULL/0/""
-/// (never a trap). Flat rows have no nested objects or arrays, so `getChild`/array methods return the
-/// empty/zero case — nested DTOs would need a JOIN-shaping layer (out of the micro-ORM's scope).
 pub struct RowSource impl ValueSource {
     pub row: Row,
-    pub index: Map<string, int>, // lowercase column name → position
+    pub index: Map<string, int>,
 
     init(row: Row, columns: List<Column>) {
         self.row = row;
@@ -48,10 +34,6 @@ pub struct RowSource impl ValueSource {
     pub fn getFloat(self: RowSource, key: string): double { return self.cell(key).asDouble(); }
     pub fn getDecimal(self: RowSource, key: string): decimal { return self.cell(key).asDecimal(); }
 
-    // NOTE: method order MUST match the `ValueSource` trait exactly (getChild BEFORE has) — Nova's
-    // trait vtable is position-based, so a reordered impl dispatches to the wrong slot.
-    // Flat rows carry no nested objects/arrays; return the empty/zero cases (a nested @serializable
-    // field then binds to its defaults). A JOIN-shaping adapter would override these.
     pub fn getChild(self: RowSource, key: string): ValueSource { return self; }
     pub fn has(self: RowSource, key: string): bool {
         let i = self.index.get(string.toLowerCase(key));
@@ -65,9 +47,6 @@ pub struct RowSource impl ValueSource {
     pub fn itemChild(self: RowSource, key: string, i: int): ValueSource { return self; }
 }
 
-/// Run a parameterized SELECT and materialize every row into a `T` (via the compiler's `<T>__bind`).
-/// Params are bound out-of-band by the driver — the SQL is never string-interpolated. `T`'s fields
-/// are matched to result columns by name.
 pub fn queryAs<T>(conn: Connection, sql: string, params: List<DbValue>): List<T> {
     let rs = conn.query(sql, params);
     let out = List<T>();
@@ -81,7 +60,6 @@ pub fn queryAs<T>(conn: Connection, sql: string, params: List<DbValue>): List<T>
     return out;
 }
 
-/// Materialize a SINGLE typed row (the first), or `undefined` if the query returned none.
 pub fn queryOne<T>(conn: Connection, sql: string, params: List<DbValue>): T | undefined {
     let rs = conn.query(sql, params);
     if (rs.rows.size() == 0) { return undefined; }
@@ -89,19 +67,6 @@ pub fn queryOne<T>(conn: Connection, sql: string, params: List<DbValue>): T | un
     return serde.bind<T>(RowSource(row, rs.columns));
 }
 
-// ===========================================================================
-// Write side — struct -> out-of-band params (SQL) / typed BSON (document store).
-//
-// The whole point is INJECTION SAFETY BY CONSTRUCTION: a struct's field VALUES never touch the query
-// string. On the SQL side they become bound `$1..$N` parameters; on the Mongo side they become leaf
-// BSON values. Only the COLUMN/FIELD NAMES (compile-known struct field identifiers — never user data)
-// are ever concatenated. So a field holding `Robert'); DROP TABLE students;--` or `{"$gt": ""}` is
-// delivered as inert data, not executable SQL / a query operator.
-// ===========================================================================
-
-/// A `ValueSink` that flattens a struct into parallel `cols` (field names) + `vals` (bound DbValues).
-/// The generated `<T>__dump(obj, sink)` drives it. Method order MUST match the `ValueSink` trait
-/// exactly (putString/putInt/putBool/putFloat/putDecimal) — the vtable is position-based.
 pub struct ParamSink impl ValueSink {
     pub cols: List<string>,
     pub vals: List<DbValue>,
@@ -118,22 +83,14 @@ pub struct ParamSink impl ValueSink {
     fn putDecimal(self: ParamSink, key: string, val: decimal): void { self.cols.push(key); self.vals.push(db.dbDecimal(val)); }
 }
 
-/// Flatten a @serializable struct into a `ParamSink` (`.cols` field names, `.vals` bound DbValues),
-/// via the compiler's `<T>__dump`. This is the "`__toParams`" primitive — the values are ready to
-/// bind out-of-band; nothing here builds SQL.
 pub fn toParams<T>(obj: T): ParamSink {
     let sink = ParamSink();
     serde.dump<T>(obj, sink);
     return sink;
 }
 
-/// INSERT a struct as one row. Column names come from the struct's fields (compile-known identifiers);
-/// every field VALUE is bound out-of-band as `$1..$N` — NEVER string-interpolated. `table` should be a
-/// trusted identifier (a literal or a validated name), not user input.
 pub fn insert<T>(conn: Connection, table: string, obj: T): ExecResult {
-    // Reify serde.dump<T> DIRECTLY here (not via toParams<T>): a generic fn delegating to another
-    // generic fn is not transitively monomorphized — `insert<UserDto>` would need a `toParams<UserDto>`
-    // spec that no concrete call site records. Building the sink inline keeps one concrete reify.
+
     let p = ParamSink();
     serde.dump<T>(obj, p);
     let sql = "INSERT INTO " + table + " (";
@@ -154,26 +111,19 @@ pub fn insert<T>(conn: Connection, table: string, obj: T): ExecResult {
     return conn.exec(sql, p.vals);
 }
 
-/// A `ValueSink` that builds a BSON document — each field a TYPED leaf entry. A user string like
-/// `{"$where": "..."}` or `$gt` is stored as a BSON *string value*, never parsed as a query operator,
-/// so operator-injection cannot execute (Mongo command injection needs user text spliced into a query
-/// DOCUMENT as a key/operator; here field values are always leaves). Method order matches `ValueSink`.
 pub struct BsonSink impl ValueSink {
     pub doc: bson.BsonDocument,
 
     init() { self.doc = bson.BsonDocument{ entries: List<bson.BsonEntry>() }; }
 
     fn putString(self: BsonSink, key: string, val: string): void { self.doc.entries.push(bson.entryString(key, val)); }
-    // int32 leaf (type 0x10) — flat-DTO ids fit int32; round-trips through bson.findInt. A true 64-bit
-    // field would need entryInt64 (type 0x12), but bson.docGetInt reads only int32, so keep the common case.
+
     fn putInt(self: BsonSink, key: string, val: long): void { self.doc.entries.push(bson.entryInt(key, val as int)); }
     fn putBool(self: BsonSink, key: string, val: bool): void { self.doc.entries.push(bson.entryBool(key, val ? 1 : 0)); }
     fn putFloat(self: BsonSink, key: string, val: double): void { self.doc.entries.push(bson.entryDoubleVal(key, val)); }
     fn putDecimal(self: BsonSink, key: string, val: decimal): void { self.doc.entries.push(bson.entryDecimal(key, val)); }
 }
 
-/// Flatten a @serializable struct into a BSON `BsonDocument` (the "`__toBson`" primitive) — every
-/// field a typed leaf value, injection-inert. `bson.serialize(doc)` yields the wire bytes.
 pub fn toBson<T>(obj: T): bson.BsonDocument {
     let sink = BsonSink();
     serde.dump<T>(obj, sink);

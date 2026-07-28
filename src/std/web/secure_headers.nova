@@ -1,4 +1,4 @@
-// secure_headers.nova — Defensive HTTP Response Headers Middleware (Helmet-equivalent)
+
 import web.request;
 import web.response;
 import web.middleware;

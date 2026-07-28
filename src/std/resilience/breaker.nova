@@ -1,15 +1,4 @@
-// breaker.nova — a circuit breaker: a pure resilience state machine reusable by ANY caller
-// that talks to a flaky dependency (an HTTP upstream, a database, a queue). Extracted here so
-// neither `web` nor `data` has to depend on the other to get it — it needs only a millisecond
-// clock.
-//
-//   CLOSED     — calls pass; N consecutive failures -> OPEN.
-//   OPEN       — calls fail fast; after timeoutMs -> HALF_OPEN (one probe window).
-//   HALF_OPEN  — calls pass; M successes -> CLOSED; any failure -> OPEN.
-//
-// A breaker turns "hammer a dead dependency, and hang every caller for the full timeout each
-// time" into "fail fast immediately, then probe for recovery" — the natural complement to the
-// per-op timeouts + connection pool.
+
 import datetime;
 
 pub const STATE_CLOSED: int = 0;
@@ -24,7 +13,7 @@ pub struct CircuitBreaker {
     pub state: int,
     pub failureCount: int,
     pub successCount: int,
-    pub lastStateChange: long, // ms
+    pub lastStateChange: long,
 
     pub failureThreshold: int,
     pub successThreshold: int,
@@ -40,11 +29,10 @@ pub struct CircuitBreaker {
         self.timeoutMs = timeoutMs;
     }
 
-    /// Whether a call may proceed. OPEN fails fast until the cooldown elapses, then probes.
     pub fn shouldAllow(self: CircuitBreaker): bool {
         if (self.state == STATE_CLOSED) { return true; }
         if (self.state == STATE_HALF_OPEN) { return true; }
-        // OPEN
+
         let elapsed = nowMs() - self.lastStateChange;
         if (elapsed >= self.timeoutMs) {
             self.state = STATE_HALF_OPEN;
@@ -66,7 +54,7 @@ pub struct CircuitBreaker {
                 self.lastStateChange = nowMs();
             }
         } else {
-            // CLOSED or OPEN: a success clears the failure streak.
+
             self.failureCount = 0;
         }
     }
@@ -79,12 +67,12 @@ pub struct CircuitBreaker {
                 self.lastStateChange = nowMs();
             }
         } else if (self.state == STATE_HALF_OPEN) {
-            // A failed probe re-opens immediately.
+
             self.state = STATE_OPEN;
             self.successCount = 0;
             self.lastStateChange = nowMs();
         } else {
-            // OPEN: refresh the cooldown window.
+
             self.lastStateChange = nowMs();
         }
     }

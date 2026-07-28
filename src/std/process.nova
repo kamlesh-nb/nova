@@ -1,11 +1,11 @@
-// process.nova — Subprocess execution management
+
 import list;
 import bytes;
 
 import assert;
 
 pub struct Process {
-    pub ctx: ptr,   // ProcessContext* pointer
+    pub ctx: ptr,
 
     pub fn spawn(cmd: string, args: list.List<string>): Process {
         let args_str = "";
@@ -25,10 +25,6 @@ pub struct Process {
         };
     }
 
-    // I4: spawn `cmd` under container-grade isolation (Linux namespaces / rootfs / caps / seccomp). The
-    // flags/rootfs/hostname come from an os.isolation IsolationSpec (see std/os/isolation.nova). On
-    // non-Linux this degrades to a plain spawn (the runtime handles the fallback). Returns a Process the
-    // orchestrator supervises exactly like a plain one (wait/kill/pid all work on the isolated child).
     pub fn spawnIsolated(cmd: string, args: list.List<string>, nsFlags: int, rootfs: string,
                          hostname: string, dropCaps: int, noNewPrivs: int, seccomp: int): Process {
         let args_str = "";
@@ -55,8 +51,7 @@ pub struct Process {
             bytes.free(buf);
             return "";
         }
-        // ARC-correct string alloc (workstream A): bytes.alloc writes the header and
-        // returns base+8; data starts at the returned pointer, length at [ptr-4].
+
         let str_ptr = bytes.alloc(n);
         let i = 0;
         while (i < n) {
@@ -71,35 +66,26 @@ pub struct Process {
         return nova_process_wait(self.ctx);
     }
 
-    // Non-blocking exit poll (waitpid WNOHANG): the exit code if the child has exited (reaped so it never
-    // zombifies), -2 if still running, -1 on error. The orchestrator's async reconcile loop uses this
-    // instead of the blocking `wait` — `kill(0)` can't tell a live process from an unreaped zombie.
     pub fn tryWait(self: Process): int {
         return nova_process_try_wait(self.ctx);
     }
 
-    // Convenience: is the child still running? (false once it has exited — and reaps it if so.)
     pub fn isRunning(self: Process): bool {
         return nova_process_try_wait(self.ctx) == -2;
     }
 
-    // The child's kernel PID (0 if not spawned). Needed to attach it to a cgroup (write to cgroup.procs).
     pub fn pid(self: Process): long {
         return nova_process_pid(self.ctx);
     }
 
-    // Signal the child. `sig` is a POSIX signal number (15 = SIGTERM, 9 = SIGKILL, 2 = SIGINT, 1 = SIGHUP).
-    // Returns 0 on success, -1 on error. The scale-down / restart primitive the orchestrator drives.
     pub fn kill(self: Process, sig: int): int {
         return nova_process_kill(self.ctx, sig);
     }
 
-    // Graceful stop (SIGTERM) — lets the child run its shutdown path. Follow with `wait` to reap it.
     pub fn terminate(self: Process): int {
         return nova_process_kill(self.ctx, 15);
     }
 
-    // Hard stop (SIGKILL) — uninterceptable; use only when a terminate + grace period expired.
     pub fn forceKill(self: Process): int {
         return nova_process_kill(self.ctx, 9);
     }

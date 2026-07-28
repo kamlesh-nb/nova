@@ -1,15 +1,4 @@
-// webview.nova — a native desktop webview window (W1), bound to the vendored
-// webview/webview 0.10.0 C library via FFI (`extern("webview")`).
-//
-// On macOS the backend is WKWebView (Cocoa); the linker adds -framework WebKit/Cocoa
-// automatically when this module is used. `run()` starts the Cocoa event loop and BLOCKS
-// on the calling thread until the window is closed — call it from `main()` (the main
-// thread), after configuring the window.
-//
-// Two-way: `eval()`/`initScript()` (Nova -> JS), `bind()`/`dispatch()` (JS -> Nova).
-// Bind handlers may be named functions OR typed lambdas (`(req: string) => ...`).
 
-// ---- FFI bindings to libwebview (C ABI, webview 0.10.0) --------------------
 extern("webview") fn webview_create(debug: int, window: ptr): ptr;
 extern("webview") fn webview_destroy(w: ptr): void;
 extern("webview") fn webview_run(w: ptr): void;
@@ -21,87 +10,68 @@ extern("webview") fn webview_set_html(w: ptr, html: string): void;
 extern("webview") fn webview_init(w: ptr, js: string): void;
 extern("webview") fn webview_eval(w: ptr, js: string): void;
 extern("webview") fn webview_unbind(w: ptr, name: string): void;
-// Nova glue (in libwebview via webview_nova.cc): bridge JS->Nova callbacks and
-// UI-thread tasks by invoking a Nova closure from a C trampoline.
+
 extern("webview") fn nova_webview_bind(w: ptr, name: string, handler: (string) -> string): void;
 extern("webview") fn nova_webview_dispatch(w: ptr, task: () -> void): void;
 
-// Size hints for setSize().
-pub const HINT_NONE: int = 0;   // width/height is the initial size
-pub const HINT_MIN: int = 1;    // ...the minimum bounds
-pub const HINT_MAX: int = 2;    // ...the maximum bounds
-pub const HINT_FIXED: int = 3;  // window is not resizable
+pub const HINT_NONE: int = 0;
+pub const HINT_MIN: int = 1;
+pub const HINT_MAX: int = 2;
+pub const HINT_FIXED: int = 3;
 
 pub struct Webview {
-    pub handle: ptr,   // webview_t (opaque)
+    pub handle: ptr,
 
-    /// Create a webview window. `debug` enables devtools/inspection when supported.
     init(debug: bool) {
         let dbg = 0;
         if (debug) { dbg = 1; }
         self.handle = webview_create(dbg, 0);
     }
 
-    /// Set the window title.
     pub fn setTitle(self: Webview, title: string): void {
         webview_set_title(self.handle, title);
     }
 
-    /// Set the window size. `hints` is one of HINT_NONE/MIN/MAX/FIXED.
     pub fn setSize(self: Webview, width: int, height: int, hints: int): void {
         webview_set_size(self.handle, width, height, hints);
     }
 
-    /// Navigate to a URL (http(s):// or data:).
     pub fn navigate(self: Webview, url: string): void {
         webview_navigate(self.handle, url);
     }
 
-    /// Render an HTML/NSX string directly as the document.
     pub fn setHtml(self: Webview, html: string): void {
         webview_set_html(self.handle, html);
     }
 
-    /// Inject JS to run on every page load, before other scripts.
     pub fn initScript(self: Webview, js: string): void {
         webview_init(self.handle, js);
     }
 
-    /// Evaluate JS in the current page (Nova -> JS).
     pub fn eval(self: Webview, js: string): void {
         webview_eval(self.handle, js);
     }
 
-    /// Bind a JS-callable native handler. In the page, `window.<name>(...)` returns a
-    /// Promise; webview passes the call arguments to `handler` as a JSON array string,
-    /// and the string `handler` returns (a JSON value) resolves that Promise. The handler
-    /// may be a named function or a typed lambda `(req: string) => { ... }`.
     pub fn bind(self: Webview, name: string, handler: (string) -> string): void {
         nova_webview_bind(self.handle, name, handler);
     }
 
-    /// Remove a previously bound handler.
     pub fn unbind(self: Webview, name: string): void {
         webview_unbind(self.handle, name);
     }
 
-    /// Run a task on the UI thread (safe to call from another thread while run() blocks;
-    /// use it to touch the window / eval JS from a Nova background task).
     pub fn dispatch(self: Webview, task: () -> void): void {
         nova_webview_dispatch(self.handle, task);
     }
 
-    /// Start the UI event loop. BLOCKS until the window is closed. Main thread only.
     pub fn run(self: Webview): void {
         webview_run(self.handle);
     }
 
-    /// Stop the event loop from another context (e.g. a bound callback).
     pub fn terminate(self: Webview): void {
         webview_terminate(self.handle);
     }
 
-    /// Destroy the window and free its resources. Idempotent.
     pub fn delete(self: Webview): void {
         if (self.handle != 0) {
             webview_destroy(self.handle);

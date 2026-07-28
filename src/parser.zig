@@ -1,4 +1,4 @@
-// src/parser.zig
+
 const std = @import("std");
 const lexer = @import("lexer.zig");
 const ast = @import("ast.zig");
@@ -16,7 +16,7 @@ pub const Parser = struct {
     file_path: []const u8,
     is_wasm: bool,
     source: []const u8,
-    /// Unique-name counter for compiler-synthesized locals (collection for-in desugar).
+
     for_counter: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, source: []const u8, file_path: []const u8, is_wasm: bool) !Parser {
@@ -43,10 +43,6 @@ pub const Parser = struct {
     pub fn deinit(self: *Parser) void {
         self.allocator.free(self.tokens);
     }
-
-    // ============================================================================
-    // Helpers
-    // ============================================================================
 
     fn current(self: *Parser) lexer.Token {
         return self.tokens[self.pos];
@@ -80,8 +76,7 @@ pub const Parser = struct {
     fn expect(self: *Parser, expected: lexer.TokenType) ParserError!void {
         const current_type = self.current().type;
         if (expected == .identifier) {
-            // `spawn` is a soft keyword: reserved in prefix position (`spawn <expr>`), but
-            // still usable as a field/method/identifier name (e.g. `process.spawn(...)`).
+
             if (current_type == .keyword_spawn) {
                 self.advance();
                 return;
@@ -99,9 +94,6 @@ pub const Parser = struct {
         self.advance();
     }
 
-    // Close a generic argument list. A `>>` (shr) token closes the current generic and
-    // leaves a single `>` for an enclosing one (e.g. Map<K, List<V>>). We split it by
-    // rewriting the token in place to `>` and NOT advancing, so the outer close consumes it.
     fn expectGenericClose(self: *Parser) ParserError!void {
         if (self.current().type == .shr) {
             self.tokens[self.pos].type = .greater;
@@ -148,10 +140,6 @@ pub const Parser = struct {
         }
     }
 
-    // ============================================================================
-    // Top level
-    // ============================================================================
-
     pub fn parseProgram(self: *Parser) ParserError!ast.Program {
         var declarations = std.ArrayList(ast.Declaration).empty;
         defer declarations.deinit(self.allocator);
@@ -168,8 +156,8 @@ pub const Parser = struct {
                     const is_wasm_block = std.mem.eql(u8, next_t.lexeme, "wasm");
                     const matches_target = (is_wasm_block == self.is_wasm);
 
-                    self.advance(); // skip '@'
-                    self.advance(); // skip 'wasm' or 'native'
+                    self.advance();
+                    self.advance();
                     try self.expect(.left_brace);
 
                     if (matches_target) {
@@ -194,7 +182,6 @@ pub const Parser = struct {
                 }
             }
 
-            // Skip top-level expression statements (like main();)
             if (self.current().type == .identifier and self.peek().type == .left_paren) {
                 _ = try self.parseExpression();
                 if (self.current().type == .semicolon) self.advance();
@@ -254,7 +241,7 @@ pub const Parser = struct {
         if (self.match(.keyword_pub)) {
             is_public = true;
         }
- 
+
         switch (self.current().type) {
             .keyword_export => {
                 self.advance();
@@ -263,17 +250,13 @@ pub const Parser = struct {
                 return ast.Declaration{ .fn_decl = fd };
             },
             .keyword_fn, .keyword_async => {
-                // F1-4: `pub fn` must set is_exported — this arm hardcoded `false`, so EVERY `pub fn`
-                // (all of the stdlib: assert.equalInt, string.eql, …) was silently marked non-exported,
-                // making per-symbol visibility meaningless. `export fn` still forces it above; a bare
-                // `fn` stays private. Behavior-preserving today (visibility is recorded, not yet
-                // enforced) and the prerequisite for enforcing it.
+
                 var fd = try self.parseFunctionDecl(is_public);
                 fd.attributes = attrs;
                 return ast.Declaration{ .fn_decl = fd };
             },
             .keyword_extern => {
-                // T3 FFI: `extern("lib") fn name(params): ret;` — a foreign C-ABI binding.
+
                 var fd = try self.parseExternFnDecl(is_public);
                 fd.attributes = attrs;
                 return ast.Declaration{ .fn_decl = fd };
@@ -302,14 +285,9 @@ pub const Parser = struct {
         }
     }
 
-    // Helper to bypass name mismatch if needed, wait, let's keep parseImportDecl
     fn import_decl_fallback(self: *Parser) ParserError!ast.ImportDecl {
         return try self.parseImportDecl();
     }
-
-    // ============================================================================
-    // Declarations
-    // ============================================================================
 
     fn parseConstDecl(self: *Parser) ParserError!ast.ConstDecl {
         const start_span = self.span();
@@ -396,8 +374,6 @@ pub const Parser = struct {
         };
     }
 
-    // T3 FFI: `extern("lib") fn name(params): ret;` — a foreign C-ABI function binding.
-    // No Nova body: the signature ends at `;`. `lib` becomes a `-l<lib>` link flag.
     fn parseExternFnDecl(self: *Parser, is_exported: bool) ParserError!ast.FunctionDecl {
         const start_span = self.span();
         try self.expect(.keyword_extern);
@@ -512,7 +488,7 @@ pub const Parser = struct {
             while (true) {
                 const trait_name = self.current().lexeme;
                 try self.expect(.identifier);
-                // Optional trait type arguments: `impl Handler<GetUser, UserDto>`.
+
                 var timpl_args = std.ArrayList(ast.TypeRef).empty;
                 defer timpl_args.deinit(self.allocator);
                 if (self.match(.less)) {
@@ -749,7 +725,7 @@ pub const Parser = struct {
         try self.expect(.keyword_trait);
         const name = self.current().lexeme;
         try self.expect(.identifier);
-        // Optional generic type parameters: `trait Handler<Q, R>` (mirrors struct).
+
         var type_params = std.ArrayList([]const u8).empty;
         if (self.match(.less)) {
             while (true) {
@@ -766,19 +742,19 @@ pub const Parser = struct {
         defer methods.deinit(self.allocator);
 
         while (self.current().type != .right_brace and self.current().type != .eof) {
-            // A1 async-first seam: an `async fn` trait method (optional `async` before `fn`).
+
             const m_is_async = self.match(.keyword_async);
             try self.expect(.keyword_fn);
             const fn_name = self.current().lexeme;
             try self.expect(.identifier);
-            
+
             try self.expect(.left_paren);
             var params = std.ArrayList(ast.Param).empty;
             defer params.deinit(self.allocator);
             while (self.current().type != .right_paren and self.current().type != .eof) {
                 const param_name = self.current().lexeme;
                 try self.expect(.identifier);
-                // `self` is the untyped receiver (no `: Type`), like a method.
+
                 if (std.mem.eql(u8, param_name, "self") and self.current().type != .colon) {
                     try params.append(self.allocator, ast.Param{
                         .name = param_name,
@@ -847,16 +823,6 @@ pub const Parser = struct {
         };
     }
 
-    // ============================================================================
-    // Types
-    // ============================================================================
-
-    /// ONE type with no `|` union and no `[N]` suffix.
-    ///
-    /// Split out because a union MEMBER must not swallow the rest of the union: calling the full
-    /// `parseTypeRef` for a member made `string | E1 | E2` parse as `string | (E1 | E2)` — the
-    /// inner call consumed `| E2` itself — so the "only one error type" rule never fired and the
-    /// nonsense type sailed through to the checker.
     fn parseTypeRefAtom(self: *Parser) ParserError!ast.TypeRef {
         if (self.match(.ampersand)) {
             if (self.current().type == .identifier and std.mem.eql(u8, self.current().lexeme, "mut")) {
@@ -918,18 +884,10 @@ pub const Parser = struct {
 
         while (true) {
             if (self.match(.pipe)) {
-                // A `|` union. specs §3.4b: COLLECT the members and classify them, rather than
-                // folding left-to-right — so `T | E | undefined` and `T | undefined | E` are the
-                // same type, and the error type can appear anywhere.
-                //
-                //   `undefined` present  -> the ok side is optional  (absence: a 404)
-                //   a named type present -> that is the error enum   (failure: a 500, log it)
-                //
-                // The result is `(T | undefined) | E`, which narrows in two steps with the rules
-                // that already exist: `is E` for the failure side, `== undefined` for absence.
+
                 var saw_undefined = false;
                 var err_type: ?ast.TypeRef = null;
-                // Re-enter the loop for each `|` member; the first `match(.pipe)` is consumed above.
+
                 while (true) {
                     const m_tok = self.current();
                     if (m_tok.type == .identifier and std.mem.eql(u8, m_tok.lexeme, "undefined")) {
@@ -938,9 +896,7 @@ pub const Parser = struct {
                     } else {
                         const member = try self.parseTypeRefAtom();
                         if (err_type != null) {
-                            // specs §3.4b: ONE error enum per signature. Two error types would
-                            // need arbitrary sum types; use one enum with variants instead —
-                            // `DbError.Timeout` / `DbError.Conn`, not `Timeout | Conn`.
+
                             const sp = self.span();
                             std.debug.print(
                                 "{s}:{d}:{d}: error: a signature may name only ONE error type.\n" ++
@@ -987,10 +943,6 @@ pub const Parser = struct {
         return base_type;
     }
 
-    // ============================================================================
-    // Statements
-    // ============================================================================
-
     fn parseBlock(self: *Parser) ParserError!ast.Block {
         try self.expect(.left_brace);
         var stmts = std.ArrayList(ast.Statement).empty;
@@ -1015,9 +967,7 @@ pub const Parser = struct {
         switch (self.current().type) {
             .keyword_let => return ast.Statement{ .let_stmt = try self.parseLetStmt(false) },
             .keyword_var => {
-                // `var` is removed: Nova has exactly two binding keywords — `let` (mutable) and
-                // `const` (immutable). Reject with a directed message rather than a generic
-                // "unexpected token" (specs §5.1).
+
                 const t = self.current();
                 std.debug.print("Parser error: {s}:{}:{}: `var` is not a Nova keyword — use `let` for a mutable variable or `const` for a constant.\n", .{ self.file_path, t.line, t.column });
                 return error.UnexpectedToken;
@@ -1028,9 +978,7 @@ pub const Parser = struct {
             .keyword_for => return try self.parseForStmt(),
             .keyword_switch => return ast.Statement{ .switch_stmt = try self.parseSwitchStmt() },
             .keyword_return => return ast.Statement{ .return_stmt = try self.parseReturnStmt() },
-            // `throw` is gone for good. A bare `catch` cannot start a statement. `try` at
-            // statement position is only rejected when it opens a BLOCK (`try {`), which is the
-            // exception form; `try f();` is an expression statement (specs §3.4b).
+
             .keyword_throw, .keyword_catch => return self.rejectExceptions(),
             .keyword_try => {
                 if (self.peekIsLeftBrace()) return self.rejectExceptions();
@@ -1056,7 +1004,7 @@ pub const Parser = struct {
                     const matches_target = (is_wasm_block == self.is_wasm);
 
                     try self.expect(.at);
-                    self.advance(); // skip 'wasm' or 'native'
+                    self.advance();
                     try self.expect(.left_brace);
 
                     if (matches_target) {
@@ -1095,27 +1043,6 @@ pub const Parser = struct {
         }
     }
 
-    /// `throw` / `try` / `catch` are RESERVED but REMOVED (specs §5.5, plan P2-12).
-    ///
-    /// Reserved rather than deleted from the lexer so that existing code gets this message
-    /// instead of "undefined identifier 'throw'", which is what deleting the keyword would
-    /// produce. Same treatment as `match`.
-    ///
-    /// Why they went, all measured rather than argued:
-    ///   * The thrown VALUE never survived. `nova_throw` took a `long long` and the catch
-    ///     bound `zext(setjmp_res)` — an i32 — so `throw "DI Error: " + key` was caught as
-    ///     the integer `8472`. The stdlib's own only user (`web/recovery.nova`) logged
-    ///     `[RECOVERY] Caught exception: 8472`, and `web/mediator.nova` had already given up
-    ///     and passed a hardcoded string to its exception handlers.
-    ///   * No unwinding, so ARC released only the catching frame's try-block locals: every
-    ///     frame between the throw and the catch leaked everything it owned.
-    ///   * setjmp/longjmp out of a C++20 coroutine is UB — and the one stdlib user was a
-    ///     pipeline behavior running inside an async HTTP handler.
-    ///
-    /// The replacement is `T | Error` (plan P2-13): errors are VALUES, checked by the type
-    /// system, with no unwinding and nothing for ARC to miss.
-    /// Is the token AFTER the current one a `{`? Distinguishes `try { … }` (the removed
-    /// exception form) from `try f()` (the §3.4b propagate operator).
     fn peekIsLeftBrace(self: *Parser) bool {
         return self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].type == .left_brace;
     }
@@ -1124,8 +1051,7 @@ pub const Parser = struct {
         const tok = self.current();
         const sp = self.span();
         if (tok.type == .keyword_try) {
-            // `try f()` is REAL (specs §3.4b) — only the BLOCK form is gone. Say so, or the
-            // message contradicts a feature the same compiler supports.
+
             std.debug.print(
                 "{s}:{d}:{d}: error: `try {{ ... }}` (the exception form) does not exist in Nova.\n" ++
                 "  `try` is a PREFIX operator on an expression, not a block:\n" ++
@@ -1186,10 +1112,7 @@ pub const Parser = struct {
         const type_name = if (self.match(.colon)) try self.parseTypeRef() else null;
         const init_expr = if (self.match(.equal)) try self.parseExpression() else null;
         try self.expect(.semicolon);
-        // Span from the `let`/`const` keyword through the statement (end anchored at
-        // the token after `;`). Capturing the START here — rather than the trailing
-        // `self.span()` alone — is what makes the binding's declaration site usable
-        // for hover/go-to-definition; a trailing-only span points at the NEXT token.
+
         const end_span = self.span();
         return ast.LetStmt{
             .name = name,
@@ -1244,10 +1167,6 @@ pub const Parser = struct {
         };
     }
 
-    /// Parse an expression, then fold a trailing `..`/`..=` into a range. So `0..n` and `0..=n` become
-    /// a `.range` expr; anything without a range operator passes through unchanged. Kept out of the main
-    /// precedence chain (only reachable where a range is meaningful — the for-in iterable) so it cannot
-    /// perturb ordinary expression parsing.
     fn parseRangeOrExpr(self: *Parser) ParserError!ast.Expression {
         const start = try self.parseExpression();
         if (self.current().type == .dot_dot or self.current().type == .dot_dot_eq) {
@@ -1264,33 +1183,21 @@ pub const Parser = struct {
         return start;
     }
 
-    /// `mod.method(...)` / `recv.method(...)` builder for the collection desugar: `<recv>.<method>(args)`.
     fn mkMethodCall(self: *Parser, recv: []const u8, method: []const u8, args: []ast.Expression, sp: ast.Span) ParserError!ast.Expression {
         const obj = try self.allocExpression(.{ .kind = .{ .ident = recv } });
         const callee = try self.allocExpression(.{ .kind = .{ .field_access = .{ .object = obj, .field = method, .span = sp } } });
         return ast.Expression{ .kind = .{ .call = .{ .callee = callee, .args = args, .span = sp } } };
     }
 
-    /// Desugar a collection for-in `for (x in COLL) BODY` to a C-style loop over the container's
-    /// index protocol (`.size()`/`.get(i)`):
-    ///   for (let __fi = 0; __fi < COLL.size(); __fi = __fi + 1) { let x = COLL.get(__fi); BODY }
-    /// A non-ident COLL is hoisted into `__fc` first so it is evaluated once; a bare ident is used
-    /// directly (see the hoist note below). The C-style form reuses the loop codegen, so `continue`
-    /// runs the increment.
     fn desugarCollectionForIn(self: *Parser, name: []const u8, iterable: ast.Expression, body: ast.Statement, sp: ast.Span) ParserError!ast.Statement {
         const n = self.for_counter;
         self.for_counter += 1;
         const fi = try std.fmt.allocPrint(self.allocator, "__for_idx_{d}", .{n});
 
-        // Hoist COLL into `__fc` ONLY when it is a non-trivial expression (evaluate it once). A bare
-        // IDENT is used directly — hoisting `let __fc = xs` would read as a MOVE of `xs` to the static
-        // ownership check, making a later `xs.size()` a false use-after-move; and an ident has no side
-        // effect to re-evaluate anyway.
         const is_ident = iterable.kind == .ident;
         const fc = if (is_ident) iterable.kind.ident else try std.fmt.allocPrint(self.allocator, "__for_coll_{d}", .{n});
         const fc_let: ?ast.Statement = if (is_ident) null else ast.Statement{ .let_stmt = .{ .name = fc, .names = null, .type_name = null, .init = iterable, .is_const = false, .span = sp } };
 
-        // let __fi: int = 0;
         const fi_init = try self.allocStatement(ast.Statement{ .let_stmt = .{
             .name = fi,
             .names = null,
@@ -1300,7 +1207,6 @@ pub const Parser = struct {
             .span = sp,
         } });
 
-        // __fi < __fc.size()
         const size_call = try self.mkMethodCall(fc, "size", &.{}, sp);
         const cond = ast.Expression{ .kind = .{ .binary = .{
             .left = try self.allocExpression(.{ .kind = .{ .ident = fi } }),
@@ -1309,7 +1215,6 @@ pub const Parser = struct {
             .span = sp,
         } } };
 
-        // __fi = __fi + 1
         const add = try self.allocExpression(.{ .kind = .{ .binary = .{
             .left = try self.allocExpression(.{ .kind = .{ .ident = fi } }),
             .op = .add,
@@ -1323,13 +1228,11 @@ pub const Parser = struct {
             .span = sp,
         } } };
 
-        // let x = __fc.get(__fi);
         const get_args = try self.allocator.alloc(ast.Expression, 1);
         get_args[0] = ast.Expression{ .kind = .{ .ident = fi } };
         const get_call = try self.mkMethodCall(fc, "get", get_args, sp);
         const x_let = ast.Statement{ .let_stmt = .{ .name = name, .names = null, .type_name = null, .init = get_call, .is_const = false, .span = sp } };
 
-        // { let x = __fc.get(__fi); BODY }
         const inner_stmts = try self.allocator.alloc(ast.Statement, 2);
         inner_stmts[0] = x_let;
         inner_stmts[1] = body;
@@ -1350,29 +1253,20 @@ pub const Parser = struct {
             outer_stmts[1] = for_stmt;
             return ast.Statement{ .block = .{ .statements = outer_stmts, .span = sp } };
         }
-        return for_stmt; // ident iterable — no hoist needed
+        return for_stmt;
     }
 
-    /// Desugar a map for-in `for ((k, v) in MAP) BODY` to a key iteration:
-    ///   { let __m = MAP; let __mk = __m.keys();
-    ///     for (k in __mk) { let v = __m.get(k); BODY } }
-    /// Reuses collection for-in (so `break`/`continue` work — unlike a `forEach` closure, which cannot
-    /// break) and hoists MAP so `keys()` is built once.
     fn desugarMapForIn(self: *Parser, k_name: []const u8, v_name: []const u8, iterable: ast.Expression, body: ast.Statement, sp: ast.Span) ParserError!ast.Statement {
         const n = self.for_counter;
         self.for_counter += 1;
         const mk = try std.fmt.allocPrint(self.allocator, "__for_keys_{d}", .{n});
 
-        // Use an ident MAP directly (no hoist) — `let __m = m` would read as a MOVE to the ownership
-        // check, so a later `m.size()` would be a false use-after-move; keys()/get() on an ident are
-        // side-effect-free to repeat. A non-ident MAP is hoisted once. `__mk` (keys()) is always hoisted.
         const m_is_ident = iterable.kind == .ident;
         const m = if (m_is_ident) iterable.kind.ident else try std.fmt.allocPrint(self.allocator, "__for_map_{d}", .{n});
         const m_let: ?ast.Statement = if (m_is_ident) null else ast.Statement{ .let_stmt = .{ .name = m, .names = null, .type_name = null, .init = iterable, .is_const = false, .span = sp } };
         const keys_call = try self.mkMethodCall(m, "keys", &.{}, sp);
         const mk_let = ast.Statement{ .let_stmt = .{ .name = mk, .names = null, .type_name = null, .init = keys_call, .is_const = false, .span = sp } };
 
-        // inner body: { let v = __m.get(k); BODY }
         const get_args = try self.allocator.alloc(ast.Expression, 1);
         get_args[0] = ast.Expression{ .kind = .{ .ident = k_name } };
         const get_call = try self.mkMethodCall(m, "get", get_args, sp);
@@ -1382,7 +1276,6 @@ pub const Parser = struct {
         inner_stmts[1] = body;
         const inner_block = ast.Statement{ .block = .{ .statements = inner_stmts, .span = sp } };
 
-        // for (k in __mk) inner_block  — reuse the collection desugar over the keys list
         const loop = try self.desugarCollectionForIn(k_name, ast.Expression{ .kind = .{ .ident = mk } }, inner_block, sp);
 
         if (m_let) |ml| {
@@ -1402,7 +1295,6 @@ pub const Parser = struct {
         try self.expect(.keyword_for);
         try self.expect(.left_paren);
 
-        // Map destructure for-in: `for ((k, v) in MAP)`. Lookahead for `( ident , ident ) in`.
         if (self.current().type == .left_paren and self.pos + 5 < self.tokens.len and
             self.tokens[self.pos + 1].type == .identifier and
             self.tokens[self.pos + 2].type == .comma and
@@ -1411,33 +1303,30 @@ pub const Parser = struct {
             self.tokens[self.pos + 5].type == .identifier and
             std.mem.eql(u8, self.tokens[self.pos + 5].lexeme, "in"))
         {
-            self.advance(); // (
+            self.advance();
             const k_name = self.current().lexeme;
-            self.advance(); // k
-            self.advance(); // ,
+            self.advance();
+            self.advance();
             const v_name = self.current().lexeme;
-            self.advance(); // v
-            self.advance(); // )
-            self.advance(); // in
+            self.advance();
+            self.advance();
+            self.advance();
             const iterable = try self.parseExpression();
             try self.expect(.right_paren);
             const body = try self.parseStatementOrBlock();
             return try self.desugarMapForIn(k_name, v_name, iterable, body, self.span());
         }
 
-        // for-in: `for (x in <iterable>)`. `in` is a CONTEXTUAL keyword (an identifier here), so it does
-        // not reserve `in` elsewhere. Detected by an ident directly followed by `in`.
         if (self.current().type == .identifier and self.peek().type == .identifier and
             std.mem.eql(u8, self.peek().lexeme, "in"))
         {
             const name = self.current().lexeme;
-            self.advance(); // binding name
-            self.advance(); // `in`
+            self.advance();
+            self.advance();
             const iterable = try self.parseRangeOrExpr();
             try self.expect(.right_paren);
             const body = try self.parseStatementOrBlock();
-            // A range iterates directly (codegen desugars the range to a counting while). Anything else
-            // is a collection — desugared to a C-style loop over `.size()`/`.get(i)`.
+
             if (iterable.kind == .range) {
                 return ast.Statement{ .for_stmt = .{
                     .initializer = null,
@@ -1549,10 +1438,6 @@ pub const Parser = struct {
         };
     }
 
-    // ============================================================================
-    // Expressions
-    // ============================================================================
-
     fn parseExpression(self: *Parser) ParserError!ast.Expression {
         return self.parseAssignment();
     }
@@ -1560,9 +1445,6 @@ pub const Parser = struct {
     fn parseAssignment(self: *Parser) ParserError!ast.Expression {
         var left = try self.parseLogical();
 
-        // specs §3.4b: `<expr> catch <handler>` / `<expr> catch (e) <handler>` — the failure-side
-        // twin of `??`. The handler yields the value on the error path, or diverges (`return`).
-        // With `(e)`, `e` is bound to the unwrapped ERROR — a plain enum, so `switch (e)` works.
         if (self.current().type == .keyword_catch) {
             self.advance();
             var err_name: ?[]const u8 = null;
@@ -1579,7 +1461,6 @@ pub const Parser = struct {
             } } };
         }
 
-        // Simple assignment: =
         if (self.match(.equal)) {
             const right = try self.parseAssignment();
             return ast.Expression{ .kind = .{ .binary = ast.BinaryExpr{
@@ -1590,8 +1471,6 @@ pub const Parser = struct {
             } } };
         }
 
-        // Compound assignments: +=, -=, *=, /=, %=, and the bitwise &=, |=, ^=, <<=, >>=.
-        // All desugar to `a = a <op> b`.
         const compound_op: ?ast.BinaryOp = switch (self.current().type) {
             .plus_equal => .add,
             .minus_equal => .sub,
@@ -1607,9 +1486,9 @@ pub const Parser = struct {
         };
 
         if (compound_op) |op| {
-            self.advance(); // consume the operator
+            self.advance();
             const right = try self.parseAssignment();
-            // Desugar: a += b  ->  a = a + b
+
             const add_expr = ast.Expression{ .kind = .{ .binary = ast.BinaryExpr{
                 .left = try self.allocExpression(left),
                 .op = op,
@@ -1661,7 +1540,7 @@ pub const Parser = struct {
                 break;
             }
         }
-        
+
         if (self.match(.question)) {
             const then_branch = try self.parseExpression();
             try self.expect(.colon);
@@ -1673,7 +1552,7 @@ pub const Parser = struct {
                 .span = self.span(),
             } } };
         }
-        
+
         return left;
     }
 
@@ -1695,8 +1574,6 @@ pub const Parser = struct {
         return left;
     }
 
-    // C-family precedence: `&` binds tighter than `^` binds tighter than `|`.
-    // So this level sits between parseBitwiseOr (looser) and parseBitwiseAnd (tighter).
     fn parseBitwiseXor(self: *Parser) ParserError!ast.Expression {
         var left = try self.parseBitwiseAnd();
         while (true) {
@@ -1846,18 +1723,13 @@ pub const Parser = struct {
     }
 
     fn parseUnary(self: *Parser) ParserError!ast.Expression {
-        // specs §3.4b: `try <expr>` — a PREFIX operator on an expression, never a block.
-        //
-        // Not an exception `try`: it means "if this returned the error side, return that error
-        // from the enclosing function; otherwise give me the unwrapped ok value". A branch on a
-        // value. `try { … }` (the old block form) is still rejected — see rejectExceptions —
-        // which is what keeps the two readings from being confused.
+
         if (self.current().type == .keyword_try) {
             self.advance();
             const operand = try self.parseUnary();
             return ast.Expression{ .kind = .{ .try_expr = try self.allocExpression(operand) } };
         }
-        // M3-B: `await <expr>` — prefix operator, suspends the async fn.
+
         if (self.current().type == .keyword_await) {
             const await_span = self.span();
             self.advance();
@@ -1883,10 +1755,7 @@ pub const Parser = struct {
         if (self.current().type == .minus) {
             self.advance();
             const operand = try self.parseUnary();
-            // specs §3.1: `-3.14m` folds into a NEGATED decimal literal (the sign goes into the digit
-            // string handed to decimal128's parser). A decimal is a heap value, not an arithmetic word,
-            // so negating it via the codegen unary path would negate a pointer — decimal ARITHMETIC
-            // (including negating a decimal variable) is Stage 2.
+
             if (operand.kind == .literal and operand.kind.literal == .decimal) {
                 const neg = try std.fmt.allocPrint(self.allocator, "-{s}", .{operand.kind.literal.decimal});
                 return ast.Expression{ .kind = .{ .literal = ast.Literal{ .decimal = neg } } };
@@ -1931,18 +1800,18 @@ pub const Parser = struct {
                         const t = self.tokens[look];
                         if (t.type == .less) depth += 1;
                         if (t.type == .greater) depth -= 1;
-                        if (t.type == .shr) depth = if (depth >= 2) depth - 2 else 0; // `>>` closes two
+                        if (t.type == .shr) depth = if (depth >= 2) depth - 2 else 0;
                         look += 1;
                     }
-                    if (depth == 0 and look < self.tokens.len and 
-                        (self.tokens[look].type == .dot or 
-                         self.tokens[look].type == .left_brace or 
+                    if (depth == 0 and look < self.tokens.len and
+                        (self.tokens[look].type == .dot or
+                         self.tokens[look].type == .left_brace or
                          self.tokens[look].type == .left_paren)) {
                         is_generic = true;
                     }
 
                     if (is_generic) {
-                        self.advance(); // consume '<'
+                        self.advance();
                         var type_args = std.ArrayList(ast.TypeRef).empty;
                         defer type_args.deinit(self.allocator);
                         while (true) {
@@ -1950,9 +1819,9 @@ pub const Parser = struct {
                             if (!self.match(.comma)) break;
                         }
                         try self.expectGenericClose();
-                        
+
                         if (self.current().type == .left_brace) {
-                            self.advance(); // consume '{'
+                            self.advance();
                             var fields = std.ArrayList(ast.ObjectFieldInit).empty;
                             defer fields.deinit(self.allocator);
                             if (self.current().type != .right_brace) {
@@ -1971,7 +1840,7 @@ pub const Parser = struct {
                                 }
                             }
                             try self.expect(.right_brace);
-                            
+
                             const type_name = switch (expr.kind) {
                                 .ident => |id| id,
                                 else => return error.UnexpectedToken,
@@ -1982,7 +1851,7 @@ pub const Parser = struct {
                                 .span = self.span(),
                             } } };
                         } else if (self.current().type == .left_paren) {
-                            self.advance(); // consume '('
+                            self.advance();
                             var args = std.ArrayList(ast.Expression).empty;
                             defer args.deinit(self.allocator);
                             if (self.current().type != .right_paren) {
@@ -1992,7 +1861,7 @@ pub const Parser = struct {
                                 }
                             }
                             try self.expect(.right_paren);
-                            
+
                             expr = ast.Expression{ .kind = .{ .generic_call = ast.GenericCallExpr{
                                 .callee = try self.allocExpression(expr),
                                 .type_args = try type_args.toOwnedSlice(self.allocator),
@@ -2001,16 +1870,16 @@ pub const Parser = struct {
                             } } };
                         } else {
                             try self.expect(.dot);
-                            
+
                             const field = self.current().lexeme;
                             try self.expect(.identifier);
-                            
+
                             expr = ast.Expression{ .kind = .{ .field_access = ast.FieldAccess{
                                 .object = try self.allocExpression(expr),
                                 .field = field,
                                 .span = self.span(),
                             } } };
-                            
+
                             try self.expect(.left_paren);
                             var args = std.ArrayList(ast.Expression).empty;
                             defer args.deinit(self.allocator);
@@ -2021,7 +1890,7 @@ pub const Parser = struct {
                                 }
                             }
                             try self.expect(.right_paren);
-                            
+
                             expr = ast.Expression{ .kind = .{ .generic_call = ast.GenericCallExpr{
                                 .callee = try self.allocExpression(expr),
                                 .type_args = try type_args.toOwnedSlice(self.allocator),
@@ -2105,8 +1974,8 @@ pub const Parser = struct {
                 },
                 .question => {
                     if (self.peek().type == .dot) {
-                        self.advance(); // consume '?'
-                        self.advance(); // consume '.'
+                        self.advance();
+                        self.advance();
                         const field = self.current().lexeme;
                         try self.expect(.identifier);
                         expr = ast.Expression{ .kind = .{ .optional_chaining = ast.OptionalChaining{
@@ -2120,7 +1989,7 @@ pub const Parser = struct {
                 },
                 .identifier => {
                     if (std.mem.eql(u8, self.current().lexeme, "as")) {
-                        self.advance(); // consume "as"
+                        self.advance();
                         const target_type = try self.parseTypeRef();
                         expr = ast.Expression{ .kind = .{ .cast = ast.CastExpr{
                             .expr = try self.allocExpression(expr),
@@ -2277,16 +2146,16 @@ pub const Parser = struct {
                 } } };
             },
             .at => {
-                self.advance(); // consume '@'
+                self.advance();
                 try self.expect(.identifier);
                 try self.expect(.left_paren);
-                
+
                 const target_type = try self.parseTypeRef();
                 try self.expect(.comma);
-                
+
                 const val = try self.parseExpression();
                 try self.expect(.right_paren);
-                
+
                 return ast.Expression{ .kind = .{ .cast = ast.CastExpr{
                     .expr = try self.allocExpression(val),
                     .target_type = target_type,
@@ -2322,10 +2191,10 @@ pub const Parser = struct {
                 }
 
                 if (is_arrow) {
-                    self.advance(); // consume '('
+                    self.advance();
                     var params = std.ArrayList([]const u8).empty;
                     defer params.deinit(self.allocator);
-                    // Optional per-param type annotations: `(s: string, n: int) => ...`.
+
                     var param_types = std.ArrayList(?ast.TypeRef).empty;
                     defer param_types.deinit(self.allocator);
                     if (self.current().type != .right_paren) {
@@ -2339,7 +2208,7 @@ pub const Parser = struct {
                         }
                     }
                     try self.expect(.right_paren);
-                    try self.expect(.fat_arrow); // consume '=>'
+                    try self.expect(.fat_arrow);
 
                     if (self.current().type == .left_brace) {
                         const block = try self.parseBlock();
@@ -2361,7 +2230,7 @@ pub const Parser = struct {
                         }} };
                     }
                 } else {
-                    self.advance(); // consume '('
+                    self.advance();
                     var items = std.ArrayList(ast.Expression).empty;
                     defer items.deinit(self.allocator);
                     var has_comma = false;
@@ -2476,7 +2345,7 @@ pub const Parser = struct {
         return switch (token.type) {
             .integer => ast.Literal{ .integer = std.fmt.parseInt(i64, token.lexeme, 10) catch 0 },
             .float => ast.Literal{ .float = std.fmt.parseFloat(f64, token.lexeme) catch 0.0 },
-            .decimal => ast.Literal{ .decimal = token.lexeme }, // digit string, parsed to decimal128 in codegen
+            .decimal => ast.Literal{ .decimal = token.lexeme },
             .string => ast.Literal{ .string = token.lexeme },
             .bool_true => ast.Literal{ .bool = true },
             .bool_false => ast.Literal{ .bool = false },
@@ -2550,7 +2419,7 @@ pub const Parser = struct {
                 if (end_idx) |close_idx| {
                     const sub_source = lexeme[start_idx + 2 .. close_idx];
                     var sub_parser = Parser.init(self.allocator, sub_source, self.file_path, self.is_wasm) catch return error.OutOfMemory;
-                    
+
                     const trimmed = std.mem.trim(u8, sub_source, " \t\r\n");
                     const is_stmt = blk: {
                         if (std.mem.startsWith(u8, trimmed, "for") or
@@ -2576,7 +2445,7 @@ pub const Parser = struct {
                             .span = self.span(),
                         } } };
                     } else sub_parser.parseExpression() catch return error.UnexpectedToken;
-                    
+
                     parts.append(self.allocator, sub_expr) catch return error.OutOfMemory;
                     current_pos = close_idx + 1;
                 } else {
@@ -2641,7 +2510,7 @@ pub const Parser = struct {
                 if (end_idx) |close_idx| {
                     const sub_source = lexeme[start_idx + 1 .. close_idx];
                     var sub_parser = Parser.init(self.allocator, sub_source, self.file_path, self.is_wasm) catch return error.OutOfMemory;
-                    
+
                     const trimmed = std.mem.trim(u8, sub_source, " \t\r\n");
                     const is_stmt = blk: {
                         if (std.mem.startsWith(u8, trimmed, "for") or
@@ -2667,7 +2536,7 @@ pub const Parser = struct {
                             .span = self.span(),
                         } } };
                     } else sub_parser.parseExpression() catch return error.UnexpectedToken;
-                    
+
                     parts.append(self.allocator, sub_expr) catch return error.OutOfMemory;
                     current_pos = close_idx + 1;
                 } else {

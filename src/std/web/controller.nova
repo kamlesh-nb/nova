@@ -1,4 +1,4 @@
-// controller.nova — Standard Controller Interface
+
 import web.router;
 
 pub trait Controller {

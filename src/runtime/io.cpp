@@ -1,8 +1,4 @@
-// io.cpp — Nova C++20 runtime: file & directory I/O (real), plus socket / TLS /
-// process / filesystem-watcher STUBS. The stubs return safe error defaults so
-// the runtime links for any program; real Boost.Asio (sockets/TLS) and process/
-// watcher implementations replace them in a later M3 step. Nova-facing strings
-// use the (s-4) length-prefix convention (runtime_str.h).
+
 #include "nova_abi.h"
 #include "runtime_str.h"
 #include <cerrno>
@@ -14,7 +10,6 @@
 #include <system_error>
 #include <vector>
 
-// M3-D-5: real TCP sockets (blocking POSIX / Winsock) + TLS via wolfSSL.
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -36,27 +31,22 @@ static inline int nova_close_fd(int fd) { return ::closesocket(fd); }
 static inline int nova_close_fd(int fd) { return ::close(fd); }
 #endif
 
-// I4: container-grade isolation via native Linux kernel primitives (namespaces / rootfs / caps /
-// seccomp). ALL Linux-only — guarded by __linux__; on macOS/Windows the isolated spawn degrades to a
-// plain spawn (documented: isolation unsupported off Linux).
 #if defined(__linux__)
-#include <linux/sched.h>   // CLONE_NEW* (also in sched.h with _GNU_SOURCE)
-#include <sched.h>         // clone, unshare
-#include <sys/mman.h>      // mmap/munmap for the clone child stack
-#include <sys/mount.h>     // mount, MS_*, MNT_DETACH
-#include <sys/prctl.h>     // prctl, PR_SET_NO_NEW_PRIVS, PR_CAPBSET_DROP
-#include <sys/syscall.h>   // SYS_pivot_root, SYS_seccomp
-#include <linux/filter.h>  // sock_filter / sock_fprog (seccomp BPF)
-#include <linux/seccomp.h> // SECCOMP_SET_MODE_FILTER, SECCOMP_RET_*
-#include <linux/audit.h>   // AUDIT_ARCH_*
-#include <linux/capability.h> // __user_cap_header/data_struct + _LINUX_CAPABILITY_VERSION_3 (kernel, not libcap)
+#include <linux/sched.h>
+#include <sched.h>
+#include <sys/mman.h>
+#include <sys/mount.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <linux/audit.h>
+#include <linux/capability.h>
 #ifndef _LINUX_CAPABILITY_VERSION_3
 #define _LINUX_CAPABILITY_VERSION_3 0x20080522
 #endif
 #endif
 
-// Isolation namespace/flags bitmask (mirrors std/os/isolation.nova). Independent of CLONE_* values so the
-// Nova side needn't know kernel constants; the runtime maps them.
 enum NovaIsoNs {
   NOVA_NS_PID  = 1,
   NOVA_NS_MOUNT = 2,
@@ -66,9 +56,6 @@ enum NovaIsoNs {
   NOVA_NS_USER = 32,
 };
 
-// wolfSSL is optional at compile time: build.zig defines NOVA_HAVE_WOLFSSL and adds
-// the include/link when the vendored deps/wolfssl is built. Without it, TLS stays
-// stubbed (sockets still work). options.h MUST precede any other wolfSSL header.
 #ifdef NOVA_HAVE_WOLFSSL
 #include <wolfssl/options.h>
 #include <wolfssl/ssl.h>
@@ -78,7 +65,6 @@ namespace fs = std::filesystem;
 
 extern "C" {
 
-// ===== File I/O (real, portable via stdio) =================================
 static thread_local char g_file_err[256] = {0};
 const char *nova_file_error(void) { return g_file_err; }
 
@@ -95,8 +81,7 @@ int nova_file_close(void *fp) { return fp ? std::fclose((FILE *)fp) : -1; }
 int nova_file_read(void *fp, char *buf, int size) {
   if (!fp)
     return -1;
-  // EINTR-safe: a signal (e.g. SIGCHLD when a supervised child dies) can make fread return short with
-  // ferror/EINTR. Retry from where it left off so a manifest read isn't silently truncated mid-reconcile.
+
   FILE *f = (FILE *)fp;
   size_t total = 0;
   while (total < (size_t)size) {
@@ -145,7 +130,7 @@ int nova_file_stat(const char *path, NovaFileStat *out) {
     out->size = (long)fs::file_size(p, ec);
     if (ec) out->size = 0;
     out->mode = 0;
-    // std::filesystem exposes only last-write-time portably.
+
     auto mt = fs::last_write_time(p, ec);
     long secs = ec ? 0 : (long)std::chrono::duration_cast<std::chrono::seconds>(mt.time_since_epoch()).count();
     out->atime = secs; out->mtime = secs; out->ctime = secs;
@@ -157,7 +142,6 @@ int nova_file_stat(const char *path, NovaFileStat *out) {
   return r;
 }
 
-// ===== Directory ops (real, portable via std::filesystem) ==================
 static thread_local char g_dir_err[256] = {0};
 const char *nova_dir_error(void) { return g_dir_err; }
 
@@ -166,7 +150,7 @@ struct DirHandle {
   fs::directory_iterator it;
   fs::directory_iterator end;
 };
-} // namespace
+}
 
 void *nova_dir_open(const char *path) {
   char *p = nova_to_cstr(path);
@@ -246,9 +230,8 @@ int nova_dir_walk(const char *root, nova_dir_walk_callback cb, void *userdata) {
   return -1;
 }
 
-// ===== TCP sockets (blocking POSIX / Winsock) ==============================
 namespace {
-// Nova string byte length (int32 at s-4).
+
 inline int nova_str_len(const char *s) {
   return s ? *reinterpret_cast<const int *>(s - 4) : 0;
 }
@@ -264,7 +247,7 @@ void nova_net_init() {
 #else
 inline void nova_net_init() {}
 #endif
-} // namespace
+}
 
 int nova_socket_connect(const char *host, int port) {
   nova_net_init();
@@ -294,12 +277,6 @@ int nova_socket_connect(const char *host, int port) {
   return fd;
 }
 
-// D6: apply a receive + send timeout (in milliseconds) to an already-connected socket.
-// A DB driver's `readAll` is a blocking `recv`; a hung-but-not-closed server would block
-// the client indefinitely. With SO_RCVTIMEO set, a stalled `recv`/`send` returns -1 with
-// errno EAGAIN/EWOULDBLOCK after `ms`, so the driver can surface a timeout instead of
-// hanging forever. `ms <= 0` clears the timeout (blocking forever, the previous default).
-// Returns 0 on success, -1 on error.
 int nova_socket_set_timeout(int fd, int ms) {
   if (fd < 0) return -1;
 #ifdef _WIN32
@@ -316,12 +293,6 @@ int nova_socket_set_timeout(int fd, int ms) {
   return (r1 == 0 && r2 == 0) ? 0 : -1;
 }
 
-// D6: connect with a bounded wall-clock deadline (milliseconds). A blocking `connect` to a
-// black-hole/firewalled host can hang for the OS default (~75s+); this puts the socket in
-// non-blocking mode, starts the connect, and `select`s for writability with a `ms` timeout —
-// returning -1 (and closing the fd) if the peer doesn't accept in time. On success the socket
-// is switched back to BLOCKING mode (drivers then layer their own recv timeout on top). A
-// `ms <= 0` falls back to the plain blocking connect.
 int nova_socket_connect_timeout(const char *host, int port, int ms) {
   if (ms <= 0) return nova_socket_connect(host, port);
   nova_net_init();
@@ -351,7 +322,7 @@ int nova_socket_connect_timeout(const char *host, int port, int ms) {
 #endif
     int cr = ::connect(fd, p->ai_addr, (socklen_t)p->ai_addrlen);
     if (cr == 0) {
-      // Immediate connect (loopback): restore blocking and return.
+
 #ifdef _WIN32
       u_long bl = 0;
       ::ioctlsocket(fd, FIONBIO, &bl);
@@ -377,7 +348,7 @@ int nova_socket_connect_timeout(const char *host, int port, int ms) {
         int soerr = 0;
         socklen_t elen = sizeof(soerr);
         if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&soerr, &elen) == 0 && soerr == 0) {
-          // Connected in time — restore blocking mode.
+
 #ifdef _WIN32
           u_long bl = 0;
           ::ioctlsocket(fd, FIONBIO, &bl);
@@ -431,12 +402,6 @@ int nova_socket_send(int fd, const char *data) {
   return total;
 }
 
-// Length-aware binary send: sends exactly `len` raw bytes from `data`, ignoring the
-// Nova string header. `nova_socket_send` derives its length from the [ptr-4] header and
-// stops at that boundary — fine for text, but a binary wire frame (BTreeDB/Postgres/…)
-// contains embedded NUL/arbitrary bytes and its length is decided by the protocol, not
-// the allocation. This is the primitive every binary driver sends through. `data` may
-// point into the middle of a buffer (partial writes), so it must NOT read the header.
 int nova_socket_send_n(int fd, const char *data, int len) {
   if (len <= 0) return 0;
   int total = 0;
@@ -453,7 +418,6 @@ int nova_socket_recv(int fd, char *buf, int max_len) {
   return n < 0 ? -1 : n;
 }
 
-// ===== TLS via wolfSSL (blocking, verify_peer) =============================
 #ifdef NOVA_HAVE_WOLFSSL
 struct TlsContext {
   WOLFSSL_CTX *ctx;
@@ -468,19 +432,14 @@ void nova_wolfssl_init() {
     done = true;
   }
 }
-} // namespace
+}
 
-// Create a client TLS context over an already-connected socket `fd`, verifying the
-// peer certificate (WOLFSSL_VERIFY_PEER) against the system trust store. `hostname`
-// is used for SNI and certificate name validation. Returns null on failure — the
-// SECURE default (no silent verify-off).
 TlsContext *nova_tls_new(int fd, const char *hostname) {
   nova_wolfssl_init();
   WOLFSSL_CTX *ctx = wolfSSL_CTX_new(wolfSSLv23_client_method());
   if (!ctx) return nullptr;
   wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_PEER, nullptr);
-  // Load the OS trust store so verification has a CA set. If unavailable, the
-  // handshake will fail verification (fail-closed) rather than trusting blindly.
+
   wolfSSL_CTX_load_system_CA_certs(ctx);
 
   WOLFSSL *ssl = wolfSSL_new(ctx);
@@ -492,7 +451,7 @@ TlsContext *nova_tls_new(int fd, const char *hostname) {
   char *hn = nova_to_cstr(hostname);
   if (hn) {
     wolfSSL_UseSNI(ssl, WOLFSSL_SNI_HOST_NAME, hn, (unsigned short)std::strlen(hn));
-    wolfSSL_check_domain_name(ssl, hn); // verify cert matches hostname
+    wolfSSL_check_domain_name(ssl, hn);
     nova_free_cstr(hostname, hn);
   }
   TlsContext *tc = new TlsContext{ctx, ssl};
@@ -524,17 +483,13 @@ void nova_tls_free(TlsContext *ctx) {
   delete ctx;
 }
 
-// ===== TDS-tunneled TLS (MS SQL Server) ====================================
-// TDS carries the TLS HANDSHAKE records inside TDS PRELOGIN (0x12) packets; once the
-// handshake completes, TLS runs RAW over the socket and the LOGIN7/SQLBatch TDS packets
-// become the plaintext that TLS encrypts. Custom wolfSSL I/O callbacks do the wrapping.
 struct TdsTlsCtx {
   WOLFSSL_CTX *ctx;
   WOLFSSL *ssl;
   int fd;
   bool handshake_done;
-  int cur_remaining;             // bytes left in the current inbound TDS packet's payload
-  std::vector<unsigned char> ob; // handshake send buffer: coalesce a whole flight into ONE packet
+  int cur_remaining;
+  std::vector<unsigned char> ob;
 };
 
 static int tds_read_exact(int fd, unsigned char *buf, int n) {
@@ -556,9 +511,6 @@ static int tds_write_all(int fd, const unsigned char *buf, int n) {
   return total;
 }
 
-// Flush the buffered handshake flight as ONE PRELOGIN packet. SQL Server 2022 rejects a TLS
-// flight split across multiple PRELOGIN packets, so all of wolfSSL's sends between two reads
-// (a full flight: e.g. ClientKeyExchange+ChangeCipherSpec+Finished) must go out together.
 static int nova_tds_flush(TdsTlsCtx *c) {
   if (c->ob.empty()) return 0;
   int total = 8 + (int)c->ob.size();
@@ -570,8 +522,6 @@ static int nova_tds_flush(TdsTlsCtx *c) {
   return 0;
 }
 
-// wolfSSL SEND: BUFFER the TLS bytes during the handshake (flushed as one flight on the next
-// read); once the handshake completes, TLS runs raw over the socket.
 static int nova_tds_io_send(WOLFSSL *ssl, char *buf, int sz, void *p) {
   (void)ssl;
   TdsTlsCtx *c = (TdsTlsCtx *)p;
@@ -582,7 +532,6 @@ static int nova_tds_io_send(WOLFSSL *ssl, char *buf, int sz, void *p) {
   return sz;
 }
 
-// wolfSSL RECV: unwrap TDS 0x12 packet payloads during the handshake; raw after.
 static int nova_tds_io_recv(WOLFSSL *ssl, char *buf, int sz, void *p) {
   (void)ssl;
   TdsTlsCtx *c = (TdsTlsCtx *)p;
@@ -591,12 +540,12 @@ static int nova_tds_io_recv(WOLFSSL *ssl, char *buf, int sz, void *p) {
     if (n == 0) return WOLFSSL_CBIO_ERR_CONN_CLOSE;
     return n < 0 ? WOLFSSL_CBIO_ERR_GENERAL : n;
   }
-  // wolfSSL is about to read: the current outgoing flight is complete — flush it as one packet.
+
   if (nova_tds_flush(c) < 0) return WOLFSSL_CBIO_ERR_GENERAL;
   while (c->cur_remaining <= 0) {
     unsigned char hdr[8];
     if (tds_read_exact(c->fd, hdr, 8) < 0) return WOLFSSL_CBIO_ERR_GENERAL;
-    c->cur_remaining = ((hdr[2] << 8) | hdr[3]) - 8; // TDS length is big-endian, incl. header
+    c->cur_remaining = ((hdr[2] << 8) | hdr[3]) - 8;
     if (c->cur_remaining < 0) return WOLFSSL_CBIO_ERR_GENERAL;
   }
   int want = sz < c->cur_remaining ? sz : c->cur_remaining;
@@ -607,16 +556,9 @@ static int nova_tds_io_recv(WOLFSSL *ssl, char *buf, int sz, void *p) {
   return n;
 }
 
-// Create a TDS-tunneled TLS client over an already-connected socket `fd`. The peer cert is
-// NOT verified (SQL Server ships a self-signed cert; drivers use TrustServerCertificate by
-// default — verification/pinning is a follow-on). Returns an opaque handle or null.
 void *nova_tds_tls_new(int fd) {
   nova_wolfssl_init();
-  // TLS 1.2 (SQL Server's TDS-tunneled handshake is 1.2). LIVE-VERIFIED against SQL Server 2022.
-  // Two things were load-bearing: (1) wolfSSL built with WOLFSSL_SECURE_RENEGOTIATION so the
-  // ClientHello carries renegotiation_info (Schannel requires it), and (2) coalescing each TLS
-  // FLIGHT into ONE PRELOGIN packet (nova_tds_flush) — the server rejects a flight split across
-  // packets, which wolfSSL's per-record sends would otherwise do.
+
   WOLFSSL_CTX *ctx = wolfSSL_CTX_new(wolfTLSv1_2_client_method());
   if (!ctx) return nullptr;
   wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_NONE, nullptr);
@@ -624,8 +566,7 @@ void *nova_tds_tls_new(int fd) {
   wolfSSL_CTX_SetIOSend(ctx, nova_tds_io_send);
   WOLFSSL *ssl = wolfSSL_new(ctx);
   if (!ssl) { wolfSSL_CTX_free(ctx); return nullptr; }
-  // SQL Server 2022 (Schannel-family) requires the renegotiation_info extension (RFC 5746);
-  // wolfSSL must be built with WOLFSSL_SECURE_RENEGOTIATION (see build.zig) for this to link.
+
   wolfSSL_UseSecureRenegotiation(ssl);
   TdsTlsCtx *c = new TdsTlsCtx{ctx, ssl, fd, false, 0, {}};
   wolfSSL_SetIOReadCtx(ssl, c);
@@ -659,27 +600,16 @@ void nova_tds_tls_free(void *p) {
   delete c;
 }
 
-// ===== Async memory-BIO TLS (driver-agnostic, non-blocking) ================
-// wolfSSL runs against in-memory ciphertext queues instead of a socket fd; the Nova async
-// pump (net/asynctls.nova) does the REAL socket I/O over AsyncStream WITH coroutine parking.
-// This is what gives every DB driver non-blocking TLS while keeping ALL cryptography and X.509
-// certificate verification inside wolfSSL — only the record I/O loop moves to Nova on the
-// async-first seam. The contract with the Nova pump:
-//   handshake/read/write drive wolfSSL; when wolfSSL wants bytes it returns "want-io".
-//   The pump then PULLs any produced ciphertext (flush to socket) and, on want-read, awaits
-//   more ciphertext from the socket and FEEDs it back — parking the coroutine across each wait.
 struct MemTlsCtx {
   WOLFSSL_CTX *ctx;
   WOLFSSL *ssl;
-  std::vector<unsigned char> in;  // ciphertext received from the socket, feeding wolfSSL recv
-  size_t in_pos;                  // read cursor into `in` (compacted when fully drained)
-  std::vector<unsigned char> out; // ciphertext wolfSSL produced, awaiting a socket flush
-  bool in_closed;                 // the peer closed the underlying socket (EOF)
-  bool is_server;                 // server side drives wolfSSL_accept, not wolfSSL_connect
+  std::vector<unsigned char> in;
+  size_t in_pos;
+  std::vector<unsigned char> out;
+  bool in_closed;
+  bool is_server;
 };
 
-// wolfSSL RECV callback: hand it bytes from the input queue, or WANT_READ when it is empty
-// (so wolfSSL_connect/read return want-io and the Nova pump can await more ciphertext).
 static int nova_mtls_io_recv(WOLFSSL *ssl, char *buf, int sz, void *p) {
   (void)ssl;
   MemTlsCtx *c = (MemTlsCtx *)p;
@@ -691,7 +621,7 @@ static int nova_mtls_io_recv(WOLFSSL *ssl, char *buf, int sz, void *p) {
   if (c->in_pos == c->in.size()) { c->in.clear(); c->in_pos = 0; }
   return n;
 }
-// wolfSSL SEND callback: append produced ciphertext to the output queue (the pump flushes it).
+
 static int nova_mtls_io_send(WOLFSSL *ssl, char *buf, int sz, void *p) {
   (void)ssl;
   MemTlsCtx *c = (MemTlsCtx *)p;
@@ -699,10 +629,6 @@ static int nova_mtls_io_send(WOLFSSL *ssl, char *buf, int sz, void *p) {
   return sz;
 }
 
-// Create a client memory-BIO TLS context. `verify != 0` = verify the peer cert against the
-// system trust store and validate `hostname` (the SECURE default); `verify == 0` = no
-// verification (only for self-signed dev servers, e.g. SQL Server's default cert). Negotiates
-// TLS 1.2/1.3 (wolfSSLv23_client_method). Returns an opaque handle or null.
 void *nova_mtls_new(const char *hostname, int verify) {
   nova_wolfssl_init();
   WOLFSSL_CTX *ctx = wolfSSL_CTX_new(wolfSSLv23_client_method());
@@ -719,7 +645,7 @@ void *nova_mtls_new(const char *hostname, int verify) {
   if (!ssl) { wolfSSL_CTX_free(ctx); return nullptr; }
   if (hostname && hostname[0]) {
     wolfSSL_UseSNI(ssl, WOLFSSL_SNI_HOST_NAME, hostname, (unsigned short)std::strlen(hostname));
-    if (verify) wolfSSL_check_domain_name(ssl, (char *)hostname); // cert must match hostname
+    if (verify) wolfSSL_check_domain_name(ssl, (char *)hostname);
   }
   MemTlsCtx *c = new MemTlsCtx{ctx, ssl, {}, 0, {}, false, false};
   wolfSSL_SetIOReadCtx(ssl, c);
@@ -727,9 +653,6 @@ void *nova_mtls_new(const char *hostname, int verify) {
   return c;
 }
 
-// Create a SERVER memory-BIO TLS context from a PEM certificate + private key (both in memory).
-// Used to stand up an in-process TLS peer (tests) and, later, Nova TLS servers. Returns null on
-// failure (bad cert/key).
 void *nova_mtls_new_server(const char *cert, int cert_len, const char *key, int key_len) {
   nova_wolfssl_init();
   WOLFSSL_CTX *ctx = wolfSSL_CTX_new(wolfSSLv23_server_method());
@@ -741,7 +664,7 @@ void *nova_mtls_new_server(const char *cert, int cert_len, const char *key, int 
     wolfSSL_CTX_free(ctx);
     return nullptr;
   }
-  wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_NONE, nullptr); // no client-cert (mutual TLS is later)
+  wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_NONE, nullptr);
   wolfSSL_CTX_SetIORecv(ctx, nova_mtls_io_recv);
   wolfSSL_CTX_SetIOSend(ctx, nova_mtls_io_send);
   WOLFSSL *ssl = wolfSSL_new(ctx);
@@ -752,7 +675,6 @@ void *nova_mtls_new_server(const char *cert, int cert_len, const char *key, int 
   return c;
 }
 
-// Drive the handshake one step. 0 = complete, 1 = want-io (flush out, feed more in), -1 = error.
 int nova_mtls_handshake(void *p) {
   MemTlsCtx *c = (MemTlsCtx *)p;
   if (!c || !c->ssl) return -1;
@@ -763,16 +685,14 @@ int nova_mtls_handshake(void *p) {
   return -1;
 }
 
-// Feed received ciphertext (raw bytes, `len` of them) into the input queue.
 void nova_mtls_feed(void *p, const char *data, int len) {
   MemTlsCtx *c = (MemTlsCtx *)p;
   if (!c || len <= 0) return;
   c->in.insert(c->in.end(), (const unsigned char *)data, (const unsigned char *)data + len);
 }
-// Mark the underlying socket as closed (EOF) so a subsequent empty recv is CONN_CLOSE, not want-read.
+
 void nova_mtls_mark_closed(void *p) { MemTlsCtx *c = (MemTlsCtx *)p; if (c) c->in_closed = true; }
 
-// Copy up to `max` bytes of pending outbound ciphertext into `buf`. Returns bytes copied (0 = none).
 int nova_mtls_pull(void *p, char *buf, int max) {
   MemTlsCtx *c = (MemTlsCtx *)p;
   if (!c || max <= 0 || c->out.empty()) return 0;
@@ -783,15 +703,13 @@ int nova_mtls_pull(void *p, char *buf, int max) {
 }
 int nova_mtls_pending_out(void *p) { MemTlsCtx *c = (MemTlsCtx *)p; return c ? (int)c->out.size() : 0; }
 
-// Encrypt `len` plaintext bytes → output queue. Returns bytes accepted or -1.
 int nova_mtls_write(void *p, const char *data, int len) {
   MemTlsCtx *c = (MemTlsCtx *)p;
   if (!c || !c->ssl || len <= 0) return 0;
   int r = wolfSSL_write(c->ssl, data, len);
   return r < 0 ? -1 : r;
 }
-// Decrypt from the input queue → `buf` (up to `max`). >0 = plaintext bytes, 0 = want-read (need
-// more ciphertext fed), -1 = error / clean TLS close.
+
 int nova_mtls_read(void *p, char *buf, int max) {
   MemTlsCtx *c = (MemTlsCtx *)p;
   if (!c || !c->ssl) return -1;
@@ -809,7 +727,7 @@ void nova_mtls_free(void *p) {
   delete c;
 }
 #else
-// wolfSSL not compiled in — TLS unavailable (sockets still work).
+
 struct TlsContext {
   int unused;
 };
@@ -834,13 +752,13 @@ int nova_tls_read(TlsContext *ctx, char *buf, int max_len) {
   return -1;
 }
 void nova_tls_free(TlsContext *ctx) { (void)ctx; }
-// TDS-tunneled TLS stubs (wolfSSL not compiled in).
+
 void *nova_tds_tls_new(int fd) { (void)fd; return nullptr; }
 int nova_tds_tls_handshake(void *p) { (void)p; return -1; }
 int nova_tds_tls_write(void *p, const char *data, int len) { (void)p; (void)data; (void)len; return -1; }
 int nova_tds_tls_read(void *p, char *buf, int max_len) { (void)p; (void)buf; (void)max_len; return -1; }
 void nova_tds_tls_free(void *p) { (void)p; }
-// Async memory-BIO TLS stubs (wolfSSL not compiled in).
+
 void *nova_mtls_new(const char *hostname, int verify) { (void)hostname; (void)verify; return nullptr; }
 void *nova_mtls_new_server(const char *cert, int cert_len, const char *key, int key_len) { (void)cert; (void)cert_len; (void)key; (void)key_len; return nullptr; }
 int nova_mtls_handshake(void *p) { (void)p; return -1; }
@@ -853,22 +771,16 @@ int nova_mtls_read(void *p, char *buf, int max) { (void)p; (void)buf; (void)max;
 void nova_mtls_free(void *p) { (void)p; }
 #endif
 
-// ===== Process primitives (R1) =============================================
-// The dumb, identity-free exec layer the orchestrator/reverse-proxy build on: spawn a BINARY, talk to
-// its stdio, wait, signal it. Identity here is the kernel PID (unique by construction) — no names, no
-// pools, no scaling logic (that all lives up in the Nova "service" tier). POSIX fork/execvp/pipe/waitpid;
-// Windows gets stubs (the orchestrator targets Linux).
 struct ProcessContext {
-  long pid;      // child PID (long, not the 32-bit `int` — a PID must never truncate). 0 after reap.
-  int in_fd;     // parent's WRITE end of the child's stdin (-1 if closed)
-  int out_fd;    // parent's READ end of the child's stdout (-1 if closed)
-  int exit_code; // cached WEXITSTATUS once reaped
-  bool reaped;   // wait() already collected the exit status
+  long pid;
+  int in_fd;
+  int out_fd;
+  int exit_code;
+  bool reaped;
 };
 
 #ifndef _WIN32
-// Split the newline-joined args_str (process.nova builds it) into a NUL-terminated argv, with cmd as
-// argv[0]. Returned pointers borrow `storage` (which owns the byte copies) — keep it alive until execvp.
+
 static std::vector<char *> nova_build_argv(const char *cmd, const char *args_str,
                                            std::vector<std::string> &storage) {
   storage.clear();
@@ -883,7 +795,7 @@ static std::vector<char *> nova_build_argv(const char *cmd, const char *args_str
         cur.push_back(*p);
       }
     }
-    storage.emplace_back(cur); // trailing arg (no terminating '\n')
+    storage.emplace_back(cur);
   }
   std::vector<char *> argv;
   argv.reserve(storage.size() + 1);
@@ -897,8 +809,8 @@ ProcessContext *nova_process_spawn(const char *cmd, const char *args_str) {
   char *c_cmd = nova_to_cstr(cmd);
   char *c_args = nova_to_cstr(args_str);
 
-  int in_pipe[2] = {-1, -1};  // parent writes -> child stdin
-  int out_pipe[2] = {-1, -1}; // child stdout -> parent reads
+  int in_pipe[2] = {-1, -1};
+  int out_pipe[2] = {-1, -1};
   if (::pipe(in_pipe) != 0 || ::pipe(out_pipe) != 0) {
     if (in_pipe[0] >= 0) ::close(in_pipe[0]);
     if (in_pipe[1] >= 0) ::close(in_pipe[1]);
@@ -919,7 +831,7 @@ ProcessContext *nova_process_spawn(const char *cmd, const char *args_str) {
   }
 
   if (pid == 0) {
-    // Child: wire stdin/stdout to the pipes, close every stray fd, exec the binary.
+
     ::dup2(in_pipe[0], STDIN_FILENO);
     ::dup2(out_pipe[1], STDOUT_FILENO);
     ::close(in_pipe[0]); ::close(in_pipe[1]);
@@ -927,10 +839,9 @@ ProcessContext *nova_process_spawn(const char *cmd, const char *args_str) {
     std::vector<std::string> storage;
     std::vector<char *> argv = nova_build_argv(c_cmd, c_args, storage);
     ::execvp(argv[0], argv.data());
-    _exit(127); // execvp only returns on failure (matches shell "command not found")
+    _exit(127);
   }
 
-  // Parent: keep the write-to-child and read-from-child ends; close the child's copies.
   ::close(in_pipe[0]);
   ::close(out_pipe[1]);
   nova_free_cstr(cmd, c_cmd);
@@ -940,37 +851,30 @@ ProcessContext *nova_process_spawn(const char *cmd, const char *args_str) {
   return ctx;
 }
 
-// ===== I4: isolated spawn (Linux namespaces / rootfs / caps / seccomp) ======
 #if defined(__linux__)
-// Everything the cloned child needs, prepared by the parent BEFORE clone (no post-clone malloc reliance
-// for the essentials — though without CLONE_VM the child has a private copy of memory, so it's fork-safe).
+
 struct IsoChildArgs {
   char **argv;
-  int in_fd, out_fd;      // child ends of the stdio pipes
+  int in_fd, out_fd;
   long ns_flags;
-  const char *rootfs;     // may be empty
-  const char *hostname;   // may be empty
+  const char *rootfs;
+  const char *hostname;
   int drop_caps, no_new_privs, seccomp_deny;
 };
 
-// Drop ALL capabilities from the bounding set + clear the permitted/effective/inheritable sets. Combined
-// with PR_SET_NO_NEW_PRIVS this makes the execed process unprivileged even if it started as root.
 static void iso_drop_caps() {
   for (int cap = 0; cap <= 63; ++cap)
-    ::prctl(PR_CAPBSET_DROP, cap, 0, 0, 0); // ignore EINVAL past the last valid cap
+    ::prctl(PR_CAPBSET_DROP, cap, 0, 0, 0);
   struct __user_cap_header_struct hdr = {_LINUX_CAPABILITY_VERSION_3, 0};
   struct __user_cap_data_struct data[2];
   std::memset(data, 0, sizeof(data));
-  ::syscall(SYS_capset, &hdr, data); // empty sets → no caps
+  ::syscall(SYS_capset, &hdr, data);
 }
 
-// Install a small default-allow seccomp-bpf filter that DENIES (EPERM) the dangerous namespace/mount
-// escape syscalls — a demonstrable Level-3 hardening. A sandboxed process calling unshare()/setns()/
-// mount()/pivot_root() then gets EPERM instead of escaping.
 static int iso_install_seccomp() {
 #if defined(SECCOMP_SET_MODE_FILTER) && defined(AUDIT_ARCH_X86_64)
   struct sock_filter filter[] = {
-    // load syscall nr
+
     BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
 #define DENY(NR) \
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (NR), 0, 1), \
@@ -992,10 +896,9 @@ static int iso_install_seccomp() {
 #endif
 }
 
-// pivot into `rootfs` as the new / (private-mount-namespace only). Standard bind→pivot_root→detach dance.
 static int iso_setup_rootfs(const char *rootfs) {
-  if (::mount("", "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) return -1; // don't leak mounts to host
-  if (::mount(rootfs, rootfs, nullptr, MS_BIND | MS_REC, nullptr) != 0) return -1; // pivot needs a mountpoint
+  if (::mount("", "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) return -1;
+  if (::mount(rootfs, rootfs, nullptr, MS_BIND | MS_REC, nullptr) != 0) return -1;
   if (::chdir(rootfs) != 0) return -1;
   ::mkdir(".old_root", 0700);
   if (::syscall(SYS_pivot_root, ".", ".old_root") != 0) return -1;
@@ -1005,8 +908,6 @@ static int iso_setup_rootfs(const char *rootfs) {
   return 0;
 }
 
-// The cloned child's entry: it runs (as PID 1 if a PID ns was requested) in the new namespaces, sets up
-// the sandbox in order, then execve's the target. Never returns on success.
 static int iso_child_entry(void *arg) {
   IsoChildArgs *a = reinterpret_cast<IsoChildArgs *>(arg);
   ::dup2(a->in_fd, STDIN_FILENO);
@@ -1019,27 +920,24 @@ static int iso_child_entry(void *arg) {
 
   if (a->ns_flags & NOVA_NS_MOUNT) {
     if (a->rootfs && a->rootfs[0]) {
-      if (iso_setup_rootfs(a->rootfs) != 0) _exit(125); // rootfs failure is fatal (would leak host FS)
+      if (iso_setup_rootfs(a->rootfs) != 0) _exit(125);
     } else {
       ::mount("", "/", nullptr, MS_REC | MS_PRIVATE, nullptr);
     }
-    // A fresh /proc so a PID-namespaced process sees ONLY its own tree (and `ps` works inside).
+
     if (a->ns_flags & NOVA_NS_PID)
       ::mount("proc", "/proc", "proc", 0, nullptr);
   }
 
   if (a->no_new_privs) ::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
   if (a->drop_caps) iso_drop_caps();
-  if (a->seccomp_deny) iso_install_seccomp(); // AFTER no_new_privs (required without CAP_SYS_ADMIN)
+  if (a->seccomp_deny) iso_install_seccomp();
 
   ::execvp(a->argv[0], a->argv);
   _exit(127);
 }
-#endif // __linux__
+#endif
 
-// I4: spawn `cmd` under container-grade isolation. On Linux, clone() into the requested namespaces with
-// a private rootfs / dropped caps / seccomp per the flags; the returned ProcessContext is a normal child
-// (waitpid/kill/pid all work). On non-Linux, isolation is unsupported → degrade to a plain spawn.
 ProcessContext *nova_process_spawn_isolated(const char *cmd, const char *args_str, long ns_flags,
                                             const char *rootfs, const char *hostname, int drop_caps,
                                             int no_new_privs, int seccomp_deny) {
@@ -1058,11 +956,10 @@ ProcessContext *nova_process_spawn_isolated(const char *cmd, const char *args_st
     return nullptr;
   }
 
-  // Build argv now (parent side); the child copies memory (no CLONE_VM), so it stays valid.
   static thread_local std::vector<std::string> storage;
   std::vector<char *> argv = nova_build_argv(c_cmd ? c_cmd : "", c_args, storage);
 
-  int clone_flags = SIGCHLD; // so the parent can waitpid the child
+  int clone_flags = SIGCHLD;
   if (ns_flags & NOVA_NS_PID)   clone_flags |= CLONE_NEWPID;
   if (ns_flags & NOVA_NS_MOUNT) clone_flags |= CLONE_NEWNS;
   if (ns_flags & NOVA_NS_UTS)   clone_flags |= CLONE_NEWUTS;
@@ -1074,7 +971,7 @@ ProcessContext *nova_process_spawn_isolated(const char *cmd, const char *args_st
                      c_rootfs ? c_rootfs : "", c_host ? c_host : "",
                      drop_caps, no_new_privs, seccomp_deny};
 
-  const size_t STACK = 1 << 20; // 1 MiB child stack
+  const size_t STACK = 1 << 20;
   void *stack = ::mmap(nullptr, STACK, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
   pid_t pid = -1;
@@ -1089,25 +986,24 @@ ProcessContext *nova_process_spawn_isolated(const char *cmd, const char *args_st
     return nullptr;
   }
 
-  // Parent: keep the stdio ends the parent talks on; close the child's copies.
   ::close(in_pipe[0]);
   ::close(out_pipe[1]);
   nova_free_cstr(cmd, c_cmd); nova_free_cstr(args_str, c_args);
   nova_free_cstr(rootfs, c_rootfs); nova_free_cstr(hostname, c_host);
-  // (stack is intentionally leaked for the child's lifetime; a per-child free would need a reaping hook.)
+
   return new ProcessContext{(long)pid, in_pipe[1], out_pipe[0], 0, false};
 #else
   (void)ns_flags; (void)rootfs; (void)hostname; (void)drop_caps; (void)no_new_privs; (void)seccomp_deny;
-  return nova_process_spawn(cmd, args_str); // isolation unsupported off Linux → plain supervision
+  return nova_process_spawn(cmd, args_str);
 #endif
 }
 
 int nova_process_write_stdin(ProcessContext *ctx, const char *data) {
   if (!ctx || ctx->in_fd < 0 || !data)
     return -1;
-  int len = *reinterpret_cast<const int *>(data - 4); // canonical Nova string length (binary-safe)
+  int len = *reinterpret_cast<const int *>(data - 4);
   if (len < 0 || len > 64 * 1024 * 1024)
-    len = (int)std::strlen(data); // fallback for a non-canonical/C string
+    len = (int)std::strlen(data);
   ssize_t n = ::write(ctx->in_fd, data, (size_t)len);
   return (int)n;
 }
@@ -1115,7 +1011,7 @@ int nova_process_write_stdin(ProcessContext *ctx, const char *data) {
 int nova_process_read_stdout(ProcessContext *ctx, char *buf, int max_len) {
   if (!ctx || ctx->out_fd < 0 || !buf || max_len <= 0)
     return -1;
-  ssize_t n = ::read(ctx->out_fd, buf, (size_t)max_len); // blocks until data or EOF (0)
+  ssize_t n = ::read(ctx->out_fd, buf, (size_t)max_len);
   return (int)n;
 }
 
@@ -1124,7 +1020,7 @@ int nova_process_wait(ProcessContext *ctx) {
     return -1;
   if (ctx->reaped)
     return ctx->exit_code;
-  // Closing the child's stdin first lets a filter that reads-to-EOF finish instead of deadlocking.
+
   if (ctx->in_fd >= 0) { ::close(ctx->in_fd); ctx->in_fd = -1; }
   int status = 0;
   pid_t r;
@@ -1135,21 +1031,15 @@ int nova_process_wait(ProcessContext *ctx) {
     return -1;
   ctx->reaped = true;
   ctx->exit_code = WIFEXITED(status) ? WEXITSTATUS(status)
-                   : WIFSIGNALED(status) ? 128 + WTERMSIG(status) // shell convention
+                   : WIFSIGNALED(status) ? 128 + WTERMSIG(status)
                                          : -1;
   return ctx->exit_code;
 }
 
-// I2 addition: the child's kernel PID (for cgroup.procs attach + observability). 0 if none.
 long long nova_process_pid(ProcessContext *ctx) {
   return ctx ? (long long)ctx->pid : 0;
 }
 
-// R1/I2 addition: NON-BLOCKING exit poll (waitpid WNOHANG). Returns the exit code if the child has
-// exited (reaping it so it never becomes a zombie), -2 if it is still running, or -1 on error / no such
-// child. This is what the orchestrator's async reconcile loop needs — kill(pid,0) can't tell a live
-// process from an unreaped zombie, and nova_process_wait blocks. Exit-code convention matches
-// nova_process_wait (128+signal for a killed child).
 int nova_process_try_wait(ProcessContext *ctx) {
   if (!ctx)
     return -1;
@@ -1163,9 +1053,9 @@ int nova_process_try_wait(ProcessContext *ctx) {
     r = ::waitpid((pid_t)ctx->pid, &status, WNOHANG);
   } while (r < 0 && errno == EINTR);
   if (r == 0)
-    return -2; // still running
+    return -2;
   if (r < 0)
-    return -1; // error (e.g. ECHILD)
+    return -1;
   ctx->reaped = true;
   ctx->exit_code = WIFEXITED(status) ? WEXITSTATUS(status)
                    : WIFSIGNALED(status) ? 128 + WTERMSIG(status)
@@ -1173,8 +1063,6 @@ int nova_process_try_wait(ProcessContext *ctx) {
   return ctx->exit_code;
 }
 
-// R1 addition: signal the child (SIGTERM=15 graceful, SIGKILL=9 hard). The scale-down / restart-on-crash
-// primitive the orchestrator needs. Returns 0 on success, -1 on error.
 int nova_process_kill(ProcessContext *ctx, int sig) {
   if (!ctx || ctx->pid <= 0)
     return -1;
@@ -1186,7 +1074,7 @@ void nova_process_free(ProcessContext *ctx) {
     return;
   if (ctx->in_fd >= 0) ::close(ctx->in_fd);
   if (ctx->out_fd >= 0) ::close(ctx->out_fd);
-  // Best-effort reap so a finished child does not linger as a zombie (non-blocking — never stalls free).
+
   if (!ctx->reaped && ctx->pid > 0) {
     int status = 0;
     ::waitpid((pid_t)ctx->pid, &status, WNOHANG);
@@ -1194,7 +1082,7 @@ void nova_process_free(ProcessContext *ctx) {
   delete ctx;
 }
 #else
-// Windows: process control is unimplemented (the orchestrator targets Linux). Stubs keep the PE build linking.
+
 ProcessContext *nova_process_spawn(const char *cmd, const char *args_str) {
   (void)cmd; (void)args_str; return nullptr;
 }
@@ -1225,4 +1113,4 @@ const char *nova_fs_watcher_next_event(WatcherContext *ctx) {
 void nova_fs_watcher_free_event(const char *ptr) { (void)ptr; }
 void nova_fs_watcher_close(WatcherContext *ctx) { (void)ctx; }
 
-} // extern "C"
+}

@@ -1,4 +1,4 @@
-// rate_limit.nova — IP-based Token Bucket Rate Limiting Middleware
+
 import web.request;
 import web.response;
 import web.middleware;
@@ -38,7 +38,7 @@ pub struct RateLimiter {
 
     init(requestsPerMinute: int) {
         self.capacity = requestsPerMinute * 1000;
-        // Refill rate per second (in millitokens)
+
         self.refillRate = (requestsPerMinute * 1000) / 60;
         self.buckets = Map<string, TokenBucket>(16, string.hash);
     }
@@ -58,7 +58,7 @@ pub struct RateLimiter {
         }
 
         let allowed = tryConsume(bucket, now);
-        // Put the modified bucket back into the map
+
         self.buckets.set(ip, bucket);
         return allowed;
     }
@@ -73,15 +73,14 @@ pub struct RateLimitMiddleware impl Middleware {
 
     pub fn execute(self: RateLimitMiddleware, req: request.Request, res: response.Response): MiddlewareAction {
         let ip = req.headers.get("X-Forwarded-For") ?? req.headers.get("X-Real-IP") ?? "127.0.0.1";
-        
-        // Handle potential comma-separated list in X-Forwarded-For
+
         let comma = string.indexOf(ip, ",");
         if (comma != -1) {
             ip = string.trim(string.slice(ip, 0, comma));
         }
 
         if (!self.limiter.isAllowed(ip)) {
-            res.status = Status.fromCode(429); // Too Many Requests
+            res.status = Status.fromCode(429);
             res.setHeader("Retry-After", "60");
             res.body = "{\"error\":\"Rate limit exceeded\"}";
             return MiddlewareAction.Stop;

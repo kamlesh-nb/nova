@@ -1,20 +1,7 @@
-// asynctls.nova — non-blocking TLS over the async-first seam (A1).
-//
-// TlsStream drives a wolfSSL memory-BIO context (all cryptography + X.509 verification stay
-// inside the audited library) while doing the REAL socket I/O over an AsyncStream — so every
-// `await` PARKS the coroutine (no scheduler thread held) during the TLS record pump. This is
-// what gives a DB driver non-blocking TLS: the same `recvInto`/`sendStr` shape as AsyncStream,
-// but encrypted, so a reader written against one works against the other.
-//
-//   let s = await asynctls.tlsConnect("db.example.com", 5432, true);   // verify the cert
-//   if (!s.ok()) { /* handshake failed */ }
-//   await s.sendStr(frame);
-//   let n = await s.recvInto(buf, 4096);
-//   s.close();
+
 import bytes;
 import net.asyncio;
 
-// Copy `n` bytes of a raw buffer into a fresh Nova string (length-headed, binary-safe).
 fn bufToStr(buf: ptr, n: int): string {
     if (n <= 0) { return ""; }
     let out = bytes.alloc(n);
@@ -24,9 +11,9 @@ fn bufToStr(buf: ptr, n: int): string {
 }
 
 pub struct TlsStream impl AsyncIO {
-    pub base: asyncio.AsyncStream,   // the underlying async socket
-    pub ctx: ptr,                    // MemTlsCtx handle (wolfSSL memory-BIO)
-    pub scratch: ptr,                // reusable ciphertext staging buffer
+    pub base: asyncio.AsyncStream,
+    pub ctx: ptr,
+    pub scratch: ptr,
     pub cap: int,
     pub open: bool,
     pub handshakeOk: bool,
@@ -40,7 +27,6 @@ pub struct TlsStream impl AsyncIO {
         self.handshakeOk = false;
     }
 
-    // Flush all ciphertext wolfSSL has produced to the socket (parks per send).
     pub async fn flushOut(self: TlsStream): int {
         while (nova_mtls_pending_out(self.ctx) > 0) {
             let n = nova_mtls_pull(self.ctx, self.scratch, self.cap);
@@ -51,7 +37,6 @@ pub struct TlsStream impl AsyncIO {
         return 0;
     }
 
-    // Pull ciphertext from the socket and feed it to wolfSSL (parks on recv). <=0 = closed/error.
     pub async fn pumpIn(self: TlsStream): int {
         let n = await self.base.recvInto(self.scratch as long, self.cap);
         if (n <= 0) { nova_mtls_mark_closed(self.ctx); return n; }
@@ -59,7 +44,6 @@ pub struct TlsStream impl AsyncIO {
         return n;
     }
 
-    // Run the TLS handshake to completion, parking on each socket wait. 0 = ok, -1 = failed.
     pub async fn handshake(self: TlsStream): int {
         while (true) {
             let st = nova_mtls_handshake(self.ctx);
@@ -72,7 +56,6 @@ pub struct TlsStream impl AsyncIO {
         return -1;
     }
 
-    // Encrypt + send `data`; parks until the ciphertext is flushed. Returns bytes accepted or -1.
     pub async fn sendStr(self: TlsStream, data: string): int {
         let w = nova_mtls_write(self.ctx, data as ptr, data.length);
         if (w < 0) { return -1; }
@@ -80,8 +63,6 @@ pub struct TlsStream impl AsyncIO {
         return w;
     }
 
-    // Decrypt into `buf` (up to `max`); parks pumping ciphertext until a record is ready.
-    // Returns plaintext bytes (>0), 0 = peer closed, -1 = error.
     pub async fn recvInto(self: TlsStream, buf: long, max: int): int {
         while (true) {
             let n = nova_mtls_read(self.ctx, buf, max);
@@ -97,7 +78,6 @@ pub struct TlsStream impl AsyncIO {
     pub fn ok(self: TlsStream): bool { return self.handshakeOk; }
     pub fn isOpen(self: TlsStream): bool { return self.open; }
 
-    // Deadline applies to the underlying ciphertext recv (each TLS record pump awaits base recv).
     pub fn setTimeout(self: TlsStream, ms: int): int {
         return self.base.setTimeout(ms);
     }
@@ -111,10 +91,6 @@ pub struct TlsStream impl AsyncIO {
     }
 }
 
-// Awaitable TLS connect: async-connect the socket, then run the handshake over it (parking
-// throughout). `verify` = validate the peer certificate against the system trust store and
-// check the hostname (the SECURE default); pass false only for self-signed dev servers.
-// Returns a TlsStream — check `.ok()` for handshake success.
 pub async fn tlsConnect(host: string, port: int, verify: bool): TlsStream {
     let base = await asyncio.asyncConnect(host, port);
     let ctx = nova_mtls_new(host as ptr, verify ? 1 : 0);
@@ -123,8 +99,6 @@ pub async fn tlsConnect(host: string, port: int, verify: bool): TlsStream {
     return ts;
 }
 
-// Wrap an already-connected AsyncStream in a SERVER-side TLS session (for in-process TLS peers
-// and, later, Nova TLS servers). `cert`/`key` are PEM. Returns a TlsStream — check `.ok()`.
 pub async fn tlsAccept(base: asyncio.AsyncStream, cert: string, key: string): TlsStream {
     let ctx = nova_mtls_new_server(cert as ptr, cert.length, key as ptr, key.length);
     let ts = TlsStream(base, ctx);

@@ -62,11 +62,11 @@ pub const CoverageRegistry = struct {
         _ = fwrite("[\n", 1, 2, file);
         for (self.blocks.items, 0..) |block, i| {
             _ = fwrite("  {\n", 1, 4, file);
-            
+
             var buf: [64]u8 = undefined;
             const id_str = try std.fmt.bufPrint(&buf, "    \"id\": {d},\n", .{block.id});
             _ = fwrite(id_str.ptr, 1, id_str.len, file);
-            
+
             _ = fwrite("    \"file_path\": \"", 1, 18, file);
             for (block.file_path) |char| {
                 if (char == '\\') {

@@ -1,37 +1,19 @@
-// crypto/random.nova — TWO generators, deliberately distinct. Never confuse them.
-//
-//  1. CSPRNG  — `randomHex` / `randomBytes` / `randomInt`. Hardware-seeded, from
-//     wolfCrypt's `wc_RNG` via the runtime. UNSEEDABLE and unpredictable: the ONLY
-//     correct source for salts, nonces, tokens, session/CSRF ids, and SCRAM
-//     client-nonces. Use these anywhere unpredictability is a security property.
-//
-//  2. Prng    — a SEEDABLE, DETERMINISTIC PCG32 (O'Neill 2014). Reproducible by
-//     design: same seed -> same sequence. For tests, YCSB key/Zipfian
-//     distributions, sampling, jitter. NEVER use it where secrecy matters — its
-//     output is fully predictable from the seed.
 
 import bytes;
 import assert;
 
-// ---------------------------------------------------------------------------
-// CSPRNG (secure)
-// ---------------------------------------------------------------------------
-
-/// `nBytes` cryptographically-secure random bytes as `2*nBytes` lowercase hex.
 pub fn randomHex(nBytes: int): string {
     return nova_random_hex(nBytes);
 }
 
-/// Alias of `randomHex` — secure random bytes, hex-encoded. (Kept for call sites
-/// that read as "give me random bytes"; the encoding is hex.)
 pub fn randomBytes(nBytes: int): string {
     return nova_random_hex(nBytes);
 }
 
 fn hexDigit(c: int): int {
-    if (c >= 48 && c <= 57) { return c - 48; }         // '0'..'9'
-    if (c >= 97 && c <= 102) { return c - 97 + 10; }   // 'a'..'f'
-    if (c >= 65 && c <= 70) { return c - 65 + 10; }    // 'A'..'F'
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 97 + 10; }
+    if (c >= 65 && c <= 70) { return c - 65 + 10; }
     return 0;
 }
 
@@ -46,17 +28,11 @@ fn hexToLong(hex: string): long {
     return acc;
 }
 
-/// A cryptographically-secure integer in [0, bound). 32 bits of CSPRNG entropy;
-/// the modulo bias over a 32-bit draw is negligible for realistic bounds.
 pub fn randomInt(bound: int): int {
     if (bound <= 0) { return 0; }
-    let draw: long = hexToLong(nova_random_hex(4)); // 4 bytes -> 32 bits, always >= 0
+    let draw: long = hexToLong(nova_random_hex(4));
     return (draw % (bound as long)) as int;
 }
-
-// ---------------------------------------------------------------------------
-// Seedable PRNG (deterministic) — PCG-XSH-RR 64/32
-// ---------------------------------------------------------------------------
 
 fn rotr32(v: ulong, r: ulong): ulong {
     let rr: ulong = r & 31;
@@ -64,13 +40,10 @@ fn rotr32(v: ulong, r: ulong): ulong {
     return ((v >> rr) | (v << (32 - rr))) & 4294967295;
 }
 
-/// A deterministic PCG32 generator. Seed it with `newPrng(seed)`; draw with
-/// `next()` (32-bit), `nextInt(bound)`, or `nextFloat()` ([0, 1)).
 pub struct Prng {
     pub state: ulong,
     pub inc: ulong,
 
-    /// Next 32-bit output (0 .. 2^32-1) and advance the state.
     pub fn next(self: Prng): long {
         let mult: ulong = 6364136223846793005;
         let old: ulong = self.state;
@@ -80,47 +53,37 @@ pub struct Prng {
         return rotr32(xorshifted, rot) as long;
     }
 
-    /// A uniform-ish integer in [0, bound).
     pub fn nextInt(self: Prng, bound: int): int {
         if (bound <= 0) { return 0; }
         return (self.next() % (bound as long)) as int;
     }
 
-    /// A double in [0, 1) with 32 bits of resolution.
     pub fn nextFloat(self: Prng): double {
         return (self.next() as double) / 4294967296.0;
     }
 }
 
-/// Construct a PCG32 seeded deterministically. `seq` selects the output stream
-/// (any two distinct `seq` values give distinct sequences from the same `seed`).
 pub fn newPrngSeq(seed: long, seq: long): Prng {
     let mult: ulong = 6364136223846793005;
     let p = Prng{ state: 0, inc: 0 };
     p.inc = (((seq as ulong)) << 1) | 1;
-    // Standard PCG seeding: step, add the seed, step again.
+
     p.state = p.state * mult + p.inc;
     p.state = p.state + (seed as ulong);
     p.state = p.state * mult + p.inc;
     return p;
 }
 
-/// Construct a PCG32 seeded from `seed` (default stream).
 pub fn newPrng(seed: long): Prng {
     return newPrngSeq(seed, 1);
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 @test
 fn test_prng_reference_vectors(): void {
-    // PCG32 published reference: srandom(42, 54) -> these first outputs. This
-    // proves the algorithm is CORRECT, not merely deterministic.
+
     let p = newPrngSeq(42, 54);
-    assert.equalInt((p.next() == 2707161783) as int, 1); // 0xa15c02b7
-    assert.equalInt((p.next() == 2068313097) as int, 1); // 0x7b47f409
+    assert.equalInt((p.next() == 2707161783) as int, 1);
+    assert.equalInt((p.next() == 2068313097) as int, 1);
     assert.equalInt((p.next() == 3122475824) as int, 1);
     assert.equalInt((p.next() == 2211639955) as int, 1);
     assert.equalInt((p.next() == 3215226955) as int, 1);
@@ -128,7 +91,7 @@ fn test_prng_reference_vectors(): void {
 
 @test
 fn test_prng_is_deterministic(): void {
-    // Same seed -> identical sequence; different seed -> different sequence.
+
     let a = newPrng(12345);
     let b = newPrng(12345);
     let c = newPrng(99999);
@@ -160,12 +123,12 @@ fn test_prng_bounds(): void {
 
 @test
 fn test_csprng_liveness(): void {
-    // 16 secure bytes -> 32 hex chars; two draws must differ (collision ~2^-128).
+
     let a = randomHex(16);
     let b = randomHex(16);
     assert.equalInt(a.length, 32);
     assert.isTrue(a != b);
-    // randomInt stays in range.
+
     let r = randomInt(100);
     assert.isTrue(r >= 0);
     assert.isTrue(r < 100);

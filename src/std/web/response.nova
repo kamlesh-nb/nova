@@ -1,4 +1,4 @@
-// response.nova — HTTP Response using refined enums
+
 import string;
 import list;
 import map;
@@ -18,12 +18,10 @@ pub struct Response {
         self.cookies = Map<string, string>(16, string.hash);
     }
 
-    /// Create a 200 OK response with a body
     pub fn ok(body: string): Response {
         return Response(Status.Ok, body);
     }
 
-    /// Create a response with custom status, body, headers, and cookies
     pub fn withHeaders(stat: Status, body: string, headers: Map<string, string>): Response {
         let cookies = Map<string, string>(16, string.hash);
         return Response{
@@ -34,19 +32,16 @@ pub struct Response {
         };
     }
 
-    /// Set a header on this response
     pub fn setHeader(self: Response, key: string, value: string): Response {
         self.headers.set(key, value);
         return self;
     }
 
-    /// Set a cookie on this response
     pub fn setCookie(self: Response, name: string, value: string): Response {
         self.cookies.set(name, value);
         return self;
     }
 
-    /// Get a header value (case-insensitive)
     pub fn getHeader(self: Response, name: string): string | undefined {
         let lower_name = string.toLowerCase(name);
         let keys = self.headers.keys();
@@ -62,25 +57,21 @@ pub struct Response {
         return undefined;
     }
 
-    /// Serialize this response to an HTTP response string
     pub fn serialize(self: Response): string {
         let code = Status.toCode(self.status);
         let code_str = intToStr(code);
         let reason = Status.reasonPhrase(self.status);
         let status_line = "HTTP/1.1 " + code_str + " " + reason + "\r\n";
 
-        // Set Content-Length if not already present
         if (self.headers.get("Content-Length") == undefined) {
             self.headers.set("Content-Length", intToStr(self.body.length));
         }
 
-        // Build headers
         let header_lines = List<string>();
         self.headers.forEach((key, value) => {
             header_lines.push(key + ": " + value);
         });
 
-        // Add Set-Cookie headers
         self.cookies.forEach((key, value) => {
             header_lines.push("Set-Cookie: " + key + "=" + value + "; Path=/");
         });
@@ -89,14 +80,12 @@ pub struct Response {
         return status_line + headers_str + "\r\n\r\n" + self.body;
     }
 
-    /// Parse an HTTP response string into a Response
     pub fn parse(raw: string): Response {
         let lines = string.split(raw, "\r\n");
         if (lines.size() == 0) {
             return Response(Status.Ok, "");
         }
 
-        // Parse status line: "HTTP/1.1 200 OK"
         let status_line = lines.get(0) ?? "";
         let parts = string.split(status_line, " ");
         let code = 200;
@@ -105,7 +94,6 @@ pub struct Response {
         }
         let stat = Status.fromCode(code);
 
-        // Parse headers
         let headers = Map<string, string>(16, string.hash);
         let i = 1;
         while (i < lines.size()) {
@@ -123,7 +111,6 @@ pub struct Response {
             i = i + 1;
         }
 
-        // Remaining is body
         let body_lines = List<string>();
         while (i < lines.size()) {
             body_lines.push(lines.get(i) ?? "");
@@ -135,8 +122,6 @@ pub struct Response {
     }
 }
 
-// --- Private helpers ---
-
 fn intToStr(val: int): string {
     if (val == 0) return "0";
     let temp = val;
@@ -145,7 +130,7 @@ fn intToStr(val: int): string {
         digits = digits + 1;
         temp = temp / 10;
     }
-    // ARC-correct string alloc (workstream A): data at ptr, length at [ptr-4].
+
     let str_ptr = bytes.alloc(digits);
     let i = digits - 1;
     temp = val;

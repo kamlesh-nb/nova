@@ -1,4 +1,4 @@
-// request.nova — HTTP Request parsing
+
 import string;
 import list;
 import map;
@@ -6,14 +6,13 @@ import bytes;
 import web.url;
 
 pub struct Request {
-    pub method: string,        // GET, POST, etc.
-    pub path: string,          // /path/to/resource
-    pub query: Map<string, string>, // query parameters
+    pub method: string,
+    pub path: string,
+    pub query: Map<string, string>,
     pub headers: Map<string, string>,
     pub cookies: Map<string, string>,
     pub body: string,
 
-    /// Parse an HTTP request from a raw string
     pub fn fromString(raw: string): Request {
         let boundary = string.indexOf(raw, "\r\n\r\n");
         if (boundary == -1) {
@@ -47,7 +46,6 @@ pub struct Request {
             i = i + 1;
         }
 
-        // Parse Cookies
         let cookies = Map<string, string>(16, string.hash);
         let cookie_str = findHeaderVal(headers, "Cookie");
         if (cookie_str != "") {
@@ -76,13 +74,11 @@ pub struct Request {
         };
     }
 
-    /// Parse from a raw memory pointer
     pub fn parse(ptr: int, len: int): Request {
         let raw = bytes.read_string(ptr, len);
         return Request.fromString(raw);
     }
 
-    /// Create an empty request
     pub fn empty(): Request {
         return Request{
             method: "",
@@ -94,7 +90,6 @@ pub struct Request {
         };
     }
 
-    /// Get a header value by name (case-insensitive)
     pub fn getHeader(self: Request, name: string): string | undefined {
         let lower_name = string.toLowerCase(name);
         let keys = self.headers.keys();
@@ -110,13 +105,10 @@ pub struct Request {
         return undefined;
     }
 
-    /// Get a cookie value by name
     pub fn getCookie(self: Request, name: string): string | undefined {
         return self.cookies.get(name);
     }
 }
-
-// --- Private helpers ---
 
 fn splitPathQuery(full_path: string): (string, Map<string, string>) {
     let idx = string.indexOf(full_path, "?");
@@ -130,8 +122,7 @@ fn splitPathQuery(full_path: string): (string, Map<string, string>) {
 }
 
 pub fn parseQuery(query_str: string): Map<string, string> {
-    // Percent-decode keys and values (`%20`→space, `+`→space). Also used for
-    // application/x-www-form-urlencoded bodies, so decoding here fixes both.
+
     let result = Map<string, string>(16, string.hash);
     let pairs = string.split(query_str, "&");
     pairs.forEach((pair) => {

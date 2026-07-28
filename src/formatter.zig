@@ -1,4 +1,4 @@
-// src/formatter.zig
+
 const std = @import("std");
 const ast = @import("ast.zig");
 
@@ -39,7 +39,7 @@ pub const Formatter = struct {
     pub fn formatProgram(self: *Formatter, program: ast.Program) ![]const u8 {
         for (program.declarations, 0..) |decl, idx| {
             if (idx > 0) {
-                // Double newline between top-level declarations
+
                 try self.write("\n");
             }
             try self.formatDeclaration(decl);
@@ -164,20 +164,18 @@ pub const Formatter = struct {
         if (fd.is_exported) {
             try self.write("pub ");
         }
-        // T3 FFI: `extern("lib") fn name(params): ret;` — no body. Must come before `fn`
-        // and re-emit the lib, or the extern binding is silently rewritten to an empty fn.
+
         if (fd.extern_lib) |lib| {
             try self.print("extern(\"{s}\") ", .{lib});
         } else if (fd.is_async) {
-            // `async fn` — dropping this turned a coroutine into a plain fn.
+
             try self.write("async ");
         }
         if (std.mem.eql(u8, fd.name, "init")) {
             try self.print("init(", .{});
         } else {
             try self.print("{s}fn {s}", .{prefix, fd.name});
-            // Generic type params: `fn map<T, U>(...)` — dropping these made every generic
-            // function lose its `<...>` and fail type-checking after a format.
+
             if (fd.type_params.len > 0) {
                 try self.write("<");
                 for (fd.type_params, 0..) |tp, i| {
@@ -217,8 +215,7 @@ pub const Formatter = struct {
             try self.write("pub ");
         }
         try self.print("struct {s}", .{sd.name});
-        // Generic params from the AST (`struct Pair<A, B>`) — the old source-span scrape
-        // dropped them on some spans, silently turning `Pair<A,B>` into a non-generic `Pair`.
+
         if (sd.type_params.len > 0) {
             try self.write("<");
             for (sd.type_params, 0..) |tp, i| {
@@ -267,10 +264,7 @@ pub const Formatter = struct {
                 std.mem.copyForwards(u8, prefix_buf[f_idx..], "pub ");
                 f_idx += 4;
             }
-            // NOTE: no `static ` prefix — Nova has no `static` keyword. A method is
-            // static iff its first parameter isn't `self`, so re-parsing the emitted
-            // `fn` (which has no self) recovers is_static; emitting `static` would be
-            // invalid syntax.
+
             try self.formatFunctionDecl(method.decl, prefix_buf[0..f_idx]);
         }
 
@@ -347,10 +341,7 @@ pub const Formatter = struct {
                 std.mem.copyForwards(u8, prefix_buf[f_idx..], "pub ");
                 f_idx += 4;
             }
-            // NOTE: no `static ` prefix — Nova has no `static` keyword. A method is
-            // static iff its first parameter isn't `self`, so re-parsing the emitted
-            // `fn` (which has no self) recovers is_static; emitting `static` would be
-            // invalid syntax.
+
             try self.formatFunctionDecl(method.decl, prefix_buf[0..f_idx]);
         }
 
@@ -365,8 +356,7 @@ pub const Formatter = struct {
             try self.write("pub ");
         }
         try self.print("trait {s}", .{td.name});
-        // Generic trait params (`trait Handler<Q, R>`) — previously dropped, turning a
-        // generic trait into a non-generic one and breaking round-trip.
+
         if (td.type_params.len > 0) {
             try self.write("<");
             for (td.type_params, 0..) |tp, i| {
@@ -379,7 +369,7 @@ pub const Formatter = struct {
         self.indent_level += 1;
         for (td.methods) |m| {
             try self.writeIndent();
-            // A1 async-first seam: preserve `async` on trait method signatures.
+
             if (m.is_async) try self.write("async ");
             try self.print("fn {s}(", .{m.name});
             for (m.params, 0..) |p, idx| {
@@ -484,8 +474,7 @@ pub const Formatter = struct {
                 try self.writeIndent();
                 try self.write("for (");
                 if (f.iterator) |it| {
-                    // `for (x in xs)` / `for ((k, v) in map)` — the for-IN form. Previously
-                    // unhandled: the formatter emitted an empty C-style header, corrupting it.
+
                     switch (it.binding) {
                         .item => |name| try self.write(name),
                         .destructure => |d| {
@@ -499,7 +488,7 @@ pub const Formatter = struct {
                     try self.write(" in ");
                     try self.formatExpression(it.iterable.*);
                 } else {
-                    // C-style `for (init; cond; incr)`.
+
                     if (f.initializer) |init_stmt| {
                         try self.formatStatementNoIndentNoNewline(init_stmt.*);
                     } else {
@@ -600,8 +589,7 @@ pub const Formatter = struct {
         if (i.then_branch.* == .block) {
             try self.formatBlock(i.then_branch.block);
         } else {
-            // Preserve a braceless single-statement branch (`if (c) break;`) — injecting
-            // `{ }` would change the token stream and the guard would then skip the file.
+
             try self.formatStatementNoIndentNoNewline(i.then_branch.*);
         }
         if (i.else_branch) |eb| {
@@ -659,9 +647,9 @@ pub const Formatter = struct {
                 try self.write(";");
             },
             else => {
-                // Fallback (should normally be one of the above in standard initializer)
+
                 try self.formatStatement(stmt);
-                // Remove trailing newline if written
+
                 if (self.out.items.len > 0 and self.out.items[self.out.items.len - 1] == '\n') {
                     _ = self.out.pop();
                 }
@@ -673,7 +661,7 @@ pub const Formatter = struct {
         return switch (op) {
             .assign => 1,
             .bit_or, .Or => 2,
-            .bit_xor => 3, // C-family: `&` > `^` > `|`
+            .bit_xor => 3,
             .bit_and, .And => 4,
             .eq, .ne => 5,
             .lt, .gt, .le, .ge => 6,
@@ -940,9 +928,7 @@ pub const Formatter = struct {
                 try self.formatBlock(b);
             },
             .template_expr => |temp| {
-                // Nova template strings are backtick-delimited with `${expr}` holes —
-                // NOT `"..."` with `{expr}`. Emitting the wrong delimiters produced code
-                // that re-lexed differently (the non-destructive guard then skipped it).
+
                 try self.write("`");
                 for (temp.parts) |part| {
                     switch (part.kind) {
@@ -971,7 +957,7 @@ pub const Formatter = struct {
         switch (tr) {
             .ident => |name| try self.write(name),
             .error_union => |eu| {
-                // `T | E`, or `T | E | undefined` when ok is itself optional (specs §3.4b).
+
                 try self.formatTypeRef(eu.ok.*);
                 try self.write(" | ");
                 try self.formatTypeRef(eu.err.*);
@@ -994,10 +980,7 @@ pub const Formatter = struct {
                 try self.write(">");
             },
             .func => |f| {
-                // Nova accepts BOTH `->` and `=>` for a function type and parses them to
-                // the same AST — which carries no record of the arrow used. The formatter
-                // must pick one; `->` is the majority in real code, so emitting it lets the
-                // most files round-trip (a `=>`-style file is left unchanged by the guard).
+
                 try self.write("(");
                 for (f.params, 0..) |p, idx| {
                     if (idx > 0) try self.write(", ");
@@ -1018,17 +1001,10 @@ pub const Formatter = struct {
     }
 };
 
-// ---------------------------------------------------------------------------
-// Tests (docs/design/README.md §2b).
-// ---------------------------------------------------------------------------
 const testing = std.testing;
 
 test "formatter: `&` and `|` print as operators, not the dead and/or keywords" {
-    // The `and`/`or` KEYWORDS were replaced by `&&`/`||` and are no longer lexed.
-    // `.bit_and`/`.bit_or` kept their keyword-era names, and the formatter still
-    // printed them as `and`/`or` — so `nova fmt` rewrote `hash & (cap - 1)` into
-    // `hash and (cap - 1)`, which no longer compiles. The formatter emitted source
-    // its own lexer rejects; zero tests in this file is why it went unnoticed.
+
     try testing.expectEqualStrings("&", Formatter.binOpToStr(.bit_and));
     try testing.expectEqualStrings("|", Formatter.binOpToStr(.bit_or));
     try testing.expectEqualStrings("&&", Formatter.binOpToStr(.And));
@@ -1036,8 +1012,7 @@ test "formatter: `&` and `|` print as operators, not the dead and/or keywords" {
 }
 
 test "formatter: every operator round-trips through the lexer" {
-    // Guards the whole class rather than the two that were wrong: anything this
-    // function emits must lex back to exactly one operator token.
+
     for ([_]ast.BinaryOp{
         .add, .sub, .mul, .div, .mod,
         .eq,  .ne,  .lt,  .gt,  .le, .ge,
@@ -1045,7 +1020,7 @@ test "formatter: every operator round-trips through the lexer" {
     }) |op| {
         const s = Formatter.binOpToStr(op);
         try testing.expect(s.len > 0);
-        // An operator spelling must not be alphabetic — that is what `and`/`or` were.
+
         for (s) |c| try testing.expect(!std.ascii.isAlphabetic(c));
     }
 }

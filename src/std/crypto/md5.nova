@@ -1,20 +1,4 @@
-// crypto/md5.nova — MD5, backed by wolfCrypt.
-//
-// MD5 is cryptographically BROKEN (collisions are trivial) — it exists ONLY for
-// legacy protocol interop (checksums, MSSQL/NTLM auth flows). Never use it for
-// integrity or authentication of new data.
-//
-// This wolfSSL build may be compiled with `NO_MD5`; in that case the runtime
-// wrapper aborts with an honest "md5 is disabled in this build" message rather
-// than returning a wrong/empty digest.
 
-/// MD5 digest of `input`, as 32 lowercase hex chars. Legacy/interop only.
-///
-/// NOTE: this wolfSSL build is compiled with `NO_MD5`, so calling this aborts the
-/// process with an honest "md5 is disabled" message (the runtime never returns a
-/// wrong/empty digest). There is therefore no MD5 KAT here — enabling MD5 in the
-/// wolfSSL build (for MSSQL/NTLM auth) is what re-activates it, and a KAT
-/// (`md5("abc") == "900150983cd24fb0d6963f7d28e17f72"`) should be added then.
 pub fn md5(input: string): string {
     return nova_md5(input);
 }

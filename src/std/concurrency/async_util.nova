@@ -1,33 +1,9 @@
-// async_util.nova — concurrency utilities over the future<T> substrate (A1).
-//
-// The runtime provides `spawn f(x)` (launch an async fn concurrently, yielding a `future<T>`
-// handle) and `await h` (suspend until the future is ready). These helpers build the common
-// FAN-OUT / JOIN patterns on top: launch many tasks, then collect their results.
-//
-//   let fs = List<future<int>>();
-//   let i = 0;
-//   while (i < n) { fs.push(spawn work(i)); i = i + 1; }
-//   let results = await async_util.when_all<int>(fs);   // [work(0), work(1), …], in order
-//
-// `spawn`/`await` are only legal inside an `async fn`, so these helpers are `async` and are
-// themselves awaited.
+
 import list;
 import bytes;
 
-// Awaitable: `await whenAny(buf, n)` → the INDEX of the first ready future among the `n` coroutine
-// handles packed (int64 each) at `buf`. Parks the coroutine until one completes, without consuming
-// it. Called directly (not via `await`) this is a stub returning 0 — the compiler lowers the
-// `await` form to the real select loop (buildWhenAny).
 pub fn whenAny(buf: int, n: int): int { return 0; }
 
-/// `select` over futures: await the FIRST of `fs` to complete and return its INDEX. The winner is
-/// NOT consumed, so read its value with `await fs.at(idx)`. The losing futures keep running (their
-/// results discarded) — `await` them (or `when_all`) afterward to free their frames if you own them.
-///
-///   let fs = List<future<int>>();
-///   fs.push(spawn slow(1)); fs.push(spawn fast(2));
-///   let i = await async_util.selectAny<int>(fs);   // whichever finished first
-///   let v = await fs.at(i);                         // the winner's value
 pub async fn selectAny<T>(fs: List<future<T>>): int {
     let n = fs.size();
     if (n <= 0) { return -1; }
@@ -39,15 +15,8 @@ pub async fn selectAny<T>(fs: List<future<T>>): int {
     return idx;
 }
 
-// Awaitable: `await whenAnyDeadline(buf, n, ms)` → first-ready future index, or -2 if the `ms`-ms
-// DEADLINE elapsed first. Same handle buffer as whenAny; a `select(futures, timer)`. Stub; lowered.
 pub fn whenAnyDeadline(buf: int, n: int, ms: int): int { return 0; }
 
-/// `select` over futures WITH a deadline — the whole-operation timeout `select(futures, timer)`.
-/// Await the first of `fs` to complete (returns its index), OR return -2 if none completes within
-/// `ms` milliseconds. Unlike a per-recv deadline, this bounds the ENTIRE operation. On -2 the
-/// futures keep running (parked) — cancel their work (e.g. discard the DB connection) and drain
-/// them. The winner (index >= 0) is NOT consumed: read it with `await fs.at(idx)`.
 pub async fn selectTimeout<T>(fs: List<future<T>>, ms: int): int {
     let n = fs.size();
     if (n <= 0) { return -2; }
@@ -59,26 +28,14 @@ pub async fn selectTimeout<T>(fs: List<future<T>>, ms: int): int {
     return idx;
 }
 
-/// The single-future convenience: run `fut` with a whole-operation deadline. Returns 0 if it
-/// completed in time (read the value with `await fut`), or -2 on timeout (cancel + drain `fut`).
-///
-///   let fut = spawn conn.query(sql, params);
-///   if (await async_util.withTimeout<ResultSet>(fut, 2000) == 0) {
-///       let rs = await fut;              // completed within 2s
-///   } else {
-///       conn.close();                    // timed out -> cancel the socket recv,
-///       let drained = await fut;         //   then drain the now-broken query future
-///   }
 pub async fn withTimeout<T>(fut: future<T>, ms: int): int {
     let buf = bytes.alloc(8);
     bytes.write_ptr(buf, 0, fut as long);
     let idx = await whenAnyDeadline(buf as int, 1, ms);
     bytes.free(buf);
-    return idx;   // 0 = completed, -2 = timed out
+    return idx;
 }
 
-/// Await EVERY future in `fs`, collecting the results into a new list in the SAME order.
-/// The tasks run concurrently (they were already launched by `spawn`); this joins them.
 pub async fn when_all<T>(fs: List<future<T>>): List<T> {
     let out = List<T>();
     let i = 0;
@@ -89,8 +46,6 @@ pub async fn when_all<T>(fs: List<future<T>>): List<T> {
     return out;
 }
 
-/// Await every future and RETURN NOTHING — a barrier that just waits for all tasks to finish
-/// (for side-effecting tasks whose result is `void`-like or ignored).
 pub async fn wait_all<T>(fs: List<future<T>>): int {
     let i = 0;
     while (i < fs.size()) {
@@ -100,7 +55,6 @@ pub async fn wait_all<T>(fs: List<future<T>>): int {
     return fs.size();
 }
 
-/// Await the first `k` futures (a bounded join). `k` is clamped to the list size.
 pub async fn when_first_n<T>(fs: List<future<T>>, k: int): List<T> {
     let out = List<T>();
     let n = if (k < fs.size()) k else fs.size();

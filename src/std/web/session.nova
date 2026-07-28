@@ -1,4 +1,4 @@
-// session.nova — Generic Session Store and Middleware
+
 import map;
 import string;
 import datetime;
@@ -19,7 +19,7 @@ pub struct SessionStore {
 
     init() {
         self.sessions = Map<string, Session>(16, string.hash);
-        self.defaultTtl = 604800; // 7 days in seconds
+        self.defaultTtl = 604800;
         self.counter = 0;
     }
 
@@ -42,10 +42,10 @@ pub struct SessionStore {
         let sess = self.sessions.get(id);
         if (sess != undefined) {
             if (ts > sess.expiresAt) {
-                self.sessions.delete_key(id); // expired!
+                self.sessions.delete_key(id);
                 return undefined;
             }
-            // Touch/extend TTL
+
             sess.expiresAt = ts + self.defaultTtl;
             return sess;
         }
@@ -68,17 +68,15 @@ pub struct SessionMiddleware impl Middleware {
 
     pub fn execute(self: SessionMiddleware, req: request.Request, res: response.Response): MiddlewareAction {
         let sid = req.getCookie(self.cookieName) ?? "";
-        
+
         let sess = self.store.getSession(sid);
         if (sess == undefined) {
             sess = self.store.createSession();
             res.setCookie(self.cookieName, sess.id);
         }
 
-        // Put active session ID to request headers so subsequent code/csrf check has access to it!
         req.headers.set("X-Session-ID", sess.id);
 
-        // Put CSRF token generated for this session to request headers (e.g. if one doesn't exist, generate one)
         let csrfToken = sess.data.get("csrf_token") ?? "";
         if (csrfToken == "") {
             sess.data.set("csrf_token", "csrf-" + sess.id);

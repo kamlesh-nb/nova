@@ -1,4 +1,4 @@
-// socket.nova — TcpStream: wraps a connected socket file descriptor
+
 import bytes;
 import mem.allocator;
 
@@ -13,10 +13,6 @@ pub struct TcpStream {
         return nova_socket_send(self.fd, data);
     }
 
-    // Length-aware binary send. `data` is a raw bytes buffer (e.g. `bytes.alloc(n)`) and
-    // `len` is exactly how many bytes to send — unlike `write`, this does NOT stop at the
-    // string header's length or at an embedded NUL, so it is safe for binary wire frames
-    // (BTreeDB/Postgres/… protocols). Returns bytes sent, or -1 on error.
     pub fn writeBytes(self: TcpStream, data: ptr, len: int): int {
         return nova_socket_send_n(self.fd, data, len);
     }
@@ -28,7 +24,7 @@ pub struct TcpStream {
             bytes.free(buf);
             return "";
         }
-        // ARC-correct string alloc (workstream A): data at ptr, length at [ptr-4].
+
         let str_ptr = bytes.alloc(n);
         let i = 0;
         while (i < n) {
@@ -51,7 +47,7 @@ pub struct TcpStream {
             bytes.free(buf);
             return "";
         }
-        // ARC-correct string alloc (workstream A): data at ptr, length at [ptr-4].
+
         let str_ptr = bytes.alloc(total);
         let i = 0;
         while (i < total) {
@@ -62,10 +58,6 @@ pub struct TcpStream {
         return str_ptr as string;
     }
 
-    // D6: bound every subsequent recv/send on this socket to `timeoutMs` milliseconds. A
-    // stalled `read`/`readAll` then returns "" (recv -> -1/EAGAIN) instead of blocking the
-    // client forever on a hung-but-not-closed server. `timeoutMs <= 0` clears the timeout
-    // (blocking forever, the previous default). Returns 0 on success, -1 on error.
     pub fn setTimeout(self: TcpStream, timeoutMs: int): int {
         return nova_socket_set_timeout(self.fd, timeoutMs);
     }

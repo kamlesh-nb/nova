@@ -74,10 +74,6 @@ pub fn int_hash(val: int): int {
     return val;
 }
 
-// ---------------------------------------------------------------------------
-// Floating-point (double) math (A4)
-// ---------------------------------------------------------------------------
-
 pub fn pi(): double { return 3.14159265358979323846; }
 pub fn e(): double { return 2.71828182845904523536; }
 
@@ -102,7 +98,6 @@ pub fn fclamp(x: double, lo: double, hi: double): double {
     return x;
 }
 
-/// Round toward negative infinity.
 pub fn ffloor(x: double): double {
     let t = x as int;
     let tf = t as double;
@@ -110,7 +105,6 @@ pub fn ffloor(x: double): double {
     return tf;
 }
 
-/// Round toward positive infinity.
 pub fn fceil(x: double): double {
     let t = x as int;
     let tf = t as double;
@@ -118,13 +112,11 @@ pub fn fceil(x: double): double {
     return tf;
 }
 
-/// Round half away from zero.
 pub fn fround(x: double): double {
     if (x < 0.0) { return fceil(x - 0.5); }
     return ffloor(x + 0.5);
 }
 
-/// Square root via Newton's method.
 pub fn fsqrt(x: double): double {
     if (x <= 0.0) { return 0.0; }
     let guess = x;
@@ -136,7 +128,6 @@ pub fn fsqrt(x: double): double {
     return guess;
 }
 
-/// Integer power for double base (non-negative exponent).
 pub fn fpow(base: double, exp: int): double {
     let result = 1.0;
     let i = 0;
@@ -149,9 +140,6 @@ pub fn fpow(base: double, exp: int): double {
 
 pub fn ln2(): double { return 0.69314718055994530942; }
 
-/// Natural logarithm. Range-reduces x to m in [1,2) by halving (x = m * 2^k), then uses the
-/// fast-converging atanh series ln(m) = 2*(z + z^3/3 + z^5/5 + ...) with z = (m-1)/(m+1).
-/// Returns 0.0 for x <= 0 (Nova has no NaN/-inf literal to return).
 pub fn fln(x: double): double {
     if (x <= 0.0) { return 0.0; }
     let m = x;
@@ -171,8 +159,6 @@ pub fn fln(x: double): double {
     return (2.0 * sum) + ((k as double) * ln2());
 }
 
-/// e^x. Range-reduces by k = round(x / ln2) so the Taylor series runs on r in [-ln2/2, ln2/2],
-/// then scales by 2^k.
 pub fn fexp(x: double): double {
     let k = fround(x / ln2());
     let r = x - (k * ln2());
@@ -191,8 +177,6 @@ pub fn fexp(x: double): double {
     return sum * scale;
 }
 
-/// base^exp for fractional exponents, via exp(exp * ln(base)). `fpow` only takes an int exponent;
-/// this is what distributions like Zipfian need (pow(i, theta) with theta ~= 0.99).
 pub fn fpowf(base: double, exp: double): double {
     if (base <= 0.0) { return 0.0; }
     return fexp(exp * fln(base));
@@ -227,4 +211,3 @@ fn test_math(): void {
     assert.equalInt(8, clamp(8, 5, 10));
     assert.equalInt(10, clamp(12, 5, 10));
 }
-

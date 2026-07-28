@@ -1,4 +1,4 @@
-// mediator.nova — Mediator pattern implementation with Pipeline Behaviors and Exception Handling
+
 import map;
 import string;
 import list;
@@ -69,7 +69,6 @@ pub struct Mediator {
             return response.Response(Status.NotFound, "Handler not found for: " + name);
         }
 
-        // Execute pre-processors
         let pre_len = self.pre_processors.len;
         let i = 0;
         while (i < pre_len) {
@@ -80,27 +79,10 @@ pub struct Mediator {
 
         let this = self;
 
-        // Define core handler invocation.
-        //
-        // The `try { return handler.handle(req); } catch (err) { ...exception_handlers... }`
-        // that was here is GONE with `throw` (specs §5.5, plan P2-12). Note what the catch
-        // block did with `err`: NOTHING. It passed the hardcoded string "Exception occurred
-        // during execution" to every exception handler — because the caught value could only
-        // ever be a meaningless i32 (`nova_throw` took a `long long`, the catch bound
-        // `zext(setjmp_res)`, so a thrown string arrived as e.g. `8472`). The pipeline was
-        // already routing around the fact that no error information survived the throw.
-        //
-        // It was also UB: this runs inside an async handler — a C++20 coroutine — and the
-        // implementation was setjmp/longjmp. And it leaked every frame it unwound.
-        //
-        // `exception_handlers` is retained on the struct: it gets its real customer when
-        // `handle` returns `TResponse | Error` (plan P2-13) and this dispatches on the error
-        // VALUE — with the message intact, which is exactly what the old code could not do.
         let core_call = () => {
             return handler.handle(req);
         };
 
-        // Execute pipeline behaviors (chaining from end to start)
         let current_next = core_call;
         let behaviors_len = self.behaviors.len;
         let idx = behaviors_len;
@@ -115,7 +97,6 @@ pub struct Mediator {
 
         let result_res = current_next();
 
-        // Execute post-processors
         let post_len = self.post_processors.len;
         let k = 0;
         while (k < post_len) {

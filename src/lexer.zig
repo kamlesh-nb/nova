@@ -1,4 +1,4 @@
-// src/lexer.zig
+
 const std = @import("std");
 
 pub const TokenType = enum {
@@ -38,7 +38,7 @@ pub const TokenType = enum {
 
     integer,
     float,
-    decimal, // specs §3.1: a `m`/`M`-suffixed number literal — `10.5m`, `100m` — is decimal128
+    decimal,
     string,
     template_string,
     interpolated_string,
@@ -56,11 +56,11 @@ pub const TokenType = enum {
     star_equal,
     slash_equal,
     percent_equal,
-    amp_equal, // &=
-    pipe_equal, // |=
-    caret_equal, // ^=
-    shl_equal, // <<=
-    shr_equal, // >>=
+    amp_equal,
+    pipe_equal,
+    caret_equal,
+    shl_equal,
+    shr_equal,
     less,
     greater,
     shl,
@@ -81,8 +81,8 @@ pub const TokenType = enum {
     right_bracket,
     arrow,
     dot,
-    dot_dot, // `..` exclusive range
-    dot_dot_eq, // `..=` inclusive range
+    dot_dot,
+    dot_dot_eq,
     pipe,
     ampersand,
     caret,
@@ -110,11 +110,7 @@ pub const Lexer = struct {
     pos: usize,
     line: usize,
     column: usize,
-    /// Byte offset in `source` where the most recently returned token began (set after
-    /// leading whitespace/comments are skipped). Punctuation tokens carry STATIC lexemes
-    /// (not slices of `source`), so their position can't be recovered from the lexeme
-    /// pointer — this exposes it for tools (e.g. `nova fmt`'s comment reinjection) that
-    /// need every token's real span, `pos` being the end offset after `nextToken`.
+
     tok_start: usize = 0,
 
     pub fn init(source: []const u8) Lexer {
@@ -188,9 +184,9 @@ pub const Lexer = struct {
             '/' => {
                 self.pos += 1;
                 self.column += 1;
-                // Check for comment
+
                 if (self.pos < self.source.len and self.source[self.pos] == '/') {
-                    // Skip line comment
+
                     while (self.pos < self.source.len and self.source[self.pos] != '\n') {
                         self.pos += 1;
                         self.column += 1;
@@ -202,7 +198,7 @@ pub const Lexer = struct {
                     self.column += 1;
                     return Token{ .type = .slash_equal, .lexeme = "/=", .line = self.line, .column = self.column - 2 };
                 }
-                // Check for JSX self-closing or closing tag
+
                 if (self.pos < self.source.len and self.source[self.pos] == '>') {
                     self.pos += 1;
                     self.column += 1;
@@ -328,19 +324,19 @@ pub const Lexer = struct {
             '.' => {
                 self.pos += 1;
                 self.column += 1;
-                // `...` ellipsis (three dots) — must be checked before `..`
+
                 if (self.pos + 1 < self.source.len and self.source[self.pos] == '.' and self.source[self.pos + 1] == '.') {
                     self.pos += 2;
                     self.column += 2;
                     return Token{ .type = .ellipsis, .lexeme = "...", .line = self.line, .column = self.column - 3 };
                 }
-                // `..=` inclusive range
+
                 if (self.pos + 1 < self.source.len and self.source[self.pos] == '.' and self.source[self.pos + 1] == '=') {
                     self.pos += 2;
                     self.column += 2;
                     return Token{ .type = .dot_dot_eq, .lexeme = "..=", .line = self.line, .column = self.column - 3 };
                 }
-                // `..` exclusive range
+
                 if (self.pos < self.source.len and self.source[self.pos] == '.') {
                     self.pos += 1;
                     self.column += 1;
@@ -455,7 +451,7 @@ pub const Lexer = struct {
                 },
                 '/' => {
                     if (self.pos + 1 < self.source.len and self.source[self.pos + 1] == '/') {
-                        // Skip comment
+
                         while (self.pos < self.source.len and self.source[self.pos] != '\n') {
                             self.pos += 1;
                         }
@@ -507,7 +503,7 @@ pub const Lexer = struct {
             }
         }
         const num_end = self.pos;
-        // specs §3.1: a trailing `m`/`M` (not part of an identifier) makes this a `decimal` literal.
+
         var is_decimal = false;
         if (self.pos < self.source.len and (self.source[self.pos] == 'm' or self.source[self.pos] == 'M')) {
             const after = self.pos + 1;
@@ -518,7 +514,7 @@ pub const Lexer = struct {
                 is_decimal = true;
             }
         }
-        const lexeme = self.source[start..num_end]; // the number WITHOUT the `m` suffix
+        const lexeme = self.source[start..num_end];
         const tt: TokenType = if (is_decimal) .decimal else if (is_float) .float else .integer;
         return Token{ .type = tt, .lexeme = lexeme, .line = self.line, .column = self.column - (self.pos - start) };
     }
@@ -528,12 +524,12 @@ pub const Lexer = struct {
     }
 
     fn readString(self: *Lexer) Token {
-        self.pos += 1; // Skip opening quote
+        self.pos += 1;
         self.column += 1;
         const start = self.pos;
         while (self.pos < self.source.len and self.source[self.pos] != '"') {
             if (self.source[self.pos] == '\\') {
-                self.pos += 2; // Skip escape sequence
+                self.pos += 2;
                 self.column += 2;
             } else {
                 self.pos += 1;
@@ -541,13 +537,13 @@ pub const Lexer = struct {
             }
         }
         const lexeme = self.source[start..self.pos];
-        self.pos += 1; // Skip closing quote
+        self.pos += 1;
         self.column += 1;
         return Token{ .type = .string, .lexeme = lexeme, .line = self.line, .column = self.column - lexeme.len - 2 };
     }
 
     fn readTemplateString(self: *Lexer) Token {
-        self.pos += 1; // Skip opening backtick
+        self.pos += 1;
         self.column += 1;
         const start = self.pos;
         while (self.pos < self.source.len and self.source[self.pos] != '`') {
@@ -560,7 +556,7 @@ pub const Lexer = struct {
             }
         }
         const lexeme = self.source[start..self.pos];
-        self.pos += 1; // Skip closing backtick
+        self.pos += 1;
         self.column += 1;
         return Token{ .type = .template_string, .lexeme = lexeme, .line = self.line, .column = self.column - lexeme.len - 2 };
     }
@@ -665,9 +661,7 @@ fn tokenTypeFromKeyword(lexeme: []const u8) TokenType {
     if (std.mem.eql(u8, lexeme, "try")) return .keyword_try;
     if (std.mem.eql(u8, lexeme, "catch")) return .keyword_catch;
     if (std.mem.eql(u8, lexeme, "throw")) return .keyword_throw;
-    // DECISION (roadmap A5): `switch` is Nova's real construct; `match` is
-    // RESERVED but intentionally unimplemented (never parsed) — kept so we can
-    // add pattern-matching later without breaking existing code that avoids it.
+
     if (std.mem.eql(u8, lexeme, "match")) return .keyword_match;
     if (std.mem.eql(u8, lexeme, "true")) return .bool_true;
     if (std.mem.eql(u8, lexeme, "false")) return .bool_false;
@@ -677,8 +671,6 @@ fn tokenTypeFromKeyword(lexeme: []const u8) TokenType {
     if (std.mem.eql(u8, lexeme, "pub")) return .keyword_pub;
     if (std.mem.eql(u8, lexeme, "var")) return .keyword_var;
     if (std.mem.eql(u8, lexeme, "union")) return .keyword_union;
-    // Logical operators are `&&` and `||` (lexed to .And/.Or). The `and`/`or`
-    // keyword forms were removed; those words are now ordinary identifiers.
 
     return .identifier;
 }

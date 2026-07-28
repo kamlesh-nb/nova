@@ -1,5 +1,3 @@
-// fs.nova — File system watcher module for Nova
-// Exposes cooperative Watcher API to monitor filesystem modifications.
 
 import bytes;
 import mem.allocator;
@@ -8,20 +6,16 @@ import io.file;
 import assert;
 
 pub struct Watcher {
-    pub handle: ptr,   // WatcherContext* pointer
+    pub handle: ptr,
 
-    /// Create a new Watcher monitoring the specified directory path.
     init(path: string) {
         self.handle = nova_fs_watcher_create(path);
     }
 
-    /// Wait cooperatively for the next file modification event.
-    /// Returns the full path of the modified/created/deleted file.
     pub fn nextEvent(self: Watcher): string {
         return nova_fs_watcher_next_event(self.handle);
     }
 
-    /// Close the watcher and free its descriptors/handles.
     pub fn close(self: Watcher): void {
         nova_fs_watcher_close(self.handle);
         self.handle = 0;
@@ -35,7 +29,7 @@ fn writeFsFile(path: string, content: string): void {
 @test
 fn test_fs_watcher(): void {
     let test_dir = "watch_test_dir";
-    dir.Dir.create(test_dir, 511); // 0o777 = 511 decimal
+    dir.Dir.create(test_dir, 511);
 
     let watcher = Watcher(test_dir);
 
@@ -43,15 +37,12 @@ fn test_fs_watcher(): void {
     let count = d.entries().len;
     d.close();
 
-    // Write the file the watcher should observe (was a fiber.spawn — which ran inline, so the write
-    // already happened before nextEvent(); the watcher queues the event either way).
     writeFsFile(`watch_test_dir/changed_${count}.txt`, "content");
 
     console.log("[test] Waiting for filesystem event...");
     let event = watcher.nextEvent();
     console.log("[test] Received filesystem event: " + event);
 
-    // Verify the event contains the expected filename
     let contains_changed = false;
     let i = 0;
     let name = "changed_";
@@ -72,6 +63,5 @@ fn test_fs_watcher(): void {
 
     assert.isTrue(contains_changed);
 
-    // Clean up
     watcher.close();
 }

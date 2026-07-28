@@ -1,4 +1,4 @@
-// redact.nova — Sensitive header values redaction for safe logging
+
 import string;
 import assert;
 

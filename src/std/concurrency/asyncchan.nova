@@ -1,14 +1,3 @@
-// asyncchan.nova — M3-D-6 coroutine-aware async channels (free-function API).
-//
-// A channel connects concurrent coroutines (launched with `go`). `recv` is
-// AWAITABLE: `await chanRecv(ch)` parks the calling coroutine until a value is sent
-// — no OS thread is held while waiting. `send` never blocks (unbounded) and wakes
-// one parked receiver. Values are int for now (generic element types are a follow-on).
-//
-//   let ch = chanNew();
-//   spawn producer(ch);               // producer calls chanSend(ch, v)
-//   let v = await chanRecv(ch);     // parks until produced
-//   chanFree(ch);
 
 pub fn chanNew(): long {
     return nova_chan_new(0);
@@ -18,8 +7,6 @@ pub fn chanSend(ch: long, val: int): void {
     nova_chan_send(ch, val);
 }
 
-// Awaitable receive. Called directly (not via `await`) this is just a stub returning
-// 0 — the compiler lowers `await chanRecv(ch)` to the real parking receive.
 pub fn chanRecv(ch: long): int {
     return 0;
 }

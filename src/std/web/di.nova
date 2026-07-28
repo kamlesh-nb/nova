@@ -1,32 +1,18 @@
-// di.nova — Standard Dependency Injection (DI) Container (ASP.NET-style)
+
 import map;
 
-/// The marker every DI-registrable service implements. The container stores services as `Service`
-/// trait OBJECTS — a fat pointer `{struct_ptr, vtable}` that is OWNED (ARC co-owns the wrapped
-/// struct; its destructor releases it). This is why the container correctly RETAINS a heap service
-/// parked in its singleton cache and frees it with the provider. A concrete service is widened to
-/// `Service` automatically when passed/returned where `Service` is expected; recover it with a
-/// downcast: `let db = svc as PgConnection;`.
 pub trait Service {
 }
 
-// Lifetime of a registration. SINGLETON: one instance for the whole provider. SCOPED: one instance
-// per request scope (see `ServiceScope`). TRANSIENT: a fresh instance on every resolve.
-// Codes are 1-based on purpose: a value of 0 stored in `Map<string, int>` reads back as `undefined`
-// (the value-type optional uses 0 as its absent sentinel), so 0 must never be a real code.
 pub const LIFETIME_SINGLETON: int = 1;
 pub const LIFETIME_SCOPED: int = 2;
 pub const LIFETIME_TRANSIENT: int = 3;
 
-/// What `resolve` returns: the service, or WHY it could not be produced. The `T | Error` shape
-/// (specs §3.4b) written out longhand — a variant with a payload so the reason survives back to the
-/// caller (a bare `throw`/`undefined` lost the key).
 pub enum Resolved {
     Ok(Service),
     NotRegistered(string),
 }
 
-/// A human-readable reason, for logs and 500 bodies.
 pub fn resolvedReason(r: Resolved): string {
     switch (r) {
         case Resolved.Ok(v): { return "ok"; }
@@ -35,15 +21,13 @@ pub fn resolvedReason(r: Resolved): string {
     return "unknown";
 }
 
-// The unreachable fallback for the `require` trap path (a trait return needs a concrete value even on
-// the dead branch, exactly as `Map.at` returns a dummy after `nova_panic`).
 struct NullService impl Service {
 }
 
 pub struct ServiceProvider {
     pub factories: Map<string, (ServiceProvider) -> Service>,
-    pub singletons: Map<string, Service>,   // the singleton cache (one instance per key)
-    pub lifetimes: Map<string, int>,        // key -> LIFETIME_*
+    pub singletons: Map<string, Service>,
+    pub lifetimes: Map<string, int>,
 
     init(factories: Map<string, (ServiceProvider) -> Service>, singletons: Map<string, Service>, lifetimes: Map<string, int>) {
         self.factories = factories;
@@ -51,10 +35,6 @@ pub struct ServiceProvider {
         self.lifetimes = lifetimes;
     }
 
-    /// Resolve a service, or say why not. ⚠️ Annotate the binding — `let r: Resolved = p.resolve(k);`
-    /// — before switching on it (an unannotated `let r = ...` does not infer to `Resolved`). SCOPED
-    /// services resolved through the root provider (no scope) behave as TRANSIENT — use a
-    /// `ServiceScope` (`createScope`) for real per-request lifetime.
     pub fn resolve(self: ServiceProvider, key: string): Resolved {
         let cached = self.singletons.get(key);
         if (cached != undefined) {
@@ -72,34 +52,24 @@ pub struct ServiceProvider {
         return Resolved.Ok(instance);
     }
 
-    /// Resolve a service the caller KNOWS is registered, returning it directly (no `Resolved` to
-    /// unwrap) — the ergonomic form for constructor injection: `GetUserHandler(sp.require("Db") as Db)`.
-    /// A missing registration is a configuration bug, so this TRAPS (loud located abort).
     pub fn require(self: ServiceProvider, key: string): Service {
         let r: Resolved = self.resolve(key);
         switch (r) {
             case Resolved.Ok(v): { return v; }
             case Resolved.NotRegistered(k): { nova_panic("DI: required service not registered"); }
         }
-        return NullService{}; // unreachable — nova_panic exits; satisfies the Service return type
+        return NullService{};
     }
 
-    /// Resolve by TYPE — the type-keyed form, keyed on `serde.typeName<T>()` (the same key
-    /// `addSingleton<T>`/`app.get<T>` use): `let db = sp.resolveType<Db>() as Db;`.
     pub fn resolveType<T>(self: ServiceProvider): Service {
         return self.require(serde.typeName<T>());
     }
 
-    /// Open a per-request scope. SCOPED services resolve to one instance per scope; singletons still
-    /// come from the root; transients are always fresh.
     pub fn createScope(self: ServiceProvider): ServiceScope {
         return ServiceScope(self);
     }
 }
 
-/// A per-request resolution scope. SCOPED services are built once per scope and cached here;
-/// singletons resolve from (and cache in) the root provider; transients are always fresh. Drop the
-/// scope at end of request to release its scoped instances.
 pub struct ServiceScope {
     pub root: ServiceProvider,
     pub scoped: Map<string, Service>,
@@ -157,8 +127,6 @@ pub struct ServiceCollection {
         self.lifetimes = Map<string, int>(32, string.hash);
     }
 
-    // ---- string-keyed registration (the low-level form) -------------------------------------------
-
     pub fn addSingleton(self: ServiceCollection, key: string, factory: (ServiceProvider) -> Service): void {
         self.factories.set(key, factory);
         self.lifetimes.set(key, LIFETIME_SINGLETON);
@@ -173,10 +141,6 @@ pub struct ServiceCollection {
         self.factories.set(key, factory);
         self.lifetimes.set(key, LIFETIME_TRANSIENT);
     }
-
-    // ---- type-keyed registration (the ergonomic form) ---------------------------------------------
-    // The key is derived from `serde.typeName<T>()` — the SAME key `sp.resolveType<T>()` and
-    // `app.get<T>` use — so registration and resolution always agree by type.
 
     pub fn addSingletonType<T>(self: ServiceCollection, factory: (ServiceProvider) -> Service): void {
         self.addSingleton(serde.typeName<T>(), factory);

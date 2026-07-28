@@ -1,4 +1,4 @@
-// mime.nova — HTTP MIME types representation using refined enums with methods
+
 import bytes;
 import string;
 
@@ -48,9 +48,6 @@ pub enum MimeType {
     }
 }
 
-// Content-Type string for a file extension (no dot), e.g. "html" -> "text/html".
-// A free function so callers in OTHER modules get the mime string without invoking an
-// enum method cross-module (the enum method call stays inside this module).
 pub fn contentType(ext: string): string {
     return MimeType.fromExtension(ext).toString();
 }

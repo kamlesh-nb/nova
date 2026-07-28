@@ -1,8 +1,3 @@
-// crypto/base64.nova — Base64 (RFC 4648), implemented in Nova over `bytes`.
-//
-// Standard alphabet (`+` `/`, `=` padding) and the URL-safe alphabet (`-` `_`,
-// no padding). Encoding/decoding is byte-exact — the input is treated as raw
-// bytes, so it round-trips arbitrary binary (NULs included), not just text.
 
 import bytes;
 import assert;
@@ -14,10 +9,9 @@ fn encodeWith(input: string, alphabet: string, pad: bool): string {
     let n = input.length;
     if (n == 0) { return ""; }
 
-    // 4 output chars per 3 input bytes; padded length is a multiple of 4.
     let groups = (n + 2) / 3;
-    let full = n / 3;              // whole 3-byte groups
-    let rem = n - full * 3;       // 0, 1, or 2 trailing bytes
+    let full = n / 3;
+    let rem = n - full * 3;
     let out_len = groups * 4;
     if (!pad && rem == 1) { out_len = full * 4 + 2; }
     if (!pad && rem == 2) { out_len = full * 4 + 3; }
@@ -41,7 +35,7 @@ fn encodeWith(input: string, alphabet: string, pad: bool): string {
         bytes.write_byte(out, o, bytes.read_byte(alphabet, b0 >> 2));
         bytes.write_byte(out, o + 1, bytes.read_byte(alphabet, (b0 & 3) << 4));
         if (pad) {
-            bytes.write_byte(out, o + 2, 61); // '='
+            bytes.write_byte(out, o + 2, 61);
             bytes.write_byte(out, o + 3, 61);
         }
     }
@@ -51,25 +45,23 @@ fn encodeWith(input: string, alphabet: string, pad: bool): string {
         bytes.write_byte(out, o, bytes.read_byte(alphabet, b0 >> 2));
         bytes.write_byte(out, o + 1, bytes.read_byte(alphabet, ((b0 & 3) << 4) | (b1 >> 4)));
         bytes.write_byte(out, o + 2, bytes.read_byte(alphabet, (b1 & 15) << 2));
-        if (pad) { bytes.write_byte(out, o + 3, 61); } // '='
+        if (pad) { bytes.write_byte(out, o + 3, 61); }
     }
     return out as string;
 }
 
-/// The 0..63 value of a Base64 char (both `+`/`/` and `-`/`_` accepted), or -1 for
-/// padding / whitespace / anything else — those are skipped by the decoder.
 fn charVal(c: int): int {
-    if (c >= 65 && c <= 90) { return c - 65; }        // 'A'..'Z' -> 0..25
-    if (c >= 97 && c <= 122) { return c - 97 + 26; }  // 'a'..'z' -> 26..51
-    if (c >= 48 && c <= 57) { return c - 48 + 52; }   // '0'..'9' -> 52..61
-    if (c == 43 || c == 45) { return 62; }            // '+' or '-'
-    if (c == 47 || c == 95) { return 63; }            // '/' or '_'
+    if (c >= 65 && c <= 90) { return c - 65; }
+    if (c >= 97 && c <= 122) { return c - 97 + 26; }
+    if (c >= 48 && c <= 57) { return c - 48 + 52; }
+    if (c == 43 || c == 45) { return 62; }
+    if (c == 47 || c == 95) { return 63; }
     return -1;
 }
 
 fn decodeAny(input: string): string {
     let n = input.length;
-    // Pass 1: count the valid (non-padding) symbols to size the output exactly.
+
     let m = 0;
     let i = 0;
     while (i < n) {
@@ -102,24 +94,21 @@ fn decodeAny(input: string): string {
     return out as string;
 }
 
-/// Standard Base64 with `=` padding.
 pub fn encode(input: string): string {
     return encodeWith(input, STD, true);
 }
 
-/// URL-safe Base64 (`-` `_`, no padding).
 pub fn encodeUrl(input: string): string {
     return encodeWith(input, URL, false);
 }
 
-/// Decode standard OR URL-safe Base64 (padding optional; unknown bytes skipped).
 pub fn decode(input: string): string {
     return decodeAny(input);
 }
 
 @test
 fn test_rfc4648_vectors(): void {
-    // RFC 4648 §10 — the canonical Base64 test vectors.
+
     assert.equalStr(encode(""), "");
     assert.equalStr(encode("f"), "Zg==");
     assert.equalStr(encode("fo"), "Zm8=");
@@ -139,8 +128,8 @@ fn test_roundtrip(): void {
 
 @test
 fn test_url_safe(): void {
-    // URL-safe alphabet + no padding; still round-trips.
+
     let e = encodeUrl("fooba");
-    assert.equalStr(e, "Zm9vYmE");     // no trailing '='
+    assert.equalStr(e, "Zm9vYmE");
     assert.equalStr(decode(e), "fooba");
 }

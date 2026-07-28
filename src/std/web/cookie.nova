@@ -1,4 +1,4 @@
-// cookie.nova — HTTP Cookie serialization and definition
+
 import collections.string_builder;
 import assert;
 
@@ -7,10 +7,10 @@ pub struct Cookie {
     pub value: string,
     pub path: string,
     pub domain: string,
-    pub maxAge: int, // -1 if not set
+    pub maxAge: int,
     pub secure: bool,
     pub httpOnly: bool,
-    pub sameSite: string, // "", "Strict", "Lax", "None"
+    pub sameSite: string,
 }
 
 pub fn serialize(cookie: Cookie): string {
@@ -18,7 +18,7 @@ pub fn serialize(cookie: Cookie): string {
     sb.append(cookie.name);
     sb.append("=");
     sb.append(cookie.value);
-    
+
     if (cookie.path != "") {
         sb.append("; Path=");
         sb.append(cookie.path);

@@ -1,49 +1,13 @@
-// recovery.nova — the pipeline behavior where panic recovery WILL live.
-//
-// ⚠️ THIS NO LONGER RECOVERS FROM ANYTHING — AND IT NEVER MEANINGFULLY DID.
-//
-// It used to be:
-//     try { return next(); }
-//     catch (err) { console.log("[RECOVERY] Caught exception: " + err); ...500... }
-//
-// `throw`/`try`/`catch` are GONE (specs §5.5, plan P2-12). Three reasons, all measured:
-//
-//  1. THE MESSAGE NEVER ARRIVED. `nova_throw` took a `long long`; the catch bound
-//     `zext(setjmp_res)` — an i32. `di.nova`'s `throw "DI Error: ..." + key` reached this
-//     handler as the integer `8472` — a string pointer truncated to 32 bits — and the line
-//     above then re-stringified it as a NUMBER. Verified output:
-//         [RECOVERY] Caught exception: 8472
-//     The `err` this behavior logged could never be anything but a meaningless integer.
-//
-//  2. IT WAS UNDEFINED BEHAVIOUR EXACTLY HERE. The implementation was setjmp/longjmp, and
-//     this behavior runs inside an async HTTP handler — i.e. inside a C++20 coroutine.
-//     `longjmp` out of a coroutine is UB. The one place this existed for is the one place
-//     it was least defined.
-//
-//  3. IT LEAKED EVERY FRAME IT UNWOUND. With no real unwinding, ARC released only the
-//     catching frame's try-block locals; every frame between the throw and here leaked
-//     everything it owned.
-//
-// So this is now an honest pass-through: it does not pretend to catch. A real recovery
-// barrier returns with the error model (`T | Error`, plan P2-13) — at which point `next()`
-// returns `Response | HttpError` and this behavior maps the error case to a 500 by
-// EXAMINING A VALUE: message intact, no unwinding, no UB under coroutines.
-//
-// Kept rather than deleted so registrations keep compiling, and so there is one obvious
-// place for the barrier to reappear.
+
 import web.request;
 import web.response;
 import web.status;
 import web.mediator;
 
 pub struct PanicRecoveryBehavior impl PipelineBehavior {
-    // Signature MUST match the trait `PipelineBehavior.handle(self, req: any, next: () => any): any`
-    // — the impl previously used concrete `request.Request`/`response.Response` types, a trait
-    // signature mismatch that never compiled (no test imported this module). The pass-through
-    // returns whatever `next()` yields.
+
     pub fn handle(self: PanicRecoveryBehavior, req: any, next: () => any): any {
-        // Pass-through until `T | Error` lands (plan P2-13). Do not add a `try` here —
-        // there is no `throw` to catch, by design.
+
         return next();
     }
 }

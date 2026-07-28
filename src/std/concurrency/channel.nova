@@ -1,4 +1,3 @@
-// channel.nova - Fiber-safe Channels for Nova
 
 import bytes;
 import mem.allocator;
@@ -22,8 +21,7 @@ pub struct Channel<T> {
     }
 
     pub fn delete(self: Channel<T>): void {
-        // Idempotent (see array/string_builder): the scope-exit destructor auto-invokes
-        // delete(), so destroying without nulling double-destroys the handle and crashes.
+
         if (self.handle != 0) {
             nova_channel_destroy(self.handle);
             self.handle = 0;
@@ -35,7 +33,7 @@ pub struct Channel<T> {
 fn test_channel(): void {
     let alloc = allocator.globalAllocator();
     let ch = Channel<string>(0, alloc);
-    // (was fiber.spawn — inline; the channel shim buffers the send for the recv below)
+
     ch.send("hello from channel");
     let val = ch.recv();
     console.log("DEBUG: val received = " + val);

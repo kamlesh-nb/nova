@@ -1,4 +1,4 @@
-// router.nova — Standard HTTP CtrlRouter
+
 import web.request;
 import web.response;
 import web.status;
@@ -31,7 +31,7 @@ pub struct CtrlRouter {
         let len = self.routes.size();
         let i = 0;
         while (i < len) {
-            let r = self.routes.at(i);          // .at is trapping (Route); .get returns an OPTIONAL,
+            let r = self.routes.at(i);
             if (string.eql(r.method, method) && string.eql(r.path, path)) {
                 return r;
             }

@@ -1,21 +1,9 @@
-// compress.cpp — W7 gzip compression over the already-linked zlib.
-//
-// zlib (`-lz`) is present in every Nova link (LLVM references it; we add `-lz` explicitly for programs
-// that don't pull LLVM). `<zlib.h>` ships in both SDKs. These are a THIN wrapper — no new dependency.
-//
-// ABI: input is a Nova string (binary-safe; length from the ARC header via nova_str_len). Output is a
-// length-prefixed binary buffer built with nova_from_bytes (gzip output contains NULs, so it is NOT a
-// NUL-terminated C string — same convention as nova_sha256_raw). Both directions use the gzip wrapper
-// (window bits 15+16). Returns an empty buffer on error, never a dangling/garbage pointer.
+
 #include "nova_abi.h"
 #include "runtime_str.h"
 #include <zlib.h>
 #include <cstdlib>
 #include <cstring>
-
-// `nova_str_len` (the Nova-string length from the ARC header) is defined inline in io.cpp, which is
-// included before this file in the unity build — no forward declaration (it is already in scope, and
-// declaring it here collides with the existing signature).
 
 extern "C" {
 
@@ -49,7 +37,7 @@ char *nova_gzip_decompress(const char *input) {
   if (ilen <= 0) return const_cast<char *>(nova_from_bytes("", 0));
   z_stream zs;
   std::memset(&zs, 0, sizeof(zs));
-  if (inflateInit2(&zs, 15 + 16) != Z_OK) // gzip
+  if (inflateInit2(&zs, 15 + 16) != Z_OK)
     return const_cast<char *>(nova_from_bytes("", 0));
   zs.next_in = (Bytef *)input;
   zs.avail_in = (uInt)ilen;
@@ -63,7 +51,7 @@ char *nova_gzip_decompress(const char *input) {
   size_t have = 0;
   int rc = Z_OK;
   while (true) {
-    if (have == cap) { // grow
+    if (have == cap) {
       size_t ncap = cap * 2;
       char *nout = (char *)std::realloc(out, ncap);
       if (!nout) { rc = Z_MEM_ERROR; break; }
@@ -75,7 +63,7 @@ char *nova_gzip_decompress(const char *input) {
     rc = inflate(&zs, Z_NO_FLUSH);
     have = cap - zs.avail_out;
     if (rc == Z_STREAM_END) break;
-    if (rc != Z_OK) break; // Z_BUF_ERROR with avail_in==0 also lands here → treated as error/empty
+    if (rc != Z_OK) break;
   }
   inflateEnd(&zs);
   const char *res = (rc == Z_STREAM_END) ? nova_from_bytes(out, (long long)have) : nova_from_bytes("", 0);
@@ -83,4 +71,4 @@ char *nova_gzip_decompress(const char *input) {
   return const_cast<char *>(res);
 }
 
-} // extern "C"
+}

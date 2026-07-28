@@ -1,4 +1,4 @@
-// map.nova — Generic hash map (open addressing, linear probing, dynamic resize)
+
 import bytes;
 import list;
 import string;
@@ -30,10 +30,7 @@ fn nextPowerOfTwo(n: int): int {
 pub struct Map<K, V> {
     pub cap: int,
     pub len: int,
-    // `Storage<K>`/`Storage<V>`, not raw ints: ARC releases a TYPED field, and the
-    // generated `__destruct_Storage_K` releases the slots. That is what lets the
-    // CALL-SITE retain (`retainIfGenericStore`) be deleted — Map was the last thing
-    // depending on it to take ownership of what it stores.
+
     pub keys: Storage<K>,
     pub vals: Storage<V>,
     pub tombstones: ptr,
@@ -91,10 +88,7 @@ pub struct Map<K, V> {
             }
             idx = (idx + 1) & (self.cap - 1);
             if (idx == startIdx) {
-                // Scanned the whole table without finding an empty slot or a
-                // matching key. Reuse a tombstone if we saw one; otherwise the
-                // table is saturated with live entries — grow and retry. This
-                // prevents the infinite loop under insert/delete churn.
+
                 if (firstTombstone != -1) {
                     self.keys.set(firstTombstone, key);
                     self.vals.set(firstTombstone, value);
@@ -136,9 +130,6 @@ pub struct Map<K, V> {
         }
     }
 
-    /// Keyed access that returns `V` directly (not `V | undefined`). Use when the key is
-    /// known present — `get` requires `?.`/`??` on every access. A missing key is a LOUD
-    /// located abort, never a silent read. For a maybe-absent key, use `get`.
     pub fn at(self: Map<K, V>, key: K): V {
         if (self.len != 0) {
             let hash = (self.hashFn)(key);
@@ -162,7 +153,7 @@ pub struct Map<K, V> {
             }
         }
         nova_panic("Map.at: key not found");
-        return self.vals.get(0); // unreachable — nova_panic exits; satisfies the V return type
+        return self.vals.get(0);
     }
 
     pub fn delete_key(self: Map<K, V>, key: K): bool {
@@ -273,10 +264,6 @@ pub struct Map<K, V> {
             i = i + 1;
         }
 
-        // The old Storages are NOT freed by hand: `oldKeys`/`oldVals` are locals of
-        // an owned type, so ARC releases them at scope exit — and their slots with
-        // them. `tombstones` is a raw BYTE array (flags, not elements), so `bytes`
-        // remains the right primitive for it and it is still freed explicitly.
         if (oldTombstones != 0) bytes.free(oldTombstones);
 
         self.cap = newCap;
@@ -285,10 +272,6 @@ pub struct Map<K, V> {
         self.tombstones = newTombstones;
     }
 
-    // `delete()` is GONE for keys/vals: they are `Storage<K>`/`Storage<V>` typed
-    // fields, so ARC releases them and their slots. `tombstones` is a raw byte array
-    // and has no owner, which is the one thing left for a hook — kept private and
-    // called only by ARC, never by hand.
     fn delete(self: Map<K, V>): void {
         if (self.tombstones != 0) {
             bytes.free(self.tombstones);

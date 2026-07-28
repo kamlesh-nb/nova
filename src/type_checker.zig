@@ -2,9 +2,6 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const builtins = @import("sema/builtins.zig");
 
-/// A7 / F3 §5 stage 4b (ptr migration): map a builtin's `Ret` to a checker TypeRef.
-/// `bytes.alloc` → `ptr` is the load-bearing one — it makes every field/return/let that
-/// stores a raw address a TYPE ERROR until it is honestly typed `ptr` (F3 §3.2).
 fn builtinRetType(r: builtins.Ret) ?ast.TypeRef {
     return switch (r) {
         .void_ => ast.TypeRef{ .ident = "void" },
@@ -17,9 +14,6 @@ fn builtinRetType(r: builtins.Ret) ?ast.TypeRef {
     };
 }
 
-/// A7 / F3 §5 stage 4b: `from` is a `ptr` (word-width address) and `to` is a ≤32-bit
-/// integer — storing it there truncates the address once `int` narrows to 32 bits.
-/// This is the one direction the ptr migration must forbid.
 fn isPtrTruncation(from: ast.TypeRef, to: ast.TypeRef) bool {
     if (from != .ident or to != .ident) return false;
     if (!std.mem.eql(u8, canonicalizeTypeName(from.ident), "ptr")) return false;
@@ -27,12 +21,10 @@ fn isPtrTruncation(from: ast.TypeRef, to: ast.TypeRef) bool {
     return std.mem.eql(u8, ct, "i8") or std.mem.eql(u8, ct, "i16") or std.mem.eql(u8, ct, "i32");
 }
 
-/// A7 / F3 §5 stage 5: the inclusive value range of a fixed-width integer type, or null
-/// for non-integers and for 64-bit types (an i64 literal always fits its own width).
 const IntRange = struct { min: i128, max: i128 };
 fn intTypeRange(name: []const u8) ?IntRange {
     const c = canonicalizeTypeName(name);
-    // Unsigned: anything starting `u` (uint/ushort/ubyte/u8…) plus `byte` (= u8).
+
     const signed = !(std.mem.startsWith(u8, name, "u") or std.mem.eql(u8, name, "byte"));
     const w: u32 = if (std.mem.eql(u8, c, "i8")) 8 else if (std.mem.eql(u8, c, "i16")) 16 else if (std.mem.eql(u8, c, "i32")) 32 else return null;
     if (signed) {
@@ -42,9 +34,6 @@ fn intTypeRange(name: []const u8) ?IntRange {
     return .{ .min = 0, .max = (@as(i128, 1) << @intCast(w)) - 1 };
 }
 
-/// A7 / F3 §5 stage 5: the bit-width of a fixed-width integer type name, or null for
-/// non-fixed-int types (structs, string, ptr, float, generics). `ptr` is deliberately
-/// excluded — ptr→int is the separate `isPtrTruncation` rule.
 fn intWidthOf(name: []const u8) ?u32 {
     const c = canonicalizeTypeName(name);
     if (std.mem.eql(u8, c, "i8")) return 8;
@@ -54,9 +43,6 @@ fn intWidthOf(name: []const u8) ?u32 {
     return null;
 }
 
-/// A widening integer conversion loses no value; a NARROWING one (wider → narrower) can,
-/// so §6 requires an explicit `as`. True only when both are fixed-width ints and
-/// `from` is strictly wider than `to`.
 fn isNarrowingInt(from: ast.TypeRef, to: ast.TypeRef) bool {
     if (from != .ident or to != .ident) return false;
     const fw = intWidthOf(from.ident) orelse return false;
@@ -64,16 +50,10 @@ fn isNarrowingInt(from: ast.TypeRef, to: ast.TypeRef) bool {
     return fw > tw;
 }
 
-/// Signedness of an integer type NAME (pre-canonical, so `int`≠`uint` is visible):
-/// unsigned iff it starts with `u` (uint/ushort/u8…) or is `byte` (= u8).
 fn intNameSigned(name: []const u8) bool {
     return !(std.mem.startsWith(u8, name, "u") or std.mem.eql(u8, name, "byte"));
 }
 
-/// A7 / F3 §5 stage 5 (§6): a SAME-WIDTH signedness change (`int`↔`uint`, `long`↔`ulong`,
-/// …) reinterprets the bits — the same 32 bits mean a different value — so it needs an
-/// explicit `as`. Different widths are handled by widening/narrowing rules, not here.
-/// `canonicalizeTypeName` collapses int/uint to `i32`, so this reads the raw names.
 fn isSignednessMismatch(from: ast.TypeRef, to: ast.TypeRef) bool {
     if (from != .ident or to != .ident) return false;
     const fw = intWidthOf(from.ident) orelse return false;
@@ -82,9 +62,6 @@ fn isSignednessMismatch(from: ast.TypeRef, to: ast.TypeRef) bool {
     return intNameSigned(from.ident) != intNameSigned(to.ident);
 }
 
-/// The compile-time value of an integer literal, accounting for a leading unary `-`
-/// (`-2147483648` parses as `neg(2147483648)`, and 2147483648 alone overflows i32 but
-/// the negation is i32-min). Returns null when the expression is not an integer literal.
 fn intLiteralValue(expr: ast.Expression) ?i128 {
     switch (expr.kind) {
         .literal => |lit| return switch (lit) {
@@ -111,30 +88,18 @@ pub const TypeChecker = struct {
     unions: std.StringHashMap(ast.UnionDecl),
     traits: std.StringHashMap(ast.TraitDecl),
     functions: std.StringHashMap(ast.FunctionDecl),
-    // Function names that appear more than once across the merged program (e.g.
-    // same bare name in two modules). Arg-count checking skips these because we
-    // can't tell which overload a bare-name call resolves to without namespacing.
+
     ambiguous_fns: std.StringHashMap(void),
-    // F1-3b N2: the set of "<file>\x00<fn-name>" pairs — which FILE defines which function. A bare
-    // call to an ambiguous name is UNAMBIGUOUS when the calling file itself defines that name (the
-    // scan resolved it via current_module_prefix before ever reaching the ambiguity check —
-    // `contains` inside string.nova is string's own). So N2 fires only when the caller's file does
-    // NOT define the name. Keys owned by allocator.
+
     fn_def_sites: std.StringHashMap(void),
     fn_first_line: std.StringHashMap(usize) = undefined,
     current_struct: ?[]const u8,
     current_ret_type: ?ast.TypeRef = null,
-    // M3-B: function coloring — true while checking the body of an `async fn`.
-    // `await` is only legal when this is set.
+
     in_async: bool = false,
-    // True while checking the DIRECT operand of `await`/`spawn`. A call reached with this set is
-    // "consumed" (awaited or spawned), so it is NOT flagged as a bare async call. The `.call`/
-    // `.generic_call` arms read-and-clear it (args/callee are not themselves awaited).
+
     in_awaited: bool = false,
-    // T2 target-capability gate. When compiling to wasm, native-only features (async/await/spawn —
-    // there is no coroutine runtime, and sockets/threads/TLS live in the native runtime) are rejected
-    // with a clean, located error instead of crashing deep in codegen. Guard native code with
-    // `@native { ... }` (and provide a wasm path with `@wasm { ... }`).
+
     is_wasm: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, file_sources: *std.StringHashMap([]const u8)) TypeChecker {
@@ -155,7 +120,6 @@ pub const TypeChecker = struct {
         };
     }
 
-    /// F1-3b N2: does `file` define a function named `name`? (locality — see `fn_def_sites`.)
     fn fileDefinesFn(self: *TypeChecker, file: []const u8, name: []const u8) bool {
         const key = std.fmt.allocPrint(self.allocator, "{s}\x00{s}", .{ file, name }) catch return false;
         defer self.allocator.free(key);
@@ -231,10 +195,7 @@ pub const TypeChecker = struct {
                 try self.enums.put(decl.enum_decl.name, decl.enum_decl);
             }
             if (decl == .struct_decl) {
-                // F1 module-scoped types: same-named structs in different modules COEXIST — each
-                // resolves to its own via findTypeInModule (sema, resolves a bare name to the LOCAL
-                // definition first) + scopedStructName (codegen keys colliding structs by module). The
-                // former "defined in two modules" hard error is retired; no collision diagnostic needed.
+
                 try self.structs.put(decl.struct_decl.name, decl.struct_decl);
             }
             if (decl == .union_decl) {
@@ -248,20 +209,7 @@ pub const TypeChecker = struct {
                     try self.ambiguous_fns.put(decl.fn_decl.name, {});
                 }
                 try self.functions.put(decl.fn_decl.name, decl.fn_decl);
-                // F1-3b N2: record that this file defines this fn name (locality).
-                // F4/F1-6: Nova has NO function overloading (specs.md §"No ... overloading"), so two
-                // functions with the SAME name in the SAME module (file) are a REDEFINITION, not an
-                // overload set — and codegen would silently dedup them by name (declarations.zig),
-                // dropping one, so calls resolve to the survivor and produce garbage. Reject it here as
-                // a located error. Keyed on (file, name) so same-named functions in DIFFERENT modules
-                // still coexist (module-prefixed symbols never collide). A recurrence at the SAME line
-                // is a benign double-inclusion of one decl (proven: 0 different-line recurrences across
-                // the corpus), so only a DIFFERENT line is a genuine second definition.
-                // GENERATED code is exempt: the compiler emits `<Struct>__bind`/`__toJson` into the single
-                // `<serde-generated>` pseudo-file, so two same-named `@serializable` structs in DIFFERENT
-                // user modules produce two identical-named binders there — a benign collision (the binder
-                // is a pure function of the struct's fields), NOT a user redefinition. Only real source
-                // files are checked. (helpers/test_harness are likewise synthetic.)
+
                 const gen_file = std.mem.eql(u8, decl.fn_decl.span.file, "<serde-generated>") or
                     std.mem.eql(u8, decl.fn_decl.span.file, "helpers.nova") or
                     std.mem.eql(u8, decl.fn_decl.span.file, "test_harness.nova");
@@ -313,11 +261,10 @@ pub const TypeChecker = struct {
     }
 
     fn checkBoolCondition(self: *TypeChecker, cond: ast.Expression, span: ast.Span) void {
-        const t = self.resolveExprType(cond) orelse return; // unknown → skip
+        const t = self.resolveExprType(cond) orelse return;
         if (t != .ident) return;
         const n = t.ident;
-        // Flag only clearly-non-bool primitives; skip bool/any/unknown/other to
-        // avoid false positives while the resolver is still coarse.
+
         if (std.mem.eql(u8, n, "string") or std.mem.eql(u8, n, "i32") or
             std.mem.eql(u8, n, "f64") or std.mem.eql(u8, n, "i64"))
         {
@@ -356,9 +303,6 @@ pub const TypeChecker = struct {
         };
     }
 
-    /// A7 / F3 §3.2a: `decimal` is now IMPLEMENTED (IEEE 754-2008 decimal128, BID — specs §3.1), a
-    /// 16-byte ARC heap object, so it is accepted like any other type. Still rejects `i128`/`u128`,
-    /// removed by F3 (zero users). Recurses so `i128[]` / `List<u128>` are caught too.
     fn rejectUnimplementedType(self: *TypeChecker, t: ast.TypeRef, span: ast.Span) void {
         switch (t) {
             .ident => |n| {
@@ -384,39 +328,23 @@ pub const TypeChecker = struct {
     fn checkReturnType(self: *TypeChecker, value: ast.Expression, span: ast.Span) void {
         const rt = self.current_ret_type orelse return;
         if (rt == .ident and (std.mem.eql(u8, rt.ident, "void") or std.mem.eql(u8, rt.ident, "any"))) return;
-        // Skip when the declared return is a generic type parameter (single upper) —
-        // including `T | undefined` — since values flow through the uniform i32
-        // representation there (e.g. `get<T>(): T | undefined { return bytes.read_i32(..) }`
-        // legitimately returns the i32 word as the erased element). Unwrap optionals so
-        // the skip still applies; otherwise A7's `bytes.*` typing turns this into a false
-        // ptr-migration positive.
+
         const rt_core = if (rt == .optional) rt.optional.* else rt;
         if (rt_core == .ident and rt_core.ident.len == 1) return;
-        // A polymorphic integer literal (`return 4000000000` from a `uint` fn) adapts to
-        // the return type — exempt from narrowing/signedness, same as a `let` initializer.
-        //
-        // ⚠️ But ONLY when the declared return is actually numeric. A literal adapts to a
-        // numeric WIDTH; it does not adapt to `string`. Exempting every int literal
-        // unconditionally silently disabled this whole check for literal returns, so
-        // `fn f(): string { return 42; }` compiled and segfaulted — which is precisely
-        // expect_fail/return_type_mismatch, the case this function exists for. The harness
-        // could not see it because a segfault also exits non-zero. (Fixed 2026-07-17.)
+
         if (intLiteralValue(value) != null) {
-            if (rt_core != .ident) return; // non-ident return shape → unknown, stay quiet
-            if (isNumericTypeName(rt_core.ident)) return; // numeric absorbs the literal
-            // else: fall through — an int literal returned from a non-numeric fn is a real error
+            if (rt_core != .ident) return;
+            if (isNumericTypeName(rt_core.ident)) return;
+
         }
-        const vt = self.resolveExprType(value) orelse return; // unknown → skip
-        // Only flag when we resolved a concrete named type. Non-ident results (e.g.
-        // a nested field access through an imported struct the resolver couldn't fully
-        // type) are treated as unknown to avoid false positives in Nova's loose system.
+        const vt = self.resolveExprType(value) orelse return;
+
         if (vt != .ident) return;
         if (!self.assignable(vt, rt)) {
             self.addError(span, "return type mismatch: returning '{s}' from a function declared to return '{s}'", .{ typeRefName(vt), typeRefName(rt) });
         }
     }
 
-    // True when a concrete struct implements the named trait (checks its `impls`).
     fn structImplementsTrait(self: *TypeChecker, struct_name: []const u8, trait_name: []const u8) bool {
         const base = canonicalizeTypeName(struct_name);
         const s = self.structs.get(base) orelse return false;
@@ -426,23 +354,15 @@ pub const TypeChecker = struct {
         return false;
     }
 
-    // Assignability: structural compatibility, plus a concrete struct is assignable to
-    // a trait type it implements (trait-object coercion happens in codegen).
     fn assignable(self: *TypeChecker, from: ast.TypeRef, to: ast.TypeRef) bool {
-        // A7 / F3 §5 stage 5: a narrowing conversion or a same-width signedness change
-        // needs an explicit `as` (§6). Both checked BEFORE isTypeCompatible, whose
-        // numeric↔numeric permissiveness (and int/uint→i32 canonicalisation) would
-        // otherwise wave `long`→`int` and `int`↔`uint` through.
+
         if (isNarrowingInt(from, to)) return false;
         if (isSignednessMismatch(from, to)) return false;
         if (isTypeCompatible(from, to)) return true;
         if (to == .ident and from == .ident and self.traits.contains(to.ident)) {
             if (self.structImplementsTrait(from.ident, to.ident)) return true;
         }
-        // Generic trait object: a struct implementing `Trait<A>` is assignable to `Trait<A>`
-        // (e.g. `let b: Box<int> = intBox`). The declared type is `.generic { name, params }`; the
-        // struct's `impl` records the trait by its BASE name, so match on that (trait-object
-        // coercion + the per-instantiation vtable happen in codegen).
+
         if (to == .generic and self.traits.contains(to.generic.name)) {
             const from_name: ?[]const u8 = switch (from) {
                 .ident => |n| n,
@@ -453,14 +373,7 @@ pub const TypeChecker = struct {
                 if (self.structImplementsTrait(fnm, to.generic.name)) return true;
             }
         }
-        // A7 / F3 §5 stage 4b (ptr migration). `ptr` is word-width; `int`/`i32` narrows
-        // to 32 bits at stage 5. The ONLY unsafe flow is a `ptr` (a real address) landing
-        // in a ≤32-bit integer — that truncates. Everything width-safe is allowed here so
-        // the flush targets exactly the truncating sites:
-        //   • int/long/any-numeric → ptr  (a size, offset, or the literal 0/null becoming
-        //     an address; widening, never lossy)
-        //   • ptr → long (i64)            (width-safe; some runtime handles are `long`)
-        // `ptr → i8/i16/i32` is deliberately NOT allowed and falls through to `false`.
+
         if (from == .ident and to == .ident) {
             const cf = canonicalizeTypeName(from.ident);
             const ct = canonicalizeTypeName(to.ident);
@@ -486,10 +399,7 @@ pub const TypeChecker = struct {
                     self.rejectUnimplementedType(t, ls.span);
                     try self.variables.put(ls.name, t);
                     if (ls.init) |init_expr| {
-                        // A7 / F3 §5 stage 5: a literal that does not fit the declared
-                        // fixed-width integer type is a hard error, not a silent 32-bit
-                        // wrap (§6: narrowing needs an explicit cast). `let n: int =
-                        // 5000000000` must say "use `long`", not quietly become 705032704.
+
                         if (t == .ident) {
                             if (intTypeRange(t.ident)) |range| {
                                 if (intLiteralValue(init_expr)) |v| {
@@ -499,15 +409,10 @@ pub const TypeChecker = struct {
                                 }
                             }
                         }
-                        // An integer literal is polymorphic — it has no inherent width or
-                        // signedness and adapts to the target (its fit is gated by the
-                        // range check above), so it is exempt from the narrowing/signedness
-                        // rules. `let u: uint = 4000000000` and `let b: byte = 5` are fine.
+
                         const init_is_int_literal = intLiteralValue(init_expr) != null;
                         if (self.resolveExprType(init_expr)) |init_t| {
-                            // Only flag clean ident-to-type mismatches; skip when the
-                            // initializer's type couldn't be cleanly resolved (non-ident),
-                            // to avoid false positives on nested/imported field access.
+
                             if (init_t == .ident and !init_is_int_literal and !self.assignable(init_t, t)) {
                                 if (isNarrowingInt(init_t, t)) {
                                     self.addError(ls.span, "narrowing conversion: '{s}' cannot be implicitly stored into '{s}' — use an explicit cast (F3 §6)", .{ typeRefName(init_t), typeRefName(t) });
@@ -558,11 +463,6 @@ pub const TypeChecker = struct {
         }
     }
 
-    // Param count of a struct's `init` constructor, or null if the struct has no
-    // explicit init (field construction / default). Used to reject constructor calls
-    // with the wrong argument count before they reach codegen (which would otherwise
-    // emit an ill-formed call, e.g. `Map<i32,i32>()` → `Map_init` with just self →
-    // LLVM verification failure).
     fn structInitParamCount(self: *TypeChecker, struct_name: []const u8) ?usize {
         const s = self.structs.get(struct_name) orelse return null;
         for (s.methods) |m| {
@@ -573,8 +473,6 @@ pub const TypeChecker = struct {
         return null;
     }
 
-    // A2/A3: recursively walk an expression, validating what we can. Currently
-    // enforces generic instantiation arity; extend with more checks over time.
     fn checkExpr(self: *TypeChecker, expr: ast.Expression) anyerror!void {
         switch (expr.kind) {
             .generic_call => |gc| {
@@ -591,15 +489,13 @@ pub const TypeChecker = struct {
                     } else if (self.functions.get(name)) |f| {
                         expected = f.type_params.len;
                     }
-                    // Only enforce when the callee is a known decl; skip unknowns
-                    // (builtins/intrinsics) to avoid false positives. Enforces both
-                    // too-few/too-many type args AND type args on a non-generic type.
+
                     if (expected) |exp| {
                         if (gc.type_args.len != exp) {
                             self.addError(gc.span, "generic '{s}' expects {d} type argument(s), got {d}", .{ name, exp, gc.type_args.len });
                         }
                     }
-                    // Constructor value-arg count, e.g. `Map<K,V>(cap, hashFn)`.
+
                     if (self.structs.contains(name)) {
                         if (self.structInitParamCount(name)) |init_params| {
                             if (gc.args.len != init_params) {
@@ -612,26 +508,17 @@ pub const TypeChecker = struct {
                 for (gc.args) |a| try self.checkExpr(a);
             },
             .call => |c| {
-                // Function coloring (call side): a call reached as the direct operand of
-                // `await`/`spawn` is consumed. Read-and-clear so the callee/args below are
-                // checked as ordinary (non-awaited) positions.
+
                 const awaited_here = self.in_awaited;
                 self.in_awaited = false;
-                // Inside an `async fn`, an async call MUST be `await`ed (or `spawn`ed). A bare call
-                // block-drives (nova_run_root) from within the event loop → nested drive → deadlock
-                // (the runtime now aborts loudly on it). Reject it at compile time instead. Note this
-                // fires ONLY in async context: a sync `main`/`@test`/top-level driving an async fn is
-                // the supported seam and stays legal.
+
                 if (self.in_async and !awaited_here and self.callTargetsAsync(c.callee.*)) {
                     self.addError(c.span, "async call must be 'await'ed (or 'spawn'ed) inside an 'async fn' — a bare call block-drives the coroutine and would deadlock the event loop", .{});
                 }
-                // Arg-count check for a plain top-level function call, but only
-                // when unambiguous (no cross-module name collision) and not a
-                // locally-shadowed name (a closure-valued variable). Conservative
-                // → no false positives.
+
                 if (c.callee.kind == .ident) {
                     const name = c.callee.kind.ident;
-                    // Non-generic constructor call, e.g. `Point(x, y)`.
+
                     if (!self.variables.contains(name) and self.structs.contains(name)) {
                         if (self.structInitParamCount(name)) |init_params| {
                             if (c.args.len != init_params) {
@@ -646,16 +533,7 @@ pub const TypeChecker = struct {
                             }
                         }
                     }
-                    // F1-3b / F1 §2.3 N2: a BARE call to a name that two or more functions share
-                    // (`contains` = string.contains AND assert.contains) is AMBIGUOUS — a compile
-                    // error, never an arbitrary pick. This detection used to live in codegen's
-                    // func_map suffix SCAN, the last thing keeping that 227-line fallback alive; the
-                    // checker already knows the name is ambiguous (`ambiguous_fns`, populated on a
-                    // bare-name collision at registration), so erroring HERE — with a source span,
-                    // upgrading the old span-less codegen abort (F1 stage 7) — lets the scan be
-                    // deleted. Not a variable (a closure value shadows), not a struct (constructor),
-                    // and only for a plain-ident callee (a qualified `string.contains(...)` is a
-                    // field_access and unambiguous).
+
                     if (self.ambiguous_fns.contains(name) and !self.variables.contains(name) and !self.structs.contains(name) and !self.fileDefinesFn(c.span.file, name)) {
                         self.addError(c.span, "call to '{s}' is ambiguous — more than one function is named '{s}' across the imported modules. Qualify it (e.g. `module.{s}(...)`).", .{ name, name, name });
                     }
@@ -666,12 +544,7 @@ pub const TypeChecker = struct {
             .binary => |b| {
                 try self.checkExpr(b.left.*);
                 try self.checkExpr(b.right.*);
-                // A7 / F3 §5 stage 4b: catch a `ptr` (raw address) stored into a ≤32-bit
-                // integer target — `self.data = bytes.alloc(...)` where `data: int`. This
-                // is the assignment counterpart of the let/return checks; without it, field
-                // stores would silently truncate at stage 5. Deliberately NARROW: it fires
-                // ONLY on the ptr→narrow-int direction, so it does not tighten Nova's
-                // otherwise-loose assignment checking.
+
                 if (b.op == .assign and intLiteralValue(b.right.*) == null) {
                     if (self.resolveExprType(b.right.*)) |rt| {
                         if (self.resolveExprType(b.left.*)) |lt| {
@@ -694,11 +567,7 @@ pub const TypeChecker = struct {
             },
             .struct_init => |si| {
                 for (si.fields) |field| try self.checkExpr(field.value);
-                // C3: a struct literal must initialize EVERY declared field — fields have no defaults,
-                // so an omitted field is left null/zero. For a trait- or owned-typed field that null then
-                // SEGVs on first use (`Holder{}` where `g: G` → `h.g.v()` derefs a null vtable). Only
-                // plain structs are checked (an enum-variant payload `E.V{...}` names a variant, and a
-                // generic instantiation whose name carries type args resolves to null here — both skip).
+
                 if (self.structs.get(si.type_name)) |s| {
                     for (s.fields) |df| {
                         var found = false;
@@ -734,12 +603,12 @@ pub const TypeChecker = struct {
                 if (self.is_wasm) {
                     self.addError(aw.span, "'await' is not available on the wasm target — async/await has no coroutine runtime in wasm. Guard native code with `@native {{ ... }}` and provide a wasm path with `@wasm {{ ... }}`.", .{});
                 }
-                // Function coloring: `await` is only legal inside an `async fn`.
+
                 if (!self.in_async) {
                     self.addError(aw.span, "'await' is only allowed inside an 'async fn'", .{});
                 }
                 const saved = self.in_awaited;
-                self.in_awaited = true; // the operand call is consumed by this await
+                self.in_awaited = true;
                 try self.checkExpr(aw.operand.*);
                 self.in_awaited = saved;
             },
@@ -747,12 +616,12 @@ pub const TypeChecker = struct {
                 if (self.is_wasm) {
                     self.addError(g.span, "'spawn'/'go' is not available on the wasm target — there is no coroutine runtime in wasm. Guard native code with `@native {{ ... }}`.", .{});
                 }
-                // `go`/`spawn <async-call>` launches a concurrent task; only legal in async.
+
                 if (!self.in_async) {
                     self.addError(g.span, "'go' is only allowed inside an 'async fn'", .{});
                 }
                 const saved = self.in_awaited;
-                self.in_awaited = true; // the operand call is consumed by this spawn
+                self.in_awaited = true;
                 try self.checkExpr(g.operand.*);
                 self.in_awaited = saved;
             },
@@ -845,11 +714,6 @@ pub const TypeChecker = struct {
         }
     }
 
-    // Substitute a generic function's type PARAMETERS with the call's type ARGUMENTS throughout a
-    // type — RECURSIVELY, so `foo<int>()` declared `fn foo<T>(): T` resolves to `int`, `List<T>` to
-    // `List<int>`, `T | undefined` to `int | undefined`, etc. (substTraitType only handled a bare
-    // top-level `T`.) Nested forms allocate fresh TypeRefs; an OOM falls back to the unsubstituted
-    // type (the prior behaviour), never a crash.
     fn substReturnType(self: *TypeChecker, tr: ast.TypeRef, tparams: []const []const u8, targs: []const ast.TypeRef) ast.TypeRef {
         switch (tr) {
             .ident => |name| {
@@ -895,13 +759,6 @@ pub const TypeChecker = struct {
         }
     }
 
-    /// A method that IMPLEMENTS a trait method is part of that trait's PUBLIC contract, so it is
-    /// callable wherever the trait is — even if the `impl` block did not repeat `pub` (the trait
-    /// method's visibility governs, and trait methods are the public API). Without this, calling
-    /// `h.handle(req)` on a `struct H impl RequestHandler { fn handle(...) ... }` was rejected as
-    /// "private" whenever `h`'s type resolved to the struct — which happens for CALL-form
-    /// construction (`H()`) bound to a `let`, while BRACE-form (`H{}`) skipped the check and hid
-    /// the inconsistency (see conformance/cases/56, which uses the brace form).
     fn methodIsTraitContract(self: *TypeChecker, s: ast.StructDecl, method_name: []const u8) bool {
         for (s.impls) |impl| {
             const td = self.traits.get(impl.name) orelse continue;
@@ -912,26 +769,23 @@ pub const TypeChecker = struct {
         return false;
     }
 
-    // True if `callee` names an `async fn` (free function or method). Used to reject a bare
-    // (non-await/spawn) async call inside an `async fn`. Conservative: an unresolved callee
-    // (module-qualified free fn, closure value, builtin) returns false → no false positive.
     fn callTargetsAsync(self: *TypeChecker, callee: ast.Expression) bool {
         switch (callee.kind) {
             .ident => |name| {
-                // A locally-shadowed name is a closure value, not the free fn.
+
                 if (self.variables.contains(name)) return false;
                 if (self.functions.get(name)) |f| return f.is_async;
                 return false;
             },
             .field_access => |fa| {
-                // Builtin receivers (`bytes`, `console`, ...) are never async.
+
                 if (fa.object.kind == .ident) {
                     if (builtins.find(fa.object.kind.ident, fa.field) != null) return false;
                 }
                 const obj_type = self.resolveExprType(fa.object.*) orelse return false;
                 const tname: []const u8 = switch (obj_type) {
                     .ident => |n| n,
-                    .generic => |g| g.name, // trait object / generic instance: match on the base name
+                    .generic => |g| g.name,
                     else => return false,
                 };
                 if (self.structs.get(tname)) |s| {
@@ -962,21 +816,18 @@ pub const TypeChecker = struct {
                 return c.target_type;
             },
             .await_expr => |aw| {
-                // Until Future<T> wrapping lands (workstream C), an async fn's
-                // declared return type flows through directly, so `await e` has the
-                // same type as `e`. Keeps await transparent to the type system.
+
                 return self.resolveExprType(aw.operand.*);
             },
             .go_expr => |g| {
-                // `go asyncCall()` yields a Future carrying the call's result type;
-                // represented transparently as that type so `await <future>` types.
+
                 return self.resolveExprType(g.operand.*);
             },
             .binary => |bin| {
                 if (bin.op == .assign) {
                     return self.resolveExprType(bin.left.*);
                 }
-                // `+` with a string operand is string concatenation → string.
+
                 if (bin.op == .add) {
                     var is_str = false;
                     if (self.resolveExprType(bin.left.*)) |lt| {
@@ -987,9 +838,7 @@ pub const TypeChecker = struct {
                     }
                     if (is_str) return ast.TypeRef{ .ident = "string" };
                 }
-                // decimal128 arithmetic (specs §3.1 Stage 2): `decimal <op> decimal` stays `decimal`
-                // for `+ - * / %`; comparisons fall through to the bool arm below. Without this the
-                // result resolved to `i32`, so `let x: decimal = a + b` looked like a type mismatch.
+
                 switch (bin.op) {
                     .add, .sub, .mul, .div, .mod => {
                         const ld = self.resolveExprType(bin.left.*);
@@ -1000,10 +849,7 @@ pub const TypeChecker = struct {
                     },
                     else => {},
                 }
-                // A7 / F3 §5 stage 4b: pointer arithmetic stays a pointer. `buf + offset`
-                // (address + index) is an address, not a narrowing int — typing it `ptr`
-                // keeps a `let p = self.buf + i` honest so it does not become a truncation
-                // site. Only for +/- (scaling a pointer); `ptr * n` etc. is nonsensical.
+
                 if (bin.op == .add or bin.op == .sub) {
                     const lp = self.resolveExprType(bin.left.*);
                     const rp = self.resolveExprType(bin.right.*);
@@ -1014,8 +860,7 @@ pub const TypeChecker = struct {
                 if (bin.op == .add) {
                     return ast.TypeRef{ .ident = "i32" };
                 }
-                // Comparison and LOGICAL operators (&&, ||) produce bool; bitwise
-                // (&, |, via .bit_and/.bit_or), shifts and arithmetic stay numeric.
+
                 return switch (bin.op) {
                     .eq, .ne, .lt, .gt, .le, .ge, .And, .Or => ast.TypeRef{ .ident = "bool" },
                     else => ast.TypeRef{ .ident = "i32" },
@@ -1025,9 +870,7 @@ pub const TypeChecker = struct {
                 return switch (lit) {
                     .integer => ast.TypeRef{ .ident = "i32" },
                     .float => ast.TypeRef{ .ident = "f64" },
-                    // specs §3.1: a `9.99m` literal is a decimal128 — without this the decimal-arith
-                    // special-case below saw a `null`-typed operand and `let x = a / b` / a decimal
-                    // return resolved to i32 (the S3 deferred quirk). Now `decimal <op> decimal` types.
+
                     .decimal => ast.TypeRef{ .ident = "decimal" },
                     .bool => ast.TypeRef{ .ident = "bool" },
                     .string => ast.TypeRef{ .ident = "string" },
@@ -1071,11 +914,7 @@ pub const TypeChecker = struct {
             .call => |call| {
                 if (call.callee.kind == .field_access) {
                     const fa = call.callee.kind.field_access;
-                    // A7 / F3 §5 stage 4b: builtin receivers (`bytes`, `console`) have no
-                    // .nova declaration and are not variables, so resolve them from the
-                    // builtin table BEFORE the general path (which would bail at the
-                    // `bytes`-is-not-a-variable lookup). This is what makes `bytes.alloc`
-                    // resolve to `ptr` and flush every address-holding int.
+
                     if (fa.object.kind == .ident) {
                         if (builtins.find(fa.object.kind.ident, fa.field)) |b| {
                             return builtinRetType(b.ret);
@@ -1113,8 +952,7 @@ pub const TypeChecker = struct {
                         else => {},
                     }
                 }
-                // Bare function call foo(...) → the function's declared return type;
-                // constructor call Foo(...) → the struct type.
+
                 if (call.callee.kind == .ident) {
                     const name = call.callee.kind.ident;
                     if (self.functions.get(name)) |f| {
@@ -1127,8 +965,7 @@ pub const TypeChecker = struct {
                 return null;
             },
             .generic_call => |gc| {
-                // Generic constructor Foo<...>(...) → the struct type; generic
-                // function call foo<...>(...) → the function's declared return type.
+
                 if (gc.callee.kind == .ident) {
                     const name = gc.callee.kind.ident;
                     if (self.structs.contains(name)) {
@@ -1136,8 +973,7 @@ pub const TypeChecker = struct {
                     }
                     if (self.functions.get(name)) |f| {
                         const rt = f.ret_type orelse return ast.TypeRef{ .ident = "void" };
-                        // Substitute the call's type args into the declared return type, so
-                        // `foo<int>()` on `fn foo<T>(): T` is `int`, not the abstract `T`.
+
                         return self.substReturnType(rt, f.type_params, gc.type_args);
                     }
                 }
@@ -1163,8 +999,7 @@ pub const TypeChecker = struct {
         self.current_struct = s.name;
         defer self.current_struct = null;
         self.checkDuplicateTypeParams(s.name, s.type_params, s.span);
-        // F4/F1-6: no overloading — two methods with the same name on one struct are a redefinition
-        // (codegen would emit a colliding `<Owner>_<method>` symbol). Reject, like trait methods do.
+
         for (s.methods, 0..) |m1, i| {
             for (s.methods[i + 1 ..]) |m2| {
                 if (std.mem.eql(u8, m1.decl.name, m2.decl.name)) {
@@ -1175,11 +1010,7 @@ pub const TypeChecker = struct {
         for (s.fields) |f| self.rejectUnimplementedType(f.type_name, f.span);
         for (s.methods) |m| {
             self.variables.clearRetainingCapacity();
-            // A7 / F3 §5 stage 4b: register `self` up front so CONSTRUCTOR bodies (which
-            // have an implicit self, no `self:` param) resolve `self.field` — otherwise
-            // `self.data = bytes.alloc(...)` in an `init` is invisible and the ptr
-            // truncation there slips past the check. An explicit `self:` param below
-            // overrides this with its precise (possibly generic-instantiated) type.
+
             try self.variables.put("self", ast.TypeRef{ .ident = s.name });
             for (m.decl.params) |param| {
                 if (std.mem.eql(u8, param.name, "self")) {
@@ -1191,9 +1022,7 @@ pub const TypeChecker = struct {
             }
             const prev_ret = self.current_ret_type;
             self.current_ret_type = m.decl.ret_type;
-            // A1 async-first seam: an `async fn` METHOD makes `spawn`/`await` legal in its
-            // body, exactly like an async free fn (checkFunction). Without this the method
-            // body is checked with in_async=false and every await is rejected.
+
             const prev_async = self.in_async;
             if (self.is_wasm and m.decl.is_async) {
                 self.addError(m.decl.span, "async method '{s}' is not available on the wasm target (no coroutine runtime). Guard native code with `@native {{ ... }}`.", .{m.decl.name});
@@ -1204,7 +1033,6 @@ pub const TypeChecker = struct {
             self.current_ret_type = prev_ret;
         }
 
-        // Trait Implementation Checks
         for (s.impls) |impl| {
             const trait_name = impl.name;
             const trait_decl = self.traits.get(trait_name) orelse {
@@ -1217,24 +1045,18 @@ pub const TypeChecker = struct {
                 for (s.methods) |m| {
                     if (std.mem.eql(u8, m.decl.name, trait_method.name)) {
                         found_method = true;
-                        // A1 async-first seam: the impl's async-ness MUST match the trait's.
-                        // A mismatch is unsafe — the vtable slot would hold a plain function
-                        // where dynamic dispatch expects a coroutine ramp (or vice versa), and
-                        // the drive/await would run a non-coroutine as one (crash).
+
                         if (m.decl.is_async != trait_method.is_async) {
                             self.addError(m.decl.span, "Method '{s}' in struct '{s}' must be {s} to match trait '{s}'", .{ trait_method.name, s.name, if (trait_method.is_async) "'async'" else "non-async", trait_name });
                         }
                         if (m.decl.params.len != trait_method.params.len) {
                             self.addError(m.decl.span, "Method '{s}' in struct '{s}' has parameter count mismatch with trait '{s}' (expected {d}, found {d})", .{ trait_method.name, s.name, trait_name, trait_method.params.len, m.decl.params.len });
                         } else {
-                            // Generic traits: substitute the trait's type params
-                            // (e.g. Q, R) with this impl's type args before comparing,
-                            // so `impl Handler<GetUser, UserDto>`'s handle(req: GetUser)
-                            // matches the trait's handle(req: Q).
+
                             const tparams = trait_decl.type_params;
                             const targs = impl.type_args;
                             for (m.decl.params, 0..) |p, i| {
-                                // The receiver is always the implementing struct.
+
                                 if (i == 0 and std.mem.eql(u8, p.name, "self")) continue;
                                 const want = substOptTraitType(trait_method.params[i].type_name, tparams, targs);
                                 if (!optTypesAreEqual(p.type_name, want)) {
@@ -1320,9 +1142,7 @@ fn canonicalizeTypeName(name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "long") or std.mem.eql(u8, name, "ulong")) return "i64";
     if (std.mem.eql(u8, name, "double")) return "f64";
     if (std.mem.eql(u8, name, "float")) return "f32";
-    // `decimal` stays `decimal` — it is a distinct heap type (decimal128), not an integer.
-    
-    // Normalize built-in signed/unsigned names
+
     if (std.mem.eql(u8, name, "u8")) return "i8";
     if (std.mem.eql(u8, name, "u16")) return "i16";
     if (std.mem.eql(u8, name, "u32")) return "i32";
@@ -1378,24 +1198,18 @@ fn isTypeCompatible(from: ast.TypeRef, to: ast.TypeRef) bool {
         (to == .ident and std.mem.eql(u8, to.ident, "any"))) {
         return true;
     }
-    // Erased generics: a generic type and its bare-name ident are the same runtime
-    // type, so `List` is compatible with `List<string>` and vice versa.
+
     if (from == .ident and to == .generic) {
         return std.mem.eql(u8, canonicalizeTypeName(from.ident), canonicalizeTypeName(to.generic.name));
     }
     if (from == .generic and to == .ident) {
         return std.mem.eql(u8, canonicalizeTypeName(from.generic.name), canonicalizeTypeName(to.ident));
     }
-    // A concrete value of type T satisfies an optional `T | undefined`.
+
     if (to == .optional and from != .optional) {
         return isTypeCompatible(from, to.optional.*);
     }
-    // specs §3.4b: a function declared `T | E` may return EITHER side —
-    //     return "x";                     -> the ok case
-    //     return DiError.NotRegistered(k) -> the err case
-    // so both satisfy the union. The reverse is deliberately NOT allowed (handled below by the
-    // tag check): a `T | E` does not satisfy a plain `T`, because that would let the error be
-    // used as if it were the value — which is the entire point of the feature.
+
     if (to == .error_union and from != .error_union) {
         return isTypeCompatible(from, to.error_union.ok.*) or
             isTypeCompatible(from, to.error_union.err.*);
@@ -1407,13 +1221,7 @@ fn isTypeCompatible(from: ast.TypeRef, to: ast.TypeRef) bool {
             const c_from = canonicalizeTypeName(id_from);
             const c_to = canonicalizeTypeName(id_to);
             if (std.mem.eql(u8, c_from, c_to)) return true;
-            
-            // Allow implicit conversion between any two numeric types, or between numeric and custom/pointer types.
-            // NOTE: this numeric<->anything permissiveness is LOAD-BEARING — Nova's uniform representation
-            // stores strings/lists/structs as i32 pointers, so the stdlib routinely mixes i32 and pointer
-            // types. Tightening it (e.g. requiring both sides numeric) breaks all stdlib compilation.
-            // Sound assignment/return type checking needs the resolver to track Nova-level types separately
-            // from their i32 representation first (A3, deeper). See conformance/expect_fail/PENDING.md.
+
             if (isNumericTypeName(c_from) and isNumericTypeName(c_to)) {
                 return true;
             }
@@ -1421,9 +1229,7 @@ fn isTypeCompatible(from: ast.TypeRef, to: ast.TypeRef) bool {
             return false;
         },
         .optional => |opt_from| return isTypeCompatible(opt_from.*, to.optional.*),
-        // specs §3.4b: an error union is compatible only with the SAME error union. It is
-        // deliberately NOT compatible with its own `ok` type — `string | DbError` must not
-        // silently become a `string`; that check is the whole point of the feature.
+
         .error_union => |eu_from| return isTypeCompatible(eu_from.ok.*, to.error_union.ok.*) and
             isTypeCompatible(eu_from.err.*, to.error_union.err.*),
         .fixed_array => |fa_from| {
@@ -1460,11 +1266,6 @@ fn optTypesAreEqual(a_opt: ?ast.TypeRef, b_opt: ?ast.TypeRef) bool {
     return typesAreEqual(a_opt.?, b_opt.?);
 }
 
-// Generic-trait substitution: replace a trait type parameter name (Q, R, TReq…)
-// with the concrete type argument the impl supplied, e.g. Q -> GetUser for
-// `impl Handler<GetUser, UserDto>`. Bare-ident substitution covers the trait
-// method signatures the flagship needs (`req: Q`, `: R`); compound forms
-// (`List<Q>`, `Q | Error`) are left as-is for now.
 fn substTraitType(tr: ast.TypeRef, tparams: []const []const u8, targs: []const ast.TypeRef) ast.TypeRef {
     switch (tr) {
         .ident => |name| {

@@ -1,4 +1,4 @@
-// set.nova — Generic set based on Map<K, V>
+
 import map;
 import bytes;
 import list;
@@ -57,7 +57,7 @@ fn test_set(): void {
 
     set.add(10);
     set.add(20);
-    set.add(10); // Duplicate
+    set.add(10);
     assert.equalInt(2, set.size());
 
     assert.isTrue(set.has(10));

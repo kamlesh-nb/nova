@@ -1,57 +1,35 @@
-// crypto/sha.nova — SHA hashes + HMAC-SHA256, backed by wolfCrypt (C6).
-//
-// Digests are returned as lowercase hex. HMAC-SHA256 is the primitive PostgreSQL
-// and MongoDB SCRAM-SHA-256 auth build on (see crypto/scram in C1).
 
 import bytes;
 import assert;
 
-/// SHA-256 digest of `input`, as 64 lowercase hex chars.
 pub fn sha256(input: string): string {
     return nova_sha256(input);
 }
 
-/// SHA-512 digest of `input`, as 128 lowercase hex chars.
 pub fn sha512(input: string): string {
     return nova_sha512(input);
 }
 
-/// SHA-1 digest of `input`, as 40 lowercase hex chars. Legacy — cryptographically
-/// weak; exposed for protocol interop (e.g. MySQL `mysql_native_password`), not
-/// for new security-sensitive use.
 pub fn sha1(input: string): string {
     return nova_sha1(input);
 }
 
-/// HMAC-SHA256 of `msg` under `key`, as 64 lowercase hex chars.
 pub fn hmacSha256(key: string, msg: string): string {
     return nova_hmac_sha256(key, msg);
 }
 
-// ---------------------------------------------------------------------------
-// RAW-byte primitives (C1: SCRAM / password hashing). These return 32 RAW bytes,
-// not hex — the SCRAM key chain XORs and re-hashes binary 32-byte blocks, so
-// hex round-tripping would corrupt the math. Inputs are binary-safe (a Nova
-// string carries its own length; NULs are fine).
-// ---------------------------------------------------------------------------
-
-/// SHA-256 of `input` as 32 RAW bytes (e.g. SCRAM StoredKey = SHA256(ClientKey)).
 pub fn sha256Raw(input: string): string {
     return nova_sha256_raw(input);
 }
 
-/// HMAC-SHA256(`key`, `msg`) as 32 RAW bytes. `key` may be a binary block.
 pub fn hmacSha256Raw(key: string, msg: string): string {
     return nova_hmac_sha256_raw(key, msg);
 }
 
-/// PBKDF2-HMAC-SHA256 — derive `dkLen` RAW bytes from `password` and `salt` over
-/// `iterations` rounds (SCRAM SaltedPassword; also a solid password hash).
 pub fn pbkdf2HmacSha256(password: string, salt: string, iterations: int, dkLen: int): string {
     return nova_pbkdf2_hmac_sha256(password, salt, iterations as long, dkLen as long);
 }
 
-/// Lowercase-hex encoding of a raw byte string — for hashing KATs / debugging.
 pub fn toHex(raw: string): string {
     const digits: string = "0123456789abcdef";
     let n = raw.length;
@@ -68,7 +46,7 @@ pub fn toHex(raw: string): string {
 
 @test
 fn test_sha_kats(): void {
-    // Known-answer tests — FAIL loudly if a digest is wrong.
+
     assert.equalStr(sha256("hello"), "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
     assert.equalStr(sha256(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
     assert.equalStr(sha512("abc"), "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f");
@@ -77,14 +55,14 @@ fn test_sha_kats(): void {
 
 @test
 fn test_hmac_kat(): void {
-    // RFC 4231 test case 2: key="Jefe", data="what do ya want for nothing?".
+
     assert.equalStr(hmacSha256("Jefe", "what do ya want for nothing?"),
                     "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
 }
 
 @test
 fn test_raw_matches_hex(): void {
-    // The raw-byte variants must equal the hex ones when hex-encoded.
+
     assert.equalStr(toHex(sha256Raw("hello")), sha256("hello"));
     assert.equalStr(toHex(hmacSha256Raw("Jefe", "what do ya want for nothing?")),
                     hmacSha256("Jefe", "what do ya want for nothing?"));
@@ -92,7 +70,7 @@ fn test_raw_matches_hex(): void {
 
 @test
 fn test_pbkdf2_kats(): void {
-    // PBKDF2-HMAC-SHA256 published vectors ("password"/"salt", dkLen=32).
+
     assert.equalStr(toHex(pbkdf2HmacSha256("password", "salt", 1, 32)),
                     "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b");
     assert.equalStr(toHex(pbkdf2HmacSha256("password", "salt", 2, 32)),

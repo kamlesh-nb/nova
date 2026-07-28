@@ -1,9 +1,4 @@
-// circuit_breaker.nova — resilience for the OUTBOUND HTTP client (W3).
-//
-// The reusable CircuitBreaker state machine now lives in `resilience/breaker.nova` (so the DB
-// layer can share it without pulling in the web client stack); this module keeps the HTTP-
-// specific `ResilientClient` wrapper over it. `CircuitBreaker` + `STATE_*` are re-exported for
-// existing callers via the `breaker` import below (`breaker.CircuitBreaker`).
+
 import resilience.breaker;
 import web.request;
 import web.response;
@@ -12,8 +7,6 @@ import web.client;
 import string;
 import map;
 
-/// An HTTP client that trips a circuit breaker on upstream failures (connection errors or
-/// 5xx). When the breaker is OPEN, calls fail fast with 503 instead of touching the network.
 pub struct ResilientClient {
     pub breaker: breaker.CircuitBreaker,
 
@@ -21,8 +14,6 @@ pub struct ResilientClient {
         self.breaker = breaker.CircuitBreaker(failureThreshold, successThreshold, timeoutMs);
     }
 
-    // A response is an upstream failure if the connection failed or the server returned 5xx.
-    // 4xx is the caller's fault, not the upstream's — it does NOT trip the breaker.
     fn record(self: ResilientClient, res: response.Response): void {
         if (Status.toCode(res.status) >= 500) {
             self.breaker.recordFailure();

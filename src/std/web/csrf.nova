@@ -1,4 +1,4 @@
-// csrf.nova — CSRF Protection Middleware
+
 import web.request;
 import web.response;
 import web.middleware;
@@ -25,7 +25,7 @@ pub struct CsrfMiddleware impl Middleware {
 
         let expected = req.headers.get("X-Session-CSRF") ?? "";
         if (expected == "") {
-            return MiddlewareAction.Next; // No session active orelse CSRF not required
+            return MiddlewareAction.Next;
         }
 
         let clientToken = req.headers.get(self.headerName) ?? getFormField(req.body, self.formField);
@@ -48,8 +48,8 @@ fn getFormField(body: string, name: string): string {
     let pairs = string.split(body, "&");
     let i = 0;
     while (i < pairs.size()) {
-        let pair = pairs.at(i);                 // .at is trapping (string); .get returns an OPTIONAL,
-        let eq = string.indexOf(pair, "=");     // whose later `pair.length` is an unguarded-optional error
+        let pair = pairs.at(i);
+        let eq = string.indexOf(pair, "=");
         if (eq != -1) {
             let key = string.slice(pair, 0, eq);
             if (key == name) {

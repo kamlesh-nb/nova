@@ -1,24 +1,14 @@
-// src/main.zig
+
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const build_options = @import("build_options");
 
-// In-process LLD (P5 #20): when nova was built with -Dinprocess-lld, these are
-// provided by src/linker/lld_link.cpp (linked against native liblld*.a) and nova
-// links its output executables itself, with no clang/ld shell-out. argv[0] is the
-// linker name; args are exactly what ld64.lld / wasm-ld would receive.
 extern fn nova_lld_link_macho(argv: [*]const [*:0]const u8, argc: c_int) c_int;
 extern fn nova_lld_link_wasm(argv: [*]const [*:0]const u8, argc: c_int) c_int;
 
-// T6/Phase-2 link-time dead-code elimination flag for the `clang++` link paths. Mach-O atomises so
-// -dead_strip drops unreferenced symbols with no -ffunction-sections; ELF needs --gc-sections (and,
-// for full effect, function-sections on the object — a later refinement). Passed via -Wl, to clang.
 const dead_strip_flag: []const u8 = if (builtin.target.os.tag == .macos) "-Wl,-dead_strip" else "-Wl,--gc-sections";
 
-// Resolve the macOS SDK path for -syslibroot: SDKROOT, else the Command Line
-// Tools SDK, else the Xcode SDK. (The -platform_version SDK/min are fixed at
-// 11.0 — ld64.lld only needs a plausible value; broad-compat deployment target.)
 fn macSdkPath(environ: anytype, io: std.Io) []const u8 {
     if (environ.get("SDKROOT")) |s| return s;
     const clt = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk";
@@ -28,10 +18,6 @@ fn macSdkPath(environ: anytype, io: std.Io) []const u8 {
     return clt;
 }
 
-// Link `obj_path` (+ nova runtime + wolfSSL) into `output_path` with in-process
-// ld64.lld, reconstructing the args the clang driver would hand the linker.
-// T3 FFI: collect the distinct library names from every `extern("lib") fn` in the program.
-// Order-preserving dedup so `-l` flags are stable and each lib appears once.
 fn collectFfiLibs(allocator: std.mem.Allocator, program: ast.Program) ![]const []const u8 {
     var libs = std.ArrayList([]const u8).empty;
     for (program.declarations) |decl| {
@@ -49,10 +35,6 @@ fn collectFfiLibs(allocator: std.mem.Allocator, program: ast.Program) ![]const [
     return libs.toOwnedSlice(allocator);
 }
 
-// T3 FFI / W1: emit the link flags for one `extern("lib")` library. Most libs become a
-// plain `-l<lib>` (resolved from system + `-L` search paths). `webview` is a VENDORED dep:
-// link its static lib by path and pull in the macOS WebKit/Cocoa frameworks its WKWebView
-// backend needs (there is no `-lwebview` on the search path, and frameworks are not `-l`).
 fn appendFfiLib(args: *std.ArrayList([]const u8), allocator: std.mem.Allocator, shared_nova: []const u8, io: std.Io, lib: []const u8) !void {
     if (std.mem.eql(u8, lib, "webview")) {
         const lib_path = try std.fmt.allocPrint(allocator, "{s}/deps/webview/build/libwebview.a", .{shared_nova});
@@ -86,12 +68,10 @@ fn linkNativeInProcessMacho(
         "-platform_version",    "macos", "11.0", "11.0",
         "-syslibroot",          sdk_path,
         "-lSystem",             "-lc++",
-        // T6/Phase-2 dead-code strip: Mach-O atomises symbols, so ld64's -dead_strip drops every
-        // function/global unreferenced from the entry point — a real app links only what it USES out of
-        // the stdlib. Measured 1.33MB → 390KB on the sample web app (~71%), runs identically.
+
         "-dead_strip",
     });
-    for (objs) |o| try args.append(allocator, o); // T6 split: one or many object files
+    for (objs) |o| try args.append(allocator, o);
     const nova_lib = try std.fmt.allocPrint(allocator, "-L{s}/lib", .{shared_nova});
     try args.appendSlice(allocator, &.{ nova_lib, "-lnova_runtime", "-lz", "-L/opt/homebrew/lib" });
     try appendWolfsslLink(&args, allocator, shared_nova, io);
@@ -100,7 +80,6 @@ fn linkNativeInProcessMacho(
     }
     try args.appendSlice(allocator, &.{ "-o", output_path });
 
-    // Build the null-terminated C argv the shim expects.
     var cargv = std.ArrayList([*:0]const u8).empty;
     defer cargv.deinit(allocator);
     for (args.items) |a| try cargv.append(allocator, try allocator.dupeZ(u8, a));
@@ -112,13 +91,6 @@ fn linkNativeInProcessMacho(
     }
 }
 
-// T1 — cross-compilation via the bundled Zig toolchain. `zig c++` ships libc (musl/glibc) + CRT and
-// cross-links ELF/COFF, so a macOS host can PRODUCE (and, given musl `-static`, run anywhere) a
-// Linux/Windows binary. Given the LLVM target triple, map it to a Zig target, cross-build the C++
-// runtime for that target ONCE (cached at `~/.nova/lib/nova_runtime_<zigtriple>.o`), and link the
-// Nova objects against it with `zig c++`. Returns true when it handled the link (a non-host target);
-// false to fall through to the host in-process-LLD / clang++ path. TLS is stubbed on cross targets
-// for now (the runtime is built without -DNOVA_HAVE_WOLFSSL — wolfSSL cross-build is a follow-on).
 const CrossTarget = struct { zig: []const u8, static: bool };
 fn mapCrossTarget(llvm_triple: []const u8) ?CrossTarget {
     const has = struct {
@@ -132,7 +104,7 @@ fn mapCrossTarget(llvm_triple: []const u8) ?CrossTarget {
     if (has(llvm_triple, "windows") or has(llvm_triple, "mingw") or has(llvm_triple, "w64"))
         return .{ .zig = if (arm) "aarch64-windows-gnu" else "x86_64-windows-gnu", .static = false };
     if (has(llvm_triple, "darwin") or has(llvm_triple, "apple")) {
-        // Native mac is handled by the host path; only take over when the arch differs from the host.
+
         const host_arm = builtin.target.cpu.arch == .aarch64;
         if (arm == host_arm) return null;
         return .{ .zig = if (arm) "aarch64-macos" else "x86_64-macos", .static = false };
@@ -152,19 +124,15 @@ fn crossLinkViaZig(
 ) !bool {
     const target = mapCrossTarget(llvm_triple) orelse return false;
 
-    // Cross-build the runtime for this target once, then cache it.
     const rt_obj = try std.fmt.allocPrint(allocator, "{s}/lib/nova_runtime_{s}.o", .{ shared_nova, target.zig });
     if (Io.Dir.access(.cwd(), io, rt_obj, .{})) |_| {} else |_| {
-        // Boost = the vendored Asio-only header subset synced to ~/.nova/deps/boost (no Homebrew).
+
         const boost_inc = if (environ.get("BOOST_PREFIX")) |bp|
             try std.fmt.allocPrint(allocator, "-I{s}/include", .{bp})
         else
             try std.fmt.allocPrint(allocator, "-I{s}/deps/boost/include", .{shared_nova});
         const rt_src = try std.fmt.allocPrint(allocator, "{s}/src/runtime/runtime.cpp", .{shared_nova});
-        // T1 zlib gap fix: the runtime pulls in compress.cpp → `<zlib.h>`. The host `-lz`/`-L/opt/homebrew`
-        // is macOS-only, and `zig c++` for musl-linux/windows ships no zlib. Point at the VENDORED zlib
-        // headers (deps/zlib, synced to ~/.nova/deps) so the cross-compile resolves the header; the zlib
-        // .c sources are compiled + linked in below (so the symbols resolve too — no host zlib).
+
         const zlib_inc = try std.fmt.allocPrint(allocator, "-I{s}/deps/zlib", .{shared_nova});
         std.debug.print("[T1] cross-compiling the C++ runtime for {s} (one-time; caches to ~/.nova/lib) ...\n", .{target.zig});
         const rc_args = [_][]const u8{ "zig", "c++", "-target", target.zig, "-std=c++20", "-O2", "-DNOVA_DROP_ARENA", boost_inc, zlib_inc, "-c", rt_src, "-o", rt_obj };
@@ -178,25 +146,18 @@ fn crossLinkViaZig(
         }
     }
 
-    // Link the Nova objects + cross runtime via `zig c++`.
     var args = std.ArrayList([]const u8).empty;
     defer args.deinit(allocator);
     try args.appendSlice(allocator, &.{ "zig", "c++", "-target", target.zig });
     if (target.static) try args.append(allocator, "-static");
     if (is_release) try args.append(allocator, "-O3");
-    for (objs) |o| try args.append(allocator, o); // T6 split: one or many object files
+    for (objs) |o| try args.append(allocator, o);
     try args.append(allocator, rt_obj);
-    // T1 zlib gap fix: compile + link the VENDORED zlib sources for the target (the runtime .o above has
-    // unresolved deflate/inflate from compress.cpp). `zig c++` builds each .c for the target; they include
-    // their own headers via quotes, so no -I is needed. Replaces the host-only `-lz -L/opt/homebrew/lib`.
-    // Only the IN-MEMORY subset — compress.cpp uses deflate/inflate/compress, never the gz* FILE API
-    // (gzopen/gzread), whose read/lseek/close need POSIX feature macros the bare musl cross-compile lacks.
+
     const zlib_srcs = [_][]const u8{ "adler32", "compress", "crc32", "deflate", "infback", "inffast", "inflate", "inftrees", "trees", "uncompr", "zutil" };
     for (zlib_srcs) |name|
         try args.append(allocator, try std.fmt.allocPrint(allocator, "{s}/deps/zlib/{s}.c", .{ shared_nova, name }));
-    // Windows: the runtime + Boost.Asio use winsock2 (WSAStartup/socket/select via ws2_32) and Asio's
-    // IOCP backend needs mswsock. The `#pragma comment(lib, ...)` in io.cpp isn't honored by lld-link
-    // here, so link the system import libs explicitly.
+
     if (std.mem.indexOf(u8, target.zig, "windows") != null)
         try args.appendSlice(allocator, &.{ "-lws2_32", "-lmswsock" });
     try args.appendSlice(allocator, &.{ "-o", output_path });
@@ -211,16 +172,10 @@ fn crossLinkViaZig(
     return true;
 }
 
-// Link `obj_path` into `output_path` (.wasm) with in-process wasm-ld. The wasm
-// target is freestanding (-nostdlib + host imports) so there is nothing to link
-// but the one object — the same args clang forwarded via -Wl,.
 fn linkWasmInProcess(allocator: std.mem.Allocator, obj_path: []const u8, output_path: []const u8) !void {
     const argv = [_][]const u8{
         "wasm-ld", "--no-entry", "--export-all", "--export-memory", "--allow-undefined",
-        // The bump allocator places its arena at heap_start and the persistent
-        // arena at heap_start+32MB, and never grows memory — so the module must
-        // ship enough initial memory to cover both (128MB). (Growing the heap on
-        // demand is the proper long-term fix.)
+
         "--initial-memory=134217728",
         obj_path, "-o", output_path,
     };
@@ -235,12 +190,9 @@ fn linkWasmInProcess(allocator: std.mem.Allocator, obj_path: []const u8, output_
     }
 }
 
-// M3-D-5: link the vendored wolfSSL static lib when it was built (TLS enabled). Kept
-// in sync with build.zig's NOVA_HAVE_WOLFSSL guard: both key off the .a existing.
-// macOS needs the Security/CoreFoundation frameworks (Apple native cert validation).
 fn appendWolfsslLink(args: *std.ArrayList([]const u8), allocator: std.mem.Allocator, shared_nova: []const u8, io: std.Io) !void {
     const lib_path = std.fmt.allocPrint(allocator, "{s}/deps/wolfssl/build/libwolfssl.a", .{shared_nova}) catch return;
-    Io.Dir.access(.cwd(), io, lib_path, .{}) catch return; // not built → TLS stubbed, skip
+    Io.Dir.access(.cwd(), io, lib_path, .{}) catch return;
     try args.append(allocator, lib_path);
     if (builtin.target.os.tag == .macos) {
         try args.append(allocator, "-framework");
@@ -302,24 +254,17 @@ fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocator: 
     if (std.mem.eql(u8, module_name, "pool")) {
         return try std.fmt.allocPrint(allocator, "src/std/data/sql/pool.nova", .{});
     }
-    // The concrete DB drivers (postgres/mysql/mssql/btreedb) live in `packages/` — resolved
-    // below via resolveFromLocalPackages (dev checkout) or the package cache (installed), like
-    // any other package. The `db` seam + generic `pool` stay in std (the shared vocabulary).
+
     if (resolveFromLocalPackages(module_name, allocator, io)) |local_hit| {
         return local_hit;
     }
     const dir_end = std.mem.lastIndexOfScalar(u8, base_path, '/') orelse 0;
     const dir = if (dir_end == 0) "" else base_path[0..dir_end];
-    // NOTE: an importing file at the project ROOT (no '/' in base_path) has an empty `dir`. Do NOT
-    // early-return `{module}.nova` here — that used to short-circuit the project-root fallback AND the
-    // package-cache lookup, so a consumer whose main.nova sits at its root could never resolve a
-    // `nova get`-fetched dependency. Fall through: the walk-up loop is simply skipped (dir empty), and
-    // resolution continues to the project-root + cache stages below.
 
     var current_len = dir.len;
     while (current_len > 0) {
         const current_dir = dir[0..current_len];
-        // 1. Check parent_dir/src/module_name.nova
+
         const src_candidate = try std.fmt.allocPrint(allocator, "{s}/src/{s}.nova", .{ current_dir, module_name });
         if (Io.Dir.access(.cwd(), io, src_candidate, .{})) |_| {
             return src_candidate;
@@ -327,7 +272,6 @@ fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocator: 
             allocator.free(src_candidate);
         }
 
-        // 2. Check parent_dir/module_name.nova
         const dir_candidate = try std.fmt.allocPrint(allocator, "{s}/{s}.nova", .{ current_dir, module_name });
         if (Io.Dir.access(.cwd(), io, dir_candidate, .{})) |_| {
             return dir_candidate;
@@ -335,14 +279,10 @@ fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocator: 
             allocator.free(dir_candidate);
         }
 
-        // Walk up to parent directory
         const last_slash = std.mem.lastIndexOfScalar(u8, current_dir, '/') orelse break;
         current_len = last_slash;
     }
 
-    // Project-root fallback: `src/<module>.nova` relative to the CWD. Lets files OUTSIDE src/
-    // (e.g. a `tests/` tree) import project modules by their dotted path — the walk-up above
-    // starts at the importing file's dir and never reaches the sibling `src/`.
     {
         const root_src = try std.fmt.allocPrint(allocator, "src/{s}.nova", .{module_name});
         if (Io.Dir.access(.cwd(), io, root_src, .{})) |_| {
@@ -352,24 +292,16 @@ fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocator: 
         }
     }
 
-    // Package-manager resolution: a module provided by a FETCHED dependency lives under
-    // `~/.nova/cache/<repo>/`. `nova get` populates that tree from `project.json`; here we let
-    // an `import <module>` bind to it. Search each cached package's `src/<module>.nova` (the
-    // conventional layout) then its `<module>.nova` root. Manifest drives fetching; the cache
-    // drives resolution — so the resolver needs no manifest parse of its own.
     if (resolveFromPackageCache(module_name, allocator, io, home)) |cache_hit| {
         return cache_hit;
     }
 
-    // Default fallback: direct join relative to base_path's dir (bare `<module>.nova` at the root).
     if (dir.len == 0) {
         return try std.fmt.allocPrint(allocator, "{s}.nova", .{module_name});
     }
     return try std.fmt.allocPrint(allocator, "{s}/{s}.nova", .{ dir, module_name });
 }
 
-/// Search `~/.nova/cache/*/` for a module provided by a fetched dependency.
-/// Returns an owned absolute path (caller frees) on the first hit, else null.
 fn resolveFromPackageCache(module_name: []const u8, allocator: std.mem.Allocator, io: std.Io, home: ?[]const u8) ?[]const u8 {
     const home_dir = home orelse return null;
 
@@ -398,14 +330,9 @@ fn resolveFromPackageCache(module_name: []const u8, allocator: std.mem.Allocator
     return null;
 }
 
-/// Search the repo's local `packages/nova-<module>/src/<module>.nova` (a dev checkout) for a
-/// package-provided module — how the DB drivers, moved OUT of std into `packages/`, resolve in
-/// tree without a `nova get` into the cache. Tries `packages/` (CWD = the driver's own project
-/// root) and `../packages/` (CWD = the `lang/` compiler project, where the corpus + build run).
-/// Returns an owned path on the first hit, else null; the installed path stays the package cache.
 fn resolveFromLocalPackages(module_name: []const u8, allocator: std.mem.Allocator, io: std.Io) ?[]const u8 {
     const roots = [_][]const u8{ "packages", "../packages" };
-    // 1. The single-module convention: `import postgres` → packages/nova-postgres/src/postgres.nova.
+
     for (roots) |root| {
         const candidate = std.fmt.allocPrint(allocator, "{s}/nova-{s}/src/{s}.nova", .{ root, module_name, module_name }) catch continue;
         if (Io.Dir.access(.cwd(), io, candidate, .{})) |_| {
@@ -414,9 +341,7 @@ fn resolveFromLocalPackages(module_name: []const u8, allocator: std.mem.Allocato
             allocator.free(candidate);
         }
     }
-    // 2. MULTI-module packages (e.g. nova-orchestrator holds net/proxy, orch/*, os/sandbox): scan every
-    //    local package's src/ for `<module_name>.nova` (dotted names arrive as slashes). Mirrors the
-    //    package-cache resolver so a dev checkout resolves a package's dotted modules from anywhere.
+
     for (roots) |root| {
         const dir = Io.Dir.openDir(.cwd(), io, root, .{ .iterate = true }) catch continue;
         defer Io.Dir.close(dir, io);
@@ -459,7 +384,6 @@ fn generateControllerRoutes(allocator: std.mem.Allocator, declarations: *std.Arr
             var statements = std.ArrayList(ast.Statement).empty;
             defer statements.deinit(allocator);
 
-            // 1. let ctrl = self;
             const let_ctrl = ast.Statement{
                 .let_stmt = .{
                     .name = "ctrl",
@@ -472,13 +396,11 @@ fn generateControllerRoutes(allocator: std.mem.Allocator, declarations: *std.Arr
             };
             try statements.append(allocator, let_ctrl);
 
-            // 2. Add router.add call for each method with route attributes
             for (s.methods) |method| {
                 for (method.decl.attributes) |attr| {
                     if (attr == .route) {
                         const route = attr.route;
 
-                        // Callee: router.add
                         const callee = try allocator.create(ast.Expression);
                         callee.* = ast.Expression{ .kind = .{ .field_access = .{
                                 .object = try allocator.create(ast.Expression),
@@ -487,7 +409,6 @@ fn generateControllerRoutes(allocator: std.mem.Allocator, declarations: *std.Arr
                             } } };
                         callee.kind.field_access.object.* = ast.Expression{ .kind = .{ .ident = "router" } };
 
-                        // Closure: (req) => ctrl.method_name(req)
                         const closure_param_names = try allocator.alloc([]const u8, 1);
                         closure_param_names[0] = "req";
 
@@ -517,7 +438,6 @@ fn generateControllerRoutes(allocator: std.mem.Allocator, declarations: *std.Arr
                             },
                         } };
 
-                        // router.add arguments
                         const add_args = try allocator.alloc(ast.Expression, 3);
                         add_args[0] = ast.Expression{ .kind = .{ .literal = .{ .string = route.method } } };
                         add_args[1] = ast.Expression{ .kind = .{ .literal = .{ .string = route.path } } };
@@ -579,26 +499,18 @@ fn generateControllerRoutes(allocator: std.mem.Allocator, declarations: *std.Arr
     }
 }
 
-// --- serde: generate a `<Struct>__bind(src: ValueSource): <Struct>` deserializer for
-// every @serializable struct (recursive over nested @serializable structs and lists).
-// Generated as source text and reparsed — far simpler than hand-building AST, and the
-// binder resolves against the merged program (requires `import serde.source`). ---
-
 fn serdeIsInt(n: []const u8) bool {
     const ints = [_][]const u8{ "i8", "u8", "byte", "i16", "u16", "short", "ushort", "i32", "u32", "int", "uint", "i64", "u64", "long", "ulong" };
     for (ints) |x| if (std.mem.eql(u8, n, x)) return true;
     return false;
 }
 fn serdeIsFloat(n: []const u8) bool {
-    // `decimal` is DELIBERATELY not here — it is exact (128-bit BID) and routes to getDecimal /
-    // itemDecimal, not the lossy f64 getFloat. See the decimal branches in generateSerdeBinders.
+
     const fs = [_][]const u8{ "f32", "f64", "float", "double" };
     for (fs) |x| if (std.mem.eql(u8, n, x)) return true;
     return false;
 }
 
-/// A payload-LESS enum (all bare variants) can serialize by its variant NAME — a string. A
-/// payload-carrying enum cannot round-trip through a name alone, so serde skips it.
 fn serdeEnumPayloadless(e: ast.EnumDecl) bool {
     for (e.variants) |v| {
         if (v.type_name != null or v.fields != null) return false;
@@ -625,7 +537,6 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
     }
     if (serializable.count() == 0) return;
 
-    // All payload-less enums, so a serde field of enum type can serialize by variant NAME (a string).
     var enums = std.StringHashMap(ast.EnumDecl).init(allocator);
     defer enums.deinit();
     for (declarations.items) |decl| {
@@ -634,11 +545,8 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
         }
     }
 
-    var src = std.ArrayList(u8).empty; // leaked on purpose — the reparsed AST references it
+    var src = std.ArrayList(u8).empty;
 
-    // Which payload-less enums are actually referenced by a serde field (scalar or optional inner)?
-    // Generate `<Enum>__name`/`<Enum>__fromName` for exactly those, so an enum field round-trips as its
-    // variant NAME (`"status":"Active"`). Emitted BEFORE the struct binders that call them.
     var needed_enums = std.StringHashMap(void).init(allocator);
     defer needed_enums.deinit();
     for (declarations.items) |decl| {
@@ -657,7 +565,7 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
         var it = needed_enums.keyIterator();
         while (it.next()) |k| {
             const en = enums.get(k.*).?;
-            // <Enum>__name(e): the variant name; <Enum>__fromName(s): name -> variant (default = first).
+
             try serdeAppendf(&src, allocator, "fn {s}__name(e: {s}): string {{\n    switch (e) {{\n", .{ en.name, en.name });
             for (en.variants) |v| {
                 try serdeAppendf(&src, allocator, "        case {s}.{s}: {{ return \"{s}\"; }}\n", .{ en.name, v.name, v.name });
@@ -694,16 +602,12 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
                     } else if (serializable.contains(tn)) {
                         try serdeAppendf(&src, allocator, "    obj.{s} = {s}__bind(src.getChild(\"{s}\"));\n", .{ fname, tn, fname });
                     } else if (enums.contains(tn)) {
-                        // Enum field: bind from its variant NAME (getString "" → first variant default).
+
                         try serdeAppendf(&src, allocator, "    obj.{s} = {s}__fromName(src.getString(\"{s}\"));\n", .{ fname, tn, fname });
                     }
                 },
                 .optional => |inner| {
-                    // An OPTIONAL field (`age: int | undefined`) was neither `.ident` nor `.generic`,
-                    // so it hit the `else` below and was NEVER bound — a present value silently read
-                    // back as `undefined` (data loss on deserialize). Emit a presence-guarded read:
-                    // when the key is present, assign the scalar (the value-optional field store boxes
-                    // it, so a present 0 stays 0); when absent, leave the ctor's `undefined` default.
+
                     if (inner.* == .ident) {
                         const itn = inner.ident;
                         if (std.mem.eql(u8, itn, "string")) {
@@ -725,10 +629,7 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
                 },
                 .generic => |g| {
                     if (std.mem.eql(u8, g.name, "List") and g.params.len == 1) {
-                        // Initialize the List FIELD to an empty container first: `obj` comes from the
-                        // no-init default constructor `{S}()`, which zero-fills — a List field lands as a
-                        // NULL handle, so the `obj.{field}.push(...)` below would deref null and crash.
-                        // (Nova structs have no field defaults; the binder must init every field it fills.)
+
                         switch (g.params[0]) {
                             .ident => |en| try serdeAppendf(&src, allocator, "    obj.{s} = List<{s}>();\n", .{ fname, en }),
                             else => {},
@@ -756,12 +657,6 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
         }
         try src.appendSlice(allocator, "    return obj;\n}\n\n");
 
-        // --- <S>__toJson(obj): string  (symmetric serializer; string-concat based) ---
-        // A RUNTIME `__sep` flag (not a compile-time comma) so an OPTIONAL field can OMIT itself when
-        // absent without stranding a comma. Output is byte-identical for structs with no optionals
-        // (first emitted field sees __sep="", the rest ","), so the existing exact-string round-trip
-        // gates are unaffected. `__sep = ","` runs only inside each field's emit, so a skipped optional
-        // leaves it untouched and the next present field is treated as first.
         try serdeAppendf(&src, allocator, "fn {s}__toJson(obj: {s}): string {{\n    let out = \"{{\";\n    let __sep = \"\";\n", .{ s.name, s.name });
         for (s.fields) |f| {
             const fname = f.name;
@@ -772,21 +667,18 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
                     } else if (serdeIsInt(tn) or std.mem.eql(u8, tn, "bool")) {
                         try serdeAppendf(&src, allocator, "    out = out + __sep + \"\\\"{s}\\\":\" + obj.{s}; __sep = \",\";\n", .{ fname, fname });
                     } else if (std.mem.eql(u8, tn, "decimal")) {
-                        // Exact decimal as an UNQUOTED JSON number (`${}` gives its BID text, no f64 hop).
+
                         try serdeAppendf(&src, allocator, "    out = out + __sep + \"\\\"{s}\\\":\" + `${{obj.{s}}}`; __sep = \",\";\n", .{ fname, fname });
                     } else if (serializable.contains(tn)) {
                         try serdeAppendf(&src, allocator, "    out = out + __sep + \"\\\"{s}\\\":\" + {s}__toJson(obj.{s}); __sep = \",\";\n", .{ fname, tn, fname });
                     } else if (enums.contains(tn)) {
-                        // Enum field serialized as its QUOTED variant name (`"status":"Active"`).
+
                         try serdeAppendf(&src, allocator, "    out = out + __sep + \"\\\"{s}\\\":\" + json.quote({s}__name(obj.{s})); __sep = \",\";\n", .{ fname, tn, fname });
                     }
-                    // f32/f64 float fields skipped (f64 stringify gap); decimal handled above
+
                 },
                 .optional => |inner| {
-                    // Symmetric with the `.optional` bind arm: emit `"key":value` only when PRESENT,
-                    // else omit the key entirely (matches the has()-based read). The value is bound to a
-                    // block-local `__v` first so the `!= undefined` guard NARROWS it to the bare inner
-                    // value (field access does not narrow; a plain local does) → it unboxes correctly.
+
                     if (inner.* == .ident) {
                         const itn = inner.ident;
                         var vexpr: ?[]const u8 = null;
@@ -835,10 +727,6 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
         }
         try src.appendSlice(allocator, "    out = out + \"}\";\n    return out;\n}\n\n");
 
-        // --- <S>__dump(obj, sink): void  (write-side mirror of __bind; scalar fields only) ---
-        // Each field's VALUE flows through a typed `put*` — never string-interpolated — so a value
-        // carrying SQL/operator metacharacters cannot escape into a query. Nested structs / lists are
-        // out of the flat write path's scope (same flat shape as the RowSource read side).
         try serdeAppendf(&src, allocator, "fn {s}__dump(obj: {s}, sink: ValueSink): void {{\n", .{ s.name, s.name });
         for (s.fields) |f| {
             const fname = f.name;
@@ -855,17 +743,13 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
                     } else if (serdeIsFloat(tn)) {
                         try serdeAppendf(&src, allocator, "    sink.putFloat(\"{s}\", obj.{s});\n", .{ fname, fname });
                     } else if (enums.contains(tn)) {
-                        // Enum field written as its variant NAME (string), symmetric with bind/toJson.
+
                         try serdeAppendf(&src, allocator, "    sink.putString(\"{s}\", {s}__name(obj.{s}));\n", .{ fname, tn, fname });
                     }
-                    // nested @serializable structs skipped (flat write path)
+
                 },
                 .optional => |inner| {
-                    // An OPTIONAL scalar field was skipped by the `else` below, so a PRESENT value
-                    // was silently dropped from the write (INSERT/BSON) — the write-side sibling of
-                    // the bind/toJson optional fix. Emit `put` only when present (bind to a block-local
-                    // so `!= undefined` narrows+unboxes the value-optional); absent → column omitted
-                    // (ValueSink has no putNull; the DB uses its default/NULL).
+
                     if (inner.* == .ident) {
                         const itn = inner.ident;
                         var sink_fn: ?[]const u8 = null;
@@ -887,7 +771,7 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
                         }
                     }
                 },
-                else => {}, // List<T> skipped (flat write path)
+                else => {},
             }
         }
         try src.appendSlice(allocator, "}\n\n");
@@ -905,16 +789,9 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
     }
 }
 
-// --- mediator (flagship): for every `struct H impl RequestHandler<Q, R>`, generate
-// a typed route dispatch `__mediator_dispatch_<Q>(src: ValueSource): string` that
-// binds the request (Q__bind), instantiates + runs the handler, and serializes the
-// response (R__toJson). This IS the compile-time handler discovery — the dispatch
-// embeds the handler, so `app.get<Q>(path)` needs no handler argument. Generated as
-// source and reparsed, like the serde binders; must run AFTER them (uses Q__bind /
-// R__toJson) and requires Q, R to be @serializable. ---
 fn generateMediatorDispatch(allocator: std.mem.Allocator, declarations: *std.ArrayList(ast.Declaration), is_wasm: bool) !void {
-    var src = std.ArrayList(u8).empty; // leaked on purpose — the reparsed AST references it
-    var by_name = std.ArrayList(u8).empty; // body of __mediator_dispatch_by_name
+    var src = std.ArrayList(u8).empty;
+    var by_name = std.ArrayList(u8).empty;
     var seen_q = std.StringHashMap(void).init(allocator);
     defer seen_q.deinit();
     var qs = std.ArrayList([]const u8).empty;
@@ -933,7 +810,7 @@ fn generateMediatorDispatch(allocator: std.mem.Allocator, declarations: *std.Arr
                 .ident => |n| n,
                 else => continue,
             };
-            if (seen_q.contains(q)) continue; // one handler per request type
+            if (seen_q.contains(q)) continue;
             try seen_q.put(q, {});
             try qs.append(allocator, q);
             try serdeAppendf(&src, allocator,
@@ -945,9 +822,7 @@ fn generateMediatorDispatch(allocator: std.mem.Allocator, declarations: *std.Arr
                     "}}\n\n", .{ q, s.name, q, r });
         }
     }
-    // A Router (a struct with an `__addRoute` method — e.g. web/routing.nova)
-    // references __mediator_dispatch_by_name, so that must exist even when the
-    // program declares no handlers yet (an empty router still compiles + 404s).
+
     var has_router = false;
     for (declarations.items) |decl| {
         if (decl != .struct_decl) continue;
@@ -961,9 +836,6 @@ fn generateMediatorDispatch(allocator: std.mem.Allocator, declarations: *std.Arr
     }
     if (src.items.len == 0 and !has_router) return;
 
-    // A single by-name dispatcher so a Router can register a route by request-type
-    // NAME (a string) and dispatch through this — no first-class fn-values needed
-    // (a function value of a struct-typed binder mis-marshals; a plain call does not).
     try serdeAppendf(&src, allocator, "fn __mediator_dispatch_by_name(__name: string, src: ValueSource): string {{\n", .{});
     for (qs.items) |q| {
         try serdeAppendf(&by_name, allocator, "    if (string.eql(__name, \"{s}\")) {{ return __mediator_dispatch_{s}(src); }}\n", .{ q, q });
@@ -996,25 +868,13 @@ fn loadProgram(allocator: std.mem.Allocator, init: std.process.Init, file_path: 
     }
 
     var source: []const u8 = undefined;
-    // Always the canonical spelling (e.g. "src/std/…" even when the bytes come from
-    // ~/.nova/std) so a module's identity — its span.file, prefix, and dedup key — does not
-    // depend on where it was read from.
+
     const resolved_file_path = file_path;
 
     if (std.mem.startsWith(u8, file_path, "src/std/")) {
         source = Io.Dir.readFileAlloc(.cwd(), init.io, file_path, allocator, .unlimited) catch |err| blk: {
             if (err == error.FileNotFound) {
-                // A std module not present under a local `src/std/` (i.e. building a user
-                // project outside the compiler checkout): read it from the installed
-                // `~/.nova/std/`, but KEEP `resolved_file_path` as the canonical "src/std/…"
-                // spelling. That spelling is what becomes each decl's span.file — and thus
-                // its module prefix and the import-dedup key. Using the absolute HOME path
-                // here instead made a std file's identity depend on WHERE it was read from,
-                // so under `nova test` (whose harness/helpers merge shifts emission order) a
-                // stdlib free function like `map.nextPowerOfTwo` got collected under one
-                // spelling and CALLED under another → "Function 'nextPowerOfTwo' not found".
-                // Keeping the canonical spelling makes user-project builds/tests behave
-                // exactly like in-checkout ones.
+
                 const sub = file_path[8..];
                 const home = init.environ_map.get("HOME") orelse init.environ_map.get("USERPROFILE") orelse "/";
                 const abs = try std.fmt.allocPrint(allocator, "{s}/.nova/std/{s}", .{ home, sub });
@@ -1033,12 +893,7 @@ fn loadProgram(allocator: std.mem.Allocator, init: std.process.Init, file_path: 
             return err;
         };
     }
-    // If this file was already collected under its canonical resolved path
-    // (reached earlier via a different spelling — relative "src/std/..." vs
-    // absolute "~/.nova/std/..."), skip it. The checks at the top of this
-    // function only see the raw file_path, so without this a module imported
-    // via two paths gets its declarations collected twice (duplicate functions,
-    // double-run tests, wasted compilation).
+
     if (visited.contains(resolved_file_path)) {
         const already_kv = visiting.fetchRemove(visiting_key);
         if (already_kv) |k| allocator.free(k.key);
@@ -1046,7 +901,6 @@ fn loadProgram(allocator: std.mem.Allocator, init: std.process.Init, file_path: 
         return;
     }
 
-    // Keep source alive for AST node references.
     try file_sources.put(try allocator.dupe(u8, resolved_file_path), source);
 
     var p = try parser.Parser.init(allocator, source, resolved_file_path, is_wasm);
@@ -1071,11 +925,6 @@ fn loadProgram(allocator: std.mem.Allocator, init: std.process.Init, file_path: 
     const visited_key = try allocator.dupe(u8, resolved_file_path);
     try visited.put(visited_key, {});
 
-    // F1-4: KEEP import_decl in the merged declarations (it was stripped here). Each carries the
-    // importing file (span.file) and the imported module name, which is the import GRAPH the symbol
-    // table needs to make module resolution a lookup instead of a file-path reconstruction (see
-    // symbols.zig findModuleBySegment/findFunctionBySegment). Downstream passes skip import_decl via
-    // their `else` arms; sema/symbols.build records the edges.
     for (program.declarations) |decl| {
         try declarations.append(allocator, decl);
     }
@@ -1091,7 +940,6 @@ fn basenameWithoutExtension(path: []const u8, allocator: std.mem.Allocator) ![]c
     return name;
 }
 
-// T5: write `content` to `<project>/<rel>`, creating parent directories as needed.
 fn scaffoldFile(allocator: std.mem.Allocator, io: std.Io, project: []const u8, rel: []const u8, content: []const u8) !void {
     const full = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ project, rel });
     defer allocator.free(full);
@@ -1104,24 +952,22 @@ fn scaffoldFile(allocator: std.mem.Allocator, io: std.Io, project: []const u8, r
     try Io.Dir.writeFile(.cwd(), io, .{ .data = content, .sub_path = full, .flags = .{} });
 }
 
-// T5: `nova init web` — a vertical-slice (VSA) web app. One folder per slice under
-// Features/, a per-feature views/ dir, Domain/ entities, wwwroot/ static assets, tests.
 fn scaffoldWeb(allocator: std.mem.Allocator, io: std.Io, project: []const u8) !void {
     const f = struct { rel: []const u8, content: []const u8 };
     const files = [_]f{
         .{ .rel = "src/main.nova", .content = templates.web_main_sample },
-        // Products / CreateProduct slice
+
         .{ .rel = "src/Features/Products/CreateProduct/command.nova", .content = templates.web_create_command_sample },
         .{ .rel = "src/Features/Products/CreateProduct/response.nova", .content = templates.web_create_response_sample },
         .{ .rel = "src/Features/Products/CreateProduct/validator.nova", .content = templates.web_create_validator_sample },
         .{ .rel = "src/Features/Products/CreateProduct/handler.nova", .content = templates.web_create_handler_sample },
-        // Products / GetProductById slice
+
         .{ .rel = "src/Features/Products/GetProductById/query.nova", .content = templates.web_get_query_sample },
         .{ .rel = "src/Features/Products/GetProductById/response.nova", .content = templates.web_get_response_sample },
         .{ .rel = "src/Features/Products/GetProductById/handler.nova", .content = templates.web_get_handler_sample },
-        // Per-feature view
+
         .{ .rel = "src/Features/Products/views/product_card.nova", .content = templates.web_view_sample },
-        // Domain + static + tests
+
         .{ .rel = "src/Domain/entities/product.nova", .content = templates.web_domain_entity_sample },
         .{ .rel = "wwwroot/index.html", .content = templates.web_index_html_sample },
         .{ .rel = "tests/features/products_test.nova", .content = templates.web_test_sample },
@@ -1129,7 +975,6 @@ fn scaffoldWeb(allocator: std.mem.Allocator, io: std.Io, project: []const u8) !v
     for (files) |file| try scaffoldFile(allocator, io, project, file.rel, file.content);
 }
 
-// T5: `nova init desktop` — a native webview desktop app (W1).
 fn scaffoldDesktop(allocator: std.mem.Allocator, io: std.Io, project: []const u8) !void {
     try scaffoldFile(allocator, io, project, "src/main.nova", templates.desktop_main_sample);
 }
@@ -1140,7 +985,7 @@ fn cmdInit(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
         return;
     }
     var template_type = args[2];
-    // `app` is a deprecated alias for `web` (vertical-slice web app).
+
     if (std.mem.eql(u8, template_type, "app")) {
         std.debug.print("note: `nova init app` is deprecated — use `nova init web` (or `desktop`). Scaffolding a web app.\n", .{});
         template_type = "web";
@@ -1221,7 +1066,6 @@ fn cmdInit(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
     defer allocator.free(project_json_path);
     try Io.Dir.writeFile(.cwd(), init.io, .{ .data = project_json_content, .sub_path = project_json_path, .flags = .{} });
 
-    // A .gitignore so `nova build` artifacts + fetched deps aren't committed (T6).
     const gitignore_path = try std.fmt.allocPrint(allocator, "{s}/.gitignore", .{project_name.?});
     defer allocator.free(gitignore_path);
     Io.Dir.writeFile(.cwd(), init.io, .{ .data = "build/\n*.o\n", .sub_path = gitignore_path, .flags = .{} }) catch {};
@@ -1278,7 +1122,6 @@ fn cmdAddFeature(allocator: std.mem.Allocator, init: std.process.Init, name: []c
     std.debug.print("Feature '{s}' scaffolded and registered successfully.\n", .{name});
 }
 
-/// Collect @test function names from declarations
 fn collectTestFunctions(declarations: []const ast.Declaration, allocator: std.mem.Allocator) ![][]const u8 {
     var test_fns = std.ArrayList([]const u8).empty;
     defer test_fns.deinit(allocator);
@@ -1301,7 +1144,6 @@ fn collectTestFunctions(declarations: []const ast.Declaration, allocator: std.me
     return try test_fns.toOwnedSlice(allocator);
 }
 
-/// Generate a synthetic test harness main() that calls all @test functions
 fn generateTestHarness(test_fn_names: []const []const u8, allocator: std.mem.Allocator) ![]const u8 {
     var src = std.ArrayList(u8).empty;
     defer src.deinit(allocator);
@@ -1330,9 +1172,7 @@ fn generateTestHarness(test_fn_names: []const []const u8, allocator: std.mem.All
 
     try src.appendSlice(allocator, "    console.log(\"\");\n");
     try src.appendSlice(allocator, "    console.log(\"Results: \" + __test_passed + \" passed, \" + __test_failed + \" failed, \" + __test_total + \" total\");\n");
-    // F5 §3.5.1: under NOVA_ARC_AUDIT a LEAK IS A TEST FAILURE. Returns 0 when the
-    // audit is off, so this is unconditional — an opt-in check that only runs under
-    // a flag someone remembers to set is a check that does not run.
+
     try src.appendSlice(allocator, "    if (nova_arc_audit_report() > 0) {\n");
     try src.appendSlice(allocator, "        nova_exit(1);\n");
     try src.appendSlice(allocator, "    }\n");
@@ -1373,11 +1213,6 @@ fn findNovaFiles(allocator: std.mem.Allocator, io: Io, root_dir: Io.Dir, sub_pat
     }
 }
 
-// T4: `nova fmt` is a from-AST re-serializer and is not yet complete for every construct
-// (comments are dropped; a few features don't round-trip). To make it NON-DESTRUCTIVE, the
-// formatted output's meaningful-token stream is compared to the original's; if they differ,
-// the format is REJECTED and the file left untouched. So `nova fmt` can never corrupt code —
-// at worst it leaves a file unchanged (reported), never silently rewrites it wrong.
 fn sameTokenStream(a: []const u8, b: []const u8) bool {
     var la = lexer.Lexer.init(a);
     var lb = lexer.Lexer.init(b);
@@ -1390,9 +1225,6 @@ fn sameTokenStream(a: []const u8, b: []const u8) bool {
     }
 }
 
-/// The (start, end) byte span of every non-EOF code token in `text`, using the lexer's
-/// `tok_start`/`pos`. Robust for punctuation (whose lexemes are static literals) and for
-/// strings (whose lexemes may be escape-processed) — both would defeat pointer arithmetic.
 const TokenSpan = struct { start: usize, end: usize };
 
 fn codeTokenSpans(allocator: std.mem.Allocator, text: []const u8) ![]TokenSpan {
@@ -1408,18 +1240,11 @@ fn codeTokenSpans(allocator: std.mem.Allocator, text: []const u8) ![]TokenSpan {
 }
 
 const CommentIns = struct {
-    offset: usize, // where to splice into the FORMATTED text
-    text: []const u8, // the rendered insertion (owned)
-    order: usize, // stable tiebreaker for equal offsets
+    offset: usize,
+    text: []const u8,
+    order: usize,
 };
 
-/// Re-inject the source's comments into `formatted`. The AST formatter drops comments
-/// but preserves the exact CODE-token sequence (the caller has already asserted token
-/// equivalence), so both texts share one token stream. Each source comment lives in a
-/// whitespace gap between two code tokens; we find the same gap in `formatted` and splice
-/// the comment in — as a trailing `// …` on the previous token's line, or on its own line
-/// (at the next token's indentation) if it stood alone. Never alters a code token, so the
-/// result stays token-equivalent.
 fn reinjectComments(allocator: std.mem.Allocator, source: []const u8, formatted: []const u8) ![]u8 {
     const s_spans = try codeTokenSpans(allocator, source);
     defer allocator.free(s_spans);
@@ -1427,15 +1252,13 @@ fn reinjectComments(allocator: std.mem.Allocator, source: []const u8, formatted:
     defer allocator.free(f_spans);
 
     const n = s_spans.len;
-    // Defensive: if the token counts disagree (shouldn't, given the guard) don't risk a
-    // misplaced comment — return the formatted text unchanged.
+
     if (n != f_spans.len) return allocator.dupe(u8, formatted);
 
     var inserts = std.ArrayList(CommentIns).empty;
     defer inserts.deinit(allocator);
     var order: usize = 0;
 
-    // Walk every gap [prev-token-end, next-token-start], i in 0..=n (i==n = tail region).
     var i: usize = 0;
     while (i <= n) : (i += 1) {
         const gap_start = if (i == 0) 0 else s_spans[i - 1].end;
@@ -1474,8 +1297,7 @@ fn reinjectComments(allocator: std.mem.Allocator, source: []const u8, formatted:
                 j = k;
                 seen_nl = false;
             } else {
-                // A non-ws, non-comment byte inside a token gap shouldn't happen; bail out
-                // of this gap rather than risk a misread.
+
                 break;
             }
         }
@@ -1483,7 +1305,6 @@ fn reinjectComments(allocator: std.mem.Allocator, source: []const u8, formatted:
 
     if (inserts.items.len == 0) return allocator.dupe(u8, formatted);
 
-    // Stable-sort insertions by splice offset (insertion order breaks ties).
     std.mem.sort(CommentIns, inserts.items, {}, struct {
         fn lt(_: void, a: CommentIns, b: CommentIns) bool {
             if (a.offset != b.offset) return a.offset < b.offset;
@@ -1501,7 +1322,7 @@ fn reinjectComments(allocator: std.mem.Allocator, source: []const u8, formatted:
         cursor = off;
     }
     if (cursor < formatted.len) try out.appendSlice(allocator, formatted[cursor..]);
-    // Free the per-insertion rendered strings.
+
     for (inserts.items) |ins| allocator.free(ins.text);
     return out.toOwnedSlice(allocator);
 }
@@ -1518,13 +1339,13 @@ fn appendCommentInsert(
     trailing: bool,
 ) !void {
     if (trailing and i >= 1) {
-        // End of the line holding the previous token in the formatted output.
+
         const base = f_spans[i - 1].start;
         const line_end = std.mem.indexOfScalarPos(u8, formatted, base, '\n') orelse formatted.len;
         const rendered = try std.fmt.allocPrint(allocator, " {s}", .{text});
         try inserts.append(allocator, .{ .offset = line_end, .text = rendered, .order = order.* });
     } else if (i < n) {
-        // Its own line, before the next token, at that line's indentation.
+
         const base = f_spans[i].start;
         const line_start = if (std.mem.lastIndexOfScalar(u8, formatted[0..base], '\n')) |nl| nl + 1 else 0;
         var ind_end = line_start;
@@ -1533,7 +1354,7 @@ fn appendCommentInsert(
         const rendered = try std.fmt.allocPrint(allocator, "{s}{s}\n", .{ indent, text });
         try inserts.append(allocator, .{ .offset = line_start, .text = rendered, .order = order.* });
     } else {
-        // After the last token (tail of file).
+
         const rendered = try std.fmt.allocPrint(allocator, "{s}\n", .{text});
         try inserts.append(allocator, .{ .offset = formatted.len, .text = rendered, .order = order.* });
     }
@@ -1557,7 +1378,6 @@ fn formatFile(allocator: std.mem.Allocator, init: std.process.Init, file_path: [
     const formatted = try f.formatProgram(program);
     defer allocator.free(formatted);
 
-    // Non-destructive guard: only write if the meaningful tokens are unchanged.
     if (!sameTokenStream(source, formatted)) {
         if (init.environ_map.get("NOVA_FMT_DEBUG") != null) {
             var la = lexer.Lexer.init(source);
@@ -1576,8 +1396,6 @@ fn formatFile(allocator: std.mem.Allocator, init: std.process.Init, file_path: [
         return;
     }
 
-    // Re-inject comments the AST formatter dropped, then re-check the guard defensively
-    // (comment splicing only touches whitespace gaps, so it must stay token-equivalent).
     const with_comments = try reinjectComments(allocator, source, formatted);
     defer allocator.free(with_comments);
     if (!sameTokenStream(source, with_comments)) {
@@ -1624,7 +1442,6 @@ const ProjectJson = struct {
     dependencies: [][]const u8,
 };
 
-/// The repository (directory) name a git URL clones into: last path segment, `.git` stripped.
 fn repoNameFromUrl(git_url: []const u8) ?[]const u8 {
     var len = git_url.len;
     while (len > 0 and git_url[len - 1] == '/') len -= 1;
@@ -1636,8 +1453,6 @@ fn repoNameFromUrl(git_url: []const u8) ?[]const u8 {
     return repo;
 }
 
-/// Clone `git_url` into `~/.nova/cache/<repo>` unless it is already present. Returns true if a
-/// clone actually happened (false = cache hit, nothing fetched).
 fn cloneIntoCache(allocator: std.mem.Allocator, init: std.process.Init, git_url: []const u8) !bool {
     const repo_name = repoNameFromUrl(git_url) orelse {
         std.debug.print("Invalid git URL format: {s}\n", .{git_url});
@@ -1647,7 +1462,6 @@ fn cloneIntoCache(allocator: std.mem.Allocator, init: std.process.Init, git_url:
     const target_dir = try std.fs.path.join(allocator, &[_][]const u8{ home_path, ".nova", "cache", repo_name });
     defer allocator.free(target_dir);
 
-    // Idempotent: a present cache dir is a hit — don't re-clone (and don't clobber).
     if (Io.Dir.access(.cwd(), init.io, target_dir, .{})) |_| {
         std.debug.print("  {s} already cached ({s})\n", .{ repo_name, target_dir });
         return false;
@@ -1671,7 +1485,6 @@ fn cloneIntoCache(allocator: std.mem.Allocator, init: std.process.Init, git_url:
     return true;
 }
 
-/// `nova get` with no URL: restore every dependency listed in `project.json` into the cache.
 fn cmdRestore(allocator: std.mem.Allocator, init: std.process.Init) !void {
     const json_data = Io.Dir.readFileAlloc(.cwd(), init.io, "project.json", allocator, .unlimited) catch {
         std.debug.print("Error: project.json not found. Run 'nova init' first.\n", .{});
@@ -1702,7 +1515,7 @@ fn cmdRestore(allocator: std.mem.Allocator, init: std.process.Init) !void {
 
 fn cmdGet(allocator: std.mem.Allocator, init: std.process.Init, args: []const []const u8) !void {
     if (args.len < 3) {
-        // No URL → restore all manifest dependencies.
+
         return cmdRestore(allocator, init);
     }
     const git_url = args[2];
@@ -1754,9 +1567,9 @@ fn cmdGet(allocator: std.mem.Allocator, init: std.process.Init, args: []const []
 }
 
 fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const []const u8) !void {
-    // Parse args: nova test [file.nova] [--native|--wasm]
+
     var file_path: []const u8 = "";
-    var target: []const u8 = "--native"; // default to native for tests
+    var target: []const u8 = "--native";
 
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
@@ -1817,7 +1630,6 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
 
     const is_wasm = std.mem.eql(u8, target, "--wasm");
 
-    // Preload string_builder standard library
     loadProgram(allocator, init, "src/std/collections/string_builder.nova", &visited, &visiting, &merged, &declarations, is_wasm, &file_sources) catch |err| {
         std.debug.print("Warning: Failed to load string_builder in test harness: {any}\n", .{err});
     };
@@ -1825,20 +1637,11 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
     for (file_paths.items) |path| {
         loadProgram(allocator, init, path, &visited, &visiting, &merged, &declarations, is_wasm, &file_sources) catch |err| {
             std.debug.print("Failed to load program {s}: {any}\n", .{ path, err });
-            // ⚠️ `return err`, not `return`. This swallowed the error and returned NORMALLY, so
-            // **every parse error in `nova test` exited 0** — a file that fails to parse reported
-            // SUCCESS, and CI would go green on a syntax error. The positive-case path in
-            // conformance/run.sh happened to survive it (a parse failure prints no `Results:`
-            // line, and that check requires one), so this only ever bit the negative cases —
-            // which, until 2026-07-17, judged on exit code alone and so could not see it either.
-            // Found the moment `throw_removed.nova` became the corpus's first `EXPECT-FAIL: parse`
-            // case and the reason-classifier reported "COMPILED-AND-RAN" for an obvious parser
-            // error. main's `userErrorHint` maps ExpectedToken/UnexpectedToken to a clean exit 1.
+
             return err;
         };
     }
 
-    // Discover @test functions
     const test_fn_names = try collectTestFunctions(declarations.items, allocator);
     if (test_fn_names.len == 0) {
         if (file_path.len == 0) {
@@ -1850,10 +1653,8 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
     }
     std.debug.print("Found {d} test function(s)\n", .{test_fn_names.len});
 
-    // Generate test harness main()
     const harness_src = try generateTestHarness(test_fn_names, allocator);
 
-    // Remove any existing main() from declarations
     var filtered_decls = std.ArrayList(ast.Declaration).empty;
     defer filtered_decls.deinit(allocator);
     for (declarations.items) |decl| {
@@ -1866,13 +1667,11 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
         }
     }
 
-    // Parse the harness source and add to declarations
     var harness_parser = try parser.Parser.init(allocator, harness_src, "test_harness.nova", is_wasm);
     defer harness_parser.deinit();
     const harness_prog = try harness_parser.parseProgram();
     try filtered_decls.appendSlice(allocator, harness_prog.declarations);
 
-    // Add compiler helpers (same as regular compilation)
     const helpers =
         \\fn __log_i32(val: i32): void {
         \\    console.log(`${val}`);
@@ -1910,15 +1709,8 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
     };
     std.debug.print("Parsed {d} top-level declaration(s).\n", .{program.declarations.len});
 
-    // F1: lexical block scope by alpha-renaming (specs §10 #23). Must run before
-    // the checker and codegen, both of which assume one flat namespace per
-    // function — an assumption this pass makes TRUE by giving every shadowing
-    // binding a distinct name. Non-shadowing code is left byte-identical.
     try sema_alpha.run(allocator, program);
 
-    // F2 stage 4a: stamp every Expression with a copy-surviving id. Must run
-    // before BOTH sema and codegen: codegen takes Expression by value, so the IR
-    // can only be keyed on something that survives the copy (sema/ids.zig).
     var id_assigner = sema_ids.Assigner.init();
     try id_assigner.run(program);
 
@@ -1927,59 +1719,23 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
     tc.is_wasm = is_wasm;
     try tc.check(program);
 
-    // F1/F2 shadow, mirroring the `nova <file>` path at ~:1330. It lives in BOTH
-    // because this is the pipeline that actually compiles the conformance corpus:
-    // `nova <file>` currently dies in codegen on nova_test_fail for any program,
-    // so the other copy's report can never fire, and a measurement you cannot run
-    // is not a measurement. Report-only and env-gated.
-    // F2 stage 4c: main OWNS sema's artefacts.
-    //
-    // The owner is declared HERE, at function scope, not inside the `if` below —
-    // codegen runs after that block and reads the IR through `live_ir`, so a
-    // block-scoped `defer sm.destroy()` frees it out from under codegen. That is a
-    // use-after-free, and freed memory usually still reads fine, so the corpus
-    // would stay green and hide it. It is precisely the bug stage 2i documented
-    // when it chose to leak instead — the fix is an owner with the RIGHT lifetime,
-    // not a longer one.
-    // F2 stage 4c: SEMA RUNS ON EVERY COMPILE, and codegen reads its types.
-    //
-    // No longer gated. The evidence, on the whole corpus: emitted IR BYTE-IDENTICAL
-    // with the cutover on, 28/28, 97.3% of resolutions answered from the IR, and —
-    // once type names were interned — no measurable time cost (+0.2 MB RSS). What
-    // used to make this a decision was sema leaking its artefacts; it now owns them
-    // (sema/sema.zig), so there is nothing left to weigh.
-    //
-    // The REPORTS stay opt-in (NOVA_SEMA_SHADOW=1): a compiler that narrates its
-    // own type inference on every build is unusable. Building and reporting are
-    // different decisions — conflating them is what kept sema off by default.
     sema_shadow.report_enabled = init.environ_map.get("NOVA_SEMA_SHADOW") != null;
-    sema_shadow.trace_resolution = sema_shadow.report_enabled; // the DIFF costs; opt-in
-    sema_shadow.f2_types_enabled = true; // no legacy to fall back to (4d)
+    sema_shadow.trace_resolution = sema_shadow.report_enabled;
+    sema_shadow.f2_types_enabled = true;
 
     const owned_sema = try sema_mod.Sema.create(allocator);
-    defer owned_sema.destroy(); // function scope: codegen reads it after this block
+    defer owned_sema.destroy();
     sema_shadow.run(allocator, program, owned_sema) catch |e| {
         std.debug.print("sema failed: {any}\n", .{e});
     };
 
-    // F4 stage 3: compute the instantiation set and REPORT it. Emits nothing —
-    // §3.5 item 3 wants the growth measured before monomorphization is written, not
-    // after a commit that says "correctness" makes the compiler 8x bigger.
-    //
-    // F4 4b: and now something reads it. The worklist must therefore run when EMISSION
-    // wants it, not only when the report does — `report_enabled` was the condition for
-    // printing, and reusing it as the condition for compiling would make the emitted
-    // program depend on whether a debug env var was set.
-    // F4 4b: the worklist ALWAYS runs — monomorphization is not optional (see
-    // sema/mono.zig). `report_enabled` gates only the printing.
     {
         var wl = sema_mono.Worklist.init(allocator, owned_sema);
         defer wl.deinit();
         wl.compute(program) catch |e| std.debug.print("F4 worklist failed: {any}\n", .{e});
         sema_mono.live_instantiations = wl.names(allocator) catch null;
         if (sema_shadow.report_enabled) wl.report();
-        // F4 erased-body elimination: record each expr's CONCRETE disposition per instantiation, so
-        // codegen reads it in a monomorphized body instead of re-deriving via the keystoneSubst side-channel.
+
         if (wl.instIds(allocator) catch null) |ids| {
             defer allocator.free(ids);
             @import("sema/inst_disp.zig").run(allocator, &owned_sema.store, &owned_sema.tab, &owned_sema.ir, ids);
@@ -2009,14 +1765,6 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
     const shared_nova = try std.fmt.allocPrint(allocator, "{s}/.nova", .{ home });
     const shared_nova_arg = try std.fmt.allocPrint(allocator, "-I{s}", .{shared_nova});
 
-    // NOVA_ASAN=1 links the AddressSanitizer runtime (built by `NOVA_ASAN=1 zig build`).
-    //
-    // The class of bug this exists for: ARC decides ownership by string-matching a rendered
-    // type name, and guesses when the name is unknown — so a confused compiler emits a release
-    // of live memory or a use of freed memory. `nova_release` on a freed object reads the
-    // refcount at ptr-8 and returns quietly on the sentinel; the damage only surfaces once
-    // malloc reuses the block and it decrements a DIFFERENT object's count, crashing somewhere
-    // unrelated. ASAN reports that read AT the release, naming the free site too.
     const asan = if (init.environ_map.get("NOVA_ASAN")) |v| !std.mem.eql(u8, v, "0") else false;
 
     var test_clang_args = std.ArrayList([]const u8).empty;
@@ -2025,8 +1773,7 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
     try test_clang_args.append(allocator, "-g");
     try test_clang_args.append(allocator, "-O0");
     try test_clang_args.append(allocator, "-pthread");
-    // T6/Phase-2 dead-code strip (see linkNativeInProcessMacho): drop functions/globals unreferenced
-    // from the entry point. Mach-O: -dead_strip (atomised, no -ffunction-sections needed). ELF: --gc-sections.
+
     try test_clang_args.append(allocator, dead_strip_flag);
     try test_clang_args.append(allocator, "-I.");
     try test_clang_args.append(allocator, shared_nova_arg);
@@ -2035,22 +1782,17 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
         try test_clang_args.append(allocator, "-fno-omit-frame-pointer");
     }
 
-    for (link_objs) |o| try test_clang_args.append(allocator, o); // T6 split: one or many object files
+    for (link_objs) |o| try test_clang_args.append(allocator, o);
 
-    // Link the prebuilt C++ runtime static lib + Boost (fiber concurrency).
-    // BOOST_PREFIX/lib is the Homebrew macOS default; configurable per platform.
     const test_nova_lib = try std.fmt.allocPrint(allocator, "-L{s}/lib", .{shared_nova});
     try test_clang_args.append(allocator, test_nova_lib);
-    // The ASAN runtime is a SEPARATE archive: mixing an instrumented object with a plain
-    // libnova_runtime.a would leave the allocator uninstrumented, which is the half that
-    // matters here (nova_release reads the header of a freed block).
+
     try test_clang_args.append(allocator, if (asan) "-lnova_runtime_asan" else "-lnova_runtime");
-    try test_clang_args.append(allocator, "-lz"); // W7 gzip (zlib)
-    // M3-D: Boost.Asio is header-only; the abandoned Boost.Fiber attempt is not
-    // compiled, so no -lboost_* is needed. Keep -L for any transitive boost_system.
+    try test_clang_args.append(allocator, "-lz");
+
     try test_clang_args.append(allocator, "-L/opt/homebrew/lib");
     try appendWolfsslLink(&test_clang_args, allocator, shared_nova, init.io);
-    // T3 FFI: link flags for every library named by an `extern("lib") fn` in the test program.
+
     for (try collectFfiLibs(allocator, program)) |lib| {
         try appendFfiLib(&test_clang_args, allocator, shared_nova, init.io, lib);
     }
@@ -2075,17 +1817,12 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
     }
     Io.Dir.deleteFile(.cwd(), init.io, obj_path) catch {};
 
-    // Run the test binary
     std.debug.print("\n", .{});
     var test_child = try std.process.spawn(init.io, .{
         .argv = &[_][]const u8{"./__nova_test"},
     });
     const test_term = try test_child.wait(init.io);
-    // Remember rather than exit here: the test binary still has to be cleaned up
-    // below. `nova test` printed "Test suite FAILED" and then returned 0 anyway, so
-    // a failing suite looked green to anything judging by exit code — which is what
-    // CI does, and what conformance/run.sh's own comment says it does. run.sh only
-    // survived because it ALSO greps the "Results: ... 0 failed" line.
+
     var suite_failed = false;
     switch (test_term) {
         .exited => |code| {
@@ -2100,12 +1837,6 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
         },
     }
 
-    // Clean up test binary
-    // Io.Dir.deleteFile(.cwd(), init.io, "__nova_test") catch {};
-
-    // Propagate the failure, AFTER cleanup. A test runner that reports success
-    // when tests failed is worse than no test runner: everything downstream of it
-    // is measuring nothing.
     if (suite_failed) std.process.exit(1);
 }
 
@@ -2114,11 +1845,6 @@ fn getFileMtime(io: Io, path: []const u8) !i96 {
     return stat.mtime.nanoseconds;
 }
 
-// A stamp for the linked static libraries the Nova sources are NOT — the prebuilt C++ runtime (and
-// wolfSSL). A source-content hash alone misses a RUNTIME-only change: edit `src/runtime/`, `zig build`
-// re-syncs `~/.nova/lib/libnova_runtime.a`, but the .nova sources are byte-identical, so the T6 cache
-// would report "up to date" and keep the OLD runtime linked in. Folding each lib's mtime into the cache
-// key makes a runtime change invalidate the cache and force a relink. Missing lib → 0 (no effect).
 fn linkLibsStamp(allocator: std.mem.Allocator, init: std.process.Init) u64 {
     const home = init.environ_map.get("HOME") orelse init.environ_map.get("USERPROFILE") orelse "/";
     const libs = [_][]const u8{
@@ -2129,16 +1855,12 @@ fn linkLibsStamp(allocator: std.mem.Allocator, init: std.process.Init) u64 {
     for (libs) |suffix| {
         const path = std.fmt.allocPrint(allocator, "{s}{s}", .{ home, suffix }) catch continue;
         defer allocator.free(path);
-        const mt = getFileMtime(init.io, path) catch continue; // absent lib → skip (0 contribution)
+        const mt = getFileMtime(init.io, path) catch continue;
         acc ^= @as(u64, @bitCast(@as(i64, @truncate(mt))));
     }
     return acc;
 }
 
-// T6 cache key: an order-independent digest of every input file's (path + content), folded with
-// the profile, a CACHE_VERSION, and the linked-runtime stamp. XOR of per-file hashes is
-// order-independent (the file set is a hashmap). Bump CACHE_VERSION when codegen changes in a way an
-// unchanged source must rebuild for.
 const CACHE_VERSION: u64 = 1;
 fn sourcesHash(file_sources: *std.StringHashMap([]const u8), is_release: bool, link_stamp: u64) u64 {
     var acc: u64 = CACHE_VERSION ^ link_stamp ^ (if (is_release) @as(u64, 0x9e3779b97f4a7c15) else 0);
@@ -2162,9 +1884,7 @@ fn compileProgram(
     is_release: bool,
     target_triple_opt: ?[]const u8,
     visited: *std.StringHashMap(void),
-    // T6: when build_mode, the object goes to build_obj_dir and a content-hash of the input
-    // files is cached in build_hash_path — an unchanged build is skipped. All empty/false for the
-    // direct `nova <file> -o` path, which behaves exactly as before.
+
     build_mode: bool,
     build_obj_dir: []const u8,
     build_hash_path: []const u8,
@@ -2188,23 +1908,18 @@ fn compileProgram(
 
     const is_wasm = std.mem.eql(u8, target, "--wasm");
 
-    // Preload string_builder standard library
     loadProgram(allocator, init, "src/std/collections/string_builder.nova", visited, &visiting, &merged, &declarations, is_wasm, &file_sources) catch |err| {
         std.debug.print("Warning: Failed to load string_builder standard library: {any}\n", .{err});
     };
 
     try loadProgram(allocator, init, file_path, visited, &visiting, &merged, &declarations, is_wasm, &file_sources);
-    // `merged.nova` is a DEBUG DUMP, not a compile input (codegen runs off `declarations`). It used to
-    // be written on every compile, cluttering the CWD; now opt-in via NOVA_DUMP_MERGED=1. (T6.)
+
     if (init.environ_map.get("NOVA_DUMP_MERGED") != null) {
         _ = Io.Dir.writeFile(.cwd(), init.io, .{ .data = merged.items, .sub_path = "merged.nova", .flags = .{} }) catch |err| {
             std.debug.print("Failed to write merged.nova: {s}\n", .{@errorName(err)});
         };
     }
 
-    // T6: content-hash cache — an unchanged build is skipped. The parse above is cheap; codegen +
-    // link is the expensive part this guards. Cache HIT requires both a matching hash AND an existing
-    // output binary (so a deleted binary rebuilds).
     var src_hash: u64 = 0;
     if (build_mode) {
         src_hash = sourcesHash(&file_sources, is_release, linkLibsStamp(allocator, init));
@@ -2265,14 +1980,8 @@ fn compileProgram(
     };
     std.debug.print("Parsed {d} top-level declaration(s).\n", .{program.declarations.len});
 
-    // F1: lexical block scope by alpha-renaming (specs §10 #23). NOTE: this
-    // pipeline is DUPLICATED (the `nova test` path does the same at ~:1117), so a
-    // pass added to only one silently does not run in the other. That is how the
-    // first cut of this change appeared to do nothing.
     try sema_alpha.run(allocator, program);
 
-    // F2 stage 4a: stamp every Expression with a copy-surviving id (see the note
-    // above — this is deliberately in BOTH pipelines).
     var id_assigner = sema_ids.Assigner.init();
     try id_assigner.run(program);
 
@@ -2281,54 +1990,23 @@ fn compileProgram(
     tc.is_wasm = is_wasm;
     try tc.check(program);
 
-    // F1 stage 1: build the symbol table alongside legacy resolution and diff them.
-    // Report-only and env-gated — changes nothing (docs/design/F1 §5 stage 1).
-    // F2 stage 4c: main OWNS sema's artefacts.
-    //
-    // The owner is declared HERE, at function scope, not inside the `if` below —
-    // codegen runs after that block and reads the IR through `live_ir`, so a
-    // block-scoped `defer sm.destroy()` frees it out from under codegen. That is a
-    // use-after-free, and freed memory usually still reads fine, so the corpus
-    // would stay green and hide it. It is precisely the bug stage 2i documented
-    // when it chose to leak instead — the fix is an owner with the RIGHT lifetime,
-    // not a longer one.
-    // F2 stage 4c: SEMA RUNS ON EVERY COMPILE, and codegen reads its types.
-    //
-    // No longer gated. The evidence, on the whole corpus: emitted IR BYTE-IDENTICAL
-    // with the cutover on, 28/28, 97.3% of resolutions answered from the IR, and —
-    // once type names were interned — no measurable time cost (+0.2 MB RSS). What
-    // used to make this a decision was sema leaking its artefacts; it now owns them
-    // (sema/sema.zig), so there is nothing left to weigh.
-    //
-    // The REPORTS stay opt-in (NOVA_SEMA_SHADOW=1): a compiler that narrates its
-    // own type inference on every build is unusable. Building and reporting are
-    // different decisions — conflating them is what kept sema off by default.
     sema_shadow.report_enabled = init.environ_map.get("NOVA_SEMA_SHADOW") != null;
-    sema_shadow.trace_resolution = sema_shadow.report_enabled; // the DIFF costs; opt-in
-    sema_shadow.f2_types_enabled = true; // no legacy to fall back to (4d)
+    sema_shadow.trace_resolution = sema_shadow.report_enabled;
+    sema_shadow.f2_types_enabled = true;
 
     const owned_sema = try sema_mod.Sema.create(allocator);
-    defer owned_sema.destroy(); // function scope: codegen reads it after this block
+    defer owned_sema.destroy();
     sema_shadow.run(allocator, program, owned_sema) catch |e| {
         std.debug.print("sema failed: {any}\n", .{e});
     };
 
-    // F4 stage 3: compute the instantiation set and REPORT it. Emits nothing —
-    // §3.5 item 3 wants the growth measured before monomorphization is written, not
-    // after a commit that says "correctness" makes the compiler 8x bigger.
-    // F4 4b: `build` monomorphizes on the same terms as `test`. A flag that changed
-    // what `nova test` emits but not `nova build` would make the corpus prove a
-    // program that never ships — the same shape of gap as the stale installed binary
-    // that reported 28/28 while the real compiler crashed.
-    // F4 4b: the worklist ALWAYS runs — monomorphization is not optional (see
-    // sema/mono.zig). `report_enabled` gates only the printing.
     {
         var wl = sema_mono.Worklist.init(allocator, owned_sema);
         defer wl.deinit();
         wl.compute(program) catch |e| std.debug.print("F4 worklist failed: {any}\n", .{e});
         sema_mono.live_instantiations = wl.names(allocator) catch null;
         if (sema_shadow.report_enabled) wl.report();
-        // F4 erased-body elimination: per-instantiation concrete dispositions (see the test-path twin).
+
         if (wl.instIds(allocator) catch null) |ids| {
             defer allocator.free(ids);
             @import("sema/inst_disp.zig").run(allocator, &owned_sema.store, &owned_sema.tab, &owned_sema.ir, ids);
@@ -2340,7 +2018,6 @@ fn compileProgram(
         defer allocator.free(obj_path);
         try llvm_codegen.compile(allocator, program, true, is_release, target_triple_opt, obj_path, false, init.environ_map.get("NOVA_T6_SPLIT") != null, null, null, init.io);
 
-        // In-process LLD: link the wasm module ourselves via wasm-ld, no clang shell-out.
         if (build_options.inprocess_lld) {
             try linkWasmInProcess(allocator, obj_path, output_path);
             Io.Dir.deleteFile(.cwd(), init.io, obj_path) catch {};
@@ -2367,20 +2044,13 @@ fn compileProgram(
         Io.Dir.deleteFile(.cwd(), init.io, obj_path) catch {};
         std.debug.print("WASM output written to {s}\n", .{output_path});
     } else if (std.mem.eql(u8, target, "--native")) {
-        // T6: in build_mode the object lives in build/<profile>/obj/<name>.o (persistent, in the
-        // build tree); otherwise it's a throwaway `<output>.o` next to the binary (deleted after link).
+
         const obj_path = if (build_mode)
             try std.fmt.allocPrint(allocator, "{s}/{s}.o", .{ build_obj_dir, std.fs.path.basename(output_path) })
         else
             try std.fmt.allocPrint(allocator, "{s}.o", .{output_path});
         defer allocator.free(obj_path);
-        // T6 Phase 1b/Stage C: per-file object split emits one object PER SOURCE FILE (into
-        // `split_objs`), linked together, so a one-file edit rebuilds one object (the rest come from
-        // the content-hash cache in build/<profile>/obj). It is now the DEFAULT for `nova build`
-        // (build_mode) — that's where the persistent cache lives and dev iteration benefits.
-        // `NOVA_T6_NOSPLIT=1` forces the single-module path (useful for a one-shot cold/CI build,
-        // ~18% faster cold since it skips per-file clone+emit+link). For throwaway `--native`
-        // single-file compiles (no cache dir) the split has no upside, so it stays opt-in there.
+
         const t6_split = if (build_mode)
             init.environ_map.get("NOVA_T6_NOSPLIT") == null
         else
@@ -2406,7 +2076,7 @@ fn compileProgram(
 
         try clang_args.append(allocator, "clang++");
         try clang_args.append(allocator, "-std=c++20");
-        // T6/Phase-2 dead-code strip: drop unreferenced functions/globals from the linked binary.
+
         try clang_args.append(allocator, dead_strip_flag);
         if (target_triple_opt) |triple| {
             try clang_args.append(allocator, "-target");
@@ -2425,12 +2095,8 @@ fn compileProgram(
         const home = init.environ_map.get("HOME") orelse init.environ_map.get("USERPROFILE") orelse "/";
         const shared_nova = try std.fmt.allocPrint(allocator, "{s}/.nova", .{ home });
 
-        // T3 FFI: gather the distinct libraries named by `extern("lib") fn` decls; each
-        // becomes a `-l<lib>` on the link line so the foreign symbols resolve.
         const ffi_libs = try collectFfiLibs(allocator, program);
 
-        // T1: an explicit NON-host target routes through the bundled Zig toolchain (cross ELF/COFF,
-        // bundled libc). Returns false for the native-host target, falling through to the paths below.
         if (target_triple_opt) |triple| {
             if (try crossLinkViaZig(allocator, init.environ_map, init.io, triple, link_objs, output_path, shared_nova, is_release)) {
                 if (init.environ_map.get("NOVA_KEEP_OBJ") == null and !build_mode)
@@ -2447,10 +2113,9 @@ fn compileProgram(
             }
         }
 
-        // In-process LLD: link the executable ourselves, no clang/ld shell-out.
         if (build_options.inprocess_lld and builtin.target.os.tag == .macos and target_triple_opt == null) {
             try linkNativeInProcessMacho(allocator, init.environ_map, init.io, link_objs, output_path, shared_nova, ffi_libs);
-            // build_mode keeps the object in build/<profile>/obj/ (persistent); else delete it.
+
             if (init.environ_map.get("NOVA_KEEP_OBJ") == null and !build_mode)
                 Io.Dir.deleteFile(.cwd(), init.io, obj_path) catch {};
             if (build_mode) {
@@ -2465,13 +2130,12 @@ fn compileProgram(
         const shared_nova_arg = try std.fmt.allocPrint(allocator, "-I{s}", .{shared_nova});
         try clang_args.append(allocator, shared_nova_arg);
 
-        for (link_objs) |o| try clang_args.append(allocator, o); // T6 split: one or many object files
+        for (link_objs) |o| try clang_args.append(allocator, o);
 
-        // Link the prebuilt C++ runtime static lib + Boost (fiber concurrency).
         const nova_lib = try std.fmt.allocPrint(allocator, "-L{s}/lib", .{shared_nova});
         try clang_args.append(allocator, nova_lib);
         try clang_args.append(allocator, "-lnova_runtime");
-        try clang_args.append(allocator, "-lz"); // W7 gzip (zlib)
+        try clang_args.append(allocator, "-lz");
         try clang_args.append(allocator, "-L/opt/homebrew/lib");
         try appendWolfsslLink(&clang_args, allocator, shared_nova, init.io);
         for (ffi_libs) |lib| {
@@ -2496,9 +2160,7 @@ fn compileProgram(
                 return error.LinkFailed;
             },
         }
-        // NOVA_KEEP_OBJ=1 keeps the intermediate object so it can be re-linked by hand — e.g.
-        // against a sanitizer build of the runtime when chasing a memory bug. build_mode also keeps
-        // it (in build/<profile>/obj/).
+
         if (init.environ_map.get("NOVA_KEEP_OBJ") == null and !build_mode) {
             Io.Dir.deleteFile(.cwd(), init.io, obj_path) catch {};
         } else if (!build_mode) {
@@ -2518,28 +2180,12 @@ fn compileProgram(
     }
 }
 
-/// A compile error the USER caused, as opposed to a bug in the compiler.
-///
-/// Both used to look identical from outside: an unhandled Zig error propagating out of `main`,
-/// so the Zig runtime printed a compiler stack trace. That meant even a perfectly good diagnostic
-/// ("Type checking failed with 1 error(s): …") was followed by ~20 lines of `llvm_codegen.zig:868`
-/// backtrace, which reads as "the compiler crashed" to anyone who did not write the compiler.
-///
-/// The diagnostic text itself is printed at the point of detection (the checker, the resolver, the
-/// codegen site). This function only decides "is this the user's fault?" — if so `main` exits 1
-/// quietly, and the message already on screen is the whole output. A genuine internal error still
-/// propagates and still gets its stack trace, which is exactly when one is wanted.
-///
-/// ⚠️ The `codegen`-detected members are DEBT, not the destination: they fire late and carry no
-/// source span, so the user gets a name but no `file:line`. The real fix is F1 stage 7 ("N3: failure
-/// is an error") and F2 stage 5 ("`.unresolved` is fatal"), which move them into sema where spans
-/// exist. Recorded in beta-readiness-plan.md P0-5. (2026-07-17)
 fn userErrorHint(e: anyerror) ?[]const u8 {
     return switch (e) {
-        // Detected in sema/the checker — a real diagnostic with file:line:col was already printed.
+
         error.TypeCheckError => "",
         error.ExpectedToken, error.UnexpectedToken => "",
-        // Detected in codegen — a message was printed, but without a source span.
+
         error.IdentifierNotFound => "undefined identifier",
         error.FunctionNotFound => "undefined function",
         error.VariableNotFound => "undefined variable",
@@ -2554,14 +2200,13 @@ fn userErrorHint(e: anyerror) ?[]const u8 {
 pub fn main(init: std.process.Init) !void {
     mainInner(init) catch |e| {
         if (userErrorHint(e)) |hint| {
-            // The detailed message is already on screen; add a terse trailer only when we have
-            // something to add, then exit WITHOUT a compiler stack trace.
+
             if (hint.len > 0) {
                 std.debug.print("\x1b[1m\x1b[31merror:\x1b[0m\x1b[1m {s}\x1b[0m (compilation failed)\n", .{hint});
             }
             std.process.exit(1);
         }
-        return e; // a genuine compiler bug — let it crash loudly, with its trace
+        return e;
     };
 }
 
@@ -2603,19 +2248,13 @@ fn mainInner(init: std.process.Init) !void {
     }
 
     var file_path: []const u8 = "";
-    // `nova build` defaults to a NATIVE executable (like `cargo build` / `go build`) — what a user
-    // running `nova build` expects and what actually runs standalone. WASM is opt-in via
-    // `--target wasm`. (The old default was `--wasm`, which produced a module that could not even
-    // build a stdlib-importing program: the WASM codegen branch does not declare the test-harness
-    // externs `assert` references. That WASM gap is tracked separately.)
+
     var target: []const u8 = "--native";
     var output_path: []const u8 = "";
     var is_release = false;
     var cross_target: ?[]const u8 = null;
     var watch_mode = false;
-    // T6: `nova build` uses the persistent `build/<profile>/{obj,bin}` layout + a content-hash
-    // cache (instant no-change rebuilds). The direct `nova <file> -o out` path is UNTOUCHED by this,
-    // so the test harness and scripts keep their simple behaviour.
+
     const build_mode = std.mem.eql(u8, args[1], "build");
 
     if (std.mem.eql(u8, args[1], "build")) {
@@ -2695,14 +2334,13 @@ fn mainInner(init: std.process.Init) !void {
         }
     }
 
-    // T6: `nova build` project setup — entry + name from project.json, and the build/<profile> layout.
     const profile: []const u8 = if (is_release) "release" else "debug";
     var build_obj_dir: []const u8 = "";
     var build_hash_path: []const u8 = "";
     if (build_mode) {
-        // Default the entry to src/main.nova (the `nova init` layout) when no --file was given.
+
         if (file_path.len == 0) file_path = "src/main.nova";
-        // Project name from project.json (falls back to the entry-file stem).
+
         var proj_name: []const u8 = std.fs.path.stem(file_path);
         if (Io.Dir.readFileAlloc(.cwd(), init.io, "project.json", allocator, .unlimited)) |pj| {
             defer allocator.free(pj);
@@ -2711,7 +2349,7 @@ fn mainInner(init: std.process.Init) !void {
                 parsed.deinit();
             } else |_| {}
         } else |_| {}
-        // build/<profile>/{obj,bin}
+
         const bin_dir = try std.fmt.allocPrint(allocator, "build/{s}/bin", .{profile});
         build_obj_dir = try std.fmt.allocPrint(allocator, "build/{s}/obj", .{profile});
         Io.Dir.createDirPath(.cwd(), init.io, bin_dir) catch {};
@@ -2737,9 +2375,7 @@ fn mainInner(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, ct, "macos-x86_64")) {
             target_triple_opt = "x86_64-apple-darwin";
         } else if (std.mem.eql(u8, ct, "windows-x86_64")) {
-            // Use the windows-gnu OS triple, NOT *-w64-mingw32: modern LLVM treats "mingw32" as an
-            // unknown OS and defaults the object format to ELF, which lld-link then rejects. The
-            // pc-windows-gnu triple selects COFF (what the mingw/lld-link toolchain expects).
+
             target_triple_opt = "x86_64-pc-windows-gnu";
         } else {
             std.debug.print("Unsupported target switch: {s}\n", .{ct});
@@ -2747,7 +2383,6 @@ fn mainInner(init: std.process.Init) !void {
         }
     }
 
-    // Derive output path if not provided.
     if (output_path.len == 0) {
         const base_name = try basenameWithoutExtension(file_path, allocator);
         defer allocator.free(base_name);
@@ -2757,7 +2392,6 @@ fn mainInner(init: std.process.Init) !void {
             output_path = try allocator.dupe(u8, base_name);
         }
     }
-
 
     if (watch_mode) {
         std.debug.print("[watch] Watching for changes...\n", .{});
@@ -2771,14 +2405,13 @@ fn mainInner(init: std.process.Init) !void {
         while (true) {
             var pass_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             const pass_allocator = pass_arena.allocator();
-            
+
             var visited = std.StringHashMap(void).init(pass_allocator);
-            
+
             compileProgram(pass_allocator, init, file_path, target, output_path, is_release, target_triple_opt, &visited, build_mode, build_obj_dir, build_hash_path) catch |err| {
                 std.debug.print("Compilation failed: {any}\n", .{err});
             };
 
-            // Update mtimes for newly visited files
             var file_iter = visited.keyIterator();
             while (file_iter.next()) |file| {
                 if (!mtimes.contains(file.*)) {
@@ -2794,7 +2427,7 @@ fn mainInner(init: std.process.Init) !void {
             var changed = false;
             while (!changed) {
                 init.io.sleep(std.Io.Duration.fromMilliseconds(500), .boot) catch {};
-                
+
                 if (mtimes.count() == 0) {
                     if (getFileMtime(init.io, file_path)) |mt| {
                         const dup_key = try allocator.dupe(u8, file_path);

@@ -1,16 +1,3 @@
-// crypto/scram.nova — SCRAM-SHA-256 client (RFC 5802 / RFC 7677), the SASL auth
-// used by PostgreSQL and MongoDB. Built on crypto/sha's raw-byte HMAC/SHA/PBKDF2
-// and crypto/base64. The key chain works on 32-byte binary blocks throughout:
-//
-//   SaltedPassword  = PBKDF2(password, salt, i)
-//   ClientKey       = HMAC(SaltedPassword, "Client Key")
-//   StoredKey       = SHA256(ClientKey)
-//   ClientSignature = HMAC(StoredKey, AuthMessage)
-//   ClientProof     = ClientKey XOR ClientSignature      <- the `^` operator
-//   ServerKey       = HMAC(SaltedPassword, "Server Key")
-//   ServerSignature = HMAC(ServerKey, AuthMessage)
-//
-// AuthMessage = client-first-bare + "," + server-first + "," + client-final-without-proof
 
 import bytes;
 import string;
@@ -19,7 +6,6 @@ import crypto.sha;
 import crypto.base64;
 import assert;
 
-/// XOR two equal-length raw byte strings (the ClientProof step).
 fn xorBytes(a: string, b: string): string {
     let n = a.length;
     let out = bytes.alloc(n);
@@ -30,11 +16,6 @@ fn xorBytes(a: string, b: string): string {
     }
     return out as string;
 }
-
-// ---------------------------------------------------------------------------
-// Low-level primitives — each maps 1:1 to an RFC 5802 term. `salt` is RAW bytes
-// (already base64-decoded); all block outputs are 32 RAW bytes.
-// ---------------------------------------------------------------------------
 
 pub fn saltedPassword(password: string, salt: string, iterations: int): string {
     return sha.pbkdf2HmacSha256(password, salt, iterations, 32);
@@ -64,7 +45,6 @@ pub fn serverSignature(servKey: string, authMessage: string): string {
     return sha.hmacSha256Raw(servKey, authMessage);
 }
 
-/// The base64 ClientProof for a completed handshake. `salt` is RAW bytes.
 pub fn computeProofB64(password: string, salt: string, iterations: int, authMessage: string): string {
     let sp = saltedPassword(password, salt, iterations);
     let ck = clientKey(sp);
@@ -73,18 +53,12 @@ pub fn computeProofB64(password: string, salt: string, iterations: int, authMess
     return base64.encode(clientProof(ck, cs));
 }
 
-/// The base64 ServerSignature the client uses to verify the server. `salt` is RAW.
 pub fn computeServerSigB64(password: string, salt: string, iterations: int, authMessage: string): string {
     let sp = saltedPassword(password, salt, iterations);
     let ss = serverSignature(serverKey(sp), authMessage);
     return base64.encode(ss);
 }
 
-// ---------------------------------------------------------------------------
-// High-level client: drives the message exchange.
-// ---------------------------------------------------------------------------
-
-/// The value after `x=` in a `x=value` attribute, or "" if it doesn't match.
 fn attrValue(part: string, key: string): string {
     if (string.startsWith(part, key)) {
         return string.slice(part, key.length, part.length);
@@ -97,18 +71,14 @@ pub struct ScramClient {
     pub password: string,
     pub clientNonce: string,
 
-    /// "n=<user>,r=<clientNonce>" — the client-first-bare.
     pub fn clientFirstBare(self: ScramClient): string {
         return `n=${self.username},r=${self.clientNonce}`;
     }
 
-    /// The full client-first-message: GS2 header "n,," + client-first-bare.
     pub fn clientFirstMessage(self: ScramClient): string {
         return `n,,${self.clientFirstBare()}`;
     }
 
-    /// Given the server-first-message ("r=<combined>,s=<saltB64>,i=<iters>"), compute
-    /// the client-final-message: "c=biws,r=<combined>,p=<proof>".
     pub fn clientFinalMessage(self: ScramClient, serverFirst: string): string {
         let combinedNonce = "";
         let saltB64 = "";
@@ -127,10 +97,6 @@ pub struct ScramClient {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests — RFC 7677 §3 reference exchange (user "user", password "pencil").
-// ---------------------------------------------------------------------------
-
 const RFC_AUTH: string =
     "n=user,r=rOprNGfwEbeRWgbNEkqO,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096,c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0";
 
@@ -145,7 +111,7 @@ fn test_scram_rfc7677_proof(): void {
 
 @test
 fn test_scram_client_exchange(): void {
-    // The high-level client, driven exactly as in RFC 7677.
+
     let c = ScramClient{
         username: "user",
         password: "pencil",

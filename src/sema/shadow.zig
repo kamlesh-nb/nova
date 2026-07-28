@@ -1,22 +1,4 @@
-// shadow.zig — F1 stage 1: diff the symbol table against legacy resolution.
-//
-// Report-only. Runs under NOVA_SEMA_SHADOW=1 and changes NO behaviour — the point
-// is to make the blast radius observable BEFORE it is taken (F1 §5 stage 1), since
-// today's resolution is nondeterministic and a big-bang cutover would be
-// unreviewable.
-//
-// It answers four questions the design asserts but had not measured:
-//
-//   A. Do two declarations collide onto one legacy mangled name? Types are keyed by
-//      BARE name (llvm_codegen.zig:76-79, `put` with no collision check), so two
-//      modules declaring `struct Config` silently overwrite each other.
-//   B. Would a suffix scan be AMBIGUOUS — i.e. does the trailing-`_`-match hit two
-//      or more different symbols? Those resolve by hash-iteration order: the
-//      compiler picks one nondeterministically (F1 §2.3).
-//   C. Does a bare name shadow a module-qualified one? This is the class that
-//      produced §10 #6 — `f.payload` resolving to a user `fn payload`.
-//   D. Is a legacy symbol path-dependent (contains $HOME)? That is F1 §2.2: the
-//      same file yields a different linker symbol depending on where it was found.
+
 const std = @import("std");
 const ast = @import("../ast.zig");
 const symbols = @import("symbols.zig");
@@ -26,45 +8,25 @@ const infer = @import("infer.zig");
 const ownership = @import("ownership.zig");
 const sema_mod = @import("sema.zig");
 
-/// F1 stage 2: when set, resolveCalleeName reports every time it falls through to
-/// a SUFFIX SCAN, how many candidates matched, and which one it picked. Set from
-/// main.zig under NOVA_SEMA_SHADOW=1. Observation only — resolution is unchanged.
 pub var trace_resolution: bool = false;
-/// Print the shadow reports (NOVA_SEMA_SHADOW=1). Separate from everything else:
-/// sema now runs on EVERY compile (stage 4c), and a compiler that narrates its own
-/// type inference on every build is unusable. Building and reporting are different
-/// decisions.
+
 pub var report_enabled: bool = false;
 
 fn out(comptime fmt: []const u8, args: anytype) void {
     if (report_enabled) std.debug.print(fmt, args);
 }
-/// F2 stage 4b: codegen READS the TypedIr instead of re-deriving types
-/// (NOVA_F2_TYPES=1). Separate from trace_resolution: measuring the difference and
-/// taking it are different decisions, and conflating them is how a shadow becomes
-/// a cutover nobody reviewed.
+
 pub var f2_types_enabled: bool = false;
-/// How many resolutions the cutover actually ANSWERED from the IR, and how many
-/// fell back to legacy. Without these, "the IR is byte-identical" is
-/// indistinguishable from "the cutover never ran" — which is the same shape as a
-/// revert-test that does not build and reports PASS.
+
 pub var f2_served: usize = 0;
 pub var render_calls: usize = 0;
 pub var render_allocs: usize = 0;
 pub var render_bytes: usize = 0;
 pub var render_cache_hits: usize = 0;
 pub var f2_fellback: usize = 0;
-/// Fallbacks where LEGACY had an answer — the only ones that block 4d.
+
 pub var f2_fellback_lossy: usize = 0;
-/// F2 stage 3: sema's artefacts, kept alive for codegen's diff. Deliberately
-/// leaked for the process lifetime — a compiler run is short and this is
-/// shadow-only scaffolding, not the cutover's ownership model.
-/// F2 stage 4c: sema's artefacts, OWNED by main (sema/sema.zig) and BORROWED here.
-///
-/// These were heap-allocated and leaked on purpose — codegen reads them after the
-/// shadow returns, so a `defer deinit()` was a use-after-free that only showed up
-/// under NOVA_SEMA_SHADOW=1. They are now views into a Sema that main creates and
-/// destroys; nothing below owns them.
+
 pub var live_sema: ?*sema_mod.Sema = null;
 pub var live_store: ?*typesys.TypeStore = null;
 pub var live_ir: ?*infer.TypedIr = null;
@@ -77,9 +39,6 @@ pub const Divergence = struct {
     detail: []const u8,
 };
 
-/// Report-only. `sm` is OWNED BY THE CALLER (main) and outlives codegen — which is
-/// the point of stage 4c: this used to create and leak the table, store and IR
-/// because codegen reads them after this returns.
 pub fn run(allocator: std.mem.Allocator, program: ast.Program, sm: *sema_mod.Sema) !void {
     live_sema = sm;
     const tab = &sm.tab;
@@ -94,12 +53,11 @@ pub fn run(allocator: std.mem.Allocator, program: ast.Program, sm: *sema_mod.Sem
     var shadowed: usize = 0;
     var path_dep: usize = 0;
 
-    // ---- A. two symbols, one legacy mangled name -------------------------
     for (tab.symbols.items, 0..) |a, i| {
         for (tab.symbols.items[i + 1 ..]) |b| {
             if (!std.mem.eql(u8, a.legacy_mangled, b.legacy_mangled)) continue;
             if (a.kind == .method and b.kind == .method and a.owner != null and b.owner != null and
-                std.mem.eql(u8, a.owner.?, b.owner.?)) continue; // same method, collected twice
+                std.mem.eql(u8, a.owner.?, b.owner.?)) continue;
             collisions += 1;
             const ma = tab.moduleOf(a.module);
             const mb = tab.moduleOf(b.module);
@@ -110,9 +68,6 @@ pub fn run(allocator: std.mem.Allocator, program: ast.Program, sm: *sema_mod.Sem
         }
     }
 
-    // ---- B. would the suffix scan be ambiguous? --------------------------
-    // Legacy: on an exact miss, scan every key for one ending in `_<name>` and take
-    // the FIRST in hash order. If 2+ symbols match, the pick is nondeterministic.
     for (tab.symbols.items) |s| {
         if (s.kind != .function) continue;
         var matches: usize = 0;
@@ -121,7 +76,7 @@ pub fn run(allocator: std.mem.Allocator, program: ast.Program, sm: *sema_mod.Sem
             if (t.kind != .function) continue;
             if (!std.mem.endsWith(u8, t.legacy_mangled, s.name)) continue;
             const pre = t.legacy_mangled.len - s.name.len;
-            // the scan requires the char before the match to be '_' (or an exact hit)
+
             if (pre != 0 and t.legacy_mangled[pre - 1] != '_') continue;
             matches += 1;
             if (first == null) first = t;
@@ -132,11 +87,10 @@ pub fn run(allocator: std.mem.Allocator, program: ast.Program, sm: *sema_mod.Sem
         }
     }
 
-    // ---- C. a bare (root) name shadowing a module-qualified one ----------
     for (tab.symbols.items) |a| {
         if (a.kind != .function) continue;
         const ma = tab.moduleOf(a.module);
-        if (!std.mem.eql(u8, ma.path, "<root>")) continue; // only user/root decls
+        if (!std.mem.eql(u8, ma.path, "<root>")) continue;
         for (tab.symbols.items) |b| {
             if (b.kind == .function and !std.mem.eql(u8, tab.moduleOf(b.module).path, "<root>") and
                 std.mem.eql(u8, a.name, b.name))
@@ -150,16 +104,13 @@ pub fn run(allocator: std.mem.Allocator, program: ast.Program, sm: *sema_mod.Sem
         }
     }
 
-    // ---- D2. PREDICT: would the canonical prefix create a NEW collision? ----
-    // declarations.zig:737-748 dedups `functions` by name, so a collision created
-    // by fixing the prefix would SILENTLY DROP one. Check before cutting over.
     var canon_collisions: usize = 0;
     for (tab.symbols.items, 0..) |a, i| {
         if (a.kind != .function) continue;
         for (tab.symbols.items[i + 1 ..]) |b| {
             if (b.kind != .function) continue;
             if (!std.mem.eql(u8, a.canonical_mangled, b.canonical_mangled)) continue;
-            if (std.mem.eql(u8, a.legacy_mangled, b.legacy_mangled)) continue; // already collided
+            if (std.mem.eql(u8, a.legacy_mangled, b.legacy_mangled)) continue;
             canon_collisions += 1;
             out("  [NEW-COLLISION] fixing the prefix would map BOTH onto '{s}': {s}:{d} and {s}:{d}\n", .{
                 a.canonical_mangled, a.span.file, a.span.line, b.span.file, b.span.line,
@@ -170,7 +121,6 @@ pub fn run(allocator: std.mem.Allocator, program: ast.Program, sm: *sema_mod.Sem
         out("  [canonical-prefix] 0 new collisions — the $HOME fix is safe to cut over\n", .{});
     }
 
-    // ---- D. path-dependent / $HOME-bearing legacy symbols ----------------
     for (tab.symbols.items) |s| {
         if (std.mem.indexOf(u8, s.legacy_mangled, "Users_") != null or
             std.mem.indexOf(u8, s.legacy_mangled, "home_") != null)
@@ -194,26 +144,11 @@ pub fn run(allocator: std.mem.Allocator, program: ast.Program, sm: *sema_mod.Sem
     };
 }
 
-/// F2 stage 2: lower every DECLARED type in the program to a TypeId and report how
-/// much of the surface can actually be typed. Report only — nothing consumes it.
-///
-/// This is the honest measure of what F2 can carry today, and the input that
-/// decides stage 4's cutover. Anything that cannot be lowered becomes `.unresolved`
-/// — a real, distinct type — never a silent `int`, which is the whole point of T4.
 fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *const symbols.SymbolTable, sm: *sema_mod.Sema) !void {
-    // Heap-allocated and deliberately LEAKED: codegen's stage-3 diff reads these
-    // after this function returns, and a TypeStore copied by value would carry
-    // copied hashmaps whose TypeIds index a different table. A compiler run is
-    // short and this is shadow-only scaffolding; stage 4 gives sema a real
-    // ownership model rather than inheriting this one.
+
     const store = &sm.store;
     live_store = store;
 
-    // F2-6 enum-variant awareness: teach the store which enums are TAGGED UNIONS (>=1 payload variant
-    // -> heap box, OWNED) vs payload-less (immediate tag, NOT owned), so `store.isOwned(.enum_)` decides
-    // correctly instead of the coarse `false`. Populated once from the declarations, keyed by the SAME
-    // SymbolId the `.enum_` type interns under (`tab.findType`). Not gated by report_enabled — it is a
-    // correctness input to `isOwned`, which the sema ownership pass and the flip both consult.
     for (program.declarations) |decl| {
         if (decl != .enum_decl) continue;
         const ed = decl.enum_decl;
@@ -229,14 +164,12 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
     }
 
     var l = lower.Lowerer.init(allocator, store);
-    l.symtab = tab; // the F1<->F2 join
+    l.symtab = tab;
 
     for (program.declarations) |decl| {
         switch (decl) {
             .fn_decl => |f| {
-                // `owner` is what makes `List<T>`'s T a DIFFERENT type from
-                // `Map<K,V>`'s K. Leaving it unset collapsed every param onto one
-                // TypeId; lower.zig now refuses an ownerless param outright.
+
                 const fscope = [_]lower.ParamScope{.{
                     .owner = tab.findFunction(f.name) orelse continue,
                     .names = f.type_params,
@@ -254,16 +187,7 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
                 l.param_scopes = &sscope;
                 for (sd.fields) |fld| _ = try l.lower(fld.type_name);
                 for (sd.methods) |m| {
-                    // A method sees the STRUCT's type params AND ITS OWN:
-                    //     pub fn map<U>(self: List<T>, fn: (T) => U): List<U>
-                    // `T` comes from `struct List<T>`, `U` from the method. Using
-                    // only the struct's params left every `U` unresolved — which is
-                    // exactly what the first run of this report showed (6 x "U"),
-                    // and it was a gap in THIS harness, not in the compiler.
-                    // TWO scopes, not one merged list: in `fn map<U>(self: List<T>)`
-                    // T is {List, 0} and U is {map, 0} — each index 0 of its OWN
-                    // declaration. Merging made U into {List, 1}, an index List does
-                    // not have, so it never substituted. Innermost last.
+
                     const mscopes = [_]lower.ParamScope{
                         .{ .owner = ssym, .names = sd.type_params },
                         .{ .owner = tab.findMethod(sd.name, m.decl.name) orelse ssym, .names = m.decl.type_params },
@@ -288,8 +212,6 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
     out("  UNRESOLVED          : {d}\n", .{l.stats.unresolved});
     out("  distinct types interned: {d}\n", .{store.count()});
 
-    // Report the distinct names F2 cannot yet type, most common first — that list
-    // IS stage 4's remaining work.
     var seen = std.StringHashMap(usize).init(allocator);
     defer seen.deinit();
     for (l.stats.unresolved_names.items) |n| {
@@ -304,11 +226,10 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
         out("    {s} (x{d})\n", .{ e.key_ptr.*, e.value_ptr.* });
         shown += 1;
     }
-    // ---- F2 stage 2c: the EXPRESSION surface -----------------------------
+
     var inf = infer.Inferer.init(allocator, store, tab, &l);
     defer inf.deinit();
-    // Stage 2i: persist what inference computes, so codegen can READ instead of
-    // re-deriving at every use site.
+
     const ir = &sm.ir;
     live_ir = ir;
     inf.ir = ir;
@@ -324,10 +245,7 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
                 inf.inferFunction(&f) catch { walk_errors += 1; };
             },
             .enum_decl => |ed| {
-                // Enums have methods too. The walk's `else => {}` skipped them
-                // entirely, so every expression in an enum method was invisible to
-                // sema while codegen still compiled it — which is part of the
-                // "not in the IR" count the stage-3 diff surfaced.
+
                 const self_ty: ?infer.TypeId = blk: {
                     const sid = tab.findTypeInModule(ed.name, tab.findModuleByFile(ed.span.file)) orelse break :blk null;
                     break :blk try store.intern(.{ .enum_ = sid });
@@ -337,10 +255,7 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
                 }
             },
             .struct_decl => |sd| {
-                // Bind `self` to the owning struct: a constructor's body uses it
-                // without declaring it (parser.zig:470).
-                // F1 module-scoped types: resolve THIS struct's own symbol (module-scoped), so a colliding
-                // `Widget` binds `self` to the Widget declared in THIS module — not the global first-match.
+
                 const sd_mod = tab.findModuleByFile(sd.span.file);
                 const self_ty: ?infer.TypeId = blk: {
                     const sid = tab.findTypeInModule(sd.name, sd_mod) orelse break :blk null;
@@ -361,14 +276,8 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
     }
     l.param_scopes = &.{};
 
-    // F1-4 VISIBILITY ENFORCEMENT: a cross-module reference to a non-pub symbol is a hard error
-    // (NOT gated by report_enabled — it is enforcement, not a shadow diagnostic). The corpus is clean
-    // (0 violations once `pub fn` was honored), so this rejects only genuine over-reaches.
     if (inf.visibility_errors.items.len > 0) {
-        // Abort HERE (like isRefCountedType's placeholder abort) rather than returning an error for a
-        // caller to handle: sema runs on every compile before codegen, so exiting here rejects the
-        // program cleanly with the located diagnostic already shown — no dependence on which pipeline
-        // (cmdTest / compileProgram) invoked us or whether it propagates the error.
+
         for (inf.visibility_errors.items) |ve| {
             switch (ve.kind) {
                 .function => std.debug.print(
@@ -388,12 +297,8 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
         std.process.exit(1);
     }
 
-    // `const` IMMUTABILITY ENFORCEMENT: reassigning a `const` binding is a hard error (the
-    // enforced-immutable half of the two-keyword `let`/`const` model). Enforcement, not a shadow
-    // diagnostic — same reject-here pattern as visibility above.
     if (inf.const_reassign_errors.items.len > 0) {
-        // Same header the type checker prints, so the UX (and the conformance classifier, which keys
-        // "typecheck" off this line) treat it uniformly with every other typecheck error.
+
         std.debug.print("Type checking failed with {d} error(s):\n", .{inf.const_reassign_errors.items.len});
         for (inf.const_reassign_errors.items) |ce| {
             std.debug.print(
@@ -404,9 +309,6 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
         std.process.exit(1);
     }
 
-    // H2 OPTIONAL SOUNDNESS: a bare member access on a `T | undefined` value is a hard error —
-    // the value must be made present first. Same reject-here pattern + "Type checking failed"
-    // header (so the conformance classifier keys it as `typecheck`).
     if (inf.optional_deref_errors.items.len > 0) {
         std.debug.print("Type checking failed with {d} error(s):\n", .{inf.optional_deref_errors.items.len});
         for (inf.optional_deref_errors.items) |oe| {
@@ -425,12 +327,6 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
         std.process.exit(1);
     }
 
-    // GENERIC-UFCS GUARDRAIL: a GENERIC free function whose first parameter is `self` is a UFCS method
-    // on a generic receiver (`fn push<T>(self: Container<T>, …)`). The checker does not solve `self`'s
-    // type parameter at the call site, so `x.m()` on such a receiver would SILENTLY not type — the
-    // exact class that hid the `Array<T>` cascade. A generic type's methods must live in its body
-    // (as List/Map/Set do); non-generic UFCS (`fn hash(self: string)`) is fine and unaffected. Turn
-    // the silent gap into a located error (specs §4.2).
     {
         var count: usize = 0;
         for (program.declarations) |decl| {
@@ -448,11 +344,6 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
         if (count > 0) std.process.exit(1);
     }
 
-    // F2-5 FATAL: a genuinely-undefined identifier (not a value, type, runtime extern, or namespace)
-    // is a hard error at end of sema — the .unresolved-fatal the stage is named for. Measured 0 across
-    // the whole corpus (validated by isFatalUnresolvedIdent's exclusions: modules / magic builtins /
-    // self / container types / nova_* externs), so this rejects only genuine typos. Undefined idents
-    // were already caught at codegen ("Identifier not found"); this moves the check earlier, to sema.
     if (inf.fatal_unresolved_idents > 0) {
         std.debug.print(
             "\x1b[1m\x1b[31merror:\x1b[0m\x1b[1m undefined identifier '{s}'\x1b[0m (and {d} more) — not a value, type, module, or known builtin. (F2-5)\n",
@@ -467,17 +358,13 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
     out("  expressions seen : {d}\n", .{etotal});
     out("  typed            : {d}  ({d}%)\n", .{ inf.stats.typed, pct });
     out("  UNRESOLVED       : {d}\n", .{inf.stats.unresolved});
-    // F2-6 stage 0: split UNRESOLVED into NOT-A-VALUE (namespace: modules/builtins/container-types,
-    // and accesses on them) vs the GENUINE coverage debt. The namespace count is not a gap — a
-    // complete typed IR marks those `namespace`, it does not type them. `genuine` is the real
-    // denominator F2-6 stage 1 drives toward 0.
+
     const ns = inf.stats.unresolved_ns_ident + inf.stats.unresolved_ns_field;
     const genuine = inf.stats.unresolved -| ns;
     out("    namespace (not-a-value: module/builtin/access-on-them) : {d}\n", .{ns});
     out("    GENUINE (the real F2-6 coverage debt)                  : {d}\n", .{genuine});
     out("  F2-5 GENUINE-UNDEFINED idents (fatal-ready, must be 0) : {d}\n", .{inf.fatal_unresolved_idents});
-    // Which GENUINE shapes fail (namespace subtracted from ident/field_access) — this names the next
-    // increment stage 1 must close, instead of guessing at it.
+
     out("  -- GENUINE shapes (by_tag, namespace subtracted) --\n", .{});
     var bt = inf.stats.by_tag.iterator();
     while (bt.next()) |e| {
@@ -494,9 +381,7 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
         out("    {s} (x{d})\n", .{ e.key_ptr.*, e.value_ptr.* });
         shown2 += 1;
     }
-    // The authoritative numbers: the IR is a SET keyed by expression identity, so
-    // each expression counts once. The stats above are event counters and
-    // over-count re-visits — worth keeping only because they name the SHAPES.
+
     const rec = ir.count();
     const unres = ir.unresolvedCount(store);
     const rpct: usize = if (rec == 0) 0 else ((rec - unres) * 100) / rec;
@@ -505,17 +390,10 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
     out("    recorded   : {d}\n", .{rec});
     out("    typed      : {d}  ({d}%)\n", .{ rec - unres, rpct });
     out("    unresolved : {d}\n", .{unres});
-    // F1 stage 3b groundwork: how many CALLs sema resolved to a SymbolId (recorded in the IR for
-    // codegen to consult instead of the func_map suffix scan). Drive this UP toward the total call
-    // count before the scan is deleted — the same shadow-then-cutover discipline as expr_types.
+
     out("    calls->SymbolId (F1-3b) : {d}\n", .{ir.expr_syms.count()});
     out("=== end F2 shadow (report only) ===\n\n", .{});
 
-    // F2-6 stage 5 step 2: the OWNERSHIP PASS (arc.md §5) — turn the disposition (step 1) into actual
-    // dup/drop/move OPS on owned `let`-locals and run the §6.1 STATIC BALANCE CHECK. Report-only;
-    // codegen behaviour is untouched. Runs only under --shadow (like every diagnostic here), so it adds
-    // zero cost to a normal build. The precondition that made step 1 land — TypeId ownership, no
-    // strings — is what this consumes: every owned-local decision comes from `store.isOwnedSafe`.
     if (report_enabled) {
         const os = ownership.analyze(allocator, store, ir, &program);
         out("=== F2-6 stage 5 step 2: ownership pass (owned-local dup/drop + balance check) ===\n", .{});
@@ -527,28 +405,13 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
         out("  ops inserted : drop={d}  move-out={d}  dup={d}\n", .{ os.drop_ops, os.move_outs, os.dup_ops });
         out("  BALANCE VIOLATIONS (use-after-move; MUST be 0)        : {d}\n", .{os.balance_violations});
         if (os.balance_violations > 0) out("    first: owned local '{s}'\n", .{os.first_violation});
-        // Owned TEMPORARIES: every owned producer occurrence gets a consumer — MOVED into a
-        // bind/return/aggregate, or DROPPED at the enclosing statement's end. Completeness is measured
-        // against the disposition oracle: `ownedOf==true` marks EVERY owned occurrence (closure interiors
-        // now descended too), so `accounted == total` means the pass gave EVERY owned value a consumer.
+
         const temp_accounted = os.temp_moves + os.temp_drops;
         const temp_total = ir.ownedTrueCount();
         const tpct: usize = if (temp_total == 0) 100 else (temp_accounted * 100) / temp_total;
         out("  owned TEMPORARIES: move={d}  drop={d}  accounted={d}/{d} ({d}%)  unaccounted={d}\n", .{ os.temp_moves, os.temp_drops, temp_accounted, temp_total, tpct, temp_total -| temp_accounted });
         out("=== end ownership pass ===\n\n", .{});
 
-        // FOUNDATION GATE (F2-6 ownership pass, 2026-07-19). The static balance check has teeth for BOTH
-        // owned-value classes now, and both are ENFORCED here:
-        //   1. LOCALS — the CFG last-use analysis proves each owned local is consumed exactly once on
-        //      every path; a use-after-MOVE is a real UAF and MUST be 0 (teeth: a synthetic `let b=a;
-        //      use(a)` is flagged).
-        //   2. TEMPORARIES — an owned temp is single-use in the source (anonymous), so it cannot be
-        //      used-after-move; its balance risk is a MISSED temp (a leak-shaped hole the pass never
-        //      saw). So the invariant is COMPLETENESS: every owned occurrence the disposition oracle
-        //      counts MUST have a pass op (move/drop). `accounted < total` means a construct produced an
-        //      owned temp the pass did not account for — exactly where an un-dropped leak would hide.
-        // A future construct that breaks either invariant fails the build here, not at a runtime leak
-        // months later — the same "nothing bites" enforcement as the disposition gate.
         if (os.balance_violations > 0 or temp_accounted < temp_total) {
             std.debug.print(
                 "\x1b[1m\x1b[31mFOUNDATION GATE FAILED (F2-6 ownership balance):\x1b[0m\x1b[1m an owned value is not provably consumed exactly once\x1b[0m\n" ++
@@ -564,8 +427,6 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
     }
 }
 
-/// F1 stage 2: totals from the instrumented resolveCalleeName. Printed after
-/// codegen, since the counters accumulate during it.
 pub fn reportResolution() void {
     if (!trace_resolution) return;
     std.debug.print("\n=== F1 shadow: resolveCalleeName suffix-scan usage ===\n", .{});
@@ -575,33 +436,18 @@ pub fn reportResolution() void {
     std.debug.print("=== end ===\n\n", .{});
 }
 
+pub var td_agree: usize = 0;
+pub var td_disagree: usize = 0;
+pub var td_blocked_typeparam: usize = 0;
+pub var td_blocked_noctx: usize = 0;
+pub var td_keystone_resolves: usize = 0;
+pub var td_keystone_disagree: usize = 0;
+pub var td_blocked_unresolved: usize = 0;
+pub var td_blocked_enum: usize = 0;
 
-// ---------------------------------------------------------------------------
-// F2 stage 3: diff the TypedIr against the legacy resolver, on every real
-// expression codegen asks about.
-// ---------------------------------------------------------------------------
-// ── string→TypeId migration: the shadow-diff harness ───────────────────────────────────────────
-// At every OWNERSHIP decision (isOwnedTypeId), compute BOTH answers — the typed `store.isOwned(t)`
-// and the legacy `isRefCountedType(renderLegacy(t))` — and classify the site. This is the safety net
-// for the whole migration: `td_disagree` MUST stay 0 (a concrete type the two engines disagree on is
-// a real bug); `td_blocked_*` quantifies EXACTLY what the keystone (type_param) + F2-5 (unresolved) +
-// enum-awareness must clear before the string engine can be deleted. Report-only under NOVA_SEMA_SHADOW.
-pub var td_agree: usize = 0; // concrete type, both engines agree — already convertible
-pub var td_disagree: usize = 0; // concrete type, engines DIFFER — a bug to fix before cutover
-pub var td_blocked_typeparam: usize = 0; // has instantiation ctx but unresolved — a METHOD-level param (map<U>)
-pub var td_blocked_noctx: usize = 0; // no instantiation ctx (erased-body compile) — resolves when erased body goes
-pub var td_keystone_resolves: usize = 0; // KEYSTONE SHADOW: substituting against current_instantiation gives a concrete type whose ownership AGREES with today's string answer — i.e. the keystone would convert this site correctly
-pub var td_keystone_disagree: usize = 0; // substitutes concrete but DISAGREES — a keystone bug to fix
-pub var td_blocked_unresolved: usize = 0; // needs F2-5 (unresolved fatal)
-pub var td_blocked_enum: usize = 0; // needs isOwned enum-variant awareness
-/// F2-6 stage 5: does the CHECKER's ownership disposition (TypedIr.expr_owned) agree with codegen's
-/// `acquisitionDisposition`? disagree must reach a known, small residue (payload-enum coarseness)
-/// before the checker can OWN the decision and the balance check runs on it.
 pub var disp_agree: usize = 0;
 pub var disp_disagree: usize = 0;
-/// Which known keystone gap a disposition disagreement falls into (classified by the type the
-/// CHECKER assigned). `.other` is the tripwire: any disagreement NOT explained by one of the two
-/// documented gaps, which the report surfaces with a sample.
+
 pub const DispResidue = enum { type_param, enum_, other };
 pub var disp_disagree_typeparam: usize = 0;
 pub var disp_disagree_enum: usize = 0;
@@ -609,62 +455,43 @@ pub var disp_disagree_other: usize = 0;
 pub var disp_last_kind: []const u8 = "";
 pub var disp_last_type: []const u8 = "";
 
-/// F2-6 stage 5 step 5 (codegen cutover, shadow half): at codegen's EXACT temp sites — a `drop` in
-/// `drainTemporaries`, a `move` in `consumeTemporary` — does codegen's action match the op the pass
-/// recorded for that ExprId? This is the §7.1 per-site shadow for the temp construct; agreement is the
-/// license to flip codegen to obey the pass (delete the `pending_temps` heuristic). `no_op` counts temps
-/// with no recorded pass op (explicitly-registered temps the pass never saw — not a disagreement).
 pub var op_agree: usize = 0;
 pub var op_disagree: usize = 0;
-pub var op_disagree_cg_drop: usize = 0; // codegen DROPPED, pass said MOVE
-pub var op_disagree_cg_move: usize = 0; // codegen MOVED, pass said DROP
+pub var op_disagree_cg_drop: usize = 0;
+pub var op_disagree_cg_move: usize = 0;
 pub var op_no_op: usize = 0;
 pub var op_last_disagree: []const u8 = "";
 pub var td_last_disagree: []const u8 = "";
 pub var td_last_disagree_typed: bool = false;
 pub var td_last_disagree_string: bool = false;
 
-// F2-6 stage 4: is a temp's stored destructor `type_name` derivable from its TypeId (via `expr_id`)?
-// Proving `dtor_name_disagree == 0` corpus-wide is the precondition for keying destructors on the
-// TypeId (and deleting the stored string), because a divergent destructor NAME is CORRUPTION, not a
-// leak. Report-only; the `no_id` bucket is temps the pass never id'd (registered outside the choke
-// point) — not a divergence, just unmeasurable here.
 pub var dtor_name_agree: usize = 0;
 pub var dtor_name_disagree: usize = 0;
 pub var dtor_name_no_id: usize = 0;
 pub var dtor_name_last_disagree_string: []const u8 = "";
 pub var dtor_name_last_disagree_typed: []const u8 = "";
-// The RAW render (no substTypeParams). raw_disagree==0 means the concrete TypeId already carries the
-// resolved type, so substTypeParams is redundant at the drain — the deletion target.
+
 pub var dtor_name_raw_agree: usize = 0;
 pub var dtor_name_raw_disagree: usize = 0;
 pub var dtor_name_raw_last: []const u8 = "";
-// Do a tuple's STORE elements (st.get(t).tuple) match the string-PARSE (getTupleElementType) — same
-// arity, per-element ownership, and rendered name? disagree==0 is the gate to build the tuple destructor
-// from the store elements (dropping getTupleElementType's fragile depth-aware string parse).
+
 pub var tuple_elem_agree: usize = 0;
 pub var tuple_elem_disagree: usize = 0;
 pub var tuple_elem_last: []const u8 = "";
-// Same store-vs-parse gate for the err-union payload arms and the storage element (before those
-// builders read ok/err/elem from the store instead of parsing `ErrUnion(ok,err)` / `Storage<T>`).
+
 pub var erru_elem_agree: usize = 0;
 pub var erru_elem_disagree: usize = 0;
 pub var erru_elem_last: []const u8 = "";
 pub var storage_elem_agree: usize = 0;
 pub var storage_elem_disagree: usize = 0;
 pub var storage_elem_last: []const u8 = "";
-// Struct FIELDS: does the store-resolved concrete field TypeId (lower-in-struct-scope + subst) match
-// substituteFieldType (the string T→concrete)? disagree==0 is the gate to build the struct destructor
-// from store field TypeIds — the increment that also retires substituteFieldType + storageElem.
+
 pub var struct_field_agree: usize = 0;
 pub var struct_field_disagree: usize = 0;
 pub var struct_field_last: []const u8 = "";
 pub var a2_irct_calls: usize = 0;
 pub var a2_irct_composite: usize = 0;
-// Stage 5 Phase A: at a release site with a known TypeId, does the TypeId's destructor SYMBOL match the
-// string path's? `flip` = same symbol, selected via the store-native builder (the cutover). `split` = the
-// two-renderer i32/int class — symbols would DIFFER, so kept on the string path (safe) until stage-6
-// renderer unification. `no_id` = no usable TypeId, string fallback. split>0 is expected, not a bug.
+
 pub var phaseA_flip: usize = 0;
 pub var phaseA_split: usize = 0;
 pub var phaseA_no_id: usize = 0;
@@ -689,10 +516,6 @@ pub fn reportTypeIdDiff() void {
     out("    .enum_       : {d}  (isOwned enum-variant awareness)\n", .{td_blocked_enum});
     out("=== end string→TypeId shadow-diff ===\n\n", .{});
 
-    // F2-6 stage 5 step 5: the ownership PASS's per-temp op vs what CODEGEN actually did, keyed by ExprId
-    // at the exact site (drop=drainTemporaries, move=consumeTemporary). disagree MUST reach a known set
-    // before codegen can be flipped to obey the pass. `no_op` = temps the pass never recorded (explicitly
-    // registered, e.g. the try-payload / downcast-struct sites) — expected, not a disagreement.
     if (op_agree + op_disagree + op_no_op > 0) {
         out("=== F2-6 stage 5 step 5: temp ops — codegen action vs pass op (per ExprId) ===\n", .{});
         out("  agree    : {d}  (codegen's drop/move matches the pass)\n", .{op_agree});
@@ -701,9 +524,7 @@ pub fn reportTypeIdDiff() void {
         out("    codegen MOVED, pass said drop   : {d}  (constructor/consuming args — needs the arc.md §3 `consuming` mark the pass lacks)\n", .{op_disagree_cg_move});
         if (op_disagree > 0) out("    last-disagree type: {s}\n", .{op_last_disagree});
         out("  no pass op: {d}  (explicitly-registered temps the pass never saw — expected)\n", .{op_no_op});
-        // F2-6 stage 4: is a DROPPED temp's destructor NAME recoverable from its TypeId (via expr_id)?
-        // Proving DISAGREE==0 corpus-wide is the precondition for keying the destructor on the TypeId and
-        // dropping the stored `type_name` — a divergent destructor name is corruption, not a leak.
+
         out("  stage 4 dtor-name from TypeId: agree={d}  DISAGREE={d}  (MUST be 0 to key on TypeId)  no-id={d}\n", .{ dtor_name_agree, dtor_name_disagree, dtor_name_no_id });
         if (dtor_name_disagree > 0) out("    last disagree: string='{s}'  typed='{s}'\n", .{ dtor_name_last_disagree_string, dtor_name_last_disagree_typed });
         out("  stage 4 RAW (no substTypeParams): agree={d}  DISAGREE={d}  (0 ⇒ substTypeParams redundant at drain)\n", .{ dtor_name_raw_agree, dtor_name_raw_disagree });
@@ -723,11 +544,6 @@ pub fn reportTypeIdDiff() void {
         out("=== end temp-op diff ===\n\n", .{});
     }
 
-    // F2-6 stage 5 (balance-check step 1): does the CHECKER's recorded disposition agree with
-    // codegen's `acquisitionDisposition`? This is the precondition for the static balance check —
-    // the checker cannot own the ownership decision (dup/drop ops, linear-use check) unless it
-    // agrees with the ground truth codegen acts on. Report-only for now: a nonzero disagree is the
-    // known enum-awareness residue (payload enums read coarsely by `store.isOwned`), not yet a gate.
     const disp_total = disp_agree + disp_disagree;
     if (disp_total > 0) {
         out("=== F2-6 stage 5: checker ownership-disposition vs codegen acquisitionDisposition ===\n", .{});
@@ -741,20 +557,6 @@ pub fn reportTypeIdDiff() void {
         out("=== end disposition shadow-diff ===\n\n", .{});
     }
 
-    // FOUNDATION GATE (F2-6 disposition oracle, 2026-07-19). The checker's recorded ownership
-    // DISPOSITION is the source codegen now OBEYS (the flip). It agrees with codegen's
-    // acquisitionDisposition on EVERY occurrence except ONE characterized, correct boundary:
-    // `.type_param` from ERASED CONTAINER METHODS (`Storage<T>.get` in an erased List/Map body), where
-    // the checker applies the erasure rule (unbound T = non-owned) and codegen monomorphizes the body
-    // (T = the concrete instantiation = owned). Both are correct for their vantage point; the
-    // `principledDisposition` fallback covers it and `--arc`/`--asan` prove it leak-free. THAT boundary
-    // is allowed. But `.enum_` disagreements are now impossible (isOwned is variant-aware), and `.other`
-    // is by definition an UNEXPLAINED checker-vs-codegen divergence — a NEW ownership decision made two
-    // different ways, the exact latent-corruption class this whole effort kills (a value one path frees
-    // and the other keeps = a use-after-free or leak surfacing months later as "string heap corruption").
-    // Either is a HARD build failure here, so the residue can NEVER silently grow past the one known,
-    // correct boundary. This is the ENFORCED "nothing bites" invariant: the foundation refuses to build
-    // if an ownership-disposition disagreement appears outside the erasure boundary.
     if (disp_disagree_enum > 0 or disp_disagree_other > 0) {
         std.debug.print(
             "\x1b[1m\x1b[31mFOUNDATION GATE FAILED (F2-6 disposition):\x1b[0m\x1b[1m an ownership-disposition disagreement appeared OUTSIDE the one allowed erasure boundary\x1b[0m\n" ++
@@ -769,17 +571,6 @@ pub fn reportTypeIdDiff() void {
         std.process.exit(1);
     }
 
-    // FOUNDATION GATE (F5-2, 2026-07-18). The whole point of the store-typed ownership engine is that
-    // ownership is a property of a TYPE, not of a spelling. This shadow proved corpus-wide that the
-    // TypeId engine and the legacy string engine give the IDENTICAL answer on every concrete decision
-    // (agree=N, disagree=0) and every keystone substitution (keystone-resolves=N, keystone-disagree=0).
-    // That agreement is the LICENSE to delete the string engine — but it is only meaningful if it stays
-    // true. A future change that makes the two engines diverge on a CONCRETE type is precisely the
-    // "ownership decided by name-matching" latent-corruption class F5 exists to kill (a value freed by
-    // one engine and kept by the other = a use-after-free or a leak, discovered months later as
-    // "string heap corruption"). So under the shadow flag this is no longer report-only: a disagreement
-    // is a HARD build failure, here, at the divergence, with the offending type named. This is the
-    // silent→loud transformation, applied to the migration invariant itself.
     if (td_disagree > 0 or td_keystone_disagree > 0) {
         std.debug.print(
             "\x1b[1m\x1b[31mFOUNDATION GATE FAILED (F5-2):\x1b[0m\x1b[1m the string ownership engine and the TypeId engine DISAGREE\x1b[0m\n" ++
@@ -794,38 +585,25 @@ pub fn reportTypeIdDiff() void {
     }
 }
 
-// F1 stage 3b: does sema's recorded callee SymbolId (symOf -> legacy_mangled) AGREE with what
-// the func_map suffix scan (resolveCalleeName) resolves a bare-name call to? Counted at the main
-// named-call codegen path. When agree is high and disagree is 0, the scan can be replaced by the
-// SymbolId lookup — the shadow-then-cutover gate for deleting the 227-line scan.
 pub var f1_3b_agree: usize = 0;
 pub var f1_3b_disagree: usize = 0;
-pub var f1_3b_sym_absent: usize = 0; // sema recorded no SymbolId for this call (scan still needed)
+pub var f1_3b_sym_absent: usize = 0;
 pub var f1_3b_last_disagree_sym: []const u8 = "";
 pub var f1_3b_last_disagree_scan: []const u8 = "";
-/// The bare CALLEE names with no recorded SymbolId — names the shape of the coverage gap so the
-/// next `recordSym` branch is chosen from evidence, not guessed.
+
 pub var f1_3b_absent_names: std.StringHashMapUnmanaged(usize) = .empty;
 pub fn noteF13bAbsent(name: []const u8) void {
     const gop = f1_3b_absent_names.getOrPut(std.heap.page_allocator, name) catch return;
     if (gop.found_existing) gop.value_ptr.* += 1 else gop.value_ptr.* = 1;
 }
 
-// F4-5 shadow: at a generic method call, did the receiver resolve to the CONCRETE monomorphized
-// body (e.g. `List_i32_push`) or fall back to the ERASED body (`List_push`)? The erased body cannot
-// be deleted while any call still lands on it, and the design says exactly that ("Deleting it is
-// separate work"). This names the residual erased-reliance so the cutover is driven by evidence, not
-// guessed at: f45_erased_by_name records the MISSING mono symbols (the `List_i32_push` that was not
-// in func_map so the call fell to `List_push`), which is the precise work-list for closing coverage.
-// Report-only under NOVA_SEMA_SHADOW.
-pub var f45_mono_hit: usize = 0; // resolved to a concrete monomorphized body — good
-pub var f45_erased_fallback: usize = 0; // an INSTANTIATED mono_name missed func_map -> fell to erased
-pub var f45_erased_nongeneric: usize = 0; // mono_name == erased (non-generic / erased-context) — correct
+pub var f45_mono_hit: usize = 0;
+pub var f45_erased_fallback: usize = 0;
+pub var f45_erased_nongeneric: usize = 0;
 pub var f45_erased_by_name: std.StringHashMapUnmanaged(usize) = .empty;
 pub fn noteF45Erased(missing_mono: []const u8) void {
     if (!report_enabled) return;
-    // The caller frees `missing_mono` (a `defer allocator.free` on `mono_name`) right after this
-    // returns, so the map MUST own a copy or it stores a dangling pointer (prints garbage bytes).
+
     const gop = f45_erased_by_name.getOrPut(std.heap.page_allocator, missing_mono) catch return;
     if (gop.found_existing) {
         gop.value_ptr.* += 1;
@@ -851,21 +629,19 @@ pub fn reportF45() void {
 }
 
 pub var diff_agree: usize = 0;
-pub var diff_legacy_invented: usize = 0; // legacy answered; F2 says unresolved
-pub var diff_f2_better: usize = 0; // legacy gave up; F2 typed it
-pub var diff_disagree: usize = 0; // both answered, differently
-pub var diff_absent: usize = 0; // not in the IR at all
-/// Which SHAPES are absent. A count says how bad; a shape says what to do.
+pub var diff_legacy_invented: usize = 0;
+pub var diff_f2_better: usize = 0;
+pub var diff_disagree: usize = 0;
+pub var diff_absent: usize = 0;
+
 pub var diff_absent_tags: std.StringHashMapUnmanaged(usize) = .empty;
-/// WHICH functions codegen compiles that sema never walked. The shape says what;
-/// this says where.
+
 pub var diff_absent_fns: std.StringHashMapUnmanaged(usize) = .empty;
 pub var walk_errors: usize = 0;
 pub var walked_fns: std.StringHashMapUnmanaged(void) = .empty;
 var absent_spans: [8][]const u8 = undefined;
 var absent_span_n: usize = 0;
 
-/// Best-effort source location for an expression — enough to go and LOOK.
 fn spanOf(e: *const ast.Expression) ?ast.Span {
     return switch (e.kind) {
         .binary => |b| b.span,
@@ -883,20 +659,6 @@ pub var diff_absent_alloc: ?std.mem.Allocator = null;
 var diff_examples: [12][3][]const u8 = undefined;
 var diff_example_n: usize = 0;
 
-/// Render a TypeId in the LEGACY vocabulary so the two can be compared at all.
-/// Necessarily lossy — that is the point: the legacy side has no way to SAY some
-/// of what F2 knows. `ptr` renders as "i32" because that is the only spelling
-/// legacy has for an address (codegen/types.zig:252), which is exactly the `data:
-/// i32` lie; they will "agree" there while meaning different things.
-
-/// Rewrite a legacy type STRING into canonical spellings: `i32` -> `int`,
-/// `f64` -> `double`, and so on, including inside generics (`List<i32>`).
-///
-/// lower.zig accepts both spellings and interns them to one type, so `i32` and
-/// `int` were never different types — only different words for one. Legacy echoes
-/// whatever the source said; the stdlib says `i32` in 481 places and `int` in 4.
-/// Without this the diff reports the stdlib's inconsistency as a type system
-/// defect, which sends you to fix code that is already correct.
 fn canonicalTypeStr(allocator: std.mem.Allocator, s: []const u8) []const u8 {
     const alias = [_]struct { from: []const u8, to: []const u8 }{
         .{ .from = "i32", .to = "int" },     .{ .from = "u32", .to = "uint" },
@@ -909,7 +671,7 @@ fn canonicalTypeStr(allocator: std.mem.Allocator, s: []const u8) []const u8 {
     var buf = std.ArrayListUnmanaged(u8).empty;
     var i: usize = 0;
     outer: while (i < s.len) {
-        // Only rewrite whole identifier tokens: `Li32st` must not become `Lintst`.
+
         const at_start = i == 0 or !isIdentChar(s[i - 1]);
         if (at_start) {
             for (alias) |a| {
@@ -933,14 +695,6 @@ fn isIdentChar(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
-/// The type's name in CODEGEN's vocabulary (see the `.prim` arm).
-///
-/// INTERNED per TypeId when an owning Sema is available. A TypeId is interned, so
-/// its name is a pure function of it — rendering it twice is pure waste, and the
-/// 4b cutover renders on EVERY resolution: 9,222 renders / 296 allocations on one
-/// corpus case, none of them freed, because codegen never frees what
-/// resolveExpressionTypeName returns. Now: rendered once per distinct type, owned
-/// by the Sema, freed with it.
 pub fn renderLegacy(allocator: std.mem.Allocator, store: *const typesys.TypeStore, id: typesys.TypeId) anyerror![]const u8 {
     render_calls += 1;
     if (live_sema) |sm| {
@@ -950,17 +704,13 @@ pub fn renderLegacy(allocator: std.mem.Allocator, store: *const typesys.TypeStor
         }
     }
     const rendered = try renderUncached(allocator, store, id);
-    // Only composite renders allocate; a prim returns a literal, which must NOT be
-    // interned — the map would try to free static memory at destroy().
+
     if (live_sema) |sm| {
         if (allocatesFor(store.get(id))) return try sm.internName(id, rendered);
     }
     return rendered;
 }
 
-/// Does rendering this type allocate? Mirrors the arms of renderUncached that call
-/// toOwnedSlice/allocPrint. Kept next to it deliberately: interning a string
-/// literal would free static memory, and NOT interning an allocation leaks it.
 fn allocatesFor(t: typesys.Type) bool {
     return switch (t) {
         .struct_ => |st| st.args.len > 0,
@@ -975,9 +725,7 @@ fn renderUncached(allocator: std.mem.Allocator, store: *const typesys.TypeStore,
         .unresolved => "<unresolved>",
         .string => "string",
         .decimal => "decimal",
-        // specs §3.4b — the SAME spelling `codegen/types.zig`'s typeRefToString emits, or the
-        // two renderers disagree about one type, which is how `Atomic<long>` ended up with a
-        // 4-byte cell and 8-byte accesses. One spelling, both paths.
+
         .error_union => |eu| blk: {
             var buf = std.ArrayListUnmanaged(u8).empty;
             try buf.appendSlice(allocator, "ErrUnion(");
@@ -987,18 +735,8 @@ fn renderUncached(allocator: std.mem.Allocator, store: *const typesys.TypeStore,
             try buf.append(allocator, ')');
             break :blk try buf.toOwnedSlice(allocator);
         },
-        .ptr => "ptr", // F3 §5 stage 2: `ptr` is now a first-class codegen primitive
-        // CODEGEN's vocabulary, deliberately — `i32`, not the canonical `int`.
-        //
-        // This renderer feeds the stage-4b cutover, and codegen compares type names
-        // as STRINGS: `expressions.zig:2136` tests `eql(t, "i32")` to route `${n}`
-        // through __i32_to_string, and does NOT accept "int". Handing it the
-        // canonical spelling would silently stop template interpolation working.
-        // F3 migrates codegen's vocabulary; until then the cutover speaks its.
-        //
-        // The DIFF does not suffer for it: recordDiff canonicalises BOTH sides
-        // (canonicalTypeStr), so `i32` and `int` still compare equal there — the
-        // spelling is a codegen interface detail, not a type distinction.
+        .ptr => "ptr",
+
         .prim => |p| switch (p.kind) {
             .bool => "bool",
             .void_ => "void",
@@ -1013,9 +751,7 @@ fn renderUncached(allocator: std.mem.Allocator, store: *const typesys.TypeStore,
         },
         .struct_ => |st| blk: {
             const sym = diff_tab.?.symbolAt(st.decl);
-            // F1 module-scoped types: a struct whose bare name collides across modules renders under its
-            // module-unique `scoped_name` (precomputed, owned by the table) so codegen keys it distinctly.
-            // A non-colliding struct has `scoped_name == null` → bare name, unchanged (the no-op case).
+
             const base = sym.scoped_name orelse sym.name;
             if (st.args.len == 0) break :blk base;
             var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -1033,10 +769,7 @@ fn renderUncached(allocator: std.mem.Allocator, store: *const typesys.TypeStore,
         },
         .enum_ => |sid| diff_tab.?.symbolAt(sid).name,
         .trait_ => |sid| diff_tab.?.symbolAt(sid).name,
-        // Render the real signature. `<fn>` was a placeholder, so EVERY function
-        // type "disagreed" with legacy's `(int) -> int` — 9 of 21 clusters, and the
-        // largest group. Exactly the `<T>` bug from earlier in the same function:
-        // a printer that cannot spell a type reports it as a defect in the type.
+
         .func => |ft| blk: {
             var buf = std.ArrayListUnmanaged(u8).empty;
             try buf.append(allocator, '(');
@@ -1052,13 +785,9 @@ fn renderUncached(allocator: std.mem.Allocator, store: *const typesys.TypeStore,
             break :blk r;
         },
         .optional => |inner| try renderLegacy(allocator, store, inner),
-        // A handle is a bare i64 at runtime (specs 7.1), and this renderer feeds
-        // CODEGEN. Rendering "future<int>" would hand codegen a name it does not
-        // know, and toLLVMType maps everything unknown to `ptr` — silently turning
-        // a handle into a pointer. The TYPE knows it is a future; the ABI does not.
+
         .future => "i64",
-        // Rendered for CODEGEN, which dispatches `.get`/`.set` on this exact spelling
-        // (llvm_codegen.zig compileStorageCall).
+
         .storage => |elem| blk: {
             var buf = std.ArrayListUnmanaged(u8).empty;
             try buf.appendSlice(allocator, "Storage<");
@@ -1066,19 +795,7 @@ fn renderUncached(allocator: std.mem.Allocator, store: *const typesys.TypeStore,
             try buf.append(allocator, '>');
             break :blk try buf.toOwnedSlice(allocator);
         },
-        // Rendered for CODEGEN as `(a,b)` — the spelling getTupleElementType parses.
-        //
-        // ⚠️ This used to render the literal string `"<tuple>"`, which does not start with `(`, so
-        // getTupleElementType returned "i32" for EVERY element of EVERY destructuring, always. That
-        // made `isRefCountedType` false for every tuple element, so the destructuring retain never
-        // fired and the locals were never released — codegen simply did not know which elements were
-        // heap. Every tuple leaked its box and all its elements (28_tuple_return_heap = 68 live
-        // objects, 29_http_request_parse = 46 — together ~108 of the ~118 above-floor objects in the
-        // whole corpus).
-        //
-        // Separator is "," with NO space, matching lower.zig's note that generics render with ", "
-        // and tuples with ",". getTupleElementType is depth-aware over <> and () so a
-        // `(Map<string,int>, int)` element is not split down the middle.
+
         .tuple => |elems| blk: {
             var buf = std.ArrayListUnmanaged(u8).empty;
             try buf.append(allocator, '(');
@@ -1090,47 +807,28 @@ fn renderUncached(allocator: std.mem.Allocator, store: *const typesys.TypeStore,
             break :blk try buf.toOwnedSlice(allocator);
         },
         .array => "<array>",
-        // Render the param's REAL name (`T`), not a placeholder. `<T>` made every
-        // generic render as `List<<T>>` against legacy's `List<T>` and counted as
-        // a disagreement — a defect in this printer being reported as a defect in
-        // the type system. A harness that invents divergences is worse than none:
-        // it sends you to fix code that was already right.
+
         .type_param => |tp| typeParamName(tp) orelse "<T>",
     };
 }
 
-/// The name of a type param, via its owner's declaration. `TypeParam` stores only
-/// {owner, index}, because a TypeId is interned and a name is not part of identity.
 fn typeParamName(tp: typesys.TypeParam) ?[]const u8 {
     const tab = diff_tab orelse return null;
     const owner = tab.symbolAt(tp.owner);
     const names: []const []const u8 = switch (owner.decl) {
         .function => |f| f.type_params,
         .struct_ => |s| s.type_params,
-        // EnumDecl has no type_params — generic enums are not parsed today.
+
         else => return null,
     };
     if (tp.index >= names.len) return null;
     return names[tp.index];
 }
 
-/// F2 stage 4b: divergences aggregated by (shape, legacy -> F2), with counts.
-///
-/// 564 divergences is not 564 problems. Triaging by reading the first 12 examples
-/// is sampling, and sampling picks the loudest cluster, not the biggest one. The
-/// counts are what say which single fix is worth the most — and which "divergence"
-/// is this harness's own bug.
 pub var diff_clusters: std.StringHashMapUnmanaged(usize) = .empty;
-/// One real source location per cluster. A cluster with no example is a claim;
-/// with a file:line it is checkable. Every verdict below was reached by opening
-/// one of these, not by reasoning about the tag name.
+
 pub var diff_cluster_where: std.StringHashMapUnmanaged([]const u8) = .empty;
 
-/// The NAME behind a divergence, when the shape has one. `ident` carries no span
-/// (it is a bare `[]const u8`), so span-based examples render as `?` for the
-/// largest gap clusters — the ones that most need locating. A shape says "38 idents
-/// are unresolved"; a name says WHICH, which is the difference between a number and
-/// a next action.
 fn nameHint(e: *const ast.Expression) ?[]const u8 {
     return switch (e.kind) {
         .ident => |n| n,
@@ -1172,7 +870,6 @@ pub fn setDiffTable(t: *const symbols.SymbolTable) void {
     diff_tab = t;
 }
 
-/// Called from resolveExpressionTypeName with BOTH answers.
 pub fn recordDiff(
     allocator: std.mem.Allocator,
     store: *const typesys.TypeStore,
@@ -1201,9 +898,7 @@ pub fn recordDiff(
     diff_absent_alloc = allocator;
     const f2_raw = renderLegacy(allocator, store, f2) catch return;
     const f2_unres = std.mem.eql(u8, f2_raw, "<unresolved>");
-    // Both sides canonicalised: the renderer speaks codegen's `i32` (see above) and
-    // legacy echoes whatever the source said, so comparing raw strings would report
-    // one type under two spellings as a divergence. It did — 48 of them.
+
     const f2s = canonicalTypeStr(allocator, f2_raw);
 
     if (legacy) |l_raw| {
@@ -1266,7 +961,7 @@ pub fn reportDiff() void {
     var n: usize = 0;
     while (af.next()) |e| {
         if (n >= 14) break;
-        // strip the module prefix to get the source name sema knows
+
         const mangled = e.key_ptr.*;
         const bare = if (std.mem.lastIndexOfScalar(u8, mangled, '_')) |i| mangled[i + 1 ..] else mangled;
         const walked = walked_fns.contains(mangled) or walked_fns.contains(bare);
@@ -1302,28 +997,23 @@ pub fn reportDiff() void {
     out("=== end ===\n\n", .{});
 }
 
-// ---------------------------------------------------------------------------
-// Tests (docs/design/README.md §2b).
-// ---------------------------------------------------------------------------
 const testing = std.testing;
 
 test "canonicalTypeStr: i32 and int are ONE type, so they must render as one word" {
     const a = testing.allocator;
     const cases = [_]struct { in: []const u8, want: []const u8 }{
         .{ .in = "i32", .want = "int" },
-        .{ .in = "int", .want = "int" }, // already canonical — unchanged
+        .{ .in = "int", .want = "int" },
         .{ .in = "f64", .want = "double" },
         .{ .in = "i64", .want = "long" },
         .{ .in = "u32", .want = "uint" },
-        // F3 §3.1: `byte` is UNSIGNED 8 and `sbyte` is SIGNED 8 — so i8 is NOT
-        // `byte`. Mapping both onto `byte` would have canonicalised a signed type
-        // to an unsigned name and called two different types equal.
+
         .{ .in = "i8", .want = "sbyte" },
         .{ .in = "u8", .want = "byte" },
         .{ .in = "i16", .want = "short" },
         .{ .in = "u16", .want = "ushort" },
         .{ .in = "f32", .want = "float" },
-        // inside generics, and both spellings of the SAME map must converge
+
         .{ .in = "Map<string, i32>", .want = "Map<string, int>" },
         .{ .in = "Map<string, int>", .want = "Map<string, int>" },
         .{ .in = "List<i32>", .want = "List<int>" },
@@ -1338,9 +1028,7 @@ test "canonicalTypeStr: i32 and int are ONE type, so they must render as one wor
 
 test "canonicalTypeStr: only whole tokens — a rewriter that invents agreement is worse than none" {
     const a = testing.allocator;
-    // `i32` inside a longer identifier is NOT the type i32. Rewriting it would
-    // make unrelated names collide and manufacture agreement the diff would then
-    // report as progress.
+
     const cases = [_]struct { in: []const u8, want: []const u8 }{
         .{ .in = "myi32var", .want = "myi32var" },
         .{ .in = "i32_helper", .want = "i32_helper" },

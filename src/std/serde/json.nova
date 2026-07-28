@@ -1,14 +1,3 @@
-// json.nova — JSON parsing & serialization.
-//
-//   let v = json.parse("{\"name\":\"Nova\",\"age\":42,\"tags\":[\"a\",\"b\"]}");
-//   let name = json.asString(json.get(v, "name")) ?? "";
-//   let age  = json.asNumber(json.get(v, "age")) ?? 0;
-//
-// JsonValue is a tag-discriminated STRUCT, not a recursive enum: enum payloads +
-// nested containers corrupt memory under ARC in the current compiler, whereas
-// structs are stable. Numbers are kept as raw text so ints and floats both
-// round-trip, coerced on extraction (asNumber / asFloat). The parser is a stateful
-// cursor (no tuple returns — those drop pointer payloads across nested returns).
 
 import string;
 import list;
@@ -16,13 +5,11 @@ import map;
 import bytes;
 import collections.string_builder;
 
-// kind tags
-// 0 = null, 1 = bool, 2 = number, 3 = string, 4 = array, 5 = object
 pub struct JsonValue {
     pub kind: int,
     pub bval: bool,
-    pub num: string,                  // raw numeric text (int or float)
-    pub sval: string,                 // string value
+    pub num: string,
+    pub sval: string,
     pub arr: List<JsonValue>,
     pub obj: Map<string, JsonValue>,
 
@@ -36,22 +23,15 @@ pub struct JsonValue {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Constructors
-// ---------------------------------------------------------------------------
 pub fn null(): JsonValue { return JsonValue(0); }
 pub fn bool(val: bool): JsonValue { let v = JsonValue(1); v.bval = val; return v; }
 pub fn number(val: long): JsonValue { let v = JsonValue(2); v.num = i64ToString(val); return v; }
-// S1: a JSON number carrying a decimal128's EXACT text (JSON numbers are stored as raw text, so
-// `19.99` survives the round-trip with no f64 loss). Extract via `asDecimal`.
+
 pub fn decimalValue(val: decimal): JsonValue { let v = JsonValue(2); v.num = `${val}`; return v; }
 pub fn str(val: string): JsonValue { let v = JsonValue(3); v.sval = val; return v; }
 pub fn array(val: List<JsonValue>): JsonValue { let v = JsonValue(4); v.arr = val; return v; }
 pub fn object(val: Map<string, JsonValue>): JsonValue { let v = JsonValue(5); v.obj = val; return v; }
 
-// ---------------------------------------------------------------------------
-// Extractors
-// ---------------------------------------------------------------------------
 pub fn isNull(val: JsonValue): bool { return val.kind == 0; }
 
 pub fn asBool(val: JsonValue): bool | undefined {
@@ -66,7 +46,7 @@ pub fn asFloat(val: JsonValue): double | undefined {
     if (val.kind == 2) { return string.parseFloat(val.num); }
     return undefined;
 }
-// S1: a JSON number as an EXACT decimal128 (the raw text is parsed straight to BID — no f64 hop).
+
 pub fn asDecimal(val: JsonValue): decimal | undefined {
     if (val.kind == 2) { return decimal.fromString(val.num); }
     return undefined;
@@ -84,7 +64,6 @@ pub fn asObject(val: JsonValue): Map<string, JsonValue> | undefined {
     return undefined;
 }
 
-/// Get a value from a JSON object by key (Null if absent / not an object).
 pub fn get(val: JsonValue, key: string): JsonValue {
     if (val.kind == 5) {
         let r = val.obj.get(key);
@@ -94,7 +73,6 @@ pub fn get(val: JsonValue, key: string): JsonValue {
     return JsonValue(0);
 }
 
-/// True if a JSON object contains the key.
 pub fn has(val: JsonValue, key: string): bool {
     if (val.kind == 5) {
         let r = val.obj.get(key);
@@ -104,7 +82,6 @@ pub fn has(val: JsonValue, key: string): bool {
     return false;
 }
 
-/// Get a value from a JSON array by index (Null if out of range / not an array).
 pub fn at(val: JsonValue, index: int): JsonValue {
     if (val.kind == 4) {
         if (index < 0 || index >= val.arr.size()) { return JsonValue(0); }
@@ -113,16 +90,12 @@ pub fn at(val: JsonValue, index: int): JsonValue {
     return JsonValue(0);
 }
 
-/// Number of elements (array) or keys (object); 0 otherwise.
 pub fn size(val: JsonValue): int {
     if (val.kind == 4) { return val.arr.size(); }
     if (val.kind == 5) { return val.obj.size(); }
     return 0;
 }
 
-// ---------------------------------------------------------------------------
-// Parsing — stateful cursor, no tuples.
-// ---------------------------------------------------------------------------
 struct JsonParser {
     src: string,
     pos: int,
@@ -145,28 +118,28 @@ struct JsonParser {
         self.skipWs();
         if (self.pos >= self.src.length) { return JsonValue(0); }
         let c = self.src[self.pos];
-        if (c == 110) { return self.parseNull(); }             // 'n'
-        if (c == 116 || c == 102) { return self.parseBool(); } // 't' | 'f'
-        if (c == 34) { return self.parseString(); }            // '"'
-        if ((c >= 48 && c <= 57) || c == 45) { return self.parseNumber(); } // 0-9 | '-'
-        if (c == 91) { return self.parseArray(); }             // '['
-        if (c == 123) { return self.parseObject(); }           // '{'
+        if (c == 110) { return self.parseNull(); }
+        if (c == 116 || c == 102) { return self.parseBool(); }
+        if (c == 34) { return self.parseString(); }
+        if ((c >= 48 && c <= 57) || c == 45) { return self.parseNumber(); }
+        if (c == 91) { return self.parseArray(); }
+        if (c == 123) { return self.parseObject(); }
         return JsonValue(0);
     }
 
     fn parseNull(self: JsonParser): JsonValue {
-        self.pos = self.pos + 4; // "null"
+        self.pos = self.pos + 4;
         return JsonValue(0);
     }
 
     fn parseBool(self: JsonParser): JsonValue {
-        if (self.src[self.pos] == 116) {   // 't' -> true
+        if (self.src[self.pos] == 116) {
             self.pos = self.pos + 4;
             let v = JsonValue(1);
             v.bval = true;
             return v;
         }
-        self.pos = self.pos + 5;           // "false"
+        self.pos = self.pos + 5;
         let v = JsonValue(1);
         v.bval = false;
         return v;
@@ -179,16 +152,14 @@ struct JsonParser {
     }
 
     fn hexVal(self: JsonParser, c: int): int {
-        if (c >= 48 && c <= 57) { return c - 48; }   // 0-9
-        if (c >= 97 && c <= 102) { return c - 87; }  // a-f
-        if (c >= 65 && c <= 70) { return c - 55; }   // A-F
+        if (c >= 48 && c <= 57) { return c - 48; }
+        if (c >= 97 && c <= 102) { return c - 87; }
+        if (c >= 65 && c <= 70) { return c - 55; }
         return 0;
     }
 
-    // Emit UTF-8 for a \uXXXX escape (BMP; surrogate pairs TODO). Cursor at 'u';
-    // leaves it just past the 4 hex digits.
     fn appendUnicode(self: JsonParser, sb: StringBuilder): void {
-        self.pos = self.pos + 1; // skip 'u'
+        self.pos = self.pos + 1;
         let cp = 0;
         let k = 0;
         while (k < 4 && self.pos < self.src.length) {
@@ -208,27 +179,26 @@ struct JsonParser {
         }
     }
 
-    // Parse a string literal (cursor at opening quote), decoding escapes.
     fn parseRawString(self: JsonParser): string {
         let len = self.src.length;
-        self.pos = self.pos + 1; // skip opening quote
+        self.pos = self.pos + 1;
         let sb = StringBuilder();
         while (self.pos < len) {
             let c = self.src[self.pos];
-            if (c == 34) { self.pos = self.pos + 1; break; }  // closing '"'
-            if (c == 92) {                                    // '\'
+            if (c == 34) { self.pos = self.pos + 1; break; }
+            if (c == 92) {
                 self.pos = self.pos + 1;
                 if (self.pos >= len) { break; }
                 let e = self.src[self.pos];
-                if (e == 110) { sb.appendChar(10); }          // \n
-                else if (e == 116) { sb.appendChar(9); }      // \t
-                else if (e == 114) { sb.appendChar(13); }     // \r
-                else if (e == 34) { sb.appendChar(34); }      // \"
-                else if (e == 92) { sb.appendChar(92); }      // \\
-                else if (e == 47) { sb.appendChar(47); }      // \/
-                else if (e == 98) { sb.appendChar(8); }       // \b
-                else if (e == 102) { sb.appendChar(12); }     // \f
-                else if (e == 117) { self.appendUnicode(sb); } // \uXXXX
+                if (e == 110) { sb.appendChar(10); }
+                else if (e == 116) { sb.appendChar(9); }
+                else if (e == 114) { sb.appendChar(13); }
+                else if (e == 34) { sb.appendChar(34); }
+                else if (e == 92) { sb.appendChar(92); }
+                else if (e == 47) { sb.appendChar(47); }
+                else if (e == 98) { sb.appendChar(8); }
+                else if (e == 102) { sb.appendChar(12); }
+                else if (e == 117) { self.appendUnicode(sb); }
                 else { sb.appendChar(e); }
                 if (e != 117) { self.pos = self.pos + 1; }
             } else {
@@ -242,13 +212,13 @@ struct JsonParser {
     fn parseNumber(self: JsonParser): JsonValue {
         let len = self.src.length;
         let start = self.pos;
-        if (self.src[self.pos] == 45) { self.pos = self.pos + 1; } // '-'
+        if (self.src[self.pos] == 45) { self.pos = self.pos + 1; }
         while (self.pos < len) {
             let c = self.src[self.pos];
             if (c >= 48 && c <= 57) {
                 self.pos = self.pos + 1;
             } else if (c == 46 || c == 101 || c == 69 || c == 43 || c == 45) {
-                self.pos = self.pos + 1; // '.', 'e', 'E', '+', '-'
+                self.pos = self.pos + 1;
             } else {
                 break;
             }
@@ -259,10 +229,10 @@ struct JsonParser {
     }
 
     fn parseArray(self: JsonParser): JsonValue {
-        self.pos = self.pos + 1; // '['
+        self.pos = self.pos + 1;
         let node = JsonValue(4);
         self.skipWs();
-        if (self.pos < self.src.length && self.src[self.pos] == 93) { // ']'
+        if (self.pos < self.src.length && self.src[self.pos] == 93) {
             self.pos = self.pos + 1;
             return node;
         }
@@ -272,27 +242,27 @@ struct JsonParser {
             self.skipWs();
             if (self.pos >= self.src.length) { break; }
             let c = self.src[self.pos];
-            if (c == 44) { self.pos = self.pos + 1; self.skipWs(); } // ','
-            else if (c == 93) { self.pos = self.pos + 1; break; }    // ']'
+            if (c == 44) { self.pos = self.pos + 1; self.skipWs(); }
+            else if (c == 93) { self.pos = self.pos + 1; break; }
             else { break; }
         }
         return node;
     }
 
     fn parseObject(self: JsonParser): JsonValue {
-        self.pos = self.pos + 1; // '{'
+        self.pos = self.pos + 1;
         let node = JsonValue(5);
         self.skipWs();
-        if (self.pos < self.src.length && self.src[self.pos] == 125) { // '}'
+        if (self.pos < self.src.length && self.src[self.pos] == 125) {
             self.pos = self.pos + 1;
             return node;
         }
         while (true) {
             self.skipWs();
-            if (self.pos >= self.src.length || self.src[self.pos] != 34) { break; } // expect '"'
+            if (self.pos >= self.src.length || self.src[self.pos] != 34) { break; }
             let key = self.parseRawString();
             self.skipWs();
-            if (self.pos < self.src.length && self.src[self.pos] == 58) { // ':'
+            if (self.pos < self.src.length && self.src[self.pos] == 58) {
                 self.pos = self.pos + 1;
                 self.skipWs();
                 let v = self.parseValue();
@@ -300,8 +270,8 @@ struct JsonParser {
                 self.skipWs();
                 if (self.pos >= self.src.length) { break; }
                 let c = self.src[self.pos];
-                if (c == 44) { self.pos = self.pos + 1; }              // ','
-                else if (c == 125) { self.pos = self.pos + 1; break; } // '}'
+                if (c == 44) { self.pos = self.pos + 1; }
+                else if (c == 125) { self.pos = self.pos + 1; break; }
                 else { break; }
             } else {
                 break;
@@ -316,9 +286,6 @@ pub fn parse(src: string): JsonValue {
     return p.parseValue();
 }
 
-// ---------------------------------------------------------------------------
-// Serialization (stringify) — index/keys iteration (no forEach closures).
-// ---------------------------------------------------------------------------
 pub fn stringify(val: JsonValue): string {
     if (val.kind == 0) { return "null"; }
     if (val.kind == 1) { return if (val.bval) "true" else "false"; }
@@ -347,11 +314,6 @@ pub fn stringify(val: JsonValue): string {
     return "null";
 }
 
-// ---------------------------------------------------------------------------
-// String helpers
-// ---------------------------------------------------------------------------
-
-/// JSON-quote and escape a string (used by generated __toJson serializers).
 pub fn quote(s: string): string {
     return quoteString(s);
 }
@@ -360,7 +322,7 @@ fn quoteString(s: string): string {
     let len = s.length;
     let result = bytes.alloc(len * 2 + 2);
     let offset = 0;
-    bytes.write_byte(result, offset, 34); // '"'
+    bytes.write_byte(result, offset, 34);
     offset = offset + 1;
     let i = 0;
     while (i < len) {
@@ -391,7 +353,7 @@ fn quoteString(s: string): string {
         }
         i = i + 1;
     }
-    bytes.write_byte(result, offset, 34); // '"'
+    bytes.write_byte(result, offset, 34);
     offset = offset + 1;
     bytes.write_i32(result - 4, 0, offset);
     return result as string;
@@ -411,7 +373,7 @@ fn i64ToString(val: long): string {
     temp = v;
     while (i >= 0) {
         if (neg && i == 0) {
-            bytes.write_byte(str_ptr, 0, 45); // '-'
+            bytes.write_byte(str_ptr, 0, 45);
         } else {
             bytes.write_byte(str_ptr, i, (temp % 10) + 48);
             temp = temp / 10;

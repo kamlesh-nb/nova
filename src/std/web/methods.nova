@@ -1,4 +1,4 @@
-// methods.nova — HTTP Methods representation using refined enums with methods
+
 import bytes;
 import string;
 

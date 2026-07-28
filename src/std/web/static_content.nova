@@ -1,12 +1,4 @@
-// static_content.nova — static file serving for the web App (W2).
-//
-// An LRU cache in front of a filesystem directory: `app.useStatic("/static", "./wwwroot")`
-// serves files under the URL prefix from disk, caching hot files (bounded, with hit/miss
-// stats). Path-traversal (`..`) is rejected; `/` maps to `index.html`; the Content-Type is
-// derived from the extension.
-//
-// Reimplemented in Nova (not bound from Zig) so it is portable (wasm-ready) and dogfoods
-// the collections + io + mime stdlib.
+
 import string;
 import map;
 import list;
@@ -15,9 +7,6 @@ import web.mime;
 import web.response;
 import web.status;
 
-/// A bounded least-recently-used cache: key -> content, evicting the least-recently-used
-/// entry when full. `order` holds keys front=LRU .. back=MRU. Small capacities only (the
-/// order scan is linear), which is exactly the hot-static-file use case.
 pub struct LruCache {
     pub capacity: int,
     pub store: map.Map<string, string>,
@@ -33,7 +22,6 @@ pub struct LruCache {
         self.misses = 0;
     }
 
-    // Move `key` to the most-recently-used position (remove where present, append to back).
     fn touch(self: LruCache, key: string): void {
         let n = self.order.size();
         let i = 0;
@@ -41,7 +29,7 @@ pub struct LruCache {
             let k = self.order.get(i) ?? "";
             if (string.eql(k, key)) {
                 self.order.remove(i);
-                i = n; // done
+                i = n;
             } else {
                 i = i + 1;
             }
@@ -81,15 +69,12 @@ pub struct LruCache {
     }
 }
 
-// Extension of a path WITHOUT the leading dot ("" if none).
 fn fileExt(path: string): string {
     let dot = string.lastIndexOf(path, ".");
     if (dot == -1) { return ""; }
     return string.slice(path, dot + 1, path.length);
 }
 
-
-/// A static mount: URL `prefix` -> filesystem `dir`, fronted by an LRU cache.
 pub struct StaticMount {
     pub prefix: string,
     pub dir: string,
@@ -101,8 +86,6 @@ pub struct StaticMount {
         self.cache = LruCache(cacheCap);
     }
 
-    /// Serve `reqPath` if it falls under this mount, else undefined (caller 404s). Returns a
-    /// 403 for path traversal. Content-Type is set from the file extension.
     pub fn serve(self: StaticMount, reqPath: string): response.Response | undefined {
         if (!string.startsWith(reqPath, self.prefix)) {
             return undefined;
@@ -120,7 +103,7 @@ pub struct StaticMount {
         let cached = self.cache.get(fsPath);
         if (cached == undefined) {
             if (!file.File.exists(fsPath)) {
-                return undefined; // not found under this mount -> let dispatch 404
+                return undefined;
             }
             content = file.File.readText(fsPath);
             self.cache.put(fsPath, content);

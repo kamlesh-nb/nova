@@ -1,4 +1,4 @@
-// server.nova — HttpServer: fiber-per-connection HTTP/1.1 server
+
 import bytes;
 import mem.allocator;
 import string;
@@ -43,8 +43,7 @@ pub struct HttpServer {
             if (stream.fd == -1) {
                 break;
             }
-            // Handle the connection. (Was fiber.spawn — which ran inline, so the server was already
-            // serial; real per-connection concurrency needs async `spawn` + async socket I/O, a follow-on.)
+
             handleConnection(stream, handler);
         }
     }

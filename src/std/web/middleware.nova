@@ -1,4 +1,4 @@
-// middleware.nova — HTTP Middleware pipeline for request interception and post-processing
+
 import web.request;
 import web.response;
 import web.methods;

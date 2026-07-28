@@ -1,11 +1,11 @@
-// tls.nova — TLS/HTTPS secure socket client
+
 import net.tcp.socket;
 import bytes;
 import net.tcp.client;
 
 pub struct TlsStream {
     pub stream: socket.TcpStream,
-    pub ctx: ptr,   // TlsContext* pointer
+    pub ctx: ptr,
 
     init(stream: socket.TcpStream, hostname: string) {
         self.stream = stream;
@@ -27,7 +27,7 @@ pub struct TlsStream {
             bytes.free(buf);
             return "";
         }
-        // ARC-correct string alloc (workstream A): data at ptr, length at [ptr-4].
+
         let str_ptr = bytes.alloc(n);
         let i = 0;
         while (i < n) {
@@ -59,14 +59,14 @@ fn test_tls_handshake(): void {
     let tls_stream = TlsStream(tcp_stream, "example.com");
     let res = tls_stream.handshake();
     console.log(`TLS TEST: handshake result = ${res}`);
-    
+
     tls_stream.write("GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n");
     console.log("TLS TEST: request written");
-    
+
     let resp = tls_stream.read(1024);
     console.log(`TLS TEST: read ${resp.length} bytes:`);
     console.log(resp);
-    
+
     tls_stream.close();
     console.log("TLS TEST: done");
 }

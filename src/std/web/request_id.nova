@@ -1,4 +1,4 @@
-// request_id.nova — Request ID tracing middleware
+
 import web.request;
 import web.response;
 import web.middleware;

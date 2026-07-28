@@ -1,4 +1,4 @@
-// multipart.nova — Multipart payload parser (multipart/form-data)
+
 import collections.list;
 import string;
 import assert;
@@ -14,7 +14,7 @@ fn extractBoundary(contentType: string): string {
     let idx = string.indexOf(contentType, "boundary=");
     if (idx == -1) return "";
     let boundary = string.slice(contentType, idx + 9, contentType.length);
-    if (boundary.length > 0 && boundary[0] == 34) { // '"'
+    if (boundary.length > 0 && boundary[0] == 34) {
         let endIdx = string.indexOf(string.slice(boundary, 1, boundary.length), "\"");
         if (endIdx != -1) {
             boundary = string.slice(boundary, 1, endIdx + 1);
@@ -28,7 +28,7 @@ fn extractParam(header: string, paramName: string): string {
     let idx = string.indexOf(header, search);
     if (idx == -1) return "";
     let start = idx + search.length;
-    if (start < header.length && header[start] == 34) { // '"'
+    if (start < header.length && header[start] == 34) {
         let end = string.indexOf(string.slice(header, start + 1, header.length), "\"");
         if (end != -1) {
             return string.slice(header, start + 1, start + 1 + end);
@@ -47,7 +47,7 @@ pub fn parseMultipart(contentType: string, body: string): List<Part> {
     let i = 0;
     while (i < rawParts.len) {
         let partStr = rawParts.at(i);
-        // Clean trailing/leading dashes for final part orelse preamble
+
         if (string.startsWith(partStr, "--") || partStr == "" || partStr == "\r\n" || partStr == "\n") {
             i = i + 1;
             continue;
@@ -63,8 +63,7 @@ pub fn parseMultipart(contentType: string, body: string): List<Part> {
         if (headerEnd != -1) {
             let headers = string.slice(partStr, 0, headerEnd);
             let rawData = string.slice(partStr, headerEnd + dataStart, partStr.length);
-            
-            // Clean leading/trailing newlines from data
+
             if (string.startsWith(rawData, "\r\n")) {
                 rawData = string.slice(rawData, 2, rawData.length);
             } else if (string.startsWith(rawData, "\n")) {
@@ -112,10 +111,10 @@ pub fn parseMultipart(contentType: string, body: string): List<Part> {
 fn test_multipart_parsing(): void {
     let contentType = "multipart/form-data; boundary=WebKitFormBoundary";
     let body = "--WebKitFormBoundary\r\nContent-Disposition: form-data; name=\"action\"\r\n\r\ndeploy-binary\r\n--WebKitFormBoundary\r\nContent-Disposition: form-data; name=\"binary\"; filename=\"app.bin\"\r\nContent-Type: application/octet-stream\r\n\r\nbin-data\r\n--WebKitFormBoundary--\r\n";
-    
+
     let parts = parseMultipart(contentType, body);
     assert.isTrue(parts.len == 2);
-    
+
     let p1 = parts.at(0);
     assert.equalStr("action", p1.name);
     assert.equalStr("deploy-binary", p1.data);

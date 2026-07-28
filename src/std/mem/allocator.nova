@@ -1,11 +1,11 @@
-// allocator.nova — Explicit Allocator standard library
+
 import bytes;
 
 pub struct Allocator {
-    pub kind: int, // 0 = Arena/custom, 1 = C/Persistent
-    pub ctx: ptr,                        // context address (ArenaAllocator*, or 0)
-    pub allocFn: (ptr, int) -> ptr,      // (ctx-addr, size) -> address
-    pub freeFn: (ptr, ptr) -> void,      // (ctx-addr, block-addr)
+    pub kind: int,
+    pub ctx: ptr,
+    pub allocFn: (ptr, int) -> ptr,
+    pub freeFn: (ptr, ptr) -> void,
 
     pub fn alloc(self: Allocator, size: int): ptr {
         let f = self.allocFn;

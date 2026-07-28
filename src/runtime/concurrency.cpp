@@ -1,18 +1,8 @@
-// concurrency.cpp — Nova C++20 runtime: concurrency + program entry.
-//
-// CURRENT: synchronous v0 shim (spawn runs the fiber inline; channels are simple
-// std blocking queues; entry calls __nova_main directly). This is stable and
-// passes the (synchronous) corpus.
-//
-// The multi-threaded Boost.Fiber implementation (work-stealing scheduler +
-// fiber-aware channels) is preserved in concurrency_boost.cpp.wip. It links and
-// runs synchronous corpus programs sometimes but currently has a FLAKY hang
-// (likely default fiber stack size / scheduler-setup) that needs debugger-level
-// investigation before it can be switched on. Once fixed, swap it back in here.
+
 #include "nova_abi.h"
 #include <boost/asio.hpp>
 #ifndef _WIN32
-#include <sys/socket.h> // P4: SO_REUSEPORT / setsockopt
+#include <sys/socket.h>
 #endif
 #include <cstdio>
 #include <chrono>
@@ -29,8 +19,6 @@ extern "C" long long __nova_main(void);
 
 extern "C" {
 
-// A Nova closure value is a heap box {fn_ptr, env} (A1). spawn unpacks and, for
-// v0, runs it inline (synchronous).
 void nova_concurrency_spawn(long long closure) {
     if (!closure) return;
     long long *box = reinterpret_cast<long long *>(closure);
@@ -40,7 +28,6 @@ void nova_concurrency_sleep(long long ms) {
     std::this_thread::sleep_for(std::chrono::milliseconds(ms));
 }
 
-// ===== Channels (simple bounded blocking queue) ============================
 namespace {
 struct Channel {
     std::mutex m;
@@ -48,7 +35,7 @@ struct Channel {
     std::queue<long long> q;
     int capacity;
 };
-} // namespace
+}
 long long nova_channel_create(int capacity) {
     auto *c = new Channel();
     c->capacity = capacity > 0 ? capacity : 1;
@@ -74,46 +61,19 @@ long long nova_channel_recv(long long h) {
 }
 void nova_channel_destroy(long long h) { delete reinterpret_cast<Channel *>(h); }
 
-// ===== Coroutine scheduler (M3-D: Asio io_context) =========================
-// The scheduler is now an `asio::io_context`. Scheduling a coroutine posts a resume
-// handler; nova_run() drains the context until idle. This replaces the M3-C FIFO
-// and, crucially, keeps the loop alive across genuine I/O waits: a pending
-// steady_timer / socket op is outstanding work, so run() blocks until it completes
-// instead of returning on a momentarily-empty queue (which the FIFO couldn't model).
-//
-// Coroutines are resumed/inspected via the LLVM switched-resume ABI directly from
-// C++ (the frame's first two pointers are resume/destroy; a null resume pointer
-// means done) — verified against Nova-compiled coroutines. This lets Asio completion
-// handlers drive Nova coroutines even though `llvm.coro.resume` is a compiler-only
-// intrinsic.
 namespace {
-// Runtime singletons are intentionally LEAKED (references to heap objects, never
-// deleted) so no static destructor runs at process exit. This avoids a
-// static-destruction-order fiasco: background threads (the pool / scheduler) can
-// still post to the io_context and touch these mutexes/maps during teardown, and
-// destructing them first crashes with "mutex lock failed". The OS reclaims on exit.
-// P0 (share-nothing, docs/design/path-a-share-nothing-scope.md): the reactor pool. A Reactor
-// is one io_context that will (P3) own a pinned thread and share nothing with its peers. For P0
-// there is exactly ONE reactor and `g_io` ALIASES it, so behavior is byte-identical to the old
-// single shared io_context — this phase lands ONLY the abstraction (the struct + the pool + the
-// accessors) that P1 (coroutine→reactor affinity) and P3 (N = cores-1) build on. Leaked like
-// every runtime singleton (no static-destruction-order fiasco).
+
 struct Reactor {
     boost::asio::io_context io;
     int id;
     explicit Reactor(int i) : id(i) {}
 };
 std::vector<Reactor *> &g_reactors = *new std::vector<Reactor *>{new Reactor(0)};
-// P1: the reactor the CURRENT worker thread serves. In P0/P1 every thread serves the single
-// reactor 0, so this stays 0; P3 (one pinned thread per reactor) sets it per reactor thread.
-// DISTINCT from g_nova_tid (the thread index used by per-thread lock-free pools) — in P0/P1 N
-// threads share reactor 0 so tids span 0..N-1 while reactor_id is 0; in P3 they coincide.
+
 thread_local int g_reactor_id = 0;
-// P4c: one-shot "pin the NEXT coroutine created on this thread to reactor N" hint (-1 = none).
-// Set by nova_pin_next_coro right before a `spawn`, so each per-reactor accept loop lands on its
-// reactor; consumed by the next CoroState construction. This is the codegen-free `spawnOn`.
+
 thread_local int g_pin_next = -1;
-// The historical name, now bound to reactor 0. Every existing use routes through the pool.
+
 boost::asio::io_context &g_io = g_reactors[0]->io;
 
 using nova_coro_fn = void (*)(void *);
@@ -124,32 +84,15 @@ inline bool raw_coro_done(long long h) {
     return reinterpret_cast<void **>(h)[0] == nullptr;
 }
 
-// M3-D-3: waiter registry (child handle → the coroutine awaiting it). Kept in the
-// runtime, NOT in the coroutine promise, so that the awaiter is scheduled by the
-// RESUMER *after* the child's resume fully returns — never while the child is still
-// executing its epilogue. This closes a multi-thread use-after-free where a parent
-// could resume on another core and coro.destroy the child mid-epilogue.
-// g_waiters is NOT striped: select/whenAny arm+disarm `self` across a SET of futures under ONE lock
-// (atomic waiter-set swap), which striping (per-handle mutex) would break. It's also cold (await/select
-// only), so it stays a single mutex. The HOT map (g_corostates, hit on every schedule) and g_heldargs
-// ARE striped below — both are single-handle-keyed with no cross-handle atomicity requirement.
 std::mutex &g_waiters_mu = *new std::mutex();
 std::unordered_map<long long, long long> &g_waiters = *new std::unordered_map<long long, long long>();
 
-// P2 (share-nothing contention relief): a lock-STRIPED map. Coroutine bookkeeping is keyed by a frame
-// handle; under N reactor threads a single global mutex convoys them, so hash the handle into
-// NSTRIPES independent {mutex, map} stripes — N reactor threads mostly hit different stripes → ~N-fold
-// less contention, and correctness is UNCHANGED (each key is still fully mutex-protected; no
-// single-thread reasoning). Chosen over per-reactor thread_local (which would need the maps to be
-// touched by exactly one reactor thread — not true across the fan-out spawn / cross-reactor wakeups).
-// extern "C++": this whole TU is inside `extern "C"` (for the ABI entry points), but a TEMPLATE must
-// have C++ linkage — so scope the striped-map infra in a C++-linkage block.
 extern "C++" {
-constexpr size_t NSTRIPES = 64; // power of 2; >= the 16-reactor cap for good spread
+constexpr size_t NSTRIPES = 64;
 inline size_t stripe_of(long long handle) {
     unsigned long long x = static_cast<unsigned long long>(handle);
     x ^= x >> 16;
-    x *= 0x9E3779B97F4A7C15ULL; // fibonacci hash mix (frames are aligned; low bits alone collide)
+    x *= 0x9E3779B97F4A7C15ULL;
     x ^= x >> 32;
     return static_cast<size_t>(x & (NSTRIPES - 1));
 }
@@ -163,17 +106,11 @@ struct StripedMap {
     StripedMap() : stripes(new Stripe[NSTRIPES]) {}
     Stripe &at(long long handle) { return stripes[stripe_of(handle)]; }
 };
-} // extern "C++"
+}
 
-// Owned arguments to release when a SPAWNED coroutine completes. A spawn reads its arguments
-// asynchronously — after the spawning statement has drained its temporaries — so an owned-temporary
-// argument (e.g. a trait object freshly widened for the call) must outlive that drain and be
-// released when the coroutine finishes. buildGo retains such an arg and registers {ptr, dtor} here;
-// nova_coro_release_held (called on completion) releases it, exactly as the statement drain would.
 StripedMap<std::vector<std::pair<long long, void (*)(long long)>>> &g_heldargs =
     *new StripedMap<std::vector<std::pair<long long, void (*)(long long)>>>();
 
-// Release a completed coroutine's held args (call with NO held-args lock; it takes it itself).
 static void nova_coro_release_held(long long coro) {
     std::vector<std::pair<long long, void (*)(long long)>> held;
     {
@@ -201,40 +138,22 @@ struct CoroState {
     bool running = false;
     bool pending_resume = false;
     bool is_detached = false;
-    // Set when an awaiter wants the frame destroyed but the scheduler is still
-    // inside raw_coro_resume() / still reading the frame. The scheduler performs
-    // the destroy once it is done. See nova_coro_release().
+
     bool destroy_when_idle = false;
-    // P1: this coroutine's REACTOR AFFINITY — captured at creation from the creating thread's
-    // g_reactor_id and never changed. A coroutine (and the socket it owns) lives entirely on this
-    // reactor. In P0/P1 there is one reactor so this is 0; P3 makes it meaningful. A `spawn`ed
-    // child's CoroState is created on the parent's thread, so the child inherits the parent's reactor.
+
     int reactor_id;
-    // M3-D-7: per-coroutine strand, now built from THIS coroutine's reactor (identical to the old
-    // `make_strand(g_io)` while there is one reactor). All of this coroutine's resumes are posted
-    // here and its async socket-op completions are bound here, so every operation on the socket it
-    // owns runs serially. Asio requires this: a single tcp::socket must not be touched from multiple
-    // threads without a strand. Once P3 makes each reactor single-threaded the strand is a free
-    // no-op (no contention on a one-thread io_context); dropping it then is an optional optimization.
+
     boost::asio::strand<boost::asio::io_context::executor_type> strand;
-    // reactor_id = the one-shot pin if set (P4c spawnOn), else the creating thread's reactor.
+
     CoroState()
         : reactor_id(g_pin_next >= 0 ? g_pin_next : g_reactor_id),
           strand(boost::asio::make_strand(g_reactors[reactor_id]->io)) {
-        if (g_pin_next >= 0) g_pin_next = -1; // consume the one-shot hint
+        if (g_pin_next >= 0) g_pin_next = -1;
     }
 };
-// STRIPED (P2): the hottest map — get_coro_state runs on every schedule. Its per-key mutex is the
-// stripe's mutex, so the load-bearing lock-ordering below (stripe mutex released before state->mu) is
-// preserved; only the contention is spread across NSTRIPES.
+
 StripedMap<std::shared_ptr<CoroState>> &g_corostates = *new StripedMap<std::shared_ptr<CoroState>>();
 
-// Returns a shared_ptr, not a raw pointer, and that is load-bearing: the caller
-// releases the stripe mutex before it locks state->mu, so with a raw pointer the
-// owning lambda could erase+delete the state in that window and the caller would
-// lock a freed mutex. Sharing ownership makes the state outlive every holder --
-// the "fiber on two threads" use-after-free. The map's entry is dropped by erase();
-// the object dies when the last in-flight holder releases it.
 std::shared_ptr<CoroState> get_coro_state(long long handle) {
     auto &s = g_corostates.at(handle);
     std::lock_guard<std::mutex> lk(s.mu);
@@ -246,26 +165,14 @@ std::shared_ptr<CoroState> get_coro_state(long long handle) {
     }
     return it->second;
 }
-} // namespace
+}
 
-// Register `parent` as the coroutine to wake when `child` completes. Called (before
-// scheduling the child) by an `await child()`; the registration is visible to the
-// resumer via the mutex + Asio's happens-before on the scheduled resume.
 void nova_register_waiter(long long child, long long parent) {
     if (!child || !parent) return;
     std::lock_guard<std::mutex> lk(g_waiters_mu);
     g_waiters[child] = parent;
 }
 
-// `select`/`when_any` over a set of futures: `buf` points to `n` coroutine handles (int64 each).
-// Returns the index of the FIRST already-completed future WITHOUT consuming it (the caller then
-// awaits that one for its value), or -1 when none is ready — in which case `self` is armed as the
-// waiter on ALL of them, so the first to complete reschedules `self` to poll again. On a hit, any
-// arming this call placed for `self` is cleared, so a later-completing future does not reschedule a
-// `self` that has moved on (its take_waiter then finds no entry). One lock hold makes the
-// done-check + arm/disarm atomic against take_waiter (which takes the same lock), so no wakeup is
-// lost even if a future completes on another core. NOTE: the losing futures keep running — the
-// caller should await (drain) them to free their frames.
 long long nova_when_any(long long buf, long long n, long long self) {
     const long long *h = reinterpret_cast<const long long *>(buf);
     std::lock_guard<std::mutex> lk(g_waiters_mu);
@@ -283,12 +190,6 @@ long long nova_when_any(long long buf, long long n, long long self) {
     return -1;
 }
 
-// select-with-deadline: like nova_when_any, but ALSO races the futures against an `ms`-millisecond
-// timer — the substrate for a WHOLE-QUERY deadline `select(query, timer)`. Returns the first
-// completed future's index, or -2 if the deadline elapsed first, or -1 while still waiting (futures
-// armed + a one-shot timer armed on the first call). No separate timer coroutine (which would
-// linger the full `ms` and leak); the timer is a plain steady_timer whose completion just
-// reschedules `self` to poll again. On resolution the timer is cancelled and its state erased.
 namespace {
 struct WhenAnyDeadline {
     std::shared_ptr<boost::asio::steady_timer> timer;
@@ -298,7 +199,6 @@ struct WhenAnyDeadline {
 std::mutex &g_wadl_mu = *new std::mutex();
 std::unordered_map<long long, WhenAnyDeadline> &g_wadl = *new std::unordered_map<long long, WhenAnyDeadline>();
 
-// Erase self's deadline state and cancel its timer (call with NEITHER lock held).
 void wadl_clear(long long self) {
     std::shared_ptr<boost::asio::steady_timer> t;
     {
@@ -310,7 +210,7 @@ void wadl_clear(long long self) {
     }
     if (t) t->cancel();
 }
-// Disarm self as the waiter on every handle in [h, h+n) (call with NEITHER lock held).
+
 void wadl_disarm(const long long *h, long long n, long long self) {
     std::lock_guard<std::mutex> lk(g_waiters_mu);
     for (long long j = 0; j < n; ++j) {
@@ -318,11 +218,11 @@ void wadl_disarm(const long long *h, long long n, long long self) {
         if (it != g_waiters.end() && it->second == self) g_waiters.erase(it);
     }
 }
-} // namespace
+}
 
 long long nova_when_any_deadline(long long buf, long long n, long long ms, long long self) {
     const long long *h = reinterpret_cast<const long long *>(buf);
-    // 1. A completed future wins over a simultaneous timeout (prefer the real result).
+
     long long found = -1;
     {
         std::lock_guard<std::mutex> lk(g_waiters_mu);
@@ -337,7 +237,6 @@ long long nova_when_any_deadline(long long buf, long long n, long long ms, long 
     }
     if (found >= 0) { wadl_clear(self); return found; }
 
-    // 2. Deadline elapsed?
     bool timed_out = false;
     {
         std::lock_guard<std::mutex> lk(g_wadl_mu);
@@ -346,7 +245,6 @@ long long nova_when_any_deadline(long long buf, long long n, long long ms, long 
     }
     if (timed_out) { wadl_disarm(h, n, self); return -2; }
 
-    // 3. Arm the futures (waiters) + a one-shot timer on the first pass.
     {
         std::lock_guard<std::mutex> lk(g_waiters_mu);
         for (long long i = 0; i < n; ++i)
@@ -361,7 +259,7 @@ long long nova_when_any_deadline(long long buf, long long n, long long ms, long 
             st.timer->expires_after(std::chrono::milliseconds(ms < 0 ? 0 : ms));
             long long self_c = self;
             st.timer->async_wait([self_c](const boost::system::error_code &ec) {
-                if (ec) return; // cancelled (a future won)
+                if (ec) return;
                 {
                     std::lock_guard<std::mutex> wl(g_wadl_mu);
                     auto it = g_wadl.find(self_c);
@@ -374,12 +272,6 @@ long long nova_when_any_deadline(long long buf, long long n, long long ms, long 
     return -1;
 }
 
-// M3-D-4: `await <future>` on a task launched with `go`. Atomically (under the same
-// registry mutex that `take_waiter` uses) either observes the task already complete
-// (return 1 → caller reads the result inline, no suspend) or registers `waiter` and
-// returns 0 (caller suspends; the runtime wakes it when the task completes). Doing
-// the done-check and the registration under one lock closes the classic
-// wait-registration race — no lost wakeup even if the task finishes on another core.
 long long nova_await_future(long long future, long long waiter) {
     if (!future) return 1;
     std::lock_guard<std::mutex> lk(g_waiters_mu);
@@ -388,12 +280,6 @@ long long nova_await_future(long long future, long long waiter) {
     return 0;
 }
 
-// Schedule a coroutine handle to be resumed by the event loop. After the resume
-// returns, if the coroutine has completed, wake its registered waiter (race-free:
-// the waiter runs strictly after this resume returns).
-// Register an owned arg (with its destructor) to be released when coroutine `coro` completes —
-// C-linkage entry point for buildGo (see the g_heldargs comment). The map + release helper live in
-// the file-local namespace above; this wrapper just exposes the insert with external linkage.
 void nova_coro_hold_arg(long long coro, long long ptr, void (*dtor)(long long)) {
     if (!coro || !ptr) return;
     auto &s = g_heldargs.at(coro);
@@ -417,8 +303,7 @@ void nova_sched_schedule(long long handle) {
 
     boost::asio::post(state->strand, [handle, state]() {
         if (raw_coro_done(handle)) {
-            // Already complete by the time we were dispatched (someone else drove it
-            // to completion between nova_sched_schedule's done-check and this post).
+
             bool destroy_self;
             bool deferred_destroy;
             {
@@ -428,22 +313,13 @@ void nova_sched_schedule(long long handle) {
                 deferred_destroy = state->destroy_when_idle;
                 state->destroy_when_idle = false;
             }
-            // Drop the map's reference; any in-flight holder keeps the state
-            // alive via its own shared_ptr (see get_coro_state).
+
             {
                 auto &cs = g_corostates.at(handle);
                 std::lock_guard<std::mutex> glk(cs.mu);
                 cs.map.erase(handle);
             }
-            // take_waiter is MANDATORY here, exactly as in the post-resume path.
-            // Omitting it leaked the registration in g_waiters forever — and
-            // g_waiters is keyed by a coroutine handle, i.e. a heap address, which
-            // is REUSED once the frame is freed. A later coroutine landing on that
-            // address inherits the stale waiter, and take_waiter then hands back a
-            // long-destroyed frame which the scheduler resumes: a jump through a
-            // garbage function pointer (PC == the bad address). That was the
-            // remaining `10_async_go` crash, and it needed two sequential async
-            // drives to show up — one to leak the entry, one to reuse the address.
+
             nova_coro_release_held(handle);
             long long w = take_waiter(handle);
             if (w) {
@@ -463,12 +339,7 @@ void nova_sched_schedule(long long handle) {
         bool deferred_destroy = false;
         {
             std::lock_guard<std::mutex> lk(state->mu);
-            // raw_coro_done() reads the FRAME, so it must be serialised against
-            // nova_coro_release() — which is why release() also takes state->mu and
-            // defers while `running`. Without that, an awaiter on the ready path
-            // (nova_await_future returned 1) destroys this frame while we are still
-            // reading it. That is a genuine two-thread use-after-free: it vanishes
-            // under NOVA_THREADS=1 and under ASAN (whose slowdown closes the window).
+
             if (raw_coro_done(handle)) {
                 state->running = false;
                 destroy_self = state->is_detached;
@@ -477,20 +348,14 @@ void nova_sched_schedule(long long handle) {
                 finished = true;
             } else if (state->pending_resume) {
                 state->pending_resume = false;
-                // MUST clear `running` before re-scheduling. nova_sched_schedule()
-                // swallows the request into pending_resume when running is still
-                // set — and nothing ever re-checks it, so the wakeup is lost and
-                // the coroutine never completes. nova_run() then drains and the
-                // caller reads an unwritten promise slot (garbage, not a hang).
-                // This was the `10_async_go` flake: ~20% of runs, `await` yielding
-                // a stale pointer instead of a result.
+
                 state->running = false;
                 resume_again = true;
             } else {
                 state->running = false;
             }
         }
-        // state->mu is released above before the map entry is dropped.
+
         if (finished) {
             {
                 auto &cs = g_corostates.at(handle);
@@ -503,9 +368,7 @@ void nova_sched_schedule(long long handle) {
             if (w) {
                 nova_sched_schedule(w);
             }
-            // Past this point we never touch the frame again, so it is safe to
-            // honour a destroy that arrived while we were running. At most one of
-            // these fires: a detached task owns itself; otherwise its awaiter does.
+
             if (deferred_destroy || (!w && destroy_self)) {
                 reinterpret_cast<nova_coro_fn *>(handle)[1](reinterpret_cast<void *>(handle));
             }
@@ -518,20 +381,6 @@ void nova_sched_schedule(long long handle) {
     });
 }
 
-// Destroy a coroutine frame, serialised against the scheduler.
-//
-// Replaces a bare `llvm.coro.destroy` at every site where one coroutine frees
-// another's frame (an awaiter freeing the task it awaited). The bare intrinsic is
-// unsafe there: the scheduler lambda reads the frame (raw_coro_done) after
-// raw_coro_resume returns, and an awaiter that took the READY path — where
-// nova_await_future observed the task already complete and returned 1 — would free
-// the frame underneath it. Two threads, one frame: the crash disappears under
-// NOVA_THREADS=1 and hides from ASAN.
-//
-// `running` is already the flag that says "the scheduler owns this frame right
-// now"; this simply makes destruction respect it. If the scheduler is running, it
-// performs the destroy when it is finished (destroy_when_idle); otherwise nobody
-// else can be touching the frame and we destroy immediately.
 void nova_coro_release(long long handle) {
     if (!handle) return;
     std::shared_ptr<CoroState> state;
@@ -545,21 +394,17 @@ void nova_coro_release(long long handle) {
         {
             std::lock_guard<std::mutex> lk(state->mu);
             if (state->running) {
-                // The scheduler is inside raw_coro_resume() or still reading the
-                // frame. It will destroy on its way out.
+
                 state->destroy_when_idle = true;
                 return;
             }
         }
-        // Drop the entry before freeing the frame: g_corostates is keyed by the
-        // handle, and the address is reused once the frame is gone. A leftover
-        // entry would hand the next coroutine at that address a stale state.
+
         auto &cs = g_corostates.at(handle);
         std::lock_guard<std::mutex> glk(cs.mu);
         cs.map.erase(handle);
     }
-    // No state (never scheduled, or the scheduler already finished and erased it)
-    // or not running: nobody else can touch the frame.
+
     reinterpret_cast<nova_coro_fn *>(handle)[1](reinterpret_cast<void *>(handle));
 }
 
@@ -577,9 +422,6 @@ void nova_sched_schedule_detached(long long handle) {
     nova_sched_schedule(handle);
 }
 
-// P3: the REACTOR count (share-nothing = one pinned thread per reactor, so this is also the worker
-// count). NOVA_THREADS overrides; else **cores − 1** (leave a core for the OS / block-drive caller),
-// capped at 16, min 1. NOVA_THREADS=1 ⇒ one reactor ⇒ exactly the pre-share-nothing behavior.
 namespace {
 unsigned nova_thread_count() {
     if (const char *e = std::getenv("NOVA_THREADS")) {
@@ -588,56 +430,27 @@ unsigned nova_thread_count() {
     }
     unsigned n = std::thread::hardware_concurrency();
     if (n <= 1) return 1;
-    n -= 1; // cores - 1
+    n -= 1;
     if (n > 16) n = 16;
     return n;
 }
-// Grow the reactor pool to `n` (idempotent; called single-threaded from nova_run BEFORE any reactor
-// thread starts, so no lock is needed). Reactor 0 already exists from static init.
+
 void ensure_reactors(int n) {
     while (static_cast<int>(g_reactors.size()) < n)
         g_reactors.push_back(new Reactor(static_cast<int>(g_reactors.size())));
 }
-} // namespace
+}
 
-// Drive the event loop until all scheduled work (and pending I/O) is complete.
-// M3-D-3: multi-core — run() on a pool of N threads so that when several coroutines
-// are runnable at once (spawned tasks, concurrently-woken timers/sockets) they
-// resume truly in parallel across cores. A coroutine may migrate threads across
-// suspends; this is safe because the load-bearing thread-local arena is gone
-// (workstream A) and ARC is atomic. Each run() returns when the context drains; we
-// join and restart() for the next top-level drive. (The pool is per-drive for now —
-// block-drive is a rare sync→async boundary, not a hot path; a persistent pool is a
-// later optimization.)
-// Worker-thread index [0, N). Set once per io_context worker; every coroutine resumed on that thread
-// reads it via nova_thread_id(). This is what lets Nova code keep PER-THREAD, LOCK-FREE structures
-// (the reverse-proxy connection pool): a per-thread slot is only ever touched by its own worker (a
-// thread runs one coroutine at a time, and Nova's pool critical sections have no await), so no lock is
-// needed — the HAProxy `idle_conn_srv[tid]` model. The main thread is 0; pool threads 1..N-1.
 static thread_local int g_nova_tid = 0;
 long long nova_thread_id(void) { return g_nova_tid; }
 
-// Per-thread depth of active `io.run()` frames. >0 means THIS thread is currently
-// executing inside the event loop (a coroutine resumed by io.run()). Block-driving an
-// async call (nova_run_root) from that state re-enters io.run() on a context that never
-// goes idle under a live server (work-guards held) → the outer coroutine wedges forever.
-// We use this to turn that silent DEADLOCK into a loud, precise abort. Incremented around
-// every io.run() below; checked at nova_run_root's entry.
 static thread_local int g_run_depth = 0;
 long long nova_worker_count(void) { return (long long)nova_thread_count(); }
-// P4c: pin the NEXT coroutine created on THIS thread to reactor `rid` (one-shot). Nova sets it right
-// before `spawn acceptLoop()` so each per-reactor accept loop lands on its reactor. Consumed by the
-// next CoroState construction (get_coro_state, reached via nova_sched_schedule). The codegen-free
-// `spawnOn`: no new spawn form, just a thread-local hint the scheduler stamps onto the fresh state.
+
 void nova_pin_next_coro(long long rid) { g_pin_next = (int)rid; }
 
 void nova_run(void) {
-    // P3 (share-nothing): N = cores-1 reactors, each an INDEPENDENT io_context driven by ONE pinned
-    // thread — thread i sets g_reactor_id = g_nova_tid = i and runs reactor i. A coroutine (and the
-    // socket it owns) lives entirely on its reactor; strands are now free no-ops on a one-thread loop.
-    // (Until P4's per-reactor SO_REUSEPORT accept distributes connections, every coroutine traces back
-    // to reactor 0, so reactors 1..N-1 are idle infrastructure here — gate-clean but single-core; P4
-    // lights them up.) NOVA_THREADS=1 ⇒ one reactor ⇒ old behavior exactly.
+
     const int n = static_cast<int>(nova_thread_count());
     ensure_reactors(n);
     std::vector<std::thread> pool;
@@ -659,15 +472,6 @@ void nova_run(void) {
     for (int i = 0; i < n; ++i) g_reactors[i]->io.restart();
 }
 
-// P4c: hold ALL reactors alive for a server's lifetime, WITHOUT touching the transient nova_run
-// (which compute/tests/async-gates use and which returns on idle — left untouched). A server calls
-// this BEFORE its (async, block-driven) runServer: it installs a leaked work_guard per reactor so each
-// reactor's run() BLOCKS instead of returning on the momentary idle. Then the ordinary block-drive
-// (nova_run inside nova_run_root) starts the N pinned reactor threads — now all persist — and runServer
-// (which IS async, so it can `spawn`) fans out one accept loop per reactor onto the live reactors. The
-// guards are never released, so nova_run never returns → the server runs for the process lifetime; a
-// program that never calls this keeps the exact transient behavior. Installing the guards BEFORE the
-// threads start is what avoids the empty-reactor early-exit race.
 std::vector<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>> &g_server_guards =
     *new std::vector<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>>();
 void nova_hold_all_reactors(void) {
@@ -677,30 +481,8 @@ void nova_hold_all_reactors(void) {
         g_server_guards.push_back(boost::asio::make_work_guard(g_reactors[i]->io));
 }
 
-// Drive the loop until `root` has ACTUALLY COMPLETED, not merely until the
-// io_context went idle. Those are different, and conflating them is a silent
-// wrong answer: nova_run() returns on an idle context, but a caller
-// (buildDriveAsyncCall) then reads root's promise slot unconditionally. If root
-// is still pending, that slot was never written and the caller returns garbage —
-// which is precisely how the `10_async_go` flake presented (`await` yielding a
-// stale pointer instead of 30).
-//
-// An idle context with a pending root means a wakeup is in flight: one thread can
-// observe an empty queue while another is between completing a child and posting
-// the parent's resume. Draining again picks it up (handlers posted to a stopped
-// context are queued and run after restart()).
-//
-// Bounded on purpose. If the root still cannot finish, a wakeup was genuinely
-// lost, and that must fail LOUDLY here rather than hand the caller an unwritten
-// promise. A crash naming the cause beats a plausible wrong number.
 void nova_run_root(long long root) {
-    // Nested block-drive detection. If we're already inside io.run() on this thread (depth>0),
-    // this call was reached from within a running coroutine — a SYNC function block-driving an
-    // async call from inside the event loop. Under a live server that never returns (held
-    // work-guards), the re-entered io.run() would never go idle → the coroutine deadlocks
-    // silently. Fail LOUDLY and precisely instead: this only fires when genuinely nested, so a
-    // sync `main`/`@test` driving async at the top level (depth 0 — the tested, supported seam)
-    // is unaffected. The fix in Nova code is to make the caller `async fn` and `await` the call.
+
     if (g_run_depth > 0) {
         std::fprintf(stderr,
                      "nova: fatal — an async call was block-driven from inside the event loop "
@@ -724,24 +506,18 @@ void nova_run_root(long long root) {
     }
 }
 
-// Access to the io_context for timer/socket awaitables (returned as an opaque
-// handle; the runtime dereferences it).
 long long nova_io_context(void) { return reinterpret_cast<long long>(&g_io); }
 
-// ===== Async channels (M3-D-6) =============================================
-// A coroutine-aware channel: `send` enqueues a value and wakes one waiting receiver;
-// `recv` either dequeues immediately or parks the calling coroutine until a value
-// arrives (codegen emits the suspend + retry loop). Unbounded (send never blocks).
 namespace {
 struct NovaChan {
     std::mutex m;
     std::queue<long long> values;
-    std::queue<long long> recv_waiters; // coroutine handles parked on recv
+    std::queue<long long> recv_waiters;
 };
-} // namespace
+}
 
 long long nova_chan_new(long long capacity) {
-    (void)capacity; // unbounded for now
+    (void)capacity;
     return reinterpret_cast<long long>(new NovaChan());
 }
 
@@ -757,13 +533,9 @@ void nova_chan_send(long long ch, long long val) {
             c->recv_waiters.pop();
         }
     }
-    if (waiter) nova_sched_schedule(waiter); // wake a parked receiver
+    if (waiter) nova_sched_schedule(waiter);
 }
 
-// Try to receive: if a value is available, store it in *out and return 1; otherwise
-// park `self` as a receiver and return 0 (caller suspends; the runtime reschedules it
-// when a send arrives, and it retries). Dequeue+park are atomic under the lock, so no
-// value is lost between the check and the park even across cores.
 long long nova_chan_recv(long long ch, long long self, long long *out) {
     if (!ch) return 1;
     auto *c = reinterpret_cast<NovaChan *>(ch);
@@ -781,20 +553,8 @@ void nova_chan_free(long long ch) {
     if (ch) delete reinterpret_cast<NovaChan *>(ch);
 }
 
-// ===== Async socket I/O via offload (M3-D-6) ===============================
-// A blocking socket op (recv/accept/connect) runs on a SEPARATE I/O thread pool so
-// it never holds a coroutine-scheduler thread. The calling coroutine parks; when the
-// op finishes, the worker stashes the result and reschedules the coroutine, which
-// reads the result via nova_io_take_result. (This is the pragmatic step: it keeps
-// the scheduler responsive; full asio non-blocking I/O for massive connection counts
-// is a later architectural refinement.)
 namespace {
-// The blocking-offload I/O pool is created LAZILY, on first use. A `boost::asio::thread_pool(N)`
-// spawns all N OS threads in its constructor, so an EAGER global here cost 64 idle threads in EVERY
-// process — even the common case (an HTTP server using the non-blocking aaccept/arecv path, which
-// never touches this pool). That inflated a plain web server's thread count to ~72 (8 scheduler + 64
-// idle). Sizing from NOVA_THREADS (× a small blocking-fan-out factor, capped) keeps the offload path
-// working for whoever DOES use it, without paying for threads a non-blocking app never runs.
+
 boost::asio::thread_pool &io_pool() {
     static boost::asio::thread_pool *pool = [] {
         unsigned n = 8;
@@ -805,8 +565,7 @@ boost::asio::thread_pool &io_pool() {
             unsigned hc = std::thread::hardware_concurrency();
             if (hc > 0) n = hc;
         }
-        // Blocking ops can fan out beyond the scheduler width, but keep it bounded — this pool exists
-        // only for the legacy syscall-offload path, not the hot non-blocking loop.
+
         unsigned size = n * 4;
         if (size < 4) size = 4;
         if (size > 64) size = 64;
@@ -821,7 +580,7 @@ void stash_io_result(long long self, long long result) {
     std::lock_guard<std::mutex> lk(g_ioresult_mu);
     g_ioresults[self] = result;
 }
-} // namespace
+}
 
 long long nova_io_take_result(long long self) {
     std::lock_guard<std::mutex> lk(g_ioresult_mu);
@@ -832,8 +591,6 @@ long long nova_io_take_result(long long self) {
     return r;
 }
 
-// Offload a blocking recv; the worker fills `buf` (a stable heap buffer, not the coro
-// frame — safe to write across the suspend) and reschedules `self` with the count.
 void nova_io_recv_async(long long fd, long long buf, long long max_len, long long self) {
     boost::asio::post(io_pool(), [fd, buf, max_len, self]() {
         long long n = nova_socket_recv((int)fd, reinterpret_cast<char *>(buf), (int)max_len);
@@ -842,7 +599,6 @@ void nova_io_recv_async(long long fd, long long buf, long long max_len, long lon
     });
 }
 
-// Offload a blocking accept; result is the client fd (or -1).
 void nova_io_accept_async(long long server_fd, long long self) {
     boost::asio::post(io_pool(), [server_fd, self]() {
         long long fd = nova_socket_accept((int)server_fd);
@@ -851,17 +607,10 @@ void nova_io_accept_async(long long server_fd, long long self) {
     });
 }
 
-// ===== Scalable async server sockets (M3-D-7, true non-blocking asio) =======
-// Unlike the offload path above, these use asio's event-driven async ops
-// (async_accept/async_read_some/async_write) directly on the io_context. A pending
-// op holds NO thread — it's registered with kqueue/epoll — so N scheduler threads
-// serve tens of thousands of connections, each a cheap coroutine (not a thread).
-// This is the C10K/C100K path for HTTP servers. Handles are pointers to the structs.
 namespace {
 struct NovaAcceptor {
     boost::asio::ip::tcp::acceptor acc;
-    // `host` empty ⇒ bind INADDR_ANY (v4, any interface); non-empty ⇒ bind that specific IPv4 address
-    // (an I3 Service VIP, e.g. a 127.0.0.x loopback alias). An unparseable host falls back to any.
+
     NovaAcceptor(boost::asio::io_context &io, const std::string &host, unsigned short port) : acc(io) {
         boost::asio::ip::tcp::endpoint ep(boost::asio::ip::tcp::v4(), port);
         if (!host.empty()) {
@@ -873,10 +622,7 @@ struct NovaAcceptor {
         acc.open(ep.protocol());
         acc.set_option(boost::asio::socket_base::reuse_address(true));
 #ifdef SO_REUSEPORT
-        // P4: SO_REUSEPORT lets EVERY reactor bind the SAME port; the kernel load-balances new
-        // connections across the per-reactor acceptors (nginx / share-nothing model). Each reactor
-        // then accepts and handles its own connections on its own thread — no cross-reactor socket
-        // sharing. Guarded: Windows has no SO_REUSEPORT (reuse_address above is the closest analog).
+
         int one = 1;
         ::setsockopt(acc.native_handle(), SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
 #endif
@@ -888,9 +634,8 @@ struct NovaSocket {
     boost::asio::ip::tcp::socket sock;
     explicit NovaSocket(boost::asio::io_context &io) : sock(io) {}
 };
-} // namespace
+}
 
-// Bind+listen on `port` (INADDR_ANY); returns an acceptor handle (0 on failure, e.g. port in use).
 long long nova_aserver_listen(long long port) {
     try {
         return reinterpret_cast<long long>(new NovaAcceptor(g_reactors[g_reactor_id]->io, "", (unsigned short)port));
@@ -899,8 +644,6 @@ long long nova_aserver_listen(long long port) {
     }
 }
 
-// I3: bind+listen on a SPECIFIC address:port (a Service VIP). `host` is a Nova string (length at
-// host-4). Empty/unparseable host ⇒ INADDR_ANY. Returns an acceptor handle (0 on failure).
 long long nova_aserver_listen_addr(long long host, long long port) {
     const char *h = reinterpret_cast<const char *>(host);
     int hlen = h ? *reinterpret_cast<const int *>(h - 4) : 0;
@@ -912,8 +655,6 @@ long long nova_aserver_listen_addr(long long host, long long port) {
     }
 }
 
-// Async-accept the next connection: parks `self`; on arrival, stashes a new socket
-// handle (0 on error) and reschedules self. No thread held while waiting.
 void nova_aaccept(long long server, long long self) {
     auto *a = reinterpret_cast<NovaAcceptor *>(server);
     auto state = get_coro_state(self);
@@ -927,10 +668,6 @@ void nova_aaccept(long long server, long long self) {
     }));
 }
 
-// Async connect (scalable client): resolve `host`:`port`, connect, and resume `self`
-// with a socket handle (0 on failure). Two-step async (resolve → connect); the
-// resolver and socket are kept alive by the capture, and all completions run on the
-// coroutine's strand. `host` is a Nova string (length at host-4).
 void nova_aconnect(long long host, long long port, long long self) {
     auto state = get_coro_state(self);
     const char *h = reinterpret_cast<const char *>(host);
@@ -961,13 +698,6 @@ void nova_aconnect(long long host, long long port, long long self) {
             }));
 }
 
-// Async read up to max_len bytes into buf; parks self, resumes with the byte count
-// (0 = EOF/peer closed, -1 = error).
-// A null socket handle (0) reaches here when a caller does I/O on a FAILED connection (asyncConnect
-// returns 0 on refuse/timeout) without checking — e.g. a DB driver that sends its handshake before
-// testing the connect result. Dereferencing `s->sock` would SEGV the whole process; instead resume the
-// awaiting coroutine with an error (-1), so the `await` returns an error the caller can handle. (nova_aclose
-// already guards this way; asend/arecv/arecv_deadline must too.)
 static inline bool nova_io_bad_socket(NovaSocket *s, long long self) {
     if (s) return false;
     stash_io_result(self, -1);
@@ -987,12 +717,6 @@ void nova_arecv(long long sock, long long buf, long long max_len, long long self
         }));
 }
 
-// Async read up to max_len bytes into buf WITH a deadline: arms the recv AND a `ms`-millisecond
-// timer, and resumes `self` with whichever fires first — bytes read (>=0) if data arrived, or -2
-// if the deadline elapsed first (a non-blocking analog of SO_RCVTIMEO). Both completions run on
-// the coroutine's strand, so the `done` flag is race-free; the loser is cancelled (the timer on a
-// data win, the pending recv via socket.cancel() on a timeout). A timed-out connection is left in
-// an indeterminate state — the caller should discard it.
 void nova_arecv_deadline(long long sock, long long buf, long long max_len, long long ms, long long self) {
     auto *s = reinterpret_cast<NovaSocket *>(sock);
     if (nova_io_bad_socket(s, self)) return;
@@ -1003,25 +727,22 @@ void nova_arecv_deadline(long long sock, long long buf, long long max_len, long 
     s->sock.async_read_some(
         boost::asio::buffer(reinterpret_cast<char *>(buf), (size_t)max_len),
         boost::asio::bind_executor(state->strand, [self, done, timer](const boost::system::error_code &ec, size_t n) {
-            if (*done) return;          // the timer already won
+            if (*done) return;
             *done = true;
-            timer->cancel();            // cancel the deadline
+            timer->cancel();
             stash_io_result(self, ec ? -1 : (long long)n);
             nova_sched_schedule(self);
         }));
     timer->async_wait(boost::asio::bind_executor(state->strand, [self, done, s](const boost::system::error_code &ec) {
-        if (*done || ec) return;        // recv already won, or the timer was cancelled
+        if (*done || ec) return;
         *done = true;
         boost::system::error_code ic;
-        s->sock.cancel(ic);             // cancel the pending recv (its handler no-ops via `done`)
-        stash_io_result(self, -2);      // -2 = deadline elapsed
+        s->sock.cancel(ic);
+        stash_io_result(self, -2);
         nova_sched_schedule(self);
     }));
 }
 
-// Async write the Nova string `data` (length at data-4) in full; parks self, resumes
-// with bytes written (-1 on error). The buffer stays alive because the awaiting
-// coroutine holds `data` across the suspend.
 void nova_asend(long long sock, long long data, long long self) {
     auto *s = reinterpret_cast<NovaSocket *>(sock);
     if (nova_io_bad_socket(s, self)) return;
@@ -1040,25 +761,12 @@ void nova_aclose(long long sock) {
     auto *s = reinterpret_cast<NovaSocket *>(sock);
     if (!s) return;
     boost::system::error_code ec;
-    // Graceful close. Two teardown hazards a bare close() hits:
-    //   1. It RSTs (discarding the still-draining response!) if there are UNREAD
-    //      request bytes in the receive buffer — and `arecv` (async_read_some) reads
-    //      only one chunk, so under load the rest of the request is often unread.
-    //   2. Even without that, closing before the send buffer drains can lose data.
-    // Fix: shutdown(send) to queue our FIN after the response, then DRAIN any unread
-    // inbound bytes (non-blocking, best-effort) so close() is clean and the client
-    // reliably receives the full response.
+
     s->sock.shutdown(boost::asio::ip::tcp::socket::shutdown_send, ec);
     s->sock.close(ec);
     delete s;
 }
 
-// M3-D: non-blocking timer await. Arms an asio::steady_timer for `ms` milliseconds;
-// when it fires, the awaiting coroutine `handle` is rescheduled. The coroutine
-// suspends immediately after calling this (codegen emits the suspend), so the
-// thread is free to run other coroutines meanwhile — real cooperative async I/O,
-// unlike the blocking nova_concurrency_sleep. The timer keeps itself alive via the
-// shared_ptr captured in the completion handler.
 void nova_await_timer(long long handle, long long ms) {
     if (!handle) return;
     auto timer = std::make_shared<boost::asio::steady_timer>(
@@ -1068,15 +776,12 @@ void nova_await_timer(long long handle, long long ms) {
     });
 }
 
-// Retained for the synchronous shim / older codegen paths (no longer used by the
-// Asio driver, which resumes via posted handlers).
 long long nova_sched_next(void) { return 0; }
 
-// ===== Program entry =======================================================
 void nova_set_args(int argc, char **argv);
 int main(int argc, char **argv) {
-    nova_set_args(argc, argv); // stash for env.args()
+    nova_set_args(argc, argv);
     return static_cast<int>(__nova_main());
 }
 
-} // extern "C"
+}

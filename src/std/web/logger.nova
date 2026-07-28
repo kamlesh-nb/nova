@@ -1,4 +1,4 @@
-// logger.nova — File-based Logger and HTTP Logging Middleware
+
 import io.file;
 import web.request;
 import web.response;

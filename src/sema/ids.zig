@@ -1,39 +1,9 @@
-// ids.zig — F2 stage 4a: give every Expression a copy-surviving identity.
-//
-// WHY THIS EXISTS
-// ---------------
-// Stage 2i keyed TypedIr on the AST node's ADDRESS. Codegen takes Expression BY
-// VALUE (`compileExpression(expr: ast.Expression)`), so by the time codegen asks
-// "what type is this?", it holds a COPY at a different address and the lookup
-// misses. That is why stage 3's absences plateaued at 1113 instead of ~0: the IR
-// was not wrong, it was unreachable.
-//
-// I had written that exact counter-argument in the stage 2i commit and shipped
-// the address anyway because it was cheaper. This pass is the correction.
-//
-// An id assigned before codegen runs travels with every copy. Addresses cannot.
-//
-// THE COLLISION HAZARD
-// --------------------
-// `ExprId.unassigned == 0`. If this walk misses a variant, those expressions all
-// keep id 0 — and a map keyed on ExprId would happily map ALL of them to a single
-// bucket, silently giving unrelated expressions each other's types. That failure
-// is invisible and would be blamed on inference for weeks.
-//
-// So the invariant is enforced on BOTH sides:
-//   - here: the walk is exhaustive (no `else =>`; adding an ExprKind variant is a
-//     COMPILE error, not a silent miss);
-//   - in TypedIr: `.unassigned` is refused outright, so any miss becomes a
-//     visible absence in the stage-3 coverage number rather than a wrong type.
-//
-// Note the walk covers two places alpha.zig deliberately skips — `literal.array`
-// / `literal.object` and JSX children — because alpha only cares about idents,
-// whereas an id must reach EVERY expression or the guarantee is not a guarantee.
+
 const std = @import("std");
 const ast = @import("../ast.zig");
 
 pub const Assigner = struct {
-    next: u32 = 1, // 0 is `.unassigned` and must never be handed out.
+    next: u32 = 1,
     assigned: usize = 0,
 
     pub fn init() Assigner {
@@ -47,9 +17,6 @@ pub const Assigner = struct {
         return id;
     }
 
-    // ---- program ---------------------------------------------------------
-    /// Takes Program by value to match sema/alpha.zig — `declarations` is a
-    /// slice, so writes through it land in the real AST.
     pub fn run(self: *Assigner, program: ast.Program) anyerror!void {
         for (program.declarations) |*d| try self.walkDecl(d);
     }
@@ -63,9 +30,7 @@ pub const Assigner = struct {
             .enum_decl => |*ed| {
                 for (ed.methods) |*m| try self.walkFn(&m.decl);
             },
-            // Unlike alpha.zig (which stops at the three above, since only those
-            // hold renameable idents), an id must reach EVERY expression — a
-            // const initialiser included.
+
             .const_decl => |*cd| try self.walkExpr(&cd.value),
             .union_decl, .import_decl, .export_decl, .trait_decl => {},
         }
@@ -75,7 +40,6 @@ pub const Assigner = struct {
         try self.walkBlock(&f.body);
     }
 
-    // ---- statements ------------------------------------------------------
     pub fn walkBlock(self: *Assigner, b: *ast.Block) anyerror!void {
         for (b.statements) |*s| try self.walkStmt(s);
     }
@@ -96,10 +60,7 @@ pub const Assigner = struct {
                 try self.walkExpr(&ws.condition);
                 try self.walkStmt(ws.body);
             },
-            // ForStmt carries BOTH the C-style triple and the optional iterator
-            // form; a `for (x of xs)` uses `iterator`, a `for (i=0;;)` uses
-            // initializer/condition/increment. Walk all of them — whichever the
-            // parser left null simply is not there.
+
             .for_stmt => |*fs| {
                 if (fs.initializer) |i| try self.walkStmt(i);
                 if (fs.condition) |*c| try self.walkExpr(c);
@@ -123,10 +84,6 @@ pub const Assigner = struct {
         }
     }
 
-    // ---- expressions -----------------------------------------------------
-    /// Assigns `e` an id, then recurses. Exhaustive by construction: no `else`
-    /// branch, so a new ExprKind variant fails to compile here rather than
-    /// silently inheriting id 0.
     pub fn walkExpr(self: *Assigner, e: *ast.Expression) anyerror!void {
         e.id = self.fresh();
         switch (e.kind) {
@@ -135,8 +92,7 @@ pub const Assigner = struct {
                 try self.walkExpr(r.end);
             },
             .literal => |*lit| switch (lit.*) {
-                // alpha.zig skips these — it only rewrites idents. An id must
-                // reach every expression, so they are walked here.
+
                 .array => |items| {
                     for (items) |*i| try self.walkExpr(i);
                 },
@@ -222,9 +178,6 @@ pub const Assigner = struct {
     }
 };
 
-// ---------------------------------------------------------------------------
-// Tests (docs/design/README.md §2b).
-// ---------------------------------------------------------------------------
 const testing = std.testing;
 
 fn mkLit(n: i64) ast.Expression {
@@ -232,8 +185,7 @@ fn mkLit(n: i64) ast.Expression {
 }
 
 test "ids: never hands out 0, because 0 means unassigned" {
-    // If this ever fails, every expression sharing id 0 would collide onto one
-    // TypedIr bucket and silently take each other's types.
+
     var a = Assigner.init();
     var e = mkLit(1);
     try a.walkExpr(&e);
@@ -262,15 +214,14 @@ test "ids: distinct expressions get distinct ids" {
 }
 
 test "ids: THE POINT — an id survives a copy, an address does not" {
-    // This is the entire reason stage 4a exists. codegen takes Expression by
-    // value; the copy is what codegen actually asks about.
+
     var a = Assigner.init();
     var e = mkLit(7);
     try a.walkExpr(&e);
 
-    const copy = e; // exactly what `compileExpression(expr: ast.Expression)` gets
-    try testing.expectEqual(e.id, copy.id); // identity survives
-    try testing.expect(&e != &copy); // address does not
+    const copy = e;
+    try testing.expectEqual(e.id, copy.id);
+    try testing.expect(&e != &copy);
 }
 
 test "ids: reaches array literal elements (alpha.zig skips these)" {
@@ -282,7 +233,7 @@ test "ids: reaches array literal elements (alpha.zig skips these)" {
     try testing.expect(items[0].id != .unassigned);
     try testing.expect(items[1].id != .unassigned);
     try testing.expect(items[0].id != items[1].id);
-    try testing.expectEqual(@as(usize, 3), a.assigned); // the array + 2 elements
+    try testing.expectEqual(@as(usize, 3), a.assigned);
 }
 
 test "ids: nested structure is fully covered" {
@@ -308,7 +259,7 @@ test "ids: nested structure is fully covered" {
     defer seen.deinit();
     for ([_]ast.Expression{ outer, inner, inner_l, inner_r, outer_r }) |x| {
         try testing.expect(x.id != .unassigned);
-        try testing.expect(!seen.contains(x.id)); // no duplicates
+        try testing.expect(!seen.contains(x.id));
         try seen.put(x.id, {});
     }
     try testing.expectEqual(@as(usize, 5), a.assigned);

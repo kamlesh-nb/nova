@@ -1,4 +1,4 @@
-// server.nova — TcpListener: binds to a port and accepts connections
+
 import bytes;
 import mem.allocator;
 import net.tcp.socket;

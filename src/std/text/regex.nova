@@ -1,41 +1,27 @@
-// text/regex.nova — a small regular-expression engine (S2).
-//
-// A pattern is COMPILED to a flat instruction program with RELATIVE jump offsets
-// (so sub-programs are position-independent and splice trivially), and matched by
-// a BACKTRACKING VM. Features: literals, `.`, character classes `[...]` `[^...]`
-// with ranges and `\d \w \s \D \W \S`, quantifiers `* + ?` and `{n}` `{n,}` `{n,m}`
-// (greedy), alternation `|`, groups `(...)` (capturing) and `(?:...)`, anchors
-// `^` `$`, and escapes. API: `compile`, `test`, `find`, `findAll`, `captures`,
-// `replaceAll`.
-//
-// NOTE: this is a backtracking matcher — simple and correct, but a pathological
-// pattern (`(a*)*b` on a long non-match) can be exponential. A linear-time
-// Thompson/Pike VM is the eventual upgrade; for typical patterns this is fine.
 
 import list;
 import string;
 import bytes;
 import assert;
 
-// ---- opcodes ----
-const OP_CHAR: int = 1;   // match self.c, advance
-const OP_ANY: int = 2;    // match any char, advance
-const OP_CLASS: int = 3;  // match if self.cls membership (neg-aware)
-const OP_MATCH: int = 4;  // accept
-const OP_JMP: int = 5;    // pc += self.x
-const OP_SPLIT: int = 6;  // try pc+self.x (backtrack), else pc += self.y
-const OP_SAVE: int = 7;   // captures[self.n] = pos
-const OP_BOL: int = 8;    // assert start-of-string
-const OP_EOL: int = 9;    // assert end-of-string
+const OP_CHAR: int = 1;
+const OP_ANY: int = 2;
+const OP_CLASS: int = 3;
+const OP_MATCH: int = 4;
+const OP_JMP: int = 5;
+const OP_SPLIT: int = 6;
+const OP_SAVE: int = 7;
+const OP_BOL: int = 8;
+const OP_EOL: int = 9;
 
 pub struct Inst {
     pub op: int,
-    pub c: int,       // OP_CHAR: char code
-    pub cls: string,  // OP_CLASS: raw class body (e.g. "a-z0-9\d"); a leading `\x` = escape
-    pub neg: int,     // OP_CLASS: negated
-    pub x: int,       // relative target (JMP / SPLIT first branch)
-    pub y: int,       // SPLIT second branch (relative)
-    pub n: int,       // OP_SAVE: slot
+    pub c: int,
+    pub cls: string,
+    pub neg: int,
+    pub x: int,
+    pub y: int,
+    pub n: int,
 }
 
 fn mk(op: int): Inst { return Inst{ op: op, c: 0, cls: "", neg: 0, x: 0, y: 0, n: 0 }; }
@@ -60,14 +46,12 @@ fn appendAll(dst: List<Inst>, src: List<Inst>): void {
     while (i < src.size()) { dst.push(src.at(i)); i = i + 1; }
 }
 
-// ---- combinators (all relative-offset, position-independent) ----
-
 fn star(p: List<Inst>): List<Inst> {
     let lp = p.size();
     let r = List<Inst>();
-    r.push(iSplit(1, lp + 2));        // body at +1, exit past the jmp at +(lp+2)
+    r.push(iSplit(1, lp + 2));
     appendAll(r, p);
-    r.push(iJmp(0 - (lp + 1)));       // back to the split
+    r.push(iJmp(0 - (lp + 1)));
     return r;
 }
 
@@ -75,14 +59,14 @@ fn plus(p: List<Inst>): List<Inst> {
     let lp = p.size();
     let r = List<Inst>();
     appendAll(r, p);
-    r.push(iSplit(0 - lp, 1));        // back to body start (-lp), or continue (+1)
+    r.push(iSplit(0 - lp, 1));
     return r;
 }
 
 fn opt(p: List<Inst>): List<Inst> {
     let lp = p.size();
     let r = List<Inst>();
-    r.push(iSplit(1, lp + 1));        // body at +1, or skip past it
+    r.push(iSplit(1, lp + 1));
     appendAll(r, p);
     return r;
 }
@@ -91,14 +75,12 @@ fn alt(a: List<Inst>, b: List<Inst>): List<Inst> {
     let la = a.size();
     let lb = b.size();
     let r = List<Inst>();
-    r.push(iSplit(1, la + 2));        // try a (+1), else b (past a and its jmp)
+    r.push(iSplit(1, la + 2));
     appendAll(r, a);
-    r.push(iJmp(lb + 1));             // after a, skip b
+    r.push(iJmp(lb + 1));
     appendAll(r, b);
     return r;
 }
-
-// ---- class membership ----
 
 fn isDigit(ch: int): bool { return ch >= 48 && ch <= 57; }
 fn isWord(ch: int): bool {
@@ -108,18 +90,17 @@ fn isSpace(ch: int): bool {
     return ch == 32 || ch == 9 || ch == 10 || ch == 13 || ch == 12 || ch == 11;
 }
 
-// `\d \w \s \D \W \S` inside/standalone.
 fn escClassMatch(e: int, ch: int): bool {
-    if (e == 100) { return isDigit(ch); }              // d
-    if (e == 68) { return !isDigit(ch); }              // D
-    if (e == 119) { return isWord(ch); }               // w
-    if (e == 87) { return !isWord(ch); }               // W
-    if (e == 115) { return isSpace(ch); }              // s
-    if (e == 83) { return !isSpace(ch); }              // S
-    if (e == 110) { return ch == 10; }                 // \n
-    if (e == 116) { return ch == 9; }                  // \t
-    if (e == 114) { return ch == 13; }                 // \r
-    return ch == e;                                    // \. \* etc -> the literal
+    if (e == 100) { return isDigit(ch); }
+    if (e == 68) { return !isDigit(ch); }
+    if (e == 119) { return isWord(ch); }
+    if (e == 87) { return !isWord(ch); }
+    if (e == 115) { return isSpace(ch); }
+    if (e == 83) { return !isSpace(ch); }
+    if (e == 110) { return ch == 10; }
+    if (e == 116) { return ch == 9; }
+    if (e == 114) { return ch == 13; }
+    return ch == e;
 }
 
 fn classMatch(body: string, neg: int, ch: int): bool {
@@ -128,10 +109,10 @@ fn classMatch(body: string, neg: int, ch: int): bool {
     let n = body.length;
     while (i < n) {
         let c = body[i];
-        if (c == 92 && i + 1 < n) {                    // '\' escape
+        if (c == 92 && i + 1 < n) {
             if (escClassMatch(body[i + 1], ch)) { inSet = true; }
             i = i + 2;
-        } else if (i + 2 < n && body[i + 1] == 45) {   // range a-z
+        } else if (i + 2 < n && body[i + 1] == 45) {
             if (ch >= c && ch <= body[i + 2]) { inSet = true; }
             i = i + 3;
         } else {
@@ -142,9 +123,6 @@ fn classMatch(body: string, neg: int, ch: int): bool {
     if (neg == 1) { return !inSet; }
     return inSet;
 }
-
-// ---- the backtracking VM (relative offsets) ----
-// Returns the end position on match, or -1. `saves` is mutated with capture bounds.
 
 fn vmMatch(prog: List<Inst>, pc: int, s: string, sp: int, saves: List<int>): int {
     let p = pc;
@@ -166,8 +144,7 @@ fn vmMatch(prog: List<Inst>, pc: int, s: string, sp: int, saves: List<int>): int
         } else if (op == OP_JMP) {
             p = p + ins.x;
         } else if (op == OP_SPLIT) {
-            // Snapshot the capture slots so a first branch that partially matches (writing
-            // SAVEs) then fails does not corrupt the captures the second branch reports.
+
             let snap = List<int>();
             let z = 0;
             while (z < saves.size()) { snap.push(saves.at(z)); z = z + 1; }
@@ -185,8 +162,6 @@ fn vmMatch(prog: List<Inst>, pc: int, s: string, sp: int, saves: List<int>): int
     }
     return -1;
 }
-
-// ---- parser: pattern string -> instruction program ----
 
 struct RxParser {
     pub pat: string,
@@ -206,7 +181,7 @@ struct RxParser {
 
     pub fn parseAlt(self: RxParser): List<Inst> {
         let left = self.parseConcat();
-        while (self.peek() == 124) {                   // '|'
+        while (self.peek() == 124) {
             let d = self.advance();
             let right = self.parseConcat();
             left = alt(left, right);
@@ -218,7 +193,7 @@ struct RxParser {
         let r = List<Inst>();
         while (true) {
             let c = self.peek();
-            if (c == -1 || c == 124 || c == 41) { break; }   // end, '|', ')'
+            if (c == -1 || c == 124 || c == 41) { break; }
             appendAll(r, self.parseRepeat());
         }
         return r;
@@ -227,31 +202,30 @@ struct RxParser {
     fn parseRepeat(self: RxParser): List<Inst> {
         let atom = self.parseAtom();
         let c = self.peek();
-        if (c == 42) { let d = self.advance(); return star(atom); }   // *
-        if (c == 43) { let d = self.advance(); return plus(atom); }   // +
-        if (c == 63) { let d = self.advance(); return opt(atom); }    // ?
-        if (c == 123) { return self.parseBrace(atom); }               // {
+        if (c == 42) { let d = self.advance(); return star(atom); }
+        if (c == 43) { let d = self.advance(); return plus(atom); }
+        if (c == 63) { let d = self.advance(); return opt(atom); }
+        if (c == 123) { return self.parseBrace(atom); }
         return atom;
     }
 
-    // {n} {n,} {n,m} — expanded to copies + star/opt (simple + correct).
     fn parseBrace(self: RxParser, atom: List<Inst>): List<Inst> {
-        let d = self.advance();                        // '{'
+        let d = self.advance();
         let mn = self.parseInt();
         let mx = mn;
         let hasComma = false;
-        if (self.peek() == 44) { let d2 = self.advance(); hasComma = true; mx = 0 - 1; }  // ','
+        if (self.peek() == 44) { let d2 = self.advance(); hasComma = true; mx = 0 - 1; }
         if (self.peek() >= 48 && self.peek() <= 57) { mx = self.parseInt(); }
-        if (self.peek() == 125) { let d3 = self.advance(); }          // '}'
+        if (self.peek() == 125) { let d3 = self.advance(); }
         let r = List<Inst>();
         let i = 0;
-        while (i < mn) { appendAll(r, atom); i = i + 1; }             // n mandatory copies
+        while (i < mn) { appendAll(r, atom); i = i + 1; }
         if (hasComma && mx < 0) {
-            appendAll(r, star(atom));                                 // {n,} -> n copies + star
+            appendAll(r, star(atom));
         } else {
             let extra = mx - mn;
             let j = 0;
-            while (j < extra) { appendAll(r, opt(atom)); j = j + 1; } // {n,m} -> (m-n) optional copies
+            while (j < extra) { appendAll(r, opt(atom)); j = j + 1; }
         }
         return r;
     }
@@ -265,19 +239,19 @@ struct RxParser {
     }
 
     fn parseClass(self: RxParser): List<Inst> {
-        let d = self.advance();                        // '['
+        let d = self.advance();
         let neg = 0;
-        if (self.peek() == 94) { let d2 = self.advance(); neg = 1; }  // '^'
+        if (self.peek() == 94) { let d2 = self.advance(); neg = 1; }
         let body = "";
-        while (self.peek() != 93 && self.peek() != -1) {              // until ']'
+        while (self.peek() != 93 && self.peek() != -1) {
             let c = self.advance();
-            if (c == 92) {                             // keep escape pair
+            if (c == 92) {
                 body = body + charStr(c) + charStr(self.advance());
             } else {
                 body = body + charStr(c);
             }
         }
-        if (self.peek() == 93) { let d3 = self.advance(); }          // ']'
+        if (self.peek() == 93) { let d3 = self.advance(); }
         let r = List<Inst>();
         r.push(iClass(body, neg));
         return r;
@@ -285,31 +259,31 @@ struct RxParser {
 
     fn escapeAtom(self: RxParser, e: int): List<Inst> {
         let r = List<Inst>();
-        // \d \w \s \D \W \S -> a one-escape class
+
         if (e == 100 || e == 119 || e == 115 || e == 68 || e == 87 || e == 83) {
             r.push(iClass("\\" + charStr(e), 0));
             return r;
         }
-        if (e == 110) { r.push(iChar(10)); return r; }               // \n
-        if (e == 116) { r.push(iChar(9)); return r; }                // \t
-        if (e == 114) { r.push(iChar(13)); return r; }               // \r
-        r.push(iChar(e));                                            // \. \* \( ... -> literal
+        if (e == 110) { r.push(iChar(10)); return r; }
+        if (e == 116) { r.push(iChar(9)); return r; }
+        if (e == 114) { r.push(iChar(13)); return r; }
+        r.push(iChar(e));
         return r;
     }
 
     fn parseAtom(self: RxParser): List<Inst> {
         let c = self.peek();
-        if (c == 40) {                                 // '('
+        if (c == 40) {
             let d = self.advance();
             let capturing = true;
-            if (self.peek() == 63) {                   // '?'
+            if (self.peek() == 63) {
                 let d2 = self.advance();
-                if (self.peek() == 58) { let d3 = self.advance(); capturing = false; }  // ':'
+                if (self.peek() == 58) { let d3 = self.advance(); capturing = false; }
             }
             let gi = 0;
             if (capturing) { self.ngroup = self.ngroup + 1; gi = self.ngroup; }
             let inner = self.parseAlt();
-            if (self.peek() == 41) { let d4 = self.advance(); }       // ')'
+            if (self.peek() == 41) { let d4 = self.advance(); }
             if (capturing) {
                 let r = List<Inst>();
                 r.push(iSave(2 * gi));
@@ -319,23 +293,21 @@ struct RxParser {
             }
             return inner;
         }
-        if (c == 46) { let d = self.advance(); let r = List<Inst>(); r.push(iAny()); return r; }   // .
-        if (c == 94) { let d = self.advance(); let r = List<Inst>(); r.push(iBol()); return r; }   // ^
-        if (c == 36) { let d = self.advance(); let r = List<Inst>(); r.push(iEol()); return r; }   // $
-        if (c == 91) { return self.parseClass(); }                   // [
-        if (c == 92) {                                 // '\' escape
+        if (c == 46) { let d = self.advance(); let r = List<Inst>(); r.push(iAny()); return r; }
+        if (c == 94) { let d = self.advance(); let r = List<Inst>(); r.push(iBol()); return r; }
+        if (c == 36) { let d = self.advance(); let r = List<Inst>(); r.push(iEol()); return r; }
+        if (c == 91) { return self.parseClass(); }
+        if (c == 92) {
             let d = self.advance();
             let e = self.advance();
             return self.escapeAtom(e);
         }
-        let d = self.advance();                        // literal
+        let d = self.advance();
         let r = List<Inst>();
         r.push(iChar(c));
         return r;
     }
 }
-
-// ---- public API ----
 
 pub struct Regex {
     pub prog: List<Inst>,
@@ -350,13 +322,11 @@ pub struct Regex {
         return saves;
     }
 
-    /// Anchored match at `start`; returns end position, or -1.
     pub fn matchAt(self: Regex, s: string, start: int): int {
         let saves = self.freshSaves();
         return vmMatch(self.prog, 0, s, start, saves);
     }
 
-    /// First match position anywhere in `s`, or -1.
     pub fn find(self: Regex, s: string): int {
         let start = 0;
         while (start <= s.length) {
@@ -366,12 +336,10 @@ pub struct Regex {
         return 0 - 1;
     }
 
-    /// Does `s` contain a match?
     pub fn test(self: Regex, s: string): bool {
         return self.find(s) >= 0;
     }
 
-    /// The first match at or after `from`, with captures. `matched` is false if none.
     pub fn execFrom(self: Regex, s: string, from: int): Match {
         let start = from;
         while (start <= s.length) {
@@ -393,12 +361,10 @@ pub struct Regex {
         return Match(false, 0 - 1, 0 - 1, List<string>());
     }
 
-    /// The first match in `s`, with captures.
     pub fn exec(self: Regex, s: string): Match {
         return self.execFrom(s, 0);
     }
 
-    /// Every non-overlapping match's whole text, left to right.
     pub fn findAll(self: Regex, s: string): List<string> {
         let out = List<string>();
         let pos = 0;
@@ -406,13 +372,12 @@ pub struct Regex {
             let m = self.execFrom(s, pos);
             if (!m.matched) { break; }
             out.push(m.group(0));
-            // Advance past the match; step at least one to make progress on empty matches.
+
             if (m.end > m.start) { pos = m.end; } else { pos = m.end + 1; }
         }
         return out;
     }
 
-    /// Replace every match with `replacement` (literal text; `$0`..`$9` group refs).
     pub fn replaceAll(self: Regex, s: string, replacement: string): string {
         let out = "";
         let pos = 0;
@@ -430,14 +395,13 @@ pub struct Regex {
     }
 }
 
-// Expand `$0`..`$9` in a replacement template against a match's groups.
 fn expandRepl(repl: string, m: Match): string {
     let out = "";
     let i = 0;
     let n = repl.length;
     while (i < n) {
         let c = repl[i];
-        if (c == 36 && i + 1 < n && repl[i + 1] >= 48 && repl[i + 1] <= 57) {  // '$' digit
+        if (c == 36 && i + 1 < n && repl[i + 1] >= 48 && repl[i + 1] <= 57) {
             out = out + m.group(repl[i + 1] - 48);
             i = i + 2;
         } else {
@@ -448,8 +412,6 @@ fn expandRepl(repl: string, m: Match): string {
     return out;
 }
 
-/// Compile a pattern into a Regex. Program = `SAVE0 <body> SAVE1 MATCH`, so slot 0/1
-/// bound the whole match (group 0) uniformly with the capturing groups.
 pub fn compile(pattern: string): Regex {
     let parser = RxParser(pattern);
     let inner = parser.parseAlt();
@@ -461,8 +423,6 @@ pub fn compile(pattern: string): Regex {
     return Regex(body, parser.ngroup);
 }
 
-/// One match: the whole span `[start,end)` and each group's captured text
-/// (`groups.at(0)` is the whole match, `groups.at(k)` is group k; "" if unmatched).
 pub struct Match {
     pub matched: bool,
     pub start: int,
@@ -477,8 +437,6 @@ pub struct Match {
     }
 }
 
-// ---- tests (stage 1: core) ----
-
 @test
 fn test_literal_and_dot(): void {
     assert.isTrue(compile("abc").test("xxabcyy"));
@@ -489,10 +447,10 @@ fn test_literal_and_dot(): void {
 
 @test
 fn test_quantifiers(): void {
-    assert.isTrue(compile("ab*c").test("ac"));       // zero b
-    assert.isTrue(compile("ab*c").test("abbbc"));    // many b
+    assert.isTrue(compile("ab*c").test("ac"));
+    assert.isTrue(compile("ab*c").test("abbbc"));
     assert.isTrue(compile("ab+c").test("abc"));
-    assert.isTrue(!compile("ab+c").test("ac"));      // needs >= 1 b
+    assert.isTrue(!compile("ab+c").test("ac"));
     assert.isTrue(compile("ab?c").test("ac"));
     assert.isTrue(compile("ab?c").test("abc"));
     assert.isTrue(!compile("ab?c").test("abbc"));
@@ -509,7 +467,7 @@ fn test_alternation_and_anchors(): void {
 
 @test
 fn test_escapes(): void {
-    assert.isTrue(compile("a\\.b").test("a.b"));       // escaped dot = literal
+    assert.isTrue(compile("a\\.b").test("a.b"));
     assert.isTrue(!compile("a\\.b").test("axb"));
 }
 
@@ -518,8 +476,8 @@ fn test_char_classes(): void {
     assert.isTrue(compile("[abc]").test("x b y"));
     assert.isTrue(!compile("[abc]").test("xyz"));
     assert.isTrue(compile("[a-z]+").test("Hello"));
-    assert.isTrue(compile("[^0-9]").test("a1"));       // 'a' is non-digit
-    assert.isTrue(!compile("[^0-9]+$").test("123"));   // all digits -> no non-digit run to end
+    assert.isTrue(compile("[^0-9]").test("a1"));
+    assert.isTrue(!compile("[^0-9]+$").test("123"));
     assert.isTrue(compile("\\d\\d\\d").test("id=456!"));
     assert.isTrue(compile("\\w+").test("_var2"));
     assert.isTrue(compile("a\\sb").test("a b"));
@@ -538,14 +496,14 @@ fn test_braces(): void {
 
 @test
 fn test_captures(): void {
-    // (\d+)-(\d+) on "12-345" -> group1 "12", group2 "345"
+
     let re = compile("(\\d+)-(\\d+)");
     let m = re.exec("code 12-345 end");
     assert.isTrue(m.matched);
     assert.equalStr(m.group(0), "12-345");
     assert.equalStr(m.group(1), "12");
     assert.equalStr(m.group(2), "345");
-    // non-capturing group doesn't count
+
     let re2 = compile("(?:ab)+(c)");
     let m2 = re2.exec("ababc");
     assert.equalStr(m2.group(1), "c");
@@ -561,13 +519,13 @@ fn test_find_all_and_replace(): void {
     assert.equalStr(nums.at(2), "333");
 
     assert.equalStr(compile("\\d+").replaceAll("a1b22c", "#"), "a#b#c");
-    // group ref in the replacement
+
     assert.equalStr(compile("(\\w+)@(\\w+)").replaceAll("x a@b y", "x $2.$1"), "x x b.a y");
 }
 
 @test
 fn test_word_boundary_via_anchors(): void {
-    // A common real use: validate a whole string.
+
     let ident = compile("^[a-zA-Z_][a-zA-Z0-9_]*$");
     assert.isTrue(ident.test("my_var2"));
     assert.isTrue(!ident.test("2bad"));

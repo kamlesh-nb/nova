@@ -1,39 +1,23 @@
-// assert.nova — Minimal test assertion module for Nova
-// Used with @test attributed functions.
-//
-// Usage:
-//   import assert;
-//
-//   @test
-//   fn testMyFeature(): void {
-//       assert.equal(1 + 1, 2);
-//       assert.isTrue(someCondition());
-//       assert.notEqual("hello", "world");
-//   }
 
 import string;
 import bytes;
 
-// Fail the current test with a message
 pub fn fail(msg: string): void {
     nova_test_fail(msg);
 }
 
-// Assert that a boolean is true
 pub fn isTrue(val: bool): void {
     if (!val) {
         nova_test_fail("Expected true, got false");
     }
 }
 
-// Assert that a boolean is false
 pub fn isFalse(val: bool): void {
     if (val) {
         nova_test_fail("Expected false, got true");
     }
 }
 
-// Assert that two int values are equal
 pub fn equalInt(actual: int, expected: int): void {
     if (actual != expected) {
         let msg = "Expected " + expected + ", got " + actual;
@@ -41,7 +25,6 @@ pub fn equalInt(actual: int, expected: int): void {
     }
 }
 
-// Assert that two int values are not equal
 pub fn notEqualInt(actual: int, expected: int): void {
     if (actual == expected) {
         let msg = "Expected values to differ, both were " + actual;
@@ -49,7 +32,6 @@ pub fn notEqualInt(actual: int, expected: int): void {
     }
 }
 
-// Assert that two strings are equal
 pub fn equalStr(actual: string, expected: string): void {
     if (!string.eql(actual, expected)) {
         let msg = "Expected \"" + expected + "\", got \"" + actual + "\"";
@@ -57,7 +39,6 @@ pub fn equalStr(actual: string, expected: string): void {
     }
 }
 
-// Assert that two strings are not equal
 pub fn notEqualStr(actual: string, expected: string): void {
     if (string.eql(actual, expected)) {
         let msg = "Expected strings to differ, both were \"" + actual + "\"";
@@ -65,7 +46,6 @@ pub fn notEqualStr(actual: string, expected: string): void {
     }
 }
 
-// Assert that a string contains a substring
 pub fn contains(haystack: string, needle: string): void {
     if (string.indexOf(haystack, needle) == -1) {
         let msg = "Expected \"" + haystack + "\" to contain \"" + needle + "\"";
@@ -73,14 +53,12 @@ pub fn contains(haystack: string, needle: string): void {
     }
 }
 
-// Assert that a value is not zero / not null
 pub fn notZero(val: int): void {
     if (val == 0) {
         nova_test_fail("Expected non-zero value, got 0");
     }
 }
 
-// Assert that an int value is zero
 pub fn zero(val: int): void {
     if (val != 0) {
         let msg = "Expected 0, got " + val;
@@ -88,7 +66,6 @@ pub fn zero(val: int): void {
     }
 }
 
-// Assert that a > b
 pub fn gt(a: int, b: int): void {
     if (a <= b) {
         let msg = "Expected " + a + " > " + b;
@@ -96,7 +73,6 @@ pub fn gt(a: int, b: int): void {
     }
 }
 
-// Assert that a >= b
 pub fn gte(a: int, b: int): void {
     if (a < b) {
         let msg = "Expected " + a + " >= " + b;
@@ -104,7 +80,6 @@ pub fn gte(a: int, b: int): void {
     }
 }
 
-// Assert that a < b
 pub fn lt(a: int, b: int): void {
     if (a >= b) {
         let msg = "Expected " + a + " < " + b;
@@ -112,7 +87,6 @@ pub fn lt(a: int, b: int): void {
     }
 }
 
-// Assert that a <= b
 pub fn lte(a: int, b: int): void {
     if (a > b) {
         let msg = "Expected " + a + " <= " + b;

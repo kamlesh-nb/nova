@@ -1,4 +1,4 @@
-// cors.nova — CORS Headers and Options Middleware
+
 import web.request;
 import web.response;
 import web.middleware;
@@ -6,8 +6,8 @@ import web.status;
 import collections.list;
 
 pub struct CorsConfig {
-    pub allowOrigin: string,       // e.g. "*" or specific origin
-    pub allowOrigins: list.List,   // List<string>
+    pub allowOrigin: string,
+    pub allowOrigins: list.List,
     pub allowMethods: string,
     pub allowHeaders: string,
     pub maxAge: string,

@@ -1,4 +1,3 @@
-// src/templates.zig
 
 pub const console_main_sample =
     \\import string;
@@ -235,12 +234,6 @@ pub const app_test_sample =
     \\}
 ;
 
-// ============================================================================
-// `nova init web` — vertical-slice (VSA) web app templates (T5).
-// Each feature slice is a self-contained folder; the mediator wires request TYPE ->
-// handler. Verified to compile as a multi-file project.
-// ============================================================================
-
 pub const web_main_sample =
     \\// main.nova — app composition root (= Program.cs): register handlers + routes, wire
     \\// static files, run. Each `handle<TReq>` binds a request type to its handler; the
@@ -429,10 +422,6 @@ pub const web_test_sample =
     \\    assert.isTrue(string.indexOf(res.body, "Widget") != -1);
     \\}
 ;
-
-// ============================================================================
-// `nova init desktop` — webview desktop app template (T5, W1).
-// ============================================================================
 
 pub const desktop_main_sample =
     \\// main.nova — a native desktop app: a webview window rendering NSX, with a Nova

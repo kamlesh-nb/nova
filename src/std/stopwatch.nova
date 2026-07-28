@@ -2,9 +2,7 @@ import datetime;
 import assert;
 
 pub struct StopWatch {
-    // A7 / F3 §6: nanoseconds in `long`. Was seconds in `int` — which had only
-    // 1-second resolution (a 50ms interval read as 0) AND overflowed int32 after
-    // ~25 days once multiplied to ms. `datetime.nowNs()` gives real sub-second timing.
+
     pub start_time: long,
     pub end_time: long,
 
@@ -28,9 +26,7 @@ pub struct StopWatch {
 @test
 fn test_stopwatch(): void {
     let sw = StopWatch();
-    // Consume a measurable amount of time with a busy loop. The ns clock must register
-    // the elapsed time as nonzero — the old seconds-based version returned 0 for anything
-    // under a second.
+
     let acc: long = 0;
     let i = 0;
     while (i < 2000000) {
@@ -41,5 +37,5 @@ fn test_stopwatch(): void {
     let ns = sw.elapsedNs();
     assert.isTrue(ns > 0);
     assert.isTrue(sw.elapsedMs() >= 0);
-    assert.isTrue(acc > 0);   // keep the loop from being optimized away
+    assert.isTrue(acc > 0);
 }
