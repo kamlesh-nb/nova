@@ -186,11 +186,32 @@ not instead of finishing it.
 
 Legend for the "◑" rows: partially landed; the *remaining* scope is the design below.
 
-**Latest (2026-07-28):** corpus **179/179 functional, 327/327 ASAN** clean; ARC-audit at floor. **~38 of 48
-items ✅** (A2 added: async coloring/deadlock; N1/R1/I1/I2/I3/I4 infra all done). Partial (5): F3
-(overflow-trap by design), F4 (Itanium mangling only), T1 (LLVM-mirror upload), T6 (Phase-3 checking),
-W6 (inbound TLS). Not started (4): **T2** (WASM audit), **H3** (test-infra consolidation), **D7** (DB
-production-readiness), **BT1** (BTreeDB concurrency, separate repo). Docs: **Z1** 🔨 (onboarding v1 done).
+## 🅱️ BETA (2026-07-28) — declared; all beta gates met on the native target (WASM = best-effort)
+
+**Nova is Beta.** Scope decision (user, 2026-07-28): **WASM is a SECONDARY / best-effort target, no longer
+primary** — so wasm bugs and B-gate-2-for-wasm do not gate Beta; the bar is the native toolchain. Evidence,
+on `main` @ `a1dd076` (fast-forwarded; PRs #3–#6 landed):
+- **Sound core** ✅ — real type-checking/generics; the async-from-sync **deadlock is fixed** (A2), the last
+  concurrency landmine. Function-coloring enforced.
+- **Dependable runtime** ✅ — native corpus **180/180**, ASAN **329/329** clean; share-nothing Asio, real
+  wolfSSL TLS.
+- **Usable stdlib incl. HTTPS** ✅ — **W6 inbound TLS** closed the last functional gap: the App server
+  terminates TLS in-process (live TLSv1.3). Collections/serde/decimal/regex/DI/HTTP-client all present.
+- **B-gate 1** (harness proves things) ✅ — self-testing negative-case guard + new wasm `--guard` bounds
+  checker. **B-gate 2** (no silent unsoundness in a documented feature) ✅ on native. **B-gate 3** (runs on
+  Linux/Windows) ✅ — per the CI-policy decision, delivery is cross-compilation (T1): a language+stdlib
+  program cross-compiled macOS→Linux-arm64 (static ELF) **runs correctly in an Ubuntu container**
+  (`sum=30 map=30 dec=20.00`); Windows PE32+ cross-build proven earlier.
+
+**Post-beta (not gating):** Z1 architecture docs (NEXT — starting now), WASM last mile (91/104; one localized
+`Storage<T>` ctor OOB the `--guard` tool pinpointed), native multi-OS *CI runners* (delivery already verified
+via cross-compile+Docker), D7/H3/BT1, F3/F4 partials.
+
+**Latest (2026-07-28):** corpus **180/180 functional, 329/329 ASAN** clean; ARC-audit at floor. Beta declared
+(above). This session: async-deadlock fix (A2), `nova build` relink, W6 inbound TLS, T2 WASM (capability gate +
+exec 5→91/104 + `--guard` bounds checker). Partial: F3 (overflow-trap by design), F4 (Itanium mangling only),
+T1 (LLVM-mirror upload), T6 (Phase-3 checking), T2 (WASM best-effort). Not started: **H3**, **D7**, **BT1**.
+Docs: **Z1** 🔨 (onboarding v1; deep-dives NEXT).
 
 **Current state (2026-07-24):** corpus **151/151 functional, 276/276 ASAN** clean; ARC-audit at floor. **29 of 46
 items ✅** (3 ◑ partial, 1 🔨 [Z1-onboarding], 13 not started). **This session (autonomous, language-first):** T7
