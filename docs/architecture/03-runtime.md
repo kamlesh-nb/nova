@@ -1,105 +1,116 @@
 # The Runtime
 
-The native runtime is **C++20**, in `src/runtime/`, compiled to a static archive
-(`~/.nova/lib/libnova_runtime.a`) that every native binary links. It provides the async scheduler,
-non-blocking sockets and TLS, channels/actors, the allocator, decimal128, and crypto. The compiler talks
-to it through a fixed **extern-C ABI seam** — the runtime can be rewritten as long as that seam holds.
+The native runtime is written in **C++20**, and resides in `src/runtime/`. It is compiled into a static
+archive (`~/.nova/lib/libnova_runtime.a`) that every native binary links. It provides the async scheduler,
+the non blocking sockets and TLS, the channels and actors, the allocator, decimal128, and crypto. The
+compiler communicates with it through a fixed **extern-C ABI seam**; the runtime may be rewritten so long
+as that seam is held.
 
 | File | Role |
 |------|------|
-| `concurrency.cpp` (~790) | The scheduler: Boost.Asio reactors, coroutine resume/suspend, `spawn`/`await`/`when_all`, channels, the block-drive entry `nova_run_root`. |
-| `io.cpp` (~1120) | Non-blocking sockets (async accept/connect/read/write, deadline recv) and TLS (wolfSSL over an in-memory BIO, pumped by Nova async); process spawn + isolation. |
-| `alloc.cpp` (~430) | The heap: `nova_bytes_alloc`, the 8-byte header, `nova_retain`/`nova_release`, value-optional boxing, the persistent arena. |
-| `core.cpp` (~430) | Primitives: `nova_panic`, string conversions, `nova_f64_bits`, args/env. |
-| `decimal.cpp` (~330) | IEEE-754 decimal128 (BID): parse/format + base-10 arithmetic with round-half-even. |
-| `crypto.cpp` (~280) | Real wolfCrypt: SHA/HMAC/CSPRNG. |
-| `nova_abi.h` (~225) | The extern-C declarations — the seam the compiler emits calls against. |
+| `concurrency.cpp` (about 790) | The scheduler: the Boost.Asio reactors, coroutine resume and suspend, `spawn`, `await`, and `when_all`, the channels, and the block drive entry `nova_run_root`. |
+| `io.cpp` (about 1120) | The non blocking sockets (async accept, connect, read, write, and deadline recv) and TLS (wolfSSL over an in memory BIO, pumped by Nova async); and process spawn and isolation. |
+| `alloc.cpp` (about 430) | The heap: `nova_bytes_alloc`, the 8 byte header, `nova_retain` and `nova_release`, value optional boxing, and the persistent arena. |
+| `core.cpp` (about 430) | The primitives: `nova_panic`, string conversions, `nova_f64_bits`, and args and env. |
+| `decimal.cpp` (about 330) | IEEE-754 decimal128 (BID): parse and format, along with base-10 arithmetic with round half even. |
+| `crypto.cpp` (about 280) | Real wolfCrypt: SHA, HMAC, and CSPRNG. |
+| `nova_abi.h` (about 225) | The extern-C declarations, that is, the seam against which the compiler emits calls. |
 
-## The scheduler — `concurrency.cpp`
+## The Scheduler, `concurrency.cpp`
 
-### Share-nothing thread-per-core (Path A / N1)
+### Share Nothing, Thread per Core (Path A, or N1)
 
-The scheduler is **N = cores-1 independent `boost::asio::io_context` reactors**, each driven by one pinned
-thread. A coroutine — and the socket it owns — lives entirely on its reactor and never migrates, so the
-per-coroutine strands are free no-ops and per-reactor data structures (e.g. the reverse-proxy connection
-pool) need no locks: the HAProxy `idle_conn_srv[tid]` model. `NOVA_THREADS=1` collapses to a single
-reactor (exact old behavior — the rollback switch).
+The scheduler consists of **N (that is, cores minus 1) independent `boost::asio::io_context` reactors**,
+each driven by one pinned thread. A coroutine, and the socket that it owns, lives entirely on its reactor
+and never migrates; hence the per-coroutine strands are free no ops, and the per-reactor data structures
+(for example the reverse proxy connection pool) require no locks, in the manner of the HAProxy
+`idle_conn_srv[tid]` model. `NOVA_THREADS=1` collapses this to a single reactor (which is the exact old
+behaviour, and serves as the rollback switch).
 
 - **`nova_run()`** starts the pinned reactor threads and drives them to idle.
-- **`nova_hold_all_reactors()`** installs a leaked `work_guard` per reactor so a *server's* `io.run()`
-  blocks for the process lifetime instead of returning on a momentary idle. `App.run` calls this before its
-  block-drive so the per-reactor SO_REUSEPORT accept loops land on live reactors (nginx model → real
-  multi-core, no cross-reactor socket sharing).
+- **`nova_hold_all_reactors()`** installs a leaked `work_guard` per reactor, so that a *server's*
+  `io.run()` blocks for the lifetime of the process instead of returning on a momentary idle. `App.run`
+  calls this before its block drive, so that the per-reactor SO_REUSEPORT accept loops land on live
+  reactors (in the nginx model), which yields real multi core operation with no cross reactor socket
+  sharing.
 
-### Coroutine resume/suspend
+### Coroutine Resume and Suspend
 
-`async fn`s are LLVM coroutines (split by `CoroSplit`). The runtime resumes them via a raw switched-resume
-ABI, tracks parent↔child waiter edges (`g_waiters`), and schedules a parent when its awaited child
-completes. Lock-striped maps (`g_corostates`, `g_heldargs`, 64 stripes) keep contention off the hot path.
+The `async fn`s are LLVM coroutines (split by `CoroSplit`). The runtime resumes them via a raw switched
+resume ABI, tracks the parent to child waiter edges (`g_waiters`), and schedules a parent when its awaited
+child completes. Lock striped maps (`g_corostates` and `g_heldargs`, with 64 stripes) keep contention off
+the hot path.
 
-### The block-drive seam and its guard
+### The Block Drive Seam and its Guard
 
-A **synchronous** caller crosses into async by *block-driving*: `nova_run_root(handle)` schedules a
-coroutine and pumps its reactor until it has actually completed (not merely idle — it re-drains while a
-wakeup is in flight and aborts loudly on a genuinely lost wakeup rather than returning an unwritten
-result). This is legal at a true top level (a sync `main`/`@test`).
+A **synchronous** caller crosses into async by *block driving*: `nova_run_root(handle)` schedules a
+coroutine and pumps its reactor until it has actually completed (and not merely gone idle, since it re
+drains while a wakeup is in flight, and aborts loudly on a genuinely lost wakeup rather than returning an
+unwritten result). This is legal at a true top level, such as a sync `main` or `@test`.
 
-Doing it from **inside** a running coroutine (a sync function block-driving async while itself running on
-the event loop) re-enters `io.run()` on a context that never goes idle under a live server → deadlock. A
-thread-local **run-depth counter** wraps every `io.run()`; `nova_run_root` aborts with a precise message
-if entered at depth > 0. Combined with the checker's function-coloring rules ([01-compiler.md](01-compiler.md)),
-this turns a silent hang into a compile error or a loud, actionable abort. This is why the web framework's
-request handlers are `async fn` end-to-end.
+Doing this from *inside* a running coroutine (that is, a sync function block driving async while it is
+itself running on the event loop) re-enters `io.run()` on a context that never goes idle under a live
+server, and hence deadlocks. A thread local **run depth counter** wraps every `io.run()`, and
+`nova_run_root` aborts with a precise message in case it is entered at a depth greater than 0. In
+combination with the checker's function colouring rules (see [01-compiler.md](01-compiler.md)), this turns
+a silent hang into either a compile error or a loud, actionable abort. This is the reason the web
+framework's request handlers are `async fn` end to end.
 
-### Channels & actors
+### Channels and Actors
 
-`nova_channel_*` implement bounded blocking channels (mutex + condvar). The actor stdlib
-(`Mailbox<M>`/`Behavior<M>`) is built on channels + coroutines on top of this.
+`nova_channel_*` implement bounded blocking channels (using a mutex and a condition variable). The actor
+standard library (`Mailbox<M>` and `Behavior<M>`) is built upon channels and coroutines, on top of this.
 
-## Async I/O and TLS — `io.cpp`
+## Async I/O and TLS, `io.cpp`
 
-Sockets are non-blocking on the Asio reactor: `nova_aaccept` / `nova_aconnect` / `nova_arecv` /
-`nova_asend` / `nova_arecv_deadline` all **park the coroutine** (register a completion handler and suspend)
-rather than block a thread. `nova_arecv_deadline` races the recv against a timer for per-read timeouts
-(slow-loris protection).
+The sockets are non blocking on the Asio reactor. `nova_aaccept`, `nova_aconnect`, `nova_arecv`,
+`nova_asend`, and `nova_arecv_deadline` all **park the coroutine** (they register a completion handler and
+suspend) rather than block a thread. `nova_arecv_deadline` races the recv against a timer, for per-read
+timeouts (which provide slow loris protection).
 
-**TLS is built the right way:** wolfSSL keeps *all* crypto and X.509 verification, running against an
-**in-memory BIO**; the record pump is Nova async over the socket. So a TLS read decrypts from an internal
-buffer, and when it needs more ciphertext it `await`s a plain socket recv — every await parks the
-coroutine, no scheduler thread is held. `nova_mtls_new` (client) / `nova_mtls_new_server` (server) build
-the context; the stdlib `TlsStream` (both client `tlsConnect` and server `tlsAccept`) drives the handshake
-and record pump. The App server terminates HTTPS in-process via `tlsAccept`.
+**TLS is built the right way.** wolfSSL retains *all* crypto and X.509 verification, running against an
+**in memory BIO**; the record pump alone is Nova async over the socket. Thus a TLS read decrypts from an
+internal buffer, and when it requires more ciphertext it `await`s a plain socket recv; every await parks
+the coroutine, and no scheduler thread is held. `nova_mtls_new` (client) and `nova_mtls_new_server`
+(server) build the context; the standard library `TlsStream` (for both the client `tlsConnect` and the
+server `tlsAccept`) drives the handshake and the record pump. The App server terminates HTTPS in process
+via `tlsAccept`.
 
-Robustness seam worth noting: async I/O on a **null/failed socket handle** (handle `0` from a refused
-connect) returns `-1` instead of dereferencing null — a DB driver that sends its handshake before checking
-the connect result degrades gracefully instead of taking down the process.
+There is a robustness seam worth an understanding: async I/O upon a **null or failed socket handle** (a
+handle of `0` from a refused connect) returns `-1` instead of dereferencing null, so that a database
+driver which sends its handshake before checking the connect result degrades gracefully, instead of
+bringing down the process.
 
-## Process spawn & isolation — `io.cpp`
+## Process Spawn and Isolation, `io.cpp`
 
-`nova_process_spawn`/`_write_stdin`/`_read_stdout`/`_try_wait` (WNOHANG)/`_wait`/`_kill`/`_pid` implement
-POSIX process control (identity = kernel PID). `nova_process_spawn_isolated` (Linux) is a container-grade
-shim: `clone()` into PID/mount/UTS/IPC/net/user namespaces → `pivot_root` a private rootfs → drop all
-capabilities → install a seccomp-BPF filter → `execve`. Off-Linux it degrades to a plain spawn. This is
-the exec layer the (external) orchestrator package builds on.
+`nova_process_spawn`, `_write_stdin`, `_read_stdout`, `_try_wait` (WNOHANG), `_wait`, `_kill`, and `_pid`
+implement POSIX process control (wherein the identity is the kernel PID). `nova_process_spawn_isolated`
+(on Linux) is a container grade shim: it does `clone()` into the PID, mount, UTS, IPC, net, and user
+namespaces, then a `pivot_root` into a private rootfs, then drops all capabilities, then installs a seccomp
+BPF filter, and finally does `execve`. Off Linux, it degrades to a plain spawn. This is the exec layer
+upon which the (external) orchestrator package builds.
 
-## The heap — `alloc.cpp`
+## The Heap, `alloc.cpp`
 
-- `nova_bytes_alloc(size)` allocates `header(8) + size`, returns the client pointer; the arena is a bump
-  region with a free-list on the persistent side.
-- `nova_valopt_box`/`_unbox` fix the value-optional-0-reads-as-undefined bug: a value-type optional is
-  boxed into an 8-byte cell so a stored `0` is distinguishable from "absent" (a null box).
-- The 8-byte header + `nova_retain`/`nova_release(ptr, dtor)` are the ARC contract codegen emits against.
+- `nova_bytes_alloc(size)` allocates `header(8) + size` and returns the client pointer; the arena is a bump
+  region with a free list on the persistent side.
+- `nova_valopt_box` and `_unbox` fix the value-optional-zero-reads-as-undefined bug: a value type optional
+  is boxed into an 8 byte cell, so that a stored `0` is distinguishable from "absent" (a null box).
+- The 8 byte header, along with `nova_retain` and `nova_release(ptr, dtor)`, is the ARC contract against
+  which codegen emits.
 
-## The ABI seam — `nova_abi.h`
+## The ABI Seam, `nova_abi.h`
 
 The compiler emits `extern "C"` calls to a fixed set of symbols. The three seams that must be preserved
-across any runtime rewrite:
+across any runtime rewrite are as follows.
 
-1. **The extern-C symbol set** (`nova_bytes_alloc`, `nova_retain`/`nova_release`, `nova_arecv`/`nova_asend`,
-   `nova_run`/`nova_run_root`, `nova_channel_*`, `nova_mtls_*`, `nova_process_*`, `nova_decimal_*`, …).
-2. **ARC** — the 8-byte heap header and retain/release semantics.
-3. **The coroutine ABI** — how the scheduler resumes a split coroutine and reads its promise.
+1. **The extern-C symbol set** (`nova_bytes_alloc`, `nova_retain` and `nova_release`, `nova_arecv` and
+   `nova_asend`, `nova_run` and `nova_run_root`, `nova_channel_*`, `nova_mtls_*`, `nova_process_*`,
+   `nova_decimal_*`, and so forth).
+2. **ARC,** that is, the 8 byte heap header and the retain and release semantics.
+3. **The coroutine ABI,** that is, the manner in which the scheduler resumes a split coroutine and reads
+   its promise.
 
-The runtime is a **single translation unit** (`runtime.cpp` includes the others) so it builds as one
-object and cross-compiles cleanly. Boost.Asio is vendored (a header subset in `deps/boost`), wolfSSL and
-zlib are vendored/built — no Homebrew dependency at build time.
+The runtime is a **single translation unit** (`runtime.cpp` includes the others), so it builds as one
+object and cross compiles cleanly. Boost.Asio is vendored (a header subset in `deps/boost`), and wolfSSL
+and zlib are vendored and built; there is no Homebrew dependency at build time.

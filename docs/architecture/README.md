@@ -1,91 +1,95 @@
-# Nova — Architecture Overview
+# Nova, Architecture Overview
 
-This directory is the technical architecture reference for the Nova language implementation
-(the `lang/` repository). It explains **how Nova is built**, subsystem by subsystem, so a new
-contributor can navigate the code and extend it with confidence.
+This directory is the technical architecture reference for the Nova language implementation, that is, the
+`lang/` repository. It explains how Nova is built, subsystem by subsystem, so that a new contributor may
+navigate the code and extend it with confidence.
 
-> Nova is **Beta** on its primary, native target. WebAssembly is a secondary / best-effort target.
-> For *what the language is* and its surface semantics, see [`../language-specification.md`](../language-specification.md).
-> For *roadmap and status*, see [`../design/execution-plan.md`](../design/execution-plan.md).
+> Nova is at present in **Beta** on its primary, native target. WebAssembly is a secondary, best effort
+> target. For an understanding of *what the language is* and its surface semantics, kindly refer to
+> [`../language-specification.md`](../language-specification.md). For the roadmap and status, please see
+> [`../design/execution-plan.md`](../design/execution-plan.md).
 
-## The three programs
+## The Three Programs
 
-Nova is three cooperating codebases:
+Nova is composed of three cooperating codebases.
 
-| Component | Language | Where | Job |
-|-----------|----------|-------|-----|
-| **Compiler** | Zig 0.16 | `src/` (this repo) | Lowers Nova source → LLVM IR → native object → linked executable. |
-| **Runtime** | C++20 | `src/runtime/` | Linked into every native binary: async scheduler (Boost.Asio + LLVM coroutines), non-blocking sockets, TLS (wolfSSL), channels/actors, allocator. |
-| **Standard library** | Nova | `src/std/` | Collections, string, serde (JSON/YAML/BSON), decimal128, regex, crypto, the HTTP/web framework, the DB seam. Compiled from source on every build. |
+| Component | Language | Location | Responsibility |
+|-----------|----------|----------|----------------|
+| **Compiler** | Zig 0.16 | `src/` (this repo) | Lowers Nova source to LLVM IR, then to a native object, and finally to a linked executable. |
+| **Runtime** | C++20 | `src/runtime/` | Linked into every native binary. It provides the async scheduler (Boost.Asio with LLVM coroutines), non blocking sockets, TLS (wolfSSL), channels and actors, and the allocator. |
+| **Standard library** | Nova | `src/std/` | Collections, string, serde (JSON, YAML, BSON), decimal128, regex, crypto, the HTTP and web framework, and the database seam. It is compiled from source on every build. |
 
-Two sibling projects live outside this repo: **BTreeDB** (the Zig storage engine, `../../btree/`) and
-**nova-orchestrator** + the DB drivers (published Nova packages). They are consumers of the language, not
-part of it.
+Two sibling projects reside outside this repository, namely **BTreeDB** (the Zig storage engine,
+`../../btree/`) and **nova-orchestrator** along with the database drivers (which are published Nova
+packages). These are consumers of the language and are not a part of it.
 
-## The compilation pipeline (one glance)
+## The Compilation Pipeline at a Glance
 
 ```
 source.nova
-   │  main.zig: loadProgram  ── recursively resolve + merge imports ──► one AST (Program)
-   ▼
-sema/alpha.zig      α-rename    (same-scope shadowing → unique names)
-sema/ids.zig        assign IDs  (NodeId / ModuleId on every node)
-type_checker.zig    check       (arg counts, visibility, ownership/pointer-truncation,
-                                  function coloring, optionals soundness — DIAGNOSTICS)
-sema/ (shadow.zig)  typed IR    (infer → subst → lower → symbols → ownership:
-                                  the AUTHORITATIVE typed intermediate representation)
-sema/mono.zig       monomorph.  (worklist discovers live generic instantiations)
-codegen/            emit        (declarations → expressions/statements → arc → LLVM IR)
-   │  LLVM verify + CoroSplit + globalDCE  →  object file(s)
-   ▼
-main.zig: link      (in-process LLD for Mach-O/WASM, or clang++ / `zig c++` for cross-targets)
-   ▼
-executable  (native)  |  module.wasm  (freestanding + host imports)
+   |  main.zig: loadProgram  .. recursively resolve and merge imports ..>  one AST (Program)
+   v
+sema/alpha.zig      alpha-rename   (same-scope shadowing to unique names)
+sema/ids.zig        assign IDs     (NodeId and ModuleId on every node)
+type_checker.zig    check          (arg counts, visibility, ownership and pointer truncation,
+                                    function colouring, optionals soundness; these are DIAGNOSTICS)
+sema/ (shadow.zig)  typed IR       (infer, subst, lower, symbols, ownership:
+                                    the AUTHORITATIVE typed intermediate representation)
+sema/mono.zig       monomorphise   (a worklist discovers live generic instantiations)
+codegen/            emit           (declarations, then expressions and statements, then arc, to LLVM IR)
+   |  LLVM verify, CoroSplit, globalDCE  ..>  object file(s)
+   v
+main.zig: link      (in-process LLD for Mach-O and WASM, or clang++ / `zig c++` for cross targets)
+   v
+executable  (native)  |  module.wasm  (freestanding, with host imports)
 ```
 
-Every stage is one directory or file, and each has a deep-dive below.
+Every stage corresponds to one directory or file, and each of them has a deep dive below.
 
-## Deep dives
+## Deep Dives
 
-1. **[The Compiler](01-compiler.md)** — the pipeline in detail: lexer, parser/AST, the semantic
-   passes (`sema/`), monomorphization, and how `main.zig` drives and links it.
-2. **[Code Generation](02-codegen.md)** — how the typed IR becomes LLVM IR: the value model
-   (`val_type` = i64), traits as fat pointers, ARC, async as coroutines, and the native/WASM splits.
-3. **[The Runtime](03-runtime.md)** — the C++20 runtime: the share-nothing Asio scheduler, async
-   socket/TLS I/O, channels/actors, the ARC heap header, and the ABI seam the compiler depends on.
-4. **[Standard Library & Web Framework](04-stdlib.md)** — how the Nova stdlib is structured and
-   compiled, the `db` seam, and the MediatR-style `App` HTTP framework.
-5. **[Adding a Feature](05-adding-a-feature.md)** — the contributor workflow: where a new keyword /
-   type / builtin / stdlib module goes, and the conformance gate that must stay green.
+1. **[The Compiler](01-compiler.md).** The pipeline in detail: the lexer, the parser and AST, the semantic
+   passes (`sema/`), monomorphisation, and the manner in which `main.zig` drives and links the whole.
+2. **[Code Generation](02-codegen.md).** How the typed IR becomes LLVM IR: the value model (`val_type`,
+   which is i64), traits as fat pointers, ARC, async as coroutines, and the native and WASM splits.
+3. **[The Runtime](03-runtime.md).** The C++20 runtime: the share nothing Asio scheduler, async socket and
+   TLS I/O, channels and actors, the ARC heap header, and the ABI seam upon which the compiler depends.
+4. **[Standard Library and Web Framework](04-stdlib.md).** The manner in which the Nova standard library is
+   structured and compiled, the `db` seam, and the MediatR style `App` HTTP framework.
+5. **[Adding a Feature](05-adding-a-feature.md).** The contributor workflow: where a new keyword, type,
+   builtin, or standard library module is to be placed, and the conformance gate that must remain green.
 
-## Ground rules that shape everything
+## Ground Rules That Shape Everything
 
-These invariants recur throughout the code; internalize them before editing:
+The following invariants recur throughout the code, and they should be internalised before any editing is
+undertaken.
 
-- **`int` is 32-bit, `long`/`ptr` are 64-bit.** A heap address must be `long`/`ptr`. `intAddr + offset`
-  truncates to 32 bits (LLVM `trunc i64→i32`) → garbage pointer → address-dependent SIGSEGV.
-- **The universal value handle is 64-bit (`val_type` = i64)** on both native and WASM — it must hold an
-  `f64`. On WASM32 a pointer is i32 and rides the low 32 bits of that i64.
-- **Monomorphization is mandatory.** Generics are instantiated (`List<int>` → `List_int_*`), never
-  type-erased at runtime. An erased body is only a link-time fallback that `globalDCE` drops.
-- **ARC, not GC.** Every heap object has an 8-byte header (`refcount @ -8`, `length @ -4`); ownership is
-  decided in the semantic/codegen passes. **Verify memory changes with AddressSanitizer** (`run.sh --asan`),
-  not just the ARC audit — the audit misses use-after-frees that ASAN catches.
+- **`int` is 32 bit, whereas `long` and `ptr` are 64 bit.** A heap address must therefore be `long` or
+  `ptr`. The expression `intAddr + offset` truncates to 32 bits (an LLVM `trunc i64 to i32`), which yields
+  a garbage pointer, and hence an address dependent SIGSEGV.
+- **The universal value handle is 64 bit (`val_type`, which is i64)** on both native and WASM, because it
+  must be able to hold an `f64`. On WASM32 a pointer is i32 and rides in the low 32 bits of that i64.
+- **Monomorphisation is mandatory.** Generics are instantiated (`List<int>` becomes `List_int_*`); they are
+  never type erased at runtime. An erased body is merely a link time fallback that `globalDCE` drops.
+- **The scheme is ARC, and not GC.** Every heap object carries an 8 byte header (`refcount` at offset minus
+  8, `length` at offset minus 4); ownership is decided in the semantic and codegen passes. Kindly verify
+  memory changes with AddressSanitizer (`run.sh --asan`), and not merely with the ARC audit, since the
+  audit does miss use after free cases that ASAN catches.
 - **The conformance corpus is the contract.** `conformance/run.sh` (positive cases via `nova test`,
-  `expect_fail/` negatives, `--asan` memory gate) runs before and after any change.
+  negatives under `expect_fail/`, and the `--asan` memory gate) is to be run before and after any change.
 
-## Build, run, test
+## Build, Run, Test
 
 ```sh
 cd lang
-zig build                    # build `nova` → ~/.nova/bin, sync std+runtime+deps to ~/.nova
-NOVA_ASAN=1 zig build        # also build the ASAN runtime (for the --asan gate)
+zig build                    # build `nova` to ~/.nova/bin, and sync std, runtime, deps to ~/.nova
+NOVA_ASAN=1 zig build        # additionally build the ASAN runtime (required for the --asan gate)
 
 nova file.nova -o out        # compile one file to a native binary
 nova test file.nova          # run its @test functions
-nova build [--release]       # project build (reads project.json) → build/<profile>/{obj,bin}
+nova build [--release]       # project build (reads project.json) to build/<profile>/{obj,bin}
 
 conformance/run.sh           # the corpus (native)
-conformance/run.sh --asan    # AddressSanitizer memory gate
-conformance/run.sh --wasm    # WASM compile gate;  --wasm-run  executes under Node
+conformance/run.sh --asan    # the AddressSanitizer memory gate
+conformance/run.sh --wasm    # the WASM compile gate; --wasm-run executes under Node
 ```

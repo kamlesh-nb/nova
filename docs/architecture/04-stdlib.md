@@ -1,9 +1,10 @@
-# Standard Library & Web Framework
+# Standard Library and Web Framework
 
-Nova's standard library is written **in Nova itself**, under `src/std/`. There is no precompiled stdlib
-binary: the modules a program imports are compiled from source on every build, through the exact same
-pipeline as user code. This keeps the language honest — the stdlib is the biggest real-world test of the
-compiler, and a stdlib module that stops compiling is caught the same way user code is.
+Nova's standard library is written **in Nova itself**, under `src/std/`. There is no precompiled standard
+library binary: the modules that a program imports are compiled from source on every build, through the
+very same pipeline as user code. This keeps the language honest, since the standard library is the largest
+real world test of the compiler, and a standard library module that ceases to compile is caught in the
+same manner as user code.
 
 ## Layout
 
@@ -11,11 +12,11 @@ compiler, and a stdlib module that stops compiling is caught the same way user c
 src/std/
   collections/   list, map, set, string_builder, storage
   string  datetime  math  assert  traits  env  exception
-  serde/         json, yaml, bson, source            (@serializable → generated __bind)
-  data/          db (the DB seam), sql/pool, orm
+  serde/         json, yaml, bson, source            (@serializable produces a generated __bind)
+  data/          db (the database seam), sql/pool, orm
   net/           asyncio, asynctls, tcp/*, tls, url
   web/           app, request, response, router, mediator, di, middleware, static_content,
-                 controller, cors, csrf, session, recovery, rate_limit, client, circuit_breaker, ...
+                 controller, cors, csrf, session, recovery, rate_limit, client, circuit_breaker, and so on
   concurrency/   fiber, channel, asyncchan, atomic, actor
   crypto/        sha, md5, base64, random, scram
   compress/      gzip
@@ -23,31 +24,34 @@ src/std/
   io/            file, dir     mem/  allocator, arena_allocator, memory
 ```
 
-The set of stdlib modules the compiler knows how to resolve is registered in `main.zig` (`std_modules`);
-`import <mod>` resolves to `src/std/<mod>.nova` (in-checkout), `~/.nova/std/<mod>.nova` (installed), or a
-fetched package's `src/<mod>.nova` (`~/.nova/cache/<repo>`). Identity is the **canonical `src/std/…`
-spelling** regardless of where the bytes are read from, so a module imported two ways is collected once.
+The set of standard library modules that the compiler knows how to resolve is registered in `main.zig`
+(the `std_modules` list). An `import <mod>` resolves to `src/std/<mod>.nova` (in checkout), or
+`~/.nova/std/<mod>.nova` (installed), or a fetched package's `src/<mod>.nova` (`~/.nova/cache/<repo>`).
+The identity is the **canonical `src/std/...` spelling**, irrespective of the location from which the
+bytes are read, so that a module imported in two ways is collected only once.
 
-## Representative subsystems
+## Representative Subsystems
 
-- **Collections** are monomorphized generics over `Storage<T>` (a typed slot array, not raw bytes), so ARC
-  releases a *typed* field via the generated `__destruct_Storage_T`. `Map<K,V>` is open-addressing with
-  linear probing and a pluggable `hashFn` (`Map<string,int>(16, string.hash)`).
-- **serde** — `@serializable` structs get a compiler-generated `<Struct>__bind(ValueSource)` deserializer
-  (source-generated and re-parsed — no reflection), recursive, over a `ValueSource` abstraction that backs
-  JSON/form/BSON uniformly. The write side generates `<Struct>__dump` into a `ValueSink`. `decimal`
-  round-trips exactly (BSON type `0x13`).
-- **decimal128** is a first-class type: `m`-suffixed literals, exact arithmetic (no implicit int↔decimal),
-  div/mod-by-zero traps. The runtime (`decimal.cpp`) does the BID codec + base-10 math.
-- **crypto** is real wolfCrypt (SHA/HMAC/CSPRNG) plus base64 implemented in Nova; `random` exposes both a
-  CSPRNG (for salts/nonces/tokens) and a seedable PCG32 `Prng` (for reproducible tests/sampling) — kept
-  deliberately distinct so a reviewer can't mistake one for the other.
-- **async utilities** — `net/asyncio` (`AsyncStream`, awaitable socket I/O), `net/asynctls`
-  (`TlsStream`), channels, actors — the Nova-level surface over the runtime's async seam.
+- **Collections** are monomorphised generics over `Storage<T>` (which is a typed slot array, and not raw
+  bytes), so that ARC releases a *typed* field via the generated `__destruct_Storage_T`. `Map<K,V>` is open
+  addressing with linear probing and a pluggable `hashFn` (as in `Map<string,int>(16, string.hash)`).
+- **serde.** A `@serializable` struct receives a compiler generated `<Struct>__bind(ValueSource)`
+  deserialiser (which is source generated and re-parsed, so there is no reflection), recursive, over a
+  `ValueSource` abstraction that backs JSON, form, and BSON uniformly. The write side generates
+  `<Struct>__dump` into a `ValueSink`. A `decimal` round trips exactly (as BSON type `0x13`).
+- **decimal128** is a first class type: `m` suffixed literals, exact arithmetic (with no implicit int to
+  decimal conversion), and div and mod by zero traps. The runtime (`decimal.cpp`) performs the BID codec
+  and the base-10 mathematics.
+- **crypto** is real wolfCrypt (SHA, HMAC, CSPRNG), along with base64 implemented in Nova. `random` exposes
+  both a CSPRNG (for salts, nonces, and tokens) and a seedable PCG32 `Prng` (for reproducible tests and
+  sampling); these two are kept deliberately distinct, so that a reviewer cannot mistake one for the other.
+- **async utilities.** `net/asyncio` (with `AsyncStream` and awaitable socket I/O), `net/asynctls` (with
+  `TlsStream`), the channels, and the actors are the Nova level surface over the runtime's async seam.
 
-## The database seam — `data/db.nova`
+## The Database Seam, `data/db.nova`
 
-Programs never talk to a concrete driver; they program against a trait seam so the backend is swappable:
+Programs never talk to a concrete driver; they program against a trait seam, so that the backend is
+swappable.
 
 ```nova
 pub trait Driver     { async fn connect(self, dsn: string): Connection; }
@@ -61,50 +65,54 @@ pub trait Connection {
 }
 ```
 
-`exec`/`query`/`prepare` are `async fn` — a driver's socket recv **parks the coroutine** (non-blocking).
-`DbValue` is a tag-struct union of SQL value kinds; `ResultSet`/`Row` decode typed cells. The concrete
-drivers (Postgres/MySQL/MSSQL/BTreeDB/MongoDB) are **separate published packages** (`nova-<name>`),
-fetched via `nova get`; only the seam and the generic connection pool live in std. A repository just
-constructs a driver and awaits it:
+`exec`, `query`, and `prepare` are `async fn`, so that a driver's socket recv **parks the coroutine** (in
+a non blocking manner). `DbValue` is a tag struct union of the SQL value kinds; `ResultSet` and `Row`
+decode the typed cells. The concrete drivers (Postgres, MySQL, MSSQL, BTreeDB, MongoDB) are **separate
+published packages** (`nova-<name>`), fetched via `nova get`; only the seam and the generic connection pool
+reside in std. A repository merely constructs a driver and awaits it.
 
 ```nova
 let conn = await driver.connect(dsn);
 let rs   = await conn.query("SELECT name FROM products WHERE id = $1", params);
 ```
 
-## The web framework — `web/app.nova`
+## The Web Framework, `web/app.nova`
 
-The App is a **minimal-API, MediatR-style** HTTP framework on the async runtime. Three responsibilities are
-kept separate:
+The App is a **minimal API, MediatR style** HTTP framework built on the async runtime. Three
+responsibilities are kept separate.
 
-- **Registration** (`app.get<TReq>(path)` / `post`/…) records `(method, path, type-key)` — plain data, no
-  dispatch. The type key is `serde.typeName<TReq>()`, so a route and its handler agree *by type*.
-- **Handlers** (`MessageHandler.handle(src): Response`) bind the request from a `ValueSource` themselves —
-  visible, debuggable Nova, no hidden binder — and return a `Response`.
-- **Dispatch** (`App.dispatch`) is the one request→Response site: match the route, build the source, resolve
-  the handler by type-key from the `AppMediator`, run it.
+- **Registration** (`app.get<TReq>(path)`, `post`, and so on) records `(method, path, type-key)`, which is
+  plain data with no dispatch. The type key is `serde.typeName<TReq>()`, so that a route and its handler
+  agree *by type*.
+- **Handlers** (`MessageHandler.handle(src): Response`) bind the request from a `ValueSource` themselves,
+  which is visible, debuggable Nova with no hidden binder, and return a `Response`.
+- **Dispatch** (`App.dispatch`) is the one request to Response site: it matches the route, builds the
+  source, resolves the handler by type key from the `AppMediator`, and runs it.
 
-The whole chain — `handleConn` (the async accept-loop coroutine) → `App.respondMiss` → `App.dispatch` →
-`AppMediator.send` → `MessageHandler.handle` → a repository's async DB call — is **`async fn` end to end**,
-so a request is served on one coroutine with no nested block-drive. This is what makes per-request DB work
-without deadlocking (see the block-drive guard in [03-runtime.md](03-runtime.md)).
+The whole chain, that is, `handleConn` (the async accept loop coroutine), then `App.respondMiss`, then
+`App.dispatch`, then `AppMediator.send`, then `MessageHandler.handle`, and finally a repository's async
+database call, is **`async fn` end to end**, so that a request is served on one coroutine with no nested
+block drive. This is what makes per-request database access work without deadlocking (please see the block
+drive guard in [03-runtime.md](03-runtime.md)).
 
-Other pieces: **DI** (`web/di.nova` — `ServiceProvider`/`ServiceScope`, singleton/scoped/transient,
-constructor injection via `handleFrom<T>`), a request pipeline (middleware/pre/post/exception),
-`useStatic` (LRU-cached static files), gzip content-negotiation, inbound TLS (`app.useTls(cert, key)` →
-in-process HTTPS), and W6 hardening (chunked decode, per-read timeouts, 431/413 caps).
+There are other pieces as well: **DI** (`web/di.nova`, providing `ServiceProvider` and `ServiceScope`,
+singleton, scoped, and transient lifetimes, and constructor injection via `handleFrom<T>`), a request
+pipeline (middleware, pre, post, and exception), `useStatic` (LRU cached static files), gzip content
+negotiation, inbound TLS (`app.useTls(cert, key)`, which gives in process HTTPS), and W6 hardening
+(chunked decode, per-read timeouts, and 431 and 413 caps).
 
-### The server loop
+### The Server Loop
 
-`App.run` calls `holdReactors()` then block-drives the async accept fan-out: one SO_REUSEPORT accept loop
-per reactor (reactor 0 inline, 1..N-1 spawned and pinned). The kernel load-balances new connections across
-the per-reactor acceptors; each connection's handler stays on its accepting reactor, so per-reactor
-connection pools reuse safely. The request loop frames HTTP directly on the receive buffer (zero-copy) and
-serves a cacheable GET from a response cache without building the request string or dispatching.
+`App.run` calls `holdReactors()` and thereafter block drives the async accept fan out: one SO_REUSEPORT
+accept loop per reactor (reactor 0 inline, and reactors 1 to N minus 1 spawned and pinned). The kernel
+load balances the new connections across the per-reactor acceptors; each connection's handler stays on its
+accepting reactor, so that the per-reactor connection pools reuse safely. The request loop frames HTTP
+directly on the receive buffer (that is, zero copy), and serves a cacheable GET from a response cache
+without building the request string or dispatching.
 
-## Templates & scaffolding
+## Templates and Scaffolding
 
-`nova init web|desktop` scaffolds an app (`src/templates.zig`, `src/main.zig`) in an ASP.NET-style,
-vertical-slice layout: features under `Features/<Area>/<UseCase>/{command,query,handler,validator}`, an
+`nova init web|desktop` scaffolds an app (see `src/templates.zig` and `src/main.zig`) in an ASP.NET style,
+vertical slice layout: features under `Features/<Area>/<UseCase>/{command,query,handler,validator}`, an
 `Infrastructure/` for repositories over the `db` seam, and a `main.nova` composition root that registers
-handlers + routes and calls `app.run(port)`. The `lang/flagship` app is the reference.
+the handlers and routes and calls `app.run(port)`. The `lang/flagship` app is the reference.
