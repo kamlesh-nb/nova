@@ -58,6 +58,12 @@ Every stage corresponds to one directory or file, and each of them has a deep di
    structured and compiled, the `db` seam, and the MediatR style `App` HTTP framework.
 5. **[Adding a Feature](05-adding-a-feature.md).** The contributor workflow: where a new keyword, type,
    builtin, or standard library module is to be placed, and the conformance gate that must remain green.
+6. **[BTreeDB](06-btreedb.md).** The sibling storage engine (a separate repository, in Zig): the slotted
+   page B+Tree, the segmented buffer pool, MVCC and the WAL, the SQL layer, and the binary wire protocol
+   that Nova's driver speaks.
+7. **[The Orchestrator](07-orchestrator.md).** The sibling control plane (a separate Nova package): the L7
+   proxy and load balancer, the reconcile loop node agent, cgroups limits, PID autoscaling, and native
+   container grade isolation.
 
 ## Ground Rules That Shape Everything
 
