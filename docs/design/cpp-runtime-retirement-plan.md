@@ -1,5 +1,24 @@
 # Retiring the C++ Runtime: A Structured Migration Plan
 
+## Tracker
+
+Statuses: DONE, WIP (in progress or partially landed), TODO. Update this table as the single source of
+truth for progress; the phase details are below.
+
+| Phase | What it retires or builds | Prereq | Status | Notes |
+|-------|---------------------------|--------|--------|-------|
+| Foundation | Event loop, buffers, HTTP parser, poll and socket layer, multi-core | none | DONE | `self-hosted-runtime.md` phases 1 to 5; race-free under `--tsan` |
+| M0 | Tooling: file-based runtime trace, symbol audit | none | TODO | Unblocks M1; stderr diagnostics did not surface last time |
+| M1 | Async scheduler migration (per-reactor run queue) | M0 | WIP | Single-level await works; multi-level and spawn hang; reverted, diff at `scheduler-migration-wip.patch` |
+| M2 | Async socket I/O on the reactor | M1 | TODO | `arecv`/`asend`/`aconnect`/`aaccept` in Nova over `os/sys` |
+| M3 | Database drivers on the reactor | M2 | TODO | No driver change; they already speak the async seam |
+| M4 | Retire Boost.Asio | M1 to M3 | TODO | Remove reactors, strands, `g_io`; drop vendored Boost |
+| M5 | File and directory I/O in Nova | M4 (soft) | TODO | `nova_file_*`, `nova_dir_*` over `os/sys` |
+| M6 | Process and primitive shims | none | TODO | `core.cpp` shims to `os/sys`; tiny atomics FFI stays |
+| M7 | Channels and actors in Nova | M1, M6 | TODO | Over the reactor; verify under `--tsan` |
+| M8 | Allocator backing in Nova | none | TODO | `mmap` arena under `nova_bytes_alloc`; ABI-CORE unchanged |
+| M9 | TLS 1.2 and 1.3 protocol in Nova | M2 | TODO | Protocol only; reference the Zig `std.crypto.tls`; crypto primitives stay vetted |
+
 ## Purpose
 
 This is the plan of record for replacing the C++ runtime (`src/runtime/`) with Nova code over a thin
@@ -18,7 +37,7 @@ it leaves or stays, and sequences the removal.
 
 | File | Lines | Responsibility | Classification |
 |------|------:|----------------|----------------|
-| `io.cpp` | 1116 | File and directory operations, blocking socket send and receive and connect, the wolfSSL memory-BIO TLS pump | MIGRATE (file, dir, socket) + STAY-FFI (TLS) |
+| `io.cpp` | 1116 | File and directory operations, blocking socket send and receive and connect, the wolfSSL memory-BIO TLS pump | MIGRATE (file, dir, socket, and the TLS protocol in M9) + STAY-FFI (crypto primitives under TLS) |
 | `concurrency.cpp` | 833 | Boost.Asio reactors, the coroutine scheduler (`nova_sched_schedule`), async I/O (`nova_aaccept`/`aconnect`/`arecv`/`asend`/`aserver_listen`), channels, actors, `when_all`, timers, the `CoroState` machinery | MIGRATE (the core of the whole effort) |
 | `core.cpp` | 438 | FFI helpers (errno, cstr marshalling), process args, exit, `f64_bits`, atomics, condition variables, mutexes, coverage, stack traces, `close`, `set_nonblock`, `reuseport` | MIGRATE (most) + a tiny atomics FFI |
 | `alloc.cpp` | 426 | The ARC allocator, the 8-byte heap header, `nova_retain`/`nova_release`, `nova_bytes_alloc`/`free`, coroutine frame allocation, valopt and `any` boxing | ABI-CORE (stays; backing store may become Nova) |
@@ -51,7 +70,8 @@ A minimal C core plus a thin FFI surface, with everything else in Nova:
 |  event loop, buffers, HTTP parser, poll and socket layer,   |
 |  scheduler, channels, actors, file and directory I/O        |
 +-------------------------------------------------------------+
-|  Thin FFI shims (STAY-FFI): crypto, TLS pump, zlib, decimal |
+|  Thin FFI shims (STAY-FFI): crypto primitives, zlib, decimal |
+|  (TLS protocol in Nova after M9; primitives stay behind FFI) |
 +-------------------------------------------------------------+
 |  Minimal C core (ABI-CORE): ARC ops, allocator entry,       |
 |  coroutine-frame glue, heap header                          |
@@ -66,8 +86,14 @@ by us.
 
 ## Rules that govern every step
 
-1. **Never reimplement crypto.** Crypto and TLS stay behind wolfSSL and wolfCrypt. This is a
-   correctness and security rule, not a preference.
+1. **Never reimplement the crypto primitives; the TLS protocol may be built in Nova.** This rule has
+   two halves that must not be confused. The cryptographic PRIMITIVES, that is, the block ciphers,
+   hashes, curves, and their constant-time arithmetic (AES-GCM, ChaCha20-Poly1305, SHA-2, X25519,
+   P-256, RSA), are never hand-rolled; they stay behind a vetted library. The TLS PROTOCOL, that is,
+   the handshake state machine, the record layer, key schedule wiring, and the framing, is ordinary
+   state-machine code and MAY be written in Nova, driving vetted primitives underneath. Building the
+   protocol in Nova (phase M9) with a reference implementation is legitimate; reimplementing AES is
+   not. Until M9 lands, TLS stays behind the wolfSSL memory-BIO pump.
 2. **Additive and reversible.** Each migration keeps the C path working until the Nova path passes the
    gates, then removes the C path in a separate, revertable commit. No step leaves the tree in a state
    where the corpus is red.
@@ -133,8 +159,23 @@ phase removes a real dependency and is independently verifiable.
   `mmap`-backed arena, keeping the ARC entry points and the heap header unchanged (ABI-CORE stays).
   Prereq: none. Gate: corpus and ASAN green; allocation microbenchmark not regressed.
 
-The decimal, crypto, and compress shims (STAY-FFI) are not phases; they remain as they are. decimal
-may be ported to Nova later as pure-compute work, outside this plan's critical path.
+- **M9. TLS 1.2 and 1.3 protocol in Nova.** Write the TLS handshake state machine, the record layer,
+  the key schedule, and the alert and framing logic in Nova, over the async socket seam (M2) and over
+  vetted crypto primitives (AES-GCM, ChaCha20-Poly1305, SHA-2, X25519, P-256, RSA) that remain behind
+  a library and are never hand-rolled (rule 1). Reference implementation: the Zig standard library's
+  `std.crypto.tls` (a TLS 1.3 client) and `std.crypto` primitives, which are a clean, readable model
+  for the protocol and a source of the primitive set to bind. This retires the wolfSSL memory-BIO pump
+  in `io.cpp` and, together with the crypto-primitive question, is the last large piece of I/O in C++.
+  Prereq: M2 (the async socket seam on the reactor). Gate: a real TLS 1.3 handshake and, separately, a
+  TLS 1.2 handshake against a standard server and client (`curl`, `openssl s_client`), the inbound and
+  outbound TLS conformance cases green on the Nova path, and no timing-sensitive primitive written by
+  us. This is a substantial phase and may itself be split (record layer, then 1.3 handshake, then 1.2)
+  when it is scheduled.
+
+The decimal, crypto-primitive, and compress shims (STAY-FFI) are not phases; they remain as they are.
+decimal may be ported to Nova later as pure-compute work, outside this plan's critical path. The
+crypto primitives stay behind a vetted library permanently; only the TLS protocol on top of them moves
+to Nova in M9.
 
 ## What must never break (the ABI seam)
 
