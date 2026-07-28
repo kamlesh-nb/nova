@@ -2,6 +2,7 @@
 #include "nova_abi.h"
 #include "runtime_str.h"
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -62,6 +63,8 @@ void nova_log_err(const char *s) {
   }
 }
 
+long long nova_ffi_errno(void) { return (long long)errno; }
+void nova_ffi_set_errno(long long v) { errno = (int)v; }
 char *nova_ffi_to_cstr(const char *nova_str) { return nova_to_cstr(nova_str); }
 void nova_ffi_free_cstr(const char *nova_str, char *c) { nova_free_cstr(nova_str, c); }
 const char *nova_ffi_from_cstr(const char *c) {

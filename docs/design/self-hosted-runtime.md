@@ -152,6 +152,19 @@ Each phase ends with a measurement or a conformance gate, so we never fly blind 
   mould, Pipelines-style pooled buffers, picohttpparser-style zero-copy parse, readiness loop
   first (kqueue and epoll) with io_uring as a later backend. Write the interface contracts.
 - **Phase 1. Harden FFI** to the syscall surface in gap 1, with conformance tests. Keystone.
+  **DONE (2026-07-28).** Delivered: `nova_ffi_errno`/`nova_ffi_set_errno` runtime helpers (errno
+  is now readable after a failing call); `bytes.read_u16`/`write_u16` builtins (16-bit C struct
+  fields; the existing `read_i32`/`write_i32` and `read_ptr`/`write_ptr` already cover 32-bit and
+  64-bit); and `src/std/os/sys.nova`, a first cut of the POSIX bindings (socket, socketpair, bind,
+  listen, accept, connect, setsockopt, fcntl, read, write, close, plus `setNonBlocking`,
+  `makeSockaddrIn`, `htons`). Proven end to end and offline by `conformance/cases/187_ffi_syscall
+  _surface.nova`: a real kernel socketpair write and read round-trip, errno after a failing
+  `close(-1)` (EBADF), and building and reading a `sockaddr_in` in a raw buffer via the typed
+  accessors. Native corpus 181/181, ASAN 331/331. **What this establishes:** scalars, pointer and
+  out-parameter buffers, errno, and C structs and arrays of structs as raw buffers with typed
+  field access (the systems idiom) all compose correctly for the syscall surface. **Deferred as
+  not-on-the-syscall-path:** full struct-by-value FFI marshalling and true C variadics (`printf`
+  style); fixed-argument-count calls to variadic C functions such as `fcntl` already work.
 - **Phase 2. `os/sys` syscall bindings in Nova**: sockets, `accept4`, `epoll`/`kqueue`,
   `read`/`write`/`writev`, `close`, `mmap`, `eventfd`/`timerfd`, non-blocking. Tested against
   the kernel.

@@ -1,0 +1,84 @@
+// os/sys: raw POSIX syscall bindings over FFI, the foundation for a Nova-owned
+// event loop (see docs/design/self-hosted-runtime.md, phase 2). These are thin
+// bindings; C structs (sockaddr_in, epoll_event, kevent) are built and read as raw
+// byte buffers with the `bytes` typed accessors, which is the systems idiom and does
+// not require full struct-ABI FFI marshalling.
+//
+// errno: nova_ffi_errno reads the C `errno` of the calling thread. It must be read
+// immediately after a failing call, before any other library call runs.
+
+import bytes;
+
+pub extern("c") fn nova_ffi_errno(): int;
+pub extern("c") fn nova_ffi_set_errno(v: int): void;
+
+pub extern("c") fn socket(domain: int, type_: int, protocol: int): int;
+pub extern("c") fn socketpair(domain: int, type_: int, protocol: int, sv: ptr): int;
+pub extern("c") fn bind(fd: int, addr: ptr, addrlen: int): int;
+pub extern("c") fn listen(fd: int, backlog: int): int;
+pub extern("c") fn accept(fd: int, addr: ptr, addrlen: ptr): int;
+pub extern("c") fn connect(fd: int, addr: ptr, addrlen: int): int;
+pub extern("c") fn setsockopt(fd: int, level: int, optname: int, optval: ptr, optlen: int): int;
+pub extern("c") fn fcntl(fd: int, cmd: int, arg: int): int;
+pub extern("c") fn read(fd: int, buf: ptr, count: long): long;
+pub extern("c") fn write(fd: int, buf: ptr, count: long): long;
+pub extern("c") fn close(fd: int): int;
+
+// Address families and socket types (portable POSIX values).
+pub const AF_INET: int = 2;
+pub const SOCK_STREAM: int = 1;
+pub const SOCK_DGRAM: int = 2;
+pub const SOL_SOCKET: int = 1;
+pub const O_NONBLOCK: int = 4;
+pub const F_GETFL: int = 3;
+pub const F_SETFL: int = 4;
+
+// AF_UNIX differs by platform (1 on both Linux and macOS for the common case).
+pub const AF_UNIX: int = 1;
+
+pub fn errno(): int { return nova_ffi_errno(); }
+pub fn clearErrno(): void { nova_ffi_set_errno(0); }
+
+pub fn newSocket(domain: int, type_: int): int { return socket(domain, type_, 0); }
+
+// socketpair returns a connected pair of fds. Returns the two fds as a tuple, or
+// (-1, -1) on failure (check errno()).
+pub fn newSocketPair(domain: int, type_: int): (int, int) {
+    let sv = bytes.alloc(8);
+    let r = socketpair(domain, type_, 0, sv);
+    if (r != 0) {
+        bytes.free(sv);
+        return (-1, -1);
+    }
+    let a = bytes.read_i32(sv, 0) as int;
+    let b = bytes.read_i32(sv, 4) as int;
+    bytes.free(sv);
+    return (a, b);
+}
+
+pub fn setNonBlocking(fd: int): int {
+    let flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) { return -1; }
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+// Build a `struct sockaddr_in` (16 bytes) in a fresh buffer: sin_family (u16),
+// sin_port (u16, network byte order), sin_addr (u32, network byte order), then
+// 8 zero bytes of sin_zero. The caller owns the returned buffer and must free it.
+pub fn makeSockaddrIn(port: int, addrBE: long): ptr {
+    let sa = bytes.alloc(16);
+    let i = 0;
+    while (i < 16) { bytes.write_byte(sa, i, 0); i = i + 1; }
+    bytes.write_u16(sa, 0, AF_INET as long);
+    bytes.write_u16(sa, 2, htons(port) as long);
+    bytes.write_i32(sa, 4, addrBE);
+    return sa;
+}
+
+// Host to network short (16-bit byte swap). x86 and arm are little-endian, so the
+// network (big-endian) order is the byte-swapped value.
+pub fn htons(x: int): int {
+    let lo = x & 255;
+    let hi = (x >> 8) & 255;
+    return (lo << 8) | hi;
+}

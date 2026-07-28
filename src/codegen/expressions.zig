@@ -1822,6 +1822,24 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                         _ = core.LLVMBuildStore(self.builder, i32_val, ptr);
                         return core.LLVMConstInt(self.val_type, 0, 0);
                     }
+                    if (std.mem.eql(u8, fa.field, "write_u16")) {
+                        const ptr_val = try self.compileExpression(call.args[0]);
+                        const offset_val = try self.compileExpression(call.args[1]);
+                        const raw = try self.compileExpression(call.args[2]);
+                        const addr = core.LLVMBuildAdd(self.builder, ptr_val, offset_val, "addr");
+                        const p16 = core.LLVMBuildIntToPtr(self.builder, addr, core.LLVMPointerType(core.LLVMInt16Type(), 0), "write_ptr");
+                        const v16 = core.LLVMBuildTrunc(self.builder, raw, core.LLVMInt16Type(), "u16_val");
+                        _ = core.LLVMBuildStore(self.builder, v16, p16);
+                        return core.LLVMConstInt(self.val_type, 0, 0);
+                    }
+                    if (std.mem.eql(u8, fa.field, "read_u16")) {
+                        const ptr_val = try self.compileExpression(call.args[0]);
+                        const offset_val = try self.compileExpression(call.args[1]);
+                        const addr = core.LLVMBuildAdd(self.builder, ptr_val, offset_val, "addr");
+                        const p16 = core.LLVMBuildIntToPtr(self.builder, addr, core.LLVMPointerType(core.LLVMInt16Type(), 0), "read_ptr");
+                        const v16 = core.LLVMBuildLoad2(self.builder, core.LLVMInt16Type(), p16, "u16_val");
+                        return core.LLVMBuildZExt(self.builder, v16, self.val_type, "u16_ext");
+                    }
                     if (std.mem.eql(u8, fa.field, "ptr_size")) {
                         return core.LLVMConstInt(self.val_type, 8, 0);
                     }
