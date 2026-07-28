@@ -12,7 +12,7 @@ truth for progress; the phase details are below.
 | M1 | Async scheduler migration (per-reactor run queue) | M0 | DONE | Nested/multi-level `await` and `spawn`+`await` drain on the reactor (corpus 199, trace-proven); Asio-backed awaits on the reactor now fail fast via `nova_reactor_io_violation` instead of silently orphaning (their migration is M2) |
 | M2 | Async socket I/O on the reactor | M1 | DONE | `net/reactorio` = reactor-native recv/send/connect/accept/resolve in Nova over `os/sys`; a thread-local current reactor; `asyncio.AsyncStream` dual-mode; `web/app.serveReactorConn`/`runReactor` run a whole request on the reactor. Corpus 200 to 204 (socketpair, loopback connect/accept, the AsyncStream seam, connect-by-name, and a full App request), all TSan clean. Remaining before flagship-DB-on-reactor (M3): multi-core reactor server (the `runReactors` worker cannot yet carry the App) and async DNS |
 | M3 | Database drivers on the reactor | M2 | DONE (mock) | The drivers connect via `asyncConnect` and do I/O through `AsyncStream`, both reactor-native from M2, so they run on the reactor with no driver change. Corpus 205: an App handler makes a per-request DB call (mock DB on the same reactor) end to end, no Asio, closing the PH6 deadlock. A live-driver run needs a reachable database; the driver code is unchanged |
-| M4 | Retire Boost.Asio | M1 to M3 | WIP | `App.run` is reactor-only; timers/read-deadlines/inbound-TLS reactor-native; the keystone `cross-reactor wakeup` (EVFILT_USER + thread-safe inbox, corpus 210, TSan clean cross-thread) is in. Remaining: rewrite `nova_run_root` (the multi-threaded async @test/standalone driver) on the reactor using cross-reactor scheduling, retire the 5 Asio-primitive corpus tests (superseded by 200 to 209), then delete the Asio code and drop Boost |
+| M4 | Retire Boost.Asio | M1 to M3 | WIP (last step) | `App.run` reactor-only; timers/read-deadlines/inbound-TLS/when-any-deadline reactor-native; cross-reactor wakeup (corpus 210); and `nova_run_root` (the async @test/standalone driver) now runs on the reactor, so nothing on the running paths drives via Asio (the 5 Asio-primitive tests are retired). Remaining: delete the now-dead Asio socket primitives + `io_context`/strands/`g_io`, and drop vendored Boost from `build.zig` |
 | M5 | File and directory I/O in Nova | M4 (soft) | TODO | `nova_file_*`, `nova_dir_*` over `os/sys` |
 | M6 | Process and primitive shims | none | TODO | `core.cpp` shims to `os/sys`; tiny atomics FFI stays |
 | M7 | Channels and actors in Nova | M1, M6 | TODO | Over the reactor; verify under `--tsan` |
@@ -269,13 +269,22 @@ phase removes a real dependency and is independently verifiable.
     `EVFILT_USER` trigger plus a per-index thread-safe inbox (a coroutine posted from another thread
     wakes the owning reactor's blocking poll and is drained on the `EVFILT_USER` event). Corpus case
     210, TSan clean cross-thread at 4 threads. Linux plugs an `eventfd` behind the same shape.
-    (b) rewrite `nova_run_root` as N reactor threads with cross-thread scheduling (route
-    `nova_sched_schedule` to the owning reactor's inbox via `reactor.post` when the target is on
-    another thread); (c) retire/convert the 5 tests and delete `nova_arecv`/`asend`/`aconnect`/
-    `aaccept`/`aserver_listen`/the Asio `nova_await_timer` branch/`when_any_deadline` timers; (d)
-    delete `io_context`/strands/thread pool/`g_io` and drop vendored Boost from `build.zig` (Boost is
-    confined to `concurrency.cpp`, so the final deletion is local). Gate each step on corpus, ASAN,
-    and TSan.
+    **(b) `nova_run_root` on the reactor. DONE.** The driver for async `@test`s and standalone async
+    `main` runs single-threaded on the reactor (resume the root, poll the kqueue for timers and
+    reactor-native I/O until done); single-threaded is sufficient (every channel/actor/select/compute
+    async test passes under `NOVA_THREADS=1`). Fresh scheduler state per drive; `g_reactor_mode`
+    cleared at the end so the caller's next `nova_sched_schedule(root)` does not double-drive.
+    `nova_when_any_deadline` is reactor-native (monotonic deadline + one-shot `EVFILT_TIMER`). The 5
+    Asio-primitive tests (113/114/115/184/186) are retired (coverage in 200/201/208/209). Native 198,
+    ASAN 365, TSan 215. So nothing on the running paths drives via Asio.
+    **(c)+(d) remaining:** delete the now-dead Asio surface (`nova_arecv`/`asend`/`aconnect`/
+    `aaccept`/`aserver_listen`, the Asio branches of `nova_sched_schedule`/`nova_await_timer`/
+    `nova_when_any_deadline`, `nova_run`/`nova_hold_all_reactors`, the `io_context` reactors/strands/
+    `g_io`), and drop vendored Boost from `build.zig` (Boost is confined to `concurrency.cpp`, so the
+    final deletion is local). The one live Asio touch left is `nova_sched_schedule`'s Asio branch,
+    which the caller hits once per root before `nova_run_root` (a harmless never-run strand post); make
+    it reactor-native or route it through the run queue, then the include and Boost drop. Gate each
+    step on corpus, ASAN, and TSan.
   - Gate (full M4): the runtime builds and links with no Boost include; corpus, ASAN, TSan, and the
     head-to-head all green.
 - **M5. File and directory I/O.** Reimplement `nova_file_*` and `nova_dir_*` in Nova over `os/sys`
@@ -354,8 +363,5 @@ multi-core (`runReactorMC`, `SO_REUSEPORT`). M4 is nearly done: `App.run` is rea
 Nothing on the web path uses Asio. Verified by corpus 199 to 209 plus a live `curl -k https://`
 TLSv1.3 test, all TSan clean. The final step to drop Boost is a real refactor, not a deletion: Boost
 still backs `nova_run_root` (the multi-threaded async `@test`/standalone driver, TSan at 4 threads) and
-5 Asio-primitive corpus tests. The keystone that was missing, cross-reactor wakeup (`EVFILT_USER` plus
-a thread-safe per-index inbox, corpus 210, TSan clean cross-thread), is now in. Next: rewrite
-`nova_run_root` on the reactor with cross-thread scheduling, retire or convert the 5 tests, then delete
-the Asio code and drop vendored Boost. Also pending: a live-driver round trip against a reachable
+5 Asio-primitive corpus tests. Cross-reactor wakeup (corpus 210) and `nova_run_root` on the reactor are both in, so nothing on the running paths drives via Asio (the 5 Asio-primitive tests are retired). Last step: delete the now-dead Asio socket primitives + `io_context`/strands/`g_io`, and drop vendored Boost from `build.zig`. Also pending: a live-driver round trip against a reachable
 database (driver code unchanged) and async DNS.
