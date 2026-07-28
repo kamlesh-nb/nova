@@ -43,7 +43,7 @@ without the framework abstraction.
 | C# (ASP.NET minimal API on Kestrel) | 124,554 | 100% | 8 cores |
 | Go (net/http) | 121,743 | 100% | 8 cores |
 | **Nova (`web.App`, reactor)** | **69,404** | 100% | the framework, now on the reactor |
-| Nova (`web.App`, Asio — retired) | 55,409 | 100% | the previous baseline |
+| Nova (`web.App`, Asio, retired) | 55,409 | 100% | the previous baseline |
 
 Two readings, both true:
 
