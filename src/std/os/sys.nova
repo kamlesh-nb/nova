@@ -11,6 +11,7 @@ import bytes;
 
 pub extern("c") fn nova_ffi_errno(): int;
 pub extern("c") fn nova_ffi_set_errno(v: int): void;
+pub extern("c") fn nova_set_nonblock(fd: int): int;
 
 pub extern("c") fn socket(domain: int, type_: int, protocol: int): int;
 pub extern("c") fn socketpair(domain: int, type_: int, protocol: int, sv: ptr): int;
@@ -65,9 +66,9 @@ pub fn newSocketPair(domain: int, type_: int): (int, int) {
 }
 
 pub fn setNonBlocking(fd: int): int {
-    let flags = fcntl(fd, F_GETFL, 0);
-    if (flags < 0) { return -1; }
-    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    // Uses a runtime shim, because fcntl is variadic and a non-variadic FFI declaration
+    // mispasses the flag argument on arm64 (varargs go on the stack, not in registers).
+    return nova_set_nonblock(fd);
 }
 
 // Build a `struct sockaddr_in` (16 bytes) in a fresh buffer: sin_family (u16),

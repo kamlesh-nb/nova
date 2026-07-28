@@ -217,10 +217,22 @@ Each phase ends with a measurement or a conformance gate, so we never fly blind 
   `conformance/cases/192`: a request served entirely through the Nova loop with no Asio, a
   connected fd pair standing in for an accepted connection, register read-interest, block in
   kqueue, wake on readiness, read into a recycled slab block, echo back, client receives it. Native
-  corpus 187/187, ASAN clean. **Still open in phase 4:** listener plus `accept4` and a standalone
-  load-tested echo server (throughput versus the Asio baseline and gap-8 overhead measurement);
-  driving LLVM coroutines directly from the reactor (the coroutine-integration step); the Linux
-  epoll backend wired behind the same `Reactor` shape.
+  corpus 187/187, ASAN clean. **Milestone 2 DONE (2026-07-28): the load-tested server, and the
+  gap-8 measurement is emphatic.** `flagship/bench/headtohead/nova-reactor/server.nova` is a minimal
+  HTTP/1.1 server on the reactor (listener, `accept`, non-blocking, keep-alive, a fixed constant-JSON
+  response, a `SlabPool` read buffer), no Asio and no web.App. Driven by `oha` at the same settings
+  as the head-to-head, a **single reactor on one core sustains about 186,500 req/s at 100 percent
+  success and 0.34 ms average**, which beats every tuned framework's eight-core number in the
+  head-to-head (Rust axum 134.8k, C# Kestrel 124.6k, Go net/http 121.7k) and is about 27 times
+  Nova's own eight-core web.App (55.4k) per core. This is the plan's thesis made concrete: the
+  ceiling was the runtime, not the compiler. Caveats recorded in the bench README: the server does
+  not yet parse the request (fixed response), it is single-core (the peers ran eight), and there is
+  no TLS. A real finding en route: `fcntl` is variadic and a non-variadic FFI declaration mispasses
+  its third argument on arm64 (varargs go on the stack), which silently left the listener blocking;
+  fixed with a tiny runtime shim `nova_set_nonblock` (the general lesson for variadic syscalls until
+  first-class variadic FFI lands). **Still open in phase 4:** driving LLVM coroutines directly from
+  the reactor (the coroutine-integration step, verified under `--tsan`); share-nothing multi-core
+  via SO_REUSEPORT across N reactor threads; the Linux epoll backend behind the same `Reactor` shape.
 - **Phase 5. Zero-copy HTTP/1 parser** (picohttpparser model), replacing the per-request maps.
 - **Phase 6. Port the `App` server** onto the Nova reactor. Re-run the head-to-head. Target is
   parity within about 1.2x to 1.5x of Go and Kestrel, which the profile says is reachable.

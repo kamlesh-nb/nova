@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <fcntl.h>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -65,6 +66,13 @@ void nova_log_err(const char *s) {
 
 long long nova_ffi_errno(void) { return (long long)errno; }
 void nova_ffi_set_errno(long long v) { errno = (int)v; }
+// fcntl is variadic; a non-variadic FFI declaration mispasses the third arg on some ABIs
+// (arm64 passes varargs on the stack). This shim lets C handle the varargs correctly.
+long long nova_set_nonblock(long long fd) {
+  int f = fcntl((int)fd, F_GETFL, 0);
+  if (f < 0) return -1;
+  return (long long)fcntl((int)fd, F_SETFL, f | O_NONBLOCK);
+}
 char *nova_ffi_to_cstr(const char *nova_str) { return nova_to_cstr(nova_str); }
 void nova_ffi_free_cstr(const char *nova_str, char *c) { nova_free_cstr(nova_str, c); }
 const char *nova_ffi_from_cstr(const char *c) {
