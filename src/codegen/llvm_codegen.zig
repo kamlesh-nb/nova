@@ -753,6 +753,13 @@ pub const LlvmCompiler = struct {
         return e.kind == .literal and (e.kind.literal == .undefined or e.kind.literal == .null);
     }
 
+    // Size (bytes) of a `ptr_type` element — 4 on wasm32, 8 on native. A vtable is a `[N x ptr]`
+    // array; its element STRIDE is this, not the 8-byte val_type slot size. (Fat-pointer slots are
+    // val_type = always 8; only WITHIN a raw pointer array does the target width matter.)
+    pub fn ptrElemSize(self: *LlvmCompiler) u64 {
+        return if (self.is_wasm) 4 else 8;
+    }
+
     // A1 heap-environment closures ------------------------------------------
     pub fn valSlotSize(self: *LlvmCompiler) usize {
         _ = self;
@@ -1385,6 +1392,11 @@ pub const LlvmCompiler = struct {
 
         const trait_decl = self.traits.get(trait_name) orelse return error.TraitNotFound;
 
+        // Vtable slots MUST be `ptr_type` (function pointers): wasm-ld relocates a pointer-typed global
+        // to the function's table index (R_WASM_TABLE_INDEX). A `ptrtoint(@func)` i64 slot is illegal in
+        // a wasm static initializer. The catch: on wasm32 `ptr_type` is i32 (4 bytes), so the vtable is
+        // 4-byte-strided — the READERS (buildTraitVtableCall, __destruct_trait) must index it with the
+        // TARGET pointer size (`self.ptrElemSize()`), not a hardcoded 8.
         const element_type = self.ptr_type;
         // §3.4h: SLOT 0 is the wrapped struct's destructor; methods follow at 1..N. That
         // is how `__destruct_trait` finds the concrete struct's destructor from a release
@@ -1695,7 +1707,10 @@ pub const LlvmCompiler = struct {
         const vtable_ptr_int = core.LLVMBuildLoad2(self.builder, self.val_type, vtable_ptr_ptr, "trait_vtable_ptr_int");
 
         // §3.4h: vtable slot 0 is the struct destructor, so method `m_idx` lives at slot `m_idx + 1`.
-        const fn_offset = core.LLVMConstInt(self.val_type, (m_idx + 1) * ptr_size, 0);
+        // The vtable is a `[N x ptr]` array — element stride is the TARGET pointer size (4 on wasm32),
+        // NOT the 8-byte val_type. A hardcoded 8 read the wrong slot on wasm → garbage function index →
+        // call_indirect "null function".
+        const fn_offset = core.LLVMConstInt(self.val_type, (m_idx + 1) * self.ptrElemSize(), 0);
         const fn_addr = core.LLVMBuildAdd(self.builder, vtable_ptr_int, fn_offset, "fn_addr");
         const fn_ptr_ptr = core.LLVMBuildIntToPtr(self.builder, fn_addr, core.LLVMPointerType(self.ptr_type, 0), "fn_ptr_ptr");
         const fn_ptr = core.LLVMBuildLoad2(self.builder, self.ptr_type, fn_ptr_ptr, "fn_ptr");
