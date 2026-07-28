@@ -1,0 +1,36 @@
+// The web.App framework running share-nothing across N Nova reactor cores, no Asio. Unlike
+// server_mc.nova (a hand-rolled reactor loop with a fixed response), this drives the REAL App
+// pipeline (typed route, mediator dispatch, handler, response) through app.runReactorMC, which
+// spawns one reactor + SO_REUSEPORT listener per thread and carries the App to each worker.
+// This is the production shape of the self-hosted runtime: `nova init` apps get here by calling
+// runReactorMC instead of run(). See docs/design/cpp-runtime-retirement-plan.md (M2/M3).
+//
+//   PORT=8090 NOVA_REACTORS=4 ./server_app_mc   (or via run.sh SERVER=appmc)
+import web.app;
+import web.request;
+import web.response;
+import web.status;
+import serde.source;
+import env;
+import string;
+
+@serializable struct Hello { pub id: int }
+
+struct HelloHandler impl MessageHandler {
+    async fn handle(self: HelloHandler, src: ValueSource): Response {
+        return json(`{"message":"Hello, World!"}`);
+    }
+}
+
+fn main(): void {
+    let pe = env.get("PORT");
+    let port = if (pe.length == 0) 8090 else string.parseI64(pe) as int;
+    let re = env.get("NOVA_REACTORS");
+    let workers = if (re.length == 0) 4 else string.parseI64(re) as int;
+
+    let application = App();
+    application.handle<Hello>(HelloHandler{});
+    application.get<Hello>("/");
+
+    application.runReactorMC(port, workers);
+}

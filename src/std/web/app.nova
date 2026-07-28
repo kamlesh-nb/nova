@@ -261,6 +261,10 @@ pub struct App {
     pub tlsCert: string,
     pub tlsKey: string,
 
+    // Port for the multi-core reactor server. Carried on the App so the reactor worker closure needs
+    // only a single capture (the App); see runReactorMC.
+    pub serverPort: int,
+
     init() {
         self.routes = List<AppRoute>();
         self.mediator = AppMediator();
@@ -274,6 +278,7 @@ pub struct App {
         self.tlsEnabled = false;
         self.tlsCert = "";
         self.tlsKey = "";
+        self.serverPort = 0;
     }
 
     pub fn useTls(self: App, certPath: string, keyPath: string): void {
@@ -728,9 +733,66 @@ pub async fn serveReactorConn(app: App, fd: int, kq: int): int {
     return await handleConn(app, s);
 }
 
+// One reactor worker thread: its own reactor, its own SO_REUSEPORT listener on the shared port (the
+// kernel load-balances connections across the threads), its own coroutines. Share-nothing: the only
+// thing crossing threads is the App configuration, which is read-only during serving. Loops forever.
+fn reactorWorkerBody(app: App, idx: int): void {
+    let lfd = sys.socket(sys.AF_INET, sys.SOCK_STREAM, 0);
+    let one = bytes.alloc(4);
+    bytes.write_i32(one, 0, 1);
+    sys.setsockopt(lfd, sys.SOL_SOCKET, 4, one, 4);   // SO_REUSEADDR
+    sys.setReusePort(lfd);
+    bytes.free(one);
+    let sa = sys.makeSockaddrIn(app.serverPort, 0);
+    if (sys.bind(lfd, sa, 16) != 0) {
+        bytes.free(sa);
+        return;
+    }
+    bytes.free(sa);
+    sys.listen(lfd, 512);
+    sys.setNonBlocking(lfd);
+
+    let r = reactor.Reactor(1024, 16384, 1024);
+    reactor.setCurrent(r.kq);
+    r.addRead(lfd, lfd as long);
+    let addrBuf = bytes.alloc(16);
+    let addrLen = bytes.alloc(4);
+
+    while (true) {
+        let n = r.poll(-1);
+        let i = 0;
+        while (i < n) {
+            let fd = r.readyFd(i);
+            if (fd == lfd) {
+                while (true) {
+                    bytes.write_i32(addrLen, 0, 16);
+                    let c = sys.accept(lfd, addrBuf, addrLen);
+                    if (c < 0) { break; }
+                    sys.setNonBlocking(c);
+                    coroStart(serveReactorConn(app, c, r.kq));
+                }
+            } else {
+                nova_reactor_resume(r.readyToken(i));
+            }
+            i = i + 1;
+        }
+    }
+}
+
+// Run the web server share-nothing across `workers` Nova reactor threads (no Asio), one reactor per
+// thread with a SO_REUSEPORT listener on `port`. The worker closure carries only the App (a single
+// capture; the port rides on the App), because a lambda passed to runReactors resolves just its first
+// capture. Blocks until the workers return (they loop forever).
+pub fn runReactorMC(self: App, port: int, workers: int): void {
+    self.serverPort = port;
+    let srv = self;
+    reactor.runReactors(workers, (idx) => {
+        reactorWorkerBody(srv, idx);
+    });
+}
+
 // Run the web server on a single Nova reactor (no Asio). Opt-in via runReactor; the default run()
-// keeps the Asio path. Each accepted connection becomes a coroutine driven by the reactor. Multi-core
-// (one reactor per core, SO_REUSEPORT) is a later step once the reactor worker can carry the App.
+// keeps the Asio path. Each accepted connection becomes a coroutine driven by the reactor.
 pub fn runReactor(self: App, port: int): void {
     let lfd = sys.socket(sys.AF_INET, sys.SOCK_STREAM, 0);
     let one = bytes.alloc(4);
