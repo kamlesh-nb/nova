@@ -24,6 +24,14 @@ pub extern("c") fn read(fd: int, buf: ptr, count: long): long;
 pub extern("c") fn write(fd: int, buf: ptr, count: long): long;
 pub extern("c") fn close(fd: int): int;
 
+// Memory/scan primitives. On modern macOS and Linux these libc functions are SIMD-optimized
+// (NEON/AVX), so they are the fast delimiter-scan and compare the HTTP parser (picohttpparser
+// model) and the string library route through, without first-class vector codegen.
+pub extern("c") fn memchr(s: ptr, c: int, n: long): ptr;
+pub extern("c") fn memcmp(a: ptr, b: ptr, n: long): int;
+pub extern("c") fn memcpy(dst: ptr, src: ptr, n: long): ptr;
+pub extern("c") fn memmove(dst: ptr, src: ptr, n: long): ptr;
+
 // Address families and socket types (portable POSIX values).
 pub const AF_INET: int = 2;
 pub const SOCK_STREAM: int = 1;

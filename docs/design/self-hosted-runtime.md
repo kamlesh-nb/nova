@@ -85,11 +85,22 @@ for buffers, and picohttpparser for parsing:
    individually allocated. Responses are assembled as a scatter-gather list and written with a
    single `writev`. Static files use `sendfile` or `splice`.
 
-4. **Zero-copy HTTP parsing.** Replace `Request.fromString` (which today splits strings and
-   builds three `Map<string,string>` per request) with a picohttpparser-style parser that
-   records header name and value as slices into the read buffer and stores them in a small
+4. **Zero-copy HTTP parsing, and SIMD.** Replace `Request.fromString` (which today splits
+   strings and builds three `Map<string,string>` per request) with a picohttpparser-style parser
+   that records header name and value as slices into the read buffer and stores them in a small
    fixed array. Header lookup is a short linear scan, which is faster than a hash map for the
-   typical five to fifteen headers and allocates nothing.
+   typical five to fifteen headers and allocates nothing. picohttpparser's speed is its **SIMD**
+   delimiter scan, and there are two levels of that, the first of which is already available:
+   - **Level 1, libc.** `memchr`, `memcmp`, `memcpy`, and `strlen` in the platform libc are
+     already hand-tuned NEON on macOS and arm64 and AVX on x86_64. Bound over the existing FFI
+     (`os/sys`, done 2026-07-28, `conformance/cases/193`), `memchr` is the SIMD delimiter scan the
+     parser needs, and routing `string.indexOf`, `string.eql`, and `string.compare` through
+     `memchr` and `memcmp` makes general string handling faster too, with no compiler work.
+   - **Level 2, first-class Nova SIMD.** For kernels the libc functions do not cover, Nova would
+     gain vector types lowered to LLVM's portable vector IR (which already targets NEON, SSE, and
+     AVX). This is a real but separable compiler capability, a track of its own, not a blocker for
+     the loop. Recommend level 1 now, and scoping level 2 as a language feature after the loop
+     lands.
 
 5. **The coroutine seam stays, the driver changes.** We keep LLVM coroutines. The reactor
    resumes and suspends them directly through the existing raw coroutine intrinsics. Because
@@ -198,7 +209,18 @@ Each phase ends with a measurement or a conformance gate, so we never fly blind 
   ARC.
 - **Phase 4. The per-core event loop in Nova**, driving coroutines directly. First milestone: a
   raw echo server. Measure the empty-loop and echo cost immediately (gap 8). Compare to an Asio
-  echo baseline.
+  echo baseline. **Milestone 1 STARTED (2026-07-28).** `src/std/net/reactor.nova` (`Reactor`): a
+  per-core kqueue event loop that owns its `kqueue` fd, an event buffer, and a read-buffer
+  `SlabPool`, with `addRead`/`delRead`, `poll`, and `readyFd`/`readyToken`/`readyBytes`/`readyEof`
+  accessors; the udata token on each event is where a connection identity (later a coroutine
+  handle) rides, so the loop finds the right connection in O(1) with no map and no lock. Proven by
+  `conformance/cases/192`: a request served entirely through the Nova loop with no Asio, a
+  connected fd pair standing in for an accepted connection, register read-interest, block in
+  kqueue, wake on readiness, read into a recycled slab block, echo back, client receives it. Native
+  corpus 187/187, ASAN clean. **Still open in phase 4:** listener plus `accept4` and a standalone
+  load-tested echo server (throughput versus the Asio baseline and gap-8 overhead measurement);
+  driving LLVM coroutines directly from the reactor (the coroutine-integration step); the Linux
+  epoll backend wired behind the same `Reactor` shape.
 - **Phase 5. Zero-copy HTTP/1 parser** (picohttpparser model), replacing the per-request maps.
 - **Phase 6. Port the `App` server** onto the Nova reactor. Re-run the head-to-head. Target is
   parity within about 1.2x to 1.5x of Go and Kestrel, which the profile says is reachable.

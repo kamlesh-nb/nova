@@ -1,0 +1,60 @@
+// net/reactor: a per-core readiness event loop for the self-hosted runtime
+// (docs/design/self-hosted-runtime.md, phase 4). This is the share-nothing thread-per-core
+// model (Seastar, glommio): one Reactor per core owns its kqueue, its read-buffer slab pool,
+// and its connections, with no shared state. On macOS and BSD the backend is kqueue (os/kqueue);
+// the Linux epoll backend (os/epoll) plugs in behind the same shape.
+//
+// The reactor is deliberately readiness-driven and allocation-free on the hot path: interest is
+// registered once per fd, poll() blocks until fds are ready, and each ready fd is read into a
+// recycled slab block. The udata token carried on each event is where a connection state pointer
+// (later, a coroutine handle) rides, so the loop can find the right connection in O(1) with no
+// map lookup and no lock.
+
+import bytes;
+import os.sys;
+import os.kqueue;
+import io.slab;
+
+pub struct Reactor {
+    pub kq: int,
+    pub eventBuf: long,
+    pub maxEvents: int,
+    pub pool: slab.SlabPool,
+
+    init(maxEvents: int, blockSize: int, blockCount: int) {
+        self.kq = kqueue.kqueue();
+        self.maxEvents = maxEvents;
+        self.eventBuf = bytes.alloc(maxEvents * kqueue.KEVENT_SIZE);
+        self.pool = slab.SlabPool(blockSize, blockCount);
+    }
+
+    pub fn ok(self: Reactor): bool { return self.kq >= 0; }
+
+    // Register read-interest on fd, carrying `token` (a connection identity) on the event.
+    pub fn addRead(self: Reactor, fd: int, token: long): int {
+        return kqueue.registerOne(self.kq, fd, kqueue.EVFILT_READ, kqueue.EV_ADD, token);
+    }
+    pub fn delRead(self: Reactor, fd: int): int {
+        return kqueue.registerOne(self.kq, fd, kqueue.EVFILT_READ, kqueue.EV_DELETE, 0);
+    }
+
+    // Block until at least one fd is ready (or timeoutMs elapses; negative blocks forever).
+    // Returns the number of ready events, readable via readyFd / readyToken / readyBytes.
+    pub fn poll(self: Reactor, timeoutMs: int): int {
+        return kqueue.wait(self.kq, self.eventBuf, self.maxEvents, timeoutMs);
+    }
+    pub fn readyFd(self: Reactor, i: int): int { return kqueue.evIdent(self.eventBuf, i) as int; }
+    pub fn readyToken(self: Reactor, i: int): long { return kqueue.evUdata(self.eventBuf, i); }
+    pub fn readyBytes(self: Reactor, i: int): long { return kqueue.evData(self.eventBuf, i); }
+    pub fn readyEof(self: Reactor, i: int): bool { return (kqueue.evFlags(self.eventBuf, i) & kqueue.EV_EOF) != 0; }
+
+    // Borrow a read buffer from the pool (payload address), and return it when done.
+    pub fn getBuffer(self: Reactor): long { return self.pool.acquire(); }
+    pub fn putBuffer(self: Reactor, buf: long): void { self.pool.release(buf); }
+
+    pub fn destroy(self: Reactor): void {
+        if (self.eventBuf != 0) { bytes.free(self.eventBuf); self.eventBuf = 0; }
+        self.pool.destroy();
+        if (self.kq >= 0) { sys.close(self.kq); self.kq = -1; }
+    }
+}
