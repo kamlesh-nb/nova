@@ -14,6 +14,7 @@ SRC="server.nova"
 [ "${SERVER:-}" = "coro" ] && SRC="server_coro.nova"
 [ "${SERVER:-}" = "mc" ] && SRC="server_mc.nova"
 [ "${SERVER:-}" = "parse" ] && SRC="server_parse.nova"
+[ "${SERVER:-}" = "flagship" ] && SRC="server_flagship.nova"
 echo "building the Nova reactor server ($SRC, release)..."
 nova "$HERE/$SRC" --release -o /tmp/nova_reactor || { echo "build failed"; exit 1; }
 

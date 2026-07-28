@@ -88,6 +88,35 @@ At the server's throughput that is roughly one percent of the per-request time b
 why it is invisible in the network numbers. The zero-copy design (a `memchr` scan into slices,
 byte-comparison matching, no allocation) delivers a parser cheap enough to disappear.
 
+## The flagship's business logic on the reactor (`server_flagship.nova`)
+
+`server_flagship.nova` runs the flagship's real per-request pipeline (the `CreateProduct`
+slice: zero-copy parse the request, serde-bind the JSON body, validate, render the JSON
+response) as a coroutine per connection. Stress it with a POST body:
+
+```sh
+oha -m POST -d '{"name":"widget","price":1299}' http://127.0.0.1:8088/api/products
+```
+
+Single reactor, one core: **146,176 req/s at 100 percent success, 0.44 ms average**. A valid
+body returns `{"id":1,"name":"widget"}`; an invalid one (`{"name":"","price":5}`) returns
+`name is required`, so the real bind and validation run. This sits below the ~185k
+fixed-response ceiling, so the pipeline work (serde parse plus validation plus response
+building) is actually visible here; 146k is a real "flagship logic per core" figure, not a
+client-bound artifact.
+
+### Why this is the pipeline and not the full async `App` framework
+
+The full `web.App` framework cannot yet run on the reactor, and this was verified, not
+assumed. The `App` mediator dispatch is built on **nested `async`/`await`**, and Nova's nested
+`await` and `spawn` route through the Asio scheduler (`nova_sched_schedule`), which the reactor
+bypasses. A reactor-driven coroutine that performs a nested `await` therefore **deadlocks** (a
+minimal test hangs). Hosting the whole async `App` on the reactor requires first migrating
+Nova's async scheduler from Asio to a reactor run queue, which is the largest remaining piece
+of the runtime work because it touches the coroutine ABI that the entire async stack depends
+on. Until then, the reactor hosts single-level coroutines, which is exactly what
+`server_flagship.nova` uses: the flagship's real business logic, with no nested `await`.
+
 ## Honest caveats
 
 This is a first, deliberately narrow measurement, and the number must be read with its

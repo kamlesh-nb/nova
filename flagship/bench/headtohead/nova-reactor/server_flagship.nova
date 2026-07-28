@@ -1,0 +1,121 @@
+// The flagship's real per-request business logic (the CreateProduct pipeline: serde-bind the JSON
+// body, validate, render the JSON response) running on the Nova event loop, driven by a coroutine
+// per connection. This is "the flagship app on the self-hosted reactor" for the part the reactor
+// can host today: a single-level coroutine with no nested `await` (the full async App mediator
+// needs the async scheduler migrated off Asio first; see docs/design/self-hosted-runtime.md).
+// Stress it with POST requests carrying a JSON body.
+import bytes;
+import os.sys;
+import net.reactor;
+import web.httpparser;
+import serde.source;
+import string;
+import env;
+
+const SO_REUSEADDR: int = 4;
+
+fn appendStr(buf: long, off: int, s: string): int {
+    let i = 0;
+    while (i < s.length) { bytes.write_byte(buf, off + i, s[i]); i = i + 1; }
+    return off + s.length;
+}
+fn appendCRLF(buf: long, off: int): int {
+    bytes.write_byte(buf, off, 13); bytes.write_byte(buf, off + 1, 10);
+    return off + 2;
+}
+fn writeAll(fd: int, buf: long, len: int): void {
+    let sent = 0;
+    while (sent < len) {
+        let w = sys.write(fd, buf + (sent as long), (len - sent) as long);
+        if (w <= 0) { if (sys.errno() == 35) { continue; } return; }
+        sent = sent + (w as int);
+    }
+}
+
+fn validateCreateProduct(name: string, price: long): string {
+    if (name.length == 0) { return "name is required"; }
+    if (price < 0) { return "price must be >= 0"; }
+    return "";
+}
+
+async fn serveConn(r: reactor.Reactor, fd: int): void {
+    let req = httpparser.HttpRequest(32);
+    let respBuf = bytes.alloc(512);
+    while (true) {
+        r.addRead(fd, currentCoro());
+        coroSuspend();
+        let buf = r.getBuffer();
+        let got = sys.read(fd, buf, 16384);
+        if (got <= 0) {
+            r.putBuffer(buf);
+            req.free();
+            bytes.free(respBuf);
+            sys.close(fd);
+            return;
+        }
+
+        // Zero-copy parse of the request headers, then the flagship CreateProduct pipeline over
+        // the JSON body (this is the real framework serde + validation).
+        let end = req.parse(buf, got as int);
+        let bodyLen = (got as int) - end;
+        let body = if (bodyLen > 0) bytes.read_string(buf + (end as long), bodyLen) else "{}";
+        let src = source.fromJson(body);
+        let name = src.getString("name");
+        let price = src.getInt("price");
+        let err = validateCreateProduct(name, price);
+        let respBody = if (err.length != 0) err else `{"id":1,"name":"${name}"}`;
+        let lenStr = `${respBody.length}`;
+
+        let o = 0;
+        o = appendStr(respBuf, o, "HTTP/1.1 200 OK"); o = appendCRLF(respBuf, o);
+        o = appendStr(respBuf, o, "Content-Type: application/json"); o = appendCRLF(respBuf, o);
+        o = appendStr(respBuf, o, "Content-Length: "); o = appendStr(respBuf, o, lenStr); o = appendCRLF(respBuf, o);
+        o = appendStr(respBuf, o, "Connection: keep-alive"); o = appendCRLF(respBuf, o);
+        o = appendCRLF(respBuf, o);
+        o = appendStr(respBuf, o, respBody);
+        writeAll(fd, respBuf, o);
+
+        r.putBuffer(buf);
+    }
+}
+
+fn main(): void {
+    let pe = env.get("PORT");
+    let port = if (pe.length == 0) 8088 else string.parseI64(pe) as int;
+
+    let lfd = sys.socket(sys.AF_INET, sys.SOCK_STREAM, 0);
+    let one = bytes.alloc(4);
+    bytes.write_i32(one, 0, 1);
+    sys.setsockopt(lfd, sys.SOL_SOCKET, SO_REUSEADDR, one, 4);
+    let sa = sys.makeSockaddrIn(port, 0);
+    if (sys.bind(lfd, sa, 16) != 0) { return; }
+    sys.listen(lfd, 512);
+    sys.setNonBlocking(lfd);
+    bytes.free(one);
+    bytes.free(sa);
+
+    let r = reactor.Reactor(1024, 16384, 1024);
+    r.addRead(lfd, lfd as long);
+    let addrBuf = bytes.alloc(16);
+    let addrLen = bytes.alloc(4);
+
+    while (true) {
+        let n = r.poll(-1);
+        let i = 0;
+        while (i < n) {
+            let fd = r.readyFd(i);
+            if (fd == lfd) {
+                while (true) {
+                    bytes.write_i32(addrLen, 0, 16);
+                    let c = sys.accept(lfd, addrBuf, addrLen);
+                    if (c < 0) { break; }
+                    sys.setNonBlocking(c);
+                    coroStart(serveConn(r, c));
+                }
+            } else {
+                nova_reactor_resume(r.readyToken(i));
+            }
+            i = i + 1;
+        }
+    }
+}

@@ -277,6 +277,22 @@ Each phase ends with a measurement or a conformance gate, so we never fly blind 
   three `Map<string,string>` per request.
 - **Phase 6. Port the `App` server** onto the Nova reactor. Re-run the head-to-head. Target is
   parity within about 1.2x to 1.5x of Go and Kestrel, which the profile says is reachable.
+  **Started (2026-07-28), and it surfaced the one real blocker.** The flagship's actual per-request
+  business logic (the `CreateProduct` slice: zero-copy parse, serde-bind the JSON body, validate,
+  render) runs on the reactor as a coroutine per connection
+  (`flagship/bench/headtohead/nova-reactor/server_flagship.nova`), at about **146k req/s on one
+  core** at 100 percent success, with the real bind and validation observable (an invalid body is
+  rejected). But the FULL async `App` framework cannot yet run on the reactor, and this was
+  verified rather than assumed: the `App` mediator dispatch is built on **nested `async`/`await`**,
+  and Nova's nested `await` and `spawn` route through the Asio scheduler (`nova_sched_schedule`),
+  which the reactor bypasses, so a reactor-driven coroutine that performs a nested `await`
+  DEADLOCKS (a minimal test hangs). **The remaining piece is therefore the async scheduler
+  migration:** replace `nova_sched_schedule`'s Asio post with a per-reactor run queue (set a
+  thread-local reactor mode; the reactor loop drains the queue and reproduces the waiter and
+  held-argument completion logic), so nested awaits and spawns are driven by the reactor. This is
+  the largest and most delicate remaining item because it touches the coroutine ABI the whole async
+  stack depends on, and it must be done under the `--tsan` gate. Once it lands, the whole async
+  `App` (mediator, DI, middleware, and eventually the reactor-native DB drivers) runs on the loop.
 - **Phase 7. io_uring completion backend** on Linux, and `sendfile`/`splice` for static content.
 - **Retirement.** Keep Asio as a fallback until the Nova loop meets or beats it on the
   head-to-head, then remove the Boost dependency and delete the Asio path.
