@@ -46,6 +46,57 @@ pub fn parseIPv4(s: string): long {
     return result;
 }
 
+fn isNumericIPv4(s: string): bool {
+    if (s.length == 0) { return false; }
+    let i = 0;
+    while (i < s.length) {
+        let c = s[i];
+        if (!((c >= 48 && c <= 57) || c == 46)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Resolve a host to the big-endian IPv4 address value for makeSockaddrIn. Numeric IPv4 is parsed
+// directly; a hostname goes through getaddrinfo. Returns -1 on failure.
+//
+// NOTE: getaddrinfo is a BLOCKING DNS lookup, so on a reactor thread it briefly stalls the loop.
+// This is done once per connection (connections are pooled), not per request, so it is an accepted
+// interim cost; a non-blocking resolver is a later step. The struct addrinfo field offsets here are
+// the macOS/BSD layout (ai_family at 4, ai_addr at 32, ai_next at 40); Linux differs (ai_addr at 24)
+// and plugs in with the epoll backend.
+pub fn resolveHost4(host: string): long {
+    if (isNumericIPv4(host)) { return parseIPv4(host); }
+
+    let n = host.length;
+    let node = bytes.alloc(n + 1);
+    let i = 0;
+    while (i < n) { bytes.write_byte(node, i, host[i]); i = i + 1; }
+    bytes.write_byte(node, n, 0);
+
+    let res = bytes.alloc(8);
+    bytes.write_ptr(res, 0, 0);
+    let rc = sys.getaddrinfo(node, 0, 0, res);
+    bytes.free(node);
+    if (rc != 0) { bytes.free(res); return -1 as long; }
+
+    let head = bytes.read_ptr(res, 0);
+    let ai = head;
+    let addr = -1 as long;
+    while (ai != 0 && addr == (-1 as long)) {
+        let fam = bytes.read_i32(ai, 4) as int;
+        if (fam == sys.AF_INET) {
+            let sa = bytes.read_ptr(ai, 32);       // ai_addr (macOS offset)
+            addr = bytes.read_i32(sa, 4) as long;  // sin_addr; write_i32 truncates the 4 bytes back
+        } else {
+            ai = bytes.read_ptr(ai, 40);           // ai_next
+        }
+    }
+    if (head != 0) { sys.freeaddrinfo(head); }
+    bytes.free(res);
+    return addr;
+}
+
 pub struct ReactorStream {
     pub fd: int,
     pub kq: int,
@@ -117,11 +168,13 @@ pub struct ReactorStream {
 // Connect to a numeric IPv4 host and port on the reactor. The non-blocking connect returns
 // EINPROGRESS; we await writability, then read SO_ERROR to confirm. Returns a ReactorStream whose
 // fd is -1 on failure.
-pub async fn reactorConnect(ip: string, port: int, kq: int): ReactorStream {
+pub async fn reactorConnect(host: string, port: int, kq: int): ReactorStream {
+    let addr = resolveHost4(host);
+    if (addr == (-1 as long)) { return ReactorStream(-1, kq); }
     let fd = sys.socket(sys.AF_INET, sys.SOCK_STREAM, 0);
     if (fd < 0) { return ReactorStream(-1, kq); }
     sys.setNonBlocking(fd);
-    let sa = sys.makeSockaddrIn(port, parseIPv4(ip));
+    let sa = sys.makeSockaddrIn(port, addr);
     let r = sys.connect(fd, sa, 16);
     bytes.free(sa);
     if (r != 0) {

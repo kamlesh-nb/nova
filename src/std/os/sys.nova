@@ -23,6 +23,8 @@ pub extern("c") fn connect(fd: int, addr: ptr, addrlen: int): int;
 pub extern("c") fn setsockopt(fd: int, level: int, optname: int, optval: ptr, optlen: int): int;
 pub extern("c") fn getsockopt(fd: int, level: int, optname: int, optval: ptr, optlen: ptr): int;
 pub extern("c") fn getsockname(fd: int, addr: ptr, addrlen: ptr): int;
+pub extern("c") fn getaddrinfo(node: ptr, service: ptr, hints: ptr, res: ptr): int;
+pub extern("c") fn freeaddrinfo(res: ptr): void;
 pub extern("c") fn fcntl(fd: int, cmd: int, arg: int): int;
 pub extern("c") fn read(fd: int, buf: ptr, count: long): long;
 pub extern("c") fn write(fd: int, buf: ptr, count: long): long;

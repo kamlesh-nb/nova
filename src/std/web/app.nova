@@ -1,6 +1,9 @@
 
 import net.asyncio;
 import net.asynctls;
+import net.reactor;
+import net.reactorio;
+import os.sys;
 import io.file;
 import web.request;
 import web.response;
@@ -712,6 +715,64 @@ async fn handleConnTls(app: App, client: long): int {
         return -1;
     }
     return await handleConn(app, tls);
+}
+
+// Handle one connection on the Nova reactor (M2 of the C++ runtime retirement plan): wrap the
+// accepted fd in a reactor-native AsyncStream (kq set) and run the same request pipeline as the
+// Asio path. Because handleConn takes the AsyncIO trait and AsyncStream is reactor-native when kq>0,
+// the whole request (parse, mediator, handler, response, and any await to a reactor-native database
+// connection) runs on the reactor with no Asio.
+pub async fn serveReactorConn(app: App, fd: int, kq: int): int {
+    let s = asyncio.AsyncStream(fd as long);
+    s.kq = kq;
+    return await handleConn(app, s);
+}
+
+// Run the web server on a single Nova reactor (no Asio). Opt-in via runReactor; the default run()
+// keeps the Asio path. Each accepted connection becomes a coroutine driven by the reactor. Multi-core
+// (one reactor per core, SO_REUSEPORT) is a later step once the reactor worker can carry the App.
+pub fn runReactor(self: App, port: int): void {
+    let lfd = sys.socket(sys.AF_INET, sys.SOCK_STREAM, 0);
+    let one = bytes.alloc(4);
+    bytes.write_i32(one, 0, 1);
+    sys.setsockopt(lfd, sys.SOL_SOCKET, 4, one, 4);   // SO_REUSEADDR
+    bytes.free(one);
+    let sa = sys.makeSockaddrIn(port, 0);
+    if (sys.bind(lfd, sa, 16) != 0) {
+        bytes.free(sa);
+        console.log("Nova web: failed to bind port (in use?)");
+        return;
+    }
+    bytes.free(sa);
+    sys.listen(lfd, 512);
+    sys.setNonBlocking(lfd);
+
+    let r = reactor.Reactor(1024, 16384, 1024);
+    reactor.setCurrent(r.kq);
+    r.addRead(lfd, lfd as long);
+    let addrBuf = bytes.alloc(16);
+    let addrLen = bytes.alloc(4);
+    console.log("Nova web server listening (Nova reactor)");
+
+    while (true) {
+        let n = r.poll(-1);
+        let i = 0;
+        while (i < n) {
+            let fd = r.readyFd(i);
+            if (fd == lfd) {
+                while (true) {
+                    bytes.write_i32(addrLen, 0, 16);
+                    let c = sys.accept(lfd, addrBuf, addrLen);
+                    if (c < 0) { break; }
+                    sys.setNonBlocking(c);
+                    coroStart(serveReactorConn(self, c, r.kq));
+                }
+            } else {
+                nova_reactor_resume(r.readyToken(i));
+            }
+            i = i + 1;
+        }
+    }
 }
 
 async fn runServer(app: App, port: int): int {

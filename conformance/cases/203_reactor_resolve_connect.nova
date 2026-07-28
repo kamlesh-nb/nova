@@ -1,0 +1,95 @@
+// M2 tail of the C++ runtime retirement plan: hostname resolution for reactor-native connect. A
+// database host is usually a name, not a numeric IP; reactorio.resolveHost4 parses numeric IPv4
+// directly and resolves a name via getaddrinfo. Here the client connects to "localhost", which is
+// resolved to the loopback address, then does a TCP round trip on one reactor. Proves a named host
+// reaches the reactor-native connect path.
+import assert;
+import bytes;
+import os.sys;
+import net.reactor;
+import net.reactorio;
+
+const SO_REUSEADDR: int = 4;
+
+fn bump(cell: long): void {
+    bytes.write_i32(cell, 0, (bytes.read_i32(cell, 0) as int) + 1);
+}
+fn count(cell: long): int {
+    return bytes.read_i32(cell, 0) as int;
+}
+
+async fn srv(listenFd: int, kq: int, done: long): void {
+    let s = await reactorio.reactorAccept(listenFd, kq);
+    if (s.isOpen()) {
+        let buf = bytes.alloc(64);
+        let n = await s.recvInto(buf, 64);
+        if (n > 0) { await s.sendBuf(buf, n); }
+        bytes.free(buf);
+        s.close();
+    }
+    bump(done);
+}
+
+async fn cli(port: int, done: long, result: long, gotLen: long): void {
+    let s = await reactorio.reactorConnect("localhost", port, reactor.currentKq());
+    if (s.isOpen()) {
+        let msg = bytes.alloc(4);
+        bytes.write_byte(msg, 0, 80); bytes.write_byte(msg, 1, 73);
+        bytes.write_byte(msg, 2, 78); bytes.write_byte(msg, 3, 71);   // PING
+        await s.sendBuf(msg, 4);
+        bytes.free(msg);
+        let n = await s.recvInto(result, 64);
+        bytes.write_i32(gotLen, 0, n as long);
+        s.close();
+    }
+    bump(done);
+}
+
+@test
+fn test_resolve_host4_loopback(): void {
+    // "localhost" resolves to the same value parseIPv4 gives for the numeric loopback.
+    assert.isTrue(reactorio.resolveHost4("localhost") == reactorio.parseIPv4("127.0.0.1"));
+    assert.isTrue(reactorio.resolveHost4("127.0.0.1") == reactorio.parseIPv4("127.0.0.1"));
+    // A host that cannot resolve returns -1.
+    assert.isTrue(reactorio.resolveHost4("no.such.host.invalid.") == (-1 as long));
+}
+
+@test
+fn test_reactor_connect_by_name(): void {
+    let lfd = sys.socket(sys.AF_INET, sys.SOCK_STREAM, 0);
+    let one = bytes.alloc(4); bytes.write_i32(one, 0, 1);
+    sys.setsockopt(lfd, sys.SOL_SOCKET, SO_REUSEADDR, one, 4);
+    bytes.free(one);
+    let sa = sys.makeSockaddrIn(0, reactorio.parseIPv4("127.0.0.1"));
+    assert.equalInt(sys.bind(lfd, sa, 16), 0);
+    bytes.free(sa);
+    sys.listen(lfd, 16);
+    sys.setNonBlocking(lfd);
+    let port = sys.boundPort(lfd);
+
+    let r = reactor.Reactor(64, 4096, 16);
+    reactor.setCurrent(r.kq);
+    let done = bytes.alloc(4); bytes.write_i32(done, 0, 0);
+    let result = bytes.alloc(64);
+    let gotLen = bytes.alloc(4); bytes.write_i32(gotLen, 0, 0);
+
+    coroStart(srv(lfd, r.kq, done));
+    coroStart(cli(port, done, result, gotLen));
+
+    let guard = 0;
+    while (count(done) < 2 && guard < 1000) {
+        let nev = r.poll(500);
+        let i = 0;
+        while (i < nev) { nova_reactor_resume(r.readyToken(i)); i = i + 1; }
+        guard = guard + 1;
+    }
+
+    assert.equalInt(count(done), 2);
+    assert.equalInt(bytes.read_i32(gotLen, 0) as int, 4);
+    assert.equalInt(bytes.read_byte(result, 0) as int, 80);   // 'P'
+
+    reactor.setCurrent(0);
+    bytes.free(done); bytes.free(result); bytes.free(gotLen);
+    r.destroy();
+    sys.close(lfd);
+}
