@@ -1,0 +1,50 @@
+// io/arena: a bump allocator for per-connection scratch memory (docs/design/self-hosted-
+// runtime.md, phase 3). This is the nginx ngx_pool_t model: allocate many small regions by
+// bumping a cursor, then free them all at once by resetting the cursor. It is the natural home
+// for the parsed headers and other per-request scratch that today allocates individual heap
+// objects; a whole request's scratch is reclaimed with a single reset, with no per-object free
+// and no ARC traffic.
+//
+// Addresses are plain `long` values, outside ARC. The Arena struct is reused across requests on
+// a connection, so its own cost is amortised.
+
+import bytes;
+
+pub struct Arena {
+    pub base: long,
+    pub cap: int,
+    pub used: int,
+
+    init(cap: int) {
+        self.base = bytes.alloc(cap);
+        self.cap = cap;
+        self.used = 0;
+    }
+
+    // Bump-allocate `n` bytes (8-byte aligned). Returns the address, or 0 if the arena is full.
+    pub fn alloc(self: Arena, n: int): long {
+        let aligned = (n + 7) / 8 * 8;
+        if (self.used + aligned > self.cap) {
+            return 0;
+        }
+        let addr = self.base + (self.used as long);
+        self.used = self.used + aligned;
+        return addr;
+    }
+
+    // Reclaim everything at once. The memory is reused from the start on the next alloc.
+    pub fn reset(self: Arena): void {
+        self.used = 0;
+    }
+
+    pub fn remaining(self: Arena): int {
+        return self.cap - self.used;
+    }
+
+    pub fn destroy(self: Arena): void {
+        if (self.base != 0) {
+            bytes.free(self.base);
+            self.base = 0;
+        }
+    }
+}

@@ -181,7 +181,21 @@ Each phase ends with a measurement or a conformance gate, so we never fly blind 
   183/183, ASAN 335/335. **Still open in phase 2:** `accept4`, `writev`, `mmap`, and the Linux
   eventfd and timerfd round-trip verification.
 - **Phase 3. Buffer infrastructure in Nova**: slab pool, ring buffer, refcounted `Bytes` slice,
-  per-connection arena. Benchmarked in isolation against malloc and against ARC.
+  per-connection arena. Benchmarked in isolation against malloc and against ARC. **Started
+  (2026-07-28).** `src/std/io/slab.nova` (`SlabPool`): one backing allocation, fixed-size blocks
+  on an intrusive free list, a manual per-block refcount so a block can be shared zero-copy and
+  is recycled automatically at zero references, all as plain `long` addresses OUTSIDE ARC (the
+  nginx-pool and Kestrel-MemoryPool model, with the tokio-Bytes and Seastar-temporary_buffer
+  refcount). `src/std/io/arena.nova` (`Arena`): a bump allocator for per-connection scratch that
+  reclaims a whole request's memory with one `reset`, no per-object free (the nginx ngx_pool_t
+  model). Proven by `conformance/cases/190` (acquire, distinct blocks, payload read and write,
+  the retain and release refcount lifecycle, recycling, exhaustion) and `191` (bump, alignment,
+  reset reuse, exhaustion). Native corpus 185/185, ASAN 339/339. **Still open in phase 3:** the
+  ring buffer over a chain of slab blocks (the per-connection read buffer), the refcounted `Bytes`
+  slice as a first-class value (blocked on a language value-type or stack-struct feature, since a
+  Nova struct is itself an ARC heap object; for now a slice is passed as an explicit base, offset,
+  length triple with the block refcount for sharing), and an isolation benchmark versus malloc and
+  ARC.
 - **Phase 4. The per-core event loop in Nova**, driving coroutines directly. First milestone: a
   raw echo server. Measure the empty-loop and echo cost immediately (gap 8). Compare to an Asio
   echo baseline.

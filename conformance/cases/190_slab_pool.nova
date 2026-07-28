@@ -1,0 +1,56 @@
+// Phase 3 of the self-hosted runtime: the recyclable slab pool that replaces per-request
+// heap allocation. Proves block hand-out, distinct addresses, payload read/write, the manual
+// refcount lifecycle (shared blocks auto-recycle at zero), recycling of released blocks, and
+// exhaustion. All memory is outside ARC (plain addresses).
+import assert;
+import bytes;
+import io.slab;
+
+@test
+fn test_slab_acquire_recycle(): void {
+    let pool = slab.SlabPool(64, 4);
+    let a = pool.acquire();
+    let b = pool.acquire();
+    assert.isTrue(a != 0);
+    assert.isTrue(b != 0);
+    assert.isTrue(a != b);
+    assert.equalInt(pool.available(), 2);
+
+    // Payload is usable memory.
+    bytes.write_i32(a, 0, 12345);
+    bytes.write_i32(a, 60, 678);
+    assert.equalInt(bytes.read_i32(a, 0) as int, 12345);
+    assert.equalInt(bytes.read_i32(a, 60) as int, 678);
+
+    // Refcount lifecycle: starts at 1; retain to 2; two releases return it to the pool.
+    assert.equalInt(pool.refcount(a), 1);
+    pool.retain(a);
+    assert.equalInt(pool.refcount(a), 2);
+    pool.release(a);
+    assert.equalInt(pool.refcount(a), 1);
+    assert.equalInt(pool.available(), 2); // still held, not recycled
+    pool.release(a);
+    assert.equalInt(pool.available(), 3); // now recycled
+
+    // Re-acquire hands back the recycled block (same address).
+    let c = pool.acquire();
+    assert.isTrue(c == a);
+    pool.destroy();
+}
+
+@test
+fn test_slab_exhaustion(): void {
+    let pool = slab.SlabPool(32, 2);
+    let x = pool.acquire();
+    let y = pool.acquire();
+    assert.isTrue(x != 0);
+    assert.isTrue(y != 0);
+    let z = pool.acquire();          // pool empty
+    assert.equalInt(z as int, 0);
+    assert.equalInt(pool.available(), 0);
+
+    pool.release(x);                 // frees one
+    let w = pool.acquire();
+    assert.isTrue(w == x);           // recycled
+    pool.destroy();
+}

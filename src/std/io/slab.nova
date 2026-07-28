@@ -1,0 +1,91 @@
+// io/slab: a pool of fixed-size, recyclable memory blocks for the self-hosted runtime
+// (docs/design/self-hosted-runtime.md, phase 3). This is the nginx-pool / Kestrel-MemoryPool
+// model: allocate one backing buffer once, hand out fixed-size blocks from a free list, and
+// recycle them rather than freeing per use. Each block carries a manual refcount so a block
+// can be shared zero-copy (in the manner of tokio Bytes and Seastar temporary_buffer) and is
+// returned to the pool automatically when the last reference is released.
+//
+// The blocks live OUTSIDE ARC: addresses are plain `long` values, never Nova heap objects, so
+// there is no retain/release traffic on the hot path. The pool struct itself is long-lived
+// (one per reactor), so its own ARC cost is amortised to nothing.
+//
+// Block layout: an 8-byte header (refcount as an i32 at offset 0, 4 bytes of padding) followed
+// by the payload. A free block reuses its header slot to hold the next-free address (intrusive
+// free list, so the list needs no separate allocation). acquire returns the payload address
+// (block + 8); the refcount and free-link live at payload - 8.
+
+import bytes;
+
+pub struct SlabPool {
+    pub base: long,
+    pub stride: int,
+    pub blockSize: int,
+    pub count: int,
+    pub freeHead: long,
+    pub freeCount: int,
+
+    init(blockSize: int, count: int) {
+        let aligned = (blockSize + 7) / 8 * 8;
+        self.blockSize = blockSize;
+        self.stride = 8 + aligned;
+        self.count = count;
+        self.base = bytes.alloc(count * self.stride);
+        self.freeCount = count;
+
+        // Chain every block onto the free list: block i points to block i+1, last to 0.
+        let i = 0;
+        while (i < count - 1) {
+            let blk = self.base + (i * self.stride) as long;
+            bytes.write_ptr(blk, 0, self.base + ((i + 1) * self.stride) as long);
+            i = i + 1;
+        }
+        bytes.write_ptr(self.base + ((count - 1) * self.stride) as long, 0, 0);
+        self.freeHead = self.base;
+    }
+
+    // Take a block from the pool. Returns the payload address, or 0 if the pool is exhausted.
+    // The returned block starts with refcount 1.
+    pub fn acquire(self: SlabPool): long {
+        if (self.freeHead == 0) {
+            return 0;
+        }
+        let blk = self.freeHead;
+        self.freeHead = bytes.read_ptr(blk, 0);
+        bytes.write_i32(blk, 0, 1);
+        self.freeCount = self.freeCount - 1;
+        return blk + 8;
+    }
+
+    // Add a reference to a block (for zero-copy sharing of a slice into it).
+    pub fn retain(self: SlabPool, payload: long): void {
+        let blk = payload - 8;
+        bytes.write_i32(blk, 0, (bytes.read_i32(blk, 0) as int + 1) as long);
+    }
+
+    // Drop a reference. When the count reaches zero the block returns to the free list.
+    pub fn release(self: SlabPool, payload: long): void {
+        let blk = payload - 8;
+        let rc = (bytes.read_i32(blk, 0) as int) - 1;
+        bytes.write_i32(blk, 0, rc as long);
+        if (rc <= 0) {
+            bytes.write_ptr(blk, 0, self.freeHead);
+            self.freeHead = blk;
+            self.freeCount = self.freeCount + 1;
+        }
+    }
+
+    pub fn refcount(self: SlabPool, payload: long): int {
+        return bytes.read_i32(payload - 8, 0) as int;
+    }
+
+    pub fn available(self: SlabPool): int {
+        return self.freeCount;
+    }
+
+    pub fn destroy(self: SlabPool): void {
+        if (self.base != 0) {
+            bytes.free(self.base);
+            self.base = 0;
+        }
+    }
+}
