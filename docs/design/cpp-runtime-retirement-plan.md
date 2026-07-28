@@ -10,7 +10,7 @@ truth for progress; the phase details are below.
 | Foundation | Event loop, buffers, HTTP parser, poll and socket layer, multi-core | none | DONE | `self-hosted-runtime.md` phases 1 to 5; race-free under `--tsan` |
 | M0 | Tooling: file-based runtime trace, symbol audit | none | DONE | `NOVA_TRACE=<file>` trace (surfaces reliably), `tools/runtime-symbol-audit.sh` (221 exported / 203 referenced) |
 | M1 | Async scheduler migration (per-reactor run queue) | M0 | DONE | Nested/multi-level `await` and `spawn`+`await` drain on the reactor (corpus 199, trace-proven); Asio-backed awaits on the reactor now fail fast via `nova_reactor_io_violation` instead of silently orphaning (their migration is M2) |
-| M2 | Async socket I/O on the reactor | M1 | WIP | `net/reactorio.ReactorStream` (recv/send in Nova over `os/sys` + reactor readiness) proven by a client and server round trip on one reactor, no Asio (corpus 200, TSan clean). Remaining: reactor-native `aconnect`/`aaccept`, a thread-local current reactor, and the `AsyncStream` cutover so drivers pick it up |
+| M2 | Async socket I/O on the reactor | M1 | WIP (core done) | `net/reactorio` = reactor-native recv/send/connect/accept in Nova over `os/sys`; a thread-local current reactor; `asyncio.AsyncStream` is dual-mode so drivers pick up the reactor with no change. Proven by corpus 200/201/202 (socketpair round trip, loopback connect/accept, and the AsyncStream seam), all TSan clean. Remaining: hostname resolution (`getaddrinfo`) and a reactor-driven inbound accept loop in `app.nova` |
 | M3 | Database drivers on the reactor | M2 | TODO | No driver change; they already speak the async seam |
 | M4 | Retire Boost.Asio | M1 to M3 | TODO | Remove reactors, strands, `g_io`; drop vendored Boost |
 | M5 | File and directory I/O in Nova | M4 (soft) | TODO | `nova_file_*`, `nova_dir_*` over `os/sys` |
@@ -169,13 +169,29 @@ phase removes a real dependency and is independently verifiable.
     by corpus case 200: two coroutines on one reactor complete a send and receive round trip over a
     socketpair, trace-confirmed to park on `EAGAIN` and resume on readiness. Native 193, ASAN 355,
     TSan 201 (200 tsan clean).
-  - **Remaining:** reactor-native `aconnect` (non-blocking `connect` + await writability + `SO_ERROR`
-    via a `getsockopt` binding) and `aaccept` (accept loop as a stream); a thread-local current
-    reactor so a stream can be built deep in driver code without threading the reactor through; and
-    the `AsyncStream` cutover (make it reactor-native when constructed on a reactor thread, else Asio)
-    so the drivers and `app.nova`'s `AsyncIO` path pick up the reactor path unchanged.
-  - Gate (full M2): an async client and server round trip on the reactor (done); the async stream and
-    TLS conformance cases pass with the new path; the Asio deployment does not regress.
+  - **Done: connect and accept.** `net/reactorio.reactorConnect` (non-blocking `connect` + await
+    writability + `SO_ERROR` via a new `getsockopt` binding) and `reactorAccept` (accept loop
+    awaiting readability), with `parseIPv4` for numeric hosts. Found and fixed a real portability
+    bug: `SOL_SOCKET` was the Linux value (1); on macOS/BSD it is `0xffff`, so `getsockopt(SO_ERROR)`
+    was failing (surfaced via `NOVA_TRACE`). Corpus case 201 does a loopback TCP client and server
+    round trip on one reactor.
+  - **Done: the current-reactor thread-local.** `nova_reactor_set_current`/`nova_reactor_current`
+    (share-nothing per reactor thread), exposed as `reactor.setCurrent`/`currentKq`; a worker sets it
+    once so a stream can be built deep in driver code without the reactor being threaded through.
+  - **Done: the `AsyncStream` cutover.** `asyncio.AsyncStream` is dual-mode: `kq == 0` is the Asio
+    stream (unchanged); `kq > 0` is reactor-native (`sock` is a raw fd, recv/send/close delegate to
+    `net/reactorio`). `asyncConnect` picks the reactor path when `reactor.currentKq() > 0`, else Asio.
+    Corpus case 202 runs a TCP round trip where the client goes entirely through the `AsyncStream`
+    seam on the reactor; the M1 `nova_reactor_io_violation` guard proves the reactor path was taken
+    (an Asio fallback on the reactor thread would have aborted). Backward compatible, Asio deployment
+    untouched.
+  - **Remaining:** hostname resolution (`getaddrinfo`; only numeric IPv4 today) so a driver can
+    connect to a named host on the reactor, and a reactor-driven inbound accept loop in `app.nova`
+    so a whole request (inbound plus the per-request database call) runs on the reactor. These, with
+    M3, deliver the flagship's per-request database on the reactor.
+  - Gate (M2 core): an async client and server round trip on the reactor (done, 200/201); the
+    `AsyncStream` seam runs reactor-native (done, 202); the Asio deployment does not regress (native
+    195, ASAN 359, TSan clean).
 - **M3. Database drivers onto the reactor.** The drivers already speak the async seam (`arecv`/`asend`
   over `AsyncStream`); once M2 provides that seam on the reactor, they run on the reactor with no
   driver change. Prereq: M2. Gate: a live driver round trip on the reactor (offline-gated codecs stay
