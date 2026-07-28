@@ -1,0 +1,192 @@
+# A Self-Reliant Nova Runtime: Study First, Then Build
+
+## Decision (2026-07-28)
+
+Stop the piecemeal tuning of the Asio-based runtime. The head-to-head measurements are clear:
+Nova serves about 55k rps where Go, C#, and Rust serve 120k to 135k, that is, roughly 2.2x
+to 2.4x behind (see `../../flagship/bench/headtohead/`). The profile
+(`../../flagship/bench/PROFILE.md`) is equally clear that this is not a codegen problem, the
+compute core is already native-tier, but a runtime problem: per-request allocation, refcount
+traffic, per-coroutine state churn behind a mutex, and unbatched syscalls. Chasing these one
+at a time on top of Boost.Asio is trial and error against a design we did not choose and do
+not fully control.
+
+The correct path is to study the best known implementations of the exact things we need, adopt
+their proven structure, and build a runtime that Nova owns end to end. Boost.Asio was a
+reasonable bootstrap, but it is a general-purpose C++ library, it is a large external
+dependency, and its per-coroutine strand model is the source of the cross-thread state we have
+been fighting. The language now has a solid compute core and a working FFI. That is exactly the
+foundation from which a language should reduce its reliance on external C++ libraries and stand
+on its own.
+
+This document is the study and the plan. No code is to be written against it until the
+reference model and the architecture below are agreed.
+
+## What is already good and must be preserved
+
+- **The compute core and codegen.** LLVM backend, native-tier per-request CPU cost (about
+  1.95 microseconds for parse plus render). This is not the problem and must not be disturbed.
+- **LLVM stackless coroutines.** The `async`/`await` mechanism is sound and is the same family
+  as Rust futures. We keep the coroutine intrinsics; we change who drives them.
+- **FFI (`extern("lib") fn`).** The keystone that makes a Nova-owned syscall layer possible.
+- **The wolfSSL memory-BIO TLS seam.** TLS is already pumped by Nova over an in-memory BIO, not
+  by Asio. This design already points the right way and is reused unchanged.
+- **ARC for application objects.** ARC is correct for user data. What must change is that the
+  I/O hot path (buffers, headers) must stop flowing through ARC (see buffers below).
+
+## Reference implementations to study, and what each teaches
+
+| Project | Language | What to take from it |
+|---------|----------|----------------------|
+| **Seastar** (ScyllaDB) | C++ | The canonical share-nothing thread-per-core reactor. One shard per core, no shared mutable state, explicit message passing across shards, per-core allocator, io_uring backend, `temporary_buffer` for refcounted zero-copy slices. This is the closest match to our target and the primary reference. |
+| **glommio** (Datadog) | Rust | Thread-per-core on io_uring, done as a library rather than a framework. Good model for how a thread-per-core reactor exposes `async`/`await` without a work-stealing scheduler. |
+| **monoio** (ByteDance) | Rust | io_uring-first thread-per-core, with an epoll fallback, and a completion-based buffer ownership model (buffers are moved into the kernel and returned). The reference for a portable completion or readiness split. |
+| **tokio + mio** | Rust | mio is the minimal, portable readiness reactor (epoll, kqueue, IOCP, and now io_uring). The reference for the low-level event source abstraction we must build in Nova. Tokio itself is work-stealing, which we do not want, but its `Bytes`/`BytesMut` are the reference for refcounted, cheaply sliceable buffers. |
+| **libuv** (Node.js) | C | The most portable event loop in existence (epoll, kqueue, IOCP, io_uring, event ports). The reference for cross-platform structure, the handle and request lifecycle, and the timer, signal, and async-wakeup integration. |
+| **nginx** | C | Worker-per-core share-nothing, its own memory pools (`ngx_pool_t`, allocate-many free-once per request), buffer chains (`ngx_chain_t`), and kernel zero-copy for static content (`sendfile`, `splice`). The reference for per-request arena allocation and zero-copy pass-through. |
+| **h2o + picohttpparser** | C | picohttpparser is the fastest HTTP/1 parser, and it is zero-copy: it returns slices into the read buffer and allocates nothing. The reference for our request parser, which today builds three hash maps per request. |
+| **hyper + httparse** | Rust | Zero-copy, SIMD-accelerated HTTP/1 parsing, and the buffer and backpressure discipline that makes axum fast. |
+| **Kestrel + System.IO.Pipelines** (.NET) | C# | The `Pipe`: a single ring buffer between a producer and a consumer, with backpressure and zero-copy `ReadOnlySequence<byte>` reads, over a pooled slab allocator (`MemoryPool`, `ArrayPool`). Since Nova's `App` framework is deliberately ASP.NET-shaped, Pipelines is the natural model for our buffer and connection I/O layer. |
+| **io_uring** (Linux kernel) | - | Submission and completion queues, registered (fixed) buffers, and provided-buffer rings for zero-copy receive. The endgame for Linux I/O; the design must leave room for it as a backend. |
+
+The common thread across every fast server above: **share-nothing per core, a small purpose-built
+event loop over the raw kernel interface, pooled and reused buffers, and zero-copy parsing that
+slices the read buffer instead of allocating.** None of them is built on a general-purpose async
+library layered over the kernel. That is the lesson.
+
+## Target architecture
+
+The shape to build, borrowing directly from Seastar and glommio for the core, Kestrel Pipelines
+for buffers, and picohttpparser for parsing:
+
+1. **Share-nothing thread-per-core.** N reactors, one per core, each with its own event loop,
+   its own connection set, its own buffer pools, and its own timer wheel. No shared mutable
+   state on the hot path. SO_REUSEPORT for accept fan-out (we already do this). Cross-core
+   communication, when unavoidable, is an explicit lock-free wakeup (`eventfd` on Linux, a
+   self-pipe or `EVFILT_USER` on macOS), never a shared lock. This directly removes the
+   cross-thread CoroState problem, because a connection and its coroutine tree live and die on
+   one core and are never touched by another.
+
+2. **A Nova-owned event loop over raw syscalls.** A per-core reactor written in Nova, calling
+   the kernel through a thin FFI syscall layer:
+   - macOS: `kqueue` / `kevent` (readiness).
+   - Linux: `io_uring` (completion) as the primary backend, `epoll` (readiness) as the
+     portable fallback.
+   - The loop owns a per-core, lock-free `fd -> waiting coroutine` map (an array indexed by fd,
+     not a hash map behind a mutex), registers interest, waits, and resumes the coroutine whose
+     fd became ready or whose operation completed.
+   - Timers via `timerfd` (Linux) or `EVFILT_TIMER` (kqueue), integrated into the same wait.
+
+3. **Reusable, refcounted, zero-copy buffers (the Pipelines model).** A per-core slab allocator
+   hands out fixed-size buffer blocks that are recycled, never freed per request, and never
+   flow through ARC. A connection reads into a ring of these blocks. Parsers and handlers take
+   `Bytes`-style slices (offset and length into a block, with a cheap refcount on the block, in
+   the manner of tokio `Bytes` and Seastar `temporary_buffer`), so no request data is copied or
+   individually allocated. Responses are assembled as a scatter-gather list and written with a
+   single `writev`. Static files use `sendfile` or `splice`.
+
+4. **Zero-copy HTTP parsing.** Replace `Request.fromString` (which today splits strings and
+   builds three `Map<string,string>` per request) with a picohttpparser-style parser that
+   records header name and value as slices into the read buffer and stores them in a small
+   fixed array. Header lookup is a short linear scan, which is faster than a hash map for the
+   typical five to fifteen headers and allocates nothing.
+
+5. **The coroutine seam stays, the driver changes.** We keep LLVM coroutines. The reactor
+   resumes and suspends them directly through the existing raw coroutine intrinsics. Because
+   each coroutine is confined to one core, the scheduler state (running, pending, the fd it
+   waits on) is single-threaded and needs no mutex and no shared map, which is the lockless
+   CoroState we could not safely retrofit onto Asio.
+
+## Design gaps and blockers, honestly enumerated
+
+These are the things that must be resolved or built before the architecture above is reachable.
+They are the reason this is a study-and-plan document and not a patch.
+
+1. **FFI expressiveness (the keystone).** A Nova-owned syscall layer needs the FFI to express,
+   with exact C ABI layout: structs by pointer and by value (`sockaddr_in`, `kevent`,
+   `epoll_event`, `io_uring` SQE and CQE, `iovec`, `timespec`), fixed-size arrays of those
+   structs (an `epoll_event[]` or `kevent[]` batch), out-parameters, `errno` access, and a few
+   variadic calls (`fcntl`, `open`). We must audit exactly what the current FFI supports and
+   close the gaps, with conformance tests, before anything else. This is task one.
+
+2. **Raw memory outside ARC.** The buffer pools must be `mmap`-backed arenas that ARC never
+   touches. Nova can already hold 64-bit addresses (`long`) and read and write through them
+   (`bytes.read`/`write`), but we need first-class, safe primitives for slab and ring buffers,
+   for pointer-sliced `Bytes`, and for a per-request arena (the nginx pool model), none of which
+   should incur retain and release.
+
+3. **Non-blocking discipline.** Every fd must be `O_NONBLOCK`, and the loop must correctly
+   handle `EAGAIN`, partial reads and writes, and short `writev`. This is straightforward but
+   pervasive and must be got right once, in one place.
+
+4. **The readiness versus completion split.** kqueue and epoll are readiness (tell me when I can
+   act), io_uring and IOCP are completion (tell me when the act is done). Buffer ownership
+   differs: completion models hand the buffer to the kernel and get it back later (see monoio).
+   The abstraction must accommodate both without leaking one model into the other. Recommend
+   starting with readiness (kqueue on macOS, epoll on Linux) because it is simpler and portable,
+   and adding an io_uring completion backend later behind the same interface.
+
+5. **Cross-core wakeup.** Rare but necessary (a timer or a result produced on another core).
+   Needs an `eventfd` or self-pipe wakeup and a lock-free SPSC or MPSC queue, not a shared
+   mutex. Keep it off the common path entirely.
+
+6. **Cancellation, timeouts, backpressure, graceful shutdown.** These must be designed into the
+   loop from the start, not bolted on. Kestrel Pipelines backpressure and libuv handle teardown
+   are the references.
+
+7. **Windows.** IOCP is a completion model and a different beast. Recommend deferring Windows
+   server support explicitly and keeping the door open through the completion abstraction.
+
+8. **The hot-loop overhead risk of writing the loop in Nova.** This is the honest counter-risk
+   to self-hosting. If ARC, bounds checks, or optional-unwrapping creep into the innermost loop,
+   Nova-level overhead could eat the win. Mitigation: keep the loop body allocation-free and
+   ARC-free by construction (raw arenas and slices), measure the empty-loop and echo-server cost
+   very early (phase 4), and be willing to push the tightest inner step behind FFI if Nova-level
+   overhead is shown to dominate. Measure before deciding, do not assume either way.
+
+## Phased plan
+
+Each phase ends with a measurement or a conformance gate, so we never fly blind again.
+
+- **Phase 0. Agree the reference model.** Ratify: thread-per-core in the Seastar and glommio
+  mould, Pipelines-style pooled buffers, picohttpparser-style zero-copy parse, readiness loop
+  first (kqueue and epoll) with io_uring as a later backend. Write the interface contracts.
+- **Phase 1. Harden FFI** to the syscall surface in gap 1, with conformance tests. Keystone.
+- **Phase 2. `os/sys` syscall bindings in Nova**: sockets, `accept4`, `epoll`/`kqueue`,
+  `read`/`write`/`writev`, `close`, `mmap`, `eventfd`/`timerfd`, non-blocking. Tested against
+  the kernel.
+- **Phase 3. Buffer infrastructure in Nova**: slab pool, ring buffer, refcounted `Bytes` slice,
+  per-connection arena. Benchmarked in isolation against malloc and against ARC.
+- **Phase 4. The per-core event loop in Nova**, driving coroutines directly. First milestone: a
+  raw echo server. Measure the empty-loop and echo cost immediately (gap 8). Compare to an Asio
+  echo baseline.
+- **Phase 5. Zero-copy HTTP/1 parser** (picohttpparser model), replacing the per-request maps.
+- **Phase 6. Port the `App` server** onto the Nova reactor. Re-run the head-to-head. Target is
+  parity within about 1.2x to 1.5x of Go and Kestrel, which the profile says is reachable.
+- **Phase 7. io_uring completion backend** on Linux, and `sendfile`/`splice` for static content.
+- **Retirement.** Keep Asio as a fallback until the Nova loop meets or beats it on the
+  head-to-head, then remove the Boost dependency and delete the Asio path.
+
+## Success criteria
+
+- Head-to-head GET throughput within about 1.2x to 1.5x of Go net/http and Kestrel on the same
+  box, not 2.5x behind.
+- The Boost.Asio dependency removed from the default native build.
+- No shared mutable state and no mutex on the request hot path, verified under a ThreadSanitizer
+  build (which we must add regardless, and which is the prerequisite for trusting any concurrent
+  runtime code).
+- The existing corpus and ASAN gates stay green throughout; the runtime rewrite does not regress
+  language or memory-safety behaviour.
+
+## Open decisions to settle in Phase 0
+
+1. **Loop in Nova versus a thin purpose-built C++ reactor.** The user's direction is to reduce
+   external reliance and to implement the loop in Nova over FFI. The counter-risk is hot-loop
+   overhead (gap 8). Recommendation: commit to the Nova loop, but validate the overhead at
+   phase 4 with a hard measurement, and keep a thin-FFI escape hatch for the single tightest
+   step if the data demands it. Decide on data, not preference.
+2. **Readiness first or io_uring first.** Recommendation: readiness first for portability and
+   simplicity (macOS development uses kqueue anyway), io_uring as a phase-7 backend.
+3. **Add the ThreadSanitizer build now.** It is a small, safe piece of infrastructure and it is
+   the gate that makes all subsequent concurrency work trustworthy. Recommend doing it in
+   phase 0 or 1 regardless of the rest.
