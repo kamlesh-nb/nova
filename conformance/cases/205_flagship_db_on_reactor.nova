@@ -1,0 +1,192 @@
+// M3 of the C++ runtime retirement plan: the flagship pattern (a web request whose handler makes a
+// per-request database call) runs entirely on the Nova reactor, no Asio. This closes the original
+// PH6 blocker, where a handler's nested async DB call deadlocked because the reactor could not drive
+// nested awaits (fixed in M1) and the DB I/O went through Asio (fixed in M2).
+//
+// A real App handler does `await asyncio.asyncConnect(host, port)` then a query round trip. Because
+// M2 made asyncConnect reactor-native on a reactor thread and AsyncStream dual-mode, the handler's
+// database I/O runs on the same reactor as the inbound request, with the identical AsyncStream seam
+// the real drivers (btreedb, postgres, ...) use, so no driver change is needed. Here a mock database
+// server on the same reactor stands in for a live database. Everything (inbound accept, request
+// parse, mediator dispatch, the handler's DB connect and query, and the response) runs on ONE
+// reactor in ONE poll loop.
+import assert;
+import bytes;
+import os.sys;
+import net.reactor;
+import net.reactorio;
+import net.asyncio;
+import web.app;
+import web.request;
+import web.response;
+import web.status;
+import serde.source;
+
+const SO_REUSEADDR: int = 4;
+
+fn bump(cell: long): void {
+    bytes.write_i32(cell, 0, (bytes.read_i32(cell, 0) as int) + 1);
+}
+fn count(cell: long): int {
+    return bytes.read_i32(cell, 0) as int;
+}
+
+// Does buf[0..n] contain the ASCII bytes of `s`?
+fn containsAscii(buf: long, n: int, s: string): bool {
+    if (s.length == 0 || n < s.length) { return false; }
+    let i = 0;
+    while (i + s.length <= n) {
+        let j = 0;
+        let eq = true;
+        while (j < s.length) {
+            if ((bytes.read_byte(buf, i + j) as int) != s[j]) { eq = false; j = s.length; }
+            else { j = j + 1; }
+        }
+        if (eq) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+@serializable struct GetUser { pub id: int }
+
+// The flagship handler: on each request it opens a database connection and runs a query, all with
+// `await` on the reactor. This is exactly the shape that deadlocked before M1+M2.
+struct GetUserHandler impl MessageHandler {
+    pub dbPort: int,
+    async fn handle(self: GetUserHandler, src: ValueSource): Response {
+        let db = await asyncio.asyncConnect("127.0.0.1", self.dbPort);
+        let val = 0;
+        if (db.isOpen()) {
+            let _ = await db.sendStr("Q");
+            let buf = bytes.alloc(64);
+            let n = await db.recvInto(buf, 64);
+            if (n >= 2) {
+                val = ((bytes.read_byte(buf, 0) as int) - 48) * 10 + ((bytes.read_byte(buf, 1) as int) - 48);
+            }
+            bytes.free(buf);
+            db.close();
+        }
+        return json(`{"val":${val}}`);
+    }
+}
+
+fn makeApp(dbPort: int): App {
+    let a = App();
+    a.handle<GetUser>(GetUserHandler{ dbPort: dbPort });
+    a.get<GetUser>("/user");
+    return a;
+}
+
+// Mock database server: read the query, reply "42".
+async fn dbServe(fd: int, kq: int, done: long): void {
+    let s = reactorio.ReactorStream(fd, kq);
+    let buf = bytes.alloc(64);
+    let n = await s.recvInto(buf, 64);
+    if (n > 0) {
+        let reply = bytes.alloc(2);
+        bytes.write_byte(reply, 0, 52);   // '4'
+        bytes.write_byte(reply, 1, 50);   // '2'
+        let _ = await s.sendBuf(reply, 2);
+        bytes.free(reply);
+    }
+    bytes.free(buf);
+    s.close();
+    bump(done);
+}
+
+async fn webServe(application: App, fd: int, kq: int, done: long): void {
+    let _ = await app.serveReactorConn(application, fd, kq);
+    bump(done);
+}
+
+async fn webClient(webPort: int, kq: int, done: long, gotOk: long): void {
+    let s = await reactorio.reactorConnect("127.0.0.1", webPort, kq);
+    if (s.isOpen()) {
+        let _ = await s.sendStr("GET /user HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        let buf = bytes.alloc(2048);
+        let n = await s.recvInto(buf, 2048);
+        if (containsAscii(buf, n, `"val":42`)) { bytes.write_i32(gotOk, 0, 1); }
+        bytes.free(buf);
+        s.close();
+    }
+    bump(done);
+}
+
+fn bindListener(port: int): int {
+    let fd = sys.socket(sys.AF_INET, sys.SOCK_STREAM, 0);
+    let one = bytes.alloc(4); bytes.write_i32(one, 0, 1);
+    sys.setsockopt(fd, sys.SOL_SOCKET, SO_REUSEADDR, one, 4);
+    bytes.free(one);
+    let sa = sys.makeSockaddrIn(0, reactorio.parseIPv4("127.0.0.1"));
+    let br = sys.bind(fd, sa, 16);
+    bytes.free(sa);
+    if (br != 0) { return -1; }
+    sys.listen(fd, 16);
+    sys.setNonBlocking(fd);
+    return fd;
+}
+
+fn acceptAll(lfd: int, addrBuf: long, addrLen: long): int {
+    bytes.write_i32(addrLen, 0, 16);
+    let c = sys.accept(lfd, addrBuf, addrLen);
+    if (c >= 0) { sys.setNonBlocking(c); }
+    return c;
+}
+
+@test
+fn test_flagship_request_with_db_on_reactor(): void {
+    let dbLfd = bindListener(0);
+    let webLfd = bindListener(0);
+    assert.isTrue(dbLfd >= 0 && webLfd >= 0);
+    let dbPort = sys.boundPort(dbLfd);
+    let webPort = sys.boundPort(webLfd);
+
+    let application = makeApp(dbPort);
+
+    let r = reactor.Reactor(64, 8192, 32);
+    reactor.setCurrent(r.kq);
+    r.addRead(webLfd, webLfd as long);
+    r.addRead(dbLfd, dbLfd as long);
+
+    let done = bytes.alloc(4); bytes.write_i32(done, 0, 0);
+    let gotOk = bytes.alloc(4); bytes.write_i32(gotOk, 0, 0);
+    let addrBuf = bytes.alloc(16);
+    let addrLen = bytes.alloc(4);
+
+    // Start the external client; the web and db server coroutines are spawned on accept.
+    coroStart(webClient(webPort, r.kq, done, gotOk));
+
+    // done reaches 3: the client, the web handler coroutine, and the db server coroutine.
+    let guard = 0;
+    while (count(done) < 3 && guard < 4000) {
+        let nev = r.poll(500);
+        let i = 0;
+        while (i < nev) {
+            let fd = r.readyFd(i);
+            if (fd == webLfd) {
+                let c = acceptAll(webLfd, addrBuf, addrLen);
+                if (c >= 0) { coroStart(webServe(application, c, r.kq, done)); }
+            } else if (fd == dbLfd) {
+                let c = acceptAll(dbLfd, addrBuf, addrLen);
+                if (c >= 0) { coroStart(dbServe(c, r.kq, done)); }
+            } else {
+                nova_reactor_resume(r.readyToken(i));
+            }
+            i = i + 1;
+        }
+        guard = guard + 1;
+    }
+
+    assert.equalInt(count(done), 3);
+    assert.equalInt(bytes.read_i32(gotOk, 0) as int, 1);
+
+    reactor.setCurrent(0);
+    bytes.free(done);
+    bytes.free(gotOk);
+    bytes.free(addrBuf);
+    bytes.free(addrLen);
+    r.destroy();
+    sys.close(webLfd);
+    sys.close(dbLfd);
+}
