@@ -21,6 +21,7 @@ fn main(): void {
     let app = App();
     app.handle<Ping>(PingHandler{});
     app.get<Ping>("/");
+    if (env.get("NOVA_CACHE").length != 0) { app.enableCache("/"); }
     let p = env.get("PORT");
     let port = if (p.length == 0) 8080 else string.parseI64(p) as int;
     app.run(port);

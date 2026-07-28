@@ -65,6 +65,35 @@ the runtime and framework hot path (zero-copy request parsing, fewer per-request
 allocations, cheaper dispatch), not a change of compiler or memory model. The headroom is
 real and identifiable, which is the useful outcome of measuring instead of estimating.
 
+## Reconciling with the earlier "~108k rps" figure
+
+An earlier note recorded the Nova web framework at ~108k rps (2.25x a same-machine Zig
+baseline). That is **not** the same measurement as the 48.7k here, and the difference is
+methodology, not a regression:
+
+- **That number was the cached, pipelined path.** The plan describes it as "keep-alive ->
+  response cache -> cache-before-parse -> zero-copy framing" with HTTP pipelining. It
+  serves a memoized response and batches many requests per network round-trip.
+- **This head-to-head is non-pipelined, uncached, one request per round-trip** (`oha`,
+  which does not pipeline), running the full framework path (mediator dispatch, a
+  `ValueSource`, `json()` render) on every request. That is the realistic
+  "independent client requests per second" number.
+
+Measured on this box to confirm:
+
+| Path | rps |
+|------|----:|
+| `oha`, no pipelining, no cache (the head-to-head) | ~48.7k |
+| `oha`, cache enabled | ~51k (cache barely helps: +6%) |
+| pipelined client, cache on, depth 64, 128 conns | ~84.5k |
+
+So enabling the cache alone does almost nothing; **pipelining is the lever** that lifts the
+number toward the earlier figure (the remaining gap to 108k is machine and pipeline depth).
+Crucially, the non-pipelined ~48.7k here matches the post-share-nothing orchestrator perf
+test (~48.9k direct), so the share-nothing / per-socket-strand work did **not** regress the
+per-request path. The 108k and the 48.7k simply measure different things: a best-case
+pipelined-throughput ceiling versus realistic per-request throughput.
+
 ## Caveats
 
 - One machine, one load tool (`oha`), one connection count, keep-alive. Not a TechEmpower
