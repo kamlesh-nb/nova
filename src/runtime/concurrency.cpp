@@ -13,6 +13,7 @@
 #include <queue>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 extern "C" long long __nova_main(void);
@@ -287,9 +288,51 @@ void nova_coro_hold_arg(long long coro, long long ptr, void (*dtor)(long long)) 
     s.map[coro].push_back({ptr, dtor});
 }
 
+// Per-reactor-thread run queue for the self-hosted runtime (docs/design/self-hosted-runtime.md,
+// phase 6). When a thread is in reactor mode, nested awaits and spawns (nova_sched_schedule) are
+// pushed onto this queue and driven by the reactor loop, instead of being posted to Asio. This is
+// what lets an `async fn` handler with nested `await` run on the Nova reactor. Off reactor threads
+// (g_reactor_mode false) the existing Asio path is used unchanged.
+thread_local std::queue<long long> *g_rq = nullptr;
+thread_local bool g_reactor_mode = false;
+// Top-level (fire-and-forget) reactor coroutines, e.g. a connection handler from coroStart.
+// These are reaped when they finish. A spawned-and-awaited coroutine is NOT here: it is reaped by
+// its awaiter (via nova_coro_release), so it must survive completion until the await reads it.
+thread_local std::unordered_set<long long> *g_detached = nullptr;
+
+extern "C" void nova_reactor_detach(long long h) {
+    if (!g_detached) g_detached = new std::unordered_set<long long>();
+    g_detached->insert(h);
+    NOVA_TRACE("detach h=%lld", h);
+}
+
+// Loud abort when a coroutine driven by the Nova reactor suspends on an Asio-backed I/O primitive.
+// The reactor thread runs its own poll loop (kqueue/epoll) and never runs the Asio io_context, so
+// such a completion can never fire: the coroutine (and its connection) would be silently orphaned.
+// Rather than hang or return a wrong value, we fail fast and name the primitive, so the boundary is
+// explicit. These primitives are migrated to the reactor in a later phase of the retirement plan
+// (docs/design/cpp-runtime-retirement-plan.md); until then, use the reactor-native socket path
+// (os.read / os.write + coroSuspend) inside reactor handlers, or run the handler under the Asio
+// scheduler (NOVA_THREADS) instead of the reactor.
+[[noreturn]] static void nova_reactor_io_violation(const char *prim) {
+    NOVA_TRACE("FATAL reactor_io_violation prim=%s", prim);
+    std::fprintf(stderr,
+        "\n[nova runtime] FATAL: awaited '%s' (Asio-backed I/O) on a coroutine driven by the Nova\n"
+        "reactor. The reactor does not run the Asio io_context, so this completion can never fire\n"
+        "and the coroutine would be orphaned. Asio-backed I/O is not yet migrated to the reactor\n"
+        "(see docs/design/cpp-runtime-retirement-plan.md). Use the reactor-native socket path\n"
+        "(os.read / os.write + coroSuspend), or run this handler under NOVA_THREADS, not the reactor.\n",
+        prim);
+    std::fflush(stderr);
+    std::abort();
+}
+#define NOVA_REACTOR_GUARD(prim) do { if (g_reactor_mode) nova_reactor_io_violation(prim); } while (0)
+
 void nova_sched_schedule(long long handle) {
     if (!handle) return;
     if (raw_coro_done(handle)) return;
+
+    if (g_reactor_mode) { NOVA_TRACE("sched->rq h=%lld qlen=%zu", handle, g_rq->size() + 1); g_rq->push(handle); return; }
 
     auto state = get_coro_state(handle);
     {
@@ -381,21 +424,61 @@ void nova_sched_schedule(long long handle) {
     });
 }
 
-// Drive a coroutine directly from a Nova-owned reactor loop, bypassing Asio entirely (the
-// self-hosted runtime, docs/design/self-hosted-runtime.md phase 4). The coroutine was created
-// unscheduled (coroStart) and registered its fd with the reactor before suspending (coroSuspend);
-// when the fd is ready, the reactor calls this with the coroutine handle. Returns 1 if the
-// coroutine finished (its frame is reaped here), 0 if it suspended again. Single reactor thread,
-// so no CoroState, no mutex: this is the lockless per-reactor drive.
-extern "C" long long nova_reactor_resume(long long h) {
-    if (!h || raw_coro_done(h)) return 1;
-    raw_coro_resume(h);
-    if (raw_coro_done(h)) {
-        nova_coro_release_held(h);
-        reinterpret_cast<nova_coro_fn *>(h)[1](reinterpret_cast<void *>(h));
-        return 1;
+// A coroutine on the reactor finished. Release its held args, then: if it has a waiter, hand
+// completion to the waiter (which reads the result and destroys the frame via nova_coro_release);
+// else if it is a top-level (detached) coroutine, reap it now; else (a spawned coroutine not yet
+// awaited) leave the frame alive so the eventual await can read it and reap it.
+static void reactor_finish(long long h) {
+    nova_coro_release_held(h);
+    long long w = take_waiter(h);
+    NOVA_TRACE("finish h=%lld waiter=%lld", h, w);
+    if (w) {
+        g_rq->push(w);
+        return;
     }
-    return 0;
+    if (g_detached && g_detached->erase(h)) {
+        NOVA_TRACE("finish-reap-detached h=%lld", h);
+        reinterpret_cast<nova_coro_fn *>(h)[1](reinterpret_cast<void *>(h));
+    } else {
+        NOVA_TRACE("finish-orphan h=%lld (no waiter, not detached: leaked frame)", h);
+    }
+}
+
+// Drive the reactor run queue to quiescence: resume each queued coroutine (a nested await or a
+// spawn), and on completion run reactor_finish. Single reactor thread, so no lock.
+static void reactor_pump() {
+    while (g_rq && !g_rq->empty()) {
+        long long h = g_rq->front();
+        g_rq->pop();
+        if (raw_coro_done(h)) { NOVA_TRACE("pump skip-done h=%lld", h); continue; }
+        NOVA_TRACE("pump resume h=%lld", h);
+        raw_coro_resume(h);
+        bool done = raw_coro_done(h);
+        NOVA_TRACE("pump post-resume h=%lld done=%d", h, (int)done);
+        if (done) reactor_finish(h);
+    }
+    NOVA_TRACE("pump drained");
+}
+
+// Drive a coroutine directly from a Nova-owned reactor loop, bypassing Asio (self-hosted runtime,
+// phase 4 and 6). The coroutine was created unscheduled (coroStart) and registered its fd with the
+// reactor before suspending; when the fd is ready the reactor calls this with the handle. Resumes
+// it, then drives the run queue so any nested awaits or spawns run on the reactor too. Returns 1 if
+// the top coroutine finished (its frame is reaped), 0 if it suspended again.
+extern "C" long long nova_reactor_resume(long long h) {
+    if (!g_rq) {
+        g_rq = new std::queue<long long>();
+        g_reactor_mode = true;
+    }
+    if (!h || raw_coro_done(h)) return 1;
+    NOVA_TRACE("reactor_resume enter h=%lld", h);
+    raw_coro_resume(h);
+    bool done = raw_coro_done(h);
+    NOVA_TRACE("reactor_resume post h=%lld done=%d", h, (int)done);
+    if (done) reactor_finish(h);
+    reactor_pump();
+    NOVA_TRACE("reactor_resume exit h=%lld ret=%d", h, done ? 1 : 0);
+    return done ? 1 : 0;
 }
 
 // Share-nothing multi-core (self-hosted runtime, phase 4). Spawn n OS threads, each running the
@@ -702,6 +785,7 @@ long long nova_aserver_listen_addr(long long host, long long port) {
 }
 
 void nova_aaccept(long long server, long long self) {
+    NOVA_REACTOR_GUARD("aaccept");
     auto *a = reinterpret_cast<NovaAcceptor *>(server);
     auto state = get_coro_state(self);
     auto *ns = new NovaSocket(g_reactors[state->reactor_id]->io);
@@ -715,6 +799,7 @@ void nova_aaccept(long long server, long long self) {
 }
 
 void nova_aconnect(long long host, long long port, long long self) {
+    NOVA_REACTOR_GUARD("aconnect");
     auto state = get_coro_state(self);
     const char *h = reinterpret_cast<const char *>(host);
     int hlen = h ? *reinterpret_cast<const int *>(h - 4) : 0;
@@ -752,6 +837,7 @@ static inline bool nova_io_bad_socket(NovaSocket *s, long long self) {
 }
 
 void nova_arecv(long long sock, long long buf, long long max_len, long long self) {
+    NOVA_REACTOR_GUARD("arecv");
     auto *s = reinterpret_cast<NovaSocket *>(sock);
     if (nova_io_bad_socket(s, self)) return;
     auto state = get_coro_state(self);
@@ -764,6 +850,7 @@ void nova_arecv(long long sock, long long buf, long long max_len, long long self
 }
 
 void nova_arecv_deadline(long long sock, long long buf, long long max_len, long long ms, long long self) {
+    NOVA_REACTOR_GUARD("arecv_deadline");
     auto *s = reinterpret_cast<NovaSocket *>(sock);
     if (nova_io_bad_socket(s, self)) return;
     auto state = get_coro_state(self);
@@ -790,6 +877,7 @@ void nova_arecv_deadline(long long sock, long long buf, long long max_len, long 
 }
 
 void nova_asend(long long sock, long long data, long long self) {
+    NOVA_REACTOR_GUARD("asend");
     auto *s = reinterpret_cast<NovaSocket *>(sock);
     if (nova_io_bad_socket(s, self)) return;
     auto state = get_coro_state(self);
@@ -815,6 +903,7 @@ void nova_aclose(long long sock) {
 
 void nova_await_timer(long long handle, long long ms) {
     if (!handle) return;
+    NOVA_REACTOR_GUARD("sleep/timer");
     auto timer = std::make_shared<boost::asio::steady_timer>(
         g_io, std::chrono::milliseconds(ms < 0 ? 0 : ms));
     timer->async_wait([handle, timer](const boost::system::error_code &) {

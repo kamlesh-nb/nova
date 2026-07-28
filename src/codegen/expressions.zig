@@ -1959,6 +1959,11 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     // the handle for the reactor to drive thereafter.
                     if (call.args.len == 1) {
                         if (try self.awaitedCallHandle(call.args[0], true)) |h| {
+                            // Mark this as a top-level (detached) coroutine so the reactor reaps it
+                            // when it finishes; a spawned-and-awaited coroutine is reaped by its await.
+                            const detach_fn = self.func_map.get("nova_reactor_detach").?;
+                            var da = [_]types.LLVMValueRef{h};
+                            _ = try self.buildCallWithCasts(detach_fn, &da);
                             const resume_fn = self.func_map.get("nova_reactor_resume").?;
                             var ra = [_]types.LLVMValueRef{h};
                             _ = try self.buildCallWithCasts(resume_fn, &ra);

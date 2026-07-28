@@ -9,7 +9,7 @@ truth for progress; the phase details are below.
 |-------|---------------------------|--------|--------|-------|
 | Foundation | Event loop, buffers, HTTP parser, poll and socket layer, multi-core | none | DONE | `self-hosted-runtime.md` phases 1 to 5; race-free under `--tsan` |
 | M0 | Tooling: file-based runtime trace, symbol audit | none | DONE | `NOVA_TRACE=<file>` trace (surfaces reliably), `tools/runtime-symbol-audit.sh` (221 exported / 203 referenced) |
-| M1 | Async scheduler migration (per-reactor run queue) | M0 | WIP | Single-level await works; multi-level and spawn hang; reverted, diff at `scheduler-migration-wip.patch` |
+| M1 | Async scheduler migration (per-reactor run queue) | M0 | DONE | Nested/multi-level `await` and `spawn`+`await` drain on the reactor (corpus 199, trace-proven); Asio-backed awaits on the reactor now fail fast via `nova_reactor_io_violation` instead of silently orphaning (their migration is M2) |
 | M2 | Async socket I/O on the reactor | M1 | TODO | `arecv`/`asend`/`aconnect`/`aaccept` in Nova over `os/sys` |
 | M3 | Database drivers on the reactor | M2 | TODO | No driver change; they already speak the async seam |
 | M4 | Retire Boost.Asio | M1 to M3 | TODO | Remove reactors, strands, `g_io`; drop vendored Boost |
@@ -140,12 +140,23 @@ phase removes a real dependency and is independently verifiable.
 
 - **M0. Tooling.** The file-based trace and the symbol audit above. Gate: the trace shows the
   scheduler sequence on the failing multi-level-await case.
-- **M1. Finish the async scheduler migration.** Complete the per-reactor run queue so nested `await`
-  and `spawn` are driven by the reactor, not Asio. The work-in-progress diff is at
-  `scheduler-migration-wip.patch`; the remaining bug is in the completion-and-requeue path for a
-  queued coroutine that suspends on its own nested await. Prereq: M0. Gate: multi-level await and
-  `spawn`+`await` on the reactor pass, corpus and ASAN and TSan green. This is the keystone; nothing
-  downstream proceeds without it.
+- **M1. Async scheduler migration. DONE.** The per-reactor run queue (`g_rq`, thread-local, entered
+  by `nova_reactor_resume`) drives nested `await` and `spawn` on the reactor thread instead of Asio.
+  When a reactor-driven coroutine schedules a child (nested await) or a spawn, `nova_sched_schedule`
+  pushes onto `g_rq`; `reactor_pump` drains it to quiescence, running `reactor_finish` (release held
+  args, hand completion to the awaiter, or reap a detached top-level coroutine) on each completion.
+  Off reactor threads (`g_reactor_mode` false) the Asio path is unchanged, so the existing
+  `NOVA_THREADS` deployment does not regress. Verified with `NOVA_TRACE`: the earlier "multi-level
+  hangs" report was a conflation. Multi-level await (`top -> await middle -> await leaf`) and
+  two-`spawn`+`await` both drain correctly and synchronously through the queue (corpus case 199).
+  The genuine boundary the trace pinned down is different: an `await` that suspends on an
+  **Asio-backed** primitive (`sleep`/timer, `arecv`, `asend`, `aconnect`, `aaccept`) can never
+  complete on the reactor, because the reactor thread runs its own poll loop and never runs the Asio
+  `io_context`, so the completion is orphaned. That is not a scheduler bug; it is exactly what M2
+  removes. Until then those primitives fail fast on a reactor thread via `nova_reactor_io_violation`
+  (a clear diagnostic naming the primitive, then `abort`), so the unsupported combination is loud
+  instead of a silent hang or wrong value. Gate: corpus (incl. 199) and ASAN green; the Asio-abort
+  path is proven out-of-corpus (a corpus case cannot abort). This unblocks M2.
 - **M2. Async socket I/O onto the reactor.** Reimplement `nova_arecv`, `nova_asend`, `nova_aconnect`,
   `nova_aaccept`, and the listen path in Nova over `os/sys` non-blocking sockets driven by the reactor,
   retiring the Asio versions in `concurrency.cpp`. Prereq: M1. Gate: an async client and server round
@@ -207,8 +218,9 @@ step in this plan may change without a coordinated code-generation change:
 
 ## Risks
 
-- **The scheduler completion path (M1).** The known-hard bug. Mitigated by M0 tooling and by verifying
-  under `--tsan` before it lands.
+- **The scheduler completion path (M1). Resolved.** The run queue drains nested await and spawn on
+  the reactor (corpus 199, trace-proven). The reactor-vs-Asio I/O boundary it exposed is guarded by
+  a loud abort (`nova_reactor_io_violation`) and closed by M2.
 - **The ABI seam.** A careless change to a code-generation-emitted symbol corrupts memory in a way
   that lands far from the cause. Mitigated by rule 4 and by the ASAN gate, which is the authority on
   ownership changes.
@@ -222,6 +234,9 @@ step in this plan may change without a coordinated code-generation change:
 Already in Nova: the event loop (`net/reactor`), the buffer pools (`io/slab`, `io/arena`), the HTTP
 parser (`web/httpparser`), the poll and socket layer (`os/sys`, `os/kqueue`, `os/epoll`), and the
 share-nothing multi-core driver. Verified: a single reactor on one core out-throughputs the tuned
-frameworks' eight-core numbers; the reactor is race-free under `--tsan`. Blocked: M1, the scheduler
-migration, which gates M2 through M4 and therefore the whole retirement. Next action: M0 tooling, then
-M1.
+frameworks' eight-core numbers; the reactor is race-free under `--tsan`. Done: M0 (trace tooling) and
+M1 (the scheduler migration) both landed. The reactor now drives nested `await` and `spawn`; the one
+remaining reactor-vs-Asio boundary (Asio-backed I/O awaited on a reactor coroutine) is guarded loud
+and is exactly what M2 removes. Next action: M2, moving `arecv`/`asend`/`aconnect`/`aaccept` onto the
+reactor over `os/sys`, which lets the database drivers and the flagship's per-request DB run on the
+reactor with no driver change.

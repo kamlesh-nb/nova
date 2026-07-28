@@ -708,6 +708,10 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         const run_reactors_type = core.LLVMFunctionType(void_type, &run_reactors_p, 2, 0);
         try compiler.func_map.put("nova_run_reactors", core.LLVMAddFunction(compiler.module, "nova_run_reactors", run_reactors_type));
 
+        var detach_p = [_]types.LLVMTypeRef{val_type};
+        const detach_type = core.LLVMFunctionType(void_type, &detach_p, 1, 0);
+        try compiler.func_map.put("nova_reactor_detach", core.LLVMAddFunction(compiler.module, "nova_reactor_detach", detach_type));
+
         const void_noarg_type = core.LLVMFunctionType(void_type, null, 0, 0);
         try compiler.func_map.put("nova_hold_all_reactors", core.LLVMAddFunction(compiler.module, "nova_hold_all_reactors", void_noarg_type));
 
