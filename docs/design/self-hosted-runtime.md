@@ -293,6 +293,34 @@ Each phase ends with a measurement or a conformance gate, so we never fly blind 
   the largest and most delicate remaining item because it touches the coroutine ABI the whole async
   stack depends on, and it must be done under the `--tsan` gate. Once it lands, the whole async
   `App` (mediator, DI, middleware, and eventually the reactor-native DB drivers) runs on the loop.
+
+  **Scheduler migration ATTEMPTED (2026-07-28), partially working, reverted.** The approach above
+  was implemented: a thread-local reactor run queue, `nova_sched_schedule` diverting to it in reactor
+  mode, a `reactor_finish`/`reactor_pump` that resumes waiters on completion, and a `nova_reactor
+  _detach` so top-level coroutines are reaped while spawned-and-awaited ones survive for their await.
+  Result: a SINGLE-level nested `await` on the reactor now works (the previously-deadlocking test
+  passes), but a MULTI-level nested await (a coroutine that itself awaits) and `spawn`+`await` still
+  hang. The bug is in the completion-and-requeue path for a queued coroutine that suspends on its own
+  nested await; it was not root-caused because runtime `fprintf` diagnostics did not surface in this
+  environment (a binary-caching layer), and shipping a scheduler with known hangs is not acceptable.
+  The change was reverted to keep the committed reactor stack clean; the work-in-progress diff is
+  preserved at `docs/design/scheduler-migration-wip.patch` for the next attempt, which should be done
+  with a working debugger or a file-based trace, and verified under `--tsan`. The single-reactor
+  drive (phases 4 and 5) is unaffected and remains solid.
+
+## North star: retire the C++ runtime, build the runtime in Nova
+
+The whole of this document serves one long-term goal, namely that Nova should stand on itself. The
+C++ runtime (`src/runtime/`) was a reasonable bootstrap, but the direction is to replace it, piece by
+piece, with Nova code over a thin FFI, until Boost.Asio and then the rest of the C++ can be retired.
+The work so far already moves several pieces into Nova: the event loop, the buffer pools, the HTTP
+parser, and the poll and socket layers are all Nova now. What remains in C++ is the coroutine
+intrinsics glue (which is really LLVM), the async scheduler (the migration above), the allocator, the
+channels and actors, and the wolfSSL TLS pump. The order that keeps each step verifiable is: finish
+the scheduler migration (so the reactor owns scheduling), then move the DB drivers onto the reactor,
+then retire Asio, then port the remaining runtime services (allocator, channels, actors) to Nova over
+FFI, keeping the corpus, ASAN, and TSan gates green throughout. The endpoint is a Nova runtime written
+in Nova, with only a minimal syscall and crypto FFI surface underneath.
 - **Phase 7. io_uring completion backend** on Linux, and `sendfile`/`splice` for static content.
 - **Retirement.** Keep Asio as a fallback until the Nova loop meets or beats it on the
   head-to-head, then remove the Boost dependency and delete the Asio path.

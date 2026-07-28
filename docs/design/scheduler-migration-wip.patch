@@ -1,0 +1,136 @@
+diff --git a/src/codegen/declarations.zig b/src/codegen/declarations.zig
+index 6510a38..34fd0e8 100644
+--- a/src/codegen/declarations.zig
++++ b/src/codegen/declarations.zig
+@@ -702,6 +702,10 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
+         const run_reactors_type = core.LLVMFunctionType(void_type, &run_reactors_p, 2, 0);
+         try compiler.func_map.put("nova_run_reactors", core.LLVMAddFunction(compiler.module, "nova_run_reactors", run_reactors_type));
+ 
++        var detach_p = [_]types.LLVMTypeRef{val_type};
++        const detach_type = core.LLVMFunctionType(void_type, &detach_p, 1, 0);
++        try compiler.func_map.put("nova_reactor_detach", core.LLVMAddFunction(compiler.module, "nova_reactor_detach", detach_type));
++
+         const void_noarg_type = core.LLVMFunctionType(void_type, null, 0, 0);
+         try compiler.func_map.put("nova_hold_all_reactors", core.LLVMAddFunction(compiler.module, "nova_hold_all_reactors", void_noarg_type));
+ 
+diff --git a/src/codegen/expressions.zig b/src/codegen/expressions.zig
+index 184a2a1..b935552 100644
+--- a/src/codegen/expressions.zig
++++ b/src/codegen/expressions.zig
+@@ -1959,6 +1959,11 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
+                     // the handle for the reactor to drive thereafter.
+                     if (call.args.len == 1) {
+                         if (try self.awaitedCallHandle(call.args[0], true)) |h| {
++                            // Mark this as a top-level (detached) coroutine so the reactor reaps it
++                            // when it finishes; a spawned-and-awaited coroutine is reaped by its await.
++                            const detach_fn = self.func_map.get("nova_reactor_detach").?;
++                            var da = [_]types.LLVMValueRef{h};
++                            _ = try self.buildCallWithCasts(detach_fn, &da);
+                             const resume_fn = self.func_map.get("nova_reactor_resume").?;
+                             var ra = [_]types.LLVMValueRef{h};
+                             _ = try self.buildCallWithCasts(resume_fn, &ra);
+diff --git a/src/runtime/concurrency.cpp b/src/runtime/concurrency.cpp
+index eb17bf5..69b5a77 100644
+--- a/src/runtime/concurrency.cpp
++++ b/src/runtime/concurrency.cpp
+@@ -13,6 +13,7 @@
+ #include <queue>
+ #include <thread>
+ #include <unordered_map>
++#include <unordered_set>
+ #include <vector>
+ 
+ extern "C" long long __nova_main(void);
+@@ -287,10 +288,29 @@ void nova_coro_hold_arg(long long coro, long long ptr, void (*dtor)(long long))
+     s.map[coro].push_back({ptr, dtor});
+ }
+ 
++// Per-reactor-thread run queue for the self-hosted runtime (docs/design/self-hosted-runtime.md,
++// phase 6). When a thread is in reactor mode, nested awaits and spawns (nova_sched_schedule) are
++// pushed onto this queue and driven by the reactor loop, instead of being posted to Asio. This is
++// what lets an `async fn` handler with nested `await` run on the Nova reactor. Off reactor threads
++// (g_reactor_mode false) the existing Asio path is used unchanged.
++thread_local std::queue<long long> *g_rq = nullptr;
++thread_local bool g_reactor_mode = false;
++// Top-level (fire-and-forget) reactor coroutines, e.g. a connection handler from coroStart.
++// These are reaped when they finish. A spawned-and-awaited coroutine is NOT here: it is reaped by
++// its awaiter (via nova_coro_release), so it must survive completion until the await reads it.
++thread_local std::unordered_set<long long> *g_detached = nullptr;
++
++extern "C" void nova_reactor_detach(long long h) {
++    if (!g_detached) g_detached = new std::unordered_set<long long>();
++    g_detached->insert(h);
++}
++
+ void nova_sched_schedule(long long handle) {
+     if (!handle) return;
+     if (raw_coro_done(handle)) return;
+ 
++    if (g_reactor_mode) { g_rq->push(handle); return; }
++
+     auto state = get_coro_state(handle);
+     {
+         std::lock_guard<std::mutex> lk(state->mu);
+@@ -381,21 +401,50 @@ void nova_sched_schedule(long long handle) {
+     });
+ }
+ 
+-// Drive a coroutine directly from a Nova-owned reactor loop, bypassing Asio entirely (the
+-// self-hosted runtime, docs/design/self-hosted-runtime.md phase 4). The coroutine was created
+-// unscheduled (coroStart) and registered its fd with the reactor before suspending (coroSuspend);
+-// when the fd is ready, the reactor calls this with the coroutine handle. Returns 1 if the
+-// coroutine finished (its frame is reaped here), 0 if it suspended again. Single reactor thread,
+-// so no CoroState, no mutex: this is the lockless per-reactor drive.
++// A coroutine on the reactor finished. Release its held args, then: if it has a waiter, hand
++// completion to the waiter (which reads the result and destroys the frame via nova_coro_release);
++// else if it is a top-level (detached) coroutine, reap it now; else (a spawned coroutine not yet
++// awaited) leave the frame alive so the eventual await can read it and reap it.
++static void reactor_finish(long long h) {
++    nova_coro_release_held(h);
++    long long w = take_waiter(h);
++    if (w) {
++        g_rq->push(w);
++        return;
++    }
++    if (g_detached && g_detached->erase(h)) {
++        reinterpret_cast<nova_coro_fn *>(h)[1](reinterpret_cast<void *>(h));
++    }
++}
++
++// Drive the reactor run queue to quiescence: resume each queued coroutine (a nested await or a
++// spawn), and on completion run reactor_finish. Single reactor thread, so no lock.
++static void reactor_pump() {
++    while (g_rq && !g_rq->empty()) {
++        long long h = g_rq->front();
++        g_rq->pop();
++        if (raw_coro_done(h)) continue;
++        raw_coro_resume(h);
++        if (raw_coro_done(h)) reactor_finish(h);
++    }
++}
++
++// Drive a coroutine directly from a Nova-owned reactor loop, bypassing Asio (self-hosted runtime,
++// phase 4 and 6). The coroutine was created unscheduled (coroStart) and registered its fd with the
++// reactor before suspending; when the fd is ready the reactor calls this with the handle. Resumes
++// it, then drives the run queue so any nested awaits or spawns run on the reactor too. Returns 1 if
++// the top coroutine finished (its frame is reaped), 0 if it suspended again.
+ extern "C" long long nova_reactor_resume(long long h) {
++    if (!g_rq) {
++        g_rq = new std::queue<long long>();
++        g_reactor_mode = true;
++    }
+     if (!h || raw_coro_done(h)) return 1;
+     raw_coro_resume(h);
+-    if (raw_coro_done(h)) {
+-        nova_coro_release_held(h);
+-        reinterpret_cast<nova_coro_fn *>(h)[1](reinterpret_cast<void *>(h));
+-        return 1;
+-    }
+-    return 0;
++    bool done = raw_coro_done(h);
++    if (done) reactor_finish(h);
++    reactor_pump();
++    return done ? 1 : 0;
+ }
+ 
+ // Share-nothing multi-core (self-hosted runtime, phase 4). Spawn n OS threads, each running the
