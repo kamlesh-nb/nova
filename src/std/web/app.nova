@@ -444,11 +444,11 @@ pub struct App {
     }
 
     pub fn run(self: App, port: int): void {
-        // Default to the Nova reactor (no Asio): share-nothing across the available cores. Fall back
-        // to the Asio server for TLS, which is not yet on the reactor, or when NOVA_ASIO=1 forces it
-        // (an escape hatch while the reactor path settles).
+        // Default to the Nova reactor (no Asio): share-nothing across the available cores, TLS
+        // included (the reactor now runs inbound TLS via serveReactorConn). NOVA_ASIO=1 forces the
+        // Asio server (an escape hatch while the reactor path settles).
         let forceAsio = env.get("NOVA_ASIO").length > 0;
-        if (self.tlsEnabled || forceAsio) {
+        if (forceAsio) {
             asyncio.holdReactors();
             runServer(self, port);
             return;
@@ -740,6 +740,17 @@ async fn handleConnTls(app: App, client: long): int {
 pub async fn serveReactorConn(app: App, fd: int, kq: int): int {
     let s = asyncio.AsyncStream(fd as long);
     s.kq = kq;
+    if (app.tlsEnabled) {
+        // Inbound TLS on the reactor: the wolfSSL memory-BIO pump (TlsStream) does its socket I/O
+        // through the reactor-native AsyncStream, so the handshake and data path run on the reactor,
+        // no Asio. TlsStream itself is an AsyncIO, so handleConn is unchanged.
+        let tls = await asynctls.tlsAccept(s, app.tlsCert, app.tlsKey);
+        if (!tls.ok()) {
+            tls.close();
+            return -1;
+        }
+        return await handleConn(app, tls);
+    }
     return await handleConn(app, s);
 }
 
