@@ -319,6 +319,75 @@ thread_local long long g_current_kq = 0;
 extern "C" void nova_reactor_set_current(long long kq) { g_current_kq = kq; }
 extern "C" long long nova_reactor_current(void) { return g_current_kq; }
 
+// Cross-reactor wakeup (M4): the keystone for retiring Asio. A coroutine scheduled from one reactor
+// thread can be handed to its owning reactor and wake that reactor's blocking poll. Each reactor
+// registers under an index with its kqueue; a thread-safe inbox holds handles posted from other
+// threads; an EVFILT_USER trigger wakes the target kqueue so its poll returns. Reactors are keyed by
+// a small index (0..N-1), not by a shared address, so nothing crosses threads except through the
+// mutex-guarded registry and the kernel trigger.
+namespace {
+struct WakeBox {
+    long long kq = 0;
+    std::mutex mu;
+    std::queue<long long> q;
+};
+std::mutex &g_wake_reg_mu = *new std::mutex();
+std::unordered_map<long long, WakeBox *> &g_wake_reg = *new std::unordered_map<long long, WakeBox *>();
+WakeBox *wake_box(long long idx) {
+    std::lock_guard<std::mutex> lk(g_wake_reg_mu);
+    auto it = g_wake_reg.find(idx);
+    return it == g_wake_reg.end() ? nullptr : it->second;
+}
+}
+
+extern "C" void nova_reactor_wake_register(long long idx, long long kq) {
+    WakeBox *b;
+    {
+        std::lock_guard<std::mutex> lk(g_wake_reg_mu);
+        auto it = g_wake_reg.find(idx);
+        if (it == g_wake_reg.end()) { b = new WakeBox(); g_wake_reg[idx] = b; }
+        else b = it->second;
+        b->kq = kq;
+    }
+#if defined(NOVA_HAVE_KQUEUE)
+    struct kevent ev;
+    EV_SET(&ev, 0, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, nullptr);
+    kevent((int)kq, &ev, 1, nullptr, 0, nullptr);
+#endif
+}
+
+// Post a handle to reactor `idx` from any thread, and wake its poll. Safe cross-thread: the inbox is
+// mutex-guarded and the EVFILT_USER trigger is kernel-synchronized.
+extern "C" void nova_reactor_post(long long idx, long long handle) {
+    WakeBox *b = wake_box(idx);
+    if (!b) return;
+    { std::lock_guard<std::mutex> lk(b->mu); b->q.push(handle); }
+#if defined(NOVA_HAVE_KQUEUE)
+    struct kevent ev;
+    EV_SET(&ev, 0, EVFILT_USER, 0, NOTE_TRIGGER, 0, nullptr);
+    kevent((int)b->kq, &ev, 1, nullptr, 0, nullptr);
+#endif
+}
+
+// Pop one handle posted to reactor `idx` (0 if empty). The reactor loop drains on an EVFILT_USER event.
+extern "C" long long nova_reactor_drain_one(long long idx) {
+    WakeBox *b = wake_box(idx);
+    if (!b) return 0;
+    std::lock_guard<std::mutex> lk(b->mu);
+    if (b->q.empty()) return 0;
+    long long h = b->q.front();
+    b->q.pop();
+    return h;
+}
+
+extern "C" long long nova_evfilt_user(void) {
+#if defined(NOVA_HAVE_KQUEUE)
+    return (long long)EVFILT_USER;
+#else
+    return 0;
+#endif
+}
+
 // Coroutines reaped during the current reactor poll batch. A deadline timer and a read can both be
 // ready in the same kevent batch for the same coroutine; if the read is processed first the
 // coroutine may finish and its frame be freed, so resuming it for the now-stale timer event would be

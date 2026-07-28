@@ -1,0 +1,77 @@
+// M4 keystone of the C++ runtime retirement plan: cross-reactor wakeup, no Asio. A coroutine
+// scheduled on one reactor thread can be handed to the reactor that owns it and wake that reactor's
+// blocking poll. This is what the share-nothing reactor lacked and Asio provided (post to another
+// strand), and it is the prerequisite for moving the multi-threaded async driver (nova_run_root) and
+// cross-thread channels/actors off Asio. The mechanism: a reactor registers under an index with its
+// kqueue; another thread posts a handle to that index (thread-safe inbox) and fires an EVFILT_USER
+// trigger that wakes the target kqueue; the reactor drains the posted handles on the EVFILT_USER event.
+import assert;
+import bytes;
+import net.reactor;
+
+// Same-thread: a posted handle wakes the poll and is drained. Proves the trigger + inbox + drain.
+@test
+fn test_self_wake(): void {
+    let r = reactor.Reactor(16, 1024, 4);
+    r.registerWake(5);
+    reactor.post(5, 42);
+
+    let got = 0;
+    let n = r.poll(1000);
+    let i = 0;
+    while (i < n) {
+        if (r.readyFilter(i) == reactor.evfiltUser()) {
+            let h = reactor.drainWake(5);
+            while (h != 0) { got = h as int; h = reactor.drainWake(5); }
+        }
+        i = i + 1;
+    }
+    assert.equalInt(got, 42);
+    r.destroy();
+}
+
+struct WakeCtx {
+    pub result: long,
+    init(result: long) { self.result = result; }
+}
+
+// One capturable context so the reactor-worker closure needs a single capture.
+fn wakeWorker(ctx: WakeCtx, idx: int): void {
+    if (idx == 0) {
+        // Receiver: own a reactor, register under index 0, block in poll until woken from the other
+        // thread, then drain the handle it was posted.
+        let r = reactor.Reactor(16, 1024, 4);
+        r.registerWake(0);
+        let n = r.poll(5000);
+        let i = 0;
+        while (i < n) {
+            if (r.readyFilter(i) == reactor.evfiltUser()) {
+                let h = reactor.drainWake(0);
+                while (h != 0) { bytes.write_i32(ctx.result, 0, h); h = reactor.drainWake(0); }
+            }
+            i = i + 1;
+        }
+        r.destroy();
+    } else {
+        // Sender: wait (monotonic-clock spin, no shared memory) so the receiver has registered, then
+        // post a handle to reactor index 0 from this other thread.
+        let start = nova_mono_ms();
+        while (nova_mono_ms() - start < (300 as long)) { let _ = start; }
+        reactor.post(0, 777);
+    }
+}
+
+@test
+fn test_cross_reactor_wakeup(): void {
+    let cell = bytes.alloc(4);
+    bytes.write_i32(cell, 0, 0);
+    let ctx = WakeCtx(cell);
+
+    // Two share-nothing reactor threads: index 0 receives, index 1 posts across the thread boundary.
+    reactor.runReactors(2, (idx) => {
+        wakeWorker(ctx, idx);
+    });
+
+    assert.equalInt(bytes.read_i32(cell, 0) as int, 777);
+    bytes.free(cell);
+}

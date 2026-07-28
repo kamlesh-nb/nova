@@ -733,6 +733,21 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         const mono_ms_type = core.LLVMFunctionType(val_type, null, 0, 0);
         try compiler.func_map.put("nova_mono_ms", core.LLVMAddFunction(compiler.module, "nova_mono_ms", mono_ms_type));
 
+        var wake_reg_p = [_]types.LLVMTypeRef{ val_type, val_type };
+        const wake_reg_type = core.LLVMFunctionType(void_type, &wake_reg_p, 2, 0);
+        try compiler.func_map.put("nova_reactor_wake_register", core.LLVMAddFunction(compiler.module, "nova_reactor_wake_register", wake_reg_type));
+
+        var post_p = [_]types.LLVMTypeRef{ val_type, val_type };
+        const post_type = core.LLVMFunctionType(void_type, &post_p, 2, 0);
+        try compiler.func_map.put("nova_reactor_post", core.LLVMAddFunction(compiler.module, "nova_reactor_post", post_type));
+
+        var drain_p = [_]types.LLVMTypeRef{val_type};
+        const drain_type = core.LLVMFunctionType(val_type, &drain_p, 1, 0);
+        try compiler.func_map.put("nova_reactor_drain_one", core.LLVMAddFunction(compiler.module, "nova_reactor_drain_one", drain_type));
+
+        const evfilt_user_type = core.LLVMFunctionType(val_type, null, 0, 0);
+        try compiler.func_map.put("nova_evfilt_user", core.LLVMAddFunction(compiler.module, "nova_evfilt_user", evfilt_user_type));
+
         const void_noarg_type = core.LLVMFunctionType(void_type, null, 0, 0);
         try compiler.func_map.put("nova_hold_all_reactors", core.LLVMAddFunction(compiler.module, "nova_hold_all_reactors", void_noarg_type));
 

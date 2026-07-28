@@ -89,6 +89,10 @@ pub const externs = [_]Builtin{
     .{ .receiver = "", .name = "nova_reactor_cancel_timer", .ret = .void_ },
     .{ .receiver = "", .name = "nova_reactor_batch_begin", .ret = .void_ },
     .{ .receiver = "", .name = "nova_mono_ms", .ret = .long },
+    .{ .receiver = "", .name = "nova_reactor_wake_register", .ret = .void_ },
+    .{ .receiver = "", .name = "nova_reactor_post", .ret = .void_ },
+    .{ .receiver = "", .name = "nova_reactor_drain_one", .ret = .long },
+    .{ .receiver = "", .name = "nova_evfilt_user", .ret = .long },
 
     .{ .receiver = "", .name = "nova_hold_all_reactors", .ret = .void_ },
 

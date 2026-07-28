@@ -36,6 +36,17 @@ pub fn currentKq(): int { return nova_reactor_current() as int; }
 // of resuming its freed frame. Required by any loop that uses read deadlines (recvIntoDeadline).
 pub fn batchBegin(): void { nova_reactor_batch_begin(); }
 
+// Cross-reactor wakeup (M4 keystone). A reactor registers under a small index with its kqueue
+// (registerWake); another thread hands it a coroutine handle and wakes its blocking poll (post);
+// the reactor drains the handles it was posted (drainWake) when its poll reports an EVFILT_USER
+// event (readyFilter(i) == evfiltUser()). This is what lets a coroutine scheduled on one reactor
+// thread be resumed on the reactor that owns it, i.e. cross-thread channels and actors without Asio.
+pub fn registerWake(self: Reactor, idx: int): void { nova_reactor_wake_register(idx as long, self.kq as long); }
+pub fn post(idx: int, handle: long): void { nova_reactor_post(idx as long, handle); }
+pub fn drainWake(idx: int): long { return nova_reactor_drain_one(idx as long); }
+pub fn readyFilter(self: Reactor, i: int): int { return kqueue.evFilter(self.eventBuf, i); }
+pub fn evfiltUser(): int { return nova_evfilt_user() as int; }
+
 pub struct Reactor {
     pub kq: int,
     pub eventBuf: long,
