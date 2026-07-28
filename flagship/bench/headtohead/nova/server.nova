@@ -1,0 +1,27 @@
+// Nova peer for the head-to-head. Uses the real web.App framework (typed mediator
+// routing, the same stack the flagship uses), GET / returning a constant JSON body.
+import web.app;
+import web.response;
+import serde.source;
+import env;
+import string;
+
+@serializable pub struct Ping {
+    pub ok: int,
+    init() { self.ok = 1; }
+}
+
+pub struct PingHandler impl MessageHandler {
+    async fn handle(self: PingHandler, src: ValueSource): Response {
+        return json(`{"message":"Hello, World!"}`);
+    }
+}
+
+fn main(): void {
+    let app = App();
+    app.handle<Ping>(PingHandler{});
+    app.get<Ping>("/");
+    let p = env.get("PORT");
+    let port = if (p.length == 0) 8080 else string.parseI64(p) as int;
+    app.run(port);
+}

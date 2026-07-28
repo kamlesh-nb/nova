@@ -1,0 +1,75 @@
+# Head-to-head: Nova vs Go vs Rust vs C#
+
+A same-box, same-load comparison of end-to-end HTTP throughput. Each peer is a minimal
+server that answers `GET /` with the **same constant JSON body**
+(`{"message":"Hello, World!"}`, `Content-Type: application/json`). This is the
+TechEmpower "JSON serialization" shape, minus the serialization: a constant body isolates
+the **HTTP stack and framework overhead**, which is what differs between the languages.
+
+Unlike the sibling `compute_core` bench (which measures pure in-process CPU work and is
+NOT rps), these ARE real requests over TCP, measured with a load generator.
+
+## The peers (each idiomatic for its ecosystem)
+
+| Dir | Stack | Notes |
+|-----|-------|-------|
+| `nova/` | `web.App` | The real framework the flagship uses: typed mediator routing, per-request `ValueSource`, trait dispatch. |
+| `go/` | `net/http` | The standard library server. |
+| `rust/` | `axum` + `tokio` | The idiomatic async web stack. Release build: LTO, 1 codegen unit, panic=abort. |
+| `csharp/` | ASP.NET Core minimal API on Kestrel | `Results.Content` (constant string, no serializer). |
+
+## Running it
+
+```sh
+cd lang
+DUR=15s CONN=64 ./flagship/bench/headtohead/run.sh
+```
+
+The runner detects each toolchain, builds it in release, warms up, then loads with `oha`
+for `DUR` at `CONN` keep-alive connections. Missing toolchains or failed builds (for
+example, Rust with no crates.io access) are skipped, not fatal. `oha` is required.
+
+## Results (2026-07-28, Apple Silicon, 8 cores, 15s @ 64 connections)
+
+| Language (stack) | Requests/sec | Relative to Nova |
+|------------------|-------------:|-----------------:|
+| Rust (axum) | 143,120 | 2.94x |
+| Go (net/http) | 121,954 | 2.50x |
+| C# (ASP.NET minimal API) | 120,107 | 2.46x |
+| **Nova (web.App)** | **48,737** | 1.00x |
+
+## Honest reading
+
+Nova serves this workload at roughly **one third** of the tuned frameworks: about 2.5x
+behind Go and C#, and about 2.9x behind Rust. That is the real end-to-end story today, and
+it is worth stating plainly rather than leaning on the flattering compute-core number.
+
+Two things to keep separate:
+
+1. **This is not a codegen gap.** Nova compiles through LLVM, the same backend as Rust and
+   Clang, and the `compute_core` bench shows the per-request CPU work is already in the
+   native tier (about 1.95 microseconds for parse plus render). The throughput gap is in
+   everything around that: the socket and HTTP machinery, the coroutine scheduling, and
+   the per-request allocation traffic that ARC has to retain and release.
+
+2. **Framework versus framework, and the frameworks are not equal in maturity.** Go's
+   `net/http`, Rust's `axum`, and Kestrel have each had years of profiling and zero-copy,
+   zero-allocation tuning on the hot path. Nova's `web.App` is young, and it does real
+   per-request work here (typed mediator dispatch, a `ValueSource`, trait-object dispatch)
+   that a bare `net/http` handler does not. Part of the gap is the HTTP and I/O stack; part
+   is the framework doing more per request.
+
+So the placement is: **Nova's language and codegen belong in the Rust/Go/C# tier, but its
+web stack does not yet deliver that tier's throughput.** Closing the gap is engineering on
+the runtime and framework hot path (zero-copy request parsing, fewer per-request
+allocations, cheaper dispatch), not a change of compiler or memory model. The headroom is
+real and identifiable, which is the useful outcome of measuring instead of estimating.
+
+## Caveats
+
+- One machine, one load tool (`oha`), one connection count, keep-alive. Not a TechEmpower
+  submission. Absolute numbers move with hardware, connection count, and payload.
+- None of the peers is tuned; each is the straightforward minimal server. That is fair, but
+  it means the ceiling for every language here is higher than shown.
+- Nova was built with `--release` (`-O3`); Go with `go build`; Rust with
+  `cargo build --release` (LTO); C# with `dotnet publish -c Release`.

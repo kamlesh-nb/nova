@@ -61,6 +61,15 @@ An item is **never** ✅ on "it compiles" or "the happy path works" — only on 
   module ~82 KB; native binary ~142 KB. **For real end-to-end flagship HTTP throughput see the orchestrator
   perf bullet above: ~48.9k rps direct / 47.6k via proxy / 10.2k DB path.** The ~500k-vs-~49k gap is exactly
   the I/O + HTTP + scheduling cost this microbenchmark excludes (compute ~1.95 µs/req; the rest ~18 µs/req).
+- **Cross-language head-to-head (real HTTP rps) ✅** — `flagship/bench/headtohead/`: Nova `web.App` vs Go
+  `net/http` vs Rust `axum` vs C# ASP.NET minimal API, each answering `GET /` with the SAME constant JSON,
+  built release, loaded with `oha` 15s @ 64 conns. 8-core arm64: **Rust 143.1k, Go 122.0k, C# 120.1k, Nova
+  48.7k rps.** Nova is ~2.5–2.9× behind the tuned frameworks end-to-end. HONEST READ: this is NOT a codegen
+  gap (LLVM backend; the compute core is already native-tier, ~1.95 µs/req) — it is the young HTTP/IO stack +
+  ARC per-request allocation traffic + `web.App`'s per-request mediator dispatch (ValueSource + trait
+  dispatch) doing more than a bare handler. Closing it is runtime/framework hot-path engineering (zero-copy
+  parse, fewer allocs, cheaper dispatch), not a compiler or memory-model change. Placement: language/codegen
+  in the Rust/Go/C# tier, web stack not yet delivering that tier's throughput.
 
 ## ✅ Recently completed (2026-07-27 session) — network stack + hardening (all pushed, origin/main `561d9de`)
 
