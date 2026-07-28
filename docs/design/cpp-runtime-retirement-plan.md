@@ -12,7 +12,7 @@ truth for progress; the phase details are below.
 | M1 | Async scheduler migration (per-reactor run queue) | M0 | DONE | Nested/multi-level `await` and `spawn`+`await` drain on the reactor (corpus 199, trace-proven); Asio-backed awaits on the reactor now fail fast via `nova_reactor_io_violation` instead of silently orphaning (their migration is M2) |
 | M2 | Async socket I/O on the reactor | M1 | DONE | `net/reactorio` = reactor-native recv/send/connect/accept/resolve in Nova over `os/sys`; a thread-local current reactor; `asyncio.AsyncStream` dual-mode; `web/app.serveReactorConn`/`runReactor` run a whole request on the reactor. Corpus 200 to 204 (socketpair, loopback connect/accept, the AsyncStream seam, connect-by-name, and a full App request), all TSan clean. Remaining before flagship-DB-on-reactor (M3): multi-core reactor server (the `runReactors` worker cannot yet carry the App) and async DNS |
 | M3 | Database drivers on the reactor | M2 | DONE (mock) | The drivers connect via `asyncConnect` and do I/O through `AsyncStream`, both reactor-native from M2, so they run on the reactor with no driver change. Corpus 205: an App handler makes a per-request DB call (mock DB on the same reactor) end to end, no Asio, closing the PH6 deadlock. A live-driver run needs a reachable database; the driver code is unchanged |
-| M4 | Retire Boost.Asio | M1 to M3 | WIP (last step) | `App.run` reactor-only; timers/read-deadlines/inbound-TLS/when-any-deadline reactor-native; cross-reactor wakeup (corpus 210); and `nova_run_root` (the async @test/standalone driver) now runs on the reactor, so nothing on the running paths drives via Asio (the 5 Asio-primitive tests are retired). Remaining: delete the now-dead Asio socket primitives + `io_context`/strands/`g_io`, and drop vendored Boost from `build.zig` |
+| M4 | Retire Boost.Asio | M1 to M3 | DONE | The async runtime is reactor-native end to end: `nova_sched_schedule` is just the run queue, timers/deadlines/TLS/sockets are reactor-native, `nova_run_root` drives async on the reactor, and the multi-core server uses the share-nothing reactor. The Asio `io_context`/strands/thread-pool/`CoroState` and socket primitives are deleted (the latter kept as loud abort stubs for the dead codegen branch); the `<boost/asio.hpp>` include, the Boost build flags, and the vendored `deps/boost` (~7MB) are gone. Native 198, ASAN 365, TSan 215, no Boost |
 | M5 | File and directory I/O in Nova | M4 (soft) | TODO | `nova_file_*`, `nova_dir_*` over `os/sys` |
 | M6 | Process and primitive shims | none | TODO | `core.cpp` shims to `os/sys`; tiny atomics FFI stays |
 | M7 | Channels and actors in Nova | M1, M6 | TODO | Over the reactor; verify under `--tsan` |
@@ -222,7 +222,7 @@ phase removes a real dependency and is independently verifiable.
   and the three coroutines complete with no ASAN leak. Prereq: M2. Gate: the flagship per-request
   database path works on the reactor (done, mock); a live-driver round trip additionally needs a
   reachable database, with the driver code unchanged. Native 198, ASAN 365, TSan 211.
-- **M4. Retire Boost.Asio. WIP.** With the scheduler (M1), async I/O (M2), and databases (M3) on the
+- **M4. Retire Boost.Asio. DONE.** With the scheduler (M1), async I/O (M2), and databases (M3) on the
   reactor, remove the Asio reactors, strands, the `g_io` context, and the Asio socket/timer code from
   `concurrency.cpp`, and drop the vendored Boost from the build. Prereq: M1 to M3. Progress this far:
   - **Done: the reactor is the default server path.** `App.run` routes through `runReactorMC` (the
@@ -358,10 +358,4 @@ reactor, proven with a mock) all landed. The reactor drives nested `await` and `
 connect, accept, and resolve are reactor-native in Nova over `os/sys`; `AsyncStream` is dual-mode; a
 whole App request runs on the reactor; the flagship pattern (a handler's per-request database call)
 runs end to end on the reactor with no Asio, closing the PH6 deadlock; and the App serves share-nothing
-multi-core (`runReactorMC`, `SO_REUSEPORT`). M4 is nearly done: `App.run` is reactor-only, the
-`NOVA_ASIO` fallback is retired, and timers, read deadlines, and inbound TLS are all reactor-native.
-Nothing on the web path uses Asio. Verified by corpus 199 to 209 plus a live `curl -k https://`
-TLSv1.3 test, all TSan clean. The final step to drop Boost is a real refactor, not a deletion: Boost
-still backs `nova_run_root` (the multi-threaded async `@test`/standalone driver, TSan at 4 threads) and
-5 Asio-primitive corpus tests. Cross-reactor wakeup (corpus 210) and `nova_run_root` on the reactor are both in, so nothing on the running paths drives via Asio (the 5 Asio-primitive tests are retired). Last step: delete the now-dead Asio socket primitives + `io_context`/strands/`g_io`, and drop vendored Boost from `build.zig`. Also pending: a live-driver round trip against a reachable
-database (driver code unchanged) and async DNS.
+multi-core (`runReactorMC`, `SO_REUSEPORT`). M4 is DONE: the async runtime is reactor-native end to end and Boost.Asio is gone. `nova_sched_schedule` is just the reactor run queue; timers, read deadlines, whole-operation deadlines, inbound TLS, and sockets are reactor-native; `nova_run_root` drives async  and standalone async on a single-threaded reactor; and the multi-core server is share-nothing. The Asio io_context/strands/thread-pool/CoroState and the async socket primitives are deleted (the primitives kept as loud abort stubs for the now-dead AsyncStream codegen branch), the `<boost/asio.hpp>` include and Boost build flags are removed, and vendored `deps/boost` (~7MB) is deleted. Native 198, ASAN 365, TSan 215, all with no Boost. Remaining follow-ons (not blocking): a live-driver round trip against a reachable database (driver code unchanged), async DNS, and the Linux epoll reactor driver for `nova_run_root`; then M5 onward (file I/O, core.cpp shims, allocator, TLS-protocol-in-Nova).
