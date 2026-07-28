@@ -1,0 +1,37 @@
+// M4 first step of the C++ runtime retirement plan: reactor-native timers, no Asio. `await sleep`
+// on a reactor coroutine arms an EVFILT_TIMER on the reactor's own kqueue (keyed by the coroutine
+// handle); the reactor loop resumes the coroutine when it fires, exactly like a ready fd. This
+// removes the Asio steady_timer for reactor coroutines and restores read-timeout / sleep support on
+// the reactor (the gap that making the reactor the default server introduced).
+import assert;
+import bytes;
+import net.reactor;
+import net.asyncio;
+
+async fn sleeper(cell: long): void {
+    await asyncio.sleep(15);
+    bytes.write_i32(cell, 0, 42);
+}
+
+@test
+fn test_reactor_native_timer_resumes_coroutine(): void {
+    let r = reactor.Reactor(16, 1024, 4);
+    reactor.setCurrent(r.kq);
+    let cell = bytes.alloc(4);
+    bytes.write_i32(cell, 0, -1);
+
+    coroStart(sleeper(cell));   // runs to the sleep, arms the reactor timer, suspends
+
+    let guard = 0;
+    while ((bytes.read_i32(cell, 0) as int) != 42 && guard < 200) {
+        let n = r.poll(500);
+        let i = 0;
+        while (i < n) { nova_reactor_resume(r.readyToken(i)); i = i + 1; }
+        guard = guard + 1;
+    }
+
+    assert.equalInt(bytes.read_i32(cell, 0) as int, 42);
+    reactor.setCurrent(0);
+    bytes.free(cell);
+    r.destroy();
+}

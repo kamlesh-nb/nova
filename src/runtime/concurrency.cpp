@@ -4,6 +4,10 @@
 #ifndef _WIN32
 #include <sys/socket.h>
 #endif
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#include <sys/event.h>   // kqueue EVFILT_TIMER, for reactor-native timers (M4)
+#define NOVA_HAVE_KQUEUE 1
+#endif
 #include <cstdio>
 #include <chrono>
 #include <condition_variable>
@@ -910,9 +914,27 @@ void nova_aclose(long long sock) {
     delete s;
 }
 
+// Reactor-native one-shot timer (M4, retiring the Asio steady_timer for reactor coroutines): arm an
+// EVFILT_TIMER on the current reactor's kqueue keyed by the coroutine handle, so the reactor loop
+// resumes the coroutine when it fires (udata carries the handle, exactly like a ready fd). No Asio,
+// no thread held. One-shot, so it auto-removes after firing.
+static void nova_reactor_arm_timer(long long handle, long long ms) {
+#if defined(NOVA_HAVE_KQUEUE)
+    int kq = (int)g_current_kq;
+    if (kq <= 0) { NOVA_TRACE("reactor timer: no current kq h=%lld", handle); return; }
+    struct kevent ev;
+    EV_SET(&ev, (uintptr_t)handle, EVFILT_TIMER, EV_ADD | EV_ONESHOT, 0,
+           (int64_t)(ms < 0 ? 0 : ms), (void *)(uintptr_t)handle);
+    kevent(kq, &ev, 1, nullptr, 0, nullptr);
+    NOVA_TRACE("reactor timer armed h=%lld ms=%lld kq=%d", handle, ms, kq);
+#else
+    (void)handle; (void)ms;   // Linux epoll timerfd path plugs in with the epoll backend.
+#endif
+}
+
 void nova_await_timer(long long handle, long long ms) {
     if (!handle) return;
-    NOVA_REACTOR_GUARD("sleep/timer");
+    if (g_reactor_mode) { nova_reactor_arm_timer(handle, ms); return; }
     auto timer = std::make_shared<boost::asio::steady_timer>(
         g_io, std::chrono::milliseconds(ms < 0 ? 0 : ms));
     timer->async_wait([handle, timer](const boost::system::error_code &) {
