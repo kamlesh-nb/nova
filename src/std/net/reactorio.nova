@@ -22,6 +22,30 @@ import os.kqueue;
 pub const EAGAIN: int = 35;
 pub const EINPROGRESS: int = 36;
 
+// Parse a dotted-quad IPv4 string into the value to store in sin_addr with bytes.write_i32, i.e.
+// the four octets in ascending memory order (little-endian int): "127.0.0.1" -> 0x0100007F, whose
+// stored bytes are 7F 00 00 01. Hostname resolution (getaddrinfo) is a later step; numeric IPv4 is
+// enough for loopback and IP-configured database hosts.
+pub fn parseIPv4(s: string): long {
+    let result = 0 as long;
+    let cur = 0;
+    let shift = 0;
+    let i = 0;
+    while (i < s.length) {
+        let c = s[i];
+        if (c == 46) {
+            result = result | ((cur as long) << shift);
+            shift = shift + 8;
+            cur = 0;
+        } else {
+            cur = cur * 10 + (c - 48);
+        }
+        i = i + 1;
+    }
+    result = result | ((cur as long) << shift);
+    return result;
+}
+
 pub struct ReactorStream {
     pub fd: int,
     pub kq: int,
@@ -78,6 +102,7 @@ pub struct ReactorStream {
         return r;
     }
 
+    pub fn fdOf(self: ReactorStream): int { return self.fd; }
     pub fn isOpen(self: ReactorStream): bool { return self.fd >= 0; }
 
     pub fn close(self: ReactorStream): void {
@@ -86,5 +111,50 @@ pub struct ReactorStream {
             sys.close(self.fd);
             self.fd = -1;
         }
+    }
+}
+
+// Connect to a numeric IPv4 host and port on the reactor. The non-blocking connect returns
+// EINPROGRESS; we await writability, then read SO_ERROR to confirm. Returns a ReactorStream whose
+// fd is -1 on failure.
+pub async fn reactorConnect(ip: string, port: int, kq: int): ReactorStream {
+    let fd = sys.socket(sys.AF_INET, sys.SOCK_STREAM, 0);
+    if (fd < 0) { return ReactorStream(-1, kq); }
+    sys.setNonBlocking(fd);
+    let sa = sys.makeSockaddrIn(port, parseIPv4(ip));
+    let r = sys.connect(fd, sa, 16);
+    bytes.free(sa);
+    if (r != 0) {
+        if (sys.errno() != EINPROGRESS) { sys.close(fd); return ReactorStream(-1, kq); }
+        kqueue.registerOne(kq, fd, kqueue.EVFILT_WRITE, kqueue.EV_ADD | kqueue.EV_ONESHOT, currentCoro());
+        coroSuspend();
+        if (sys.soError(fd) != 0) { sys.close(fd); return ReactorStream(-1, kq); }
+    }
+    return ReactorStream(fd, kq);
+}
+
+// Accept one connection on a listening fd, awaiting readability while the backlog is empty. Returns
+// a ReactorStream for the accepted connection (fd -1 on error). The listener's read-interest is
+// removed on success so a later accept does not resume the wrong coroutine.
+pub async fn reactorAccept(listenFd: int, kq: int): ReactorStream {
+    let addrBuf = bytes.alloc(16);
+    let addrLen = bytes.alloc(4);
+    while (true) {
+        bytes.write_i32(addrLen, 0, 16);
+        let c = sys.accept(listenFd, addrBuf, addrLen);
+        if (c >= 0) {
+            sys.setNonBlocking(c);
+            kqueue.registerOne(kq, listenFd, kqueue.EVFILT_READ, kqueue.EV_DELETE, 0);
+            bytes.free(addrBuf);
+            bytes.free(addrLen);
+            return ReactorStream(c, kq);
+        }
+        if (sys.errno() != EAGAIN) {
+            bytes.free(addrBuf);
+            bytes.free(addrLen);
+            return ReactorStream(-1, kq);
+        }
+        kqueue.registerOne(kq, listenFd, kqueue.EVFILT_READ, kqueue.EV_ADD, currentCoro());
+        coroSuspend();
     }
 }
