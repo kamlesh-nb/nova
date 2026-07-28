@@ -1,0 +1,90 @@
+// net/reactorio: reactor-native async socket I/O in Nova (M2 of the C++ runtime retirement plan,
+// docs/design/cpp-runtime-retirement-plan.md). This is the reactor-driven replacement for the
+// Asio-backed async I/O primitives (nova_arecv / nova_asend / nova_aconnect / nova_aaccept): the
+// same "await a read / write" shape, but implemented over os/sys non-blocking sockets and the Nova
+// reactor's readiness (os/kqueue), with no Asio.
+//
+// The mechanism mirrors the reactor's connection loop: a non-blocking syscall is tried inline; on
+// EAGAIN the fd is registered with the reactor carrying `currentCoro()` as the readiness token, and
+// the coroutine suspends (coroSuspend). When the reactor polls that fd ready it resumes the
+// coroutine (nova_reactor_resume(token)), which retries the syscall. No thread is held while blocked.
+//
+// A ReactorStream is just a raw fd plus the kqueue it is registered on, so it carries no Asio state
+// and can be constructed anywhere a reactor coroutine has an fd (an accepted connection, a connected
+// client). This is the seam the database drivers move onto in M3.
+
+import bytes;
+import os.sys;
+import os.kqueue;
+
+// errno values are platform-specific. macOS/BSD values here; Linux (EAGAIN=11, EINPROGRESS=115)
+// plugs in behind the same shape when the epoll backend is verified on Linux.
+pub const EAGAIN: int = 35;
+pub const EINPROGRESS: int = 36;
+
+pub struct ReactorStream {
+    pub fd: int,
+    pub kq: int,
+
+    init(fd: int, kq: int) {
+        self.fd = fd;
+        self.kq = kq;
+    }
+
+    // Read up to `max` bytes into `buf`. Returns the byte count (0 on peer close/EOF), or -1 on a
+    // real error. Awaits readability on EAGAIN without holding a thread.
+    pub async fn recvInto(self: ReactorStream, buf: long, max: int): int {
+        while (true) {
+            let n = sys.read(self.fd, buf, max as long);
+            if (n >= 0) {
+                return n as int;
+            }
+            if (sys.errno() != EAGAIN) {
+                return -1;
+            }
+            kqueue.registerOne(self.kq, self.fd, kqueue.EVFILT_READ, kqueue.EV_ADD, currentCoro());
+            coroSuspend();
+        }
+    }
+
+    // Write all `len` bytes from `buf`, awaiting writability on EAGAIN. Returns bytes sent, or -1.
+    pub async fn sendBuf(self: ReactorStream, buf: long, len: int): int {
+        let sent = 0;
+        while (sent < len) {
+            let w = sys.write(self.fd, buf + (sent as long), (len - sent) as long);
+            if (w > 0) {
+                sent = sent + (w as int);
+            } else if (w < 0 && sys.errno() == EAGAIN) {
+                kqueue.registerOne(self.kq, self.fd, kqueue.EVFILT_WRITE,
+                                   kqueue.EV_ADD | kqueue.EV_ONESHOT, currentCoro());
+                coroSuspend();
+            } else {
+                return -1;
+            }
+        }
+        return sent;
+    }
+
+    // Send a string. Copies into a scratch buffer once, then sends it reactor-natively. (A future
+    // step can pass the string's byte address directly to avoid the copy.)
+    pub async fn sendStr(self: ReactorStream, data: string): int {
+        let len = data.length;
+        if (len == 0) { return 0; }
+        let tmp = bytes.alloc(len);
+        let i = 0;
+        while (i < len) { bytes.write_byte(tmp, i, data[i]); i = i + 1; }
+        let r = await self.sendBuf(tmp, len);
+        bytes.free(tmp);
+        return r;
+    }
+
+    pub fn isOpen(self: ReactorStream): bool { return self.fd >= 0; }
+
+    pub fn close(self: ReactorStream): void {
+        if (self.fd >= 0) {
+            kqueue.registerOne(self.kq, self.fd, kqueue.EVFILT_READ, kqueue.EV_DELETE, 0);
+            sys.close(self.fd);
+            self.fd = -1;
+        }
+    }
+}

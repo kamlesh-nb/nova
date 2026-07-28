@@ -10,7 +10,7 @@ truth for progress; the phase details are below.
 | Foundation | Event loop, buffers, HTTP parser, poll and socket layer, multi-core | none | DONE | `self-hosted-runtime.md` phases 1 to 5; race-free under `--tsan` |
 | M0 | Tooling: file-based runtime trace, symbol audit | none | DONE | `NOVA_TRACE=<file>` trace (surfaces reliably), `tools/runtime-symbol-audit.sh` (221 exported / 203 referenced) |
 | M1 | Async scheduler migration (per-reactor run queue) | M0 | DONE | Nested/multi-level `await` and `spawn`+`await` drain on the reactor (corpus 199, trace-proven); Asio-backed awaits on the reactor now fail fast via `nova_reactor_io_violation` instead of silently orphaning (their migration is M2) |
-| M2 | Async socket I/O on the reactor | M1 | TODO | `arecv`/`asend`/`aconnect`/`aaccept` in Nova over `os/sys` |
+| M2 | Async socket I/O on the reactor | M1 | WIP | `net/reactorio.ReactorStream` (recv/send in Nova over `os/sys` + reactor readiness) proven by a client and server round trip on one reactor, no Asio (corpus 200, TSan clean). Remaining: reactor-native `aconnect`/`aaccept`, a thread-local current reactor, and the `AsyncStream` cutover so drivers pick it up |
 | M3 | Database drivers on the reactor | M2 | TODO | No driver change; they already speak the async seam |
 | M4 | Retire Boost.Asio | M1 to M3 | TODO | Remove reactors, strands, `g_io`; drop vendored Boost |
 | M5 | File and directory I/O in Nova | M4 (soft) | TODO | `nova_file_*`, `nova_dir_*` over `os/sys` |
@@ -157,10 +157,25 @@ phase removes a real dependency and is independently verifiable.
   (a clear diagnostic naming the primitive, then `abort`), so the unsupported combination is loud
   instead of a silent hang or wrong value. Gate: corpus (incl. 199) and ASAN green; the Asio-abort
   path is proven out-of-corpus (a corpus case cannot abort). This unblocks M2.
-- **M2. Async socket I/O onto the reactor.** Reimplement `nova_arecv`, `nova_asend`, `nova_aconnect`,
-  `nova_aaccept`, and the listen path in Nova over `os/sys` non-blocking sockets driven by the reactor,
-  retiring the Asio versions in `concurrency.cpp`. Prereq: M1. Gate: an async client and server round
-  trip on the reactor; the async stream and TLS conformance cases pass with the new path.
+- **M2. Async socket I/O onto the reactor. WIP.** Reimplement the async socket seam in Nova over
+  `os/sys` non-blocking sockets driven by the reactor, retiring the Asio versions in `concurrency.cpp`.
+  Prereq: M1.
+  - **Done (this step): the reactor-native stream.** `src/std/net/reactorio.nova` (`ReactorStream` =
+    a raw fd plus the kqueue it is registered on) provides `recvInto` / `sendBuf` / `sendStr` as
+    `async fn`s that try a non-blocking `read`/`write` inline and, on `EAGAIN`, register readiness
+    (`EVFILT_READ`, or one-shot `EVFILT_WRITE`) with the reactor carrying `currentCoro()` as the
+    token, then `coroSuspend`; the reactor resumes them when the fd is ready. No Asio, no thread held
+    while blocked. Reactor write-interest (`addWrite`/`delWrite`) was added to `net/reactor`. Proven
+    by corpus case 200: two coroutines on one reactor complete a send and receive round trip over a
+    socketpair, trace-confirmed to park on `EAGAIN` and resume on readiness. Native 193, ASAN 355,
+    TSan 201 (200 tsan clean).
+  - **Remaining:** reactor-native `aconnect` (non-blocking `connect` + await writability + `SO_ERROR`
+    via a `getsockopt` binding) and `aaccept` (accept loop as a stream); a thread-local current
+    reactor so a stream can be built deep in driver code without threading the reactor through; and
+    the `AsyncStream` cutover (make it reactor-native when constructed on a reactor thread, else Asio)
+    so the drivers and `app.nova`'s `AsyncIO` path pick up the reactor path unchanged.
+  - Gate (full M2): an async client and server round trip on the reactor (done); the async stream and
+    TLS conformance cases pass with the new path; the Asio deployment does not regress.
 - **M3. Database drivers onto the reactor.** The drivers already speak the async seam (`arecv`/`asend`
   over `AsyncStream`); once M2 provides that seam on the reactor, they run on the reactor with no
   driver change. Prereq: M2. Gate: a live driver round trip on the reactor (offline-gated codecs stay

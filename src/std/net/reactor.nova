@@ -46,6 +46,15 @@ pub struct Reactor {
         return kqueue.registerOne(self.kq, fd, kqueue.EVFILT_READ, kqueue.EV_DELETE, 0);
     }
 
+    // Register one-shot write-interest on fd (for awaiting writability when a send hits EAGAIN).
+    // One-shot so the reactor does not spin on the persistently-writable socket; re-arm per send.
+    pub fn addWrite(self: Reactor, fd: int, token: long): int {
+        return kqueue.registerOne(self.kq, fd, kqueue.EVFILT_WRITE, kqueue.EV_ADD | kqueue.EV_ONESHOT, token);
+    }
+    pub fn delWrite(self: Reactor, fd: int): int {
+        return kqueue.registerOne(self.kq, fd, kqueue.EVFILT_WRITE, kqueue.EV_DELETE, 0);
+    }
+
     // Block until at least one fd is ready (or timeoutMs elapses; negative blocks forever).
     // Returns the number of ready events, readable via readyFd / readyToken / readyBytes.
     pub fn poll(self: Reactor, timeoutMs: int): int {

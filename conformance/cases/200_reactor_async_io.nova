@@ -1,0 +1,92 @@
+// M2 of the C++ runtime retirement plan: reactor-native async socket I/O, no Asio. Two coroutines
+// on ONE reactor exchange a message over a socketpair, each using `await stream.recvInto` /
+// `await stream.sendBuf` (net/reactorio). The reads and writes are non-blocking syscalls that park
+// the coroutine on EAGAIN (registering readiness with the reactor) and resume when the reactor polls
+// the fd ready. This proves the async-stream seam runs on the Nova reactor with zero Asio: an async
+// client and server round trip driven entirely by the reactor loop.
+import assert;
+import bytes;
+import os.sys;
+import net.reactor;
+import net.reactorio;
+
+fn bump(cell: long): void {
+    bytes.write_i32(cell, 0, (bytes.read_i32(cell, 0) as int) + 1);
+}
+fn count(cell: long): int {
+    return bytes.read_i32(cell, 0) as int;
+}
+
+// The "server" side: receive one message and echo it straight back.
+async fn echoConn(fd: int, kq: int, done: long): void {
+    let s = reactorio.ReactorStream(fd, kq);
+    let buf = bytes.alloc(64);
+    let n = await s.recvInto(buf, 64);
+    if (n > 0) {
+        await s.sendBuf(buf, n);
+    }
+    bytes.free(buf);
+    bump(done);
+}
+
+// The "client" side: send PING, then read the echo into `result`.
+async fn clientConn(fd: int, kq: int, done: long, result: long, gotLen: long): void {
+    let s = reactorio.ReactorStream(fd, kq);
+    let msg = bytes.alloc(4);
+    bytes.write_byte(msg, 0, 80);   // 'P'
+    bytes.write_byte(msg, 1, 73);   // 'I'
+    bytes.write_byte(msg, 2, 78);   // 'N'
+    bytes.write_byte(msg, 3, 71);   // 'G'
+    await s.sendBuf(msg, 4);
+    bytes.free(msg);
+
+    let n = await s.recvInto(result, 64);
+    bytes.write_i32(gotLen, 0, n as long);
+    bump(done);
+}
+
+@test
+fn test_reactor_async_round_trip(): void {
+    let (a, b) = sys.newSocketPair(sys.AF_UNIX, sys.SOCK_STREAM);
+    assert.isTrue(a >= 0 && b >= 0);
+    sys.setNonBlocking(a);
+    sys.setNonBlocking(b);
+
+    let r = reactor.Reactor(64, 4096, 16);
+    let done = bytes.alloc(4);
+    bytes.write_i32(done, 0, 0);
+    let result = bytes.alloc(64);
+    let gotLen = bytes.alloc(4);
+    bytes.write_i32(gotLen, 0, 0);
+
+    // Start both connection coroutines; each runs to its first suspend (recv/send EAGAIN).
+    coroStart(echoConn(b, r.kq, done));
+    coroStart(clientConn(a, r.kq, done, result, gotLen));
+
+    // Drive the reactor until both coroutines finish. The iteration cap fails loudly instead of
+    // hanging the gate if a wakeup is ever missed.
+    let guard = 0;
+    while (count(done) < 2 && guard < 1000) {
+        let nev = r.poll(500);
+        let i = 0;
+        while (i < nev) {
+            nova_reactor_resume(r.readyToken(i));
+            i = i + 1;
+        }
+        guard = guard + 1;
+    }
+
+    assert.equalInt(count(done), 2);
+    assert.equalInt(bytes.read_i32(gotLen, 0) as int, 4);
+    assert.equalInt(bytes.read_byte(result, 0) as int, 80);   // 'P'
+    assert.equalInt(bytes.read_byte(result, 1) as int, 73);   // 'I'
+    assert.equalInt(bytes.read_byte(result, 2) as int, 78);   // 'N'
+    assert.equalInt(bytes.read_byte(result, 3) as int, 71);   // 'G'
+
+    bytes.free(done);
+    bytes.free(result);
+    bytes.free(gotLen);
+    r.destroy();
+    sys.close(a);
+    sys.close(b);
+}
