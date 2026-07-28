@@ -122,20 +122,18 @@ fn crossLinkViaZig(
     shared_nova: []const u8,
     is_release: bool,
 ) !bool {
+    _ = environ; // Boost include (formerly from BOOST_PREFIX) retired in M4; no env lookup needed.
     const target = mapCrossTarget(llvm_triple) orelse return false;
 
     const rt_obj = try std.fmt.allocPrint(allocator, "{s}/lib/nova_runtime_{s}.o", .{ shared_nova, target.zig });
     if (Io.Dir.access(.cwd(), io, rt_obj, .{})) |_| {} else |_| {
 
-        const boost_inc = if (environ.get("BOOST_PREFIX")) |bp|
-            try std.fmt.allocPrint(allocator, "-I{s}/include", .{bp})
-        else
-            try std.fmt.allocPrint(allocator, "-I{s}/deps/boost/include", .{shared_nova});
         const rt_src = try std.fmt.allocPrint(allocator, "{s}/src/runtime/runtime.cpp", .{shared_nova});
 
         const zlib_inc = try std.fmt.allocPrint(allocator, "-I{s}/deps/zlib", .{shared_nova});
         std.debug.print("[T1] cross-compiling the C++ runtime for {s} (one-time; caches to ~/.nova/lib) ...\n", .{target.zig});
-        const rc_args = [_][]const u8{ "zig", "c++", "-target", target.zig, "-std=c++20", "-O2", "-DNOVA_DROP_ARENA", boost_inc, zlib_inc, "-c", rt_src, "-o", rt_obj };
+        // Boost.Asio retired (M4): the runtime is reactor-native, no Boost include needed.
+        const rc_args = [_][]const u8{ "zig", "c++", "-target", target.zig, "-std=c++20", "-O2", "-DNOVA_DROP_ARENA", zlib_inc, "-c", rt_src, "-o", rt_obj };
         var rc_child = try std.process.spawn(io, .{ .argv = &rc_args });
         switch (try rc_child.wait(io)) {
             .exited => |code| if (code != 0) {

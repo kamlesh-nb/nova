@@ -388,11 +388,9 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile) void {
         \\  echo "webview: built ($WEBVIEW_LIB)" || echo "webview: build failed (GUI FFI unavailable)"
         \\fi
         \\rsync -a --exclude=".git" deps/ "{[home]s}/.nova/deps/"
-        \\# Prebuild the C++ runtime ONCE into a static library.
-        \\# Boost is the VENDORED Asio-only header subset (deps/boost/include, ~7MB, extracted
-        \\# by a lexical #include scan of boost/asio.hpp) — NO Homebrew/apt/system Boost. It is
-        \\# synced to ~/.nova/deps by the rsync above. BOOST_PREFIX overrides for a local full Boost.
-        \\BOOST_PREFIX="${{BOOST_PREFIX:-deps/boost}}"
+        \\# Prebuild the C++ runtime ONCE into a static library. Boost.Asio has been retired (M4):
+        \\# the async runtime is reactor-native (net/reactorio over os/sys, kqueue/epoll), so nothing
+        \\# in src/runtime includes Boost and no Boost include path is needed.
         \\# M3-D-5: build the vendored wolfSSL static lib once (TLS via wolfSSL). If
         \\# libwolfssl.a is already built, skip. Enables real TLS with verify_peer.
         \\WOLF_LIB="deps/wolfssl/build/libwolfssl.a"
@@ -412,10 +410,10 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile) void {
         \\else
         \\  echo "wolfSSL: no prebuilt lib and no cmake (TLS stubbed)"
         \\fi
-        \\echo "Building libnova_runtime.a (Boost prefix: $BOOST_PREFIX) ..."
+        \\echo "Building libnova_runtime.a (no Boost; reactor runtime) ..."
         \\# Workstream A: NOVA_DROP_ARENA makes every heap object honestly refcounted
         \\# (no load-bearing thread-local arena). Required for multi-core + clean ARC.
-        \\clang++ -std=c++20 -O2 -pthread -DNOVA_DROP_ARENA $WOLF_FLAGS -c -I"$BOOST_PREFIX/include" \
+        \\clang++ -std=c++20 -O2 -pthread -DNOVA_DROP_ARENA $WOLF_FLAGS -c \
         \\    src/runtime/runtime.cpp -o "{[home]s}/.nova/lib/nova_runtime.o"
         \\ar rcs "{[home]s}/.nova/lib/libnova_runtime.a" "{[home]s}/.nova/lib/nova_runtime.o"
         \\# T1: the cross-compilation cache (nova_runtime_<triple>.o, built lazily by `nova build
@@ -440,7 +438,7 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile) void {
         \\if [ "${{NOVA_ASAN:-0}}" = "1" ]; then
         \\  echo "Building libnova_runtime_asan.a (AddressSanitizer) ..."
         \\  clang++ -std=c++20 -O1 -g -fsanitize=address -fno-omit-frame-pointer \
-        \\      -pthread -DNOVA_DROP_ARENA $WOLF_FLAGS -c -I"$BOOST_PREFIX/include" \
+        \\      -pthread -DNOVA_DROP_ARENA $WOLF_FLAGS -c \
         \\      src/runtime/runtime.cpp -o "{[home]s}/.nova/lib/nova_runtime_asan.o"
         \\  ar rcs "{[home]s}/.nova/lib/libnova_runtime_asan.a" "{[home]s}/.nova/lib/nova_runtime_asan.o"
         \\  echo "ASAN runtime built. Use: NOVA_ASAN=1 nova test <file>"
@@ -454,7 +452,7 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile) void {
         \\if [ "${{NOVA_TSAN:-0}}" = "1" ]; then
         \\  echo "Building libnova_runtime_tsan.a (ThreadSanitizer) ..."
         \\  clang++ -std=c++20 -O1 -g -fsanitize=thread -fno-omit-frame-pointer \
-        \\      -pthread -DNOVA_DROP_ARENA $WOLF_FLAGS -c -I"$BOOST_PREFIX/include" \
+        \\      -pthread -DNOVA_DROP_ARENA $WOLF_FLAGS -c \
         \\      src/runtime/runtime.cpp -o "{[home]s}/.nova/lib/nova_runtime_tsan.o"
         \\  ar rcs "{[home]s}/.nova/lib/libnova_runtime_tsan.a" "{[home]s}/.nova/lib/nova_runtime_tsan.o"
         \\  echo "TSAN runtime built. Use: NOVA_TSAN=1 nova test <file> (with NOVA_THREADS>1)"
