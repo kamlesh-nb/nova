@@ -20,6 +20,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # down as leaks are fixed.
 ARC_MODE=0
 ASAN_MODE=0
+TSAN_MODE=0
 SHADOW_MODE=0
 WASM_MODE=0
 # --wasm : compile every positive case to a wasm module (`nova <file> --wasm`) and
@@ -58,6 +59,11 @@ if [[ "${1:-}" == "--arc" ]]; then ARC_MODE=1; shift; fi
 # Requires the sanitized runtime: `NOVA_ASAN=1 zig build` first.
 # NOT a leak gate — LeakSanitizer is unsupported on Darwin; use --arc for leaks.
 if [[ "${1:-}" == "--asan" ]]; then ASAN_MODE=1; shift; fi
+# --tsan : run the concurrency subset under ThreadSanitizer with NOVA_THREADS=4. TSan finds
+# DATA RACES in the multi-reactor runtime that the (single-threaded) corpus and ASAN gate
+# cannot. This is the gate for the self-hosted runtime work — any race becomes a located
+# report naming both accesses. Requires: NOVA_TSAN=1 zig build first.
+if [[ "${1:-}" == "--tsan" ]]; then TSAN_MODE=1; shift; fi
 FILTER="${1:-}"
 
 if [[ ! -x "$NOVA" ]]; then
@@ -256,6 +262,36 @@ if [[ $ASAN_MODE -eq 1 ]]; then
     else
       printf "  \033[31mFAIL\033[0m  %-32s %s\n" "$name" "(did not run cleanly under asan)"
       fail=$((fail+1)); failed_cases+=("$name:asan-run")
+    fi
+  done
+fi
+
+# ThreadSanitizer gate (opt-in: NOVA_TSAN=1 zig build && ./run.sh --tsan)
+# Runs the multi-threaded subset under NOVA_THREADS=4; single-threaded cases would exercise
+# no concurrency and are skipped. Extend TSAN_CASES as new concurrent code lands.
+if [[ $TSAN_MODE -eq 1 ]]; then
+  echo "--- ThreadSanitizer gate (data races, NOVA_THREADS=4) ---"
+  if [[ ! -f "$HOME/.nova/lib/libnova_runtime_tsan.a" ]]; then
+    echo "  ERROR: libnova_runtime_tsan.a missing — run: NOVA_TSAN=1 zig build" >&2
+    exit 2
+  fi
+  TSAN_CASES=(10_async_go 11_channels 102_future_first_class 103_async_when_all 113_async_stream_io)
+  for name in "${TSAN_CASES[@]}"; do
+    [[ -n "$FILTER" && "$name" != *"$FILTER"* ]] && continue
+    f="$HERE/cases/$name.nova"
+    [[ -f "$f" ]] || { printf "  \033[31mFAIL\033[0m  %-32s %s\n" "$name" "(case missing)"; fail=$((fail+1)); continue; }
+    out="$(NOVA_TSAN=1 NOVA_THREADS=4 "$NOVA" test "$f" 2>&1)"
+    if printf '%s' "$out" | grep -q "data race"; then
+      where="$(printf '%s' "$out" | grep -m1 -oE '#0 .* in [A-Za-z_][A-Za-z0-9_]*' | sed 's/.* in //')"
+      printf "  \033[31mFAIL\033[0m  %-32s \033[31mdata race\033[0m in %s\n" "$name" "${where:-?}"
+      printf '%s\n' "$out" | grep -E "Write of size|Read of size|Previous (read|write)|#[0-9] .* in " | head -6 | sed 's/^/          /'
+      fail=$((fail+1)); failed_cases+=("$name:tsan-race")
+    elif printf '%s' "$out" | grep -qE '^Results:.*0 failed'; then
+      printf "  \033[32mPASS\033[0m  %-32s %s\n" "$name" "(tsan clean, threads=4)"
+      pass=$((pass+1))
+    else
+      printf "  \033[31mFAIL\033[0m  %-32s %s\n" "$name" "(did not run cleanly under tsan)"
+      fail=$((fail+1)); failed_cases+=("$name:tsan-run")
     fi
   done
 fi

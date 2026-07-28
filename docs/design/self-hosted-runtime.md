@@ -212,6 +212,12 @@ Each phase ends with a measurement or a conformance gate, so we never fly blind 
    step if the data demands it. Decide on data, not preference.
 2. **Readiness first or io_uring first.** Recommendation: readiness first for portability and
    simplicity (macOS development uses kqueue anyway), io_uring as a phase-7 backend.
-3. **Add the ThreadSanitizer build now.** It is a small, safe piece of infrastructure and it is
-   the gate that makes all subsequent concurrency work trustworthy. Recommend doing it in
-   phase 0 or 1 regardless of the rest.
+3. **Add the ThreadSanitizer build now. DONE (2026-07-28).** `NOVA_TSAN=1 zig build` builds
+   `libnova_runtime_tsan.a` (the C++ runtime instrumented with `-fsanitize=thread`), mirroring the
+   ASAN build; `nova test` links it and `-fsanitize=thread` when `NOVA_TSAN=1`; and
+   `conformance/run.sh --tsan` runs the concurrency subset (`10_async_go`, `11_channels`,
+   `102_future_first_class`, `103_async_when_all`, `113_async_stream_io`) under `NOVA_THREADS=4`,
+   turning any data race in the multi-reactor runtime into a located report. All five pass clean
+   today, which also establishes that the existing async runtime's `when_all`, channel, future, and
+   async-socket paths are race-free under TSan at four threads. Extend `TSAN_CASES` as the event
+   loop lands. This is the gate the event-loop and lockless-CoroState work will be verified against.

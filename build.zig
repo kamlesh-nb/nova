@@ -445,6 +445,20 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile) void {
         \\  ar rcs "{[home]s}/.nova/lib/libnova_runtime_asan.a" "{[home]s}/.nova/lib/nova_runtime_asan.o"
         \\  echo "ASAN runtime built. Use: NOVA_ASAN=1 nova test <file>"
         \\fi
+        \\# NOVA_TSAN=1: additionally build a ThreadSanitizer runtime. This is the gate for the
+        \\# self-hosted runtime work (docs/design/self-hosted-runtime.md): the corpus and the ASAN
+        \\# gate are effectively single-threaded and CANNOT catch a data race in the multi-reactor
+        \\# runtime. TSan instruments the C++ runtime (the scheduler, the CoroState map, the
+        \\# reactors) so that a race under NOVA_THREADS>1 becomes a located report naming both
+        \\# accesses. Opt-in because it is slow; `nova test` links it only when NOVA_TSAN=1 too.
+        \\if [ "${{NOVA_TSAN:-0}}" = "1" ]; then
+        \\  echo "Building libnova_runtime_tsan.a (ThreadSanitizer) ..."
+        \\  clang++ -std=c++20 -O1 -g -fsanitize=thread -fno-omit-frame-pointer \
+        \\      -pthread -DNOVA_DROP_ARENA $WOLF_FLAGS -c -I"$BOOST_PREFIX/include" \
+        \\      src/runtime/runtime.cpp -o "{[home]s}/.nova/lib/nova_runtime_tsan.o"
+        \\  ar rcs "{[home]s}/.nova/lib/libnova_runtime_tsan.a" "{[home]s}/.nova/lib/nova_runtime_tsan.o"
+        \\  echo "TSAN runtime built. Use: NOVA_TSAN=1 nova test <file> (with NOVA_THREADS>1)"
+        \\fi
         \\echo "Installed compiler to {[bin]s}/nova"
         \\echo "Prebuilt libnova_runtime.a; synced std/runtime/deps to {[home]s}/.nova/"
         \\

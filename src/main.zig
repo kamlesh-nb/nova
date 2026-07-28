@@ -1766,6 +1766,7 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
     const shared_nova_arg = try std.fmt.allocPrint(allocator, "-I{s}", .{shared_nova});
 
     const asan = if (init.environ_map.get("NOVA_ASAN")) |v| !std.mem.eql(u8, v, "0") else false;
+    const tsan = if (init.environ_map.get("NOVA_TSAN")) |v| !std.mem.eql(u8, v, "0") else false;
 
     var test_clang_args = std.ArrayList([]const u8).empty;
     try test_clang_args.append(allocator, "clang++");
@@ -1780,6 +1781,9 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
     if (asan) {
         try test_clang_args.append(allocator, "-fsanitize=address");
         try test_clang_args.append(allocator, "-fno-omit-frame-pointer");
+    } else if (tsan) {
+        try test_clang_args.append(allocator, "-fsanitize=thread");
+        try test_clang_args.append(allocator, "-fno-omit-frame-pointer");
     }
 
     for (link_objs) |o| try test_clang_args.append(allocator, o);
@@ -1787,7 +1791,7 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
     const test_nova_lib = try std.fmt.allocPrint(allocator, "-L{s}/lib", .{shared_nova});
     try test_clang_args.append(allocator, test_nova_lib);
 
-    try test_clang_args.append(allocator, if (asan) "-lnova_runtime_asan" else "-lnova_runtime");
+    try test_clang_args.append(allocator, if (asan) "-lnova_runtime_asan" else if (tsan) "-lnova_runtime_tsan" else "-lnova_runtime");
     try test_clang_args.append(allocator, "-lz");
 
     try test_clang_args.append(allocator, "-L/opt/homebrew/lib");
