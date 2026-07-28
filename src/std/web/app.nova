@@ -4,6 +4,7 @@ import net.asynctls;
 import net.reactor;
 import net.reactorio;
 import os.sys;
+import env;
 import io.file;
 import web.request;
 import web.response;
@@ -443,9 +444,18 @@ pub struct App {
     }
 
     pub fn run(self: App, port: int): void {
-
-        asyncio.holdReactors();
-        runServer(self, port);
+        // Default to the Nova reactor (no Asio): share-nothing across the available cores. Fall back
+        // to the Asio server for TLS, which is not yet on the reactor, or when NOVA_ASIO=1 forces it
+        // (an escape hatch while the reactor path settles).
+        let forceAsio = env.get("NOVA_ASIO").length > 0;
+        if (self.tlsEnabled || forceAsio) {
+            asyncio.holdReactors();
+            runServer(self, port);
+            return;
+        }
+        let workers = asyncio.reactorCount();
+        let n = if (workers < 1) 1 else workers;
+        self.runReactorMC(port, n);
     }
 }
 
