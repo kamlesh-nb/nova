@@ -10,7 +10,7 @@ truth for progress; the phase details are below.
 | Foundation | Event loop, buffers, HTTP parser, poll and socket layer, multi-core | none | DONE | `self-hosted-runtime.md` phases 1 to 5; race-free under `--tsan` |
 | M0 | Tooling: file-based runtime trace, symbol audit | none | DONE | `NOVA_TRACE=<file>` trace (surfaces reliably), `tools/runtime-symbol-audit.sh` (221 exported / 203 referenced) |
 | M1 | Async scheduler migration (per-reactor run queue) | M0 | DONE | Nested/multi-level `await` and `spawn`+`await` drain on the reactor (corpus 199, trace-proven); Asio-backed awaits on the reactor now fail fast via `nova_reactor_io_violation` instead of silently orphaning (their migration is M2) |
-| M2 | Async socket I/O on the reactor | M1 | WIP (core done) | `net/reactorio` = reactor-native recv/send/connect/accept in Nova over `os/sys`; a thread-local current reactor; `asyncio.AsyncStream` is dual-mode so drivers pick up the reactor with no change. Proven by corpus 200/201/202 (socketpair round trip, loopback connect/accept, and the AsyncStream seam), all TSan clean. Remaining: hostname resolution (`getaddrinfo`) and a reactor-driven inbound accept loop in `app.nova` |
+| M2 | Async socket I/O on the reactor | M1 | DONE | `net/reactorio` = reactor-native recv/send/connect/accept/resolve in Nova over `os/sys`; a thread-local current reactor; `asyncio.AsyncStream` dual-mode; `web/app.serveReactorConn`/`runReactor` run a whole request on the reactor. Corpus 200 to 204 (socketpair, loopback connect/accept, the AsyncStream seam, connect-by-name, and a full App request), all TSan clean. Remaining before flagship-DB-on-reactor (M3): multi-core reactor server (the `runReactors` worker cannot yet carry the App) and async DNS |
 | M3 | Database drivers on the reactor | M2 | TODO | No driver change; they already speak the async seam |
 | M4 | Retire Boost.Asio | M1 to M3 | TODO | Remove reactors, strands, `g_io`; drop vendored Boost |
 | M5 | File and directory I/O in Nova | M4 (soft) | TODO | `nova_file_*`, `nova_dir_*` over `os/sys` |
@@ -185,13 +185,21 @@ phase removes a real dependency and is independently verifiable.
     seam on the reactor; the M1 `nova_reactor_io_violation` guard proves the reactor path was taken
     (an Asio fallback on the reactor thread would have aborted). Backward compatible, Asio deployment
     untouched.
-  - **Remaining:** hostname resolution (`getaddrinfo`; only numeric IPv4 today) so a driver can
-    connect to a named host on the reactor, and a reactor-driven inbound accept loop in `app.nova`
-    so a whole request (inbound plus the per-request database call) runs on the reactor. These, with
-    M3, deliver the flagship's per-request database on the reactor.
-  - Gate (M2 core): an async client and server round trip on the reactor (done, 200/201); the
-    `AsyncStream` seam runs reactor-native (done, 202); the Asio deployment does not regress (native
-    195, ASAN 359, TSan clean).
+  - **Done: hostname resolution.** `net/reactorio.resolveHost4` parses numeric IPv4 directly and
+    resolves a name via `getaddrinfo` (new `os/sys` bindings). `reactorConnect` takes a host name, so
+    a driver reaches a named database host on the reactor. `getaddrinfo` is a blocking DNS lookup done
+    once per connection (pooled), not per request; async DNS is a later step. Corpus case 203.
+  - **Done: a whole request on the reactor.** `web/app.serveReactorConn` wraps an accepted fd in a
+    reactor-native `AsyncStream` and runs the same `handleConn` pipeline (parse, route, mediator,
+    handler, response) as the Asio path; `App.runReactor` is the opt-in single-reactor server (the
+    default `run()` keeps Asio). Corpus case 204 serves a real App request (typed route plus handler)
+    over a reactor-native stream on one reactor; the M1 io-violation guard confirms the reactor path
+    (0 violations). So the request and any per-request database call now run on the reactor.
+  - **Remaining before M3:** a multi-core reactor server (the `nova_run_reactors` worker is a bare
+    named fn that cannot yet carry the `App`, so `runReactor` is single-core for now), and async DNS.
+  - Gate (M2): client and server round trip on the reactor, connect-by-name, and a full App request,
+    all reactor-native (200 to 204); the Asio deployment does not regress. Native 197, ASAN 363,
+    TSan 209.
 - **M3. Database drivers onto the reactor.** The drivers already speak the async seam (`arecv`/`asend`
   over `AsyncStream`); once M2 provides that seam on the reactor, they run on the reactor with no
   driver change. Prereq: M2. Gate: a live driver round trip on the reactor (offline-gated codecs stay
@@ -265,9 +273,12 @@ step in this plan may change without a coordinated code-generation change:
 Already in Nova: the event loop (`net/reactor`), the buffer pools (`io/slab`, `io/arena`), the HTTP
 parser (`web/httpparser`), the poll and socket layer (`os/sys`, `os/kqueue`, `os/epoll`), and the
 share-nothing multi-core driver. Verified: a single reactor on one core out-throughputs the tuned
-frameworks' eight-core numbers; the reactor is race-free under `--tsan`. Done: M0 (trace tooling) and
-M1 (the scheduler migration) both landed. The reactor now drives nested `await` and `spawn`; the one
-remaining reactor-vs-Asio boundary (Asio-backed I/O awaited on a reactor coroutine) is guarded loud
-and is exactly what M2 removes. Next action: M2, moving `arecv`/`asend`/`aconnect`/`aaccept` onto the
-reactor over `os/sys`, which lets the database drivers and the flagship's per-request DB run on the
-reactor with no driver change.
+frameworks' eight-core numbers; the reactor is race-free under `--tsan`. Done: M0 (trace tooling),
+M1 (the scheduler migration), and M2 (async socket I/O on the reactor) all landed. The reactor drives
+nested `await` and `spawn`; recv, send, connect, accept, and resolve are reactor-native in Nova over
+`os/sys`; `AsyncStream` is dual-mode; and a whole App request runs on the reactor (`serveReactorConn`
+/ `runReactor`), verified by corpus 199 to 204, all TSan clean, with no regression to the Asio
+deployment. Next action: M3, running a live database driver on the reactor (the drivers already pick
+up `reactorio` through `AsyncStream`, so likely no driver change) and the flagship's per-request
+database on the reactor; then the multi-core reactor server (teach the `nova_run_reactors` worker to
+carry the `App`) and async DNS.
