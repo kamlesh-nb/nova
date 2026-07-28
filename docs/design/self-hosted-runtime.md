@@ -242,11 +242,15 @@ Each phase ends with a measurement or a conformance gate, so we never fly blind 
   and reaps the frame when the coroutine finishes; single reactor thread, so no CoroState and no
   mutex, which is the lockless per-reactor drive we could not safely retrofit onto Asio. Proven by
   `conformance/cases/194` (a coroutine echo over a socketpair), clean under `--tsan`. Native 188/188,
-  ASAN 345/345, TSan subset 193/193, case 194 zero races. **Still open in phase 4:** wiring the
-  coroutine handler into the standalone reactor server (one async handler per accepted connection,
-  then re-measure); share-nothing multi-core via SO_REUSEPORT across N reactor threads (where the
-  no-lock CoroState holds because each coroutine lives on exactly one reactor); the Linux epoll
-  backend behind the same `Reactor` shape.
+  ASAN 345/345, TSan subset 193/193, case 194 zero races. **Wired into the server and re-measured
+  (2026-07-28):** `flagship/bench/headtohead/nova-reactor/server_coro.nova` handles each connection
+  with a real `async fn` coroutine (await-style suspension) instead of the callback loop. Single
+  reactor, one core: about **168,500 req/s** at 100 percent success, versus **186,500** for the
+  callback server. **The async layer costs about 10 percent**, a small and reasonable price for real
+  `async`/`await` in the handler, and the coroutine server still beats every tuned framework's
+  eight-core head-to-head number on one core. **Still open in phase 4:** share-nothing multi-core via
+  SO_REUSEPORT across N reactor threads (where the no-lock CoroState holds because each coroutine
+  lives on exactly one reactor); the Linux epoll backend behind the same `Reactor` shape.
 - **Phase 5. Zero-copy HTTP/1 parser** (picohttpparser model), replacing the per-request maps.
 - **Phase 6. Port the `App` server** onto the Nova reactor. Re-run the head-to-head. Target is
   parity within about 1.2x to 1.5x of Go and Kestrel, which the profile says is reachable.

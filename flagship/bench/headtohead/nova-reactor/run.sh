@@ -9,8 +9,10 @@ DUR="${DUR:-15s}"; CONN="${CONN:-64}"; PORT="${PORT:-8099}"
 
 command -v oha >/dev/null 2>&1 || { echo "oha not installed"; exit 1; }
 
-echo "building the Nova reactor server (release)..."
-nova "$HERE/server.nova" --release -o /tmp/nova_reactor || { echo "build failed"; exit 1; }
+# SERVER=coro measures the coroutine handler; anything else measures the callback loop.
+SRC="server.nova"; [ "${SERVER:-}" = "coro" ] && SRC="server_coro.nova"
+echo "building the Nova reactor server ($SRC, release)..."
+nova "$HERE/$SRC" --release -o /tmp/nova_reactor || { echo "build failed"; exit 1; }
 
 PORT="$PORT" /tmp/nova_reactor >/tmp/nova_reactor.log 2>&1 &
 srv=$!

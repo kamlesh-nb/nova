@@ -13,17 +13,30 @@ cd lang
 DUR=15s CONN=64 ./flagship/bench/headtohead/nova-reactor/run.sh
 ```
 
-## Result (2026-07-28, Apple Silicon, 8 cores; the server used ONE)
+## Result (2026-07-28, Apple Silicon, 8 cores; the Nova servers used ONE)
+
+There are two Nova reactor servers here. `server.nova` uses a flat callback loop.
+`server_coro.nova` handles each connection with a real Nova `async fn` coroutine driven
+by the loop (`coroStart` / `currentCoro` / `coroSuspend` / `nova_reactor_resume`), which is
+the ergonomic form a real application would use.
 
 | Server | Cores | Requests/sec |
 |--------|------:|-------------:|
-| **Nova reactor (this)** | **1** | **186,549** |
+| **Nova reactor, callback** (`server.nova`) | **1** | **186,549** |
+| **Nova reactor, coroutine** (`server_coro.nova`) | **1** | **168,529** |
 | Rust axum | 8 | 134,755 |
 | C# Kestrel (minimal API) | 8 | 124,554 |
 | Go net/http | 8 | 121,743 |
 | Nova web.App | 8 | 55,409 |
 
-100 percent success, 0.34 ms average latency.
+Both Nova servers: 100 percent success, about 0.34 to 0.38 ms average latency.
+
+**The async layer costs about 10 percent** (168.5k versus 186.5k): per request the coroutine
+suspends, the reactor resumes and reaps, and the fd is re-registered, where the callback loop
+does none of that. That is a small, reasonable price for real `async`/`await` in the handler,
+and the coroutine server still out-throughputs every tuned framework's eight-core number on a
+single core. `run.sh` measures the callback server; set `SERVER=coro` to measure the coroutine
+one.
 
 **A single Nova reactor on one core out-throughputs every tuned framework's eight-core
 number.** Per core the gap is larger still: about 27 times Nova's own `web.App`, and roughly
