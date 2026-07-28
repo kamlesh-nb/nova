@@ -254,7 +254,7 @@ Each phase ends with a measurement or a conformance gate, so we never fly blind 
   `SO_REUSEPORT` listener, its own slab pool, and its own coroutines, with no shared state;
   `server_mc.nova` is the multi-core server. The multi-core code is CLEAN under ThreadSanitizer
   (`conformance/cases/195`: four concurrent reactors running coroutines over a slab pool and the
-  shared allocator, in the `--tsan` gate) — the share-nothing design and the lockless per-reactor
+  shared allocator, in the `--tsan` gate); the share-nothing design and the lockless per-reactor
   coroutine drive hold up. The multi-core THROUGHPUT, however, cannot be measured on a single
   machine: the sweep plateaus at about 185k rps regardless of reactor count, two `oha` instances
   against eight reactors summed to less than one instance, and the server used only about 70 percent
