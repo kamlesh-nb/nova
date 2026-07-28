@@ -770,6 +770,7 @@ fn reactorWorkerBody(app: App, idx: int): void {
 
     while (true) {
         let n = r.poll(-1);
+        reactor.batchBegin();
         let i = 0;
         while (i < n) {
             let fd = r.readyFd(i);
@@ -828,6 +829,7 @@ pub fn runReactor(self: App, port: int): void {
 
     while (true) {
         let n = r.poll(-1);
+        reactor.batchBegin();
         let i = 0;
         while (i < n) {
             let fd = r.readyFd(i);
