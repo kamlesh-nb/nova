@@ -827,8 +827,16 @@ pub const LlvmCompiler = struct {
         // Arena pointers are < 32MB boundary (33554432)
         const boundary = core.LLVMConstInt(self.val_type, 32 * 1024 * 1024, 0);
         const is_arena = core.LLVMBuildICmp(builder, types.LLVMIntPredicate.LLVMIntULT, ptr, boundary, "is_arena");
-        const cond = core.LLVMBuildOr(builder, is_zero, is_arena, "cond");
-        
+        // wasm: PURE BUMP — never add to the free-list. The free-list classifies blocks by a HARDCODED
+        // 32MB heap/persistent boundary, but the `__heap_base` seeding shifted those regions, so reuse
+        // corrupted still-live blocks (a freed StringBuilder buffer reused over a live string → the
+        // "garbage tail" in url/serde). Trading reuse for correctness is fine on wasm: linear memory is
+        // large and growable, and modules are short-lived. Native keeps the real free-list.
+        const cond = if (self.is_wasm)
+            core.LLVMConstInt(self.i1_type, 1, 0)
+        else
+            core.LLVMBuildOr(builder, is_zero, is_arena, "cond");
+
         _ = core.LLVMBuildCondBr(builder, cond, ret_bb, do_free_bb);
 
         core.LLVMPositionBuilderAtEnd(builder, do_free_bb);
