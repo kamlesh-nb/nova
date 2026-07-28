@@ -48,6 +48,15 @@ An item is **never** ✅ on "it compiles" or "the happy path works" — only on 
   rps** `GET /` through the proxy vs ~48.9k direct (near-zero LB overhead, 100% success); **~10.2k rps** on
   the per-request DB path (each request opens a real TCP connect). LB verified **20/20/20** perfect
   round-robin across replicas.
+- **WASM perf test (flagship compute core) ✅** — the flagship web server CANNOT compile to wasm (async +
+  sockets + TLS are native-only; the T2 capability gate rejects it with 99 clean located errors), so there
+  is no wasm web server to load-test. What a host-embedded wasm module actually runs is the per-request
+  COMPUTE CORE — the `CreateProduct` handler minus `async`/DB: `fromJson` → bind → validate → render. Same
+  source, native and wasm (`flagship/bench/`, commit `ff03f1e`). 8-core mac: native **~513k req/s** (~1.95 µs;
+  ARC frees each request), wasm under Node **~690k req/s** (~1.45 µs). Wasm edges native by ~1.35× purely
+  because its bump allocator skips the per-request ARC free — the correct trade for a request-scoped,
+  torn-down-per-invocation edge module, not a general speedup. Identical results both sides (checksum scales
+  exactly with iterations, so the loop is real). Wasm module ~82 KB; native binary ~142 KB.
 
 ## ✅ Recently completed (2026-07-27 session) — network stack + hardening (all pushed, origin/main `561d9de`)
 
