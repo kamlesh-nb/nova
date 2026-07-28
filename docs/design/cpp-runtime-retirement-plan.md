@@ -12,7 +12,7 @@ truth for progress; the phase details are below.
 | M1 | Async scheduler migration (per-reactor run queue) | M0 | DONE | Nested/multi-level `await` and `spawn`+`await` drain on the reactor (corpus 199, trace-proven); Asio-backed awaits on the reactor now fail fast via `nova_reactor_io_violation` instead of silently orphaning (their migration is M2) |
 | M2 | Async socket I/O on the reactor | M1 | DONE | `net/reactorio` = reactor-native recv/send/connect/accept/resolve in Nova over `os/sys`; a thread-local current reactor; `asyncio.AsyncStream` dual-mode; `web/app.serveReactorConn`/`runReactor` run a whole request on the reactor. Corpus 200 to 204 (socketpair, loopback connect/accept, the AsyncStream seam, connect-by-name, and a full App request), all TSan clean. Remaining before flagship-DB-on-reactor (M3): multi-core reactor server (the `runReactors` worker cannot yet carry the App) and async DNS |
 | M3 | Database drivers on the reactor | M2 | DONE (mock) | The drivers connect via `asyncConnect` and do I/O through `AsyncStream`, both reactor-native from M2, so they run on the reactor with no driver change. Corpus 205: an App handler makes a per-request DB call (mock DB on the same reactor) end to end, no Asio, closing the PH6 deadlock. A live-driver run needs a reachable database; the driver code is unchanged |
-| M4 | Retire Boost.Asio | M1 to M3 | WIP | `App.run` now defaults to the reactor (Asio kept for TLS and `NOVA_ASIO=1`); reactor-native timers landed (corpus 207). Remaining: read deadlines on the reactor, inbound TLS on the reactor, then remove the Asio socket/timer code and drop vendored Boost |
+| M4 | Retire Boost.Asio | M1 to M3 | WIP | `App.run` defaults to the reactor (Asio kept for TLS and `NOVA_ASIO=1`); reactor-native timers (corpus 207) and read deadlines (corpus 208, `readTimeoutMs` enforced) landed. Remaining: inbound TLS on the reactor, then remove the Asio socket/timer code and drop vendored Boost |
 | M5 | File and directory I/O in Nova | M4 (soft) | TODO | `nova_file_*`, `nova_dir_*` over `os/sys` |
 | M6 | Process and primitive shims | none | TODO | `core.cpp` shims to `os/sys`; tiny atomics FFI stays |
 | M7 | Channels and actors in Nova | M1, M6 | TODO | Over the reactor; verify under `--tsan` |
@@ -234,12 +234,18 @@ phase removes a real dependency and is independently verifiable.
     reactor's kqueue when on a reactor thread (the Asio `steady_timer` only off the reactor), so
     `await sleep` and, next, read deadlines no longer need Asio on the reactor. Corpus case 207.
     This also restores the timer capability that defaulting to the reactor had dropped.
-  - **Remaining, in order:** (1) wire a read deadline into `reactorio.recvInto` (arm a reactor timer
-    alongside the read, whichever fires first wins) so the reactor server enforces `readTimeoutMs`;
-    (2) inbound TLS on the reactor (a reactor-native `AsyncStream` under the wolfSSL memory-BIO pump,
-    reusing the M9 protocol work) so the TLS fallback can be dropped; (3) once nothing on any path
-    uses Asio, delete the Asio socket/timer/`g_io` code from `concurrency.cpp` and drop vendored
-    Boost. Confine Boost to `concurrency.cpp` only (already true), so the deletion is local.
+  - **Done: read deadlines on the reactor.** `reactorio.recvIntoDeadline` bounds a read by a deadline
+    against the monotonic clock (`nova_mono_ms`): a reactor timer only wakes the coroutine to re-check
+    the clock, cancelled on any exit; on timeout it returns -2 and the server closes the connection.
+    `AsyncStream.recvInto` routes to it when a timeout is set, so `handleConn`'s `readTimeoutMs` is
+    enforced on the reactor. A batch-safe resume guard (`batchBegin` per poll batch, armed only while
+    a deadline is active) stops a stale deadline-timer event from resuming a coroutine reaped earlier
+    in the same batch. Corpus case 208 (times out, and data-arrives-first).
+  - **Remaining, in order:** (1) inbound TLS on the reactor (a reactor-native `AsyncStream` under the
+    wolfSSL memory-BIO pump, reusing the M9 protocol work) so the TLS fallback can be dropped; (2)
+    once nothing on any path uses Asio, delete the Asio socket/timer/`g_io` code from
+    `concurrency.cpp` and drop vendored Boost. Confine Boost to `concurrency.cpp` only (already true),
+    so the deletion is local.
   - Gate (full M4): the runtime builds and links with no Boost include; corpus, ASAN, TSan, and the
     head-to-head all green.
 - **M5. File and directory I/O.** Reimplement `nova_file_*` and `nova_dir_*` in Nova over `os/sys`
@@ -313,9 +319,9 @@ reactor, proven with a mock) all landed. The reactor drives nested `await` and `
 connect, accept, and resolve are reactor-native in Nova over `os/sys`; `AsyncStream` is dual-mode; a
 whole App request runs on the reactor; the flagship pattern (a handler's per-request database call)
 runs end to end on the reactor with no Asio, closing the PH6 deadlock; and the App serves share-nothing
-multi-core (`runReactorMC`, `SO_REUSEPORT`). M4 is under way: `App.run` now defaults to the reactor
-(Asio kept for TLS and `NOVA_ASIO=1`), and timers are reactor-native (`EVFILT_TIMER`). Verified by
-corpus 199 to 207, all TSan clean, with no regression to the Asio deployment. Next action (finish M4):
-wire read deadlines into `reactorio.recvInto`, move inbound TLS onto the reactor, then delete the Asio
-socket/timer code and drop vendored Boost; plus a live-driver round trip against a reachable database
-(driver code unchanged) and async DNS.
+multi-core (`runReactorMC`, `SO_REUSEPORT`). M4 is under way: `App.run` defaults to the reactor (Asio
+kept for TLS and `NOVA_ASIO=1`), timers are reactor-native (`EVFILT_TIMER`), and read deadlines are
+enforced on the reactor (`readTimeoutMs`). Verified by corpus 199 to 208, all TSan clean, with no
+regression to the Asio deployment. Next action (finish M4): move inbound TLS onto the reactor, then
+delete the Asio socket/timer code and drop vendored Boost; plus a live-driver round trip against a
+reachable database (driver code unchanged) and async DNS.
