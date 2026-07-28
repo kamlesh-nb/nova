@@ -1,0 +1,50 @@
+# Flagship request-path profile (macOS `sample`, 10s under oha -c128, uncached path)
+
+Top-of-stack leaf hotspots (samples >= 16), non-idle:
+```
+        __sendto  (in libsystem_kernel.dylib)        1231
+        __recvfrom  (in libsystem_kernel.dylib)        985
+        nova_release  (in h2h_nova)        785
+        _nanov2_free  (in libsystem_malloc.dylib)        529
+        nanov2_malloc_type  (in libsystem_malloc.dylib)        303
+        pthread_mutex_lock  (in libsystem_pthread.dylib)        296
+        web_app_handleConn.resume  (in h2h_nova)        279
+        _free  (in libsystem_malloc.dylib)        208
+        pthread_mutex_unlock  (in libsystem_pthread.dylib)        169
+        _platform_memset  (in libsystem_platform.dylib)        162
+        _malloc_zone_malloc  (in libsystem_malloc.dylib)        154
+        _tlv_get_addr  (in libdyld.dylib)        140
+        nova_retain  (in h2h_nova)        121
+        get_coro_state  (in h2h_nova)        114
+        Request_fromString  (in h2h_nova)        104
+        madvise  (in libsystem_kernel.dylib)        91
+        std::unordered_map<long long, std::shared_ptr<(anonymous namespace)::CoroState>>::erase[abi:ne210107](long long const&)  (in h2h_nova)        84
+        (anonymous namespace)::audit_alloc(char const*, long long, void const*)  (in h2h_nova)        83
+        (anonymous namespace)::audit_free(char const*, long long)  (in h2h_nova)        77
+        nova_sched_schedule  (in h2h_nova)        76
+        string_split  (in h2h_nova)        74
+        boost::asio::detail::thread_info_base::allocate<boost::asio::detail::thread_info_base::default_tag>(boost::asio::detail::thread_info_base::default_tag, boost::asio::detail::thread_info_base*, unsigned long, unsigned long)  (in h2h_nova)        67
+        Response_serialize  (in h2h_nova)        65
+        web_app_bufContentLength  (in h2h_nova)        60
+        boost::asio::detail::executor_op<boost::asio::detail::strand_executor_service::invoker<boost::asio::io_context::basic_executor_type<std::allocator<void>, 0ul> const, void>, boost::asio::detail::scheduler_operation>::ptr::reset()  (in h2h_nova)        53
+        std::__hash_table<std::__hash_value_type<long long, long long>>::__emplace_unique_key_args<long long, std::piecewise_construct_t const&, std::tuple<long long const&>, std::tuple<>>(long long const&, std::piecewise_construct_t const&, std::tuple<long long const&>&&, std::tuple<>&&)  (in h2h_nova)        49
+        nova_bytes_alloc  (in h2h_nova)        48
+        __destruct_Storage_string  (in h2h_nova)        47
+        nova_coro_release  (in h2h_nova)        46
+        boost::asio::detail::scheduler::do_run_one(boost::asio::detail::conditionally_enabled_mutex::scoped_lock&, boost::asio::detail::scheduler_thread_info&, boost::system::error_code const&)  (in h2h_nova)        45
+        _platform_strcmp$VARIANT$Base  (in libsystem_platform.dylib)        42
+        boost::asio::detail::executor_op<boost::asio::detail::strand_executor_service::invoker<boost::asio::io_context::basic_executor_type<std::allocator<void>, 0ul> const, void>, boost::asio::detail::scheduler_operation>::do_complete(void*, boost::asio::detail::scheduler_operation*, boost::system::error_code const&, unsigned long)  (in h2h_nova)        42
+        std::__shared_weak_count::__release_weak()  (in libc++.1.dylib)        40
+        std::__hash_table<std::__hash_value_type<long long, long long>>::remove(std::__hash_const_iterator<std::__hash_node<std::__hash_value_type<long long, long long>, void*>*>)  (in h2h_nova)        38
+        nanov2_allocate_outlined  (in libsystem_malloc.dylib)        37
+        Map_string_string_forEach  (in h2h_nova)        36
+        nova_bytes_alloc_persistent  (in h2h_nova)        36
+        nova_arecv_deadline  (in h2h_nova)        33
+        DYLD-STUB$$_platform_bzero  (in libsystem_malloc.dylib)        32
+        boost::asio::detail::scheduler::work_finished()  (in h2h_nova)        32
+        boost::asio::detail::binder0<nova_sched_schedule::$_0>::operator()()  (in h2h_nova)        30
+        std::mutex::unlock()  (in libc++.1.dylib)        29
+        DYLD-STUB$$pthread_mutex_lock  (in libc++.1.dylib)        28
+        web_request_trimWhitespace  (in h2h_nova)        28
+        nanov2_find_block_and_allocate  (in libsystem_malloc.dylib)        27
+```
