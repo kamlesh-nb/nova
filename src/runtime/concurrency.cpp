@@ -5,7 +5,8 @@
 #include <sys/socket.h>
 #endif
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
-#include <sys/event.h>   // kqueue EVFILT_TIMER, for reactor-native timers (M4)
+#include <sys/event.h>   // kqueue EVFILT_TIMER/EVFILT_USER, for the reactor driver (M4)
+#include <unistd.h>      // close
 #define NOVA_HAVE_KQUEUE 1
 #endif
 #include <cstdio>
@@ -21,6 +22,13 @@
 #include <vector>
 
 extern "C" long long __nova_main(void);
+
+// Forward declarations of reactor primitives defined later in this file / in core.cpp, used by
+// nova_when_any_deadline (above their definitions) to arm a reactor-native deadline timer.
+extern "C" long long nova_reactor_current(void);
+extern "C" void nova_reactor_set_timer(long long handle, long long ms);
+extern "C" void nova_reactor_cancel_timer(long long handle);
+extern "C" long long nova_mono_ms(void);
 
 extern "C" {
 
@@ -200,6 +208,8 @@ struct WhenAnyDeadline {
     std::shared_ptr<boost::asio::steady_timer> timer;
     bool fired = false;
     bool armed = false;
+    bool reactor = false;    // armed on the reactor (EVFILT_TIMER) rather than Asio
+    long long deadline = 0;  // reactor mode: monotonic-ms deadline
 };
 std::mutex &g_wadl_mu = *new std::mutex();
 std::unordered_map<long long, WhenAnyDeadline> &g_wadl = *new std::unordered_map<long long, WhenAnyDeadline>();
@@ -240,13 +250,26 @@ long long nova_when_any_deadline(long long buf, long long n, long long ms, long 
             }
         }
     }
-    if (found >= 0) { wadl_clear(self); return found; }
+    const bool reactor = nova_reactor_current() != 0;
+    if (found >= 0) {
+        if (reactor) nova_reactor_cancel_timer(self);
+        wadl_clear(self);
+        return found;
+    }
 
+    // Timed out? On the reactor the deadline is measured against the monotonic clock (the timer just
+    // woke us to re-check); on Asio the timer callback set `fired`.
     bool timed_out = false;
     {
         std::lock_guard<std::mutex> lk(g_wadl_mu);
         auto it = g_wadl.find(self);
-        if (it != g_wadl.end() && it->second.fired) { g_wadl.erase(it); timed_out = true; }
+        if (it != g_wadl.end() && it->second.armed) {
+            if (it->second.reactor) {
+                if (nova_mono_ms() >= it->second.deadline) { g_wadl.erase(it); timed_out = true; }
+            } else if (it->second.fired) {
+                g_wadl.erase(it); timed_out = true;
+            }
+        }
     }
     if (timed_out) { wadl_disarm(h, n, self); return -2; }
 
@@ -260,18 +283,30 @@ long long nova_when_any_deadline(long long buf, long long n, long long ms, long 
         auto &st = g_wadl[self];
         if (!st.armed) {
             st.armed = true;
-            st.timer = std::make_shared<boost::asio::steady_timer>(g_io);
-            st.timer->expires_after(std::chrono::milliseconds(ms < 0 ? 0 : ms));
-            long long self_c = self;
-            st.timer->async_wait([self_c](const boost::system::error_code &ec) {
-                if (ec) return;
-                {
-                    std::lock_guard<std::mutex> wl(g_wadl_mu);
-                    auto it = g_wadl.find(self_c);
-                    if (it != g_wadl.end()) it->second.fired = true;
-                }
-                nova_sched_schedule(self_c);
-            });
+            if (reactor) {
+                st.reactor = true;
+                long long d = ms < 0 ? 0 : ms;
+                st.deadline = nova_mono_ms() + d;
+                nova_reactor_set_timer(self, d);
+            } else {
+                st.timer = std::make_shared<boost::asio::steady_timer>(g_io);
+                st.timer->expires_after(std::chrono::milliseconds(ms < 0 ? 0 : ms));
+                long long self_c = self;
+                st.timer->async_wait([self_c](const boost::system::error_code &ec) {
+                    if (ec) return;
+                    {
+                        std::lock_guard<std::mutex> wl(g_wadl_mu);
+                        auto it = g_wadl.find(self_c);
+                        if (it != g_wadl.end()) it->second.fired = true;
+                    }
+                    nova_sched_schedule(self_c);
+                });
+            }
+        } else if (st.reactor) {
+            // Resumed early (a future woke us but is not done, or a spurious wake) before the
+            // deadline: re-arm the one-shot reactor timer for the remaining time and keep waiting.
+            long long remaining = st.deadline - nova_mono_ms();
+            nova_reactor_set_timer(self, remaining < 0 ? 0 : remaining);
         }
     }
     return -1;
@@ -729,8 +764,60 @@ void nova_run_root(long long root) {
                      "or move the work off the request path.\n");
         std::abort();
     }
-    nova_run();
     if (!root) return;
+#if defined(NOVA_HAVE_KQUEUE)
+    // Single-threaded reactor drive (no Asio): the driver for async @tests and standalone async main.
+    // Resume the root on this thread's own reactor; compute and channels drain through the run queue
+    // during the resume, and timers and reactor-native socket I/O come back through the kqueue, which
+    // the poll loop services until the root completes. The prior nova_sched_schedule(root) from the
+    // caller posted to a strand that is never run here, so it is a no-op; the reactor resume is the
+    // one that runs the body.
+    // Fresh scheduler state for this drive. g_reactor_mode is left true by nova_reactor_resume; if it
+    // leaked across drives, the caller's nova_sched_schedule(root) for the NEXT root would divert it
+    // into g_rq (double-driving it). So start clean and clear the flag again at the end.
+    if (!g_rq) g_rq = new std::queue<long long>();
+    while (!g_rq->empty()) g_rq->pop();
+    g_reactor_mode = true;
+    g_deadline_active = false;
+    if (g_batch_reaped) g_batch_reaped->clear();
+
+    int kq = kqueue();
+    long long prev_kq = g_current_kq;
+    nova_reactor_set_current((long long)kq);
+    ++g_run_depth;
+    nova_reactor_resume(root);   // kick past the initial suspend and drain the run queue
+    int idle = 0;
+    while (!raw_coro_done(root)) {
+        struct kevent evs[64];
+        struct timespec ts;
+        ts.tv_sec = 0;
+        ts.tv_nsec = 20 * 1000 * 1000;   // 20ms tick
+        int n = kevent(kq, nullptr, 0, evs, 64, &ts);
+        if (n <= 0) {
+            if (++idle > 750) break;     // ~15s lost-wakeup cap
+            continue;
+        }
+        idle = 0;
+        nova_reactor_batch_begin();
+        for (int i = 0; i < n; ++i) {
+            nova_reactor_resume((long long)(intptr_t)evs[i].udata);
+        }
+    }
+    --g_run_depth;
+    nova_reactor_set_current(prev_kq);
+    ::close(kq);
+    // Leave reactor mode so the caller's next nova_sched_schedule (e.g. the next @test's root) takes
+    // the ordinary path, not this thread's run queue.
+    g_reactor_mode = false;
+    if (!raw_coro_done(root)) {
+        std::fprintf(stderr,
+                     "nova: fatal — async root %p never completed (lost wakeup); "
+                     "refusing to read its unwritten result\n",
+                     reinterpret_cast<void *>(root));
+        std::abort();
+    }
+#else
+    nova_run();
     for (int i = 0; i < 10000 && !raw_coro_done(root); ++i) {
         std::this_thread::yield();
         nova_run();
@@ -742,6 +829,7 @@ void nova_run_root(long long root) {
                      reinterpret_cast<void *>(root));
         std::abort();
     }
+#endif
 }
 
 long long nova_io_context(void) { return reinterpret_cast<long long>(&g_io); }

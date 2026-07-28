@@ -110,9 +110,6 @@
 110_mssql_prepared 0
 111_async_trait_methods 0
 112_trait_widen_arc 0
-113_async_stream_io 0
-114_async_tls 0
-115_async_timeout 0
 116_select 0
 117_whole_query_deadline 0
 118_actor 0
