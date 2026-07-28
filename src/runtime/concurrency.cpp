@@ -398,6 +398,35 @@ extern "C" long long nova_reactor_resume(long long h) {
     return 0;
 }
 
+// Share-nothing multi-core (self-hosted runtime, phase 4). Spawn n OS threads, each running the
+// Nova worker closure with its reactor index. Each thread sets up its own reactor and its own
+// SO_REUSEPORT listener on the shared port, so the kernel load-balances connections and there is
+// no shared state across cores. Blocks until the workers return (a server's workers loop forever).
+extern "C" void nova_run_reactors(long long n, long long box) {
+    if (!box || n <= 0) return;
+    long long fn_ptr = *reinterpret_cast<long long *>(box);
+    long long env = *reinterpret_cast<long long *>(box + sizeof(long long));
+    typedef void (*worker_fn)(long long, long long);
+    std::vector<std::thread> ts;
+    ts.reserve(static_cast<size_t>(n));
+    for (long long i = 0; i < n; i++) {
+        ts.emplace_back([fn_ptr, env, i]() {
+            reinterpret_cast<worker_fn>(fn_ptr)(env, i);
+        });
+    }
+    for (auto &t : ts) t.join();
+}
+
+// SO_REUSEPORT via the C macro (portable; the numeric value differs by platform).
+extern "C" long long nova_set_reuseport(long long fd) {
+    int one = 1;
+    int r = 0;
+#ifdef SO_REUSEPORT
+    r = ::setsockopt((int)fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+#endif
+    return (long long)r;
+}
+
 void nova_coro_release(long long handle) {
     if (!handle) return;
     std::shared_ptr<CoroState> state;

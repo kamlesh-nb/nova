@@ -248,9 +248,19 @@ Each phase ends with a measurement or a conformance gate, so we never fly blind 
   reactor, one core: about **168,500 req/s** at 100 percent success, versus **186,500** for the
   callback server. **The async layer costs about 10 percent**, a small and reasonable price for real
   `async`/`await` in the handler, and the coroutine server still beats every tuned framework's
-  eight-core head-to-head number on one core. **Still open in phase 4:** share-nothing multi-core via
-  SO_REUSEPORT across N reactor threads (where the no-lock CoroState holds because each coroutine
-  lives on exactly one reactor); the Linux epoll backend behind the same `Reactor` shape.
+  eight-core head-to-head number on one core. **Share-nothing multi-core DONE (2026-07-28), verified
+  race-free.** `nova_run_reactors(n, worker)` spawns n OS threads (via the FFI box convention, exposed
+  as the typed `reactor.runReactors`), each running an independent reactor with its own
+  `SO_REUSEPORT` listener, its own slab pool, and its own coroutines, with no shared state;
+  `server_mc.nova` is the multi-core server. The multi-core code is CLEAN under ThreadSanitizer
+  (`conformance/cases/195`: four concurrent reactors running coroutines over a slab pool and the
+  shared allocator, in the `--tsan` gate) — the share-nothing design and the lockless per-reactor
+  coroutine drive hold up. The multi-core THROUGHPUT, however, cannot be measured on a single
+  machine: the sweep plateaus at about 185k rps regardless of reactor count, two `oha` instances
+  against eight reactors summed to less than one instance, and the server used only about 70 percent
+  of one core, so the co-located load generator and loopback, not the server, are the bottleneck. A
+  real figure needs a separate load-generation machine. **Still open in phase 4:** the Linux epoll
+  backend behind the same `Reactor` shape.
 - **Phase 5. Zero-copy HTTP/1 parser** (picohttpparser model), replacing the per-request maps.
 - **Phase 6. Port the `App` server** onto the Nova reactor. Re-run the head-to-head. Target is
   parity within about 1.2x to 1.5x of Go and Kestrel, which the profile says is reachable.

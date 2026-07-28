@@ -15,6 +15,14 @@ import os.sys;
 import os.kqueue;
 import io.slab;
 
+// Run `n` share-nothing reactor threads, each invoking `worker(reactorIndex)`. The typed closure
+// param boxes a named worker fn correctly at the call site; the runtime spawns the OS threads and
+// blocks until they return (a server's workers loop forever). Each worker sets up its own reactor
+// and SO_REUSEPORT listener, so there is no shared state across cores.
+pub fn runReactors(n: int, worker: (int) -> void): void {
+    nova_run_reactors(n, worker);
+}
+
 pub struct Reactor {
     pub kq: int,
     pub eventBuf: long,

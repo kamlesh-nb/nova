@@ -275,7 +275,7 @@ if [[ $TSAN_MODE -eq 1 ]]; then
     echo "  ERROR: libnova_runtime_tsan.a missing — run: NOVA_TSAN=1 zig build" >&2
     exit 2
   fi
-  TSAN_CASES=(10_async_go 11_channels 102_future_first_class 103_async_when_all 113_async_stream_io)
+  TSAN_CASES=(10_async_go 11_channels 102_future_first_class 103_async_when_all 113_async_stream_io 195_multicore_reactors)
   for name in "${TSAN_CASES[@]}"; do
     [[ -n "$FILTER" && "$name" != *"$FILTER"* ]] && continue
     f="$HERE/cases/$name.nova"

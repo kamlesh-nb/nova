@@ -1,0 +1,50 @@
+// Phase 4: share-nothing multi-core. nova_run_reactors spawns N OS threads, each running an
+// independent reactor with its own coroutines and slab pool. This test runs the coroutine echo
+// on 4 threads at once; the point is what `--tsan` verifies here: the per-thread coroutine drive,
+// the slab pool, and the shared allocator are race-free across reactors. Completing without a
+// crash or a TSan report IS the assertion. macOS/BSD.
+import assert;
+import bytes;
+import os.sys;
+import net.reactor;
+
+async fn echoW(r: reactor.Reactor, fd: int): void {
+    r.addRead(fd, currentCoro());
+    coroSuspend();
+    let buf = r.getBuffer();
+    let n = sys.read(fd, buf, 256);
+    if (n > 0) { sys.write(fd, buf, n); }
+    r.putBuffer(buf);
+}
+
+fn worker(idx: int): void {
+    let (a, b) = sys.newSocketPair(sys.AF_UNIX, sys.SOCK_STREAM);
+    let r = reactor.Reactor(8, 512, 4);
+    coroStart(echoW(r, b));
+
+    let out = bytes.alloc(2);
+    bytes.write_byte(out, 0, 88);
+    bytes.write_byte(out, 1, 89);
+    sys.write(a, out, 2);
+
+    let n = r.poll(1000);
+    if (n == 1) {
+        nova_reactor_resume(r.readyToken(0));
+    }
+
+    let inb = bytes.alloc(8);
+    let got = sys.read(a, inb, 8);
+    let _ = got;   // the echo round-trip completed; correctness is covered by case 194
+
+    bytes.free(out);
+    bytes.free(inb);
+    sys.close(a);
+    sys.close(b);
+    r.destroy();
+}
+
+@test
+fn test_multicore_reactors(): void {
+    reactor.runReactors(4, worker);   // 4 threads, each an independent reactor; joins when done
+    assert.isTrue(true);
+}

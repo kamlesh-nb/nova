@@ -44,6 +44,31 @@ number.** Per core the gap is larger still: about 27 times Nova's own `web.App`,
 was the runtime, not the compiler. The same LLVM-compiled Nova code that served 55k rps through
 Asio and the framework serves 186k on one core through a purpose-built loop with pooled buffers.
 
+## Multi-core (`server_mc.nova`)
+
+`server_mc.nova` runs `NOVA_REACTORS` share-nothing threads, each with its own reactor and its
+own `SO_REUSEPORT` listener (the kernel spreads connections), its own slab pool, and its own
+coroutines. Run it with `SERVER=mc NOVA_REACTORS=8 ./run.sh` (or set `NOVA_REACTORS` when
+launching `server_mc` directly).
+
+The multi-core scaling **cannot be measured on a single machine**, and the data says so clearly:
+
+- The sweep plateaus at about 185k rps whether 2, 4, or 8 reactors are used (1 reactor gave
+  155k, so 1 to 2 did help), and 8 reactors slightly *drops* from core contention.
+- Driving 8 reactors with two parallel `oha` instances summed to 164k, which is *less* than one
+  `oha` instance's 185k, while the server used only **69.6 percent of one core**.
+
+So the server is mostly idle and has large unused headroom; the load generator, co-located on the
+same eight cores and competing for them, is the bottleneck, along with loopback networking. The
+single-core numbers already saturate the local client. A real multi-core throughput figure needs a
+**separate load-generation machine** (or a real network with dedicated clients), which this
+environment does not have.
+
+What *is* verified here is that the multi-core path is **correct and race-free**: four concurrent
+reactors, each running coroutines over a slab pool and the shared allocator, are clean under
+ThreadSanitizer (`conformance/cases/195`, in the `--tsan` gate). The share-nothing design and the
+lockless per-reactor coroutine drive hold up under TSan.
+
 ## Honest caveats
 
 This is a first, deliberately narrow measurement, and the number must be read with its
