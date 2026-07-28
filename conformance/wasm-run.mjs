@@ -12,8 +12,14 @@
 import { readFileSync } from 'node:fs';
 import crypto from 'node:crypto';
 
-const path = process.argv[2];
-if (!path) { console.error('usage: wasm-run.mjs <module.wasm>'); process.exit(2); }
+// --guard: bounds-checking mode. Static data ([0, __heap_base)) is effectively read-only for a running
+// program (string/decimal literals, trait vtables), EXCEPT the allocator's own globals. After every
+// @test we re-verify that region is byte-identical; the FIRST test that mutates it is the one doing an
+// out-of-bounds write — which is exactly how a corrupted vtable/function-pointer becomes a
+// call_indirect "null function". Reports the test, the changed offset(s), and old→new bytes.
+const GUARD = process.argv.includes('--guard');
+const path = process.argv.filter((a) => a !== '--guard')[2];
+if (!path) { console.error('usage: wasm-run.mjs [--guard] <module.wasm>'); process.exit(2); }
 const wasmBytes = readFileSync(path);
 
 let memory, exports;
@@ -294,11 +300,63 @@ const tests = Object.keys(exports).filter(
 );
 if (tests.length === 0) { console.error('no @test exports found'); process.exit(1); }
 
+// ---- bounds-checking guard setup ----------------------------------------------------------------
+let guardBase = 0, snapshot = null, allocGlobals = [];
+if (GUARD) {
+  // Watch ONLY true static data [0, __data_end) — the region holding string/decimal literals and trait
+  // vtables. The SHADOW STACK lives in [__data_end, __heap_base) and mutates legitimately, so watching
+  // up to __heap_base drowns the signal in stack noise. __data_end is the honest read-only boundary.
+  guardBase = Number(exports.__data_end?.value ?? exports.__heap_base?.value ?? 0);
+  // The allocator's bump pointers live INSIDE static data and change legitimately — exclude them.
+  for (const g of ['heap_ptr', 'persistent_ptr', 'free_list']) {
+    const gv = exports[g];
+    if (gv) { const a = Number(gv.value); for (let i = a; i < a + 8; i++) allocGlobals.push(i); }
+  }
+  const excl = new Set(allocGlobals);
+  snapshot = u8().slice(0, guardBase);
+  for (const i of excl) snapshot[i] = 0; // normalize excluded bytes so they never count as a diff
+  console.error(`[guard] watching static data [0, ${guardBase}) minus ${excl.size} allocator bytes`);
+}
+function guardCheck(afterName) {
+  const cur = u8();
+  const excl = new Set(allocGlobals);
+  let first = -1, count = 0, sample = '';
+  for (let i = 0; i < guardBase; i++) {
+    const b = excl.has(i) ? 0 : cur[i];
+    if (b !== snapshot[i]) {
+      if (first < 0) { first = i; sample = `[${i}] ${snapshot[i]}->${cur[i]}`; }
+      count++;
+    }
+  }
+  if (first >= 0) {
+    console.error(`[guard] CORRUPTION after '${afterName}': ${count} static-data byte(s) changed, first at offset ${first}  (${sample})`);
+    // resync so we report each NEW corrupter, not the same one repeatedly
+    snapshot = u8().slice(0, guardBase);
+    for (const i of excl) snapshot[i] = 0;
+    return true;
+  }
+  return false;
+}
+
 let failName = '';
+let anyCorruption = false;
 for (const name of tests) {
+  let trap = null;
   try { exports[name](); }
-  catch (e) { failed = true; failName = name; failMsg = `trap: ${e.message}`; break; }
+  catch (e) { trap = e.message; }
+  if (GUARD) {
+    if (trap) console.error(`[guard] (test '${name}' trapped: ${trap})`);
+    if (guardCheck(name)) anyCorruption = true;
+    failed = false; // keep going — we want to see EVERY corrupter, not stop at the first symptom
+    continue;
+  }
+  if (trap) { failed = true; failName = name; failMsg = `trap: ${trap}`; break; }
   if (failed) { failName = name; break; }
+}
+if (GUARD) {
+  console.error(anyCorruption ? '[guard] static-data corruption detected (see first-offset above)'
+                              : '[guard] static data intact across all tests');
+  process.exit(anyCorruption ? 3 : 0);
 }
 if (failed) { console.error(`FAIL in ${failName}: ${failMsg}`); process.exit(1); }
 console.error(`ok: ${tests.length} @test fn(s)`);
