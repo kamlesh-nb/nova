@@ -846,7 +846,30 @@ pub const LlvmCompiler = struct {
         
         core.LLVMPositionBuilderAtEnd(ab, a_entry_bb);
         const a_size = core.LLVMGetParam(alloc_fn, 0);
-        
+
+        // wasm: lazily seed the bump pointers from `__heap_base` (the linker's true end-of-static-data)
+        // on the first allocation — a static ptrtoint initializer is illegal on wasm, and the @test
+        // harness never calls main. heap_ptr==0 is the "uninitialized" sentinel (a real heap base is
+        // never 0). Without this the heap started inside the data section and clobbered .rodata/.data.
+        if (self.is_wasm) {
+            if (core.LLVMGetNamedGlobal(self.module, "__heap_base")) |heap_base| {
+                const seed_bb = core.LLVMAppendBasicBlock(alloc_fn, "seed_heap");
+                const cont_bb = core.LLVMAppendBasicBlock(alloc_fn, "alloc_cont");
+                const cur = core.LLVMBuildLoad2(ab, self.val_type, self.heap_ptr.?, "seed_cur");
+                const is0 = core.LLVMBuildICmp(ab, .LLVMIntEQ, cur, core.LLVMConstInt(self.val_type, 0, 0), "heap_uninit");
+                _ = core.LLVMBuildCondBr(ab, is0, seed_bb, cont_bb);
+                core.LLVMPositionBuilderAtEnd(ab, seed_bb);
+                const hb = core.LLVMBuildPtrToInt(ab, heap_base, self.val_type, "heap_base_int");
+                _ = core.LLVMBuildStore(ab, hb, self.heap_ptr.?);
+                if (self.persistent_ptr) |pp| {
+                    const poff = core.LLVMConstInt(self.val_type, 32 * 1024 * 1024, 0);
+                    _ = core.LLVMBuildStore(ab, core.LLVMBuildAdd(ab, hb, poff, "pbase"), pp);
+                }
+                _ = core.LLVMBuildBr(ab, cont_bb);
+                core.LLVMPositionBuilderAtEnd(ab, cont_bb);
+            }
+        }
+
         const a_old_ptr = core.LLVMBuildLoad2(ab, self.val_type, self.heap_ptr.?, "old_heap");
         const a_size_i32 = core.LLVMBuildTrunc(ab, a_size, self.i32_type, "size_i32");
         const a_size_ptr2 = core.LLVMBuildIntToPtr(ab, a_old_ptr, core.LLVMPointerType(self.i32_type, 0), "size_ptr2");

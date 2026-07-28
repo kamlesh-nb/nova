@@ -118,16 +118,34 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
     }
     const heap_start = if (total_data_size < 1024) @as(u32, 1024) else (total_data_size + 15) & ~@as(u32, 15);
 
+    // The wasm bump allocator's start. The `total_data_size` estimate above only counts Nova string
+    // literals — it CANNOT see the decimal-literal C-strings (LLVMBuildGlobalString), trait vtables, the
+    // heap_ptr/free_list/persistent_ptr globals, or anything else wasm-ld lays out. Starting the heap at
+    // that estimate put it INSIDE the linker's data section, so the first allocations clobbered .rodata/
+    // .data (a decimal literal read back as garbage — bug #23 tail). On wasm, start the heap at
+    // `__heap_base`, the symbol wasm-ld sets to the true (aligned) end of static data. Native links the
+    // C++ runtime allocator, so this LLVM bump allocator is wasm-only; keep the estimate there.
     const heap_ptr_global = core.LLVMAddGlobal(compiler.module, compiler.val_type, "heap_ptr");
-    core.LLVMSetInitializer(heap_ptr_global, core.LLVMConstInt(compiler.val_type, @intCast(heap_start), 0));
+    const persistent_ptr_global = core.LLVMAddGlobal(compiler.module, compiler.val_type, "persistent_ptr");
+    if (is_wasm) {
+        // wasm can't `ptrtoint(&__heap_base)` in a STATIC initializer, and the @test harness never calls
+        // main — so init to 0 (a sentinel: __heap_base is never 0) and lazily set heap_ptr/persistent_ptr
+        // to __heap_base on the first allocation (see nova_bytes_alloc emission in llvm_codegen.zig).
+        // Declare __heap_base so that emission can reference it.
+        const heap_base = core.LLVMAddGlobal(compiler.module, compiler.i8_type, "__heap_base");
+        core.LLVMSetLinkage(heap_base, .LLVMExternalLinkage);
+        core.LLVMSetInitializer(heap_ptr_global, core.LLVMConstInt(compiler.val_type, 0, 0));
+        core.LLVMSetInitializer(persistent_ptr_global, core.LLVMConstInt(compiler.val_type, 0, 0));
+    } else {
+        core.LLVMSetInitializer(heap_ptr_global, core.LLVMConstInt(compiler.val_type, @intCast(heap_start), 0));
+        core.LLVMSetInitializer(persistent_ptr_global, core.LLVMConstInt(compiler.val_type, @intCast(heap_start + 32 * 1024 * 1024), 0));
+    }
     compiler.heap_ptr = heap_ptr_global;
 
     const free_list_global = core.LLVMAddGlobal(compiler.module, compiler.val_type, "free_list");
     core.LLVMSetInitializer(free_list_global, core.LLVMConstInt(compiler.val_type, 0, 0));
     compiler.free_list = free_list_global;
 
-    const persistent_ptr_global = core.LLVMAddGlobal(compiler.module, compiler.val_type, "persistent_ptr");
-    core.LLVMSetInitializer(persistent_ptr_global, core.LLVMConstInt(compiler.val_type, @intCast(heap_start + 32 * 1024 * 1024), 0));
     compiler.persistent_ptr = persistent_ptr_global;
 
     // Declare global string literals in LLVM

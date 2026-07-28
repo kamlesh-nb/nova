@@ -12,7 +12,9 @@
 123_any_container.nova
 126_ternary.nova
 127_value_optional_zero.nova
+15_name_resolution.nova
 16_block_scope.nova
+164_default_ctor_list_init.nova
 165_scope_shadowing.nova
 166_optional_chaining.nova
 168_enum_method_and_optional.nova
@@ -25,6 +27,8 @@
 21_new_with_allocator.nova
 22_static_methods.nova
 23_module_qualified_calls.nova
+26_utf8.nova
+28_tuple_return_heap.nova
 30_optional_member_access.nova
 31_atomics.nova
 32_error_payloads.nova
@@ -32,6 +36,7 @@
 35_closure_returns_struct.nova
 36_enum_method_dispatch.nova
 38_optional_deref_guard.nova
+39_declared_type_ownership.nova
 40_map_refcounted_closure.nova
 41_struct_literal_owned_field.nova
 42_nested_owned_aggregates.nova
@@ -41,9 +46,14 @@
 47_ifexpr_owned.nova
 48_template_borrowed_part.nova
 49_closure_interpolation.nova
+50_decimal.nova
+51_bson_decimal.nova
 55_generic_traits.nova
+56_typed_mediator.nova
+57_mediator_discovery.nova
 61_nested_owned_list.nova
 63_db_seam.nova
+68_generic_method_mono.nova
 71_tuple_element_typed_ops.nova
 76_optional_builtin_deref_guard.nova
 77_module_scoped_types.nova
@@ -53,5 +63,9 @@
 81_erased_trait_destroy.nova
 87_crypto_base64.nova
 88_bitwise_xor.nova
+90_bson_binary.nova
 91_optional_soundness.nova
+92_regex.nova
 93_loop_early_return_arc.nova
+94_decimal_conv.nova
+95_decimal_parse.nova

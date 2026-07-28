@@ -42,6 +42,16 @@ function readN(ptr, len) {
   ptr = ptr32(ptr); len = Number(len);
   return new TextDecoder().decode(u8().subarray(ptr, ptr + len));
 }
+// Read a NUL-terminated C string (an LLVM global, e.g. a decimal literal handed to
+// nova_decimal_from_string) — NOT length-prefixed like a nova string.
+function readCStr(ptr) {
+  ptr = ptr32(ptr);
+  if (ptr === 0) return '';
+  const mem = u8();
+  let end = ptr;
+  while (end < mem.length && mem[end] !== 0) end++;
+  return new TextDecoder().decode(mem.subarray(ptr, end));
+}
 // Allocate a nova string via the module allocator, return its byte ptr (BigInt).
 function makeStr(s) {
   const b = new TextEncoder().encode(s);
@@ -74,6 +84,152 @@ const atomicRW = {
   cas_bool: (p, e, d) => { p = ptr32(p); const o = u8()[p] ? 1 : 0; if (o === e) { u8()[p] = d ? 1 : 0; return 1; } return 0; },
 };
 
+// decimal128 (BID) — a faithful BigInt port of src/runtime/decimal.cpp. A nova `decimal` is a POINTER
+// to a 16-byte little-endian BID128: number = (-1)^sign * coeff * 10^(biasedExp - 6176), with
+// sign=bit127, biasedExp=bits126..113 (14b), coeff=bits112..0 (113b). BigInt is exact, so no u128
+// overflow bookkeeping is needed except to match the C++ rounding at encode/align/div.
+const DEC_BIAS = 6176, DEC_MAXD = 34, DEC_MAXBIASED = 12287;
+const MASK113 = (1n << 113n) - 1n, MASK64 = (1n << 64n) - 1n;
+const decNumDigits = (v) => (v === 0n ? 1 : String(v).length);
+const decPow10 = (k) => 10n ** BigInt(k);
+const decRoundDrop = (coeff, k) => {                    // drop low k digits, round-half-even
+  if (k <= 0) return coeff;
+  const div = decPow10(k), q = coeff / div, r = coeff % div, half = div / 2n;
+  if (r > half) return q + 1n;
+  if (r === half && (q & 1n) === 1n) return q + 1n;
+  return q;
+};
+function decDecode(ptr) {
+  const p = ptr32(ptr);
+  const v = (view().getBigUint64(p + 8, true) << 64n) | view().getBigUint64(p, true);
+  const sign = Number((v >> 127n) & 1n);
+  if (((v >> 125n) & 3n) === 3n) return { sign, coeff: 0n, exp: 0, special: true };
+  const biased = Number((v >> 113n) & 0x3fffn);
+  return { sign, coeff: v & MASK113, exp: biased - DEC_BIAS, special: false };
+}
+function decPack(sign, coeff, exp) {
+  let biased = exp + DEC_BIAS;
+  if (biased < 0) biased = 0; if (biased > DEC_MAXBIASED) biased = DEC_MAXBIASED;
+  let v = (coeff & MASK113) | (BigInt(biased & 0x3fff) << 113n);
+  if (sign) v |= 1n << 127n;
+  const p = ptr32(exports.nova_bytes_alloc(16n));
+  view().setBigUint64(p, v & MASK64, true);
+  view().setBigUint64(p + 8, (v >> 64n) & MASK64, true);
+  return BigInt(p);
+}
+function decEncode(d) {
+  let nd = decNumDigits(d.coeff);
+  if (nd > DEC_MAXD) {
+    const drop = nd - DEC_MAXD; d.coeff = decRoundDrop(d.coeff, drop); d.exp += drop;
+    if (decNumDigits(d.coeff) > DEC_MAXD) { d.coeff = decRoundDrop(d.coeff, 1); d.exp += 1; }
+  }
+  if (d.coeff === 0n) d.sign = 0;
+  return decPack(d.sign, d.coeff, d.exp);
+}
+function decAlign(a, b) {
+  let E = Math.min(a.exp, b.exp);
+  const msd = Math.max(a.exp + decNumDigits(a.coeff), b.exp + decNumDigits(b.coeff));
+  if (E < msd - 37) E = msd - 37;
+  for (const d of [a, b]) {
+    if (d.exp > E) { d.coeff *= decPow10(d.exp - E); d.exp = E; }
+    else if (d.exp < E) { d.coeff = decRoundDrop(d.coeff, E - d.exp); d.exp = E; }
+  }
+}
+function decAddSigned(a, b) {
+  if (a.special || b.special) return decPack(0, 0n, 0);
+  decAlign(a, b);
+  const r = { sign: 0, coeff: 0n, exp: a.exp, special: false };
+  if (a.sign === b.sign) { r.coeff = a.coeff + b.coeff; r.sign = a.sign; }
+  else if (a.coeff >= b.coeff) { r.coeff = a.coeff - b.coeff; r.sign = a.sign; }
+  else { r.coeff = b.coeff - a.coeff; r.sign = b.sign; }
+  return decEncode(r);
+}
+const dec = {
+  fromStr(str) {
+    str = str.trim(); let i = 0, sign = 0;
+    if (str[i] === '+') i++; else if (str[i] === '-') { sign = 1; i++; }
+    let coeff = 0n, frac = 0, seenDot = false, exp = 0;
+    for (; i < str.length; i++) {
+      const c = str[i];
+      if (c === '.') { if (seenDot) break; seenDot = true; continue; }
+      if (c === 'e' || c === 'E') { exp += parseInt(str.slice(i + 1), 10) || 0; i = str.length; break; }
+      if (c < '0' || c > '9') break;
+      coeff = coeff * 10n + BigInt(c.charCodeAt(0) - 48); if (seenDot) frac++;
+    }
+    exp -= frac;
+    return decEncode({ sign, coeff, exp, special: false });
+  },
+  toStr(ptr) {
+    const { sign, coeff, exp, special } = decDecode(ptr);
+    if (special) return '0';
+    const S = coeff === 0n ? '0' : String(coeff), nd = S.length;
+    let out = (sign && !(nd === 1 && S === '0')) ? '-' : '';
+    if (exp >= 0) out += S + '0'.repeat(exp);
+    else {
+      const point = nd + exp;
+      if (point <= 0) out += '0.' + '0'.repeat(-point) + S;
+      else out += S.slice(0, point) + '.' + S.slice(point);
+    }
+    return out;
+  },
+  add: (a, b) => decAddSigned(decDecode(a), decDecode(b)),
+  sub: (a, b) => { const bb = decDecode(b); bb.sign ^= 1; return decAddSigned(decDecode(a), bb); },
+  mul(a, b) {
+    const x = decDecode(a), y = decDecode(b);
+    if (x.special || y.special) return decPack(0, 0n, 0);
+    return decEncode({ sign: x.sign ^ y.sign, coeff: x.coeff * y.coeff, exp: x.exp + y.exp, special: false });
+  },
+  div(a, b) {
+    const x = decDecode(a), y = decDecode(b);
+    if (x.special || y.special) return decPack(0, 0n, 0);
+    if (y.coeff === 0n) { failed = true; failMsg = 'decimal divide by zero'; return decPack(0, 0n, 0); }
+    if (x.coeff === 0n) return decPack(0, 0n, 0);
+    let P = DEC_MAXD + 1 - decNumDigits(x.coeff); if (P < 0) P = 0;
+    const num = x.coeff * decPow10(P), q0 = num / y.coeff, rem = num % y.coeff, twice = rem * 2n;
+    let q = q0;
+    if (twice > y.coeff) q += 1n; else if (twice === y.coeff && (q & 1n) === 1n) q += 1n;
+    const r = { sign: x.sign ^ y.sign, coeff: q, exp: x.exp - y.exp - P, special: false };
+    const pref = x.exp - y.exp;                          // preferred exponent: 0.25 not 0.2500…0
+    while (r.exp < pref && r.coeff !== 0n && r.coeff % 10n === 0n) { r.coeff /= 10n; r.exp += 1; }
+    return decEncode(r);
+  },
+  mod(a, b) {
+    const x = decDecode(a), y = decDecode(b);
+    if (x.special || y.special) return decPack(0, 0n, 0);
+    if (y.coeff === 0n) { failed = true; failMsg = 'decimal modulo by zero'; return decPack(0, 0n, 0); }
+    decAlign(x, y);
+    return decEncode({ sign: x.sign, coeff: x.coeff % y.coeff, exp: x.exp, special: false });
+  },
+  cmp(a, b) {
+    const x = decDecode(a), y = decDecode(b);
+    if (x.special || y.special) return 0n;
+    const xz = x.coeff === 0n, yz = y.coeff === 0n;
+    if (xz && yz) return 0n;
+    const xs = xz ? 0 : (x.sign ? -1 : 1), ys = yz ? 0 : (y.sign ? -1 : 1);
+    if (xs !== ys) return xs < ys ? -1n : 1n;
+    decAlign(x, y);
+    const mag = x.coeff < y.coeff ? -1 : (x.coeff > y.coeff ? 1 : 0);
+    return BigInt(xs < 0 ? -mag : mag);
+  },
+  fromInt(n) {
+    n = BigInt.asIntN(64, n); const sign = n < 0n ? 1 : 0;
+    return decEncode({ sign, coeff: n < 0n ? -n : n, exp: 0, special: false });
+  },
+  toInt(ptr) {
+    const d = decDecode(ptr); if (d.special) return 0n;
+    let mag = d.coeff;
+    if (d.exp > 0) mag *= decPow10(d.exp);
+    else if (d.exp < 0) mag = -d.exp >= 39 ? 0n : mag / decPow10(-d.exp);
+    const IMAX = (1n << 63n) - 1n, IMINMAG = 1n << 63n;
+    if (d.sign) {
+      if (mag > IMINMAG) { failed = true; failMsg = 'decimal to int overflow'; return 0n; }
+      return mag === IMINMAG ? -(1n << 63n) : -mag;
+    }
+    if (mag > IMAX) { failed = true; failMsg = 'decimal to int overflow'; return 0n; }
+    return mag;
+  },
+};
+
 const env = {
   log: () => {},                       // stdout suppressed for the gate
   nova_test_fail: (p) => { failed = true; failMsg = readStr(p); },
@@ -100,6 +256,7 @@ const env = {
   // prints 3.0 as "3", 2.5 as "2.5" — the shortest round-trip repr, == String(f).
   nova_f64_to_string: (f) => makeStr(String(f)),
   nova_bool_to_string: (b) => makeStr(Number(b) ? 'true' : 'false'),
+  nova_f64_bits: (d) => { const dv = new DataView(new ArrayBuffer(8)); dv.setFloat64(0, d, true); return dv.getBigInt64(0, true); },
 
   nova_getenv: (p) => makeStr(process.env[readStr(p)] ?? ''),
   nova_setenv: () => {},
@@ -111,11 +268,13 @@ const env = {
   nova_hmac_sha256: (k, m) => makeStr(crypto.createHmac('sha256', readStr(k)).update(readStr(m)).digest('hex')),
   nova_random_hex: (n) => makeStr(crypto.randomBytes(Number(n)).toString('hex')),
 
-  // Decimal128 is not reimplemented in JS; these cases fail here but still link.
-  nova_decimal_from_string: () => 0n,
-  nova_decimal_to_string: () => makeStr('<decimal-unsupported>'),
-  nova_decimal_add: () => 0n, nova_decimal_sub: () => 0n, nova_decimal_mul: () => 0n,
-  nova_decimal_div: () => 0n, nova_decimal_mod: () => 0n, nova_decimal_cmp: () => 0n,
+  // decimal128 (BID) — faithful BigInt port of decimal.cpp (see `dec` above).
+  nova_decimal_from_string: (p) => dec.fromStr(readCStr(p)),   // literal path: NUL-terminated C string
+  nova_decimal_from_string_n: (p, n) => dec.fromStr(readN(p, n)),
+  nova_decimal_to_string: (p) => makeStr(dec.toStr(p)),
+  nova_decimal_add: dec.add, nova_decimal_sub: dec.sub, nova_decimal_mul: dec.mul,
+  nova_decimal_div: dec.div, nova_decimal_mod: dec.mod, nova_decimal_cmp: dec.cmp,
+  nova_decimal_from_int: dec.fromInt, nova_decimal_to_int: dec.toInt,
 
   nova_atomic_load_i32: atomicRW.load_i32, nova_atomic_load_i64: atomicRW.load_i64, nova_atomic_load_bool: atomicRW.load_bool,
   nova_atomic_store_i32: atomicRW.store_i32, nova_atomic_store_i64: atomicRW.store_i64, nova_atomic_store_bool: atomicRW.store_bool,
