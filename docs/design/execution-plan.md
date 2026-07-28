@@ -70,6 +70,16 @@ An item is **never** ✅ on "it compiles" or "the happy path works" — only on 
   dispatch) doing more than a bare handler. Closing it is runtime/framework hot-path engineering (zero-copy
   parse, fewer allocs, cheaper dispatch), not a compiler or memory-model change. Placement: language/codegen
   in the Rust/Go/C# tier, web stack not yet delivering that tier's throughput.
+- **Request-path profile + optimization pass 1 ✅** — `flagship/bench/PROFILE.md`: macOS `sample` under load
+  showed the reactor is IDLE (kevent = 50.8k samples vs 8.1k non-idle on-CPU; Asio scheduler only ~6%), so a
+  tokio-style runtime rewrite would target the wrong layer. On-CPU cost is ~50% memory/ARC/locking + per-coro
+  state, ~29% unbatched send/recv syscalls, ~7% HTTP parse/framework. Two profile-guided fixes landed: (1)
+  runtime — the ARC audit guard was a function-local `static` (thread-safe-static check on EVERY alloc/free +
+  blocked inlining) → load-once global; (2) framework — `Request.fromString` built 3 cap-16 hash maps per
+  request (query/headers/cookies) even when unused → cap 1–8, still auto-resizing. Result: Nova **48.7k →
+  55.4k rps at c=64 (+14%)**, gap to Go/Rust/C# narrowed from ~2.5–2.9× to ~2.2–2.4×; corpus 180/180, ASAN
+  329/329 green. Open levers (bigger): per-reactor lockless CoroState, full per-request arena / in-place
+  header parse, syscall batching — all on Asio, no rewrite.
 
 ## ✅ Recently completed (2026-07-27 session) — network stack + hardening (all pushed, origin/main `561d9de`)
 

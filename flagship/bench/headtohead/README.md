@@ -31,12 +31,41 @@ example, Rust with no crates.io access) are skipped, not fatal. `oha` is require
 
 ## Results (2026-07-28, Apple Silicon, 8 cores, 15s @ 64 connections)
 
-| Language (stack) | Requests/sec | Relative to Nova |
+After optimization pass 1 (see below):
+
+| Language (stack) | Requests/sec | Nova as fraction |
 |------------------|-------------:|-----------------:|
-| Rust (axum) | 143,120 | 2.94x |
-| Go (net/http) | 121,954 | 2.50x |
-| C# (ASP.NET minimal API) | 120,107 | 2.46x |
-| **Nova (web.App)** | **48,737** | 1.00x |
+| Rust (axum) | 134,755 | 0.41x |
+| C# (ASP.NET minimal API) | 124,554 | 0.44x |
+| Go (net/http) | 121,743 | 0.46x |
+| **Nova (web.App)** | **55,409** | 1.00x |
+
+Nova is now roughly 2.2x to 2.4x behind the tuned frameworks, down from 2.5x to 2.9x.
+
+### Optimization pass 1 (measured, +14 percent for Nova)
+
+Guided by the profile in `../PROFILE.md`, two low-risk changes:
+
+1. **Runtime: removed a per-allocation guard.** The ARC audit hooks gated on a
+   function-local `static` (`audit_enabled()` / `dump_enabled()`), which compiles to a
+   thread-safe-static guard check on every alloc and free and also blocks inlining. Changed
+   to a load-once global, so the disabled path folds away and the hooks inline. (The audit
+   feature still works when `NOVA_ARC_AUDIT` is set.)
+2. **Framework: less eager per-request allocation.** `Request.fromString` built three
+   `Map<string,string>` hash maps (query, headers, cookies) at capacity 16 on every
+   request, even when unused. Query and cookies (usually empty) now start at capacity 1 to
+   4, headers at 8; the maps still auto-resize, so behaviour is unchanged.
+
+Nova went from 48,737 to 55,409 rps at c=64 (reproduced twice). Native corpus 180/180 and
+ASAN 329/329 remained green. This is a first pass; the larger levers (a per-reactor
+lockless CoroState, full per-request arena, and syscall batching) are still open, per
+`../PROFILE.md`.
+
+### Earlier baseline (before pass 1)
+
+| Rust | Go | C# | Nova |
+|-----:|---:|---:|-----:|
+| 143,120 | 121,954 | 120,107 | 48,737 |
 
 ## Honest reading
 

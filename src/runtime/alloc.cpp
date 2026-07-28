@@ -21,18 +21,14 @@ inline bool is_in_arena(const char *ptr) {
          ptr < t_arena_start + FALLBACK_ARENA_SIZE;
 }
 
-inline bool audit_enabled() {
-  static const bool on = std::getenv("NOVA_ARC_AUDIT") != nullptr;
-  return on;
-}
+const bool g_audit_enabled_v = std::getenv("NOVA_ARC_AUDIT") != nullptr;
+inline bool audit_enabled() { return g_audit_enabled_v; }
 
 std::atomic<long long> g_audit_live{0};
 std::atomic<long long> g_audit_bytes{0};
 
-inline bool dump_enabled() {
-  static const bool on = std::getenv("NOVA_ARC_DUMP") != nullptr;
-  return on;
-}
+const bool g_dump_enabled_v = std::getenv("NOVA_ARC_DUMP") != nullptr;
+inline bool dump_enabled() { return g_dump_enabled_v; }
 
 struct LiveEntry {
   const char *base;

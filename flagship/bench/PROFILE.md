@@ -46,9 +46,17 @@ all of which are fixable **on** Asio. The earlier tradeoff note reached the same
 from coarser evidence ("the bottleneck is IO plus coroutine-scheduling, not the reactor");
 this profile confirms it and names the specific costs.
 
+## Status
+
+Pass 1 done (commit lands with this file): removed the per-allocation audit guard (item 3)
+and cut the eager per-request map capacities (a first slice of item 1). Measured result:
+Nova 48,737 -> 55,409 rps at c=64 (+14 percent), corpus 180/180 and ASAN 329/329 green.
+The larger levers (2, 4, and the rest of 1) remain open.
+
 ## Ranked, actionable wins (all on the current runtime, no rewrite)
 
-1. **Kill per-request allocation (biggest lever, ~35 percent).** The request path builds a
+1. **Kill per-request allocation (biggest lever, ~35 percent).** PARTIALLY DONE (map
+   capacities cut). Still open: parse headers in place as buffer slices, per-request arena. The request path builds a
    `Map<string,string>` for headers (a hash map allocated per request), splits and trims
    strings, and allocates a `Request`, a `ValueSource`, and the response string, each
    refcounted and freed. Parse headers in place as slices into the read buffer, keep them
@@ -60,8 +68,10 @@ this profile confirms it and names the specific costs.
    lock) and pool or inline it to remove the heap allocation, the shared_ptr refcount, and
    the mutex. A blocking mutex in the async hot path has already been observed to cost
    dramatically here.
-3. **Compile out the ARC audit hooks in release (~1 to 2 percent, free).** `audit_alloc`
-   and `audit_free` are on the hot allocation path in the `-O3` binary and should not be.
+3. **Compile out the ARC audit hooks in release (~1 to 2 percent, free).** DONE. The cost
+   was not the hooks themselves but the function-local `static` guard in `audit_enabled()`
+   and `dump_enabled()` (a thread-safe-static check on every alloc and free, which also
+   blocked inlining); changed to a load-once global.
 4. **Batch syscalls (~29 percent).** Coalesce headers and body into a single `writev`, and
    use larger receive buffers, to cut the send/recv count per request.
 

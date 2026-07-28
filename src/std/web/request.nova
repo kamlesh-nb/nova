@@ -33,7 +33,7 @@ pub struct Request {
         let full_path = parts.get(1) ?? "";
         let (path, query) = splitPathQuery(full_path);
 
-        let headers = Map<string, string>(16, string.hash);
+        let headers = Map<string, string>(8, string.hash);
         let i = 1;
         while (i < lines.size()) {
             let line = lines.get(i) ?? "";
@@ -46,7 +46,7 @@ pub struct Request {
             i = i + 1;
         }
 
-        let cookies = Map<string, string>(16, string.hash);
+        let cookies = Map<string, string>(4, string.hash);
         let cookie_str = findHeaderVal(headers, "Cookie");
         if (cookie_str != "") {
             let pairs = string.split(cookie_str, ";");
@@ -83,9 +83,9 @@ pub struct Request {
         return Request{
             method: "",
             path: "",
-            query: Map<string, string>(16, string.hash),
-            headers: Map<string, string>(16, string.hash),
-            cookies: Map<string, string>(16, string.hash),
+            query: Map<string, string>(1, string.hash),
+            headers: Map<string, string>(1, string.hash),
+            cookies: Map<string, string>(1, string.hash),
             body: "",
         };
     }
@@ -113,7 +113,7 @@ pub struct Request {
 fn splitPathQuery(full_path: string): (string, Map<string, string>) {
     let idx = string.indexOf(full_path, "?");
     if (idx == -1) {
-        return (full_path, Map<string, string>(16, string.hash));
+        return (full_path, Map<string, string>(1, string.hash));
     }
     let path = string.slice(full_path, 0, idx);
     let query_str = string.slice(full_path, idx + 1, full_path.length);
@@ -123,7 +123,7 @@ fn splitPathQuery(full_path: string): (string, Map<string, string>) {
 
 pub fn parseQuery(query_str: string): Map<string, string> {
 
-    let result = Map<string, string>(16, string.hash);
+    let result = Map<string, string>(4, string.hash);
     let pairs = string.split(query_str, "&");
     pairs.forEach((pair) => {
         let parts = string.split(pair, "=");
