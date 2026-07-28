@@ -167,7 +167,19 @@ Each phase ends with a measurement or a conformance gate, so we never fly blind 
   style); fixed-argument-count calls to variadic C functions such as `fcntl` already work.
 - **Phase 2. `os/sys` syscall bindings in Nova**: sockets, `accept4`, `epoll`/`kqueue`,
   `read`/`write`/`writev`, `close`, `mmap`, `eventfd`/`timerfd`, non-blocking. Tested against
-  the kernel.
+  the kernel. **Poll mechanism DONE (2026-07-28).** `src/std/os/kqueue.nova` (macOS and BSD
+  readiness reactor: `kqueue`, `kevent`, the 32-byte `struct kevent` build-and-read helpers, the
+  filter and flag constants, plus `registerOne` and `wait`) is proven end to end on macOS by
+  `conformance/cases/188`: register read-interest on a socket, write to its peer, and `kevent`
+  reports the correct fd, filter, byte count, and udata token. `src/std/os/epoll.nova` (Linux:
+  `epoll_create1`/`epoll_ctl`/`epoll_wait`, `eventfd`, `timerfd_create`/`timerfd_settime`, the
+  constants, and the `struct epoll_event` helpers) compiles and links on macOS (its syscalls are
+  dropped by globalDCE where uncalled) and its x86_64 layout logic is covered by
+  `conformance/cases/189`; the epoll syscall round-trip and the aarch64 layout switch
+  (`EPOLL_EVENT_SIZE = 16`, data at offset 8) are to be verified in a Linux pass. Added a
+  sign-extending `bytes.read_i16` for signed 16-bit fields (`kevent.filter`). Native corpus
+  183/183, ASAN 335/335. **Still open in phase 2:** `accept4`, `writev`, `mmap`, and the Linux
+  eventfd and timerfd round-trip verification.
 - **Phase 3. Buffer infrastructure in Nova**: slab pool, ring buffer, refcounted `Bytes` slice,
   per-connection arena. Benchmarked in isolation against malloc and against ARC.
 - **Phase 4. The per-core event loop in Nova**, driving coroutines directly. First milestone: a

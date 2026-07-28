@@ -1,0 +1,78 @@
+// os/kqueue: the macOS and BSD readiness reactor backend for the self-hosted runtime
+// (docs/design/self-hosted-runtime.md, phase 2). kqueue is a readiness interface: register
+// interest in an fd via a `struct kevent` change, then kevent() blocks until one or more
+// registered events are ready and fills an event list.
+//
+// `struct kevent` on 64-bit (LP64), 32 bytes, naturally aligned:
+//   ident  : uintptr_t  offset 0,  8 bytes  (usually the fd)
+//   filter : int16_t     offset 8,  2 bytes  (EVFILT_READ etc, signed)
+//   flags  : uint16_t    offset 10, 2 bytes  (EV_ADD etc)
+//   fflags : uint32_t    offset 12, 4 bytes
+//   data   : intptr_t    offset 16, 8 bytes  (bytes available, or error)
+//   udata  : void*       offset 24, 8 bytes  (opaque user token; carries the coroutine handle)
+//
+// `struct timespec`, 16 bytes: tv_sec (offset 0, 8), tv_nsec (offset 8, 8).
+
+import bytes;
+
+pub extern("c") fn kqueue(): int;
+pub extern("c") fn kevent(kq: int, changelist: ptr, nchanges: int, eventlist: ptr, nevents: int, timeout: ptr): int;
+
+pub const KEVENT_SIZE: int = 32;
+pub const TIMESPEC_SIZE: int = 16;
+
+// Filters (signed 16-bit).
+pub const EVFILT_READ: int = -1;
+pub const EVFILT_WRITE: int = -2;
+pub const EVFILT_TIMER: int = -7;
+
+// Flags.
+pub const EV_ADD: int = 1;
+pub const EV_DELETE: int = 2;
+pub const EV_ENABLE: int = 4;
+pub const EV_DISABLE: int = 8;
+pub const EV_ONESHOT: int = 16;
+pub const EV_CLEAR: int = 32;
+pub const EV_EOF: int = 32768;
+pub const EV_ERROR: int = 16384;
+
+// Write one kevent into `buf` at slot `i` (byte offset i * KEVENT_SIZE).
+pub fn setEvent(buf: ptr, i: int, ident: long, filter: int, flags: int, fflags: int, data: long, udata: long): void {
+    let base = (i * KEVENT_SIZE) as long;
+    bytes.write_ptr(buf, base, ident);
+    bytes.write_u16(buf, base + 8, filter as long);
+    bytes.write_u16(buf, base + 10, flags as long);
+    bytes.write_i32(buf, base + 12, fflags as long);
+    bytes.write_ptr(buf, base + 16, data);
+    bytes.write_ptr(buf, base + 24, udata);
+}
+
+pub fn evIdent(buf: ptr, i: int): long { return bytes.read_ptr(buf, (i * KEVENT_SIZE) as long); }
+pub fn evFilter(buf: ptr, i: int): int { return bytes.read_i16(buf, (i * KEVENT_SIZE + 8) as long) as int; }
+pub fn evFlags(buf: ptr, i: int): int { return bytes.read_u16(buf, (i * KEVENT_SIZE + 10) as long) as int; }
+pub fn evFflags(buf: ptr, i: int): int { return bytes.read_i32(buf, (i * KEVENT_SIZE + 12) as long) as int; }
+pub fn evData(buf: ptr, i: int): long { return bytes.read_ptr(buf, (i * KEVENT_SIZE + 16) as long); }
+pub fn evUdata(buf: ptr, i: int): long { return bytes.read_ptr(buf, (i * KEVENT_SIZE + 24) as long); }
+
+// Register a single change on kq (no waiting): interest in `filter` on `fd`.
+pub fn registerOne(kq: int, fd: int, filter: int, flags: int, udata: long): int {
+    let ch = bytes.alloc(KEVENT_SIZE);
+    setEvent(ch, 0, fd as long, filter, flags, 0, 0, udata);
+    let r = kevent(kq, ch, 1, 0, 0, 0);
+    bytes.free(ch);
+    return r;
+}
+
+// Wait for up to `maxEvents` ready events, up to `timeoutMs` (negative blocks forever).
+// Returns the number of events written into `eventlist`.
+pub fn wait(kq: int, eventlist: ptr, maxEvents: int, timeoutMs: int): int {
+    if (timeoutMs < 0) {
+        return kevent(kq, 0, 0, eventlist, maxEvents, 0);
+    }
+    let ts = bytes.alloc(TIMESPEC_SIZE);
+    bytes.write_ptr(ts, 0, (timeoutMs / 1000) as long);
+    bytes.write_ptr(ts, 8, ((timeoutMs % 1000) * 1000000) as long);
+    let r = kevent(kq, 0, 0, eventlist, maxEvents, ts);
+    bytes.free(ts);
+    return r;
+}

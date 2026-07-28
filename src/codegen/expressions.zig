@@ -1840,6 +1840,14 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                         const v16 = core.LLVMBuildLoad2(self.builder, core.LLVMInt16Type(), p16, "u16_val");
                         return core.LLVMBuildZExt(self.builder, v16, self.val_type, "u16_ext");
                     }
+                    if (std.mem.eql(u8, fa.field, "read_i16")) {
+                        const ptr_val = try self.compileExpression(call.args[0]);
+                        const offset_val = try self.compileExpression(call.args[1]);
+                        const addr = core.LLVMBuildAdd(self.builder, ptr_val, offset_val, "addr");
+                        const p16 = core.LLVMBuildIntToPtr(self.builder, addr, core.LLVMPointerType(core.LLVMInt16Type(), 0), "read_ptr");
+                        const v16 = core.LLVMBuildLoad2(self.builder, core.LLVMInt16Type(), p16, "i16_val");
+                        return core.LLVMBuildSExt(self.builder, v16, self.val_type, "i16_ext");
+                    }
                     if (std.mem.eql(u8, fa.field, "ptr_size")) {
                         return core.LLVMConstInt(self.val_type, 8, 0);
                     }

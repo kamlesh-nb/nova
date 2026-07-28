@@ -1,0 +1,26 @@
+// Phase 2: the Linux epoll backend's syscalls cannot run on macOS, but its `struct
+// epoll_event` build-and-read helpers are pure byte manipulation and are exercised here so
+// the module compiles and its x86_64 layout logic is covered on every platform. The actual
+// epoll_ctl/epoll_wait round-trip is verified on a Linux box (phase-2 Linux pass); on macOS
+// those symbols are dropped by globalDCE because nothing here calls them.
+import assert;
+import bytes;
+import os.epoll;
+
+@test
+fn test_epoll_event_build_and_read(): void {
+    // A two-slot event buffer, x86_64 packed layout (12 bytes each).
+    let evs = bytes.alloc(epoll.EPOLL_EVENT_SIZE * 2);
+
+    // Slot 0: readable, token = a fd handle 7.
+    epoll.setEvent(evs, 0, epoll.EPOLLIN | epoll.EPOLLET, 7);
+    // Slot 1: writable, token = 4242.
+    epoll.setEvent(evs, 1, epoll.EPOLLOUT, 4242);
+
+    assert.equalInt(epoll.evEvents(evs, 0), epoll.EPOLLIN | epoll.EPOLLET);
+    assert.equalInt(epoll.evData(evs, 0) as int, 7);
+    assert.equalInt(epoll.evEvents(evs, 1), epoll.EPOLLOUT);
+    assert.equalInt(epoll.evData(evs, 1) as int, 4242);
+
+    bytes.free(evs);
+}

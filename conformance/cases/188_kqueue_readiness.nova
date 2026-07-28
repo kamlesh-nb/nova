@@ -1,0 +1,58 @@
+// Phase 2 of the self-hosted runtime: prove the kqueue readiness reactor works end to end
+// on macOS and BSD. This is the exact mechanism the event loop is built on: register
+// interest in a socket becoming readable, block in kevent(), and get told which fd is ready.
+// macOS/BSD only (the corpus runs on macOS).
+import assert;
+import bytes;
+import os.sys;
+import os.kqueue;
+
+@test
+fn test_kqueue_read_readiness(): void {
+    // A connected fd pair, and a kqueue.
+    let (a, b) = sys.newSocketPair(sys.AF_UNIX, sys.SOCK_STREAM);
+    assert.isTrue(a >= 0);
+    assert.isTrue(b >= 0);
+    let kq = kqueue.kqueue();
+    assert.isTrue(kq >= 0);
+
+    // Register read-interest on b, carrying a token (1234) as udata.
+    let r = kqueue.registerOne(kq, b, kqueue.EVFILT_READ, kqueue.EV_ADD, 1234);
+    assert.equalInt(r, 0);
+
+    // Nothing written yet: a 0 ms poll must report no events.
+    let evs = bytes.alloc(kqueue.KEVENT_SIZE * 4);
+    let n0 = kqueue.wait(kq, evs, 4, 0);
+    assert.equalInt(n0, 0);
+
+    // Write 5 bytes to a; b becomes readable.
+    let msg = bytes.alloc(5);
+    bytes.write_byte(msg, 0, 65);
+    bytes.write_byte(msg, 1, 66);
+    bytes.write_byte(msg, 2, 67);
+    bytes.write_byte(msg, 3, 68);
+    bytes.write_byte(msg, 4, 69);
+    assert.isTrue(sys.write(a, msg, 5) == 5);
+
+    // Now kevent reports exactly one event on fd b, filter READ, ~5 bytes available,
+    // and the udata token we registered.
+    let n1 = kqueue.wait(kq, evs, 4, 1000);
+    assert.equalInt(n1, 1);
+    assert.equalInt(kqueue.evIdent(evs, 0) as int, b);
+    assert.equalInt(kqueue.evFilter(evs, 0), kqueue.EVFILT_READ);
+    assert.isTrue(kqueue.evData(evs, 0) >= 5);
+    assert.equalInt(kqueue.evUdata(evs, 0) as int, 1234);
+
+    // Drain, then confirm no more readiness.
+    let buf = bytes.alloc(16);
+    assert.isTrue(sys.read(b, buf, 16) == 5);
+    let n2 = kqueue.wait(kq, evs, 4, 0);
+    assert.equalInt(n2, 0);
+
+    bytes.free(evs);
+    bytes.free(msg);
+    bytes.free(buf);
+    assert.equalInt(sys.close(a), 0);
+    assert.equalInt(sys.close(b), 0);
+    assert.equalInt(sys.close(kq), 0);
+}
