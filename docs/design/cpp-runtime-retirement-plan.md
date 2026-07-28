@@ -8,7 +8,7 @@ truth for progress; the phase details are below.
 | Phase | What it retires or builds | Prereq | Status | Notes |
 |-------|---------------------------|--------|--------|-------|
 | Foundation | Event loop, buffers, HTTP parser, poll and socket layer, multi-core | none | DONE | `self-hosted-runtime.md` phases 1 to 5; race-free under `--tsan` |
-| M0 | Tooling: file-based runtime trace, symbol audit | none | TODO | Unblocks M1; stderr diagnostics did not surface last time |
+| M0 | Tooling: file-based runtime trace, symbol audit | none | DONE | `NOVA_TRACE=<file>` trace (surfaces reliably), `tools/runtime-symbol-audit.sh` (221 exported / 203 referenced) |
 | M1 | Async scheduler migration (per-reactor run queue) | M0 | WIP | Single-level await works; multi-level and spawn hang; reverted, diff at `scheduler-migration-wip.patch` |
 | M2 | Async socket I/O on the reactor | M1 | TODO | `arecv`/`asend`/`aconnect`/`aaccept` in Nova over `os/sys` |
 | M3 | Database drivers on the reactor | M2 | TODO | No driver change; they already speak the async seam |
@@ -118,6 +118,20 @@ surface in this environment (a binary-caching layer). Before the next concurrenc
 - **A runtime-symbol audit.** A small script that lists every `nova_*` symbol the C++ runtime exports
   and every symbol the code generator and the standard library reference, so that "what still depends
   on C++" is a fact, not a guess, and so that a retired symbol is proven unreferenced before deletion.
+
+**M0 delivered (2026-07-28).** Both tools are built. The trace is a file-based, per-line-flushed
+facility gated on `NOVA_TRACE=<file>`, callable from Nova (`nova_trace_msg`, `nova_trace_kv`) and from
+C++ (the `NOVA_TRACE(...)` macro in `nova_abi.h`); it is a no-op with near-zero cost when unset,
+verified to surface reliably where stderr did not. The audit is `tools/runtime-symbol-audit.sh`,
+which reports 221 exported `nova_*` symbols, 203 referenced by the compiler or standard library, and
+the current removal candidates; pass a symbol name to see exactly where it is referenced.
+
+**Diagnostics workflow for the concurrency phases.** To trace runtime-internal code (for example the
+scheduler in M1), add `NOVA_TRACE("sched pump h=%lld done=%d", h, done)` calls in the runtime, and run
+with `NOVA_TRACE=/tmp/trace.log`. Because a compiled binary is cached by Nova-source hash, a
+runtime-only change may not reach an unchanged test binary; run against a fresh or uncached test file
+(or clear the build cache) so the updated runtime is linked. The trace file then contains the exact
+sequence, flushed per line, regardless of how the binary is run.
 
 ## The phased migration
 

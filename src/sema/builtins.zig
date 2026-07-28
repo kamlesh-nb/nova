@@ -73,6 +73,10 @@ pub const externs = [_]Builtin{
 
     .{ .receiver = "", .name = "nova_pin_next_coro", .ret = .void_ },
 
+    .{ .receiver = "", .name = "nova_trace_msg", .ret = .void_ },
+    .{ .receiver = "", .name = "nova_trace_kv", .ret = .void_ },
+    .{ .receiver = "", .name = "nova_trace_enabled", .ret = .int },
+
     .{ .receiver = "", .name = "currentCoro", .ret = .long },
     .{ .receiver = "", .name = "coroSuspend", .ret = .void_ },
     .{ .receiver = "", .name = "coroStart", .ret = .long },

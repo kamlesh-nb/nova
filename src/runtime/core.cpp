@@ -6,6 +6,7 @@
 #include <chrono>
 #include <fcntl.h>
 #include <condition_variable>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -62,6 +63,64 @@ void nova_log_err(const char *s) {
     std::fflush(stderr);
     nova_free_cstr(s, c);
   }
+}
+
+// --- Runtime trace facility (M0) -------------------------------------------------------------
+// A file-based, per-line-flushed trace, gated on the NOVA_TRACE env var, so runtime diagnostics
+// always surface (the scheduler debug was blocked by stderr being swallowed). Load-once gate, so
+// disabled cost is a single relaxed load; enabled cost is a mutexed unbuffered fprintf.
+static const bool g_trace_on = std::getenv("NOVA_TRACE") != nullptr;
+static std::mutex g_trace_mu;
+static std::FILE *g_trace_fp = nullptr;
+
+static std::FILE *nova_trace_fp() {
+    if (!g_trace_fp) {
+        const char *path = std::getenv("NOVA_TRACE");
+        if (!path) return nullptr;
+        g_trace_fp = std::fopen(path, "a");
+        if (g_trace_fp) std::setvbuf(g_trace_fp, nullptr, _IONBF, 0); // unbuffered
+    }
+    return g_trace_fp;
+}
+
+int nova_trace_enabled(void) { return g_trace_on ? 1 : 0; }
+
+void nova_trace_line(const char *s) {
+    if (!g_trace_on) return;
+    std::lock_guard<std::mutex> lk(g_trace_mu);
+    std::FILE *fp = nova_trace_fp();
+    if (!fp) return;
+    std::fprintf(fp, "%s\n", s ? s : "");
+    std::fflush(fp);
+}
+
+void nova_trace_msg(long long nova_str) {
+    if (!g_trace_on) return;
+    char *c = nova_to_cstr(reinterpret_cast<const char *>(nova_str));
+    nova_trace_line(c);
+    nova_free_cstr(reinterpret_cast<const char *>(nova_str), c);
+}
+
+void nova_trace_kv(long long nova_str, long long value) {
+    if (!g_trace_on) return;
+    char *c = nova_to_cstr(reinterpret_cast<const char *>(nova_str));
+    std::lock_guard<std::mutex> lk(g_trace_mu);
+    std::FILE *fp = nova_trace_fp();
+    if (fp) { std::fprintf(fp, "%s=%lld\n", c ? c : "", value); std::fflush(fp); }
+    nova_free_cstr(reinterpret_cast<const char *>(nova_str), c);
+}
+// C++-internal variadic trace, used via the NOVA_TRACE macro (nova_abi.h).
+void nova_tracef(const char *fmt, ...) {
+    if (!g_trace_on) return;
+    std::lock_guard<std::mutex> lk(g_trace_mu);
+    std::FILE *fp = nova_trace_fp();
+    if (!fp) return;
+    va_list ap;
+    va_start(ap, fmt);
+    std::vfprintf(fp, fmt, ap);
+    va_end(ap);
+    std::fputc('\n', fp);
+    std::fflush(fp);
 }
 
 long long nova_ffi_errno(void) { return (long long)errno; }

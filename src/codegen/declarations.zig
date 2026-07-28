@@ -693,6 +693,12 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
 
         try compiler.func_map.put("nova_pin_next_coro", core.LLVMAddFunction(compiler.module, "nova_pin_next_coro", spin_lu_type));
 
+        try compiler.func_map.put("nova_trace_msg", core.LLVMAddFunction(compiler.module, "nova_trace_msg", spin_lu_type));
+        try compiler.func_map.put("nova_trace_enabled", core.LLVMAddFunction(compiler.module, "nova_trace_enabled", mutex_create_type));
+        var trace_kv_p = [_]types.LLVMTypeRef{ val_type, val_type };
+        const trace_kv_type = core.LLVMFunctionType(void_type, &trace_kv_p, 2, 0);
+        try compiler.func_map.put("nova_trace_kv", core.LLVMAddFunction(compiler.module, "nova_trace_kv", trace_kv_type));
+
         var reactor_resume_p = [_]types.LLVMTypeRef{val_type};
         const reactor_resume_type = core.LLVMFunctionType(val_type, &reactor_resume_p, 1, 0);
         try compiler.func_map.put("nova_reactor_resume", core.LLVMAddFunction(compiler.module, "nova_reactor_resume", reactor_resume_type));

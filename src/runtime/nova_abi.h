@@ -11,6 +11,27 @@
 extern "C" {
 #endif
 
+// Runtime trace facility (M0 of the C++ runtime retirement plan). Writes to the file named by the
+// NOVA_TRACE environment variable, with an explicit flush per line, so runtime diagnostics surface
+// reliably regardless of how the binary is built, cached, or run (the scheduler debug was blocked
+// by stderr not surfacing). Disabled and near-zero-cost when NOVA_TRACE is unset. Thread-safe.
+// Use from C++ via the NOVA_TRACE macro; callable from Nova via nova_trace_msg / nova_trace_kv.
+int  nova_trace_enabled(void);
+void nova_trace_line(const char *s);           // one pre-formatted line (a newline is appended)
+void nova_trace_msg(long long nova_str);        // a Nova string (callable from Nova)
+void nova_trace_kv(long long nova_str, long long value); // "tag=value" (callable from Nova)
+void nova_tracef(const char *fmt, ...);          // printf-style, C++-internal; a newline is appended
+
+// C++-internal trace macro. Zero-argument-overhead when NOVA_TRACE is unset (a load-once flag
+// short-circuits before the format is evaluated). Example: NOVA_TRACE("sched pump h=%lld", h);
+#ifdef __cplusplus
+} // extern "C"
+#endif
+#define NOVA_TRACE(...) do { if (nova_trace_enabled()) nova_tracef(__VA_ARGS__); } while (0)
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 long long nova_bytes_alloc(long long size);
 long long nova_bytes_alloc_persistent(long long size);
 void      nova_bytes_free(long long ptr_val);
