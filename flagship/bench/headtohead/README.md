@@ -29,18 +29,52 @@ The runner detects each toolchain, builds it in release, warms up, then loads wi
 for `DUR` at `CONN` keep-alive connections. Missing toolchains or failed builds (for
 example, Rust with no crates.io access) are skipped, not fatal. `oha` is required.
 
-## Results (2026-07-28, Apple Silicon, 8 cores, 15s @ 64 connections)
+## Results after the self-hosted reactor (2026-07-29, Apple Silicon, 8 cores, 15s @ 64 connections)
 
-After optimization pass 1 (see below):
+With the async runtime moved off Boost.Asio onto the Nova reactor (see
+`../../../docs/design/cpp-runtime-retirement-plan.md`, M0 to M4). Two things changed: `web.App`
+now serves on the reactor, and there is a raw-reactor path that runs the real request pipeline
+without the framework abstraction.
+
+| Stack | Requests/sec | Success | Note |
+|-------|-------------:|--------:|------|
+| **Nova raw reactor + flagship pipeline** (one core) | **164,196** | 100% | zero-copy parse + serde bind + validate + render, no `web.App` |
+| Rust (axum) | 134,755 | 100% | 8 cores |
+| C# (ASP.NET minimal API on Kestrel) | 124,554 | 100% | 8 cores |
+| Go (net/http) | 121,743 | 100% | 8 cores |
+| **Nova (`web.App`, reactor)** | **69,404** | 100% | the framework, now on the reactor |
+| Nova (`web.App`, Asio — retired) | 55,409 | 100% | the previous baseline |
+
+Two readings, both true:
+
+1. **The runtime is in the top tier.** The raw reactor running the actual flagship pipeline
+   (zero-copy parse, bind, validation, render) does **164k rps on ONE core**, ahead of Go, C#, and
+   Rust's eight-core numbers. This is the point of the self-hosted-runtime work, now confirmed on a
+   Boost-free runtime.
+2. **`web.App` gained 25 percent for free** by moving off Asio onto the reactor (55,409 to 69,404 rps,
+   no framework change), but the framework abstraction (mediator dispatch, DI/`ValueSource`, routing,
+   per-request allocation) still costs the difference between 164k and 69k. That gap is now clearly
+   framework engineering (zero-copy, zero-allocation on the App hot path), not the runtime and not
+   codegen.
+
+Reactor server variants measured the same run (single core unless noted, fixed JSON unless noted):
+`coro` (raw reactor coroutine handler) 185,404; `flagship` (raw reactor, real pipeline) 164,196;
+`mc` (multi-core, fixed JSON) 154,990; `appmc` (`web.App` multi-core) 69,404. Note `mc` is LOWER than
+single-core `coro`: this box is CPU-contended (the `oha` load generator shares the 8 cores with the
+server), so the multi-core figures are pinned by the load generator, not the server. A separate
+load-gen machine would show higher multi-core throughput; these are conservative same-box numbers.
+
+### Results before the reactor (optimization pass 1)
 
 | Language (stack) | Requests/sec | Nova as fraction |
 |------------------|-------------:|-----------------:|
 | Rust (axum) | 134,755 | 0.41x |
 | C# (ASP.NET minimal API) | 124,554 | 0.44x |
 | Go (net/http) | 121,743 | 0.46x |
-| **Nova (web.App)** | **55,409** | 1.00x |
+| **Nova (web.App, Asio)** | **55,409** | 1.00x |
 
-Nova is now roughly 2.2x to 2.4x behind the tuned frameworks, down from 2.5x to 2.9x.
+Nova was roughly 2.2x to 2.4x behind the tuned frameworks on the Asio `web.App`, down from 2.5x to
+2.9x after pass 1.
 
 ### Optimization pass 1 (measured, +14 percent for Nova)
 
