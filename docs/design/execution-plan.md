@@ -52,11 +52,15 @@ An item is **never** ✅ on "it compiles" or "the happy path works" — only on 
   sockets + TLS are native-only; the T2 capability gate rejects it with 99 clean located errors), so there
   is no wasm web server to load-test. What a host-embedded wasm module actually runs is the per-request
   COMPUTE CORE — the `CreateProduct` handler minus `async`/DB: `fromJson` → bind → validate → render. Same
-  source, native and wasm (`flagship/bench/`, commit `ff03f1e`). 8-core mac: native **~513k req/s** (~1.95 µs;
-  ARC frees each request), wasm under Node **~690k req/s** (~1.45 µs). Wasm edges native by ~1.35× purely
-  because its bump allocator skips the per-request ARC free — the correct trade for a request-scoped,
-  torn-down-per-invocation edge module, not a general speedup. Identical results both sides (checksum scales
-  exactly with iterations, so the loop is real). Wasm module ~82 KB; native binary ~142 KB.
+  source, native and wasm (`flagship/bench/`, commit `ff03f1e`). **These are COMPUTE-CORE ops/s, NOT HTTP
+  rps** — a tight in-process loop calling `handleOne(body)`, zero networking (no TCP/socket/HTTP-parse/accept/
+  scheduler). 8-core mac: native **~513k compute-cores/s** (~1.95 µs; ARC frees each request), wasm under Node
+  **~690k/s** (~1.45 µs). Wasm edges native by ~1.35× purely because its bump allocator skips the per-request
+  ARC free — the correct trade for a request-scoped, torn-down-per-invocation edge module, not a general
+  speedup. Identical results both sides (checksum scales exactly with iterations, so the loop is real). Wasm
+  module ~82 KB; native binary ~142 KB. **For real end-to-end flagship HTTP throughput see the orchestrator
+  perf bullet above: ~48.9k rps direct / 47.6k via proxy / 10.2k DB path.** The ~500k-vs-~49k gap is exactly
+  the I/O + HTTP + scheduling cost this microbenchmark excludes (compute ~1.95 µs/req; the rest ~18 µs/req).
 
 ## ✅ Recently completed (2026-07-27 session) — network stack + hardening (all pushed, origin/main `561d9de`)
 

@@ -1,5 +1,21 @@
 # Flagship benchmarks
 
+## IMPORTANT: this measures the compute core, NOT HTTP throughput
+
+The numbers below are a **pure in-process microbenchmark** of one request's CPU work.
+They are **not** end-to-end web-server throughput. There is **no networking** in these
+figures: no TCP, no socket read or write, no HTTP parsing off the wire, no connection
+accept, no scheduler, no response flush. It is a tight loop calling `handleOne(body)`,
+which does only `fromJson -> bind -> validate -> render`.
+
+For the flagship's **real HTTP throughput** (native, over actual TCP), see the
+orchestrator perf test in `docs/design/execution-plan.md`: roughly **48.9k rps** direct,
+47.6k through the proxy, 10.2k on the per-request DB path. The gap between ~500k here and
+~49k there is exactly the I/O, HTTP framing, connection lifecycle, and scheduling cost
+that this microbenchmark deliberately excludes. A request spends about 1.95 us computing
+and the rest (~18 us at 49k rps) in that machinery, so the compute core is not the
+bottleneck.
+
 ## What is measured, and why it is scoped this way
 
 The flagship is a **web server**. It stands on the async socket and TLS runtime, which
@@ -17,7 +33,9 @@ work of one request:
 source.fromJson(body)  ->  bind the command  ->  validate  ->  render the JSON response
 ```
 
-The same source compiles to native and to wasm, so the two may be compared honestly.
+The same source compiles to native and to wasm, so the two may be compared honestly. The
+"req/s" in the table below is therefore **compute cores per second**, i.e. `1 / (time per
+handleOne call)`, not requests served over a socket.
 
 ## Running it
 
@@ -35,10 +53,10 @@ node flagship/bench/wasm-bench.mjs /tmp/flagbench.wasm
 
 ## Results (2026-07-28, Apple Silicon)
 
-| Target | Throughput | Per request | Notes |
-|--------|-----------|-------------|-------|
-| Native | ~513k req/s | ~1.95 us | 2M iterations; ARC frees each request |
-| Wasm (Node) | ~690k req/s | ~1.45 us | steady state, 5k to 100k iterations; bump allocator |
+| Target | Compute cores/s | Per core | Notes |
+|--------|-----------------|----------|-------|
+| Native | ~513k /s | ~1.95 us | 2M iterations; ARC frees each request. NOT HTTP rps (that is ~49k) |
+| Wasm (Node) | ~690k /s | ~1.45 us | steady state, 5k to 100k iterations; bump allocator |
 
 Both produce identical results (the checksum is 24 per request and scales exactly with
 the iteration count, so the loop is real and not optimised away). Wasm module: ~82 KB;
