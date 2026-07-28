@@ -1,3 +1,5 @@
+import net.reactor;
+import net.reactorio;
 
 pub fn socketRecvAsync(fd: int, buf: int, max: int): int {
     return 0;
@@ -59,12 +61,23 @@ pub trait AsyncIO {
     fn setTimeout(self, ms: int): int;
 }
 
+// AsyncStream is dual-mode (M2 of the C++ runtime retirement plan). When `kq` is 0 it is the Asio
+// stream: `sock` is a NovaSocket pointer and recv/send route through the Asio async I/O primitives.
+// When `kq` is a reactor's kqueue fd (set by asyncConnect on a reactor thread), it is reactor-native:
+// `sock` is a raw fd and recv/send delegate to net/reactorio over os/sys with no Asio. Drivers and
+// the app framework are written against this one type and the AsyncIO trait, so they pick up the
+// reactor path with no change simply by running on a reactor thread.
 pub struct AsyncStream impl AsyncIO {
     pub sock: long,
     pub timeoutMs: int,
-    init(sock: long) { self.sock = sock; self.timeoutMs = 0; }
+    pub kq: int,
+    init(sock: long) { self.sock = sock; self.timeoutMs = 0; self.kq = 0; }
 
     pub async fn recvInto(self: AsyncStream, buf: long, max: int): int {
+        if (self.kq > 0) {
+            let rs = reactorio.ReactorStream(self.sock as int, self.kq);
+            return await rs.recvInto(buf, max);
+        }
         if (self.timeoutMs > 0) { return await async_read_deadline(self.sock, buf, max, self.timeoutMs); }
         return await async_read(self.sock, buf, max);
     }
@@ -74,15 +87,36 @@ pub struct AsyncStream impl AsyncIO {
     }
 
     pub async fn sendStr(self: AsyncStream, data: string): int {
+        if (self.kq > 0) {
+            let rs = reactorio.ReactorStream(self.sock as int, self.kq);
+            return await rs.sendStr(data);
+        }
         return await async_write(self.sock, data);
     }
     pub fn isOpen(self: AsyncStream): bool { return self.sock != 0; }
     pub fn close(self: AsyncStream): void {
-        if (self.sock != 0) { aclose(self.sock); self.sock = 0; }
+        if (self.sock != 0) {
+            if (self.kq > 0) {
+                let rs = reactorio.ReactorStream(self.sock as int, self.kq);
+                rs.close();
+            } else {
+                aclose(self.sock);
+            }
+            self.sock = 0;
+        }
     }
 }
 
+// Connect and return an AsyncStream. On a reactor thread (reactor.currentKq() > 0) this is a
+// reactor-native connect (no Asio); otherwise it is the Asio connect. Same return type either way.
 pub async fn asyncConnect(host: string, port: int): AsyncStream {
+    let ck = reactor.currentKq();
+    if (ck > 0) {
+        let rs = await reactorio.reactorConnect(host, port, ck);
+        let s = AsyncStream(rs.fdOf() as long);
+        s.kq = ck;
+        return s;
+    }
     let s = await aconnect(host, port);
     return AsyncStream(s);
 }

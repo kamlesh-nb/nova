@@ -1,0 +1,96 @@
+// M2 step 2 of the C++ runtime retirement plan: the AsyncStream seam runs reactor-native, no Asio.
+// This is the cutover that lets the database drivers (which are written against asyncio.AsyncStream)
+// pick up the reactor path unchanged: on a reactor thread, reactor.setCurrent(kq) makes
+// asyncio.asyncConnect return a reactor-native AsyncStream, whose recvInto/sendStr delegate to
+// net/reactorio over os/sys. Here the client side goes entirely through the AsyncStream API; the
+// server side accepts and echoes. A real TCP round trip on one reactor, through the driver seam.
+import assert;
+import bytes;
+import os.sys;
+import net.reactor;
+import net.reactorio;
+import net.asyncio;
+
+const SO_REUSEADDR: int = 4;
+
+fn bump(cell: long): void {
+    bytes.write_i32(cell, 0, (bytes.read_i32(cell, 0) as int) + 1);
+}
+fn count(cell: long): int {
+    return bytes.read_i32(cell, 0) as int;
+}
+
+async fn serverSide(listenFd: int, kq: int, done: long): void {
+    let s = await reactorio.reactorAccept(listenFd, kq);
+    if (s.isOpen()) {
+        let buf = bytes.alloc(64);
+        let n = await s.recvInto(buf, 64);
+        if (n > 0) { await s.sendBuf(buf, n); }
+        bytes.free(buf);
+        s.close();
+    }
+    bump(done);
+}
+
+// The client uses the AsyncStream seam (asyncConnect + recvInto/sendStr), which is reactor-native
+// because reactor.setCurrent has been called on this thread.
+async fn clientSide(port: int, done: long, result: long, gotLen: long): void {
+    let s = await asyncio.asyncConnect("127.0.0.1", port);
+    if (s.isOpen()) {
+        await s.sendStr("PING");
+        let n = await s.recvInto(result, 64);
+        bytes.write_i32(gotLen, 0, n as long);
+        s.close();
+    }
+    bump(done);
+}
+
+@test
+fn test_asyncstream_reactor_round_trip(): void {
+    let lfd = sys.socket(sys.AF_INET, sys.SOCK_STREAM, 0);
+    let one = bytes.alloc(4); bytes.write_i32(one, 0, 1);
+    sys.setsockopt(lfd, sys.SOL_SOCKET, SO_REUSEADDR, one, 4);
+    bytes.free(one);
+    let sa = sys.makeSockaddrIn(0, reactorio.parseIPv4("127.0.0.1"));
+    assert.equalInt(sys.bind(lfd, sa, 16), 0);
+    bytes.free(sa);
+    sys.listen(lfd, 16);
+    sys.setNonBlocking(lfd);
+    let port = sys.boundPort(lfd);
+    assert.isTrue(port > 0);
+
+    let r = reactor.Reactor(64, 4096, 16);
+    // Mark this thread's reactor so asyncConnect resolves to the reactor-native path.
+    reactor.setCurrent(r.kq);
+    assert.equalInt(reactor.currentKq(), r.kq);
+
+    let done = bytes.alloc(4); bytes.write_i32(done, 0, 0);
+    let result = bytes.alloc(64);
+    let gotLen = bytes.alloc(4); bytes.write_i32(gotLen, 0, 0);
+
+    coroStart(serverSide(lfd, r.kq, done));
+    coroStart(clientSide(port, done, result, gotLen));
+
+    let guard = 0;
+    while (count(done) < 2 && guard < 1000) {
+        let nev = r.poll(500);
+        let i = 0;
+        while (i < nev) {
+            nova_reactor_resume(r.readyToken(i));
+            i = i + 1;
+        }
+        guard = guard + 1;
+    }
+
+    assert.equalInt(count(done), 2);
+    assert.equalInt(bytes.read_i32(gotLen, 0) as int, 4);
+    assert.equalInt(bytes.read_byte(result, 0) as int, 80);   // 'P'
+    assert.equalInt(bytes.read_byte(result, 3) as int, 71);   // 'G'
+
+    reactor.setCurrent(0);
+    bytes.free(done);
+    bytes.free(result);
+    bytes.free(gotLen);
+    r.destroy();
+    sys.close(lfd);
+}

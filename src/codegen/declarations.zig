@@ -712,6 +712,13 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         const detach_type = core.LLVMFunctionType(void_type, &detach_p, 1, 0);
         try compiler.func_map.put("nova_reactor_detach", core.LLVMAddFunction(compiler.module, "nova_reactor_detach", detach_type));
 
+        var set_current_p = [_]types.LLVMTypeRef{val_type};
+        const set_current_type = core.LLVMFunctionType(void_type, &set_current_p, 1, 0);
+        try compiler.func_map.put("nova_reactor_set_current", core.LLVMAddFunction(compiler.module, "nova_reactor_set_current", set_current_type));
+
+        const current_type = core.LLVMFunctionType(val_type, null, 0, 0);
+        try compiler.func_map.put("nova_reactor_current", core.LLVMAddFunction(compiler.module, "nova_reactor_current", current_type));
+
         const void_noarg_type = core.LLVMFunctionType(void_type, null, 0, 0);
         try compiler.func_map.put("nova_hold_all_reactors", core.LLVMAddFunction(compiler.module, "nova_hold_all_reactors", void_noarg_type));
 

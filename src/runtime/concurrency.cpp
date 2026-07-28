@@ -306,6 +306,15 @@ extern "C" void nova_reactor_detach(long long h) {
     NOVA_TRACE("detach h=%lld", h);
 }
 
+// The current thread's reactor identity (its kqueue/epoll fd), share-nothing per reactor thread.
+// A reactor worker sets this once at startup so a coroutine running on the thread can build a
+// reactor-native stream (reactorio) without the reactor being threaded through every call. Zero
+// means "no reactor on this thread" (an Asio thread, or the main thread), so the Asio I/O path is
+// used. This is what lets AsyncStream pick the reactor path transparently on a reactor thread.
+thread_local long long g_current_kq = 0;
+extern "C" void nova_reactor_set_current(long long kq) { g_current_kq = kq; }
+extern "C" long long nova_reactor_current(void) { return g_current_kq; }
+
 // Loud abort when a coroutine driven by the Nova reactor suspends on an Asio-backed I/O primitive.
 // The reactor thread runs its own poll loop (kqueue/epoll) and never runs the Asio io_context, so
 // such a completion can never fire: the coroutine (and its connection) would be silently orphaned.

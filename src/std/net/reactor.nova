@@ -23,6 +23,14 @@ pub fn runReactors(n: int, worker: (int) -> void): void {
     nova_run_reactors(n, worker);
 }
 
+// The current thread's reactor identity (its kqueue fd), share-nothing per reactor thread. A reactor
+// worker calls setCurrent(kq) once so code running on the thread (e.g. a database driver opening a
+// connection deep in its call stack) can build a reactor-native stream via currentKq() without the
+// reactor being threaded through every call. Returns 0 off a reactor thread (Asio or the main
+// thread), which is the signal to use the Asio I/O path.
+pub fn setCurrent(kq: int): void { nova_reactor_set_current(kq as long); }
+pub fn currentKq(): int { return nova_reactor_current() as int; }
+
 pub struct Reactor {
     pub kq: int,
     pub eventBuf: long,
