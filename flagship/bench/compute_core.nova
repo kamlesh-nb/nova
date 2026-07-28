@@ -1,0 +1,41 @@
+import serde.source;
+import string;
+
+// Flagship CreateProduct compute core (the handler minus async + DB): the exact
+// per-request work a host-embedded wasm module would run — bind, validate, render.
+pub struct CreateProduct {
+    pub name: string,
+    pub price: int,
+    init(name: string, price: int) { self.name = name; self.price = price; }
+}
+
+pub fn validateCreateProduct(cmd: CreateProduct): string {
+    if (cmd.name.length == 0) { return "name is required"; }
+    if (cmd.price < 0) { return "price must be >= 0"; }
+    return "";
+}
+
+pub fn handleOne(body: string): int {
+    let src = source.fromJson(body);
+    let cmd = CreateProduct(src.getString("name"), src.getInt("price") as int);
+    let err = validateCreateProduct(cmd);
+    if (err.length != 0) { return err.length; }
+    let resp = `{"id":1,"name":"${cmd.name}"}`;
+    return resp.length;
+}
+
+pub fn runBench(iters: int): int {
+    let body = "{\"name\":\"widget\",\"price\":1299}";
+    let acc = 0;
+    let i = 0;
+    while (i < iters) {
+        acc = acc + handleOne(body);
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn main(): void {
+    let acc = runBench(2000000);
+    console.log(`checksum=${acc}`);
+}
