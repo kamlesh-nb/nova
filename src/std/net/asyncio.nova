@@ -76,6 +76,7 @@ pub struct AsyncStream impl AsyncIO {
     pub async fn recvInto(self: AsyncStream, buf: long, max: int): int {
         if (self.kq > 0) {
             let rs = reactorio.ReactorStream(self.sock as int, self.kq);
+            if (self.timeoutMs > 0) { return await rs.recvIntoDeadline(buf, max, self.timeoutMs); }
             return await rs.recvInto(buf, max);
         }
         if (self.timeoutMs > 0) { return await async_read_deadline(self.sock, buf, max, self.timeoutMs); }

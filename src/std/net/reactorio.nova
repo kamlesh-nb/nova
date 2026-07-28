@@ -122,6 +122,27 @@ pub struct ReactorStream {
         }
     }
 
+    // Like recvInto, but bounded by a read deadline. On timeout returns -2 (the caller closes the
+    // connection). Implemented against the monotonic clock: a reactor timer is armed only to WAKE the
+    // coroutine so it can re-check the deadline; on any exit the timer is cancelled. Whether the wake
+    // was the socket or the timer, the loop re-reads and re-checks the clock, so it needs no
+    // event-type distinction. A timer that fires in the same poll batch as a completing read cannot
+    // resume a reaped frame: reaping records the handle for the batch and nova_reactor_resume skips it.
+    pub async fn recvIntoDeadline(self: ReactorStream, buf: long, max: int, timeoutMs: int): int {
+        if (timeoutMs <= 0) { return await self.recvInto(buf, max); }
+        let deadline = nova_mono_ms() + (timeoutMs as long);
+        while (true) {
+            let n = sys.read(self.fd, buf, max as long);
+            if (n >= 0) { nova_reactor_cancel_timer(currentCoro()); return n as int; }
+            if (sys.errno() != EAGAIN) { nova_reactor_cancel_timer(currentCoro()); return -1; }
+            let now = nova_mono_ms();
+            if (now >= deadline) { nova_reactor_cancel_timer(currentCoro()); return -2; }
+            kqueue.registerOne(self.kq, self.fd, kqueue.EVFILT_READ, kqueue.EV_ADD, currentCoro());
+            nova_reactor_set_timer(currentCoro(), deadline - now);
+            coroSuspend();
+        }
+    }
+
     // Write all `len` bytes from `buf`, awaiting writability on EAGAIN. Returns bytes sent, or -1.
     pub async fn sendBuf(self: ReactorStream, buf: long, len: int): int {
         let sent = 0;

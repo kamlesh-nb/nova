@@ -167,6 +167,11 @@ int64_t nova_time_now_ns(void) {
   using namespace std::chrono;
   return duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count();
 }
+// Monotonic milliseconds, for measuring timeouts/deadlines (immune to wall-clock jumps).
+int64_t nova_mono_ms(void) {
+  using namespace std::chrono;
+  return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
 
 namespace {
 thread_local int t_failed = 0;

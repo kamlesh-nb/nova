@@ -31,6 +31,11 @@ pub fn runReactors(n: int, worker: (int) -> void): void {
 pub fn setCurrent(kq: int): void { nova_reactor_set_current(kq as long); }
 pub fn currentKq(): int { return nova_reactor_current() as int; }
 
+// Call once per poll batch, before resuming the batch's ready coroutines. It lets the runtime skip a
+// stale event (e.g. a read-deadline timer) for a coroutine reaped earlier in the same batch, instead
+// of resuming its freed frame. Required by any loop that uses read deadlines (recvIntoDeadline).
+pub fn batchBegin(): void { nova_reactor_batch_begin(); }
+
 pub struct Reactor {
     pub kq: int,
     pub eventBuf: long,

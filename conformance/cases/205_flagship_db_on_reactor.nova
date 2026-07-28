@@ -161,6 +161,7 @@ fn test_flagship_request_with_db_on_reactor(): void {
     let guard = 0;
     while (count(done) < 3 && guard < 4000) {
         let nev = r.poll(500);
+        reactor.batchBegin();
         let i = 0;
         while (i < nev) {
             let fd = r.readyFd(i);

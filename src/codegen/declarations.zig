@@ -719,6 +719,20 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         const current_type = core.LLVMFunctionType(val_type, null, 0, 0);
         try compiler.func_map.put("nova_reactor_current", core.LLVMAddFunction(compiler.module, "nova_reactor_current", current_type));
 
+        var set_timer_p = [_]types.LLVMTypeRef{ val_type, val_type };
+        const set_timer_type = core.LLVMFunctionType(void_type, &set_timer_p, 2, 0);
+        try compiler.func_map.put("nova_reactor_set_timer", core.LLVMAddFunction(compiler.module, "nova_reactor_set_timer", set_timer_type));
+
+        var cancel_timer_p = [_]types.LLVMTypeRef{val_type};
+        const cancel_timer_type = core.LLVMFunctionType(void_type, &cancel_timer_p, 1, 0);
+        try compiler.func_map.put("nova_reactor_cancel_timer", core.LLVMAddFunction(compiler.module, "nova_reactor_cancel_timer", cancel_timer_type));
+
+        const batch_begin_type = core.LLVMFunctionType(void_type, null, 0, 0);
+        try compiler.func_map.put("nova_reactor_batch_begin", core.LLVMAddFunction(compiler.module, "nova_reactor_batch_begin", batch_begin_type));
+
+        const mono_ms_type = core.LLVMFunctionType(val_type, null, 0, 0);
+        try compiler.func_map.put("nova_mono_ms", core.LLVMAddFunction(compiler.module, "nova_mono_ms", mono_ms_type));
+
         const void_noarg_type = core.LLVMFunctionType(void_type, null, 0, 0);
         try compiler.func_map.put("nova_hold_all_reactors", core.LLVMAddFunction(compiler.module, "nova_hold_all_reactors", void_noarg_type));
 

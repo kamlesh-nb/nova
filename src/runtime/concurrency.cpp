@@ -319,6 +319,28 @@ thread_local long long g_current_kq = 0;
 extern "C" void nova_reactor_set_current(long long kq) { g_current_kq = kq; }
 extern "C" long long nova_reactor_current(void) { return g_current_kq; }
 
+// Coroutines reaped during the current reactor poll batch. A deadline timer and a read can both be
+// ready in the same kevent batch for the same coroutine; if the read is processed first the
+// coroutine may finish and its frame be freed, so resuming it for the now-stale timer event would be
+// a use-after-free. The reactor loop calls nova_reactor_batch_begin() before draining a batch;
+// reaping records the handle here; nova_reactor_resume skips a handle recorded this batch without
+// touching its (freed) frame. Only active on reactor threads (g_reactor_mode).
+thread_local std::unordered_set<long long> *g_batch_reaped = nullptr;
+// Only track reaps while a read-deadline timer is active this batch. Without a deadline a coroutine
+// has at most one ready event per batch, so the stale-resume race cannot happen; keeping the set
+// empty then means a loop that does not call batchBegin (e.g. a plain accept loop) is never poisoned
+// by accumulated handles. batchBegin clears both, so any deadline-using loop resets per batch.
+thread_local bool g_deadline_active = false;
+extern "C" void nova_reactor_batch_begin(void) {
+    if (g_batch_reaped) g_batch_reaped->clear();
+    g_deadline_active = false;
+}
+static inline void mark_reaped_this_batch(long long h) {
+    if (!g_reactor_mode || !g_deadline_active) return;
+    if (!g_batch_reaped) g_batch_reaped = new std::unordered_set<long long>();
+    g_batch_reaped->insert(h);
+}
+
 // Loud abort when a coroutine driven by the Nova reactor suspends on an Asio-backed I/O primitive.
 // The reactor thread runs its own poll loop (kqueue/epoll) and never runs the Asio io_context, so
 // such a completion can never fire: the coroutine (and its connection) would be silently orphaned.
@@ -451,6 +473,7 @@ static void reactor_finish(long long h) {
     }
     if (g_detached && g_detached->erase(h)) {
         NOVA_TRACE("finish-reap-detached h=%lld", h);
+        mark_reaped_this_batch(h);
         reinterpret_cast<nova_coro_fn *>(h)[1](reinterpret_cast<void *>(h));
     } else {
         NOVA_TRACE("finish-orphan h=%lld (no waiter, not detached: leaked frame)", h);
@@ -483,6 +506,9 @@ extern "C" long long nova_reactor_resume(long long h) {
         g_rq = new std::queue<long long>();
         g_reactor_mode = true;
     }
+    // A stale event (e.g. a deadline timer) for a coroutine already reaped this batch: skip without
+    // dereferencing its freed frame.
+    if (g_batch_reaped && g_batch_reaped->count(h)) return 1;
     if (!h || raw_coro_done(h)) return 1;
     NOVA_TRACE("reactor_resume enter h=%lld", h);
     raw_coro_resume(h);
@@ -525,6 +551,7 @@ extern "C" long long nova_set_reuseport(long long fd) {
 
 void nova_coro_release(long long handle) {
     if (!handle) return;
+    mark_reaped_this_batch(handle);
     std::shared_ptr<CoroState> state;
     {
         auto &cs = g_corostates.at(handle);
@@ -929,6 +956,25 @@ static void nova_reactor_arm_timer(long long handle, long long ms) {
     NOVA_TRACE("reactor timer armed h=%lld ms=%lld kq=%d", handle, ms, kq);
 #else
     (void)handle; (void)ms;   // Linux epoll timerfd path plugs in with the epoll backend.
+#endif
+}
+
+// Explicit reactor-timer control for deadlines (reactorio.recvIntoDeadline): arm a one-shot timer
+// keyed by the coroutine handle, and cancel it. nova_reactor_arm_timer is the shared implementation.
+extern "C" void nova_reactor_set_timer(long long handle, long long ms) {
+    if (!handle) return;
+    g_deadline_active = true;   // arm the batch-reap guard for this batch's stale-timer protection
+    nova_reactor_arm_timer(handle, ms);
+}
+extern "C" void nova_reactor_cancel_timer(long long handle) {
+#if defined(NOVA_HAVE_KQUEUE)
+    int kq = (int)g_current_kq;
+    if (kq <= 0 || !handle) return;
+    struct kevent ev;
+    EV_SET(&ev, (uintptr_t)handle, EVFILT_TIMER, EV_DELETE, 0, 0, nullptr);
+    kevent(kq, &ev, 1, nullptr, 0, nullptr);   // ENOENT if already fired/absent, harmless
+#else
+    (void)handle;
 #endif
 }
 

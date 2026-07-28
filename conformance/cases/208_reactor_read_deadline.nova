@@ -1,0 +1,87 @@
+// M4 of the C++ runtime retirement plan: read deadlines on the reactor, no Asio. A reactor-native
+// read can be bounded by a deadline (reactorio.recvIntoDeadline): a reactor timer wakes the coroutine
+// to re-check the clock, and on timeout the read returns -2 so the server closes the connection. This
+// restores the readTimeoutMs enforcement that making the reactor the default server had dropped. It
+// also exercises the batch-safe resume guard: a deadline timer that fires alongside a completing read
+// must not resume a reaped coroutine (the reactor loop calls reactor.batchBegin() each batch).
+import assert;
+import bytes;
+import os.sys;
+import net.reactor;
+import net.reactorio;
+
+// Store the result offset by +1000 so it is always positive: bytes.read_i32 zero-extends, so a
+// stored negative (like the -2 timeout code) would read back as a large unsigned value. 998 = -2,
+// 1002 = 2 bytes read.
+async fn timedRecv(fd: int, kq: int, timeoutMs: int, result: long): void {
+    let s = reactorio.ReactorStream(fd, kq);
+    let buf = bytes.alloc(64);
+    let n = await s.recvIntoDeadline(buf, 64, timeoutMs);
+    bytes.write_i32(result, 0, (n + 1000) as long);
+    bytes.free(buf);
+    s.close();
+}
+
+async fn sender(fd: int, kq: int): void {
+    let s = reactorio.ReactorStream(fd, kq);
+    let msg = bytes.alloc(2);
+    bytes.write_byte(msg, 0, 104); bytes.write_byte(msg, 1, 105);   // "hi"
+    let _ = await s.sendBuf(msg, 2);
+    bytes.free(msg);
+}
+
+@test
+fn test_recv_deadline_times_out(): void {
+    let (a, b) = sys.newSocketPair(sys.AF_UNIX, sys.SOCK_STREAM);
+    sys.setNonBlocking(a);
+    sys.setNonBlocking(b);
+    let r = reactor.Reactor(16, 1024, 4);
+    reactor.setCurrent(r.kq);
+    let result = bytes.alloc(4);
+    bytes.write_i32(result, 0, 0);
+    coroStart(timedRecv(b, r.kq, 40, result));   // 40ms deadline, no data is ever sent
+
+    let guard = 0;
+    while ((bytes.read_i32(result, 0) as int) == 0 && guard < 400) {
+        let n = r.poll(500);
+        reactor.batchBegin();
+        let i = 0;
+        while (i < n) { nova_reactor_resume(r.readyToken(i)); i = i + 1; }
+        guard = guard + 1;
+    }
+
+    assert.equalInt(bytes.read_i32(result, 0) as int, 998);   // timed out (-2 + 1000)
+    reactor.setCurrent(0);
+    bytes.free(result);
+    r.destroy();
+    sys.close(a);
+}
+
+@test
+fn test_recv_deadline_gets_data(): void {
+    let (a, b) = sys.newSocketPair(sys.AF_UNIX, sys.SOCK_STREAM);
+    sys.setNonBlocking(a);
+    sys.setNonBlocking(b);
+    let r = reactor.Reactor(16, 1024, 4);
+    reactor.setCurrent(r.kq);
+    let result = bytes.alloc(4);
+    bytes.write_i32(result, 0, 0);
+    coroStart(timedRecv(b, r.kq, 5000, result));   // generous deadline
+    coroStart(sender(a, r.kq));                      // data arrives well before it
+
+    let guard = 0;
+    while ((bytes.read_i32(result, 0) as int) == 0 && guard < 400) {
+        let n = r.poll(500);
+        reactor.batchBegin();
+        let i = 0;
+        while (i < n) { nova_reactor_resume(r.readyToken(i)); i = i + 1; }
+        guard = guard + 1;
+    }
+
+    assert.equalInt(bytes.read_i32(result, 0) as int, 1002);    // got 2 bytes (+1000), not a timeout
+    reactor.setCurrent(0);
+    bytes.free(result);
+    r.destroy();
+    sys.close(a);
+    sys.close(b);
+}
