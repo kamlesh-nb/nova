@@ -6,6 +6,10 @@
 #include <cstring>
 #ifndef _WIN32
 #include <dlfcn.h>
+#include <sys/mman.h>
+#ifndef MAP_ANON
+#define MAP_ANON MAP_ANONYMOUS
+#endif
 #endif
 
 namespace {
@@ -15,6 +19,21 @@ inline size_t arena_align(size_t s) { return (s + 7) & ~size_t(7); }
 
 thread_local char *t_arena_start = nullptr;
 thread_local char *t_arena_current = nullptr;
+
+// The bump arena's backing pages come from the kernel directly (mmap of anonymous memory), not the
+// C heap: M8 moves the allocator's page source off libc malloc. The arena is a leaked-forever
+// per-thread bump region (arena objects are never individually freed, so nova_bytes_free no-ops on
+// them), which is exactly the shape a single anonymous mapping wants. Individual overflow and
+// persistent objects still use malloc, because they are freed one at a time and mapping each would
+// round every small object up to a whole page. On Windows the page source stays malloc for now.
+inline char *arena_page_alloc(size_t size) {
+#ifdef _WIN32
+  return (char *)std::malloc(size);
+#else
+  void *p = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+  return (p == MAP_FAILED) ? nullptr : (char *)p;
+#endif
+}
 
 inline bool is_in_arena(const char *ptr) {
   return t_arena_start && ptr >= t_arena_start &&
@@ -217,7 +236,7 @@ long long nova_bytes_alloc(long long size) {
   }
 #endif
   if (!t_arena_start) {
-    t_arena_start = (char *)std::malloc(FALLBACK_ARENA_SIZE);
+    t_arena_start = arena_page_alloc(FALLBACK_ARENA_SIZE);
     t_arena_current = t_arena_start;
   }
   size_t alloc_size = arena_align((size_t)size + NOVA_OBJ_HEADER_SIZE);

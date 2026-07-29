@@ -16,7 +16,7 @@ truth for progress; the phase details are below.
 | M5 | File and directory I/O in Nova | M4 (soft) | DONE | `io/file.nova` + `io/dir.nova` over `os/sys` (open/read/write/lseek/close, mkdir/rmdir/rename, stat/access, opendir/readdir/closedir); `nova_file_*`/`nova_dir_*` deleted; only the variadic `nova_open` shim stays. `io.cpp` 1116 to 950. Native 199, ASAN 367, TSan 216 |
 | M6 | Process and primitive shims | none | DONE | `reuseport` (pure Nova `setsockopt`) and env `get`/`set` (`os/sys` `getenv`/`setenv`) moved to Nova; their C deleted. The honest-primitive floor stays: `errno` (a macro), `set_nonblock` (variadic), `close` (the tcp stack cannot import `os/sys`: its `socket` export collides by name with the `socket` module; the reactor path already uses `sys.close`), `exit` (`_Exit`), args (argv capture), atomics, mutex/condvar/rwlock/spinlock |
 | M7 | Channels and actors in Nova | M1, M6 | DONE | Actors (`Mailbox<M>`, `ActorCell<M>`) are already Nova over the reactor. The async channel (`nova_chan_*`) is reclassified as part of the reactor scheduler ABI-CORE seam: codegen emits `nova_chan_recv` directly around `llvm.coro.suspend`, and `nova_chan_send` wakes waiters via `nova_sched_schedule`, so it stays in the minimal C core. The vestigial blocking `Channel<T>` is deferred pending generic-container ARC ownership |
-| M8 | Allocator backing in Nova | none | TODO | `mmap` arena under `nova_bytes_alloc`; ABI-CORE unchanged |
+| M8 | Allocator backing in Nova | none | DONE | The bump arena under `nova_bytes_alloc` is backed by `mmap` anonymous pages, not libc `malloc`; `os/sys` exposes `mmap`/`munmap` so a Nova arena can do the same. ABI-CORE entry points and heap header unchanged. Native 200, ASAN 369; alloc microbench not regressed |
 | M9 | TLS 1.2 and 1.3 protocol in Nova | M2 | TODO | Protocol only; reference the Zig `std.crypto.tls`; crypto primitives stay vetted |
 
 ## Purpose
@@ -40,7 +40,7 @@ it leaves or stays, and sequences the removal.
 | `io.cpp` | 950 | Blocking socket send and receive and connect, the wolfSSL memory-BIO TLS pump (file and directory operations retired to Nova in M5) | MIGRATE (socket, and the TLS protocol in M9) + STAY-FFI (crypto primitives under TLS) |
 | `concurrency.cpp` | 833 | Boost.Asio reactors, the coroutine scheduler (`nova_sched_schedule`), async I/O (`nova_aaccept`/`aconnect`/`arecv`/`asend`/`aserver_listen`), channels, actors, `when_all`, timers, the `CoroState` machinery | MIGRATE (the core of the whole effort) |
 | `core.cpp` | 438 | FFI helpers (errno, cstr marshalling), process args, exit, `f64_bits`, atomics, condition variables, mutexes, coverage, stack traces, `close`, `set_nonblock`, `reuseport` | MIGRATE (most) + a tiny atomics FFI |
-| `alloc.cpp` | 426 | The ARC allocator, the 8-byte heap header, `nova_retain`/`nova_release`, `nova_bytes_alloc`/`free`, coroutine frame allocation, valopt and `any` boxing | ABI-CORE (stays; backing store may become Nova) |
+| `alloc.cpp` | 426 | The ARC allocator, the 8-byte heap header, `nova_retain`/`nova_release`, `nova_bytes_alloc`/`free`, coroutine frame allocation, valopt and `any` boxing | ABI-CORE (stays; bump-arena page source is now `mmap` kernel pages, not libc `malloc`, per M8) |
 | `decimal.cpp` | 328 | decimal128 BID arithmetic and codec | STAY-FFI (portable later, not blocking) |
 | `crypto.cpp` | 279 | SHA, MD5, base64, CSPRNG over wolfCrypt | STAY-FFI (never reimplement crypto) |
 | `compress.cpp` | 74 | gzip over zlib | STAY-FFI |
@@ -355,9 +355,24 @@ phase removes a real dependency and is independently verifiable.
     work rather than shipped with an ARC hazard the `--asan` gate would reject.
   Gate: the channel, select, and actor conformance cases pass natively and under `--tsan` (unchanged;
   M7 moved no code).
-- **M8. Allocator backing.** Optionally move the page source under `nova_bytes_alloc` to a Nova
-  `mmap`-backed arena, keeping the ARC entry points and the heap header unchanged (ABI-CORE stays).
-  Prereq: none. Gate: corpus and ASAN green; allocation microbenchmark not regressed.
+- **M8. Allocator backing. DONE.** The allocator's page source is now raw kernel pages, not the libc
+  heap. `nova_bytes_alloc` serves the common case from a per-thread 32 MB bump arena; that arena's
+  backing is acquired with `mmap` of anonymous, zero-filled, read/write private memory
+  (`arena_page_alloc` in `alloc.cpp`) instead of `std::malloc`. The arena is a leaked-forever bump
+  region (arena objects are never individually freed, so `nova_bytes_free` no-ops on them), which is
+  exactly the shape a single anonymous mapping wants; individual overflow and persistent objects keep
+  using `malloc`, because they are freed one at a time and mapping each would round every small object
+  up to a whole page. The ABI-CORE surface is untouched: `nova_bytes_alloc`/`free`,
+  `nova_retain`/`release`, and the 8-byte header (refcount at minus 8, length at minus 4) are
+  byte-for-byte unchanged, so no code-generation change was needed. `os/sys` also gains `mmap`/`munmap`
+  bindings plus `mapAnon`/`unmap` helpers, so a Nova arena (for example the `io/slab` and `io/arena`
+  pools) can back itself with kernel pages the same way; conformance case 212 maps, writes, reads, and
+  unmaps anonymous memory from Nova. Under `--asan` and `--tsan` the arena is bypassed entirely
+  (`NOVA_DROP_ARENA` makes every object an individually tracked `malloc`), so those gates test the
+  honestly-refcounted path and the arena change is covered by the native corpus and the microbenchmark.
+  Prereq: none. Gate: native 200, ASAN 369, and the allocation microbenchmark (20 million 24-byte
+  allocations) unchanged versus the `malloc`-backed arena, within run-to-run noise, because the bump
+  hot path is identical and only the one-time page acquisition changed.
 
 - **M9. TLS 1.2 and 1.3 protocol in Nova.** Write the TLS handshake state machine, the record layer,
   the key schedule, and the alert and framing logic in Nova, over the async socket seam (M2) and over
@@ -427,6 +442,10 @@ because `os/sys`'s `socket` export collides by name with the `socket` module). M
 reclassification: the actor mailbox is already Nova over the reactor, and the async channel
 (`nova_chan_*`) is part of the reactor scheduler ABI-CORE seam (the code generator emits it around
 `llvm.coro.suspend`), so it stays in the minimal C core; the vestigial blocking `Channel<T>` is deferred
-to the generic-container ARC work. Remaining follow-ons (not blocking): a live-driver round trip against
-a reachable database (driver code unchanged), async DNS, the Linux epoll reactor driver for
-`nova_run_root`, and the `os.socket` split; then M8 (allocator backing) and M9 (TLS protocol in Nova).
+to the generic-container ARC work. M8 is DONE: the bump arena under `nova_bytes_alloc` is backed by
+`mmap` anonymous pages instead of libc `malloc` (`os/sys` also exposes `mmap`/`munmap` so a Nova arena
+can do the same), with the ARC entry points and heap header unchanged and the allocation microbenchmark
+not regressed. Remaining follow-ons (not blocking): a live-driver round trip against a reachable
+database (driver code unchanged), async DNS, the Linux epoll reactor driver for `nova_run_root`, and the
+`os.socket` split; then M9 (the TLS 1.2 and 1.3 protocol in Nova over vetted crypto primitives), the
+last large piece.

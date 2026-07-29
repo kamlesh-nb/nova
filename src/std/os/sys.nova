@@ -62,6 +62,19 @@ pub extern("c") fn opendir(path: ptr): ptr;
 pub extern("c") fn readdir(dir: ptr): ptr;
 pub extern("c") fn closedir(dir: ptr): int;
 
+// Anonymous memory mapping (M8: the allocator page source is raw kernel pages, not libc malloc).
+// mapAnon requests `length` bytes of zero-filled read/write private memory straight from the kernel;
+// a Nova bump arena can back itself with this instead of nova_bytes_alloc. mmap returns MAP_FAILED
+// (a pointer of all ones) on error, which mapAnon reports as 0.
+pub extern("c") fn mmap(addr: ptr, length: long, prot: int, flags: int, fd: int, offset: long): ptr;
+pub extern("c") fn munmap(addr: ptr, length: long): int;
+
+// mmap prot and flag bits (macOS/BSD values; Linux MAP_ANON is 0x20, plugs in with epoll).
+pub const PROT_READ: int = 1;
+pub const PROT_WRITE: int = 2;
+pub const MAP_PRIVATE: int = 2;
+pub const MAP_ANON: int = 4096;    // 0x1000 on macOS/BSD
+
 // open(2) flags and lseek whence (macOS/BSD values; Linux differs and plugs in with epoll).
 pub const O_RDONLY: int = 0;
 pub const O_WRONLY: int = 1;
@@ -204,6 +217,23 @@ pub fn setReusePort(fd: int): int {
     let r = setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, one, 4);
     bytes.free(one);
     return r;
+}
+
+// Map `length` bytes of anonymous, zero-filled, read/write memory from the kernel, or 0 on failure.
+// The caller owns the mapping and must sys.unmap(addr, length) it. mmap returns MAP_FAILED (an
+// all-ones pointer) on error, reported here as 0.
+pub fn mapAnon(length: long): ptr {
+    let p = mmap(0, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    let pl = p as long;
+    if (pl == -1 || pl == 0) {
+        return 0;
+    }
+    return p;
+}
+
+// Unmap a region returned by mapAnon. Returns 0 on success.
+pub fn unmap(addr: ptr, length: long): int {
+    return munmap(addr, length);
 }
 
 // Build a `struct sockaddr_in` (16 bytes) in a fresh buffer: sin_family (u16),
