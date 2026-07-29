@@ -179,34 +179,10 @@ extern long long *__nova_cov_counters;
 void        nova_coverage_init(long long count);
 void        nova_coverage_dump(long long count);
 
-typedef struct NovaFileStat { long size; int mode; long atime, mtime, ctime; int is_dir, is_reg, is_symlink; } NovaFileStat;
-int   nova_file_stat(const char *path, NovaFileStat *out);
-void *nova_file_open(const char *path, const char *mode);
-int   nova_file_close(void *fp);
-int   nova_file_read(void *fp, char *buf, int size);
-int   nova_file_read_all(void *fp, char *buf, int size);
-int   nova_file_write(void *fp, const char *buf, int size);
-int   nova_file_write_all(void *fp, const char *buf, int size);
-int   nova_file_seek(void *fp, long offset, int whence);
-long  nova_file_tell(void *fp);
-int   nova_file_eof(void *fp);
-int   nova_file_flush(void *fp);
-const char *nova_file_error(void);
-int   nova_file_exists(const char *path);
-
-typedef int (*nova_dir_walk_callback)(const char *path, int is_dir, void *userdata);
-int   nova_dir_walk(const char *root, nova_dir_walk_callback cb, void *userdata);
-const char *nova_dir_error(void);
-void *nova_dir_open(const char *path);
-int   nova_dir_close(void *dir);
-const char *nova_dir_read(void *dir);
-int   nova_dir_create(const char *path, int mode);
-int   nova_dir_remove(const char *path);
-int   nova_dir_rename(const char *oldp, const char *newp);
-int   nova_dir_exists(const char *path);
-int   nova_dir_is_dir(const char *path);
-char *nova_dir_getcwd(void);
-int   nova_dir_chdir(const char *path);
+// File and directory I/O moved to Nova over os/sys in M5 (see src/std/io/file.nova and
+// src/std/io/dir.nova); the nova_file_*/nova_dir_* C surface is retired. The only remaining
+// shim is nova_open (variadic open(2)), declared inline where it is used.
+long long nova_open(const char *path, long long flags, long long mode);
 
 int  nova_socket_connect(const char *host, int port);
 int  nova_close(int fd);

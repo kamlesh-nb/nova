@@ -562,97 +562,10 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         const audit_fn = core.LLVMAddFunction(compiler.module, "nova_arc_audit_report", audit_type);
         try compiler.func_map.put("nova_arc_audit_report", audit_fn);
 
-        var open_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.ptr_type };
-        const open_type = core.LLVMFunctionType(compiler.ptr_type, &open_params, 2, 0);
-        const open_fn = core.LLVMAddFunction(compiler.module, "nova_file_open", open_type);
-        try compiler.func_map.put("nova_file_open", open_fn);
-
-        const fclose_type = core.LLVMFunctionType(compiler.i32_type, &one_param_ptr, 1, 0);
-        const fclose_fn = core.LLVMAddFunction(compiler.module, "nova_file_close", fclose_type);
-        try compiler.func_map.put("nova_file_close", fclose_fn);
-
-        var fread_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.ptr_type, compiler.i32_type };
-        const fread_type = core.LLVMFunctionType(compiler.i32_type, &fread_params, 3, 0);
-        const fread_fn = core.LLVMAddFunction(compiler.module, "nova_file_read", fread_type);
-        try compiler.func_map.put("nova_file_read", fread_fn);
-
-        var fwrite_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.ptr_type, compiler.i32_type };
-        const fwrite_type = core.LLVMFunctionType(compiler.i32_type, &fwrite_params, 3, 0);
-        const fwrite_fn = core.LLVMAddFunction(compiler.module, "nova_file_write", fwrite_type);
-        try compiler.func_map.put("nova_file_write", fwrite_fn);
-
-        var fread_all_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.ptr_type, compiler.i32_type };
-        const fread_all_type = core.LLVMFunctionType(compiler.i32_type, &fread_all_params, 3, 0);
-        const fread_all_fn = core.LLVMAddFunction(compiler.module, "nova_file_read_all", fread_all_type);
-        try compiler.func_map.put("nova_file_read_all", fread_all_fn);
-
-        var fwrite_all_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.ptr_type, compiler.i32_type };
-        const fwrite_all_type = core.LLVMFunctionType(compiler.i32_type, &fwrite_all_params, 3, 0);
-        const fwrite_all_fn = core.LLVMAddFunction(compiler.module, "nova_file_write_all", fwrite_all_type);
-        try compiler.func_map.put("nova_file_write_all", fwrite_all_fn);
-
-        var fseek_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.i64_type, compiler.i32_type };
-        const fseek_type = core.LLVMFunctionType(compiler.i32_type, &fseek_params, 3, 0);
-        const fseek_fn = core.LLVMAddFunction(compiler.module, "nova_file_seek", fseek_type);
-        try compiler.func_map.put("nova_file_seek", fseek_fn);
-
-        const ftell_type = core.LLVMFunctionType(compiler.i64_type, &one_param_ptr, 1, 0);
-        const ftell_fn = core.LLVMAddFunction(compiler.module, "nova_file_tell", ftell_type);
-        try compiler.func_map.put("nova_file_tell", ftell_fn);
-
-        const feof_type = core.LLVMFunctionType(compiler.i32_type, &one_param_ptr, 1, 0);
-        const feof_fn = core.LLVMAddFunction(compiler.module, "nova_file_eof", feof_type);
-        try compiler.func_map.put("nova_file_eof", feof_fn);
-
-        const fflush_type = core.LLVMFunctionType(compiler.i32_type, &one_param_ptr, 1, 0);
-        const fflush_fn = core.LLVMAddFunction(compiler.module, "nova_file_flush", fflush_type);
-        try compiler.func_map.put("nova_file_flush", fflush_fn);
-
-        const fexists_type = core.LLVMFunctionType(compiler.i32_type, &one_param_ptr, 1, 0);
-        const fexists_fn = core.LLVMAddFunction(compiler.module, "nova_file_exists", fexists_type);
-        try compiler.func_map.put("nova_file_exists", fexists_fn);
-
-        const dir_open_type = core.LLVMFunctionType(compiler.ptr_type, &one_param_ptr, 1, 0);
-        const dir_open_fn = core.LLVMAddFunction(compiler.module, "nova_dir_open", dir_open_type);
-        try compiler.func_map.put("nova_dir_open", dir_open_fn);
-
-        const dir_read_type = core.LLVMFunctionType(compiler.ptr_type, &one_param_ptr, 1, 0);
-        const dir_read_fn = core.LLVMAddFunction(compiler.module, "nova_dir_read", dir_read_type);
-        try compiler.func_map.put("nova_dir_read", dir_read_fn);
-
-        const dir_close_type = core.LLVMFunctionType(compiler.i32_type, &one_param_ptr, 1, 0);
-        const dir_close_fn = core.LLVMAddFunction(compiler.module, "nova_dir_close", dir_close_type);
-        try compiler.func_map.put("nova_dir_close", dir_close_fn);
-
-        var dir_create_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.i32_type };
-        const dir_create_type = core.LLVMFunctionType(compiler.i32_type, &dir_create_params, 2, 0);
-        const dir_create_fn = core.LLVMAddFunction(compiler.module, "nova_dir_create", dir_create_type);
-        try compiler.func_map.put("nova_dir_create", dir_create_fn);
-
-        const dir_remove_type = core.LLVMFunctionType(compiler.i32_type, &one_param_ptr, 1, 0);
-        const dir_remove_fn = core.LLVMAddFunction(compiler.module, "nova_dir_remove", dir_remove_type);
-        try compiler.func_map.put("nova_dir_remove", dir_remove_fn);
-
-        var dir_rename_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.ptr_type };
-        const dir_rename_type = core.LLVMFunctionType(compiler.i32_type, &dir_rename_params, 2, 0);
-        const dir_rename_fn = core.LLVMAddFunction(compiler.module, "nova_dir_rename", dir_rename_type);
-        try compiler.func_map.put("nova_dir_rename", dir_rename_fn);
-
-        const dir_exists_type = core.LLVMFunctionType(compiler.i32_type, &one_param_ptr, 1, 0);
-        const dir_exists_fn = core.LLVMAddFunction(compiler.module, "nova_dir_exists", dir_exists_type);
-        try compiler.func_map.put("nova_dir_exists", dir_exists_fn);
-
-        const dir_is_dir_type = core.LLVMFunctionType(compiler.i32_type, &one_param_ptr, 1, 0);
-        const dir_is_dir_fn = core.LLVMAddFunction(compiler.module, "nova_dir_is_dir", dir_is_dir_type);
-        try compiler.func_map.put("nova_dir_is_dir", dir_is_dir_fn);
-
-        const dir_getcwd_type = core.LLVMFunctionType(compiler.ptr_type, &[_]types.LLVMTypeRef{}, 0, 0);
-        const dir_getcwd_fn = core.LLVMAddFunction(compiler.module, "nova_dir_getcwd", dir_getcwd_type);
-        try compiler.func_map.put("nova_dir_getcwd", dir_getcwd_fn);
-
-        const dir_chdir_type = core.LLVMFunctionType(compiler.i32_type, &one_param_ptr, 1, 0);
-        const dir_chdir_fn = core.LLVMAddFunction(compiler.module, "nova_dir_chdir", dir_chdir_type);
-        try compiler.func_map.put("nova_dir_chdir", dir_chdir_fn);
+        // File and directory runtime functions retired in M5: file and directory I/O moved to
+        // Nova over os/sys (see src/std/io/file.nova and src/std/io/dir.nova), so the codegen no
+        // longer declares nova_file_*/nova_dir_*. The only shim left is nova_open (variadic open),
+        // declared in Nova as an extern("c") in os/sys.nova.
 
         var bytes_free_params = [_]types.LLVMTypeRef{compiler.val_type};
         const bytes_free_type = core.LLVMFunctionType(compiler.void_type, &bytes_free_params, 1, 0);

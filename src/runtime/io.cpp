@@ -2,12 +2,9 @@
 #include "nova_abi.h"
 #include "runtime_str.h"
 #include <cerrno>
-#include <chrono>
 #include <cstdio>
 #include <cstring>
-#include <filesystem>
 #include <string>
-#include <system_error>
 #include <vector>
 
 #ifdef _WIN32
@@ -61,174 +58,11 @@ enum NovaIsoNs {
 #include <wolfssl/ssl.h>
 #endif
 
-namespace fs = std::filesystem;
-
 extern "C" {
 
-static thread_local char g_file_err[256] = {0};
-const char *nova_file_error(void) { return g_file_err; }
-
-void *nova_file_open(const char *path, const char *mode) {
-  char *p = nova_to_cstr(path), *m = nova_to_cstr(mode);
-  FILE *fp = (p && m) ? std::fopen(p, m) : nullptr;
-  if (!fp)
-    std::snprintf(g_file_err, sizeof(g_file_err), "cannot open file");
-  nova_free_cstr(path, p);
-  nova_free_cstr(mode, m);
-  return fp;
-}
-int nova_file_close(void *fp) { return fp ? std::fclose((FILE *)fp) : -1; }
-int nova_file_read(void *fp, char *buf, int size) {
-  if (!fp)
-    return -1;
-
-  FILE *f = (FILE *)fp;
-  size_t total = 0;
-  while (total < (size_t)size) {
-    size_t n = std::fread(buf + total, 1, (size_t)size - total, f);
-    total += n;
-    if (n == 0) {
-      if (std::feof(f))
-        break;
-      if (std::ferror(f) && errno == EINTR) {
-        clearerr(f);
-        continue;
-      }
-      break;
-    }
-  }
-  return (int)total;
-}
-int nova_file_read_all(void *fp, char *buf, int size) {
-  return nova_file_read(fp, buf, size);
-}
-int nova_file_write(void *fp, const char *buf, int size) {
-  return fp ? (int)std::fwrite(buf, 1, (size_t)size, (FILE *)fp) : -1;
-}
-int nova_file_write_all(void *fp, const char *buf, int size) {
-  return nova_file_write(fp, buf, size);
-}
-int nova_file_seek(void *fp, long offset, int whence) {
-  return fp ? std::fseek((FILE *)fp, offset, whence) : -1;
-}
-long nova_file_tell(void *fp) { return fp ? std::ftell((FILE *)fp) : -1; }
-int nova_file_eof(void *fp) { return fp ? std::feof((FILE *)fp) : 1; }
-int nova_file_flush(void *fp) { return fp ? std::fflush((FILE *)fp) : -1; }
-int nova_file_exists(const char *path) {
-  char *p = nova_to_cstr(path);
-  std::error_code ec;
-  int r = (p && fs::exists(p, ec)) ? 1 : 0;
-  nova_free_cstr(path, p);
-  return r;
-}
-int nova_file_stat(const char *path, NovaFileStat *out) {
-  char *p = nova_to_cstr(path);
-  std::error_code ec;
-  auto st = p ? fs::status(p, ec) : fs::file_status{};
-  int r = (p && !ec && fs::exists(st)) ? 0 : -1;
-  if (r == 0 && out) {
-    out->size = (long)fs::file_size(p, ec);
-    if (ec) out->size = 0;
-    out->mode = 0;
-
-    auto mt = fs::last_write_time(p, ec);
-    long secs = ec ? 0 : (long)std::chrono::duration_cast<std::chrono::seconds>(mt.time_since_epoch()).count();
-    out->atime = secs; out->mtime = secs; out->ctime = secs;
-    out->is_dir = fs::is_directory(st) ? 1 : 0;
-    out->is_reg = fs::is_regular_file(st) ? 1 : 0;
-    out->is_symlink = fs::is_symlink(st) ? 1 : 0;
-  }
-  nova_free_cstr(path, p);
-  return r;
-}
-
-static thread_local char g_dir_err[256] = {0};
-const char *nova_dir_error(void) { return g_dir_err; }
-
-namespace {
-struct DirHandle {
-  fs::directory_iterator it;
-  fs::directory_iterator end;
-};
-}
-
-void *nova_dir_open(const char *path) {
-  char *p = nova_to_cstr(path);
-  void *result = nullptr;
-  if (p) {
-    std::error_code ec;
-    fs::directory_iterator it(p, ec);
-    if (!ec) {
-      auto *d = new DirHandle();
-      d->it = it;
-      result = d;
-    }
-  }
-  nova_free_cstr(path, p);
-  return result;
-}
-int nova_dir_close(void *dir) {
-  delete reinterpret_cast<DirHandle *>(dir);
-  return 0;
-}
-const char *nova_dir_read(void *dir) {
-  if (!dir) return nullptr;
-  auto *d = reinterpret_cast<DirHandle *>(dir);
-  if (d->it == d->end) return nullptr;
-  std::string name = d->it->path().filename().string();
-  std::error_code ec;
-  d->it.increment(ec);
-  return nova_from_cstr(name.c_str());
-}
-int nova_dir_create(const char *path, int mode) {
-  (void)mode;
-  char *p = nova_to_cstr(path);
-  std::error_code ec;
-  int r = (p && fs::create_directory(p, ec) && !ec) ? 0 : -1;
-  nova_free_cstr(path, p);
-  return r;
-}
-int nova_dir_remove(const char *path) {
-  char *p = nova_to_cstr(path);
-  std::error_code ec;
-  int r = (p && fs::remove(p, ec) && !ec) ? 0 : -1;
-  nova_free_cstr(path, p);
-  return r;
-}
-int nova_dir_rename(const char *op, const char *np) {
-  char *a = nova_to_cstr(op), *b = nova_to_cstr(np);
-  std::error_code ec;
-  int r = -1;
-  if (a && b) { fs::rename(a, b, ec); r = ec ? -1 : 0; }
-  nova_free_cstr(op, a);
-  nova_free_cstr(np, b);
-  return r;
-}
-int nova_dir_exists(const char *path) {
-  char *p = nova_to_cstr(path);
-  std::error_code ec;
-  int r = (p && fs::is_directory(p, ec)) ? 1 : 0;
-  nova_free_cstr(path, p);
-  return r;
-}
-int nova_dir_is_dir(const char *path) { return nova_dir_exists(path); }
-char *nova_dir_getcwd(void) {
-  std::error_code ec;
-  std::string cwd = fs::current_path(ec).string();
-  return ec ? nullptr : const_cast<char *>(nova_from_cstr(cwd.c_str()));
-}
-int nova_dir_chdir(const char *path) {
-  char *p = nova_to_cstr(path);
-  std::error_code ec;
-  int r = -1;
-  if (p) { fs::current_path(p, ec); r = ec ? -1 : 0; }
-  nova_free_cstr(path, p);
-  return r;
-}
-int nova_dir_walk(const char *root, nova_dir_walk_callback cb, void *userdata) {
-  (void)root; (void)cb; (void)userdata;
-  return -1;
-}
+// File and directory I/O (nova_file_*/nova_dir_*) was retired in M5: it now lives in Nova over
+// the raw POSIX syscalls in os/sys (src/std/io/file.nova, src/std/io/dir.nova). What remains in
+// this file is the blocking socket connect and the wolfSSL memory-BIO TLS pump.
 
 namespace {
 

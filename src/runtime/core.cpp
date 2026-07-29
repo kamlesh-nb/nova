@@ -132,6 +132,13 @@ long long nova_set_nonblock(long long fd) {
   if (f < 0) return -1;
   return (long long)fcntl((int)fd, F_SETFL, f | O_NONBLOCK);
 }
+// open(2) is variadic (int open(const char*, int, ...)); a non-variadic FFI declaration
+// mispasses the mode argument on arm64 (varargs go on the stack, not in registers), exactly
+// as with fcntl above. This tiny shim lets C forward the mode correctly. It is the only C
+// left under io/file after M5; everything else in file and directory I/O is Nova over os/sys.
+long long nova_open(const char *path, long long flags, long long mode) {
+  return (long long)::open(path, (int)flags, (unsigned int)mode);
+}
 char *nova_ffi_to_cstr(const char *nova_str) { return nova_to_cstr(nova_str); }
 void nova_ffi_free_cstr(const char *nova_str, char *c) { nova_free_cstr(nova_str, c); }
 const char *nova_ffi_from_cstr(const char *c) {

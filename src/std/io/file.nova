@@ -2,9 +2,12 @@
 import bytes;
 import mem.allocator;
 import string;
+import os.sys;
 
+// File I/O in Nova over the raw POSIX syscalls in os/sys (M5). A File holds an open file
+// descriptor; read/write/seek/close are the syscalls directly, with no C stdio buffering.
 pub struct File {
-    pub handle: ptr,
+    pub fd: int,
     pub path: string,
     pub allocator: allocator.Allocator,
 
@@ -12,91 +15,160 @@ pub struct File {
         let f = bytes.new_with_allocator<File>(allocator.globalAllocator());
         f.allocator = allocator.globalAllocator();
         f.path = path;
-        f.handle = nova_file_open(path, mode);
+        f.fd = openFd(path, mode);
         return f;
     }
 
     pub fn read(self: File, buf: ptr, size: int): int {
-        return nova_file_read(self.handle, buf, size);
+        if (self.fd < 0) { return -1; }
+        return sys.read(self.fd, buf, size as long) as int;
     }
 
+    // Read up to `size` bytes, looping over short reads until full or end of file, returning the
+    // total read. A single read(2) may return fewer bytes than requested, so readAll loops. The
+    // running offset is computed on a long base (heap addresses are 64-bit; see CLAUDE.md).
     pub fn readAll(self: File, buf: ptr, size: int): int {
-        return nova_file_read_all(self.handle, buf, size);
+        if (self.fd < 0) { return -1; }
+        let base = buf as long;
+        let total = 0;
+        while (total < size) {
+            let n = sys.read(self.fd, base + (total as long), (size - total) as long) as int;
+            if (n <= 0) { break; }
+            total = total + n;
+        }
+        return total;
     }
 
     pub fn write(self: File, buf: ptr, size: int): int {
-        return nova_file_write(self.handle, buf, size);
+        if (self.fd < 0) { return -1; }
+        return sys.write(self.fd, buf, size as long) as int;
     }
 
     pub fn writeAll(self: File, buf: ptr, size: int): int {
-        return nova_file_write_all(self.handle, buf, size);
+        if (self.fd < 0) { return -1; }
+        let base = buf as long;
+        let total = 0;
+        while (total < size) {
+            let n = sys.write(self.fd, base + (total as long), (size - total) as long) as int;
+            if (n <= 0) { break; }
+            total = total + n;
+        }
+        return total;
     }
 
+    // Write a whole string. A single write(2) on a regular file writes it all (the old stdio path
+    // did one fwrite here); the return is the byte count written, or -1 on a bad descriptor.
     pub fn writeString(self: File, s: string): int {
-        return nova_file_write(self.handle, s, s.length);
+        if (self.fd < 0) { return -1; }
+        return sys.write(self.fd, s, s.length as long) as int;
     }
 
     pub fn seek(self: File, offset: long, whence: int): int {
-        return nova_file_seek(self.handle, offset, whence);
+        if (self.fd < 0) { return -1; }
+        return sys.lseek(self.fd, offset, whence) as int;
     }
 
     pub fn tell(self: File): long {
-        return nova_file_tell(self.handle);
+        if (self.fd < 0) { return -1; }
+        return sys.lseek(self.fd, 0, sys.SEEK_CUR);
     }
 
+    // At end of file when the current offset is at or past the file size. A raw fd has no feof,
+    // so this reads the position and the end offset and restores the position.
     pub fn eof(self: File): bool {
-        return nova_file_eof(self.handle) != 0;
+        if (self.fd < 0) { return true; }
+        let cur = sys.lseek(self.fd, 0, sys.SEEK_CUR);
+        let end = sys.lseek(self.fd, 0, sys.SEEK_END);
+        sys.lseek(self.fd, cur, sys.SEEK_SET);
+        return cur >= end;
     }
 
+    // fd writes are unbuffered (handed straight to the kernel), so flush is a no-op that
+    // succeeds. Use fsync explicitly for durability.
     pub fn flush(self: File): int {
-        return nova_file_flush(self.handle);
+        return 0;
+    }
+
+    pub fn fsync(self: File): int {
+        if (self.fd < 0) { return -1; }
+        return sys.fsync(self.fd);
     }
 
     pub fn close(self: File): void {
-        nova_file_close(self.handle);
-        self.handle = 0;
+        if (self.fd >= 0) {
+            sys.close(self.fd);
+        }
+        self.fd = -1;
     }
 
     pub fn exists(path: string): bool {
-        return nova_file_exists(path) != 0;
+        return sys.pathExists(path);
     }
 
     pub fn readText(path: string): string {
-        let fp = nova_file_open(path, "r");
-        if (fp == 0) {
+        let fd = openFd(path, "r");
+        if (fd < 0) {
             return "";
         }
 
-        nova_file_seek(fp, 0, 2);
-        let size = nova_file_tell(fp);
-        nova_file_seek(fp, 0, 0);
+        let size = sys.lseek(fd, 0, sys.SEEK_END) as int;
+        sys.lseek(fd, 0, sys.SEEK_SET);
         if (size <= 0) {
-            nova_file_close(fp);
+            sys.close(fd);
             return "";
         }
 
         let data_ptr = allocator.globalAllocator().alloc(size + 1);
         bytes.write_i32(data_ptr - 4, 0, size);
-        nova_file_read_all(fp, data_ptr, size);
-        nova_file_close(fp);
+        let base = data_ptr as long;
+        let total = 0;
+        while (total < size) {
+            let n = sys.read(fd, base + (total as long), (size - total) as long) as int;
+            if (n <= 0) { break; }
+            total = total + n;
+        }
+        bytes.write_byte(data_ptr, total, 0);
+        sys.close(fd);
         return data_ptr as string;
     }
 
     pub fn writeText(path: string, content: string): void {
-        let fp = nova_file_open(path, "w");
-        if (fp == 0) {
+        let fd = openFd(path, "w");
+        if (fd < 0) {
             return;
         }
-        nova_file_write(fp, content, content.length);
-        nova_file_close(fp);
+        sys.write(fd, content, content.length as long);
+        sys.close(fd);
     }
 
     pub fn appendText(path: string, content: string): void {
-        let fp = nova_file_open(path, "a");
-        if (fp == 0) {
+        let fd = openFd(path, "a");
+        if (fd < 0) {
             return;
         }
-        nova_file_write(fp, content, content.length);
-        nova_file_close(fp);
+        sys.write(fd, content, content.length as long);
+        sys.close(fd);
     }
+}
+
+// Map a stdio-style mode string to open(2) flags and open the file (mode 0644 for created files).
+fn openFd(path: string, mode: string): int {
+    let flags = sys.O_RDONLY;
+    if (mode == "r") {
+        flags = sys.O_RDONLY;
+    } else if (mode == "w") {
+        flags = sys.O_WRONLY | sys.O_CREAT | sys.O_TRUNC;
+    } else if (mode == "a") {
+        flags = sys.O_WRONLY | sys.O_CREAT | sys.O_APPEND;
+    } else if (mode == "r+") {
+        flags = sys.O_RDWR;
+    } else if (mode == "w+") {
+        flags = sys.O_RDWR | sys.O_CREAT | sys.O_TRUNC;
+    } else if (mode == "a+") {
+        flags = sys.O_RDWR | sys.O_CREAT | sys.O_APPEND;
+    }
+    let cp = sys.cstr(path);
+    let fd = sys.nova_open(cp, flags, 420);
+    bytes.free(cp);
+    return fd;
 }

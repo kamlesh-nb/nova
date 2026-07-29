@@ -54,13 +54,6 @@ pub const externs = [_]Builtin{
     .{ .receiver = "", .name = "nova_exit", .ret = .void_ },
     .{ .receiver = "", .name = "nova_arg_count", .ret = .long },
     .{ .receiver = "", .name = "nova_arg_at", .ret = .string },
-    .{ .receiver = "", .name = "nova_file_open", .ret = .ptr },
-    .{ .receiver = "", .name = "nova_file_close", .ret = .void_ },
-    .{ .receiver = "", .name = "nova_file_write", .ret = .int },
-    .{ .receiver = "", .name = "nova_file_seek", .ret = .int },
-    .{ .receiver = "", .name = "nova_file_tell", .ret = .int },
-
-    .{ .receiver = "", .name = "nova_file_read_all", .ret = .int },
 
     .{ .receiver = "", .name = "nova_f64_bits", .ret = .long },
 
@@ -214,7 +207,8 @@ test "externs: the WHOLE test harness is declared, not just one of it" {
 test "externs: bare-name runtime functions resolve" {
 
     try testing.expectEqual(Ret.void_, findExtern("nova_test_fail").?.ret);
-    try testing.expectEqual(Ret.ptr, findExtern("nova_file_open").?.ret);
+    // nova_file_open was retired in M5 (file I/O moved to Nova over os/sys), so it no longer resolves.
+    try testing.expect(findExtern("nova_file_open") == null);
     try testing.expect(findExtern("__i32_to_string") == null);
     try testing.expect(findExtern("not_an_extern") == null);
 }

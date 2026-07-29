@@ -30,6 +30,91 @@ pub extern("c") fn read(fd: int, buf: ptr, count: long): long;
 pub extern("c") fn write(fd: int, buf: ptr, count: long): long;
 pub extern("c") fn close(fd: int): int;
 
+// File and directory syscalls (M5: file and directory I/O in Nova over os/sys). These
+// bind libc directly except open, which is variadic (int open(const char*, int, ...)) and so
+// mispasses its mode argument on arm64 through a non-variadic FFI declaration, the same hazard
+// as fcntl; nova_open is a two-line runtime shim that forwards mode correctly. On arm64 macOS
+// the plain stat/opendir/readdir symbols are already the 64-bit-inode variants (no $INODE64
+// suffix), so they bind by name. struct stat and struct dirent are read as raw byte buffers
+// at fixed macOS/BSD offsets, the same systems idiom this module uses for sockaddr and kevent.
+pub extern("c") fn nova_open(path: ptr, flags: int, mode: int): int;
+pub extern("c") fn lseek(fd: int, offset: long, whence: int): long;
+pub extern("c") fn fsync(fd: int): int;
+pub extern("c") fn mkdir(path: ptr, mode: int): int;
+pub extern("c") fn rmdir(path: ptr): int;
+pub extern("c") fn unlink(path: ptr): int;
+pub extern("c") fn rename(from: ptr, to: ptr): int;
+pub extern("c") fn access(path: ptr, amode: int): int;
+pub extern("c") fn stat(path: ptr, buf: ptr): int;
+pub extern("c") fn lstat(path: ptr, buf: ptr): int;
+pub extern("c") fn getcwd(buf: ptr, size: long): ptr;
+pub extern("c") fn chdir(path: ptr): int;
+pub extern("c") fn opendir(path: ptr): ptr;
+pub extern("c") fn readdir(dir: ptr): ptr;
+pub extern("c") fn closedir(dir: ptr): int;
+
+// open(2) flags and lseek whence (macOS/BSD values; Linux differs and plugs in with epoll).
+pub const O_RDONLY: int = 0;
+pub const O_WRONLY: int = 1;
+pub const O_RDWR: int = 2;
+pub const O_CREAT: int = 512;    // 0x0200 on macOS/BSD (0x40 on Linux)
+pub const O_TRUNC: int = 1024;   // 0x0400
+pub const O_APPEND: int = 8;     // 0x0008
+pub const SEEK_SET: int = 0;
+pub const SEEK_CUR: int = 1;
+pub const SEEK_END: int = 2;
+pub const F_OK: int = 0;
+
+// struct stat st_mode bits (S_IFMT masks the file-type field). Portable POSIX octal values,
+// written here in decimal: S_IFMT 0170000, S_IFDIR 0040000, S_IFREG 0100000, S_IFLNK 0120000.
+pub const S_IFMT: int = 61440;
+pub const S_IFDIR: int = 16384;
+pub const S_IFREG: int = 32768;
+pub const S_IFLNK: int = 40960;
+
+// macOS/BSD struct stat is 144 bytes: st_mode is a u16 at offset 4, st_size an i64 at offset 96,
+// st_mtimespec.tv_sec a long at offset 48. struct dirent has d_name (NUL-terminated) at offset 21.
+const STAT_MODE_OFF: int = 4;
+const DIRENT_NAME_OFF: int = 21;
+
+// A fresh NUL-terminated C string copy of a Nova string (Nova strings are length-prefixed, not
+// NUL-terminated). The caller owns the buffer and must bytes.free it after the call returns.
+pub fn cstr(s: string): ptr {
+    let n = s.length;
+    let b = bytes.alloc(n + 1);
+    let i = 0;
+    while (i < n) { bytes.write_byte(b, i, s[i]); i = i + 1; }
+    bytes.write_byte(b, n, 0);
+    return b;
+}
+
+// True if the path exists (any file type), via access(F_OK). Matches the old fs::exists.
+pub fn pathExists(path: string): bool {
+    let cp = cstr(path);
+    let r = access(cp, F_OK);
+    bytes.free(cp);
+    return r == 0;
+}
+
+// The st_mode of a path, or -1 if the path cannot be stat'd. Callers mask with S_IFMT to test
+// the file type (for example (mode & S_IFMT) == S_IFDIR for "is a directory").
+pub fn pathStatMode(path: string): int {
+    let cp = cstr(path);
+    let buf = bytes.alloc(160);
+    let r = stat(cp, buf);
+    let m = if (r == 0) (bytes.read_u16(buf, STAT_MODE_OFF) as int) else -1;
+    bytes.free(cp);
+    bytes.free(buf);
+    return m;
+}
+
+// True if the path exists and is a directory.
+pub fn pathIsDir(path: string): bool {
+    let m = pathStatMode(path);
+    if (m < 0) { return false; }
+    return (m & S_IFMT) == S_IFDIR;
+}
+
 // Memory/scan primitives. On modern macOS and Linux these libc functions are SIMD-optimized
 // (NEON/AVX), so they are the fast delimiter-scan and compare the HTTP parser (picohttpparser
 // model) and the string library route through, without first-class vector codegen.

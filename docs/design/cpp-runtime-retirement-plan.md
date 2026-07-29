@@ -13,7 +13,7 @@ truth for progress; the phase details are below.
 | M2 | Async socket I/O on the reactor | M1 | DONE | `net/reactorio` = reactor-native recv/send/connect/accept/resolve in Nova over `os/sys`; a thread-local current reactor; `asyncio.AsyncStream` dual-mode; `web/app.serveReactorConn`/`runReactor` run a whole request on the reactor. Corpus 200 to 204 (socketpair, loopback connect/accept, the AsyncStream seam, connect-by-name, and a full App request), all TSan clean. Remaining before flagship-DB-on-reactor (M3): multi-core reactor server (the `runReactors` worker cannot yet carry the App) and async DNS |
 | M3 | Database drivers on the reactor | M2 | DONE (mock) | The drivers connect via `asyncConnect` and do I/O through `AsyncStream`, both reactor-native from M2, so they run on the reactor with no driver change. Corpus 205: an App handler makes a per-request DB call (mock DB on the same reactor) end to end, no Asio, closing the PH6 deadlock. A live-driver run needs a reachable database; the driver code is unchanged |
 | M4 | Retire Boost.Asio | M1 to M3 | DONE | The async runtime is reactor-native end to end: `nova_sched_schedule` is just the run queue, timers/deadlines/TLS/sockets are reactor-native, `nova_run_root` drives async on the reactor, and the multi-core server uses the share-nothing reactor. The Asio `io_context`/strands/thread-pool/`CoroState` and socket primitives are deleted (the latter kept as loud abort stubs for the dead codegen branch); the `<boost/asio.hpp>` include, the Boost build flags, and the vendored `deps/boost` (~7MB) are gone. Native 198, ASAN 365, TSan 215, no Boost |
-| M5 | File and directory I/O in Nova | M4 (soft) | TODO | `nova_file_*`, `nova_dir_*` over `os/sys` |
+| M5 | File and directory I/O in Nova | M4 (soft) | DONE | `io/file.nova` + `io/dir.nova` over `os/sys` (open/read/write/lseek/close, mkdir/rmdir/rename, stat/access, opendir/readdir/closedir); `nova_file_*`/`nova_dir_*` deleted; only the variadic `nova_open` shim stays. `io.cpp` 1116 to 950. Native 199, ASAN 367, TSan 216 |
 | M6 | Process and primitive shims | none | TODO | `core.cpp` shims to `os/sys`; tiny atomics FFI stays |
 | M7 | Channels and actors in Nova | M1, M6 | TODO | Over the reactor; verify under `--tsan` |
 | M8 | Allocator backing in Nova | none | TODO | `mmap` arena under `nova_bytes_alloc`; ABI-CORE unchanged |
@@ -37,7 +37,7 @@ it leaves or stays, and sequences the removal.
 
 | File | Lines | Responsibility | Classification |
 |------|------:|----------------|----------------|
-| `io.cpp` | 1116 | File and directory operations, blocking socket send and receive and connect, the wolfSSL memory-BIO TLS pump | MIGRATE (file, dir, socket, and the TLS protocol in M9) + STAY-FFI (crypto primitives under TLS) |
+| `io.cpp` | 950 | Blocking socket send and receive and connect, the wolfSSL memory-BIO TLS pump (file and directory operations retired to Nova in M5) | MIGRATE (socket, and the TLS protocol in M9) + STAY-FFI (crypto primitives under TLS) |
 | `concurrency.cpp` | 833 | Boost.Asio reactors, the coroutine scheduler (`nova_sched_schedule`), async I/O (`nova_aaccept`/`aconnect`/`arecv`/`asend`/`aserver_listen`), channels, actors, `when_all`, timers, the `CoroState` machinery | MIGRATE (the core of the whole effort) |
 | `core.cpp` | 438 | FFI helpers (errno, cstr marshalling), process args, exit, `f64_bits`, atomics, condition variables, mutexes, coverage, stack traces, `close`, `set_nonblock`, `reuseport` | MIGRATE (most) + a tiny atomics FFI |
 | `alloc.cpp` | 426 | The ARC allocator, the 8-byte heap header, `nova_retain`/`nova_release`, `nova_bytes_alloc`/`free`, coroutine frame allocation, valopt and `any` boxing | ABI-CORE (stays; backing store may become Nova) |
@@ -287,10 +287,24 @@ phase removes a real dependency and is independently verifiable.
     step on corpus, ASAN, and TSan.
   - Gate (full M4): the runtime builds and links with no Boost include; corpus, ASAN, TSan, and the
     head-to-head all green.
-- **M5. File and directory I/O.** Reimplement `nova_file_*` and `nova_dir_*` in Nova over `os/sys`
-  (`open`, `read`, `write`, `close`, `stat`, `mkdir`, `readdir`, `rename`, `unlink`). Prereq: none
-  hard, but best after M4 so `io.cpp` shrinks to the TLS pump only. Gate: the `io/file` and `io/dir`
-  conformance cases pass on the Nova path.
+- **M5. File and directory I/O. DONE.** `src/std/io/file.nova` and `src/std/io/dir.nova` are
+  reimplemented in Nova over the raw POSIX syscalls in `os/sys`: a `File` holds an open file
+  descriptor and uses `open`/`read`/`write`/`lseek`/`close`/`fsync` directly with no C stdio; a `Dir`
+  holds a `DIR*` from `opendir` and walks it with `readdir`, reading the entry name out of `struct
+  dirent`; `mkdir`/`rmdir`/`rename`/`access`/`stat`/`getcwd`/`chdir` bind libc directly. `struct stat`
+  and `struct dirent` are read as raw byte buffers at fixed macOS and BSD offsets (`st_mode` u16 at
+  offset 4, `d_name` at offset 21), the same systems idiom `os/sys` already uses for `sockaddr` and
+  `kevent`. The one C shim left is `nova_open`, because `open(2)` is variadic and a non-variadic FFI
+  declaration mispasses its mode argument on arm64 (varargs go on the stack), exactly like the
+  existing `fcntl` shim; it is two lines in `core.cpp`. The whole `nova_file_*` and `nova_dir_*` C
+  surface (about 165 lines) is deleted from `io.cpp`, along with its codegen declarations
+  (`declarations.zig`), its bare-builtin registrations (`builtins.zig`), and its ABI header
+  declarations, so `io.cpp` drops from 1116 to 950 lines and now holds only the blocking socket
+  connect and the wolfSSL memory-BIO TLS pump. Conformance case 211 exercises the whole surface (text
+  round trip, the fd handle API, seek and tell, directory create and list and rename, cwd). Gate:
+  native 199, ASAN 367, TSan 216, all green with the file and directory C gone. The Linux plug is the
+  same syscalls with the Linux `struct stat`/`struct dirent` offsets and `O_*` values, behind the
+  same `os/sys` shape.
 - **M6. Process and primitive shims.** Move the `core.cpp` shims (`close`, args, exit, `set_nonblock`,
   `reuseport`, errno) fully into `os/sys`, and provide atomics and one condition-variable primitive as
   a tiny, honest FFI (these are genuinely primitive and may stay behind a few-line C shim). Prereq:
@@ -347,7 +361,7 @@ step in this plan may change without a coordinated code-generation change:
 - **Calling Nova from a runtime thread.** Already proven by `nova_run_reactors`, but every migrated
   service must be reachable from a reactor thread without a hidden Asio dependency.
 
-## Status snapshot (2026-07-28)
+## Status snapshot (2026-07-29)
 
 Already in Nova: the event loop (`net/reactor`), the buffer pools (`io/slab`, `io/arena`), the HTTP
 parser (`web/httpparser`), the poll and socket layer (`os/sys`, `os/kqueue`, `os/epoll`), and the
@@ -358,4 +372,11 @@ reactor, proven with a mock) all landed. The reactor drives nested `await` and `
 connect, accept, and resolve are reactor-native in Nova over `os/sys`; `AsyncStream` is dual-mode; a
 whole App request runs on the reactor; the flagship pattern (a handler's per-request database call)
 runs end to end on the reactor with no Asio, closing the PH6 deadlock; and the App serves share-nothing
-multi-core (`runReactorMC`, `SO_REUSEPORT`). M4 is DONE: the async runtime is reactor-native end to end and Boost.Asio is gone. `nova_sched_schedule` is just the reactor run queue; timers, read deadlines, whole-operation deadlines, inbound TLS, and sockets are reactor-native; `nova_run_root` drives async  and standalone async on a single-threaded reactor; and the multi-core server is share-nothing. The Asio io_context/strands/thread-pool/CoroState and the async socket primitives are deleted (the primitives kept as loud abort stubs for the now-dead AsyncStream codegen branch), the `<boost/asio.hpp>` include and Boost build flags are removed, and vendored `deps/boost` (~7MB) is deleted. Native 198, ASAN 365, TSan 215, all with no Boost. Remaining follow-ons (not blocking): a live-driver round trip against a reachable database (driver code unchanged), async DNS, and the Linux epoll reactor driver for `nova_run_root`; then M5 onward (file I/O, core.cpp shims, allocator, TLS-protocol-in-Nova).
+multi-core (`runReactorMC`, `SO_REUSEPORT`). M4 is DONE: the async runtime is reactor-native end to end and Boost.Asio is gone. `nova_sched_schedule` is just the reactor run queue; timers, read deadlines, whole-operation deadlines, inbound TLS, and sockets are reactor-native; `nova_run_root` drives async  and standalone async on a single-threaded reactor; and the multi-core server is share-nothing. The Asio io_context/strands/thread-pool/CoroState and the async socket primitives are deleted (the primitives kept as loud abort stubs for the now-dead AsyncStream codegen branch), the `<boost/asio.hpp>` include and Boost build flags are removed, and vendored `deps/boost` (~7MB) is deleted. Native 198, ASAN 365, TSan 215, all with no Boost. M5 is DONE: file and directory I/O is now Nova
+over `os/sys` (`io/file.nova`, `io/dir.nova`), the `nova_file_*`/`nova_dir_*` C surface is deleted from
+`io.cpp` (1116 to 950 lines) along with its codegen and ABI declarations, and only the variadic
+`nova_open` shim remains; `io.cpp` now holds just the socket connect and the wolfSSL TLS pump. Native
+199, ASAN 367, TSan 216. Remaining follow-ons (not blocking): a live-driver round trip against a
+reachable database (driver code unchanged), async DNS, and the Linux epoll reactor driver for
+`nova_run_root`; then M6 onward (core.cpp shims, channels and actors in Nova, allocator,
+TLS-protocol-in-Nova).

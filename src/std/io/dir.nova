@@ -2,7 +2,10 @@
 import bytes;
 import mem.allocator;
 import collections.list;
+import os.sys;
 
+// Directory I/O in Nova over the raw POSIX syscalls in os/sys (M5). A Dir holds an open DIR*
+// from opendir; read walks it with readdir, reading the entry name out of struct dirent.
 pub struct Dir {
     pub handle: ptr,
     pub path: string,
@@ -12,25 +15,31 @@ pub struct Dir {
         let d = bytes.new_with_allocator<Dir>(allocator.globalAllocator());
         d.allocator = allocator.globalAllocator();
         d.path = path;
-        d.handle = nova_dir_open(path);
+        let cp = sys.cstr(path);
+        d.handle = sys.opendir(cp);
+        bytes.free(cp);
         return d;
     }
 
     pub fn read(self: Dir): string | undefined {
-        let entry = nova_dir_read(self.handle);
-        if (entry == 0) {
+        if (self.handle == 0) {
+            return undefined;
+        }
+        let ent = sys.readdir(self.handle);
+        if (ent == 0) {
             return undefined;
         }
 
+        // struct dirent: the NUL-terminated d_name starts at offset 21 on macOS/BSD.
         let clen = 0;
-        while (bytes.read_byte(entry, clen) != 0) {
+        while (bytes.read_byte(ent, 21 + clen) != 0) {
             clen = clen + 1;
         }
 
         let buf = allocator.globalAllocator().alloc(clen);
         let i = 0;
         while (i < clen) {
-            bytes.write_byte(buf, i, bytes.read_byte(entry, i));
+            bytes.write_byte(buf, i, bytes.read_byte(ent, 21 + i));
             i = i + 1;
         }
         return buf as string;
@@ -49,52 +58,70 @@ pub struct Dir {
     }
 
     pub fn close(self: Dir): void {
-        nova_dir_close(self.handle);
+        if (self.handle != 0) {
+            sys.closedir(self.handle);
+        }
         self.handle = 0;
     }
 
     pub fn create(path: string, mode: int): int {
-        return nova_dir_create(path, mode);
+        let cp = sys.cstr(path);
+        let r = sys.mkdir(cp, mode);
+        bytes.free(cp);
+        return r;
     }
 
     pub fn remove(path: string): int {
-        return nova_dir_remove(path);
+        let cp = sys.cstr(path);
+        let r = sys.rmdir(cp);
+        bytes.free(cp);
+        return r;
     }
 
     pub fn rename(oldPath: string, newPath: string): int {
-        return nova_dir_rename(oldPath, newPath);
+        let a = sys.cstr(oldPath);
+        let b = sys.cstr(newPath);
+        let r = sys.rename(a, b);
+        bytes.free(a);
+        bytes.free(b);
+        return r;
     }
 
     pub fn exists(path: string): bool {
-        return nova_dir_exists(path) != 0;
+        return sys.pathIsDir(path);
     }
 
     pub fn isDir(path: string): bool {
-        return nova_dir_is_dir(path) != 0;
+        return sys.pathIsDir(path);
     }
 
     pub fn getCwd(): string {
-        let ptr = nova_dir_getcwd();
-        if (ptr == 0) {
+        let buf = bytes.alloc(4096);
+        let r = sys.getcwd(buf, 4096);
+        if (r == 0) {
+            bytes.free(buf);
             return "";
         }
 
         let clen = 0;
-        while (bytes.read_byte(ptr, clen) != 0) {
+        while (bytes.read_byte(buf, clen) != 0) {
             clen = clen + 1;
         }
 
-        let buf = allocator.globalAllocator().alloc(clen);
+        let out = allocator.globalAllocator().alloc(clen);
         let i = 0;
         while (i < clen) {
-            bytes.write_byte(buf, i, bytes.read_byte(ptr, i));
+            bytes.write_byte(out, i, bytes.read_byte(buf, i));
             i = i + 1;
         }
-        bytes.free(ptr);
-        return buf as string;
+        bytes.free(buf);
+        return out as string;
     }
 
     pub fn chdir(path: string): int {
-        return nova_dir_chdir(path);
+        let cp = sys.cstr(path);
+        let r = sys.chdir(cp);
+        bytes.free(cp);
+        return r;
     }
 }
