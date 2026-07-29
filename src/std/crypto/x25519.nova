@@ -1,0 +1,264 @@
+// X25519 (RFC 7748) Diffie-Hellman on Curve25519, implemented in Nova with no external library
+// (M9 phase C). Field elements are 10 signed limbs in radix 2^25.5 (the ref10 representation), held
+// as `long` so products stay within 64 bits (Nova has no 128-bit integer). The scalar multiply is the
+// Montgomery ladder with a constant-time conditional swap, and there are no secret-dependent branches
+// or table lookups. The field carry/pack/unpack are the ref10 routines; the field multiply is the
+// curve25519-donna schoolbook. Inversion is Fermat (z^(p-2)) via the standard addition chain.
+//
+// References: wolfSSL fe_operations.c (ref10 field, in deps), curve25519-donna (the multiply), and
+// RFC 7748. Verified against the RFC 7748 vectors (conformance case 225).
+import bytes;
+
+// A field element is 10 limbs stored as 8-byte signed longs in an 80-byte buffer.
+fn newFe(): ptr { return bytes.alloc(80); }
+fn getl(f: ptr, i: int): long { return bytes.read_ptr(f, i * 8) as long; }
+fn setl(f: ptr, i: int, v: long): void { bytes.write_ptr(f, i * 8, v as ptr); }
+
+fn load3(s: ptr, off: int): long {
+    return (bytes.read_byte(s, off) as long)
+        | ((bytes.read_byte(s, off + 1) as long) << 8)
+        | ((bytes.read_byte(s, off + 2) as long) << 16);
+}
+fn load4(s: ptr, off: int): long {
+    return (bytes.read_byte(s, off) as long)
+        | ((bytes.read_byte(s, off + 1) as long) << 8)
+        | ((bytes.read_byte(s, off + 2) as long) << 16)
+        | ((bytes.read_byte(s, off + 3) as long) << 24);
+}
+
+// Unpack 32 little-endian bytes into a field element (ref10 fe_frombytes).
+fn feFromBytes(h: ptr, s: ptr): void {
+    let h0 = load4(s, 0);
+    let h1 = load3(s, 4) << 6;
+    let h2 = load3(s, 7) << 5;
+    let h3 = load3(s, 10) << 3;
+    let h4 = load3(s, 13) << 2;
+    let h5 = load4(s, 16);
+    let h6 = load3(s, 20) << 7;
+    let h7 = load3(s, 23) << 5;
+    let h8 = load3(s, 26) << 4;
+    let h9 = (load3(s, 29) & 8388607) << 2;
+    // Carry to reduced radix-2^25.5 form.
+    let c9 = (h9 + (1 << 24)) >> 25; h0 = h0 + c9 * 19; h9 = h9 - (c9 << 25);
+    let c1 = (h1 + (1 << 24)) >> 25; h2 = h2 + c1; h1 = h1 - (c1 << 25);
+    let c3 = (h3 + (1 << 24)) >> 25; h4 = h4 + c3; h3 = h3 - (c3 << 25);
+    let c5 = (h5 + (1 << 24)) >> 25; h6 = h6 + c5; h5 = h5 - (c5 << 25);
+    let c7 = (h7 + (1 << 24)) >> 25; h8 = h8 + c7; h7 = h7 - (c7 << 25);
+    let c0 = (h0 + (1 << 25)) >> 26; h1 = h1 + c0; h0 = h0 - (c0 << 26);
+    let c2 = (h2 + (1 << 25)) >> 26; h3 = h3 + c2; h2 = h2 - (c2 << 26);
+    let c4 = (h4 + (1 << 25)) >> 26; h5 = h5 + c4; h4 = h4 - (c4 << 26);
+    let c6 = (h6 + (1 << 25)) >> 26; h7 = h7 + c6; h6 = h6 - (c6 << 26);
+    let c8 = (h8 + (1 << 25)) >> 26; h9 = h9 + c8; h8 = h8 - (c8 << 26);
+    setl(h, 0, h0); setl(h, 1, h1); setl(h, 2, h2); setl(h, 3, h3); setl(h, 4, h4);
+    setl(h, 5, h5); setl(h, 6, h6); setl(h, 7, h7); setl(h, 8, h8); setl(h, 9, h9);
+}
+
+// Pack a field element into 32 little-endian bytes (ref10 fe_tobytes), reducing mod 2^255-19.
+fn feToBytes(s: ptr, h: ptr): void {
+    let h0 = getl(h, 0); let h1 = getl(h, 1); let h2 = getl(h, 2); let h3 = getl(h, 3); let h4 = getl(h, 4);
+    let h5 = getl(h, 5); let h6 = getl(h, 6); let h7 = getl(h, 7); let h8 = getl(h, 8); let h9 = getl(h, 9);
+    let q = (19 * h9 + (1 << 24)) >> 25;
+    q = (h0 + q) >> 26; q = (h1 + q) >> 25; q = (h2 + q) >> 26; q = (h3 + q) >> 25;
+    q = (h4 + q) >> 26; q = (h5 + q) >> 25; q = (h6 + q) >> 26; q = (h7 + q) >> 25;
+    q = (h8 + q) >> 26; q = (h9 + q) >> 25;
+    h0 = h0 + 19 * q;
+    let c0 = h0 >> 26; h1 = h1 + c0; h0 = h0 - (c0 << 26);
+    let c1 = h1 >> 25; h2 = h2 + c1; h1 = h1 - (c1 << 25);
+    let c2 = h2 >> 26; h3 = h3 + c2; h2 = h2 - (c2 << 26);
+    let c3 = h3 >> 25; h4 = h4 + c3; h3 = h3 - (c3 << 25);
+    let c4 = h4 >> 26; h5 = h5 + c4; h4 = h4 - (c4 << 26);
+    let c5 = h5 >> 25; h6 = h6 + c5; h5 = h5 - (c5 << 25);
+    let c6 = h6 >> 26; h7 = h7 + c6; h6 = h6 - (c6 << 26);
+    let c7 = h7 >> 25; h8 = h8 + c7; h7 = h7 - (c7 << 25);
+    let c8 = h8 >> 26; h9 = h9 + c8; h8 = h8 - (c8 << 26);
+    let c9 = h9 >> 25; h9 = h9 - (c9 << 25);
+    bytes.write_byte(s, 0, (h0 >> 0) & 0xff);
+    bytes.write_byte(s, 1, (h0 >> 8) & 0xff);
+    bytes.write_byte(s, 2, (h0 >> 16) & 0xff);
+    bytes.write_byte(s, 3, ((h0 >> 24) | (h1 << 2)) & 0xff);
+    bytes.write_byte(s, 4, (h1 >> 6) & 0xff);
+    bytes.write_byte(s, 5, (h1 >> 14) & 0xff);
+    bytes.write_byte(s, 6, ((h1 >> 22) | (h2 << 3)) & 0xff);
+    bytes.write_byte(s, 7, (h2 >> 5) & 0xff);
+    bytes.write_byte(s, 8, (h2 >> 13) & 0xff);
+    bytes.write_byte(s, 9, ((h2 >> 21) | (h3 << 5)) & 0xff);
+    bytes.write_byte(s, 10, (h3 >> 3) & 0xff);
+    bytes.write_byte(s, 11, (h3 >> 11) & 0xff);
+    bytes.write_byte(s, 12, ((h3 >> 19) | (h4 << 6)) & 0xff);
+    bytes.write_byte(s, 13, (h4 >> 2) & 0xff);
+    bytes.write_byte(s, 14, (h4 >> 10) & 0xff);
+    bytes.write_byte(s, 15, (h4 >> 18) & 0xff);
+    bytes.write_byte(s, 16, (h5 >> 0) & 0xff);
+    bytes.write_byte(s, 17, (h5 >> 8) & 0xff);
+    bytes.write_byte(s, 18, (h5 >> 16) & 0xff);
+    bytes.write_byte(s, 19, ((h5 >> 24) | (h6 << 1)) & 0xff);
+    bytes.write_byte(s, 20, (h6 >> 7) & 0xff);
+    bytes.write_byte(s, 21, (h6 >> 15) & 0xff);
+    bytes.write_byte(s, 22, ((h6 >> 23) | (h7 << 3)) & 0xff);
+    bytes.write_byte(s, 23, (h7 >> 5) & 0xff);
+    bytes.write_byte(s, 24, (h7 >> 13) & 0xff);
+    bytes.write_byte(s, 25, ((h7 >> 21) | (h8 << 4)) & 0xff);
+    bytes.write_byte(s, 26, (h8 >> 4) & 0xff);
+    bytes.write_byte(s, 27, (h8 >> 12) & 0xff);
+    bytes.write_byte(s, 28, ((h8 >> 20) | (h9 << 6)) & 0xff);
+    bytes.write_byte(s, 29, (h9 >> 2) & 0xff);
+    bytes.write_byte(s, 30, (h9 >> 10) & 0xff);
+    bytes.write_byte(s, 31, (h9 >> 18) & 0xff);
+}
+
+fn feAdd(out: ptr, a: ptr, b: ptr): void {
+    let i = 0;
+    while (i < 10) { setl(out, i, getl(a, i) + getl(b, i)); i = i + 1; }
+}
+fn feSub(out: ptr, a: ptr, b: ptr): void {
+    let i = 0;
+    while (i < 10) { setl(out, i, getl(a, i) - getl(b, i)); i = i + 1; }
+}
+fn feCopy(out: ptr, a: ptr): void {
+    let i = 0;
+    while (i < 10) { setl(out, i, getl(a, i)); i = i + 1; }
+}
+
+// Carry-reduce an 11-limb product buffer (index 0..10) into reduced radix-2^25.5 form in-place.
+fn reduceCoeffs(t: ptr): void {
+    setl(t, 10, 0);
+    let i = 0;
+    while (i < 10) {
+        let over = getl(t, i) >> 26; setl(t, i, getl(t, i) - (over << 26)); setl(t, i + 1, getl(t, i + 1) + over);
+        over = getl(t, i + 1) >> 25; setl(t, i + 1, getl(t, i + 1) - (over << 25)); setl(t, i + 2, getl(t, i + 2) + over);
+        i = i + 2;
+    }
+    let o10 = getl(t, 10);
+    setl(t, 0, getl(t, 0) + 19 * o10);
+    setl(t, 10, 0);
+    let over = getl(t, 0) >> 26; setl(t, 0, getl(t, 0) - (over << 26)); setl(t, 1, getl(t, 1) + over);
+}
+
+// Field multiply (curve25519-donna schoolbook into 19 limbs, fold the top 9 by 19, then carry).
+fn feMul(out: ptr, f: ptr, g: ptr): void {
+    let a0 = getl(f, 0); let a1 = getl(f, 1); let a2 = getl(f, 2); let a3 = getl(f, 3); let a4 = getl(f, 4);
+    let a5 = getl(f, 5); let a6 = getl(f, 6); let a7 = getl(f, 7); let a8 = getl(f, 8); let a9 = getl(f, 9);
+    let b0 = getl(g, 0); let b1 = getl(g, 1); let b2 = getl(g, 2); let b3 = getl(g, 3); let b4 = getl(g, 4);
+    let b5 = getl(g, 5); let b6 = getl(g, 6); let b7 = getl(g, 7); let b8 = getl(g, 8); let b9 = getl(g, 9);
+    let t = bytes.alloc(19 * 8);
+    setl(t, 0, a0 * b0);
+    setl(t, 1, a0 * b1 + a1 * b0);
+    setl(t, 2, 2 * a1 * b1 + a0 * b2 + a2 * b0);
+    setl(t, 3, a1 * b2 + a2 * b1 + a0 * b3 + a3 * b0);
+    setl(t, 4, a2 * b2 + 2 * (a1 * b3 + a3 * b1) + a0 * b4 + a4 * b0);
+    setl(t, 5, a2 * b3 + a3 * b2 + a1 * b4 + a4 * b1 + a0 * b5 + a5 * b0);
+    setl(t, 6, 2 * (a3 * b3 + a1 * b5 + a5 * b1) + a2 * b4 + a4 * b2 + a0 * b6 + a6 * b0);
+    setl(t, 7, a3 * b4 + a4 * b3 + a2 * b5 + a5 * b2 + a1 * b6 + a6 * b1 + a0 * b7 + a7 * b0);
+    setl(t, 8, a4 * b4 + 2 * (a3 * b5 + a5 * b3 + a1 * b7 + a7 * b1) + a2 * b6 + a6 * b2 + a0 * b8 + a8 * b0);
+    setl(t, 9, a4 * b5 + a5 * b4 + a3 * b6 + a6 * b3 + a2 * b7 + a7 * b2 + a1 * b8 + a8 * b1 + a0 * b9 + a9 * b0);
+    setl(t, 10, 2 * (a5 * b5 + a3 * b7 + a7 * b3 + a1 * b9 + a9 * b1) + a4 * b6 + a6 * b4 + a2 * b8 + a8 * b2);
+    setl(t, 11, a5 * b6 + a6 * b5 + a4 * b7 + a7 * b4 + a3 * b8 + a8 * b3 + a2 * b9 + a9 * b2);
+    setl(t, 12, a6 * b6 + 2 * (a5 * b7 + a7 * b5 + a3 * b9 + a9 * b3) + a4 * b8 + a8 * b4);
+    setl(t, 13, a6 * b7 + a7 * b6 + a5 * b8 + a8 * b5 + a4 * b9 + a9 * b4);
+    setl(t, 14, 2 * (a7 * b7 + a5 * b9 + a9 * b5) + a6 * b8 + a8 * b6);
+    setl(t, 15, a7 * b8 + a8 * b7 + a6 * b9 + a9 * b6);
+    setl(t, 16, a8 * b8 + 2 * (a7 * b9 + a9 * b7));
+    setl(t, 17, a8 * b9 + a9 * b8);
+    setl(t, 18, 2 * a9 * b9);
+    // Fold degree: out[i] += 19 * out[i+10] for i in 0..8.
+    let i = 0;
+    while (i < 9) { setl(t, i, getl(t, i) + 19 * getl(t, i + 10)); i = i + 1; }
+    reduceCoeffs(t);
+    i = 0;
+    while (i < 10) { setl(out, i, getl(t, i)); i = i + 1; }
+    bytes.free(t);
+}
+
+fn feSq(out: ptr, a: ptr): void { feMul(out, a, a); }
+
+// Multiply by the curve constant a24 = 121665.
+fn feMul121665(out: ptr, a: ptr): void {
+    let t = bytes.alloc(11 * 8);
+    let i = 0;
+    while (i < 10) { setl(t, i, getl(a, i) * 121665); i = i + 1; }
+    reduceCoeffs(t);
+    i = 0;
+    while (i < 10) { setl(out, i, getl(t, i)); i = i + 1; }
+    bytes.free(t);
+}
+
+// Constant-time conditional swap of two field elements when swap == 1.
+fn feCswap(a: ptr, b: ptr, swap: long): void {
+    let mask = 0 - swap;
+    let i = 0;
+    while (i < 10) {
+        let x = (getl(a, i) ^ getl(b, i)) & mask;
+        setl(a, i, getl(a, i) ^ x);
+        setl(b, i, getl(b, i) ^ x);
+        i = i + 1;
+    }
+}
+
+// Inversion: out = z^(2^255-21) = z^(p-2), via the standard addition chain.
+fn feInvert(out: ptr, z: ptr): void {
+    let t0 = newFe(); let t1 = newFe(); let t2 = newFe(); let t3 = newFe();
+    let i = 0;
+    feSq(t0, z);
+    feSq(t1, t0); feSq(t1, t1); feMul(t1, z, t1);
+    feMul(t0, t0, t1);
+    feSq(t2, t0); feMul(t1, t1, t2);
+    feSq(t2, t1); i = 1; while (i < 5) { feSq(t2, t2); i = i + 1; } feMul(t1, t2, t1);
+    feSq(t2, t1); i = 1; while (i < 10) { feSq(t2, t2); i = i + 1; } feMul(t2, t2, t1);
+    feSq(t3, t2); i = 1; while (i < 20) { feSq(t3, t3); i = i + 1; } feMul(t2, t3, t2);
+    feSq(t2, t2); i = 1; while (i < 10) { feSq(t2, t2); i = i + 1; } feMul(t1, t2, t1);
+    feSq(t2, t1); i = 1; while (i < 50) { feSq(t2, t2); i = i + 1; } feMul(t2, t2, t1);
+    feSq(t3, t2); i = 1; while (i < 100) { feSq(t3, t3); i = i + 1; } feMul(t2, t3, t2);
+    feSq(t2, t2); i = 1; while (i < 50) { feSq(t2, t2); i = i + 1; } feMul(t1, t2, t1);
+    feSq(t1, t1); i = 1; while (i < 5) { feSq(t1, t1); i = i + 1; } feMul(out, t1, t0);
+    bytes.free(t0); bytes.free(t1); bytes.free(t2); bytes.free(t3);
+}
+
+// X25519: scalarMult(out, scalar[32], point[32]). out = scalar * point on Curve25519.
+pub fn scalarMult(out: ptr, scalar: ptr, point: ptr): void {
+    // Clamp the scalar.
+    let e = bytes.alloc(32);
+    let i = 0;
+    while (i < 32) { bytes.write_byte(e, i, bytes.read_byte(scalar, i)); i = i + 1; }
+    bytes.write_byte(e, 0, bytes.read_byte(e, 0) & 248);
+    bytes.write_byte(e, 31, (bytes.read_byte(e, 31) & 127) | 64);
+
+    let x1 = newFe(); feFromBytes(x1, point);
+    let x2 = newFe(); let z2 = newFe(); let x3 = newFe(); let z3 = newFe();
+    // x2=1, z2=0, x3=x1, z3=1
+    i = 0; while (i < 10) { setl(x2, i, 0); setl(z2, i, 0); setl(z3, i, 0); i = i + 1; }
+    setl(x2, 0, 1); setl(z3, 0, 1); feCopy(x3, x1);
+
+    let a = newFe(); let aa = newFe(); let b = newFe(); let bb = newFe(); let ee = newFe();
+    let c = newFe(); let d = newFe(); let da = newFe(); let cb = newFe(); let t = newFe();
+
+    let swap: long = 0;
+    let pos = 254;
+    while (pos >= 0) {
+        let kt = (bytes.read_byte(e, pos >> 3) >> (pos & 7)) & 1;
+        swap = swap ^ (kt as long);
+        feCswap(x2, x3, swap);
+        feCswap(z2, z3, swap);
+        swap = kt as long;
+
+        feAdd(a, x2, z2); feSq(aa, a);
+        feSub(b, x2, z2); feSq(bb, b);
+        feSub(ee, aa, bb);
+        feAdd(c, x3, z3); feSub(d, x3, z3);
+        feMul(da, d, a); feMul(cb, c, b);
+        feAdd(t, da, cb); feSq(x3, t);
+        feSub(t, da, cb); feSq(t, t); feMul(z3, x1, t);
+        feMul(x2, aa, bb);
+        feMul121665(t, ee); feAdd(t, aa, t); feMul(z2, ee, t);
+        pos = pos - 1;
+    }
+    feCswap(x2, x3, swap);
+    feCswap(z2, z3, swap);
+
+    feInvert(z2, z2);
+    feMul(x2, x2, z2);
+    feToBytes(out, x2);
+
+    bytes.free(e); bytes.free(x1); bytes.free(x2); bytes.free(z2); bytes.free(x3); bytes.free(z3);
+    bytes.free(a); bytes.free(aa); bytes.free(b); bytes.free(bb); bytes.free(ee);
+    bytes.free(c); bytes.free(d); bytes.free(da); bytes.free(cb); bytes.free(t);
+}

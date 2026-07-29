@@ -1,0 +1,85 @@
+// X25519 (RFC 7748) implemented in Nova (M9 phase C, no external library). Verified against the
+// RFC 7748 section 5.2 scalar-multiply vector and the section 6.1 Diffie-Hellman key agreement.
+import crypto.x25519;
+import bytes;
+import assert;
+
+fn hexNib(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return 0;
+}
+
+fn eqHex(buf: ptr, n: int, hex: string): bool {
+    if (hex.length != n * 2) { return false; }
+    let i = 0;
+    while (i < n) {
+        if (bytes.read_byte(buf, i) != hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1])) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn hexBuf(hex: string): ptr {
+    let n = hex.length / 2;
+    let b = bytes.alloc(n);
+    let i = 0;
+    while (i < n) {
+        bytes.write_byte(b, i, hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1]));
+        i = i + 1;
+    }
+    return b;
+}
+
+fn base9(): ptr {
+    let b = bytes.alloc(32);
+    bytes.write_byte(b, 0, 9);
+    let i = 1;
+    while (i < 32) { bytes.write_byte(b, i, 0); i = i + 1; }
+    return b;
+}
+
+// RFC 7748 section 5.2.
+@test
+fn rfc7748_scalarmult(): void {
+    let scalar = hexBuf("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4");
+    let u = hexBuf("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c");
+    let out = bytes.alloc(32);
+    x25519.scalarMult(out, scalar, u);
+    assert.isTrue(eqHex(out, 32, "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552"));
+}
+
+// RFC 7748 section 6.1: public keys from private keys (scalar times the base point 9).
+@test
+fn rfc7748_pubkeys(): void {
+    let alicePriv = hexBuf("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+    let alicePub = bytes.alloc(32);
+    x25519.scalarMult(alicePub, alicePriv, base9());
+    assert.isTrue(eqHex(alicePub, 32, "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"));
+
+    let bobPriv = hexBuf("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
+    let bobPub = bytes.alloc(32);
+    x25519.scalarMult(bobPub, bobPriv, base9());
+    assert.isTrue(eqHex(bobPub, 32, "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f"));
+}
+
+// RFC 7748 section 6.1: both sides compute the same shared secret.
+@test
+fn rfc7748_ecdh_agreement(): void {
+    let alicePriv = hexBuf("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+    let bobPriv = hexBuf("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
+    let alicePub = hexBuf("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a");
+    let bobPub = hexBuf("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f");
+
+    let sharedA = bytes.alloc(32);
+    x25519.scalarMult(sharedA, alicePriv, bobPub);
+    let sharedB = bytes.alloc(32);
+    x25519.scalarMult(sharedB, bobPriv, alicePub);
+
+    assert.isTrue(eqHex(sharedA, 32, "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742"));
+    let i = 0;
+    while (i < 32) { assert.equalInt(bytes.read_byte(sharedA, i), bytes.read_byte(sharedB, i)); i = i + 1; }
+}
