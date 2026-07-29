@@ -1,0 +1,177 @@
+// SHA-1 (FIPS 180-1) implemented in Nova, no external library (M9 phase A). SHA-1 is not used for TLS
+// 1.3 security, but TLS 1.2 needs it for the legacy PRF and HMAC-SHA1 record MAC, and it appears in
+// certificate handling; it is included for completeness and is never used where collision resistance
+// matters. Words are `long` masked to 32 bits, so `>>` is logical.
+//
+// Reference: Zig std.crypto Sha1. Verified against known-answer vectors (conformance case 217).
+import bytes;
+import mem.allocator;
+
+const MASK32: ulong = 0xffffffff;
+
+pub const SHA1_DIGEST_LEN: int = 20;
+pub const SHA1_BLOCK_LEN: int = 64;
+
+fn rotl(x: ulong, n: int): ulong {
+    return ((x << n) | (x >> (32 - n))) & MASK32;
+}
+
+fn beWord(buf: ptr, off: int): ulong {
+    return (((bytes.read_byte(buf, off) as ulong) << 24)
+        | ((bytes.read_byte(buf, off + 1) as ulong) << 16)
+        | ((bytes.read_byte(buf, off + 2) as ulong) << 8)
+        | (bytes.read_byte(buf, off + 3) as ulong)) & MASK32;
+}
+
+fn putWord(out: ptr, off: int, w: ulong): void {
+    bytes.write_byte(out, off, ((w >> 24) & 0xff) as int);
+    bytes.write_byte(out, off + 1, ((w >> 16) & 0xff) as int);
+    bytes.write_byte(out, off + 2, ((w >> 8) & 0xff) as int);
+    bytes.write_byte(out, off + 3, (w & 0xff) as int);
+}
+
+pub struct Sha1 {
+    pub h: ptr,        // 5 words, 20 bytes
+    pub block: ptr,    // 64-byte pending block
+    pub blockLen: int,
+    pub total: long,
+
+    pub fn create(): Sha1 {
+        let s = bytes.new_with_allocator<Sha1>(allocator.globalAllocator());
+        s.h = bytes.alloc(5 * 4);
+        s.block = bytes.alloc(SHA1_BLOCK_LEN);
+        s.reset();
+        return s;
+    }
+
+    pub fn reset(self: Sha1): void {
+        putWord(self.h, 0, 0x67452301);
+        putWord(self.h, 4, 0xefcdab89);
+        putWord(self.h, 8, 0x98badcfe);
+        putWord(self.h, 12, 0x10325476);
+        putWord(self.h, 16, 0xc3d2e1f0);
+        self.blockLen = 0;
+        self.total = 0;
+    }
+
+    fn compress(self: Sha1, buf: ptr, off: int): void {
+        let w = bytes.alloc(80 * 4);
+        let t = 0;
+        while (t < 16) {
+            putWord(w, t * 4, beWord(buf, off + t * 4));
+            t = t + 1;
+        }
+        while (t < 80) {
+            let x = beWord(w, (t - 3) * 4) ^ beWord(w, (t - 8) * 4) ^ beWord(w, (t - 14) * 4) ^ beWord(w, (t - 16) * 4);
+            putWord(w, t * 4, rotl(x, 1));
+            t = t + 1;
+        }
+
+        let a = beWord(self.h, 0);
+        let b = beWord(self.h, 4);
+        let c = beWord(self.h, 8);
+        let d = beWord(self.h, 12);
+        let e = beWord(self.h, 16);
+
+        t = 0;
+        while (t < 80) {
+            let f: ulong = 0;
+            let k: ulong = 0;
+            if (t < 20) {
+                f = (b & c) | ((~b) & d);
+                k = 0x5a827999;
+            } else if (t < 40) {
+                f = b ^ c ^ d;
+                k = 0x6ed9eba1;
+            } else if (t < 60) {
+                f = (b & c) | (b & d) | (c & d);
+                k = 0x8f1bbcdc;
+            } else {
+                f = b ^ c ^ d;
+                k = 0xca62c1d6;
+            }
+            let temp = (rotl(a, 5) + (f & MASK32) + e + k + beWord(w, t * 4)) & MASK32;
+            e = d;
+            d = c;
+            c = rotl(b, 30);
+            b = a;
+            a = temp;
+            t = t + 1;
+        }
+
+        putWord(self.h, 0, (beWord(self.h, 0) + a) & MASK32);
+        putWord(self.h, 4, (beWord(self.h, 4) + b) & MASK32);
+        putWord(self.h, 8, (beWord(self.h, 8) + c) & MASK32);
+        putWord(self.h, 12, (beWord(self.h, 12) + d) & MASK32);
+        putWord(self.h, 16, (beWord(self.h, 16) + e) & MASK32);
+        bytes.free(w);
+    }
+
+    pub fn update(self: Sha1, data: ptr, len: int): void {
+        self.total = self.total + (len as long);
+        let i = 0;
+        if (self.blockLen > 0) {
+            while (i < len && self.blockLen < SHA1_BLOCK_LEN) {
+                bytes.write_byte(self.block, self.blockLen, bytes.read_byte(data, i));
+                self.blockLen = self.blockLen + 1;
+                i = i + 1;
+            }
+            if (self.blockLen == SHA1_BLOCK_LEN) {
+                self.compress(self.block, 0);
+                self.blockLen = 0;
+            }
+        }
+        while (len - i >= SHA1_BLOCK_LEN) {
+            self.compress(data, i);
+            i = i + SHA1_BLOCK_LEN;
+        }
+        while (i < len) {
+            bytes.write_byte(self.block, self.blockLen, bytes.read_byte(data, i));
+            self.blockLen = self.blockLen + 1;
+            i = i + 1;
+        }
+    }
+
+    pub fn final(self: Sha1, out: ptr): void {
+        let bitLen = self.total * 8;
+        let pad = bytes.alloc(SHA1_BLOCK_LEN * 2);
+        let n = 0;
+        bytes.write_byte(pad, n, 0x80);
+        n = n + 1;
+        while (((self.blockLen + n + 8) % SHA1_BLOCK_LEN) != 0) {
+            bytes.write_byte(pad, n, 0);
+            n = n + 1;
+        }
+        let j = 0;
+        while (j < 8) {
+            bytes.write_byte(pad, n + j, ((bitLen >> ((7 - j) * 8)) & 0xff) as int);
+            j = j + 1;
+        }
+        n = n + 8;
+        self.update(pad, n);
+        let i = 0;
+        while (i < 5) {
+            putWord(out, i * 4, beWord(self.h, i * 4));
+            i = i + 1;
+        }
+        bytes.free(pad);
+    }
+
+    pub fn delete(self: Sha1): void {
+        if (self.h != 0) {
+            bytes.free(self.h);
+            self.h = 0;
+        }
+        if (self.block != 0) {
+            bytes.free(self.block);
+            self.block = 0;
+        }
+    }
+}
+
+pub fn hashInto(data: ptr, len: int, out: ptr): void {
+    let s = Sha1.create();
+    s.update(data, len);
+    s.final(out);
+    s.delete();
+}

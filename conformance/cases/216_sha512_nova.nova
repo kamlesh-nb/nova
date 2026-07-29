@@ -1,0 +1,83 @@
+// SHA-512 and SHA-384 implemented in Nova (M9 phase A, no external library, 64-bit words). Verified
+// against NIST known-answer vectors, plus an incremental multi-update matching a one-shot.
+import crypto.sha512;
+import bytes;
+import assert;
+
+fn hexNib(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return 0;
+}
+
+fn eqHex(buf: ptr, n: int, hex: string): bool {
+    if (hex.length != n * 2) { return false; }
+    let i = 0;
+    while (i < n) {
+        if (bytes.read_byte(buf, i) != hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1])) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn strBuf(s: string): ptr {
+    let n = s.length;
+    let b = bytes.alloc(n + 1);
+    let i = 0;
+    while (i < n) { bytes.write_byte(b, i, s[i]); i = i + 1; }
+    return b;
+}
+
+@test
+fn sha512_empty(): void {
+    let out = bytes.alloc(64);
+    sha512.hashInto(bytes.alloc(1), 0, out);
+    assert.isTrue(eqHex(out, 64, "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"));
+}
+
+@test
+fn sha512_abc(): void {
+    let d = strBuf("abc");
+    let out = bytes.alloc(64);
+    sha512.hashInto(d, 3, out);
+    assert.isTrue(eqHex(out, 64, "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"));
+}
+
+@test
+fn sha512_two_block(): void {
+    // NIST 896-bit (112-byte) message; forces the two-block padding path.
+    let d = strBuf("abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu");
+    let out = bytes.alloc(64);
+    sha512.hashInto(d, 112, out);
+    assert.isTrue(eqHex(out, 64, "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909"));
+}
+
+@test
+fn sha384_abc(): void {
+    let d = strBuf("abc");
+    let out = bytes.alloc(48);
+    sha512.hash384Into(d, 3, out);
+    assert.isTrue(eqHex(out, 48, "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7"));
+}
+
+@test
+fn sha384_empty(): void {
+    let out = bytes.alloc(48);
+    sha512.hash384Into(bytes.alloc(1), 0, out);
+    assert.isTrue(eqHex(out, 48, "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b"));
+}
+
+@test
+fn sha512_incremental(): void {
+    let d = strBuf("The quick brown fox jumps over the lazy dog");
+    let s = sha512.Sha512.create(false);
+    s.update(d, 10);
+    s.update(d + 10, 33);
+    let out = bytes.alloc(64);
+    s.final(out);
+    s.delete();
+    assert.isTrue(eqHex(out, 64, "07e547d9586f6a73f73fbac0435ed76951218fb7d0c8d788a309d785436bbb642e93a252a954f23912547d1e8a3b5ed6e1bfd7097821233fa0538f3db854fee6"));
+}

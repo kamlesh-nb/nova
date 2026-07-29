@@ -1,0 +1,99 @@
+// HMAC (RFC 2104) over the Nova SHA-2 hashes, no external library (M9 phase A). HMAC is the MAC and
+// the building block of the HKDF key schedule and the TLS 1.2 PRF. This is pure protocol composition
+// over the hash primitives, so there is nothing timing-sensitive beyond the hash itself.
+//
+// HMAC(K, m) = H((K' ^ opad) || H((K' ^ ipad) || m)), where K' is K hashed down to the block size if
+// it is longer, else K zero-padded to the block size. Verified against RFC 4231 (conformance case 218).
+import bytes;
+import crypto.sha256;
+import crypto.sha512;
+
+const IPAD: int = 0x36;
+const OPAD: int = 0x5c;
+
+pub const HMAC_SHA256_LEN: int = 32;
+pub const HMAC_SHA384_LEN: int = 48;
+pub const HMAC_SHA512_LEN: int = 64;
+
+// HMAC-SHA256. Writes 32 bytes to out.
+pub fn hmacSha256(key: ptr, keyLen: int, msg: ptr, msgLen: int, out: ptr): void {
+    let bs = sha256.SHA256_BLOCK_LEN;
+    let dl = sha256.SHA256_DIGEST_LEN;
+    let k0 = bytes.alloc(bs);
+    if (keyLen > bs) {
+        sha256.hashInto(key, keyLen, k0);
+    } else {
+        let i = 0;
+        while (i < keyLen) { bytes.write_byte(k0, i, bytes.read_byte(key, i)); i = i + 1; }
+    }
+    let ipad = bytes.alloc(bs);
+    let opad = bytes.alloc(bs);
+    let i = 0;
+    while (i < bs) {
+        let kb = bytes.read_byte(k0, i);
+        bytes.write_byte(ipad, i, kb ^ IPAD);
+        bytes.write_byte(opad, i, kb ^ OPAD);
+        i = i + 1;
+    }
+    let inner = sha256.Sha256.create();
+    inner.update(ipad, bs);
+    inner.update(msg, msgLen);
+    let ih = bytes.alloc(dl);
+    inner.final(ih);
+    inner.delete();
+    let outer = sha256.Sha256.create();
+    outer.update(opad, bs);
+    outer.update(ih, dl);
+    outer.final(out);
+    outer.delete();
+    bytes.free(k0);
+    bytes.free(ipad);
+    bytes.free(opad);
+    bytes.free(ih);
+}
+
+// HMAC over SHA-384 (is384 true) or SHA-512 (false). dl is the digest length (48 or 64).
+fn hmac512Core(is384: bool, dl: int, key: ptr, keyLen: int, msg: ptr, msgLen: int, out: ptr): void {
+    let bs = sha512.SHA512_BLOCK_LEN;
+    let k0 = bytes.alloc(bs);
+    if (keyLen > bs) {
+        if (is384) { sha512.hash384Into(key, keyLen, k0); } else { sha512.hashInto(key, keyLen, k0); }
+    } else {
+        let i = 0;
+        while (i < keyLen) { bytes.write_byte(k0, i, bytes.read_byte(key, i)); i = i + 1; }
+    }
+    let ipad = bytes.alloc(bs);
+    let opad = bytes.alloc(bs);
+    let i = 0;
+    while (i < bs) {
+        let kb = bytes.read_byte(k0, i);
+        bytes.write_byte(ipad, i, kb ^ IPAD);
+        bytes.write_byte(opad, i, kb ^ OPAD);
+        i = i + 1;
+    }
+    let inner = sha512.Sha512.create(is384);
+    inner.update(ipad, bs);
+    inner.update(msg, msgLen);
+    let ih = bytes.alloc(dl);
+    inner.final(ih);
+    inner.delete();
+    let outer = sha512.Sha512.create(is384);
+    outer.update(opad, bs);
+    outer.update(ih, dl);
+    outer.final(out);
+    outer.delete();
+    bytes.free(k0);
+    bytes.free(ipad);
+    bytes.free(opad);
+    bytes.free(ih);
+}
+
+// HMAC-SHA384. Writes 48 bytes to out.
+pub fn hmacSha384(key: ptr, keyLen: int, msg: ptr, msgLen: int, out: ptr): void {
+    hmac512Core(true, HMAC_SHA384_LEN, key, keyLen, msg, msgLen, out);
+}
+
+// HMAC-SHA512. Writes 64 bytes to out.
+pub fn hmacSha512(key: ptr, keyLen: int, msg: ptr, msgLen: int, out: ptr): void {
+    hmac512Core(false, HMAC_SHA512_LEN, key, keyLen, msg, msgLen, out);
+}

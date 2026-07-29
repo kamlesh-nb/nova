@@ -1798,6 +1798,16 @@ pub const Parser = struct {
                     var is_generic = false;
                     while (look < self.tokens.len and depth > 0) {
                         const t = self.tokens[look];
+                        // A type-argument list cannot contain a statement terminator or a block brace.
+                        // If one appears before the matching `>`, this `<` is a comparison, not a
+                        // generic, and we must stop here rather than run on to a later `>>` (which the
+                        // depth logic below would treat as a close). Without this, `while (i < len) {`
+                        // followed later by an expression like `x >> (…)` was misparsed as a generic
+                        // call. Parentheses are NOT bailed on, because a type argument may be a function
+                        // type such as `Map<string, (int) -> any>`.
+                        if (t.type == .semicolon or t.type == .left_brace or t.type == .right_brace) {
+                            break;
+                        }
                         if (t.type == .less) depth += 1;
                         if (t.type == .greater) depth -= 1;
                         if (t.type == .shr) depth = if (depth >= 2) depth - 2 else 0;

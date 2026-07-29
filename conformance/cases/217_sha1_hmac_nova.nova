@@ -1,0 +1,112 @@
+// SHA-1 and HMAC (SHA-256/384/512) implemented in Nova (M9 phase A, no external library). SHA-1 vs
+// known-answer vectors; HMAC vs the RFC 4231 test vectors.
+import crypto.sha1;
+import crypto.hmac;
+import bytes;
+import assert;
+
+fn hexNib(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return 0;
+}
+
+fn eqHex(buf: ptr, n: int, hex: string): bool {
+    if (hex.length != n * 2) { return false; }
+    let i = 0;
+    while (i < n) {
+        if (bytes.read_byte(buf, i) != hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1])) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn strBuf(s: string): ptr {
+    let n = s.length;
+    let b = bytes.alloc(n + 1);
+    let i = 0;
+    while (i < n) { bytes.write_byte(b, i, s[i]); i = i + 1; }
+    return b;
+}
+
+fn fill(p: ptr, n: int, v: int): void {
+    let i = 0;
+    while (i < n) { bytes.write_byte(p, i, v); i = i + 1; }
+}
+
+@test
+fn sha1_abc(): void {
+    let out = bytes.alloc(20);
+    sha1.hashInto(strBuf("abc"), 3, out);
+    assert.isTrue(eqHex(out, 20, "a9993e364706816aba3e25717850c26c9cd0d89d"));
+}
+
+@test
+fn sha1_empty(): void {
+    let out = bytes.alloc(20);
+    sha1.hashInto(bytes.alloc(1), 0, out);
+    assert.isTrue(eqHex(out, 20, "da39a3ee5e6b4b0d3255bfef95601890afd80709"));
+}
+
+@test
+fn sha1_two_block(): void {
+    let d = strBuf("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq");
+    let out = bytes.alloc(20);
+    sha1.hashInto(d, 56, out);
+    assert.isTrue(eqHex(out, 20, "84983e441c3bd26ebaae4aa1f95129e5e54670f1"));
+}
+
+// RFC 4231 test case 1: key = 0x0b x20, msg = "Hi There".
+@test
+fn hmac_rfc4231_case1(): void {
+    let key = bytes.alloc(20);
+    fill(key, 20, 0x0b);
+    let msg = strBuf("Hi There");
+    let out256 = bytes.alloc(32);
+    hmac.hmacSha256(key, 20, msg, 8, out256);
+    assert.isTrue(eqHex(out256, 32, "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"));
+
+    let out384 = bytes.alloc(48);
+    hmac.hmacSha384(key, 20, msg, 8, out384);
+    assert.isTrue(eqHex(out384, 48, "afd03944d84895626b0825f4ab46907f15f9dadbe4101ec682aa034c7cebc59cfaea9ea9076ede7f4af152e8b2fa9cb6"));
+
+    let out512 = bytes.alloc(64);
+    hmac.hmacSha512(key, 20, msg, 8, out512);
+    assert.isTrue(eqHex(out512, 64, "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cdedaa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854"));
+}
+
+// RFC 4231 test case 2: key = "Jefe", msg = "what do ya want for nothing?".
+@test
+fn hmac_rfc4231_case2(): void {
+    let key = strBuf("Jefe");
+    let msg = strBuf("what do ya want for nothing?");
+    let out256 = bytes.alloc(32);
+    hmac.hmacSha256(key, 4, msg, 28, out256);
+    assert.isTrue(eqHex(out256, 32, "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"));
+}
+
+// RFC 4231 test case 3: key = 0xaa x20, msg = 0xdd x50 (long message, single hash-of-key not needed).
+@test
+fn hmac_rfc4231_case3(): void {
+    let key = bytes.alloc(20);
+    fill(key, 20, 0xaa);
+    let msg = bytes.alloc(50);
+    fill(msg, 50, 0xdd);
+    let out256 = bytes.alloc(32);
+    hmac.hmacSha256(key, 20, msg, 50, out256);
+    assert.isTrue(eqHex(out256, 32, "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe"));
+}
+
+// RFC 4231 test case 6: key = 0xaa x131 (longer than the block, forces the hash-the-key path).
+@test
+fn hmac_rfc4231_case6(): void {
+    let key = bytes.alloc(131);
+    fill(key, 131, 0xaa);
+    let msg = strBuf("Test Using Larger Than Block-Size Key - Hash Key First");
+    let out256 = bytes.alloc(32);
+    hmac.hmacSha256(key, 131, msg, 54, out256);
+    assert.isTrue(eqHex(out256, 32, "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"));
+}

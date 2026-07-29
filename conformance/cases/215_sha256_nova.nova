@@ -1,0 +1,93 @@
+// SHA-256 implemented in Nova (M9 phase A, no external library). Verified against NIST known-answer
+// vectors, an incremental (multi-update) hash matching a one-shot, and a multi-block input.
+import crypto.sha256;
+import bytes;
+import assert;
+
+fn hexNib(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return 0;
+}
+
+fn eqHex(buf: ptr, n: int, hex: string): bool {
+    if (hex.length != n * 2) { return false; }
+    let i = 0;
+    while (i < n) {
+        if (bytes.read_byte(buf, i) != hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1])) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn strBuf(s: string): ptr {
+    let n = s.length;
+    let b = bytes.alloc(n + 1);
+    let i = 0;
+    while (i < n) { bytes.write_byte(b, i, s[i]); i = i + 1; }
+    return b;
+}
+
+@test
+fn sha256_empty(): void {
+    let out = bytes.alloc(32);
+    sha256.hashInto(bytes.alloc(1), 0, out);
+    assert.isTrue(eqHex(out, 32, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
+}
+
+@test
+fn sha256_abc(): void {
+    let d = strBuf("abc");
+    let out = bytes.alloc(32);
+    sha256.hashInto(d, 3, out);
+    assert.isTrue(eqHex(out, 32, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+}
+
+@test
+fn sha256_two_block(): void {
+    // NIST 448-bit message vector (56 bytes; forces the two-block padding path).
+    let d = strBuf("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq");
+    let out = bytes.alloc(32);
+    sha256.hashInto(d, 56, out);
+    assert.isTrue(eqHex(out, 32, "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"));
+}
+
+@test
+fn sha256_long(): void {
+    // One million 'a' characters -> known digest. Fed in chunks to exercise incremental update.
+    let s = sha256.Sha256.create();
+    let chunk = bytes.alloc(1000);
+    let i = 0;
+    while (i < 1000) { bytes.write_byte(chunk, i, 97); i = i + 1; } // 'a'
+    let n = 0;
+    while (n < 1000) {
+        s.update(chunk, 1000);
+        n = n + 1;
+    }
+    let out = bytes.alloc(32);
+    s.final(out);
+    s.delete();
+    assert.isTrue(eqHex(out, 32, "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"));
+}
+
+@test
+fn sha256_incremental_matches_oneshot(): void {
+    let d = strBuf("The quick brown fox jumps over the lazy dog");
+    let one = bytes.alloc(32);
+    sha256.hashInto(d, 43, one);
+
+    let s = sha256.Sha256.create();
+    s.update(d, 10);
+    s.update(d + 10, 20);
+    s.update(d + 30, 13);
+    let inc = bytes.alloc(32);
+    s.final(inc);
+    s.delete();
+
+    let i = 0;
+    while (i < 32) { assert.equalInt(bytes.read_byte(one, i), bytes.read_byte(inc, i)); i = i + 1; }
+    assert.isTrue(eqHex(one, 32, "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592"));
+}

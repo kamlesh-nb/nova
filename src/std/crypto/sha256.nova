@@ -1,0 +1,209 @@
+// SHA-256 (FIPS 180-4) implemented in Nova, no external library (M9 phase A). This is the transcript
+// hash, the HMAC and HKDF core, and the handshake hash for TLS. Words are held in `long` masked to 32
+// bits (`& 0xffffffff`), which keeps every value non-negative so `>>` is a logical shift. State and
+// schedule words are stored and read through the byte-assembly helpers (beWord/putWord) rather than
+// read_i32/write_i32, to avoid any sign-extension ambiguity on words with the high bit set.
+//
+// Reference: Zig std.crypto sha2. Verified against NIST known-answer vectors (conformance case 215).
+import bytes;
+import mem.allocator;
+
+const MASK32: long = 0xffffffff;
+
+// Round constants: the first 32 bits of the fractional parts of the cube roots of the first 64 primes.
+const K256: long[64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+// Initial hash value: the first 32 bits of the fractional parts of the square roots of the first 8 primes.
+const IV256: long[8] = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+];
+
+pub const SHA256_DIGEST_LEN: int = 32;
+pub const SHA256_BLOCK_LEN: int = 64;
+
+// Rotate a 32-bit word right by n bits. x is masked to 32 bits, so x >> n is logical.
+fn rotr(x: long, n: int): long {
+    return ((x >> n) | (x << (32 - n))) & MASK32;
+}
+
+// Read 4 big-endian bytes at buf+off as a 32-bit word.
+fn beWord(buf: ptr, off: int): long {
+    return (((bytes.read_byte(buf, off) as long) << 24)
+        | ((bytes.read_byte(buf, off + 1) as long) << 16)
+        | ((bytes.read_byte(buf, off + 2) as long) << 8)
+        | (bytes.read_byte(buf, off + 3) as long)) & MASK32;
+}
+
+// Write a 32-bit word big-endian to out+off.
+fn putWord(out: ptr, off: int, w: long): void {
+    bytes.write_byte(out, off, ((w >> 24) & 0xff) as int);
+    bytes.write_byte(out, off + 1, ((w >> 16) & 0xff) as int);
+    bytes.write_byte(out, off + 2, ((w >> 8) & 0xff) as int);
+    bytes.write_byte(out, off + 3, (w & 0xff) as int);
+}
+
+// Incremental SHA-256. The 8 state words live big-endian in `h`; `block` buffers a partial input block;
+// `total` counts absorbed bytes. This shape lets the TLS transcript update as records arrive and
+// finalize at any point.
+pub struct Sha256 {
+    pub h: ptr,
+    pub block: ptr,
+    pub blockLen: int,
+    pub total: long,
+
+    pub fn create(): Sha256 {
+        let s = bytes.new_with_allocator<Sha256>(allocator.globalAllocator());
+        s.h = bytes.alloc(8 * 4);
+        s.block = bytes.alloc(SHA256_BLOCK_LEN);
+        s.reset();
+        return s;
+    }
+
+    pub fn reset(self: Sha256): void {
+        let i = 0;
+        while (i < 8) {
+            putWord(self.h, i * 4, IV256[i]);
+            i = i + 1;
+        }
+        self.blockLen = 0;
+        self.total = 0;
+    }
+
+    // Absorb one 64-byte block from buf+off into the 8 state words.
+    fn compress(self: Sha256, buf: ptr, off: int): void {
+        let w = bytes.alloc(64 * 4);
+        let t = 0;
+        while (t < 16) {
+            putWord(w, t * 4, beWord(buf, off + t * 4));
+            t = t + 1;
+        }
+        while (t < 64) {
+            let w15 = beWord(w, (t - 15) * 4);
+            let w2 = beWord(w, (t - 2) * 4);
+            let s0 = (rotr(w15, 7) ^ rotr(w15, 18) ^ (w15 >> 3)) & MASK32;
+            let s1 = (rotr(w2, 17) ^ rotr(w2, 19) ^ (w2 >> 10)) & MASK32;
+            let w16 = beWord(w, (t - 16) * 4);
+            let w7 = beWord(w, (t - 7) * 4);
+            putWord(w, t * 4, (w16 + s0 + w7 + s1) & MASK32);
+            t = t + 1;
+        }
+
+        let a = beWord(self.h, 0);
+        let b = beWord(self.h, 4);
+        let c = beWord(self.h, 8);
+        let d = beWord(self.h, 12);
+        let e = beWord(self.h, 16);
+        let f = beWord(self.h, 20);
+        let g = beWord(self.h, 24);
+        let hh = beWord(self.h, 28);
+
+        t = 0;
+        while (t < 64) {
+            let bigS1 = (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) & MASK32;
+            let ch = ((e & f) ^ ((~e) & g)) & MASK32;
+            let temp1 = (hh + bigS1 + ch + K256[t] + beWord(w, t * 4)) & MASK32;
+            let bigS0 = (rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) & MASK32;
+            let maj = ((a & b) ^ (a & c) ^ (b & c)) & MASK32;
+            let temp2 = (bigS0 + maj) & MASK32;
+            hh = g;
+            g = f;
+            f = e;
+            e = (d + temp1) & MASK32;
+            d = c;
+            c = b;
+            b = a;
+            a = (temp1 + temp2) & MASK32;
+            t = t + 1;
+        }
+
+        putWord(self.h, 0, (beWord(self.h, 0) + a) & MASK32);
+        putWord(self.h, 4, (beWord(self.h, 4) + b) & MASK32);
+        putWord(self.h, 8, (beWord(self.h, 8) + c) & MASK32);
+        putWord(self.h, 12, (beWord(self.h, 12) + d) & MASK32);
+        putWord(self.h, 16, (beWord(self.h, 16) + e) & MASK32);
+        putWord(self.h, 20, (beWord(self.h, 20) + f) & MASK32);
+        putWord(self.h, 24, (beWord(self.h, 24) + g) & MASK32);
+        putWord(self.h, 28, (beWord(self.h, 28) + hh) & MASK32);
+        bytes.free(w);
+    }
+
+    pub fn update(self: Sha256, data: ptr, len: int): void {
+        self.total = self.total + (len as long);
+        let i = 0;
+        if (self.blockLen > 0) {
+            while (i < len && self.blockLen < SHA256_BLOCK_LEN) {
+                bytes.write_byte(self.block, self.blockLen, bytes.read_byte(data, i));
+                self.blockLen = self.blockLen + 1;
+                i = i + 1;
+            }
+            if (self.blockLen == SHA256_BLOCK_LEN) {
+                self.compress(self.block, 0);
+                self.blockLen = 0;
+            }
+        }
+        while (len - i >= SHA256_BLOCK_LEN) {
+            self.compress(data, i);
+            i = i + SHA256_BLOCK_LEN;
+        }
+        while (i < len) {
+            bytes.write_byte(self.block, self.blockLen, bytes.read_byte(data, i));
+            self.blockLen = self.blockLen + 1;
+            i = i + 1;
+        }
+    }
+
+    // Write the 32-byte digest to out. The bit length is captured before padding; the pad bytes we then
+    // feed through update do not affect the result.
+    pub fn final(self: Sha256, out: ptr): void {
+        let bitLen = self.total * 8;
+        let pad = bytes.alloc(SHA256_BLOCK_LEN * 2);
+        let n = 0;
+        bytes.write_byte(pad, n, 0x80);
+        n = n + 1;
+        while (((self.blockLen + n + 8) % SHA256_BLOCK_LEN) != 0) {
+            bytes.write_byte(pad, n, 0);
+            n = n + 1;
+        }
+        let j = 0;
+        while (j < 8) {
+            bytes.write_byte(pad, n + j, ((bitLen >> ((7 - j) * 8)) & 0xff) as int);
+            j = j + 1;
+        }
+        n = n + 8;
+        self.update(pad, n);
+        let i = 0;
+        while (i < 8) {
+            putWord(out, i * 4, beWord(self.h, i * 4));
+            i = i + 1;
+        }
+        bytes.free(pad);
+    }
+
+    pub fn delete(self: Sha256): void {
+        if (self.h != 0) {
+            bytes.free(self.h);
+            self.h = 0;
+        }
+        if (self.block != 0) {
+            bytes.free(self.block);
+            self.block = 0;
+        }
+    }
+}
+
+// One-shot SHA-256 of len bytes at data, writing 32 bytes to out.
+pub fn hashInto(data: ptr, len: int, out: ptr): void {
+    let s = Sha256.create();
+    s.update(data, len);
+    s.final(out);
+    s.delete();
+}
