@@ -1,0 +1,168 @@
+// TLS 1.2 client as a TlsBio (M13 stage 4): drives crypto/tls/12/tlsClient over the same transport-
+// agnostic feed/pull/step/writeApp/readApp interface as the TLS 1.3 bios, so net/asynctls and the TDS
+// driver can speak TLS 1.2 in pure Nova. The handshake authenticates the server (ServerKeyExchange
+// signature). Client only; verified live vs openssl s_server -tls1_2. See net/tlsmembio for the trait.
+import bytes;
+import net.tlsmembio;
+import crypto.tls.12.client12;
+import crypto.random;
+
+fn at(b: ptr, off: int): ptr { return (b as long + off) as ptr; }
+fn fillRandom(buf: ptr, n: int): void {
+    let s = random.randomBytes(n);
+    let i = 0;
+    while (i < n) { bytes.write_byte(buf, i, s[i] & 0xff); i = i + 1; }
+}
+
+pub struct Client12Bio impl TlsBio {
+    pub buf: tlsmembio.MemBuf,
+    pub cl: client12.TlsClient12,
+    pub state: int,                 // 1 recv flight, 2 recv server Finished, 3 done, -1 error
+    pub hs: ptr, pub hsLen: int, pub hsCap: int, pub consumed: int,
+    pub svd: ptr,                   // expected server verify_data
+    pub scratch: ptr, pub plain: ptr,
+
+    pub fn feed(self: Client12Bio, data: ptr, n: int): void { self.buf.feed(data, n); }
+    pub fn markClosed(self: Client12Bio): void { self.buf.closed = true; }
+    pub fn pendingOut(self: Client12Bio): int { return self.buf.olen; }
+    pub fn pull(self: Client12Bio, b: ptr, max: int): int { return self.buf.pull(b, max); }
+
+    fn appendHs(self: Client12Bio, src: ptr, n: int): void {
+        if (self.hsLen + n > self.hsCap) {
+            let nc = (self.hsLen + n) * 2;
+            let nb = bytes.alloc(nc);
+            let i = 0;
+            while (i < self.hsLen) { bytes.write_byte(nb, i, bytes.read_byte(self.hs, i)); i = i + 1; }
+            bytes.free(self.hs); self.hs = nb; self.hsCap = nc;
+        }
+        let i = 0;
+        while (i < n) { bytes.write_byte(self.hs, self.hsLen + i, bytes.read_byte(src, i)); i = i + 1; }
+        self.hsLen = self.hsLen + n;
+    }
+
+    // On ServerHelloDone: build ClientKeyExchange + ChangeCipherSpec + (encrypted) Finished into the
+    // outbound queue, and record the expected server verify_data.
+    fn sendClientFlight(self: Client12Bio): void {
+        let cke = bytes.alloc(256);
+        let ckeLen = self.cl.buildClientKeyExchange(cke);
+        self.buf.appendRecord(0x16, 0x03, 0x03, cke, ckeLen);
+        let ccs = bytes.alloc(1); bytes.write_byte(ccs, 0, 1);
+        self.buf.appendRecord(0x14, 0x03, 0x03, ccs, 1);
+
+        let vd = bytes.alloc(12);
+        self.cl.clientVerifyData(vd);
+        let finMsg = bytes.alloc(16);
+        bytes.write_byte(finMsg, 0, 0x14); bytes.write_byte(finMsg, 1, 0); bytes.write_byte(finMsg, 2, 0); bytes.write_byte(finMsg, 3, 0x0c);
+        let i = 0;
+        while (i < 12) { bytes.write_byte(finMsg, 4 + i, bytes.read_byte(vd, i)); i = i + 1; }
+        self.cl.addTr(finMsg, 16);
+        self.cl.serverVerifyData(self.svd);
+        let encFin = bytes.alloc(64);
+        let efLen = self.cl.sealRecord(0x16, finMsg, 16, encFin);
+        self.buf.appendRecord(0x16, 0x03, 0x03, encFin, efLen);
+        bytes.free(cke); bytes.free(ccs); bytes.free(vd); bytes.free(finMsg); bytes.free(encFin);
+    }
+
+    pub fn step(self: Client12Bio): int {
+        if (self.state == 3) { return 0; }
+        if (self.state < 0) { return 0 - 1; }
+        while (true) {
+            let m = self.buf.nextRecord(self.scratch);
+            if (m == 0) { return 1; }
+            let ctype = bytes.read_byte(self.scratch, 0);
+            if (self.state == 1) {
+                if (ctype == 0x14) { continue; }
+                if (ctype != 0x16) { self.state = 0 - 1; return 0 - 1; }
+                self.appendHs(at(self.scratch, 5), m - 5);
+                // Dispatch complete handshake messages.
+                let more = true;
+                while (more && self.consumed + 4 <= self.hsLen) {
+                    let p = self.consumed;
+                    let mt = bytes.read_byte(self.hs, p);
+                    let ml = (bytes.read_byte(self.hs, p + 1) << 16) | (bytes.read_byte(self.hs, p + 2) << 8) | bytes.read_byte(self.hs, p + 3);
+                    if (p + 4 + ml > self.hsLen) { more = false; }
+                    else {
+                        let msg = at(self.hs, p);
+                        if (mt == 0x02) { self.cl.processServerHello(msg, 4 + ml); }
+                        else if (mt == 0x0b) { self.cl.processCertificate(msg, 4 + ml); }
+                        else if (mt == 0x0c) { if (!self.cl.processServerKeyExchange(msg, 4 + ml)) { self.state = 0 - 1; return 0 - 1; } }
+                        else if (mt == 0x0e) {
+                            self.cl.addTr(msg, 4 + ml);
+                            self.sendClientFlight();
+                            self.state = 2;
+                        }
+                        self.consumed = p + 4 + ml;
+                    }
+                }
+                if (self.state == 2) { return 1; }
+            } else if (self.state == 2) {
+                if (ctype == 0x14) { continue; }         // server ChangeCipherSpec
+                if (ctype != 0x16) { self.state = 0 - 1; return 0 - 1; }
+                let sfin = self.plain;
+                let sfl = self.cl.openRecord(0x16, at(self.scratch, 5), m - 5, sfin);
+                if (sfl < 0) { self.state = 0 - 1; return 0 - 1; }
+                // Verify server verify_data (bytes 4..16 of the Finished message).
+                let ok = true;
+                let i = 0;
+                while (i < 12) { if (bytes.read_byte(sfin, 4 + i) != bytes.read_byte(self.svd, i)) { ok = false; } i = i + 1; }
+                if (!ok) { self.state = 0 - 1; return 0 - 1; }
+                self.state = 3;
+                return 0;
+            }
+        }
+        return 1;
+    }
+
+    pub fn writeApp(self: Client12Bio, data: ptr, n: int): int {
+        let enc = bytes.alloc(n + 64);
+        let el = self.cl.sealRecord(0x17, data, n, enc);
+        self.buf.appendRecord(0x17, 0x03, 0x03, enc, el);
+        bytes.free(enc);
+        return n;
+    }
+
+    pub fn readApp(self: Client12Bio, out: ptr, max: int): int {
+        while (true) {
+            let m = self.buf.nextRecord(self.scratch);
+            if (m == 0) { if (self.buf.closed) { return 0 - 1; } return 0; }
+            let ctype = bytes.read_byte(self.scratch, 0);
+            if (ctype == 0x17) {
+                let pl = self.cl.openRecord(0x17, at(self.scratch, 5), m - 5, self.plain);
+                if (pl < 0) { return 0 - 1; }
+                let take = pl;
+                if (take > max) { take = max; }
+                let i = 0;
+                while (i < take) { bytes.write_byte(out, i, bytes.read_byte(self.plain, i)); i = i + 1; }
+                return take;
+            } else if (ctype == 0x16) {
+                // Post-handshake handshake record (e.g. NewSessionTicket): decrypt to advance seq, skip.
+                self.cl.openRecord(0x16, at(self.scratch, 5), m - 5, self.plain);
+            } else if (ctype == 0x15) {
+                return 0 - 1;                            // alert -> closed
+            }
+        }
+        return 0;
+    }
+
+    pub fn closeBio(self: Client12Bio): void {
+        self.buf.freeBuffers();
+        bytes.free(self.hs);
+        bytes.free(self.svd);
+        bytes.free(self.scratch);
+        bytes.free(self.plain);
+    }
+}
+
+// Build a fresh TLS 1.2 client bio for `host` (SNI); the ClientHello is queued for the first pull().
+pub fn newClient12Bio(host: string): Client12Bio {
+    let cl = client12.newClient12();
+    fillRandom(cl.clientRandom, 32);
+    let mb = tlsmembio.newMemBuf();
+    let ch = bytes.alloc(512);
+    let chLen = client12.buildClientHello(cl.clientRandom, host, ch);
+    cl.addTr(ch, chLen);
+    mb.appendRecord(0x16, 0x03, 0x03, ch, chLen);
+    bytes.free(ch);
+    return Client12Bio { buf: mb, cl: cl, state: 1, hs: bytes.alloc(16384), hsLen: 0, hsCap: 16384,
+                         consumed: 0, svd: bytes.alloc(12), scratch: bytes.alloc(33792), plain: bytes.alloc(33792) };
+}

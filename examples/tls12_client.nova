@@ -8,7 +8,7 @@
 //   nova examples/tls12_client.nova -o cli12 && ./cli12
 import os.sys;
 import net.reactorio;
-import crypto.tls.12.tlsClient;
+import crypto.tls.12.client12;
 import crypto.random;
 import bytes;
 
@@ -37,12 +37,12 @@ fn main(): int {
     let fd = sys.socket(sys.AF_INET, sys.SOCK_STREAM, 0);
     let sa = sys.makeSockaddrIn(4433, reactorio.parseIPv4("127.0.0.1"));
     if (sys.connect(fd, sa, 16) != 0) { logS("connect failed"); return 1; }
-    let c = tlsClient.newClient12();
+    let c = client12.newClient12();
     fillRnd(c.clientRandom, 32);
 
     // ClientHello
     let ch = bytes.alloc(512);
-    let chLen = tlsClient.buildClientHello(c.clientRandom, "localhost", ch);
+    let chLen = client12.buildClientHello(c.clientRandom, "localhost", ch);
     c.addTr(ch, chLen);
     let rec = bytes.alloc(1024);
     writeAll(fd, rec, wrapRec(0x16, ch, chLen, rec));

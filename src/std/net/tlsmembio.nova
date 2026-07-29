@@ -24,7 +24,7 @@ fn fillRandom(buf: ptr, n: int): void {
 
 // A growable inbound-ciphertext ring [ilo, ihi) plus an outbound-ciphertext queue [0, olen). Records are
 // TLS-framed (5-byte header + body); nextRecord hands back one whole record at a time.
-struct MemBuf {
+pub struct MemBuf {
     pub ibuf: ptr, pub icap: int, pub ilo: int, pub ihi: int,
     pub obuf: ptr, pub ocap: int, pub olen: int,
     pub closed: bool,
@@ -116,7 +116,7 @@ struct MemBuf {
     }
 }
 
-fn newMemBuf(): MemBuf {
+pub fn newMemBuf(): MemBuf {
     return MemBuf { ibuf: bytes.alloc(4096), icap: 4096, ilo: 0, ihi: 0,
                     obuf: bytes.alloc(4096), ocap: 4096, olen: 0, closed: false };
 }
