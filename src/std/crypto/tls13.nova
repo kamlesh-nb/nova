@@ -1,0 +1,164 @@
+// TLS 1.3 (RFC 8446) key schedule and record protection in Nova, no external library (M9 phase E).
+//
+// The key schedule composes the already-verified HKDF-Expand-Label / Derive-Secret primitives in the
+// RFC 8446 section 7.1 order (early secret -> derived -> handshake secret -> traffic secrets -> per-
+// direction key and IV). Record protection is the section 5.2 construction: the per-record nonce is the
+// write IV XOR the 64-bit sequence number (right-aligned), the additional data is the 5-byte record
+// header, and the AEAD is AES-128/256-GCM or ChaCha20-Poly1305.
+//
+// References: RFC 8446. Verified against the RFC 8448 "Simple 1-RTT Handshake" trace.
+import bytes;
+import crypto.hkdf;
+import crypto.sha256;
+import crypto.sha512;
+import crypto.aesgcm;
+import crypto.chachapoly;
+
+// Cipher suites (AEAD + key length). The hash for the key schedule is passed separately as the HKDF
+// `kind` (0 = SHA-256, 1 = SHA-384), matching the suite.
+const SUITE_AES128_GCM: int = 0;   // key 16, SHA-256
+const SUITE_AES256_GCM: int = 1;   // key 32, SHA-384
+const SUITE_CHACHA20: int = 2;     // key 32, SHA-256
+
+pub fn keyLen(suite: int): int {
+    if (suite == SUITE_AES128_GCM) { return 16; }
+    return 32;
+}
+
+fn strBuf(s: string): ptr {
+    let b = bytes.alloc(s.length);
+    let i = 0;
+    while (i < s.length) { bytes.write_byte(b, i, s[i]); i = i + 1; }
+    return b;
+}
+
+fn hashEmpty(kind: int, out: ptr): void {
+    let d = bytes.alloc(1);
+    if (kind == 0) { sha256.hashInto(d, 0, out); } else { sha512.hash384Into(d, 0, out); }
+    bytes.free(d);
+}
+
+// ---- key schedule (RFC 8446 section 7.1) ----
+
+// Early Secret = HKDF-Extract(salt = 0, IKM = PSK = 0).
+pub fn earlySecret(kind: int, out: ptr): void {
+    let hl = hkdf.hashLen(kind);
+    let z = bytes.alloc(hl);
+    let i = 0;
+    while (i < hl) { bytes.write_byte(z, i, 0); i = i + 1; }
+    hkdf.extract(kind, z, hl, z, hl, out);
+    bytes.free(z);
+}
+
+// derived = Derive-Secret(secret, "derived", "").
+pub fn deriveDerived(kind: int, secret: ptr, out: ptr): void {
+    let hl = hkdf.hashLen(kind);
+    let eh = bytes.alloc(hl);
+    hashEmpty(kind, eh);
+    let lab = strBuf("derived");
+    hkdf.deriveSecret(kind, secret, hl, lab, 7, eh, out);
+    bytes.free(eh); bytes.free(lab);
+}
+
+// Handshake (or Master) Secret = HKDF-Extract(salt = derived, IKM = ECDHE (or 0 for master)).
+pub fn extractSecret(kind: int, salt: ptr, ikm: ptr, ikmLen: int, out: ptr): void {
+    hkdf.extract(kind, salt, hkdf.hashLen(kind), ikm, ikmLen, out);
+}
+
+// Derive-Secret(secret, label, Transcript-Hash(messages)); the caller supplies the transcript hash.
+pub fn deriveTraffic(kind: int, secret: ptr, label: string, transcript: ptr, out: ptr): void {
+    let lab = strBuf(label);
+    hkdf.deriveSecret(kind, secret, hkdf.hashLen(kind), lab, label.length, transcript, out);
+    bytes.free(lab);
+}
+
+// From a traffic secret, derive the AEAD key and 12-byte IV (HKDF-Expand-Label "key" / "iv").
+pub fn deriveKeyIv(kind: int, suite: int, trafficSecret: ptr, keyOut: ptr, ivOut: ptr): void {
+    let hl = hkdf.hashLen(kind);
+    let empty = bytes.alloc(1);
+    let kl = strBuf("key");
+    hkdf.expandLabel(kind, trafficSecret, hl, kl, 3, empty, 0, keyOut, keyLen(suite));
+    let il = strBuf("iv");
+    hkdf.expandLabel(kind, trafficSecret, hl, il, 2, empty, 0, ivOut, 12);
+    bytes.free(empty); bytes.free(kl); bytes.free(il);
+}
+
+// ---- record protection (RFC 8446 section 5.2) ----
+
+// Per-record nonce: the 12-byte IV XOR the 64-bit sequence number, right-aligned.
+pub fn recordNonce(iv: ptr, seq: long, out: ptr): void {
+    let i = 0;
+    while (i < 12) { bytes.write_byte(out, i, bytes.read_byte(iv, i)); i = i + 1; }
+    i = 0;
+    while (i < 8) {
+        let b = ((seq >> (8 * (7 - i))) & 0xff) as int;
+        bytes.write_byte(out, 4 + i, bytes.read_byte(out, 4 + i) ^ b);
+        i = i + 1;
+    }
+}
+
+fn aeadSeal(suite: int, key: ptr, nonce: ptr, aad: ptr, aadLen: int, pt: ptr, ptLen: int, ctOut: ptr, tagOut: ptr): void {
+    if (suite == SUITE_CHACHA20) {
+        chachapoly.seal(key, nonce, aad, aadLen, pt, ptLen, ctOut, tagOut);
+    } else {
+        aesgcm.seal(key, keyLen(suite), nonce, 12, aad, aadLen, pt, ptLen, ctOut, tagOut);
+    }
+}
+fn aeadOpen(suite: int, key: ptr, nonce: ptr, aad: ptr, aadLen: int, ct: ptr, ctLen: int, tag: ptr, ptOut: ptr): bool {
+    if (suite == SUITE_CHACHA20) {
+        return chachapoly.open(key, nonce, aad, aadLen, ct, ctLen, tag, ptOut);
+    }
+    return aesgcm.open(key, keyLen(suite), nonce, 12, aad, aadLen, ct, ctLen, tag, ptOut);
+}
+
+// Protect one record: encrypts `content` (contentLen bytes) with trailing inner content-type byte, into
+// a full TLSCiphertext record (5-byte header + ciphertext + 16-byte tag) written to out. Returns the
+// total record length.
+pub fn recordProtect(suite: int, key: ptr, iv: ptr, seq: long,
+                     content: ptr, contentLen: int, contentType: int, out: ptr): int {
+    let innerLen = contentLen + 1;                 // TLSInnerPlaintext = content || type (no padding)
+    let ctLen = innerLen + 16;
+    let inner = bytes.alloc(innerLen);
+    let i = 0;
+    while (i < contentLen) { bytes.write_byte(inner, i, bytes.read_byte(content, i)); i = i + 1; }
+    bytes.write_byte(inner, contentLen, contentType);
+
+    // Header / additional data: 0x17 || 0x0303 || length(uint16), length = ctLen.
+    bytes.write_byte(out, 0, 0x17);
+    bytes.write_byte(out, 1, 0x03);
+    bytes.write_byte(out, 2, 0x03);
+    bytes.write_byte(out, 3, (ctLen >> 8) & 0xff);
+    bytes.write_byte(out, 4, ctLen & 0xff);
+
+    let nonce = bytes.alloc(12);
+    recordNonce(iv, seq, nonce);
+    aeadSeal(suite, key, nonce, out, 5, inner, innerLen, (out as long + 5) as ptr, (out as long + 5 + innerLen) as ptr);
+    bytes.free(inner); bytes.free(nonce);
+    return 5 + ctLen;
+}
+
+// Unprotect one record: verifies and decrypts a TLSCiphertext record into its inner plaintext
+// (content || content-type || zero padding) written to out. Returns the inner plaintext length, or -1 if
+// the tag does not verify. The caller strips trailing zero padding; the last non-zero byte is the type.
+pub fn recordUnprotect(suite: int, key: ptr, iv: ptr, seq: long, record: ptr, recLen: int, out: ptr): int {
+    let ctLen = recLen - 5;
+    let ptLen = ctLen - 16;
+    let nonce = bytes.alloc(12);
+    recordNonce(iv, seq, nonce);
+    let ct = (record as long + 5) as ptr;
+    let tag = (record as long + 5 + ptLen) as ptr;
+    let ok = aeadOpen(suite, key, nonce, record, 5, ct, ptLen, tag, out);
+    bytes.free(nonce);
+    if (!ok) { return -1; }
+    return ptLen;
+}
+
+// Strip TLS 1.3 inner-plaintext trailing zero padding: writes the content type to typeOut[0] and returns
+// the content length (everything before the type byte). Returns -1 if the record was all zeros.
+pub fn innerParse(inner: ptr, innerLen: int, typeOut: ptr): int {
+    let i = innerLen - 1;
+    while (i >= 0 && bytes.read_byte(inner, i) == 0) { i = i - 1; }
+    if (i < 0) { return -1; }
+    bytes.write_byte(typeOut, 0, bytes.read_byte(inner, i));
+    return i;                                     // content occupies inner[0..i)
+}
