@@ -1,0 +1,72 @@
+// Pure-Nova TLS 1.3 memory-BIO (M11 stage C): a full client<->server handshake and bidirectional
+// application-data exchange driven entirely in memory (no sockets) through net/tlsmembio's TlsBio
+// trait objects. Proves the memory-BIO that backs net/asynctls without needing a live peer.
+import net.tlsmembio;
+import bytes;
+import assert;
+
+const SRV_CERT: string = "308201a130820147a00302010202141132d0ad2cb5a5aec6d088a049552374cbbca34b300a06082a8648ce3d040302301b3119301706035504030c106e6f76612e7365727665722e74657374301e170d3236303732393133303632325a170d3336303732363133303632325a301b3119301706035504030c106e6f76612e7365727665722e746573743059301306072a8648ce3d020106082a8648ce3d03010703420004d921dfec51642932c9708bba6c381bfa3c2be73b257131e5174bd0f24731f64be497968ec1d04110412c5a84296bec7a1cc509c7c1a39b615bb1df985d2fbf73a3693067301d0603551d0e04160414826695b337da03b19b733834f0477dd3b548376a301f0603551d23041830168014826695b337da03b19b733834f0477dd3b548376a300f0603551d130101ff040530030101ff30140603551d11040d300b82096c6f63616c686f7374300a06082a8648ce3d0403020348003045022005cdb781873d82d91c39162afe7cf08981be5d25a6d068e0228b7125f52f3134022100e1656421fa188dba029990964ce2e1914a294995104592cac75024b011bc30a3";
+const SRV_PRIV: string = "accfe82d31600d5810b9984176898804a4ba458216b1ac913231be5008ca82f1";
+
+fn hexNib(c: int): int { if (c >= 48 && c <= 57) { return c - 48; } if (c >= 97 && c <= 102) { return c - 87; } return 0; }
+fn hexBuf(hex: string): ptr {
+    let n = hex.length / 2;
+    let b = bytes.alloc(n);
+    let i = 0;
+    while (i < n) { bytes.write_byte(b, i, hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1])); i = i + 1; }
+    return b;
+}
+
+// Shuttle all pending outbound ciphertext from a -> b.
+fn transfer(a: tlsmembio.TlsBio, b: tlsmembio.TlsBio, tmp: ptr, cap: int): void {
+    while (a.pendingOut() > 0) {
+        let n = a.pull(tmp, cap);
+        if (n <= 0) { return; }
+        b.feed(tmp, n);
+    }
+}
+
+@test
+fn tls13_loopback(): void {
+    let cb: tlsmembio.TlsBio = tlsmembio.newClientBio("localhost");
+    let sb: tlsmembio.TlsBio = tlsmembio.newServerBio(hexBuf(SRV_CERT), 421, hexBuf(SRV_PRIV));
+    let tmp = bytes.alloc(33792);
+
+    let cdone = false; let sdone = false;
+    let i = 0;
+    while (i < 20 && !(cdone && sdone)) {
+        transfer(cb, sb, tmp, 33792);
+        let ss = sb.step();
+        assert.isTrue(ss >= 0);
+        if (ss == 0) { sdone = true; }
+        transfer(sb, cb, tmp, 33792);
+        let cs = cb.step();
+        assert.isTrue(cs >= 0);
+        if (cs == 0) { cdone = true; }
+        i = i + 1;
+    }
+    assert.isTrue(cdone);
+    assert.isTrue(sdone);
+
+    // App data client -> server.
+    let msg = bytes.alloc(5);
+    bytes.write_byte(msg, 0, 104); bytes.write_byte(msg, 1, 101); bytes.write_byte(msg, 2, 108); bytes.write_byte(msg, 3, 108); bytes.write_byte(msg, 4, 111);
+    cb.writeApp(msg, 5);
+    transfer(cb, sb, tmp, 33792);
+    let out = bytes.alloc(256);
+    let k = sb.readApp(out, 256);
+    assert.equalInt(k, 5);
+    assert.equalInt(bytes.read_byte(out, 0), 104);
+    assert.equalInt(bytes.read_byte(out, 4), 111);
+
+    // App data server -> client.
+    sb.writeApp(out, 5);
+    transfer(sb, cb, tmp, 33792);
+    let out2 = bytes.alloc(256);
+    let k2 = cb.readApp(out2, 256);
+    assert.equalInt(k2, 5);
+    assert.equalInt(bytes.read_byte(out2, 0), 104);
+
+    cb.closeBio();
+    sb.closeBio();
+}
