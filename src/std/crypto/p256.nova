@@ -445,3 +445,276 @@ pub fn ecdh(outSecret32: ptr, scalar32: ptr, peerPub65: ptr): int {
     bytes.free(xa); bytes.free(ya);
     return 1;
 }
+
+// ---- ECDSA verification (operates only on public values, so it need not be constant-time) ----
+//
+// Scalar arithmetic is modulo the group order n. It reuses the CIOS Montgomery pattern with n's limbs
+// and n's n0' = -n^-1 mod 2^32. A value < 2^256 is < 2n (since n > 2^255), so a single conditional
+// subtract of n reduces it into [0, n).
+
+const N0INV: ulong = 0xee00bc4f;
+
+// The i-th limb of the order n (little-endian).
+fn nl(i: int): ulong {
+    if (i == 0) { return 0xfc632551; }
+    if (i == 1) { return 0xf3b9cac2; }
+    if (i == 2) { return 0xa7179e84; }
+    if (i == 3) { return 0xbce6faad; }
+    if (i == 6) { return U0; }
+    return MASK32;                       // i in {4, 5, 7}
+}
+
+fn feIsZero(a: ptr): bool {
+    let d: ulong = 0;
+    let j = 0;
+    while (j < 8) { d = d | getw(a, j); j = j + 1; }
+    return d == U0;
+}
+
+fn ltN(a: ptr): bool {                   // is a < n?
+    let borrow: ulong = 0;
+    let j = 0;
+    while (j < 8) {
+        let x = getw(a, j) - nl(j) - borrow;
+        borrow = (x >> 32) & U1;
+        j = j + 1;
+    }
+    return borrow == U1;
+}
+fn inRangeN(a: ptr): bool { return (!feIsZero(a)) && ltN(a); }   // 1 <= a < n
+
+fn nCondSub(out: ptr, t: ptr): void {    // t[0..8] (< 2n) -> t-n if t >= n else t
+    let d = bytes.alloc(64);
+    let borrow: ulong = 0;
+    let j = 0;
+    while (j < 8) {
+        let x = getw(t, j) - nl(j) - borrow;
+        setw(d, j, x & MASK32);
+        borrow = (x >> 32) & U1;
+        j = j + 1;
+    }
+    let x8 = getw(t, 8) - borrow;
+    borrow = (x8 >> 32) & U1;
+    let mask = U0 - (borrow ^ U1);
+    j = 0;
+    while (j < 8) {
+        setw(out, j, (getw(d, j) & mask) | (getw(t, j) & (~mask)));
+        j = j + 1;
+    }
+    bytes.free(d);
+}
+
+fn nAdd(out: ptr, a: ptr, b: ptr): void {
+    let t = bytes.alloc(72);
+    let carry: ulong = 0;
+    let j = 0;
+    while (j < 8) {
+        let s = getw(a, j) + getw(b, j) + carry;
+        setw(t, j, s & MASK32);
+        carry = s >> 32;
+        j = j + 1;
+    }
+    setw(t, 8, carry);
+    nCondSub(out, t);
+    bytes.free(t);
+}
+
+fn nMul(out: ptr, a: ptr, b: ptr): void {          // Montgomery multiply mod n
+    let t = bytes.alloc(80);
+    let j = 0;
+    while (j < 10) { setw(t, j, U0); j = j + 1; }
+    let i = 0;
+    while (i < 8) {
+        let bi = getw(b, i);
+        let carry: ulong = 0;
+        j = 0;
+        while (j < 8) {
+            let s = getw(t, j) + getw(a, j) * bi + carry;
+            setw(t, j, s & MASK32);
+            carry = s >> 32;
+            j = j + 1;
+        }
+        let s8 = getw(t, 8) + carry;
+        setw(t, 8, s8 & MASK32);
+        setw(t, 9, s8 >> 32);
+        let m = (getw(t, 0) * N0INV) & MASK32;
+        let c2 = (getw(t, 0) + m * nl(0)) >> 32;
+        j = 1;
+        while (j < 8) {
+            let s = getw(t, j) + m * nl(j) + c2;
+            setw(t, j - 1, s & MASK32);
+            c2 = s >> 32;
+            j = j + 1;
+        }
+        let s7 = getw(t, 8) + c2;
+        setw(t, 7, s7 & MASK32);
+        setw(t, 8, getw(t, 9) + (s7 >> 32));
+        i = i + 1;
+    }
+    nCondSub(out, t);
+    bytes.free(t);
+}
+
+fn toMontN(out: ptr, a: ptr): void {     // out = a*R mod n
+    feCopy(out, a);
+    let i = 0;
+    while (i < 256) { nAdd(out, out, out); i = i + 1; }
+}
+fn fromMontN(out: ptr, x: ptr): void {
+    let one = newFe(); feZero(one); setw(one, 0, U1);
+    nMul(out, x, one);
+    bytes.free(one);
+}
+fn montOneN(out: ptr): void {
+    let one = newFe(); feZero(one); setw(one, 0, U1);
+    toMontN(out, one);
+    bytes.free(one);
+}
+
+// out = a * b mod n (a, b in [0, n)).
+fn modMulN(out: ptr, a: ptr, b: ptr): void {
+    let aM = newFe(); toMontN(aM, a);
+    nMul(out, aM, b);
+    bytes.free(aM);
+}
+
+// out = a^-1 mod n (a in [1, n)), via Fermat a^(n-2) over the fixed public exponent.
+fn invModN(out: ptr, a: ptr): void {
+    let aM = newFe(); toMontN(aM, a);
+    let r = newFe(); montOneN(r);
+    let e = bytes.alloc(32);
+    setHex(e, "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc63254f");
+    let k = 255;
+    while (k >= 0) {
+        nMul(r, r, r);
+        let bitVal = (bytes.read_byte(e, 31 - (k >> 3)) >> (k & 7)) & 1;
+        if (bitVal == 1) { nMul(r, r, aM); }
+        k = k - 1;
+    }
+    fromMontN(out, r);
+    bytes.free(aM); bytes.free(r); bytes.free(e);
+}
+
+// out = in mod n (in < 2^256, so a single conditional subtract of n suffices).
+fn reduceModN(out: ptr, inp: ptr): void {
+    let t = bytes.alloc(72);
+    let j = 0;
+    while (j < 8) { setw(t, j, getw(inp, j)); j = j + 1; }
+    setw(t, 8, U0);
+    nCondSub(out, t);
+    bytes.free(t);
+}
+
+// Decode and validate an uncompressed public point (65 bytes) into a Montgomery Jacobian point.
+// Returns 1 on success, 0 if the point is malformed or not on the curve.
+fn decodePointToJac(pub65: ptr, q: ptr): int {
+    if (bytes.read_byte(pub65, 0) != 4) { return 0; }
+    let xn = newFe(); let yn = newFe();
+    feFromBE(xn, pub65, 1); feFromBE(yn, pub65, 33);
+    if (!feLtP(xn) || !feLtP(yn) || !onCurve(xn, yn)) {
+        bytes.free(xn); bytes.free(yn);
+        return 0;
+    }
+    toMont(px(q), xn); toMont(py(q), yn);
+    let one = newFe(); feZero(one); setw(one, 0, U1); toMont(pz(q), one);
+    bytes.free(xn); bytes.free(yn); bytes.free(one);
+    return 1;
+}
+
+// Jacobian point to affine (normal coordinates); returns 1 if the point is at infinity.
+fn jacToAffine(p: ptr, xOut: ptr, yOut: ptr): int {
+    if (feIsZero(pz(p))) { return 1; }
+    toAffine(p, xOut, yOut);
+    return 0;
+}
+
+// Affine point addition (full case handling); inputs and outputs are normal coordinates. Returns 1 if
+// the result is the point at infinity. Not constant-time (only ever used on public verification data).
+fn affineAdd(aInf: int, ax: ptr, ay: ptr, bInf: int, bx: ptr, by: ptr, rxOut: ptr, ryOut: ptr): int {
+    if (aInf == 1) {
+        if (bInf == 1) { return 1; }
+        feCopy(rxOut, bx); feCopy(ryOut, by);
+        return 0;
+    }
+    if (bInf == 1) { feCopy(rxOut, ax); feCopy(ryOut, ay); return 0; }
+    let axM = newFe(); toMont(axM, ax); let ayM = newFe(); toMont(ayM, ay);
+    let bxM = newFe(); toMont(bxM, bx); let byM = newFe(); toMont(byM, by);
+    let lam = newFe(); let t1 = newFe(); let t2 = newFe();
+    let inf = 0;
+    if (feEq(axM, bxM)) {
+        if (feEq(ayM, byM)) {
+            // Point doubling: lambda = (3x^2 - 3) / (2y), since the curve has a = -3.
+            feSq(t1, axM);
+            feAdd(t2, t1, t1); feAdd(t1, t2, t1);          // 3x^2
+            let three = newFe(); feZero(three); setw(three, 0, 3);
+            let threeM = newFe(); toMont(threeM, three);
+            feSub(t1, t1, threeM);                          // 3x^2 - 3
+            feAdd(t2, ayM, ayM);                            // 2y
+            let inv = newFe(); feInvert(inv, t2);
+            feMul(lam, t1, inv);
+            bytes.free(three); bytes.free(threeM); bytes.free(inv);
+        } else {
+            inf = 1;                                        // ay = -by => sum is infinity
+        }
+    } else {
+        feSub(t1, byM, ayM);                                // y2 - y1
+        feSub(t2, bxM, axM);                                // x2 - x1
+        let inv = newFe(); feInvert(inv, t2);
+        feMul(lam, t1, inv);
+        bytes.free(inv);
+    }
+    if (inf == 0) {
+        let rxM = newFe(); let ryM = newFe();
+        feSq(rxM, lam);
+        feSub(rxM, rxM, axM);
+        feSub(rxM, rxM, bxM);                               // rx = lambda^2 - ax - bx
+        feSub(t1, axM, rxM);
+        feMul(ryM, lam, t1);
+        feSub(ryM, ryM, ayM);                               // ry = lambda*(ax - rx) - ay
+        fromMont(rxOut, rxM);
+        fromMont(ryOut, ryM);
+        bytes.free(rxM); bytes.free(ryM);
+    }
+    bytes.free(axM); bytes.free(ayM); bytes.free(bxM); bytes.free(byM);
+    bytes.free(lam); bytes.free(t1); bytes.free(t2);
+    return inf;
+}
+
+// ECDSA-P256 signature verification. hash32 is the message digest (e.g. SHA-256, big-endian), pub65 is
+// the signer's uncompressed public point, and (r32, s32) is the signature. Returns true iff valid.
+pub fn ecdsaVerify(hash32: ptr, pub65: ptr, r32: ptr, s32: ptr): bool {
+    let r = newFe(); feFromBE(r, r32, 0);
+    let s = newFe(); feFromBE(s, s32, 0);
+    let q = newPt();
+    if (!inRangeN(r) || !inRangeN(s) || decodePointToJac(pub65, q) == 0) {
+        bytes.free(r); bytes.free(s); bytes.free(q);
+        return false;
+    }
+    let hb = newFe(); feFromBE(hb, hash32, 0);
+    let e = newFe(); reduceModN(e, hb);                     // e = hash mod n
+    let w = newFe(); invModN(w, s);                         // w = s^-1 mod n
+    let u1 = newFe(); modMulN(u1, e, w);                    // u1 = e*w mod n
+    let u2 = newFe(); modMulN(u2, r, w);                    // u2 = r*w mod n
+    let u1b = bytes.alloc(32); feToBE(u1b, 0, u1);
+    let u2b = bytes.alloc(32); feToBE(u2b, 0, u2);
+
+    let a = newPt(); baseG(a); scalarMultPoint(a, u1b, 32); // u1*G
+    scalarMultPoint(q, u2b, 32);                            // u2*Q
+
+    let ax = newFe(); let ay = newFe(); let aInf = jacToAffine(a, ax, ay);
+    let bx = newFe(); let by = newFe(); let bInf = jacToAffine(q, bx, by);
+    let rx = newFe(); let ry = newFe();
+    let rInf = affineAdd(aInf, ax, ay, bInf, bx, by, rx, ry);
+
+    let ok = false;
+    if (rInf == 0) {
+        let v = newFe(); reduceModN(v, rx);                 // v = R.x mod n
+        ok = feEq(v, r);
+        bytes.free(v);
+    }
+    bytes.free(r); bytes.free(s); bytes.free(q); bytes.free(hb); bytes.free(e);
+    bytes.free(w); bytes.free(u1); bytes.free(u2); bytes.free(u1b); bytes.free(u2b);
+    bytes.free(a); bytes.free(ax); bytes.free(ay); bytes.free(bx); bytes.free(by);
+    bytes.free(rx); bytes.free(ry);
+    return ok;
+}

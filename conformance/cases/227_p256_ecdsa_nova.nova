@@ -1,0 +1,59 @@
+// NIST P-256 ECDSA signature verification in Nova (M9 phase C, no external library). Verified against a
+// real signature produced by OpenSSL 3.6 (ECDSA-with-SHA256): the public point, message digest, and the
+// (r, s) signature are pinned here, along with negative checks that a tampered signature is rejected.
+import crypto.p256;
+import bytes;
+import assert;
+
+fn hexNib(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return 0;
+}
+fn hexBuf(hex: string): ptr {
+    let n = hex.length / 2;
+    let b = bytes.alloc(n);
+    let i = 0;
+    while (i < n) {
+        bytes.write_byte(b, i, hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1]));
+        i = i + 1;
+    }
+    return b;
+}
+
+const PUB: string  = "04ac8a971b8a1888892cd64e8053e926fd9b47b2a2bbe9e79508210e1b72ef1ca9e5d369e875415fce9c9fcc3ae465f9e7f06f8200821e28889cc1cedc206affee";
+const HASH: string = "1a6f05529113bd7d1f3178addd560ac16f1a9ff62656da4e0a17650e6613991b";
+const R: string    = "ac04df23969f5adf2646e0daf4ad46386479b20a1e0886462647deddeb6ccc85";
+const S: string    = "f7390d1921c67384940e2119160e9965d08bc3542a7de48d6e06c8fead229aba";
+
+// The genuine OpenSSL signature verifies.
+@test
+fn ecdsa_valid(): void {
+    assert.isTrue(p256.ecdsaVerify(hexBuf(HASH), hexBuf(PUB), hexBuf(R), hexBuf(S)));
+}
+
+// A one-bit change in the message digest must be rejected.
+@test
+fn ecdsa_bad_hash(): void {
+    let h = hexBuf(HASH);
+    bytes.write_byte(h, 0, (bytes.read_byte(h, 0) ^ 1) & 0xff);
+    assert.isTrue(!p256.ecdsaVerify(h, hexBuf(PUB), hexBuf(R), hexBuf(S)));
+}
+
+// A tampered s value must be rejected.
+@test
+fn ecdsa_bad_s(): void {
+    let s = hexBuf(S);
+    bytes.write_byte(s, 31, (bytes.read_byte(s, 31) ^ 2) & 0xff);
+    assert.isTrue(!p256.ecdsaVerify(hexBuf(HASH), hexBuf(PUB), hexBuf(R), s));
+}
+
+// A signature with s = 0 is out of range and must be rejected.
+@test
+fn ecdsa_reject_zero_s(): void {
+    let z = bytes.alloc(32);
+    let i = 0;
+    while (i < 32) { bytes.write_byte(z, i, 0); i = i + 1; }
+    assert.isTrue(!p256.ecdsaVerify(hexBuf(HASH), hexBuf(PUB), hexBuf(R), z));
+}
