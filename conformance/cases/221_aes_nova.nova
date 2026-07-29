@@ -1,0 +1,95 @@
+// Constant-time bitsliced AES (FIPS-197) implemented in Nova (M9 phase B, no external library).
+// Verified against the FIPS-197 known-answer vectors for AES-128 and AES-256.
+import crypto.aes;
+import bytes;
+import assert;
+
+fn hexNib(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return 0;
+}
+
+fn eqHex(buf: ptr, n: int, hex: string): bool {
+    if (hex.length != n * 2) { return false; }
+    let i = 0;
+    while (i < n) {
+        if (bytes.read_byte(buf, i) != hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1])) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn hexInto(dst: ptr, hex: string): int {
+    let n = hex.length / 2;
+    let i = 0;
+    while (i < n) {
+        bytes.write_byte(dst, i, hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1]));
+        i = i + 1;
+    }
+    return n;
+}
+
+// FIPS-197 Appendix C.1: AES-128.
+@test
+fn aes128_fips197_c1(): void {
+    let key = bytes.alloc(16);
+    hexInto(key, "000102030405060708090a0b0c0d0e0f");
+    let pt = bytes.alloc(16);
+    hexInto(pt, "00112233445566778899aabbccddeeff");
+    let ct = bytes.alloc(16);
+    let ctx = aes.Aes.create(key, 16);
+    ctx.encryptBlock(pt, ct);
+    ctx.delete();
+    assert.isTrue(eqHex(ct, 16, "69c4e0d86a7b0430d8cdb78070b4c55a"));
+}
+
+// FIPS-197 Appendix B: AES-128 with the worked-example key.
+@test
+fn aes128_fips197_b(): void {
+    let key = bytes.alloc(16);
+    hexInto(key, "2b7e151628aed2a6abf7158809cf4f3c");
+    let pt = bytes.alloc(16);
+    hexInto(pt, "3243f6a8885a308d313198a2e0370734");
+    let ct = bytes.alloc(16);
+    let ctx = aes.Aes.create(key, 16);
+    ctx.encryptBlock(pt, ct);
+    ctx.delete();
+    assert.isTrue(eqHex(ct, 16, "3925841d02dc09fbdc118597196a0b32"));
+}
+
+// FIPS-197 Appendix C.3: AES-256.
+@test
+fn aes256_fips197_c3(): void {
+    let key = bytes.alloc(32);
+    hexInto(key, "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+    let pt = bytes.alloc(16);
+    hexInto(pt, "00112233445566778899aabbccddeeff");
+    let ct = bytes.alloc(16);
+    let ctx = aes.Aes.create(key, 32);
+    ctx.encryptBlock(pt, ct);
+    ctx.delete();
+    assert.isTrue(eqHex(ct, 16, "8ea2b7ca516745bfeafc49904b496089"));
+}
+
+// A second block with the same context (round keys reused correctly).
+@test
+fn aes128_reuse_context(): void {
+    let key = bytes.alloc(16);
+    hexInto(key, "000102030405060708090a0b0c0d0e0f");
+    let ctx = aes.Aes.create(key, 16);
+    let pt = bytes.alloc(16);
+    let ct = bytes.alloc(16);
+    hexInto(pt, "00112233445566778899aabbccddeeff");
+    ctx.encryptBlock(pt, ct);
+    assert.isTrue(eqHex(ct, 16, "69c4e0d86a7b0430d8cdb78070b4c55a"));
+    // encrypt an all-zero block too
+    let z = bytes.alloc(16);
+    let cz = bytes.alloc(16);
+    ctx.encryptBlock(z, cz);
+    assert.isTrue(eqHex(cz, 16, "c6a13b37878f5b826f4f8162a1c8d879"));
+    ctx.delete();
+}

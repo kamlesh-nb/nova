@@ -1,0 +1,259 @@
+// AES-128 and AES-256 block cipher (FIPS-197), constant-time, implemented in Nova with no external
+// library (M9 phase B). This is a faithful port of BearSSL's aes_ct: the state is bitsliced across 8
+// 32-bit words (each a bit-plane over two blocks) and the S-box is computed with the Boyar-Peralta
+// boolean circuit, so there are NO table lookups and NO data-dependent branches. That is what makes it
+// constant-time and side-channel resistant, unlike a table-based AES. Only encryption is implemented
+// (AES-GCM and CTR need only the forward direction). Words are `ulong` masked to 32 bits.
+//
+// Reference: BearSSL src/symcipher/aes_ct.c and aes_ct_enc.c (Thomas Pornin, public domain). Verified
+// against the FIPS-197 known-answer vectors (conformance case 221).
+import bytes;
+import mem.allocator;
+
+const M32: ulong = 0xffffffff;
+
+pub const AES_BLOCK_LEN: int = 16;
+
+// Round constants for the key schedule.
+const RCON: int[10] = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36];
+
+fn le32(buf: ptr, off: int): ulong {
+    return (bytes.read_byte(buf, off) as ulong)
+        | ((bytes.read_byte(buf, off + 1) as ulong) << 8)
+        | ((bytes.read_byte(buf, off + 2) as ulong) << 16)
+        | ((bytes.read_byte(buf, off + 3) as ulong) << 24);
+}
+
+fn putLe32(buf: ptr, off: int, w: ulong): void {
+    bytes.write_byte(buf, off, (w & 0xff) as int);
+    bytes.write_byte(buf, off + 1, ((w >> 8) & 0xff) as int);
+    bytes.write_byte(buf, off + 2, ((w >> 16) & 0xff) as int);
+    bytes.write_byte(buf, off + 3, ((w >> 24) & 0xff) as int);
+}
+
+// q is a buffer of 8 words (32 bytes). Accessors keep everything little-endian and masked to 32 bits.
+fn getq(q: ptr, i: int): ulong { return le32(q, i * 4); }
+fn setq(q: ptr, i: int, v: ulong): void { putLe32(q, i * 4, v & M32); }
+
+// The bitsliced AES S-box (Boyar and Peralta's circuit) applied to the 8 bit-planes in q.
+fn subBytes(q: ptr): void {
+    let x0 = getq(q, 7); let x1 = getq(q, 6); let x2 = getq(q, 5); let x3 = getq(q, 4);
+    let x4 = getq(q, 3); let x5 = getq(q, 2); let x6 = getq(q, 1); let x7 = getq(q, 0);
+
+    let y14 = x3 ^ x5; let y13 = x0 ^ x6; let y9 = x0 ^ x3; let y8 = x0 ^ x5;
+    let t0 = x1 ^ x2; let y1 = t0 ^ x7; let y4 = y1 ^ x3; let y12 = y13 ^ y14;
+    let y2 = y1 ^ x0; let y5 = y1 ^ x6; let y3 = y5 ^ y8; let t1 = x4 ^ y12;
+    let y15 = t1 ^ x5; let y20 = t1 ^ x1; let y6 = y15 ^ x7; let y10 = y15 ^ t0;
+    let y11 = y20 ^ y9; let y7 = x7 ^ y11; let y17 = y10 ^ y11; let y19 = y10 ^ y8;
+    let y16 = t0 ^ y11; let y21 = y13 ^ y16; let y18 = x0 ^ y16;
+
+    let t2 = y12 & y15; let t3 = y3 & y6; let t4 = t3 ^ t2; let t5 = y4 & x7;
+    let t6 = t5 ^ t2; let t7 = y13 & y16; let t8 = y5 & y1; let t9 = t8 ^ t7;
+    let t10 = y2 & y7; let t11 = t10 ^ t7; let t12 = y9 & y11; let t13 = y14 & y17;
+    let t14 = t13 ^ t12; let t15 = y8 & y10; let t16 = t15 ^ t12; let t17 = t4 ^ t14;
+    let t18 = t6 ^ t16; let t19 = t9 ^ t14; let t20 = t11 ^ t16; let t21 = t17 ^ y20;
+    let t22 = t18 ^ y19; let t23 = t19 ^ y21; let t24 = t20 ^ y18;
+    let t25 = t21 ^ t22; let t26 = t21 & t23; let t27 = t24 ^ t26; let t28 = t25 & t27;
+    let t29 = t28 ^ t22; let t30 = t23 ^ t24; let t31 = t22 ^ t26; let t32 = t31 & t30;
+    let t33 = t32 ^ t24; let t34 = t23 ^ t33; let t35 = t27 ^ t33; let t36 = t24 & t35;
+    let t37 = t36 ^ t34; let t38 = t27 ^ t36; let t39 = t29 & t38; let t40 = t25 ^ t39;
+    let t41 = t40 ^ t37; let t42 = t29 ^ t33; let t43 = t29 ^ t40; let t44 = t33 ^ t37;
+    let t45 = t42 ^ t41; let z0 = t44 & y15; let z1 = t37 & y6; let z2 = t33 & x7;
+    let z3 = t43 & y16; let z4 = t40 & y1; let z5 = t29 & y7; let z6 = t42 & y11;
+    let z7 = t45 & y17; let z8 = t41 & y10; let z9 = t44 & y12; let z10 = t37 & y3;
+    let z11 = t33 & y4; let z12 = t43 & y13; let z13 = t40 & y5; let z14 = t29 & y2;
+    let z15 = t42 & y9; let z16 = t45 & y14; let z17 = t41 & y8;
+
+    let t46 = z15 ^ z16; let t47 = z10 ^ z11; let t48 = z5 ^ z13; let t49 = z9 ^ z10;
+    let t50 = z2 ^ z12; let t51 = z2 ^ z5; let t52 = z7 ^ z8; let t53 = z0 ^ z3;
+    let t54 = z6 ^ z7; let t55 = z16 ^ z17; let t56 = z12 ^ t48; let t57 = t50 ^ t53;
+    let t58 = z4 ^ t46; let t59 = z3 ^ t54; let t60 = t46 ^ t57; let t61 = z14 ^ t57;
+    let t62 = t52 ^ t58; let t63 = t49 ^ t58; let t64 = z4 ^ t59; let t65 = t61 ^ t62;
+    let t66 = z1 ^ t63; let t67 = t64 ^ t65;
+
+    let s0 = t59 ^ t63;
+    let s6 = t56 ^ (t62 ^ M32);
+    let s7 = t48 ^ (t60 ^ M32);
+    let s3 = t53 ^ t66;
+    let s4 = t51 ^ t66;
+    let s5 = t47 ^ t65;
+    let s1 = t64 ^ (s3 ^ M32);
+    let s2 = t55 ^ (t67 ^ M32);
+
+    setq(q, 7, s0); setq(q, 6, s1); setq(q, 5, s2); setq(q, 4, s3);
+    setq(q, 3, s4); setq(q, 2, s5); setq(q, 1, s6); setq(q, 0, s7);
+}
+
+// Transpose between the natural (per-block words) and the bit-sliced layout. Self-composed here.
+fn orthoSwap(q: ptr, ia: int, ib: int, cl: ulong, ch: ulong, s: int): void {
+    let a = getq(q, ia);
+    let b = getq(q, ib);
+    setq(q, ia, (a & cl) | ((b & cl) << s));
+    setq(q, ib, ((a & ch) >> s) | (b & ch));
+}
+
+fn ortho(q: ptr): void {
+    orthoSwap(q, 0, 1, 0x55555555, 0xaaaaaaaa, 1);
+    orthoSwap(q, 2, 3, 0x55555555, 0xaaaaaaaa, 1);
+    orthoSwap(q, 4, 5, 0x55555555, 0xaaaaaaaa, 1);
+    orthoSwap(q, 6, 7, 0x55555555, 0xaaaaaaaa, 1);
+    orthoSwap(q, 0, 2, 0x33333333, 0xcccccccc, 2);
+    orthoSwap(q, 1, 3, 0x33333333, 0xcccccccc, 2);
+    orthoSwap(q, 4, 6, 0x33333333, 0xcccccccc, 2);
+    orthoSwap(q, 5, 7, 0x33333333, 0xcccccccc, 2);
+    orthoSwap(q, 0, 4, 0x0f0f0f0f, 0xf0f0f0f0, 4);
+    orthoSwap(q, 1, 5, 0x0f0f0f0f, 0xf0f0f0f0, 4);
+    orthoSwap(q, 2, 6, 0x0f0f0f0f, 0xf0f0f0f0, 4);
+    orthoSwap(q, 3, 7, 0x0f0f0f0f, 0xf0f0f0f0, 4);
+}
+
+// SubWord for the key schedule: run one word through the bitsliced S-box.
+fn subWord(x: ulong): ulong {
+    let q = bytes.alloc(32);
+    let i = 0;
+    while (i < 8) { setq(q, i, 0); i = i + 1; }
+    setq(q, 0, x);
+    ortho(q);
+    subBytes(q);
+    ortho(q);
+    let r = getq(q, 0);
+    bytes.free(q);
+    return r;
+}
+
+fn shiftRows(q: ptr): void {
+    let i = 0;
+    while (i < 8) {
+        let x = getq(q, i);
+        setq(q, i, (x & 0x000000ff)
+            | ((x & 0x0000fc00) >> 2) | ((x & 0x00000300) << 6)
+            | ((x & 0x00f00000) >> 4) | ((x & 0x000f0000) << 4)
+            | ((x & 0xc0000000) >> 6) | ((x & 0x3f000000) << 2));
+        i = i + 1;
+    }
+}
+
+fn rotr16(x: ulong): ulong { return ((x << 16) | (x >> 16)) & M32; }
+fn rotr8(x: ulong): ulong { return ((x >> 8) | (x << 24)) & M32; }
+
+fn mixColumns(q: ptr): void {
+    let q0 = getq(q, 0); let q1 = getq(q, 1); let q2 = getq(q, 2); let q3 = getq(q, 3);
+    let q4 = getq(q, 4); let q5 = getq(q, 5); let q6 = getq(q, 6); let q7 = getq(q, 7);
+    let r0 = rotr8(q0); let r1 = rotr8(q1); let r2 = rotr8(q2); let r3 = rotr8(q3);
+    let r4 = rotr8(q4); let r5 = rotr8(q5); let r6 = rotr8(q6); let r7 = rotr8(q7);
+    setq(q, 0, q7 ^ r7 ^ r0 ^ rotr16(q0 ^ r0));
+    setq(q, 1, q0 ^ r0 ^ q7 ^ r7 ^ r1 ^ rotr16(q1 ^ r1));
+    setq(q, 2, q1 ^ r1 ^ r2 ^ rotr16(q2 ^ r2));
+    setq(q, 3, q2 ^ r2 ^ q7 ^ r7 ^ r3 ^ rotr16(q3 ^ r3));
+    setq(q, 4, q3 ^ r3 ^ q7 ^ r7 ^ r4 ^ rotr16(q4 ^ r4));
+    setq(q, 5, q4 ^ r4 ^ r5 ^ rotr16(q5 ^ r5));
+    setq(q, 6, q5 ^ r5 ^ r6 ^ rotr16(q6 ^ r6));
+    setq(q, 7, q6 ^ r6 ^ r7 ^ rotr16(q7 ^ r7));
+}
+
+fn addRoundKey(q: ptr, sk: ptr, skOff: int): void {
+    let i = 0;
+    while (i < 8) {
+        setq(q, i, getq(q, i) ^ le32(sk, (skOff + i) * 4));
+        i = i + 1;
+    }
+}
+
+// An AES context: the expanded, bitsliced round keys and the number of rounds.
+pub struct Aes {
+    pub skey: ptr,      // (numRounds + 1) * 8 words, each 4 bytes
+    pub numRounds: int,
+
+    // Expand a 16-byte (AES-128) or 32-byte (AES-256) key.
+    pub fn create(key: ptr, keyLen: int): Aes {
+        let ctx = bytes.new_with_allocator<Aes>(allocator.globalAllocator());
+        let nr = if (keyLen == 32) 14 else if (keyLen == 24) 12 else 10;
+        ctx.numRounds = nr;
+        let nk = keyLen / 4;
+        let nkf = (nr + 1) * 4;
+
+        // Classic key expansion into skRaw (nkf words).
+        let skRaw = bytes.alloc(nkf * 4);
+        let i = 0;
+        while (i < nk) { putLe32(skRaw, i * 4, le32(key, i * 4)); i = i + 1; }
+        let tmp = le32(skRaw, (nk - 1) * 4);
+        let j = 0;
+        let k = 0;
+        i = nk;
+        while (i < nkf) {
+            if (j == 0) {
+                tmp = ((tmp << 24) | (tmp >> 8)) & M32;
+                tmp = subWord(tmp) ^ (RCON[k] as ulong);
+            } else if (nk > 6 && j == 4) {
+                tmp = subWord(tmp);
+            }
+            tmp = tmp ^ le32(skRaw, (i - nk) * 4);
+            putLe32(skRaw, i * 4, tmp);
+            j = j + 1;
+            if (j == nk) { j = 0; k = k + 1; }
+            i = i + 1;
+        }
+
+        // Bitslice the round keys: each round is 4 words -> a q of 8 words -> stored expanded.
+        ctx.skey = bytes.alloc((nr + 1) * 8 * 4);
+        let q = bytes.alloc(32);
+        let round = 0;
+        while (round <= nr) {
+            // Block words go into the even q slots (the odd slots are the second parallel block).
+            setq(q, 0, le32(skRaw, (round * 4 + 0) * 4));
+            setq(q, 2, le32(skRaw, (round * 4 + 1) * 4));
+            setq(q, 4, le32(skRaw, (round * 4 + 2) * 4));
+            setq(q, 6, le32(skRaw, (round * 4 + 3) * 4));
+            setq(q, 1, 0); setq(q, 3, 0); setq(q, 5, 0); setq(q, 7, 0);
+            ortho(q);
+            let w = 0;
+            while (w < 8) {
+                putLe32(ctx.skey, (round * 8 + w) * 4, getq(q, w));
+                w = w + 1;
+            }
+            round = round + 1;
+        }
+        bytes.free(skRaw);
+        bytes.free(q);
+        return ctx;
+    }
+
+    // Encrypt one 16-byte block from `in` to out (in and out may alias).
+    pub fn encryptBlock(self: Aes, dataIn: ptr, out: ptr): void {
+        let q = bytes.alloc(32);
+        // Block words go into the even q slots; the odd slots would hold a second parallel block.
+        setq(q, 0, le32(dataIn, 0));
+        setq(q, 2, le32(dataIn, 4));
+        setq(q, 4, le32(dataIn, 8));
+        setq(q, 6, le32(dataIn, 12));
+        setq(q, 1, 0); setq(q, 3, 0); setq(q, 5, 0); setq(q, 7, 0);
+        ortho(q);
+
+        addRoundKey(q, self.skey, 0);
+        let r = 1;
+        while (r < self.numRounds) {
+            subBytes(q);
+            shiftRows(q);
+            mixColumns(q);
+            addRoundKey(q, self.skey, r * 8);
+            r = r + 1;
+        }
+        subBytes(q);
+        shiftRows(q);
+        addRoundKey(q, self.skey, self.numRounds * 8);
+
+        ortho(q);
+        putLe32(out, 0, getq(q, 0));
+        putLe32(out, 4, getq(q, 2));
+        putLe32(out, 8, getq(q, 4));
+        putLe32(out, 12, getq(q, 6));
+        bytes.free(q);
+    }
+
+    pub fn delete(self: Aes): void {
+        if (self.skey != 0) {
+            bytes.free(self.skey);
+            self.skey = 0;
+        }
+    }
+}
