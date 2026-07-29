@@ -8,6 +8,7 @@
 import bytes;
 import net.reactorio;
 import crypto.tls13client;
+import crypto.tls13server;
 import crypto.random;
 
 fn at(b: ptr, off: int): ptr { return (b as long + off) as ptr; }
@@ -115,6 +116,64 @@ pub async fn handshake(io: TlsIO, cl: tls13client.TlsClient, ephPub: ptr, host: 
     let finLen = cl.clientFinishedRecord(vd, fin);
     if (await io.sendAll(fin, finLen) < 0) { return -1; }
     return 0;
+}
+
+// Run the TLS 1.3 server handshake over the reactor socket: read the ClientHello, send the ServerHello, a
+// dummy ChangeCipherSpec, and the encrypted flight (certificate + signed CertificateVerify + Finished),
+// then verify the client Finished. `srv` is a fresh TlsServer carrying the certificate and signing key.
+// serverRandom is 32 bytes. Returns 0 on a verified handshake, -1 otherwise.
+pub async fn serveHandshake(io: TlsIO, srv: tls13server.TlsServer, serverRandom: ptr): int {
+    let buf = bytes.alloc(33792);
+    let n = await io.readRecord(buf);
+    if (n < 0 || bytes.read_byte(buf, 0) != 0x16) { return -1; }
+    srv.processClientHello(at(buf, 5), n - 5);
+
+    let sh = bytes.alloc(1024);
+    let shLen = srv.buildServerHello(serverRandom, sh);
+    let rec = bytes.alloc(shLen + 5);
+    bytes.write_byte(rec, 0, 0x16); bytes.write_byte(rec, 1, 0x03); bytes.write_byte(rec, 2, 0x03);
+    bytes.write_byte(rec, 3, (shLen >> 8) & 0xff); bytes.write_byte(rec, 4, shLen & 0xff);
+    let i = 0;
+    while (i < shLen) { bytes.write_byte(rec, 5 + i, bytes.read_byte(sh, i)); i = i + 1; }
+    if (await io.sendAll(rec, shLen + 5) < 0) { return -1; }
+
+    let ccs = bytes.alloc(6);
+    bytes.write_byte(ccs, 0, 0x14); bytes.write_byte(ccs, 1, 0x03); bytes.write_byte(ccs, 2, 0x03);
+    bytes.write_byte(ccs, 3, 0x00); bytes.write_byte(ccs, 4, 0x01); bytes.write_byte(ccs, 5, 0x01);
+    if (await io.sendAll(ccs, 6) < 0) { return -1; }
+
+    let flight = bytes.alloc(8192);
+    let fLen = srv.buildFlight(flight);
+    if (await io.sendAll(flight, fLen) < 0) { return -1; }
+
+    // Client Finished (skip a client ChangeCipherSpec).
+    let m = await io.readRecord(buf);
+    while (m > 0 && bytes.read_byte(buf, 0) == 0x14) { m = await io.readRecord(buf); }
+    if (m < 0 || !srv.processClientFinished(buf, m)) { return -1; }
+    return 0;
+}
+
+// Send application data (server) over the established connection.
+pub async fn serverWrite(io: TlsIO, srv: tls13server.TlsServer, data: ptr, n: int): int {
+    let out = bytes.alloc(n + 64);
+    let m = srv.encryptApp(data, n, out);
+    let r = await io.sendAll(out, m);
+    bytes.free(out);
+    return r;
+}
+
+// Read the next application-data payload (server side). Returns the plaintext length (excluding the inner
+// content-type byte), or -1.
+pub async fn serverRead(io: TlsIO, srv: tls13server.TlsServer, out: ptr): int {
+    let rec = bytes.alloc(33792);
+    while (true) {
+        let m = await io.readRecord(rec);
+        if (m < 0) { bytes.free(rec); return -1; }
+        let inner = srv.decryptApp(rec, m, out);
+        if (inner > 0 && bytes.read_byte(out, inner - 1) == 0x17) { bytes.free(rec); return inner - 1; }
+    }
+    bytes.free(rec);
+    return -1;
 }
 
 // Send application data over the established connection.
