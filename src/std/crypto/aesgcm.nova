@@ -1,0 +1,164 @@
+// AES-GCM AEAD (NIST SP 800-38D) implemented in Nova over the constant-time bitsliced AES and the
+// constant-time GHASH, no external library (M9 phase B). This is the TLS AES_128_GCM_SHA256 and
+// AES_256_GCM_SHA384 record protection. The block cipher and GHASH are constant-time; the only
+// data-dependent branch here is the tag comparison on open, which is done as a constant-time compare.
+//
+// Reference: NIST SP 800-38D, wolfSSL AES-GCM (deps/wolfssl). Verified against the published GCM test
+// vectors and cross-checked against the wolfCrypt binding (conformance case 223).
+import bytes;
+import crypto.aes;
+import crypto.ghash;
+
+pub const GCM_TAG_LEN: int = 16;
+
+// Increment the low 32 bits (bytes 12..15, big-endian) of a counter block, modulo 2^32.
+fn inc32(ctr: ptr): void {
+    let i = 15;
+    let carry = 1;
+    while (i >= 12) {
+        let v = bytes.read_byte(ctr, i) + carry;
+        bytes.write_byte(ctr, i, v & 0xff);
+        carry = v >> 8;
+        i = i - 1;
+    }
+}
+
+// Write a 64-bit big-endian value to buf+off.
+fn putLen64(buf: ptr, off: int, bits: long): void {
+    let i = 0;
+    while (i < 8) {
+        bytes.write_byte(buf, off + i, ((bits >> ((7 - i) * 8)) & 0xff) as int);
+        i = i + 1;
+    }
+}
+
+// GCTR: XOR the AES-CTR keystream (starting at counter block icb) over len bytes.
+fn gctr(ctx: aes.Aes, icb: ptr, dataIn: ptr, len: int, out: ptr): void {
+    let ctr = bytes.alloc(16);
+    let i = 0;
+    while (i < 16) { bytes.write_byte(ctr, i, bytes.read_byte(icb, i)); i = i + 1; }
+    let ks = bytes.alloc(16);
+    let done = 0;
+    while (done < len) {
+        ctx.encryptBlock(ctr, ks);
+        let n = if (len - done < 16) (len - done) else 16;
+        let k = 0;
+        while (k < n) {
+            bytes.write_byte(out, done + k, bytes.read_byte(dataIn, done + k) ^ bytes.read_byte(ks, k));
+            k = k + 1;
+        }
+        inc32(ctr);
+        done = done + n;
+    }
+    bytes.free(ctr);
+    bytes.free(ks);
+}
+
+// Compute the hash subkey H = AES_K(0) and the pre-counter block J0 from the IV.
+fn computeH(ctx: aes.Aes, h: ptr): void {
+    let zero = bytes.alloc(16);
+    let i = 0;
+    while (i < 16) { bytes.write_byte(zero, i, 0); i = i + 1; }
+    ctx.encryptBlock(zero, h);
+    bytes.free(zero);
+}
+
+fn computeJ0(h: ptr, iv: ptr, ivLen: int, j0: ptr): void {
+    if (ivLen == 12) {
+        let i = 0;
+        while (i < 12) { bytes.write_byte(j0, i, bytes.read_byte(iv, i)); i = i + 1; }
+        bytes.write_byte(j0, 12, 0);
+        bytes.write_byte(j0, 13, 0);
+        bytes.write_byte(j0, 14, 0);
+        bytes.write_byte(j0, 15, 1);
+    } else {
+        // J0 = GHASH_H(IV || pad || 0^64 || len64(ivbits)).
+        let g = ghash.Ghash.create(h);
+        g.update(iv, ivLen);
+        let lb = bytes.alloc(16);
+        let k = 0;
+        while (k < 8) { bytes.write_byte(lb, k, 0); k = k + 1; }
+        putLen64(lb, 8, (ivLen as long) * 8);
+        g.block(lb, 0);
+        g.final(j0);
+        g.delete();
+        bytes.free(lb);
+    }
+}
+
+// GHASH over aad || pad || ct || pad || len64(aadbits) || len64(ctbits), into s.
+fn computeS(h: ptr, aad: ptr, aadLen: int, ct: ptr, ctLen: int, s: ptr): void {
+    let g = ghash.Ghash.create(h);
+    g.update(aad, aadLen);
+    g.update(ct, ctLen);
+    let lens = bytes.alloc(16);
+    putLen64(lens, 0, (aadLen as long) * 8);
+    putLen64(lens, 8, (ctLen as long) * 8);
+    g.block(lens, 0);
+    g.final(s);
+    g.delete();
+    bytes.free(lens);
+}
+
+// Seal: encrypt ptLen bytes at pt to ctOut and write the 16-byte tag to tagOut. keyLen is 16 or 32.
+pub fn seal(key: ptr, keyLen: int, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
+            pt: ptr, ptLen: int, ctOut: ptr, tagOut: ptr): void {
+    let ctx = aes.Aes.create(key, keyLen);
+    let h = bytes.alloc(16);
+    computeH(ctx, h);
+    let j0 = bytes.alloc(16);
+    computeJ0(h, iv, ivLen, j0);
+
+    let icb = bytes.alloc(16);
+    let i = 0;
+    while (i < 16) { bytes.write_byte(icb, i, bytes.read_byte(j0, i)); i = i + 1; }
+    inc32(icb);
+    gctr(ctx, icb, pt, ptLen, ctOut);
+
+    let s = bytes.alloc(16);
+    computeS(h, aad, aadLen, ctOut, ptLen, s);
+    let ej0 = bytes.alloc(16);
+    ctx.encryptBlock(j0, ej0);
+    i = 0;
+    while (i < 16) { bytes.write_byte(tagOut, i, bytes.read_byte(s, i) ^ bytes.read_byte(ej0, i)); i = i + 1; }
+
+    ctx.delete();
+    bytes.free(h); bytes.free(j0); bytes.free(icb); bytes.free(s); bytes.free(ej0);
+}
+
+// Open: verify the tag, and on success decrypt ct to ptOut and return true. A false return means the
+// tag did not verify; ptOut must not be used.
+pub fn open(key: ptr, keyLen: int, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
+            ct: ptr, ctLen: int, tag: ptr, ptOut: ptr): bool {
+    let ctx = aes.Aes.create(key, keyLen);
+    let h = bytes.alloc(16);
+    computeH(ctx, h);
+    let j0 = bytes.alloc(16);
+    computeJ0(h, iv, ivLen, j0);
+
+    let s = bytes.alloc(16);
+    computeS(h, aad, aadLen, ct, ctLen, s);
+    let ej0 = bytes.alloc(16);
+    ctx.encryptBlock(j0, ej0);
+
+    // Constant-time tag compare.
+    let diff = 0;
+    let i = 0;
+    while (i < 16) {
+        diff = diff | ((bytes.read_byte(s, i) ^ bytes.read_byte(ej0, i)) ^ bytes.read_byte(tag, i));
+        i = i + 1;
+    }
+    let ok = diff == 0;
+    if (ok) {
+        let icb = bytes.alloc(16);
+        i = 0;
+        while (i < 16) { bytes.write_byte(icb, i, bytes.read_byte(j0, i)); i = i + 1; }
+        inc32(icb);
+        gctr(ctx, icb, ct, ctLen, ptOut);
+        bytes.free(icb);
+    }
+
+    ctx.delete();
+    bytes.free(h); bytes.free(j0); bytes.free(s); bytes.free(ej0);
+    return ok;
+}

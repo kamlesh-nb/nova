@@ -1,0 +1,114 @@
+// AES-GCM AEAD implemented in Nova (M9 phase B, no external library). Verified against the published
+// GCM test vectors (McGrew and Viega, Test Cases 3 and 4), a seal/open round trip, tamper detection,
+// and a byte-for-byte differential check against the wolfCrypt binding for AES-256.
+import crypto.aesgcm;
+import crypto.aead;
+import bytes;
+import assert;
+
+fn hexNib(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return 0;
+}
+
+fn eqHex(buf: ptr, n: int, hex: string): bool {
+    if (hex.length != n * 2) { return false; }
+    let i = 0;
+    while (i < n) {
+        if (bytes.read_byte(buf, i) != hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1])) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn hexInto(dst: ptr, hex: string): int {
+    let n = hex.length / 2;
+    let i = 0;
+    while (i < n) {
+        bytes.write_byte(dst, i, hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1]));
+        i = i + 1;
+    }
+    return n;
+}
+
+// GCM Test Case 3: AES-128, 64-byte plaintext, no AAD.
+@test
+fn gcm_testcase3(): void {
+    let key = bytes.alloc(16);
+    hexInto(key, "feffe9928665731c6d6a8f9467308308");
+    let iv = bytes.alloc(12);
+    hexInto(iv, "cafebabefacedbaddecaf888");
+    let pt = bytes.alloc(64);
+    hexInto(pt, "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255");
+    let ct = bytes.alloc(64);
+    let tag = bytes.alloc(16);
+    let dummy = bytes.alloc(1);
+
+    aesgcm.seal(key, 16, iv, 12, dummy, 0, pt, 64, ct, tag);
+    assert.isTrue(eqHex(ct, 64, "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091473f5985"));
+    assert.isTrue(eqHex(tag, 16, "4d5c2af327cd64a62cf35abd2ba6fab4"));
+
+    let rt = bytes.alloc(64);
+    assert.isTrue(aesgcm.open(key, 16, iv, 12, dummy, 0, ct, 64, tag, rt));
+    let i = 0;
+    while (i < 64) { assert.equalInt(bytes.read_byte(rt, i), bytes.read_byte(pt, i)); i = i + 1; }
+}
+
+// GCM Test Case 4: AES-128, 60-byte plaintext, 20-byte AAD.
+@test
+fn gcm_testcase4(): void {
+    let key = bytes.alloc(16);
+    hexInto(key, "feffe9928665731c6d6a8f9467308308");
+    let iv = bytes.alloc(12);
+    hexInto(iv, "cafebabefacedbaddecaf888");
+    let aad = bytes.alloc(20);
+    let aadLen = hexInto(aad, "feedfacedeadbeeffeedfacedeadbeefabaddad2");
+    let pt = bytes.alloc(60);
+    hexInto(pt, "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39");
+    let ct = bytes.alloc(60);
+    let tag = bytes.alloc(16);
+
+    aesgcm.seal(key, 16, iv, 12, aad, aadLen, pt, 60, ct, tag);
+    assert.isTrue(eqHex(ct, 60, "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091"));
+    assert.isTrue(eqHex(tag, 16, "5bc94fbc3221a5db94fae95ae7121a47"));
+
+    // Tamper the tag: open must fail.
+    let rt = bytes.alloc(60);
+    bytes.write_byte(tag, 0, bytes.read_byte(tag, 0) ^ 1);
+    assert.isFalse(aesgcm.open(key, 16, iv, 12, aad, aadLen, ct, 60, tag, rt));
+}
+
+// Differential vs the wolfCrypt binding for AES-256 with AAD (the wolfCrypt path is a temporary
+// oracle that this Nova AES-GCM replaces).
+@test
+fn gcm_aes256_matches_wolfcrypt(): void {
+    let key = bytes.alloc(32);
+    let iv = bytes.alloc(12);
+    let aad = bytes.alloc(13);
+    let pt = bytes.alloc(40);
+    let i = 0;
+    while (i < 32) { bytes.write_byte(key, i, i * 5 + 1); i = i + 1; }
+    i = 0;
+    while (i < 12) { bytes.write_byte(iv, i, i + 7); i = i + 1; }
+    i = 0;
+    while (i < 13) { bytes.write_byte(aad, i, i * 3); i = i + 1; }
+    i = 0;
+    while (i < 40) { bytes.write_byte(pt, i, i * 2 + 9); i = i + 1; }
+
+    let ctNova = bytes.alloc(40);
+    let tagNova = bytes.alloc(16);
+    aesgcm.seal(key, 32, iv, 12, aad, 13, pt, 40, ctNova, tagNova);
+
+    let ctWolf = bytes.alloc(40);
+    let tagWolf = bytes.alloc(16);
+    assert.isTrue(aead.aesgcmSeal(key, aead.AES256_KEY_LEN, iv, aad, 13, pt, 40, ctWolf, tagWolf));
+
+    i = 0;
+    while (i < 40) { assert.equalInt(bytes.read_byte(ctNova, i), bytes.read_byte(ctWolf, i)); i = i + 1; }
+    i = 0;
+    while (i < 16) { assert.equalInt(bytes.read_byte(tagNova, i), bytes.read_byte(tagWolf, i)); i = i + 1; }
+}
