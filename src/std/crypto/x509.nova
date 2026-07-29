@@ -94,13 +94,18 @@ struct Cert {
     pub ecStart: int, pub ecLen: int,          // EC point 0x04||X||Y
     pub subjectStart: int, pub subjectLen: int,
     pub issuerStart: int, pub issuerLen: int,
+    pub nbStart: int, pub nbLen: int, pub nbTag: int,   // notBefore Time (0x17 UTCTIME / 0x18 GeneralizedTime)
+    pub naStart: int, pub naLen: int, pub naTag: int,   // notAfter Time
+    pub isCa: bool,                                     // BasicConstraints cA
+    pub sanStart: int, pub sanLen: int,                // SubjectAltName GeneralNames content
 }
 
 pub fn parseCert(buf: ptr, len: int): Cert {
     let bad = Cert { buf: buf, ok: false,
         tbsStart: 0, tbsLen: 0, sigAlg: SIG_UNKNOWN, sigStart: 0, sigLen: 0,
         keyType: KEY_UNKNOWN, rsaNStart: 0, rsaNLen: 0, rsaEStart: 0, rsaELen: 0,
-        ecStart: 0, ecLen: 0, subjectStart: 0, subjectLen: 0, issuerStart: 0, issuerLen: 0 };
+        ecStart: 0, ecLen: 0, subjectStart: 0, subjectLen: 0, issuerStart: 0, issuerLen: 0,
+        nbStart: 0, nbLen: 0, nbTag: 0, naStart: 0, naLen: 0, naTag: 0, isCa: false, sanStart: 0, sanLen: 0 };
 
     let cert = readTlv(buf, 0);
     if (cert.tag != 0x30) { return bad; }
@@ -117,7 +122,10 @@ pub fn parseCert(buf: ptr, len: int): Cert {
     let innerSig = readTlv(buf, q); q = innerSig.next;   // signature AlgorithmIdentifier (ignored)
     let issuer = readTlv(buf, q);
     let issuerStart = q; let issuerLen = issuer.next - q; q = issuer.next;
-    let validity = readTlv(buf, q); q = validity.next;
+    let validity = readTlv(buf, q);
+    let nb = readTlv(buf, validity.start);              // notBefore Time
+    let na = readTlv(buf, nb.next);                     // notAfter Time
+    q = validity.next;
     let subject = readTlv(buf, q);
     let subjectStart = q; let subjectLen = subject.next - q; q = subject.next;
     let spki = readTlv(buf, q);
@@ -145,6 +153,38 @@ pub fn parseCert(buf: ptr, len: int): Cert {
         rsaEStart = expInt.start; rsaELen = expInt.len;
     }
 
+    // Extensions ([3] EXPLICIT), if present after the SPKI: capture BasicConstraints cA and SAN.
+    let isCa = false;
+    let sanStart = 0; let sanLen = 0;
+    q = spki.next;
+    if (q < tbs.next) {
+        let ex = readTlv(buf, q);
+        if (ex.tag == 0xa3) {
+            let extSeq = readTlv(buf, ex.start);       // SEQUENCE OF Extension
+            let ep = extSeq.start;
+            let extEnd = extSeq.start + extSeq.len;
+            while (ep < extEnd) {
+                let one = readTlv(buf, ep);            // Extension SEQUENCE
+                let oid = readTlv(buf, one.start);
+                let vpos = oid.next;
+                let maybe = readTlv(buf, vpos);
+                if (maybe.tag == 0x01) { vpos = maybe.next; }   // skip optional critical BOOLEAN
+                let val = readTlv(buf, vpos);          // OCTET STRING wrapping the extension value
+                if (oidEq(buf, oid.start, oid.len, "551d13")) {          // BasicConstraints 2.5.29.19
+                    let bcSeq = readTlv(buf, val.start);
+                    if (bcSeq.len > 0) {
+                        let caFlag = readTlv(buf, bcSeq.start);
+                        if (caFlag.tag == 0x01 && bytes.read_byte(buf, caFlag.start) != 0) { isCa = true; }
+                    }
+                } else if (oidEq(buf, oid.start, oid.len, "551d11")) {   // SubjectAltName 2.5.29.17
+                    let san = readTlv(buf, val.start);
+                    sanStart = san.start; sanLen = san.len;
+                }
+                ep = one.next;
+            }
+        }
+    }
+
     // signatureAlgorithm + signatureValue, after the TBS.
     let sigAlgSeq = readTlv(buf, tbs.next);
     let sigOid = readTlv(buf, sigAlgSeq.start);
@@ -157,7 +197,9 @@ pub fn parseCert(buf: ptr, len: int): Cert {
         tbsStart: tbsStart, tbsLen: tbsLen, sigAlg: sigAlg, sigStart: sigStart, sigLen: sigLen,
         keyType: keyType, rsaNStart: rsaNStart, rsaNLen: rsaNLen, rsaEStart: rsaEStart, rsaELen: rsaELen,
         ecStart: ecStart, ecLen: ecLen, subjectStart: subjectStart, subjectLen: subjectLen,
-        issuerStart: issuerStart, issuerLen: issuerLen };
+        issuerStart: issuerStart, issuerLen: issuerLen,
+        nbStart: nb.start, nbLen: nb.len, nbTag: nb.tag, naStart: na.start, naLen: na.len, naTag: na.tag,
+        isCa: isCa, sanStart: sanStart, sanLen: sanLen };
 }
 
 fn hashIdOf(sigAlg: int): int {
@@ -244,4 +286,103 @@ pub fn nameMatches(child: Cert, issuer: Cert): bool {
         i = i + 1;
     }
     return true;
+}
+
+// ---- trust policy: validity dates, CA constraint, hostname matching, chain linking ----
+
+fn digit2(buf: ptr, p: int): long {
+    return ((bytes.read_byte(buf, p) - 48) * 10 + (bytes.read_byte(buf, p + 1) - 48)) as long;
+}
+
+// Convert a certificate Time (UTCTIME YYMMDDHHMMSSZ or GeneralizedTime YYYYMMDDHHMMSSZ) to a comparable
+// number YYYYMMDDHHMMSS. UTCTIME years 50..99 are 19xx, 00..49 are 20xx (RFC 5280).
+fn timeToNum(buf: ptr, start: int, tag: int): long {
+    let yyyy: long = 0;
+    let off = start;
+    if (tag == 0x18) {
+        yyyy = digit2(buf, start) * 100 + digit2(buf, start + 2);
+        off = start + 4;
+    } else {
+        let yy = digit2(buf, start);
+        if (yy >= 50) { yyyy = 1900 + yy; } else { yyyy = 2000 + yy; }
+        off = start + 2;
+    }
+    let mo = digit2(buf, off);
+    let da = digit2(buf, off + 2);
+    let hh = digit2(buf, off + 4);
+    let mi = digit2(buf, off + 6);
+    let ss = digit2(buf, off + 8);
+    return ((((yyyy * 100 + mo) * 100 + da) * 100 + hh) * 100 + mi) * 100 + ss;
+}
+
+// Is the certificate within its validity window at `now` (a YYYYMMDDHHMMSS number, e.g. UTC "now")?
+pub fn checkValidity(cert: Cert, now: long): bool {
+    let nb = timeToNum(cert.buf, cert.nbStart, cert.nbTag);
+    let na = timeToNum(cert.buf, cert.naStart, cert.naTag);
+    return nb <= now && now <= na;
+}
+
+// Is this a CA certificate (BasicConstraints cA = TRUE)?
+pub fn isCA(cert: Cert): bool { return cert.isCa; }
+
+fn lower(c: int): int { if (c >= 65 && c <= 90) { return c + 32; } return c; }
+
+// Case-insensitive compare of buf[bstart..) (blen bytes) against host[hstart..) (hlen bytes).
+fn ciEqual(buf: ptr, bstart: int, blen: int, host: string, hstart: int, hlen: int): bool {
+    if (blen != hlen) { return false; }
+    let i = 0;
+    while (i < blen) {
+        if (lower(bytes.read_byte(buf, bstart + i)) != lower(host[hstart + i])) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Match one dNSName (buf[start..start+len)) against host, honoring a leftmost "*." wildcard label.
+fn dnsMatch(buf: ptr, start: int, len: int, host: string): bool {
+    if (len >= 2 && bytes.read_byte(buf, start) == 42 && bytes.read_byte(buf, start + 1) == 46) {
+        let hi = 0;
+        while (hi < host.length && host[hi] != 46) { hi = hi + 1; }
+        if (hi <= 0 || hi >= host.length) { return false; }   // wildcard needs a non-empty first label
+        return ciEqual(buf, start + 2, len - 2, host, hi + 1, host.length - (hi + 1));
+    }
+    return ciEqual(buf, start, len, host, 0, host.length);
+}
+
+// Does the leaf certificate's SubjectAltName cover the hostname?
+pub fn matchHostname(cert: Cert, host: string): bool {
+    let p = cert.sanStart;
+    let end = cert.sanStart + cert.sanLen;
+    while (p < end) {
+        let gn = readTlv(cert.buf, p);
+        if (gn.tag == 0x82) {                          // dNSName [2] IMPLICIT IA5String
+            if (dnsMatch(cert.buf, gn.start, gn.len, host)) { return true; }
+        }
+        p = gn.next;
+    }
+    return false;
+}
+
+// One chain link: `child` is validly issued by `issuer` at `now` (issuer is a CA, names chain, both
+// within validity, and the signature verifies).
+pub fn verifyLink(child: Cert, issuer: Cert, now: long): bool {
+    return child.ok && issuer.ok && issuer.isCa
+        && nameMatches(child, issuer)
+        && checkValidity(child, now) && checkValidity(issuer, now)
+        && verifySignedBy(child, issuer);
+}
+
+// Verify a two-certificate chain (leaf directly under a trusted, self-signed root) for `host` at `now`.
+pub fn verifyChain2(leaf: Cert, root: Cert, host: string, now: long): bool {
+    return verifyLink(leaf, root, now)
+        && verifySignedBy(root, root)
+        && matchHostname(leaf, host);
+}
+
+// Verify a three-certificate chain (leaf under intermediate under a trusted, self-signed root).
+pub fn verifyChain3(leaf: Cert, inter: Cert, root: Cert, host: string, now: long): bool {
+    return verifyLink(leaf, inter, now)
+        && verifyLink(inter, root, now)
+        && verifySignedBy(root, root)
+        && matchHostname(leaf, host);
 }

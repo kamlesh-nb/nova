@@ -1,0 +1,90 @@
+// X.509 certificate-chain trust policy in Nova (M9 phase E, no external library). Verified against an
+// OpenSSL-generated 3-level EC chain (root CA -> intermediate CA -> leaf) with BasicConstraints and a
+// SubjectAltName. OpenSSL "verify -CAfile root -untrusted int leaf" accepts it; here we check the full
+// chain, validity windows, the CA constraint, and hostname (including wildcard) matching.
+import crypto.x509;
+import bytes;
+import assert;
+
+fn hexNib(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    return 0;
+}
+fn hexBuf(hex: string): ptr {
+    let n = hex.length / 2;
+    let b = bytes.alloc(n);
+    let i = 0;
+    while (i < n) { bytes.write_byte(b, i, hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1])); i = i + 1; }
+    return b;
+}
+
+const ROOT: string = "3082018330820129a0030201020214548c2367bec66e0c9cc95f3005961d24f44acef1300a06082a8648ce3d04030230173115301306035504030c0c4e6f766120526f6f74204341301e170d3236303732393132323433355a170d3336303732363132323433355a30173115301306035504030c0c4e6f766120526f6f742043413059301306072a8648ce3d020106082a8648ce3d030107034200041c77fb7e0628ef39ab7d1c1cf0bd9212b08d901b5e47e965d2176dc18fd36d5760a531bde379f67d4414b4bf5b0e54764fab69b79e5cf138b51990dcda915135a3533051301d0603551d0e041604145569c4164e5784a50437f5eb468928c08abafb08301f0603551d230418301680145569c4164e5784a50437f5eb468928c08abafb08300f0603551d130101ff040530030101ff300a06082a8648ce3d040302034800304502201f14ba1fd3562bc2b7024dae726aab97411b739cb14a9501b61a762e9bbadb91022100d2cbd851c013dac6c992afd17e2c5f8922a413bbacbc1264473dfdeaff472777";
+const INT: string = "3082018c30820131a003020102021412d3e005aa5b5b8f405287d21a503f816241cee1300a06082a8648ce3d04030230173115301306035504030c0c4e6f766120526f6f74204341301e170d3236303732393132323433355a170d3336303732363132323433355a301f311d301b06035504030c144e6f766120496e7465726d6564696174652043413059301306072a8648ce3d020106082a8648ce3d0301070342000425ec50b912b0f99807958b31fa64dc2da0eb3b904db5f8aedb6f2be201dcf4a2285100c8377d0526bf54409ab2f4050e050ba099f72f6db736225d48544173c1a3533051300f0603551d130101ff040530030101ff301d0603551d0e041604144139395d7979e4d26dc5c08456644d2c63e449f1301f0603551d230418301680145569c4164e5784a50437f5eb468928c08abafb08300a06082a8648ce3d0403020349003046022100b0f20ea3162a23613e2ba3b47c81fadac4a9fb6e593d11d898bde0c0766f9a6d0221009a1470cefd14220a8c136f294e6fc1dd0f56df07191dfec85d5c86d79af45e46";
+const LEAF: string = "308201b43082015aa0030201020214440c80b4ef1b2180f183436d8c3e11192f21056b300a06082a8648ce3d040302301f311d301b06035504030c144e6f766120496e7465726d656469617465204341301e170d3236303732393132323433355a170d3336303732363132323433355a30193117301506035504030c0e6c6561662e6e6f76612e746573743059301306072a8648ce3d020106082a8648ce3d03010703420004ceec03474f9a5233091919e3b80ae88b4cee5c91f0966907bbbf6a8784c1f96ed6f3e8977afee8d786d1b7612ae76a946c9e3b3d954aebf5aab973c7ea327a0ba37a307830090603551d1304023000302b0603551d1104243022820e6c6561662e6e6f76612e7465737482102a2e77696c642e6e6f76612e74657374301d0603551d0e04160414eb1f9a8b00df5aefa18e0558e6178387485c012e301f0603551d230418301680144139395d7979e4d26dc5c08456644d2c63e449f1300a06082a8648ce3d04030203480030450221009754b61df3777bffd519dada7111ddd0a329bc9df8a558bf957ff2cd5ecd20bb0220092d8edf8ef70f94c8b6d853dc3cb83d3ffb3cfcbf14898426402c3d73825e07";
+
+// A time (YYYYMMDDHHMMSS) inside the certs' validity window (2026-07-29 .. 2036-07-26).
+const NOW: long = 20270101000000;
+
+
+// The full 3-level chain verifies at a time inside the validity window.
+@test
+fn chain_valid(): void {
+    let root = x509.parseCert(hexBuf(ROOT), 391);
+    let inter = x509.parseCert(hexBuf(INT), 400);
+    let leaf = x509.parseCert(hexBuf(LEAF), 440);
+    assert.isTrue(root.ok && inter.ok && leaf.ok);
+    assert.isTrue(x509.verifyChain3(leaf, inter, root, "leaf.nova.test", NOW));
+}
+
+// The CA constraint: root and intermediate are CAs, the leaf is not.
+@test
+fn ca_constraints(): void {
+    let root = x509.parseCert(hexBuf(ROOT), 391);
+    let inter = x509.parseCert(hexBuf(INT), 400);
+    let leaf = x509.parseCert(hexBuf(LEAF), 440);
+    assert.isTrue(x509.isCA(root));
+    assert.isTrue(x509.isCA(inter));
+    assert.isTrue(!x509.isCA(leaf));
+}
+
+// Hostname matching, including the wildcard SAN entry *.wild.nova.test.
+@test
+fn hostname_matching(): void {
+    let leaf = x509.parseCert(hexBuf(LEAF), 440);
+    assert.isTrue(x509.matchHostname(leaf, "leaf.nova.test"));
+    assert.isTrue(x509.matchHostname(leaf, "anything.wild.nova.test"));   // wildcard covers one label
+    assert.isTrue(!x509.matchHostname(leaf, "wild.nova.test"));           // wildcard needs a label
+    assert.isTrue(!x509.matchHostname(leaf, "a.b.wild.nova.test"));       // only one label
+    assert.isTrue(!x509.matchHostname(leaf, "evil.com"));
+}
+
+// A wrong hostname fails the whole chain even though the signatures are valid.
+@test
+fn wrong_hostname_rejected(): void {
+    let root = x509.parseCert(hexBuf(ROOT), 391);
+    let inter = x509.parseCert(hexBuf(INT), 400);
+    let leaf = x509.parseCert(hexBuf(LEAF), 440);
+    assert.isTrue(!x509.verifyChain3(leaf, inter, root, "evil.com", NOW));
+}
+
+// Times outside the validity window fail.
+@test
+fn validity_window(): void {
+    let leaf = x509.parseCert(hexBuf(LEAF), 440);
+    assert.isTrue(x509.checkValidity(leaf, NOW));
+    assert.isTrue(!x509.checkValidity(leaf, 20200101000000));   // before notBefore
+    assert.isTrue(!x509.checkValidity(leaf, 20400101000000));   // after notAfter
+    let root = x509.parseCert(hexBuf(ROOT), 391);
+    let inter = x509.parseCert(hexBuf(INT), 400);
+    assert.isTrue(!x509.verifyChain3(leaf, inter, root, "leaf.nova.test", 20400101000000));
+}
+
+// A broken chain (wrong anchor) is rejected: verifying the leaf directly under the root skips the
+// intermediate, so the issuer name and signature do not match.
+@test
+fn broken_chain_rejected(): void {
+    let root = x509.parseCert(hexBuf(ROOT), 391);
+    let leaf = x509.parseCert(hexBuf(LEAF), 440);
+    assert.isTrue(!x509.verifyChain2(leaf, root, "leaf.nova.test", NOW));
+}
