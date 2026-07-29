@@ -472,15 +472,7 @@ extern "C" void nova_run_reactors(long long n, long long box) {
     for (auto &t : ts) t.join();
 }
 
-// SO_REUSEPORT via the C macro (portable; the numeric value differs by platform).
-extern "C" long long nova_set_reuseport(long long fd) {
-    int one = 1;
-    int r = 0;
-#ifdef SO_REUSEPORT
-    r = ::setsockopt((int)fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
-#endif
-    return (long long)r;
-}
+// nova_set_reuseport retired in M6: sys.setReusePort is pure Nova over setsockopt in os/sys.
 
 // Reap a coroutine frame (the awaiter read its result). Single reactor thread, so it is never
 // concurrently running here; just run its destroy function.

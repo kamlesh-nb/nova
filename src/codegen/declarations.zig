@@ -243,15 +243,12 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
             var two_ptr = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.ptr_type };
             var one_val = [_]types.LLVMTypeRef{compiler.val_type};
             const ptr_1ptr = core.LLVMFunctionType(compiler.ptr_type, &one_ptr, 1, 0);
-            const void_2ptr = core.LLVMFunctionType(compiler.void_type, &two_ptr, 2, 0);
             const ptr_2ptr = core.LLVMFunctionType(compiler.ptr_type, &two_ptr, 2, 0);
             const val_0 = core.LLVMFunctionType(compiler.val_type, &one_ptr, 0, 0);
             const val_1val = core.LLVMFunctionType(compiler.val_type, &one_val, 1, 0);
             const ptr_1val = core.LLVMFunctionType(compiler.ptr_type, &one_val, 1, 0);
             const Imp2 = struct { name: [:0]const u8, ty: types.LLVMTypeRef };
             const imps2 = [_]Imp2{
-                .{ .name = "nova_getenv", .ty = ptr_1ptr },
-                .{ .name = "nova_setenv", .ty = void_2ptr },
                 .{ .name = "nova_arg_count", .ty = val_0 },
                 .{ .name = "nova_arg_at", .ty = val_1val },
                 .{ .name = "nova_sha256", .ty = ptr_1ptr },
@@ -433,14 +430,8 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         const mtls_free_type = core.LLVMFunctionType(compiler.void_type, &one_param_ptr, 1, 0);
         try compiler.func_map.put("nova_mtls_free", core.LLVMAddFunction(compiler.module, "nova_mtls_free", mtls_free_type));
 
-        const getenv_type = core.LLVMFunctionType(compiler.ptr_type, &one_param_ptr, 1, 0);
-        const getenv_fn = core.LLVMAddFunction(compiler.module, "nova_getenv", getenv_type);
-        try compiler.func_map.put("nova_getenv", getenv_fn);
-
-        var setenv_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.ptr_type };
-        const setenv_type = core.LLVMFunctionType(compiler.void_type, &setenv_params, 2, 0);
-        const setenv_fn = core.LLVMAddFunction(compiler.module, "nova_setenv", setenv_type);
-        try compiler.func_map.put("nova_setenv", setenv_fn);
+        // nova_getenv/nova_setenv were retired in M6: std/env.nova reads and writes the environment
+        // through the getenv/setenv bindings in os/sys.
 
         const argc_type = core.LLVMFunctionType(compiler.val_type, &one_param_ptr, 0, 0);
         try compiler.func_map.put("nova_arg_count", core.LLVMAddFunction(compiler.module, "nova_arg_count", argc_type));
@@ -615,7 +606,7 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         var reactor_resume_p = [_]types.LLVMTypeRef{val_type};
         const reactor_resume_type = core.LLVMFunctionType(val_type, &reactor_resume_p, 1, 0);
         try compiler.func_map.put("nova_reactor_resume", core.LLVMAddFunction(compiler.module, "nova_reactor_resume", reactor_resume_type));
-        try compiler.func_map.put("nova_set_reuseport", core.LLVMAddFunction(compiler.module, "nova_set_reuseport", reactor_resume_type));
+        // nova_set_reuseport retired in M6: sys.setReusePort is pure Nova over setsockopt.
 
         var run_reactors_p = [_]types.LLVMTypeRef{ val_type, val_type };
         const run_reactors_type = core.LLVMFunctionType(void_type, &run_reactors_p, 2, 0);

@@ -9,10 +9,13 @@
 
 import bytes;
 
+// errno access and the non-blocking shim are honest primitives that stay in C: errno is a
+// per-thread macro (no address to bind from Nova), and fcntl(F_SETFL) is variadic so a
+// non-variadic FFI declaration mispasses its flag on arm64 (see nova_set_nonblock in core.cpp,
+// the same reason nova_open exists). Everything else below is a direct libc binding.
 pub extern("c") fn nova_ffi_errno(): int;
 pub extern("c") fn nova_ffi_set_errno(v: int): void;
 pub extern("c") fn nova_set_nonblock(fd: int): int;
-pub extern("c") fn nova_set_reuseport(fd: int): int;
 
 pub extern("c") fn socket(domain: int, type_: int, protocol: int): int;
 pub extern("c") fn socketpair(domain: int, type_: int, protocol: int, sv: ptr): int;
@@ -29,6 +32,12 @@ pub extern("c") fn fcntl(fd: int, cmd: int, arg: int): int;
 pub extern("c") fn read(fd: int, buf: ptr, count: long): long;
 pub extern("c") fn write(fd: int, buf: ptr, count: long): long;
 pub extern("c") fn close(fd: int): int;
+
+// Process environment (M6: process shims in Nova over os/sys). getenv returns a pointer into the
+// process environment (do not free it); setenv copies. The string marshalling wrappers are in
+// std/env.nova, which owns the allocator import.
+pub extern("c") fn getenv(name: ptr): ptr;
+pub extern("c") fn setenv(name: ptr, value: ptr, overwrite: int): int;
 
 // File and directory syscalls (M5: file and directory I/O in Nova over os/sys). These
 // bind libc directly except open, which is variadic (int open(const char*, int, ...)) and so
@@ -143,6 +152,10 @@ pub const AF_UNIX: int = 1;
 // with the epoll backend.
 pub const SO_ERROR: int = 4103;
 
+// SO_REUSEPORT lets N reactor threads each bind the same port (kernel load-balances accepts), the
+// share-nothing multi-core listener. macOS/BSD value is 0x0200; Linux is 15, plugs in with epoll.
+pub const SO_REUSEPORT: int = 512;
+
 pub fn errno(): int { return nova_ffi_errno(); }
 pub fn clearErrno(): void { nova_ffi_set_errno(0); }
 
@@ -183,8 +196,14 @@ pub fn setNonBlocking(fd: int): int {
     return nova_set_nonblock(fd);
 }
 
+// Set SO_REUSEPORT so several reactor threads can bind the same port. Pure Nova over setsockopt
+// (M6); no runtime shim, unlike setNonBlocking, because setsockopt is not variadic.
 pub fn setReusePort(fd: int): int {
-    return nova_set_reuseport(fd);
+    let one = bytes.alloc(4);
+    bytes.write_i32(one, 0, 1);
+    let r = setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, one, 4);
+    bytes.free(one);
+    return r;
 }
 
 // Build a `struct sockaddr_in` (16 bytes) in a fresh buffer: sin_family (u16),

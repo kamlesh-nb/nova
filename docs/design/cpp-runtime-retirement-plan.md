@@ -14,7 +14,7 @@ truth for progress; the phase details are below.
 | M3 | Database drivers on the reactor | M2 | DONE (mock) | The drivers connect via `asyncConnect` and do I/O through `AsyncStream`, both reactor-native from M2, so they run on the reactor with no driver change. Corpus 205: an App handler makes a per-request DB call (mock DB on the same reactor) end to end, no Asio, closing the PH6 deadlock. A live-driver run needs a reachable database; the driver code is unchanged |
 | M4 | Retire Boost.Asio | M1 to M3 | DONE | The async runtime is reactor-native end to end: `nova_sched_schedule` is just the run queue, timers/deadlines/TLS/sockets are reactor-native, `nova_run_root` drives async on the reactor, and the multi-core server uses the share-nothing reactor. The Asio `io_context`/strands/thread-pool/`CoroState` and socket primitives are deleted (the latter kept as loud abort stubs for the dead codegen branch); the `<boost/asio.hpp>` include, the Boost build flags, and the vendored `deps/boost` (~7MB) are gone. Native 198, ASAN 365, TSan 215, no Boost |
 | M5 | File and directory I/O in Nova | M4 (soft) | DONE | `io/file.nova` + `io/dir.nova` over `os/sys` (open/read/write/lseek/close, mkdir/rmdir/rename, stat/access, opendir/readdir/closedir); `nova_file_*`/`nova_dir_*` deleted; only the variadic `nova_open` shim stays. `io.cpp` 1116 to 950. Native 199, ASAN 367, TSan 216 |
-| M6 | Process and primitive shims | none | TODO | `core.cpp` shims to `os/sys`; tiny atomics FFI stays |
+| M6 | Process and primitive shims | none | DONE | `reuseport` (pure Nova `setsockopt`) and env `get`/`set` (`os/sys` `getenv`/`setenv`) moved to Nova; their C deleted. The honest-primitive floor stays: `errno` (a macro), `set_nonblock` (variadic), `close` (the tcp stack cannot import `os/sys`: its `socket` export collides by name with the `socket` module; the reactor path already uses `sys.close`), `exit` (`_Exit`), args (argv capture), atomics, mutex/condvar/rwlock/spinlock |
 | M7 | Channels and actors in Nova | M1, M6 | TODO | Over the reactor; verify under `--tsan` |
 | M8 | Allocator backing in Nova | none | TODO | `mmap` arena under `nova_bytes_alloc`; ABI-CORE unchanged |
 | M9 | TLS 1.2 and 1.3 protocol in Nova | M2 | TODO | Protocol only; reference the Zig `std.crypto.tls`; crypto primitives stay vetted |
@@ -305,10 +305,28 @@ phase removes a real dependency and is independently verifiable.
   native 199, ASAN 367, TSan 216, all green with the file and directory C gone. The Linux plug is the
   same syscalls with the Linux `struct stat`/`struct dirent` offsets and `O_*` values, behind the
   same `os/sys` shape.
-- **M6. Process and primitive shims.** Move the `core.cpp` shims (`close`, args, exit, `set_nonblock`,
-  `reuseport`, errno) fully into `os/sys`, and provide atomics and one condition-variable primitive as
-  a tiny, honest FFI (these are genuinely primitive and may stay behind a few-line C shim). Prereq:
-  none. Gate: the relevant cases pass; `core.cpp` reduces to the ABI-CORE helpers.
+- **M6. Process and primitive shims. DONE.** The migratable shims are now Nova over `os/sys`, and the
+  line under them is drawn at the genuinely-primitive floor. Moved to Nova (their C deleted): `reuseport`
+  is `sys.setReusePort`, pure Nova over `setsockopt(SO_REUSEPORT)` with no runtime shim (setsockopt is
+  not variadic), so `nova_set_reuseport` is gone from `concurrency.cpp`; env `get`/`set` read and write
+  through new `getenv`/`setenv` bindings in `os/sys` with the string marshalling in `std/env.nova`, so
+  `nova_getenv`/`nova_setenv` are gone from `core.cpp`. Each deletion also removed the codegen
+  declarations (`declarations.zig`) and, where present, the bare-builtin registrations (`builtins.zig`)
+  and the ABI header declarations. What stays is the honest primitive floor, exactly as the plan intends:
+  `errno` (`nova_ffi_errno`, because errno is a per-thread macro with no address to bind from Nova),
+  `set_nonblock` (variadic `fcntl`, the same reason `nova_open` exists), `exit` (`std::_Exit`, chosen
+  precisely to skip the `atexit` handler that coverage registers, so it cannot become a plain libc `exit`
+  binding), process args (`nova_arg_count`/`nova_arg_at`, because the generated `main` captures `argv`
+  and no `os/sys` binding can reach it), and the concurrency primitives (atomics, `mutex`, `condvar`,
+  `rwlock`, `spinlock`), which are the "tiny, honest FFI" the plan calls out. One named target,
+  `close`, is a special case: `os/sys` already binds libc `close` and the reactor path uses `sys.close`,
+  but the legacy tcp socket stack (`net/tcp/socket`, `net/tcp/server`, `web/client`) cannot import
+  `os/sys`, because `os/sys` exports a `socket` function that collides by name with the `socket` module
+  alias those files use (a name-based-resolution limit in the current module scoping, surfaced exactly
+  by this change). So the tcp stack keeps `nova_close` (via a `closeFd` helper in `net/tcp/socket`), and
+  a clean migration is deferred to splitting the socket-family bindings into an `os.socket` module, or
+  adding an extern link-name so the binding need not be named `socket`. Gate: the env conformance path
+  and the multi-core reactor cases (which exercise `setReusePort`) pass; native, ASAN, TSan green.
 - **M7. Channels and actors.** Reimplement channels and the actor mailbox in Nova over the reactor and
   the primitives from M6. Prereq: M1, M6. Gate: the channel and actor conformance cases pass under
   `--tsan`.

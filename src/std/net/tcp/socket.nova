@@ -73,3 +73,10 @@ pub struct TcpStream {
         self.close();
     }
 }
+
+// Close a raw fd. The tcp/web modules go through nova_close rather than sys.close, because
+// importing os/sys pulls in its `socket` function, which collides by name with the `socket`
+// module these files use (a name-based-resolution limit; migrating needs an os.socket split).
+pub fn closeFd(fd: int): int {
+    return nova_close(fd);
+}

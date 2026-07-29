@@ -158,8 +158,6 @@ void      nova_log_string(const char *s);
 void      nova_log_info(const char *s);
 void      nova_log_debug(const char *s);
 void      nova_log_err(const char *s);
-char*     nova_getenv(const char *name);
-void      nova_setenv(const char *name, const char *value);
 char*     nova_sha256(const char *input);
 char*     nova_sha512(const char *input);
 char*     nova_sha1(const char *input);

@@ -100,7 +100,7 @@ struct HttpConn {
 
     fn close(self: HttpConn): void {
         if (self.tlsCtx != 0) { nova_tls_free(self.tlsCtx); self.tlsCtx = 0; }
-        if (self.fd >= 0) { nova_close(self.fd); self.fd = -1; }
+        if (self.fd >= 0) { socket.closeFd(self.fd); self.fd = -1; }
     }
 }
 

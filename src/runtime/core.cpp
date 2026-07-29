@@ -290,28 +290,9 @@ void nova_panic_cstr(const char *msg) {
 
 long long nova_get_stacktrace(void) { return nova_bytes_alloc(0); }
 
-char *nova_getenv(const char *name) {
-  if (!name)
-    return const_cast<char *>(nova_from_cstr(""));
-  char *nm = nova_to_cstr(name);
-  const char *v = nm ? std::getenv(nm) : nullptr;
-  nova_free_cstr(name, nm);
-  return const_cast<char *>(nova_from_cstr(v ? v : ""));
-}
-void nova_setenv(const char *name, const char *value) {
-  if (!name || !value)
-    return;
-  char *nm = nova_to_cstr(name);
-  char *vl = nova_to_cstr(value);
-  if (nm && vl)
-#ifdef _WIN32
-    _putenv_s(nm, vl);
-#else
-    ::setenv(nm, vl, 1);
-#endif
-  nova_free_cstr(name, nm);
-  nova_free_cstr(value, vl);
-}
+// nova_getenv/nova_setenv retired in M6: std/env.nova reads and writes the environment through
+// the getenv/setenv bindings in os/sys. Process arguments stay here because the runtime entry
+// captures argv.
 
 static int g_argc = 0;
 static char **g_argv = nullptr;
@@ -498,6 +479,10 @@ void nova_atomic_store_bool(uint8_t *p, int32_t v) {
   __atomic_store_n(p, (uint8_t)v, __ATOMIC_SEQ_CST);
 }
 
+// nova_close closes a file descriptor. It stays a runtime primitive: os/sys binds libc close
+// (the reactor path uses sys.close), but the legacy tcp socket stack cannot import os/sys, because
+// os/sys exports a `socket` function that collides by name with the `socket` module those files
+// use (a name-based-resolution limit). Migrating close there needs an os.socket split (M6 note).
 int nova_close(int fd) {
 #ifdef _WIN32
   return _close(fd);
