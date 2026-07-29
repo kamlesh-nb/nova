@@ -88,3 +88,35 @@ fn broken_chain_rejected(): void {
     let leaf = x509.parseCert(hexBuf(LEAF), 440);
     assert.isTrue(!x509.verifyChain2(leaf, root, "leaf.nova.test", NOW));
 }
+
+// Build a TLS certificate_list (CertificateEntry = cert<3-byte len> || extensions<2>) and verify it, as
+// the TLS client does with the captured server certificates.
+fn w3(buf: ptr, off: int, v: int): void {
+    bytes.write_byte(buf, off, (v >> 16) & 0xff);
+    bytes.write_byte(buf, off + 1, (v >> 8) & 0xff);
+    bytes.write_byte(buf, off + 2, v & 0xff);
+}
+fn addEntry(list: ptr, p: int, certHex: string, certLen: int): int {
+    w3(list, p, certLen); p = p + 3;
+    let der = hexBuf(certHex);
+    let i = 0;
+    while (i < certLen) { bytes.write_byte(list, p + i, bytes.read_byte(der, i)); i = i + 1; }
+    p = p + certLen;
+    bytes.write_byte(list, p, 0); bytes.write_byte(list, p + 1, 0); p = p + 2;   // empty extensions
+    return p;
+}
+
+@test
+fn cert_list_chain(): void {
+    // certificate_list = leaf entry || intermediate entry (the order a TLS server sends).
+    let list = bytes.alloc(1024);
+    let p = addEntry(list, 0, LEAF, 440);
+    p = addEntry(list, p, INT, 400);
+    assert.isTrue(x509.verifyCertList(list, p, hexBuf(ROOT), 391, "leaf.nova.test", NOW));
+    assert.isTrue(!x509.verifyCertList(list, p, hexBuf(ROOT), 391, "evil.com", NOW));
+
+    // Leaf-only list does not chain to the root (the intermediate is missing).
+    let solo = bytes.alloc(512);
+    let q = addEntry(solo, 0, LEAF, 440);
+    assert.isTrue(!x509.verifyCertList(solo, q, hexBuf(ROOT), 391, "leaf.nova.test", NOW));
+}

@@ -80,6 +80,7 @@ struct TlsClient {
     pub finishedOk: bool,
     pub hsBuf: ptr, pub hsCap: int, pub hsLen: int, pub hsPos: int,   // handshake reassembly buffer
     pub leafOff: int, pub leafLen: int,  // leaf certificate location within hsBuf
+    pub certListOff: int, pub certListLen: int,   // certificate_list region within hsBuf
 }
 
 pub fn newClient(ephPriv: ptr): TlsClient {
@@ -91,6 +92,7 @@ pub fn newClient(ephPriv: ptr): TlsClient {
         capKey: bytes.alloc(32), capIv: bytes.alloc(12), sapKey: bytes.alloc(32), sapIv: bytes.alloc(12),
         sSeq: 0, cSeq: 0, certVerifyOk: false, finishedOk: false,
         hsBuf: bytes.alloc(8192), hsCap: 8192, hsLen: 0, hsPos: 0, leafOff: 0, leafLen: 0,
+        certListOff: 0, certListLen: 0,
     };
 }
 
@@ -233,6 +235,9 @@ pub fn feedHandshake(self: TlsClient, record: ptr, recLen: int): int {
         let mtype = bytes.read_byte(self.hsBuf, self.hsPos);
         let mp = self.hsPos;
         if (mtype == 0x0b) {                       // Certificate
+            self.certListLen = (bytes.read_byte(self.hsBuf, mp + 5) << 16) | (bytes.read_byte(self.hsBuf, mp + 6) << 8)
+                             | bytes.read_byte(self.hsBuf, mp + 7);
+            self.certListOff = mp + 8;             // start of the first CertificateEntry
             let clen = (bytes.read_byte(self.hsBuf, mp + 8) << 16) | (bytes.read_byte(self.hsBuf, mp + 9) << 8)
                      | bytes.read_byte(self.hsBuf, mp + 10);
             self.leafOff = mp + 11;
@@ -312,4 +317,13 @@ pub fn decryptApp(self: TlsClient, record: ptr, recLen: int, out: ptr): int {
     let n = tls13.recordUnprotect(self.suite, self.sapKey, self.sapIv, self.sSeq, record, recLen, out);
     self.sSeq = self.sSeq + 1;
     return n;
+}
+
+// Trust decision: validate the server's certificate chain (captured during the handshake) against a
+// trusted root, for `host` at `now` (a YYYYMMDDHHMMSS number). This is separate from the handshake's
+// CertificateVerify check (which only proves the server holds the leaf key); call it after the handshake
+// to decide whether to trust the leaf. Returns true iff the chain is trusted.
+pub fn verifyServerChain(self: TlsClient, rootDer: ptr, rootLen: int, host: string, now: long): bool {
+    if (self.certListLen <= 0) { return false; }
+    return x509.verifyCertList(at(self.hsBuf, self.certListOff), self.certListLen, rootDer, rootLen, host, now);
 }

@@ -386,3 +386,26 @@ pub fn verifyChain3(leaf: Cert, inter: Cert, root: Cert, host: string, now: long
         && verifySignedBy(root, root)
         && matchHostname(leaf, host);
 }
+
+fn rd3(buf: ptr, p: int): int {
+    return (bytes.read_byte(buf, p) << 16) | (bytes.read_byte(buf, p + 1) << 8) | bytes.read_byte(buf, p + 2);
+}
+
+// Verify a TLS Certificate message's certificate_list against a trusted root, for a hostname at `now`.
+// `list` is the certificate_list content (a run of CertificateEntry: cert<3-byte len> || extensions<2>).
+// Handles a lone leaf (verifyChain2) or leaf + one intermediate (verifyChain3). Returns true iff trusted.
+pub fn verifyCertList(list: ptr, listLen: int, rootDer: ptr, rootLen: int, host: string, now: long): bool {
+    if (listLen < 3) { return false; }
+    let c0len = rd3(list, 0);
+    let leaf = parseCert((list as long + 3) as ptr, c0len);
+    let p = 3 + c0len;
+    let ext0 = (bytes.read_byte(list, p) << 8) | bytes.read_byte(list, p + 1);
+    p = p + 2 + ext0;
+    let root = parseCert(rootDer, rootLen);
+    if (p + 3 > listLen) {
+        return verifyChain2(leaf, root, host, now);       // leaf only
+    }
+    let c1len = rd3(list, p);
+    let inter = parseCert((list as long + (p + 3) as long) as ptr, c1len);
+    return verifyChain3(leaf, inter, root, host, now);     // leaf + intermediate
+}
