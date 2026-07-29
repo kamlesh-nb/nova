@@ -79,7 +79,7 @@ fn build_client_hello(): void {
     let i = 0;
     while (i < 32) { bytes.write_byte(rnd, i, i); bytes.write_byte(sid, i, 255 - i); i = i + 1; }
     let out = bytes.alloc(512);
-    let n = tls13client.buildClientHello(rnd, sid, pk, out);
+    let n = tls13client.buildClientHello(rnd, sid, pk, "example.com", out);
     // Handshake type 0x01, and the 3-byte body length equals n-4.
     assert.equalInt(bytes.read_byte(out, 0), 0x01);
     let bodyLen = (bytes.read_byte(out, 1) << 16) | (bytes.read_byte(out, 2) << 8) | bytes.read_byte(out, 3);

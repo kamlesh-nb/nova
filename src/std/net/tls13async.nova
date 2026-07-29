@@ -73,11 +73,11 @@ fn fillRandom(buf: ptr, n: int): void {
 // ServerHello, reassemble and verify the server's encrypted flight, and send the client Finished. `cl`
 // must be a fresh TlsClient carrying our ephemeral key; ephPub is that key's public value. Returns 0 on a
 // verified handshake, -1 otherwise.
-pub async fn handshake(io: TlsIO, cl: tls13client.TlsClient, ephPub: ptr): int {
+pub async fn handshake(io: TlsIO, cl: tls13client.TlsClient, ephPub: ptr, host: string): int {
     let rnd = bytes.alloc(32); fillRandom(rnd, 32);
     let sid = bytes.alloc(32); fillRandom(sid, 32);
     let ch = bytes.alloc(1024);
-    let chLen = tls13client.buildClientHello(rnd, sid, ephPub, ch);
+    let chLen = tls13client.buildClientHello(rnd, sid, ephPub, host, ch);
     cl.addClientHello(ch, chLen);
 
     let rec = bytes.alloc(chLen + 5);
@@ -87,9 +87,17 @@ pub async fn handshake(io: TlsIO, cl: tls13client.TlsClient, ephPub: ptr): int {
     while (i < chLen) { bytes.write_byte(rec, 5 + i, bytes.read_byte(ch, i)); i = i + 1; }
     if (await io.sendAll(rec, chLen + 5) < 0) { return -1; }
 
+    // Dummy ChangeCipherSpec for middlebox compatibility (RFC 8446 appendix D.4).
+    let ccs = bytes.alloc(6);
+    bytes.write_byte(ccs, 0, 0x14); bytes.write_byte(ccs, 1, 0x03); bytes.write_byte(ccs, 2, 0x03);
+    bytes.write_byte(ccs, 3, 0x00); bytes.write_byte(ccs, 4, 0x01); bytes.write_byte(ccs, 5, 0x01);
+    if (await io.sendAll(ccs, 6) < 0) { return -1; }
+
     let buf = bytes.alloc(33792);
     let n = await io.readRecord(buf);
     if (n < 0 || bytes.read_byte(buf, 0) != 0x16) { return -1; }
+    // Reject a HelloRetryRequest (unsupported: we always offer x25519) and any version-downgrade attempt.
+    if (tls13client.isHelloRetryRequest(at(buf, 5)) || tls13client.hasDowngradeSentinel(at(buf, 5))) { return -1; }
     cl.processServerHello(at(buf, 5), n - 5);
 
     let ok = 0;

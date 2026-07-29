@@ -82,7 +82,7 @@ fn main(): int {
     let rnd = bytes.alloc(32); fillRandom(rnd, 32);
     let sid = bytes.alloc(32); fillRandom(sid, 32);
     let ch = bytes.alloc(1024);
-    let chLen = tls13client.buildClientHello(rnd, sid, epub, ch);
+    let chLen = tls13client.buildClientHello(rnd, sid, epub, "localhost", ch);
     c.addClientHello(ch, chLen);
 
     let rec = bytes.alloc(chLen + 5);
@@ -91,12 +91,20 @@ fn main(): int {
     let i = 0;
     while (i < chLen) { bytes.write_byte(rec, 5 + i, bytes.read_byte(ch, i)); i = i + 1; }
     writeAll(fd, rec, chLen + 5);
-    logStr("sent ClientHello");
+    // Dummy ChangeCipherSpec for middlebox compatibility.
+    let ccs = bytes.alloc(6);
+    bytes.write_byte(ccs, 0, 0x14); bytes.write_byte(ccs, 1, 0x03); bytes.write_byte(ccs, 2, 0x03);
+    bytes.write_byte(ccs, 3, 0x00); bytes.write_byte(ccs, 4, 0x01); bytes.write_byte(ccs, 5, 0x01);
+    writeAll(fd, ccs, 6);
+    logStr("sent ClientHello (with SNI)");
 
     // ServerHello.
     let buf = bytes.alloc(32768);
     let n = readRecord(fd, buf);
     if (n < 0 || bytes.read_byte(buf, 0) != 0x16) { logStr("no ServerHello"); return 1; }
+    if (tls13client.isHelloRetryRequest(at(buf, 5)) || tls13client.hasDowngradeSentinel(at(buf, 5))) {
+        logStr("HelloRetryRequest / downgrade rejected"); return 1;
+    }
     c.processServerHello(at(buf, 5), n - 5);
     logStr("got ServerHello, derived handshake keys");
 

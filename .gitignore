@@ -19,3 +19,6 @@ my_app/
 recovered/
 .DS_Store
 *.log
+
+# Local crypto reference copy (not part of the build)
+deps/BearSSL/

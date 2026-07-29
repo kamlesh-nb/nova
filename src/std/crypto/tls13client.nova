@@ -24,11 +24,25 @@ fn putHex(out: ptr, p: int, hex: string): int {
     return p + n;
 }
 
-// Build a minimal TLS 1.3 ClientHello handshake message into out: offers X25519 + AES-128-GCM-SHA256,
-// with supported_versions=1.3, supported_groups=x25519, signature_algorithms (RSA-PSS/PKCS1 + ECDSA
-// P-256, all SHA-256), and a key_share carrying our ephemeral public key. random and sessionId are 32
-// bytes each; ephPub is our 32-byte X25519 public key. Returns the message length.
-pub fn buildClientHello(random: ptr, sessionId: ptr, ephPub: ptr, out: ptr): int {
+// Write a server_name (SNI) extension (RFC 6066) for `host` at out[p]. Returns the new position.
+fn putSni(out: ptr, p: int, host: string): int {
+    let hl = host.length;
+    p = putHex(out, p, "0000");                    // extension_type: server_name
+    bytes.write_byte(out, p, ((5 + hl) >> 8) & 0xff); bytes.write_byte(out, p + 1, (5 + hl) & 0xff); p = p + 2;
+    bytes.write_byte(out, p, ((3 + hl) >> 8) & 0xff); bytes.write_byte(out, p + 1, (3 + hl) & 0xff); p = p + 2;
+    bytes.write_byte(out, p, 0); p = p + 1;        // name_type: host_name
+    bytes.write_byte(out, p, (hl >> 8) & 0xff); bytes.write_byte(out, p + 1, hl & 0xff); p = p + 2;
+    let i = 0;
+    while (i < hl) { bytes.write_byte(out, p + i, host[i]); i = i + 1; }
+    return p + hl;
+}
+
+// Build a TLS 1.3 ClientHello handshake message into out for the given server hostname. Offers X25519 +
+// AES-128-GCM-SHA256 with server_name (SNI), supported_versions=1.3, supported_groups=x25519,
+// signature_algorithms (RSA-PSS/PKCS1 + ECDSA P-256, all SHA-256), psk_key_exchange_modes (psk_dhe_ke),
+// and a key_share carrying our ephemeral public key. random and sessionId are 32 bytes each; ephPub is our
+// 32-byte X25519 public key. Returns the message length.
+pub fn buildClientHello(random: ptr, sessionId: ptr, ephPub: ptr, host: string, out: ptr): int {
     let p = 4;                                     // reserve the 4-byte handshake header
     bytes.write_byte(out, p, 0x03); bytes.write_byte(out, p + 1, 0x03); p = p + 2;   // legacy_version
     let i = 0;
@@ -43,9 +57,11 @@ pub fn buildClientHello(random: ptr, sessionId: ptr, ephPub: ptr, out: ptr): int
 
     let extLenPos = p; p = p + 2;                  // extensions length (backpatched)
     let extStart = p;
+    p = putSni(out, p, host);                      // server_name (SNI)
     p = putHex(out, p, "002b0003020304");          // supported_versions: TLS 1.3
     p = putHex(out, p, "000a00040002001d");        // supported_groups: x25519
     p = putHex(out, p, "000d00080006080404030401");// signature_algorithms: rsa_pss/ecdsa/rsa_pkcs1 SHA-256
+    p = putHex(out, p, "002d00020101");            // psk_key_exchange_modes: psk_dhe_ke
     p = putHex(out, p, "003300260024001d0020");    // key_share: x25519 entry header
     i = 0;
     while (i < 32) { bytes.write_byte(out, p + i, bytes.read_byte(ephPub, i)); i = i + 1; }
@@ -60,6 +76,32 @@ pub fn buildClientHello(random: ptr, sessionId: ptr, ephPub: ptr, out: ptr): int
     bytes.write_byte(out, 2, (bodyLen >> 8) & 0xff);
     bytes.write_byte(out, 3, bodyLen & 0xff);
     return p;
+}
+
+// Downgrade protection (RFC 8446 section 4.1.3): if a TLS 1.3 client sees the "DOWNGRD" sentinel in the
+// last 8 bytes of the ServerHello random, a middlebox forced a lower version and the client must abort.
+pub fn hasDowngradeSentinel(shMsg: ptr): bool {
+    let tag = "444f574e47524400";                  // "DOWNGRD" + 0x00 (0x01 variant differs only in the last byte)
+    let i = 0;
+    while (i < 7) {
+        if (bytes.read_byte(shMsg, 30 + i) != chNib(tag[i * 2]) * 16 + chNib(tag[i * 2 + 1])) { return false; }
+        i = i + 1;
+    }
+    let last = bytes.read_byte(shMsg, 37);
+    return last == 0 || last == 1;
+}
+
+// A ServerHello is a HelloRetryRequest when its random equals the fixed SHA-256("HelloRetryRequest")
+// sentinel (RFC 8446 section 4.1.3). shMsg is the ServerHello handshake message.
+pub fn isHelloRetryRequest(shMsg: ptr): bool {
+    let hrr = "cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c";
+    let i = 0;
+    while (i < 32) {
+        let want = chNib(hrr[i * 2]) * 16 + chNib(hrr[i * 2 + 1]);
+        if (bytes.read_byte(shMsg, 6 + i) != want) { return false; }   // random starts at offset 6
+        i = i + 1;
+    }
+    return true;
 }
 
 struct TlsClient {
