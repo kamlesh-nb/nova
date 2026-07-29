@@ -212,11 +212,28 @@ pub struct ClientBio impl TlsBio {
                     let i = 0;
                     while (i < take) { bytes.write_byte(buf, i, bytes.read_byte(self.plain, i)); i = i + 1; }
                     return take;
+                } else if (itype == 0x15) {
+                    // Alert (RFC 8446 section 6): close_notify or fatal - either way the peer is done
+                    // sending, so report end-of-stream. The sequence was already advanced by decryptApp.
+                    self.buf.closed = true;
+                    return 0 - 1;
                 }
-                // Post-handshake handshake/alert records (e.g. NewSessionTicket) advance the sequence and are skipped.
+                // Post-handshake handshake records (e.g. NewSessionTicket, KeyUpdate) advance the sequence
+                // and are skipped.
             }
         }
         return 0;
+    }
+
+    // Queue an encrypted close_notify alert (level 1 warning, description 0) for a clean shutdown; the
+    // transport should flush pending output before closing the socket.
+    pub fn closeNotify(self: ClientBio): void {
+        if (self.state == 3) {
+            let out = bytes.alloc(64);
+            let n = self.cl.encryptAlert(1, 0, out);
+            self.buf.appendOut(out, n);
+            bytes.free(out);
+        }
     }
 
     pub fn closeBio(self: ClientBio): void {
@@ -326,6 +343,9 @@ pub struct ServerBio impl TlsBio {
                     let i = 0;
                     while (i < take) { bytes.write_byte(buf, i, bytes.read_byte(self.plain, i)); i = i + 1; }
                     return take;
+                } else if (itype == 0x15) {
+                    self.buf.closed = true;         // client close_notify / fatal alert: end of stream
+                    return 0 - 1;
                 }
             }
         }

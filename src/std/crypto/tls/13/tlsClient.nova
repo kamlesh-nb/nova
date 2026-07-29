@@ -353,6 +353,17 @@ pub fn encryptApp(self: TlsClient, data: ptr, dataLen: int, out: ptr): int {
     return n;
 }
 
+// Encrypt an Alert (RFC 8446 section 6): a 2-byte {level, description} body under the application key
+// with inner content type 0x15. Used to send close_notify (level 1 warning, description 0) at shutdown.
+pub fn encryptAlert(self: TlsClient, level: int, desc: int, out: ptr): int {
+    let a = bytes.alloc(2);
+    bytes.write_byte(a, 0, level); bytes.write_byte(a, 1, desc);
+    let n = tls.recordProtect(self.suite, self.capKey, self.capIv, self.cSeq, a, 2, 0x15, out);
+    self.cSeq = self.cSeq + 1;
+    bytes.free(a);
+    return n;
+}
+
 // Decrypt an application-data record with the server application key. Returns the inner plaintext length
 // (including the trailing content-type byte), or -1 on failure.
 pub fn decryptApp(self: TlsClient, record: ptr, recLen: int, out: ptr): int {
