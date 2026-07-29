@@ -1,0 +1,485 @@
+// TLS 1.2 client (RFC 5246) in pure Nova, no external library (M13). ECDHE key exchange (secp256r1 or
+// x25519) with AES-GCM AEAD cipher suites; the server is authenticated by verifying its ServerKeyExchange
+// signature (RSA PKCS#1 v1.5 or ECDSA-P256) against the leaf certificate's public key. The record layer is
+// RFC 5288 AES-GCM (4-byte implicit salt from the key block + 8-byte explicit per-record nonce). Key
+// derivation uses the TLS 1.2 PRF (crypto/tls/12/prf) with the cipher suite's hash. Extended master secret
+// (RFC 7627) is used when the server agrees. Verified live against openssl s_server -tls1_2.
+import bytes;
+import crypto.tls.12.prf;
+import crypto.hash.sha256;
+import crypto.hash.sha512;
+import crypto.mac.hmac;
+import crypto.aead.aesgcm;
+import crypto.ecc.p256;
+import crypto.ecc.x25519;
+import crypto.rsa;
+import crypto.x509;
+import crypto.random;
+import assert;
+
+// Cipher suites we offer (all ECDHE + AES-GCM).
+const CS_ECDHE_RSA_AES128_GCM: int = 0xc02f;
+const CS_ECDHE_RSA_AES256_GCM: int = 0xc030;
+const CS_ECDHE_ECDSA_AES128_GCM: int = 0xc02b;
+const CS_ECDHE_ECDSA_AES256_GCM: int = 0xc02c;
+
+// Named groups.
+const GRP_SECP256R1: int = 23;
+const GRP_X25519: int = 29;
+
+fn at(b: ptr, off: int): ptr { return (b as long + off) as ptr; }
+fn rd16(b: ptr, o: int): int { return (bytes.read_byte(b, o) << 8) | bytes.read_byte(b, o + 1); }
+fn rd24(b: ptr, o: int): int { return (bytes.read_byte(b, o) << 16) | (bytes.read_byte(b, o + 1) << 8) | bytes.read_byte(b, o + 2); }
+
+pub struct TlsClient12 {
+    pub clientRandom: ptr, pub serverRandom: ptr,
+    pub suite: int, pub prfHash: int, pub keyLen: int, pub isEcdsa: bool,
+    pub group: int,                          // chosen ECDHE group (from ServerKeyExchange)
+    pub ephPriv: ptr, pub ephPub: ptr, pub ephPubLen: int,
+    pub serverEph: ptr, pub serverEphLen: int,
+    pub ems: bool,                           // extended master secret negotiated
+
+    // Leaf-cert public key (copied out of the certificate).
+    pub keyType: int,
+    pub rsaN: ptr, pub rsaNLen: int, pub rsaE: ptr, pub rsaELen: int,
+    pub ecPub: ptr,                          // 65-byte EC point
+
+    pub master: ptr,                         // 48-byte master secret
+    pub cWriteKey: ptr, pub sWriteKey: ptr,
+    pub cIV: ptr, pub sIV: ptr,              // 4-byte GCM salts
+    pub cSeq: ulong, pub sSeq: ulong,
+
+    pub tr: ptr, pub trLen: int, pub trCap: int,   // raw transcript (handshake messages)
+
+    // Append raw handshake-message bytes (including the 4-byte header) to the transcript.
+    pub fn addTr(self: TlsClient12, msg: ptr, n: int): void {
+        if (self.trLen + n > self.trCap) {
+            let nc = (self.trLen + n) * 2;
+            let nb = bytes.alloc(nc);
+            let i = 0;
+            while (i < self.trLen) { bytes.write_byte(nb, i, bytes.read_byte(self.tr, i)); i = i + 1; }
+            bytes.free(self.tr); self.tr = nb; self.trCap = nc;
+        }
+        let i = 0;
+        while (i < n) { bytes.write_byte(self.tr, self.trLen + i, bytes.read_byte(msg, i)); i = i + 1; }
+        self.trLen = self.trLen + n;
+    }
+
+    // Hash the current transcript with the suite PRF hash into out (32 or 48 bytes).
+    pub fn trHash(self: TlsClient12, out: ptr): void {
+        if (self.prfHash == 1) { sha512.hash384Into(self.tr, self.trLen, out); return; }
+        sha256.hashInto(self.tr, self.trLen, out);
+    }
+    fn prfHashLen(self: TlsClient12): int { if (self.prfHash == 1) { return 48; } return 32; }
+
+    // Parse ServerHello (handshake message incl. 4-byte header): pick suite params, server random, and
+    // detect the extended_master_secret extension.
+    pub fn processServerHello(self: TlsClient12, msg: ptr, n: int): void {
+        self.addTr(msg, n);
+        // body starts at 4; layout: version(2) random(32) sidLen(1) sid.. suite(2) comp(1) [extLen(2) exts..]
+        let p = 4 + 2;
+        let i = 0;
+        while (i < 32) { bytes.write_byte(self.serverRandom, i, bytes.read_byte(msg, p + i)); i = i + 1; }
+        p = p + 32;
+        let sidLen = bytes.read_byte(msg, p); p = p + 1 + sidLen;
+        self.suite = rd16(msg, p); p = p + 2;
+        p = p + 1;                               // compression method
+        self.applySuite();
+        // Extensions.
+        if (p + 2 <= n) {
+            let extLen = rd16(msg, p); p = p + 2;
+            let end = p + extLen;
+            while (p + 4 <= end) {
+                let etype = rd16(msg, p);
+                let elen = rd16(msg, p + 2);
+                if (etype == 23) { self.ems = true; }     // extended_master_secret
+                p = p + 4 + elen;
+            }
+        }
+    }
+
+    fn applySuite(self: TlsClient12): void {
+        if (self.suite == CS_ECDHE_RSA_AES256_GCM || self.suite == CS_ECDHE_ECDSA_AES256_GCM) {
+            self.prfHash = 1; self.keyLen = 32;
+        } else {
+            self.prfHash = 0; self.keyLen = 16;
+        }
+        self.isEcdsa = (self.suite == CS_ECDHE_ECDSA_AES128_GCM || self.suite == CS_ECDHE_ECDSA_AES256_GCM);
+    }
+
+    // Parse the Certificate message; extract the leaf public key.
+    pub fn processCertificate(self: TlsClient12, msg: ptr, n: int): void {
+        self.addTr(msg, n);
+        // body: certsLen(3) then [certLen(3) certDer]..
+        let certsLen = rd24(msg, 4);
+        let certLen = rd24(msg, 7);
+        let certOff = 10;
+        let cert = x509.parseCert(at(msg, certOff), certLen);
+        self.keyType = cert.keyType;
+        if (cert.keyType == 0) {                 // RSA
+            self.rsaNLen = cert.rsaNLen; self.rsaN = bytes.alloc(cert.rsaNLen);
+            let i = 0;
+            while (i < cert.rsaNLen) { bytes.write_byte(self.rsaN, i, bytes.read_byte(msg, certOff + cert.rsaNStart + i)); i = i + 1; }
+            self.rsaELen = cert.rsaELen; self.rsaE = bytes.alloc(cert.rsaELen);
+            i = 0;
+            while (i < cert.rsaELen) { bytes.write_byte(self.rsaE, i, bytes.read_byte(msg, certOff + cert.rsaEStart + i)); i = i + 1; }
+        } else {                                 // EC (P-256)
+            self.ecPub = bytes.alloc(65);
+            let i = 0;
+            while (i < 65) { bytes.write_byte(self.ecPub, i, bytes.read_byte(msg, certOff + cert.ecStart + i)); i = i + 1; }
+        }
+    }
+
+    // Parse ServerKeyExchange, verify its signature, and store the server ECDHE public. Returns true iff
+    // the signature over (client_random || server_random || ecdh_params) verifies.
+    pub fn processServerKeyExchange(self: TlsClient12, msg: ptr, n: int): bool {
+        self.addTr(msg, n);
+        let p = 4;
+        let curveType = bytes.read_byte(msg, p); p = p + 1;   // 3 = named_curve
+        self.group = rd16(msg, p); p = p + 2;
+        let pubLen = bytes.read_byte(msg, p);
+        let paramsStart = 4;
+        let paramsLen = 1 + 2 + 1 + pubLen;                   // curve_type, named_curve, len, point
+        self.serverEphLen = pubLen; self.serverEph = bytes.alloc(pubLen);
+        let i = 0;
+        while (i < pubLen) { bytes.write_byte(self.serverEph, i, bytes.read_byte(msg, p + 1 + i)); i = i + 1; }
+        p = p + 1 + pubLen;
+
+        // Signature: sig_hash_alg(2) sigLen(2) sig..
+        let sigHash = bytes.read_byte(msg, p);                // 4=SHA256,5=SHA384,6=SHA512,2=SHA1
+        let sigAlg = bytes.read_byte(msg, p + 1);             // 1=RSA, 3=ECDSA
+        let sigLen = rd16(msg, p + 2);
+        let sigOff = p + 4;
+
+        // signed data = client_random || server_random || ecdh_params
+        let signed = bytes.alloc(64 + paramsLen);
+        i = 0;
+        while (i < 32) { bytes.write_byte(signed, i, bytes.read_byte(self.clientRandom, i)); i = i + 1; }
+        i = 0;
+        while (i < 32) { bytes.write_byte(signed, 32 + i, bytes.read_byte(self.serverRandom, i)); i = i + 1; }
+        i = 0;
+        while (i < paramsLen) { bytes.write_byte(signed, 64 + i, bytes.read_byte(msg, paramsStart + i)); i = i + 1; }
+
+        // hash the signed data
+        let hl = 32; let hid = 0;
+        if (sigHash == 5) { hl = 48; hid = 1; } else if (sigHash == 6) { hl = 64; hid = 2; }
+        let h = bytes.alloc(hl);
+        if (sigHash == 5) { sha512.hash384Into(signed, 64 + paramsLen, h); }
+        else if (sigHash == 6) { sha512.hashInto(signed, 64 + paramsLen, h); }
+        else { sha256.hashInto(signed, 64 + paramsLen, h); }
+
+        let ok = false;
+        if (sigAlg == 1) {
+            ok = rsa.verifyPkcs1(hid, h, at(msg, sigOff), sigLen, self.rsaN, self.rsaNLen, self.rsaE, self.rsaELen);
+        } else {
+            // ECDSA: sig is DER SEQUENCE { INTEGER r, INTEGER s }; P-256 verify uses a 32-byte hash.
+            let r = bytes.alloc(32); let s = bytes.alloc(32);
+            parseEcdsaSig(at(msg, sigOff), sigLen, r, s);
+            let h32 = bytes.alloc(32);
+            i = 0;
+            while (i < 32) { bytes.write_byte(h32, i, bytes.read_byte(h, i)); i = i + 1; }   // leftmost 32 bytes
+            ok = p256.ecdsaVerify(h32, self.ecPub, r, s);
+            bytes.free(r); bytes.free(s); bytes.free(h32);
+        }
+        bytes.free(signed); bytes.free(h);
+        return ok;
+    }
+
+    // After ServerHelloDone: generate our ephemeral, build ClientKeyExchange (added to transcript), compute
+    // the pre-master secret + master secret + key block. Returns the CKE handshake-message length in out.
+    pub fn buildClientKeyExchange(self: TlsClient12, out: ptr): int {
+        // Generate ephemeral on the server-chosen group and the pre-master secret.
+        let pms = bytes.alloc(32);
+        if (self.group == GRP_X25519) {
+            self.ephPriv = bytes.alloc(32); fillRandom(self.ephPriv, 32);
+            let base = bytes.alloc(32); bytes.write_byte(base, 0, 9);
+            self.ephPub = bytes.alloc(32); x25519.scalarMult(self.ephPub, self.ephPriv, base);
+            self.ephPubLen = 32;
+            x25519.scalarMult(pms, self.ephPriv, self.serverEph);
+            bytes.free(base);
+        } else {
+            self.ephPriv = bytes.alloc(32); fillRandom(self.ephPriv, 32);
+            self.ephPub = bytes.alloc(65); p256.derivePublic(self.ephPub, self.ephPriv);
+            self.ephPubLen = 65;
+            p256.ecdh(pms, self.ephPriv, self.serverEph);
+        }
+
+        // ClientKeyExchange handshake message: type(0x10) len(3) pointLen(1) point.
+        let bodyLen = 1 + self.ephPubLen;
+        bytes.write_byte(out, 0, 0x10);
+        bytes.write_byte(out, 1, (bodyLen >> 16) & 0xff); bytes.write_byte(out, 2, (bodyLen >> 8) & 0xff); bytes.write_byte(out, 3, bodyLen & 0xff);
+        bytes.write_byte(out, 4, self.ephPubLen);
+        let i = 0;
+        while (i < self.ephPubLen) { bytes.write_byte(out, 5 + i, bytes.read_byte(self.ephPub, i)); i = i + 1; }
+        let ckeLen = 5 + self.ephPubLen;
+
+        self.deriveKeys(pms);                    // master + key block, BEFORE adding CKE to the transcript for the master (EMS needs CH..CKE)
+        self.addTr(out, ckeLen);
+        // For EMS, session_hash must include CKE; recompute master if EMS.
+        if (self.ems) { self.deriveMasterEms(pms); self.deriveKeyBlock(); }
+        bytes.free(pms);
+        return ckeLen;
+    }
+
+    // Standard master secret (non-EMS) + key block.
+    fn deriveKeys(self: TlsClient12, pms: ptr): void {
+        if (!self.ems) {
+            let seed = bytes.alloc(64);
+            let i = 0;
+            while (i < 32) { bytes.write_byte(seed, i, bytes.read_byte(self.clientRandom, i)); i = i + 1; }
+            i = 0;
+            while (i < 32) { bytes.write_byte(seed, 32 + i, bytes.read_byte(self.serverRandom, i)); i = i + 1; }
+            let label = labelBuf("master secret");
+            prf.prf(self.prfHash, pms, 32, label, 13, seed, 64, self.master, 48);
+            bytes.free(seed); bytes.free(label);
+            self.deriveKeyBlock();
+        }
+    }
+
+    fn deriveMasterEms(self: TlsClient12, pms: ptr): void {
+        let sh = bytes.alloc(self.prfHashLen());
+        self.trHash(sh);                         // session_hash over CH..CKE
+        let label = labelBuf("extended master secret");
+        prf.prf(self.prfHash, pms, 32, label, 22, sh, self.prfHashLen(), self.master, 48);
+        bytes.free(sh); bytes.free(label);
+    }
+
+    // key_block = PRF(master, "key expansion", server_random || client_random). For GCM: no MAC keys;
+    // client_write_key || server_write_key || client_IV(4) || server_IV(4).
+    fn deriveKeyBlock(self: TlsClient12): void {
+        let seed = bytes.alloc(64);
+        let i = 0;
+        while (i < 32) { bytes.write_byte(seed, i, bytes.read_byte(self.serverRandom, i)); i = i + 1; }
+        i = 0;
+        while (i < 32) { bytes.write_byte(seed, 32 + i, bytes.read_byte(self.clientRandom, i)); i = i + 1; }
+        let need = self.keyLen * 2 + 8;
+        let kb = bytes.alloc(need);
+        let label = labelBuf("key expansion");
+        prf.prf(self.prfHash, self.master, 48, label, 13, seed, 64, kb, need);
+        self.cWriteKey = bytes.alloc(self.keyLen); self.sWriteKey = bytes.alloc(self.keyLen);
+        self.cIV = bytes.alloc(4); self.sIV = bytes.alloc(4);
+        i = 0;
+        while (i < self.keyLen) { bytes.write_byte(self.cWriteKey, i, bytes.read_byte(kb, i)); i = i + 1; }
+        i = 0;
+        while (i < self.keyLen) { bytes.write_byte(self.sWriteKey, i, bytes.read_byte(kb, self.keyLen + i)); i = i + 1; }
+        i = 0;
+        while (i < 4) { bytes.write_byte(self.cIV, i, bytes.read_byte(kb, self.keyLen * 2 + i)); i = i + 1; }
+        i = 0;
+        while (i < 4) { bytes.write_byte(self.sIV, i, bytes.read_byte(kb, self.keyLen * 2 + 4 + i)); i = i + 1; }
+        bytes.free(seed); bytes.free(kb); bytes.free(label);
+    }
+
+    // client verify_data = PRF(master, "client finished", trHash(CH..CKE), 12). Call BEFORE adding the
+    // client Finished message to the transcript.
+    pub fn clientVerifyData(self: TlsClient12, out12: ptr): void {
+        let h = bytes.alloc(self.prfHashLen());
+        self.trHash(h);
+        let label = labelBuf("client finished");
+        prf.prf(self.prfHash, self.master, 48, label, 15, h, self.prfHashLen(), out12, 12);
+        bytes.free(h); bytes.free(label);
+    }
+
+    // server verify_data check = PRF(master, "server finished", trHash(CH..client Finished), 12). Call
+    // AFTER adding the client Finished message to the transcript.
+    pub fn serverVerifyData(self: TlsClient12, out12: ptr): void {
+        let h = bytes.alloc(self.prfHashLen());
+        self.trHash(h);
+        let label = labelBuf("server finished");
+        prf.prf(self.prfHash, self.master, 48, label, 15, h, self.prfHashLen(), out12, 12);
+        bytes.free(h); bytes.free(label);
+    }
+
+    // AES-GCM seal of one record fragment. out = explicit_nonce(8) || ciphertext || tag(16). ctype is the
+    // record content type used in the AAD. Returns the fragment length.
+    pub fn sealRecord(self: TlsClient12, ctype: int, pt: ptr, ptLen: int, out: ptr): int {
+        let nonce = bytes.alloc(12);
+        let i = 0;
+        while (i < 4) { bytes.write_byte(nonce, i, bytes.read_byte(self.cIV, i)); i = i + 1; }
+        writeU64(nonce, 4, self.cSeq);
+        // explicit nonce = the 8-byte sequence number
+        i = 0;
+        while (i < 8) { bytes.write_byte(out, i, bytes.read_byte(nonce, 4 + i)); i = i + 1; }
+        let aad = bytes.alloc(13);
+        writeU64(aad, 0, self.cSeq);
+        bytes.write_byte(aad, 8, ctype); bytes.write_byte(aad, 9, 0x03); bytes.write_byte(aad, 10, 0x03);
+        bytes.write_byte(aad, 11, (ptLen >> 8) & 0xff); bytes.write_byte(aad, 12, ptLen & 0xff);
+        let tag = bytes.alloc(16);
+        aesgcm.seal(self.cWriteKey, self.keyLen, nonce, 12, aad, 13, pt, ptLen, at(out, 8), tag);
+        i = 0;
+        while (i < 16) { bytes.write_byte(out, 8 + ptLen + i, bytes.read_byte(tag, i)); i = i + 1; }
+        self.cSeq = self.cSeq + 1;
+        bytes.free(nonce); bytes.free(aad); bytes.free(tag);
+        return 8 + ptLen + 16;
+    }
+
+    // AES-GCM open of one record fragment (explicit_nonce(8) || ct || tag(16)). Returns plaintext length or -1.
+    pub fn openRecord(self: TlsClient12, ctype: int, frag: ptr, fragLen: int, out: ptr): int {
+        let ctLen = fragLen - 8 - 16;
+        if (ctLen < 0) { return 0 - 1; }
+        let nonce = bytes.alloc(12);
+        let i = 0;
+        while (i < 4) { bytes.write_byte(nonce, i, bytes.read_byte(self.sIV, i)); i = i + 1; }
+        i = 0;
+        while (i < 8) { bytes.write_byte(nonce, 4 + i, bytes.read_byte(frag, i)); i = i + 1; }   // explicit nonce
+        let aad = bytes.alloc(13);
+        writeU64(aad, 0, self.sSeq);
+        bytes.write_byte(aad, 8, ctype); bytes.write_byte(aad, 9, 0x03); bytes.write_byte(aad, 10, 0x03);
+        bytes.write_byte(aad, 11, (ctLen >> 8) & 0xff); bytes.write_byte(aad, 12, ctLen & 0xff);
+        let tag = bytes.alloc(16);
+        i = 0;
+        while (i < 16) { bytes.write_byte(tag, i, bytes.read_byte(frag, 8 + ctLen + i)); i = i + 1; }
+        let ok = aesgcm.open(self.sWriteKey, self.keyLen, nonce, 12, aad, 13, at(frag, 8), ctLen, tag, out);
+        self.sSeq = self.sSeq + 1;
+        bytes.free(nonce); bytes.free(aad); bytes.free(tag);
+        if (!ok) { return 0 - 1; }
+        return ctLen;
+    }
+}
+
+fn writeU64(b: ptr, o: int, v: ulong): void {
+    let i = 0;
+    while (i < 8) { bytes.write_byte(b, o + i, ((v >> (((7 - i) * 8) as ulong)) & 0xff) as int); i = i + 1; }
+}
+
+fn fillRandom(buf: ptr, n: int): void {
+    let s = random.randomBytes(n);
+    let i = 0;
+    while (i < n) { bytes.write_byte(buf, i, s[i] & 0xff); i = i + 1; }
+}
+
+fn labelBuf(s: string): ptr {
+    let b = bytes.alloc(s.length);
+    let i = 0;
+    while (i < s.length) { bytes.write_byte(b, i, s[i]); i = i + 1; }
+    return b;
+}
+
+// Parse a DER ECDSA-Sig-Value (SEQUENCE { INTEGER r, INTEGER s }) into 32-byte big-endian r, s.
+fn parseEcdsaSig(sig: ptr, sigLen: int, rOut: ptr, sOut: ptr): void {
+    // SEQUENCE header
+    let p = 2;                                   // skip 0x30, len
+    if (bytes.read_byte(sig, 1) >= 0x80) { p = 2 + (bytes.read_byte(sig, 1) & 0x7f); }
+    // INTEGER r
+    let rLen = bytes.read_byte(sig, p + 1);
+    let rStart = p + 2;
+    copyIntTo32(sig, rStart, rLen, rOut);
+    let sPos = rStart + rLen;
+    let sLen = bytes.read_byte(sig, sPos + 1);
+    let sStart = sPos + 2;
+    copyIntTo32(sig, sStart, sLen, sOut);
+}
+fn copyIntTo32(buf: ptr, start: int, len: int, out: ptr): void {
+    let i = 0;
+    while (i < 32) { bytes.write_byte(out, i, 0); i = i + 1; }
+    let take = len; let src = start;
+    if (take > 32) { src = start + (take - 32); take = 32; }   // strip leading 0x00
+    let pad = 32 - take;
+    i = 0;
+    while (i < take) { bytes.write_byte(out, pad + i, bytes.read_byte(buf, src + i)); i = i + 1; }
+}
+
+// Build the ClientHello handshake message (offering ECDHE + AES-GCM suites, SNI, supported_groups,
+// signature_algorithms, ec_point_formats, extended_master_secret, renegotiation_info). Returns its length.
+pub fn buildClientHello(clientRandom: ptr, host: string, out: ptr): int {
+    let p = 0;
+    // handshake header filled at the end
+    let body = 4;
+    bytes.write_byte(out, body, 0x03); bytes.write_byte(out, body + 1, 0x03);   // client_version TLS 1.2
+    let q = body + 2;
+    let i = 0;
+    while (i < 32) { bytes.write_byte(out, q + i, bytes.read_byte(clientRandom, i)); i = i + 1; }
+    q = q + 32;
+    bytes.write_byte(out, q, 0); q = q + 1;      // session_id length 0
+    // cipher suites (4 suites)
+    bytes.write_byte(out, q, 0); bytes.write_byte(out, q + 1, 8); q = q + 2;
+    writeU16(out, q, CS_ECDHE_ECDSA_AES256_GCM); q = q + 2;
+    writeU16(out, q, CS_ECDHE_RSA_AES256_GCM); q = q + 2;
+    writeU16(out, q, CS_ECDHE_ECDSA_AES128_GCM); q = q + 2;
+    writeU16(out, q, CS_ECDHE_RSA_AES128_GCM); q = q + 2;
+    bytes.write_byte(out, q, 1); bytes.write_byte(out, q + 1, 0); q = q + 2;   // compression: null
+
+    // Extensions.
+    let extLenPos = q; q = q + 2;
+    // server_name (SNI)
+    writeU16(out, q, 0); q = q + 2;              // type 0
+    let snLen = host.length;
+    writeU16(out, q, snLen + 5); q = q + 2;      // ext data len
+    writeU16(out, q, snLen + 3); q = q + 2;      // server_name_list len
+    bytes.write_byte(out, q, 0); q = q + 1;      // name_type host_name
+    writeU16(out, q, snLen); q = q + 2;
+    i = 0;
+    while (i < snLen) { bytes.write_byte(out, q + i, host[i]); i = i + 1; }
+    q = q + snLen;
+    // supported_groups: x25519, secp256r1
+    writeU16(out, q, 10); q = q + 2;
+    writeU16(out, q, 6); q = q + 2;
+    writeU16(out, q, 4); q = q + 2;
+    writeU16(out, q, GRP_X25519); q = q + 2;
+    writeU16(out, q, GRP_SECP256R1); q = q + 2;
+    // ec_point_formats: uncompressed
+    writeU16(out, q, 11); q = q + 2;
+    writeU16(out, q, 2); q = q + 2;
+    bytes.write_byte(out, q, 1); bytes.write_byte(out, q + 1, 0); q = q + 2;
+    // signature_algorithms: rsa/ecdsa with sha256/384/512
+    writeU16(out, q, 13); q = q + 2;
+    writeU16(out, q, 14); q = q + 2;
+    writeU16(out, q, 12); q = q + 2;
+    writeU16(out, q, 0x0403); q = q + 2;         // ecdsa_secp256r1_sha256
+    writeU16(out, q, 0x0503); q = q + 2;         // ecdsa_sha384
+    writeU16(out, q, 0x0603); q = q + 2;         // ecdsa_sha512
+    writeU16(out, q, 0x0401); q = q + 2;         // rsa_pkcs1_sha256
+    writeU16(out, q, 0x0501); q = q + 2;         // rsa_pkcs1_sha384
+    writeU16(out, q, 0x0601); q = q + 2;         // rsa_pkcs1_sha512
+    // extended_master_secret (empty)
+    writeU16(out, q, 23); q = q + 2; writeU16(out, q, 0); q = q + 2;
+    // renegotiation_info (empty)
+    writeU16(out, q, 0xff01); q = q + 2; writeU16(out, q, 1); q = q + 2; bytes.write_byte(out, q, 0); q = q + 1;
+
+    let extLen = q - (extLenPos + 2);
+    writeU16(out, extLenPos, extLen);
+
+    let bodyLen = q - body;
+    bytes.write_byte(out, 0, 0x01);
+    bytes.write_byte(out, 1, (bodyLen >> 16) & 0xff); bytes.write_byte(out, 2, (bodyLen >> 8) & 0xff); bytes.write_byte(out, 3, bodyLen & 0xff);
+    return q;
+}
+
+fn writeU16(b: ptr, o: int, v: int): void { bytes.write_byte(b, o, (v >> 8) & 0xff); bytes.write_byte(b, o + 1, v & 0xff); }
+
+pub fn newClient12(): TlsClient12 {
+    return TlsClient12 {
+        clientRandom: bytes.alloc(32), serverRandom: bytes.alloc(32),
+        suite: 0, prfHash: 0, keyLen: 16, isEcdsa: false, group: 0,
+        ephPriv: bytes.alloc(1), ephPub: bytes.alloc(1), ephPubLen: 0, serverEph: bytes.alloc(1), serverEphLen: 0,
+        ems: false, keyType: -1, rsaN: bytes.alloc(1), rsaNLen: 0, rsaE: bytes.alloc(1), rsaELen: 0, ecPub: bytes.alloc(65),
+        master: bytes.alloc(48), cWriteKey: bytes.alloc(1), sWriteKey: bytes.alloc(1),
+        cIV: bytes.alloc(4), sIV: bytes.alloc(4), cSeq: 0, sSeq: 0,
+        tr: bytes.alloc(8192), trLen: 0, trCap: 8192,
+    };
+}
+
+// Record-layer round trip (self-consistency): seal then open reproduces the plaintext under matched keys.
+@test
+fn test_gcm_record_roundtrip(): void {
+    let c = newClient12();
+    c.keyLen = 16;
+    let k = 0;
+    while (k < 16) { bytes.write_byte(c.cWriteKey, k, k); bytes.write_byte(c.sWriteKey, k, k); k = k + 1; }
+    k = 0;
+    while (k < 4) { bytes.write_byte(c.cIV, k, 0x10 + k); bytes.write_byte(c.sIV, k, 0x10 + k); k = k + 1; }
+    let pt = labelBuf("hello record layer");
+    let rec = bytes.alloc(64);
+    let m = c.sealRecord(0x17, pt, 18, rec);
+    // decode with the "server" side keys (same key/IV/seq here) via a second client mirrored
+    let d = newClient12();
+    d.keyLen = 16;
+    k = 0;
+    while (k < 16) { bytes.write_byte(d.sWriteKey, k, k); k = k + 1; }
+    k = 0;
+    while (k < 4) { bytes.write_byte(d.sIV, k, 0x10 + k); k = k + 1; }
+    let out = bytes.alloc(64);
+    let pl = d.openRecord(0x17, rec, m, out);
+    assert.equalInt(pl, 18);
+    let i = 0;
+    while (i < 18) { assert.equalInt(bytes.read_byte(out, i), bytes.read_byte(pt, i)); i = i + 1; }
+}

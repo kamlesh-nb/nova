@@ -1,0 +1,130 @@
+// A live TLS 1.2 client in pure Nova (RFC 5246), no external crypto library, over a blocking socket.
+// Completes a real ECDHE handshake against openssl s_server -tls1_2, authenticates the server by
+// verifying its ServerKeyExchange signature, and exchanges AES-GCM-protected application data.
+// Verified across ECDHE-RSA / ECDHE-ECDSA, AES-128/256-GCM, SHA-256/384, secp256r1 / x25519:
+//
+//   openssl s_server -accept 127.0.0.1:4433 -cert rsa.crt -key rsa.key -tls1_2 \
+//     -cipher ECDHE-RSA-AES128-GCM-SHA256 -www -quiet
+//   nova examples/tls12_client.nova -o cli12 && ./cli12
+import os.sys;
+import net.reactorio;
+import crypto.tls.12.tlsClient;
+import crypto.random;
+import bytes;
+
+fn at(b: ptr, off: int): ptr { return (b as long + off) as ptr; }
+fn logS(s: string): void { let b=bytes.alloc(s.length+1); let i=0; while(i<s.length){bytes.write_byte(b,i,s[i]);i=i+1;} bytes.write_byte(b,s.length,10); sys.write(1,b,(s.length+1) as long); bytes.free(b); }
+fn readN(fd: int, buf: ptr, off: int, n: int): int {
+    let got = 0;
+    while (got < n) { let r = sys.read(fd, at(buf, off+got), (n-got) as long); if (r <= 0) { return -1; } got = got + (r as int); }
+    return 0;
+}
+fn readRecord(fd: int, buf: ptr): int {
+    if (readN(fd, buf, 0, 5) != 0) { return -1; }
+    let len = (bytes.read_byte(buf,3) << 8) | bytes.read_byte(buf,4);
+    if (readN(fd, buf, 5, len) != 0) { return -1; }
+    return 5 + len;
+}
+fn writeAll(fd: int, buf: ptr, n: int): void { let s=0; while(s<n){ let w=sys.write(fd, at(buf,s), (n-s) as long); if(w<=0){return;} s=s+(w as int);} }
+fn wrapRec(ctype: int, body: ptr, bodyLen: int, out: ptr): int {
+    bytes.write_byte(out,0,ctype); bytes.write_byte(out,1,0x03); bytes.write_byte(out,2,0x03);
+    bytes.write_byte(out,3,(bodyLen>>8)&0xff); bytes.write_byte(out,4,bodyLen&0xff);
+    let i=0; while(i<bodyLen){bytes.write_byte(out,5+i,bytes.read_byte(body,i));i=i+1;}
+    return 5+bodyLen;
+}
+
+fn main(): int {
+    let fd = sys.socket(sys.AF_INET, sys.SOCK_STREAM, 0);
+    let sa = sys.makeSockaddrIn(4433, reactorio.parseIPv4("127.0.0.1"));
+    if (sys.connect(fd, sa, 16) != 0) { logS("connect failed"); return 1; }
+    let c = tlsClient.newClient12();
+    fillRnd(c.clientRandom, 32);
+
+    // ClientHello
+    let ch = bytes.alloc(512);
+    let chLen = tlsClient.buildClientHello(c.clientRandom, "localhost", ch);
+    c.addTr(ch, chLen);
+    let rec = bytes.alloc(1024);
+    writeAll(fd, rec, wrapRec(0x16, ch, chLen, rec));
+    logS("sent ClientHello");
+
+    // Read server flight, split handshake messages, until ServerHelloDone (0x0e).
+    let buf = bytes.alloc(32768);
+    let hs = bytes.alloc(32768); let hsLen = 0; let consumed = 0;
+    let sawDone = false;
+    while (!sawDone) {
+        let n = readRecord(fd, buf);
+        if (n < 0) { logS("EOF in flight"); return 1; }
+        if (bytes.read_byte(buf,0) != 0x16) { continue; }
+        let plen = n - 5; let i = 0;
+        while (i < plen) { bytes.write_byte(hs, hsLen+i, bytes.read_byte(buf, 5+i)); i = i + 1; }
+        hsLen = hsLen + plen;
+        // extract only NOT-yet-consumed complete handshake messages
+        let more = true;
+        while (more && consumed + 4 <= hsLen) {
+            let p = consumed;
+            let mt = bytes.read_byte(hs, p);
+            let ml = (bytes.read_byte(hs,p+1)<<16)|(bytes.read_byte(hs,p+2)<<8)|bytes.read_byte(hs,p+3);
+            if (p + 4 + ml > hsLen) { more = false; }   // incomplete, wait for more
+            else {
+                let msg = at(hs, p);
+                if (mt == 0x02) { c.processServerHello(msg, 4+ml); logS("got ServerHello"); }
+                else if (mt == 0x0b) { c.processCertificate(msg, 4+ml); logS("got Certificate"); }
+                else if (mt == 0x0c) { if (!c.processServerKeyExchange(msg, 4+ml)) { logS("SKE SIGNATURE INVALID"); return 1; } logS("got ServerKeyExchange (sig OK)"); }
+                else if (mt == 0x0e) { c.addTr(msg, 4+ml); sawDone = true; logS("got ServerHelloDone"); }
+                consumed = consumed + 4 + ml;
+            }
+        }
+    }
+
+    // ClientKeyExchange
+    let cke = bytes.alloc(256);
+    let ckeLen = c.buildClientKeyExchange(cke);
+    writeAll(fd, rec, wrapRec(0x16, cke, ckeLen, rec));
+    // ChangeCipherSpec
+    let ccs = bytes.alloc(1); bytes.write_byte(ccs,0,1);
+    writeAll(fd, rec, wrapRec(0x14, ccs, 1, rec));
+    // Finished (encrypted)
+    let vd = bytes.alloc(12); c.clientVerifyData(vd);
+    let finMsg = bytes.alloc(16);
+    bytes.write_byte(finMsg,0,0x14); bytes.write_byte(finMsg,1,0); bytes.write_byte(finMsg,2,0); bytes.write_byte(finMsg,3,0x0c);
+    let i=0; while(i<12){bytes.write_byte(finMsg,4+i,bytes.read_byte(vd,i));i=i+1;}
+    c.addTr(finMsg, 16);
+    let svd = bytes.alloc(12); c.serverVerifyData(svd);
+    let encFin = bytes.alloc(64);
+    let efLen = c.sealRecord(0x16, finMsg, 16, encFin);
+    writeAll(fd, rec, wrapRec(0x16, encFin, efLen, rec));
+    logS("sent ClientKeyExchange + CCS + Finished");
+
+    // Server CCS + Finished
+    let n2 = readRecord(fd, buf);
+    while (n2 > 0 && bytes.read_byte(buf,0) == 0x14) { n2 = readRecord(fd, buf); }
+    if (n2 < 0) { logS("EOF before server Finished"); return 1; }
+    let sfin = bytes.alloc(64);
+    let sfl = c.openRecord(0x16, at(buf,5), n2-5, sfin);
+    if (sfl < 0) { logS("server Finished DECRYPT FAILED"); return 1; }
+    let okmatch = true;
+    i = 0; while(i<12){ if(bytes.read_byte(sfin,4+i)!=bytes.read_byte(svd,i)){okmatch=false;} i=i+1; }
+    if (!okmatch) { logS("server Finished verify_data MISMATCH"); return 1; }
+    logS("TLS 1.2 handshake COMPLETE, server Finished verified");
+
+    // App data
+    let req = "GET / HTTP/1.0\r\nHost: localhost\r\n\r\n";
+    let rb = bytes.alloc(req.length); i=0; while(i<req.length){bytes.write_byte(rb,i,req[i]);i=i+1;}
+    let enc = bytes.alloc(256);
+    let el = c.sealRecord(0x17, rb, req.length, enc);
+    writeAll(fd, rec, wrapRec(0x17, enc, el, rec));
+    let out = bytes.alloc(32768);
+    let g = 0;
+    while (g < 40) {
+        let m = readRecord(fd, buf);
+        if (m < 0) { return 0; }
+        if (bytes.read_byte(buf,0) == 0x17) {
+            let pl = c.openRecord(0x17, at(buf,5), m-5, out);
+            if (pl > 0) { logS("--- decrypted response ---"); let show=pl; if(show>50){show=50;} sys.write(1,out,show as long); return 0; }
+        }
+        g = g + 1;
+    }
+    return 0;
+}
+fn fillRnd(b: ptr, n: int): void { let s=random.randomBytes(n); let i=0; while(i<n){bytes.write_byte(b,i,s[i]&0xff);i=i+1;} }

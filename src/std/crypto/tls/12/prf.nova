@@ -1,0 +1,88 @@
+// TLS 1.2 pseudo-random function (RFC 5246 section 5) in pure Nova. PRF(secret, label, seed) =
+// P_hash(secret, label || seed), where P_hash iterates HMAC over A(i) = HMAC(secret, A(i-1)), A(0) = seed:
+//   P_hash = HMAC(secret, A(1)||seed) | HMAC(secret, A(2)||seed) | ...
+// TLS 1.2 uses the cipher-suite PRF hash: SHA-256 for the *_SHA256 suites, SHA-384 for *_SHA384.
+// Verified against the well-known IETF TLS 1.2 PRF-SHA256 test vector (see the KAT).
+import bytes;
+import crypto.mac.hmac;
+import assert;
+
+// hashId: 0 = SHA-256 (32-byte HMAC), 1 = SHA-384 (48-byte HMAC).
+fn hLen(hashId: int): int { if (hashId == 1) { return 48; } return 32; }
+
+fn hmacInto(hashId: int, key: ptr, keyLen: int, msg: ptr, msgLen: int, out: ptr): void {
+    if (hashId == 1) { hmac.hmacSha384(key, keyLen, msg, msgLen, out); return; }
+    hmac.hmacSha256(key, keyLen, msg, msgLen, out);
+}
+
+// PRF(secret, label, seed) -> out[0..outLen). label and seed are concatenated as the P_hash seed.
+pub fn prf(hashId: int, secret: ptr, secretLen: int, label: ptr, labelLen: int,
+           seed: ptr, seedLen: int, out: ptr, outLen: int): void {
+    let hl = hLen(hashId);
+    // fullSeed = label || seed.
+    let fsLen = labelLen + seedLen;
+    let fullSeed = bytes.alloc(fsLen);
+    let i = 0;
+    while (i < labelLen) { bytes.write_byte(fullSeed, i, bytes.read_byte(label, i)); i = i + 1; }
+    i = 0;
+    while (i < seedLen) { bytes.write_byte(fullSeed, labelLen + i, bytes.read_byte(seed, i)); i = i + 1; }
+
+    // A(1) = HMAC(secret, fullSeed).
+    let a = bytes.alloc(hl);
+    hmacInto(hashId, secret, secretLen, fullSeed, fsLen, a);
+
+    // block input = A(i) || fullSeed.
+    let blk = bytes.alloc(hl + fsLen);
+    let digest = bytes.alloc(hl);
+    let produced = 0;
+    while (produced < outLen) {
+        // blk = A || fullSeed.
+        i = 0;
+        while (i < hl) { bytes.write_byte(blk, i, bytes.read_byte(a, i)); i = i + 1; }
+        i = 0;
+        while (i < fsLen) { bytes.write_byte(blk, hl + i, bytes.read_byte(fullSeed, i)); i = i + 1; }
+        hmacInto(hashId, secret, secretLen, blk, hl + fsLen, digest);
+        let take = hl;
+        if (produced + take > outLen) { take = outLen - produced; }
+        i = 0;
+        while (i < take) { bytes.write_byte(out, produced + i, bytes.read_byte(digest, i)); i = i + 1; }
+        produced = produced + hl;
+        // A(i+1) = HMAC(secret, A(i)).
+        hmacInto(hashId, secret, secretLen, a, hl, a);
+    }
+    bytes.free(fullSeed); bytes.free(a); bytes.free(blk); bytes.free(digest);
+}
+
+fn hexNib(c: int): int { if (c >= 48 && c <= 57) { return c - 48; } if (c >= 97 && c <= 102) { return c - 87; } return 0; }
+fn hexBuf(hex: string): ptr {
+    let n = hex.length / 2;
+    let b = bytes.alloc(n);
+    let i = 0;
+    while (i < n) { bytes.write_byte(b, i, hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1])); i = i + 1; }
+    return b;
+}
+fn eqHex(buf: ptr, n: int, hex: string): bool {
+    if (hex.length != n * 2) { return false; }
+    let i = 0;
+    while (i < n) {
+        if (bytes.read_byte(buf, i) != hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1])) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// IETF TLS 1.2 PRF-SHA256 test vector (secret/label/seed -> 100-byte output).
+const PRF_KAT: string = "e3f229ba727be17b8d122620557cd453c2aab21d07c3d495329b52d4e61edb5a6b301791e90d35c9c9a46b4e14baf9af0fa022f7077def17abfd3797c0564bab4fbc91666e9def9b97fce34f796789baa48082d122ee42c5a72e5a5110fff70187347b66";
+
+@test
+fn test_prf_sha256_kat(): void {
+    let secret = hexBuf("9bbe436ba940f017b17652849a71db35");
+    let label = "test label";
+    let labelBuf = bytes.alloc(label.length);
+    let i = 0;
+    while (i < label.length) { bytes.write_byte(labelBuf, i, label[i]); i = i + 1; }
+    let seed = hexBuf("a0ba9f936cda311827a6f796ffd5198c");
+    let out = bytes.alloc(100);
+    prf(0, secret, 16, labelBuf, label.length, seed, 16, out, 100);
+    assert.isTrue(eqHex(out, 100, PRF_KAT));
+}
