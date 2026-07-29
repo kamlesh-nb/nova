@@ -1,0 +1,383 @@
+// RSA signature verification (RSASSA-PKCS1-v1_5 and RSASSA-PSS) in Nova, no external library
+// (M9 phase C). RSA verification uses only public data (the public key and the signature), so it need
+// not be constant-time.
+//
+// The core is modular exponentiation s^e mod N over a runtime-sized modulus (2048/3072/4096-bit). N is
+// k 32-bit limbs (little-endian); the multiply is the same CIOS Montgomery routine as p256 generalised
+// to a runtime modulus and n0' (computed from N[0] by Newton's iteration). Conversion into Montgomery
+// form is by 32*k successive doublings mod N (done a couple of times per verify, so speed is a non-issue,
+// and it avoids needing a precomputed R^2 mod N). The public exponent is small (usually 65537), so the
+// exponentiation itself is a handful of squarings.
+//
+// PKCS#1 v1.5 checks EM = 0x00 || 0x01 || 0xFF.. || 0x00 || DigestInfo || hash. PSS runs EMSA-PSS-VERIFY
+// with MGF1 and salt length equal to the hash length (the TLS 1.3 rsa_pss_rsae_* convention).
+//
+// References: PKCS#1 v2.2 (RFC 8017), the standard Montgomery CIOS algorithm. Verified against OpenSSL.
+import bytes;
+import crypto.sha256;
+import crypto.sha512;
+
+const MASK32: ulong = 0xffffffff;
+const U0: ulong = 0;
+const U1: ulong = 1;
+const TWO: ulong = 2;
+
+fn getw(f: ptr, i: int): ulong { return (bytes.read_ptr(f, i * 8) as long) as ulong; }
+fn setw(f: ptr, i: int, v: ulong): void { bytes.write_ptr(f, i * 8, (v as long) as ptr); }
+
+fn bnCopy(out: ptr, a: ptr, k: int): void {
+    let i = 0;
+    while (i < k) { setw(out, i, getw(a, i)); i = i + 1; }
+}
+
+fn bnFromBE(out: ptr, buf: ptr, off: int, k: int): void {
+    let i = 0;
+    while (i < k) {
+        let base = off + (k - 1 - i) * 4;
+        let w = ((bytes.read_byte(buf, base) as ulong) << 24)
+              | ((bytes.read_byte(buf, base + 1) as ulong) << 16)
+              | ((bytes.read_byte(buf, base + 2) as ulong) << 8)
+              | (bytes.read_byte(buf, base + 3) as ulong);
+        setw(out, i, w);
+        i = i + 1;
+    }
+}
+
+fn bnToBE(buf: ptr, off: int, a: ptr, k: int): void {
+    let i = 0;
+    while (i < k) {
+        let base = off + (k - 1 - i) * 4;
+        let w = getw(a, i);
+        bytes.write_byte(buf, base, ((w >> 24) & 0xff) as int);
+        bytes.write_byte(buf, base + 1, ((w >> 16) & 0xff) as int);
+        bytes.write_byte(buf, base + 2, ((w >> 8) & 0xff) as int);
+        bytes.write_byte(buf, base + 3, (w & 0xff) as int);
+        i = i + 1;
+    }
+}
+
+// n0' = -N^-1 mod 2^32, via Newton's iteration on the least-significant limb.
+fn bnN0inv(N: ptr): ulong {
+    let n0 = getw(N, 0);
+    let inv: ulong = 1;
+    let i = 0;
+    while (i < 40) { inv = (inv * (TWO - n0 * inv)) & MASK32; i = i + 1; }
+    return (U0 - inv) & MASK32;
+}
+
+fn bnLt(a: ptr, b: ptr, k: int): bool {         // is a < b?
+    let borrow: ulong = 0;
+    let j = 0;
+    while (j < k) {
+        let x = getw(a, j) - getw(b, j) - borrow;
+        borrow = (x >> 32) & U1;
+        j = j + 1;
+    }
+    return borrow == U1;
+}
+
+// t has k+1 limbs and t < 2N; write t-N if t >= N else t, into out[0..k-1].
+fn bnCondSubN(out: ptr, t: ptr, N: ptr, k: int): void {
+    let d = bytes.alloc(k * 8);
+    let borrow: ulong = 0;
+    let j = 0;
+    while (j < k) {
+        let x = getw(t, j) - getw(N, j) - borrow;
+        setw(d, j, x & MASK32);
+        borrow = (x >> 32) & U1;
+        j = j + 1;
+    }
+    let xk = getw(t, k) - borrow;
+    borrow = (xk >> 32) & U1;
+    let mask = U0 - (borrow ^ U1);              // all ones when t >= N
+    j = 0;
+    while (j < k) {
+        setw(out, j, (getw(d, j) & mask) | (getw(t, j) & (~mask)));
+        j = j + 1;
+    }
+    bytes.free(d);
+}
+
+fn bnAddModN(out: ptr, a: ptr, b: ptr, N: ptr, k: int): void {
+    let t = bytes.alloc((k + 1) * 8);
+    let carry: ulong = 0;
+    let j = 0;
+    while (j < k) {
+        let s = getw(a, j) + getw(b, j) + carry;
+        setw(t, j, s & MASK32);
+        carry = s >> 32;
+        j = j + 1;
+    }
+    setw(t, k, carry);
+    bnCondSubN(out, t, N, k);
+    bytes.free(t);
+}
+
+// CIOS Montgomery multiply: out = a*b*R^-1 mod N, R = 2^(32k). Inputs and output are canonical (< N).
+fn bnMontMul(out: ptr, a: ptr, b: ptr, N: ptr, k: int, n0inv: ulong): void {
+    let t = bytes.alloc((k + 2) * 8);
+    let j = 0;
+    while (j < k + 2) { setw(t, j, U0); j = j + 1; }
+    let i = 0;
+    while (i < k) {
+        let bi = getw(b, i);
+        let carry: ulong = 0;
+        j = 0;
+        while (j < k) {
+            let s = getw(t, j) + getw(a, j) * bi + carry;
+            setw(t, j, s & MASK32);
+            carry = s >> 32;
+            j = j + 1;
+        }
+        let sk = getw(t, k) + carry;
+        setw(t, k, sk & MASK32);
+        setw(t, k + 1, sk >> 32);
+        let m = (getw(t, 0) * n0inv) & MASK32;
+        let c2 = (getw(t, 0) + m * getw(N, 0)) >> 32;
+        j = 1;
+        while (j < k) {
+            let s = getw(t, j) + m * getw(N, j) + c2;
+            setw(t, j - 1, s & MASK32);
+            c2 = s >> 32;
+            j = j + 1;
+        }
+        let sk2 = getw(t, k) + c2;
+        setw(t, k - 1, sk2 & MASK32);
+        setw(t, k, getw(t, k + 1) + (sk2 >> 32));
+        i = i + 1;
+    }
+    bnCondSubN(out, t, N, k);
+    bytes.free(t);
+}
+
+fn bnSetOne(out: ptr, k: int): void {
+    let j = 0;
+    while (j < k) { setw(out, j, U0); j = j + 1; }
+    setw(out, 0, U1);
+}
+
+// out = a*R mod N, by 32*k successive doublings mod N.
+fn bnToMont(out: ptr, a: ptr, N: ptr, k: int): void {
+    bnCopy(out, a, k);
+    let i = 0;
+    let bits = 32 * k;
+    while (i < bits) { bnAddModN(out, out, out, N, k); i = i + 1; }
+}
+
+fn bnFromMont(out: ptr, x: ptr, N: ptr, k: int, n0inv: ulong): void {
+    let one = bytes.alloc(k * 8);
+    bnSetOne(one, k);
+    bnMontMul(out, x, one, N, k, n0inv);
+    bytes.free(one);
+}
+
+// out = base^e mod N, with e supplied as big-endian bytes.
+fn bnModExp(out: ptr, base: ptr, N: ptr, k: int, n0inv: ulong, e: ptr, eLen: int): void {
+    let baseM = bytes.alloc(k * 8); bnToMont(baseM, base, N, k);
+    let r = bytes.alloc(k * 8); bnSetOne(r, k); bnToMont(r, r, N, k);   // R mod N
+    let bi = 0;
+    while (bi < eLen) {
+        let bt = bytes.read_byte(e, bi);
+        let bit = 7;
+        while (bit >= 0) {
+            bnMontMul(r, r, r, N, k, n0inv);
+            if (((bt >> bit) & 1) == 1) { bnMontMul(r, r, baseM, N, k, n0inv); }
+            bit = bit - 1;
+        }
+        bi = bi + 1;
+    }
+    bnFromMont(out, r, N, k, n0inv);
+    bytes.free(baseM); bytes.free(r);
+}
+
+// Bit length of the modulus.
+fn bnBitLen(a: ptr, k: int): int {
+    let i = k - 1;
+    while (i >= 0) {
+        let w = getw(a, i);
+        if (w != U0) {
+            let b = 31;
+            while (b >= 0) {
+                if (((w >> b) & U1) == U1) { return i * 32 + b + 1; }
+                b = b - 1;
+            }
+        }
+        i = i - 1;
+    }
+    return 0;
+}
+
+// RSA public operation: emOut (nLen bytes, big-endian) = sig^e mod N. Returns 0 if sig >= N.
+fn rsaPublicOp(emOut: ptr, sig: ptr, N: ptr, k: int, e: ptr, eLen: int): int {
+    let s = bytes.alloc(k * 8); bnFromBE(s, sig, 0, k);
+    if (!bnLt(s, N, k)) { bytes.free(s); return 0; }
+    let m = bytes.alloc(k * 8);
+    bnModExp(m, s, N, k, bnN0inv(N), e, eLen);
+    bnToBE(emOut, 0, m, k);
+    bytes.free(s); bytes.free(m);
+    return 1;
+}
+
+// ---- hash dispatch (0 = SHA-256, 1 = SHA-384, 2 = SHA-512) ----
+
+fn hLen(id: int): int {
+    if (id == 0) { return 32; }
+    if (id == 1) { return 48; }
+    return 64;
+}
+fn doHash(id: int, data: ptr, len: int, out: ptr): void {
+    if (id == 0) { sha256.hashInto(data, len, out); return; }
+    if (id == 1) { sha512.hash384Into(data, len, out); return; }
+    sha512.hashInto(data, len, out);
+}
+
+fn nib(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    return c - 55;
+}
+fn writeHex(buf: ptr, off: int, hex: string): int {   // returns number of bytes written
+    let n = hex.length / 2;
+    let i = 0;
+    while (i < n) {
+        bytes.write_byte(buf, off + i, nib(hex[i * 2]) * 16 + nib(hex[i * 2 + 1]));
+        i = i + 1;
+    }
+    return n;
+}
+// The DER DigestInfo prefix (19 bytes) for each hash.
+fn digestInfoHex(id: int): string {
+    if (id == 0) { return "3031300d060960864801650304020105000420"; }
+    if (id == 1) { return "3041300d060960864801650304020205000430"; }
+    return "3051300d060960864801650304020305000440";
+}
+
+fn memEq(a: ptr, aoff: int, b: ptr, boff: int, n: int): bool {
+    let i = 0;
+    let diff = 0;
+    while (i < n) {
+        diff = diff | (bytes.read_byte(a, aoff + i) ^ bytes.read_byte(b, boff + i));
+        i = i + 1;
+    }
+    return diff == 0;
+}
+
+// ---- public API ----
+
+// RSASSA-PKCS1-v1_5 verify. msgHash is the digest of the signed message (length implied by hashId).
+pub fn verifyPkcs1(hashId: int, msgHash: ptr, sig: ptr, sigLen: int, N: ptr, nLen: int, e: ptr, eLen: int): bool {
+    let k = nLen / 4;
+    if (sigLen != nLen) { return false; }
+    let hl = hLen(hashId);
+    let Nl = bytes.alloc(k * 8); bnFromBE(Nl, N, 0, k);
+    let em = bytes.alloc(nLen);
+    let ok = rsaPublicOp(em, sig, Nl, k, e, eLen);
+    if (ok == 0) { bytes.free(Nl); bytes.free(em); return false; }
+
+    // Build the expected EM = 00 01 FF..FF 00 || DigestInfo || hash and compare.
+    let psLen = nLen - 3 - 19 - hl;
+    let good = psLen >= 8;
+    let expected = bytes.alloc(nLen);
+    bytes.write_byte(expected, 0, 0);
+    bytes.write_byte(expected, 1, 1);
+    let i = 0;
+    while (i < psLen) { bytes.write_byte(expected, 2 + i, 0xff); i = i + 1; }
+    bytes.write_byte(expected, 2 + psLen, 0);
+    let dp = writeHex(expected, 3 + psLen, digestInfoHex(hashId));
+    let j = 0;
+    while (j < hl) { bytes.write_byte(expected, 3 + psLen + dp + j, bytes.read_byte(msgHash, j)); j = j + 1; }
+
+    let matched = good && memEq(em, 0, expected, 0, nLen);
+    bytes.free(Nl); bytes.free(em); bytes.free(expected);
+    return matched;
+}
+
+// MGF1 mask generation over the selected hash: out[0..outLen) = MGF1(seed[0..seedLen)).
+fn mgf1(hashId: int, seed: ptr, seedLen: int, out: ptr, outLen: int): void {
+    let hl = hLen(hashId);
+    let buf = bytes.alloc(seedLen + 4);
+    let dg = bytes.alloc(hl);
+    let i = 0;
+    while (i < seedLen) { bytes.write_byte(buf, i, bytes.read_byte(seed, i)); i = i + 1; }
+    let counter = 0;
+    let produced = 0;
+    while (produced < outLen) {
+        bytes.write_byte(buf, seedLen, (counter >> 24) & 0xff);
+        bytes.write_byte(buf, seedLen + 1, (counter >> 16) & 0xff);
+        bytes.write_byte(buf, seedLen + 2, (counter >> 8) & 0xff);
+        bytes.write_byte(buf, seedLen + 3, counter & 0xff);
+        doHash(hashId, buf, seedLen + 4, dg);
+        let take = hl;
+        if (produced + take > outLen) { take = outLen - produced; }
+        let j = 0;
+        while (j < take) { bytes.write_byte(out, produced + j, bytes.read_byte(dg, j)); j = j + 1; }
+        produced = produced + hl;
+        counter = counter + 1;
+    }
+    bytes.free(buf); bytes.free(dg);
+}
+
+// RSASSA-PSS verify (EMSA-PSS-VERIFY, MGF1, salt length = hash length).
+pub fn verifyPss(hashId: int, msgHash: ptr, sig: ptr, sigLen: int, N: ptr, nLen: int, e: ptr, eLen: int): bool {
+    let k = nLen / 4;
+    if (sigLen != nLen) { return false; }
+    let hl = hLen(hashId);
+    let Nl = bytes.alloc(k * 8); bnFromBE(Nl, N, 0, k);
+    let em = bytes.alloc(nLen);
+    let ok = rsaPublicOp(em, sig, Nl, k, e, eLen);
+    if (ok == 0) { bytes.free(Nl); bytes.free(em); return false; }
+
+    let modBits = bnBitLen(Nl, k);
+    let emBits = modBits - 1;
+    let emLen = (emBits + 7) / 8;
+    let off = nLen - emLen;                     // leading bytes of em that must be zero
+    let dbLen = emLen - hl - 1;
+    let topBits = 8 * emLen - emBits;           // number of top bits of maskedDB[0] that must be zero
+
+    let bad = false;
+    let li = 0;
+    while (li < off) { if (bytes.read_byte(em, li) != 0) { bad = true; } li = li + 1; }
+    if (bytes.read_byte(em, off + emLen - 1) != 0xbc) { bad = true; }
+    let topZeroMask = (0xff << (8 - topBits)) & 0xff;
+    if ((bytes.read_byte(em, off) & topZeroMask) != 0) { bad = true; }
+
+    // H is the hl bytes just before the 0xbc trailer; maskedDB is the dbLen bytes before H.
+    let hOff = off + dbLen;
+    let H = bytes.alloc(hl);
+    let i = 0;
+    while (i < hl) { bytes.write_byte(H, i, bytes.read_byte(em, hOff + i)); i = i + 1; }
+
+    // DB = maskedDB XOR MGF1(H, dbLen); then clear the top bits of DB[0].
+    let dbMask = bytes.alloc(dbLen);
+    mgf1(hashId, H, hl, dbMask, dbLen);
+    let db = bytes.alloc(dbLen);
+    i = 0;
+    while (i < dbLen) {
+        bytes.write_byte(db, i, bytes.read_byte(em, off + i) ^ bytes.read_byte(dbMask, i));
+        i = i + 1;
+    }
+    bytes.write_byte(db, 0, bytes.read_byte(db, 0) & (0xff >> topBits));
+
+    // DB must be 0x00.. || 0x01 || salt, with |salt| = hl.
+    let psEnd = dbLen - hl - 1;
+    let pi = 0;
+    while (pi < psEnd) { if (bytes.read_byte(db, pi) != 0) { bad = true; } pi = pi + 1; }
+    if (bytes.read_byte(db, psEnd) != 1) { bad = true; }
+
+    // M' = (8 zero bytes) || msgHash || salt; accept iff Hash(M') == H.
+    let mpLen = 8 + hl + hl;
+    let mp = bytes.alloc(mpLen);
+    i = 0;
+    while (i < 8) { bytes.write_byte(mp, i, 0); i = i + 1; }
+    i = 0;
+    while (i < hl) { bytes.write_byte(mp, 8 + i, bytes.read_byte(msgHash, i)); i = i + 1; }
+    i = 0;
+    while (i < hl) { bytes.write_byte(mp, 8 + hl + i, bytes.read_byte(db, psEnd + 1 + i)); i = i + 1; }
+    let hp = bytes.alloc(hl);
+    doHash(hashId, mp, mpLen, hp);
+    let matched = (!bad) && memEq(hp, 0, H, 0, hl);
+
+    bytes.free(Nl); bytes.free(em); bytes.free(H); bytes.free(dbMask);
+    bytes.free(db); bytes.free(mp); bytes.free(hp);
+    return matched;
+}
