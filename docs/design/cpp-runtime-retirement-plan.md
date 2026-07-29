@@ -17,7 +17,7 @@ truth for progress; the phase details are below.
 | M6 | Process and primitive shims | none | DONE | `reuseport` (pure Nova `setsockopt`) and env `get`/`set` (`os/sys` `getenv`/`setenv`) moved to Nova; their C deleted. The honest-primitive floor stays: `errno` (a macro), `set_nonblock` (variadic), `close` (the tcp stack cannot import `os/sys`: its `socket` export collides by name with the `socket` module; the reactor path already uses `sys.close`), `exit` (`_Exit`), args (argv capture), atomics, mutex/condvar/rwlock/spinlock |
 | M7 | Channels and actors in Nova | M1, M6 | DONE | Actors (`Mailbox<M>`, `ActorCell<M>`) are already Nova over the reactor. The async channel (`nova_chan_*`) is reclassified as part of the reactor scheduler ABI-CORE seam: codegen emits `nova_chan_recv` directly around `llvm.coro.suspend`, and `nova_chan_send` wakes waiters via `nova_sched_schedule`, so it stays in the minimal C core. The vestigial blocking `Channel<T>` is deferred pending generic-container ARC ownership |
 | M8 | Allocator backing in Nova | none | DONE | The bump arena under `nova_bytes_alloc` is backed by `mmap` anonymous pages, not libc `malloc`; `os/sys` exposes `mmap`/`munmap` so a Nova arena can do the same. ABI-CORE entry points and heap header unchanged. Native 200, ASAN 369; alloc microbench not regressed |
-| M9 | TLS 1.2 and 1.3 protocol in Nova | M2 | TODO | Protocol only; reference the Zig `std.crypto.tls`; crypto primitives stay vetted |
+| M9 | TLS 1.2 and 1.3 protocol in Nova | M2 | WIP | Protocol only; crypto primitives stay vetted. Split into 9.0 primitives, 9.1 record layer, 9.2 key schedule, 9.3 handshake, 9.4 reactor integration, 9.5 TLS 1.2. 9.0 STARTED: AES-128/256-GCM and ChaCha20-Poly1305 AEAD bound from wolfCrypt (`crypto/aead.nova`), verified against NIST and RFC 8439 known-answer vectors (case 213) |
 
 ## Purpose
 
@@ -374,18 +374,43 @@ phase removes a real dependency and is independently verifiable.
   allocations) unchanged versus the `malloc`-backed arena, within run-to-run noise, because the bump
   hot path is identical and only the one-time page acquisition changed.
 
-- **M9. TLS 1.2 and 1.3 protocol in Nova.** Write the TLS handshake state machine, the record layer,
-  the key schedule, and the alert and framing logic in Nova, over the async socket seam (M2) and over
-  vetted crypto primitives (AES-GCM, ChaCha20-Poly1305, SHA-2, X25519, P-256, RSA) that remain behind
-  a library and are never hand-rolled (rule 1). Reference implementation: the Zig standard library's
-  `std.crypto.tls` (a TLS 1.3 client) and `std.crypto` primitives, which are a clean, readable model
-  for the protocol and a source of the primitive set to bind. This retires the wolfSSL memory-BIO pump
-  in `io.cpp` and, together with the crypto-primitive question, is the last large piece of I/O in C++.
-  Prereq: M2 (the async socket seam on the reactor). Gate: a real TLS 1.3 handshake and, separately, a
-  TLS 1.2 handshake against a standard server and client (`curl`, `openssl s_client`), the inbound and
-  outbound TLS conformance cases green on the Nova path, and no timing-sensitive primitive written by
-  us. This is a substantial phase and may itself be split (record layer, then 1.3 handshake, then 1.2)
-  when it is scheduled.
+- **M9. TLS 1.2 and 1.3 protocol in Nova. WIP.** Write the TLS handshake state machine, the record
+  layer, the key schedule, and the alert and framing logic in Nova, over the async socket seam (M2) and
+  over vetted crypto primitives (AES-GCM, ChaCha20-Poly1305, SHA-2, ECDHE, RSA) that remain behind a
+  library and are never hand-rolled (rule 1). Reference implementation: the Zig standard library's
+  `std.crypto.tls` (a TLS 1.3 client) and `std.crypto` primitives, a clean, readable model for the
+  protocol and a source of the primitive set to bind. This retires the wolfSSL memory-BIO pump in
+  `io.cpp` and, with the crypto-primitive question, is the last large piece of I/O in C++. Prereq: M2.
+  Because this is the largest phase, it is split into ordered slices, each independently gated:
+  - **9.0 Vetted crypto primitives (bindings). STARTED.** Bind, never reimplement, the primitive set
+    TLS 1.3 drives, from the vendored wolfCrypt (which enables AES-GCM, ChaCha20-Poly1305, ECC for
+    P-256 ECDHE and ECDSA, HKDF, and SHA-256 and SHA-384; note this build has no X25519, so the Nova
+    handshake uses P-256, which RFC 8446 mandates). Done so far: the AEAD ciphers. `crypto/aead.nova`
+    binds `nova_aead_aesgcm_seal`/`open` and `nova_aead_chacha20poly1305_seal`/`open` (thin wrappers in
+    `crypto.cpp` over wolfCrypt `wc_AesGcm*` and `wc_ChaCha20Poly1305_*`), on raw buffers with explicit
+    lengths, returning success or an authentication failure the caller must treat as fatal. Verified
+    against published known-answer vectors (NIST GCM cases 1 and 13, the RFC 8439 section 2.8.2
+    ChaCha20-Poly1305 vector) plus a round trip and tamper detection (conformance case 213). Remaining
+    9.0: HKDF-Extract and HKDF-Expand-Label (built in Nova from HMAC, which is protocol composition, not
+    a primitive), SHA-256 and SHA-384 transcript hashing exposed as an incremental interface, P-256
+    ECDHE key generation and shared-secret, X.509 chain parse and validation, and signature
+    verification (RSA-PSS, ECDSA-P256).
+  - **9.1 Record layer (Nova).** TLS record framing (content type, legacy version, length), the
+    per-record nonce from the sequence number XOR the write IV, the additional-data construction, and
+    record seal and open over the 9.0 AEAD. Gate: RFC 8448 record vectors.
+  - **9.2 Key schedule (Nova).** The HKDF key schedule of RFC 8446 section 7 (early, handshake, and
+    master secrets, traffic keys, and finished keys). Gate: RFC 8448 key vectors.
+  - **9.3 Handshake state machine (Nova).** ClientHello and ServerHello with the key_share,
+    supported_versions, signature_algorithms, and server_name extensions, EncryptedExtensions,
+    Certificate, CertificateVerify, and Finished, with the transcript hash, certificate validation, and
+    signature verification through 9.0.
+  - **9.4 Reactor integration.** Drive the Nova TLS engine over `asyncio.AsyncStream` in place of the
+    wolfSSL memory-BIO pump (`nova_mtls_*`), then a live handshake against `curl` and `openssl
+    s_client`. This retires the `nova_mtls_*` C.
+  - **9.5 TLS 1.2.** The 1.2 handshake and record layer, scheduled after 1.3 is live.
+  Gate for the whole phase: a real TLS 1.3 handshake and, separately, a TLS 1.2 handshake against a
+  standard server and client, the inbound and outbound TLS conformance cases green on the Nova path,
+  and no timing-sensitive primitive written by us.
 
 The decimal, crypto-primitive, and compress shims (STAY-FFI) are not phases; they remain as they are.
 decimal may be ported to Nova later as pure-compute work, outside this plan's critical path. The

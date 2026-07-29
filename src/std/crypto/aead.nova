@@ -1,0 +1,48 @@
+// AEAD ciphers for the Nova TLS record layer (M9): AES-128/256-GCM and ChaCha20-Poly1305.
+// These bind vetted wolfCrypt primitives; the TLS protocol that drives them (record framing, the
+// HKDF key schedule, the handshake state machine) is written in Nova. Rule 1: the cipher primitives
+// are never reimplemented in Nova, only driven.
+//
+// All functions work on raw buffers (pointers plus explicit lengths), the systems idiom os/sys uses.
+// seal writes ptLen bytes of ciphertext to ctOut and the 16-byte authentication tag to tagOut. open
+// writes ctLen bytes of plaintext to ptOut and returns false if the tag does not verify: a false from
+// open means the record is forged or corrupted and MUST be treated as a fatal error, never retried.
+
+import bytes;
+
+pub const AES128_KEY_LEN: int = 16;
+pub const AES256_KEY_LEN: int = 32;
+pub const CHACHA_KEY_LEN: int = 32;
+pub const GCM_NONCE_LEN: int = 12;
+pub const AEAD_TAG_LEN: int = 16;
+
+pub extern("c") fn nova_aead_aesgcm_seal(key: ptr, keyLen: int, iv: ptr, ivLen: int,
+    aad: ptr, aadLen: int, pt: ptr, ptLen: int, ctOut: ptr, tagOut: ptr): int;
+pub extern("c") fn nova_aead_aesgcm_open(key: ptr, keyLen: int, iv: ptr, ivLen: int,
+    aad: ptr, aadLen: int, ct: ptr, ctLen: int, tag: ptr, ptOut: ptr): int;
+pub extern("c") fn nova_aead_chacha20poly1305_seal(key: ptr, iv: ptr,
+    aad: ptr, aadLen: int, pt: ptr, ptLen: int, ctOut: ptr, tagOut: ptr): int;
+pub extern("c") fn nova_aead_chacha20poly1305_open(key: ptr, iv: ptr,
+    aad: ptr, aadLen: int, ct: ptr, ctLen: int, tag: ptr, ptOut: ptr): int;
+
+// AES-GCM. keyLen is 16 (AES-128) or 32 (AES-256); the nonce is 12 bytes; the tag is 16.
+pub fn aesgcmSeal(key: ptr, keyLen: int, iv: ptr, aad: ptr, aadLen: int,
+                  pt: ptr, ptLen: int, ctOut: ptr, tagOut: ptr): bool {
+    return nova_aead_aesgcm_seal(key, keyLen, iv, GCM_NONCE_LEN, aad, aadLen, pt, ptLen, ctOut, tagOut) == 0;
+}
+
+pub fn aesgcmOpen(key: ptr, keyLen: int, iv: ptr, aad: ptr, aadLen: int,
+                  ct: ptr, ctLen: int, tag: ptr, ptOut: ptr): bool {
+    return nova_aead_aesgcm_open(key, keyLen, iv, GCM_NONCE_LEN, aad, aadLen, ct, ctLen, tag, ptOut) == 0;
+}
+
+// ChaCha20-Poly1305 (RFC 8439). The key is 32 bytes, the nonce is 12, the tag is 16.
+pub fn chachaPolySeal(key: ptr, iv: ptr, aad: ptr, aadLen: int,
+                      pt: ptr, ptLen: int, ctOut: ptr, tagOut: ptr): bool {
+    return nova_aead_chacha20poly1305_seal(key, iv, aad, aadLen, pt, ptLen, ctOut, tagOut) == 0;
+}
+
+pub fn chachaPolyOpen(key: ptr, iv: ptr, aad: ptr, aadLen: int,
+                      ct: ptr, ctLen: int, tag: ptr, ptOut: ptr): bool {
+    return nova_aead_chacha20poly1305_open(key, iv, aad, aadLen, ct, ctLen, tag, ptOut) == 0;
+}
