@@ -2,7 +2,6 @@
 // RFC 8439 section 2.8.2 known-answer vector, a seal/open round trip, tamper detection, and a
 // differential check against the wolfCrypt binding (which this Nova AEAD will replace).
 import crypto.chachapoly;
-import crypto.aead;
 import bytes;
 import assert;
 
@@ -73,35 +72,6 @@ fn aead_rfc8439(): void {
 
 // Differential check: the Nova AEAD seal must match the wolfCrypt binding byte for byte on a fresh
 // input. (The wolfCrypt path is a temporary oracle that the Nova implementation replaces.)
-@test
-fn aead_matches_wolfcrypt(): void {
-    let key = bytes.alloc(32);
-    let nonce = bytes.alloc(12);
-    let aad = bytes.alloc(8);
-    let pt = bytes.alloc(50);
-    let i = 0;
-    while (i < 32) { bytes.write_byte(key, i, i + 3); i = i + 1; }
-    i = 0;
-    while (i < 12) { bytes.write_byte(nonce, i, i * 5 + 1); i = i + 1; }
-    i = 0;
-    while (i < 8) { bytes.write_byte(aad, i, i + 200); i = i + 1; }
-    i = 0;
-    while (i < 50) { bytes.write_byte(pt, i, i * 7 + 2); i = i + 1; }
-
-    let ctNova = bytes.alloc(50);
-    let tagNova = bytes.alloc(16);
-    chachapoly.seal(key, nonce, aad, 8, pt, 50, ctNova, tagNova);
-
-    let ctWolf = bytes.alloc(50);
-    let tagWolf = bytes.alloc(16);
-    assert.isTrue(aead.chachaPolySeal(key, nonce, aad, 8, pt, 50, ctWolf, tagWolf));
-
-    i = 0;
-    while (i < 50) { assert.equalInt(bytes.read_byte(ctNova, i), bytes.read_byte(ctWolf, i)); i = i + 1; }
-    i = 0;
-    while (i < 16) { assert.equalInt(bytes.read_byte(tagNova, i), bytes.read_byte(tagWolf, i)); i = i + 1; }
-}
-
 // Empty plaintext with AAD: the tag still authenticates and open succeeds.
 @test
 fn aead_empty_plaintext(): void {

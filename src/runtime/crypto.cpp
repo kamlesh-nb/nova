@@ -260,54 +260,6 @@ char *nova_random_hex(long long n) {
 // open (decrypt) functions return nonzero on authentication failure, which the caller MUST treat as a
 // fatal record error (a forged or corrupted record), never as recoverable.
 
-// AES-GCM. key_len is 16 (AES-128) or 32 (AES-256); iv_len is the nonce length (12 for TLS); the tag
-// is 16 bytes. ct_out holds pt_len bytes, tag_out holds 16.
-int nova_aead_aesgcm_seal(const char *key, int key_len, const char *iv, int iv_len,
-                          const char *aad, int aad_len, const char *pt, int pt_len,
-                          char *ct_out, char *tag_out) {
-  Aes aes;
-  if (wc_AesInit(&aes, NULL, INVALID_DEVID) != 0)
-    return -1;
-  int r = wc_AesGcmSetKey(&aes, (const byte *)key, (word32)key_len);
-  if (r == 0)
-    r = wc_AesGcmEncrypt(&aes, (byte *)ct_out, (const byte *)pt, (word32)pt_len,
-                         (const byte *)iv, (word32)iv_len, (byte *)tag_out, 16,
-                         (const byte *)aad, (word32)aad_len);
-  wc_AesFree(&aes);
-  return r;
-}
-int nova_aead_aesgcm_open(const char *key, int key_len, const char *iv, int iv_len,
-                          const char *aad, int aad_len, const char *ct, int ct_len,
-                          const char *tag, char *pt_out) {
-  Aes aes;
-  if (wc_AesInit(&aes, NULL, INVALID_DEVID) != 0)
-    return -1;
-  int r = wc_AesGcmSetKey(&aes, (const byte *)key, (word32)key_len);
-  if (r == 0)
-    r = wc_AesGcmDecrypt(&aes, (byte *)pt_out, (const byte *)ct, (word32)ct_len,
-                         (const byte *)iv, (word32)iv_len, (const byte *)tag, 16,
-                         (const byte *)aad, (word32)aad_len);
-  wc_AesFree(&aes);
-  return r; // 0 = ok; AES_GCM_AUTH_E on tag mismatch
-}
-
-// ChaCha20-Poly1305 (RFC 8439). key is 32 bytes, iv is 12, tag is 16.
-int nova_aead_chacha20poly1305_seal(const char *key, const char *iv,
-                                    const char *aad, int aad_len, const char *pt, int pt_len,
-                                    char *ct_out, char *tag_out) {
-  return wc_ChaCha20Poly1305_Encrypt((const byte *)key, (const byte *)iv,
-                                     (const byte *)aad, (word32)aad_len,
-                                     (const byte *)pt, (word32)pt_len,
-                                     (byte *)ct_out, (byte *)tag_out);
-}
-int nova_aead_chacha20poly1305_open(const char *key, const char *iv,
-                                    const char *aad, int aad_len, const char *ct, int ct_len,
-                                    const char *tag, char *pt_out) {
-  return wc_ChaCha20Poly1305_Decrypt((const byte *)key, (const byte *)iv,
-                                     (const byte *)aad, (word32)aad_len,
-                                     (const byte *)ct, (word32)ct_len,
-                                     (const byte *)tag, (byte *)pt_out); // nonzero on MAC failure
-}
 
 #else
 
@@ -331,10 +283,6 @@ char *nova_sha256_raw(const char *) { return nova_crypto_unavailable("sha256_raw
 char *nova_pbkdf2_hmac_sha256(const char *, const char *, long long, long long) { return nova_crypto_unavailable("pbkdf2_hmac_sha256"); }
 char *nova_random_hex(long long) { return nova_crypto_unavailable("random"); }
 char *nova_rsa_oaep_encrypt(const char *, const char *, int) { return nova_crypto_unavailable("rsa_oaep_encrypt"); }
-int nova_aead_aesgcm_seal(const char *, int, const char *, int, const char *, int, const char *, int, char *, char *) { nova_crypto_unavailable("aead_aesgcm_seal"); return -1; }
-int nova_aead_aesgcm_open(const char *, int, const char *, int, const char *, int, const char *, int, const char *, char *) { nova_crypto_unavailable("aead_aesgcm_open"); return -1; }
-int nova_aead_chacha20poly1305_seal(const char *, const char *, const char *, int, const char *, int, char *, char *) { nova_crypto_unavailable("aead_chacha20poly1305_seal"); return -1; }
-int nova_aead_chacha20poly1305_open(const char *, const char *, const char *, int, const char *, int, const char *, char *) { nova_crypto_unavailable("aead_chacha20poly1305_open"); return -1; }
 
 #endif
 
