@@ -1,0 +1,73 @@
+// CA trust store (M12): a server certificate chain is trusted iff it validates against a root in the
+// store, at a given time, for a given hostname. Uses a real OpenSSL-generated EC chain: a self-signed
+// "Nova Test Root CA" and a leaf for localhost signed by it. Verifies the trust decision (accept the
+// valid chain; reject a wrong hostname, an out-of-validity time, and an empty store).
+import crypto.tls.truststore;
+import bytes;
+import assert;
+
+const ROOT_PEM: string = "-----BEGIN CERTIFICATE-----\nMIIBjjCCATOgAwIBAgIUHbZhpCUOFkfCDqv/JeotLJDyeXMwCgYIKoZIzj0EAwIw\nHDEaMBgGA1UEAwwRTm92YSBUZXN0IFJvb3QgQ0EwHhcNMjYwNzI5MTgwOTIyWhcN\nMzYwNzI2MTgwOTIyWjAcMRowGAYDVQQDDBFOb3ZhIFRlc3QgUm9vdCBDQTBZMBMG\nByqGSM49AgEGCCqGSM49AwEHA0IABNqn/zlADJ/12wkVnD6USO641XXalyG/QvZ5\nqqxdqo1yIovs15f1M+DBJqfkqrbehbV6j3prLWU4rnfaEUGSj0ujUzBRMB0GA1Ud\nDgQWBBTfDvA8kCM/LHd0JGhivHtUZR6M1zAfBgNVHSMEGDAWgBTfDvA8kCM/LHd0\nJGhivHtUZR6M1zAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0kAMEYCIQC8\n154wFHubZjSBCEqyZyyn8k4VrnEt470nLpHn6GSwUQIhAKg2/3w49bVXLlTlQS3A\nzLPSa2emofa5mz9B5PV4lkqg\n-----END CERTIFICATE-----\n";
+const LEAF_HEX: string = "308201963082013ba00302010202145b3507c6faf88a771b76548c4fde1edfe7eae378300a06082a8648ce3d040302301c311a301806035504030c114e6f7661205465737420526f6f74204341301e170d3236303732393138303932325a170d3238313033313138303932325a30143112301006035504030c096c6f63616c686f73743059301306072a8648ce3d020106082a8648ce3d030107034200048a9b8452a9bf9f5fdcc6517af81374abe5d374537bc95ca9e7aa4b8879439f67fb5a2f6021e1a121d07b88c00d44a577a844cdb1f71492b1bd301a18ad3a01d1a363306130140603551d11040d300b82096c6f63616c686f737430090603551d1304023000301d0603551d0e041604141041f0f472f60aa92922242631578f2148d944a2301f0603551d23041830168014df0ef03c90233f2c7774246862bc7b54651e8cd7300a06082a8648ce3d0403020349003046022100e7d192f8134befddac8bf136c4cb3e4cd5d7e7fa0c5119993e9c76fc051a2c67022100f0232611f565d2c62fac81f59f7d235458e0ef239bc9ea0f73caec4ad5c9fda1";
+
+fn hexNib(c: int): int { if (c >= 48 && c <= 57) { return c - 48; } if (c >= 97 && c <= 102) { return c - 87; } return 0; }
+fn hexBuf(hex: string): ptr {
+    let n = hex.length / 2;
+    let b = bytes.alloc(n);
+    let i = 0;
+    while (i < n) { bytes.write_byte(b, i, hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1])); i = i + 1; }
+    return b;
+}
+
+// Build a TLS certificate_list holding a single leaf entry: len(3) || der || ext_len(2)=0.
+fn leafList(hex: string, lenOut: ptr): ptr {
+    let n = hex.length / 2;
+    let leaf = hexBuf(hex);
+    let list = bytes.alloc(3 + n + 2);
+    bytes.write_byte(list, 0, (n >> 16) & 0xff); bytes.write_byte(list, 1, (n >> 8) & 0xff); bytes.write_byte(list, 2, n & 0xff);
+    let i = 0;
+    while (i < n) { bytes.write_byte(list, 3 + i, bytes.read_byte(leaf, i)); i = i + 1; }
+    bytes.write_byte(list, 3 + n, 0); bytes.write_byte(list, 3 + n + 1, 0);
+    bytes.free(leaf);
+    bytes.write_i32(lenOut, 0, 3 + n + 2);
+    return list;
+}
+
+@test
+fn trust_accepts_valid_chain(): void {
+    let store = truststore.loadPemBundle(ROOT_PEM);
+    assert.equalInt(store.count(), 1);
+    let lo = bytes.alloc(4);
+    let list = leafList(LEAF_HEX, lo);
+    let listLen = bytes.read_byte(lo, 0) | (bytes.read_byte(lo, 1) << 8) | (bytes.read_byte(lo, 2) << 16);
+    // now = 2027-01-01 00:00:00, within the leaf's validity window.
+    assert.isTrue(store.trusts(list, listLen, "localhost", 20270101000000));
+}
+
+@test
+fn trust_rejects_wrong_host(): void {
+    let store = truststore.loadPemBundle(ROOT_PEM);
+    let lo = bytes.alloc(4);
+    let list = leafList(LEAF_HEX, lo);
+    let listLen = bytes.read_byte(lo, 0) | (bytes.read_byte(lo, 1) << 8) | (bytes.read_byte(lo, 2) << 16);
+    assert.isTrue(!store.trusts(list, listLen, "evil.example.com", 20270101000000));
+}
+
+@test
+fn trust_rejects_out_of_validity(): void {
+    let store = truststore.loadPemBundle(ROOT_PEM);
+    let lo = bytes.alloc(4);
+    let list = leafList(LEAF_HEX, lo);
+    let listLen = bytes.read_byte(lo, 0) | (bytes.read_byte(lo, 1) << 8) | (bytes.read_byte(lo, 2) << 16);
+    assert.isTrue(!store.trusts(list, listLen, "localhost", 20200101000000));   // before notBefore
+    assert.isTrue(!store.trusts(list, listLen, "localhost", 20300101000000));   // after notAfter
+}
+
+@test
+fn trust_rejects_empty_store(): void {
+    let store = truststore.loadPemBundle("no certificates here");
+    assert.equalInt(store.count(), 0);
+    let lo = bytes.alloc(4);
+    let list = leafList(LEAF_HEX, lo);
+    let listLen = bytes.read_byte(lo, 0) | (bytes.read_byte(lo, 1) << 8) | (bytes.read_byte(lo, 2) << 16);
+    assert.isTrue(!store.trusts(list, listLen, "localhost", 20270101000000));
+}
