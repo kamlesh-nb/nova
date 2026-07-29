@@ -1,0 +1,81 @@
+// NIST P-256 (secp256r1) ECDH implemented in Nova (M9 phase C, no external library). Verified against
+// OpenSSL 3.6 as an independent oracle: two key pairs, their public points, and the shared secret
+// (computed by OpenSSL both directions) are pinned here.
+import crypto.p256;
+import bytes;
+import assert;
+
+fn hexNib(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return 0;
+}
+
+fn hexBuf(hex: string): ptr {
+    let n = hex.length / 2;
+    let b = bytes.alloc(n);
+    let i = 0;
+    while (i < n) {
+        bytes.write_byte(b, i, hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1]));
+        i = i + 1;
+    }
+    return b;
+}
+
+fn eqHex(buf: ptr, n: int, hex: string): bool {
+    if (hex.length != n * 2) { return false; }
+    let i = 0;
+    while (i < n) {
+        if (bytes.read_byte(buf, i) != hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1])) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+const PRIV_A: string = "63eedc4fae92de4557ce93fbf11821ead9ae12cba6171019f2b4de0ac2bf3921";
+const PUB_A: string  = "04b82f10222813223bd4a099b217e7d4664a53539e4b94d98430d49f35956227b00922ac2afaf40660192ac8933028cc1ac8ace845d8d0b2f2bdba0bd277d29a03";
+const PRIV_B: string = "c356c26186f01d2a422656a055b618fcdd41b16ffe89b4a998c750448dd63e5c";
+const PUB_B: string  = "0417ee52077c22d06a02a50200e287a1afe3b186207814f363eee19d3881691abc51d0534850770809a93159e4f07c41f5bf750f5669ef06536e3896e307c2117f";
+const SHARED: string = "88c790b6aa09b070f8f0367f22450d80d3c557c09404046cbfa06c1ae030f29d";
+
+// derivePublic(scalar) reproduces the public point OpenSSL computed for the same scalar.
+@test
+fn p256_derive_public(): void {
+    let pubA = bytes.alloc(65);
+    p256.derivePublic(pubA, hexBuf(PRIV_A));
+    assert.isTrue(eqHex(pubA, 65, PUB_A));
+
+    let pubB = bytes.alloc(65);
+    p256.derivePublic(pubB, hexBuf(PRIV_B));
+    assert.isTrue(eqHex(pubB, 65, PUB_B));
+}
+
+// ECDH from both sides yields the same shared secret X coordinate that OpenSSL derived.
+@test
+fn p256_ecdh_agreement(): void {
+    let sAB = bytes.alloc(32);
+    let okA = p256.ecdh(sAB, hexBuf(PRIV_A), hexBuf(PUB_B));
+    assert.equalInt(okA, 1);
+    assert.isTrue(eqHex(sAB, 32, SHARED));
+
+    let sBA = bytes.alloc(32);
+    let okB = p256.ecdh(sBA, hexBuf(PRIV_B), hexBuf(PUB_A));
+    assert.equalInt(okB, 1);
+    assert.isTrue(eqHex(sBA, 32, SHARED));
+
+    let i = 0;
+    while (i < 32) { assert.equalInt(bytes.read_byte(sAB, i), bytes.read_byte(sBA, i)); i = i + 1; }
+}
+
+// A point not on the curve (valid X, Y bumped by one) is rejected.
+@test
+fn p256_reject_bad_point(): void {
+    let bad = hexBuf(PUB_B);
+    bytes.write_byte(bad, 64, (bytes.read_byte(bad, 64) + 1) & 0xff);
+    let out = bytes.alloc(32);
+    let ok = p256.ecdh(out, hexBuf(PRIV_A), bad);
+    assert.equalInt(ok, 0);
+}

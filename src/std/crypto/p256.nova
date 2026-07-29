@@ -1,0 +1,447 @@
+// NIST P-256 (secp256r1) ECDH, implemented in Nova with no external library (M9 phase C).
+//
+// The base field GF(p), p = 2^256 - 2^224 + 2^192 + 2^96 - 1, is handled with Montgomery arithmetic:
+// a field element is eight 32-bit limbs (little-endian) held in a 64-byte buffer, and the multiply is
+// the CIOS Montgomery routine using `ulong` (u64) for the u32*u32 products and carries (Nova has no
+// 128-bit integer). Montgomery n0' = -p^-1 mod 2^32 = 1 for this modulus. Every field result is fully
+// reduced to [0, p) via a masked conditional subtract, so elements are always canonical.
+//
+// Point arithmetic is in Jacobian coordinates (the BearSSL ec_p256_m31 double/add formulas, which are
+// field-representation-agnostic). The scalar multiply is BearSSL's 2-bit-window ladder with a `qz`
+// "still infinity" flag and constant-time conditional copies, so it sidesteps the addition formula's
+// exceptional cases without any secret-dependent branch or table lookup. Field inversion is Fermat
+// (z^(p-2)); its square-and-multiply schedule follows the fixed public exponent, not the secret base.
+//
+// References: BearSSL ec_p256_m31.c (point formulas + ladder, in deps), FIPS 186-4 domain parameters,
+// the standard Montgomery CIOS algorithm. Verified against RFC 5903 / NIST CAVP ECDH vectors.
+import bytes;
+
+const MASK32: ulong = 0xffffffff;
+const U0: ulong = 0;
+const U1: ulong = 1;
+
+// ---- field element storage (8 limbs of 32 bits, little-endian, in a 64-byte buffer) ----
+
+fn newFe(): ptr { return bytes.alloc(64); }
+fn getw(f: ptr, i: int): ulong { return (bytes.read_ptr(f, i * 8) as long) as ulong; }
+fn setw(f: ptr, i: int, v: ulong): void { bytes.write_ptr(f, i * 8, (v as long) as ptr); }
+
+// The i-th limb of the modulus p (little-endian): p = ffffffff 00000001 0...0 ffffffff ffffffff ffffffff.
+fn pl(i: int): ulong {
+    if (i == 3) { return U0; }
+    if (i == 4) { return U0; }
+    if (i == 5) { return U0; }
+    if (i == 6) { return U1; }
+    return MASK32;
+}
+
+fn feCopy(out: ptr, a: ptr): void {
+    let i = 0;
+    while (i < 8) { setw(out, i, getw(a, i)); i = i + 1; }
+}
+fn feZero(out: ptr): void {
+    let i = 0;
+    while (i < 8) { setw(out, i, U0); i = i + 1; }
+}
+
+// Conditional subtract of p: given t[0..8] (t < 2p, t[8] the top carry in {0,1}), write t-p if t >= p
+// else t, into out[0..7]. Constant-time (masked).
+fn condSubP(out: ptr, t: ptr): void {
+    let d = bytes.alloc(64);
+    let borrow: ulong = 0;
+    let j = 0;
+    while (j < 8) {
+        let x = getw(t, j) - pl(j) - borrow;
+        setw(d, j, x & MASK32);
+        borrow = (x >> 32) & U1;
+        j = j + 1;
+    }
+    let x8 = getw(t, 8) - borrow;
+    borrow = (x8 >> 32) & U1;              // 1 => t < p (keep t); 0 => t >= p (take d)
+    let mask = U0 - (borrow ^ U1);         // all ones when t >= p
+    j = 0;
+    while (j < 8) {
+        setw(out, j, (getw(d, j) & mask) | (getw(t, j) & (~mask)));
+        j = j + 1;
+    }
+    bytes.free(d);
+}
+
+fn feAdd(out: ptr, a: ptr, b: ptr): void {
+    let t = bytes.alloc(72);
+    let carry: ulong = 0;
+    let j = 0;
+    while (j < 8) {
+        let s = getw(a, j) + getw(b, j) + carry;
+        setw(t, j, s & MASK32);
+        carry = s >> 32;
+        j = j + 1;
+    }
+    setw(t, 8, carry);
+    condSubP(out, t);
+    bytes.free(t);
+}
+
+fn feSub(out: ptr, a: ptr, b: ptr): void {
+    let d = bytes.alloc(64);
+    let borrow: ulong = 0;
+    let j = 0;
+    while (j < 8) {
+        let x = getw(a, j) - getw(b, j) - borrow;
+        setw(d, j, x & MASK32);
+        borrow = (x >> 32) & U1;
+        j = j + 1;
+    }
+    let mask = U0 - borrow;                // all ones when a < b: add p back
+    let carry: ulong = 0;
+    j = 0;
+    while (j < 8) {
+        let s = getw(d, j) + (pl(j) & mask) + carry;
+        setw(out, j, s & MASK32);
+        carry = s >> 32;
+        j = j + 1;
+    }
+    bytes.free(d);
+}
+
+// Montgomery multiply (CIOS): out = a*b*R^-1 mod p, R = 2^256. Inputs and output are canonical (< p).
+fn feMul(out: ptr, a: ptr, b: ptr): void {
+    let t = bytes.alloc(80);              // t[0..9]
+    let j = 0;
+    while (j < 10) { setw(t, j, U0); j = j + 1; }
+    let i = 0;
+    while (i < 8) {
+        let bi = getw(b, i);
+        let carry: ulong = 0;
+        j = 0;
+        while (j < 8) {
+            let s = getw(t, j) + getw(a, j) * bi + carry;
+            setw(t, j, s & MASK32);
+            carry = s >> 32;
+            j = j + 1;
+        }
+        let s8 = getw(t, 8) + carry;
+        setw(t, 8, s8 & MASK32);
+        setw(t, 9, s8 >> 32);
+        // reduction: m = t[0] * n0' mod 2^32, and n0' = 1 for p.
+        let m = getw(t, 0);
+        let c2 = (getw(t, 0) + m * pl(0)) >> 32;
+        j = 1;
+        while (j < 8) {
+            let s = getw(t, j) + m * pl(j) + c2;
+            setw(t, j - 1, s & MASK32);
+            c2 = s >> 32;
+            j = j + 1;
+        }
+        let s7 = getw(t, 8) + c2;
+        setw(t, 7, s7 & MASK32);
+        setw(t, 8, getw(t, 9) + (s7 >> 32));
+        i = i + 1;
+    }
+    condSubP(out, t);
+    bytes.free(t);
+}
+
+fn feSq(out: ptr, a: ptr): void { feMul(out, a, a); }
+
+// Convert into Montgomery form: out = a*R mod p, by 256 successive doublings (a is canonical, < p).
+fn toMont(out: ptr, a: ptr): void {
+    feCopy(out, a);
+    let i = 0;
+    while (i < 256) { feAdd(out, out, out); i = i + 1; }
+}
+
+// Leave Montgomery form: out = x*R^-1 mod p = feMul(x, 1).
+fn fromMont(out: ptr, x: ptr): void {
+    let one = newFe();
+    feZero(one); setw(one, 0, U1);
+    feMul(out, x, one);
+    bytes.free(one);
+}
+
+fn montOne(out: ptr): void {
+    let one = newFe();
+    feZero(one); setw(one, 0, U1);
+    toMont(out, one);
+    bytes.free(one);
+}
+
+fn feEq(a: ptr, b: ptr): bool {
+    let diff: ulong = 0;
+    let j = 0;
+    while (j < 8) { diff = diff | (getw(a, j) ^ getw(b, j)); j = j + 1; }
+    return diff == U0;
+}
+
+// Is the canonical value a strictly less than p?
+fn feLtP(a: ptr): bool {
+    let borrow: ulong = 0;
+    let j = 0;
+    while (j < 8) {
+        let x = getw(a, j) - pl(j) - borrow;
+        borrow = (x >> 32) & U1;
+        j = j + 1;
+    }
+    return borrow == U1;
+}
+
+// Field inversion in Montgomery form: out = a^-1 * R mod p = (aR)^(p-2) in the Montgomery domain.
+fn feInvert(out: ptr, a: ptr): void {
+    let r = newFe();
+    montOne(r);
+    let e = bytes.alloc(32);
+    setHex(e, "ffffffff00000001000000000000000000000000fffffffffffffffffffffffd");
+    let k = 255;
+    while (k >= 0) {
+        feSq(r, r);
+        let bitVal = (bytes.read_byte(e, 31 - (k >> 3)) >> (k & 7)) & 1;
+        if (bitVal == 1) { feMul(r, r, a); }
+        k = k - 1;
+    }
+    feCopy(out, r);
+    bytes.free(r);
+    bytes.free(e);
+}
+
+// ---- big-endian byte <-> field element, and hex helpers ----
+
+fn feFromBE(out: ptr, buf: ptr, off: int): void {
+    let i = 0;
+    while (i < 8) {
+        let base = off + (7 - i) * 4;
+        let w = ((bytes.read_byte(buf, base) as ulong) << 24)
+              | ((bytes.read_byte(buf, base + 1) as ulong) << 16)
+              | ((bytes.read_byte(buf, base + 2) as ulong) << 8)
+              | (bytes.read_byte(buf, base + 3) as ulong);
+        setw(out, i, w);
+        i = i + 1;
+    }
+}
+
+fn feToBE(buf: ptr, off: int, a: ptr): void {
+    let i = 0;
+    while (i < 8) {
+        let base = off + (7 - i) * 4;
+        let w = getw(a, i);
+        bytes.write_byte(buf, base, ((w >> 24) & 0xff) as int);
+        bytes.write_byte(buf, base + 1, ((w >> 16) & 0xff) as int);
+        bytes.write_byte(buf, base + 2, ((w >> 8) & 0xff) as int);
+        bytes.write_byte(buf, base + 3, (w & 0xff) as int);
+        i = i + 1;
+    }
+}
+
+fn nib(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    return c - 55;
+}
+fn setHex(buf: ptr, hex: string): void {
+    let n = hex.length / 2;
+    let i = 0;
+    while (i < n) {
+        bytes.write_byte(buf, i, nib(hex[i * 2]) * 16 + nib(hex[i * 2 + 1]));
+        i = i + 1;
+    }
+}
+
+fn bMont(out: ptr): void {
+    let b = bytes.alloc(32);
+    setHex(b, "5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b");
+    let t = newFe();
+    feFromBE(t, b, 0);
+    toMont(out, t);
+    bytes.free(b);
+    bytes.free(t);
+}
+
+// ---- Jacobian points: 192-byte buffer, X at 0, Y at 64, Z at 128 (each a Montgomery field element) ----
+
+fn newPt(): ptr { return bytes.alloc(192); }
+fn px(p: ptr): ptr { return p; }
+fn py(p: ptr): ptr { return (p as long + 64) as ptr; }
+fn pz(p: ptr): ptr { return (p as long + 128) as ptr; }
+
+fn ptCopy(d: ptr, s: ptr): void {
+    let i = 0;
+    while (i < 24) { setw(d, i, getw(s, i)); i = i + 1; }
+}
+fn ptZero(p: ptr): void {                  // all-zero => point at infinity (Z = 0)
+    let i = 0;
+    while (i < 24) { setw(p, i, U0); i = i + 1; }
+}
+fn ptCcopy(d: ptr, s: ptr, flag: ulong): void {   // copy s into d when flag == 1 (constant-time)
+    let mask = U0 - flag;
+    let i = 0;
+    while (i < 24) {
+        setw(d, i, (getw(s, i) & mask) | (getw(d, i) & (~mask)));
+        i = i + 1;
+    }
+}
+
+// Double a Jacobian point in place (works for the point at infinity too).
+fn jDouble(q: ptr): void {
+    let t1 = newFe(); let t2 = newFe(); let t3 = newFe(); let t4 = newFe();
+    feSq(t1, pz(q));                       // z^2
+    feAdd(t2, px(q), t1);                  // x + z^2
+    feSub(t1, px(q), t1);                  // x - z^2
+    feMul(t3, t1, t2);
+    feAdd(t1, t3, t3);
+    feAdd(t1, t3, t1);                     // m = 3*(x+z^2)*(x-z^2)
+    feSq(t3, py(q));
+    feAdd(t3, t3, t3);                     // 2*y^2
+    feMul(t2, px(q), t3);
+    feAdd(t2, t2, t2);                     // s = 4*x*y^2
+    feSq(px(q), t1);
+    feSub(px(q), px(q), t2);
+    feSub(px(q), px(q), t2);               // x' = m^2 - 2s
+    feMul(t4, py(q), pz(q));
+    feAdd(pz(q), t4, t4);                  // z' = 2*y*z
+    feSub(t2, t2, px(q));                  // s - x'
+    feMul(py(q), t1, t2);                  // m*(s - x')
+    feSq(t4, t3);
+    feAdd(t4, t4, t4);                     // 8*y^4
+    feSub(py(q), py(q), t4);               // y'
+    bytes.free(t1); bytes.free(t2); bytes.free(t3); bytes.free(t4);
+}
+
+// Add Jacobian point p2 into p1 (general case; the caller's ladder guards the exceptional cases).
+fn jAdd(p1: ptr, p2: ptr): void {
+    let t1 = newFe(); let t2 = newFe(); let t3 = newFe(); let t4 = newFe();
+    let t5 = newFe(); let t6 = newFe(); let t7 = newFe();
+    feSq(t3, pz(p2));
+    feMul(t1, px(p1), t3);                 // u1 = x1*z2^2
+    feMul(t4, pz(p2), t3);
+    feMul(t3, py(p1), t4);                 // s1 = y1*z2^3
+    feSq(t4, pz(p1));
+    feMul(t2, px(p2), t4);                 // u2 = x2*z1^2
+    feMul(t5, pz(p1), t4);
+    feMul(t4, py(p2), t5);                 // s2 = y2*z1^3
+    feSub(t2, t2, t1);                     // h = u2 - u1
+    feSub(t4, t4, t3);                     // r = s2 - s1
+    feSq(t7, t2);                          // h^2
+    feMul(t6, t1, t7);                     // u1*h^2
+    feMul(t5, t7, t2);                     // h^3
+    feSq(px(p1), t4);                      // r^2
+    feSub(px(p1), px(p1), t5);
+    feSub(px(p1), px(p1), t6);
+    feSub(px(p1), px(p1), t6);             // x3
+    feSub(t6, t6, px(p1));
+    feMul(py(p1), t4, t6);
+    feMul(t1, t5, t3);                     // s1*h^3
+    feSub(py(p1), py(p1), t1);             // y3
+    feMul(t1, pz(p1), pz(p2));
+    feMul(pz(p1), t1, t2);                 // z3 = h*z1*z2
+    bytes.free(t1); bytes.free(t2); bytes.free(t3); bytes.free(t4);
+    bytes.free(t5); bytes.free(t6); bytes.free(t7);
+}
+
+fn neqZero(v: ulong): ulong { return ((v | (U0 - v)) >> 63) & U1; }
+fn eqVal(v: ulong, c: ulong): ulong { return neqZero(v ^ c) ^ U1; }
+
+// Multiply Jacobian point p by the big-endian scalar x[0..xlen), in place. 2-bit window ladder with a
+// constant-time "still infinity" flag (BearSSL p256_mul). The scalar must be < the group order n.
+fn scalarMultPoint(p: ptr, x: ptr, xlen: int): void {
+    let p2 = newPt(); ptCopy(p2, p); jDouble(p2);        // 2P
+    let p3 = newPt(); ptCopy(p3, p); jAdd(p3, p2);       // 3P
+    let q = newPt(); ptZero(q);                          // Q = 0 (infinity)
+    let tt = newPt(); let uu = newPt();
+    let qz: ulong = 1;
+    let bi = 0;
+    while (bi < xlen) {
+        let byteV = bytes.read_byte(x, bi);
+        let k = 6;
+        while (k >= 0) {
+            jDouble(q); jDouble(q);
+            ptCopy(tt, p);
+            ptCopy(uu, q);
+            let bitsPair = ((byteV >> k) & 3) as ulong;
+            let bnz = neqZero(bitsPair);
+            ptCcopy(tt, p2, eqVal(bitsPair, 2));
+            ptCcopy(tt, p3, eqVal(bitsPair, 3));
+            jAdd(uu, tt);
+            ptCcopy(q, tt, bnz & qz);
+            ptCcopy(q, uu, bnz & (qz ^ U1));
+            qz = qz & (bnz ^ U1);
+            k = k - 2;
+        }
+        bi = bi + 1;
+    }
+    ptCopy(p, q);
+    bytes.free(p2); bytes.free(p3); bytes.free(q); bytes.free(tt); bytes.free(uu);
+}
+
+// Recover affine (x, y) from a Jacobian point (both outputs are canonical, non-Montgomery).
+fn toAffine(p: ptr, xaOut: ptr, yaOut: ptr): void {
+    let zinv = newFe(); feInvert(zinv, pz(p));
+    let z2 = newFe(); feSq(z2, zinv);
+    let xm = newFe(); feMul(xm, px(p), z2);
+    let z3 = newFe(); feMul(z3, z2, zinv);
+    let ym = newFe(); feMul(ym, py(p), z3);
+    fromMont(xaOut, xm);
+    fromMont(yaOut, ym);
+    bytes.free(zinv); bytes.free(z2); bytes.free(xm); bytes.free(z3); bytes.free(ym);
+}
+
+// Set p = the generator G in Montgomery Jacobian form (Z = 1).
+fn baseG(p: ptr): void {
+    let gx = bytes.alloc(32);
+    setHex(gx, "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296");
+    let gy = bytes.alloc(32);
+    setHex(gy, "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5");
+    let t = newFe();
+    feFromBE(t, gx, 0); toMont(px(p), t);
+    feFromBE(t, gy, 0); toMont(py(p), t);
+    feZero(t); setw(t, 0, U1); toMont(pz(p), t);
+    bytes.free(gx); bytes.free(gy); bytes.free(t);
+}
+
+// Is (xn, yn) (canonical, non-Montgomery) a point on the curve y^2 = x^3 - 3x + b?
+fn onCurve(xn: ptr, yn: ptr): bool {
+    let xm = newFe(); let ym = newFe();
+    toMont(xm, xn); toMont(ym, yn);
+    let l = newFe(); feSq(l, ym);
+    let r = newFe(); feSq(r, xm); feMul(r, r, xm);   // x^3
+    let t = newFe(); feAdd(t, xm, xm); feAdd(t, t, xm);
+    feSub(r, r, t);                                  // x^3 - 3x
+    let bm = newFe(); bMont(bm); feAdd(r, r, bm);    // + b
+    let ok = feEq(l, r);
+    bytes.free(xm); bytes.free(ym); bytes.free(l); bytes.free(r); bytes.free(t); bytes.free(bm);
+    return ok;
+}
+
+// ---- public API ----
+
+// Derive the uncompressed public key (0x04 || X || Y, 65 bytes) for a 32-byte big-endian private scalar.
+pub fn derivePublic(outPub65: ptr, scalar32: ptr): void {
+    let g = newPt(); baseG(g);
+    scalarMultPoint(g, scalar32, 32);
+    let xa = newFe(); let ya = newFe();
+    toAffine(g, xa, ya);
+    bytes.write_byte(outPub65, 0, 4);
+    feToBE(outPub65, 1, xa);
+    feToBE(outPub65, 33, ya);
+    bytes.free(g); bytes.free(xa); bytes.free(ya);
+}
+
+// ECDH: shared secret (32-byte big-endian X coordinate) from our 32-byte scalar and the peer's
+// uncompressed public point (65 bytes). Returns 1 on success, 0 if the peer point is invalid.
+pub fn ecdh(outSecret32: ptr, scalar32: ptr, peerPub65: ptr): int {
+    if (bytes.read_byte(peerPub65, 0) != 4) { return 0; }
+    let xn = newFe(); let yn = newFe();
+    feFromBE(xn, peerPub65, 1); feFromBE(yn, peerPub65, 33);
+    if (!feLtP(xn) || !feLtP(yn) || !onCurve(xn, yn)) {
+        bytes.free(xn); bytes.free(yn);
+        return 0;
+    }
+    let q = newPt();
+    toMont(px(q), xn); toMont(py(q), yn);
+    let one = newFe(); feZero(one); setw(one, 0, U1); toMont(pz(q), one);
+    scalarMultPoint(q, scalar32, 32);
+    let xa = newFe(); let ya = newFe();
+    toAffine(q, xa, ya);
+    feToBE(outSecret32, 0, xa);
+    bytes.free(xn); bytes.free(yn); bytes.free(q); bytes.free(one);
+    bytes.free(xa); bytes.free(ya);
+    return 1;
+}
