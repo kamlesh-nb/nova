@@ -70,6 +70,38 @@ fn full_client_handshake(): void {
     assert.equalInt((c.sSeq as int), 0);
 }
 
+// The ClientHello builder produces a well-formed handshake message carrying our key_share.
+@test
+fn build_client_hello(): void {
+    let rnd = bytes.alloc(32);
+    let sid = bytes.alloc(32);
+    let pk = hexBuf("99381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c");
+    let i = 0;
+    while (i < 32) { bytes.write_byte(rnd, i, i); bytes.write_byte(sid, i, 255 - i); i = i + 1; }
+    let out = bytes.alloc(512);
+    let n = tls13client.buildClientHello(rnd, sid, pk, out);
+    // Handshake type 0x01, and the 3-byte body length equals n-4.
+    assert.equalInt(bytes.read_byte(out, 0), 0x01);
+    let bodyLen = (bytes.read_byte(out, 1) << 16) | (bytes.read_byte(out, 2) << 8) | bytes.read_byte(out, 3);
+    assert.equalInt(bodyLen, n - 4);
+    // The key_share is the last 32 bytes and equals our public key.
+    assert.isTrue(eqHex(at(out, n - 32), 32, "99381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c"));
+}
+
+fn at(buf: ptr, off: int): ptr { return (buf as long + off) as ptr; }
+
+// The incremental feedHandshake path (used for live, fragment-tolerant reassembly) verifies the flight.
+@test
+fn flight_reassembly(): void {
+    let c = tls13client.newClient(hexBuf(CLIENT_PRIV));
+    c.addClientHello(hexBuf(CH), 196);
+    c.processServerHello(hexBuf(SH), 90);
+    let r = c.feedHandshake(hexBuf(REC), 679);
+    assert.equalInt(r, 1);                        // 1 = server Finished reached
+    assert.isTrue(c.certVerifyOk);
+    assert.isTrue(c.finishedOk);
+}
+
 // A tampered flight (flipped ciphertext byte) fails verification.
 @test
 fn tampered_flight(): void {

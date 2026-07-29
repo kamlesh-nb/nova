@@ -1,0 +1,155 @@
+// A live TLS 1.3 client in pure Nova (no external crypto library), driving the crypto/tls13client state
+// machine over a blocking socket. It completes a real TLS 1.3 handshake and exchanges encrypted
+// application data. Verified end to end against `openssl s_server -tls1_3`:
+//
+//   openssl s_server -accept 127.0.0.1:4433 -cert cert.pem -key key.pem -tls1_3 -www
+//   nova examples/tls13_client.nova -o tls13_client && ./tls13_client
+//
+// The Nova client's ClientHello is accepted, it verifies the server's RSA-PSS/ECDSA CertificateVerify and
+// the Finished MAC, sends its own Finished, and decrypts the server's HTTP response. Certificate-chain
+// trust decisions (validity dates, name matching, a trust store) are a separate policy layer.
+import os.sys;
+import net.reactorio;
+import crypto.tls13client;
+import crypto.x25519;
+import crypto.random;
+import bytes;
+
+fn at(b: ptr, off: int): ptr { return (b as long + off) as ptr; }
+
+fn logStr(s: string): void {
+    let b = bytes.alloc(s.length + 1);
+    let i = 0;
+    while (i < s.length) { bytes.write_byte(b, i, s[i]); i = i + 1; }
+    bytes.write_byte(b, s.length, 10);
+    sys.write(1, b, (s.length + 1) as long);
+    bytes.free(b);
+}
+
+fn fillRandom(buf: ptr, n: int): void {
+    let s = random.randomBytes(n);
+    let i = 0;
+    while (i < n) { bytes.write_byte(buf, i, s[i] & 0xff); i = i + 1; }
+}
+
+fn base9(): ptr {
+    let b = bytes.alloc(32);
+    bytes.write_byte(b, 0, 9);
+    let i = 1;
+    while (i < 32) { bytes.write_byte(b, i, 0); i = i + 1; }
+    return b;
+}
+
+// Read exactly n bytes into buf+off; 0 on success, -1 on EOF/error.
+fn readN(fd: int, buf: ptr, off: int, n: int): int {
+    let got = 0;
+    while (got < n) {
+        let r = sys.read(fd, at(buf, off + got), (n - got) as long);
+        if (r <= 0) { return -1; }
+        got = got + (r as int);
+    }
+    return 0;
+}
+
+// Read one TLS record (5-byte header + body). Returns the total record length, or -1.
+fn readRecord(fd: int, buf: ptr): int {
+    if (readN(fd, buf, 0, 5) != 0) { return -1; }
+    let len = (bytes.read_byte(buf, 3) << 8) | bytes.read_byte(buf, 4);
+    if (readN(fd, buf, 5, len) != 0) { return -1; }
+    return 5 + len;
+}
+
+fn writeAll(fd: int, buf: ptr, n: int): void {
+    let sent = 0;
+    while (sent < n) {
+        let w = sys.write(fd, at(buf, sent), (n - sent) as long);
+        if (w <= 0) { return; }
+        sent = sent + (w as int);
+    }
+}
+
+fn main(): int {
+    let fd = sys.socket(sys.AF_INET, sys.SOCK_STREAM, 0);
+    let sa = sys.makeSockaddrIn(4433, reactorio.parseIPv4("127.0.0.1"));
+    if (sys.connect(fd, sa, 16) != 0) { logStr("connect failed"); return 1; }
+    bytes.free(sa);
+    logStr("connected to 127.0.0.1:4433");
+
+    // Ephemeral X25519 key + ClientHello.
+    let priv = bytes.alloc(32); fillRandom(priv, 32);
+    let epub = bytes.alloc(32); x25519.scalarMult(epub, priv, base9());
+    let c = tls13client.newClient(priv);
+    let rnd = bytes.alloc(32); fillRandom(rnd, 32);
+    let sid = bytes.alloc(32); fillRandom(sid, 32);
+    let ch = bytes.alloc(1024);
+    let chLen = tls13client.buildClientHello(rnd, sid, epub, ch);
+    c.addClientHello(ch, chLen);
+
+    let rec = bytes.alloc(chLen + 5);
+    bytes.write_byte(rec, 0, 0x16); bytes.write_byte(rec, 1, 0x03); bytes.write_byte(rec, 2, 0x01);
+    bytes.write_byte(rec, 3, (chLen >> 8) & 0xff); bytes.write_byte(rec, 4, chLen & 0xff);
+    let i = 0;
+    while (i < chLen) { bytes.write_byte(rec, 5 + i, bytes.read_byte(ch, i)); i = i + 1; }
+    writeAll(fd, rec, chLen + 5);
+    logStr("sent ClientHello");
+
+    // ServerHello.
+    let buf = bytes.alloc(32768);
+    let n = readRecord(fd, buf);
+    if (n < 0 || bytes.read_byte(buf, 0) != 0x16) { logStr("no ServerHello"); return 1; }
+    c.processServerHello(at(buf, 5), n - 5);
+    logStr("got ServerHello, derived handshake keys");
+
+    // Read records until the encrypted handshake flight is fully reassembled and verified.
+    let flightOk = false;
+    let tries = 0;
+    while (!flightOk && tries < 40) {
+        let m = readRecord(fd, buf);
+        if (m < 0) { logStr("read error before flight"); return 1; }
+        let r = c.feedHandshake(buf, m);
+        if (r == 0 - 1) { logStr("flight decrypt FAILED"); return 1; }
+        if (r == 1) { flightOk = true; }
+        tries = tries + 1;
+    }
+    if (!flightOk) { logStr("FLIGHT VERIFY FAILED"); return 1; }
+    logStr("server flight verified: CertificateVerify + Finished OK");
+
+    // Send the client Finished, then an HTTP request over the application channel.
+    let vd = bytes.alloc(32);
+    c.clientFinished(vd);
+    let fin = bytes.alloc(128);
+    let finLen = c.clientFinishedRecord(vd, fin);
+    writeAll(fd, fin, finLen);
+    logStr("sent client Finished; handshake complete");
+
+    let req = "GET / HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let reqBuf = bytes.alloc(req.length);
+    i = 0;
+    while (i < req.length) { bytes.write_byte(reqBuf, i, req[i]); i = i + 1; }
+    let app = bytes.alloc(req.length + 64);
+    let appLen = c.encryptApp(reqBuf, req.length, app);
+    writeAll(fd, app, appLen);
+    logStr("sent encrypted HTTP request; reading response...");
+
+    // Decrypt server records; print the first application-data plaintext.
+    let out = bytes.alloc(32768);
+    let got = 0;
+    while (got < 16) {
+        let m = readRecord(fd, buf);
+        if (m < 0) { got = 16; }
+        else {
+            let inner = c.decryptApp(buf, m, out);
+            if (inner > 0 && bytes.read_byte(out, inner - 1) == 0x17) {
+                logStr("--- decrypted application data (first 300 bytes) ---");
+                let show = inner - 1;
+                if (show > 300) { show = 300; }
+                sys.write(1, out, show as long);
+                got = 16;
+            }
+        }
+        got = got + 1;
+    }
+    sys.close(fd);
+    logStr("done");
+    return 0;
+}

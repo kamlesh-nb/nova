@@ -13,6 +13,55 @@ import crypto.sha256;
 
 fn at(buf: ptr, off: int): ptr { return (buf as long + off) as ptr; }
 
+fn chNib(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    return c - 87;
+}
+fn putHex(out: ptr, p: int, hex: string): int {
+    let n = hex.length / 2;
+    let i = 0;
+    while (i < n) { bytes.write_byte(out, p + i, chNib(hex[i * 2]) * 16 + chNib(hex[i * 2 + 1])); i = i + 1; }
+    return p + n;
+}
+
+// Build a minimal TLS 1.3 ClientHello handshake message into out: offers X25519 + AES-128-GCM-SHA256,
+// with supported_versions=1.3, supported_groups=x25519, signature_algorithms (RSA-PSS/PKCS1 + ECDSA
+// P-256, all SHA-256), and a key_share carrying our ephemeral public key. random and sessionId are 32
+// bytes each; ephPub is our 32-byte X25519 public key. Returns the message length.
+pub fn buildClientHello(random: ptr, sessionId: ptr, ephPub: ptr, out: ptr): int {
+    let p = 4;                                     // reserve the 4-byte handshake header
+    bytes.write_byte(out, p, 0x03); bytes.write_byte(out, p + 1, 0x03); p = p + 2;   // legacy_version
+    let i = 0;
+    while (i < 32) { bytes.write_byte(out, p + i, bytes.read_byte(random, i)); i = i + 1; }
+    p = p + 32;
+    bytes.write_byte(out, p, 0x20); p = p + 1;     // legacy_session_id (32 bytes, middlebox compat)
+    i = 0;
+    while (i < 32) { bytes.write_byte(out, p + i, bytes.read_byte(sessionId, i)); i = i + 1; }
+    p = p + 32;
+    p = putHex(out, p, "00021301");                // cipher_suites: TLS_AES_128_GCM_SHA256
+    p = putHex(out, p, "0100");                    // legacy_compression_methods: null
+
+    let extLenPos = p; p = p + 2;                  // extensions length (backpatched)
+    let extStart = p;
+    p = putHex(out, p, "002b0003020304");          // supported_versions: TLS 1.3
+    p = putHex(out, p, "000a00040002001d");        // supported_groups: x25519
+    p = putHex(out, p, "000d00080006080404030401");// signature_algorithms: rsa_pss/ecdsa/rsa_pkcs1 SHA-256
+    p = putHex(out, p, "003300260024001d0020");    // key_share: x25519 entry header
+    i = 0;
+    while (i < 32) { bytes.write_byte(out, p + i, bytes.read_byte(ephPub, i)); i = i + 1; }
+    p = p + 32;
+    let extLen = p - extStart;
+    bytes.write_byte(out, extLenPos, (extLen >> 8) & 0xff);
+    bytes.write_byte(out, extLenPos + 1, extLen & 0xff);
+
+    let bodyLen = p - 4;                            // handshake header: type 0x01 + 3-byte length
+    bytes.write_byte(out, 0, 0x01);
+    bytes.write_byte(out, 1, (bodyLen >> 16) & 0xff);
+    bytes.write_byte(out, 2, (bodyLen >> 8) & 0xff);
+    bytes.write_byte(out, 3, bodyLen & 0xff);
+    return p;
+}
+
 struct TlsClient {
     pub kind: int,                       // HKDF hash: 0 = SHA-256
     pub suite: int,                      // 0 = AES-128-GCM, 1 = AES-256-GCM, 2 = ChaCha20-Poly1305
@@ -29,6 +78,8 @@ struct TlsClient {
     pub sSeq: long, pub cSeq: long,      // server / client record sequence numbers
     pub certVerifyOk: bool,
     pub finishedOk: bool,
+    pub hsBuf: ptr, pub hsCap: int, pub hsLen: int, pub hsPos: int,   // handshake reassembly buffer
+    pub leafOff: int, pub leafLen: int,  // leaf certificate location within hsBuf
 }
 
 pub fn newClient(ephPriv: ptr): TlsClient {
@@ -39,6 +90,7 @@ pub fn newClient(ephPriv: ptr): TlsClient {
         master: bytes.alloc(48), cap: bytes.alloc(48), sap: bytes.alloc(48),
         capKey: bytes.alloc(32), capIv: bytes.alloc(12), sapKey: bytes.alloc(32), sapIv: bytes.alloc(12),
         sSeq: 0, cSeq: 0, certVerifyOk: false, finishedOk: false,
+        hsBuf: bytes.alloc(8192), hsCap: 8192, hsLen: 0, hsPos: 0, leafOff: 0, leafLen: 0,
     };
 }
 
@@ -136,6 +188,78 @@ pub fn processFlight(self: TlsClient, record: ptr, recLen: int): bool {
     }
     bytes.free(inner);
     return self.certVerifyOk && self.finishedOk;
+}
+
+fn hsAppend(self: TlsClient, src: ptr, n: int): void {
+    if (self.hsLen + n > self.hsCap) {
+        let nc = (self.hsLen + n) * 2;
+        let nb = bytes.alloc(nc);
+        let i = 0;
+        while (i < self.hsLen) { bytes.write_byte(nb, i, bytes.read_byte(self.hsBuf, i)); i = i + 1; }
+        bytes.free(self.hsBuf);
+        self.hsBuf = nb;
+        self.hsCap = nc;
+    }
+    let i = 0;
+    while (i < n) { bytes.write_byte(self.hsBuf, self.hsLen + i, bytes.read_byte(src, i)); i = i + 1; }
+    self.hsLen = self.hsLen + n;
+}
+
+// Feed one decrypted-or-not server record during the handshake. Real servers fragment the flight across
+// several records (and may coalesce), so the handshake messages are reassembled in hsBuf and processed as
+// each becomes complete. Returns 1 once the server Finished has been processed, 0 if more records are
+// needed, or -1 on a decryption failure. Non-handshake records (e.g. a ChangeCipherSpec) are ignored.
+pub fn feedHandshake(self: TlsClient, record: ptr, recLen: int): int {
+    let rtype = bytes.read_byte(record, 0);
+    if (rtype != 0x17) { return 0; }               // e.g. ChangeCipherSpec, skip
+    let inner = bytes.alloc(recLen);
+    let innerLen = tls13.recordUnprotect(self.suite, self.sKey, self.sIv, self.sSeq, record, recLen, inner);
+    self.sSeq = self.sSeq + 1;
+    if (innerLen < 0) { bytes.free(inner); return -1; }
+    let typeOut = bytes.alloc(1);
+    let contentLen = tls13.innerParse(inner, innerLen, typeOut);
+    let ctype = bytes.read_byte(typeOut, 0);
+    bytes.free(typeOut);
+    if (ctype == 0x16) { hsAppend(self, inner, contentLen); }
+    bytes.free(inner);
+
+    let done = 0;
+    while (self.hsPos + 4 <= self.hsLen) {
+        let mlen = (bytes.read_byte(self.hsBuf, self.hsPos + 1) << 16)
+                 | (bytes.read_byte(self.hsBuf, self.hsPos + 2) << 8)
+                 | bytes.read_byte(self.hsBuf, self.hsPos + 3);
+        let msgLen = 4 + mlen;
+        if (self.hsPos + msgLen > self.hsLen) { return done; }   // message not fully received yet
+        let mtype = bytes.read_byte(self.hsBuf, self.hsPos);
+        let mp = self.hsPos;
+        if (mtype == 0x0b) {                       // Certificate
+            let clen = (bytes.read_byte(self.hsBuf, mp + 8) << 16) | (bytes.read_byte(self.hsBuf, mp + 9) << 8)
+                     | bytes.read_byte(self.hsBuf, mp + 10);
+            self.leafOff = mp + 11;
+            self.leafLen = clen;
+            trAdd(self, at(self.hsBuf, mp), msgLen);
+        } else if (mtype == 0x0f) {                // CertificateVerify
+            let hCert = bytes.alloc(48);
+            trHash(self, hCert);
+            let scheme = (bytes.read_byte(self.hsBuf, mp + 4) << 8) | bytes.read_byte(self.hsBuf, mp + 5);
+            let siglen = (bytes.read_byte(self.hsBuf, mp + 6) << 8) | bytes.read_byte(self.hsBuf, mp + 7);
+            let cert = x509.parseCert(at(self.hsBuf, self.leafOff), self.leafLen);
+            self.certVerifyOk = tls13hs.verifyCertificateVerify(cert, scheme, at(self.hsBuf, mp + 8), siglen, hCert);
+            bytes.free(hCert);
+            trAdd(self, at(self.hsBuf, mp), msgLen);
+        } else if (mtype == 0x14) {                // Finished
+            let hCV = bytes.alloc(48);
+            trHash(self, hCV);
+            self.finishedOk = tls13hs.verifyFinished(self.kind, self.shs, hCV, at(self.hsBuf, mp + 4));
+            bytes.free(hCV);
+            trAdd(self, at(self.hsBuf, mp), msgLen);
+            done = 1;
+        } else {                                   // EncryptedExtensions and others
+            trAdd(self, at(self.hsBuf, mp), msgLen);
+        }
+        self.hsPos = self.hsPos + msgLen;
+    }
+    return done;
 }
 
 // Derive the application traffic secrets and keys (over the transcript through the server Finished), then
