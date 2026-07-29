@@ -1,34 +1,13 @@
-
+// String-convenience SHA/HMAC/PBKDF2 facade over the pure-Nova ptr-based primitives (crypto/hash/*,
+// crypto/mac/hmac, crypto/kdf/pbkdf2). No external library. This is the API the SCRAM and SQL-driver
+// auth paths use; the KATs below pin the wire outputs.
 import bytes;
+import crypto.hash.sha256;
+import crypto.hash.sha512;
+import crypto.hash.sha1;
+import crypto.mac.hmac;
+import crypto.kdf.pbkdf2;
 import assert;
-
-pub fn sha256(input: string): string {
-    return nova_sha256(input);
-}
-
-pub fn sha512(input: string): string {
-    return nova_sha512(input);
-}
-
-pub fn sha1(input: string): string {
-    return nova_sha1(input);
-}
-
-pub fn hmacSha256(key: string, msg: string): string {
-    return nova_hmac_sha256(key, msg);
-}
-
-pub fn sha256Raw(input: string): string {
-    return nova_sha256_raw(input);
-}
-
-pub fn hmacSha256Raw(key: string, msg: string): string {
-    return nova_hmac_sha256_raw(key, msg);
-}
-
-pub fn pbkdf2HmacSha256(password: string, salt: string, iterations: int, dkLen: int): string {
-    return nova_pbkdf2_hmac_sha256(password, salt, iterations as long, dkLen as long);
-}
 
 pub fn toHex(raw: string): string {
     const digits: string = "0123456789abcdef";
@@ -44,9 +23,45 @@ pub fn toHex(raw: string): string {
     return out as string;
 }
 
+// Raw-digest helpers return an N-byte string (the heap header carries the length, so embedded NUL bytes
+// are preserved). The hex helpers wrap these through toHex.
+pub fn sha256Raw(input: string): string {
+    let out = bytes.alloc(32);
+    sha256.hashInto(input as ptr, input.length, out);
+    return out as string;
+}
+
+pub fn sha512Raw(input: string): string {
+    let out = bytes.alloc(64);
+    sha512.hashInto(input as ptr, input.length, out);
+    return out as string;
+}
+
+pub fn sha1Raw(input: string): string {
+    let out = bytes.alloc(20);
+    sha1.hashInto(input as ptr, input.length, out);
+    return out as string;
+}
+
+pub fn hmacSha256Raw(key: string, msg: string): string {
+    let out = bytes.alloc(32);
+    hmac.hmacSha256(key as ptr, key.length, msg as ptr, msg.length, out);
+    return out as string;
+}
+
+pub fn sha256(input: string): string { return toHex(sha256Raw(input)); }
+pub fn sha512(input: string): string { return toHex(sha512Raw(input)); }
+pub fn sha1(input: string): string { return toHex(sha1Raw(input)); }
+pub fn hmacSha256(key: string, msg: string): string { return toHex(hmacSha256Raw(key, msg)); }
+
+pub fn pbkdf2HmacSha256(password: string, salt: string, iterations: int, dkLen: int): string {
+    let out = bytes.alloc(dkLen);
+    pbkdf2.pbkdf2Sha256(password as ptr, password.length, salt as ptr, salt.length, iterations, out, dkLen);
+    return out as string;
+}
+
 @test
 fn test_sha_kats(): void {
-
     assert.equalStr(sha256("hello"), "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
     assert.equalStr(sha256(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
     assert.equalStr(sha512("abc"), "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f");
@@ -55,14 +70,12 @@ fn test_sha_kats(): void {
 
 @test
 fn test_hmac_kat(): void {
-
     assert.equalStr(hmacSha256("Jefe", "what do ya want for nothing?"),
                     "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
 }
 
 @test
 fn test_raw_matches_hex(): void {
-
     assert.equalStr(toHex(sha256Raw("hello")), sha256("hello"));
     assert.equalStr(toHex(hmacSha256Raw("Jefe", "what do ya want for nothing?")),
                     hmacSha256("Jefe", "what do ya want for nothing?"));
@@ -70,7 +83,6 @@ fn test_raw_matches_hex(): void {
 
 @test
 fn test_pbkdf2_kats(): void {
-
     assert.equalStr(toHex(pbkdf2HmacSha256("password", "salt", 1, 32)),
                     "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b");
     assert.equalStr(toHex(pbkdf2HmacSha256("password", "salt", 2, 32)),

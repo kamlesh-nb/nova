@@ -29,8 +29,9 @@ fn test_hmac_sha256_kat(): void {
 @test
 fn test_csprng(): void {
     let a = random.randomBytes(16);
-    assert.equalInt(a.length, 32);
+    assert.equalInt(a.length, 16);                 // raw bytes (M11: randomBytes returns n bytes, not hex)
     assert.isTrue(a != random.randomBytes(16));
+    assert.equalInt(random.randomHex(16).length, 32);   // hex form is still 2n chars
     let r = random.randomInt(50);
     assert.isTrue(r >= 0);
     assert.isTrue(r < 50);

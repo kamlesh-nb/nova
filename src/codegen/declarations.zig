@@ -240,23 +240,13 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
 
         {
             var one_ptr = [_]types.LLVMTypeRef{compiler.ptr_type};
-            var two_ptr = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.ptr_type };
             var one_val = [_]types.LLVMTypeRef{compiler.val_type};
-            const ptr_1ptr = core.LLVMFunctionType(compiler.ptr_type, &one_ptr, 1, 0);
-            const ptr_2ptr = core.LLVMFunctionType(compiler.ptr_type, &two_ptr, 2, 0);
             const val_0 = core.LLVMFunctionType(compiler.val_type, &one_ptr, 0, 0);
             const val_1val = core.LLVMFunctionType(compiler.val_type, &one_val, 1, 0);
-            const ptr_1val = core.LLVMFunctionType(compiler.ptr_type, &one_val, 1, 0);
             const Imp2 = struct { name: [:0]const u8, ty: types.LLVMTypeRef };
             const imps2 = [_]Imp2{
                 .{ .name = "nova_arg_count", .ty = val_0 },
                 .{ .name = "nova_arg_at", .ty = val_1val },
-                .{ .name = "nova_sha256", .ty = ptr_1ptr },
-                .{ .name = "nova_sha512", .ty = ptr_1ptr },
-                .{ .name = "nova_sha1", .ty = ptr_1ptr },
-                .{ .name = "nova_md5", .ty = ptr_1ptr },
-                .{ .name = "nova_hmac_sha256", .ty = ptr_2ptr },
-                .{ .name = "nova_random_hex", .ty = ptr_1val },
             };
             for (imps2) |imp| {
                 const f = core.LLVMAddFunction(compiler.module, imp.name.ptr, imp.ty);
@@ -439,47 +429,18 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         const argat_type = core.LLVMFunctionType(compiler.val_type, &argat_params, 1, 0);
         try compiler.func_map.put("nova_arg_at", core.LLVMAddFunction(compiler.module, "nova_arg_at", argat_type));
 
-        const sha256_type = core.LLVMFunctionType(compiler.ptr_type, &one_param_ptr, 1, 0);
-        const sha256_fn = core.LLVMAddFunction(compiler.module, "nova_sha256", sha256_type);
-        try compiler.func_map.put("nova_sha256", sha256_fn);
-
-        const md5_type = core.LLVMFunctionType(compiler.ptr_type, &one_param_ptr, 1, 0);
-        const md5_fn = core.LLVMAddFunction(compiler.module, "nova_md5", md5_type);
-        try compiler.func_map.put("nova_md5", md5_fn);
-
-        const sha512_fn = core.LLVMAddFunction(compiler.module, "nova_sha512", core.LLVMFunctionType(compiler.ptr_type, &one_param_ptr, 1, 0));
-        try compiler.func_map.put("nova_sha512", sha512_fn);
-
-        const sha1_fn = core.LLVMAddFunction(compiler.module, "nova_sha1", core.LLVMFunctionType(compiler.ptr_type, &one_param_ptr, 1, 0));
-        try compiler.func_map.put("nova_sha1", sha1_fn);
-
+        // SHA/MD5/HMAC/PBKDF2/random are now pure Nova (M11 stage A); only the MySQL auth-scramble and
+        // RSA-OAEP wolfCrypt shims remain declared here (retired in stage B).
         var scramble_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.ptr_type, compiler.i32_type };
         const scramble_fn = core.LLVMAddFunction(compiler.module, "nova_mysql_scramble", core.LLVMFunctionType(compiler.ptr_type, &scramble_params, 3, 0));
         try compiler.func_map.put("nova_mysql_scramble", scramble_fn);
         const scramble2_fn = core.LLVMAddFunction(compiler.module, "nova_mysql_sha2_scramble", core.LLVMFunctionType(compiler.ptr_type, &scramble_params, 3, 0));
         try compiler.func_map.put("nova_mysql_sha2_scramble", scramble2_fn);
 
-        var two_ptr = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.ptr_type };
-        const hmac_fn = core.LLVMAddFunction(compiler.module, "nova_hmac_sha256", core.LLVMFunctionType(compiler.ptr_type, &two_ptr, 2, 0));
-        try compiler.func_map.put("nova_hmac_sha256", hmac_fn);
-
-        const hmac_raw_fn = core.LLVMAddFunction(compiler.module, "nova_hmac_sha256_raw", core.LLVMFunctionType(compiler.ptr_type, &two_ptr, 2, 0));
-        try compiler.func_map.put("nova_hmac_sha256_raw", hmac_raw_fn);
-        const sha256_raw_fn = core.LLVMAddFunction(compiler.module, "nova_sha256_raw", core.LLVMFunctionType(compiler.ptr_type, &one_param_ptr, 1, 0));
-        try compiler.func_map.put("nova_sha256_raw", sha256_raw_fn);
-
         const gzc_fn = core.LLVMAddFunction(compiler.module, "nova_gzip_compress", core.LLVMFunctionType(compiler.ptr_type, &one_param_ptr, 1, 0));
         try compiler.func_map.put("nova_gzip_compress", gzc_fn);
         const gzd_fn = core.LLVMAddFunction(compiler.module, "nova_gzip_decompress", core.LLVMFunctionType(compiler.ptr_type, &one_param_ptr, 1, 0));
         try compiler.func_map.put("nova_gzip_decompress", gzd_fn);
-
-        var pbkdf2_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.ptr_type, compiler.val_type, compiler.val_type };
-        const pbkdf2_fn = core.LLVMAddFunction(compiler.module, "nova_pbkdf2_hmac_sha256", core.LLVMFunctionType(compiler.ptr_type, &pbkdf2_params, 4, 0));
-        try compiler.func_map.put("nova_pbkdf2_hmac_sha256", pbkdf2_fn);
-
-        var one_i64 = [_]types.LLVMTypeRef{compiler.val_type};
-        const rand_fn = core.LLVMAddFunction(compiler.module, "nova_random_hex", core.LLVMFunctionType(compiler.ptr_type, &one_i64, 1, 0));
-        try compiler.func_map.put("nova_random_hex", rand_fn);
 
         var rsa_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.ptr_type, compiler.i32_type };
         const rsa_fn = core.LLVMAddFunction(compiler.module, "nova_rsa_oaep_encrypt", core.LLVMFunctionType(compiler.ptr_type, &rsa_params, 3, 0));

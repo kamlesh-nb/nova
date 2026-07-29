@@ -158,14 +158,8 @@ void      nova_log_string(const char *s);
 void      nova_log_info(const char *s);
 void      nova_log_debug(const char *s);
 void      nova_log_err(const char *s);
-char*     nova_sha256(const char *input);
-char*     nova_sha512(const char *input);
-char*     nova_sha1(const char *input);
-char*     nova_md5(const char *input);
 char*     nova_mysql_scramble(const char *password, const char *salt, int salt_len);
 char*     nova_mysql_sha2_scramble(const char *password, const char *salt, int salt_len);
-char*     nova_hmac_sha256(const char *key, const char *msg);
-char*     nova_random_hex(long long n);
 void      nova_exit(int code);
 
 void        nova_test_reset(void);

@@ -1,36 +1,70 @@
-
+// CSPRNG + deterministic PCG helpers in pure Nova. Cryptographic randomness comes from the OS via
+// /dev/urandom (read through the honest nova_open/read/close primitives) - no wolfCrypt. The Prng below
+// is a deterministic PCG32 for reproducible, NON-cryptographic use (seeded simulations, jitter).
 import bytes;
+import os.sys;
 import assert;
 
-pub fn randomHex(nBytes: int): string {
-    return nova_random_hex(nBytes);
-}
+const HEXD: string = "0123456789abcdef";
 
-pub fn randomBytes(nBytes: int): string {
-    return nova_random_hex(nBytes);
-}
-
-fn hexDigit(c: int): int {
-    if (c >= 48 && c <= 57) { return c - 48; }
-    if (c >= 97 && c <= 102) { return c - 97 + 10; }
-    if (c >= 65 && c <= 70) { return c - 65 + 10; }
-    return 0;
-}
-
-fn hexToLong(hex: string): long {
-    let acc: long = 0;
+// NUL-terminated C string for a path literal.
+fn cstr(s: string): ptr {
+    let b = bytes.alloc(s.length + 1);
     let i = 0;
-    let n = hex.length;
-    while (i < n) {
-        acc = acc * 16 + (hexDigit(bytes.read_byte(hex, i)) as long);
+    while (i < s.length) { bytes.write_byte(b, i, s[i]); i = i + 1; }
+    bytes.write_byte(b, s.length, 0);
+    return b;
+}
+
+// Fill `n` bytes at `buf` with OS entropy. Returns the number of bytes read (n on success).
+fn osRandom(buf: ptr, n: int): int {
+    let path = cstr("/dev/urandom");
+    let fd = sys.nova_open(path, sys.O_RDONLY, 0);
+    bytes.free(path);
+    if (fd < 0) { return 0; }
+    let got = 0;
+    while (got < n) {
+        let r = sys.read(fd, (buf as long + got) as ptr, (n - got) as long);
+        if (r <= 0) { sys.close(fd); return got; }
+        got = got + (r as int);
+    }
+    sys.close(fd);
+    return got;
+}
+
+// `nBytes` of OS entropy as a 2*nBytes-character lowercase hex string.
+pub fn randomHex(nBytes: int): string {
+    let raw = bytes.alloc(nBytes);
+    osRandom(raw, nBytes);
+    let out = bytes.alloc(nBytes * 2);
+    let i = 0;
+    while (i < nBytes) {
+        let b = bytes.read_byte(raw, i);
+        bytes.write_byte(out, i * 2, bytes.read_byte(HEXD, (b >> 4) & 15));
+        bytes.write_byte(out, i * 2 + 1, bytes.read_byte(HEXD, b & 15));
         i = i + 1;
     }
-    return acc;
+    bytes.free(raw);
+    return out as string;
+}
+
+// `nBytes` of OS entropy as a raw nBytes-length string (the heap header carries the length).
+pub fn randomBytes(nBytes: int): string {
+    let raw = bytes.alloc(nBytes);
+    osRandom(raw, nBytes);
+    return raw as string;
 }
 
 pub fn randomInt(bound: int): int {
     if (bound <= 0) { return 0; }
-    let draw: long = hexToLong(nova_random_hex(4));
+    let b = bytes.alloc(4);
+    osRandom(b, 4);
+    let draw: long = ((bytes.read_byte(b, 0) as long) << 24)
+        | ((bytes.read_byte(b, 1) as long) << 16)
+        | ((bytes.read_byte(b, 2) as long) << 8)
+        | (bytes.read_byte(b, 3) as long);
+    bytes.free(b);
+    if (draw < 0) { draw = 0 - draw; }
     return (draw % (bound as long)) as int;
 }
 
@@ -128,6 +162,10 @@ fn test_csprng_liveness(): void {
     let b = randomHex(16);
     assert.equalInt(a.length, 32);
     assert.isTrue(a != b);
+
+    // randomBytes returns raw bytes (length == nBytes).
+    let x = randomBytes(16);
+    assert.equalInt(x.length, 16);
 
     let r = randomInt(100);
     assert.isTrue(r >= 0);

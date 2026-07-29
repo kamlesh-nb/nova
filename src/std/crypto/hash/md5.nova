@@ -1,4 +1,131 @@
+// MD5 (RFC 1321) in pure Nova. MD5 is cryptographically broken and kept only for legacy protocol
+// compatibility (e.g. MySQL mysql_native_password). Do not use it for new security constructions.
+// Verified against the RFC 1321 test suite (see the KATs below).
+import bytes;
 
+// Per-round left-rotate amounts.
+fn shiftAt(i: int): int {
+    if (i < 16) {
+        let t = i & 3;
+        if (t == 0) { return 7; } if (t == 1) { return 12; } if (t == 2) { return 17; } return 22;
+    }
+    if (i < 32) {
+        let t = i & 3;
+        if (t == 0) { return 5; } if (t == 1) { return 9; } if (t == 2) { return 14; } return 20;
+    }
+    if (i < 48) {
+        let t = i & 3;
+        if (t == 0) { return 4; } if (t == 1) { return 11; } if (t == 2) { return 16; } return 23;
+    }
+    let t = i & 3;
+    if (t == 0) { return 6; } if (t == 1) { return 10; } if (t == 2) { return 15; } return 21;
+}
+
+// The 64 sine-derived constants, big-endian, 8 hex chars each.
+const KHEX: string = "d76aa478e8c7b756242070dbc1bdceeef57c0faf4787c62aa8304613fd469501698098d88b44f7afffff5bb1895cd7be6b901122fd987193a679438e49b40821f61e2562c040b340265e5a51e9b6c7aad62f105d02441453d8a1e681e7d3fbc821e1cde6c33707d6f4d50d87455a14eda9e3e905fcefa3f8676f02d98d2a4c8afffa39428771f6816d9d6122fde5380ca4beea444bdecfa9f6bb4b60bebfbc70289b7ec6eaa127fad4ef308504881d05d9d4d039e6db99e51fa27cf8c4ac5665f4292244432aff97ab9423a7fc93a039655b59c38f0ccc92ffeff47d85845dd16fa87e4ffe2ce6e0a30143144e0811a1f7537e82bd3af2352ad7d2bbeb86d391";
+
+fn hexNib(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    return c - 87;                              // lowercase a-f
+}
+fn kAt(i: int): ulong {
+    let o = i * 8;
+    let v: ulong = 0;
+    let j = 0;
+    while (j < 8) { v = (v << 4) | (hexNib(bytes.read_byte(KHEX, o + j)) as ulong); j = j + 1; }
+    return v;
+}
+
+fn rotl32(x: ulong, s: int): ulong {
+    let m: ulong = 0xffffffff;
+    let xm = x & m;
+    return ((xm << (s as ulong)) | (xm >> ((32 - s) as ulong))) & m;
+}
+fn m32(x: ulong): ulong { return x & 0xffffffff; }
+
+// Hash `len` bytes at `data`, writing the 16-byte digest to `out`.
+pub fn hashInto(data: ptr, len: int, out: ptr): void {
+    let m: ulong = 0xffffffff;
+    let a0: ulong = 0x67452301;
+    let b0: ulong = 0xefcdab89;
+    let c0: ulong = 0x98badcfe;
+    let d0: ulong = 0x10325476;
+
+    // Padded message: len + 1 (0x80) + zeros to 56 mod 64 + 8-byte little-endian bit length.
+    let padded = ((len + 8) / 64 + 1) * 64;
+    let buf = bytes.alloc(padded);
+    let i = 0;
+    while (i < len) { bytes.write_byte(buf, i, bytes.read_byte(data, i)); i = i + 1; }
+    bytes.write_byte(buf, len, 0x80);
+    i = len + 1;
+    while (i < padded) { bytes.write_byte(buf, i, 0); i = i + 1; }
+    let bitLen: ulong = (len as ulong) * 8;
+    i = 0;
+    while (i < 8) { bytes.write_byte(buf, padded - 8 + i, ((bitLen >> ((i * 8) as ulong)) & 0xff) as int); i = i + 1; }
+
+    let off = 0;
+    while (off < padded) {
+        let a = a0; let b = b0; let c = c0; let d = d0;
+        let j = 0;
+        while (j < 64) {
+            let f: ulong = 0;
+            let g = 0;
+            if (j < 16) {
+                f = (b & c) | ((m32(b) ^ m) & d);   // (b & c) | (~b & d)
+                g = j;
+            } else if (j < 32) {
+                f = (d & b) | ((m32(d) ^ m) & c);
+                g = (5 * j + 1) & 15;
+            } else if (j < 48) {
+                f = b ^ c ^ d;
+                g = (3 * j + 5) & 15;
+            } else {
+                f = c ^ (b | (m32(d) ^ m));
+                g = (7 * j) & 15;
+            }
+            // Little-endian 32-bit word g of this block.
+            let w: ulong = (bytes.read_byte(buf, off + g * 4) as ulong)
+                | ((bytes.read_byte(buf, off + g * 4 + 1) as ulong) << 8)
+                | ((bytes.read_byte(buf, off + g * 4 + 2) as ulong) << 16)
+                | ((bytes.read_byte(buf, off + g * 4 + 3) as ulong) << 24);
+            let tmp = d;
+            d = c;
+            c = b;
+            let sum = m32(a + m32(f) + kAt(j) + w);
+            b = m32(b + rotl32(sum, shiftAt(j)));
+            a = tmp;
+            j = j + 1;
+        }
+        a0 = m32(a0 + a); b0 = m32(b0 + b); c0 = m32(c0 + c); d0 = m32(d0 + d);
+        off = off + 64;
+    }
+    bytes.free(buf);
+
+    // Output the four state words little-endian.
+    writeLe(out, 0, a0); writeLe(out, 4, b0); writeLe(out, 8, c0); writeLe(out, 12, d0);
+}
+
+fn writeLe(out: ptr, o: int, v: ulong): void {
+    bytes.write_byte(out, o, (v & 0xff) as int);
+    bytes.write_byte(out, o + 1, ((v >> 8) & 0xff) as int);
+    bytes.write_byte(out, o + 2, ((v >> 16) & 0xff) as int);
+    bytes.write_byte(out, o + 3, ((v >> 24) & 0xff) as int);
+}
+
+const HEXD: string = "0123456789abcdef";
+
+// MD5 of a string, returned as a 32-character lowercase hex digest (matches the old C shim).
 pub fn md5(input: string): string {
-    return nova_md5(input);
+    let raw = bytes.alloc(16);
+    hashInto(input as ptr, input.length, raw);
+    let out = bytes.alloc(32);
+    let i = 0;
+    while (i < 16) {
+        let b = bytes.read_byte(raw, i);
+        bytes.write_byte(out, i * 2, bytes.read_byte(HEXD, (b >> 4) & 15));
+        bytes.write_byte(out, i * 2 + 1, bytes.read_byte(HEXD, b & 15));
+        i = i + 1;
+    }
+    bytes.free(raw);
+    return out as string;
 }
