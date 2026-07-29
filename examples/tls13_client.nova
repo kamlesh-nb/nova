@@ -10,8 +10,8 @@
 // trust decisions (validity dates, name matching, a trust store) are a separate policy layer.
 import os.sys;
 import net.reactorio;
-import crypto.tls13client;
-import crypto.x25519;
+import crypto.tls.13.tlsClient;
+import crypto.ecc.x25519;
 import crypto.random;
 import bytes;
 
@@ -78,11 +78,11 @@ fn main(): int {
     // Ephemeral X25519 key + ClientHello.
     let priv = bytes.alloc(32); fillRandom(priv, 32);
     let epub = bytes.alloc(32); x25519.scalarMult(epub, priv, base9());
-    let c = tls13client.newClient(priv);
+    let c = tlsClient.newClient(priv);
     let rnd = bytes.alloc(32); fillRandom(rnd, 32);
     let sid = bytes.alloc(32); fillRandom(sid, 32);
     let ch = bytes.alloc(1024);
-    let chLen = tls13client.buildClientHello(rnd, sid, epub, "localhost", ch);
+    let chLen = tlsClient.buildClientHello(rnd, sid, epub, "localhost", ch);
     c.addClientHello(ch, chLen);
 
     let rec = bytes.alloc(chLen + 5);
@@ -102,7 +102,7 @@ fn main(): int {
     let buf = bytes.alloc(32768);
     let n = readRecord(fd, buf);
     if (n < 0 || bytes.read_byte(buf, 0) != 0x16) { logStr("no ServerHello"); return 1; }
-    if (tls13client.isHelloRetryRequest(at(buf, 5)) || tls13client.hasDowngradeSentinel(at(buf, 5))) {
+    if (tlsClient.isHelloRetryRequest(at(buf, 5)) || tlsClient.hasDowngradeSentinel(at(buf, 5))) {
         logStr("HelloRetryRequest / downgrade rejected"); return 1;
     }
     c.processServerHello(at(buf, 5), n - 5);

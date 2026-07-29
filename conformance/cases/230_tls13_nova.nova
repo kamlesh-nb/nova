@@ -3,8 +3,8 @@
 // -> handshake secret -> client/server handshake traffic secrets -> server write key and IV), and the
 // server's first protected handshake record (decrypt to the exact plaintext, and re-encrypt to the exact
 // wire bytes) all match the published values.
-import crypto.x25519;
-import crypto.tls13;
+import crypto.ecc.x25519;
+import crypto.tls.13.tls;
 import bytes;
 import assert;
 
@@ -59,28 +59,28 @@ fn ecdhe(): void {
 @test
 fn key_schedule(): void {
     let early = bytes.alloc(32);
-    tls13.earlySecret(0, early);
+    tls.earlySecret(0, early);
     assert.isTrue(eqHex(early, 32, EARLY));
 
     let derived = bytes.alloc(32);
-    tls13.deriveDerived(0, early, derived);
+    tls.deriveDerived(0, early, derived);
     assert.isTrue(eqHex(derived, 32, DERIVED));
 
     let hs = bytes.alloc(32);
-    tls13.extractSecret(0, derived, hexBuf(ECDHE), 32, hs);
+    tls.extractSecret(0, derived, hexBuf(ECDHE), 32, hs);
     assert.isTrue(eqHex(hs, 32, HANDSHAKE));
 
     let chs = bytes.alloc(32);
-    tls13.deriveTraffic(0, hs, "c hs traffic", hexBuf(TRANSCRIPT), chs);
+    tls.deriveTraffic(0, hs, "c hs traffic", hexBuf(TRANSCRIPT), chs);
     assert.isTrue(eqHex(chs, 32, CLIENT_HS));
 
     let shs = bytes.alloc(32);
-    tls13.deriveTraffic(0, hs, "s hs traffic", hexBuf(TRANSCRIPT), shs);
+    tls.deriveTraffic(0, hs, "s hs traffic", hexBuf(TRANSCRIPT), shs);
     assert.isTrue(eqHex(shs, 32, SERVER_HS));
 
     let key = bytes.alloc(16);
     let iv = bytes.alloc(12);
-    tls13.deriveKeyIv(0, 0, shs, key, iv);        // suite 0 = AES-128-GCM
+    tls.deriveKeyIv(0, 0, shs, key, iv);        // suite 0 = AES-128-GCM
     assert.isTrue(eqHex(key, 16, SERVER_KEY));
     assert.isTrue(eqHex(iv, 12, SERVER_IV));
 }
@@ -95,7 +95,7 @@ fn record_unprotect(): void {
     let iv = hexBuf(SERVER_IV);
     let rec = hexBuf(REC);
     let out = bytes.alloc(700);
-    let innerLen = tls13.recordUnprotect(0, key, iv, 0, rec, 679, out);   // 674 - 16 = 658
+    let innerLen = tls.recordUnprotect(0, key, iv, 0, rec, 679, out);   // 674 - 16 = 658
     assert.equalInt(innerLen, 658);
     assert.isTrue(eqHex(out, 657, PAY));                                  // content
     assert.equalInt(bytes.read_byte(out, 657), 0x16);                    // inner content type = handshake
@@ -107,7 +107,7 @@ fn record_protect(): void {
     let key = hexBuf(SERVER_KEY);
     let iv = hexBuf(SERVER_IV);
     let out = bytes.alloc(700);
-    let recLen = tls13.recordProtect(0, key, iv, 0, hexBuf(PAY), 657, 0x16, out);
+    let recLen = tls.recordProtect(0, key, iv, 0, hexBuf(PAY), 657, 0x16, out);
     assert.equalInt(recLen, 679);
     assert.isTrue(eqBuf(out, hexBuf(REC), 679));
 }

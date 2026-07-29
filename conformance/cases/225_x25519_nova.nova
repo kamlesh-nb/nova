@@ -1,6 +1,6 @@
 // X25519 (RFC 7748) implemented in Nova (M9 phase C, no external library). Verified against the
 // RFC 7748 section 5.2 scalar-multiply vector and the section 6.1 Diffie-Hellman key agreement.
-import crypto.x25519;
+import crypto.ecc.x25519;
 import bytes;
 import assert;
 

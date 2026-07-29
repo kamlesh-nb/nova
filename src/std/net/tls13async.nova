@@ -7,8 +7,8 @@
 // the async I/O layer, exercised live against openssl s_server via examples/tls13_async_client.nova.
 import bytes;
 import net.reactorio;
-import crypto.tls13client;
-import crypto.tls13server;
+import crypto.tls.13.tlsClient;
+import crypto.tls.13.tlsServer;
 import crypto.random;
 
 fn at(b: ptr, off: int): ptr { return (b as long + off) as ptr; }
@@ -74,11 +74,11 @@ fn fillRandom(buf: ptr, n: int): void {
 // ServerHello, reassemble and verify the server's encrypted flight, and send the client Finished. `cl`
 // must be a fresh TlsClient carrying our ephemeral key; ephPub is that key's public value. Returns 0 on a
 // verified handshake, -1 otherwise.
-pub async fn handshake(io: TlsIO, cl: tls13client.TlsClient, ephPub: ptr, host: string): int {
+pub async fn handshake(io: TlsIO, cl: tlsClient.TlsClient, ephPub: ptr, host: string): int {
     let rnd = bytes.alloc(32); fillRandom(rnd, 32);
     let sid = bytes.alloc(32); fillRandom(sid, 32);
     let ch = bytes.alloc(1024);
-    let chLen = tls13client.buildClientHello(rnd, sid, ephPub, host, ch);
+    let chLen = tlsClient.buildClientHello(rnd, sid, ephPub, host, ch);
     cl.addClientHello(ch, chLen);
 
     let rec = bytes.alloc(chLen + 5);
@@ -98,7 +98,7 @@ pub async fn handshake(io: TlsIO, cl: tls13client.TlsClient, ephPub: ptr, host: 
     let n = await io.readRecord(buf);
     if (n < 0 || bytes.read_byte(buf, 0) != 0x16) { return -1; }
     // Reject a HelloRetryRequest (unsupported: we always offer x25519) and any version-downgrade attempt.
-    if (tls13client.isHelloRetryRequest(at(buf, 5)) || tls13client.hasDowngradeSentinel(at(buf, 5))) { return -1; }
+    if (tlsClient.isHelloRetryRequest(at(buf, 5)) || tlsClient.hasDowngradeSentinel(at(buf, 5))) { return -1; }
     cl.processServerHello(at(buf, 5), n - 5);
 
     let ok = 0;
@@ -122,7 +122,7 @@ pub async fn handshake(io: TlsIO, cl: tls13client.TlsClient, ephPub: ptr, host: 
 // dummy ChangeCipherSpec, and the encrypted flight (certificate + signed CertificateVerify + Finished),
 // then verify the client Finished. `srv` is a fresh TlsServer carrying the certificate and signing key.
 // serverRandom is 32 bytes. Returns 0 on a verified handshake, -1 otherwise.
-pub async fn serveHandshake(io: TlsIO, srv: tls13server.TlsServer, serverRandom: ptr): int {
+pub async fn serveHandshake(io: TlsIO, srv: tlsServer.TlsServer, serverRandom: ptr): int {
     let buf = bytes.alloc(33792);
     let n = await io.readRecord(buf);
     if (n < 0 || bytes.read_byte(buf, 0) != 0x16) { return -1; }
@@ -154,7 +154,7 @@ pub async fn serveHandshake(io: TlsIO, srv: tls13server.TlsServer, serverRandom:
 }
 
 // Send application data (server) over the established connection.
-pub async fn serverWrite(io: TlsIO, srv: tls13server.TlsServer, data: ptr, n: int): int {
+pub async fn serverWrite(io: TlsIO, srv: tlsServer.TlsServer, data: ptr, n: int): int {
     let out = bytes.alloc(n + 64);
     let m = srv.encryptApp(data, n, out);
     let r = await io.sendAll(out, m);
@@ -164,7 +164,7 @@ pub async fn serverWrite(io: TlsIO, srv: tls13server.TlsServer, data: ptr, n: in
 
 // Read the next application-data payload (server side). Returns the plaintext length (excluding the inner
 // content-type byte), or -1.
-pub async fn serverRead(io: TlsIO, srv: tls13server.TlsServer, out: ptr): int {
+pub async fn serverRead(io: TlsIO, srv: tlsServer.TlsServer, out: ptr): int {
     let rec = bytes.alloc(33792);
     while (true) {
         let m = await io.readRecord(rec);
@@ -177,7 +177,7 @@ pub async fn serverRead(io: TlsIO, srv: tls13server.TlsServer, out: ptr): int {
 }
 
 // Send application data over the established connection.
-pub async fn write(io: TlsIO, cl: tls13client.TlsClient, data: ptr, n: int): int {
+pub async fn write(io: TlsIO, cl: tlsClient.TlsClient, data: ptr, n: int): int {
     let out = bytes.alloc(n + 64);
     let m = cl.encryptApp(data, n, out);
     let r = await io.sendAll(out, m);
@@ -188,7 +188,7 @@ pub async fn write(io: TlsIO, cl: tls13client.TlsClient, data: ptr, n: int): int
 // Read the next application-data payload into out (up to the caller's buffer). Post-handshake handshake
 // records (e.g. NewSessionTicket) are decrypted to advance the sequence number and skipped. Returns the
 // plaintext length (excluding the inner content-type byte), or -1 on error.
-pub async fn read(io: TlsIO, cl: tls13client.TlsClient, out: ptr): int {
+pub async fn read(io: TlsIO, cl: tlsClient.TlsClient, out: ptr): int {
     let rec = bytes.alloc(33792);
     while (true) {
         let m = await io.readRecord(rec);

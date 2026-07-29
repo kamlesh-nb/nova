@@ -7,8 +7,8 @@
 import net.reactor;
 import net.reactorio;
 import net.tls13async;
-import crypto.tls13client;
-import crypto.x25519;
+import crypto.tls.13.tlsClient;
+import crypto.ecc.x25519;
 import crypto.random;
 import os.sys;
 import bytes;
@@ -36,7 +36,7 @@ async fn run(done: ptr): int {
     let io = tls13async.newIO(rs.fdOf(), kq);
     let priv = bytes.alloc(32); fillRandom(priv, 32);
     let epub = bytes.alloc(32); x25519.scalarMult(epub, priv, base9());
-    let cl = tls13client.newClient(priv);
+    let cl = tlsClient.newClient(priv);
 
     if (await tls13async.handshake(io, cl, epub, "localhost") < 0) {
         console.log("handshake FAILED"); bytes.write_byte(done, 0, 1); return 1;

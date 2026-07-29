@@ -1,8 +1,8 @@
 // ChaCha20 and Poly1305 implemented in Nova (M9 phase B, no external library). Verified against the
 // RFC 8439 test vectors: the ChaCha20 keystream block (section 2.3.2), the ChaCha20 encryption of the
 // 114-byte sunscreen message (section 2.4.2), and the Poly1305 tag (section 2.5.2).
-import crypto.chacha20;
-import crypto.poly1305;
+import crypto.cipher.chacha20;
+import crypto.mac.poly1305;
 import bytes;
 import assert;
 

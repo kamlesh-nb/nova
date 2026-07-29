@@ -1,7 +1,7 @@
 // AES-GCM AEAD implemented in Nova (M9 phase B, no external library). Verified against the published
 // GCM test vectors (McGrew and Viega, Test Cases 3 and 4), a seal/open round trip, tamper detection,
 // and a byte-for-byte differential check against the wolfCrypt binding for AES-256.
-import crypto.aesgcm;
+import crypto.aead.aesgcm;
 import bytes;
 import assert;
 

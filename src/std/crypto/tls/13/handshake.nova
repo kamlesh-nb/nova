@@ -6,13 +6,13 @@
 //
 // References: RFC 8446 sections 4.4 (Authentication) and 7.1 (Key Schedule). Verified against RFC 8448.
 import bytes;
-import crypto.tls13;
-import crypto.hkdf;
-import crypto.hmac;
-import crypto.sha256;
+import crypto.tls.13.tls;
+import crypto.kdf.hkdf;
+import crypto.mac.hmac;
+import crypto.hash.sha256;
 import crypto.x509;
 import crypto.rsa;
-import crypto.p256;
+import crypto.ecc.p256;
 
 fn strBuf(s: string): ptr {
     let b = bytes.alloc(s.length);
@@ -158,11 +158,11 @@ fn derIntTo(buf: ptr, start: int, len: int, out: ptr): void {
 pub fn masterSecret(kind: int, handshakeSecret: ptr, out: ptr): void {
     let hl = hkdf.hashLen(kind);
     let derived = bytes.alloc(hl);
-    tls13.deriveDerived(kind, handshakeSecret, derived);
+    tls.deriveDerived(kind, handshakeSecret, derived);
     let zero = bytes.alloc(hl);
     let i = 0;
     while (i < hl) { bytes.write_byte(zero, i, 0); i = i + 1; }
-    tls13.extractSecret(kind, derived, zero, hl, out);
+    tls.extractSecret(kind, derived, zero, hl, out);
     bytes.free(derived); bytes.free(zero);
 }
 

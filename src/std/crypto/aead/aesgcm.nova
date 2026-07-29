@@ -6,8 +6,8 @@
 // Reference: NIST SP 800-38D, wolfSSL AES-GCM (deps/wolfssl). Verified against the published GCM test
 // vectors and cross-checked against the wolfCrypt binding (conformance case 223).
 import bytes;
-import crypto.aes;
-import crypto.ghash;
+import crypto.cipher.aes;
+import crypto.mac.ghash;
 
 pub const GCM_TAG_LEN: int = 16;
 

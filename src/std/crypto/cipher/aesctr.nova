@@ -5,7 +5,7 @@
 //
 // Reference: NIST SP 800-38A section 6.5 and Appendix F.5. Verified against the F.5 vectors (case 224).
 import bytes;
-import crypto.aes;
+import crypto.cipher.aes;
 
 pub const AES_CTR_BLOCK_LEN: int = 16;
 

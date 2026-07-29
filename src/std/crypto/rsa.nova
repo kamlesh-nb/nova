@@ -14,8 +14,8 @@
 //
 // References: PKCS#1 v2.2 (RFC 8017), the standard Montgomery CIOS algorithm. Verified against OpenSSL.
 import bytes;
-import crypto.sha256;
-import crypto.sha512;
+import crypto.hash.sha256;
+import crypto.hash.sha512;
 
 const MASK32: ulong = 0xffffffff;
 const U0: ulong = 0;

@@ -15,7 +15,7 @@
 // References: BearSSL ec_p256_m31.c (point formulas + ladder, in deps), FIPS 186-4 domain parameters,
 // the standard Montgomery CIOS algorithm. Verified against RFC 5903 / NIST CAVP ECDH vectors.
 import bytes;
-import crypto.hmac;
+import crypto.mac.hmac;
 
 const MASK32: ulong = 0xffffffff;
 const U0: ulong = 0;

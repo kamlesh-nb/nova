@@ -1,7 +1,7 @@
 // Gates X2 crypto: the split `crypto/` folder (crypto.sha / crypto.random). SHA-256/512/1
 // + HMAC-SHA256 known-answer tests, CSPRNG liveness, and the seedable PCG32 PRNG's
 // reference vectors + determinism. (base64 has its own gate, 87_crypto_base64.)
-import crypto.sha;
+import crypto.hash.sha;
 import crypto.random;
 import assert;
 

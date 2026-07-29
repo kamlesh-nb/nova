@@ -2,8 +2,8 @@
 // 8448 "Simple 1-RTT Handshake": the running transcript hash, the server Finished MAC, the server
 // CertificateVerify signature (RSA-PSS over the transcript, checked with the leaf cert's key), the
 // application traffic secrets, and ServerHello parsing all reproduce the published values.
-import crypto.tls13;
-import crypto.tls13hs;
+import crypto.tls.13.tls;
+import crypto.tls.13.handshake;
 import crypto.x509;
 import bytes;
 import assert;
@@ -47,20 +47,20 @@ const SERVER_PUB: string = "c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69
 // The transcript hash of ClientHello..ServerHello matches the RFC value.
 @test
 fn transcript(): void {
-    let t = tls13hs.transcriptNew();
-    tls13hs.transcriptAdd(t, hexBuf(CH), 196);
-    tls13hs.transcriptAdd(t, hexBuf(SH), 90);
+    let t = handshake.transcriptNew();
+    handshake.transcriptAdd(t, hexBuf(CH), 196);
+    handshake.transcriptAdd(t, hexBuf(SH), 90);
     let h = bytes.alloc(32);
-    tls13hs.transcriptHash(0, t, h);
+    handshake.transcriptHash(0, t, h);
     assert.isTrue(eqHex(h, 32, T_CH_SH));
-    tls13hs.transcriptFree(t);
+    handshake.transcriptFree(t);
 }
 
 // ServerHello parsing extracts the negotiated cipher suite and the server key_share.
 @test
 fn server_hello(): void {
     let sp = bytes.alloc(32);
-    let cipher = tls13hs.parseServerHello(hexBuf(SH), 90, sp);
+    let cipher = handshake.parseServerHello(hexBuf(SH), 90, sp);
     assert.equalInt(cipher, 0x1301);              // TLS_AES_128_GCM_SHA256
     assert.isTrue(eqHex(sp, 32, SERVER_PUB));
 }
@@ -69,68 +69,68 @@ fn server_hello(): void {
 @test
 fn server_finished(): void {
     let pay = hexBuf(PAY);
-    let t = tls13hs.transcriptNew();
-    tls13hs.transcriptAdd(t, hexBuf(CH), 196);
-    tls13hs.transcriptAdd(t, hexBuf(SH), 90);
-    tls13hs.transcriptAdd(t, at(pay, 0), 40);      // EncryptedExtensions
-    tls13hs.transcriptAdd(t, at(pay, 40), 445);    // Certificate
-    tls13hs.transcriptAdd(t, at(pay, 485), 136);   // CertificateVerify
+    let t = handshake.transcriptNew();
+    handshake.transcriptAdd(t, hexBuf(CH), 196);
+    handshake.transcriptAdd(t, hexBuf(SH), 90);
+    handshake.transcriptAdd(t, at(pay, 0), 40);      // EncryptedExtensions
+    handshake.transcriptAdd(t, at(pay, 40), 445);    // Certificate
+    handshake.transcriptAdd(t, at(pay, 485), 136);   // CertificateVerify
     let hCV = bytes.alloc(32);
-    tls13hs.transcriptHash(0, t, hCV);
+    handshake.transcriptHash(0, t, hCV);
 
     let verifyData = at(pay, 625);                 // Finished message verify_data (32 bytes)
-    assert.isTrue(tls13hs.verifyFinished(0, hexBuf(SERVER_HS), hCV, verifyData));
+    assert.isTrue(handshake.verifyFinished(0, hexBuf(SERVER_HS), hCV, verifyData));
     // A tampered transcript must fail.
     bytes.write_byte(hCV, 0, (bytes.read_byte(hCV, 0) ^ 1) & 0xff);
-    assert.isTrue(!tls13hs.verifyFinished(0, hexBuf(SERVER_HS), hCV, verifyData));
-    tls13hs.transcriptFree(t);
+    assert.isTrue(!handshake.verifyFinished(0, hexBuf(SERVER_HS), hCV, verifyData));
+    handshake.transcriptFree(t);
 }
 
 // The server CertificateVerify signature (RSA-PSS over the transcript through Certificate) verifies.
 @test
 fn certificate_verify(): void {
     let pay = hexBuf(PAY);
-    let t = tls13hs.transcriptNew();
-    tls13hs.transcriptAdd(t, hexBuf(CH), 196);
-    tls13hs.transcriptAdd(t, hexBuf(SH), 90);
-    tls13hs.transcriptAdd(t, at(pay, 0), 40);      // EncryptedExtensions
-    tls13hs.transcriptAdd(t, at(pay, 40), 445);    // Certificate
+    let t = handshake.transcriptNew();
+    handshake.transcriptAdd(t, hexBuf(CH), 196);
+    handshake.transcriptAdd(t, hexBuf(SH), 90);
+    handshake.transcriptAdd(t, at(pay, 0), 40);      // EncryptedExtensions
+    handshake.transcriptAdd(t, at(pay, 40), 445);    // Certificate
     let hCert = bytes.alloc(32);
-    tls13hs.transcriptHash(0, t, hCert);
+    handshake.transcriptHash(0, t, hCert);
 
     let cert = x509.parseCert(at(pay, 51), 432);   // leaf cert DER inside the Certificate message
     assert.isTrue(cert.ok);
     let sig = at(pay, 493);                         // CertificateVerify signature (128 bytes)
-    assert.isTrue(tls13hs.verifyCertificateVerify(cert, 0x0804, sig, 128, hCert));
+    assert.isTrue(handshake.verifyCertificateVerify(cert, 0x0804, sig, 128, hCert));
 
     // A tampered transcript hash must fail the signature check.
     bytes.write_byte(hCert, 5, (bytes.read_byte(hCert, 5) ^ 0x40) & 0xff);
-    assert.isTrue(!tls13hs.verifyCertificateVerify(cert, 0x0804, sig, 128, hCert));
-    tls13hs.transcriptFree(t);
+    assert.isTrue(!handshake.verifyCertificateVerify(cert, 0x0804, sig, 128, hCert));
+    handshake.transcriptFree(t);
 }
 
 // The application traffic secrets derive from the master secret and the full-flight transcript.
 @test
 fn application_secrets(): void {
-    let t = tls13hs.transcriptNew();
-    tls13hs.transcriptAdd(t, hexBuf(CH), 196);
-    tls13hs.transcriptAdd(t, hexBuf(SH), 90);
+    let t = handshake.transcriptNew();
+    handshake.transcriptAdd(t, hexBuf(CH), 196);
+    handshake.transcriptAdd(t, hexBuf(SH), 90);
     let pay = hexBuf(PAY);
-    tls13hs.transcriptAdd(t, pay, 657);            // EE || Cert || CertVerify || Finished
+    handshake.transcriptAdd(t, pay, 657);            // EE || Cert || CertVerify || Finished
     let hSF = bytes.alloc(32);
-    tls13hs.transcriptHash(0, t, hSF);
+    handshake.transcriptHash(0, t, hSF);
     assert.isTrue(eqHex(hSF, 32, T_CH_SF));
 
     let master = bytes.alloc(32);
-    tls13hs.masterSecret(0, hexBuf(HANDSHAKE), master);
+    handshake.masterSecret(0, hexBuf(HANDSHAKE), master);
     assert.isTrue(eqHex(master, 32, MASTER));
 
     let cap = bytes.alloc(32);
-    tls13.deriveTraffic(0, master, "c ap traffic", hSF, cap);
+    tls.deriveTraffic(0, master, "c ap traffic", hSF, cap);
     assert.isTrue(eqHex(cap, 32, C_AP));
 
     let sap = bytes.alloc(32);
-    tls13.deriveTraffic(0, master, "s ap traffic", hSF, sap);
+    tls.deriveTraffic(0, master, "s ap traffic", hSF, sap);
     assert.isTrue(eqHex(sap, 32, S_AP));
-    tls13hs.transcriptFree(t);
+    handshake.transcriptFree(t);
 }

@@ -7,8 +7,8 @@
 // Reference: RFC 8439. Verified against the RFC 8439 section 2.8.2 vector, and cross-checked against
 // the wolfCrypt binding, in conformance case 220.
 import bytes;
-import crypto.chacha20;
-import crypto.poly1305;
+import crypto.cipher.chacha20;
+import crypto.mac.poly1305;
 
 pub const KEY_LEN: int = 32;
 pub const NONCE_LEN: int = 12;

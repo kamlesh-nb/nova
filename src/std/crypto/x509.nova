@@ -8,10 +8,10 @@
 //
 // References: RFC 5280 (X.509), RFC 8017 (PKCS#1). Verified against OpenSSL-generated EC and RSA chains.
 import bytes;
-import crypto.p256;
+import crypto.ecc.p256;
 import crypto.rsa;
-import crypto.sha256;
-import crypto.sha512;
+import crypto.hash.sha256;
+import crypto.hash.sha512;
 
 // Signature-algorithm identifiers.
 const SIG_ECDSA_SHA256: int = 0;

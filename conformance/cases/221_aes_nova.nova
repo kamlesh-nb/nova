@@ -1,6 +1,6 @@
 // Constant-time bitsliced AES (FIPS-197) implemented in Nova (M9 phase B, no external library).
 // Verified against the FIPS-197 known-answer vectors for AES-128 and AES-256.
-import crypto.aes;
+import crypto.cipher.aes;
 import bytes;
 import assert;
 

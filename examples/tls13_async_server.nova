@@ -7,7 +7,7 @@
 import net.reactor;
 import net.reactorio;
 import net.tls13async;
-import crypto.tls13server;
+import crypto.tls.13.tlsServer;
 import crypto.random;
 import os.sys;
 import bytes;
@@ -40,7 +40,7 @@ async fn serveOne(lfd: int, kq: int, done: ptr): int {
 
     let io = tls13async.newIO(rs.fdOf(), kq);
     let ephPriv = bytes.alloc(32); fillRandom(ephPriv, 32);
-    let srv = tls13server.newServer(hexBuf(SRV_CERT), 421, hexBuf(SRV_PRIV), ephPriv);
+    let srv = tlsServer.newServer(hexBuf(SRV_CERT), 421, hexBuf(SRV_PRIV), ephPriv);
     let sr = bytes.alloc(32); fillRandom(sr, 32);
 
     if (await tls13async.serveHandshake(io, srv, sr) < 0) {

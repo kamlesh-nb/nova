@@ -1,7 +1,7 @@
 // ChaCha20-Poly1305 AEAD implemented in Nova (M9 phase B, no external library). Verified against the
 // RFC 8439 section 2.8.2 known-answer vector, a seal/open round trip, tamper detection, and a
 // differential check against the wolfCrypt binding (which this Nova AEAD will replace).
-import crypto.chachapoly;
+import crypto.aead.chachapoly;
 import bytes;
 import assert;
 

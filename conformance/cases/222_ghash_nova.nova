@@ -1,7 +1,7 @@
 // GHASH (the GF(2^128) hash of AES-GCM) implemented in Nova (M9 phase B, no external library).
 // Verified against the published GCM Test Case 2 (McGrew and Viega) and reference values whose
 // generator was itself checked against that published test case, plus the padded-update path.
-import crypto.ghash;
+import crypto.mac.ghash;
 import bytes;
 import assert;
 

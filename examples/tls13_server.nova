@@ -7,7 +7,7 @@
 //   echo -e "GET / HTTP/1.0\r\n\r\n" | openssl s_client -connect 127.0.0.1:4433 -tls1_3 -quiet
 import os.sys;
 import net.reactorio;
-import crypto.tls13server;
+import crypto.tls.13.tlsServer;
 import crypto.random;
 import bytes;
 
@@ -90,7 +90,7 @@ fn main(): int {
     if (n < 0 || bytes.read_byte(buf, 0) != 0x16) { logStr("no ClientHello"); return 1; }
 
     let ephPriv = bytes.alloc(32); fillRandom(ephPriv, 32);
-    let srv = tls13server.newServer(hexBuf(SRV_CERT), 421, hexBuf(SRV_PRIV), ephPriv);
+    let srv = tlsServer.newServer(hexBuf(SRV_CERT), 421, hexBuf(SRV_PRIV), ephPriv);
     srv.processClientHello(at(buf, 5), n - 5);
 
     // ServerHello.

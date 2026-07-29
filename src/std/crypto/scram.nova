@@ -2,7 +2,7 @@
 import bytes;
 import string;
 import list;
-import crypto.sha;
+import crypto.hash.sha;
 import crypto.base64;
 import assert;
 

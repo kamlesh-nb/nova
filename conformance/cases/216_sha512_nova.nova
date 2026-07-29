@@ -1,6 +1,6 @@
 // SHA-512 and SHA-384 implemented in Nova (M9 phase A, no external library, 64-bit words). Verified
 // against NIST known-answer vectors, plus an incremental multi-update matching a one-shot.
-import crypto.sha512;
+import crypto.hash.sha512;
 import bytes;
 import assert;
 

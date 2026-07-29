@@ -285,6 +285,9 @@ switch (self) {
 
 - **Import:** `import assert;`, `import collections.map;` — dotted paths address nested stdlib modules.
   Names are used qualified by the last segment: `map.Map<K,V>()`, `bson.BsonDocument{…}`.
+  - A path segment is normally an identifier, but a **version directory** may be a bare integer:
+    `import crypto.tls.13.tls;` addresses `crypto/tls/13/tls.nova`, qualified as `tls.*`. The integer
+    may not be the first segment.
 - **`pub`** marks a declaration exported from its module. **Cross-module visibility is enforced**: a
   non-`pub` **function**, **type** (struct/enum), or **const** referenced from another module is a hard
   error — "not public" *(→ this session, commit 7d7a76d; the stdlib is `pub` where it must be)*.

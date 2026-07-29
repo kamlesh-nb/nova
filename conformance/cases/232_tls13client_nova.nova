@@ -3,7 +3,7 @@
 // (ECDHE + handshake secrets), decrypt and verify the server's encrypted flight (CertificateVerify +
 // Finished), then derive the application secrets and compute the client Finished. Every derived value
 // matches the RFC.
-import crypto.tls13client;
+import crypto.tls.13.tlsClient;
 import bytes;
 import assert;
 
@@ -42,7 +42,7 @@ const CLIENT_FINISHED: string = "a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98
 
 @test
 fn full_client_handshake(): void {
-    let c = tls13client.newClient(hexBuf(CLIENT_PRIV));
+    let c = tlsClient.newClient(hexBuf(CLIENT_PRIV));
     c.addClientHello(hexBuf(CH), 196);
     c.processServerHello(hexBuf(SH), 90);
 
@@ -79,7 +79,7 @@ fn build_client_hello(): void {
     let i = 0;
     while (i < 32) { bytes.write_byte(rnd, i, i); bytes.write_byte(sid, i, 255 - i); i = i + 1; }
     let out = bytes.alloc(512);
-    let n = tls13client.buildClientHello(rnd, sid, pk, "example.com", out);
+    let n = tlsClient.buildClientHello(rnd, sid, pk, "example.com", out);
     // Handshake type 0x01, and the 3-byte body length equals n-4.
     assert.equalInt(bytes.read_byte(out, 0), 0x01);
     let bodyLen = (bytes.read_byte(out, 1) << 16) | (bytes.read_byte(out, 2) << 8) | bytes.read_byte(out, 3);
@@ -93,7 +93,7 @@ fn at(buf: ptr, off: int): ptr { return (buf as long + off) as ptr; }
 // The incremental feedHandshake path (used for live, fragment-tolerant reassembly) verifies the flight.
 @test
 fn flight_reassembly(): void {
-    let c = tls13client.newClient(hexBuf(CLIENT_PRIV));
+    let c = tlsClient.newClient(hexBuf(CLIENT_PRIV));
     c.addClientHello(hexBuf(CH), 196);
     c.processServerHello(hexBuf(SH), 90);
     let r = c.feedHandshake(hexBuf(REC), 679);
@@ -105,7 +105,7 @@ fn flight_reassembly(): void {
 // A tampered flight (flipped ciphertext byte) fails verification.
 @test
 fn tampered_flight(): void {
-    let c = tls13client.newClient(hexBuf(CLIENT_PRIV));
+    let c = tlsClient.newClient(hexBuf(CLIENT_PRIV));
     c.addClientHello(hexBuf(CH), 196);
     c.processServerHello(hexBuf(SH), 90);
     let rec = hexBuf(REC);

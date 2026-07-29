@@ -8,11 +8,11 @@
 //
 // References: RFC 8446. Verified against the RFC 8448 "Simple 1-RTT Handshake" trace.
 import bytes;
-import crypto.hkdf;
-import crypto.sha256;
-import crypto.sha512;
-import crypto.aesgcm;
-import crypto.chachapoly;
+import crypto.kdf.hkdf;
+import crypto.hash.sha256;
+import crypto.hash.sha512;
+import crypto.aead.aesgcm;
+import crypto.aead.chachapoly;
 
 // Cipher suites (AEAD + key length). The hash for the key schedule is passed separately as the HKDF
 // `kind` (0 = SHA-256, 1 = SHA-384), matching the suite.

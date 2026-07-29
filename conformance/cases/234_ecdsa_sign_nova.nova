@@ -2,7 +2,7 @@
 // Verified against the RFC 6979 Appendix A.2.5 P-256 / SHA-256 test vectors (private key C9AFA9..., the
 // messages "sample" and "test"): the produced (r, s) match the RFC exactly, and the signatures verify
 // under the Nova ECDSA verifier with the public key derived from the same private key.
-import crypto.p256;
+import crypto.ecc.p256;
 import bytes;
 import assert;
 

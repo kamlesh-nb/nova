@@ -1,7 +1,7 @@
 // NIST P-256 ECDSA signature verification in Nova (M9 phase C, no external library). Verified against a
 // real signature produced by OpenSSL 3.6 (ECDSA-with-SHA256): the public point, message digest, and the
 // (r, s) signature are pinned here, along with negative checks that a tampered signature is rejected.
-import crypto.p256;
+import crypto.ecc.p256;
 import bytes;
 import assert;
 

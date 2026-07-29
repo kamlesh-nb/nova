@@ -809,7 +809,13 @@ pub const Parser = struct {
         while (self.current().type == .dot) {
             self.advance();
             const part = self.current().lexeme;
-            try self.expect(.identifier);
+            // A path segment is normally an identifier, but a version directory may be a bare
+            // integer (e.g. `import crypto.tls.13.tls;` -> crypto/tls/13/tls.nova).
+            if (self.current().type == .integer) {
+                self.advance();
+            } else {
+                try self.expect(.identifier);
+            }
             try path_buf.append(self.allocator, '/');
             try path_buf.appendSlice(self.allocator, part);
         }

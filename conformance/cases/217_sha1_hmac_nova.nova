@@ -1,7 +1,7 @@
 // SHA-1 and HMAC (SHA-256/384/512) implemented in Nova (M9 phase A, no external library). SHA-1 vs
 // known-answer vectors; HMAC vs the RFC 4231 test vectors.
-import crypto.sha1;
-import crypto.hmac;
+import crypto.hash.sha1;
+import crypto.mac.hmac;
 import bytes;
 import assert;
 

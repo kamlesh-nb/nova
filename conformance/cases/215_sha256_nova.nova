@@ -1,6 +1,6 @@
 // SHA-256 implemented in Nova (M9 phase A, no external library). Verified against NIST known-answer
 // vectors, an incremental (multi-update) hash matching a one-shot, and a multi-block input.
-import crypto.sha256;
+import crypto.hash.sha256;
 import bytes;
 import assert;
 

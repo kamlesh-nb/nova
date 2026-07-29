@@ -1,7 +1,7 @@
 // Gates C1 crypto: PBKDF2-HMAC-SHA256 + SCRAM-SHA-256 (RFC 5802 / 7677), the SASL
 // auth used by PostgreSQL and MongoDB. The SCRAM proof exercises the whole raw-byte
 // key chain (PBKDF2 -> HMAC -> SHA256 -> XOR via `^` -> base64).
-import crypto.sha;
+import crypto.hash.sha;
 import crypto.scram;
 import crypto.base64;
 import assert;

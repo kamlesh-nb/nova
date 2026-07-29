@@ -6,11 +6,11 @@
 //
 // References: RFC 8446. Exercised live against openssl s_client via examples/tls13_server.nova.
 import bytes;
-import crypto.tls13;
-import crypto.tls13hs;
-import crypto.x25519;
-import crypto.p256;
-import crypto.sha256;
+import crypto.tls.13.tls;
+import crypto.tls.13.handshake;
+import crypto.ecc.x25519;
+import crypto.ecc.p256;
+import crypto.hash.sha256;
 
 fn at(b: ptr, off: int): ptr { return (b as long + off) as ptr; }
 fn w3(buf: ptr, off: int, v: int): void {
@@ -149,15 +149,15 @@ pub fn buildServerHello(self: TlsServer, serverRandom: ptr, out: ptr): int {
     // key schedule from the ECDHE.
     let ecdhe = bytes.alloc(32);
     x25519.scalarMult(ecdhe, self.ephPriv, self.clientPub);
-    let early = bytes.alloc(48); tls13.earlySecret(self.kind, early);
-    let derived = bytes.alloc(48); tls13.deriveDerived(self.kind, early, derived);
-    tls13.extractSecret(self.kind, derived, ecdhe, 32, self.hs);
+    let early = bytes.alloc(48); tls.earlySecret(self.kind, early);
+    let derived = bytes.alloc(48); tls.deriveDerived(self.kind, early, derived);
+    tls.extractSecret(self.kind, derived, ecdhe, 32, self.hs);
     trAdd(self, out, p);
     let hSH = bytes.alloc(48); trHash(self, hSH);
-    tls13.deriveTraffic(self.kind, self.hs, "c hs traffic", hSH, self.chs);
-    tls13.deriveTraffic(self.kind, self.hs, "s hs traffic", hSH, self.shs);
-    tls13.deriveKeyIv(self.kind, self.suite, self.chs, self.cKey, self.cIv);
-    tls13.deriveKeyIv(self.kind, self.suite, self.shs, self.sKey, self.sIv);
+    tls.deriveTraffic(self.kind, self.hs, "c hs traffic", hSH, self.chs);
+    tls.deriveTraffic(self.kind, self.hs, "s hs traffic", hSH, self.shs);
+    tls.deriveKeyIv(self.kind, self.suite, self.chs, self.cKey, self.cIv);
+    tls.deriveKeyIv(self.kind, self.suite, self.shs, self.sKey, self.sIv);
     bytes.free(ephPub); bytes.free(ecdhe); bytes.free(early); bytes.free(derived); bytes.free(hSH);
     return p;
 }
@@ -244,7 +244,7 @@ pub fn buildFlight(self: TlsServer, out: ptr): int {
     // Finished over Transcript-Hash(CH..CertificateVerify).
     let finStart = ip;
     let hCV = bytes.alloc(32); trHash(self, hCV);
-    let vd = bytes.alloc(32); tls13hs.finishedVerifyData(self.kind, self.shs, hCV, vd);
+    let vd = bytes.alloc(32); handshake.finishedVerifyData(self.kind, self.shs, hCV, vd);
     bytes.write_byte(inner, ip, 0x14); ip = ip + 1;
     w3(inner, ip, 32); ip = ip + 3;
     let vi = 0;
@@ -253,16 +253,16 @@ pub fn buildFlight(self: TlsServer, out: ptr): int {
     trAdd(self, at(inner, finStart), ip - finStart);
     bytes.free(hCV); bytes.free(vd);
 
-    let recLen = tls13.recordProtect(self.suite, self.sKey, self.sIv, self.sSeq, inner, ip, 0x16, out);
+    let recLen = tls.recordProtect(self.suite, self.sKey, self.sIv, self.sSeq, inner, ip, 0x16, out);
     self.sSeq = self.sSeq + 1;
 
     // Application traffic secrets, over the transcript through the server Finished.
     let hSF = bytes.alloc(48); trHash(self, hSF);
-    tls13hs.masterSecret(self.kind, self.hs, self.master);
-    tls13.deriveTraffic(self.kind, self.master, "c ap traffic", hSF, self.cap);
-    tls13.deriveTraffic(self.kind, self.master, "s ap traffic", hSF, self.sap);
-    tls13.deriveKeyIv(self.kind, self.suite, self.cap, self.capKey, self.capIv);
-    tls13.deriveKeyIv(self.kind, self.suite, self.sap, self.sapKey, self.sapIv);
+    handshake.masterSecret(self.kind, self.hs, self.master);
+    tls.deriveTraffic(self.kind, self.master, "c ap traffic", hSF, self.cap);
+    tls.deriveTraffic(self.kind, self.master, "s ap traffic", hSF, self.sap);
+    tls.deriveKeyIv(self.kind, self.suite, self.cap, self.capKey, self.capIv);
+    tls.deriveKeyIv(self.kind, self.suite, self.sap, self.sapKey, self.sapIv);
     bytes.free(hSF); bytes.free(inner);
     return recLen;
 }
@@ -271,11 +271,11 @@ pub fn buildFlight(self: TlsServer, out: ptr): int {
 // application keys (reset sequence numbers). Returns true iff the client Finished MAC verifies.
 pub fn processClientFinished(self: TlsServer, record: ptr, recLen: int): bool {
     let inner = bytes.alloc(recLen);
-    let innerLen = tls13.recordUnprotect(self.suite, self.cKey, self.cIv, self.cSeq, record, recLen, inner);
+    let innerLen = tls.recordUnprotect(self.suite, self.cKey, self.cIv, self.cSeq, record, recLen, inner);
     self.cSeq = self.cSeq + 1;
     if (innerLen < 0) { bytes.free(inner); return false; }
     let hSF = bytes.alloc(48); trHash(self, hSF);          // transcript through server Finished
-    self.finishedOk = tls13hs.verifyFinished(self.kind, self.chs, hSF, at(inner, 4));
+    self.finishedOk = handshake.verifyFinished(self.kind, self.chs, hSF, at(inner, 4));
     bytes.free(inner); bytes.free(hSF);
     if (self.finishedOk) { self.cSeq = 0; self.sSeq = 0; }
     return self.finishedOk;
@@ -283,12 +283,12 @@ pub fn processClientFinished(self: TlsServer, record: ptr, recLen: int): bool {
 
 // Encrypt / decrypt application data with the negotiated application keys.
 pub fn encryptApp(self: TlsServer, data: ptr, dataLen: int, out: ptr): int {
-    let n = tls13.recordProtect(self.suite, self.sapKey, self.sapIv, self.sSeq, data, dataLen, 0x17, out);
+    let n = tls.recordProtect(self.suite, self.sapKey, self.sapIv, self.sSeq, data, dataLen, 0x17, out);
     self.sSeq = self.sSeq + 1;
     return n;
 }
 pub fn decryptApp(self: TlsServer, record: ptr, recLen: int, out: ptr): int {
-    let n = tls13.recordUnprotect(self.suite, self.capKey, self.capIv, self.cSeq, record, recLen, out);
+    let n = tls.recordUnprotect(self.suite, self.capKey, self.capIv, self.cSeq, record, recLen, out);
     self.cSeq = self.cSeq + 1;
     return n;
 }

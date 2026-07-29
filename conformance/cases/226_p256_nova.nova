@@ -1,7 +1,7 @@
 // NIST P-256 (secp256r1) ECDH implemented in Nova (M9 phase C, no external library). Verified against
 // OpenSSL 3.6 as an independent oracle: two key pairs, their public points, and the shared secret
 // (computed by OpenSSL both directions) are pinned here.
-import crypto.p256;
+import crypto.ecc.p256;
 import bytes;
 import assert;
 

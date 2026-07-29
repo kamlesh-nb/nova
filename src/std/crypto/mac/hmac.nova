@@ -5,8 +5,8 @@
 // HMAC(K, m) = H((K' ^ opad) || H((K' ^ ipad) || m)), where K' is K hashed down to the block size if
 // it is longer, else K zero-padded to the block size. Verified against RFC 4231 (conformance case 218).
 import bytes;
-import crypto.sha256;
-import crypto.sha512;
+import crypto.hash.sha256;
+import crypto.hash.sha512;
 
 const IPAD: int = 0x36;
 const OPAD: int = 0x5c;
