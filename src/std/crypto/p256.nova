@@ -15,6 +15,7 @@
 // References: BearSSL ec_p256_m31.c (point formulas + ladder, in deps), FIPS 186-4 domain parameters,
 // the standard Montgomery CIOS algorithm. Verified against RFC 5903 / NIST CAVP ECDH vectors.
 import bytes;
+import crypto.hmac;
 
 const MASK32: ulong = 0xffffffff;
 const U0: ulong = 0;
@@ -717,4 +718,74 @@ pub fn ecdsaVerify(hash32: ptr, pub65: ptr, r32: ptr, s32: ptr): bool {
     bytes.free(a); bytes.free(ax); bytes.free(ay); bytes.free(bx); bytes.free(by);
     bytes.free(rx); bytes.free(ry);
     return ok;
+}
+
+// Build the RFC 6979 HMAC input V || sep || int2octets(x) || bits2octets(h1) into out (97 bytes).
+fn hmacInput(out: ptr, v: ptr, sep: int, x: ptr, h: ptr): void {
+    let i = 0;
+    while (i < 32) { bytes.write_byte(out, i, bytes.read_byte(v, i)); i = i + 1; }
+    bytes.write_byte(out, 32, sep);
+    i = 0;
+    while (i < 32) { bytes.write_byte(out, 33 + i, bytes.read_byte(x, i)); i = i + 1; }
+    i = 0;
+    while (i < 32) { bytes.write_byte(out, 65 + i, bytes.read_byte(h, i)); i = i + 1; }
+}
+
+// ECDSA-P256 signing with the RFC 6979 deterministic nonce (HMAC-SHA256). Writes the 32-byte big-endian
+// r and s to rOut/sOut. Returns 1 on success. The scalar multiply and the mod-n inversion follow a data-
+// independent operation sequence; a production signer should still get a dedicated side-channel review.
+pub fn ecdsaSign(hash32: ptr, privKey32: ptr, rOut: ptr, sOut: ptr): int {
+    // z = hash mod n; h1o = bits2octets(hash) (also z, as 32 big-endian bytes); d = privKey mod n.
+    let hz = newFe(); feFromBE(hz, hash32, 0);
+    let z = newFe(); reduceModN(z, hz);
+    let h1o = bytes.alloc(32); feToBE(h1o, 0, z);
+    let dtmp = newFe(); feFromBE(dtmp, privKey32, 0);
+    let d = newFe(); reduceModN(d, dtmp);
+
+    // RFC 6979 3.2: V = 0x01.., K = 0x00.., then two HMAC "update" rounds.
+    let vv = bytes.alloc(32); let kk = bytes.alloc(32);
+    let i = 0;
+    while (i < 32) { bytes.write_byte(vv, i, 1); bytes.write_byte(kk, i, 0); i = i + 1; }
+    let msg = bytes.alloc(97);
+    hmacInput(msg, vv, 0, privKey32, h1o); hmac.hmacSha256(kk, 32, msg, 97, kk); hmac.hmacSha256(kk, 32, vv, 32, vv);
+    hmacInput(msg, vv, 1, privKey32, h1o); hmac.hmacSha256(kk, 32, msg, 97, kk); hmac.hmacSha256(kk, 32, vv, 32, vv);
+
+    let result = 0;
+    let attempts = 0;
+    while (result == 0 && attempts < 64) {
+        hmac.hmacSha256(kk, 32, vv, 32, vv);       // T = V (256 bits) -> candidate k
+        let kfe = newFe(); feFromBE(kfe, vv, 0);
+        if (inRangeN(kfe)) {
+            let g = newPt(); baseG(g); scalarMultPoint(g, vv, 32);   // k*G
+            let xa = newFe(); let ya = newFe(); toAffine(g, xa, ya);
+            let r = newFe(); reduceModN(r, xa);                      // r = x1 mod n
+            if (!feIsZero(r)) {
+                let rd = newFe(); modMulN(rd, r, d);                 // r*d
+                let zrd = newFe(); nAdd(zrd, z, rd);                 // z + r*d
+                let kinv = newFe(); invModN(kinv, kfe);             // k^-1
+                let s = newFe(); modMulN(s, kinv, zrd);            // s = k^-1 (z + r*d)
+                if (!feIsZero(s)) {
+                    feToBE(rOut, 0, r);
+                    feToBE(sOut, 0, s);
+                    result = 1;
+                }
+                bytes.free(rd); bytes.free(zrd); bytes.free(kinv); bytes.free(s);
+            }
+            bytes.free(g); bytes.free(xa); bytes.free(ya); bytes.free(r);
+        }
+        bytes.free(kfe);
+        if (result == 0) {                          // K = HMAC(K, V || 0x00); V = HMAC(K, V)
+            let m2 = bytes.alloc(33);
+            i = 0;
+            while (i < 32) { bytes.write_byte(m2, i, bytes.read_byte(vv, i)); i = i + 1; }
+            bytes.write_byte(m2, 32, 0);
+            hmac.hmacSha256(kk, 32, m2, 33, kk);
+            hmac.hmacSha256(kk, 32, vv, 32, vv);
+            bytes.free(m2);
+        }
+        attempts = attempts + 1;
+    }
+    bytes.free(hz); bytes.free(z); bytes.free(h1o); bytes.free(dtmp); bytes.free(d);
+    bytes.free(vv); bytes.free(kk); bytes.free(msg);
+    return result;
 }

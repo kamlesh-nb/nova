@@ -1,0 +1,294 @@
+// TLS 1.3 (RFC 8446) server handshake state machine in Nova, no external library (M9 phase E). The accept
+// side, mirroring crypto/tls13client: parse the ClientHello, send the ServerHello, then the encrypted
+// flight (EncryptedExtensions, our Certificate, a CertificateVerify we SIGN with the server key, and the
+// Finished), and verify the client's Finished. Signing uses the Nova ECDSA-P256 signer (ecdsa_secp256r1
+// _sha256). I/O-agnostic; the caller drives the socket.
+//
+// References: RFC 8446. Exercised live against openssl s_client via examples/tls13_server.nova.
+import bytes;
+import crypto.tls13;
+import crypto.tls13hs;
+import crypto.x25519;
+import crypto.p256;
+import crypto.sha256;
+
+fn at(b: ptr, off: int): ptr { return (b as long + off) as ptr; }
+fn w3(buf: ptr, off: int, v: int): void {
+    bytes.write_byte(buf, off, (v >> 16) & 0xff);
+    bytes.write_byte(buf, off + 1, (v >> 8) & 0xff);
+    bytes.write_byte(buf, off + 2, v & 0xff);
+}
+fn sNib(c: int): int { if (c >= 48 && c <= 57) { return c - 48; } return c - 87; }
+fn putHex(out: ptr, p: int, hex: string): int {
+    let n = hex.length / 2;
+    let i = 0;
+    while (i < n) { bytes.write_byte(out, p + i, sNib(hex[i * 2]) * 16 + sNib(hex[i * 2 + 1])); i = i + 1; }
+    return p + n;
+}
+fn base9(): ptr {
+    let b = bytes.alloc(32);
+    bytes.write_byte(b, 0, 9);
+    let i = 1;
+    while (i < 32) { bytes.write_byte(b, i, 0); i = i + 1; }
+    return b;
+}
+
+struct TlsServer {
+    pub kind: int, pub suite: int,
+    pub ephPriv: ptr,                    // server ephemeral X25519 private key
+    pub certDer: ptr, pub certLen: int,  // our certificate (DER)
+    pub signKey: ptr,                    // our EC private scalar (32 bytes) for CertificateVerify
+    pub clientPub: ptr,                  // client X25519 key_share
+    pub sid: ptr, pub sidLen: int,       // client legacy_session_id (echoed back)
+    pub trBuf: ptr, pub trLen: int, pub trCap: int,
+    pub hs: ptr, pub chs: ptr, pub shs: ptr,
+    pub cKey: ptr, pub cIv: ptr, pub sKey: ptr, pub sIv: ptr,
+    pub master: ptr, pub cap: ptr, pub sap: ptr,
+    pub capKey: ptr, pub capIv: ptr, pub sapKey: ptr, pub sapIv: ptr,
+    pub sSeq: long, pub cSeq: long,
+    pub finishedOk: bool,
+}
+
+pub fn newServer(certDer: ptr, certLen: int, signKey: ptr, ephPriv: ptr): TlsServer {
+    return TlsServer {
+        kind: 0, suite: 0, ephPriv: ephPriv, certDer: certDer, certLen: certLen, signKey: signKey,
+        clientPub: bytes.alloc(32), sid: bytes.alloc(32), sidLen: 0,
+        trBuf: bytes.alloc(8192), trLen: 0, trCap: 8192,
+        hs: bytes.alloc(48), chs: bytes.alloc(48), shs: bytes.alloc(48),
+        cKey: bytes.alloc(32), cIv: bytes.alloc(12), sKey: bytes.alloc(32), sIv: bytes.alloc(12),
+        master: bytes.alloc(48), cap: bytes.alloc(48), sap: bytes.alloc(48),
+        capKey: bytes.alloc(32), capIv: bytes.alloc(12), sapKey: bytes.alloc(32), sapIv: bytes.alloc(12),
+        sSeq: 0, cSeq: 0, finishedOk: false,
+    };
+}
+
+fn trAdd(self: TlsServer, msg: ptr, n: int): void {
+    if (self.trLen + n > self.trCap) {
+        let nc = (self.trLen + n) * 2;
+        let nb = bytes.alloc(nc);
+        let i = 0;
+        while (i < self.trLen) { bytes.write_byte(nb, i, bytes.read_byte(self.trBuf, i)); i = i + 1; }
+        bytes.free(self.trBuf);
+        self.trBuf = nb;
+        self.trCap = nc;
+    }
+    let i = 0;
+    while (i < n) { bytes.write_byte(self.trBuf, self.trLen + i, bytes.read_byte(msg, i)); i = i + 1; }
+    self.trLen = self.trLen + n;
+}
+fn trHash(self: TlsServer, out: ptr): void { sha256.hashInto(self.trBuf, self.trLen, out); }
+
+// Parse the ClientHello: capture the client key_share (X25519) and the legacy_session_id (to echo).
+pub fn processClientHello(self: TlsServer, ch: ptr, chLen: int): void {
+    let p = 4 + 2 + 32;
+    let sl = bytes.read_byte(ch, p);
+    self.sidLen = sl;
+    let i = 0;
+    while (i < sl) { bytes.write_byte(self.sid, i, bytes.read_byte(ch, p + 1 + i)); i = i + 1; }
+    p = p + 1 + sl;
+    let cipherLen = (bytes.read_byte(ch, p) << 8) | bytes.read_byte(ch, p + 1);
+    p = p + 2 + cipherLen;
+    let compLen = bytes.read_byte(ch, p);
+    p = p + 1 + compLen;
+    let extLen = (bytes.read_byte(ch, p) << 8) | bytes.read_byte(ch, p + 1);
+    p = p + 2;
+    let end = p + extLen;
+    while (p < end) {
+        let etype = (bytes.read_byte(ch, p) << 8) | bytes.read_byte(ch, p + 1);
+        let elen = (bytes.read_byte(ch, p + 2) << 8) | bytes.read_byte(ch, p + 3);
+        let body = p + 4;
+        if (etype == 0x0033) {                     // key_share: a list of KeyShareEntry
+            let listLen = (bytes.read_byte(ch, body) << 8) | bytes.read_byte(ch, body + 1);
+            let q = body + 2;
+            let qe = q + listLen;
+            while (q < qe) {
+                let grp = (bytes.read_byte(ch, q) << 8) | bytes.read_byte(ch, q + 1);
+                let klen = (bytes.read_byte(ch, q + 2) << 8) | bytes.read_byte(ch, q + 3);
+                if (grp == 0x001d) {               // x25519
+                    let j = 0;
+                    while (j < klen) { bytes.write_byte(self.clientPub, j, bytes.read_byte(ch, q + 4 + j)); j = j + 1; }
+                }
+                q = q + 4 + klen;
+            }
+        }
+        p = body + elen;
+    }
+    trAdd(self, ch, chLen);
+}
+
+// Build the ServerHello (echoing the session id, offering our x25519 key_share), and derive the
+// handshake-phase secrets and keys from the ECDHE. Returns the ServerHello message length.
+pub fn buildServerHello(self: TlsServer, serverRandom: ptr, out: ptr): int {
+    let ephPub = bytes.alloc(32);
+    x25519.scalarMult(ephPub, self.ephPriv, base9());
+
+    let p = 4;
+    bytes.write_byte(out, p, 0x03); bytes.write_byte(out, p + 1, 0x03); p = p + 2;
+    let i = 0;
+    while (i < 32) { bytes.write_byte(out, p + i, bytes.read_byte(serverRandom, i)); i = i + 1; }
+    p = p + 32;
+    bytes.write_byte(out, p, self.sidLen); p = p + 1;
+    i = 0;
+    while (i < self.sidLen) { bytes.write_byte(out, p + i, bytes.read_byte(self.sid, i)); i = i + 1; }
+    p = p + self.sidLen;
+    p = putHex(out, p, "1301");                    // cipher_suite TLS_AES_128_GCM_SHA256
+    bytes.write_byte(out, p, 0); p = p + 1;        // legacy_compression_method
+    let extLenPos = p; p = p + 2;
+    p = putHex(out, p, "002b00020304");            // supported_versions: TLS 1.3
+    p = putHex(out, p, "00330024001d0020");        // key_share: x25519 entry header
+    i = 0;
+    while (i < 32) { bytes.write_byte(out, p + i, bytes.read_byte(ephPub, i)); i = i + 1; }
+    p = p + 32;
+    let extLen = p - (extLenPos + 2);
+    bytes.write_byte(out, extLenPos, (extLen >> 8) & 0xff);
+    bytes.write_byte(out, extLenPos + 1, extLen & 0xff);
+    let bodyLen = p - 4;
+    bytes.write_byte(out, 0, 0x02);
+    w3(out, 1, bodyLen);
+
+    // key schedule from the ECDHE.
+    let ecdhe = bytes.alloc(32);
+    x25519.scalarMult(ecdhe, self.ephPriv, self.clientPub);
+    let early = bytes.alloc(48); tls13.earlySecret(self.kind, early);
+    let derived = bytes.alloc(48); tls13.deriveDerived(self.kind, early, derived);
+    tls13.extractSecret(self.kind, derived, ecdhe, 32, self.hs);
+    trAdd(self, out, p);
+    let hSH = bytes.alloc(48); trHash(self, hSH);
+    tls13.deriveTraffic(self.kind, self.hs, "c hs traffic", hSH, self.chs);
+    tls13.deriveTraffic(self.kind, self.hs, "s hs traffic", hSH, self.shs);
+    tls13.deriveKeyIv(self.kind, self.suite, self.chs, self.cKey, self.cIv);
+    tls13.deriveKeyIv(self.kind, self.suite, self.shs, self.sKey, self.sIv);
+    bytes.free(ephPub); bytes.free(ecdhe); bytes.free(early); bytes.free(derived); bytes.free(hSH);
+    return p;
+}
+
+// DER-encode one ECDSA integer (strip leading zeros, prepend 0x00 if the high bit is set). Returns bytes.
+fn derInt(src: ptr, out: ptr, off: int): int {
+    let s = 0;
+    while (s < 31 && bytes.read_byte(src, s) == 0) { s = s + 1; }
+    let pad = 0;
+    if ((bytes.read_byte(src, s) & 0x80) != 0) { pad = 1; }
+    let vlen = 32 - s + pad;
+    bytes.write_byte(out, off, 0x02);
+    bytes.write_byte(out, off + 1, vlen);
+    let p = off + 2;
+    if (pad == 1) { bytes.write_byte(out, p, 0); p = p + 1; }
+    let i = s;
+    while (i < 32) { bytes.write_byte(out, p, bytes.read_byte(src, i)); p = p + 1; i = i + 1; }
+    return p - off;
+}
+fn encodeEcdsaSig(r: ptr, s: ptr, out: ptr): int {
+    let rlen = derInt(r, out, 2);
+    let slen = derInt(s, out, 2 + rlen);
+    let total = rlen + slen;
+    bytes.write_byte(out, 0, 0x30);
+    bytes.write_byte(out, 1, total);
+    return 2 + total;
+}
+
+// Build the server's encrypted handshake flight (EncryptedExtensions, Certificate, CertificateVerify,
+// Finished) as one protected record into out. Signs the CertificateVerify and derives the application
+// traffic secrets. Returns the record length.
+pub fn buildFlight(self: TlsServer, out: ptr): int {
+    let inner = bytes.alloc(4096 + self.certLen);
+    let ip = 0;
+
+    // EncryptedExtensions (empty).
+    let eeStart = ip;
+    ip = putHex(inner, ip, "080000020000");
+    trAdd(self, at(inner, eeStart), 6);
+
+    // Certificate: 0b || bodyLen || 00 || listLen || certLen || cert || 0000
+    let certStart = ip;
+    let listLen = 3 + self.certLen + 2;
+    let bodyLen = 1 + 3 + listLen;
+    bytes.write_byte(inner, ip, 0x0b); ip = ip + 1;
+    w3(inner, ip, bodyLen); ip = ip + 3;
+    bytes.write_byte(inner, ip, 0); ip = ip + 1;             // certificate_request_context (empty)
+    w3(inner, ip, listLen); ip = ip + 3;
+    w3(inner, ip, self.certLen); ip = ip + 3;
+    let ci = 0;
+    while (ci < self.certLen) { bytes.write_byte(inner, ip + ci, bytes.read_byte(self.certDer, ci)); ci = ci + 1; }
+    ip = ip + self.certLen;
+    bytes.write_byte(inner, ip, 0); bytes.write_byte(inner, ip + 1, 0); ip = ip + 2;   // entry extensions
+    trAdd(self, at(inner, certStart), ip - certStart);
+
+    // CertificateVerify: sign 64sp || context || 0x00 || Transcript-Hash(CH..Certificate).
+    let cvStart = ip;
+    let hCert = bytes.alloc(32); trHash(self, hCert);
+    let ctx = "TLS 1.3, server CertificateVerify";
+    let content = bytes.alloc(64 + 33 + 1 + 32);
+    let cp = 0;
+    while (cp < 64) { bytes.write_byte(content, cp, 0x20); cp = cp + 1; }
+    let k = 0;
+    while (k < ctx.length) { bytes.write_byte(content, 64 + k, ctx[k]); k = k + 1; }
+    bytes.write_byte(content, 97, 0);
+    k = 0;
+    while (k < 32) { bytes.write_byte(content, 98 + k, bytes.read_byte(hCert, k)); k = k + 1; }
+    let digest = bytes.alloc(32); sha256.hashInto(content, 130, digest);
+    let r = bytes.alloc(32); let s = bytes.alloc(32);
+    p256.ecdsaSign(digest, self.signKey, r, s);
+    let sigDer = bytes.alloc(80);
+    let sigLen = encodeEcdsaSig(r, s, sigDer);
+    let cvBodyLen = 4 + sigLen;                              // scheme(2) + sigLen field(2) + sig
+    bytes.write_byte(inner, ip, 0x0f); ip = ip + 1;
+    w3(inner, ip, cvBodyLen); ip = ip + 3;
+    bytes.write_byte(inner, ip, 0x04); bytes.write_byte(inner, ip + 1, 0x03); ip = ip + 2;   // ecdsa_secp256r1_sha256
+    bytes.write_byte(inner, ip, (sigLen >> 8) & 0xff); bytes.write_byte(inner, ip + 1, sigLen & 0xff); ip = ip + 2;
+    let si = 0;
+    while (si < sigLen) { bytes.write_byte(inner, ip + si, bytes.read_byte(sigDer, si)); si = si + 1; }
+    ip = ip + sigLen;
+    trAdd(self, at(inner, cvStart), ip - cvStart);
+    bytes.free(hCert); bytes.free(content); bytes.free(digest); bytes.free(r); bytes.free(s); bytes.free(sigDer);
+
+    // Finished over Transcript-Hash(CH..CertificateVerify).
+    let finStart = ip;
+    let hCV = bytes.alloc(32); trHash(self, hCV);
+    let vd = bytes.alloc(32); tls13hs.finishedVerifyData(self.kind, self.shs, hCV, vd);
+    bytes.write_byte(inner, ip, 0x14); ip = ip + 1;
+    w3(inner, ip, 32); ip = ip + 3;
+    let vi = 0;
+    while (vi < 32) { bytes.write_byte(inner, ip + vi, bytes.read_byte(vd, vi)); vi = vi + 1; }
+    ip = ip + 32;
+    trAdd(self, at(inner, finStart), ip - finStart);
+    bytes.free(hCV); bytes.free(vd);
+
+    let recLen = tls13.recordProtect(self.suite, self.sKey, self.sIv, self.sSeq, inner, ip, 0x16, out);
+    self.sSeq = self.sSeq + 1;
+
+    // Application traffic secrets, over the transcript through the server Finished.
+    let hSF = bytes.alloc(48); trHash(self, hSF);
+    tls13hs.masterSecret(self.kind, self.hs, self.master);
+    tls13.deriveTraffic(self.kind, self.master, "c ap traffic", hSF, self.cap);
+    tls13.deriveTraffic(self.kind, self.master, "s ap traffic", hSF, self.sap);
+    tls13.deriveKeyIv(self.kind, self.suite, self.cap, self.capKey, self.capIv);
+    tls13.deriveKeyIv(self.kind, self.suite, self.sap, self.sapKey, self.sapIv);
+    bytes.free(hSF); bytes.free(inner);
+    return recLen;
+}
+
+// Decrypt and verify the client's Finished (a protected handshake record). On success, switch to
+// application keys (reset sequence numbers). Returns true iff the client Finished MAC verifies.
+pub fn processClientFinished(self: TlsServer, record: ptr, recLen: int): bool {
+    let inner = bytes.alloc(recLen);
+    let innerLen = tls13.recordUnprotect(self.suite, self.cKey, self.cIv, self.cSeq, record, recLen, inner);
+    self.cSeq = self.cSeq + 1;
+    if (innerLen < 0) { bytes.free(inner); return false; }
+    let hSF = bytes.alloc(48); trHash(self, hSF);          // transcript through server Finished
+    self.finishedOk = tls13hs.verifyFinished(self.kind, self.chs, hSF, at(inner, 4));
+    bytes.free(inner); bytes.free(hSF);
+    if (self.finishedOk) { self.cSeq = 0; self.sSeq = 0; }
+    return self.finishedOk;
+}
+
+// Encrypt / decrypt application data with the negotiated application keys.
+pub fn encryptApp(self: TlsServer, data: ptr, dataLen: int, out: ptr): int {
+    let n = tls13.recordProtect(self.suite, self.sapKey, self.sapIv, self.sSeq, data, dataLen, 0x17, out);
+    self.sSeq = self.sSeq + 1;
+    return n;
+}
+pub fn decryptApp(self: TlsServer, record: ptr, recLen: int, out: ptr): int {
+    let n = tls13.recordUnprotect(self.suite, self.capKey, self.capIv, self.cSeq, record, recLen, out);
+    self.cSeq = self.cSeq + 1;
+    return n;
+}
