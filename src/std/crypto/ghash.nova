@@ -1,0 +1,122 @@
+// GHASH, the GF(2^128) universal hash used by AES-GCM (NIST SP 800-38D), implemented in Nova with no
+// external library (M9 phase B). The field multiply is the bit-by-bit shift-and-xor, but the two
+// data-dependent choices (whether to add V, and whether to reduce) are made with masks rather than
+// branches, so it is constant-time. Blocks and the reduction follow the GCM big-endian, bit-reflected
+// convention.
+//
+// Reference: wolfSSL GMULT/RIGHTSHIFTX (deps/wolfssl/wolfcrypt/src/aes.c) and BearSSL ghash_ctmul,
+// made branch-free. Verified against a reference GHASH computed independently (conformance case 222).
+import bytes;
+import mem.allocator;
+
+pub const GHASH_BLOCK_LEN: int = 16;
+
+// x = x * h in GF(2^128). x and h are 16-byte big-endian blocks; x is overwritten with the product.
+fn gmult(x: ptr, h: ptr): void {
+    let z = bytes.alloc(16);
+    let v = bytes.alloc(16);
+    let i = 0;
+    while (i < 16) {
+        bytes.write_byte(z, i, 0);
+        bytes.write_byte(v, i, bytes.read_byte(x, i));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 16) {
+        let yb = bytes.read_byte(h, i);
+        let j = 0;
+        while (j < 8) {
+            // mask = 0xff if the current bit of h is set, else 0x00 (no branch).
+            let mask = (0 - ((yb >> 7) & 1)) & 0xff;
+            let k = 0;
+            while (k < 16) {
+                bytes.write_byte(z, k, bytes.read_byte(z, k) ^ (bytes.read_byte(v, k) & mask));
+                k = k + 1;
+            }
+            // Shift V right by one bit; if a 1 fell off the low end, reduce by XORing 0xe1 into V[0].
+            let lsb = bytes.read_byte(v, 15) & 1;
+            let borrow = (0 - lsb) & 0xe1;
+            let carryIn = 0;
+            k = 0;
+            while (k < 16) {
+                let cur = bytes.read_byte(v, k);
+                let carryOut = (cur & 1) << 7;
+                bytes.write_byte(v, k, (cur >> 1) | carryIn);
+                carryIn = carryOut;
+                k = k + 1;
+            }
+            bytes.write_byte(v, 0, bytes.read_byte(v, 0) ^ borrow);
+            yb = (yb << 1) & 0xff;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 16) { bytes.write_byte(x, i, bytes.read_byte(z, i)); i = i + 1; }
+    bytes.free(z);
+    bytes.free(v);
+}
+
+// A running GHASH keyed by H: Y starts at 0, each block does Y = (Y ^ block) * H.
+pub struct Ghash {
+    pub h: ptr,
+    pub y: ptr,
+
+    pub fn create(hkey: ptr): Ghash {
+        let g = bytes.new_with_allocator<Ghash>(allocator.globalAllocator());
+        g.h = bytes.alloc(16);
+        g.y = bytes.alloc(16);
+        let i = 0;
+        while (i < 16) {
+            bytes.write_byte(g.h, i, bytes.read_byte(hkey, i));
+            bytes.write_byte(g.y, i, 0);
+            i = i + 1;
+        }
+        return g;
+    }
+
+    pub fn reset(self: Ghash): void {
+        let i = 0;
+        while (i < 16) { bytes.write_byte(self.y, i, 0); i = i + 1; }
+    }
+
+    // Absorb one full 16-byte block at b+off.
+    pub fn block(self: Ghash, b: ptr, off: int): void {
+        let i = 0;
+        while (i < 16) {
+            bytes.write_byte(self.y, i, bytes.read_byte(self.y, i) ^ bytes.read_byte(b, off + i));
+            i = i + 1;
+        }
+        gmult(self.y, self.h);
+    }
+
+    // Absorb len bytes, zero-padding the final partial block (as GCM does for AAD and ciphertext).
+    pub fn update(self: Ghash, data: ptr, len: int): void {
+        let i = 0;
+        while (len - i >= 16) {
+            self.block(data, i);
+            i = i + 16;
+        }
+        let rem = len - i;
+        if (rem > 0) {
+            let tmp = bytes.alloc(16);
+            let k = 0;
+            while (k < 16) {
+                bytes.write_byte(tmp, k, if (k < rem) bytes.read_byte(data, i + k) else 0);
+                k = k + 1;
+            }
+            self.block(tmp, 0);
+            bytes.free(tmp);
+        }
+    }
+
+    pub fn final(self: Ghash, out: ptr): void {
+        let i = 0;
+        while (i < 16) { bytes.write_byte(out, i, bytes.read_byte(self.y, i)); i = i + 1; }
+    }
+
+    pub fn delete(self: Ghash): void {
+        if (self.h != 0) { bytes.free(self.h); self.h = 0; }
+        if (self.y != 0) { bytes.free(self.y); self.y = 0; }
+    }
+}

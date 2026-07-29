@@ -1,0 +1,112 @@
+// GHASH (the GF(2^128) hash of AES-GCM) implemented in Nova (M9 phase B, no external library).
+// Verified against the published GCM Test Case 2 (McGrew and Viega) and reference values whose
+// generator was itself checked against that published test case, plus the padded-update path.
+import crypto.ghash;
+import bytes;
+import assert;
+
+fn hexNib(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return 0;
+}
+
+fn eqHex(buf: ptr, n: int, hex: string): bool {
+    if (hex.length != n * 2) { return false; }
+    let i = 0;
+    while (i < n) {
+        if (bytes.read_byte(buf, i) != hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1])) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn hexInto(dst: ptr, hex: string): int {
+    let n = hex.length / 2;
+    let i = 0;
+    while (i < n) {
+        bytes.write_byte(dst, i, hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1]));
+        i = i + 1;
+    }
+    return n;
+}
+
+// GCM Test Case 2: H = AES-128(0) of the zero block; GHASH over the ciphertext block and the length
+// block equals the published tag XOR E_K(J0) = f38cbb1a...
+@test
+fn ghash_gcm_testcase2(): void {
+    let h = bytes.alloc(16);
+    hexInto(h, "66e94bd4ef8a2c3b884cfa59ca342b2e");
+    let c = bytes.alloc(16);
+    hexInto(c, "0388dace60b6a392f328c2b971b2fe78");
+    let lenblk = bytes.alloc(16);
+    hexInto(lenblk, "00000000000000000000000000000080");
+
+    let g = ghash.Ghash.create(h);
+    g.block(c, 0);
+    g.block(lenblk, 0);
+    let out = bytes.alloc(16);
+    g.final(out);
+    g.delete();
+    assert.isTrue(eqHex(out, 16, "f38cbb1ad69223dcc3457ae5b6b0f885"));
+}
+
+// Reference values (generator verified against GCM Test Case 2 above).
+@test
+fn ghash_reference_blocks(): void {
+    let h = bytes.alloc(16);
+    hexInto(h, "66e94bd4ef8a2c3b884cfa59ca342b2e");
+    let b1 = bytes.alloc(16);
+    hexInto(b1, "000102030405060708090a0b0c0d0e0f");
+    let b2 = bytes.alloc(16);
+    hexInto(b2, "101112131415161718191a1b1c1d1e1f");
+
+    let g = ghash.Ghash.create(h);
+    g.block(b1, 0);
+    let out = bytes.alloc(16);
+    g.final(out);
+    assert.isTrue(eqHex(out, 16, "9673155feb4b3741b24db4ad03ba38d1"));
+
+    g.block(b2, 0);
+    g.final(out);
+    assert.isTrue(eqHex(out, 16, "5fc84be708181f1619433ea1199ad142"));
+    g.delete();
+}
+
+// The padded update path: feeding 32 bytes via update() must match feeding two explicit blocks.
+@test
+fn ghash_update_padding(): void {
+    let h = bytes.alloc(16);
+    hexInto(h, "66e94bd4ef8a2c3b884cfa59ca342b2e");
+    let data = bytes.alloc(32);
+    hexInto(data, "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+
+    let g = ghash.Ghash.create(h);
+    g.update(data, 32);
+    let out = bytes.alloc(16);
+    g.final(out);
+    g.delete();
+    assert.isTrue(eqHex(out, 16, "5fc84be708181f1619433ea1199ad142"));
+
+    // A 20-byte input: one full block plus a 4-byte block zero-padded to 16.
+    let g2 = ghash.Ghash.create(h);
+    g2.update(data, 20);
+    let full = bytes.alloc(16);
+    hexInto(full, "000102030405060708090a0b0c0d0e0f");
+    let tail = bytes.alloc(16);
+    hexInto(tail, "10111213000000000000000000000000");
+    let g3 = ghash.Ghash.create(h);
+    g3.block(full, 0);
+    g3.block(tail, 0);
+    let o2 = bytes.alloc(16);
+    let o3 = bytes.alloc(16);
+    g2.final(o2);
+    g3.final(o3);
+    g2.delete();
+    g3.delete();
+    let i = 0;
+    while (i < 16) { assert.equalInt(bytes.read_byte(o2, i), bytes.read_byte(o3, i)); i = i + 1; }
+}
