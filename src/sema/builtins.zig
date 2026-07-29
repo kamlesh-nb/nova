@@ -100,28 +100,13 @@ pub const externs = [_]Builtin{
     .{ .receiver = "", .name = "nova_socket_connect_timeout", .ret = .int },
     .{ .receiver = "", .name = "nova_socket_set_timeout", .ret = .int },
     .{ .receiver = "", .name = "nova_close", .ret = .void_ },
+    .{ .receiver = "", .name = "nova_getrandom", .ret = .void_ },
 
     .{ .receiver = "", .name = "nova_process_try_wait", .ret = .int },
     .{ .receiver = "", .name = "nova_process_pid", .ret = .long },
     .{ .receiver = "", .name = "nova_aserver_listen_addr", .ret = .long },
     .{ .receiver = "", .name = "nova_process_spawn_isolated", .ret = .ptr },
-
-    .{ .receiver = "", .name = "nova_tds_tls_new", .ret = .ptr },
-    .{ .receiver = "", .name = "nova_tds_tls_handshake", .ret = .int },
-    .{ .receiver = "", .name = "nova_tds_tls_write", .ret = .int },
-    .{ .receiver = "", .name = "nova_tds_tls_read", .ret = .int },
-    .{ .receiver = "", .name = "nova_tds_tls_free", .ret = .void_ },
-
-    .{ .receiver = "", .name = "nova_mtls_new", .ret = .ptr },
-    .{ .receiver = "", .name = "nova_mtls_new_server", .ret = .ptr },
-    .{ .receiver = "", .name = "nova_mtls_handshake", .ret = .int },
-    .{ .receiver = "", .name = "nova_mtls_feed", .ret = .void_ },
-    .{ .receiver = "", .name = "nova_mtls_mark_closed", .ret = .void_ },
-    .{ .receiver = "", .name = "nova_mtls_pull", .ret = .int },
-    .{ .receiver = "", .name = "nova_mtls_pending_out", .ret = .int },
-    .{ .receiver = "", .name = "nova_mtls_write", .ret = .int },
-    .{ .receiver = "", .name = "nova_mtls_read", .ret = .int },
-    .{ .receiver = "", .name = "nova_mtls_free", .ret = .void_ },
+    // The wolfSSL TLS externs (nova_tds_tls_*, nova_mtls_*) were removed in M13; TLS is pure Nova now.
 };
 
 pub fn findExtern(name: []const u8) ?Builtin {

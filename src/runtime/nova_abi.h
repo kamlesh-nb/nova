@@ -181,12 +181,7 @@ int  nova_socket_accept(int server_fd);
 int  nova_socket_send(int fd, const char *data);
 int  nova_socket_send_n(int fd, const char *data, int len);
 int  nova_socket_recv(int fd, char *buf, int max_len);
-typedef struct TlsContext TlsContext;
-TlsContext* nova_tls_new(int fd, const char *hostname);
-int  nova_tls_handshake(TlsContext *ctx);
-int  nova_tls_write(TlsContext *ctx, const char *data);
-int  nova_tls_read(TlsContext *ctx, char *buf, int max_len);
-void nova_tls_free(TlsContext *ctx);
+// TLS is pure Nova as of M13 (crypto/tls + net/tlsmembio + net/tls12bio); no C TLS declarations remain.
 
 typedef struct ProcessContext ProcessContext;
 ProcessContext* nova_process_spawn(const char *cmd, const char *args_str);

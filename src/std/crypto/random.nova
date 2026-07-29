@@ -1,35 +1,16 @@
-// CSPRNG + deterministic PCG helpers in pure Nova. Cryptographic randomness comes from the OS via
-// /dev/urandom (read through the honest nova_open/read/close primitives) - no wolfCrypt. The Prng below
-// is a deterministic PCG32 for reproducible, NON-cryptographic use (seeded simulations, jitter).
+// CSPRNG + deterministic PCG helpers in pure Nova. Cryptographic randomness comes from the OS entropy
+// source (nova_getrandom over getentropy(2), an honest kernel primitive - NOT a crypto library, and NOT
+// the os.sys module, so importing this does not drag os.sys's socket/file externs into every consumer).
+// The Prng below is a deterministic PCG32 for reproducible, NON-cryptographic use (seeds, jitter).
 import bytes;
-import os.sys;
 import assert;
 
 const HEXD: string = "0123456789abcdef";
 
-// NUL-terminated C string for a path literal.
-fn cstr(s: string): ptr {
-    let b = bytes.alloc(s.length + 1);
-    let i = 0;
-    while (i < s.length) { bytes.write_byte(b, i, s[i]); i = i + 1; }
-    bytes.write_byte(b, s.length, 0);
-    return b;
-}
-
-// Fill `n` bytes at `buf` with OS entropy. Returns the number of bytes read (n on success).
+// Fill `n` bytes at `buf` with OS entropy.
 fn osRandom(buf: ptr, n: int): int {
-    let path = cstr("/dev/urandom");
-    let fd = sys.nova_open(path, sys.O_RDONLY, 0);
-    bytes.free(path);
-    if (fd < 0) { return 0; }
-    let got = 0;
-    while (got < n) {
-        let r = sys.read(fd, (buf as long + got) as ptr, (n - got) as long);
-        if (r <= 0) { sys.close(fd); return got; }
-        got = got + (r as int);
-    }
-    sys.close(fd);
-    return got;
+    nova_getrandom(buf, n as long);
+    return n;
 }
 
 // `nBytes` of OS entropy as a 2*nBytes-character lowercase hex string.

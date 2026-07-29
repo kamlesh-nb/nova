@@ -7,6 +7,7 @@ import list;
 import map;
 import net.tcp.client;
 import net.tcp.socket;
+import net.tlsmembio;
 import net.url;
 import compress.gzip;
 import serde.source;
@@ -75,31 +76,80 @@ pub struct HttpClient {
     }
 }
 
+fn cliBufToStr(buf: ptr, n: int): string {
+    if (n <= 0) { return ""; }
+    let out = bytes.alloc(n);
+    let i = 0;
+    while (i < n) { bytes.write_byte(out, i, bytes.read_byte(buf, i)); i = i + 1; }
+    return out as string;
+}
+
+// A blocking HTTP connection. When `secure`, TLS runs in pure Nova: the ClientBio (net/tlsmembio, TLS
+// 1.3) is pumped over the raw socket with nova_socket_send/recv. No wolfSSL. The handshake authenticates
+// the peer; chain-to-CA trust is a separate policy layer (verifyServerChain + a trust store).
 struct HttpConn {
     pub secure: bool,
     pub fd: int,
-    pub tlsCtx: ptr,
+    pub bio: tlsmembio.TlsBio,
+    pub scratch: ptr,
+    pub cap: int,
+
+    fn tlsFlush(self: HttpConn): void {
+        while (self.bio.pendingOut() > 0) {
+            let n = self.bio.pull(self.scratch, self.cap);
+            if (n <= 0) { return; }
+            // Ciphertext is binary (may contain NUL): send exactly n bytes from the buffer pointer.
+            nova_socket_send_n(self.fd, self.scratch, n);
+        }
+    }
+
+    fn tlsHandshake(self: HttpConn): int {
+        while (true) {
+            let st = self.bio.step();
+            self.tlsFlush();
+            if (st == 0) { return 0; }
+            if (st < 0) { return 0 - 1; }
+            let n = nova_socket_recv(self.fd, self.scratch, self.cap);
+            if (n <= 0) { return 0 - 1; }
+            self.bio.feed(self.scratch, n);
+        }
+        return 0 - 1;
+    }
 
     fn writeStr(self: HttpConn, data: string): int {
-        if (self.tlsCtx != 0) { return nova_tls_write(self.tlsCtx, data); }
+        if (self.secure) {
+            self.bio.writeApp(data as ptr, data.length);
+            self.tlsFlush();
+            return data.length;
+        }
         return nova_socket_send(self.fd, data);
     }
 
     fn recv(self: HttpConn, max: int): string {
+        if (self.secure) {
+            let out = bytes.alloc(max);
+            while (true) {
+                let pl = self.bio.readApp(out, max);
+                if (pl > 0) { let s = cliBufToStr(out, pl); bytes.free(out); return s; }
+                if (pl < 0) { bytes.free(out); return ""; }
+                let n = nova_socket_recv(self.fd, self.scratch, self.cap);
+                if (n <= 0) { bytes.free(out); return ""; }
+                self.bio.feed(self.scratch, n);
+            }
+            bytes.free(out);
+            return "";
+        }
         let buf = bytes.alloc(max);
-        let n = 0;
-        if (self.tlsCtx != 0) { n = nova_tls_read(self.tlsCtx, buf, max); }
-        else { n = nova_socket_recv(self.fd, buf, max); }
+        let n = nova_socket_recv(self.fd, buf, max);
         if (n <= 0) { bytes.free(buf); return ""; }
-        let sp = bytes.alloc(n);
-        let i = 0;
-        while (i < n) { bytes.write_byte(sp, i, bytes.read_byte(buf, i)); i = i + 1; }
+        let sp = cliBufToStr(buf, n);
         bytes.free(buf);
-        return sp as string;
+        return sp;
     }
 
     fn close(self: HttpConn): void {
-        if (self.tlsCtx != 0) { nova_tls_free(self.tlsCtx); self.tlsCtx = 0; }
+        self.bio.closeBio();
+        bytes.free(self.scratch);
         if (self.fd >= 0) { socket.closeFd(self.fd); self.fd = -1; }
     }
 }
@@ -213,10 +263,10 @@ pub struct Http {
             return response.Response(Status.InternalServerError, "connection failed");
         }
         if (timeoutMs > 0) { nova_socket_set_timeout(fd, timeoutMs); }
-        let conn = HttpConn{ secure: false, fd: fd, tlsCtx: 0 };
+        let bio: tlsmembio.TlsBio = tlsmembio.newClientBio(u.host);
+        let conn = HttpConn{ secure: u.secure, fd: fd, bio: bio, scratch: bytes.alloc(33792), cap: 33792 };
         if (u.secure) {
-            conn.tlsCtx = nova_tls_new(fd, u.host);
-            if (nova_tls_handshake(conn.tlsCtx) != 0) {
+            if (conn.tlsHandshake() != 0) {
                 conn.close();
                 return response.Response(Status.InternalServerError, "TLS handshake failed");
             }

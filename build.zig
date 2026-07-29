@@ -391,29 +391,12 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile) void {
         \\# Prebuild the C++ runtime ONCE into a static library. Boost.Asio has been retired (M4):
         \\# the async runtime is reactor-native (net/reactorio over os/sys, kqueue/epoll), so nothing
         \\# in src/runtime includes Boost and no Boost include path is needed.
-        \\# M3-D-5: build the vendored wolfSSL static lib once (TLS via wolfSSL). If
-        \\# libwolfssl.a is already built, skip. Enables real TLS with verify_peer.
-        \\WOLF_LIB="deps/wolfssl/build/libwolfssl.a"
-        \\WOLF_FLAGS=""
-        \\if [ -f "$WOLF_LIB" ]; then
-        \\  WOLF_FLAGS="-DNOVA_HAVE_WOLFSSL -Ideps/wolfssl -Ideps/wolfssl/build"
-        \\  echo "wolfSSL: using $WOLF_LIB (TLS enabled)"
-        \\elif command -v cmake >/dev/null 2>&1; then
-        \\  echo "wolfSSL: building static lib via cmake ..."
-        \\  cmake -S deps/wolfssl -B deps/wolfssl/build -DCMAKE_BUILD_TYPE=Release \
-        \\    -DBUILD_SHARED_LIBS=OFF -DWOLFSSL_TLS13=yes -DWOLFSSL_EXAMPLES=no \
-        \\    -DWOLFSSL_CRYPT_TESTS=no -DWOLFSSL_OPENSSLEXTRA=no \
-        \\    -DWOLFSSL_SECURE_RENEGOTIATION=yes >/dev/null 2>&1 && \
-        \\  cmake --build deps/wolfssl/build --parallel 8 >/dev/null 2>&1 && \
-        \\  WOLF_FLAGS="-DNOVA_HAVE_WOLFSSL -Ideps/wolfssl -Ideps/wolfssl/build" && \
-        \\  echo "wolfSSL: built (TLS enabled)" || echo "wolfSSL: build failed (TLS stubbed)"
-        \\else
-        \\  echo "wolfSSL: no prebuilt lib and no cmake (TLS stubbed)"
-        \\fi
-        \\echo "Building libnova_runtime.a (no Boost; reactor runtime) ..."
+        \\# TLS is pure Nova (M9/M11/M13): crypto/tls + net/tlsmembio + net/tls12bio. wolfSSL is retired,
+        \\# so there is no C TLS library to build or link, and no NOVA_HAVE_WOLFSSL define.
+        \\echo "Building libnova_runtime.a (no Boost, no wolfSSL; reactor runtime) ..."
         \\# Workstream A: NOVA_DROP_ARENA makes every heap object honestly refcounted
         \\# (no load-bearing thread-local arena). Required for multi-core + clean ARC.
-        \\clang++ -std=c++20 -O2 -pthread -DNOVA_DROP_ARENA $WOLF_FLAGS -c \
+        \\clang++ -std=c++20 -O2 -pthread -DNOVA_DROP_ARENA -c \
         \\    src/runtime/runtime.cpp -o "{[home]s}/.nova/lib/nova_runtime.o"
         \\ar rcs "{[home]s}/.nova/lib/libnova_runtime.a" "{[home]s}/.nova/lib/nova_runtime.o"
         \\# T1: the cross-compilation cache (nova_runtime_<triple>.o, built lazily by `nova build
@@ -438,7 +421,7 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile) void {
         \\if [ "${{NOVA_ASAN:-0}}" = "1" ]; then
         \\  echo "Building libnova_runtime_asan.a (AddressSanitizer) ..."
         \\  clang++ -std=c++20 -O1 -g -fsanitize=address -fno-omit-frame-pointer \
-        \\      -pthread -DNOVA_DROP_ARENA $WOLF_FLAGS -c \
+        \\      -pthread -DNOVA_DROP_ARENA -c \
         \\      src/runtime/runtime.cpp -o "{[home]s}/.nova/lib/nova_runtime_asan.o"
         \\  ar rcs "{[home]s}/.nova/lib/libnova_runtime_asan.a" "{[home]s}/.nova/lib/nova_runtime_asan.o"
         \\  echo "ASAN runtime built. Use: NOVA_ASAN=1 nova test <file>"
@@ -452,7 +435,7 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile) void {
         \\if [ "${{NOVA_TSAN:-0}}" = "1" ]; then
         \\  echo "Building libnova_runtime_tsan.a (ThreadSanitizer) ..."
         \\  clang++ -std=c++20 -O1 -g -fsanitize=thread -fno-omit-frame-pointer \
-        \\      -pthread -DNOVA_DROP_ARENA $WOLF_FLAGS -c \
+        \\      -pthread -DNOVA_DROP_ARENA -c \
         \\      src/runtime/runtime.cpp -o "{[home]s}/.nova/lib/nova_runtime_tsan.o"
         \\  ar rcs "{[home]s}/.nova/lib/libnova_runtime_tsan.a" "{[home]s}/.nova/lib/nova_runtime_tsan.o"
         \\  echo "TSAN runtime built. Use: NOVA_TSAN=1 nova test <file> (with NOVA_THREADS>1)"

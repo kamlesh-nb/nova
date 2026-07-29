@@ -363,62 +363,8 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         const test_fail_msg_fn = core.LLVMAddFunction(compiler.module, "nova_test_fail_message", test_fail_msg_type);
         try compiler.func_map.put("nova_test_fail_message", test_fail_msg_fn);
 
-        var tls_new_params = [_]types.LLVMTypeRef{ compiler.i32_type, compiler.ptr_type };
-        const tls_new_type = core.LLVMFunctionType(compiler.ptr_type, &tls_new_params, 2, 0);
-        const tls_new_fn = core.LLVMAddFunction(compiler.module, "nova_tls_new", tls_new_type);
-        try compiler.func_map.put("nova_tls_new", tls_new_fn);
-
-        const tls_handshake_type = core.LLVMFunctionType(compiler.i32_type, &one_param_ptr, 1, 0);
-        const tls_handshake_fn = core.LLVMAddFunction(compiler.module, "nova_tls_handshake", tls_handshake_type);
-        try compiler.func_map.put("nova_tls_handshake", tls_handshake_fn);
-
-        var tls_write_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.ptr_type };
-        const tls_write_type = core.LLVMFunctionType(compiler.i32_type, &tls_write_params, 2, 0);
-        const tls_write_fn = core.LLVMAddFunction(compiler.module, "nova_tls_write", tls_write_type);
-        try compiler.func_map.put("nova_tls_write", tls_write_fn);
-
-        var tls_read_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.ptr_type, compiler.i32_type };
-        const tls_read_type = core.LLVMFunctionType(compiler.i32_type, &tls_read_params, 3, 0);
-        const tls_read_fn = core.LLVMAddFunction(compiler.module, "nova_tls_read", tls_read_type);
-        try compiler.func_map.put("nova_tls_read", tls_read_fn);
-
-        const tls_free_type = core.LLVMFunctionType(compiler.void_type, &one_param_ptr, 1, 0);
-        const tls_free_fn = core.LLVMAddFunction(compiler.module, "nova_tls_free", tls_free_type);
-        try compiler.func_map.put("nova_tls_free", tls_free_fn);
-
-        var tds_new_params = [_]types.LLVMTypeRef{compiler.i32_type};
-        const tds_new_type = core.LLVMFunctionType(compiler.ptr_type, &tds_new_params, 1, 0);
-        try compiler.func_map.put("nova_tds_tls_new", core.LLVMAddFunction(compiler.module, "nova_tds_tls_new", tds_new_type));
-        const tds_hs_type = core.LLVMFunctionType(compiler.i32_type, &one_param_ptr, 1, 0);
-        try compiler.func_map.put("nova_tds_tls_handshake", core.LLVMAddFunction(compiler.module, "nova_tds_tls_handshake", tds_hs_type));
-        var tds_wr_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.ptr_type, compiler.i32_type };
-        const tds_wr_type = core.LLVMFunctionType(compiler.i32_type, &tds_wr_params, 3, 0);
-        try compiler.func_map.put("nova_tds_tls_write", core.LLVMAddFunction(compiler.module, "nova_tds_tls_write", tds_wr_type));
-        try compiler.func_map.put("nova_tds_tls_read", core.LLVMAddFunction(compiler.module, "nova_tds_tls_read", tds_wr_type));
-        const tds_free_type = core.LLVMFunctionType(compiler.void_type, &one_param_ptr, 1, 0);
-        try compiler.func_map.put("nova_tds_tls_free", core.LLVMAddFunction(compiler.module, "nova_tds_tls_free", tds_free_type));
-
-        var mtls_new_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.i32_type };
-        const mtls_new_type = core.LLVMFunctionType(compiler.ptr_type, &mtls_new_params, 2, 0);
-        try compiler.func_map.put("nova_mtls_new", core.LLVMAddFunction(compiler.module, "nova_mtls_new", mtls_new_type));
-        var mtls_srv_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.i32_type, compiler.ptr_type, compiler.i32_type };
-        const mtls_srv_type = core.LLVMFunctionType(compiler.ptr_type, &mtls_srv_params, 4, 0);
-        try compiler.func_map.put("nova_mtls_new_server", core.LLVMAddFunction(compiler.module, "nova_mtls_new_server", mtls_srv_type));
-        const mtls_hs_type = core.LLVMFunctionType(compiler.i32_type, &one_param_ptr, 1, 0);
-        try compiler.func_map.put("nova_mtls_handshake", core.LLVMAddFunction(compiler.module, "nova_mtls_handshake", mtls_hs_type));
-        var mtls_pp_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.ptr_type, compiler.i32_type };
-        const mtls_feed_type = core.LLVMFunctionType(compiler.void_type, &mtls_pp_params, 3, 0);
-        try compiler.func_map.put("nova_mtls_feed", core.LLVMAddFunction(compiler.module, "nova_mtls_feed", mtls_feed_type));
-        const mtls_closed_type = core.LLVMFunctionType(compiler.void_type, &one_param_ptr, 1, 0);
-        try compiler.func_map.put("nova_mtls_mark_closed", core.LLVMAddFunction(compiler.module, "nova_mtls_mark_closed", mtls_closed_type));
-        const mtls_pp_i32_type = core.LLVMFunctionType(compiler.i32_type, &mtls_pp_params, 3, 0);
-        try compiler.func_map.put("nova_mtls_pull", core.LLVMAddFunction(compiler.module, "nova_mtls_pull", mtls_pp_i32_type));
-        try compiler.func_map.put("nova_mtls_write", core.LLVMAddFunction(compiler.module, "nova_mtls_write", mtls_pp_i32_type));
-        try compiler.func_map.put("nova_mtls_read", core.LLVMAddFunction(compiler.module, "nova_mtls_read", mtls_pp_i32_type));
-        const mtls_pend_type = core.LLVMFunctionType(compiler.i32_type, &one_param_ptr, 1, 0);
-        try compiler.func_map.put("nova_mtls_pending_out", core.LLVMAddFunction(compiler.module, "nova_mtls_pending_out", mtls_pend_type));
-        const mtls_free_type = core.LLVMFunctionType(compiler.void_type, &one_param_ptr, 1, 0);
-        try compiler.func_map.put("nova_mtls_free", core.LLVMAddFunction(compiler.module, "nova_mtls_free", mtls_free_type));
+        // The wolfSSL socket-TLS (nova_tls_*), TDS-TLS (nova_tds_tls_*), and memory-BIO (nova_mtls_*)
+        // externs were removed in M13: TLS is now pure Nova (crypto/tls, net/tlsmembio, net/tls12bio).
 
         // nova_getenv/nova_setenv were retired in M6: std/env.nova reads and writes the environment
         // through the getenv/setenv bindings in os/sys.
@@ -432,6 +378,10 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         // SHA/MD5/HMAC/PBKDF2/random are now pure Nova (M11 stage A); only the MySQL auth-scramble and
         // All crypto (SHA/HMAC/PBKDF2/random/MySQL-scramble/RSA-OAEP) is pure Nova as of M11 stage B;
         // no wolfCrypt shim is declared here anymore.
+        var getrandom_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.i64_type };
+        const getrandom_fn = core.LLVMAddFunction(compiler.module, "nova_getrandom", core.LLVMFunctionType(compiler.void_type, &getrandom_params, 2, 0));
+        try compiler.func_map.put("nova_getrandom", getrandom_fn);
+
         const gzc_fn = core.LLVMAddFunction(compiler.module, "nova_gzip_compress", core.LLVMFunctionType(compiler.ptr_type, &one_param_ptr, 1, 0));
         try compiler.func_map.put("nova_gzip_compress", gzc_fn);
         const gzd_fn = core.LLVMAddFunction(compiler.module, "nova_gzip_decompress", core.LLVMFunctionType(compiler.ptr_type, &one_param_ptr, 1, 0));

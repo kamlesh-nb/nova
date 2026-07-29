@@ -189,15 +189,12 @@ fn linkWasmInProcess(allocator: std.mem.Allocator, obj_path: []const u8, output_
 }
 
 fn appendWolfsslLink(args: *std.ArrayList([]const u8), allocator: std.mem.Allocator, shared_nova: []const u8, io: std.Io) !void {
-    const lib_path = std.fmt.allocPrint(allocator, "{s}/deps/wolfssl/build/libwolfssl.a", .{shared_nova}) catch return;
-    Io.Dir.access(.cwd(), io, lib_path, .{}) catch return;
-    try args.append(allocator, lib_path);
-    if (builtin.target.os.tag == .macos) {
-        try args.append(allocator, "-framework");
-        try args.append(allocator, "Security");
-        try args.append(allocator, "-framework");
-        try args.append(allocator, "CoreFoundation");
-    }
+    // wolfSSL was retired in M13 (TLS is pure Nova). Nothing to link; kept as a no-op so the three
+    // link sites need no change. getentropy() (crypto.cpp) is in libSystem/glibc, no framework needed.
+    _ = args;
+    _ = allocator;
+    _ = shared_nova;
+    _ = io;
 }
 
 const lexer = @import("lexer.zig");
@@ -228,7 +225,7 @@ fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocator: 
         const sub = module_name[4..];
         return try std.fmt.allocPrint(allocator, "src/std/{s}.nova", .{sub});
     }
-    const std_modules = [_][]const u8{ "net/tcp/socket", "net/tcp/server", "net/tcp/client", "net/tls", "net/url", "net/asyncio", "net/asynctls", "web/request", "web/response", "web/mime", "web/status", "web/methods", "web/server", "web/client", "web/mediator", "web/routing", "web/middleware", "web/url", "web/cookie", "web/cors", "web/request_id", "web/redact", "web/secure_headers", "web/body_limit", "web/recovery", "web/rate_limit", "web/multipart", "web/session", "web/csrf", "web/di", "web/controller", "web/router", "web/app", "web/logger", "web/httpparser", "concurrency/fiber", "concurrency/channel", "concurrency/asyncchan", "concurrency/atomic", "concurrency/async_util", "concurrency/actor", "io/file", "io/dir", "collections/list", "collections/map", "collections/set", "collections/string_builder", "serde/json", "serde/source", "serde/bson", "serde/yaml", "mem/allocator", "mem/arena_allocator", "mem/memory", "string", "datetime", "math", "assert", "traits", "env", "crypto/hash/sha", "crypto/hash/md5", "crypto/base64", "crypto/random", "crypto/scram", "crypto/hash/sha256", "crypto/hash/sha512", "crypto/hash/sha1", "crypto/mac/hmac", "crypto/kdf/hkdf", "crypto/kdf/pbkdf2", "crypto/cipher/chacha20", "crypto/mac/poly1305", "crypto/aead/chachapoly", "crypto/cipher/aes", "crypto/mac/ghash", "crypto/aead/aesgcm", "crypto/cipher/aesctr", "crypto/ecc/x25519", "crypto/ecc/p256", "crypto/rsa", "crypto/x509", "crypto/tls/13/tls", "crypto/tls/13/handshake", "crypto/tls/13/tlsClient", "crypto/tls/13/tlsServer", "crypto/tls/12/prf", "crypto/tls/12/client12", "process", "fs", "exception", "data/db", "data/sql/pool", "text/utf8", "text/regex", "webview", "web/static_content", "web/circuit_breaker", "resilience/breaker", "compress/gzip", "data/orm", "os/sys", "os/kqueue", "os/epoll", "io/slab", "io/arena", "net/reactor", "net/reactorio", "net/tls13async", "net/tlsmembio", "net/wolftls", "net/tls12bio" };
+    const std_modules = [_][]const u8{ "net/tcp/socket", "net/tcp/server", "net/tcp/client", "net/url", "net/asyncio", "net/asynctls", "web/request", "web/response", "web/mime", "web/status", "web/methods", "web/server", "web/client", "web/mediator", "web/routing", "web/middleware", "web/url", "web/cookie", "web/cors", "web/request_id", "web/redact", "web/secure_headers", "web/body_limit", "web/recovery", "web/rate_limit", "web/multipart", "web/session", "web/csrf", "web/di", "web/controller", "web/router", "web/app", "web/logger", "web/httpparser", "concurrency/fiber", "concurrency/channel", "concurrency/asyncchan", "concurrency/atomic", "concurrency/async_util", "concurrency/actor", "io/file", "io/dir", "collections/list", "collections/map", "collections/set", "collections/string_builder", "serde/json", "serde/source", "serde/bson", "serde/yaml", "mem/allocator", "mem/arena_allocator", "mem/memory", "string", "datetime", "math", "assert", "traits", "env", "crypto/hash/sha", "crypto/hash/md5", "crypto/base64", "crypto/random", "crypto/scram", "crypto/hash/sha256", "crypto/hash/sha512", "crypto/hash/sha1", "crypto/mac/hmac", "crypto/kdf/hkdf", "crypto/kdf/pbkdf2", "crypto/cipher/chacha20", "crypto/mac/poly1305", "crypto/aead/chachapoly", "crypto/cipher/aes", "crypto/mac/ghash", "crypto/aead/aesgcm", "crypto/cipher/aesctr", "crypto/ecc/x25519", "crypto/ecc/p256", "crypto/rsa", "crypto/x509", "crypto/tls/13/tls", "crypto/tls/13/handshake", "crypto/tls/13/tlsClient", "crypto/tls/13/tlsServer", "crypto/tls/12/prf", "crypto/tls/12/client12", "process", "fs", "exception", "data/db", "data/sql/pool", "text/utf8", "text/regex", "webview", "web/static_content", "web/circuit_breaker", "resilience/breaker", "compress/gzip", "data/orm", "os/sys", "os/kqueue", "os/epoll", "io/slab", "io/arena", "net/reactor", "net/reactorio", "net/tls13async", "net/tlsmembio", "net/tls12bio" };
     for (std_modules) |m| {
         if (std.mem.eql(u8, module_name, m)) {
             return try std.fmt.allocPrint(allocator, "src/std/{s}.nova", .{module_name});
@@ -1851,7 +1848,6 @@ fn linkLibsStamp(allocator: std.mem.Allocator, init: std.process.Init) u64 {
     const home = init.environ_map.get("HOME") orelse init.environ_map.get("USERPROFILE") orelse "/";
     const libs = [_][]const u8{
         "/.nova/lib/libnova_runtime.a",
-        "/.nova/deps/wolfssl/build/libwolfssl.a",
     };
     var acc: u64 = 0;
     for (libs) |suffix| {

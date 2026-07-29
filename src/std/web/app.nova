@@ -704,7 +704,7 @@ pub async fn serveReactorConn(app: App, fd: int, kq: int): int {
     let s = asyncio.AsyncStream(fd as long);
     s.kq = kq;
     if (app.tlsEnabled) {
-        // Inbound TLS on the reactor: the wolfSSL memory-BIO pump (TlsStream) does its socket I/O
+        // Inbound TLS on the reactor: the pure-Nova TLS 1.3 memory-BIO (TlsStream over net/tlsmembio) does its socket I/O
         // through the reactor-native AsyncStream, so the handshake and data path run on the reactor,
         // no Asio. TlsStream itself is an AsyncIO, so handleConn is unchanged.
         let tls = await asynctls.tlsAccept(s, app.tlsCert, app.tlsKey);
