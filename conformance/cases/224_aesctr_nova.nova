@@ -1,0 +1,93 @@
+// AES-CTR (NIST SP 800-38A) implemented in Nova (M9 phase B, no external library). Verified against
+// the SP 800-38A Appendix F.5 known-answer vectors for AES-128 (F.5.1/2) and AES-256 (F.5.5/6).
+import crypto.aesctr;
+import bytes;
+import assert;
+
+fn hexNib(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return 0;
+}
+
+fn eqHex(buf: ptr, n: int, hex: string): bool {
+    if (hex.length != n * 2) { return false; }
+    let i = 0;
+    while (i < n) {
+        if (bytes.read_byte(buf, i) != hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1])) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn hexInto(dst: ptr, hex: string): int {
+    let n = hex.length / 2;
+    let i = 0;
+    while (i < n) {
+        bytes.write_byte(dst, i, hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1]));
+        i = i + 1;
+    }
+    return n;
+}
+
+const PLAINTEXT: string = "6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e5130c81c46a35ce411e5fbc1191a0a52eff69f2445df4f9b17ad2b417be66c3710";
+const CTR0: string = "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff";
+
+// SP 800-38A F.5.1 (encrypt) and F.5.2 (decrypt): AES-128-CTR.
+@test
+fn aesctr_128(): void {
+    let key = bytes.alloc(16);
+    hexInto(key, "2b7e151628aed2a6abf7158809cf4f3c");
+    let ctr = bytes.alloc(16);
+    hexInto(ctr, CTR0);
+    let pt = bytes.alloc(64);
+    hexInto(pt, PLAINTEXT);
+    let ct = bytes.alloc(64);
+    aesctr.crypt(key, 16, ctr, pt, 64, ct);
+    assert.isTrue(eqHex(ct, 64, "874d6191b620e3261bef6864990db6ce9806f66b7970fdff8617187bb9fffdff5ae4df3edbd5d35e5b4f09020db03eab1e031dda2fbe03d1792170a0f3009cee"));
+
+    // Decrypt (same operation) recovers the plaintext.
+    let ctr2 = bytes.alloc(16);
+    hexInto(ctr2, CTR0);
+    let rt = bytes.alloc(64);
+    aesctr.crypt(key, 16, ctr2, ct, 64, rt);
+    let i = 0;
+    while (i < 64) { assert.equalInt(bytes.read_byte(rt, i), bytes.read_byte(pt, i)); i = i + 1; }
+}
+
+// SP 800-38A F.5.5: AES-256-CTR.
+@test
+fn aesctr_256(): void {
+    let key = bytes.alloc(32);
+    hexInto(key, "603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4");
+    let ctr = bytes.alloc(16);
+    hexInto(ctr, CTR0);
+    let pt = bytes.alloc(64);
+    hexInto(pt, PLAINTEXT);
+    let ct = bytes.alloc(64);
+    aesctr.crypt(key, 32, ctr, pt, 64, ct);
+    assert.isTrue(eqHex(ct, 64, "601ec313775789a5b7a7f504bbf3d228f443e3ca4d62b59aca84e990cacaf5c52b0930daa23de94ce87017ba2d84988ddfc9c58db67aada613c2dd08457941a6"));
+}
+
+// A partial (non-block-multiple) length must also round-trip.
+@test
+fn aesctr_partial(): void {
+    let key = bytes.alloc(16);
+    hexInto(key, "2b7e151628aed2a6abf7158809cf4f3c");
+    let ctr = bytes.alloc(16);
+    hexInto(ctr, CTR0);
+    let pt = bytes.alloc(37);
+    let i = 0;
+    while (i < 37) { bytes.write_byte(pt, i, i * 11 + 3); i = i + 1; }
+    let ct = bytes.alloc(37);
+    aesctr.crypt(key, 16, ctr, pt, 37, ct);
+    let ctr2 = bytes.alloc(16);
+    hexInto(ctr2, CTR0);
+    let rt = bytes.alloc(37);
+    aesctr.crypt(key, 16, ctr2, ct, 37, rt);
+    i = 0;
+    while (i < 37) { assert.equalInt(bytes.read_byte(rt, i), bytes.read_byte(pt, i)); i = i + 1; }
+}
