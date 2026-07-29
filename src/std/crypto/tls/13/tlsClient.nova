@@ -369,3 +369,9 @@ pub fn verifyServerChain(self: TlsClient, rootDer: ptr, rootLen: int, host: stri
     if (self.certListLen <= 0) { return false; }
     return x509.verifyCertList(at(self.hsBuf, self.certListOff), self.certListLen, rootDer, rootLen, host, now);
 }
+
+// The captured server certificate_list (for verifying against a multi-root trust store). The pointer math
+// is inlined rather than via the local `at` helper: a public fn that RETURNS at(...) trips a name clash
+// with serde/json's `at` (JsonValue) when both are in one compile graph (e.g. web/client).
+pub fn certListPtr(self: TlsClient): ptr { return (self.hsBuf as long + self.certListOff) as ptr; }
+pub fn certListSize(self: TlsClient): int { return self.certListLen; }

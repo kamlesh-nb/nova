@@ -13,6 +13,8 @@ import crypto.tls.13.tlsServer;
 import crypto.ecc.x25519;
 import crypto.random;
 import crypto.base64;
+import crypto.tls.truststore;
+import list;
 
 fn at(b: ptr, off: int): ptr { return (b as long + off) as ptr; }
 
@@ -142,6 +144,7 @@ pub struct ClientBio impl TlsBio {
     pub state: int,                 // 1 expect ServerHello, 2 expect flight, 3 done, -1 error
     pub scratch: ptr, pub scap: int,
     pub plain: ptr,
+    pub verify: bool, pub host: string, pub store: truststore.TrustStore,   // CA trust policy (when verify)
 
     pub fn feed(self: ClientBio, data: ptr, n: int): void { self.buf.feed(data, n); }
     pub fn markClosed(self: ClientBio): void { self.buf.closed = true; }
@@ -167,6 +170,13 @@ pub struct ClientBio impl TlsBio {
                 let r = self.cl.feedHandshake(self.scratch, m);
                 if (r == 0 - 1) { self.state = 0 - 1; return 0 - 1; }
                 if (r == 1) {
+                    // CA trust policy: the handshake proved possession of the leaf key; now (if enabled)
+                    // require the chain to validate against a trusted root for the hostname, at UTC now.
+                    if (self.verify) {
+                        if (!self.store.trusts(self.cl.certListPtr(), self.cl.certListSize(), self.host, truststore.nowUtc())) {
+                            self.state = 0 - 1; return 0 - 1;
+                        }
+                    }
                     let vd = bytes.alloc(32);
                     self.cl.clientFinished(vd);
                     let fin = bytes.alloc(128);
@@ -235,7 +245,17 @@ pub fn newClientBio(host: string): ClientBio {
     mb.appendRecord(0x14, 0x03, 0x03, ccs, 1);
 
     bytes.free(base); bytes.free(ephPub); bytes.free(rnd); bytes.free(sid); bytes.free(ch); bytes.free(ccs);
-    return ClientBio { buf: mb, cl: cl, state: 1, scratch: bytes.alloc(33792), scap: 33792, plain: bytes.alloc(33792) };
+    return ClientBio { buf: mb, cl: cl, state: 1, scratch: bytes.alloc(33792), scap: 33792, plain: bytes.alloc(33792),
+                       verify: false, host: host, store: truststore.TrustStore { ders: List<long>(), lens: List<int>() } };
+}
+
+// Like newClientBio, but enforces CA trust: after the handshake the server chain must validate against
+// `store` for `host` at UTC-now, or the handshake fails (step() returns -1).
+pub fn newClientBioVerify(host: string, store: truststore.TrustStore): ClientBio {
+    let b = newClientBio(host);
+    b.verify = true;
+    b.store = store;
+    return b;
 }
 
 // ---- server role ----
