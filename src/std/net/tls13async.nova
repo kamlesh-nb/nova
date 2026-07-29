@@ -1,0 +1,137 @@
+// Reactor-async TLS 1.3 client wiring (M9 phase E): drives the crypto/tls13client state machine over a
+// non-blocking reactor socket (net/reactorio ReactorStream), with record framing on top of the reactor's
+// async recv/send. No external crypto library, no thread held while waiting on the network. This is what
+// lets a Nova reactor coroutine speak TLS 1.3 (e.g. to back an HTTPS client).
+//
+// References: RFC 8446. The handshake crypto is verified offline (conformance case 232); this module is
+// the async I/O layer, exercised live against openssl s_server via examples/tls13_async_client.nova.
+import bytes;
+import net.reactorio;
+import crypto.tls13client;
+import crypto.random;
+
+fn at(b: ptr, off: int): ptr { return (b as long + off) as ptr; }
+
+// A buffered, record-framing view over a connected reactor socket. rbuf holds bytes in [rlo, rhi).
+struct TlsIO {
+    pub fd: int, pub kq: int,
+    pub rbuf: ptr, pub rcap: int, pub rlo: int, pub rhi: int,
+}
+
+pub fn newIO(fd: int, kq: int): TlsIO {
+    return TlsIO { fd: fd, kq: kq, rbuf: bytes.alloc(33792), rcap: 33792, rlo: 0, rhi: 0 };
+}
+
+// Pull more bytes from the socket into the buffer (compacting first if the tail is full). Returns the
+// number of bytes read, or -1 on EOF/error.
+async fn fill(self: TlsIO): int {
+    if (self.rlo > 0 && self.rhi == self.rcap) {
+        let m = self.rhi - self.rlo;
+        let i = 0;
+        while (i < m) { bytes.write_byte(self.rbuf, i, bytes.read_byte(self.rbuf, self.rlo + i)); i = i + 1; }
+        self.rlo = 0;
+        self.rhi = m;
+    }
+    let rs = reactorio.ReactorStream(self.fd, self.kq);
+    let n = await rs.recvInto((self.rbuf as long) + (self.rhi as long), self.rcap - self.rhi);
+    if (n <= 0) { return -1; }
+    self.rhi = self.rhi + n;
+    return n;
+}
+
+// Ensure at least `need` bytes are buffered.
+async fn ensure(self: TlsIO, need: int): int {
+    while (self.rhi - self.rlo < need) {
+        if (await self.fill() < 0) { return -1; }
+    }
+    return 0;
+}
+
+// Read exactly one TLS record (5-byte header + body) into out. Returns the record length, or -1.
+async fn readRecord(self: TlsIO, out: ptr): int {
+    if (await self.ensure(5) < 0) { return -1; }
+    let len = (bytes.read_byte(self.rbuf, self.rlo + 3) << 8) | bytes.read_byte(self.rbuf, self.rlo + 4);
+    if (await self.ensure(5 + len) < 0) { return -1; }
+    let i = 0;
+    while (i < 5 + len) { bytes.write_byte(out, i, bytes.read_byte(self.rbuf, self.rlo + i)); i = i + 1; }
+    self.rlo = self.rlo + 5 + len;
+    return 5 + len;
+}
+
+async fn sendAll(self: TlsIO, buf: ptr, n: int): int {
+    let rs = reactorio.ReactorStream(self.fd, self.kq);
+    return await rs.sendBuf(buf as long, n);
+}
+
+fn fillRandom(buf: ptr, n: int): void {
+    let s = random.randomBytes(n);
+    let i = 0;
+    while (i < n) { bytes.write_byte(buf, i, s[i] & 0xff); i = i + 1; }
+}
+
+// Run the full TLS 1.3 client handshake over the reactor socket: send the ClientHello, process the
+// ServerHello, reassemble and verify the server's encrypted flight, and send the client Finished. `cl`
+// must be a fresh TlsClient carrying our ephemeral key; ephPub is that key's public value. Returns 0 on a
+// verified handshake, -1 otherwise.
+pub async fn handshake(io: TlsIO, cl: tls13client.TlsClient, ephPub: ptr): int {
+    let rnd = bytes.alloc(32); fillRandom(rnd, 32);
+    let sid = bytes.alloc(32); fillRandom(sid, 32);
+    let ch = bytes.alloc(1024);
+    let chLen = tls13client.buildClientHello(rnd, sid, ephPub, ch);
+    cl.addClientHello(ch, chLen);
+
+    let rec = bytes.alloc(chLen + 5);
+    bytes.write_byte(rec, 0, 0x16); bytes.write_byte(rec, 1, 0x03); bytes.write_byte(rec, 2, 0x01);
+    bytes.write_byte(rec, 3, (chLen >> 8) & 0xff); bytes.write_byte(rec, 4, chLen & 0xff);
+    let i = 0;
+    while (i < chLen) { bytes.write_byte(rec, 5 + i, bytes.read_byte(ch, i)); i = i + 1; }
+    if (await io.sendAll(rec, chLen + 5) < 0) { return -1; }
+
+    let buf = bytes.alloc(33792);
+    let n = await io.readRecord(buf);
+    if (n < 0 || bytes.read_byte(buf, 0) != 0x16) { return -1; }
+    cl.processServerHello(at(buf, 5), n - 5);
+
+    let ok = 0;
+    while (ok == 0) {
+        let m = await io.readRecord(buf);
+        if (m < 0) { return -1; }
+        let r = cl.feedHandshake(buf, m);
+        if (r == 0 - 1) { return -1; }
+        if (r == 1) { ok = 1; }
+    }
+
+    let vd = bytes.alloc(32);
+    cl.clientFinished(vd);
+    let fin = bytes.alloc(128);
+    let finLen = cl.clientFinishedRecord(vd, fin);
+    if (await io.sendAll(fin, finLen) < 0) { return -1; }
+    return 0;
+}
+
+// Send application data over the established connection.
+pub async fn write(io: TlsIO, cl: tls13client.TlsClient, data: ptr, n: int): int {
+    let out = bytes.alloc(n + 64);
+    let m = cl.encryptApp(data, n, out);
+    let r = await io.sendAll(out, m);
+    bytes.free(out);
+    return r;
+}
+
+// Read the next application-data payload into out (up to the caller's buffer). Post-handshake handshake
+// records (e.g. NewSessionTicket) are decrypted to advance the sequence number and skipped. Returns the
+// plaintext length (excluding the inner content-type byte), or -1 on error.
+pub async fn read(io: TlsIO, cl: tls13client.TlsClient, out: ptr): int {
+    let rec = bytes.alloc(33792);
+    while (true) {
+        let m = await io.readRecord(rec);
+        if (m < 0) { bytes.free(rec); return -1; }
+        let inner = cl.decryptApp(rec, m, out);
+        if (inner > 0) {
+            let itype = bytes.read_byte(out, inner - 1);
+            if (itype == 0x17) { bytes.free(rec); return inner - 1; }
+        }
+    }
+    bytes.free(rec);
+    return -1;
+}
