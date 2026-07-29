@@ -1,0 +1,100 @@
+// HKDF (RFC 5869) and the TLS 1.3 HKDF-Expand-Label / Derive-Secret helpers, in Nova. Verified against
+// RFC 5869 (extract + expand) and the canonical RFC 8448 TLS 1.3 early-secret and "derived" values
+// (extract + expand-label).
+import crypto.hkdf;
+import crypto.sha256;
+import bytes;
+import assert;
+
+fn hexNib(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return 0;
+}
+
+fn eqHex(buf: ptr, n: int, hex: string): bool {
+    if (hex.length != n * 2) { return false; }
+    let i = 0;
+    while (i < n) {
+        if (bytes.read_byte(buf, i) != hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1])) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn hexInto(dst: ptr, hex: string): int {
+    let n = hex.length / 2;
+    let i = 0;
+    while (i < n) {
+        bytes.write_byte(dst, i, hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1]));
+        i = i + 1;
+    }
+    return n;
+}
+
+fn strBuf(s: string): ptr {
+    let n = s.length;
+    let b = bytes.alloc(n + 1);
+    let i = 0;
+    while (i < n) { bytes.write_byte(b, i, s[i]); i = i + 1; }
+    return b;
+}
+
+// RFC 5869 test case 1 (SHA-256).
+@test
+fn rfc5869_case1(): void {
+    let ikm = bytes.alloc(22);
+    let i = 0;
+    while (i < 22) { bytes.write_byte(ikm, i, 0x0b); i = i + 1; }
+    let salt = bytes.alloc(13);
+    hexInto(salt, "000102030405060708090a0b0c");
+    let info = bytes.alloc(10);
+    hexInto(info, "f0f1f2f3f4f5f6f7f8f9");
+
+    let prk = bytes.alloc(32);
+    hkdf.extract(hkdf.SHA256, salt, 13, ikm, 22, prk);
+    assert.isTrue(eqHex(prk, 32, "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5"));
+
+    let okm = bytes.alloc(42);
+    hkdf.expand(hkdf.SHA256, prk, 32, info, 10, okm, 42);
+    assert.isTrue(eqHex(okm, 42, "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"));
+}
+
+// RFC 5869 test case 3 (SHA-256, zero-length salt and info).
+@test
+fn rfc5869_case3(): void {
+    let ikm = bytes.alloc(22);
+    let i = 0;
+    while (i < 22) { bytes.write_byte(ikm, i, 0x0b); i = i + 1; }
+    let empty = bytes.alloc(1);
+
+    let prk = bytes.alloc(32);
+    hkdf.extract(hkdf.SHA256, empty, 0, ikm, 22, prk);
+    assert.isTrue(eqHex(prk, 32, "19ef24a32c717b167f33a91d6f648bdf96596776afdb6377ac434c1c293ccb04"));
+
+    let okm = bytes.alloc(42);
+    hkdf.expand(hkdf.SHA256, prk, 32, empty, 0, okm, 42);
+    assert.isTrue(eqHex(okm, 42, "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8"));
+}
+
+// RFC 8448 TLS 1.3: Early Secret = HKDF-Extract(0, 0^32); then
+// Derived = Derive-Secret(Early Secret, "derived", "") with the empty-transcript SHA-256.
+@test
+fn tls13_early_and_derived(): void {
+    let zeros = bytes.alloc(32); // 32 zero bytes (salt and IKM)
+    let early = bytes.alloc(32);
+    hkdf.extract(hkdf.SHA256, zeros, 32, zeros, 32, early);
+    assert.isTrue(eqHex(early, 32, "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"));
+
+    // Transcript hash of the empty message = SHA-256("").
+    let emptyHash = bytes.alloc(32);
+    sha256.hashInto(bytes.alloc(1), 0, emptyHash);
+
+    let label = strBuf("derived");
+    let derived = bytes.alloc(32);
+    hkdf.deriveSecret(hkdf.SHA256, early, 32, label, 7, emptyHash, derived);
+    assert.isTrue(eqHex(derived, 32, "6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba"));
+}
