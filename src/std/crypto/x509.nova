@@ -1,0 +1,247 @@
+// X.509 certificate parsing and signature verification in Nova, no external library (M9 phase D).
+//
+// A small DER/ASN.1 TLV reader walks the certificate structure (RFC 5280) and extracts the parts TLS
+// certificate validation needs: the raw TBSCertificate bytes (what the signature covers), the subject
+// public key (RSA modulus+exponent, or an EC point), the signature algorithm, and the signature value.
+// verifySignedBy then hashes the TBS and checks the signature with the issuer's key, reusing the Nova
+// P-256 ECDSA and RSA (PKCS#1 v1.5 / PSS) verifiers.
+//
+// References: RFC 5280 (X.509), RFC 8017 (PKCS#1). Verified against OpenSSL-generated EC and RSA chains.
+import bytes;
+import crypto.p256;
+import crypto.rsa;
+import crypto.sha256;
+import crypto.sha512;
+
+// Signature-algorithm identifiers.
+const SIG_ECDSA_SHA256: int = 0;
+const SIG_ECDSA_SHA384: int = 1;
+const SIG_ECDSA_SHA512: int = 2;
+const SIG_RSA_SHA256: int = 3;
+const SIG_RSA_SHA384: int = 4;
+const SIG_RSA_SHA512: int = 5;
+const SIG_RSA_PSS: int = 6;
+const SIG_UNKNOWN: int = -1;
+
+// Public-key types.
+const KEY_RSA: int = 0;
+const KEY_EC_P256: int = 1;
+const KEY_UNKNOWN: int = -1;
+
+fn ptrAt(buf: ptr, off: int): ptr { return (buf as long + off) as ptr; }
+
+// A DER TLV: tag byte, content range [start, start+len), and next = the position just past this TLV.
+struct Tlv {
+    pub tag: int,
+    pub start: int,
+    pub len: int,
+    pub next: int,
+}
+
+fn readTlv(buf: ptr, pos: int): Tlv {
+    let tag = bytes.read_byte(buf, pos);
+    let p = pos + 1;
+    let b = bytes.read_byte(buf, p);
+    p = p + 1;
+    let len = 0;
+    if (b < 0x80) {
+        len = b;
+    } else {
+        let nb = b & 0x7f;
+        let i = 0;
+        while (i < nb) { len = (len << 8) | bytes.read_byte(buf, p); p = p + 1; i = i + 1; }
+    }
+    return Tlv { tag: tag, start: p, len: len, next: p + len };
+}
+
+fn hexNibble(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    return c - 87;                          // lowercase a-f
+}
+// Compare `len` bytes at buf[start..] to a lowercase-hex pattern.
+fn oidEq(buf: ptr, start: int, len: int, hex: string): bool {
+    if (hex.length != len * 2) { return false; }
+    let i = 0;
+    while (i < len) {
+        let want = hexNibble(hex[i * 2]) * 16 + hexNibble(hex[i * 2 + 1]);
+        if (bytes.read_byte(buf, start + i) != want) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn decodeSigOid(buf: ptr, start: int, len: int): int {
+    if (oidEq(buf, start, len, "2a8648ce3d040302")) { return SIG_ECDSA_SHA256; }
+    if (oidEq(buf, start, len, "2a8648ce3d040303")) { return SIG_ECDSA_SHA384; }
+    if (oidEq(buf, start, len, "2a8648ce3d040304")) { return SIG_ECDSA_SHA512; }
+    if (oidEq(buf, start, len, "2a864886f70d01010b")) { return SIG_RSA_SHA256; }
+    if (oidEq(buf, start, len, "2a864886f70d01010c")) { return SIG_RSA_SHA384; }
+    if (oidEq(buf, start, len, "2a864886f70d01010d")) { return SIG_RSA_SHA512; }
+    if (oidEq(buf, start, len, "2a864886f70d01010a")) { return SIG_RSA_PSS; }
+    return SIG_UNKNOWN;
+}
+
+// A parsed certificate. All *Start/*Len fields are offsets into buf.
+struct Cert {
+    pub buf: ptr,
+    pub ok: bool,
+    pub tbsStart: int, pub tbsLen: int,        // raw TBSCertificate TLV (the signed bytes)
+    pub sigAlg: int,
+    pub sigStart: int, pub sigLen: int,        // signature bytes (past the BIT STRING unused-bits byte)
+    pub keyType: int,
+    pub rsaNStart: int, pub rsaNLen: int,      // RSA modulus (leading 0x00 stripped)
+    pub rsaEStart: int, pub rsaELen: int,
+    pub ecStart: int, pub ecLen: int,          // EC point 0x04||X||Y
+    pub subjectStart: int, pub subjectLen: int,
+    pub issuerStart: int, pub issuerLen: int,
+}
+
+pub fn parseCert(buf: ptr, len: int): Cert {
+    let bad = Cert { buf: buf, ok: false,
+        tbsStart: 0, tbsLen: 0, sigAlg: SIG_UNKNOWN, sigStart: 0, sigLen: 0,
+        keyType: KEY_UNKNOWN, rsaNStart: 0, rsaNLen: 0, rsaEStart: 0, rsaELen: 0,
+        ecStart: 0, ecLen: 0, subjectStart: 0, subjectLen: 0, issuerStart: 0, issuerLen: 0 };
+
+    let cert = readTlv(buf, 0);
+    if (cert.tag != 0x30) { return bad; }
+    let tbs = readTlv(buf, cert.start);
+    if (tbs.tag != 0x30) { return bad; }
+    let tbsStart = cert.start;
+    let tbsLen = tbs.next - cert.start;
+
+    // Walk TBSCertificate fields.
+    let q = tbs.start;
+    let f = readTlv(buf, q);
+    if (f.tag == 0xa0) { q = f.next; }         // skip [0] EXPLICIT version if present
+    let serial = readTlv(buf, q); q = serial.next;
+    let innerSig = readTlv(buf, q); q = innerSig.next;   // signature AlgorithmIdentifier (ignored)
+    let issuer = readTlv(buf, q);
+    let issuerStart = q; let issuerLen = issuer.next - q; q = issuer.next;
+    let validity = readTlv(buf, q); q = validity.next;
+    let subject = readTlv(buf, q);
+    let subjectStart = q; let subjectLen = subject.next - q; q = subject.next;
+    let spki = readTlv(buf, q);
+
+    // SubjectPublicKeyInfo: algorithm SEQUENCE + subjectPublicKey BIT STRING.
+    let algSeq = readTlv(buf, spki.start);
+    let algOid = readTlv(buf, algSeq.start);
+    let spkBit = readTlv(buf, algSeq.next);
+
+    let keyType = KEY_UNKNOWN;
+    let rsaNStart = 0; let rsaNLen = 0; let rsaEStart = 0; let rsaELen = 0;
+    let ecStart = 0; let ecLen = 0;
+    if (oidEq(buf, algOid.start, algOid.len, "2a8648ce3d0201")) {
+        keyType = KEY_EC_P256;                 // id-ecPublicKey; content skips the unused-bits byte
+        ecStart = spkBit.start + 1;
+        ecLen = spkBit.len - 1;
+    } else if (oidEq(buf, algOid.start, algOid.len, "2a864886f70d010101")) {
+        keyType = KEY_RSA;
+        let rsaSeq = readTlv(buf, spkBit.start + 1);
+        let modInt = readTlv(buf, rsaSeq.start);
+        let ms = modInt.start; let ml = modInt.len;
+        if (bytes.read_byte(buf, ms) == 0) { ms = ms + 1; ml = ml - 1; }
+        rsaNStart = ms; rsaNLen = ml;
+        let expInt = readTlv(buf, modInt.next);
+        rsaEStart = expInt.start; rsaELen = expInt.len;
+    }
+
+    // signatureAlgorithm + signatureValue, after the TBS.
+    let sigAlgSeq = readTlv(buf, tbs.next);
+    let sigOid = readTlv(buf, sigAlgSeq.start);
+    let sigAlg = decodeSigOid(buf, sigOid.start, sigOid.len);
+    let sigVal = readTlv(buf, sigAlgSeq.next);
+    let sigStart = sigVal.start + 1;           // skip BIT STRING unused-bits byte
+    let sigLen = sigVal.len - 1;
+
+    return Cert { buf: buf, ok: true,
+        tbsStart: tbsStart, tbsLen: tbsLen, sigAlg: sigAlg, sigStart: sigStart, sigLen: sigLen,
+        keyType: keyType, rsaNStart: rsaNStart, rsaNLen: rsaNLen, rsaEStart: rsaEStart, rsaELen: rsaELen,
+        ecStart: ecStart, ecLen: ecLen, subjectStart: subjectStart, subjectLen: subjectLen,
+        issuerStart: issuerStart, issuerLen: issuerLen };
+}
+
+fn hashIdOf(sigAlg: int): int {
+    if (sigAlg == SIG_ECDSA_SHA384 || sigAlg == SIG_RSA_SHA384) { return 1; }
+    if (sigAlg == SIG_ECDSA_SHA512 || sigAlg == SIG_RSA_SHA512) { return 2; }
+    return 0;
+}
+fn hLenOf(hid: int): int {
+    if (hid == 1) { return 48; }
+    if (hid == 2) { return 64; }
+    return 32;
+}
+fn doHash(hid: int, data: ptr, len: int, out: ptr): void {
+    if (hid == 0) { sha256.hashInto(data, len, out); return; }
+    if (hid == 1) { sha512.hash384Into(data, len, out); return; }
+    sha512.hashInto(data, len, out);
+}
+
+// Copy the DER integer buf[start..start+len) into out[0..outLen) right-aligned, stripping a leading
+// 0x00 sign byte and left-padding with zeros.
+fn derIntTo(buf: ptr, start: int, len: int, out: ptr, outLen: int): void {
+    let s = start; let l = len;
+    while (l > 0 && bytes.read_byte(buf, s) == 0) { s = s + 1; l = l - 1; }
+    let i = 0;
+    while (i < outLen) { bytes.write_byte(out, i, 0); i = i + 1; }
+    let pad = outLen - l;
+    i = 0;
+    while (i < l) { bytes.write_byte(out, pad + i, bytes.read_byte(buf, s + i)); i = i + 1; }
+}
+
+// Verify that `child` was signed by the private key matching `issuer`'s public key.
+pub fn verifySignedBy(child: Cert, issuer: Cert): bool {
+    if (!child.ok || !issuer.ok || child.sigAlg == SIG_UNKNOWN) { return false; }
+    let hid = hashIdOf(child.sigAlg);
+    let hl = hLenOf(hid);
+    let digest = bytes.alloc(hl);
+    doHash(hid, ptrAt(child.buf, child.tbsStart), child.tbsLen, digest);
+
+    let ok = false;
+    if (child.sigAlg <= SIG_ECDSA_SHA512) {
+        if (issuer.keyType == KEY_EC_P256) {
+            // signature is DER ECDSA-Sig-Value SEQUENCE { r INTEGER, s INTEGER }
+            let seq = readTlv(child.buf, child.sigStart);
+            let rInt = readTlv(child.buf, seq.start);
+            let sInt = readTlv(child.buf, rInt.next);
+            let r = bytes.alloc(32); let s = bytes.alloc(32);
+            derIntTo(child.buf, rInt.start, rInt.len, r, 32);
+            derIntTo(child.buf, sInt.start, sInt.len, s, 32);
+            // e = leftmost 32 bytes of the digest (for SHA-384/512 with P-256)
+            let e = bytes.alloc(32);
+            let i = 0;
+            while (i < 32) {
+                if (i < hl) { bytes.write_byte(e, i, bytes.read_byte(digest, i)); }
+                else { bytes.write_byte(e, i, 0); }
+                i = i + 1;
+            }
+            ok = p256.ecdsaVerify(e, ptrAt(issuer.buf, issuer.ecStart), r, s);
+            bytes.free(r); bytes.free(s); bytes.free(e);
+        }
+    } else if (child.sigAlg <= SIG_RSA_SHA512) {
+        if (issuer.keyType == KEY_RSA) {
+            ok = rsa.verifyPkcs1(hid, digest, ptrAt(child.buf, child.sigStart), child.sigLen,
+                ptrAt(issuer.buf, issuer.rsaNStart), issuer.rsaNLen,
+                ptrAt(issuer.buf, issuer.rsaEStart), issuer.rsaELen);
+        }
+    } else {
+        if (issuer.keyType == KEY_RSA) {
+            ok = rsa.verifyPss(hid, digest, ptrAt(child.buf, child.sigStart), child.sigLen,
+                ptrAt(issuer.buf, issuer.rsaNStart), issuer.rsaNLen,
+                ptrAt(issuer.buf, issuer.rsaEStart), issuer.rsaELen);
+        }
+    }
+    bytes.free(digest);
+    return ok;
+}
+
+// Do the issuer/subject DER names match (used for chain linking)?
+pub fn nameMatches(child: Cert, issuer: Cert): bool {
+    if (child.issuerLen != issuer.subjectLen) { return false; }
+    let i = 0;
+    while (i < child.issuerLen) {
+        if (bytes.read_byte(child.buf, child.issuerStart + i)
+            != bytes.read_byte(issuer.buf, issuer.subjectStart + i)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
