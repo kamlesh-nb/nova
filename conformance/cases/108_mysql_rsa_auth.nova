@@ -7,12 +7,12 @@
 // and malformed input fails closed to an empty string.
 import assert;
 import string;
+import crypto.rsa;
 
-// The runtime RSA primitive is a bare extern; production always calls it through a typed Nova
-// wrapper (mysql's `rsaEncryptPassword`) so its owned-string return is adopted + freed. Mirror
-// that here — calling the bare extern directly wouldn't ARC-track the returned ciphertext.
+// RSA-OAEP-SHA1 encryption is now pure Nova (crypto/rsa.oaepEncryptSha1); the mysql driver's
+// `rsaEncryptPassword` calls it. Verified live: OpenSSL decrypts a Nova-produced ciphertext.
 fn rsaEnc(pem: string, data: string, len: int): string {
-    return nova_rsa_oaep_encrypt(pem, data, len);
+    return rsa.oaepEncryptSha1(pem, data, len);
 }
 
 // A real 2048-bit RSA public key (SubjectPublicKeyInfo PEM). Modulus = 256 bytes.

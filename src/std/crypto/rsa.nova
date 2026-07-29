@@ -16,6 +16,9 @@
 import bytes;
 import crypto.hash.sha256;
 import crypto.hash.sha512;
+import crypto.hash.sha1;
+import crypto.base64;
+import crypto.random;
 
 const MASK32: ulong = 0xffffffff;
 const U0: ulong = 0;
@@ -223,11 +226,13 @@ fn rsaPublicOp(emOut: ptr, sig: ptr, N: ptr, k: int, e: ptr, eLen: int): int {
 fn hLen(id: int): int {
     if (id == 0) { return 32; }
     if (id == 1) { return 48; }
+    if (id == 3) { return 20; }             // SHA-1 (OAEP / MGF1-SHA1)
     return 64;
 }
 fn doHash(id: int, data: ptr, len: int, out: ptr): void {
     if (id == 0) { sha256.hashInto(data, len, out); return; }
     if (id == 1) { sha512.hash384Into(data, len, out); return; }
+    if (id == 3) { sha1.hashInto(data, len, out); return; }
     sha512.hashInto(data, len, out);
 }
 
@@ -380,4 +385,161 @@ pub fn verifyPss(hashId: int, msgHash: ptr, sig: ptr, sigLen: int, N: ptr, nLen:
     bytes.free(Nl); bytes.free(em); bytes.free(H); bytes.free(dbMask);
     bytes.free(db); bytes.free(mp); bytes.free(hp);
     return matched;
+}
+
+// ---- RSAES-OAEP encryption (public op; used by MySQL caching_sha2 full auth) ----
+//
+// OAEP with SHA-1 (label = "", MGF1-SHA1), matching the MySQL client. The encrypt operation is a
+// public-key op over public data, so it need not be constant-time. The randomness (the OAEP seed)
+// comes from the pure-Nova CSPRNG.
+
+// A DER TLV: tag, content offset `start`, content length `len`, and `next` (just past this TLV).
+struct DerTlv { pub tag: int, pub start: int, pub len: int, pub next: int }
+
+fn readTlv(buf: ptr, pos: int): DerTlv {
+    let tag = bytes.read_byte(buf, pos);
+    let p = pos + 1;
+    let b = bytes.read_byte(buf, p);
+    p = p + 1;
+    let len = 0;
+    if (b < 0x80) {
+        len = b;
+    } else {
+        let nb = b & 0x7f;
+        let i = 0;
+        while (i < nb) { len = (len << 8) | bytes.read_byte(buf, p); p = p + 1; i = i + 1; }
+    }
+    return DerTlv { tag: tag, start: p, len: len, next: p + len };
+}
+
+// Index of `needle` in `hay` at or after `from`, or -1.
+fn indexOf(hay: string, needle: string, from: int): int {
+    let n = hay.length;
+    let m = needle.length;
+    let i = from;
+    while (i + m <= n) {
+        let j = 0;
+        while (j < m && hay[i + j] == needle[j]) { j = j + 1; }
+        if (j == m) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Extract the base64 body of a "-----BEGIN PUBLIC KEY-----" PEM block, stripped of whitespace, and
+// base64-decode it to DER. Returns an empty string if the markers are missing.
+fn pemToDer(pem: string): string {
+    let begin = "-----BEGIN PUBLIC KEY-----";
+    let end = "-----END PUBLIC KEY-----";
+    let bs = indexOf(pem, begin, 0);
+    if (bs < 0) { return ""; }
+    let bodyStart = bs + begin.length;
+    let es = indexOf(pem, end, bodyStart);
+    if (es < 0) { return ""; }
+    // Copy the body, dropping newlines and carriage returns.
+    let clean = bytes.alloc(es - bodyStart);
+    let n = 0;
+    let i = bodyStart;
+    while (i < es) {
+        let c = pem[i];
+        if (c != 10 && c != 13 && c != 32 && c != 9) { bytes.write_byte(clean, n, c); n = n + 1; }
+        i = i + 1;
+    }
+    let b64 = bytes.alloc(n);
+    let j = 0;
+    while (j < n) { bytes.write_byte(b64, j, bytes.read_byte(clean, j)); j = j + 1; }
+    bytes.free(clean);
+    let s = base64.decode(b64 as string);
+    bytes.free(b64);
+    return s;
+}
+
+// RSAES-OAEP-SHA1 encrypt `data` (dataLen bytes) under the RSA public key in `pem`. Returns the
+// modulus-sized ciphertext as a raw string, or an empty string on any failure (bad PEM, message too
+// long). Matches the retired nova_rsa_oaep_encrypt (WC_RSA_OAEP_PAD, SHA-1, MGF1-SHA1, empty label).
+pub fn oaepEncryptSha1(pem: string, data: string, dataLen: int): string {
+    let der = pemToDer(pem);
+    if (der.length < 8) { return ""; }
+    let derp = der as ptr;
+
+    // Parse SubjectPublicKeyInfo: SEQ { alg SEQ, BIT STRING { SEQ { INT n, INT e } } }.
+    let outer = readTlv(derp, 0);
+    if (outer.tag != 0x30) { return ""; }
+    let alg = readTlv(derp, outer.start);
+    let bitstr = readTlv(derp, alg.next);
+    if (bitstr.tag != 0x03) { return ""; }
+    let inner = readTlv(derp, bitstr.start + 1);        // skip the BIT STRING unused-bits byte
+    if (inner.tag != 0x30) { return ""; }
+    let nInt = readTlv(derp, inner.start);
+    if (nInt.tag != 0x02) { return ""; }
+    let ns = nInt.start; let nl = nInt.len;
+    if (bytes.read_byte(derp, ns) == 0) { ns = ns + 1; nl = nl - 1; }   // strip leading 0x00
+    let eInt = readTlv(derp, nInt.next);
+    if (eInt.tag != 0x02) { return ""; }
+
+    let k = nl;                                          // modulus size in bytes
+    if ((k & 3) != 0) { return ""; }                     // need a whole number of 32-bit limbs
+    let hl = 20;                                         // SHA-1
+    if (dataLen > k - 2 * hl - 2) { return ""; }         // message too long for OAEP
+
+    // Modulus limbs and exponent bytes (copied out of the DER buffer).
+    let nBytes = bytes.alloc(k);
+    let ci = 0;
+    while (ci < k) { bytes.write_byte(nBytes, ci, bytes.read_byte(derp, ns + ci)); ci = ci + 1; }
+    let eBytes = bytes.alloc(eInt.len);
+    ci = 0;
+    while (ci < eInt.len) { bytes.write_byte(eBytes, ci, bytes.read_byte(derp, eInt.start + ci)); ci = ci + 1; }
+
+    // DB = lHash(20) || PS(0..) || 0x01 || M.
+    let dbLen = k - hl - 1;
+    let db = bytes.alloc(dbLen);
+    let dummy = bytes.alloc(1);
+    doHash(3, dummy, 0, db);                              // lHash = SHA1("") into db[0..20)
+    bytes.free(dummy);
+    let psLen = dbLen - hl - 1 - dataLen;
+    let p = hl;
+    let z = 0;
+    while (z < psLen) { bytes.write_byte(db, p, 0); p = p + 1; z = z + 1; }
+    bytes.write_byte(db, p, 1); p = p + 1;
+    z = 0;
+    while (z < dataLen) { bytes.write_byte(db, p, bytes.read_byte(data as ptr, z)); p = p + 1; z = z + 1; }
+
+    // seed = random 20; maskedDB = DB ^ MGF1(seed); maskedSeed = seed ^ MGF1(maskedDB).
+    let seed = bytes.alloc(hl);
+    let rnd = random.randomBytes(hl);
+    z = 0;
+    while (z < hl) { bytes.write_byte(seed, z, bytes.read_byte(rnd as ptr, z)); z = z + 1; }
+
+    let dbMask = bytes.alloc(dbLen);
+    mgf1(3, seed, hl, dbMask, dbLen);
+    let maskedDb = bytes.alloc(dbLen);
+    z = 0;
+    while (z < dbLen) { bytes.write_byte(maskedDb, z, bytes.read_byte(db, z) ^ bytes.read_byte(dbMask, z)); z = z + 1; }
+
+    let seedMask = bytes.alloc(hl);
+    mgf1(3, maskedDb, dbLen, seedMask, hl);
+    let maskedSeed = bytes.alloc(hl);
+    z = 0;
+    while (z < hl) { bytes.write_byte(maskedSeed, z, bytes.read_byte(seed, z) ^ bytes.read_byte(seedMask, z)); z = z + 1; }
+
+    // EM = 0x00 || maskedSeed || maskedDB  (k bytes).
+    let em = bytes.alloc(k);
+    bytes.write_byte(em, 0, 0);
+    z = 0;
+    while (z < hl) { bytes.write_byte(em, 1 + z, bytes.read_byte(maskedSeed, z)); z = z + 1; }
+    z = 0;
+    while (z < dbLen) { bytes.write_byte(em, 1 + hl + z, bytes.read_byte(maskedDb, z)); z = z + 1; }
+
+    // c = EM^e mod n.
+    let kw = k / 4;
+    let Nl = bytes.alloc(kw * 8); bnFromBE(Nl, nBytes, 0, kw);
+    let ct = bytes.alloc(k);
+    let ok = rsaPublicOp(ct, em, Nl, kw, eBytes, eInt.len);
+
+    bytes.free(nBytes); bytes.free(eBytes); bytes.free(db); bytes.free(seed);
+    bytes.free(dbMask); bytes.free(maskedDb); bytes.free(seedMask); bytes.free(maskedSeed);
+    bytes.free(em); bytes.free(Nl);
+
+    if (ok == 0) { bytes.free(ct); return ""; }
+    return ct as string;
 }

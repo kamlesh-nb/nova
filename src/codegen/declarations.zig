@@ -430,21 +430,12 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         try compiler.func_map.put("nova_arg_at", core.LLVMAddFunction(compiler.module, "nova_arg_at", argat_type));
 
         // SHA/MD5/HMAC/PBKDF2/random are now pure Nova (M11 stage A); only the MySQL auth-scramble and
-        // RSA-OAEP wolfCrypt shims remain declared here (retired in stage B).
-        var scramble_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.ptr_type, compiler.i32_type };
-        const scramble_fn = core.LLVMAddFunction(compiler.module, "nova_mysql_scramble", core.LLVMFunctionType(compiler.ptr_type, &scramble_params, 3, 0));
-        try compiler.func_map.put("nova_mysql_scramble", scramble_fn);
-        const scramble2_fn = core.LLVMAddFunction(compiler.module, "nova_mysql_sha2_scramble", core.LLVMFunctionType(compiler.ptr_type, &scramble_params, 3, 0));
-        try compiler.func_map.put("nova_mysql_sha2_scramble", scramble2_fn);
-
+        // All crypto (SHA/HMAC/PBKDF2/random/MySQL-scramble/RSA-OAEP) is pure Nova as of M11 stage B;
+        // no wolfCrypt shim is declared here anymore.
         const gzc_fn = core.LLVMAddFunction(compiler.module, "nova_gzip_compress", core.LLVMFunctionType(compiler.ptr_type, &one_param_ptr, 1, 0));
         try compiler.func_map.put("nova_gzip_compress", gzc_fn);
         const gzd_fn = core.LLVMAddFunction(compiler.module, "nova_gzip_decompress", core.LLVMFunctionType(compiler.ptr_type, &one_param_ptr, 1, 0));
         try compiler.func_map.put("nova_gzip_decompress", gzd_fn);
-
-        var rsa_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.ptr_type, compiler.i32_type };
-        const rsa_fn = core.LLVMAddFunction(compiler.module, "nova_rsa_oaep_encrypt", core.LLVMFunctionType(compiler.ptr_type, &rsa_params, 3, 0));
-        try compiler.func_map.put("nova_rsa_oaep_encrypt", rsa_fn);
 
         var process_spawn_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.ptr_type };
         const process_spawn_type = core.LLVMFunctionType(compiler.ptr_type, &process_spawn_params, 2, 0);

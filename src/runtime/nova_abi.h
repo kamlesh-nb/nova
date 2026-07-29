@@ -158,8 +158,6 @@ void      nova_log_string(const char *s);
 void      nova_log_info(const char *s);
 void      nova_log_debug(const char *s);
 void      nova_log_err(const char *s);
-char*     nova_mysql_scramble(const char *password, const char *salt, int salt_len);
-char*     nova_mysql_sha2_scramble(const char *password, const char *salt, int salt_len);
 void      nova_exit(int code);
 
 void        nova_test_reset(void);
