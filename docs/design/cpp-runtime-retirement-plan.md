@@ -15,7 +15,7 @@ truth for progress; the phase details are below.
 | M4 | Retire Boost.Asio | M1 to M3 | DONE | The async runtime is reactor-native end to end: `nova_sched_schedule` is just the run queue, timers/deadlines/TLS/sockets are reactor-native, `nova_run_root` drives async on the reactor, and the multi-core server uses the share-nothing reactor. The Asio `io_context`/strands/thread-pool/`CoroState` and socket primitives are deleted (the latter kept as loud abort stubs for the dead codegen branch); the `<boost/asio.hpp>` include, the Boost build flags, and the vendored `deps/boost` (~7MB) are gone. Native 198, ASAN 365, TSan 215, no Boost |
 | M5 | File and directory I/O in Nova | M4 (soft) | DONE | `io/file.nova` + `io/dir.nova` over `os/sys` (open/read/write/lseek/close, mkdir/rmdir/rename, stat/access, opendir/readdir/closedir); `nova_file_*`/`nova_dir_*` deleted; only the variadic `nova_open` shim stays. `io.cpp` 1116 to 950. Native 199, ASAN 367, TSan 216 |
 | M6 | Process and primitive shims | none | DONE | `reuseport` (pure Nova `setsockopt`) and env `get`/`set` (`os/sys` `getenv`/`setenv`) moved to Nova; their C deleted. The honest-primitive floor stays: `errno` (a macro), `set_nonblock` (variadic), `close` (the tcp stack cannot import `os/sys`: its `socket` export collides by name with the `socket` module; the reactor path already uses `sys.close`), `exit` (`_Exit`), args (argv capture), atomics, mutex/condvar/rwlock/spinlock |
-| M7 | Channels and actors in Nova | M1, M6 | TODO | Over the reactor; verify under `--tsan` |
+| M7 | Channels and actors in Nova | M1, M6 | DONE | Actors (`Mailbox<M>`, `ActorCell<M>`) are already Nova over the reactor. The async channel (`nova_chan_*`) is reclassified as part of the reactor scheduler ABI-CORE seam: codegen emits `nova_chan_recv` directly around `llvm.coro.suspend`, and `nova_chan_send` wakes waiters via `nova_sched_schedule`, so it stays in the minimal C core. The vestigial blocking `Channel<T>` is deferred pending generic-container ARC ownership |
 | M8 | Allocator backing in Nova | none | TODO | `mmap` arena under `nova_bytes_alloc`; ABI-CORE unchanged |
 | M9 | TLS 1.2 and 1.3 protocol in Nova | M2 | TODO | Protocol only; reference the Zig `std.crypto.tls`; crypto primitives stay vetted |
 
@@ -55,10 +55,13 @@ it leaves or stays, and sequences the removal.
   keep behind FFI.
 - **ABI-CORE.** The irreducible runtime seam that the compiler's code generation emits calls to
   directly: the ARC operations, the allocator entry points, the coroutine-frame glue, the heap header
-  layout. These stay in a minimal C core for the foreseeable future because moving them into Nova
-  would require the code generator to call Nova from contexts that do not yet have a Nova frame. Their
-  backing (for example, the page source under the allocator) may become Nova; their entry points and
-  the ABI they present may not change without a coordinated code-generation change.
+  layout, the reactor scheduler entry points (`nova_sched_schedule`, `nova_reactor_resume`), and the
+  async-channel primitives (`nova_chan_recv`/`send`/`new`/`free`), which the code generator emits inside
+  the `llvm.coro.suspend` seam to park and wake coroutine waiters (see M7). These stay in a minimal C
+  core for the foreseeable future because moving them into Nova would require the code generator to call
+  Nova from contexts that do not yet have a Nova frame. Their backing (for example, the page source
+  under the allocator) may become Nova; their entry points and the ABI they present may not change
+  without a coordinated code-generation change.
 
 ## Target end state
 
@@ -327,9 +330,31 @@ phase removes a real dependency and is independently verifiable.
   a clean migration is deferred to splitting the socket-family bindings into an `os.socket` module, or
   adding an extern link-name so the binding need not be named `socket`. Gate: the env conformance path
   and the multi-core reactor cases (which exercise `setReusePort`) pass; native, ASAN, TSan green.
-- **M7. Channels and actors.** Reimplement channels and the actor mailbox in Nova over the reactor and
-  the primitives from M6. Prereq: M1, M6. Gate: the channel and actor conformance cases pass under
-  `--tsan`.
+- **M7. Channels and actors. DONE.** The actor layer is already Nova and the channel that the actors
+  and every concurrency conformance case use is scheduler infrastructure that belongs in the ABI-CORE
+  seam, so M7 is a reclassification rather than a rewrite.
+  - **Actors are already in Nova.** `std/concurrency/actor.nova` implements the `Actor<M>` trait, the
+    `Mailbox<M>` (a signal channel plus a Nova message queue), and `ActorCell<M>.run` as an `async fn`
+    that `await`s the mailbox on the reactor. There is no actor C code to retire; the mailbox runs on
+    the reactor over the M1 scheduler and the M3/M4 coroutine primitives. The `10_async_go`, `11_channels`,
+    `116_select`, and `118_actor` cases exercise this and are green natively and under `--tsan`.
+  - **The async channel is the reactor scheduler seam (ABI-CORE), not userspace.** `nova_chan_recv`,
+    `nova_chan_send`, `nova_chan_new`, and `nova_chan_free` are not an ordinary container: the code
+    generator emits `nova_chan_recv(ch, self, out)` directly, in a poll-and-suspend loop built around
+    `llvm.coro.suspend` (see `buildChanRecv` in `codegen/expressions.zig`), and `nova_chan_send` wakes a
+    parked coroutine through `nova_sched_schedule`, the reactor run queue. That is exactly the "scheduler
+    entry points" the ABI-CORE row keeps: the primitive schedules coroutine waiters and is part of the
+    coroutine-frame convention the code generator depends on. Moving it into Nova would mean the code
+    generator calling a mangled Nova symbol from the suspend seam that hung during the first scheduler
+    migration; it stays in the minimal C core alongside `nova_sched_schedule` and `nova_reactor_resume`.
+  - **The blocking `Channel<T>` is deferred.** `nova_channel_*` (a `mutex`/`condvar`/queue) backs a
+    `Channel<T>` that only its own self-test uses (no conformance case, not gated). Reimplementing it in
+    Nova over the M6 `mutex`/`condvar` is otherwise clean, but it stores a generic `T` as a raw `long`,
+    which needs TypeId-aware retain and release to be ARC-correct: that is the open generic-container
+    ownership question (see `nova-any-ownership-model`), not an M7 deliverable. It is deferred to that
+    work rather than shipped with an ARC hazard the `--asan` gate would reject.
+  Gate: the channel, select, and actor conformance cases pass natively and under `--tsan` (unchanged;
+  M7 moved no code).
 - **M8. Allocator backing.** Optionally move the page source under `nova_bytes_alloc` to a Nova
   `mmap`-backed arena, keeping the ARC entry points and the heap header unchanged (ABI-CORE stays).
   Prereq: none. Gate: corpus and ASAN green; allocation microbenchmark not regressed.
@@ -394,7 +419,14 @@ multi-core (`runReactorMC`, `SO_REUSEPORT`). M4 is DONE: the async runtime is re
 over `os/sys` (`io/file.nova`, `io/dir.nova`), the `nova_file_*`/`nova_dir_*` C surface is deleted from
 `io.cpp` (1116 to 950 lines) along with its codegen and ABI declarations, and only the variadic
 `nova_open` shim remains; `io.cpp` now holds just the socket connect and the wolfSSL TLS pump. Native
-199, ASAN 367, TSan 216. Remaining follow-ons (not blocking): a live-driver round trip against a
-reachable database (driver code unchanged), async DNS, and the Linux epoll reactor driver for
-`nova_run_root`; then M6 onward (core.cpp shims, channels and actors in Nova, allocator,
-TLS-protocol-in-Nova).
+199, ASAN 367, TSan 216. M6 is DONE: the movable process shims are Nova over `os/sys` (`reuseport` via
+pure-Nova `setsockopt`, env `get`/`set` via new `getenv`/`setenv` bindings, their C deleted), and the
+honest-primitive floor is drawn (errno, variadic `set_nonblock`, `exit`'s `_Exit`, argv-capturing args,
+atomics, and the sync primitives stay; `close` stays for the tcp stack pending an `os.socket` split,
+because `os/sys`'s `socket` export collides by name with the `socket` module). M7 is DONE by
+reclassification: the actor mailbox is already Nova over the reactor, and the async channel
+(`nova_chan_*`) is part of the reactor scheduler ABI-CORE seam (the code generator emits it around
+`llvm.coro.suspend`), so it stays in the minimal C core; the vestigial blocking `Channel<T>` is deferred
+to the generic-container ARC work. Remaining follow-ons (not blocking): a live-driver round trip against
+a reachable database (driver code unchanged), async DNS, the Linux epoll reactor driver for
+`nova_run_root`, and the `os.socket` split; then M8 (allocator backing) and M9 (TLS protocol in Nova).
