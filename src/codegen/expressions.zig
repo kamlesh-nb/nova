@@ -1010,7 +1010,10 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
         .literal => |lit| {
             switch (lit) {
                 .integer => |val| {
-                    return core.LLVMConstInt(self.val_type, @intCast(val), 0);
+                    // Reinterpret the i64 bit pattern as u64 so a full-width literal (for example
+                    // 0xffffffffffffffff, which is -1 as i64) lowers to the right constant instead of
+                    // overflowing @intCast.
+                    return core.LLVMConstInt(self.val_type, @bitCast(val), 0);
                 },
                 .bool => |b| {
                     const val: u64 = if (b) 1 else 0;

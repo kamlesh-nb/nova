@@ -1,0 +1,57 @@
+// Radix-prefixed integer literals: 0x hex, 0b binary, 0o octal. Read at their base, usable anywhere
+// a decimal integer is, and large hex values fit a long. Added for the in-Nova crypto work (M9), where
+// round constants and masks are naturally hexadecimal, but the feature is general.
+import assert;
+
+const MASK32: long = 0xffffffff;
+
+enum Flag {
+    A = 0x01,
+    B = 0x02,
+    C = 0x10,
+}
+
+@test
+fn hex_values(): void {
+    assert.equalInt(0x0, 0);
+    assert.equalInt(0xff, 255);
+    assert.equalInt(0xFF, 255);
+    assert.equalInt(0x10, 16);
+    assert.equalInt(0xdeadbeef as int, 0xdeadbeef as int);
+}
+
+@test
+fn binary_and_octal(): void {
+    assert.equalInt(0b0, 0);
+    assert.equalInt(0b1010, 10);
+    assert.equalInt(0b11111111, 255);
+    assert.equalInt(0o0, 0);
+    assert.equalInt(0o17, 15);
+    assert.equalInt(0o777, 511);
+}
+
+@test
+fn large_hex_is_long(): void {
+    let m: long = 0xffffffff;
+    assert.isTrue(m == 4294967295);
+    let full: long = 0xffffffffffffffff; // all 64 bits set == -1 as a signed long
+    assert.isTrue(full == -1);
+}
+
+@test
+fn radix_in_expressions(): void {
+    assert.equalInt(0xff + 0x01, 256);
+    assert.equalInt(0xf0 & 0x3c, 0x30);
+    assert.equalInt(0x0f | 0xf0, 0xff);
+    assert.equalInt(0xff ^ 0x0f, 0xf0);
+    assert.equalInt(0x1 << 8, 0x100);
+    let w: long = 0x80000001;
+    assert.isTrue((((w >> 1) | (w << 31)) & MASK32) == 0xc0000000);
+}
+
+@test
+fn radix_enum_values(): void {
+    assert.equalInt(Flag.A as int, 1);
+    assert.equalInt(Flag.B as int, 2);
+    assert.equalInt(Flag.C as int, 16);
+}

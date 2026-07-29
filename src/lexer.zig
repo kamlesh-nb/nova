@@ -482,6 +482,28 @@ pub const Lexer = struct {
 
     fn readNumber(self: *Lexer) Token {
         const start = self.pos;
+        // Radix-prefixed integer literals: 0x.. (hex), 0b.. (binary), 0o.. (octal). The lexeme keeps
+        // the prefix; the parser reads the value with the matching base. These are always integers,
+        // never floats or decimals.
+        if (self.source[self.pos] == '0' and self.pos + 1 < self.source.len) {
+            const p = self.source[self.pos + 1];
+            const base: u8 = switch (p) {
+                'x', 'X' => 16,
+                'b', 'B' => 2,
+                'o', 'O' => 8,
+                else => 0,
+            };
+            if (base != 0) {
+                self.pos += 2;
+                self.column += 2;
+                while (self.pos < self.source.len and isBaseDigit(self.source[self.pos], base)) {
+                    self.pos += 1;
+                    self.column += 1;
+                }
+                const lexeme = self.source[start..self.pos];
+                return Token{ .type = .integer, .lexeme = lexeme, .line = self.line, .column = self.column - (self.pos - start) };
+            }
+        }
         while (self.pos < self.source.len and
             self.source[self.pos] >= '0' and self.source[self.pos] <= '9')
         {
@@ -521,6 +543,16 @@ pub const Lexer = struct {
 
     fn isIdentChar(c: u8) bool {
         return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';
+    }
+
+    // A digit valid in the given radix: 0-9a-fA-F for 16, 0-7 for 8, 0-1 for 2.
+    fn isBaseDigit(c: u8, base: u8) bool {
+        return switch (base) {
+            16 => (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F'),
+            8 => c >= '0' and c <= '7',
+            2 => c == '0' or c == '1',
+            else => c >= '0' and c <= '9',
+        };
     }
 
     fn readString(self: *Lexer) Token {

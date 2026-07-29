@@ -38,7 +38,7 @@ A program's entry is `fn main(): void`. Command-line arguments are read via `env
 - **Literals:**
   | Kind | Example | Type |
   |---|---|---|
-  | integer | `42`, `-7` | `int` (32-bit) |
+  | integer | `42`, `-7`, `0xff`, `0b1010`, `0o17` | `int` (32-bit); a radix-prefixed literal (`0x` hex, `0b` binary, `0o` octal) is read at its base and fits `long` when it exceeds 32 bits |
   | float | `1.5`, `3.14` | `f64` (`double`) |
   | string | `"hello"` | `string` (UTF-8 bytes) |
   | bool | `true` `false` | `bool` |

@@ -665,7 +665,7 @@ pub const Parser = struct {
                 if (self.match(.equal)) {
                     const val_token = self.current();
                     try self.expect(.integer);
-                    value = std.fmt.parseInt(i64, val_token.lexeme, 10) catch return error.UnexpectedToken;
+                    value = parseIntLexeme(val_token.lexeme);
                 } else if (self.match(.left_brace)) {
                     var payload_fields = std.ArrayList(ast.Field).empty;
                     defer payload_fields.deinit(self.allocator);
@@ -2339,11 +2339,30 @@ pub const Parser = struct {
         }
     }
 
+    // Parse an integer-literal lexeme, honoring a 0x/0b/0o radix prefix (decimal otherwise). The
+    // radix forms are read as u64 and bit-cast to i64 so the whole 64-bit range is expressible (for
+    // example 0xffffffffffffffff is -1), while a plain decimal keeps its signed base-10 value.
+    fn parseIntLexeme(lexeme: []const u8) i64 {
+        if (lexeme.len > 2 and lexeme[0] == '0') {
+            const base: u8 = switch (lexeme[1]) {
+                'x', 'X' => 16,
+                'b', 'B' => 2,
+                'o', 'O' => 8,
+                else => 0,
+            };
+            if (base != 0) {
+                const u = std.fmt.parseInt(u64, lexeme[2..], base) catch 0;
+                return @bitCast(u);
+            }
+        }
+        return std.fmt.parseInt(i64, lexeme, 10) catch 0;
+    }
+
     fn parseLiteral(self: *Parser) ParserError!ast.Literal {
         const token = self.current();
         self.advance();
         return switch (token.type) {
-            .integer => ast.Literal{ .integer = std.fmt.parseInt(i64, token.lexeme, 10) catch 0 },
+            .integer => ast.Literal{ .integer = parseIntLexeme(token.lexeme) },
             .float => ast.Literal{ .float = std.fmt.parseFloat(f64, token.lexeme) catch 0.0 },
             .decimal => ast.Literal{ .decimal = token.lexeme },
             .string => ast.Literal{ .string = token.lexeme },
