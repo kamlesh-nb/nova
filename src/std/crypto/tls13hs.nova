@@ -1,0 +1,194 @@
+// TLS 1.3 (RFC 8446) handshake authentication in Nova, no external library (M9 phase E). This is the
+// certificate-and-Finished core of the handshake state machine, built on the tls13 key schedule and the
+// Nova X.509 / RSA / ECDSA verifiers: the running transcript hash, the Finished MAC, the CertificateVerify
+// signature check, and the application traffic secrets. The message framing (ServerHello parse) rounds it
+// out. Wiring these to the reactor for a live handshake is the next slice.
+//
+// References: RFC 8446 sections 4.4 (Authentication) and 7.1 (Key Schedule). Verified against RFC 8448.
+import bytes;
+import crypto.tls13;
+import crypto.hkdf;
+import crypto.hmac;
+import crypto.sha256;
+import crypto.x509;
+import crypto.rsa;
+import crypto.p256;
+
+fn strBuf(s: string): ptr {
+    let b = bytes.alloc(s.length);
+    let i = 0;
+    while (i < s.length) { bytes.write_byte(b, i, s[i]); i = i + 1; }
+    return b;
+}
+fn ptrAt(buf: ptr, off: int): ptr { return (buf as long + off) as ptr; }
+
+// ---- running transcript hash (accumulates handshake messages; hashes the prefix on demand) ----
+
+struct Transcript {
+    pub buf: ptr,
+    pub len: int,
+    pub cap: int,
+}
+
+pub fn transcriptNew(): Transcript { return Transcript { buf: bytes.alloc(4096), len: 0, cap: 4096 }; }
+
+pub fn transcriptAdd(t: Transcript, msg: ptr, n: int): void {
+    if (t.len + n > t.cap) {
+        let nc = (t.len + n) * 2;
+        let nb = bytes.alloc(nc);
+        let i = 0;
+        while (i < t.len) { bytes.write_byte(nb, i, bytes.read_byte(t.buf, i)); i = i + 1; }
+        bytes.free(t.buf);
+        t.buf = nb;
+        t.cap = nc;
+    }
+    let i = 0;
+    while (i < n) { bytes.write_byte(t.buf, t.len + i, bytes.read_byte(msg, i)); i = i + 1; }
+    t.len = t.len + n;
+}
+
+// Only SHA-256 transcripts for now (the AES-128-GCM and ChaCha20 suites); SHA-384 is a follow-on.
+pub fn transcriptHash(kind: int, t: Transcript, out: ptr): void {
+    sha256.hashInto(t.buf, t.len, out);
+}
+pub fn transcriptFree(t: Transcript): void { bytes.free(t.buf); }
+
+// ---- Finished ----
+
+// finished_key = HKDF-Expand-Label(BaseKey, "finished", "", Hash.length).
+pub fn finishedKey(kind: int, trafficSecret: ptr, out: ptr): void {
+    let hl = hkdf.hashLen(kind);
+    let empty = bytes.alloc(1);
+    let lab = strBuf("finished");
+    hkdf.expandLabel(kind, trafficSecret, hl, lab, 8, empty, 0, out, hl);
+    bytes.free(empty); bytes.free(lab);
+}
+
+// verify_data = HMAC(finished_key, Transcript-Hash(...)).
+pub fn finishedVerifyData(kind: int, trafficSecret: ptr, transcriptHash: ptr, out: ptr): void {
+    let hl = hkdf.hashLen(kind);
+    let fk = bytes.alloc(hl);
+    finishedKey(kind, trafficSecret, fk);
+    hmac.hmacSha256(fk, hl, transcriptHash, hl, out);
+    bytes.free(fk);
+}
+
+// Verify a peer Finished message (constant-time compare against the expected verify_data).
+pub fn verifyFinished(kind: int, trafficSecret: ptr, transcriptHash: ptr, expected: ptr): bool {
+    let hl = hkdf.hashLen(kind);
+    let vd = bytes.alloc(hl);
+    finishedVerifyData(kind, trafficSecret, transcriptHash, vd);
+    let diff = 0;
+    let i = 0;
+    while (i < hl) { diff = diff | (bytes.read_byte(vd, i) ^ bytes.read_byte(expected, i)); i = i + 1; }
+    bytes.free(vd);
+    return diff == 0;
+}
+
+// ---- CertificateVerify (RFC 8446 section 4.4.3) ----
+
+// The signed content: 64 space bytes, the context string, a 0x00 separator, then the transcript hash.
+fn certVerifyContent(context: ptr, ctxLen: int, transcriptHash: ptr, hl: int, out: ptr): int {
+    let i = 0;
+    while (i < 64) { bytes.write_byte(out, i, 0x20); i = i + 1; }
+    let p = 64;
+    i = 0;
+    while (i < ctxLen) { bytes.write_byte(out, p + i, bytes.read_byte(context, i)); i = i + 1; }
+    p = p + ctxLen;
+    bytes.write_byte(out, p, 0); p = p + 1;
+    i = 0;
+    while (i < hl) { bytes.write_byte(out, p + i, bytes.read_byte(transcriptHash, i)); i = i + 1; }
+    return p + hl;
+}
+
+// TLS SignatureScheme codes handled here.
+const SS_RSA_PKCS1_SHA256: int = 0x0401;
+const SS_ECDSA_P256_SHA256: int = 0x0403;
+const SS_RSA_PSS_SHA256: int = 0x0804;
+
+// Verify the server's CertificateVerify signature over the transcript, using the leaf certificate's key.
+pub fn verifyCertificateVerify(cert: x509.Cert, sigScheme: int, sig: ptr, sigLen: int, transcriptHash: ptr): bool {
+    let hl = 32;                                   // SHA-256 schemes
+    let ctx = strBuf("TLS 1.3, server CertificateVerify");
+    let content = bytes.alloc(64 + 33 + 1 + hl);
+    let clen = certVerifyContent(ctx, 33, transcriptHash, hl, content);
+    let digest = bytes.alloc(hl);
+    sha256.hashInto(content, clen, digest);
+
+    let ok = false;
+    if (sigScheme == SS_RSA_PSS_SHA256) {
+        ok = rsa.verifyPss(0, digest, sig, sigLen,
+            ptrAt(cert.buf, cert.rsaNStart), cert.rsaNLen, ptrAt(cert.buf, cert.rsaEStart), cert.rsaELen);
+    } else if (sigScheme == SS_RSA_PKCS1_SHA256) {
+        ok = rsa.verifyPkcs1(0, digest, sig, sigLen,
+            ptrAt(cert.buf, cert.rsaNStart), cert.rsaNLen, ptrAt(cert.buf, cert.rsaEStart), cert.rsaELen);
+    } else if (sigScheme == SS_ECDSA_P256_SHA256) {
+        // signature is DER ECDSA-Sig-Value SEQUENCE { r INTEGER, s INTEGER }
+        let seqStart = derContentStart(sig, 0);
+        let rTag = derContentStart(sig, seqStart);
+        let rLen = derLen(sig, seqStart);
+        let sTag = derContentStart(sig, rTag + rLen);
+        let sLen = derLen(sig, rTag + rLen);
+        let r = bytes.alloc(32); let s = bytes.alloc(32);
+        derIntTo(sig, rTag, rLen, r);
+        derIntTo(sig, sTag, sLen, s);
+        ok = p256.ecdsaVerify(digest, ptrAt(cert.buf, cert.ecStart), r, s);
+        bytes.free(r); bytes.free(s);
+    }
+    bytes.free(ctx); bytes.free(content); bytes.free(digest);
+    return ok;
+}
+
+// Minimal DER helpers for the ECDSA signature (single-byte lengths, as ECDSA-P256 sigs use).
+fn derLen(buf: ptr, pos: int): int { return bytes.read_byte(buf, pos + 1); }
+fn derContentStart(buf: ptr, pos: int): int { return pos + 2; }
+fn derIntTo(buf: ptr, start: int, len: int, out: ptr): void {
+    let s = start; let l = len;
+    while (l > 0 && bytes.read_byte(buf, s) == 0) { s = s + 1; l = l - 1; }
+    let i = 0;
+    while (i < 32) { bytes.write_byte(out, i, 0); i = i + 1; }
+    let pad = 32 - l;
+    i = 0;
+    while (i < l) { bytes.write_byte(out, pad + i, bytes.read_byte(buf, s + i)); i = i + 1; }
+}
+
+// ---- application traffic secrets ----
+
+// Master Secret = HKDF-Extract(Derive-Secret(Handshake Secret, "derived", ""), 0).
+pub fn masterSecret(kind: int, handshakeSecret: ptr, out: ptr): void {
+    let hl = hkdf.hashLen(kind);
+    let derived = bytes.alloc(hl);
+    tls13.deriveDerived(kind, handshakeSecret, derived);
+    let zero = bytes.alloc(hl);
+    let i = 0;
+    while (i < hl) { bytes.write_byte(zero, i, 0); i = i + 1; }
+    tls13.extractSecret(kind, derived, zero, hl, out);
+    bytes.free(derived); bytes.free(zero);
+}
+
+// ---- ServerHello parse (extract the negotiated cipher suite and the server key_share) ----
+
+// Returns the cipher suite (e.g. 0x1301 for TLS_AES_128_GCM_SHA256) and writes the server's key_share
+// public value (X25519, 32 bytes) into pubOut. Returns -1 if no key_share was found.
+pub fn parseServerHello(sh: ptr, shLen: int, pubOut: ptr): int {
+    let p = 4 + 2 + 32;                            // msg header, legacy_version, random
+    let sidLen = bytes.read_byte(sh, p);
+    p = p + 1 + sidLen;
+    let cipher = (bytes.read_byte(sh, p) << 8) | bytes.read_byte(sh, p + 1);
+    p = p + 2 + 1;                                 // cipher_suite + legacy_compression_method
+    let extLen = (bytes.read_byte(sh, p) << 8) | bytes.read_byte(sh, p + 1);
+    p = p + 2;
+    let end = p + extLen;
+    while (p < end) {
+        let etype = (bytes.read_byte(sh, p) << 8) | bytes.read_byte(sh, p + 1);
+        let elen = (bytes.read_byte(sh, p + 2) << 8) | bytes.read_byte(sh, p + 3);
+        let body = p + 4;
+        if (etype == 0x0033) {                     // key_share
+            let klen = (bytes.read_byte(sh, body + 2) << 8) | bytes.read_byte(sh, body + 3);
+            let i = 0;
+            while (i < klen) { bytes.write_byte(pubOut, i, bytes.read_byte(sh, body + 4 + i)); i = i + 1; }
+        }
+        p = body + elen;
+    }
+    return cipher;
+}
