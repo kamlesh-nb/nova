@@ -1,0 +1,91 @@
+// ChaCha20-Poly1305 AEAD (RFC 8439 section 2.8) implemented in Nova over the Nova ChaCha20 and
+// Poly1305, no external library (M9 phase B). This is the TLS 1.3 CHACHA20_POLY1305_SHA256 record
+// protection. The one-time Poly1305 key is the first 32 bytes of the ChaCha20 keystream at counter 0;
+// the payload is encrypted from counter 1; the tag authenticates aad || pad || ciphertext || pad ||
+// len64(aad) || len64(ciphertext). Tag verification on open is a constant-time compare.
+//
+// Reference: RFC 8439. Verified against the RFC 8439 section 2.8.2 vector, and cross-checked against
+// the wolfCrypt binding, in conformance case 220.
+import bytes;
+import crypto.chacha20;
+import crypto.poly1305;
+
+pub const KEY_LEN: int = 32;
+pub const NONCE_LEN: int = 12;
+pub const TAG_LEN: int = 16;
+
+// Write a 64-bit little-endian length to buf+off.
+fn putLen64(buf: ptr, off: int, v: int): void {
+    let vl = v as long;
+    let i = 0;
+    while (i < 8) {
+        bytes.write_byte(buf, off + i, ((vl >> (i * 8)) & 0xff) as int);
+        i = i + 1;
+    }
+}
+
+// The one-time Poly1305 key: the first 32 bytes of the ChaCha20 keystream block at counter 0.
+fn poly1305KeyGen(key: ptr, nonce: ptr, otk: ptr): void {
+    let block = bytes.alloc(64);
+    chacha20.keystreamBlock(key, 0, nonce, block);
+    let i = 0;
+    while (i < 32) { bytes.write_byte(otk, i, bytes.read_byte(block, i)); i = i + 1; }
+    bytes.free(block);
+}
+
+// Poly1305 over aad || pad16 || ct || pad16 || len64(aad) || len64(ct), keyed by otk. Writes 16 bytes.
+fn computeTag(otk: ptr, aad: ptr, aadLen: int, ct: ptr, ctLen: int, tag: ptr): void {
+    let p = poly1305.Poly1305.create(otk);
+    let zeros = bytes.alloc(16);
+    let i = 0;
+    while (i < 16) { bytes.write_byte(zeros, i, 0); i = i + 1; }
+
+    p.update(aad, aadLen);
+    let apad = (16 - (aadLen % 16)) % 16;
+    if (apad > 0) { p.update(zeros, apad); }
+    p.update(ct, ctLen);
+    let cpad = (16 - (ctLen % 16)) % 16;
+    if (cpad > 0) { p.update(zeros, cpad); }
+
+    let lens = bytes.alloc(16);
+    putLen64(lens, 0, aadLen);
+    putLen64(lens, 8, ctLen);
+    p.update(lens, 16);
+    p.final(tag);
+    p.delete();
+    bytes.free(zeros);
+    bytes.free(lens);
+}
+
+// Seal: encrypt ptLen bytes at pt to ctOut and write the 16-byte tag to tagOut.
+pub fn seal(key: ptr, nonce: ptr, aad: ptr, aadLen: int, pt: ptr, ptLen: int, ctOut: ptr, tagOut: ptr): void {
+    let otk = bytes.alloc(32);
+    poly1305KeyGen(key, nonce, otk);
+    chacha20.applyKeystream(key, 1, nonce, pt, ptLen, ctOut);
+    computeTag(otk, aad, aadLen, ctOut, ptLen, tagOut);
+    bytes.free(otk);
+}
+
+// Open: verify the tag over aad and ct; on success decrypt ct to ptOut and return true. A false return
+// means the tag did not verify (forged or corrupted) and ptOut must not be used.
+pub fn open(key: ptr, nonce: ptr, aad: ptr, aadLen: int, ct: ptr, ctLen: int, tag: ptr, ptOut: ptr): bool {
+    let otk = bytes.alloc(32);
+    poly1305KeyGen(key, nonce, otk);
+    let expTag = bytes.alloc(16);
+    computeTag(otk, aad, aadLen, ct, ctLen, expTag);
+
+    // Constant-time tag compare: OR all byte differences.
+    let diff = 0;
+    let i = 0;
+    while (i < 16) {
+        diff = diff | (bytes.read_byte(expTag, i) ^ bytes.read_byte(tag, i));
+        i = i + 1;
+    }
+    let ok = diff == 0;
+    if (ok) {
+        chacha20.applyKeystream(key, 1, nonce, ct, ctLen, ptOut);
+    }
+    bytes.free(otk);
+    bytes.free(expTag);
+    return ok;
+}

@@ -1,0 +1,111 @@
+// ChaCha20 stream cipher (RFC 8439) implemented in Nova, no external library (M9 phase B). The 16-word
+// state is kept little-endian in a 64-byte buffer; words are `ulong` masked to 32 bits so shifts are
+// logical and adds wrap at 2^32. ChaCha is an ARX design (add / rotate / xor) with no data-dependent
+// branches or table lookups, so a faithful port is naturally constant-time.
+//
+// Reference: RFC 8439 and Zig std.crypto chacha20. Verified against the RFC 8439 vectors (case 219).
+import bytes;
+
+const MASK32: ulong = 0xffffffff;
+
+pub const CHACHA_KEY_LEN: int = 32;
+pub const CHACHA_NONCE_LEN: int = 12;
+pub const CHACHA_BLOCK_LEN: int = 64;
+
+fn rotl(x: ulong, n: int): ulong {
+    return ((x << n) | (x >> (32 - n))) & MASK32;
+}
+
+// Read 4 little-endian bytes at buf+off as a 32-bit word.
+fn leWord(buf: ptr, off: int): ulong {
+    return (bytes.read_byte(buf, off) as ulong)
+        | ((bytes.read_byte(buf, off + 1) as ulong) << 8)
+        | ((bytes.read_byte(buf, off + 2) as ulong) << 16)
+        | ((bytes.read_byte(buf, off + 3) as ulong) << 24);
+}
+
+// Write a 32-bit word little-endian to buf+off.
+fn putLe(buf: ptr, off: int, w: ulong): void {
+    bytes.write_byte(buf, off, (w & 0xff) as int);
+    bytes.write_byte(buf, off + 1, ((w >> 8) & 0xff) as int);
+    bytes.write_byte(buf, off + 2, ((w >> 16) & 0xff) as int);
+    bytes.write_byte(buf, off + 3, ((w >> 24) & 0xff) as int);
+}
+
+// The ChaCha quarter round on the four state words at indices a, b, c, d (word indices, not byte).
+fn qr(s: ptr, a: int, b: int, c: int, d: int): void {
+    let wa = leWord(s, a * 4);
+    let wb = leWord(s, b * 4);
+    let wc = leWord(s, c * 4);
+    let wd = leWord(s, d * 4);
+    wa = (wa + wb) & MASK32; wd = rotl(wd ^ wa, 16);
+    wc = (wc + wd) & MASK32; wb = rotl(wb ^ wc, 12);
+    wa = (wa + wb) & MASK32; wd = rotl(wd ^ wa, 8);
+    wc = (wc + wd) & MASK32; wb = rotl(wb ^ wc, 7);
+    putLe(s, a * 4, wa);
+    putLe(s, b * 4, wb);
+    putLe(s, c * 4, wc);
+    putLe(s, d * 4, wd);
+}
+
+// Produce one 64-byte keystream block for the given key (32 bytes), block counter, and nonce (12
+// bytes), writing it to out.
+pub fn keystreamBlock(key: ptr, counter: ulong, nonce: ptr, out: ptr): void {
+    let s = bytes.alloc(64);
+    // "expand 32-byte k" constants.
+    putLe(s, 0, 0x61707865);
+    putLe(s, 4, 0x3320646e);
+    putLe(s, 8, 0x79622d32);
+    putLe(s, 12, 0x6b206574);
+    let i = 0;
+    while (i < 8) { putLe(s, (4 + i) * 4, leWord(key, i * 4)); i = i + 1; }
+    putLe(s, 12 * 4, counter & MASK32);
+    i = 0;
+    while (i < 3) { putLe(s, (13 + i) * 4, leWord(nonce, i * 4)); i = i + 1; }
+
+    let w = bytes.alloc(64);
+    i = 0;
+    while (i < 64) { bytes.write_byte(w, i, bytes.read_byte(s, i)); i = i + 1; }
+
+    let r = 0;
+    while (r < 10) {
+        qr(w, 0, 4, 8, 12);
+        qr(w, 1, 5, 9, 13);
+        qr(w, 2, 6, 10, 14);
+        qr(w, 3, 7, 11, 15);
+        qr(w, 0, 5, 10, 15);
+        qr(w, 1, 6, 11, 12);
+        qr(w, 2, 7, 8, 13);
+        qr(w, 3, 4, 9, 14);
+        r = r + 1;
+    }
+
+    i = 0;
+    while (i < 16) {
+        putLe(out, i * 4, (leWord(w, i * 4) + leWord(s, i * 4)) & MASK32);
+        i = i + 1;
+    }
+    bytes.free(s);
+    bytes.free(w);
+}
+
+// Encrypt (or decrypt; ChaCha20 is symmetric) len bytes at `in` to out, XORing the keystream that
+// starts at the given block counter. RFC 8439 AEAD uses counter 1 for the payload (0 makes the
+// Poly1305 key).
+pub fn applyKeystream(key: ptr, counter0: ulong, nonce: ptr, dataIn: ptr, len: int, out: ptr): void {
+    let ks = bytes.alloc(64);
+    let done = 0;
+    let ctr = counter0;
+    while (done < len) {
+        keystreamBlock(key, ctr, nonce, ks);
+        let n = if (len - done < 64) (len - done) else 64;
+        let i = 0;
+        while (i < n) {
+            bytes.write_byte(out, done + i, bytes.read_byte(dataIn, done + i) ^ bytes.read_byte(ks, i));
+            i = i + 1;
+        }
+        done = done + n;
+        ctr = ctr + 1;
+    }
+    bytes.free(ks);
+}

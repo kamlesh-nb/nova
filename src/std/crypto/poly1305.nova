@@ -1,0 +1,191 @@
+// Poly1305 one-time authenticator (RFC 8439) implemented in Nova, no external library (M9 phase B).
+// The 130-bit modular arithmetic uses the well-known 5-limb, 26-bit representation ("poly1305-donna"
+// 32-bit), with `ulong` (u64) intermediate products. The final reduction is a constant-time masked
+// select rather than a branch, so it does not leak the accumulator. r is clamped by the limb masks.
+//
+// Reference: RFC 8439 and the poly1305-donna 32-bit implementation. Verified against the RFC 8439
+// vectors (case 220).
+import bytes;
+import mem.allocator;
+
+const M26: ulong = 0x3ffffff;    // 26-bit limb mask
+const HIBIT: ulong = 0x1000000;  // 1 << 24: the 2^128 bit for a full block
+
+pub const POLY1305_KEY_LEN: int = 32;
+pub const POLY1305_TAG_LEN: int = 16;
+
+fn leWord(buf: ptr, off: int): ulong {
+    return (bytes.read_byte(buf, off) as ulong)
+        | ((bytes.read_byte(buf, off + 1) as ulong) << 8)
+        | ((bytes.read_byte(buf, off + 2) as ulong) << 16)
+        | ((bytes.read_byte(buf, off + 3) as ulong) << 24);
+}
+
+fn putLe(buf: ptr, off: int, w: ulong): void {
+    bytes.write_byte(buf, off, (w & 0xff) as int);
+    bytes.write_byte(buf, off + 1, ((w >> 8) & 0xff) as int);
+    bytes.write_byte(buf, off + 2, ((w >> 16) & 0xff) as int);
+    bytes.write_byte(buf, off + 3, ((w >> 24) & 0xff) as int);
+}
+
+pub struct Poly1305 {
+    pub r0: ulong, pub r1: ulong, pub r2: ulong, pub r3: ulong, pub r4: ulong,
+    pub s1: ulong, pub s2: ulong, pub s3: ulong, pub s4: ulong,
+    pub h0: ulong, pub h1: ulong, pub h2: ulong, pub h3: ulong, pub h4: ulong,
+    pub pad0: ulong, pub pad1: ulong, pub pad2: ulong, pub pad3: ulong,
+    pub buf: ptr,
+    pub bufLen: int,
+
+    pub fn create(key: ptr): Poly1305 {
+        let p = bytes.new_with_allocator<Poly1305>(allocator.globalAllocator());
+        let t0 = leWord(key, 0);
+        let t1 = leWord(key, 4);
+        let t2 = leWord(key, 8);
+        let t3 = leWord(key, 12);
+        // r, clamped by these limb masks (equivalent to r &= 0x0ffffffc0ffffffc0ffffffc0fffffff).
+        p.r0 = t0 & 0x3ffffff;
+        p.r1 = ((t0 >> 26) | (t1 << 6)) & 0x3ffff03;
+        p.r2 = ((t1 >> 20) | (t2 << 12)) & 0x3ffc0ff;
+        p.r3 = ((t2 >> 14) | (t3 << 18)) & 0x3f03fff;
+        p.r4 = (t3 >> 8) & 0x00fffff;
+        p.s1 = p.r1 * 5;
+        p.s2 = p.r2 * 5;
+        p.s3 = p.r3 * 5;
+        p.s4 = p.r4 * 5;
+        p.h0 = 0; p.h1 = 0; p.h2 = 0; p.h3 = 0; p.h4 = 0;
+        p.pad0 = leWord(key, 16);
+        p.pad1 = leWord(key, 20);
+        p.pad2 = leWord(key, 24);
+        p.pad3 = leWord(key, 28);
+        p.buf = bytes.alloc(16);
+        p.bufLen = 0;
+        return p;
+    }
+
+    // Absorb one 16-byte block from m+off. hibit is HIBIT for a full block or 0 for the padded final.
+    fn absorb(self: Poly1305, m: ptr, off: int, hibit: ulong): void {
+        let t0 = leWord(m, off);
+        let t1 = leWord(m, off + 4);
+        let t2 = leWord(m, off + 8);
+        let t3 = leWord(m, off + 12);
+        let h0 = self.h0 + (t0 & M26);
+        let h1 = self.h1 + (((t0 >> 26) | (t1 << 6)) & M26);
+        let h2 = self.h2 + (((t1 >> 20) | (t2 << 12)) & M26);
+        let h3 = self.h3 + (((t2 >> 14) | (t3 << 18)) & M26);
+        let h4 = self.h4 + ((t3 >> 8) | hibit);
+
+        let d0 = h0 * self.r0 + h1 * self.s4 + h2 * self.s3 + h3 * self.s2 + h4 * self.s1;
+        let d1 = h0 * self.r1 + h1 * self.r0 + h2 * self.s4 + h3 * self.s3 + h4 * self.s2;
+        let d2 = h0 * self.r2 + h1 * self.r1 + h2 * self.r0 + h3 * self.s4 + h4 * self.s3;
+        let d3 = h0 * self.r3 + h1 * self.r2 + h2 * self.r1 + h3 * self.r0 + h4 * self.s4;
+        let d4 = h0 * self.r4 + h1 * self.r3 + h2 * self.r2 + h3 * self.r1 + h4 * self.r0;
+
+        let c = d0 >> 26; let nh0 = d0 & M26;
+        d1 = d1 + c; c = d1 >> 26; let nh1 = d1 & M26;
+        d2 = d2 + c; c = d2 >> 26; let nh2 = d2 & M26;
+        d3 = d3 + c; c = d3 >> 26; let nh3 = d3 & M26;
+        d4 = d4 + c; c = d4 >> 26; let nh4 = d4 & M26;
+        let fh0 = nh0 + c * 5;
+        c = fh0 >> 26; fh0 = fh0 & M26;
+        let fh1 = nh1 + c;
+
+        self.h0 = fh0;
+        self.h1 = fh1;
+        self.h2 = nh2;
+        self.h3 = nh3;
+        self.h4 = nh4;
+    }
+
+    pub fn update(self: Poly1305, data: ptr, len: int): void {
+        let i = 0;
+        if (self.bufLen > 0) {
+            while (i < len && self.bufLen < 16) {
+                bytes.write_byte(self.buf, self.bufLen, bytes.read_byte(data, i));
+                self.bufLen = self.bufLen + 1;
+                i = i + 1;
+            }
+            if (self.bufLen == 16) {
+                self.absorb(self.buf, 0, HIBIT);
+                self.bufLen = 0;
+            }
+        }
+        while (len - i >= 16) {
+            self.absorb(data, i, HIBIT);
+            i = i + 16;
+        }
+        while (i < len) {
+            bytes.write_byte(self.buf, self.bufLen, bytes.read_byte(data, i));
+            self.bufLen = self.bufLen + 1;
+            i = i + 1;
+        }
+    }
+
+    // Finalize the accumulator, add the pad, and write the 16-byte tag to out.
+    pub fn final(self: Poly1305, out: ptr): void {
+        if (self.bufLen > 0) {
+            // Pad the last partial block: append 0x01, zero the rest, absorb with hibit already in it.
+            bytes.write_byte(self.buf, self.bufLen, 1);
+            let j = self.bufLen + 1;
+            while (j < 16) { bytes.write_byte(self.buf, j, 0); j = j + 1; }
+            self.absorb(self.buf, 0, 0);
+            self.bufLen = 0;
+        }
+
+        // Fully carry h.
+        let h0 = self.h0; let h1 = self.h1; let h2 = self.h2; let h3 = self.h3; let h4 = self.h4;
+        let c = h1 >> 26; h1 = h1 & M26; h2 = h2 + c;
+        c = h2 >> 26; h2 = h2 & M26; h3 = h3 + c;
+        c = h3 >> 26; h3 = h3 & M26; h4 = h4 + c;
+        c = h4 >> 26; h4 = h4 & M26; h0 = h0 + c * 5;
+        c = h0 >> 26; h0 = h0 & M26; h1 = h1 + c;
+
+        // g = h + 5; if g carries past 2^130 then h >= p, so use g's low 130 bits, else keep h.
+        let g0 = h0 + 5; c = g0 >> 26; g0 = g0 & M26;
+        let g1 = h1 + c; c = g1 >> 26; g1 = g1 & M26;
+        let g2 = h2 + c; c = g2 >> 26; g2 = g2 & M26;
+        let g3 = h3 + c; c = g3 >> 26; g3 = g3 & M26;
+        let g4 = h4 + c;
+        // Bit 26 of g4 is the 2^130 carry: 1 means h >= p. Constant-time select.
+        let useG = (g4 >> 26) & 1;
+        let mask = 0 - useG;               // all ones if useG == 1, else 0
+        let notMask = mask ^ 0xffffffffffffffff;
+        g4 = g4 & M26;
+        h0 = (h0 & notMask) | (g0 & mask);
+        h1 = (h1 & notMask) | (g1 & mask);
+        h2 = (h2 & notMask) | (g2 & mask);
+        h3 = (h3 & notMask) | (g3 & mask);
+        h4 = (h4 & notMask) | (g4 & mask);
+
+        // Serialize h as four 32-bit little-endian words.
+        let f0 = (h0 | (h1 << 26)) & 0xffffffff;
+        let f1 = ((h1 >> 6) | (h2 << 20)) & 0xffffffff;
+        let f2 = ((h2 >> 12) | (h3 << 14)) & 0xffffffff;
+        let f3 = ((h3 >> 18) | (h4 << 8)) & 0xffffffff;
+
+        // Add the pad (the s half of the key) with carry.
+        let a0 = f0 + self.pad0; let cc = a0 >> 32; a0 = a0 & 0xffffffff;
+        let a1 = f1 + self.pad1 + cc; cc = a1 >> 32; a1 = a1 & 0xffffffff;
+        let a2 = f2 + self.pad2 + cc; cc = a2 >> 32; a2 = a2 & 0xffffffff;
+        let a3 = f3 + self.pad3 + cc; a3 = a3 & 0xffffffff;
+
+        putLe(out, 0, a0);
+        putLe(out, 4, a1);
+        putLe(out, 8, a2);
+        putLe(out, 12, a3);
+    }
+
+    pub fn delete(self: Poly1305): void {
+        if (self.buf != 0) {
+            bytes.free(self.buf);
+            self.buf = 0;
+        }
+    }
+}
+
+// One-shot Poly1305: authenticate msgLen bytes at msg under the 32-byte key, writing a 16-byte tag.
+pub fn authInto(key: ptr, msg: ptr, msgLen: int, out: ptr): void {
+    let p = Poly1305.create(key);
+    p.update(msg, msgLen);
+    p.final(out);
+    p.delete();
+}

@@ -1,0 +1,119 @@
+// ChaCha20-Poly1305 AEAD implemented in Nova (M9 phase B, no external library). Verified against the
+// RFC 8439 section 2.8.2 known-answer vector, a seal/open round trip, tamper detection, and a
+// differential check against the wolfCrypt binding (which this Nova AEAD will replace).
+import crypto.chachapoly;
+import crypto.aead;
+import bytes;
+import assert;
+
+fn hexNib(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return 0;
+}
+
+fn eqHex(buf: ptr, n: int, hex: string): bool {
+    if (hex.length != n * 2) { return false; }
+    let i = 0;
+    while (i < n) {
+        if (bytes.read_byte(buf, i) != hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1])) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn hexInto(dst: ptr, hex: string): int {
+    let n = hex.length / 2;
+    let i = 0;
+    while (i < n) {
+        bytes.write_byte(dst, i, hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1]));
+        i = i + 1;
+    }
+    return n;
+}
+
+fn strBuf(s: string): ptr {
+    let n = s.length;
+    let b = bytes.alloc(n + 1);
+    let i = 0;
+    while (i < n) { bytes.write_byte(b, i, s[i]); i = i + 1; }
+    return b;
+}
+
+// RFC 8439 section 2.8.2.
+@test
+fn aead_rfc8439(): void {
+    let key = bytes.alloc(32);
+    hexInto(key, "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f");
+    let nonce = bytes.alloc(12);
+    hexInto(nonce, "070000004041424344454647");
+    let aad = bytes.alloc(12);
+    let aadLen = hexInto(aad, "50515253c0c1c2c3c4c5c6c7");
+    let pt = strBuf("Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.");
+    let ct = bytes.alloc(114);
+    let tag = bytes.alloc(16);
+
+    chachapoly.seal(key, nonce, aad, aadLen, pt, 114, ct, tag);
+    assert.isTrue(eqHex(ct, 114, "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b6116"));
+    assert.isTrue(eqHex(tag, 16, "1ae10b594f09e26a7e902ecbd0600691"));
+
+    // Open recovers the plaintext.
+    let rt = bytes.alloc(114);
+    assert.isTrue(chachapoly.open(key, nonce, aad, aadLen, ct, 114, tag, rt));
+    let i = 0;
+    while (i < 114) { assert.equalInt(bytes.read_byte(rt, i), bytes.read_byte(pt, i)); i = i + 1; }
+
+    // A flipped tag byte must fail authentication.
+    bytes.write_byte(tag, 0, bytes.read_byte(tag, 0) ^ 1);
+    assert.isFalse(chachapoly.open(key, nonce, aad, aadLen, ct, 114, tag, rt));
+}
+
+// Differential check: the Nova AEAD seal must match the wolfCrypt binding byte for byte on a fresh
+// input. (The wolfCrypt path is a temporary oracle that the Nova implementation replaces.)
+@test
+fn aead_matches_wolfcrypt(): void {
+    let key = bytes.alloc(32);
+    let nonce = bytes.alloc(12);
+    let aad = bytes.alloc(8);
+    let pt = bytes.alloc(50);
+    let i = 0;
+    while (i < 32) { bytes.write_byte(key, i, i + 3); i = i + 1; }
+    i = 0;
+    while (i < 12) { bytes.write_byte(nonce, i, i * 5 + 1); i = i + 1; }
+    i = 0;
+    while (i < 8) { bytes.write_byte(aad, i, i + 200); i = i + 1; }
+    i = 0;
+    while (i < 50) { bytes.write_byte(pt, i, i * 7 + 2); i = i + 1; }
+
+    let ctNova = bytes.alloc(50);
+    let tagNova = bytes.alloc(16);
+    chachapoly.seal(key, nonce, aad, 8, pt, 50, ctNova, tagNova);
+
+    let ctWolf = bytes.alloc(50);
+    let tagWolf = bytes.alloc(16);
+    assert.isTrue(aead.chachaPolySeal(key, nonce, aad, 8, pt, 50, ctWolf, tagWolf));
+
+    i = 0;
+    while (i < 50) { assert.equalInt(bytes.read_byte(ctNova, i), bytes.read_byte(ctWolf, i)); i = i + 1; }
+    i = 0;
+    while (i < 16) { assert.equalInt(bytes.read_byte(tagNova, i), bytes.read_byte(tagWolf, i)); i = i + 1; }
+}
+
+// Empty plaintext with AAD: the tag still authenticates and open succeeds.
+@test
+fn aead_empty_plaintext(): void {
+    let key = bytes.alloc(32);
+    let nonce = bytes.alloc(12);
+    let aad = strBuf("header-only");
+    let ct = bytes.alloc(1);
+    let tag = bytes.alloc(16);
+    chachapoly.seal(key, nonce, aad, 11, ct, 0, ct, tag);
+    let rt = bytes.alloc(1);
+    assert.isTrue(chachapoly.open(key, nonce, aad, 11, ct, 0, tag, rt));
+    // Wrong AAD fails.
+    let aad2 = strBuf("header-onlX");
+    assert.isFalse(chachapoly.open(key, nonce, aad2, 11, ct, 0, tag, rt));
+}
