@@ -101,11 +101,11 @@ fn certificate_verify(): void {
     let cert = x509.parseCert(at(pay, 51), 432);   // leaf cert DER inside the Certificate message
     assert.isTrue(cert.ok);
     let sig = at(pay, 493);                         // CertificateVerify signature (128 bytes)
-    assert.isTrue(handshake.verifyCertificateVerify(cert, 0x0804, sig, 128, hCert));
+    assert.isTrue(handshake.verifyCertificateVerify(cert, 0x0804, sig, 128, hCert, 32));
 
     // A tampered transcript hash must fail the signature check.
     bytes.write_byte(hCert, 5, (bytes.read_byte(hCert, 5) ^ 0x40) & 0xff);
-    assert.isTrue(!handshake.verifyCertificateVerify(cert, 0x0804, sig, 128, hCert));
+    assert.isTrue(!handshake.verifyCertificateVerify(cert, 0x0804, sig, 128, hCert, 32));
     handshake.transcriptFree(t);
 }
 

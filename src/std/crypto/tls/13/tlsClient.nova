@@ -10,6 +10,7 @@ import crypto.tls.13.handshake;
 import crypto.ecc.x25519;
 import crypto.x509;
 import crypto.hash.sha256;
+import crypto.hash.sha512;
 
 fn at(buf: ptr, off: int): ptr { return (buf as long + off) as ptr; }
 
@@ -52,7 +53,7 @@ pub fn buildClientHello(random: ptr, sessionId: ptr, ephPub: ptr, host: string, 
     i = 0;
     while (i < 32) { bytes.write_byte(out, p + i, bytes.read_byte(sessionId, i)); i = i + 1; }
     p = p + 32;
-    p = putHex(out, p, "00021301");                // cipher_suites: TLS_AES_128_GCM_SHA256
+    p = putHex(out, p, "0006130113021303");        // cipher_suites: AES-128-GCM-SHA256, AES-256-GCM-SHA384, CHACHA20-POLY1305-SHA256
     p = putHex(out, p, "0100");                    // legacy_compression_methods: null
 
     let extLenPos = p; p = p + 2;                  // extensions length (backpatched)
@@ -153,7 +154,12 @@ fn trAdd(self: TlsClient, msg: ptr, n: int): void {
     while (i < n) { bytes.write_byte(self.trBuf, self.trLen + i, bytes.read_byte(msg, i)); i = i + 1; }
     self.trLen = self.trLen + n;
 }
-fn trHash(self: TlsClient, out: ptr): void { sha256.hashInto(self.trBuf, self.trLen, out); }
+// Transcript hash with the negotiated suite's hash (SHA-256 for kind 0, SHA-384 for kind 1).
+fn trHash(self: TlsClient, out: ptr): void {
+    if (self.kind == 1) { sha512.hash384Into(self.trBuf, self.trLen, out); }
+    else { sha256.hashInto(self.trBuf, self.trLen, out); }
+}
+fn trHashLen(self: TlsClient): int { if (self.kind == 1) { return 48; } return 32; }
 
 // Record the ClientHello handshake-message bytes into the transcript (the caller built and sent them).
 pub fn addClientHello(self: TlsClient, chMsg: ptr, chLen: int): void {
@@ -216,7 +222,7 @@ pub fn processFlight(self: TlsClient, record: ptr, recLen: int): bool {
             let scheme = (bytes.read_byte(inner, p + 4) << 8) | bytes.read_byte(inner, p + 5);
             let siglen = (bytes.read_byte(inner, p + 6) << 8) | bytes.read_byte(inner, p + 7);
             let cert = x509.parseCert(leafBuf, leafLen);
-            self.certVerifyOk = handshake.verifyCertificateVerify(cert, scheme, at(inner, p + 8), siglen, hCert);
+            self.certVerifyOk = handshake.verifyCertificateVerify(cert, scheme, at(inner, p + 8), siglen, hCert, trHashLen(self));
             bytes.free(hCert);
             trAdd(self, at(inner, p), msgLen);
         } else if (mtype == 0x14) {                  // Finished
@@ -291,7 +297,7 @@ pub fn feedHandshake(self: TlsClient, record: ptr, recLen: int): int {
             let scheme = (bytes.read_byte(self.hsBuf, mp + 4) << 8) | bytes.read_byte(self.hsBuf, mp + 5);
             let siglen = (bytes.read_byte(self.hsBuf, mp + 6) << 8) | bytes.read_byte(self.hsBuf, mp + 7);
             let cert = x509.parseCert(at(self.hsBuf, self.leafOff), self.leafLen);
-            self.certVerifyOk = handshake.verifyCertificateVerify(cert, scheme, at(self.hsBuf, mp + 8), siglen, hCert);
+            self.certVerifyOk = handshake.verifyCertificateVerify(cert, scheme, at(self.hsBuf, mp + 8), siglen, hCert, trHashLen(self));
             bytes.free(hCert);
             trAdd(self, at(self.hsBuf, mp), msgLen);
         } else if (mtype == 0x14) {                // Finished
