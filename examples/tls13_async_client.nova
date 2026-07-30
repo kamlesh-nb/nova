@@ -36,7 +36,7 @@ async fn run(done: ptr): int {
     let io = tls13async.newIO(rs.fdOf(), kq);
     let priv = bytes.alloc(32); fillRandom(priv, 32);
     let epub = bytes.alloc(32); x25519.scalarMult(epub, priv, base9());
-    let cl = tlsClient.newClient(priv);
+    let cl = tlsClient.newClient(priv, bytes.alloc(32), bytes.alloc(48));
 
     if (await tls13async.handshake(io, cl, epub, "localhost") < 0) {
         console.log("handshake FAILED"); bytes.write_byte(done, 0, 1); return 1;

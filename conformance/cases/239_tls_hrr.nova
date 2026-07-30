@@ -62,7 +62,7 @@ const TH_AFTER_HRR: string = "7fa5da070c64824f9e38a8317718e256ad5604a50bed6c1fdf
 
 @test
 fn hrr_transcript_rewrite(): void {
-    let c = tlsClient.newClient(bytes.alloc(32), bytes.alloc(32));
+    let c = tlsClient.newClient(bytes.alloc(32), bytes.alloc(32), bytes.alloc(48));
     // ClientHello1 is 20 opaque bytes 00..13 (the exact contents are irrelevant to the rewrite).
     c.addClientHello(hexBuf("000102030405060708090a0b0c0d0e0f10111213"), 20);
     let group = c.processHelloRetryRequest(hexBuf(HRR), 56);
@@ -77,7 +77,7 @@ const HRR_COOKIE: string = "0200003d0303cf21ad74e59a6111be1d8c021e65b891c2a21116
 
 @test
 fn hrr_cookie_captured(): void {
-    let c = tlsClient.newClient(bytes.alloc(32), bytes.alloc(32));
+    let c = tlsClient.newClient(bytes.alloc(32), bytes.alloc(32), bytes.alloc(48));
     c.addClientHello(hexBuf("000102030405060708090a0b0c0d0e0f10111213"), 20);
     let group = c.processHelloRetryRequest(hexBuf(HRR_COOKIE), 65);
     assert.equalInt(group, 0x0017);
@@ -88,7 +88,7 @@ fn hrr_cookie_captured(): void {
 // ClientHello2 carries a single secp256r1 key_share and echoes the cookie.
 @test
 fn hrr_client_hello2(): void {
-    let c = tlsClient.newClient(bytes.alloc(32), bytes.alloc(32));
+    let c = tlsClient.newClient(bytes.alloc(32), bytes.alloc(32), bytes.alloc(48));
     c.addClientHello(hexBuf("000102030405060708090a0b0c0d0e0f10111213"), 20);
     c.processHelloRetryRequest(hexBuf(HRR_COOKIE), 65);
     let rnd = bytes.alloc(32);
@@ -98,7 +98,7 @@ fn hrr_client_hello2(): void {
     let out = bytes.alloc(512);
     // groupMask 2 = secp256r1 only.
     let noPsk = bytes.alloc(1);
-    let n = tlsClient.buildClientHelloEx(rnd, sid, pk, pkP, "example.com", "", 2, c.hrrCookiePtr(), c.hrrCookieSize(), noPsk, 0, 0, 0, 0, out);
+    let n = tlsClient.buildClientHelloEx(rnd, sid, pk, pkP, bytes.alloc(97), "example.com", "", 2, c.hrrCookiePtr(), c.hrrCookieSize(), noPsk, 0, 0, 0, 0, out);
     // The key_share carries exactly one entry: secp256r1 (0017) with a 65-byte value; no x25519 (001d).
     // ext_type 0033, ext_len 0047, client_shares_len 0045, group 0017, ke_len 0041, then 04 00 00 ...
     assert.isTrue(findPattern(out, n, "003300470045001700410400000000") >= 0);

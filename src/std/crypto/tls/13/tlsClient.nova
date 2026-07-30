@@ -9,6 +9,7 @@ import crypto.tls.13.tls;
 import crypto.tls.13.handshake;
 import crypto.ecc.x25519;
 import crypto.ecc.p256;
+import crypto.ecc.p384;
 import crypto.x509;
 import crypto.hash.sha256;
 import crypto.hash.sha512;
@@ -78,7 +79,7 @@ fn putSni(out: ptr, p: int, host: string): int {
 // application_layer_protocol_negotiation extension. Returns the message length.
 pub fn buildClientHello(random: ptr, sessionId: ptr, ephPub: ptr, ephPubP256: ptr, host: string, alpn: string, out: ptr): int {
     let empty = bytes.alloc(1);
-    let n = buildClientHelloEx(random, sessionId, ephPub, ephPubP256, host, alpn, 3, empty, 0, empty, 0, 0, 0, 0, out);
+    let n = buildClientHelloEx(random, sessionId, ephPub, ephPubP256, empty, host, alpn, 3, empty, 0, empty, 0, 0, 0, 0, out);
     bytes.free(empty);
     return n;
 }
@@ -88,7 +89,7 @@ pub fn buildClientHello(random: ptr, sessionId: ptr, ephPub: ptr, ephPubP256: pt
 // lists both groups regardless. `cookie`/`cookieLen` echo a HelloRetryRequest cookie (RFC 8446 4.2.2)
 // when cookieLen > 0. A ClientHello2 (the retry) sets groupMask to just the server-selected group and
 // carries the cookie; everything else matches the first ClientHello.
-pub fn buildClientHelloEx(random: ptr, sessionId: ptr, ephPub: ptr, ephPubP256: ptr, host: string, alpn: string,
+pub fn buildClientHelloEx(random: ptr, sessionId: ptr, ephPub: ptr, ephPubP256: ptr, ephPubP384: ptr, host: string, alpn: string,
                           groupMask: int, cookie: ptr, cookieLen: int,
                           pskTicket: ptr, pskTicketLen: int, obfAge: long, binderLen: int, earlyData: int, out: ptr): int {
     let p = 4;                                     // reserve the 4-byte handshake header
@@ -107,7 +108,7 @@ pub fn buildClientHelloEx(random: ptr, sessionId: ptr, ephPub: ptr, ephPubP256: 
     let extStart = p;
     p = putSni(out, p, host);                      // server_name (SNI)
     p = putHex(out, p, "002b0003020304");          // supported_versions: TLS 1.3
-    p = putHex(out, p, "000a00060004001d0017");    // supported_groups: x25519, secp256r1
+    p = putHex(out, p, "000a00080006001d00170018");// supported_groups: x25519, secp256r1, secp384r1
     p = putHex(out, p, "000d00080006080404030401");// signature_algorithms: rsa_pss/ecdsa/rsa_pkcs1 SHA-256
     p = putHex(out, p, "002d00020101");            // psk_key_exchange_modes: psk_dhe_ke
     p = putAlpn(out, p, alpn);                      // application_layer_protocol_negotiation (if offered)
@@ -137,6 +138,12 @@ pub fn buildClientHelloEx(random: ptr, sessionId: ptr, ephPub: ptr, ephPubP256: 
         i = 0;
         while (i < 65) { bytes.write_byte(out, p + i, bytes.read_byte(ephPubP256, i)); i = i + 1; }
         p = p + 65;
+    }
+    if ((groupMask & 4) != 0) {                    // secp384r1 (0018, 97-byte uncompressed point)
+        p = putHex(out, p, "00180061");
+        i = 0;
+        while (i < 97) { bytes.write_byte(out, p + i, bytes.read_byte(ephPubP384, i)); i = i + 1; }
+        p = p + 97;
     }
     let ksListLen = p - ksListStart;
     bytes.write_byte(out, ksListLenPos, (ksListLen >> 8) & 0xff); bytes.write_byte(out, ksListLenPos + 1, ksListLen & 0xff);
@@ -209,6 +216,7 @@ struct TlsClient {
     pub suite: int,                      // 0 = AES-128-GCM, 1 = AES-256-GCM, 2 = ChaCha20-Poly1305
     pub eph: ptr,                        // our ephemeral X25519 private key (32 bytes)
     pub ephP256: ptr,                    // our ephemeral secp256r1 private scalar (32 bytes)
+    pub ephP384: ptr,                    // our ephemeral secp384r1 private scalar (48 bytes)
     pub trBuf: ptr, pub trLen: int, pub trCap: int,
     pub hs: ptr,                         // handshake secret
     pub chs: ptr, pub shs: ptr,          // client / server handshake traffic secrets
@@ -235,9 +243,9 @@ struct TlsClient {
     pub offerEarly: bool, pub earlyAccepted: bool, // this handshake offers 0-RTT / the server accepted it
 }
 
-pub fn newClient(ephPriv: ptr, ephPrivP256: ptr): TlsClient {
+pub fn newClient(ephPriv: ptr, ephPrivP256: ptr, ephPrivP384: ptr): TlsClient {
     return TlsClient {
-        kind: 0, suite: 0, eph: ephPriv, ephP256: ephPrivP256, trBuf: bytes.alloc(4096), trLen: 0, trCap: 4096,
+        kind: 0, suite: 0, eph: ephPriv, ephP256: ephPrivP256, ephP384: ephPrivP384, trBuf: bytes.alloc(4096), trLen: 0, trCap: 4096,
         hs: bytes.alloc(48), chs: bytes.alloc(48), shs: bytes.alloc(48),
         cKey: bytes.alloc(32), cIv: bytes.alloc(12), sKey: bytes.alloc(32), sIv: bytes.alloc(12),
         master: bytes.alloc(48), cap: bytes.alloc(48), sap: bytes.alloc(48),
@@ -254,9 +262,9 @@ pub fn newClient(ephPriv: ptr, ephPrivP256: ptr): TlsClient {
 // A client that resumes with a previously issued ticket: it offers the PSK (pre_shared_key) alongside the
 // normal (EC)DHE key_share. `psk` is the resumption PSK (pskLen bytes = the ticket's hash length), `kind`
 // its hash (0 SHA-256 / 1 SHA-384), `ticket` the opaque ticket identity, and `ageAdd` the ticket_age_add.
-pub fn newClientResume(ephPriv: ptr, ephPrivP256: ptr, psk: ptr, pskLen: int, kind: int,
+pub fn newClientResume(ephPriv: ptr, ephPrivP256: ptr, ephPrivP384: ptr, psk: ptr, pskLen: int, kind: int,
                        ticket: ptr, ticketLen: int, ageAdd: long): TlsClient {
-    let c = newClient(ephPriv, ephPrivP256);
+    let c = newClient(ephPriv, ephPrivP256, ephPrivP384);
     c.offerPsk = true;
     c.haveTicket = true;
     c.ticketKind = kind;
@@ -357,7 +365,7 @@ pub fn addClientHello(self: TlsClient, chMsg: ptr, chLen: int): void {
 // Process the ServerHello: negotiate the suite, run the ECDHE, and derive the handshake-phase secrets
 // and keys. shMsg is the ServerHello handshake message.
 pub fn processServerHello(self: TlsClient, shMsg: ptr, shLen: int): void {
-    let serverPub = bytes.alloc(65);               // fits x25519 (32) or secp256r1 uncompressed (65)
+    let serverPub = bytes.alloc(97);               // fits x25519 (32) / secp256r1 (65) / secp384r1 (97)
     let groupBuf = bytes.alloc(2);
     let cipher = handshake.parseServerHello(shMsg, shLen, serverPub, groupBuf);
     let group = (bytes.read_byte(groupBuf, 0) << 8) | bytes.read_byte(groupBuf, 1);
@@ -365,9 +373,12 @@ pub fn processServerHello(self: TlsClient, shMsg: ptr, shLen: int): void {
     else if (cipher == 0x1303) { self.suite = 2; self.kind = 0; }
     else { self.suite = 0; self.kind = 0; }
 
-    // Run the ECDHE for the group the server selected in its key_share.
-    let ecdhe = bytes.alloc(32);
-    if (group == 0x0017) { p256.ecdh(ecdhe, self.ephP256, serverPub); }
+    // Run the ECDHE for the group the server selected in its key_share (the shared secret is 32 bytes for
+    // x25519/P-256, 48 bytes for P-384).
+    let ecdhe = bytes.alloc(48);
+    let ecdheLen = 32;
+    if (group == 0x0018) { p384.ecdh(ecdhe, self.ephP384, serverPub); ecdheLen = 48; }
+    else if (group == 0x0017) { p256.ecdh(ecdhe, self.ephP256, serverPub); }
     else { x25519.scalarMult(ecdhe, self.eph, serverPub); }
     // Early Secret: keyed by the resumption PSK when we offered one and the server accepted it
     // (pre_shared_key echoed), otherwise the all-zero PSK. psk_dhe_ke mixes the ECDHE in either way.
@@ -379,7 +390,7 @@ pub fn processServerHello(self: TlsClient, shMsg: ptr, shLen: int): void {
         tls.earlySecret(self.kind, early);
     }
     let derived = bytes.alloc(48); tls.deriveDerived(self.kind, early, derived);
-    tls.extractSecret(self.kind, derived, ecdhe, 32, self.hs);
+    tls.extractSecret(self.kind, derived, ecdhe, ecdheLen, self.hs);
 
     trAdd(self, shMsg, shLen);
     let hSH = bytes.alloc(48); trHash(self, hSH);

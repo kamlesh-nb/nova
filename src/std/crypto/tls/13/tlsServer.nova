@@ -10,6 +10,7 @@ import crypto.tls.13.tls;
 import crypto.tls.13.handshake;
 import crypto.ecc.x25519;
 import crypto.ecc.p256;
+import crypto.ecc.p384;
 import crypto.hash.sha256;
 import crypto.hash.sha512;
 
@@ -38,12 +39,14 @@ struct TlsServer {
     pub kind: int, pub suite: int,
     pub ephPriv: ptr,                    // server ephemeral X25519 private key
     pub ephPrivP256: ptr,                // server ephemeral secp256r1 private scalar
+    pub ephPrivP384: ptr,                // server ephemeral secp384r1 private scalar
     pub certDer: ptr, pub certLen: int,  // our certificate (DER)
     pub signKey: ptr,                    // our EC private scalar (32 bytes) for CertificateVerify
     pub clientPub: ptr,                  // client X25519 key_share
     pub clientPubP: ptr,                 // client secp256r1 key_share (65-byte uncompressed)
-    pub group: int,                      // negotiated group (0x001d x25519 / 0x0017 secp256r1)
-    pub haveX25519: bool, pub haveP256: bool,   // which key_shares the client offered
+    pub clientPubP384: ptr,              // client secp384r1 key_share (97-byte uncompressed)
+    pub group: int,                      // negotiated group (001d x25519 / 0017 secp256r1 / 0018 secp384r1)
+    pub haveX25519: bool, pub haveP256: bool, pub haveP384: bool,   // which key_shares the client offered
     pub alpnOffer: string, pub alpnSel: string, // protocols we support / the one we selected ("" = none)
     pub sid: ptr, pub sidLen: int,       // client legacy_session_id (echoed back)
     pub trBuf: ptr, pub trLen: int, pub trCap: int,
@@ -55,12 +58,12 @@ struct TlsServer {
     pub finishedOk: bool,
 }
 
-pub fn newServer(certDer: ptr, certLen: int, signKey: ptr, ephPriv: ptr, ephPrivP256: ptr): TlsServer {
+pub fn newServer(certDer: ptr, certLen: int, signKey: ptr, ephPriv: ptr, ephPrivP256: ptr, ephPrivP384: ptr): TlsServer {
     return TlsServer {
-        kind: 0, suite: 0, ephPriv: ephPriv, ephPrivP256: ephPrivP256,
+        kind: 0, suite: 0, ephPriv: ephPriv, ephPrivP256: ephPrivP256, ephPrivP384: ephPrivP384,
         certDer: certDer, certLen: certLen, signKey: signKey,
-        clientPub: bytes.alloc(32), clientPubP: bytes.alloc(65), group: 0x001d,
-        haveX25519: false, haveP256: false, alpnOffer: "", alpnSel: "",
+        clientPub: bytes.alloc(32), clientPubP: bytes.alloc(65), clientPubP384: bytes.alloc(97), group: 0x001d,
+        haveX25519: false, haveP256: false, haveP384: false, alpnOffer: "", alpnSel: "",
         sid: bytes.alloc(32), sidLen: 0,
         trBuf: bytes.alloc(8192), trLen: 0, trCap: 8192,
         hs: bytes.alloc(48), chs: bytes.alloc(48), shs: bytes.alloc(48),
@@ -170,6 +173,10 @@ pub fn processClientHello(self: TlsServer, ch: ptr, chLen: int): void {
                     self.haveP256 = true;
                     let j = 0;
                     while (j < klen) { bytes.write_byte(self.clientPubP, j, bytes.read_byte(ch, q + 4 + j)); j = j + 1; }
+                } else if (grp == 0x0018) {         // secp384r1 (97-byte uncompressed point)
+                    self.haveP384 = true;
+                    let j = 0;
+                    while (j < klen) { bytes.write_byte(self.clientPubP384, j, bytes.read_byte(ch, q + 4 + j)); j = j + 1; }
                 }
                 q = q + 4 + klen;
             }
@@ -178,9 +185,10 @@ pub fn processClientHello(self: TlsServer, ch: ptr, chLen: int): void {
         }
         p = body + elen;
     }
-    // Group selection: prefer x25519 when the client shared it, else secp256r1.
+    // Group selection: prefer x25519, then secp256r1, then secp384r1 (whichever the client shared).
     if (self.haveX25519) { self.group = 0x001d; }
     else if (self.haveP256) { self.group = 0x0017; }
+    else if (self.haveP384) { self.group = 0x0018; }
     trAdd(self, ch, chLen);
 }
 
@@ -202,9 +210,20 @@ pub fn buildServerHello(self: TlsServer, serverRandom: ptr, out: ptr): int {
     bytes.write_byte(out, p, 0); p = p + 1;        // legacy_compression_method
     let extLenPos = p; p = p + 2;
     p = putHex(out, p, "002b00020304");            // supported_versions: TLS 1.3
-    // key_share for the negotiated group; compute the matching ECDHE shared secret.
-    let ecdhe = bytes.alloc(32);
-    if (self.group == 0x0017) {                    // secp256r1
+    // key_share for the negotiated group; compute the matching ECDHE shared secret (32 bytes for
+    // x25519/P-256, 48 bytes for P-384).
+    let ecdhe = bytes.alloc(48);
+    let ecdheLen = 32;
+    if (self.group == 0x0018) {                    // secp384r1
+        let ephPub = bytes.alloc(97); p384.derivePublic(ephPub, self.ephPrivP384);
+        p = putHex(out, p, "0033006500180061");    // key_share: secp384r1 entry header (97-byte value)
+        i = 0;
+        while (i < 97) { bytes.write_byte(out, p + i, bytes.read_byte(ephPub, i)); i = i + 1; }
+        p = p + 97;
+        p384.ecdh(ecdhe, self.ephPrivP384, self.clientPubP384);
+        ecdheLen = 48;
+        bytes.free(ephPub);
+    } else if (self.group == 0x0017) {             // secp256r1
         let ephPub = bytes.alloc(65); p256.derivePublic(ephPub, self.ephPrivP256);
         p = putHex(out, p, "0033004500170041");    // key_share: secp256r1 entry header (65-byte value)
         i = 0;
@@ -231,7 +250,7 @@ pub fn buildServerHello(self: TlsServer, serverRandom: ptr, out: ptr): int {
     // key schedule from the ECDHE.
     let early = bytes.alloc(48); tls.earlySecret(self.kind, early);
     let derived = bytes.alloc(48); tls.deriveDerived(self.kind, early, derived);
-    tls.extractSecret(self.kind, derived, ecdhe, 32, self.hs);
+    tls.extractSecret(self.kind, derived, ecdhe, ecdheLen, self.hs);
     trAdd(self, out, p);
     let hSH = bytes.alloc(48); trHash(self, hSH);
     tls.deriveTraffic(self.kind, self.hs, "c hs traffic", hSH, self.chs);

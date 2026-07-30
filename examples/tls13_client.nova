@@ -78,7 +78,7 @@ fn main(): int {
     // Ephemeral X25519 key + ClientHello.
     let priv = bytes.alloc(32); fillRandom(priv, 32);
     let epub = bytes.alloc(32); x25519.scalarMult(epub, priv, base9());
-    let c = tlsClient.newClient(priv);
+    let c = tlsClient.newClient(priv, bytes.alloc(32), bytes.alloc(48));
     let rnd = bytes.alloc(32); fillRandom(rnd, 32);
     let sid = bytes.alloc(32); fillRandom(sid, 32);
     let ch = bytes.alloc(1024);

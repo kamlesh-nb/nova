@@ -83,3 +83,22 @@ fn server_p256_group(): void {
     assert.equalInt(bytes.read_byte(out, 0), 88);
     assert.equalInt(bytes.read_byte(out, 2), 90);
 }
+
+// The client offers only a secp384r1 key_share, so the server negotiates the P-384 group (48-byte ECDHE)
+// and the handshake completes with bidirectional application data.
+@test
+fn server_p384_group(): void {
+    let cb = tlsmembio.newClientBioGroups("localhost", "", 4);   // groupMask 4 = secp384r1 only
+    let sb = tlsmembio.newServerBio(hexBuf(SRV_CERT), 421, hexBuf(SRV_PRIV));
+    let tmp = bytes.alloc(33792);
+    assert.isTrue(handshake(cb, sb, tmp));
+    assert.equalInt(sb.srv.group, 0x0018);          // server selected secp384r1
+
+    let msg = bytes.alloc(2);
+    bytes.write_byte(msg, 0, 65); bytes.write_byte(msg, 1, 66);
+    cb.writeApp(msg, 2);
+    while (cb.pendingOut() > 0) { let n = cb.pull(tmp, 33792); sb.feed(tmp, n); }
+    let out = bytes.alloc(64);
+    assert.equalInt(sb.readApp(out, 64), 2);
+    assert.equalInt(bytes.read_byte(out, 0), 65);
+}

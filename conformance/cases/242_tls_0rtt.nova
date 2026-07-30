@@ -25,7 +25,7 @@ fn newRtt(): tlsClient.TlsClient {
     let ticket = bytes.alloc(4);
     bytes.write_byte(ticket, 0, 0xca); bytes.write_byte(ticket, 1, 0xfe);
     bytes.write_byte(ticket, 2, 0xf0); bytes.write_byte(ticket, 3, 0x0d);
-    return tlsClient.newClientResume(bytes.alloc(32), bytes.alloc(32), psk, 32, 0, ticket, 4, 0);
+    return tlsClient.newClientResume(bytes.alloc(32), bytes.alloc(32), bytes.alloc(48), psk, 32, 0, ticket, 4, 0);
 }
 
 fn buildRttCh(c: tlsClient.TlsClient, out: ptr): int {
@@ -35,7 +35,7 @@ fn buildRttCh(c: tlsClient.TlsClient, out: ptr): int {
     let rnd = bytes.alloc(32); let sid = bytes.alloc(32); let pk = bytes.alloc(32);
     let pkP = bytes.alloc(65); bytes.write_byte(pkP, 0, 4);
     let empty = bytes.alloc(1);
-    let n = tlsClient.buildClientHelloEx(rnd, sid, pk, pkP, "localhost", "", 3, empty, 0, ticket, 4, 0, 32, 1, out);
+    let n = tlsClient.buildClientHelloEx(rnd, sid, pk, pkP, bytes.alloc(97), "localhost", "", 3, empty, 0, ticket, 4, 0, 32, 1, out);
     c.fillResumptionBinder(out, n);
     c.addClientHello(out, n);
     return n;
@@ -65,8 +65,8 @@ fn early_key_derivation(): void {
     let out = bytes.alloc(2048);
     buildRttCh(c, out);
     c.deriveEarlyKeys();
-    assert.isTrue(eqHex(c.eKey, 16, "1dce731467877aaf3fe27c857008ec8e"));
-    assert.isTrue(eqHex(c.eIv, 12, "08f697bfdb8b0aae87ba32ec"));
+    assert.isTrue(eqHex(c.eKey, 16, "409b330560fedd86ede7c5c138646611"));
+    assert.isTrue(eqHex(c.eIv, 12, "b1a3dd1333f6c49f1210c7fa"));
 }
 
 // EndOfEarlyData is a 4-byte handshake message (05 00 00 00) wrapped as a protected record (outer type

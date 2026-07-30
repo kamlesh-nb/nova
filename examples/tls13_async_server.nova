@@ -41,7 +41,8 @@ async fn serveOne(lfd: int, kq: int, done: ptr): int {
     let io = tls13async.newIO(rs.fdOf(), kq);
     let ephPriv = bytes.alloc(32); fillRandom(ephPriv, 32);
     let ephPrivP = bytes.alloc(32); fillRandom(ephPrivP, 32);
-    let srv = tlsServer.newServer(hexBuf(SRV_CERT), 421, hexBuf(SRV_PRIV), ephPriv, ephPrivP);
+    let ephPrivP384 = bytes.alloc(48); fillRandom(ephPrivP384, 48);
+    let srv = tlsServer.newServer(hexBuf(SRV_CERT), 421, hexBuf(SRV_PRIV), ephPriv, ephPrivP, ephPrivP384);
     let sr = bytes.alloc(32); fillRandom(sr, 32);
 
     if (await tls13async.serveHandshake(io, srv, sr) < 0) {

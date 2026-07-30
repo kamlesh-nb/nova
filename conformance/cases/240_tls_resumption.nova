@@ -29,20 +29,20 @@ fn resumption_binder_offset(): void {
     let ticket = bytes.alloc(4);
     bytes.write_byte(ticket, 0, 0xca); bytes.write_byte(ticket, 1, 0xfe);
     bytes.write_byte(ticket, 2, 0xf0); bytes.write_byte(ticket, 3, 0x0d);
-    let c = tlsClient.newClientResume(bytes.alloc(32), bytes.alloc(32), psk, 32, 0, ticket, 4, 0);
+    let c = tlsClient.newClientResume(bytes.alloc(32), bytes.alloc(32), bytes.alloc(48), psk, 32, 0, ticket, 4, 0);
 
     let rnd = bytes.alloc(32); let sid = bytes.alloc(32); let pk = bytes.alloc(32);
     let pkP = bytes.alloc(65); bytes.write_byte(pkP, 0, 4);
     let empty = bytes.alloc(1);
     let out = bytes.alloc(2048);
-    let n = tlsClient.buildClientHelloEx(rnd, sid, pk, pkP, "localhost", "", 3, empty, 0, ticket, 4, 0, 32, 0, out);
+    let n = tlsClient.buildClientHelloEx(rnd, sid, pk, pkP, bytes.alloc(97), "localhost", "", 3, empty, 0, ticket, 4, 0, 32, 0, out);
     c.fillResumptionBinder(out, n);
 
     // The binder is the last 32 bytes. Reference computed independently (HMAC over the transcript hash of
     // out[0 .. n-35], keyed by finished_key(res binder key(early_secret(PSK)))).
-    assert.equalInt(n, 298);
+    assert.equalInt(n, 300);
     assert.isTrue(eqHex((out as long + n - 32) as ptr, 32,
-        "7e5d4c597776de8deee80fb668bd57dd45a48d57a38a1a6a78cc1cfe15396c5a"));
+        "f67e9513bf838b33607a3ec82f44740d55c9028b9caf2f596404d2f2ba03c14d"));
     // The byte just before the binder entry (out[n-33]) is the binder-entry length (0x20 = 32).
     assert.equalInt(bytes.read_byte(out, n - 33), 0x20);
     // and out[n-35..n-34] is the binders-list length (0x0021 = 33), excluded from the binder transcript.

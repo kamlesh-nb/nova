@@ -91,7 +91,8 @@ fn main(): int {
 
     let ephPriv = bytes.alloc(32); fillRandom(ephPriv, 32);
     let ephPrivP = bytes.alloc(32); fillRandom(ephPrivP, 32);
-    let srv = tlsServer.newServer(hexBuf(SRV_CERT), 421, hexBuf(SRV_PRIV), ephPriv, ephPrivP);
+    let ephPrivP384 = bytes.alloc(48); fillRandom(ephPrivP384, 48);
+    let srv = tlsServer.newServer(hexBuf(SRV_CERT), 421, hexBuf(SRV_PRIV), ephPriv, ephPrivP, ephPrivP384);
     srv.processClientHello(at(buf, 5), n - 5);
 
     // ServerHello.
