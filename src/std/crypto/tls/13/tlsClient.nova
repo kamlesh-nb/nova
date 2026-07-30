@@ -421,6 +421,48 @@ pub fn encryptAlert(self: TlsClient, level: int, desc: int, out: ptr): int {
     return n;
 }
 
+// ---- KeyUpdate (RFC 8446 section 4.6.3 / 7.2) ----
+
+// Rotate the SERVER application traffic secret to the next generation, re-derive the read key/IV, and
+// reset the server record sequence to 0. Call this after a server KeyUpdate is received (the record that
+// carried it was decrypted under the previous key).
+pub fn updateServerKey(self: TlsClient): void {
+    let ns = bytes.alloc(48);
+    tls.deriveTrafficUpdate(self.kind, self.sap, ns);
+    let i = 0;
+    while (i < 48) { bytes.write_byte(self.sap, i, bytes.read_byte(ns, i)); i = i + 1; }
+    bytes.free(ns);
+    tls.deriveKeyIv(self.kind, self.suite, self.sap, self.sapKey, self.sapIv);
+    self.sSeq = 0;
+}
+
+// Rotate the CLIENT application traffic secret to the next generation, re-derive the write key/IV, and
+// reset the client record sequence to 0. Call this AFTER sending our own KeyUpdate (the sender switches
+// to the next-generation keys only after the KeyUpdate has been sent).
+pub fn updateClientKey(self: TlsClient): void {
+    let ns = bytes.alloc(48);
+    tls.deriveTrafficUpdate(self.kind, self.cap, ns);
+    let i = 0;
+    while (i < 48) { bytes.write_byte(self.cap, i, bytes.read_byte(ns, i)); i = i + 1; }
+    bytes.free(ns);
+    tls.deriveKeyIv(self.kind, self.suite, self.cap, self.capKey, self.capIv);
+    self.cSeq = 0;
+}
+
+// Build and encrypt a KeyUpdate handshake message (content type 0x16) under the CURRENT client app key.
+// request is 0 (update_not_requested) or 1 (update_requested). The caller must call updateClientKey()
+// afterwards to switch its send key to the next generation.
+pub fn keyUpdateRecord(self: TlsClient, request: int, out: ptr): int {
+    let msg = bytes.alloc(5);
+    bytes.write_byte(msg, 0, 0x18);                // handshake type: key_update
+    bytes.write_byte(msg, 1, 0); bytes.write_byte(msg, 2, 0); bytes.write_byte(msg, 3, 1);   // length 1
+    bytes.write_byte(msg, 4, request);
+    let n = tls.recordProtect(self.suite, self.capKey, self.capIv, self.cSeq, msg, 5, 0x16, out);
+    self.cSeq = self.cSeq + 1;
+    bytes.free(msg);
+    return n;
+}
+
 // Decrypt an application-data record with the server application key. Returns the inner plaintext length
 // (including the trailing content-type byte), or -1 on failure.
 pub fn decryptApp(self: TlsClient, record: ptr, recLen: int, out: ptr): int {

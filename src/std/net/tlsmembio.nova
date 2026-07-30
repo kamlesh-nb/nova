@@ -218,9 +218,32 @@ pub struct ClientBio impl TlsBio {
                     // sending, so report end-of-stream. The sequence was already advanced by decryptApp.
                     self.buf.closed = true;
                     return 0 - 1;
+                } else if (itype == 0x16) {
+                    // Post-handshake handshake message(s). Handle KeyUpdate (RFC 8446 section 4.6.3);
+                    // other messages (e.g. NewSessionTicket) are ignored. The whole record was decrypted
+                    // under the current server key, so rotate the read key only after parsing it.
+                    let plen = inner - 1;
+                    let p = 0;
+                    while (p + 4 <= plen) {
+                        let mtype = bytes.read_byte(self.plain, p);
+                        let mlen = (bytes.read_byte(self.plain, p + 1) << 16)
+                                 | (bytes.read_byte(self.plain, p + 2) << 8) | bytes.read_byte(self.plain, p + 3);
+                        if (mtype == 0x18) {                 // KeyUpdate
+                            let req = bytes.read_byte(self.plain, p + 4);
+                            self.cl.updateServerKey();
+                            if (req == 1) {
+                                // update_requested: reply with our own KeyUpdate (update_not_requested),
+                                // then switch our send key to the next generation.
+                                let ku = bytes.alloc(64);
+                                let n = self.cl.keyUpdateRecord(0, ku);
+                                self.buf.appendOut(ku, n);
+                                bytes.free(ku);
+                                self.cl.updateClientKey();
+                            }
+                        }
+                        p = p + 4 + mlen;
+                    }
                 }
-                // Post-handshake handshake records (e.g. NewSessionTicket, KeyUpdate) advance the sequence
-                // and are skipped.
             }
         }
         return 0;
@@ -239,6 +262,19 @@ pub struct ClientBio impl TlsBio {
 
     // The ALPN protocol the server selected during the handshake ("" if none was negotiated).
     pub fn selectedAlpn(self: ClientBio): string { return self.cl.selectedAlpn(); }
+
+    // Proactively rotate our send key (RFC 8446 section 4.6.3): queue an encrypted KeyUpdate under the
+    // current key, then switch to the next-generation client key. request=1 asks the server to update
+    // its send key too; request=0 rotates only ours. Call after the handshake completes (state 3).
+    pub fn requestKeyUpdate(self: ClientBio, request: int): void {
+        if (self.state == 3) {
+            let ku = bytes.alloc(64);
+            let n = self.cl.keyUpdateRecord(request, ku);
+            self.buf.appendOut(ku, n);
+            bytes.free(ku);
+            self.cl.updateClientKey();
+        }
+    }
 
     pub fn closeBio(self: ClientBio): void {
         self.buf.freeBuffers();

@@ -118,3 +118,41 @@ fn tampered_flight(): void {
     bytes.write_byte(rec, 100, (bytes.read_byte(rec, 100) ^ 1) & 0xff);
     assert.isTrue(!c.processFlight(rec, 679));
 }
+
+// KeyUpdate (RFC 8446 section 7.2): rotating the server application traffic secret matches the reference
+// HKDF-Expand-Label(secret, "traffic upd", "") and resets the server record sequence.
+const S_AP_UPD: string = "51921b8aa3001976eb401d0a4319a8516416a6c56001a357e5d162031e84f916";
+
+@test
+fn key_update_rotation(): void {
+    let c = tlsClient.newClient(hexBuf(CLIENT_PRIV), bytes.alloc(32));
+    c.addClientHello(hexBuf(CH), 196);
+    c.processServerHello(hexBuf(SH), 90);
+    assert.isTrue(c.processFlight(hexBuf(REC), 679));
+    let vd = bytes.alloc(32);
+    c.clientFinished(vd);                          // derives the application secrets (c.sap == S_AP)
+    assert.isTrue(eqHex(c.sap, 32, S_AP));
+    c.sSeq = 7;                                     // pretend some server records were read
+    c.updateServerKey();                            // rotate the server key to the next generation
+    assert.isTrue(eqHex(c.sap, 32, S_AP_UPD));
+    assert.equalInt((c.sSeq as int), 0);            // the sequence resets on a key change
+}
+
+// A KeyUpdate handshake record is a single TLSCiphertext (content type 0x16 outer, 0x18 inner) carrying
+// the 4-byte header 18 00 00 01 plus the request byte.
+@test
+fn key_update_record_shape(): void {
+    let c = tlsClient.newClient(hexBuf(CLIENT_PRIV), bytes.alloc(32));
+    c.addClientHello(hexBuf(CH), 196);
+    c.processServerHello(hexBuf(SH), 90);
+    assert.isTrue(c.processFlight(hexBuf(REC), 679));
+    let vd = bytes.alloc(32);
+    c.clientFinished(vd);
+    let out = bytes.alloc(64);
+    let n = c.keyUpdateRecord(1, out);              // update_requested
+    assert.equalInt(bytes.read_byte(out, 0), 0x17); // outer TLSCiphertext type (app data)
+    assert.equalInt(n, 5 + 5 + 1 + 16);             // 5 header + 5 msg + 1 inner-type + 16 tag
+    // Sending our KeyUpdate advances then (via updateClientKey) resets the client sequence.
+    c.updateClientKey();
+    assert.equalInt((c.cSeq as int), 0);
+}

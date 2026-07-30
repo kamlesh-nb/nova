@@ -72,6 +72,17 @@ pub fn deriveTraffic(kind: int, secret: ptr, label: string, transcript: ptr, out
     bytes.free(lab);
 }
 
+// Next-generation application traffic secret for a KeyUpdate (RFC 8446 section 7.2):
+// application_traffic_secret_N+1 = HKDF-Expand-Label(secret_N, "traffic upd", "", Hash.length).
+// The context is the empty string (not a transcript hash), so this uses expandLabel directly.
+pub fn deriveTrafficUpdate(kind: int, secret: ptr, out: ptr): void {
+    let hl = hkdf.hashLen(kind);
+    let empty = bytes.alloc(1);
+    let lab = strBuf("traffic upd");
+    hkdf.expandLabel(kind, secret, hl, lab, 11, empty, 0, out, hl);
+    bytes.free(empty); bytes.free(lab);
+}
+
 // From a traffic secret, derive the AEAD key and 12-byte IV (HKDF-Expand-Label "key" / "iv").
 pub fn deriveKeyIv(kind: int, suite: int, trafficSecret: ptr, keyOut: ptr, ivOut: ptr): void {
     let hl = hkdf.hashLen(kind);
