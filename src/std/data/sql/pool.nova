@@ -2,6 +2,7 @@
 import db;
 import string;
 import resilience.breaker;
+import net.httpsclient;
 
 pub struct Pool {
     pub driver: Driver,
@@ -112,4 +113,23 @@ pub struct ResilientPool {
     pub fn state(self): int { return self.breaker.getState(); }
     pub fn isOpen(self): bool { return self.breaker.getState() == breaker.STATE_OPEN; }
     pub fn closeAll(self): void { self.pool.closeAll(); }
+
+    // Out-of-band health probe: GET the database service's HTTP(S) readiness endpoint (e.g. a managed
+    // DB's status API or a sidecar) via the reactor-native pure-Nova HTTPS client, and feed the result
+    // into the circuit breaker: a 2xx records a success, anything else a failure (which can trip the
+    // breaker to fail fast before queries pile up). When `caPem` is a non-empty PEM CA bundle the
+    // endpoint's certificate chain is verified. Async; await from a reactor coroutine. Returns healthy.
+    pub async fn probeHealth(self: ResilientPool, healthUrl: string, caPem: string): bool {
+        let code = 0;
+        if (caPem.length > 0) {
+            let rv = await httpsclient.getVerified(healthUrl, caPem);
+            code = rv.code;
+        } else {
+            let r = await httpsclient.get(healthUrl);
+            code = r.code;
+        }
+        let healthy = code >= 200 && code < 300;
+        if (healthy) { self.breaker.recordSuccess(); } else { self.breaker.recordFailure(); }
+        return healthy;
+    }
 }
