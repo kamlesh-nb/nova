@@ -422,6 +422,10 @@ pub struct ServerBio impl TlsBio {
 
     pub fn feed(self: ServerBio, data: ptr, n: int): void { self.buf.feed(data, n); }
     pub fn markClosed(self: ServerBio): void { self.buf.closed = true; }
+    // Offer these ALPN protocols (comma-separated, server preference order); the server picks the first
+    // that the client also offered and echoes it in EncryptedExtensions. selectedAlpn reports the choice.
+    pub fn offerAlpn(self: ServerBio, alpn: string): void { self.srv.alpnOffer = alpn; }
+    pub fn selectedAlpn(self: ServerBio): string { return self.srv.alpnSel; }
     pub fn pendingOut(self: ServerBio): int { return self.buf.olen; }
     pub fn pull(self: ServerBio, buf: ptr, max: int): int { return self.buf.pull(buf, max); }
 
@@ -500,7 +504,8 @@ pub struct ServerBio impl TlsBio {
 // bio. Use newServerBioPem when you have PEM inputs and want the bio to own the parsed buffers.
 pub fn newServerBio(certDer: ptr, certLen: int, signKey: ptr): ServerBio {
     let ephPriv = bytes.alloc(32); fillRandom(ephPriv, 32);
-    let srv = tlsServer.newServer(certDer, certLen, signKey, ephPriv);
+    let ephPrivP = bytes.alloc(32); fillRandom(ephPrivP, 32);
+    let srv = tlsServer.newServer(certDer, certLen, signKey, ephPriv, ephPrivP);
     let sr = bytes.alloc(32); fillRandom(sr, 32);
     return ServerBio { buf: newMemBuf(), srv: srv, sr: sr, state: 0, scratch: bytes.alloc(33792),
                        scap: 33792, plain: bytes.alloc(33792), certOwned: certDer, keyOwned: signKey, owns: false };
@@ -600,7 +605,8 @@ pub fn newServerBioPem(certPem: string, keyPem: string): ServerBio {
     while (i < certLen) { bytes.write_byte(cbuf, i, bytes.read_byte(certDer as ptr, i)); i = i + 1; }
     let scalar = ecKeyScalar(keyPem);
     let ephPriv = bytes.alloc(32); fillRandom(ephPriv, 32);
-    let srv = tlsServer.newServer(cbuf, certLen, scalar, ephPriv);
+    let ephPrivP = bytes.alloc(32); fillRandom(ephPrivP, 32);
+    let srv = tlsServer.newServer(cbuf, certLen, scalar, ephPriv, ephPrivP);
     let sr = bytes.alloc(32); fillRandom(sr, 32);
     return ServerBio { buf: newMemBuf(), srv: srv, sr: sr, state: 0, scratch: bytes.alloc(33792),
                        scap: 33792, plain: bytes.alloc(33792), certOwned: cbuf, keyOwned: scalar, owns: true };

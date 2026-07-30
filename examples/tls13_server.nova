@@ -90,7 +90,8 @@ fn main(): int {
     if (n < 0 || bytes.read_byte(buf, 0) != 0x16) { logStr("no ClientHello"); return 1; }
 
     let ephPriv = bytes.alloc(32); fillRandom(ephPriv, 32);
-    let srv = tlsServer.newServer(hexBuf(SRV_CERT), 421, hexBuf(SRV_PRIV), ephPriv);
+    let ephPrivP = bytes.alloc(32); fillRandom(ephPrivP, 32);
+    let srv = tlsServer.newServer(hexBuf(SRV_CERT), 421, hexBuf(SRV_PRIV), ephPriv, ephPrivP);
     srv.processClientHello(at(buf, 5), n - 5);
 
     // ServerHello.

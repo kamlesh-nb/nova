@@ -64,12 +64,14 @@ pub fn finishedKey(kind: int, trafficSecret: ptr, out: ptr): void {
     bytes.free(empty); bytes.free(lab);
 }
 
-// verify_data = HMAC(finished_key, Transcript-Hash(...)).
+// verify_data = HMAC(finished_key, Transcript-Hash(...)); the HMAC hash follows the suite (SHA-256 for
+// kind 0, SHA-384 for kind 1).
 pub fn finishedVerifyData(kind: int, trafficSecret: ptr, transcriptHash: ptr, out: ptr): void {
     let hl = hkdf.hashLen(kind);
     let fk = bytes.alloc(hl);
     finishedKey(kind, trafficSecret, fk);
-    hmac.hmacSha256(fk, hl, transcriptHash, hl, out);
+    if (kind == 1) { hmac.hmacSha384(fk, hl, transcriptHash, hl, out); }
+    else { hmac.hmacSha256(fk, hl, transcriptHash, hl, out); }
     bytes.free(fk);
 }
 
