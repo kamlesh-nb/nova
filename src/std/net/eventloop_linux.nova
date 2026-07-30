@@ -1,0 +1,177 @@
+// net/eventloop: the completion-based EventLoop abstraction — LINUX (epoll) variant, selected by the
+// target-conditional file rule (platform.os == "linux"). Same trait + op-record contract as the macOS
+// (kqueue) variant; only the mechanism differs. The op record layout, op-kind constants, and the
+// EventLoop trait are intentionally duplicated verbatim across the per-OS files: the target-conditional
+// resolver compiles exactly ONE of them, so there is never a duplicate-definition conflict.
+//
+// epoll is readiness (like kqueue), so this backend EMULATES completion: submit() arms interest and
+// poll() performs the recv/send/accept into the op buffer when the fd is ready, reporting the byte count.
+// A future io_uring backend would be genuinely completion-based (submit SQEs, reap CQEs) behind the same
+// trait. NOTE (runtime-verification pending on Linux): the read-deadline timer (nova_reactor_set_timer)
+// and the cross-reactor wake are kqueue-wired in the C runtime today; their epoll (timerfd/eventfd)
+// integration is a follow-on, so recvIntoDeadline and cross-reactor channels are not yet functional on
+// Linux even though the async I/O path here is. This file is compile-verified via cross-compilation.
+
+import bytes;
+import os.sys;
+import os.epoll;
+
+// Linux errno for "would block" (EAGAIN == EWOULDBLOCK == 11).
+pub const EAGAIN: int = 11;
+
+// Op kinds.
+pub const OP_RECV: int = 0;
+pub const OP_SEND: int = 1;
+pub const OP_ACCEPT: int = 2;
+pub const OP_CONNECT: int = 3;
+
+// In-flight op record — identical layout to the macOS variant (see eventloop_darwin.nova for the field
+// map and the read_i32-zero-extension rationale for the 8-byte result slot + separate done flag).
+pub const OP_SIZE: int = 40;
+
+pub fn makeOp(op: long, kind: int, fd: int, buf: long, len: int, token: long): void {
+    bytes.write_i32(op, 0, kind as long);
+    bytes.write_i32(op, 4, fd as long);
+    bytes.write_ptr(op, 8, buf);
+    bytes.write_i32(op, 16, len as long);
+    bytes.write_i32(op, 20, 0);
+    bytes.write_ptr(op, 24, token);
+    bytes.write_ptr(op, 32, 0);
+}
+pub fn opKind(op: long): int { return bytes.read_i32(op, 0) as int; }
+pub fn opFd(op: long): int { return bytes.read_i32(op, 4) as int; }
+pub fn opBuf(op: long): long { return bytes.read_ptr(op, 8); }
+pub fn opLen(op: long): int { return bytes.read_i32(op, 16) as int; }
+pub fn opDone(op: long): int { return bytes.read_i32(op, 20) as int; }
+pub fn opToken(op: long): long { return bytes.read_ptr(op, 24); }
+pub fn opResult(op: long): int { return bytes.read_ptr(op, 32) as int; }
+pub fn setOpResult(op: long, r: int): void { bytes.write_ptr(op, 32, r as long); bytes.write_i32(op, 20, 1); }
+
+// epoll interest mask for an op kind.
+fn eventsFor(kind: int): int {
+    if (kind == OP_SEND || kind == OP_CONNECT) { return epoll.EPOLLOUT | epoll.EPOLLONESHOT; }
+    return epoll.EPOLLIN;
+}
+
+// Arm an op's interest on an epoll fd, carrying the op address as the event data. In the one-op-per-fd
+// reactor model (a coroutine awaits one I/O at a time per fd) the fd is removed on completion, so a plain
+// ADD never hits EEXIST.
+pub fn submit(kq: int, op: long): int {
+    return epoll.ctlAdd(kq, opFd(op), eventsFor(opKind(op)), op);
+}
+
+// Remove read interest (read-deadline timeout, or ReactorStream.close on a still-armed fd).
+pub fn cancelRead(kq: int, fd: int): void {
+    epoll.ctlDel(kq, fd);
+}
+
+// --- backend-neutral readiness surface (low-level readiness cases; macOS-gated, compiled on Linux) ----
+// These mirror the darwin wrappers so net/reactor stays backend-free. epoll carries no fd or byte count
+// in the event (only {events, data}), so evFd/evBytes are best-effort and the readiness cases that rely
+// on them run only on the macOS/kqueue gate; here they exist to link.
+pub const EVENT_SIZE: int = 12;   // sizeof packed struct epoll_event (x86_64)
+
+pub fn armRead(kq: int, fd: int, token: long): int { return epoll.ctlAdd(kq, fd, epoll.EPOLLIN, token); }
+pub fn armWrite(kq: int, fd: int, token: long): int {
+    return epoll.ctlAdd(kq, fd, epoll.EPOLLOUT | epoll.EPOLLONESHOT, token);
+}
+pub fn cancelWrite(kq: int, fd: int): void { epoll.ctlDel(kq, fd); }
+pub fn waitReady(kq: int, eventBuf: long, maxEvents: int, timeoutMs: int): int {
+    return epoll.epoll_wait(kq, eventBuf, maxEvents, timeoutMs);
+}
+pub fn evFd(eventBuf: long, i: int): int { return epoll.evData(eventBuf, i) as int; }
+pub fn evToken(eventBuf: long, i: int): long { return epoll.evData(eventBuf, i); }
+pub fn evBytes(eventBuf: long, i: int): long { return 0 as long; }
+pub fn evEof(eventBuf: long, i: int): bool {
+    return (epoll.evEvents(eventBuf, i) & (epoll.EPOLLHUP | epoll.EPOLLRDHUP)) != 0;
+}
+pub fn evFilterAt(eventBuf: long, i: int): int { return epoll.evEvents(eventBuf, i); }
+
+// The completion-based event loop (same trait as the macOS variant).
+pub trait EventLoop {
+    fn submit(self, op: long): int;
+    fn poll(self, timeoutMs: int): int;
+    fn completedToken(self, i: int): long;
+    fn ok(self): bool;
+    fn destroy(self): void;
+}
+
+// epoll-backed completion emulation (Linux).
+pub struct Poller impl EventLoop {
+    pub kq: int,             // the epoll fd (named `kq` to match the reactor's field for both backends)
+    pub eventBuf: long,
+    pub compBuf: long,
+    pub maxEvents: int,
+    pub nComp: int,
+
+    init(maxEvents: int) {
+        self.kq = epoll.epoll_create1(0);
+        self.maxEvents = maxEvents;
+        self.eventBuf = bytes.alloc(maxEvents * epoll.EPOLL_EVENT_SIZE);
+        self.compBuf = bytes.alloc(maxEvents * 8);
+        self.nComp = 0;
+    }
+
+    fn ok(self: Poller): bool { return self.kq >= 0; }
+
+    fn submit(self: Poller, op: long): int {
+        return epoll.ctlAdd(self.kq, opFd(op), eventsFor(opKind(op)), op);
+    }
+
+    fn poll(self: Poller, timeoutMs: int): int {
+        let n = epoll.epoll_wait(self.kq, self.eventBuf, self.maxEvents, timeoutMs);
+        self.nComp = 0;
+        let i = 0;
+        while (i < n) {
+            let op = epoll.evData(self.eventBuf, i);
+            if (op != (0 as long)) {
+                let kind = opKind(op);
+                let fd = opFd(op);
+                let buf = opBuf(op);
+                let len = opLen(op);
+                let complete = true;
+                let res = 0;
+                if (kind == OP_RECV) {
+                    let r = sys.read(fd, buf, len as long);
+                    if (r < 0 && sys.errno() == EAGAIN) { complete = false; } else { res = r as int; }
+                } else if (kind == OP_SEND) {
+                    let w = sys.write(fd, buf, len as long);
+                    if (w < 0 && sys.errno() == EAGAIN) {
+                        // spurious writability: re-arm the one-shot write interest and keep waiting.
+                        let ev = bytes.alloc(epoll.EPOLL_EVENT_SIZE);
+                        epoll.setEvent(ev, 0, epoll.EPOLLOUT | epoll.EPOLLONESHOT, op);
+                        epoll.epoll_ctl(self.kq, epoll.EPOLL_CTL_MOD, fd, ev);
+                        bytes.free(ev);
+                        complete = false;
+                    } else { res = w as int; }
+                } else if (kind == OP_ACCEPT) {
+                    let c = sys.accept(fd, 0, 0);
+                    if (c < 0 && sys.errno() == EAGAIN) { complete = false; } else {
+                        if (c >= 0) { sys.setNonBlocking(c); }
+                        res = c;
+                    }
+                } else if (kind == OP_CONNECT) {
+                    res = if (sys.soError(fd) == 0) 0 else -1;
+                }
+                if (complete) {
+                    epoll.ctlDel(self.kq, fd);   // one op per fd per completion; next submit re-adds
+                    setOpResult(op, res);
+                    bytes.write_ptr(self.compBuf, (self.nComp * 8) as long, opToken(op));
+                    self.nComp = self.nComp + 1;
+                }
+            }
+            i = i + 1;
+        }
+        return self.nComp;
+    }
+
+    fn completedToken(self: Poller, i: int): long {
+        return bytes.read_ptr(self.compBuf, (i * 8) as long);
+    }
+
+    fn destroy(self: Poller): void {
+        if (self.eventBuf != 0) { bytes.free(self.eventBuf); self.eventBuf = 0; }
+        if (self.compBuf != 0) { bytes.free(self.compBuf); self.compBuf = 0; }
+        if (self.kq >= 0) { sys.close(self.kq); self.kq = -1; }
+    }
+}

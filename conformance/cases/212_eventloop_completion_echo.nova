@@ -15,7 +15,7 @@ fn test_completion_recv_then_send(): void {
     assert.isTrue(server >= 0);
     sys.setNonBlocking(server);
 
-    let lp = eventloop.KqueueLoop(16);
+    let lp = eventloop.Poller(16);
     assert.isTrue(lp.ok());
 
     // Caller-owned op record + payload buffer (must outlive the op).

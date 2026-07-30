@@ -62,9 +62,9 @@ pub fn opResult(op: long): int { return bytes.read_ptr(op, 32) as int; }
 pub fn setOpResult(op: long, r: int): void { bytes.write_ptr(op, 32, r as long); bytes.write_i32(op, 20, 1); }
 
 // Arm an op's readiness on a kqueue fd directly, carrying the op address as the udata token. This is the
-// submit path reactorio uses: the ReactorStream holds the kq (not the KqueueLoop struct), and the struct
+// submit path reactorio uses: the ReactorStream holds the kq (not the Poller struct), and the struct
 // only needs to own the event/completion buffers for poll(). kqueue is the shared state (the kq fd), so a
-// bare-kq submit and a struct poll() on the same kq cooperate. Mirrors KqueueLoop.submit.
+// bare-kq submit and a struct poll() on the same kq cooperate. Mirrors Poller.submit.
 pub fn submit(kq: int, op: long): int {
     let kind = opKind(op);
     let fd = opFd(op);
@@ -79,7 +79,30 @@ pub fn cancelRead(kq: int, fd: int): void {
     kqueue.registerOne(kq, fd, kqueue.EVFILT_READ, kqueue.EV_DELETE, 0);
 }
 
-// The completion-based event loop. Each backend (KqueueLoop / EpollLoop / IocpLoop) implements it; the
+// --- backend-neutral readiness surface (kept for the low-level readiness cases 192/194/195/210) --------
+// The completion API above is the go-forward path; these thin wrappers let net/reactor stay free of any
+// direct kqueue/epoll dependency so it compiles on every target. On kqueue they are the raw kevent ops.
+pub const EVENT_SIZE: int = 32;   // sizeof(struct kevent)
+
+pub fn armRead(kq: int, fd: int, token: long): int {
+    return kqueue.registerOne(kq, fd, kqueue.EVFILT_READ, kqueue.EV_ADD, token);
+}
+pub fn armWrite(kq: int, fd: int, token: long): int {
+    return kqueue.registerOne(kq, fd, kqueue.EVFILT_WRITE, kqueue.EV_ADD | kqueue.EV_ONESHOT, token);
+}
+pub fn cancelWrite(kq: int, fd: int): void {
+    kqueue.registerOne(kq, fd, kqueue.EVFILT_WRITE, kqueue.EV_DELETE, 0);
+}
+pub fn waitReady(kq: int, eventBuf: long, maxEvents: int, timeoutMs: int): int {
+    return kqueue.wait(kq, eventBuf, maxEvents, timeoutMs);
+}
+pub fn evFd(eventBuf: long, i: int): int { return kqueue.evIdent(eventBuf, i) as int; }
+pub fn evToken(eventBuf: long, i: int): long { return kqueue.evUdata(eventBuf, i); }
+pub fn evBytes(eventBuf: long, i: int): long { return kqueue.evData(eventBuf, i); }
+pub fn evEof(eventBuf: long, i: int): bool { return (kqueue.evFlags(eventBuf, i) & kqueue.EV_EOF) != 0; }
+pub fn evFilterAt(eventBuf: long, i: int): int { return kqueue.evFilter(eventBuf, i); }
+
+// The completion-based event loop. Each backend (Poller / EpollLoop / IocpLoop) implements it; the
 // reactor is generic over it so the trait is a compile-time seam (monomorphized, no dyn dispatch).
 pub trait EventLoop {
     // Register an in-flight op (address of an OP_SIZE record). Returns 0 on success, negative on error.
@@ -95,7 +118,7 @@ pub trait EventLoop {
 }
 
 // kqueue-backed completion emulation (macOS/BSD).
-pub struct KqueueLoop impl EventLoop {
+pub struct Poller impl EventLoop {
     pub kq: int,
     pub eventBuf: long,
     pub compBuf: long,       // maxEvents * 8: coroutine tokens to resume from the last poll
@@ -110,11 +133,11 @@ pub struct KqueueLoop impl EventLoop {
         self.nComp = 0;
     }
 
-    fn ok(self: KqueueLoop): bool { return self.kq >= 0; }
+    fn ok(self: Poller): bool { return self.kq >= 0; }
 
     // Arm readiness for the op, carrying its address as the kqueue udata token. recv/accept want
     // readability (persistent EV_ADD); send/connect want one-shot writability.
-    fn submit(self: KqueueLoop, op: long): int {
+    fn submit(self: Poller, op: long): int {
         let kind = opKind(op);
         let fd = opFd(op);
         if (kind == OP_SEND || kind == OP_CONNECT) {
@@ -123,7 +146,7 @@ pub struct KqueueLoop impl EventLoop {
         return kqueue.registerOne(self.kq, fd, kqueue.EVFILT_READ, kqueue.EV_ADD, op);
     }
 
-    fn poll(self: KqueueLoop, timeoutMs: int): int {
+    fn poll(self: Poller, timeoutMs: int): int {
         let n = kqueue.wait(self.kq, self.eventBuf, self.maxEvents, timeoutMs);
         self.nComp = 0;
         let i = 0;
@@ -179,11 +202,11 @@ pub struct KqueueLoop impl EventLoop {
         return self.nComp;
     }
 
-    fn completedToken(self: KqueueLoop, i: int): long {
+    fn completedToken(self: Poller, i: int): long {
         return bytes.read_ptr(self.compBuf, (i * 8) as long);
     }
 
-    fn destroy(self: KqueueLoop): void {
+    fn destroy(self: Poller): void {
         if (self.eventBuf != 0) { bytes.free(self.eventBuf); self.eventBuf = 0; }
         if (self.compBuf != 0) { bytes.free(self.compBuf); self.compBuf = 0; }
         if (self.kq >= 0) { sys.close(self.kq); self.kq = -1; }
