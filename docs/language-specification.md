@@ -401,9 +401,11 @@ that breaks any case fails the gate.
   Native is the working default. CLAUDE.md still lists WASM as a strategic target.
 - **Function cross-module visibility** — has a multi-segment-import hole (a non-`pub` function reachable
   via `import a.b` is not rejected). Types/consts are enforced robustly (§8).
-- **Diagnostics** — an undefined identifier / unresolved call is *rejected*, but sometimes late (at
-  codegen) with a terser message rather than a located sema error (F1-7/F2-5 are diagnostics-quality
-  work, not correctness).
+- **Diagnostics** — an undefined identifier / bare unresolved call is now a **located** sema error
+  (`file:line:col: error: undefined identifier '…'`), and an unresolved qualified/method call
+  (`x.noSuchFn(…)`) prints a **located, named** codegen error (`… no method or function 'noSuchFn' on
+  'x'`) instead of the old terse span-less "no such method or function" *(→ this session)*. Remaining
+  polish: fold the qualified/method-call check into sema so it fires before codegen (F1-7).
 - **Int local slots** are 64-bit wide (a perf detail); int *arithmetic* is honestly 32-bit *(→ 19)*.
 - **`defer`, unions, JSX, tuples-in-general** are present but lightly/not corpus-covered (🔎 above).
 

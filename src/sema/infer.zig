@@ -271,6 +271,7 @@ pub const Inferer = struct {
     fatal_unresolved_idents: usize = 0,
 
     first_fatal_ident: ?[]const u8 = null,
+    first_fatal_span: ?ast.Span = null,
 
     captured_return: ?TypeId = null,
 
@@ -463,6 +464,12 @@ pub const Inferer = struct {
                 if (self.isFatalUnresolvedIdent(name)) {
                     self.fatal_unresolved_idents += 1;
                     if (self.first_fatal_ident == null) self.first_fatal_ident = name;
+                    // Prefer the first ident that actually carries a source location (line > 0);
+                    // synthesized idents have the default unset span.
+                    if (self.first_fatal_span == null and e.span.line > 0) {
+                        self.first_fatal_span = e.span;
+                        self.first_fatal_ident = name;
+                    }
                 } else {
 
                     self.stats.unresolved_ns_ident += 1;

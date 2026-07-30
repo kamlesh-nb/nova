@@ -2310,6 +2310,7 @@ pub const Parser = struct {
             },
             .identifier, .keyword_fn => {
                 const name = self.current().lexeme;
+                const ident_span = self.span();
                 self.advance();
 
                 if (std.mem.eql(u8, name, "undefined")) {
@@ -2346,7 +2347,7 @@ pub const Parser = struct {
                     } } };
                 }
 
-                return ast.Expression{ .kind = .{ .ident = name } };
+                return ast.Expression{ .kind = .{ .ident = name }, .span = ident_span };
             },
             else => {
                 std.debug.print("Unexpected token: type={}, lexeme='{s}' at line {}, col {}\n", .{self.current().type, self.current().lexeme, self.current().line, self.current().column});

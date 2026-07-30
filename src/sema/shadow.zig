@@ -345,10 +345,18 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
     }
 
     if (inf.fatal_unresolved_idents > 0) {
-        std.debug.print(
-            "\x1b[1m\x1b[31merror:\x1b[0m\x1b[1m undefined identifier '{s}'\x1b[0m (and {d} more) — not a value, type, module, or known builtin. (F2-5)\n",
-            .{ inf.first_fatal_ident orelse "?", inf.fatal_unresolved_idents - 1 },
-        );
+        const more = inf.fatal_unresolved_idents - 1;
+        if (inf.first_fatal_span) |sp| {
+            std.debug.print(
+                "  \x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m undefined identifier '{s}'\x1b[0m — not a value, type, module, or known builtin.{s}\n",
+                .{ sp.file, sp.line, sp.col, inf.first_fatal_ident orelse "?", if (more > 0) " (first of several)" else "" },
+            );
+        } else {
+            std.debug.print(
+                "\x1b[1m\x1b[31merror:\x1b[0m\x1b[1m undefined identifier '{s}'\x1b[0m (and {d} more) — not a value, type, module, or known builtin. (F2-5)\n",
+                .{ inf.first_fatal_ident orelse "?", more },
+            );
+        }
         std.process.exit(1);
     }
 

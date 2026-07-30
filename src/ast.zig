@@ -305,6 +305,10 @@ pub const ExprId = enum(u32) { unassigned = 0, _ };
 pub const Expression = struct {
     id: ExprId = .unassigned,
     kind: ExprKind,
+    // Source location of this expression. Defaulted (line 0 = "unset") so the many synthesized/desugared
+    // Expression literals across the compiler keep compiling; the parser sets it for user-written primary
+    // expressions (e.g. identifiers) so diagnostics can point at file:line:col.
+    span: Span = .{ .start = 0, .end = 0, .line = 0, .col = 0, .file = "" },
 };
 
 pub const ExprKind = union(enum) {
