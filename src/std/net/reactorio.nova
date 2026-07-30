@@ -14,7 +14,6 @@
 // client). This is the seam the database drivers move onto in M3.
 
 import bytes;
-import os.sys;
 import os.socket;
 import net.eventloop;
 
@@ -77,7 +76,7 @@ pub fn resolveHost4(host: string): long {
 
     let res = bytes.alloc(8);
     bytes.write_ptr(res, 0, 0);
-    let rc = sys.getaddrinfo(node, 0, 0, res);
+    let rc = socket.getAddrInfo(node, 0, 0, res);
     bytes.free(node);
     if (rc != 0) { bytes.free(res); return -1 as long; }
 
@@ -86,14 +85,14 @@ pub fn resolveHost4(host: string): long {
     let addr = -1 as long;
     while (ai != 0 && addr == (-1 as long)) {
         let fam = bytes.read_i32(ai, 4) as int;
-        if (fam == sys.AF_INET) {
+        if (fam == socket.AF_INET) {
             let sa = bytes.read_ptr(ai, 32);       // ai_addr (macOS offset)
             addr = bytes.read_i32(sa, 4) as long;  // sin_addr; write_i32 truncates the 4 bytes back
         } else {
             ai = bytes.read_ptr(ai, 40);           // ai_next
         }
     }
-    if (head != 0) { sys.freeaddrinfo(head); }
+    if (head != 0) { socket.freeAddrInfo(head); }
     bytes.free(res);
     return addr;
 }

@@ -76,3 +76,8 @@ pub fn connectInProgress(): bool { return sys.errno() == einprogress(); }
 // sockaddr_in helpers (pure byte layout; identical on every platform).
 pub fn makeSockaddrIn(port: int, addrBE: long): ptr { return sys.makeSockaddrIn(port, addrBE); }
 pub fn boundPort(fd: int): int { return sys.boundPort(fd); }
+
+// DNS resolution (getaddrinfo/freeaddrinfo). Kept behind the socket seam so callers don't import os.sys
+// (which would drag its POSIX `socket` extern into the Windows graph and collide with winsock's).
+pub fn getAddrInfo(node: ptr, service: ptr, hints: ptr, res: ptr): int { return sys.getaddrinfo(node, service, hints, res); }
+pub fn freeAddrInfo(res: ptr): void { sys.freeaddrinfo(res); }

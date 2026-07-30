@@ -41,6 +41,8 @@ pub extern("c") fn setsockopt(s: long, level: int, optname: int, optval: ptr, op
 pub extern("c") fn getsockopt(s: long, level: int, optname: int, optval: ptr, optlen: ptr): int;
 pub extern("c") fn getsockname(s: long, addr: ptr, addrlen: ptr): int;
 pub extern("c") fn ioctlsocket(s: long, cmd: long, argp: ptr): int;
+pub extern("c") fn getaddrinfo(node: ptr, service: ptr, hints: ptr, res: ptr): int;
+pub extern("c") fn freeaddrinfo(res: ptr): void;
 
 // Overlapped I/O (the IOCP backend, step 4). WSABUF is { u_long len; char* buf } = 16 bytes on x64
 // (4 bytes len + 4 padding + 8 ptr). completionRoutine is null (0) for IOCP-notified overlapped ops.

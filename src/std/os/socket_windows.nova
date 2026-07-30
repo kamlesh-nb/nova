@@ -74,6 +74,9 @@ pub fn makeSockaddrIn(port: int, addrBE: long): ptr {
     bytes.write_i32(sa, 4, addrBE);
     return sa;
 }
+pub fn getAddrInfo(node: ptr, service: ptr, hints: ptr, res: ptr): int { return winsock.getaddrinfo(node, service, hints, res); }
+pub fn freeAddrInfo(res: ptr): void { winsock.freeaddrinfo(res); }
+
 pub fn boundPort(fd: int): int {
     let sa = bytes.alloc(16);
     let len = bytes.alloc(4);

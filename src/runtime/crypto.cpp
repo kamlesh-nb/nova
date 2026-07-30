@@ -7,9 +7,20 @@
 // randomness here rather than through the os.sys module keeps crypto/random free of the os.sys import,
 // so the crypto/TLS stack does not drag os.sys's socket/file externs into every consumer's namespace.
 
-#include <sys/random.h>
 #include <cstddef>
 
+#ifdef _WIN32
+// Windows: BCryptGenRandom with the system-preferred RNG is the CSPRNG (mingw-w64 provides bcrypt.h;
+// links -lbcrypt). BCRYPT_USE_SYSTEM_PREFERRED_RNG lets the algorithm handle be NULL.
+#include <windows.h>
+#include <bcrypt.h>
+extern "C" void nova_getrandom(char *buf, long long n) {
+  if (BCryptGenRandom(NULL, (PUCHAR)buf, (ULONG)n, 0x00000002 /*BCRYPT_USE_SYSTEM_PREFERRED_RNG*/) != 0) {
+    for (long long i = 0; i < n; i++) buf[i] = 0;   // fail closed to zeros rather than hang
+  }
+}
+#else
+#include <sys/random.h>
 extern "C" void nova_getrandom(char *buf, long long n) {
   long long off = 0;
   while (off < n) {
@@ -22,3 +33,4 @@ extern "C" void nova_getrandom(char *buf, long long n) {
     off += (long long)chunk;
   }
 }
+#endif

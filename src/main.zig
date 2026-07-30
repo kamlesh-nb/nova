@@ -157,7 +157,7 @@ fn crossLinkViaZig(
         try args.append(allocator, try std.fmt.allocPrint(allocator, "{s}/deps/zlib/{s}.c", .{ shared_nova, name }));
 
     if (std.mem.indexOf(u8, target.zig, "windows") != null)
-        try args.appendSlice(allocator, &.{ "-lws2_32", "-lmswsock" });
+        try args.appendSlice(allocator, &.{ "-lws2_32", "-lmswsock", "-lbcrypt" });
     try args.appendSlice(allocator, &.{ "-o", output_path });
     var child = try std.process.spawn(io, .{ .argv = args.items });
     switch (try child.wait(io)) {

@@ -16,6 +16,7 @@
 #include <shared_mutex>
 #include <thread>
 #ifdef _WIN32
+#include <winsock2.h>
 #include <io.h>
 #include <stdlib.h>
 #else
@@ -128,9 +129,15 @@ void nova_ffi_set_errno(long long v) { errno = (int)v; }
 // fcntl is variadic; a non-variadic FFI declaration mispasses the third arg on some ABIs
 // (arm64 passes varargs on the stack). This shim lets C handle the varargs correctly.
 long long nova_set_nonblock(long long fd) {
+#ifdef _WIN32
+  // Sockets on Windows are made non-blocking with ioctlsocket(FIONBIO), not fcntl.
+  u_long nb = 1;
+  return (long long)::ioctlsocket((SOCKET)fd, FIONBIO, &nb);
+#else
   int f = fcntl((int)fd, F_GETFL, 0);
   if (f < 0) return -1;
   return (long long)fcntl((int)fd, F_SETFL, f | O_NONBLOCK);
+#endif
 }
 // open(2) is variadic (int open(const char*, int, ...)); a non-variadic FFI declaration
 // mispasses the mode argument on arm64 (varargs go on the stack, not in registers), exactly
