@@ -1,0 +1,3 @@
+// The CheckHealth request: report DB-service readiness + circuit-breaker state. No fields — the health
+// probe URL and (optional) CA bundle come from the environment.
+pub struct CheckHealth {}

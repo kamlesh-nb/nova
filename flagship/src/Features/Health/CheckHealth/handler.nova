@@ -1,0 +1,30 @@
+import web.response;
+import web.status;
+import serde.source;
+import pool;
+import resilience.breaker;
+import env;
+import Features.Health.CheckHealth.query;
+
+// Liveness/readiness endpoint. Holds the SAME ResilientPool the app uses for queries (constructed once
+// in main, so its circuit-breaker state accumulates across requests). `handle` is `async fn`: it awaits
+// `pool.probeHealth`, an out-of-band verified HTTPS GET to the database service's readiness endpoint via
+// net/httpsclient (reactor-native, pure-Nova TLS 1.3), on the request coroutine. A 2xx records a breaker
+// success, anything else a failure, so repeated probe failures trip the breaker OPEN and callers can see
+// it here before queries pile up. Target/CA come from NOVA_DB_HEALTH_URL / NOVA_DB_HEALTH_CA (a non-empty
+// CA verifies the endpoint's certificate chain). Returns a small JSON status document.
+pub struct CheckHealthHandler impl MessageHandler {
+    pub pool: ResilientPool,
+
+    async fn handle(self: CheckHealthHandler, src: ValueSource): Response {
+        let url = env.get("NOVA_DB_HEALTH_URL");
+        if (url == "") { url = "https://localhost:4433/"; }
+        let ca = env.get("NOVA_DB_HEALTH_CA");
+        let healthy = await self.pool.probeHealth(url, ca);
+        let st = self.pool.state();
+        let name = if (st == breaker.STATE_OPEN) "open" else if (st == breaker.STATE_HALF_OPEN) "half_open" else "closed";
+        let hs = if (healthy) "true" else "false";
+        let ver = if (ca.length > 0) "true" else "false";
+        return json(`{"healthy":${hs},"breaker":"${name}","verified":${ver},"probe":"${url}"}`);
+    }
+}
