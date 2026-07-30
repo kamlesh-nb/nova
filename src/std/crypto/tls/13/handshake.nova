@@ -156,6 +156,33 @@ fn derIntTo(buf: ptr, start: int, len: int, out: ptr): void {
     while (i < l) { bytes.write_byte(out, pad + i, bytes.read_byte(buf, s + i)); i = i + 1; }
 }
 
+// ---- EncryptedExtensions: ALPN selection (RFC 7301 / RFC 8446 section 4.3.1) ----
+
+// Parse the server's ALPN selection out of an EncryptedExtensions handshake message (type 0x08). `ee` is
+// the buffer and `off` the offset of the message start (the 0x08 type byte). Returns the selected protocol
+// name (e.g. "http/1.1"), or "" if the server sent no application_layer_protocol_negotiation extension.
+pub fn parseAlpnSelection(ee: ptr, off: int): string {
+    let p = off + 4;                                // skip handshake header (type + 3-byte length)
+    let extLen = (bytes.read_byte(ee, p) << 8) | bytes.read_byte(ee, p + 1);
+    p = p + 2;
+    let end = p + extLen;
+    while (p + 4 <= end) {
+        let etype = (bytes.read_byte(ee, p) << 8) | bytes.read_byte(ee, p + 1);
+        let elen = (bytes.read_byte(ee, p + 2) << 8) | bytes.read_byte(ee, p + 3);
+        let body = p + 4;
+        if (etype == 0x0010) {                      // application_layer_protocol_negotiation
+            // ProtocolNameList: list_len(2), then a single ProtocolName len(1) + bytes.
+            let nameLen = bytes.read_byte(ee, body + 2);
+            let s = bytes.alloc(nameLen);
+            let k = 0;
+            while (k < nameLen) { bytes.write_byte(s, k, bytes.read_byte(ee, body + 3 + k)); k = k + 1; }
+            return s as string;
+        }
+        p = body + elen;
+    }
+    return "";
+}
+
 // ---- application traffic secrets ----
 
 // Master Secret = HKDF-Extract(Derive-Secret(Handshake Secret, "derived", ""), 0).

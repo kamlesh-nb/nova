@@ -80,7 +80,7 @@ pub async fn handshake(io: TlsIO, cl: tlsClient.TlsClient, ephPub: ptr, host: st
     let sid = bytes.alloc(32); fillRandom(sid, 32);
     let ch = bytes.alloc(1024);
     let ephPubP = bytes.alloc(65); p256.derivePublic(ephPubP, cl.ephP256);
-    let chLen = tlsClient.buildClientHello(rnd, sid, ephPub, ephPubP, host, ch);
+    let chLen = tlsClient.buildClientHello(rnd, sid, ephPub, ephPubP, host, "", ch);
     bytes.free(ephPubP);
     cl.addClientHello(ch, chLen);
 
