@@ -10,6 +10,7 @@
 import bytes;
 import crypto.tls.13.tlsClient;
 import crypto.tls.13.tlsServer;
+import crypto.tls.13.tls;
 import crypto.ecc.x25519;
 import crypto.ecc.p256;
 import crypto.ecc.p384;
@@ -463,6 +464,39 @@ pub fn newClientBioVerify(host: string, store: truststore.TrustStore): ClientBio
 
 // ---- server role ----
 
+// A minimal single-entry resumption ticket cache: maps the most recently issued ticket (opaque id) to
+// its PSK. All state lives in one heap buffer `store` (a struct-value shallow copy shares it), so a
+// ticket issued on one connection can be resumed on the next. Layout: [valid(1)][idLen(2)][pskLen(1)]
+// [kind(1)][id(1024) @ 8][psk(48) @ 1032].
+pub struct TicketCache { pub store: ptr }
+pub fn newTicketCache(): TicketCache {
+    let s = bytes.alloc(1088);
+    bytes.write_byte(s, 0, 0);                      // valid = false
+    return TicketCache { store: s };
+}
+fn cachePut(c: TicketCache, id: ptr, idLen: int, psk: ptr, pskLen: int, kind: int): void {
+    let s = c.store;
+    bytes.write_byte(s, 0, 1);
+    bytes.write_byte(s, 1, (idLen >> 8) & 0xff); bytes.write_byte(s, 2, idLen & 0xff);
+    bytes.write_byte(s, 3, pskLen); bytes.write_byte(s, 4, kind);
+    let i = 0;
+    while (i < idLen) { bytes.write_byte(s, 8 + i, bytes.read_byte(id, i)); i = i + 1; }
+    i = 0;
+    while (i < pskLen) { bytes.write_byte(s, 1032 + i, bytes.read_byte(psk, i)); i = i + 1; }
+}
+fn cacheEq(c: TicketCache, id: ptr, idLen: int): bool {
+    let s = c.store;
+    if (bytes.read_byte(s, 0) != 1) { return false; }
+    let cLen = (bytes.read_byte(s, 1) << 8) | bytes.read_byte(s, 2);
+    if (cLen != idLen) { return false; }
+    let i = 0;
+    while (i < idLen) { if (bytes.read_byte(s, 8 + i) != bytes.read_byte(id, i)) { return false; } i = i + 1; }
+    return true;
+}
+fn cachePskLen(c: TicketCache): int { return bytes.read_byte(c.store, 3); }
+fn cacheKind(c: TicketCache): int { return bytes.read_byte(c.store, 4); }
+fn cachePskPtr(c: TicketCache): ptr { return (c.store as long + 1032) as ptr; }
+
 pub struct ServerBio impl TlsBio {
     pub buf: MemBuf,
     pub srv: tlsServer.TlsServer,
@@ -471,6 +505,9 @@ pub struct ServerBio impl TlsBio {
     pub scratch: ptr, pub scap: int,
     pub plain: ptr,
     pub certOwned: ptr, pub keyOwned: ptr, pub owns: bool,   // cert/key buffers to free (PEM path only)
+    pub cache: TicketCache,         // resumption ticket cache (shared across connections)
+    pub allowEarly: bool,           // accept 0-RTT early data when a resumption PSK is accepted
+    pub earlyData: ptr, pub earlyDataLen: int, pub earlyRead: int, pub earlyDone: bool,  // received 0-RTT data
 
     pub fn feed(self: ServerBio, data: ptr, n: int): void { self.buf.feed(data, n); }
     pub fn markClosed(self: ServerBio): void { self.buf.closed = true; }
@@ -480,6 +517,13 @@ pub struct ServerBio impl TlsBio {
     pub fn selectedAlpn(self: ServerBio): string { return self.srv.alpnSel; }
     // Advertise a record_size_limit (RFC 8449): the client must then send records no larger than this.
     pub fn setRecordSizeLimit(self: ServerBio, limit: int): void { self.srv.recvLimit = limit; }
+    // Share a resumption ticket cache across this server's connections (so a ticket issued on one can be
+    // resumed on the next), and optionally accept 0-RTT early data on resumed connections.
+    pub fn useTicketCache(self: ServerBio, c: TicketCache): void { self.cache = c; }
+    pub fn acceptEarlyData(self: ServerBio, on: bool): void { self.allowEarly = on; }
+    // Whether this handshake resumed via a PSK / accepted the client's 0-RTT early data.
+    pub fn resumed(self: ServerBio): bool { return self.srv.pskAccepted; }
+    pub fn earlyAccepted(self: ServerBio): bool { return self.srv.earlyAccepted; }
     pub fn pendingOut(self: ServerBio): int { return self.buf.olen; }
     pub fn pull(self: ServerBio, buf: ptr, max: int): int { return self.buf.pull(buf, max); }
 
@@ -494,6 +538,17 @@ pub struct ServerBio impl TlsBio {
             if (self.state == 0) {
                 if (ctype != 0x16) { self.state = 0 - 1; return 0 - 1; }
                 self.srv.processClientHello(at(self.scratch, 5), m - 5);
+                // Resumption: if the client offered a PSK we know, verify its binder and (if allowed and
+                // the client offered 0-RTT) derive the early-traffic keys before the ServerHello.
+                if (self.srv.pskIdLen > 0 && cacheEq(self.cache, self.srv.pskId, self.srv.pskIdLen)) {
+                    let pl = cachePskLen(self.cache);
+                    let i = 0;
+                    while (i < pl) { bytes.write_byte(self.srv.psk, i, bytes.read_byte(cachePskPtr(self.cache), i)); i = i + 1; }
+                    self.srv.pskLen = pl;
+                    if (self.srv.verifyPskBinder()) {
+                        if (self.allowEarly && self.srv.earlyOffered) { self.srv.deriveEarlyKeysServer(); }
+                    }
+                }
                 let sh = bytes.alloc(1024);
                 let shLen = self.srv.buildServerHello(self.sr, sh);
                 self.buf.appendRecord(0x16, 0x03, 0x03, sh, shLen);
@@ -506,7 +561,41 @@ pub struct ServerBio impl TlsBio {
                 self.state = 1;
                 return 1;
             } else if (self.state == 1) {
+                // 0-RTT: before the client Finished, decrypt early-data records (under the early keys):
+                // application_data is buffered as 0-RTT data; EndOfEarlyData ends the early stream.
+                if (self.srv.earlyAccepted && !self.earlyDone) {
+                    let inner = self.srv.decryptEarly(self.scratch, m, self.plain);
+                    if (inner < 0) { self.state = 0 - 1; return 0 - 1; }
+                    let itype = bytes.read_byte(self.plain, inner - 1);
+                    if (itype == 0x17) {
+                        let dl = inner - 1;
+                        let j = 0;
+                        while (j < dl) { bytes.write_byte(self.earlyData, self.earlyDataLen + j, bytes.read_byte(self.plain, j)); j = j + 1; }
+                        self.earlyDataLen = self.earlyDataLen + dl;
+                        continue;
+                    } else if (itype == 0x16 && bytes.read_byte(self.plain, 0) == 0x05) {
+                        self.srv.addEndOfEarlyData();       // EndOfEarlyData -> switch to handshake keys
+                        self.earlyDone = true;
+                        continue;
+                    }
+                    self.state = 0 - 1; return 0 - 1;
+                }
                 if (!self.srv.processClientFinished(self.scratch, m)) { self.state = 0 - 1; return 0 - 1; }
+                // Issue a NewSessionTicket so the client can resume later: a random id + nonce, the PSK
+                // derived from resumption_master_secret, cached under the id.
+                let hl = 32; if (self.srv.kind == 1) { hl = 48; }
+                let tid = bytes.alloc(32); fillRandom(tid, 32);
+                let nonce = bytes.alloc(8); fillRandom(nonce, 8);
+                let ab = bytes.alloc(4); fillRandom(ab, 4);
+                let ageAdd: long = ((bytes.read_byte(ab, 0) as long) << 24) | ((bytes.read_byte(ab, 1) as long) << 16)
+                                 | ((bytes.read_byte(ab, 2) as long) << 8) | (bytes.read_byte(ab, 3) as long);
+                let npsk = bytes.alloc(48);
+                tls.deriveResumptionPsk(self.srv.kind, self.srv.resMaster, nonce, 8, npsk);
+                cachePut(self.cache, tid, 32, npsk, hl, self.srv.kind);
+                let nst = bytes.alloc(256);
+                let nn = self.srv.newSessionTicketRecord(tid, 32, nonce, 8, ageAdd, self.allowEarly, nst);
+                self.buf.appendOut(nst, nn);
+                bytes.free(tid); bytes.free(nonce); bytes.free(ab); bytes.free(npsk); bytes.free(nst);
                 self.state = 2;
                 return 0;
             }
@@ -531,6 +620,15 @@ pub struct ServerBio impl TlsBio {
     }
 
     pub fn readApp(self: ServerBio, buf: ptr, max: int): int {
+        // Deliver any buffered 0-RTT early data first (received before the client Finished).
+        if (self.earlyRead < self.earlyDataLen) {
+            let take = self.earlyDataLen - self.earlyRead;
+            if (take > max) { take = max; }
+            let i = 0;
+            while (i < take) { bytes.write_byte(buf, i, bytes.read_byte(self.earlyData, self.earlyRead + i)); i = i + 1; }
+            self.earlyRead = self.earlyRead + take;
+            return take;
+        }
         while (true) {
             let m = self.buf.nextRecord(self.scratch);
             if (m == 0) { if (self.buf.closed) { return 0 - 1; } return 0; }
@@ -571,7 +669,7 @@ pub fn newServerBio(certDer: ptr, certLen: int, signKey: ptr): ServerBio {
     let srv = tlsServer.newServer(certDer, certLen, signKey, ephPriv, ephPrivP, ephPrivP384);
     let sr = bytes.alloc(32); fillRandom(sr, 32);
     return ServerBio { buf: newMemBuf(), srv: srv, sr: sr, state: 0, scratch: bytes.alloc(33792),
-                       scap: 33792, plain: bytes.alloc(33792), certOwned: certDer, keyOwned: signKey, owns: false };
+                       scap: 33792, plain: bytes.alloc(33792), certOwned: certDer, keyOwned: signKey, owns: false, cache: newTicketCache(), allowEarly: false, earlyData: bytes.alloc(16384), earlyDataLen: 0, earlyRead: 0, earlyDone: false };
 }
 
 
@@ -673,5 +771,5 @@ pub fn newServerBioPem(certPem: string, keyPem: string): ServerBio {
     let srv = tlsServer.newServer(cbuf, certLen, scalar, ephPriv, ephPrivP, ephPrivP384);
     let sr = bytes.alloc(32); fillRandom(sr, 32);
     return ServerBio { buf: newMemBuf(), srv: srv, sr: sr, state: 0, scratch: bytes.alloc(33792),
-                       scap: 33792, plain: bytes.alloc(33792), certOwned: cbuf, keyOwned: scalar, owns: true };
+                       scap: 33792, plain: bytes.alloc(33792), certOwned: cbuf, keyOwned: scalar, owns: true, cache: newTicketCache(), allowEarly: false, earlyData: bytes.alloc(16384), earlyDataLen: 0, earlyRead: 0, earlyDone: false };
 }
