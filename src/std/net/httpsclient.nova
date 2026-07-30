@@ -1,0 +1,135 @@
+// Reactor-native HTTPS client in pure Nova: connects, CA-verifies, and does an HTTP/1.1 GET non-blocking
+// on a reactor coroutine via net/asynctls (the full TLS 1.3 memory-BIO). This is the async counterpart to
+// the synchronous web/client.getVerified. It lives in its own module because the reactor-async TLS stack
+// (net/asynctls -> asyncio/reactorio) and the blocking-socket web/client stack (net/tcp) cannot share one
+// compilation graph, so it carries its own small HTTP response framing rather than importing web/client.
+//
+// Must be awaited from a reactor coroutine. On an untrusted chain the handshake fails and code 0 is
+// returned. Does not follow redirects.
+import bytes;
+import string;
+import list;
+import map;
+import net.asynctls;
+import net.url;
+import compress.gzip;
+
+pub struct HttpsResp {
+    pub code: int,
+    pub headers: Map<string, string>,
+    pub body: string,
+}
+
+fn bufToStr(buf: ptr, n: int): string {
+    if (n <= 0) { return ""; }
+    let out = bytes.alloc(n);
+    let i = 0;
+    while (i < n) { bytes.write_byte(out, i, bytes.read_byte(buf, i)); i = i + 1; }
+    return out as string;
+}
+
+fn parseHex(s: string): int {
+    let v = 0;
+    let i = 0;
+    while (i < s.length) {
+        let c = s[i];
+        let d = 0 - 1;
+        if (c >= 48 && c <= 57) { d = c - 48; }
+        else if (c >= 97 && c <= 102) { d = c - 97 + 10; }
+        else if (c >= 65 && c <= 70) { d = c - 65 + 10; }
+        if (d < 0) { break; }
+        v = v * 16 + d;
+        i = i + 1;
+    }
+    return v;
+}
+
+fn dechunk(s: string): string {
+    let out = List<string>();
+    let pos = 0;
+    while (pos < s.length) {
+        let rest = string.slice(s, pos, s.length);
+        let nl = string.indexOf(rest, "\r\n");
+        if (nl == 0 - 1) { break; }
+        let sizeLine = string.slice(s, pos, pos + nl);
+        let size = parseHex(sizeLine);
+        pos = pos + nl + 2;
+        if (size == 0) { break; }
+        if (pos + size > s.length) { break; }
+        out.push(string.slice(s, pos, pos + size));
+        pos = pos + size + 2;
+    }
+    return string.join(out, "");
+}
+
+// Parse a raw HTTP/1.x response: status code, headers, and body (dechunked + gunzipped as indicated).
+fn frameResp(raw: string): HttpsResp {
+    let headers = Map<string, string>(16, string.hash);
+    let sep = string.indexOf(raw, "\r\n\r\n");
+    let headPart = if (sep == 0 - 1) raw else string.slice(raw, 0, sep);
+    let bodyRaw = if (sep == 0 - 1) "" else string.slice(raw, sep + 4, raw.length);
+
+    let lines = string.split(headPart, "\r\n");
+    let code = 0;
+    if (lines.size() > 0) {
+        let statusLine = lines.get(0) ?? "";
+        let sp = string.split(statusLine, " ");
+        if (sp.size() >= 2) { code = string.parseI64(sp.get(1) ?? "0") as int; }
+    }
+    let i = 1;
+    while (i < lines.size()) {
+        let line = lines.get(i) ?? "";
+        let idx = string.indexOf(line, ": ");
+        if (idx != 0 - 1) {
+            headers.set(string.slice(line, 0, idx), string.slice(line, idx + 2, line.length));
+        }
+        i = i + 1;
+    }
+
+    let chunked = false;
+    let gz = false;
+    let hk = headers.keys();
+    let hi = 0;
+    while (hi < hk.size()) {
+        let k = hk.get(hi) ?? "";
+        let lk = string.toLowerCase(k);
+        if (lk == "transfer-encoding" && string.contains(string.toLowerCase(headers.get(k) ?? ""), "chunked")) { chunked = true; }
+        if (lk == "content-encoding" && string.contains(string.toLowerCase(headers.get(k) ?? ""), "gzip")) { gz = true; }
+        hi = hi + 1;
+    }
+    let dechunked = if (chunked) dechunk(bodyRaw) else bodyRaw;
+    let body = if (gz) gzip.decompress(dechunked) else dechunked;
+    return HttpsResp{ code: code, headers: headers, body: body };
+}
+
+// Drive a GET over an already-connected TLS stream and frame the response.
+async fn getOver(ts: asynctls.TlsStream, u: url.Url): HttpsResp {
+    if (!ts.ok()) { ts.close(); return HttpsResp{ code: 0, headers: Map<string, string>(4, string.hash), body: "" }; }
+    let req = "GET " + u.path + " HTTP/1.1\r\nHost: " + u.host + "\r\nConnection: close\r\nAccept-Encoding: gzip\r\nUser-Agent: nova-https/1.0\r\n\r\n";
+    if (await ts.sendStr(req) < 0) { ts.close(); return HttpsResp{ code: 0, headers: Map<string, string>(4, string.hash), body: "" }; }
+    let parts = List<string>();
+    let buf = bytes.alloc(65536);
+    while (true) {
+        let n = await ts.recvInto(buf as long, 65536);
+        if (n <= 0) { break; }
+        parts.push(bufToStr(buf, n));
+    }
+    ts.close();
+    return frameResp(string.join(parts, ""));
+}
+
+// Verified HTTPS GET: the server chain must validate against `caPem` (a PEM CA bundle) for the URL host,
+// or code 0 is returned. Await from a reactor coroutine.
+pub async fn getVerified(urlStr: string, caPem: string): HttpsResp {
+    let u = url.parse(urlStr);
+    let ts = await asynctls.tlsConnectVerify(u.host, u.port, caPem);
+    return await getOver(ts, u);
+}
+
+// HTTPS GET without chain validation (the handshake still authenticates the peer's key; it just does not
+// check the chain against a trust root). Offers ALPN "http/1.1".
+pub async fn get(urlStr: string): HttpsResp {
+    let u = url.parse(urlStr);
+    let ts = await asynctls.tlsConnectAlpn(u.host, u.port, "http/1.1");
+    return await getOver(ts, u);
+}
