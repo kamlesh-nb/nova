@@ -97,7 +97,8 @@ fn hrr_client_hello2(): void {
     let pkP = bytes.alloc(65); bytes.write_byte(pkP, 0, 4);
     let out = bytes.alloc(512);
     // groupMask 2 = secp256r1 only.
-    let n = tlsClient.buildClientHelloEx(rnd, sid, pk, pkP, "example.com", "", 2, c.hrrCookiePtr(), c.hrrCookieSize(), out);
+    let noPsk = bytes.alloc(1);
+    let n = tlsClient.buildClientHelloEx(rnd, sid, pk, pkP, "example.com", "", 2, c.hrrCookiePtr(), c.hrrCookieSize(), noPsk, 0, 0, 0, 0, out);
     // The key_share carries exactly one entry: secp256r1 (0017) with a 65-byte value; no x25519 (001d).
     // ext_type 0033, ext_len 0047, client_shares_len 0045, group 0017, ke_len 0041, then 04 00 00 ...
     assert.isTrue(findPattern(out, n, "003300470045001700410400000000") >= 0);

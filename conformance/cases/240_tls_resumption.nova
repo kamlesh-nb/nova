@@ -35,7 +35,7 @@ fn resumption_binder_offset(): void {
     let pkP = bytes.alloc(65); bytes.write_byte(pkP, 0, 4);
     let empty = bytes.alloc(1);
     let out = bytes.alloc(2048);
-    let n = tlsClient.buildClientHelloEx(rnd, sid, pk, pkP, "localhost", "", 3, empty, 0, ticket, 4, 0, 32, out);
+    let n = tlsClient.buildClientHelloEx(rnd, sid, pk, pkP, "localhost", "", 3, empty, 0, ticket, 4, 0, 32, 0, out);
     c.fillResumptionBinder(out, n);
 
     // The binder is the last 32 bytes. Reference computed independently (HMAC over the transcript hash of

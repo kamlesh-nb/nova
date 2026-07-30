@@ -61,6 +61,14 @@ pub fn earlySecretPsk(kind: int, psk: ptr, pskLen: int, out: ptr): void {
     bytes.free(z);
 }
 
+// client_early_traffic_secret = Derive-Secret(early_secret, "c e traffic", ClientHello) for 0-RTT (RFC
+// 8446 7.1). The caller supplies the transcript hash of the ClientHello.
+pub fn deriveEarlyTraffic(kind: int, earlySec: ptr, chHash: ptr, out: ptr): void {
+    let lab = strBuf("c e traffic");
+    hkdf.deriveSecret(kind, earlySec, hkdf.hashLen(kind), lab, 11, chHash, out);
+    bytes.free(lab);
+}
+
 // binder_key = Derive-Secret(early_secret, "res binder", "") for a resumption PSK (RFC 8446 7.1).
 pub fn deriveResBinderKey(kind: int, earlySec: ptr, out: ptr): void {
     let hl = hkdf.hashLen(kind);

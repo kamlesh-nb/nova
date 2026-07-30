@@ -1,0 +1,84 @@
+// TLS 1.3 0-RTT early data (RFC 8446 2.3, 4.2.10): the client offers an early_data extension in a
+// resumption ClientHello and derives the client_early_traffic key/IV from the PSK and the ClientHello
+// hash. This locks that derivation (reference computed independently via HKDF) and the EndOfEarlyData
+// record shape. The live 0-RTT round-trip (accept and reject) is verified against openssl s_server
+// -early_data.
+import crypto.tls.13.tlsClient;
+import bytes;
+import assert;
+
+fn eqHex(buf: ptr, n: int, hex: string): bool {
+    if (hex.length != n * 2) { return false; }
+    let i = 0;
+    while (i < n) {
+        let hi = hex[i * 2]; let lo = hex[i * 2 + 1];
+        let hv = 0; if (hi >= 97) { hv = hi - 87; } else { hv = hi - 48; }
+        let lv = 0; if (lo >= 97) { lv = lo - 87; } else { lv = lo - 48; }
+        if (bytes.read_byte(buf, i) != hv * 16 + lv) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+fn newRtt(): tlsClient.TlsClient {
+    let psk = bytes.alloc(32);
+    let i = 0; while (i < 32) { bytes.write_byte(psk, i, 0x42); i = i + 1; }
+    let ticket = bytes.alloc(4);
+    bytes.write_byte(ticket, 0, 0xca); bytes.write_byte(ticket, 1, 0xfe);
+    bytes.write_byte(ticket, 2, 0xf0); bytes.write_byte(ticket, 3, 0x0d);
+    return tlsClient.newClientResume(bytes.alloc(32), bytes.alloc(32), psk, 32, 0, ticket, 4, 0);
+}
+
+fn buildRttCh(c: tlsClient.TlsClient, out: ptr): int {
+    let ticket = bytes.alloc(4);
+    bytes.write_byte(ticket, 0, 0xca); bytes.write_byte(ticket, 1, 0xfe);
+    bytes.write_byte(ticket, 2, 0xf0); bytes.write_byte(ticket, 3, 0x0d);
+    let rnd = bytes.alloc(32); let sid = bytes.alloc(32); let pk = bytes.alloc(32);
+    let pkP = bytes.alloc(65); bytes.write_byte(pkP, 0, 4);
+    let empty = bytes.alloc(1);
+    let n = tlsClient.buildClientHelloEx(rnd, sid, pk, pkP, "localhost", "", 3, empty, 0, ticket, 4, 0, 32, 1, out);
+    c.fillResumptionBinder(out, n);
+    c.addClientHello(out, n);
+    return n;
+}
+
+// The resumption ClientHello carries an (empty) early_data extension when 0-RTT is offered.
+@test
+fn early_data_extension_present(): void {
+    let c = newRtt();
+    let out = bytes.alloc(2048);
+    let n = buildRttCh(c, out);
+    // scan for the early_data extension header 00 2a 00 00
+    let found = false;
+    let i = 0;
+    while (i + 4 <= n) {
+        if (bytes.read_byte(out, i) == 0x00 && bytes.read_byte(out, i + 1) == 0x2a
+            && bytes.read_byte(out, i + 2) == 0x00 && bytes.read_byte(out, i + 3) == 0x00) { found = true; }
+        i = i + 1;
+    }
+    assert.isTrue(found);
+}
+
+// client_early_traffic key/IV match an independent HKDF reference over the PSK and ClientHello hash.
+@test
+fn early_key_derivation(): void {
+    let c = newRtt();
+    let out = bytes.alloc(2048);
+    buildRttCh(c, out);
+    c.deriveEarlyKeys();
+    assert.isTrue(eqHex(c.eKey, 16, "1dce731467877aaf3fe27c857008ec8e"));
+    assert.isTrue(eqHex(c.eIv, 12, "08f697bfdb8b0aae87ba32ec"));
+}
+
+// EndOfEarlyData is a 4-byte handshake message (05 00 00 00) wrapped as a protected record (outer type
+// application_data 0x17): 5 header + 4 msg + 1 inner-type + 16 tag.
+@test
+fn end_of_early_data_shape(): void {
+    let c = newRtt();
+    let out = bytes.alloc(2048);
+    buildRttCh(c, out);
+    c.deriveEarlyKeys();
+    let rec = bytes.alloc(64);
+    let n = c.endOfEarlyDataRecord(rec);
+    assert.equalInt(bytes.read_byte(rec, 0), 0x17);
+    assert.equalInt(n, 5 + 4 + 1 + 16);
+}

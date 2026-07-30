@@ -57,6 +57,7 @@ fn full_client_handshake(): void {
 
     // Derive application secrets and compute the client Finished verify_data.
     let vd = bytes.alloc(32);
+    c.deriveAppSecrets();
     c.clientFinished(vd);
     assert.isTrue(eqHex(vd, 32, CLIENT_FINISHED));
     assert.isTrue(eqHex(c.cap, 32, C_AP));
@@ -131,6 +132,7 @@ fn resumption_master_and_psk(): void {
     c.processServerHello(hexBuf(SH), 90);
     assert.isTrue(c.processFlight(hexBuf(REC), 679));
     let vd = bytes.alloc(32);
+    c.deriveAppSecrets();
     c.clientFinished(vd);                          // derives resumption_master_secret
     assert.isTrue(eqHex(c.resMaster, 32, RES_MASTER));
     // NewSessionTicket with ticket_nonce = 00 00 (as in RFC 8448); parse it to derive the PSK.
@@ -153,6 +155,7 @@ fn key_update_rotation(): void {
     c.processServerHello(hexBuf(SH), 90);
     assert.isTrue(c.processFlight(hexBuf(REC), 679));
     let vd = bytes.alloc(32);
+    c.deriveAppSecrets();
     c.clientFinished(vd);                          // derives the application secrets (c.sap == S_AP)
     assert.isTrue(eqHex(c.sap, 32, S_AP));
     c.sSeq = 7;                                     // pretend some server records were read
@@ -170,6 +173,7 @@ fn key_update_record_shape(): void {
     c.processServerHello(hexBuf(SH), 90);
     assert.isTrue(c.processFlight(hexBuf(REC), 679));
     let vd = bytes.alloc(32);
+    c.deriveAppSecrets();
     c.clientFinished(vd);
     let out = bytes.alloc(64);
     let n = c.keyUpdateRecord(1, out);              // update_requested

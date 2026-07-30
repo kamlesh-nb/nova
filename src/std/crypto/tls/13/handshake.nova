@@ -179,6 +179,22 @@ pub fn serverAcceptedPsk(sh: ptr, shLen: int): bool {
 
 // ---- EncryptedExtensions: ALPN selection (RFC 7301 / RFC 8446 section 4.3.1) ----
 
+// True if EncryptedExtensions (type 0x08) contains an early_data extension (0x002a), i.e. the server
+// accepted our 0-RTT data (RFC 8446 4.2.10). `ee` is the buffer, `off` the message start.
+pub fn serverAcceptedEarlyData(ee: ptr, off: int): bool {
+    let p = off + 4;
+    let extLen = (bytes.read_byte(ee, p) << 8) | bytes.read_byte(ee, p + 1);
+    p = p + 2;
+    let end = p + extLen;
+    while (p + 4 <= end) {
+        let etype = (bytes.read_byte(ee, p) << 8) | bytes.read_byte(ee, p + 1);
+        let elen = (bytes.read_byte(ee, p + 2) << 8) | bytes.read_byte(ee, p + 3);
+        if (etype == 0x002a) { return true; }
+        p = p + 4 + elen;
+    }
+    return false;
+}
+
 // Parse the server's ALPN selection out of an EncryptedExtensions handshake message (type 0x08). `ee` is
 // the buffer and `off` the offset of the message start (the 0x08 type byte). Returns the selected protocol
 // name (e.g. "http/1.1"), or "" if the server sent no application_layer_protocol_negotiation extension.
