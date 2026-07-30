@@ -11,6 +11,8 @@ import Features.Products.CreateProduct.command;
 import Features.Products.CreateProduct.handler;
 import Features.Products.GetProductById.query;
 import Features.Products.GetProductById.handler;
+import Features.Upstream.FetchUpstream.query;
+import Features.Upstream.FetchUpstream.handler;
 import Infrastructure.product_repository;
 
 fn buildApp(): App {
@@ -25,6 +27,12 @@ fn buildApp(): App {
     let repo = ProductRepository("postgresql://postgres@127.0.0.1:5432/appdb");
     app.handle<GetProductById>(GetProductByIdHandler{ repo: repo });
     app.get<GetProductById>("/api/products/{id:int}");
+
+    // Upstream feature — a per-request outbound verified HTTPS call via net/httpsclient (reactor-native
+    // pure-Nova TLS 1.3), awaited on the request coroutine. Target/CA come from NOVA_UPSTREAM_URL /
+    // NOVA_UPSTREAM_CA. GET /api/fetch returns a JSON summary of the upstream response.
+    app.handle<FetchUpstream>(FetchUpstreamHandler{});
+    app.get<FetchUpstream>("/api/fetch");
 
     // Serve static assets (wwwroot/) for any unmatched GET.
     app.useStatic("/", "./wwwroot");

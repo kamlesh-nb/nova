@@ -1,0 +1,25 @@
+import web.response;
+import web.status;
+import serde.source;
+import net.httpsclient;
+import env;
+import Features.Upstream.FetchUpstream.query;
+
+// Makes a REAL outbound HTTPS call from inside the request coroutine via net/httpsclient (the reactor
+// -native, pure-Nova TLS 1.3 client). `handle` is async, so the upstream handshake + fetch PARK this
+// coroutine while the socket round-trips (no thread blocked). When NOVA_UPSTREAM_CA holds a PEM CA
+// bundle the upstream chain is verified; otherwise the peer is authenticated but the chain is not
+// checked. Returns a small JSON summary (upstream URL, status code, body size).
+pub struct FetchUpstreamHandler impl MessageHandler {
+    async fn handle(self: FetchUpstreamHandler, src: ValueSource): Response {
+        let target = env.get("NOVA_UPSTREAM_URL");
+        if (target == "") { target = "https://localhost:4433/"; }
+        let ca = env.get("NOVA_UPSTREAM_CA");
+        if (ca.length > 0) {
+            let rv = await httpsclient.getVerified(target, ca);
+            return json(`{"upstream":"${target}","verified":true,"code":${rv.code},"bytes":${rv.body.length}}`);
+        }
+        let r = await httpsclient.get(target);
+        return json(`{"upstream":"${target}","verified":false,"code":${r.code},"bytes":${r.body.length}}`);
+    }
+}
