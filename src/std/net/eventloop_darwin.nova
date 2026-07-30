@@ -15,11 +15,8 @@
 // suspended frame; poll() only writes the result field. Nothing here allocates or frees the op/buffer.
 
 import bytes;
-import os.sys;
+import os.socket;
 import os.kqueue;
-
-// macOS/BSD errno for "would block".
-pub const EAGAIN: int = 35;
 
 // Op kinds.
 pub const OP_RECV: int = 0;
@@ -169,23 +166,23 @@ pub struct Poller impl EventLoop {
                 let complete = true;
                 let res = 0;
                 if (kind == OP_RECV) {
-                    let r = sys.read(fd, buf, len as long);
-                    if (r < 0 && sys.errno() == EAGAIN) { complete = false; } else { res = r as int; }
+                    let r = socket.recvSock(fd, buf, len);
+                    if (r < 0 && socket.wouldBlock()) { complete = false; } else { res = r as int; }
                 } else if (kind == OP_SEND) {
-                    let w = sys.write(fd, buf, len as long);
-                    if (w < 0 && sys.errno() == EAGAIN) {
+                    let w = socket.sendSock(fd, buf, len);
+                    if (w < 0 && socket.wouldBlock()) {
                         // spurious writability: re-arm one-shot write and wait again
                         kqueue.registerOne(self.kq, fd, kqueue.EVFILT_WRITE, kqueue.EV_ADD | kqueue.EV_ONESHOT, op);
                         complete = false;
                     } else { res = w as int; }
                 } else if (kind == OP_ACCEPT) {
-                    let c = sys.accept(fd, 0, 0);
-                    if (c < 0 && sys.errno() == EAGAIN) { complete = false; } else {
-                        if (c >= 0) { sys.setNonBlocking(c); }
+                    let c = socket.acceptSock(fd, 0, 0);
+                    if (c < 0 && socket.wouldBlock()) { complete = false; } else {
+                        if (c >= 0) { socket.setNonBlock(c); }
                         res = c;
                     }
                 } else if (kind == OP_CONNECT) {
-                    res = if (sys.soError(fd) == 0) 0 else -1;
+                    res = if (socket.sockError(fd) == 0) 0 else -1;
                 }
                 if (complete) {
                     // Stop the fd refiring for a completed persistent (read) interest.
@@ -209,6 +206,6 @@ pub struct Poller impl EventLoop {
     fn destroy(self: Poller): void {
         if (self.eventBuf != 0) { bytes.free(self.eventBuf); self.eventBuf = 0; }
         if (self.compBuf != 0) { bytes.free(self.compBuf); self.compBuf = 0; }
-        if (self.kq >= 0) { sys.close(self.kq); self.kq = -1; }
+        if (self.kq >= 0) { socket.close(self.kq); self.kq = -1; }
     }
 }

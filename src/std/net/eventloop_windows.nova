@@ -1,0 +1,160 @@
+// net/eventloop: the completion-based EventLoop — WINDOWS (IOCP) variant, selected when
+// platform.os == "windows". Unlike the kqueue/epoll variants (which EMULATE completion over readiness),
+// IOCP is NATIVELY completion-based, so this is the backend the completion-shaped EventLoop trait matches
+// directly: submit() issues an overlapped WSARecv/WSASend and poll() drains finished operations from the
+// completion port with the byte count already filled in. The op record embeds an OVERLAPPED at offset 0,
+// so a completion's lpOverlapped IS the op address.
+//
+// COMPILE-VERIFIED via cross-compilation (this completes the kqueue/epoll/IOCP trilogy at the Nova level).
+// RUNTIME on Windows is NOT yet wired and needs, as follow-ons: (a) the C++ runtime to build for Windows
+// (nova_run_reactors on Windows threads; core.cpp/io.cpp currently use POSIX fcntl/mkdir); (b) each socket
+// associated with the port via CreateIoCompletionPort before I/O (see `associate`); (c) AcceptEx/ConnectEx
+// for accept/connect (recv/send are done here); (d) the reactor's int `kq` cannot hold a 64-bit port
+// HANDLE, so the port is kept full-width here and the int-kq model is revisited for Windows.
+
+import bytes;
+import os.socket;
+import os.winsock;
+import os.windows;
+
+// Op kinds.
+pub const OP_RECV: int = 0;
+pub const OP_SEND: int = 1;
+pub const OP_ACCEPT: int = 2;
+pub const OP_CONNECT: int = 3;
+
+// In-flight op record (96 bytes). Prefixed by an OVERLAPPED so the completion's lpOverlapped == op addr.
+//   [0..32) OVERLAPPED (zeroed per submit)
+//   [32] kind i32   [36] fd i32   [40] buf ptr   [48] len i32   [52] done i32   [56] token ptr
+//   [64] result i64   [72] WSABUF { [72] len i32, [80] buf ptr }   [88] flags i32 (lpFlags scratch)
+pub const OP_SIZE: int = 96;
+
+pub fn makeOp(op: long, kind: int, fd: int, buf: long, len: int, token: long): void {
+    bytes.write_ptr(op, 0, 0);  bytes.write_ptr(op, 8, 0);
+    bytes.write_ptr(op, 16, 0); bytes.write_ptr(op, 24, 0);   // zero the OVERLAPPED
+    bytes.write_i32(op, 32, kind as long);
+    bytes.write_i32(op, 36, fd as long);
+    bytes.write_ptr(op, 40, buf);
+    bytes.write_i32(op, 48, len as long);
+    bytes.write_i32(op, 52, 0);
+    bytes.write_ptr(op, 56, token);
+    bytes.write_ptr(op, 64, 0);
+}
+pub fn opKind(op: long): int { return bytes.read_i32(op, 32) as int; }
+pub fn opFd(op: long): int { return bytes.read_i32(op, 36) as int; }
+pub fn opBuf(op: long): long { return bytes.read_ptr(op, 40); }
+pub fn opLen(op: long): int { return bytes.read_i32(op, 48) as int; }
+pub fn opDone(op: long): int { return bytes.read_i32(op, 52) as int; }
+pub fn opToken(op: long): long { return bytes.read_ptr(op, 56); }
+pub fn opResult(op: long): int { return bytes.read_ptr(op, 64) as int; }
+pub fn setOpResult(op: long, r: int): void { bytes.write_ptr(op, 64, r as long); bytes.write_i32(op, 52, 1); }
+
+// Zero the OVERLAPPED and issue the overlapped I/O for an op. Returns 0 (queued or immediate; the
+// completion arrives on the port either way). accept/connect require AcceptEx/ConnectEx (follow-on).
+fn issue(op: long): int {
+    bytes.write_ptr(op, 0, 0);  bytes.write_ptr(op, 8, 0);
+    bytes.write_ptr(op, 16, 0); bytes.write_ptr(op, 24, 0);
+    let kind = opKind(op);
+    let s = opFd(op) as long;
+    winsock.setWsaBuf(op + 72, opLen(op), opBuf(op));
+    if (kind == OP_RECV) {
+        bytes.write_i32(op, 88, 0);   // lpFlags scratch, must be non-null
+        return winsock.WSARecv(s, (op + 72) as ptr, 1, 0 as ptr, (op + 88) as ptr, op as ptr, 0);
+    } else if (kind == OP_SEND) {
+        return winsock.WSASend(s, (op + 72) as ptr, 1, 0 as ptr, 0, op as ptr, 0);
+    }
+    // OP_ACCEPT / OP_CONNECT: AcceptEx / ConnectEx wiring is a follow-on.
+    return -1;
+}
+
+// Associate a socket with a completion port (once, before its first overlapped I/O). Returns the port
+// handle (or 0 on failure). POSIX backends provide a no-op equivalent so callers can invoke it uniformly.
+pub fn associate(port: long, fd: int): long {
+    return windows.CreateIoCompletionPort(fd as long, port, fd as long, 0);
+}
+
+// submit free fn (reactorio path). The socket must already be associated with the reactor's port; this
+// only starts the overlapped op. The `kq` argument is unused on IOCP (the completion routes via the
+// socket's associated port, not a per-call handle).
+pub fn submit(kq: int, op: long): int { return issue(op); }
+
+// IOCP has no per-fd readiness to cancel; CancelIoEx would be used for a true cancel (follow-on).
+pub fn cancelRead(kq: int, fd: int): void { }
+
+// --- backend-neutral readiness surface: IOCP is completion-only, so these are stubs. The low-level
+// readiness cases (192/194/195/210) are macOS-gated and never run here; these exist so net/reactor links.
+pub const EVENT_SIZE: int = 32;   // OVERLAPPED_ENTRY, so the reactor's event buffer is sized for GQCSEx
+pub fn armRead(kq: int, fd: int, token: long): int { return 0; }
+pub fn armWrite(kq: int, fd: int, token: long): int { return 0; }
+pub fn cancelWrite(kq: int, fd: int): void { }
+pub fn waitReady(kq: int, eventBuf: long, maxEvents: int, timeoutMs: int): int { return 0; }
+pub fn evFd(eventBuf: long, i: int): int { return 0; }
+pub fn evToken(eventBuf: long, i: int): long { return 0 as long; }
+pub fn evBytes(eventBuf: long, i: int): long { return 0 as long; }
+pub fn evEof(eventBuf: long, i: int): bool { return false; }
+pub fn evFilterAt(eventBuf: long, i: int): int { return 0; }
+
+pub trait EventLoop {
+    fn submit(self, op: long): int;
+    fn poll(self, timeoutMs: int): int;
+    fn completedToken(self, i: int): long;
+    fn ok(self): bool;
+    fn destroy(self): void;
+}
+
+// IOCP-backed native completion (Windows).
+pub struct Poller impl EventLoop {
+    pub port: long,          // the completion port HANDLE (full width; does not fit the reactor's int kq)
+    pub kq: int,             // truncated port, for the reactor's shared `kq` field (runtime caveat above)
+    pub eventBuf: long,      // maxEvents * OVERLAPPED_ENTRY_SIZE, drained by GetQueuedCompletionStatusEx
+    pub compBuf: long,       // maxEvents * 8: coroutine tokens to resume
+    pub removedBuf: long,    // ULONG out-param for GQCSEx
+    pub maxEvents: int,
+    pub nComp: int,
+
+    init(maxEvents: int) {
+        winsock.startup();
+        self.port = windows.CreateIoCompletionPort(windows.INVALID_HANDLE, 0, 0, 0);
+        self.kq = self.port as int;
+        self.maxEvents = maxEvents;
+        self.eventBuf = bytes.alloc(maxEvents * windows.OVERLAPPED_ENTRY_SIZE);
+        self.compBuf = bytes.alloc(maxEvents * 8);
+        self.removedBuf = bytes.alloc(4);
+        self.nComp = 0;
+    }
+
+    fn ok(self: Poller): bool { return self.port != (0 as long); }
+
+    fn submit(self: Poller, op: long): int { return issue(op); }
+
+    fn poll(self: Poller, timeoutMs: int): int {
+        self.nComp = 0;
+        bytes.write_i32(self.removedBuf, 0, 0);
+        let ok = windows.GetQueuedCompletionStatusEx(self.port, self.eventBuf, self.maxEvents, self.removedBuf, timeoutMs, 0);
+        if (ok != 0) {
+            let n = bytes.read_i32(self.removedBuf, 0) as int;
+            let i = 0;
+            while (i < n) {
+                let op = windows.entryOverlapped(self.eventBuf, i);
+                if (op != (0 as long)) {
+                    setOpResult(op, windows.entryBytes(self.eventBuf, i));
+                    bytes.write_ptr(self.compBuf, (self.nComp * 8) as long, opToken(op));
+                    self.nComp = self.nComp + 1;
+                }
+                i = i + 1;
+            }
+        }
+        return self.nComp;
+    }
+
+    fn completedToken(self: Poller, i: int): long {
+        return bytes.read_ptr(self.compBuf, (i * 8) as long);
+    }
+
+    fn destroy(self: Poller): void {
+        if (self.eventBuf != 0) { bytes.free(self.eventBuf); self.eventBuf = 0; }
+        if (self.compBuf != 0) { bytes.free(self.compBuf); self.compBuf = 0; }
+        if (self.removedBuf != 0) { bytes.free(self.removedBuf); self.removedBuf = 0; }
+        if (self.port != (0 as long)) { windows.CloseHandle(self.port); self.port = 0; }
+    }
+}

@@ -1,0 +1,87 @@
+// os/socket (Windows override): the backend-neutral socket API over Winsock (os/winsock). Selected when
+// platform.os == "windows". A SOCKET is UINT_PTR; it is truncated to `int` at this boundary to match the
+// reactor's fd model (real handle values fit). Errors come from WSAGetLastError, not errno, and the
+// socket is closed with closesocket. COMPILE-VERIFIED via cross-compilation; runtime verification pending
+// on a Windows host.
+
+import os.winsock;
+import bytes;
+
+pub const AF_INET: int = 2;
+pub const SOCK_STREAM: int = 1;
+
+// Create a TCP socket, ensuring Winsock is initialised first (WSAStartup is idempotent/ref-counted).
+pub fn newTcp(): int {
+    winsock.startup();
+    return winsock.socket(winsock.AF_INET, winsock.SOCK_STREAM, winsock.IPPROTO_TCP) as int;
+}
+pub fn close(fd: int): int { return winsock.closesocket(fd as long); }
+pub fn bindSock(fd: int, addr: ptr, addrlen: int): int { return winsock.bind(fd as long, addr, addrlen); }
+pub fn listenSock(fd: int, backlog: int): int { return winsock.listen(fd as long, backlog); }
+pub fn acceptSock(fd: int, addr: ptr, addrlen: ptr): int { return winsock.accept(fd as long, addr, addrlen) as int; }
+pub fn connectSock(fd: int, addr: ptr, addrlen: int): int { return winsock.connect(fd as long, addr, addrlen); }
+
+// recv/send: read/write do not work on a SOCKET on Windows. Return type is long to match the POSIX base
+// (Winsock recv/send return int; -1/SOCKET_ERROR maps to a negative long).
+pub fn recvSock(fd: int, buf: long, len: int): long { return winsock.recv(fd as long, buf as ptr, len, 0) as long; }
+pub fn sendSock(fd: int, buf: long, len: int): long { return winsock.send(fd as long, buf as ptr, len, 0) as long; }
+
+// Non-blocking via ioctlsocket(FIONBIO, 1).
+pub fn setNonBlock(fd: int): int {
+    let one = bytes.alloc(4);
+    bytes.write_i32(one, 0, 1);
+    let r = winsock.ioctlsocket(fd as long, winsock.FIONBIO, one);
+    bytes.free(one);
+    return r;
+}
+
+pub fn setReuseAddr(fd: int): int {
+    let one = bytes.alloc(4);
+    bytes.write_i32(one, 0, 1);
+    let r = winsock.setsockopt(fd as long, winsock.SOL_SOCKET, winsock.SO_REUSEADDR, one, 4);
+    bytes.free(one);
+    return r;
+}
+// Windows has no SO_REUSEPORT; SO_REUSEADDR gives the closest (shared-port) behaviour there.
+pub fn setReusePort(fd: int): int { return setReuseAddr(fd); }
+
+pub fn sockError(fd: int): int {
+    let val = bytes.alloc(4);
+    let len = bytes.alloc(4);
+    bytes.write_i32(val, 0, 0);
+    bytes.write_i32(len, 0, 4);
+    let r = winsock.getsockopt(fd as long, winsock.SOL_SOCKET, winsock.SO_ERROR, val, len);
+    let e = if (r == 0) (bytes.read_i32(val, 0) as int) else -1;
+    bytes.free(val);
+    bytes.free(len);
+    return e;
+}
+
+pub fn wouldBlock(): bool { return winsock.WSAGetLastError() == winsock.WSAEWOULDBLOCK; }
+
+// A non-blocking connect() in progress reports WSAEWOULDBLOCK on Windows (not EINPROGRESS).
+pub fn connectInProgress(): bool { return winsock.WSAGetLastError() == winsock.WSAEWOULDBLOCK; }
+
+// sockaddr_in layout is identical to POSIX (win uses the same struct); build it inline (htons byte-swap).
+pub fn makeSockaddrIn(port: int, addrBE: long): ptr {
+    let sa = bytes.alloc(16);
+    let i = 0;
+    while (i < 16) { bytes.write_byte(sa, i, 0); i = i + 1; }
+    bytes.write_u16(sa, 0, AF_INET as long);
+    let lo = port & 255;
+    let hi = (port >> 8) & 255;
+    bytes.write_u16(sa, 2, ((lo << 8) | hi) as long);
+    bytes.write_i32(sa, 4, addrBE);
+    return sa;
+}
+pub fn boundPort(fd: int): int {
+    let sa = bytes.alloc(16);
+    let len = bytes.alloc(4);
+    bytes.write_i32(len, 0, 16);
+    let r = winsock.getsockname(fd as long, sa, len);
+    let raw = bytes.read_u16(sa, 2) as int;
+    let p = if (r == 0) (((raw & 255) << 8) | ((raw >> 8) & 255)) else -1;
+    bytes.free(sa);
+    bytes.free(len);
+    return p;
+}

@@ -1,0 +1,78 @@
+// os/socket: the backend-neutral socket API for the reactor (step 3 of the cross-platform reactor). This
+// is the POSIX base (macOS + Linux) over os/sys; os/socket_windows.nova overrides it on Windows (Winsock).
+// Splitting socket ops into their own module resolves the long-deferred collision between os/sys's bare
+// `socket` extern and the `socket` MODULE (net/tcp/socket), and gives the reactor one socket surface whose
+// Windows implementation speaks SOCKET handles + WSAGetLastError instead of fds + errno.
+//
+// Handles are `int` (fd) here; the Windows variant truncates SOCKET (UINT_PTR) to int at this boundary —
+// real socket-handle values fit, and keeping int avoids an int->long migration across the reactor stack.
+//
+// The socket-option constants (SOL_SOCKET/SO_ERROR/SO_REUSEPORT) and EAGAIN differ between macOS and
+// Linux; this file selects them by platform.os so it is correct on both (os/sys hardcodes the macOS
+// values). No divergent externs are involved, so the platform branches compile on every target.
+
+import os.sys;
+import platform;
+import bytes;
+
+pub const AF_INET: int = 2;
+pub const SOCK_STREAM: int = 1;
+
+fn eagain(): int { return if (platform.isLinux) 11 else 35; }
+fn solSocket(): int { return if (platform.isLinux) 1 else 65535; }
+fn soErrorOpt(): int { return if (platform.isLinux) 4 else 4103; }
+fn soReusePort(): int { return if (platform.isLinux) 15 else 512; }
+const SO_REUSEADDR: int = 4;
+
+pub fn newTcp(): int { return sys.socket(AF_INET, SOCK_STREAM, 0); }
+pub fn close(fd: int): int { return sys.close(fd); }
+pub fn bindSock(fd: int, addr: ptr, addrlen: int): int { return sys.bind(fd, addr, addrlen); }
+pub fn listenSock(fd: int, backlog: int): int { return sys.listen(fd, backlog); }
+pub fn acceptSock(fd: int, addr: ptr, addrlen: ptr): int { return sys.accept(fd, addr, addrlen); }
+pub fn connectSock(fd: int, addr: ptr, addrlen: int): int { return sys.connect(fd, addr, addrlen); }
+
+// recv/send: on POSIX read/write work on sockets, so they back these directly. The Windows variant maps
+// them to recv/send (read/write do not work on a SOCKET).
+pub fn recvSock(fd: int, buf: long, len: int): long { return sys.read(fd, buf, len as long); }
+pub fn sendSock(fd: int, buf: long, len: int): long { return sys.write(fd, buf, len as long); }
+
+pub fn setNonBlock(fd: int): int { return sys.setNonBlocking(fd); }
+
+pub fn setReuseAddr(fd: int): int {
+    let one = bytes.alloc(4);
+    bytes.write_i32(one, 0, 1);
+    let r = sys.setsockopt(fd, solSocket(), SO_REUSEADDR, one, 4);
+    bytes.free(one);
+    return r;
+}
+pub fn setReusePort(fd: int): int {
+    let one = bytes.alloc(4);
+    bytes.write_i32(one, 0, 1);
+    let r = sys.setsockopt(fd, solSocket(), soReusePort(), one, 4);
+    bytes.free(one);
+    return r;
+}
+
+// Pending socket error via getsockopt(SO_ERROR): 0 = connect succeeded, non-zero = failure.
+pub fn sockError(fd: int): int {
+    let val = bytes.alloc(4);
+    let len = bytes.alloc(4);
+    bytes.write_i32(val, 0, 0);
+    bytes.write_i32(len, 0, 4);
+    let r = sys.getsockopt(fd, solSocket(), soErrorOpt(), val, len);
+    let e = if (r == 0) (bytes.read_i32(val, 0) as int) else -1;
+    bytes.free(val);
+    bytes.free(len);
+    return e;
+}
+
+// True if the last socket call failed only because it would block (the reactor's "await readiness" cue).
+pub fn wouldBlock(): bool { return sys.errno() == eagain(); }
+
+// True if a non-blocking connect() is still in progress (await writability, then check sockError).
+fn einprogress(): int { return if (platform.isLinux) 115 else 36; }
+pub fn connectInProgress(): bool { return sys.errno() == einprogress(); }
+
+// sockaddr_in helpers (pure byte layout; identical on every platform).
+pub fn makeSockaddrIn(port: int, addrBE: long): ptr { return sys.makeSockaddrIn(port, addrBE); }
+pub fn boundPort(fd: int): int { return sys.boundPort(fd); }

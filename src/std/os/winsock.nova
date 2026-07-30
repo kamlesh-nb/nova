@@ -1,0 +1,65 @@
+// os/winsock: Winsock2 (ws2_32) for the reactor on Windows (step 3; windows-only). On Windows a socket is
+// a SOCKET (UINT_PTR, `long` here), NOT a file descriptor: read/write/close do not apply — recv/send and
+// closesocket do — and errors come from WSAGetLastError, not errno. os/socket_windows wraps these behind
+// the backend-neutral socket API. COMPILE-VERIFIED via cross-compilation; runtime verification pending on
+// a Windows host. Link needs -lws2_32 (added in the IOCP build step).
+
+import bytes;
+
+// Address family / socket type (same numeric values as POSIX).
+pub const AF_INET: int = 2;
+pub const SOCK_STREAM: int = 1;
+pub const IPPROTO_TCP: int = 6;
+
+// Option level/names — Windows values (differ from Linux; match macOS for SOL_SOCKET/SO_ERROR).
+pub const SOL_SOCKET: int = 65535;       // 0xffff
+pub const SO_REUSEADDR: int = 4;
+pub const SO_ERROR: int = 4103;          // 0x1007
+pub const SOMAXCONN: int = 128;
+
+// ioctlsocket command for non-blocking mode (FIONBIO). It is 0x8004667E (a _IOW-encoded long).
+pub const FIONBIO: long = 2147772030;
+
+pub const INVALID_SOCKET: long = -1;
+pub const SOCKET_ERROR: int = -1;
+pub const WSAEWOULDBLOCK: int = 10035;
+
+pub extern("c") fn WSAStartup(wVersionRequested: int, lpWSAData: ptr): int;
+pub extern("c") fn WSACleanup(): int;
+pub extern("c") fn WSAGetLastError(): int;
+
+// SOCKET-returning / SOCKET-taking calls (SOCKET is pointer-sized -> long).
+pub extern("c") fn socket(af: int, type_: int, protocol: int): long;
+pub extern("c") fn closesocket(s: long): int;
+pub extern("c") fn bind(s: long, addr: ptr, namelen: int): int;
+pub extern("c") fn listen(s: long, backlog: int): int;
+pub extern("c") fn accept(s: long, addr: ptr, addrlen: ptr): long;
+pub extern("c") fn connect(s: long, name: ptr, namelen: int): int;
+pub extern("c") fn recv(s: long, buf: ptr, len: int, flags: int): int;
+pub extern("c") fn send(s: long, buf: ptr, len: int, flags: int): int;
+pub extern("c") fn setsockopt(s: long, level: int, optname: int, optval: ptr, optlen: int): int;
+pub extern("c") fn getsockopt(s: long, level: int, optname: int, optval: ptr, optlen: ptr): int;
+pub extern("c") fn getsockname(s: long, addr: ptr, addrlen: ptr): int;
+pub extern("c") fn ioctlsocket(s: long, cmd: long, argp: ptr): int;
+
+// Overlapped I/O (the IOCP backend, step 4). WSABUF is { u_long len; char* buf } = 16 bytes on x64
+// (4 bytes len + 4 padding + 8 ptr). completionRoutine is null (0) for IOCP-notified overlapped ops.
+pub const WSABUF_SIZE: int = 16;
+pub fn setWsaBuf(wb: ptr, len: int, buf: long): void {
+    bytes.write_i32(wb, 0, len as long);
+    bytes.write_ptr(wb, 8, buf);
+}
+pub extern("c") fn WSARecv(s: long, buffers: ptr, bufferCount: int, lpBytesRecvd: ptr, lpFlags: ptr, lpOverlapped: ptr, completionRoutine: long): int;
+pub extern("c") fn WSASend(s: long, buffers: ptr, bufferCount: int, lpBytesSent: ptr, dwFlags: int, lpOverlapped: ptr, completionRoutine: long): int;
+
+// WSAStartup wants MAKEWORD(2,2) = 0x0202 and a WSADATA out-buffer (~408 bytes on x64; 512 is safe).
+pub const WSADATA_SIZE: int = 512;
+pub const WINSOCK_VERSION: int = 514;    // 0x0202
+
+// Initialise Winsock (idempotent; ref-counted by the OS). Returns 0 on success.
+pub fn startup(): int {
+    let d = bytes.alloc(WSADATA_SIZE);
+    let r = WSAStartup(WINSOCK_VERSION, d);
+    bytes.free(d);
+    return r;
+}

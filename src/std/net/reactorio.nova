@@ -15,6 +15,7 @@
 
 import bytes;
 import os.sys;
+import os.socket;
 import net.eventloop;
 
 // errno values are platform-specific. macOS/BSD values here; Linux (EAGAIN=11, EINPROGRESS=115)
@@ -186,7 +187,7 @@ pub struct ReactorStream {
     pub fn close(self: ReactorStream): void {
         if (self.fd >= 0) {
             eventloop.cancelRead(self.kq, self.fd);
-            sys.close(self.fd);
+            socket.close(self.fd);
             self.fd = -1;
         }
     }
@@ -198,21 +199,21 @@ pub struct ReactorStream {
 pub async fn reactorConnect(host: string, port: int, kq: int): ReactorStream {
     let addr = resolveHost4(host);
     if (addr == (-1 as long)) { return ReactorStream(-1, kq); }
-    let fd = sys.socket(sys.AF_INET, sys.SOCK_STREAM, 0);
+    let fd = socket.newTcp();
     if (fd < 0) { return ReactorStream(-1, kq); }
-    sys.setNonBlocking(fd);
-    let sa = sys.makeSockaddrIn(port, addr);
-    let r = sys.connect(fd, sa, 16);
+    socket.setNonBlock(fd);
+    let sa = socket.makeSockaddrIn(port, addr);
+    let r = socket.connectSock(fd, sa, 16);
     bytes.free(sa);
     if (r != 0) {
-        if (sys.errno() != EINPROGRESS) { sys.close(fd); return ReactorStream(-1, kq); }
+        if (!socket.connectInProgress()) { socket.close(fd); return ReactorStream(-1, kq); }
         let op = bytes.alloc(eventloop.OP_SIZE);
         eventloop.makeOp(op, eventloop.OP_CONNECT, fd, 0, 0, currentCoro());
         eventloop.submit(kq, op);
         coroSuspend();
         let res = eventloop.opResult(op);
         bytes.free(op);
-        if (res != 0) { sys.close(fd); return ReactorStream(-1, kq); }
+        if (res != 0) { socket.close(fd); return ReactorStream(-1, kq); }
     }
     return ReactorStream(fd, kq);
 }
