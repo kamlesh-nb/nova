@@ -151,6 +151,8 @@ pub struct Client12Bio impl TlsBio {
         bytes.free(self.scratch);
         bytes.free(self.plain);
     }
+    // TLS 1.2 does not negotiate ALPN here.
+    pub fn selectedAlpn(self: Client12Bio): string { return ""; }
 }
 
 // Build a fresh TLS 1.2 client bio for `host` (SNI); the ClientHello is queued for the first pull().

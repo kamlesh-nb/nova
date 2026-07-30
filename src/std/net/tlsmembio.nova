@@ -137,6 +137,7 @@ pub trait TlsBio {
     fn writeApp(self, data: ptr, n: int): int;
     fn readApp(self, buf: ptr, max: int): int;
     fn closeBio(self): void;
+    fn selectedAlpn(self): string;      // negotiated ALPN protocol ("" if none / not applicable)
 }
 
 // ---- client role ----
