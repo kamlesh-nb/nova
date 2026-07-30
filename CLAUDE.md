@@ -31,6 +31,36 @@ conformance/run.sh --arc        # ARC leak gate (baseline-gated)
 NOVA_ARC_AUDIT=1 nova test f    # per-run ARC audit ("ARC audit: clean" or survivors)
 ```
 
+## Working on Windows — read this first if the repo is cloned on a Windows host
+
+**Native Windows builds of the `nova` compiler are NOT wired up. Do not expect `zig build` to work on a
+bare Windows host — it will fail.** Two hard blockers:
+- `build.zig`'s install step runs `sh -c` with `rsync`/`mkdir -p` (around line 448), so it needs a Unix
+  shell + rsync on PATH (Git Bash / MSYS2) at minimum.
+- The static LLVM the compiler links is only configured for **macOS and Linux hosts**
+  (`build.zig` `configureLlvmLink`); there is **no Windows-host LLVM dist**, so the compiler cannot link
+  itself on Windows.
+
+**→ The comfortable path on a Windows machine is WSL2 (Ubuntu).** Clone the repo *inside* WSL, install
+**Zig 0.16**, and use the normal Linux flow — `zig build`, `nova <file>.nova`, `conformance/run.sh`,
+`conformance/run.sh --asan` all work there (Linux is a first-class, gated target). Develop in WSL; treat
+the Windows side as a *target*, not a dev host. (Before cloning, `git config --global core.autocrlf input`
+so the bash scripts and `.nova` sources keep LF.)
+
+**What "Windows support" currently means: cross-compilation, not native dev.** From macOS / Linux / WSL,
+`nova app.nova --target windows-x86_64` produces a real **PE32+ .exe** — the C++ runtime and the full
+reactor stack cross-compile and link (adds `-lws2_32 -lmswsock -lbcrypt`). This is **compile+link
+verified only**: runtime EXECUTION on Windows — especially the async reactor (the IOCP `Poller`,
+`nova_run_reactors` on Windows threads, socket→port association, `AcceptEx`/`ConnectEx`) — has **not**
+been run-verified (there is no Windows host in the loop). Non-async programs are the most likely to run;
+the reactor is the risky part. See `docs/design/cpp-runtime-retirement-plan.md` and the reactor design
+notes for exactly what is stubbed vs done.
+
+**If asked to make `zig build` run natively on a Windows host** (not just cross-compile *to* Windows), the
+two unstarted pieces are: (1) replace the `sh`/`rsync` install step with a cross-platform copy (a small
+Zig `Step` or per-OS branch), and (2) add a Windows-host static-LLVM dist to `configureLlvmLink` (mirror
+the linux/macos entries). Until both exist, direct Windows-host development is not possible; use WSL.
+
 ## Layout
 
 - `src/` — lexer, parser, `type_checker.zig`, **`sema/`** (infer/mono/ownership/lower/symbols — the
