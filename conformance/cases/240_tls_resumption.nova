@@ -1,0 +1,50 @@
+// TLS 1.3 resumption (RFC 8446 2.2, 4.2.11): the pre_shared_key binder in a resumption ClientHello.
+// This locks the binder transcript truncation, which must end "up to and including the identities field"
+// (RFC 8446 4.2.11.2) - i.e. it excludes the entire binders vector INCLUDING its 2-byte length, not just
+// the binder entry. Getting that boundary wrong makes a real server reject the binder. The
+// resumption_master_secret and per-ticket PSK derivation are checked against RFC 8448 in case 232; the
+// live resume round-trip is verified against openssl s_server.
+import crypto.tls.13.tlsClient;
+import bytes;
+import assert;
+
+fn eqHex(buf: ptr, n: int, hex: string): bool {
+    if (hex.length != n * 2) { return false; }
+    let i = 0;
+    while (i < n) {
+        let hi = hex[i * 2]; let lo = hex[i * 2 + 1];
+        let hv = 0; if (hi >= 97) { hv = hi - 87; } else { hv = hi - 48; }
+        let lv = 0; if (lo >= 97) { lv = lo - 87; } else { lv = lo - 48; }
+        if (bytes.read_byte(buf, i) != hv * 16 + lv) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// A resumption ClientHello (fixed inputs) carries a binder over the correctly truncated transcript.
+@test
+fn resumption_binder_offset(): void {
+    let psk = bytes.alloc(32);
+    let i = 0; while (i < 32) { bytes.write_byte(psk, i, 0x42); i = i + 1; }
+    let ticket = bytes.alloc(4);
+    bytes.write_byte(ticket, 0, 0xca); bytes.write_byte(ticket, 1, 0xfe);
+    bytes.write_byte(ticket, 2, 0xf0); bytes.write_byte(ticket, 3, 0x0d);
+    let c = tlsClient.newClientResume(bytes.alloc(32), bytes.alloc(32), psk, 32, 0, ticket, 4, 0);
+
+    let rnd = bytes.alloc(32); let sid = bytes.alloc(32); let pk = bytes.alloc(32);
+    let pkP = bytes.alloc(65); bytes.write_byte(pkP, 0, 4);
+    let empty = bytes.alloc(1);
+    let out = bytes.alloc(2048);
+    let n = tlsClient.buildClientHelloEx(rnd, sid, pk, pkP, "localhost", "", 3, empty, 0, ticket, 4, 0, 32, out);
+    c.fillResumptionBinder(out, n);
+
+    // The binder is the last 32 bytes. Reference computed independently (HMAC over the transcript hash of
+    // out[0 .. n-35], keyed by finished_key(res binder key(early_secret(PSK)))).
+    assert.equalInt(n, 298);
+    assert.isTrue(eqHex((out as long + n - 32) as ptr, 32,
+        "7e5d4c597776de8deee80fb668bd57dd45a48d57a38a1a6a78cc1cfe15396c5a"));
+    // The byte just before the binder entry (out[n-33]) is the binder-entry length (0x20 = 32).
+    assert.equalInt(bytes.read_byte(out, n - 33), 0x20);
+    // and out[n-35..n-34] is the binders-list length (0x0021 = 33), excluded from the binder transcript.
+    assert.equalInt((bytes.read_byte(out, n - 35) << 8) | bytes.read_byte(out, n - 34), 0x0021);
+}

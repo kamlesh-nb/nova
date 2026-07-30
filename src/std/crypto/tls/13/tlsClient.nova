@@ -12,6 +12,7 @@ import crypto.ecc.p256;
 import crypto.x509;
 import crypto.hash.sha256;
 import crypto.hash.sha512;
+import crypto.mac.hmac;
 
 fn at(buf: ptr, off: int): ptr { return (buf as long + off) as ptr; }
 
@@ -77,7 +78,7 @@ fn putSni(out: ptr, p: int, host: string): int {
 // application_layer_protocol_negotiation extension. Returns the message length.
 pub fn buildClientHello(random: ptr, sessionId: ptr, ephPub: ptr, ephPubP256: ptr, host: string, alpn: string, out: ptr): int {
     let empty = bytes.alloc(1);
-    let n = buildClientHelloEx(random, sessionId, ephPub, ephPubP256, host, alpn, 3, empty, 0, out);
+    let n = buildClientHelloEx(random, sessionId, ephPub, ephPubP256, host, alpn, 3, empty, 0, empty, 0, 0, 0, out);
     bytes.free(empty);
     return n;
 }
@@ -88,7 +89,8 @@ pub fn buildClientHello(random: ptr, sessionId: ptr, ephPub: ptr, ephPubP256: pt
 // when cookieLen > 0. A ClientHello2 (the retry) sets groupMask to just the server-selected group and
 // carries the cookie; everything else matches the first ClientHello.
 pub fn buildClientHelloEx(random: ptr, sessionId: ptr, ephPub: ptr, ephPubP256: ptr, host: string, alpn: string,
-                          groupMask: int, cookie: ptr, cookieLen: int, out: ptr): int {
+                          groupMask: int, cookie: ptr, cookieLen: int,
+                          pskTicket: ptr, pskTicketLen: int, obfAge: long, binderLen: int, out: ptr): int {
     let p = 4;                                     // reserve the 4-byte handshake header
     bytes.write_byte(out, p, 0x03); bytes.write_byte(out, p + 1, 0x03); p = p + 2;   // legacy_version
     let i = 0;
@@ -140,6 +142,28 @@ pub fn buildClientHelloEx(random: ptr, sessionId: ptr, ephPub: ptr, ephPubP256: 
     bytes.write_byte(out, ksListLenPos, (ksListLen >> 8) & 0xff); bytes.write_byte(out, ksListLenPos + 1, ksListLen & 0xff);
     let ksExtLen = p - (ksExtLenPos + 2);
     bytes.write_byte(out, ksExtLenPos, (ksExtLen >> 8) & 0xff); bytes.write_byte(out, ksExtLenPos + 1, ksExtLen & 0xff);
+
+    // pre_shared_key (RFC 8446 4.2.11) MUST be the LAST extension. The binder value is left zeroed here;
+    // the caller fills it via fillResumptionBinder once the truncated-ClientHello transcript is known.
+    if (binderLen > 0) {
+        bytes.write_byte(out, p, 0x00); bytes.write_byte(out, p + 1, 0x29); p = p + 2;   // ext_type: pre_shared_key
+        let idLen = 2 + pskTicketLen + 4;              // one PskIdentity: opaque<2> ticket + uint32 age
+        let bindersLen = 1 + binderLen;                // one PskBinderEntry: opaque<1> value
+        let pskExtLen = 2 + idLen + 2 + bindersLen;
+        bytes.write_byte(out, p, (pskExtLen >> 8) & 0xff); bytes.write_byte(out, p + 1, pskExtLen & 0xff); p = p + 2;
+        bytes.write_byte(out, p, (idLen >> 8) & 0xff); bytes.write_byte(out, p + 1, idLen & 0xff); p = p + 2;
+        bytes.write_byte(out, p, (pskTicketLen >> 8) & 0xff); bytes.write_byte(out, p + 1, pskTicketLen & 0xff); p = p + 2;
+        let ti = 0;
+        while (ti < pskTicketLen) { bytes.write_byte(out, p + ti, bytes.read_byte(pskTicket, ti)); ti = ti + 1; }
+        p = p + pskTicketLen;
+        bytes.write_byte(out, p, ((obfAge >> 24) & 0xff) as int); bytes.write_byte(out, p + 1, ((obfAge >> 16) & 0xff) as int);
+        bytes.write_byte(out, p + 2, ((obfAge >> 8) & 0xff) as int); bytes.write_byte(out, p + 3, (obfAge & 0xff) as int); p = p + 4;
+        bytes.write_byte(out, p, (bindersLen >> 8) & 0xff); bytes.write_byte(out, p + 1, bindersLen & 0xff); p = p + 2;
+        bytes.write_byte(out, p, binderLen); p = p + 1;
+        let bz = 0;
+        while (bz < binderLen) { bytes.write_byte(out, p + bz, 0); bz = bz + 1; }
+        p = p + binderLen;
+    }
 
     let extLen = p - extStart;
     bytes.write_byte(out, extLenPos, (extLen >> 8) & 0xff);
@@ -201,6 +225,11 @@ struct TlsClient {
     pub certListOff: int, pub certListLen: int,   // certificate_list region within hsBuf
     pub alpnSel: string,                          // ALPN protocol the server selected ("" = none)
     pub hrrCookie: ptr, pub hrrCookieLen: int,    // cookie echoed from a HelloRetryRequest (len 0 = none)
+    pub resMaster: ptr,                           // resumption_master_secret (derived at handshake end)
+    pub ticket: ptr, pub ticketLen: int,          // a received (or offered) session ticket
+    pub ticketPsk: ptr, pub ticketAgeAdd: long,   // its derived PSK + ticket_age_add
+    pub ticketKind: int, pub haveTicket: bool,    // the PSK's hash (0 SHA-256 / 1 SHA-384) + presence
+    pub offerPsk: bool, pub pskAccepted: bool,    // this handshake offers a PSK / the server accepted it
 }
 
 pub fn newClient(ephPriv: ptr, ephPrivP256: ptr): TlsClient {
@@ -213,7 +242,30 @@ pub fn newClient(ephPriv: ptr, ephPrivP256: ptr): TlsClient {
         sSeq: 0, cSeq: 0, certVerifyOk: false, finishedOk: false,
         hsBuf: bytes.alloc(8192), hsCap: 8192, hsLen: 0, hsPos: 0, leafOff: 0, leafLen: 0,
         certListOff: 0, certListLen: 0, alpnSel: "", hrrCookie: bytes.alloc(1), hrrCookieLen: 0,
+        resMaster: bytes.alloc(48), ticket: bytes.alloc(1), ticketLen: 0, ticketPsk: bytes.alloc(48),
+        ticketAgeAdd: 0, ticketKind: 0, haveTicket: false, offerPsk: false, pskAccepted: false,
     };
+}
+
+// A client that resumes with a previously issued ticket: it offers the PSK (pre_shared_key) alongside the
+// normal (EC)DHE key_share. `psk` is the resumption PSK (pskLen bytes = the ticket's hash length), `kind`
+// its hash (0 SHA-256 / 1 SHA-384), `ticket` the opaque ticket identity, and `ageAdd` the ticket_age_add.
+pub fn newClientResume(ephPriv: ptr, ephPrivP256: ptr, psk: ptr, pskLen: int, kind: int,
+                       ticket: ptr, ticketLen: int, ageAdd: long): TlsClient {
+    let c = newClient(ephPriv, ephPrivP256);
+    c.offerPsk = true;
+    c.haveTicket = true;
+    c.ticketKind = kind;
+    c.kind = kind;
+    bytes.free(c.ticketPsk); c.ticketPsk = bytes.alloc(pskLen);
+    let i = 0;
+    while (i < pskLen) { bytes.write_byte(c.ticketPsk, i, bytes.read_byte(psk, i)); i = i + 1; }
+    bytes.free(c.ticket); c.ticket = bytes.alloc(ticketLen);
+    i = 0;
+    while (i < ticketLen) { bytes.write_byte(c.ticket, i, bytes.read_byte(ticket, i)); i = i + 1; }
+    c.ticketLen = ticketLen;
+    c.ticketAgeAdd = ageAdd;
+    return c;
 }
 
 // Process a HelloRetryRequest (RFC 8446 sections 4.1.4 + 4.4.1). Parses the selected cipher suite (which
@@ -313,7 +365,15 @@ pub fn processServerHello(self: TlsClient, shMsg: ptr, shLen: int): void {
     let ecdhe = bytes.alloc(32);
     if (group == 0x0017) { p256.ecdh(ecdhe, self.ephP256, serverPub); }
     else { x25519.scalarMult(ecdhe, self.eph, serverPub); }
-    let early = bytes.alloc(48); tls.earlySecret(self.kind, early);
+    // Early Secret: keyed by the resumption PSK when we offered one and the server accepted it
+    // (pre_shared_key echoed), otherwise the all-zero PSK. psk_dhe_ke mixes the ECDHE in either way.
+    let early = bytes.alloc(48);
+    if (self.offerPsk && handshake.serverAcceptedPsk(shMsg, shLen)) {
+        self.pskAccepted = true;
+        tls.earlySecretPsk(self.kind, self.ticketPsk, trHashLen(self), early);
+    } else {
+        tls.earlySecret(self.kind, early);
+    }
     let derived = bytes.alloc(48); tls.deriveDerived(self.kind, early, derived);
     tls.extractSecret(self.kind, derived, ecdhe, 32, self.hs);
 
@@ -470,7 +530,19 @@ pub fn clientFinished(self: TlsClient, vdOut: ptr): void {
     tls.deriveTraffic(self.kind, self.master, "s ap traffic", hSF, self.sap);
     tls.deriveKeyIv(self.kind, self.suite, self.cap, self.capKey, self.capIv);
     tls.deriveKeyIv(self.kind, self.suite, self.sap, self.sapKey, self.sapIv);
-    bytes.free(hSF);
+
+    // resumption_master_secret = Derive-Secret(master, "res master", ClientHello...client Finished).
+    // Append the client Finished message to the transcript, then hash it (this closes the transcript).
+    let hl = trHashLen(self);
+    let cf = bytes.alloc(4 + hl);
+    bytes.write_byte(cf, 0, 0x14); bytes.write_byte(cf, 1, 0); bytes.write_byte(cf, 2, 0); bytes.write_byte(cf, 3, hl);
+    let ci = 0;
+    while (ci < hl) { bytes.write_byte(cf, 4 + ci, bytes.read_byte(vdOut, ci)); ci = ci + 1; }
+    trAdd(self, cf, 4 + hl);
+    let hCF = bytes.alloc(hl);
+    trHash(self, hCF);
+    tls.deriveResMaster(self.kind, self.master, hCF, self.resMaster);
+    bytes.free(cf); bytes.free(hCF); bytes.free(hSF);
 }
 
 // Wrap the client Finished verify_data as an encrypted handshake record (using the client handshake
@@ -582,3 +654,65 @@ pub fn selectedAlpn(self: TlsClient): string { return self.alpnSel; }
 
 // Hash of the current running transcript with the negotiated suite hash (exposed for tests / diagnostics).
 pub fn transcriptHashInto(self: TlsClient, out: ptr): void { trHash(self, out); }
+
+// ---- resumption (RFC 8446 2.2, 4.2.11, 4.6.1) ----
+
+// Compute and write the PSK binder into a resumption ClientHello that buildClientHelloEx left zeroed.
+// The binder is HMAC(finished_key, Transcript-Hash(truncated ClientHello)), where the truncation removes
+// the binder entry (its value and 1-byte length) but keeps everything up to the binders-list length. The
+// transcript also includes any prior handshake messages (empty for a first-flight resumption).
+pub fn fillResumptionBinder(self: TlsClient, out: ptr, chLen: int): void {
+    let hl = trHashLen(self);
+    // Truncate() ends "up to and including the identities field" (RFC 8446 4.2.11.2): exclude the binder
+    // value (hl), its 1-byte length, AND the 2-byte binders-list length.
+    let truncLen = chLen - hl - 3;
+    let tmp = bytes.alloc(self.trLen + truncLen);
+    let i = 0;
+    while (i < self.trLen) { bytes.write_byte(tmp, i, bytes.read_byte(self.trBuf, i)); i = i + 1; }
+    let j = 0;
+    while (j < truncLen) { bytes.write_byte(tmp, self.trLen + j, bytes.read_byte(out, j)); j = j + 1; }
+    let th = bytes.alloc(hl);
+    if (self.kind == 1) { sha512.hash384Into(tmp, self.trLen + truncLen, th); }
+    else { sha256.hashInto(tmp, self.trLen + truncLen, th); }
+    let es = bytes.alloc(hl); tls.earlySecretPsk(self.kind, self.ticketPsk, hl, es);
+    let bk = bytes.alloc(hl); tls.deriveResBinderKey(self.kind, es, bk);
+    let fk = bytes.alloc(hl); handshake.finishedKey(self.kind, bk, fk);
+    let binder = bytes.alloc(hl);
+    if (self.kind == 1) { hmac.hmacSha384(fk, hl, th, hl, binder); }
+    else { hmac.hmacSha256(fk, hl, th, hl, binder); }
+    let k = 0;
+    while (k < hl) { bytes.write_byte(out, chLen - hl + k, bytes.read_byte(binder, k)); k = k + 1; }
+    bytes.free(tmp); bytes.free(th); bytes.free(es); bytes.free(bk); bytes.free(fk); bytes.free(binder);
+}
+
+// Parse a NewSessionTicket (RFC 8446 4.6.1) and derive its PSK from resumption_master_secret. `buf` holds
+// the handshake message and `off` its start (the 0x04 type byte). Stores the ticket, PSK, and
+// ticket_age_add for a later resumption; getters below hand them to a session cache.
+pub fn parseNewSessionTicket(self: TlsClient, buf: ptr, off: int): void {
+    let p = off + 4;                               // skip handshake header
+    p = p + 4;                                     // ticket_lifetime (unused here)
+    let ageAdd = ((bytes.read_byte(buf, p) as long) << 24) | ((bytes.read_byte(buf, p + 1) as long) << 16)
+               | ((bytes.read_byte(buf, p + 2) as long) << 8) | (bytes.read_byte(buf, p + 3) as long);
+    p = p + 4;
+    let nonceLen = bytes.read_byte(buf, p); p = p + 1;
+    let noncePos = p; p = p + nonceLen;
+    let tlen = (bytes.read_byte(buf, p) << 8) | bytes.read_byte(buf, p + 1); p = p + 2;
+    let tpos = p;
+    bytes.free(self.ticket);
+    self.ticket = bytes.alloc(tlen);
+    let i = 0;
+    while (i < tlen) { bytes.write_byte(self.ticket, i, bytes.read_byte(buf, tpos + i)); i = i + 1; }
+    self.ticketLen = tlen;
+    self.ticketAgeAdd = ageAdd;
+    self.ticketKind = self.kind;
+    tls.deriveResumptionPsk(self.kind, self.resMaster, (buf as long + noncePos) as ptr, nonceLen, self.ticketPsk);
+    self.haveTicket = true;
+}
+
+pub fn ticketPtr(self: TlsClient): ptr { return self.ticket; }
+pub fn ticketSize(self: TlsClient): int { return self.ticketLen; }
+pub fn ticketPskPtr(self: TlsClient): ptr { return self.ticketPsk; }
+pub fn ticketAge(self: TlsClient): long { return self.ticketAgeAdd; }
+pub fn ticketHashKind(self: TlsClient): int { return self.ticketKind; }
+pub fn hasTicket(self: TlsClient): bool { return self.haveTicket; }
+pub fn pskWasAccepted(self: TlsClient): bool { return self.pskAccepted; }

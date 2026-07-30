@@ -119,6 +119,29 @@ fn tampered_flight(): void {
     assert.isTrue(!c.processFlight(rec, 679));
 }
 
+// Resumption (RFC 8448 section 3): the resumption_master_secret and the PSK derived from a
+// NewSessionTicket nonce match the RFC trace.
+const RES_MASTER: string = "7df235f2031d2a051287d02b0241b0bfdaf86cc856231f2d5aba46c434ec196c";
+const RES_PSK: string = "4ecd0eb6ec3b4d87f5d6028f922ca4c5851a277fd41311c9e62d2c9492e1c4f3";
+
+@test
+fn resumption_master_and_psk(): void {
+    let c = tlsClient.newClient(hexBuf(CLIENT_PRIV), bytes.alloc(32));
+    c.addClientHello(hexBuf(CH), 196);
+    c.processServerHello(hexBuf(SH), 90);
+    assert.isTrue(c.processFlight(hexBuf(REC), 679));
+    let vd = bytes.alloc(32);
+    c.clientFinished(vd);                          // derives resumption_master_secret
+    assert.isTrue(eqHex(c.resMaster, 32, RES_MASTER));
+    // NewSessionTicket with ticket_nonce = 00 00 (as in RFC 8448); parse it to derive the PSK.
+    // 04 000013 | lifetime 00093a80 | age_add deadbeef | nonce_len 02 nonce 0000 |
+    // ticket_len 0004 ticket cafef00d | ext_len 0000
+    let nst = hexBuf("0400001300093a80deadbeef0200000004cafef00d0000");
+    c.parseNewSessionTicket(nst, 0);
+    assert.isTrue(eqHex(c.ticketPskPtr(), 32, RES_PSK));
+    assert.equalInt(c.ticketSize(), 4);
+}
+
 // KeyUpdate (RFC 8446 section 7.2): rotating the server application traffic secret matches the reference
 // HKDF-Expand-Label(secret, "traffic upd", "") and resets the server record sequence.
 const S_AP_UPD: string = "51921b8aa3001976eb401d0a4319a8516416a6c56001a357e5d162031e84f916";

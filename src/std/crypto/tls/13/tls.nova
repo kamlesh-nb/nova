@@ -50,6 +50,27 @@ pub fn earlySecret(kind: int, out: ptr): void {
     bytes.free(z);
 }
 
+// Early Secret with a resumption PSK = HKDF-Extract(salt = 0, IKM = PSK). Used by both the binder
+// derivation and (on an accepted resumption) the handshake key schedule.
+pub fn earlySecretPsk(kind: int, psk: ptr, pskLen: int, out: ptr): void {
+    let hl = hkdf.hashLen(kind);
+    let z = bytes.alloc(hl);
+    let i = 0;
+    while (i < hl) { bytes.write_byte(z, i, 0); i = i + 1; }
+    hkdf.extract(kind, z, hl, psk, pskLen, out);
+    bytes.free(z);
+}
+
+// binder_key = Derive-Secret(early_secret, "res binder", "") for a resumption PSK (RFC 8446 7.1).
+pub fn deriveResBinderKey(kind: int, earlySec: ptr, out: ptr): void {
+    let hl = hkdf.hashLen(kind);
+    let eh = bytes.alloc(hl);
+    hashEmpty(kind, eh);
+    let lab = strBuf("res binder");
+    hkdf.deriveSecret(kind, earlySec, hl, lab, 10, eh, out);
+    bytes.free(eh); bytes.free(lab);
+}
+
 // derived = Derive-Secret(secret, "derived", "").
 pub fn deriveDerived(kind: int, secret: ptr, out: ptr): void {
     let hl = hkdf.hashLen(kind);
@@ -81,6 +102,22 @@ pub fn deriveTrafficUpdate(kind: int, secret: ptr, out: ptr): void {
     let lab = strBuf("traffic upd");
     hkdf.expandLabel(kind, secret, hl, lab, 11, empty, 0, out, hl);
     bytes.free(empty); bytes.free(lab);
+}
+
+// resumption_master_secret = Derive-Secret(master_secret, "res master", ClientHello...client Finished).
+// The caller supplies the transcript hash through the client Finished.
+pub fn deriveResMaster(kind: int, master: ptr, transcriptHash: ptr, out: ptr): void {
+    let lab = strBuf("res master");
+    hkdf.deriveSecret(kind, master, hkdf.hashLen(kind), lab, 10, transcriptHash, out);
+    bytes.free(lab);
+}
+
+// Per-ticket PSK = HKDF-Expand-Label(resumption_master_secret, "resumption", ticket_nonce, Hash.length).
+pub fn deriveResumptionPsk(kind: int, resMaster: ptr, nonce: ptr, nonceLen: int, out: ptr): void {
+    let hl = hkdf.hashLen(kind);
+    let lab = strBuf("resumption");
+    hkdf.expandLabel(kind, resMaster, hl, lab, 10, nonce, nonceLen, out, hl);
+    bytes.free(lab);
 }
 
 // From a traffic secret, derive the AEAD key and 12-byte IV (HKDF-Expand-Label "key" / "iv").

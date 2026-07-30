@@ -156,6 +156,25 @@ fn derIntTo(buf: ptr, start: int, len: int, out: ptr): void {
     while (i < l) { bytes.write_byte(out, pad + i, bytes.read_byte(buf, s + i)); i = i + 1; }
 }
 
+// True if the ServerHello echoed a pre_shared_key extension (0x0029), i.e. the server accepted our
+// resumption PSK (RFC 8446 4.2.11). `sh` is the ServerHello handshake message.
+pub fn serverAcceptedPsk(sh: ptr, shLen: int): bool {
+    let p = 4 + 2 + 32;                            // msg header, legacy_version, random
+    let sidLen = bytes.read_byte(sh, p);
+    p = p + 1 + sidLen;
+    p = p + 2 + 1;                                 // cipher_suite + legacy_compression_method
+    let extLen = (bytes.read_byte(sh, p) << 8) | bytes.read_byte(sh, p + 1);
+    p = p + 2;
+    let end = p + extLen;
+    while (p + 4 <= end) {
+        let etype = (bytes.read_byte(sh, p) << 8) | bytes.read_byte(sh, p + 1);
+        let elen = (bytes.read_byte(sh, p + 2) << 8) | bytes.read_byte(sh, p + 3);
+        if (etype == 0x0029) { return true; }
+        p = p + 4 + elen;
+    }
+    return false;
+}
+
 // ---- EncryptedExtensions: ALPN selection (RFC 7301 / RFC 8446 section 4.3.1) ----
 
 // Parse the server's ALPN selection out of an EncryptedExtensions handshake message (type 0x08). `ee` is
