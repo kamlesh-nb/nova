@@ -478,3 +478,78 @@ not regressed. Remaining follow-ons (not blocking): a live-driver round trip aga
 database (driver code unchanged), async DNS, the Linux epoll reactor driver for `nova_run_root`, and the
 `os.socket` split; then M9 (the TLS 1.2 and 1.3 protocol in Nova over vetted crypto primitives), the
 last large piece.
+
+---
+
+## M14: Maximum FFI reach — inventory, risk, and what we deliberately skip (2026-07-30)
+
+The reactor cross-platform work (kqueue/epoll/IOCP behind one `EventLoop` trait) and the Windows
+runtime port landed; `nova --target windows-x86_64` produces a real PE32+ executable. With that done,
+the question becomes: **how much of the remaining C++ runtime can move to Nova/FFI**, and — critically —
+**how much SHOULD**, once we apply the governing rule:
+
+> **Gating rule (this section).** A move is only worth doing if it is low-risk AND does not regress
+> performance. Anything on a hot path, or that destabilises ARC/coroutines, is SKIPPED and stays C —
+> a smaller runtime is not worth a slower or more fragile language.
+
+This is decisive, because the theoretical reach and the *safe* reach are very different. The runtime is
+2,951 lines (`.cpp`). About 90% is *technically* movable to Nova or FFI — but roughly two thirds of that
+90% is the **hot ABI-CORE** (per-object ARC, per-await scheduling), which the gating rule removes from
+scope. What is left is a set of **cold leaves** that move cleanly with no perf cost.
+
+### Inventory (hot? = on a per-object / per-await / per-byte hot path)
+
+| Subsystem (file) | LOC | Hot? | FFI mechanism | Risk | Perf impact | Verdict |
+|---|---:|:--:|---|---|---|---|
+| blocking socket connect (`io.cpp`) | ~200 | no | Nova over `os/sys` (`connect`/`getaddrinfo`), proven by `reactorio` | low | none | **MOVE** |
+| process spawn (`io.cpp`) | ~350 | no | Nova over `os/sys` `posix_spawn` (+ `pipe`/`waitpid`/`kill`); Windows `CreateProcess` backend | low–med | none | **MOVE** |
+| zlib (`compress.cpp`) | 74 | no | `extern("z")` FFI — still calls zlib either way | low | none | **MOVE** |
+| entropy (`crypto.cpp`) | 36 | no | `extern` `getentropy`/`BCryptGenRandom` | low | none | **MOVE** |
+| cold primitives (`core.cpp`: errno, exit, args, clocks, trace, test harness, panic, cstr helpers) | ~200 | no | libc FFI | low | none | **MOVE** |
+| decimal128 (`decimal.cpp`) | 328 | only in decimal-heavy code | pure Nova BID + codegen routing | med | regresses decimal-heavy workloads (Nova BID vs optimised C, no intrinsics) | **BORDERLINE — defer** |
+| sync primitives (`core.cpp`: mutex/condvar/rwlock/spin, atomics) | ~120 | yes (runtime locks) | libc `pthread_*` / atomics FFI | med | risk of regressing lock-heavy async | **SKIP (perf) — keep** |
+| ARC ops (`alloc.cpp`: `nova_retain`/`release`/`bytes_alloc`/`free`, arena, header) | 445 | **yes — hottest** | extern-link-name so a Nova fn *is* `nova_retain` | high | **regresses the whole language baseline** (a call/indirection on every retain/release/alloc) | **SKIP (perf) — keep** |
+| coroutine scheduler policy (`concurrency.cpp`: run queue, timers, `nova_run_reactors`, `nova_chan_*`) | ~500 | yes (per-await) | `@coro_resume`/`@coro_destroy` builtins + thread FFI | high | per-await overhead + async-stability risk | **SKIP (perf/risk) — keep** |
+| coroutine intrinsic glue (`concurrency.cpp`/`alloc.cpp`: `llvm.coro.*`, `handle.resume/destroy`, frame alloc) | ~200 | yes | — | — | — | **IRREDUCIBLE (compiler-emitted only)** |
+| unity glue (`runtime.cpp`) | 11 | — | — | — | — | deletes with the leaves |
+
+### The three conclusions
+
+1. **MOVE (safe, cold, no perf cost) — ~860 lines.** `io.cpp` (sockets + process), `compress.cpp`,
+   `crypto.cpp`, and the cold half of `core.cpp`. These are infrequent operations (a spawn, a connect,
+   a gzip call, a clock read); moving them to `os/sys`-style FFI has zero hot-path cost and follows the
+   already-proven `reactorio`/`os.socket` pattern. This also delivers the cross-platform file/dir/process
+   goal (POSIX + a Windows backend) as a side effect.
+
+2. **SKIP on the gating rule — ~1,065 lines.** The ARC allocator (`alloc.cpp`), the coroutine scheduler
+   policy (`concurrency.cpp`), and the `core.cpp` sync primitives. These are the *largest* pieces and the
+   *hottest* paths. `nova_retain`/`nova_release` run on essentially every reference-counted operation;
+   the scheduler runs on every `await`. Routing them through a Nova function or an FFI indirection — even
+   with an extern-link-name or coroutine builtins — adds a call/branch to the language's innermost loops.
+   The C here is small, correct, ASAN/TSan-clean, and heavily optimised by the C++ compiler. **Per the
+   gating rule, we do not touch it.** (`decimal.cpp` is BORDERLINE: not universally hot, but a Nova BID
+   port would regress decimal-heavy code and needs codegen routing — deferred, revisit only if a perf-
+   neutral path is shown.)
+
+3. **IRREDUCIBLE — ~200 lines.** The `llvm.coro.*` intrinsic sequence, the `handle.resume()/.destroy()`
+   dispatch, ARC call-site placement, and the heap-header contract. These are compiler-emitted IR by
+   nature; they can never be FFI regardless of perf.
+
+### Net effect
+
+The runtime floor goes from **2,951 → ~2,090 lines** by moving the cold leaves — about **a 29%
+reduction**, taking the C++ down to essentially **the hot ABI-CORE + irreducible coroutine glue**. The
+theoretical path to ~300 lines exists (extern-link-name for ARC/decimal/boxing, coroutine builtins for
+the scheduler), but it is **explicitly out of scope under the gating rule**: it trades ~1,000 lines of
+C for a measurable, permanent tax on the language's hottest paths. We keep the fast core in C on purpose.
+
+### M14 plan (only the MOVE row; each slice gated native + ASAN, and a perf spot-check where relevant)
+
+| Slice | Retires | Risk notes |
+|---|---|---|
+| M14.1 | Process spawn → Nova over `os/sys` `posix_spawn` (POSIX base) + `os/proc_windows` `CreateProcess` | Fork-safety avoided by using `posix_spawn` (no post-fork Nova code); the Linux `spawn_isolated` clone/namespaces path is complex and stays C for now (flag) |
+| M14.2 | Blocking socket `connect` (`io.cpp`) → Nova over `os/sys` | Proven pattern (`reactorio`); the only consumer is the sync HTTP/DB path |
+| M14.3 | `compress.cpp` zlib → Nova `extern("z")` binding | No perf change (still zlib); verify gzip corpus |
+| M14.4 | `crypto.cpp` entropy + cold `core.cpp` primitives → FFI | Cold; the `os.socket` split (done) removed the namespace-pollution blocker |
+
+Explicitly NOT in M14: ARC, allocator, coroutine scheduler, sync primitives, decimal (perf/risk).
