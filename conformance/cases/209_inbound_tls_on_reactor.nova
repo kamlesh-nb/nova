@@ -54,6 +54,12 @@ async fn tlsServer(fd: int, kq: int, done: long): void {
     bump(done);
 }
 
+// Completion-model accept: await one connection and spawn the TLS server coroutine, then complete.
+async fn tlsAcceptOne(lfd: int, kq: int, done: long): void {
+    let s = await reactorio.reactorAccept(lfd, kq);
+    if (s.isOpen()) { coroStart(tlsServer(s.fdOf(), kq, done)); }
+}
+
 async fn tlsClient(host: string, port: int, done: long, gotOk: long): void {
     let ts = await asynctls.tlsConnect(host, port, false);   // reactor-native asyncConnect underneath
     if (ts.ok()) {
@@ -82,28 +88,19 @@ fn test_inbound_tls_on_reactor(): void {
 
     let r = reactor.Reactor(64, 20480, 32);
     reactor.setCurrent(r.kq);
-    r.addRead(lfd, lfd as long);
     let done = bytes.alloc(4); bytes.write_i32(done, 0, 0);
     let gotOk = bytes.alloc(4); bytes.write_i32(gotOk, 0, 0);
-    let addrBuf = bytes.alloc(16);
-    let addrLen = bytes.alloc(4);
 
+    coroStart(tlsAcceptOne(lfd, r.kq, done));
     coroStart(tlsClient("127.0.0.1", port, done, gotOk));
 
     let guard = 0;
     while (count(done) < 2 && guard < 4000) {
-        let nev = r.poll(500);
+        let nev = r.pollComplete(500);
         reactor.batchBegin();
         let i = 0;
         while (i < nev) {
-            let fd = r.readyFd(i);
-            if (fd == lfd) {
-                bytes.write_i32(addrLen, 0, 16);
-                let c = sys.accept(lfd, addrBuf, addrLen);
-                if (c >= 0) { sys.setNonBlocking(c); coroStart(tlsServer(c, r.kq, done)); }
-            } else {
-                nova_reactor_resume(r.readyToken(i));
-            }
+            nova_reactor_resume(r.completedToken(i));
             i = i + 1;
         }
         guard = guard + 1;
@@ -113,7 +110,7 @@ fn test_inbound_tls_on_reactor(): void {
     assert.equalInt(bytes.read_i32(gotOk, 0) as int, 1);
 
     reactor.setCurrent(0);
-    bytes.free(done); bytes.free(gotOk); bytes.free(addrBuf); bytes.free(addrLen);
+    bytes.free(done); bytes.free(gotOk);
     r.destroy();
     sys.close(lfd);
 }

@@ -14,6 +14,7 @@ import bytes;
 import os.sys;
 import os.kqueue;
 import io.slab;
+import net.eventloop;
 
 // Run `n` share-nothing reactor threads, each invoking `worker(reactorIndex)`. The typed closure
 // param boxes a named worker fn correctly at the call site; the runtime spawns the OS threads and
@@ -44,58 +45,67 @@ pub fn batchBegin(): void { nova_reactor_batch_begin(); }
 pub fn registerWake(self: Reactor, idx: int): void { nova_reactor_wake_register(idx as long, self.kq as long); }
 pub fn post(idx: int, handle: long): void { nova_reactor_post(idx as long, handle); }
 pub fn drainWake(idx: int): long { return nova_reactor_drain_one(idx as long); }
-pub fn readyFilter(self: Reactor, i: int): int { return kqueue.evFilter(self.eventBuf, i); }
+pub fn readyFilter(self: Reactor, i: int): int { return kqueue.evFilter(self.loop.eventBuf, i); }
 pub fn evfiltUser(): int { return nova_evfilt_user() as int; }
 
+// The per-core reactor is now a driver over a completion-based EventLoop backend (net/eventloop,
+// selected per target: KqueueLoop / EpollLoop / IocpLoop). The completion API (submitOp / pollComplete /
+// completedToken) is the go-forward async I/O path used by reactorio, web/app, and the async cases. The
+// readiness API (addRead / poll / readyToken / readyFd / readyBytes) is retained for the low-level cases
+// that test the raw readiness primitive (192/194/195), the read-deadline path (208), and the
+// cross-reactor wake (210); those will convert later, after which the readiness surface is removed.
 pub struct Reactor {
+    pub loop: eventloop.KqueueLoop,
     pub kq: int,
-    pub eventBuf: long,
     pub maxEvents: int,
     pub pool: slab.SlabPool,
 
     init(maxEvents: int, blockSize: int, blockCount: int) {
-        self.kq = kqueue.kqueue();
+        self.loop = eventloop.KqueueLoop(maxEvents);
+        self.kq = self.loop.kq;
         self.maxEvents = maxEvents;
-        self.eventBuf = bytes.alloc(maxEvents * kqueue.KEVENT_SIZE);
         self.pool = slab.SlabPool(blockSize, blockCount);
     }
 
     pub fn ok(self: Reactor): bool { return self.kq >= 0; }
 
-    // Register read-interest on fd, carrying `token` (a connection identity) on the event.
+    // --- completion API (go-forward async I/O seam) ---------------------------------------------------
+    // Submit an in-flight op (address of an eventloop.OP_SIZE record). See net/eventloop.
+    pub fn submitOp(self: Reactor, op: long): int { return self.loop.submit(op); }
+    // Block up to timeoutMs and complete ready ops; returns the number completed this batch.
+    pub fn pollComplete(self: Reactor, timeoutMs: int): int { return self.loop.poll(timeoutMs); }
+    // The coroutine token to resume for the i-th ready item of the last pollComplete (the coroutine reads
+    // its own op result). Uniform across I/O completions and timer/wake events.
+    pub fn completedToken(self: Reactor, i: int): long { return self.loop.completedToken(i); }
+
+    // --- readiness API (legacy; kept for low-level 192/194/195, deadline 208, wake 210) --------------
     pub fn addRead(self: Reactor, fd: int, token: long): int {
         return kqueue.registerOne(self.kq, fd, kqueue.EVFILT_READ, kqueue.EV_ADD, token);
     }
     pub fn delRead(self: Reactor, fd: int): int {
         return kqueue.registerOne(self.kq, fd, kqueue.EVFILT_READ, kqueue.EV_DELETE, 0);
     }
-
-    // Register one-shot write-interest on fd (for awaiting writability when a send hits EAGAIN).
-    // One-shot so the reactor does not spin on the persistently-writable socket; re-arm per send.
     pub fn addWrite(self: Reactor, fd: int, token: long): int {
         return kqueue.registerOne(self.kq, fd, kqueue.EVFILT_WRITE, kqueue.EV_ADD | kqueue.EV_ONESHOT, token);
     }
     pub fn delWrite(self: Reactor, fd: int): int {
         return kqueue.registerOne(self.kq, fd, kqueue.EVFILT_WRITE, kqueue.EV_DELETE, 0);
     }
-
-    // Block until at least one fd is ready (or timeoutMs elapses; negative blocks forever).
-    // Returns the number of ready events, readable via readyFd / readyToken / readyBytes.
     pub fn poll(self: Reactor, timeoutMs: int): int {
-        return kqueue.wait(self.kq, self.eventBuf, self.maxEvents, timeoutMs);
+        return kqueue.wait(self.kq, self.loop.eventBuf, self.maxEvents, timeoutMs);
     }
-    pub fn readyFd(self: Reactor, i: int): int { return kqueue.evIdent(self.eventBuf, i) as int; }
-    pub fn readyToken(self: Reactor, i: int): long { return kqueue.evUdata(self.eventBuf, i); }
-    pub fn readyBytes(self: Reactor, i: int): long { return kqueue.evData(self.eventBuf, i); }
-    pub fn readyEof(self: Reactor, i: int): bool { return (kqueue.evFlags(self.eventBuf, i) & kqueue.EV_EOF) != 0; }
+    pub fn readyFd(self: Reactor, i: int): int { return kqueue.evIdent(self.loop.eventBuf, i) as int; }
+    pub fn readyToken(self: Reactor, i: int): long { return kqueue.evUdata(self.loop.eventBuf, i); }
+    pub fn readyBytes(self: Reactor, i: int): long { return kqueue.evData(self.loop.eventBuf, i); }
+    pub fn readyEof(self: Reactor, i: int): bool { return (kqueue.evFlags(self.loop.eventBuf, i) & kqueue.EV_EOF) != 0; }
 
     // Borrow a read buffer from the pool (payload address), and return it when done.
     pub fn getBuffer(self: Reactor): long { return self.pool.acquire(); }
     pub fn putBuffer(self: Reactor, buf: long): void { self.pool.release(buf); }
 
     pub fn destroy(self: Reactor): void {
-        if (self.eventBuf != 0) { bytes.free(self.eventBuf); self.eventBuf = 0; }
         self.pool.destroy();
-        if (self.kq >= 0) { sys.close(self.kq); self.kq = -1; }
+        self.loop.destroy();   // frees event/completion buffers and closes the kq
+        self.kq = -1;
     }
 }

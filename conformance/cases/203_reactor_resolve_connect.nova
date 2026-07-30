@@ -78,10 +78,10 @@ fn test_reactor_connect_by_name(): void {
 
     let guard = 0;
     while (count(done) < 2 && guard < 1000) {
-        let nev = r.poll(500);
+        let nev = r.pollComplete(500);
         reactor.batchBegin();
         let i = 0;
-        while (i < nev) { nova_reactor_resume(r.readyToken(i)); i = i + 1; }
+        while (i < nev) { nova_reactor_resume(r.completedToken(i)); i = i + 1; }
         guard = guard + 1;
     }
 

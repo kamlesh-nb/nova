@@ -43,10 +43,10 @@ fn test_recv_deadline_times_out(): void {
 
     let guard = 0;
     while ((bytes.read_i32(result, 0) as int) == 0 && guard < 400) {
-        let n = r.poll(500);
+        let n = r.pollComplete(500);
         reactor.batchBegin();
         let i = 0;
-        while (i < n) { nova_reactor_resume(r.readyToken(i)); i = i + 1; }
+        while (i < n) { nova_reactor_resume(r.completedToken(i)); i = i + 1; }
         guard = guard + 1;
     }
 
@@ -71,10 +71,10 @@ fn test_recv_deadline_gets_data(): void {
 
     let guard = 0;
     while ((bytes.read_i32(result, 0) as int) == 0 && guard < 400) {
-        let n = r.poll(500);
+        let n = r.pollComplete(500);
         reactor.batchBegin();
         let i = 0;
-        while (i < n) { nova_reactor_resume(r.readyToken(i)); i = i + 1; }
+        while (i < n) { nova_reactor_resume(r.completedToken(i)); i = i + 1; }
         guard = guard + 1;
     }
 

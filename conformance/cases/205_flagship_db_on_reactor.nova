@@ -100,6 +100,17 @@ async fn webServe(application: App, fd: int, kq: int, done: long): void {
     bump(done);
 }
 
+// Completion-model accept: one awaited accept per listener spawns its server coroutine (exactly one
+// connection is expected on each), then completes — so no pending accept op is left leaked (ASAN-clean).
+async fn webAcceptOne(application: App, lfd: int, kq: int, done: long): void {
+    let s = await reactorio.reactorAccept(lfd, kq);
+    if (s.isOpen()) { coroStart(webServe(application, s.fdOf(), kq, done)); }
+}
+async fn dbAcceptOne(lfd: int, kq: int, done: long): void {
+    let s = await reactorio.reactorAccept(lfd, kq);
+    if (s.isOpen()) { coroStart(dbServe(s.fdOf(), kq, done)); }
+}
+
 async fn webClient(webPort: int, kq: int, done: long, gotOk: long): void {
     let s = await reactorio.reactorConnect("127.0.0.1", webPort, kq);
     if (s.isOpen()) {
@@ -146,34 +157,22 @@ fn test_flagship_request_with_db_on_reactor(): void {
 
     let r = reactor.Reactor(64, 8192, 32);
     reactor.setCurrent(r.kq);
-    r.addRead(webLfd, webLfd as long);
-    r.addRead(dbLfd, dbLfd as long);
-
     let done = bytes.alloc(4); bytes.write_i32(done, 0, 0);
     let gotOk = bytes.alloc(4); bytes.write_i32(gotOk, 0, 0);
-    let addrBuf = bytes.alloc(16);
-    let addrLen = bytes.alloc(4);
 
-    // Start the external client; the web and db server coroutines are spawned on accept.
+    // Accept coroutines (one per listener) + the external client; servers spawn on accept completion.
+    coroStart(webAcceptOne(application, webLfd, r.kq, done));
+    coroStart(dbAcceptOne(dbLfd, r.kq, done));
     coroStart(webClient(webPort, r.kq, done, gotOk));
 
     // done reaches 3: the client, the web handler coroutine, and the db server coroutine.
     let guard = 0;
     while (count(done) < 3 && guard < 4000) {
-        let nev = r.poll(500);
+        let nev = r.pollComplete(500);
         reactor.batchBegin();
         let i = 0;
         while (i < nev) {
-            let fd = r.readyFd(i);
-            if (fd == webLfd) {
-                let c = acceptAll(webLfd, addrBuf, addrLen);
-                if (c >= 0) { coroStart(webServe(application, c, r.kq, done)); }
-            } else if (fd == dbLfd) {
-                let c = acceptAll(dbLfd, addrBuf, addrLen);
-                if (c >= 0) { coroStart(dbServe(c, r.kq, done)); }
-            } else {
-                nova_reactor_resume(r.readyToken(i));
-            }
+            nova_reactor_resume(r.completedToken(i));
             i = i + 1;
         }
         guard = guard + 1;
@@ -185,8 +184,6 @@ fn test_flagship_request_with_db_on_reactor(): void {
     reactor.setCurrent(0);
     bytes.free(done);
     bytes.free(gotOk);
-    bytes.free(addrBuf);
-    bytes.free(addrLen);
     r.destroy();
     sys.close(webLfd);
     sys.close(dbLfd);

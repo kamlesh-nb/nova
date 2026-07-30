@@ -539,7 +539,17 @@ pub const TypeChecker = struct {
                     }
                 }
                 try self.checkExpr(c.callee.*);
-                for (c.args) |a| try self.checkExpr(a);
+                // coroStart(<async call>) detaches (spawns) the coroutine — like `spawn`, it consumes the
+                // async call rather than block-driving it, so a bare async call passed to coroStart inside
+                // an async fn is allowed (the reactor drives the detached coroutine).
+                if (c.callee.kind == .ident and std.mem.eql(u8, c.callee.kind.ident, "coroStart")) {
+                    const saved = self.in_awaited;
+                    self.in_awaited = true;
+                    for (c.args) |a| try self.checkExpr(a);
+                    self.in_awaited = saved;
+                } else {
+                    for (c.args) |a| try self.checkExpr(a);
+                }
             },
             .binary => |b| {
                 try self.checkExpr(b.left.*);

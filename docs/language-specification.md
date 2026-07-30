@@ -334,6 +334,9 @@ let v = await f;         // suspend until it completes
   *(→ expect_fail/bare_async_call_in_async)*. A bare async call block-drives the callee to completion,
   and doing that from within a running coroutine re-enters the event loop → deadlock; the checker
   rejects the shape and the runtime aborts loudly if one is ever reached at runtime.
+  - `coroStart(<async-call>)` is a third **detached spawn** form (fire-and-forget; the reactor drives the
+    coroutine, no `Future` is returned). Like `spawn`, it consumes the async call rather than block-driving
+    it, so it is allowed inside an `async fn` *(→ this session; the reactor accept loop uses it)*.
 - **Sync → async at the top.** A **synchronous** `main`/`@test`/top-level caller *may* call an `async fn`
   directly: it is driven to completion (block-drive). This is the one sanctioned bridge from sync into
   async and is safe only at a true top level (not already inside the loop) *(→ 111_async_trait_methods)*.

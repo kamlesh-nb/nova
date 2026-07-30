@@ -717,6 +717,19 @@ pub async fn serveReactorConn(app: App, fd: int, kq: int): int {
     return await handleConn(app, s);
 }
 
+// Accept loop as a reactor coroutine (completion model): await one accepted connection at a time and
+// spawn a serve coroutine for it. This replaces the old inline "listener readable -> drain backlog"
+// branch, so the reactor's poll loop is uniform (every ready item is just a coroutine to resume) and
+// maps directly onto IOCP AcceptEx. Loops forever.
+async fn reactorAcceptLoop(app: App, lfd: int, kq: int): void {
+    while (true) {
+        let s = await reactorio.reactorAccept(lfd, kq);
+        if (s.isOpen()) {
+            coroStart(serveReactorConn(app, s.fdOf(), kq));
+        }
+    }
+}
+
 // One reactor worker thread: its own reactor, its own SO_REUSEPORT listener on the shared port (the
 // kernel load-balances connections across the threads), its own coroutines. Share-nothing: the only
 // thing crossing threads is the App configuration, which is read-only during serving. Loops forever.
@@ -738,27 +751,14 @@ fn reactorWorkerBody(app: App, idx: int): void {
 
     let r = reactor.Reactor(1024, 16384, 1024);
     reactor.setCurrent(r.kq);
-    r.addRead(lfd, lfd as long);
-    let addrBuf = bytes.alloc(16);
-    let addrLen = bytes.alloc(4);
+    coroStart(reactorAcceptLoop(app, lfd, r.kq));
 
     while (true) {
-        let n = r.poll(-1);
+        let n = r.pollComplete(-1);
         reactor.batchBegin();
         let i = 0;
         while (i < n) {
-            let fd = r.readyFd(i);
-            if (fd == lfd) {
-                while (true) {
-                    bytes.write_i32(addrLen, 0, 16);
-                    let c = sys.accept(lfd, addrBuf, addrLen);
-                    if (c < 0) { break; }
-                    sys.setNonBlocking(c);
-                    coroStart(serveReactorConn(app, c, r.kq));
-                }
-            } else {
-                nova_reactor_resume(r.readyToken(i));
-            }
+            nova_reactor_resume(r.completedToken(i));
             i = i + 1;
         }
     }
@@ -796,28 +796,15 @@ pub fn runReactor(self: App, port: int): void {
 
     let r = reactor.Reactor(1024, 16384, 1024);
     reactor.setCurrent(r.kq);
-    r.addRead(lfd, lfd as long);
-    let addrBuf = bytes.alloc(16);
-    let addrLen = bytes.alloc(4);
+    coroStart(reactorAcceptLoop(self, lfd, r.kq));
     console.log("Nova web server listening (Nova reactor)");
 
     while (true) {
-        let n = r.poll(-1);
+        let n = r.pollComplete(-1);
         reactor.batchBegin();
         let i = 0;
         while (i < n) {
-            let fd = r.readyFd(i);
-            if (fd == lfd) {
-                while (true) {
-                    bytes.write_i32(addrLen, 0, 16);
-                    let c = sys.accept(lfd, addrBuf, addrLen);
-                    if (c < 0) { break; }
-                    sys.setNonBlocking(c);
-                    coroStart(serveReactorConn(self, c, r.kq));
-                }
-            } else {
-                nova_reactor_resume(r.readyToken(i));
-            }
+            nova_reactor_resume(r.completedToken(i));
             i = i + 1;
         }
     }

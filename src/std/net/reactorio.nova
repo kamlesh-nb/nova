@@ -15,7 +15,7 @@
 
 import bytes;
 import os.sys;
-import os.kqueue;
+import net.eventloop;
 
 // errno values are platform-specific. macOS/BSD values here; Linux (EAGAIN=11, EINPROGRESS=115)
 // plugs in behind the same shape when the epoll backend is verified on Linux.
@@ -109,17 +109,15 @@ pub struct ReactorStream {
     // Read up to `max` bytes into `buf`. Returns the byte count (0 on peer close/EOF), or -1 on a
     // real error. Awaits readability on EAGAIN without holding a thread.
     pub async fn recvInto(self: ReactorStream, buf: long, max: int): int {
-        while (true) {
-            let n = sys.read(self.fd, buf, max as long);
-            if (n >= 0) {
-                return n as int;
-            }
-            if (sys.errno() != EAGAIN) {
-                return -1;
-            }
-            kqueue.registerOne(self.kq, self.fd, kqueue.EVFILT_READ, kqueue.EV_ADD, currentCoro());
-            coroSuspend();
-        }
+        // Completion model: submit a recv op carrying this coroutine as the token, suspend, and read the
+        // byte count the loop filled in. The op record + buf are on this frame, so they outlive the op.
+        let op = bytes.alloc(eventloop.OP_SIZE);
+        eventloop.makeOp(op, eventloop.OP_RECV, self.fd, buf, max, currentCoro());
+        eventloop.submit(self.kq, op);
+        coroSuspend();
+        let r = eventloop.opResult(op);
+        bytes.free(op);
+        return r;
     }
 
     // Like recvInto, but bounded by a read deadline. On timeout returns -2 (the caller closes the
@@ -130,33 +128,41 @@ pub struct ReactorStream {
     // resume a reaped frame: reaping records the handle for the batch and nova_reactor_resume skips it.
     pub async fn recvIntoDeadline(self: ReactorStream, buf: long, max: int, timeoutMs: int): int {
         if (timeoutMs <= 0) { return await self.recvInto(buf, max); }
-        let deadline = nova_mono_ms() + (timeoutMs as long);
-        while (true) {
-            let n = sys.read(self.fd, buf, max as long);
-            if (n >= 0) { nova_reactor_cancel_timer(currentCoro()); return n as int; }
-            if (sys.errno() != EAGAIN) { nova_reactor_cancel_timer(currentCoro()); return -1; }
-            let now = nova_mono_ms();
-            if (now >= deadline) { nova_reactor_cancel_timer(currentCoro()); return -2; }
-            kqueue.registerOne(self.kq, self.fd, kqueue.EVFILT_READ, kqueue.EV_ADD, currentCoro());
-            nova_reactor_set_timer(currentCoro(), deadline - now);
-            coroSuspend();
+        // Completion model: submit a recv op (done flag starts 0) and arm a one-shot timer. Whichever
+        // fires first wakes this coroutine: if the loop completed the read it set done=1 and the byte
+        // count; if only the timer fired, done is still 0, so we time out (-2) and cancel the still-armed
+        // read op. A same-batch data+timer race resolves to the data (the loop ran the read and set
+        // done), and the duplicate timer wake is skipped by the batch reap guard.
+        let op = bytes.alloc(eventloop.OP_SIZE);
+        eventloop.makeOp(op, eventloop.OP_RECV, self.fd, buf, max, currentCoro());
+        eventloop.submit(self.kq, op);
+        nova_reactor_set_timer(currentCoro(), timeoutMs as long);
+        coroSuspend();
+        nova_reactor_cancel_timer(currentCoro());
+        if (eventloop.opDone(op) == 1) {
+            let r = eventloop.opResult(op);
+            bytes.free(op);
+            return r;
         }
+        eventloop.cancelRead(self.kq, self.fd);
+        bytes.free(op);
+        return -2;
     }
 
     // Write all `len` bytes from `buf`, awaiting writability on EAGAIN. Returns bytes sent, or -1.
     pub async fn sendBuf(self: ReactorStream, buf: long, len: int): int {
+        // Completion model: submit a send op per remaining chunk. The loop only completes a send once it
+        // has made progress (it re-arms on a spurious EAGAIN), so opResult is the bytes written (>0) or a
+        // real error; a partial write loops to submit the remainder.
         let sent = 0;
         while (sent < len) {
-            let w = sys.write(self.fd, buf + (sent as long), (len - sent) as long);
-            if (w > 0) {
-                sent = sent + (w as int);
-            } else if (w < 0 && sys.errno() == EAGAIN) {
-                kqueue.registerOne(self.kq, self.fd, kqueue.EVFILT_WRITE,
-                                   kqueue.EV_ADD | kqueue.EV_ONESHOT, currentCoro());
-                coroSuspend();
-            } else {
-                return -1;
-            }
+            let op = bytes.alloc(eventloop.OP_SIZE);
+            eventloop.makeOp(op, eventloop.OP_SEND, self.fd, buf + (sent as long), len - sent, currentCoro());
+            eventloop.submit(self.kq, op);
+            coroSuspend();
+            let w = eventloop.opResult(op);
+            bytes.free(op);
+            if (w > 0) { sent = sent + w; } else { return -1; }
         }
         return sent;
     }
@@ -179,7 +185,7 @@ pub struct ReactorStream {
 
     pub fn close(self: ReactorStream): void {
         if (self.fd >= 0) {
-            kqueue.registerOne(self.kq, self.fd, kqueue.EVFILT_READ, kqueue.EV_DELETE, 0);
+            eventloop.cancelRead(self.kq, self.fd);
             sys.close(self.fd);
             self.fd = -1;
         }
@@ -200,9 +206,13 @@ pub async fn reactorConnect(host: string, port: int, kq: int): ReactorStream {
     bytes.free(sa);
     if (r != 0) {
         if (sys.errno() != EINPROGRESS) { sys.close(fd); return ReactorStream(-1, kq); }
-        kqueue.registerOne(kq, fd, kqueue.EVFILT_WRITE, kqueue.EV_ADD | kqueue.EV_ONESHOT, currentCoro());
+        let op = bytes.alloc(eventloop.OP_SIZE);
+        eventloop.makeOp(op, eventloop.OP_CONNECT, fd, 0, 0, currentCoro());
+        eventloop.submit(kq, op);
         coroSuspend();
-        if (sys.soError(fd) != 0) { sys.close(fd); return ReactorStream(-1, kq); }
+        let res = eventloop.opResult(op);
+        bytes.free(op);
+        if (res != 0) { sys.close(fd); return ReactorStream(-1, kq); }
     }
     return ReactorStream(fd, kq);
 }
@@ -211,24 +221,13 @@ pub async fn reactorConnect(host: string, port: int, kq: int): ReactorStream {
 // a ReactorStream for the accepted connection (fd -1 on error). The listener's read-interest is
 // removed on success so a later accept does not resume the wrong coroutine.
 pub async fn reactorAccept(listenFd: int, kq: int): ReactorStream {
-    let addrBuf = bytes.alloc(16);
-    let addrLen = bytes.alloc(4);
-    while (true) {
-        bytes.write_i32(addrLen, 0, 16);
-        let c = sys.accept(listenFd, addrBuf, addrLen);
-        if (c >= 0) {
-            sys.setNonBlocking(c);
-            kqueue.registerOne(kq, listenFd, kqueue.EVFILT_READ, kqueue.EV_DELETE, 0);
-            bytes.free(addrBuf);
-            bytes.free(addrLen);
-            return ReactorStream(c, kq);
-        }
-        if (sys.errno() != EAGAIN) {
-            bytes.free(addrBuf);
-            bytes.free(addrLen);
-            return ReactorStream(-1, kq);
-        }
-        kqueue.registerOne(kq, listenFd, kqueue.EVFILT_READ, kqueue.EV_ADD, currentCoro());
-        coroSuspend();
-    }
+    // Completion model: submit an accept op; the loop performs accept() when the listener is readable,
+    // sets the accepted fd non-blocking, and reports it as the op result (or -1). One accept per op.
+    let op = bytes.alloc(eventloop.OP_SIZE);
+    eventloop.makeOp(op, eventloop.OP_ACCEPT, listenFd, 0, 0, currentCoro());
+    eventloop.submit(kq, op);
+    coroSuspend();
+    let c = eventloop.opResult(op);
+    bytes.free(op);
+    return ReactorStream(c, kq);
 }
