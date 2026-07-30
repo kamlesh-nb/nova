@@ -76,6 +76,19 @@ fn putSni(out: ptr, p: int, host: string): int {
 // comma-separated list of ALPN protocol names to offer (e.g. "h2,http/1.1"); an empty string omits the
 // application_layer_protocol_negotiation extension. Returns the message length.
 pub fn buildClientHello(random: ptr, sessionId: ptr, ephPub: ptr, ephPubP256: ptr, host: string, alpn: string, out: ptr): int {
+    let empty = bytes.alloc(1);
+    let n = buildClientHelloEx(random, sessionId, ephPub, ephPubP256, host, alpn, 3, empty, 0, out);
+    bytes.free(empty);
+    return n;
+}
+
+// The general ClientHello builder. `groupMask` selects which key_share entries to include: bit 0 (value
+// 1) = x25519, bit 1 (value 2) = secp256r1 (3 = both, the initial ClientHello). supported_groups always
+// lists both groups regardless. `cookie`/`cookieLen` echo a HelloRetryRequest cookie (RFC 8446 4.2.2)
+// when cookieLen > 0. A ClientHello2 (the retry) sets groupMask to just the server-selected group and
+// carries the cookie; everything else matches the first ClientHello.
+pub fn buildClientHelloEx(random: ptr, sessionId: ptr, ephPub: ptr, ephPubP256: ptr, host: string, alpn: string,
+                          groupMask: int, cookie: ptr, cookieLen: int, out: ptr): int {
     let p = 4;                                     // reserve the 4-byte handshake header
     bytes.write_byte(out, p, 0x03); bytes.write_byte(out, p + 1, 0x03); p = p + 2;   // legacy_version
     let i = 0;
@@ -96,16 +109,38 @@ pub fn buildClientHello(random: ptr, sessionId: ptr, ephPub: ptr, ephPubP256: pt
     p = putHex(out, p, "000d00080006080404030401");// signature_algorithms: rsa_pss/ecdsa/rsa_pkcs1 SHA-256
     p = putHex(out, p, "002d00020101");            // psk_key_exchange_modes: psk_dhe_ke
     p = putAlpn(out, p, alpn);                      // application_layer_protocol_negotiation (if offered)
-    // key_share: ext_type 0033, ext_len 006b, client_shares_len 0069, then two KeyShareEntry values:
-    // x25519 (001d, 32 bytes) followed by secp256r1 (0017, 65-byte uncompressed point).
-    p = putHex(out, p, "0033006b0069001d0020");    // key_share header + x25519 entry header
-    i = 0;
-    while (i < 32) { bytes.write_byte(out, p + i, bytes.read_byte(ephPub, i)); i = i + 1; }
-    p = p + 32;
-    p = putHex(out, p, "00170041");                // secp256r1 entry header (65-byte key_exchange)
-    i = 0;
-    while (i < 65) { bytes.write_byte(out, p + i, bytes.read_byte(ephPubP256, i)); i = i + 1; }
-    p = p + 65;
+    if (cookieLen > 0) {                            // cookie: echo the HelloRetryRequest cookie
+        bytes.write_byte(out, p, 0x00); bytes.write_byte(out, p + 1, 0x2c); p = p + 2;   // ext_type: cookie
+        let cExt = cookieLen + 2;
+        bytes.write_byte(out, p, (cExt >> 8) & 0xff); bytes.write_byte(out, p + 1, cExt & 0xff); p = p + 2;
+        bytes.write_byte(out, p, (cookieLen >> 8) & 0xff); bytes.write_byte(out, p + 1, cookieLen & 0xff); p = p + 2;
+        let ci = 0;
+        while (ci < cookieLen) { bytes.write_byte(out, p + ci, bytes.read_byte(cookie, ci)); ci = ci + 1; }
+        p = p + cookieLen;
+    }
+    // key_share: ext_type 0033, then client_shares (backpatched lengths). Entries are selected by
+    // groupMask: x25519 (001d, 32 bytes) and/or secp256r1 (0017, 65-byte uncompressed point).
+    bytes.write_byte(out, p, 0x00); bytes.write_byte(out, p + 1, 0x33); p = p + 2;   // ext_type: key_share
+    let ksExtLenPos = p; p = p + 2;                // extension_data length (backpatched)
+    let ksListLenPos = p; p = p + 2;               // client_shares length (backpatched)
+    let ksListStart = p;
+    if ((groupMask & 1) != 0) {
+        p = putHex(out, p, "001d0020");
+        i = 0;
+        while (i < 32) { bytes.write_byte(out, p + i, bytes.read_byte(ephPub, i)); i = i + 1; }
+        p = p + 32;
+    }
+    if ((groupMask & 2) != 0) {
+        p = putHex(out, p, "00170041");
+        i = 0;
+        while (i < 65) { bytes.write_byte(out, p + i, bytes.read_byte(ephPubP256, i)); i = i + 1; }
+        p = p + 65;
+    }
+    let ksListLen = p - ksListStart;
+    bytes.write_byte(out, ksListLenPos, (ksListLen >> 8) & 0xff); bytes.write_byte(out, ksListLenPos + 1, ksListLen & 0xff);
+    let ksExtLen = p - (ksExtLenPos + 2);
+    bytes.write_byte(out, ksExtLenPos, (ksExtLen >> 8) & 0xff); bytes.write_byte(out, ksExtLenPos + 1, ksExtLen & 0xff);
+
     let extLen = p - extStart;
     bytes.write_byte(out, extLenPos, (extLen >> 8) & 0xff);
     bytes.write_byte(out, extLenPos + 1, extLen & 0xff);
@@ -165,6 +200,7 @@ struct TlsClient {
     pub leafOff: int, pub leafLen: int,  // leaf certificate location within hsBuf
     pub certListOff: int, pub certListLen: int,   // certificate_list region within hsBuf
     pub alpnSel: string,                          // ALPN protocol the server selected ("" = none)
+    pub hrrCookie: ptr, pub hrrCookieLen: int,    // cookie echoed from a HelloRetryRequest (len 0 = none)
 }
 
 pub fn newClient(ephPriv: ptr, ephPrivP256: ptr): TlsClient {
@@ -176,9 +212,64 @@ pub fn newClient(ephPriv: ptr, ephPrivP256: ptr): TlsClient {
         capKey: bytes.alloc(32), capIv: bytes.alloc(12), sapKey: bytes.alloc(32), sapIv: bytes.alloc(12),
         sSeq: 0, cSeq: 0, certVerifyOk: false, finishedOk: false,
         hsBuf: bytes.alloc(8192), hsCap: 8192, hsLen: 0, hsPos: 0, leafOff: 0, leafLen: 0,
-        certListOff: 0, certListLen: 0, alpnSel: "",
+        certListOff: 0, certListLen: 0, alpnSel: "", hrrCookie: bytes.alloc(1), hrrCookieLen: 0,
     };
 }
+
+// Process a HelloRetryRequest (RFC 8446 sections 4.1.4 + 4.4.1). Parses the selected cipher suite (which
+// fixes the transcript hash), the retry's selected_group (0 if the HRR carried no key_share), and an
+// optional cookie (stored for the second ClientHello to echo). Performs the special transcript rewrite:
+// ClientHello1 is replaced by a synthetic "message_hash" message, then the HRR is appended. `hrr` is the
+// HelloRetryRequest handshake message and `hrrLen` its length. Returns the selected group (or 0).
+pub fn processHelloRetryRequest(self: TlsClient, hrr: ptr, hrrLen: int): int {
+    let p = 4 + 2 + 32;                            // msg header, legacy_version, random
+    let sidLen = bytes.read_byte(hrr, p);
+    p = p + 1 + sidLen;
+    let cipher = (bytes.read_byte(hrr, p) << 8) | bytes.read_byte(hrr, p + 1);
+    p = p + 2 + 1;                                 // cipher_suite + legacy_compression_method
+    if (cipher == 0x1302) { self.suite = 1; self.kind = 1; }
+    else if (cipher == 0x1303) { self.suite = 2; self.kind = 0; }
+    else { self.suite = 0; self.kind = 0; }
+    let extLen = (bytes.read_byte(hrr, p) << 8) | bytes.read_byte(hrr, p + 1);
+    p = p + 2;
+    let end = p + extLen;
+    let group = 0;
+    while (p + 4 <= end) {
+        let etype = (bytes.read_byte(hrr, p) << 8) | bytes.read_byte(hrr, p + 1);
+        let elen = (bytes.read_byte(hrr, p + 2) << 8) | bytes.read_byte(hrr, p + 3);
+        let body = p + 4;
+        if (etype == 0x0033) {                     // key_share: the retry carries only selected_group
+            group = (bytes.read_byte(hrr, body) << 8) | bytes.read_byte(hrr, body + 1);
+        } else if (etype == 0x002c) {              // cookie (RFC 8446 4.2.2)
+            let clen = (bytes.read_byte(hrr, body) << 8) | bytes.read_byte(hrr, body + 1);
+            bytes.free(self.hrrCookie);
+            self.hrrCookie = bytes.alloc(clen);
+            let k = 0;
+            while (k < clen) { bytes.write_byte(self.hrrCookie, k, bytes.read_byte(hrr, body + 2 + k)); k = k + 1; }
+            self.hrrCookieLen = clen;
+        }
+        p = body + elen;
+    }
+    // Transcript rewrite (RFC 8446 4.4.1): replace ClientHello1 with
+    //   message_hash(254) || 00 00 Hash.length || Hash(ClientHello1)
+    // using the now-negotiated suite hash, then append the HelloRetryRequest.
+    let hl = trHashLen(self);
+    let h1 = bytes.alloc(hl);
+    trHash(self, h1);                              // hash of ClientHello1 (the whole current transcript)
+    self.trLen = 0;
+    let mh = bytes.alloc(4 + hl);
+    bytes.write_byte(mh, 0, 0xfe);                 // HandshakeType message_hash(254)
+    bytes.write_byte(mh, 1, 0); bytes.write_byte(mh, 2, 0); bytes.write_byte(mh, 3, hl);
+    let k = 0;
+    while (k < hl) { bytes.write_byte(mh, 4 + k, bytes.read_byte(h1, k)); k = k + 1; }
+    trAdd(self, mh, 4 + hl);
+    trAdd(self, hrr, hrrLen);
+    bytes.free(mh); bytes.free(h1);
+    return group;
+}
+
+pub fn hrrCookiePtr(self: TlsClient): ptr { return self.hrrCookie; }
+pub fn hrrCookieSize(self: TlsClient): int { return self.hrrCookieLen; }
 
 // Running transcript held as a growable buffer directly in the client (the prefix is hashed on demand).
 fn trAdd(self: TlsClient, msg: ptr, n: int): void {
@@ -488,3 +579,6 @@ pub fn certListSize(self: TlsClient): int { return self.certListLen; }
 
 // The ALPN protocol the server selected in EncryptedExtensions, or "" if none was negotiated.
 pub fn selectedAlpn(self: TlsClient): string { return self.alpnSel; }
+
+// Hash of the current running transcript with the negotiated suite hash (exposed for tests / diagnostics).
+pub fn transcriptHashInto(self: TlsClient, out: ptr): void { trHash(self, out); }

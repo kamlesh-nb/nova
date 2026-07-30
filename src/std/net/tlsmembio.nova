@@ -146,6 +146,8 @@ pub struct ClientBio impl TlsBio {
     pub scratch: ptr, pub scap: int,
     pub plain: ptr,
     pub verify: bool, pub host: string, pub store: truststore.TrustStore,   // CA trust policy (when verify)
+    pub rnd: ptr, pub sid: ptr, pub ephPub: ptr, pub ephPubP: ptr, pub alpn: string,   // retained to rebuild ClientHello2
+    pub hrrDone: bool,                     // a HelloRetryRequest was already consumed (a second is illegal)
 
     pub fn feed(self: ClientBio, data: ptr, n: int): void { self.buf.feed(data, n); }
     pub fn markClosed(self: ClientBio): void { self.buf.closed = true; }
@@ -162,10 +164,26 @@ pub struct ClientBio impl TlsBio {
             if (ctype == 0x14) { continue; }             // skip ChangeCipherSpec
             if (self.state == 1) {
                 if (ctype != 0x16) { self.state = 0 - 1; return 0 - 1; }
-                if (tlsClient.isHelloRetryRequest(at(self.scratch, 5)) || tlsClient.hasDowngradeSentinel(at(self.scratch, 5))) {
-                    self.state = 0 - 1; return 0 - 1;
+                let sh = at(self.scratch, 5);
+                if (tlsClient.hasDowngradeSentinel(sh)) { self.state = 0 - 1; return 0 - 1; }
+                if (tlsClient.isHelloRetryRequest(sh)) {
+                    // HelloRetryRequest (RFC 8446 4.1.4): retry with a single-group key_share (+ cookie).
+                    if (self.hrrDone) { self.state = 0 - 1; return 0 - 1; }   // a second HRR is illegal
+                    self.hrrDone = true;
+                    let group = self.cl.processHelloRetryRequest(sh, m - 5);
+                    let mask = 3;                          // no key_share in the HRR: re-offer both shares
+                    if (group == 0x0017) { mask = 2; }
+                    else if (group == 0x001d) { mask = 1; }
+                    else if (group != 0) { self.state = 0 - 1; return 0 - 1; }   // group we cannot satisfy
+                    let ch2 = bytes.alloc(1024);
+                    let ch2Len = tlsClient.buildClientHelloEx(self.rnd, self.sid, self.ephPub, self.ephPubP,
+                        self.host, self.alpn, mask, self.cl.hrrCookiePtr(), self.cl.hrrCookieSize(), ch2);
+                    self.cl.addClientHello(ch2, ch2Len);   // ClientHello2 into the transcript
+                    self.buf.appendRecord(0x16, 0x03, 0x03, ch2, ch2Len);
+                    bytes.free(ch2);
+                    continue;                              // stay in state 1, await the real ServerHello
                 }
-                self.cl.processServerHello(at(self.scratch, 5), m - 5);
+                self.cl.processServerHello(sh, m - 5);
                 self.state = 2;
             } else if (self.state == 2) {
                 let r = self.cl.feedHandshake(self.scratch, m);
@@ -280,6 +298,10 @@ pub struct ClientBio impl TlsBio {
         self.buf.freeBuffers();
         bytes.free(self.scratch);
         bytes.free(self.plain);
+        bytes.free(self.rnd);
+        bytes.free(self.sid);
+        bytes.free(self.ephPub);
+        bytes.free(self.ephPubP);
     }
 }
 
@@ -291,6 +313,14 @@ pub fn newClientBio(host: string): ClientBio {
 // Like newClientBio, but offers ALPN: `alpn` is a comma-separated protocol list (e.g. "h2,http/1.1").
 // After the handshake, selectedAlpn() reports what the server chose.
 pub fn newClientBioAlpn(host: string, alpn: string): ClientBio {
+    return newClientBioGroups(host, alpn, 3);
+}
+
+// The general client-bio constructor. `groupMask` selects which key_share entries the initial ClientHello
+// carries (bit 0 = x25519, bit 1 = secp256r1; 3 = both). Offering fewer shares yields a smaller
+// ClientHello at the cost of a possible HelloRetryRequest round-trip if the server prefers a group we
+// listed but did not share; the bio handles that retry transparently.
+pub fn newClientBioGroups(host: string, alpn: string, groupMask: int): ClientBio {
     let priv = bytes.alloc(32); fillRandom(priv, 32);
     let base = bytes.alloc(32); bytes.write_byte(base, 0, 9);
     let ephPub = bytes.alloc(32); x25519.scalarMult(ephPub, priv, base);
@@ -303,16 +333,21 @@ pub fn newClientBioAlpn(host: string, alpn: string): ClientBio {
     let rnd = bytes.alloc(32); fillRandom(rnd, 32);
     let sid = bytes.alloc(32); fillRandom(sid, 32);
     let ch = bytes.alloc(1024);
-    let chLen = tlsClient.buildClientHello(rnd, sid, ephPub, ephPubP, host, alpn, ch);
+    let emptyCookie = bytes.alloc(1);
+    let chLen = tlsClient.buildClientHelloEx(rnd, sid, ephPub, ephPubP, host, alpn, groupMask, emptyCookie, 0, ch);
+    bytes.free(emptyCookie);
     cl.addClientHello(ch, chLen);
     mb.appendRecord(0x16, 0x03, 0x01, ch, chLen);
     // Dummy ChangeCipherSpec for middlebox compatibility (RFC 8446 appendix D.4).
     let ccs = bytes.alloc(1); bytes.write_byte(ccs, 0, 1);
     mb.appendRecord(0x14, 0x03, 0x03, ccs, 1);
 
-    bytes.free(base); bytes.free(ephPub); bytes.free(ephPubP); bytes.free(rnd); bytes.free(sid); bytes.free(ch); bytes.free(ccs);
+    // rnd/sid/ephPub/ephPubP are retained on the bio (not freed) so a HelloRetryRequest can rebuild an
+    // identical ClientHello2 with a single-group key_share.
+    bytes.free(base); bytes.free(ch); bytes.free(ccs);
     return ClientBio { buf: mb, cl: cl, state: 1, scratch: bytes.alloc(33792), scap: 33792, plain: bytes.alloc(33792),
-                       verify: false, host: host, store: truststore.TrustStore { ders: List<long>(), lens: List<int>() } };
+                       verify: false, host: host, store: truststore.TrustStore { ders: List<long>(), lens: List<int>() },
+                       rnd: rnd, sid: sid, ephPub: ephPub, ephPubP: ephPubP, alpn: alpn, hrrDone: false };
 }
 
 // Like newClientBio, but enforces CA trust: after the handshake the server chain must validate against
