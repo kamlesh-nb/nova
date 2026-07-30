@@ -61,6 +61,53 @@ two unstarted pieces are: (1) replace the `sh`/`rsync` install step with a cross
 Zig `Step` or per-OS branch), and (2) add a Windows-host static-LLVM dist to `configureLlvmLink` (mirror
 the linux/macos entries). Until both exist, direct Windows-host development is not possible; use WSL.
 
+### Windows host TODO — the plan for when a real Windows 10 machine is available
+
+Everything below is **compile-verified (cross-compiles to a PE32+ .exe) but NOT run-verified** — there has
+been no Windows host in the loop. On a Windows 10 box, do these in order and verify each *live* (a real
+run + assert), not just a compile. Detail lives in `docs/design/cpp-runtime-retirement-plan.md` and the
+memory notes `nova-reactor-eventloop-iocp`, `nova-windows-runtime-port`, `nova-m14-max-ffi-reach`.
+
+1. **Get a native toolchain first.** Either finish the two native-`zig build` blockers above, OR build the
+   `nova` compiler under WSL and cross-compile programs to Windows, then run the `.exe` on the Windows
+   side. (You need runnable Windows binaries to test any of the below.)
+
+2. **IOCP reactor runtime** (`src/std/net/eventloop_windows.nova` — the `Poller`). It cross-compiles and is
+   selected on Windows, but the runtime is unproven and these pieces are **stubbed / unfinished**:
+   - `nova_run_reactors` on the C side is kqueue/POSIX-oriented — needs a **Windows-threads** path
+     (`concurrency.cpp` is `#ifndef _WIN32`-guarded; the coroutine scheduler + thread spawn need a Windows
+     impl or verification).
+   - **socket→port association**: each socket must be `CreateIoCompletionPort`'d before overlapped I/O
+     (`eventloop_windows.associate`); reactorio does not call it yet — wire it in.
+   - **AcceptEx / ConnectEx**: `submit` returns -1 for `OP_ACCEPT`/`OP_CONNECT` today (only `WSARecv`/
+     `WSASend` are done). Implement them (they need `WSAIoctl` to fetch the function pointers).
+   - **int-kq vs 64-bit port HANDLE**: `Reactor.kq` is `int` but the IOCP port is a 64-bit `HANDLE`; the
+     `Poller` keeps the full-width `port` but the reactor's shared int field truncates it — reconcile.
+   - **Cross-reactor wake**: use `PostQueuedCompletionStatus` (the completion-model analogue of
+     EVFILT_USER / eventfd).
+   - **Test**: conformance reactor cases (192, 200-205, 209) + a live reactor echo/HTTP server + the
+     async HTTPS client, all run on Windows.
+
+3. **Process management on Windows** (M14.1, `io.cpp` `nova_process_*`). The POSIX path is real; the
+   `#else` Windows path is **stubs returning -1**. Implement over `CreateProcessW` + `CreatePipe` +
+   `WaitForSingleObject` + `GetExitCodeProcess` + `TerminateProcess` (or, if M14.1 lands first, expose the
+   POSIX-neutral `os/proc` seam and add `os/proc_windows`). **Test**: `process.nova`'s spawn + stdin/stdout
+   round trip + wait + kill.
+
+4. **File / dir on Windows** (currently NOT Windows-native). File/dir I/O is Nova over `os/sys`, which is
+   **POSIX-flavored** — on Windows it rides mingw's compat layer (`open`/`read`/`mkdir`/`dirent`), which
+   covers the basics but not long paths, UTF-16 names, or proper Windows semantics. First **verify** the
+   mingw path actually works at runtime (read/write a file, list a dir); if it falls short, add an
+   `os/fs_windows` split (mirror `os/socket_windows`) over `CreateFileW`/`ReadFile`/`WriteFile`/
+   `CreateDirectoryW`/`FindFirstFileW`/`FindNextFileW`. **Test**: `io/file` read/write + `io/dir` listing.
+
+5. **Then run the full corpus on Windows** (`conformance/run.sh` under Git Bash / MSYS) and record a
+   Windows baseline the way there is a `wasm-run-baseline.txt`.
+
+Order of dependence: (1) toolchain → then (4) file/dir + (3) process are independent and simplest to
+verify → (2) IOCP reactor is the largest and should be last. The linker already adds
+`-lws2_32 -lmswsock -lbcrypt`.
+
 ## Layout
 
 - `src/` — lexer, parser, `type_checker.zig`, **`sema/`** (infer/mono/ownership/lower/symbols — the
