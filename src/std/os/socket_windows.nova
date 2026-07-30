@@ -77,6 +77,93 @@ pub fn makeSockaddrIn(port: int, addrBE: long): ptr {
 pub fn getAddrInfo(node: ptr, service: ptr, hints: ptr, res: ptr): int { return winsock.getaddrinfo(node, service, hints, res); }
 pub fn freeAddrInfo(res: ptr): void { winsock.freeaddrinfo(res); }
 
+// --- blocking (synchronous) socket layer (M14.2) — Windows over Winsock. Compile-verified only. --------
+fn isNumericIPv4(s: string): bool {
+    if (s.length == 0) { return false; }
+    let i = 0;
+    while (i < s.length) { let c = s[i]; if (!((c >= 48 && c <= 57) || c == 46)) { return false; } i = i + 1; }
+    return true;
+}
+fn parseIPv4BE(s: string): long {
+    let result = 0 as long; let cur = 0; let shift = 0; let i = 0;
+    while (i < s.length) {
+        let c = s[i];
+        if (c == 46) { result = result | ((cur as long) << shift); shift = shift + 8; cur = 0; }
+        else { cur = cur * 10 + (c - 48); }
+        i = i + 1;
+    }
+    result = result | ((cur as long) << shift);
+    return result;
+}
+pub fn resolveHost4(host: string): long {
+    if (isNumericIPv4(host)) { return parseIPv4BE(host); }
+    let n = host.length;
+    let node = bytes.alloc(n + 1);
+    let i = 0;
+    while (i < n) { bytes.write_byte(node, i, host[i]); i = i + 1; }
+    bytes.write_byte(node, n, 0);
+    let res = bytes.alloc(8);
+    bytes.write_ptr(res, 0, 0);
+    let rc = getAddrInfo(node, 0, 0, res);
+    bytes.free(node);
+    if (rc != 0) { bytes.free(res); return -1 as long; }
+    let head = bytes.read_ptr(res, 0);
+    let ai = head;
+    let addr = -1 as long;
+    while (ai != 0 && addr == (-1 as long)) {
+        let fam = bytes.read_i32(ai, 4) as int;
+        if (fam == AF_INET) { let sa = bytes.read_ptr(ai, 32); addr = bytes.read_i32(sa, 4) as long; }  // ADDRINFOA ai_addr @32
+        else { ai = bytes.read_ptr(ai, 40); }
+    }
+    if (head != 0) { freeAddrInfo(head); }
+    bytes.free(res);
+    return addr;
+}
+pub fn connectBlocking(host: string, port: int): int {
+    let addr = resolveHost4(host);
+    if (addr == (-1 as long)) { return -1; }
+    let fd = newTcp();
+    if (fd < 0) { return -1; }
+    let sa = makeSockaddrIn(port, addr);
+    let r = connectSock(fd, sa, 16);
+    bytes.free(sa);
+    if (r != 0) { close(fd); return -1; }
+    return fd;
+}
+// Windows SO_RCVTIMEO/SNDTIMEO take a DWORD milliseconds (not a timeval).
+pub fn setTimeout(fd: int, ms: int): int {
+    let d = bytes.alloc(4);
+    bytes.write_i32(d, 0, (if (ms > 0) ms else 0) as long);
+    let r1 = winsock.setsockopt(fd as long, winsock.SOL_SOCKET, 4102, d, 4);   // SO_RCVTIMEO
+    let r2 = winsock.setsockopt(fd as long, winsock.SOL_SOCKET, 4101, d, 4);   // SO_SNDTIMEO
+    bytes.free(d);
+    return if (r1 == 0 && r2 == 0) 0 else -1;
+}
+pub fn sendAll(fd: int, buf: long, len: int): int {
+    let total = 0;
+    while (total < len) {
+        let n = sendSock(fd, buf + (total as long), len - total);
+        if (n <= 0) { return if (total > 0) total else -1; }
+        total = total + (n as int);
+    }
+    return total;
+}
+pub fn recvOnce(fd: int, buf: long, max: int): int {
+    let n = recvSock(fd, buf, max);
+    return if (n < 0) -1 else (n as int);
+}
+pub fn listenAny(port: int): int {
+    let fd = newTcp();
+    if (fd < 0) { return -1; }
+    setReuseAddr(fd);
+    let sa = makeSockaddrIn(port, 0);
+    let br = bindSock(fd, sa, 16);
+    bytes.free(sa);
+    if (br != 0 || listenSock(fd, 128) != 0) { close(fd); return -1; }
+    return fd;
+}
+pub fn acceptOne(fd: int): int { return acceptSock(fd, 0, 0); }
+
 pub fn boundPort(fd: int): int {
     let sa = bytes.alloc(16);
     let len = bytes.alloc(4);

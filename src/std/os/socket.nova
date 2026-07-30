@@ -81,3 +81,121 @@ pub fn boundPort(fd: int): int { return sys.boundPort(fd); }
 // (which would drag its POSIX `socket` extern into the Windows graph and collide with winsock's).
 pub fn getAddrInfo(node: ptr, service: ptr, hints: ptr, res: ptr): int { return sys.getaddrinfo(node, service, hints, res); }
 pub fn freeAddrInfo(res: ptr): void { sys.freeaddrinfo(res); }
+
+// --- blocking (synchronous) socket layer (M14.2: retires io.cpp's nova_socket_* to Nova) --------------
+// The blocking TCP stack (net/tcp, sync web/client) is built on these. IPv4 only, matching the async
+// reactor path (reactorio.resolveHost4); getaddrinfo's ai_addr offset differs by platform.
+
+fn soRcvTimeo(): int { return if (platform.isLinux) 20 else 4102; }   // macOS SO_RCVTIMEO = 0x1006
+fn soSndTimeo(): int { return if (platform.isLinux) 21 else 4101; }   // macOS SO_SNDTIMEO = 0x1005
+fn aiAddrOffset(): int { return if (platform.isLinux) 24 else 32; }   // struct addrinfo ai_addr
+
+fn isNumericIPv4(s: string): bool {
+    if (s.length == 0) { return false; }
+    let i = 0;
+    while (i < s.length) {
+        let c = s[i];
+        if (!((c >= 48 && c <= 57) || c == 46)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+fn parseIPv4BE(s: string): long {
+    let result = 0 as long;
+    let cur = 0;
+    let shift = 0;
+    let i = 0;
+    while (i < s.length) {
+        let c = s[i];
+        if (c == 46) { result = result | ((cur as long) << shift); shift = shift + 8; cur = 0; }
+        else { cur = cur * 10 + (c - 48); }
+        i = i + 1;
+    }
+    result = result | ((cur as long) << shift);
+    return result;
+}
+
+// Resolve a host to the big-endian IPv4 address for makeSockaddrIn, or -1. Numeric IPv4 parsed directly;
+// a hostname goes through getaddrinfo (a blocking DNS lookup, acceptable on the synchronous path).
+pub fn resolveHost4(host: string): long {
+    if (isNumericIPv4(host)) { return parseIPv4BE(host); }
+    let n = host.length;
+    let node = bytes.alloc(n + 1);
+    let i = 0;
+    while (i < n) { bytes.write_byte(node, i, host[i]); i = i + 1; }
+    bytes.write_byte(node, n, 0);
+    let res = bytes.alloc(8);
+    bytes.write_ptr(res, 0, 0);
+    let rc = getAddrInfo(node, 0, 0, res);
+    bytes.free(node);
+    if (rc != 0) { bytes.free(res); return -1 as long; }
+    let head = bytes.read_ptr(res, 0);
+    let ai = head;
+    let addr = -1 as long;
+    let off = aiAddrOffset();
+    while (ai != 0 && addr == (-1 as long)) {
+        let fam = bytes.read_i32(ai, 4) as int;
+        if (fam == AF_INET) {
+            let sa = bytes.read_ptr(ai, off);
+            addr = bytes.read_i32(sa, 4) as long;
+        } else {
+            ai = bytes.read_ptr(ai, 40);
+        }
+    }
+    if (head != 0) { freeAddrInfo(head); }
+    bytes.free(res);
+    return addr;
+}
+
+// Blocking connect to host:port. Returns a connected fd, or -1.
+pub fn connectBlocking(host: string, port: int): int {
+    let addr = resolveHost4(host);
+    if (addr == (-1 as long)) { return -1; }
+    let fd = newTcp();
+    if (fd < 0) { return -1; }
+    let sa = makeSockaddrIn(port, addr);
+    let r = connectSock(fd, sa, 16);
+    bytes.free(sa);
+    if (r != 0) { close(fd); return -1; }
+    return fd;
+}
+
+// A receive/send timeout in ms via SO_RCVTIMEO / SO_SNDTIMEO (a `struct timeval` on POSIX).
+pub fn setTimeout(fd: int, ms: int): int {
+    let tv = bytes.alloc(16);
+    bytes.write_ptr(tv, 0, (if (ms > 0) (ms / 1000) else 0) as long);
+    bytes.write_ptr(tv, 8, (if (ms > 0) ((ms % 1000) * 1000) else 0) as long);
+    let r1 = sys.setsockopt(fd, solSocket(), soRcvTimeo(), tv, 16);
+    let r2 = sys.setsockopt(fd, solSocket(), soSndTimeo(), tv, 16);
+    bytes.free(tv);
+    return if (r1 == 0 && r2 == 0) 0 else -1;
+}
+
+// Send all `len` bytes from `buf`; returns bytes sent or -1.
+pub fn sendAll(fd: int, buf: long, len: int): int {
+    let total = 0;
+    while (total < len) {
+        let n = sendSock(fd, buf + (total as long), len - total);
+        if (n <= 0) { return if (total > 0) total else -1; }
+        total = total + (n as int);
+    }
+    return total;
+}
+// Receive up to `max` bytes into `buf`; returns byte count (0 = EOF) or -1.
+pub fn recvOnce(fd: int, buf: long, max: int): int {
+    let n = recvSock(fd, buf, max);
+    return if (n < 0) -1 else (n as int);
+}
+
+// Create a listening socket bound to INADDR_ANY:port (SO_REUSEADDR), backlog 128. Returns fd or -1.
+pub fn listenAny(port: int): int {
+    let fd = newTcp();
+    if (fd < 0) { return -1; }
+    setReuseAddr(fd);
+    let sa = makeSockaddrIn(port, 0);
+    let br = bindSock(fd, sa, 16);
+    bytes.free(sa);
+    if (br != 0 || listenSock(fd, 128) != 0) { close(fd); return -1; }
+    return fd;
+}
+pub fn acceptOne(fd: int): int { return acceptSock(fd, 0, 0); }

@@ -298,44 +298,6 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         try compiler.func_map.put("close", close_fn);
         try compiler.func_map.put("nova_close", close_fn);
 
-        const listen_type = core.LLVMFunctionType(compiler.i32_type, &one_param_i32, 1, 0);
-        const listen_fn = core.LLVMAddFunction(compiler.module, "nova_socket_listen", listen_type);
-        try compiler.func_map.put("nova_socket_listen", listen_fn);
-
-        const accept_type = core.LLVMFunctionType(compiler.i32_type, &one_param_i32, 1, 0);
-        const accept_fn = core.LLVMAddFunction(compiler.module, "nova_socket_accept", accept_type);
-        try compiler.func_map.put("nova_socket_accept", accept_fn);
-
-        var send_params = [_]types.LLVMTypeRef{ compiler.i32_type, compiler.ptr_type };
-        const send_type = core.LLVMFunctionType(compiler.i32_type, &send_params, 2, 0);
-        const send_fn = core.LLVMAddFunction(compiler.module, "nova_socket_send", send_type);
-        try compiler.func_map.put("nova_socket_send", send_fn);
-
-        var send_n_params = [_]types.LLVMTypeRef{ compiler.i32_type, compiler.ptr_type, compiler.i32_type };
-        const send_n_type = core.LLVMFunctionType(compiler.i32_type, &send_n_params, 3, 0);
-        const send_n_fn = core.LLVMAddFunction(compiler.module, "nova_socket_send_n", send_n_type);
-        try compiler.func_map.put("nova_socket_send_n", send_n_fn);
-
-        var recv_params = [_]types.LLVMTypeRef{ compiler.i32_type, compiler.ptr_type, compiler.i32_type };
-        const recv_type = core.LLVMFunctionType(compiler.i32_type, &recv_params, 3, 0);
-        const recv_fn = core.LLVMAddFunction(compiler.module, "nova_socket_recv", recv_type);
-        try compiler.func_map.put("nova_socket_recv", recv_fn);
-
-        var connect_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.i32_type };
-        const connect_type = core.LLVMFunctionType(compiler.i32_type, &connect_params, 2, 0);
-        const connect_fn = core.LLVMAddFunction(compiler.module, "nova_socket_connect", connect_type);
-        try compiler.func_map.put("nova_socket_connect", connect_fn);
-
-        var connect_to_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.i32_type, compiler.i32_type };
-        const connect_to_type = core.LLVMFunctionType(compiler.i32_type, &connect_to_params, 3, 0);
-        const connect_to_fn = core.LLVMAddFunction(compiler.module, "nova_socket_connect_timeout", connect_to_type);
-        try compiler.func_map.put("nova_socket_connect_timeout", connect_to_fn);
-
-        var set_to_params = [_]types.LLVMTypeRef{ compiler.i32_type, compiler.i32_type };
-        const set_to_type = core.LLVMFunctionType(compiler.i32_type, &set_to_params, 2, 0);
-        const set_to_fn = core.LLVMAddFunction(compiler.module, "nova_socket_set_timeout", set_to_type);
-        try compiler.func_map.put("nova_socket_set_timeout", set_to_fn);
-
         const test_reset_type = core.LLVMFunctionType(compiler.void_type, null, 0, 0);
         const test_reset_fn = core.LLVMAddFunction(compiler.module, "nova_test_reset", test_reset_type);
         try compiler.func_map.put("nova_test_reset", test_reset_fn);

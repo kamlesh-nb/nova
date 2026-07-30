@@ -91,14 +91,6 @@ pub const externs = [_]Builtin{
     .{ .receiver = "", .name = "nova_spin_create", .ret = .long },
     .{ .receiver = "", .name = "nova_spin_lock", .ret = .void_ },
     .{ .receiver = "", .name = "nova_spin_unlock", .ret = .void_ },
-    .{ .receiver = "", .name = "nova_socket_send", .ret = .int },
-    .{ .receiver = "", .name = "nova_socket_send_n", .ret = .int },
-
-    .{ .receiver = "", .name = "nova_socket_recv", .ret = .int },
-    .{ .receiver = "", .name = "nova_socket_connect", .ret = .int },
-
-    .{ .receiver = "", .name = "nova_socket_connect_timeout", .ret = .int },
-    .{ .receiver = "", .name = "nova_socket_set_timeout", .ret = .int },
     .{ .receiver = "", .name = "nova_close", .ret = .void_ },
     .{ .receiver = "", .name = "nova_getrandom", .ret = .void_ },
 

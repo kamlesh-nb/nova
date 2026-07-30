@@ -14,7 +14,7 @@ import assert;
 import bytes;
 import net.tcp.server;
 import net.tcp.client;
-import net.tcp.socket;
+import net.tcp.stream;
 
 @test
 fn test_send_n_is_binary_safe(): void {

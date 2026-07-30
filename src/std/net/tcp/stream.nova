@@ -1,6 +1,10 @@
 
 import bytes;
-import mem.allocator;
+import os.socket;
+
+// The blocking TCP stream over os/socket (M14.2: was the C nova_socket_* layer). `socket.*` here is the
+// os.socket module; net/tcp/{client,server} and web/client go through the facade fns below so they never
+// import os.socket directly (its qualifier would collide with this module's `socket` qualifier).
 
 pub struct TcpStream {
     pub fd: int,
@@ -10,21 +14,20 @@ pub struct TcpStream {
     }
 
     pub fn write(self: TcpStream, data: string): int {
-        return nova_socket_send(self.fd, data);
+        return socket.sendAll(self.fd, data as long, data.length);
     }
 
     pub fn writeBytes(self: TcpStream, data: ptr, len: int): int {
-        return nova_socket_send_n(self.fd, data, len);
+        return socket.sendAll(self.fd, data as long, len);
     }
 
     pub fn read(self: TcpStream, max_len: int): string {
         let buf = bytes.alloc(max_len);
-        let n = nova_socket_recv(self.fd, buf, max_len);
+        let n = socket.recvOnce(self.fd, buf, max_len);
         if (n <= 0) {
             bytes.free(buf);
             return "";
         }
-
         let str_ptr = bytes.alloc(n);
         let i = 0;
         while (i < n) {
@@ -39,7 +42,7 @@ pub struct TcpStream {
         let buf = bytes.alloc(max_len);
         let total = 0;
         while (total < max_len) {
-            let n = nova_socket_recv(self.fd, buf + total, max_len - total);
+            let n = socket.recvOnce(self.fd, buf + total, max_len - total);
             if (n <= 0) break;
             total = total + n;
         }
@@ -47,7 +50,6 @@ pub struct TcpStream {
             bytes.free(buf);
             return "";
         }
-
         let str_ptr = bytes.alloc(total);
         let i = 0;
         while (i < total) {
@@ -59,12 +61,12 @@ pub struct TcpStream {
     }
 
     pub fn setTimeout(self: TcpStream, timeoutMs: int): int {
-        return nova_socket_set_timeout(self.fd, timeoutMs);
+        return socket.setTimeout(self.fd, timeoutMs);
     }
 
     pub fn close(self: TcpStream): void {
         if (self.fd != -1) {
-            nova_close(self.fd);
+            socket.close(self.fd);
             self.fd = -1;
         }
     }
@@ -74,9 +76,15 @@ pub struct TcpStream {
     }
 }
 
-// Close a raw fd. The tcp/web modules go through nova_close rather than sys.close, because
-// importing os/sys pulls in its `socket` function, which collides by name with the `socket`
-// module these files use (a name-based-resolution limit; migrating needs an os.socket split).
 pub fn closeFd(fd: int): int {
-    return nova_close(fd);
+    return socket.close(fd);
 }
+
+// --- facade over os.socket so net/tcp/{client,server} + web/client don't import os.socket directly -----
+pub fn connect(host: string, port: int): int { return socket.connectBlocking(host, port); }
+pub fn setTimeout(fd: int, ms: int): int { return socket.setTimeout(fd, ms); }
+pub fn listenAny(port: int): int { return socket.listenAny(port); }
+pub fn acceptOne(fd: int): int { return socket.acceptOne(fd); }
+pub fn sendStr(fd: int, data: string): int { return socket.sendAll(fd, data as long, data.length); }
+pub fn sendBytes(fd: int, data: ptr, len: int): int { return socket.sendAll(fd, data as long, len); }
+pub fn recvBytes(fd: int, buf: ptr, max: int): int { return socket.recvOnce(fd, buf as long, max); }

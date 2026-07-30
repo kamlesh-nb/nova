@@ -1,23 +1,27 @@
 
 import bytes;
-import net.tcp.socket;
+import net.tcp.stream;
 
 pub struct TcpClient {
-    pub fn connect(host: string, port: int): socket.TcpStream {
-        let fd = nova_socket_connect(host, port);
+    pub fn connect(host: string, port: int): stream.TcpStream {
+        let fd = stream.connect(host, port);
         if (fd < 0) {
-            let dummy: socket.TcpStream = undefined;
+            let dummy: stream.TcpStream = undefined;
             return dummy;
         }
-        return socket.TcpStream(fd);
+        return stream.TcpStream(fd);
     }
 
-    pub fn connectTimeout(host: string, port: int, timeoutMs: int): socket.TcpStream {
-        let fd = nova_socket_connect_timeout(host, port, timeoutMs);
+    // Blocking connect, then bound subsequent I/O with a receive/send timeout (M14.2 simplified the
+    // connect itself to blocking; the timeout applies to reads/writes on the returned stream).
+    pub fn connectTimeout(host: string, port: int, timeoutMs: int): stream.TcpStream {
+        let fd = stream.connect(host, port);
         if (fd < 0) {
-            let dummy: socket.TcpStream = undefined;
+            let dummy: stream.TcpStream = undefined;
             return dummy;
         }
-        return socket.TcpStream(fd);
+        let s = stream.TcpStream(fd);
+        if (timeoutMs > 0) { s.setTimeout(timeoutMs); }
+        return s;
     }
 }

@@ -1,26 +1,26 @@
 
 import bytes;
 import mem.allocator;
-import net.tcp.socket;
+import net.tcp.stream;
 
 pub struct TcpListener {
     pub fd: int,
 
     pub fn bind(port: int): TcpListener {
-        let fd = nova_socket_listen(port);
+        let fd = stream.listenAny(port);
         let listener = bytes.new_with_allocator<TcpListener>(allocator.globalAllocator());
         listener.fd = fd;
         return listener;
     }
 
-    pub fn accept(self: TcpListener): socket.TcpStream {
-        let client_fd = nova_socket_accept(self.fd);
-        return socket.TcpStream(client_fd);
+    pub fn accept(self: TcpListener): stream.TcpStream {
+        let client_fd = stream.acceptOne(self.fd);
+        return stream.TcpStream(client_fd);
     }
 
     pub fn close(self: TcpListener): void {
         if (self.fd != -1) {
-            socket.closeFd(self.fd);
+            stream.closeFd(self.fd);
             self.fd = -1;
         }
     }

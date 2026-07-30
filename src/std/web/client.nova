@@ -6,7 +6,7 @@ import string;
 import list;
 import map;
 import net.tcp.client;
-import net.tcp.socket;
+import net.tcp.stream;
 import net.tlsmembio;
 import crypto.tls.truststore;
 import net.url;
@@ -100,7 +100,7 @@ struct HttpConn {
             let n = self.bio.pull(self.scratch, self.cap);
             if (n <= 0) { return; }
             // Ciphertext is binary (may contain NUL): send exactly n bytes from the buffer pointer.
-            nova_socket_send_n(self.fd, self.scratch, n);
+            stream.sendBytes(self.fd, self.scratch, n);
         }
     }
 
@@ -110,7 +110,7 @@ struct HttpConn {
             self.tlsFlush();
             if (st == 0) { return 0; }
             if (st < 0) { return 0 - 1; }
-            let n = nova_socket_recv(self.fd, self.scratch, self.cap);
+            let n = stream.recvBytes(self.fd, self.scratch, self.cap);
             if (n <= 0) { return 0 - 1; }
             self.bio.feed(self.scratch, n);
         }
@@ -123,7 +123,7 @@ struct HttpConn {
             self.tlsFlush();
             return data.length;
         }
-        return nova_socket_send(self.fd, data);
+        return stream.sendStr(self.fd, data);
     }
 
     fn recv(self: HttpConn, max: int): string {
@@ -133,7 +133,7 @@ struct HttpConn {
                 let pl = self.bio.readApp(out, max);
                 if (pl > 0) { let s = cliBufToStr(out, pl); bytes.free(out); return s; }
                 if (pl < 0) { bytes.free(out); return ""; }
-                let n = nova_socket_recv(self.fd, self.scratch, self.cap);
+                let n = stream.recvBytes(self.fd, self.scratch, self.cap);
                 if (n <= 0) { bytes.free(out); return ""; }
                 self.bio.feed(self.scratch, n);
             }
@@ -141,7 +141,7 @@ struct HttpConn {
             return "";
         }
         let buf = bytes.alloc(max);
-        let n = nova_socket_recv(self.fd, buf, max);
+        let n = stream.recvBytes(self.fd, buf, max);
         if (n <= 0) { bytes.free(buf); return ""; }
         let sp = cliBufToStr(buf, n);
         bytes.free(buf);
@@ -151,7 +151,7 @@ struct HttpConn {
     fn close(self: HttpConn): void {
         self.bio.closeBio();
         bytes.free(self.scratch);
-        if (self.fd >= 0) { socket.closeFd(self.fd); self.fd = -1; }
+        if (self.fd >= 0) { stream.closeFd(self.fd); self.fd = -1; }
     }
 }
 
@@ -259,11 +259,11 @@ pub struct Http {
     fn doRequest(method: string, urlStr: string, headers: Map<string, string>, body: string, timeoutMs: int, hopsLeft: int, caPem: string): response.Response {
         let u = url.parse(urlStr);
 
-        let fd = if (timeoutMs > 0) nova_socket_connect_timeout(u.host, u.port, timeoutMs) else nova_socket_connect(u.host, u.port);
+        let fd = stream.connect(u.host, u.port);
         if (fd < 0) {
             return response.Response(Status.InternalServerError, "connection failed");
         }
-        if (timeoutMs > 0) { nova_socket_set_timeout(fd, timeoutMs); }
+        if (timeoutMs > 0) { stream.setTimeout(fd, timeoutMs); }
         // When caPem is provided (and the URL is https), enforce CA trust: the server chain must validate
         // against a root in the bundle for u.host at UTC-now, or the handshake fails. The store is bound to
         // a named local so its backing lists outlive the bio (an inline temporary would be released early).
