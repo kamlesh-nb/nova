@@ -59,9 +59,11 @@ fn transcript(): void {
 // ServerHello parsing extracts the negotiated cipher suite and the server key_share.
 @test
 fn server_hello(): void {
-    let sp = bytes.alloc(32);
-    let cipher = handshake.parseServerHello(hexBuf(SH), 90, sp);
+    let sp = bytes.alloc(65);
+    let grp = bytes.alloc(2);
+    let cipher = handshake.parseServerHello(hexBuf(SH), 90, sp, grp);
     assert.equalInt(cipher, 0x1301);              // TLS_AES_128_GCM_SHA256
+    assert.equalInt((bytes.read_byte(grp, 0) << 8) | bytes.read_byte(grp, 1), 0x001d);  // x25519
     assert.isTrue(eqHex(sp, 32, SERVER_PUB));
 }
 

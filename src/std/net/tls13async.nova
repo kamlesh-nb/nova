@@ -9,6 +9,7 @@ import bytes;
 import net.reactorio;
 import crypto.tls.13.tlsClient;
 import crypto.tls.13.tlsServer;
+import crypto.ecc.p256;
 import crypto.random;
 
 fn at(b: ptr, off: int): ptr { return (b as long + off) as ptr; }
@@ -78,7 +79,9 @@ pub async fn handshake(io: TlsIO, cl: tlsClient.TlsClient, ephPub: ptr, host: st
     let rnd = bytes.alloc(32); fillRandom(rnd, 32);
     let sid = bytes.alloc(32); fillRandom(sid, 32);
     let ch = bytes.alloc(1024);
-    let chLen = tlsClient.buildClientHello(rnd, sid, ephPub, host, ch);
+    let ephPubP = bytes.alloc(65); p256.derivePublic(ephPubP, cl.ephP256);
+    let chLen = tlsClient.buildClientHello(rnd, sid, ephPub, ephPubP, host, ch);
+    bytes.free(ephPubP);
     cl.addClientHello(ch, chLen);
 
     let rec = bytes.alloc(chLen + 5);

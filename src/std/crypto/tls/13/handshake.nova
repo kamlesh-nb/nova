@@ -173,8 +173,11 @@ pub fn masterSecret(kind: int, handshakeSecret: ptr, out: ptr): void {
 // ---- ServerHello parse (extract the negotiated cipher suite and the server key_share) ----
 
 // Returns the cipher suite (e.g. 0x1301 for TLS_AES_128_GCM_SHA256) and writes the server's key_share
-// public value (X25519, 32 bytes) into pubOut. Returns -1 if no key_share was found.
-pub fn parseServerHello(sh: ptr, shLen: int, pubOut: ptr): int {
+// public value into pubOut (32 bytes for x25519, 65 bytes uncompressed for secp256r1). The selected
+// NamedGroup (0x001d x25519 or 0x0017 secp256r1) is written big-endian into groupOut[0..1]; it is left 0
+// if no key_share was found.
+pub fn parseServerHello(sh: ptr, shLen: int, pubOut: ptr, groupOut: ptr): int {
+    bytes.write_byte(groupOut, 0, 0); bytes.write_byte(groupOut, 1, 0);
     let p = 4 + 2 + 32;                            // msg header, legacy_version, random
     let sidLen = bytes.read_byte(sh, p);
     p = p + 1 + sidLen;
@@ -187,7 +190,9 @@ pub fn parseServerHello(sh: ptr, shLen: int, pubOut: ptr): int {
         let etype = (bytes.read_byte(sh, p) << 8) | bytes.read_byte(sh, p + 1);
         let elen = (bytes.read_byte(sh, p + 2) << 8) | bytes.read_byte(sh, p + 3);
         let body = p + 4;
-        if (etype == 0x0033) {                     // key_share
+        if (etype == 0x0033) {                     // key_share (server: a single KeyShareEntry)
+            bytes.write_byte(groupOut, 0, bytes.read_byte(sh, body));
+            bytes.write_byte(groupOut, 1, bytes.read_byte(sh, body + 1));
             let klen = (bytes.read_byte(sh, body + 2) << 8) | bytes.read_byte(sh, body + 3);
             let i = 0;
             while (i < klen) { bytes.write_byte(pubOut, i, bytes.read_byte(sh, body + 4 + i)); i = i + 1; }

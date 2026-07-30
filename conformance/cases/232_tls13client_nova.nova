@@ -42,7 +42,7 @@ const CLIENT_FINISHED: string = "a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98
 
 @test
 fn full_client_handshake(): void {
-    let c = tlsClient.newClient(hexBuf(CLIENT_PRIV));
+    let c = tlsClient.newClient(hexBuf(CLIENT_PRIV), bytes.alloc(32));
     c.addClientHello(hexBuf(CH), 196);
     c.processServerHello(hexBuf(SH), 90);
 
@@ -79,13 +79,19 @@ fn build_client_hello(): void {
     let i = 0;
     while (i < 32) { bytes.write_byte(rnd, i, i); bytes.write_byte(sid, i, 255 - i); i = i + 1; }
     let out = bytes.alloc(512);
-    let n = tlsClient.buildClientHello(rnd, sid, pk, "example.com", out);
+    // A recognizable 65-byte secp256r1 key_share (0x04 || bytes 1..64).
+    let pkP = bytes.alloc(65);
+    let k = 0;
+    while (k < 65) { bytes.write_byte(pkP, k, k); k = k + 1; }
+    let n = tlsClient.buildClientHello(rnd, sid, pk, pkP, "example.com", out);
     // Handshake type 0x01, and the 3-byte body length equals n-4.
     assert.equalInt(bytes.read_byte(out, 0), 0x01);
     let bodyLen = (bytes.read_byte(out, 1) << 16) | (bytes.read_byte(out, 2) << 8) | bytes.read_byte(out, 3);
     assert.equalInt(bodyLen, n - 4);
-    // The key_share is the last 32 bytes and equals our public key.
-    assert.isTrue(eqHex(at(out, n - 32), 32, "99381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c"));
+    // The message ends with the secp256r1 key_share (last 65 bytes); the x25519 share (32 bytes) precedes
+    // its 4-byte entry header, so it sits at n-101.
+    assert.isTrue(eqHex(at(out, n - 65), 65, "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40"));
+    assert.isTrue(eqHex(at(out, n - 101), 32, "99381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c"));
 }
 
 fn at(buf: ptr, off: int): ptr { return (buf as long + off) as ptr; }
@@ -93,7 +99,7 @@ fn at(buf: ptr, off: int): ptr { return (buf as long + off) as ptr; }
 // The incremental feedHandshake path (used for live, fragment-tolerant reassembly) verifies the flight.
 @test
 fn flight_reassembly(): void {
-    let c = tlsClient.newClient(hexBuf(CLIENT_PRIV));
+    let c = tlsClient.newClient(hexBuf(CLIENT_PRIV), bytes.alloc(32));
     c.addClientHello(hexBuf(CH), 196);
     c.processServerHello(hexBuf(SH), 90);
     let r = c.feedHandshake(hexBuf(REC), 679);
@@ -105,7 +111,7 @@ fn flight_reassembly(): void {
 // A tampered flight (flipped ciphertext byte) fails verification.
 @test
 fn tampered_flight(): void {
-    let c = tlsClient.newClient(hexBuf(CLIENT_PRIV));
+    let c = tlsClient.newClient(hexBuf(CLIENT_PRIV), bytes.alloc(32));
     c.addClientHello(hexBuf(CH), 196);
     c.processServerHello(hexBuf(SH), 90);
     let rec = hexBuf(REC);

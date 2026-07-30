@@ -8,6 +8,7 @@ import bytes;
 import crypto.tls.13.tls;
 import crypto.tls.13.handshake;
 import crypto.ecc.x25519;
+import crypto.ecc.p256;
 import crypto.x509;
 import crypto.hash.sha256;
 import crypto.hash.sha512;
@@ -39,11 +40,13 @@ fn putSni(out: ptr, p: int, host: string): int {
 }
 
 // Build a TLS 1.3 ClientHello handshake message into out for the given server hostname. Offers X25519 +
-// AES-128-GCM-SHA256 with server_name (SNI), supported_versions=1.3, supported_groups=x25519,
-// signature_algorithms (RSA-PSS/PKCS1 + ECDSA P-256, all SHA-256), psk_key_exchange_modes (psk_dhe_ke),
-// and a key_share carrying our ephemeral public key. random and sessionId are 32 bytes each; ephPub is our
-// 32-byte X25519 public key. Returns the message length.
-pub fn buildClientHello(random: ptr, sessionId: ptr, ephPub: ptr, host: string, out: ptr): int {
+// AES-128-GCM-SHA256 / AES-256-GCM-SHA384 / ChaCha20-Poly1305 with server_name (SNI),
+// supported_versions=1.3, supported_groups=x25519+secp256r1, signature_algorithms (RSA-PSS/PKCS1 + ECDSA
+// P-256, all SHA-256), psk_key_exchange_modes (psk_dhe_ke), and two key_share entries carrying our
+// ephemeral public keys (the server picks one group). random and sessionId are 32 bytes each; ephPub is
+// our 32-byte X25519 public key and ephPubP256 is our 65-byte uncompressed secp256r1 point. Returns the
+// message length.
+pub fn buildClientHello(random: ptr, sessionId: ptr, ephPub: ptr, ephPubP256: ptr, host: string, out: ptr): int {
     let p = 4;                                     // reserve the 4-byte handshake header
     bytes.write_byte(out, p, 0x03); bytes.write_byte(out, p + 1, 0x03); p = p + 2;   // legacy_version
     let i = 0;
@@ -60,13 +63,19 @@ pub fn buildClientHello(random: ptr, sessionId: ptr, ephPub: ptr, host: string, 
     let extStart = p;
     p = putSni(out, p, host);                      // server_name (SNI)
     p = putHex(out, p, "002b0003020304");          // supported_versions: TLS 1.3
-    p = putHex(out, p, "000a00040002001d");        // supported_groups: x25519
+    p = putHex(out, p, "000a00060004001d0017");    // supported_groups: x25519, secp256r1
     p = putHex(out, p, "000d00080006080404030401");// signature_algorithms: rsa_pss/ecdsa/rsa_pkcs1 SHA-256
     p = putHex(out, p, "002d00020101");            // psk_key_exchange_modes: psk_dhe_ke
-    p = putHex(out, p, "003300260024001d0020");    // key_share: x25519 entry header
+    // key_share: ext_type 0033, ext_len 006b, client_shares_len 0069, then two KeyShareEntry values:
+    // x25519 (001d, 32 bytes) followed by secp256r1 (0017, 65-byte uncompressed point).
+    p = putHex(out, p, "0033006b0069001d0020");    // key_share header + x25519 entry header
     i = 0;
     while (i < 32) { bytes.write_byte(out, p + i, bytes.read_byte(ephPub, i)); i = i + 1; }
     p = p + 32;
+    p = putHex(out, p, "00170041");                // secp256r1 entry header (65-byte key_exchange)
+    i = 0;
+    while (i < 65) { bytes.write_byte(out, p + i, bytes.read_byte(ephPubP256, i)); i = i + 1; }
+    p = p + 65;
     let extLen = p - extStart;
     bytes.write_byte(out, extLenPos, (extLen >> 8) & 0xff);
     bytes.write_byte(out, extLenPos + 1, extLen & 0xff);
@@ -109,6 +118,7 @@ struct TlsClient {
     pub kind: int,                       // HKDF hash: 0 = SHA-256
     pub suite: int,                      // 0 = AES-128-GCM, 1 = AES-256-GCM, 2 = ChaCha20-Poly1305
     pub eph: ptr,                        // our ephemeral X25519 private key (32 bytes)
+    pub ephP256: ptr,                    // our ephemeral secp256r1 private scalar (32 bytes)
     pub trBuf: ptr, pub trLen: int, pub trCap: int,
     pub hs: ptr,                         // handshake secret
     pub chs: ptr, pub shs: ptr,          // client / server handshake traffic secrets
@@ -126,9 +136,9 @@ struct TlsClient {
     pub certListOff: int, pub certListLen: int,   // certificate_list region within hsBuf
 }
 
-pub fn newClient(ephPriv: ptr): TlsClient {
+pub fn newClient(ephPriv: ptr, ephPrivP256: ptr): TlsClient {
     return TlsClient {
-        kind: 0, suite: 0, eph: ephPriv, trBuf: bytes.alloc(4096), trLen: 0, trCap: 4096,
+        kind: 0, suite: 0, eph: ephPriv, ephP256: ephPrivP256, trBuf: bytes.alloc(4096), trLen: 0, trCap: 4096,
         hs: bytes.alloc(48), chs: bytes.alloc(48), shs: bytes.alloc(48),
         cKey: bytes.alloc(32), cIv: bytes.alloc(12), sKey: bytes.alloc(32), sIv: bytes.alloc(12),
         master: bytes.alloc(48), cap: bytes.alloc(48), sap: bytes.alloc(48),
@@ -169,14 +179,18 @@ pub fn addClientHello(self: TlsClient, chMsg: ptr, chLen: int): void {
 // Process the ServerHello: negotiate the suite, run the ECDHE, and derive the handshake-phase secrets
 // and keys. shMsg is the ServerHello handshake message.
 pub fn processServerHello(self: TlsClient, shMsg: ptr, shLen: int): void {
-    let serverPub = bytes.alloc(32);
-    let cipher = handshake.parseServerHello(shMsg, shLen, serverPub);
+    let serverPub = bytes.alloc(65);               // fits x25519 (32) or secp256r1 uncompressed (65)
+    let groupBuf = bytes.alloc(2);
+    let cipher = handshake.parseServerHello(shMsg, shLen, serverPub, groupBuf);
+    let group = (bytes.read_byte(groupBuf, 0) << 8) | bytes.read_byte(groupBuf, 1);
     if (cipher == 0x1302) { self.suite = 1; self.kind = 1; }
     else if (cipher == 0x1303) { self.suite = 2; self.kind = 0; }
     else { self.suite = 0; self.kind = 0; }
 
+    // Run the ECDHE for the group the server selected in its key_share.
     let ecdhe = bytes.alloc(32);
-    x25519.scalarMult(ecdhe, self.eph, serverPub);
+    if (group == 0x0017) { p256.ecdh(ecdhe, self.ephP256, serverPub); }
+    else { x25519.scalarMult(ecdhe, self.eph, serverPub); }
     let early = bytes.alloc(48); tls.earlySecret(self.kind, early);
     let derived = bytes.alloc(48); tls.deriveDerived(self.kind, early, derived);
     tls.extractSecret(self.kind, derived, ecdhe, 32, self.hs);
@@ -187,7 +201,7 @@ pub fn processServerHello(self: TlsClient, shMsg: ptr, shLen: int): void {
     tls.deriveTraffic(self.kind, self.hs, "s hs traffic", hSH, self.shs);
     tls.deriveKeyIv(self.kind, self.suite, self.chs, self.cKey, self.cIv);
     tls.deriveKeyIv(self.kind, self.suite, self.shs, self.sKey, self.sIv);
-    bytes.free(serverPub); bytes.free(ecdhe); bytes.free(early); bytes.free(derived); bytes.free(hSH);
+    bytes.free(serverPub); bytes.free(groupBuf); bytes.free(ecdhe); bytes.free(early); bytes.free(derived); bytes.free(hSH);
 }
 
 // Decrypt and process the server's encrypted handshake flight (one TLSCiphertext record containing
