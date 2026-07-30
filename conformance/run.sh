@@ -172,8 +172,8 @@ classify_failure() {
     echo "COMPILED-AND-RAN"          # the check is NOT firing
   elif printf '%s' "$out" | grep -q "in main (nova)"; then
     echo "compiler-crash"            # a Zig backtrace reached the user
-  elif printf '%s' "$out" | grep -q "Type checking failed\|undefined identifier\|is not public"; then
-    echo "typecheck"           # includes F1-4 cross-module visibility rejections
+  elif printf '%s' "$out" | grep -q "Type checking failed\|undefined identifier\|is not public\|in module '"; then
+    echo "typecheck"           # includes F1-4 cross-module visibility + F1-7 module-fn rejections
   elif printf '%s' "$out" | grep -q "Parser error\|Expect failed:"; then
     echo "parse"
   elif printf '%s' "$out" | grep -q "(compilation failed)"; then

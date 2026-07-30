@@ -272,6 +272,12 @@ pub const Inferer = struct {
 
     first_fatal_ident: ?[]const u8 = null,
     first_fatal_span: ?ast.Span = null,
+    // F1-7: a qualified call `mod.fn(...)` where `mod` is a known module but has no function `fn` — the
+    // confident subset of the codegen MethodOrFunctionNotFound, rejected here so it fires before codegen.
+    fatal_unresolved_calls: usize = 0,
+    first_fatal_call_recv: ?[]const u8 = null,
+    first_fatal_call_field: ?[]const u8 = null,
+    first_fatal_call_span: ?ast.Span = null,
 
     captured_return: ?TypeId = null,
 
@@ -620,6 +626,23 @@ pub const Inferer = struct {
                     }
 
                     if (try self.staticMethodReturn(fa)) |t| return self.ok(t);
+                    // F1-7: every resolution path above failed. If the receiver is a KNOWN MODULE and the
+                    // module has no such function, this is a genuinely unresolved qualified call — the
+                    // confident subset of codegen's MethodOrFunctionNotFound, so reject it here (located)
+                    // before codegen. Value/struct method calls stay with codegen (generics/traits).
+                    if (fa.object.kind == .ident) {
+                        const recv = fa.object.kind.ident;
+                        if (self.lookup(recv) == null and self.isKnownModule(recv) and
+                            self.resolveModuleFn(recv, fa.field, fa.span) == null)
+                        {
+                            self.fatal_unresolved_calls += 1;
+                            if (self.first_fatal_call_recv == null) {
+                                self.first_fatal_call_recv = recv;
+                                self.first_fatal_call_field = fa.field;
+                                self.first_fatal_call_span = fa.span;
+                            }
+                        }
+                    }
                     if (fa.object.kind == .ident) try self.note(fa.object.kind.ident);
                 }
 
@@ -1242,6 +1265,15 @@ pub const Inferer = struct {
         if (self.symtab.findModuleByImportName(name) != null) return false;
         if (self.symtab.findModuleBySegment(name) != null) return false;
         return true;
+    }
+
+    fn isKnownModule(self: *Inferer, name: []const u8) bool {
+        if (self.current_module) |cm| {
+            if (self.symtab.resolveImportedModule(cm, name) != null) return true;
+        }
+        if (self.symtab.findModuleByImportName(name) != null) return true;
+        if (self.symtab.findModuleBySegment(name) != null) return true;
+        return false;
     }
 
     fn moduleCallReturn(self: *Inferer, fa: ast.FieldAccess, out_sym: *?types.SymbolId) !?TypeId {

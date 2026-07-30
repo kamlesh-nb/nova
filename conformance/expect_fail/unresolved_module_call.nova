@@ -1,0 +1,16 @@
+// EXPECT-FAIL: typecheck
+// F1-7 (2026-07-30): a qualified call `mod.fn(...)` where `mod` is a KNOWN module but has no function
+// `fn` is now rejected in SEMA with a located error (`file:line:col: no function 'noSuchFn' in module
+// 'string'`), BEFORE codegen. Previously this slipped to codegen and produced the terse span-less "no
+// such method or function". This is the CONFIDENT subset of the codegen MethodOrFunctionNotFound: the
+// receiver is a module (not a value), so there is no UFCS / generic / trait path — if the module has no
+// such function, the call is genuinely unresolvable. Value/struct method calls (p.noSuchMethod, see
+// unresolved_call.nova) still resolve at codegen, where generics and traits are fully known.
+import assert;
+import string;
+
+@test
+fn t_unresolved_module_call(): void {
+    let n = string.definitelyNotAFunction("x");
+    assert.equalInt(n, 0);
+}

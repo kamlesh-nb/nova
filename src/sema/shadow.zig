@@ -360,6 +360,15 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
         std.process.exit(1);
     }
 
+    if (inf.fatal_unresolved_calls > 0) {
+        const sp = inf.first_fatal_call_span orelse ast.Span{ .start = 0, .end = 0, .line = 0, .col = 0, .file = "" };
+        std.debug.print(
+            "  \x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m no function '{s}' in module '{s}'\x1b[0m — check the name and that it is `pub`.\n",
+            .{ sp.file, sp.line, sp.col, inf.first_fatal_call_field orelse "?", inf.first_fatal_call_recv orelse "?" },
+        );
+        std.process.exit(1);
+    }
+
     const etotal = inf.stats.typed + inf.stats.unresolved;
     const pct: usize = if (etotal == 0) 0 else (inf.stats.typed * 100) / etotal;
     out("=== F2 shadow: EXPRESSION surface ===\n", .{});
