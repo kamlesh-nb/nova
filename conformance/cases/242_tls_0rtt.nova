@@ -65,8 +65,8 @@ fn early_key_derivation(): void {
     let out = bytes.alloc(2048);
     buildRttCh(c, out);
     c.deriveEarlyKeys();
-    assert.isTrue(eqHex(c.eKey, 16, "409b330560fedd86ede7c5c138646611"));
-    assert.isTrue(eqHex(c.eIv, 12, "b1a3dd1333f6c49f1210c7fa"));
+    assert.isTrue(eqHex(c.eKey, 16, "1a0f99897da291b9ea2edaab697cdd3d"));
+    assert.isTrue(eqHex(c.eIv, 12, "b48a5ca26790918c39ac8dbf"));
 }
 
 // EndOfEarlyData is a 4-byte handshake message (05 00 00 00) wrapped as a protected record (outer type

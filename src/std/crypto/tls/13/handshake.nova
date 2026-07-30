@@ -195,6 +195,22 @@ pub fn serverAcceptedEarlyData(ee: ptr, off: int): bool {
     return false;
 }
 
+// Parse a record_size_limit extension (0x001c, RFC 8449) out of an EncryptedExtensions message (type
+// 0x08): the peer's maximum receive record plaintext size. Returns the value, or 0 if absent.
+pub fn parseRecordSizeLimit(ee: ptr, off: int): int {
+    let p = off + 4;
+    let extLen = (bytes.read_byte(ee, p) << 8) | bytes.read_byte(ee, p + 1);
+    p = p + 2;
+    let end = p + extLen;
+    while (p + 4 <= end) {
+        let etype = (bytes.read_byte(ee, p) << 8) | bytes.read_byte(ee, p + 1);
+        let elen = (bytes.read_byte(ee, p + 2) << 8) | bytes.read_byte(ee, p + 3);
+        if (etype == 0x001c) { return (bytes.read_byte(ee, p + 4) << 8) | bytes.read_byte(ee, p + 5); }
+        p = p + 4 + elen;
+    }
+    return 0;
+}
+
 // Parse the server's ALPN selection out of an EncryptedExtensions handshake message (type 0x08). `ee` is
 // the buffer and `off` the offset of the message start (the 0x08 type byte). Returns the selected protocol
 // name (e.g. "http/1.1"), or "" if the server sent no application_layer_protocol_negotiation extension.

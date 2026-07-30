@@ -48,6 +48,7 @@ struct TlsServer {
     pub group: int,                      // negotiated group (001d x25519 / 0017 secp256r1 / 0018 secp384r1)
     pub haveX25519: bool, pub haveP256: bool, pub haveP384: bool,   // which key_shares the client offered
     pub alpnOffer: string, pub alpnSel: string, // protocols we support / the one we selected ("" = none)
+    pub recvLimit: int, pub sendLimit: int,     // record_size_limit we advertise / the client's (RFC 8449)
     pub sid: ptr, pub sidLen: int,       // client legacy_session_id (echoed back)
     pub trBuf: ptr, pub trLen: int, pub trCap: int,
     pub hs: ptr, pub chs: ptr, pub shs: ptr,
@@ -64,6 +65,7 @@ pub fn newServer(certDer: ptr, certLen: int, signKey: ptr, ephPriv: ptr, ephPriv
         certDer: certDer, certLen: certLen, signKey: signKey,
         clientPub: bytes.alloc(32), clientPubP: bytes.alloc(65), clientPubP384: bytes.alloc(97), group: 0x001d,
         haveX25519: false, haveP256: false, haveP384: false, alpnOffer: "", alpnSel: "",
+        recvLimit: 16385, sendLimit: 16385,
         sid: bytes.alloc(32), sidLen: 0,
         trBuf: bytes.alloc(8192), trLen: 0, trCap: 8192,
         hs: bytes.alloc(48), chs: bytes.alloc(48), shs: bytes.alloc(48),
@@ -182,6 +184,8 @@ pub fn processClientHello(self: TlsServer, ch: ptr, chLen: int): void {
             }
         } else if (etype == 0x0010) {              // ALPN
             self.alpnSel = negotiateAlpn(self.alpnOffer, ch, body, elen);
+        } else if (etype == 0x001c) {              // record_size_limit (RFC 8449)
+            self.sendLimit = (bytes.read_byte(ch, body) << 8) | bytes.read_byte(ch, body + 1);
         }
         p = body + elen;
     }
@@ -310,6 +314,10 @@ pub fn buildFlight(self: TlsServer, out: ptr): int {
         while (ai < nl) { bytes.write_byte(inner, ip + ai, self.alpnSel[ai]); ai = ai + 1; }
         ip = ip + nl;
     }
+    // record_size_limit (RFC 8449): advertise the max plaintext record we will receive.
+    bytes.write_byte(inner, ip, 0x00); bytes.write_byte(inner, ip + 1, 0x1c); ip = ip + 2;
+    bytes.write_byte(inner, ip, 0x00); bytes.write_byte(inner, ip + 1, 0x02); ip = ip + 2;
+    bytes.write_byte(inner, ip, (self.recvLimit >> 8) & 0xff); bytes.write_byte(inner, ip + 1, self.recvLimit & 0xff); ip = ip + 2;
     let eeExtLen = ip - eeExtStart;
     bytes.write_byte(inner, eeExtLenPos, (eeExtLen >> 8) & 0xff); bytes.write_byte(inner, eeExtLenPos + 1, eeExtLen & 0xff);
     w3(inner, eeBodyLenPos, ip - (eeBodyLenPos + 3));

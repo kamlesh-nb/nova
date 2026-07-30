@@ -102,3 +102,45 @@ fn server_p384_group(): void {
     assert.equalInt(sb.readApp(out, 64), 2);
     assert.equalInt(bytes.read_byte(out, 0), 65);
 }
+
+// record_size_limit (RFC 8449): the server advertises a 200-byte limit, so the client fragments a large
+// write into records whose plaintext is at most 199 bytes; the server still reassembles the full payload.
+@test
+fn client_respects_record_size_limit(): void {
+    let cb = tlsmembio.newClientBio("localhost");
+    let sb = tlsmembio.newServerBio(hexBuf(SRV_CERT), 421, hexBuf(SRV_PRIV));
+    sb.setRecordSizeLimit(200);
+    let tmp = bytes.alloc(33792);
+    assert.isTrue(handshake(cb, sb, tmp));
+    assert.equalInt(cb.cl.sendLimit, 200);          // parsed the server's advertised limit
+
+    // Write 500 bytes; expect >= 3 records, each with ciphertext <= 199 + 1 (type) + 16 (tag) = 216.
+    let payload = bytes.alloc(500);
+    let i = 0; while (i < 500) { bytes.write_byte(payload, i, i & 0xff); i = i + 1; }
+    cb.writeApp(payload, 500);
+    let outbuf = bytes.alloc(4096);
+    let total = cb.pull(outbuf, 4096);
+    let recs = 0;
+    let p = 0;
+    while (p + 5 <= total) {
+        let rlen = (bytes.read_byte(outbuf, p + 3) << 8) | bytes.read_byte(outbuf, p + 4);
+        assert.isTrue(rlen <= 216);
+        recs = recs + 1;
+        p = p + 5 + rlen;
+    }
+    assert.isTrue(recs >= 3);
+
+    // The server reassembles all 500 bytes across the fragments.
+    sb.feed(outbuf, total);
+    let got = bytes.alloc(1024);
+    let n = 0;
+    while (n < 500) {
+        let k = sb.readApp((got as long + n) as ptr, 1024 - n);
+        if (k <= 0) { n = 0 - 1; }
+        if (n < 0) { n = 500; }                     // break on error/want-read
+        else { n = n + k; }
+    }
+    assert.equalInt(n, 500);
+    assert.equalInt(bytes.read_byte(got, 0), 0);
+    assert.equalInt(bytes.read_byte(got, 499), 499 & 0xff);
+}

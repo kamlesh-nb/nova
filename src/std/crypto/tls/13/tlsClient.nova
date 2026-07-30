@@ -111,6 +111,7 @@ pub fn buildClientHelloEx(random: ptr, sessionId: ptr, ephPub: ptr, ephPubP256: 
     p = putHex(out, p, "000a00080006001d00170018");// supported_groups: x25519, secp256r1, secp384r1
     p = putHex(out, p, "000d00080006080404030401");// signature_algorithms: rsa_pss/ecdsa/rsa_pkcs1 SHA-256
     p = putHex(out, p, "002d00020101");            // psk_key_exchange_modes: psk_dhe_ke
+    p = putHex(out, p, "001c00024001");            // record_size_limit: 16385 (TLS 1.3 max) (RFC 8449)
     p = putAlpn(out, p, alpn);                      // application_layer_protocol_negotiation (if offered)
     if (cookieLen > 0) {                            // cookie: echo the HelloRetryRequest cookie
         bytes.write_byte(out, p, 0x00); bytes.write_byte(out, p + 1, 0x2c); p = p + 2;   // ext_type: cookie
@@ -241,6 +242,7 @@ struct TlsClient {
     pub offerPsk: bool, pub pskAccepted: bool,    // this handshake offers a PSK / the server accepted it
     pub eKey: ptr, pub eIv: ptr, pub eSeq: long,  // 0-RTT client_early_traffic key/IV/sequence
     pub offerEarly: bool, pub earlyAccepted: bool, // this handshake offers 0-RTT / the server accepted it
+    pub sendLimit: int,                           // peer's record_size_limit (RFC 8449); max send plaintext = sendLimit-1
 }
 
 pub fn newClient(ephPriv: ptr, ephPrivP256: ptr, ephPrivP384: ptr): TlsClient {
@@ -256,6 +258,7 @@ pub fn newClient(ephPriv: ptr, ephPrivP256: ptr, ephPrivP384: ptr): TlsClient {
         resMaster: bytes.alloc(48), ticket: bytes.alloc(1), ticketLen: 0, ticketPsk: bytes.alloc(48),
         ticketAgeAdd: 0, ticketKind: 0, haveTicket: false, offerPsk: false, pskAccepted: false,
         eKey: bytes.alloc(32), eIv: bytes.alloc(12), eSeq: 0, offerEarly: false, earlyAccepted: false,
+        sendLimit: 16385,
     };
 }
 
@@ -445,6 +448,7 @@ pub fn processFlight(self: TlsClient, record: ptr, recLen: int): bool {
         } else if (mtype == 0x08) {                  // EncryptedExtensions (carries the ALPN selection)
             self.alpnSel = handshake.parseAlpnSelection(inner, p);
             if (self.offerEarly) { self.earlyAccepted = handshake.serverAcceptedEarlyData(inner, p); }
+            let rsl1 = handshake.parseRecordSizeLimit(inner, p); if (rsl1 > 0) { self.sendLimit = rsl1; }
             trAdd(self, at(inner, p), msgLen);
         } else {
             trAdd(self, at(inner, p), msgLen);
@@ -525,6 +529,7 @@ pub fn feedHandshake(self: TlsClient, record: ptr, recLen: int): int {
         } else if (mtype == 0x08) {                // EncryptedExtensions (carries the ALPN selection)
             self.alpnSel = handshake.parseAlpnSelection(self.hsBuf, mp);
             if (self.offerEarly) { self.earlyAccepted = handshake.serverAcceptedEarlyData(self.hsBuf, mp); }
+            let rsl2 = handshake.parseRecordSizeLimit(self.hsBuf, mp); if (rsl2 > 0) { self.sendLimit = rsl2; }
             trAdd(self, at(self.hsBuf, mp), msgLen);
         } else {
             trAdd(self, at(self.hsBuf, mp), msgLen);

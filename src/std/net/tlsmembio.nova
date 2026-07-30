@@ -226,10 +226,19 @@ pub struct ClientBio impl TlsBio {
     }
 
     pub fn writeApp(self: ClientBio, data: ptr, n: int): int {
-        let out = bytes.alloc(n + 64);
-        let m = self.cl.encryptApp(data, n, out);
-        self.buf.appendOut(out, m);
-        bytes.free(out);
+        // Fragment into records no larger than the peer's record_size_limit (RFC 8449): the max
+        // application plaintext per TLS 1.3 record is sendLimit - 1 (the content-type byte).
+        let cap = self.cl.sendLimit - 1;
+        let off = 0;
+        while (off < n) {
+            let chunk = n - off;
+            if (chunk > cap) { chunk = cap; }
+            let out = bytes.alloc(chunk + 64);
+            let m = self.cl.encryptApp((data as long + off) as ptr, chunk, out);
+            self.buf.appendOut(out, m);
+            bytes.free(out);
+            off = off + chunk;
+        }
         return n;
     }
 
@@ -469,6 +478,8 @@ pub struct ServerBio impl TlsBio {
     // that the client also offered and echoes it in EncryptedExtensions. selectedAlpn reports the choice.
     pub fn offerAlpn(self: ServerBio, alpn: string): void { self.srv.alpnOffer = alpn; }
     pub fn selectedAlpn(self: ServerBio): string { return self.srv.alpnSel; }
+    // Advertise a record_size_limit (RFC 8449): the client must then send records no larger than this.
+    pub fn setRecordSizeLimit(self: ServerBio, limit: int): void { self.srv.recvLimit = limit; }
     pub fn pendingOut(self: ServerBio): int { return self.buf.olen; }
     pub fn pull(self: ServerBio, buf: ptr, max: int): int { return self.buf.pull(buf, max); }
 
@@ -504,10 +515,18 @@ pub struct ServerBio impl TlsBio {
     }
 
     pub fn writeApp(self: ServerBio, data: ptr, n: int): int {
-        let out = bytes.alloc(n + 64);
-        let m = self.srv.encryptApp(data, n, out);
-        self.buf.appendOut(out, m);
-        bytes.free(out);
+        // Fragment to the client's record_size_limit (RFC 8449): max plaintext per record = sendLimit - 1.
+        let cap = self.srv.sendLimit - 1;
+        let off = 0;
+        while (off < n) {
+            let chunk = n - off;
+            if (chunk > cap) { chunk = cap; }
+            let out = bytes.alloc(chunk + 64);
+            let m = self.srv.encryptApp((data as long + off) as ptr, chunk, out);
+            self.buf.appendOut(out, m);
+            bytes.free(out);
+            off = off + chunk;
+        }
         return n;
     }
 

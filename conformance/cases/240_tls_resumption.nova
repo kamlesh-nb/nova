@@ -40,9 +40,9 @@ fn resumption_binder_offset(): void {
 
     // The binder is the last 32 bytes. Reference computed independently (HMAC over the transcript hash of
     // out[0 .. n-35], keyed by finished_key(res binder key(early_secret(PSK)))).
-    assert.equalInt(n, 300);
+    assert.equalInt(n, 306);
     assert.isTrue(eqHex((out as long + n - 32) as ptr, 32,
-        "f67e9513bf838b33607a3ec82f44740d55c9028b9caf2f596404d2f2ba03c14d"));
+        "6ba41ef04b1a557b2a4927abb71a92342897fb4f0d8190d21e658cb5d78fb4ff"));
     // The byte just before the binder entry (out[n-33]) is the binder-entry length (0x20 = 32).
     assert.equalInt(bytes.read_byte(out, n - 33), 0x20);
     // and out[n-35..n-34] is the binders-list length (0x0021 = 33), excluded from the binder transcript.
