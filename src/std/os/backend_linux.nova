@@ -1,0 +1,5 @@
+// Target-conditional reactor backend seam (Linux). Selected when platform.os == "linux". Native mechanism
+// is epoll (readiness); a future io_uring backend would set COMPLETION_BASED = true. See the darwin file.
+pub fn name(): string { return "epoll"; }
+pub const EVENT_SIZE: int = 12;          // sizeof(struct epoll_event), packed
+pub const COMPLETION_BASED: bool = false;

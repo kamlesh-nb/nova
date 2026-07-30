@@ -1,0 +1,8 @@
+// Target-conditional reactor backend seam (macOS/BSD). Selected by the target-conditional file rule
+// (see language-specification.md 8): `import os.backend;` compiles THIS file when platform.os == "darwin".
+// Step 1 lands only the identity + shape of the backend; step 2 (EventLoop trait + Reactor<B>) fills in
+// the completion-based readiness/submit surface. On Darwin the native mechanism is kqueue (readiness),
+// which the EventLoop layer will drive in completion-emulation mode.
+pub fn name(): string { return "kqueue"; }
+pub const EVENT_SIZE: int = 32;          // sizeof(struct kevent)
+pub const COMPLETION_BASED: bool = false; // native model is readiness; completion is emulated

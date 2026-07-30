@@ -1,0 +1,6 @@
+// Target-conditional reactor backend seam (Windows). Selected when platform.os == "windows". Native
+// mechanism is IOCP, which is COMPLETION-based (a proactor): the EventLoop layer submits overlapped I/O
+// and drains completions, so this is the backend the completion-shaped EventLoop trait matches directly.
+pub fn name(): string { return "iocp"; }
+pub const EVENT_SIZE: int = 32;          // sizeof(OVERLAPPED_ENTRY) on x64
+pub const COMPLETION_BASED: bool = true;

@@ -288,6 +288,28 @@ switch (self) {
   - A path segment is normally an identifier, but a **version directory** may be a bare integer:
     `import crypto.tls.13.tls;` addresses `crypto/tls/13/tls.nova`, qualified as `tls.*`. The integer
     may not be the first segment.
+- **Compiler-provided `platform` module** *(→ this session)* — `import platform;` resolves to a module the
+  compiler **synthesizes** from the compilation target (it is not a file on disk; its values always match
+  the actual `--target`, or the host for `--native`). It exports compile-time constants describing the
+  target:
+  - `platform.os: string` — one of `"darwin"`, `"linux"`, `"windows"`, `"wasm"`.
+  - `platform.arch: string` — one of `"aarch64"`, `"x86_64"`, `"wasm32"`.
+  - `platform.pointerSize: int` — 8 (or 4 on wasm32).
+  - `platform.isDarwin`, `platform.isLinux`, `platform.isWindows`, `platform.isWasm`, `platform.isPosix: bool`
+    — convenience predicates (`isPosix` = darwin or linux).
+
+  Use it for **fine-grained**, cross-compilable target choices (a byte offset, an errno value, a
+  constant). Because it is compile-time-known, a future release may prune `if (platform.isX) {…}` branches
+  whose condition is comptime-false before codegen; **until then, do not place a platform-only `extern`
+  behind a `platform` `if`** — the symbol would still be emitted and fail to link on the other OS. For
+  divergent-extern code, use target-conditional files (next bullet) instead.
+- **Target-conditional files (build constraints)** *(→ this session)* — when resolving module `M`, if a
+  file `M_<os>.nova` exists next to `M.nova` (where `<os>` is the target's `platform.os` value), the
+  suffixed file is compiled **instead of** the base file. So `import os.backend;` compiles
+  `os/backend_darwin.nova` on macOS, `os/backend_linux.nova` on Linux, `os/backend_windows.nova` on
+  Windows. This is how whole modules with platform-divergent syscalls (e.g. the reactor's kqueue / epoll
+  / IOCP backends) are selected — the non-target files are never parsed, so their externs never reach the
+  linker. The base `M.nova` (if present) is the fallback when no suffixed file matches the target.
 - **`pub`** marks a declaration exported from its module. **Cross-module visibility is enforced**: a
   non-`pub` **function**, **type** (struct/enum), or **const** referenced from another module is a hard
   error — "not public" *(→ this session, commit 7d7a76d; the stdlib is `pub` where it must be)*.

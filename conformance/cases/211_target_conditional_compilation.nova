@@ -1,0 +1,25 @@
+// Target-conditional compilation: the compiler-synthesized `platform` module + target-conditional file
+// selection (language-specification.md 8). On the native macOS gate `platform` reflects the host and
+// `import os.backend;` resolves os/backend_darwin.nova via the file-suffix rule. This is step 1 of the
+// EventLoop/IOCP reactor work: it proves the mechanism the multi-backend reactor is built on.
+import assert;
+import platform;
+import os.backend;
+
+@test fn platform_reflects_host(): void {
+    // Native build => host facts. The macOS conformance host is aarch64 darwin.
+    assert.equalStr(platform.os, "darwin");
+    assert.isTrue(platform.isDarwin);
+    assert.isFalse(platform.isLinux);
+    assert.isFalse(platform.isWindows);
+    assert.isFalse(platform.isWasm);
+    assert.isTrue(platform.isPosix);
+    assert.equalInt(platform.pointerSize, 8);
+}
+
+@test fn backend_file_chosen_by_target(): void {
+    // `os.backend` compiled os/backend_darwin.nova, not _linux/_windows.
+    assert.equalStr(backend.name(), "kqueue");
+    assert.equalInt(backend.EVENT_SIZE, 32);
+    assert.isFalse(backend.COMPLETION_BASED);
+}

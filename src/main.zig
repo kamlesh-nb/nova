@@ -220,12 +220,125 @@ fn getSharedAssetPath(allocator: std.mem.Allocator, init: std.process.Init, rela
     return try std.fmt.allocPrint(allocator, "{s}/.nova/{s}", .{ home, relative_path });
 }
 
+// Compile-target facts, derived once per compilation from `--target`/triple (or the host for --native)
+// and exposed to Nova source as the synthesized `builtin` module + used to pick target-conditional files.
+const TargetInfo = struct {
+    os: []const u8, // "darwin" | "linux" | "windows" | "wasm"
+    arch: []const u8, // "aarch64" | "x86_64" | "wasm32"
+    ptr_size: u8,
+    is_posix: bool,
+};
+
+fn hostOs() []const u8 {
+    return switch (builtin.target.os.tag) {
+        .macos => "darwin",
+        .linux => "linux",
+        .windows => "windows",
+        else => "darwin",
+    };
+}
+fn hostArch() []const u8 {
+    return switch (builtin.target.cpu.arch) {
+        .aarch64 => "aarch64",
+        .x86_64 => "x86_64",
+        else => "x86_64",
+    };
+}
+
+fn deriveTargetInfo(target: []const u8, triple: ?[]const u8) TargetInfo {
+    if (std.mem.eql(u8, target, "--wasm")) {
+        return .{ .os = "wasm", .arch = "wasm32", .ptr_size = 4, .is_posix = false };
+    }
+    const has = struct {
+        fn f(h: []const u8, n: []const u8) bool {
+            return std.mem.indexOf(u8, h, n) != null;
+        }
+    }.f;
+    var os: []const u8 = hostOs();
+    var arch: []const u8 = hostArch();
+    if (triple) |t| {
+        if (has(t, "linux")) {
+            os = "linux";
+        } else if (has(t, "windows") or has(t, "mingw") or has(t, "w64")) {
+            os = "windows";
+        } else if (has(t, "darwin") or has(t, "apple") or has(t, "macos")) {
+            os = "darwin";
+        }
+        if (has(t, "aarch64") or has(t, "arm64")) {
+            arch = "aarch64";
+        } else if (has(t, "x86_64") or has(t, "x86-64") or has(t, "amd64")) {
+            arch = "x86_64";
+        }
+    }
+    return .{ .os = os, .arch = arch, .ptr_size = 8, .is_posix = std.mem.eql(u8, os, "darwin") or std.mem.eql(u8, os, "linux") };
+}
+
+// Source of the compiler-synthesized `platform` module (never a file on disk).
+fn genPlatformSource(allocator: std.mem.Allocator, t: TargetInfo) ![]const u8 {
+    const b = struct {
+        fn s(v: bool) []const u8 {
+            return if (v) "true" else "false";
+        }
+    }.s;
+    return try std.fmt.allocPrint(allocator,
+        \\pub const os: string = "{s}";
+        \\pub const arch: string = "{s}";
+        \\pub const pointerSize: int = {d};
+        \\pub const isDarwin: bool = {s};
+        \\pub const isLinux: bool = {s};
+        \\pub const isWindows: bool = {s};
+        \\pub const isWasm: bool = {s};
+        \\pub const isPosix: bool = {s};
+        \\
+    , .{
+        t.os,                                    t.arch, t.ptr_size,
+        b(std.mem.eql(u8, t.os, "darwin")),      b(std.mem.eql(u8, t.os, "linux")),
+        b(std.mem.eql(u8, t.os, "windows")),     b(std.mem.eql(u8, t.os, "wasm")),
+        b(t.is_posix),
+    });
+}
+
+// True if `cand` (a `.nova` path) exists, in cwd or the installed ~/.nova/std fallback.
+fn suffixedFileExists(cand: []const u8, allocator: std.mem.Allocator, io: std.Io, home: ?[]const u8) bool {
+    if (Io.Dir.access(.cwd(), io, cand, .{})) |_| {
+        return true;
+    } else |_| {}
+    if (std.mem.startsWith(u8, cand, "src/std/")) {
+        const sub = cand[8..];
+        const h = home orelse "/";
+        const abs = std.fmt.allocPrint(allocator, "{s}/.nova/std/{s}", .{ h, sub }) catch return false;
+        defer allocator.free(abs);
+        if (Io.Dir.access(.cwd(), io, abs, .{})) |_| {
+            return true;
+        } else |_| {}
+    }
+    return false;
+}
+
+// Target-conditional file selection: given a resolved `foo/bar.nova`, return `foo/bar_<os>.nova` when
+// that file exists (build constraints, Go/Zig style), else null. Caller owns the returned path. The
+// module identity stays the BASE path so `import foo` links regardless of which variant compiled; only
+// the bytes read from disk come from the suffixed file.
+fn targetSuffixedPath(path: []const u8, os_tag: []const u8, allocator: std.mem.Allocator, io: std.Io, home: ?[]const u8) ?[]const u8 {
+    if (!std.mem.endsWith(u8, path, ".nova")) return null;
+    const stem = path[0 .. path.len - 5];
+    const cand = std.fmt.allocPrint(allocator, "{s}_{s}.nova", .{ stem, os_tag }) catch return null;
+    if (suffixedFileExists(cand, allocator, io, home)) return cand;
+    allocator.free(cand);
+    return null;
+}
+
 fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocator: std.mem.Allocator, io: std.Io, home: ?[]const u8) ![]const u8 {
+    if (std.mem.eql(u8, module_name, "platform")) {
+        // Synthetic module — parsed from generated source (see loadProgram), but given a src/std path so
+        // canonicalModulePrefix maps its declarations to module "platform" (the import's qualifier).
+        return try allocator.dupe(u8, "src/std/platform.nova");
+    }
     if (std.mem.startsWith(u8, module_name, "std/")) {
         const sub = module_name[4..];
         return try std.fmt.allocPrint(allocator, "src/std/{s}.nova", .{sub});
     }
-    const std_modules = [_][]const u8{ "net/tcp/socket", "net/tcp/server", "net/tcp/client", "net/url", "net/asyncio", "net/asynctls", "web/request", "web/response", "web/mime", "web/status", "web/methods", "web/server", "web/client", "web/mediator", "web/routing", "web/middleware", "web/url", "web/cookie", "web/cors", "web/request_id", "web/redact", "web/secure_headers", "web/body_limit", "web/recovery", "web/rate_limit", "web/multipart", "web/session", "web/csrf", "web/di", "web/controller", "web/router", "web/app", "web/logger", "web/httpparser", "concurrency/fiber", "concurrency/channel", "concurrency/asyncchan", "concurrency/atomic", "concurrency/async_util", "concurrency/actor", "io/file", "io/dir", "collections/list", "collections/map", "collections/set", "collections/string_builder", "serde/json", "serde/source", "serde/bson", "serde/yaml", "mem/allocator", "mem/arena_allocator", "mem/memory", "string", "datetime", "math", "assert", "traits", "env", "crypto/hash/sha", "crypto/hash/md5", "crypto/base64", "crypto/random", "crypto/scram", "crypto/hash/sha256", "crypto/hash/sha512", "crypto/hash/sha1", "crypto/mac/hmac", "crypto/kdf/hkdf", "crypto/kdf/pbkdf2", "crypto/cipher/chacha20", "crypto/mac/poly1305", "crypto/aead/chachapoly", "crypto/cipher/aes", "crypto/mac/ghash", "crypto/aead/aesgcm", "crypto/cipher/aesctr", "crypto/ecc/x25519", "crypto/ecc/p256", "crypto/ecc/p384", "crypto/rsa", "crypto/x509", "crypto/tls/13/tls", "crypto/tls/13/handshake", "crypto/tls/13/tlsClient", "crypto/tls/13/tlsServer", "crypto/tls/12/prf", "crypto/tls/truststore", "crypto/tls/12/client12", "process", "fs", "exception", "data/db", "data/sql/pool", "text/utf8", "text/regex", "webview", "web/static_content", "web/circuit_breaker", "resilience/breaker", "compress/gzip", "data/orm", "os/sys", "os/kqueue", "os/epoll", "io/slab", "io/arena", "net/reactor", "net/reactorio", "net/tls13async", "net/tlsmembio", "net/tls12bio", "net/httpsclient" };
+    const std_modules = [_][]const u8{ "net/tcp/socket", "net/tcp/server", "net/tcp/client", "net/url", "net/asyncio", "net/asynctls", "web/request", "web/response", "web/mime", "web/status", "web/methods", "web/server", "web/client", "web/mediator", "web/routing", "web/middleware", "web/url", "web/cookie", "web/cors", "web/request_id", "web/redact", "web/secure_headers", "web/body_limit", "web/recovery", "web/rate_limit", "web/multipart", "web/session", "web/csrf", "web/di", "web/controller", "web/router", "web/app", "web/logger", "web/httpparser", "concurrency/fiber", "concurrency/channel", "concurrency/asyncchan", "concurrency/atomic", "concurrency/async_util", "concurrency/actor", "io/file", "io/dir", "collections/list", "collections/map", "collections/set", "collections/string_builder", "serde/json", "serde/source", "serde/bson", "serde/yaml", "mem/allocator", "mem/arena_allocator", "mem/memory", "string", "datetime", "math", "assert", "traits", "env", "crypto/hash/sha", "crypto/hash/md5", "crypto/base64", "crypto/random", "crypto/scram", "crypto/hash/sha256", "crypto/hash/sha512", "crypto/hash/sha1", "crypto/mac/hmac", "crypto/kdf/hkdf", "crypto/kdf/pbkdf2", "crypto/cipher/chacha20", "crypto/mac/poly1305", "crypto/aead/chachapoly", "crypto/cipher/aes", "crypto/mac/ghash", "crypto/aead/aesgcm", "crypto/cipher/aesctr", "crypto/ecc/x25519", "crypto/ecc/p256", "crypto/ecc/p384", "crypto/rsa", "crypto/x509", "crypto/tls/13/tls", "crypto/tls/13/handshake", "crypto/tls/13/tlsClient", "crypto/tls/13/tlsServer", "crypto/tls/12/prf", "crypto/tls/truststore", "crypto/tls/12/client12", "process", "fs", "exception", "data/db", "data/sql/pool", "text/utf8", "text/regex", "webview", "web/static_content", "web/circuit_breaker", "resilience/breaker", "compress/gzip", "data/orm", "os/sys", "os/kqueue", "os/epoll", "os/backend", "io/slab", "io/arena", "net/reactor", "net/reactorio", "net/tls13async", "net/tlsmembio", "net/tls12bio", "net/httpsclient" };
     for (std_modules) |m| {
         if (std.mem.eql(u8, module_name, m)) {
             return try std.fmt.allocPrint(allocator, "src/std/{s}.nova", .{module_name});
@@ -848,7 +961,7 @@ fn generateMediatorDispatch(allocator: std.mem.Allocator, declarations: *std.Arr
     }
 }
 
-fn loadProgram(allocator: std.mem.Allocator, init: std.process.Init, file_path: []const u8, visited: *std.StringHashMap(void), visiting: *std.StringHashMap(void), merged: *std.ArrayList(u8), declarations: *std.ArrayList(ast.Declaration), is_wasm: bool, file_sources: *std.StringHashMap([]const u8)) anyerror!void {
+fn loadProgram(allocator: std.mem.Allocator, init: std.process.Init, file_path: []const u8, visited: *std.StringHashMap(void), visiting: *std.StringHashMap(void), merged: *std.ArrayList(u8), declarations: *std.ArrayList(ast.Declaration), is_wasm: bool, file_sources: *std.StringHashMap([]const u8), tinfo: TargetInfo) anyerror!void {
     if (visiting.contains(file_path)) return error.CyclicImport;
     if (visited.contains(file_path)) return;
 
@@ -866,11 +979,19 @@ fn loadProgram(allocator: std.mem.Allocator, init: std.process.Init, file_path: 
 
     const resolved_file_path = file_path;
 
-    if (std.mem.startsWith(u8, file_path, "src/std/")) {
-        source = Io.Dir.readFileAlloc(.cwd(), init.io, file_path, allocator, .unlimited) catch |err| blk: {
+    // Read from the target-conditional variant (foo_<os>.nova) if present; module identity stays file_path.
+    const suffix_home = init.environ_map.get("HOME") orelse init.environ_map.get("USERPROFILE");
+    const read_path_opt = if (std.mem.eql(u8, file_path, "src/std/platform.nova")) null else targetSuffixedPath(file_path, tinfo.os, allocator, init.io, suffix_home);
+    defer if (read_path_opt) |rp| allocator.free(rp);
+    const read_path = read_path_opt orelse file_path;
+
+    if (std.mem.eql(u8, file_path, "src/std/platform.nova")) {
+        source = try genPlatformSource(allocator, tinfo);
+    } else if (std.mem.startsWith(u8, read_path, "src/std/")) {
+        source = Io.Dir.readFileAlloc(.cwd(), init.io, read_path, allocator, .unlimited) catch |err| blk: {
             if (err == error.FileNotFound) {
 
-                const sub = file_path[8..];
+                const sub = read_path[8..];
                 const home = init.environ_map.get("HOME") orelse init.environ_map.get("USERPROFILE") orelse "/";
                 const abs = try std.fmt.allocPrint(allocator, "{s}/.nova/std/{s}", .{ home, sub });
                 defer allocator.free(abs);
@@ -883,8 +1004,8 @@ fn loadProgram(allocator: std.mem.Allocator, init: std.process.Init, file_path: 
             }
         };
     } else {
-        source = Io.Dir.readFileAlloc(.cwd(), init.io, file_path, allocator, .unlimited) catch |err| {
-            std.debug.print("Failed to read file '{s}': {any}\n", .{ file_path, err });
+        source = Io.Dir.readFileAlloc(.cwd(), init.io, read_path, allocator, .unlimited) catch |err| {
+            std.debug.print("Failed to read file '{s}': {any}\n", .{ read_path, err });
             return err;
         };
     }
@@ -908,9 +1029,10 @@ fn loadProgram(allocator: std.mem.Allocator, init: std.process.Init, file_path: 
     for (program.declarations) |decl| {
         if (decl == .import_decl) {
             if (std.mem.eql(u8, decl.import_decl.module, "bytes")) continue;
-            const imported_path = try resolveImportPath(resolved_file_path, decl.import_decl.module, allocator, init.io, init.environ_map.get("HOME") orelse init.environ_map.get("USERPROFILE"));
+            const home = init.environ_map.get("HOME") orelse init.environ_map.get("USERPROFILE");
+            const imported_path = try resolveImportPath(resolved_file_path, decl.import_decl.module, allocator, init.io, home);
             defer allocator.free(imported_path);
-            try loadProgram(allocator, init, imported_path, visited, visiting, merged, declarations, is_wasm, file_sources);
+            try loadProgram(allocator, init, imported_path, visited, visiting, merged, declarations, is_wasm, file_sources, tinfo);
         }
     }
 
@@ -1624,13 +1746,14 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
     defer declarations.deinit(allocator);
 
     const is_wasm = std.mem.eql(u8, target, "--wasm");
+    const tinfo = deriveTargetInfo(target, null);
 
-    loadProgram(allocator, init, "src/std/collections/string_builder.nova", &visited, &visiting, &merged, &declarations, is_wasm, &file_sources) catch |err| {
+    loadProgram(allocator, init, "src/std/collections/string_builder.nova", &visited, &visiting, &merged, &declarations, is_wasm, &file_sources, tinfo) catch |err| {
         std.debug.print("Warning: Failed to load string_builder in test harness: {any}\n", .{err});
     };
 
     for (file_paths.items) |path| {
-        loadProgram(allocator, init, path, &visited, &visiting, &merged, &declarations, is_wasm, &file_sources) catch |err| {
+        loadProgram(allocator, init, path, &visited, &visiting, &merged, &declarations, is_wasm, &file_sources, tinfo) catch |err| {
             std.debug.print("Failed to load program {s}: {any}\n", .{ path, err });
 
             return err;
@@ -1905,12 +2028,13 @@ fn compileProgram(
     defer declarations.deinit(allocator);
 
     const is_wasm = std.mem.eql(u8, target, "--wasm");
+    const tinfo = deriveTargetInfo(target, target_triple_opt);
 
-    loadProgram(allocator, init, "src/std/collections/string_builder.nova", visited, &visiting, &merged, &declarations, is_wasm, &file_sources) catch |err| {
+    loadProgram(allocator, init, "src/std/collections/string_builder.nova", visited, &visiting, &merged, &declarations, is_wasm, &file_sources, tinfo) catch |err| {
         std.debug.print("Warning: Failed to load string_builder standard library: {any}\n", .{err});
     };
 
-    try loadProgram(allocator, init, file_path, visited, &visiting, &merged, &declarations, is_wasm, &file_sources);
+    try loadProgram(allocator, init, file_path, visited, &visiting, &merged, &declarations, is_wasm, &file_sources, tinfo);
 
     if (init.environ_map.get("NOVA_DUMP_MERGED") != null) {
         _ = Io.Dir.writeFile(.cwd(), init.io, .{ .data = merged.items, .sub_path = "merged.nova", .flags = .{} }) catch |err| {
