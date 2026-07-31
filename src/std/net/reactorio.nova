@@ -18,6 +18,12 @@ import os.socket;
 import os.backend;
 import net.eventloop;
 
+// Op records are allocated and freed on every single read and write. They are fixed-size and never
+// leave the owning reactor thread, so they come from a thread-local free list in the runtime rather
+// than malloc — reuse is a pointer swap. See nova_op_alloc in core.cpp.
+extern("c") fn nova_op_alloc(size: long): long;
+extern("c") fn nova_op_free(op: long): void;
+
 // errno values are platform-specific (EAGAIN() is 35 on macOS but 11 on Linux), so they come from the
 // per-OS seam in os/backend rather than being pinned to one kernel here.
 pub fn EAGAIN(): int { return backend.ERR_AGAIN; }
@@ -112,12 +118,12 @@ pub struct ReactorStream {
     pub async fn recvInto(self: ReactorStream, buf: long, max: int): int {
         // Completion model: submit a recv op carrying this coroutine as the token, suspend, and read the
         // byte count the loop filled in. The op record + buf are on this frame, so they outlive the op.
-        let op = bytes.alloc(eventloop.OP_SIZE);
+        let op = nova_op_alloc(eventloop.OP_SIZE as long);
         eventloop.makeOp(op, eventloop.OP_RECV, self.fd, buf, max, currentCoro());
         eventloop.submit(self.kq, op);
         coroSuspend();
         let r = eventloop.opResult(op);
-        bytes.free(op);
+        nova_op_free(op);
         return r;
     }
 
@@ -134,7 +140,7 @@ pub struct ReactorStream {
         // count; if only the timer fired, done is still 0, so we time out (-2) and cancel the still-armed
         // read op. A same-batch data+timer race resolves to the data (the loop ran the read and set
         // done), and the duplicate timer wake is skipped by the batch reap guard.
-        let op = bytes.alloc(eventloop.OP_SIZE);
+        let op = nova_op_alloc(eventloop.OP_SIZE as long);
         eventloop.makeOp(op, eventloop.OP_RECV, self.fd, buf, max, currentCoro());
         eventloop.submit(self.kq, op);
         nova_reactor_set_timer(currentCoro(), timeoutMs as long);
@@ -142,11 +148,11 @@ pub struct ReactorStream {
         nova_reactor_cancel_timer(currentCoro());
         if (eventloop.opDone(op) == 1) {
             let r = eventloop.opResult(op);
-            bytes.free(op);
+            nova_op_free(op);
             return r;
         }
         eventloop.cancelRead(self.kq, self.fd);
-        bytes.free(op);
+        nova_op_free(op);
         return -2;
     }
 
@@ -157,12 +163,12 @@ pub struct ReactorStream {
         // real error; a partial write loops to submit the remainder.
         let sent = 0;
         while (sent < len) {
-            let op = bytes.alloc(eventloop.OP_SIZE);
+            let op = nova_op_alloc(eventloop.OP_SIZE as long);
             eventloop.makeOp(op, eventloop.OP_SEND, self.fd, buf + (sent as long), len - sent, currentCoro());
             eventloop.submit(self.kq, op);
             coroSuspend();
             let w = eventloop.opResult(op);
-            bytes.free(op);
+            nova_op_free(op);
             if (w > 0) { sent = sent + w; } else { return -1; }
         }
         return sent;
@@ -209,15 +215,15 @@ pub async fn reactorConnect(host: string, port: int, kq: int): ReactorStream {
     // the overlapped call would be rejected. The address therefore travels in the op's buf/len
     // slots, which the readiness backends ignore for OP_CONNECT.
     if (eventloop.connectIsSubmitted()) {
-        let cop = bytes.alloc(eventloop.OP_SIZE);
+        let cop = nova_op_alloc(eventloop.OP_SIZE as long);
         eventloop.makeOp(cop, eventloop.OP_CONNECT, fd, sa, 16, currentCoro());
         if (eventloop.submit(kq, cop) != 0) {
-            bytes.free(cop); bytes.free(sa); socket.close(fd);
+            nova_op_free(cop); bytes.free(sa); socket.close(fd);
             return ReactorStream(-1, kq);
         }
         coroSuspend();
         let cres = eventloop.opResult(cop);
-        bytes.free(cop);
+        nova_op_free(cop);
         bytes.free(sa);
         if (cres < 0) { socket.close(fd); return ReactorStream(-1, kq); }
         return ReactorStream(fd, kq);
@@ -227,12 +233,12 @@ pub async fn reactorConnect(host: string, port: int, kq: int): ReactorStream {
     bytes.free(sa);
     if (r != 0) {
         if (!socket.connectInProgress()) { socket.close(fd); return ReactorStream(-1, kq); }
-        let op = bytes.alloc(eventloop.OP_SIZE);
+        let op = nova_op_alloc(eventloop.OP_SIZE as long);
         eventloop.makeOp(op, eventloop.OP_CONNECT, fd, 0, 0, currentCoro());
         eventloop.submit(kq, op);
         coroSuspend();
         let res = eventloop.opResult(op);
-        bytes.free(op);
+        nova_op_free(op);
         if (res != 0) { socket.close(fd); return ReactorStream(-1, kq); }
     }
     return ReactorStream(fd, kq);
@@ -244,11 +250,11 @@ pub async fn reactorConnect(host: string, port: int, kq: int): ReactorStream {
 pub async fn reactorAccept(listenFd: int, kq: int): ReactorStream {
     // Completion model: submit an accept op; the loop performs accept() when the listener is readable,
     // sets the accepted fd non-blocking, and reports it as the op result (or -1). One accept per op.
-    let op = bytes.alloc(eventloop.OP_SIZE);
+    let op = nova_op_alloc(eventloop.OP_SIZE as long);
     eventloop.makeOp(op, eventloop.OP_ACCEPT, listenFd, 0, 0, currentCoro());
     eventloop.submit(kq, op);
     coroSuspend();
     let c = eventloop.opResult(op);
-    bytes.free(op);
+    nova_op_free(op);
     return ReactorStream(c, kq);
 }

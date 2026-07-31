@@ -45,9 +45,23 @@ pub fn opResult(op: long): int { return bytes.read_ptr(op, 32) as int; }
 pub fn setOpResult(op: long, r: int): void { bytes.write_ptr(op, 32, r as long); bytes.write_i32(op, 20, 1); }
 
 // epoll interest mask for an op kind.
+// EPOLLONESHOT on BOTH directions: the kernel disarms the fd once it fires, so re-arming is a single
+// EPOLL_CTL_MOD on the next submit and the fd never has to be removed. Without ONESHOT on reads, a
+// level-triggered EPOLLIN would keep firing for a socket nobody is currently reading.
 fn eventsFor(kind: int): int {
     if (kind == OP_SEND || kind == OP_CONNECT) { return epoll.EPOLLOUT | epoll.EPOLLONESHOT; }
-    return epoll.EPOLLIN;
+    return epoll.EPOLLIN | epoll.EPOLLONESHOT;
+}
+
+// Registration is kept for the life of the fd (see nova_epoll_mark_registered): the first arm ADDs,
+// every later one MODs. This is what removes the ADD/DEL pair that used to bracket every single read
+// and write.
+extern("c") fn nova_epoll_mark_registered(fd: int): int;
+extern("c") fn nova_epoll_clear_registered(fd: int): void;
+
+fn arm(kq: int, fd: int, events: int, data: long): int {
+    if (nova_epoll_mark_registered(fd) != 0) { return epoll.ctlAdd(kq, fd, events, data); }
+    return epoll.ctlMod(kq, fd, events, data);
 }
 
 // Arm an op's interest on an epoll fd, carrying the op address as the event data. In the one-op-per-fd
@@ -61,12 +75,16 @@ pub fn submit(kq: int, op: long): int {
         if (uringPrep(ring, op) != 0) { return -1; }
         return if (nova_uring_submit_and_wait(ring, 0) >= 0) 0 else -1;
     }
-    return epoll.ctlAdd(kq, opFd(op), eventsFor(opKind(op)), op);
+    return arm(kq, opFd(op), eventsFor(opKind(op)), op);
 }
 
 // Remove read interest (read-deadline timeout, or ReactorStream.close on a still-armed fd).
+// The one place an fd genuinely leaves the set (stream close, or a read deadline giving up), so it
+// is also where the registration memo is cleared — otherwise a recycled fd number would be MOD'd
+// before it was ever ADDed, which fails with ENOENT.
 pub fn cancelRead(kq: int, fd: int): void {
     epoll.ctlDel(kq, fd);
+    nova_epoll_clear_registered(fd);
 }
 
 // --- backend-neutral readiness surface (low-level readiness cases; macOS-gated, compiled on Linux) ----
@@ -128,6 +146,16 @@ pub fn usingUring(): bool { return nova_reactor_backend() == BACKEND_URING; }
 // Stage one op as an SQE. A proactor ISSUES the I/O, so unlike the epoll path (which waits for
 // readiness and then performs the call itself) the kernel does the work and reports the byte count.
 // CONNECT carries the sockaddr LENGTH in off, not len.
+// Stage an SQE WITHOUT entering the kernel. Batching is the entire point of io_uring: calling
+// io_uring_enter per operation costs a syscall each, which is what a ring exists to avoid. The
+// pending SQEs are published by the next pollUring, which every caller reaches (submit then await).
+// The only forced flush is a full submission queue.
+fn stageUring(ring: long, op: long): int {
+    if (uringPrep(ring, op) == 0) { return 0; }
+    if (nova_uring_submit_and_wait(ring, 0) < 0) { return -1; }   // SQ full: publish, then retry
+    return uringPrep(ring, op);
+}
+
 fn uringPrep(ring: long, op: long): int {
     let kind = opKind(op);
     let fd = opFd(op);
@@ -211,13 +239,8 @@ pub struct Poller impl EventLoop {
     }
 
     fn submit(self: Poller, op: long): int {
-        if (self.ring != (0 as long)) {
-            if (uringPrep(self.ring, op) != 0) { return -1; }
-            // Published immediately rather than batched: callers submit then await, so an SQE left
-            // staged would simply never start.
-            return if (nova_uring_submit_and_wait(self.ring, 0) >= 0) 0 else -1;
-        }
-        return epoll.ctlAdd(self.kq, opFd(op), eventsFor(opKind(op)), op);
+        if (self.ring != (0 as long)) { return stageUring(self.ring, op); }
+        return arm(self.kq, opFd(op), eventsFor(opKind(op)), op);
     }
 
     fn poll(self: Poller, timeoutMs: int): int {
@@ -271,7 +294,8 @@ pub struct Poller impl EventLoop {
                     res = if (socket.sockError(fd) == 0) 0 else -1;
                 }
                 if (complete) {
-                    epoll.ctlDel(self.kq, fd);   // one op per fd per completion; next submit re-adds
+                    // No EPOLL_CTL_DEL: EPOLLONESHOT already disarmed the fd, and it stays
+                    // registered so the next submit is a single MOD rather than a DEL/ADD pair.
                     setOpResult(op, res);
                     bytes.write_ptr(self.compBuf, (self.nComp * 8) as long, opToken(op));
                     self.nComp = self.nComp + 1;

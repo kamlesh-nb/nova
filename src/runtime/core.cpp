@@ -126,6 +126,40 @@ void nova_tracef(const char *fmt, ...) {
     std::fflush(fp);
 }
 
+// --- reactor op-record pool ----------------------------------------------------------------------
+// net/reactorio allocates a fresh op record for EVERY read and write, then frees it — a malloc/free
+// pair per I/O on the hottest path in the server. The records are fixed-size and strictly
+// thread-confined (a reactor worker owns its coroutines), so a thread-local free list retires that
+// traffic entirely: reuse is a pointer swap. Capped so an idle worker does not sit on memory.
+namespace {
+const int NOVA_OP_POOL_MAX = 256;
+thread_local void *g_op_pool[NOVA_OP_POOL_MAX];
+thread_local int g_op_pool_n = 0;
+thread_local long long g_op_pool_size = 0;
+}
+
+// `size` is eventloop.OP_SIZE, which differs per backend, so the pool is sized by the first caller
+// and reset if a larger record is ever requested.
+long long nova_op_alloc(long long size) {
+  if (size != g_op_pool_size) {
+    // Backend changed the record size (only possible before any I/O); drop what we hold.
+    for (int i = 0; i < g_op_pool_n; ++i) std::free(g_op_pool[i]);
+    g_op_pool_n = 0;
+    g_op_pool_size = size;
+  }
+  if (g_op_pool_n > 0) return (long long)(intptr_t)g_op_pool[--g_op_pool_n];
+  return (long long)(intptr_t)std::malloc((size_t)size);
+}
+
+void nova_op_free(long long op) {
+  if (!op) return;
+  if (g_op_pool_n < NOVA_OP_POOL_MAX) {
+    g_op_pool[g_op_pool_n++] = (void *)(intptr_t)op;
+    return;
+  }
+  std::free((void *)(intptr_t)op);
+}
+
 long long nova_ffi_errno(void) { return (long long)errno; }
 void nova_ffi_set_errno(long long v) { errno = (int)v; }
 // fcntl is variadic; a non-variadic FFI declaration mispasses the third arg on some ABIs
