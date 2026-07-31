@@ -73,7 +73,7 @@ fn linkNativeInProcessMacho(
     });
     for (objs) |o| try args.append(allocator, o);
     const nova_lib = try std.fmt.allocPrint(allocator, "-L{s}/lib", .{shared_nova});
-    try args.appendSlice(allocator, &.{ nova_lib, "-lnova_runtime", "-lz", "-L/opt/homebrew/lib" });
+    try args.appendSlice(allocator, &.{ nova_lib, "-lnova_runtime", "-L/opt/homebrew/lib" });
     try appendWolfsslLink(&args, allocator, shared_nova, io);
     for (ffi_libs) |lib| {
         try appendFfiLib(&args, allocator, shared_nova, io, lib);
@@ -130,10 +130,10 @@ fn crossLinkViaZig(
 
         const rt_src = try std.fmt.allocPrint(allocator, "{s}/src/runtime/runtime.cpp", .{shared_nova});
 
-        const zlib_inc = try std.fmt.allocPrint(allocator, "-I{s}/deps/zlib", .{shared_nova});
         std.debug.print("[T1] cross-compiling the C++ runtime for {s} (one-time; caches to ~/.nova/lib) ...\n", .{target.zig});
         // Boost.Asio retired (M4): the runtime is reactor-native, no Boost include needed.
-        const rc_args = [_][]const u8{ "zig", "c++", "-target", target.zig, "-std=c++20", "-O2", "-DNOVA_DROP_ARENA", zlib_inc, "-c", rt_src, "-o", rt_obj };
+        // zlib retired: compression is pure Nova (compress/deflate.nova), no zlib include/link.
+        const rc_args = [_][]const u8{ "zig", "c++", "-target", target.zig, "-std=c++20", "-O2", "-DNOVA_DROP_ARENA", "-c", rt_src, "-o", rt_obj };
         var rc_child = try std.process.spawn(io, .{ .argv = &rc_args });
         switch (try rc_child.wait(io)) {
             .exited => |code| if (code != 0) {
@@ -152,10 +152,8 @@ fn crossLinkViaZig(
     for (objs) |o| try args.append(allocator, o);
     try args.append(allocator, rt_obj);
 
-    const zlib_srcs = [_][]const u8{ "adler32", "compress", "crc32", "deflate", "infback", "inffast", "inflate", "inftrees", "trees", "uncompr", "zutil" };
-    for (zlib_srcs) |name|
-        try args.append(allocator, try std.fmt.allocPrint(allocator, "{s}/deps/zlib/{s}.c", .{ shared_nova, name }));
-
+    // zlib retired: compression is pure Nova (compress/deflate.nova), so the vendored zlib .c files
+    // are no longer compiled into cross targets.
     if (std.mem.indexOf(u8, target.zig, "windows") != null)
         try args.appendSlice(allocator, &.{ "-lws2_32", "-lmswsock", "-lbcrypt" });
     try args.appendSlice(allocator, &.{ "-o", output_path });
@@ -338,7 +336,7 @@ fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocator: 
         const sub = module_name[4..];
         return try std.fmt.allocPrint(allocator, "src/std/{s}.nova", .{sub});
     }
-    const std_modules = [_][]const u8{ "net/tcp/stream", "net/tcp/server", "net/tcp/client", "net/url", "net/asyncio", "net/asynctls", "web/request", "web/response", "web/mime", "web/status", "web/methods", "web/client", "web/mediator", "web/routing", "web/middleware", "web/url", "web/cookie", "web/cors", "web/request_id", "web/redact", "web/secure_headers", "web/body_limit", "web/recovery", "web/rate_limit", "web/multipart", "web/session", "web/csrf", "web/di", "web/controller", "web/router", "web/app", "web/logger", "web/httpparser", "concurrency/fiber", "concurrency/channel", "concurrency/asyncchan", "concurrency/atomic", "concurrency/async_util", "concurrency/actor", "io/file", "io/dir", "collections/list", "collections/map", "collections/set", "collections/string_builder", "serde/json", "serde/source", "serde/bson", "serde/yaml", "mem/allocator", "mem/memory", "string", "datetime", "math", "assert", "traits", "env", "crypto/hash/sha", "crypto/hash/md5", "crypto/base64", "crypto/random", "crypto/scram", "crypto/hash/sha256", "crypto/hash/sha512", "crypto/hash/sha1", "crypto/mac/hmac", "crypto/kdf/hkdf", "crypto/kdf/pbkdf2", "crypto/cipher/chacha20", "crypto/mac/poly1305", "crypto/aead/chachapoly", "crypto/cipher/aes", "crypto/mac/ghash", "crypto/aead/aesgcm", "crypto/cipher/aesctr", "crypto/ecc/x25519", "crypto/ecc/p256", "crypto/ecc/p384", "crypto/rsa", "crypto/x509", "crypto/tls/13/tls", "crypto/tls/13/handshake", "crypto/tls/13/tlsClient", "crypto/tls/13/tlsServer", "crypto/tls/12/prf", "crypto/tls/truststore", "crypto/tls/12/client12", "process", "fs", "exception", "data/db", "data/sql/pool", "text/utf8", "text/regex", "webview", "web/static_content", "web/circuit_breaker", "resilience/breaker", "compress/gzip", "data/orm", "os/sys", "os/kqueue", "os/epoll", "os/backend", "os/socket", "os/winsock", "os/windows", "io/slab", "io/arena", "net/reactor", "net/reactorio", "net/tls13async", "net/tlsmembio", "net/tls12bio", "net/httpsclient", "net/eventloop" };
+    const std_modules = [_][]const u8{ "net/tcp/stream", "net/tcp/server", "net/tcp/client", "net/url", "net/asyncio", "net/asynctls", "web/request", "web/response", "web/mime", "web/status", "web/methods", "web/client", "web/mediator", "web/routing", "web/middleware", "web/url", "web/cookie", "web/cors", "web/request_id", "web/redact", "web/secure_headers", "web/body_limit", "web/recovery", "web/rate_limit", "web/multipart", "web/session", "web/csrf", "web/di", "web/controller", "web/router", "web/app", "web/logger", "web/httpparser", "concurrency/fiber", "concurrency/channel", "concurrency/asyncchan", "concurrency/atomic", "concurrency/async_util", "concurrency/actor", "io/file", "io/dir", "collections/list", "collections/map", "collections/set", "collections/string_builder", "serde/json", "serde/source", "serde/bson", "serde/yaml", "mem/allocator", "mem/memory", "string", "datetime", "math", "assert", "traits", "env", "crypto/hash/sha", "crypto/hash/md5", "crypto/base64", "crypto/random", "crypto/scram", "crypto/hash/sha256", "crypto/hash/sha512", "crypto/hash/sha1", "crypto/mac/hmac", "crypto/kdf/hkdf", "crypto/kdf/pbkdf2", "crypto/cipher/chacha20", "crypto/mac/poly1305", "crypto/aead/chachapoly", "crypto/cipher/aes", "crypto/mac/ghash", "crypto/aead/aesgcm", "crypto/cipher/aesctr", "crypto/ecc/x25519", "crypto/ecc/p256", "crypto/ecc/p384", "crypto/rsa", "crypto/x509", "crypto/tls/13/tls", "crypto/tls/13/handshake", "crypto/tls/13/tlsClient", "crypto/tls/13/tlsServer", "crypto/tls/12/prf", "crypto/tls/truststore", "crypto/tls/12/client12", "process", "fs", "exception", "data/db", "data/sql/pool", "text/utf8", "text/regex", "webview", "web/static_content", "web/circuit_breaker", "resilience/breaker", "compress/gzip", "compress/deflate", "compress/lz4", "data/orm", "os/sys", "os/kqueue", "os/epoll", "os/backend", "os/socket", "os/winsock", "os/windows", "io/slab", "io/arena", "net/reactor", "net/reactorio", "net/tls13async", "net/tlsmembio", "net/tls12bio", "net/httpsclient", "net/eventloop" };
     for (std_modules) |m| {
         if (std.mem.eql(u8, module_name, m)) {
             return try std.fmt.allocPrint(allocator, "src/std/{s}.nova", .{module_name});
@@ -1910,7 +1908,6 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
     try test_clang_args.append(allocator, test_nova_lib);
 
     try test_clang_args.append(allocator, if (asan) "-lnova_runtime_asan" else if (tsan) "-lnova_runtime_tsan" else "-lnova_runtime");
-    try test_clang_args.append(allocator, "-lz");
 
     try test_clang_args.append(allocator, "-L/opt/homebrew/lib");
     try appendWolfsslLink(&test_clang_args, allocator, shared_nova, init.io);
@@ -2257,7 +2254,6 @@ fn compileProgram(
         const nova_lib = try std.fmt.allocPrint(allocator, "-L{s}/lib", .{shared_nova});
         try clang_args.append(allocator, nova_lib);
         try clang_args.append(allocator, "-lnova_runtime");
-        try clang_args.append(allocator, "-lz");
         try clang_args.append(allocator, "-L/opt/homebrew/lib");
         try appendWolfsslLink(&clang_args, allocator, shared_nova, init.io);
         for (ffi_libs) |lib| {
