@@ -206,9 +206,32 @@ extern "C" int nova_uring_peek(long long ring, int i, long long *ud, int *res);
 extern "C" void nova_uring_advance(long long ring, int n);
 extern "C" int nova_uring_op_timeout(void);
 
+// The wake eventfd this thread's ring is watching. A POLL_ADD is ONE-SHOT, so every fire has to be
+// drained (or the fd stays readable and the next poll returns immediately) and re-armed.
+thread_local int g_uring_wake_fd = -1;
+extern "C" int nova_uring_op_poll_add(void);
+
+static void uring_wake_rearm() {
+    long long ring = nova_uring_current();
+    if (!ring || g_uring_wake_fd < 0) return;
+    const int POLLIN_BIT = 0x001;
+    nova_uring_prep(ring, nova_uring_op_poll_add(), g_uring_wake_fd, 0, 0, POLLIN_BIT,
+                    (long long)NOVA_EPOLL_WAKE_DATA);
+    nova_uring_submit_and_wait(ring, 0);
+}
+
+static void uring_wake_drain() {
+    if (g_uring_wake_fd < 0) return;
+    uint64_t sink = 0;
+    ssize_t r = ::read(g_uring_wake_fd, &sink, sizeof(sink));   // eventfd is non-blocking
+    (void)r;
+    uring_wake_rearm();
+}
+
 static void uring_dispatch(long long user_data, int res) {
     uint64_t d = (uint64_t)user_data;
-    if (d == NOVA_EPOLL_WAKE_DATA || d == 0) return;
+    if (d == NOVA_EPOLL_WAKE_DATA) { uring_wake_drain(); return; }
+    if (d == 0) return;
     if (d & NOVA_EPOLL_TIMER_TAG) {
         long long h = (long long)(d & ~NOVA_EPOLL_TIMER_TAG);
         if (h) nova_reactor_resume(h);   // no fd to reclaim: the timeout lived in the ring
@@ -652,8 +675,21 @@ extern "C" void nova_reactor_wake_register(long long idx, long long kq) {
     EV_SET(&ev, 0, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, nullptr);
     kevent((int)kq, &ev, 1, nullptr, 0, nullptr);
 #elif defined(NOVA_HAVE_EPOLL)
-    // epoll has no EVFILT_USER, so the wake channel is an eventfd added to this reactor's set. One
-    // per reactor, created on first registration and kept for the process's life.
+    // Neither Linux backend has EVFILT_USER, so the wake channel is an eventfd either way — what
+    // differs is how its readability is OBSERVED. io_uring has no set to register interest in, so it
+    // watches the eventfd with a POLL_ADD SQE, re-armed after each fire (see uring_wake_rearm).
+    if (nova_reactor_backend() == 1) {
+        if (b->wake_fd < 0) {
+            int efd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+            if (efd >= 0) {
+                b->wake_fd = efd;
+                g_uring_wake_fd = efd;
+                uring_wake_rearm();
+            }
+        }
+        return;
+    }
+    // epoll: the eventfd joins this reactor's set, once, for the process's life.
     if (b->wake_fd < 0) {
         int efd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
         if (efd >= 0) {

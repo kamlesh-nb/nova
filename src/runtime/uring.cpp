@@ -189,6 +189,9 @@ int nova_uring_prep(long long ring, int op, int fd, long long addr, int len, lon
     sqe->addr = (uint64_t)addr;
     sqe->len = (uint32_t)len;
     sqe->off = (uint64_t)off;
+    // POLL_ADD carries its event mask in poll32_events, which unions with addr2 rather than off —
+    // setting off alone leaves the mask zero and the poll silently never fires.
+    if (op == IORING_OP_POLL_ADD) sqe->poll32_events = (uint32_t)off;
     sqe->user_data = (uint64_t)user_data;
 
     r->sq_array[index] = index;
