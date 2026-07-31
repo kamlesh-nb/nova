@@ -993,8 +993,7 @@ void nova_run_root(long long root) {
             if (!raw_coro_done(root)) {
                 std::fprintf(stderr,
                              "nova: fatal — async root %p never completed (lost wakeup); "
-                             "refusing to read its unwritten result
-",
+                             "refusing to read its unwritten result\n",
                              reinterpret_cast<void *>(root));
                 std::abort();
             }
