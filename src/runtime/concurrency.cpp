@@ -16,6 +16,7 @@
 #if defined(__linux__)
 #include <sys/epoll.h>     // the readiness reactor driver, the Linux peer of kqueue
 #include <sys/eventfd.h>   // cross-reactor wake (kqueue uses EVFILT_USER)
+#include <sys/ioctl.h>     // FIONREAD — epoll has no byte count, kqueue carries one
 #include <sys/timerfd.h>   // reactor timers   (kqueue uses EVFILT_TIMER)
 #include <unistd.h>        // close, read, write
 #define NOVA_HAVE_EPOLL 1
@@ -137,6 +138,16 @@ extern "C" int nova_epoll_mark_registered(int fd) {
 extern "C" void nova_epoll_clear_registered(int fd) {
     if (fd < 0 || (size_t)fd >= g_epoll_registered.size()) return;
     g_epoll_registered[(size_t)fd] = 0;
+}
+
+// Bytes readable on an fd. A kevent reports this for free in kevent.data; an epoll_event has no
+// equivalent field, so the readiness surface has to ask for it. ioctl is variadic, so it goes
+// through a shim here for the same reason fcntl does (a non-variadic FFI declaration mispasses the
+// argument on arm64). 0 on error, which reads as "nothing pending".
+extern "C" long long nova_fionread(int fd) {
+    int n = 0;
+    if (fd < 0 || ::ioctl(fd, FIONREAD, &n) != 0) return 0;
+    return (long long)n;
 }
 
 static void epoll_dispatch(const struct epoll_event &ev) {

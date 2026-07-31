@@ -174,7 +174,13 @@ fn uringPrep(ring: long, op: long): int {
 pub fn evToken(eventBuf: long, i: int): long {
     return nova_reactor_event_token(epoll.evData(eventBuf, i));
 }
-pub fn evBytes(eventBuf: long, i: int): long { return 0 as long; }
+// kqueue puts the readable byte count in the event; epoll does not, so it is queried. The data word
+// is the fd here for the same reason evFd treats it as one — the low-level readiness surface arms
+// with the fd as its own token.
+extern("c") fn nova_fionread(fd: int): long;
+pub fn evBytes(eventBuf: long, i: int): long {
+    return nova_fionread(epoll.evData(eventBuf, i) as int);
+}
 pub fn evEof(eventBuf: long, i: int): bool {
     return (epoll.evEvents(eventBuf, i) & (epoll.EPOLLHUP | epoll.EPOLLRDHUP)) != 0;
 }
