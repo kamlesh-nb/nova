@@ -445,6 +445,10 @@ pub const IndexExpr = struct {
 pub const StructInit = struct {
     type_name: []const u8,
     fields: []ObjectFieldInit,
+    // F4-1: explicit type args from `Foo<int>{ ... }`. Empty when the literal is unparameterised
+    // (`Foo{ ... }`) and T is left to field inference. When present these are AUTHORITATIVE: sema
+    // binds them positionally to the struct's type params and validates the fields against them.
+    type_args: []TypeRef = &.{},
     span: Span,
 };
 

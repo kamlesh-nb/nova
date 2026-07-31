@@ -78,6 +78,40 @@ fn intLiteralValue(expr: ast.Expression) ?i128 {
     }
 }
 
+// F4-1 helpers: validate explicit struct-literal type args (`Foo<int>{ ... }`).
+fn identOf(tr: ast.TypeRef) ?[]const u8 {
+    return switch (tr) {
+        .ident => |n| n,
+        else => null,
+    };
+}
+
+fn isScalarPrim(name: []const u8) bool {
+    const scalars = [_][]const u8{
+        "int",  "long", "byte", "bool",   "float", "double", "char",
+        "uint", "ulong", "short", "ushort", "i8",   "i16",    "i32",
+        "i64",  "u8",   "u16",  "u32",    "u64",  "f32",    "f64",
+    };
+    for (scalars) |s| {
+        if (std.mem.eql(u8, s, name)) return true;
+    }
+    return false;
+}
+
+// True only for the memory-unsafe clash: one side is `string` (a heap pointer) and the other is a
+// scalar primitive. That is the case that miscompiles into a pointer<->scalar reinterpret (stores an
+// int where a string pointer is expected -> deref garbage). Kept deliberately narrow so tightening the
+// check never false-positives on int<->long widening, optionals, `any`, or trait widening.
+fn stringScalarClash(a: ast.TypeRef, b: ast.TypeRef) bool {
+    const an = identOf(a) orelse return false;
+    const bn = identOf(b) orelse return false;
+    const a_str = std.mem.eql(u8, an, "string");
+    const b_str = std.mem.eql(u8, bn, "string");
+    if (a_str and isScalarPrim(bn)) return true;
+    if (b_str and isScalarPrim(an)) return true;
+    return false;
+}
+
 pub const TypeChecker = struct {
     allocator: std.mem.Allocator,
     errors: std.ArrayList([]const u8),
@@ -592,6 +626,38 @@ pub const TypeChecker = struct {
                                 self.addError(si.span, "struct literal '{s}{{ … }}' is missing field '{s}' — initialize every field, or use the constructor '{s}(…)'", .{ si.type_name, df.name, si.type_name });
                             } else {
                                 self.addError(si.span, "struct literal '{s}{{ … }}' is missing field '{s}' — every field must be initialized (fields have no defaults)", .{ si.type_name, df.name });
+                            }
+                        }
+                    }
+
+                    // F4-1: explicit type args (`Foo<int>{ ... }`) are now carried on the AST. Validate
+                    // them: arity against the struct's type params, then — for each field whose declared
+                    // type is one of those params — reject a value that clashes with the bound arg. The
+                    // clash check is narrow (string vs scalar, the memory-unsafe case) on purpose; once a
+                    // contradiction is an error, survivors agree with field inference, so monomorphization
+                    // stays correct without any further rewiring.
+                    if (si.type_args.len > 0) {
+                        if (s.type_params.len != si.type_args.len) {
+                            self.addError(si.span, "'{s}' takes {d} type argument(s), but {d} were given", .{ si.type_name, s.type_params.len, si.type_args.len });
+                        } else {
+                            for (si.fields) |lf| {
+                                for (s.fields) |df| {
+                                    if (!std.mem.eql(u8, df.name, lf.name)) continue;
+                                    const pname = identOf(df.type_name) orelse break;
+                                    var bound: ?ast.TypeRef = null;
+                                    for (s.type_params, 0..) |tp, i| {
+                                        if (std.mem.eql(u8, tp, pname)) {
+                                            bound = si.type_args[i];
+                                            break;
+                                        }
+                                    }
+                                    const b = bound orelse break; // field type is concrete, not a param
+                                    const actual = self.resolveExprType(lf.value) orelse break;
+                                    if (stringScalarClash(b, actual)) {
+                                        self.addError(lf.span, "type argument mismatch: field '{s}' has type '{s}' (from explicit '{s}<…>'), but the value is '{s}'", .{ lf.name, identOf(b) orelse "?", si.type_name, identOf(actual) orelse "?" });
+                                    }
+                                    break;
+                                }
                             }
                         }
                     }

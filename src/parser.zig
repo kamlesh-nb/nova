@@ -1864,6 +1864,10 @@ pub const Parser = struct {
                             expr = ast.Expression{ .kind = .{ .struct_init = ast.StructInit{
                                 .type_name = type_name,
                                 .fields = try fields.toOwnedSlice(self.allocator),
+                                // F4-1: keep the explicit `<...>` args (was dropped here) so sema can
+                                // bind + validate them. toOwnedSlice empties the list, so the defer
+                                // deinit above is a no-op (same handoff the generic_call branch uses).
+                                .type_args = try type_args.toOwnedSlice(self.allocator),
                                 .span = self.span(),
                             } } };
                         } else if (self.current().type == .left_paren) {
