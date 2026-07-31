@@ -1,0 +1,13 @@
+// Tier 1 — directory create / exists / remove over os/sys (mingw compat on Windows).
+import assert;
+import io.dir;
+
+fn main(): int {
+    let d = "nova_ci_dir";
+    dir.Dir.create(d, 511);
+    assert.isTrue(dir.Dir.exists(d));
+    assert.isTrue(dir.Dir.isDir(d));
+    dir.Dir.remove(d);
+    console.log("t03_dir ok");
+    return 0;
+}

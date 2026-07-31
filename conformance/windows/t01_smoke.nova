@@ -1,0 +1,10 @@
+// Tier 1 — pure compute + console. Proves the runtime starts and exits cleanly on Windows.
+import assert;
+
+fn main(): int {
+    assert.equalInt(40 + 2, 42);
+    let s = "windows";
+    assert.equalInt(s.length, 7);
+    console.log("t01_smoke ok");
+    return 0;
+}

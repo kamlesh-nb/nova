@@ -1,0 +1,97 @@
+name: windows
+
+# Windows RUNTIME verification without a Windows dev host.
+#
+# Native `zig build` does NOT work on a bare Windows host (the install step needs a Unix shell +
+# rsync, and the static LLVM is only wired for macOS/Linux hosts). So we never build the compiler on
+# Windows. Instead:
+#   job 1 (ubuntu)  -> build `nova` on Linux, CROSS-COMPILE the Nova run-tests to windows-x86_64 .exe
+#   job 2 (windows) -> download those .exe and actually RUN them (real IOCP/process/file-dir behaviour)
+#
+# This is the feedback loop that lets us implement Windows APIs on a Unix host and have a real Windows
+# runner tell us the truth. Tests live in conformance/windows/*.nova (main()-based; pass = exit 0).
+# A test that does not cross-compile yet (known Windows gaps) is SKIPPED, not failed, so the workflow
+# stays green on what works and lights up new tests as their Windows support lands.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  cross-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Cache Zig global cache (LLVM dist + build cache)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: zig-cache-${{ runner.os }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: zig-cache-${{ runner.os }}-
+
+      - name: Build nova (static LLVM fetched from the self-hosted mirror)
+        run: |
+          zig build -Dstatic-llvm=true
+          echo "$HOME/.nova/bin" >> "$GITHUB_PATH"
+
+      - name: Cross-compile Windows run-tests to PE32+
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          compiled=0; skipped=0
+          for f in conformance/windows/*.nova; do
+            name=$(basename "$f" .nova)
+            if nova "$f" --target windows-x86_64 -o "$GITHUB_WORKSPACE/artifacts/$name.exe" \
+                 > "$GITHUB_WORKSPACE/artifacts/$name.log" 2>&1; then
+              echo "OK    $name"; compiled=$((compiled+1))
+            else
+              echo "SKIP  $name (does not cross-compile to Windows yet -- see artifact log)"
+              skipped=$((skipped+1))
+            fi
+          done
+          echo "cross-compiled=$compiled skipped=$skipped"
+          if [ "$compiled" -eq 0 ]; then
+            echo "::error::no Windows test cross-compiled -- build/toolchain regression"; exit 1
+          fi
+          ls -la "$GITHUB_WORKSPACE/artifacts"
+
+      - name: Upload Windows executables + logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exes
+          path: artifacts/
+
+  windows-run:
+    needs: cross-build
+    runs-on: windows-latest
+    steps:
+      - name: Download cross-compiled executables
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-exes
+          path: artifacts
+
+      - name: Run each .exe (pass = exit 0)
+        shell: pwsh
+        run: |
+          $exes = Get-ChildItem artifacts -Filter *.exe
+          if ($exes.Count -eq 0) { Write-Error "no .exe artifacts to run"; exit 1 }
+          $fail = 0
+          foreach ($e in $exes) {
+            Write-Host "=== $($e.Name) ==="
+            $out = & $e.FullName 2>&1 | Out-String
+            $code = $LASTEXITCODE
+            Write-Host $out.Trim()
+            if ($code -ne 0) { Write-Host "FAIL $($e.Name) (exit $code)"; $fail++ }
+            else            { Write-Host "PASS $($e.Name)" }
+          }
+          Write-Host "----"
+          if ($fail -gt 0) { Write-Error "$fail Windows test(s) failed at runtime"; exit 1 }
+          Write-Host "all Windows run-tests passed"
