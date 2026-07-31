@@ -13,6 +13,8 @@ import map;
 import net.asynctls;
 import net.url;
 import compress.gzip;
+import web.response;
+import web.status;
 
 pub struct HttpsResp {
     pub code: int,
@@ -62,44 +64,20 @@ fn dechunk(s: string): string {
     return string.join(out, "");
 }
 
-// Parse a raw HTTP/1.x response: status code, headers, and body (dechunked + gunzipped as indicated).
+// Parse a raw HTTP/1.x response into HttpsResp. The status/header/body split reuses the SHARED fast
+// parser (web.response.parse -- the same memchr path the server and the sync client use), so there is
+// one HTTP parsing implementation. The transfer framing (chunked de-framing + gzip) is applied on top,
+// since that is content decoding the base parser deliberately leaves alone.
 fn frameResp(raw: string): HttpsResp {
-    let headers = Map<string, string>(16, string.hash);
-    let sep = string.indexOf(raw, "\r\n\r\n");
-    let headPart = if (sep == 0 - 1) raw else string.slice(raw, 0, sep);
-    let bodyRaw = if (sep == 0 - 1) "" else string.slice(raw, sep + 4, raw.length);
-
-    let lines = string.split(headPart, "\r\n");
-    let code = 0;
-    if (lines.size() > 0) {
-        let statusLine = lines.get(0) ?? "";
-        let sp = string.split(statusLine, " ");
-        if (sp.size() >= 2) { code = string.parseI64(sp.get(1) ?? "0") as int; }
-    }
-    let i = 1;
-    while (i < lines.size()) {
-        let line = lines.get(i) ?? "";
-        let idx = string.indexOf(line, ": ");
-        if (idx != 0 - 1) {
-            headers.set(string.slice(line, 0, idx), string.slice(line, idx + 2, line.length));
-        }
-        i = i + 1;
-    }
-
-    let chunked = false;
-    let gz = false;
-    let hk = headers.keys();
-    let hi = 0;
-    while (hi < hk.size()) {
-        let k = hk.get(hi) ?? "";
-        let lk = string.toLowerCase(k);
-        if (lk == "transfer-encoding" && string.contains(string.toLowerCase(headers.get(k) ?? ""), "chunked")) { chunked = true; }
-        if (lk == "content-encoding" && string.contains(string.toLowerCase(headers.get(k) ?? ""), "gzip")) { gz = true; }
-        hi = hi + 1;
-    }
-    let dechunked = if (chunked) dechunk(bodyRaw) else bodyRaw;
+    let r = response.Response.parse(raw);
+    let code = Status.toCode(r.status);
+    let te = string.toLowerCase(r.getHeader("transfer-encoding") ?? "");
+    let ce = string.toLowerCase(r.getHeader("content-encoding") ?? "");
+    let chunked = string.contains(te, "chunked");
+    let gz = string.contains(ce, "gzip");
+    let dechunked = if (chunked) dechunk(r.body) else r.body;
     let body = if (gz) gzip.decompress(dechunked) else dechunked;
-    return HttpsResp{ code: code, headers: headers, body: body };
+    return HttpsResp{ code: code, headers: r.headers, body: body };
 }
 
 // Drive a GET over an already-connected TLS stream and frame the response.
