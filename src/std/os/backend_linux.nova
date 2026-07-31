@@ -3,3 +3,33 @@
 pub fn name(): string { return "epoll"; }
 pub const EVENT_SIZE: int = 12;          // sizeof(struct epoll_event), packed
 pub const COMPLETION_BASED: bool = false;
+
+// --- OS-varying ABI constants --------------------------------------------------------------------
+// os/sys is ONE shared implementation, but these values genuinely differ per kernel, and hardcoding
+// the macOS set (as os/sys did) silently corrupts every other target: open() gets the wrong creation
+// flags, mmap the wrong anonymous bit, and struct stat/dirent are read at the wrong offsets. They
+// live in this per-OS seam so the shared file stays target-neutral.
+
+// open(2) flags — Linux (octal in the headers; decimal here).
+pub const O_CREAT: int = 64;         // 0100
+pub const O_TRUNC: int = 512;        // 01000
+pub const O_APPEND: int = 1024;      // 02000
+pub const O_NONBLOCK: int = 2048;    // 04000
+
+// mmap: MAP_ANONYMOUS is 0x20 on Linux, NOT the 0x1000 macOS uses.
+pub const MAP_ANON: int = 32;
+
+// Socket option level and names — all different from macOS.
+pub const SOL_SOCKET: int = 1;
+pub const SO_ERROR: int = 4;
+pub const SO_REUSEADDR: int = 2;
+pub const SO_REUSEPORT: int = 15;
+
+// struct stat (x86_64): dev(8) ino(8) nlink(8) then mode at 24. st_mode is 4 bytes here, but only
+// the low 16 carry the type bits S_IFMT masks, so a u16 read at this offset is still correct.
+pub const STAT_MODE_OFF: int = 24;
+// struct dirent: d_ino(8) d_off(8) d_reclen(2) d_type(1) => d_name at 19.
+pub const DIRENT_NAME_OFF: int = 19;
+
+pub const EAGAIN: int = 11;
+pub const EINPROGRESS: int = 115;

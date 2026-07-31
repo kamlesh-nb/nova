@@ -6,3 +6,33 @@
 pub fn name(): string { return "kqueue"; }
 pub const EVENT_SIZE: int = 32;          // sizeof(struct kevent)
 pub const COMPLETION_BASED: bool = false; // native model is readiness; completion is emulated
+
+// --- OS-varying ABI constants --------------------------------------------------------------------
+// os/sys is ONE shared implementation, but these values genuinely differ per kernel, and hardcoding
+// the macOS set (as os/sys did) silently corrupts every other target: open() gets the wrong creation
+// flags, mmap the wrong anonymous bit, and struct stat/dirent are read at the wrong offsets. They
+// live in this per-OS seam so the shared file stays target-neutral.
+
+// open(2) flags — macOS/BSD.
+pub const O_CREAT: int = 512;        // 0x0200
+pub const O_TRUNC: int = 1024;       // 0x0400
+pub const O_APPEND: int = 8;         // 0x0008
+pub const O_NONBLOCK: int = 4;       // 0x0004
+
+// mmap: MAP_ANON is 0x1000 on macOS/BSD.
+pub const MAP_ANON: int = 4096;
+
+// Socket option level and names.
+pub const SOL_SOCKET: int = 65535;   // 0xffff
+pub const SO_ERROR: int = 4103;      // 0x1007
+pub const SO_REUSEADDR: int = 4;
+pub const SO_REUSEPORT: int = 512;   // 0x0200
+
+// struct stat: st_mode is a u16 at offset 4 (dev_t is 4 bytes here).
+pub const STAT_MODE_OFF: int = 4;
+// struct dirent: d_ino(8) d_seekoff(8) d_reclen(2) d_namlen(2) d_type(1) => d_name at 21.
+pub const DIRENT_NAME_OFF: int = 21;
+
+// errno values used by the non-blocking socket paths.
+pub const EAGAIN: int = 35;
+pub const EINPROGRESS: int = 36;

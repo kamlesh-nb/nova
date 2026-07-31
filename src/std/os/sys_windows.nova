@@ -90,7 +90,8 @@ pub const S_IFLNK: int = 40960;
 // Layout this module WRITES in stat() and READS in pathStatMode — kept identical to the POSIX file
 // so io/file and io/dir need no Windows branch.
 const STAT_MODE_OFF: int = 4;
-const DIRENT_NAME_OFF: int = 21;
+// Public because io/dir walks the entry itself and must not hardcode a per-OS offset.
+pub const DIRENT_NAME_OFF: int = 21;
 
 pub const AF_INET: int = 2;
 pub const SOCK_STREAM: int = 1;

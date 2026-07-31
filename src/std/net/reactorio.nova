@@ -15,12 +15,13 @@
 
 import bytes;
 import os.socket;
+import os.backend;
 import net.eventloop;
 
-// errno values are platform-specific. macOS/BSD values here; Linux (EAGAIN=11, EINPROGRESS=115)
-// plugs in behind the same shape when the epoll backend is verified on Linux.
-pub const EAGAIN: int = 35;
-pub const EINPROGRESS: int = 36;
+// errno values are platform-specific (EAGAIN is 35 on macOS but 11 on Linux), so they come from the
+// per-OS seam in os/backend rather than being pinned to one kernel here.
+pub const EAGAIN: int = backend.EAGAIN;
+pub const EINPROGRESS: int = backend.EINPROGRESS;
 
 // Parse a dotted-quad IPv4 string into the value to store in sin_addr with bytes.write_i32, i.e.
 // the four octets in ascending memory order (little-endian int): "127.0.0.1" -> 0x0100007F, whose
