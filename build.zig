@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 // LLVM install prefixes (override either with NOVA_LLVM_PREFIX). The two link
 // modes need different trees:
@@ -36,6 +37,14 @@ fn configureLlvmLink(b: *std.Build, m: *std.Build.Module, static: bool, os_tag: 
     }
 
     if (!static) {
+        if (os_tag == .windows) {
+            // Native Windows dev build: dynamic-link the LLVM C API from a local LLVM install.
+            // Set NOVA_LLVM_PREFIX to the install root (e.g. C:/Program Files/LLVM) so the lib path
+            // above resolves to <prefix>/lib, which holds LLVM-C.lib (the import lib for LLVM-C.dll).
+            // No system zlib on Windows; the C-API surface does not require it.
+            m.linkSystemLibrary("LLVM-C", .{ .use_pkg_config = .no });
+            return;
+        }
         // Default: dynamic link (fast dev builds), matching the original dep.
         m.linkSystemLibrary("LLVM", .{ .use_pkg_config = .no });
         m.linkSystemLibrary("z", .{});
@@ -358,6 +367,32 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile) void {
 
     const bin_dest = b.fmt("{s}/.nova/bin", .{home});
     const std_dest = b.fmt("{s}/.nova/std", .{home});
+
+    // Native Windows host: the sh/rsync/clang++ script below is POSIX-only. Mirror it in PowerShell
+    // (present on every Windows) with New-Item/Copy-Item and the LLVM install's clang++/llvm-ar. The
+    // macOS-only webview build and the ASAN/TSAN runtimes are skipped here (follow-ons). This branch
+    // only runs when `zig build` is invoked ON a Windows host; macOS/Linux take the unchanged path.
+    if (builtin.os.tag == .windows) {
+        const ps = b.fmt(
+            \\$ErrorActionPreference = "Stop"
+            \\New-Item -ItemType Directory -Force -Path "{[bin]s}","{[std]s}","{[home]s}/.nova/src/runtime","{[home]s}/.nova/deps","{[home]s}/.nova/lib" | Out-Null
+            \\Copy-Item -Force zig-out/bin/nova.exe "{[bin]s}/nova.exe"
+            \\Copy-Item -Recurse -Force src/std/* "{[std]s}/"
+            \\Copy-Item -Recurse -Force src/runtime/* "{[home]s}/.nova/src/runtime/"
+            \\Copy-Item -Recurse -Force deps/* "{[home]s}/.nova/deps/"
+            \\Write-Host "Building libnova_runtime.a (Windows; reactor runtime + Win32 syscall shims) ..."
+            \\clang++ -std=c++20 -O2 -DNOVA_DROP_ARENA -c src/runtime/runtime.cpp -o "{[home]s}/.nova/lib/nova_runtime.o"
+            \\llvm-ar rcs "{[home]s}/.nova/lib/libnova_runtime.a" "{[home]s}/.nova/lib/nova_runtime.o"
+            \\Write-Host "Installed compiler to {[bin]s}/nova.exe"
+            \\Write-Host "Prebuilt libnova_runtime.a; synced std/runtime/deps to {[home]s}/.nova/"
+            \\
+        , .{ .bin = bin_dest, .std = std_dest, .home = home });
+        const install_cmd_ps = b.addSystemCommand(&.{ "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps });
+        const install_exe_ps = b.addInstallArtifact(exe, .{});
+        install_cmd_ps.step.dependOn(&install_exe_ps.step);
+        b.getInstallStep().dependOn(&install_cmd_ps.step);
+        return;
+    }
 
     const script = b.fmt(
         \\set -e
