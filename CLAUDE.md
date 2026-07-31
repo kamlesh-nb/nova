@@ -179,7 +179,7 @@ Every remaining failure is structural, not a bug to chase:
   clone on any platform.
 - **`188_kqueue_readiness`** asserts kqueue struct layouts (fails off macOS) and
   **`189_epoll_event_layout`** asserts epoll's (fails off Linux). Inapplicable by design.
-- **`210_cross_reactor_wakeup` under io_uring only** — see the known gap below.
+(`210_cross_reactor_wakeup` was an io_uring-only failure and is fixed — see the SQE note below.)
 
 ### Throughput (oha, release build, 30s @ c=100)
 
@@ -224,15 +224,22 @@ The per-fd arm records are shared between the two backends (`nova_reactor_arm_*`
 identical and only the spelling differs (`WSARecv` vs `IORING_OP_RECV`). `evBytes` falls back to
 `FIONREAD` because a zero-byte completion has no count to report.
 
-### Known gap
+### Cross-reactor wake on io_uring — and an SQE trap worth remembering
 
-`210_cross_reactor_wakeup`'s multi-threaded half fails under io_uring (the single-threaded self-wake
-passes, and epoll/IOCP pass both). The wake channel is an eventfd either way; on io_uring its
-readability is watched with a one-shot `IORING_OP_POLL_ADD` that must be drained and re-armed after
-each fire, from BOTH the C driver and the Nova-side poll. That is wired, but the cross-THREAD case
-still does not deliver — suspect the arm being made against the wrong thread's ring, since the wake
-fd is thread-local and registration order versus ring creation matters. Everything else on io_uring
-passes.
+The wake channel is an eventfd on both Linux backends; what differs is how its readability is
+observed. epoll registers it in the set. io_uring has no set, so it watches the fd with a ONE-SHOT
+`IORING_OP_POLL_ADD`, which must be drained and re-armed after every fire — from the C driver AND
+from the Nova-side poll, because a reactor loop driven from Nova reaps completions itself and never
+reaches the C dispatch.
+
+The trap: in `io_uring_sqe`, **`poll32_events` unions with `off`/`addr2`**. Setting the event mask
+while ALSO leaving `off` populated makes addr2 non-zero, the kernel rejects the SQE with -EINVAL, and
+the completion comes back instantly carrying the correct `user_data`. That presents as a wake that
+fires the moment it is armed: the poll returns, the filter correctly reports a user wake, and only
+the empty inbox reveals anything is wrong. `nova_uring_prep` now clears `off` for POLL_ADD.
+
+Worth knowing generally — several io_uring opcodes alias fields through that union, so "set the field
+the docs name" is not sufficient; the ones it overlaps have to be cleared.
 
 ## Status
 
