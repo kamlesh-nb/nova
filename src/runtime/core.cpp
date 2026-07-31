@@ -16,7 +16,9 @@
 #include <shared_mutex>
 #include <thread>
 #ifdef _WIN32
-#include <winsock2.h>
+#include <winsock2.h>  // MUST precede <windows.h> so the winsock v2 symbols win over v1
+#include <ws2tcpip.h>
+#include <windows.h>
 #include <io.h>
 #include <stdlib.h>
 #else
@@ -497,5 +499,83 @@ int nova_close(int fd) {
   return ::close(fd);
 #endif
 }
+
+#ifdef _WIN32
+// ---------------------------------------------------------------------------------------------------
+// POSIX syscall shims for Windows. os/sys.nova declares these as `extern("c")` against the libc names
+// (mmap/munmap/fsync/socketpair); the zig-mingw C library does not provide them, so the Windows target
+// fails to link (undefined symbol). We define the libc names here mapped onto the Win32 equivalents,
+// matching the exact ABI os/sys emits. Anonymous private RW mapping and file flush are all os/sys asks
+// of mmap/fsync, so prot/flags/fd/offset are ignored for mmap. Mirrors the nova_set_nonblock ->
+// ioctlsocket and entropy -> BCryptGenRandom pattern already used above / in crypto.cpp.
+
+// mapAnon() passes MAP_PRIVATE|MAP_ANON RW; VirtualAlloc gives zero-filled committed pages. Returns
+// MAP_FAILED ((void*)-1) on error, which os/sys.mapAnon translates to 0.
+void *mmap(void *addr, long long length, int prot, int flags, int fd, long long offset) {
+  (void)addr; (void)prot; (void)flags; (void)fd; (void)offset;
+  if (length <= 0) return (void *)-1;
+  void *p = ::VirtualAlloc(nullptr, (SIZE_T)length, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+  return p ? p : (void *)-1;
+}
+
+// VirtualFree with MEM_RELEASE requires size 0 and the original base pointer. Returns 0 on success.
+int munmap(void *addr, long long length) {
+  (void)length;
+  return ::VirtualFree(addr, 0, MEM_RELEASE) ? 0 : -1;
+}
+
+// fsync(fd): flush a CRT file descriptor's buffers to disk via its underlying HANDLE.
+int fsync(int fd) {
+  HANDLE h = (HANDLE)_get_osfhandle(fd);
+  if (h == INVALID_HANDLE_VALUE) return -1;
+  return ::FlushFileBuffers(h) ? 0 : -1;
+}
+
+// Winsock needs one-time WSAStartup before any socket call. socketpair (reactor self-wake) is the only
+// os/sys entry that can run before the rest of the socket stack initialises it, so guard it here.
+static void ensureWinsock() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    WSADATA wsa;
+    ::WSAStartup(MAKEWORD(2, 2), &wsa);
+  });
+}
+
+// socketpair(): Windows has no AF_UNIX socketpair, so emulate a connected pair over a 127.0.0.1
+// loopback listener. Used for the reactor's cross-thread wake pipe. Writes the two fds into sv[0]/sv[1]
+// (SOCKET is 64-bit on Win64; freshly-created loopback sockets have small handle values that fit `int`,
+// matching os/sys's int-fd model). Returns 0 on success, -1 on error.
+int socketpair(int domain, int type, int protocol, int *sv) {
+  (void)domain; (void)protocol;
+  ensureWinsock();
+  SOCKET listener = ::socket(AF_INET, type, 0);
+  if (listener == INVALID_SOCKET) return -1;
+  struct sockaddr_in addr;
+  std::memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
+  addr.sin_port = 0;
+  int addrlen = (int)sizeof(addr);
+  if (::bind(listener, (struct sockaddr *)&addr, addrlen) == SOCKET_ERROR ||
+      ::getsockname(listener, (struct sockaddr *)&addr, &addrlen) == SOCKET_ERROR ||
+      ::listen(listener, 1) == SOCKET_ERROR) {
+    ::closesocket(listener);
+    return -1;
+  }
+  SOCKET client = ::socket(AF_INET, type, 0);
+  if (client == INVALID_SOCKET) { ::closesocket(listener); return -1; }
+  if (::connect(client, (struct sockaddr *)&addr, addrlen) == SOCKET_ERROR) {
+    ::closesocket(listener);
+    ::closesocket(client);
+    return -1;
+  }
+  SOCKET server = ::accept(listener, nullptr, nullptr);
+  ::closesocket(listener);
+  if (server == INVALID_SOCKET) { ::closesocket(client); return -1; }
+  sv[0] = (int)client;
+  sv[1] = (int)server;
+  return 0;
+}
+#endif // _WIN32
 
 }
