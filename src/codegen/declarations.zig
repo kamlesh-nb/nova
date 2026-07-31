@@ -344,10 +344,7 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         const getrandom_fn = core.LLVMAddFunction(compiler.module, "nova_getrandom", core.LLVMFunctionType(compiler.void_type, &getrandom_params, 2, 0));
         try compiler.func_map.put("nova_getrandom", getrandom_fn);
 
-        const gzc_fn = core.LLVMAddFunction(compiler.module, "nova_gzip_compress", core.LLVMFunctionType(compiler.ptr_type, &one_param_ptr, 1, 0));
-        try compiler.func_map.put("nova_gzip_compress", gzc_fn);
-        const gzd_fn = core.LLVMAddFunction(compiler.module, "nova_gzip_decompress", core.LLVMFunctionType(compiler.ptr_type, &one_param_ptr, 1, 0));
-        try compiler.func_map.put("nova_gzip_decompress", gzd_fn);
+        // nova_gzip_compress/decompress retired: gzip is pure Nova (compress/deflate.nova).
 
         var process_spawn_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.ptr_type };
         const process_spawn_type = core.LLVMFunctionType(compiler.ptr_type, &process_spawn_params, 2, 0);

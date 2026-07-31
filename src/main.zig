@@ -73,7 +73,7 @@ fn linkNativeInProcessMacho(
     });
     for (objs) |o| try args.append(allocator, o);
     const nova_lib = try std.fmt.allocPrint(allocator, "-L{s}/lib", .{shared_nova});
-    try args.appendSlice(allocator, &.{ nova_lib, "-lnova_runtime", "-lz", "-L/opt/homebrew/lib" });
+    try args.appendSlice(allocator, &.{ nova_lib, "-lnova_runtime", "-L/opt/homebrew/lib" });
     try appendWolfsslLink(&args, allocator, shared_nova, io);
     for (ffi_libs) |lib| {
         try appendFfiLib(&args, allocator, shared_nova, io, lib);
@@ -130,10 +130,10 @@ fn crossLinkViaZig(
 
         const rt_src = try std.fmt.allocPrint(allocator, "{s}/src/runtime/runtime.cpp", .{shared_nova});
 
-        const zlib_inc = try std.fmt.allocPrint(allocator, "-I{s}/deps/zlib", .{shared_nova});
         std.debug.print("[T1] cross-compiling the C++ runtime for {s} (one-time; caches to ~/.nova/lib) ...\n", .{target.zig});
         // Boost.Asio retired (M4): the runtime is reactor-native, no Boost include needed.
-        const rc_args = [_][]const u8{ "zig", "c++", "-target", target.zig, "-std=c++20", "-O2", "-DNOVA_DROP_ARENA", zlib_inc, "-c", rt_src, "-o", rt_obj };
+        // zlib retired: compression is pure Nova (compress/deflate.nova), no zlib include/link.
+        const rc_args = [_][]const u8{ "zig", "c++", "-target", target.zig, "-std=c++20", "-O2", "-DNOVA_DROP_ARENA", "-c", rt_src, "-o", rt_obj };
         var rc_child = try std.process.spawn(io, .{ .argv = &rc_args });
         switch (try rc_child.wait(io)) {
             .exited => |code| if (code != 0) {
@@ -152,10 +152,8 @@ fn crossLinkViaZig(
     for (objs) |o| try args.append(allocator, o);
     try args.append(allocator, rt_obj);
 
-    const zlib_srcs = [_][]const u8{ "adler32", "compress", "crc32", "deflate", "infback", "inffast", "inflate", "inftrees", "trees", "uncompr", "zutil" };
-    for (zlib_srcs) |name|
-        try args.append(allocator, try std.fmt.allocPrint(allocator, "{s}/deps/zlib/{s}.c", .{ shared_nova, name }));
-
+    // zlib retired: compression is pure Nova (compress/deflate.nova), so the vendored zlib .c files
+    // are no longer compiled into cross targets.
     if (std.mem.indexOf(u8, target.zig, "windows") != null)
         try args.appendSlice(allocator, &.{ "-lws2_32", "-lmswsock", "-lbcrypt" });
     try args.appendSlice(allocator, &.{ "-o", output_path });
@@ -1910,7 +1908,6 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
     try test_clang_args.append(allocator, test_nova_lib);
 
     try test_clang_args.append(allocator, if (asan) "-lnova_runtime_asan" else if (tsan) "-lnova_runtime_tsan" else "-lnova_runtime");
-    try test_clang_args.append(allocator, "-lz");
 
     try test_clang_args.append(allocator, "-L/opt/homebrew/lib");
     try appendWolfsslLink(&test_clang_args, allocator, shared_nova, init.io);
@@ -2257,7 +2254,6 @@ fn compileProgram(
         const nova_lib = try std.fmt.allocPrint(allocator, "-L{s}/lib", .{shared_nova});
         try clang_args.append(allocator, nova_lib);
         try clang_args.append(allocator, "-lnova_runtime");
-        try clang_args.append(allocator, "-lz");
         try clang_args.append(allocator, "-L/opt/homebrew/lib");
         try appendWolfsslLink(&clang_args, allocator, shared_nova, init.io);
         for (ffi_libs) |lib| {
