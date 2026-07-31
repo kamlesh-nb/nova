@@ -26,10 +26,30 @@ nova build [--release]          # project build → build/<profile>/{obj,bin} (r
 nova init web|desktop --name X  # scaffold an app
 
 conformance/run.sh              # the corpus — run BEFORE and AFTER any change (currently 148/148)
+conformance/run.sh -j           # SAME corpus, run in parallel (cores-1 workers) — ~5x faster (~2min vs >10min)
 conformance/run.sh --asan       # AddressSanitizer gate (catches UAF/double-free; 266/266). Requires NOVA_ASAN=1 build first.
 conformance/run.sh --arc        # ARC leak gate (baseline-gated)
 NOVA_ARC_AUDIT=1 nova test f    # per-run ARC audit ("ARC audit: clean" or survivors)
 ```
+
+### Running the corpus in parallel (`-j`)
+
+The default `conformance/run.sh` is sequential (~10 min, and the reactor cases push it longer). `-j`
+runs the same positive corpus across `cores-1` workers (~2 min); `-j N` sets the worker count. It applies
+ONLY to the plain `nova test` run — the `--asan` / `--arc` / `--wasm` modes stay sequential (baseline-gated,
+order-sensitive), and the harness self-test + `expect_fail` gates run after, unchanged.
+
+How it stays correct in parallel — two things had to be handled:
+- **`nova test` writes a hardcoded `__nova_test` output file**, so parallel instances would clobber each
+  other → each worker runs the case in its OWN temp dir (with `packages/` symlinked in so most
+  driver-importing cases still resolve). This is why concurrent runs were "banned" — it was fixable.
+- **Per-case timeout** via coreutils `timeout`/`gtimeout`, else a `perl` `alarm` (stock macOS has no
+  `timeout`), so a case that waits on a live service can't stall the batch.
+
+Known limitation: a case that links a package's **native** lib (the `mysql`/`mssql`/`pg` DB drivers,
+`67/100/109/110`) links it relative to the repo root, so under `-j` it **fails fast** in the temp dir
+(link error) and `-j` exits non-zero. Those few are environment-dependent anyway (some need a live DB) —
+verify them with the plain sequential `run.sh`. Everything else is authoritative under `-j`.
 
 ## Working on Windows — read this first if the repo is cloned on a Windows host
 

@@ -97,6 +97,20 @@ if [[ "${1:-}" == "--asan" ]]; then ASAN_MODE=1; shift; fi
 # cannot. This is the gate for the self-hosted runtime work — any race becomes a located
 # report naming both accesses. Requires: NOVA_TSAN=1 zig build first.
 if [[ "${1:-}" == "--tsan" ]]; then TSAN_MODE=1; shift; fi
+# -j [N] / --parallel [N] : run the plain positive corpus N-way parallel (default: cores-1). Each case
+# runs in its own temp dir so the hardcoded __nova_test output cannot collide, with packages/ symlinked
+# in so driver-importing cases still resolve; server cases use ephemeral ports so they parallelise
+# cleanly. Applies ONLY to the default `nova test` run — the sanitizer/wasm/arc modes stay sequential
+# (baseline-gated, order-sensitive). The default (no -j) path is unchanged.
+PARALLEL=0
+if [[ "${1:-}" == "-j" || "${1:-}" == "--parallel" ]]; then
+  shift
+  if [[ "${1:-}" =~ ^[0-9]+$ ]]; then PARALLEL="$1"; shift
+  else
+    _nc="$( (command -v sysctl >/dev/null && sysctl -n hw.ncpu) 2>/dev/null || nproc 2>/dev/null || echo 4 )"
+    PARALLEL=$(( _nc > 2 ? _nc - 1 : 2 ))
+  fi
+fi
 FILTER="${1:-}"
 
 if [[ ! -x "$NOVA" ]]; then
@@ -105,6 +119,45 @@ if [[ ! -x "$NOVA" ]]; then
 fi
 
 pass=0; fail=0; failed_cases=()
+if [[ $PARALLEL -gt 0 && $WASM_MODE -eq 0 && $WASMRUN_MODE -eq 0 && $ASAN_MODE -eq 0 && $ARC_MODE -eq 0 && $TSAN_MODE -eq 0 ]]; then
+  # ---- parallel default corpus (opt-in -j) : per-case temp dir + packages symlink ----
+  # Self-contained worker (plain exported env vars propagate into the xargs child; an exported
+  # function does not, reliably). Timeout via coreutils timeout/gtimeout, else a perl alarm.
+  ROOT="$(cd "$HERE/.." && pwd)"
+  export NOVA ROOT CASE_TIMEOUT
+  echo "--- parallel: ${PARALLEL} workers (per-case temp dir; packages symlinked) ---"
+  _verd="$(mktemp)"; _worker="$(mktemp)"
+  # Worker is a tiny script (macOS xargs -I{} chokes on a long inline command; an exported function does
+  # not reliably reach the xargs child). Reads $NOVA/$ROOT/$CASE_TIMEOUT from the exported env. Each case
+  # runs in its own temp dir so the hardcoded __nova_test output cannot collide, with packages/ symlinked
+  # so most driver-importing cases resolve; the per-case $CASE_TIMEOUT (perl alarm on stock macOS) caps a
+  # case that waits on a live service. NOTE: a case that links a package's NATIVE lib (the mysql/mssql/pg
+  # DB drivers) links it relative to the repo root, so it FAILS FAST here (link error) rather than in a
+  # long serial hang — verify those few with the plain sequential run.
+  cat > "$_worker" <<'WORKER'
+f="$1"; name="$(basename "$f")"; wd="$(mktemp -d)"
+ln -s "$ROOT/packages" "$wd/packages" 2>/dev/null
+cd "$wd" || exit 0
+if command -v timeout >/dev/null 2>&1; then out="$(timeout -k 5 "$CASE_TIMEOUT" "$NOVA" test "$f" 2>&1)"; code=$?
+elif command -v gtimeout >/dev/null 2>&1; then out="$(gtimeout -k 5 "$CASE_TIMEOUT" "$NOVA" test "$f" 2>&1)"; code=$?
+else out="$(perl -e "alarm $CASE_TIMEOUT; exec @ARGV" "$NOVA" test "$f" 2>&1)"; code=$?; fi
+cd / ; rm -rf "$wd"
+res="$(printf '%s\n' "$out" | grep -E '^Results:' | tail -1)"
+if [ "$code" -eq 0 ] && printf '%s' "$res" | grep -q '0 failed'; then printf 'PASS\t%s\t%s\n' "$name" "$res"
+else printf 'FAIL\t%s\t%s\n' "$name" "${res:-<compile/link or timeout>}"; fi
+WORKER
+  for f in "$HERE"/cases/*.nova; do
+    n="$(basename "$f")"; [[ -n "$FILTER" && "$n" != *"$FILTER"* ]] && continue
+    printf '%s\n' "$f"
+  done | xargs -P "$PARALLEL" -n1 bash "$_worker" >> "$_verd"
+  rm -f "$_worker"
+  # tally (sorted for stable output)
+  while IFS="$(printf '\t')" read -r v name res; do
+    if [[ "$v" == "PASS" ]]; then printf "  \033[32mPASS\033[0m  %-32s %s\n" "$name" "$res"; pass=$((pass+1))
+    else printf "  \033[31mFAIL\033[0m  %-32s %s\n" "$name" "$res"; fail=$((fail+1)); failed_cases+=("$name"); fi
+  done < <(sort "$_verd")
+  rm -f "$_verd"
+else
 for f in "$HERE"/cases/*.nova; do
   name="$(basename "$f")"
   [[ -n "$FILTER" && "$name" != *"$FILTER"* ]] && continue
@@ -172,6 +225,7 @@ for f in "$HERE"/cases/*.nova; do
     fail=$((fail+1)); failed_cases+=("$name")
   fi
 done
+fi
 
 # Negative cases: each expect_fail/*.nova MUST be REJECTED, and must be rejected
 # for the RIGHT REASON.
