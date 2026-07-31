@@ -7,7 +7,7 @@
 //   * dirent      — MSVC's UCRT has no <dirent.h>; opendir/readdir/closedir are undefined symbols.
 //                   Rebuilt here over FindFirstFileW/FindNextFileW, laying the entry out so
 //                   io/dir's `d_name at offset 21` read is satisfied.
-//   * open flags  — O_CREAT()/O_TRUNC() on Windows are NOT the macOS/BSD values in os/sys, and text
+//   * open flags  — O_CREAT/O_TRUNC on Windows are NOT the macOS/BSD values in os/sys, and text
 //                   mode would corrupt binary data. Files go through CreateFileW instead, whose
 //                   creation disposition is explicit and which is always binary.
 //   * struct stat — MSVC puts st_mode at a different offset. stat() here fills a buffer matching
@@ -104,7 +104,7 @@ pub const AF_UNIX: int = 1;
 // 127.0.0.1 already in network byte order, i.e. the bytes 127,0,0,1 read as a little-endian i32.
 pub const INADDR_LOOPBACK_BE: long = 16777343;   // 0x0100007F
 pub fn SO_ERROR(): int { return 4103; }
-// Windows has no SO_REUSEPORT(); SO_REUSEADDR (4) is the closest shared-port behaviour.
+// Windows has no SO_REUSEPORT; SO_REUSEADDR (4) is the closest shared-port behaviour.
 pub fn SO_REUSEPORT(): int { return 4; }
 
 // --- errno ------------------------------------------------------------------------------------

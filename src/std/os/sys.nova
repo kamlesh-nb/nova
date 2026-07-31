@@ -74,7 +74,8 @@ pub extern("c") fn munmap(addr: ptr, length: long): int;
 // another module does not fold in this compiler (it reports the name as undefined, and a same-named
 // one recurses until the stack dies). A function body evaluates normally, so the per-OS seam in
 // os/backend can still be the single source of truth for values that genuinely differ by kernel.
-// mmap prot and flag bits. PROT_*/MAP_PRIVATE agree across POSIX; MAP_ANON() does NOT (0x1000 on
+
+// mmap prot and flag bits. PROT_*/MAP_PRIVATE agree across POSIX; MAP_ANON does NOT (0x1000 on
 // macOS/BSD, 0x20 on Linux), so it comes from the per-OS seam.
 pub const PROT_READ: int = 1;
 pub const PROT_WRITE: int = 2;
@@ -82,7 +83,7 @@ pub const MAP_PRIVATE: int = 2;
 pub fn MAP_ANON(): int { return backend.MMAP_ANON; }
 
 // open(2) flags and lseek whence. The access modes are 0/1/2 everywhere; the creation and status
-// flags are NOT (O_CREAT() is 0x200 on macOS but 0x40 on Linux), so those come from the per-OS seam.
+// flags are NOT (O_CREAT is 0x200 on macOS but 0x40 on Linux), so those come from the per-OS seam.
 // Getting them wrong does not fail loudly — open() just does the wrong thing.
 pub const O_RDONLY: int = 0;
 pub const O_WRONLY: int = 1;
@@ -104,7 +105,7 @@ pub const S_IFLNK: int = 40960;
 
 // struct stat and struct dirent are read as raw bytes at fixed offsets, and those offsets differ by
 // kernel (macOS puts st_mode at 4, Linux at 24; d_name is at 21 vs 19). Both come from the per-OS
-// seam. DIRENT_NAME_OFF() is public because io/dir walks the entry itself.
+// seam. DIRENT_NAME_OFF is public because io/dir walks the entry itself.
 pub fn STAT_MODE_OFF(): int { return backend.STAT_MODE_OFFSET; }
 pub fn DIRENT_NAME_OFF(): int { return backend.DIRENT_NAME_OFFSET; }
 
