@@ -101,7 +101,7 @@ pub const S_IFLNK: int = 40960;
 // struct stat and struct dirent are read as raw bytes at fixed offsets, and those offsets differ by
 // kernel (macOS puts st_mode at 4, Linux at 24; d_name is at 21 vs 19). Both come from the per-OS
 // seam. DIRENT_NAME_OFF is public because io/dir walks the entry itself.
-const STAT_MODE_OFF: int = backend.STAT_MODE_OFFSET;
+pub const STAT_MODE_OFF: int = backend.STAT_MODE_OFFSET;
 pub const DIRENT_NAME_OFF: int = backend.DIRENT_NAME_OFFSET;
 
 // A fresh NUL-terminated C string copy of a Nova string (Nova strings are length-prefixed, not
