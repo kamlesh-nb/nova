@@ -127,6 +127,81 @@ static void epoll_dispatch(const struct epoll_event &ev) {
 }
 #endif // NOVA_HAVE_EPOLL
 
+#if defined(NOVA_HAVE_EPOLL)
+// --- io_uring dispatch ---------------------------------------------------------------------------
+// The COMPLETION-shaped Linux backend. Its user_data encoding deliberately reuses the epoll tags
+// above, so a timer fire and a wake are recognised identically on both Linux backends; what differs
+// is that a completion already CARRIES its result (like IOCP), so the byte count is written back
+// into the op record before the coroutine resumes, instead of the poll performing the I/O itself.
+//
+// Op-record offsets are net/eventloop_linux.nova's — note they are NOT the Windows ones.
+const int NOVA_LX_OP_DONE_OFF = 20;
+const int NOVA_LX_OP_TOKEN_OFF = 24;
+const int NOVA_LX_OP_RESULT_OFF = 32;
+
+extern "C" int nova_reactor_backend(void);
+extern "C" long long nova_uring_current(void);
+extern "C" void nova_uring_set_current(long long ring);
+extern "C" long long nova_uring_create(int entries);
+extern "C" void nova_uring_destroy(long long ring);
+extern "C" int nova_uring_prep(long long ring, int op, int fd, long long addr, int len, long long off, long long ud);
+extern "C" int nova_uring_submit_and_wait(long long ring, int wait_nr);
+extern "C" int nova_uring_cq_ready(long long ring);
+extern "C" int nova_uring_peek(long long ring, int i, long long *ud, int *res);
+extern "C" void nova_uring_advance(long long ring, int n);
+extern "C" int nova_uring_op_timeout(void);
+
+static void uring_dispatch(long long user_data, int res) {
+    uint64_t d = (uint64_t)user_data;
+    if (d == NOVA_EPOLL_WAKE_DATA || d == 0) return;
+    if (d & NOVA_EPOLL_TIMER_TAG) {
+        long long h = (long long)(d & ~NOVA_EPOLL_TIMER_TAG);
+        if (h) nova_reactor_resume(h);   // no fd to reclaim: the timeout lived in the ring
+        return;
+    }
+    char *op = (char *)d;
+    *reinterpret_cast<int *>(op + NOVA_LX_OP_DONE_OFF) = 1;
+    *reinterpret_cast<long long *>(op + NOVA_LX_OP_RESULT_OFF) = (long long)res;
+    long long token = *reinterpret_cast<long long *>(op + NOVA_LX_OP_TOKEN_OFF);
+    if (token) nova_reactor_resume(token);
+}
+
+// A reactor timer on io_uring is an IORING_OP_TIMEOUT SQE rather than a timerfd: no extra fd, and
+// the fire arrives on the same completion queue as I/O. The timespec must outlive the submission,
+// so it is carried in a per-deadline heap cell freed when the completion lands.
+struct NovaUringTimeout { int64_t sec; int64_t nsec; };
+std::mutex &g_uring_to_mu = *new std::mutex();
+std::unordered_map<long long, NovaUringTimeout *> &g_uring_tos =
+    *new std::unordered_map<long long, NovaUringTimeout *>();
+
+static void uring_timer_arm(long long handle, long long ms) {
+    long long ring = nova_uring_current();
+    if (!ring || !handle) return;
+    NovaUringTimeout *t = new NovaUringTimeout();
+    long long m = ms < 0 ? 0 : ms;
+    t->sec = m / 1000;
+    t->nsec = (m % 1000) * 1000000;
+    {
+        std::lock_guard<std::mutex> lk(g_uring_to_mu);
+        auto it = g_uring_tos.find(handle);
+        if (it != g_uring_tos.end()) { delete it->second; it->second = t; }
+        else g_uring_tos[handle] = t;
+    }
+    nova_uring_prep(ring, nova_uring_op_timeout(), -1, (long long)(intptr_t)t, 1, 0,
+                    (long long)((uint64_t)handle | NOVA_EPOLL_TIMER_TAG));
+    nova_uring_submit_and_wait(ring, 0);
+}
+
+static void uring_timer_release(long long handle) {
+    std::lock_guard<std::mutex> lk(g_uring_to_mu);
+    auto it = g_uring_tos.find(handle);
+    if (it == g_uring_tos.end()) return;
+    delete it->second;
+    g_uring_tos.erase(it);
+}
+#endif // NOVA_HAVE_EPOLL (io_uring shares the Linux guard)
+
+
 #if defined(NOVA_HAVE_IOCP)
 // --- IOCP reactor support (the Windows peer of the kqueue driver) ------------------------------
 //
@@ -883,6 +958,50 @@ void nova_run_root(long long root) {
     g_deadline_active = false;
     if (g_batch_reaped) g_batch_reaped->clear();
 
+    // io_uring drives the same coroutine machinery, but as a proactor: completions carry results,
+    // so uring_dispatch writes them into the op record rather than the loop performing the I/O.
+    if (nova_reactor_backend() == 1) {
+        long long ring = nova_uring_create(256);
+        if (ring) {
+            long long prev_ring = nova_uring_current();
+            nova_uring_set_current(ring);
+            ++g_run_depth;
+            nova_reactor_resume(root);
+            int uidle = 0;
+            while (!raw_coro_done(root)) {
+                nova_uring_submit_and_wait(ring, 1);
+                int ready = nova_uring_cq_ready(ring);
+                if (ready <= 0) {
+                    if (++uidle > 750) break;
+                    continue;
+                }
+                uidle = 0;
+                nova_reactor_batch_begin();
+                for (int i = 0; i < ready; ++i) {
+                    long long ud = 0; int res = 0;
+                    nova_uring_peek(ring, i, &ud, &res);
+                    if ((uint64_t)ud & NOVA_EPOLL_TIMER_TAG)
+                        uring_timer_release((long long)((uint64_t)ud & ~NOVA_EPOLL_TIMER_TAG));
+                    uring_dispatch(ud, res);
+                }
+                nova_uring_advance(ring, ready);
+            }
+            --g_run_depth;
+            nova_uring_set_current(prev_ring);
+            nova_uring_destroy(ring);
+            g_reactor_mode = false;
+            if (!raw_coro_done(root)) {
+                std::fprintf(stderr,
+                             "nova: fatal — async root %p never completed (lost wakeup); "
+                             "refusing to read its unwritten result\n",
+                             reinterpret_cast<void *>(root));
+                std::abort();
+            }
+            return;
+        }
+        // Ring creation failed after the probe said yes: fall through to epoll rather than abort.
+    }
+
     int ep = ::epoll_create1(EPOLL_CLOEXEC);
     long long prev_ep = g_current_kq;
     nova_reactor_set_current((long long)ep);
@@ -1009,6 +1128,7 @@ static void nova_reactor_arm_timer(long long handle, long long ms) {
     iocp_timer_arm(handle, ms);
     NOVA_TRACE("reactor timer armed h=%lld ms=%lld (iocp)", handle, ms);
 #elif defined(NOVA_HAVE_EPOLL)
+    if (nova_reactor_backend() == 1) { uring_timer_arm(handle, ms); return; }   // IORING_OP_TIMEOUT
     if (g_current_kq <= 0) { NOVA_TRACE("reactor timer: no current epfd h=%lld", handle); return; }
     epoll_timer_arm(handle, ms);   // a timerfd registered on the reactor's epoll set
     NOVA_TRACE("reactor timer armed h=%lld ms=%lld (epoll)", handle, ms);

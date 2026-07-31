@@ -54,6 +54,13 @@ fn eventsFor(kind: int): int {
 // reactor model (a coroutine awaits one I/O at a time per fd) the fd is removed on completion, so a plain
 // ADD never hits EEXIST.
 pub fn submit(kq: int, op: long): int {
+    // io_uring: a ring handle is a heap pointer and cannot travel in the reactor's int `kq`, so the
+    // ring comes from the runtime's per-thread current-ring instead (set when the Poller was built).
+    let ring = if (usingUring()) nova_uring_current() else (0 as long);
+    if (ring != (0 as long)) {
+        if (uringPrep(ring, op) != 0) { return -1; }
+        return if (nova_uring_submit_and_wait(ring, 0) >= 0) 0 else -1;
+    }
     return epoll.ctlAdd(kq, opFd(op), eventsFor(opKind(op)), op);
 }
 
@@ -69,7 +76,8 @@ pub fn cancelRead(kq: int, fd: int): void {
 // Readiness backend: connect() is STARTED with a non-blocking connect and the op then awaits
 // writability, so the submit is not itself the connect. The IOCP backend sets this true —
 // see net/eventloop_windows.
-pub const CONNECT_IS_SUBMITTED: bool = false;
+// Linux answers at RUNTIME: io_uring is a proactor and issues the connect itself; epoll is not.
+pub fn connectIsSubmitted(): bool { return usingUring(); }
 
 pub const EVENT_SIZE: int = 12;   // sizeof packed struct epoll_event (x86_64)
 
@@ -88,6 +96,52 @@ pub fn evFd(eventBuf: long, i: int): int { return epoll.evData(eventBuf, i) as i
 // every token through the runtime untags it and reclaims the one-shot timerfd — resuming the raw
 // tagged word would jump through a bogus pointer.
 pub extern("c") fn nova_reactor_event_token(data: long): long;
+
+// --- io_uring: the COMPLETION-shaped Linux backend -----------------------------------------------
+// Linux has two reactor backends and the target-conditional file rule cannot pick between them (it
+// selects by OS, and both are Linux), so the choice is made by the runtime once per process and read
+// here. epoll stays the default; io_uring is opt-in via NOVA_REACTOR=uring AND probed, because the
+// header being present says nothing about the running kernel.
+//
+// The ring mechanics live in C (src/runtime/uring.cpp) because advancing the shared rings requires
+// acquire/release memory ordering, which Nova cannot express. Everything above that layer — which op
+// to submit, and what its result means — is here.
+pub extern("c") fn nova_reactor_backend(): int;
+pub extern("c") fn nova_uring_create(entries: int): long;
+pub extern("c") fn nova_uring_destroy(ring: long): void;
+pub extern("c") fn nova_uring_set_current(ring: long): void;
+pub extern("c") fn nova_uring_current(): long;
+pub extern("c") fn nova_uring_prep(ring: long, op: int, fd: int, addr: long, len: int, off: long, userData: long): int;
+pub extern("c") fn nova_uring_submit_and_wait(ring: long, waitNr: int): int;
+pub extern("c") fn nova_uring_cq_ready(ring: long): int;
+pub extern("c") fn nova_uring_peek(ring: long, i: int, userData: ptr, res: ptr): int;
+pub extern("c") fn nova_uring_advance(ring: long, n: int): void;
+pub extern("c") fn nova_uring_op_recv(): int;
+pub extern("c") fn nova_uring_op_send(): int;
+pub extern("c") fn nova_uring_op_accept(): int;
+pub extern("c") fn nova_uring_op_connect(): int;
+
+pub const BACKEND_URING: int = 1;
+pub fn usingUring(): bool { return nova_reactor_backend() == BACKEND_URING; }
+
+// Stage one op as an SQE. A proactor ISSUES the I/O, so unlike the epoll path (which waits for
+// readiness and then performs the call itself) the kernel does the work and reports the byte count.
+// CONNECT carries the sockaddr LENGTH in off, not len.
+fn uringPrep(ring: long, op: long): int {
+    let kind = opKind(op);
+    let fd = opFd(op);
+    if (kind == OP_RECV) {
+        return nova_uring_prep(ring, nova_uring_op_recv(), fd, opBuf(op), opLen(op), 0, op);
+    } else if (kind == OP_SEND) {
+        return nova_uring_prep(ring, nova_uring_op_send(), fd, opBuf(op), opLen(op), 0, op);
+    } else if (kind == OP_ACCEPT) {
+        // Null sockaddr: the peer address is not needed, and the result IS the accepted fd.
+        return nova_uring_prep(ring, nova_uring_op_accept(), fd, 0, 0, 0, op);
+    } else if (kind == OP_CONNECT) {
+        return nova_uring_prep(ring, nova_uring_op_connect(), fd, opBuf(op), 0, opLen(op) as long, op);
+    }
+    return -1;
+}
 pub fn evToken(eventBuf: long, i: int): long {
     return nova_reactor_event_token(epoll.evData(eventBuf, i));
 }
@@ -118,26 +172,52 @@ pub trait EventLoop {
 // epoll-backed completion emulation (Linux).
 pub struct Poller impl EventLoop {
     pub kq: int,             // the epoll fd (named `kq` to match the reactor's field for both backends)
+    pub ring: long,          // the io_uring handle when that backend is selected, else 0
     pub eventBuf: long,
     pub compBuf: long,
+    pub udBuf: long,         // io_uring: user_data out-param for peek
+    pub resBuf: long,        // io_uring: result out-param for peek
     pub maxEvents: int,
     pub nComp: int,
 
     init(maxEvents: int) {
-        self.kq = epoll.epoll_create1(0);
         self.maxEvents = maxEvents;
-        self.eventBuf = bytes.alloc(maxEvents * epoll.EPOLL_EVENT_SIZE);
         self.compBuf = bytes.alloc(maxEvents * 8);
         self.nComp = 0;
+        self.ring = 0;
+        if (usingUring()) {
+            // Sized so a full batch of completions fits: the CQ defaults to twice the SQ.
+            self.ring = nova_uring_create(maxEvents * 2);
+            nova_uring_set_current(self.ring);
+            self.kq = -1;                       // no epoll fd exists on this backend
+            self.eventBuf = bytes.alloc(8);     // unused; non-null so destroy stays uniform
+            self.udBuf = bytes.alloc(8);
+            self.resBuf = bytes.alloc(4);
+        } else {
+            self.kq = epoll.epoll_create1(0);
+            self.eventBuf = bytes.alloc(maxEvents * epoll.EPOLL_EVENT_SIZE);
+            self.udBuf = 0;
+            self.resBuf = 0;
+        }
     }
 
-    fn ok(self: Poller): bool { return self.kq >= 0; }
+    fn ok(self: Poller): bool {
+        if (self.ring != (0 as long)) { return true; }
+        return self.kq >= 0;
+    }
 
     fn submit(self: Poller, op: long): int {
+        if (self.ring != (0 as long)) {
+            if (uringPrep(self.ring, op) != 0) { return -1; }
+            // Published immediately rather than batched: callers submit then await, so an SQE left
+            // staged would simply never start.
+            return if (nova_uring_submit_and_wait(self.ring, 0) >= 0) 0 else -1;
+        }
         return epoll.ctlAdd(self.kq, opFd(op), eventsFor(opKind(op)), op);
     }
 
     fn poll(self: Poller, timeoutMs: int): int {
+        if (self.ring != (0 as long)) { return self.pollUring(); }
         let n = epoll.epoll_wait(self.kq, self.eventBuf, self.maxEvents, timeoutMs);
         self.nComp = 0;
         let i = 0;
@@ -198,6 +278,36 @@ pub struct Poller impl EventLoop {
         return self.nComp;
     }
 
+    // io_uring drain. The kernel already performed the I/O, so a completion CARRIES its result and
+    // there is nothing to re-issue: the byte count goes straight into the op record and the op's
+    // coroutine is queued. A negative res is an -errno, reported as -1 like the epoll path does.
+    fn pollUring(self: Poller): int {
+        self.nComp = 0;
+        nova_uring_submit_and_wait(self.ring, 1);
+        let ready = nova_uring_cq_ready(self.ring);
+        let i = 0;
+        while (i < ready && self.nComp < self.maxEvents) {
+            nova_uring_peek(self.ring, i, self.udBuf, self.resBuf);
+            let ud = bytes.read_ptr(self.udBuf, 0);
+            let res = bytes.read_i32(self.resBuf, 0) as int;
+            let tok = nova_reactor_event_token(ud);
+            if (ud != tok || tok == (0 as long)) {
+                // Runtime-posted: a reactor timer fire or a cross-reactor wake, not an op record.
+                if (tok != (0 as long)) {
+                    bytes.write_ptr(self.compBuf, (self.nComp * 8) as long, tok);
+                    self.nComp = self.nComp + 1;
+                }
+            } else if (ud != (0 as long)) {
+                setOpResult(ud, if (res < 0) -1 else res);
+                bytes.write_ptr(self.compBuf, (self.nComp * 8) as long, opToken(ud));
+                self.nComp = self.nComp + 1;
+            }
+            i = i + 1;
+        }
+        if (ready > 0) { nova_uring_advance(self.ring, ready); }
+        return self.nComp;
+    }
+
     fn completedToken(self: Poller, i: int): long {
         return bytes.read_ptr(self.compBuf, (i * 8) as long);
     }
@@ -205,6 +315,13 @@ pub struct Poller impl EventLoop {
     fn destroy(self: Poller): void {
         if (self.eventBuf != 0) { bytes.free(self.eventBuf); self.eventBuf = 0; }
         if (self.compBuf != 0) { bytes.free(self.compBuf); self.compBuf = 0; }
+        if (self.udBuf != 0) { bytes.free(self.udBuf); self.udBuf = 0; }
+        if (self.resBuf != 0) { bytes.free(self.resBuf); self.resBuf = 0; }
+        if (self.ring != (0 as long)) {
+            nova_uring_set_current(0);   // clear before unmapping, so a late submit cannot use it
+            nova_uring_destroy(self.ring);
+            self.ring = 0;
+        }
         if (self.kq >= 0) { socket.close(self.kq); self.kq = -1; }
     }
 }

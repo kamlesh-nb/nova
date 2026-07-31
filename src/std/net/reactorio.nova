@@ -207,7 +207,7 @@ pub async fn reactorConnect(host: string, port: int, kq: int): ReactorStream {
     // not be preceded by a non-blocking connect() — the socket would already have one in flight and
     // the overlapped call would be rejected. The address therefore travels in the op's buf/len
     // slots, which the readiness backends ignore for OP_CONNECT.
-    if (eventloop.CONNECT_IS_SUBMITTED) {
+    if (eventloop.connectIsSubmitted()) {
         let cop = bytes.alloc(eventloop.OP_SIZE);
         eventloop.makeOp(cop, eventloop.OP_CONNECT, fd, sa, 16, currentCoro());
         if (eventloop.submit(kq, cop) != 0) {

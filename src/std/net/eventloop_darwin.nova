@@ -82,7 +82,7 @@ pub fn cancelRead(kq: int, fd: int): void {
 // Readiness backend: connect() is STARTED with a non-blocking connect and the op then awaits
 // writability, so the submit is not itself the connect. The IOCP backend sets this true —
 // see net/eventloop_windows.
-pub const CONNECT_IS_SUBMITTED: bool = false;
+pub fn connectIsSubmitted(): bool { return false; }
 
 pub const EVENT_SIZE: int = 32;   // sizeof(struct kevent)
 
