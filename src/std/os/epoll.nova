@@ -58,6 +58,16 @@ pub fn ctlAdd(epfd: int, fd: int, events: int, data: long): int {
     bytes.free(ev);
     return r;
 }
+// Re-arm an already-registered fd's interest. This is the hot-path call: with EPOLLONESHOT the
+// kernel disarms an fd after it fires, and MOD re-arms it without the ADD/DEL churn.
+pub fn ctlMod(epfd: int, fd: int, events: int, data: long): int {
+    let ev = bytes.alloc(EPOLL_EVENT_SIZE);
+    setEvent(ev, 0, events, data);
+    let r = epoll_ctl(epfd, EPOLL_CTL_MOD, fd, ev);
+    bytes.free(ev);
+    return r;
+}
+
 pub fn ctlDel(epfd: int, fd: int): int {
     return epoll_ctl(epfd, EPOLL_CTL_DEL, fd, 0);
 }

@@ -114,6 +114,31 @@ static void epoll_timer_arm(long long handle, long long ms) {
     g_epoll_timers[handle] = tfd;
 }
 
+// --- persistent fd registration ------------------------------------------------------------------
+// The reactor used to EPOLL_CTL_ADD an fd on every submit and EPOLL_CTL_DEL it on every completion,
+// so a single keep-alive request cost four epoll_ctl calls on top of its recv/send. Registration is
+// kept instead: the first submit ADDs, later ones MOD (re-arming EPOLLONESHOT), and the fd is only
+// deleted when the stream closes. That is the difference between ~7 syscalls per request and ~3 —
+// and it matters most exactly where this runs, since a virtualised kernel makes each one dearer.
+//
+// Thread-local because a reactor worker owns its fds, and reachable from C because both the Poller
+// and net/reactorio's free-function submit path need it. Indexed by fd: they are small and dense.
+thread_local std::vector<char> g_epoll_registered;
+
+// 1 if the fd was NOT registered (caller should ADD), 0 if it already was (caller should MOD).
+extern "C" int nova_epoll_mark_registered(int fd) {
+    if (fd < 0) return 1;
+    if ((size_t)fd >= g_epoll_registered.size()) g_epoll_registered.resize((size_t)fd + 64, 0);
+    if (g_epoll_registered[(size_t)fd]) return 0;
+    g_epoll_registered[(size_t)fd] = 1;
+    return 1;
+}
+
+extern "C" void nova_epoll_clear_registered(int fd) {
+    if (fd < 0 || (size_t)fd >= g_epoll_registered.size()) return;
+    g_epoll_registered[(size_t)fd] = 0;
+}
+
 static void epoll_dispatch(const struct epoll_event &ev) {
     uint64_t d = ev.data.u64;
     if (d == NOVA_EPOLL_WAKE_DATA) return;   // the wake IS the loop returning
