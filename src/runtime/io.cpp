@@ -21,6 +21,7 @@ static inline int nova_close_fd(int fd) { return ::closesocket(fd); }
 #include <netinet/in.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/stat.h>   // mkdir — pulled in transitively on macOS, but NOT on Linux (iso_setup_rootfs)
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>

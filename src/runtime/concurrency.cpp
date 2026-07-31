@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
@@ -27,7 +28,10 @@ extern "C" long long __nova_main(void);
 extern "C" long long nova_reactor_current(void);
 extern "C" void nova_reactor_set_timer(long long handle, long long ms);
 extern "C" void nova_reactor_cancel_timer(long long handle);
-extern "C" long long nova_mono_ms(void);
+// int64_t, NOT `long long`: core.cpp defines this as int64_t, which is `long long` on macOS but
+// `long` on Linux x86_64 — declaring it `long long` here makes the two differ only in return type,
+// which C++ rejects outright ("functions that differ only in their return type cannot be overloaded").
+extern "C" int64_t nova_mono_ms(void);
 
 extern "C" {
 
