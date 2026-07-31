@@ -82,12 +82,29 @@ pub fn waitReady(kq: int, eventBuf: long, maxEvents: int, timeoutMs: int): int {
     return epoll.epoll_wait(kq, eventBuf, maxEvents, timeoutMs);
 }
 pub fn evFd(eventBuf: long, i: int): int { return epoll.evData(eventBuf, i) as int; }
-pub fn evToken(eventBuf: long, i: int): long { return epoll.evData(eventBuf, i); }
+
+// The runtime tags a timer fire in the data word (epoll_event carries no fd, so a timerfd fire is
+// otherwise indistinguishable from a socket becoming readable) and reports a wake as 0. Routing
+// every token through the runtime untags it and reclaims the one-shot timerfd — resuming the raw
+// tagged word would jump through a bogus pointer.
+pub extern("c") fn nova_reactor_event_token(data: long): long;
+pub fn evToken(eventBuf: long, i: int): long {
+    return nova_reactor_event_token(epoll.evData(eventBuf, i));
+}
 pub fn evBytes(eventBuf: long, i: int): long { return 0 as long; }
 pub fn evEof(eventBuf: long, i: int): bool {
     return (epoll.evEvents(eventBuf, i) & (epoll.EPOLLHUP | epoll.EPOLLRDHUP)) != 0;
 }
-pub fn evFilterAt(eventBuf: long, i: int): int { return epoll.evEvents(eventBuf, i); }
+// epoll has no filter identifier, only an events bitmask — but callers written against kqueue test
+// `filter == evfiltUser()` to spot a cross-reactor wake. The reactor's wake eventfd is registered
+// with an all-ones data word, so it is recognised here and reported with the same negative sentinel
+// nova_evfilt_user() returns on this platform. A real events mask is never negative.
+const WAKE_DATA: long = -1;
+const USER_FILTER: int = -2;
+pub fn evFilterAt(eventBuf: long, i: int): int {
+    if (epoll.evData(eventBuf, i) == WAKE_DATA) { return USER_FILTER; }
+    return epoll.evEvents(eventBuf, i);
+}
 
 // The completion-based event loop (same trait as the macOS variant).
 pub trait EventLoop {
@@ -125,7 +142,21 @@ pub struct Poller impl EventLoop {
         self.nComp = 0;
         let i = 0;
         while (i < n) {
-            let op = epoll.evData(self.eventBuf, i);
+            let raw = epoll.evData(self.eventBuf, i);
+            let tok = nova_reactor_event_token(raw);
+            if (raw != tok || tok == (0 as long)) {
+                // Not an op record: a reactor timer fire or a cross-reactor wake, both of which the
+                // runtime posts onto this same epoll set. Dereferencing one as an op would follow a
+                // tagged word as a pointer. The untagged value IS the coroutine to resume (a wake
+                // yields 0 and resumes nothing), and there is no I/O result to write back.
+                if (tok != (0 as long)) {
+                    bytes.write_ptr(self.compBuf, (self.nComp * 8) as long, tok);
+                    self.nComp = self.nComp + 1;
+                }
+                i = i + 1;
+                continue;
+            }
+            let op = raw;
             if (op != (0 as long)) {
                 let kind = opKind(op);
                 let fd = opFd(op);

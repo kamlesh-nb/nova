@@ -13,6 +13,13 @@
 #include <windows.h>     // IOCP: the completion-based reactor driver, the Windows peer of kqueue
 #define NOVA_HAVE_IOCP 1
 #endif
+#if defined(__linux__)
+#include <sys/epoll.h>     // the readiness reactor driver, the Linux peer of kqueue
+#include <sys/eventfd.h>   // cross-reactor wake (kqueue uses EVFILT_USER)
+#include <sys/timerfd.h>   // reactor timers   (kqueue uses EVFILT_TIMER)
+#include <unistd.h>        // close, read, write
+#define NOVA_HAVE_EPOLL 1
+#endif
 #include <cstdio>
 #include <chrono>
 #include <condition_variable>
@@ -40,6 +47,85 @@ extern "C" int64_t nova_mono_ms(void);
 // nova_reactor_resume is defined further down; the IOCP support below (and only it) needs it
 // ahead of that definition.
 extern "C" long long nova_reactor_resume(long long handle);
+
+#if defined(NOVA_HAVE_EPOLL)
+// --- epoll reactor support (the Linux peer of the kqueue driver) -------------------------------
+//
+// epoll is READINESS-based like kqueue, so the driver has the same shape — but kqueue folds timers
+// and cross-thread wakeups into the same queue as I/O via EVFILT_TIMER and EVFILT_USER, and epoll
+// has neither. Both become file descriptors instead: a timerfd per deadline, one eventfd per
+// reactor. They then arrive as ordinary readiness events, which is what keeps the loop uniform.
+//
+// Routing: a kevent carries `udata`, and net/eventloop_linux puts the coroutine handle in
+// epoll_event.data.u64 the same way. But epoll_event carries ONLY that word — not the fd it came
+// from — so a timer fire could not otherwise be told apart from a socket becoming readable, and the
+// timerfd would leak. Bit 63 tags it: userspace pointers never set it on x86_64 or aarch64.
+const uint64_t NOVA_EPOLL_TIMER_TAG = 1ULL << 63;
+const uint64_t NOVA_EPOLL_WAKE_DATA = ~0ULL;   // the reactor's own eventfd; nothing to resume
+// Reported as the "filter" of a wake event so the kqueue-shaped `filter == evfiltUser()` test keeps
+// working on epoll. Negative, because an epoll events mask never is.
+const long long NOVA_EPOLL_USER_FILTER = -2;
+
+std::mutex &g_epoll_timer_mu = *new std::mutex();
+std::unordered_map<long long, int> &g_epoll_timers = *new std::unordered_map<long long, int>();
+
+// Closing the timerfd removes it from the epoll set automatically (it was never dup'd), so no
+// EPOLL_CTL_DEL is needed — and the epfd may already be gone by the time a drive ends.
+static void epoll_timer_cancel(long long handle) {
+    int fd = -1;
+    {
+        std::lock_guard<std::mutex> lk(g_epoll_timer_mu);
+        auto it = g_epoll_timers.find(handle);
+        if (it == g_epoll_timers.end()) return;
+        fd = it->second;
+        g_epoll_timers.erase(it);
+    }
+    if (fd >= 0) ::close(fd);
+}
+
+static void epoll_timer_arm(long long handle, long long ms) {
+    int ep = (int)nova_reactor_current();
+    if (ep <= 0 || !handle) return;
+    epoll_timer_cancel(handle);   // re-arming replaces the pending deadline, as EV_ADD does
+
+    int tfd = ::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (tfd < 0) return;
+
+    struct itimerspec its;
+    std::memset(&its, 0, sizeof(its));
+    long long m = ms < 0 ? 0 : ms;
+    if (m == 0) {
+        // An all-zero it_value DISARMS a timerfd rather than firing it, so a zero-delay timeout
+        // would hang. 1ns still fires immediately and actually fires.
+        its.it_value.tv_nsec = 1;
+    } else {
+        its.it_value.tv_sec = (time_t)(m / 1000);
+        its.it_value.tv_nsec = (long)((m % 1000) * 1000000);
+    }
+    ::timerfd_settime(tfd, 0, &its, nullptr);
+
+    struct epoll_event ev;
+    std::memset(&ev, 0, sizeof(ev));
+    ev.events = EPOLLIN;
+    ev.data.u64 = (uint64_t)handle | NOVA_EPOLL_TIMER_TAG;
+    if (::epoll_ctl(ep, EPOLL_CTL_ADD, tfd, &ev) != 0) { ::close(tfd); return; }
+
+    std::lock_guard<std::mutex> lk(g_epoll_timer_mu);
+    g_epoll_timers[handle] = tfd;
+}
+
+static void epoll_dispatch(const struct epoll_event &ev) {
+    uint64_t d = ev.data.u64;
+    if (d == NOVA_EPOLL_WAKE_DATA) return;   // the wake IS the loop returning
+    if (d & NOVA_EPOLL_TIMER_TAG) {
+        long long h = (long long)(d & ~NOVA_EPOLL_TIMER_TAG);
+        epoll_timer_cancel(h);   // one-shot: close the timerfd now that it has fired
+        if (h) nova_reactor_resume(h);
+        return;
+    }
+    nova_reactor_resume((long long)d);
+}
+#endif // NOVA_HAVE_EPOLL
 
 #if defined(NOVA_HAVE_IOCP)
 // --- IOCP reactor support (the Windows peer of the kqueue driver) ------------------------------
@@ -409,6 +495,7 @@ extern "C" long long nova_reactor_current(void) { return g_current_kq; }
 namespace {
 struct WakeBox {
     long long kq = 0;
+    int wake_fd = -1;   // epoll only: the eventfd this reactor is woken through
     std::mutex mu;
     std::queue<long long> q;
 };
@@ -434,6 +521,20 @@ extern "C" void nova_reactor_wake_register(long long idx, long long kq) {
     struct kevent ev;
     EV_SET(&ev, 0, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, nullptr);
     kevent((int)kq, &ev, 1, nullptr, 0, nullptr);
+#elif defined(NOVA_HAVE_EPOLL)
+    // epoll has no EVFILT_USER, so the wake channel is an eventfd added to this reactor's set. One
+    // per reactor, created on first registration and kept for the process's life.
+    if (b->wake_fd < 0) {
+        int efd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        if (efd >= 0) {
+            struct epoll_event wev;
+            std::memset(&wev, 0, sizeof(wev));
+            wev.events = EPOLLIN;
+            wev.data.u64 = NOVA_EPOLL_WAKE_DATA;
+            if (::epoll_ctl((int)kq, EPOLL_CTL_ADD, efd, &wev) == 0) b->wake_fd = efd;
+            else ::close(efd);
+        }
+    }
 #endif
     // IOCP needs no registration step: any thread may PostQueuedCompletionStatus to the port, so
     // recording b->kq above is the whole setup.
@@ -454,6 +555,14 @@ extern "C" void nova_reactor_post(long long idx, long long handle) {
     // synthetic completion so a port blocked in GetQueuedCompletionStatusEx returns at once. The
     // null OVERLAPPED is what marks it as a wake rather than finished I/O (see iocp_dispatch).
     PostQueuedCompletionStatus((HANDLE)(intptr_t)b->kq, 0, NOVA_WAKE_KEY, nullptr);
+#elif defined(NOVA_HAVE_EPOLL)
+    // Writing to the reactor's eventfd makes it readable, which is what breaks epoll_wait out. The
+    // counter value is irrelevant — the readiness itself is the signal.
+    if (b->wake_fd >= 0) {
+        uint64_t one = 1;
+        ssize_t w = ::write(b->wake_fd, &one, sizeof(one));
+        (void)w;
+    }
 #endif
 }
 
@@ -471,9 +580,31 @@ extern "C" long long nova_reactor_drain_one(long long idx) {
 extern "C" long long nova_evfilt_user(void) {
 #if defined(NOVA_HAVE_KQUEUE)
     return (long long)EVFILT_USER;
+#elif defined(NOVA_HAVE_EPOLL)
+    // epoll has no filter identifier — an event carries an events BITMASK, which is always
+    // non-negative. A negative sentinel therefore cannot collide with one, and net/eventloop_linux
+    // reports it from evFilterAt for the wake eventfd so `filter == evfiltUser()` still works.
+    return NOVA_EPOLL_USER_FILTER;
 #else
     return 0;
 #endif
+}
+
+// Translate one raw event data word into the coroutine handle to resume, for reactor loops driven
+// from NOVA rather than by nova_run_root (net/reactor's readiness path). On epoll this is where a
+// tagged timer fire is untagged and its one-shot timerfd reclaimed — without it the tag would be
+// resumed as if it were a coroutine pointer. Identity everywhere else.
+extern "C" long long nova_reactor_event_token(long long data) {
+#if defined(NOVA_HAVE_EPOLL)
+    uint64_t d = (uint64_t)data;
+    if (d == NOVA_EPOLL_WAKE_DATA) return 0;   // a wake resumes nothing
+    if (d & NOVA_EPOLL_TIMER_TAG) {
+        long long h = (long long)(d & ~NOVA_EPOLL_TIMER_TAG);
+        epoll_timer_cancel(h);
+        return h;
+    }
+#endif
+    return data;
 }
 
 
@@ -742,10 +873,48 @@ void nova_run_root(long long root) {
                      reinterpret_cast<void *>(root));
         std::abort();
     }
+#elif defined(NOVA_HAVE_EPOLL)
+    // Linux: same readiness shape as the kqueue drive above. Timers and cross-reactor wakes are
+    // file descriptors here (timerfd/eventfd) rather than kqueue filters, so they arrive through
+    // this same epoll_wait as ordinary readiness — see epoll_dispatch.
+    if (!g_rq) g_rq = new std::queue<long long>();
+    while (!g_rq->empty()) g_rq->pop();
+    g_reactor_mode = true;
+    g_deadline_active = false;
+    if (g_batch_reaped) g_batch_reaped->clear();
+
+    int ep = ::epoll_create1(EPOLL_CLOEXEC);
+    long long prev_ep = g_current_kq;
+    nova_reactor_set_current((long long)ep);
+    ++g_run_depth;
+    nova_reactor_resume(root);   // kick past the initial suspend and drain the run queue
+    int idle = 0;
+    while (!raw_coro_done(root)) {
+        struct epoll_event evs[64];
+        int n = ::epoll_wait(ep, evs, 64, 20);   // 20ms tick, as on kqueue
+        if (n <= 0) {
+            if (++idle > 750) break;             // ~15s lost-wakeup cap
+            continue;
+        }
+        idle = 0;
+        nova_reactor_batch_begin();
+        for (int i = 0; i < n; ++i) epoll_dispatch(evs[i]);
+    }
+    --g_run_depth;
+    nova_reactor_set_current(prev_ep);
+    ::close(ep);
+    g_reactor_mode = false;
+    if (!raw_coro_done(root)) {
+        std::fprintf(stderr,
+                     "nova: fatal — async root %p never completed (lost wakeup); "
+                     "refusing to read its unwritten result\n",
+                     reinterpret_cast<void *>(root));
+        std::abort();
+    }
 #else
-    // Linux still needs the epoll reactor driver (a follow-on); no Asio fallback remains.
+    // Neither kqueue, IOCP nor epoll: no reactor driver exists for this target.
     (void)root;
-    std::fprintf(stderr, "nova: fatal — no reactor driver on this platform (build the epoll backend)\n");
+    std::fprintf(stderr, "nova: fatal — no reactor driver on this platform\n");
     std::abort();
 #endif
 }
@@ -839,8 +1008,12 @@ static void nova_reactor_arm_timer(long long handle, long long ms) {
     if (g_current_kq == 0) { NOVA_TRACE("reactor timer: no current port h=%lld", handle); return; }
     iocp_timer_arm(handle, ms);
     NOVA_TRACE("reactor timer armed h=%lld ms=%lld (iocp)", handle, ms);
+#elif defined(NOVA_HAVE_EPOLL)
+    if (g_current_kq <= 0) { NOVA_TRACE("reactor timer: no current epfd h=%lld", handle); return; }
+    epoll_timer_arm(handle, ms);   // a timerfd registered on the reactor's epoll set
+    NOVA_TRACE("reactor timer armed h=%lld ms=%lld (epoll)", handle, ms);
 #else
-    (void)handle; (void)ms;   // Linux epoll timerfd path plugs in with the epoll backend.
+    (void)handle; (void)ms;
 #endif
 }
 
@@ -861,6 +1034,9 @@ extern "C" void nova_reactor_cancel_timer(long long handle) {
 #elif defined(NOVA_HAVE_IOCP)
     if (!handle) return;
     iocp_timer_cancel(handle);   // absent is fine (already fired), as with EV_DELETE's ENOENT
+#elif defined(NOVA_HAVE_EPOLL)
+    if (!handle) return;
+    epoll_timer_cancel(handle);   // closing the timerfd also removes it from the epoll set
 #else
     (void)handle;
 #endif
