@@ -536,7 +536,20 @@ early-exit narrowing + see-through→hard-error; gates `optional_unguarded` + `9
 **Problem.** `StructInit` drops explicit type args; `Foo<int>{…}` and impl-side `impl Handler<A,B>` arg
 storage rely on this. **Design:** add `type_args: []TypeRef` to `StructInit` (parser + AST), thread through
 sema so `Foo<int>{…}` type-checks and monomorphizes correctly. **DoD:** gate `generic_type_args` (explicit
-`Foo<int>{…}`, and an impl with type args round-trips); full suite green. **Deps:** none. **Tracking:** _pending_
+`Foo<int>{…}`, and an impl with type args round-trips); full suite green. **Deps:** none.
+
+**What landed (2026-07-31, branch `f4-1-type-args`):** the parser DID parse `<...>` on a struct literal but
+DROPPED it (the `{`-init branch built `StructInit` without the args while the `(`-call branch kept them), so
+`Box<int>{v:7}` only worked because T is inferred from the field value. Proven with `Box<string>{v:7}`: it
+compiled and CRASHED at runtime (int stored where a string pointer is expected). Fix: `type_args` added to
+`StructInit` (AST + parser capture), and `type_checker` now validates explicit args — arity against the
+struct's type params, plus a narrow string-vs-scalar clash check on param-typed fields (the memory-unsafe
+reinterpret). Because a contradiction is now a located error, survivors always agree with field inference, so
+monomorphization needed no rewiring. Gate `generic_type_args_mismatch` (expect_fail) added; `80_struct_init_
+typeargs` still green. NOTE (follow-on): the SAME field value vs declared type is unchecked for CONCRETE
+fields too (`struct P{v:string}` + `P{v:7}` crashes) — a broader struct-literal-field-typing hole, separate
+task (higher regression risk, needs the full coercion lattice). **Tracking:** ✅ 2026-07-31 · gates
+`80_struct_init_typeargs` + `generic_type_args_mismatch`.
 
 # F2 — Module-qualified type inside a closure (P0.5)
 

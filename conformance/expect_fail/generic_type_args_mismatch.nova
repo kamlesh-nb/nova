@@ -1,0 +1,16 @@
+// EXPECT-FAIL: typecheck
+// F4-1 (2026-07-31): explicit struct-literal type args are validated, not dropped. The parser used to
+// keep `<...>` on a generic CALL but throw it away on a struct-init LITERAL, so `Box<int>{v:7}` only
+// worked because T was inferred from the field. `Box<string>{v:7}` then compiled and CRASHED at runtime
+// (an int stored where a string pointer is expected). Now the checker binds the explicit args to the
+// struct's type params and rejects the memory-unsafe string-vs-scalar clash with a located diagnostic.
+// NEGATIVE test: must FAIL to compile.
+import assert;
+
+struct Box<T> { pub v: T, }
+
+@test
+fn contradiction(): void {
+    let b = Box<string>{ v: 7 };   // declared <string>, gave a scalar -> rejected
+    assert.equalInt(b.v.length, 0);
+}
