@@ -4,6 +4,7 @@
 import assert;
 import string;
 import io.file;
+import io.dir;
 import web.app;
 import web.request;
 import web.status;
@@ -25,12 +26,15 @@ fn test_lru_eviction_and_stats(): void {
 
 @test
 fn test_static_serve_through_app(): void {
-    // Write two files the mount will serve.
-    file.File.writeText("/tmp/nova_static_gate_index.html", "<h1>Static OK</h1>");
-    file.File.writeText("/tmp/nova_static_gate_app.css", "body{color:red}");
+    // Write two files the mount will serve. The root comes from dir.Dir.tempDir() rather than a
+    // hardcoded "/tmp", which is not a path on Windows — Win32 resolves a leading "/" against the
+    // current drive root, so the mount would point at a directory that does not exist.
+    let root = dir.Dir.tempDir();
+    file.File.writeText(root + "/nova_static_gate_index.html", "<h1>Static OK</h1>");
+    file.File.writeText(root + "/nova_static_gate_app.css", "body{color:red}");
 
     let a = app.App();
-    a.useStatic("/s", "/tmp");
+    a.useStatic("/s", root);
 
     // HTML content + Content-Type.
     let r1 = a.dispatch(request.Request.fromString("GET /s/nova_static_gate_index.html HTTP/1.1\r\nHost:x\r\n\r\n"));
