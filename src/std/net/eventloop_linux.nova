@@ -142,7 +142,21 @@ pub struct Poller impl EventLoop {
         self.nComp = 0;
         let i = 0;
         while (i < n) {
-            let op = epoll.evData(self.eventBuf, i);
+            let raw = epoll.evData(self.eventBuf, i);
+            let tok = nova_reactor_event_token(raw);
+            if (raw != tok || tok == (0 as long)) {
+                // Not an op record: a reactor timer fire or a cross-reactor wake, both of which the
+                // runtime posts onto this same epoll set. Dereferencing one as an op would follow a
+                // tagged word as a pointer. The untagged value IS the coroutine to resume (a wake
+                // yields 0 and resumes nothing), and there is no I/O result to write back.
+                if (tok != (0 as long)) {
+                    bytes.write_ptr(self.compBuf, (self.nComp * 8) as long, tok);
+                    self.nComp = self.nComp + 1;
+                }
+                i = i + 1;
+                continue;
+            }
+            let op = raw;
             if (op != (0 as long)) {
                 let kind = opKind(op);
                 let fd = opFd(op);
