@@ -3,7 +3,34 @@ import string;
 import list;
 import map;
 import bytes;
+import os.sys;
+import collections.string_builder;
 import web.status;
+
+// memchr (SIMD-backed) delimiter scan, shared shape with web/request. Response.parse uses it for the
+// client side (parsing responses from external calls); serialize builds into one StringBuilder buffer
+// instead of a List<string> + join + concat chain.
+fn idxByte(buf: long, start: int, end: int, b: int): int {
+    if (start >= end) { return -1; }
+    let p = sys.memchr(buf + (start as long), b, (end - start) as long);
+    if (p == 0) { return -1; }
+    return (p - buf) as int;
+}
+
+// case-insensitive ASCII equality, no allocation.
+fn ciEquals(a: string, b: string): bool {
+    if (a.length != b.length) { return false; }
+    let i = 0;
+    while (i < a.length) {
+        let ca = a[i];
+        let cb = b[i];
+        if (ca >= 65 && ca <= 90) { ca = ca + 32; }
+        if (cb >= 65 && cb <= 90) { cb = cb + 32; }
+        if (ca != cb) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
 
 pub struct Response {
     pub status: Status,
@@ -43,13 +70,12 @@ pub struct Response {
     }
 
     pub fn getHeader(self: Response, name: string): string | undefined {
-        let lower_name = string.toLowerCase(name);
         let keys = self.headers.keys();
         let keysLen = keys.size();
         let i = 0;
         while (i < keysLen) {
             let key = keys.get(i) ?? "";
-            if (string.toLowerCase(key) == lower_name) {
+            if (ciEquals(key, name)) {
                 return self.headers.get(key);
             }
             i = i + 1;
@@ -58,66 +84,76 @@ pub struct Response {
     }
 
     pub fn serialize(self: Response): string {
-        let code = Status.toCode(self.status);
-        let code_str = intToStr(code);
-        let reason = Status.reasonPhrase(self.status);
-        let status_line = "HTTP/1.1 " + code_str + " " + reason + "\r\n";
-
         if (self.headers.get("Content-Length") == undefined) {
             self.headers.set("Content-Length", intToStr(self.body.length));
         }
 
-        let header_lines = List<string>();
+        // one growable buffer, no List/join/concat chain
+        let sb = string_builder.StringBuilder();
+        sb.append("HTTP/1.1 ");
+        sb.append(intToStr(Status.toCode(self.status)));
+        sb.append(" ");
+        sb.append(Status.reasonPhrase(self.status));
+        sb.append("\r\n");
         self.headers.forEach((key, value) => {
-            header_lines.push(key + ": " + value);
+            sb.append(key);
+            sb.append(": ");
+            sb.append(value);
+            sb.append("\r\n");
         });
-
         self.cookies.forEach((key, value) => {
-            header_lines.push("Set-Cookie: " + key + "=" + value + "; Path=/");
+            sb.append("Set-Cookie: ");
+            sb.append(key);
+            sb.append("=");
+            sb.append(value);
+            sb.append("; Path=/\r\n");
         });
-
-        let headers_str = string.join(header_lines, "\r\n");
-        return status_line + headers_str + "\r\n\r\n" + self.body;
+        sb.append("\r\n");
+        sb.append(self.body);
+        return sb.toString();
     }
 
+    // Parse a raw HTTP/1 response (client side: external calls). memchr offset scan, no split/join.
     pub fn parse(raw: string): Response {
-        let lines = string.split(raw, "\r\n");
-        if (lines.size() == 0) {
-            return Response(Status.Ok, "");
-        }
+        let n = raw.length;
+        let buf = raw as long;
 
-        let status_line = lines.get(0) ?? "";
-        let parts = string.split(status_line, " ");
+        let eol = idxByte(buf, 0, n, 13); // CR ending the status line
+        if (eol < 0) { return Response(Status.Ok, ""); }
+
+        // status line: HTTP/1.1 CODE REASON
+        let sp1 = idxByte(buf, 0, eol, 32);
         let code = 200;
-        if (parts.size() >= 2) {
-            code = string.parseI64(parts.get(1) ?? "200") as int;
+        if (sp1 >= 0) {
+            let sp2 = idxByte(buf, sp1 + 1, eol, 32);
+            let code_end = if (sp2 >= 0) sp2 else eol;
+            code = string.parseI64(string.slice(raw, sp1 + 1, code_end)) as int;
         }
         let stat = Status.fromCode(code);
 
+        let pos = eol + 2;
         let headers = Map<string, string>(16, string.hash);
-        let i = 1;
-        while (i < lines.size()) {
-            let line = lines.get(i) ?? "";
-            if (line == "") {
-                i = i + 1;
+        while (pos < n) {
+            if (bytes.read_byte(buf, pos) as int == 13) { // blank line -> end of headers
+                pos = pos + 2;
                 break;
             }
-            let idx = string.indexOf(line, ": ");
-            if (idx != -1) {
-                let key = string.slice(line, 0, idx);
-                let val = string.slice(line, idx + 2, line.length);
+            let line_end = idxByte(buf, pos, n, 13);
+            if (line_end < 0) { break; }
+            let colon = idxByte(buf, pos, line_end, 58);
+            if (colon >= 0) {
+                let key = string.slice(raw, pos, colon);
+                let v_off = colon + 1;
+                while (v_off < line_end && (bytes.read_byte(buf, v_off) as int == 32)) {
+                    v_off = v_off + 1;
+                }
+                let val = string.slice(raw, v_off, line_end);
                 headers.set(key, val);
             }
-            i = i + 1;
+            pos = line_end + 2;
         }
 
-        let body_lines = List<string>();
-        while (i < lines.size()) {
-            body_lines.push(lines.get(i) ?? "");
-            i = i + 1;
-        }
-        let body = string.join(body_lines, "\r\n");
-
+        let body = if (pos <= n) string.slice(raw, pos, n) else "";
         return Response.withHeaders(stat, body, headers);
     }
 }

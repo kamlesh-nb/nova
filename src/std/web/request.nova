@@ -3,7 +3,38 @@ import string;
 import list;
 import map;
 import bytes;
+import os.sys;
 import web.url;
+
+// HTTP/1 request parsing. The hot path uses a memchr (SIMD-backed, os/sys) delimiter scan over the
+// raw buffer and slices method/path/headers directly out of it -- no `string.split` (no per-line
+// List), no intermediate trim slices. This is the same picohttpparser-style engine that
+// web/httpparser exposes zero-copy; Request materialises the handler-facing string fields on top of
+// it. Header keys keep their on-the-wire case; getHeader compares case-insensitively without
+// allocating (byte-wise), so `req.headers.get("Content-Type")` and `req.getHeader("content-type")`
+// both work.
+
+fn idxByte(buf: long, start: int, end: int, b: int): int {
+    if (start >= end) { return -1; }
+    let p = sys.memchr(buf + (start as long), b, (end - start) as long);
+    if (p == 0) { return -1; }
+    return (p - buf) as int;
+}
+
+// case-insensitive ASCII equality, no allocation.
+fn ciEquals(a: string, b: string): bool {
+    if (a.length != b.length) { return false; }
+    let i = 0;
+    while (i < a.length) {
+        let ca = a[i];
+        let cb = b[i];
+        if (ca >= 65 && ca <= 90) { ca = ca + 32; }
+        if (cb >= 65 && cb <= 90) { cb = cb + 32; }
+        if (ca != cb) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
 
 pub struct Request {
     pub method: string,
@@ -14,40 +45,51 @@ pub struct Request {
     pub body: string,
 
     pub fn fromString(raw: string): Request {
-        let boundary = string.indexOf(raw, "\r\n\r\n");
-        if (boundary == -1) {
-            return Request.empty();
-        }
+        let n = raw.length;
+        let buf = raw as long;
 
-        let headers_part = string.slice(raw, 0, boundary);
-        let body = string.slice(raw, boundary + 4, raw.length);
+        // request line: METHOD SP PATH SP VERSION CRLF
+        let sp1 = idxByte(buf, 0, n, 32);
+        if (sp1 < 0) { return Request.empty(); }
+        let method = string.slice(raw, 0, sp1);
 
-        let lines = string.split(headers_part, "\r\n");
-        if (lines.size() == 0) {
-            return Request.empty();
-        }
-
-        let request_line = lines.get(0) ?? "";
-        let parts = string.split(request_line, " ");
-        let method = parts.get(0) ?? "";
-        let full_path = parts.get(1) ?? "";
+        let sp2 = idxByte(buf, sp1 + 1, n, 32);
+        if (sp2 < 0) { return Request.empty(); }
+        let full_path = string.slice(raw, sp1 + 1, sp2);
         let (path, query) = splitPathQuery(full_path);
 
+        let eol = idxByte(buf, sp2 + 1, n, 13); // CR ending the request line
+        if (eol < 0) { return Request.empty(); }
+        let pos = eol + 2;
+
         let headers = Map<string, string>(8, string.hash);
-        let i = 1;
-        while (i < lines.size()) {
-            let line = lines.get(i) ?? "";
-            if (line != "") {
-                let (key, value) = parseHeader(line);
-                if (key != "") {
-                    headers.set(key, value);
-                }
+        let cookie_str = "";
+
+        // header lines until the blank CRLF
+        while (pos < n) {
+            if (bytes.read_byte(buf, pos) as int == 13) { // blank line -> end of headers
+                pos = pos + 2;
+                break;
             }
-            i = i + 1;
+            let line_end = idxByte(buf, pos, n, 13);
+            if (line_end < 0) { break; }
+            let colon = idxByte(buf, pos, line_end, 58); // ':'
+            if (colon >= 0) {
+                let key = string.slice(raw, pos, colon);
+                let v_off = colon + 1;
+                while (v_off < line_end && (bytes.read_byte(buf, v_off) as int == 32)) {
+                    v_off = v_off + 1;
+                }
+                let val = string.slice(raw, v_off, line_end);
+                headers.set(key, val);
+                if (ciEquals(key, "Cookie")) { cookie_str = val; }
+            }
+            pos = line_end + 2;
         }
 
+        let body = if (pos <= n) string.slice(raw, pos, n) else "";
+
         let cookies = Map<string, string>(4, string.hash);
-        let cookie_str = findHeaderVal(headers, "Cookie");
         if (cookie_str != "") {
             let pairs = string.split(cookie_str, ";");
             let j = 0;
@@ -90,14 +132,15 @@ pub struct Request {
         };
     }
 
+    // Case-insensitive header lookup with no per-key allocation (byte-wise compare on original-case
+    // keys), replacing the old per-key toLowerCase scan.
     pub fn getHeader(self: Request, name: string): string | undefined {
-        let lower_name = string.toLowerCase(name);
         let keys = self.headers.keys();
         let keysLen = keys.size();
         let i = 0;
         while (i < keysLen) {
             let key = keys.get(i) ?? "";
-            if (string.toLowerCase(key) == lower_name) {
+            if (ciEquals(key, name)) {
                 return self.headers.get(key);
             }
             i = i + 1;
@@ -156,28 +199,4 @@ fn trimWhitespace(s: string): string {
         return "";
     }
     return string.slice(s, start, end);
-}
-
-fn parseHeader(line: string): (string, string) {
-    let idx = string.indexOf(line, ":");
-    if (idx == -1) {
-        return ("", "");
-    }
-    let key = trimWhitespace(string.slice(line, 0, idx));
-    let val = trimWhitespace(string.slice(line, idx + 1, line.length));
-    return (key, val);
-}
-
-fn findHeaderVal(headers: Map<string, string>, name: string): string {
-    let lower_name = string.toLowerCase(name);
-    let keys = headers.keys();
-    let i = 0;
-    while (i < keys.size()) {
-        let key = keys.get(i) ?? "";
-        if (string.toLowerCase(key) == lower_name) {
-            return headers.get(key) ?? "";
-        }
-        i = i + 1;
-    }
-    return "";
 }
