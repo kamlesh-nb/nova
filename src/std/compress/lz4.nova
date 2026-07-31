@@ -1,0 +1,324 @@
+// Pure-Nova LZ4 -- fast byte-oriented LZ77 compression (no entropy coding), plus the LZ4 frame format
+// (RFC / lz4 spec) so it interoperates with the `lz4` CLI. Companion to compress/deflate.nova (gzip).
+//
+// Layout: xxHash32 (frame checksums), the LZ4 block codec (compress/decompress), and the frame wrapper
+// (magic + frame descriptor + framed blocks + end mark). Reuses deflate.ByteBuf as the growable output.
+
+import bytes;
+import string;
+import compress.deflate;
+
+const M32: long = 4294967295; // 0xFFFFFFFF
+
+// ------------------------------------------------------------------------------------------------
+// xxHash32 (used for the LZ4 frame header checksum, and to skip an optional content checksum).
+// All arithmetic is unsigned 32-bit -> long masked to 32 bits (Nova int is signed i32).
+// ------------------------------------------------------------------------------------------------
+const XXP1: long = 2654435761;
+const XXP2: long = 2246822519;
+const XXP3: long = 3266489917;
+const XXP4: long = 668265263;
+const XXP5: long = 374761393;
+
+fn rotl32(x: long, r: int): long {
+    return ((x << r) | (x >> (32 - r))) & M32;
+}
+fn rd32le(src: string, p: int): long {
+    return (bytes.read_byte(src, p) as long)
+        | ((bytes.read_byte(src, p + 1) as long) << 8)
+        | ((bytes.read_byte(src, p + 2) as long) << 16)
+        | ((bytes.read_byte(src, p + 3) as long) << 24);
+}
+fn xxRound(acc: long, input: long): long {
+    let a: long = (acc + ((input * XXP2) & M32)) & M32;
+    let b: long = rotl32(a, 13);
+    return (b * XXP1) & M32;
+}
+
+// xxHash32 over src[start..start+len), seed 0.
+pub fn xxh32(src: string, start: int, len: int): long {
+    let p = start;
+    let end = start + len;
+    let h: long = 0;
+    if (len >= 16) {
+        let limit = end - 16;
+        let v1: long = (XXP1 + XXP2) & M32;
+        let v2: long = XXP2;
+        let v3: long = 0;
+        let v4: long = (M32 + 1 - XXP1) & M32; // -XXP1 mod 2^32
+        while (p <= limit) {
+            v1 = xxRound(v1, rd32le(src, p)); p = p + 4;
+            v2 = xxRound(v2, rd32le(src, p)); p = p + 4;
+            v3 = xxRound(v3, rd32le(src, p)); p = p + 4;
+            v4 = xxRound(v4, rd32le(src, p)); p = p + 4;
+        }
+        h = (rotl32(v1, 1) + rotl32(v2, 7) + rotl32(v3, 12) + rotl32(v4, 18)) & M32;
+    } else {
+        h = XXP5;
+    }
+    h = (h + (len as long)) & M32;
+    while (p + 4 <= end) {
+        h = (h + ((rd32le(src, p) * XXP3) & M32)) & M32;
+        h = (rotl32(h, 17) * XXP4) & M32;
+        p = p + 4;
+    }
+    while (p < end) {
+        h = (h + ((bytes.read_byte(src, p) as long) * XXP5)) & M32;
+        h = (rotl32(h, 11) * XXP1) & M32;
+        p = p + 1;
+    }
+    h = h ^ (h >> 15);
+    h = (h * XXP2) & M32;
+    h = h ^ (h >> 13);
+    h = (h * XXP3) & M32;
+    h = h ^ (h >> 16);
+    return h & M32;
+}
+
+// ------------------------------------------------------------------------------------------------
+// LZ4 block codec.
+// ------------------------------------------------------------------------------------------------
+fn wr32(p: ptr, i: int, v: int): void {
+    bytes.write_byte(p, i * 4, v & 255);
+    bytes.write_byte(p, i * 4 + 1, (v >> 8) & 255);
+    bytes.write_byte(p, i * 4 + 2, (v >> 16) & 255);
+    bytes.write_byte(p, i * 4 + 3, (v >> 24) & 255);
+}
+fn rd32(p: ptr, i: int): int {
+    return bytes.read_byte(p, i * 4)
+        | (bytes.read_byte(p, i * 4 + 1) << 8)
+        | (bytes.read_byte(p, i * 4 + 2) << 16)
+        | (bytes.read_byte(p, i * 4 + 3) << 24);
+}
+fn hash4(data: string, pos: int): int {
+    let seq: long = rd32le(data, pos);
+    return (((seq * XXP1) & M32) >> 16) as int; // 16-bit hash
+}
+fn match4(data: string, a: int, b: int): bool {
+    return bytes.read_byte(data, a) == bytes.read_byte(data, b)
+        && bytes.read_byte(data, a + 1) == bytes.read_byte(data, b + 1)
+        && bytes.read_byte(data, a + 2) == bytes.read_byte(data, b + 2)
+        && bytes.read_byte(data, a + 3) == bytes.read_byte(data, b + 3);
+}
+// LSIC: linear small-integer code (255-runs then remainder).
+fn writeLSIC(out: deflate.ByteBuf, v: int): void {
+    let x = v;
+    while (x >= 255) { out.push(255); x = x - 255; }
+    out.push(x);
+}
+
+// Compress data[begin..begin+n) as a raw LZ4 block, appending to `out`. Greedy 4-byte hash matcher,
+// honoring LZ4's end constraints (last 5 bytes literal, last match starts <= len-12) so the official
+// decoder accepts it.
+fn compressBlockInto(out: deflate.ByteBuf, data: string, begin: int, n: int): void {
+    let head = bytes.alloc(65536 * 4);
+    let h = 0;
+    while (h < 65536) { wr32(head, h, -1); h = h + 1; }
+
+    let anchor = begin;
+    let pos = begin;
+    let end = begin + n;
+    let mflimit = end - 12;
+    let last5 = end - 5;
+
+    while (pos < mflimit) {
+        let hv = hash4(data, pos);
+        let cand = rd32(head, hv);
+        wr32(head, hv, pos);
+        if (cand >= 0 && pos - cand <= 65535 && cand >= begin && match4(data, cand, pos)) {
+            let matchLen = 4;
+            while (pos + matchLen < last5 && bytes.read_byte(data, cand + matchLen) == bytes.read_byte(data, pos + matchLen)) {
+                matchLen = matchLen + 1;
+            }
+            let offset = pos - cand;
+            let litLen = pos - anchor;
+            let mlCode = matchLen - 4;
+            let t1 = if (litLen >= 15) 15 else litLen;
+            let t2 = if (mlCode >= 15) 15 else mlCode;
+            out.push((t1 << 4) | t2);
+            if (litLen >= 15) { writeLSIC(out, litLen - 15); }
+            let i = 0;
+            while (i < litLen) { out.push(bytes.read_byte(data, anchor + i)); i = i + 1; }
+            out.push(offset & 255);
+            out.push((offset >> 8) & 255);
+            if (mlCode >= 15) { writeLSIC(out, mlCode - 15); }
+            pos = pos + matchLen;
+            anchor = pos;
+        } else {
+            pos = pos + 1;
+        }
+    }
+    // last literals (no match)
+    let litLen = end - anchor;
+    let t1 = if (litLen >= 15) 15 else litLen;
+    out.push(t1 << 4);
+    if (litLen >= 15) { writeLSIC(out, litLen - 15); }
+    let i = 0;
+    while (i < litLen) { out.push(bytes.read_byte(data, anchor + i)); i = i + 1; }
+}
+
+// Decompress a raw LZ4 block src[begin..begin+n) into `out` (appending). Byte-by-byte copies, so
+// overlapping matches (offset < length) are handled correctly.
+fn decompressBlockInto(out: deflate.ByteBuf, src: string, begin: int, n: int): void {
+    let pos = begin;
+    let end = begin + n;
+    while (pos < end) {
+        let token = bytes.read_byte(src, pos); pos = pos + 1;
+        let litLen = token >> 4;
+        if (litLen == 15) {
+            while (true) {
+                let b = bytes.read_byte(src, pos); pos = pos + 1;
+                litLen = litLen + b;
+                if (b != 255) { break; }
+            }
+        }
+        let i = 0;
+        while (i < litLen) { out.push(bytes.read_byte(src, pos)); pos = pos + 1; i = i + 1; }
+        if (pos >= end) { break; } // last sequence is literals only
+        let offset = bytes.read_byte(src, pos) | (bytes.read_byte(src, pos + 1) << 8);
+        pos = pos + 2;
+        let matchLen = (token & 15) + 4;
+        if ((token & 15) == 15) {
+            while (true) {
+                let b = bytes.read_byte(src, pos); pos = pos + 1;
+                matchLen = matchLen + b;
+                if (b != 255) { break; }
+            }
+        }
+        let start = out.len - offset;
+        let k = 0;
+        while (k < matchLen) { out.push(out.at(start + k)); k = k + 1; }
+    }
+}
+
+// Raw-block public API (no frame; caller tracks sizes).
+pub fn compressBlock(data: string): string {
+    let out = deflate.ByteBuf();
+    compressBlockInto(out, data, 0, data.length);
+    return out.toString();
+}
+pub fn decompressBlock(src: string): string {
+    let out = deflate.ByteBuf();
+    decompressBlockInto(out, src, 0, src.length);
+    return out.toString();
+}
+
+// ------------------------------------------------------------------------------------------------
+// LZ4 frame format (interoperates with the `lz4` CLI).
+// ------------------------------------------------------------------------------------------------
+const BLOCK_MAX: int = 4194304; // 4 MB (BD=7)
+
+// Compress `data` into a single LZ4 frame. Minimal descriptor: version 01, block-independence, no
+// content size, no checksums. Blocks up to 4 MB; a block that would grow is stored uncompressed.
+pub fn compress(data: string): string {
+    let out = deflate.ByteBuf();
+    // magic 0x184D2204 (LE)
+    out.push(4); out.push(34); out.push(77); out.push(24);
+    // frame descriptor: FLG = version(01)<<6 | block_indep(1)<<5 = 0x60 ; BD = 7<<4 = 0x70
+    let flg = 96;  // 0x60
+    let bd = 112;  // 0x70
+    out.push(flg);
+    out.push(bd);
+    // header checksum = (xxh32(FLG,BD) >> 8) & 0xFF
+    let hdr = bytes.alloc(2);
+    bytes.write_byte(hdr, 0, flg);
+    bytes.write_byte(hdr, 1, bd);
+    let hc = ((xxh32(hdr as string, 0, 2) >> 8) & 255) as int;
+    out.push(hc);
+
+    let n = data.length;
+    let off = 0;
+    while (off < n) {
+        let chunk = n - off;
+        if (chunk > BLOCK_MAX) { chunk = BLOCK_MAX; }
+        // compress this chunk as a block
+        let blk = deflate.ByteBuf();
+        compressBlockInto(blk, data, off, chunk);
+        if (blk.len < chunk) {
+            // compressed block: 4-byte size (high bit clear)
+            out.push(blk.len & 255);
+            out.push((blk.len >> 8) & 255);
+            out.push((blk.len >> 16) & 255);
+            out.push((blk.len >> 24) & 255);
+            let i = 0;
+            while (i < blk.len) { out.push(blk.at(i)); i = i + 1; }
+        } else {
+            // stored (uncompressed) block: size with high bit set
+            let sz = chunk;
+            out.push(sz & 255);
+            out.push((sz >> 8) & 255);
+            out.push((sz >> 16) & 255);
+            out.push(((sz >> 24) & 255) | 128);
+            let i = 0;
+            while (i < chunk) { out.push(bytes.read_byte(data, off + i)); i = i + 1; }
+        }
+        off = off + chunk;
+    }
+    // end mark
+    out.push(0); out.push(0); out.push(0); out.push(0);
+    return out.toString();
+}
+
+// Decompress an LZ4 frame. Handles compressed + uncompressed blocks, and skips the optional
+// content-size field, per-block checksums, and content checksum if their flags are set (so frames
+// produced by the `lz4` CLI decode).
+pub fn decompress(src: string): string {
+    let out = deflate.ByteBuf();
+    let n = src.length;
+    if (n < 7) { return ""; }
+    // magic (4) already assumed 04 22 4D 18
+    let flg = bytes.read_byte(src, 4);
+    // let bd = bytes.read_byte(src, 5);
+    let pos = 6;
+    let contentSize = (flg & 8) != 0;
+    let contentChecksum = (flg & 4) != 0;
+    let blockChecksum = (flg & 16) != 0;
+    if (contentSize) { pos = pos + 8; }
+    pos = pos + 1; // HC byte
+
+    while (pos + 4 <= n) {
+        let bsize = bytes.read_byte(src, pos)
+            | (bytes.read_byte(src, pos + 1) << 8)
+            | (bytes.read_byte(src, pos + 2) << 16)
+            | (bytes.read_byte(src, pos + 3) << 24);
+        pos = pos + 4;
+        if (bsize == 0) { break; } // end mark
+        // bit 31 (0x80000000) set => uncompressed/stored block. In a 32-bit signed int that is < 0.
+        let realSize = bsize & 2147483647; // clear the high bit
+        let isStored = (bsize < 0);
+        if (isStored) {
+            let i = 0;
+            while (i < realSize) { out.push(bytes.read_byte(src, pos + i)); i = i + 1; }
+        } else {
+            decompressBlockInto(out, src, pos, realSize);
+        }
+        pos = pos + realSize;
+        if (blockChecksum) { pos = pos + 4; }
+    }
+    if (contentChecksum) { pos = pos + 4; }
+    return out.toString();
+}
+
+// ------------------------------------------------------------------------------------------------
+import assert;
+
+@test
+fn test_lz4_frame_roundtrip(): void {
+    let original = "Hello, LZ4! Hello, LZ4! Hello, LZ4! Hello, LZ4! Hello, LZ4!";
+    let packed = compress(original);
+    assert.isTrue(packed.length > 0);
+    assert.equalStr(decompress(packed), original);
+}
+
+@test
+fn test_lz4_block_roundtrip(): void {
+    let s = "abcabcabcabcabcabcabcabcabcabc";
+    assert.equalStr(decompressBlock(compressBlock(s)), s);
+}
+
+@test
+fn test_lz4_empty_and_binary(): void {
+    assert.equalStr(decompress(compress("")), "");
+    let s = "a\tb\nc  d\te\nf";
+    assert.equalStr(decompress(compress(s)), s);
+}
