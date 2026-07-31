@@ -319,11 +319,15 @@ fn checkTestDiscovery(b: *std.Build) void {
         const content = src_dir.readFileAlloc(io, entry.path, b.allocator, .limited(8 << 20)) catch continue;
         if (!fileHasTests(content)) continue;
 
-        const needle = std.fmt.allocPrint(b.allocator, "@import(\"{s}\")", .{entry.path}) catch continue;
+        // `entry.path` is reused by the walker on the next iteration, so this copy is needed
+        // anyway; on Windows the walker yields `\` separators while `@import` paths are always
+        // `/`, so normalize or every nested file reads as missing.
+        const owned = b.allocator.dupe(u8, entry.path) catch continue;
+        std.mem.replaceScalar(u8, owned, '\\', '/');
+
+        const needle = std.fmt.allocPrint(b.allocator, "@import(\"{s}\")", .{owned}) catch continue;
         if (std.mem.indexOf(u8, root_src, needle) != null) continue;
 
-        // `entry.path` is reused by the walker on the next iteration.
-        const owned = b.allocator.dupe(u8, entry.path) catch continue;
         missing.append(b.allocator, owned) catch continue;
     }
 

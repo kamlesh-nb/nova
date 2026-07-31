@@ -22,3 +22,6 @@ recovered/
 
 # Local crypto reference copy (not part of the build)
 deps/BearSSL/
+__nova_test.exe
+__nova_test.pdb
+*.pdb

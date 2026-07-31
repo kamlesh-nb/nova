@@ -7,7 +7,13 @@ const build_options = @import("build_options");
 extern fn nova_lld_link_macho(argv: [*]const [*:0]const u8, argc: c_int) c_int;
 extern fn nova_lld_link_wasm(argv: [*]const [*:0]const u8, argc: c_int) c_int;
 
-const dead_strip_flag: []const u8 = if (builtin.target.os.tag == .macos) "-Wl,-dead_strip" else "-Wl,--gc-sections";
+const dead_strip_flag: []const u8 = switch (builtin.target.os.tag) {
+    .macos => "-Wl,-dead_strip",
+    // clang++ on Windows drives MSVC's link.exe, which does not understand --gc-sections
+    // (it arrives as `/-gc-sections` → LNK4044 and no stripping). /OPT:REF is its equivalent.
+    .windows => "-Wl,/OPT:REF",
+    else => "-Wl,--gc-sections",
+};
 
 fn macSdkPath(environ: anytype, io: std.Io) []const u8 {
     if (environ.get("SDKROOT")) |s| return s;
@@ -47,6 +53,14 @@ fn appendFfiLib(args: *std.ArrayList([]const u8), allocator: std.mem.Allocator, 
             try args.appendSlice(allocator, &.{ "-framework", "WebKit", "-framework", "Cocoa" });
         }
         return;
+    }
+    // POSIX library names that MSVC folds into its CRT — there is no c.lib/m.lib/pthread.lib to
+    // open, so passing them through is a hard LNK1181, not a harmless no-op. `extern("c")` decls
+    // in std are the common source. The symbols themselves come from the UCRT, already linked.
+    if (builtin.target.os.tag == .windows) {
+        for (&[_][]const u8{ "c", "m", "pthread", "dl", "rt" }) |implicit| {
+            if (std.mem.eql(u8, lib, implicit)) return;
+        }
     }
     try args.append(allocator, try std.fmt.allocPrint(allocator, "-l{s}", .{lib}));
 }
@@ -184,6 +198,35 @@ fn linkWasmInProcess(allocator: std.mem.Allocator, obj_path: []const u8, output_
         std.debug.print("in-process LLD (wasm) failed with code {d}\n", .{rc});
         return error.LinkFailed;
     }
+}
+
+/// Append the Nova C++ runtime to a clang++ link line.
+///
+/// On Windows clang++ targets MSVC, whose link.exe resolves `-lnova_runtime` to `nova_runtime.lib`
+/// and cannot read the GNU-format `libnova_runtime.a` that llvm-ar writes (LNK1104). The runtime is
+/// a unity build — one `runtime.cpp` → one object — so the COFF object is linked directly there:
+/// identical to demand-loading the archive's single member, minus the archive-format question.
+fn appendRuntimeLink(
+    args: *std.ArrayList([]const u8),
+    allocator: std.mem.Allocator,
+    shared_nova: []const u8,
+    lib_name: []const u8,
+) !void {
+    if (builtin.target.os.tag == .windows) {
+        try args.append(allocator, try std.fmt.allocPrint(allocator, "{s}/lib/{s}.o", .{ shared_nova, lib_name }));
+        // compiler-rt's builtins carry the 128-bit helpers (__udivti3/__umodti3, used by
+        // decimal.cpp's __int128 math); MSVC's CRT has no equivalent. clang++ only finds the
+        // builtins archive under the windows/ layout when -rtlib=compiler-rt is explicit —
+        // without it the link dies on unresolved __udivti3.
+        try args.append(allocator, "-rtlib=compiler-rt");
+        // Same system libs the cross-link (crossLinkViaZig) already passes for windows targets:
+        // sockets (reactor/os.socket), AcceptEx/ConnectEx, and BCryptGenRandom for nova_getrandom.
+        try args.appendSlice(allocator, &.{ "-lws2_32", "-lmswsock", "-lbcrypt" });
+        return;
+    }
+    try args.append(allocator, try std.fmt.allocPrint(allocator, "-L{s}/lib", .{shared_nova}));
+    try args.append(allocator, try std.fmt.allocPrint(allocator, "-l{s}", .{lib_name}));
+    try args.append(allocator, "-L/opt/homebrew/lib");
 }
 
 fn appendWolfsslLink(args: *std.ArrayList([]const u8), allocator: std.mem.Allocator, shared_nova: []const u8, io: std.Io) !void {
@@ -1904,12 +1947,12 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
 
     for (link_objs) |o| try test_clang_args.append(allocator, o);
 
-    const test_nova_lib = try std.fmt.allocPrint(allocator, "-L{s}/lib", .{shared_nova});
-    try test_clang_args.append(allocator, test_nova_lib);
-
-    try test_clang_args.append(allocator, if (asan) "-lnova_runtime_asan" else if (tsan) "-lnova_runtime_tsan" else "-lnova_runtime");
-
-    try test_clang_args.append(allocator, "-L/opt/homebrew/lib");
+    try appendRuntimeLink(&test_clang_args, allocator, shared_nova, if (asan)
+        "nova_runtime_asan"
+    else if (tsan)
+        "nova_runtime_tsan"
+    else
+        "nova_runtime");
     try appendWolfsslLink(&test_clang_args, allocator, shared_nova, init.io);
 
     for (try collectFfiLibs(allocator, program)) |lib| {
@@ -2251,10 +2294,7 @@ fn compileProgram(
 
         for (link_objs) |o| try clang_args.append(allocator, o);
 
-        const nova_lib = try std.fmt.allocPrint(allocator, "-L{s}/lib", .{shared_nova});
-        try clang_args.append(allocator, nova_lib);
-        try clang_args.append(allocator, "-lnova_runtime");
-        try clang_args.append(allocator, "-L/opt/homebrew/lib");
+        try appendRuntimeLink(&clang_args, allocator, shared_nova, "nova_runtime");
         try appendWolfsslLink(&clang_args, allocator, shared_nova, init.io);
         for (ffi_libs) |lib| {
             try appendFfiLib(&clang_args, allocator, shared_nova, init.io, lib);
