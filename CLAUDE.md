@@ -171,7 +171,13 @@ administratively (`/proc/sys/kernel/io_uring_disabled`).
 |---|---|---|
 | Windows / IOCP | **224** | 10 |
 | Linux / epoll | **225** | 9 |
-| Linux / io_uring | **224** | 10 |
+| Linux / io_uring | **225** | 9 |
+
+epoll and io_uring have IDENTICAL failure lists — every reachable case passes on both.
+
+Run the corpora ONE AT A TIME. Running two concurrently on a 4-core box starves the app/server cases
+past the per-case timeout and invents 3-4 phantom failures (they report "timed out after 60s", which
+is how to recognise it); a concurrent pair read 221/221 where the serial runs read 224/225.
 
 Every remaining failure is structural, not a bug to chase:
 - **8 DB/codec cases** (`64/65/66/67`, `100/105/107/109/110`) import the drivers from `packages/`,
