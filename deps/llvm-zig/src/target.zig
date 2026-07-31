@@ -1,4 +1,34 @@
+const std = @import("std");
+const builtin = @import("builtin");
 const LLVMtype = @import("types.zig");
+
+// Backends the linked LLVM actually ships. The LLVM.org *Windows* binary release builds
+// LLVM-C.dll with a reduced LLVM_TARGETS_TO_BUILD, and referencing an LLVMInitialize<T>*
+// the DLL does not export is a hard link error (`lld-link: undefined symbol`), not a
+// runtime no-op — so the aggregate initializers below enumerate only what is present.
+// Every backend nova emits for (x86_64, aarch64, arm, wasm32) is inside this set.
+// macOS/Linux LLVM drops carry all backends and take the unfiltered path.
+const windows_backends = [_][]const u8{ "AArch64", "ARM", "BPF", "NVPTX", "RISCV", "WebAssembly", "X86" };
+
+fn haveBackend(comptime name: []const u8) bool {
+    if (builtin.target.os.tag != .windows) return true;
+    for (windows_backends) |b| {
+        if (std.mem.eql(u8, b, name)) return true;
+    }
+    return false;
+}
+
+// Full per-category backend lists. AsmParser/Disassembler legitimately omit backends that
+// have no such component upstream (NVPTX has neither; XCore has no AsmParser).
+const all_backends = [_][]const u8{ "AArch64", "AMDGPU", "ARM", "AVR", "BPF", "Hexagon", "Lanai", "Mips", "MSP430", "NVPTX", "PowerPC", "RISCV", "Sparc", "SystemZ", "WebAssembly", "X86", "XCore", "VE" };
+const asm_parser_backends = [_][]const u8{ "AArch64", "AMDGPU", "ARM", "AVR", "BPF", "Hexagon", "Lanai", "Mips", "MSP430", "PowerPC", "RISCV", "Sparc", "SystemZ", "WebAssembly", "X86", "VE" };
+const disassembler_backends = [_][]const u8{ "AArch64", "AMDGPU", "ARM", "AVR", "BPF", "Hexagon", "Lanai", "Mips", "MSP430", "PowerPC", "RISCV", "Sparc", "SystemZ", "VE", "WebAssembly", "X86", "XCore" };
+
+fn initBackends(comptime backends: []const []const u8, comptime component: []const u8) void {
+    inline for (backends) |b| {
+        if (comptime haveBackend(b)) @field(@This(), "LLVMInitialize" ++ b ++ component)();
+    }
+}
 
 pub extern fn LLVMInitializeAArch64TargetInfo() void;
 pub extern fn LLVMInitializeAMDGPUTargetInfo() void;
@@ -112,121 +142,22 @@ pub extern fn LLVMInitializeX86Disassembler() void;
 pub extern fn LLVMInitializeXCoreDisassembler() void;
 
 pub fn LLVMInitializeAllTargetInfos() callconv(.c) void {
-    LLVMInitializeAArch64TargetInfo();
-    LLVMInitializeAMDGPUTargetInfo();
-    LLVMInitializeARMTargetInfo();
-    LLVMInitializeAVRTargetInfo();
-    LLVMInitializeBPFTargetInfo();
-    LLVMInitializeHexagonTargetInfo();
-    LLVMInitializeLanaiTargetInfo();
-    LLVMInitializeMipsTargetInfo();
-    LLVMInitializeMSP430TargetInfo();
-    LLVMInitializeNVPTXTargetInfo();
-    LLVMInitializePowerPCTargetInfo();
-    LLVMInitializeRISCVTargetInfo();
-    LLVMInitializeSparcTargetInfo();
-    LLVMInitializeSystemZTargetInfo();
-    LLVMInitializeWebAssemblyTargetInfo();
-    LLVMInitializeX86TargetInfo();
-    LLVMInitializeXCoreTargetInfo();
-    LLVMInitializeVETargetInfo();
+    initBackends(&all_backends, "TargetInfo");
 }
 pub fn LLVMInitializeAllTargets() callconv(.c) void {
-    LLVMInitializeAArch64Target();
-    LLVMInitializeAMDGPUTarget();
-    LLVMInitializeARMTarget();
-    LLVMInitializeAVRTarget();
-    LLVMInitializeBPFTarget();
-    LLVMInitializeHexagonTarget();
-    LLVMInitializeLanaiTarget();
-    LLVMInitializeMipsTarget();
-    LLVMInitializeMSP430Target();
-    LLVMInitializeNVPTXTarget();
-    LLVMInitializePowerPCTarget();
-    LLVMInitializeRISCVTarget();
-    LLVMInitializeSparcTarget();
-    LLVMInitializeSystemZTarget();
-    LLVMInitializeWebAssemblyTarget();
-    LLVMInitializeX86Target();
-    LLVMInitializeXCoreTarget();
-    LLVMInitializeVETarget();
+    initBackends(&all_backends, "Target");
 }
 pub fn LLVMInitializeAllTargetMCs() callconv(.c) void {
-    LLVMInitializeAArch64TargetMC();
-    LLVMInitializeAMDGPUTargetMC();
-    LLVMInitializeARMTargetMC();
-    LLVMInitializeAVRTargetMC();
-    LLVMInitializeBPFTargetMC();
-    LLVMInitializeHexagonTargetMC();
-    LLVMInitializeLanaiTargetMC();
-    LLVMInitializeMipsTargetMC();
-    LLVMInitializeMSP430TargetMC();
-    LLVMInitializeNVPTXTargetMC();
-    LLVMInitializePowerPCTargetMC();
-    LLVMInitializeRISCVTargetMC();
-    LLVMInitializeSparcTargetMC();
-    LLVMInitializeSystemZTargetMC();
-    LLVMInitializeWebAssemblyTargetMC();
-    LLVMInitializeX86TargetMC();
-    LLVMInitializeXCoreTargetMC();
-    LLVMInitializeVETargetMC();
+    initBackends(&all_backends, "TargetMC");
 }
 pub fn LLVMInitializeAllAsmPrinters() callconv(.c) void {
-    LLVMInitializeAArch64AsmPrinter();
-    LLVMInitializeAMDGPUAsmPrinter();
-    LLVMInitializeARMAsmPrinter();
-    LLVMInitializeAVRAsmPrinter();
-    LLVMInitializeBPFAsmPrinter();
-    LLVMInitializeHexagonAsmPrinter();
-    LLVMInitializeLanaiAsmPrinter();
-    LLVMInitializeMipsAsmPrinter();
-    LLVMInitializeMSP430AsmPrinter();
-    LLVMInitializeNVPTXAsmPrinter();
-    LLVMInitializePowerPCAsmPrinter();
-    LLVMInitializeRISCVAsmPrinter();
-    LLVMInitializeSparcAsmPrinter();
-    LLVMInitializeSystemZAsmPrinter();
-    LLVMInitializeWebAssemblyAsmPrinter();
-    LLVMInitializeX86AsmPrinter();
-    LLVMInitializeXCoreAsmPrinter();
-    LLVMInitializeVEAsmPrinter();
+    initBackends(&all_backends, "AsmPrinter");
 }
 pub fn LLVMInitializeAllAsmParsers() callconv(.c) void {
-    LLVMInitializeAArch64AsmParser();
-    LLVMInitializeAMDGPUAsmParser();
-    LLVMInitializeARMAsmParser();
-    LLVMInitializeAVRAsmParser();
-    LLVMInitializeBPFAsmParser();
-    LLVMInitializeHexagonAsmParser();
-    LLVMInitializeLanaiAsmParser();
-    LLVMInitializeMipsAsmParser();
-    LLVMInitializeMSP430AsmParser();
-    LLVMInitializePowerPCAsmParser();
-    LLVMInitializeRISCVAsmParser();
-    LLVMInitializeSparcAsmParser();
-    LLVMInitializeSystemZAsmParser();
-    LLVMInitializeWebAssemblyAsmParser();
-    LLVMInitializeX86AsmParser();
-    LLVMInitializeVEAsmParser();
+    initBackends(&asm_parser_backends, "AsmParser");
 }
 pub fn LLVMInitializeAllDisassemblers() callconv(.c) void {
-    LLVMInitializeAArch64Disassembler();
-    LLVMInitializeAMDGPUDisassembler();
-    LLVMInitializeARMDisassembler();
-    LLVMInitializeAVRDisassembler();
-    LLVMInitializeBPFDisassembler();
-    LLVMInitializeHexagonDisassembler();
-    LLVMInitializeLanaiDisassembler();
-    LLVMInitializeMipsDisassembler();
-    LLVMInitializeMSP430Disassembler();
-    LLVMInitializePowerPCDisassembler();
-    LLVMInitializeRISCVDisassembler();
-    LLVMInitializeSparcDisassembler();
-    LLVMInitializeSystemZDisassembler();
-    LLVMInitializeWebAssemblyDisassembler();
-    LLVMInitializeX86Disassembler();
-    LLVMInitializeXCoreDisassembler();
-    LLVMInitializeVEDisassembler();
+    initBackends(&disassembler_backends, "Disassembler");
 }
 pub fn LLVMInitializeNativeTarget() callconv(.c) LLVMtype.LLVMBool {
     LLVMInitializeX86TargetInfo();
