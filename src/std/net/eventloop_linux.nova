@@ -159,7 +159,10 @@ fn uringWaitReady(eventBuf: long, maxEvents: int): int {
     while (i < n) {
         nova_uring_peek(ring, i, ud, res);
         let slot = eventBuf + ((i * epoll.EPOLL_EVENT_SIZE) as long);
-        bytes.write_ptr(slot, URING_EV_DATA_OFF, bytes.read_ptr(ud, 0));
+        let raw = bytes.read_ptr(ud, 0);
+        // A wake is one-shot: drain the eventfd and re-arm, or every later post is lost.
+        if (raw == WAKE_DATA) { nova_uring_wake_drain(); }
+        bytes.write_ptr(slot, URING_EV_DATA_OFF, raw);
         bytes.write_i32(slot, URING_EV_RES_OFF, bytes.read_i32(res, 0));
         i = i + 1;
     }
@@ -216,6 +219,7 @@ pub extern("c") fn nova_uring_submit_and_wait(ring: long, waitNr: int): int;
 pub extern("c") fn nova_uring_cq_ready(ring: long): int;
 pub extern("c") fn nova_uring_peek(ring: long, i: int, userData: ptr, res: ptr): int;
 pub extern("c") fn nova_uring_advance(ring: long, n: int): void;
+pub extern("c") fn nova_uring_wake_drain(): void;
 pub extern("c") fn nova_uring_op_recv(): int;
 pub extern("c") fn nova_uring_op_send(): int;
 pub extern("c") fn nova_uring_op_accept(): int;

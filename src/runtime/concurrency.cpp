@@ -220,7 +220,15 @@ static void uring_wake_rearm() {
     nova_uring_submit_and_wait(ring, 0);
 }
 
-static void uring_wake_drain() {
+// Exposed because a reactor loop driven from NOVA (net/reactor's poll) reaps completions itself and
+// never reaches the C driver's dispatch — without this the eventfd stays readable and the one-shot
+// POLL_ADD is never re-armed, so the first cross-reactor wake works and every later one is lost.
+extern "C" void nova_uring_wake_drain();
+
+static void uring_wake_drain_impl();
+void nova_uring_wake_drain() { uring_wake_drain_impl(); }
+
+static void uring_wake_drain_impl() {
     if (g_uring_wake_fd < 0) return;
     uint64_t sink = 0;
     ssize_t r = ::read(g_uring_wake_fd, &sink, sizeof(sink));   // eventfd is non-blocking
@@ -230,7 +238,7 @@ static void uring_wake_drain() {
 
 static void uring_dispatch(long long user_data, int res) {
     uint64_t d = (uint64_t)user_data;
-    if (d == NOVA_EPOLL_WAKE_DATA) { uring_wake_drain(); return; }
+    if (d == NOVA_EPOLL_WAKE_DATA) { uring_wake_drain_impl(); return; }
     if (d == 0) return;
     if (d & NOVA_EPOLL_TIMER_TAG) {
         long long h = (long long)(d & ~NOVA_EPOLL_TIMER_TAG);
