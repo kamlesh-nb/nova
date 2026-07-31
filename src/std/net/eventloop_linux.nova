@@ -280,7 +280,10 @@ pub fn evEof(eventBuf: long, i: int): bool {
 const WAKE_DATA: long = -1;
 const USER_FILTER: int = -2;
 pub fn evFilterAt(eventBuf: long, i: int): int {
-    if (epoll.evData(eventBuf, i) == WAKE_DATA) { return USER_FILTER; }
+    // Via evRaw, so the wake is recognised on BOTH Linux backends: the uring slot layout puts
+    // user_data at offset 0, where an epoll_event has its events mask instead.
+    if (evRaw(eventBuf, i) == WAKE_DATA) { return USER_FILTER; }
+    if (usingUring()) { return 0; }   // io_uring reports no readiness bitmask
     return epoll.evEvents(eventBuf, i);
 }
 
