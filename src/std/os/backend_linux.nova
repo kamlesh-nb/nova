@@ -11,25 +11,25 @@ pub const COMPLETION_BASED: bool = false;
 // live in this per-OS seam so the shared file stays target-neutral.
 
 // open(2) flags — Linux (octal in the headers; decimal here).
-pub const O_CREAT: int = 64;         // 0100
-pub const O_TRUNC: int = 512;        // 01000
-pub const O_APPEND: int = 1024;      // 02000
-pub const O_NONBLOCK: int = 2048;    // 04000
+pub const OPEN_CREAT: int = 64;         // 0100
+pub const OPEN_TRUNC: int = 512;        // 01000
+pub const OPEN_APPEND: int = 1024;      // 02000
+pub const OPEN_NONBLOCK: int = 2048;    // 04000
 
 // mmap: MAP_ANONYMOUS is 0x20 on Linux, NOT the 0x1000 macOS uses.
-pub const MAP_ANON: int = 32;
+pub const MMAP_ANON: int = 32;
 
 // Socket option level and names — all different from macOS.
-pub const SOL_SOCKET: int = 1;
-pub const SO_ERROR: int = 4;
-pub const SO_REUSEADDR: int = 2;
-pub const SO_REUSEPORT: int = 15;
+pub const SOCKOPT_LEVEL: int = 1;
+pub const SOCKOPT_ERROR: int = 4;
+pub const SOCKOPT_REUSEADDR: int = 2;
+pub const SOCKOPT_REUSEPORT: int = 15;
 
 // struct stat (x86_64): dev(8) ino(8) nlink(8) then mode at 24. st_mode is 4 bytes here, but only
 // the low 16 carry the type bits S_IFMT masks, so a u16 read at this offset is still correct.
-pub const STAT_MODE_OFF: int = 24;
+pub const STAT_MODE_OFFSET: int = 24;
 // struct dirent: d_ino(8) d_off(8) d_reclen(2) d_type(1) => d_name at 19.
-pub const DIRENT_NAME_OFF: int = 19;
+pub const DIRENT_NAME_OFFSET: int = 19;
 
-pub const EAGAIN: int = 11;
-pub const EINPROGRESS: int = 115;
+pub const ERR_AGAIN: int = 11;
+pub const ERR_INPROGRESS: int = 115;

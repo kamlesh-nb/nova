@@ -75,7 +75,7 @@ pub extern("c") fn munmap(addr: ptr, length: long): int;
 pub const PROT_READ: int = 1;
 pub const PROT_WRITE: int = 2;
 pub const MAP_PRIVATE: int = 2;
-pub const MAP_ANON: int = backend.MAP_ANON;
+pub const MAP_ANON: int = backend.MMAP_ANON;
 
 // open(2) flags and lseek whence. The access modes are 0/1/2 everywhere; the creation and status
 // flags are NOT (O_CREAT is 0x200 on macOS but 0x40 on Linux), so those come from the per-OS seam.
@@ -83,9 +83,9 @@ pub const MAP_ANON: int = backend.MAP_ANON;
 pub const O_RDONLY: int = 0;
 pub const O_WRONLY: int = 1;
 pub const O_RDWR: int = 2;
-pub const O_CREAT: int = backend.O_CREAT;
-pub const O_TRUNC: int = backend.O_TRUNC;
-pub const O_APPEND: int = backend.O_APPEND;
+pub const O_CREAT: int = backend.OPEN_CREAT;
+pub const O_TRUNC: int = backend.OPEN_TRUNC;
+pub const O_APPEND: int = backend.OPEN_APPEND;
 pub const SEEK_SET: int = 0;
 pub const SEEK_CUR: int = 1;
 pub const SEEK_END: int = 2;
@@ -101,8 +101,8 @@ pub const S_IFLNK: int = 40960;
 // struct stat and struct dirent are read as raw bytes at fixed offsets, and those offsets differ by
 // kernel (macOS puts st_mode at 4, Linux at 24; d_name is at 21 vs 19). Both come from the per-OS
 // seam. DIRENT_NAME_OFF is public because io/dir walks the entry itself.
-const STAT_MODE_OFF: int = backend.STAT_MODE_OFF;
-pub const DIRENT_NAME_OFF: int = backend.DIRENT_NAME_OFF;
+const STAT_MODE_OFF: int = backend.STAT_MODE_OFFSET;
+pub const DIRENT_NAME_OFF: int = backend.DIRENT_NAME_OFFSET;
 
 // A fresh NUL-terminated C string copy of a Nova string (Nova strings are length-prefixed, not
 // NUL-terminated). The caller owns the buffer and must bytes.free it after the call returns.
@@ -155,8 +155,8 @@ pub const AF_INET: int = 2;
 pub const SOCK_STREAM: int = 1;
 pub const SOCK_DGRAM: int = 2;
 // SOL_SOCKET is 0xffff on macOS/BSD but 1 on Linux; O_NONBLOCK is 0x4 vs 0x800. Per-OS seam.
-pub const SOL_SOCKET: int = backend.SOL_SOCKET;
-pub const O_NONBLOCK: int = backend.O_NONBLOCK;
+pub const SOL_SOCKET: int = backend.SOCKOPT_LEVEL;
+pub const O_NONBLOCK: int = backend.OPEN_NONBLOCK;
 pub const F_GETFL: int = 3;
 pub const F_SETFL: int = 4;
 
@@ -165,11 +165,11 @@ pub const AF_UNIX: int = 1;
 
 // SO_ERROR reads (and clears) the pending socket error, used after a non-blocking connect reports
 // writability to tell success from failure. 0x1007 on macOS/BSD, 4 on Linux — per-OS seam.
-pub const SO_ERROR: int = backend.SO_ERROR;
+pub const SO_ERROR: int = backend.SOCKOPT_ERROR;
 
 // SO_REUSEPORT lets N reactor threads each bind the same port (kernel load-balances accepts), the
 // share-nothing multi-core listener. 0x0200 on macOS/BSD, 15 on Linux — per-OS seam.
-pub const SO_REUSEPORT: int = backend.SO_REUSEPORT;
+pub const SO_REUSEPORT: int = backend.SOCKOPT_REUSEPORT;
 
 pub fn errno(): int { return nova_ffi_errno(); }
 pub fn clearErrno(): void { nova_ffi_set_errno(0); }

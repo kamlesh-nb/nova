@@ -15,20 +15,20 @@ pub const COMPLETION_BASED: bool = true;
 // goes to Win32 directly (CreateFileW's disposition instead of O_CREAT, VirtualAlloc instead of
 // mmap). They are declared so the seam has the same shape on every target; the values are the
 // Winsock ones where Winsock has an equivalent.
-pub const O_CREAT: int = 256;        // _O_CREAT
-pub const O_TRUNC: int = 512;        // _O_TRUNC
-pub const O_APPEND: int = 8;         // _O_APPEND
-pub const O_NONBLOCK: int = 0;       // no equivalent; sockets use ioctlsocket(FIONBIO)
+pub const OPEN_CREAT: int = 256;        // _O_CREAT
+pub const OPEN_TRUNC: int = 512;        // _O_TRUNC
+pub const OPEN_APPEND: int = 8;         // _O_APPEND
+pub const OPEN_NONBLOCK: int = 0;       // no equivalent; sockets use ioctlsocket(FIONBIO)
 
-pub const MAP_ANON: int = 0;         // no equivalent; VirtualAlloc takes no such flag
+pub const MMAP_ANON: int = 0;         // no equivalent; VirtualAlloc takes no such flag
 
-pub const SOL_SOCKET: int = 65535;   // 0xffff
-pub const SO_ERROR: int = 4103;      // 0x1007
-pub const SO_REUSEADDR: int = 4;
-pub const SO_REUSEPORT: int = 4;     // no SO_REUSEPORT; SO_REUSEADDR is the closest behaviour
+pub const SOCKOPT_LEVEL: int = 65535;   // 0xffff
+pub const SOCKOPT_ERROR: int = 4103;      // 0x1007
+pub const SOCKOPT_REUSEADDR: int = 4;
+pub const SOCKOPT_REUSEPORT: int = 4;     // no SO_REUSEPORT; SO_REUSEADDR is the closest behaviour
 
-pub const STAT_MODE_OFF: int = 4;    // the layout os/sys_windows.stat() writes
-pub const DIRENT_NAME_OFF: int = 21; // the layout os/sys_windows.readdir() writes
+pub const STAT_MODE_OFFSET: int = 4;    // the layout os/sys_windows.stat() writes
+pub const DIRENT_NAME_OFFSET: int = 21; // the layout os/sys_windows.readdir() writes
 
-pub const EAGAIN: int = 11;
-pub const EINPROGRESS: int = 115;
+pub const ERR_AGAIN: int = 11;
+pub const ERR_INPROGRESS: int = 115;

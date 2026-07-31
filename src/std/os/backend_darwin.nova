@@ -14,25 +14,25 @@ pub const COMPLETION_BASED: bool = false; // native model is readiness; completi
 // live in this per-OS seam so the shared file stays target-neutral.
 
 // open(2) flags — macOS/BSD.
-pub const O_CREAT: int = 512;        // 0x0200
-pub const O_TRUNC: int = 1024;       // 0x0400
-pub const O_APPEND: int = 8;         // 0x0008
-pub const O_NONBLOCK: int = 4;       // 0x0004
+pub const OPEN_CREAT: int = 512;        // 0x0200
+pub const OPEN_TRUNC: int = 1024;       // 0x0400
+pub const OPEN_APPEND: int = 8;         // 0x0008
+pub const OPEN_NONBLOCK: int = 4;       // 0x0004
 
 // mmap: MAP_ANON is 0x1000 on macOS/BSD.
-pub const MAP_ANON: int = 4096;
+pub const MMAP_ANON: int = 4096;
 
 // Socket option level and names.
-pub const SOL_SOCKET: int = 65535;   // 0xffff
-pub const SO_ERROR: int = 4103;      // 0x1007
-pub const SO_REUSEADDR: int = 4;
-pub const SO_REUSEPORT: int = 512;   // 0x0200
+pub const SOCKOPT_LEVEL: int = 65535;   // 0xffff
+pub const SOCKOPT_ERROR: int = 4103;      // 0x1007
+pub const SOCKOPT_REUSEADDR: int = 4;
+pub const SOCKOPT_REUSEPORT: int = 512;   // 0x0200
 
 // struct stat: st_mode is a u16 at offset 4 (dev_t is 4 bytes here).
-pub const STAT_MODE_OFF: int = 4;
+pub const STAT_MODE_OFFSET: int = 4;
 // struct dirent: d_ino(8) d_seekoff(8) d_reclen(2) d_namlen(2) d_type(1) => d_name at 21.
-pub const DIRENT_NAME_OFF: int = 21;
+pub const DIRENT_NAME_OFFSET: int = 21;
 
 // errno values used by the non-blocking socket paths.
-pub const EAGAIN: int = 35;
-pub const EINPROGRESS: int = 36;
+pub const ERR_AGAIN: int = 35;
+pub const ERR_INPROGRESS: int = 36;
