@@ -163,6 +163,8 @@ pub struct Huffman {
             }
             i = i + 1;
         }
+        bytes.free(offsets); // offsets is a ptr LOCAL -> not ARC-owned; free it (counts/symbols are
+                             // struct fields -> ARC-owned, never freed here). See ptr-field-arc memory.
     }
 
     // Decode one symbol from the bit stream.
@@ -372,7 +374,12 @@ fn inflateDynamic(br: BitReader, out: ByteBuf): void {
     let litH = Huffman(litLens, hlit);
     let distH = Huffman(distLens, hdist);
     inflateBlock(br, out, litH, distH, true);
-    clHuff.delete();
+    // free the ptr LOCAL scratch buffers (Huffman copied what it needs into its own struct fields).
+    bytes.free(ord);
+    bytes.free(cl);
+    bytes.free(lens);
+    bytes.free(litLens);
+    bytes.free(distLens);
 }
 
 // Fixed Huffman tables (RFC 1951 3.2.6): literals 0-143 => 8 bits, 144-255 => 9, 256-279 => 7,
@@ -385,6 +392,7 @@ fn fixedLitHuffman(): Huffman {
     while (i < 280) { bytes.write_byte(lens, i, 7); i = i + 1; }
     while (i < 288) { bytes.write_byte(lens, i, 8); i = i + 1; }
     let h = Huffman(lens, 288);
+    bytes.free(lens);
     return h;
 }
 fn fixedDistHuffman(): Huffman {
@@ -392,6 +400,7 @@ fn fixedDistHuffman(): Huffman {
     let i = 0;
     while (i < 30) { bytes.write_byte(lens, i, 5); i = i + 1; }
     let h = Huffman(lens, 30);
+    bytes.free(lens);
     return h;
 }
 
@@ -621,6 +630,8 @@ pub fn deflateRaw(data: string): ByteBuf {
     }
     emitLitLen(bw, 256); // end of block
     bw.flush();
+    bytes.free(head); // ptr LOCAL scratch (bw.out is a struct field -> ARC-owned, returned)
+    bytes.free(prev);
     return bw.out;
 }
 

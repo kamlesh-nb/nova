@@ -155,6 +155,7 @@ fn compressBlockInto(out: deflate.ByteBuf, data: string, begin: int, n: int): vo
     if (litLen >= 15) { writeLSIC(out, litLen - 15); }
     let i = 0;
     while (i < litLen) { out.push(bytes.read_byte(data, anchor + i)); i = i + 1; }
+    bytes.free(head); // ptr LOCAL scratch (out is a caller-owned ByteBuf, untouched)
 }
 
 // Decompress a raw LZ4 block src[begin..begin+n) into `out` (appending). Byte-by-byte copies, so
@@ -224,6 +225,7 @@ pub fn compress(data: string): string {
     bytes.write_byte(hdr, 0, flg);
     bytes.write_byte(hdr, 1, bd);
     let hc = ((xxh32(hdr as string, 0, 2) >> 8) & 255) as int;
+    bytes.free(hdr); // ptr LOCAL scratch
     out.push(hc);
 
     let n = data.length;
