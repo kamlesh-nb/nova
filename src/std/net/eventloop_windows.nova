@@ -167,7 +167,7 @@ pub fn cancelRead(kq: int, fd: int): void { }
 // A proactor ISSUES the connect (ConnectEx) as the submitted operation. The readiness backends
 // instead start a non-blocking connect() first and then await writability, a prologue that must be
 // skipped here: once connect() has been started, ConnectEx on the same socket fails.
-pub const CONNECT_IS_SUBMITTED: bool = true;
+pub fn connectIsSubmitted(): bool { return true; }
 
 pub const EVENT_SIZE: int = 32;   // OVERLAPPED_ENTRY, so the reactor's event buffer is sized for GQCSEx
 pub fn armRead(kq: int, fd: int, token: long): int { return 0; }

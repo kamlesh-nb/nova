@@ -76,7 +76,8 @@ pub fn cancelRead(kq: int, fd: int): void {
 // Readiness backend: connect() is STARTED with a non-blocking connect and the op then awaits
 // writability, so the submit is not itself the connect. The IOCP backend sets this true —
 // see net/eventloop_windows.
-pub const CONNECT_IS_SUBMITTED: bool = false;
+// Linux answers at RUNTIME: io_uring is a proactor and issues the connect itself; epoll is not.
+pub fn connectIsSubmitted(): bool { return usingUring(); }
 
 pub const EVENT_SIZE: int = 12;   // sizeof packed struct epoll_event (x86_64)
 
