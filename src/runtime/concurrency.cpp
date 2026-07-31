@@ -49,6 +49,25 @@ extern "C" int64_t nova_mono_ms(void);
 // ahead of that definition.
 extern "C" long long nova_reactor_resume(long long handle);
 
+// --- readiness emulation over a proactor ---------------------------------------------------------
+// Neither IOCP nor io_uring has "tell me when this fd is readable" — you hand them an operation, not
+// an interest. The standard way to get readiness anyway is a ZERO-BYTE receive: it completes exactly
+// when data arrives and consumes none of it, so the completion IS the readiness edge and the caller
+// then does a normal read. Both proactor backends use this, so the per-fd arm records (which must
+// outlive the arming call) live here rather than in either one. Thread-local: a reactor worker owns
+// its fds.
+thread_local std::unordered_map<int, long long> g_reactor_arms;
+
+extern "C" long long nova_reactor_arm_get(int fd) {
+    auto it = g_reactor_arms.find(fd);
+    return it == g_reactor_arms.end() ? 0 : it->second;
+}
+extern "C" void nova_reactor_arm_set(int fd, long long op) {
+    if (op) g_reactor_arms[fd] = op;
+    else g_reactor_arms.erase(fd);
+}
+
+
 #if defined(NOVA_HAVE_EPOLL)
 // --- epoll reactor support (the Linux peer of the kqueue driver) -------------------------------
 //
@@ -311,23 +330,6 @@ static void iocp_timer_arm(long long handle, long long ms) {
     // reclaims it. Harmless, and it keeps the callback lock-free.
     std::lock_guard<std::mutex> lk(g_iocp_timer_mu);
     g_iocp_timers[handle] = t;
-}
-
-// --- readiness emulation over IOCP -----------------------------------------------------------
-// A proactor has no "tell me when this fd is readable". The standard way to get it anyway is a
-// ZERO-BYTE receive: WSARecv with an empty buffer completes precisely when data arrives, without
-// consuming any, so the completion IS the readiness edge and the caller then does a normal read.
-// Each armed fd needs an op record that outlives the call, so they are kept here, one per fd,
-// thread-local (a reactor worker owns its fds).
-thread_local std::unordered_map<int, long long> g_iocp_arms;
-
-extern "C" long long nova_iocp_arm_get(int fd) {
-    auto it = g_iocp_arms.find(fd);
-    return it == g_iocp_arms.end() ? 0 : it->second;
-}
-extern "C" void nova_iocp_arm_set(int fd, long long op) {
-    if (op) g_iocp_arms[fd] = op;
-    else g_iocp_arms.erase(fd);
 }
 
 // Turn one completion into a coroutine resume.

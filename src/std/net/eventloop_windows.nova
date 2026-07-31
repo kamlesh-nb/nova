@@ -175,9 +175,9 @@ pub const EVENT_SIZE: int = 32;   // OVERLAPPED_ENTRY, so the reactor's event bu
 // Readiness over a proactor, via a ZERO-BYTE receive. WSARecv with an empty buffer completes exactly
 // when data arrives and consumes none of it, so the completion is the readiness edge and the caller
 // then performs a normal read — which is what the readiness API promises. The op record has to
-// outlive the call, so one is kept per armed fd in the runtime (see nova_iocp_arm_get).
-extern("c") fn nova_iocp_arm_get(fd: int): long;
-extern("c") fn nova_iocp_arm_set(fd: int, op: long): void;
+// outlive the call, so one is kept per armed fd in the runtime (see nova_reactor_arm_get).
+extern("c") fn nova_reactor_arm_get(fd: int): long;
+extern("c") fn nova_reactor_arm_set(fd: int, op: long): void;
 extern("c") fn nova_op_alloc(size: long): long;
 extern("c") fn nova_op_free(op: long): void;
 
@@ -186,10 +186,10 @@ fn armZeroByte(kq: int, fd: int, token: long, kind: int): int {
     // The socket must be joined to the port before any overlapped op, exactly as for real I/O.
     windows.CreateIoCompletionPort(fd as long, kq as long, fd as long, 0);
 
-    let op = nova_iocp_arm_get(fd);
+    let op = nova_reactor_arm_get(fd);
     if (op == (0 as long)) {
         op = nova_op_alloc(OP_SIZE as long);
-        nova_iocp_arm_set(fd, op);
+        nova_reactor_arm_set(fd, op);
     }
     makeOp(op, kind, fd, 0, 0, token);   // zero length: readiness only, no transfer
     return issue(op);
@@ -200,9 +200,9 @@ pub fn armWrite(kq: int, fd: int, token: long): int { return armZeroByte(kq, fd,
 
 // Release the arm record when interest is dropped, or the op leaks for the fd's lifetime.
 fn dropArm(fd: int): void {
-    let op = nova_iocp_arm_get(fd);
+    let op = nova_reactor_arm_get(fd);
     if (op != (0 as long)) {
-        nova_iocp_arm_set(fd, 0);
+        nova_reactor_arm_set(fd, 0);
         nova_op_free(op);
     }
 }

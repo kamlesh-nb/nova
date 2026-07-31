@@ -83,6 +83,7 @@ pub fn submit(kq: int, op: long): int {
 // is also where the registration memo is cleared — otherwise a recycled fd number would be MOD'd
 // before it was ever ADDed, which fails with ENOENT.
 pub fn cancelRead(kq: int, fd: int): void {
+    if (usingUring()) { dropArm(fd); return; }
     epoll.ctlDel(kq, fd);
     nova_epoll_clear_registered(fd);
 }
@@ -99,15 +100,95 @@ pub fn connectIsSubmitted(): bool { return usingUring(); }
 
 pub const EVENT_SIZE: int = 12;   // sizeof packed struct epoll_event (x86_64)
 
-pub fn armRead(kq: int, fd: int, token: long): int { return epoll.ctlAdd(kq, fd, epoll.EPOLLIN, token); }
+// io_uring is a proactor and has no readiness interest to register, so the readiness half of this
+// surface is emulated with a ZERO-BYTE receive/send: it completes exactly when the socket becomes
+// readable/writable and transfers nothing, making the completion the readiness edge. The arm record
+// must outlive the call, so one is kept per fd in the runtime (shared with the IOCP backend, which
+// needs the identical trick).
+extern("c") fn nova_reactor_arm_get(fd: int): long;
+extern("c") fn nova_reactor_arm_set(fd: int, op: long): void;
+extern("c") fn nova_op_alloc(size: long): long;
+extern("c") fn nova_op_free(op: long): void;
+
+fn armZeroByte(fd: int, token: long, kind: int): int {
+    if (fd < 0) { return -1; }
+    let op = nova_reactor_arm_get(fd);
+    if (op == (0 as long)) {
+        op = nova_op_alloc(OP_SIZE as long);
+        nova_reactor_arm_set(fd, op);
+    }
+    makeOp(op, kind, fd, 0, 0, token);   // zero length: readiness only, no transfer
+    return stageUring(nova_uring_current(), op);
+}
+
+fn dropArm(fd: int): void {
+    let op = nova_reactor_arm_get(fd);
+    if (op != (0 as long)) {
+        nova_reactor_arm_set(fd, 0);
+        nova_op_free(op);
+    }
+}
+
+pub fn armRead(kq: int, fd: int, token: long): int {
+    if (usingUring()) { return armZeroByte(fd, token, OP_RECV); }
+    return epoll.ctlAdd(kq, fd, epoll.EPOLLIN, token);
+}
 pub fn armWrite(kq: int, fd: int, token: long): int {
+    if (usingUring()) { return armZeroByte(fd, token, OP_SEND); }
     return epoll.ctlAdd(kq, fd, epoll.EPOLLOUT | epoll.EPOLLONESHOT, token);
 }
-pub fn cancelWrite(kq: int, fd: int): void { epoll.ctlDel(kq, fd); }
+pub fn cancelWrite(kq: int, fd: int): void {
+    if (usingUring()) { dropArm(fd); return; }
+    epoll.ctlDel(kq, fd);
+}
+
+// A uring "event" slot reuses the 12 bytes an epoll_event occupies: user_data (8) then res (4).
+const URING_EV_DATA_OFF: int = 0;
+const URING_EV_RES_OFF: int = 8;
+
+// Drain completions into eventBuf in that slot layout, so ev* below can read either backend.
+fn uringWaitReady(eventBuf: long, maxEvents: int): int {
+    let ring = nova_uring_current();
+    if (ring == (0 as long)) { return 0; }
+    nova_uring_submit_and_wait(ring, 1);
+    let ready = nova_uring_cq_ready(ring);
+    let n = if (ready > maxEvents) maxEvents else ready;
+    let ud = bytes.alloc(8);
+    let res = bytes.alloc(4);
+    let i = 0;
+    while (i < n) {
+        nova_uring_peek(ring, i, ud, res);
+        let slot = eventBuf + ((i * epoll.EPOLL_EVENT_SIZE) as long);
+        bytes.write_ptr(slot, URING_EV_DATA_OFF, bytes.read_ptr(ud, 0));
+        bytes.write_i32(slot, URING_EV_RES_OFF, bytes.read_i32(res, 0));
+        i = i + 1;
+    }
+    bytes.free(ud);
+    bytes.free(res);
+    if (ready > 0) { nova_uring_advance(ring, ready); }
+    return n;
+}
+
 pub fn waitReady(kq: int, eventBuf: long, maxEvents: int, timeoutMs: int): int {
+    if (usingUring()) { return uringWaitReady(eventBuf, maxEvents); }
     return epoll.epoll_wait(kq, eventBuf, maxEvents, timeoutMs);
 }
-pub fn evFd(eventBuf: long, i: int): int { return epoll.evData(eventBuf, i) as int; }
+
+// The raw data word of entry i, whichever backend produced it.
+fn evRaw(eventBuf: long, i: int): long {
+    if (usingUring()) {
+        return bytes.read_ptr(eventBuf + ((i * epoll.EPOLL_EVENT_SIZE) as long), URING_EV_DATA_OFF);
+    }
+    return epoll.evData(eventBuf, i);
+}
+
+pub fn evFd(eventBuf: long, i: int): int {
+    let d = evRaw(eventBuf, i);
+    // On uring the word is the arm op record, so the fd is read out of it; on epoll the low-level
+    // readiness surface arms with the fd as its own token, so the word IS the fd.
+    if (usingUring()) { return if (d != (0 as long)) opFd(d) else -1; }
+    return d as int;
+}
 
 // The runtime tags a timer fire in the data word (epoll_event carries no fd, so a timerfd fire is
 // otherwise indistinguishable from a socket becoming readable) and reports a wake as 0. Routing
@@ -172,16 +253,24 @@ fn uringPrep(ring: long, op: long): int {
     return -1;
 }
 pub fn evToken(eventBuf: long, i: int): long {
-    return nova_reactor_event_token(epoll.evData(eventBuf, i));
+    let d = evRaw(eventBuf, i);
+    let tok = nova_reactor_event_token(d);
+    // A runtime-posted timer/wake reports itself by changing under untagging; anything else on uring
+    // is an arm op record, whose stored token is what the caller registered.
+    if (usingUring() && d == tok && d != (0 as long)) { return opToken(d); }
+    return tok;
 }
 // kqueue puts the readable byte count in the event; epoll does not, so it is queried. The data word
 // is the fd here for the same reason evFd treats it as one — the low-level readiness surface arms
 // with the fd as its own token.
 extern("c") fn nova_fionread(fd: int): long;
+// A zero-byte readiness completion transfers nothing, so the count comes from the socket either way.
 pub fn evBytes(eventBuf: long, i: int): long {
-    return nova_fionread(epoll.evData(eventBuf, i) as int);
+    return nova_fionread(evFd(eventBuf, i));
 }
 pub fn evEof(eventBuf: long, i: int): bool {
+    // uring has no hangup flag: a readable socket with nothing pending is the peer's shutdown.
+    if (usingUring()) { return evBytes(eventBuf, i) == (0 as long); }
     return (epoll.evEvents(eventBuf, i) & (epoll.EPOLLHUP | epoll.EPOLLRDHUP)) != 0;
 }
 // epoll has no filter identifier, only an events bitmask — but callers written against kqueue test
