@@ -2,6 +2,8 @@
 // (open/read/write/lseek/close, mkdir/rmdir/rename, stat/access, opendir/readdir/closedir),
 // with no C stdio and no nova_file_*/nova_dir_* runtime code. Exercises the whole surface:
 // text round trip, the fd handle API, and directory create/list/rename.
+// Paths come from dir.Dir.tempDir() rather than a hardcoded "/tmp" so the case is target-neutral
+// (Windows has no /tmp; Win32 would resolve a leading "/" against the current drive root).
 import io.file;
 import io.dir;
 import assert;
@@ -9,7 +11,7 @@ import bytes;
 
 @test
 fn text_roundtrip(): void {
-    let path = "/tmp/nova_c211_text.txt";
+    let path = dir.Dir.tempDir() + "/nova_c211_text.txt";
     file.File.writeText(path, "hello nova m5");
     assert.isTrue(file.File.exists(path));
     assert.equalStr(file.File.readText(path), "hello nova m5");
@@ -20,7 +22,7 @@ fn text_roundtrip(): void {
 
 @test
 fn fd_handle_api(): void {
-    let path = "/tmp/nova_c211_handle.txt";
+    let path = dir.Dir.tempDir() + "/nova_c211_handle.txt";
     let f = file.File.open(path, "w");
     assert.equalInt(f.writeString("abcdef"), 6);
     f.close();
@@ -36,7 +38,7 @@ fn fd_handle_api(): void {
 
 @test
 fn seek_and_tell(): void {
-    let path = "/tmp/nova_c211_seek.txt";
+    let path = dir.Dir.tempDir() + "/nova_c211_seek.txt";
     let f = file.File.open(path, "w");
     f.writeString("0123456789");
     f.close();
@@ -53,23 +55,23 @@ fn seek_and_tell(): void {
 
 @test
 fn dir_create_list_rename(): void {
-    let base = "/tmp/nova_c211_dir";
+    let base = dir.Dir.tempDir() + "/nova_c211_dir";
     dir.Dir.create(base, 493);
     assert.isTrue(dir.Dir.exists(base));
     assert.isTrue(dir.Dir.isDir(base));
-    assert.isFalse(dir.Dir.isDir("/tmp/nova_c211_dir/nope"));
+    assert.isFalse(dir.Dir.isDir(base + "/nope"));
 
-    file.File.writeText("/tmp/nova_c211_dir/a.txt", "a");
-    file.File.writeText("/tmp/nova_c211_dir/b.txt", "b");
+    file.File.writeText(base + "/a.txt", "a");
+    file.File.writeText(base + "/b.txt", "b");
 
     let d = dir.Dir.open(base);
     let entries = d.entries();
     d.close();
     assert.gte(entries.size(), 2);
 
-    dir.Dir.rename("/tmp/nova_c211_dir/a.txt", "/tmp/nova_c211_dir/c.txt");
-    assert.isTrue(file.File.exists("/tmp/nova_c211_dir/c.txt"));
-    assert.isFalse(file.File.exists("/tmp/nova_c211_dir/a.txt"));
+    dir.Dir.rename(base + "/a.txt", base + "/c.txt");
+    assert.isTrue(file.File.exists(base + "/c.txt"));
+    assert.isFalse(file.File.exists(base + "/a.txt"));
 }
 
 @test

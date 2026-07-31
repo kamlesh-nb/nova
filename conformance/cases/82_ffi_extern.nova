@@ -5,7 +5,10 @@
 import assert;
 
 extern("c") fn abs(x: int): int;
-extern("c") fn labs(x: long): long;
+// llabs, not labs: C `long` is 64-bit on LP64 (macOS/Linux) but 32-bit on Windows (LLP64), so
+// labs would truncate here and prove the opposite of what this case asserts. `long long` is
+// 64-bit on every target, which is what Nova's `long` maps to.
+extern("c") fn llabs(x: long): long;
 extern("c") fn malloc(n: long): ptr;
 extern("c") fn memset(p: ptr, c: int, n: long): ptr;
 extern("c") fn free(p: ptr): void;
@@ -25,7 +28,7 @@ fn test_ffi_scalar(): void {
     assert.equalInt(abs(-5), 5);
     assert.equalInt(abs(123), 123);
     // 64-bit long crosses without truncation.
-    assert.isTrue(labs(-9000000000) == 9000000000);
+    assert.isTrue(llabs(-9000000000) == 9000000000);
 }
 
 @test

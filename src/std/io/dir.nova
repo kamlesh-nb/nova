@@ -124,4 +124,47 @@ pub struct Dir {
         bytes.free(cp);
         return r;
     }
+
+    // A writable temporary directory, without a trailing separator: TMPDIR (the POSIX convention,
+    // always set on macOS), then TEMP/TMP (always set on Windows), then the POSIX default. Callers
+    // build paths from this instead of hardcoding "/tmp", which does not exist on Windows — Win32
+    // resolves a leading "/" against the current drive root, so "/tmp/x" silently means "C:\tmp\x".
+    pub fn tempDir(): string {
+        let t = envDir("TMPDIR");
+        if (t.length > 0) { return t; }
+        t = envDir("TEMP");
+        if (t.length > 0) { return t; }
+        t = envDir("TMP");
+        if (t.length > 0) { return t; }
+        return "/tmp";
+    }
+}
+
+// One environment variable as a Nova string, with any trailing '/' or '\' trimmed so callers can
+// always join with a single separator. "" when unset.
+fn envDir(name: string): string {
+    let cp = sys.cstr(name);
+    let v = sys.getenv(cp);
+    bytes.free(cp);
+    if (v == 0) {
+        return "";
+    }
+
+    let clen = 0;
+    while (bytes.read_byte(v, clen) != 0) {
+        clen = clen + 1;
+    }
+    while (clen > 0) {
+        let last = bytes.read_byte(v, clen - 1);
+        if (last != 47 && last != 92) { break; }   // '/' '\'
+        clen = clen - 1;
+    }
+
+    let out = allocator.globalAllocator().alloc(clen);
+    let i = 0;
+    while (i < clen) {
+        bytes.write_byte(out, i, bytes.read_byte(v, i));
+        i = i + 1;
+    }
+    return out as string;
 }

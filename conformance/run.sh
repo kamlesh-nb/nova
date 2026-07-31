@@ -168,6 +168,20 @@ classify_failure() {
   local out="$1" code="$2"
   if printf '%s' "$out" | grep -q "terminated abnormally"; then
     echo "COMPILED-THEN-CRASHED"     # the check is NOT firing; this is the bug
+  elif printf '%s' "$out" | grep -q "Running [0-9]* test(s)" \
+       && ! printf '%s' "$out" | grep -q "Results: .* passed"; then
+    # Same verdict, reached without signals — required on Windows, harmless elsewhere.
+    # Windows has no SIGSEGV: a crashing test process still reports `.exited`, carrying the
+    # NTSTATUS exception code (0xC0000005 = access violation), and that code is truncated to
+    # 8 bits before `nova test` sees it — so a segfault prints "Test suite FAILED (exit code
+    # 5)", which no exit code alone can tell apart from an ordinary failure. The branch above
+    # therefore never fires there, and a compile-and-crash would masquerade as a valid
+    # rejection — exactly the failure this self-test exists to catch.
+    #
+    # What IS unambiguous on every platform: the suite announced "Running N test(s)" and then
+    # never printed its "Results:" summary, i.e. the process died mid-run. Keyed on that
+    # instead of on the exit status.
+    echo "COMPILED-THEN-CRASHED"
   elif [[ $code -eq 0 ]]; then
     echo "COMPILED-AND-RAN"          # the check is NOT firing
   elif printf '%s' "$out" | grep -q "in main (nova)"; then
