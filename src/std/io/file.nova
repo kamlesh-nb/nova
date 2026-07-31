@@ -157,15 +157,15 @@ fn openFd(path: string, mode: string): int {
     if (mode == "r") {
         flags = sys.O_RDONLY;
     } else if (mode == "w") {
-        flags = sys.O_WRONLY | sys.O_CREAT | sys.O_TRUNC;
+        flags = sys.O_WRONLY | sys.O_CREAT() | sys.O_TRUNC();
     } else if (mode == "a") {
-        flags = sys.O_WRONLY | sys.O_CREAT | sys.O_APPEND;
+        flags = sys.O_WRONLY | sys.O_CREAT() | sys.O_APPEND();
     } else if (mode == "r+") {
         flags = sys.O_RDWR;
     } else if (mode == "w+") {
-        flags = sys.O_RDWR | sys.O_CREAT | sys.O_TRUNC;
+        flags = sys.O_RDWR | sys.O_CREAT() | sys.O_TRUNC();
     } else if (mode == "a+") {
-        flags = sys.O_RDWR | sys.O_CREAT | sys.O_APPEND;
+        flags = sys.O_RDWR | sys.O_CREAT() | sys.O_APPEND();
     }
     let cp = sys.cstr(path);
     let fd = sys.nova_open(cp, flags, 420);

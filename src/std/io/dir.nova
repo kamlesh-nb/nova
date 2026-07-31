@@ -32,7 +32,7 @@ pub struct Dir {
 
         // struct dirent: where the NUL-terminated d_name starts differs by kernel (21 on macOS/BSD,
         // 19 on Linux), so the offset comes from os/sys's per-OS seam rather than being hardcoded.
-        let nameOff = sys.DIRENT_NAME_OFF;
+        let nameOff = sys.DIRENT_NAME_OFF();
         let clen = 0;
         while (bytes.read_byte(ent, nameOff + clen) != 0) {
             clen = clen + 1;
