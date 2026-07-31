@@ -17,17 +17,33 @@ import os.socket;
 import os.winsock;
 import os.windows;
 
+// Reserved completion keys, posted by the C runtime rather than produced by an I/O completion.
+// These MUST match NOVA_WAKE_KEY / NOVA_TIMER_KEY in src/runtime/concurrency.cpp: a real I/O
+// completion carries the key its handle was associated with (the fd, see `associate`) and a non-null
+// lpOverlapped pointing at the op record, so negative sentinels cannot collide with one.
+pub const WAKE_KEY: long = -1;    // cross-reactor wake (PostQueuedCompletionStatus)
+pub const TIMER_KEY: long = -2;   // reactor timer fire; lpOverlapped IS the coroutine handle
+
+// Slots in the Poller's association memo (see ensureAssociated). A power of two so the modulo is
+// cheap; collisions only cost a redundant, harmless re-association.
+const ASSOC_SLOTS: int = 256;
+
 // Op kinds.
 pub const OP_RECV: int = 0;
 pub const OP_SEND: int = 1;
 pub const OP_ACCEPT: int = 2;
 pub const OP_CONNECT: int = 3;
 
-// In-flight op record (96 bytes). Prefixed by an OVERLAPPED so the completion's lpOverlapped == op addr.
+// In-flight op record. Prefixed by an OVERLAPPED so the completion's lpOverlapped == op addr.
 //   [0..32) OVERLAPPED (zeroed per submit)
 //   [32] kind i32   [36] fd i32   [40] buf ptr   [48] len i32   [52] done i32   [56] token ptr
 //   [64] result i64   [72] WSABUF { [72] len i32, [80] buf ptr }   [88] flags i32 (lpFlags scratch)
-pub const OP_SIZE: int = 96;
+// Accept-only tail, because AcceptEx (unlike accept()) needs both to exist before the call:
+//   [96] accepted socket i32   [100] fixed-up i32   [104..168) AcceptEx address output buffer
+pub const OP_SIZE: int = 176;
+const OP_ACCEPTED_OFF: int = 96;
+const OP_ACCEPT_FIXED_OFF: int = 100;
+const OP_ACCEPT_ADDR_OFF: int = 104;
 
 pub fn makeOp(op: long, kind: int, fd: int, buf: long, len: int, token: long): void {
     bytes.write_ptr(op, 0, 0);  bytes.write_ptr(op, 8, 0);
@@ -46,11 +62,51 @@ pub fn opBuf(op: long): long { return bytes.read_ptr(op, 40); }
 pub fn opLen(op: long): int { return bytes.read_i32(op, 48) as int; }
 pub fn opDone(op: long): int { return bytes.read_i32(op, 52) as int; }
 pub fn opToken(op: long): long { return bytes.read_ptr(op, 56); }
-pub fn opResult(op: long): int { return bytes.read_ptr(op, 64) as int; }
+// For most ops this is the completion's byte count. An accept op is different: the useful result is
+// the socket AcceptEx was given up front, and Windows requires SO_UPDATE_ACCEPT_CONTEXT before that
+// socket behaves like one returned by accept(). Both are handled here, on the first read after the
+// completion — the earliest point Nova code runs on EITHER driver, since the C reactor loop resumes
+// the coroutine directly and cannot call back into Nova.
+pub fn opResult(op: long): int {
+    if (opKind(op) == OP_ACCEPT) { return finishAccept(op); }
+    return bytes.read_ptr(op, 64) as int;
+}
+
+fn finishAccept(op: long): int {
+    let a = bytes.read_i32(op, OP_ACCEPTED_OFF) as int;
+    if (a <= 0) { return -1; }
+    if (bytes.read_i32(op, OP_ACCEPT_FIXED_OFF) != 0) { return a; }
+    bytes.write_i32(op, OP_ACCEPT_FIXED_OFF, 1);
+
+    // OVERLAPPED.Internal (offset 0) carries the NTSTATUS; anything but 0 means the accept failed,
+    // in which case the pre-created socket has to be reclaimed or it leaks.
+    if (bytes.read_ptr(op, 0) != (0 as long)) {
+        winsock.closesocket(a as long);
+        bytes.write_i32(op, OP_ACCEPTED_OFF, -1);
+        return -1;
+    }
+
+    let lf = bytes.alloc(8);
+    bytes.write_ptr(lf, 0, opFd(op) as long);
+    winsock.setsockopt(a as long, winsock.SOL_SOCKET, winsock.SO_UPDATE_ACCEPT_CONTEXT, lf, 8);
+    bytes.free(lf);
+    socket.setNonBlock(a);
+    return a;
+}
 pub fn setOpResult(op: long, r: int): void { bytes.write_ptr(op, 64, r as long); bytes.write_i32(op, 52, 1); }
 
-// Zero the OVERLAPPED and issue the overlapped I/O for an op. Returns 0 (queued or immediate; the
-// completion arrives on the port either way). accept/connect require AcceptEx/ConnectEx (follow-on).
+// An overlapped call that could not complete inline reports SOCKET_ERROR with WSA_IO_PENDING. That
+// is SUCCESS for a proactor — the completion will arrive on the port — so it maps to 0 like an
+// inline completion (which is also still posted to the port).
+const WSA_IO_PENDING: int = 997;
+
+fn queued(rc: int): int {
+    if (rc == 0) { return 0; }
+    return if (winsock.WSAGetLastError() == WSA_IO_PENDING) 0 else -1;
+}
+
+// Zero the OVERLAPPED and issue the overlapped I/O for an op. accept/connect require AcceptEx /
+// ConnectEx (follow-on). The socket must already be associated with the port — see ensureAssociated.
 fn issue(op: long): int {
     bytes.write_ptr(op, 0, 0);  bytes.write_ptr(op, 8, 0);
     bytes.write_ptr(op, 16, 0); bytes.write_ptr(op, 24, 0);
@@ -59,11 +115,26 @@ fn issue(op: long): int {
     winsock.setWsaBuf(op + 72, opLen(op), opBuf(op));
     if (kind == OP_RECV) {
         bytes.write_i32(op, 88, 0);   // lpFlags scratch, must be non-null
-        return winsock.WSARecv(s, (op + 72) as ptr, 1, 0 as ptr, (op + 88) as ptr, op as ptr, 0);
+        return queued(winsock.WSARecv(s, (op + 72) as ptr, 1, 0 as ptr, (op + 88) as ptr, op as ptr, 0));
     } else if (kind == OP_SEND) {
-        return winsock.WSASend(s, (op + 72) as ptr, 1, 0 as ptr, 0, op as ptr, 0);
+        return queued(winsock.WSASend(s, (op + 72) as ptr, 1, 0 as ptr, 0, op as ptr, 0));
     }
-    // OP_ACCEPT / OP_CONNECT: AcceptEx / ConnectEx wiring is a follow-on.
+    if (kind == OP_ACCEPT) {
+        // AcceptEx does not create the socket; it fills one you supply. Make it here and remember
+        // it, because the completion reports a byte count and NOT the accepted socket the way
+        // accept() returns one — opResult() hands this back instead (see finishAccept).
+        let a = winsock.socket(winsock.AF_INET, winsock.SOCK_STREAM, winsock.IPPROTO_TCP);
+        if (a < (0 as long)) { return -1; }
+        bytes.write_i32(op, OP_ACCEPTED_OFF, a as int as long);
+        bytes.write_i32(op, OP_ACCEPT_FIXED_OFF, 0);
+        return queued(winsock.AcceptEx(s, a, (op + (OP_ACCEPT_ADDR_OFF as long)) as ptr, 0,
+                                       winsock.ACCEPTEX_ADDRLEN, winsock.ACCEPTEX_ADDRLEN,
+                                       0 as ptr, op as ptr));
+    } else if (kind == OP_CONNECT) {
+        // The sockaddr travels in the op's buf/len slots (see CONNECT_IS_SUBMITTED); a proactor
+        // issues the connect itself rather than awaiting writability on one already started.
+        return winsock.nova_wsa_connectex(s, opBuf(op) as ptr, opLen(op), op as ptr);
+    }
     return -1;
 }
 
@@ -73,25 +144,70 @@ pub fn associate(port: long, fd: int): long {
     return windows.CreateIoCompletionPort(fd as long, port, fd as long, 0);
 }
 
-// submit free fn (reactorio path). The socket must already be associated with the reactor's port; this
-// only starts the overlapped op. The `kq` argument is unused on IOCP (the completion routes via the
-// socket's associated port, not a per-call handle).
-pub fn submit(kq: int, op: long): int { return issue(op); }
+// submit free fn (reactorio path). Unlike the Poller method this has no state to memoize in, so the
+// association is re-attempted on every submit; a repeat is rejected with ERROR_INVALID_PARAMETER and
+// ignored. Hoisting it to socket-registration time is the follow-on that removes the extra syscall.
+pub fn submit(kq: int, op: long): int {
+    let fd = opFd(op);
+    if (fd >= 0) { windows.CreateIoCompletionPort(fd as long, kq as long, fd as long, 0); }
+    return issue(op);
+}
 
 // IOCP has no per-fd readiness to cancel; CancelIoEx would be used for a true cancel (follow-on).
 pub fn cancelRead(kq: int, fd: int): void { }
 
-// --- backend-neutral readiness surface: IOCP is completion-only, so these are stubs. The low-level
-// readiness cases (192/194/195/210) are macOS-gated and never run here; these exist so net/reactor links.
+// --- backend-neutral readiness surface -----------------------------------------------------------
+// On IOCP there is only ONE queue: readiness and completion are the same port, so the draining half
+// of this surface (waitReady/ev*) is real and shares the completion path below. Only the ARMING half
+// has no analogue — "tell me when this fd is readable" is not a thing a proactor offers; work is
+// started with an overlapped op instead (see submit/issue). armRead/armWrite therefore stay no-ops,
+// so the low-level readiness cases (192/194/195) still need converting to the completion API, while
+// the timer (207) and cross-reactor wake (210) paths work here because both arrive as posted
+// completions.
+// A proactor ISSUES the connect (ConnectEx) as the submitted operation. The readiness backends
+// instead start a non-blocking connect() first and then await writability, a prologue that must be
+// skipped here: once connect() has been started, ConnectEx on the same socket fails.
+pub const CONNECT_IS_SUBMITTED: bool = true;
+
 pub const EVENT_SIZE: int = 32;   // OVERLAPPED_ENTRY, so the reactor's event buffer is sized for GQCSEx
 pub fn armRead(kq: int, fd: int, token: long): int { return 0; }
 pub fn armWrite(kq: int, fd: int, token: long): int { return 0; }
 pub fn cancelWrite(kq: int, fd: int): void { }
-pub fn waitReady(kq: int, eventBuf: long, maxEvents: int, timeoutMs: int): int { return 0; }
-pub fn evFd(eventBuf: long, i: int): int { return 0; }
-pub fn evToken(eventBuf: long, i: int): long { return 0 as long; }
-pub fn evBytes(eventBuf: long, i: int): long { return 0 as long; }
-pub fn evEof(eventBuf: long, i: int): bool { return false; }
+
+// Drain up to maxEvents completions into eventBuf. Same call the Poller makes; this is the free-
+// function form net/reactor's readiness path uses, which has the port and the buffer but no Poller.
+pub fn waitReady(kq: int, eventBuf: long, maxEvents: int, timeoutMs: int): int {
+    let removed = bytes.alloc(4);
+    bytes.write_i32(removed, 0, 0);
+    let ok = windows.GetQueuedCompletionStatusEx(kq as long, eventBuf as ptr, maxEvents, removed, timeoutMs, 0);
+    let n = if (ok != 0) (bytes.read_i32(removed, 0) as int) else 0;
+    bytes.free(removed);
+    return n;
+}
+
+// The coroutine to resume for entry i. Mirrors Poller.poll's dispatch: a timer post carries the
+// handle in lpOverlapped, a wake carries nothing, and an I/O completion carries the op record whose
+// byte count is written back before its token is returned.
+pub fn evToken(eventBuf: long, i: int): long {
+    let key = windows.entryKey(eventBuf, i);
+    let ov = windows.entryOverlapped(eventBuf, i);
+    if (key == TIMER_KEY) { return ov; }
+    if (key == WAKE_KEY) { return 0 as long; }
+    if (ov == (0 as long)) { return 0 as long; }
+    setOpResult(ov, windows.entryBytes(eventBuf, i));
+    return opToken(ov);
+}
+
+// `associate` keys each socket by its fd, so the completion key IS the fd for real I/O.
+pub fn evFd(eventBuf: long, i: int): int {
+    let key = windows.entryKey(eventBuf, i);
+    if (key == TIMER_KEY || key == WAKE_KEY) { return -1; }
+    return key as int;
+}
+
+pub fn evBytes(eventBuf: long, i: int): long { return windows.entryBytes(eventBuf, i) as long; }
+// A completed zero-byte read on a stream socket is the peer's orderly shutdown, as on POSIX.
+pub fn evEof(eventBuf: long, i: int): bool { return windows.entryBytes(eventBuf, i) == 0; }
 pub fn evFilterAt(eventBuf: long, i: int): int { return 0; }
 
 pub trait EventLoop {
@@ -109,6 +225,7 @@ pub struct Poller impl EventLoop {
     pub eventBuf: long,      // maxEvents * OVERLAPPED_ENTRY_SIZE, drained by GetQueuedCompletionStatusEx
     pub compBuf: long,       // maxEvents * 8: coroutine tokens to resume
     pub removedBuf: long,    // ULONG out-param for GQCSEx
+    pub assocBuf: long,      // ASSOC_SLOTS * 4: which fds are already joined to this port
     pub maxEvents: int,
     pub nComp: int,
 
@@ -120,12 +237,32 @@ pub struct Poller impl EventLoop {
         self.eventBuf = bytes.alloc(maxEvents * windows.OVERLAPPED_ENTRY_SIZE);
         self.compBuf = bytes.alloc(maxEvents * 8);
         self.removedBuf = bytes.alloc(4);
+        self.assocBuf = bytes.alloc(ASSOC_SLOTS * 4);
+        let i = 0;
+        while (i < ASSOC_SLOTS) { bytes.write_i32(self.assocBuf, i * 4, 0); i = i + 1; }
         self.nComp = 0;
     }
 
     fn ok(self: Poller): bool { return self.port != (0 as long); }
 
-    fn submit(self: Poller, op: long): int { return issue(op); }
+    // A socket must be joined to the completion port BEFORE its first overlapped op, or the
+    // completion is delivered nowhere and the op silently never finishes. Joining is one-time and
+    // permanent (a handle cannot be moved between ports), so the fds already done are memoized in a
+    // direct-mapped table: a hit costs one load, a miss or a collision costs one redundant
+    // CreateIoCompletionPort, which is rejected harmlessly. Bounded, unlike a growing set.
+    fn ensureAssociated(self: Poller, fd: int): void {
+        if (fd <= 0) { return; }
+        // Windows kernel handle values are multiples of 4, so shifting first spreads the slots.
+        let slot = ((fd / 4) % ASSOC_SLOTS) * 4;
+        if ((bytes.read_i32(self.assocBuf, slot) as int) == fd) { return; }
+        windows.CreateIoCompletionPort(fd as long, self.port, fd as long, 0);
+        bytes.write_i32(self.assocBuf, slot, fd as long);
+    }
+
+    fn submit(self: Poller, op: long): int {
+        self.ensureAssociated(opFd(op));
+        return issue(op);
+    }
 
     fn poll(self: Poller, timeoutMs: int): int {
         self.nComp = 0;
@@ -135,10 +272,20 @@ pub struct Poller impl EventLoop {
             let n = bytes.read_i32(self.removedBuf, 0) as int;
             let i = 0;
             while (i < n) {
-                let op = windows.entryOverlapped(self.eventBuf, i);
-                if (op != (0 as long)) {
-                    setOpResult(op, windows.entryBytes(self.eventBuf, i));
-                    bytes.write_ptr(self.compBuf, (self.nComp * 8) as long, opToken(op));
+                let key = windows.entryKey(self.eventBuf, i);
+                let ov = windows.entryOverlapped(self.eventBuf, i);
+                if (key == TIMER_KEY) {
+                    // A reactor timer fire posted by the runtime: lpOverlapped IS the coroutine
+                    // handle, not an op record, so it is resumed directly with no result to write.
+                    if (ov != (0 as long)) {
+                        bytes.write_ptr(self.compBuf, (self.nComp * 8) as long, ov);
+                        self.nComp = self.nComp + 1;
+                    }
+                } else if (key == WAKE_KEY) {
+                    // Cross-reactor wake: returning from the poll is the whole point of it.
+                } else if (ov != (0 as long)) {
+                    setOpResult(ov, windows.entryBytes(self.eventBuf, i));
+                    bytes.write_ptr(self.compBuf, (self.nComp * 8) as long, opToken(ov));
                     self.nComp = self.nComp + 1;
                 }
                 i = i + 1;
@@ -155,6 +302,7 @@ pub struct Poller impl EventLoop {
         if (self.eventBuf != 0) { bytes.free(self.eventBuf); self.eventBuf = 0; }
         if (self.compBuf != 0) { bytes.free(self.compBuf); self.compBuf = 0; }
         if (self.removedBuf != 0) { bytes.free(self.removedBuf); self.removedBuf = 0; }
+        if (self.assocBuf != 0) { bytes.free(self.assocBuf); self.assocBuf = 0; }
         if (self.port != (0 as long)) { windows.CloseHandle(self.port); self.port = 0; }
     }
 }

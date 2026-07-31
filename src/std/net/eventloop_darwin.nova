@@ -79,6 +79,11 @@ pub fn cancelRead(kq: int, fd: int): void {
 // --- backend-neutral readiness surface (kept for the low-level readiness cases 192/194/195/210) --------
 // The completion API above is the go-forward path; these thin wrappers let net/reactor stay free of any
 // direct kqueue/epoll dependency so it compiles on every target. On kqueue they are the raw kevent ops.
+// Readiness backend: connect() is STARTED with a non-blocking connect and the op then awaits
+// writability, so the submit is not itself the connect. The IOCP backend sets this true —
+// see net/eventloop_windows.
+pub const CONNECT_IS_SUBMITTED: bool = false;
+
 pub const EVENT_SIZE: int = 32;   // sizeof(struct kevent)
 
 pub fn armRead(kq: int, fd: int, token: long): int {

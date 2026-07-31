@@ -10,6 +10,7 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <mswsock.h>   // WSAID_CONNECTEX / LPFN_CONNECTEX, for nova_wsa_connectex below
 #pragma comment(lib, "ws2_32.lib")
 using socklen_t = int;
 static inline int nova_close_fd(int fd) { return ::closesocket(fd); }
@@ -409,5 +410,45 @@ const char *nova_fs_watcher_next_event(WatcherContext *ctx) {
 }
 void nova_fs_watcher_free_event(const char *ptr) { (void)ptr; }
 void nova_fs_watcher_close(WatcherContext *ctx) { (void)ctx; }
+
+#ifdef _WIN32
+// Overlapped connect for the IOCP reactor.
+//
+// This is the ONE piece of the Windows port that cannot be a Nova `extern("c")` binding, and the
+// reason is Winsock's own design rather than a preference: AcceptEx is a real export of mswsock.lib
+// and so binds by name, but ConnectEx is deliberately NOT exported — it is only reachable by asking
+// a socket for its address at runtime via WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER). Nova's FFI
+// binds named symbols and has no way to call a pointer obtained at runtime, so the WSAIoctl + the
+// indirect call are done here and exposed under a stable name that Nova CAN bind.
+//
+// The pointer is per-provider, not per-socket, so one resolution serves the process; the socket
+// argument to WSAIoctl is only used to pick the provider. Returns 0 when the connect is under way
+// (inline or pending — either way the completion lands on the port), -1 otherwise.
+int nova_wsa_connectex(long long s, void *addr, int addrlen, void *overlapped) {
+  static LPFN_CONNECTEX fn = nullptr;
+  if (!fn) {
+    GUID guid = WSAID_CONNECTEX;
+    DWORD got = 0;
+    if (::WSAIoctl((SOCKET)s, SIO_GET_EXTENSION_FUNCTION_POINTER, &guid, sizeof(guid), &fn,
+                   sizeof(fn), &got, nullptr, nullptr) == SOCKET_ERROR) {
+      return -1;
+    }
+  }
+  // ConnectEx requires an explicitly BOUND socket, unlike connect(). Binding to the wildcard
+  // address/port is what connect() does implicitly; a socket that is already bound just fails here
+  // harmlessly, so this needs no "have I bound it" bookkeeping.
+  struct sockaddr_in any;
+  std::memset(&any, 0, sizeof(any));
+  any.sin_family = AF_INET;
+  any.sin_addr.s_addr = INADDR_ANY;
+  any.sin_port = 0;
+  ::bind((SOCKET)s, (struct sockaddr *)&any, (int)sizeof(any));
+
+  BOOL ok = fn((SOCKET)s, (const struct sockaddr *)addr, addrlen, nullptr, 0, nullptr,
+               (LPOVERLAPPED)overlapped);
+  if (ok) return 0;
+  return (::WSAGetLastError() == WSA_IO_PENDING) ? 0 : -1;
+}
+#endif
 
 }

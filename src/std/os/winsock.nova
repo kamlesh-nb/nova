@@ -54,6 +54,26 @@ pub fn setWsaBuf(wb: ptr, len: int, buf: long): void {
 pub extern("c") fn WSARecv(s: long, buffers: ptr, bufferCount: int, lpBytesRecvd: ptr, lpFlags: ptr, lpOverlapped: ptr, completionRoutine: long): int;
 pub extern("c") fn WSASend(s: long, buffers: ptr, bufferCount: int, lpBytesSent: ptr, dwFlags: int, lpOverlapped: ptr, completionRoutine: long): int;
 
+// --- overlapped accept / connect (the proactor forms of accept(2) / connect(2)) -----------------
+// AcceptEx is a genuine export of mswsock.lib, so it binds by name like any other symbol. It needs
+// the accepted socket to EXIST first (unlike accept(), which creates one) and writes the local and
+// remote addresses into outBuf, which must hold localLen + remoteLen bytes — each at least
+// sizeof(sockaddr_in) + 16.
+pub extern("c") fn AcceptEx(listenSock: long, acceptSock: long, outBuf: ptr, recvDataLen: int,
+                            localLen: int, remoteLen: int, received: ptr, overlapped: ptr): int;
+pub const ACCEPTEX_ADDRLEN: int = 32;      // sizeof(sockaddr_in) + 16, per AcceptEx's contract
+pub const ACCEPTEX_BUFLEN: int = 64;       // local + remote, with recvDataLen 0 (no inline read)
+
+// ConnectEx is NOT exported by mswsock.lib — Winsock only hands it out through WSAIoctl as a
+// runtime function pointer, which Nova's FFI cannot call. nova_wsa_connectex (src/runtime/io.cpp)
+// does that one resolution and indirect call, and binds by name here like everything else.
+pub extern("c") fn nova_wsa_connectex(s: long, addr: ptr, addrlen: int, overlapped: ptr): int;
+
+// SO_UPDATE_ACCEPT_CONTEXT copies the listener's properties onto a socket produced by AcceptEx.
+// Without it the accepted socket is not fully "a socket returned by accept()" — getpeername,
+// getsockname and shutdown misbehave on it.
+pub const SO_UPDATE_ACCEPT_CONTEXT: int = 28683;   // 0x700B
+
 // WSAStartup wants MAKEWORD(2,2) = 0x0202 and a WSADATA out-buffer (~408 bytes on x64; 512 is safe).
 pub const WSADATA_SIZE: int = 512;
 pub const WINSOCK_VERSION: int = 514;    // 0x0202

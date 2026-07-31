@@ -8,6 +8,11 @@
 #include <unistd.h>      // close
 #define NOVA_HAVE_KQUEUE 1
 #endif
+#ifdef _WIN32
+#include <winsock2.h>    // MUST precede <windows.h> so the winsock v2 symbols win over v1
+#include <windows.h>     // IOCP: the completion-based reactor driver, the Windows peer of kqueue
+#define NOVA_HAVE_IOCP 1
+#endif
 #include <cstdio>
 #include <chrono>
 #include <condition_variable>
@@ -32,6 +37,108 @@ extern "C" void nova_reactor_cancel_timer(long long handle);
 // `long` on Linux x86_64 — declaring it `long long` here makes the two differ only in return type,
 // which C++ rejects outright ("functions that differ only in their return type cannot be overloaded").
 extern "C" int64_t nova_mono_ms(void);
+// nova_reactor_resume is defined further down; the IOCP support below (and only it) needs it
+// ahead of that definition.
+extern "C" long long nova_reactor_resume(long long handle);
+
+#if defined(NOVA_HAVE_IOCP)
+// --- IOCP reactor support (the Windows peer of the kqueue driver) ------------------------------
+//
+// Completion keys tell the three kinds of completion apart. A real I/O completion carries whatever
+// key its handle was associated with (net/eventloop_windows uses the fd) plus a non-null OVERLAPPED
+// that IS the op record; these two sentinels are reserved for completions the runtime posts itself.
+// net/eventloop_windows.nova's Poller.poll must agree with this — keep the two in step.
+const ULONG_PTR NOVA_WAKE_KEY = (ULONG_PTR)-1;    // cross-reactor wake; nothing to resume
+const ULONG_PTR NOVA_TIMER_KEY = (ULONG_PTR)-2;   // lpOverlapped IS the coroutine handle
+
+// Op-record offsets, mirroring the layout net/eventloop_windows.nova documents (its OVERLAPPED sits
+// at offset 0, so a completion's lpOverlapped is the record's address).
+const int NOVA_OP_DONE_OFF = 52;     // i32 flag: the op has completed
+const int NOVA_OP_TOKEN_OFF = 56;    // coroutine handle to resume
+const int NOVA_OP_RESULT_OFF = 64;   // i64 byte count / result
+
+// TIMERS. kqueue has EVFILT_TIMER, so an armed timeout arrives as an ordinary event on the same
+// queue the loop already waits on. A completion port has no timer source, so one is built: a
+// one-shot timer-queue timer whose callback does nothing but PostQueuedCompletionStatus. The fire
+// therefore arrives as a completion on the port, which means BOTH drivers see it — the C loop in
+// nova_run_root and the Nova-side Poller in net/eventloop_windows — with no shared state between
+// them. A thread-local list would only have worked for the first.
+struct NovaIocpTimer {
+    HANDLE timer;
+    HANDLE port;
+    long long handle;   // the coroutine to resume
+};
+std::mutex &g_iocp_timer_mu = *new std::mutex();
+std::unordered_map<long long, NovaIocpTimer *> &g_iocp_timers =
+    *new std::unordered_map<long long, NovaIocpTimer *>();
+
+// Runs on a threadpool thread: touches only fields set before the timer was created, so it needs no
+// lock. Posting is all it does; the resume happens on the reactor thread that drains the port.
+static VOID CALLBACK nova_iocp_timer_cb(PVOID param, BOOLEAN) {
+    NovaIocpTimer *t = reinterpret_cast<NovaIocpTimer *>(param);
+    PostQueuedCompletionStatus(t->port, 0, NOVA_TIMER_KEY,
+                               reinterpret_cast<LPOVERLAPPED>((uintptr_t)t->handle));
+}
+
+static void iocp_timer_cancel(long long handle) {
+    NovaIocpTimer *t = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_iocp_timer_mu);
+        auto it = g_iocp_timers.find(handle);
+        if (it == g_iocp_timers.end()) return;
+        t = it->second;
+        g_iocp_timers.erase(it);
+    }
+    // A null completion event means "do not block if the callback is running", which is required
+    // when cancelling from inside the dispatch of that timer's own fire.
+    if (t->timer) DeleteTimerQueueTimer(nullptr, t->timer, nullptr);
+    delete t;
+}
+
+static void iocp_timer_arm(long long handle, long long ms) {
+    // nova_reactor_current(), not g_current_kq: that thread_local is defined further down the file.
+    HANDLE port = (HANDLE)(intptr_t)nova_reactor_current();
+    if (!port || !handle) return;
+    iocp_timer_cancel(handle);   // re-arming replaces the pending deadline, as EV_ADD does
+
+    NovaIocpTimer *t = new NovaIocpTimer{nullptr, port, handle};
+    HANDLE h = nullptr;
+    if (!CreateTimerQueueTimer(&h, nullptr, nova_iocp_timer_cb, t,
+                               (DWORD)(ms < 0 ? 0 : ms), 0, WT_EXECUTEONLYONCE)) {
+        delete t;
+        return;
+    }
+    t->timer = h;
+    // Registered after creation, so a timer that fires immediately may post before it is visible
+    // here; the dispatch below then finds nothing to cancel and the next arm for this coroutine
+    // reclaims it. Harmless, and it keeps the callback lock-free.
+    std::lock_guard<std::mutex> lk(g_iocp_timer_mu);
+    g_iocp_timers[handle] = t;
+}
+
+// Turn one completion into a coroutine resume.
+static void iocp_dispatch(const OVERLAPPED_ENTRY &e) {
+    if (e.lpCompletionKey == NOVA_WAKE_KEY) return;   // the wake IS the loop returning
+
+    if (e.lpCompletionKey == NOVA_TIMER_KEY) {
+        long long h = (long long)(uintptr_t)e.lpOverlapped;
+        iocp_timer_cancel(h);   // one-shot: reclaim the timer object now that it has fired
+        if (h) nova_reactor_resume(h);
+        return;
+    }
+
+    // An I/O completion: IOCP is a proactor, so the byte count is already known and is written back
+    // into the op record before the coroutine resumes. Readiness backends have nothing to write.
+    char *op = reinterpret_cast<char *>(e.lpOverlapped);
+    if (!op) return;
+    *reinterpret_cast<int *>(op + NOVA_OP_DONE_OFF) = 1;
+    *reinterpret_cast<long long *>(op + NOVA_OP_RESULT_OFF) =
+        (long long)e.dwNumberOfBytesTransferred;
+    long long token = *reinterpret_cast<long long *>(op + NOVA_OP_TOKEN_OFF);
+    if (token) nova_reactor_resume(token);
+}
+#endif // NOVA_HAVE_IOCP
+
 
 extern "C" {
 
@@ -328,6 +435,8 @@ extern "C" void nova_reactor_wake_register(long long idx, long long kq) {
     EV_SET(&ev, 0, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, nullptr);
     kevent((int)kq, &ev, 1, nullptr, 0, nullptr);
 #endif
+    // IOCP needs no registration step: any thread may PostQueuedCompletionStatus to the port, so
+    // recording b->kq above is the whole setup.
 }
 
 // Post a handle to reactor `idx` from any thread, and wake its poll. Safe cross-thread: the inbox is
@@ -340,6 +449,11 @@ extern "C" void nova_reactor_post(long long idx, long long handle) {
     struct kevent ev;
     EV_SET(&ev, 0, EVFILT_USER, 0, NOTE_TRIGGER, 0, nullptr);
     kevent((int)b->kq, &ev, 1, nullptr, 0, nullptr);
+#elif defined(NOVA_HAVE_IOCP)
+    // PostQueuedCompletionStatus is the completion-model analogue of NOTE_TRIGGER: it queues a
+    // synthetic completion so a port blocked in GetQueuedCompletionStatusEx returns at once. The
+    // null OVERLAPPED is what marks it as a wake rather than finished I/O (see iocp_dispatch).
+    PostQueuedCompletionStatus((HANDLE)(intptr_t)b->kq, 0, NOVA_WAKE_KEY, nullptr);
 #endif
 }
 
@@ -361,6 +475,7 @@ extern "C" long long nova_evfilt_user(void) {
     return 0;
 #endif
 }
+
 
 // Coroutines reaped during the current reactor poll batch. A deadline timer and a read can both be
 // ready in the same kevent batch for the same coroutine; if the read is processed first the
@@ -586,8 +701,49 @@ void nova_run_root(long long root) {
                      reinterpret_cast<void *>(root));
         std::abort();
     }
+#elif defined(NOVA_HAVE_IOCP)
+    // Windows: same shape as the kqueue drive above, over a completion port. IOCP is a PROACTOR —
+    // a completion says "the I/O you asked for has finished, here is the byte count" rather than
+    // "this fd is ready" — so the driver writes that count back into the op record before resuming
+    // (iocp_dispatch), which is the step the readiness backends do not need. Timers have no kernel
+    // source here and are serviced from the driver's own list.
+    if (!g_rq) g_rq = new std::queue<long long>();
+    while (!g_rq->empty()) g_rq->pop();
+    g_reactor_mode = true;
+    g_deadline_active = false;
+    if (g_batch_reaped) g_batch_reaped->clear();
+
+    HANDLE port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0);
+    long long prev_port = g_current_kq;
+    nova_reactor_set_current((long long)(intptr_t)port);
+    ++g_run_depth;
+    nova_reactor_resume(root);   // kick past the initial suspend and drain the run queue
+    int idle = 0;
+    while (!raw_coro_done(root)) {
+        OVERLAPPED_ENTRY entries[64];
+        ULONG removed = 0;
+    BOOL ok = GetQueuedCompletionStatusEx(port, entries, 64, &removed, 20, FALSE);
+        if (ok && removed > 0) {
+            idle = 0;
+            nova_reactor_batch_begin();
+            for (ULONG i = 0; i < removed; ++i) iocp_dispatch(entries[i]);
+        } else if (++idle > 750) {
+            break;   // ~15s lost-wakeup cap, as on kqueue
+        }
+    }
+    --g_run_depth;
+    nova_reactor_set_current(prev_port);
+    CloseHandle(port);
+    g_reactor_mode = false;
+    if (!raw_coro_done(root)) {
+        std::fprintf(stderr,
+                     "nova: fatal — async root %p never completed (lost wakeup); "
+                     "refusing to read its unwritten result\n",
+                     reinterpret_cast<void *>(root));
+        std::abort();
+    }
 #else
-    // Non-kqueue platforms need the epoll reactor driver (a follow-on); no Asio fallback remains.
+    // Linux still needs the epoll reactor driver (a follow-on); no Asio fallback remains.
     (void)root;
     std::fprintf(stderr, "nova: fatal — no reactor driver on this platform (build the epoll backend)\n");
     std::abort();
@@ -677,6 +833,12 @@ static void nova_reactor_arm_timer(long long handle, long long ms) {
            (int64_t)(ms < 0 ? 0 : ms), (void *)(uintptr_t)handle);
     kevent(kq, &ev, 1, nullptr, 0, nullptr);
     NOVA_TRACE("reactor timer armed h=%lld ms=%lld kq=%d", handle, ms, kq);
+#elif defined(NOVA_HAVE_IOCP)
+    // No kernel timer source on a completion port; the driver's own list carries the deadline and
+    // clamps the next poll timeout to it (see iocp_timer_arm).
+    if (g_current_kq == 0) { NOVA_TRACE("reactor timer: no current port h=%lld", handle); return; }
+    iocp_timer_arm(handle, ms);
+    NOVA_TRACE("reactor timer armed h=%lld ms=%lld (iocp)", handle, ms);
 #else
     (void)handle; (void)ms;   // Linux epoll timerfd path plugs in with the epoll backend.
 #endif
@@ -696,6 +858,9 @@ extern "C" void nova_reactor_cancel_timer(long long handle) {
     struct kevent ev;
     EV_SET(&ev, (uintptr_t)handle, EVFILT_TIMER, EV_DELETE, 0, 0, nullptr);
     kevent(kq, &ev, 1, nullptr, 0, nullptr);   // ENOENT if already fired/absent, harmless
+#elif defined(NOVA_HAVE_IOCP)
+    if (!handle) return;
+    iocp_timer_cancel(handle);   // absent is fine (already fired), as with EV_DELETE's ENOENT
 #else
     (void)handle;
 #endif

@@ -18,6 +18,39 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # nothing. But leaks were previously not measured AT ALL by this harness, so any
 # regression was invisible. Baseline-gating catches regressions today and ratchets
 # down as leaks are fixed.
+# Per-case wall-clock cap. A case that BLOCKS (a reactor waiting on an event its backend never
+# delivers, say) used to stall the whole corpus with no output and no diagnosis — indistinguishable
+# from a slow machine, and fatal to an unattended run. Bounded here instead, so a hang is reported as
+# an ordinary failure and the run continues. macOS has no coreutils `timeout`, so this is the same
+# background-killer shape the wasm path already uses. Override with NOVA_CASE_TIMEOUT.
+CASE_TIMEOUT="${NOVA_CASE_TIMEOUT:-120}"
+HAVE_TIMEOUT="$(command -v timeout || true)"   # coreutils on Linux/Git-Bash; absent on stock macOS
+
+run_case() {
+  local rc out
+  if [[ -n "$HAVE_TIMEOUT" ]]; then
+    out="$("$HAVE_TIMEOUT" -k 5 "$CASE_TIMEOUT" "$NOVA" test "$1" 2>&1)"; rc=$?
+  else
+    # No coreutils timeout (stock macOS): kill from a background sleeper. The sleeper is NOT
+    # waited on — killing the subshell does not necessarily reap its `sleep` child, and waiting
+    # for it would then cost the full timeout on EVERY case, turning the guard into the stall it
+    # exists to prevent.
+    local tmp cpid kpid
+    tmp="$(mktemp -t novacase.XXXXXX)"
+    ( "$NOVA" test "$1" >"$tmp" 2>&1 ) & cpid=$!
+    ( sleep "$CASE_TIMEOUT"; kill -9 "$cpid" 2>/dev/null ) & kpid=$!
+    wait "$cpid" 2>/dev/null; rc=$?
+    kill "$kpid" 2>/dev/null
+    out="$(cat "$tmp" 2>/dev/null)"
+    rm -f "$tmp" 2>/dev/null
+  fi
+  printf '%s\n' "$out"
+  # 124 is timeout(1)'s verdict; a background kill surfaces as 128+SIGKILL. Either way, say so —
+  # otherwise a hang reads as an ordinary non-zero exit and gets misdiagnosed.
+  { [[ $rc -eq 124 ]] || [[ $rc -ge 128 ]]; } && echo "(timed out after ${CASE_TIMEOUT}s)"
+  return $rc
+}
+
 ARC_MODE=0
 ASAN_MODE=0
 TSAN_MODE=0
@@ -127,7 +160,7 @@ for f in "$HERE"/cases/*.nova; do
   fi
   # nova test emits DEBUG lines on stderr; capture everything, judge by exit code
   # and the "Results:" summary line.
-  out="$("$NOVA" test "$f" 2>&1)"
+  out="$(run_case "$f")"
   code=$?
   results="$(printf '%s\n' "$out" | grep -E '^Results:' | tail -1)"
   if [[ $code -eq 0 && "$results" == *"0 failed"* ]]; then

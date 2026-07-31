@@ -31,8 +31,20 @@ pub extern("c") fn nova_ffi_errno(): int;
 pub extern("c") fn nova_ffi_set_errno(v: int): void;
 pub extern("c") fn nova_set_nonblock(fd: int): int;
 
-// Sockets: ws2_32 exports these under the POSIX names with compatible signatures.
-pub extern("c") fn socket(domain: int, type_: int, protocol: int): int;
+// Sockets: ws2_32 exports these under the POSIX names with compatible signatures, so they bind
+// directly. The two ENTRY points are wrappers instead, because Winsock — unlike a POSIX socket
+// layer — must be initialised before its first use: without WSAStartup, socket() returns
+// INVALID_SOCKET and every call after it fails. POSIX has no such step, so callers do not make it,
+// and os/sys must therefore make it for them.
+pub fn socket(domain: int, type_: int, protocol: int): int {
+    winsock.startup();
+    return winsock.socket(domain, type_, protocol) as int;
+}
+pub fn getaddrinfo(node: ptr, service: ptr, hints: ptr, res: ptr): int {
+    winsock.startup();
+    return winsock.getaddrinfo(node, service, hints, res);
+}
+
 pub extern("c") fn bind(fd: int, addr: ptr, addrlen: int): int;
 pub extern("c") fn listen(fd: int, backlog: int): int;
 pub extern("c") fn accept(fd: int, addr: ptr, addrlen: ptr): int;
@@ -40,7 +52,6 @@ pub extern("c") fn connect(fd: int, addr: ptr, addrlen: int): int;
 pub extern("c") fn setsockopt(fd: int, level: int, optname: int, optval: ptr, optlen: int): int;
 pub extern("c") fn getsockopt(fd: int, level: int, optname: int, optval: ptr, optlen: ptr): int;
 pub extern("c") fn getsockname(fd: int, addr: ptr, addrlen: ptr): int;
-pub extern("c") fn getaddrinfo(node: ptr, service: ptr, hints: ptr, res: ptr): int;
 pub extern("c") fn freeaddrinfo(res: ptr): void;
 
 pub extern("c") fn getenv(name: ptr): ptr;

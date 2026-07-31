@@ -66,6 +66,11 @@ pub fn cancelRead(kq: int, fd: int): void {
 // These mirror the darwin wrappers so net/reactor stays backend-free. epoll carries no fd or byte count
 // in the event (only {events, data}), so evFd/evBytes are best-effort and the readiness cases that rely
 // on them run only on the macOS/kqueue gate; here they exist to link.
+// Readiness backend: connect() is STARTED with a non-blocking connect and the op then awaits
+// writability, so the submit is not itself the connect. The IOCP backend sets this true —
+// see net/eventloop_windows.
+pub const CONNECT_IS_SUBMITTED: bool = false;
+
 pub const EVENT_SIZE: int = 12;   // sizeof packed struct epoll_event (x86_64)
 
 pub fn armRead(kq: int, fd: int, token: long): int { return epoll.ctlAdd(kq, fd, epoll.EPOLLIN, token); }

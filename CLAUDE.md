@@ -33,80 +33,79 @@ NOVA_ARC_AUDIT=1 nova test f    # per-run ARC audit ("ARC audit: clean" or survi
 
 ## Working on Windows — read this first if the repo is cloned on a Windows host
 
-**Native Windows builds of the `nova` compiler are NOT wired up. Do not expect `zig build` to work on a
-bare Windows host — it will fail.** Two hard blockers:
-- `build.zig`'s install step runs `sh -c` with `rsync`/`mkdir -p` (around line 448), so it needs a Unix
-  shell + rsync on PATH (Git Bash / MSYS2) at minimum.
-- The static LLVM the compiler links is only configured for **macOS and Linux hosts**
-  (`build.zig` `configureLlvmLink`); there is **no Windows-host LLVM dist**, so the compiler cannot link
-  itself on Windows.
+**Native `zig build` on a Windows host now works, and the runtime is run-verified there** — see the
+status section below for the exact invocation, what was implemented, and what is still open. Both of
+the original blockers are gone: the install step no longer needs `sh`/`rsync` (there is a PowerShell
+branch), and the compiler links the LLVM **C API** dynamically instead of needing a Windows-host
+static-LLVM dist.
 
-**→ The comfortable path on a Windows machine is WSL2 (Ubuntu).** Clone the repo *inside* WSL, install
-**Zig 0.16**, and use the normal Linux flow — `zig build`, `nova <file>.nova`, `conformance/run.sh`,
-`conformance/run.sh --asan` all work there (Linux is a first-class, gated target). Develop in WSL; treat
-the Windows side as a *target*, not a dev host. (Before cloning, `git config --global core.autocrlf input`
-so the bash scripts and `.nova` sources keep LF.)
+**WSL2 (Ubuntu) remains a fine path too**, and is still the way to exercise the Linux gates. Clone
+the repo *inside* WSL, install **Zig 0.16**, and use the normal Linux flow. (Before cloning,
+`git config --global core.autocrlf input` so the bash scripts and `.nova` sources keep LF.) Note that
+`-Dstatic-llvm` currently 404s on the mirror, so point `NOVA_LLVM_PREFIX` at a system LLVM instead.
 
-**What "Windows support" currently means: cross-compilation, not native dev.** From macOS / Linux / WSL,
-`nova app.nova --target windows-x86_64` produces a real **PE32+ .exe** — the C++ runtime and the full
-reactor stack cross-compile and link (adds `-lws2_32 -lmswsock -lbcrypt`). This is **compile+link
-verified only**: runtime EXECUTION on Windows — especially the async reactor (the IOCP `Poller`,
-`nova_run_reactors` on Windows threads, socket→port association, `AcceptEx`/`ConnectEx`) — has **not**
-been run-verified (there is no Windows host in the loop). Non-async programs are the most likely to run;
-the reactor is the risky part. See `docs/design/cpp-runtime-retirement-plan.md` and the reactor design
-notes for exactly what is stubbed vs done.
+**Cross-compilation still works and is unchanged.** From macOS / Linux / WSL,
+`nova app.nova --target windows-x86_64` produces a real **PE32+ .exe** (adds
+`-lws2_32 -lmswsock -lbcrypt`). What changed is that Windows is no longer *only* a cross-target:
+execution — including the async reactor — is now exercised on a real host.
 
-**If asked to make `zig build` run natively on a Windows host** (not just cross-compile *to* Windows), the
-two unstarted pieces are: (1) replace the `sh`/`rsync` install step with a cross-platform copy (a small
-Zig `Step` or per-OS branch), and (2) add a Windows-host static-LLVM dist to `configureLlvmLink` (mirror
-the linux/macos entries). Until both exist, direct Windows-host development is not possible; use WSL.
+### Windows host status — native dev + runtime, as of 2026-07-31
 
-### Windows host TODO — the plan for when a real Windows 10 machine is available
+A Windows 10 host is now in the loop, and the port is **run-verified**, not just compile-verified.
+Corpus on Windows: see `conformance/windows-baseline.txt`.
 
-Everything below is **compile-verified (cross-compiles to a PE32+ .exe) but NOT run-verified** — there has
-been no Windows host in the loop. On a Windows 10 box, do these in order and verify each *live* (a real
-run + assert), not just a compile. Detail lives in `docs/design/cpp-runtime-retirement-plan.md` and the
-memory notes `nova-reactor-eventloop-iocp`, `nova-windows-runtime-port`, `nova-m14-max-ffi-reach`.
+**Native `zig build` on a Windows host works.** Requirements: Zig 0.16, and an LLVM install with
+`LLVM-C.dll` + `LLVM-C.lib` (LLVM 21 verified) pointed at by `NOVA_LLVM_PREFIX`, with its `bin/` on
+PATH for `clang++`/`llvm-ar`:
 
-1. **Get a native toolchain first.** Either finish the two native-`zig build` blockers above, OR build the
-   `nova` compiler under WSL and cross-compile programs to Windows, then run the `.exe` on the Windows
-   side. (You need runnable Windows binaries to test any of the below.)
+```powershell
+$env:NOVA_LLVM_PREFIX = 'C:/LLVM'; $env:PATH = 'C:\LLVM\bin;' + $env:PATH; zig build
+```
 
-2. **IOCP reactor runtime** (`src/std/net/eventloop_windows.nova` — the `Poller`). It cross-compiles and is
-   selected on Windows, but the runtime is unproven and these pieces are **stubbed / unfinished**:
-   - `nova_run_reactors` on the C side is kqueue/POSIX-oriented — needs a **Windows-threads** path
-     (`concurrency.cpp` is `#ifndef _WIN32`-guarded; the coroutine scheduler + thread spawn need a Windows
-     impl or verification).
-   - **socket→port association**: each socket must be `CreateIoCompletionPort`'d before overlapped I/O
-     (`eventloop_windows.associate`); reactorio does not call it yet — wire it in.
-   - **AcceptEx / ConnectEx**: `submit` returns -1 for `OP_ACCEPT`/`OP_CONNECT` today (only `WSARecv`/
-     `WSASend` are done). Implement them (they need `WSAIoctl` to fetch the function pointers).
-   - **int-kq vs 64-bit port HANDLE**: `Reactor.kq` is `int` but the IOCP port is a 64-bit `HANDLE`; the
-     `Poller` keeps the full-width `port` but the reactor's shared int field truncates it — reconcile.
-   - **Cross-reactor wake**: use `PostQueuedCompletionStatus` (the completion-model analogue of
-     EVFILT_USER / eventfd).
-   - **Test**: conformance reactor cases (192, 200-205, 209) + a live reactor echo/HTTP server + the
-     async HTTPS client, all run on Windows.
+Both original blockers are resolved: `build.zig` has a PowerShell install step (no sh/rsync), and
+the dynamic path links the LLVM **C API** rather than needing a static Windows LLVM dist. Two
+Windows-specific traps are handled and worth knowing about:
+- The LLVM.org Windows `LLVM-C.dll` ships a REDUCED target set (AArch64, ARM, BPF, NVPTX, RISCV,
+  WebAssembly, X86). Referencing an absent `LLVMInitialize<T>*` is a hard link error, not a runtime
+  no-op — `deps/llvm-zig/src/target.zig` filters the aggregate initializers to what is present.
+- The link path drives MSVC's `link.exe`: `/OPT:REF` not `--gc-sections`, the runtime's COFF object
+  not `-lnova_runtime` (link.exe cannot read llvm-ar's GNU archive), `-rtlib=compiler-rt` for the
+  128-bit helpers, and `-lc`/`-lm`/`-lpthread` dropped (MSVC folds them into its CRT).
 
-3. **Process management on Windows** (M14.1, `io.cpp` `nova_process_*`). The POSIX path is real; the
-   `#else` Windows path is **stubs returning -1**. Implement over `CreateProcessW` + `CreatePipe` +
-   `WaitForSingleObject` + `GetExitCodeProcess` + `TerminateProcess` (or, if M14.1 lands first, expose the
-   POSIX-neutral `os/proc` seam and add `os/proc_windows`). **Test**: `process.nova`'s spawn + stdin/stdout
-   round trip + wait + kill.
+**Windows syscalls are Nova over Win32 FFI**, mirroring how `os/socket_windows` sits over
+`os/winsock` — not C++ shims in the runtime. The target-conditional file rule (`targetSuffixedPath`)
+swaps the whole module, so shared callers are unchanged:
+- `os/winfs` + `os/sys_windows` — file/dir/env. MSVC's UCRT has no `<dirent.h>`, its `O_CREAT`/
+  `O_TRUNC` are NOT the macOS values `os/sys` declares, its `struct stat` puts `st_mode` elsewhere,
+  and `setenv` is absent — so this is a real reimplementation, not a thin alias.
+- `os/winproc` + `std/process_windows` — spawn/stdio/wait/kill over CreateProcessW + pipes.
+- IOCP reactor: `nova_run_root` in `concurrency.cpp` has a Windows branch (it was kqueue-only, so
+  EVERY async program aborted with "no reactor driver" — note this still applies to **Linux**).
 
-4. **File / dir on Windows** (currently NOT Windows-native). File/dir I/O is Nova over `os/sys`, which is
-   **POSIX-flavored** — on Windows it rides mingw's compat layer (`open`/`read`/`mkdir`/`dirent`), which
-   covers the basics but not long paths, UTF-16 names, or proper Windows semantics. First **verify** the
-   mingw path actually works at runtime (read/write a file, list a dir); if it falls short, add an
-   `os/fs_windows` split (mirror `os/socket_windows`) over `CreateFileW`/`ReadFile`/`WriteFile`/
-   `CreateDirectoryW`/`FindFirstFileW`/`FindNextFileW`. **Test**: `io/file` read/write + `io/dir` listing.
+Things that bite, recorded so they are not rediscovered:
+- **WSAStartup**: POSIX has no init step so callers do not make one. `os/sys_windows.socket` and
+  `socket_windows.getAddrInfo` initialise Winsock themselves; without that, `bind` and hostname
+  resolution fail while a numeric address appears to work.
+- **Timers**: IOCP has no `EVFILT_TIMER` equivalent. Deadlines use a one-shot timer-queue timer whose
+  callback only `PostQueuedCompletionStatus`es, so the fire arrives as a completion and BOTH drivers
+  (the C loop and the Nova-side `Poller`) see it. A thread-local list only serves the former.
+- **Association**: a socket must be `CreateIoCompletionPort`'d before its first overlapped op or the
+  completion is delivered nowhere and the op silently never finishes.
+- **ConnectEx** is the one piece that is NOT pure FFI, unavoidably: `AcceptEx` is a real mswsock.lib
+  export and binds by name, but ConnectEx is only reachable through
+  `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)` as a runtime pointer, and Nova FFI binds named
+  symbols only. `nova_wsa_connectex` (`io.cpp`) does that one resolution + indirect call.
+- `nova_run_reactors` did **not** need a Windows-threads path — it already uses `std::thread`.
+- `/tmp` is not a path on Windows (Win32 resolves a leading `/` against the current drive root); use
+  `dir.Dir.tempDir()`.
 
-5. **Then run the full corpus on Windows** (`conformance/run.sh` under Git Bash / MSYS) and record a
-   Windows baseline the way there is a `wasm-run-baseline.txt`.
-
-Order of dependence: (1) toolchain → then (4) file/dir + (3) process are independent and simplest to
-verify → (2) IOCP reactor is the largest and should be last. The linker already adds
-`-lws2_32 -lmswsock -lbcrypt`.
+**Still open on Windows:**
+1. **Readiness cases 192/194/195** — `armRead`/`armWrite` have no IOCP analogue (a proactor has no
+   "tell me when readable"). These need converting to the completion API, which the design notes
+   already plan; the draining half (`waitReady`/`ev*`) is implemented and shares the completion path.
+2. **`--asan` / `--arc` gates** are not wired on Windows (the install step skips those runtimes).
+3. **Linux still aborts in `nova_run_root`** — it needs the epoll driver, exactly as Windows needed
+   the IOCP one. Same shape; `NOVA_HAVE_IOCP` is the template.
 
 ## Layout
 

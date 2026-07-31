@@ -202,6 +202,26 @@ pub async fn reactorConnect(host: string, port: int, kq: int): ReactorStream {
     if (fd < 0) { return ReactorStream(-1, kq); }
     socket.setNonBlock(fd);
     let sa = socket.makeSockaddrIn(port, addr);
+
+    // A completion backend performs the connect AS the submitted operation (ConnectEx), so it must
+    // not be preceded by a non-blocking connect() — the socket would already have one in flight and
+    // the overlapped call would be rejected. The address therefore travels in the op's buf/len
+    // slots, which the readiness backends ignore for OP_CONNECT.
+    if (eventloop.CONNECT_IS_SUBMITTED) {
+        let cop = bytes.alloc(eventloop.OP_SIZE);
+        eventloop.makeOp(cop, eventloop.OP_CONNECT, fd, sa, 16, currentCoro());
+        if (eventloop.submit(kq, cop) != 0) {
+            bytes.free(cop); bytes.free(sa); socket.close(fd);
+            return ReactorStream(-1, kq);
+        }
+        coroSuspend();
+        let cres = eventloop.opResult(cop);
+        bytes.free(cop);
+        bytes.free(sa);
+        if (cres < 0) { socket.close(fd); return ReactorStream(-1, kq); }
+        return ReactorStream(fd, kq);
+    }
+
     let r = socket.connectSock(fd, sa, 16);
     bytes.free(sa);
     if (r != 0) {

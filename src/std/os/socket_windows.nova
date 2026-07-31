@@ -74,7 +74,13 @@ pub fn makeSockaddrIn(port: int, addrBE: long): ptr {
     bytes.write_i32(sa, 4, addrBE);
     return sa;
 }
-pub fn getAddrInfo(node: ptr, service: ptr, hints: ptr, res: ptr): int { return winsock.getaddrinfo(node, service, hints, res); }
+// Resolution is an ENTRY point: a caller resolves a hostname before creating any socket, so this may
+// be the first Winsock call in the process and must initialise it (newTcp cannot have done so yet).
+// Skipping this is why a numeric address worked while a name silently failed.
+pub fn getAddrInfo(node: ptr, service: ptr, hints: ptr, res: ptr): int {
+    winsock.startup();
+    return winsock.getaddrinfo(node, service, hints, res);
+}
 pub fn freeAddrInfo(res: ptr): void { winsock.freeaddrinfo(res); }
 
 // --- blocking (synchronous) socket layer (M14.2) — Windows over Winsock. Compile-verified only. --------
