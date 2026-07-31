@@ -7,6 +7,14 @@ const build_options = @import("build_options");
 extern fn nova_lld_link_macho(argv: [*]const [*:0]const u8, argc: c_int) c_int;
 extern fn nova_lld_link_wasm(argv: [*]const [*:0]const u8, argc: c_int) c_int;
 
+// Codegen builds its target machine with LLVMRelocDefault, which on ELF is Reloc::Static — the
+// object therefore carries absolute R_X86_64_32S relocations. Ubuntu's clang links -pie by default,
+// and a PIE image cannot hold those ("relocation R_X86_64_32S against `.text` can not be used when
+// making a PIE object"), so the link fails for any program whose layout produces one. Tell the
+// driver what codegen actually emitted. The alternative is a PIC target machine, which is a codegen
+// change affecting every target; this is the narrow, matching fix.
+const pie_flags: []const []const u8 = if (builtin.target.os.tag == .linux) &.{"-no-pie"} else &.{};
+
 const dead_strip_flag: []const u8 = switch (builtin.target.os.tag) {
     .macos => "-Wl,-dead_strip",
     // clang++ on Windows drives MSVC's link.exe, which does not understand --gc-sections
@@ -1935,6 +1943,7 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
     try test_clang_args.append(allocator, "-pthread");
 
     try test_clang_args.append(allocator, dead_strip_flag);
+    try test_clang_args.appendSlice(allocator, pie_flags);
     try test_clang_args.append(allocator, "-I.");
     try test_clang_args.append(allocator, shared_nova_arg);
     if (asan) {
@@ -2240,6 +2249,7 @@ fn compileProgram(
         try clang_args.append(allocator, "-std=c++20");
 
         try clang_args.append(allocator, dead_strip_flag);
+        try clang_args.appendSlice(allocator, pie_flags);
         if (target_triple_opt) |triple| {
             try clang_args.append(allocator, "-target");
             try clang_args.append(allocator, triple);
