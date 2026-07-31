@@ -153,8 +153,9 @@ pub fn submit(kq: int, op: long): int {
     return issue(op);
 }
 
-// IOCP has no per-fd readiness to cancel; CancelIoEx would be used for a true cancel (follow-on).
-pub fn cancelRead(kq: int, fd: int): void { }
+// Drops the zero-byte arm record. A pending overlapped op is left to complete on its own — the
+// socket is about to be closed, which cancels it in the kernel; CancelIoEx would be the explicit form.
+pub fn cancelRead(kq: int, fd: int): void { dropArm(fd); }
 
 // --- backend-neutral readiness surface -----------------------------------------------------------
 // On IOCP there is only ONE queue: readiness and completion are the same port, so the draining half
@@ -170,9 +171,42 @@ pub fn cancelRead(kq: int, fd: int): void { }
 pub fn connectIsSubmitted(): bool { return true; }
 
 pub const EVENT_SIZE: int = 32;   // OVERLAPPED_ENTRY, so the reactor's event buffer is sized for GQCSEx
-pub fn armRead(kq: int, fd: int, token: long): int { return 0; }
-pub fn armWrite(kq: int, fd: int, token: long): int { return 0; }
-pub fn cancelWrite(kq: int, fd: int): void { }
+
+// Readiness over a proactor, via a ZERO-BYTE receive. WSARecv with an empty buffer completes exactly
+// when data arrives and consumes none of it, so the completion is the readiness edge and the caller
+// then performs a normal read — which is what the readiness API promises. The op record has to
+// outlive the call, so one is kept per armed fd in the runtime (see nova_iocp_arm_get).
+extern("c") fn nova_iocp_arm_get(fd: int): long;
+extern("c") fn nova_iocp_arm_set(fd: int, op: long): void;
+extern("c") fn nova_op_alloc(size: long): long;
+extern("c") fn nova_op_free(op: long): void;
+
+fn armZeroByte(kq: int, fd: int, token: long, kind: int): int {
+    if (fd < 0) { return -1; }
+    // The socket must be joined to the port before any overlapped op, exactly as for real I/O.
+    windows.CreateIoCompletionPort(fd as long, kq as long, fd as long, 0);
+
+    let op = nova_iocp_arm_get(fd);
+    if (op == (0 as long)) {
+        op = nova_op_alloc(OP_SIZE as long);
+        nova_iocp_arm_set(fd, op);
+    }
+    makeOp(op, kind, fd, 0, 0, token);   // zero length: readiness only, no transfer
+    return issue(op);
+}
+
+pub fn armRead(kq: int, fd: int, token: long): int { return armZeroByte(kq, fd, token, OP_RECV); }
+pub fn armWrite(kq: int, fd: int, token: long): int { return armZeroByte(kq, fd, token, OP_SEND); }
+
+// Release the arm record when interest is dropped, or the op leaks for the fd's lifetime.
+fn dropArm(fd: int): void {
+    let op = nova_iocp_arm_get(fd);
+    if (op != (0 as long)) {
+        nova_iocp_arm_set(fd, 0);
+        nova_op_free(op);
+    }
+}
+pub fn cancelWrite(kq: int, fd: int): void { dropArm(fd); }
 
 // Drain up to maxEvents completions into eventBuf. Same call the Poller makes; this is the free-
 // function form net/reactor's readiness path uses, which has the port and the buffer but no Poller.
@@ -205,7 +239,21 @@ pub fn evFd(eventBuf: long, i: int): int {
     return key as int;
 }
 
-pub fn evBytes(eventBuf: long, i: int): long { return windows.entryBytes(eventBuf, i) as long; }
+// A zero-byte readiness completion transfers nothing, so the count comes from the socket itself
+// (kqueue reports it in the event; IOCP does not). FIONREAD is Winsock's spelling.
+const FIONREAD: long = 1074030207;   // 0x4004667F
+pub fn evBytes(eventBuf: long, i: int): long {
+    let n = windows.entryBytes(eventBuf, i) as long;
+    if (n > (0 as long)) { return n; }
+    let fd = evFd(eventBuf, i);
+    if (fd < 0) { return 0 as long; }
+    let cnt = bytes.alloc(4);
+    bytes.write_i32(cnt, 0, 0);
+    let r = winsock.ioctlsocket(fd as long, FIONREAD, cnt);
+    let avail = if (r == 0) (bytes.read_i32(cnt, 0) as long) else (0 as long);
+    bytes.free(cnt);
+    return avail;
+}
 // A completed zero-byte read on a stream socket is the peer's orderly shutdown, as on POSIX.
 pub fn evEof(eventBuf: long, i: int): bool { return windows.entryBytes(eventBuf, i) == 0; }
 pub fn evFilterAt(eventBuf: long, i: int): int { return 0; }

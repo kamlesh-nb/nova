@@ -313,6 +313,23 @@ static void iocp_timer_arm(long long handle, long long ms) {
     g_iocp_timers[handle] = t;
 }
 
+// --- readiness emulation over IOCP -----------------------------------------------------------
+// A proactor has no "tell me when this fd is readable". The standard way to get it anyway is a
+// ZERO-BYTE receive: WSARecv with an empty buffer completes precisely when data arrives, without
+// consuming any, so the completion IS the readiness edge and the caller then does a normal read.
+// Each armed fd needs an op record that outlives the call, so they are kept here, one per fd,
+// thread-local (a reactor worker owns its fds).
+thread_local std::unordered_map<int, long long> g_iocp_arms;
+
+extern "C" long long nova_iocp_arm_get(int fd) {
+    auto it = g_iocp_arms.find(fd);
+    return it == g_iocp_arms.end() ? 0 : it->second;
+}
+extern "C" void nova_iocp_arm_set(int fd, long long op) {
+    if (op) g_iocp_arms[fd] = op;
+    else g_iocp_arms.erase(fd);
+}
+
 // Turn one completion into a coroutine resume.
 static void iocp_dispatch(const OVERLAPPED_ENTRY &e) {
     if (e.lpCompletionKey == NOVA_WAKE_KEY) return;   // the wake IS the loop returning
