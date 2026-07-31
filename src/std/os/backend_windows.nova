@@ -4,3 +4,31 @@
 pub fn name(): string { return "iocp"; }
 pub const EVENT_SIZE: int = 32;          // sizeof(OVERLAPPED_ENTRY) on x64
 pub const COMPLETION_BASED: bool = true;
+
+// --- OS-varying ABI constants --------------------------------------------------------------------
+// os/sys is ONE shared implementation, but these values genuinely differ per kernel, and hardcoding
+// the macOS set (as os/sys did) silently corrupts every other target: open() gets the wrong creation
+// flags, mmap the wrong anonymous bit, and struct stat/dirent are read at the wrong offsets. They
+// live in this per-OS seam so the shared file stays target-neutral.
+
+// Windows does not use these POSIX numbers at all — os/sys_windows replaces the whole module and
+// goes to Win32 directly (CreateFileW's disposition instead of O_CREAT, VirtualAlloc instead of
+// mmap). They are declared so the seam has the same shape on every target; the values are the
+// Winsock ones where Winsock has an equivalent.
+pub const OPEN_CREAT: int = 256;        // _O_CREAT
+pub const OPEN_TRUNC: int = 512;        // _O_TRUNC
+pub const OPEN_APPEND: int = 8;         // _O_APPEND
+pub const OPEN_NONBLOCK: int = 0;       // no equivalent; sockets use ioctlsocket(FIONBIO)
+
+pub const MMAP_ANON: int = 0;         // no equivalent; VirtualAlloc takes no such flag
+
+pub const SOCKOPT_LEVEL: int = 65535;   // 0xffff
+pub const SOCKOPT_ERROR: int = 4103;      // 0x1007
+pub const SOCKOPT_REUSEADDR: int = 4;
+pub const SOCKOPT_REUSEPORT: int = 4;     // no SO_REUSEPORT; SO_REUSEADDR is the closest behaviour
+
+pub const STAT_MODE_OFFSET: int = 4;    // the layout os/sys_windows.stat() writes
+pub const DIRENT_NAME_OFFSET: int = 21; // the layout os/sys_windows.readdir() writes
+
+pub const ERR_AGAIN: int = 11;
+pub const ERR_INPROGRESS: int = 115;

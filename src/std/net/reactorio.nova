@@ -5,7 +5,7 @@
 // reactor's readiness (os/kqueue), with no Asio.
 //
 // The mechanism mirrors the reactor's connection loop: a non-blocking syscall is tried inline; on
-// EAGAIN the fd is registered with the reactor carrying `currentCoro()` as the readiness token, and
+// EAGAIN() the fd is registered with the reactor carrying `currentCoro()` as the readiness token, and
 // the coroutine suspends (coroSuspend). When the reactor polls that fd ready it resumes the
 // coroutine (nova_reactor_resume(token)), which retries the syscall. No thread is held while blocked.
 //
@@ -15,12 +15,13 @@
 
 import bytes;
 import os.socket;
+import os.backend;
 import net.eventloop;
 
-// errno values are platform-specific. macOS/BSD values here; Linux (EAGAIN=11, EINPROGRESS=115)
-// plugs in behind the same shape when the epoll backend is verified on Linux.
-pub const EAGAIN: int = 35;
-pub const EINPROGRESS: int = 36;
+// errno values are platform-specific (EAGAIN() is 35 on macOS but 11 on Linux), so they come from the
+// per-OS seam in os/backend rather than being pinned to one kernel here.
+pub fn EAGAIN(): int { return backend.ERR_AGAIN; }
+pub fn EINPROGRESS(): int { return backend.ERR_INPROGRESS; }
 
 // Parse a dotted-quad IPv4 string into the value to store in sin_addr with bytes.write_i32, i.e.
 // the four octets in ascending memory order (little-endian int): "127.0.0.1" -> 0x0100007F, whose
@@ -107,7 +108,7 @@ pub struct ReactorStream {
     }
 
     // Read up to `max` bytes into `buf`. Returns the byte count (0 on peer close/EOF), or -1 on a
-    // real error. Awaits readability on EAGAIN without holding a thread.
+    // real error. Awaits readability on EAGAIN() without holding a thread.
     pub async fn recvInto(self: ReactorStream, buf: long, max: int): int {
         // Completion model: submit a recv op carrying this coroutine as the token, suspend, and read the
         // byte count the loop filled in. The op record + buf are on this frame, so they outlive the op.
@@ -149,10 +150,10 @@ pub struct ReactorStream {
         return -2;
     }
 
-    // Write all `len` bytes from `buf`, awaiting writability on EAGAIN. Returns bytes sent, or -1.
+    // Write all `len` bytes from `buf`, awaiting writability on EAGAIN(). Returns bytes sent, or -1.
     pub async fn sendBuf(self: ReactorStream, buf: long, len: int): int {
         // Completion model: submit a send op per remaining chunk. The loop only completes a send once it
-        // has made progress (it re-arms on a spurious EAGAIN), so opResult is the bytes written (>0) or a
+        // has made progress (it re-arms on a spurious EAGAIN()), so opResult is the bytes written (>0) or a
         // real error; a partial write loops to submit the remainder.
         let sent = 0;
         while (sent < len) {
@@ -193,7 +194,7 @@ pub struct ReactorStream {
 }
 
 // Connect to a numeric IPv4 host and port on the reactor. The non-blocking connect returns
-// EINPROGRESS; we await writability, then read SO_ERROR to confirm. Returns a ReactorStream whose
+// EINPROGRESS(); we await writability, then read SO_ERROR to confirm. Returns a ReactorStream whose
 // fd is -1 on failure.
 pub async fn reactorConnect(host: string, port: int, kq: int): ReactorStream {
     let addr = resolveHost4(host);

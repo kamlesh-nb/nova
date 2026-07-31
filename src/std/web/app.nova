@@ -737,7 +737,7 @@ fn reactorWorkerBody(app: App, idx: int): void {
     let lfd = sys.socket(sys.AF_INET, sys.SOCK_STREAM, 0);
     let one = bytes.alloc(4);
     bytes.write_i32(one, 0, 1);
-    sys.setsockopt(lfd, sys.SOL_SOCKET, 4, one, 4);   // SO_REUSEADDR
+    sys.setsockopt(lfd, sys.SOL_SOCKET(), 4, one, 4);   // SO_REUSEADDR
     sys.setReusePort(lfd);
     bytes.free(one);
     let sa = sys.makeSockaddrIn(app.serverPort, 0);
@@ -782,7 +782,7 @@ pub fn runReactor(self: App, port: int): void {
     let lfd = sys.socket(sys.AF_INET, sys.SOCK_STREAM, 0);
     let one = bytes.alloc(4);
     bytes.write_i32(one, 0, 1);
-    sys.setsockopt(lfd, sys.SOL_SOCKET, 4, one, 4);   // SO_REUSEADDR
+    sys.setsockopt(lfd, sys.SOL_SOCKET(), 4, one, 4);   // SO_REUSEADDR
     bytes.free(one);
     let sa = sys.makeSockaddrIn(port, 0);
     if (sys.bind(lfd, sa, 16) != 0) {

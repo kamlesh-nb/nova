@@ -30,16 +30,18 @@ pub struct Dir {
             return undefined;
         }
 
-        // struct dirent: the NUL-terminated d_name starts at offset 21 on macOS/BSD.
+        // struct dirent: where the NUL-terminated d_name starts differs by kernel (21 on macOS/BSD,
+        // 19 on Linux), so the offset comes from os/sys's per-OS seam rather than being hardcoded.
+        let nameOff = sys.DIRENT_NAME_OFF();
         let clen = 0;
-        while (bytes.read_byte(ent, 21 + clen) != 0) {
+        while (bytes.read_byte(ent, nameOff + clen) != 0) {
             clen = clen + 1;
         }
 
         let buf = allocator.globalAllocator().alloc(clen);
         let i = 0;
         while (i < clen) {
-            bytes.write_byte(buf, i, bytes.read_byte(ent, 21 + i));
+            bytes.write_byte(buf, i, bytes.read_byte(ent, nameOff + i));
             i = i + 1;
         }
         return buf as string;
