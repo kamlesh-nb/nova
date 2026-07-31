@@ -36,3 +36,8 @@ pub const DIRENT_NAME_OFFSET: int = 21;
 // errno values used by the non-blocking socket paths.
 pub const ERR_AGAIN: int = 35;
 pub const ERR_INPROGRESS: int = 36;
+
+// struct addrinfo's ai_addr. macOS/BSD: ai_canonname at 24, ai_addr at 32.
+// Reading the wrong one yields ai_canonname, which is NULL for most lookups — so the bug presents
+// as a null dereference in hostname resolution rather than a wrong address.
+pub const ADDRINFO_ADDR_OFFSET: int = 32;

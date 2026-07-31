@@ -33,3 +33,8 @@ pub const DIRENT_NAME_OFFSET: int = 19;
 
 pub const ERR_AGAIN: int = 11;
 pub const ERR_INPROGRESS: int = 115;
+
+// struct addrinfo's ai_addr. Linux: ai_addr at 24, ai_canonname at 32 — the SWAP of macOS.
+// Reading the wrong one yields ai_canonname, which is NULL for most lookups — so the bug presents
+// as a null dereference in hostname resolution rather than a wrong address.
+pub const ADDRINFO_ADDR_OFFSET: int = 24;

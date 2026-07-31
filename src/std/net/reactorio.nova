@@ -93,8 +93,11 @@ pub fn resolveHost4(host: string): long {
     while (ai != 0 && addr == (-1 as long)) {
         let fam = bytes.read_i32(ai, 4) as int;
         if (fam == socket.AF_INET) {
-            let sa = bytes.read_ptr(ai, 32);       // ai_addr (macOS offset)
-            addr = bytes.read_i32(sa, 4) as long;  // sin_addr; write_i32 truncates the 4 bytes back
+            // ai_addr's offset differs by libc (32 on macOS/BSD, 24 on Linux, where 32 is
+            // ai_canonname instead), so it comes from the per-OS seam.
+            let sa = bytes.read_ptr(ai, backend.ADDRINFO_ADDR_OFFSET);
+            if (sa == 0) { ai = bytes.read_ptr(ai, 40); }
+            else { addr = bytes.read_i32(sa, 4) as long; }  // sin_addr
         } else {
             ai = bytes.read_ptr(ai, 40);           // ai_next
         }
