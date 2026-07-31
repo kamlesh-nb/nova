@@ -146,6 +146,16 @@ long long nova_uring_create(int entries) {
     return (long long)(intptr_t)r;
 }
 
+// The ring's own file descriptor. Callers use it as the reactor's `kq` handle: it is a real,
+// non-negative fd, which matters because the reactor and the web layer both test that handle to
+// decide "is there a reactor on this thread" (Reactor.ok is kq >= 0, currentKq() != 0). Handing them
+// -1 makes an io_uring worker look like it has NO reactor, and the request path then falls through
+// to the retired Asio branch and aborts.
+int nova_uring_fd(long long ring) {
+    NovaUring *r = (NovaUring *)(intptr_t)ring;
+    return r ? r->fd : -1;
+}
+
 void nova_uring_destroy(long long ring) {
     NovaUring *r = (NovaUring *)(intptr_t)ring;
     if (!r) return;

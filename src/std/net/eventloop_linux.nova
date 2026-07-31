@@ -111,6 +111,7 @@ pub extern("c") fn nova_uring_create(entries: int): long;
 pub extern("c") fn nova_uring_destroy(ring: long): void;
 pub extern("c") fn nova_uring_set_current(ring: long): void;
 pub extern("c") fn nova_uring_current(): long;
+pub extern("c") fn nova_uring_fd(ring: long): int;
 pub extern("c") fn nova_uring_prep(ring: long, op: int, fd: int, addr: long, len: int, off: long, userData: long): int;
 pub extern("c") fn nova_uring_submit_and_wait(ring: long, waitNr: int): int;
 pub extern("c") fn nova_uring_cq_ready(ring: long): int;
@@ -189,7 +190,10 @@ pub struct Poller impl EventLoop {
             // Sized so a full batch of completions fits: the CQ defaults to twice the SQ.
             self.ring = nova_uring_create(maxEvents * 2);
             nova_uring_set_current(self.ring);
-            self.kq = -1;                       // no epoll fd exists on this backend
+            // The ring's fd, NOT -1: Reactor.ok() and the web layer both test this handle to decide
+            // whether a reactor exists on this thread, and -1 reads as "none" — the request path
+            // then falls through to the retired Asio branch. No epoll_ctl is ever issued on it.
+            self.kq = nova_uring_fd(self.ring);
             self.eventBuf = bytes.alloc(8);     // unused; non-null so destroy stays uniform
             self.udBuf = bytes.alloc(8);
             self.resBuf = bytes.alloc(4);
