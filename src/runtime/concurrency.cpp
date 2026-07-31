@@ -62,6 +62,9 @@ extern "C" long long nova_reactor_resume(long long handle);
 // timerfd would leak. Bit 63 tags it: userspace pointers never set it on x86_64 or aarch64.
 const uint64_t NOVA_EPOLL_TIMER_TAG = 1ULL << 63;
 const uint64_t NOVA_EPOLL_WAKE_DATA = ~0ULL;   // the reactor's own eventfd; nothing to resume
+// Reported as the "filter" of a wake event so the kqueue-shaped `filter == evfiltUser()` test keeps
+// working on epoll. Negative, because an epoll events mask never is.
+const long long NOVA_EPOLL_USER_FILTER = -2;
 
 std::mutex &g_epoll_timer_mu = *new std::mutex();
 std::unordered_map<long long, int> &g_epoll_timers = *new std::unordered_map<long long, int>();
@@ -577,9 +580,31 @@ extern "C" long long nova_reactor_drain_one(long long idx) {
 extern "C" long long nova_evfilt_user(void) {
 #if defined(NOVA_HAVE_KQUEUE)
     return (long long)EVFILT_USER;
+#elif defined(NOVA_HAVE_EPOLL)
+    // epoll has no filter identifier — an event carries an events BITMASK, which is always
+    // non-negative. A negative sentinel therefore cannot collide with one, and net/eventloop_linux
+    // reports it from evFilterAt for the wake eventfd so `filter == evfiltUser()` still works.
+    return NOVA_EPOLL_USER_FILTER;
 #else
     return 0;
 #endif
+}
+
+// Translate one raw event data word into the coroutine handle to resume, for reactor loops driven
+// from NOVA rather than by nova_run_root (net/reactor's readiness path). On epoll this is where a
+// tagged timer fire is untagged and its one-shot timerfd reclaimed — without it the tag would be
+// resumed as if it were a coroutine pointer. Identity everywhere else.
+extern "C" long long nova_reactor_event_token(long long data) {
+#if defined(NOVA_HAVE_EPOLL)
+    uint64_t d = (uint64_t)data;
+    if (d == NOVA_EPOLL_WAKE_DATA) return 0;   // a wake resumes nothing
+    if (d & NOVA_EPOLL_TIMER_TAG) {
+        long long h = (long long)(d & ~NOVA_EPOLL_TIMER_TAG);
+        epoll_timer_cancel(h);
+        return h;
+    }
+#endif
+    return data;
 }
 
 
