@@ -24,10 +24,6 @@ import os.windows;
 pub const WAKE_KEY: long = -1;    // cross-reactor wake (PostQueuedCompletionStatus)
 pub const TIMER_KEY: long = -2;   // reactor timer fire; lpOverlapped IS the coroutine handle
 
-// Slots in the Poller's association memo (see ensureAssociated). A power of two so the modulo is
-// cheap; collisions only cost a redundant, harmless re-association.
-const ASSOC_SLOTS: int = 256;
-
 // Op kinds.
 pub const OP_RECV: int = 0;
 pub const OP_SEND: int = 1;
@@ -150,13 +146,23 @@ pub fn associate(port: long, fd: int): long {
 // ignored. Hoisting it to socket-registration time is the follow-on that removes the extra syscall.
 pub fn submit(kq: int, op: long): int {
     let fd = opFd(op);
-    if (fd >= 0) { windows.CreateIoCompletionPort(fd as long, kq as long, fd as long, 0); }
+    // Joining a handle to a port is ONE-TIME and permanent, so doing it per operation was a syscall
+    // on the hottest path in the server for nothing. The memo is cleared on close (see cancelRead),
+    // which is what keeps it safe: a recycled SOCKET number must not inherit "already associated".
+    if (fd >= 0 && nova_iocp_mark_associated(fd) != 0) {
+        windows.CreateIoCompletionPort(fd as long, kq as long, fd as long, 0);
+    }
     return issue(op);
 }
 
 // Drops the zero-byte arm record. A pending overlapped op is left to complete on its own — the
 // socket is about to be closed, which cancels it in the kernel; CancelIoEx would be the explicit form.
-pub fn cancelRead(kq: int, fd: int): void { dropArm(fd); }
+pub fn cancelRead(kq: int, fd: int): void {
+    dropArm(fd);
+    // The fd is about to be closed. Forget its association, or the next socket handed this handle
+    // number would be treated as already joined to the port and its completions would never arrive.
+    nova_iocp_clear_associated(fd);
+}
 
 // `done` sentinel meaning "the awaiting coroutine abandoned this op; the completion owns the record".
 pub const OP_ABANDONED: int = 2;
@@ -203,6 +209,8 @@ pub const EVENT_SIZE: int = 32;   // OVERLAPPED_ENTRY, so the reactor's event bu
 // when data arrives and consumes none of it, so the completion is the readiness edge and the caller
 // then performs a normal read — which is what the readiness API promises. The op record has to
 // outlive the call, so one is kept per armed fd in the runtime (see nova_reactor_arm_get).
+extern("c") fn nova_iocp_mark_associated(fd: int): int;
+extern("c") fn nova_iocp_clear_associated(fd: int): void;
 extern("c") fn nova_io_stat_issued(): void;
 extern("c") fn nova_io_stat_completed(): void;
 extern("c") fn nova_io_watchdog_start(): void;
@@ -226,7 +234,9 @@ fn setArmed(op: long, v: int): void { bytes.write_i32(op, OP_ARMED_OFF, v as lon
 fn armZeroByte(kq: int, fd: int, token: long, kind: int): int {
     if (fd < 0) { return -1; }
     // The socket must be joined to the port before any overlapped op, exactly as for real I/O.
-    windows.CreateIoCompletionPort(fd as long, kq as long, fd as long, 0);
+    if (nova_iocp_mark_associated(fd) != 0) {
+        windows.CreateIoCompletionPort(fd as long, kq as long, fd as long, 0);
+    }
 
     let op = nova_reactor_arm_get(fd);
     if (op == (0 as long)) {
@@ -331,7 +341,6 @@ pub struct Poller impl EventLoop {
     pub eventBuf: long,      // maxEvents * OVERLAPPED_ENTRY_SIZE, drained by GetQueuedCompletionStatusEx
     pub compBuf: long,       // maxEvents * 8: coroutine tokens to resume
     pub removedBuf: long,    // ULONG out-param for GQCSEx
-    pub assocBuf: long,      // ASSOC_SLOTS * 4: which fds are already joined to this port
     pub maxEvents: int,
     pub nComp: int,
 
@@ -344,9 +353,6 @@ pub struct Poller impl EventLoop {
         self.eventBuf = bytes.alloc(maxEvents * windows.OVERLAPPED_ENTRY_SIZE);
         self.compBuf = bytes.alloc(maxEvents * 8);
         self.removedBuf = bytes.alloc(4);
-        self.assocBuf = bytes.alloc(ASSOC_SLOTS * 4);
-        let i = 0;
-        while (i < ASSOC_SLOTS) { bytes.write_i32(self.assocBuf, i * 4, 0); i = i + 1; }
         self.nComp = 0;
     }
 
@@ -359,11 +365,13 @@ pub struct Poller impl EventLoop {
     // CreateIoCompletionPort, which is rejected harmlessly. Bounded, unlike a growing set.
     fn ensureAssociated(self: Poller, fd: int): void {
         if (fd <= 0) { return; }
-        // Windows kernel handle values are multiples of 4, so shifting first spreads the slots.
-        let slot = ((fd / 4) % ASSOC_SLOTS) * 4;
-        if ((bytes.read_i32(self.assocBuf, slot) as int) == fd) { return; }
-        windows.CreateIoCompletionPort(fd as long, self.port, fd as long, 0);
-        bytes.write_i32(self.assocBuf, slot, fd as long);
+        // Uses the runtime memo rather than a private table, so association has ONE source of truth
+        // and ONE clear point (cancelRead). The old direct-mapped table had no clear at all: a
+        // recycled SOCKET number matching a stale slot read as "already associated" and its
+        // completions were then delivered nowhere.
+        if (nova_iocp_mark_associated(fd) != 0) {
+            windows.CreateIoCompletionPort(fd as long, self.port, fd as long, 0);
+        }
     }
 
     fn submit(self: Poller, op: long): int {
@@ -419,7 +427,6 @@ pub struct Poller impl EventLoop {
         if (self.eventBuf != 0) { bytes.free(self.eventBuf); self.eventBuf = 0; }
         if (self.compBuf != 0) { bytes.free(self.compBuf); self.compBuf = 0; }
         if (self.removedBuf != 0) { bytes.free(self.removedBuf); self.removedBuf = 0; }
-        if (self.assocBuf != 0) { bytes.free(self.assocBuf); self.assocBuf = 0; }
         if (self.port != (0 as long)) { windows.CloseHandle(self.port); self.port = 0; }
     }
 }

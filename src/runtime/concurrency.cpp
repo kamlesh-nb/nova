@@ -59,6 +59,33 @@ extern "C" void nova_io_stat_resume_skipped(void);
 // its fds.
 thread_local std::unordered_map<int, long long> g_reactor_arms;
 
+#if defined(NOVA_HAVE_IOCP)
+// --- IOCP association memo -----------------------------------------------------------------------
+// A handle is joined to a completion port ONCE and permanently. The submit path used to call
+// CreateIoCompletionPort on EVERY operation and rely on the redundant call failing harmlessly --
+// correct, but a syscall per I/O on the hottest path in the server.
+//
+// The asymmetry that governs this memo: claiming "not yet associated" when it already is costs one
+// wasted call, while claiming "already associated" when it is NOT means every completion for that
+// socket is delivered nowhere and its connection hangs forever. So the memo must be cleared the
+// moment a socket closes -- SOCKET handle values are recycled aggressively by Windows, and a stale
+// entry would silently skip the association for the next socket that inherits the number.
+//
+// Thread-local: a reactor worker owns its sockets. Keyed by handle value, which for Windows sockets
+// is small and a multiple of 4, so a set beats a vector indexed by it.
+thread_local std::unordered_set<int> g_iocp_associated;
+
+// 1 if the caller must associate (not seen before), 0 if it is already joined to the port.
+extern "C" int nova_iocp_mark_associated(int fd) {
+    if (fd < 0) return 1;
+    return g_iocp_associated.insert(fd).second ? 1 : 0;
+}
+
+extern "C" void nova_iocp_clear_associated(int fd) {
+    if (fd >= 0) g_iocp_associated.erase(fd);
+}
+#endif // NOVA_HAVE_IOCP
+
 extern "C" long long nova_reactor_arm_get(int fd) {
     auto it = g_reactor_arms.find(fd);
     return it == g_reactor_arms.end() ? 0 : it->second;
