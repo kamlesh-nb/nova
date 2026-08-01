@@ -10,30 +10,11 @@
         .llvm = .{
             .path = "deps/llvm-zig",
         },
-        // T1/deps generalization: the LLVM libraries for the STATIC self-contained build are fetched
-        // per-platform from the self-hosted mirror (github.com/kamlesh-nb/llvm-dist), NOT Homebrew.
-        // LAZY so only the host/target's tree is downloaded, and only for `-Dstatic-llvm`. The tree
-        // is content-hashed, so the same tarball validates from cache (a local `zig fetch`) or the
-        // mirror URL. Each holds `lib/` = 226 native libLLVM*.a + LLVM's static C-lib deps
-        // (z/zstd/xml2/lzma) + libstdc++.so/libgcc_s.so (see deps/llvm-zig/README-linux-static.md).
-        .llvm_linux_aarch64 = .{
-            .url = "https://github.com/kamlesh-nb/llvm-dist/releases/download/llvm-21/llvm-21-aarch64-linux.tar.gz",
-            .hash = "N-V-__8AAKAkKBVcWIUadVpEprwbDN5DRB03WYKoenBWSlTF",
-            .lazy = true,
-        },
-        .llvm_linux_x86_64 = .{
-            .url = "https://github.com/kamlesh-nb/llvm-dist/releases/download/llvm-21/llvm-21-x86_64-linux.tar.gz",
-            .hash = "N-V-__8AAKmsaRbiOQVlbrSbyackbn-CfUt8FX4mxkcI4-nx",
-            .lazy = true,
-        },
-        // macOS is LLVM 22 (the converted native drop — see README-static-llvm.md); the C-API 21↔22
-        // bindings are compatible. lib/ = 211 native Mach-O libLLVM*.a. zstd is the in-repo vendored
-        // copy and z/xml2/libc++ come from the SDK/zig, so (unlike Linux) no externals in the tarball.
-        .llvm_macos_arm64 = .{
-            .url = "https://github.com/kamlesh-nb/llvm-dist/releases/download/llvm-22/llvm-22-aarch64-macos.tar.gz",
-            .hash = "N-V-__8AADtKVQ3jCkdYg6_btVpcsToWavgcBW07AgLMwZlY",
-            .lazy = true,
-        },
+        // NOTE: there is no fetched LLVM mirror. A static build (`-Dstatic-llvm`) links a LOCAL LLVM
+        // pointed at by NOVA_LLVM_PREFIX (an installed apt/brew llvm-21, whose libLLVM*.a build.zig
+        // globs), or the hardcoded dev prefix. The former self-hosted `llvm-dist` GitHub mirror was
+        // removed (the repo no longer exists); the CI release workflow installs LLVM 21 from the OS
+        // package manager instead. See configureLlvmLink in build.zig and .github/workflows/release.yml.
     },
     .paths = .{
         "build.zig",
