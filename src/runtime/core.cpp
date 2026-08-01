@@ -82,7 +82,10 @@ __attribute__((constructor)) void nova_install_crash_handler() {
   std::memset(&sa, 0, sizeof(sa));
   sa.sa_sigaction = nova_crash_handler;
   sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
-  ::sigemptyset(&sa.sa_mask);
+  // NOT `::sigemptyset` — on macOS sigemptyset is a MACRO, and a macro cannot be namespace-
+  // qualified (`::` then expands onto `(*(set)=0,0)` and fails to parse). Unqualified resolves to
+  // the macro on macOS and to the global function on Linux, so both platforms build.
+  sigemptyset(&sa.sa_mask);
   ::sigaction(SIGSEGV, &sa, nullptr);
   ::sigaction(SIGBUS, &sa, nullptr);
   ::sigaction(SIGILL, &sa, nullptr);
