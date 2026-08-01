@@ -81,9 +81,6 @@
 62_socket_send_n 0
 63_db_seam 0
 64_db_connection 0
-65_btreedb_codec 0
-66_postgres_codec 0
-67_mysql_codec 0
 68_generic_method_mono 0
 69_app_typed_routing 0
 70_container_trait_arc 0
@@ -97,17 +94,12 @@
 97_serde_decimal_yaml 0
 98_serde_json_yaml_coimport 0
 99_serde_struct_decimal 0
-100_mssql_codec 0
 101_errdefer 0
 102_future_first_class 0
 103_async_when_all 0
 104_conn_pool 0
-105_prepared_statements 0
 106_resilient_pool 0
-107_pg_scram_auth 0
 108_mysql_rsa_auth 0
-109_mysql_binary_protocol 0
-110_mssql_prepared 0
 111_async_trait_methods 0
 112_trait_widen_arc 0
 116_select 0
