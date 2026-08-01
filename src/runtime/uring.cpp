@@ -63,6 +63,7 @@ struct NovaUring {
     unsigned *cq_tail = nullptr;
     unsigned *cq_mask = nullptr;
     struct io_uring_cqe *cqes = nullptr;
+    unsigned cq_entries = 0;
 
     void *sq_ptr = nullptr;  size_t sq_sz = 0;
     void *cq_ptr = nullptr;  size_t cq_sz = 0;
@@ -97,6 +98,7 @@ long long nova_uring_create(int entries) {
     NovaUring *r = new NovaUring();
     r->fd = fd;
     r->sq_entries = p.sq_entries;
+    r->cq_entries = p.cq_entries;
 
     r->sq_sz = p.sq_off.array + p.sq_entries * sizeof(unsigned);
     r->cq_sz = p.cq_off.cqes + p.cq_entries * sizeof(struct io_uring_cqe);
@@ -230,7 +232,23 @@ int nova_uring_cq_ready(long long ring) {
     if (!r) return 0;
     unsigned tail = __atomic_load_n(r->cq_tail, __ATOMIC_ACQUIRE);
     unsigned head = __atomic_load_n(r->cq_head, __ATOMIC_RELAXED);
-    return (int)(tail - head);
+    unsigned n = tail - head;
+    // tail - head is UNSIGNED, so a head that has run past the tail does not come back negative --
+    // it wraps to ~4e9. The caller would then peek ring slots the kernel never wrote and hand back
+    // uninitialised words as user_data (which presents as a wild pointer deref far from the heap).
+    // The CQ can never legitimately hold more than its own entry count, so anything larger is a
+    // bookkeeping bug: report it once and yield nothing rather than reading garbage.
+    if (n > r->cq_entries) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::fprintf(stderr,
+                         "nova_uring: CQ head passed tail (head=%u tail=%u entries=%u) -- "
+                         "completions were over-consumed\n", head, tail, r->cq_entries);
+        }
+        return 0;
+    }
+    return (int)n;
 }
 
 // Read the i-th ready completion without consuming it.
@@ -242,6 +260,17 @@ int nova_uring_peek(long long ring, int i, long long *user_data, int *res) {
     if (user_data) *user_data = (long long)cqe->user_data;
     if (res) *res = cqe->res;
     return 0;
+}
+
+// The i-th completion's FLAGS. Needed for multishot poll: the kernel sets IORING_CQE_F_MORE while
+// the poll stays armed, and CLEARS it on the delivery that terminates it. A caller that relies on
+// the arm persisting (as the readiness surface does) must re-arm when F_MORE is absent, or that fd
+// goes permanently silent.
+unsigned nova_uring_peek_flags(long long ring, int i) {
+    NovaUring *r = (NovaUring *)(intptr_t)ring;
+    if (!r) return 0;
+    unsigned head = __atomic_load_n(r->cq_head, __ATOMIC_RELAXED) + (unsigned)i;
+    return r->cqes[head & *r->cq_mask].flags;
 }
 
 // Consume `n` completions. The RELEASE store tells the kernel those CQE slots are reusable.
@@ -287,7 +316,42 @@ int nova_uring_op_send(void)    { return IORING_OP_SEND; }
 int nova_uring_op_accept(void)  { return IORING_OP_ACCEPT; }
 int nova_uring_op_connect(void) { return IORING_OP_CONNECT; }
 int nova_uring_op_timeout(void) { return IORING_OP_TIMEOUT; }
+// Opt-in tracing of the words a drain hands back (NOVA_URING_DEBUG=1). A user_data that is neither
+// a live record nor one of the encoded sentinels is the signature of a completion nobody owns.
+void nova_uring_dbg_word(long long w, int idx, int ready, int flags, int res) {
+    static const bool on = std::getenv("NOVA_URING_DEBUG") != nullptr;
+    if (!on) return;
+    // At benchmark rates this fires tens of thousands of times a second, so cap it: the first few
+    // hundred completions are enough to see which words appear.
+    static int budget = 300;
+    if (budget-- <= 0) return;
+    std::fprintf(stderr, "uring drain: i=%d/%d ud=0x%llx flags=0x%x res=%d\n",
+                 idx, ready, (unsigned long long)w, (unsigned)flags, res);
+}
+
 int nova_uring_op_poll_add(void){ return IORING_OP_POLL_ADD; }
+int nova_uring_op_poll_remove(void) { return IORING_OP_POLL_REMOVE; }
+int nova_uring_op_async_cancel(void) { return IORING_OP_ASYNC_CANCEL; }
+
+// IORING_POLL_ADD_MULTI travels in the SQE's `len` and makes the poll MULTISHOT: it stays armed and
+// reports every edge, instead of being consumed by the first one. That is what makes POLL_ADD a
+// faithful stand-in for kqueue's EV_ADD (persistent) rather than EV_ADD|EV_ONESHOT.
+// Guarded because it postdates the opcode itself (kernel 5.13); 0 means "not available", and the
+// caller then falls back to arming one-shot and re-arming on every completion.
+unsigned nova_uring_poll_add_multi(void) {
+#ifdef IORING_POLL_ADD_MULTI
+    return IORING_POLL_ADD_MULTI;
+#else
+    return 0;
+#endif
+}
+unsigned nova_uring_cqe_f_more(void) {
+#ifdef IORING_CQE_F_MORE
+    return IORING_CQE_F_MORE;
+#else
+    return 0;
+#endif
+}
 
 }  // extern "C"
 

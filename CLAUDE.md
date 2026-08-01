@@ -82,6 +82,11 @@ PATH for `clang++`/`llvm-ar`:
 $env:NOVA_LLVM_PREFIX = 'C:/LLVM'; $env:PATH = 'C:\LLVM\bin;' + $env:PATH; zig build
 ```
 
+`C:\LLVM\bin` must be on PATH at **RUN** time too, not only to build: the produced `nova.exe`
+links `LLVM-C.dll` dynamically. Without it EVERY corpus case reports `<compile/link error>` and
+the harness declares its own negative-case classifier broken — which reads exactly like a compiler
+regression. The tell is `nova.exe` exiting `0xC0000135` (STATUS_DLL_NOT_FOUND) with no output.
+
 Both original blockers are resolved: `build.zig` has a PowerShell install step (no sh/rsync), and
 the dynamic path links the LLVM **C API** rather than needing a static Windows LLVM dist. Two
 Windows-specific traps are handled and worth knowing about:
@@ -185,7 +190,7 @@ between them: `nova_reactor_backend()` decides once per process. The probe matte
 being present says nothing about the running kernel, which can be too old or have io_uring disabled
 administratively (`/proc/sys/kernel/io_uring_disabled`).
 
-### Conformance (234 cases, run 2026-07-31)
+### Conformance (234 cases, run 2026-08-01)
 
 | Backend | Passed | Failed |
 |---|---|---|
@@ -196,8 +201,11 @@ administratively (`/proc/sys/kernel/io_uring_disabled`).
 epoll and io_uring have IDENTICAL failure lists — every reachable case passes on both.
 
 Run the corpora ONE AT A TIME. Running two concurrently on a 4-core box starves the app/server cases
-past the per-case timeout and invents 3-4 phantom failures (they report "timed out after 60s", which
-is how to recognise it); a concurrent pair read 221/221 where the serial runs read 224/225.
+past the per-case timeout and invents phantom failures (they report a timeout, which is how to
+recognise it). `conformance/run.sh -j` fixed the per-case output collision that used to make this
+unavoidable, but it does NOT make a genuinely MULTI-THREADED case safe: `195_multicore_reactors`
+spawns its own reactor threads and intermittently times out under `-j` on a 4-core box while passing
+cleanly on its own. Re-check any `-j` failure sequentially before believing it.
 
 Every remaining failure is structural, not a bug to chase:
 - **8 DB/codec cases** (`64/65/66/67`, `100/105/107/109/110`) import the drivers from `packages/`,
@@ -207,24 +215,50 @@ Every remaining failure is structural, not a bug to chase:
   **`189_epoll_event_layout`** asserts epoll's (fails off Linux). Inapplicable by design.
 (`210_cross_reactor_wakeup` was an io_uring-only failure and is fixed — see the SQE note below.)
 
-### Throughput (oha, release build, 30s @ c=100)
+### Throughput (oha, release build)
 
-Measured on a 4-core box with the load generator CO-RESIDENT, so the server gets ~2.45 cores (3
-workers at ~82% each) and these are lower bounds — a separate load box would read higher. `web.app`
-with one typed JSON route; workers = `nproc - 1`.
+**Measure with a FIXED REQUEST COUNT (`-n`), not a time box (`-z`).** A time-boxed run stops at the
+deadline and never waits for outstanding requests, so it reports "100% success" even when the server
+is stranding connections — which is exactly how the IOCP stall below hid for so long. `-z` also
+charges ~100 in-flight requests as "aborted due to deadline" at c=100, which reads as a fake 99.9%.
 
-| Backend | req/s | Per reactor | Avg | Worst | Success |
-|---|---|---|---|---|---|
-| Windows / IOCP | 10,148 | ~3,383 | 9.8 ms | 56 ms | 100% |
-| Linux / epoll | 20,561 | ~6,854 | 3.9 ms | 43 ms | 100% |
-| Linux / io_uring | 20,801 | ~6,934 | 3.3 ms | 69 ms | 100% |
+Measured on a 4-core box with the load generator CO-RESIDENT, so these are lower bounds. Two servers:
+`web.app` with one typed JSON route (workers = `nproc - 1`), and the flagship's Nova-owned reactor
+(`flagship/bench/headtohead/nova-reactor/server.nova`, ONE core).
 
-For scale: kqueue on an Apple M1 does ~164k req/s (~8 cores), i.e. roughly 3.5x the per-core figure
-here. WSL2 virtualises syscalls, which punishes a syscall-heavy path disproportionately, and this box
-shares 4 cores with the load generator — but the gap is real, not purely methodology.
+| Server / backend | req/s | Cores | Success |
+|---|---|---|---|
+| Nova reactor / epoll | 75,621 | 0.87 | 300,000/300,000 |
+| Nova reactor / io_uring | ~65,000 | 0.93 | 299,995/300,000 |
+| web.app / epoll | 26,599 | ~3 | 100% |
+| web.app / io_uring | ~30,000 | ~3 | 100% |
+| web.app / IOCP (Windows) | 16,620 (`-z`) | ~3 | see stall below |
 
-**These numbers are AFTER three optimisations worth ~1.5x; the earlier figures were 8.0k / 14.1k /
-13.6k.** If throughput regresses, suspect these first:
+### The kqueue gap is mostly the ENVIRONMENT — measured, not assumed
+
+The M1 figure (186k on one core) is ~2.6x this box. That is NOT a Linux-backend deficiency: the
+head-to-head peers were built and run here with the identical method, and they degrade as much or
+more.
+
+| Server | req/s here | Cores | per core |
+|---|---|---|---|
+| Nova reactor / epoll | 75,621 | 0.87 | **86,921** |
+| Rust axum + tokio | 55,094 | 1.74 | 31,663 |
+| Go net/http | 15,846 | 1.57 | 10,092 |
+
+Go scores 15,846 here against 121,743 on the M1 — a **7.7x** environment penalty; Rust drops 2.4x;
+Nova 2.6x. So Nova's fall is in-band. Contributors, in order: WSL2 virtualises syscalls and loopback
+(worst case for a syscall-per-request path), the load generator takes ~3 of 4 cores, and the M1
+P-core is simply faster. On THIS box one Nova reactor core beats Rust axum's 1.74 and Go's 1.57.
+
+**The one genuinely OURS**: io_uring is still slower than epoll (65k at 93% CPU vs 75.6k at 87%),
+~1.4x more CPU per request, because it is readiness EMULATED on a completion engine — poll, then a
+separate read, plus a re-arm, where epoll does two kernel interactions. Multishot `RECV` + `SQPOLL`
+is the real headroom. That comparison is same-box/same-minute, so unlike the M1 numbers it is not
+confounded.
+
+**Earlier figures for regression-hunting were 8.0k / 14.1k / 13.6k (web.app, time-boxed).** If
+throughput regresses, suspect these first:
 1. **Persistent fd registration** (`eventloop_linux`). The reactor used to `EPOLL_CTL_ADD` on every
    submit and `EPOLL_CTL_DEL` on every completion — four `epoll_ctl` calls per keep-alive request on
    top of recv/send. It now ADDs once, re-arms with `EPOLL_CTL_MOD` + `EPOLLONESHOT`, and only DELs
@@ -240,6 +274,34 @@ shares 4 cores with the load generator — but the gap is real, not purely metho
 Next wins, in order: per-request allocations in `web/app` + the HTTP parser (helps ALL backends,
 including Windows), io_uring `SQPOLL` (zero syscalls on the hot path) and multishot recv/accept, then
 full edge-triggered epoll to drop the remaining `MOD`.
+
+### On a proactor the KERNEL owns the op record — never "give up and free"
+
+The single most expensive class of bug in this codebase's IOCP/io_uring work, and it always presents
+the same way: a connection hangs forever, the server sits at 0% CPU, and the fault (if any) lands
+somewhere unrelated. On kqueue/epoll, abandoning an operation means deregistering an *interest* —
+afterwards nothing in the kernel refers to the op record, so freeing it is safe. On IOCP the kernel
+holds `lpOverlapped == op`, and on io_uring a submitted SQE holds it as `user_data`, until the
+operation completes or is cancelled. Free it there and the pooled record is handed out again, the
+next submit zeroes its OVERLAPPED (`issue()` does this first), and the ORIGINAL completion is
+delivered nowhere.
+
+`net/eventloop*.abandonOp(kq, op)` is the seam: it returns whether the CALLER still owns the record.
+epoll/kqueue answer false (free it); IOCP and io_uring answer true, having marked the record
+`OP_ABANDONED` and issued CancelIoEx / ASYNC_CANCEL — the drain frees it when the completion lands.
+Rules that follow, all of which were violated and cost real debugging:
+- A resume is NOT proof your op finished. `recvInto`/`sendBuf` wait for `opDone == 1`; a stale timer
+  or batch wake can resume the coroutine while the op is still in flight.
+- One outstanding op per record. Re-issuing on a live OVERLAPPED destroys the first op's bookkeeping.
+- Dropping an arm does not free it — cancel, and leave the record in the per-fd arm map for reuse.
+
+### Known open: IOCP strands connections at high concurrency
+
+At c>=50 a fraction of connections are never served: the acceptor stays healthy (a fresh request gets
+200) and the server goes fully idle, but those connections' `WSARecv` completions never arrive. Four
+contributors of the class above are fixed and it went from always-stalling to ~1-in-3 runs; the last
+one is not found. Reproduce with `oha -n 5000 -c 50` — and note it is INVISIBLE to a `-z` run. Go
+net/http on the same box with the same command completes, so it is ours, not oha-on-Windows.
 
 ### Readiness on a proactor
 

@@ -21,6 +21,18 @@ pub const OP_RECV: int = 0;
 pub const OP_SEND: int = 1;
 pub const OP_ACCEPT: int = 2;
 pub const OP_CONNECT: int = 3;
+// Readiness-only kinds, used by the low-level arm* surface on io_uring. They issue an
+// IORING_OP_POLL_ADD rather than a transfer, so they mean the same thing EVFILT_READ/EVFILT_WRITE
+// mean on kqueue: "tell me when this fd is readable/writable", with no data moved.
+pub const OP_POLL_IN: int = 4;
+pub const OP_POLL_OUT: int = 5;
+
+// poll(2) event bits, as the kernel reports them in a POLL_ADD completion's res.
+const POLLIN_BIT: int = 1;
+const POLLOUT_BIT: int = 4;
+const POLLERR_BIT: int = 8;
+const POLLHUP_BIT: int = 16;
+const POLLRDHUP_BIT: int = 8192;
 
 // In-flight op record — identical layout to the macOS variant (see eventloop_darwin.nova for the field
 // map and the read_i32-zero-extension rationale for the 8-byte result slot + separate done flag).
@@ -82,6 +94,30 @@ pub fn submit(kq: int, op: long): int {
 // The one place an fd genuinely leaves the set (stream close, or a read deadline giving up), so it
 // is also where the registration memo is cleared — otherwise a recycled fd number would be MOD'd
 // before it was ever ADDed, which fails with ENOENT.
+// `done` sentinel meaning "the awaiting coroutine abandoned this op; the completion owns the record".
+pub const OP_ABANDONED: int = 2;
+
+// Abandon an op the awaiting coroutine gave up on (a read deadline), reporting whether the CALLER
+// still owns the record. epoll answers false -- deregistering the interest leaves nothing in the
+// kernel pointing at the op, so the caller frees it. io_uring answers TRUE for the same reason IOCP
+// does: a submitted SQE carries the record as its user_data, so freeing it now would let the pool
+// hand it out again while the kernel is still going to complete against it. See the note in
+// net/eventloop_windows.
+pub fn abandonOp(kq: int, op: long): bool {
+    if (op == (0 as long)) { return false; }
+    if (!usingUring()) {
+        cancelRead(kq, opFd(op));
+        return false;   // caller still owns it
+    }
+    bytes.write_i32(op, 20, OP_ABANDONED as long);   // done := abandoned
+    bytes.write_ptr(op, 24, 0);                      // token := none; resume nobody
+    let ring = nova_uring_current();
+    if (ring != (0 as long)) {
+        nova_uring_prep(ring, nova_uring_op_async_cancel(), -1, op, 0, 0, 0);
+    }
+    return true;   // the completion owns it now
+}
+
 pub fn cancelRead(kq: int, fd: int): void {
     if (usingUring()) { dropArm(fd); return; }
     epoll.ctlDel(kq, fd);
@@ -100,41 +136,75 @@ pub fn connectIsSubmitted(): bool { return usingUring(); }
 
 pub const EVENT_SIZE: int = 12;   // sizeof packed struct epoll_event (x86_64)
 
-// io_uring is a proactor and has no readiness interest to register, so the readiness half of this
-// surface is emulated with a ZERO-BYTE receive/send: it completes exactly when the socket becomes
-// readable/writable and transfers nothing, making the completion the readiness edge. The arm record
-// must outlive the call, so one is kept per fd in the runtime (shared with the IOCP backend, which
-// needs the identical trick).
+// io_uring is a proactor, but it is NOT limited to transfers: IORING_OP_POLL_ADD is a genuine
+// readiness interest, so this surface maps onto it directly and means exactly what EVFILT_READ /
+// EVFILT_WRITE mean on kqueue. That matters beyond tidiness -- readiness was previously emulated
+// with a zero-byte receive, which is meaningless on a LISTENING socket (there is no data to peek,
+// only a pending connection), so a listener armed for read never became ready and the server
+// accepted nothing. POLL_ADD reports POLLIN on a listener exactly as kqueue does.
+// POLL_ADD is one-shot here, which matches how the reactor drives it (it re-arms per wait), and
+// mirrors kqueue's EV_ONESHOT write arm. The arm record must outlive the call, so one is kept per
+// fd in the runtime (shared with the IOCP backend).
 extern("c") fn nova_reactor_arm_get(fd: int): long;
 extern("c") fn nova_reactor_arm_set(fd: int, op: long): void;
+extern("c") fn nova_reactor_rearm_push(op: long): void;
+extern("c") fn nova_reactor_rearm_pop(): long;
 extern("c") fn nova_op_alloc(size: long): long;
 extern("c") fn nova_op_free(op: long): void;
 
-fn armZeroByte(fd: int, token: long, kind: int): int {
+// Byte 20 of an arm record (the `done` slot, unused for readiness) tracks whether a poll for this
+// fd is currently OUTSTANDING in the kernel. epoll gets this invariant for free -- one registration
+// per fd, and re-registering is idempotent -- but on io_uring every arm is a fresh SQE, so nothing
+// stops two polls existing for one fd at once. That happens routinely: the caller closes a
+// connection without cancelling (close auto-cancels the poll, but ASYNCHRONOUSLY), the fd number is
+// recycled for a new connection, and arming it stages a second poll while the first is still live.
+// Both then fire, the caller reads twice, the second read returns EAGAIN, and a short read is
+// indistinguishable from a hangup -- so it closes a perfectly healthy connection.
+fn opArmed(op: long): int { return bytes.read_i32(op, 20) as int; }
+fn setArmed(op: long, v: int): void { bytes.write_i32(op, 20, v as long); }
+
+fn armPoll(fd: int, token: long, kind: int): int {
     if (fd < 0) { return -1; }
     let op = nova_reactor_arm_get(fd);
     if (op == (0 as long)) {
         op = nova_op_alloc(OP_SIZE as long);
         nova_reactor_arm_set(fd, op);
+        makeOp(op, kind, fd, 0, 0, token);
+        setArmed(op, 1);
+        return stageUring(nova_uring_current(), op);
     }
-    makeOp(op, kind, fd, 0, 0, token);   // zero length: readiness only, no transfer
+    // Reusing this fd's record: makeOp clears the armed flag, so read it first.
+    let wasArmed = opArmed(op);
+    makeOp(op, kind, fd, 0, 0, token);   // readiness only, no transfer
+    setArmed(op, 1);
+    // Already outstanding: the interest is live and now carries the new token. Staging another SQE
+    // here is what produces the duplicate readiness described above.
+    if (wasArmed != 0) { return 0; }
     return stageUring(nova_uring_current(), op);
 }
 
 fn dropArm(fd: int): void {
     let op = nova_reactor_arm_get(fd);
-    if (op != (0 as long)) {
-        nova_reactor_arm_set(fd, 0);
-        nova_op_free(op);
+    if (op == (0 as long)) { return; }
+    // A multishot arm is STILL REGISTERED in the kernel with this record as its user_data, so the
+    // epoll path's "clear the slot and free" is a dangling pointer here: the cancellation itself
+    // completes asynchronously and carries the address with it. Ask the kernel to drop the poll
+    // (POLL_REMOVE matches on user_data, passed in addr) and leave the record in the per-fd arm map
+    // -- armPoll reuses it the next time this fd is armed, so it is a per-fd cache, not a leak, and
+    // it is bounded by the highest fd the process reaches.
+    let ring = nova_uring_current();
+    if (ring != (0 as long)) {
+        nova_uring_prep(ring, nova_uring_op_poll_remove(), -1, op, 0, 0, 0);
     }
+    setArmed(op, 0);   // no interest outstanding once the removal is queued
 }
 
 pub fn armRead(kq: int, fd: int, token: long): int {
-    if (usingUring()) { return armZeroByte(fd, token, OP_RECV); }
+    if (usingUring()) { return armPoll(fd, token, OP_POLL_IN); }
     return epoll.ctlAdd(kq, fd, epoll.EPOLLIN, token);
 }
 pub fn armWrite(kq: int, fd: int, token: long): int {
-    if (usingUring()) { return armZeroByte(fd, token, OP_SEND); }
+    if (usingUring()) { return armPoll(fd, token, OP_POLL_OUT); }
     return epoll.ctlAdd(kq, fd, epoll.EPOLLOUT | epoll.EPOLLONESHOT, token);
 }
 pub fn cancelWrite(kq: int, fd: int): void {
@@ -146,30 +216,119 @@ pub fn cancelWrite(kq: int, fd: int): void {
 const URING_EV_DATA_OFF: int = 0;
 const URING_EV_RES_OFF: int = 8;
 
+// Is `raw` already recorded in the slots written so far this batch?
+fn slotSeen(eventBuf: long, written: int, raw: long): bool {
+    let j = 0;
+    while (j < written) {
+        if (bytes.read_ptr(eventBuf + ((j * EVENT_SIZE) as long), URING_EV_DATA_OFF) == raw) {
+            return true;
+        }
+        j = j + 1;
+    }
+    return false;
+}
+
 // Drain completions into eventBuf in that slot layout, so ev* below can read either backend.
+//
+// Two counters, deliberately: `consumed` CQEs are taken off the ring, `written` events are reported.
+// They differ because a MULTISHOT poll can deliver SEVERAL completions for one fd in a single drain
+// (one per readable edge), whereas a level-triggered kevent/epoll_wait reports each fd AT MOST ONCE
+// per wait. Callers are written against the latter -- the reactor servers process an event, and on a
+// short read close the fd and return its slab buffer. A duplicate for that same fd later in the very
+// same batch then reads a closed fd, returns the buffer a second time and closes again: a double
+// free in the slab pool. So duplicates are consumed but coalesced, restoring kqueue's contract.
 fn uringWaitReady(eventBuf: long, maxEvents: int): int {
     let ring = nova_uring_current();
     if (ring == (0 as long)) { return 0; }
+    // Re-arm everything that fired in the PREVIOUS batch. By now the caller has processed those
+    // events and drained the sockets, so a level-triggered poll only re-completes if there is
+    // genuinely more to read -- which is precisely epoll's one-report-per-fd-per-wait behaviour.
+    let pending = nova_reactor_rearm_pop();
+    while (pending != (0 as long)) {
+        // Skip anything re-armed in the meantime (the caller may have armed this fd again itself),
+        // or the record would end up with two outstanding polls.
+        if (opArmed(pending) == 0) {
+            // Mark armed ONLY if the SQE was actually accepted. Claiming it unconditionally is a
+            // silent connection stall: a momentarily full submission queue drops the re-arm, the
+            // record still reads as armed so nothing ever retries, and that fd never reports again
+            // -- the client sees the request simply never answered.
+            if (stageUring(ring, pending) == 0) {
+                setArmed(pending, 1);
+            } else {
+                // Put it back and stop draining this round; the rest stay queued. Breaking (rather
+                // than continuing) avoids re-popping what was just pushed when the SQ is full.
+                nova_reactor_rearm_push(pending);
+                pending = 0;
+                continue;
+            }
+        }
+        pending = nova_reactor_rearm_pop();
+    }
     nova_uring_submit_and_wait(ring, 1);
     let ready = nova_uring_cq_ready(ring);
-    let n = if (ready > maxEvents) maxEvents else ready;
     let ud = bytes.alloc(8);
     let res = bytes.alloc(4);
-    let i = 0;
-    while (i < n) {
+    let consumed = 0;
+    let written = 0;
+    while (consumed < ready && written < maxEvents) {
+        let i = consumed;
         nova_uring_peek(ring, i, ud, res);
-        let slot = eventBuf + ((i * epoll.EPOLL_EVENT_SIZE) as long);
+        let slot = eventBuf + ((written * EVENT_SIZE) as long);
         let raw = bytes.read_ptr(ud, 0);
         // A wake is one-shot: drain the eventfd and re-arm, or every later post is lost.
         if (raw == WAKE_DATA) { nova_uring_wake_drain(); }
-        bytes.write_ptr(slot, URING_EV_DATA_OFF, raw);
-        bytes.write_i32(slot, URING_EV_RES_OFF, bytes.read_i32(res, 0));
-        i = i + 1;
+        // ONLY an op record may be dereferenced here -- opKind() on a posted word is a wild read.
+        let drop = false;
+        if (isOpRecordWord(raw)) {
+            let r = bytes.read_i32(res, 0) as int;
+            if (opKind(raw) == OP_POLL_IN || opKind(raw) == OP_POLL_OUT) {
+                setArmed(raw, 0);   // this poll is spent; the fd has no outstanding interest now
+                // Report only if the mask actually says something happened on THIS interest. A
+                // completion carrying none of the relevant bits is not readiness, and passing it up
+                // makes the caller read EAGAIN -- which, for a caller that treats a short read as a
+                // hangup, closes a live connection. kqueue only ever reports the filter that fired.
+                if (r >= 0 && opKind(raw) == OP_POLL_IN
+                    && (r & (POLLIN_BIT | POLLHUP_BIT | POLLERR_BIT | POLLRDHUP_BIT)) == 0) {
+                    nova_reactor_rearm_push(raw);
+                    drop = true;
+                }
+                if (r >= 0 && !drop) {
+                    // A one-shot poll is spent once it fires, so it must be re-armed to keep the
+                    // interest alive (callers arm ONCE per fd -- kqueue EV_ADD, epoll EPOLLIN
+                    // without ONESHOT). DEFER it: re-arming here, before the caller has read, would
+                    // immediately re-complete against the same unread data and deliver a duplicate.
+                    if (opKind(raw) == OP_POLL_IN) { nova_reactor_rearm_push(raw); }
+                } else {
+                    // NEGATIVE res on a poll is the kernel TEARING THE ARM DOWN, not readiness --
+                    // almost always -ECANCELED because the fd was closed (closing auto-cancels its
+                    // polls). Reporting it as an event is actively harmful: by the time it drains,
+                    // the fd number may already have been recycled for a new connection, and the
+                    // caller would read EAGAIN, treat the short read as a hangup, and close a
+                    // perfectly healthy connection -- which is what kept success just under 100%.
+                    // kqueue never hands the application a "your registration went away" event, so
+                    // swallow it: consume the CQE, report nothing, and do not re-arm.
+                    drop = true;
+                }
+            }
+        }
+        if (drop) {
+            consumed = consumed + 1;
+            continue;
+        }
+        // Coalesce a repeat report of the same arm; it is already accounted for in this batch.
+        if (!slotSeen(eventBuf, written, raw)) {
+            bytes.write_ptr(slot, URING_EV_DATA_OFF, raw);
+            bytes.write_i32(slot, URING_EV_RES_OFF, bytes.read_i32(res, 0));
+            written = written + 1;
+        }
+        consumed = consumed + 1;
     }
     bytes.free(ud);
     bytes.free(res);
-    if (ready > 0) { nova_uring_advance(ring, ready); }
-    return n;
+    // Advance by what was CONSUMED (which includes coalesced duplicates), never by `ready`: the
+    // surplus beyond maxEvents stays queued for the next call, exactly as kevent leaves it.
+    if (consumed > 0) { nova_uring_advance(ring, consumed); }
+    return written;
 }
 
 pub fn waitReady(kq: int, eventBuf: long, maxEvents: int, timeoutMs: int): int {
@@ -185,11 +344,18 @@ fn evRaw(eventBuf: long, i: int): long {
     return epoll.evData(eventBuf, i);
 }
 
+// A data word is only an op-record POINTER when untagging leaves it unchanged. A wake (all-ones)
+// and a timer fire (NOVA_EPOLL_TIMER_TAG in bit 63) are encoded values, and dereferencing one is a
+// wild read -- `d != 0` is NOT a sufficient guard, since WAKE_DATA is -1 and passes it.
+fn isOpRecordWord(d: long): bool {
+    return d != (0 as long) && d != WAKE_DATA && nova_reactor_event_token(d) == d;
+}
+
 pub fn evFd(eventBuf: long, i: int): int {
     let d = evRaw(eventBuf, i);
     // On uring the word is the arm op record, so the fd is read out of it; on epoll the low-level
     // readiness surface arms with the fd as its own token, so the word IS the fd.
-    if (usingUring()) { return if (d != (0 as long)) opFd(d) else -1; }
+    if (usingUring()) { return if (isOpRecordWord(d)) opFd(d) else -1; }
     return d as int;
 }
 
@@ -224,6 +390,12 @@ pub extern("c") fn nova_uring_op_recv(): int;
 pub extern("c") fn nova_uring_op_send(): int;
 pub extern("c") fn nova_uring_op_accept(): int;
 pub extern("c") fn nova_uring_op_connect(): int;
+pub extern("c") fn nova_uring_op_poll_add(): int;
+pub extern("c") fn nova_uring_op_poll_remove(): int;
+pub extern("c") fn nova_uring_op_async_cancel(): int;
+pub extern("c") fn nova_uring_poll_add_multi(): int;
+pub extern("c") fn nova_uring_cqe_f_more(): int;
+pub extern("c") fn nova_uring_peek_flags(ring: long, i: int): int;
 
 pub const BACKEND_URING: int = 1;
 pub fn usingUring(): bool { return nova_reactor_backend() == BACKEND_URING; }
@@ -253,6 +425,21 @@ fn uringPrep(ring: long, op: long): int {
         return nova_uring_prep(ring, nova_uring_op_accept(), fd, 0, 0, 0, op);
     } else if (kind == OP_CONNECT) {
         return nova_uring_prep(ring, nova_uring_op_connect(), fd, opBuf(op), 0, opLen(op) as long, op);
+    } else if (kind == OP_POLL_IN) {
+        // The event mask travels in `off` -- nova_uring_prep moves it into poll32_events and clears
+        // off, because those two UNION in the SQE (see the note there).
+        //
+        // Deliberately ONE-SHOT, not IORING_POLL_ADD_MULTI. Multishot looks like the natural match
+        // for kqueue's persistent EV_ADD, but it keeps delivering completions for the SAME arm
+        // record, and every consumer of a completion resumes that record's token. Once the first
+        // resume lets the coroutine finish, its frame is freed, and the next delivery resumes a dead
+        // handle -- a jump into a freed frame. Persistence is instead restored by re-arming on the
+        // drain (see uringWaitReady), which gives one completion per arm and the same "interest
+        // survives" contract without the repeat-delivery hazard.
+        return nova_uring_prep(ring, nova_uring_op_poll_add(), fd, 0, 0, POLLIN_BIT as long, op);
+    } else if (kind == OP_POLL_OUT) {
+        // Write interest stays ONE-SHOT, matching kqueue's EV_ADD | EV_ONESHOT.
+        return nova_uring_prep(ring, nova_uring_op_poll_add(), fd, 0, 0, POLLOUT_BIT as long, op);
     }
     return -1;
 }
@@ -273,8 +460,15 @@ pub fn evBytes(eventBuf: long, i: int): long {
     return nova_fionread(evFd(eventBuf, i));
 }
 pub fn evEof(eventBuf: long, i: int): bool {
-    // uring has no hangup flag: a readable socket with nothing pending is the peer's shutdown.
-    if (usingUring()) { return evBytes(eventBuf, i) == (0 as long); }
+    if (usingUring()) {
+        // A POLL_ADD completion's res IS the poll mask, so hangup is reported directly -- the same
+        // bits the epoll branch below tests, and the same meaning as kqueue's EV_EOF. Do NOT infer
+        // EOF from "readable with zero bytes pending": that is false for a LISTENING socket, whose
+        // FIONREAD is always 0, and would make the reactor close its own listener.
+        let res = bytes.read_i32(eventBuf + ((i * EVENT_SIZE) as long), URING_EV_RES_OFF) as int;
+        if (res < 0) { return true; }   // -errno on the poll itself
+        return (res & (POLLHUP_BIT | POLLRDHUP_BIT | POLLERR_BIT)) != 0;
+    }
     return (epoll.evEvents(eventBuf, i) & (epoll.EPOLLHUP | epoll.EPOLLRDHUP)) != 0;
 }
 // epoll has no filter identifier, only an events bitmask — but callers written against kqueue test
@@ -324,7 +518,12 @@ pub struct Poller impl EventLoop {
             // whether a reactor exists on this thread, and -1 reads as "none" — the request path
             // then falls through to the retired Asio branch. No epoll_ctl is ever issued on it.
             self.kq = nova_uring_fd(self.ring);
-            self.eventBuf = bytes.alloc(8);     // unused; non-null so destroy stays uniform
+            // NOT unused, and it must be full size. The completion path (pollUring) reports through
+            // compBuf, but the READINESS path -- Reactor.poll -> waitReady -> uringWaitReady -- is
+            // handed this very buffer and fills it with up to maxEvents 12-byte slots. Sizing it 8
+            // bytes overflowed the heap by ~12KB at maxEvents=1024, which corrupted neighbouring
+            // allocations and resurfaced later as a wild pointer in an unrelated read.
+            self.eventBuf = bytes.alloc(maxEvents * EVENT_SIZE);
             self.udBuf = bytes.alloc(8);
             self.resBuf = bytes.alloc(4);
         } else {
@@ -428,13 +627,27 @@ pub struct Poller impl EventLoop {
                     self.nComp = self.nComp + 1;
                 }
             } else if (ud != (0 as long)) {
-                setOpResult(ud, if (res < 0) -1 else res);
-                bytes.write_ptr(self.compBuf, (self.nComp * 8) as long, opToken(ud));
-                self.nComp = self.nComp + 1;
+                if (opDone(ud) == OP_ABANDONED) {
+                    // The awaiting coroutine gave up while this SQE was still in the kernel; it
+                    // handed the record to this completion so the pool could not recycle it under a
+                    // live op. Free it and resume nobody.
+                    nova_op_free(ud);
+                } else {
+                    setOpResult(ud, if (res < 0) -1 else res);
+                    bytes.write_ptr(self.compBuf, (self.nComp * 8) as long, opToken(ud));
+                    self.nComp = self.nComp + 1;
+                }
             }
             i = i + 1;
         }
-        if (ready > 0) { nova_uring_advance(self.ring, ready); }
+        // Advance by exactly what was CONSUMED (i), never by `ready`. The loop stops early once
+        // maxEvents completions have been recorded, and consuming past that point discards CQEs
+        // that were never dispatched: their op records never get setOpResult, their waiters never
+        // resume, and the record is later freed through another path -- a use-after-free that only
+        // shows up when ready > maxEvents, i.e. under real concurrency. kqueue has this right by
+        // construction (kevent returns at most maxEvents and LEAVES the rest queued); matching that
+        // means the surplus stays in the CQ and is picked up by the next poll.
+        if (i > 0) { nova_uring_advance(self.ring, i); }
         return self.nComp;
     }
 

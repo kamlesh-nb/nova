@@ -157,6 +157,32 @@ pub fn submit(kq: int, op: long): int {
 // socket is about to be closed, which cancels it in the kernel; CancelIoEx would be the explicit form.
 pub fn cancelRead(kq: int, fd: int): void { dropArm(fd); }
 
+// `done` sentinel meaning "the awaiting coroutine abandoned this op; the completion owns the record".
+pub const OP_ABANDONED: int = 2;
+
+// Give up on an op whose I/O may still be in flight, and report whether the CALLER still owns the
+// record. Returns true when ownership has been transferred to the pending completion.
+//
+// This is the difference that matters between a readiness backend and a proactor. On kqueue/epoll,
+// abandoning a read means deregistering an interest -- nothing in the kernel refers to the op record
+// afterwards, so the caller frees it immediately. On IOCP the kernel holds a POINTER to it
+// (lpOverlapped == op) until the operation completes or is cancelled. Freeing it there returns it to
+// the op pool, a later submit reuses it, and issue() zeroes the OVERLAPPED while the original recv
+// is still pending -- so that completion is delivered nowhere and its connection hangs forever. That
+// is silent under a time-boxed benchmark (which stops before waiting for stragglers) and shows up as
+// a stall the moment a run waits for every request to finish.
+//
+// CancelIoEx asks the kernel to abort it; either way a completion WILL arrive, and the drain above
+// frees the record when it does.
+pub fn abandonOp(kq: int, op: long): bool {
+    if (op == (0 as long)) { return false; }
+    bytes.write_i32(op, 52, OP_ABANDONED as long);   // done := abandoned
+    bytes.write_ptr(op, 56, 0);                      // token := none; resume nobody
+    let fd = opFd(op);
+    if (fd >= 0) { windows.CancelIoEx(fd as long, op as ptr); }
+    return true;   // the completion owns it now
+}
+
 // --- backend-neutral readiness surface -----------------------------------------------------------
 // On IOCP there is only ONE queue: readiness and completion are the same port, so the draining half
 // of this surface (waitReady/ev*) is real and shares the completion path below. Only the ARMING half
@@ -181,6 +207,18 @@ extern("c") fn nova_reactor_arm_set(fd: int, op: long): void;
 extern("c") fn nova_op_alloc(size: long): long;
 extern("c") fn nova_op_free(op: long): void;
 
+// Byte 52 of an arm record (`done`) doubles as "an overlapped op is OUTSTANDING on this record".
+// It has to: issue() ZEROES the OVERLAPPED as its first act, so issuing a second op on a record that
+// already has one in flight destroys the kernel's bookkeeping for the first -- that completion is
+// then delivered nowhere and its connection hangs forever. The same invariant io_uring needs, for
+// the same reason: on a proactor the kernel owns the record until it completes.
+// Offset 92 is spare (88 is the 4-byte lpFlags scratch, 96 begins the accept-only tail). It gets a
+// byte of its own rather than reusing `done`, because setOpResult writes done=1 on EVERY completion
+// -- so `done` could never read back as "no longer armed".
+const OP_ARMED_OFF: int = 92;
+fn opArmed(op: long): int { return bytes.read_i32(op, OP_ARMED_OFF) as int; }
+fn setArmed(op: long, v: int): void { bytes.write_i32(op, OP_ARMED_OFF, v as long); }
+
 fn armZeroByte(kq: int, fd: int, token: long, kind: int): int {
     if (fd < 0) { return -1; }
     // The socket must be joined to the port before any overlapped op, exactly as for real I/O.
@@ -190,8 +228,17 @@ fn armZeroByte(kq: int, fd: int, token: long, kind: int): int {
     if (op == (0 as long)) {
         op = nova_op_alloc(OP_SIZE as long);
         nova_reactor_arm_set(fd, op);
+        makeOp(op, kind, fd, 0, 0, token);
+        setArmed(op, 1);
+        return issue(op);
+    }
+    // Already outstanding: refresh the token but do NOT re-issue on a live OVERLAPPED.
+    if (opArmed(op) != 0) {
+        bytes.write_ptr(op, 56, token);
+        return 0;
     }
     makeOp(op, kind, fd, 0, 0, token);   // zero length: readiness only, no transfer
+    setArmed(op, 1);
     return issue(op);
 }
 
@@ -199,11 +246,18 @@ pub fn armRead(kq: int, fd: int, token: long): int { return armZeroByte(kq, fd, 
 pub fn armWrite(kq: int, fd: int, token: long): int { return armZeroByte(kq, fd, token, OP_SEND); }
 
 // Release the arm record when interest is dropped, or the op leaks for the fd's lifetime.
+// The zero-byte recv may still be IN FLIGHT here (dropping interest is not the same as the kernel
+// being finished with the record), so this hands ownership to the pending completion exactly as
+// abandonOp does rather than freeing underneath it.
 fn dropArm(fd: int): void {
     let op = nova_reactor_arm_get(fd);
-    if (op != (0 as long)) {
-        nova_reactor_arm_set(fd, 0);
-        nova_op_free(op);
+    if (op == (0 as long)) { return; }
+    if (opArmed(op) != 0) {
+        // Still in flight: ask the kernel to abort it, but do NOT free -- the record is the
+        // OVERLAPPED the kernel is holding. It stays in the per-fd arm map, so it is reused the next
+        // time this fd is armed rather than leaked, and nothing can recycle it under a live op.
+        setArmed(op, 0);
+        if (fd >= 0) { windows.CancelIoEx(fd as long, op as ptr); }
     }
 }
 pub fn cancelWrite(kq: int, fd: int): void { dropArm(fd); }
@@ -332,9 +386,18 @@ pub struct Poller impl EventLoop {
                 } else if (key == WAKE_KEY) {
                     // Cross-reactor wake: returning from the poll is the whole point of it.
                 } else if (ov != (0 as long)) {
-                    setOpResult(ov, windows.entryBytes(self.eventBuf, i));
-                    bytes.write_ptr(self.compBuf, (self.nComp * 8) as long, opToken(ov));
-                    self.nComp = self.nComp + 1;
+                    if (opDone(ov) == OP_ABANDONED) {
+                        // The awaiting coroutine gave up (a read deadline) while this overlapped op
+                        // was still in the kernel. Ownership of the record was transferred to this
+                        // completion precisely so it could not be recycled underneath a live op --
+                        // so free it here and resume nobody; that coroutine moved on long ago.
+                        nova_op_free(ov);
+                    } else {
+                        setArmed(ov, 0);   // this record's overlapped op is finished
+                        setOpResult(ov, windows.entryBytes(self.eventBuf, i));
+                        bytes.write_ptr(self.compBuf, (self.nComp * 8) as long, opToken(ov));
+                        self.nComp = self.nComp + 1;
+                    }
                 }
                 i = i + 1;
             }

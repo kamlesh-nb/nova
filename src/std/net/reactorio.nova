@@ -125,6 +125,13 @@ pub struct ReactorStream {
         eventloop.makeOp(op, eventloop.OP_RECV, self.fd, buf, max, currentCoro());
         eventloop.submit(self.kq, op);
         coroSuspend();
+        // A resume is not proof that THIS op finished -- a stale timer or a batch wake can resume
+        // the coroutine while the operation is still in flight. Freeing on such a wake returns the
+        // record to the pool while a proactor still owns it as an OVERLAPPED/user_data; the next
+        // submit reuses it, and the original completion is then delivered nowhere, stranding an
+        // unrelated connection. `done` is the only completion signal (every backend sets it via
+        // setOpResult), so wait for it.
+        while (eventloop.opDone(op) != 1) { coroSuspend(); }
         let r = eventloop.opResult(op);
         nova_op_free(op);
         return r;
@@ -154,8 +161,11 @@ pub struct ReactorStream {
             nova_op_free(op);
             return r;
         }
-        eventloop.cancelRead(self.kq, self.fd);
-        nova_op_free(op);
+        // Abandoning an op is NOT simply "cancel the interest and free": on a proactor the kernel
+        // holds this record until the operation completes or is cancelled, so freeing it here lets
+        // the pool hand it out again while a completion is still coming -- which loses that
+        // completion and hangs the connection. abandonOp reports who owns it afterwards.
+        if (!eventloop.abandonOp(self.kq, op)) { nova_op_free(op); }
         return -2;
     }
 
@@ -170,6 +180,7 @@ pub struct ReactorStream {
             eventloop.makeOp(op, eventloop.OP_SEND, self.fd, buf + (sent as long), len - sent, currentCoro());
             eventloop.submit(self.kq, op);
             coroSuspend();
+            while (eventloop.opDone(op) != 1) { coroSuspend(); }   // see recvInto
             let w = eventloop.opResult(op);
             nova_op_free(op);
             if (w > 0) { sent = sent + w; } else { return -1; }

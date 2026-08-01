@@ -25,6 +25,72 @@
 #include <unistd.h>
 #endif
 
+// --- crash diagnostics (opt-in: NOVA_CRASH_TRACE=1) ---------------------------------------------
+// A fatal signal in a release build is otherwise just "Segmentation fault" with nothing to act on,
+// and a debugger is not always installable on the host where it reproduces. With this on, the
+// process prints its return-address stack to stderr before dying; llvm-symbolizer / addr2line turn
+// that into lines. Async-signal-safe: only backtrace(), write(), and _exit() run in the handler.
+#if defined(__linux__) || defined(__APPLE__)
+#include <csignal>
+#include <execinfo.h>
+
+namespace {
+void nova_write_lit(const char *s) { (void)!::write(2, s, std::strlen(s)); }
+
+void nova_write_hex(unsigned long long v) {
+  char h[16];
+  int len = 0;
+  if (v == 0) h[len++] = '0';
+  while (v > 0) { int nib = (int)(v & 0xF); h[len++] = (char)(nib < 10 ? '0' + nib : 'a' + nib - 10); v >>= 4; }
+  nova_write_lit("0x");
+  while (len > 0) { --len; (void)!::write(2, &h[len], 1); }
+}
+
+void nova_crash_handler(int sig, siginfo_t *info, void *) {
+  void *frames[64];
+  int n = ::backtrace(frames, 64);
+  nova_write_lit("\n=== NOVA CRASH: fatal signal ");
+  nova_write_hex((unsigned long long)sig);
+  // The faulting address is the whole diagnosis for a bad dereference: near-zero means a null
+  // base, a small value means an offset off a null, and a wild value means a corrupted pointer.
+  nova_write_lit(" at fault addr ");
+  nova_write_hex((unsigned long long)(uintptr_t)(info ? info->si_addr : nullptr));
+  nova_write_lit(" ===\n");
+  ::backtrace_symbols_fd(frames, n, 2);
+  nova_write_lit("=== end crash ===\n");
+  ::_exit(128 + sig);
+}
+
+__attribute__((constructor)) void nova_install_crash_handler() {
+  if (!std::getenv("NOVA_CRASH_TRACE")) return;
+  // An ALTERNATE stack is what makes this useful for the most common fatal fault of all: running
+  // out of stack. That SIGSEGV is delivered on the very stack that just overflowed, so a normal
+  // handler faults again immediately and the process dies silently with no output at all -- which
+  // is indistinguishable from "the handler was never installed".
+  // Fixed size, NOT SIGSTKSZ: modern glibc defines that as sysconf(_SC_SIGSTKSZ), which is not a
+  // constant expression, so using it here would declare a variable-length array. 64K is far more
+  // than backtrace() + write() need.
+  static char altstack[65536];
+  stack_t ss;
+  std::memset(&ss, 0, sizeof(ss));
+  ss.ss_sp = altstack;
+  ss.ss_size = sizeof(altstack);
+  ss.ss_flags = 0;
+  ::sigaltstack(&ss, nullptr);
+
+  struct sigaction sa;
+  std::memset(&sa, 0, sizeof(sa));
+  sa.sa_sigaction = nova_crash_handler;
+  sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+  ::sigemptyset(&sa.sa_mask);
+  ::sigaction(SIGSEGV, &sa, nullptr);
+  ::sigaction(SIGBUS, &sa, nullptr);
+  ::sigaction(SIGILL, &sa, nullptr);
+  ::sigaction(SIGFPE, &sa, nullptr);
+}
+}  // namespace
+#endif
+
 extern "C" {
 
 void nova_log_string(const char *s) {

@@ -7,11 +7,11 @@
 // request content is not parsed (a fixed-response benchmark isolates the loop and I/O path).
 import bytes;
 import os.sys;
+import os.socket;
 import net.reactor;
 import env;
 import string;
 
-const SO_REUSEADDR: int = 4; // macOS value
 
 fn appendStr(buf: long, off: int, s: string): int {
     let i = 0;
@@ -34,7 +34,11 @@ fn writeAll(fd: int, buf: long, len: int): void {
     while (sent < len) {
         let w = sys.write(fd, buf + (sent as long), (len - sent) as long);
         if (w <= 0) {
-            if (sys.errno() == 35) { continue; } // EAGAIN on macOS
+            // socket.wouldBlock(), NOT a hardcoded 35: EAGAIN is 35 on macOS but 11 on Linux, so the
+            // literal made this branch dead off macOS -- a write that merely needed retrying was
+            // treated as fatal and writeAll returned with the response half-sent, which the client
+            // reports as "connection closed before message completed".
+            if (socket.wouldBlock()) { continue; }
             return;
         }
         sent = sent + (w as int);
@@ -48,7 +52,9 @@ fn main(): void {
     let lfd = sys.socket(sys.AF_INET, sys.SOCK_STREAM, 0);
     let one = bytes.alloc(4);
     bytes.write_i32(one, 0, 1);
-    sys.setsockopt(lfd, sys.SOL_SOCKET, SO_REUSEADDR, one, 4);
+    // socket.setReuseAddr picks the right SO_REUSEADDR per OS (4 on macOS, 2 on Linux); the old
+    // literal 4 set SO_ERROR on Linux instead, so the port stayed unbindable during TIME_WAIT.
+    socket.setReuseAddr(lfd);
     let sa = sys.makeSockaddrIn(port, 0);
     if (sys.bind(lfd, sa, 16) != 0) {
         return;

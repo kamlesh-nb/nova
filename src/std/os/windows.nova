@@ -24,6 +24,10 @@ pub extern("c") fn GetQueuedCompletionStatus(port: long, lpBytes: ptr, lpKey: pt
 pub extern("c") fn GetQueuedCompletionStatusEx(port: long, entries: ptr, count: int, removed: ptr, timeoutMs: int, alertable: int): int;
 // Post a manual completion (cross-reactor wake: the completion-model equivalent of EVFILT_USER/eventfd).
 pub extern("c") fn PostQueuedCompletionStatus(port: long, nBytes: int, completionKey: long, lpOverlapped: ptr): int;
+// Cancel a specific in-flight overlapped operation on a handle (lpOverlapped == the op record), or
+// every pending one when lpOverlapped is null. The op still delivers a completion afterwards —
+// normally with ERROR_OPERATION_ABORTED — which is exactly why the record cannot be freed until then.
+pub extern("c") fn CancelIoEx(fileHandle: long, lpOverlapped: ptr): int;
 
 // OVERLAPPED_ENTRY (x64): [0] lpCompletionKey (ULONG_PTR) [8] lpOverlapped (ptr) [16] Internal (ULONG_PTR)
 // [24] dwNumberOfBytesTransferred (DWORD). 32 bytes with padding.

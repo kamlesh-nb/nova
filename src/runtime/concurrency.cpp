@@ -67,6 +67,26 @@ extern "C" void nova_reactor_arm_set(int fd, long long op) {
     else g_reactor_arms.erase(fd);
 }
 
+// Arms that fired and need re-arming, DEFERRED until the caller has processed the batch.
+//
+// Timing is the whole point. A poll interest is level-triggered, so re-arming it while the reported
+// data is still unread completes again immediately and queues a duplicate for the same fd. The
+// caller then gets a second readiness event, reads EAGAIN, and (reasonably) treats a short read as a
+// hangup -- closing a live connection. Re-arming only at the start of the NEXT wait, after the
+// caller has drained the socket, reproduces exactly what a level-triggered epoll registration does:
+// one report per fd per wait. Thread-local, like the arm map it belongs to.
+thread_local std::vector<long long> g_reactor_rearms;
+
+extern "C" void nova_reactor_rearm_push(long long op) {
+    if (op) g_reactor_rearms.push_back(op);
+}
+extern "C" long long nova_reactor_rearm_pop(void) {
+    if (g_reactor_rearms.empty()) return 0;
+    long long op = g_reactor_rearms.back();
+    g_reactor_rearms.pop_back();
+    return op;
+}
+
 
 #if defined(NOVA_HAVE_EPOLL)
 // --- epoll reactor support (the Linux peer of the kqueue driver) -------------------------------

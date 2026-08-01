@@ -92,6 +92,16 @@ pub fn armRead(kq: int, fd: int, token: long): int {
 pub fn armWrite(kq: int, fd: int, token: long): int {
     return kqueue.registerOne(kq, fd, kqueue.EVFILT_WRITE, kqueue.EV_ADD | kqueue.EV_ONESHOT, token);
 }
+// Abandon an op the awaiting coroutine gave up on, reporting whether the CALLER still owns the
+// record. On kqueue this is just deregistration: once the interest is gone nothing in the kernel
+// refers to the op, so the caller frees it as before and this returns false. The proactor backends
+// answer differently -- see the long note in net/eventloop_windows.
+pub fn abandonOp(kq: int, op: long): bool {
+    if (op == (0 as long)) { return false; }
+    cancelRead(kq, opFd(op));
+    return false;   // caller still owns it
+}
+
 pub fn cancelWrite(kq: int, fd: int): void {
     kqueue.registerOne(kq, fd, kqueue.EVFILT_WRITE, kqueue.EV_DELETE, 0);
 }

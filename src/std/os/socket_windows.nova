@@ -15,7 +15,14 @@ pub fn newTcp(): int {
     winsock.startup();
     return winsock.socket(winsock.AF_INET, winsock.SOCK_STREAM, winsock.IPPROTO_TCP) as int;
 }
-pub fn close(fd: int): int { return winsock.closesocket(fd as long); }
+// `close` is ALSO a compiler builtin name (it maps to the runtime's POSIX `nova_close`), and an
+// UNQUALIFIED `close(fd)` in this file can bind to that builtin instead of to this function --
+// which one wins depends on the rest of the import graph, so it presents as a heisenbug. On POSIX
+// the two are equivalent; on Windows `_close` on a SOCKET trips the UCRT invalid-parameter handler
+// and the process dies via a silent __fastfail (exit 0xC0000409). Internal callers must therefore
+// use `closeSock`, never the bare name. See connectBlocking/listenAny below.
+fn closeSock(fd: int): int { return winsock.closesocket(fd as long); }
+pub fn close(fd: int): int { return closeSock(fd); }
 pub fn bindSock(fd: int, addr: ptr, addrlen: int): int { return winsock.bind(fd as long, addr, addrlen); }
 pub fn listenSock(fd: int, backlog: int): int { return winsock.listen(fd as long, backlog); }
 pub fn acceptSock(fd: int, addr: ptr, addrlen: ptr): int { return winsock.accept(fd as long, addr, addrlen) as int; }
@@ -133,7 +140,7 @@ pub fn connectBlocking(host: string, port: int): int {
     let sa = makeSockaddrIn(port, addr);
     let r = connectSock(fd, sa, 16);
     bytes.free(sa);
-    if (r != 0) { close(fd); return -1; }
+    if (r != 0) { closeSock(fd); return -1; }
     return fd;
 }
 // Windows SO_RCVTIMEO/SNDTIMEO take a DWORD milliseconds (not a timeval).
@@ -165,7 +172,7 @@ pub fn listenAny(port: int): int {
     let sa = makeSockaddrIn(port, 0);
     let br = bindSock(fd, sa, 16);
     bytes.free(sa);
-    if (br != 0 || listenSock(fd, 128) != 0) { close(fd); return -1; }
+    if (br != 0 || listenSock(fd, 128) != 0) { closeSock(fd); return -1; }
     return fd;
 }
 pub fn acceptOne(fd: int): int { return acceptSock(fd, 0, 0); }
