@@ -61,7 +61,13 @@ jobs:
             lang/zig-out/nova-*-macos-*.tar.gz.sha256
 
   build-linux:
-    runs-on: ubuntu-latest   # x86_64
+    # x86_64 + arm64. NOTE: ubuntu-24.04-arm is a GitHub-hosted arm64 runner -- free for public
+    # repos, BILLED for private repos (nova is private). Drop it from the matrix to avoid arm64 cost.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ ubuntu-latest, ubuntu-24.04-arm ]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
         with: { path: lang }
@@ -90,7 +96,7 @@ jobs:
         run: zig build archive -Dstatic-llvm=true
       - uses: actions/upload-artifact@v4
         with:
-          name: nova-linux-x86_64
+          name: nova-linux-${{ matrix.runner }}   # unique per matrix leg; the file itself encodes arch
           path: |
             lang/zig-out/nova-*-linux-*.tar.gz
             lang/zig-out/nova-*-linux-*.tar.gz.sha256
@@ -102,7 +108,13 @@ jobs:
   # (there is no static path there), so LLVM is installed via Chocolatey and LLVM-C.dll is bundled
   # next to nova.exe by the archive step.
   build-windows:
-    runs-on: windows-latest
+    # x86_64 + arm64. windows-11-arm is a GitHub-hosted arm64 runner (BILLED on private repos, and
+    # arm64 Windows LLVM support is even less certain). continue-on-error keeps both legs non-blocking.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ windows-latest, windows-11-arm ]
+    runs-on: ${{ matrix.runner }}
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -133,7 +145,7 @@ jobs:
         run: zig build archive   # NOT -Dstatic-llvm: Windows uses the dynamic LLVM-C path
       - uses: actions/upload-artifact@v4
         with:
-          name: nova-windows-x86_64
+          name: nova-windows-${{ matrix.runner }}   # unique per matrix leg; the file itself encodes arch
           path: |
             lang/zig-out/nova-*-windows-*.zip
             lang/zig-out/nova-*-windows-*.zip.sha256
