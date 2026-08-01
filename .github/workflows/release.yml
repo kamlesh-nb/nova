@@ -108,12 +108,14 @@ jobs:
   # (there is no static path there), so LLVM is installed via Chocolatey and LLVM-C.dll is bundled
   # next to nova.exe by the archive step.
   build-windows:
-    # x86_64 + arm64. windows-11-arm is a GitHub-hosted arm64 runner (BILLED on private repos, and
-    # arm64 Windows LLVM support is even less certain). continue-on-error keeps both legs non-blocking.
+    # x86_64 only. arm64 (windows-11-arm) was removed: the hosted arm64 Windows image ships no LLVM
+    # with the C-API dev libs (LLVM-C.lib/.dll) the build needs, so it fails with no way to fix short
+    # of providing a full arm64 Windows LLVM -- and it is a billed arm64 runner on this private repo.
+    # Re-add `windows-11-arm` to the matrix once such an LLVM is available to point NOVA_LLVM_PREFIX at.
     strategy:
       fail-fast: false
       matrix:
-        runner: [ windows-latest, windows-11-arm ]
+        runner: [ windows-latest ]
     runs-on: ${{ matrix.runner }}
     continue-on-error: true
     steps:
