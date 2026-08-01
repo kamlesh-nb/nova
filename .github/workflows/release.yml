@@ -1,21 +1,15 @@
 name: release
 
-# Build the per-OS toolchain bundles (`zig build archive`) and publish them to a GitHub Release.
+# Build all 6 Nova toolchain bundles (macOS/Linux/Windows x {x86_64, arm64}) and publish them to a
+# GitHub Release.
 #
-# WHY THIS SHAPE (every step uses a mechanism already proven in CI):
-#   * Only the `nova` repo is checked out. `nls` (the language server) lives in a SEPARATE PRIVATE
-#     repo, which the workflow's default GITHUB_TOKEN cannot access -- checking it out is what broke
-#     the first version of this file. So CI SKIPS nls (NOVA_ARCHIVE_SKIP_NLS=1) and ships a
-#     nova+runtime+stdlib bundle. nls is released from its own repo (see "nls" note at the bottom).
-#   * LLVM is installed from the OS package manager (brew on macOS, apt.llvm.org on Linux) and the
-#     build is pointed at it via NOVA_LLVM_PREFIX. With -Dstatic-llvm, build.zig GLOBS that install's
-#     own libLLVM*.a component archives, so it works against any stock LLVM 21 -- no private mirror
-#     repo, no committed lib-list upkeep. The resulting nova binary is self-contained (statically
-#     links LLVM; verified locally on macOS: `otool -L` shows no libLLVM, and it compiles+runs).
-#   * macOS + Linux each build their OWN bundle on their runner (a toolchain bundle must be built where
-#     it runs). Windows is deferred until native `zig build` works there (stub at the bottom).
+#   * LLVM 21 is installed from the OS package manager and the build is pointed at it via
+#     NOVA_LLVM_PREFIX. macOS/Linux static-link (build.zig globs the install's libLLVM*.a);
+#     Windows dynamic-links LLVM-C and bundles LLVM-C.dll next to nova.exe.
+#   * nls (a separate private repo) is not built here (NOVA_ARCHIVE_SKIP_NLS=1).
+#   * NOTE: arm64 Linux/Windows runners are BILLED on private repos.
 #
-# Trigger: push a tag like `v0.1.0`, or run manually with a version input.
+# Trigger: push a tag `v*`, or run manually (Actions -> release -> Run workflow) with a version.
 
 on:
   push:
@@ -28,51 +22,50 @@ on:
         default: "v0.0.0-dev"
 
 permissions:
-  contents: write   # create the Release and upload assets on THIS repo (default token suffices)
+  contents: write
 
 env:
   NOVA_VERSION: ${{ github.event.inputs.version || github.ref_name }}
+  NOVA_ARCHIVE_SKIP_NLS: "1"
 
 jobs:
   build-macos:
-    runs-on: macos-14   # Apple Silicon (arm64)
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ macos-14, macos-13 ]   # arm64, x86_64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-        with: { path: lang }   # cwd layout the archive step expects: lang/ (+ nls/ when not skipped)
-      - name: Install Zig 0.16.0
-        uses: mlugg/setup-zig@v2
+        with: { path: lang }
+      - uses: mlugg/setup-zig@v2
         with: { version: 0.16.0 }
       - name: Install LLVM 21 (Homebrew) and point the build at it
         run: |
-          brew install llvm
-          echo "NOVA_LLVM_PREFIX=$(brew --prefix llvm)" >> "$GITHUB_ENV"
-          "$(brew --prefix llvm)/bin/llvm-config" --version
-      - name: Build archive (static-link against the installed LLVM; nls from its own repo)
+          brew install llvm@21 || brew install llvm
+          PREFIX="$(brew --prefix llvm@21 2>/dev/null || brew --prefix llvm)"
+          echo "NOVA_LLVM_PREFIX=$PREFIX" >> "$GITHUB_ENV"
+          "$PREFIX/bin/llvm-config" --version
+      - name: Build archive
         working-directory: lang
-        env: { NOVA_ARCHIVE_SKIP_NLS: "1" }
-        # -Dstatic-llvm + NOVA_LLVM_PREFIX -> build.zig globs the installed LLVM's own libLLVM*.a
-        # (no private mirror). Self-contained binary: nova does not dynamically link libLLVM.
         run: zig build archive -Dstatic-llvm=true
       - uses: actions/upload-artifact@v4
         with:
-          name: nova-macos-aarch64
+          name: nova-macos-${{ matrix.runner }}   # unique per leg; the filename encodes the real arch
           path: |
             lang/zig-out/nova-*-macos-*.tar.gz
             lang/zig-out/nova-*-macos-*.tar.gz.sha256
 
   build-linux:
-    # x86_64 + arm64. NOTE: ubuntu-24.04-arm is a GitHub-hosted arm64 runner -- free for public
-    # repos, BILLED for private repos (nova is private). Drop it from the matrix to avoid arm64 cost.
     strategy:
       fail-fast: false
       matrix:
-        runner: [ ubuntu-latest, ubuntu-24.04-arm ]
+        runner: [ ubuntu-latest, ubuntu-24.04-arm ]   # x86_64, arm64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
         with: { path: lang }
-      - name: Install Zig 0.16.0
-        uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@v2
         with: { version: 0.16.0 }
       - name: Install LLVM 21 (apt.llvm.org) + static-link deps, point the build at it
         run: |
@@ -80,113 +73,88 @@ jobs:
           sudo apt-get install -y llvm-21-dev libzstd-dev zlib1g-dev libxml2-dev liblzma-dev
           echo "NOVA_LLVM_PREFIX=/usr/lib/llvm-21" >> "$GITHUB_ENV"
           /usr/lib/llvm-21/bin/llvm-config --version
-          ls /usr/lib/llvm-21/lib/libLLVM*.a | head -3   # confirm static component archives are present
-          # apt's LLVM does NOT bundle libstdc++.so/libgcc_s.so (they are system libs). Expose them
-          # under the exact names the static link expects and point NOVA_LLVM_STDCXX_DIR at them.
+          # apt's LLVM does not bundle libstdc++.so/libgcc_s.so (system libs); expose them under the
+          # exact names the static link expects and point NOVA_LLVM_STDCXX_DIR at them.
           mkdir -p "$HOME/stdcxx"
           ln -sf "$(g++ -print-file-name=libstdc++.so)" "$HOME/stdcxx/libstdc++.so"
           ln -sf "$(gcc -print-file-name=libgcc_s.so.1)" "$HOME/stdcxx/libgcc_s.so"
           echo "NOVA_LLVM_STDCXX_DIR=$HOME/stdcxx" >> "$GITHUB_ENV"
-          ls -lL "$HOME/stdcxx"   # -L: resolve the symlinks, proving the targets exist
-      - name: Build archive (static-link against the installed LLVM; nls from its own repo)
+      - name: Build archive
         working-directory: lang
-        env: { NOVA_ARCHIVE_SKIP_NLS: "1" }
-        # -Dstatic-llvm + NOVA_LLVM_PREFIX -> build.zig globs /usr/lib/llvm-21/lib/libLLVM*.a
-        # (no private mirror). Self-contained binary: nova does not dynamically link libLLVM.
         run: zig build archive -Dstatic-llvm=true
       - uses: actions/upload-artifact@v4
         with:
-          name: nova-linux-${{ matrix.runner }}   # unique per matrix leg; the file itself encodes arch
+          name: nova-linux-${{ matrix.runner }}
           path: |
             lang/zig-out/nova-*-linux-*.tar.gz
             lang/zig-out/nova-*-linux-*.tar.gz.sha256
 
-  # BEST-EFFORT: native Windows `zig build` is the current bring-up frontier and is NOT yet
-  # run-verified (the install step + LLVM link on a bare Windows host). continue-on-error means a
-  # failure here does NOT block the mac/linux release; when the bring-up lands, this job goes green
-  # and its artifact is picked up automatically. On Windows the compiler DYNAMICALLY links LLVM-C
-  # (there is no static path there), so LLVM is installed via Chocolatey and LLVM-C.dll is bundled
-  # next to nova.exe by the archive step.
   build-windows:
-    # x86_64 only. arm64 (windows-11-arm) was removed: the hosted arm64 Windows image ships no LLVM
-    # with the C-API dev libs (LLVM-C.lib/.dll) the build needs, so it fails with no way to fix short
-    # of providing a full arm64 Windows LLVM -- and it is a billed arm64 runner on this private repo.
-    # Re-add `windows-11-arm` to the matrix once such an LLVM is available to point NOVA_LLVM_PREFIX at.
     strategy:
       fail-fast: false
       matrix:
-        runner: [ windows-latest ]
+        runner: [ windows-latest, windows-11-arm ]   # x86_64, arm64
     runs-on: ${{ matrix.runner }}
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
         with: { path: lang }
-      - name: Install Zig 0.16.0
-        uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@v2
         with: { version: 0.16.0 }
-      - name: Locate LLVM and point the build at it (best-effort; do not fail here)
+      - name: Ensure LLVM (with C-API dev libs) and point the build at it
         shell: pwsh
         run: |
-          # windows-latest preinstalls LLVM (clang/lld) but typically WITHOUT the C-API dev files
-          # (LLVM-C.lib / LLVM-C.dll / llvm-config) that nova needs. Discover whatever is present and
-          # report the gap; the real test is the build step (this whole job is continue-on-error).
-          $prefix = $null
-          $clang = Get-Command clang.exe -ErrorAction SilentlyContinue
-          if (Test-Path "C:/Program Files/LLVM/bin/clang.exe") { $prefix = "C:/Program Files/LLVM" }
-          elseif ($clang) { $prefix = Split-Path (Split-Path $clang.Source) }
-          else { $prefix = "C:/Program Files/LLVM" }   # fallback; the build will report if wrong
+          # Prefer a preinstalled LLVM (windows-latest ships one with LLVM-C.lib). If it is missing or
+          # lacks the C-API import lib (e.g. the arm64 image), install via Chocolatey.
+          function Find-Prefix {
+            if (Test-Path "C:/Program Files/LLVM/lib/LLVM-C.lib") { return "C:/Program Files/LLVM" }
+            $clang = Get-Command clang.exe -ErrorAction SilentlyContinue
+            if ($clang) {
+              $p = Split-Path (Split-Path $clang.Source)
+              if (Test-Path "$p/lib/LLVM-C.lib") { return $p }
+            }
+            return $null
+          }
+          $prefix = Find-Prefix
+          if (-not $prefix) {
+            Write-Host "No LLVM with LLVM-C.lib found; installing via Chocolatey..."
+            choco install llvm --no-progress -y
+            $prefix = Find-Prefix
+            if (-not $prefix) { $prefix = "C:/Program Files/LLVM" }
+          }
           echo "NOVA_LLVM_PREFIX=$prefix" >> $env:GITHUB_ENV
           Write-Host "LLVM prefix: $prefix"
-          if (Test-Path "$prefix/bin/llvm-config.exe") { & "$prefix/bin/llvm-config.exe" --version }
-          else { Write-Host "llvm-config.exe: absent (normal for the stock Windows LLVM)" }
-          Write-Host ("LLVM-C.lib present: " + (Test-Path "$prefix/lib/LLVM-C.lib"))
-          Write-Host ("LLVM-C.dll present: " + (Test-Path "$prefix/bin/LLVM-C.dll"))
-      - name: Build archive (dynamic LLVM-C; nls from its own repo)
+          Write-Host ("LLVM-C.lib: " + (Test-Path "$prefix/lib/LLVM-C.lib") + " | LLVM-C.dll: " + (Test-Path "$prefix/bin/LLVM-C.dll"))
+      - name: Build archive (dynamic LLVM-C; bundles LLVM-C.dll)
         working-directory: lang
-        env: { NOVA_ARCHIVE_SKIP_NLS: "1" }
         run: zig build archive   # NOT -Dstatic-llvm: Windows uses the dynamic LLVM-C path
       - uses: actions/upload-artifact@v4
         with:
-          name: nova-windows-${{ matrix.runner }}   # unique per matrix leg; the file itself encodes arch
+          name: nova-windows-${{ matrix.runner }}
           path: |
             lang/zig-out/nova-*-windows-*.zip
             lang/zig-out/nova-*-windows-*.zip.sha256
 
   release:
-    # build-windows is included so the release WAITS for it, but it is continue-on-error, so a
-    # Windows failure does not block the release -- mac/linux still ship, windows joins when it works.
     needs: [ build-macos, build-linux, build-windows ]
     runs-on: ubuntu-latest
     steps:
-      - name: Download all archives
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with: { path: dist }
-      - name: Flatten + combined checksums
+      - name: Collect + checksums
         run: |
           mkdir -p out
           find dist -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' \) -exec cp {} out/ \;
-          # checksum whatever archives actually arrived (windows may be absent)
           ( cd out && sha256sum nova-*.tar.gz nova-*.zip 2>/dev/null > SHA256SUMS.txt || true )
           ls -la out
-      - name: Publish GitHub Release (uploads via the gh-backed action)
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.NOVA_VERSION }}
           name: Nova ${{ env.NOVA_VERSION }}
           generate_release_notes: true
-          fail_on_unmatched_files: false   # windows .zip may be absent
           files: |
             out/nova-*.tar.gz
             out/nova-*.tar.gz.sha256
             out/nova-*.zip
             out/nova-*.zip.sha256
             out/SHA256SUMS.txt
-
-  # ---------------------------------------------------------------------------------------------
-  # nls (language server): NOT built here. It is a separate PRIVATE repo (kamlesh-nb/nls) whose
-  # build links LLVM its own way and cannot use -Dstatic-llvm. To include it in releases, either:
-  #   (a) add a release workflow to the nls repo that runs `zig build` + uploads nova-nls-<os>-<arch>,
-  #       OR
-  #   (b) grant this workflow read access to nls (a fine-grained PAT stored as secret NLS_TOKEN),
-  #       add `actions/checkout` of kamlesh-nb/nls with `token: ${{ secrets.NLS_TOKEN }}` into a
-  #       sibling `nls/` dir, drop NOVA_ARCHIVE_SKIP_NLS, and provision LLVM for the nls link.
