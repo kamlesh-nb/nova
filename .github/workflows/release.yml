@@ -110,15 +110,23 @@ jobs:
       - name: Install Zig 0.16.0
         uses: mlugg/setup-zig@v2
         with: { version: 0.16.0 }
-      - name: Install LLVM (Chocolatey) and point the build at it
+      - name: Locate LLVM and point the build at it (best-effort; do not fail here)
         shell: pwsh
         run: |
-          choco install llvm --no-progress -y
-          $prefix = "C:/Program Files/LLVM"
+          # windows-latest preinstalls LLVM (clang/lld) but typically WITHOUT the C-API dev files
+          # (LLVM-C.lib / LLVM-C.dll / llvm-config) that nova needs. Discover whatever is present and
+          # report the gap; the real test is the build step (this whole job is continue-on-error).
+          $prefix = $null
+          $clang = Get-Command clang.exe -ErrorAction SilentlyContinue
+          if (Test-Path "C:/Program Files/LLVM/bin/clang.exe") { $prefix = "C:/Program Files/LLVM" }
+          elseif ($clang) { $prefix = Split-Path (Split-Path $clang.Source) }
+          else { $prefix = "C:/Program Files/LLVM" }   # fallback; the build will report if wrong
           echo "NOVA_LLVM_PREFIX=$prefix" >> $env:GITHUB_ENV
-          & "$prefix/bin/llvm-config.exe" --version
-          # dynamic link needs the import lib; report whether it is present (dev files vary by package)
-          Test-Path "$prefix/lib/LLVM-C.lib" | ForEach-Object { Write-Host "LLVM-C.lib present: $_" }
+          Write-Host "LLVM prefix: $prefix"
+          if (Test-Path "$prefix/bin/llvm-config.exe") { & "$prefix/bin/llvm-config.exe" --version }
+          else { Write-Host "llvm-config.exe: absent (normal for the stock Windows LLVM)" }
+          Write-Host ("LLVM-C.lib present: " + (Test-Path "$prefix/lib/LLVM-C.lib"))
+          Write-Host ("LLVM-C.dll present: " + (Test-Path "$prefix/bin/LLVM-C.dll"))
       - name: Build archive (dynamic LLVM-C; nls from its own repo)
         working-directory: lang
         env: { NOVA_ARCHIVE_SKIP_NLS: "1" }
