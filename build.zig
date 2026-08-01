@@ -545,7 +545,13 @@ fn addNovaArchive(b: *std.Build, exe: *std.Build.Step.Compile) void {
             \\# self-installer: copy the tree into the user's ~/.nova
             \\Set-Content "$stage/install.ps1" '$d="$env:USERPROFILE/.nova"; New-Item -ItemType Directory -Force -Path "$d/bin","$d/lib" | Out-Null; Copy-Item -Recurse -Force ./* "$d/"; Write-Host "Installed Nova to $d"'
             \\Compress-Archive -Force -Path "$stage/*" -DestinationPath "zig-out/{[bundle]s}.zip"
-            \\(Get-FileHash "zig-out/{[bundle]s}.zip" -Algorithm SHA256).Hash.ToLower() + "  {[bundle]s}.zip" | Set-Content "zig-out/{[bundle]s}.zip.sha256"
+            \\# SHA256 via .NET types, NOT Get-FileHash: the powershell this build spawns does not
+            \\# reliably autoload the Utility module (PSModulePath is not set), so Get-FileHash is
+            \\# "not recognized". [System.Security.Cryptography] is always available.
+            \\$bytes = [System.IO.File]::ReadAllBytes("zig-out/{[bundle]s}.zip")
+            \\$sha = [System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes)
+            \\$hex = ($sha | ForEach-Object {{ $_.ToString("x2") }}) -join ""
+            \\Set-Content "zig-out/{[bundle]s}.zip.sha256" "$hex  {[bundle]s}.zip"
             \\Write-Host "archive:  zig-out/{[bundle]s}.zip"
             \\Write-Host "checksum: zig-out/{[bundle]s}.zip.sha256"
             \\
