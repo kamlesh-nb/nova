@@ -226,6 +226,40 @@ void nova_op_free(long long op) {
   std::free((void *)(intptr_t)op);
 }
 
+// --- I/O accounting (opt-in: NOVA_IO_WATCHDOG=1) ------------------------------------------------
+// Answers the one question a stalled proactor cannot otherwise be asked: are operations OUTSTANDING
+// in the kernel (issued but never completed), or has the application simply stopped issuing them?
+// Those two have completely different causes and are indistinguishable from the outside -- in both
+// the process sits at 0% CPU with connections established.
+namespace {
+std::atomic<long long> g_io_issued{0};
+std::atomic<long long> g_io_completed{0};
+std::atomic<long long> g_resume_skipped{0};
+std::atomic<bool> g_io_watchdog_started{false};
+}
+
+extern "C" void nova_io_stat_issued(void)    { g_io_issued.fetch_add(1, std::memory_order_relaxed); }
+extern "C" void nova_io_stat_completed(void) { g_io_completed.fetch_add(1, std::memory_order_relaxed); }
+extern "C" void nova_io_stat_resume_skipped(void) { g_resume_skipped.fetch_add(1, std::memory_order_relaxed); }
+
+extern "C" void nova_io_watchdog_start(void) {
+  if (!std::getenv("NOVA_IO_WATCHDOG")) return;
+  bool expected = false;
+  if (!g_io_watchdog_started.compare_exchange_strong(expected, true)) return;
+  std::thread([] {
+    long long prev_i = -1, prev_c = -1;
+    for (;;) {
+      std::this_thread::sleep_for(std::chrono::seconds(2));
+      long long i = g_io_issued.load(std::memory_order_relaxed);
+      long long c = g_io_completed.load(std::memory_order_relaxed);
+      const char *tag = (i == prev_i && c == prev_c) ? "  <- IDLE (nothing moving)" : "";
+      std::fprintf(stderr, "nova io: issued=%lld completed=%lld outstanding=%lld resume_skipped=%lld%s\n",
+                   i, c, i - c, g_resume_skipped.load(std::memory_order_relaxed), tag);
+      prev_i = i; prev_c = c;
+    }
+  }).detach();
+}
+
 long long nova_ffi_errno(void) { return (long long)errno; }
 void nova_ffi_set_errno(long long v) { errno = (int)v; }
 // fcntl is variadic; a non-variadic FFI declaration mispasses the third arg on some ABIs

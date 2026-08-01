@@ -108,6 +108,7 @@ fn queued(rc: int): int {
 // Zero the OVERLAPPED and issue the overlapped I/O for an op. accept/connect require AcceptEx /
 // ConnectEx (follow-on). The socket must already be associated with the port — see ensureAssociated.
 fn issue(op: long): int {
+    nova_io_stat_issued();
     bytes.write_ptr(op, 0, 0);  bytes.write_ptr(op, 8, 0);
     bytes.write_ptr(op, 16, 0); bytes.write_ptr(op, 24, 0);
     let kind = opKind(op);
@@ -202,6 +203,9 @@ pub const EVENT_SIZE: int = 32;   // OVERLAPPED_ENTRY, so the reactor's event bu
 // when data arrives and consumes none of it, so the completion is the readiness edge and the caller
 // then performs a normal read — which is what the readiness API promises. The op record has to
 // outlive the call, so one is kept per armed fd in the runtime (see nova_reactor_arm_get).
+extern("c") fn nova_io_stat_issued(): void;
+extern("c") fn nova_io_stat_completed(): void;
+extern("c") fn nova_io_watchdog_start(): void;
 extern("c") fn nova_reactor_arm_get(fd: int): long;
 extern("c") fn nova_reactor_arm_set(fd: int, op: long): void;
 extern("c") fn nova_op_alloc(size: long): long;
@@ -336,6 +340,7 @@ pub struct Poller impl EventLoop {
         self.port = windows.CreateIoCompletionPort(windows.INVALID_HANDLE, 0, 0, 0);
         self.kq = self.port as int;
         self.maxEvents = maxEvents;
+        nova_io_watchdog_start();
         self.eventBuf = bytes.alloc(maxEvents * windows.OVERLAPPED_ENTRY_SIZE);
         self.compBuf = bytes.alloc(maxEvents * 8);
         self.removedBuf = bytes.alloc(4);
@@ -386,6 +391,7 @@ pub struct Poller impl EventLoop {
                 } else if (key == WAKE_KEY) {
                     // Cross-reactor wake: returning from the poll is the whole point of it.
                 } else if (ov != (0 as long)) {
+                    nova_io_stat_completed();
                     if (opDone(ov) == OP_ABANDONED) {
                         // The awaiting coroutine gave up (a read deadline) while this overlapped op
                         // was still in the kernel. Ownership of the record was transferred to this

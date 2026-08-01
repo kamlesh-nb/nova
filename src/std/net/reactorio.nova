@@ -123,7 +123,14 @@ pub struct ReactorStream {
         // byte count the loop filled in. The op record + buf are on this frame, so they outlive the op.
         let op = nova_op_alloc(eventloop.OP_SIZE as long);
         eventloop.makeOp(op, eventloop.OP_RECV, self.fd, buf, max, currentCoro());
-        eventloop.submit(self.kq, op);
+        // A FAILED submit posts NO completion, so suspending here waits forever. This is what every
+        // mature proactor does -- cf. libhv event/overlapio.c, where WSARecv/WSASend/AcceptEx return
+        // the error straight to the caller when it is not ERROR_IO_PENDING and no completion
+        // callback ever runs. On Windows the realistic trigger is WSAENOBUFS (the locked-pages
+        // limit), hit exactly when many concurrent overlapped receives are outstanding -- which is
+        // why the resulting stall was load-dependent and stranded individual connections. Freeing is
+        // safe here precisely because nothing is coming: the kernel never took the record.
+        if (eventloop.submit(self.kq, op) != 0) { nova_op_free(op); return -1; }
         coroSuspend();
         // A resume is not proof that THIS op finished -- a stale timer or a batch wake can resume
         // the coroutine while the operation is still in flight. Freeing on such a wake returns the
@@ -152,7 +159,8 @@ pub struct ReactorStream {
         // done), and the duplicate timer wake is skipped by the batch reap guard.
         let op = nova_op_alloc(eventloop.OP_SIZE as long);
         eventloop.makeOp(op, eventloop.OP_RECV, self.fd, buf, max, currentCoro());
-        eventloop.submit(self.kq, op);
+        // See recvInto: no completion follows a failed submit, so neither suspend nor arm a timer.
+        if (eventloop.submit(self.kq, op) != 0) { nova_op_free(op); return -1; }
         nova_reactor_set_timer(currentCoro(), timeoutMs as long);
         coroSuspend();
         nova_reactor_cancel_timer(currentCoro());
@@ -178,7 +186,7 @@ pub struct ReactorStream {
         while (sent < len) {
             let op = nova_op_alloc(eventloop.OP_SIZE as long);
             eventloop.makeOp(op, eventloop.OP_SEND, self.fd, buf + (sent as long), len - sent, currentCoro());
-            eventloop.submit(self.kq, op);
+            if (eventloop.submit(self.kq, op) != 0) { nova_op_free(op); return -1; }
             coroSuspend();
             while (eventloop.opDone(op) != 1) { coroSuspend(); }   // see recvInto
             let w = eventloop.opResult(op);
@@ -249,7 +257,7 @@ pub async fn reactorConnect(host: string, port: int, kq: int): ReactorStream {
         if (!socket.connectInProgress()) { socket.close(fd); return ReactorStream(-1, kq); }
         let op = nova_op_alloc(eventloop.OP_SIZE as long);
         eventloop.makeOp(op, eventloop.OP_CONNECT, fd, 0, 0, currentCoro());
-        eventloop.submit(kq, op);
+        if (eventloop.submit(kq, op) != 0) { nova_op_free(op); return -1; }
         coroSuspend();
         let res = eventloop.opResult(op);
         nova_op_free(op);
@@ -266,7 +274,9 @@ pub async fn reactorAccept(listenFd: int, kq: int): ReactorStream {
     // sets the accepted fd non-blocking, and reports it as the op result (or -1). One accept per op.
     let op = nova_op_alloc(eventloop.OP_SIZE as long);
     eventloop.makeOp(op, eventloop.OP_ACCEPT, listenFd, 0, 0, currentCoro());
-    eventloop.submit(kq, op);
+    // Especially important here: an acceptor suspended on a failed submit stops accepting on this
+    // listener for the life of the process.
+    if (eventloop.submit(kq, op) != 0) { nova_op_free(op); return -1; }
     coroSuspend();
     let c = eventloop.opResult(op);
     nova_op_free(op);

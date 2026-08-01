@@ -232,7 +232,7 @@ Measured on a 4-core box with the load generator CO-RESIDENT, so these are lower
 | Nova reactor / io_uring | ~65,000 | 0.93 | 299,995/300,000 |
 | web.app / epoll | 26,599 | ~3 | 100% |
 | web.app / io_uring | ~30,000 | ~3 | 100% |
-| web.app / IOCP (Windows) | 16,620 (`-z`) | ~3 | see stall below |
+| web.app / IOCP (Windows) | ~11,300-13,200 | ~3 | 300,000/300,000 |
 
 ### The kqueue gap is mostly the ENVIRONMENT — measured, not assumed
 
@@ -295,13 +295,29 @@ Rules that follow, all of which were violated and cost real debugging:
 - One outstanding op per record. Re-issuing on a live OVERLAPPED destroys the first op's bookkeeping.
 - Dropping an arm does not free it — cancel, and leave the record in the per-fd arm map for reuse.
 
-### Known open: IOCP strands connections at high concurrency
+### A coroutine handle is a FRAME ADDRESS — and addresses get recycled
 
-At c>=50 a fraction of connections are never served: the acceptor stays healthy (a fresh request gets
-200) and the server goes fully idle, but those connections' `WSARecv` completions never arrive. Four
-contributors of the class above are fixed and it went from always-stalling to ~1-in-3 runs; the last
-one is not found. Reproduce with `oha -n 5000 -c 50` — and note it is INVISIBLE to a `-z` run. Go
-net/http on the same box with the same command completes, so it is ours, not oha-on-Windows.
+This one cost days and hid behind four unrelated-looking fixes, so it is worth stating outright.
+`nova_reactor_resume` skips handles recorded in `g_batch_reaped`, a guard that exists so a stale
+deadline-timer event cannot resume a coroutine whose frame was already freed this batch. But the
+handle IS the frame address, frames are heap-allocated, and the set is only cleared at the START of
+a batch. So when a frame was reaped mid-batch and the allocator handed the SAME address to a
+brand-new coroutine, that coroutine inherited the stale mark and its first legitimate resume was
+dropped on the floor — leaving its connection ESTABLISHED forever with nothing outstanding and the
+server at 0% CPU. `nova_reactor_detach` now erases the mark: reaching it means the address is live
+again.
+
+It presented as a Windows/IOCP bug (stalls at c>=50) but lives in `concurrency.cpp` and is shared by
+ALL backends — IOCP merely hit the timing first. Any "connection hangs and the server is idle" report
+on any backend should suspect this shape.
+
+**Diagnosing this class**: two opt-in runtime facilities exist because inference was not enough.
+`NOVA_IO_WATCHDOG=1` prints `issued/completed/outstanding/resume_skipped` every 2s, which separates
+the three possibilities that look identical from outside — the kernel never completed an operation
+(outstanding stuck > the parked acceptors), the app stopped issuing one (outstanding == acceptors),
+or a resume was swallowed (resume_skipped > 0). `NOVA_CRASH_TRACE=1` prints a backtrace and fault
+address on an alternate signal stack, so a stack-exhaustion SIGSEGV still reports instead of dying
+silently. Measure before theorising; each of these ruled out an entire class in one run.
 
 ### Readiness on a proactor
 

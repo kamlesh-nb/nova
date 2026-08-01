@@ -48,6 +48,7 @@ extern "C" int64_t nova_mono_ms(void);
 // nova_reactor_resume is defined further down; the IOCP support below (and only it) needs it
 // ahead of that definition.
 extern "C" long long nova_reactor_resume(long long handle);
+extern "C" void nova_io_stat_resume_skipped(void);
 
 // --- readiness emulation over a proactor ---------------------------------------------------------
 // Neither IOCP nor io_uring has "tell me when this fd is readable" — you hand them an operation, not
@@ -651,10 +652,19 @@ thread_local bool g_reactor_mode = false;
 // These are reaped when they finish. A spawned-and-awaited coroutine is NOT here: it is reaped by
 // its awaiter (via nova_coro_release), so it must survive completion until the await reads it.
 thread_local std::unordered_set<long long> *g_detached = nullptr;
+// Defined further down with the batch bookkeeping; needed here so a newly-detached coroutine can
+// clear a stale reap mark left on its (recycled) frame address.
+extern thread_local std::unordered_set<long long> *g_batch_reaped;
 
 extern "C" void nova_reactor_detach(long long h) {
     if (!g_detached) g_detached = new std::unordered_set<long long>();
     g_detached->insert(h);
+    // A coroutine handle IS its frame address, and frames are heap-allocated. So an address reaped
+    // earlier in THIS batch can be handed straight back out by the allocator to this brand-new
+    // coroutine — which then inherits the stale "already reaped" mark and has its first legitimate
+    // resume silently dropped, stranding it (and its connection) forever. Reaching here means the
+    // address belongs to a LIVE coroutine again, so the mark must go.
+    if (g_batch_reaped) g_batch_reaped->erase(h);
     NOVA_TRACE("detach h=%lld", h);
 }
 
@@ -885,7 +895,7 @@ extern "C" long long nova_reactor_resume(long long h) {
     }
     // A stale event (e.g. a deadline timer) for a coroutine already reaped this batch: skip without
     // dereferencing its freed frame.
-    if (g_batch_reaped && g_batch_reaped->count(h)) return 1;
+    if (g_batch_reaped && g_batch_reaped->count(h)) { nova_io_stat_resume_skipped(); return 1; }
     if (!h || raw_coro_done(h)) return 1;
     NOVA_TRACE("reactor_resume enter h=%lld", h);
     raw_coro_resume(h);
