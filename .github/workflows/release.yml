@@ -71,10 +71,17 @@ jobs:
       - name: Install LLVM 21 (apt.llvm.org) + static-link deps, point the build at it
         run: |
           wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 21
-          sudo apt-get install -y llvm-21-dev libzstd-dev zlib1g-dev libxml2-dev
+          sudo apt-get install -y llvm-21-dev libzstd-dev zlib1g-dev libxml2-dev liblzma-dev
           echo "NOVA_LLVM_PREFIX=/usr/lib/llvm-21" >> "$GITHUB_ENV"
           /usr/lib/llvm-21/bin/llvm-config --version
           ls /usr/lib/llvm-21/lib/libLLVM*.a | head -3   # confirm static component archives are present
+          # apt's LLVM does NOT bundle libstdc++.so/libgcc_s.so (they are system libs). Expose them
+          # under the exact names the static link expects and point NOVA_LLVM_STDCXX_DIR at them.
+          mkdir -p "$HOME/stdcxx"
+          ln -sf "$(g++ -print-file-name=libstdc++.so)" "$HOME/stdcxx/libstdc++.so"
+          ln -sf "$(gcc -print-file-name=libgcc_s.so.1)" "$HOME/stdcxx/libgcc_s.so"
+          echo "NOVA_LLVM_STDCXX_DIR=$HOME/stdcxx" >> "$GITHUB_ENV"
+          ls -lL "$HOME/stdcxx"   # -L: resolve the symlinks, proving the targets exist
       - name: Build archive (static-link against the installed LLVM; nls from its own repo)
         working-directory: lang
         env: { NOVA_ARCHIVE_SKIP_NLS: "1" }
