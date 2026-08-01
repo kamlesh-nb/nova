@@ -14,9 +14,8 @@ name: windows
 # stays green on what works and lights up new tests as their Windows support lands.
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
+  # MANUAL ONLY. Not on push/PR: this uses a BILLED Windows runner on a private repo. Run it
+  # deliberately from Actions -> windows -> Run workflow.
   workflow_dispatch:
 
 jobs:
