@@ -539,8 +539,10 @@ fn addNovaArchive(b: *std.Build, exe: *std.Build.Step.Compile) void {
             \\if ($env:NOVA_LLVM_PREFIX) {{ Copy-Item -Force "$env:NOVA_LLVM_PREFIX/bin/LLVM-C.dll" "$stage/bin/" -ErrorAction SilentlyContinue }}
             \\Copy-Item -Force "{[home]s}/.nova/lib/libnova_runtime.a" "$stage/lib/"
             \\Copy-Item -Recurse -Force "{[home]s}/.nova/std" "$stage/std"
-            \\Copy-Item -Recurse -Force "{[home]s}/.nova/src" "$stage/src"
-            \\Copy-Item -Recurse -Force "{[home]s}/.nova/deps" "$stage/deps"
+            \\# NOTE: src/runtime + deps are NOT bundled -- the prebuilt libnova_runtime.a covers
+            \\# host-target compilation. They are only needed to cross-compile the runtime to OTHER
+            \\# targets (nova build --target) or to build webview FFI apps; add them back if the
+            \\# shipped toolchain must do that.
             \\Set-Content "$stage/VERSION" "{[version]s}"
             \\# self-installer: copy the tree into the user's ~/.nova
             \\Set-Content "$stage/install.ps1" '$d="$env:USERPROFILE/.nova"; New-Item -ItemType Directory -Force -Path "$d/bin","$d/lib" | Out-Null; Copy-Item -Recurse -Force ./* "$d/"; Write-Host "Installed Nova to $d"'
@@ -580,8 +582,9 @@ fn addNovaArchive(b: *std.Build, exe: *std.Build.Step.Compile) void {
         \\fi
         \\cp "{[home]s}/.nova/lib/libnova_runtime.a" "$STAGE/lib/"
         \\rsync -a "{[home]s}/.nova/std/" "$STAGE/std/"
-        \\rsync -a "{[home]s}/.nova/src/" "$STAGE/src/"
-        \\rsync -a "{[home]s}/.nova/deps/" "$STAGE/deps/"
+        \\# NOTE: src/runtime + deps are NOT bundled -- the prebuilt libnova_runtime.a covers host-target
+        \\# compilation. They are only needed to cross-compile the runtime to OTHER targets
+        \\# (nova build --target) or to build webview FFI apps; add them back if that is required.
         \\printf '%s\n' "{[version]s}" > "$STAGE/VERSION"
         \\# self-installer: copy the tree into the user's ~/.nova
         \\cat > "$STAGE/install.sh" <<'INSTALL'
@@ -591,7 +594,7 @@ fn addNovaArchive(b: *std.Build, exe: *std.Build.Step.Compile) void {
         \\mkdir -p "$D/bin" "$D/lib"
         \\cp -R ./bin/* "$D/bin/"
         \\cp -R ./lib/* "$D/lib/"
-        \\cp -R ./std "$D/" ; cp -R ./src "$D/" ; cp -R ./deps "$D/"
+        \\cp -R ./std "$D/"
         \\echo "Installed Nova to $D (add $D/bin to PATH)"
         \\INSTALL
         \\chmod +x "$STAGE/install.sh"
