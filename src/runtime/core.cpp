@@ -32,7 +32,13 @@
 // that into lines. Async-signal-safe: only backtrace(), write(), and _exit() run in the handler.
 #if defined(__linux__) || defined(__APPLE__)
 #include <csignal>
+// backtrace()/execinfo.h exist on glibc and macOS, but NOT musl (musl ships no execinfo.h). Gate the
+// stack-trace parts so a musl cross-compile (e.g. x86_64-linux-musl, the T1 static Linux target) still
+// builds; on musl the handler prints the signal + fault address without frames.
+#if defined(__GLIBC__) || defined(__APPLE__)
 #include <execinfo.h>
+#define NOVA_HAVE_BACKTRACE 1
+#endif
 
 namespace {
 void nova_write_lit(const char *s) { (void)!::write(2, s, std::strlen(s)); }
@@ -47,8 +53,10 @@ void nova_write_hex(unsigned long long v) {
 }
 
 void nova_crash_handler(int sig, siginfo_t *info, void *) {
+#if defined(NOVA_HAVE_BACKTRACE)
   void *frames[64];
   int n = ::backtrace(frames, 64);
+#endif
   nova_write_lit("\n=== NOVA CRASH: fatal signal ");
   nova_write_hex((unsigned long long)sig);
   // The faulting address is the whole diagnosis for a bad dereference: near-zero means a null
@@ -56,7 +64,11 @@ void nova_crash_handler(int sig, siginfo_t *info, void *) {
   nova_write_lit(" at fault addr ");
   nova_write_hex((unsigned long long)(uintptr_t)(info ? info->si_addr : nullptr));
   nova_write_lit(" ===\n");
+#if defined(NOVA_HAVE_BACKTRACE)
   ::backtrace_symbols_fd(frames, n, 2);
+#else
+  nova_write_lit("(no backtrace: this libc has no execinfo.h)\n");
+#endif
   nova_write_lit("=== end crash ===\n");
   ::_exit(128 + sig);
 }
