@@ -54,18 +54,42 @@ fn configureLlvmLink(b: *std.Build, m: *std.Build.Module, static: bool, os_tag: 
     // Static: link every libLLVM*.a component. The linker demand-loads only the
     // members that resolve undefined symbols, so listing the whole set matches an
     // `llvm-config --libs` curation, order-independent (macOS ld resolves archive
-    // cycles). The list is committed (reproducible, no configure-time fs walk).
-    // Regenerate for a different prefix with:
-    //   ls <prefix>/lib/libLLVM*.a | xargs -n1 basename | sed 's/^lib//;s/\.a$//' \
-    //     | sort > deps/llvm-zig/llvm-libs.txt
-    const llvm_libs = if (os_tag == .linux) llvm_libs_linux else llvm_libs_macos;
-    var lines = std.mem.tokenizeScalar(u8, llvm_libs, '\n');
+    // cycles).
+    //
+    // TWO sources for the component list:
+    //   * BRING-YOUR-OWN LLVM (NOVA_LLVM_PREFIX set -- e.g. an apt/brew `llvm@21` install in CI):
+    //     GLOB the prefix's lib dir for the libLLVM*.a it actually ships. A stock package-manager
+    //     LLVM has a slightly different component set than the pinned mirror (it lacks a handful like
+    //     LLVMCAS/LLVMDTLTO), so a hardcoded list would fail to link against it. Globbing the actual
+    //     install is what lets "just apt/brew install llvm-21" work with no per-source list upkeep.
+    //   * MIRROR (no prefix): the committed list (reproducible, no configure-time fs walk).
+    //     Regenerate with: ls <prefix>/lib/libLLVM*.a | xargs -n1 basename | sed 's/^lib//;s/\.a$//' \
+    //       | sort > deps/llvm-zig/llvm-libs.txt
     var count: usize = 0;
-    while (lines.next()) |raw| {
-        const comp = std.mem.trim(u8, raw, " \r\t");
-        if (comp.len == 0) continue;
-        m.linkSystemLibrary(comp, .{ .preferred_link_mode = .static, .use_pkg_config = .no });
-        count += 1;
+    if (b.graph.environ_map.get("NOVA_LLVM_PREFIX")) |prefix| {
+        const io = b.graph.io;
+        const lib_dir_path = b.pathJoin(&.{ prefix, "lib" });
+        // build_root.handle.openDir with an ABSOLUTE path works on POSIX (the base fd is ignored).
+        var dir = b.build_root.handle.openDir(io, lib_dir_path, .{ .iterate = true }) catch
+            std.debug.panic("configureLlvmLink: cannot open NOVA_LLVM_PREFIX lib dir {s}", .{lib_dir_path});
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (it.next(io) catch null) |entry| {
+            if (!std.mem.startsWith(u8, entry.name, "libLLVM")) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".a")) continue;
+            const comp = entry.name["lib".len .. entry.name.len - ".a".len]; // libLLVMXxx.a -> LLVMXxx
+            m.linkSystemLibrary(b.dupe(comp), .{ .preferred_link_mode = .static, .use_pkg_config = .no });
+            count += 1;
+        }
+    } else {
+        const llvm_libs = if (os_tag == .linux) llvm_libs_linux else llvm_libs_macos;
+        var lines = std.mem.tokenizeScalar(u8, llvm_libs, '\n');
+        while (lines.next()) |raw| {
+            const comp = std.mem.trim(u8, raw, " \r\t");
+            if (comp.len == 0) continue;
+            m.linkSystemLibrary(comp, .{ .preferred_link_mode = .static, .use_pkg_config = .no });
+            count += 1;
+        }
     }
     if (count == 0) std.debug.panic("configureLlvmLink: empty llvm-libs list", .{});
 
@@ -269,6 +293,7 @@ pub fn build(b: *std.Build) void {
     checkTestDiscovery(b);
 
     addNovaInstall(b, exe);
+    addNovaArchive(b, exe);
 }
 
 /// `src/root.zig`'s test block is a HAND-WRITTEN list, and Zig only runs the tests of
@@ -489,4 +514,108 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile) void {
     const install_exe = b.addInstallArtifact(exe, .{});
     install_cmd.step.dependOn(&install_exe.step);
     b.getInstallStep().dependOn(&install_cmd.step);
+}
+
+/// `zig build archive` — package one relocatable bundle of the whole toolchain for THIS host:
+/// the compiler (`nova`), the language server (`nls`, built fresh from the sibling repo), the
+/// stdlib, the prebuilt runtime static lib, and the runtime/deps sources `nova build --target`
+/// needs. The install step already assembles all of these under ~/.nova, so the archive stages
+/// FROM there into a clean tree (no ASAN/TSAN variants, no cross-compile cache) and tars it.
+///
+/// Host-only by design: the bundle is named for the build host's os/arch and contains that host's
+/// binaries. It carries a tiny `install` script that copies the tree into the user's ~/.nova, so
+/// the archive is self-installing, plus a VERSION file, and a SHA256 checksum is written alongside
+/// the archive so a release can be verified. The version comes from the NOVA_VERSION env var
+/// (set by the release workflow from the git tag); it defaults to "dev" for local builds.
+/// Output: `zig-out/nova-<version>-<os>-<arch>.tar.gz` (+ `.sha256`; `.zip` on Windows).
+fn addNovaArchive(b: *std.Build, exe: *std.Build.Step.Compile) void {
+    const os_name = @tagName(builtin.target.os.tag); // macos | linux | windows
+    const arch_name = @tagName(builtin.target.cpu.arch); // aarch64 | x86_64 | ...
+    const version = b.graph.environ_map.get("NOVA_VERSION") orelse "dev";
+    const bundle = b.fmt("nova-{s}-{s}-{s}", .{ version, os_name, arch_name });
+
+    const archive_step = b.step("archive", "Package a self-installing, versioned, checksummed toolchain bundle (nova + nls + stdlib) for this host");
+
+    const home = b.graph.environ_map.get("HOME") orelse
+        b.graph.environ_map.get("USERPROFILE") orelse
+        std.debug.panic("$HOME not set; cannot run archive step", .{});
+
+    if (builtin.os.tag == .windows) {
+        const ps = b.fmt(
+            \\$ErrorActionPreference = "Stop"
+            \\$stage = "zig-out/dist/{[bundle]s}"
+            \\if (Test-Path $stage) {{ Remove-Item -Recurse -Force $stage }}
+            \\New-Item -ItemType Directory -Force -Path "$stage/bin","$stage/lib" | Out-Null
+            \\Copy-Item -Force "{[home]s}/.nova/bin/nova.exe" "$stage/bin/nova.exe"
+            \\# nls: build from the sibling repo unless skipped (NOVA_ARCHIVE_SKIP_NLS=1), matching the
+            \\# Unix path -- used where the private nls repo is not checked out (e.g. CI).
+            \\if ($env:NOVA_ARCHIVE_SKIP_NLS -eq "1") {{ Write-Host "archive: NOVA_ARCHIVE_SKIP_NLS=1 -- bundling without nls" }}
+            \\else {{ Push-Location ../nls; zig build -Dnova-src=../lang/src/root.zig; Pop-Location; Copy-Item -Force "{[home]s}/.nova/bin/nls.exe" "$stage/bin/nls.exe" }}
+            \\# nova.exe dynamically links LLVM-C.dll on Windows; bundle it next to the exe so the
+            \\# archive is self-contained (the loader finds a DLL in the exe's own directory).
+            \\if ($env:NOVA_LLVM_PREFIX) {{ Copy-Item -Force "$env:NOVA_LLVM_PREFIX/bin/LLVM-C.dll" "$stage/bin/" -ErrorAction SilentlyContinue }}
+            \\Copy-Item -Force "{[home]s}/.nova/lib/libnova_runtime.a" "$stage/lib/"
+            \\Copy-Item -Recurse -Force "{[home]s}/.nova/std" "$stage/std"
+            \\Copy-Item -Recurse -Force "{[home]s}/.nova/src" "$stage/src"
+            \\Copy-Item -Recurse -Force "{[home]s}/.nova/deps" "$stage/deps"
+            \\Set-Content "$stage/VERSION" "{[version]s}"
+            \\# self-installer: copy the tree into the user's ~/.nova
+            \\Set-Content "$stage/install.ps1" '$d="$env:USERPROFILE/.nova"; New-Item -ItemType Directory -Force -Path "$d/bin","$d/lib" | Out-Null; Copy-Item -Recurse -Force ./* "$d/"; Write-Host "Installed Nova to $d"'
+            \\Compress-Archive -Force -Path "$stage/*" -DestinationPath "zig-out/{[bundle]s}.zip"
+            \\(Get-FileHash "zig-out/{[bundle]s}.zip" -Algorithm SHA256).Hash.ToLower() + "  {[bundle]s}.zip" | Set-Content "zig-out/{[bundle]s}.zip.sha256"
+            \\Write-Host "archive:  zig-out/{[bundle]s}.zip"
+            \\Write-Host "checksum: zig-out/{[bundle]s}.zip.sha256"
+            \\
+        , .{ .bundle = bundle, .home = home, .version = version });
+        const cmd = b.addSystemCommand(&.{ "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps });
+        cmd.step.dependOn(b.getInstallStep()); // ~/.nova must be populated first
+        archive_step.dependOn(&cmd.step);
+        return;
+    }
+
+    const script = b.fmt(
+        \\set -e
+        \\STAGE="zig-out/dist/{[bundle]s}"
+        \\rm -rf "$STAGE"
+        \\mkdir -p "$STAGE/bin" "$STAGE/lib"
+        \\cp "{[home]s}/.nova/bin/nova" "$STAGE/bin/nova"
+        \\# nls: build fresh from the sibling compiler repo (installs to ~/.nova/bin/nls). It links
+        \\# LLVM the same way the compiler does; where that toolchain is not set up (e.g. a Linux CI
+        \\# runner without system LLVM), set NOVA_ARCHIVE_SKIP_NLS=1 to ship a nova+stdlib bundle
+        \\# without the language server rather than fail the release.
+        \\if [ "${{NOVA_ARCHIVE_SKIP_NLS:-0}}" = "1" ]; then
+        \\  echo "archive: NOVA_ARCHIVE_SKIP_NLS=1 -- bundling without nls (language server)"
+        \\else
+        \\  ( cd ../nls && zig build -Dnova-src=../lang/src/root.zig )
+        \\  cp "{[home]s}/.nova/bin/nls" "$STAGE/bin/nls"
+        \\fi
+        \\cp "{[home]s}/.nova/lib/libnova_runtime.a" "$STAGE/lib/"
+        \\rsync -a "{[home]s}/.nova/std/" "$STAGE/std/"
+        \\rsync -a "{[home]s}/.nova/src/" "$STAGE/src/"
+        \\rsync -a "{[home]s}/.nova/deps/" "$STAGE/deps/"
+        \\printf '%s\n' "{[version]s}" > "$STAGE/VERSION"
+        \\# self-installer: copy the tree into the user's ~/.nova
+        \\cat > "$STAGE/install.sh" <<'INSTALL'
+        \\#!/bin/sh
+        \\set -e
+        \\D="$HOME/.nova"
+        \\mkdir -p "$D/bin" "$D/lib"
+        \\cp -R ./bin/* "$D/bin/"
+        \\cp -R ./lib/* "$D/lib/"
+        \\cp -R ./std "$D/" ; cp -R ./src "$D/" ; cp -R ./deps "$D/"
+        \\echo "Installed Nova to $D (add $D/bin to PATH)"
+        \\INSTALL
+        \\chmod +x "$STAGE/install.sh"
+        \\tar czf "zig-out/{[bundle]s}.tar.gz" -C zig-out/dist "{[bundle]s}"
+        \\# SHA256 checksum next to the archive (sha256sum on Linux, shasum on macOS)
+        \\( cd zig-out && {{ command -v sha256sum >/dev/null 2>&1 && sha256sum "{[bundle]s}.tar.gz" || shasum -a 256 "{[bundle]s}.tar.gz"; }} > "{[bundle]s}.tar.gz.sha256" )
+        \\echo "archive:  zig-out/{[bundle]s}.tar.gz"
+        \\echo "checksum: zig-out/{[bundle]s}.tar.gz.sha256"
+        \\
+    , .{ .bundle = bundle, .home = home, .version = version });
+
+    const cmd = b.addSystemCommand(&.{ "sh", "-c", script });
+    cmd.step.dependOn(b.getInstallStep()); // ~/.nova must be populated first
+    _ = exe;
+    archive_step.dependOn(&cmd.step);
 }
