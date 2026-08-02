@@ -76,7 +76,10 @@ fn dispResidueOf(store: *const typesys.TypeStore, tid: typesys.TypeId) sema_shad
         .type_param => .type_param,
         .enum_ => .enum_,
         .optional => |inner| dispResidueOf(store, inner),
-        else => .other,
+        // A disposition disagreement on a NON-OWNED type (a primitive like i32/bool/etc.) cannot corrupt
+        // memory -- no retain/release happens regardless of which side wins -- so it is SAFE, not a real
+        // ownership divergence. Only disagreements on OWNED types can be genuine bugs.
+        else => if (!store.isOwned(tid)) .not_owned else .other,
     };
 }
 
@@ -111,6 +114,7 @@ pub fn acquisitionDisposition(self: *LlvmCompiler, expr: *const ast.Expression) 
                     switch (sema_tag) {
                         .type_param => sema_shadow.disp_disagree_typeparam += 1,
                         .enum_ => sema_shadow.disp_disagree_enum += 1,
+                        .not_owned => sema_shadow.disp_disagree_not_owned += 1,
                         .other => {
                             sema_shadow.disp_disagree_other += 1;
                             sema_shadow.disp_last_kind = @tagName(expr.kind);

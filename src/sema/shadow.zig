@@ -465,9 +465,10 @@ pub var td_blocked_enum: usize = 0;
 pub var disp_agree: usize = 0;
 pub var disp_disagree: usize = 0;
 
-pub const DispResidue = enum { type_param, enum_, other };
+pub const DispResidue = enum { type_param, enum_, not_owned, other };
 pub var disp_disagree_typeparam: usize = 0;
 pub var disp_disagree_enum: usize = 0;
+pub var disp_disagree_not_owned: usize = 0;
 pub var disp_disagree_other: usize = 0;
 pub var disp_last_kind: []const u8 = "";
 pub var disp_last_type: []const u8 = "";
@@ -569,6 +570,7 @@ pub fn reportTypeIdDiff() void {
         out("    DISAGREE : {d}   (all in the SAFE direction: checker under-claims owned, never over-claims)\n", .{disp_disagree});
         out("      .type_param (generic erased return -> codegen monomorphizes to owned; closes with F4) : {d}\n", .{disp_disagree_typeparam});
         out("      .enum_      (payload enum — CLOSED: isOwned is now variant-aware via the enum_tagged table) : {d}\n", .{disp_disagree_enum});
+        out("      .not_owned  (SAFE: disagreement on a non-owned primitive; no retain/release either way)   : {d}\n", .{disp_disagree_not_owned});
         out("      OTHER       (unexplained — a real disposition bug; MUST be 0)                            : {d}\n", .{disp_disagree_other});
         if (disp_disagree_other > 0) out("        e.g. kind='{s}' type='{s}'\n", .{ disp_last_kind, disp_last_type });
         out("=== end disposition shadow-diff ===\n\n", .{});
