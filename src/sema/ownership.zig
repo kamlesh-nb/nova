@@ -235,8 +235,19 @@ fn walkStmt(name: []const u8, s: *const ast.Statement, state: St, st: *Stats) Fl
             if (ls.init) |init| {
                 if (mentionsComplex(&init, name)) return .deferred;
                 if (isIdent(&init, name)) {
-                    if (state == .moved) return .violation;
-                    return .{ .fallthrough = .moved };
+                    // `let y = x` binds a SECOND owned reference to x. Under ARC this is a
+                    // retaining DUP whenever x is used afterward -- codegen inserts nova_retain
+                    // at the bind, so x and y are each dropped exactly once and the refcount
+                    // stays balanced (last-use with no later mention degenerates to a move, which
+                    // is likewise balanced). Modeling it as a LINEAR move made the check report a
+                    // false "use-after-move" on the legitimate later use of x -- the only two such
+                    // sites in the corpus, `frame` (web.client: `let body = dechunked; ...;
+                    // body = gzip.decompress(dechunked)`) and `close_notify_detected`
+                    // (tlsmembio: `let cw = cb; ...; cb.closeNotify()`), are both ASAN-clean.
+                    // Nova is reference-counted, not affine: there is no source-level double-free
+                    // via rebinding for codegen's retain to miss, so a dup leaves x live.
+                    st.dup_ops += 1;
+                    return .{ .fallthrough = state };
                 }
                 if (mentions(&init, name)) {
                     if (state == .moved) return .violation;

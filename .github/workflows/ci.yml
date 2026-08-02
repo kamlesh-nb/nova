@@ -111,17 +111,19 @@ jobs:
         shell: bash
         run: bash conformance/run.sh -j
 
-      # SOUNDNESS GATE (L1/L2) -- run.sh --shadow bundles three checks under NOVA_SEMA_SHADOW: (a) the string
-      # ownership engine vs the resolved-TypeId engine MUST agree (F5-2 -- clean, 0/193), (b) no UNEXPLAINED
-      # checker-vs-codegen ownership-disposition divergence (F2-6 disposition -- clean after the enum/primitive
-      # boundaries were recognized), and (c) the F2-6 ownership-BALANCE static check. It is NOT yet a hard CI
-      # gate because (c) has 3 CONSERVATIVE false positives on the if-EXPRESSION both-arms consumption pattern
-      # (e.g. `if (gz) f(x) else x`, where x is consumed exactly once per mutually-exclusive path) --
-      # verified ASAN-clean, so not a real UAF. Enforce this once the balance check treats if-expr arms as
-      # alternative consumption paths (the 3 cases: 157_http_client, 237_tls_alert, 86_circuit_breaker).
-      #   run: bash conformance/run.sh --shadow
-      #
-      # FOLLOW-ON (also not yet enforced): the AddressSanitizer gate (`NOVA_ASAN=1 zig build` then
+      # SOUNDNESS GATE (L1/L2) -- run.sh --shadow bundles three checks under NOVA_SEMA_SHADOW, all now clean
+      # across the corpus (0 FOUNDATION GATE failures): (a) the string ownership engine vs the resolved-TypeId
+      # engine MUST agree (F5-2), (b) no UNEXPLAINED checker-vs-codegen ownership-disposition divergence
+      # (F2-6 disposition -- enum/primitive recognized as safe boundaries), and (c) the F2-6 ownership-BALANCE
+      # static check. (c)'s last false positives were the `let y = x` retaining-DUP shape (`let body = dechunked;
+      # ...; body = f(dechunked)` and `let cw = cb; ...; cb.closeNotify()`) -- Nova is reference-counted, not
+      # affine, so binding a second owned reference and reusing the first is a nova_retain DUP, not a linear
+      # move; the balance model now treats it as such (src/sema/ownership.zig). This is the L1/L2 soundness gate.
+      - name: Soundness gate (--shadow)
+        shell: bash
+        run: bash conformance/run.sh --shadow
+
+      # FOLLOW-ON (not yet enforced): the AddressSanitizer gate (`NOVA_ASAN=1 zig build` then
       # `conformance/run.sh --asan`) catches use-after-free / double-free directly. Held out until the corpus
       # is confirmed to run --asan clean AND non-hanging from a bare clone (an environmental case stalled).
 
