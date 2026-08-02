@@ -10,9 +10,13 @@ name: CI
 # x86_64 + arm64 binaries from the macOS build.
 
 on:
-  # MANUAL ONLY. Not on push/PR: the corpus has known failures (which marked pushes red) and the
-  # matrix includes BILLED runners (Windows x2, arm64 Linux) on this private repo. Run it deliberately
-  # from Actions -> CI -> Run workflow when you want a full corpus/matrix check.
+  # The `soundness` job (below) runs on every push/PR on the FREE macos-arm64 runner: build with the
+  # pinned+checksum-verified Zig, the full conformance corpus, and the --shadow soundness gate. The
+  # heavy `build-test` matrix and `cross-compile` jobs stay MANUAL (`workflow_dispatch`) via a per-job
+  # `if:` -- they include BILLED runners (Windows x2, arm64 Linux) and experimental cells with known
+  # failures, so they should not fire on every commit. Run those deliberately from Actions -> CI.
+  push:
+  pull_request:
   workflow_dispatch:
 
 concurrency:
@@ -27,6 +31,8 @@ env:
 jobs:
   build-test:
     name: build+corpus (${{ matrix.name }})
+    # Manual only: billed runners + experimental cells. The per-commit gate is `soundness` below.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.experimental }}
     strategy:
@@ -131,15 +137,17 @@ jobs:
   # binaries AND a Windows x86_64 .exe via the bundled Zig toolchain (T1), and upload them as artifacts.
   cross-compile:
     name: cross-compile Linux + Windows artifacts (T1)
+    # Manual only (produces release artifacts); the per-commit gate is `soundness`.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Zig
+      - name: Install Zig (pinned + checksum-verified)
         shell: bash
         run: |
-          curl -sL "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-macos-${ZIG_VERSION}.tar.xz" | tar xJ
-          echo "$(pwd)/zig-aarch64-macos-${ZIG_VERSION}" >> "$GITHUB_PATH"
+          BIN="$(scripts/bootstrap-zig.sh | tail -1)"
+          echo "$BIN" >> "$GITHUB_PATH"
 
       - name: Verify Zig
         run: zig version
@@ -182,3 +190,45 @@ jobs:
         with:
           name: nova-cross-samples
           path: dist/
+
+  # PER-COMMIT GATE (L4). Runs on every push/PR on the FREE macos-arm64 runner -- the green
+  # development platform -- with the PINNED, checksum-verified Zig toolchain. Three gates, all
+  # currently green: build, the full conformance corpus, and the --shadow soundness gate
+  # (F5-2 engine-agreement + F2-6 disposition + F2-6 ownership-balance). This is NOT allow-fail:
+  # a red here blocks the commit. The heavy matrix + artifact jobs above stay manual.
+  soundness:
+    name: soundness gate (macos-arm64, pinned Zig)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig (pinned + checksum-verified)
+        shell: bash
+        run: |
+          BIN="$(scripts/bootstrap-zig.sh | tail -1)"
+          echo "$BIN" >> "$GITHUB_PATH"
+
+      - name: Verify Zig is the pinned version
+        shell: bash
+        run: |
+          want="$(tr -d '[:space:]' < .zig-version)"
+          got="$(zig version)"
+          echo "pinned=$want running=$got"
+          [ "$want" = "$got" ] || { echo "::error::Zig version drift: pinned $want, running $got"; exit 1; }
+
+      - name: Install deps (macOS)
+        run: |
+          brew install llvm@21 boost cmake
+          echo "NOVA_LLVM_PREFIX=$(brew --prefix llvm@21)" >> "$GITHUB_ENV"
+          echo "BOOST_PREFIX=$(brew --prefix boost)" >> "$GITHUB_ENV"
+
+      - name: Build nova
+        run: zig build
+
+      - name: Conformance corpus
+        shell: bash
+        run: bash conformance/run.sh -j
+
+      - name: Soundness gate (--shadow)
+        shell: bash
+        run: bash conformance/run.sh --shadow

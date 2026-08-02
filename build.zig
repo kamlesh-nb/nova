@@ -152,7 +152,32 @@ fn addInprocessLld(b: *std.Build, m: *std.Build.Module) void {
     }
 }
 
+// L4 toolchain pin: the compiler is developed and gated against EXACTLY this Zig. Nova rides Zig
+// 0.16's std.Io/std.Build surface closely, so a drifted toolchain fails in obscure ways -- pin it
+// here (single source of truth, mirrored by .zig-version and scripts/zig-checksums.txt) and fail
+// LOUD at configure time on a mismatch. Override deliberately with -Dallow-zig-drift=true when
+// bringing the toolchain forward (then update all three pin sites + re-run the gates).
+const pinned_zig_version = std.SemanticVersion{ .major = 0, .minor = 16, .patch = 0 };
+
+fn assertPinnedZig(b: *std.Build) void {
+    if (b.option(bool, "allow-zig-drift", "Bypass the pinned-Zig-version check (toolchain bring-up only)") orelse false) return;
+    const v = builtin.zig_version;
+    if (v.order(pinned_zig_version) != .eq) {
+        std.debug.print(
+            \\
+            \\error: Nova is pinned to Zig {f} but you are building with Zig {f}.
+            \\       The compiler tracks this exact toolchain (std.Io / std.Build surface);
+            \\       a different version can miscompile or fail obscurely.
+            \\       Install Zig {f} (scripts/bootstrap-zig.sh fetches + checksum-verifies it),
+            \\       or pass -Dallow-zig-drift=true if you are intentionally moving the pin.
+            \\
+        , .{ pinned_zig_version, v, pinned_zig_version });
+        std.process.exit(1);
+    }
+}
+
 pub fn build(b: *std.Build) void {
+    assertPinnedZig(b);
     const target = b.standardTargetOptions(.{});
 
     const optimize = b.standardOptimizeOption(.{});
