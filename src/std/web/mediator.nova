@@ -5,46 +5,101 @@ import list;
 import web.request;
 import web.response;
 import web.status;
+import serde.source;
+import web.di;
 
-pub trait RequestTrait {}
+// The mediator is the app developer's request-dispatch seam: a request key maps to a MessageHandler,
+// and cross-cutting concerns (pre-processing, wrapping behaviors, post-processing, exception handling)
+// are registered once and run around every handler. Handlers are ASYNC (so a handler may `await` a
+// database or another service) and bound through serde's ValueSource, returning a web Response.
+//
+// Handlers may be registered directly, or as a FACTORY resolved from a per-request DI scope
+// (registerFactory), so a handler can take scoped dependencies.
+//
+// Note on the pipeline `next`: a PipelineBehavior receives a `Next` OBJECT (not a `() => Response`
+// closure) and calls `await next.proceed(src)` to continue the chain. This is deliberate -- a Nova
+// closure cannot `await`, so continuation has to be a method on an object for the wrap-around,
+// short-circuit semantics to work with async handlers.
 
-pub trait RequestHandler {
-    fn handle(self: RequestHandler, req: any): any;
+pub trait MessageHandler {
+    async fn handle(self: MessageHandler, src: ValueSource): response.Response;
 }
 
 pub trait PipelineBehavior {
-    fn handle(self: PipelineBehavior, req: any, next: () => any): any;
+    async fn handle(self: PipelineBehavior, src: ValueSource, next: Next): response.Response;
 }
 
 pub trait PreProcessor {
-    fn process(self: PreProcessor, req: any): void;
+    async fn process(self: PreProcessor, src: ValueSource): void;
 }
 
 pub trait PostProcessor {
-    fn process(self: PostProcessor, req: any, res: any): any;
+    async fn process(self: PostProcessor, src: ValueSource, res: response.Response): response.Response;
 }
 
 pub trait ExceptionHandler {
-    fn handle(self: ExceptionHandler, req: any, err: string): any;
+    async fn handle(self: ExceptionHandler, src: ValueSource, err: string): response.Response;
+}
+
+struct NoHandler impl MessageHandler {
+    async fn handle(self: NoHandler, src: ValueSource): response.Response {
+        return response.Response(Status.NotFound, "No handler");
+    }
+}
+
+// The continuation handed to a PipelineBehavior. `proceed` invokes the next behavior in the list, or
+// the terminal handler once the behaviors are exhausted. It is an object because its `proceed` method
+// is `async` and must be awaitable; a closure cannot await.
+pub struct Next {
+    pub behaviors: List<PipelineBehavior>,
+    pub idx: int,
+    pub handler: MessageHandler,
+
+    init(behaviors: List<PipelineBehavior>, idx: int, handler: MessageHandler) {
+        self.behaviors = behaviors;
+        self.idx = idx;
+        self.handler = handler;
+    }
+
+    pub async fn proceed(self: Next, src: ValueSource): response.Response {
+        if (self.idx >= self.behaviors.size()) {
+            return await self.handler.handle(src);
+        }
+        let b = self.behaviors.get(self.idx) ?? NoBehavior{};
+        let nxt = Next(self.behaviors, self.idx + 1, self.handler);
+        return await b.handle(src, nxt);
+    }
+}
+
+struct NoBehavior impl PipelineBehavior {
+    async fn handle(self: NoBehavior, src: ValueSource, next: Next): response.Response {
+        return await next.proceed(src);
+    }
 }
 
 pub struct Mediator {
-    pub handlers: Map<string, RequestHandler>,
+    pub handlers: Map<string, MessageHandler>,
+    pub factories: Map<string, (ServiceScope) -> MessageHandler>,
     pub behaviors: List<PipelineBehavior>,
     pub pre_processors: List<PreProcessor>,
     pub post_processors: List<PostProcessor>,
     pub exception_handlers: List<ExceptionHandler>,
 
     init() {
-        self.handlers = Map<string, RequestHandler>(16, string.hash);
+        self.handlers = Map<string, MessageHandler>(32, string.hash);
+        self.factories = Map<string, (ServiceScope) -> MessageHandler>(32, string.hash);
         self.behaviors = List<PipelineBehavior>();
         self.pre_processors = List<PreProcessor>();
         self.post_processors = List<PostProcessor>();
         self.exception_handlers = List<ExceptionHandler>();
     }
 
-    pub fn registerHandler(self: Mediator, name: string, handler: RequestHandler): void {
-        self.handlers.set(name, handler);
+    pub fn register(self: Mediator, key: string, handler: MessageHandler): void {
+        self.handlers.set(key, handler);
+    }
+
+    pub fn registerFactory(self: Mediator, key: string, factory: (ServiceScope) -> MessageHandler): void {
+        self.factories.set(key, factory);
     }
 
     pub fn addBehavior(self: Mediator, behavior: PipelineBehavior): void {
@@ -63,60 +118,61 @@ pub struct Mediator {
         self.exception_handlers.push(handler);
     }
 
-    pub fn send(self: Mediator, name: string, req: any): any {
-        let handler = self.handlers.get(name);
-        if (handler == undefined) {
-            return response.Response(Status.NotFound, "Handler not found for: " + name);
+    fn resolve(self: Mediator, key: string, provider: ServiceProvider): MessageHandler {
+        let factory = self.factories.get(key);
+        if (factory != undefined) {
+            let scope = provider.createScope();
+            let build = factory ?? ((sc) => { return NoHandler{}; });
+            return build(scope);
+        }
+        let direct = self.handlers.get(key);
+        if (direct == undefined) { return NoHandler{}; }
+        return direct ?? NoHandler{};
+    }
+
+    pub async fn send(self: Mediator, key: string, provider: ServiceProvider, src: ValueSource): response.Response {
+        if (self.factories.get(key) == undefined && self.handlers.get(key) == undefined) {
+            return response.Response(Status.NotFound, "No handler for request: " + key);
         }
 
         let pre_len = self.pre_processors.len;
         let i = 0;
         while (i < pre_len) {
             let pre = self.pre_processors.at(i);
-            pre.process(req);
+            await pre.process(src);
             i = i + 1;
         }
 
-        let this = self;
-
-        let core_call = () => {
-            return handler.handle(req);
-        };
-
-        let current_next = core_call;
-        let behaviors_len = self.behaviors.len;
-        let idx = behaviors_len;
-        while (idx > 0) {
-            idx = idx - 1;
-            let behavior = self.behaviors.at(idx);
-            let saved_next = current_next;
-            current_next = () => {
-                return behavior.handle(req, saved_next);
-            };
-        }
-
-        let result_res = current_next();
+        let handler = self.resolve(key, provider);
+        let start = Next(self.behaviors, 0, handler);
+        let res = await start.proceed(src);
 
         let post_len = self.post_processors.len;
         let k = 0;
         while (k < post_len) {
             let post = self.post_processors.at(k);
-            result_res = post.process(req, result_res);
+            res = await post.process(src, res);
             k = k + 1;
         }
 
-        return result_res;
+        return res;
     }
 }
 
+pub fn text(body: string): response.Response {
+    let r = response.Response(Status.Ok, body);
+    r.setHeader("Content-Type", "text/plain; charset=utf-8");
+    return r;
+}
+
 pub fn html(body: string): response.Response {
-    let res = response.Response.ok(body);
-    res.setHeader("Content-Type", "text/html");
+    let res = response.Response(Status.Ok, body);
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
     return res;
 }
 
 pub fn json(body: string): response.Response {
-    let res = response.Response.ok(body);
+    let res = response.Response(Status.Ok, body);
     res.setHeader("Content-Type", "application/json");
     return res;
 }

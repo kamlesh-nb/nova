@@ -84,6 +84,7 @@ pub const web_create_handler_sample =
     \\import web.response;
     \\import web.status;
     \\import serde.source;
+    \\import web.mediator;
     \\import Features.Products.CreateProduct.command;
     \\import Features.Products.CreateProduct.validator;
     \\
@@ -119,6 +120,7 @@ pub const web_get_handler_sample =
     \\import web.response;
     \\import web.status;
     \\import serde.source;
+    \\import web.mediator;
     \\import Features.Products.GetProductById.query;
     \\
     \\pub struct GetProductByIdHandler impl MessageHandler {

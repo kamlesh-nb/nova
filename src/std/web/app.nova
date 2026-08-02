@@ -13,6 +13,7 @@ import web.multipart;
 import serde.source;
 import web.static_content;
 import web.di;
+import web.mediator;
 import compress.gzip;
 import string;
 import list;
@@ -20,50 +21,9 @@ import map;
 import bytes;
 import assert;
 
-pub trait MessageHandler {
-
-    async fn handle(self: MessageHandler, src: ValueSource): response.Response;
-}
-
-pub struct AppMediator {
-
-    pub handlers: Map<string, MessageHandler>,
-    pub factories: Map<string, (ServiceScope) -> MessageHandler>,
-
-    init() {
-        self.handlers = Map<string, MessageHandler>(32, string.hash);
-        self.factories = Map<string, (ServiceScope) -> MessageHandler>(32, string.hash);
-    }
-
-    pub fn register(self: AppMediator, key: string, handler: MessageHandler): void {
-        self.handlers.set(key, handler);
-    }
-
-    pub fn registerFactory(self: AppMediator, key: string, factory: (ServiceScope) -> MessageHandler): void {
-        self.factories.set(key, factory);
-    }
-
-    pub async fn send(self: AppMediator, key: string, provider: ServiceProvider, src: ValueSource): response.Response {
-        let factory = self.factories.get(key);
-        if (factory != undefined) {
-            let scope = provider.createScope();
-            let build = factory ?? ((sc) => { return NoHandler{}; });
-            let handler = build(scope);
-            return await handler.handle(src);
-        }
-        let handler = self.handlers.get(key);
-        if (handler == undefined) {
-            return response.Response(Status.NotFound, "No handler for request: " + key);
-        }
-        return await handler.handle(src);
-    }
-}
-
-struct NoHandler impl MessageHandler {
-    async fn handle(self: NoHandler, src: ValueSource): response.Response {
-        return response.Response(Status.NotFound, "No handler");
-    }
-}
+// The request-dispatch mediator lives in web.mediator (MessageHandler + the async pipeline). The App
+// composes it; it no longer declares its own. `text`/`json`/`html` response helpers also live there,
+// and the thin wrappers below delegate to them so `app.text/json/html` keeps working.
 
 pub struct Seg {
     pub is_param: bool,
@@ -142,23 +102,9 @@ fn isAllDigits(s: string): bool {
     return true;
 }
 
-pub fn text(body: string): response.Response {
-    let r = response.Response(Status.Ok, body);
-    r.setHeader("Content-Type", "text/plain; charset=utf-8");
-    return r;
-}
-
-pub fn json(body: string): response.Response {
-    let r = response.Response(Status.Ok, body);
-    r.setHeader("Content-Type", "application/json");
-    return r;
-}
-
-pub fn html(body: string): response.Response {
-    let r = response.Response(Status.Ok, body);
-    r.setHeader("Content-Type", "text/html; charset=utf-8");
-    return r;
-}
+// `text`/`json`/`html` response helpers live in web.mediator (their single definition). Because
+// web.app imports web.mediator, they remain in scope for any module that imports web.app -- so a bare
+// `json(...)` in a handler still resolves, with no duplicate definition to make it ambiguous.
 
 pub struct MultiMapSource impl ValueSource {
     pub fields: Map<string, List<string>>,
@@ -245,7 +191,7 @@ pub fn multipartSource(contentType: string, body: string): MultiMapSource {
 
 pub struct App {
     pub routes: List<AppRoute>,
-    pub mediator: AppMediator,
+    pub mediator: mediator.Mediator,
     pub static_mounts: List<static_content.StaticMount>,
 
     pub cache: Map<string, string>,
@@ -267,7 +213,7 @@ pub struct App {
 
     init() {
         self.routes = List<AppRoute>();
-        self.mediator = AppMediator();
+        self.mediator = mediator.Mediator();
         self.static_mounts = List<static_content.StaticMount>();
         self.cache = Map<string, string>(16, string.hash);
         self.cacheable = Map<string, bool>(16, string.hash);
@@ -343,11 +289,11 @@ pub struct App {
         self.static_mounts.push(static_content.StaticMount(prefix, dir, 128));
     }
 
-    pub fn handle<TReq>(self: App, handler: MessageHandler): void {
+    pub fn handle<TReq>(self: App, handler: mediator.MessageHandler): void {
         self.mediator.register(serde.typeName<TReq>(), handler);
     }
 
-    pub fn handleFrom<TReq>(self: App, factory: (ServiceScope) -> MessageHandler): void {
+    pub fn handleFrom<TReq>(self: App, factory: (ServiceScope) -> mediator.MessageHandler): void {
         self.mediator.registerFactory(serde.typeName<TReq>(), factory);
     }
 
