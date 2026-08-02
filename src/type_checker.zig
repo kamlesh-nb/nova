@@ -527,6 +527,17 @@ pub const TypeChecker = struct {
         return null;
     }
 
+    // The `init` constructor's parameters (constructor args align 1:1, no implicit self). Used to reject an
+    // implicit trait->concrete narrowing passed to a CONSTRUCTOR arg -- the same unsound path as a free/method
+    // call arg, just via `StructName(traitValue)` where the init parameter is a concrete struct.
+    fn structInitParams(self: *TypeChecker, struct_name: []const u8) ?[]ast.Param {
+        const s = self.structs.get(struct_name) orelse return null;
+        for (s.methods) |m| {
+            if (std.mem.eql(u8, m.decl.name, "init")) return m.decl.params;
+        }
+        return null;
+    }
+
     fn checkExpr(self: *TypeChecker, expr: ast.Expression) anyerror!void {
         switch (expr.kind) {
             .generic_call => |gc| {
@@ -579,6 +590,10 @@ pub const TypeChecker = struct {
                                 self.addError(c.span, "constructor '{s}' expects {d} argument(s), got {d}", .{ name, init_params, c.args.len });
                             }
                         }
+                        // Soundness: a constructor arg passed to a CONCRETE init parameter cannot be a trait
+                        // object (same unsound trait->concrete narrowing as a call arg -- e.g. Holder(traitVal)
+                        // where init(d: Dog)). Reject it; require an explicit `as` downcast.
+                        if (self.structInitParams(name)) |ip| self.rejectNarrowingArgs(c.args, ip);
                     }
                     if (!self.ambiguous_fns.contains(name) and !self.variables.contains(name)) {
                         if (self.functions.get(name)) |f| {
