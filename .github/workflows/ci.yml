@@ -107,9 +107,23 @@ jobs:
       - name: Build nova
         run: zig build
 
-      - name: Conformance corpus (148 cases)
+      - name: Conformance corpus
         shell: bash
-        run: bash conformance/run.sh
+        run: bash conformance/run.sh -j
+
+      # SOUNDNESS GATE (L1/L2) -- run.sh --shadow bundles three checks under NOVA_SEMA_SHADOW: (a) the string
+      # ownership engine vs the resolved-TypeId engine MUST agree (F5-2 -- clean, 0/193), (b) no UNEXPLAINED
+      # checker-vs-codegen ownership-disposition divergence (F2-6 disposition -- clean after the enum/primitive
+      # boundaries were recognized), and (c) the F2-6 ownership-BALANCE static check. It is NOT yet a hard CI
+      # gate because (c) has 3 CONSERVATIVE false positives on the if-EXPRESSION both-arms consumption pattern
+      # (e.g. `if (gz) f(x) else x`, where x is consumed exactly once per mutually-exclusive path) --
+      # verified ASAN-clean, so not a real UAF. Enforce this once the balance check treats if-expr arms as
+      # alternative consumption paths (the 3 cases: 157_http_client, 237_tls_alert, 86_circuit_breaker).
+      #   run: bash conformance/run.sh --shadow
+      #
+      # FOLLOW-ON (also not yet enforced): the AddressSanitizer gate (`NOVA_ASAN=1 zig build` then
+      # `conformance/run.sh --asan`) catches use-after-free / double-free directly. Held out until the corpus
+      # is confirmed to run --asan clean AND non-hanging from a bare clone (an environmental case stalled).
 
   # GREEN — the real cross-compile story: from the macOS/arm64 build, produce Linux x86_64 + arm64
   # binaries AND a Windows x86_64 .exe via the bundled Zig toolchain (T1), and upload them as artifacts.
