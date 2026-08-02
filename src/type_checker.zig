@@ -388,6 +388,26 @@ pub const TypeChecker = struct {
         return false;
     }
 
+    // Reject implicit TRAIT -> CONCRETE narrowing for each (arg, param) pair. A trait value is a fat
+    // pointer {struct_ptr, vtable} that may hold ANY implementation, so it cannot be silently treated as a
+    // specific concrete struct (previously miscompiled into a use-after-free). Require an explicit `as`
+    // downcast, or a trait-typed parameter. Concrete -> trait widening stays allowed. Shared by free-function
+    // calls and method calls so the rejection is uniform across both callee shapes.
+    fn rejectNarrowingArgs(self: *TypeChecker, args: []const ast.Expression, params: []const ast.Param) void {
+        const npairs = @min(args.len, params.len);
+        var i: usize = 0;
+        while (i < npairs) : (i += 1) {
+            const pt = params[i].type_name orelse continue;
+            if (pt != .ident) continue;
+            if (!self.structs.contains(pt.ident) or self.traits.contains(pt.ident)) continue;
+            const at = self.resolveExprType(args[i]) orelse continue;
+            if (at != .ident) continue;
+            if (self.traits.contains(at.ident) and !std.mem.eql(u8, at.ident, pt.ident)) {
+                self.addError(args[i].span, "cannot pass a trait object '{s}' to concrete parameter '{s}: {s}' — a trait value may hold any implementation, so narrowing it needs an explicit downcast ('<expr> as {s}'), or the parameter should take the trait type '{s}'", .{ at.ident, params[i].name, pt.ident, pt.ident, at.ident });
+            }
+        }
+    }
+
     fn assignable(self: *TypeChecker, from: ast.TypeRef, to: ast.TypeRef) bool {
 
         if (isNarrowingInt(from, to)) return false;
@@ -565,11 +585,36 @@ pub const TypeChecker = struct {
                             if (c.args.len != f.params.len) {
                                 self.addError(c.span, "function '{s}' expects {d} argument(s), got {d}", .{ name, f.params.len, c.args.len });
                             }
+                            // Soundness: reject an implicit TRAIT -> CONCRETE narrowing at a call argument.
+                            // A trait value is a fat pointer {struct_ptr, vtable}; a concrete parameter
+                            // expects the bare struct, and the trait may hold ANY implementation. Passing it
+                            // implicitly is unsound (and previously miscompiled into a use-after-free). Make
+                            // the intent explicit with a downcast. Concrete -> trait widening stays allowed.
+                            self.rejectNarrowingArgs(c.args, f.params);
                         }
                     }
 
                     if (self.ambiguous_fns.contains(name) and !self.variables.contains(name) and !self.structs.contains(name) and !self.fileDefinesFn(c.span.file, name)) {
                         self.addError(c.span, "call to '{s}' is ambiguous — more than one function is named '{s}' across the imported modules. Qualify it (e.g. `module.{s}(...)`).", .{ name, name, name });
+                    }
+                } else if (c.callee.kind == .field_access) {
+                    // Same soundness rule for METHOD calls: `obj.method(traitArg)` where the method parameter
+                    // is a concrete struct. Resolve the receiver's struct, find the method, and align the args
+                    // with its parameters (skipping the implicit `self` at index 0).
+                    const fa = c.callee.kind.field_access;
+                    if (self.resolveExprType(fa.object.*)) |obj_type| {
+                        if (obj_type == .ident) {
+                            if (self.structs.get(obj_type.ident)) |s| {
+                                for (s.methods) |m| {
+                                    if (std.mem.eql(u8, m.decl.name, fa.field)) {
+                                        var mparams = m.decl.params;
+                                        if (mparams.len > 0 and std.mem.eql(u8, mparams[0].name, "self")) mparams = mparams[1..];
+                                        self.rejectNarrowingArgs(c.args, mparams);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 try self.checkExpr(c.callee.*);
@@ -996,7 +1041,14 @@ pub const TypeChecker = struct {
                             return builtinRetType(b.ret);
                         }
                     }
-                    const obj_type = self.resolveExprType(fa.object.*) orelse return null;
+                    const obj_type = self.resolveExprType(fa.object.*) orelse {
+                        // Module-qualified constructor: `module.StructName(...)` -> StructName. The object
+                        // is a module (not a typed value, so it resolves to null) and the field names a
+                        // struct. Without this, any value derived from such a constructor (e.g.
+                        // `let d = btreedb.BTreeDriver()`) stays untyped, which blocks later type checks.
+                        if (self.structs.contains(fa.field)) return ast.TypeRef{ .ident = fa.field };
+                        return null;
+                    };
                     switch (obj_type) {
                         .ident => |struct_name| {
                             if (self.structs.get(struct_name)) |s| {

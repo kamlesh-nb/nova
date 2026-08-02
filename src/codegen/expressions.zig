@@ -349,7 +349,8 @@ pub fn awaitedCallHandle(self: *LlvmCompiler, operand: ast.Expression, is_spawn:
 
         const pidx = idx + recv_off;
         if (self.getFunctionParamType(resolved, pidx)) |expected_type| {
-            if (self.traits.contains(getStructBaseName(expected_type))) {
+            const exp_base = getStructBaseName(expected_type);
+            if (self.traits.contains(exp_base)) {
                 if (try self.resolveExpressionTypeName(arg)) |struct_name| {
                     if (self.structs.contains(struct_name)) {
                         val = try self.constructTraitObject(val, struct_name, expected_type);
@@ -357,6 +358,19 @@ pub fn awaitedCallHandle(self: *LlvmCompiler, operand: ast.Expression, is_spawn:
                             try self.compileRetain(val);
                             try spawn_held.append(self.allocator, val);
                         }
+                    }
+                }
+            } else if (self.structs.contains(exp_base)) {
+                // Reverse of the widening above: the parameter is a CONCRETE struct but the argument is a
+                // TRAIT object (a fat pointer {struct_ptr, vtable}). Without this the fat pointer is passed
+                // AS the struct, so the callee reads the vtable slot as a field and runs a mismatched ARC
+                // destructor -- a silent use-after-free (the connpass cross-coroutine crash). Downcast by
+                // loading struct_ptr from the fat pointer. Borrow semantics: the trait object still owns the
+                // struct, so no retain (the arg is not owning), matching the concrete-arg widening path.
+                if (try self.resolveExpressionTypeName(arg)) |arg_type| {
+                    if (self.traits.contains(getStructBaseName(arg_type))) {
+                        const sp_ptr = core.LLVMBuildIntToPtr(self.builder, val, core.LLVMPointerType(self.val_type, 0), "argdowncast_sp");
+                        val = core.LLVMBuildLoad2(self.builder, self.val_type, sp_ptr, "argdowncast_struct");
                     }
                 }
             }

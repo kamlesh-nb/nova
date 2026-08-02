@@ -1,0 +1,19 @@
+// NEGATIVE test: must FAIL to compile.
+// Passing a trait object to a CONCRETE-struct parameter is an unsound implicit narrowing: a trait value is
+// a fat pointer {struct_ptr, vtable} and may hold ANY implementation, so it cannot be silently treated as a
+// specific concrete struct. It must be rejected (require an explicit `as` downcast, or a trait-typed
+// parameter). Regression guard for the connpass cross-coroutine use-after-free, where a `Connection` trait
+// object was passed to a `BTreeConnection` concrete parameter and miscompiled into a UAF.
+trait Speaker { fn speak(self): int; }
+struct Dog impl Speaker {
+    pub n: int,
+    init(n: int) { self.n = n; }
+    pub fn speak(self): int { return self.n; }
+}
+fn makeSpeaker(): Speaker { return Dog(7); }
+fn useDog(d: Dog): int { return d.speak(); }
+@test
+fn t(): void {
+    let s = makeSpeaker();   // s : Speaker (a trait object)
+    let x = useDog(s);       // ERROR: narrowing Speaker -> Dog implicitly
+}
