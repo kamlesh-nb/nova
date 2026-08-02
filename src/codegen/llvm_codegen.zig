@@ -428,7 +428,8 @@ pub const LlvmCompiler = struct {
         return "i32";
     }
 
-    pub const isRefCountedType = arc_mod.isRefCountedType;
+    pub const legacyStringOwnership = arc_mod.legacyStringOwnership;
+    pub const erasedOwnershipDefault = arc_mod.erasedOwnershipDefault;
     pub const compileCallArgument = arc_mod.compileCallArgument;
     pub const acquisitionDisposition = arc_mod.acquisitionDisposition;
     pub const takeOwnedElement = arc_mod.takeOwnedElement;
@@ -3007,6 +3008,8 @@ pub const LlvmCompiler = struct {
     pub const isOwnedTupleElemByName = types_mod.isOwnedTupleElemByName;
     pub const isOwnedDeclaredType = types_mod.isOwnedDeclaredType;
     pub const tidForTypeRef = types_mod.tidForTypeRef;
+    pub const tidForName = types_mod.tidForName;
+    pub const ownedByName = types_mod.ownedByName;
 
     pub const compileStatement = statements_mod.compileStatement;
     pub const runErrdefers = statements_mod.runErrdefers;

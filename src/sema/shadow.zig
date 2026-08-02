@@ -27,6 +27,16 @@ pub var f2_fellback: usize = 0;
 
 pub var f2_fellback_lossy: usize = 0;
 
+// L1 string->TypeId migration metric: categorised count of ownership-by-name queries (types.ownedByName).
+// primitive = trivially not-owned (a language fact); resolved = a concrete TypeId was recovered and the
+// TypeId engine decided (the principled path); string_decided = the erased residual (bare type-params in
+// dead, mono-stripped generic bodies -- the only decisions NOT made by the TypeId engine). Surfaced in
+// the shadow report; string_decided should contain ONLY erased type-params.
+pub var irct_live_calls: usize = 0;
+pub var irct_primitive: usize = 0;
+pub var irct_resolved: usize = 0;
+pub var irct_string_decided: usize = 0;
+
 pub var live_sema: ?*sema_mod.Sema = null;
 pub var live_store: ?*typesys.TypeStore = null;
 pub var live_ir: ?*infer.TypedIr = null;
@@ -557,8 +567,8 @@ pub fn reportTypeIdDiff() void {
         if (struct_field_disagree > 0) out("    last struct mismatch: '{s}'\n", .{struct_field_last});
         out("  stage 5 PhaseA release-site flip: flip={d} (store-native selected)  split={d} (i32/int, kept string)  no-id={d}\n", .{ phaseA_flip, phaseA_split, phaseA_no_id });
         if (phaseA_split > 0) out("    last split: '{s}'\n", .{phaseA_split_last});
-        out("  a2 isRefCountedType calls: {d}  (string ownership decisions still made — target: only primitives/erased)\n", .{a2_irct_calls});
-        out("  a2 isRefCountedType COMPOSITE (parser path): {d}\n", .{a2_irct_composite});
+        out("  ownedByName split: primitive={d}  resolved-by-TypeId={d}  erased-residual={d}  (L1 migration: only bare type-params in dead erased bodies should remain in erased-residual)\n", .{ irct_primitive, irct_resolved, irct_string_decided });
+        out("  legacyStringOwnership calls (shadow baseline only): {d}\n", .{a2_irct_calls});
         out("=== end temp-op diff ===\n\n", .{});
     }
 

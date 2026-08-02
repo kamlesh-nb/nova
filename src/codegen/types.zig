@@ -404,7 +404,7 @@ fn tdShadowDiff(self: *LlvmCompiler, t: typesys.TypeId) void {
         else => {
             const typed = st.isOwned(t);
             const rendered = sema_shadow.renderLegacy(self.allocator, st, t) catch return;
-            const str = self.isRefCountedType(rendered);
+            const str = self.legacyStringOwnership(rendered);
             if (typed == str) {
                 sema_shadow.td_agree += 1;
             } else {
@@ -463,7 +463,7 @@ pub fn isOwnedLocal(self: *LlvmCompiler, name: []const u8, type_string: []const 
             }
         }
     }
-    return self.isRefCountedType(type_string);
+    return self.ownedByName(type_string);
 }
 
 pub fn typeOfExprConcrete(self: *LlvmCompiler, expr_ptr: *const ast.Expression) ?typesys.TypeId {
@@ -507,7 +507,7 @@ pub fn isOwnedErrUnionOk(self: *LlvmCompiler, expr_ptr: *const ast.Expression, o
             }
         }
     }
-    return self.isRefCountedType(ok_string);
+    return self.ownedByName(ok_string);
 }
 
 pub fn isOwnedErrUnionErr(self: *LlvmCompiler, expr_ptr: *const ast.Expression, err_string: []const u8) bool {
@@ -519,7 +519,7 @@ pub fn isOwnedErrUnionErr(self: *LlvmCompiler, expr_ptr: *const ast.Expression, 
             }
         }
     }
-    return self.isRefCountedType(err_string);
+    return self.ownedByName(err_string);
 }
 
 pub fn isOwnedStorageElem(self: *LlvmCompiler, obj_ptr: *const ast.Expression, elem_string: []const u8) bool {
@@ -530,7 +530,7 @@ pub fn isOwnedStorageElem(self: *LlvmCompiler, obj_ptr: *const ast.Expression, e
             }
         }
     }
-    return self.isRefCountedType(elem_string);
+    return self.ownedByName(elem_string);
 }
 
 pub fn typeIdForRenderedName(self: *LlvmCompiler, name: []const u8) ?typesys.TypeId {
@@ -559,14 +559,14 @@ pub fn typeIdForRenderedName(self: *LlvmCompiler, name: []const u8) ?typesys.Typ
 }
 
 pub fn isOwnedStorageElemByName(self: *LlvmCompiler, elem_string: []const u8) bool {
-    const container = std.fmt.allocPrint(self.allocator, "Storage<{s}>", .{elem_string}) catch return self.isRefCountedType(elem_string);
+    const container = std.fmt.allocPrint(self.allocator, "Storage<{s}>", .{elem_string}) catch return self.ownedByName(elem_string);
     defer self.allocator.free(container);
     if (self.typeIdForRenderedName(container)) |tid| {
         if (self.type_store) |st| {
             if (st.get(tid) == .storage) return self.isOwnedTypeId(st.get(tid).storage);
         }
     }
-    return self.isRefCountedType(elem_string);
+    return self.ownedByName(elem_string);
 }
 
 pub fn isOwnedErrUnionPayloadByName(self: *LlvmCompiler, union_name: []const u8, is_err: bool, payload_string: []const u8) bool {
@@ -578,7 +578,7 @@ pub fn isOwnedErrUnionPayloadByName(self: *LlvmCompiler, union_name: []const u8,
             }
         }
     }
-    return self.isRefCountedType(payload_string);
+    return self.ownedByName(payload_string);
 }
 
 pub fn isOwnedTupleElemByName(self: *LlvmCompiler, tuple_name: []const u8, idx: usize, elem_string: []const u8) bool {
@@ -588,7 +588,61 @@ pub fn isOwnedTupleElemByName(self: *LlvmCompiler, tuple_name: []const u8, idx: 
             if (info == .tuple and idx < info.tuple.len) return self.isOwnedTypeId(info.tuple[idx]);
         }
     }
-    return self.isRefCountedType(elem_string);
+    return self.ownedByName(elem_string);
+}
+
+// L1 string->TypeId migration: recover a RESOLVED TypeId from a rendered type name, so an ownership
+// decision made from a name-only site can defer to the single TypeId engine (isOwnedTypeId) instead
+// of string-matching. Covers composites + struct-with-args via the rendered-name index, and plain
+// named types (struct / enum / trait / primitive) via the sema lowerer -- the same lower path
+// isOwnedDeclaredType uses. Returns null only for names with no concrete type: bare type parameters
+// and instantiation-free generics (e.g. "T", "List<T>"), which are reachable only from erased
+// generic bodies that monomorphization dead-strips.
+pub fn tidForName(self: *LlvmCompiler, name: []const u8) ?typesys.TypeId {
+    if (self.type_store) |st| {
+        if (self.typeIdForRenderedName(name)) |tid| {
+            if (nameResolvable(st, tid)) return tid;
+        }
+    }
+    if (sema_shadow.live_sema) |sm| {
+        var l = lower.Lowerer.init(self.allocator, &sm.store);
+        defer l.deinit();
+        l.symtab = &sm.tab;
+        const t = l.lower(.{ .ident = name }) catch return null;
+        if (nameResolvable(&sm.store, t)) return t;
+    }
+    return null;
+}
+
+// A name resolves to a usable ownership answer for anything with a concrete type -- INCLUDING enums
+// (isOwnedTypeId reads enum_tagged, the SAME "any variant has a payload" rule the string engine's
+// enumIsTaggedUnion applied). Only a bare type parameter or an unresolved name has no answer from a
+// name alone (no instantiation context), so those are rejected and handled by the erased default.
+fn nameResolvable(store: *const typesys.TypeStore, t: typesys.TypeId) bool {
+    return switch (store.get(t)) {
+        .type_param, .unresolved => false,
+        .optional => |inner| nameResolvable(store, inner),
+        else => true,
+    };
+}
+
+// The principled replacement for the legacy string-ownership fallback. A primitive is not owned (a
+// language fact); anything with a recoverable TypeId defers to the ONE ownership engine; only a bare
+// type parameter in an erased (dead-stripped) body has no concrete type to ask, and there the
+// conservative owned=true default -- NOT a decision by user-type NAME -- is emitted into code mono
+// discards. This is what lets the string ownership engine be retired for all real types.
+pub fn ownedByName(self: *LlvmCompiler, name: []const u8) bool {
+    sema_shadow.irct_live_calls += 1;
+    if (isPrimitiveTypeName(name)) {
+        sema_shadow.irct_primitive += 1;
+        return false;
+    }
+    if (self.tidForName(name)) |tid| {
+        sema_shadow.irct_resolved += 1;
+        return self.isOwnedTypeId(tid);
+    }
+    sema_shadow.irct_string_decided += 1;
+    return self.erasedOwnershipDefault(name);
 }
 
 pub fn isOwnedDeclaredType(self: *LlvmCompiler, tr: ast.TypeRef, string_fallback: []const u8) bool {
@@ -596,10 +650,10 @@ pub fn isOwnedDeclaredType(self: *LlvmCompiler, tr: ast.TypeRef, string_fallback
         var l = lower.Lowerer.init(self.allocator, &sm.store);
         defer l.deinit();
         l.symtab = &sm.tab;
-        const t = l.lower(tr) catch return self.isRefCountedType(string_fallback);
+        const t = l.lower(tr) catch return self.ownedByName(string_fallback);
         if (decidedDirectly(&sm.store, t)) return self.isOwnedTypeId(t);
     }
-    return self.isRefCountedType(string_fallback);
+    return self.ownedByName(string_fallback);
 }
 
 pub fn tidForTypeRef(self: *LlvmCompiler, tr: ast.TypeRef) ?typesys.TypeId {
@@ -624,7 +678,7 @@ fn isOwnedRenderedFallback(self: *LlvmCompiler, t: typesys.TypeId) bool {
     const st = self.type_store.?;
     const rendered = sema_shadow.renderLegacy(self.allocator, st, t) catch return false;
     const subst = self.substTypeParams(rendered) catch return false;
-    return self.isRefCountedType(subst);
+    return self.legacyStringOwnership(subst);
 }
 
 pub fn scopedStructName(self: *LlvmCompiler, name: []const u8, file: []const u8) []const u8 {

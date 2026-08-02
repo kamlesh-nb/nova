@@ -21,7 +21,38 @@ pub fn enumIsTaggedUnion(self: *LlvmCompiler, enum_name: []const u8) bool {
     return false;
 }
 
-pub fn isRefCountedType(self: *LlvmCompiler, type_name: []const u8) bool {
+// Ownership default for a value with NO recoverable concrete TypeId. Reached ONLY from
+// types.ownedByName -- after the primitive short-circuit and after tidForName failed -- i.e. a bare
+// type parameter or an instantiation-free generic/function type from an ERASED generic body, which
+// monomorphization dead-strips (but whose IR must still verify, so a decision is unavoidable). This
+// is a STRUCTURAL default over dead code, NOT ownership-by-user-type-name: every RESOLVABLE type is
+// decided by the TypeId engine (isOwnedTypeId) before reaching here. A lone type-parameter slot
+// carries no owned reference; every other shape (a function value, a List/Map container) is
+// heap-owned. An untypeable placeholder means sema failed to type a LIVE value that reached ARC -- a
+// compiler bug -- so keep the loud guard rather than silently guessing.
+pub fn erasedOwnershipDefault(self: *LlvmCompiler, type_name: []const u8) bool {
+    _ = self;
+    if (isUntypeablePlaceholder(type_name)) {
+        std.debug.print(
+            "\x1b[1m\x1b[31mcompiler error:\x1b[0m\x1b[1m ARC ownership asked of an un-typeable value '{s}'\x1b[0m\n" ++
+            "  sema failed to type a value that reached a retain/release. This is a COMPILER bug\n" ++
+            "  (not user code): freeing it would corrupt memory. Please report.\n",
+            .{type_name});
+        std.process.exit(70);
+    }
+    // A bare, undeclared single-letter name is a type parameter (a declared one-letter type would
+    // have resolved via tidForName). Its slot holds no owned reference in an erased body.
+    if (type_name.len == 1 and type_name[0] >= 'A' and type_name[0] <= 'Z') return false;
+    return true;
+}
+
+// LEGACY string ownership classifier. As of the L1 string->TypeId migration this is NO LONGER a
+// codegen ownership decider -- codegen uses the resolved-TypeId engine (isOwnedTypeId) for every
+// real type, and erasedOwnershipDefault for dead erased bodies. This survives ONLY as the SHADOW
+// gate's comparison baseline (types.tdShadowDiff / isOwnedRenderedFallback): it reproduces the
+// historical name-matched rule so the shadow diff keeps proving the TypeId engine agrees with it
+// (the F5-2 engine-agreement invariant). Do NOT call it from a codegen path.
+pub fn legacyStringOwnership(self: *LlvmCompiler, type_name: []const u8) bool {
     if (sema_shadow.report_enabled) { sema_shadow.a2_irct_calls += 1; if (std.mem.indexOfAny(u8, type_name, "<(") != null) sema_shadow.a2_irct_composite += 1; }
     const base = getStructBaseName(type_name);
     if (type_name.len == 1 and type_name[0] >= 'A' and type_name[0] <= 'Z') {
