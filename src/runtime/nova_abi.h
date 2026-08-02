@@ -5,6 +5,18 @@
 #include <stdint.h>
 #include <stddef.h>
 
+// L5 stability: the extern-C runtime ABI contract version. The STABLE seam this pins is the
+// heap-object layout and the reference-counting entry points (see docs/abi/runtime-abi.md):
+//   * every heap object carries an 8-byte header; refcount is a u32 at [ptr-8], byte-length a
+//     u32 at [ptr-4]; the object payload starts at ptr.
+//   * nova_retain(ptr) / nova_release(ptr, dtor) are the ref-count entry points.
+//   * nova_bytes_alloc / nova_bytes_free are the allocation entry points.
+// The compiler emits code against exactly this layout (NOVA_OBJ_HEADER_SIZE, mirrored in
+// src/codegen/arc.zig and surfaced as build_options.nova_abi_version). Bump this ONLY on a
+// breaking change to that stable seam -- NOT for adding async/reactor/syscall symbols below,
+// which are INTERNAL (compiler<->its own runtime) and not a third-party contract.
+#define NOVA_ABI_VERSION 1
+
 #define NOVA_OBJ_HEADER_SIZE 8
 
 #ifdef __cplusplus

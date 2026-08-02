@@ -1,6 +1,6 @@
 .{
     .name = .nova,
-    .version = "0.0.0",
+    .version = "0.1.0",
     .fingerprint = 0xfae65c8f2150b029,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{

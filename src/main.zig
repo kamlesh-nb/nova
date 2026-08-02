@@ -2390,6 +2390,25 @@ fn mainInner(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, args[1], "version") or std.mem.eql(u8, args[1], "--version") or std.mem.eql(u8, args[1], "-v")) {
+        // L5 stability: report the language/toolchain version, the runtime ABI contract version,
+        // the pinned Zig, and the host target -- all from single sources of truth (build_options).
+        std.debug.print(
+            \\nova {s}
+            \\  abi:    {d}    (extern-C runtime ABI contract; see docs/abi/runtime-abi.md)
+            \\  zig:    {f}    (pinned; see .zig-version)
+            \\  host:   {s}-{s}
+            \\
+        , .{
+            build_options.nova_version,
+            build_options.nova_abi_version,
+            builtin.zig_version,
+            @tagName(builtin.target.cpu.arch),
+            @tagName(builtin.target.os.tag),
+        });
+        return;
+    }
+
     if (std.mem.eql(u8, args[1], "init")) {
         try cmdInit(allocator, init, args);
         return;

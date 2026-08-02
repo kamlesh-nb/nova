@@ -1,9 +1,13 @@
 # The Nova Language — Specification & Reference
 
+**Spec version:** 0.1.0 (Beta) -- tracks the `nova version` release. Per `docs/STABILITY.md`, a 0.x
+number means there is no cross-version stability guarantee yet; syntax and semantics may still change.
+
 **Status:** authoritative language reference, reverse-engineered from the compiler's actual behavior and
 the **conformance corpus** (`lang/conformance/cases/`, 55 executable cases as of this writing). Every
 non-trivial claim is cited to the case that pins it, e.g. *(→ 53_for_loops)*. This document supersedes
-`specs.md` (which is retained for history but deprecated).
+`specs.md` (which is retained for history but deprecated). Versioning, the deprecation policy, and the
+runtime ABI contract live in `docs/STABILITY.md` and `docs/abi/runtime-abi.md`.
 
 > **Ground-truth rule.** If a statement here is not backed by a conformance case or directly observed
 > compiler behavior, it is marked 🔎 (present but unverified) or ⏳ (planned/partial). Everything else is

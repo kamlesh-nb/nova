@@ -216,6 +216,10 @@ jobs:
           echo "pinned=$want running=$got"
           [ "$want" = "$got" ] || { echo "::error::Zig version drift: pinned $want, running $got"; exit 1; }
 
+      - name: Version-sync guard (L5)
+        shell: bash
+        run: bash scripts/check-version-sync.sh
+
       - name: Install deps (macOS)
         run: |
           brew install llvm@21 boost cmake

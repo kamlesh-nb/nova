@@ -159,6 +159,13 @@ fn addInprocessLld(b: *std.Build, m: *std.Build.Module) void {
 // bringing the toolchain forward (then update all three pin sites + re-run the gates).
 const pinned_zig_version = std.SemanticVersion{ .major = 0, .minor = 16, .patch = 0 };
 
+// L5 stability: the language/toolchain version (semver) and the extern-C runtime ABI contract
+// version. `nova_version` is mirrored in build.zig.zon `.version`; keep them in lockstep. `nova`
+// is BETA -- a 0.x version deliberately signals "no cross-version stability guarantee yet" per
+// docs/STABILITY.md. `nova_abi_version` matches src/runtime/nova_abi.h NOVA_ABI_VERSION.
+const nova_version = "0.1.0";
+const nova_abi_version: u32 = 1;
+
 fn assertPinnedZig(b: *std.Build) void {
     if (b.option(bool, "allow-zig-drift", "Bypass the pinned-Zig-version check (toolchain bring-up only)") orelse false) return;
     const v = builtin.zig_version;
@@ -216,6 +223,13 @@ pub fn build(b: *std.Build) void {
     if (inprocess_lld and !static_llvm) @panic("-Dinprocess-lld requires -Dstatic-llvm");
     const build_opts = b.addOptions();
     build_opts.addOption(bool, "inprocess_lld", inprocess_lld);
+    // L5 stability: single source of truth for the version surfaced by `nova version`.
+    //   nova_version   -- the language/toolchain semver (also mirrored in build.zig.zon).
+    //   nova_abi_version -- the extern-C runtime ABI contract version (see src/runtime/nova_abi.h
+    //                       NOVA_ABI_VERSION and docs/abi/runtime-abi.md). Bumped ONLY on a
+    //                       breaking change to the stable seam (heap header layout / retain-release).
+    build_opts.addOption([]const u8, "nova_version", nova_version);
+    build_opts.addOption(u32, "nova_abi_version", nova_abi_version);
     const build_opts_mod = build_opts.createModule();
 
     // `mod` is the module `zig build test` compiles (`addTest{ .root_module = mod }`),
