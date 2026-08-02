@@ -3,6 +3,7 @@ import string;
 import list;
 import map;
 import bytes;
+import assert;
 import os.sys;
 import web.url;
 
@@ -199,4 +200,157 @@ fn trimWhitespace(s: string): string {
         return "";
     }
     return string.slice(s, start, end);
+}
+
+// ── HTTP wire framing ─────────────────────────────────────────────────────────
+// Low-level request parsing directly off a raw socket buffer (`buf: long`), used by the server's
+// connection reader to frame a request incrementally before the full bytes have arrived: find the
+// header terminator, read Content-Length / detect chunked, decode a chunked body, and pull the
+// method + path. These complement the string-based Request.fromString for the streaming read path.
+// (buf is `long`: pointer math must stay 64-bit, so offsets are added at long width.)
+
+fn lowerByte(b: int): int {
+    if (b >= 65 && b <= 90) { return b + 32; }
+    return b;
+}
+
+pub fn bufFindHeaderEnd(buf: long, start: int, end: int): int {
+    let i = start;
+    while (i + 4 <= end) {
+        if (bytes.read_byte(buf, i) == 13 && bytes.read_byte(buf, i + 1) == 10 &&
+            bytes.read_byte(buf, i + 2) == 13 && bytes.read_byte(buf, i + 3) == 10) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub fn bufFindCI(buf: long, start: int, end: int, needle: string): int {
+    let nlen = needle.length;
+    if (nlen == 0) { return start; }
+    let i = start;
+    while (i + nlen <= end) {
+        let j = 0;
+        let matched = true;
+        while (j < nlen) {
+            if (lowerByte(bytes.read_byte(buf, i + j)) != (needle[j] as int)) { matched = false; break; }
+            j = j + 1;
+        }
+        if (matched) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub fn bufContentLength(buf: long, start: int, hdrEnd: int): int {
+    let idx = bufFindCI(buf, start, hdrEnd, "content-length:");
+    if (idx == -1) { return 0; }
+    let p = idx + 15;
+    while (p < hdrEnd && bytes.read_byte(buf, p) == 32) { p = p + 1; }
+    let n = 0;
+    while (p < hdrEnd) {
+        let c = bytes.read_byte(buf, p);
+        if (c < 48 || c > 57) { break; }
+        n = n * 10 + (c - 48);
+        p = p + 1;
+    }
+    return n;
+}
+
+pub fn bufIsChunked(buf: long, start: int, hdrEnd: int): bool {
+    return bufFindCI(buf, start, hdrEnd, "transfer-encoding: chunked") != -1;
+}
+
+pub fn bufFindCRLF(buf: long, from: int, len: int): int {
+    let p = from;
+    while (p + 1 < len) {
+        if (bytes.read_byte(buf, p) == 13 && bytes.read_byte(buf, p + 1) == 10) { return p; }
+        p = p + 1;
+    }
+    return -1;
+}
+
+pub fn bufParseHex(buf: long, from: int, to: int): int {
+    let v = 0;
+    let p = from;
+    while (p < to) {
+        let c = bytes.read_byte(buf, p);
+        let d = -1;
+        if (c >= 48 && c <= 57) { d = c - 48; }
+        else if (c >= 97 && c <= 102) { d = c - 97 + 10; }
+        else if (c >= 65 && c <= 70) { d = c - 65 + 10; }
+        if (d < 0) { break; }
+        v = v * 16 + d;
+        p = p + 1;
+    }
+    return v;
+}
+
+pub fn bufChunkedEnd(buf: long, start: int, len: int): int {
+    let p = start;
+    while (p < len) {
+        let lineEnd = bufFindCRLF(buf, p, len);
+        if (lineEnd == -1) { return -1; }
+        let size = bufParseHex(buf, p, lineEnd);
+        let dataStart = lineEnd + 2;
+        if (size == 0) {
+            if (dataStart + 2 <= len) { return dataStart + 2; }
+            return -1;
+        }
+        let next = dataStart + size + 2;
+        if (next > len) { return -1; }
+        p = next;
+    }
+    return -1;
+}
+
+pub fn bufDechunk(buf: long, start: int, len: int): string {
+    let out = List<string>();
+    let p = start;
+    while (p < len) {
+        let lineEnd = bufFindCRLF(buf, p, len);
+        if (lineEnd == -1) { break; }
+        let size = bufParseHex(buf, p, lineEnd);
+        let dataStart = lineEnd + 2;
+        if (size == 0) { break; }
+        if (dataStart + size > len) { break; }
+        out.push(bytes.read_string(buf + dataStart, size));
+        p = dataStart + size + 2;
+    }
+    return string.join(out, "");
+}
+
+pub fn bufMethodPath(buf: long, len: int): (string, string) {
+    let sp1 = -1;
+    let i = 0;
+    while (i < len) {
+        if (bytes.read_byte(buf, i) == 32) { sp1 = i; break; }
+        i = i + 1;
+    }
+    if (sp1 == -1) { return ("", ""); }
+    let method = bytes.read_string(buf, sp1);
+    let ps = sp1 + 1;
+    let pe = ps;
+    while (pe < len) {
+        let c = bytes.read_byte(buf, pe);
+        if (c == 32 || c == 63) { break; }
+        pe = pe + 1;
+    }
+    let path = bytes.read_string(buf + ps, pe - ps);
+    return (method, path);
+}
+
+@test
+fn test_chunked_request_decode(): void {
+    let s = "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+    let n = s.length;
+    let buf: long = bytes.alloc(n);
+    let i = 0;
+    while (i < n) { bytes.write_byte(buf, i, s[i]); i = i + 1; }
+    assert.equalInt(bufChunkedEnd(buf, 0, n), n);
+    assert.equalStr(bufDechunk(buf, 0, n), "Wikipedia");
+    assert.equalInt(bufChunkedEnd(buf, 0, n - 4), -1);
+    assert.equalInt(bufParseHex(buf, 0, 1), 4);
+    bytes.free(buf);
 }
