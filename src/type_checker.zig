@@ -408,6 +408,34 @@ pub const TypeChecker = struct {
         }
     }
 
+    // Same narrowing rejection for a GENERIC method call (e.g. List<Dog>.push(traitVal)): a method param typed
+    // as a type-parameter (T) is substituted with the receiver's instantiation arg (Dog) before the check, so
+    // pushing a trait into a List<Concrete> is caught (it otherwise miscompiles -- the trait fat pointer gets
+    // stored as the concrete element and reads garbage). Concrete->trait widening (List<Trait>) stays allowed.
+    fn rejectNarrowingArgsSubst(self: *TypeChecker, args: []const ast.Expression, params: []const ast.Param, tparams: []const []const u8, targs: []const ast.TypeRef) void {
+        const npairs = @min(args.len, params.len);
+        var i: usize = 0;
+        while (i < npairs) : (i += 1) {
+            var pt = params[i].type_name orelse continue;
+            if (pt != .ident) continue;
+            // Substitute a type-parameter name (T) with the instantiation's concrete type arg.
+            var k: usize = 0;
+            while (k < tparams.len and k < targs.len) : (k += 1) {
+                if (std.mem.eql(u8, tparams[k], pt.ident)) {
+                    pt = targs[k];
+                    break;
+                }
+            }
+            if (pt != .ident) continue;
+            if (!self.structs.contains(pt.ident) or self.traits.contains(pt.ident)) continue;
+            const at = self.resolveExprType(args[i]) orelse continue;
+            if (at != .ident) continue;
+            if (self.traits.contains(at.ident) and !std.mem.eql(u8, at.ident, pt.ident)) {
+                self.addError(args[i].span, "cannot pass a trait object '{s}' to a concrete element/parameter of type '{s}' — a trait value may hold any implementation, so narrowing it needs an explicit downcast ('<expr> as {s}')", .{ at.ident, pt.ident, pt.ident });
+            }
+        }
+    }
+
     fn assignable(self: *TypeChecker, from: ast.TypeRef, to: ast.TypeRef) bool {
 
         if (isNarrowingInt(from, to)) return false;
@@ -629,6 +657,20 @@ pub const TypeChecker = struct {
                                     }
                                 }
                             }
+                        } else if (obj_type == .generic) {
+                            // Generic receiver (e.g. List<Dog>): substitute the struct's type params with the
+                            // instantiation args before the narrowing check, so pushing a trait into a
+                            // List<Concrete> is rejected.
+                            if (self.structs.get(obj_type.generic.name)) |s| {
+                                for (s.methods) |m| {
+                                    if (std.mem.eql(u8, m.decl.name, fa.field)) {
+                                        var mparams = m.decl.params;
+                                        if (mparams.len > 0 and std.mem.eql(u8, mparams[0].name, "self")) mparams = mparams[1..];
+                                        self.rejectNarrowingArgsSubst(c.args, mparams, s.type_params, obj_type.generic.params);
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -658,6 +700,13 @@ pub const TypeChecker = struct {
                                 self.addError(b.span, "narrowing conversion: '{s}' cannot be implicitly stored into '{s}' — use an explicit cast (F3 §6)", .{ typeRefName(rt), typeRefName(lt) });
                             } else if (isSignednessMismatch(rt, lt)) {
                                 self.addError(b.span, "signedness mismatch: '{s}' and '{s}' differ in sign — use an explicit cast (F3 §6)", .{ typeRefName(rt), typeRefName(lt) });
+                            } else if (rt == .ident and lt == .ident and
+                                self.traits.contains(rt.ident) and self.structs.contains(lt.ident) and
+                                !self.traits.contains(lt.ident) and !std.mem.eql(u8, rt.ident, lt.ident))
+                            {
+                                // Soundness (L1): a trait object cannot be implicitly narrowed to a concrete
+                                // struct on assignment (same UAF class as a call/constructor arg).
+                                self.addError(b.span, "cannot assign a trait object '{s}' to a concrete '{s}' target — a trait value may hold any implementation, so narrowing it needs an explicit downcast ('<expr> as {s}')", .{ rt.ident, lt.ident, lt.ident });
                             }
                         }
                     }
@@ -1112,12 +1161,28 @@ pub const TypeChecker = struct {
                 if (gc.callee.kind == .ident) {
                     const name = gc.callee.kind.ident;
                     if (self.structs.contains(name)) {
+                        // Carry the type args on the constructed type (e.g. Box<Dog> -> .generic) so downstream
+                        // checks -- notably generic-method narrowing (List<Dog>.push(traitVal)) -- can see the
+                        // instantiation. Bare (non-generic) constructors stay .ident.
+                        if (gc.type_args.len > 0) {
+                            return ast.TypeRef{ .generic = .{ .name = name, .params = gc.type_args } };
+                        }
                         return ast.TypeRef{ .ident = name };
                     }
                     if (self.functions.get(name)) |f| {
                         const rt = f.ret_type orelse return ast.TypeRef{ .ident = "void" };
 
                         return self.substReturnType(rt, f.type_params, gc.type_args);
+                    }
+                } else if (gc.callee.kind == .field_access) {
+                    // Module-qualified generic constructor, e.g. `list.List<Dog>()`: the callee is
+                    // module.Struct. Carry the type args so generic-method narrowing sees the instantiation.
+                    const fname = gc.callee.kind.field_access.field;
+                    if (self.structs.contains(fname)) {
+                        if (gc.type_args.len > 0) {
+                            return ast.TypeRef{ .generic = .{ .name = fname, .params = gc.type_args } };
+                        }
+                        return ast.TypeRef{ .ident = fname };
                     }
                 }
                 return null;
