@@ -307,14 +307,28 @@ selected by DSN `sslmode` (disable default = unchanged / require / verify-full w
 Widening the concrete stream into an AsyncIO param is the safe direction (same pattern as handleConn).
 CAVEAT: the TLS path is COMPILE + ASAN verified only -- no live TLS Postgres server on this host; the
 plaintext default path is unchanged and offline-tested (SSLRequest wire bytes gated in test 66).
-REMAINING T2: mysql (CLIENT_SSL + SSLRequest packet), mssql (turn ON the existing cert verification),
-mongodb (implicit TLS via tlsConnect), btreedb; plus fail-closed enforcement for require/verify-full on
-'N' (blocked on the connect error channel).
+T2 [x]* -- all five drivers wired 2026-08-03, with two honest caveats (hence the asterisk):
+- pg: SSLRequest + upgrade, DSN sslmode (disable/require/verify-full + sslrootcert). TLS 1.3, verify OK.
+- mongodb: implicit TLS via tlsConnect/tlsConnectVerify, DSN tls=true/verify + tlsCAFile. TLS 1.3.
+- btreedb: implicit TLS via tlsConnect[Verify], DSN tls=. TLS 1.3 (server must serve TLS on the port).
+- mysql: CLIENT_SSL + 32-byte SSLRequest (seq 1) -> upgrade -> full response over TLS (seq 2), auth flow
+  extracted to myAuthFinish(io: AsyncIO). DSN sslmode. Seq/capability logic is the riskiest unverified bit.
+- mssql: PARTIAL. Fixed the force-true handshake outcome (a failed tunneled TLS handshake used to look
+  successful). But actual CERT VERIFICATION is NOT enabled: mssql runs TLS 1.2 (tls12bio), which has no
+  verify constructor / no CA-chain hook -- so its MITM hole is NOT closed. Blocked on a new sub-task:
+  implement TLS-1.2 chain verification in tls12bio (x509.verifyChain already exists; wire the server
+  Certificate message into it). Until then mssql TLS authenticates the key exchange but not the peer cert.
+CAVEATS: (1) every driver's TLS handshake is COMPILE + ASAN verified only -- no live TLS DB server on
+this host; the plaintext default paths are unchanged and offline-tested (SSLRequest wire bytes gated for
+pg + mysql). (2) fail-closed enforcement (require/verify-full MUST refuse on the server declining TLS)
+is still best-effort-fallback, blocked on the connect error channel (T1 residual).
+Remaining true-P0 follow-ons carried forward: TLS-1.2 chain verify (mssql MITM), connect error channel
+(fail-closed), and a live TLS integration test (T16).
 
 | # | Pri | Item | Blocker | Where it lands | Status |
 |---|---|---|---|---|---|
 | T1 | P0 | Error propagation: add `DbError` return/channel; wire each driver's decoder into its read loop | C1 | seam + all 5 drivers | [x] |
-| T2 | P0 | TLS on the SQL data path: TLS `AsyncStream`/BIO in net/aio; SSLRequest (pg), CLIENT_SSL (mysql), cert verify (mssql) | C2 | net/aio + pg/mysql/mssql/mongo/btree | [~] |
+| T2 | P0 | TLS on the SQL data path: TLS `AsyncStream`/BIO in net/aio; SSLRequest (pg), CLIENT_SSL (mysql), cert verify (mssql) | C2 | net/aio + pg/mysql/mssql/mongo/btree | [x]* |
 | T3 | P0 | Correct temporal + special-type decode (ISO dates, mssql FLOAT/DATE*/PLP, bytea hex, BSON ObjectId/datetime) | C5 | pg/mysql/mssql/mongo | [ ] |
 | T4 | P0 | Enforce parameterization: server-side bind, or fix `$1..$9`-only + binary-blob escaping | C4 | pg/mysql/btree + ORM | [ ] |
 | T5 | P0 | mongodb: wire `hello` + `authenticate` into connect; parse `cursor.firstBatch` + getMore | -- | mongodb | [ ] |
