@@ -465,6 +465,16 @@ binary-search get/has, ordered keys), case 247. COLLECTIONS DEPTH NOW COMPLETE. 
 work, tracked with the M12/M13 TLS line, not pure-stdlib): mTLS + OCSP/CRL revocation (both OPTIONAL,
 do only if service-to-service client-cert auth is on the roadmap). TLS 1.2 SERVER role = WON'T-DO.
 
+DECISION 2026-08-03 (revised, same day) -- mTLS + OCSP/CRL are REQUIRED, not optional.
+Nova will consume EXTERNAL services (some over TLS 1.2, which the CLIENT role already supports -- M13,
+live vs OpenSSL) that (a) require a client certificate (mTLS) and (b) whose certs must be revocation-
+checked. So mTLS (client-cert presentation on BOTH the 1.3 and 1.2 CLIENTS) and OCSP/CRL are now planned
+work, done in verified increments: (1) mTLS 1.3 client, (2) mTLS 1.2 client, (3) OCSP (stapling verify +
+request/response ASN.1, offline-tested; live responder fetch gated), (4) CRL (parse + serial check
+offline; live DP fetch gated). These are CLIENT-side additions -- no CBC/RSA-kx SERVER padding-oracle
+surface -- so far lower risk than the 1.2 server. The 1.2 SERVER role remains WON'T-DO (below): we are a
+client to these services, not their server.
+
 DECISION 2026-08-03 -- TLS 1.2 SERVER role: WON'T-DO (by design).
 Rationale: Nova already serves TLS 1.3 (both roles, full spec) and connects over TLS 1.2 (client role).
 A 1.2 SERVER role adds exactly one capability -- accepting inbound connections from clients that cannot
