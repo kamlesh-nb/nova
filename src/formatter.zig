@@ -751,6 +751,11 @@ pub const Formatter = struct {
                         }
                         try self.write("]");
                     },
+                    .array_repeat => |ar| {
+                        try self.write("[");
+                        try self.formatExpression(ar.value.*);
+                        try self.print("; {d}]", .{ar.count});
+                    },
                     .object => |fields| {
                         try self.write("{");
                         for (fields, 0..) |f, idx| {

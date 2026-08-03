@@ -737,6 +737,16 @@ pub const TypeChecker = struct {
                             break;
                         }
                     }
+                } else if (lit == .array_repeat) {
+                    try self.checkExpr(lit.array_repeat.value.*);
+                    const v = lit.array_repeat.value.*;
+                    if (self.resolveExprType(v)) |et| {
+                        if (et != .ident or !isScalarPrim(et.ident)) {
+                            self.addError(expr.span, "array elements must be a primitive type (int, long, double, float, bool, byte); got '{s}' — use List for reference or complex element types", .{typeRefName(et)});
+                        }
+                    } else if (v.kind == .struct_init or v.kind == .tuple or (v.kind == .literal and v.kind.literal == .array)) {
+                        self.addError(expr.span, "array elements must be a primitive type (int, long, double, float, bool, byte); a struct, tuple, or nested array is not allowed — use List for those", .{});
+                    }
                 }
             },
             .unary => |u| try self.checkExpr(u.operand.*),

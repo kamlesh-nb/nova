@@ -1058,6 +1058,43 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
 
                     return array_ptr_val;
                 },
+                .array_repeat => |ar| {
+                    // [value; count] : allocate count 8-byte slots, evaluate value ONCE, fill via a
+                    // runtime loop (LLVM lowers a constant-value fill to a memset).
+                    const element_size: usize = 8;
+                    const size_val = core.LLVMConstInt(self.val_type, ar.count * element_size, 0);
+                    const array_ptr_val = try self.compileAlloc(size_val);
+                    const fill_val = self.coerceToSlotType(try self.compileExpression(ar.value.*), self.val_type);
+
+                    const cur_fn = core.LLVMGetBasicBlockParent(core.LLVMGetInsertBlock(self.builder));
+                    const head_bb = core.LLVMAppendBasicBlock(cur_fn, "arr_rep_head");
+                    const body_bb = core.LLVMAppendBasicBlock(cur_fn, "arr_rep_body");
+                    const done_bb = core.LLVMAppendBasicBlock(cur_fn, "arr_rep_done");
+                    const entry_bb = core.LLVMGetInsertBlock(self.builder);
+                    _ = core.LLVMBuildBr(self.builder, head_bb);
+
+                    core.LLVMPositionBuilderAtEnd(self.builder, head_bb);
+                    const iv = core.LLVMBuildPhi(self.builder, self.val_type, "arr_rep_i");
+                    const count_val = core.LLVMConstInt(self.val_type, ar.count, 0);
+                    const cond = core.LLVMBuildICmp(self.builder, .LLVMIntULT, iv, count_val, "arr_rep_cond");
+                    _ = core.LLVMBuildCondBr(self.builder, cond, body_bb, done_bb);
+
+                    core.LLVMPositionBuilderAtEnd(self.builder, body_bb);
+                    const es_val = core.LLVMConstInt(self.val_type, element_size, 0);
+                    const off = core.LLVMBuildMul(self.builder, iv, es_val, "arr_rep_off");
+                    const addr = core.LLVMBuildAdd(self.builder, array_ptr_val, off, "arr_rep_addr");
+                    const slot = core.LLVMBuildIntToPtr(self.builder, addr, self.ptr_type, "arr_rep_slot");
+                    _ = core.LLVMBuildStore(self.builder, fill_val, slot);
+                    const next = core.LLVMBuildAdd(self.builder, iv, core.LLVMConstInt(self.val_type, 1, 0), "arr_rep_next");
+                    _ = core.LLVMBuildBr(self.builder, head_bb);
+
+                    var inc_vals = [_]types.LLVMValueRef{ core.LLVMConstInt(self.val_type, 0, 0), next };
+                    var inc_bbs = [_]types.LLVMBasicBlockRef{ entry_bb, body_bb };
+                    core.LLVMAddIncoming(iv, &inc_vals, &inc_bbs, 2);
+
+                    core.LLVMPositionBuilderAtEnd(self.builder, done_bb);
+                    return array_ptr_val;
+                },
                 .float => |val| {
 
                     return core.LLVMConstReal(core.LLVMDoubleType(), val);

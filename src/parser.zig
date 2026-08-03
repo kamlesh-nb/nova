@@ -9,6 +9,17 @@ const ParserError = error{
     OutOfMemory,
 };
 
+// A compile-time non-negative integer literal, for the `[value; count]` array-repeat count.
+fn intLiteralOf(e: ast.Expression) ?usize {
+    switch (e.kind) {
+        .literal => |lit| switch (lit) {
+            .integer => |v| return if (v >= 0) @intCast(v) else null,
+            else => return null,
+        },
+        else => return null,
+    }
+}
+
 pub const Parser = struct {
     allocator: std.mem.Allocator,
     tokens: []lexer.Token,
@@ -2278,10 +2289,23 @@ pub const Parser = struct {
                 var elems = std.ArrayList(ast.Expression).empty;
                 defer elems.deinit(self.allocator);
                 if (self.current().type != .right_bracket) {
-                    while (true) {
-                        try elems.append(self.allocator, try self.parseExpression());
-                        if (!self.match(.comma)) break;
+                    const first = try self.parseExpression();
+                    // `[value; count]` repeat-init: count must be a compile-time integer literal.
+                    if (self.current().type == .semicolon) {
+                        self.advance();
+                        const count_expr = try self.parseExpression();
+                        try self.expect(.right_bracket);
+                        const n = intLiteralOf(count_expr) orelse {
+                            std.debug.print("Parser error: {s}:{}:{}: array repeat count must be a constant non-negative integer literal, e.g. [0.0; 256]\n", .{ self.file_path, self.current().line, self.current().column });
+                            return error.UnexpectedToken;
+                        };
+                        const vptr = try self.allocExpression(first);
+                        return ast.Expression{ .kind = .{ .literal = ast.Literal{ .array_repeat = .{ .value = vptr, .count = n } } } };
+                    }
+                    try elems.append(self.allocator, first);
+                    while (self.match(.comma)) {
                         if (self.current().type == .right_bracket) break;
+                        try elems.append(self.allocator, try self.parseExpression());
                     }
                 }
                 try self.expect(.right_bracket);

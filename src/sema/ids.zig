@@ -96,6 +96,7 @@ pub const Assigner = struct {
                 .array => |items| {
                     for (items) |*i| try self.walkExpr(i);
                 },
+                .array_repeat => |*ar| try self.walkExpr(ar.value),
                 .object => |fields| {
                     for (fields) |*f| try self.walkExpr(&f.value);
                 },

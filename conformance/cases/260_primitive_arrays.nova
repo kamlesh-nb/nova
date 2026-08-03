@@ -51,3 +51,19 @@ fn array_as_param_mutation(): void {
     let x = [5, 6, 7];
     assert.equalInt(50, scaleFirst(x));
 }
+
+@test
+fn sized_creation_repeat_init(): void {
+    // [value; count] : a fixed array of `count` elements, all `value`.
+    let z: double[8] = [0.0; 8];
+    assert.equalInt(8, z.length);
+    assert.isTrue(z[0] == 0.0 && z[7] == 0.0);
+    z[3] = 4.5;
+    assert.isTrue(z[3] > 4.4 && z[3] < 4.6);
+
+    let ones = [1; 100];
+    assert.equalInt(100, ones.length);
+    let sum = 0; let i = 0;
+    while (i < ones.length) { sum = sum + ones[i]; i = i + 1; }
+    assert.equalInt(100, sum);              // 100 * 1
+}

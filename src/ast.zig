@@ -374,7 +374,15 @@ pub const Literal = union(enum) {
     null,
     undefined,
     array: []Expression,
+    array_repeat: ArrayRepeat,
     object: []ObjectFieldInit,
+};
+
+// `[value; count]` -- a fixed array of `count` elements all initialized to `value`. count is a
+// compile-time constant (fixed length); value is evaluated once and filled by a codegen loop.
+pub const ArrayRepeat = struct {
+    value: *Expression,
+    count: usize,
 };
 
 pub const ObjectFieldInit = struct {

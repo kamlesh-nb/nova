@@ -442,6 +442,11 @@ pub const Inferer = struct {
                     if (self.store.get(elem) == .unresolved) return self.unresolved("literal");
                     return self.ok(try self.store.intern(.{ .array = .{ .elem = elem, .len = items.len } }));
                 },
+                .array_repeat => |ar| {
+                    const elem = try self.inferExpr(ar.value);
+                    if (self.store.get(elem) == .unresolved) return self.unresolved("literal");
+                    return self.ok(try self.store.intern(.{ .array = .{ .elem = elem, .len = ar.count } }));
+                },
                 else => self.unresolved("literal"),
             },
             .ident => |name| {
