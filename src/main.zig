@@ -364,16 +364,51 @@ fn suffixedFileExists(cand: []const u8, allocator: std.mem.Allocator, io: std.Io
     return false;
 }
 
-// Target-conditional file selection: given a resolved `foo/bar.nova`, return `foo/bar_<os>.nova` when
-// that file exists (build constraints, Go/Zig style), else null. Caller owns the returned path. The
-// module identity stays the BASE path so `import foo` links regardless of which variant compiled; only
-// the bytes read from disk come from the suffixed file.
-fn targetSuffixedPath(path: []const u8, os_tag: []const u8, allocator: std.mem.Allocator, io: std.Io, home: ?[]const u8) ?[]const u8 {
+// Platform-axis variant selection (restructure R1): given a resolved `dir/name.nova`, pick the
+// most-specific existing target variant, keyed off the SAME os/arch the synthesized `platform` module
+// exposes. Search order (first existing wins):
+//   1. dir/<os>/<arch>/name.nova     2. dir/<os>/name.nova
+//   3. dir/posix/<arch>/name.nova    4. dir/posix/name.nova        (3,4 only when is_posix)
+//   5. dir/name_<os>.nova            (LEGACY suffix -- kept so un-migrated modules still resolve)
+// Returns null when none exists (the caller then reads the flat base path). Module identity stays the
+// BASE path so `import foo` links regardless of which file's bytes were read.
+fn targetVariantPath(path: []const u8, os_tag: []const u8, arch: []const u8, is_posix: bool, allocator: std.mem.Allocator, io: std.Io, home: ?[]const u8) ?[]const u8 {
     if (!std.mem.endsWith(u8, path, ".nova")) return null;
     const stem = path[0 .. path.len - 5];
-    const cand = std.fmt.allocPrint(allocator, "{s}_{s}.nova", .{ stem, os_tag }) catch return null;
-    if (suffixedFileExists(cand, allocator, io, home)) return cand;
-    allocator.free(cand);
+    const slash = std.mem.lastIndexOfScalar(u8, stem, '/') orelse stem.len;
+    const dir = if (slash == stem.len) "" else stem[0..slash];
+    const name = if (slash == stem.len) stem else stem[slash + 1 ..];
+
+    const tryCand = struct {
+        fn go(cand: []const u8, a: std.mem.Allocator, zio: std.Io, h: ?[]const u8) ?[]const u8 {
+            if (suffixedFileExists(cand, a, zio, h)) return cand;
+            a.free(cand);
+            return null;
+        }
+    }.go;
+
+    // 1. dir/<os>/<arch>/name.nova
+    if (std.fmt.allocPrint(allocator, "{s}/{s}/{s}/{s}.nova", .{ dir, os_tag, arch, name }) catch null) |c| {
+        if (tryCand(c, allocator, io, home)) |hit| return hit;
+    }
+    // 2. dir/<os>/name.nova
+    if (std.fmt.allocPrint(allocator, "{s}/{s}/{s}.nova", .{ dir, os_tag, name }) catch null) |c| {
+        if (tryCand(c, allocator, io, home)) |hit| return hit;
+    }
+    if (is_posix) {
+        // 3. dir/posix/<arch>/name.nova
+        if (std.fmt.allocPrint(allocator, "{s}/posix/{s}/{s}.nova", .{ dir, arch, name }) catch null) |c| {
+            if (tryCand(c, allocator, io, home)) |hit| return hit;
+        }
+        // 4. dir/posix/name.nova
+        if (std.fmt.allocPrint(allocator, "{s}/posix/{s}.nova", .{ dir, name }) catch null) |c| {
+            if (tryCand(c, allocator, io, home)) |hit| return hit;
+        }
+    }
+    // 5. legacy dir/name_<os>.nova
+    if (std.fmt.allocPrint(allocator, "{s}_{s}.nova", .{ stem, os_tag }) catch null) |c| {
+        if (tryCand(c, allocator, io, home)) |hit| return hit;
+    }
     return null;
 }
 
@@ -1030,7 +1065,7 @@ fn loadProgram(allocator: std.mem.Allocator, init: std.process.Init, file_path: 
 
     // Read from the target-conditional variant (foo_<os>.nova) if present; module identity stays file_path.
     const suffix_home = init.environ_map.get("HOME") orelse init.environ_map.get("USERPROFILE");
-    const read_path_opt = if (std.mem.eql(u8, file_path, "src/std/platform.nova")) null else targetSuffixedPath(file_path, tinfo.os, allocator, init.io, suffix_home);
+    const read_path_opt = if (std.mem.eql(u8, file_path, "src/std/platform.nova")) null else targetVariantPath(file_path, tinfo.os, tinfo.arch, tinfo.is_posix, allocator, init.io, suffix_home);
     defer if (read_path_opt) |rp| allocator.free(rp);
     const read_path = read_path_opt orelse file_path;
 
