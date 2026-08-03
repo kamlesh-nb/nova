@@ -60,3 +60,20 @@ fn test_dns_cache(): void {
     assert.equalInt(12345, (c.get("example.com") ?? 0) as int);
     assert.isTrue(c.get("other.com") == undefined);
 }
+
+@test
+fn test_sockaddr_in6(): void {
+    let addr = bytes.alloc(16);
+    dns.parseIPv6("2001:db8::1", addr);
+    // Linux form (family 10, no bsd len byte)
+    let sa = dns.makeSockaddrIn6(10, 8080, addr, false);
+    assert.equalInt(10, b(sa, 0)); assert.equalInt(0, b(sa, 1));   // AF_INET6 LE
+    assert.equalInt(0x1f, b(sa, 2)); assert.equalInt(0x90, b(sa, 3)); // port 8080 BE
+    assert.equalInt(0x20, b(sa, 8)); assert.equalInt(0x01, b(sa, 9)); // addr starts at 8
+    assert.equalInt(1, b(sa, 23));                                  // ::1 low byte
+    // BSD form (family 30, sin6_len byte)
+    let sb = dns.makeSockaddrIn6(30, 443, addr, true);
+    assert.equalInt(28, b(sb, 0));                                 // sin6_len
+    assert.equalInt(30, b(sb, 1));                                 // AF_INET6 (1 byte)
+    assert.equalInt(0x01, b(sb, 2)); assert.equalInt(0xbb, b(sb, 3)); // port 443 BE
+}

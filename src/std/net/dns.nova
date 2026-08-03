@@ -83,3 +83,28 @@ pub struct DnsCache {
 }
 
 pub fn newDnsCache(): DnsCache { return DnsCache(); }
+
+// Build a sockaddr_in6 (28 bytes) for a v6 dial: AF_INET6 family + port (network order) + the 16-byte
+// address. `family` is the OS's AF_INET6 (30 on macOS/BSD, 10 on Linux) and `bsdLen` true adds the BSD
+// sin6_len byte in slot 0 (macOS/BSD has it, Linux does not). Layout:
+//   BSD:   [sin6_len(1)][sin6_family(1)][port(2 BE)][flowinfo(4)][addr(16)][scope_id(4)]
+//   Linux: [sin6_family(2 LE)][port(2 BE)][flowinfo(4)][addr(16)][scope_id(4)]
+// Pure -- the actual AF_INET6 socket() + connect() is the reactor's runtime dial (os/socket), verified
+// live; this is the address-construction layer.
+pub fn makeSockaddrIn6(family: int, port: int, addr16: ptr, bsdLen: bool): ptr {
+    let sa = bytes.alloc(28);
+    let i = 0;
+    while (i < 28) { bytes.write_byte(sa, i, 0); i = i + 1; }
+    if (bsdLen) {
+        bytes.write_byte(sa, 0, 28);                 // sin6_len
+        bytes.write_byte(sa, 1, family & 0xff);      // sin6_family (1 byte on BSD)
+    } else {
+        bytes.write_byte(sa, 0, family & 0xff);      // sin6_family (2-byte LE on Linux)
+        bytes.write_byte(sa, 1, (family >> 8) & 0xff);
+    }
+    bytes.write_byte(sa, 2, (port >> 8) & 0xff);     // sin6_port, network byte order
+    bytes.write_byte(sa, 3, port & 0xff);
+    let j = 0;                                        // sin6_addr at offset 8
+    while (j < 16) { bytes.write_byte(sa, 8 + j, bytes.read_byte(addr16, j)); j = j + 1; }
+    return sa;
+}

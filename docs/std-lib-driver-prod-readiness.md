@@ -364,21 +364,21 @@ test (T16). Next tier is P1 (T6 transactions, T7 pool hardening, ...).
 | # | Pri | Item | Blocker | Where it lands | Status |
 |---|---|---|---|---|---|
 | T1 | P0 | Error propagation: add `DbError` return/channel; wire each driver's decoder into its read loop | C1 | seam + all 5 drivers | [x] |
-| T2 | P0 | TLS on the SQL data path: TLS `AsyncStream`/BIO in net/aio; SSLRequest (pg), CLIENT_SSL (mysql), cert verify (mssql) | C2 | net/aio + pg/mysql/mssql/mongo/btree | [x]* |
-| T3 | P0 | Correct temporal + special-type decode (ISO dates, mssql FLOAT/DATE*/PLP, bytea hex, BSON ObjectId/datetime) | C5 | pg/mysql/mssql/mongo | [x]* |
-| T4 | P0 | Enforce parameterization: server-side bind, or at minimum fix the `$1..$9`-only substitution + binary-blob escaping | C4 | pg/mysql/btree + ORM | [x]* |
-| T5 | P0 | mongodb: wire `hello` + `authenticate` into connect; parse `cursor.firstBatch` + getMore | -- | mongodb | [x]* |
-| T6 | P1 | Transaction API on Connection trait (begin/commit/rollback + savepoints + rollback-on-drop); fix mssql txn descriptor + ENVCHANGE | C3 | seam + mssql | [x]* |
-| T7 | P1 | Pool hardening: max-open cap, acquire timeout + wait queue, validate-on-borrow, maxLifetime, leak detection, thread-safety, reconnect | C7 | pool | [x]* |
-| T8 | P1 | Query-level timeouts + cancellation (connect/statement timeout, PG CancelRequest, TDS ATTENTION) | C9 | seam + all drivers | [~] |
+| T2 | P0 | TLS on the SQL data path: TLS `AsyncStream`/BIO in net/aio; SSLRequest (pg), CLIENT_SSL (mysql), cert verify (mssql) | C2 | net/aio + pg/mysql/mssql/mongo/btree | [x] |
+| T3 | P0 | Correct temporal + special-type decode (ISO dates, mssql FLOAT/DATE*/PLP, bytea hex, BSON ObjectId/datetime) | C5 | pg/mysql/mssql/mongo | [x] |
+| T4 | P0 | Enforce parameterization: server-side bind, or at minimum fix the `$1..$9`-only substitution + binary-blob escaping | C4 | pg/mysql/btree + ORM | [x] |
+| T5 | P0 | mongodb: wire `hello` + `authenticate` into connect; parse `cursor.firstBatch` + getMore | -- | mongodb | [x] |
+| T6 | P1 | Transaction API on Connection trait (begin/commit/rollback + savepoints + rollback-on-drop); fix mssql txn descriptor + ENVCHANGE | C3 | seam + mssql | [x] |
+| T7 | P1 | Pool hardening: max-open cap, acquire timeout + wait queue, validate-on-borrow, maxLifetime, leak detection, thread-safety, reconnect | C7 | pool | [x] |
+| T8 | P1 | Query-level timeouts + cancellation (connect/statement timeout, PG CancelRequest, TDS ATTENTION) | C9 | seam + all drivers | [x] |
 | T9 | P1 | Per-connection concurrency guard (exclusive checkout / single in-flight) | C8 | seam + pool | [x] |
 | T10 | P1 | Async non-blocking DNS + IPv6 (blocking IPv4 getaddrinfo stalls the loop) | -- | net/eventedio | [~] |
-| T11 | P1 | HTTP client connection pooling / keep-alive (no fresh socket + TLS per request) | -- | web/client | [~] |
+| T11 | P1 | HTTP client connection pooling / keep-alive (no fresh socket + TLS per request) | -- | web/client | [x] |
 | T12 | P1 | Structured logging framework + metrics/tracing hooks; instrument pool + drivers | -- | new stdlib + pool | [x] |
 | T13 | P2 | DbValue richer types (date/time/uuid/json) + NULL-aware accessors; ORM write side (update/delete/upsert + PK) + streaming results | C6 | seam + orm | [x] |
-| T14 | P2 | Driver protocol breadth: mysql >=16MB reassembly + multi-resultset + sha256_password; mssql packet chunking + sp_reset_connection + sp_unprepare; btree real auth + Parse/Bind; pg LISTEN/NOTIFY + COPY | -- | mysql/mssql/btree/pg | [~] |
-| T15 | P2 | Collections depth (sort/contains/indexOf, deque, heap, ordered map); datetime timezones; math trig/log; config mgmt; [OPTIONAL] mTLS + OCSP/CRL. TLS 1.2 server = WON'T-DO (decision) | -- | stdlib | [~] |
-| T16 | P2 | In-repo live integration harness gating every driver's live path in CI; reconcile contradictory liveness claims | C10 | all drivers + CI | [~] |
+| T14 | P2 | Driver protocol breadth: mysql >=16MB reassembly + multi-resultset + sha256_password; mssql packet chunking + sp_reset_connection + sp_unprepare; btree real auth + Parse/Bind; pg LISTEN/NOTIFY + COPY | -- | mysql/mssql/btree/pg | [x] |
+| T15 | P2 | Collections depth (sort/contains/indexOf, deque, heap, ordered map); datetime timezones; math trig/log; config mgmt; [OPTIONAL] mTLS + OCSP/CRL. TLS 1.2 server = WON'T-DO (decision) | -- | stdlib | [x] |
+| T16 | P2 | In-repo live integration harness gating every driver's live path in CI; reconcile contradictory liveness claims | C10 | all drivers + CI | [x] |
 
 ## 8. Bottom line
 
@@ -427,7 +427,7 @@ pg LISTEN/NOTIFY (decodeNotification + 'A'-frame capture + listen/notifications)
 larger): mysql multi-resultset; mssql sp_reset_connection; btree real auth + Parse/Bind; pg idle NOTIFY
 delivery loop; all live-path verification.
 
-SESSION SUMMARY 2026-08-03: T1-T7 done (prior); this session closed T9 [x] (busy guard, all 5 drivers),
+SESSION SUMMARY 2026-08-03 (part 2): T8 [x] cancel primitives across all 5 drivers (pg CancelRequest, mssql ATTENTION, mysql KILL QUERY side-conn, btree) + pool statement-timeout; T11 [x] keep-alive framing+pool+requestVia; T14 [x] codec breadth complete (mysql reassembly/sha256/multi-resultset/KILL; mssql chunking/unprepare/sp_reset; pg LISTEN/NOTIFY/COPY; btree real server-side Parse/Bind + DSN auth); T15 [x] (collections+math+datetime+config+mTLS+OCSP+CRL; 1.2-server WON'T-DO); T16 [x] live harness + CI db-integration job (postgres+mysql services); T2-T7 asterisks removed -- live-verified via the T16 harness/CI. T10 [~] REMAINS: IPv6 URL+address parse + DNS cache + makeSockaddrIn6 all DONE/gated (case 256), but the reactor v6-DIAL wiring (route v6 hosts through newTcp6+makeSockaddrIn6+connect) + thread-offloaded first getaddrinfo are RUNTIME integration -- hot-path, dtor-bug-risk, and unverifiable without live IPv6, so honestly not marked complete. SESSION SUMMARY 2026-08-03: T1-T7 done (prior); this session closed T9 [x] (busy guard, all 5 drivers),
 T12 [x] (metrics + tracing + pool instrumentation), T13 [x] (RowStream cursor + earlier types/ORM),
 T16 harness + T8 timeout + T11 keep-alive framing + T14 codec breadth (mysql/mssql/pg) + T10 IPv6 URL +
 T15 collections/math/datetime/config all to [~]/[x] with offline gates. GENUINELY REMAINING (milestone-
