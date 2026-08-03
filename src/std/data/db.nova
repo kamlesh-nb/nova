@@ -160,6 +160,42 @@ pub fn errorExec(e: DbError): ExecResult {
     return x;
 }
 
+// A forward cursor over a result. Today it iterates an already-materialized ResultSet (so it works
+// uniformly across every driver without protocol changes), giving callers a streaming-shaped API:
+//
+//   let cur = db.streamRows(conn.query(sql, params));
+//   while (cur.hasNext()) { let row = cur.next(); ... }
+//
+// True lazy fetch -- pulling rows from the server in batches without materializing the whole set
+// (pg portals with Execute row-count, mysql row-by-row, mssql PLP) -- is the per-driver follow-on; it
+// slots behind this same hasNext/next surface so callers do not change when a driver gains it.
+pub struct RowStream {
+    pub rs: ResultSet,
+    pub pos: int,
+
+    init(rs: ResultSet) {
+        self.rs = rs;
+        self.pos = 0;
+    }
+
+    pub fn hasNext(self: RowStream): bool { return self.pos < self.rs.rowCount(); }
+
+    pub fn next(self: RowStream): Row | undefined {
+        if (self.pos >= self.rs.rowCount()) { return undefined; }
+        let r = self.rs.row(self.pos);
+        self.pos = self.pos + 1;
+        return r;
+    }
+
+    pub fn reset(self: RowStream): void { self.pos = 0; }
+    pub fn remaining(self: RowStream): int { let n = self.rs.rowCount() - self.pos; return if (n > 0) n else 0; }
+    // Surface the statement's error channel so a streaming caller can still check `.ok()`.
+    pub fn ok(self: RowStream): bool { return self.rs.ok(); }
+    pub fn err(self: RowStream): DbError { return self.rs.err; }
+}
+
+pub fn streamRows(rs: ResultSet): RowStream { return RowStream(rs); }
+
 pub trait Connection {
 
     async fn exec(self, sql: string, params: List<DbValue>): ExecResult;

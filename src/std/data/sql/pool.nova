@@ -23,6 +23,9 @@ pub struct Pool {
     pub maxOpen: int,          // 0 = unlimited. A soft cap surfaced via borrowedCount/overflowCount:
                               // a hard blocking cap needs an async wait primitive (aio.sleep is a stub).
     pub maxLifetimeMs: long,   // 0 = unlimited; a pooled conn older than this is evicted on acquire.
+    pub queryTimeoutMs: int,   // 0 = unlimited; applied via conn.setTimeout on every acquire so each
+                              // borrowed connection carries a per-statement deadline (T8). The driver's
+                              // awaited recv errors past the deadline, so the query returns .hasError().
     pub validateOnBorrow: bool,// ping a pooled conn (SELECT 1) before handing it out; reconnect on failure.
     pub opened: int,
     pub live: int,
@@ -37,6 +40,7 @@ pub struct Pool {
         self.maxIdle = if (maxIdle > 0) maxIdle else 1;
         self.maxOpen = 0;
         self.maxLifetimeMs = 0;
+        self.queryTimeoutMs = 0;
         self.validateOnBorrow = false;
         self.opened = 0;
         self.live = 0;
@@ -49,6 +53,18 @@ pub struct Pool {
         self.maxOpen = maxOpen;
         self.maxLifetimeMs = maxLifetimeMs;
         self.validateOnBorrow = validateOnBorrow;
+    }
+
+    // Set a per-statement deadline (ms) applied to every connection this pool hands out (T8). 0 clears
+    // it. The deadline rides the driver's awaited recv, so a statement that outruns it fails with an
+    // error on the ResultSet/ExecResult rather than blocking the reactor indefinitely.
+    pub fn configureTimeouts(self, queryTimeoutMs: int): void {
+        self.queryTimeoutMs = queryTimeoutMs;
+    }
+
+    // Apply the configured statement deadline to a connection about to be handed out.
+    fn applyTimeout(self, c: Connection): void {
+        if (self.queryTimeoutMs > 0) { c.setTimeout(self.queryTimeoutMs); }
     }
 
     // Health check: a pooled connection is live iff a trivial query succeeds (T1 error channel).
@@ -83,6 +99,7 @@ pub struct Pool {
                 }
             }
             self.markBorrowed();
+            self.applyTimeout(p.conn);
             return p.conn;
         }
         // No usable idle connection: open a new one. maxOpen is a soft cap (see field note); record when
@@ -90,6 +107,7 @@ pub struct Pool {
         if (self.maxOpen > 0 && self.borrowed >= self.maxOpen) { self.overflow = self.overflow + 1; }
         let c = await self.newConn();
         self.markBorrowed();
+        self.applyTimeout(c);
         return c;
     }
 

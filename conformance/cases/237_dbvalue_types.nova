@@ -22,3 +22,28 @@ fn test_null_aware_accessors(): void {
     let z = db.dbInt(0);
     assert.equalInt(z.asIntOr(-1), 0);
 }
+
+@test
+fn test_rowstream_cursor(): void {
+    // Build a ResultSet by hand: two rows, one int cell each (id 10, 20).
+    let rs = ResultSet();
+    let r0 = Row(); r0.cells.push(db.dbInt(10)); rs.rows.push(r0);
+    let r1 = Row(); r1.cells.push(db.dbInt(20)); rs.rows.push(r1);
+
+    let cur = db.streamRows(rs);
+    assert.isTrue(cur.ok());
+    assert.equalInt(cur.remaining(), 2);
+    assert.isTrue(cur.hasNext());
+    let a = cur.next() ?? Row();
+    assert.equalInt(a.getInt(0), 10);
+    assert.equalInt(cur.remaining(), 1);
+    let b = cur.next() ?? Row();
+    assert.equalInt(b.getInt(0), 20);
+    assert.isFalse(cur.hasNext());
+    assert.isTrue(cur.next() == undefined);
+    // reset re-iterates
+    cur.reset();
+    assert.equalInt(cur.remaining(), 2);
+    let a2 = cur.next() ?? Row();
+    assert.equalInt(a2.getInt(0), 10);
+}

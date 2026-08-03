@@ -17,7 +17,8 @@ struct Counter {
     pub opens: int,
     pub closes: int,
     pub sick: bool,          // when true, a conn's query fails (drives validate-on-borrow reconnect)
-    init() { self.opens = 0; self.closes = 0; self.sick = false; }
+    pub lastTimeout: int,    // records the last setTimeout(ms) the pool applied on acquire (T8)
+    init() { self.opens = 0; self.closes = 0; self.sick = false; self.lastTimeout = 0; }
 }
 
 struct CountingConn impl Connection {
@@ -40,7 +41,7 @@ struct CountingConn impl Connection {
         return rs;
     }
     pub fn close(self): void { self.ctr.closes = self.ctr.closes + 1; }
-    pub fn setTimeout(self, ms: int): int { return 0; }
+    pub fn setTimeout(self, ms: int): int { self.ctr.lastTimeout = ms; return 0; }
     pub async fn prepare(self, sql: string): int { self.prepared.push(sql); return self.prepared.size() - 1; }
     pub async fn queryPrepared(self, stmt: int, params: List<DbValue>): ResultSet {
         if (stmt < 0 || stmt >= self.prepared.size()) { return ResultSet(); }
@@ -192,4 +193,18 @@ fn test_pool_query_through_pooled_conn(): void {
     assert.equalInt(rs.row(0).getInt(0), 0);   // conn #0's id
     p.release(c);
     p.closeAll();
+}
+
+@test
+fn test_pool_applies_query_timeout(): void {
+    let ctr = Counter();
+    let p = Pool(CountingDriver(ctr), "mock://x", 4);
+    p.configureTimeouts(2500);        // 2.5s per-statement deadline
+    let a = p.acquire();              // fresh conn -> applyTimeout(2500)
+    assert.equalInt(2500, ctr.lastTimeout);
+    p.release(a);
+    ctr.lastTimeout = 0;
+    let b = p.acquire();             // reused idle conn -> applyTimeout again
+    assert.equalInt(2500, ctr.lastTimeout);
+    p.release(b);
 }
