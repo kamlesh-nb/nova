@@ -292,9 +292,15 @@ wrong; P1 = required for a real deployment; P2 = completeness/ergonomics.
 Every roadmap item as a trackable row: priority, the cross-cutting blocker it closes (C1-C10 from
 section 2), where the work lands, and status. Legend: [ ] not started, [~] in progress, [x] done.
 
+T1 DONE 2026-08-03: `data/db` gained `err: DbError` on ResultSet/ExecResult (+ ok/hasError +
+errorResult/errorExec); pg/mysql/mssql/btreedb/mongodb all decode their wire error onto the result
+instead of swallowing it; `ResilientPool` failure detection now keys on `hasError()`. One residual is
+tracked separately: connect-time errors still do not propagate (Driver.connect returns a bare
+Connection) -- that needs a connect error channel and is folded into C1/T8 follow-up.
+
 | # | Pri | Item | Blocker | Where it lands | Status |
 |---|---|---|---|---|---|
-| T1 | P0 | Error propagation: add `DbError` return/channel; wire each driver's decoder into its read loop | C1 | seam + all 5 drivers | [ ] |
+| T1 | P0 | Error propagation: add `DbError` return/channel; wire each driver's decoder into its read loop | C1 | seam + all 5 drivers | [x] |
 | T2 | P0 | TLS on the SQL data path: TLS `AsyncStream`/BIO in net/aio; SSLRequest (pg), CLIENT_SSL (mysql), cert verify (mssql) | C2 | net/aio + pg/mysql/mssql/mongo/btree | [ ] |
 | T3 | P0 | Correct temporal + special-type decode (ISO dates, mssql FLOAT/DATE*/PLP, bytea hex, BSON ObjectId/datetime) | C5 | pg/mysql/mssql/mongo | [ ] |
 | T4 | P0 | Enforce parameterization: server-side bind, or fix `$1..$9`-only + binary-blob escaping | C4 | pg/mysql/btree + ORM | [ ] |

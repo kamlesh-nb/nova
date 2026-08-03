@@ -84,7 +84,10 @@ pub struct ResilientPool {
         }
         let c = await self.pool.acquire();
         let rs = await c.query(sql, params);
-        if (string.eql(rs.tag, "")) {
+        // A server-reported error (rs.err) or a missing command tag (dead/half-open connection) is a
+        // failure: trip the breaker and discard the connection. Previously only the empty-tag heuristic
+        // was available; rs.hasError() now catches a real SQL error on an otherwise-live connection.
+        if (rs.hasError() || string.eql(rs.tag, "")) {
             self.breaker.recordFailure();
             self.pool.discard(c);
         } else {
@@ -100,7 +103,7 @@ pub struct ResilientPool {
         }
         let c = await self.pool.acquire();
         let ex = await c.exec(sql, params);
-        if (string.eql(ex.tag, "")) {
+        if (ex.hasError() || string.eql(ex.tag, "")) {
             self.breaker.recordFailure();
             self.pool.discard(c);
         } else {
