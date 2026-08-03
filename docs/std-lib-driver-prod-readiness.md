@@ -369,7 +369,7 @@ test (T16). Next tier is P1 (T6 transactions, T7 pool hardening, ...).
 | T6 | P1 | Transaction API on Connection trait (begin/commit/rollback + savepoints + rollback-on-drop); fix mssql txn descriptor + ENVCHANGE | C3 | seam + mssql | [x]* |
 | T7 | P1 | Pool hardening: max-open cap, acquire timeout + wait queue, validate-on-borrow, maxLifetime, leak detection, thread-safety, reconnect | C7 | pool | [x]* |
 | T8 | P1 | Query-level timeouts + cancellation (connect/statement timeout, PG CancelRequest, TDS ATTENTION) | C9 | seam + all drivers | [~] |
-| T9 | P1 | Per-connection concurrency guard (exclusive checkout / single in-flight) | C8 | seam + pool | [~] |
+| T9 | P1 | Per-connection concurrency guard (exclusive checkout / single in-flight) | C8 | seam + pool | [x] |
 | T10 | P1 | Async non-blocking DNS + IPv6 (blocking IPv4 getaddrinfo stalls the loop) | -- | net/eventedio | [ ] |
 | T11 | P1 | HTTP client connection pooling / keep-alive (no fresh socket + TLS per request) | -- | web/client | [ ] |
 | T12 | P1 | Structured logging framework + metrics/tracing hooks; instrument pool + drivers | -- | new stdlib + pool | [x] |
@@ -407,10 +407,21 @@ write side is update<T>(conn,table,obj,keyCol) + deleteBy(conn,table,keyCol,keyV
 map uuid/json OIDs. REMAINING: cursor/streaming results (fetch rows in batches rather than materializing
 the full ResultSet) -- needs per-driver batch-fetch support and a live server to verify, deferred with T16.
 
+T9 [x] 2026-08-03: per-connection concurrency guard shipped across ALL FIVE drivers. Each Connection
+carries a busy:bool; query/exec (and, where they send frames directly rather than delegating,
+queryPrepared/execPrepared -- mysql/mssql) refuse re-entry with a "connection busy: concurrent use"
+DbError, clearing the flag on every return path. begin/commit/rollback and the delegating prepared
+paths are guarded TRANSITIVELY through the exec/query they call (guarding them directly would false-trip
+the inner guard). One in-flight request per connection; concurrency comes from the pool's exclusive
+checkout. Offline codec suites green per driver (pg reference; btree 19, mysql 26+23, mssql 22+21, mongo
+26). Minor follow-on: mysql/mssql `prepare` (COM_STMT_PREPARE / sp_prepare) also send a frame and could
+take the guard; left to match the pg reference scope.
+
 T15 [~] 2026-08-03: stdlib depth partially landed and gated. DONE: list ext (reverse/clear/pop/first/
 last/findIndex/any/all/indexOf/contains, case 235); config.nova (env-override layered config, case 236);
 math trig/log (sin/cos/tan/atan/atan2/log10/log2 with range reduction) + datetime timezones
-(tzOffsetSeconds/fromIsoUtc/formatOffset), case 244. REMAINING: deque/heap/ordered-map containers; TLS
+(tzOffsetSeconds/fromIsoUtc/formatOffset), case 244; Deque<T> (double-ended, two-stack amortized) +
+Heap<T> (min priority queue with a less comparator), case 246. REMAINING: ordered-map container; TLS
 1.2 server + mTLS + OCSP/CRL revocation (large TLS-role work, tracked with the M12/M13 TLS line).
 
 T9 [~] 2026-08-03: per-connection concurrency guard on pg (query/exec refuse re-entry while a request is
