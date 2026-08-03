@@ -412,6 +412,86 @@ pub fn docGetObjectId(doc: BsonDocument, index: int): string {
     return entry.str_val;
 }
 
+fn jsonEscape(s: string): string {
+    let out = "\"";
+    let i = 0;
+    while (i < s.length) {
+        let c = s[i];
+        if (c == 34) { out = out + "\\\""; }
+        else if (c == 92) { out = out + "\\\\"; }
+        else if (c == 10) { out = out + "\\n"; }
+        else if (c == 13) { out = out + "\\r"; }
+        else if (c == 9) { out = out + "\\t"; }
+        else { out = out + string.slice(s, i, i + 1); }
+        i = i + 1;
+    }
+    return out + "\"";
+}
+fn jbHexPair(b: int): string {
+    let p = bytes.alloc(2);
+    bytes.write_byte(p, 0, hexNibbleCh((b / 16) & 15));
+    bytes.write_byte(p, 1, hexNibbleCh(b & 15));
+    return p as string;
+}
+// int64 value from the hi/lo split entry storage.
+fn i64Val(e: BsonEntry): long { return (e.int_val << 32) | ((e.int_val2 as long) & 4294967295); }
+// double value string from the hi/lo IEEE bits, via the LE-bytes runtime builtin.
+fn dblStr(e: BsonEntry): string {
+    let lo = e.int_val2;
+    let hi = e.int_val as int;
+    let b = bytes.alloc(8);
+    bytes.write_byte(b, 0, lo & 255); bytes.write_byte(b, 1, (lo / 256) & 255);
+    bytes.write_byte(b, 2, (lo / 65536) & 255); bytes.write_byte(b, 3, (lo / 16777216) & 255);
+    bytes.write_byte(b, 4, hi & 255); bytes.write_byte(b, 5, (hi / 256) & 255);
+    bytes.write_byte(b, 6, (hi / 65536) & 255); bytes.write_byte(b, 7, (hi / 16777216) & 255);
+    return nova_ieee_le_to_str(b as string, 8);
+}
+fn binHex(s: string): string {
+    let out = "\"";
+    let i = 0;
+    while (i < s.length) { out = out + jbHexPair(s[i]); i = i + 1; }
+    return out + "\"";
+}
+
+// Render a BsonDocument as a JSON string (relaxed extended JSON: ObjectId/binary -> hex string,
+// datetime/timestamp -> number). Used by the MongoDB driver so `find` returns real documents.
+pub fn docToJson(doc: BsonDocument): string {
+    let out = "{";
+    let i = 0;
+    while (i < doc.entries.size()) {
+        let e = doc.entries.at(i);
+        if (i > 0) { out = out + ","; }
+        out = out + jsonEscape(e.key) + ":" + entryToJson(e);
+        i = i + 1;
+    }
+    return out + "}";
+}
+fn entryToJson(e: BsonEntry): string {
+    let t = e.type_id;
+    if (t == 2) { return jsonEscape(e.str_val); }
+    if (t == 7) { return jsonEscape(e.str_val); }           // ObjectId hex
+    if (t == 16) { return `${e.int_val as int}`; }
+    if (t == 18 || t == 9 || t == 17) { return `${i64Val(e)}`; }
+    if (t == 1) { return dblStr(e); }
+    if (t == 8) { if (e.int_val != 0) { return "true"; } return "false"; }
+    if (t == 10) { return "null"; }
+    if (t == 19) { return jsonEscape(`${e.dec_val}`); }     // decimal128 as a string (exactness)
+    if (t == 5) { return binHex(e.str_val); }
+    if (t == 3) { return docToJson(deserialize(e.str_val as ptr)); }
+    if (t == 4) {
+        let arr = deserialize(e.str_val as ptr);
+        let out = "[";
+        let j = 0;
+        while (j < arr.entries.size()) {
+            if (j > 0) { out = out + ","; }
+            out = out + entryToJson(arr.entries.at(j));
+            j = j + 1;
+        }
+        return out + "]";
+    }
+    return "null";
+}
+
 pub fn docGetBinary(doc: BsonDocument, index: int): string {
     if (index < 0 || index >= doc.entries.size()) return "";
     let entry = doc.entries.at(index);
