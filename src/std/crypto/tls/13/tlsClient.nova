@@ -595,6 +595,57 @@ pub fn clientFinishedRecord(self: TlsClient, verifyData: ptr, out: ptr): int {
     return n;
 }
 
+fn w3c(out: ptr, off: int, v: int): void {
+    bytes.write_byte(out, off, (v >> 16) & 0xff);
+    bytes.write_byte(out, off + 1, (v >> 8) & 0xff);
+    bytes.write_byte(out, off + 2, v & 0xff);
+}
+
+// mTLS -- build the client's Certificate handshake message (RFC 8446 4.4.2) into `out`. Mirrors the
+// server Certificate: 0b || bodyLen(3) || ctxLen=0 || listLen(3) || certLen(3) || cert || ext=0000.
+// An EMPTY cert (certLen 0 -> listLen 0) is a valid "I have no certificate" reply to an optional
+// CertificateRequest. Returns the message length. Pure (no self) so it is unit-testable.
+pub fn buildClientCertificate(certDer: ptr, certLen: int, out: ptr): int {
+    let listLen = if (certLen > 0) 3 + certLen + 2 else 0;
+    let bodyLen = 1 + 3 + listLen;
+    let p = 0;
+    bytes.write_byte(out, p, 0x0b); p = p + 1;
+    w3c(out, p, bodyLen); p = p + 3;
+    bytes.write_byte(out, p, 0); p = p + 1;              // certificate_request_context (empty)
+    w3c(out, p, listLen); p = p + 3;
+    if (certLen > 0) {
+        w3c(out, p, certLen); p = p + 3;
+        let i = 0;
+        while (i < certLen) { bytes.write_byte(out, p + i, bytes.read_byte(certDer, i)); i = i + 1; }
+        p = p + certLen;
+        bytes.write_byte(out, p, 0); bytes.write_byte(out, p + 1, 0); p = p + 2;   // entry extensions
+    }
+    return p;
+}
+
+// mTLS -- build the client's CertificateVerify handshake message (RFC 8446 4.4.3): sign the transcript
+// hash (through the client Certificate) with the client's P-256 key under the CLIENT context, wrapped as
+// 0f || bodyLen(3) || scheme(2)=ecdsa_secp256r1_sha256 || sigLen(2) || DER-sig. Returns the length.
+pub fn buildClientCertVerify(transcriptHash: ptr, hl: int, key: ptr, out: ptr): int {
+    let digest = bytes.alloc(32);
+    handshake.certVerifyDigest(false, transcriptHash, hl, digest);   // false = client context
+    let r = bytes.alloc(32); let s = bytes.alloc(32);
+    p256.ecdsaSign(digest, key, r, s);
+    let sigDer = bytes.alloc(80);
+    let sigLen = handshake.encodeEcdsaSigDer(r, s, sigDer);
+    let bodyLen = 4 + sigLen;
+    let p = 0;
+    bytes.write_byte(out, p, 0x0f); p = p + 1;
+    w3c(out, p, bodyLen); p = p + 3;
+    bytes.write_byte(out, p, 0x04); bytes.write_byte(out, p + 1, 0x03); p = p + 2;   // ecdsa_secp256r1_sha256
+    bytes.write_byte(out, p, (sigLen >> 8) & 0xff); bytes.write_byte(out, p + 1, sigLen & 0xff); p = p + 2;
+    let i = 0;
+    while (i < sigLen) { bytes.write_byte(out, p + i, bytes.read_byte(sigDer, i)); i = i + 1; }
+    p = p + sigLen;
+    bytes.free(digest); bytes.free(r); bytes.free(s); bytes.free(sigDer);
+    return p;
+}
+
 // Encrypt application data as a TLSCiphertext record with the client application key (content type
 // 0x17). Returns the record length.
 pub fn encryptApp(self: TlsClient, data: ptr, dataLen: int, out: ptr): int {
