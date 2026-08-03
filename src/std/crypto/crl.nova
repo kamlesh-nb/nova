@@ -1,0 +1,204 @@
+// CRL (RFC 5280) certificate-revocation lists, client side. A client fetches a CRL from the cert's CRL
+// distribution point, verifies the issuer's signature over the tbsCertList, and checks whether the leaf's
+// serial appears in revokedCertificates. This module provides the ASN.1 parse (serial membership) + the
+// signature verification (offline-testable) + a builder for the round-trip gate. The HTTP fetch from the
+// CRL-DP URL is the caller's job (live network). Common shape only: an ECDSA-P256/SHA-256 issuer.
+
+import bytes;
+import crypto.x509;
+import crypto.hash.sha256;
+import crypto.ecc.p256;
+
+pub struct CrlView {
+    pub ok: bool,
+    pub tbsStart: int, pub tbsLen: int,      // signed tbsCertList (DER)
+    pub revokedOff: int, pub revokedLen: int, // revokedCertificates SEQUENCE OF (value region), 0 if none
+    pub sigOff: int, pub sigLen: int,
+
+    init() { self.ok = false; self.tbsStart = 0; self.tbsLen = 0; self.revokedOff = 0; self.revokedLen = 0; self.sigOff = 0; self.sigLen = 0; }
+}
+
+fn isTime(tag: int): bool { return tag == 0x17 || tag == 0x18; }   // UTCTime / GeneralizedTime
+
+// Parse a CertificateList (DER): locate the signed tbsCertList, the revokedCertificates region, and the
+// signature. Robust to the optional version + optional nextUpdate.
+pub fn parseCrl(der: ptr, len: int): CrlView {
+    let v = CrlView();
+    let top = x509.readTlv(der, 0);                  // CertificateList SEQUENCE
+    if (top.tag != 0x30) { return v; }
+    let tbs = x509.readTlv(der, top.start);          // tbsCertList SEQUENCE
+    if (tbs.tag != 0x30) { return v; }
+    v.tbsStart = top.start;
+    v.tbsLen = tbs.next - top.start;
+
+    let sigAlg = x509.readTlv(der, tbs.next);        // signatureAlgorithm
+    let sigBit = x509.readTlv(der, sigAlg.next);     // signatureValue BIT STRING
+    v.sigOff = sigBit.start + 1;                     // skip unused-bits byte
+    v.sigLen = sigBit.len - 1;
+
+    // Walk tbsCertList to revokedCertificates.
+    let p = tbs.start;
+    let e = x509.readTlv(der, p);
+    if (e.tag == 0x02) { p = e.next; e = x509.readTlv(der, p); }   // optional version INTEGER
+    // e = signature AlgorithmIdentifier (SEQUENCE) -> skip
+    p = e.next; e = x509.readTlv(der, p);            // issuer Name (SEQUENCE) -> skip
+    p = e.next; e = x509.readTlv(der, p);            // thisUpdate Time -> skip
+    if (isTime(e.tag)) { p = e.next; e = x509.readTlv(der, p); }   // that was thisUpdate; advance
+    if (isTime(e.tag)) { p = e.next; e = x509.readTlv(der, p); }   // optional nextUpdate
+    // e is now revokedCertificates (SEQUENCE) or crlExtensions ([0] 0xa0) or past-end.
+    if (p < v.tbsStart + v.tbsLen && e.tag == 0x30) {
+        v.revokedOff = e.start;
+        v.revokedLen = e.len;
+    }
+    v.ok = true;
+    return v;
+}
+
+// Is `serial` (INTEGER value bytes) present in the CRL's revokedCertificates? Each entry is
+// SEQUENCE { userCertificate INTEGER, revocationDate Time, ... }.
+pub fn isRevoked(der: ptr, v: CrlView, serial: ptr, serialLen: int): bool {
+    if (!v.ok || v.revokedLen == 0) { return false; }
+    let p = v.revokedOff;
+    let end = v.revokedOff + v.revokedLen;
+    while (p < end) {
+        let entry = x509.readTlv(der, p);            // revoked entry SEQUENCE
+        let ser = x509.readTlv(der, entry.start);    // userCertificate INTEGER
+        if (serialEq(der, ser.start, ser.len, serial, serialLen)) { return true; }
+        p = entry.next;
+    }
+    return false;
+}
+
+fn serialEq(der: ptr, off: int, n: int, serial: ptr, serialLen: int): bool {
+    if (n != serialLen) { return false; }
+    let i = 0;
+    while (i < n) { if (bytes.read_byte(der, off + i) != bytes.read_byte(serial, i)) { return false; } i = i + 1; }
+    return true;
+}
+
+// Verify the issuer's signature over tbsCertList with a P-256 issuer public key (65-byte point).
+pub fn verifyCrlSignatureEc(der: ptr, v: CrlView, issuerPub65: ptr): bool {
+    if (!v.ok) { return false; }
+    let digest = bytes.alloc(32);
+    sha256.hashInto((der as long + v.tbsStart) as ptr, v.tbsLen, digest);
+    let sigPtr = (der as long + v.sigOff) as ptr;
+    let r = bytes.alloc(32); let s = bytes.alloc(32);
+    decodeSig(sigPtr, r, s);
+    let ok = p256.ecdsaVerify(digest, issuerPub65, r, s);
+    bytes.free(digest); bytes.free(r); bytes.free(s);
+    return ok;
+}
+
+fn decodeSig(sig: ptr, rOut: ptr, sOut: ptr): void {
+    let rTag = 4;
+    let rLen = bytes.read_byte(sig, 3);
+    let sValHdr = rTag + rLen;
+    let sTag = sValHdr + 2;
+    let sLen = bytes.read_byte(sig, sValHdr + 1);
+    intTo(sig, rTag, rLen, rOut);
+    intTo(sig, sTag, sLen, sOut);
+}
+fn intTo(buf: ptr, start: int, len: int, out: ptr): void {
+    let s = start; let l = len;
+    while (l > 0 && bytes.read_byte(buf, s) == 0) { s = s + 1; l = l - 1; }
+    let i = 0; while (i < 32) { bytes.write_byte(out, i, 0); i = i + 1; }
+    let pad = 32 - l;
+    i = 0; while (i < l) { bytes.write_byte(out, pad + i, bytes.read_byte(buf, s + i)); i = i + 1; }
+}
+
+// --- DER writer (bottom-up) ----------------------------------------------------------------------
+fn wlen(out: ptr, off: int, n: int): int {
+    if (n < 0x80) { bytes.write_byte(out, off, n); return 1; }
+    if (n < 0x100) { bytes.write_byte(out, off, 0x81); bytes.write_byte(out, off + 1, n); return 2; }
+    bytes.write_byte(out, off, 0x82); bytes.write_byte(out, off + 1, (n >> 8) & 0xff); bytes.write_byte(out, off + 2, n & 0xff);
+    return 3;
+}
+fn wrap(out: ptr, off: int, tag: int, child: ptr, childLen: int): int {
+    bytes.write_byte(out, off, tag);
+    let ln = wlen(out, off + 1, childLen);
+    let p = off + 1 + ln;
+    let i = 0; while (i < childLen) { bytes.write_byte(out, p + i, bytes.read_byte(child, i)); i = i + 1; }
+    return 1 + ln + childLen;
+}
+fn cat(out: ptr, off: int, src: ptr, n: int): int {
+    let i = 0; while (i < n) { bytes.write_byte(out, off + i, bytes.read_byte(src, i)); i = i + 1; }
+    return n;
+}
+
+// Build a signed CRL revoking `serials` (a packed array of `count` fixed-width `serialLen`-byte serials),
+// signed by an ECDSA-P256 key. Used by the round-trip gate; also a minimal Nova CRL issuer. `time15` is a
+// 15-byte GeneralizedTime.
+pub fn buildTestCrl(serials: ptr, serialLen: int, count: int, key32: ptr, time15: ptr, out: ptr): int {
+    // revokedCertificates SEQUENCE OF { SEQ { INTEGER serial, GeneralizedTime revDate } }
+    let entries = bytes.alloc(64 + count * (serialLen + 24));
+    let ep = 0;
+    let k = 0;
+    while (k < count) {
+        let one = bytes.alloc(serialLen + 32);
+        let op = 0;
+        let ser = bytes.alloc(serialLen + 4);
+        let serLen = wrap(ser, 0, 0x02, (serials as long + k * serialLen) as ptr, serialLen);
+        op = op + cat(one, op, ser, serLen);
+        let rd = bytes.alloc(20); let rdLen = wrap(rd, 0, 0x18, time15, 15);
+        op = op + cat(one, op, rd, rdLen);
+        let entry = bytes.alloc(serialLen + 40); let entryLen = wrap(entry, 0, 0x30, one, op);
+        ep = ep + cat(entries, ep, entry, entryLen);
+        k = k + 1;
+    }
+    let revoked = bytes.alloc(80 + count * (serialLen + 40)); let revokedLen = wrap(revoked, 0, 0x30, entries, ep);
+
+    // signature AlgorithmIdentifier = ecdsa-with-SHA256
+    let sigAlg = bytes.alloc(12);
+    bytes.write_byte(sigAlg, 0, 0x30); bytes.write_byte(sigAlg, 1, 0x0a);
+    bytes.write_byte(sigAlg, 2, 0x06); bytes.write_byte(sigAlg, 3, 0x08);
+    bytes.write_byte(sigAlg, 4, 0x2a); bytes.write_byte(sigAlg, 5, 0x86); bytes.write_byte(sigAlg, 6, 0x48);
+    bytes.write_byte(sigAlg, 7, 0xce); bytes.write_byte(sigAlg, 8, 0x3d); bytes.write_byte(sigAlg, 9, 0x04);
+    bytes.write_byte(sigAlg, 10, 0x03); bytes.write_byte(sigAlg, 11, 0x02);
+    // issuer Name = empty RDNSequence (30 00) -- parser skips it by TLV
+    let issuer = bytes.alloc(4); bytes.write_byte(issuer, 0, 0x30); bytes.write_byte(issuer, 1, 0x00);
+    // thisUpdate GeneralizedTime
+    let tu = bytes.alloc(20); let tuLen = wrap(tu, 0, 0x18, time15, 15);
+
+    // tbsCertList = SEQ { signature, issuer, thisUpdate, revokedCertificates }   (v1: no version)
+    let tbsBody = bytes.alloc(200 + revokedLen); let tp = 0;
+    tp = tp + cat(tbsBody, tp, sigAlg, 12);
+    tp = tp + cat(tbsBody, tp, issuer, 2);
+    tp = tp + cat(tbsBody, tp, tu, tuLen);
+    tp = tp + cat(tbsBody, tp, revoked, revokedLen);
+    let tbs = bytes.alloc(240 + revokedLen); let tbsLen = wrap(tbs, 0, 0x30, tbsBody, tp);
+
+    // sign SHA-256(tbs)
+    let digest = bytes.alloc(32); sha256.hashInto(tbs, tbsLen, digest);
+    let r = bytes.alloc(32); let s = bytes.alloc(32); p256.ecdsaSign(digest, key32, r, s);
+    let sigVal = bytes.alloc(80); let sigValLen = encodeSig(r, s, sigVal);
+    let bitBody = bytes.alloc(84); bytes.write_byte(bitBody, 0, 0x00); let bb = 1 + cat(bitBody, 1, sigVal, sigValLen);
+    let sigBit = bytes.alloc(88); let sigBitLen = wrap(sigBit, 0, 0x03, bitBody, bb);
+
+    // CertificateList = SEQ { tbs, sigAlg, signature }
+    let body = bytes.alloc(400 + revokedLen); let bp = 0;
+    bp = bp + cat(body, bp, tbs, tbsLen);
+    bp = bp + cat(body, bp, sigAlg, 12);
+    bp = bp + cat(body, bp, sigBit, sigBitLen);
+    return wrap(out, 0, 0x30, body, bp);
+}
+
+fn encodeSig(r: ptr, s: ptr, out: ptr): int {
+    let rlen = encInt(r, out, 2);
+    let slen = encInt(s, out, 2 + rlen);
+    let total = rlen + slen;
+    bytes.write_byte(out, 0, 0x30); bytes.write_byte(out, 1, total);
+    return 2 + total;
+}
+fn encInt(src: ptr, out: ptr, off: int): int {
+    let s = 0;
+    while (s < 31 && bytes.read_byte(src, s) == 0) { s = s + 1; }
+    let pad = 0;
+    if ((bytes.read_byte(src, s) & 0x80) != 0) { pad = 1; }
+    let vlen = 32 - s + pad;
+    bytes.write_byte(out, off, 0x02); bytes.write_byte(out, off + 1, vlen);
+    let p = off + 2;
+    if (pad == 1) { bytes.write_byte(out, p, 0); p = p + 1; }
+    let i = s;
+    while (i < 32) { bytes.write_byte(out, p, bytes.read_byte(src, i)); p = p + 1; i = i + 1; }
+    return p - off;
+}

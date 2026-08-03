@@ -1,0 +1,68 @@
+// T15 mTLS phase 4: CRL (RFC 5280) revocation lists. Gates the ASN.1 parse (serial membership) +
+// issuer-signature verification by round-tripping a signed CRL: a serial on the list is reported revoked,
+// one not on it is not, and the issuer signature validates (a wrong key fails). (The live HTTP fetch from
+// the CRL distribution point is the caller's job.)
+import crypto.crl;
+import crypto.ecc.p256;
+import bytes;
+import assert;
+
+fn fill(buf: ptr, n: int, seed: int): void {
+    let i = 0; while (i < n) { bytes.write_byte(buf, i, (i * 5 + seed) & 0xff); i = i + 1; }
+}
+fn mkTime(): ptr {
+    let t = "20260803120000Z"; let b = bytes.alloc(15);
+    let i = 0; while (i < 15) { bytes.write_byte(b, i, t[i]); i = i + 1; }
+    return b;
+}
+
+@test
+fn test_crl_membership_and_signature(): void {
+    let key = bytes.alloc(32); fill(key, 32, 1); bytes.write_byte(key, 0, 0x11);
+    let pubKey = bytes.alloc(65); p256.derivePublic(pubKey, key);
+
+    // two revoked serials, packed 8 bytes each (high bit clear so no DER pad)
+    let SLEN = 8;
+    let serials = bytes.alloc(2 * SLEN);
+    fill(serials, 2 * SLEN, 20);
+    bytes.write_byte(serials, 0, 0x10);          // serial A high byte
+    bytes.write_byte(serials, SLEN, 0x20);       // serial B high byte
+
+    let crlBuf = bytes.alloc(2048);
+    let n = crl.buildTestCrl(serials, SLEN, 2, key, mkTime(), crlBuf);
+    assert.isTrue(n > 0);
+
+    let v = crl.parseCrl(crlBuf, n);
+    assert.isTrue(v.ok);
+    assert.isTrue(v.revokedLen > 0);
+
+    // serial A (on the list) is revoked
+    let a = bytes.alloc(SLEN); let i = 0; while (i < SLEN) { bytes.write_byte(a, i, bytes.read_byte(serials, i)); i = i + 1; }
+    assert.isTrue(crl.isRevoked(crlBuf, v, a, SLEN));
+    // serial B (on the list) is revoked
+    let b = bytes.alloc(SLEN); i = 0; while (i < SLEN) { bytes.write_byte(b, i, bytes.read_byte(serials, SLEN + i)); i = i + 1; }
+    assert.isTrue(crl.isRevoked(crlBuf, v, b, SLEN));
+    // a serial NOT on the list is not revoked
+    let c = bytes.alloc(SLEN); fill(c, SLEN, 99); bytes.write_byte(c, 0, 0x7f);
+    assert.isFalse(crl.isRevoked(crlBuf, v, c, SLEN));
+
+    // issuer signature verifies; a wrong key fails
+    assert.isTrue(crl.verifyCrlSignatureEc(crlBuf, v, pubKey));
+    let badKey = bytes.alloc(32); fill(badKey, 32, 9); bytes.write_byte(badKey, 0, 0x22);
+    let badPub = bytes.alloc(65); p256.derivePublic(badPub, badKey);
+    assert.isFalse(crl.verifyCrlSignatureEc(crlBuf, v, badPub));
+}
+
+@test
+fn test_crl_empty_list(): void {
+    // A CRL with no revoked certs: parse ok, nothing revoked.
+    let key = bytes.alloc(32); fill(key, 32, 1); bytes.write_byte(key, 0, 0x11);
+    let pubKey = bytes.alloc(65); p256.derivePublic(pubKey, key);
+    let crlBuf = bytes.alloc(1024);
+    let n = crl.buildTestCrl(bytes.alloc(1), 8, 0, key, mkTime(), crlBuf);
+    let v = crl.parseCrl(crlBuf, n);
+    assert.isTrue(v.ok);
+    let any = bytes.alloc(8); fill(any, 8, 3); bytes.write_byte(any, 0, 0x10);
+    assert.isFalse(crl.isRevoked(crlBuf, v, any, 8));
+    assert.isTrue(crl.verifyCrlSignatureEc(crlBuf, v, pubKey));
+}
