@@ -243,6 +243,10 @@ struct TlsClient {
     pub eKey: ptr, pub eIv: ptr, pub eSeq: long,  // 0-RTT client_early_traffic key/IV/sequence
     pub offerEarly: bool, pub earlyAccepted: bool, // this handshake offers 0-RTT / the server accepted it
     pub sendLimit: int,                           // peer's record_size_limit (RFC 8449); max send plaintext = sendLimit-1
+    pub certRequested: bool,                      // mTLS: the server sent a CertificateRequest
+    pub haveClientCert: bool,                     // a client certificate + key is configured
+    pub clientCertDer: ptr, pub clientCertLen: int,   // client leaf certificate (DER)
+    pub clientKey: ptr,                           // client P-256 private scalar (32 bytes) for CertificateVerify
 }
 
 pub fn newClient(ephPriv: ptr, ephPrivP256: ptr, ephPrivP384: ptr): TlsClient {
@@ -259,7 +263,46 @@ pub fn newClient(ephPriv: ptr, ephPrivP256: ptr, ephPrivP384: ptr): TlsClient {
         ticketAgeAdd: 0, ticketKind: 0, haveTicket: false, offerPsk: false, pskAccepted: false,
         eKey: bytes.alloc(32), eIv: bytes.alloc(12), eSeq: 0, offerEarly: false, earlyAccepted: false,
         sendLimit: 16385,
+        certRequested: false, haveClientCert: false, clientCertDer: bytes.alloc(1), clientCertLen: 0, clientKey: bytes.alloc(32),
     };
+}
+
+// mTLS: configure the client certificate + P-256 signing key presented when the server sends a
+// CertificateRequest. `certDer` is the leaf certificate (DER), `key` the 32-byte private scalar.
+pub fn setClientCert(self: TlsClient, certDer: ptr, certLen: int, key: ptr): void {
+    self.clientCertDer = certDer;
+    self.clientCertLen = certLen;
+    let i = 0;
+    while (i < 32) { bytes.write_byte(self.clientKey, i, bytes.read_byte(key, i)); i = i + 1; }
+    self.haveClientCert = true;
+}
+
+pub fn wasCertRequested(self: TlsClient): bool { return self.certRequested; }
+
+// mTLS: build the client's authentication flight in response to a CertificateRequest, as ONE protected
+// (0x16) record under the client handshake key, and add its messages to the transcript. With a client
+// cert configured this is Certificate + CertificateVerify; WITHOUT one it is an EMPTY Certificate and
+// NO CertificateVerify (RFC 8446 4.4.2 -- a valid "I have no certificate" reply). cSeq advances by one
+// so the following Finished is protected at the next sequence number.
+pub fn buildClientCertFlightRecord(self: TlsClient, out: ptr): int {
+    let hl = trHashLen(self);
+    let inner = bytes.alloc(4 + self.clientCertLen + 256);
+    let certMsgLen = buildClientCertificate(if (self.haveClientCert) self.clientCertDer else inner,
+                                            if (self.haveClientCert) self.clientCertLen else 0, inner);
+    trAdd(self, inner, certMsgLen);
+    let innerLen = certMsgLen;
+    if (self.haveClientCert) {
+        let hCert = bytes.alloc(48); trHash(self, hCert);           // transcript through client Certificate
+        let cvPtr = (inner as long + certMsgLen) as ptr;
+        let cvLen = buildClientCertVerify(hCert, hl, self.clientKey, cvPtr);
+        trAdd(self, cvPtr, cvLen);
+        bytes.free(hCert);
+        innerLen = certMsgLen + cvLen;
+    }
+    let n = tls.recordProtect(self.suite, self.cKey, self.cIv, self.cSeq, inner, innerLen, 0x16, out);
+    self.cSeq = self.cSeq + 1;
+    bytes.free(inner);
+    return n;
 }
 
 // A client that resumes with a previously issued ticket: it offers the PSK (pre_shared_key) alongside the
@@ -530,6 +573,9 @@ pub fn feedHandshake(self: TlsClient, record: ptr, recLen: int): int {
             self.alpnSel = handshake.parseAlpnSelection(self.hsBuf, mp);
             if (self.offerEarly) { self.earlyAccepted = handshake.serverAcceptedEarlyData(self.hsBuf, mp); }
             let rsl2 = handshake.parseRecordSizeLimit(self.hsBuf, mp); if (rsl2 > 0) { self.sendLimit = rsl2; }
+            trAdd(self, at(self.hsBuf, mp), msgLen);
+        } else if (mtype == 0x0d) {                // CertificateRequest (mTLS): server wants a client cert
+            self.certRequested = true;
             trAdd(self, at(self.hsBuf, mp), msgLen);
         } else {
             trAdd(self, at(self.hsBuf, mp), msgLen);

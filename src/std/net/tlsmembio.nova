@@ -213,6 +213,15 @@ pub struct ClientBio impl TlsBio {
                         self.buf.appendOut(eoed, en);
                         bytes.free(eoed);
                     }
+                    // mTLS: if the server sent a CertificateRequest, our authentication flight
+                    // (Certificate [+ CertificateVerify]) goes out BEFORE Finished and joins the
+                    // transcript the Finished verify_data covers.
+                    if (self.cl.wasCertRequested()) {
+                        let cf = bytes.alloc(4096);
+                        let cfLen = self.cl.buildClientCertFlightRecord(cf);
+                        self.buf.appendOut(cf, cfLen);
+                        bytes.free(cf);
+                    }
                     let vd = bytes.alloc(48);
                     self.cl.clientFinished(vd);
                     let fin = bytes.alloc(128);
@@ -225,6 +234,11 @@ pub struct ClientBio impl TlsBio {
             }
         }
         return 1;
+    }
+
+    // mTLS: present this client certificate + P-256 key if the server sends a CertificateRequest.
+    pub fn configureClientCert(self: ClientBio, certDer: ptr, certLen: int, key: ptr): void {
+        self.cl.setClientCert(certDer, certLen, key);
     }
 
     pub fn writeApp(self: ClientBio, data: ptr, n: int): int {
