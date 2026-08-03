@@ -7,37 +7,64 @@ import web.request;
 import web.response;
 import web.status;
 
+// THE router. One route table, one pattern parser, one matcher -- shared by every routing scenario:
+//   - web.app (App) composes a Router for its async, DI-backed mediator dispatch.
+//   - a Router used standalone dispatches synchronously through the compiler-generated
+//     __mediator_dispatch_by_name (see Router.dispatch / Router.serve below).
+// Route patterns support typed path parameters: `/api/user/{id:int}` binds `id` from the path and, for
+// an `int` parameter, rejects a non-numeric segment (a 400 at the dispatch layer). `parsePattern`,
+// `Seg`, and `resolve` are the single implementation of that behaviour; nothing re-rolls its own.
+
 pub trait RequestHandler<TReq, TResp> {
     fn handle(self, req: TReq): TResp;
 }
 
-struct RouteSeg {
-    is_param: bool,
-    text: string,
-    init(is_param: bool, text: string) { self.is_param = is_param; self.text = text; }
-}
+// One pattern segment. `is_param` marks `{name}` / `{name:type}`; `ptype` is the declared type of a
+// parameter ("" or "string" for an untyped one, "int" to validate a numeric segment).
+pub struct Seg {
+    pub is_param: bool,
+    pub text: string,
+    pub ptype: string,
 
-struct TypedRoute {
-    method: string,
-    pattern: List<RouteSeg>,
-    typeName: string,
-    init(method: string, pattern: List<RouteSeg>, typeName: string) {
-        self.method = method;
-        self.pattern = pattern;
-        self.typeName = typeName;
+    init(is_param: bool, text: string, ptype: string) {
+        self.is_param = is_param;
+        self.text = text;
+        self.ptype = ptype;
     }
 }
 
-struct DispatchResult {
-    pub status: int,
-    pub body: string,
-    init(status: int, body: string) { self.status = status; self.body = body; }
+pub struct Route {
+    pub method: string,
+    pub segs: List<Seg>,
+    pub key: string,
+
+    init(method: string, segs: List<Seg>, key: string) {
+        self.method = method;
+        self.segs = segs;
+        self.key = key;
+    }
 }
 
-// Path splitting lives in web.request (request.pathSegs); routing reuses it rather than keeping its own.
+// The outcome of matching one request against the table. Exactly one of matched / typedBad /
+// methodNotAllowed is set on a non-empty table; all three false means no path matched (404).
+pub struct RouteMatch {
+    pub matched: bool,
+    pub typedBad: bool,
+    pub methodNotAllowed: bool,
+    pub params: Map<string, string>,
+    pub key: string,
 
-fn parsePattern(path: string): List<RouteSeg> {
-    let segs = List<RouteSeg>();
+    init(matched: bool, typedBad: bool, methodNotAllowed: bool, params: Map<string, string>, key: string) {
+        self.matched = matched;
+        self.typedBad = typedBad;
+        self.methodNotAllowed = methodNotAllowed;
+        self.params = params;
+        self.key = key;
+    }
+}
+
+pub fn parsePattern(path: string): List<Seg> {
+    let segs = List<Seg>();
     let splits = request.pathSegs(path);
     let pi = 0;
     while (pi < splits.size()) {
@@ -45,10 +72,15 @@ fn parsePattern(path: string): List<RouteSeg> {
         if (string.startsWith(p, "{") && string.endsWith(p, "}")) {
             let inner = string.slice(p, 1, p.length - 1);
             let colon = string.indexOf(inner, ":");
-            let name = colon == -1 ? inner : string.slice(inner, 0, colon);
-            segs.push(RouteSeg(true, name));
+            if (colon == -1) {
+                segs.push(Seg(true, inner, "string"));
+            } else {
+                let nm = string.slice(inner, 0, colon);
+                let ty = string.slice(inner, colon + 1, inner.length);
+                segs.push(Seg(true, nm, ty));
+            }
         } else {
-            segs.push(RouteSeg(false, p));
+            segs.push(Seg(false, p, ""));
         }
         pi = pi + 1;
     }
@@ -56,64 +88,97 @@ fn parsePattern(path: string): List<RouteSeg> {
 }
 
 pub struct Router {
-    routes: List<TypedRoute>,
+    pub routes: List<Route>,
 
     init() {
-        self.routes = List<TypedRoute>();
+        self.routes = List<Route>();
     }
 
-    pub fn __addRoute(self: Router, method: string, path: string, typeName: string): void {
-        self.routes.push(TypedRoute(method, parsePattern(path), typeName));
+    // Registration hook. `app.get<T>(path)` / `router.get<T>(path)` is lowered by codegen to
+    // `__addRoute("GET", path, "T")` for any receiver that defines this method (see expressions.zig).
+    pub fn __addRoute(self: Router, method: string, path: string, key: string): void {
+        self.routes.push(Route(method, parsePattern(path), key));
     }
 
-    pub fn route(self: Router, method: string, path: string, body: ValueSource): DispatchResult {
-        let reqSegs = request.pathSegs(path);
+    // The single matcher. Pure (no dispatch): every caller -- App's async path and the sync serve/
+    // dispatch below -- resolves a request the same way, so typed-param handling never diverges.
+    pub fn resolve(self: Router, method: string, path: string): RouteMatch {
+        let segs = request.pathSegs(path);
+        let nseg = segs.size();
         let pathMatched = false;
-        let ri = 0;
-        while (ri < self.routes.size()) {
-            let route = self.routes.at(ri);
-            let segs = route.pattern;
-            if (segs.size() == reqSegs.size()) {
-                let params = Map<string, string>(4, string.hash);
-                let matched = true;
+        let r = 0;
+        while (r < self.routes.size()) {
+            let route = self.routes.at(r);
+            if (route.segs.size() == nseg) {
+                let params = Map<string, string>(8, string.hash);
+                let ok = true;
+                let typedBad = false;
                 let i = 0;
-                let n = segs.size();
-                while (i < n) {
-                    let seg = segs.get(i) ?? RouteSeg(false, "");
-                    let req = reqSegs.get(i) ?? "";
-                    if (seg.is_param) {
-                        params.set(seg.text, req);
-                    } else {
-                        if (!string.eql(seg.text, req)) { matched = false; }
+                while (i < nseg) {
+                    let pat = route.segs.at(i);
+                    let val = segs.get(i) ?? "";
+                    if (pat.is_param) {
+                        if (string.eql(pat.ptype, "int") && !request.isAllDigits(val)) {
+                            typedBad = true;
+                            ok = false;
+                        } else {
+                            params.set(pat.text, val);
+                        }
+                    } else if (!string.eql(pat.text, val)) {
+                        ok = false;
                     }
                     i = i + 1;
                 }
-                if (matched) {
+                if (ok) {
                     pathMatched = true;
                     if (string.eql(route.method, method)) {
-                        let composite = CompositeSource(ParamSource(params), body);
-                        return DispatchResult(200, __mediator_dispatch_by_name(route.typeName, composite));
+                        return RouteMatch(true, false, false, params, route.key);
                     }
+                } else if (typedBad && string.eql(route.method, method)) {
+                    return RouteMatch(false, true, false, Map<string, string>(1, string.hash), "");
                 }
             }
-            ri = ri + 1;
+            r = r + 1;
         }
-        if (pathMatched) { return DispatchResult(405, "405"); }
-        return DispatchResult(404, "404");
+        if (pathMatched) {
+            return RouteMatch(false, false, true, Map<string, string>(1, string.hash), "");
+        }
+        return RouteMatch(false, false, false, Map<string, string>(1, string.hash), "");
     }
 
+    // Synchronous standalone dispatch: match, overlay the path params over the body (route params win --
+    // @fromRoute over @fromBody), and run the discovered handler via the generated mediator dispatch.
+    // Returns the serialized handler body, or "400"/"404"/"405" for the non-match outcomes.
     pub fn dispatch(self: Router, method: string, path: string, body: ValueSource): string {
-        let r = self.route(method, path, body);
-        return r.body;
+        let m = self.resolve(method, path);
+        if (m.matched) {
+            let composite = CompositeSource(ParamSource(m.params), body);
+            return __mediator_dispatch_by_name(m.key, composite);
+        }
+        if (m.typedBad) { return "400"; }
+        if (m.methodNotAllowed) { return "405"; }
+        return "404";
     }
 
+    // Bridge to the HTTP server: run the typed mediator pipeline over a real Request and wrap the
+    // result in a Response (matched -> 200 + JSON, typed-bad -> 400, wrong method -> 405, no path -> 404).
     pub fn serve(self: Router, req: request.Request): response.Response {
-        let raw = req.body;
-        let jsonBody = raw == "" ? "{}" : raw;
-        let src = source.fromJson(jsonBody);
-        let r = self.route(req.method, req.path, src);
-        let resp = response.Response(Status.fromCode(r.status), r.body);
-        resp.setHeader("Content-Type", "application/json");
-        return resp;
+        let m = self.resolve(req.method, req.path);
+        if (m.matched) {
+            let jsonBody = req.body == "" ? "{}" : req.body;
+            let src = source.fromJson(jsonBody);
+            let composite = CompositeSource(ParamSource(m.params), src);
+            let body = __mediator_dispatch_by_name(m.key, composite);
+            let resp = response.Response(Status.Ok, body);
+            resp.setHeader("Content-Type", "application/json");
+            return resp;
+        }
+        if (m.typedBad) {
+            return response.Response(Status.BadRequest, "Bad Request: invalid path parameter");
+        }
+        if (m.methodNotAllowed) {
+            return response.Response(Status.MethodNotAllowed, "405");
+        }
+        return response.Response(Status.NotFound, "404");
     }
 }

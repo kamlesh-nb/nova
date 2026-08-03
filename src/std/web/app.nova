@@ -12,6 +12,7 @@ import serde.source;
 import web.static_content;
 import web.di;
 import web.mediator;
+import web.routing;
 import compress.gzip;
 import string;
 import list;
@@ -23,68 +24,18 @@ import assert;
 // composes it; it no longer declares its own. `text`/`json`/`html` response helpers also live there,
 // and the thin wrappers below delegate to them so `app.text/json/html` keeps working.
 
-pub struct Seg {
-    pub is_param: bool,
-    pub text: string,
-    pub ptype: string,
-
-    init(is_param: bool, text: string, ptype: string) {
-        self.is_param = is_param;
-        self.text = text;
-        self.ptype = ptype;
-    }
-}
-
-pub struct AppRoute {
-    pub method: string,
-    pub segs: List<Seg>,
-
-    pub key: string,
-
-    init(method: string, segs: List<Seg>, key: string) {
-        self.method = method;
-        self.segs = segs;
-        self.key = key;
-    }
-}
-
-fn parsePattern(path: string): List<Seg> {
-    let segs = List<Seg>();
-    let parts = string.split(path, "/");
-    let n = parts.size();
-    let i = 0;
-    while (i < n) {
-        let p = parts.get(i) ?? "";
-        if (p != "") {
-            if (string.startsWith(p, "{") && string.endsWith(p, "}")) {
-                let inner = string.slice(p, 1, p.length - 1);
-                let colon = string.indexOf(inner, ":");
-                if (colon == -1) {
-                    segs.push(Seg(true, inner, "string"));
-                } else {
-                    let nm = string.slice(inner, 0, colon);
-                    let ty = string.slice(inner, colon + 1, inner.length);
-                    segs.push(Seg(true, nm, ty));
-                }
-            } else {
-                segs.push(Seg(false, p, ""));
-            }
-        }
-        i = i + 1;
-    }
-    return segs;
-}
-
-// Path parsing (pathSegs / isAllDigits) and request-body parsing (MultiMapSource / formSource /
-// multipartSource) now live in web.request -- it is request parsing, not app logic. The App calls them
-// qualified as `request.*` below.
+// Routing lives in web.routing (the single Router: Route table + parsePattern + typed matcher). The App
+// composes a Router for its route table and matches through `router.resolve`; it does not re-roll its
+// own segment type or matching loop. Path parsing (pathSegs / isAllDigits) and request-body parsing
+// (MultiMapSource / formSource / multipartSource) live in web.request -- the App calls them as
+// `request.*` below.
 
 // `text`/`json`/`html` response helpers live in web.mediator (their single definition). Because
 // web.app imports web.mediator, they remain in scope for any module that imports web.app -- so a bare
 // `json(...)` in a handler still resolves, with no duplicate definition to make it ambiguous.
 
 pub struct App {
-    pub routes: List<AppRoute>,
+    pub router: routing.Router,
     pub mediator: mediator.Mediator,
     pub static_mounts: List<static_content.StaticMount>,
 
@@ -106,7 +57,7 @@ pub struct App {
     pub serverPort: int,
 
     init() {
-        self.routes = List<AppRoute>();
+        self.router = routing.Router();
         self.mediator = mediator.Mediator();
         self.static_mounts = List<static_content.StaticMount>();
         self.cache = Map<string, string>(16, string.hash);
@@ -191,79 +142,53 @@ pub struct App {
         self.mediator.registerFactory(serde.typeName<TReq>(), factory);
     }
 
+    // Route registration delegates to the single Router. The key is serde.typeName<TReq>() -- the same
+    // string app.handle<TReq> registers the mediator handler under -- so a route resolves to its handler.
     pub fn get<TReq>(self: App, path: string): void {
-        self.routes.push(AppRoute("GET", parsePattern(path), serde.typeName<TReq>()));
+        self.router.__addRoute("GET", path, serde.typeName<TReq>());
     }
     pub fn post<TReq>(self: App, path: string): void {
-        self.routes.push(AppRoute("POST", parsePattern(path), serde.typeName<TReq>()));
+        self.router.__addRoute("POST", path, serde.typeName<TReq>());
     }
     pub fn put<TReq>(self: App, path: string): void {
-        self.routes.push(AppRoute("PUT", parsePattern(path), serde.typeName<TReq>()));
+        self.router.__addRoute("PUT", path, serde.typeName<TReq>());
     }
     pub fn delete<TReq>(self: App, path: string): void {
-        self.routes.push(AppRoute("DELETE", parsePattern(path), serde.typeName<TReq>()));
+        self.router.__addRoute("DELETE", path, serde.typeName<TReq>());
     }
     pub fn patch<TReq>(self: App, path: string): void {
-        self.routes.push(AppRoute("PATCH", parsePattern(path), serde.typeName<TReq>()));
+        self.router.__addRoute("PATCH", path, serde.typeName<TReq>());
     }
 
+    // Build the ValueSource the handler binds from: the body (JSON / form / multipart) for methods that
+    // carry one, with the path params overlaid so a @fromRoute field wins over @fromBody. A GET has no
+    // body, so it binds from the params alone.
     fn sourceFor(self: App, req: Request, params: Map<string, string>): ValueSource {
+        let paramSrc = source.ParamSource(params);
         if (string.eql(req.method, "POST") || string.eql(req.method, "PUT") || string.eql(req.method, "PATCH")) {
             let contentType = req.getHeader("content-type") ?? "";
             let ct = string.toLowerCase(contentType);
             if (string.indexOf(ct, "multipart/form-data") != -1) {
-                return request.multipartSource(contentType, req.body);
+                return source.CompositeSource(paramSrc, request.multipartSource(contentType, req.body));
             }
             if (string.indexOf(ct, "x-www-form-urlencoded") != -1) {
-                return request.formSource(req.body);
+                return source.CompositeSource(paramSrc, request.formSource(req.body));
             }
-            return source.fromJson(req.body);
+            return source.CompositeSource(paramSrc, source.fromJson(req.body));
         }
-        return source.ParamSource(params);
+        return paramSrc;
     }
 
     pub async fn dispatch(self: App, req: Request): response.Response {
-        let segs = request.pathSegs(req.path);
-        let nseg = segs.size();
-        let nroutes = self.routes.size();
-        let path_matched = false;
-        let r = 0;
-        while (r < nroutes) {
-            let route = self.routes.at(r);
-            if (route.segs.size() == nseg) {
-                let params = Map<string, string>(8, string.hash);
-                let ok = true;
-                let typed_bad = false;
-                let i = 0;
-                while (i < nseg) {
-                    let pat = route.segs.at(i);
-                    let val = segs.get(i) ?? "";
-                    if (pat.is_param) {
-                        if (string.eql(pat.ptype, "int") && !request.isAllDigits(val)) {
-                            typed_bad = true;
-                            ok = false;
-                        } else {
-                            params.set(pat.text, val);
-                        }
-                    } else if (!string.eql(pat.text, val)) {
-                        ok = false;
-                    }
-                    i = i + 1;
-                }
-                if (ok) {
-                    path_matched = true;
-                    if (string.eql(route.method, req.method)) {
-
-                        let src = self.sourceFor(req, params);
-                        return await self.mediator.send(route.key, self.provider, src);
-                    }
-                } else if (typed_bad && string.eql(route.method, req.method)) {
-                    return response.Response(Status.BadRequest, "Bad Request: invalid path parameter");
-                }
-            }
-            r = r + 1;
+        let m = self.router.resolve(req.method, req.path);
+        if (m.typedBad) {
+            return response.Response(Status.BadRequest, "Bad Request: invalid path parameter");
         }
-        if (path_matched) {
+        if (m.matched) {
+            let src = self.sourceFor(req, m.params);
+            return await self.mediator.send(m.key, self.provider, src);
+        }
+        if (m.methodNotAllowed) {
             return response.Response(Status.MethodNotAllowed, "Method Not Allowed");
         }
 
