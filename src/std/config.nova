@@ -1,0 +1,66 @@
+// Layered configuration: a value resolves from the environment first, then a registered default. A
+// production service reads config from env (12-factor) with sensible built-in defaults; this is that,
+// with typed getters. An optional prefix maps a dotted/kebab key to an env var:
+//
+//   let cfg = config.newConfig().withPrefix("APP_");
+//   cfg.setDefault("http.port", "8080");
+//   cfg.getInt("http.port", 0);   // reads env APP_HTTP_PORT, else the default 8080
+
+import string;
+import map;
+import env;
+
+// Env var name for a config key: prefix + UPPERCASE, with '.' and '-' turned into '_'.
+fn envKeyOf(prefix: string, key: string): string {
+    let up = string.toUpperCase(key);
+    let out = "";
+    let i = 0;
+    while (i < up.length) {
+        let c = up[i];
+        if (c == 46 || c == 45) { out = out + "_"; } else { out = out + string.slice(up, i, i + 1); }
+        i = i + 1;
+    }
+    return prefix + out;
+}
+
+pub struct Config {
+    pub defaults: Map<string, string>,
+    pub prefix: string,
+
+    init() {
+        self.defaults = Map<string, string>(16, string.hash);
+        self.prefix = "";
+    }
+
+    pub fn withPrefix(self: Config, p: string): Config { self.prefix = p; return self; }
+    pub fn setDefault(self: Config, key: string, val: string): void { self.defaults.set(key, val); }
+
+    // Resolve: env override wins, then the registered default, then `dflt`.
+    pub fn getString(self: Config, key: string, dflt: string): string {
+        let envVal = env.get(envKeyOf(self.prefix, key));
+        if (envVal != "") { return envVal; }
+        let d = self.defaults.get(key);
+        if (d != undefined) { return d ?? dflt; }
+        return dflt;
+    }
+
+    pub fn getInt(self: Config, key: string, dflt: int): int {
+        let s = self.getString(key, "");
+        if (s == "") { return dflt; }
+        return string.parseI64(s) as int;
+    }
+
+    pub fn getBool(self: Config, key: string, dflt: bool): bool {
+        let s = string.toLowerCase(self.getString(key, ""));
+        if (s == "") { return dflt; }
+        return string.eql(s, "true") || string.eql(s, "1") || string.eql(s, "yes") || string.eql(s, "on");
+    }
+
+    // Whether a value is present (as an env override or a default).
+    pub fn has(self: Config, key: string): bool {
+        if (env.get(envKeyOf(self.prefix, key)) != "") { return true; }
+        return self.defaults.get(key) != undefined;
+    }
+}
+
+pub fn newConfig(): Config { return Config(); }

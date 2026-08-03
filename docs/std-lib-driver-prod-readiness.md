@@ -40,7 +40,7 @@ the end is the recommended order of work; nothing here has been changed yet.
 | Text / Unicode | Alpha | utf8 codepoints + Thompson-NFA regex; no normalization/grapheme/casefold, no backrefs/lookaround. |
 | Concurrency | Alpha | atomic + generic channel; `asyncchan` int-only, `whenAny` a stub; no select/WaitGroup/mutex/cancel. |
 | Datetime / Math | Alpha | epoch/UTC only (no timezones); math has no trig/log10/bigint. Decimal (built-in) is Prod. |
-| Observability / Config / HTTP-2 / WebSocket | Alpha/Missing | Structured logging now present (std/log, T12); still no metrics/tracing, no layered config, no HTTP/2, no WS. |
+| Observability / Config / HTTP-2 / WebSocket | Alpha/Missing | Structured logging (std/log) + layered config (std/config) now present; still no metrics/tracing, no HTTP/2, no WS. |
 
 ---
 
