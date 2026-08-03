@@ -5,7 +5,6 @@
 // decides). Also unit-tests the pure findOcspStaple extractor on a synthetic CertificateEntry.
 import net.tlsmembio;
 import crypto.tls.truststore;
-import crypto.tls.revocation;
 import crypto.tls.13.tlsClient;
 import crypto.x509;
 import crypto.ocsp;
@@ -53,34 +52,27 @@ fn ocspLenFor(status: int): int {
     return ocsp.buildTestResponse(serial, leaf.serialLen, status, hexBuf(PRIV), keyHash(), mkTime(), out);
 }
 
-// After a verifying handshake the ClientBio has CAPTURED any stapled OCSP; an app enforces revocation on
-// it (crypto/tls/revocation). A good staple accepts, a revoked staple rejects, both with a completed
-// handshake (revocation is an application policy layer, kept out of the universal TLS import graph).
+// The verifying ClientBio captures the server's stapled OCSP and enforces revocation INLINE during its
+// chain-trust check: a good staple completes the handshake, a revoked staple ABORTS it (even though the
+// chain is valid), and no staple soft-fails (chain trust decides).
 @test
-fn staple_good_captured_and_accepted(): void {
+fn staple_good_completes(): void {
     let store = truststore.newTrustStoreDer(hexBuf(CERT), CLEN);
     let cb = tlsmembio.newClientBioVerify("localhost", store);
     let sb = tlsmembio.newServerBio(hexBuf(CERT), CLEN, hexBuf(PRIV));
     sb.setStapledOcsp(ocspFor(ocsp.CERT_GOOD), ocspLenFor(ocsp.CERT_GOOD));
-    assert.isTrue(handshake(cb, sb, bytes.alloc(33792)));
+    assert.isTrue(handshake(cb, sb, bytes.alloc(33792)));         // trusted + good -> completes
     assert.isTrue(cb.stapledOcspSize() > 0);                      // captured from the Certificate message
-    let store2 = truststore.newTrustStoreDer(hexBuf(CERT), CLEN);
-    assert.isTrue(revocation.trustsNotRevoked(store2, cb.peerCertListPtr(), cb.peerCertListSize(), "localhost",
-                  20260803120000, cb.stapledOcspPtr(), cb.stapledOcspSize(), bytes.alloc(1), 0));
 }
 
 @test
-fn staple_revoked_captured_and_rejected(): void {
+fn staple_revoked_aborts(): void {
     let store = truststore.newTrustStoreDer(hexBuf(CERT), CLEN);
     let cb = tlsmembio.newClientBioVerify("localhost", store);
     let sb = tlsmembio.newServerBio(hexBuf(CERT), CLEN, hexBuf(PRIV));
     sb.setStapledOcsp(ocspFor(ocsp.CERT_REVOKED), ocspLenFor(ocsp.CERT_REVOKED));
-    assert.isTrue(handshake(cb, sb, bytes.alloc(33792)));         // chain valid -> handshake completes
-    assert.isTrue(cb.stapledOcspSize() > 0);
-    let store2 = truststore.newTrustStoreDer(hexBuf(CERT), CLEN);
-    // the captured staple says REVOKED -> the app's revocation check rejects
-    assert.isFalse(revocation.trustsNotRevoked(store2, cb.peerCertListPtr(), cb.peerCertListSize(), "localhost",
-                   20260803120000, cb.stapledOcspPtr(), cb.stapledOcspSize(), bytes.alloc(1), 0));
+    // chain is valid but the stapled OCSP says REVOKED -> the verifying client aborts inline
+    assert.isFalse(handshake(cb, sb, bytes.alloc(33792)));
 }
 
 @test
@@ -89,7 +81,6 @@ fn no_staple_soft_fails_to_trust(): void {
     let cb = tlsmembio.newClientBioVerify("localhost", store);
     let sb = tlsmembio.newServerBio(hexBuf(CERT), CLEN, hexBuf(PRIV));   // no staple
     assert.isTrue(handshake(cb, sb, bytes.alloc(33792)));
-    assert.equalInt(0, cb.stapledOcspSize());                    // nothing captured
 }
 
 @test

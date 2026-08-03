@@ -9,6 +9,7 @@
 import bytes;
 import list;
 import crypto.x509;
+import crypto.tls.revocation;
 import crypto.base64;
 import datetime;
 
@@ -82,6 +83,31 @@ pub struct TrustStore {
             i = i + 1;
         }
         return leaf;                                    // self-issued fallback
+    }
+
+    // Chain-verify AND enforce revocation (TLS 1.3 cert_list): trusted for `host` at `now`, AND the leaf
+    // not revoked by the stapled OCSP (ocspLen>0) or CRL (crlLen>0). HARD-FAIL on a proven revocation,
+    // SOFT-FAIL on UNKNOWN (accept when it cannot be determined). Now wired inline in the universal TLS
+    // verify path (the codegen call-resolution fix removed the constraint that kept this opt-in).
+    pub fn trustsNotRevoked(self: TrustStore, certList: ptr, listLen: int, host: string, now: long,
+                            ocspDer: ptr, ocspLen: int, crlDer: ptr, crlLen: int): bool {
+        if (!self.trusts(certList, listLen, host, now)) { return false; }
+        let leaf = x509.leafCert(certList, listLen);
+        let issuer = self.issuerOf(leaf, x509.interCert13(certList, listLen));
+        if (ocspLen > 0 && revocation.checkOcspStapled(leaf, issuer, ocspDer, ocspLen) == revocation.REV_REVOKED) { return false; }
+        if (crlLen > 0 && revocation.checkCrl(leaf, issuer, crlDer, crlLen) == revocation.REV_REVOKED) { return false; }
+        return true;
+    }
+
+    // TLS 1.2 variant (cert_list has no per-cert extension bytes).
+    pub fn trustsNotRevoked12(self: TrustStore, certList: ptr, listLen: int, host: string, now: long,
+                              ocspDer: ptr, ocspLen: int, crlDer: ptr, crlLen: int): bool {
+        if (!self.trusts12(certList, listLen, host, now)) { return false; }
+        let leaf = x509.leafCert(certList, listLen);
+        let issuer = self.issuerOf(leaf, x509.interCert12(certList, listLen));
+        if (ocspLen > 0 && revocation.checkOcspStapled(leaf, issuer, ocspDer, ocspLen) == revocation.REV_REVOKED) { return false; }
+        if (crlLen > 0 && revocation.checkCrl(leaf, issuer, crlDer, crlLen) == revocation.REV_REVOKED) { return false; }
+        return true;
     }
 
     pub fn free(self: TrustStore): void {

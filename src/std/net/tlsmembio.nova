@@ -198,14 +198,16 @@ pub struct ClientBio impl TlsBio {
                     // CA trust policy: the handshake proved possession of the leaf key; now (if enabled)
                     // require the chain to validate against a trusted root for the hostname, at UTC now.
                     if (self.verify) {
-                        if (!self.store.trusts(self.cl.certListPtr(), self.cl.certListSize(), self.host, truststore.nowUtc())) {
+                        // Chain trust AND revocation, inline: a stapled OCSP response captured from the
+                        // Certificate message (len 0 if none) is checked against the leaf's issuer --
+                        // HARD-FAIL if it says revoked, SOFT-FAIL (accept) when there is no staple.
+                        let noCrl = bytes.alloc(1);
+                        if (!self.store.trustsNotRevoked(self.cl.certListPtr(), self.cl.certListSize(), self.host,
+                                                         truststore.nowUtc(), self.cl.ocspStaplePtr(), self.cl.ocspStapleSize(), noCrl, 0)) {
+                            bytes.free(noCrl);
                             self.state = 0 - 1; return 0 - 1;
                         }
-                        // A stapled OCSP response (if any) is CAPTURED from the Certificate message and
-                        // exposed via ClientBio.stapledOcspPtr()/Size(); an application that opts into
-                        // revocation checks it with crypto/tls/revocation.checkOcspStapled. Enforcement is
-                        // not done inline here so the revocation/OCSP/CRL modules stay out of every TLS
-                        // client's import graph (see the note in crypto/tls/revocation).
+                        bytes.free(noCrl);
                     }
                     // Application secrets are derived over the transcript through the server Finished
                     // (before any EndOfEarlyData is added).
