@@ -1,0 +1,33 @@
+// T12: the structured logging framework (std/log) -- level-filtered JSON log lines with typed fields.
+import assert;
+import log;
+import list;
+
+@test
+fn test_format_json_line(): void {
+    let lg = log.newLogger(LogLevel.Info);
+    let line = lg.format(LogLevel.Info, "request handled",
+        log.fields2(log.f("path", "/api/user"), log.f("status", "200")));
+    assert.equalStr(line, "{\"level\":\"info\",\"msg\":\"request handled\",\"path\":\"/api/user\",\"status\":\"200\"}");
+}
+
+@test
+fn test_json_escaping(): void {
+    let lg = log.newLogger(LogLevel.Debug);
+    let line = lg.format(LogLevel.Error, "he said \"hi\"", log.fields1(log.f("k", "a\\b")));
+    assert.equalStr(line, "{\"level\":\"error\",\"msg\":\"he said \\\"hi\\\"\",\"k\":\"a\\\\b\"}");
+}
+
+@test
+fn test_level_filter(): void {
+    let lg = log.newLogger(LogLevel.Warn);
+    assert.isTrue(!lg.enabled(LogLevel.Info));    // below min -> filtered
+    assert.isTrue(lg.enabled(LogLevel.Warn));
+    assert.isTrue(lg.enabled(LogLevel.Error));
+}
+
+@test
+fn test_no_fields(): void {
+    let lg = log.newLogger(LogLevel.Info);
+    assert.equalStr(lg.format(LogLevel.Info, "up", log.noFields()), "{\"level\":\"info\",\"msg\":\"up\"}");
+}

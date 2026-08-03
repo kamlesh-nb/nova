@@ -1,0 +1,89 @@
+// Structured logging: level-filtered JSON log lines with typed fields. A production service wants
+// machine-parseable logs (one JSON object per line) rather than free-text; this renders exactly that,
+// filtered by a configurable minimum level.
+//
+//   let lg = log.newLogger(log.LogLevel.Info);
+//   lg.info("request handled", log.fields2(log.f("path", "/api/user"), log.f("status", "200")));
+//   -> {"level":"info","msg":"request handled","path":"/api/user","status":"200"}
+
+import string;
+import list;
+
+pub enum LogLevel { Debug, Info, Warn, Error }
+
+fn levelNum(l: LogLevel): int {
+    if (l == LogLevel.Debug) { return 0; }
+    if (l == LogLevel.Info) { return 1; }
+    if (l == LogLevel.Warn) { return 2; }
+    return 3;
+}
+fn levelName(l: LogLevel): string {
+    if (l == LogLevel.Debug) { return "debug"; }
+    if (l == LogLevel.Info) { return "info"; }
+    if (l == LogLevel.Warn) { return "warn"; }
+    return "error";
+}
+
+// A structured key/value field. Values are strings (the caller formats numbers/bools); the renderer
+// JSON-escapes both.
+pub struct Field {
+    pub key: string,
+    pub val: string,
+    init(key: string, val: string) { self.key = key; self.val = val; }
+}
+pub fn f(key: string, val: string): Field { return Field(key, val); }
+
+// Small ergonomic constructors for the common field counts (Nova has no varargs).
+pub fn noFields(): List<Field> { return List<Field>(); }
+pub fn fields1(a: Field): List<Field> { let l = List<Field>(); l.push(a); return l; }
+pub fn fields2(a: Field, b: Field): List<Field> { let l = List<Field>(); l.push(a); l.push(b); return l; }
+pub fn fields3(a: Field, b: Field, c: Field): List<Field> { let l = List<Field>(); l.push(a); l.push(b); l.push(c); return l; }
+
+fn jesc(s: string): string {
+    let out = "";
+    let i = 0;
+    while (i < s.length) {
+        let c = s[i];
+        if (c == 34) { out = out + "\\\""; }
+        else if (c == 92) { out = out + "\\\\"; }
+        else if (c == 10) { out = out + "\\n"; }
+        else if (c == 13) { out = out + "\\r"; }
+        else if (c == 9) { out = out + "\\t"; }
+        else { out = out + string.slice(s, i, i + 1); }
+        i = i + 1;
+    }
+    return out;
+}
+
+pub struct Logger {
+    pub minLevel: LogLevel,
+    init(minLevel: LogLevel) { self.minLevel = minLevel; }
+
+    // Render one structured JSON log line (level, msg, then each field). Pure -- for testing and for
+    // callers that want to route the line somewhere other than stdout.
+    pub fn format(self: Logger, level: LogLevel, msg: string, fields: List<Field>): string {
+        let out = `{"level":"${levelName(level)}","msg":"${jesc(msg)}"`;
+        let i = 0;
+        while (i < fields.size()) {
+            let fld = fields.get(i) ?? Field("", "");
+            out = out + `,"${jesc(fld.key)}":"${jesc(fld.val)}"`;
+            i = i + 1;
+        }
+        return out + "}";
+    }
+
+    // Emit the line to stdout when the level meets the configured minimum.
+    pub fn log(self: Logger, level: LogLevel, msg: string, fields: List<Field>): void {
+        if (levelNum(level) < levelNum(self.minLevel)) { return; }
+        console.log(self.format(level, msg, fields));
+    }
+
+    pub fn enabled(self: Logger, level: LogLevel): bool { return levelNum(level) >= levelNum(self.minLevel); }
+
+    pub fn debug(self: Logger, msg: string, fields: List<Field>): void { self.log(LogLevel.Debug, msg, fields); }
+    pub fn info(self: Logger, msg: string, fields: List<Field>): void { self.log(LogLevel.Info, msg, fields); }
+    pub fn warn(self: Logger, msg: string, fields: List<Field>): void { self.log(LogLevel.Warn, msg, fields); }
+    pub fn error(self: Logger, msg: string, fields: List<Field>): void { self.log(LogLevel.Error, msg, fields); }
+}
+
+pub fn newLogger(minLevel: LogLevel): Logger { return Logger(minLevel); }

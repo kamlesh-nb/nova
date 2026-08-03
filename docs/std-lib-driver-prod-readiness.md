@@ -40,7 +40,7 @@ the end is the recommended order of work; nothing here has been changed yet.
 | Text / Unicode | Alpha | utf8 codepoints + Thompson-NFA regex; no normalization/grapheme/casefold, no backrefs/lookaround. |
 | Concurrency | Alpha | atomic + generic channel; `asyncchan` int-only, `whenAny` a stub; no select/WaitGroup/mutex/cancel. |
 | Datetime / Math | Alpha | epoch/UTC only (no timezones); math has no trig/log10/bigint. Decimal (built-in) is Prod. |
-| Observability / Config / HTTP-2 / WebSocket | Missing | No metrics, no tracing, no structured logging framework, no layered config, no HTTP/2, no WS. |
+| Observability / Config / HTTP-2 / WebSocket | Alpha/Missing | Structured logging now present (std/log, T12); still no metrics/tracing, no layered config, no HTTP/2, no WS. |
 
 ---
 
@@ -372,7 +372,7 @@ test (T16). Next tier is P1 (T6 transactions, T7 pool hardening, ...).
 | T9 | P1 | Per-connection concurrency guard (exclusive checkout / single in-flight) | C8 | seam + pool | [~] |
 | T10 | P1 | Async non-blocking DNS + IPv6 (blocking IPv4 getaddrinfo stalls the loop) | -- | net/eventedio | [ ] |
 | T11 | P1 | HTTP client connection pooling / keep-alive (no fresh socket + TLS per request) | -- | web/client | [ ] |
-| T12 | P1 | Structured logging framework + metrics/tracing hooks; instrument pool + drivers | -- | new stdlib + pool | [ ] |
+| T12 | P1 | Structured logging framework + metrics/tracing hooks; instrument pool + drivers | -- | new stdlib + pool | [~] |
 | T13 | P2 | DbValue richer types (date/time/uuid/json) + NULL-aware accessors; ORM write side (update/delete/upsert + PK) + streaming results | C6 | seam + orm | [ ] |
 | T14 | P2 | Driver protocol breadth: mysql >=16MB reassembly + multi-resultset + sha256_password; mssql packet chunking + sp_reset_connection + sp_unprepare; btree real auth + Parse/Bind; pg LISTEN/NOTIFY + COPY | -- | mysql/mssql/btree/pg | [ ] |
 | T15 | P2 | Collections depth (sort/contains/indexOf, deque, heap, ordered map); datetime timezones; math trig/log; config mgmt; TLS revocation (OCSP/CRL) + TLS 1.2 server + mTLS | -- | stdlib | [ ] |
@@ -396,3 +396,8 @@ on a side conn), and wiring cancel() into a timeout path -- unverifiable without
 T9 [~] 2026-08-03: per-connection concurrency guard on pg (query/exec refuse re-entry while a request is
 in flight -> "connection busy" DbError, preventing frame interleaving). Compile-verified (needs a live
 conn to exercise). Reference impl; extend the same busy flag to mysql/mssql/btree/mongo.
+
+T12 [~] 2026-08-03: structured logging framework landed -- std/log: a Logger with level filtering
+(Debug/Info/Warn/Error) and JSON-line output with typed Field key/values (format() is pure + tested;
+log() emits to stdout). Case 234 gates JSON rendering + escaping + level filter. Remaining T12: metrics
+(counters/histograms) + tracing (span) hooks, and wiring the logger + metrics into the pool/drivers.
