@@ -1,0 +1,56 @@
+// Deque<T> -- a double-ended queue with amortized O(1) push/pop at both ends, built from two List<T>
+// stacks (front holds the head in reverse, back holds the tail). When one end is drained its opposite
+// stack is flipped over, so a run of pops costs O(1) each amortized. (T15 collections depth.)
+
+import list;
+
+pub struct Deque<T> {
+    pub front: List<T>,   // head-side, stored reversed (top of stack == logical front)
+    pub back: List<T>,    // tail-side, stored in order (top of stack == logical back)
+
+    init() {
+        self.front = List<T>();
+        self.back = List<T>();
+    }
+
+    pub fn size(self: Deque<T>): int { return self.front.size() + self.back.size(); }
+    pub fn isEmpty(self: Deque<T>): bool { return self.size() == 0; }
+
+    pub fn pushFront(self: Deque<T>, v: T): void { self.front.push(v); }
+    pub fn pushBack(self: Deque<T>, v: T): void { self.back.push(v); }
+
+    // Move every element of `src` onto `dst` in reverse, emptying src. Used to re-balance when one end
+    // runs dry: the opposite stack is flipped so its bottom becomes the new top.
+    fn flip(self: Deque<T>, src: List<T>, dst: List<T>): void {
+        while (src.size() > 0) {
+            let v = src.pop();
+            if (v != undefined) { dst.push(v ?? src.get(0)); }
+        }
+    }
+
+    pub fn popFront(self: Deque<T>): T | undefined {
+        if (self.front.size() == 0) {
+            self.flip(self.back, self.front);
+        }
+        return self.front.pop();
+    }
+
+    pub fn popBack(self: Deque<T>): T | undefined {
+        if (self.back.size() == 0) {
+            self.flip(self.front, self.back);
+        }
+        return self.back.pop();
+    }
+
+    pub fn peekFront(self: Deque<T>): T | undefined {
+        if (self.front.size() == 0) { self.flip(self.back, self.front); }
+        return self.front.last();
+    }
+
+    pub fn peekBack(self: Deque<T>): T | undefined {
+        if (self.back.size() == 0) { self.flip(self.front, self.back); }
+        return self.back.last();
+    }
+}
+
+pub fn newDeque<T>(): Deque<T> { return Deque<T>(); }

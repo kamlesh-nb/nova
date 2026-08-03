@@ -1,0 +1,58 @@
+// T15 collections depth: Deque<T> (double-ended) + Heap<T> (min priority queue).
+import deque;
+import heap;
+import assert;
+
+fn lessInt(a: int, b: int): bool { return a < b; }
+
+@test
+fn test_deque_both_ends(): void {
+    let dq = deque.newDeque<int>();
+    assert.isTrue(dq.isEmpty());
+    dq.pushBack(1);
+    dq.pushBack(2);
+    dq.pushFront(0);          // logical order: 0,1,2
+    assert.equalInt(3, dq.size());
+    assert.equalInt(0, dq.peekFront() ?? -1);
+    assert.equalInt(2, dq.peekBack() ?? -1);
+    assert.equalInt(0, dq.popFront() ?? -1);   // 1,2
+    assert.equalInt(2, dq.popBack() ?? -1);    // 1
+    assert.equalInt(1, dq.popFront() ?? -1);   // empty
+    assert.isTrue(dq.isEmpty());
+    assert.isTrue(dq.popFront() == undefined);
+}
+
+@test
+fn test_deque_flip_runs(): void {
+    // push all on one end, drain from the other -> exercises the flip re-balance.
+    let dq = deque.newDeque<int>();
+    let i = 0;
+    while (i < 6) { dq.pushBack(i); i = i + 1; }
+    let out = 0;
+    while (!dq.isEmpty()) {
+        let v = dq.popFront() ?? -1;
+        assert.equalInt(out, v);
+        out = out + 1;
+    }
+    assert.equalInt(6, out);
+}
+
+@test
+fn test_heap_min_order(): void {
+    let h = heap.newHeap<int>(lessInt);
+    h.push(5);
+    h.push(1);
+    h.push(3);
+    h.push(2);
+    h.push(4);
+    assert.equalInt(5, h.size());
+    assert.equalInt(1, h.peek() ?? -1);
+    // pop yields ascending order
+    assert.equalInt(1, h.pop() ?? -1);
+    assert.equalInt(2, h.pop() ?? -1);
+    assert.equalInt(3, h.pop() ?? -1);
+    assert.equalInt(4, h.pop() ?? -1);
+    assert.equalInt(5, h.pop() ?? -1);
+    assert.isTrue(h.isEmpty());
+    assert.isTrue(h.pop() == undefined);
+}
