@@ -32,7 +32,7 @@ the end is the recommended order of work; nothing here has been changed yet.
 | Area | Grade | Note |
 |---|---|---|
 | Web framework | Beta | The most mature area: DI, mediator, middleware, unified router, CORS/CSRF/session/rate-limit, TLS server, multi-core reactor. |
-| Crypto / TLS | Beta | TLS 1.3 both roles (resumption, 0-RTT, KeyUpdate); chain verification. Gaps: no OCSP/CRL, TLS 1.2 server, mTLS. |
+| Crypto / TLS | Beta | TLS 1.3 both roles (resumption, 0-RTT, KeyUpdate) + TLS 1.2 client; chain verification. TLS 1.2 SERVER = WON'T-DO (see decision below). Optional: mTLS, OCSP/CRL. |
 | IO / FS / OS | Beta | file/dir/process complete incl. isolated spawn + full Windows backend. Gaps: stat/metadata, recursive mkdir, tree walk, mmap. |
 | String / JSON | Beta | Solid split/join/slice/parse + JSON DOM. Gaps: format/printf, padStart, streaming/error-reporting parse. |
 | Serde (yaml, bson) | Alpha | yaml + bson complete-ish but subset; no streaming, weak error reporting. |
@@ -218,8 +218,9 @@ not half-written ones.
   TLS server, multi-core reactor (`runReactorMC`). Rivals a real web stack.
 - Crypto/TLS (Beta): 204 pub fns. TLS 1.3 client AND server (SNI, ALPN, HRR, resumption + 0-RTT +
   KeyUpdate, AES-GCM + ChaCha20-Poly1305, X25519/P256/P384), x509 chain verification + truststore.
-  Gaps: no OCSP/CRL revocation, TLS 1.2 is client-only (no 1.2 server), no evident mTLS/client-cert
-  handshake, no Ed25519/scrypt/argon2, SHA-384 transcript flagged follow-on (`handshake.nova:50`).
+  Gaps: no OCSP/CRL revocation, no evident mTLS/client-cert handshake, no Ed25519/scrypt/argon2,
+  SHA-384 transcript flagged follow-on (`handshake.nova:50`). TLS 1.2 is client-only by DECISION: the
+  1.2 SERVER role is WON'T-DO (see the decision note under section 7 / T15).
 - IO/FS/OS (Beta): file + dir complete; process strong incl. `spawnIsolated` (namespaces/rootfs) and a
   full Windows backend set. Gaps: stat/metadata (size/mtime/perms), recursive mkdir, copy, tree walk/
   glob, symlinks, mmap; `fs.nova` is only a Watcher.
@@ -375,7 +376,7 @@ test (T16). Next tier is P1 (T6 transactions, T7 pool hardening, ...).
 | T12 | P1 | Structured logging framework + metrics/tracing hooks; instrument pool + drivers | -- | new stdlib + pool | [x] |
 | T13 | P2 | DbValue richer types (date/time/uuid/json) + NULL-aware accessors; ORM write side (update/delete/upsert + PK) + streaming results | C6 | seam + orm | [x] |
 | T14 | P2 | Driver protocol breadth: mysql >=16MB reassembly + multi-resultset + sha256_password; mssql packet chunking + sp_reset_connection + sp_unprepare; btree real auth + Parse/Bind; pg LISTEN/NOTIFY + COPY | -- | mysql/mssql/btree/pg | [~] |
-| T15 | P2 | Collections depth (sort/contains/indexOf, deque, heap, ordered map); datetime timezones; math trig/log; config mgmt; TLS revocation (OCSP/CRL) + TLS 1.2 server + mTLS | -- | stdlib | [~] |
+| T15 | P2 | Collections depth (sort/contains/indexOf, deque, heap, ordered map); datetime timezones; math trig/log; config mgmt; [OPTIONAL] mTLS + OCSP/CRL. TLS 1.2 server = WON'T-DO (decision) | -- | stdlib | [~] |
 | T16 | P2 | In-repo live integration harness gating every driver's live path in CI; reconcile contradictory liveness claims | C10 | all drivers + CI | [~] |
 
 ## 8. Bottom line
@@ -429,7 +430,8 @@ SESSION SUMMARY 2026-08-03: T1-T7 done (prior); this session closed T9 [x] (busy
 T12 [x] (metrics + tracing + pool instrumentation), T13 [x] (RowStream cursor + earlier types/ORM),
 T16 harness + T8 timeout + T11 keep-alive framing + T14 codec breadth (mysql/mssql/pg) + T10 IPv6 URL +
 T15 collections/math/datetime/config all to [~]/[x] with offline gates. GENUINELY REMAINING (milestone-
-scale or live/runtime-bound, NOT rushed): T15 TLS 1.2 server + mTLS + OCSP/CRL (crypto, must verify vs
+scale or live/runtime-bound, NOT rushed): T15 mTLS + OCSP/CRL [OPTIONAL] (TLS 1.2 server = WON'T-DO,
+see decision) (crypto, must verify vs
 OpenSSL); T10 async non-blocking DNS (runtime, off-reactor getaddrinfo) + real v6 socket connect; T14
 btree Parse/Bind + real auth (needs btree server), mysql multi-resultset, mssql sp_reset_connection; T13
 lazy server-side batch fetch; live-path verification for every driver (T16 CI service containers). These
@@ -459,7 +461,22 @@ math trig/log (sin/cos/tan/atan/atan2/log10/log2 with range reduction) + datetim
 (tzOffsetSeconds/fromIsoUtc/formatOffset), case 244; Deque<T> (double-ended, two-stack amortized) +
 Heap<T> (min priority queue with a less comparator), case 246; OrderedMap<K,V> (sorted-key map,
 binary-search get/has, ordered keys), case 247. COLLECTIONS DEPTH NOW COMPLETE. REMAINING (all TLS-role
-work, tracked with the M12/M13 TLS line, not pure-stdlib): TLS 1.2 server + mTLS + OCSP/CRL revocation.
+work, tracked with the M12/M13 TLS line, not pure-stdlib): mTLS + OCSP/CRL revocation (both OPTIONAL,
+do only if service-to-service client-cert auth is on the roadmap). TLS 1.2 SERVER role = WON'T-DO.
+
+DECISION 2026-08-03 -- TLS 1.2 SERVER role: WON'T-DO (by design).
+Rationale: Nova already serves TLS 1.3 (both roles, full spec) and connects over TLS 1.2 (client role).
+A 1.2 SERVER role adds exactly one capability -- accepting inbound connections from clients that cannot
+speak 1.3. Since TLS 1.3 (RFC 8446, 2018) is negotiated by every current browser / curl / language
+runtime / load balancer, a modern server-side framework essentially never faces a 1.3-incapable client;
+the ones that exist are legacy middleboxes / ancient Java / Win7-era stacks, not Nova's target. The
+direction that DOES matter -- talking to old servers that only accept 1.2 (some managed SQL Server /
+MySQL / corporate APIs) -- is the CLIENT side, already shipped. Against that near-zero payoff, a 1.2
+server means implementing RSA key-exchange + the CBC cipher-suite family (Lucky13 / padding-oracle /
+BEAST history) as a server: security-critical crypto that must be verified byte-for-byte vs OpenSSL,
+where a subtle bug is a real vulnerability, not a failed test. High risk, negligible modern benefit ->
+not implemented. Revisit ONLY if a concrete deployment requires serving a 1.2-only client, letting that
+constraint drive the (minimal, audited) cipher-suite choice.
 
 T9 [~] 2026-08-03: per-connection concurrency guard on pg (query/exec refuse re-entry while a request is
 in flight -> "connection busy" DbError, preventing frame interleaving). Compile-verified (needs a live
