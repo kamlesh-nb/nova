@@ -1,0 +1,51 @@
+// T12: metrics registry (counters/gauges + Prometheus/JSON snapshot) + tracing span.
+import metrics;
+import log;
+import string;
+import assert;
+
+@test
+fn test_counters_gauges(): void {
+    let reg = metrics.newRegistry();
+    reg.inc("db_queries_total");
+    reg.inc("db_queries_total");
+    reg.add("db_queries_total", 3);
+    reg.setGauge("pool_idle", 4);
+    reg.setGauge("pool_idle", 7);   // gauge overwrites
+    assert.equalInt(5, reg.counter("db_queries_total") as int);
+    assert.equalInt(7, reg.gauge("pool_idle") as int);
+}
+
+@test
+fn test_numstr(): void {
+    assert.isTrue(string.eql("0", metrics.numStr(0)));
+    assert.isTrue(string.eql("42", metrics.numStr(42)));
+    assert.isTrue(string.eql("-13", metrics.numStr(0 - 13)));
+    assert.isTrue(string.eql("1000000", metrics.numStr(1000000)));
+}
+
+@test
+fn test_snapshots(): void {
+    let reg = metrics.newRegistry();
+    reg.add("reqs_total", 10);
+    reg.setGauge("inflight", 2);
+    let prom = reg.snapshotProm();
+    assert.equalInt(1, if (string.contains(prom, "# TYPE reqs_total counter")) 1 else 0);
+    assert.equalInt(1, if (string.contains(prom, "reqs_total 10")) 1 else 0);
+    assert.equalInt(1, if (string.contains(prom, "# TYPE inflight gauge")) 1 else 0);
+    let js = reg.snapshotJson();
+    assert.equalInt(1, if (string.contains(js, `"reqs_total":10`)) 1 else 0);
+    assert.equalInt(1, if (string.contains(js, `"inflight":2`)) 1 else 0);
+}
+
+@test
+fn test_span(): void {
+    let reg = metrics.newRegistry();
+    let lg = log.newLogger(log.LogLevel.Error);   // quiet: span logs at info, suppressed
+    let sp = log.startSpan(lg, "db.query");
+    let e = sp.finish(reg);
+    assert.isTrue(e >= 0);
+    // span recorded a counter + gauge
+    assert.isTrue(reg.counter("db.query_ns_total") >= 0);
+    assert.isTrue(reg.gauge("db.query_last_ns") >= 0);
+}

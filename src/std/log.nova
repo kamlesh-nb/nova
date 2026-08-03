@@ -8,6 +8,8 @@
 
 import string;
 import list;
+import datetime;
+import metrics;
 
 pub enum LogLevel { Debug, Info, Warn, Error }
 
@@ -87,3 +89,36 @@ pub struct Logger {
 }
 
 pub fn newLogger(minLevel: LogLevel): Logger { return Logger(minLevel); }
+
+// A timing span (tracing): captures a start timestamp, and on finish() emits a structured info line
+// with the elapsed time and records `<name>_ns_total` (counter) + `<name>_last_ns` (gauge) into a
+// metrics registry. Lives here (not in metrics) so metrics stays free of a log dependency.
+//
+//   let sp = log.startSpan(lg, "db.query");
+//   ... work ...
+//   sp.finish(reg);
+pub struct Span {
+    pub logger: Logger,
+    pub name: string,
+    pub startNs: long,
+
+    init(logger: Logger, name: string, startNs: long) {
+        self.logger = logger;
+        self.name = name;
+        self.startNs = startNs;
+    }
+
+    pub fn finish(self: Span, reg: metrics.Registry): long {
+        let elapsed = datetime.nowNs() - self.startNs;
+        reg.add(self.name + "_ns_total", elapsed);
+        reg.setGauge(self.name + "_last_ns", elapsed);
+        self.logger.info(self.name, fields2(
+            f("span", self.name),
+            f("elapsed_ns", metrics.numStr(elapsed))));
+        return elapsed;
+    }
+}
+
+pub fn startSpan(logger: Logger, name: string): Span {
+    return Span(logger, name, datetime.nowNs());
+}

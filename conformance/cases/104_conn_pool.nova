@@ -10,6 +10,8 @@ import assert;
 import list;
 import db;
 import pool;
+import metrics;
+import string;
 
 struct Counter {
     pub opens: int,
@@ -93,6 +95,26 @@ fn test_pool_opens_second_for_concurrent_checkout(): void {
     p.release(a);
     p.release(b);
     assert.equalInt(p.idleCount(), 2);
+}
+
+@test
+fn test_pool_publishes_metrics(): void {
+    let ctr = Counter();
+    let p = Pool(CountingDriver(ctr), "mock://x", 4);
+    let a = p.acquire();
+    let b = p.acquire();                  // 2 live, 2 borrowed
+    let reg = metrics.newRegistry();
+    p.publishMetrics(reg, "pg");
+    assert.equalInt(2, reg.gauge("pg_pool_live") as int);
+    assert.equalInt(2, reg.gauge("pg_pool_borrowed") as int);
+    assert.equalInt(2, reg.gauge("pg_pool_opened_total") as int);
+    p.release(a);
+    p.release(b);
+    p.publishMetrics(reg, "pg");
+    assert.equalInt(2, reg.gauge("pg_pool_idle") as int);
+    assert.equalInt(0, reg.gauge("pg_pool_borrowed") as int);
+    // snapshot renders the gauge
+    assert.equalInt(1, if (string.contains(reg.snapshotProm(), "pg_pool_idle 2")) 1 else 0);
 }
 
 @test

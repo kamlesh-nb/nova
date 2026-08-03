@@ -4,6 +4,7 @@ import string;
 import datetime;
 import resilience.breaker;
 import net.httpsclient;
+import metrics;
 
 fn nowMs(): long { return datetime.nowNs() / 1000000; }
 
@@ -113,6 +114,18 @@ pub struct Pool {
         if (self.borrowed > 0) { self.borrowed = self.borrowed - 1; }
         c.close();
         if (self.live > 0) { self.live = self.live - 1; }
+    }
+
+    // Publish the pool's counters/gauges into a metrics registry, under the given name prefix (e.g.
+    // "pg"). Counters are monotonic totals since process start; gauges are point-in-time. Call this on
+    // a scrape or periodically; it is a pure snapshot, no locking beyond field reads.
+    pub fn publishMetrics(self, reg: metrics.Registry, prefix: string): void {
+        reg.setGauge(prefix + "_pool_idle", self.idle.size() as long);
+        reg.setGauge(prefix + "_pool_live", self.live as long);
+        reg.setGauge(prefix + "_pool_borrowed", self.borrowed as long);
+        reg.setGauge(prefix + "_pool_high_water", self.highWater as long);
+        reg.setGauge(prefix + "_pool_opened_total", self.opened as long);
+        reg.setGauge(prefix + "_pool_overflow_total", self.overflow as long);
     }
 
     pub fn idleCount(self): int { return self.idle.size(); }
