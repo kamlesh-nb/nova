@@ -409,3 +409,19 @@ pub fn verifyCertList(list: ptr, listLen: int, rootDer: ptr, rootLen: int, host:
     let inter = parseCert((list as long + (p + 3) as long) as ptr, c1len);
     return verifyChain3(leaf, inter, root, host, now);     // leaf + intermediate
 }
+
+// TLS 1.2 variant: the certificate_list is [certLen(3) certDer].. with NO per-cert extension bytes
+// (those exist only in TLS 1.3 CertificateEntry). Same chain policy as verifyCertList otherwise.
+pub fn verifyCertList12(list: ptr, listLen: int, rootDer: ptr, rootLen: int, host: string, now: long): bool {
+    if (listLen < 3) { return false; }
+    let c0len = rd3(list, 0);
+    let leaf = parseCert((list as long + 3) as ptr, c0len);
+    let p = 3 + c0len;
+    let root = parseCert(rootDer, rootLen);
+    if (p + 3 > listLen) {
+        return verifyChain2(leaf, root, host, now);       // leaf only
+    }
+    let c1len = rd3(list, p);
+    let inter = parseCert((list as long + (p + 3) as long) as ptr, c1len);
+    return verifyChain3(leaf, inter, root, host, now);     // leaf + intermediate
+}

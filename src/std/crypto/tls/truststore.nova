@@ -57,6 +57,18 @@ pub struct TrustStore {
         return false;
     }
 
+    // TLS 1.2 variant: the cert_list has no per-cert extension bytes (see x509.verifyCertList12).
+    pub fn trusts12(self: TrustStore, certList: ptr, listLen: int, host: string, now: long): bool {
+        let i = 0;
+        while (i < self.ders.size()) {
+            let d = (self.ders.get(i) ?? 0) as ptr;
+            let n = self.lens.get(i) ?? 0;
+            if (x509.verifyCertList12(certList, listLen, d, n, host, now)) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
     pub fn free(self: TrustStore): void {
         let i = 0;
         while (i < self.ders.size()) { bytes.free((self.ders.get(i) ?? 0) as ptr); i = i + 1; }
