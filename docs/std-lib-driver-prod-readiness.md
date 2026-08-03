@@ -346,13 +346,26 @@ The asterisk: this makes the client-side substitution CORRECT + injection-safe (
 quotes), but does not ROUTE query/exec through server-side bind -- true parameterization is still only
 the *Prepared methods. Full server-side-bind routing for query/exec is a follow-on.
 
+T5 [x]* -- mongodb lifted from "cannot function" to functional shape 2026-08-03:
+- connect now sends `hello` and, with DSN credentials ([user:pass@]host in the mongodb:// DSN), calls
+  SCRAM-SHA-256 `authenticate` with a per-connection CSPRNG nonce -- previously connect opened the
+  socket and returned without any handshake/auth, so the driver could not talk to any MongoDB.
+- find() parses cursor.firstBatch and returns each result document as a "document" text cell holding
+  its JSON (new stdlib bson.docToJson) instead of the old synthetic 1/0 row.
+The asterisk: the live handshake/auth + cursor path need a running MongoDB (none on this host) --
+compile-verified; docToJson is offline-tested. getMore (batches beyond firstBatch) is a follow-on.
+
+ALL FIVE P0 items (T1-T5) are now done. Remaining follow-ons (not P0-complete): connect error channel
+(fail-closed TLS + connect-time errors), mssql TDS temporal types, getMore, and the live integration
+test (T16). Next tier is P1 (T6 transactions, T7 pool hardening, ...).
+
 | # | Pri | Item | Blocker | Where it lands | Status |
 |---|---|---|---|---|---|
 | T1 | P0 | Error propagation: add `DbError` return/channel; wire each driver's decoder into its read loop | C1 | seam + all 5 drivers | [x] |
 | T2 | P0 | TLS on the SQL data path: TLS `AsyncStream`/BIO in net/aio; SSLRequest (pg), CLIENT_SSL (mysql), cert verify (mssql) | C2 | net/aio + pg/mysql/mssql/mongo/btree | [x]* |
 | T3 | P0 | Correct temporal + special-type decode (ISO dates, mssql FLOAT/DATE*/PLP, bytea hex, BSON ObjectId/datetime) | C5 | pg/mysql/mssql/mongo | [x]* |
 | T4 | P0 | Enforce parameterization: server-side bind, or at minimum fix the `$1..$9`-only substitution + binary-blob escaping | C4 | pg/mysql/btree + ORM | [x]* |
-| T5 | P0 | mongodb: wire `hello` + `authenticate` into connect; parse `cursor.firstBatch` + getMore | -- | mongodb | [ ] |
+| T5 | P0 | mongodb: wire `hello` + `authenticate` into connect; parse `cursor.firstBatch` + getMore | -- | mongodb | [x]* |
 | T6 | P1 | Transaction API on Connection trait (begin/commit/rollback + savepoints + rollback-on-drop); fix mssql txn descriptor + ENVCHANGE | C3 | seam + mssql | [ ] |
 | T7 | P1 | Pool hardening: max-open cap, acquire timeout + wait queue, validate-on-borrow, maxLifetime, leak detection, thread-safety, reconnect | C7 | pool | [ ] |
 | T8 | P1 | Query-level timeouts + cancellation (connect/statement timeout, PG CancelRequest, TDS ATTENTION) | C9 | seam + all drivers | [ ] |
