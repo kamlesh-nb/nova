@@ -32,7 +32,7 @@ the end is the recommended order of work; nothing here has been changed yet.
 | Area | Grade | Note |
 |---|---|---|
 | Web framework | Beta | The most mature area: DI, mediator, middleware, unified router, CORS/CSRF/session/rate-limit, TLS server, multi-core reactor. |
-| Crypto / TLS | Beta | TLS 1.3 both roles (resumption, 0-RTT, KeyUpdate) + TLS 1.2 client; chain verification. TLS 1.2 SERVER = WON'T-DO (see decision below). Optional: mTLS, OCSP/CRL. |
+| Crypto / TLS | Beta | TLS 1.3 both roles + TLS 1.2 client + mTLS (client-cert, both versions) + OCSP + CRL revocation; chain verification. TLS 1.2 SERVER = WON'T-DO (decision). |
 | IO / FS / OS | Beta | file/dir/process complete incl. isolated spawn + full Windows backend. Gaps: stat/metadata, recursive mkdir, tree walk, mmap. |
 | String / JSON | Beta | Solid split/join/slice/parse + JSON DOM. Gaps: format/printf, padStart, streaming/error-reporting parse. |
 | Serde (yaml, bson) | Alpha | yaml + bson complete-ish but subset; no streaming, weak error reporting. |
@@ -469,9 +469,7 @@ DECISION 2026-08-03 (revised, same day) -- mTLS + OCSP/CRL are REQUIRED, not opt
 Nova will consume EXTERNAL services (some over TLS 1.2, which the CLIENT role already supports -- M13,
 live vs OpenSSL) that (a) require a client certificate (mTLS) and (b) whose certs must be revocation-
 checked. So mTLS (client-cert presentation on BOTH the 1.3 and 1.2 CLIENTS) and OCSP/CRL are now planned
-work, done in verified increments: (1) mTLS 1.3 client [DONE -- case 250 mutual-auth loopback green], (2) mTLS 1.2 client [DONE -- case 251, offline gate; live vs OpenSSL s_server -Verify], (3) OCSP (stapling verify +
-request/response ASN.1, offline-tested; live responder fetch gated), (4) CRL (parse + serial check
-offline; live DP fetch gated). These are CLIENT-side additions -- no CBC/RSA-kx SERVER padding-oracle
+work, done in verified increments: (1) mTLS 1.3 client [DONE -- case 250 mutual-auth loopback green], (2) mTLS 1.2 client [DONE -- case 251, offline gate; live vs OpenSSL s_server -Verify], (3) OCSP [DONE -- case 252], (4) CRL [DONE -- case 253]. ALL FOUR PHASES COMPLETE (offline-gated; live fetch/OpenSSL steps noted). These are CLIENT-side additions -- no CBC/RSA-kx SERVER padding-oracle
 surface -- so far lower risk than the 1.2 server. The 1.2 SERVER role remains WON'T-DO (below): we are a
 client to these services, not their server.
 
