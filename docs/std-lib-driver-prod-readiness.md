@@ -338,12 +338,20 @@ The asterisk: mssql TDS temporal types (DATETIME/DATE/TIME/DATETIME2/DATETIMEOFF
 NULL -- adding them needs TDS temporal encodings + calendar conversion (days-since-epoch -> Y-M-D), a
 documented T3 follow-on. pg uuid/json remain text (usable as strings, not "wrong").
 
+T4 [x]* -- parameterization correctness fixed across pg/mysql/btreedb 2026-08-03 (offline-verified):
+substituteParams now parses MULTI-DIGIT $N (was $1..$9 only, so the ORM's $1..$N silently broke for
+structs with >9 columns -- fixed for free on all three). Blob params render a binary-safe literal
+('\xHEX' bytea for pg/btree, x'HEX' for mysql) instead of text-escaping raw bytes (NUL/quote unsafe).
+The asterisk: this makes the client-side substitution CORRECT + injection-safe (escapeText doubles
+quotes), but does not ROUTE query/exec through server-side bind -- true parameterization is still only
+the *Prepared methods. Full server-side-bind routing for query/exec is a follow-on.
+
 | # | Pri | Item | Blocker | Where it lands | Status |
 |---|---|---|---|---|---|
 | T1 | P0 | Error propagation: add `DbError` return/channel; wire each driver's decoder into its read loop | C1 | seam + all 5 drivers | [x] |
 | T2 | P0 | TLS on the SQL data path: TLS `AsyncStream`/BIO in net/aio; SSLRequest (pg), CLIENT_SSL (mysql), cert verify (mssql) | C2 | net/aio + pg/mysql/mssql/mongo/btree | [x]* |
 | T3 | P0 | Correct temporal + special-type decode (ISO dates, mssql FLOAT/DATE*/PLP, bytea hex, BSON ObjectId/datetime) | C5 | pg/mysql/mssql/mongo | [x]* |
-| T4 | P0 | Enforce parameterization: server-side bind, or fix `$1..$9`-only + binary-blob escaping | C4 | pg/mysql/btree + ORM | [ ] |
+| T4 | P0 | Enforce parameterization: server-side bind, or at minimum fix the `$1..$9`-only substitution + binary-blob escaping | C4 | pg/mysql/btree + ORM | [x]* |
 | T5 | P0 | mongodb: wire `hello` + `authenticate` into connect; parse `cursor.firstBatch` + getMore | -- | mongodb | [ ] |
 | T6 | P1 | Transaction API on Connection trait (begin/commit/rollback + savepoints + rollback-on-drop); fix mssql txn descriptor + ENVCHANGE | C3 | seam + mssql | [ ] |
 | T7 | P1 | Pool hardening: max-open cap, acquire timeout + wait queue, validate-on-borrow, maxLifetime, leak detection, thread-safety, reconnect | C7 | pool | [ ] |
