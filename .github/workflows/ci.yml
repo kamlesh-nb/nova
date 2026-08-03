@@ -236,3 +236,62 @@ jobs:
       - name: Soundness gate (--shadow)
         shell: bash
         run: bash conformance/run.sh --shadow
+
+  # T16 -- LIVE DB integration: run integration/live_db_harness.nova against real database service
+  # containers. Service containers are Linux-only (Docker), so this needs the Linux runtime build, which
+  # is still experimental (see build-test notes: vendored ARM64 deps + Homebrew-path install). Until that
+  # lands this job is workflow_dispatch + continue-on-error; the harness itself is complete and SKIPS every
+  # driver whose DSN is unset, so it is green offline and turns each driver's live CRUD path on the moment
+  # its service + DSN are present. This is the mechanism that upgrades the P0/P1 driver items (T1-T7) from
+  # "code-complete" to "live-verified".
+  db-integration:
+    name: live DB integration harness (T16)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    continue-on-error: true            # gated on the Linux runtime build (tracked follow-on)
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: nova
+          POSTGRES_PASSWORD: nova
+          POSTGRES_DB: novadb
+        ports: [ "5432:5432" ]
+        options: >-
+          --health-cmd "pg_isready -U nova" --health-interval 5s --health-timeout 5s --health-retries 10
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: nova
+          MYSQL_DATABASE: novadb
+          MYSQL_USER: nova
+          MYSQL_PASSWORD: nova
+        ports: [ "3306:3306" ]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -unova -pnova" --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig (pinned + checksum-verified)
+        shell: bash
+        run: echo "$(scripts/bootstrap-zig.sh | tail -1)" >> "$GITHUB_PATH"
+
+      - name: Install deps (Linux)
+        run: |
+          sudo apt-get update
+          wget -q https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && sudo ./llvm.sh 21
+          sudo apt-get install -y llvm-21-dev libclang-21-dev clang-21 libboost-all-dev cmake zlib1g-dev
+          sudo ln -sf "$(command -v clang++-21)" /usr/local/bin/clang++
+          echo "NOVA_LLVM_PREFIX=/usr/lib/llvm-21" >> "$GITHUB_ENV"
+          echo "BOOST_PREFIX=/usr" >> "$GITHUB_ENV"
+
+      - name: Build nova
+        run: zig build
+
+      - name: Run the live DB harness (each driver's live CRUD path)
+        shell: bash
+        env:
+          NOVA_PG_DSN: "postgres://nova:nova@127.0.0.1:5432/novadb"
+          NOVA_MYSQL_DSN: "mysql://nova:nova@127.0.0.1:3306/novadb"
+        run: |
+          ~/.nova/bin/nova test integration/live_db_harness.nova
