@@ -421,8 +421,9 @@ T15 [~] 2026-08-03: stdlib depth partially landed and gated. DONE: list ext (rev
 last/findIndex/any/all/indexOf/contains, case 235); config.nova (env-override layered config, case 236);
 math trig/log (sin/cos/tan/atan/atan2/log10/log2 with range reduction) + datetime timezones
 (tzOffsetSeconds/fromIsoUtc/formatOffset), case 244; Deque<T> (double-ended, two-stack amortized) +
-Heap<T> (min priority queue with a less comparator), case 246. REMAINING: ordered-map container; TLS
-1.2 server + mTLS + OCSP/CRL revocation (large TLS-role work, tracked with the M12/M13 TLS line).
+Heap<T> (min priority queue with a less comparator), case 246; OrderedMap<K,V> (sorted-key map,
+binary-search get/has, ordered keys), case 247. COLLECTIONS DEPTH NOW COMPLETE. REMAINING (all TLS-role
+work, tracked with the M12/M13 TLS line, not pure-stdlib): TLS 1.2 server + mTLS + OCSP/CRL revocation.
 
 T9 [~] 2026-08-03: per-connection concurrency guard on pg (query/exec refuse re-entry while a request is
 in flight -> "connection busy" DbError, preventing frame interleaving). Compile-verified (needs a live

@@ -1,0 +1,56 @@
+// T15 collections depth: OrderedMap<K,V> -- sorted-key map with binary-search get/has.
+import ordered_map;
+import list;
+import assert;
+
+fn lessInt(a: int, b: int): bool { return a < b; }
+
+@test
+fn test_ordered_insert_and_get(): void {
+    let m = ordered_map.newOrderedMap<int, int>(lessInt);
+    m.set(5, 50);
+    m.set(1, 10);
+    m.set(3, 30);
+    m.set(2, 20);
+    assert.equalInt(4, m.size());
+    assert.equalInt(10, m.get(1) ?? -1);
+    assert.equalInt(30, m.get(3) ?? -1);
+    assert.equalInt(50, m.get(5) ?? -1);
+    assert.isTrue(m.get(9) == undefined);
+    assert.isTrue(m.has(2));
+    assert.isTrue(!m.has(4));
+    // min/max
+    assert.equalInt(1, m.minKey() ?? -1);
+    assert.equalInt(5, m.maxKey() ?? -1);
+}
+
+@test
+fn test_ordered_update_and_keys(): void {
+    let m = ordered_map.newOrderedMap<int, int>(lessInt);
+    m.set(2, 20);
+    m.set(1, 10);
+    m.set(2, 99);           // update, not insert
+    assert.equalInt(2, m.size());
+    assert.equalInt(99, m.get(2) ?? -1);
+    // keys come out ascending
+    let ks = m.keysInOrder();
+    assert.equalInt(1, ks.get(0) ?? -1);
+    assert.equalInt(2, ks.get(1) ?? -1);
+}
+
+@test
+fn test_ordered_remove(): void {
+    let m = ordered_map.newOrderedMap<int, int>(lessInt);
+    m.set(1, 10);
+    m.set(2, 20);
+    m.set(3, 30);
+    assert.isTrue(m.remove(2));
+    assert.isTrue(!m.remove(2));    // already gone
+    assert.equalInt(2, m.size());
+    assert.isTrue(m.get(2) == undefined);
+    // remaining still ordered and intact
+    let ks = m.keysInOrder();
+    assert.equalInt(1, ks.get(0) ?? -1);
+    assert.equalInt(3, ks.get(1) ?? -1);
+    assert.equalInt(30, m.get(3) ?? -1);
+}

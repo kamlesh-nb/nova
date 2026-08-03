@@ -1,0 +1,100 @@
+// OrderedMap<K, V> -- a map that keeps its keys in sorted order (by a caller-supplied `less`
+// comparator), so iteration and range queries are ordered, unlike the hash Map. Backed by parallel
+// sorted List<K>/List<V> with binary search: get/has are O(log n), set/remove are O(n) (shift on
+// insert), keysInOrder yields ascending keys. (T15 collections depth -- the ordered-map container.)
+
+import list;
+
+pub struct OrderedMap<K, V> {
+    pub ks: List<K>,
+    pub vs: List<V>,
+    pub less: (K, K) -> bool,
+
+    init(less: (K, K) -> bool) {
+        self.ks = List<K>();
+        self.vs = List<V>();
+        self.less = less;
+    }
+
+    pub fn size(self: OrderedMap<K, V>): int { return self.ks.size(); }
+    pub fn isEmpty(self: OrderedMap<K, V>): bool { return self.ks.size() == 0; }
+
+    // Lower bound: index of the first key not less than `key` (== insertion point). Also usable to test
+    // presence: present iff idx < size and neither key < ks[idx] nor ks[idx] < key.
+    fn lowerBound(self: OrderedMap<K, V>, key: K): int {
+        let lo = 0;
+        let hi = self.ks.size();
+        let f = self.less;
+        while (lo < hi) {
+            let mid = (lo + hi) / 2;
+            let mk = self.ks.get(mid) ?? key;
+            if (f(mk ?? key, key)) { lo = mid + 1; }   // mk < key -> go right
+            else { hi = mid; }
+        }
+        return lo;
+    }
+
+    fn eqAt(self: OrderedMap<K, V>, idx: int, key: K): bool {
+        if (idx < 0 || idx >= self.ks.size()) { return false; }
+        let mk = self.ks.get(idx) ?? key;
+        let f = self.less;
+        // equal iff neither is less than the other
+        return !f(mk ?? key, key) && !f(key, mk ?? key);
+    }
+
+    // Insert or update: keeps keys sorted. Updating an existing key overwrites its value in place.
+    pub fn set(self: OrderedMap<K, V>, key: K, val: V): void {
+        let idx = self.lowerBound(key);
+        if (self.eqAt(idx, key)) {
+            self.vs.set(idx, val);
+            return;
+        }
+        self.ks.insert(idx, key);
+        self.vs.insert(idx, val);
+    }
+
+    pub fn has(self: OrderedMap<K, V>, key: K): bool {
+        return self.eqAt(self.lowerBound(key), key);
+    }
+
+    pub fn get(self: OrderedMap<K, V>, key: K): V | undefined {
+        let idx = self.lowerBound(key);
+        if (self.eqAt(idx, key)) { return self.vs.get(idx); }
+        return undefined;
+    }
+
+    // Remove a key (and its value). Returns whether it was present. Deletes at `idx` by shifting each
+    // parallel list's tail left one slot, then dropping the last (List has no removeAt).
+    pub fn remove(self: OrderedMap<K, V>, key: K): bool {
+        let idx = self.lowerBound(key);
+        if (!self.eqAt(idx, key)) { return false; }
+        let n = self.ks.size();
+        let i = idx;
+        while (i < n - 1) {
+            self.ks.set(i, self.ks.get(i + 1) ?? self.ks.get(i));
+            self.vs.set(i, self.vs.get(i + 1) ?? self.vs.get(i));
+            i = i + 1;
+        }
+        self.ks.pop();
+        self.vs.pop();
+        return true;
+    }
+
+    // Keys in ascending order (a copy).
+    pub fn keysInOrder(self: OrderedMap<K, V>): List<K> {
+        let out = List<K>();
+        let i = 0;
+        while (i < self.ks.size()) {
+            let k = self.ks.get(i);
+            if (k != undefined) { out.push(k ?? self.ks.get(0)); }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    // Smallest / largest key (or undefined when empty).
+    pub fn minKey(self: OrderedMap<K, V>): K | undefined { return self.ks.first(); }
+    pub fn maxKey(self: OrderedMap<K, V>): K | undefined { return self.ks.last(); }
+}
+
+pub fn newOrderedMap<K, V>(less: (K, K) -> bool): OrderedMap<K, V> { return OrderedMap<K, V>(less); }
