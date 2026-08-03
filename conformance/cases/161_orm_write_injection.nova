@@ -29,6 +29,21 @@ struct RecordingConn impl Connection {
     async fn prepare(self: RecordingConn, sql: string): int { return 0; }
     async fn queryPrepared(self: RecordingConn, stmt: int, params: List<DbValue>): ResultSet { return ResultSet(); }
     async fn execPrepared(self: RecordingConn, stmt: int, params: List<DbValue>): ExecResult { return ExecResult(0, ""); }
+    async fn begin(self: RecordingConn): ExecResult { return await self.exec("BEGIN", List<DbValue>()); }
+    async fn commit(self: RecordingConn): ExecResult { return await self.exec("COMMIT", List<DbValue>()); }
+    async fn rollback(self: RecordingConn): ExecResult { return await self.exec("ROLLBACK", List<DbValue>()); }
+}
+
+@test
+fn test_transaction_methods_issue_sql(): void {
+    // T6: begin/commit/rollback are on the Connection seam and issue the transaction control statements.
+    let conn = RecordingConn();
+    let b = conn.begin();
+    assert.equalStr(conn.lastSql, "BEGIN");
+    let c = conn.commit();
+    assert.equalStr(conn.lastSql, "COMMIT");
+    let r = conn.rollback();
+    assert.equalStr(conn.lastSql, "ROLLBACK");
 }
 
 @test

@@ -46,6 +46,9 @@ struct CountingConn impl Connection {
         if (stmt < 0 || stmt >= self.prepared.size()) { return ExecResult(0, ""); }
         return await self.exec(self.prepared.get(stmt) ?? "", params);
     }
+    pub async fn begin(self): ExecResult { return await self.exec("BEGIN", List<DbValue>()); }
+    pub async fn commit(self): ExecResult { return await self.exec("COMMIT", List<DbValue>()); }
+    pub async fn rollback(self): ExecResult { return await self.exec("ROLLBACK", List<DbValue>()); }
 }
 
 struct CountingDriver impl Driver {

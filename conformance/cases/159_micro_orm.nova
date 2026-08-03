@@ -43,6 +43,9 @@ struct MockConn impl Connection {
     async fn execPrepared(self: MockConn, stmt: int, params: List<DbValue>): ExecResult {
         return ExecResult(0, "MOCK");
     }
+    async fn begin(self: MockConn): ExecResult { return ExecResult(0, "MOCK"); }
+    async fn commit(self: MockConn): ExecResult { return ExecResult(0, "MOCK"); }
+    async fn rollback(self: MockConn): ExecResult { return ExecResult(0, "MOCK"); }
 }
 
 @test

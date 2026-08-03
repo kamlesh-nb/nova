@@ -156,6 +156,14 @@ pub trait Connection {
     async fn prepare(self, sql: string): int;
     async fn queryPrepared(self, stmt: int, params: List<DbValue>): ResultSet;
     async fn execPrepared(self, stmt: int, params: List<DbValue>): ExecResult;
+
+    // Transaction control. SQL drivers issue their dialect's BEGIN/COMMIT/ROLLBACK; the ExecResult
+    // carries a DbError (via the T1 error channel) if the statement failed, so a caller can check
+    // `.ok()` and, on error mid-transaction, `rollback()`. There is no auto-rollback-on-drop yet (a
+    // sync destructor cannot await); use the try/errdefer pattern to roll back on the error path.
+    async fn begin(self): ExecResult;
+    async fn commit(self): ExecResult;
+    async fn rollback(self): ExecResult;
 }
 
 pub trait Driver {
