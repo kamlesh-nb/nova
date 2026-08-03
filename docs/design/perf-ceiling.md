@@ -127,12 +127,31 @@ stored in a `List`, an `any`, or passed where an i64 is expected). Insert an exp
 exactly those boundaries — do not let the i64 leak back into the hot path.
 
 **Definition of Done:**
-- [ ] `double[]` loops (dot/saxpy) auto-vectorize (`otool -tv` shows `.2d`/`.4s` in the loop body).
-- [ ] spectral-norm, nsieve, mandelbrot re-measured; target ≤ 1.15× the fastest peer.
-- [ ] Corpus green (`run.sh -j`), ASAN-clean, ARC gate unchanged.
-- [ ] New conformance case: an array passed to two params + a vectorizable kernel, correctness-checked.
+- [x] Array slots (locals + params) are `ptr`, not the i64 word (`slotTypeForLocalId`); `coerceToSlotType`
+      handles the ptr↔i64 seams. **Part 1 — landed, corpus 254/254 + ASAN green.**
+- [x] Array element access GEPs the `ptr` base directly (no `inttoptr`), typed float loads. **Part 1.**
+- [x] Array params flow as `ptr` in the signature (caller inttoptr's at the call via existing arg
+      coercion). **Part 1.** (No `noalias`: unsound if the same array is passed to two params.)
+- [ ] **Part 2 (the payoff, remaining): array construction must return a real `ptr`.**
+      `nova_bytes_alloc` is declared to return the i64 word, so `[v;n]` / `[...]` produce a laundered
+      pointer (`inttoptr(ptrtoint(malloc))`), which LLVM treats as provenance-less — so even with `ptr`
+      slots the loop does **not** vectorize (verified: a Nova saxpy stays scalar). Fix: declare the
+      array allocation path to return `ptr` (or add an array-specific `ptr`-returning alloc), and update
+      the array-literal/repeat codegen to GEP element stores from that `ptr` instead of `inttoptr`+add.
+      This ripples to every `compileAlloc` caller (tuples, boxes, structs) via `coerceToSlotType`, so it
+      is the large, careful part — do it as its own gated change.
+- [ ] `double[]` loops (saxpy) then auto-vectorize (`otool -tv` shows `.2d` in the loop body).
+- [ ] spectral-norm, nsieve, mandelbrot re-measured (note: spectral's division-heavy inner loop and
+      mandelbrot's byte buffer won't vectorize regardless; the clean win is on elementwise float kernels).
+- [ ] Corpus green, ASAN-clean, ARC gate unchanged.
 
-**Tracking:** _pending_
+**Tracking:** 🔨 Part 1 landed (ptr slots/params/access + ptr↔i64 coerce), corpus 254/254 + ASAN clean.
+Part 2 (allocator returns `ptr`) is the remaining core for the vectorization payoff.
+
+**Root-cause note discovered while implementing:** the provenance chain must be *pure `ptr`* from the
+allocation through the slot to the GEP — any `ptrtoint`/`inttoptr` round-trip in between launders the
+pointer and LLVM's alias analysis gives up. Part 1 made the slot/param/access ptr-clean; the allocator
+return type is the last laundering site.
 
 ### 3.2 ⬜ ARC optimizer — redundant retain/release elimination + escape analysis
 

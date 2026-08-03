@@ -189,9 +189,15 @@ pub fn slotTypeForLocal(self: *LlvmCompiler, type_name: ?[]const u8) types.LLVMT
 pub fn slotTypeForLocalId(self: *LlvmCompiler, type_name: ?[]const u8, type_id: ?typesys.TypeId) types.LLVMTypeRef {
     if (type_id) |tid| {
         if (self.valueOptionalInner(tid) != null) return self.val_type;
+        // Fixed arrays are `ptr` slots (not the i64 word) so pointer provenance survives -- lets LLVM
+        // disambiguate arrays and vectorize/hoist array loops. Access GEPs the ptr directly.
+        if (self.type_store) |st| {
+            if (st.get(tid) == .array) return self.ptr_type;
+        }
     }
     if (type_name) |tn| {
         if (std.mem.eql(u8, tn, "f64x4")) return core.LLVMVectorType(core.LLVMDoubleType(), 4);
+        if (std.mem.indexOfScalar(u8, tn, '[') != null) return self.ptr_type; // T[N] array by name
         if (cgPrim(tn)) |p| {
             if (p.repr == .f64 or p.repr == .f32) return core.LLVMDoubleType();
         }
@@ -215,6 +221,15 @@ pub fn coerceToSlotType(self: *LlvmCompiler, val: types.LLVMValueRef, slot_ty: t
     }
     if (sk == .LLVMIntegerTypeKind and vk == .LLVMDoubleTypeKind) {
         return core.LLVMBuildBitCast(self.builder, val, slot_ty, "double_to_val");
+    }
+    // ptr <-> i64 value-word: array slots are `ptr` (for provenance/vectorization); everything else
+    // stays the i64 word, so the seams (array into a List/any/i64 param, or an i64 into a ptr slot)
+    // convert here.
+    if (sk == .LLVMPointerTypeKind and vk == .LLVMIntegerTypeKind) {
+        return core.LLVMBuildIntToPtr(self.builder, val, slot_ty, "val_to_ptr");
+    }
+    if (sk == .LLVMIntegerTypeKind and vk == .LLVMPointerTypeKind) {
+        return core.LLVMBuildPtrToInt(self.builder, val, slot_ty, "ptr_to_val");
     }
     return val;
 }

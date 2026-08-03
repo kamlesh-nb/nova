@@ -795,6 +795,18 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         const params = try allocator.alloc(types.LLVMTypeRef, func.param_count);
         defer allocator.free(params);
         @memset(params, compiler.val_type);
+        // Array params flow as `ptr` (not the i64 word): the pointer arrives as a clean function
+        // argument with provenance, so LLVM can disambiguate arrays and vectorize/hoist the loop. (No
+        // `noalias` -- it would be unsound if the same array is passed to two params; LLVM still
+        // vectorizes via a runtime overlap check.) The caller inttoptr's the i64 array value at the
+        // call site (existing arg coercion). Return type stays the word for now.
+        if (compiler.function_local_types.get(func.name)) |lt| {
+            for (0..func.param_count) |pi| {
+                if (lt.get(func.param_names[pi])) |tn| {
+                    if (std.mem.indexOfScalar(u8, tn, '[') != null) params[pi] = compiler.ptr_type;
+                }
+            }
+        }
 
         const is_void = std.mem.eql(u8, func.return_type, "void");
         const is_main = std.mem.eql(u8, func.name, "main");

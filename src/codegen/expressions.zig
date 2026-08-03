@@ -154,6 +154,29 @@ pub fn fnRefInt(self: *LlvmCompiler, fn_val: types.LLVMValueRef, name: []const u
 //   simd.add4/sub4/mul4/div4(a,b) / simd.fma4(a,b,c) -> f64x4
 //   simd.load4(arr,i) / simd.store4(arr,i,v)     load/store 4 lanes from a double[]
 //   simd.sum4(v)                                  -> double (horizontal add)
+// Element LLVM type for a float array (double[]/float[]) so access loads/stores the real type (needed
+// for the vectorizer). Returns null for int/bool arrays (the i64 word is correct for those).
+pub fn arrayElemFloatLLVM(self: *LlvmCompiler, obj: *const ast.Expression) ?types.LLVMTypeRef {
+    const ir = self.typed_ir orelse return null;
+    const st = self.type_store orelse return null;
+    const tid = ir.typeOf(obj) orelse return null;
+    const t = st.get(tid);
+    if (t != .array) return null;
+    const et = st.get(t.array.elem);
+    if (et == .prim and et.prim.kind == .float) {
+        if (et.prim.bits == 64) return core.LLVMDoubleType();
+        if (et.prim.bits == 32) return core.LLVMFloatType();
+    }
+    return null;
+}
+
+// Recover a base pointer for array access: array slots are now `ptr`, but a literal / other source may
+// still be the i64 word -- inttoptr only in that case.
+pub fn arrayBasePtr(self: *LlvmCompiler, base: types.LLVMValueRef) types.LLVMValueRef {
+    if (core.LLVMGetTypeKind(core.LLVMTypeOf(base)) == .LLVMPointerTypeKind) return base;
+    return core.LLVMBuildIntToPtr(self.builder, base, self.ptr_type, "arr_base");
+}
+
 pub fn compileSimdCall(self: *LlvmCompiler, field: []const u8, args: []const ast.Expression) anyerror!types.LLVMValueRef {
     const vecTy = self.vecF64x4Type();
     const dbl = core.LLVMDoubleType();
@@ -1415,9 +1438,15 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                             _ = core.LLVMBuildStore(self.builder, b, sptr);
                             return r_val;
                         }
-                        // Typed GEP store (mirror of the GEP read): stride-1 pattern for the vectorizer.
-                        const base_ptr = core.LLVMBuildIntToPtr(self.builder, base, self.ptr_type, "arr_store_base");
+                        // GEP the base `ptr` directly (mirror of the read). Float arrays store the real
+                        // element type; others the i64 word.
+                        const base_ptr = self.arrayBasePtr(base);
                         var st_idxs = [_]types.LLVMValueRef{off};
+                        if (self.arrayElemFloatLLVM(idx.object)) |ety| {
+                            const ep = core.LLVMBuildInBoundsGEP2(self.builder, ety, base_ptr, &st_idxs, 1, "arr_store_gepf");
+                            _ = core.LLVMBuildStore(self.builder, self.coerceToSlotType(r_val, ety), ep);
+                            return r_val;
+                        }
                         const elem_ptr = core.LLVMBuildInBoundsGEP2(self.builder, self.val_type, base_ptr, &st_idxs, 1, "arr_store_gep");
                         _ = core.LLVMBuildStore(self.builder, self.coerceToSlotType(r_val, self.val_type), elem_ptr);
                         return r_val;
@@ -3185,10 +3214,14 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 const byte_val = core.LLVMBuildLoad2(self.builder, self.i8_type, ptr, "byte_val");
                 return core.LLVMBuildZExt(self.builder, byte_val, self.val_type, "byte_val_ext");
             } else {
-                // Typed GEP (getelementptr val_type, base, index) instead of inttoptr+add: gives LLVM a
-                // clean stride-1 access pattern so array loops auto-vectorize (SIMD) and hoist.
-                const base_ptr = core.LLVMBuildIntToPtr(self.builder, obj_ptr, self.ptr_type, "arr_base");
+                // GEP the base `ptr` directly (array slots are ptr now -> provenance survives, so LLVM
+                // can vectorize/hoist). Float arrays load the real element type; others the i64 word.
+                const base_ptr = self.arrayBasePtr(obj_ptr);
                 var idxs = [_]types.LLVMValueRef{offset_val};
+                if (self.arrayElemFloatLLVM(idx.object)) |ety| {
+                    const ep = core.LLVMBuildInBoundsGEP2(self.builder, ety, base_ptr, &idxs, 1, "arr_gepf");
+                    return core.LLVMBuildLoad2(self.builder, ety, ep, "index_fval");
+                }
                 const elem_ptr = core.LLVMBuildInBoundsGEP2(self.builder, self.val_type, base_ptr, &idxs, 1, "arr_gep");
                 return core.LLVMBuildLoad2(self.builder, self.val_type, elem_ptr, "index_val");
             }
