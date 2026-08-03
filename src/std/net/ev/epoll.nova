@@ -14,7 +14,7 @@
 
 import bytes;
 import os.socket;
-import os.epoll;
+import os.linux.epoll;
 
 // Op kinds.
 pub const OP_RECV: int = 0;

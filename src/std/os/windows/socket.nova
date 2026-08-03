@@ -4,7 +4,7 @@
 // socket is closed with closesocket. COMPILE-VERIFIED via cross-compilation; runtime verification pending
 // on a Windows host.
 
-import os.winsock;
+import os.windows.winsock;
 import bytes;
 
 pub const AF_INET: int = 2;

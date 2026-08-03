@@ -13,8 +13,8 @@ import list;
 import bytes;
 import assert;
 import os.sys;
-import os.winfs;
-import os.winproc;
+import os.windows.fs;
+import os.windows.proc;
 
 // Context record (Nova-allocated, freed by close()):
 //   [0]  hProcess (long)        [8]  hStdinWrite (long)   [16] hStdoutRead (long)
@@ -70,11 +70,11 @@ fn buildCommandLine(cmd: string, args: list.List<string>): string {
 // A SECURITY_ATTRIBUTES saying "child processes inherit this handle" — required on both pipe ends
 // at creation time; the parent's end then has inheritance cleared individually.
 fn inheritableSa(): ptr {
-    let sa = bytes.alloc(winproc.SECURITY_ATTRIBUTES_SIZE);
+    let sa = bytes.alloc(proc.SECURITY_ATTRIBUTES_SIZE);
     let i = 0;
-    while (i < winproc.SECURITY_ATTRIBUTES_SIZE) { bytes.write_byte(sa, i, 0); i = i + 1; }
-    bytes.write_i32(sa, winproc.SA_LENGTH_OFF, winproc.SECURITY_ATTRIBUTES_SIZE as long);
-    bytes.write_i32(sa, winproc.SA_INHERIT_OFF, 1);
+    while (i < proc.SECURITY_ATTRIBUTES_SIZE) { bytes.write_byte(sa, i, 0); i = i + 1; }
+    bytes.write_i32(sa, proc.SA_LENGTH_OFF, proc.SECURITY_ATTRIBUTES_SIZE as long);
+    bytes.write_i32(sa, proc.SA_INHERIT_OFF, 1);
     return sa;
 }
 
@@ -90,8 +90,8 @@ pub struct Process {
         let outWrite = bytes.alloc(8);
         let inRead = bytes.alloc(8);
         let inWrite = bytes.alloc(8);
-        let madeOut = winproc.CreatePipe(outRead, outWrite, sa, 0);
-        let madeIn = winproc.CreatePipe(inRead, inWrite, sa, 0);
+        let madeOut = proc.CreatePipe(outRead, outWrite, sa, 0);
+        let madeIn = proc.CreatePipe(inRead, inWrite, sa, 0);
         bytes.free(sa);
         if (madeOut == 0 || madeIn == 0) {
             bytes.free(outRead); bytes.free(outWrite); bytes.free(inRead); bytes.free(inWrite);
@@ -106,55 +106,55 @@ pub struct Process {
 
         // The parent's ends must NOT be inheritable, or the child holds a duplicate of the stdout
         // write end and the parent's read never reaches EOF.
-        winproc.SetHandleInformation(hOutRead, winproc.HANDLE_FLAG_INHERIT, 0);
-        winproc.SetHandleInformation(hInWrite, winproc.HANDLE_FLAG_INHERIT, 0);
+        proc.SetHandleInformation(hOutRead, proc.HANDLE_FLAG_INHERIT, 0);
+        proc.SetHandleInformation(hInWrite, proc.HANDLE_FLAG_INHERIT, 0);
 
-        let si = bytes.alloc(winproc.STARTUPINFO_SIZE);
+        let si = bytes.alloc(proc.STARTUPINFO_SIZE);
         let i = 0;
-        while (i < winproc.STARTUPINFO_SIZE) { bytes.write_byte(si, i, 0); i = i + 1; }
-        bytes.write_i32(si, winproc.SI_CB_OFF, winproc.STARTUPINFO_SIZE as long);
-        bytes.write_i32(si, winproc.SI_FLAGS_OFF, winproc.STARTF_USESTDHANDLES as long);
-        bytes.write_ptr(si, winproc.SI_STDIN_OFF, hInRead);
-        bytes.write_ptr(si, winproc.SI_STDOUT_OFF, hOutWrite);
-        bytes.write_ptr(si, winproc.SI_STDERR_OFF, hOutWrite);
+        while (i < proc.STARTUPINFO_SIZE) { bytes.write_byte(si, i, 0); i = i + 1; }
+        bytes.write_i32(si, proc.SI_CB_OFF, proc.STARTUPINFO_SIZE as long);
+        bytes.write_i32(si, proc.SI_FLAGS_OFF, proc.STARTF_USESTDHANDLES as long);
+        bytes.write_ptr(si, proc.SI_STDIN_OFF, hInRead);
+        bytes.write_ptr(si, proc.SI_STDOUT_OFF, hOutWrite);
+        bytes.write_ptr(si, proc.SI_STDERR_OFF, hOutWrite);
 
-        let pi = bytes.alloc(winproc.PROCESS_INFORMATION_SIZE);
+        let pi = bytes.alloc(proc.PROCESS_INFORMATION_SIZE);
         i = 0;
-        while (i < winproc.PROCESS_INFORMATION_SIZE) { bytes.write_byte(pi, i, 0); i = i + 1; }
+        while (i < proc.PROCESS_INFORMATION_SIZE) { bytes.write_byte(pi, i, 0); i = i + 1; }
 
         // lpApplicationName is null and the program name lives in lpCommandLine, so PATH lookup
         // works the way spawn("cmd.exe", ...) callers expect.
         let cline = sys.cstr(buildCommandLine(cmd, args));
-        let wline = winfs.widen(cline);
+        let wline = fs.widen(cline);
         bytes.free(cline);
         if (wline == (0 as ptr)) {
             bytes.free(si); bytes.free(pi);
-            winfs.CloseHandle(hOutRead); winfs.CloseHandle(hOutWrite);
-            winfs.CloseHandle(hInRead); winfs.CloseHandle(hInWrite);
+            fs.CloseHandle(hOutRead); fs.CloseHandle(hOutWrite);
+            fs.CloseHandle(hInRead); fs.CloseHandle(hInWrite);
             return Process{ ctx: 0 as ptr };
         }
 
-        let ok = winproc.CreateProcessW(0 as ptr, wline, 0 as ptr, 0 as ptr, 1,
-                                        winproc.CREATE_NO_WINDOW, 0 as ptr, 0 as ptr, si, pi);
+        let ok = proc.CreateProcessW(0 as ptr, wline, 0 as ptr, 0 as ptr, 1,
+                                        proc.CREATE_NO_WINDOW, 0 as ptr, 0 as ptr, si, pi);
         bytes.free(wline);
         bytes.free(si);
 
         // The child owns its ends now; the parent must drop them either way.
-        winfs.CloseHandle(hInRead);
-        winfs.CloseHandle(hOutWrite);
+        fs.CloseHandle(hInRead);
+        fs.CloseHandle(hOutWrite);
 
         if (ok == 0) {
             bytes.free(pi);
-            winfs.CloseHandle(hOutRead);
-            winfs.CloseHandle(hInWrite);
+            fs.CloseHandle(hOutRead);
+            fs.CloseHandle(hInWrite);
             return Process{ ctx: 0 as ptr };
         }
 
-        let hProc = bytes.read_ptr(pi, winproc.PI_PROCESS_OFF);
-        let hThread = bytes.read_ptr(pi, winproc.PI_THREAD_OFF);
-        let pid = bytes.read_i32(pi, winproc.PI_PID_OFF) as int;
+        let hProc = bytes.read_ptr(pi, proc.PI_PROCESS_OFF);
+        let hThread = bytes.read_ptr(pi, proc.PI_THREAD_OFF);
+        let pid = bytes.read_i32(pi, proc.PI_PID_OFF) as int;
         bytes.free(pi);
-        winfs.CloseHandle(hThread);   // the thread handle is not part of the Process surface
+        fs.CloseHandle(hThread);   // the thread handle is not part of the Process surface
 
         let ctx = bytes.alloc(CTX_SIZE);
         bytes.write_ptr(ctx, CTX_PROC_OFF, hProc);
@@ -178,7 +178,7 @@ pub struct Process {
         let h = bytes.read_ptr(self.ctx, CTX_STDIN_OFF);
         let wrote = bytes.alloc(4);
         bytes.write_i32(wrote, 0, 0);
-        let ok = winfs.WriteFile(h, data as ptr, data.length, wrote, 0 as ptr);
+        let ok = fs.WriteFile(h, data as ptr, data.length, wrote, 0 as ptr);
         let n = bytes.read_i32(wrote, 0) as int;
         bytes.free(wrote);
         return if (ok != 0) n else -1;
@@ -191,7 +191,7 @@ pub struct Process {
         let got = bytes.alloc(4);
         bytes.write_i32(got, 0, 0);
         // A closed write end surfaces as ERROR_BROKEN_PIPE, which is EOF, not an error.
-        let ok = winfs.ReadFile(h, buf, max_len, got, 0 as ptr);
+        let ok = fs.ReadFile(h, buf, max_len, got, 0 as ptr);
         let n = bytes.read_i32(got, 0) as int;
         bytes.free(got);
         if (ok == 0 || n <= 0) {
@@ -218,7 +218,7 @@ pub struct Process {
         // Drop our copy of the child's stdin first: a child blocked reading stdin (`cat`) would
         // otherwise never exit and this would hang forever.
         self.closeStdin();
-        winproc.WaitForSingleObject(h, winproc.INFINITE);
+        proc.WaitForSingleObject(h, proc.INFINITE);
         return self.reap();
     }
 
@@ -229,7 +229,7 @@ pub struct Process {
             return bytes.read_i32(self.ctx, CTX_EXIT_OFF) as int;
         }
         let h = bytes.read_ptr(self.ctx, CTX_PROC_OFF);
-        if (winproc.WaitForSingleObject(h, 0) == winproc.WAIT_TIMEOUT) { return -2; }
+        if (proc.WaitForSingleObject(h, 0) == proc.WAIT_TIMEOUT) { return -2; }
         return self.reap();
     }
 
@@ -238,7 +238,7 @@ pub struct Process {
         let h = bytes.read_ptr(self.ctx, CTX_PROC_OFF);
         let code = bytes.alloc(4);
         bytes.write_i32(code, 0, 0);
-        let ok = winproc.GetExitCodeProcess(h, code);
+        let ok = proc.GetExitCodeProcess(h, code);
         let c = bytes.read_i32(code, 0) as int;
         bytes.free(code);
         if (ok == 0) { return -1; }
@@ -250,7 +250,7 @@ pub struct Process {
     fn closeStdin(self: Process): void {
         let h = bytes.read_ptr(self.ctx, CTX_STDIN_OFF);
         if (h != (0 as long)) {
-            winfs.CloseHandle(h);
+            fs.CloseHandle(h);
             bytes.write_ptr(self.ctx, CTX_STDIN_OFF, 0);
         }
     }
@@ -269,7 +269,7 @@ pub struct Process {
     pub fn kill(self: Process, sig: int): int {
         if (self.ctx == 0) { return -1; }
         let h = bytes.read_ptr(self.ctx, CTX_PROC_OFF);
-        return if (winproc.TerminateProcess(h, 128 + sig) != 0) 0 else -1;
+        return if (proc.TerminateProcess(h, 128 + sig) != 0) 0 else -1;
     }
 
     pub fn terminate(self: Process): int { return self.kill(15); }
@@ -279,9 +279,9 @@ pub struct Process {
         if (self.ctx != 0) {
             self.closeStdin();
             let out = bytes.read_ptr(self.ctx, CTX_STDOUT_OFF);
-            if (out != (0 as long)) { winfs.CloseHandle(out); }
+            if (out != (0 as long)) { fs.CloseHandle(out); }
             let h = bytes.read_ptr(self.ctx, CTX_PROC_OFF);
-            if (h != (0 as long)) { winfs.CloseHandle(h); }
+            if (h != (0 as long)) { fs.CloseHandle(h); }
             bytes.free(self.ctx);
             self.ctx = 0;
         }

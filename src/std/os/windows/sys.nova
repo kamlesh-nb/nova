@@ -22,8 +22,8 @@
 // INVALID_HANDLE_VALUE is -1, so io/file's `fd < 0` failure test keeps working.
 
 import bytes;
-import os.winfs;
-import os.winsock;
+import os.windows.fs;
+import os.windows.winsock;
 
 // errno and the non-blocking shim stay C primitives for the same reasons as on POSIX (errno is a
 // per-thread macro; nova_set_nonblock maps to ioctlsocket(FIONBIO) on Windows — see core.cpp).
@@ -135,7 +135,7 @@ fn failWith(e: int): int {
 
 // Translate the pending Win32 error into errno and report failure.
 fn fail(): int {
-    let w = winfs.GetLastError();
+    let w = fs.GetLastError();
     if (w == ERROR_FILE_NOT_FOUND || w == ERROR_PATH_NOT_FOUND) { return failWith(ENOENT); }
     if (w == ERROR_ACCESS_DENIED) { return failWith(EACCES); }
     if (w == ERROR_INVALID_HANDLE) { return failWith(EBADF); }
@@ -161,33 +161,33 @@ fn accessFor(flags: int): int {
     if ((flags & O_APPEND()) != 0) {
         // FILE_APPEND_DATA without FILE_WRITE_DATA makes every write land at EOF atomically, which
         // is what O_APPEND() guarantees; seeking-then-writing would not be equivalent.
-        let a = winfs.FILE_APPEND_DATA;
-        return if ((flags & O_RDWR) != 0) (a | winfs.GENERIC_READ) else a;
+        let a = fs.FILE_APPEND_DATA;
+        return if ((flags & O_RDWR) != 0) (a | fs.GENERIC_READ) else a;
     }
-    if ((flags & O_RDWR) != 0) { return winfs.GENERIC_READ | winfs.GENERIC_WRITE; }
-    if ((flags & O_WRONLY) != 0) { return winfs.GENERIC_WRITE; }
-    return winfs.GENERIC_READ;
+    if ((flags & O_RDWR) != 0) { return fs.GENERIC_READ | fs.GENERIC_WRITE; }
+    if ((flags & O_WRONLY) != 0) { return fs.GENERIC_WRITE; }
+    return fs.GENERIC_READ;
 }
 
 fn dispositionFor(flags: int): int {
     let creat = (flags & O_CREAT()) != 0;
     let trunc = (flags & O_TRUNC()) != 0;
-    if (creat && trunc) { return winfs.CREATE_ALWAYS; }
-    if (creat) { return winfs.OPEN_ALWAYS; }
-    if (trunc) { return winfs.TRUNCATE_EXISTING; }
-    return winfs.OPEN_EXISTING;
+    if (creat && trunc) { return fs.CREATE_ALWAYS; }
+    if (creat) { return fs.OPEN_ALWAYS; }
+    if (trunc) { return fs.TRUNCATE_EXISTING; }
+    return fs.OPEN_EXISTING;
 }
 
 // open(2). `mode` (the POSIX permission bits) has no Win32 equivalent and is ignored, as it is on
 // every Windows CRT. Returns the handle truncated to int, or -1.
 pub fn nova_open(path: ptr, flags: int, mode: int): int {
-    let w = winfs.widen(path);
+    let w = fs.widen(path);
     if (w == (0 as ptr)) { return -1; }
-    let share = winfs.FILE_SHARE_READ | winfs.FILE_SHARE_WRITE | winfs.FILE_SHARE_DELETE;
-    let h = winfs.CreateFileW(w, accessFor(flags), share, 0 as ptr,
-                              dispositionFor(flags), winfs.FILE_ATTRIBUTE_NORMAL, 0 as long);
+    let share = fs.FILE_SHARE_READ | fs.FILE_SHARE_WRITE | fs.FILE_SHARE_DELETE;
+    let h = fs.CreateFileW(w, accessFor(flags), share, 0 as ptr,
+                              dispositionFor(flags), fs.FILE_ATTRIBUTE_NORMAL, 0 as long);
     bytes.free(w);
-    if (h == winfs.INVALID_HANDLE) { return fail(); }
+    if (h == fs.INVALID_HANDLE) { return fail(); }
     return h as int;
 }
 
@@ -202,7 +202,7 @@ pub fn nova_open(path: ptr, flags: int, mode: int): int {
 pub fn read(fd: int, buf: ptr, count: long): long {
     let got = bytes.alloc(4);
     bytes.write_i32(got, 0, 0);
-    let ok = winfs.ReadFile(fd as long, buf, count as int, got, 0 as ptr);
+    let ok = fs.ReadFile(fd as long, buf, count as int, got, 0 as ptr);
     let n = bytes.read_i32(got, 0) as int;
     bytes.free(got);
     if (ok != 0) { return n as long; }
@@ -213,7 +213,7 @@ pub fn read(fd: int, buf: ptr, count: long): long {
 pub fn write(fd: int, buf: ptr, count: long): long {
     let wrote = bytes.alloc(4);
     bytes.write_i32(wrote, 0, 0);
-    let ok = winfs.WriteFile(fd as long, buf, count as int, wrote, 0 as ptr);
+    let ok = fs.WriteFile(fd as long, buf, count as int, wrote, 0 as ptr);
     let n = bytes.read_i32(wrote, 0) as int;
     bytes.free(wrote);
     if (ok != 0) { return n as long; }
@@ -227,7 +227,7 @@ pub fn write(fd: int, buf: ptr, count: long): long {
 pub fn close(fd: int): int {
     if (fd < 0) { return failWith(EBADF); }
     if (winsock.closesocket(fd as long) == 0) { return 0; }
-    if (winfs.CloseHandle(fd as long) != 0) { return 0; }
+    if (fs.CloseHandle(fd as long) != 0) { return 0; }
     return fail();
 }
 
@@ -235,58 +235,58 @@ pub fn close(fd: int): int {
 pub fn lseek(fd: int, offset: long, whence: int): long {
     let out = bytes.alloc(8);
     bytes.write_ptr(out, 0, 0);
-    let ok = winfs.SetFilePointerEx(fd as long, offset, out, whence);
+    let ok = fs.SetFilePointerEx(fd as long, offset, out, whence);
     let pos = bytes.read_ptr(out, 0);
     bytes.free(out);
     return if (ok != 0) (pos as long) else (-1 as long);
 }
 
 pub fn fsync(fd: int): int {
-    return if (winfs.FlushFileBuffers(fd as long) != 0) 0 else fail();
+    return if (fs.FlushFileBuffers(fd as long) != 0) 0 else fail();
 }
 
 // --- paths -----------------------------------------------------------------------------------
 // Run a Win32 BOOL-returning call that takes one wide path; returns 0 on success, -1 on failure,
 // matching the POSIX convention its callers expect.
 fn attrsOf(path: ptr): int {
-    let w = winfs.widen(path);
-    if (w == (0 as ptr)) { return winfs.INVALID_FILE_ATTRIBUTES; }
-    let a = winfs.GetFileAttributesW(w);
+    let w = fs.widen(path);
+    if (w == (0 as ptr)) { return fs.INVALID_FILE_ATTRIBUTES; }
+    let a = fs.GetFileAttributesW(w);
     bytes.free(w);
     return a;
 }
 
 pub fn mkdir(path: ptr, mode: int): int {
-    let w = winfs.widen(path);
+    let w = fs.widen(path);
     if (w == (0 as ptr)) { return -1; }
-    let r = winfs.CreateDirectoryW(w, 0 as ptr);
+    let r = fs.CreateDirectoryW(w, 0 as ptr);
     bytes.free(w);
     return if (r != 0) 0 else fail();
 }
 
 pub fn rmdir(path: ptr): int {
-    let w = winfs.widen(path);
+    let w = fs.widen(path);
     if (w == (0 as ptr)) { return -1; }
-    let r = winfs.RemoveDirectoryW(w);
+    let r = fs.RemoveDirectoryW(w);
     bytes.free(w);
     return if (r != 0) 0 else fail();
 }
 
 pub fn unlink(path: ptr): int {
-    let w = winfs.widen(path);
+    let w = fs.widen(path);
     if (w == (0 as ptr)) { return -1; }
-    let r = winfs.DeleteFileW(w);
+    let r = fs.DeleteFileW(w);
     bytes.free(w);
     return if (r != 0) 0 else fail();
 }
 
 // rename(2) replaces an existing destination; plain MoveFileW would fail, so REPLACE_EXISTING.
 pub fn rename(from: ptr, to: ptr): int {
-    let a = winfs.widen(from);
+    let a = fs.widen(from);
     if (a == (0 as ptr)) { return -1; }
-    let b = winfs.widen(to);
+    let b = fs.widen(to);
     if (b == (0 as ptr)) { bytes.free(a); return -1; }
-    let r = winfs.MoveFileExW(a, b, winfs.MOVEFILE_REPLACE_EXISTING);
+    let r = fs.MoveFileExW(a, b, fs.MOVEFILE_REPLACE_EXISTING);
     bytes.free(a);
     bytes.free(b);
     return if (r != 0) 0 else fail();
@@ -294,16 +294,16 @@ pub fn rename(from: ptr, to: ptr): int {
 
 // access(2): only F_OK (existence) is meaningful here — Windows ACLs do not map onto R_OK/W_OK/X_OK.
 pub fn access(path: ptr, amode: int): int {
-    return if (attrsOf(path) != winfs.INVALID_FILE_ATTRIBUTES) 0 else failWith(ENOENT);
+    return if (attrsOf(path) != fs.INVALID_FILE_ATTRIBUTES) 0 else failWith(ENOENT);
 }
 
 // stat(2): fills `buf` with the fields os/sys documents — st_mode as a u16 at offset 4. Callers
 // allocate 160 bytes (see pathStatMode), comfortably more than the two fields written here.
 pub fn stat(path: ptr, buf: ptr): int {
     let a = attrsOf(path);
-    if (a == winfs.INVALID_FILE_ATTRIBUTES) { return failWith(ENOENT); }
-    let isDir = (a & winfs.FILE_ATTRIBUTE_DIRECTORY) != 0;
-    let isLink = (a & winfs.FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    if (a == fs.INVALID_FILE_ATTRIBUTES) { return failWith(ENOENT); }
+    let isDir = (a & fs.FILE_ATTRIBUTE_DIRECTORY) != 0;
+    let isLink = (a & fs.FILE_ATTRIBUTE_REPARSE_POINT) != 0;
     let mode = if (isDir) S_IFDIR else S_IFREG;
     bytes.write_u16(buf, STAT_MODE_OFF(), mode as long);
     return 0;
@@ -312,9 +312,9 @@ pub fn stat(path: ptr, buf: ptr): int {
 // lstat(2): like stat but reports a reparse point as a symlink rather than following it.
 pub fn lstat(path: ptr, buf: ptr): int {
     let a = attrsOf(path);
-    if (a == winfs.INVALID_FILE_ATTRIBUTES) { return failWith(ENOENT); }
-    let mode = if ((a & winfs.FILE_ATTRIBUTE_REPARSE_POINT) != 0) S_IFLNK
-               else if ((a & winfs.FILE_ATTRIBUTE_DIRECTORY) != 0) S_IFDIR
+    if (a == fs.INVALID_FILE_ATTRIBUTES) { return failWith(ENOENT); }
+    let mode = if ((a & fs.FILE_ATTRIBUTE_REPARSE_POINT) != 0) S_IFLNK
+               else if ((a & fs.FILE_ATTRIBUTE_DIRECTORY) != 0) S_IFDIR
                else S_IFREG;
     bytes.write_u16(buf, STAT_MODE_OFF(), mode as long);
     return 0;
@@ -325,17 +325,17 @@ pub fn lstat(path: ptr, buf: ptr): int {
 pub fn getcwd(buf: ptr, size: long): ptr {
     let cap = (size as int) / 2;
     let w = bytes.alloc(cap * 2);
-    let n = winfs.GetCurrentDirectoryW(cap, w);
+    let n = fs.GetCurrentDirectoryW(cap, w);
     if (n <= 0 || n > cap) { bytes.free(w); return 0 as ptr; }
-    let written = winfs.narrowInto(w, buf, size as int);
+    let written = fs.narrowInto(w, buf, size as int);
     bytes.free(w);
     return if (written > 0) buf else (0 as ptr);
 }
 
 pub fn chdir(path: ptr): int {
-    let w = winfs.widen(path);
+    let w = fs.widen(path);
     if (w == (0 as ptr)) { return -1; }
-    let r = winfs.SetCurrentDirectoryW(w);
+    let r = fs.SetCurrentDirectoryW(w);
     bytes.free(w);
     return if (r != 0) 0 else fail();
 }
@@ -371,14 +371,14 @@ pub fn opendir(path: ptr): ptr {
     bytes.write_byte(pat, p, 42);      // '*'
     bytes.write_byte(pat, p + 1, 0);
 
-    let w = winfs.widen(pat);
+    let w = fs.widen(pat);
     bytes.free(pat);
     if (w == (0 as ptr)) { return 0 as ptr; }
 
     let d = bytes.alloc(DIR_RECORD_SIZE);
-    let h = winfs.FindFirstFileW(w, (d as long) + (DIR_DATA_OFF as long));
+    let h = fs.FindFirstFileW(w, (d as long) + (DIR_DATA_OFF as long));
     bytes.free(w);
-    if (h == winfs.INVALID_HANDLE) { bytes.free(d); return 0 as ptr; }
+    if (h == fs.INVALID_HANDLE) { bytes.free(d); return 0 as ptr; }
     bytes.write_ptr(d, DIR_FIND_OFF, h);
     bytes.write_i32(d, DIR_PENDING_OFF, 1);
     return d;
@@ -387,25 +387,25 @@ pub fn opendir(path: ptr): ptr {
 pub fn readdir(dir: ptr): ptr {
     if (dir == (0 as ptr)) { return 0 as ptr; }
     let h = bytes.read_ptr(dir, DIR_FIND_OFF);
-    if (h == winfs.INVALID_HANDLE) { return 0 as ptr; }
+    if (h == fs.INVALID_HANDLE) { return 0 as ptr; }
 
     if (bytes.read_i32(dir, DIR_PENDING_OFF) == 0) {
         // Exhausted when FindNextFileW fails (ERROR_NO_MORE_FILES).
-        if (winfs.FindNextFileW(h, (dir as long) + (DIR_DATA_OFF as long)) == 0) { return 0 as ptr; }
+        if (fs.FindNextFileW(h, (dir as long) + (DIR_DATA_OFF as long)) == 0) { return 0 as ptr; }
     }
     bytes.write_i32(dir, DIR_PENDING_OFF, 0);
 
     let ent = (dir as long) + (DIR_ENT_OFF as long);
     let name = (ent + (DIRENT_NAME_OFF() as long)) as ptr;
-    let src = ((dir as long) + (DIR_DATA_OFF as long) + (winfs.FIND_DATA_NAME_OFF as long)) as ptr;
-    if (winfs.narrowInto(src, name, DIR_NAME_CAP) == 0) { bytes.write_byte(name, 0, 0); }
+    let src = ((dir as long) + (DIR_DATA_OFF as long) + (fs.FIND_DATA_NAME_OFF as long)) as ptr;
+    if (fs.narrowInto(src, name, DIR_NAME_CAP) == 0) { bytes.write_byte(name, 0, 0); }
     return ent as ptr;
 }
 
 pub fn closedir(dir: ptr): int {
     if (dir == (0 as ptr)) { return -1; }
     let h = bytes.read_ptr(dir, DIR_FIND_OFF);
-    if (h != winfs.INVALID_HANDLE) { winfs.FindClose(h); }
+    if (h != fs.INVALID_HANDLE) { fs.FindClose(h); }
     bytes.free(dir);
     return 0;
 }
@@ -417,7 +417,7 @@ pub fn setenv(name: ptr, value: ptr, overwrite: int): int {
         let cur = getenv(name);
         if (cur != (0 as ptr)) { return 0; }
     }
-    return if (winfs._putenv_s(name, value) == 0) 0 else -1;
+    return if (fs._putenv_s(name, value) == 0) 0 else -1;
 }
 
 // --- sockets ---------------------------------------------------------------------------------
@@ -532,13 +532,13 @@ pub fn setReusePort(fd: int): int {
 // is the Windows equivalent of an anonymous private mmap; it returns null (not MAP_FAILED) on error.
 pub fn mmap(addr: ptr, length: long, prot: int, flags: int, fd: int, offset: long): ptr {
     if (length <= (0 as long)) { return -1 as ptr; }
-    let p = winfs.VirtualAlloc(0 as ptr, length, winfs.MEM_COMMIT | winfs.MEM_RESERVE, winfs.PAGE_READWRITE);
+    let p = fs.VirtualAlloc(0 as ptr, length, fs.MEM_COMMIT | fs.MEM_RESERVE, fs.PAGE_READWRITE);
     return if (p == (0 as ptr)) (-1 as ptr) else p;
 }
 
 // MEM_RELEASE requires the original base pointer and a size of 0.
 pub fn munmap(addr: ptr, length: long): int {
-    return if (winfs.VirtualFree(addr, 0 as long, winfs.MEM_RELEASE) != 0) 0 else -1;
+    return if (fs.VirtualFree(addr, 0 as long, fs.MEM_RELEASE) != 0) 0 else -1;
 }
 
 pub fn mapAnon(length: long): ptr {

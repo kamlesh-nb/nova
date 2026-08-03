@@ -14,8 +14,8 @@
 
 import bytes;
 import os.socket;
-import os.winsock;
-import os.windows;
+import os.windows.winsock;
+import os.windows.win32;
 
 // Reserved completion keys, posted by the C runtime rather than produced by an I/O completion.
 // These MUST match NOVA_WAKE_KEY / NOVA_TIMER_KEY in src/runtime/concurrency.cpp: a real I/O
@@ -138,7 +138,7 @@ fn issue(op: long): int {
 // Associate a socket with a completion port (once, before its first overlapped I/O). Returns the port
 // handle (or 0 on failure). POSIX backends provide a no-op equivalent so callers can invoke it uniformly.
 pub fn associate(port: long, fd: int): long {
-    return windows.CreateIoCompletionPort(fd as long, port, fd as long, 0);
+    return win32.CreateIoCompletionPort(fd as long, port, fd as long, 0);
 }
 
 // submit free fn (reactorio path). Unlike the Poller method this has no state to memoize in, so the
@@ -150,7 +150,7 @@ pub fn submit(kq: int, op: long): int {
     // on the hottest path in the server for nothing. The memo is cleared on close (see cancelRead),
     // which is what keeps it safe: a recycled SOCKET number must not inherit "already associated".
     if (fd >= 0 && nova_iocp_mark_associated(fd) != 0) {
-        windows.CreateIoCompletionPort(fd as long, kq as long, fd as long, 0);
+        win32.CreateIoCompletionPort(fd as long, kq as long, fd as long, 0);
     }
     return issue(op);
 }
@@ -186,7 +186,7 @@ pub fn abandonOp(kq: int, op: long): bool {
     bytes.write_i32(op, 52, OP_ABANDONED as long);   // done := abandoned
     bytes.write_ptr(op, 56, 0);                      // token := none; resume nobody
     let fd = opFd(op);
-    if (fd >= 0) { windows.CancelIoEx(fd as long, op as ptr); }
+    if (fd >= 0) { win32.CancelIoEx(fd as long, op as ptr); }
     return true;   // the completion owns it now
 }
 
@@ -235,7 +235,7 @@ fn armZeroByte(kq: int, fd: int, token: long, kind: int): int {
     if (fd < 0) { return -1; }
     // The socket must be joined to the port before any overlapped op, exactly as for real I/O.
     if (nova_iocp_mark_associated(fd) != 0) {
-        windows.CreateIoCompletionPort(fd as long, kq as long, fd as long, 0);
+        win32.CreateIoCompletionPort(fd as long, kq as long, fd as long, 0);
     }
 
     let op = nova_reactor_arm_get(fd);
@@ -271,7 +271,7 @@ fn dropArm(fd: int): void {
         // OVERLAPPED the kernel is holding. It stays in the per-fd arm map, so it is reused the next
         // time this fd is armed rather than leaked, and nothing can recycle it under a live op.
         setArmed(op, 0);
-        if (fd >= 0) { windows.CancelIoEx(fd as long, op as ptr); }
+        if (fd >= 0) { win32.CancelIoEx(fd as long, op as ptr); }
     }
 }
 pub fn cancelWrite(kq: int, fd: int): void { dropArm(fd); }
@@ -281,7 +281,7 @@ pub fn cancelWrite(kq: int, fd: int): void { dropArm(fd); }
 pub fn waitReady(kq: int, eventBuf: long, maxEvents: int, timeoutMs: int): int {
     let removed = bytes.alloc(4);
     bytes.write_i32(removed, 0, 0);
-    let ok = windows.GetQueuedCompletionStatusEx(kq as long, eventBuf as ptr, maxEvents, removed, timeoutMs, 0);
+    let ok = win32.GetQueuedCompletionStatusEx(kq as long, eventBuf as ptr, maxEvents, removed, timeoutMs, 0);
     let n = if (ok != 0) (bytes.read_i32(removed, 0) as int) else 0;
     bytes.free(removed);
     return n;
@@ -291,18 +291,18 @@ pub fn waitReady(kq: int, eventBuf: long, maxEvents: int, timeoutMs: int): int {
 // handle in lpOverlapped, a wake carries nothing, and an I/O completion carries the op record whose
 // byte count is written back before its token is returned.
 pub fn evToken(eventBuf: long, i: int): long {
-    let key = windows.entryKey(eventBuf, i);
-    let ov = windows.entryOverlapped(eventBuf, i);
+    let key = win32.entryKey(eventBuf, i);
+    let ov = win32.entryOverlapped(eventBuf, i);
     if (key == TIMER_KEY) { return ov; }
     if (key == WAKE_KEY) { return 0 as long; }
     if (ov == (0 as long)) { return 0 as long; }
-    setOpResult(ov, windows.entryBytes(eventBuf, i));
+    setOpResult(ov, win32.entryBytes(eventBuf, i));
     return opToken(ov);
 }
 
 // `associate` keys each socket by its fd, so the completion key IS the fd for real I/O.
 pub fn evFd(eventBuf: long, i: int): int {
-    let key = windows.entryKey(eventBuf, i);
+    let key = win32.entryKey(eventBuf, i);
     if (key == TIMER_KEY || key == WAKE_KEY) { return -1; }
     return key as int;
 }
@@ -311,7 +311,7 @@ pub fn evFd(eventBuf: long, i: int): int {
 // (kqueue reports it in the event; IOCP does not). FIONREAD is Winsock's spelling.
 const FIONREAD: long = 1074030207;   // 0x4004667F
 pub fn evBytes(eventBuf: long, i: int): long {
-    let n = windows.entryBytes(eventBuf, i) as long;
+    let n = win32.entryBytes(eventBuf, i) as long;
     if (n > (0 as long)) { return n; }
     let fd = evFd(eventBuf, i);
     if (fd < 0) { return 0 as long; }
@@ -323,7 +323,7 @@ pub fn evBytes(eventBuf: long, i: int): long {
     return avail;
 }
 // A completed zero-byte read on a stream socket is the peer's orderly shutdown, as on POSIX.
-pub fn evEof(eventBuf: long, i: int): bool { return windows.entryBytes(eventBuf, i) == 0; }
+pub fn evEof(eventBuf: long, i: int): bool { return win32.entryBytes(eventBuf, i) == 0; }
 pub fn evFilterAt(eventBuf: long, i: int): int { return 0; }
 
 pub trait EventLoop {
@@ -346,11 +346,11 @@ pub struct Poller impl EventLoop {
 
     init(maxEvents: int) {
         winsock.startup();
-        self.port = windows.CreateIoCompletionPort(windows.INVALID_HANDLE, 0, 0, 0);
+        self.port = win32.CreateIoCompletionPort(win32.INVALID_HANDLE, 0, 0, 0);
         self.kq = self.port as int;
         self.maxEvents = maxEvents;
         nova_io_watchdog_start();
-        self.eventBuf = bytes.alloc(maxEvents * windows.OVERLAPPED_ENTRY_SIZE);
+        self.eventBuf = bytes.alloc(maxEvents * win32.OVERLAPPED_ENTRY_SIZE);
         self.compBuf = bytes.alloc(maxEvents * 8);
         self.removedBuf = bytes.alloc(4);
         self.nComp = 0;
@@ -370,7 +370,7 @@ pub struct Poller impl EventLoop {
         // recycled SOCKET number matching a stale slot read as "already associated" and its
         // completions were then delivered nowhere.
         if (nova_iocp_mark_associated(fd) != 0) {
-            windows.CreateIoCompletionPort(fd as long, self.port, fd as long, 0);
+            win32.CreateIoCompletionPort(fd as long, self.port, fd as long, 0);
         }
     }
 
@@ -382,13 +382,13 @@ pub struct Poller impl EventLoop {
     fn poll(self: Poller, timeoutMs: int): int {
         self.nComp = 0;
         bytes.write_i32(self.removedBuf, 0, 0);
-        let ok = windows.GetQueuedCompletionStatusEx(self.port, self.eventBuf, self.maxEvents, self.removedBuf, timeoutMs, 0);
+        let ok = win32.GetQueuedCompletionStatusEx(self.port, self.eventBuf, self.maxEvents, self.removedBuf, timeoutMs, 0);
         if (ok != 0) {
             let n = bytes.read_i32(self.removedBuf, 0) as int;
             let i = 0;
             while (i < n) {
-                let key = windows.entryKey(self.eventBuf, i);
-                let ov = windows.entryOverlapped(self.eventBuf, i);
+                let key = win32.entryKey(self.eventBuf, i);
+                let ov = win32.entryOverlapped(self.eventBuf, i);
                 if (key == TIMER_KEY) {
                     // A reactor timer fire posted by the runtime: lpOverlapped IS the coroutine
                     // handle, not an op record, so it is resumed directly with no result to write.
@@ -408,7 +408,7 @@ pub struct Poller impl EventLoop {
                         nova_op_free(ov);
                     } else {
                         setArmed(ov, 0);   // this record's overlapped op is finished
-                        setOpResult(ov, windows.entryBytes(self.eventBuf, i));
+                        setOpResult(ov, win32.entryBytes(self.eventBuf, i));
                         bytes.write_ptr(self.compBuf, (self.nComp * 8) as long, opToken(ov));
                         self.nComp = self.nComp + 1;
                     }
@@ -427,6 +427,6 @@ pub struct Poller impl EventLoop {
         if (self.eventBuf != 0) { bytes.free(self.eventBuf); self.eventBuf = 0; }
         if (self.compBuf != 0) { bytes.free(self.compBuf); self.compBuf = 0; }
         if (self.removedBuf != 0) { bytes.free(self.removedBuf); self.removedBuf = 0; }
-        if (self.port != (0 as long)) { windows.CloseHandle(self.port); self.port = 0; }
+        if (self.port != (0 as long)) { win32.CloseHandle(self.port); self.port = 0; }
     }
 }

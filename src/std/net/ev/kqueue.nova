@@ -16,7 +16,7 @@
 
 import bytes;
 import os.socket;
-import os.kqueue;
+import os.darwin.kqueue;
 
 // Op kinds.
 pub const OP_RECV: int = 0;
