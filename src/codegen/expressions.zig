@@ -2868,15 +2868,20 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 defer self.allocator.free(full_name);
                 var fn_val_opt: ?types.LLVMValueRef = self.func_map.get(full_name) orelse self.func_map.get(fa.field);
                 if (fn_val_opt == null) {
+                    // Deterministically pick the SHORTEST key ending in "_<full_name>" (the most-direct
+                    // module match). Returning the first hashmap hit was order-dependent: "net_url_parse"
+                    // and "net_url_test_url_parse" both end in "_url_parse", so adding modules could flip
+                    // `url.parse` to `url.test_url_parse`.
+                    var best_len: usize = std.math.maxInt(usize);
                     var iter = self.func_map.iterator();
                     while (iter.next()) |entry| {
                         const key = entry.key_ptr.*;
                         const suffix_len = full_name.len + 1;
                         if (key.len >= suffix_len) {
                             const suffix = key[key.len - suffix_len..];
-                            if (suffix[0] == '_' and std.mem.eql(u8, suffix[1..], full_name)) {
+                            if (suffix[0] == '_' and std.mem.eql(u8, suffix[1..], full_name) and key.len < best_len) {
+                                best_len = key.len;
                                 fn_val_opt = entry.value_ptr.*;
-                                break;
                             }
                         }
                     }
@@ -3902,14 +3907,32 @@ pub fn getFunc(self: *LlvmCompiler, name: []const u8) ?types.LLVMValueRef {
         }
     }
     if (self.func_map.get(name)) |v| return v;
+    // Fuzzy fallback: `name` is often a partly-qualified symbol (e.g. "url_parse" for `url.parse`) whose
+    // fully-mangled key is "net_url_parse". Several functions can share a trailing segment --
+    // "net_url_parse" and "net_url_test_url_parse" both end in "url_parse" -- so returning the FIRST
+    // hashmap key that ends in `name` is ambiguous AND order-dependent (adding modules reorders the map,
+    // which silently flipped `url.parse` to `url.test_url_parse`). Resolve deterministically: among keys
+    // ending in `name` at a '_' segment boundary, take the SHORTEST (the most-direct match -- fewest
+    // extra prefix segments). Fall back to the shortest plain-endsWith match only if none has the '_'
+    // boundary.
+    var best: ?types.LLVMValueRef = null;
+    var best_len: usize = std.math.maxInt(usize);
+    var best_bounded: ?types.LLVMValueRef = null;
+    var best_bounded_len: usize = std.math.maxInt(usize);
     var iter = self.func_map.iterator();
     while (iter.next()) |entry| {
         const key = entry.key_ptr.*;
-        if (std.mem.endsWith(u8, key, name)) {
-            return entry.value_ptr.*;
+        if (!std.mem.endsWith(u8, key, name)) continue;
+        if (key.len < best_len) {
+            best_len = key.len;
+            best = entry.value_ptr.*;
+        }
+        if (key.len > name.len and key[key.len - name.len - 1] == '_' and key.len < best_bounded_len) {
+            best_bounded_len = key.len;
+            best_bounded = entry.value_ptr.*;
         }
     }
-    return null;
+    return best_bounded orelse best;
 }
 
 pub fn resolveReifyTypeName(self: *LlvmCompiler, type_ref: ast.TypeRef) anyerror![]const u8 {

@@ -1653,28 +1653,37 @@ pub const LlvmCompiler = struct {
             } else if (self.func_map.get(cap_full_name)) |_| {
                 resolved_name = cap_full_name;
             } else {
+                // `full_name` is the partly-qualified "<alias>_<field>" (e.g. "url_parse"); its fully
+                // mangled key is "net_url_parse". Several functions can share that trailing segment --
+                // "net_url_parse" and "net_url_test_url_parse" both end in "_url_parse" -- so taking the
+                // FIRST hashmap key that ends in it is ambiguous AND order-dependent: adding modules
+                // reorders the map and silently rebinds `url.parse` to `url.test_url_parse`. Pick the
+                // SHORTEST matching key deterministically (the most-direct match, fewest extra prefix
+                // segments). Try full_name first, then the capitalized variant.
+                var best_len: usize = std.math.maxInt(usize);
                 var iter = self.func_map.iterator();
                 while (iter.next()) |entry| {
                     const key = entry.key_ptr.*;
                     const suffix_len = full_name.len + 1;
                     if (key.len >= suffix_len) {
                         const suffix = key[key.len - suffix_len..];
-                        if (suffix[0] == '_' and std.mem.eql(u8, suffix[1..], full_name)) {
+                        if (suffix[0] == '_' and std.mem.eql(u8, suffix[1..], full_name) and key.len < best_len) {
+                            best_len = key.len;
                             resolved_name = key;
-                            break;
                         }
                     }
                 }
                 if (resolved_name == null) {
+                    best_len = std.math.maxInt(usize);
                     iter = self.func_map.iterator();
                     while (iter.next()) |entry| {
                         const key = entry.key_ptr.*;
                         const suffix_len = cap_full_name.len + 1;
                         if (key.len >= suffix_len) {
                             const suffix = key[key.len - suffix_len..];
-                            if (suffix[0] == '_' and std.mem.eql(u8, suffix[1..], cap_full_name)) {
+                            if (suffix[0] == '_' and std.mem.eql(u8, suffix[1..], cap_full_name) and key.len < best_len) {
+                                best_len = key.len;
                                 resolved_name = key;
-                                break;
                             }
                         }
                     }
