@@ -5,7 +5,7 @@
 import assert;
 import bytes;
 import os.sys;
-import os.kqueue;
+import os.darwin.kqueue;
 
 @test
 fn test_kqueue_read_readiness(): void {

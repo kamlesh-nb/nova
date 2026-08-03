@@ -5,7 +5,7 @@
 // those symbols are dropped by globalDCE because nothing here calls them.
 import assert;
 import bytes;
-import os.epoll;
+import os.linux.epoll;
 
 @test
 fn test_epoll_event_build_and_read(): void {
