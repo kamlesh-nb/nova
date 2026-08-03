@@ -387,6 +387,17 @@ fn targetVariantPath(path: []const u8, os_tag: []const u8, arch: []const u8, is_
         }
     }.go;
 
+    // Mechanism-named backends: the net/eventloop module is selected by MECHANISM (kqueue/epoll/iocp),
+    // not by an os/ folder, so it maps to net/ev/<mechanism>.nova per target. The module identity stays
+    // `net/eventloop` (the caller's base path), so importers' `eventloop.X` still resolves. io_uring is
+    // runtime-dispatched inside the linux (epoll) unit, so linux -> net/ev/epoll.nova.
+    if (std.mem.eql(u8, dir, "src/std/net") and std.mem.eql(u8, name, "eventloop")) {
+        const mech: []const u8 = if (std.mem.eql(u8, os_tag, "darwin")) "kqueue" else if (std.mem.eql(u8, os_tag, "windows")) "iocp" else "epoll";
+        if (std.fmt.allocPrint(allocator, "src/std/net/ev/{s}.nova", .{mech}) catch null) |c| {
+            if (tryCand(c, allocator, io, home)) |hit| return hit;
+        }
+    }
+
     // 1. dir/<os>/<arch>/name.nova
     if (std.fmt.allocPrint(allocator, "{s}/{s}/{s}/{s}.nova", .{ dir, os_tag, arch, name }) catch null) |c| {
         if (tryCand(c, allocator, io, home)) |hit| return hit;
