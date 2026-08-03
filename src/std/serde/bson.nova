@@ -252,6 +252,20 @@ pub fn serialize(doc: BsonDocument): ptr {
     return ptr;
 }
 
+fn hexNibbleCh(v: int): int { if (v < 10) { return 48 + v; } return 97 + (v - 10); }
+// A 12-byte ObjectId at `off` -> its canonical 24-char lowercase hex string.
+fn objectIdHex(ptr: ptr, off: int): string {
+    let out = bytes.alloc(24);
+    let i = 0;
+    while (i < 12) {
+        let b = bytes.read_byte(ptr, off + i);
+        bytes.write_byte(out, i * 2, hexNibbleCh((b / 16) & 15));
+        bytes.write_byte(out, i * 2 + 1, hexNibbleCh(b & 15));
+        i = i + 1;
+    }
+    return out as string;
+}
+
 pub fn deserialize(ptr: ptr): BsonDocument {
     let doc = BsonDocument{ entries: List<BsonEntry>() };
 
@@ -294,6 +308,18 @@ pub fn deserialize(ptr: ptr): BsonDocument {
             offset = offset + bin_len;
 
             doc.entries.push(BsonEntry{ type_id: 5, key: key, str_val: buf as string, int_val: 0, int_val2: 0, dec_val: 0m });
+        }
+        if (type_byte == 7) {                 // ObjectId: 12 bytes -> 24-hex-char string
+            let oid = objectIdHex(ptr, offset);
+            offset = offset + 12;
+            doc.entries.push(BsonEntry{ type_id: 7, key: key, str_val: oid, int_val: 0, int_val2: 0, dec_val: 0m });
+        }
+        if (type_byte == 9 || type_byte == 17) {   // UTC datetime / timestamp: int64 (ms / packed)
+            let lo = bytes.read_i32(ptr, offset);
+            offset = offset + 4;
+            let hi = bytes.read_i32(ptr, offset);
+            offset = offset + 4;
+            doc.entries.push(entryInt64(key, hi, lo));
         }
         if (type_byte == 16) {
             let val = bytes.read_i32(ptr, offset);
@@ -375,6 +401,14 @@ pub fn docGetString(doc: BsonDocument, index: int): string {
     if (index < 0 || index >= doc.entries.size()) return "";
     let entry = doc.entries.at(index);
     if (entry.type_id != 2) return "";
+    return entry.str_val;
+}
+
+// An ObjectId (type 7) as its 24-char hex string ("" if the entry is not an ObjectId).
+pub fn docGetObjectId(doc: BsonDocument, index: int): string {
+    if (index < 0 || index >= doc.entries.size()) return "";
+    let entry = doc.entries.at(index);
+    if (entry.type_id != 7) return "";
     return entry.str_val;
 }
 
@@ -478,8 +512,11 @@ pub fn validate(ptr: ptr, buf_len: int): int {
             let alen = bytes.read_i32(ptr, offset);
             offset = offset + alen;
         }
+        if (tb == 7) offset = offset + 12;         // ObjectId
         if (tb == 8) offset = offset + 1;
+        if (tb == 9) offset = offset + 8;          // UTC datetime
         if (tb == 16) offset = offset + 4;
+        if (tb == 17) offset = offset + 8;         // timestamp
         if (tb == 18) offset = offset + 8;
     }
     return (offset <= declared_size) ? 1 : 0;
