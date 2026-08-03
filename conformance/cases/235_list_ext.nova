@@ -1,0 +1,46 @@
+// T15: extended List operations (reverse/clear/pop/first/last/findIndex/any/all/indexOf/contains).
+import assert;
+import list;
+
+@test
+fn test_list_reverse_and_pop(): void {
+    let l = List<int>();
+    l.push(1); l.push(2); l.push(3);
+    l.reverse();
+    assert.equalInt(l.at(0), 3);
+    assert.equalInt(l.at(2), 1);
+    assert.equalInt(l.pop() ?? -1, 1);   // last after reverse
+    assert.equalInt(l.size(), 2);
+    l.clear();
+    assert.equalInt(l.size(), 0);
+    assert.isTrue((l.last() ?? -99) == -99);   // empty
+}
+
+@test
+fn test_list_indexOf_contains_int(): void {
+    let l = List<int>();
+    l.push(10); l.push(20); l.push(30);
+    assert.equalInt(l.indexOf(20), 1);
+    assert.equalInt(l.indexOf(99), -1);
+    assert.isTrue(l.contains(30));
+    assert.isTrue(!l.contains(40));
+}
+
+@test
+fn test_list_indexOf_contains_str(): void {
+    let l = List<string>();
+    l.push("a"); l.push("b"); l.push("c");
+    assert.equalInt(l.indexOf("b"), 1);
+    assert.isTrue(l.contains("c"));
+    assert.isTrue(!l.contains("z"));
+}
+
+@test
+fn test_list_predicates(): void {
+    let l = List<int>();
+    l.push(2); l.push(4); l.push(6);
+    assert.isTrue(l.all((x) => x % 2 == 0));
+    assert.isTrue(l.any((x) => x > 5));
+    assert.isTrue(!l.any((x) => x > 10));
+    assert.equalInt(l.findIndex((x) => x == 4), 1);
+}

@@ -130,6 +130,68 @@ pub struct List<T> {
         return result;
     }
 
+    // Reverse in place.
+    pub fn reverse(self: List<T>): void {
+        let i = 0;
+        let j = self.len - 1;
+        while (i < j) {
+            let tmp = self.data.get(i);
+            self.data.set(i, self.data.get(j));
+            self.data.set(j, tmp);
+            i = i + 1;
+            j = j - 1;
+        }
+    }
+
+    // Empty the list (drops the length; the backing store is reused).
+    pub fn clear(self: List<T>): void { self.len = 0; }
+
+    pub fn first(self: List<T>): T | undefined {
+        if (self.len == 0) { return undefined; }
+        return self.data.get(0);
+    }
+    pub fn last(self: List<T>): T | undefined {
+        if (self.len == 0) { return undefined; }
+        return self.data.get(self.len - 1);
+    }
+    // Remove and return the last element (undefined if empty).
+    pub fn pop(self: List<T>): T | undefined {
+        if (self.len == 0) { return undefined; }
+        let v = self.data.get(self.len - 1);
+        self.len = self.len - 1;
+        return v;
+    }
+
+    // First index whose element satisfies `pred`, or -1.
+    pub fn findIndex(self: List<T>, pred: (T) => bool): int {
+        let i = 0;
+        while (i < self.len) {
+            if (pred(self.data.get(i))) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+    pub fn any(self: List<T>, pred: (T) => bool): bool { return self.findIndex(pred) != -1; }
+    pub fn all(self: List<T>, pred: (T) => bool): bool {
+        let i = 0;
+        while (i < self.len) {
+            if (!pred(self.data.get(i))) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    // Index of the first element equal to `value` (requires T to support ==), or -1.
+    pub fn indexOf(self: List<T>, value: T): int {
+        let i = 0;
+        while (i < self.len) {
+            if (self.data.get(i) == value) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+    pub fn contains(self: List<T>, value: T): bool { return self.indexOf(value) != -1; }
+
 }
 
 @test
