@@ -111,6 +111,42 @@ pub fn insert<T>(conn: Connection, table: string, obj: T): ExecResult {
     return conn.exec(sql, p.vals);
 }
 
+// UPDATE <table> SET col=$n, ... WHERE <keyCol> = $last. The struct's keyCol field becomes the WHERE
+// value (it is NOT written in SET); every other field is a bound SET assignment. Params are bound (T4),
+// so values never reach the SQL text.
+pub fn update<T>(conn: Connection, table: string, obj: T, keyCol: string): ExecResult {
+    let p = ParamSink();
+    serde.dump<T>(obj, p);
+    let sql = "UPDATE " + table + " SET ";
+    let params = List<DbValue>();
+    let keyVal = db.dbNull();
+    let first = true;
+    let i = 0;
+    while (i < p.cols.size()) {
+        let col = p.cols.get(i) ?? "";
+        let v = p.vals.get(i) ?? db.dbNull();
+        if (string.eql(col, keyCol)) {
+            keyVal = v;
+        } else {
+            if (!first) { sql = sql + ", "; }
+            params.push(v);
+            sql = sql + col + " = $" + (params.size());
+            first = false;
+        }
+        i = i + 1;
+    }
+    params.push(keyVal);
+    sql = sql + " WHERE " + keyCol + " = $" + (params.size());
+    return conn.exec(sql, params);
+}
+
+// DELETE FROM <table> WHERE <keyCol> = $1 (the key value is bound).
+pub fn deleteBy(conn: Connection, table: string, keyCol: string, keyVal: DbValue): ExecResult {
+    let params = List<DbValue>();
+    params.push(keyVal);
+    return conn.exec("DELETE FROM " + table + " WHERE " + keyCol + " = $1", params);
+}
+
 pub struct BsonSink impl ValueSink {
     pub doc: bson.BsonDocument,
 

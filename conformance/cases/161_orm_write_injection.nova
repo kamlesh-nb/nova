@@ -90,3 +90,19 @@ fn test_tobson_stores_leaf_values(): void {
     assert.isTrue(bson.docFind(back, "balance") >= 0);
     bytes.free(wire);
 }
+
+@test
+fn test_update_and_delete_sql(): void {
+    // T13: ORM write side -- update SETs non-key columns and WHEREs the key; delete WHEREs the key.
+    let conn = RecordingConn();
+    let u = UserDto{ id: 7, name: "Ada", active: true, balance: 12.50m };
+    let r = orm.update<UserDto>(conn, "users", u, "id");
+    // id is the key -> WHERE; name/active/balance -> SET (in field order).
+    assert.equalStr(conn.lastSql, "UPDATE users SET name = $1, active = $2, balance = $3 WHERE id = $4");
+    assert.equalInt(conn.lastParams.size(), 4);
+    assert.equalInt((conn.lastParams.get(3) ?? db.dbNull()).asLong() as int, 7);  // key value last
+
+    let d = orm.deleteBy(conn, "users", "id", db.dbInt(7));
+    assert.equalStr(conn.lastSql, "DELETE FROM users WHERE id = $1");
+    assert.equalInt((conn.lastParams.get(0) ?? db.dbNull()).asLong() as int, 7);
+}
