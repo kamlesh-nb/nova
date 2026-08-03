@@ -39,6 +39,9 @@ pub struct DbValue {
     pub fn asDouble(self: DbValue): double { return self.f; }
     pub fn asDecimal(self: DbValue): decimal { return self.dec; }
     pub fn asText(self: DbValue): string { return self.s; }
+    // Temporal values are carried as their normalized ISO-8601 text (in `s`) under DbType.Timestamp,
+    // so a driver never lossily forces a date string through parseI64. asTimestamp == asText.
+    pub fn asTimestamp(self: DbValue): string { return self.s; }
 }
 
 pub fn dbNull(): DbValue { return DbValue(DbType.Null, 0, 0.0, 0m, ""); }
@@ -49,6 +52,8 @@ pub fn dbDouble(d: double): DbValue { return DbValue(DbType.Float8, 0, d, 0m, ""
 pub fn dbDecimal(d: decimal): DbValue { return DbValue(DbType.Decimal, 0, 0.0, d, ""); }
 pub fn dbText(s: string): DbValue { return DbValue(DbType.Text, 0, 0.0, 0m, s); }
 pub fn dbBlob(s: string): DbValue { return DbValue(DbType.Blob, 0, 0.0, 0m, s); }
+// A temporal value as normalized ISO-8601 text (date / time / timestamp / timestamptz).
+pub fn dbTimestamp(iso: string): DbValue { return DbValue(DbType.Timestamp, 0, 0.0, 0m, iso); }
 
 pub struct Column {
     pub name: string,
@@ -72,6 +77,7 @@ pub struct Row {
     pub fn getDouble(self: Row, i: int): double { return self.get(i).asDouble(); }
     pub fn getDecimal(self: Row, i: int): decimal { return self.get(i).asDecimal(); }
     pub fn getText(self: Row, i: int): string { return self.get(i).asText(); }
+    pub fn getTimestamp(self: Row, i: int): string { return self.get(i).asTimestamp(); }
 }
 
 pub struct DbError {
