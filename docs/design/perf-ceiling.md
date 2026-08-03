@@ -52,8 +52,29 @@ all memory. Consequences, all measured:
   non-pointer params.
 
 **Verified null result:** switching array loads to the real element type (`double` instead of the i64
-word + bitcast) produced *zero* speedup, confirming the bitcast was never the bottleneck — the
-`inttoptr` barrier is. (That change was reverted; it is only useful once §3.1 lands.)
+word + bitcast) produced *zero* speedup, confirming the bitcast was never the bottleneck. (That change
+was reverted; it is only useful once §3.1 lands.)
+
+**Measured Phase-1 proof (at the LLVM-IR / C level, `opt`/`clang` 21, M1).** Before committing the
+multi-day codegen change, the ceiling and the mechanism were verified directly:
+
+- **The `inttoptr` barrier is real but conditional.** A 3-pointer saxpy (`c[i]=a[i]*s+b[i]`) does **not**
+  vectorize when the arrays are integers cast to pointers (0 vector ops), but **does** with real
+  `double* restrict` params (full NEON). LLVM refuses to insert its runtime alias check on
+  provenance-less (`inttoptr`) pointers. Simpler 1-2 pointer loops sometimes vectorize despite
+  `inttoptr` — so the block is *not* universal; it bites the multi-array kernels that matter
+  (matrix/vector math, stencils, blends).
+- **The compute headroom is ~1.9×.** A compute-bound, L1-resident, elementwise kernel (8th-degree Horner
+  poly) times **353.7 ms vectorized vs 687.0 ms scalar** — i.e. vectorization ≈ 2× (the double-2-wide
+  limit on M1 NEON), which is the ceiling Phase 1 unlocks for compute-bound array loops.
+- **Caveat on magnitude:** memory-bound loops (working set > L2, e.g. saxpy at N=4096) are bandwidth-
+  limited and see *little* from vectorization regardless. The win is on compute-bound, cache-resident
+  array math. So §3.1's payoff is real but workload-dependent — biggest where the array loop is
+  arithmetic-heavy and fits in cache.
+
+Conclusion: §3.1 is worth doing (it reliably unlocks the ~2× on the kernels where it matters), and the
+`inttoptr` diagnosis is confirmed as the mechanism — but the honest expected gain on the *benchmark set*
+is spectral/mandelbrot moving toward parity, not a blanket 2× everywhere.
 
 The i64-word model was a deliberate simplification that made a one-person compiler tractable. Its cost
 is that alias-sensitive optimization is off the table until pointer-typed values flow as LLVM `ptr`.
