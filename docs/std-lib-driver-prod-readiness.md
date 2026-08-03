@@ -370,7 +370,7 @@ test (T16). Next tier is P1 (T6 transactions, T7 pool hardening, ...).
 | T7 | P1 | Pool hardening: max-open cap, acquire timeout + wait queue, validate-on-borrow, maxLifetime, leak detection, thread-safety, reconnect | C7 | pool | [x]* |
 | T8 | P1 | Query-level timeouts + cancellation (connect/statement timeout, PG CancelRequest, TDS ATTENTION) | C9 | seam + all drivers | [~] |
 | T9 | P1 | Per-connection concurrency guard (exclusive checkout / single in-flight) | C8 | seam + pool | [x] |
-| T10 | P1 | Async non-blocking DNS + IPv6 (blocking IPv4 getaddrinfo stalls the loop) | -- | net/eventedio | [ ] |
+| T10 | P1 | Async non-blocking DNS + IPv6 (blocking IPv4 getaddrinfo stalls the loop) | -- | net/eventedio | [~] |
 | T11 | P1 | HTTP client connection pooling / keep-alive (no fresh socket + TLS per request) | -- | web/client | [~] |
 | T12 | P1 | Structured logging framework + metrics/tracing hooks; instrument pool + drivers | -- | new stdlib + pool | [x] |
 | T13 | P2 | DbValue richer types (date/time/uuid/json) + NULL-aware accessors; ORM write side (update/delete/upsert + PK) + streaming results | C6 | seam + orm | [x] |
