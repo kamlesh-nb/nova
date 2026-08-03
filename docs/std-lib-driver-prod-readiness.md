@@ -298,10 +298,23 @@ instead of swallowing it; `ResilientPool` failure detection now keys on `hasErro
 tracked separately: connect-time errors still do not propagate (Driver.connect returns a bare
 Connection) -- that needs a connect error channel and is folded into C1/T8 follow-up.
 
+T2 IN PROGRESS 2026-08-03: added the async STARTTLS client-upgrade seam
+`asynctls.tlsClientUpgrade` / `tlsClientUpgradeVerify` (upgrade an open AsyncStream in place, the
+client analog of tlsAccept; reuses the proven TlsStream + TLS 1.3 memory-BIO the web server runs live
+in case 209). Wired POSTGRES (reference): its reader + connection now hold the `AsyncIO` trait (so the
+transport can be plaintext AsyncStream OR TlsStream), and connect sends SSLRequest + upgrades on 'S',
+selected by DSN `sslmode` (disable default = unchanged / require / verify-full with `sslrootcert`).
+Widening the concrete stream into an AsyncIO param is the safe direction (same pattern as handleConn).
+CAVEAT: the TLS path is COMPILE + ASAN verified only -- no live TLS Postgres server on this host; the
+plaintext default path is unchanged and offline-tested (SSLRequest wire bytes gated in test 66).
+REMAINING T2: mysql (CLIENT_SSL + SSLRequest packet), mssql (turn ON the existing cert verification),
+mongodb (implicit TLS via tlsConnect), btreedb; plus fail-closed enforcement for require/verify-full on
+'N' (blocked on the connect error channel).
+
 | # | Pri | Item | Blocker | Where it lands | Status |
 |---|---|---|---|---|---|
 | T1 | P0 | Error propagation: add `DbError` return/channel; wire each driver's decoder into its read loop | C1 | seam + all 5 drivers | [x] |
-| T2 | P0 | TLS on the SQL data path: TLS `AsyncStream`/BIO in net/aio; SSLRequest (pg), CLIENT_SSL (mysql), cert verify (mssql) | C2 | net/aio + pg/mysql/mssql/mongo/btree | [ ] |
+| T2 | P0 | TLS on the SQL data path: TLS `AsyncStream`/BIO in net/aio; SSLRequest (pg), CLIENT_SSL (mysql), cert verify (mssql) | C2 | net/aio + pg/mysql/mssql/mongo/btree | [~] |
 | T3 | P0 | Correct temporal + special-type decode (ISO dates, mssql FLOAT/DATE*/PLP, bytea hex, BSON ObjectId/datetime) | C5 | pg/mysql/mssql/mongo | [ ] |
 | T4 | P0 | Enforce parameterization: server-side bind, or fix `$1..$9`-only + binary-blob escaping | C4 | pg/mysql/btree + ORM | [ ] |
 | T5 | P0 | mongodb: wire `hello` + `authenticate` into connect; parse `cursor.firstBatch` + getMore | -- | mongodb | [ ] |
