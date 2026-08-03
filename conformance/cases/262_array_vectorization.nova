@@ -1,0 +1,46 @@
+// Correctness of array loops that the compiler now auto-vectorizes: fixed float arrays flow as `ptr`
+// (pointer provenance survives), so LLVM's loop vectorizer (enabled in the release pipeline) turns
+// elementwise double[] loops into NEON/SSE vector code. This gates that the *results* stay correct;
+// the vectorization itself is a codegen optimization. (i64 loop counters vectorize; an i32 counter's
+// sext currently blocks scalar-evolution -- see docs/design/perf-ceiling.md.)
+import assert;
+
+fn saxpy(a: double[64], b: double[64], c: double[64], s: double, n: long): void {
+    let i: long = 0;
+    while (i < n) { c[i] = a[i] * s + b[i]; i = i + 1; }
+}
+
+fn poly(inp: double[64], out: double[64], n: long): void {
+    let i: long = 0;
+    while (i < n) { let v = inp[i]; out[i] = v * v + v; i = i + 1; }
+}
+
+@test
+fn saxpy_correct(): void {
+    let a: double[64] = [1.0; 64];
+    let b: double[64] = [2.0; 64];
+    let c: double[64] = [0.0; 64];
+    saxpy(a, b, c, 3.0, 64);            // 1*3 + 2 = 5, every lane
+    assert.isTrue(c[0] > 4.99 && c[0] < 5.01);
+    assert.isTrue(c[63] > 4.99 && c[63] < 5.01);
+}
+
+@test
+fn poly_correct(): void {
+    let a: double[64] = [0.5; 64];
+    let out: double[64] = [0.0; 64];
+    poly(a, out, 64);                    // 0.5*0.5 + 0.5 = 0.75
+    assert.isTrue(out[0] > 0.74 && out[0] < 0.76);
+    assert.isTrue(out[63] > 0.74 && out[63] < 0.76);
+}
+
+@test
+fn sum_reduction_correct(): void {
+    // a reduction still computes the right total whether or not it vectorizes
+    let a: double[64] = [0.0; 64];
+    let i: long = 0;
+    while (i < 64) { a[i] = (i as double); i = i + 1; }
+    let s = 0.0; let j: long = 0;
+    while (j < 64) { s = s + a[j]; j = j + 1; }
+    assert.isTrue(s > 2015.9 && s < 2016.1);   // 0+1+...+63 = 2016
+}

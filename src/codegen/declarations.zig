@@ -991,10 +991,16 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
                 alloca_val = core.LLVMBuildAlloca(compiler.builder, slot_ty, name_z.ptr);
             }
 
-            const zero = if (core.LLVMGetTypeKind(slot_ty) == .LLVMDoubleTypeKind)
+            // Zero-init the slot with the right kind of null: 0.0 for double, 0 for ints, and a real
+            // null/zeroinitializer for ptr (array) and vector slots -- ConstInt on a non-int type emits
+            // an invalid `i0 0` that poisons the optimizer (blocks vectorization).
+            const zk = core.LLVMGetTypeKind(slot_ty);
+            const zero = if (zk == .LLVMDoubleTypeKind)
                 core.LLVMConstReal(slot_ty, 0)
+            else if (zk == .LLVMIntegerTypeKind)
+                core.LLVMConstInt(slot_ty, 0, 0)
             else
-                core.LLVMConstInt(slot_ty, 0, 0);
+                core.LLVMConstNull(slot_ty);
             _ = core.LLVMBuildStore(compiler.builder, zero, alloca_val);
             try compiler.locals.put(name, alloca_val);
         }
@@ -1275,6 +1281,14 @@ fn emitModule(
     if (!is_wasm) {
         const opts = transform.LLVMCreatePassBuilderOptions();
         defer transform.LLVMDisposePassBuilderOptions(opts);
+        // The C PassBuilder API defaults loop + SLP vectorization OFF, so `default<O3>` was running
+        // without the vectorizer. Enable them (release only) -- now that array values carry pointer
+        // provenance (perf-ceiling.md pt1+pt2), auto-vectorization of array loops can actually fire.
+        if (is_release) {
+            transform.LLVMPassBuilderOptionsSetLoopVectorization(opts, 1);
+            transform.LLVMPassBuilderOptionsSetSLPVectorization(opts, 1);
+            transform.LLVMPassBuilderOptionsSetLoopUnrolling(opts, 1);
+        }
         const passes: [*:0]const u8 = if (is_release) "default<O3>,globaldce" else "default<O0>,globaldce";
         const perr = transform.LLVMRunPasses(module, passes, compiler.target_machine, opts);
         if (perr != null) {

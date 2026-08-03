@@ -1147,24 +1147,22 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     const element_size: usize = 8;
                     const size_val = core.LLVMConstInt(self.val_type, arr.len * element_size, 0);
 
-                    const array_ptr_val = try self.compileAlloc(size_val);
-
+                    // Allocate a real ptr (provenance) and GEP element stores from it -- no inttoptr.
+                    const base = try self.compileAllocArray(size_val);
                     for (arr, 0..) |elem, idx| {
-                        const offset = core.LLVMConstInt(self.val_type, idx * element_size, 0);
                         const val = try self.compileExpression(elem);
-                        const addr = core.LLVMBuildAdd(self.builder, array_ptr_val, offset, "array_elem_addr");
-                        const ptr = core.LLVMBuildIntToPtr(self.builder, addr, self.ptr_type, "array_elem_ptr");
-                        _ = core.LLVMBuildStore(self.builder, val, ptr);
+                        var gi = [_]types.LLVMValueRef{core.LLVMConstInt(self.val_type, idx, 0)};
+                        const ep = core.LLVMBuildInBoundsGEP2(self.builder, self.val_type, base, &gi, 1, "array_elem_ptr");
+                        _ = core.LLVMBuildStore(self.builder, self.coerceToSlotType(val, self.val_type), ep);
                     }
-
-                    return array_ptr_val;
+                    return base;
                 },
                 .array_repeat => |ar| {
                     // [value; count] : allocate count 8-byte slots, evaluate value ONCE, fill via a
                     // runtime loop (LLVM lowers a constant-value fill to a memset).
                     const element_size: usize = 8;
                     const size_val = core.LLVMConstInt(self.val_type, ar.count * element_size, 0);
-                    const array_ptr_val = try self.compileAlloc(size_val);
+                    const array_ptr_val = try self.compileAllocArray(size_val); // real ptr (provenance)
                     const fill_val = self.coerceToSlotType(try self.compileExpression(ar.value.*), self.val_type);
 
                     const cur_fn = core.LLVMGetBasicBlockParent(core.LLVMGetInsertBlock(self.builder));
@@ -1181,10 +1179,8 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     _ = core.LLVMBuildCondBr(self.builder, cond, body_bb, done_bb);
 
                     core.LLVMPositionBuilderAtEnd(self.builder, body_bb);
-                    const es_val = core.LLVMConstInt(self.val_type, element_size, 0);
-                    const off = core.LLVMBuildMul(self.builder, iv, es_val, "arr_rep_off");
-                    const addr = core.LLVMBuildAdd(self.builder, array_ptr_val, off, "arr_rep_addr");
-                    const slot = core.LLVMBuildIntToPtr(self.builder, addr, self.ptr_type, "arr_rep_slot");
+                    var gidx = [_]types.LLVMValueRef{iv};
+                    const slot = core.LLVMBuildInBoundsGEP2(self.builder, self.val_type, array_ptr_val, &gidx, 1, "arr_rep_slot");
                     _ = core.LLVMBuildStore(self.builder, fill_val, slot);
                     const next = core.LLVMBuildAdd(self.builder, iv, core.LLVMConstInt(self.val_type, 1, 0), "arr_rep_next");
                     _ = core.LLVMBuildBr(self.builder, head_bb);

@@ -255,6 +255,13 @@ long long nova_bytes_alloc(long long size) {
   return (long long)(curr + NOVA_OBJ_HEADER_SIZE);
 }
 
+// Same allocation as nova_bytes_alloc, but returns a real pointer so codegen keeps pointer provenance
+// for fixed arrays (perf: lets LLVM disambiguate arrays and vectorize/hoist array loops). See
+// docs/design/perf-ceiling.md.
+extern "C" void *nova_array_alloc(long long size) {
+  return (void *)nova_bytes_alloc(size);
+}
+
 extern "C" void nova_release(long long ptr_val, void (*destructor)(long long));
 
 extern "C" long long nova_any_box(long long payload, long long dtor) {

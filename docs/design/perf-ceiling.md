@@ -145,8 +145,25 @@ exactly those boundaries — do not let the i64 leak back into the hot path.
       mandelbrot's byte buffer won't vectorize regardless; the clean win is on elementwise float kernels).
 - [ ] Corpus green, ASAN-clean, ARC gate unchanged.
 
-**Tracking:** 🔨 Part 1 landed (ptr slots/params/access + ptr↔i64 coerce), corpus 254/254 + ASAN clean.
-Part 2 (allocator returns `ptr`) is the remaining core for the vectorization payoff.
+- [x] **Part 2 landed** — array construction returns a real `ptr` (`nova_array_alloc`), element stores
+      GEP from it. Provenance is now pure ptr from alloc → slot → access.
+- [x] **Auto-vectorization enabled** — the release pass pipeline set neither loop nor SLP vectorization
+      (C PassBuilder API defaults them OFF), and the TargetMachine used CPU `"generic"` (pessimistic
+      cost model). Now: `SetLoopVectorization`/`SetSLPVectorization(1)` + host CPU/features on native.
+- [x] **i0 zero-init bug fixed** — local slot zero-init did `LLVMConstInt(ptr_ty, 0)` → invalid `i0 0`
+      (exposed by the new ptr slots), which poisoned the optimizer. Now `ConstNull` for ptr/vector slots.
+- [x] `double[]` loops **auto-vectorize** — a Nova poly/saxpy kernel emits `.2d` NEON vector ops; a
+      compute-bound poly kernel is **~7× faster** (51 ms vs 357 ms scalar). Corpus 254/254, ASAN-clean.
+      Case `262_array_vectorization`.
+
+**Tracking:** ✅ Part 1 + Part 2 + auto-vectorization landed. Array float loops with **i64 counters**
+vectorize and run ~7× the scalar version. Corpus 254/254 + ASAN clean.
+
+**One follow-on remains for the benchmark set:** an **i32 loop counter** (`let i = 0`, Nova's default
+`int`) updates via a `sext i32→i64` in the induction variable, which defeats LLVM's scalar-evolution so
+the loop won't vectorize. `let i: long = 0` sidesteps it and vectorizes today. The general fix is F3-5
+(honest i64 loop counters / eliminate the IV sext) — that would make `int`-counter array loops vectorize
+without the annotation, which is what most of the benchmark kernels (spectral, nsieve) use.
 
 **Root-cause note discovered while implementing:** the provenance chain must be *pure `ptr`* from the
 allocation through the slot to the GEP — any `ptrtoint`/`inttoptr` round-trip in between launders the

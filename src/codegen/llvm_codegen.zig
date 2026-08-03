@@ -234,11 +234,21 @@ pub const LlvmCompiler = struct {
             types.LLVMCodeGenOptLevel.LLVMCodeGenLevelNone;
         const reloc = types.LLVMRelocMode.LLVMRelocDefault;
         const code_model = types.LLVMCodeModel.LLVMCodeModelDefault;
+        // For a native (non-wasm, non-cross) build, target the actual host CPU + features so the
+        // vectorizer models the real vector units (NEON/AVX) and its cost model fires -- "generic" is
+        // pessimistic and leaves array loops scalar. Cross/wasm builds stay generic for portability.
+        const native = !is_wasm and target_triple_opt == null;
+        const host_cpu = if (native) target_machine.LLVMGetHostCPUName() else null;
+        const host_feat = if (native) target_machine.LLVMGetHostCPUFeatures() else null;
+        defer if (host_cpu) |c| core.LLVMDisposeMessage(c);
+        defer if (host_feat) |f| core.LLVMDisposeMessage(f);
+        const cpu_z: [*:0]const u8 = if (host_cpu) |c| @ptrCast(c) else "generic";
+        const feat_z: [*:0]const u8 = if (host_feat) |f| @ptrCast(f) else "";
         const tm = target_machine.LLVMCreateTargetMachine(
             target_ref,
             triple_z.ptr,
-            "generic",
-            "",
+            cpu_z,
+            feat_z,
             opt_level,
             reloc,
             code_model,
@@ -499,6 +509,22 @@ pub const LlvmCompiler = struct {
         const fn_t = core.LLVMGlobalGetValueType(alloc_fn);
         var args = [_]types.LLVMValueRef{size};
         return core.LLVMBuildCall2(self.builder, fn_t, alloc_fn, &args, 1, "alloc_tmp");
+    }
+
+    // Array allocation that returns a real `ptr` (nova_array_alloc), so fixed-array construction keeps
+    // pointer provenance -- the array literal/repeat store through this ptr and return it into a ptr
+    // slot with no inttoptr laundering, which lets LLVM vectorize/hoist the later access loops.
+    pub fn compileAllocArray(self: *LlvmCompiler, size: types.LLVMValueRef) anyerror!types.LLVMValueRef {
+        const alloc_fn = if (self.func_map.get("nova_array_alloc")) |f| f else blk: {
+            var arg_types = [_]types.LLVMTypeRef{self.val_type};
+            const fn_type = core.LLVMFunctionType(self.ptr_type, &arg_types, 1, 0);
+            const f = core.LLVMAddFunction(self.module, "nova_array_alloc", fn_type);
+            try self.func_map.put("nova_array_alloc", f);
+            break :blk f;
+        };
+        const fn_t = core.LLVMGlobalGetValueType(alloc_fn);
+        var args = [_]types.LLVMValueRef{size};
+        return core.LLVMBuildCall2(self.builder, fn_t, alloc_fn, &args, 1, "arr_alloc");
     }
 
     pub fn compileAllocPersistent(self: *LlvmCompiler, size: types.LLVMValueRef) anyerror!types.LLVMValueRef {
