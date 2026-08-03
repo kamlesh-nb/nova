@@ -1,0 +1,66 @@
+// Explicit SIMD: the f64x4 vector type over LLVM <4 x double>. Vector locals live in their own vector
+// slots (slotTypeForLocalId maps "f64x4"), so simd.* ops lower to NEON/SSE vector instructions.
+// API: splat4/make4 construct, load4/store4 move 4 lanes to/from a double[], add4/sub4/mul4/div4/fma4
+// compute, sum4 reduces to a scalar. Value type (never ARC-owned).
+import assert;
+
+@test
+fn make_and_sum(): void {
+    let v: f64x4 = simd.make4(1.0, 2.0, 3.0, 4.0);
+    let s = simd.sum4(v);
+    assert.isTrue(s > 9.99 && s < 10.01);          // 1+2+3+4
+}
+
+@test
+fn splat_and_add(): void {
+    let a: f64x4 = simd.splat4(3.0);
+    let b: f64x4 = simd.splat4(4.0);
+    let c: f64x4 = simd.add4(a, b);
+    let s = simd.sum4(c);
+    assert.isTrue(s > 27.99 && s < 28.01);         // (3+4)*4
+}
+
+@test
+fn mul_sub_div(): void {
+    let a: f64x4 = simd.make4(2.0, 4.0, 6.0, 8.0);
+    let b: f64x4 = simd.splat4(2.0);
+    let m = simd.sum4(simd.mul4(a, b));            // (2+4+6+8)*2 = 40
+    let d = simd.sum4(simd.div4(a, b));            // (1+2+3+4) = 10
+    let sub = simd.sum4(simd.sub4(a, b));          // (0+2+4+6) = 12
+    assert.isTrue(m > 39.9 && m < 40.1);
+    assert.isTrue(d > 9.9 && d < 10.1);
+    assert.isTrue(sub > 11.9 && sub < 12.1);
+}
+
+@test
+fn load_fma_store(): void {
+    let a: double[8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+    let b: double[8] = [10.0, 10.0, 10.0, 10.0, 20.0, 20.0, 20.0, 20.0];
+    let out: double[8] = [0.0; 8];
+    // out[i] = a[i]*2 + b[i], 4 lanes at a time
+    let two: f64x4 = simd.splat4(2.0);
+    let i = 0;
+    while (i < 8) {
+        let va: f64x4 = simd.load4(a, i);
+        let vb: f64x4 = simd.load4(b, i);
+        simd.store4(out, i, simd.fma4(va, two, vb));
+        i = i + 4;
+    }
+    assert.isTrue(out[0] > 11.9 && out[0] < 12.1);   // 1*2+10
+    assert.isTrue(out[3] > 17.9 && out[3] < 18.1);   // 4*2+10
+    assert.isTrue(out[7] > 35.9 && out[7] < 36.1);   // 8*2+20
+}
+
+@test
+fn dot_product_matches_scalar(): void {
+    let a: double[8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+    let b: double[8] = [2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0];
+    // scalar reference
+    let ref = 0.0; let k = 0;
+    while (k < 8) { ref = ref + a[k]*b[k]; k = k + 1; }
+    // SIMD
+    let acc: f64x4 = simd.splat4(0.0); let i = 0;
+    while (i < 8) { acc = simd.fma4(simd.load4(a, i), simd.load4(b, i), acc); i = i + 4; }
+    let simdDot = simd.sum4(acc);
+    assert.isTrue(simdDot > ref - 0.001 && simdDot < ref + 0.001);
+}

@@ -2,7 +2,7 @@
 const std = @import("std");
 const types = @import("../types.zig");
 
-pub const Ret = enum { void_, int, long, ptr, string, bool_, decimal, double };
+pub const Ret = enum { void_, int, long, ptr, string, bool_, decimal, double, vec4 };
 
 pub const Builtin = struct {
 
@@ -36,6 +36,18 @@ pub const table = [_]Builtin{
     .{ .receiver = "decimal", .name = "fromInt", .ret = .decimal },
     .{ .receiver = "decimal", .name = "toInt", .ret = .int },
     .{ .receiver = "decimal", .name = "fromString", .ret = .decimal },
+
+    // Explicit SIMD (f64x4). Codegen lowers each to LLVM <4 x double> ops (see compileSimdCall).
+    .{ .receiver = "simd", .name = "splat4", .ret = .vec4 },
+    .{ .receiver = "simd", .name = "make4", .ret = .vec4 },
+    .{ .receiver = "simd", .name = "load4", .ret = .vec4 },
+    .{ .receiver = "simd", .name = "add4", .ret = .vec4 },
+    .{ .receiver = "simd", .name = "sub4", .ret = .vec4 },
+    .{ .receiver = "simd", .name = "mul4", .ret = .vec4 },
+    .{ .receiver = "simd", .name = "div4", .ret = .vec4 },
+    .{ .receiver = "simd", .name = "fma4", .ret = .vec4 },
+    .{ .receiver = "simd", .name = "sum4", .ret = .double },
+    .{ .receiver = "simd", .name = "store4", .ret = .void_ },
 
     .{ .receiver = "console", .name = "log", .ret = .void_ },
     .{ .receiver = "console", .name = "info", .ret = .void_ },
@@ -136,6 +148,7 @@ pub fn retType(store: *types.TypeStore, r: Ret) !types.TypeId {
         .bool_ => store.boolT(),
         .decimal => store.decimalT(),
         .double => store.doubleT(),
+        .vec4 => store.vecF64x4T(),
     };
 }
 

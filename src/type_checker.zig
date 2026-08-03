@@ -12,6 +12,7 @@ fn builtinRetType(r: builtins.Ret) ?ast.TypeRef {
         .bool_ => ast.TypeRef{ .ident = "bool" },
         .decimal => ast.TypeRef{ .ident = "decimal" },
         .double => ast.TypeRef{ .ident = "f64" },
+        .vec4 => ast.TypeRef{ .ident = "f64x4" },
     };
 }
 

@@ -935,6 +935,7 @@ pub const LlvmCompiler = struct {
 
     pub const toLLVMType = types_mod.toLLVMType;
     pub const llvmForRepr = types_mod.llvmForRepr;
+    pub const vecF64x4Type = types_mod.vecF64x4Type;
     pub const castToValType = types_mod.castToValType;
     pub const castFromValType = types_mod.castFromValType;
     pub const slotTypeForLocal = types_mod.slotTypeForLocal;
@@ -3031,6 +3032,7 @@ pub const LlvmCompiler = struct {
     pub const registerTemporary = expressions_mod.registerTemporary;
     pub const drainTemporaries = expressions_mod.drainTemporaries;
     pub const buildClosureCall = expressions_mod.buildClosureCall;
+    pub const compileSimdCall = expressions_mod.compileSimdCall;
     pub const buildBareFnBox = expressions_mod.buildBareFnBox;
     pub const fnBoxReturn = expressions_mod.fnBoxReturn;
     pub const fnRefInt = expressions_mod.fnRefInt;

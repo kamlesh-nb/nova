@@ -148,6 +148,84 @@ pub fn fnRefInt(self: *LlvmCompiler, fn_val: types.LLVMValueRef, name: []const u
     return core.LLVMBuildLoad2(self.builder, self.val_type, g, "fnref_raw");
 }
 
+// Explicit SIMD (f64x4): a small builtin API over LLVM <4 x double>. Vector values live in their own
+// <4 x double> local slots (slotTypeForLocalId maps "f64x4"), so ops stay in NEON/SSE registers.
+//   simd.splat4(x) / simd.make4(a,b,c,d)         -> f64x4
+//   simd.add4/sub4/mul4/div4(a,b) / simd.fma4(a,b,c) -> f64x4
+//   simd.load4(arr,i) / simd.store4(arr,i,v)     load/store 4 lanes from a double[]
+//   simd.sum4(v)                                  -> double (horizontal add)
+pub fn compileSimdCall(self: *LlvmCompiler, field: []const u8, args: []const ast.Expression) anyerror!types.LLVMValueRef {
+    const vecTy = self.vecF64x4Type();
+    const dbl = core.LLVMDoubleType();
+
+    // element pointer into a double[] at index i: (double*)base + i
+    const elemPtr = struct {
+        fn get(c: *LlvmCompiler, arr_word: types.LLVMValueRef, idx: types.LLVMValueRef) types.LLVMValueRef {
+            const base = core.LLVMBuildIntToPtr(c.builder, arr_word, c.ptr_type, "simd_base");
+            var ix = [_]types.LLVMValueRef{idx};
+            return core.LLVMBuildInBoundsGEP2(c.builder, core.LLVMDoubleType(), base, &ix, 1, "simd_gep");
+        }
+    }.get;
+
+    if (std.mem.eql(u8, field, "splat4")) {
+        const x = try self.compileExpression(args[0]);              // double
+        var undef = core.LLVMGetUndef(vecTy);
+        undef = core.LLVMBuildInsertElement(self.builder, undef, x, core.LLVMConstInt(self.i32_type, 0, 0), "splat0");
+        var mask = [_]types.LLVMValueRef{ core.LLVMConstInt(self.i32_type, 0, 0), core.LLVMConstInt(self.i32_type, 0, 0), core.LLVMConstInt(self.i32_type, 0, 0), core.LLVMConstInt(self.i32_type, 0, 0) };
+        const maskv = core.LLVMConstVector(&mask, 4);
+        return core.LLVMBuildShuffleVector(self.builder, undef, core.LLVMGetUndef(vecTy), maskv, "splat4");
+    }
+    if (std.mem.eql(u8, field, "make4")) {
+        var v = core.LLVMGetUndef(vecTy);
+        var lane: c_uint = 0;
+        while (lane < 4) : (lane += 1) {
+            const e = try self.compileExpression(args[lane]);
+            v = core.LLVMBuildInsertElement(self.builder, v, e, core.LLVMConstInt(self.i32_type, lane, 0), "make4");
+        }
+        return v;
+    }
+    if (std.mem.eql(u8, field, "load4")) {
+        const arr = try self.compileExpression(args[0]);
+        const idx = try self.compileExpression(args[1]);
+        const p = elemPtr(self, arr, idx);
+        return core.LLVMBuildLoad2(self.builder, vecTy, p, "load4");
+    }
+    if (std.mem.eql(u8, field, "store4")) {
+        const arr = try self.compileExpression(args[0]);
+        const idx = try self.compileExpression(args[1]);
+        const v = try self.compileExpression(args[2]);
+        const p = elemPtr(self, arr, idx);
+        _ = core.LLVMBuildStore(self.builder, v, p);
+        return core.LLVMConstInt(self.val_type, 0, 0);
+    }
+    if (std.mem.eql(u8, field, "sum4")) {
+        const v = try self.compileExpression(args[0]);
+        // horizontal add via 4 extractelements (portable; LLVM folds to faddp on NEON)
+        var acc = core.LLVMBuildExtractElement(self.builder, v, core.LLVMConstInt(self.i32_type, 0, 0), "l0");
+        var lane: c_uint = 1;
+        while (lane < 4) : (lane += 1) {
+            const e = core.LLVMBuildExtractElement(self.builder, v, core.LLVMConstInt(self.i32_type, lane, 0), "ln");
+            acc = core.LLVMBuildFAdd(self.builder, acc, e, "sumacc");
+        }
+        return acc;
+    }
+    // binary lane ops
+    const a = try self.compileExpression(args[0]);
+    const b = try self.compileExpression(args[1]);
+    if (std.mem.eql(u8, field, "add4")) return core.LLVMBuildFAdd(self.builder, a, b, "add4");
+    if (std.mem.eql(u8, field, "sub4")) return core.LLVMBuildFSub(self.builder, a, b, "sub4");
+    if (std.mem.eql(u8, field, "mul4")) return core.LLVMBuildFMul(self.builder, a, b, "mul4");
+    if (std.mem.eql(u8, field, "div4")) return core.LLVMBuildFDiv(self.builder, a, b, "div4");
+    if (std.mem.eql(u8, field, "fma4")) {
+        const c = try self.compileExpression(args[2]);
+        const m = core.LLVMBuildFMul(self.builder, a, b, "fma_mul");
+        return core.LLVMBuildFAdd(self.builder, m, c, "fma_add");
+    }
+    _ = dbl;
+    std.debug.print("unknown simd op: {s}\n", .{field});
+    return error.UnknownSimdOp;
+}
+
 pub fn buildClosureCall(self: *LlvmCompiler, box_val: types.LLVMValueRef, call_args: []const ast.Expression) anyerror!types.LLVMValueRef {
     const es = self.valSlotSize();
     const box_ptr = core.LLVMBuildIntToPtr(self.builder, box_val, self.ptr_type, "clo_box");
@@ -1718,6 +1796,9 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
 
             if (call.callee.kind == .field_access) {
                 const fa = call.callee.kind.field_access;
+                if (fa.object.kind == .ident and std.mem.eql(u8, fa.object.kind.ident, "simd")) {
+                    return try self.compileSimdCall(fa.field, call.args);
+                }
                 if (fa.object.kind == .ident) {
                 } else {
                 }

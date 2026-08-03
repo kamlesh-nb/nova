@@ -248,6 +248,10 @@ pub const TypeStore = struct {
     pub fn doubleT(self: *TypeStore) !TypeId {
         return self.intern(.{ .prim = .{ .kind = .float, .bits = 64 } });
     }
+    // f64x4 SIMD vector, encoded as a 256-bit float prim (renders to "f64x4"); slot type <4 x double>.
+    pub fn vecF64x4T(self: *TypeStore) !TypeId {
+        return self.intern(.{ .prim = .{ .kind = .float, .bits = 256 } });
+    }
     pub fn floatT(self: *TypeStore) !TypeId {
         return self.intern(.{ .prim = .{ .kind = .float, .bits = 32 } });
     }

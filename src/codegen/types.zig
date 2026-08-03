@@ -154,6 +154,7 @@ pub fn isPrimitiveTypeName(type_name: []const u8) bool {
 
     return cgPrim(type_name) != null or
         std.mem.eql(u8, type_name, "void") or
+        std.mem.eql(u8, type_name, "f64x4") or   // SIMD vector: a value type, never ARC-owned
         std.mem.eql(u8, type_name, "any");
 }
 
@@ -190,11 +191,18 @@ pub fn slotTypeForLocalId(self: *LlvmCompiler, type_name: ?[]const u8, type_id: 
         if (self.valueOptionalInner(tid) != null) return self.val_type;
     }
     if (type_name) |tn| {
+        if (std.mem.eql(u8, tn, "f64x4")) return core.LLVMVectorType(core.LLVMDoubleType(), 4);
         if (cgPrim(tn)) |p| {
             if (p.repr == .f64 or p.repr == .f32) return core.LLVMDoubleType();
         }
     }
     return self.val_type;
+}
+
+// The SIMD lane type: <4 x double>. One place so the builtins and the slot picker agree.
+pub fn vecF64x4Type(self: *LlvmCompiler) types.LLVMTypeRef {
+    _ = self;
+    return core.LLVMVectorType(core.LLVMDoubleType(), 4);
 }
 
 pub fn coerceToSlotType(self: *LlvmCompiler, val: types.LLVMValueRef, slot_ty: types.LLVMTypeRef) types.LLVMValueRef {

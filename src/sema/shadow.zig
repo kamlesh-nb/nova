@@ -769,7 +769,7 @@ fn renderUncached(allocator: std.mem.Allocator, store: *const typesys.TypeStore,
         .prim => |p| switch (p.kind) {
             .bool => "bool",
             .void_ => "void",
-            .float => if (p.bits == 32) "f32" else "f64",
+            .float => if (p.bits == 256) "f64x4" else if (p.bits == 32) "f32" else "f64",
             .int => switch (p.bits) {
                 1 => "bool",
                 8 => if (p.signed) "i8" else "u8",
