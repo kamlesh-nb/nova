@@ -87,6 +87,7 @@ fn decodeSigOid(buf: ptr, start: int, len: int): int {
 struct Cert {
     pub buf: ptr,
     pub ok: bool,
+    pub serialStart: int, pub serialLen: int,  // serialNumber INTEGER value (for OCSP/CRL binding)
     pub tbsStart: int, pub tbsLen: int,        // raw TBSCertificate TLV (the signed bytes)
     pub sigAlg: int,
     pub sigStart: int, pub sigLen: int,        // signature bytes (past the BIT STRING unused-bits byte)
@@ -103,7 +104,7 @@ struct Cert {
 }
 
 pub fn parseCert(buf: ptr, len: int): Cert {
-    let bad = Cert { buf: buf, ok: false,
+    let bad = Cert { buf: buf, ok: false, serialStart: 0, serialLen: 0,
         tbsStart: 0, tbsLen: 0, sigAlg: SIG_UNKNOWN, sigStart: 0, sigLen: 0,
         keyType: KEY_UNKNOWN, rsaNStart: 0, rsaNLen: 0, rsaEStart: 0, rsaELen: 0,
         ecStart: 0, ecLen: 0, subjectStart: 0, subjectLen: 0, issuerStart: 0, issuerLen: 0,
@@ -121,6 +122,7 @@ pub fn parseCert(buf: ptr, len: int): Cert {
     let f = readTlv(buf, q);
     if (f.tag == 0xa0) { q = f.next; }         // skip [0] EXPLICIT version if present
     let serial = readTlv(buf, q); q = serial.next;
+    let serialStart = serial.start; let serialLen = serial.len;
     let innerSig = readTlv(buf, q); q = innerSig.next;   // signature AlgorithmIdentifier (ignored)
     let issuer = readTlv(buf, q);
     let issuerStart = q; let issuerLen = issuer.next - q; q = issuer.next;
@@ -195,7 +197,7 @@ pub fn parseCert(buf: ptr, len: int): Cert {
     let sigStart = sigVal.start + 1;           // skip BIT STRING unused-bits byte
     let sigLen = sigVal.len - 1;
 
-    return Cert { buf: buf, ok: true,
+    return Cert { buf: buf, ok: true, serialStart: serialStart, serialLen: serialLen,
         tbsStart: tbsStart, tbsLen: tbsLen, sigAlg: sigAlg, sigStart: sigStart, sigLen: sigLen,
         keyType: keyType, rsaNStart: rsaNStart, rsaNLen: rsaNLen, rsaEStart: rsaEStart, rsaELen: rsaELen,
         ecStart: ecStart, ecLen: ecLen, subjectStart: subjectStart, subjectLen: subjectLen,
@@ -426,4 +428,36 @@ pub fn verifyCertList12(list: ptr, listLen: int, rootDer: ptr, rootLen: int, hos
     let c1len = rd3(list, p);
     let inter = parseCert((list as long + (p + 3) as long) as ptr, c1len);
     return verifyChain3(leaf, inter, root, host, now);     // leaf + intermediate
+}
+
+// Whether the cert's key is EC P-256 (the type the OCSP/CRL EC verifiers accept). Exposed so the
+// revocation layer can decide without the private key-type constant.
+pub fn isEcKey(cert: Cert): bool { return cert.keyType == KEY_EC_P256; }
+
+// The leaf (first) certificate of a certificate_list.
+pub fn leafCert(list: ptr, listLen: int): Cert {
+    if (listLen < 3) { return parseCert(list, 0); }
+    let c0len = rd3(list, 0);
+    return parseCert((list as long + 3) as ptr, c0len);
+}
+// The intermediate (second) cert of a TLS 1.3 certificate_list (cert<3>||ext<2> runs), or a bad Cert
+// (ok=false) when the list holds only the leaf (the caller then falls back to a store root).
+pub fn interCert13(list: ptr, listLen: int): Cert {
+    if (listLen < 3) { return parseCert(list, 0); }
+    let c0len = rd3(list, 0);
+    let p = 3 + c0len;
+    let ext0 = (bytes.read_byte(list, p) << 8) | bytes.read_byte(list, p + 1);
+    p = p + 2 + ext0;
+    if (p + 3 > listLen) { return parseCert(list, 0); }
+    let c1len = rd3(list, p);
+    return parseCert((list as long + (p + 3) as long) as ptr, c1len);
+}
+// TLS 1.2 intermediate (no per-cert extension bytes).
+pub fn interCert12(list: ptr, listLen: int): Cert {
+    if (listLen < 3) { return parseCert(list, 0); }
+    let c0len = rd3(list, 0);
+    let p = 3 + c0len;
+    if (p + 3 > listLen) { return parseCert(list, 0); }
+    let c1len = rd3(list, p);
+    return parseCert((list as long + (p + 3) as long) as ptr, c1len);
 }

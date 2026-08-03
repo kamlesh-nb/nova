@@ -106,6 +106,15 @@ pub fn parseOcspResponse(der: ptr, len: int): OcspResult {
     return r;
 }
 
+// Bind a response to a certificate: the SingleResponse serial must equal the leaf's serial. (Prevents
+// accepting an otherwise-valid response that is about a DIFFERENT certificate.)
+pub fn serialMatches(der: ptr, res: OcspResult, serial: ptr, serialLen: int): bool {
+    if (!res.ok || res.serialLen != serialLen) { return false; }
+    let i = 0;
+    while (i < serialLen) { if (bytes.read_byte(der, res.serialOff + i) != bytes.read_byte(serial, i)) { return false; } i = i + 1; }
+    return true;
+}
+
 // Verify the responder's signature over tbsResponseData with a P-256 responder public key (65-byte
 // point). Returns false unless the response is ECDSA-P256/SHA-256 and the signature validates.
 pub fn verifyOcspSignatureEc(der: ptr, res: OcspResult, responderPub65: ptr): bool {
