@@ -3,9 +3,12 @@ import string;
 import list;
 import map;
 import bytes;
+import assert;
 import os.sys;
 import collections.string_builder;
 import web.status;
+import web.request;
+import compress.gzip;
 
 // memchr (SIMD-backed) delimiter scan, shared shape with web/request. Response.parse uses it for the
 // client side (parsing responses from external calls); serialize builds into one StringBuilder buffer
@@ -154,8 +157,50 @@ pub struct Response {
         }
 
         let body = if (pos <= n) string.slice(raw, pos, n) else "";
+
+        // Decode the transfer/content encodings so callers see the actual payload. Chunked framing is
+        // decoded with the same engine the server read path uses (request.bufDechunk over the body's
+        // bytes); a gzip Content-Encoding is then inflated. A string's bytes are addressable via
+        // `body as long`, so no copy into a separate buffer is needed.
+        let te = decodedHeader(headers, "transfer-encoding");
+        if (string.contains(te, "chunked")) {
+            body = request.bufDechunk(body as long, 0, body.length);
+        }
+        let ce = decodedHeader(headers, "content-encoding");
+        if (string.contains(ce, "gzip")) {
+            body = gzip.decompress(body);
+        }
         return Response.withHeaders(stat, body, headers);
     }
+}
+
+// Case-insensitive header lookup returning a lowercased value (or ""), for content-negotiation checks.
+fn decodedHeader(headers: Map<string, string>, name: string): string {
+    let keys = headers.keys();
+    let i = 0;
+    while (i < keys.size()) {
+        let k = keys.get(i) ?? "";
+        if (ciEquals(k, name)) { return string.toLowerCase(headers.get(k) ?? ""); }
+        i = i + 1;
+    }
+    return "";
+}
+
+@test
+fn test_parse_content_length(): void {
+    let raw = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
+    let r = Response.parse(raw);
+    assert.equalInt(Status.toCode(r.status), 200);
+    assert.equalStr(r.body, "hello");
+    assert.equalStr(r.getHeader("Content-Type") ?? "", "text/plain");
+}
+
+@test
+fn test_parse_chunked(): void {
+    let raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+    let r = Response.parse(raw);
+    assert.equalInt(Status.toCode(r.status), 200);
+    assert.equalStr(r.body, "Wikipedia");
 }
 
 fn intToStr(val: int): string {

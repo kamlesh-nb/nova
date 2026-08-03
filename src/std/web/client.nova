@@ -1,6 +1,5 @@
 
 import bytes;
-import assert;
 import mem.allocator;
 import string;
 import list;
@@ -10,7 +9,6 @@ import net.tcp.stream;
 import net.tlsmembio;
 import crypto.tls.truststore;
 import net.url;
-import compress.gzip;
 import serde.source;
 import web.request;
 import web.response;
@@ -77,14 +75,6 @@ pub struct HttpClient {
     }
 }
 
-fn cliBufToStr(buf: ptr, n: int): string {
-    if (n <= 0) { return ""; }
-    let out = bytes.alloc(n);
-    let i = 0;
-    while (i < n) { bytes.write_byte(out, i, bytes.read_byte(buf, i)); i = i + 1; }
-    return out as string;
-}
-
 // A blocking HTTP connection. When `secure`, TLS runs in pure Nova: the ClientBio (net/tlsmembio, TLS
 // 1.3) is pumped over the raw socket with nova_socket_send/recv. No wolfSSL. The handshake authenticates
 // the peer; chain-to-CA trust is a separate policy layer (verifyServerChain + a trust store).
@@ -131,7 +121,7 @@ struct HttpConn {
             let out = bytes.alloc(max);
             while (true) {
                 let pl = self.bio.readApp(out, max);
-                if (pl > 0) { let s = cliBufToStr(out, pl); bytes.free(out); return s; }
+                if (pl > 0) { let s = bytes.read_string(out, pl); bytes.free(out); return s; }
                 if (pl < 0) { bytes.free(out); return ""; }
                 let n = stream.recvBytes(self.fd, self.scratch, self.cap);
                 if (n <= 0) { bytes.free(out); return ""; }
@@ -143,7 +133,7 @@ struct HttpConn {
         let buf = bytes.alloc(max);
         let n = stream.recvBytes(self.fd, buf, max);
         if (n <= 0) { bytes.free(buf); return ""; }
-        let sp = cliBufToStr(buf, n);
+        let sp = bytes.read_string(buf, n);
         bytes.free(buf);
         return sp;
     }
@@ -153,97 +143,6 @@ struct HttpConn {
         bytes.free(self.scratch);
         if (self.fd >= 0) { stream.closeFd(self.fd); self.fd = -1; }
     }
-}
-
-struct RawResp {
-    pub code: int,
-    pub headers: Map<string, string>,
-    pub body: string,
-}
-
-fn parseHex(s: string): int {
-    let v = 0;
-    let i = 0;
-    while (i < s.length) {
-        let c = s[i];
-        let d = -1;
-        if (c >= 48 && c <= 57) { d = c - 48; }
-        else if (c >= 97 && c <= 102) { d = c - 97 + 10; }
-        else if (c >= 65 && c <= 70) { d = c - 65 + 10; }
-        if (d < 0) { break; }
-        v = v * 16 + d;
-        i = i + 1;
-    }
-    return v;
-}
-
-fn dechunk(s: string): string {
-    let out = List<string>();
-    let pos = 0;
-    while (pos < s.length) {
-        let rest = string.slice(s, pos, s.length);
-        let nl = string.indexOf(rest, "\r\n");
-        if (nl == -1) { break; }
-        let sizeLine = string.slice(s, pos, pos + nl);
-        let size = parseHex(sizeLine);
-        pos = pos + nl + 2;
-        if (size == 0) { break; }
-        if (pos + size > s.length) { break; }
-        out.push(string.slice(s, pos, pos + size));
-        pos = pos + size + 2;
-    }
-    return string.join(out, "");
-}
-
-fn frame(raw: string): RawResp {
-    let headers = Map<string, string>(16, string.hash);
-    let sep = string.indexOf(raw, "\r\n\r\n");
-    let headPart = if (sep == -1) raw else string.slice(raw, 0, sep);
-    let bodyRaw = if (sep == -1) "" else string.slice(raw, sep + 4, raw.length);
-
-    let lines = string.split(headPart, "\r\n");
-    let code = 0;
-    if (lines.size() > 0) {
-        let statusLine = lines.get(0) ?? "";
-        let sp = string.split(statusLine, " ");
-        if (sp.size() >= 2) { code = string.parseI64(sp.get(1) ?? "0") as int; }
-    }
-    let i = 1;
-    while (i < lines.size()) {
-        let line = lines.get(i) ?? "";
-        let idx = string.indexOf(line, ": ");
-        if (idx != -1) {
-            let key = string.slice(line, 0, idx);
-            let val = string.slice(line, idx + 2, line.length);
-            headers.set(key, val);
-        }
-        i = i + 1;
-    }
-
-    let chunked = false;
-    let hk = headers.keys();
-    let hi = 0;
-    while (hi < hk.size()) {
-        let k = hk.get(hi) ?? "";
-        if (string.toLowerCase(k) == "transfer-encoding") {
-            if (string.contains(string.toLowerCase(headers.get(k) ?? ""), "chunked")) { chunked = true; }
-        }
-        hi = hi + 1;
-    }
-    let dechunked = if (chunked) dechunk(bodyRaw) else bodyRaw;
-
-    let body = dechunked;
-    let ci = 0;
-    while (ci < hk.size()) {
-        let k = hk.get(ci) ?? "";
-        if (string.toLowerCase(k) == "content-encoding") {
-            if (string.contains(string.toLowerCase(headers.get(k) ?? ""), "gzip")) {
-                body = gzip.decompress(dechunked);
-            }
-        }
-        ci = ci + 1;
-    }
-    return RawResp{ code: code, headers: headers, body: body };
 }
 
 pub struct Http {
@@ -299,27 +198,23 @@ pub struct Http {
             parts.push(chunk);
         }
         conn.close();
-        let framed = frame(string.join(parts, ""));
+        // Response framing + chunked/gzip decoding lives in web.response (Response.parse); the client
+        // no longer keeps its own copy.
+        let resp = response.Response.parse(string.join(parts, ""));
+        let code = Status.toCode(resp.status);
 
-        if ((framed.code == 301 || framed.code == 302 || framed.code == 303 || framed.code == 307 || framed.code == 308) && hopsLeft > 0) {
-            let loc = "";
-            let lk = framed.headers.keys();
-            let li = 0;
-            while (li < lk.size()) {
-                let k = lk.get(li) ?? "";
-                if (string.toLowerCase(k) == "location") { loc = framed.headers.get(k) ?? ""; }
-                li = li + 1;
-            }
+        if ((code == 301 || code == 302 || code == 303 || code == 307 || code == 308) && hopsLeft > 0) {
+            let loc = resp.getHeader("location") ?? "";
             if (loc.length > 0) {
                 let nextUrl = Http.resolveLocation(u, loc);
-                let keepMethod = framed.code == 307 || framed.code == 308;
+                let keepMethod = code == 307 || code == 308;
                 let nextMethod = if (keepMethod) method else "GET";
                 let nextBody = if (keepMethod) body else "";
                 return Http.doRequest(nextMethod, nextUrl, headers, nextBody, timeoutMs, hopsLeft - 1, caPem);
             }
         }
 
-        return response.Response.withHeaders(Status.fromCode(framed.code), framed.body, framed.headers);
+        return resp;
     }
 
     fn resolveLocation(base: url.Url, loc: string): string {
@@ -363,31 +258,8 @@ pub struct Http {
     }
 }
 
-@test
-fn test_dechunk(): void {
-
-    let raw = "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
-    assert.equalStr(dechunk(raw), "Wikipedia");
-    assert.equalInt(parseHex("1a"), 26);
-    assert.equalInt(parseHex("ff;name=x"), 255);
-}
-
-@test
-fn test_frame_content_length(): void {
-    let raw = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
-    let r = frame(raw);
-    assert.equalInt(r.code, 200);
-    assert.equalStr(r.body, "hello");
-    assert.equalStr(r.headers.get("Content-Type") ?? "", "text/plain");
-}
-
-@test
-fn test_frame_chunked(): void {
-    let raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
-    let r = frame(raw);
-    assert.equalInt(r.code, 200);
-    assert.equalStr(r.body, "Wikipedia");
-}
+// Response framing/chunked/gzip is tested where it now lives (web.response: test_parse_content_length,
+// test_parse_chunked). The client's former duplicate tests were retired with the duplicate code.
 
 pub fn getJson<T>(urlStr: string): T {
     let r = Http.get(urlStr);
