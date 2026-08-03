@@ -19,10 +19,11 @@ import web.csrf;
 import web.logger;
 import web.recovery;
 import web.mediator;
-import web.router;
+import web.routing;
 import web.middleware;
 import web.request;
 import web.response;
+import web.status;
 
 // --- CSRF token validation (the security-critical path) ---
 @test
@@ -51,17 +52,30 @@ fn test_csrf_post_token_match_passes(): void {
     assert.isTrue(m.execute(req, res) == MiddlewareAction.Next);   // match → allowed
 }
 
-// --- Router matching (the fixed .get→.at loop) ---
+// --- Router matching: closure (controller) routes on THE unified web.routing.Router ---
 @test
 fn test_router_match_hit_and_miss(): void {
-    let rt = router.CtrlRouter();
-    rt.add("GET", "/users", (req: request.Request) => response.Response.ok("users"));
-    rt.add("POST", "/users", (req: request.Request) => response.Response.ok("created"));
+    let rt = routing.Router();
+    rt.handle("GET", "/users", (req: request.Request) => response.Response.ok("users"));
+    rt.handle("POST", "/users", (req: request.Request) => response.Response.ok("created"));
 
-    let hit = rt.matchRoute("GET", "/users");
-    assert.isTrue(hit != undefined);
-    assert.isTrue(string.eql((hit ?? router.Route{ method: "", path: "", handler: (r: request.Request) => response.Response.ok("") }).path, "/users"));
+    // hit -> the closure handler runs
+    let hit = rt.serve(makeReq("GET", "/users"));
+    assert.isTrue(hit.status == Status.Ok);
+    assert.isTrue(string.eql(hit.body, "users"));
 
-    let miss = rt.matchRoute("DELETE", "/nope");
-    assert.isTrue(miss == undefined);
+    // path matches, method does not -> 405
+    let wrongMethod = rt.serve(makeReq("DELETE", "/users"));
+    assert.isTrue(wrongMethod.status == Status.MethodNotAllowed);
+
+    // no such path -> 404
+    let miss = rt.serve(makeReq("DELETE", "/nope"));
+    assert.isTrue(miss.status == Status.NotFound);
+}
+
+fn makeReq(method: string, path: string): request.Request {
+    let r = request.Request.empty();
+    r.method = method;
+    r.path = path;
+    return r;
 }

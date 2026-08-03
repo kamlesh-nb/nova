@@ -9,11 +9,12 @@ import web.status;
 
 // THE router. One route table, one pattern parser, one matcher -- shared by every routing scenario:
 //   - web.app (App) composes a Router for its async, DI-backed mediator dispatch.
-//   - a Router used standalone dispatches synchronously through the compiler-generated
-//     __mediator_dispatch_by_name (see Router.dispatch / Router.serve below).
+//   - a Router used standalone dispatches synchronously, either through the compiler-generated
+//     __mediator_dispatch_by_name (typed RequestHandler routes) or through a closure handler
+//     (`(Request) -> Response`, the controller style). Both kinds live in the same table and share the
+//     same matcher, so pattern + typed-param behaviour never diverges between them.
 // Route patterns support typed path parameters: `/api/user/{id:int}` binds `id` from the path and, for
-// an `int` parameter, rejects a non-numeric segment (a 400 at the dispatch layer). `parsePattern`,
-// `Seg`, and `resolve` are the single implementation of that behaviour; nothing re-rolls its own.
+// an `int` parameter, rejects a non-numeric segment (a 400 at the dispatch layer).
 
 pub trait RequestHandler<TReq, TResp> {
     fn handle(self, req: TReq): TResp;
@@ -33,33 +34,44 @@ pub struct Seg {
     }
 }
 
+// One route. `isCtrl` selects the dispatch tail: false -> a typed mediator route keyed by `key`;
+// true -> a controller route served by `handler`. The unused field carries a harmless default (an
+// empty key / a not-found handler) so the record is always fully formed.
 pub struct Route {
     pub method: string,
     pub segs: List<Seg>,
     pub key: string,
+    pub handler: (request.Request) -> response.Response,
+    pub isCtrl: bool,
 
-    init(method: string, segs: List<Seg>, key: string) {
+    init(method: string, segs: List<Seg>, key: string, handler: (request.Request) -> response.Response, isCtrl: bool) {
         self.method = method;
         self.segs = segs;
         self.key = key;
+        self.handler = handler;
+        self.isCtrl = isCtrl;
     }
 }
 
 // The outcome of matching one request against the table. Exactly one of matched / typedBad /
 // methodNotAllowed is set on a non-empty table; all three false means no path matched (404).
+// `routeIndex` is the matched route's slot (-1 when not matched), so a dispatcher can read its
+// handler/key without re-scanning.
 pub struct RouteMatch {
     pub matched: bool,
     pub typedBad: bool,
     pub methodNotAllowed: bool,
     pub params: Map<string, string>,
     pub key: string,
+    pub routeIndex: int,
 
-    init(matched: bool, typedBad: bool, methodNotAllowed: bool, params: Map<string, string>, key: string) {
+    init(matched: bool, typedBad: bool, methodNotAllowed: bool, params: Map<string, string>, key: string, routeIndex: int) {
         self.matched = matched;
         self.typedBad = typedBad;
         self.methodNotAllowed = methodNotAllowed;
         self.params = params;
         self.key = key;
+        self.routeIndex = routeIndex;
     }
 }
 
@@ -94,14 +106,22 @@ pub struct Router {
         self.routes = List<Route>();
     }
 
-    // Registration hook. `app.get<T>(path)` / `router.get<T>(path)` is lowered by codegen to
+    // Typed mediator registration. `app.get<T>(path)` / `router.get<T>(path)` is lowered by codegen to
     // `__addRoute("GET", path, "T")` for any receiver that defines this method (see expressions.zig).
+    // The handler slot is unused for a mediator route, so it carries a not-found default.
     pub fn __addRoute(self: Router, method: string, path: string, key: string): void {
-        self.routes.push(Route(method, parsePattern(path), key));
+        self.routes.push(Route(method, parsePattern(path), key,
+            (req: request.Request) => response.Response(Status.NotFound, "Not Found"), false));
     }
 
-    // The single matcher. Pure (no dispatch): every caller -- App's async path and the sync serve/
-    // dispatch below -- resolves a request the same way, so typed-param handling never diverges.
+    // Controller registration: a closure handler for a (possibly patterned) route. Same table, same
+    // matcher as the typed routes -- so a controller route may use `/thing/{id:int}` too.
+    pub fn handle(self: Router, method: string, path: string, handler: (request.Request) -> response.Response): void {
+        self.routes.push(Route(method, parsePattern(path), "", handler, true));
+    }
+
+    // The single matcher. Pure (no dispatch): every caller -- App's async path and the sync route/
+    // serve/dispatch below -- resolves a request the same way, so typed-param handling never diverges.
     pub fn resolve(self: Router, method: string, path: string): RouteMatch {
         let segs = request.pathSegs(path);
         let nseg = segs.size();
@@ -132,23 +152,30 @@ pub struct Router {
                 if (ok) {
                     pathMatched = true;
                     if (string.eql(route.method, method)) {
-                        return RouteMatch(true, false, false, params, route.key);
+                        return RouteMatch(true, false, false, params, route.key, r);
                     }
                 } else if (typedBad && string.eql(route.method, method)) {
-                    return RouteMatch(false, true, false, Map<string, string>(1, string.hash), "");
+                    return RouteMatch(false, true, false, Map<string, string>(1, string.hash), "", -1);
                 }
             }
             r = r + 1;
         }
         if (pathMatched) {
-            return RouteMatch(false, false, true, Map<string, string>(1, string.hash), "");
+            return RouteMatch(false, false, true, Map<string, string>(1, string.hash), "", -1);
         }
-        return RouteMatch(false, false, false, Map<string, string>(1, string.hash), "");
+        return RouteMatch(false, false, false, Map<string, string>(1, string.hash), "", -1);
     }
 
-    // Synchronous standalone dispatch: match, overlay the path params over the body (route params win --
-    // @fromRoute over @fromBody), and run the discovered handler via the generated mediator dispatch.
-    // Returns the serialized handler body, or "400"/"404"/"405" for the non-match outcomes.
+    // Convenience: the matched Route object (or undefined). Same matching as resolve.
+    pub fn matchRoute(self: Router, method: string, path: string): Route | undefined {
+        let m = self.resolve(method, path);
+        if (m.matched) { return self.routes.at(m.routeIndex); }
+        return undefined;
+    }
+
+    // Synchronous typed dispatch (string result): match, overlay the path params over the body (route
+    // params win -- @fromRoute over @fromBody), and run the discovered handler via the generated
+    // mediator dispatch. Returns the serialized body, or "400"/"404"/"405" for the non-match outcomes.
     pub fn dispatch(self: Router, method: string, path: string, body: ValueSource): string {
         let m = self.resolve(method, path);
         if (m.matched) {
@@ -160,11 +187,17 @@ pub struct Router {
         return "404";
     }
 
-    // Bridge to the HTTP server: run the typed mediator pipeline over a real Request and wrap the
-    // result in a Response (matched -> 200 + JSON, typed-bad -> 400, wrong method -> 405, no path -> 404).
+    // The universal Request -> Response dispatch, serving BOTH tails: a controller route runs its
+    // closure handler; a typed route runs the mediator pipeline (path params overlaid on the JSON body)
+    // and wraps the result in a 200 JSON response. Non-matches map to 400 / 405 / 404.
     pub fn serve(self: Router, req: request.Request): response.Response {
         let m = self.resolve(req.method, req.path);
         if (m.matched) {
+            let route = self.routes.at(m.routeIndex);
+            if (route.isCtrl) {
+                let h = route.handler;
+                return h(req);
+            }
             let jsonBody = req.body == "" ? "{}" : req.body;
             let src = source.fromJson(jsonBody);
             let composite = CompositeSource(ParamSource(m.params), src);
@@ -180,5 +213,10 @@ pub struct Router {
             return response.Response(Status.MethodNotAllowed, "405");
         }
         return response.Response(Status.NotFound, "404");
+    }
+
+    // Alias for the controller-style entry point (reads better next to `handle`).
+    pub fn route(self: Router, req: request.Request): response.Response {
+        return self.serve(req);
     }
 }

@@ -1,6 +1,9 @@
 
-import web.router;
+import web.routing;
 
+// A controller groups related routes. It registers them on THE router (web.routing.Router) via
+// `router.handle(method, path, handler)` -- the same table the typed mediator routes live in, so a
+// controller route shares the one matcher (patterns + typed path params included).
 pub trait Controller {
-    fn registerRoutes(self: Controller, router: CtrlRouter): void;
+    fn registerRoutes(self: Controller, router: routing.Router): void;
 }
