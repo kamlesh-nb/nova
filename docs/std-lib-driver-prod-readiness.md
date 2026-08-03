@@ -371,7 +371,7 @@ test (T16). Next tier is P1 (T6 transactions, T7 pool hardening, ...).
 | T8 | P1 | Query-level timeouts + cancellation (connect/statement timeout, PG CancelRequest, TDS ATTENTION) | C9 | seam + all drivers | [~] |
 | T9 | P1 | Per-connection concurrency guard (exclusive checkout / single in-flight) | C8 | seam + pool | [x] |
 | T10 | P1 | Async non-blocking DNS + IPv6 (blocking IPv4 getaddrinfo stalls the loop) | -- | net/eventedio | [ ] |
-| T11 | P1 | HTTP client connection pooling / keep-alive (no fresh socket + TLS per request) | -- | web/client | [ ] |
+| T11 | P1 | HTTP client connection pooling / keep-alive (no fresh socket + TLS per request) | -- | web/client | [~] |
 | T12 | P1 | Structured logging framework + metrics/tracing hooks; instrument pool + drivers | -- | new stdlib + pool | [x] |
 | T13 | P2 | DbValue richer types (date/time/uuid/json) + NULL-aware accessors; ORM write side (update/delete/upsert + PK) + streaming results | C6 | seam + orm | [x] |
 | T14 | P2 | Driver protocol breadth: mysql >=16MB reassembly + multi-resultset + sha256_password; mssql packet chunking + sp_reset_connection + sp_unprepare; btree real auth + Parse/Bind; pg LISTEN/NOTIFY + COPY | -- | mysql/mssql/btree/pg | [~] |
@@ -424,6 +424,14 @@ pg LISTEN/NOTIFY (decodeNotification + 'A'-frame capture + listen/notifications)
 (decodeCopyResponse/decodeCopyData + copyOut). Each unit-tested on synthetic frames. REMAINING (live or
 larger): mysql multi-resultset; mssql sp_reset_connection; btree real auth + Parse/Bind; pg idle NOTIFY
 delivery loop; all live-path verification.
+
+T11 [~] 2026-08-03: HTTP keep-alive foundation landed. The bug-prone core -- exact response framing
+without EOF -- is a pure httpMessageLen(buf) (Content-Length / chunked zero-terminator / -2 "no length
+must close"), thoroughly unit-tested (case 248, 30/30 incl pipelined + case-insensitive + chunked). Plus
+a KeepAlivePool keyed by host:port:secure (take/put, per-host idle cap) and Http.requestVia(pool, ...)
+that reuses a pooled conn, sends Connection: keep-alive, reads one framed message, and returns the conn
+unless the response is unframed/says close. End-to-end socket REUSE is verified against a live server
+(integration harness), not offline.
 
 T9 [x] 2026-08-03: per-connection concurrency guard shipped across ALL FIVE drivers. Each Connection
 carries a busy:bool; query/exec (and, where they send frames directly rather than delegating,

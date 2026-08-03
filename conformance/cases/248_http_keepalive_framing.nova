@@ -1,0 +1,58 @@
+// T11: HTTP keep-alive message framing -- httpMessageLen returns the byte length of the first complete
+// HTTP message in a buffer (or -1 = need more, -2 = no self-delimiting length -> must close). This is
+// the core that lets a keep-alive client read exactly one response without waiting for EOF.
+import assert;
+import web.client;
+
+@test
+fn test_content_length_complete(): void {
+    let msg = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    assert.equalInt(msg.length, client.httpMessageLen(msg));
+}
+
+@test
+fn test_content_length_incomplete(): void {
+    // body says 5 bytes but only 3 arrived -> need more
+    let msg = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhel";
+    assert.equalInt(-1, client.httpMessageLen(msg));
+}
+
+@test
+fn test_content_length_case_insensitive_and_extra(): void {
+    // a second pipelined message must not be consumed: length is exactly headers + 2 body bytes
+    let one = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nOK";
+    let buf = one + "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    assert.equalInt(one.length, client.httpMessageLen(buf));
+}
+
+@test
+fn test_headers_incomplete(): void {
+    let msg = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n";   // no blank-line terminator yet
+    assert.equalInt(-1, client.httpMessageLen(msg));
+}
+
+@test
+fn test_chunked_complete(): void {
+    // two chunks then the zero terminator
+    let msg = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n3\r\n foo\r\n0\r\n\r\n";
+    assert.equalInt(msg.length, client.httpMessageLen(msg));
+}
+
+@test
+fn test_chunked_incomplete(): void {
+    let msg = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";  // no 0-terminator
+    assert.equalInt(-1, client.httpMessageLen(msg));
+}
+
+@test
+fn test_no_length_must_close(): void {
+    // neither Content-Length nor chunked -> body runs to close, cannot keep-alive
+    let msg = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nsome body";
+    assert.equalInt(-2, client.httpMessageLen(msg));
+}
+
+@test
+fn test_zero_length_body(): void {
+    let msg = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
+    assert.equalInt(msg.length, client.httpMessageLen(msg));
+}

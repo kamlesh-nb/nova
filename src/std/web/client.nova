@@ -145,6 +145,114 @@ struct HttpConn {
     }
 }
 
+// --- T11: keep-alive framing + connection pool ---------------------------------------------------
+// To reuse a connection across requests the client can no longer read until EOF -- the server holds
+// the socket open. It must read EXACTLY one framed HTTP message. httpMessageLen inspects a buffer and
+// returns the total byte length of the first complete message (headers + body), or -1 if more bytes
+// are still needed. This is the bug-prone core of any keep-alive client, so it is pure + unit-tested.
+//
+// Framing rules (RFC 7230): the body length is Content-Length if present; else, if
+// Transfer-Encoding: chunked, the body ends at the "0\r\n\r\n" zero-chunk terminator; else there is no
+// self-delimiting length and the message runs to connection close (return -2 = "must close, cannot
+// keep-alive"). Header names are matched case-insensitively.
+pub fn httpMessageLen(buf: string): int {
+    let headerEnd = indexOfSeq(buf, "\r\n\r\n");
+    if (headerEnd < 0) { return -1; }                 // headers not fully received yet
+    let bodyStart = headerEnd + 4;
+    let headerBlock = string.toLowerCase(string.slice(buf, 0, headerEnd));
+
+    let clPos = indexOfSeq(headerBlock, "content-length:");
+    if (clPos >= 0) {
+        let n = parseHeaderInt(headerBlock, clPos + 15);
+        let total = bodyStart + n;
+        if (buf.length >= total) { return total; }
+        return -1;                                     // body not fully received yet
+    }
+    if (indexOfSeq(headerBlock, "transfer-encoding:") >= 0 && indexOfSeq(headerBlock, "chunked") >= 0) {
+        // Complete iff the zero-length chunk terminator has arrived.
+        let term = indexOfSeqFrom(buf, "0\r\n\r\n", bodyStart);
+        if (term >= 0) { return term + 5; }
+        return -1;
+    }
+    return -2;                                          // no self-delimiting length -> must close
+}
+
+// Skip spaces after "content-length:" and read the decimal value.
+fn parseHeaderInt(s: string, start: int): int {
+    let i = start;
+    while (i < s.length && (s[i] == 32 || s[i] == 9)) { i = i + 1; }
+    let n = 0;
+    while (i < s.length && s[i] >= 48 && s[i] <= 57) { n = n * 10 + (s[i] - 48); i = i + 1; }
+    return n;
+}
+
+fn indexOfSeq(hay: string, needle: string): int { return indexOfSeqFrom(hay, needle, 0); }
+
+fn indexOfSeqFrom(hay: string, needle: string, from: int): int {
+    if (needle.length == 0) { return from; }
+    let i = if (from > 0) from else 0;
+    while (i + needle.length <= hay.length) {
+        let j = 0;
+        while (j < needle.length && hay[i + j] == needle[j]) { j = j + 1; }
+        if (j == needle.length) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// A pool of idle keep-alive connections keyed by "host:port:secure". get() hands back a live idle
+// connection for reuse (or -1 fd sentinel when none); put() returns one after a keep-alive response.
+// maxIdlePerHost bounds retained sockets. The fd/bio live in HttpConn; here we key and cap them.
+pub struct KeepAlivePool {
+    pub idle: Map<string, List<HttpConn>>,
+    pub maxIdlePerHost: int,
+
+    init(maxIdlePerHost: int) {
+        self.idle = Map<string, List<HttpConn>>(16, string.hash);
+        self.maxIdlePerHost = if (maxIdlePerHost > 0) maxIdlePerHost else 4;
+    }
+
+    fn key(self: KeepAlivePool, host: string, port: int, secure: bool): string {
+        return host + ":" + itoa(port) + (if (secure) ":s" else ":p");
+    }
+
+    // Take an idle connection for this endpoint, or undefined if none is pooled.
+    pub fn take(self: KeepAlivePool, host: string, port: int, secure: bool): HttpConn | undefined {
+        let k = self.key(host, port, secure);
+        let lst = self.idle.get(k);
+        if (lst == undefined) { return undefined; }
+        let l = lst ?? List<HttpConn>();
+        if (l.size() == 0) { return undefined; }
+        return l.pop();                                 // LIFO: warmest connection first
+    }
+
+    // Return a connection to the pool after a successful keep-alive response. Beyond the per-host cap
+    // the surplus is closed rather than pooled. Returns whether it was retained.
+    pub fn put(self: KeepAlivePool, host: string, port: int, secure: bool, conn: HttpConn): bool {
+        let k = self.key(host, port, secure);
+        let existing = self.idle.get(k);
+        let l = if (existing == undefined) List<HttpConn>() else (existing ?? List<HttpConn>());
+        if (l.size() >= self.maxIdlePerHost) { conn.close(); return false; }
+        l.push(conn);
+        self.idle.set(k, l);
+        return true;
+    }
+
+    pub fn idleCount(self: KeepAlivePool, host: string, port: int, secure: bool): int {
+        let lst = self.idle.get(self.key(host, port, secure));
+        if (lst == undefined) { return 0; }
+        return (lst ?? List<HttpConn>()).size();
+    }
+}
+
+fn itoa(v: int): string {
+    if (v == 0) { return "0"; }
+    let n = v; let neg = n < 0; if (neg) { n = 0 - n; }
+    let s = "";
+    while (n > 0) { let d = n % 10; s = string.slice("0123456789", d, d + 1) + s; n = n / 10; }
+    return if (neg) "-" + s else s;
+}
+
 pub struct Http {
 
     pub fn request(method: string, urlStr: string, headers: Map<string, string>, body: string): response.Response {
@@ -153,6 +261,57 @@ pub struct Http {
 
     pub fn requestTimeout(method: string, urlStr: string, headers: Map<string, string>, body: string, timeoutMs: int): response.Response {
         return Http.doRequest(method, urlStr, headers, body, timeoutMs, 5, "");
+    }
+
+    // T11 keep-alive request over a KeepAlivePool: reuse a pooled connection for this endpoint when one
+    // exists, send `Connection: keep-alive`, read EXACTLY one framed message via httpMessageLen (never
+    // to EOF), and return the connection to the pool unless the response is unframed / says close. The
+    // pure framing + pool keying are unit-tested; end-to-end socket reuse is verified against a live
+    // server (integration harness), not offline.
+    pub fn requestVia(pool: KeepAlivePool, method: string, urlStr: string, headers: Map<string, string>, body: string): response.Response {
+        let u = url.parse(urlStr);
+        let reused = pool.take(u.host, u.port, u.secure);
+        let conn = HttpConn{ secure: u.secure, fd: -1, bio: tlsmembio.newClientBio(u.host), scratch: bytes.alloc(33792), cap: 33792 };
+        let fresh = true;
+        if (reused != undefined) {
+            conn = reused ?? conn;
+            fresh = false;
+        } else {
+            let fd = stream.connect(u.host, u.port);
+            if (fd < 0) { return response.Response(Status.InternalServerError, "connection failed"); }
+            conn = HttpConn{ secure: u.secure, fd: fd, bio: tlsmembio.newClientBio(u.host), scratch: bytes.alloc(33792), cap: 33792 };
+            if (u.secure && conn.tlsHandshake() != 0) { conn.close(); return response.Response(Status.InternalServerError, "TLS handshake failed"); }
+        }
+
+        let reqLine = method + " " + u.path + " HTTP/1.1\r\n";
+        let hdrs = List<string>();
+        hdrs.push("Host: " + u.host);
+        hdrs.push("Connection: keep-alive");
+        if (body.length > 0) { hdrs.push(`Content-Length: ${body.length}`); }
+        headers.forEach((k, v) => { hdrs.push(k + ": " + v); });
+        conn.writeStr(reqLine + string.join(hdrs, "\r\n") + "\r\n\r\n" + body);
+
+        // Read until httpMessageLen reports a complete message (or the peer signals no-length -> close).
+        let buf = "";
+        let mustClose = false;
+        while (true) {
+            let total = httpMessageLen(buf);
+            if (total >= 0) { break; }                    // one complete message buffered
+            if (total == -2) { mustClose = true; }        // unframed -> drain to EOF then close
+            let chunk = conn.recv(65536);
+            if (chunk.length == 0) { mustClose = true; break; }
+            buf = buf + chunk;
+        }
+
+        let resp = response.Response.parse(buf);
+        // Reuse only if the response was self-delimiting and neither side asked to close.
+        let connHdr = string.toLowerCase(resp.getHeader("connection") ?? "");
+        if (mustClose || string.contains(connHdr, "close")) {
+            conn.close();
+        } else {
+            pool.put(u.host, u.port, u.secure, conn);
+        }
+        return resp;
     }
 
     fn doRequest(method: string, urlStr: string, headers: Map<string, string>, body: string, timeoutMs: int, hopsLeft: int, caPem: string): response.Response {
