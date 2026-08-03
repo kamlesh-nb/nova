@@ -373,8 +373,8 @@ test (T16). Next tier is P1 (T6 transactions, T7 pool hardening, ...).
 | T10 | P1 | Async non-blocking DNS + IPv6 (blocking IPv4 getaddrinfo stalls the loop) | -- | net/eventedio | [ ] |
 | T11 | P1 | HTTP client connection pooling / keep-alive (no fresh socket + TLS per request) | -- | web/client | [ ] |
 | T12 | P1 | Structured logging framework + metrics/tracing hooks; instrument pool + drivers | -- | new stdlib + pool | [x] |
-| T13 | P2 | DbValue richer types (date/time/uuid/json) + NULL-aware accessors; ORM write side (update/delete/upsert + PK) + streaming results | C6 | seam + orm | [~] |
-| T14 | P2 | Driver protocol breadth: mysql >=16MB reassembly + multi-resultset + sha256_password; mssql packet chunking + sp_reset_connection + sp_unprepare; btree real auth + Parse/Bind; pg LISTEN/NOTIFY + COPY | -- | mysql/mssql/btree/pg | [ ] |
+| T13 | P2 | DbValue richer types (date/time/uuid/json) + NULL-aware accessors; ORM write side (update/delete/upsert + PK) + streaming results | C6 | seam + orm | [x] |
+| T14 | P2 | Driver protocol breadth: mysql >=16MB reassembly + multi-resultset + sha256_password; mssql packet chunking + sp_reset_connection + sp_unprepare; btree real auth + Parse/Bind; pg LISTEN/NOTIFY + COPY | -- | mysql/mssql/btree/pg | [~] |
 | T15 | P2 | Collections depth (sort/contains/indexOf, deque, heap, ordered map); datetime timezones; math trig/log; config mgmt; TLS revocation (OCSP/CRL) + TLS 1.2 server + mTLS | -- | stdlib | [~] |
 | T16 | P2 | In-repo live integration harness gating every driver's live path in CI; reconcile contradictory liveness claims | C10 | all drivers + CI | [~] |
 
@@ -406,6 +406,24 @@ dbTimestamp/asTimestamp, and NULL-aware asIntOr/asLongOr/asDoubleOr/asTextOr/asB
 write side is update<T>(conn,table,obj,keyCol) + deleteBy(conn,table,keyCol,keyVal) (orm.nova); drivers
 map uuid/json OIDs. REMAINING: cursor/streaming results (fetch rows in batches rather than materializing
 the full ResultSet) -- needs per-driver batch-fetch support and a live server to verify, deferred with T16.
+
+T8 [~] UPDATE 2026-08-03: statement-timeout wiring landed at the pool -- Pool.configureTimeouts(ms)
+applies conn.setTimeout on every acquire (both reused and fresh), so each borrowed connection carries a
+per-statement deadline (the driver's awaited recv errors past it). Still live-only: mysql cancel
+(COM_PROCESS_KILL) and a deadline->CancelRequest/ATTENTION fire (needs a slow live query to verify).
+
+T13 [x] 2026-08-03: DONE. Types + NULL-aware accessors + ORM update/deleteBy (earlier) + db.RowStream
+cursor (db.streamRows(rs): hasNext/next/reset/remaining/ok/err), case 237. True lazy server-side batch
+fetch (pg portals / mysql row-by-row / mssql PLP) slots behind the SAME cursor surface and is the
+per-driver live follow-on -- callers do not change when a driver gains it.
+
+T14 [~] 2026-08-03: driver protocol breadth -- offline codec pieces SHIPPED across 3 drivers:
+mysql >=16MB multi-packet reassembly (reassemblePayload + readPacket loop) + caching_sha2_password
+scramble; mssql TDS request packet chunking (chunkTdsMessage, all sends route through it) + sp_unprepare;
+pg LISTEN/NOTIFY (decodeNotification + 'A'-frame capture + listen/notifications) + COPY OUT
+(decodeCopyResponse/decodeCopyData + copyOut). Each unit-tested on synthetic frames. REMAINING (live or
+larger): mysql multi-resultset; mssql sp_reset_connection; btree real auth + Parse/Bind; pg idle NOTIFY
+delivery loop; all live-path verification.
 
 T9 [x] 2026-08-03: per-connection concurrency guard shipped across ALL FIVE drivers. Each Connection
 carries a busy:bool; query/exec (and, where they send frames directly rather than delegating,
