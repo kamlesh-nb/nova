@@ -2,6 +2,7 @@
 // bytes (handling "::" compression); the cache lets a repeat connect resolve from memory (no blocking
 // getaddrinfo on the reactor thread).
 import net.dns;
+import net.dial;
 import bytes;
 import assert;
 
@@ -76,4 +77,12 @@ fn test_sockaddr_in6(): void {
     assert.equalInt(28, b(sb, 0));                                 // sin6_len
     assert.equalInt(30, b(sb, 1));                                 // AF_INET6 (1 byte)
     assert.equalInt(0x01, b(sb, 2)); assert.equalInt(0xbb, b(sb, 3)); // port 443 BE
+}
+
+@test
+fn test_dial_family_detection(): void {
+    assert.isTrue(dial.isIPv6Literal("::1"));
+    assert.isTrue(dial.isIPv6Literal("2001:db8::1"));
+    assert.isFalse(dial.isIPv6Literal("127.0.0.1"));
+    assert.isFalse(dial.isIPv6Literal("example.com"));
 }

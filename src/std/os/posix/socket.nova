@@ -160,6 +160,42 @@ pub fn connectBlocking(host: string, port: int): int {
     return fd;
 }
 
+// --- IPv6 dial (T10) -----------------------------------------------------------------------------
+// AF_INET6 differs by OS (30 on macOS/BSD, 10 on Linux); selected by platform like the other constants.
+fn afInet6(): int { return if (platform.isLinux) 10 else 30; }
+pub fn newTcp6(): int { return sys.socket(afInet6(), SOCK_STREAM, 0); }
+
+// Build an OS-correct sockaddr_in6 (28 bytes) from a 16-byte address: Linux has a 2-byte LE family in
+// slot 0; BSD/macOS has sin6_len(=28) then a 1-byte family. sin6_port is network order at offset 2, the
+// address at offset 8.
+pub fn makeSockaddrIn6(port: int, addr16: ptr): ptr {
+    let sa = bytes.alloc(28);
+    let i = 0;
+    while (i < 28) { bytes.write_byte(sa, i, 0); i = i + 1; }
+    let fam = afInet6();
+    if (platform.isLinux) {
+        bytes.write_byte(sa, 0, fam & 0xff); bytes.write_byte(sa, 1, (fam >> 8) & 0xff);
+    } else {
+        bytes.write_byte(sa, 0, 28); bytes.write_byte(sa, 1, fam & 0xff);
+    }
+    bytes.write_byte(sa, 2, (port >> 8) & 0xff); bytes.write_byte(sa, 3, port & 0xff);
+    let j = 0;
+    while (j < 16) { bytes.write_byte(sa, 8 + j, bytes.read_byte(addr16, j)); j = j + 1; }
+    return sa;
+}
+
+// Blocking connect to a pre-parsed 16-byte IPv6 address (the caller parses the v6 literal via
+// net/dns.parseIPv6). Completes the v6 dial path; verified live (no v6 loopback offline).
+pub fn connectBlocking6(addr16: ptr, port: int): int {
+    let fd = newTcp6();
+    if (fd < 0) { return -1; }
+    let sa = makeSockaddrIn6(port, addr16);
+    let r = connectSock(fd, sa, 28);
+    bytes.free(sa);
+    if (r != 0) { close(fd); return -1; }
+    return fd;
+}
+
 // A receive/send timeout in ms via SO_RCVTIMEO / SO_SNDTIMEO (a `struct timeval` on POSIX).
 pub fn setTimeout(fd: int, ms: int): int {
     let tv = bytes.alloc(16);

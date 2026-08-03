@@ -1,0 +1,25 @@
+// net/dial (T10): a family-agnostic blocking TCP dial. Given a host that is an IPv4 literal, an IPv6
+// literal, or a hostname, it opens the right socket -- routing IPv6 literals through the v6 sockaddr/
+// socket path (os/socket.connectBlocking6) and everything else through the v4 path. This is the
+// integration that turns the v6 address + socket layers into a usable connection. The reactor's
+// non-blocking async connect gains v6 the same way (a follow-on on the completion path); this covers the
+// blocking callers (e.g. the HTTP client).
+
+import bytes;
+import string;
+import net.dns;
+import os.socket;
+
+// Is `host` an IPv6 literal? A ':' in the host (which never appears in an IPv4 address or a DNS name)
+// marks it. Callers that carry a bracketed "[::1]" should strip the brackets first (net/url does).
+pub fn isIPv6Literal(host: string): bool { return string.indexOf(host, ":") >= 0; }
+
+// Blocking-connect to host:port over IPv4 or IPv6. Returns the socket fd, or -1 on failure.
+pub fn dial(host: string, port: int): int {
+    if (isIPv6Literal(host)) {
+        let addr = bytes.alloc(16);
+        if (!dns.parseIPv6(host, addr)) { return -1; }
+        return socket.connectBlocking6(addr, port);
+    }
+    return socket.connectBlocking(host, port);
+}
