@@ -182,6 +182,117 @@ pub fn fpowf(base: double, exp: double): double {
     return fexp(exp * fln(base));
 }
 
+pub fn tau(): double { return 6.28318530717958647692; }
+pub fn log10e(): double { return 0.43429448190325182765; }
+pub fn log2e(): double { return 1.44269504088896340736; }
+
+pub fn log10(x: double): double { return fln(x) * log10e(); }
+pub fn log2(x: double): double { return fln(x) * log2e(); }
+
+// Range-reduce an angle to [-pi, pi] so the Maclaurin series stays accurate for large inputs.
+fn wrapAngle(x: double): double {
+    let t = x;
+    while (t > pi()) { t = t - tau(); }
+    while (t < 0.0 - pi()) { t = t + tau(); }
+    return t;
+}
+
+pub fn sin(x: double): double {
+    let r = wrapAngle(x);
+    let term = r;
+    let sum = r;
+    let r2 = r * r;
+    let n = 1;
+    while (n < 12) {
+        // term_{n} = -term_{n-1} * r^2 / ((2n)(2n+1))
+        let d = ((2.0 * (n as double)) * ((2.0 * (n as double)) + 1.0));
+        term = (0.0 - term) * r2 / d;
+        sum = sum + term;
+        n = n + 1;
+    }
+    return sum;
+}
+
+pub fn cos(x: double): double {
+    let r = wrapAngle(x);
+    let term = 1.0;
+    let sum = 1.0;
+    let r2 = r * r;
+    let n = 1;
+    while (n < 12) {
+        // term_{n} = -term_{n-1} * r^2 / ((2n-1)(2n))
+        let d = (((2.0 * (n as double)) - 1.0) * (2.0 * (n as double)));
+        term = (0.0 - term) * r2 / d;
+        sum = sum + term;
+        n = n + 1;
+    }
+    return sum;
+}
+
+pub fn tan(x: double): double {
+    let c = cos(x);
+    if (fabs(c) < 0.000000000001) { return 0.0; }
+    return sin(x) / c;
+}
+
+// atan via the identity atan(x) = 2*atan(x/(1+sqrt(1+x^2))) applied twice to shrink |x|,
+// then the Maclaurin series (which only converges for |x|<=1).
+pub fn atan(x: double): double {
+    let neg = x < 0.0;
+    let a = fabs(x);
+    let reduce = 0;
+    while (a > 0.2) {
+        a = a / (1.0 + fsqrt(1.0 + (a * a)));
+        reduce = reduce + 1;
+    }
+    let term = a;
+    let sum = a;
+    let a2 = a * a;
+    let n = 1;
+    while (n < 16) {
+        term = (0.0 - term) * a2;
+        sum = sum + term / ((2.0 * (n as double)) + 1.0);
+        n = n + 1;
+    }
+    let result = sum;
+    while (reduce > 0) { result = result * 2.0; reduce = reduce - 1; }
+    if (neg) { return 0.0 - result; }
+    return result;
+}
+
+pub fn atan2(y: double, x: double): double {
+    if (x > 0.0) { return atan(y / x); }
+    if (x < 0.0) {
+        if (y >= 0.0) { return atan(y / x) + pi(); }
+        return atan(y / x) - pi();
+    }
+    // x == 0
+    if (y > 0.0) { return pi() / 2.0; }
+    if (y < 0.0) { return 0.0 - (pi() / 2.0); }
+    return 0.0;
+}
+
+@test
+fn test_trig_log(): void {
+    // sin(pi/6) ~= 0.5, cos(pi/3) ~= 0.5
+    assert.isTrue(fabs(sin(pi() / 6.0) - 0.5) < 0.0001);
+    assert.isTrue(fabs(cos(pi() / 3.0) - 0.5) < 0.0001);
+    // sin(0)=0, cos(0)=1
+    assert.isTrue(fabs(sin(0.0)) < 0.0001);
+    assert.isTrue(fabs(cos(0.0) - 1.0) < 0.0001);
+    // tan(pi/4) ~= 1
+    assert.isTrue(fabs(tan(pi() / 4.0) - 1.0) < 0.0001);
+    // large-angle range reduction: sin(10pi + pi/6) ~= 0.5
+    assert.isTrue(fabs(sin((10.0 * pi()) + (pi() / 6.0)) - 0.5) < 0.0005);
+    // atan(1) ~= pi/4, atan2(1,1) ~= pi/4
+    assert.isTrue(fabs(atan(1.0) - (pi() / 4.0)) < 0.0001);
+    assert.isTrue(fabs(atan2(1.0, 1.0) - (pi() / 4.0)) < 0.0001);
+    assert.isTrue(fabs(atan2(1.0, 0.0 - 1.0) - (3.0 * pi() / 4.0)) < 0.0005);
+    // log10(1000)=3, log2(8)=3
+    assert.isTrue(fabs(log10(1000.0) - 3.0) < 0.0005);
+    assert.isTrue(fabs(log2(8.0) - 3.0) < 0.0005);
+}
+
 @test
 fn test_float_math(): void {
     assert.isTrue(fabs(0.0 - 3.5) > 3.4);
