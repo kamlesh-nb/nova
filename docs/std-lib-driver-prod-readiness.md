@@ -282,7 +282,8 @@ wrong; P1 = required for a real deployment; P2 = completeness/ergonomics.
     mssql outbound packet chunking + sp_reset_connection on reuse + sp_unprepare; btreedb real auth +
     Parse/Bind; pg LISTEN/NOTIFY + COPY.
 15. Collections depth (sort/contains/indexOf, deque, heap, ordered map); datetime timezones; math
-    trig/log; config management; TLS revocation (OCSP/CRL) + TLS 1.2 server + mTLS.
+    trig/log; config management; [OPTIONAL] mTLS + TLS revocation (OCSP/CRL). TLS 1.2 server = WON'T-DO
+    (see the decision note at the end of this section).
 16. In-repo live integration harness (C10) so the live path of every driver is gated in CI rather than
     asserted in comments; reconcile the contradictory liveness claims.
 
