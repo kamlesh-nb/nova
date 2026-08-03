@@ -97,19 +97,19 @@ Windows-specific traps are handled and worth knowing about:
   not `-lnova_runtime` (link.exe cannot read llvm-ar's GNU archive), `-rtlib=compiler-rt` for the
   128-bit helpers, and `-lc`/`-lm`/`-lpthread` dropped (MSVC folds them into its CRT).
 
-**Windows syscalls are Nova over Win32 FFI**, mirroring how `os/socket_windows` sits over
-`os/winsock` — not C++ shims in the runtime. The target-conditional file rule (`targetSuffixedPath`)
+**Windows syscalls are Nova over Win32 FFI**, mirroring how `os/windows/socket` sits over
+`os/windows/winsock` — not C++ shims in the runtime. The target-conditional file rule (`targetVariantPath`)
 swaps the whole module, so shared callers are unchanged:
-- `os/winfs` + `os/sys_windows` — file/dir/env. MSVC's UCRT has no `<dirent.h>`, its `O_CREAT`/
+- `os/windows/fs` + `os/windows/sys` — file/dir/env. MSVC's UCRT has no `<dirent.h>`, its `O_CREAT`/
   `O_TRUNC` are NOT the macOS values `os/sys` declares, its `struct stat` puts `st_mode` elsewhere,
   and `setenv` is absent — so this is a real reimplementation, not a thin alias.
-- `os/winproc` + `std/process_windows` — spawn/stdio/wait/kill over CreateProcessW + pipes.
+- `os/windows/proc` + `std/process_windows` — spawn/stdio/wait/kill over CreateProcessW + pipes.
 - IOCP reactor: `nova_run_root` in `concurrency.cpp` has a Windows branch (it was kqueue-only, so
   EVERY async program aborted with "no reactor driver" — note this still applies to **Linux**).
 
 Things that bite, recorded so they are not rediscovered:
-- **WSAStartup**: POSIX has no init step so callers do not make one. `os/sys_windows.socket` and
-  `socket_windows.getAddrInfo` initialise Winsock themselves; without that, `bind` and hostname
+- **WSAStartup**: POSIX has no init step so callers do not make one. `os/windows/sys.socket` and
+  `os/windows/socket.getAddrInfo` initialise Winsock themselves; without that, `bind` and hostname
   resolution fail while a numeric address appears to work.
 - **Timers**: IOCP has no `EVFILT_TIMER` equivalent. Deadlines use a one-shot timer-queue timer whose
   callback only `PostQueuedCompletionStatus`es, so the fire arrives as a completion and BOTH drivers
@@ -259,7 +259,7 @@ confounded.
 
 **Earlier figures for regression-hunting were 8.0k / 14.1k / 13.6k (web.app, time-boxed).** If
 throughput regresses, suspect these first:
-1. **Persistent fd registration** (`eventloop_linux`). The reactor used to `EPOLL_CTL_ADD` on every
+1. **Persistent fd registration** (`net/ev/epoll`). The reactor used to `EPOLL_CTL_ADD` on every
    submit and `EPOLL_CTL_DEL` on every completion — four `epoll_ctl` calls per keep-alive request on
    top of recv/send. It now ADDs once, re-arms with `EPOLL_CTL_MOD` + `EPOLLONESHOT`, and only DELs
    on close: ~7 syscalls per request down to ~3. Registration state is thread-local in the runtime
@@ -286,7 +286,7 @@ operation completes or is cancelled. Free it there and the pooled record is hand
 next submit zeroes its OVERLAPPED (`issue()` does this first), and the ORIGINAL completion is
 delivered nowhere.
 
-`net/eventloop*.abandonOp(kq, op)` is the seam: it returns whether the CALLER still owns the record.
+`net/ev/<backend>.abandonOp(kq, op)` is the seam: it returns whether the CALLER still owns the record.
 epoll/kqueue answer false (free it); IOCP and io_uring answer true, having marked the record
 `OP_ABANDONED` and issued CancelIoEx / ASYNC_CANCEL — the drain frees it when the completion lands.
 Rules that follow, all of which were violated and cost real debugging:
