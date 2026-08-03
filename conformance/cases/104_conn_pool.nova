@@ -14,7 +14,8 @@ import pool;
 struct Counter {
     pub opens: int,
     pub closes: int,
-    init() { self.opens = 0; self.closes = 0; }
+    pub sick: bool,          // when true, a conn's query fails (drives validate-on-borrow reconnect)
+    init() { self.opens = 0; self.closes = 0; self.sick = false; }
 }
 
 struct CountingConn impl Connection {
@@ -27,6 +28,7 @@ struct CountingConn impl Connection {
         return ExecResult(1, "OK");
     }
     pub async fn query(self, sql: string, params: List<DbValue>): ResultSet {
+        if (self.ctr.sick) { return db.errorResult(db.DbError("", "dead")); }
         let rs = ResultSet();
         rs.columns.push(Column("n", DbType.Int4));
         let r = Row();
@@ -122,6 +124,40 @@ fn test_pool_closeAll_drains(): void {
     p.closeAll();
     assert.equalInt(p.idleCount(), 0);
     assert.equalInt(ctr.closes, 3);       // all three idle conns closed
+}
+
+@test
+fn test_pool_borrowed_accounting(): void {
+    // T7: borrowed + high-water accounting (a leak / sizing signal).
+    let ctr = Counter();
+    let p = Pool(CountingDriver(ctr), "mock://x", 4);
+    let a = p.acquire();
+    let b = p.acquire();
+    assert.equalInt(p.borrowedCount(), 2);
+    assert.equalInt(p.highWaterCount(), 2);
+    p.release(a);
+    assert.equalInt(p.borrowedCount(), 1);   // one back
+    assert.equalInt(p.highWaterCount(), 2);  // high-water sticks
+    p.release(b);
+    assert.equalInt(p.borrowedCount(), 0);
+}
+
+@test
+fn test_pool_validate_on_borrow_reconnects(): void {
+    // T7: with validate-on-borrow, a dead pooled connection is discarded and a fresh one opened.
+    let ctr = Counter();
+    let p = Pool(CountingDriver(ctr), "mock://x", 4);
+    p.configure(0, 0, true);                  // validateOnBorrow = true
+    let c = p.acquire();                      // opens #0
+    p.release(c);                             // idle now holds #0
+    assert.equalInt(ctr.opens, 1);
+
+    ctr.sick = true;                          // the pooled conn is now dead
+    let c2 = p.acquire();                     // ping fails -> discard #0, open #1
+    assert.equalInt(ctr.opens, 2);            // reconnected
+    assert.equalInt(ctr.closes, 1);           // the dead one was closed
+    ctr.sick = false;
+    p.release(c2);
 }
 
 @test

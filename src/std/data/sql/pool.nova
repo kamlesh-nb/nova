@@ -1,39 +1,101 @@
 
 import db;
 import string;
+import datetime;
 import resilience.breaker;
 import net.httpsclient;
+
+fn nowMs(): long { return datetime.nowNs() / 1000000; }
+
+// An idle connection tagged with the wall-clock time it was created, for maxLifetime eviction.
+struct Pooled {
+    pub conn: Connection,
+    pub born: long,
+    init(conn: Connection, born: long) { self.conn = conn; self.born = born; }
+}
 
 pub struct Pool {
     pub driver: Driver,
     pub dsn: string,
-    pub idle: List<Connection>,
+    pub idle: List<Pooled>,
     pub maxIdle: int,
+    pub maxOpen: int,          // 0 = unlimited. A soft cap surfaced via borrowedCount/overflowCount:
+                              // a hard blocking cap needs an async wait primitive (aio.sleep is a stub).
+    pub maxLifetimeMs: long,   // 0 = unlimited; a pooled conn older than this is evicted on acquire.
+    pub validateOnBorrow: bool,// ping a pooled conn (SELECT 1) before handing it out; reconnect on failure.
     pub opened: int,
     pub live: int,
+    pub borrowed: int,         // currently checked-out connections
+    pub highWater: int,        // max simultaneous borrowed seen (leak / sizing signal)
+    pub overflow: int,         // times a new conn was opened while borrowed >= maxOpen (cap exceeded)
 
     init(driver: Driver, dsn: string, maxIdle: int) {
         self.driver = driver;
         self.dsn = dsn;
-        self.idle = List<Connection>();
+        self.idle = List<Pooled>();
         self.maxIdle = if (maxIdle > 0) maxIdle else 1;
+        self.maxOpen = 0;
+        self.maxLifetimeMs = 0;
+        self.validateOnBorrow = false;
         self.opened = 0;
         self.live = 0;
+        self.borrowed = 0;
+        self.highWater = 0;
+        self.overflow = 0;
+    }
+
+    pub fn configure(self, maxOpen: int, maxLifetimeMs: long, validateOnBorrow: bool): void {
+        self.maxOpen = maxOpen;
+        self.maxLifetimeMs = maxLifetimeMs;
+        self.validateOnBorrow = validateOnBorrow;
+    }
+
+    // Health check: a pooled connection is live iff a trivial query succeeds (T1 error channel).
+    async fn ping(self, c: Connection): bool {
+        let r = await c.query("SELECT 1", List<DbValue>());
+        return r.ok();
+    }
+
+    fn markBorrowed(self): void {
+        self.borrowed = self.borrowed + 1;
+        if (self.borrowed > self.highWater) { self.highWater = self.borrowed; }
     }
 
     pub async fn acquire(self): Connection {
-        let n = self.idle.size();
-        if (n > 0) {
-            let c = self.idle.at(n - 1);
-            self.idle.remove(n - 1);
-            return c;
+        let now = nowMs();
+        // Reuse the newest idle connection that is neither aged out nor dead; drop the rest.
+        while (self.idle.size() > 0) {
+            let last = self.idle.size() - 1;
+            let p = self.idle.at(last);
+            self.idle.remove(last);
+            if (self.maxLifetimeMs > 0 && now - p.born > self.maxLifetimeMs) {
+                p.conn.close();
+                if (self.live > 0) { self.live = self.live - 1; }
+                continue;                                   // aged out -> try the next idle
+            }
+            if (self.validateOnBorrow) {
+                let ok = await self.ping(p.conn);
+                if (!ok) {
+                    p.conn.close();
+                    if (self.live > 0) { self.live = self.live - 1; }
+                    continue;                               // dead -> reconnect (fall through / next idle)
+                }
+            }
+            self.markBorrowed();
+            return p.conn;
         }
-        return await self.newConn();
+        // No usable idle connection: open a new one. maxOpen is a soft cap (see field note); record when
+        // it is exceeded so leaks / undersizing are observable.
+        if (self.maxOpen > 0 && self.borrowed >= self.maxOpen) { self.overflow = self.overflow + 1; }
+        let c = await self.newConn();
+        self.markBorrowed();
+        return c;
     }
 
     pub fn release(self, c: Connection): void {
+        if (self.borrowed > 0) { self.borrowed = self.borrowed - 1; }
         if (self.idle.size() < self.maxIdle) {
-            self.idle.push(c);
+            self.idle.push(Pooled(c, nowMs()));
         } else {
             c.close();
             if (self.live > 0) { self.live = self.live - 1; }
@@ -48,6 +110,7 @@ pub struct Pool {
     }
 
     pub fn discard(self, c: Connection): void {
+        if (self.borrowed > 0) { self.borrowed = self.borrowed - 1; }
         c.close();
         if (self.live > 0) { self.live = self.live - 1; }
     }
@@ -55,13 +118,16 @@ pub struct Pool {
     pub fn idleCount(self): int { return self.idle.size(); }
     pub fn openedCount(self): int { return self.opened; }
     pub fn liveCount(self): int { return self.live; }
+    pub fn borrowedCount(self): int { return self.borrowed; }
+    pub fn highWaterCount(self): int { return self.highWater; }
+    pub fn overflowCount(self): int { return self.overflow; }
 
     pub fn closeAll(self): void {
         while (self.idle.size() > 0) {
             let last = self.idle.size() - 1;
-            let c = self.idle.at(last);
+            let p = self.idle.at(last);
             self.idle.remove(last);
-            c.close();
+            p.conn.close();
             if (self.live > 0) { self.live = self.live - 1; }
         }
     }

@@ -366,8 +366,8 @@ test (T16). Next tier is P1 (T6 transactions, T7 pool hardening, ...).
 | T3 | P0 | Correct temporal + special-type decode (ISO dates, mssql FLOAT/DATE*/PLP, bytea hex, BSON ObjectId/datetime) | C5 | pg/mysql/mssql/mongo | [x]* |
 | T4 | P0 | Enforce parameterization: server-side bind, or at minimum fix the `$1..$9`-only substitution + binary-blob escaping | C4 | pg/mysql/btree + ORM | [x]* |
 | T5 | P0 | mongodb: wire `hello` + `authenticate` into connect; parse `cursor.firstBatch` + getMore | -- | mongodb | [x]* |
-| T6 | P1 | Transaction API on Connection trait (begin/commit/rollback + savepoints + rollback-on-drop); fix mssql txn descriptor + ENVCHANGE | C3 | seam + mssql | [ ] |
-| T7 | P1 | Pool hardening: max-open cap, acquire timeout + wait queue, validate-on-borrow, maxLifetime, leak detection, thread-safety, reconnect | C7 | pool | [ ] |
+| T6 | P1 | Transaction API on Connection trait (begin/commit/rollback + savepoints + rollback-on-drop); fix mssql txn descriptor + ENVCHANGE | C3 | seam + mssql | [x]* |
+| T7 | P1 | Pool hardening: max-open cap, acquire timeout + wait queue, validate-on-borrow, maxLifetime, leak detection, thread-safety, reconnect | C7 | pool | [x]* |
 | T8 | P1 | Query-level timeouts + cancellation (connect/statement timeout, PG CancelRequest, TDS ATTENTION) | C9 | seam + all drivers | [ ] |
 | T9 | P1 | Per-connection concurrency guard (exclusive checkout / single in-flight) | C8 | seam + pool | [ ] |
 | T10 | P1 | Async non-blocking DNS + IPv6 (blocking IPv4 getaddrinfo stalls the loop) | -- | net/eventedio | [ ] |
