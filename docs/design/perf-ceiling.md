@@ -159,11 +159,27 @@ exactly those boundaries — do not let the i64 leak back into the hot path.
 **Tracking:** ✅ Part 1 + Part 2 + auto-vectorization landed. Array float loops with **i64 counters**
 vectorize and run ~7× the scalar version. Corpus 254/254 + ASAN clean.
 
-**One follow-on remains for the benchmark set:** an **i32 loop counter** (`let i = 0`, Nova's default
-`int`) updates via a `sext i32→i64` in the induction variable, which defeats LLVM's scalar-evolution so
-the loop won't vectorize. `let i: long = 0` sidesteps it and vectorizes today. The general fix is F3-5
-(honest i64 loop counters / eliminate the IV sext) — that would make `int`-counter array loops vectorize
-without the annotation, which is what most of the benchmark kernels (spectral, nsieve) use.
+**One follow-on remains for the benchmark set — and it's harder than it looks (investigated).** An
+**i32 loop counter** (`let i = 0`, Nova's default `int`) does not vectorize; `let i: long = 0` does
+(measured: the same poly kernel is scalar 357 ms with `int`, vectorized 51 ms with `long`).
+
+Why: `int` is honest 32-bit but lives in an **i64 slot** (canonicalized after each op). So the induction
+variable is an **i64 phi doing 32-bit-wrapping arithmetic** — after opt, the increment is
+`ashr(add(shl(i,32), 2^32), 32)`. LLVM's `IndVarSimplify` widens *narrow* (i32) IVs to i64; it will not
+"re-widen" a wide phi that does narrow math, so SCEV never sees an affine `{0,+,1}` recurrence and the
+vectorizer bails.
+
+Tried and rejected: emitting the int add as `add nsw i32 (trunc iv), 1; sext` — LLVM canonicalizes it
+straight back to the same `shl/ashr` wide-phi form. **`nsw` changes nothing here** (and doesn't even
+change the wrapping result), so it was reverted.
+
+The real fix is an **i32 slot for int loop counters** (a native i32 phi → the C/Rust pattern LLVM
+vectorizes). But blanket i32 int slots were tried before and caused trouble (project memory:
+`nova-honest-int-already-done` — "do NOT retry i32 slots"), so this needs either (a) a *scoped* i32 slot
+for provable loop-induction variables only, or (b) accepting `let i: long = 0` as the documented idiom
+for hot numeric loops. **Recommendation: (b) for now** — it vectorizes today at zero risk; revisit (a)
+only if a real workload needs `int`-counter auto-vectorization. Note that two of the current benchmark
+kernels wouldn't benefit regardless (spectral's inner loop divides; mandelbrot writes a byte buffer).
 
 **Root-cause note discovered while implementing:** the provenance chain must be *pure `ptr`* from the
 allocation through the slot to the GEP — any `ptrtoint`/`inttoptr` round-trip in between launders the
