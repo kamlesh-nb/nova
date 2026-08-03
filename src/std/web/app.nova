@@ -8,8 +8,6 @@ import io.file;
 import web.request;
 import web.response;
 import web.status;
-import web.url;
-import web.multipart;
 import serde.source;
 import web.static_content;
 import web.di;
@@ -77,117 +75,13 @@ fn parsePattern(path: string): List<Seg> {
     return segs;
 }
 
-fn pathSegs(path: string): List<string> {
-    let out = List<string>();
-    let parts = string.split(path, "/");
-    let n = parts.size();
-    let i = 0;
-    while (i < n) {
-        let p = parts.get(i) ?? "";
-        if (p != "") { out.push(p); }
-        i = i + 1;
-    }
-    return out;
-}
-
-fn isAllDigits(s: string): bool {
-    let n = s.length;
-    if (n == 0) { return false; }
-    let i = 0;
-    while (i < n) {
-        let c = s[i];
-        if (c < 48 || c > 57) { return false; }
-        i = i + 1;
-    }
-    return true;
-}
+// Path parsing (pathSegs / isAllDigits) and request-body parsing (MultiMapSource / formSource /
+// multipartSource) now live in web.request -- it is request parsing, not app logic. The App calls them
+// qualified as `request.*` below.
 
 // `text`/`json`/`html` response helpers live in web.mediator (their single definition). Because
 // web.app imports web.mediator, they remain in scope for any module that imports web.app -- so a bare
 // `json(...)` in a handler still resolves, with no duplicate definition to make it ambiguous.
-
-pub struct MultiMapSource impl ValueSource {
-    pub fields: Map<string, List<string>>,
-
-    init(fields: Map<string, List<string>>) { self.fields = fields; }
-
-    pub fn getString(self: MultiMapSource, key: string): string {
-        let l = self.fields.get(key);
-        if (l == undefined) { return ""; }
-        return (l ?? List<string>()).get(0) ?? "";
-    }
-    pub fn getInt(self: MultiMapSource, key: string): long { return string.parseI64(self.getString(key)); }
-    pub fn getBool(self: MultiMapSource, key: string): bool { return string.eql(self.getString(key), "true"); }
-    pub fn getFloat(self: MultiMapSource, key: string): double { return string.parseFloat(self.getString(key)); }
-    pub fn getDecimal(self: MultiMapSource, key: string): decimal { return decimal.fromString(self.getString(key)); }
-    pub fn getChild(self: MultiMapSource, key: string): ValueSource {
-        return MultiMapSource(Map<string, List<string>>(2, string.hash));
-    }
-    pub fn has(self: MultiMapSource, key: string): bool {
-        let l = self.fields.get(key);
-        if (l == undefined) { return false; }
-        return true;
-    }
-    pub fn arrayLen(self: MultiMapSource, key: string): int {
-        let l = self.fields.get(key);
-        if (l == undefined) { return 0; }
-        return (l ?? List<string>()).size();
-    }
-    pub fn itemString(self: MultiMapSource, key: string, i: int): string {
-        let l = self.fields.get(key);
-        if (l == undefined) { return ""; }
-        return (l ?? List<string>()).get(i) ?? "";
-    }
-    pub fn itemInt(self: MultiMapSource, key: string, i: int): long { return string.parseI64(self.itemString(key, i)); }
-    pub fn itemDecimal(self: MultiMapSource, key: string, i: int): decimal { return decimal.fromString(self.itemString(key, i)); }
-    pub fn itemChild(self: MultiMapSource, key: string, i: int): ValueSource {
-        return MultiMapSource(Map<string, List<string>>(2, string.hash));
-    }
-}
-
-fn mmPush(m: Map<string, List<string>>, key: string, val: string): void {
-    let existing = m.get(key);
-    if (existing == undefined) {
-        let lst = List<string>();
-        lst.push(val);
-        m.set(key, lst);
-    } else {
-        (existing ?? List<string>()).push(val);
-    }
-}
-
-pub fn formSource(body: string): MultiMapSource {
-    let m = Map<string, List<string>>(16, string.hash);
-    if (body != "") {
-        let pairs = string.split(body, "&");
-        let i = 0;
-        while (i < pairs.size()) {
-            let pair = pairs.get(i) ?? "";
-            if (pair != "") {
-                let eq = string.indexOf(pair, "=");
-                if (eq == -1) {
-                    mmPush(m, url.decode(pair), "");
-                } else {
-                    mmPush(m, url.decode(string.slice(pair, 0, eq)), url.decode(string.slice(pair, eq + 1, pair.length)));
-                }
-            }
-            i = i + 1;
-        }
-    }
-    return MultiMapSource(m);
-}
-
-pub fn multipartSource(contentType: string, body: string): MultiMapSource {
-    let m = Map<string, List<string>>(16, string.hash);
-    let parts = multipart.parseMultipart(contentType, body);
-    let i = 0;
-    while (i < parts.size()) {
-        let p = parts.get(i) ?? multipart.Part{ name: "", filename: "", contentType: "", data: "" };
-        mmPush(m, p.name, p.data);
-        i = i + 1;
-    }
-    return MultiMapSource(m);
-}
 
 pub struct App {
     pub routes: List<AppRoute>,
@@ -318,10 +212,10 @@ pub struct App {
             let contentType = req.getHeader("content-type") ?? "";
             let ct = string.toLowerCase(contentType);
             if (string.indexOf(ct, "multipart/form-data") != -1) {
-                return multipartSource(contentType, req.body);
+                return request.multipartSource(contentType, req.body);
             }
             if (string.indexOf(ct, "x-www-form-urlencoded") != -1) {
-                return formSource(req.body);
+                return request.formSource(req.body);
             }
             return source.fromJson(req.body);
         }
@@ -329,7 +223,7 @@ pub struct App {
     }
 
     pub async fn dispatch(self: App, req: Request): response.Response {
-        let segs = pathSegs(req.path);
+        let segs = request.pathSegs(req.path);
         let nseg = segs.size();
         let nroutes = self.routes.size();
         let path_matched = false;
@@ -345,7 +239,7 @@ pub struct App {
                     let pat = route.segs.at(i);
                     let val = segs.get(i) ?? "";
                     if (pat.is_param) {
-                        if (string.eql(pat.ptype, "int") && !isAllDigits(val)) {
+                        if (string.eql(pat.ptype, "int") && !request.isAllDigits(val)) {
                             typed_bad = true;
                             ok = false;
                         } else {

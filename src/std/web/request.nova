@@ -6,6 +6,8 @@ import bytes;
 import assert;
 import os.sys;
 import web.url;
+import web.multipart;
+import serde.source;
 
 // HTTP/1 request parsing. The hot path uses a memchr (SIMD-backed, os/sys) delimiter scan over the
 // raw buffer and slices method/path/headers directly out of it -- no `string.split` (no per-line
@@ -339,6 +341,124 @@ pub fn bufMethodPath(buf: long, len: int): (string, string) {
     }
     let path = bytes.read_string(buf + ps, pe - ps);
     return (method, path);
+}
+
+// ── Path parsing ──────────────────────────────────────────────────────────────
+// Split a request path into its non-empty segments, and a typed-parameter validator. Used by the
+// App router to match a path against its route table.
+
+pub fn pathSegs(path: string): List<string> {
+    let out = List<string>();
+    let parts = string.split(path, "/");
+    let n = parts.size();
+    let i = 0;
+    while (i < n) {
+        let p = parts.get(i) ?? "";
+        if (p != "") { out.push(p); }
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn isAllDigits(s: string): bool {
+    let n = s.length;
+    if (n == 0) { return false; }
+    let i = 0;
+    while (i < n) {
+        let c = s[i];
+        if (c < 48 || c > 57) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ── Request body parsing ──────────────────────────────────────────────────────
+// Parse a form body (application/x-www-form-urlencoded or multipart/form-data) into a ValueSource so a
+// handler binds it the same way it binds a JSON body. A form field can repeat, so the backing store maps
+// each key to a List<string>; MultiMapSource exposes the first value for scalar reads and the whole list
+// for array reads.
+
+pub struct MultiMapSource impl ValueSource {
+    pub fields: Map<string, List<string>>,
+
+    init(fields: Map<string, List<string>>) { self.fields = fields; }
+
+    pub fn getString(self: MultiMapSource, key: string): string {
+        let l = self.fields.get(key);
+        if (l == undefined) { return ""; }
+        return (l ?? List<string>()).get(0) ?? "";
+    }
+    pub fn getInt(self: MultiMapSource, key: string): long { return string.parseI64(self.getString(key)); }
+    pub fn getBool(self: MultiMapSource, key: string): bool { return string.eql(self.getString(key), "true"); }
+    pub fn getFloat(self: MultiMapSource, key: string): double { return string.parseFloat(self.getString(key)); }
+    pub fn getDecimal(self: MultiMapSource, key: string): decimal { return decimal.fromString(self.getString(key)); }
+    pub fn getChild(self: MultiMapSource, key: string): ValueSource {
+        return MultiMapSource(Map<string, List<string>>(2, string.hash));
+    }
+    pub fn has(self: MultiMapSource, key: string): bool {
+        let l = self.fields.get(key);
+        if (l == undefined) { return false; }
+        return true;
+    }
+    pub fn arrayLen(self: MultiMapSource, key: string): int {
+        let l = self.fields.get(key);
+        if (l == undefined) { return 0; }
+        return (l ?? List<string>()).size();
+    }
+    pub fn itemString(self: MultiMapSource, key: string, i: int): string {
+        let l = self.fields.get(key);
+        if (l == undefined) { return ""; }
+        return (l ?? List<string>()).get(i) ?? "";
+    }
+    pub fn itemInt(self: MultiMapSource, key: string, i: int): long { return string.parseI64(self.itemString(key, i)); }
+    pub fn itemDecimal(self: MultiMapSource, key: string, i: int): decimal { return decimal.fromString(self.itemString(key, i)); }
+    pub fn itemChild(self: MultiMapSource, key: string, i: int): ValueSource {
+        return MultiMapSource(Map<string, List<string>>(2, string.hash));
+    }
+}
+
+fn mmPush(m: Map<string, List<string>>, key: string, val: string): void {
+    let existing = m.get(key);
+    if (existing == undefined) {
+        let lst = List<string>();
+        lst.push(val);
+        m.set(key, lst);
+    } else {
+        (existing ?? List<string>()).push(val);
+    }
+}
+
+pub fn formSource(body: string): MultiMapSource {
+    let m = Map<string, List<string>>(16, string.hash);
+    if (body != "") {
+        let pairs = string.split(body, "&");
+        let i = 0;
+        while (i < pairs.size()) {
+            let pair = pairs.get(i) ?? "";
+            if (pair != "") {
+                let eq = string.indexOf(pair, "=");
+                if (eq == -1) {
+                    mmPush(m, url.decode(pair), "");
+                } else {
+                    mmPush(m, url.decode(string.slice(pair, 0, eq)), url.decode(string.slice(pair, eq + 1, pair.length)));
+                }
+            }
+            i = i + 1;
+        }
+    }
+    return MultiMapSource(m);
+}
+
+pub fn multipartSource(contentType: string, body: string): MultiMapSource {
+    let m = Map<string, List<string>>(16, string.hash);
+    let parts = multipart.parseMultipart(contentType, body);
+    let i = 0;
+    while (i < parts.size()) {
+        let p = parts.get(i) ?? multipart.Part{ name: "", filename: "", contentType: "", data: "" };
+        mmPush(m, p.name, p.data);
+        i = i + 1;
+    }
+    return MultiMapSource(m);
 }
 
 @test

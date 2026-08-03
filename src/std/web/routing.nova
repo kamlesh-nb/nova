@@ -34,16 +34,11 @@ struct DispatchResult {
     init(status: int, body: string) { self.status = status; self.body = body; }
 }
 
-fn routeSplit(path: string): List<string> {
-    let out = List<string>();
-    let parts = string.split(path, "/");
-    for (p in parts) { if (p != "") { out.push(p); } }
-    return out;
-}
+// Path splitting lives in web.request (request.pathSegs); routing reuses it rather than keeping its own.
 
 fn parsePattern(path: string): List<RouteSeg> {
     let segs = List<RouteSeg>();
-    let splits = routeSplit(path);
+    let splits = request.pathSegs(path);
     let pi = 0;
     while (pi < splits.size()) {
         let p = splits.at(pi);
@@ -72,7 +67,7 @@ pub struct Router {
     }
 
     pub fn route(self: Router, method: string, path: string, body: ValueSource): DispatchResult {
-        let reqSegs = routeSplit(path);
+        let reqSegs = request.pathSegs(path);
         let pathMatched = false;
         let ri = 0;
         while (ri < self.routes.size()) {
