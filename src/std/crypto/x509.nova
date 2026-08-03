@@ -31,14 +31,16 @@ const KEY_UNKNOWN: int = -1;
 fn ptrAt(buf: ptr, off: int): ptr { return (buf as long + off) as ptr; }
 
 // A DER TLV: tag byte, content range [start, start+len), and next = the position just past this TLV.
-struct Tlv {
+pub struct Tlv {
     pub tag: int,
     pub start: int,
     pub len: int,
     pub next: int,
 }
 
-fn readTlv(buf: ptr, pos: int): Tlv {
+// A DER TLV (tag-length-value) reader at `pos`: returns the tag, the value offset (start), the value
+// length, and the offset just past the value (next). Exposed for the OCSP/CRL parsers.
+pub fn readTlv(buf: ptr, pos: int): Tlv {
     let tag = bytes.read_byte(buf, pos);
     let p = pos + 1;
     let b = bytes.read_byte(buf, p);

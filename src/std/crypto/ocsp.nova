@@ -1,0 +1,316 @@
+// OCSP (RFC 6960) certificate-revocation checking, client side. A TLS client validates a stapled or
+// fetched OCSPResponse: parse its status, confirm the SingleResponse says the leaf is `good` (not
+// `revoked`), and verify the responder's signature over the tbsResponseData. This module provides the
+// ASN.1 parse + signature verification (offline-testable), a request builder for the non-stapled path,
+// and a response builder (used by the round-trip gate and usable as a Nova OCSP responder). The actual
+// HTTP fetch to the responder URL is the caller's job (live network).
+//
+// Only the common shape is handled: an ECDSA-P256/SHA-256 responder, DEFAULT v1 (no version field), a
+// byKey responderID, and the first SingleResponse. RSA responders + multi-response are follow-ons.
+
+import bytes;
+import crypto.x509;
+import crypto.hash.sha256;
+import crypto.hash.sha1;
+import crypto.ecc.p256;
+
+pub const STATUS_SUCCESSFUL: int = 0;
+pub const CERT_GOOD: int = 0;
+pub const CERT_REVOKED: int = 1;
+pub const CERT_UNKNOWN: int = 2;
+pub const CERT_ERROR: int = 0 - 1;
+pub const SIG_ECDSA_SHA256: int = 0;
+pub const SIG_UNKNOWN: int = 0 - 1;
+
+pub struct OcspResult {
+    pub responseStatus: int,     // 0 = successful
+    pub certStatus: int,         // CERT_GOOD / CERT_REVOKED / CERT_UNKNOWN / CERT_ERROR
+    pub serialOff: int, pub serialLen: int,
+    pub tbsStart: int, pub tbsLen: int,     // the signed tbsResponseData (DER, tag..value)
+    pub sigAlg: int, pub sigOff: int, pub sigLen: int,
+    pub ok: bool,
+
+    init() {
+        self.responseStatus = 0 - 1; self.certStatus = CERT_ERROR;
+        self.serialOff = 0; self.serialLen = 0; self.tbsStart = 0; self.tbsLen = 0;
+        self.sigAlg = SIG_UNKNOWN; self.sigOff = 0; self.sigLen = 0; self.ok = false;
+    }
+    pub fn isGood(self: OcspResult): bool { return self.ok && self.responseStatus == 0 && self.certStatus == CERT_GOOD; }
+    pub fn isRevoked(self: OcspResult): bool { return self.ok && self.responseStatus == 0 && self.certStatus == CERT_REVOKED; }
+}
+
+// ecdsa-with-SHA256 OID = 1.2.840.10045.4.3.2 -> DER content bytes.
+fn isEcdsaSha256(buf: ptr, algSeqStart: int): bool {
+    // algSeqStart points at the AlgorithmIdentifier SEQUENCE; read its OID and compare the tail bytes.
+    let seq = x509.readTlv(buf, algSeqStart);
+    let oid = x509.readTlv(buf, seq.start);
+    if (oid.len != 8) { return false; }
+    // 2a 86 48 ce 3d 04 03 02
+    return bytes.read_byte(buf, oid.start) == 0x2a && bytes.read_byte(buf, oid.start + 5) == 0x04
+        && bytes.read_byte(buf, oid.start + 6) == 0x03 && bytes.read_byte(buf, oid.start + 7) == 0x02;
+}
+
+// Parse an OCSPResponse (DER) into status + signed-region offsets. On any structural problem, ok stays
+// false. Handles: responseStatus, responseBytes -> BasicOCSPResponse -> tbsResponseData + signature, and
+// within the tbs the first SingleResponse's serial + certStatus.
+pub fn parseOcspResponse(der: ptr, len: int): OcspResult {
+    let r = OcspResult();
+    let top = x509.readTlv(der, 0);                  // OCSPResponse SEQUENCE
+    if (top.tag != 0x30) { return r; }
+    let rs = x509.readTlv(der, top.start);           // responseStatus ENUMERATED
+    if (rs.tag != 0x0a) { return r; }
+    r.responseStatus = bytes.read_byte(der, rs.start);
+    if (r.responseStatus != 0) { r.ok = true; return r; }   // a non-successful response is validly parsed
+
+    let rbCtx = x509.readTlv(der, rs.next);          // [0] responseBytes
+    if (rbCtx.tag != 0xa0) { return r; }
+    let rbSeq = x509.readTlv(der, rbCtx.start);      // ResponseBytes SEQUENCE
+    let rtype = x509.readTlv(der, rbSeq.start);      // responseType OID
+    let respOct = x509.readTlv(der, rtype.next);     // response OCTET STRING = BasicOCSPResponse
+    let basic = x509.readTlv(der, respOct.start);    // BasicOCSPResponse SEQUENCE
+    let tbs = x509.readTlv(der, basic.start);        // tbsResponseData (ResponseData SEQUENCE)
+    r.tbsStart = basic.start;
+    r.tbsLen = tbs.next - basic.start;
+    let sigAlgStart = tbs.next;
+    if (isEcdsaSha256(der, sigAlgStart)) { r.sigAlg = SIG_ECDSA_SHA256; }
+    let sigAlgTlv = x509.readTlv(der, sigAlgStart);
+    let sigBit = x509.readTlv(der, sigAlgTlv.next);  // signature BIT STRING
+    r.sigOff = sigBit.start + 1;                     // skip unused-bits byte
+    r.sigLen = sigBit.len - 1;
+
+    // Walk tbsResponseData: [0]version? , responderID , producedAt , responses SEQUENCE OF SingleResponse
+    let t = tbs.start;
+    let first = x509.readTlv(der, t);
+    if (first.tag == 0xa0) { t = first.next; first = x509.readTlv(der, t); }   // skip optional version [0]
+    // first is responderID ([1] byName / [2] byKey) -- skip it
+    t = first.next;
+    let produced = x509.readTlv(der, t);             // producedAt GeneralizedTime
+    t = produced.next;
+    let responses = x509.readTlv(der, t);            // SEQUENCE OF SingleResponse
+    let sr = x509.readTlv(der, responses.start);     // first SingleResponse SEQUENCE
+    let certId = x509.readTlv(der, sr.start);        // CertID SEQUENCE
+    // CertID: hashAlgorithm, issuerNameHash, issuerKeyHash, serialNumber
+    let c = certId.start;
+    let ha = x509.readTlv(der, c); c = ha.next;
+    let inh = x509.readTlv(der, c); c = inh.next;
+    let ikh = x509.readTlv(der, c); c = ikh.next;
+    let serial = x509.readTlv(der, c);               // serialNumber INTEGER
+    r.serialOff = serial.start; r.serialLen = serial.len;
+    // certStatus follows the CertID
+    let status = x509.readTlv(der, certId.next);
+    if (status.tag == 0x80) { r.certStatus = CERT_GOOD; }
+    else if (status.tag == 0xa1) { r.certStatus = CERT_REVOKED; }
+    else if (status.tag == 0x82) { r.certStatus = CERT_UNKNOWN; }
+    else { r.certStatus = CERT_ERROR; }
+    r.ok = true;
+    return r;
+}
+
+// Verify the responder's signature over tbsResponseData with a P-256 responder public key (65-byte
+// point). Returns false unless the response is ECDSA-P256/SHA-256 and the signature validates.
+pub fn verifyOcspSignatureEc(der: ptr, res: OcspResult, responderPub65: ptr): bool {
+    if (!res.ok || res.sigAlg != SIG_ECDSA_SHA256) { return false; }
+    let digest = bytes.alloc(32);
+    sha256.hashInto((der as long + res.tbsStart) as ptr, res.tbsLen, digest);
+    let sigPtr = (der as long + res.sigOff) as ptr;
+    let r = bytes.alloc(32); let s = bytes.alloc(32);
+    decodeSig(sigPtr, r, s);
+    let ok = p256.ecdsaVerify(digest, responderPub65, r, s);
+    bytes.free(digest); bytes.free(r); bytes.free(s);
+    return ok;
+}
+
+fn decodeSig(sig: ptr, rOut: ptr, sOut: ptr): void {
+    // DER ECDSA-Sig-Value SEQUENCE { r INTEGER, s INTEGER }, single-byte lengths.
+    let rTag = 2 + 2;                 // seq header(2) then r header(2) -> r value at offset 4
+    let rLen = bytes.read_byte(sig, 3);
+    let sValHdr = rTag + rLen;        // s header
+    let sTag = sValHdr + 2;
+    let sLen = bytes.read_byte(sig, sValHdr + 1);
+    intTo(sig, rTag, rLen, rOut);
+    intTo(sig, sTag, sLen, sOut);
+}
+fn intTo(buf: ptr, start: int, len: int, out: ptr): void {
+    let s = start; let l = len;
+    while (l > 0 && bytes.read_byte(buf, s) == 0) { s = s + 1; l = l - 1; }
+    let i = 0;
+    while (i < 32) { bytes.write_byte(out, i, 0); i = i + 1; }
+    let pad = 32 - l;
+    i = 0;
+    while (i < l) { bytes.write_byte(out, pad + i, bytes.read_byte(buf, s + i)); i = i + 1; }
+}
+
+// --- DER writer helpers (bottom-up construction) -------------------------------------------------
+fn wlen(out: ptr, off: int, n: int): int {
+    if (n < 0x80) { bytes.write_byte(out, off, n); return 1; }
+    if (n < 0x100) { bytes.write_byte(out, off, 0x81); bytes.write_byte(out, off + 1, n); return 2; }
+    bytes.write_byte(out, off, 0x82); bytes.write_byte(out, off + 1, (n >> 8) & 0xff); bytes.write_byte(out, off + 2, n & 0xff);
+    return 3;
+}
+// Write tag || len(childLen) || child into out at off; return bytes written.
+fn wrap(out: ptr, off: int, tag: int, child: ptr, childLen: int): int {
+    bytes.write_byte(out, off, tag);
+    let ln = wlen(out, off + 1, childLen);
+    let p = off + 1 + ln;
+    let i = 0;
+    while (i < childLen) { bytes.write_byte(out, p + i, bytes.read_byte(child, i)); i = i + 1; }
+    return 1 + ln + childLen;
+}
+fn cat(out: ptr, off: int, src: ptr, n: int): int {
+    let i = 0;
+    while (i < n) { bytes.write_byte(out, off + i, bytes.read_byte(src, i)); i = i + 1; }
+    return n;
+}
+
+// Build an OCSPRequest for one CertID (issuerNameHash + issuerKeyHash are 20-byte SHA-1 digests, serial
+// is the leaf serial INTEGER value). Returns the DER length into `out`. (POST this to the AIA responder.)
+pub fn buildOcspRequest(nameHash20: ptr, keyHash20: ptr, serial: ptr, serialLen: int, out: ptr): int {
+    // CertID = SEQ { AlgId(sha1), OCTET(nameHash), OCTET(keyHash), INTEGER(serial) }
+    let alg = bytes.alloc(16);
+    // sha1 AlgorithmIdentifier: SEQ { OID 1.3.14.3.2.26, NULL }
+    let algInner = bytes.alloc(11);
+    let ai = 0;
+    bytes.write_byte(algInner, ai, 0x06); bytes.write_byte(algInner, ai + 1, 0x05);
+    bytes.write_byte(algInner, ai + 2, 0x2b); bytes.write_byte(algInner, ai + 3, 0x0e); bytes.write_byte(algInner, ai + 4, 0x03);
+    bytes.write_byte(algInner, ai + 5, 0x02); bytes.write_byte(algInner, ai + 6, 0x1a); ai = ai + 7;
+    bytes.write_byte(algInner, ai, 0x05); bytes.write_byte(algInner, ai + 1, 0x00); ai = ai + 2;
+    let algLen = wrap(alg, 0, 0x30, algInner, ai);
+
+    let cid = bytes.alloc(128);
+    let cp = 0;
+    cp = cp + cat(cid, cp, alg, algLen);
+    let onh = bytes.alloc(24); let onhLen = wrap(onh, 0, 0x04, nameHash20, 20); cp = cp + cat(cid, cp, onh, onhLen);
+    let okh = bytes.alloc(24); let okhLen = wrap(okh, 0, 0x04, keyHash20, 20); cp = cp + cat(cid, cp, okh, okhLen);
+    let ser = bytes.alloc(serialLen + 4); let serLen = wrap(ser, 0, 0x02, serial, serialLen); cp = cp + cat(cid, cp, ser, serLen);
+    let certId = bytes.alloc(160); let certIdLen = wrap(certId, 0, 0x30, cid, cp);
+
+    // Request = SEQ { reqCert CertID }  ; Request list = SEQ OF Request ; TBSRequest = SEQ { requestList }
+    let req = bytes.alloc(180); let reqLen = wrap(req, 0, 0x30, certId, certIdLen);
+    let reqList = bytes.alloc(200); let reqListLen = wrap(reqList, 0, 0x30, req, reqLen);
+    let tbs = bytes.alloc(220); let tbsLen = wrap(tbs, 0, 0x30, reqList, reqListLen);
+    let total = wrap(out, 0, 0x30, tbs, tbsLen);       // OCSPRequest = SEQ { tbsRequest }
+    return total;
+}
+
+// Build a signed OCSPResponse for one serial with the given status, signed by an ECDSA-P256 key. Used by
+// the round-trip gate; also a minimal Nova OCSP responder. `keyHash20` is the responder key hash
+// (responderID byKey), `time15` a 15-byte GeneralizedTime ("YYYYMMDDhhmmssZ").
+pub fn buildTestResponse(serial: ptr, serialLen: int, certStatus: int, key32: ptr, keyHash20: ptr, time15: ptr, out: ptr): int {
+    // certID (issuer hashes are arbitrary 20-byte fillers for the gate)
+    let filler = bytes.alloc(20);
+    let fi = 0; while (fi < 20) { bytes.write_byte(filler, fi, 0xAB); fi = fi + 1; }
+    let cidReq = bytes.alloc(200);
+    let cidLen = certIdDer(filler, filler, serial, serialLen, cidReq);
+
+    // certStatus
+    let cs = bytes.alloc(32); let csLen = 0;
+    if (certStatus == CERT_REVOKED) {
+        // [1] RevokedInfo { revocationTime GeneralizedTime }
+        let rt = bytes.alloc(20); let rtLen = wrap(rt, 0, 0x18, time15, 15);
+        csLen = wrap(cs, 0, 0xa1, rt, rtLen);
+    } else {
+        bytes.write_byte(cs, 0, 0x80); bytes.write_byte(cs, 1, 0x00); csLen = 2;   // good
+    }
+    // thisUpdate
+    let tu = bytes.alloc(20); let tuLen = wrap(tu, 0, 0x18, time15, 15);
+
+    // SingleResponse = SEQ { certID, certStatus, thisUpdate }
+    let srBody = bytes.alloc(300); let sp = 0;
+    sp = sp + cat(srBody, sp, cidReq, cidLen);
+    sp = sp + cat(srBody, sp, cs, csLen);
+    sp = sp + cat(srBody, sp, tu, tuLen);
+    let sr = bytes.alloc(320); let srLen = wrap(sr, 0, 0x30, srBody, sp);
+    let responses = bytes.alloc(340); let respLen = wrap(responses, 0, 0x30, sr, srLen);
+
+    // responderID byKey [2] EXPLICIT KeyHash(OCTET STRING)
+    let kh = bytes.alloc(24); let khLen = wrap(kh, 0, 0x04, keyHash20, 20);
+    let rid = bytes.alloc(28); let ridLen = wrap(rid, 0, 0xa2, kh, khLen);
+    // producedAt
+    let pa = bytes.alloc(20); let paLen = wrap(pa, 0, 0x18, time15, 15);
+
+    // tbsResponseData = SEQ { responderID, producedAt, responses }
+    let tbsBody = bytes.alloc(420); let tp = 0;
+    tp = tp + cat(tbsBody, tp, rid, ridLen);
+    tp = tp + cat(tbsBody, tp, pa, paLen);
+    tp = tp + cat(tbsBody, tp, responses, respLen);
+    let tbs = bytes.alloc(460); let tbsLen = wrap(tbs, 0, 0x30, tbsBody, tp);
+
+    // sign SHA-256(tbs)
+    let digest = bytes.alloc(32); sha256.hashInto(tbs, tbsLen, digest);
+    let r = bytes.alloc(32); let s = bytes.alloc(32); p256.ecdsaSign(digest, key32, r, s);
+    let sigVal = bytes.alloc(80); let sigValLen = encodeSig(r, s, sigVal);
+    // signature BIT STRING = 00 || DER-sig
+    let bitBody = bytes.alloc(84); bytes.write_byte(bitBody, 0, 0x00); let bb = 1 + cat(bitBody, 1, sigVal, sigValLen);
+    let sigBit = bytes.alloc(88); let sigBitLen = wrap(sigBit, 0, 0x03, bitBody, bb);
+
+    // signatureAlgorithm = SEQ { OID ecdsa-with-SHA256 } = 30 0a 06 08 2a8648ce3d040302
+    let sigAlg = bytes.alloc(12);
+    bytes.write_byte(sigAlg, 0, 0x30); bytes.write_byte(sigAlg, 1, 0x0a);
+    bytes.write_byte(sigAlg, 2, 0x06); bytes.write_byte(sigAlg, 3, 0x08);
+    bytes.write_byte(sigAlg, 4, 0x2a); bytes.write_byte(sigAlg, 5, 0x86); bytes.write_byte(sigAlg, 6, 0x48);
+    bytes.write_byte(sigAlg, 7, 0xce); bytes.write_byte(sigAlg, 8, 0x3d); bytes.write_byte(sigAlg, 9, 0x04);
+    bytes.write_byte(sigAlg, 10, 0x03); bytes.write_byte(sigAlg, 11, 0x02);
+
+    // BasicOCSPResponse = SEQ { tbs, sigAlg, signature }
+    let basicBody = bytes.alloc(600); let bp = 0;
+    bp = bp + cat(basicBody, bp, tbs, tbsLen);
+    bp = bp + cat(basicBody, bp, sigAlg, 12);
+    bp = bp + cat(basicBody, bp, sigBit, sigBitLen);
+    let basic = bytes.alloc(640); let basicLen = wrap(basic, 0, 0x30, basicBody, bp);
+
+    // ResponseBytes = SEQ { OID id-pkix-ocsp-basic, OCTET STRING(basic) }
+    let oid = bytes.alloc(11);
+    bytes.write_byte(oid, 0, 0x06); bytes.write_byte(oid, 1, 0x09);
+    bytes.write_byte(oid, 2, 0x2b); bytes.write_byte(oid, 3, 0x06); bytes.write_byte(oid, 4, 0x01);
+    bytes.write_byte(oid, 5, 0x05); bytes.write_byte(oid, 6, 0x05); bytes.write_byte(oid, 7, 0x07);
+    bytes.write_byte(oid, 8, 0x30); bytes.write_byte(oid, 9, 0x01); bytes.write_byte(oid, 10, 0x01);
+    let oct = bytes.alloc(660); let octLen = wrap(oct, 0, 0x04, basic, basicLen);
+    let rbBody = bytes.alloc(680); let rp = 0;
+    rp = rp + cat(rbBody, rp, oid, 11);
+    rp = rp + cat(rbBody, rp, oct, octLen);
+    let rbSeq = bytes.alloc(700); let rbSeqLen = wrap(rbSeq, 0, 0x30, rbBody, rp);
+    let rbCtx = bytes.alloc(720); let rbCtxLen = wrap(rbCtx, 0, 0xa0, rbSeq, rbSeqLen);
+
+    // OCSPResponse = SEQ { responseStatus ENUMERATED(0), [0] responseBytes }
+    let outBody = bytes.alloc(740); let op = 0;
+    bytes.write_byte(outBody, op, 0x0a); bytes.write_byte(outBody, op + 1, 0x01); bytes.write_byte(outBody, op + 2, 0x00); op = op + 3;
+    op = op + cat(outBody, op, rbCtx, rbCtxLen);
+    return wrap(out, 0, 0x30, outBody, op);
+}
+
+// certID = SEQ { AlgId(sha1), OCTET(nameHash), OCTET(keyHash), INTEGER(serial) }
+fn certIdDer(nameHash20: ptr, keyHash20: ptr, serial: ptr, serialLen: int, out: ptr): int {
+    let algInner = bytes.alloc(11);
+    bytes.write_byte(algInner, 0, 0x06); bytes.write_byte(algInner, 1, 0x05);
+    bytes.write_byte(algInner, 2, 0x2b); bytes.write_byte(algInner, 3, 0x0e); bytes.write_byte(algInner, 4, 0x03);
+    bytes.write_byte(algInner, 5, 0x02); bytes.write_byte(algInner, 6, 0x1a);
+    bytes.write_byte(algInner, 7, 0x05); bytes.write_byte(algInner, 8, 0x00);
+    let alg = bytes.alloc(16); let algLen = wrap(alg, 0, 0x30, algInner, 9);
+    let body = bytes.alloc(128); let p = 0;
+    p = p + cat(body, p, alg, algLen);
+    let onh = bytes.alloc(24); let onhLen = wrap(onh, 0, 0x04, nameHash20, 20); p = p + cat(body, p, onh, onhLen);
+    let okh = bytes.alloc(24); let okhLen = wrap(okh, 0, 0x04, keyHash20, 20); p = p + cat(body, p, okh, okhLen);
+    let ser = bytes.alloc(serialLen + 4); let serLen = wrap(ser, 0, 0x02, serial, serialLen); p = p + cat(body, p, ser, serLen);
+    return wrap(out, 0, 0x30, body, p);
+}
+
+fn encodeSig(r: ptr, s: ptr, out: ptr): int {
+    let rlen = encInt(r, out, 2);
+    let slen = encInt(s, out, 2 + rlen);
+    let total = rlen + slen;
+    bytes.write_byte(out, 0, 0x30); bytes.write_byte(out, 1, total);
+    return 2 + total;
+}
+fn encInt(src: ptr, out: ptr, off: int): int {
+    let s = 0;
+    while (s < 31 && bytes.read_byte(src, s) == 0) { s = s + 1; }
+    let pad = 0;
+    if ((bytes.read_byte(src, s) & 0x80) != 0) { pad = 1; }
+    let vlen = 32 - s + pad;
+    bytes.write_byte(out, off, 0x02); bytes.write_byte(out, off + 1, vlen);
+    let p = off + 2;
+    if (pad == 1) { bytes.write_byte(out, p, 0); p = p + 1; }
+    let i = s;
+    while (i < 32) { bytes.write_byte(out, p, bytes.read_byte(src, i)); p = p + 1; i = i + 1; }
+    return p - off;
+}

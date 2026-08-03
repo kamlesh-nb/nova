@@ -1,0 +1,80 @@
+// T15 mTLS phase 3: OCSP (RFC 6960) revocation checking. Gates the ASN.1 parse + responder-signature
+// verification by round-tripping a signed OCSPResponse (built by the same module, which doubles as a
+// minimal responder): a `good` response parses to CERT_GOOD and its ECDSA signature validates; a
+// `revoked` response parses to CERT_REVOKED; a wrong responder key fails verification; the request
+// builder emits a well-formed OCSPRequest. (The live HTTP fetch to the AIA responder is the caller's job.)
+import crypto.ocsp;
+import crypto.ecc.p256;
+import bytes;
+import assert;
+
+fn fill(buf: ptr, n: int, seed: int): void {
+    let i = 0; while (i < n) { bytes.write_byte(buf, i, (i * 5 + seed) & 0xff); i = i + 1; }
+}
+fn mkTime(): ptr {
+    let t = "20260803120000Z";
+    let b = bytes.alloc(15);
+    let i = 0; while (i < 15) { bytes.write_byte(b, i, t[i]); i = i + 1; }
+    return b;
+}
+fn mkSerial(): ptr {
+    let s = bytes.alloc(8); fill(s, 8, 3); bytes.write_byte(s, 0, 0x10);   // high bit clear -> no DER pad
+    return s;
+}
+
+@test
+fn test_ocsp_good_roundtrip(): void {
+    let key = bytes.alloc(32); fill(key, 32, 1); bytes.write_byte(key, 0, 0x11);
+    let pubKey = bytes.alloc(65); p256.derivePublic(pubKey, key);
+    let keyHash = bytes.alloc(20); fill(keyHash, 20, 7);
+    let serial = mkSerial();
+
+    let resp = bytes.alloc(1024);
+    let n = ocsp.buildTestResponse(serial, 8, ocsp.CERT_GOOD, key, keyHash, mkTime(), resp);
+    assert.isTrue(n > 0);
+
+    let res = ocsp.parseOcspResponse(resp, n);
+    assert.isTrue(res.ok);
+    assert.equalInt(0, res.responseStatus);
+    assert.equalInt(ocsp.CERT_GOOD, res.certStatus);
+    assert.isTrue(res.isGood());
+    assert.isFalse(res.isRevoked());
+
+    // serial round-trips (value + length)
+    assert.equalInt(8, res.serialLen);
+    let i = 0;
+    while (i < 8) { assert.equalInt(bytes.read_byte(serial, i), bytes.read_byte(resp, res.serialOff + i)); i = i + 1; }
+
+    // responder signature verifies with the right key, fails with a wrong one
+    assert.isTrue(ocsp.verifyOcspSignatureEc(resp, res, pubKey));
+    let badKey = bytes.alloc(32); fill(badKey, 32, 9); bytes.write_byte(badKey, 0, 0x22);
+    let badPub = bytes.alloc(65); p256.derivePublic(badPub, badKey);
+    assert.isFalse(ocsp.verifyOcspSignatureEc(resp, res, badPub));
+}
+
+@test
+fn test_ocsp_revoked(): void {
+    let key = bytes.alloc(32); fill(key, 32, 1); bytes.write_byte(key, 0, 0x11);
+    let pubKey = bytes.alloc(65); p256.derivePublic(pubKey, key);
+    let keyHash = bytes.alloc(20); fill(keyHash, 20, 7);
+
+    let resp = bytes.alloc(1024);
+    let n = ocsp.buildTestResponse(mkSerial(), 8, ocsp.CERT_REVOKED, key, keyHash, mkTime(), resp);
+    let res = ocsp.parseOcspResponse(resp, n);
+    assert.isTrue(res.ok);
+    assert.equalInt(ocsp.CERT_REVOKED, res.certStatus);
+    assert.isTrue(res.isRevoked());
+    assert.isFalse(res.isGood());
+    assert.isTrue(ocsp.verifyOcspSignatureEc(resp, res, pubKey));   // a revoked response is still signed
+}
+
+@test
+fn test_ocsp_request_build(): void {
+    let nameHash = bytes.alloc(20); fill(nameHash, 20, 2);
+    let keyHash = bytes.alloc(20); fill(keyHash, 20, 4);
+    let serial = mkSerial();
+    let req = bytes.alloc(256);
+    let n = ocsp.buildOcspRequest(nameHash, keyHash, serial, 8, req);
+    assert.isTrue(n > 0);
+    assert.equalInt(0x30, bytes.read_byte(req, 0));   // OCSPRequest SEQUENCE
+}
