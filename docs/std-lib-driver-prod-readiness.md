@@ -36,11 +36,11 @@ the end is the recommended order of work; nothing here has been changed yet.
 | IO / FS / OS | Beta | file/dir/process complete incl. isolated spawn + full Windows backend. Gaps: stat/metadata, recursive mkdir, tree walk, mmap. |
 | String / JSON | Beta | Solid split/join/slice/parse + JSON DOM. Gaps: format/printf, padStart, streaming/error-reporting parse. |
 | Serde (yaml, bson) | Alpha | yaml + bson complete-ish but subset; no streaming, weak error reporting. |
-| Collections | Alpha | Generic list/map/set but bare: no sort/contains/indexOf, no deque/heap/ordered map. |
+| Collections | Beta | list ext (sort/contains/indexOf/any/all/...) + Deque + Heap + OrderedMap now shipped (T15). |
 | Text / Unicode | Alpha | utf8 codepoints + Thompson-NFA regex; no normalization/grapheme/casefold, no backrefs/lookaround. |
 | Concurrency | Alpha | atomic + generic channel; `asyncchan` int-only, `whenAny` a stub; no select/WaitGroup/mutex/cancel. |
-| Datetime / Math | Alpha | epoch/UTC only (no timezones); math has no trig/log10/bigint. Decimal (built-in) is Prod. |
-| Observability / Config / HTTP-2 / WebSocket | Alpha/Missing | Structured logging (std/log) + layered config (std/config) now present; still no metrics/tracing, no HTTP/2, no WS. |
+| Datetime / Math | Beta | timezone-aware ISO parse/format (T15) + trig/log10/log2 now present; bigint still absent. Decimal (built-in) is Prod. |
+| Observability / Config / HTTP-2 / WebSocket | Alpha | Structured logging (std/log) + layered config (std/config) + metrics/tracing (std/metrics: counters/gauges/Prom+JSON, Span) now present (T12); still no HTTP/2, no WS. |
 
 ---
 
@@ -424,6 +424,16 @@ pg LISTEN/NOTIFY (decodeNotification + 'A'-frame capture + listen/notifications)
 (decodeCopyResponse/decodeCopyData + copyOut). Each unit-tested on synthetic frames. REMAINING (live or
 larger): mysql multi-resultset; mssql sp_reset_connection; btree real auth + Parse/Bind; pg idle NOTIFY
 delivery loop; all live-path verification.
+
+SESSION SUMMARY 2026-08-03: T1-T7 done (prior); this session closed T9 [x] (busy guard, all 5 drivers),
+T12 [x] (metrics + tracing + pool instrumentation), T13 [x] (RowStream cursor + earlier types/ORM),
+T16 harness + T8 timeout + T11 keep-alive framing + T14 codec breadth (mysql/mssql/pg) + T10 IPv6 URL +
+T15 collections/math/datetime/config all to [~]/[x] with offline gates. GENUINELY REMAINING (milestone-
+scale or live/runtime-bound, NOT rushed): T15 TLS 1.2 server + mTLS + OCSP/CRL (crypto, must verify vs
+OpenSSL); T10 async non-blocking DNS (runtime, off-reactor getaddrinfo) + real v6 socket connect; T14
+btree Parse/Bind + real auth (needs btree server), mysql multi-resultset, mssql sp_reset_connection; T13
+lazy server-side batch fetch; live-path verification for every driver (T16 CI service containers). These
+need a live server / reference crypto peer to finish honestly.
 
 T11 [~] 2026-08-03: HTTP keep-alive foundation landed. The bug-prone core -- exact response framing
 without EOF -- is a pure httpMessageLen(buf) (Content-Length / chunked zero-terminator / -2 "no length
