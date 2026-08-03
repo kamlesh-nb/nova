@@ -153,6 +153,19 @@ allocation through the slot to the GEP — any `ptrtoint`/`inttoptr` round-trip 
 pointer and LLVM's alias analysis gives up. Part 1 made the slot/param/access ptr-clean; the allocator
 return type is the last laundering site.
 
+**Part 2 precise shape (verified against the runtime).** `nova_bytes_alloc` returns `long long` (i64),
+not a pointer (`src/runtime/alloc.cpp`, `nova_abi.h`) — the address is an integer at the C boundary. Two
+ways to get a provenance-carrying `ptr` for array construction:
+  1. **Scoped (recommended):** add `void* nova_array_alloc(long long)` to the runtime (`return (void*)nova_bytes_alloc(n)`),
+     declare it `ptr @nova_array_alloc(i64)` in codegen, and route ONLY the array-literal / `[v;n]`
+     codegen through it (GEP the element stores from the returned `ptr`, return the `ptr`). Non-array
+     `compileAlloc` callers (tuples, boxes, structs) are untouched. Smallest blast radius.
+  2. **ABI-compat hack:** redeclare `nova_bytes_alloc` itself as `ptr`-returning — works on arm64/x86-64
+     (pointer and `long long` share the return register) but ripples to every `compileAlloc` caller and
+     is not portable. Avoid.
+Either way this is a focused, gated change (runtime rebuild + array-literal codegen + full corpus/ASAN),
+not a one-liner — do it deliberately, not at the tail of an unrelated session.
+
 ### 3.2 ⬜ ARC optimizer — redundant retain/release elimination + escape analysis
 
 Closes the binary-trees / allocation gap. Precedent: Swift's ARC optimizer removes the large majority
