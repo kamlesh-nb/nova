@@ -326,11 +326,23 @@ is still best-effort-fallback, blocked on the connect error channel (T1 residual
 Remaining true-P0 follow-ons carried forward: TLS-1.2 chain verify (mssql MITM), connect error channel
 (fail-closed), and a live TLS integration test (T16).
 
+T3 [x]* -- temporal + special-type decode fixed across all drivers 2026-08-03 (all offline-verified):
+- seam: dbTimestamp + asTimestamp/getTimestamp (temporal carried as ISO text under DbType.Timestamp).
+- pg: timestamp kept as ISO string (was parseI64 -> year only); bytea "\xHEX" -> raw bytes.
+- mysql: text datetime kept as string (was parseI64); binary datetime now includes microseconds.
+- mssql: FLOAT (FLT4/8/N) decoded via nova_ieee_le_to_str (was NULL, silent data loss); GUID -> canonical
+  8-4-4-4-12 UUID string (was raw bytes).
+- serde/bson: ObjectId(0x07)->hex + docGetObjectId, datetime(0x09)/timestamp(0x11)->int64. Fixes a
+  parser DESYNC: every real Mongo reply's _id ObjectId used to misparse the whole document.
+The asterisk: mssql TDS temporal types (DATETIME/DATE/TIME/DATETIME2/DATETIMEOFFSET) still decode to
+NULL -- adding them needs TDS temporal encodings + calendar conversion (days-since-epoch -> Y-M-D), a
+documented T3 follow-on. pg uuid/json remain text (usable as strings, not "wrong").
+
 | # | Pri | Item | Blocker | Where it lands | Status |
 |---|---|---|---|---|---|
 | T1 | P0 | Error propagation: add `DbError` return/channel; wire each driver's decoder into its read loop | C1 | seam + all 5 drivers | [x] |
 | T2 | P0 | TLS on the SQL data path: TLS `AsyncStream`/BIO in net/aio; SSLRequest (pg), CLIENT_SSL (mysql), cert verify (mssql) | C2 | net/aio + pg/mysql/mssql/mongo/btree | [x]* |
-| T3 | P0 | Correct temporal + special-type decode (ISO dates, mssql FLOAT/DATE*/PLP, bytea hex, BSON ObjectId/datetime) | C5 | pg/mysql/mssql/mongo | [ ] |
+| T3 | P0 | Correct temporal + special-type decode (ISO dates, mssql FLOAT/DATE*/PLP, bytea hex, BSON ObjectId/datetime) | C5 | pg/mysql/mssql/mongo | [x]* |
 | T4 | P0 | Enforce parameterization: server-side bind, or fix `$1..$9`-only + binary-blob escaping | C4 | pg/mysql/btree + ORM | [ ] |
 | T5 | P0 | mongodb: wire `hello` + `authenticate` into connect; parse `cursor.firstBatch` + getMore | -- | mongodb | [ ] |
 | T6 | P1 | Transaction API on Connection trait (begin/commit/rollback + savepoints + rollback-on-drop); fix mssql txn descriptor + ENVCHANGE | C3 | seam + mssql | [ ] |
