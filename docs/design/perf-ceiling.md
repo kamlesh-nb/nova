@@ -1,0 +1,170 @@
+# Nova — Closing the Performance Gap to Rust
+
+**Goal.** Match Rust (and beat Go/C#) on CPU-bound compute. Today Nova is competitive on scalar loops
+but 1.15×-2.22× slower on array and allocation workloads. This document diagnoses *why*, to the exact
+codegen site, and lays out the ordered engineering to close it. Nothing here is research; every step is
+precedented compiler work.
+
+**Status legend / tracking convention:** as in `execution-plan.md` (⬜ TODO · ✍️ DESIGNED · 🔨 WIP ·
+✅ DONE, each with a Definition of Done and a Tracking line).
+
+---
+
+## 1. Current standing (Apple M1, best of 10, absolute ms)
+
+| Benchmark | Rust | Go | C# | Nova | Nova vs fastest |
+|---|---:|---:|---:|---:|---|
+| nbody (N=1M) | 28.9 | 75.1 | 81.8 | 29.1 | 1.01× — competitive |
+| fannkuch-redux (n=11) | 2061 | 1938 | 1973 | 1916 | fastest |
+| mandelbrot (1600²) | 267.9 | 233.9 | 305.0 | 269.1 | 1.15× slower (vs Go) |
+| nsieve (160k ×400) | 259.9 | 264.7 | 300.4 | 353.2 | 1.36× slower (vs Rust) |
+| spectral-norm (N=1000) | 38.2 | 39.9 | 68.3 | 55.0 | 1.44× slower (vs Rust) |
+| binary-trees (depth 16) | 276.0 | 270.4 | 193.7 | 429.4 | 2.22× slower (vs C#) |
+
+Correctness: every Nova program matches the reference golden output; binary-trees is ASAN-clean.
+Nova is *slower, not wrong*. Full report + sources: `lang/bench/`.
+
+**Precedent that the ceiling is high.** Two gaps this size were already closed by single changes:
+`math.fsqrt` (a 30-iteration Newton loop → the `llvm.sqrt.f64` intrinsic) took nbody from ~20× to 1×,
+and the `List<double>` closure-ABI fix unblocked float containers entirely. When Nova hands LLVM clean
+IR, LLVM makes it competitive. The remaining gaps are where Nova hands LLVM *dirty* IR.
+
+---
+
+## 2. Root-cause diagnosis
+
+### 2.1 The array gap (mandelbrot / nsieve / spectral) — value representation
+
+**Root cause: the uniform i64 value-word defeats LLVM alias analysis.**
+
+Nova represents *every* value — pointers included — as an `i64` word (`slotTypeForLocalId`,
+`src/codegen/types.zig`, returns `val_type` for any type that isn't a scalar prim or `f64x4`). An array
+parameter is therefore an `i64`; every element access recovers a pointer with **`inttoptr`**
+(`src/codegen/expressions.zig`, sites `arr_base` / `arr_store_base` / `simd_base`) and then `GEP`s.
+
+LLVM's alias analysis is **blind through `inttoptr`**: a pointer with no provenance is assumed to alias
+all memory. Consequences, all measured:
+- The loop vectorizer will not run — it cannot prove `a[]` and `b[]` are distinct, so `c[i]=a[i]*b[i]`
+  stays scalar. A textbook saxpy/dot in Nova compiles to scalar code identical in speed to *scalar*
+  Rust; both are ~4× off a vectorized version.
+- LICM/GVN cannot hoist or coalesce array loads as aggressively.
+- `noalias` is **inapplicable**: the parameters are `i64`, not `ptr`, and LLVM ignores `noalias` on
+  non-pointer params.
+
+**Verified null result:** switching array loads to the real element type (`double` instead of the i64
+word + bitcast) produced *zero* speedup, confirming the bitcast was never the bottleneck — the
+`inttoptr` barrier is. (That change was reverted; it is only useful once §3.1 lands.)
+
+The i64-word model was a deliberate simplification that made a one-person compiler tractable. Its cost
+is that alias-sensitive optimization is off the table until pointer-typed values flow as LLVM `ptr`.
+
+### 2.2 The allocation gap (binary-trees) — ARC per-object cost
+
+**Root cause: naive, unoptimized reference counting.**
+
+Every heap object carries a refcount touched on every `nova_retain` / `nova_release`
+(`src/codegen/arc.zig`), and reclamation is per-object. binary-trees allocates ~millions of short-lived
+nodes; Nova pays a refcount round-trip and a free per node, where a generational GC (C#, the winner at
+0.70×) bump-allocates and sweeps a young generation. Nova emits **no ARC optimization at all** today:
+no redundant retain/release elimination, no escape analysis, no stack promotion of non-escaping
+allocations. This is the entire 2.22×.
+
+ARC is a legitimate design choice (predictable latency, no GC pauses, clean C/C++ interop — Swift ships
+production software on it). It will never beat a tracing GC on an allocation-*pathological*
+microbenchmark, but optimized ARC reaches Swift-level: competitive for real workloads and within a
+small factor even here.
+
+### 2.3 Non-issues (already at parity)
+
+Scalar arithmetic (nbody, fannkuch) is already competitive — no work needed. `fsqrt` is done.
+
+---
+
+## 3. The plan (ordered by leverage)
+
+### 3.1 ⬜ Pointer representation — flow arrays/pointers as `ptr`, not `i64`+`inttoptr`
+
+**The single highest-leverage change.** Unblocks alias analysis → auto-vectorization + hoisting →
+mandelbrot / nsieve / spectral toward parity, and makes `noalias` meaningful.
+
+**Scope it narrowly first — arrays only, not the whole value model.** A full i64→typed conversion of
+every value is a large refactor; the perf win is concentrated in array-typed values. Minimal viable cut:
+
+1. `slotTypeForLocalId` returns `ptr` (not `val_type`) for **array-typed** locals/params (name matches
+   `T[N]` / the sema `.array` type). Array locals become `ptr` allocas; params become `ptr`.
+2. Array element access GEPs the **base `ptr` directly** — delete the `inttoptr` at `arr_base` /
+   `arr_store_base`. The base is already a `ptr`; `GEP <elemty>, %base, %i` keeps provenance.
+3. Array construction (`[...]`, `[v;n]`) returns the `ptr` from `compileAlloc` without the
+   ptr→i64 round-trip; consumers that stored it as i64 now store it as `ptr`.
+4. Element loads/stores use the **real element type** (the reverted typed-load change — re-land it here).
+5. **`noalias` on distinct array parameters** — mark `ptr` params whose sema type is an array with the
+   LLVM `noalias` attribute (safe: a fresh `[v;n]` allocation is unique; two array params are distinct
+   objects by Nova's value semantics). This is what lets the vectorizer fire on `c[i]=a[i]*b[i]`.
+
+**Watch:** the seam where an array value crosses into a context that still expects the i64 word (e.g.
+stored in a `List`, an `any`, or passed where an i64 is expected). Insert an explicit `ptrtoint` at
+exactly those boundaries — do not let the i64 leak back into the hot path.
+
+**Definition of Done:**
+- [ ] `double[]` loops (dot/saxpy) auto-vectorize (`otool -tv` shows `.2d`/`.4s` in the loop body).
+- [ ] spectral-norm, nsieve, mandelbrot re-measured; target ≤ 1.15× the fastest peer.
+- [ ] Corpus green (`run.sh -j`), ASAN-clean, ARC gate unchanged.
+- [ ] New conformance case: an array passed to two params + a vectorizable kernel, correctness-checked.
+
+**Tracking:** _pending_
+
+### 3.2 ⬜ ARC optimizer — redundant retain/release elimination + escape analysis
+
+Closes the binary-trees / allocation gap. Precedent: Swift's ARC optimizer removes the large majority
+of naive refcount traffic. Ordered sub-steps, cheapest first:
+
+1. **Redundant retain/release elimination** — a `retain` immediately followed by a `release` on the same
+   SSA value within a block (and the CFG-extended version) cancels. Nova's ownership pass
+   (`src/sema/` ownership + `src/codegen/arc.zig`) already tracks per-edge drops; add a local peephole
+   that cancels balanced pairs before emission.
+2. **Non-escaping stack promotion** — an object whose reference provably never escapes its creating
+   frame (not returned, not stored to the heap, not captured) can be stack-allocated and skip ARC
+   entirely. binary-trees' transient trees are the model case. Needs a conservative escape analysis
+   over the typed IR.
+3. **(Optional) young-object arena** — bump-allocate short-lived objects from a per-frame arena reset on
+   return, sidestepping per-node `free`. Bounded to a scope where escape analysis proves safety.
+
+**Definition of Done:**
+- [ ] binary-trees re-measured; target ≤ 1.5× the fastest peer (from 2.22×).
+- [ ] ARC gate + ASAN green (no new leaks/UAF — this is the load-bearing invariant).
+- [ ] `NOVA_ARC_AUDIT` shows reduced retain/release counts on an allocation microbench.
+
+**Tracking:** _pending_
+
+### 3.3 ⬜ (Follow-on) register allocation for array-resident scalars
+
+After §3.1, confirm the loop accumulator and loop-invariant array bases are register-promoted (mem2reg
++ LICM). If a residual gap remains on the division-heavy spectral inner loop, investigate hoisting the
+`evala` integer computation and the int→double conversion. Likely small; measure before investing.
+
+**Tracking:** _pending_
+
+---
+
+## 4. Non-goals / honest scope
+
+- **Not converting the entire i64 value model.** §3.1 is scoped to array-typed values, where the perf
+  lives. A global typed-value-model rewrite is out of scope unless a later benchmark demands it.
+- **Not beating a tracing GC on allocation-pathological microbenchmarks.** Optimized ARC targets
+  Swift-level (competitive for real workloads), not GC-parity on binary-trees-style churn.
+- **Perspective:** Nova's target is I/O-bound server services (the reactor sustains ~75k req/s); these
+  compute microbenchmarks measure *codegen maturity*, not the shipping workload. This plan exists
+  because raw-compute parity was made an explicit goal, not because the current numbers block Nova's
+  purpose.
+
+---
+
+## 5. Verification protocol (every phase)
+
+1. Re-run `lang/bench/` (all six benchmarks + the SIMD kernel), best of 10, absolute ms; update
+   `lang/bench/benchmark.md`.
+2. Full corpus green: `conformance/run.sh -j`.
+3. ASAN-clean: `NOVA_ASAN=1 zig build` then the targeted `--asan` cases (mandatory — the array/ARC
+   changes touch memory).
+4. ARC gate unchanged or improved.
+5. Record the before/after ms in the phase's Tracking line, with the commit SHA.
