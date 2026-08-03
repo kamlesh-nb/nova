@@ -128,13 +128,25 @@ const SS_RSA_PSS_SHA256: int = 0x0804;
 // signature actually covers is always SHA-256 here, because the client offers only SHA-256 signature
 // algorithms (rsa_pss/pkcs1_sha256, ecdsa_secp256r1_sha256).
 pub fn verifyCertificateVerify(cert: x509.Cert, sigScheme: int, sig: ptr, sigLen: int, transcriptHash: ptr, transcriptHashLen: int): bool {
-    let thl = transcriptHashLen;
-    let ctx = strBuf("TLS 1.3, server CertificateVerify");
-    let content = bytes.alloc(64 + 33 + 1 + thl);
-    let clen = certVerifyContent(ctx, 33, transcriptHash, thl, content);
     let digest = bytes.alloc(32);
-    sha256.hashInto(content, clen, digest);
+    certVerifyDigest(true, transcriptHash, transcriptHashLen, digest);   // server context
+    let ok = verifyCvSig(cert, sigScheme, sig, sigLen, digest);
+    bytes.free(digest);
+    return ok;
+}
 
+// mTLS: verify a CLIENT CertificateVerify -- identical dispatch, client context digest.
+pub fn verifyClientCertificateVerify(cert: x509.Cert, sigScheme: int, sig: ptr, sigLen: int, transcriptHash: ptr, transcriptHashLen: int): bool {
+    let digest = bytes.alloc(32);
+    certVerifyDigest(false, transcriptHash, transcriptHashLen, digest);  // client context
+    let ok = verifyCvSig(cert, sigScheme, sig, sigLen, digest);
+    bytes.free(digest);
+    return ok;
+}
+
+// Verify a CertificateVerify signature over a precomputed digest against the leaf cert's key. Shared by
+// the server and client (mTLS) verifiers so the RSA-PSS / RSA-PKCS1 / ECDSA-P256 dispatch lives once.
+fn verifyCvSig(cert: x509.Cert, sigScheme: int, sig: ptr, sigLen: int, digest: ptr): bool {
     let ok = false;
     if (sigScheme == SS_RSA_PSS_SHA256) {
         ok = rsa.verifyPss(0, digest, sig, sigLen,
@@ -144,18 +156,11 @@ pub fn verifyCertificateVerify(cert: x509.Cert, sigScheme: int, sig: ptr, sigLen
             ptrAt(cert.buf, cert.rsaNStart), cert.rsaNLen, ptrAt(cert.buf, cert.rsaEStart), cert.rsaELen);
     } else if (sigScheme == SS_ECDSA_P256_SHA256) {
         // signature is DER ECDSA-Sig-Value SEQUENCE { r INTEGER, s INTEGER }
-        let seqStart = derContentStart(sig, 0);
-        let rTag = derContentStart(sig, seqStart);
-        let rLen = derLen(sig, seqStart);
-        let sTag = derContentStart(sig, rTag + rLen);
-        let sLen = derLen(sig, rTag + rLen);
         let r = bytes.alloc(32); let s = bytes.alloc(32);
-        derIntTo(sig, rTag, rLen, r);
-        derIntTo(sig, sTag, sLen, s);
+        decodeEcdsaSigDer(sig, r, s);
         ok = p256.ecdsaVerify(digest, ptrAt(cert.buf, cert.ecStart), r, s);
         bytes.free(r); bytes.free(s);
     }
-    bytes.free(ctx); bytes.free(content); bytes.free(digest);
     return ok;
 }
 

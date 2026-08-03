@@ -67,6 +67,10 @@ struct TlsServer {
     pub eKey: ptr, pub eIv: ptr, pub eSeq: long,       // server-side client_early_traffic key/IV/sequence
     pub chTruncHash: ptr, pub offeredBinder: ptr,      // Hash(Truncate(ClientHello)) + the client's binder
     pub pskId: ptr,                      // the offered PSK identity (ticket), copied out for cache lookup
+    pub requestClientCert: bool,         // mTLS: send a CertificateRequest and expect a client cert flight
+    pub clientCertProcessed: bool,       // the client's Certificate(+Verify) flight has been consumed
+    pub clientCertPresent: bool,         // the client presented a non-empty certificate
+    pub clientCertOk: bool,              // the client's CertificateVerify signature validated
 }
 
 pub fn newServer(certDer: ptr, certLen: int, signKey: ptr, ephPriv: ptr, ephPrivP256: ptr, ephPrivP384: ptr): TlsServer {
@@ -87,7 +91,67 @@ pub fn newServer(certDer: ptr, certLen: int, signKey: ptr, ephPriv: ptr, ephPriv
         pskIdOff: 0, pskIdLen: 0, binderOff: 0, chLen0: 0, earlyOffered: false, earlyAccepted: false,
         eKey: bytes.alloc(32), eIv: bytes.alloc(12), eSeq: 0,
         chTruncHash: bytes.alloc(48), offeredBinder: bytes.alloc(48), pskId: bytes.alloc(1024),
+        requestClientCert: false, clientCertProcessed: false, clientCertPresent: false, clientCertOk: false,
     };
+}
+
+// mTLS: ask the client for a certificate (send a CertificateRequest in the handshake flight and expect
+// a Certificate(+CertificateVerify) reply before the client Finished).
+pub fn setRequestClientCert(self: TlsServer, on: bool): void { self.requestClientCert = on; }
+
+// mTLS results after processClientCertFlight: whether the client presented a cert and whether its
+// CertificateVerify validated. A caller enforcing required client auth checks clientAuthOk().
+pub fn clientPresentedCert(self: TlsServer): bool { return self.clientCertPresent; }
+pub fn clientAuthOk(self: TlsServer): bool { return self.clientCertPresent && self.clientCertOk; }
+
+// Process the client's mTLS authentication flight (one protected record: Certificate [+
+// CertificateVerify]). Parses the client leaf certificate, verifies the CertificateVerify signature over
+// the transcript through the client Certificate, and adds both messages to the transcript. An empty
+// Certificate (no cert) leaves clientCertPresent=false. Returns false only on a decrypt/parse failure.
+pub fn processClientCertFlight(self: TlsServer, record: ptr, recLen: int): bool {
+    let inner = bytes.alloc(recLen);
+    let innerLen = tls.recordUnprotect(self.suite, self.cKey, self.cIv, self.cSeq, record, recLen, inner);
+    self.cSeq = self.cSeq + 1;
+    if (innerLen < 0) { bytes.free(inner); return false; }
+    let typeOut = bytes.alloc(1);
+    let contentLen = tls.innerParse(inner, innerLen, typeOut);
+    bytes.free(typeOut);
+
+    let leafOff = 0; let leafLen = 0;
+    let p = 0;
+    while (p + 4 <= contentLen) {
+        let mtype = bytes.read_byte(inner, p);
+        let mlen = (bytes.read_byte(inner, p + 1) << 16) | (bytes.read_byte(inner, p + 2) << 8) | bytes.read_byte(inner, p + 3);
+        let msgLen = 4 + mlen;
+        if (mtype == 0x0b) {                          // Certificate
+            let ctxLen = bytes.read_byte(inner, p + 4);
+            let listOff = p + 5 + ctxLen;
+            let listLen = (bytes.read_byte(inner, listOff) << 16) | (bytes.read_byte(inner, listOff + 1) << 8) | bytes.read_byte(inner, listOff + 2);
+            if (listLen > 0) {
+                let cLen = (bytes.read_byte(inner, listOff + 3) << 16) | (bytes.read_byte(inner, listOff + 4) << 8) | bytes.read_byte(inner, listOff + 5);
+                leafOff = listOff + 6;
+                leafLen = cLen;
+                self.clientCertPresent = true;
+            }
+            trAdd(self, at(inner, p), msgLen);
+        } else if (mtype == 0x0f) {                   // CertificateVerify
+            let hCert = bytes.alloc(48); trHash(self, hCert);     // transcript through client Certificate
+            let scheme = (bytes.read_byte(inner, p + 4) << 8) | bytes.read_byte(inner, p + 5);
+            let siglen = (bytes.read_byte(inner, p + 6) << 8) | bytes.read_byte(inner, p + 7);
+            if (leafLen > 0) {
+                let cert = x509.parseCert(at(inner, leafOff), leafLen);
+                self.clientCertOk = handshake.verifyClientCertificateVerify(cert, scheme, at(inner, p + 8), siglen, hCert, trHashLen(self));
+            }
+            bytes.free(hCert);
+            trAdd(self, at(inner, p), msgLen);
+        } else {
+            trAdd(self, at(inner, p), msgLen);
+        }
+        p = p + msgLen;
+    }
+    self.clientCertProcessed = true;
+    bytes.free(inner);
+    return true;
 }
 
 fn trAdd(self: TlsServer, msg: ptr, n: int): void {
@@ -391,6 +455,23 @@ pub fn buildFlight(self: TlsServer, out: ptr): int {
     bytes.write_byte(inner, eeExtLenPos, (eeExtLen >> 8) & 0xff); bytes.write_byte(inner, eeExtLenPos + 1, eeExtLen & 0xff);
     w3(inner, eeBodyLenPos, ip - (eeBodyLenPos + 3));
     trAdd(self, at(inner, eeStart), ip - eeStart);
+
+    // mTLS: a CertificateRequest (RFC 8446 4.3.2) after EncryptedExtensions asks the client to
+    // authenticate. Full handshakes only (resumption authenticates via the PSK). The single required
+    // extension is signature_algorithms carrying ecdsa_secp256r1_sha256, the scheme our client
+    // CertificateVerify uses. Body = ctx(1)=0 || extLen(2)=8 || {sig_algs ext: 000d, len 0004, list 0002, 0403}.
+    if (self.requestClientCert && !self.pskAccepted) {
+        let crStart = ip;
+        bytes.write_byte(inner, ip, 0x0d); ip = ip + 1;
+        w3(inner, ip, 11); ip = ip + 3;
+        bytes.write_byte(inner, ip, 0); ip = ip + 1;                                            // request context (empty)
+        bytes.write_byte(inner, ip, 0x00); bytes.write_byte(inner, ip + 1, 0x08); ip = ip + 2;  // extensions length
+        bytes.write_byte(inner, ip, 0x00); bytes.write_byte(inner, ip + 1, 0x0d); ip = ip + 2;  // signature_algorithms
+        bytes.write_byte(inner, ip, 0x00); bytes.write_byte(inner, ip + 1, 0x04); ip = ip + 2;  // ext_data length
+        bytes.write_byte(inner, ip, 0x00); bytes.write_byte(inner, ip + 1, 0x02); ip = ip + 2;  // scheme list length
+        bytes.write_byte(inner, ip, 0x04); bytes.write_byte(inner, ip + 1, 0x03); ip = ip + 2;  // ecdsa_secp256r1_sha256
+        trAdd(self, at(inner, crStart), ip - crStart);
+    }
 
     let hl = trHashLen(self);
     // An abbreviated (resumption) handshake authenticates via the PSK, so it omits Certificate and

@@ -1,0 +1,81 @@
+// T15 mTLS (phase 1d): a pure-Nova TLS 1.3 MUTUAL-auth handshake driven in memory. The server sends a
+// CertificateRequest; the client answers with Certificate + CertificateVerify signed by its key; the
+// server verifies that CertificateVerify. This closes the client mTLS loop end to end. Also covers the
+// RFC 8446 optional-auth path: a client with no cert replies with an EMPTY Certificate and the handshake
+// still completes (server just records that no client cert was presented).
+import net.tlsmembio;
+import bytes;
+import assert;
+
+// Reuse the P-256 leaf cert + private scalar fixture from the server tests (case 241). For the mutual
+// test the CLIENT presents this same cert/key as its client certificate; the server verifies the
+// client's CertificateVerify against the cert's public key. (Chain/identity trust is a separate policy
+// layer; phase 1 proves the CertificateVerify signature path.)
+const CERT: string = "308201a130820147a00302010202141132d0ad2cb5a5aec6d088a049552374cbbca34b300a06082a8648ce3d040302301b3119301706035504030c106e6f76612e7365727665722e74657374301e170d3236303732393133303632325a170d3336303732363133303632325a301b3119301706035504030c106e6f76612e7365727665722e746573743059301306072a8648ce3d020106082a8648ce3d03010703420004d921dfec51642932c9708bba6c381bfa3c2be73b257131e5174bd0f24731f64be497968ec1d04110412c5a84296bec7a1cc509c7c1a39b615bb1df985d2fbf73a3693067301d0603551d0e04160414826695b337da03b19b733834f0477dd3b548376a301f0603551d23041830168014826695b337da03b19b733834f0477dd3b548376a300f0603551d130101ff040530030101ff30140603551d11040d300b82096c6f63616c686f7374300a06082a8648ce3d0403020348003045022005cdb781873d82d91c39162afe7cf08981be5d25a6d068e0228b7125f52f3134022100e1656421fa188dba029990964ce2e1914a294995104592cac75024b011bc30a3";
+const PRIV: string = "accfe82d31600d5810b9984176898804a4ba458216b1ac913231be5008ca82f1";
+const CERT_LEN: int = 421;
+
+fn hexNib(c: int): int { if (c >= 48 && c <= 57) { return c - 48; } if (c >= 97 && c <= 102) { return c - 87; } return 0; }
+fn hexBuf(hex: string): ptr {
+    let n = hex.length / 2;
+    let b = bytes.alloc(n);
+    let i = 0;
+    while (i < n) { bytes.write_byte(b, i, hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1])); i = i + 1; }
+    return b;
+}
+
+fn handshake(cb: tlsmembio.ClientBio, sb: tlsmembio.ServerBio, tmp: ptr): bool {
+    let cdone = false; let sdone = false;
+    let i = 0;
+    while (i < 20 && !(cdone && sdone)) {
+        while (cb.pendingOut() > 0) { let n = cb.pull(tmp, 33792); sb.feed(tmp, n); }
+        let ss = sb.step();
+        if (ss < 0) { return false; }
+        if (ss == 0) { sdone = true; }
+        while (sb.pendingOut() > 0) { let n = sb.pull(tmp, 33792); cb.feed(tmp, n); }
+        let cs = cb.step();
+        if (cs < 0) { return false; }
+        if (cs == 0) { cdone = true; }
+        i = i + 1;
+    }
+    return cdone && sdone;
+}
+
+@test
+fn mtls_mutual_auth_succeeds(): void {
+    let cb = tlsmembio.newClientBio("localhost");
+    let ccert = hexBuf(CERT);
+    let ckey = hexBuf(PRIV);
+    cb.configureClientCert(ccert, CERT_LEN, ckey);        // client presents this cert
+    let sb = tlsmembio.newServerBio(hexBuf(CERT), CERT_LEN, hexBuf(PRIV));
+    sb.requestClientCert(true);                           // server asks for one
+
+    let tmp = bytes.alloc(33792);
+    assert.isTrue(handshake(cb, sb, tmp));                // both sides finish
+    assert.isTrue(sb.clientPresentedCert());              // a client cert arrived
+    assert.isTrue(sb.clientAuthOk());                     // its CertificateVerify validated
+}
+
+@test
+fn mtls_optional_no_client_cert(): void {
+    // Client has NO cert but the server requests one: RFC 8446 says reply with an empty Certificate and
+    // no CertificateVerify. The handshake still completes; the server records no client auth.
+    let cb = tlsmembio.newClientBio("localhost");         // no configureClientCert
+    let sb = tlsmembio.newServerBio(hexBuf(CERT), CERT_LEN, hexBuf(PRIV));
+    sb.requestClientCert(true);
+
+    let tmp = bytes.alloc(33792);
+    assert.isTrue(handshake(cb, sb, tmp));                // completes (optional auth)
+    assert.isFalse(sb.clientPresentedCert());
+    assert.isFalse(sb.clientAuthOk());
+}
+
+@test
+fn mtls_off_is_unaffected(): void {
+    // Sanity: with no CertificateRequest the normal one-way handshake is unchanged.
+    let cb = tlsmembio.newClientBio("localhost");
+    let sb = tlsmembio.newServerBio(hexBuf(CERT), CERT_LEN, hexBuf(PRIV));
+    let tmp = bytes.alloc(33792);
+    assert.isTrue(handshake(cb, sb, tmp));
+    assert.isFalse(sb.clientPresentedCert());
+}

@@ -530,6 +530,11 @@ pub struct ServerBio impl TlsBio {
     // that the client also offered and echoes it in EncryptedExtensions. selectedAlpn reports the choice.
     pub fn offerAlpn(self: ServerBio, alpn: string): void { self.srv.alpnOffer = alpn; }
     pub fn selectedAlpn(self: ServerBio): string { return self.srv.alpnSel; }
+    // mTLS: request a client certificate (send a CertificateRequest); after the handshake, clientAuthOk()
+    // reports whether the client presented a cert whose CertificateVerify validated.
+    pub fn requestClientCert(self: ServerBio, on: bool): void { self.srv.setRequestClientCert(on); }
+    pub fn clientAuthOk(self: ServerBio): bool { return self.srv.clientAuthOk(); }
+    pub fn clientPresentedCert(self: ServerBio): bool { return self.srv.clientPresentedCert(); }
     // Advertise a record_size_limit (RFC 8449): the client must then send records no larger than this.
     pub fn setRecordSizeLimit(self: ServerBio, limit: int): void { self.srv.recvLimit = limit; }
     // Share a resumption ticket cache across this server's connections (so a ticket issued on one can be
@@ -594,6 +599,12 @@ pub struct ServerBio impl TlsBio {
                         continue;
                     }
                     self.state = 0 - 1; return 0 - 1;
+                }
+                // mTLS: the client's authentication flight (Certificate [+ CertificateVerify]) arrives as
+                // its own record before the Finished; consume it first, then loop for the Finished record.
+                if (self.srv.requestClientCert && !self.srv.clientCertProcessed) {
+                    if (!self.srv.processClientCertFlight(self.scratch, m)) { self.state = 0 - 1; return 0 - 1; }
+                    continue;
                 }
                 if (!self.srv.processClientFinished(self.scratch, m)) { self.state = 0 - 1; return 0 - 1; }
                 // Issue a NewSessionTicket so the client can resume later: a random id + nonce, the PSK
