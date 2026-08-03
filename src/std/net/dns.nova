@@ -1,0 +1,85 @@
+// DNS support for the async net stack (T10): IPv6 address-literal parsing and a resolution cache. The
+// cache is the practical fix for the "blocking getaddrinfo stalls the reactor" problem -- after the
+// first lookup a host resolves from memory with no syscall, so a reactor coroutine never blocks on a
+// repeat connect. parseIPv6 turns a textual v6 address into its 16 packed bytes (the value a
+// sockaddr_in6 needs). Both are pure + unit-tested here; the sockaddr_in6 dial itself is the runtime
+// (os/socket) layer and is exercised by the live integration harness.
+
+import bytes;
+import string;
+import map;
+
+// Hex nibble, or -1 for a non-hex byte.
+fn hexVal(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return 0 - 1;
+}
+
+// Parse an IPv6 textual address (e.g. "::1", "2001:db8::1", "fe80::1ff:fe23:4567:890a") into 16 packed
+// bytes written to out16. Handles the "::" zero-run compression (at most one). Returns true on success.
+pub fn parseIPv6(addr: string, out16: ptr): bool {
+    let i = 0;
+    while (i < 16) { bytes.write_byte(out16, i, 0); i = i + 1; }
+
+    // Split into the part before "::" and after it (if any).
+    let dc = string.indexOf(addr, "::");
+    let head = if (dc >= 0) string.slice(addr, 0, dc) else addr;
+    let tail = if (dc >= 0) string.slice(addr, dc + 2, addr.length) else "";
+
+    // Parse a colon-separated group list into bytes starting at out16[off]; returns bytes written or -1.
+    let headBytes = writeGroups(head, out16, 0);
+    if (headBytes < 0) { return false; }
+    if (dc < 0) {
+        return headBytes == 16;                      // no "::" -> must be a full 8-group address
+    }
+    // tail groups are right-aligned in the 16 bytes (the "::" fills the gap with zeros already written).
+    let tmp = bytes.alloc(16);
+    let tailBytes = writeGroups(tail, tmp, 0);
+    if (tailBytes < 0) { return false; }
+    if (headBytes + tailBytes > 16) { return false; }
+    let j = 0;
+    while (j < tailBytes) { bytes.write_byte(out16, 16 - tailBytes + j, bytes.read_byte(tmp, j)); j = j + 1; }
+    return true;
+}
+
+// Write colon-separated 16-bit groups of `s` as big-endian byte pairs into buf from `off`. Empty s
+// writes nothing. Returns bytes written, or -1 on a malformed group.
+fn writeGroups(s: string, buf: ptr, off: int): int {
+    if (s.length == 0) { return 0; }
+    let p = off;
+    let val = 0;
+    let digits = 0;
+    let i = 0;
+    while (i <= s.length) {
+        let end = i == s.length;
+        let c = if (end) 58 else s[i];               // treat end like a ':' separator
+        if (c == 58) {                               // ':'
+            if (digits == 0) { return 0 - 1; }
+            bytes.write_byte(buf, p, (val >> 8) & 0xff); bytes.write_byte(buf, p + 1, val & 0xff);
+            p = p + 2;
+            val = 0; digits = 0;
+        } else {
+            let h = hexVal(c);
+            if (h < 0 || digits >= 4) { return 0 - 1; }
+            val = (val << 4) | h;
+            digits = digits + 1;
+        }
+        i = i + 1;
+    }
+    return p - off;
+}
+
+// A small host->address resolution cache. Values pack the resolved address; a hit avoids a blocking
+// getaddrinfo on the reactor thread. keyed by host string.
+pub struct DnsCache {
+    pub m: Map<string, long>,
+    init() { self.m = Map<string, long>(64, string.hash); }
+
+    pub fn get(self: DnsCache, host: string): long | undefined { return self.m.get(host); }
+    pub fn put(self: DnsCache, host: string, addr: long): void { self.m.set(host, addr); }
+    pub fn has(self: DnsCache, host: string): bool { return self.m.get(host) != undefined; }
+}
+
+pub fn newDnsCache(): DnsCache { return DnsCache(); }

@@ -1,0 +1,62 @@
+// T10: IPv6 address-literal parsing + DNS resolution cache. parseIPv6 turns textual v6 into 16 packed
+// bytes (handling "::" compression); the cache lets a repeat connect resolve from memory (no blocking
+// getaddrinfo on the reactor thread).
+import net.dns;
+import bytes;
+import assert;
+
+fn b(buf: ptr, i: int): int { return bytes.read_byte(buf, i); }
+
+@test
+fn test_parse_loopback(): void {
+    let out = bytes.alloc(16);
+    assert.isTrue(dns.parseIPv6("::1", out));
+    let i = 0; while (i < 15) { assert.equalInt(0, b(out, i)); i = i + 1; }
+    assert.equalInt(1, b(out, 15));
+}
+
+@test
+fn test_parse_full(): void {
+    // 2001:0db8:0000:0000:0000:0000:0000:0001 written compressed
+    let out = bytes.alloc(16);
+    assert.isTrue(dns.parseIPv6("2001:db8::1", out));
+    assert.equalInt(0x20, b(out, 0)); assert.equalInt(0x01, b(out, 1));
+    assert.equalInt(0x0d, b(out, 2)); assert.equalInt(0xb8, b(out, 3));
+    let i = 4; while (i < 15) { assert.equalInt(0, b(out, i)); i = i + 1; }
+    assert.equalInt(1, b(out, 15));
+}
+
+@test
+fn test_parse_uncompressed(): void {
+    let out = bytes.alloc(16);
+    assert.isTrue(dns.parseIPv6("fe80:0:0:0:1ff:fe23:4567:890a", out));
+    assert.equalInt(0xfe, b(out, 0)); assert.equalInt(0x80, b(out, 1));
+    assert.equalInt(0x01, b(out, 8)); assert.equalInt(0xff, b(out, 9));
+    assert.equalInt(0x45, b(out, 12)); assert.equalInt(0x67, b(out, 13));
+    assert.equalInt(0x89, b(out, 14)); assert.equalInt(0x0a, b(out, 15));
+}
+
+@test
+fn test_parse_all_zero(): void {
+    let out = bytes.alloc(16);
+    assert.isTrue(dns.parseIPv6("::", out));
+    let i = 0; while (i < 16) { assert.equalInt(0, b(out, i)); i = i + 1; }
+}
+
+@test
+fn test_parse_rejects_bad(): void {
+    let out = bytes.alloc(16);
+    assert.isFalse(dns.parseIPv6("2001:db8", out));        // too few groups, no "::"
+    assert.isFalse(dns.parseIPv6("xyz::1", out));          // non-hex
+    assert.isFalse(dns.parseIPv6("12345::1", out));        // group > 4 digits
+}
+
+@test
+fn test_dns_cache(): void {
+    let c = dns.newDnsCache();
+    assert.isFalse(c.has("example.com"));
+    c.put("example.com", 12345);
+    assert.isTrue(c.has("example.com"));
+    assert.equalInt(12345, (c.get("example.com") ?? 0) as int);
+    assert.isTrue(c.get("other.com") == undefined);
+}
