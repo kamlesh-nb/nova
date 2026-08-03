@@ -173,13 +173,27 @@ Tried and rejected: emitting the int add as `add nsw i32 (trunc iv), 1; sext` �
 straight back to the same `shl/ashr` wide-phi form. **`nsw` changes nothing here** (and doesn't even
 change the wrapping result), so it was reverted.
 
-The real fix is an **i32 slot for int loop counters** (a native i32 phi → the C/Rust pattern LLVM
-vectorizes). But blanket i32 int slots were tried before and caused trouble (project memory:
-`nova-honest-int-already-done` — "do NOT retry i32 slots"), so this needs either (a) a *scoped* i32 slot
-for provable loop-induction variables only, or (b) accepting `let i: long = 0` as the documented idiom
-for hot numeric loops. **Recommendation: (b) for now** — it vectorizes today at zero risk; revisit (a)
-only if a real workload needs `int`-counter auto-vectorization. Note that two of the current benchmark
-kernels wouldn't benefit regardless (spectral's inner loop divides; mandelbrot writes a byte buffer).
+The real fix is a clean induction variable (a native i32 phi, or a plain i64 IV). Two routes were
+considered, and the safe one already exists:
+
+- **A scoped `int`-slot / clean-IV in `while` loops was investigated and rejected as unsafe to do
+  bluntly.** Making every `x = x + const` a clean (non-canonicalized) i64 add would break
+  wrapping-dependent code — PRNGs, hashes, and checksums in the crypto stdlib rely on 32-bit wrap. Doing
+  it safely needs real induction-variable analysis (prove the counter stays in range and is used only
+  for indexing/comparison), a substantial safety-critical pass. Not worth it given the next point.
+
+- **✅ `for (i in 0..n)` already IS the scoped, vectorizable loop induction variable.** Nova's range-for
+  emits the counter increment as a plain `add i64` (statements.zig, `for_stmt`), bypassing the 32-bit
+  canonicalization the `while` + `int` path applies — so it's a clean affine i64 IV that LLVM's
+  scalar-evolution recognizes and the loop auto-vectorizes. It is safe *by construction* (the counter is
+  structurally a bounded index, never observed wrapping). **Measured: a poly kernel is ~7× faster with
+  `for (i in 0..n)` (52 ms) than the `while` + `int` form (362 ms).** Case `263_range_for_vectorizable`.
+
+**Resolution / idiom:** write hot numeric loops as **`for (i in 0..n)`** (or a `let i: long = 0`
+`while`). Both vectorize today at zero risk. A general `while` + `int` counter still won't vectorize
+(the i64-slot canonicalization), but that no longer matters — the idiomatic loop construct handles it.
+(Two current benchmark kernels wouldn't benefit either way: spectral's inner loop divides; mandelbrot
+writes a byte buffer.)
 
 **Root-cause note discovered while implementing:** the provenance chain must be *pure `ptr`* from the
 allocation through the slot to the GEP — any `ptrtoint`/`inttoptr` round-trip in between launders the
