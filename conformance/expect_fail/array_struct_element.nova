@@ -1,0 +1,10 @@
+// EXPECT-FAIL: typecheck
+// NEGATIVE test: fixed arrays are PRIMITIVES ONLY. A struct element would be stored as a raw value-word
+// with no ARC and read back as garbage, so it is rejected at type-check time (use List for structs).
+import assert;
+struct P { v: int }
+@test
+fn struct_array_rejected(): void {
+    let a = [P{ v: 1 }, P{ v: 2 }];
+    assert.equalInt(1, a[0].v);
+}

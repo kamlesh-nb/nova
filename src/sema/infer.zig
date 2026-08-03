@@ -1170,7 +1170,8 @@ pub const Inferer = struct {
         if (!std.mem.eql(u8, fa.field, "length") and !std.mem.eql(u8, fa.field, "len")) return null;
         const obj = try self.inferExpr(fa.object);
         self.stats.typed -|= 1;
-        if (self.store.get(obj) != .string) return null;
+        const k = self.store.get(obj);
+        if (k != .string and k != .array) return null;   // .length/.len: string byte count OR array element count
         return try self.store.intT();
     }
 

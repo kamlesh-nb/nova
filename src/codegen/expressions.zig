@@ -1282,6 +1282,31 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                         }
                         return error.FieldAccessObjectNotStruct;
                     },
+                    .index => |idx| {
+                        // a[i] = v : direct indexed store, mirror of the .index read path. String
+                        // elements are 1 byte; array elements are the 8-byte value-word (a double RHS is
+                        // bitcast to the word via coerceToSlotType). NOTE: value-element semantics -- no
+                        // ARC on the overwritten slot yet, so this is sound for value arrays ([int]/[f64])
+                        // but not arrays of reference types (that lands with the fixed-array ARC design).
+                        const base = try self.compileExpression(idx.object.*);
+                        try self.guardOptionalDeref(idx.object, base, idx.span);
+                        var off = try self.compileExpression(idx.index.*);
+                        const obj_type = try self.resolveExpressionTypeName(idx.object);
+                        const is_string = if (obj_type) |t| std.mem.eql(u8, t, "string") else false;
+                        if (is_string) {
+                            const saddr = core.LLVMBuildAdd(self.builder, base, off, "idx_store_addr");
+                            const sptr = core.LLVMBuildIntToPtr(self.builder, saddr, self.ptr_type, "idx_store_ptr");
+                            const b = core.LLVMBuildTrunc(self.builder, self.coerceToSlotType(r_val, self.val_type), self.i8_type, "idx_byte");
+                            _ = core.LLVMBuildStore(self.builder, b, sptr);
+                            return r_val;
+                        }
+                        const es = core.LLVMConstInt(self.val_type, 8, 0);
+                        off = core.LLVMBuildMul(self.builder, off, es, "idx_store_mul");
+                        const addr = core.LLVMBuildAdd(self.builder, base, off, "idx_store_addr");
+                        const ptr = core.LLVMBuildIntToPtr(self.builder, addr, self.ptr_type, "idx_store_ptr");
+                        _ = core.LLVMBuildStore(self.builder, self.coerceToSlotType(r_val, self.val_type), ptr);
+                        return r_val;
+                    },
                     else => {
                         std.debug.print("Unsupported assignment target: {s}\n", .{@tagName(bin.left.kind)});
                         return error.UnsupportedAssignmentTarget;
@@ -2896,6 +2921,16 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             }
 
             if (std.mem.eql(u8, fa.field, "length") or std.mem.eql(u8, fa.field, "len")) {
+                // A fixed array T[N] has a compile-time element count -- return it as a constant
+                // (the heap header holds the BYTE length, not the element count).
+                if (self.typed_ir) |ir| {
+                    if (self.type_store) |st| {
+                        if (ir.typeOf(fa.object)) |tid| {
+                            const ty = st.get(tid);
+                            if (ty == .array) return core.LLVMConstInt(self.val_type, ty.array.len, 0);
+                        }
+                    }
+                }
                 const obj_type = try self.resolveExpressionTypeName(fa.object);
                 const is_struct = if (obj_type) |name| self.isStructType(name) else false;
                 if (!is_struct) {

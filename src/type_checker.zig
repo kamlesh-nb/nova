@@ -713,6 +713,32 @@ pub const TypeChecker = struct {
                     }
                 }
             },
+            .literal => |lit| {
+                // Fixed arrays are PRIMITIVES ONLY. Elements are stored as the raw 8-byte value-word
+                // with no per-element ARC, so a reference/complex element (struct, string, trait) would
+                // be reinterpreted as an integer and read back as garbage. Reject it with a pointer to
+                // List<T>, which owns its elements. (Value primitives: int/long/double/float/bool/byte.)
+                if (lit == .array) {
+                    for (lit.array) |*elem| {
+                        try self.checkExpr(elem.*);
+                        // Reject by resolved type when known...
+                        if (self.resolveExprType(elem.*)) |et| {
+                            if (et != .ident or !isScalarPrim(et.ident)) {
+                                self.addError(expr.span, "array elements must be a primitive type (int, long, double, float, bool, byte); got '{s}' — use List for reference or complex element types", .{typeRefName(et)});
+                                break;
+                            }
+                        } else if (elem.kind == .struct_init or elem.kind == .tuple or
+                            (elem.kind == .literal and elem.kind.literal == .array))
+                        {
+                            // ...and by form for the non-primitive constructors the checker cannot
+                            // resolve to a name (a struct/tuple/nested-array element is a reference/
+                            // aggregate, stored as a raw word -> read back as garbage).
+                            self.addError(expr.span, "array elements must be a primitive type (int, long, double, float, bool, byte); a struct, tuple, or nested array is not allowed — use List for those", .{});
+                            break;
+                        }
+                    }
+                }
+            },
             .unary => |u| try self.checkExpr(u.operand.*),
             .field_access => |fa| try self.checkExpr(fa.object.*),
             .index => |idx| {

@@ -1,0 +1,53 @@
+// Fixed primitive arrays T[N]: literal, read a[i], write a[i]=v, and .length. Elements are stored as
+// the raw 8-byte value-word (direct load/store, no boxed optional, no per-element ARC) -- the fast path
+// for numeric/buffer code. Restricted to primitives (int/long/double/float/bool/byte); reference or
+// aggregate element types use List instead (see expect_fail/array_struct_element, array_string_element).
+import assert;
+
+@test
+fn int_array_read_write_length(): void {
+    let a: int[4] = [10, 20, 30, 40];
+    assert.equalInt(4, a.length);
+    assert.equalInt(10, a[0]);
+    a[1] = 99;
+    a[3] = a[0] + a[1];             // 109
+    assert.equalInt(99, a[1]);
+    assert.equalInt(109, a[3]);
+}
+
+@test
+fn double_array_mutation(): void {
+    let d: double[3] = [1.5, 2.5, 3.5];
+    assert.equalInt(3, d.length);
+    d[0] = 9.25;
+    d[2] = d[0] + d[1];            // 11.75
+    assert.isTrue(d[0] > 9.2 && d[0] < 9.3);
+    assert.isTrue(d[2] > 11.7 && d[2] < 11.8);
+}
+
+@test
+fn array_literal_length_inferred(): void {
+    let a = [1, 2, 3, 4, 5];        // no annotation -> int[5]
+    assert.equalInt(5, a.length);
+    let sum = 0; let i = 0;
+    while (i < a.length) { sum = sum + a[i]; i = i + 1; }
+    assert.equalInt(15, sum);
+}
+
+struct Vec3 { xs: double[3] }
+
+@test
+fn array_as_struct_field(): void {
+    let v = Vec3 { xs: [1.0, 2.0, 3.0] };
+    v.xs[1] = 8.0;
+    assert.isTrue(v.xs[1] > 7.9 && v.xs[1] < 8.1);
+    assert.equalInt(3, v.xs.length);
+}
+
+fn scaleFirst(a: int[3]): int { a[0] = a[0] * 10; return a[0]; }
+
+@test
+fn array_as_param_mutation(): void {
+    let x = [5, 6, 7];
+    assert.equalInt(50, scaleFirst(x));
+}
