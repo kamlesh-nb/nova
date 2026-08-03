@@ -74,33 +74,6 @@ pub struct Row {
     pub fn getText(self: Row, i: int): string { return self.get(i).asText(); }
 }
 
-pub struct ResultSet {
-    pub columns: List<Column>,
-    pub rows: List<Row>,
-    pub tag: string,
-    pub rows_affected: long,
-
-    init() {
-        self.columns = List<Column>();
-        self.rows = List<Row>();
-        self.tag = "";
-        self.rows_affected = 0;
-    }
-
-    pub fn rowCount(self: ResultSet): int { return self.rows.size(); }
-    pub fn colCount(self: ResultSet): int { return self.columns.size(); }
-    pub fn row(self: ResultSet, i: int): Row { return self.rows.get(i) ?? Row(); }
-}
-
-pub struct ExecResult {
-    pub rows_affected: long,
-    pub tag: string,
-    init(rows_affected: long, tag: string) {
-        self.rows_affected = rows_affected;
-        self.tag = tag;
-    }
-}
-
 pub struct DbError {
     pub code: string,
     pub message: string,
@@ -113,6 +86,58 @@ pub struct DbError {
 }
 
 pub fn noError(): DbError { return DbError("", ""); }
+
+pub struct ResultSet {
+    pub columns: List<Column>,
+    pub rows: List<Row>,
+    pub tag: string,
+    pub rows_affected: long,
+    // The server-reported error for this statement, or noError() on success. Drivers populate it from
+    // their wire ErrorResponse decoder; callers check `rs.ok()` / read `rs.err`. Defaulting to noError()
+    // keeps existing `ResultSet()` construction and error-ignoring callers source-compatible.
+    pub err: DbError,
+
+    init() {
+        self.columns = List<Column>();
+        self.rows = List<Row>();
+        self.tag = "";
+        self.rows_affected = 0;
+        self.err = noError();
+    }
+
+    pub fn rowCount(self: ResultSet): int { return self.rows.size(); }
+    pub fn colCount(self: ResultSet): int { return self.columns.size(); }
+    pub fn row(self: ResultSet, i: int): Row { return self.rows.get(i) ?? Row(); }
+    pub fn ok(self: ResultSet): bool { return self.err.isEmpty(); }
+    pub fn hasError(self: ResultSet): bool { return !self.err.isEmpty(); }
+}
+
+pub struct ExecResult {
+    pub rows_affected: long,
+    pub tag: string,
+    pub err: DbError,
+    init(rows_affected: long, tag: string) {
+        self.rows_affected = rows_affected;
+        self.tag = tag;
+        self.err = noError();
+    }
+
+    pub fn ok(self: ExecResult): bool { return self.err.isEmpty(); }
+    pub fn hasError(self: ExecResult): bool { return !self.err.isEmpty(); }
+}
+
+// Constructors for the error path: a failed statement returns an empty result carrying the DbError.
+pub fn errorResult(e: DbError): ResultSet {
+    let r = ResultSet();
+    r.err = e;
+    return r;
+}
+
+pub fn errorExec(e: DbError): ExecResult {
+    let x = ExecResult(0, "");
+    x.err = e;
+    return x;
+}
 
 pub trait Connection {
 
