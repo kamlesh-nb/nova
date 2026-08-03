@@ -8,7 +8,7 @@
 import bytes;
 import os.sys;
 import os.socket;
-import net.reactor;
+import net.poller;
 import env;
 import string;
 
@@ -75,7 +75,7 @@ fn main(): void {
     o = appendStr(resp, o, `{"message":"Hello, World!"}`);
     let respLen = o;
 
-    let r = reactor.Reactor(1024, 16384, 64);
+    let r = poller.Reactor(1024, 16384, 64);
     r.addRead(lfd, lfd as long);
 
     let addrBuf = bytes.alloc(16);

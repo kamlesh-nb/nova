@@ -8,7 +8,7 @@
 // covered; the forever-looping server itself (runReactorMC) is validated by construction.
 import assert;
 import bytes;
-import net.reactor;
+import net.poller;
 import web.app;
 
 // A single capturable context: the App plus a shared result buffer. Packing both into one struct
@@ -38,7 +38,7 @@ fn test_app_reaches_each_worker(): void {
     while (i < 8) { bytes.write_i32(results, i * 4, -1); i = i + 1; }
 
     let ctx = WorkerCtx(application, results);
-    reactor.runReactors(4, (idx) => {
+    poller.runReactors(4, (idx) => {
         probeWorker(ctx, idx);
     });
 

@@ -6,7 +6,7 @@
 import assert;
 import bytes;
 import os.sys;
-import net.reactor;
+import net.poller;
 
 @test
 fn test_reactor_echo_roundtrip(): void {
@@ -14,7 +14,7 @@ fn test_reactor_echo_roundtrip(): void {
     assert.isTrue(client >= 0);
     assert.isTrue(server >= 0);
 
-    let r = reactor.Reactor(16, 4096, 8);
+    let r = poller.Reactor(16, 4096, 8);
     assert.isTrue(r.ok());
     assert.equalInt(r.addRead(server, server as long), 0);
 

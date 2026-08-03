@@ -9,7 +9,7 @@
 // the Finished MAC, sends its own Finished, and decrypts the server's HTTP response. Certificate-chain
 // trust decisions (validity dates, name matching, a trust store) are a separate policy layer.
 import os.sys;
-import net.reactorio;
+import net.eventedio;
 import crypto.tls.13.tlsClient;
 import crypto.ecc.x25519;
 import crypto.random;
@@ -70,7 +70,7 @@ fn writeAll(fd: int, buf: ptr, n: int): void {
 
 fn main(): int {
     let fd = sys.socket(sys.AF_INET, sys.SOCK_STREAM, 0);
-    let sa = sys.makeSockaddrIn(4433, reactorio.parseIPv4("127.0.0.1"));
+    let sa = sys.makeSockaddrIn(4433, eventedio.parseIPv4("127.0.0.1"));
     if (sys.connect(fd, sa, 16) != 0) { logStr("connect failed"); return 1; }
     bytes.free(sa);
     logStr("connected to 127.0.0.1:4433");

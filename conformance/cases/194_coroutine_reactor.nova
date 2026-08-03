@@ -7,9 +7,9 @@
 import assert;
 import bytes;
 import os.sys;
-import net.reactor;
+import net.poller;
 
-async fn echoOnce(r: reactor.Reactor, fd: int): void {
+async fn echoOnce(r: poller.Reactor, fd: int): void {
     r.addRead(fd, currentCoro());   // register self on the reactor
     coroSuspend();                  // yield until the fd is readable
     let buf = r.getBuffer();
@@ -23,7 +23,7 @@ async fn echoOnce(r: reactor.Reactor, fd: int): void {
 @test
 fn test_coroutine_reactor_echo(): void {
     let (client, server) = sys.newSocketPair(sys.AF_UNIX, sys.SOCK_STREAM);
-    let r = reactor.Reactor(16, 4096, 8);
+    let r = poller.Reactor(16, 4096, 8);
 
     // Start the handler coroutine unscheduled: it runs to its first coroSuspend (registering
     // read-interest on server), then returns its handle. No Asio involved.

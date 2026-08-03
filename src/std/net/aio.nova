@@ -1,5 +1,5 @@
-import net.reactor;
-import net.reactorio;
+import net.poller;
+import net.eventedio;
 
 pub fn socketRecvAsync(fd: int, buf: int, max: int): int {
     return 0;
@@ -75,7 +75,7 @@ pub struct AsyncStream impl AsyncIO {
 
     pub async fn recvInto(self: AsyncStream, buf: long, max: int): int {
         if (self.kq > 0) {
-            let rs = reactorio.ReactorStream(self.sock as int, self.kq);
+            let rs = eventedio.ReactorStream(self.sock as int, self.kq);
             if (self.timeoutMs > 0) { return await rs.recvIntoDeadline(buf, max, self.timeoutMs); }
             return await rs.recvInto(buf, max);
         }
@@ -89,7 +89,7 @@ pub struct AsyncStream impl AsyncIO {
 
     pub async fn sendStr(self: AsyncStream, data: string): int {
         if (self.kq > 0) {
-            let rs = reactorio.ReactorStream(self.sock as int, self.kq);
+            let rs = eventedio.ReactorStream(self.sock as int, self.kq);
             return await rs.sendStr(data);
         }
         return await async_write(self.sock, data);
@@ -98,7 +98,7 @@ pub struct AsyncStream impl AsyncIO {
     pub fn close(self: AsyncStream): void {
         if (self.sock != 0) {
             if (self.kq > 0) {
-                let rs = reactorio.ReactorStream(self.sock as int, self.kq);
+                let rs = eventedio.ReactorStream(self.sock as int, self.kq);
                 rs.close();
             } else {
                 aclose(self.sock);
@@ -108,12 +108,12 @@ pub struct AsyncStream impl AsyncIO {
     }
 }
 
-// Connect and return an AsyncStream. On a reactor thread (reactor.currentKq() > 0) this is a
+// Connect and return an AsyncStream. On a reactor thread (poller.currentKq() > 0) this is a
 // reactor-native connect (no Asio); otherwise it is the Asio connect. Same return type either way.
 pub async fn asyncConnect(host: string, port: int): AsyncStream {
-    let ck = reactor.currentKq();
+    let ck = poller.currentKq();
     if (ck > 0) {
-        let rs = await reactorio.reactorConnect(host, port, ck);
+        let rs = await eventedio.reactorConnect(host, port, ck);
         let s = AsyncStream(rs.fdOf() as long);
         s.kq = ck;
         return s;

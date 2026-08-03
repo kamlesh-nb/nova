@@ -7,8 +7,8 @@
 import assert;
 import bytes;
 import os.sys;
-import net.reactor;
-import net.reactorio;
+import net.poller;
+import net.eventedio;
 
 fn bump(cell: long): void {
     bytes.write_i32(cell, 0, (bytes.read_i32(cell, 0) as int) + 1);
@@ -19,7 +19,7 @@ fn count(cell: long): int {
 
 // The "server" side: receive one message and echo it straight back.
 async fn echoConn(fd: int, kq: int, done: long): void {
-    let s = reactorio.ReactorStream(fd, kq);
+    let s = eventedio.ReactorStream(fd, kq);
     let buf = bytes.alloc(64);
     let n = await s.recvInto(buf, 64);
     if (n > 0) {
@@ -31,7 +31,7 @@ async fn echoConn(fd: int, kq: int, done: long): void {
 
 // The "client" side: send PING, then read the echo into `result`.
 async fn clientConn(fd: int, kq: int, done: long, result: long, gotLen: long): void {
-    let s = reactorio.ReactorStream(fd, kq);
+    let s = eventedio.ReactorStream(fd, kq);
     let msg = bytes.alloc(4);
     bytes.write_byte(msg, 0, 80);   // 'P'
     bytes.write_byte(msg, 1, 73);   // 'I'
@@ -52,7 +52,7 @@ fn test_reactor_async_round_trip(): void {
     sys.setNonBlocking(a);
     sys.setNonBlocking(b);
 
-    let r = reactor.Reactor(64, 4096, 16);
+    let r = poller.Reactor(64, 4096, 16);
     let done = bytes.alloc(4);
     bytes.write_i32(done, 0, 0);
     let result = bytes.alloc(64);
@@ -68,7 +68,7 @@ fn test_reactor_async_round_trip(): void {
     let guard = 0;
     while (count(done) < 2 && guard < 1000) {
         let nev = r.pollComplete(500);
-        reactor.batchBegin();
+        poller.batchBegin();
         let i = 0;
         while (i < nev) {
             nova_reactor_resume(r.completedToken(i));

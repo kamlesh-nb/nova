@@ -84,7 +84,7 @@ pub fn freeAddrInfo(res: ptr): void { sys.freeaddrinfo(res); }
 
 // --- blocking (synchronous) socket layer (M14.2: retires io.cpp's nova_socket_* to Nova) --------------
 // The blocking TCP stack (net/tcp, sync web/client) is built on these. IPv4 only, matching the async
-// reactor path (reactorio.resolveHost4); getaddrinfo's ai_addr offset differs by platform.
+// reactor path (eventedio.resolveHost4); getaddrinfo's ai_addr offset differs by platform.
 
 fn soRcvTimeo(): int { return if (platform.isLinux) 20 else 4102; }   // macOS SO_RCVTIMEO = 0x1006
 fn soSndTimeo(): int { return if (platform.isLinux) 21 else 4101; }   // macOS SO_SNDTIMEO = 0x1005

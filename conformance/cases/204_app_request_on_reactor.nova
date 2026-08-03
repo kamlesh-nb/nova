@@ -8,8 +8,8 @@
 import assert;
 import bytes;
 import os.sys;
-import net.reactor;
-import net.reactorio;
+import net.poller;
+import net.eventedio;
 import web.app;
 import web.request;
 import web.response;
@@ -57,7 +57,7 @@ async fn serverSide(application: App, fd: int, kq: int, done: long): void {
 }
 
 async fn clientSide(fd: int, kq: int, done: long, gotStatus: long, gotBody: long): void {
-    let s = reactorio.ReactorStream(fd, kq);
+    let s = eventedio.ReactorStream(fd, kq);
     await s.sendStr("GET /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
     let buf = bytes.alloc(2048);
     let n = await s.recvInto(buf, 2048);
@@ -82,8 +82,8 @@ fn test_app_request_served_on_reactor(): void {
     sys.setNonBlocking(a);
     sys.setNonBlocking(b);
 
-    let r = reactor.Reactor(64, 8192, 16);
-    reactor.setCurrent(r.kq);
+    let r = poller.Reactor(64, 8192, 16);
+    poller.setCurrent(r.kq);
     let done = bytes.alloc(4); bytes.write_i32(done, 0, 0);
     let gotStatus = bytes.alloc(4); bytes.write_i32(gotStatus, 0, 0);
     let gotBody = bytes.alloc(4); bytes.write_i32(gotBody, 0, 0);
@@ -94,7 +94,7 @@ fn test_app_request_served_on_reactor(): void {
     let guard = 0;
     while (count(done) < 2 && guard < 2000) {
         let nev = r.pollComplete(500);
-        reactor.batchBegin();
+        poller.batchBegin();
         let i = 0;
         while (i < nev) { nova_reactor_resume(r.completedToken(i)); i = i + 1; }
         guard = guard + 1;
@@ -104,7 +104,7 @@ fn test_app_request_served_on_reactor(): void {
     assert.equalInt(bytes.read_i32(gotStatus, 0) as int, 200);
     assert.equalInt(bytes.read_i32(gotBody, 0) as int, 1);
 
-    reactor.setCurrent(0);
+    poller.setCurrent(0);
     bytes.free(done);
     bytes.free(gotStatus);
     bytes.free(gotBody);

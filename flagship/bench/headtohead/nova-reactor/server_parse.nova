@@ -5,7 +5,7 @@
 // instead of an inline callback. See docs/design/self-hosted-runtime.md phase 4.
 import bytes;
 import os.sys;
-import net.reactor;
+import net.poller;
 import env;
 import string;
 import web.httpparser;
@@ -32,7 +32,7 @@ fn writeAll(fd: int, buf: long, len: int): void {
 
 // One connection, as a coroutine: await readability, read the request, respond, repeat
 // (keep-alive), until the peer closes. The reactor resumes this on each readiness event.
-async fn serveConn(r: reactor.Reactor, fd: int, resp: long, respLen: int): void {
+async fn serveConn(r: poller.Reactor, fd: int, resp: long, respLen: int): void {
     let req = httpparser.HttpRequest(32);
     while (true) {
         r.addRead(fd, currentCoro());
@@ -81,7 +81,7 @@ fn main(): void {
     o = appendStr(resp, o, `{"message":"Hello, World!"}`);
     let respLen = o;
 
-    let r = reactor.Reactor(1024, 16384, 1024);
+    let r = poller.Reactor(1024, 16384, 1024);
     r.addRead(lfd, lfd as long);
 
     let addrBuf = bytes.alloc(16);

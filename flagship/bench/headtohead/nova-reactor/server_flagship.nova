@@ -6,7 +6,7 @@
 // Stress it with POST requests carrying a JSON body.
 import bytes;
 import os.sys;
-import net.reactor;
+import net.poller;
 import web.httpparser;
 import serde.source;
 import string;
@@ -38,7 +38,7 @@ fn validateCreateProduct(name: string, price: long): string {
     return "";
 }
 
-async fn serveConn(r: reactor.Reactor, fd: int): void {
+async fn serveConn(r: poller.Reactor, fd: int): void {
     let req = httpparser.HttpRequest(32);
     let respBuf = bytes.alloc(512);
     while (true) {
@@ -94,7 +94,7 @@ fn main(): void {
     bytes.free(one);
     bytes.free(sa);
 
-    let r = reactor.Reactor(1024, 16384, 1024);
+    let r = poller.Reactor(1024, 16384, 1024);
     r.addRead(lfd, lfd as long);
     let addrBuf = bytes.alloc(16);
     let addrLen = bytes.alloc(4);

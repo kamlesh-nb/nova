@@ -475,7 +475,7 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile) void {
         \\fi
         \\rsync -a --exclude=".git" deps/ "{[home]s}/.nova/deps/"
         \\# Prebuild the C++ runtime ONCE into a static library. Boost.Asio has been retired (M4):
-        \\# the async runtime is reactor-native (net/reactorio over os/sys, kqueue/epoll), so nothing
+        \\# the async runtime is reactor-native (net/eventedio over os/sys, kqueue/epoll), so nothing
         \\# in src/runtime includes Boost and no Boost include path is needed.
         \\# TLS is pure Nova (M9/M11/M13): crypto/tls + net/tlsmembio + net/tls12bio. wolfSSL is retired,
         \\# so there is no C TLS library to build or link, and no NOVA_HAVE_WOLFSSL define.

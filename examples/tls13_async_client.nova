@@ -4,8 +4,8 @@
 //
 //   openssl s_server -accept 127.0.0.1:4433 -cert cert.pem -key key.pem -tls1_3 -www
 //   nova examples/tls13_async_client.nova -o c && ./c
-import net.reactor;
-import net.reactorio;
+import net.poller;
+import net.eventedio;
 import net.tls13async;
 import crypto.tls.13.tlsClient;
 import crypto.ecc.x25519;
@@ -28,8 +28,8 @@ fn base9(): ptr {
 
 // The reactor coroutine: connect, handshake, GET, print the response, then signal `done`.
 async fn run(done: ptr): int {
-    let kq = reactor.currentKq();
-    let rs = await reactorio.reactorConnect("127.0.0.1", 4433, kq);
+    let kq = poller.currentKq();
+    let rs = await eventedio.reactorConnect("127.0.0.1", 4433, kq);
     if (rs.fdOf() < 0) { console.log("connect failed"); bytes.write_byte(done, 0, 1); return 1; }
     console.log("connected (reactor coroutine)");
 
@@ -65,13 +65,13 @@ async fn run(done: ptr): int {
 }
 
 fn main(): int {
-    let r = reactor.Reactor(1024, 16384, 1024);
-    reactor.setCurrent(r.kq);
+    let r = poller.Reactor(1024, 16384, 1024);
+    poller.setCurrent(r.kq);
     let done = bytes.alloc(1); bytes.write_byte(done, 0, 0);
     coroStart(run(done));
     while (bytes.read_byte(done, 0) == 0) {
         let n = r.pollComplete(2000);
-        reactor.batchBegin();
+        poller.batchBegin();
         let i = 0;
         while (i < n) { nova_reactor_resume(r.completedToken(i)); i = i + 1; }
         if (n == 0) { bytes.write_byte(done, 0, 1); }   // 2s idle timeout guard

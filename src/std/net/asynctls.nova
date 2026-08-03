@@ -6,7 +6,7 @@
 // hostname, a CA store) is a separate policy layer (crypto/tls/13/tlsClient.verifyServerChain); the
 // `verify` flag is accepted for source compatibility but that policy layer is applied by the caller.
 import bytes;
-import net.asyncio;
+import net.aio;
 import net.tlsmembio;
 import crypto.tls.truststore;
 
@@ -19,14 +19,14 @@ fn bufToStr(buf: ptr, n: int): string {
 }
 
 pub struct TlsStream impl AsyncIO {
-    pub base: asyncio.AsyncStream,
+    pub base: aio.AsyncStream,
     pub bio: tlsmembio.TlsBio,
     pub scratch: ptr,
     pub cap: int,
     pub open: bool,
     pub handshakeOk: bool,
 
-    init(base: asyncio.AsyncStream, bio: tlsmembio.TlsBio) {
+    init(base: aio.AsyncStream, bio: tlsmembio.TlsBio) {
         self.base = base;
         self.bio = bio;
         self.cap = 16384;
@@ -104,7 +104,7 @@ pub struct TlsStream impl AsyncIO {
 }
 
 pub async fn tlsConnect(host: string, port: int, verify: bool): TlsStream {
-    let base = await asyncio.asyncConnect(host, port);
+    let base = await aio.asyncConnect(host, port);
     let bio: tlsmembio.TlsBio = tlsmembio.newClientBio(host);
     let ts = TlsStream(base, bio);
     let hs = await ts.handshake();
@@ -114,7 +114,7 @@ pub async fn tlsConnect(host: string, port: int, verify: bool): TlsStream {
 // Connect and offer ALPN (comma-separated protocol list, e.g. "h2,http/1.1"); selectedAlpn() reports the
 // server's choice after the handshake.
 pub async fn tlsConnectAlpn(host: string, port: int, alpn: string): TlsStream {
-    let base = await asyncio.asyncConnect(host, port);
+    let base = await aio.asyncConnect(host, port);
     let bio: tlsmembio.TlsBio = tlsmembio.newClientBioAlpn(host, alpn);
     let ts = TlsStream(base, bio);
     let hs = await ts.handshake();
@@ -124,7 +124,7 @@ pub async fn tlsConnectAlpn(host: string, port: int, alpn: string): TlsStream {
 // Connect and enforce CA trust: the server chain must validate against `caPem` (a PEM bundle) for `host`,
 // or the handshake fails (ok() is false). Returns the stream; the caller checks ok().
 pub async fn tlsConnectVerify(host: string, port: int, caPem: string): TlsStream {
-    let base = await asyncio.asyncConnect(host, port);
+    let base = await aio.asyncConnect(host, port);
     let store = truststore.loadPemBundle(caPem);
     let bio: tlsmembio.TlsBio = tlsmembio.newClientBioVerify(host, store);
     let ts = TlsStream(base, bio);
@@ -132,7 +132,7 @@ pub async fn tlsConnectVerify(host: string, port: int, caPem: string): TlsStream
     return ts;
 }
 
-pub async fn tlsAccept(base: asyncio.AsyncStream, cert: string, key: string): TlsStream {
+pub async fn tlsAccept(base: aio.AsyncStream, cert: string, key: string): TlsStream {
     let bio: tlsmembio.TlsBio = tlsmembio.newServerBioPem(cert, key);
     let ts = TlsStream(base, bio);
     let hs = await ts.handshake();
@@ -141,7 +141,7 @@ pub async fn tlsAccept(base: asyncio.AsyncStream, cert: string, key: string): Tl
 
 // Accept and offer ALPN (comma-separated preference list); the server echoes the first protocol the
 // client also offered, reported by selectedAlpn().
-pub async fn tlsAcceptAlpn(base: asyncio.AsyncStream, cert: string, key: string, alpn: string): TlsStream {
+pub async fn tlsAcceptAlpn(base: aio.AsyncStream, cert: string, key: string, alpn: string): TlsStream {
     let sb = tlsmembio.newServerBioPem(cert, key);
     sb.offerAlpn(alpn);
     let bio: tlsmembio.TlsBio = sb;

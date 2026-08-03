@@ -4,7 +4,7 @@
 // the Seastar/glommio thread-per-core model. See docs/design/self-hosted-runtime.md phase 4.
 import bytes;
 import os.sys;
-import net.reactor;
+import net.poller;
 import env;
 import string;
 
@@ -28,7 +28,7 @@ fn writeAll(fd: int, buf: long, len: int): void {
     }
 }
 
-async fn serveConn(r: reactor.Reactor, fd: int, resp: long, respLen: int): void {
+async fn serveConn(r: poller.Reactor, fd: int, resp: long, respLen: int): void {
     while (true) {
         r.addRead(fd, currentCoro());
         coroSuspend();
@@ -68,7 +68,7 @@ fn reactorWorker(idx: int): void {
     o = appendStr(resp, o, `{"message":"Hello, World!"}`);
     let respLen = o;
 
-    let r = reactor.Reactor(1024, 16384, 1024);
+    let r = poller.Reactor(1024, 16384, 1024);
     r.addRead(lfd, lfd as long);
     let addrBuf = bytes.alloc(16);
     let addrLen = bytes.alloc(4);
@@ -97,5 +97,5 @@ fn reactorWorker(idx: int): void {
 fn main(): void {
     let re = env.get("NOVA_REACTORS");
     let n = if (re.length == 0) 4 else string.parseI64(re) as int;
-    reactor.runReactors(n, reactorWorker);
+    poller.runReactors(n, reactorWorker);
 }

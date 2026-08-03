@@ -1,8 +1,8 @@
 
-import net.asyncio;
+import net.aio;
 import net.asynctls;
-import net.reactor;
-import net.reactorio;
+import net.poller;
+import net.eventedio;
 import os.sys;
 import io.file;
 import web.request;
@@ -286,7 +286,7 @@ pub struct App {
         // The web server runs on the Nova reactor, share-nothing across the available cores, TLS
         // included (serveReactorConn tlsAccepts when useTls is set). No Asio: the previous NOVA_ASIO
         // fallback is retired now that the reactor path carries the whole server (M4).
-        let workers = asyncio.reactorCount();
+        let workers = aio.reactorCount();
         let n = if (workers < 1) 1 else workers;
         self.runReactorMC(port, n);
     }
@@ -413,7 +413,7 @@ async fn handleConn(app: App, io: AsyncIO): int {
 // the whole request (parse, mediator, handler, response, and any await to a reactor-native database
 // connection) runs on the reactor with no Asio.
 pub async fn serveReactorConn(app: App, fd: int, kq: int): int {
-    let s = asyncio.AsyncStream(fd as long);
+    let s = aio.AsyncStream(fd as long);
     s.kq = kq;
     if (app.tlsEnabled) {
         // Inbound TLS on the reactor: the pure-Nova TLS 1.3 memory-BIO (TlsStream over net/tlsmembio) does its socket I/O
@@ -435,7 +435,7 @@ pub async fn serveReactorConn(app: App, fd: int, kq: int): int {
 // maps directly onto IOCP AcceptEx. Loops forever.
 async fn reactorAcceptLoop(app: App, lfd: int, kq: int): void {
     while (true) {
-        let s = await reactorio.reactorAccept(lfd, kq);
+        let s = await eventedio.reactorAccept(lfd, kq);
         if (s.isOpen()) {
             coroStart(serveReactorConn(app, s.fdOf(), kq));
         }
@@ -461,13 +461,13 @@ fn reactorWorkerBody(app: App, idx: int): void {
     sys.listen(lfd, 512);
     sys.setNonBlocking(lfd);
 
-    let r = reactor.Reactor(1024, 16384, 1024);
-    reactor.setCurrent(r.kq);
+    let r = poller.Reactor(1024, 16384, 1024);
+    poller.setCurrent(r.kq);
     coroStart(reactorAcceptLoop(app, lfd, r.kq));
 
     while (true) {
         let n = r.pollComplete(-1);
-        reactor.batchBegin();
+        poller.batchBegin();
         let i = 0;
         while (i < n) {
             nova_reactor_resume(r.completedToken(i));
@@ -483,7 +483,7 @@ fn reactorWorkerBody(app: App, idx: int): void {
 pub fn runReactorMC(self: App, port: int, workers: int): void {
     self.serverPort = port;
     let srv = self;
-    reactor.runReactors(workers, (idx) => {
+    poller.runReactors(workers, (idx) => {
         reactorWorkerBody(srv, idx);
     });
 }
@@ -506,14 +506,14 @@ pub fn runReactor(self: App, port: int): void {
     sys.listen(lfd, 512);
     sys.setNonBlocking(lfd);
 
-    let r = reactor.Reactor(1024, 16384, 1024);
-    reactor.setCurrent(r.kq);
+    let r = poller.Reactor(1024, 16384, 1024);
+    poller.setCurrent(r.kq);
     coroStart(reactorAcceptLoop(self, lfd, r.kq));
     console.log("Nova web server listening (Nova reactor)");
 
     while (true) {
         let n = r.pollComplete(-1);
-        reactor.batchBegin();
+        poller.batchBegin();
         let i = 0;
         while (i < n) {
             nova_reactor_resume(r.completedToken(i));

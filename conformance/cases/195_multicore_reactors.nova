@@ -6,9 +6,9 @@
 import assert;
 import bytes;
 import os.sys;
-import net.reactor;
+import net.poller;
 
-async fn echoW(r: reactor.Reactor, fd: int): void {
+async fn echoW(r: poller.Reactor, fd: int): void {
     r.addRead(fd, currentCoro());
     coroSuspend();
     let buf = r.getBuffer();
@@ -19,7 +19,7 @@ async fn echoW(r: reactor.Reactor, fd: int): void {
 
 fn worker(idx: int): void {
     let (a, b) = sys.newSocketPair(sys.AF_UNIX, sys.SOCK_STREAM);
-    let r = reactor.Reactor(8, 512, 4);
+    let r = poller.Reactor(8, 512, 4);
     coroStart(echoW(r, b));
 
     let out = bytes.alloc(2);
@@ -45,6 +45,6 @@ fn worker(idx: int): void {
 
 @test
 fn test_multicore_reactors(): void {
-    reactor.runReactors(4, worker);   // 4 threads, each an independent reactor; joins when done
+    poller.runReactors(4, worker);   // 4 threads, each an independent reactor; joins when done
     assert.isTrue(true);
 }

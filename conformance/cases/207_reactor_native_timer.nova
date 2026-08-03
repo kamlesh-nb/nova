@@ -5,18 +5,18 @@
 // the reactor (the gap that making the reactor the default server introduced).
 import assert;
 import bytes;
-import net.reactor;
-import net.asyncio;
+import net.poller;
+import net.aio;
 
 async fn sleeper(cell: long): void {
-    await asyncio.sleep(15);
+    await aio.sleep(15);
     bytes.write_i32(cell, 0, 42);
 }
 
 @test
 fn test_reactor_native_timer_resumes_coroutine(): void {
-    let r = reactor.Reactor(16, 1024, 4);
-    reactor.setCurrent(r.kq);
+    let r = poller.Reactor(16, 1024, 4);
+    poller.setCurrent(r.kq);
     let cell = bytes.alloc(4);
     bytes.write_i32(cell, 0, -1);
 
@@ -31,7 +31,7 @@ fn test_reactor_native_timer_resumes_coroutine(): void {
     }
 
     assert.equalInt(bytes.read_i32(cell, 0) as int, 42);
-    reactor.setCurrent(0);
+    poller.setCurrent(0);
     bytes.free(cell);
     r.destroy();
 }

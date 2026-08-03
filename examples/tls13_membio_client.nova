@@ -5,7 +5,7 @@
 //   openssl s_server -accept 127.0.0.1:4433 -cert ec.crt -key ec.key -tls1_3 -www -quiet
 //   nova examples/tls13_membio_client.nova -o mbcli && ./mbcli
 import os.sys;
-import net.reactorio;
+import net.eventedio;
 import net.tlsmembio;
 import bytes;
 
@@ -14,7 +14,7 @@ fn logS(s: string): void { let b=bytes.alloc(s.length+1); let i=0; while(i<s.len
 
 fn main(): int {
     let fd = sys.socket(sys.AF_INET, sys.SOCK_STREAM, 0);
-    let sa = sys.makeSockaddrIn(4433, reactorio.parseIPv4("127.0.0.1"));
+    let sa = sys.makeSockaddrIn(4433, eventedio.parseIPv4("127.0.0.1"));
     if (sys.connect(fd, sa, 16) != 0) { logS("connect failed"); return 1; }
     let cb: tlsmembio.TlsBio = tlsmembio.newClientBio("localhost");
     let tmp = bytes.alloc(33792);

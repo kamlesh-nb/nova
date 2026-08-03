@@ -6,7 +6,7 @@
 //   nova examples/tls13_server.nova -o srv && ./srv
 //   echo -e "GET / HTTP/1.0\r\n\r\n" | openssl s_client -connect 127.0.0.1:4433 -tls1_3 -quiet
 import os.sys;
-import net.reactorio;
+import net.eventedio;
 import crypto.tls.13.tlsServer;
 import crypto.random;
 import bytes;
@@ -75,7 +75,7 @@ fn main(): int {
     let lfd = sys.socket(sys.AF_INET, sys.SOCK_STREAM, 0);
     let one = bytes.alloc(4); bytes.write_i32(one, 0, 1);
     sys.setsockopt(lfd, sys.SOL_SOCKET, 4, one, 4);          // SO_REUSEADDR
-    let sa = sys.makeSockaddrIn(4433, reactorio.parseIPv4("127.0.0.1"));
+    let sa = sys.makeSockaddrIn(4433, eventedio.parseIPv4("127.0.0.1"));
     if (sys.bind(lfd, sa, 16) != 0) { logStr("bind failed"); return 1; }
     sys.listen(lfd, 16);
     logStr("Nova TLS 1.3 server listening on 127.0.0.1:4433");

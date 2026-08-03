@@ -6,7 +6,7 @@
 // References: RFC 8446. The handshake crypto is verified offline (conformance case 232); this module is
 // the async I/O layer, exercised live against openssl s_server via examples/tls13_async_client.nova.
 import bytes;
-import net.reactorio;
+import net.eventedio;
 import crypto.tls.13.tlsClient;
 import crypto.tls.13.tlsServer;
 import crypto.ecc.p256;
@@ -34,7 +34,7 @@ async fn fill(self: TlsIO): int {
         self.rlo = 0;
         self.rhi = m;
     }
-    let rs = reactorio.ReactorStream(self.fd, self.kq);
+    let rs = eventedio.ReactorStream(self.fd, self.kq);
     let n = await rs.recvInto((self.rbuf as long) + (self.rhi as long), self.rcap - self.rhi);
     if (n <= 0) { return -1; }
     self.rhi = self.rhi + n;
@@ -61,7 +61,7 @@ async fn readRecord(self: TlsIO, out: ptr): int {
 }
 
 async fn sendAll(self: TlsIO, buf: ptr, n: int): int {
-    let rs = reactorio.ReactorStream(self.fd, self.kq);
+    let rs = eventedio.ReactorStream(self.fd, self.kq);
     return await rs.sendBuf(buf as long, n);
 }
 

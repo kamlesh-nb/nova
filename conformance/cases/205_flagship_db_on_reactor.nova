@@ -3,7 +3,7 @@
 // PH6 blocker, where a handler's nested async DB call deadlocked because the reactor could not drive
 // nested awaits (fixed in M1) and the DB I/O went through Asio (fixed in M2).
 //
-// A real App handler does `await asyncio.asyncConnect(host, port)` then a query round trip. Because
+// A real App handler does `await aio.asyncConnect(host, port)` then a query round trip. Because
 // M2 made asyncConnect reactor-native on a reactor thread and AsyncStream dual-mode, the handler's
 // database I/O runs on the same reactor as the inbound request, with the identical AsyncStream seam
 // the real drivers (btreedb, postgres, ...) use, so no driver change is needed. Here a mock database
@@ -13,9 +13,9 @@
 import assert;
 import bytes;
 import os.sys;
-import net.reactor;
-import net.reactorio;
-import net.asyncio;
+import net.poller;
+import net.eventedio;
+import net.aio;
 import web.app;
 import web.request;
 import web.response;
@@ -55,7 +55,7 @@ fn containsAscii(buf: long, n: int, s: string): bool {
 struct GetUserHandler impl MessageHandler {
     pub dbPort: int,
     async fn handle(self: GetUserHandler, src: ValueSource): Response {
-        let db = await asyncio.asyncConnect("127.0.0.1", self.dbPort);
+        let db = await aio.asyncConnect("127.0.0.1", self.dbPort);
         let val = 0;
         if (db.isOpen()) {
             let _ = await db.sendStr("Q");
@@ -80,7 +80,7 @@ fn makeApp(dbPort: int): App {
 
 // Mock database server: read the query, reply "42".
 async fn dbServe(fd: int, kq: int, done: long): void {
-    let s = reactorio.ReactorStream(fd, kq);
+    let s = eventedio.ReactorStream(fd, kq);
     let buf = bytes.alloc(64);
     let n = await s.recvInto(buf, 64);
     if (n > 0) {
@@ -103,16 +103,16 @@ async fn webServe(application: App, fd: int, kq: int, done: long): void {
 // Completion-model accept: one awaited accept per listener spawns its server coroutine (exactly one
 // connection is expected on each), then completes — so no pending accept op is left leaked (ASAN-clean).
 async fn webAcceptOne(application: App, lfd: int, kq: int, done: long): void {
-    let s = await reactorio.reactorAccept(lfd, kq);
+    let s = await eventedio.reactorAccept(lfd, kq);
     if (s.isOpen()) { coroStart(webServe(application, s.fdOf(), kq, done)); }
 }
 async fn dbAcceptOne(lfd: int, kq: int, done: long): void {
-    let s = await reactorio.reactorAccept(lfd, kq);
+    let s = await eventedio.reactorAccept(lfd, kq);
     if (s.isOpen()) { coroStart(dbServe(s.fdOf(), kq, done)); }
 }
 
 async fn webClient(webPort: int, kq: int, done: long, gotOk: long): void {
-    let s = await reactorio.reactorConnect("127.0.0.1", webPort, kq);
+    let s = await eventedio.reactorConnect("127.0.0.1", webPort, kq);
     if (s.isOpen()) {
         let _ = await s.sendStr("GET /user HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
         let buf = bytes.alloc(2048);
@@ -129,7 +129,7 @@ fn bindListener(port: int): int {
     let one = bytes.alloc(4); bytes.write_i32(one, 0, 1);
     sys.setsockopt(fd, sys.SOL_SOCKET, SO_REUSEADDR, one, 4);
     bytes.free(one);
-    let sa = sys.makeSockaddrIn(0, reactorio.parseIPv4("127.0.0.1"));
+    let sa = sys.makeSockaddrIn(0, eventedio.parseIPv4("127.0.0.1"));
     let br = sys.bind(fd, sa, 16);
     bytes.free(sa);
     if (br != 0) { return -1; }
@@ -155,8 +155,8 @@ fn test_flagship_request_with_db_on_reactor(): void {
 
     let application = makeApp(dbPort);
 
-    let r = reactor.Reactor(64, 8192, 32);
-    reactor.setCurrent(r.kq);
+    let r = poller.Reactor(64, 8192, 32);
+    poller.setCurrent(r.kq);
     let done = bytes.alloc(4); bytes.write_i32(done, 0, 0);
     let gotOk = bytes.alloc(4); bytes.write_i32(gotOk, 0, 0);
 
@@ -169,7 +169,7 @@ fn test_flagship_request_with_db_on_reactor(): void {
     let guard = 0;
     while (count(done) < 3 && guard < 4000) {
         let nev = r.pollComplete(500);
-        reactor.batchBegin();
+        poller.batchBegin();
         let i = 0;
         while (i < nev) {
             nova_reactor_resume(r.completedToken(i));
@@ -181,7 +181,7 @@ fn test_flagship_request_with_db_on_reactor(): void {
     assert.equalInt(count(done), 3);
     assert.equalInt(bytes.read_i32(gotOk, 0) as int, 1);
 
-    reactor.setCurrent(0);
+    poller.setCurrent(0);
     bytes.free(done);
     bytes.free(gotOk);
     r.destroy();
