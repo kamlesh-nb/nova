@@ -247,6 +247,7 @@ struct TlsClient {
     pub haveClientCert: bool,                     // a client certificate + key is configured
     pub clientCertDer: ptr, pub clientCertLen: int,   // client leaf certificate (DER)
     pub clientKey: ptr,                           // client P-256 private scalar (32 bytes) for CertificateVerify
+    pub ocspOff: int, pub ocspLen: int,           // stapled OCSP response location within hsBuf (0 = none)
 }
 
 pub fn newClient(ephPriv: ptr, ephPrivP256: ptr, ephPrivP384: ptr): TlsClient {
@@ -264,7 +265,33 @@ pub fn newClient(ephPriv: ptr, ephPrivP256: ptr, ephPrivP384: ptr): TlsClient {
         eKey: bytes.alloc(32), eIv: bytes.alloc(12), eSeq: 0, offerEarly: false, earlyAccepted: false,
         sendLimit: 16385,
         certRequested: false, haveClientCert: false, clientCertDer: bytes.alloc(1), clientCertLen: 0, clientKey: bytes.alloc(32),
+        ocspOff: 0, ocspLen: 0,
     };
+}
+
+// A stapled OCSP location within a buffer (offset + length; len 0 = no staple).
+pub struct OcspStaple { pub off: int, pub len: int, init(off: int, len: int) { self.off = off; self.len = len; } }
+
+// Scan a TLS 1.3 CertificateEntry's extensions (buf[extOff .. extOff+extLen)) for a status_request
+// extension (0x0005) carrying a stapled OCSP response, and return its DER location. The extension_data is
+// a CertificateStatus: status_type(1)=1 (ocsp) || OCSPResponse<3> (a 3-byte length then the DER). Pure,
+// so it is unit-testable on a synthetic entry.
+pub fn findOcspStaple(buf: ptr, extOff: int, extLen: int): OcspStaple {
+    let p = extOff;
+    let end = extOff + extLen;
+    while (p + 4 <= end) {
+        let etype = (bytes.read_byte(buf, p) << 8) | bytes.read_byte(buf, p + 1);
+        let elen = (bytes.read_byte(buf, p + 2) << 8) | bytes.read_byte(buf, p + 3);
+        if (etype == 0x0005) {                       // status_request -> CertificateStatus
+            let cs = p + 4;
+            if (elen >= 4 && bytes.read_byte(buf, cs) == 1) {   // status_type ocsp
+                let rlen = (bytes.read_byte(buf, cs + 1) << 16) | (bytes.read_byte(buf, cs + 2) << 8) | bytes.read_byte(buf, cs + 3);
+                return OcspStaple(cs + 4, rlen);
+            }
+        }
+        p = p + 4 + elen;
+    }
+    return OcspStaple(0, 0);
 }
 
 // mTLS: configure the client certificate + P-256 signing key presented when the server sends a
@@ -552,6 +579,12 @@ pub fn feedHandshake(self: TlsClient, record: ptr, recLen: int): int {
                      | bytes.read_byte(self.hsBuf, mp + 10);
             self.leafOff = mp + 11;
             self.leafLen = clen;
+            // OCSP stapling: the leaf CertificateEntry's extensions follow its cert_data (extLen<2>).
+            let entryExtPos = self.leafOff + self.leafLen;
+            let entryExtLen = (bytes.read_byte(self.hsBuf, entryExtPos) << 8) | bytes.read_byte(self.hsBuf, entryExtPos + 1);
+            let staple = findOcspStaple(self.hsBuf, entryExtPos + 2, entryExtLen);
+            self.ocspOff = staple.off;
+            self.ocspLen = staple.len;
             trAdd(self, at(self.hsBuf, mp), msgLen);
         } else if (mtype == 0x0f) {                // CertificateVerify
             let hCert = bytes.alloc(48);
@@ -775,6 +808,9 @@ pub fn verifyServerChain(self: TlsClient, rootDer: ptr, rootLen: int, host: stri
 // with serde/json's `at` (JsonValue) when both are in one compile graph (e.g. web/client).
 pub fn certListPtr(self: TlsClient): ptr { return (self.hsBuf as long + self.certListOff) as ptr; }
 pub fn certListSize(self: TlsClient): int { return self.certListLen; }
+// The stapled OCSP response captured from the Certificate message (len 0 = none). Valid until hsBuf frees.
+pub fn ocspStaplePtr(self: TlsClient): ptr { return (self.hsBuf as long + self.ocspOff) as ptr; }
+pub fn ocspStapleSize(self: TlsClient): int { return self.ocspLen; }
 
 // The ALPN protocol the server selected in EncryptedExtensions, or "" if none was negotiated.
 pub fn selectedAlpn(self: TlsClient): string { return self.alpnSel; }

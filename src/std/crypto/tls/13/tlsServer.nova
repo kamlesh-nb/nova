@@ -71,6 +71,7 @@ struct TlsServer {
     pub clientCertProcessed: bool,       // the client's Certificate(+Verify) flight has been consumed
     pub clientCertPresent: bool,         // the client presented a non-empty certificate
     pub clientCertOk: bool,              // the client's CertificateVerify signature validated
+    pub stapleOcsp: ptr, pub stapleOcspLen: int,   // OCSP response to staple in the leaf CertificateEntry (0 = none)
 }
 
 pub fn newServer(certDer: ptr, certLen: int, signKey: ptr, ephPriv: ptr, ephPrivP256: ptr, ephPrivP384: ptr): TlsServer {
@@ -92,8 +93,12 @@ pub fn newServer(certDer: ptr, certLen: int, signKey: ptr, ephPriv: ptr, ephPriv
         eKey: bytes.alloc(32), eIv: bytes.alloc(12), eSeq: 0,
         chTruncHash: bytes.alloc(48), offeredBinder: bytes.alloc(48), pskId: bytes.alloc(1024),
         requestClientCert: false, clientCertProcessed: false, clientCertPresent: false, clientCertOk: false,
+        stapleOcsp: bytes.alloc(1), stapleOcspLen: 0,
     };
 }
+
+// OCSP stapling: include this OCSP response in the leaf CertificateEntry's status_request extension.
+pub fn setStapleOcsp(self: TlsServer, der: ptr, len: int): void { self.stapleOcsp = der; self.stapleOcspLen = len; }
 
 // mTLS: ask the client for a certificate (send a CertificateRequest in the handshake flight and expect
 // a Certificate(+CertificateVerify) reply before the client Finished).
@@ -425,7 +430,7 @@ fn encodeEcdsaSig(r: ptr, s: ptr, out: ptr): int {
 // Finished) as one protected record into out. Signs the CertificateVerify and derives the application
 // traffic secrets. Returns the record length.
 pub fn buildFlight(self: TlsServer, out: ptr): int {
-    let inner = bytes.alloc(4096 + self.certLen);
+    let inner = bytes.alloc(4096 + self.certLen + self.stapleOcspLen);
     let ip = 0;
 
     // EncryptedExtensions: empty, unless an ALPN protocol was negotiated (then echo it).
@@ -477,9 +482,11 @@ pub fn buildFlight(self: TlsServer, out: ptr): int {
     // An abbreviated (resumption) handshake authenticates via the PSK, so it omits Certificate and
     // CertificateVerify; a full handshake sends both.
     if (!self.pskAccepted) {
-    // Certificate: 0b || bodyLen || 00 || listLen || certLen || cert || 0000
+    // Certificate: 0b || bodyLen || 00 || listLen || certLen || cert || entryExtensions
+    // The leaf CertificateEntry's extensions carry a stapled OCSP response (status_request) when set.
     let certStart = ip;
-    let listLen = 3 + self.certLen + 2;
+    let entryExtBytes = if (self.stapleOcspLen > 0) 8 + self.stapleOcspLen else 0;   // status_request ext, or none
+    let listLen = 3 + self.certLen + 2 + entryExtBytes;
     let bodyLen = 1 + 3 + listLen;
     bytes.write_byte(inner, ip, 0x0b); ip = ip + 1;
     w3(inner, ip, bodyLen); ip = ip + 3;
@@ -489,7 +496,19 @@ pub fn buildFlight(self: TlsServer, out: ptr): int {
     let ci = 0;
     while (ci < self.certLen) { bytes.write_byte(inner, ip + ci, bytes.read_byte(self.certDer, ci)); ci = ci + 1; }
     ip = ip + self.certLen;
-    bytes.write_byte(inner, ip, 0); bytes.write_byte(inner, ip + 1, 0); ip = ip + 2;   // entry extensions
+    // entry extensions: length<2> then, when stapling, the status_request extension carrying a
+    // CertificateStatus { status_type=ocsp(1), OCSPResponse<3> }.
+    bytes.write_byte(inner, ip, (entryExtBytes >> 8) & 0xff); bytes.write_byte(inner, ip + 1, entryExtBytes & 0xff); ip = ip + 2;
+    if (self.stapleOcspLen > 0) {
+        bytes.write_byte(inner, ip, 0x00); bytes.write_byte(inner, ip + 1, 0x05); ip = ip + 2;   // status_request
+        let extData = 4 + self.stapleOcspLen;                                                     // status_type(1) + len(3) + DER
+        bytes.write_byte(inner, ip, (extData >> 8) & 0xff); bytes.write_byte(inner, ip + 1, extData & 0xff); ip = ip + 2;
+        bytes.write_byte(inner, ip, 0x01); ip = ip + 1;                                           // status_type = ocsp
+        w3(inner, ip, self.stapleOcspLen); ip = ip + 3;
+        let oi = 0;
+        while (oi < self.stapleOcspLen) { bytes.write_byte(inner, ip + oi, bytes.read_byte(self.stapleOcsp, oi)); oi = oi + 1; }
+        ip = ip + self.stapleOcspLen;
+    }
     trAdd(self, at(inner, certStart), ip - certStart);
 
     // CertificateVerify: sign 64sp || context || 0x00 || Transcript-Hash(CH..Certificate). The transcript

@@ -201,6 +201,11 @@ pub struct ClientBio impl TlsBio {
                         if (!self.store.trusts(self.cl.certListPtr(), self.cl.certListSize(), self.host, truststore.nowUtc())) {
                             self.state = 0 - 1; return 0 - 1;
                         }
+                        // A stapled OCSP response (if any) is CAPTURED from the Certificate message and
+                        // exposed via ClientBio.stapledOcspPtr()/Size(); an application that opts into
+                        // revocation checks it with crypto/tls/revocation.checkOcspStapled. Enforcement is
+                        // not done inline here so the revocation/OCSP/CRL modules stay out of every TLS
+                        // client's import graph (see the note in crypto/tls/revocation).
                     }
                     // Application secrets are derived over the transcript through the server Finished
                     // (before any EndOfEarlyData is added).
@@ -240,6 +245,15 @@ pub struct ClientBio impl TlsBio {
     pub fn configureClientCert(self: ClientBio, certDer: ptr, certLen: int, key: ptr): void {
         self.cl.setClientCert(certDer, certLen, key);
     }
+
+    // The OCSP response the server stapled in its Certificate message (len 0 = none), captured during the
+    // handshake. An application that wants revocation enforcement reads this after the handshake and
+    // checks it via crypto/tls/revocation.checkOcspStapled against the leaf's issuer.
+    pub fn stapledOcspPtr(self: ClientBio): ptr { return self.cl.ocspStaplePtr(); }
+    pub fn stapledOcspSize(self: ClientBio): int { return self.cl.ocspStapleSize(); }
+    // The server certificate_list (for parsing the leaf/issuer when checking revocation).
+    pub fn peerCertListPtr(self: ClientBio): ptr { return self.cl.certListPtr(); }
+    pub fn peerCertListSize(self: ClientBio): int { return self.cl.certListSize(); }
 
     pub fn writeApp(self: ClientBio, data: ptr, n: int): int {
         // Fragment into records no larger than the peer's record_size_limit (RFC 8449): the max
@@ -533,6 +547,8 @@ pub struct ServerBio impl TlsBio {
     // mTLS: request a client certificate (send a CertificateRequest); after the handshake, clientAuthOk()
     // reports whether the client presented a cert whose CertificateVerify validated.
     pub fn requestClientCert(self: ServerBio, on: bool): void { self.srv.setRequestClientCert(on); }
+    // OCSP stapling: staple this OCSP response in the leaf CertificateEntry (verifying clients check it).
+    pub fn setStapledOcsp(self: ServerBio, der: ptr, len: int): void { self.srv.setStapleOcsp(der, len); }
     pub fn clientAuthOk(self: ServerBio): bool { return self.srv.clientAuthOk(); }
     pub fn clientPresentedCert(self: ServerBio): bool { return self.srv.clientPresentedCert(); }
     // Advertise a record_size_limit (RFC 8449): the client must then send records no larger than this.

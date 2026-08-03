@@ -85,18 +85,18 @@ fn test_truststore_hard_fails_on_revoked(): void {
     // good OCSP staple: trusted AND not revoked -> accept
     let good = bytes.alloc(1024);
     let gn = ocsp.buildTestResponse(serial, leaf.serialLen, ocsp.CERT_GOOD, key, keyHash(), mkTime(), good);
-    assert.isTrue(store.trustsNotRevoked(list, CLEN + 5, "localhost", now, good, gn, bytes.alloc(1), 0));
+    assert.isTrue(revocation.trustsNotRevoked(store, list, CLEN + 5, "localhost", now, good, gn, bytes.alloc(1), 0));
 
     // revoked OCSP staple: chain valid but REVOKED -> HARD-FAIL
     let rev = bytes.alloc(1024);
     let rn = ocsp.buildTestResponse(serial, leaf.serialLen, ocsp.CERT_REVOKED, key, keyHash(), mkTime(), rev);
-    assert.isFalse(store.trustsNotRevoked(list, CLEN + 5, "localhost", now, rev, rn, bytes.alloc(1), 0));
+    assert.isFalse(revocation.trustsNotRevoked(store, list, CLEN + 5, "localhost", now, rev, rn, bytes.alloc(1), 0));
 
     // no revocation material: SOFT-FAIL -> accept (unchanged from plain trusts)
-    assert.isTrue(store.trustsNotRevoked(list, CLEN + 5, "localhost", now, bytes.alloc(1), 0, bytes.alloc(1), 0));
+    assert.isTrue(revocation.trustsNotRevoked(store, list, CLEN + 5, "localhost", now, bytes.alloc(1), 0, bytes.alloc(1), 0));
 
     // CRL listing the serial -> HARD-FAIL
     let crlR = bytes.alloc(1024);
     let cn = crl.buildTestCrl(serial, leaf.serialLen, 1, key, mkTime(), crlR);
-    assert.isFalse(store.trustsNotRevoked(list, CLEN + 5, "localhost", now, bytes.alloc(1), 0, crlR, cn));
+    assert.isFalse(revocation.trustsNotRevoked(store, list, CLEN + 5, "localhost", now, bytes.alloc(1), 0, crlR, cn));
 }
