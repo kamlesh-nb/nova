@@ -1,0 +1,73 @@
+// T15 mTLS (phase 1): the security crux of client-certificate auth is the TLS 1.3 CertificateVerify --
+// the client signs a transcript digest with its cert key, under the CLIENT context string. This gates
+// handshake.certVerifyDigest: the content (64-space prefix + context + 0x00 + transcript hash) round-
+// trips through a real P-256 sign/verify, a tampered transcript fails, and the client and server
+// contexts produce DIFFERENT digests (so a client can never be confused with a server signature).
+import assert;
+import bytes;
+import crypto.tls.13.handshake;
+import crypto.ecc.p256;
+
+fn fillPattern(buf: ptr, n: int, seed: int): void {
+    let i = 0;
+    while (i < n) { bytes.write_byte(buf, i, (i * 7 + seed) & 0xff); i = i + 1; }
+}
+
+@test
+fn test_client_certverify_roundtrip(): void {
+    // a P-256 keypair (fixed non-zero scalar; derivePublic gives the matching public point)
+    let priv = bytes.alloc(32);
+    fillPattern(priv, 32, 3);
+    bytes.write_byte(priv, 0, 0x11);        // ensure non-zero, in-range
+    let pubKey = bytes.alloc(65);
+    p256.derivePublic(pubKey, priv);
+
+    // a transcript hash (SHA-256 suite -> 32 bytes)
+    let th = bytes.alloc(32);
+    fillPattern(th, 32, 99);
+
+    // client signs the CertificateVerify digest
+    let digest = bytes.alloc(32);
+    handshake.certVerifyDigest(false, th, 32, digest);   // false = client context
+    let r = bytes.alloc(32);
+    let s = bytes.alloc(32);
+    p256.ecdsaSign(digest, priv, r, s);
+
+    // a verifier recomputes the SAME client digest and the signature validates
+    let digest2 = bytes.alloc(32);
+    handshake.certVerifyDigest(false, th, 32, digest2);
+    assert.isTrue(p256.ecdsaVerify(digest2, pubKey, r, s));
+}
+
+@test
+fn test_tampered_transcript_fails(): void {
+    let priv = bytes.alloc(32); fillPattern(priv, 32, 3); bytes.write_byte(priv, 0, 0x11);
+    let pubKey = bytes.alloc(65); p256.derivePublic(pubKey, priv);
+    let th = bytes.alloc(32); fillPattern(th, 32, 99);
+
+    let digest = bytes.alloc(32);
+    handshake.certVerifyDigest(false, th, 32, digest);
+    let r = bytes.alloc(32); let s = bytes.alloc(32);
+    p256.ecdsaSign(digest, priv, r, s);
+
+    // flip one transcript byte -> different digest -> the old signature must NOT verify
+    let thBad = bytes.alloc(32); fillPattern(thBad, 32, 99);
+    bytes.write_byte(thBad, 5, bytes.read_byte(thBad, 5) ^ 0xff);
+    let digestBad = bytes.alloc(32);
+    handshake.certVerifyDigest(false, thBad, 32, digestBad);
+    assert.isFalse(p256.ecdsaVerify(digestBad, pubKey, r, s));
+}
+
+@test
+fn test_client_and_server_context_differ(): void {
+    // Same transcript, different role context -> different signed digest. This is what stops a client
+    // CertificateVerify from being accepted as a server one (and vice versa).
+    let th = bytes.alloc(32); fillPattern(th, 32, 42);
+    let dc = bytes.alloc(32); let ds = bytes.alloc(32);
+    handshake.certVerifyDigest(false, th, 32, dc);   // client
+    handshake.certVerifyDigest(true, th, 32, ds);    // server
+    let same = true;
+    let i = 0;
+    while (i < 32) { if (bytes.read_byte(dc, i) != bytes.read_byte(ds, i)) { same = false; } i = i + 1; }
+    assert.isFalse(same);
+}
