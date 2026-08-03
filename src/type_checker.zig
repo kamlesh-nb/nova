@@ -11,6 +11,7 @@ fn builtinRetType(r: builtins.Ret) ?ast.TypeRef {
         .string => ast.TypeRef{ .ident = "string" },
         .bool_ => ast.TypeRef{ .ident = "bool" },
         .decimal => ast.TypeRef{ .ident = "decimal" },
+        .double => ast.TypeRef{ .ident = "f64" },
     };
 }
 

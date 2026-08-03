@@ -154,6 +154,11 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         var f64bits_p = [_]types.LLVMTypeRef{core.LLVMDoubleType()};
         try compiler.func_map.put("nova_f64_bits", core.LLVMAddFunction(compiler.module, "nova_f64_bits", core.LLVMFunctionType(compiler.val_type, &f64bits_p, 1, 0)));
 
+        // nova_f64_sqrt IS the llvm.sqrt.f64 intrinsic (double -> double), lowered by LLVM to a hardware
+        // fsqrt. Registering it under this name lets math.fsqrt call it like any extern; no runtime symbol.
+        var sqrt_p = [_]types.LLVMTypeRef{core.LLVMDoubleType()};
+        try compiler.func_map.put("nova_f64_sqrt", core.LLVMAddFunction(compiler.module, "llvm.sqrt.f64", core.LLVMFunctionType(core.LLVMDoubleType(), &sqrt_p, 1, 0)));
+
         var bool_p = [_]types.LLVMTypeRef{compiler.val_type};
         const bool_t = core.LLVMFunctionType(compiler.val_type, &bool_p, 1, 0);
         try compiler.func_map.put("nova_bool_to_string", core.LLVMAddFunction(compiler.module, "nova_bool_to_string", bool_t));

@@ -2,7 +2,7 @@
 const std = @import("std");
 const types = @import("../types.zig");
 
-pub const Ret = enum { void_, int, long, ptr, string, bool_, decimal };
+pub const Ret = enum { void_, int, long, ptr, string, bool_, decimal, double };
 
 pub const Builtin = struct {
 
@@ -56,6 +56,10 @@ pub const externs = [_]Builtin{
     .{ .receiver = "", .name = "nova_arg_at", .ret = .string },
 
     .{ .receiver = "", .name = "nova_f64_bits", .ret = .long },
+
+    // Lowered directly to the llvm.sqrt.f64 intrinsic (hardware fsqrt) in codegen -- not a runtime
+    // symbol. math.fsqrt calls this so float-heavy code gets one instruction, not a Newton loop.
+    .{ .receiver = "", .name = "nova_f64_sqrt", .ret = .double },
 
     .{ .receiver = "", .name = "nova_mutex_create", .ret = .long },
     .{ .receiver = "", .name = "nova_mutex_lock", .ret = .void_ },
@@ -131,6 +135,7 @@ pub fn retType(store: *types.TypeStore, r: Ret) !types.TypeId {
         .string => store.stringT(),
         .bool_ => store.boolT(),
         .decimal => store.decimalT(),
+        .double => store.doubleT(),
     };
 }
 

@@ -118,14 +118,10 @@ pub fn fround(x: double): double {
 }
 
 pub fn fsqrt(x: double): double {
+    // Hardware fsqrt via the llvm.sqrt.f64 intrinsic (was a 30-iteration Newton loop). The <=0 guard
+    // preserves the historical contract (0.0 for non-positive input) rather than the intrinsic's NaN.
     if (x <= 0.0) { return 0.0; }
-    let guess = x;
-    let i = 0;
-    while (i < 30) {
-        guess = (guess + x / guess) / 2.0;
-        i = i + 1;
-    }
-    return guess;
+    return nova_f64_sqrt(x);
 }
 
 pub fn fpow(base: double, exp: int): double {
