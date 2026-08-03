@@ -376,7 +376,7 @@ test (T16). Next tier is P1 (T6 transactions, T7 pool hardening, ...).
 | T13 | P2 | DbValue richer types (date/time/uuid/json) + NULL-aware accessors; ORM write side (update/delete/upsert + PK) + streaming results | C6 | seam + orm | [~] |
 | T14 | P2 | Driver protocol breadth: mysql >=16MB reassembly + multi-resultset + sha256_password; mssql packet chunking + sp_reset_connection + sp_unprepare; btree real auth + Parse/Bind; pg LISTEN/NOTIFY + COPY | -- | mysql/mssql/btree/pg | [ ] |
 | T15 | P2 | Collections depth (sort/contains/indexOf, deque, heap, ordered map); datetime timezones; math trig/log; config mgmt; TLS revocation (OCSP/CRL) + TLS 1.2 server + mTLS | -- | stdlib | [~] |
-| T16 | P2 | In-repo live integration harness gating every driver's live path in CI; reconcile contradictory liveness claims | C10 | all drivers + CI | [ ] |
+| T16 | P2 | In-repo live integration harness gating every driver's live path in CI; reconcile contradictory liveness claims | C10 | all drivers + CI | [~] |
 
 ## 8. Bottom line
 
