@@ -1,0 +1,57 @@
+// Regression: a closure/lambda whose parameter is a `double` used to fail LLVM verification. The
+// closure ABI is a uniform i64 value-word (the thunk bitcasts back to the real param type), but the
+// call site passed a raw `double` instead of coercing it to the value-word -> "Call parameter type
+// does not match function signature" at codegen. Because List<T> dispatches element handling through
+// an internal closure, this ALSO broke List<double> (and List<float>) entirely -- push/get/set all
+// miscompiled. Fixed in codegen/expressions.zig buildClosureCall (coerce args to the value-word,
+// symmetric to the thunk's cast). Guards the float-closure and float-container path.
+import list;
+import assert;
+
+@test
+fn closure_double_param(): void {
+    let f = (x: double) => x * 2.0;
+    let r = f(3.5);                       // was: LLVM verification failure at compile time
+    assert.isTrue(r > 6.9);
+    assert.isTrue(r < 7.1);
+}
+
+@test
+fn closure_double_two_params(): void {
+    let add = (a: double, b: double) => a + b;
+    let s = add(2.5, 4.25);
+    assert.isTrue(s > 6.74);
+    assert.isTrue(s < 6.76);
+}
+
+@test
+fn closure_mixed_int_double(): void {
+    // an int param (already the value-word) alongside a double param (needs coercion)
+    let g = (k: int, v: double) => v * 3.0;
+    let r = g(7, 1.5);
+    assert.isTrue(r > 4.4);
+    assert.isTrue(r < 4.6);
+}
+
+@test
+fn list_double_push_get(): void {
+    let a = list.List<double>();
+    a.push(1.25); a.push(2.5); a.push(3.75);
+    assert.equalInt(3, a.size());
+    let v0 = a.get(0) ?? 0.0;
+    let v2 = a.get(2) ?? 0.0;
+    assert.isTrue(v0 > 1.2 && v0 < 1.3);
+    assert.isTrue(v2 > 3.7 && v2 < 3.8);
+}
+
+@test
+fn list_double_set_and_sum(): void {
+    let a = list.List<double>();
+    let i = 0;
+    while (i < 5) { a.push(0.0); i = i + 1; }
+    a.set(0, 10.5); a.set(4, 0.0 - 2.5);
+    let sum = 0.0;
+    let j = 0;
+    while (j < a.size()) { sum = sum + (a.get(j) ?? 0.0); j = j + 1; }
+    assert.isTrue(sum > 7.9 && sum < 8.1);        // 10.5 + 0 + 0 + 0 - 2.5 = 8.0
+}

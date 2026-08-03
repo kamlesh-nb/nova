@@ -168,7 +168,10 @@ pub fn buildClosureCall(self: *LlvmCompiler, box_val: types.LLVMValueRef, call_a
     defer self.allocator.free(args);
     args[0] = env_val;
     for (call_args, 0..) |arg, idx| {
-        args[idx + 1] = try self.compileCallArgument(arg);
+        // The closure/thunk ABI is uniform: every param is the i64 value-word (the thunk bitcasts
+        // back to the real param type via buildCallWithCasts). A `double` argument compiles to a real
+        // `double`, so coerce it to the value-word here or the call mismatches fn_t's i64 params.
+        args[idx + 1] = self.coerceToSlotType(try self.compileCallArgument(arg), self.val_type);
     }
     return core.LLVMBuildCall2(self.builder, fn_t, call_ptr, args.ptr, @intCast(nparams), "closure_call");
 }
