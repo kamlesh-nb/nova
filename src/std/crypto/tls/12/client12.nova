@@ -52,6 +52,11 @@ pub struct TlsClient12 {
 
     pub tr: ptr, pub trLen: int, pub trCap: int,   // raw transcript (handshake messages)
 
+    // mTLS (client auth): set when the server sends a CertificateRequest + the configured client cert/key.
+    pub certRequested: bool, pub haveClientCert: bool,
+    pub clientCertDer: ptr, pub clientCertLen: int,
+    pub clientKey: ptr,                            // client P-256 private scalar (32 bytes)
+
     // Append raw handshake-message bytes (including the 4-byte header) to the transcript.
     pub fn addTr(self: TlsClient12, msg: ptr, n: int): void {
         if (self.trLen + n > self.trCap) {
@@ -468,7 +473,81 @@ pub fn newClient12(): TlsClient12 {
         master: bytes.alloc(48), cWriteKey: bytes.alloc(1), sWriteKey: bytes.alloc(1),
         cIV: bytes.alloc(4), sIV: bytes.alloc(4), cSeq: 0, sSeq: 0,
         tr: bytes.alloc(8192), trLen: 0, trCap: 8192,
+        certRequested: false, haveClientCert: false, clientCertDer: bytes.alloc(1), clientCertLen: 0, clientKey: bytes.alloc(32),
     };
+}
+
+// mTLS: configure the client certificate + P-256 signing key to present on a CertificateRequest.
+pub fn setClientCert12(self: TlsClient12, certDer: ptr, certLen: int, key: ptr): void {
+    self.clientCertDer = certDer;
+    self.clientCertLen = certLen;
+    let i = 0;
+    while (i < 32) { bytes.write_byte(self.clientKey, i, bytes.read_byte(key, i)); i = i + 1; }
+    self.haveClientCert = true;
+}
+
+// mTLS: build the TLS 1.2 client Certificate handshake message (RFC 5246 7.4.2): 0b || bodyLen(3) ||
+// certListLen(3) || [certLen(3) || cert]. An empty list (no client cert) is a valid reply. Pure.
+pub fn buildClientCertificate12(certDer: ptr, certLen: int, out: ptr): int {
+    let listLen = if (certLen > 0) 3 + certLen else 0;
+    let bodyLen = 3 + listLen;
+    bytes.write_byte(out, 0, 0x0b);
+    bytes.write_byte(out, 1, (bodyLen >> 16) & 0xff); bytes.write_byte(out, 2, (bodyLen >> 8) & 0xff); bytes.write_byte(out, 3, bodyLen & 0xff);
+    bytes.write_byte(out, 4, (listLen >> 16) & 0xff); bytes.write_byte(out, 5, (listLen >> 8) & 0xff); bytes.write_byte(out, 6, listLen & 0xff);
+    let p = 7;
+    if (certLen > 0) {
+        bytes.write_byte(out, p, (certLen >> 16) & 0xff); bytes.write_byte(out, p + 1, (certLen >> 8) & 0xff); bytes.write_byte(out, p + 2, certLen & 0xff);
+        p = p + 3;
+        let i = 0;
+        while (i < certLen) { bytes.write_byte(out, p + i, bytes.read_byte(certDer, i)); i = i + 1; }
+        p = p + certLen;
+    }
+    return p;
+}
+
+// mTLS: build the TLS 1.2 CertificateVerify (RFC 5246 7.4.8): 0f || bodyLen(3) || {hash=sha256(0x04),
+// sig=ecdsa(0x03)} || sigLen(2) || DER-sig. UNLIKE 1.3, the signature covers Hash(handshake_messages)
+// DIRECTLY (no 64-space/context prefix). The digest is SHA-256 of the raw transcript CH..CKE (the hash
+// is fixed by the ecdsa_sha256 SignatureAndHashAlgorithm, independent of the suite PRF). Call after the
+// client Certificate and ClientKeyExchange are in the transcript, before the client Finished. Returns len.
+pub fn buildCertVerify12(self: TlsClient12, key: ptr, out: ptr): int {
+    let digest = bytes.alloc(32);
+    sha256.hashInto(self.tr, self.trLen, digest);          // SHA-256(handshake_messages so far)
+    let r = bytes.alloc(32); let s = bytes.alloc(32);
+    p256.ecdsaSign(digest, key, r, s);
+    let sigDer = bytes.alloc(80);
+    let sigLen = derEncodeSig12(r, s, sigDer);
+    let bodyLen = 2 + 2 + sigLen;                          // alg(2) + sigLen field(2) + sig
+    bytes.write_byte(out, 0, 0x0f);
+    bytes.write_byte(out, 1, (bodyLen >> 16) & 0xff); bytes.write_byte(out, 2, (bodyLen >> 8) & 0xff); bytes.write_byte(out, 3, bodyLen & 0xff);
+    bytes.write_byte(out, 4, 0x04); bytes.write_byte(out, 5, 0x03);          // sha256, ecdsa
+    bytes.write_byte(out, 6, (sigLen >> 8) & 0xff); bytes.write_byte(out, 7, sigLen & 0xff);
+    let i = 0;
+    while (i < sigLen) { bytes.write_byte(out, 8 + i, bytes.read_byte(sigDer, i)); i = i + 1; }
+    bytes.free(digest); bytes.free(r); bytes.free(s); bytes.free(sigDer);
+    return 8 + sigLen;
+}
+
+// DER ECDSA-Sig-Value SEQUENCE { r, s } for two 32-byte scalars (single-byte lengths).
+fn derEncodeSig12(r: ptr, s: ptr, out: ptr): int {
+    let rlen = derEncInt12(r, out, 2);
+    let slen = derEncInt12(s, out, 2 + rlen);
+    let total = rlen + slen;
+    bytes.write_byte(out, 0, 0x30); bytes.write_byte(out, 1, total);
+    return 2 + total;
+}
+fn derEncInt12(src: ptr, out: ptr, off: int): int {
+    let s = 0;
+    while (s < 31 && bytes.read_byte(src, s) == 0) { s = s + 1; }
+    let pad = 0;
+    if ((bytes.read_byte(src, s) & 0x80) != 0) { pad = 1; }
+    let vlen = 32 - s + pad;
+    bytes.write_byte(out, off, 0x02); bytes.write_byte(out, off + 1, vlen);
+    let p = off + 2;
+    if (pad == 1) { bytes.write_byte(out, p, 0); p = p + 1; }
+    let i = s;
+    while (i < 32) { bytes.write_byte(out, p, bytes.read_byte(src, i)); p = p + 1; i = i + 1; }
+    return p - off;
 }
 
 // Record-layer round trip (self-consistency): seal then open reproduces the plaintext under matched keys.
