@@ -368,8 +368,8 @@ test (T16). Next tier is P1 (T6 transactions, T7 pool hardening, ...).
 | T5 | P0 | mongodb: wire `hello` + `authenticate` into connect; parse `cursor.firstBatch` + getMore | -- | mongodb | [x]* |
 | T6 | P1 | Transaction API on Connection trait (begin/commit/rollback + savepoints + rollback-on-drop); fix mssql txn descriptor + ENVCHANGE | C3 | seam + mssql | [x]* |
 | T7 | P1 | Pool hardening: max-open cap, acquire timeout + wait queue, validate-on-borrow, maxLifetime, leak detection, thread-safety, reconnect | C7 | pool | [x]* |
-| T8 | P1 | Query-level timeouts + cancellation (connect/statement timeout, PG CancelRequest, TDS ATTENTION) | C9 | seam + all drivers | [ ] |
-| T9 | P1 | Per-connection concurrency guard (exclusive checkout / single in-flight) | C8 | seam + pool | [ ] |
+| T8 | P1 | Query-level timeouts + cancellation (connect/statement timeout, PG CancelRequest, TDS ATTENTION) | C9 | seam + all drivers | [~] |
+| T9 | P1 | Per-connection concurrency guard (exclusive checkout / single in-flight) | C8 | seam + pool | [~] |
 | T10 | P1 | Async non-blocking DNS + IPv6 (blocking IPv4 getaddrinfo stalls the loop) | -- | net/eventedio | [ ] |
 | T11 | P1 | HTTP client connection pooling / keep-alive (no fresh socket + TLS per request) | -- | web/client | [ ] |
 | T12 | P1 | Structured logging framework + metrics/tracing hooks; instrument pool + drivers | -- | new stdlib + pool | [ ] |
@@ -386,3 +386,13 @@ driver shares the same production-disqualifying gaps -- swallowed errors, missin
 broken temporal decode, no transactions, an immature pool, and no live verification. Because those gaps
 are shared, most of the P0/P1 work lands at the seam and shared `net`/pool layer and lifts all five
 drivers together, rather than being five separate rewrites.
+
+T8 [~] 2026-08-03: query cancellation PRIMITIVES landed -- pg CancelRequest (capture BackendKeyData +
+buildCancelRequest + async cancel() over a side connection) and mssql TDS ATTENTION (buildAttention +
+cancel()); both wire-byte offline-tested. Remaining: statement/connect timeouts (the per-recv setTimeout
+exists but a deadline->cancel wiring in the reactor is the real feature), mysql cancel (COM_PROCESS_KILL
+on a side conn), and wiring cancel() into a timeout path -- unverifiable without a live server.
+
+T9 [~] 2026-08-03: per-connection concurrency guard on pg (query/exec refuse re-entry while a request is
+in flight -> "connection busy" DbError, preventing frame interleaving). Compile-verified (needs a live
+conn to exercise). Reference impl; extend the same busy flag to mysql/mssql/btree/mongo.
