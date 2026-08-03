@@ -15,6 +15,8 @@ pub enum DbType {
     Text,
     Blob,
     Decimal,
+    Uuid,
+    Json,
 }
 
 pub struct DbValue {
@@ -42,6 +44,16 @@ pub struct DbValue {
     // Temporal values are carried as their normalized ISO-8601 text (in `s`) under DbType.Timestamp,
     // so a driver never lossily forces a date string through parseI64. asTimestamp == asText.
     pub fn asTimestamp(self: DbValue): string { return self.s; }
+    pub fn asUuid(self: DbValue): string { return self.s; }   // canonical UUID string
+    pub fn asJson(self: DbValue): string { return self.s; }   // raw JSON text
+
+    // NULL-aware accessors: return the supplied default when the value is SQL NULL, instead of the
+    // silent 0/"" the plain accessors give (which cannot distinguish NULL from a real 0 / empty string).
+    pub fn asIntOr(self: DbValue, dflt: int): int { if (self.isNull()) { return dflt; } return self.i as int; }
+    pub fn asLongOr(self: DbValue, dflt: long): long { if (self.isNull()) { return dflt; } return self.i; }
+    pub fn asDoubleOr(self: DbValue, dflt: double): double { if (self.isNull()) { return dflt; } return self.f; }
+    pub fn asTextOr(self: DbValue, dflt: string): string { if (self.isNull()) { return dflt; } return self.s; }
+    pub fn asBoolOr(self: DbValue, dflt: bool): bool { if (self.isNull()) { return dflt; } return self.i != 0; }
 }
 
 pub fn dbNull(): DbValue { return DbValue(DbType.Null, 0, 0.0, 0m, ""); }
@@ -54,6 +66,9 @@ pub fn dbText(s: string): DbValue { return DbValue(DbType.Text, 0, 0.0, 0m, s); 
 pub fn dbBlob(s: string): DbValue { return DbValue(DbType.Blob, 0, 0.0, 0m, s); }
 // A temporal value as normalized ISO-8601 text (date / time / timestamp / timestamptz).
 pub fn dbTimestamp(iso: string): DbValue { return DbValue(DbType.Timestamp, 0, 0.0, 0m, iso); }
+// A UUID as its canonical 8-4-4-4-12 string, and a JSON/JSONB value as raw text.
+pub fn dbUuid(s: string): DbValue { return DbValue(DbType.Uuid, 0, 0.0, 0m, s); }
+pub fn dbJson(s: string): DbValue { return DbValue(DbType.Json, 0, 0.0, 0m, s); }
 
 pub struct Column {
     pub name: string,

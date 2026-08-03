@@ -1,0 +1,24 @@
+// T13: DbValue rich types (uuid/json) + NULL-aware accessors.
+import assert;
+import data.db;
+
+@test
+fn test_uuid_json_values(): void {
+    let u = db.dbUuid("33221100-5544-7766-8899-aabbccddeeff");
+    assert.isTrue(u.kind == DbType.Uuid);
+    assert.equalStr(u.asUuid(), "33221100-5544-7766-8899-aabbccddeeff");
+    let j = db.dbJson("{\"a\":1}");
+    assert.isTrue(j.kind == DbType.Json);
+    assert.equalStr(j.asJson(), "{\"a\":1}");
+}
+
+@test
+fn test_null_aware_accessors(): void {
+    let n = db.dbNull();
+    assert.equalInt(n.asIntOr(-1), -1);          // NULL -> default, not silent 0
+    assert.equalStr(n.asTextOr("none"), "none");
+    assert.isTrue(n.asBoolOr(true));
+    // a real 0 is distinguishable from NULL
+    let z = db.dbInt(0);
+    assert.equalInt(z.asIntOr(-1), 0);
+}
