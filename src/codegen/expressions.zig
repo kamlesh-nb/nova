@@ -1327,7 +1327,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                         // but not arrays of reference types (that lands with the fixed-array ARC design).
                         const base = try self.compileExpression(idx.object.*);
                         try self.guardOptionalDeref(idx.object, base, idx.span);
-                        var off = try self.compileExpression(idx.index.*);
+                        const off = try self.compileExpression(idx.index.*);
                         const obj_type = try self.resolveExpressionTypeName(idx.object);
                         const is_string = if (obj_type) |t| std.mem.eql(u8, t, "string") else false;
                         if (is_string) {
@@ -1337,11 +1337,11 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                             _ = core.LLVMBuildStore(self.builder, b, sptr);
                             return r_val;
                         }
-                        const es = core.LLVMConstInt(self.val_type, 8, 0);
-                        off = core.LLVMBuildMul(self.builder, off, es, "idx_store_mul");
-                        const addr = core.LLVMBuildAdd(self.builder, base, off, "idx_store_addr");
-                        const ptr = core.LLVMBuildIntToPtr(self.builder, addr, self.ptr_type, "idx_store_ptr");
-                        _ = core.LLVMBuildStore(self.builder, self.coerceToSlotType(r_val, self.val_type), ptr);
+                        // Typed GEP store (mirror of the GEP read): stride-1 pattern for the vectorizer.
+                        const base_ptr = core.LLVMBuildIntToPtr(self.builder, base, self.ptr_type, "arr_store_base");
+                        var st_idxs = [_]types.LLVMValueRef{off};
+                        const elem_ptr = core.LLVMBuildInBoundsGEP2(self.builder, self.val_type, base_ptr, &st_idxs, 1, "arr_store_gep");
+                        _ = core.LLVMBuildStore(self.builder, self.coerceToSlotType(r_val, self.val_type), elem_ptr);
                         return r_val;
                     },
                     else => {
@@ -3093,7 +3093,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             const obj_ptr = try self.compileExpression(idx.object.*);
 
             try self.guardOptionalDeref(idx.object, obj_ptr, idx.span);
-            var offset_val = try self.compileExpression(idx.index.*);
+            const offset_val = try self.compileExpression(idx.index.*);
 
             const obj_type = try self.resolveExpressionTypeName(idx.object);
             const is_string = if (obj_type) |t| std.mem.eql(u8, t, "string") else false;
@@ -3104,13 +3104,12 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 const byte_val = core.LLVMBuildLoad2(self.builder, self.i8_type, ptr, "byte_val");
                 return core.LLVMBuildZExt(self.builder, byte_val, self.val_type, "byte_val_ext");
             } else {
-                const element_size: usize = 8;
-                const el_size_val = core.LLVMConstInt(self.val_type, element_size, 0);
-                offset_val = core.LLVMBuildMul(self.builder, offset_val, el_size_val, "index_offset_mul");
-
-                const addr = core.LLVMBuildAdd(self.builder, obj_ptr, offset_val, "index_addr");
-                const ptr = core.LLVMBuildIntToPtr(self.builder, addr, self.ptr_type, "index_ptr");
-                return core.LLVMBuildLoad2(self.builder, self.val_type, ptr, "index_val");
+                // Typed GEP (getelementptr val_type, base, index) instead of inttoptr+add: gives LLVM a
+                // clean stride-1 access pattern so array loops auto-vectorize (SIMD) and hoist.
+                const base_ptr = core.LLVMBuildIntToPtr(self.builder, obj_ptr, self.ptr_type, "arr_base");
+                var idxs = [_]types.LLVMValueRef{offset_val};
+                const elem_ptr = core.LLVMBuildInBoundsGEP2(self.builder, self.val_type, base_ptr, &idxs, 1, "arr_gep");
+                return core.LLVMBuildLoad2(self.builder, self.val_type, elem_ptr, "index_val");
             }
         },
         .tuple => |tuple_exprs| {
