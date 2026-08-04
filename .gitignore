@@ -25,3 +25,6 @@ deps/BearSSL/
 __nova_test.exe
 __nova_test.pdb
 *.pdb
+
+# Debug dump of the merged front-end source (NOVA_DUMP_MERGED=1); never part of the build
+merged.nova
