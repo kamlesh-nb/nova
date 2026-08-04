@@ -95,7 +95,7 @@ fn linkNativeInProcessMacho(
     });
     for (objs) |o| try args.append(allocator, o);
     const nova_lib = try std.fmt.allocPrint(allocator, "-L{s}/lib", .{shared_nova});
-    try args.appendSlice(allocator, &.{ nova_lib, "-lnova_runtime", "-L/opt/homebrew/lib" });
+    try args.appendSlice(allocator, &.{ nova_lib, "-lnovacore", "-L/opt/homebrew/lib" });
     try appendWolfsslLink(&args, allocator, shared_nova, io);
     for (ffi_libs) |lib| {
         try appendFfiLib(&args, allocator, shared_nova, io, lib);
@@ -147,7 +147,7 @@ fn crossLinkViaZig(
     _ = environ; // Boost include (formerly from BOOST_PREFIX) retired in M4; no env lookup needed.
     const target = mapCrossTarget(llvm_triple) orelse return false;
 
-    const rt_obj = try std.fmt.allocPrint(allocator, "{s}/lib/nova_runtime_{s}.o", .{ shared_nova, target.zig });
+    const rt_obj = try std.fmt.allocPrint(allocator, "{s}/lib/novacore_{s}.o", .{ shared_nova, target.zig });
     if (Io.Dir.access(.cwd(), io, rt_obj, .{})) |_| {} else |_| {
 
         const rt_src = try std.fmt.allocPrint(allocator, "{s}/src/runtime/runtime.cpp", .{shared_nova});
@@ -210,8 +210,8 @@ fn linkWasmInProcess(allocator: std.mem.Allocator, obj_path: []const u8, output_
 
 /// Append the Nova C++ runtime to a clang++ link line.
 ///
-/// On Windows clang++ targets MSVC, whose link.exe resolves `-lnova_runtime` to `nova_runtime.lib`
-/// and cannot read the GNU-format `libnova_runtime.a` that llvm-ar writes (LNK1104). The runtime is
+/// On Windows clang++ targets MSVC, whose link.exe resolves `-lnovacore` to `novacore.lib`
+/// and cannot read the GNU-format `libnovacore.a` that llvm-ar writes (LNK1104). The runtime is
 /// a unity build — one `runtime.cpp` → one object — so the COFF object is linked directly there:
 /// identical to demand-loading the archive's single member, minus the archive-format question.
 fn appendRuntimeLink(
@@ -2305,11 +2305,11 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
     for (link_objs) |o| try test_clang_args.append(allocator, o);
 
     try appendRuntimeLink(&test_clang_args, allocator, shared_nova, if (asan)
-        "nova_runtime_asan"
+        "novacore_asan"
     else if (tsan)
-        "nova_runtime_tsan"
+        "novacore_tsan"
     else
-        "nova_runtime");
+        "novacore");
     try appendWolfsslLink(&test_clang_args, allocator, shared_nova, init.io);
 
     for (try collectFfiLibs(allocator, program)) |lib| {
@@ -2367,7 +2367,7 @@ fn getFileMtime(io: Io, path: []const u8) !i96 {
 fn linkLibsStamp(allocator: std.mem.Allocator, init: std.process.Init) u64 {
     const home = init.environ_map.get("HOME") orelse init.environ_map.get("USERPROFILE") orelse "/";
     const libs = [_][]const u8{
-        "/.nova/lib/libnova_runtime.a",
+        "/.nova/lib/libnovacore.a",
     };
     var acc: u64 = 0;
     for (libs) |suffix| {
@@ -2654,7 +2654,7 @@ fn compileProgram(
 
         for (link_objs) |o| try clang_args.append(allocator, o);
 
-        try appendRuntimeLink(&clang_args, allocator, shared_nova, "nova_runtime");
+        try appendRuntimeLink(&clang_args, allocator, shared_nova, "novacore");
         try appendWolfsslLink(&clang_args, allocator, shared_nova, init.io);
         for (ffi_libs) |lib| {
             try appendFfiLib(&clang_args, allocator, shared_nova, init.io, lib);

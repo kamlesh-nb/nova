@@ -352,8 +352,8 @@ fi
 # AddressSanitizer gate (opt-in: NOVA_ASAN=1 zig build && ./run.sh --asan)
 if [[ $ASAN_MODE -eq 1 ]]; then
   echo "--- AddressSanitizer gate (use-after-free / double-free) ---"
-  if [[ ! -f "$HOME/.nova/lib/libnova_runtime_asan.a" ]]; then
-    echo "  ERROR: libnova_runtime_asan.a missing — run: NOVA_ASAN=1 zig build" >&2
+  if [[ ! -f "$HOME/.nova/lib/libnovacore_asan.a" ]]; then
+    echo "  ERROR: libnovacore_asan.a missing — run: NOVA_ASAN=1 zig build" >&2
     exit 2
   fi
   for f in "$HERE"/cases/*.nova; do
@@ -381,8 +381,8 @@ fi
 # no concurrency and are skipped. Extend TSAN_CASES as new concurrent code lands.
 if [[ $TSAN_MODE -eq 1 ]]; then
   echo "--- ThreadSanitizer gate (data races, NOVA_THREADS=4) ---"
-  if [[ ! -f "$HOME/.nova/lib/libnova_runtime_tsan.a" ]]; then
-    echo "  ERROR: libnova_runtime_tsan.a missing — run: NOVA_TSAN=1 zig build" >&2
+  if [[ ! -f "$HOME/.nova/lib/libnovacore_tsan.a" ]]; then
+    echo "  ERROR: libnovacore_tsan.a missing — run: NOVA_TSAN=1 zig build" >&2
     exit 2
   fi
   TSAN_CASES=(10_async_go 11_channels 102_future_first_class 103_async_when_all 195_multicore_reactors 199_reactor_nested_await 200_reactor_async_io 201_reactor_tcp_connect_accept 202_asyncstream_on_reactor 203_reactor_resolve_connect 204_app_request_on_reactor 205_flagship_db_on_reactor 206_app_multicore_workers 207_reactor_native_timer 208_reactor_read_deadline 209_inbound_tls_on_reactor 210_cross_reactor_wakeup)

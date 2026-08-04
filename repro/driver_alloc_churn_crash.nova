@@ -46,9 +46,9 @@
 //   NOVA_KEEP_OBJ=1 nova repro/driver_alloc_churn_crash.nova --native -o /tmp/repro  # keeps /tmp/repro.o
 //   clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -fsanitize=address -pthread \
 //     -DNOVA_DROP_ARENA -DNOVA_HAVE_WOLFSSL -Ideps/wolfssl -Ideps/wolfssl/build \
-//     -c -I/opt/homebrew/include src/runtime/runtime.cpp -o /tmp/asan/nova_runtime_asan.o
+//     -c -I/opt/homebrew/include src/runtime/runtime.cpp -o /tmp/asan/novacore_asan.o
 //   clang++ -std=c++20 -g -O0 -fsanitize=address -pthread /tmp/repro.o \
-//     /tmp/asan/nova_runtime_asan.o -L/opt/homebrew/lib deps/wolfssl/build/libwolfssl.a \
+//     /tmp/asan/novacore_asan.o -L/opt/homebrew/lib deps/wolfssl/build/libwolfssl.a \
 //     -framework CoreFoundation -framework Security -o /tmp/repro_asan
 //   NOVA_THREADS=1 ASAN_OPTIONS=detect_leaks=0 /tmp/repro_asan
 //

@@ -228,7 +228,13 @@ pub fn build(b: *std.Build) void {
     // P5 #20: link LLD into nova so it links its output executables in-process
     // (no clang/ld shell-out). Requires -Dstatic-llvm (needs the native liblld*.a
     // + libLLVM from the same LLVM 22 tree). Exposed to the code via build_options.
-    const inprocess_lld = b.option(bool, "inprocess-lld", "Link LLD into nova for in-process linking (requires -Dstatic-llvm)") orelse false;
+    // Default ON for a CROSS static build: a cross-delivered `nova` must carry LLD so it links user
+    // programs itself, with no clang/ld on the target machine (the whole point of static delivery).
+    // A native static build keeps the old default (off) so local dev is unchanged; pass the flag
+    // explicitly to override either way.
+    const is_cross_build = target.result.os.tag != builtin.target.os.tag or
+        target.result.cpu.arch != builtin.target.cpu.arch;
+    const inprocess_lld = b.option(bool, "inprocess-lld", "Link LLD into nova for in-process linking (requires -Dstatic-llvm; defaults ON for a cross static build)") orelse (static_llvm and is_cross_build);
     if (inprocess_lld and !static_llvm) @panic("-Dinprocess-lld requires -Dstatic-llvm");
     const build_opts = b.addOptions();
     build_opts.addOption(bool, "inprocess_lld", inprocess_lld);
@@ -323,8 +329,33 @@ pub fn build(b: *std.Build) void {
 
     checkTestDiscovery(b);
 
-    addNovaInstall(b, exe);
-    addNovaArchive(b, exe);
+    addNovaInstall(b, exe, target);
+    addNovaArchive(b, exe, target);
+}
+
+// The target OS/arch as a zig `-target` triple and the display os/arch names, plus whether this is a
+// cross build (target != host). Used to cross-compile the C++ runtime with `zig c++ -target` and to
+// name the archive by the TARGET rather than the build host. Same-OS cross-arch is the supported
+// shape (mac/win/wsl2 each build both arches of their own OS); the host archiver bundles the
+// target-arch object fine, so only the compiler needs the triple.
+const TargetInfo = struct { triple: []const u8, os_name: []const u8, arch_name: []const u8, is_cross: bool };
+
+fn targetInfo(b: *std.Build, target: std.Build.ResolvedTarget) TargetInfo {
+    const arch = @tagName(target.result.cpu.arch); // aarch64 | x86_64 | ...
+    const os_name = @tagName(target.result.os.tag); // macos | linux | windows
+    // zig `-target` OS spelling (linux needs the gnu abi to match the apt LLVM the runtime links against).
+    const os_triple = switch (target.result.os.tag) {
+        .linux => "linux-gnu",
+        else => os_name,
+    };
+    const is_cross = target.result.os.tag != builtin.target.os.tag or
+        target.result.cpu.arch != builtin.target.cpu.arch;
+    return .{
+        .triple = b.fmt("{s}-{s}", .{ arch, os_triple }),
+        .os_name = os_name,
+        .arch_name = arch,
+        .is_cross = is_cross,
+    };
 }
 
 /// `src/root.zig`'s test block is a HAND-WRITTEN list, and Zig only runs the tests of
@@ -420,10 +451,19 @@ fn fileHasTests(src: []const u8) bool {
 /// executes `$HOME/.nova/bin/nova`, not `zig-out/bin/nova`. Without it, run.sh
 /// silently tests a stale binary — that reported a green 28/28 while the real
 /// compiler crashed on every run.
-fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile) void {
+fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile, target: std.Build.ResolvedTarget) void {
     const home = b.graph.environ_map.get("HOME") orelse
         b.graph.environ_map.get("USERPROFILE") orelse
         std.debug.panic("$HOME not set; cannot run install steps", .{});
+
+    const ti = targetInfo(b, target);
+    // The C++ compiler for the runtime static lib. Native: system clang++ (proven, unchanged). Cross:
+    // the bundled `zig c++ -target <triple>`, which cross-compiles to any arch/OS with no extra
+    // toolchain. The host archiver (`ar`/`llvm-ar`) then bundles the target-arch object as usual.
+    const cxx = if (ti.is_cross)
+        b.fmt("zig c++ -target {s}", .{ti.triple}) // `zig` is on PATH during `zig build`; works in sh + PowerShell
+    else
+        "clang++";
 
     const bin_dest = b.fmt("{s}/.nova/bin", .{home});
     const std_dest = b.fmt("{s}/.nova/std", .{home});
@@ -440,13 +480,13 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile) void {
             \\Copy-Item -Recurse -Force src/std/* "{[std]s}/"
             \\Copy-Item -Recurse -Force src/runtime/* "{[home]s}/.nova/src/runtime/"
             \\Copy-Item -Recurse -Force deps/* "{[home]s}/.nova/deps/"
-            \\Write-Host "Building libnova_runtime.a (Windows; reactor runtime + Win32 syscall shims) ..."
-            \\clang++ -std=c++20 -O2 -DNOVA_DROP_ARENA -c src/runtime/runtime.cpp -o "{[home]s}/.nova/lib/nova_runtime.o"
-            \\llvm-ar rcs "{[home]s}/.nova/lib/libnova_runtime.a" "{[home]s}/.nova/lib/nova_runtime.o"
+            \\Write-Host "Building libnovacore.a (Windows; reactor runtime + Win32 syscall shims) ..."
+            \\{[cxx]s} -std=c++20 -O2 -DNOVA_DROP_ARENA -c src/runtime/runtime.cpp -o "{[home]s}/.nova/lib/novacore.o"
+            \\llvm-ar rcs "{[home]s}/.nova/lib/libnovacore.a" "{[home]s}/.nova/lib/novacore.o"
             \\Write-Host "Installed compiler to {[bin]s}/nova.exe"
-            \\Write-Host "Prebuilt libnova_runtime.a; synced std/runtime/deps to {[home]s}/.nova/"
+            \\Write-Host "Prebuilt libnovacore.a; synced std/runtime/deps to {[home]s}/.nova/"
             \\
-        , .{ .bin = bin_dest, .std = std_dest, .home = home });
+        , .{ .bin = bin_dest, .std = std_dest, .home = home, .cxx = cxx });
         const install_cmd_ps = b.addSystemCommand(&.{ "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps });
         const install_exe_ps = b.addInstallArtifact(exe, .{});
         install_cmd_ps.step.dependOn(&install_exe_ps.step);
@@ -488,16 +528,16 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile) void {
         \\# in src/runtime includes Boost and no Boost include path is needed.
         \\# TLS is pure Nova (M9/M11/M13): crypto/tls + net/tlsmembio + net/tls12bio. wolfSSL is retired,
         \\# so there is no C TLS library to build or link, and no NOVA_HAVE_WOLFSSL define.
-        \\echo "Building libnova_runtime.a (no Boost, no wolfSSL; reactor runtime) ..."
+        \\echo "Building libnovacore.a (no Boost, no wolfSSL; reactor runtime) ..."
         \\# Workstream A: NOVA_DROP_ARENA makes every heap object honestly refcounted
         \\# (no load-bearing thread-local arena). Required for multi-core + clean ARC.
-        \\clang++ -std=c++20 -O2 -pthread -DNOVA_DROP_ARENA -c \
-        \\    src/runtime/runtime.cpp -o "{[home]s}/.nova/lib/nova_runtime.o"
-        \\ar rcs "{[home]s}/.nova/lib/libnova_runtime.a" "{[home]s}/.nova/lib/nova_runtime.o"
-        \\# T1: the cross-compilation cache (nova_runtime_<triple>.o, built lazily by `nova build
+        \\{[cxx]s} -std=c++20 -O2 -pthread -DNOVA_DROP_ARENA -c \
+        \\    src/runtime/runtime.cpp -o "{[home]s}/.nova/lib/novacore.o"
+        \\ar rcs "{[home]s}/.nova/lib/libnovacore.a" "{[home]s}/.nova/lib/novacore.o"
+        \\# T1: the cross-compilation cache (novacore_<triple>.o, built lazily by `nova build
         \\# --target ...`) is keyed only by triple, so it must be invalidated whenever the runtime
-        \\# source changes. Clear it here — triples contain dashes, so this glob spares nova_runtime_asan.o.
-        \\rm -f "{[home]s}/.nova/lib/nova_runtime_"*-*.o 2>/dev/null || true
+        \\# source changes. Clear it here — triples contain dashes, so this glob spares novacore_asan.o.
+        \\rm -f "{[home]s}/.nova/lib/novacore_"*-*.o 2>/dev/null || true
         \\# NOVA_ASAN=1: additionally build an AddressSanitizer runtime. Opt-in because it
         \\# roughly doubles this step; `nova test` links it only when NOVA_ASAN=1 too.
         \\#
@@ -514,11 +554,11 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile) void {
         \\# (which every retain/release/alloc does). LeakSanitizer is unsupported on Darwin —
         \\# use NOVA_ARC_AUDIT for leaks, which is semantic and better anyway.
         \\if [ "${{NOVA_ASAN:-0}}" = "1" ]; then
-        \\  echo "Building libnova_runtime_asan.a (AddressSanitizer) ..."
+        \\  echo "Building libnovacore_asan.a (AddressSanitizer) ..."
         \\  clang++ -std=c++20 -O1 -g -fsanitize=address -fno-omit-frame-pointer \
         \\      -pthread -DNOVA_DROP_ARENA -c \
-        \\      src/runtime/runtime.cpp -o "{[home]s}/.nova/lib/nova_runtime_asan.o"
-        \\  ar rcs "{[home]s}/.nova/lib/libnova_runtime_asan.a" "{[home]s}/.nova/lib/nova_runtime_asan.o"
+        \\      src/runtime/runtime.cpp -o "{[home]s}/.nova/lib/novacore_asan.o"
+        \\  ar rcs "{[home]s}/.nova/lib/libnovacore_asan.a" "{[home]s}/.nova/lib/novacore_asan.o"
         \\  echo "ASAN runtime built. Use: NOVA_ASAN=1 nova test <file>"
         \\fi
         \\# NOVA_TSAN=1: additionally build a ThreadSanitizer runtime. This is the gate for the
@@ -528,17 +568,17 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile) void {
         \\# reactors) so that a race under NOVA_THREADS>1 becomes a located report naming both
         \\# accesses. Opt-in because it is slow; `nova test` links it only when NOVA_TSAN=1 too.
         \\if [ "${{NOVA_TSAN:-0}}" = "1" ]; then
-        \\  echo "Building libnova_runtime_tsan.a (ThreadSanitizer) ..."
+        \\  echo "Building libnovacore_tsan.a (ThreadSanitizer) ..."
         \\  clang++ -std=c++20 -O1 -g -fsanitize=thread -fno-omit-frame-pointer \
         \\      -pthread -DNOVA_DROP_ARENA -c \
-        \\      src/runtime/runtime.cpp -o "{[home]s}/.nova/lib/nova_runtime_tsan.o"
-        \\  ar rcs "{[home]s}/.nova/lib/libnova_runtime_tsan.a" "{[home]s}/.nova/lib/nova_runtime_tsan.o"
+        \\      src/runtime/runtime.cpp -o "{[home]s}/.nova/lib/novacore_tsan.o"
+        \\  ar rcs "{[home]s}/.nova/lib/libnovacore_tsan.a" "{[home]s}/.nova/lib/novacore_tsan.o"
         \\  echo "TSAN runtime built. Use: NOVA_TSAN=1 nova test <file> (with NOVA_THREADS>1)"
         \\fi
         \\echo "Installed compiler to {[bin]s}/nova"
-        \\echo "Prebuilt libnova_runtime.a; synced std/runtime/deps to {[home]s}/.nova/"
+        \\echo "Prebuilt libnovacore.a; synced std/runtime/deps to {[home]s}/.nova/"
         \\
-    , .{ .bin = bin_dest, .std = std_dest, .home = home });
+    , .{ .bin = bin_dest, .std = std_dest, .home = home, .cxx = cxx });
 
     const install_cmd = b.addSystemCommand(&.{ "sh", "-c", script });
     // The script copies zig-out/bin/nova, so the artifact must be installed first.
@@ -559,9 +599,12 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile) void {
 /// the archive so a release can be verified. The version comes from the NOVA_VERSION env var
 /// (set by the release workflow from the git tag); it defaults to "dev" for local builds.
 /// Output: `zig-out/nova-<version>-<os>-<arch>.tar.gz` (+ `.sha256`; `.zip` on Windows).
-fn addNovaArchive(b: *std.Build, exe: *std.Build.Step.Compile) void {
-    const os_name = @tagName(builtin.target.os.tag); // macos | linux | windows
-    const arch_name = @tagName(builtin.target.cpu.arch); // aarch64 | x86_64 | ...
+fn addNovaArchive(b: *std.Build, exe: *std.Build.Step.Compile, target: std.Build.ResolvedTarget) void {
+    // Name the bundle by the TARGET (from -Dtarget), not the build host, so a cross build produces
+    // e.g. nova-<ver>-macos-x86_64.tar.gz from an arm64 host.
+    const ti = targetInfo(b, target);
+    const os_name = ti.os_name; // macos | linux | windows
+    const arch_name = ti.arch_name; // aarch64 | x86_64 | ...
     const version = b.graph.environ_map.get("NOVA_VERSION") orelse "dev";
     const bundle = b.fmt("nova-{s}-{s}-{s}", .{ version, os_name, arch_name });
 
@@ -585,9 +628,9 @@ fn addNovaArchive(b: *std.Build, exe: *std.Build.Step.Compile) void {
             \\# nova.exe dynamically links LLVM-C.dll on Windows; bundle it next to the exe so the
             \\# archive is self-contained (the loader finds a DLL in the exe's own directory).
             \\if ($env:NOVA_LLVM_PREFIX) {{ Copy-Item -Force "$env:NOVA_LLVM_PREFIX/bin/LLVM-C.dll" "$stage/bin/" -ErrorAction SilentlyContinue }}
-            \\Copy-Item -Force "{[home]s}/.nova/lib/libnova_runtime.a" "$stage/lib/"
+            \\Copy-Item -Force "{[home]s}/.nova/lib/libnovacore.a" "$stage/lib/"
             \\Copy-Item -Recurse -Force "{[home]s}/.nova/std" "$stage/std"
-            \\# NOTE: src/runtime + deps are NOT bundled -- the prebuilt libnova_runtime.a covers
+            \\# NOTE: src/runtime + deps are NOT bundled -- the prebuilt libnovacore.a covers
             \\# host-target compilation. They are only needed to cross-compile the runtime to OTHER
             \\# targets (nova build --target) or to build webview FFI apps; add them back if the
             \\# shipped toolchain must do that.
@@ -628,9 +671,9 @@ fn addNovaArchive(b: *std.Build, exe: *std.Build.Step.Compile) void {
         \\  ( cd ../nls && zig build -Dnova-src=../lang/src/root.zig )
         \\  cp "{[home]s}/.nova/bin/nls" "$STAGE/bin/nls"
         \\fi
-        \\cp "{[home]s}/.nova/lib/libnova_runtime.a" "$STAGE/lib/"
+        \\cp "{[home]s}/.nova/lib/libnovacore.a" "$STAGE/lib/"
         \\rsync -a "{[home]s}/.nova/std/" "$STAGE/std/"
-        \\# NOTE: src/runtime + deps are NOT bundled -- the prebuilt libnova_runtime.a covers host-target
+        \\# NOTE: src/runtime + deps are NOT bundled -- the prebuilt libnovacore.a covers host-target
         \\# compilation. They are only needed to cross-compile the runtime to OTHER targets
         \\# (nova build --target) or to build webview FFI apps; add them back if that is required.
         \\printf '%s\n' "{[version]s}" > "$STAGE/VERSION"

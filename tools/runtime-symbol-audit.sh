@@ -8,7 +8,7 @@
 #         tools/runtime-symbol-audit.sh <name>     # is this one symbol referenced, and where
 set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-LIB="$HOME/.nova/lib/libnova_runtime.a"
+LIB="$HOME/.nova/lib/libnovacore.a"
 [ -f "$LIB" ] || { echo "runtime not built: $LIB missing (run: zig build)"; exit 2; }
 
 # EXPORTED: defined text symbols in the runtime archive (macOS prefixes with an underscore).
