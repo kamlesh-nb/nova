@@ -10,7 +10,7 @@ import web.status;
 @serializable struct GetUser { pub id: int }
 @serializable struct UserDto { pub id: int, pub name: string }
 struct GetUserHandler impl RequestHandler<GetUser, UserDto> {
-    fn handle(self, req: GetUser): UserDto { return UserDto{ id: req.id, name: "Ada" }; }
+    async fn handle(self, req: GetUser): UserDto { return UserDto{ id: req.id, name: "Ada" }; }
 }
 
 fn makeReq(method: string, path: string, body: string): request.Request {

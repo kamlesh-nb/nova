@@ -38,6 +38,11 @@
 #if defined(__GLIBC__) || defined(__APPLE__)
 #include <execinfo.h>
 #define NOVA_HAVE_BACKTRACE 1
+#else
+// musl (and other libcs without execinfo) still have the unwind ABI from libgcc/compiler-rt, so we
+// can walk return addresses even without backtrace()/backtrace_symbols().
+#include <unwind.h>
+#define NOVA_HAVE_UNWIND 1
 #endif
 
 namespace {
@@ -446,7 +451,83 @@ void nova_panic_cstr(const char *msg) {
   std::_Exit(134);
 }
 
-long long nova_get_stacktrace(void) { return nova_bytes_alloc(0); }
+// Copy raw bytes into a fresh Nova string (heap buffer with the 8-byte ARC header, len set).
+static long long nova_stacktrace_str(const char *data, long long len) {
+  if (len < 0) len = 0;
+  long long buf = nova_bytes_alloc(len);
+  if (len > 0) std::memcpy((char *)(uintptr_t)buf, data, (size_t)len);
+  return buf;
+}
+
+// Format a list of return addresses as `0x...` lines (one per frame) into a Nova string. Used on the
+// platforms without a symbolizing backtrace (Windows, musl); the addresses resolve with
+// llvm-symbolizer / addr2line / the debugger.
+static long long nova_stacktrace_from_addrs(void *const *addrs, int n) {
+  char line[64 * 20];
+  int off = 0;
+  for (int i = 0; i < n && i < 64; i++) {
+    int w = std::snprintf(line + off, sizeof(line) - (size_t)off, "0x%llx\n",
+                          (unsigned long long)(uintptr_t)addrs[i]);
+    if (w <= 0 || off + w >= (int)sizeof(line)) break;
+    off += w;
+  }
+  return nova_stacktrace_str(line, off);
+}
+
+#if defined(NOVA_HAVE_UNWIND)
+namespace {
+struct NovaUnwindState {
+  void *addrs[64];
+  int n;
+};
+_Unwind_Reason_Code nova_unwind_cb(struct _Unwind_Context *ctx, void *arg) {
+  NovaUnwindState *st = (NovaUnwindState *)arg;
+  if (st->n < 64) st->addrs[st->n++] = (void *)(uintptr_t)_Unwind_GetIP(ctx);
+  return _URC_NO_REASON;
+}
+} // namespace
+#endif
+
+// Capture the current call stack and return it as a Nova string, one frame per line. Works on every
+// supported target; frame 0 (this function) is skipped so the trace starts at the caller:
+//   - glibc / macOS: real symbol names via backtrace() + backtrace_symbols().
+//   - Windows: hex return addresses via RtlCaptureStackBackTrace().
+//   - musl / other libc: hex return addresses via the unwind ABI (_Unwind_Backtrace).
+long long nova_get_stacktrace(void) {
+#if defined(NOVA_HAVE_BACKTRACE)
+  void *frames[64];
+  int n = ::backtrace(frames, 64);
+  if (n <= 1) return nova_bytes_alloc(0);
+  char **syms = ::backtrace_symbols(frames, n);
+  if (!syms) return nova_bytes_alloc(0);
+  long long total = 0;
+  for (int i = 1; i < n; i++) total += (long long)std::strlen(syms[i]) + 1; // + '\n'
+  long long buf = nova_bytes_alloc(total);
+  char *p = (char *)(uintptr_t)buf;
+  long long off = 0;
+  for (int i = 1; i < n; i++) {
+    long long l = (long long)std::strlen(syms[i]);
+    std::memcpy(p + off, syms[i], (size_t)l);
+    off += l;
+    p[off++] = '\n';
+  }
+  ::free(syms);
+  return buf;
+#elif defined(_WIN32)
+  void *frames[64];
+  USHORT n = ::RtlCaptureStackBackTrace(1 /* skip this fn */, 63, frames, nullptr);
+  return nova_stacktrace_from_addrs(frames, (int)n);
+#elif defined(NOVA_HAVE_UNWIND)
+  NovaUnwindState st;
+  st.n = 0;
+  _Unwind_Backtrace(nova_unwind_cb, &st);
+  // Skip frame 0 (this function): start the pointer one past it when there is more than one.
+  if (st.n <= 1) return nova_bytes_alloc(0);
+  return nova_stacktrace_from_addrs(&st.addrs[1], st.n - 1);
+#else
+  return nova_bytes_alloc(0);
+#endif
+}
 
 // nova_getenv/nova_setenv retired in M6: std/env.nova reads and writes the environment through
 // the getenv/setenv bindings in os/sys. Process arguments stay here because the runtime entry

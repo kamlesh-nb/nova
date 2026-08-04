@@ -10,7 +10,7 @@ import web.mediator;
 // `next`, so it can `await` the continuation (a closure could not).
 pub struct PanicRecoveryBehavior impl PipelineBehavior {
 
-    pub async fn handle(self: PanicRecoveryBehavior, src: ValueSource, next: Next): response.Response {
-        return await next.proceed(src);
+    pub async fn handle(self: PanicRecoveryBehavior, ctx: RequestContext, next: Next): response.Response {
+        return await next.proceed(ctx);
     }
 }

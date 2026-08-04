@@ -1,45 +1,37 @@
-// FLAGSHIP: the typed mediator routing DX, end-to-end through the real web.app framework, with
-// clean SRP — registration, dispatch, and binding each in their own place.
-//
-//   struct GetUserHandler impl MessageHandler { fn handle(self, src) { ...bind + respond... } }
-//   app.handle<GetUser>(GetUserHandler{});   // register the handler for the GetUser request type
-//   app.get<GetUser>("/api/user/{id:int}");  // route: GET path -> GetUser (registration only)
-//
-// `get<TReq>`/`post<TReq>`/`handle<TReq>` are REAL generic methods on `App` (visible in
-// web/app.nova), monomorphized per request type. `get<T>` ONLY registers a route; `App.dispatch`
-// is the one place `mediator.send` runs; the HANDLER binds the request itself (`src.getInt("id")`)
-// — visible, debuggable Nova, no hidden binder. The only compiler assist is `serde.typeName<T>()`,
-// which yields the type name so the route key and the handler registration agree by type.
+// 69 — Typed routing end to end through web.app on the runtime mediator. A request implements `Message`
+// and is handled by a `RequestHandler<TReq, TResp>`; `app.get/post<TReq>(path)` registers only the
+// route. On dispatch the App binds the request, and the mediator picks the handler by request type,
+// runs it, and serialises the DTO. No `any`, no downcast, no handler registration beyond the route.
 import assert;
 import web.app;
 import web.request;
 import web.response;
 import web.status;
+import web.routing;
+import web.mediator;
+import serde.json;
 import serde.source;
 import string;
-import map;
 
-@serializable struct GetUser { pub id: int }
-@serializable struct CreateUser { pub name: string }
+@serializable struct GetUser impl Message { pub id: int }
+@serializable struct CreateUser impl Message { pub name: string }
+@serializable struct UserDto { pub id: int, pub name: string }
+@serializable struct CreatedDto { pub created: string }
 
-struct GetUserHandler impl MessageHandler {
-    async fn handle(self: GetUserHandler, src: ValueSource): Response {
-        let q = GetUser{ id: src.getInt("id") };   // binding is ordinary, visible, debuggable code
-        return json(`{"id":${q.id},"name":"Ada"}`);
+struct GetUserHandler impl RequestHandler<GetUser, UserDto> {
+    async fn handle(self: GetUserHandler, q: GetUser): UserDto {
+        return UserDto{ id: q.id, name: "Ada" };
     }
 }
 
-struct CreateUserHandler impl MessageHandler {
-    async fn handle(self: CreateUserHandler, src: ValueSource): Response {
-        let c = CreateUser{ name: src.getString("name") };
-        return json(`{"created":"${c.name}"}`);
+struct CreateUserHandler impl RequestHandler<CreateUser, CreatedDto> {
+    async fn handle(self: CreateUserHandler, c: CreateUser): CreatedDto {
+        return CreatedDto{ created: c.name };
     }
 }
 
 fn makeApp(): App {
     let a = App();
-    a.handle<GetUser>(GetUserHandler{});
-    a.handle<CreateUser>(CreateUserHandler{});
     a.get<GetUser>("/api/user/{id:int}");
     a.post<CreateUser>("/api/user");
     return a;

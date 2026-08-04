@@ -1,0 +1,34 @@
+// examples/26_defer.nova
+import list;
+
+enum TxError { Conflict }
+
+fn transfer(fail: bool, log: List<string>): int | TxError {
+    log.push("acquire lock");
+    defer log.push("release lock");        // ALWAYS runs, on both paths
+    errdefer log.push("rollback txn");     // only runs if we fail below
+
+    if (fail) { return TxError.Conflict; } // error path: errdefer then defer
+    log.push("commit txn");
+    return 1;                              // success path: only the defer runs
+}
+
+fn printLog(label: string, log: List<string>): void {
+    let i = 0;
+    while (i < log.size()) {
+        console.log(`  ${label}: ${log.at(i)}`);
+        i = i + 1;
+    }
+}
+
+fn main(): void {
+    let ok = list.List<string>();
+    let r1 = transfer(false, ok) catch -1;
+    console.log(`success -> result ${r1}`);
+    printLog("ok  ", ok);
+
+    let bad = list.List<string>();
+    let r2 = transfer(true, bad) catch -1;
+    console.log(`conflict -> result ${r2}`);
+    printLog("fail", bad);
+}

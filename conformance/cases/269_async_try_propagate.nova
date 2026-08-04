@@ -1,0 +1,48 @@
+// 269 — `try` error-propagation inside an `async` function. Propagating the error is an early return,
+// and inside a coroutine that must be the coroutine return sequence (store into the promise result
+// slot, then branch to the final suspend), NOT a raw `ret`. A raw `ret` bypassed the coroutine state
+// machine (the error box was mistaken for a coroutine handle) and crashed on resume, corrupting any
+// heap-carrying error propagated across an `await`. Regression guard for that fix.
+//
+// This is the exact shape the typed web mediator generates for a handler returning `TResp | HttpError`
+// (`let __r = try await __h.handle(__req);`), so it must be rock solid.
+import assert;
+import string;
+
+struct Boom {
+    pub s: string,
+    init(s: string) { self.s = s; }
+    fn message(self: Boom): string { return "boom:" + self.s; }
+}
+
+async fn fetch(id: int): int | Boom {
+    if (id < 0) { return Boom("neg"); }
+    return id * 10;
+}
+
+// Nested: awaits fetch, then `try` propagates the heap error (Boom) out across TWO async frames.
+async fn wrap(id: int): string | Boom {
+    let v = try await fetch(id);
+    return `ok:${v}`;
+}
+
+// The ok path unwraps and continues.
+@test
+fn test_async_try_ok(): void {
+    let r = wrap(4) catch (e) e.message();
+    assert.equalStr(r, "ok:40");
+}
+
+// The error path propagates the heap error across the await; accessing its FIELD must be safe.
+@test
+fn test_async_try_err_field(): void {
+    let r = wrap(-1) catch (e) e.s;
+    assert.equalStr(r, "neg");
+}
+
+// The error path with a METHOD call on the propagated error (exactly the generated dispatch shape).
+@test
+fn test_async_try_err_method(): void {
+    let r = wrap(-1) catch (e) e.message();
+    assert.equalStr(r, "boom:neg");
+}

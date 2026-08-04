@@ -1,0 +1,31 @@
+// examples/10_collections.nova
+import collections.list;
+
+fn main(): void {
+    // A growable, typed vector.
+    let fruits = list.List<string>();
+    fruits.push("apple");
+    fruits.push("banana");
+    fruits.push("cherry");
+    console.log(`size = ${fruits.size()}`);
+
+    // get(i) returns an OPTIONAL (T | undefined). Unwrap with ?? (chapter 10).
+    console.log(`fruits[1] = ${fruits.get(1) ?? "?"}`);
+    console.log(`fruits[9] = ${fruits.get(9) ?? "?"}`);   // out of range -> undefined
+
+    // set(i, v) overwrites in place.
+    fruits.set(0, "avocado");
+    console.log(`fruits[0] = ${fruits.get(0) ?? "?"}`);
+
+    // Iterate with for-in.
+    for (f in fruits) { console.log(`fruit: ${f}`); }
+
+    // Transform pipelines with map / filter / reduce.
+    let nums = list.List<int>();
+    for (i in 1..=5) { nums.push(i); }
+
+    let squares = nums.map((n) => n * n);
+    let big = squares.filter((n) => n > 4);
+    let total = big.reduce(0, (acc, n) => acc + n);
+    console.log(`squares>4 count = ${big.size()}, total = ${total}`);
+}

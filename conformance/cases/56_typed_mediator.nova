@@ -6,6 +6,8 @@
 // will generate at each route; shown explicitly here to gate the pipeline.
 import assert;
 import serde.source;
+import web.response;
+import web.status;
 
 trait RequestHandler<TReq, TResp> {
     fn handle(self, req: TReq): TResp;

@@ -249,6 +249,12 @@ pub const OptDerefError = struct {
     kind: OptDerefKind = .opt,
 };
 
+pub const CatchMismatchError = struct {
+    span: ast.Span,
+    ok: TypeId,
+    handler: TypeId,
+};
+
 pub const Inferer = struct {
     allocator: std.mem.Allocator,
     store: *types.TypeStore,
@@ -268,6 +274,11 @@ pub const Inferer = struct {
 
     optional_deref_errors: std.ArrayListUnmanaged(OptDerefError) = .empty,
 
+    // A `catch` whose handler value does not match the ok side of the error union. Both arms must
+    // unify (the catch yields the ok type), so e.g. `intFn() catch (e) e.describe()` (ok=int,
+    // handler=string) is a soundness error, not silent garbage.
+    catch_mismatch_errors: std.ArrayListUnmanaged(CatchMismatchError) = .empty,
+
     fatal_unresolved_idents: usize = 0,
 
     first_fatal_ident: ?[]const u8 = null,
@@ -282,6 +293,12 @@ pub const Inferer = struct {
     captured_return: ?TypeId = null,
 
     in_call_callee: bool = false,
+
+    // The statement list currently being inferred (set by inferStmtSeq). Lets a
+    // `let name = closure` look ahead to a call site `name(args)` in the same block and
+    // pin the closure's param types from the argument types, so the closure (and any local
+    // that holds its result) is correctly typed on the first pass.
+    current_stmt_seq: ?[]ast.Statement = null,
 
     ir: ?*TypedIr = null,
     stats: Stats = .{},
@@ -302,6 +319,7 @@ pub const Inferer = struct {
         self.visibility_errors.deinit(self.allocator);
         self.const_reassign_errors.deinit(self.allocator);
         self.optional_deref_errors.deinit(self.allocator);
+        self.catch_mismatch_errors.deinit(self.allocator);
     }
 
     fn push(self: *Inferer) !void {
@@ -389,6 +407,21 @@ pub const Inferer = struct {
     fn ok(self: *Inferer, id: TypeId) TypeId {
         self.stats.typed += 1;
         return id;
+    }
+
+    // Do the two arms of a `catch` unify? The result type is the ok side; the handler must produce
+    // a value usable as it. Conservative to avoid false positives: same type is fine, unresolved is
+    // skipped, and the only rejected shape is a heap `string`/`decimal` on one arm and something
+    // else on the other, which is exactly the case codegen would mis-stringify or mis-free (e.g. an
+    // `int` ok side with a `string` handler). Numeric/struct/trait/enum variety is allowed.
+    fn catchArmsCompatible(self: *Inferer, ok_t: TypeId, handler_t: TypeId) bool {
+        if (ok_t == handler_t) return true;
+        const ko = self.store.get(ok_t);
+        const kh = self.store.get(handler_t);
+        if (ko == .unresolved or kh == .unresolved) return true;
+        if ((ko == .string) != (kh == .string)) return false;
+        if ((ko == .decimal) != (kh == .decimal)) return false;
+        return true;
     }
 
     pub fn inferExpr(self: *Inferer, ep: *const ast.Expression) anyerror!TypeId {
@@ -689,6 +722,17 @@ pub const Inferer = struct {
                     }
                 }
 
+                // Module-qualified constant: `module.CONST`. The object is a module
+                // reference (an ident with no local binding) and the field names a
+                // `pub const`. Resolve to the constant's declared type. Without this the
+                // access stays `unresolved`, so downstream `+` dispatch and codegen guess
+                // it as an int: `mod.STR + x` renders the string POINTER as a decimal, and
+                // `mod.A + mod.B` becomes a numeric add of two pointers -> a wild pointer
+                // stored as a string -> heap corruption on the later ARC free.
+                if (fa.object.kind == .ident and self.lookup(fa.object.kind.ident) == null) {
+                    if (try self.constType(fa.field)) |t| return self.ok(t);
+                }
+
                 if (fa.object.kind == .ident) {
                     const obj = fa.object.kind.ident;
                     if (self.lookup(obj) == null and !self.isFatalUnresolvedIdent(obj)) {
@@ -826,6 +870,28 @@ pub const Inferer = struct {
             },
             .closure => |cl| {
 
+                // A closure whose param types cannot be pinned from its body alone (e.g.
+                // `(a, b) => a + b`, where both params are only used with each other) infers as
+                // unresolved on the first pass. closureSecondPass then re-infers it from a call
+                // site's argument types and records the resolved `.func` type. On a re-inference
+                // with no expected type, reuse that cached resolution instead of recomputing to
+                // unresolved again — otherwise the call site (and any local bound to its result)
+                // stays untyped, and a later `${r}` picks the wrong stringifier and crashes.
+                if (expected == null) {
+                    if (self.ir) |ir| {
+                        if (ir.typeOf(&e)) |cached| {
+                            if (self.store.get(cached) == .func) {
+                                const cft = self.store.get(cached).func;
+                                var all_resolved = self.store.get(cft.ret) != .unresolved and cft.params.len == cl.params.len;
+                                for (cft.params) |pt| {
+                                    if (self.store.get(pt) == .unresolved) all_resolved = false;
+                                }
+                                if (all_resolved) return self.ok(cached);
+                            }
+                        }
+                    }
+                }
+
                 const want: ?types.FuncType = if (expected) |x| switch (self.store.get(x)) {
                     .func => |ft| ft,
                     else => null,
@@ -904,8 +970,15 @@ pub const Inferer = struct {
                 const ity = self.store.get(it);
                 if (ity == .error_union) {
                     if (ce.err_name) |n| try self.bind(n, ity.error_union.err);
-                    _ = try self.inferExpr(ce.handler);
-                    return self.ok(ity.error_union.ok);
+                    const ok_ty = ity.error_union.ok;
+                    // The catch yields the ok type, so the handler value must match it. Infer the
+                    // handler with the ok type expected, then verify they unify.
+                    const ht = try self.inferExprExpecting(ce.handler, ok_ty);
+                    if (!self.catchArmsCompatible(ok_ty, ht)) {
+                        const sp = if (ce.handler.span.line > 0) ce.handler.span else ce.expr.span;
+                        self.catch_mismatch_errors.append(self.allocator, .{ .span = sp, .ok = ok_ty, .handler = ht }) catch {};
+                    }
+                    return self.ok(ok_ty);
                 }
                 _ = try self.inferExpr(ce.handler);
                 return self.ok(it);
@@ -1614,10 +1687,27 @@ pub const Inferer = struct {
     fn inferExprQuietly(self: *Inferer, e: *const ast.Expression, expected: ?TypeId) anyerror!TypeId {
         const saved_ir = self.ir;
         const saved = self.stats.typed;
+        // A quiet inference must not leak diagnostics. It is used for look-ahead (e.g. typing a
+        // call's arguments before the surrounding locals are bound), so an "undefined identifier"
+        // it hits is not a real error — snapshot and restore the fatal-diagnostic counters too.
+        const saved_fatal_idents = self.fatal_unresolved_idents;
+        const saved_first_ident = self.first_fatal_ident;
+        const saved_first_span = self.first_fatal_span;
+        const saved_fatal_calls = self.fatal_unresolved_calls;
+        const saved_first_call_recv = self.first_fatal_call_recv;
+        const saved_first_call_field = self.first_fatal_call_field;
+        const saved_first_call_span = self.first_fatal_call_span;
         self.ir = null;
         defer {
             self.ir = saved_ir;
             self.stats.typed = saved;
+            self.fatal_unresolved_idents = saved_fatal_idents;
+            self.first_fatal_ident = saved_first_ident;
+            self.first_fatal_span = saved_first_span;
+            self.fatal_unresolved_calls = saved_fatal_calls;
+            self.first_fatal_call_recv = saved_first_call_recv;
+            self.first_fatal_call_field = saved_first_call_field;
+            self.first_fatal_call_span = saved_first_call_span;
         }
         return self.inferExprInner(e.*, expected);
     }
@@ -1629,6 +1719,9 @@ pub const Inferer = struct {
     }
 
     pub fn inferStmtSeq(self: *Inferer, statements: []ast.Statement) anyerror!void {
+        const saved_seq = self.current_stmt_seq;
+        self.current_stmt_seq = statements;
+        defer self.current_stmt_seq = saved_seq;
         for (statements, 0..) |*s, idx| {
             try self.inferStmt(s);
             if (earlyExitNarrowing(s)) |n| {
@@ -1657,7 +1750,20 @@ pub const Inferer = struct {
 
                     if (ls.init) |*i| _ = try self.inferExprExpecting(i, t);
                 } else if (ls.init) |*i| {
-                    t = try self.inferExpr(i);
+                    // A closure whose param types cannot be pinned from its body alone (e.g.
+                    // `let add = (a, b) => a + b`) infers as unresolved on its own. Look ahead to a
+                    // call site `name(args)` in this block and use the argument types as the
+                    // closure's expected param types, so the closure and any local holding its
+                    // result are typed correctly on the first pass.
+                    if (i.kind == .closure and i.kind.closure.params.len > 0 and ls.names == null) {
+                        if (try self.closureCallExpectation(ls.name, i.kind.closure.params.len)) |exp| {
+                            t = try self.inferExprExpecting(i, exp);
+                        } else {
+                            t = try self.inferExpr(i);
+                        }
+                    } else {
+                        t = try self.inferExpr(i);
+                    }
                 } else {
                     t = try self.store.unresolvedT();
                 }
@@ -1804,22 +1910,98 @@ pub const Inferer = struct {
         }
         try self.inferStmtSeq(f.body.statements);
 
-        try self.closureSecondPass(&f.body);
+        _ = try self.closureSecondPass(&f.body);
     }
 
-    fn closureSecondPass(self: *Inferer, fn_body: *const ast.Block) anyerror!void {
+    // Recursively search an expression tree for a call `name(args)` with `arity` args, returning
+    // the argument types (quietly inferred). Unlike callArgTypesInExpr this descends into every
+    // sub-expression (templates, binary ops, casts, ...), so it also finds `${name(a, b)}`.
+    fn callArgTypesDeep(self: *Inferer, e: *const ast.Expression, name: []const u8, arity: usize) anyerror!?[]TypeId {
+        switch (e.kind) {
+            .call => |call| {
+                if (call.callee.kind == .ident and std.mem.eql(u8, call.callee.kind.ident, name) and call.args.len == arity) {
+                    const out = try self.allocator.alloc(TypeId, arity);
+                    for (call.args, 0..) |*a, i| out[i] = try self.inferExprQuietly(a, null);
+                    return out;
+                }
+                if (try self.callArgTypesDeep(call.callee, name, arity)) |r| return r;
+                for (call.args) |*a| if (try self.callArgTypesDeep(a, name, arity)) |r| return r;
+            },
+            .generic_call => |gc| {
+                if (try self.callArgTypesDeep(gc.callee, name, arity)) |r| return r;
+                for (gc.args) |*a| if (try self.callArgTypesDeep(a, name, arity)) |r| return r;
+            },
+            .template_expr => |te| for (te.parts) |*p| { if (try self.callArgTypesDeep(p, name, arity)) |r| return r; },
+            .binary => |b| {
+                if (try self.callArgTypesDeep(b.left, name, arity)) |r| return r;
+                if (try self.callArgTypesDeep(b.right, name, arity)) |r| return r;
+            },
+            .unary => |u| { if (try self.callArgTypesDeep(u.operand, name, arity)) |r| return r; },
+            .cast => |c| { if (try self.callArgTypesDeep(c.expr, name, arity)) |r| return r; },
+            .nullish_coalesce => |n| {
+                if (try self.callArgTypesDeep(n.left, name, arity)) |r| return r;
+                if (try self.callArgTypesDeep(n.right, name, arity)) |r| return r;
+            },
+            .optional_chaining => |o| { if (try self.callArgTypesDeep(o.object, name, arity)) |r| return r; },
+            .field_access => |fa| { if (try self.callArgTypesDeep(fa.object, name, arity)) |r| return r; },
+            .index => |ix| {
+                if (try self.callArgTypesDeep(ix.object, name, arity)) |r| return r;
+                if (try self.callArgTypesDeep(ix.index, name, arity)) |r| return r;
+            },
+            .if_expr => |ie| {
+                if (try self.callArgTypesDeep(ie.condition, name, arity)) |r| return r;
+                if (try self.callArgTypesDeep(ie.then_branch, name, arity)) |r| return r;
+                if (try self.callArgTypesDeep(ie.else_branch, name, arity)) |r| return r;
+            },
+            .try_expr => |tx| { if (try self.callArgTypesDeep(tx, name, arity)) |r| return r; },
+            .await_expr => |ae| { if (try self.callArgTypesDeep(ae.operand, name, arity)) |r| return r; },
+            .go_expr => |ae| { if (try self.callArgTypesDeep(ae.operand, name, arity)) |r| return r; },
+            .tuple => |elems| for (elems) |*el| { if (try self.callArgTypesDeep(el, name, arity)) |r| return r; },
+            else => {},
+        }
+        return null;
+    }
+
+    // Look ahead in the current statement block for a call `name(args)` matching `arity`, and if
+    // found with at least one known argument type, return the expected `.func` type (params =
+    // argument types, ret = unresolved). Used to pin a closure's param types on the first pass.
+    fn closureCallExpectation(self: *Inferer, name: []const u8, arity: usize) anyerror!?TypeId {
+        const stmts = self.current_stmt_seq orelse return null;
+        for (stmts) |*s| {
+            const ep: ?*const ast.Expression = switch (s.*) {
+                .expr_stmt => |*es| &es.expr,
+                .let_stmt => |*ls| if (ls.init) |*i| i else null,
+                .return_stmt => |*rs| if (rs.value) |*v| v else null,
+                else => null,
+            };
+            if (ep) |e| {
+                if (try self.callArgTypesDeep(e, name, arity)) |arg_types| {
+                    defer self.allocator.free(arg_types);
+                    var any_known = false;
+                    for (arg_types) |at| if (self.store.get(at) != .unresolved) { any_known = true; };
+                    if (!any_known) continue;
+                    return try self.store.intern(.{ .func = .{ .params = arg_types, .ret = try self.store.unresolvedT() } });
+                }
+            }
+        }
+        return null;
+    }
+
+    fn closureSecondPass(self: *Inferer, fn_body: *const ast.Block) anyerror!bool {
+        var retyped_any = false;
         for (fn_body.statements) |*s| {
             if (s.* != .let_stmt) continue;
             const ls = &s.let_stmt;
             const cl_init = if (ls.init) |*i| i else continue;
             if (cl_init.kind != .closure) continue;
-            try self.retypeBoundClosure(fn_body, ls.name, cl_init);
+            if (try self.retypeBoundClosure(fn_body, ls.name, cl_init)) retyped_any = true;
         }
+        return retyped_any;
     }
 
-    fn retypeBoundClosure(self: *Inferer, fn_body: *const ast.Block, name: []const u8, cl_init: *const ast.Expression) anyerror!void {
+    fn retypeBoundClosure(self: *Inferer, fn_body: *const ast.Block, name: []const u8, cl_init: *const ast.Expression) anyerror!bool {
         const cl = cl_init.kind.closure;
-        if (cl.params.len == 0) return;
+        if (cl.params.len == 0) return false;
 
         if (self.ir) |ir| {
             if (ir.typeOf(cl_init)) |t| {
@@ -1829,19 +2011,24 @@ pub const Inferer = struct {
                     for (ft.params) |pt| {
                         if (self.store.get(pt) == .unresolved) any_unresolved = true;
                     }
-                    if (!any_unresolved) return;
+                    if (!any_unresolved) return false;
                 }
             }
         }
-        const arg_types = (try self.findCallArgTypes(fn_body, name, cl.params.len)) orelse return;
+        const arg_types = (try self.findCallArgTypes(fn_body, name, cl.params.len)) orelse return false;
         defer self.allocator.free(arg_types);
 
         var any_known = false;
         for (arg_types) |at| if (self.store.get(at) != .unresolved) { any_known = true; };
-        if (!any_known) return;
+        if (!any_known) return false;
 
         const exp = try self.store.intern(.{ .func = .{ .params = arg_types, .ret = try self.store.unresolvedT() } });
-        _ = try self.inferExprExpecting(cl_init, exp);
+        const ct = try self.inferExprExpecting(cl_init, exp);
+        // Only worth a re-inference of the enclosing body if we actually produced a resolved func.
+        if (self.store.get(ct) == .func and self.store.get(self.store.get(ct).func.ret) != .unresolved) {
+            return true;
+        }
+        return false;
     }
 
     fn findCallArgTypes(self: *Inferer, block: *const ast.Block, name: []const u8, arity: usize) anyerror!?[]TypeId {

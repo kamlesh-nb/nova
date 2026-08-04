@@ -1,0 +1,77 @@
+// 267 — The typed handler DX end-to-end through the real web.app framework: a handler receives the
+// DESERIALISED request and returns a typed DTO, which the framework serialises to JSON. No ValueSource,
+// no manual field reads, no hidden downcast.
+//
+//   struct H impl RequestHandler<GetProductById, ProductDto> {
+//       async fn handle(self, req: GetProductById): ProductDto { ... }   // typed in, typed out
+//   }
+//   app.get<GetProductById>("/api/products/{id:int}");   // route only; the handler is discovered
+//
+// The compiler discovers the `RequestHandler<TReq, TResp>` impl and generates the dispatch: it binds
+// the request from the route params overlaid on the body (@fromRoute over @fromBody), calls the typed
+// handler, and serialises the returned DTO with the generated `<T>__toJson`. `App.dispatch` runs this
+// generated path whenever no old-style ValueSource handler is registered for the key, so both the typed
+// design and the legacy MessageHandler design coexist (69 / 124 cover the legacy path).
+import assert;
+import web.app;
+import web.request;
+import web.response;
+import web.status;
+import web.routing;
+import web.mediator;
+import serde.json;
+import serde.source;
+import string;
+
+@serializable struct GetProductById impl Message { pub id: int }
+@serializable struct CreateProduct impl Message { pub name: string, pub price: int }
+@serializable struct ProductDto { pub id: int, pub name: string }
+
+// GET handler: id is bound from the route (@fromRoute).
+struct GetProductByIdHandler impl RequestHandler<GetProductById, ProductDto> {
+    async fn handle(self: GetProductByIdHandler, req: GetProductById): ProductDto {
+        return ProductDto{ id: req.id, name: "Sample Product" };
+    }
+}
+
+// POST handler: fields are bound from the JSON body (@fromBody).
+struct CreateProductHandler impl RequestHandler<CreateProduct, ProductDto> {
+    async fn handle(self: CreateProductHandler, req: CreateProduct): ProductDto {
+        return ProductDto{ id: 1, name: req.name };
+    }
+}
+
+fn makeApp(): App {
+    let a = App();
+    a.get<GetProductById>("/api/products/{id:int}");
+    a.post<CreateProduct>("/api/products");
+    return a;
+}
+
+// (1) GET: the route param binds into the typed request; the DTO comes back as JSON.
+@test
+fn test_typed_get_binds_route(): void {
+    let a = makeApp();
+    let req = Request.fromString("GET /api/products/7 HTTP/1.1\r\nHost: x\r\n\r\n");
+    let resp = a.dispatch(req);
+    assert.equalStr(resp.body, `{"id":7,"name":"Sample Product"}`);
+    assert.equalInt(resp.status.toCode(), 200);
+}
+
+// (2) POST: the JSON body binds into the typed request (@fromBody).
+@test
+fn test_typed_post_binds_body(): void {
+    let a = makeApp();
+    let req = Request.fromString("POST /api/products HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"name\": \"Widget\", \"price\": 9}");
+    let resp = a.dispatch(req);
+    assert.equalStr(resp.body, `{"id":1,"name":"Widget"}`);
+}
+
+// (3) An unmatched route is a 404, unchanged.
+@test
+fn test_unmatched_route_404(): void {
+    let a = makeApp();
+    let req = Request.fromString("GET /nope HTTP/1.1\r\nHost: x\r\n\r\n");
+    let resp = a.dispatch(req);
+    assert.equalInt(resp.status.toCode(), 404);
+}

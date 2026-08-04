@@ -1,0 +1,34 @@
+import web.mediator;
+import web.response;
+import web.status;
+import web.di;
+import Features.Products.Shared.database;
+
+// A logging behaviour: wraps every handler, tags the response with the request type it handled. A real
+// one would time the request and write a structured log line. Being outermost, it sees the final
+// Response whether the handler ran or a behaviour short-circuited.
+pub struct LoggingBehavior impl PipelineBehavior {
+    async fn handle(self: LoggingBehavior, ctx: RequestContext, next: Next): Response {
+        let res = await next.proceed(ctx);
+        res.setHeader("X-Handled-By", ctx.requestType);
+        return res;
+    }
+}
+
+// A transaction / unit-of-work behaviour: it opens a transaction on the request's SCOPED connection
+// (the same instance the handler's repository uses), runs the handler, and commits on success or rolls
+// back on an error response. This is why `send` opens one DI scope per request: the behaviour and the
+// handler share the connection.
+pub struct TransactionBehavior impl PipelineBehavior {
+    async fn handle(self: TransactionBehavior, ctx: RequestContext, next: Next): Response {
+        let conn = ctx.scope.require("InMemoryConnection") as InMemoryConnection;
+        let _ = await conn.begin();
+        let res = await next.proceed(ctx);
+        if (res.status.toCode() < 400) {
+            let _ = await conn.commit();
+        } else {
+            let _ = await conn.rollback();
+        }
+        return res;
+    }
+}

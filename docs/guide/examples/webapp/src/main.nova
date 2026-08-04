@@ -1,0 +1,55 @@
+// main.nova, the app composition root (= Program.cs): register services and behaviours, map routes,
+// serve static files, run. Handlers are discovered by their `RequestHandler<TReq, TResp>` impls, so the
+// route is the only per-endpoint registration. On a request the framework binds it and `send`s it to the
+// mediator, which picks the handler by request type, opens a per-request DI scope, runs the behaviour
+// pipeline (log, validate, transaction), and returns the response.
+import web.app;
+import web.di;
+import web.request;
+import web.response;
+import web.routing;
+import web.mediator;
+import serde.json;
+import Features.Products.Shared.database;
+import Features.Products.Shared.repository;
+import Features.Products.Shared.behaviours;
+import Features.Products.CreateProduct.command;
+import Features.Products.CreateProduct.handler;
+import Features.Products.CreateProduct.validator;
+import Features.Products.GetProductById.query;
+import Features.Products.GetProductById.handler;
+
+// Services: the database connection is a singleton (a shared store); the repository is resolved per
+// request and injected with it. Swap the connection line for a real driver (postgres, btreedb, ...) and
+// nothing in the repository or the handlers changes.
+fn configureServices(): ServiceCollection {
+    let services = ServiceCollection();
+    services.addSingleton("InMemoryConnection", (sp) => { return InMemoryConnection(); });
+    services.addScoped("ProductRepository", (sp) => { return ProductRepository(sp.require("InMemoryConnection") as InMemoryConnection); });
+    return services;
+}
+
+fn buildApp(): App {
+    let app = App();
+    app.useServices(configureServices());
+
+    // The behaviour pipeline, outermost first: log the request, validate it (short-circuiting bad input
+    // with a 400 before any transaction), then wrap the handler in a database transaction.
+    app.useBehavior(LoggingBehavior{});
+    app.useBehavior(ValidationBehavior{});
+    app.useBehavior(TransactionBehavior{});
+
+    // Products feature: one route per slice. Handlers are found by their impls; their dependencies are
+    // injected from the services above.
+    app.post<CreateProduct>("/api/products");
+    app.get<GetProductById>("/api/products/{id:int}");
+
+    app.useStatic("/", "./wwwroot");
+    return app;
+}
+
+fn main(): void {
+    let app = buildApp();
+    console.log("Listening on http://127.0.0.1:8080");
+    app.run(8080);
+}

@@ -1,0 +1,61 @@
+import assert;
+import string;
+import web.app;
+import web.di;
+import web.request;
+import web.response;
+import web.mediator;
+import Features.Products.Shared.database;
+import Features.Products.Shared.repository;
+import Features.Products.Shared.behaviours;
+import Features.Products.CreateProduct.command;
+import Features.Products.CreateProduct.handler;
+import Features.Products.CreateProduct.validator;
+import Features.Products.GetProductById.query;
+import Features.Products.GetProductById.handler;
+
+fn testApp(): App {
+    let services = ServiceCollection();
+    services.addSingleton("InMemoryConnection", (sp) => { return InMemoryConnection(); });
+    services.addScoped("ProductRepository", (sp) => { return ProductRepository(sp.require("InMemoryConnection") as InMemoryConnection); });
+    let app = App();
+    app.useServices(services);
+    app.useBehavior(LoggingBehavior{});
+    app.useBehavior(ValidationBehavior{});
+    app.useBehavior(TransactionBehavior{});
+    app.post<CreateProduct>("/api/products");
+    app.get<GetProductById>("/api/products/{id:int}");
+    return app;
+}
+
+// Create a product, then read it back by its new id: the handler persists through the injected
+// repository, the transaction commits, and the logging behaviour tags the response.
+@test
+fn test_create_then_get(): void {
+    let app = testApp();
+    let created = app.dispatch(Request.fromString("POST /api/products HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"name\":\"Widget\",\"price\":9}"));
+    assert.equalInt(created.status.toCode(), 200);
+    assert.isTrue(string.indexOf(created.body, "\"id\":1") != -1);
+    assert.equalStr(created.getHeader("X-Handled-By") ?? "", "CreateProduct");
+
+    let got = app.dispatch(Request.fromString("GET /api/products/1 HTTP/1.1\r\nHost: x\r\n\r\n"));
+    assert.equalInt(got.status.toCode(), 200);
+    assert.isTrue(string.indexOf(got.body, "Widget") != -1);
+}
+
+// A product that does not exist is a 404 (the handler returns HttpError, the framework maps it).
+@test
+fn test_get_missing_404(): void {
+    let app = testApp();
+    let got = app.dispatch(Request.fromString("GET /api/products/999 HTTP/1.1\r\nHost: x\r\n\r\n"));
+    assert.equalInt(got.status.toCode(), 404);
+}
+
+// Invalid input is rejected by the ValidationBehavior with a 400, before the handler or transaction run.
+@test
+fn test_validation_400(): void {
+    let app = testApp();
+    let bad = app.dispatch(Request.fromString("POST /api/products HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"name\":\"\",\"price\":9}"));
+    assert.equalInt(bad.status.toCode(), 400);
+    assert.isTrue(string.indexOf(bad.body, "name is required") != -1);
+}

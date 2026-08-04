@@ -20,6 +20,10 @@ import web.app;
 import web.request;
 import web.response;
 import web.status;
+import web.routing;
+import web.mediator;
+import web.di;
+import serde.json;
 import serde.source;
 
 const SO_REUSEADDR: int = 4;
@@ -48,14 +52,23 @@ fn containsAscii(buf: long, n: int, s: string): bool {
     return false;
 }
 
-@serializable struct GetUser { pub id: int }
+@serializable struct GetUser impl Message { pub id: int }
+@serializable struct ValDto { pub val: int }
+
+// The DB endpoint config, injected into the handler from the DI container.
+struct DbConfig impl Service {
+    pub port: int,
+    init(port: int) { self.port = port; }
+}
 
 // The flagship handler: on each request it opens a database connection and runs a query, all with
-// `await` on the reactor. This is exactly the shape that deadlocked before M1+M2.
-struct GetUserHandler impl MessageHandler {
-    pub dbPort: int,
-    async fn handle(self: GetUserHandler, src: ValueSource): Response {
-        let db = await aio.asyncConnect("127.0.0.1", self.dbPort);
+// `await` on the reactor. This is exactly the shape that deadlocked before M1+M2. The DB port is
+// injected through the constructor (resolved from the per-request scope).
+struct GetUserHandler impl RequestHandler<GetUser, ValDto> {
+    cfg: DbConfig,
+    init(cfg: DbConfig) { self.cfg = cfg; }
+    async fn handle(self: GetUserHandler, q: GetUser): ValDto {
+        let db = await aio.asyncConnect("127.0.0.1", self.cfg.port);
         let val = 0;
         if (db.isOpen()) {
             let _ = await db.sendStr("Q");
@@ -67,13 +80,15 @@ struct GetUserHandler impl MessageHandler {
             bytes.free(buf);
             db.close();
         }
-        return json(`{"val":${val}}`);
+        return ValDto{ val: val };
     }
 }
 
 fn makeApp(dbPort: int): App {
+    let services = ServiceCollection();
+    services.addSingleton("DbConfig", (sp) => { return DbConfig(dbPort); });
     let a = App();
-    a.handle<GetUser>(GetUserHandler{ dbPort: dbPort });
+    a.useServices(services);
     a.get<GetUser>("/user");
     return a;
 }

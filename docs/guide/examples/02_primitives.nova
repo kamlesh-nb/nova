@@ -1,0 +1,28 @@
+// Primitive types, literals, operators, and casts.
+fn main(): void {
+    let i: int = 42;              // 32-bit signed
+    let big: long = 10000000000;  // 64-bit
+    let pi: float = 3.14159;      // IEEE-754 double
+    let ok: bool = true;
+    let name: string = "Nova";
+
+    console.log(`int:    ${i}`);
+    console.log(`long:   ${big}`);
+    console.log(`float:  ${pi}`);
+    console.log(`bool:   ${ok}`);
+    console.log(`string: ${name}`);
+
+    // Operators
+    console.log(`7 / 2   = ${7 / 2}`);      // integer division -> 3
+    console.log(`7 % 2   = ${7 % 2}`);      // modulo -> 1
+    console.log(`2 ** via mul 2*2*2 = ${2 * 2 * 2}`);
+    console.log(`1 << 4  = ${1 << 4}`);     // bit shift -> 16
+    console.log(`6 & 3   = ${6 & 3}`);      // bitwise AND -> 2
+    console.log(`6 | 1   = ${6 | 1}`);      // bitwise OR  -> 7
+    console.log(`5 ^ 1   = ${5 ^ 1}`);      // XOR -> 4
+
+    // Casts with `as`
+    let f: float = i as float;
+    let back: int = pi as int;              // truncates -> 3
+    console.log(`42 as float = ${f}, 3.14159 as int = ${back}`);
+}

@@ -58,11 +58,14 @@ pub struct App {
 
     init() {
         self.router = routing.Router();
-        self.mediator = mediator.Mediator();
+        self.provider = ServiceCollection().buildServiceProvider();
+        // The runtime mediator: the compiler-generated `__registerHandlers` populates it with a handler
+        // adapter (and any validators) for every request type that implements `Message`.
+        self.mediator = mediator.Mediator(self.provider);
+        __registerHandlers(self.mediator);
         self.static_mounts = List<static_content.StaticMount>();
         self.cache = Map<string, string>(16, string.hash);
         self.cacheable = Map<string, bool>(16, string.hash);
-        self.provider = ServiceCollection().buildServiceProvider();
         self.readTimeoutMs = 30000;
         self.maxHeaderBytes = 32768;
         self.maxBodyBytes = 1048576;
@@ -90,6 +93,16 @@ pub struct App {
 
     pub fn useServices(self: App, sc: ServiceCollection): void {
         self.provider = sc.buildServiceProvider();
+        // The mediator opens a scope off this provider for every `send`, so handlers and behaviours
+        // share per-request scoped services (a DB connection, a unit of work).
+        self.mediator.setProvider(self.provider);
+    }
+
+    // Register a cross-cutting behaviour that wraps every handler (logging, validation, timing, auth).
+    // Behaviours run in registration order (first registered is outermost); each calls
+    // `await next.proceed(ctx)` to continue, and may short-circuit by returning a Response.
+    pub fn useBehavior(self: App, behavior: mediator.PipelineBehavior): void {
+        self.mediator.useBehavior(behavior);
     }
 
     pub fn enableCache(self: App, path: string): void {
@@ -134,16 +147,10 @@ pub struct App {
         self.static_mounts.push(static_content.StaticMount(prefix, dir, 128));
     }
 
-    pub fn handle<TReq>(self: App, handler: mediator.MessageHandler): void {
-        self.mediator.register(serde.typeName<TReq>(), handler);
-    }
-
-    pub fn handleFrom<TReq>(self: App, factory: (ServiceScope) -> mediator.MessageHandler): void {
-        self.mediator.registerFactory(serde.typeName<TReq>(), factory);
-    }
-
     // Route registration delegates to the single Router. The key is serde.typeName<TReq>() -- the same
-    // string app.handle<TReq> registers the mediator handler under -- so a route resolves to its handler.
+    // string the compiler registers the handler adapter under -- so a matched route resolves to its
+    // handler through the mediator. The handler itself is discovered by its `RequestHandler<TReq, _>`
+    // impl; there is nothing to register beyond the route.
     pub fn get<TReq>(self: App, path: string): void {
         self.router.__addRoute("GET", path, serde.typeName<TReq>());
     }
@@ -185,8 +192,13 @@ pub struct App {
             return response.Response(Status.BadRequest, "Bad Request: invalid path parameter");
         }
         if (m.matched) {
+            // Bind the request source (route params over body), then hand off to the runtime mediator:
+            // the compiler-generated `__mediator_dispatch_runtime` binds the typed request, widens it,
+            // and calls `mediator.send`, which picks the handler by request type, opens a per-request DI
+            // scope, runs the behaviour pipeline (validation, transactions, logging), and returns the
+            // Response. The App never knows about handlers; it binds and sends.
             let src = self.sourceFor(req, m.params);
-            return await self.mediator.send(m.key, self.provider, src);
+            return await __mediator_dispatch_runtime(m.key, src, self.mediator);
         }
         if (m.methodNotAllowed) {
             return response.Response(Status.MethodNotAllowed, "Method Not Allowed");

@@ -1,0 +1,39 @@
+// examples/geometry.nova
+// A tiny sibling module imported by 20_modules.nova. Only `pub` declarations are
+// visible to other modules; a non-pub struct/fn referenced from another file is a
+// hard compile error. Both the struct and the free function below are `pub`.
+
+pub struct Point {
+    pub x: int,
+    pub y: int,
+    init(x: int, y: int) {
+        self.x = x;
+        self.y = y;
+    }
+}
+
+// Manhattan (taxicab) distance between two points.
+pub fn manhattan(a: Point, b: Point): int {
+    let dx = if (a.x > b.x) a.x - b.x else b.x - a.x;
+    let dy = if (a.y > b.y) a.y - b.y else b.y - a.y;
+    return dx + dy;
+}
+
+// A non-pub helper: usable inside this module, invisible to importers.
+fn double(n: int): int { return n + n; }
+
+pub fn perimeter(a: Point, b: Point): int {
+    return double(manhattan(a, b));
+}
+
+// A @test so the guide's run_all.sh exercises this module directly (it has no
+// `main`). Importers ignore @test functions; they run only under `nova test`.
+import assert;
+
+@test
+fn t_geometry(): void {
+    let a = Point(0, 0);
+    let b = Point(3, 4);
+    assert.equalInt(manhattan(a, b), 7);
+    assert.equalInt(perimeter(a, b), 14);
+}

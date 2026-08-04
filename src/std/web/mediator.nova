@@ -1,164 +1,189 @@
 
-import map;
 import string;
+import map;
 import list;
-import web.request;
 import web.response;
 import web.status;
-import serde.source;
 import web.di;
 
-// The mediator is the app developer's request-dispatch seam: a request key maps to a MessageHandler,
-// and cross-cutting concerns (pre-processing, wrapping behaviors, post-processing, exception handling)
-// are registered once and run around every handler. Handlers are ASYNC (so a handler may `await` a
-// database or another service) and bound through serde's ValueSource, returning a web Response.
+// The runtime mediator (MediatR-parity). This module IS the framework: the registry, `send`, the
+// behaviour pipeline, per-request DI scopes, and validation all live here in ordinary Nova. The
+// compiler only generates thin per-type glue (a widen `Q__asMessage`, a handler adapter `Q__Adapter`, a
+// validator adapter, and the registration) because those need the concrete request/response types.
 //
-// Handlers may be registered directly, or as a FACTORY resolved from a per-request DI scope
-// (registerFactory), so a handler can take scoped dependencies.
-//
-// Note on the pipeline `next`: a PipelineBehavior receives a `Next` OBJECT (not a `() => Response`
-// closure) and calls `await next.proceed(src)` to continue the chain. This is deliberate -- a Nova
-// closure cannot `await`, so continuation has to be a method on an object for the wrap-around,
-// short-circuit semantics to work with async handlers.
+// Dispatch is by request TYPE. The request travels erased as a `Message` trait object (never `any`,
+// which corrupts heap structs). `send` looks the handler up by the request's type name, opens a scope,
+// runs the behaviour chain terminating in the handler adapter, and returns a Response.
 
-pub trait MessageHandler {
-    async fn handle(self: MessageHandler, src: ValueSource): response.Response;
+// The erased carrier. Every request type implements it (the compiler records the impl).
+pub trait Message {}
+
+// A per-type validator the developer writes: typed over its request. The compiler generates an erased
+// ValidatorAdapter for it (downcast + call) and auto-registers it, like handlers.
+pub trait Validator<TReq> {
+    fn validate(self: Validator<TReq>, req: TReq): List<string>;
+}
+
+// The erased validator the runtime stores: takes the request as a Message and returns the errors (empty
+// = valid). The compiler-generated adapter downcasts the Message to the concrete request type.
+pub trait ValidatorAdapter {
+    fn validate(self: ValidatorAdapter, req: Message): List<string>;
+}
+
+// The compiler-generated adapter for one handler: downcast the request, resolve the handler and its
+// dependencies from the scope, run it, serialise the response.
+pub trait HandlerAdapter {
+    async fn execute(self: HandlerAdapter, ctx: RequestContext): response.Response;
+}
+
+// What a behaviour and the terminal adapter receive: the erased request, its type key, the per-request
+// DI scope (shared by behaviours and the handler, so a transaction behaviour and the handler use one
+// connection), the marker traits the request type implements, and the validator registry.
+pub struct RequestContext {
+    pub request: Message,
+    pub requestType: string,
+    pub scope: ServiceScope,
+    pub markers: List<string>,
+    pub validators: Map<string, ValidatorAdapter>,
+
+    init(request: Message, requestType: string, scope: ServiceScope, markers: List<string>, validators: Map<string, ValidatorAdapter>) {
+        self.request = request;
+        self.requestType = requestType;
+        self.scope = scope;
+        self.markers = markers;
+        self.validators = validators;
+    }
+
+    // Whether the request type carries a marker trait (e.g. "Cacheable"). Handler-specific behaviours
+    // opt in on the request via a marker instead of per-type registration.
+    pub fn requestIs(self: RequestContext, marker: string): bool {
+        let i = 0;
+        while (i < self.markers.size()) {
+            if (string.eql(self.markers.at(i), marker)) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    pub fn validatorFor(self: RequestContext, key: string): ValidatorAdapter | undefined {
+        return self.validators.get(key);
+    }
 }
 
 pub trait PipelineBehavior {
-    async fn handle(self: PipelineBehavior, src: ValueSource, next: Next): response.Response;
-}
-
-pub trait PreProcessor {
-    async fn process(self: PreProcessor, src: ValueSource): void;
-}
-
-pub trait PostProcessor {
-    async fn process(self: PostProcessor, src: ValueSource, res: response.Response): response.Response;
-}
-
-pub trait ExceptionHandler {
-    async fn handle(self: ExceptionHandler, src: ValueSource, err: string): response.Response;
-}
-
-struct NoHandler impl MessageHandler {
-    async fn handle(self: NoHandler, src: ValueSource): response.Response {
-        return response.Response(Status.NotFound, "No handler");
-    }
-}
-
-// The continuation handed to a PipelineBehavior. `proceed` invokes the next behavior in the list, or
-// the terminal handler once the behaviors are exhausted. It is an object because its `proceed` method
-// is `async` and must be awaitable; a closure cannot await.
-pub struct Next {
-    pub behaviors: List<PipelineBehavior>,
-    pub idx: int,
-    pub handler: MessageHandler,
-
-    init(behaviors: List<PipelineBehavior>, idx: int, handler: MessageHandler) {
-        self.behaviors = behaviors;
-        self.idx = idx;
-        self.handler = handler;
-    }
-
-    pub async fn proceed(self: Next, src: ValueSource): response.Response {
-        if (self.idx >= self.behaviors.size()) {
-            return await self.handler.handle(src);
-        }
-        let b = self.behaviors.get(self.idx) ?? NoBehavior{};
-        let nxt = Next(self.behaviors, self.idx + 1, self.handler);
-        return await b.handle(src, nxt);
-    }
+    async fn handle(self: PipelineBehavior, ctx: RequestContext, next: Next): response.Response;
 }
 
 struct NoBehavior impl PipelineBehavior {
-    async fn handle(self: NoBehavior, src: ValueSource, next: Next): response.Response {
-        return await next.proceed(src);
+    async fn handle(self: NoBehavior, ctx: RequestContext, next: Next): response.Response {
+        return await next.proceed(ctx);
+    }
+}
+
+// The continuation handed to a behaviour: runs the next behaviour, or the terminal adapter once the
+// behaviours are exhausted. It is an object (not a closure) because `proceed` is async and a Nova
+// closure cannot await.
+pub struct Next {
+    pub behaviors: List<PipelineBehavior>,
+    pub idx: int,
+    pub terminal: HandlerAdapter,
+
+    init(behaviors: List<PipelineBehavior>, idx: int, terminal: HandlerAdapter) {
+        self.behaviors = behaviors;
+        self.idx = idx;
+        self.terminal = terminal;
+    }
+
+    pub async fn proceed(self: Next, ctx: RequestContext): response.Response {
+        if (self.idx >= self.behaviors.size()) {
+            return await self.terminal.execute(ctx);
+        }
+        let b = self.behaviors.at(self.idx);
+        let nxt = Next(self.behaviors, self.idx + 1, self.terminal);
+        return await b.handle(ctx, nxt);
+    }
+}
+
+pub struct HandlerEntry {
+    pub adapter: HandlerAdapter,
+    pub markers: List<string>,
+    init(adapter: HandlerAdapter, markers: List<string>) { self.adapter = adapter; self.markers = markers; }
+}
+
+struct NotFoundAdapter impl HandlerAdapter {
+    async fn execute(self: NotFoundAdapter, ctx: RequestContext): response.Response {
+        return response.Response(Status.NotFound, "no handler for " + ctx.requestType);
     }
 }
 
 pub struct Mediator {
-    pub handlers: Map<string, MessageHandler>,
-    pub factories: Map<string, (ServiceScope) -> MessageHandler>,
+    pub handlers: Map<string, HandlerEntry>,
+    pub validators: Map<string, ValidatorAdapter>,
     pub behaviors: List<PipelineBehavior>,
-    pub pre_processors: List<PreProcessor>,
-    pub post_processors: List<PostProcessor>,
-    pub exception_handlers: List<ExceptionHandler>,
+    pub provider: ServiceProvider,
 
-    init() {
-        self.handlers = Map<string, MessageHandler>(32, string.hash);
-        self.factories = Map<string, (ServiceScope) -> MessageHandler>(32, string.hash);
+    init(provider: ServiceProvider) {
+        self.handlers = Map<string, HandlerEntry>(32, string.hash);
+        self.validators = Map<string, ValidatorAdapter>(32, string.hash);
         self.behaviors = List<PipelineBehavior>();
-        self.pre_processors = List<PreProcessor>();
-        self.post_processors = List<PostProcessor>();
-        self.exception_handlers = List<ExceptionHandler>();
+        self.provider = provider;
     }
 
-    pub fn register(self: Mediator, key: string, handler: MessageHandler): void {
-        self.handlers.set(key, handler);
+    // Registration (the compiler generates calls to these; the developer registers behaviours).
+    pub fn register(self: Mediator, key: string, adapter: HandlerAdapter, markers: List<string>): void {
+        self.handlers.set(key, HandlerEntry(adapter, markers));
+    }
+    pub fn registerValidator(self: Mediator, key: string, v: ValidatorAdapter): void {
+        self.validators.set(key, v);
+    }
+    pub fn useBehavior(self: Mediator, b: PipelineBehavior): void {
+        self.behaviors.push(b);
+    }
+    pub fn hasHandlerFor(self: Mediator, key: string): bool {
+        return self.handlers.get(key) != undefined;
+    }
+    pub fn setProvider(self: Mediator, provider: ServiceProvider): void {
+        self.provider = provider;
     }
 
-    pub fn registerFactory(self: Mediator, key: string, factory: (ServiceScope) -> MessageHandler): void {
-        self.factories.set(key, factory);
-    }
-
-    pub fn addBehavior(self: Mediator, behavior: PipelineBehavior): void {
-        self.behaviors.push(behavior);
-    }
-
-    pub fn addPreProcessor(self: Mediator, pre: PreProcessor): void {
-        self.pre_processors.push(pre);
-    }
-
-    pub fn addPostProcessor(self: Mediator, post: PostProcessor): void {
-        self.post_processors.push(post);
-    }
-
-    pub fn addExceptionHandler(self: Mediator, handler: ExceptionHandler): void {
-        self.exception_handlers.push(handler);
-    }
-
-    fn resolve(self: Mediator, key: string, provider: ServiceProvider): MessageHandler {
-        let factory = self.factories.get(key);
-        if (factory != undefined) {
-            let scope = provider.createScope();
-            let build = factory ?? ((sc) => { return NoHandler{}; });
-            return build(scope);
+    // The first-class runtime dispatch. `req` is the already-widened request, `key` its type name.
+    pub async fn send(self: Mediator, req: Message, key: string): response.Response {
+        let scope = self.provider.createScope();
+        let entry = self.handlers.get(key);
+        let markers = List<string>();
+        let terminal: HandlerAdapter = NotFoundAdapter{};
+        if (entry != undefined) {
+            let e = entry ?? HandlerEntry(NotFoundAdapter{}, List<string>());
+            terminal = e.adapter;
+            markers = e.markers;
         }
-        let direct = self.handlers.get(key);
-        if (direct == undefined) { return NoHandler{}; }
-        return direct ?? NoHandler{};
-    }
-
-    pub async fn send(self: Mediator, key: string, provider: ServiceProvider, src: ValueSource): response.Response {
-        if (self.factories.get(key) == undefined && self.handlers.get(key) == undefined) {
-            return response.Response(Status.NotFound, "No handler for request: " + key);
-        }
-
-        let pre_len = self.pre_processors.len;
-        let i = 0;
-        while (i < pre_len) {
-            let pre = self.pre_processors.at(i);
-            await pre.process(src);
-            i = i + 1;
-        }
-
-        let handler = self.resolve(key, provider);
-        let start = Next(self.behaviors, 0, handler);
-        let res = await start.proceed(src);
-
-        let post_len = self.post_processors.len;
-        let k = 0;
-        while (k < post_len) {
-            let post = self.post_processors.at(k);
-            res = await post.process(src, res);
-            k = k + 1;
-        }
-
-        return res;
+        let ctx = RequestContext(req, key, scope, markers, self.validators);
+        let start = Next(self.behaviors, 0, terminal);
+        return await start.proceed(ctx);
     }
 }
 
+// The one generic validation behaviour: resolve the per-type validator for the current request and
+// short-circuit with a 400 on failure, else continue. Registered once with `app.useBehavior`.
+pub struct ValidationBehavior impl PipelineBehavior {
+    async fn handle(self: ValidationBehavior, ctx: RequestContext, next: Next): response.Response {
+        let v = ctx.validatorFor(ctx.requestType);
+        if (v != undefined) {
+            let errs = (v ?? NullValidator{}).validate(ctx.request);
+            if (errs.size() > 0) {
+                return response.Response(Status.BadRequest, errs.at(0));
+            }
+        }
+        return await next.proceed(ctx);
+    }
+}
+
+struct NullValidator impl ValidatorAdapter {
+    fn validate(self: NullValidator, req: Message): List<string> { return List<string>(); }
+}
+
+// Response helpers. A handler builds a typed DTO and the framework serialises it, but these are handy
+// for a handler that wants to shape a Response directly (an error page, a redirect body, HTML).
 pub fn text(body: string): response.Response {
     let r = response.Response(Status.Ok, body);
     r.setHeader("Content-Type", "text/plain; charset=utf-8");
@@ -166,13 +191,13 @@ pub fn text(body: string): response.Response {
 }
 
 pub fn html(body: string): response.Response {
-    let res = response.Response(Status.Ok, body);
-    res.setHeader("Content-Type", "text/html; charset=utf-8");
-    return res;
+    let r = response.Response(Status.Ok, body);
+    r.setHeader("Content-Type", "text/html; charset=utf-8");
+    return r;
 }
 
 pub fn json(body: string): response.Response {
-    let res = response.Response(Status.Ok, body);
-    res.setHeader("Content-Type", "application/json");
-    return res;
+    let r = response.Response(Status.Ok, body);
+    r.setHeader("Content-Type", "application/json");
+    return r;
 }

@@ -37,8 +37,12 @@ A program's entry is `fn main(): void`. Command-line arguments are read via `env
 - **Identifiers:** letter/`_` then letters/digits/`_`.
 - **Keywords:** `let`, `const`, `fn`, `struct`, `enum`, `trait`, `union`, `impl`, `import`, `pub`,
   `if`, `else`, `while`, `for`, `switch`, `case`, `return`, `break`, `continue`, `defer`, `async`,
-  `await`, `go`, `as`, `true`, `false`, `undefined`, `null`. `in` is a **contextual** keyword (only
-  special inside a `for (… in …)` header) *(→ 53_for_loops)*. `var` was **removed** — use `let`/`const`.
+  `await`, `spawn`, `as`, `true`, `false`, `undefined`, `null`. `go` is **reserved-unimplemented**
+  (like `match`) — the launch keyword is `spawn` (see §9); writing `go` is a parse error. `in` and
+  `exception` are **contextual** keywords: `exception` is a keyword only at declaration position
+  (`exception Name { … }`, see §3.5), so `import exception;` and identifiers named `exception` still
+  work; `in` is special only inside a `for (... in ...)` header *(→ 53_for_loops)*. `var` was
+  **removed**; use `let`/`const`.
 - **Literals:**
   | Kind | Example | Type |
   |---|---|---|
@@ -104,8 +108,9 @@ An optional is written `T | undefined`. `undefined` means **absence** (not an er
 
 ### 3.5 Error unions — `T | E`
 
-Nova's error model: a function that can fail returns `T | E` where `E` is a user error type (an enum or
-struct). **Errors are values you return, not exceptions** *(→ 33_error_union, 32_error_payloads)*:
+Nova's error model: a function that can fail returns `T | E` where `E` is a user error type (an enum,
+struct, or an **`exception`**). **Errors are values you return, not exceptions in the throwing sense**
+*(→ 33_error_union, 32_error_payloads, 266_exception)*:
 
 ```nova
 fn readConfig(path: string): string | ConfigError { … }
@@ -115,6 +120,18 @@ fn readConfig(path: string): string | ConfigError { … }
   function; otherwise yield the unwrapped ok value.
 - `readConfig(p) catch h` — on the error side, evaluate the **expression** `h` (which may bind the error:
   `catch (e) reason(e)`); the ok value passes through unchanged.
+- **`exception` — a union error type with a mandatory `message()`.** An `exception` is a tagged
+  union (an enum) that the compiler **requires** to define a `message(self): string` method; omitting
+  it is a compile error. Used as the error side, one function can fail with several variants and every
+  caller handles them uniformly with `catch (e) e.message()`, which dispatches to the matching case.
+  `exception` is a **contextual** keyword (special only at declaration position), so `import exception;`
+  and identifiers named `exception` are unaffected. The `exception` module also exports
+  `stackTrace(): string` (the current call stack, one frame per line; works on macOS, Linux, and Windows). *(→ 266_exception,
+  expect_fail/exception_missing_message)*. (`catch`'s two arms must unify, so an exception reads best
+  with a `string` ok side.)
+- **`catch` type agreement.** Both arms of a `catch` must unify, since the expression yields the ok
+  type. A string/decimal handler against a non-matching ok side is a compile error, not silent
+  garbage.
 - `errdefer cleanup()` — runs `cleanup()` ONLY when the enclosing function returns on the **error** path
   (an explicit error-side return, or a `try` that propagates). Plain `defer` runs at every scope exit;
   `errdefer` is its error-only twin, for unwinding a half-built resource when the operation fails. Multiple
@@ -150,7 +167,7 @@ per-instantiation destructors and ARC) *(→ 07_generics, 02_generics_destructor
 - `Storage<T>` — the low-level owned buffer backing `List`/`Map`; ARC releases each slot via a generated
   `__destruct_Storage_T`.
 - `Atomic<T>` — `load`/`store`/`add`/`sub`/`compareAndSwap` over int/long/bool *(→ 31_atomics)*.
-- `Future<T>` — the result handle of a `go`-launched async call (§11).
+- `Future<T>` — the result handle of a `spawn`-launched async call (§11).
 - **Tuples** — `(a, b)`; ARC-correct even when holding heap elements *(→ 28_tuple_return_heap)*.
 
 ### 3.8 Structs, enums, traits
@@ -324,16 +341,17 @@ switch (self) {
 
 ## 9. Concurrency
 
-`async` / `await` / `go` over a Boost.Asio coroutine runtime *(→ 10_async_go, 11_channels)*:
+`async` / `await` / `spawn` over a Boost.Asio coroutine runtime *(→ 10_async_go, 11_channels)*:
 ```nova
 async fn fetch(): int { … }
-let f = go fetch();      // launch concurrently → Future
+let f = spawn fetch();   // launch concurrently → Future
 let v = await f;         // suspend until it completes
 ```
 - `async fn` compiles to a native LLVM coroutine.
-- `go`/`spawn <async-call>` launches it as a concurrent task, yielding a `Future`.
+- `spawn <async-call>` launches it as a concurrent task, yielding a `Future`. (`go` is reserved but
+  unimplemented — it is a parse error; use `spawn`.)
 - `await <future>` suspends the caller until the result is ready.
-- **Function coloring.** `await` and `spawn`/`go` are legal **only inside an `async fn`**. Inside an
+- **Function coloring.** `await` and `spawn` are legal **only inside an `async fn`**. Inside an
   `async fn`, an async call **must** be `await`ed or `spawn`ed — a *bare* async call is a compile error
   *(→ expect_fail/bare_async_call_in_async)*. A bare async call block-drives the callee to completion,
   and doing that from within a running coroutine re-enters the event loop → deadlock; the checker

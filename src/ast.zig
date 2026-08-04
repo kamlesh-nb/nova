@@ -86,6 +86,10 @@ pub const EnumDecl = struct {
     methods: []MethodDecl,
     attributes: []Attribute,
     span: Span,
+    // An `exception` declaration is an enum (a tagged union) that the compiler REQUIRES to provide a
+    // `describe(self): string` method. It is used as the error side of `T | E`; a caller handles it
+    // with `catch (e) e.describe()`. Set by the parser for the `exception` keyword.
+    is_exception: bool = false,
 };
 
 pub const Variant = struct {

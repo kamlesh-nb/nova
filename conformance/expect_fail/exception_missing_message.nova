@@ -1,0 +1,17 @@
+// EXPECT-FAIL: typecheck
+// An `exception` must define a `message(self): string` method. This one does not, so compilation
+// must fail (that is the whole point of the `exception` keyword over a plain enum). The error is
+// "exception 'BadError' must define a `message(self): string` method".
+exception BadError {
+    Oops(string),
+    Broken(int),
+}
+
+fn f(): int | BadError {
+    return BadError.Oops("boom");
+}
+
+@test
+fn t_exception_without_message(): void {
+    let x = f() catch -1;
+}

@@ -249,6 +249,7 @@ fn appendWolfsslLink(args: *std.ArrayList([]const u8), allocator: std.mem.Alloca
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const llvm_codegen = @import("codegen/llvm_codegen.zig");
+const codegen_arc = @import("codegen/arc.zig");
 const type_checker = @import("type_checker.zig");
 const sema_shadow = @import("sema/shadow.zig");
 const sema_alpha = @import("sema/alpha.zig");
@@ -1018,20 +1019,97 @@ fn generateMediatorDispatch(allocator: std.mem.Allocator, declarations: *std.Arr
                 .ident => |n| n,
                 else => continue,
             };
-            const r = switch (impl.type_args[1]) {
-                .ident => |n| n,
+            // The response type arg is either a plain DTO `R` (always serialised as 200 JSON) or an
+            // error union `R | E` (200 JSON on the ok side; on the error side the framework calls
+            // `e.toResponse()`, so a handler can return any status). `HttpError` (web.response) is the
+            // standard error type, but any type with a `toResponse(): Response` method works.
+            var r_ok: []const u8 = "";
+            var r_err: ?[]const u8 = null;
+            switch (impl.type_args[1]) {
+                .ident => |n| r_ok = n,
+                .error_union => |eu| {
+                    r_ok = switch (eu.ok.*) {
+                        .ident => |n| n,
+                        else => continue,
+                    };
+                    r_err = switch (eu.err.*) {
+                        .ident => |n| n,
+                        else => continue,
+                    };
+                },
                 else => continue,
-            };
+            }
             if (seen_q.contains(q)) continue;
             try seen_q.put(q, {});
             try qs.append(allocator, q);
-            try serdeAppendf(&src, allocator,
-                "fn __mediator_dispatch_{s}(src: ValueSource): string {{\n" ++
-                    "    let __h = {s}{{}};\n" ++
-                    "    let __req = {s}__bind(src);\n" ++
-                    "    let __resp = __h.handle(__req);\n" ++
-                    "    return {s}__toJson(__resp);\n" ++
-                    "}}\n\n", .{ q, s.name, q, r });
+
+            // Construct the handler, resolving each `init` parameter from the DI provider (ASP.NET-style
+            // constructor injection). A handler with no constructor is just `H{}`; a handler that takes
+            // dependencies becomes `H(__provider.require("Dep") as Dep, ...)`.
+            var init_params: []const ast.Param = &.{};
+            var handle_is_async = false;
+            for (s.methods) |m| {
+                if (std.mem.eql(u8, m.decl.name, "init")) {
+                    init_params = m.decl.params;
+                } else if (std.mem.eql(u8, m.decl.name, "handle")) {
+                    handle_is_async = m.decl.is_async;
+                }
+            }
+            // The generated dispatch is always `async` (so `by_name` is uniform and the App can await
+            // it), but we only `await` the handler when its own `handle` is async — a sync handler is
+            // called directly. This lets an async handler `await` a database driver, while a plain
+            // handler pays no coroutine cost at its own call site.
+            const await_kw: []const u8 = if (handle_is_async) "await " else "";
+            var ctor_buf = std.ArrayList(u8).empty;
+            defer ctor_buf.deinit(allocator);
+            var di_ok = init_params.len > 0;
+            if (di_ok) {
+                try serdeAppendf(&ctor_buf, allocator, "{s}(", .{s.name});
+                for (init_params, 0..) |p, pi| {
+                    const dep: []const u8 = if (p.type_name) |tr| switch (tr) {
+                        .ident => |n| n,
+                        else => "",
+                    } else "";
+                    if (dep.len == 0) {
+                        di_ok = false;
+                        break;
+                    }
+                    if (pi > 0) try ctor_buf.appendSlice(allocator, ", ");
+                    try serdeAppendf(&ctor_buf, allocator, "__provider.require(\"{s}\") as {s}", .{ dep, dep });
+                }
+                try ctor_buf.appendSlice(allocator, ")");
+            }
+            if (!di_ok) {
+                ctor_buf.clearRetainingCapacity();
+                try serdeAppendf(&ctor_buf, allocator, "{s}{{}}", .{s.name});
+            }
+            const handler_ctor = ctor_buf.items;
+
+            if (r_err != null) {
+                // ok helper returns `Response | E`, so `try` short-circuits the error out of it; the
+                // dispatch then maps that error to a Response via its `toResponse()`.
+                try serdeAppendf(&src, allocator,
+                    "async fn __mediator_ok_{s}(src: ValueSource, __provider: ServiceProvider): Response | {s} {{\n" ++
+                        "    let __h = {s};\n" ++
+                        "    let __req = {s}__bind(src);\n" ++
+                        "    let __r = try {s}__h.handle(__req);\n" ++
+                        "    let __resp = Response(Status.Ok, {s}__toJson(__r));\n" ++
+                        "    __resp.setHeader(\"Content-Type\", \"application/json\");\n" ++
+                        "    return __resp;\n" ++
+                        "}}\n" ++
+                        "async fn __mediator_dispatch_{s}(src: ValueSource, __provider: ServiceProvider): Response {{\n" ++
+                        "    return await __mediator_ok_{s}(src, __provider) catch (__e) __e.toResponse();\n" ++
+                        "}}\n\n", .{ q, r_err.?, handler_ctor, q, await_kw, r_ok, q, q });
+            } else {
+                try serdeAppendf(&src, allocator,
+                    "async fn __mediator_dispatch_{s}(src: ValueSource, __provider: ServiceProvider): Response {{\n" ++
+                        "    let __h = {s};\n" ++
+                        "    let __req = {s}__bind(src);\n" ++
+                        "    let __resp = Response(Status.Ok, {s}__toJson({s}__h.handle(__req)));\n" ++
+                        "    __resp.setHeader(\"Content-Type\", \"application/json\");\n" ++
+                        "    return __resp;\n" ++
+                        "}}\n\n", .{ q, handler_ctor, q, r_ok, await_kw });
+            }
         }
     }
 
@@ -1048,16 +1126,227 @@ fn generateMediatorDispatch(allocator: std.mem.Allocator, declarations: *std.Arr
     }
     if (src.items.len == 0 and !has_router) return;
 
-    try serdeAppendf(&src, allocator, "fn __mediator_dispatch_by_name(__name: string, src: ValueSource): string {{\n", .{});
+    try serdeAppendf(&src, allocator, "async fn __mediator_dispatch_by_name(__name: string, src: ValueSource, __provider: ServiceProvider): Response {{\n", .{});
     for (qs.items) |q| {
-        try serdeAppendf(&by_name, allocator, "    if (string.eql(__name, \"{s}\")) {{ return __mediator_dispatch_{s}(src); }}\n", .{ q, q });
+        try serdeAppendf(&by_name, allocator, "    if (string.eql(__name, \"{s}\")) {{ return await __mediator_dispatch_{s}(src, __provider); }}\n", .{ q, q });
     }
     try src.appendSlice(allocator, by_name.items);
-    try src.appendSlice(allocator, "    return \"\";\n}\n\n");
+    try src.appendSlice(allocator, "    return Response(Status.NotFound, \"\");\n}\n\n");
 
     var p = try parser.Parser.init(allocator, src.items, "<mediator-generated>", is_wasm);
     const prog = p.parseProgram() catch |err| {
         std.debug.print("mediator dispatch generation failed to parse:\n{s}\n", .{src.items});
+        return err;
+    };
+    for (prog.declarations) |d| {
+        try declarations.append(allocator, d);
+    }
+}
+
+// The RUNTIME mediator glue (web/rmediator.nova). For each `impl RequestHandler<Q,R>` this emits the
+// tiny type-directed Nova the runtime cannot write itself: a widen `Q__asMessage`, an adapter
+// `Q__Adapter` (downcast the erased request, build the handler with DI from the request scope, run it,
+// serialise R), and it accumulates a `__registerHandlers(m)` that registers every adapter. The
+// framework (dispatch, pipeline, DI, scopes, validation) lives in stdlib; this pass only writes the
+// per-type glue. Emitted ALONGSIDE the legacy baked dispatch during the transition.
+fn generateRuntimeMediator(allocator: std.mem.Allocator, declarations: *std.ArrayList(ast.Declaration), is_wasm: bool) !void {
+    var src = std.ArrayList(u8).empty;
+    var reg = std.ArrayList(u8).empty;
+    defer reg.deinit(allocator);
+    var disp = std.ArrayList(u8).empty;
+    defer disp.deinit(allocator);
+    var seen = std.StringHashMap(void).init(allocator);
+    defer seen.deinit();
+    var found = false;
+
+    // Only requests that opt into the runtime mediator (by implementing `Message`) get the runtime
+    // glue. This lets the runtime path coexist with the legacy baked dispatch during the migration: a
+    // handler whose request does not implement `Message` keeps using the old path untouched.
+    var message_structs = std.StringHashMap(void).init(allocator);
+    defer message_structs.deinit();
+    // Per request type, its impl list (so we can record marker traits: any impl that is not a framework
+    // trait becomes a marker the runtime can test with `ctx.requestIs("...")`).
+    var req_impls = std.StringHashMap([]const ast.TraitImpl).init(allocator);
+    defer req_impls.deinit();
+    for (declarations.items) |decl| {
+        if (decl != .struct_decl) continue;
+        for (decl.struct_decl.impls) |impl| {
+            if (std.mem.eql(u8, impl.name, "Message")) {
+                try message_structs.put(decl.struct_decl.name, {});
+                try req_impls.put(decl.struct_decl.name, decl.struct_decl.impls);
+            }
+        }
+    }
+
+    for (declarations.items) |decl| {
+        if (decl != .struct_decl) continue;
+        const s = decl.struct_decl;
+        for (s.impls) |impl| {
+            if (!std.mem.eql(u8, impl.name, "RequestHandler")) continue;
+            if (impl.type_args.len != 2) continue;
+            const q = switch (impl.type_args[0]) {
+                .ident => |n| n,
+                else => continue,
+            };
+            if (!message_structs.contains(q)) continue;
+            var r_ok: []const u8 = "";
+            var r_err: ?[]const u8 = null;
+            switch (impl.type_args[1]) {
+                .ident => |n| r_ok = n,
+                .error_union => |eu| {
+                    r_ok = switch (eu.ok.*) {
+                        .ident => |n| n,
+                        else => continue,
+                    };
+                    r_err = switch (eu.err.*) {
+                        .ident => |n| n,
+                        else => continue,
+                    };
+                },
+                else => continue,
+            }
+            if (seen.contains(q)) continue;
+            try seen.put(q, {});
+
+            // handler construction via DI resolved from the per-request SCOPE (ctx.scope).
+            var init_params: []const ast.Param = &.{};
+            var handle_is_async = false;
+            for (s.methods) |m| {
+                if (std.mem.eql(u8, m.decl.name, "init")) {
+                    init_params = m.decl.params;
+                } else if (std.mem.eql(u8, m.decl.name, "handle")) {
+                    handle_is_async = m.decl.is_async;
+                }
+            }
+            const await_kw: []const u8 = if (handle_is_async) "await " else "";
+            var ctor_buf = std.ArrayList(u8).empty;
+            defer ctor_buf.deinit(allocator);
+            var di_ok = init_params.len > 0;
+            if (di_ok) {
+                try serdeAppendf(&ctor_buf, allocator, "{s}(", .{s.name});
+                for (init_params, 0..) |p, pi| {
+                    const dep: []const u8 = if (p.type_name) |tr| switch (tr) {
+                        .ident => |n| n,
+                        else => "",
+                    } else "";
+                    if (dep.len == 0) {
+                        di_ok = false;
+                        break;
+                    }
+                    if (pi > 0) try ctor_buf.appendSlice(allocator, ", ");
+                    try serdeAppendf(&ctor_buf, allocator, "ctx.scope.require(\"{s}\") as {s}", .{ dep, dep });
+                }
+                try ctor_buf.appendSlice(allocator, ")");
+            }
+            if (!di_ok) {
+                ctor_buf.clearRetainingCapacity();
+                try serdeAppendf(&ctor_buf, allocator, "{s}{{}}", .{s.name});
+            }
+            const handler_ctor = ctor_buf.items;
+
+            found = true;
+            // widen at a return boundary (Nova cannot widen a generic to a trait inline).
+            try serdeAppendf(&src, allocator, "fn {s}__asMessage(q: {s}): Message {{ return q; }}\n", .{ q, q });
+
+            if (r_err != null) {
+                try serdeAppendf(&src, allocator,
+                    "async fn {s}__rok(ctx: RequestContext): Response | {s} {{\n" ++
+                        "    let __q = ctx.request as {s};\n" ++
+                        "    let __h = {s};\n" ++
+                        "    let __r = try {s}__h.handle(__q);\n" ++
+                        "    let __resp = Response(Status.Ok, {s}__toJson(__r));\n" ++
+                        "    __resp.setHeader(\"Content-Type\", \"application/json\");\n" ++
+                        "    return __resp;\n" ++
+                        "}}\n" ++
+                        "struct {s}__Adapter impl HandlerAdapter {{\n" ++
+                        "    async fn execute(self: {s}__Adapter, ctx: RequestContext): Response {{\n" ++
+                        "        return await {s}__rok(ctx) catch (__e) __e.toResponse();\n" ++
+                        "    }}\n" ++
+                        "}}\n\n", .{ q, r_err.?, q, handler_ctor, await_kw, r_ok, q, q, q });
+            } else {
+                try serdeAppendf(&src, allocator,
+                    "struct {s}__Adapter impl HandlerAdapter {{\n" ++
+                        "    async fn execute(self: {s}__Adapter, ctx: RequestContext): Response {{\n" ++
+                        "        let __q = ctx.request as {s};\n" ++
+                        "        let __h = {s};\n" ++
+                        "        let __resp = Response(Status.Ok, {s}__toJson({s}__h.handle(__q)));\n" ++
+                        "        __resp.setHeader(\"Content-Type\", \"application/json\");\n" ++
+                        "        return __resp;\n" ++
+                        "    }}\n" ++
+                        "}}\n\n", .{ q, q, q, handler_ctor, r_ok, await_kw });
+            }
+
+            // Record the request type's marker traits (impls that are not framework traits). A behaviour
+            // opts in per request via a marker instead of per-type registration.
+            try serdeAppendf(&reg, allocator, "    let __mk_{s} = List<string>();\n", .{q});
+            if (req_impls.get(q)) |impls| {
+                for (impls) |mi| {
+                    if (std.mem.eql(u8, mi.name, "Message")) continue;
+                    if (std.mem.eql(u8, mi.name, "RequestHandler")) continue;
+                    if (std.mem.eql(u8, mi.name, "Request")) continue;
+                    try serdeAppendf(&reg, allocator, "    __mk_{s}.push(\"{s}\");\n", .{ q, mi.name });
+                }
+            }
+            try serdeAppendf(&reg, allocator, "    m.register(\"{s}\", {s}__Adapter{{}}, __mk_{s});\n", .{ q, q, q });
+
+            // The HTTP endpoint side: bind the typed request from the source, widen it, and send it
+            // through the runtime mediator. Keyed by the same type name the route is registered under.
+            try serdeAppendf(&disp, allocator, "    if (string.eql(__key, \"{s}\")) {{ let __q = {s}__bind(src); return await m.send({s}__asMessage(__q), \"{s}\"); }}\n", .{ q, q, q, q });
+        }
+    }
+
+    // Auto-register per-type validators: for each `impl Validator<Q>` generate an erased adapter that
+    // downcasts the Message and calls the typed validator, then register it by request-type name.
+    for (declarations.items) |decl| {
+        if (decl != .struct_decl) continue;
+        const vs = decl.struct_decl;
+        for (vs.impls) |impl| {
+            if (!std.mem.eql(u8, impl.name, "Validator")) continue;
+            if (impl.type_args.len != 1) continue;
+            const vq = switch (impl.type_args[0]) {
+                .ident => |n| n,
+                else => continue,
+            };
+            found = true;
+            try serdeAppendf(&src, allocator,
+                "struct {s}__ValAdapter impl ValidatorAdapter {{\n" ++
+                    "    fn validate(self: {s}__ValAdapter, req: Message): List<string> {{\n" ++
+                    "        let __q = req as {s};\n" ++
+                    "        return {s}{{}}.validate(__q);\n" ++
+                    "    }}\n" ++
+                    "}}\n\n", .{ vs.name, vs.name, vq, vs.name });
+            try serdeAppendf(&reg, allocator, "    m.registerValidator(\"{s}\", {s}__ValAdapter{{}});\n", .{ vq, vs.name });
+        }
+    }
+
+    // Emit the two entry points whenever there is an App/router (even with no Message handlers) so
+    // `App.init` (which calls `__registerHandlers`) and `App.dispatch` (which calls
+    // `__mediator_dispatch_runtime`) always resolve. The runtime `Mediator` type they reference lives in
+    // `web.mediator`, which a web app loads via `web.app`.
+    var has_router = false;
+    for (declarations.items) |decl| {
+        if (decl != .struct_decl) continue;
+        for (decl.struct_decl.methods) |m| {
+            if (std.mem.eql(u8, m.decl.name, "__addRoute")) {
+                has_router = true;
+                break;
+            }
+        }
+        if (has_router) break;
+    }
+    if (!found and !has_router) return;
+
+    try serdeAppendf(&src, allocator, "fn __registerHandlers(m: Mediator): void {{\n", .{});
+    try src.appendSlice(allocator, reg.items);
+    try src.appendSlice(allocator, "}\n\n");
+
+    try serdeAppendf(&src, allocator, "async fn __mediator_dispatch_runtime(__key: string, src: ValueSource, m: Mediator): Response {{\n", .{});
+    try src.appendSlice(allocator, disp.items);
+    try src.appendSlice(allocator, "    return Response(Status.NotFound, \"Not Found\");\n}\n\n");
+
+    var p = try parser.Parser.init(allocator, src.items, "<rmediator-generated>", is_wasm);
+    const prog = p.parseProgram() catch |err| {
+        std.debug.print("runtime mediator generation failed to parse:\n{s}\n", .{src.items});
         return err;
     };
     for (prog.declarations) |d| {
@@ -1186,6 +1475,8 @@ fn scaffoldWeb(allocator: std.mem.Allocator, io: std.Io, project: []const u8) !v
         .{ .rel = "src/Features/Products/GetProductById/query.nova", .content = templates.web_get_query_sample },
         .{ .rel = "src/Features/Products/GetProductById/response.nova", .content = templates.web_get_response_sample },
         .{ .rel = "src/Features/Products/GetProductById/handler.nova", .content = templates.web_get_handler_sample },
+
+        .{ .rel = "src/Features/Products/Shared/repository.nova", .content = templates.web_repository_sample },
 
         .{ .rel = "src/Features/Products/views/product_card.nova", .content = templates.web_view_sample },
 
@@ -1924,6 +2215,7 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
     try generateControllerRoutes(allocator, &filtered_decls);
     try generateSerdeBinders(allocator, &filtered_decls, is_wasm);
     try generateMediatorDispatch(allocator, &filtered_decls, is_wasm);
+    try generateRuntimeMediator(allocator, &filtered_decls, is_wasm);
 
     const program = ast.Program{
         .declarations = filtered_decls.items,
@@ -1942,6 +2234,7 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
     try tc.check(program);
 
     sema_shadow.report_enabled = init.environ_map.get("NOVA_SEMA_SHADOW") != null;
+    codegen_arc.elide_enabled = init.environ_map.get("NOVA_ARC_ELIDE") != null;
     sema_shadow.trace_resolution = sema_shadow.report_enabled;
     sema_shadow.f2_types_enabled = true;
 
@@ -2191,6 +2484,7 @@ fn compileProgram(
     try generateControllerRoutes(allocator, &declarations);
     try generateSerdeBinders(allocator, &declarations, is_wasm);
     try generateMediatorDispatch(allocator, &declarations, is_wasm);
+    try generateRuntimeMediator(allocator, &declarations, is_wasm);
     const source = try merged.toOwnedSlice(allocator);
     defer allocator.free(source);
 
@@ -2217,6 +2511,7 @@ fn compileProgram(
     try tc.check(program);
 
     sema_shadow.report_enabled = init.environ_map.get("NOVA_SEMA_SHADOW") != null;
+    codegen_arc.elide_enabled = init.environ_map.get("NOVA_ARC_ELIDE") != null;
     sema_shadow.trace_resolution = sema_shadow.report_enabled;
     sema_shadow.f2_types_enabled = true;
 

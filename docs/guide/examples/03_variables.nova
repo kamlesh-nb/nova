@@ -1,0 +1,18 @@
+// let (mutable) and const (immutable). Type annotations optional when inferable.
+fn main(): void {
+    let count = 0;          // inferred int, mutable
+    count = count + 5;      // ok, let is mutable
+    console.log(`count = ${count}`);
+
+    const pi = 3.14159;     // immutable; reassigning is a compile error
+    console.log(`pi = ${pi}`);
+
+    let x: int = 10;        // explicit annotation
+    console.log(`x = ${x}`);
+
+    // Tuple destructuring
+    let (a, b) = pair();
+    console.log(`a = ${a}, b = ${b}`);
+}
+
+fn pair(): (int, int) { return (1, 2); }

@@ -7,6 +7,9 @@
 // (generated code is exempt from cross-module visibility).
 import assert;
 import serde.source;
+import web.response;
+import web.status;
+import web.di;
 
 trait RequestHandler<TReq, TResp> {
     fn handle(self, req: TReq): TResp;
@@ -24,6 +27,7 @@ struct GetUserHandler impl RequestHandler<GetUser, UserDto> {
 
 @test
 fn test_discovered_dispatch(): void {
-    let out = __mediator_dispatch_GetUser(source.fromJson("{\"id\": 7}"));
-    assert.equalStr(out, "{\"id\":7,\"name\":\"Ada\"}");
+    let provider = ServiceCollection().buildServiceProvider();
+    let out = __mediator_dispatch_GetUser(source.fromJson("{\"id\": 7}"), provider);
+    assert.equalStr(out.body, "{\"id\":7,\"name\":\"Ada\"}");
 }

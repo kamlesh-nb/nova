@@ -1,0 +1,67 @@
+import list;
+import data.db;
+import web.di;
+
+// An in-memory database that implements the SAME `Connection` seam the real drivers (postgres, mysql,
+// btreedb, ...) implement. The repository code below is written against `Connection` + the micro-ORM,
+// so swapping in a live driver is a one-line change in main.nova: register a real connection instead of
+// this one, and nothing in the repository or the handlers changes. Rows are [id, name, price].
+pub struct InMemoryConnection impl Connection, Service {
+    pub rows: List<Row>,
+    pub nextId: int,
+
+    init() {
+        self.rows = List<Row>();
+        self.nextId = 1;
+    }
+
+    // INSERT: assign an id, store [id, <bound params: name, price>]. The new id comes back in
+    // ExecResult.rows_affected.
+    async fn exec(self: InMemoryConnection, sql: string, params: List<DbValue>): ExecResult {
+        let id = self.nextId;
+        self.nextId = self.nextId + 1;
+        let r = Row();
+        r.cells.push(db.dbLong(id));
+        let i = 0;
+        while (i < params.size()) {
+            r.cells.push(params.get(i) ?? db.dbNull());
+            i = i + 1;
+        }
+        self.rows.push(r);
+        return ExecResult(id, "INSERT");
+    }
+
+    // SELECT: no params returns every row; one param filters by id (the WHERE id = $1 case).
+    async fn query(self: InMemoryConnection, sql: string, params: List<DbValue>): ResultSet {
+        let rs = ResultSet();
+        rs.columns.push(Column("id", DbType.Int8));
+        rs.columns.push(Column("name", DbType.Text));
+        rs.columns.push(Column("price", DbType.Int8));
+        let i = 0;
+        while (i < self.rows.size()) {
+            let r = self.rows.get(i) ?? Row();
+            if (params.size() == 0) {
+                rs.rows.push(r);
+            } else {
+                let want = (params.get(0) ?? db.dbNull()).asLong();
+                let idv = (r.cells.get(0) ?? db.dbNull()).asLong();
+                if (idv == want) { rs.rows.push(r); }
+            }
+            i = i + 1;
+        }
+        return rs;
+    }
+
+    fn close(self: InMemoryConnection): void {}
+    fn setTimeout(self: InMemoryConnection, ms: int): int { return 0; }
+    async fn prepare(self: InMemoryConnection, sql: string): int { return 0; }
+    async fn queryPrepared(self: InMemoryConnection, stmt: int, params: List<DbValue>): ResultSet {
+        return await self.query("", params);
+    }
+    async fn execPrepared(self: InMemoryConnection, stmt: int, params: List<DbValue>): ExecResult {
+        return await self.exec("", params);
+    }
+    async fn begin(self: InMemoryConnection): ExecResult { return ExecResult(0, "BEGIN"); }
+    async fn commit(self: InMemoryConnection): ExecResult { return ExecResult(0, "COMMIT"); }
+    async fn rollback(self: InMemoryConnection): ExecResult { return ExecResult(0, "ROLLBACK"); }
+}

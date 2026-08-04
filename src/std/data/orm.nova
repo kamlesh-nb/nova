@@ -47,6 +47,36 @@ pub struct RowSource impl ValueSource {
     pub fn itemChild(self: RowSource, key: string, i: int): ValueSource { return self; }
 }
 
+// Bind a whole result set to a list of typed rows. This is the pure, synchronous half of a query: no
+// I/O, just the compiler-generated binder mapping columns to fields by name. Await the connection where
+// the I/O belongs (in the repository), then hand the result set here. Keeping the generic binder
+// synchronous is deliberate: `serde.bind<T>` resolves T to its concrete binder at the call site, which
+// only happens when T is a concrete type argument, not a type parameter threaded through an async frame.
+pub fn bindAll<T>(rs: ResultSet): List<T> {
+    let out = List<T>();
+    let i = 0;
+    while (i < rs.rows.size()) {
+        let row = rs.rows.get(i) ?? Row();
+        let src = RowSource(row, rs.columns);
+        out.push(serde.bind<T>(src));
+        i = i + 1;
+    }
+    return out;
+}
+
+// Bind the first row of a result set, or `undefined` when the set is empty.
+pub fn bindOne<T>(rs: ResultSet): T | undefined {
+    if (rs.rows.size() == 0) { return undefined; }
+    let row = rs.rows.get(0) ?? Row();
+    return serde.bind<T>(RowSource(row, rs.columns));
+}
+
+// Convenience helpers for the non-async call sites (scripts, tests that run outside the event loop):
+// they block-drive the connection and bind in one call. On the request path, prefer awaiting
+// `conn.query` yourself and calling `bindAll`/`bindOne`, so nothing block-drives inside the loop. The
+// bind loop is inlined here rather than delegating to `bindAll`/`bindOne`: threading a type parameter
+// from one generic function into another does not instantiate the callee, whereas a concrete type
+// argument at a call site does.
 pub fn queryAs<T>(conn: Connection, sql: string, params: List<DbValue>): List<T> {
     let rs = conn.query(sql, params);
     let out = List<T>();

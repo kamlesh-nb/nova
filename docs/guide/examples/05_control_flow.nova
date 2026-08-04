@@ -1,0 +1,22 @@
+// if / else, while, and if-as-expression. Conditions must be bool.
+fn main(): void {
+    let n = 7;
+    if (n % 2 == 0) {
+        console.log("even");
+    } else {
+        console.log("odd");
+    }
+
+    // if is also an expression
+    let label = if (n > 5) "big" else "small";
+    console.log(`label = ${label}`);
+
+    // while
+    let i = 0;
+    let sum = 0;
+    while (i < 5) {
+        sum = sum + i;
+        i = i + 1;
+    }
+    console.log(`sum 0..4 = ${sum}`);
+}

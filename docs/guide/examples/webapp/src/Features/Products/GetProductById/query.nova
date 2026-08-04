@@ -1,0 +1,7 @@
+import web.mediator;
+
+// The query: fetch a product by id. Bound from the route param `{id:int}`. `impl Message` opts the
+// request into the mediator: the framework binds it and `send`s it to the handler by request type.
+@serializable pub struct GetProductById impl Message {
+    pub id: int,
+}

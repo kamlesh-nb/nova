@@ -485,6 +485,7 @@ pub const LlvmCompiler = struct {
     pub const errUnionParts = arc_mod.errUnionParts;
     pub const buildErrUnion = arc_mod.buildErrUnion;
     pub const compileRelease = arc_mod.compileRelease;
+    pub const elideBorrowedArc = arc_mod.elideBorrowedArc;
     pub const getOrCreateDestructor = arc_mod.getOrCreateDestructor;
     pub const getOrCreateTraitDestructor = arc_mod.getOrCreateTraitDestructor;
     pub const getOrCreateDestructorByTypeId = arc_mod.getOrCreateDestructorByTypeId;

@@ -14,19 +14,22 @@ import web.app;
 import web.request;
 import web.response;
 import web.status;
+import web.routing;
+import web.mediator;
+import serde.json;
 import serde.source;
 
-@serializable struct Ping { pub n: int }
+@serializable struct Ping impl Message { pub n: int }
+@serializable struct PongDto { pub pong: int }
 
-struct PingHandler impl MessageHandler {
-    async fn handle(self: PingHandler, src: ValueSource): Response {
-        return json(`{"pong":1}`);
+struct PingHandler impl RequestHandler<Ping, PongDto> {
+    async fn handle(self: PingHandler, q: Ping): PongDto {
+        return PongDto{ pong: 1 };
     }
 }
 
 fn makeApp(): App {
     let a = App();
-    a.handle<Ping>(PingHandler{});
     a.get<Ping>("/ping");
     return a;
 }

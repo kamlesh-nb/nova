@@ -1,0 +1,27 @@
+// examples/22_channels.nova
+// Channels let concurrent tasks hand values to one another. A producer task
+// `chanSend`s into the channel; a consumer `await chanRecv`s, parking until a
+// value is available and being woken by the send. This is deterministic: no
+// timing assumptions, and it TERMINATES once both values are received.
+import concurrency.asyncchan;
+
+// Runs concurrently; pushes two values into the channel, then returns.
+async fn producer(ch: long): int {
+    asyncchan.chanSend(ch, 40);
+    asyncchan.chanSend(ch, 2);
+    return 0;
+}
+
+async fn consume(): int {
+    let ch = asyncchan.chanNew();
+    let h = spawn producer(ch);            // launch the producer concurrently
+    let a = await asyncchan.chanRecv(ch);  // parks until producer sends 40
+    let b = await asyncchan.chanRecv(ch);  // parks until producer sends 2
+    let done = await h;                    // join the producer task
+    asyncchan.chanFree(ch);
+    return a + b;                          // 42
+}
+
+fn main(): void {
+    console.log(`received sum = ${consume()}`);
+}

@@ -1,0 +1,52 @@
+// The `exception` construct: a tagged union (like an enum) that the compiler REQUIRES to define a
+// `message(self): string` method. It is used as the error side of `T | E`, so one function can fail
+// in several ways and every caller handles them uniformly with `catch (e) e.message()`, which
+// dispatches to the right variant. `exception` is a contextual keyword, so `import exception;` and
+// identifiers named `exception` are unaffected.
+import assert;
+
+exception LookupError {
+    NotFound(string),
+    Timeout(int),
+    fn message(self: LookupError): string {
+        switch (self) {
+            case LookupError.NotFound(k): { return "not found: " + k; }
+            case LookupError.Timeout(ms): { return `timed out after ${ms}ms`; }
+        }
+        return "unknown";
+    }
+}
+
+// The ok side is a string so `catch (e) e.message()` unifies (both sides are strings).
+fn fetch(k: string): string | LookupError {
+    if (k == "missing") { return LookupError.NotFound(k); }
+    if (k == "slow")    { return LookupError.Timeout(500); }
+    return `data for ${k}`;
+}
+
+@test
+fn test_ok_passes_through(): void {
+    assert.equalStr(fetch("user1") catch (e) e.message(), "data for user1");
+}
+
+@test
+fn test_first_variant_dispatches(): void {
+    assert.equalStr(fetch("missing") catch (e) e.message(), "not found: missing");
+}
+
+@test
+fn test_second_variant_dispatches(): void {
+    assert.equalStr(fetch("slow") catch (e) e.message(), "timed out after 500ms");
+}
+
+// `try` propagates the exception out of a second layer, still catchable by message().
+fn fetchTwice(k: string): string | LookupError {
+    let a = try fetch(k);
+    return a + "!";
+}
+
+@test
+fn test_try_propagates_exception(): void {
+    assert.equalStr(fetchTwice("ok") catch (e) e.message(), "data for ok!");
+    assert.equalStr(fetchTwice("missing") catch (e) e.message(), "not found: missing");
+}

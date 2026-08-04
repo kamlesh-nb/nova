@@ -1,0 +1,42 @@
+import list;
+import data.db;
+import data.orm;
+import web.di;
+import Features.Products.GetProductById.response;
+import Features.Products.Shared.database;
+
+// The repository: a real data-access object written against the micro-ORM and the `Connection` seam.
+// The connection is injected (main.nova registers it), so the repository never knows whether it is
+// talking to the in-memory database or a live driver. Handlers, in turn, receive this repository through
+// their own constructor. Implementing `Service` is what lets the DI container store and hand it out.
+pub struct ProductRepository impl Service {
+    conn: InMemoryConnection,
+    init(conn: InMemoryConnection) { self.conn = conn; }
+
+    // Read a product by id, materialised straight into the typed DTO by the ORM (columns -> fields by
+    // name, via the compiler-generated binder). `undefined` when there is no such row.
+    pub async fn findById(self: ProductRepository, id: int): ProductDto | undefined {
+        let params = List<DbValue>();
+        params.push(db.dbInt(id));
+        // Await the I/O here (the connection is async), then bind the rows with the sync ORM binder. The
+        // binder is generic over the concrete `ProductDto`, so the compiler resolves its column mapping.
+        let rs = await self.conn.query("SELECT id, name, price FROM products WHERE id = $1", params);
+        return orm.bindOne<ProductDto>(rs);
+    }
+
+    // Every product (used by the list endpoint).
+    pub async fn findAll(self: ProductRepository): List<ProductDto> {
+        let rs = await self.conn.query("SELECT id, name, price FROM products", List<DbValue>());
+        return orm.bindAll<ProductDto>(rs);
+    }
+
+    // Insert a product, returning its new id (the ORM binds parameters, so values never touch the SQL
+    // text). The insert runs inside the request's transaction when a transaction behaviour is active.
+    pub async fn create(self: ProductRepository, name: string, price: int): int {
+        let params = List<DbValue>();
+        params.push(db.dbText(name));
+        params.push(db.dbLong(price));
+        let r = await self.conn.exec("INSERT INTO products (name, price) VALUES ($1, $2)", params);
+        return r.rows_affected as int;
+    }
+}

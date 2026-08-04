@@ -1,0 +1,19 @@
+import web.routing;
+import serde.json;
+import Features.Products.CreateProduct.command;
+import Features.Products.CreateProduct.response;
+import Features.Products.Shared.repository;
+
+// Handles CreateProduct. The request arrives already deserialised and, by the time the handler runs, the
+// ValidationBehavior has already checked it (see validator.nova), so the handler is pure business logic:
+// persist the product through the injected repository and return the created DTO. The insert runs inside
+// the request transaction opened by the TransactionBehavior.
+pub struct CreateProductHandler impl RequestHandler<CreateProduct, CreateProductResponse> {
+    repo: ProductRepository,
+    init(repo: ProductRepository) { self.repo = repo; }
+
+    async fn handle(self: CreateProductHandler, cmd: CreateProduct): CreateProductResponse {
+        let id = await self.repo.create(cmd.name, cmd.price);
+        return CreateProductResponse{ id: id, name: cmd.name };
+    }
+}

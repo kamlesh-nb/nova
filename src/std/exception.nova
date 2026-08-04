@@ -1,4 +1,10 @@
 
-pub fn getStackTrace(): string {
+// The current call stack as a string, one frame per line. Useful inside an exception's message()
+// method or when logging a failure. Works on every supported target:
+//   - macOS and glibc Linux: real symbol names (backtrace + backtrace_symbols).
+//   - Windows: hex return addresses (RtlCaptureStackBackTrace).
+//   - musl Linux and other libcs: hex return addresses (the unwind ABI).
+// Hex addresses resolve to source with llvm-symbolizer / addr2line / the debugger.
+pub fn stackTrace(): string {
     return nova_get_stacktrace();
 }

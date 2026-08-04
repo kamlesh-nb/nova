@@ -1,0 +1,26 @@
+// examples/27_exception.nova
+exception LookupError {
+    NotFound(string),
+    Forbidden(string),
+    fn message(self: LookupError): string {
+        switch (self) {
+            case LookupError.NotFound(k):  { return "not found: " + k; }
+            case LookupError.Forbidden(w): { return `access denied for ${w}`; }
+        }
+        return "unknown";
+    }
+}
+
+// LookupError is the error side, so lookup may fail in more than one way. The ok side is a string,
+// so `catch (e) e.message()` unifies (both sides are strings).
+fn lookup(user: string, key: string): string | LookupError {
+    if (user == "guest") { return LookupError.Forbidden(user); }
+    if (key == "missing") { return LookupError.NotFound(key); }
+    return `${key} = 42`;
+}
+
+fn main(): void {
+    console.log(lookup("admin", "count")   catch (e) e.message());
+    console.log(lookup("admin", "missing") catch (e) e.message());
+    console.log(lookup("guest", "count")   catch (e) e.message());
+}

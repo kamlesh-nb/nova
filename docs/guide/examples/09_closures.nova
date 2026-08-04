@@ -1,0 +1,32 @@
+// examples/09_closures.nova
+import collections.list;
+
+fn main(): void {
+    // A closure literal. Parameters are UNTYPED, their types are inferred.
+    let inc = (x) => x + 1;
+    console.log(`inc(9) = ${inc(9)}`);
+
+    // Closures capture variables from the surrounding scope (by value).
+    let base = 100;
+    let addBase = (x) => x + base;
+    console.log(`addBase(5) = ${addBase(5)}`);
+
+    // Higher-order use: pass closures to List.map / filter / reduce.
+    let nums = list.List<int>();
+    nums.push(1); nums.push(2); nums.push(3); nums.push(4);
+
+    // An expression-bodied closure transforms each element.
+    let doubled = nums.map((n) => n * 2);
+    console.log(`doubled = ${doubled.get(0) ?? 0}, ${doubled.get(1) ?? 0}, ${doubled.get(2) ?? 0}, ${doubled.get(3) ?? 0}`);
+
+    // filter keeps elements for which the predicate is true.
+    let evens = nums.filter((n) => n % 2 == 0);
+    console.log(`even count = ${evens.size()}`);
+
+    // A block-bodied, two-parameter closure `(a, b) => { ... }` folds the list.
+    let sum = nums.reduce(0, (acc, n) => {
+        let next = acc + n;
+        return next;
+    });
+    console.log(`sum = ${sum}`);
+}

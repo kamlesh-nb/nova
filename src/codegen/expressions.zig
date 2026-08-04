@@ -3277,7 +3277,17 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             core.LLVMPositionBuilderAtEnd(self.builder, prop_bb);
 
             try self.runErrdefers();
-            _ = core.LLVMBuildRet(self.builder, box);
+            // Propagating the error is an early return. Inside an `async` fn that means the coroutine
+            // return sequence (store the error into the promise result slot, then branch to the final
+            // suspend), NOT a raw `ret` — a raw `ret` bypasses the coroutine state machine and corrupts
+            // it (the error box is mistaken for a coroutine handle), which crashes on resume.
+            if (self.current_async_promise) |promise| {
+                const rslot = self.coroPromiseResultSlot(promise);
+                _ = core.LLVMBuildStore(self.builder, box, rslot);
+                _ = core.LLVMBuildBr(self.builder, self.current_async_final_bb.?);
+            } else {
+                _ = core.LLVMBuildRet(self.builder, box);
+            }
 
             core.LLVMPositionBuilderAtEnd(self.builder, cont_bb);
             const pay_addr = core.LLVMBuildAdd(self.builder, box, core.LLVMConstInt(self.val_type, @intCast(word), 0), "try_pay_addr");

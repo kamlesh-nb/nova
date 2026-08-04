@@ -1,0 +1,22 @@
+import web.routing;
+import web.response;
+import serde.json;
+import Features.Products.GetProductById.query;
+import Features.Products.GetProductById.response;
+import Features.Products.Shared.repository;
+
+// Handles GetProductById. The `ProductRepository` is injected through the constructor, resolved from the
+// per-request DI scope. The handler loads the product and returns it, or `HttpError(404)` when there is
+// no such product. Success and failure are both ordinary typed return values (`ProductDto | HttpError`).
+pub struct GetProductByIdHandler impl RequestHandler<GetProductById, ProductDto | HttpError> {
+    repo: ProductRepository,
+    init(repo: ProductRepository) { self.repo = repo; }
+
+    async fn handle(self: GetProductByIdHandler, q: GetProductById): ProductDto | HttpError {
+        let found = await self.repo.findById(q.id);
+        if (found == undefined) {
+            return HttpError(404, "product not found");
+        }
+        return found ?? ProductDto{ id: 0, name: "" };
+    }
+}

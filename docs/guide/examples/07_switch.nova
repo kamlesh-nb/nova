@@ -1,0 +1,17 @@
+// switch over enum values, including payload-binding variants.
+enum Shape { Circle(int), Square(int), Point }
+
+fn area(s: Shape): int {
+    switch (s) {
+        case Shape.Circle(r): { return 3 * r * r; }   // binds the payload r
+        case Shape.Square(side): { return side * side; }
+        case Shape.Point: { return 0; }
+    }
+    return -1;
+}
+
+fn main(): void {
+    console.log(`circle(2)  area ~= ${area(Shape.Circle(2))}`);
+    console.log(`square(3)  area  = ${area(Shape.Square(3))}`);
+    console.log(`point      area  = ${area(Shape.Point)}`);
+}

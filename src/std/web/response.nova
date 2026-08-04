@@ -35,6 +35,24 @@ fn ciEquals(a: string, b: string): bool {
     return true;
 }
 
+// The standard error side of a typed handler's `TResp | HttpError` return. A handler returns the ok
+// DTO for success (the framework serialises it as 200 JSON) or an `HttpError` for failure, which the
+// framework turns into a Response via `toResponse()`: the given status code and the message as the body.
+pub struct HttpError {
+    pub status: int,
+    pub message: string,
+
+    init(status: int, message: string) {
+        self.status = status;
+        self.message = message;
+    }
+
+    pub fn toResponse(self: HttpError): Response {
+        let r = Response(Status.fromCode(self.status), self.message);
+        return r;
+    }
+}
+
 pub struct Response {
     pub status: Status,
     pub body: string,

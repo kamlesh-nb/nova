@@ -1,0 +1,70 @@
+// 270 — PipelineBehaviours wrap a typed handler in the runtime mediator. A behaviour receives the
+// RequestContext (the erased request + type key + per-request scope + markers) and a Next; it can
+// inspect the request (downcast it), short-circuit with its own Response, or `await next.proceed(ctx)`
+// and post-process. Behaviours run in registration order around every handler.
+import assert;
+import string;
+import web.app;
+import web.request;
+import web.response;
+import web.status;
+import web.routing;
+import web.mediator;
+import serde.json;
+import serde.source;
+
+@serializable struct GetX impl Message { pub id: int }
+@serializable struct XDto { pub id: int, pub name: string }
+
+struct GetXHandler impl RequestHandler<GetX, XDto> {
+    async fn handle(self: GetXHandler, q: GetX): XDto {
+        return XDto{ id: q.id, name: "real" };
+    }
+}
+
+// A behaviour: block id 0 with a 400, otherwise run the handler and tag the Response.
+struct GuardBehavior impl PipelineBehavior {
+    async fn handle(self: GuardBehavior, ctx: RequestContext, next: Next): Response {
+        let q = ctx.request as GetX;
+        if (q.id == 0) {
+            return Response(Status.BadRequest, "id zero blocked");
+        }
+        let res = await next.proceed(ctx);
+        res.setHeader("X-Wrapped", "yes");
+        return res;
+    }
+}
+
+fn buildApp(): App {
+    let app = App();
+    app.useBehavior(GuardBehavior{});
+    app.get<GetX>("/x/{id:int}");
+    return app;
+}
+
+// (1) The behaviour runs AROUND the typed handler: the handler produces the body, the behaviour tags it.
+@test
+fn test_behavior_wraps_handler(): void {
+    let app = buildApp();
+    let res = app.dispatch(Request.fromString("GET /x/7 HTTP/1.1\r\nHost: x\r\n\r\n"));
+    assert.equalStr(res.body, `{"id":7,"name":"real"}`);
+    assert.equalStr(res.getHeader("X-Wrapped") ?? "", "yes");
+}
+
+// (2) The behaviour SHORT-CIRCUITS: returns a Response without calling next, so the handler never runs.
+@test
+fn test_behavior_short_circuits(): void {
+    let app = buildApp();
+    let res = app.dispatch(Request.fromString("GET /x/0 HTTP/1.1\r\nHost: x\r\n\r\n"));
+    assert.equalInt(res.status.toCode(), 400);
+    assert.equalStr(res.body, "id zero blocked");
+}
+
+// (3) With no behaviour registered, dispatch still works (the direct path).
+@test
+fn test_no_behavior_direct(): void {
+    let app = App();
+    app.get<GetX>("/x/{id:int}");
+    let res = app.dispatch(Request.fromString("GET /x/3 HTTP/1.1\r\nHost: x\r\n\r\n"));
+    assert.equalStr(res.body, `{"id":3,"name":"real"}`);
+}

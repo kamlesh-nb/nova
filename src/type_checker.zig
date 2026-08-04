@@ -1352,6 +1352,25 @@ pub const TypeChecker = struct {
             }
         }
 
+        // An `exception` must provide a `message(self): string` method. This is what makes an
+        // exception more than a plain enum: any caller can turn it into a message with e.message().
+        if (e.is_exception) {
+            var has_message = false;
+            for (e.methods) |m| {
+                if (!std.mem.eql(u8, m.decl.name, "message")) continue;
+                const is_instance = m.decl.params.len > 0 and std.mem.eql(u8, m.decl.params[0].name, "self");
+                const rt = m.decl.ret_type;
+                const returns_string = rt != null and rt.? == .ident and std.mem.eql(u8, rt.?.ident, "string");
+                if (is_instance and returns_string) {
+                    has_message = true;
+                    break;
+                }
+            }
+            if (!has_message) {
+                self.addError(e.span, "exception '{s}' must define a `message(self): string` method — every exception provides a human-readable message. Add `fn message(self: {s}): string {{ ... }}`.", .{ e.name, e.name });
+            }
+        }
+
         for (e.methods) |m| {
             self.variables.clearRetainingCapacity();
             for (m.decl.params) |param| {

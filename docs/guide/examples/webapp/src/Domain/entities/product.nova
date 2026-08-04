@@ -1,0 +1,12 @@
+// Domain entity, the core business object (persistence-agnostic).
+pub struct Product {
+    pub id: int,
+    pub name: string,
+    pub price: int,
+
+    init(id: int, name: string, price: int) {
+        self.id = id;
+        self.name = name;
+        self.price = price;
+    }
+}

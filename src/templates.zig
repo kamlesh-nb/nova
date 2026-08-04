@@ -18,26 +18,37 @@ pub const console_test_sample =
 
 
 pub const web_main_sample =
-    \\// main.nova — app composition root (= Program.cs): register handlers + routes, wire
-    \\// static files, run. Each `handle<TReq>` binds a request type to its handler; the
-    \\// matching `get/post<TReq>` registers the route. Vertical slices live under Features/.
+    \\// main.nova, app composition root (= Program.cs): register routes, wire static files, run. Each
+    \\// `get/post<TReq>` maps a route to a request type; the handler that implements
+    \\// `RequestHandler<TReq, TResp>` is discovered by the compiler, so there is nothing else to register.
+    \\// Vertical slices live under Features/. Importing a slice's handler is what makes it discoverable.
     \\import web.app;
+    \\import web.di;
     \\import web.request;
     \\import web.response;
-    \\import serde.source;
+    \\import web.routing;
+    \\import serde.json;
+    \\import Features.Products.Shared.repository;
     \\import Features.Products.CreateProduct.command;
     \\import Features.Products.CreateProduct.handler;
     \\import Features.Products.GetProductById.query;
     \\import Features.Products.GetProductById.handler;
     \\
+    \\// Register the app's services. Handlers declare their dependencies as constructor parameters, and
+    \\// the framework resolves them from here (ASP.NET-style constructor injection).
+    \\fn configureServices(): ServiceCollection {
+    \\    let services = ServiceCollection();
+    \\    services.addSingleton("ProductRepository", (sp) => { return ProductRepository(); });
+    \\    return services;
+    \\}
+    \\
     \\fn buildApp(): App {
     \\    let app = App();
+    \\    app.useServices(configureServices());
     \\
-    \\    // Products feature — one registration per slice.
-    \\    app.handle<CreateProduct>(CreateProductHandler{});
+    \\    // Products feature, one route per slice. The handlers are found by their impls, and their
+    \\    // constructor dependencies are injected from the services above.
     \\    app.post<CreateProduct>("/api/products");
-    \\
-    \\    app.handle<GetProductById>(GetProductByIdHandler{});
     \\    app.get<GetProductById>("/api/products/{id:int}");
     \\
     \\    // Serve static assets (wwwroot/) for any unmatched GET.
@@ -53,9 +64,12 @@ pub const web_main_sample =
 ;
 
 pub const web_create_command_sample =
-    \\// The command: what the client sends to create a product. @serializable makes the
-    \\// compiler generate its binder so `CreateProduct{ name: src.getString("name") }` works.
-    \\@serializable pub struct CreateProduct {
+    \\import web.mediator;
+    \\
+    \\// The command: what the client sends to create a product. @serializable lets the framework bind
+    \\// this struct from the request body (@fromBody), so the handler receives it already deserialised.
+    \\// `impl Message` opts it into the mediator, dispatched to its handler by request type.
+    \\@serializable pub struct CreateProduct impl Message {
     \\    pub name: string,
     \\    pub price: int,
     \\}
@@ -82,29 +96,59 @@ pub const web_create_validator_sample =
 
 pub const web_create_handler_sample =
     \\import web.response;
-    \\import web.status;
-    \\import serde.source;
-    \\import web.mediator;
+    \\import web.routing;
+    \\import serde.json;
     \\import Features.Products.CreateProduct.command;
+    \\import Features.Products.CreateProduct.response;
     \\import Features.Products.CreateProduct.validator;
+    \\import Features.Products.Shared.repository;
     \\
-    \\// Handles CreateProduct: bind the command (visible, debuggable), validate, respond.
-    \\pub struct CreateProductHandler impl MessageHandler {
-    \\    async fn handle(self: CreateProductHandler, src: ValueSource): Response {
-    \\        let cmd = CreateProduct{ name: src.getString("name"), price: src.getInt("price") as int };
+    \\// Handles CreateProduct. The request arrives already deserialised (bound from the JSON body), and
+    \\// the ProductRepository is injected through the constructor. The handler returns
+    \\// `CreateProductResponse | HttpError`: the framework serialises the ok DTO as 200 JSON, and an
+    \\// HttpError as its status code with the message as the body. No ValueSource, no manual field reads.
+    \\pub struct CreateProductHandler impl RequestHandler<CreateProduct, CreateProductResponse | HttpError> {
+    \\    repo: ProductRepository,
+    \\    init(repo: ProductRepository) { self.repo = repo; }
+    \\
+    \\    async fn handle(self: CreateProductHandler, cmd: CreateProduct): CreateProductResponse | HttpError {
     \\        let err = validateCreateProduct(cmd);
     \\        if (err.length != 0) {
-    \\            return Response(Status.BadRequest, err);
+    \\            return HttpError(400, err);
     \\        }
-    \\        // (persist here via a Shared/database repository, then return the new id)
-    \\        return json(`{"id":1,"name":"${cmd.name}"}`);
+    \\        let id = self.repo.create(cmd.name);
+    \\        return CreateProductResponse{ id: id, name: cmd.name };
+    \\    }
+    \\}
+;
+
+pub const web_repository_sample =
+    \\import web.di;
+    \\import Features.Products.GetProductById.response;
+    \\
+    \\// A repository service. Handlers receive it through their constructor, and the DI container
+    \\// resolves it (see main.nova, which registers it as a singleton). A real repository would talk to
+    \\// a database driver; this one returns stub data. Implementing `Service` is what lets the container
+    \\// store and hand it out.
+    \\pub struct ProductRepository impl Service {
+    \\    init() {}
+    \\
+    \\    pub fn findById(self: ProductRepository, id: int): ProductDto {
+    \\        return ProductDto{ id: id, name: "Sample Product" };
+    \\    }
+    \\
+    \\    pub fn create(self: ProductRepository, name: string): int {
+    \\        return 1;
     \\    }
     \\}
 ;
 
 pub const web_get_query_sample =
-    \\// The query: fetch a product by id. Bound from the route param `{id:int}`.
-    \\@serializable pub struct GetProductById {
+    \\import web.mediator;
+    \\
+    \\// The query: fetch a product by id. Bound from the route param `{id:int}`. `impl Message` opts the
+    \\// request into the mediator: the framework binds it and `send`s it to the handler by request type.
+    \\@serializable pub struct GetProductById impl Message {
     \\    pub id: int,
     \\}
 ;
@@ -117,17 +161,21 @@ pub const web_get_response_sample =
 ;
 
 pub const web_get_handler_sample =
-    \\import web.response;
-    \\import web.status;
-    \\import serde.source;
-    \\import web.mediator;
+    \\import web.routing;
+    \\import serde.json;
     \\import Features.Products.GetProductById.query;
+    \\import Features.Products.GetProductById.response;
+    \\import Features.Products.Shared.repository;
     \\
-    \\pub struct GetProductByIdHandler impl MessageHandler {
-    \\    async fn handle(self: GetProductByIdHandler, src: ValueSource): Response {
-    \\        let q = GetProductById{ id: src.getInt("id") as int };
-    \\        // (load from a repository; stubbed here)
-    \\        return json(`{"id":${q.id},"name":"Sample Product"}`);
+    \\// Handles GetProductById. `id` is bound from the route param `{id:int}`. The `ProductRepository`
+    \\// is injected through the constructor, resolved from the DI container. A handler that cannot fail
+    \\// simply returns its DTO, which the framework serialises as 200 JSON.
+    \\pub struct GetProductByIdHandler impl RequestHandler<GetProductById, ProductDto> {
+    \\    repo: ProductRepository,
+    \\    init(repo: ProductRepository) { self.repo = repo; }
+    \\
+    \\    async fn handle(self: GetProductByIdHandler, q: GetProductById): ProductDto {
+    \\        return self.repo.findById(q.id);
     \\    }
     \\}
 ;
@@ -135,7 +183,7 @@ pub const web_get_handler_sample =
 pub const web_view_sample =
     \\import web.response;
     \\
-    \\// A per-feature NSX/JSX view — returns an HTML string the handler (or a page route)
+    \\// A per-feature NSX/JSX view, returns an HTML string the handler (or a page route)
     \\// can render. Feature views live beside the slices that use them.
     \\pub fn productCard(name: string, price: int): string {
     \\    return <div class="card">
@@ -146,7 +194,7 @@ pub const web_view_sample =
 ;
 
 pub const web_domain_entity_sample =
-    \\// Domain entity — the core business object (persistence-agnostic).
+    \\// Domain entity, the core business object (persistence-agnostic).
     \\pub struct Product {
     \\    pub id: int,
     \\    pub name: string,
@@ -173,20 +221,23 @@ pub const web_index_html_sample =
 
 pub const web_test_sample =
     \\import assert;
+    \\import string;
     \\import web.app;
+    \\import web.di;
     \\import web.request;
     \\import web.response;
-    \\import serde.source;
+    \\import Features.Products.Shared.repository;
     \\import Features.Products.CreateProduct.command;
     \\import Features.Products.CreateProduct.handler;
     \\import Features.Products.GetProductById.query;
     \\import Features.Products.GetProductById.handler;
     \\
     \\fn testApp(): App {
+    \\    let services = ServiceCollection();
+    \\    services.addSingleton("ProductRepository", (sp) => { return ProductRepository(); });
     \\    let app = App();
-    \\    app.handle<CreateProduct>(CreateProductHandler{});
+    \\    app.useServices(services);
     \\    app.post<CreateProduct>("/api/products");
-    \\    app.handle<GetProductById>(GetProductByIdHandler{});
     \\    app.get<GetProductById>("/api/products/{id:int}");
     \\    return app;
     \\}
@@ -209,7 +260,7 @@ pub const web_test_sample =
 ;
 
 pub const desktop_main_sample =
-    \\// main.nova — a native desktop app: a webview window rendering NSX, with a Nova
+    \\// main.nova, a native desktop app: a webview window rendering NSX, with a Nova
     \\// handler bound to a JS call. Build native and run to open the window.
     \\import webview;
     \\

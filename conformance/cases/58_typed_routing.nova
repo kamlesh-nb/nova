@@ -11,13 +11,13 @@ import serde.source;
 @serializable struct GetUser { pub id: int }
 @serializable struct UserDto { pub id: int, pub name: string }
 struct GetUserHandler impl RequestHandler<GetUser, UserDto> {
-    fn handle(self, req: GetUser): UserDto { return UserDto{ id: req.id, name: "Ada" }; }
+    async fn handle(self, req: GetUser): UserDto { return UserDto{ id: req.id, name: "Ada" }; }
 }
 
 @serializable struct AddReq { pub a: int, pub b: int }
 @serializable struct SumDto { pub sum: int }
 struct AddHandler impl RequestHandler<AddReq, SumDto> {
-    fn handle(self, req: AddReq): SumDto { return SumDto{ sum: req.a + req.b }; }
+    async fn handle(self, req: AddReq): SumDto { return SumDto{ sum: req.a + req.b }; }
 }
 
 @test

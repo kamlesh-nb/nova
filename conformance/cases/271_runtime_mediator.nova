@@ -1,0 +1,96 @@
+// 271 — The RUNTIME mediator (web/rmediator.nova) driven by COMPILER-GENERATED glue. A request that
+// implements `Message` opts into the runtime path. The compiler generates its widen (`Q__asMessage`),
+// its handler adapter (`Q__Adapter`: downcast + DI-from-scope + run + serialise), an erased adapter for
+// each `Validator<Q>`, records the request's marker traits, and a `__registerHandlers(m)` that registers
+// them all. The framework (registry, `send`, pipeline, per-request scope, validation, markers) is all
+// stdlib. This case writes only the request, DTO, handler, validator, and composition.
+import assert;
+import string;
+import list;
+import web.mediator;
+import web.response;
+import web.status;
+import web.routing;
+import web.di;
+import serde.json;
+import serde.source;
+
+// A marker trait: this request opts a behaviour in per request type (no per-type registration).
+trait Auditable {}
+
+@serializable struct CreateProduct impl Message, Auditable { pub name: string, pub price: int }
+@serializable struct ProductDto { pub id: int, pub name: string }
+
+// A scoped service, resolved from the per-request scope by the generated adapter.
+struct ProductRepo impl Service {
+    pub tag: string,
+    init() { self.tag = "repo"; }
+    pub fn create(self: ProductRepo, name: string): int { return 1; }
+}
+
+// The typed handler, its dependency injected through the constructor.
+struct CreateProductHandler impl RequestHandler<CreateProduct, ProductDto> {
+    repo: ProductRepo,
+    init(repo: ProductRepo) { self.repo = repo; }
+    async fn handle(self: CreateProductHandler, cmd: CreateProduct): ProductDto {
+        let id = self.repo.create(cmd.name);
+        return ProductDto{ id: id, name: cmd.name };
+    }
+}
+
+// A per-type validator, TYPED over its request. The compiler generates its erased adapter and
+// auto-registers it, like FluentValidation's assembly scan.
+struct CreateProductValidator impl Validator<CreateProduct> {
+    fn validate(self: CreateProductValidator, cmd: CreateProduct): List<string> {
+        let errs = List<string>();
+        if (cmd.name.length == 0) { errs.push("name is required"); }
+        if (cmd.price < 0) { errs.push("price must be >= 0"); }
+        return errs;
+    }
+}
+
+// A behaviour that acts only on requests carrying the Auditable marker, and tags the response.
+struct AuditBehavior impl PipelineBehavior {
+    async fn handle(self: AuditBehavior, ctx: RequestContext, next: Next): Response {
+        let res = await next.proceed(ctx);
+        if (ctx.requestIs("Auditable")) { res.setHeader("X-Audited", "yes"); }
+        return res;
+    }
+}
+
+fn buildMediator(): Mediator {
+    let services = ServiceCollection();
+    services.addScoped("ProductRepo", (sp) => { return ProductRepo(); });
+    let m = Mediator(services.buildServiceProvider());
+    __registerHandlers(m);                    // compiler-generated: handler adapters + validators + markers
+    m.useBehavior(AuditBehavior{});
+    m.useBehavior(ValidationBehavior{});
+    return m;
+}
+
+// (1) A valid request dispatches to the DI-injected handler; the Auditable marker tags the response.
+@test
+fn test_send_dispatches_and_marks(): void {
+    let m = buildMediator();
+    let res = m.send(CreateProduct__asMessage(CreateProduct{ name: "Widget", price: 9 }), "CreateProduct");
+    assert.equalInt(res.status.toCode(), 200);
+    assert.equalStr(res.body, `{"id":1,"name":"Widget"}`);
+    assert.equalStr(res.getHeader("X-Audited") ?? "", "yes");
+}
+
+// (2) The auto-registered validator short-circuits with a 400 (validation runs inside the audit wrap).
+@test
+fn test_validation_short_circuits(): void {
+    let m = buildMediator();
+    let res = m.send(CreateProduct__asMessage(CreateProduct{ name: "", price: 9 }), "CreateProduct");
+    assert.equalInt(res.status.toCode(), 400);
+    assert.equalStr(res.body, "name is required");
+}
+
+// (3) An unknown request type is a 404.
+@test
+fn test_unknown_request_404(): void {
+    let m = buildMediator();
+    let res = m.send(CreateProduct__asMessage(CreateProduct{ name: "X", price: 1 }), "Nope");
+    assert.equalInt(res.status.toCode(), 404);
+}

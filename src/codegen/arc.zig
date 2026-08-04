@@ -1265,6 +1265,175 @@ pub fn releaseLocalVariables(self: *LlvmCompiler) anyerror!void {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Prototype: compile-time retain/release elision (borrowed-field pattern).
+//
+// Removes a defensive `nova_retain` + its paired `nova_release`(s) when a local
+// slot only ever holds a value copied out of a BORROWED PARAMETER's field and
+// never escapes (used only for null-checks, borrowed call-args, or its own
+// release). The parameter is caller-owned and alive across the whole call, so
+// its sub-object cannot be freed underneath us -> the retain/release is net-zero.
+//
+// Gated by NOVA_ARC_ELIDE (elide_enabled). Off = today's codegen, unchanged.
+// This is a conservative peephole: any shape it can't prove safe is left alone.
+pub var elide_enabled: bool = false;
+pub var elide_count: usize = 0;
+
+fn callTargetName(inst: types.LLVMValueRef) ?[]const u8 {
+    if (core.LLVMGetInstructionOpcode(inst) != .LLVMCall) return null;
+    const n = core.LLVMGetNumOperands(inst);
+    if (n < 1) return null;
+    const callee = core.LLVMGetOperand(inst, @intCast(n - 1)); // callee is the last operand
+    var len: usize = 0;
+    const name_c = core.LLVMGetValueName2(callee, &len);
+    if (len == 0) return null;
+    return name_c[0..len];
+}
+
+fn isNamedCall(inst: types.LLVMValueRef, want: []const u8) bool {
+    const nm = callTargetName(inst) orelse return false;
+    return std.mem.eql(u8, nm, want);
+}
+
+// sv must be: ptrtoint( load( inttoptr( add( load(param_slot), CONST ) ) ) )
+fn tracesBorrowedParamField(sv: types.LLVMValueRef, param_slots: []const types.LLVMValueRef) bool {
+    if (core.LLVMIsAInstruction(sv) == null) return false;
+    if (core.LLVMGetInstructionOpcode(sv) != .LLVMPtrToInt) return false;
+    const field_load = core.LLVMGetOperand(sv, 0);
+    if (core.LLVMIsAInstruction(field_load) == null or core.LLVMGetInstructionOpcode(field_load) != .LLVMLoad) return false;
+    const field_ptr = core.LLVMGetOperand(field_load, 0);
+    if (core.LLVMIsAInstruction(field_ptr) == null or core.LLVMGetInstructionOpcode(field_ptr) != .LLVMIntToPtr) return false;
+    const addr = core.LLVMGetOperand(field_ptr, 0);
+    if (core.LLVMIsAInstruction(addr) == null or core.LLVMGetInstructionOpcode(addr) != .LLVMAdd) return false;
+    const base_load = core.LLVMGetOperand(addr, 0);
+    if (core.LLVMIsAInstruction(base_load) == null or core.LLVMGetInstructionOpcode(base_load) != .LLVMLoad) return false;
+    const base_slot = core.LLVMGetOperand(base_load, 0);
+    for (param_slots) |ps| if (ps == base_slot) return true;
+    return false;
+}
+
+fn valueIsRetained(sv: types.LLVMValueRef) ?types.LLVMValueRef {
+    var use = core.LLVMGetFirstUse(sv);
+    while (use != null) : (use = core.LLVMGetNextUse(use)) {
+        const user = core.LLVMGetUser(use);
+        if (isNamedCall(user, "nova_retain")) return user;
+    }
+    return null;
+}
+
+pub fn elideBorrowedArc(self: *LlvmCompiler, module: types.LLVMModuleRef) void {
+    if (!elide_enabled) return;
+    var fnv = core.LLVMGetFirstFunction(module);
+    while (fnv != null) : (fnv = core.LLVMGetNextFunction(fnv)) {
+        elideBorrowedArcInFn(self, fnv);
+    }
+}
+
+fn elideBorrowedArcInFn(self: *LlvmCompiler, fnv: types.LLVMValueRef) void {
+    const a = self.allocator;
+
+    // 1) param-holding alloca slots: `store %param, %alloca` in the function.
+    var param_slots = std.ArrayList(types.LLVMValueRef).empty;
+    defer param_slots.deinit(a);
+    const nparams = core.LLVMCountParams(fnv);
+    var bb = core.LLVMGetFirstBasicBlock(fnv);
+    while (bb != null) : (bb = core.LLVMGetNextBasicBlock(bb)) {
+        var inst = core.LLVMGetFirstInstruction(bb);
+        while (inst != null) : (inst = core.LLVMGetNextInstruction(inst)) {
+            if (core.LLVMGetInstructionOpcode(inst) != .LLVMStore) continue;
+            const val = core.LLVMGetOperand(inst, 0);
+            const ptr = core.LLVMGetOperand(inst, 1);
+            if (core.LLVMIsAAllocaInst(ptr) == null) continue;
+            var pi: c_uint = 0;
+            while (pi < nparams) : (pi += 1) {
+                if (core.LLVMGetParam(fnv, pi) == val) {
+                    param_slots.append(a, ptr) catch {};
+                    break;
+                }
+            }
+        }
+    }
+    if (param_slots.items.len == 0) return;
+
+    // 2) each alloca: is it a non-escaping borrow of a param field?
+    var to_erase = std.ArrayList(types.LLVMValueRef).empty;
+    defer to_erase.deinit(a);
+
+    bb = core.LLVMGetFirstBasicBlock(fnv);
+    while (bb != null) : (bb = core.LLVMGetNextBasicBlock(bb)) {
+        var inst = core.LLVMGetFirstInstruction(bb);
+        while (inst != null) : (inst = core.LLVMGetNextInstruction(inst)) {
+            if (core.LLVMIsAAllocaInst(inst) == null) continue;
+            const slot = inst;
+
+            var owned_store: ?types.LLVMValueRef = null; // the ptrtoint stored value
+            var retain_inst: ?types.LLVMValueRef = null;
+            var releases = std.ArrayList(types.LLVMValueRef).empty;
+            defer releases.deinit(a);
+            var ok = true;
+            var owned_store_count: usize = 0;
+
+            var use = core.LLVMGetFirstUse(slot);
+            scan: while (use != null) : (use = core.LLVMGetNextUse(use)) {
+                const user = core.LLVMGetUser(use);
+                const opc = core.LLVMGetInstructionOpcode(user);
+                if (opc == .LLVMStore and core.LLVMGetOperand(user, 1) == slot) {
+                    // a store INTO the slot
+                    const sv = core.LLVMGetOperand(user, 0);
+                    if (core.LLVMIsAConstantInt(sv) != null) continue :scan; // zero-init: ignore
+                    if (tracesBorrowedParamField(sv, param_slots.items)) {
+                        if (valueIsRetained(sv)) |r| {
+                            owned_store = sv;
+                            retain_inst = r;
+                            owned_store_count += 1;
+                            continue :scan;
+                        }
+                    }
+                    ok = false; // unknown store into the slot
+                    break :scan;
+                } else if (opc == .LLVMStore and core.LLVMGetOperand(user, 0) == slot) {
+                    ok = false; // slot's ADDRESS stored somewhere -> escapes
+                    break :scan;
+                } else if (opc == .LLVMLoad and core.LLVMGetOperand(user, 0) == slot) {
+                    // every consumer of this load must be a borrow use
+                    var luse = core.LLVMGetFirstUse(user);
+                    while (luse != null) : (luse = core.LLVMGetNextUse(luse)) {
+                        const luser = core.LLVMGetUser(luse);
+                        const lopc = core.LLVMGetInstructionOpcode(luser);
+                        if (lopc == .LLVMICmp) continue;
+                        if (isNamedCall(luser, "nova_release")) {
+                            releases.append(a, luser) catch {};
+                            continue;
+                        }
+                        if (lopc == .LLVMCall) {
+                            // borrowed call-arg: the load must be an ARGUMENT, not the callee
+                            const n = core.LLVMGetNumOperands(luser);
+                            if (n >= 1 and core.LLVMGetOperand(luser, @intCast(n - 1)) == user) {
+                                ok = false; // used as the callee (function pointer) -> bail
+                                break :scan;
+                            }
+                            continue;
+                        }
+                        ok = false; // Ret / Store-as-value / PtrToInt / GEP / ... -> escapes
+                        break :scan;
+                    }
+                } else {
+                    ok = false; // any other use of the slot pointer -> bail
+                    break :scan;
+                }
+            }
+
+            if (ok and owned_store_count == 1 and retain_inst != null) {
+                to_erase.append(a, retain_inst.?) catch {};
+                for (releases.items) |r| to_erase.append(a, r) catch {};
+                elide_count += 1;
+            }
+        }
+    }
+
+    for (to_erase.items) |ins| core.LLVMInstructionEraseFromParent(ins);
+}
+
 test "isUntypeablePlaceholder: whole-string placeholders match, real types and fn-types do not" {
     const testing = std.testing;
 

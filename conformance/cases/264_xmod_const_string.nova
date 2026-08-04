@@ -1,0 +1,36 @@
+// Regression: a cross-module `pub const X: string`, referenced module-qualified
+// (`mod.X`), must be typed as `string` — so `+` dispatches to string concat, not a
+// numeric add. Before the fix, `mod.X` inferred as `unresolved`; codegen then guessed
+// `int`, so `mod.STR + x` rendered the string POINTER as a decimal, and `mod.A + mod.B`
+// became a numeric add of two pointers → a wild pointer stored as a string → heap
+// corruption on the later ARC free (a crash that surfaced in an unrelated later test).
+// Fix: infer.zig field_access resolves module-qualified consts via constType.
+// (int consts always worked — int IS the value-word type — hence a string-only bug.)
+import assert;
+import string;
+import xmod_const_helper;
+
+@test
+fn test_xmod_const_left_literal_right(): void {
+    // Left is a cross-module const, right is a string literal.
+    assert.equalStr(xmod_const_helper.GREETING + "there", "hello there");
+}
+
+@test
+fn test_xmod_two_consts(): void {
+    // BOTH operands cross-module consts — the wild-pointer crash case.
+    assert.equalStr(xmod_const_helper.GREETING + xmod_const_helper.WORLD, "hello world");
+}
+
+@test
+fn test_xmod_const_unannotated_local(): void {
+    // Binding a cross-module const to a local WITHOUT an annotation must keep `string`.
+    let g = xmod_const_helper.GREETING;
+    assert.equalStr(g + xmod_const_helper.WORLD, "hello world");
+}
+
+@test
+fn test_xmod_int_const_still_numeric(): void {
+    // Guard the other direction: an int const still does numeric addition.
+    assert.equalInt(xmod_const_helper.COUNT + 4, 7);
+}

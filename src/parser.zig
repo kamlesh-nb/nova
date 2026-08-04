@@ -282,9 +282,23 @@ pub const Parser = struct {
                 return ast.Declaration{ .union_decl = ud };
             },
             .keyword_enum => {
-                var ed = try self.parseEnumDecl();
+                self.advance(); // consume 'enum'
+                var ed = try self.parseEnumDecl(false);
                 ed.attributes = attrs;
                 return ast.Declaration{ .enum_decl = ed };
+            },
+            // `exception` is a contextual keyword: at declaration position `exception Name { ... }`
+            // parses like an enum but is marked as an exception (sema then requires describe()).
+            // Everywhere else `exception` is an ordinary identifier (e.g. the `exception` module),
+            // so `import exception;` and variables named `exception` are unaffected.
+            .identifier => {
+                if (std.mem.eql(u8, self.current().lexeme, "exception")) {
+                    self.advance(); // consume contextual 'exception'
+                    var ed = try self.parseEnumDecl(true);
+                    ed.attributes = attrs;
+                    return ast.Declaration{ .enum_decl = ed };
+                }
+                return error.UnexpectedToken;
             },
             .keyword_trait => {
                 const td = try self.parseTraitDecl(is_public);
@@ -631,9 +645,11 @@ pub const Parser = struct {
         };
     }
 
-    fn parseEnumDecl(self: *Parser) ParserError!ast.EnumDecl {
+    // The leading keyword (`enum`) or the contextual `exception` identifier has already been consumed
+    // by the caller. `is_exception` marks the result as an exception (an enum the compiler requires to
+    // have a `describe(self): string` method).
+    fn parseEnumDecl(self: *Parser, is_exception: bool) ParserError!ast.EnumDecl {
         const start_span = self.span();
-        try self.expect(.keyword_enum);
         const name = self.current().lexeme;
         try self.expect(.identifier);
         try self.expect(.left_brace);
@@ -722,6 +738,7 @@ pub const Parser = struct {
             .variants = try variants.toOwnedSlice(self.allocator),
             .methods = try methods.toOwnedSlice(self.allocator),
             .attributes = &.{},
+            .is_exception = is_exception,
             .span = .{
                 .start = start_span.start,
                 .end = end_span.start,

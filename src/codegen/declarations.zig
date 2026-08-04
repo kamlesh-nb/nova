@@ -1250,6 +1250,10 @@ fn emitModule(
     is_release: bool,
     dump_ll_name: ?[]const u8,
 ) !void {
+    // Prototype ARC elision (NOVA_ARC_ELIDE): remove provably-redundant borrowed
+    // retain/release pairs before the IR is dumped / verified / emitted.
+    compiler.elideBorrowedArc(module);
+
     if (dump_ll_name) |nm| {
         const nm_z = try allocator.dupeZ(u8, nm);
         defer allocator.free(nm_z);

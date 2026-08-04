@@ -6,6 +6,7 @@ import serde.source;
 import web.request;
 import web.response;
 import web.status;
+import web.di;
 
 // THE router. One route table, one pattern parser, one matcher -- shared by every routing scenario:
 //   - web.app (App) composes a Router for its async, DI-backed mediator dispatch.
@@ -17,7 +18,7 @@ import web.status;
 // an `int` parameter, rejects a non-numeric segment (a 400 at the dispatch layer).
 
 pub trait RequestHandler<TReq, TResp> {
-    fn handle(self, req: TReq): TResp;
+    async fn handle(self, req: TReq): TResp;
 }
 
 // One pattern segment. `is_param` marks `{name}` / `{name:type}`; `ptype` is the declared type of a
@@ -180,7 +181,9 @@ pub struct Router {
         let m = self.resolve(method, path);
         if (m.matched) {
             let composite = CompositeSource(ParamSource(m.params), body);
-            return __mediator_dispatch_by_name(m.key, composite);
+            let provider = ServiceCollection().buildServiceProvider();
+            let resp = __mediator_dispatch_by_name(m.key, composite, provider);
+            return resp.body;
         }
         if (m.typedBad) { return "400"; }
         if (m.methodNotAllowed) { return "405"; }
@@ -201,10 +204,8 @@ pub struct Router {
             let jsonBody = req.body == "" ? "{}" : req.body;
             let src = source.fromJson(jsonBody);
             let composite = CompositeSource(ParamSource(m.params), src);
-            let body = __mediator_dispatch_by_name(m.key, composite);
-            let resp = response.Response(Status.Ok, body);
-            resp.setHeader("Content-Type", "application/json");
-            return resp;
+            let provider = ServiceCollection().buildServiceProvider();
+            return __mediator_dispatch_by_name(m.key, composite, provider);
         }
         if (m.typedBad) {
             return response.Response(Status.BadRequest, "Bad Request: invalid path parameter");

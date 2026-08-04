@@ -337,6 +337,19 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
         std.process.exit(1);
     }
 
+    if (inf.catch_mismatch_errors.items.len > 0) {
+        std.debug.print("Type checking failed with {d} error(s):\n", .{inf.catch_mismatch_errors.items.len});
+        for (inf.catch_mismatch_errors.items) |ce| {
+            const ok_name = renderLegacy(allocator, store, ce.ok) catch "<type>";
+            const handler_name = renderLegacy(allocator, store, ce.handler) catch "<type>";
+            std.debug.print(
+                "  \x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m catch handler has type '{s}', but the value before `catch` is `{s} | E`, so both must agree — a `catch` yields the ok type. Convert the handler to '{s}' (e.g. return a string on both sides, or map the error to the ok type).\x1b[0m\n",
+                .{ ce.span.file, ce.span.line, ce.span.col, handler_name, ok_name, ok_name },
+            );
+        }
+        std.process.exit(1);
+    }
+
     {
         var count: usize = 0;
         for (program.declarations) |decl| {
