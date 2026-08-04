@@ -391,26 +391,34 @@ jobs:
           echo "BOOST_PREFIX=/usr" >> "$GITHUB_ENV"
 
       # The live DB harness imports the driver packages (postgres/mysql/mssql/btreedb/mongodb), which
-      # live in their OWN repos, not this one. The import resolver maps `import postgres` to
+      # live in their OWN public repos, not this one. The import resolver maps `import postgres` to
       # `packages/nova-postgres/src/postgres.nova`, so clone each driver as `packages/nova-<name>`.
       # ALL five must be present to COMPILE the harness even though only postgres+mysql have live
       # service containers here; the harness skips any driver whose DSN is unset at RUN time.
       # (The plain corpus does NOT need these: no corpus case imports a driver package.)
-      # NOTE: if these repos are private, add a PAT as the `PACKAGES_TOKEN` secret; the default
-      # GITHUB_TOKEN cannot read repos in another owner's account. This job is allow-fail, so a
-      # missing token or repo degrades to a skip rather than breaking the gate.
+
+      # Cache the cloned packages so the nightly run reuses them. The key carries an ISO year-week
+      # bucket so the cache refreshes weekly, picking up driver updates without re-cloning every run.
+      - name: Package cache bucket
+        id: pkgbucket
+        shell: bash
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache driver packages
+        uses: actions/cache@v4
+        with:
+          path: packages
+          key: driver-packages-${{ steps.pkgbucket.outputs.week }}
+
       - name: Clone driver packages
         shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
         run: |
           mkdir -p packages
-          auth=""
-          [ -n "${GH_TOKEN:-}" ] && auth="https://x-access-token:${GH_TOKEN}@github.com/"
           for pkg in postgres mysql mssql btreedb mongodb; do
-            url="https://github.com/kamlesh-nb/nova-${pkg}"
-            [ -n "$auth" ] && url="${auth}kamlesh-nb/nova-${pkg}"
-            git clone --depth 1 "$url" "packages/nova-${pkg}" || echo "::warning::could not clone nova-${pkg} (private without PACKAGES_TOKEN?)"
+            # Skip if the cache already restored this driver; otherwise shallow-clone the public repo.
+            [ -d "packages/nova-${pkg}/.git" ] && { echo "nova-${pkg}: cached"; continue; }
+            git clone --depth 1 "https://github.com/kamlesh-nb/nova-${pkg}" "packages/nova-${pkg}" \
+              || echo "::warning::could not clone nova-${pkg}"
           done
 
       - name: Build nova
