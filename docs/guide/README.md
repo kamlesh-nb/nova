@@ -38,6 +38,8 @@ functions run with `nova test <file>.nova`.
 | 15 | [Concurrency](15-concurrency.md) | `async`/`await`/`spawn`, futures, channels |
 | 16 | [Serialization](16-serialization.md) | `@serializable`, JSON/BSON |
 | 17 | [Building a web service](17-web.md) | request/response, routing, the capstone |
+| 18 | [How Nova works: architecture](18-architecture.md) | the compiler pipeline, ARC memory, the concurrency engine, self-contained delivery |
+| 19 | [Building & distributing](19-building-and-distribution.md) | `nova build`, cross-compiling programs, packaging toolchain bundles + checksums |
 
 > **Version:** tracks `nova version` (Beta 0.1.0). Syntax may still change per
 > [`../STABILITY.md`](../STABILITY.md).
