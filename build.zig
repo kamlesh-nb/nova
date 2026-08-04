@@ -25,7 +25,7 @@ const llvm_libs_linux = @embedFile("deps/llvm-zig/llvm-libs-linux.txt");
 // build.zig deliberately does NO LLVM linking — it happens here so this repo
 // owns the toolchain paths and the dynamic/static choice. Paths come from `llvmPrefix`
 // (NOVA_LLVM_PREFIX, else the hardcoded dev prefix) -- there is no fetched mirror.
-fn configureLlvmLink(b: *std.Build, m: *std.Build.Module, static: bool, os_tag: std.Target.Os.Tag) void {
+fn configureLlvmLink(b: *std.Build, m: *std.Build.Module, static: bool, os_tag: std.Target.Os.Tag, arch: std.Target.Cpu.Arch) void {
     // The LLVM prefix: NOVA_LLVM_PREFIX (an installed apt/brew LLVM), else the hardcoded dev prefix.
     // There is no auto-fetched mirror -- static builds link a LOCAL LLVM (the CI release workflow
     // installs LLVM 21 and sets NOVA_LLVM_PREFIX; see release.yml).
@@ -113,9 +113,18 @@ fn configureLlvmLink(b: *std.Build, m: *std.Build.Module, static: bool, os_tag: 
         m.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ stdcxx_dir, "libstdc++.so" }) });
         m.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ stdcxx_dir, "libgcc_s.so" }) }); // libgcc_s unwinder
     } else {
-        // zstd: llvm-config bakes in a Homebrew path; use the vendored static copy.
-        m.addLibraryPath(b.path("deps/zstd"));
-        m.linkSystemLibrary("zstd", .{ .preferred_link_mode = .static, .use_pkg_config = .no });
+        // zstd: llvm-config bakes in a Homebrew path. The vendored static copy (deps/zstd/libzstd.a)
+        // is arm64-ONLY, so it only satisfies the arm64 build. On x86_64 (the macos-13 release cell)
+        // linking it arch-mismatches; fall back to a system/Homebrew zstd there (dynamic). Point
+        // NOVA_ZSTD_PREFIX at it (release.yml does `brew install zstd`); else rely on default paths.
+        if (arch == .aarch64) {
+            m.addLibraryPath(b.path("deps/zstd"));
+            m.linkSystemLibrary("zstd", .{ .preferred_link_mode = .static, .use_pkg_config = .no });
+        } else {
+            if (b.graph.environ_map.get("NOVA_ZSTD_PREFIX")) |zp|
+                m.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ zp, "lib" }) });
+            m.linkSystemLibrary("zstd", .{ .use_pkg_config = .no });
+        }
         // z/xml2 resolve against the macOS SDK dylibs.
         m.linkSystemLibrary("z", .{});
         m.linkSystemLibrary("xml2", .{});
@@ -214,7 +223,7 @@ pub fn build(b: *std.Build) void {
     // A STATIC build links a LOCAL LLVM: set NOVA_LLVM_PREFIX to an installed LLVM (apt/brew llvm-21 --
     // its libLLVM*.a are globbed in configureLlvmLink), else the hardcoded dev prefix is used. There is
     // no auto-fetched mirror (the CI release workflow installs LLVM 21 and sets the prefix).
-    configureLlvmLink(b, llvm_mod, static_llvm, target.result.os.tag);
+    configureLlvmLink(b, llvm_mod, static_llvm, target.result.os.tag, target.result.cpu.arch);
 
     // P5 #20: link LLD into nova so it links its output executables in-process
     // (no clang/ld shell-out). Requires -Dstatic-llvm (needs the native liblld*.a
