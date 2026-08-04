@@ -18,6 +18,11 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  # Nightly: exercise the FULL 3-OS x 2-arch matrix (the billed Windows + arm64 runners) once a day
+  # rather than on every commit. Experimental cells stay allow-fail, so a nightly is informational
+  # until their porting blockers (documented per cell below) are cleared.
+  schedule:
+    - cron: "0 6 * * *"
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -31,8 +36,9 @@ env:
 jobs:
   build-test:
     name: build+corpus (${{ matrix.name }})
-    # Manual only: billed runners + experimental cells. The per-commit gate is `soundness` below.
-    if: github.event_name == 'workflow_dispatch'
+    # Manual + NIGHTLY: billed runners + experimental cells, so not on every commit. The per-commit
+    # gate is `soundness` below; the full 3-OS x 2-arch matrix runs on dispatch and once a night.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.experimental }}
     strategy:
@@ -57,6 +63,25 @@ jobs:
           - { name: windows-arm64, os: windows-11-arm, experimental: true }
     steps:
       - uses: actions/checkout@v4
+
+      # Cache the Zig incremental build cache: on a hit, `zig build` only relinks instead of
+      # recompiling the whole compiler + LLVM bindings, which is the dominant CI step. Keyed on the
+      # build inputs so any source change invalidates it; restore-keys warm-start from the last build.
+      - name: Cache Zig build cache
+        uses: actions/cache@v4
+        with:
+          path: .zig-cache
+          key: zigcache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**', 'deps/**/*.zig') }}
+          restore-keys: |
+            zigcache-${{ runner.os }}-${{ runner.arch }}-
+
+      # Cache Homebrew downloads so `brew install llvm@21` reuses the bottle instead of refetching.
+      - name: Cache Homebrew (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: brew-${{ runner.os }}-${{ runner.arch }}-llvm21-boost
 
       - name: Install Zig (Unix)
         if: runner.os != 'Windows'
@@ -201,6 +226,29 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+
+      # Per-commit job: cache the pinned Zig toolchain and the incremental build cache so the common
+      # path (build + corpus + shadow) is a relink, not a full rebuild. This is the hot loop for
+      # contributors, so the cache pays off on every push.
+      - name: Cache Zig toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.nova-zig
+          key: zigtoolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.zig-version') }}
+
+      - name: Cache Zig build cache
+        uses: actions/cache@v4
+        with:
+          path: .zig-cache
+          key: zigcache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**', 'deps/**/*.zig') }}
+          restore-keys: |
+            zigcache-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Cache Homebrew (macOS)
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: brew-${{ runner.os }}-${{ runner.arch }}-llvm21-boost
 
       - name: Install Zig (pinned + checksum-verified)
         shell: bash

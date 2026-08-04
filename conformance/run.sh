@@ -146,10 +146,19 @@ res="$(printf '%s\n' "$out" | grep -E '^Results:' | tail -1)"
 if [ "$code" -eq 0 ] && printf '%s' "$res" | grep -q '0 failed'; then printf 'PASS\t%s\t%s\n' "$name" "$res"
 else printf 'FAIL\t%s\t%s\n' "$name" "${res:-<compile/link or timeout>}"; fi
 WORKER
+  # Longest-first scheduling: cases that import the heavy stdlib graph (web/net/reactor/tls/crypto/
+  # data) compile the whole 15k-line merged program and dominate wall time, so feed them to the
+  # workers FIRST. xargs -P assigns items in order as workers free up, so starting the long poles
+  # early lets the many short cases backfill the tail instead of a 9s case landing last on an idle
+  # box. Weight 0 = heavy (first), 1 = light; sorted by (weight, path) for deterministic order.
   for f in "$HERE"/cases/*.nova; do
     n="$(basename "$f")"; [[ -n "$FILTER" && "$n" != *"$FILTER"* ]] && continue
-    printf '%s\n' "$f"
-  done | xargs -P "$PARALLEL" -n1 bash "$_worker" >> "$_verd"
+    if grep -qE '^[[:space:]]*import[[:space:]]+(web|net|reactor|flagship|asynctls|tls|crypto|data)\b' "$f" 2>/dev/null; then
+      printf '0\t%s\n' "$f"
+    else
+      printf '1\t%s\n' "$f"
+    fi
+  done | sort | cut -f2- | xargs -P "$PARALLEL" -n1 bash "$_worker" >> "$_verd"
   rm -f "$_worker"
   # tally (sorted for stable output)
   while IFS="$(printf '\t')" read -r v name res; do

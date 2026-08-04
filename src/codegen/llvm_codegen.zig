@@ -110,6 +110,16 @@ pub const LlvmCompiler = struct {
     scopes: std.ArrayList(Scope),
     locals: std.StringHashMap(types.LLVMValueRef),
     func_map: std.StringHashMap(types.LLVMValueRef),
+    // Memoises getFunctionParamTypeRef, whose body is an O(all-declarations x methods x
+    // instantiations) linear scan with per-iteration allocation. It is called per-parameter
+    // per-call-site over the whole merged program, so on stdlib-heavy files (15k merged lines)
+    // the repeated scan dominated compile time. The result is a pure function of
+    // (func_name, param_idx) for a fixed program, so caching it is safe. Key: "name\x00idx".
+    param_type_cache: std.StringHashMap(?ast.TypeRef),
+    // Same memoisation for getFunctionParamType (the string-returning sibling). Value is an
+    // owned type-name string; callers own their result, so a hit returns a fresh dupe (cheap next
+    // to the scan it avoids). Both keys and stored value strings are freed on deinit.
+    param_type_str_cache: std.StringHashMap(?[]const u8),
     structs: std.StringHashMap(ast.StructDecl),
     unions: std.StringHashMap(ast.UnionDecl),
     enums: std.StringHashMap(ast.EnumDecl),
@@ -274,6 +284,8 @@ pub const LlvmCompiler = struct {
             .persistent_ptr = null,
             .locals = std.StringHashMap(types.LLVMValueRef).init(allocator),
             .func_map = std.StringHashMap(types.LLVMValueRef).init(allocator),
+            .param_type_cache = std.StringHashMap(?ast.TypeRef).init(allocator),
+            .param_type_str_cache = std.StringHashMap(?[]const u8).init(allocator),
             .async_fns = std.StringHashMap(void).init(allocator),
             .structs = std.StringHashMap(ast.StructDecl).init(allocator),
             .unions = std.StringHashMap(ast.UnionDecl).init(allocator),
@@ -339,6 +351,19 @@ pub const LlvmCompiler = struct {
         self.scopes.deinit(self.allocator);
         self.locals.deinit();
         self.func_map.deinit();
+        {
+            var it = self.param_type_cache.keyIterator();
+            while (it.next()) |k| self.allocator.free(k.*);
+            self.param_type_cache.deinit();
+        }
+        {
+            var it = self.param_type_str_cache.iterator();
+            while (it.next()) |e| {
+                self.allocator.free(e.key_ptr.*);
+                if (e.value_ptr.*) |v| self.allocator.free(v);
+            }
+            self.param_type_str_cache.deinit();
+        }
         self.async_fns.deinit();
         self.structs.deinit();
         self.unions.deinit();
@@ -1056,6 +1081,22 @@ pub const LlvmCompiler = struct {
     }
 
     pub fn getFunctionParamType(self: *LlvmCompiler, func_name: []const u8, param_idx: usize) ?[]const u8 {
+        const key = std.fmt.allocPrint(self.allocator, "{s}\x00{d}", .{ func_name, param_idx }) catch return self.getFunctionParamTypeUncached(func_name, param_idx);
+        if (self.param_type_str_cache.get(key)) |cached| {
+            self.allocator.free(key);
+            return if (cached) |c| (self.allocator.dupe(u8, c) catch null) else null;
+        }
+        const result = self.getFunctionParamTypeUncached(func_name, param_idx);
+        // Store an independent copy in the cache; the caller keeps `result`.
+        const stored: ?[]const u8 = if (result) |r| (self.allocator.dupe(u8, r) catch null) else null;
+        self.param_type_str_cache.put(key, stored) catch {
+            if (stored) |s| self.allocator.free(s);
+            self.allocator.free(key);
+        };
+        return result;
+    }
+
+    fn getFunctionParamTypeUncached(self: *LlvmCompiler, func_name: []const u8, param_idx: usize) ?[]const u8 {
         for (self.program.declarations) |decl| {
             switch (decl) {
                 .fn_decl => |f| {
@@ -1102,6 +1143,20 @@ pub const LlvmCompiler = struct {
     }
 
     pub fn getFunctionParamTypeRef(self: *LlvmCompiler, func_name: []const u8, param_idx: usize) ?ast.TypeRef {
+        // Cache lookup: the scan below is O(all-declarations x methods x instantiations) and this
+        // is called per-parameter per-call-site, so memoise on (func_name, param_idx). Pure for a
+        // fixed program.
+        const key = std.fmt.allocPrint(self.allocator, "{s}\x00{d}", .{ func_name, param_idx }) catch return self.getFunctionParamTypeRefUncached(func_name, param_idx);
+        if (self.param_type_cache.get(key)) |cached| {
+            self.allocator.free(key);
+            return cached;
+        }
+        const result = self.getFunctionParamTypeRefUncached(func_name, param_idx);
+        self.param_type_cache.put(key, result) catch self.allocator.free(key);
+        return result;
+    }
+
+    fn getFunctionParamTypeRefUncached(self: *LlvmCompiler, func_name: []const u8, param_idx: usize) ?ast.TypeRef {
         for (self.program.declarations) |decl| {
             switch (decl) {
                 .fn_decl => |f| {
