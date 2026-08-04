@@ -109,6 +109,26 @@ jobs:
       - name: Verify Zig
         run: zig version
 
+      # Cache the LLVM (+ boost) DOWNLOADS per package manager rather than the install PREFIX: the
+      # prefix lives in root-owned dirs (/usr/lib, /opt/homebrew/Cellar) that actions/cache cannot
+      # restore without sudo, and brew scatters LLVM's runtime-dep dylibs across the Cellar. Caching
+      # the download cache keeps the install method (and its dependency resolution) identical while
+      # skipping the slow part, the multi-hundred-MB fetch. macOS uses the Homebrew cache above; the
+      # two below cover Linux (.deb archives) and Windows (Chocolatey installers).
+      - name: Cache apt LLVM debs (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: ~/apt-llvm-cache
+          key: apt-llvm-${{ runner.arch }}-21
+
+      - name: Cache Chocolatey downloads (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: C:\choco-cache
+          key: choco-llvm-${{ runner.arch }}
+
       - name: Install deps (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -123,7 +143,12 @@ jobs:
           wget -q https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
           sudo ./llvm.sh 21
+          # Seed apt's archive from the user-owned cache so already-downloaded .debs are not refetched.
+          mkdir -p ~/apt-llvm-cache
+          sudo cp -n ~/apt-llvm-cache/*.deb /var/cache/apt/archives/ 2>/dev/null || true
           sudo apt-get install -y llvm-21-dev libclang-21-dev clang-21 libboost-all-dev cmake zlib1g-dev
+          # Save the freshly downloaded .debs back to the cache for the next run.
+          cp -u /var/cache/apt/archives/*.deb ~/apt-llvm-cache/ 2>/dev/null || true
           sudo ln -sf "$(command -v clang++-21)" /usr/local/bin/clang++
           echo "NOVA_LLVM_PREFIX=/usr/lib/llvm-21" >> "$GITHUB_ENV"
           echo "BOOST_PREFIX=/usr" >> "$GITHUB_ENV"
@@ -132,7 +157,8 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          choco install llvm cmake -y || true
+          # --cache-location points Chocolatey at the cached dir so the installer is reused on a hit.
+          choco install llvm cmake -y --cache-location='C:\choco-cache' || true
           echo "NOVA_LLVM_PREFIX=C:/Program Files/LLVM" >> "$GITHUB_ENV"
 
       - name: Build nova
@@ -167,6 +193,20 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+
+      - name: Cache Zig build cache
+        uses: actions/cache@v4
+        with:
+          path: .zig-cache
+          key: zigcache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**', 'deps/**/*.zig') }}
+          restore-keys: |
+            zigcache-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Cache Homebrew (macOS)
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: brew-${{ runner.os }}-${{ runner.arch }}-llvm21-boost
 
       - name: Install Zig (pinned + checksum-verified)
         shell: bash
@@ -320,6 +360,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Cache Zig build cache
+        uses: actions/cache@v4
+        with:
+          path: .zig-cache
+          key: zigcache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**', 'deps/**/*.zig') }}
+          restore-keys: |
+            zigcache-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Cache apt LLVM debs (Linux)
+        uses: actions/cache@v4
+        with:
+          path: ~/apt-llvm-cache
+          key: apt-llvm-${{ runner.arch }}-21
+
       - name: Install Zig (pinned + checksum-verified)
         shell: bash
         run: echo "$(scripts/bootstrap-zig.sh | tail -1)" >> "$GITHUB_PATH"
@@ -328,7 +382,10 @@ jobs:
         run: |
           sudo apt-get update
           wget -q https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && sudo ./llvm.sh 21
+          mkdir -p ~/apt-llvm-cache
+          sudo cp -n ~/apt-llvm-cache/*.deb /var/cache/apt/archives/ 2>/dev/null || true
           sudo apt-get install -y llvm-21-dev libclang-21-dev clang-21 libboost-all-dev cmake zlib1g-dev
+          cp -u /var/cache/apt/archives/*.deb ~/apt-llvm-cache/ 2>/dev/null || true
           sudo ln -sf "$(command -v clang++-21)" /usr/local/bin/clang++
           echo "NOVA_LLVM_PREFIX=/usr/lib/llvm-21" >> "$GITHUB_ENV"
           echo "BOOST_PREFIX=/usr" >> "$GITHUB_ENV"
