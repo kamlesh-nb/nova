@@ -1,5 +1,6 @@
 
 import serde.json;
+import serde.yaml;
 import string;
 import list;
 import map;
@@ -72,6 +73,84 @@ pub struct JsonSource impl ValueSource {
 
 pub fn fromJson(body: string): JsonSource {
     return JsonSource(json.parse(body));
+}
+
+// A ValueSource over a parsed YAML document, so any @serializable struct binds from YAML the same way
+// it does from JSON: `let cfg = Cfg__bind(source.fromYaml(text))`. Numbers land as Number(long) for
+// integers and Decimal(decimal) for fractionals in the YAML value model, so the integer/float/decimal
+// accessors each fall back through both; a decimal renders to a parseable string via interpolation.
+pub struct YamlSource impl ValueSource {
+    pub node: yaml.YamlValue,
+
+    init(node: yaml.YamlValue) { self.node = node; }
+
+    pub fn getString(self: YamlSource, key: string): string {
+        return yaml.asString(yaml.get(self.node, key)) ?? "";
+    }
+    pub fn getInt(self: YamlSource, key: string): long {
+        let v = yaml.get(self.node, key);
+        let n = yaml.asNumber(v);
+        if (n != undefined) { return n; }
+        let d = yaml.asDecimal(v);
+        if (d != undefined) { return string.parseI64(`${d}`); }
+        return 0;
+    }
+    pub fn getBool(self: YamlSource, key: string): bool {
+        return yaml.asBool(yaml.get(self.node, key)) ?? false;
+    }
+    pub fn getFloat(self: YamlSource, key: string): double {
+        let v = yaml.get(self.node, key);
+        let n = yaml.asNumber(v);
+        if (n != undefined) { return string.parseFloat(`${n}`); }
+        let d = yaml.asDecimal(v);
+        if (d != undefined) { return string.parseFloat(`${d}`); }
+        return 0.0;
+    }
+    pub fn getDecimal(self: YamlSource, key: string): decimal {
+        let v = yaml.get(self.node, key);
+        let d = yaml.asDecimal(v);
+        if (d != undefined) { return d; }
+        let n = yaml.asNumber(v);
+        if (n != undefined) { return decimal.fromString(`${n}`); }
+        return 0m;
+    }
+    pub fn getChild(self: YamlSource, key: string): ValueSource {
+        return YamlSource(yaml.get(self.node, key));
+    }
+    pub fn has(self: YamlSource, key: string): bool {
+        return !yaml.isNull(yaml.get(self.node, key));
+    }
+    pub fn arrayLen(self: YamlSource, key: string): int {
+        let a = yaml.asArray(yaml.get(self.node, key));
+        if (a == undefined) { return 0; }
+        return a.size();
+    }
+    pub fn itemString(self: YamlSource, key: string, i: int): string {
+        return yaml.asString(yaml.at(yaml.get(self.node, key), i)) ?? "";
+    }
+    pub fn itemInt(self: YamlSource, key: string, i: int): long {
+        let v = yaml.at(yaml.get(self.node, key), i);
+        let n = yaml.asNumber(v);
+        if (n != undefined) { return n; }
+        let d = yaml.asDecimal(v);
+        if (d != undefined) { return string.parseI64(`${d}`); }
+        return 0;
+    }
+    pub fn itemDecimal(self: YamlSource, key: string, i: int): decimal {
+        let v = yaml.at(yaml.get(self.node, key), i);
+        let d = yaml.asDecimal(v);
+        if (d != undefined) { return d; }
+        let n = yaml.asNumber(v);
+        if (n != undefined) { return decimal.fromString(`${n}`); }
+        return 0m;
+    }
+    pub fn itemChild(self: YamlSource, key: string, i: int): ValueSource {
+        return YamlSource(yaml.at(yaml.get(self.node, key), i));
+    }
+}
+
+pub fn fromYaml(body: string): YamlSource {
+    return YamlSource(yaml.parse(body));
 }
 
 pub struct ParamSource impl ValueSource {

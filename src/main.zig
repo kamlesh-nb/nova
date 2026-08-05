@@ -810,21 +810,23 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
             const fname = f.name;
             switch (f.type_name) {
                 .ident => |tn| {
+                    // has-guard every field so an ABSENT key keeps the value init() set (the documented
+                    // "__bind overwrites the fields it finds" contract). Without the guard an omitted key
+                    // zero-filled the field, so a partial JSON/YAML document silently wiped the defaults.
                     if (std.mem.eql(u8, tn, "string")) {
-                        try serdeAppendf(&src, allocator, "    obj.{s} = src.getString(\"{s}\");\n", .{ fname, fname });
+                        try serdeAppendf(&src, allocator, "    if (src.has(\"{s}\")) {{ obj.{s} = src.getString(\"{s}\"); }}\n", .{ fname, fname, fname });
                     } else if (serdeIsInt(tn)) {
-                        try serdeAppendf(&src, allocator, "    obj.{s} = src.getInt(\"{s}\");\n", .{ fname, fname });
+                        try serdeAppendf(&src, allocator, "    if (src.has(\"{s}\")) {{ obj.{s} = src.getInt(\"{s}\"); }}\n", .{ fname, fname, fname });
                     } else if (std.mem.eql(u8, tn, "bool")) {
-                        try serdeAppendf(&src, allocator, "    obj.{s} = src.getBool(\"{s}\");\n", .{ fname, fname });
+                        try serdeAppendf(&src, allocator, "    if (src.has(\"{s}\")) {{ obj.{s} = src.getBool(\"{s}\"); }}\n", .{ fname, fname, fname });
                     } else if (std.mem.eql(u8, tn, "decimal")) {
-                        try serdeAppendf(&src, allocator, "    obj.{s} = src.getDecimal(\"{s}\");\n", .{ fname, fname });
+                        try serdeAppendf(&src, allocator, "    if (src.has(\"{s}\")) {{ obj.{s} = src.getDecimal(\"{s}\"); }}\n", .{ fname, fname, fname });
                     } else if (serdeIsFloat(tn)) {
-                        try serdeAppendf(&src, allocator, "    obj.{s} = src.getFloat(\"{s}\");\n", .{ fname, fname });
+                        try serdeAppendf(&src, allocator, "    if (src.has(\"{s}\")) {{ obj.{s} = src.getFloat(\"{s}\"); }}\n", .{ fname, fname, fname });
                     } else if (serializable.contains(tn)) {
-                        try serdeAppendf(&src, allocator, "    obj.{s} = {s}__bind(src.getChild(\"{s}\"));\n", .{ fname, tn, fname });
+                        try serdeAppendf(&src, allocator, "    if (src.has(\"{s}\")) {{ obj.{s} = {s}__bind(src.getChild(\"{s}\")); }}\n", .{ fname, fname, tn, fname });
                     } else if (enums.contains(tn)) {
-
-                        try serdeAppendf(&src, allocator, "    obj.{s} = {s}__fromName(src.getString(\"{s}\"));\n", .{ fname, tn, fname });
+                        try serdeAppendf(&src, allocator, "    if (src.has(\"{s}\")) {{ obj.{s} = {s}__fromName(src.getString(\"{s}\")); }}\n", .{ fname, fname, tn, fname });
                     }
                 },
                 .optional => |inner| {
@@ -850,7 +852,9 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
                 },
                 .generic => |g| {
                     if (std.mem.eql(u8, g.name, "List") and g.params.len == 1) {
-
+                        // has-guard the whole list too: an absent key keeps the init() default list
+                        // rather than resetting it to empty (matches the scalar/nested guard above).
+                        try serdeAppendf(&src, allocator, "    if (src.has(\"{s}\")) {{\n", .{fname});
                         switch (g.params[0]) {
                             .ident => |en| try serdeAppendf(&src, allocator, "    obj.{s} = List<{s}>();\n", .{ fname, en }),
                             else => {},
@@ -871,6 +875,7 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
                             else => {},
                         }
                         try serdeAppendf(&src, allocator, " __i = __i + 1; }} }}\n", .{});
+                        try serdeAppendf(&src, allocator, "    }}\n", .{});   // close if (src.has(...))
                     }
                 },
                 else => {},
