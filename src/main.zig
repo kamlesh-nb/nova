@@ -500,7 +500,7 @@ fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocator: 
         current_len = last_slash;
     }
 
-    if (resolveFromLocalPackages(module_name, allocator, io)) |local_hit| {
+    if (resolveFromLocalPackages(module_name, dir, allocator, io)) |local_hit| {
         return local_hit;
     }
 
@@ -551,31 +551,58 @@ fn resolveFromPackageCache(module_name: []const u8, allocator: std.mem.Allocator
     return null;
 }
 
-fn resolveFromLocalPackages(module_name: []const u8, allocator: std.mem.Allocator, io: std.Io) ?[]const u8 {
-    const roots = [_][]const u8{ "packages", "../packages" };
-
-    for (roots) |root| {
-        const candidate = std.fmt.allocPrint(allocator, "{s}/nova-{s}/src/{s}.nova", .{ root, module_name, module_name }) catch continue;
+// Scan a single `packages/` root for a module: first `<root>/nova-<module>/src/<module>.nova` (the
+// package's own top module), then `<root>/<any-pkg>/src/<module>.nova` (a flat module inside any
+// package, e.g. nova-datastar's `datastar`/`ds_sink`). Returns an owned path or null.
+fn scanPackageRoot(root: []const u8, module_name: []const u8, allocator: std.mem.Allocator, io: std.Io) ?[]const u8 {
+    const direct = std.fmt.allocPrint(allocator, "{s}/nova-{s}/src/{s}.nova", .{ root, module_name, module_name }) catch return null;
+    if (Io.Dir.access(.cwd(), io, direct, .{})) |_| {
+        return direct;
+    } else |_| {
+        allocator.free(direct);
+    }
+    const dir = Io.Dir.openDir(.cwd(), io, root, .{ .iterate = true }) catch return null;
+    defer Io.Dir.close(dir, io);
+    var it = Io.Dir.iterate(dir);
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        const candidate = std.fmt.allocPrint(allocator, "{s}/{s}/src/{s}.nova", .{ root, entry.name, module_name }) catch continue;
         if (Io.Dir.access(.cwd(), io, candidate, .{})) |_| {
             return candidate;
         } else |_| {
             allocator.free(candidate);
         }
     }
+    return null;
+}
 
-    for (roots) |root| {
-        const dir = Io.Dir.openDir(.cwd(), io, root, .{ .iterate = true }) catch continue;
-        defer Io.Dir.close(dir, io);
-        var it = Io.Dir.iterate(dir);
-        while (it.next(io) catch null) |entry| {
-            if (entry.kind != .directory) continue;
-            const candidate = std.fmt.allocPrint(allocator, "{s}/{s}/src/{s}.nova", .{ root, entry.name, module_name }) catch continue;
-            if (Io.Dir.access(.cwd(), io, candidate, .{})) |_| {
-                return candidate;
-            } else |_| {
-                allocator.free(candidate);
-            }
+// Resolve `module_name` from a sibling `packages/` directory. Searches the CWD-relative roots
+// (`packages`, `../packages`) AND a `packages/` dir at every ANCESTOR of the importing file, so a
+// cross-package import (e.g. an app under packages/nova-orchestrator/examples importing nova-datastar's
+// `datastar`) resolves no matter what the process CWD is — `nova build --file <deep/path>` included.
+fn resolveFromLocalPackages(module_name: []const u8, importer_dir: []const u8, allocator: std.mem.Allocator, io: std.Io) ?[]const u8 {
+    // CWD-relative `packages/` at several parent depths. `nova build --file <deep/path>` and `nova test`
+    // run from different CWDs (the project dir, the lang dir, the file's dir), so probe a few `../` levels
+    // rather than assume one. First existing package with the module wins.
+    const cwd_roots = [_][]const u8{
+        "packages", "../packages", "../../packages", "../../../packages",
+        "../../../../packages", "../../../../../packages",
+    };
+    for (cwd_roots) |root| {
+        if (scanPackageRoot(root, module_name, allocator, io)) |hit| return hit;
+    }
+
+    var current_len = importer_dir.len;
+    while (current_len > 0) {
+        const anc = importer_dir[0..current_len];
+        const root = std.fmt.allocPrint(allocator, "{s}/packages", .{anc}) catch return null;
+        if (scanPackageRoot(root, module_name, allocator, io)) |hit| {
+            allocator.free(root);
+            return hit;
         }
+        allocator.free(root);
+        const last_slash = std.mem.lastIndexOfScalar(u8, anc, '/') orelse break;
+        current_len = last_slash;
     }
     return null;
 }
