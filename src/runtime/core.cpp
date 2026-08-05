@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #else
 #include <unistd.h>
+#include <sys/socket.h>  // fd-passing (SCM_RIGHTS) shims below
 #endif
 
 // --- crash diagnostics (opt-in: NOVA_CRASH_TRACE=1) ---------------------------------------------
@@ -301,6 +302,90 @@ long long nova_set_nonblock(long long fd) {
 // left under io/file after M5; everything else in file and directory I/O is Nova over os/sys.
 long long nova_open(const char *path, long long flags, long long mode) {
   return (long long)::open(path, (int)flags, (unsigned int)mode);
+}
+
+// --- fd passing (SCM_RIGHTS) -------------------------------------------------------------------
+// The "connection handoff" primitive: a process accepts a client socket and passes that open fd to
+// a sibling process over a connected AF_UNIX socket, so the sibling replies to the client directly
+// and the accepter drops out of the data path (the fire-and-forget proxy design). This must be a C
+// shim because sendmsg/recvmsg carry the fd in a `struct msghdr` + `struct cmsghdr` ancillary block
+// whose macros (CMSG_SPACE/CMSG_FIRSTHDR/CMSG_DATA) and field offsets are not expressible over the
+// raw-bytes FFI idiom os/sys uses, and differ across kernels. POSIX only; Windows fd-passing needs
+// WSADuplicateSocket + a separate protocol, deferred (the stubs return -1).
+
+// Send `fd` plus `len` bytes of ordinary payload (the already-consumed request prefix) over the
+// connected AF_UNIX socket `sock`. At least one payload byte always travels, since a zero-length
+// datagram would not carry the ancillary block reliably. Returns bytes sent (>=0) or -1.
+long long nova_send_fd(long long sock, const char *data, long long len, long long fd) {
+#ifdef _WIN32
+  (void)sock; (void)data; (void)len; (void)fd;
+  return -1;
+#else
+  struct msghdr msg;
+  memset(&msg, 0, sizeof(msg));
+  char dummy = 0;
+  struct iovec iov;
+  iov.iov_base = (void *)(len > 0 ? data : &dummy);
+  iov.iov_len = (size_t)(len > 0 ? len : 1);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  union {
+    char buf[CMSG_SPACE(sizeof(int))];
+    struct cmsghdr align;
+  } u;
+  memset(u.buf, 0, sizeof(u.buf));
+  msg.msg_control = u.buf;
+  msg.msg_controllen = sizeof(u.buf);
+  struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+  cm->cmsg_level = SOL_SOCKET;
+  cm->cmsg_type = SCM_RIGHTS;
+  cm->cmsg_len = CMSG_LEN(sizeof(int));
+  int sfd = (int)fd;
+  memcpy(CMSG_DATA(cm), &sfd, sizeof(int));
+  ssize_t n;
+  do { n = sendmsg((int)sock, &msg, 0); } while (n < 0 && errno == EINTR);
+  return (long long)n;
+#endif
+}
+
+// Receive an fd (and up to `cap` payload bytes) from the connected AF_UNIX socket `sock`. Writes the
+// received fd to *(int*)out_fd_ptr, or -1 if none arrived. Returns payload bytes (0 = peer closed) or
+// -1. The caller owns the received fd and must close it.
+long long nova_recv_fd(long long sock, char *buf, long long cap, long long out_fd_ptr) {
+#ifdef _WIN32
+  (void)sock; (void)buf; (void)cap;
+  if (out_fd_ptr) *reinterpret_cast<int *>(out_fd_ptr) = -1;
+  return -1;
+#else
+  struct msghdr msg;
+  memset(&msg, 0, sizeof(msg));
+  struct iovec iov;
+  iov.iov_base = buf;
+  iov.iov_len = (size_t)cap;
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  union {
+    char buf[CMSG_SPACE(sizeof(int))];
+    struct cmsghdr align;
+  } u;
+  memset(u.buf, 0, sizeof(u.buf));
+  msg.msg_control = u.buf;
+  msg.msg_controllen = sizeof(u.buf);
+  ssize_t n;
+  do { n = recvmsg((int)sock, &msg, 0); } while (n < 0 && errno == EINTR);
+  int got = -1;
+  if (n >= 0) {
+    for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msg); cm != nullptr;
+         cm = CMSG_NXTHDR(&msg, cm)) {
+      if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS) {
+        memcpy(&got, CMSG_DATA(cm), sizeof(int));
+        break;
+      }
+    }
+  }
+  if (out_fd_ptr) *reinterpret_cast<int *>(out_fd_ptr) = got;
+  return (long long)n;
+#endif
 }
 char *nova_ffi_to_cstr(const char *nova_str) { return nova_to_cstr(nova_str); }
 void nova_ffi_free_cstr(const char *nova_str, char *c) { nova_free_cstr(nova_str, c); }

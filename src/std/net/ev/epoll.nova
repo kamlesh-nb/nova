@@ -26,6 +26,10 @@ pub const OP_CONNECT: int = 3;
 // mean on kqueue: "tell me when this fd is readable/writable", with no data moved.
 pub const OP_POLL_IN: int = 4;
 pub const OP_POLL_OUT: int = 5;
+// OP_RECVFD: on readability, recvmsg ONE passed fd (SCM_RIGHTS) instead of bytes; result is the received
+// client fd (>=0) or -1 on channel close/error. buf is an 8-byte scratch ([4..8) receives the fd). This
+// is the fd-passing handoff receive op. Supported on the epoll (readiness) path; not on io_uring.
+pub const OP_RECVFD: int = 6;
 
 // poll(2) event bits, as the kernel reports them in a POLL_ADD completion's res.
 const POLLIN_BIT: int = 1;
@@ -575,6 +579,13 @@ pub struct Poller impl EventLoop {
                 if (kind == OP_RECV) {
                     let r = socket.recvSock(fd, buf, len);
                     if (r < 0 && socket.wouldBlock()) { complete = false; } else { res = r as int; }
+                } else if (kind == OP_RECVFD) {
+                    // buf is an 8-byte scratch: recv one fd into [4..8), payload (ignored) into [0..4).
+                    bytes.write_i32(buf, 4, -1);
+                    let rn = socket.recvFdRaw(fd, buf, 4, buf + 4);
+                    if (rn < 0 && socket.wouldBlock()) { complete = false; }
+                    else if (rn <= 0) { res = -1; }
+                    else { res = bytes.read_i32(buf, 4) as int; }
                 } else if (kind == OP_SEND) {
                     let w = socket.sendSock(fd, buf, len);
                     if (w < 0 && socket.wouldBlock()) {

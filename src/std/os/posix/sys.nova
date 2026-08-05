@@ -34,6 +34,13 @@ pub extern("c") fn read(fd: int, buf: ptr, count: long): long;
 pub extern("c") fn write(fd: int, buf: ptr, count: long): long;
 pub extern("c") fn close(fd: int): int;
 
+// fd passing over a connected AF_UNIX socket (SCM_RIGHTS). These are runtime shims (core.cpp), not
+// bare libc, because the fd rides in a struct msghdr/cmsghdr ancillary block whose layout is not
+// expressible over the raw-bytes idiom and differs by kernel. nova_send_fd sends `fd` plus `len`
+// payload bytes; nova_recv_fd receives an fd (written to *out_fd, -1 if none) plus up to `cap` bytes.
+pub extern("c") fn nova_send_fd(sock: int, data: ptr, len: long, fd: int): long;
+pub extern("c") fn nova_recv_fd(sock: int, buf: ptr, cap: long, out_fd: ptr): long;
+
 // Process environment (M6: process shims in Nova over os/sys). getenv returns a pointer into the
 // process environment (do not free it); setenv copies. The string marshalling wrappers are in
 // std/env.nova, which owns the allocator import.

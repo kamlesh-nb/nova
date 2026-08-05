@@ -177,6 +177,24 @@ pub fn listenAny(port: int): int {
 }
 pub fn acceptOne(fd: int): int { return acceptSock(fd, 0, 0); }
 
+// fd passing (SCM_RIGHTS) is a POSIX mechanism; Windows would need WSADuplicateSocket + a separate
+// protocol. These stubs keep the shared callers (web/app handoff receiver, orchestrator proxyd) compiling
+// on Windows; they fail closed (no unix socket, no handoff) so a Windows build simply does not offer the
+// fd-passing mode. AF_UNIX exists on Win10+ but the ancillary-data path does not, so handoff stays off.
+pub const AF_UNIX: int = 1;
+pub fn newUnix(): int { return -1; }
+pub fn unixPair(sv: ptr): int { return -1; }
+pub fn sockaddrUnLen(): int { return 0; }
+pub fn makeSockaddrUn(path: string): ptr { return 0; }
+pub fn sendFd(sock: int, fd: int, payload: string): long { return -1 as long; }
+pub fn recvFdRaw(fd: int, buf: long, cap: int, outFd: long): long { return -1 as long; }
+pub struct HandoffResult {
+    pub fd: int,
+    pub payload: string,
+    pub n: int,
+}
+pub fn recvFd(sock: int, cap: int): HandoffResult { return HandoffResult { fd: -1, payload: "", n: -1 }; }
+
 pub fn boundPort(fd: int): int {
     let sa = bytes.alloc(16);
     let len = bytes.alloc(4);

@@ -235,3 +235,82 @@ pub fn listenAny(port: int): int {
     return fd;
 }
 pub fn acceptOne(fd: int): int { return acceptSock(fd, 0, 0); }
+
+// --- fd passing (connection handoff) ----------------------------------------------------------
+// The fire-and-forget proxy primitive: an accepter hands an open client fd to a sibling process over
+// a connected AF_UNIX socket, so the sibling replies to the client directly. AF_UNIX is 1 on both
+// macOS and Linux, so it needs no per-OS seam.
+pub const AF_UNIX: int = 1;
+
+pub fn newUnix(): int { return sys.socket(AF_UNIX, SOCK_STREAM, 0); }
+
+// Build a sockaddr_un for a filesystem path. macOS/BSD is [sun_len(1)][sun_family(1)][sun_path], Linux
+// is [sun_family(2, LE)][sun_path]; the path starts at offset 2 on both. Pass sockaddrUnLen() as the
+// addrlen to bind/connect. Path must be shorter than the sun_path field (104 macOS / 108 Linux).
+pub fn sockaddrUnLen(): int { return if (platform.isLinux) 110 else 106; }
+pub fn makeSockaddrUn(path: string): ptr {
+    let sz = sockaddrUnLen();
+    let sa = bytes.alloc(sz);
+    let i = 0;
+    while (i < sz) { bytes.write_byte(sa, i, 0); i = i + 1; }
+    if (platform.isLinux) {
+        bytes.write_byte(sa, 0, AF_UNIX & 0xff);
+        bytes.write_byte(sa, 1, (AF_UNIX >> 8) & 0xff);
+    } else {
+        bytes.write_byte(sa, 0, sz);       // sun_len
+        bytes.write_byte(sa, 1, AF_UNIX);  // sun_family
+    }
+    let n = path.length;
+    let j = 0;
+    while (j < n) { bytes.write_byte(sa, 2 + j, path[j]); j = j + 1; }
+    return sa;
+}
+
+// A connected AF_UNIX stream pair (both ends usable immediately, no bind/listen). Writes the two fds
+// into a caller-provided 8-byte buffer as two i32s; returns 0 on success or -1. Typically one end is
+// kept by the accepter and the other inherited by a forked worker.
+pub fn unixPair(sv: ptr): int { return sys.socketpair(AF_UNIX, SOCK_STREAM, 0, sv); }
+
+// Send an open fd plus a string payload (the already-read request prefix) over the AF_UNIX socket.
+// Returns bytes sent (>=0) or -1.
+pub fn sendFd(sock: int, fd: int, payload: string): long {
+    let n = payload.length;
+    let buf = bytes.alloc(if (n > 0) n else 1);
+    let i = 0;
+    while (i < n) { bytes.write_byte(buf, i, payload[i]); i = i + 1; }
+    let r = sys.nova_send_fd(sock, buf, n as long, fd);
+    bytes.free(buf);
+    return r;
+}
+
+// The result of a handoff receive: the passed fd (-1 if none arrived), the payload bytes that rode
+// along with it (the request prefix the accepter had already consumed), and the raw recvmsg count `n`
+// so a non-blocking caller can tell the three cases apart: n>0 an fd/data arrived, n==0 the peer closed
+// the channel (stop), n<0 would-block (nothing queued right now).
+pub struct HandoffResult {
+    pub fd: int,
+    pub payload: string,
+    pub n: int,
+}
+
+// Low-level fd receive for the reactor's OP_RECVFD completion path: recvmsg one fd (written as an i32
+// to *outFd) plus up to `cap` payload bytes into `buf`, both raw addresses. Returns the raw recvmsg
+// count: >0 a fd/data arrived, 0 the peer closed, <0 error or would-block (check wouldBlock()).
+pub fn recvFdRaw(fd: int, buf: long, cap: int, outFd: long): long {
+    return sys.nova_recv_fd(fd, buf, cap as long, outFd);
+}
+
+// Receive an fd plus up to `cap` payload bytes from the AF_UNIX socket. On peer-close the returned fd
+// is -1 and n is 0; on would-block (non-blocking socket) fd is -1 and n is -1.
+pub fn recvFd(sock: int, cap: int): HandoffResult {
+    let buf = bytes.alloc(if (cap > 0) cap else 1);
+    let outFd = bytes.alloc(4);
+    bytes.write_i32(outFd, 0, -1);
+    let n = sys.nova_recv_fd(sock, buf, cap as long, outFd);
+    let fd = bytes.read_i32(outFd, 0) as int;
+    let payload = "";
+    if (n > 0) { payload = bytes.read_string(buf, n as int); }
+    bytes.free(outFd);
+    bytes.free(buf);
+    return HandoffResult { fd: fd, payload: payload, n: n as int };
+}

@@ -186,6 +186,10 @@ void        nova_coverage_dump(long long count);
 // shim is nova_open (variadic open(2)), declared inline where it is used.
 long long nova_open(const char *path, long long flags, long long mode);
 
+// fd passing (SCM_RIGHTS): the connection-handoff primitive for a fire-and-forget proxy. See core.cpp.
+long long nova_send_fd(long long sock, const char *data, long long len, long long fd);
+long long nova_recv_fd(long long sock, char *buf, long long cap, long long out_fd_ptr);
+
 int  nova_socket_connect(const char *host, int port);
 int  nova_close(int fd);
 int  nova_socket_listen(int port);

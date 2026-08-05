@@ -4,6 +4,7 @@ import net.asynctls;
 import net.poller;
 import net.eventedio;
 import os.sys;
+import os.socket;
 import io.file;
 import web.request;
 import web.response;
@@ -19,6 +20,7 @@ import list;
 import map;
 import bytes;
 import assert;
+import env;
 
 // The request-dispatch mediator lives in web.mediator (MessageHandler + the async pipeline). The App
 // composes it; it no longer declares its own. `text`/`json`/`html` response helpers also live there,
@@ -220,12 +222,33 @@ pub struct App {
     }
 
     pub fn run(self: App, port: int): void {
-        // The web server runs on the Nova reactor, share-nothing across the available cores, TLS
-        // included (serveReactorConn tlsAccepts when useTls is set). No Asio: the previous NOVA_ASIO
-        // fallback is retired now that the reactor path carries the whole server (M4).
-        let workers = aio.reactorCount();
-        let n = if (workers < 1) 1 else workers;
-        self.runReactorMC(port, n);
+        // A web app is single-reactor by default: share-nothing per PROCESS. The reactor runs INLINE on
+        // this (the calling) thread, so the App and its DI provider never cross a thread boundary, which
+        // is what keeps per-request service resolution correct. TLS is included (serveReactorConn
+        // tlsAccepts when useTls is set). No Asio: the reactor path carries the whole server (M4).
+        //
+        // To use more cores, run more INSTANCES of the binary (each with its own NOVA_PORT) behind proxyd
+        // and let the orchestrator manage the replicas -- see the deployment guide. That is the supported
+        // scaling model. In-process multi-reactor is still available as an explicit opt-in via
+        // NOVA_WEB_WORKERS>1 (share-nothing per worker; the App config is read-only during serving), but
+        // it is not the default.
+        self.serverPort = port;
+        // fd-passing handoff mode: when NOVA_HANDOFF_SOCK names proxyd's AF_UNIX rendezvous, this app
+        // does NOT bind a TCP port. Instead it connects to proxyd and serves client SOCKETS that proxyd
+        // hands over (SCM_RIGHTS), replying to each client directly. proxyd is then out of the data path.
+        // Single-reactor as always; the received fds are served with the identical request pipeline.
+        let handoff = env.get("NOVA_HANDOFF_SOCK");
+        if (!string.eql(handoff, "")) {
+            reactorHandoffBody(self, handoff);
+            return;
+        }
+        let requested = env.get("NOVA_WEB_WORKERS");
+        let n = if (string.eql(requested, "")) 1 else (string.parseI64(requested) as int);
+        if (n <= 1) {
+            reactorWorkerBody(self, 0);
+        } else {
+            self.runReactorMC(port, n);
+        }
     }
 }
 
@@ -402,6 +425,56 @@ fn reactorWorkerBody(app: App, idx: int): void {
     poller.setCurrent(r.kq);
     coroStart(reactorAcceptLoop(app, lfd, r.kq));
 
+    while (true) {
+        let n = r.pollComplete(-1);
+        poller.batchBegin();
+        let i = 0;
+        while (i < n) {
+            nova_reactor_resume(r.completedToken(i));
+            i = i + 1;
+        }
+    }
+}
+
+// fd-passing handoff receiver: instead of accepting TCP, receive client SOCKETS that proxyd hands over
+// its AF_UNIX control channel (SCM_RIGHTS), and serve each on this reactor with the identical request
+// pipeline (serveReactorConn). The app replies to each client DIRECTLY, so proxyd never sees the
+// response. Each received fd becomes its own coroutine, exactly like an accepted connection.
+async fn handoffRecvLoop(app: App, ctrlFd: int, kq: int): void {
+    while (true) {
+        // recvFdOp waits for readability on the reactor and recvmsg's ONE handed-off client fd (or -1 if
+        // proxyd closed the channel). Each received fd becomes its own serve coroutine, exactly like an
+        // accepted connection; the app reads the request off it and replies directly to the client.
+        let clientFd = await eventedio.recvFdOp(ctrlFd, kq);
+        if (clientFd < 0) { console.log("Nova web: proxyd handoff channel closed"); return; }
+        socket.setNonBlock(clientFd);
+        coroStart(serveReactorConn(app, clientFd, kq));
+    }
+}
+
+// Single-reactor handoff receiver body: connect to proxyd's rendezvous (retrying, as proxyd may still
+// be starting), then drive the reactor forever serving handed-off connections. Mirrors reactorWorkerBody
+// but with a handoff receive loop in place of the TCP accept loop.
+fn reactorHandoffBody(app: App, sockPath: string): void {
+    let ua = socket.makeSockaddrUn(sockPath);
+    let ctrl = socket.newUnix();
+    let ok = -1;
+    let tries = 0;
+    while (tries < 2000000) {
+        ok = socket.connectSock(ctrl, ua, socket.sockaddrUnLen());
+        if (ok == 0) { break; }
+        socket.close(ctrl);
+        ctrl = socket.newUnix();
+        tries = tries + 1;
+    }
+    bytes.free(ua);
+    if (ok != 0) { console.log("Nova web: could not reach proxyd handoff socket " + sockPath); return; }
+    socket.setNonBlock(ctrl);
+
+    let r = poller.Reactor(1024, 16384, 1024);
+    poller.setCurrent(r.kq);
+    coroStart(handoffRecvLoop(app, ctrl, r.kq));
+    console.log("Nova web server listening (fd-handoff receiver on " + sockPath + ")");
     while (true) {
         let n = r.pollComplete(-1);
         poller.batchBegin();

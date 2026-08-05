@@ -29,6 +29,10 @@ pub const OP_RECV: int = 0;
 pub const OP_SEND: int = 1;
 pub const OP_ACCEPT: int = 2;
 pub const OP_CONNECT: int = 3;
+// OP_RECVFD (fd-passing handoff receive) is POSIX-only; on IOCP it is unsupported. The const exists so
+// the shared eventedio.recvFdOp compiles on Windows; submitting it fails (issue() has no branch), so the
+// handoff receiver returns -1 and the app simply does not offer fd-passing on Windows.
+pub const OP_RECVFD: int = 6;
 
 // In-flight op record. Prefixed by an OVERLAPPED so the completion's lpOverlapped == op addr.
 //   [0..32) OVERLAPPED (zeroed per submit)

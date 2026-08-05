@@ -221,6 +221,25 @@ pub struct ReactorStream {
     }
 }
 
+// Receive ONE handed-off fd on the reactor via the OP_RECVFD completion op: the loop recvmsg's a single
+// SCM_RIGHTS fd when the control socket is readable and reports it as the op result. Returns the received
+// client fd (>=0) to serve, or -1 when the control channel closed / errored. This is the fd-passing
+// handoff receiver primitive: it cannot use recvInto (a plain recv() would read the payload byte and DROP
+// the ancillary fd); it must go through recvmsg, which OP_RECVFD does. The 8-byte scratch lives on this
+// coroutine's frame, so it outlives the op. One fd per call; the caller loops (like accept).
+pub async fn recvFdOp(ctrlFd: int, kq: int): int {
+    let scratch: long = bytes.alloc(8);
+    let op = nova_op_alloc(eventloop.OP_SIZE as long);
+    eventloop.makeOp(op, eventloop.OP_RECVFD, ctrlFd, scratch, 8, currentCoro());
+    if (eventloop.submit(kq, op) != 0) { nova_op_free(op); bytes.free(scratch); return -1; }
+    coroSuspend();
+    while (eventloop.opDone(op) != 1) { coroSuspend(); }   // see recvInto: done is the only completion signal
+    let r = eventloop.opResult(op);
+    nova_op_free(op);
+    bytes.free(scratch);
+    return r;
+}
+
 // Connect to a numeric IPv4 host and port on the reactor. The non-blocking connect returns
 // EINPROGRESS(); we await writability, then read SO_ERROR to confirm. Returns a ReactorStream whose
 // fd is -1 on failure.
