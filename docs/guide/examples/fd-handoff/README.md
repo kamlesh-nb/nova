@@ -1,7 +1,7 @@
 # Fire-and-forget proxy prototype: fd-passing connection handoff
 
 This is a prototype of a proxy design where the proxy gets **out of the response path**. Instead of
-reading the request, dialling a backend, and shuttling every byte both ways (the shape `proxyd` uses
+reading the request, dialling a backend, and shuttling every byte both ways (the shape `service` uses
 today), the proxy hands the client's **socket** to the app process, and the app writes the response
 straight to the client. The proxy never sees the response.
 
@@ -42,24 +42,24 @@ than raw FFI), surfaced in Nova as `os.socket.sendFd` / `os.socket.recvFd` plus 
 helpers (`newUnix`, `unixPair`, `makeSockaddrUn`). POSIX only for now: Windows fd-passing needs
 `WSADuplicateSocket` and a different protocol.
 
-## The same handoff wired into the real proxyd + web app
+## The same handoff wired into the real service + web app
 
 `router.nova` / `worker.nova` are the minimal illustration. The real thing is now wired into the
-production pieces and is exercised by `run-proxyd.sh`:
+production pieces and is exercised by `run-service.sh`:
 
-- **proxyd** gains a handoff mode: set `NOVA_HANDOFF_SOCK` and it binds a TCP front port plus that
+- **service** gains a handoff mode: set `NOVA_HANDOFF_SOCK` and it binds a TCP front port plus that
   `AF_UNIX` rendezvous, and hands each accepted client socket to a backend app round-robin instead of
   forwarding bytes (`proxy.serveHandoffOnReactor`). It does not parse HTTP or copy responses, so this
   is effectively an L4 accept-and-pass. The keep-alive backend pool is not used in this mode (the proxy
   holds no backend TCP connections at all).
 - **the web app** gains a handoff receiver: set `NOVA_HANDOFF_SOCK` and `app.run` connects to the
-  rendezvous and serves the sockets proxyd hands it, on its reactor, with the identical request
+  rendezvous and serves the sockets service hands it, on its reactor, with the identical request
   pipeline (`reactorHandoffBody` + the reactor's new `OP_RECVFD` op).
 
 Run it:
 
 ```sh
-./run-proxyd.sh
+./run-service.sh
 ```
 
 ### Measured (single 8-core dev box, load generator co-resident)
@@ -81,5 +81,5 @@ The proxy no longer sees responses, so **edge gzip, response-header rewriting, r
 (which actually lowers the tail latency in the classic path), and **per-request load balancing across a
 keep-alive connection** all move to the app or are given up. Selection is per-connection round-robin,
 not path-based. And it is a **same-host** technique (fd-passing cannot cross a kernel), which fits the
-common orchd topology where `proxyd` and the app replicas are co-resident on a node. On Linux it runs
+common orchd topology where `service` and the app replicas are co-resident on a node. On Linux it runs
 on the epoll backend; io_uring and Windows do not support the handoff op (they degrade to "no handoff").

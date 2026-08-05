@@ -1,29 +1,29 @@
 #!/usr/bin/env bash
-# Integrated fd-passing handoff: the REAL proxyd + the REAL web app, both in handoff mode.
+# Integrated fd-passing handoff: the REAL service + the REAL web app, both in handoff mode.
 #
-# proxyd (NOVA_HANDOFF_SOCK set) binds a TCP front port and an AF_UNIX rendezvous, and hands each
+# service (NOVA_HANDOFF_SOCK set) binds a TCP front port and an AF_UNIX rendezvous, and hands each
 # accepted client SOCKET to a backend app over the rendezvous (SCM_RIGHTS). Each app (NOVA_HANDOFF_SOCK
 # set) connects to the rendezvous and serves handed-off sockets on its reactor, replying to the client
-# directly. proxyd is out of the data path: it does not parse HTTP or copy response bytes.
+# directly. service is out of the data path: it does not parse HTTP or copy response bytes.
 #
-# Contrast with the classic mode (no NOVA_HANDOFF_SOCK): proxyd reads the request, forwards it to a
+# Contrast with the classic mode (no NOVA_HANDOFF_SOCK): service reads the request, forwards it to a
 # backend over a pooled TCP connection, and streams the response back (in the data path).
 set -u
 export PATH="$HOME/.nova/bin:$PATH"
 REPO=/Users/kamlesh/nova-lang
-PROXYD="$REPO/packages/nova-orchestrator/build/debug/bin/proxyd"
+SVC="$REPO/packages/nova-orchestrator/build/debug/bin/service"
 APP="$REPO/lang/docs/guide/examples/webapp/build/debug/bin/webapp"
-SOCK=/tmp/nova_proxyd_handoff.sock
+SOCK=/tmp/nova_service_handoff.sock
 
-cleanup(){ pkill -9 -x proxyd 2>/dev/null; pkill -9 -x webapp 2>/dev/null; rm -f "$SOCK"; }
+cleanup(){ pkill -9 -x service 2>/dev/null; pkill -9 -x webapp 2>/dev/null; rm -f "$SOCK"; }
 trap cleanup EXIT
 cleanup; sleep 0.3
 
-[ -x "$PROXYD" ] || { echo "build proxyd first: (cd packages/nova-orchestrator && ./build.sh)"; exit 1; }
+[ -x "$SVC" ] || { echo "build service first: (cd packages/nova-orchestrator && ./build.sh)"; exit 1; }
 [ -x "$APP" ]    || { echo "build the app first: (cd lang/docs/guide/examples/webapp && nova build)"; exit 1; }
 
-echo "starting proxyd (fd-handoff, TCP :8095, rendezvous $SOCK) ..."
-NOVA_HANDOFF_SOCK="$SOCK" NOVA_PORT=8095 PROXYD_CONFIG="$REPO/packages/nova-orchestrator/proxyd.json" "$PROXYD" & sleep 1
+echo "starting service (fd-handoff, TCP :8095, rendezvous $SOCK) ..."
+NOVA_HANDOFF_SOCK="$SOCK" NOVA_PORT=8095 SERVICE_CONFIG="$REPO/packages/nova-orchestrator/service.json" "$SVC" & sleep 1
 echo "starting two apps in handoff mode ..."
 NOVA_HANDOFF_SOCK="$SOCK" "$APP" &
 NOVA_HANDOFF_SOCK="$SOCK" "$APP" &

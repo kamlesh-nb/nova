@@ -7,7 +7,7 @@ Kubernetes control-plane / data-plane split:
 
 | Binary    | Plane        | Job |
 |-----------|--------------|-----|
-| `proxyd`  | data plane   | An L7 reverse proxy and load balancer in front of your app replicas. |
+| `service`  | data plane   | An L7 reverse proxy and load balancer in front of your app replicas. |
 | `orchd`   | control plane| The node agent: reconciles desired vs actual replicas, runs health probes, publishes service discovery, writes metrics. |
 | `orchctl` | operations   | An offline CLI over the config store: inspect it, manage cluster membership, print a rolling-upgrade plan. |
 
@@ -17,22 +17,22 @@ references. `examples/run-live.sh` runs everything below against the real binari
 ## The shape of a deployment
 
 ```
-                        proxyd  (:8090, round-robin, health checks)
+                        service  (:8090, round-robin, health checks)
                         /     \
         app replica A (:8080)  app replica B (:8081)     <- your NovaDB-backed web app
                         \     /
                          NovaDB (:3009)                  <- app data AND orchestrator config
                            ^
-                         orchd  (reconciles replicas, writes the discovery file proxyd reads)
+                         orchd  (reconciles replicas, writes the discovery file service reads)
 ```
 
 The same NovaDB instance holds two things: your application data (the `products` table) and the
 orchestrator's own configuration store (cluster membership, workload definitions). That is why the
 config store speaks the `novadb://` connection string you met in Chapter 18.
 
-## proxyd: the data plane
+## service: the data plane
 
-`proxyd` reads a JSON config and load-balances across a set of backends. The minimal config:
+`service` reads a JSON config and load-balances across a set of backends. The minimal config:
 
 ```json
 {
@@ -46,23 +46,23 @@ config store speaks the `novadb://` connection string you met in Chapter 18.
 Run it, or lint the config without serving:
 
 ```sh
-proxyd proxyd.json --check     # validate, print backend count + strategy, exit
-proxyd proxyd.json             # serve; NOVA_PORT overrides listenPort
+service service.json --check     # validate, print backend count + strategy, exit
+service service.json             # serve; NOVA_PORT overrides listenPort
 ```
 
 Strategies are `roundrobin`, `weighted`, `leastconn`, and `consistenthash`. Active health checks poll
 `healthPath`; a backend is taken out after `fall` consecutive failures and returned after `rise`
-successes. `proxyd` refuses to start with zero live backends, so a misconfigured pool fails loudly
+successes. `service` refuses to start with zero live backends, so a misconfigured pool fails loudly
 instead of silently black-holing traffic.
 
 Your app already supports running many replicas on one host: `main_novadb.nova` honours `NOVA_PORT`, so
-`NOVA_PORT=8080 ./webapp` and `NOVA_PORT=8081 ./webapp` give you two replicas for proxyd to balance.
+`NOVA_PORT=8080 ./webapp` and `NOVA_PORT=8081 ./webapp` give you two replicas for service to balance.
 
 ## orchd: the control plane
 
-Where `proxyd` moves traffic, `orchd` keeps the replicas alive. It watches a manifest directory and
+Where `service` moves traffic, `orchd` keeps the replicas alive. It watches a manifest directory and
 reconciles the actual set of running replicas against the desired count on a fixed loop, runs async
-health probes, and, when configured, publishes a service-discovery file that `proxyd` reads instead of a
+health probes, and, when configured, publishes a service-discovery file that `service` reads instead of a
 static backend list, and writes a Prometheus metrics file with crash-loop alerts.
 
 ```json
@@ -80,9 +80,9 @@ orchd orchd.json               # run the reconcile loop
 
 The `store` block is turned into a NovaDB connection string by the orchestrator's `storeConnectionString`
 helper, which produces exactly the `novadb://user:password@host:port?db=...&tls=...` URL the driver
-parses. With `discoveryFile` set, orchd writes lines like `web=127.0.0.1:8080,127.0.0.1:8081`; a `proxyd`
+parses. With `discoveryFile` set, orchd writes lines like `web=127.0.0.1:8080,127.0.0.1:8081`; a `service`
 configured with `discoveryService: "web"` then load-balances across whatever replicas orchd currently
-has healthy, so scaling up or losing a replica reshapes the pool without editing proxyd's config.
+has healthy, so scaling up or losing a replica reshapes the pool without editing service's config.
 
 ## orchctl: operating the config store
 
@@ -105,7 +105,7 @@ leader-lease and fencing details behind high availability, are in `packages/nova
 
 `examples/run-live.sh` puts it together end to end: it starts NovaDB, builds and starts two replicas of
 the NovaDB-backed web app on 8080 and 8081, exercises the app directly (a write through to NovaDB and a
-read back), then starts `proxyd` on 8090 and curls the app through the proxy three times so you can see
+read back), then starts `service` on 8090 and curls the app through the proxy three times so you can see
 the round-robin. It finishes with `orchctl` inspecting a seeded config-store dump and printing an upgrade
 plan. Run it from `lang/docs/guide/examples/`:
 
@@ -116,16 +116,16 @@ plan. Run it from `lang/docs/guide/examples/`:
 It builds what it needs (the NovaDB server, the app, the orchestrator binaries) and cleans up every
 process on exit.
 
-> **Note.** `proxyd` runs on the reactor-native socket path (the same one the web server uses): it
+> **Note.** `service` runs on the reactor-native socket path (the same one the web server uses): it
 > binds, accepts, forwards to a backend, and streams the response back, load-balancing across the
 > replicas. It keeps a **keep-alive pool of backend connections** (per reactor) and reuses a warm one
 > per request instead of a fresh TCP handshake, which is the main throughput lever; health probes share
-> the same pool. To use more cores, run N single-reactor `proxyd` instances behind SO_REUSEPORT.
+> the same pool. To use more cores, run N single-reactor `service` instances behind SO_REUSEPORT.
 
 ## Health, metrics, and upgrades in production
 
 - **Health.** `orchd` exposes liveness and readiness (`/healthz`, `/readyz`) and a Prometheus
-  `/metrics` surface with alert lines for crash loops. `proxyd`'s own health checks decide which
+  `/metrics` surface with alert lines for crash loops. `service`'s own health checks decide which
   backends receive traffic.
 - **Rolling upgrade.** Drain, promote a standby if the node was the leader, upgrade, rejoin, with
   rollback if a step fails. `orchctl upgrade-plan` gives you the order.

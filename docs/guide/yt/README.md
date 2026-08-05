@@ -42,7 +42,7 @@ The timestamps are a guide, not a rule. Speak at your own pace and adjust.
 | 16 | [Serialization](16-serialization.md) | JSON serde, `@serializable` |
 | 17 | [Web](17-web.md) | The `nova init web` template and the mediator pipeline |
 | 18 | [Data access and NovaDB](18-data-access.md) | The `db` seam, the drivers, connection strings, the micro-ORM, backing the web app with NovaDB |
-| 21 | [Deploying with the orchestrator](21-deploying-with-the-orchestrator.md) | `proxyd`/`orchd`/`orchctl`, load-balanced replicas, the config store on NovaDB |
+| 21 | [Deploying with the orchestrator](21-deploying-with-the-orchestrator.md) | `service`/`orchd`/`orchctl`, load-balanced replicas, the config store on NovaDB |
 
 ## Suggested recording order
 

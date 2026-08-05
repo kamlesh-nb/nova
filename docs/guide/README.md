@@ -41,7 +41,7 @@ functions run with `nova test <file>.nova`.
 | 18 | [Data access & NovaDB](18-data-access.md) | the `db` seam, the drivers, connection strings, the micro-ORM, backing the web app with NovaDB |
 | 19 | [How Nova works: architecture](19-architecture.md) | the compiler pipeline, ARC memory, the concurrency engine, self-contained delivery |
 | 20 | [Building & distributing](20-building-and-distribution.md) | `nova build`, cross-compiling programs, packaging toolchain bundles + checksums |
-| 21 | [Deploying with the orchestrator](21-deploying-with-the-orchestrator.md) | `proxyd`/`orchd`/`orchctl`, load-balanced replicas, the config store on NovaDB |
+| 21 | [Deploying with the orchestrator](21-deploying-with-the-orchestrator.md) | `service`/`orchd`/`orchctl`, load-balanced replicas, the config store on NovaDB |
 
 > **Version:** tracks `nova version` (Beta 0.1.0). Syntax may still change per
 > [`../STABILITY.md`](../STABILITY.md).

@@ -426,7 +426,7 @@ its products in memory; the next chapter points it at a real database. Good next
 - [Chapter 18, Data access and NovaDB](18-data-access.md): the `db` seam and the drivers, and how to
   move this exact web app onto a live NovaDB by changing one file.
 - [Chapter 21, Deploying with the orchestrator](21-deploying-with-the-orchestrator.md): run the app as
-  load-balanced replicas behind `proxyd`, supervised by `orchd`.
+  load-balanced replicas behind `service`, supervised by `orchd`.
 - The standard library packages. The database drivers (`nova-postgres`, `nova-mysql`, `nova-mssql`,
   `nova-mongodb`, `nova-novadb`) plug into the same app through repositories. See
   [`../packages.md`](../packages.md).

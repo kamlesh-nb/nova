@@ -55,7 +55,7 @@ fn buildApp(): App {
 
 fn main(): void {
     // Port defaults to 8080 but honours NOVA_PORT, so the orchestrator can run several replicas of this
-    // same binary on one host (each on its own port) and load-balance across them through proxyd.
+    // same binary on one host (each on its own port) and load-balance across them through the service load balancer.
     let port = 8080;
     let pe = env.get("NOVA_PORT");
     if (!string.eql(pe, "")) { port = string.parseI64(pe) as int; }

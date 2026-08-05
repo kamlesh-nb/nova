@@ -204,7 +204,7 @@ which is the subject of Chapter 21.
 ## Where to go next
 
 - Chapter 17 for the web framework the repository plugs into.
-- Chapter 21 for deploying this NovaDB-backed app under the orchestrator (proxyd, orchd, orchctl).
+- Chapter 21 for deploying this NovaDB-backed app under the orchestrator (service, orchd, orchctl).
 - Chapter 16 for `@serializable`, which powers both JSON responses and the ORM binder.
 - The database driver packages (`nova-postgres`, `nova-mysql`, `nova-mssql`, `nova-mongodb`,
   `nova-novadb`) for the connection-string options each one accepts.

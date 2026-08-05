@@ -13,7 +13,7 @@ import novadb;
 // method routes through it.
 //
 // This holds a single connection, so requests to one instance are serialised. That is fine here: the
-// orchestrator runs several instances behind proxyd (Chapter 21), and each has its own connection. For
+// orchestrator runs several instances behind the service load balancer (Chapter 21), and each has its own connection. For
 // many connections per instance, swap this for the `pool` module's `Pool` (acquire/release per call);
 // the trade-off is that a multi-statement transaction must pin one pooled connection.
 pub struct NovaDbConnection impl Connection, Service {

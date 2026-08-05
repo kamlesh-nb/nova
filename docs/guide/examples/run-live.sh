@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end live demonstration: the guide web app, backed by a real NovaDB, then put behind the
-# orchestrator (proxyd load-balancing two replicas, orchctl operating the config store).
+# orchestrator (service load-balancing two replicas, orchctl operating the config store).
 #
 # This is NOT part of the offline gate (run_all.sh) because it needs a running NovaDB server. It builds
 # what it needs from the monorepo and cleans up after itself. Run it from anywhere:
@@ -81,12 +81,12 @@ note "GET /api/products/1  (read; served from NovaDB)"
 curl -s http://127.0.0.1:8080/api/products/1 ; echo
 
 # ---------------------------------------------------------------------------------------------------
-say "4/5  put the app behind proxyd (data plane, load-balancing the two replicas)"
+say "4/5  put the app behind service (data plane, load-balancing the two replicas)"
 ( cd "$ORCH" && ./build.sh ) >"$WORK/orch-build.log" 2>&1 || { note "orchestrator build failed"; exit 1; }
-PROXYD="$ORCH/build/debug/bin/proxyd"
+SVC="$ORCH/build/debug/bin/service"
 ORCHCTL="$ORCH/build/debug/bin/orchctl"
 
-cat > "$WORK/proxyd.json" <<'JSON'
+cat > "$WORK/service.json" <<'JSON'
 {
   "listenHost": "", "listenPort": 8090, "strategy": "roundrobin",
   "health": { "enabled": true, "path": "/", "intervalMs": 2000, "timeoutMs": 1000, "rise": 1, "fall": 3 },
@@ -94,13 +94,13 @@ cat > "$WORK/proxyd.json" <<'JSON'
                 { "host": "127.0.0.1", "port": 8081, "weight": 1 } ]
 }
 JSON
-"$PROXYD" "$WORK/proxyd.json" --check || { note "proxyd config invalid"; exit 1; }
-"$PROXYD" "$WORK/proxyd.json" >"$WORK/proxyd.log" 2>&1 & PIDS+=($!)
-if wait_port 127.0.0.1 8090 "proxyd"; then
-  note "GET through proxyd on :8090 three times (round-robins across the two replicas)"
+"$SVC" "$WORK/service.json" --check || { note "service config invalid"; exit 1; }
+"$SVC" "$WORK/service.json" >"$WORK/service.log" 2>&1 & PIDS+=($!)
+if wait_port 127.0.0.1 8090 "service"; then
+  note "GET through service on :8090 three times (round-robins across the two replicas)"
   for _ in 1 2 3; do curl -s http://127.0.0.1:8090/api/products/1 ; echo; done
 else
-  note "NOTE: proxyd did not bind (is the port free?)."
+  note "NOTE: service did not bind (is the port free?)."
 fi
 
 # ---------------------------------------------------------------------------------------------------
@@ -116,5 +116,5 @@ printf 'workloads/web\treplicas=2\n'       >> "$WORK/store.dump"
 "$ORCHCTL" upgrade-plan "$WORK/store.dump"
 
 say "done  (in production, orchd would supervise the replicas, persist membership/workloads to NovaDB via"
-note "storeConnectionString's novadb:// URL, and write the discovery file proxyd reads instead of static"
+note "storeConnectionString's novadb:// URL, and write the discovery file service reads instead of static"
 note "backends. See lang/docs/guide/21-deploying-with-the-orchestrator.md.)"
