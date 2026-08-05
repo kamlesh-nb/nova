@@ -97,11 +97,12 @@ if [[ "${1:-}" == "--asan" ]]; then ASAN_MODE=1; shift; fi
 # cannot. This is the gate for the self-hosted runtime work — any race becomes a located
 # report naming both accesses. Requires: NOVA_TSAN=1 zig build first.
 if [[ "${1:-}" == "--tsan" ]]; then TSAN_MODE=1; shift; fi
-# -j [N] / --parallel [N] : run the plain positive corpus N-way parallel (default: cores-1). Each case
-# runs in its own temp dir so the hardcoded __nova_test output cannot collide, with packages/ symlinked
-# in so driver-importing cases still resolve; server cases use ephemeral ports so they parallelise
-# cleanly. Applies ONLY to the default `nova test` run — the sanitizer/wasm/arc modes stay sequential
-# (baseline-gated, order-sensitive). The default (no -j) path is unchanged.
+# -j [N] / --parallel [N] : run the positive corpus N-way parallel (default: cores-1). Each case runs
+# in its own temp dir so the hardcoded __nova_test output cannot collide, with packages/ symlinked in so
+# driver-importing cases still resolve; server cases use ephemeral ports so they parallelise cleanly.
+# Applies to the default `nova test` run AND to `--asan` (which gains per-case temp-dir isolation + a
+# per-case timeout, so it no longer wedges on a server case that waits on a socket). The wasm/arc/tsan
+# modes stay sequential (baseline-gated, order-sensitive). The default (no -j) path is unchanged.
 PARALLEL=0
 if [[ "${1:-}" == "-j" || "${1:-}" == "--parallel" ]]; then
   shift
@@ -170,6 +171,9 @@ else
 for f in "$HERE"/cases/*.nova; do
   name="$(basename "$f")"
   [[ -n "$FILTER" && "$name" != *"$FILTER"* ]] && continue
+  # ASAN mode has its own dedicated gate below (each case is run under NOVA_ASAN=1 there); skip the
+  # redundant plain run so `--asan` is a focused gate like `--wasm`/`--tsan`, not a double run.
+  [[ $ASAN_MODE -eq 1 ]] && continue
   if [[ $WASM_MODE -eq 1 ]]; then
     base="$HERE/cases/$name"
     wout="$(mktemp -t novawasm.XXXXXX)"; wout="$wout.wasm"
@@ -356,6 +360,44 @@ if [[ $ASAN_MODE -eq 1 ]]; then
     echo "  ERROR: libnovacore_asan.a missing — run: NOVA_ASAN=1 zig build" >&2
     exit 2
   fi
+  if [[ $PARALLEL -gt 0 ]]; then
+    # ---- parallel ASAN (opt-in: --asan -j) ----------------------------------------------------
+    # The same per-case temp-dir isolation + timeout the plain -j path uses, with NOVA_ASAN=1. The
+    # sequential loop below has NO per-case timeout, so ONE server/reactor case that waits on a socket
+    # wedges the entire gate (it hangs with no output). Running each case in its own temp dir (so the
+    # hardcoded __nova_test output cannot collide) under a per-case timeout makes ASAN safe to
+    # parallelise across cores-1 workers — the full gate then completes in minutes instead of hanging.
+    ROOT="$(cd "$HERE/.." && pwd)"
+    export NOVA ROOT CASE_TIMEOUT
+    echo "--- parallel: ${PARALLEL} workers (per-case temp dir; packages symlinked; NOVA_ASAN=1) ---"
+    _averd="$(mktemp)"; _aworker="$(mktemp)"
+    cat > "$_aworker" <<'AWORKER'
+f="$1"; name="$(basename "$f" .nova)"; wd="$(mktemp -d)"
+ln -s "$ROOT/packages" "$wd/packages" 2>/dev/null
+cd "$wd" || exit 0
+if command -v timeout >/dev/null 2>&1; then out="$(NOVA_ASAN=1 timeout -k 5 "$CASE_TIMEOUT" "$NOVA" test "$f" 2>&1)"
+elif command -v gtimeout >/dev/null 2>&1; then out="$(NOVA_ASAN=1 gtimeout -k 5 "$CASE_TIMEOUT" "$NOVA" test "$f" 2>&1)"
+else out="$(NOVA_ASAN=1 perl -e "alarm $CASE_TIMEOUT; exec @ARGV" "$NOVA" test "$f" 2>&1)"; fi
+cd / ; rm -rf "$wd"
+if printf '%s' "$out" | grep -q "ERROR: AddressSanitizer"; then
+  kind="$(printf '%s' "$out" | grep -m1 -oE 'AddressSanitizer: [a-z-]+' | sed 's/AddressSanitizer: //')"
+  printf 'FAIL\t%s\tasan-%s\n' "$name" "${kind:-error}"
+elif printf '%s' "$out" | grep -qE '^Results:.*0 failed'; then printf 'PASS\t%s\t(asan clean)\n' "$name"
+else printf 'FAIL\t%s\tasan-run\n' "$name"; fi
+AWORKER
+    # Longest-first (heavy stdlib graph first), same scheduling as the plain -j path.
+    for f in "$HERE"/cases/*.nova; do
+      n="$(basename "$f")"; [[ -n "$FILTER" && "$n" != *"$FILTER"* ]] && continue
+      if grep -qE '^[[:space:]]*import[[:space:]]+(web|net|reactor|flagship|asynctls|tls|crypto|data)\b' "$f" 2>/dev/null; then
+        printf '0\t%s\n' "$f"; else printf '1\t%s\n' "$f"; fi
+    done | sort | cut -f2- | xargs -P "$PARALLEL" -n1 bash "$_aworker" >> "$_averd"
+    rm -f "$_aworker"
+    while IFS="$(printf '\t')" read -r v nm info; do
+      if [[ "$v" == "PASS" ]]; then printf "  \033[32mPASS\033[0m  %-32s %s\n" "$nm" "$info"; pass=$((pass+1))
+      else printf "  \033[31mFAIL\033[0m  %-32s \033[31m%s\033[0m\n" "$nm" "$info"; fail=$((fail+1)); failed_cases+=("$nm:$info"); fi
+    done < <(sort "$_averd")
+    rm -f "$_averd"
+  else
   for f in "$HERE"/cases/*.nova; do
     name="$(basename "$f" .nova)"
     [[ -n "$FILTER" && "$name" != *"$FILTER"* ]] && continue
@@ -374,6 +416,7 @@ if [[ $ASAN_MODE -eq 1 ]]; then
       fail=$((fail+1)); failed_cases+=("$name:asan-run")
     fi
   done
+  fi
 fi
 
 # ThreadSanitizer gate (opt-in: NOVA_TSAN=1 zig build && ./run.sh --tsan)
