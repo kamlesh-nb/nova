@@ -1098,30 +1098,55 @@ fn generateMediatorDispatch(allocator: std.mem.Allocator, declarations: *std.Arr
             }
             const handler_ctor = ctor_buf.items;
 
+            // Raw-response escape hatch: a handler whose success type IS `Response` returns it verbatim
+            // (its own status + Content-Type, e.g. text/html or text/event-stream from mediator.html/sse),
+            // instead of the framework JSON-serialising a DTO. Detected by the response type name.
+            const raw_ok = std.mem.endsWith(u8, r_ok, "Response");
             if (r_err != null) {
                 // ok helper returns `Response | E`, so `try` short-circuits the error out of it; the
                 // dispatch then maps that error to a Response via its `toResponse()`.
-                try serdeAppendf(&src, allocator,
-                    "async fn __mediator_ok_{s}(src: ValueSource, __provider: ServiceProvider): Response | {s} {{\n" ++
-                        "    let __h = {s};\n" ++
-                        "    let __req = {s}__bind(src);\n" ++
-                        "    let __r = try {s}__h.handle(__req);\n" ++
-                        "    let __resp = Response(Status.Ok, {s}__toJson(__r));\n" ++
-                        "    __resp.setHeader(\"Content-Type\", \"application/json\");\n" ++
-                        "    return __resp;\n" ++
-                        "}}\n" ++
-                        "async fn __mediator_dispatch_{s}(src: ValueSource, __provider: ServiceProvider): Response {{\n" ++
-                        "    return await __mediator_ok_{s}(src, __provider) catch (__e) __e.toResponse();\n" ++
-                        "}}\n\n", .{ q, r_err.?, handler_ctor, q, await_kw, r_ok, q, q });
+                if (raw_ok) {
+                    try serdeAppendf(&src, allocator,
+                        "async fn __mediator_ok_{s}(src: ValueSource, __provider: ServiceProvider): Response | {s} {{\n" ++
+                            "    let __h = {s};\n" ++
+                            "    let __req = {s}__bind(src);\n" ++
+                            "    return try {s}__h.handle(__req);\n" ++
+                            "}}\n" ++
+                            "async fn __mediator_dispatch_{s}(src: ValueSource, __provider: ServiceProvider): Response {{\n" ++
+                            "    return await __mediator_ok_{s}(src, __provider) catch (__e) __e.toResponse();\n" ++
+                            "}}\n\n", .{ q, r_err.?, handler_ctor, q, await_kw, q, q });
+                } else {
+                    try serdeAppendf(&src, allocator,
+                        "async fn __mediator_ok_{s}(src: ValueSource, __provider: ServiceProvider): Response | {s} {{\n" ++
+                            "    let __h = {s};\n" ++
+                            "    let __req = {s}__bind(src);\n" ++
+                            "    let __r = try {s}__h.handle(__req);\n" ++
+                            "    let __resp = Response(Status.Ok, {s}__toJson(__r));\n" ++
+                            "    __resp.setHeader(\"Content-Type\", \"application/json\");\n" ++
+                            "    return __resp;\n" ++
+                            "}}\n" ++
+                            "async fn __mediator_dispatch_{s}(src: ValueSource, __provider: ServiceProvider): Response {{\n" ++
+                            "    return await __mediator_ok_{s}(src, __provider) catch (__e) __e.toResponse();\n" ++
+                            "}}\n\n", .{ q, r_err.?, handler_ctor, q, await_kw, r_ok, q, q });
+                }
             } else {
-                try serdeAppendf(&src, allocator,
-                    "async fn __mediator_dispatch_{s}(src: ValueSource, __provider: ServiceProvider): Response {{\n" ++
-                        "    let __h = {s};\n" ++
-                        "    let __req = {s}__bind(src);\n" ++
-                        "    let __resp = Response(Status.Ok, {s}__toJson({s}__h.handle(__req)));\n" ++
-                        "    __resp.setHeader(\"Content-Type\", \"application/json\");\n" ++
-                        "    return __resp;\n" ++
-                        "}}\n\n", .{ q, handler_ctor, q, r_ok, await_kw });
+                if (raw_ok) {
+                    try serdeAppendf(&src, allocator,
+                        "async fn __mediator_dispatch_{s}(src: ValueSource, __provider: ServiceProvider): Response {{\n" ++
+                            "    let __h = {s};\n" ++
+                            "    let __req = {s}__bind(src);\n" ++
+                            "    return {s}__h.handle(__req);\n" ++
+                            "}}\n\n", .{ q, handler_ctor, q, await_kw });
+                } else {
+                    try serdeAppendf(&src, allocator,
+                        "async fn __mediator_dispatch_{s}(src: ValueSource, __provider: ServiceProvider): Response {{\n" ++
+                            "    let __h = {s};\n" ++
+                            "    let __req = {s}__bind(src);\n" ++
+                            "    let __resp = Response(Status.Ok, {s}__toJson({s}__h.handle(__req)));\n" ++
+                            "    __resp.setHeader(\"Content-Type\", \"application/json\");\n" ++
+                            "    return __resp;\n" ++
+                            "}}\n\n", .{ q, handler_ctor, q, r_ok, await_kw });
+                }
             }
         }
     }
@@ -1261,32 +1286,60 @@ fn generateRuntimeMediator(allocator: std.mem.Allocator, declarations: *std.Arra
             // widen at a return boundary (Nova cannot widen a generic to a trait inline).
             try serdeAppendf(&src, allocator, "fn {s}__asMessage(q: {s}): Message {{ return q; }}\n", .{ q, q });
 
+            // Raw-response escape hatch (see the runtime-dispatch site above): a `Response`-typed handler
+            // result is emitted verbatim so a handler can return HTML / SSE / any content-type.
+            const raw_ok = std.mem.endsWith(u8, r_ok, "Response");
             if (r_err != null) {
-                try serdeAppendf(&src, allocator,
-                    "async fn {s}__rok(ctx: RequestContext): Response | {s} {{\n" ++
-                        "    let __q = ctx.request as {s};\n" ++
-                        "    let __h = {s};\n" ++
-                        "    let __r = try {s}__h.handle(__q);\n" ++
-                        "    let __resp = Response(Status.Ok, {s}__toJson(__r));\n" ++
-                        "    __resp.setHeader(\"Content-Type\", \"application/json\");\n" ++
-                        "    return __resp;\n" ++
-                        "}}\n" ++
-                        "struct {s}__Adapter impl HandlerAdapter {{\n" ++
-                        "    async fn execute(self: {s}__Adapter, ctx: RequestContext): Response {{\n" ++
-                        "        return await {s}__rok(ctx) catch (__e) __e.toResponse();\n" ++
-                        "    }}\n" ++
-                        "}}\n\n", .{ q, r_err.?, q, handler_ctor, await_kw, r_ok, q, q, q });
+                if (raw_ok) {
+                    try serdeAppendf(&src, allocator,
+                        "async fn {s}__rok(ctx: RequestContext): Response | {s} {{\n" ++
+                            "    let __q = ctx.request as {s};\n" ++
+                            "    let __h = {s};\n" ++
+                            "    return try {s}__h.handle(__q);\n" ++
+                            "}}\n" ++
+                            "struct {s}__Adapter impl HandlerAdapter {{\n" ++
+                            "    async fn execute(self: {s}__Adapter, ctx: RequestContext): Response {{\n" ++
+                            "        return await {s}__rok(ctx) catch (__e) __e.toResponse();\n" ++
+                            "    }}\n" ++
+                            "}}\n\n", .{ q, r_err.?, q, handler_ctor, await_kw, q, q, q });
+                } else {
+                    try serdeAppendf(&src, allocator,
+                        "async fn {s}__rok(ctx: RequestContext): Response | {s} {{\n" ++
+                            "    let __q = ctx.request as {s};\n" ++
+                            "    let __h = {s};\n" ++
+                            "    let __r = try {s}__h.handle(__q);\n" ++
+                            "    let __resp = Response(Status.Ok, {s}__toJson(__r));\n" ++
+                            "    __resp.setHeader(\"Content-Type\", \"application/json\");\n" ++
+                            "    return __resp;\n" ++
+                            "}}\n" ++
+                            "struct {s}__Adapter impl HandlerAdapter {{\n" ++
+                            "    async fn execute(self: {s}__Adapter, ctx: RequestContext): Response {{\n" ++
+                            "        return await {s}__rok(ctx) catch (__e) __e.toResponse();\n" ++
+                            "    }}\n" ++
+                            "}}\n\n", .{ q, r_err.?, q, handler_ctor, await_kw, r_ok, q, q, q });
+                }
             } else {
-                try serdeAppendf(&src, allocator,
-                    "struct {s}__Adapter impl HandlerAdapter {{\n" ++
-                        "    async fn execute(self: {s}__Adapter, ctx: RequestContext): Response {{\n" ++
-                        "        let __q = ctx.request as {s};\n" ++
-                        "        let __h = {s};\n" ++
-                        "        let __resp = Response(Status.Ok, {s}__toJson({s}__h.handle(__q)));\n" ++
-                        "        __resp.setHeader(\"Content-Type\", \"application/json\");\n" ++
-                        "        return __resp;\n" ++
-                        "    }}\n" ++
-                        "}}\n\n", .{ q, q, q, handler_ctor, r_ok, await_kw });
+                if (raw_ok) {
+                    try serdeAppendf(&src, allocator,
+                        "struct {s}__Adapter impl HandlerAdapter {{\n" ++
+                            "    async fn execute(self: {s}__Adapter, ctx: RequestContext): Response {{\n" ++
+                            "        let __q = ctx.request as {s};\n" ++
+                            "        let __h = {s};\n" ++
+                            "        return {s}__h.handle(__q);\n" ++
+                            "    }}\n" ++
+                            "}}\n\n", .{ q, q, q, handler_ctor, await_kw });
+                } else {
+                    try serdeAppendf(&src, allocator,
+                        "struct {s}__Adapter impl HandlerAdapter {{\n" ++
+                            "    async fn execute(self: {s}__Adapter, ctx: RequestContext): Response {{\n" ++
+                            "        let __q = ctx.request as {s};\n" ++
+                            "        let __h = {s};\n" ++
+                            "        let __resp = Response(Status.Ok, {s}__toJson({s}__h.handle(__q)));\n" ++
+                            "        __resp.setHeader(\"Content-Type\", \"application/json\");\n" ++
+                            "        return __resp;\n" ++
+                            "    }}\n" ++
+                            "}}\n\n", .{ q, q, q, handler_ctor, r_ok, await_kw });
+                }
             }
 
             // Record the request type's marker traits (impls that are not framework traits). A behaviour

@@ -201,3 +201,13 @@ pub fn json(body: string): response.Response {
     r.setHeader("Content-Type", "application/json");
     return r;
 }
+
+// Server-Sent Events body (text/event-stream) — the content-type Datastar patches ride on. `body` is the
+// pre-built SSE frames (e.g. from a datastar BufferSink). A handler returning this via the raw-response
+// escape hatch (its result type is `Response`) drives Datastar over ordinary request/response fetches.
+pub fn sse(body: string): response.Response {
+    let r = response.Response(Status.Ok, body);
+    r.setHeader("Content-Type", "text/event-stream");
+    r.setHeader("Cache-Control", "no-cache");
+    return r;
+}
