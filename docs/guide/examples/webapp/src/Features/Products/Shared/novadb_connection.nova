@@ -1,0 +1,101 @@
+import list;
+import data.db;
+import web.di;
+import novadb;
+
+// A `Connection` backed by a live NovaDB. It implements the SAME seam as `InMemoryConnection`, so the
+// repository and handlers do not change; `main_novadb.nova` just registers this instead.
+//
+// The one rule that shapes this file: opening a connection is asynchronous and must happen on the
+// reactor, never from a cold `main()`. So we do NOT connect in the constructor. We connect lazily, the
+// first time a query or exec runs, which is always inside an async request handler where the reactor is
+// live. `ensure()` opens the socket once, then creates the products table if it is missing, and every
+// method routes through it.
+//
+// This holds a single connection, so requests to one instance are serialised. That is fine here: the
+// orchestrator runs several instances behind proxyd (Chapter 21), and each has its own connection. For
+// many connections per instance, swap this for the `pool` module's `Pool` (acquire/release per call);
+// the trade-off is that a multi-statement transaction must pin one pooled connection.
+pub struct NovaDbConnection impl Connection, Service {
+    driver: NovaDriver,
+    dsn: string,
+    conn: Connection | undefined,
+    ready: bool,
+
+    init(dsn: string) {
+        self.driver = NovaDriver();
+        self.dsn = dsn;
+        self.conn = undefined;
+        self.ready = false;
+    }
+
+    // Open the connection once (on the reactor), create the schema once, seed a few known rows so the
+    // read endpoints return something on a fresh server, then reuse the connection. NovaDB has no
+    // auto-increment, so the seed rows carry explicit ids (1..3), which is also how a real insert should
+    // supply its key here.
+    async fn ensure(self: NovaDbConnection): Connection {
+        let existing = self.conn;
+        if (existing != undefined) { return existing; }
+        let c = await self.driver.connect(self.dsn);
+        if (!self.ready) {
+            let r = await c.exec("CREATE TABLE IF NOT EXISTS products (id INT PRIMARY KEY, name TEXT, price INT)", List<DbValue>());
+            await self.seed(c, 1, "Keyboard", 4500);
+            await self.seed(c, 2, "Mouse", 1800);
+            await self.seed(c, 3, "Monitor", 22000);
+            self.ready = true;
+        }
+        self.conn = c;
+        return c;
+    }
+
+    // Insert a known row with an explicit id if it is not already present (idempotent seeding).
+    async fn seed(self: NovaDbConnection, c: Connection, id: int, name: string, price: int): void {
+        let existing = List<DbValue>();
+        existing.push(db.dbInt(id));
+        let rs = await c.query("SELECT id FROM products WHERE id = $1", existing);
+        if (rs.rows.size() > 0) { return; }
+        let p = List<DbValue>();
+        p.push(db.dbInt(id));
+        p.push(db.dbText(name));
+        p.push(db.dbInt(price));
+        let _ = await c.exec("INSERT INTO products (id, name, price) VALUES ($1, $2, $3)", p);
+    }
+
+    async fn exec(self: NovaDbConnection, sql: string, params: List<DbValue>): ExecResult {
+        let c = await self.ensure();
+        return await c.exec(sql, params);
+    }
+
+    async fn query(self: NovaDbConnection, sql: string, params: List<DbValue>): ResultSet {
+        let c = await self.ensure();
+        return await c.query(sql, params);
+    }
+
+    fn close(self: NovaDbConnection): void {
+        let existing = self.conn;
+        if (existing != undefined) { existing.close(); }
+    }
+
+    fn setTimeout(self: NovaDbConnection, ms: int): int { return 0; }
+
+    async fn prepare(self: NovaDbConnection, sql: string): int { return 0; }
+    async fn queryPrepared(self: NovaDbConnection, stmt: int, params: List<DbValue>): ResultSet {
+        return await self.query("", params);
+    }
+    async fn execPrepared(self: NovaDbConnection, stmt: int, params: List<DbValue>): ExecResult {
+        return await self.exec("", params);
+    }
+
+    async fn begin(self: NovaDbConnection): ExecResult {
+        let c = await self.ensure();
+        return await c.begin();
+    }
+    async fn commit(self: NovaDbConnection): ExecResult {
+        let c = await self.ensure();
+        return await c.commit();
+    }
+    async fn rollback(self: NovaDbConnection): ExecResult {
+        let c = await self.ensure();
+        return await c.rollback();
+    }
+}

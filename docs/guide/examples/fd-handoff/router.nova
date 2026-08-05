@@ -1,0 +1,66 @@
+// Fire-and-forget proxy PROTOTYPE, router role (the proxy).
+//
+// It binds a TCP port AND a named AF_UNIX rendezvous socket, waits for a worker (the app) to connect
+// on the AF_UNIX socket, then accepts TCP clients and HANDS each client socket to the worker over the
+// AF_UNIX control channel using SCM_RIGHTS. After the handoff the router closes its own copy of the
+// client fd: from that point the worker owns the connection and replies to the client DIRECTLY. The
+// router is out of the data path. This is the "app writes directly to the client" model.
+
+import os.socket;
+import os.sys;
+import bytes;
+import string;
+import env;
+import list;
+
+const SOCK_PATH: string = "/tmp/nova_handoff.sock";
+
+fn main(): int {
+    // Fresh rendezvous socket (remove any stale one from a previous run).
+    let cp = sys.cstr(SOCK_PATH);
+    sys.unlink(cp);
+    bytes.free(cp);
+
+    let u = socket.newUnix();
+    let ua = socket.makeSockaddrUn(SOCK_PATH);
+    let br = socket.bindSock(u, ua, socket.sockaddrUnLen());
+    bytes.free(ua);
+    if (br != 0) { console.log("router: AF_UNIX bind failed"); return 1; }
+    socket.listenSock(u, 16);
+
+    let lfd = socket.listenAny(8099);
+    if (lfd < 0) { console.log("router: TCP :8099 bind failed"); return 1; }
+    console.log("router: TCP :8099 up; waiting for a worker on " + SOCK_PATH);
+
+    // Accept the configured number of workers (the app replicas) before serving, then round-robin
+    // the handoff across them, exactly as an L7 load balancer spreads across backends.
+    let ws = env.get("WORKERS");
+    let want = if (ws == "9") 9 else (if (ws == "3") 3 else (if (ws == "2") 2 else 1));
+    let workers = list.List<int>();
+    let w = 0;
+    while (w < want) {
+        let wf = socket.acceptSock(u, 0, 0);
+        if (wf < 0) { console.log("router: worker accept failed"); return 1; }
+        workers.push(wf);
+        w = w + 1;
+    }
+    console.log(`router: ${want} worker(s) connected; round-robin fd-passing`);
+
+    let served = 0;
+    while (served < 1000000) {
+        let c = socket.acceptOne(lfd);
+        if (c < 0) { continue; }
+        // Read the request prefix the way an L7 proxy would (to route on it); pass it along so the
+        // worker does not have to re-read what we consumed.
+        let buf = bytes.alloc(8192);
+        let n = socket.recvOnce(c, buf as long, 8192);
+        let req = if (n > 0) bytes.read_string(buf, n as int) else "";
+        bytes.free(buf);
+        let target = workers.get(served % want);
+        let sent = socket.sendFd(target, c, req);
+        socket.close(c);           // hand-off done: the router drops out of the data path
+        if (sent < 0) { console.log("router: fd handoff failed"); }
+        served = served + 1;
+    }
+    return 0;
+}

@@ -3,15 +3,20 @@ import data.db;
 import data.orm;
 import web.di;
 import Features.Products.GetProductById.response;
-import Features.Products.Shared.database;
 
 // The repository: a real data-access object written against the micro-ORM and the `Connection` seam.
-// The connection is injected (main.nova registers it), so the repository never knows whether it is
-// talking to the in-memory database or a live driver. Handlers, in turn, receive this repository through
-// their own constructor. Implementing `Service` is what lets the DI container store and hand it out.
+// The field is the `Connection` TRAIT, not a concrete type, so this exact code runs against the
+// in-memory database, NovaDB, or any driver without changing a line here. The composition root
+// (main.nova / main_novadb.nova) constructs the concrete connection and injects it; this repository
+// never names it. Implementing `Service` is what lets the DI container store and hand it out.
 pub struct ProductRepository impl Service {
-    conn: InMemoryConnection,
-    init(conn: InMemoryConnection) { self.conn = conn; }
+    conn: Connection,
+    init(conn: Connection) { self.conn = conn; }
+
+    // Hand the shared connection to the transaction behaviour, which wraps begin/commit around the
+    // request. The behaviour resolves THIS repository (a concrete service) and asks for the connection,
+    // so it stays driver-agnostic without needing to name the concrete connection type.
+    pub fn connection(self: ProductRepository): Connection { return self.conn; }
 
     // Read a product by id, materialised straight into the typed DTO by the ORM (columns -> fields by
     // name, via the compiler-generated binder). `undefined` when there is no such row.

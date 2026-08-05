@@ -1,4 +1,4 @@
-# 19. Building and distributing
+# 20. Building and distributing
 
 This chapter covers the mechanics of turning Nova source into something you can ship: compiling a
 single file, building a project, cross-compiling a program for another operating system, and, at the
@@ -142,5 +142,5 @@ checksum, the single `zig build archive` command produces.
 
 ## Where to go next
 
-- Chapter 18 for why the toolchain is self-contained (in-process LLD, the prebuilt runtime).
+- Chapter 19 for why the toolchain is self-contained (in-process LLD, the prebuilt runtime).
 - Chapter 1 to return to the everyday `nova` and `nova test` workflow.

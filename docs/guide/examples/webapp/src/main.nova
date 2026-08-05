@@ -19,13 +19,15 @@ import Features.Products.CreateProduct.validator;
 import Features.Products.GetProductById.query;
 import Features.Products.GetProductById.handler;
 
-// Services: the database connection is a singleton (a shared store); the repository is resolved per
-// request and injected with it. Swap the connection line for a real driver (postgres, btreedb, ...) and
-// nothing in the repository or the handlers changes.
+// Services: the database connection is a singleton (a shared store) registered under the "Connection"
+// key; the repository is resolved per request and injected with it. This build uses the in-memory
+// connection, so it runs with no server. To talk to a real NovaDB, see `main_novadb.nova`: it registers
+// the SAME "Connection" key with a live driver, and nothing in the repository, the handlers, or the
+// behaviours changes.
 fn configureServices(): ServiceCollection {
     let services = ServiceCollection();
-    services.addSingleton("InMemoryConnection", (sp) => { return InMemoryConnection(); });
-    services.addScoped("ProductRepository", (sp) => { return ProductRepository(sp.require("InMemoryConnection") as InMemoryConnection); });
+    services.addSingleton("Connection", (sp) => { return InMemoryConnection(); });
+    services.addScoped("ProductRepository", (sp) => { return ProductRepository(sp.require("Connection") as InMemoryConnection); });
     return services;
 }
 

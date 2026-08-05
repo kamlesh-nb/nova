@@ -1,8 +1,10 @@
 # Nova video tutorials
 
-This folder holds presenter-ready scripts for a full video series on the Nova language. There is one
-script per chapter of the [written guide](../README.md), in the same order. Each script is a spoken
-walkthrough with on-screen code and live runs, so you can record straight from it.
+This folder holds presenter-ready scripts for a full video series on the Nova language, following the
+[written guide](../README.md) in order. There is a script per usage chapter; the two reference chapters,
+19 Architecture and 20 Building and distributing, have no companion video, so the series runs
+17, 18, then 21. Each script is a spoken walkthrough with on-screen code and live runs, so you can record
+straight from it.
 
 Every code block and every program output in these scripts is copied from the guide's runnable
 examples in [`../examples/`](../examples), which are compiled and run by `run_all.sh`. So what you show
@@ -39,9 +41,12 @@ The timestamps are a guide, not a rule. Speak at your own pace and adjust.
 | 15 | [Concurrency](15-concurrency.md) | `async`, `await`, `spawn`, channels |
 | 16 | [Serialization](16-serialization.md) | JSON serde, `@serializable` |
 | 17 | [Web](17-web.md) | The `nova init web` template and the mediator pipeline |
+| 18 | [Data access and NovaDB](18-data-access.md) | The `db` seam, the drivers, connection strings, the micro-ORM, backing the web app with NovaDB |
+| 21 | [Deploying with the orchestrator](21-deploying-with-the-orchestrator.md) | `proxyd`/`orchd`/`orchctl`, load-balanced replicas, the config store on NovaDB |
 
 ## Suggested recording order
 
 Record in numbered order. Each video assumes the viewer has watched the ones before it, and the outros
 are written to lead into the next one. Videos 01 to 06 are the fundamentals, 07 to 11 are the type and
-error model, 12 to 14 fill in the details, and 15 to 17 build up to real concurrent and web apps.
+error model, 12 to 14 fill in the details, 15 to 17 build up to real concurrent and web apps, 18 backs
+the app with NovaDB, and 21 deploys it with the orchestrator.

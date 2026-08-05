@@ -2,7 +2,8 @@ import web.mediator;
 import web.response;
 import web.status;
 import web.di;
-import Features.Products.Shared.database;
+import data.db;
+import Features.Products.Shared.repository;
 
 // A logging behaviour: wraps every handler, tags the response with the request type it handled. A real
 // one would time the request and write a structured log line. Being outermost, it sees the final
@@ -21,7 +22,11 @@ pub struct LoggingBehavior impl PipelineBehavior {
 // handler share the connection.
 pub struct TransactionBehavior impl PipelineBehavior {
     async fn handle(self: TransactionBehavior, ctx: RequestContext, next: Next): Response {
-        let conn = ctx.scope.require("InMemoryConnection") as InMemoryConnection;
+        // Resolve the SAME scoped repository the handler will use, and open the transaction on its
+        // connection. Going through the repository keeps this behaviour driver-agnostic: it never names
+        // the concrete connection type, so it works unchanged for the in-memory store and for NovaDB.
+        let repo = ctx.scope.require("ProductRepository") as ProductRepository;
+        let conn = repo.connection();
         let _ = await conn.begin();
         let res = await next.proceed(ctx);
         if (res.status.toCode() < 400) {

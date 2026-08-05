@@ -1,4 +1,4 @@
-# 18. How Nova works: architecture
+# 19. How Nova works: architecture
 
 The earlier chapters showed Nova from the outside: the syntax you write and the behaviour you get.
 This chapter looks under the bonnet. It is not needed to write Nova, but it explains why the language
@@ -147,6 +147,6 @@ If you want to read the implementation, the shape is:
 
 - Chapter 13 for ownership and memory from the writing-code side.
 - Chapter 15 for the concurrency API in practice.
-- Chapter 19 for building and distributing the toolchain, including cross-compilation.
+- Chapter 20 for building and distributing the toolchain, including cross-compilation.
 - The [language specification](../language-specification.md) for the precise contract behind the
   surface language.

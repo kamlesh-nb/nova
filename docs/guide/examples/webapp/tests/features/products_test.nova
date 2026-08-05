@@ -16,8 +16,8 @@ import Features.Products.GetProductById.handler;
 
 fn testApp(): App {
     let services = ServiceCollection();
-    services.addSingleton("InMemoryConnection", (sp) => { return InMemoryConnection(); });
-    services.addScoped("ProductRepository", (sp) => { return ProductRepository(sp.require("InMemoryConnection") as InMemoryConnection); });
+    services.addSingleton("Connection", (sp) => { return InMemoryConnection(); });
+    services.addScoped("ProductRepository", (sp) => { return ProductRepository(sp.require("Connection") as InMemoryConnection); });
     let app = App();
     app.useServices(services);
     app.useBehavior(LoggingBehavior{});

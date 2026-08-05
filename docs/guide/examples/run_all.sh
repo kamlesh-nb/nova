@@ -30,6 +30,14 @@ if [ -d "$WEBAPP" ]; then
   if ( cd "$WEBAPP" && "$NOVA" build >/dev/null 2>&1 ); then echo "PASS (build) webapp"; else echo "FAIL (build) webapp"; fail=1; fi
   wout="$("$NOVA" test "$WEBAPP/tests/features/products_test.nova" 2>&1)"; wrc=$?
   if [ $wrc -eq 0 ]; then echo "PASS (test) webapp"; else echo "FAIL (test) webapp"; echo "$wout" | tail -5; fail=1; fi
+
+  # The NovaDB-backed build of the SAME app (main_novadb.nova). Running it needs a live NovaDB server
+  # (see run-live.sh), so here we only compile-check it. It imports the novadb driver from packages/,
+  # so symlink packages/ into the project first (transient; gitignored), then remove it.
+  ln -sfn "$HERE/../../../../packages" "$WEBAPP/packages"
+  if ( cd "$WEBAPP" && "$NOVA" build --file src/main_novadb.nova -o /tmp/nova_guide_webapp_novadb >/dev/null 2>&1 ); then echo "PASS (compile) webapp[novadb]"; else echo "FAIL (compile) webapp[novadb]"; fail=1; fi
+  rm -f "$WEBAPP/packages"
+
   rm -rf "$WEBAPP/build" "$WEBAPP/__nova_test" "$WEBAPP/__nova_test.ll"
 fi
 

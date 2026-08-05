@@ -283,4 +283,4 @@ TLS                    app.useTls(certPath, keyPath) for HTTPS.
 
 ## Outro (15:00)
 
-**Say:** And that is the whole guide. You have now seen every core construct in Nova, from your very first `console.log`, through values, control flow, functions, structs, traits, generics, error handling, concurrency, serialization, and finally a working web service. Congratulations on finishing the series. The natural next step is to build your own thing: run `nova init web --name myapp`, add a feature slice, plug in one of the database driver packages through a repository, and start building. Thank you for watching. If the series helped you, a like and a subscribe really does help. Now go and build something.
+**Say:** You have now built a working web service, the capstone of the core language. But it keeps its data in memory. In the next video we give it a real database: Nova's `Connection` seam, the drivers, and how to move this exact app onto a live NovaDB by changing one file. After that, Video 21 deploys it behind a load balancer with the orchestrator. See you in Video 18.
