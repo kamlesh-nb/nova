@@ -24,6 +24,11 @@ if [ $fail -eq 0 ]; then
   conformance/run.sh -j || fail=1
 fi
 
+if [ $fail -eq 0 ]; then
+  step "compiler fuzz (fixed-seed regression smoke; scale via NOVA_FUZZ_N/SEED for exploration)"
+  NOVA_FUZZ_N="${NOVA_FUZZ_N:-40}" conformance/fuzz.sh || fail=1
+fi
+
 echo
 if [ $fail -eq 0 ]; then echo "GATE PASS  nova (lang)  [$OS]"; else echo "GATE FAIL  nova (lang)  [$OS]"; fi
 exit $fail
