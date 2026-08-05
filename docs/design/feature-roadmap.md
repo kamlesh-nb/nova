@@ -139,24 +139,24 @@ Traits PascalCase, no `I`-prefix.
 **Shared prerequisite for every driver below:** the binary socket-send fix (`nova_socket_send_n`) — the
 current `nova_socket_send` uses `strlen` and truncates binary wire data at the first null byte. Also a
 shared **abstract DB driver** seam (connection / query / typed params / result rows / typed column decode)
-that BTreeDB, the SQL drivers, and Mongo all implement — the existing one is "too naive" (CLAUDE.md) and
-should be redesigned **once, from the BTreeDB work**, then implemented per-backend.
+that NovaDB, the SQL drivers, and Mongo all implement — the existing one is "too naive" (CLAUDE.md) and
+should be redesigned **once, from the NovaDB work**, then implemented per-backend.
 
-**Priority order: BTreeDB (P2, Nova's own engine — defines the seam) → SQL drivers (P3) → MongoDB (P6, lowest).**
+**Priority order: NovaDB (P2, Nova's own engine — defines the seam) → SQL drivers (P3) → MongoDB (P6, lowest).**
 
-### BTreeDB integration — ⭐ PRIORITY DB (Nova's own storage engine, P2)
+### NovaDB integration — ⭐ PRIORITY DB (Nova's own storage engine, P2)
 
 CLAUDE.md's reason-to-exist storage engine and the **priority DB integration** — it's the native DB Nova
 apps target, it's locally/offline testable, and its SQL parser + query executor make it the natural place to
-define the shared DB seam that the SQL drivers then reuse. BTreeDB is a **separate project** built separately
+define the shared DB seam that the SQL drivers then reuse. NovaDB is a **separate project** built separately
 (CLAUDE.md); the binary-protocol work on the btree side is tracked in `[[btree-readiness]]` /
 `btree/btree_readiness_plan.md`. Below is the **Nova-language-side** driver + benchmarks.
 
 | Feature | What | Deps | Effort |
 |---|---|---|---|
-| **Shared abstract DB seam** | Redesign the "too naive" driver interface (connection / query / typed params / rows / typed decode). BTreeDB is the reference; the seam must also fit the SQL drivers (and later Mongo). | binary socket I/O | ~2–3 days |
+| **Shared abstract DB seam** | Redesign the "too naive" driver interface (connection / query / typed params / rows / typed decode). NovaDB is the reference; the seam must also fit the SQL drivers (and later Mongo). | binary socket I/O | ~2–3 days |
 | **Nova DB driver** | Target the **JSON protocol first** per `[[btree-readiness]]`, then the pure **binary protocol** (btree side has a `proto/` scaffold: wire/command/session). connect → query → typed rows, decimal round-trip. | seam, protocol | ~1–2 wk |
-| **YCSB benchmarks** | Write YCSB workloads in Nova against BTreeDB (explicit CLAUDE.md goal). | driver | ~3–5 days |
+| **YCSB benchmarks** | Write YCSB workloads in Nova against NovaDB (explicit CLAUDE.md goal). | driver | ~3–5 days |
 
 ### SQL drivers — PostgreSQL, MySQL, MSSQL (P3)
 
@@ -179,7 +179,7 @@ MSSQL reuse it.
 
 ### MongoDB driver — ⬇ LOWEST PRIORITY (P6)
 
-Was the earlier "immediate ask"; **explicitly deprioritized** behind BTreeDB and the SQL drivers. Kept
+Was the earlier "immediate ask"; **explicitly deprioritized** behind NovaDB and the SQL drivers. Kept
 because the wire + BSON + decimal path is offline-byte-verifiable and its SCRAM work is shared with
 PostgreSQL — cheap to add once crypto + the seam exist. Uses the now-complete `decimal128` for BSON decimal
 round-trips.
@@ -343,7 +343,7 @@ line item, it is the definition of done.
 Rationale for the ordering: **(1)** close the one remaining live memory-safety hole and the harness blind
 spot that hides regressions — everything downstream is unverifiable until then; **(2)** land the small
 unblockers every driver and the flagship depend on; **(3)** build the flagship (typed mediator routing) —
-the reason the compiler was overhauled; **(4)** prove the whole stack with **BTreeDB — Nova's own storage
+the reason the compiler was overhauled; **(4)** prove the whole stack with **NovaDB — Nova's own storage
 engine** (CLAUDE.md's reason to exist, and locally/offline testable), establishing the shared DB seam, then
 fan out to the SQL drivers; **MongoDB is lowest priority** (P6); **(5)** concurrency/stdlib/toolchain polish,
 which is additive and parallel-safe.
@@ -372,26 +372,26 @@ which is additive and parallel-safe.
 | 8 | **`get<T>`/`post<T>`/…** lowering — ✅ **LANDED** (`aa180b0`, gate `58_typed_routing`): `app.get<GetUser>(path)` lowers to `app.__addRoute("GET", path, "GetUser")` (route keyed by request-type name), dispatched via the generated `__mediator_dispatch_by_name` (bind→handle→serialize). Zero registration. Sounder than the doc's fn-pointer plan (a fn-value of a struct-typed binder mis-marshals; a name+call doesn't). Native green FUNC 78/78, ARC/SHADOW 136/136. **Stdlib Router + @fromRoute + serve LANDED — flagship COMPLETE end-to-end** (`0f9a073`, `5faa532`, `7342d68`): `import web.routing` gives `RequestHandler<Q,R>` + `Router` — zero boilerplate. Pattern routes `/user/{id:int}` extract path params, overlay them on the body via `CompositeSource` (route wins). `Router.serve(req): Response` bridges the typed pipeline to the HTTP server — a live app is `server.listen(port, app.serve)`, no new networking code; 404 (no path) vs 405 (path matched, wrong method) distinguished. Gates `59_route_params`, `60_router_serve`. Native green FUNC 80/80, ARC/SHADOW 140/140, ASAN clean. (Found+deferred: a nested-owned-`List` ARC double-free; a cross-module `Status.toCode(x)` enum-method codegen gap — both in backlog.) | #7 ✅ | Tier 1.5(b) | ✅ done |
 | 9 | **End-to-end conformance** — typed handler, route+query bind, `@fromRoute`+`@fromBody`, 404/405, auto-JSON. | #8 | route §7 | ~1 day |
 
-### P2 — BTreeDB integration (Nova's own storage engine — first real driver; establishes the shared DB seam)
+### P2 — NovaDB integration (Nova's own storage engine — first real driver; establishes the shared DB seam)
 
 CLAUDE.md's reason-to-exist storage engine, and the **priority DB integration**. It goes first: it's the
-native DB Nova apps target, it's **locally/offline testable** (no third-party server), and — because BTreeDB
+native DB Nova apps target, it's **locally/offline testable** (no third-party server), and — because NovaDB
 carries its own SQL parser + query executor — the seam extracted here transfers directly to the SQL drivers.
-BTreeDB is a **separate project** built separately (CLAUDE.md); its binary protocol is tracked on the btree
+NovaDB is a **separate project** built separately (CLAUDE.md); its binary protocol is tracked on the btree
 side (`[[btree-readiness]]`, `btree/btree_readiness_plan.md`). These are the **Nova-language-side** driver + benchmarks.
 
 | # | Item | Deps | Ref | Effort |
 |---|---|---|---|---|
 | 10 | **Shared abstract DB seam** — ✅ **LANDED** (`835abe6`, `b74f167`): new `src/std/data/db.nova` (`import db`). One typed cell `DbValue` (tag-struct, NOT enum-payload — that corrupts on f64/containers) for both bound params and decoded values; `DbType` mirrors the btree binary OIDs (+decimal, +Null); `Column`/`Row`(typed getters)/`ResultSet`/`ExecResult`/`DbError`; `Connection`(exec/query/close, typed params in, ResultSet out) + `Driver`(connect(dsn)) traits. Gates `63_db_seam` (typed accessors, exact decimal round-trip, NULL, nested ResultSet readback) + `64_db_connection` (mock backend queried through the Connection trait object). Surfaced+fixed a real trait-object ARC leak (widening leaked the fat pointer — affected DI/mediator too). Green FUNC 84/84, ARC 148/148, SHADOW 148/148, ASAN. | #3 ✅ | Tier 2 | ✅ done |
-| 11 | **Nova BTreeDB driver** — ✅ **CODEC LANDED** (`aeadd17`): `data/btree/btreedb.nova` — typed `BTreeConnection impl db.Connection` + `BTreeDriver impl db.Driver` over the **binary** protocol (`[type:u8][len:u32 BE][payload]`). Went binary-first (reconciling the stale "JSON first" note — the btree side already shipped a verified binary path). Captures column OIDs from RowDescription → typed `DbType`; decodes text-format DataRow cells → typed `DbValue` (int/text/bool, NULL via -1 length); request frames sent binary-safe via `writeBytes`; client-side `$N` param substitution with the server's escaping. Gate `65_btreedb_codec` (offline byte-verified: frame encode, typed decode incl NULL, tag/error, params). **LIVE-VALIDATED end-to-end** against a running BTreeDB (`:3009`): `connect` handshake → `CREATE`/`INSERT` (exec, `OK` tags) → `SELECT` (typed ResultSet, correct rows) → parameterized `WHERE id=$1` / `WHERE name=$1` (client-side substitution + escaping), all correct. **TYPED decode confirmed live**: after adding `QueryResponse.column_types` to the btree executor (schema-resolved per projection), `SELECT id,name,qty` returns typed columns → the driver's `getInt`/`getBool` yield real values (`sum(qty)=49` = arithmetic on decoded ints, not strings). Required a small btree-side wiring (route pg-style `'H'` startup to `proto/session.zig`; reconcile session/oidmap with the current executor; add `column_types` — btree is a separate project). Green FUNC 85/85, ARC 150/150, SHADOW 150/150, ASAN. **Remaining:** exact `decimal128` decode (text→decimal128 parser); extended Parse/Bind. | #10 ✅, #3 ✅ | Tier 2 | ✅ live typed |
-| 12 | **YCSB benchmarks in Nova** against BTreeDB (explicit CLAUDE.md goal). | #11 | Tier 2 | ~3–5 days |
+| 11 | **Nova NovaDB driver** — ✅ **CODEC LANDED** (`aeadd17`): `data/btree/btreedb.nova` — typed `BTreeConnection impl db.Connection` + `BTreeDriver impl db.Driver` over the **binary** protocol (`[type:u8][len:u32 BE][payload]`). Went binary-first (reconciling the stale "JSON first" note — the btree side already shipped a verified binary path). Captures column OIDs from RowDescription → typed `DbType`; decodes text-format DataRow cells → typed `DbValue` (int/text/bool, NULL via -1 length); request frames sent binary-safe via `writeBytes`; client-side `$N` param substitution with the server's escaping. Gate `65_btreedb_codec` (offline byte-verified: frame encode, typed decode incl NULL, tag/error, params). **LIVE-VALIDATED end-to-end** against a running NovaDB (`:3009`): `connect` handshake → `CREATE`/`INSERT` (exec, `OK` tags) → `SELECT` (typed ResultSet, correct rows) → parameterized `WHERE id=$1` / `WHERE name=$1` (client-side substitution + escaping), all correct. **TYPED decode confirmed live**: after adding `QueryResponse.column_types` to the btree executor (schema-resolved per projection), `SELECT id,name,qty` returns typed columns → the driver's `getInt`/`getBool` yield real values (`sum(qty)=49` = arithmetic on decoded ints, not strings). Required a small btree-side wiring (route pg-style `'H'` startup to `proto/session.zig`; reconcile session/oidmap with the current executor; add `column_types` — btree is a separate project). Green FUNC 85/85, ARC 150/150, SHADOW 150/150, ASAN. **Remaining:** exact `decimal128` decode (text→decimal128 parser); extended Parse/Bind. | #10 ✅, #3 ✅ | Tier 2 | ✅ live typed |
+| 12 | **YCSB benchmarks in Nova** against NovaDB (explicit CLAUDE.md goal). | #11 | Tier 2 | ~3–5 days |
 
 ### P3 — SQL drivers (on the shared seam; PostgreSQL is the reference)
 
 | # | Item | Deps | Ref | Effort |
 |---|---|---|---|---|
-| 13 | **PostgreSQL** — ✅ **LANDED + LIVE-VERIFIED** (`cb4f228`): `data/sql/postgres.nova` — `PgConnection impl db.Connection` + `PgDriver` over the real pg v3 protocol (startup w/o type byte, cstring names/SQL, pg OIDs, `'R'` auth handshake, tagged `'E'` errors, DSN parse). Same seam as BTreeDB → proves cross-backend abstraction. Live vs a running PostgreSQL: connect (trust) → CREATE/INSERT → SELECT with typed int + BOOL (getInt/getBool, sum over decoded ints) → parameterized `WHERE $1`. Gate `66_postgres_codec` (offline byte-verified). Green FUNC 86/86, ARC 152/152, SHADOW 152/152, ASAN. **The reference SQL driver** — its codec/auth/decode extract to MySQL/MSSQL. **Remaining:** extended query/prepared statements (server-side params); binary result format; MD5/SCRAM auth (this build disables MD5; SCRAM needs HMAC/PBKDF2 — crypto #16); `numeric`→exact decimal (text→decimal128 parser). | #3 ✅, #10 ✅ | Tier 2 | ✅ live (auth: trust/cleartext) |
-| 14 | **MySQL** — ✅ **CODEC LANDED** (`b65a8ce`): `data/sql/mysql.nova` — `MyConnection impl db.Connection` + `MyDriver` over the MySQL protocol (u24-LE packet framing + seq, length-encoded ints/strings, Handshake v10 + HandshakeResponse41, COM_QUERY, column-def + text-row decode → typed DbValue). Third driver on the seam. Auth: `mysql_native_password` (SHA1 scramble) + `caching_sha2_password` fast path (SHA256) — added `crypto.sha1`/`mysqlNativeScramble`/`mysqlSha2Scramble` (runtime, golden-verified vs python hashlib). Gate `67_mysql_codec` (offline byte-verified) + `25_crypto` SHA-1 KAT. Green FUNC 87/87, ARC 154/154, SHADOW 154/154, ASAN. **NOT live-verified** (no MySQL server available) — connect/query is spec-followed but unproven live, unlike BTreeDB/PostgreSQL. **Remaining:** live verification against a real MySQL; caching_sha2 full auth (TLS/RSA); prepared statements; EOF-deprecation handling. | #3 ✅, #10 ✅ | Tier 2 | ◑ codec done; live pending |
+| 13 | **PostgreSQL** — ✅ **LANDED + LIVE-VERIFIED** (`cb4f228`): `data/sql/postgres.nova` — `PgConnection impl db.Connection` + `PgDriver` over the real pg v3 protocol (startup w/o type byte, cstring names/SQL, pg OIDs, `'R'` auth handshake, tagged `'E'` errors, DSN parse). Same seam as NovaDB → proves cross-backend abstraction. Live vs a running PostgreSQL: connect (trust) → CREATE/INSERT → SELECT with typed int + BOOL (getInt/getBool, sum over decoded ints) → parameterized `WHERE $1`. Gate `66_postgres_codec` (offline byte-verified). Green FUNC 86/86, ARC 152/152, SHADOW 152/152, ASAN. **The reference SQL driver** — its codec/auth/decode extract to MySQL/MSSQL. **Remaining:** extended query/prepared statements (server-side params); binary result format; MD5/SCRAM auth (this build disables MD5; SCRAM needs HMAC/PBKDF2 — crypto #16); `numeric`→exact decimal (text→decimal128 parser). | #3 ✅, #10 ✅ | Tier 2 | ✅ live (auth: trust/cleartext) |
+| 14 | **MySQL** — ✅ **CODEC LANDED** (`b65a8ce`): `data/sql/mysql.nova` — `MyConnection impl db.Connection` + `MyDriver` over the MySQL protocol (u24-LE packet framing + seq, length-encoded ints/strings, Handshake v10 + HandshakeResponse41, COM_QUERY, column-def + text-row decode → typed DbValue). Third driver on the seam. Auth: `mysql_native_password` (SHA1 scramble) + `caching_sha2_password` fast path (SHA256) — added `crypto.sha1`/`mysqlNativeScramble`/`mysqlSha2Scramble` (runtime, golden-verified vs python hashlib). Gate `67_mysql_codec` (offline byte-verified) + `25_crypto` SHA-1 KAT. Green FUNC 87/87, ARC 154/154, SHADOW 154/154, ASAN. **NOT live-verified** (no MySQL server available) — connect/query is spec-followed but unproven live, unlike NovaDB/PostgreSQL. **Remaining:** live verification against a real MySQL; caching_sha2 full auth (TLS/RSA); prepared statements; EOF-deprecation handling. | #3 ✅, #10 ✅ | Tier 2 | ◑ codec done; live pending |
 | 15 | **MSSQL** — TDS (PRELOGIN/LOGIN7/SQLBatch/RPC), TLS-during-handshake, token-stream decode. Most complex; do last. | #3, #10, TLS, crypto (#16) | Tier 2 | ~2–3 wk |
 
 ### P4 — Concurrency, stdlib, error model (additive, parallel-safe)
@@ -401,7 +401,7 @@ side (`[[btree-readiness]]`, `btree/btree_readiness_plan.md`). These are the **N
 | 16 | **crypto** — SHA-256/HMAC/PBKDF2 (SCRAM/`caching_sha2` prerequisite), then AEAD. | — | Tier 3 | ~1 wk |
 | 17 | **Error model `T \| Error`** (Zig-shaped: `try`/`catch`-expr/`errdefer`, two-register return) — replaces the broken `throw` longjmp. Spec-first (§5.5 rewrite). Fold in enum-payload-on-local fix (route §8.E1) + tuple type-checker half (§8.D1/2/4). | two-register return | route §8.C | ~2 wk |
 | 18 | **Full channels → `async` utilities (`when_all`/`parallel_for`) → actor stdlib layer.** Runtime substrate is done; this is API/ergonomics. | runtime (done) | Tier 1 | ~2–3 wk |
-| 19 | **serde completeness** (F4-6 fold into sema, decimal in JSON/YAML), **regex**. (BTreeDB moved up to P2.) | seam | Tier 2/3 | ongoing |
+| 19 | **serde completeness** (F4-6 fold into sema, decimal in JSON/YAML), **regex**. (NovaDB moved up to P2.) | seam | Tier 2/3 | ongoing |
 
 ### P5 — Toolchain self-sufficiency, FFI, tooling (separate axis, no ARC touch)
 
@@ -414,7 +414,7 @@ side (`[[btree-readiness]]`, `btree/btree_readiness_plan.md`). These are the **N
 
 ### P6 — Lowest priority: MongoDB driver
 
-Was the earlier "immediate ask"; **explicitly deprioritized** — BTreeDB (Nova's own engine) and the SQL
+Was the earlier "immediate ask"; **explicitly deprioritized** — NovaDB (Nova's own engine) and the SQL
 drivers come first. Kept on the roadmap because the wire + BSON + decimal path is offline-byte-verifiable
 and the SCRAM work is shared with PostgreSQL, so it's cheap once crypto + the seam exist.
 
@@ -430,5 +430,5 @@ F3-5 honest int local slots (i64→i32) + overflow trap · F1-6 Itanium mangling
 
 **Critical dependency chain:** harness integrity (#1) → trustworthy gates · `nova_socket_send_n` (#3) →
 all drivers · F4-1 (#4) → generic traits (#6) → handler discovery (#7) → `get<T>`/`post<T>`/… (#8) → flagship ·
-shared DB seam (#10) → BTreeDB driver (#11) + Postgres/MySQL/MSSQL (#13–15) + MongoDB (#24) · crypto (#16)
+shared DB seam (#10) → NovaDB driver (#11) + Postgres/MySQL/MSSQL (#13–15) + MongoDB (#24) · crypto (#16)
 → SCRAM/auth · static LLVM + `liblld*.a` → linker (#20) → FFI (#22).

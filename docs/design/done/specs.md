@@ -794,7 +794,7 @@ Canonical import names (`main.zig:std_modules`). Status = fitness for use, not e
 | `io/file`, `io/dir`, `fs`, `process` | ⚠️ alpha |
 | `net/tcp/*`, `net/tls`, `net/asyncio` | ⚠️ alpha; TLS verify gaps |
 | `web/*` (~30 modules) | ⚠️ prototype — middleware largely not in-path; sessions/CSRF insecure (no CSPRNG) |
-| `data/btree/client` | ✅ verified against BTreeDB (binary protocol); ⚠️ see §8 |
+| `data/btree/client` | ✅ verified against NovaDB (binary protocol); ⚠️ see §8 |
 | `concurrency/fiber` | ⚠️ **deprecated** (§7) |
 | `concurrency/channel`, `asyncchan`, `atomic` | ⚠️/✅ see §7 |
 | `mem/allocator`, `mem/arena_allocator`, `traits`, `assert`, `exception` | ⚠️ alpha |

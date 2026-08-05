@@ -5,8 +5,8 @@ import postgres;
 import env;
 
 fn main(): void {
-    let dsn = env.get("YCSB_DSN");
-    if (dsn.length == 0) { dsn = "postgres://kamlesh@127.0.0.1:5432/ycsbtest"; }
-    let conn = PgDriver().connect(dsn);
+    let connectionString = env.get("YCSB_DSN");
+    if (connectionString.length == 0) { connectionString = "postgres://kamlesh@127.0.0.1:5432/ycsbtest"; }
+    let conn = PgDriver().connect(connectionString);
     ycsb_client_core.dispatch(conn, "CREATE TABLE ycsb_af (ykey TEXT PRIMARY KEY, ydata TEXT)");
 }

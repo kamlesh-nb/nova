@@ -3,11 +3,11 @@
 //   NOVA=./zig-out/bin/nova ./zig-out/bin/nova test --release repro/ycsb/ycsb_btree.nova
 import ycsb_core;
 import db;
-import btreedb;
+import novadb;
 
 @test
 fn ycsb_btree_suite(): void {
-    let conn = BTreeDriver().connect("127.0.0.1:3009");
+    let conn = NovaDriver().connect("127.0.0.1:3009");
     ycsb_core.runSuite("BTreeDB", conn,
         "CREATE TABLE ycsb_af (ykey TEXT PRIMARY KEY, ydata TEXT)",
         10000, 5000, 0.99, false);

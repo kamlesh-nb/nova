@@ -62,7 +62,7 @@ There is no publish step beyond `git push`: the URL *is* the package identity.
 
 ## Existing packages (the seed ecosystem)
 
-The database drivers (PostgreSQL, MySQL, MSSQL, MongoDB, BTreeDB) and the orchestrator are maintained
+The database drivers (PostgreSQL, MySQL, MSSQL, MongoDB, NovaDB) and the orchestrator are maintained
 as separate Nova packages rather than living in the standard library. They are the working examples of
 the package model: real Nova code, consumed by applications via `nova get`, versioned in their own
 repositories. The database *seam* (the `Connection`/`Driver` traits and the generic pool) stays in the

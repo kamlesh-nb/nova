@@ -1,0 +1,11 @@
+fn main(): int {
+    let a = [1.0; 4096]; let b = [2.0; 4096];
+    let acc = 0.0; let rep = 0;
+    while (rep < 100000) {
+        let s = 0.0; let i = 0;
+        while (i < 4096) { s = s + a[i]*b[i]; i = i + 1; }
+        acc = acc + s; rep = rep + 1;
+    }
+    console.log(`${acc}`);
+    return 0;
+}

@@ -24,7 +24,7 @@ the end is the recommended order of work; nothing here has been changed yet.
 | nova-postgres | Alpha | Correct codec + SCRAM + prepared stmts, but no TLS, errors swallowed, timestamp/bytea broken. |
 | nova-mysql | Alpha | Solid codec + auth math, but no TLS at all, errors swallowed, text-datetime decode wrong. |
 | nova-mssql (TDS) | Alpha | Real sp_prepare + tunneled TLS, but cert verification off, FLOAT/temporal decode to NULL, no PLP. |
-| nova-btreedb | Alpha | Real typed binary protocol + defensive framing, but hardcoded creds, `'E'` frames swallowed. |
+| nova-novadb | Alpha | Real typed binary protocol + defensive framing, but hardcoded creds, `'E'` frames swallowed. |
 | nova-mongodb | Prototype | `hello`/auth never wired into `connect`, no cursor/getMore, BSON lacks ObjectId/datetime. |
 
 ### Standard library (non-DB)
@@ -182,7 +182,7 @@ framing (`:84-90`); prepared params all NVARCHAR(4000) + sp_unprepare never call
 + ENVCHANGE ignored (C3); no sp_reset_connection on pool reuse (leaked session state); Windows/NTLM/
 Kerberos/AAD auth all absent; unknown-token hard-stop truncates results (`:600`).
 
-### 4.4 nova-btreedb -- Alpha
+### 4.4 nova-novadb -- Alpha
 Strengths: genuine Postgres-convention binary protocol (typed OID cell decode, big-endian framing),
 defensive length guard against desync (`btreedb.nova:313`), buffered reader with compaction + dtor
 freeing (past-leak fix), exact decimal128, documented reason for abrupt close (avoids nested-drive

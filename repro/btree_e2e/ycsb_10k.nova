@@ -11,7 +11,7 @@ import string;
 import datetime;
 import math;
 import db;
-import btreedb;
+import novadb;
 
 // ---------- PRNG: 64-bit LCG (deterministic, reproducible) ----------
 struct Rng {
@@ -117,7 +117,7 @@ fn ycsb_suite(): void {
     let valueSize = 64;
 
     let rng = Rng(88172645463325252);
-    let drv = BTreeDriver();
+    let drv = NovaDriver();
     let conn = drv.connect("127.0.0.1:3009");
     conn.exec("CREATE TABLE ycsb_bench10k (ykey TEXT PRIMARY KEY, ydata TEXT)", List<DbValue>());
     let value = genValue(valueSize);

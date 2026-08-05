@@ -6,7 +6,7 @@
     "https://github.com/kamlesh-nb/nova-postgres",
     "https://github.com/kamlesh-nb/nova-mysql",
     "https://github.com/kamlesh-nb/nova-mssql",
-    "https://github.com/kamlesh-nb/nova-btreedb",
+    "https://github.com/kamlesh-nb/nova-novadb",
     "https://github.com/kamlesh-nb/nova-mongodb"
   ]
 }

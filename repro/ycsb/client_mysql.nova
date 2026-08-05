@@ -5,8 +5,8 @@ import mysql;
 import env;
 
 fn main(): void {
-    let dsn = env.get("YCSB_DSN");
-    if (dsn.length == 0) { dsn = "mysql://ycsb:ycsbpass@127.0.0.1:3306/ycsbtest"; }
-    let conn = MyDriver().connect(dsn);
+    let connectionString = env.get("YCSB_DSN");
+    if (connectionString.length == 0) { connectionString = "mysql://ycsb:ycsbpass@127.0.0.1:3306/ycsbtest"; }
+    let conn = MyDriver().connect(connectionString);
     ycsb_client_core.dispatch(conn, "CREATE TABLE ycsb_af (ykey VARCHAR(64) PRIMARY KEY, ydata TEXT)");
 }

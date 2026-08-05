@@ -1,6 +1,6 @@
 # DB Production-Readiness Roadmap
 
-**Purpose.** The Nova DB drivers (BTreeDB, PostgreSQL, MySQL, MSSQL, MongoDB) are protocol-complete and
+**Purpose.** The Nova DB drivers (NovaDB, PostgreSQL, MySQL, MSSQL, MongoDB) are protocol-complete and
 live-verified, but they are *beta*, not production. This document is the plan to close that gap — the operational
 layer (pooling, transactions, timeouts, retries, real parameterization) that turns "four drivers that work in a
 demo" into "a data layer you would ship." **MongoDB is the first driver targeted for production readiness**

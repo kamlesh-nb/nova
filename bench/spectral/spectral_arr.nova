@@ -1,0 +1,45 @@
+// Spectral norm with FIXED primitive arrays (double[1000]) created via [value; count] repeat-init,
+// instead of List<double>. Same algorithm as spectral.nova; measures the fixed-array path.
+import math;
+const N: int = 1000;
+
+fn evala(i: int, j: int): int { return (i + j) * (i + j + 1) / 2 + i + 1; }
+
+fn times(v: double[1000], u: double[1000]): void {
+    let i = 0;
+    while (i < N) {
+        let a = 0.0; let j = 0;
+        while (j < N) { a = a + u[j] / (evala(i, j) as double); j = j + 1; }
+        v[i] = a; i = i + 1;
+    }
+}
+fn timesTrans(v: double[1000], u: double[1000]): void {
+    let i = 0;
+    while (i < N) {
+        let a = 0.0; let j = 0;
+        while (j < N) { a = a + u[j] / (evala(j, i) as double); j = j + 1; }
+        v[i] = a; i = i + 1;
+    }
+}
+fn aTimesTransp(v: double[1000], u: double[1000], x: double[1000]): void {
+    times(x, u); timesTrans(v, x);
+}
+
+fn pad9(n: long): string { let s = `${n}`; while (s.length < 9) { s = "0" + s; } return s; }
+fn fixed9(v: double): string {
+    let neg = v < 0.0; let a = if (neg) 0.0 - v else v;
+    let scaled = (a * 1000000000.0 + 0.5) as long; let ip = scaled / 1000000000; let fp = scaled - ip * 1000000000;
+    return (if (neg) "-" else "") + `${ip}` + "." + pad9(fp);
+}
+
+fn main(): int {
+    let u: double[1000] = [1.0; 1000];
+    let v: double[1000] = [1.0; 1000];
+    let x: double[1000] = [0.0; 1000];
+    let k = 0;
+    while (k < 10) { aTimesTransp(v, u, x); aTimesTransp(u, v, x); k = k + 1; }
+    let vBv = 0.0; let vv = 0.0; let m = 0;
+    while (m < N) { let vi = v[m]; vBv = vBv + u[m] * vi; vv = vv + vi * vi; m = m + 1; }
+    console.log(fixed9(math.fsqrt(vBv / vv)));
+    return 0;
+}

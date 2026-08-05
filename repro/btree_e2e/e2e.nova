@@ -4,11 +4,11 @@ import assert;
 import list;
 import string;
 import db;
-import btreedb;
+import novadb;
 
 @test
 fn btree_e2e_crud(): void {
-    let drv = BTreeDriver();
+    let drv = NovaDriver();
     let conn = drv.connect("127.0.0.1:3009");
 
     conn.exec("CREATE TABLE nova_e2e (id INT PRIMARY KEY, name TEXT, age INT)", List<DbValue>());

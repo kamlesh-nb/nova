@@ -1,0 +1,8 @@
+import list;
+fn main(): int {
+    let a = list.List<double>();
+    a.push(1.5);
+    a.set(0, 2.5);
+    console.log(`${a.size()}`);
+    return 0;
+}

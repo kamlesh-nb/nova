@@ -1,0 +1,16 @@
+fn main(): int {
+    let a = [1.0; 4096]; let b = [2.0; 4096];
+    let acc = 0.0; let rep = 0;
+    while (rep < 100000) {
+        let vs: f64x4 = simd.splat4(0.0); let i = 0;
+        while (i < 4096) {
+            let va: f64x4 = simd.load4(a, i);
+            let vb: f64x4 = simd.load4(b, i);
+            vs = simd.fma4(va, vb, vs);
+            i = i + 4;
+        }
+        acc = acc + simd.sum4(vs); rep = rep + 1;
+    }
+    console.log(`${acc}`);
+    return 0;
+}

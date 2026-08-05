@@ -1,0 +1,45 @@
+// Spectral norm (Computer Language Benchmarks Game), faithful to the scalar single-thread Go 1.go.
+import list;
+import math;
+const N: int = 100;
+
+fn evala(i: int, j: int): int { return (i + j) * (i + j + 1) / 2 + i + 1; }
+
+fn times(v: list.List<double>, u: list.List<double>): void {
+    let i = 0; let n = v.size();
+    while (i < n) {
+        let a = 0.0; let j = 0;
+        while (j < n) { a = a + (u.get(j) ?? 0.0) / (evala(i, j) as double); j = j + 1; }
+        v.set(i, a); i = i + 1;
+    }
+}
+fn timesTrans(v: list.List<double>, u: list.List<double>): void {
+    let i = 0; let n = v.size();
+    while (i < n) {
+        let a = 0.0; let j = 0;
+        while (j < n) { a = a + (u.get(j) ?? 0.0) / (evala(j, i) as double); j = j + 1; }
+        v.set(i, a); i = i + 1;
+    }
+}
+fn aTimesTransp(v: list.List<double>, u: list.List<double>, x: list.List<double>): void {
+    times(x, u); timesTrans(v, x);
+}
+
+fn pad9(n: long): string { let s = `${n}`; while (s.length < 9) { s = "0" + s; } return s; }
+fn fixed9(v: double): string {
+    let neg = v < 0.0; let a = if (neg) 0.0 - v else v;
+    let scaled = (a * 1000000000.0 + 0.5) as long; let ip = scaled / 1000000000; let fp = scaled - ip * 1000000000;
+    return (if (neg) "-" else "") + `${ip}` + "." + pad9(fp);
+}
+
+fn main(): int {
+    let u = list.List<double>(); let v = list.List<double>(); let x = list.List<double>();
+    let i = 0;
+    while (i < N) { u.push(1.0); v.push(1.0); x.push(0.0); i = i + 1; }
+    let k = 0;
+    while (k < 10) { aTimesTransp(v, u, x); aTimesTransp(u, v, x); k = k + 1; }
+    let vBv = 0.0; let vv = 0.0; let m = 0;
+    while (m < N) { let vi = v.get(m) ?? 0.0; vBv = vBv + (u.get(m) ?? 0.0) * vi; vv = vv + vi * vi; m = m + 1; }
+    console.log(fixed9(math.fsqrt(vBv / vv)));
+    return 0;
+}

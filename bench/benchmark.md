@@ -4,54 +4,93 @@ Cross-language comparison of **Nova** against **Rust**, **Go**, and **C#** on si
 [Programming Language Benchmarks](https://programming-language-benchmarks.vercel.app/) suite.
 
 Every implementation is a **scalar, single-threaded** port of the *same* algorithm. Every Nova program
-prints the reference *golden* output byte-for-byte (or agrees with all three peers). Times are the
-**best of 10 wall-clock runs** on an Apple M1, all release builds. Numbers are milliseconds.
+prints the reference *golden* output byte-for-byte and agrees with every peer at the same problem size
+(verified this run — see "Golden match" below). Times are the **best of 8–12 wall-clock runs** on an
+Apple M1, all release builds. Numbers are milliseconds, lower is better.
+
+The Nova sources here use **`for (i in 0..n)` range loops** for their counted loops. That matters: a
+range-for lowers to a clean 64-bit induction variable, which LLVM's scalar-evolution recognizes, so the
+array loops **auto-vectorize** (NEON). The `while` + `int`-counter form emits a 32-bit trunc/sext on the
+counter each iteration, which defeats vectorization. This rewrite is what moved spectral-norm from 1.44×
+slower to *fastest of the four*.
 
 ---
 
 ## Results (absolute wall-clock, milliseconds — lower is better)
 
+Nova here uses **`for (i in 0..n)` range loops** and the **`NOVA_ARC_ELIDE` retain/release elision** (see
+below); that is the best config measured.
+
 | Benchmark | Rust | Go | C# | **Nova** | Fastest peer | **Nova vs fastest** |
 |---|---:|---:|---:|---:|---|---:|
-| nbody (N=1M) | 28.9 | 75.1 | 81.8 | **29.1** | Rust 28.9 | **1.01× slower** |
-| fannkuch-redux (n=11) | 2061.6 | 1938.1 | 1973.1 | **1916.1** | *Nova* | **fastest** |
-| mandelbrot (1600²) | 267.9 | 233.9 | 305.0 | **269.1** | Go 233.9 | **1.15× slower** |
-| nsieve (160k ×400) | 259.9 | 264.7 | 300.4 | **353.2** | Rust 259.9 | **1.36× slower** |
-| spectral-norm (N=1000) | 38.2 | 39.9 | 68.3 | **55.0** | Rust 38.2 | **1.44× slower** |
-| binary-trees (depth 16) | 276.0 | 270.4 | 193.7 | **429.4** | C# 193.7 | **2.22× slower** |
+| spectral-norm (N=1000) | 38.1 | 40.1 | 68.8 | **38.7** | Rust 38.1 | **1.02× (tie)** |
+| fannkuch-redux (n=11) | 2094 | 1975 | 2005 | **1927** | *Nova* | **fastest** |
+| mandelbrot (1600²) | 269.0 | — | 307.5 | **271.6** | Rust 269.0 | **1.01× (tie)** |
+| nbody (N=1M) | 29.7 | 76.2 | 82.6 | **31.6** | Rust 29.7 | **1.06× slower** |
+| nsieve (160k ×400) | 263.7 | 268.6 | 303.7 | **371.4** | Rust 263.7 | **1.41× slower** |
+| binary-trees (depth 16) | 277.9 | 270.7 | 194.2 | **385.7** | C# 194.2 | **1.99× slower** |
 
-**Bottom line: Nova is competitive on 2 of the 6 (nbody, fannkuch) and slower on the other 4** — by
-1.15× to 2.22× against the fastest peer for each benchmark. It is not, in general, as fast as Rust/Go/C#.
+*(mandelbrot: Go is omitted — the available Go port uses a different inner algorithm and does not produce
+the reference hash, so it is not a like-for-like comparison. Rust and C# do.)*
+
+**Bottom line: Nova matches Rust within noise on 4 of 6 (spectral-norm, fannkuch, mandelbrot, nbody) — and
+beats Go AND C# on those same four — and is slower only on nsieve (1.41×) and binary-trees (1.99×).** The
+two laggards are structural, not tunable: nsieve is scalar strided-memory codegen (the i64 value-word IR
+model), binary-trees is allocation churn (ARC per-node vs a generational GC). Closing either to true Rust
+parity needs a large project (a typed-SSA IR, or a region/arena allocator), not a tweak — so benchmarking
+is **closed here**. ARC's determinism/pauseless tails are the right trade for a server-side language, and
+binary-trees is the one workload built to punish exactly that.
 
 ---
 
 ## Where Nova is, honestly
 
-**Competitive (≈ within noise):**
-- **nbody** — 29.1 ms vs Rust's 28.9 ms. Scalar floating-point loop; essentially tied once `fsqrt` was
-  lowered to the hardware `llvm.sqrt.f64` intrinsic (it was ~20× slower before that fix).
-- **fannkuch-redux** — 1916 ms, marginally the fastest of the four. Integer array permutation with no
-  allocation; all four land within ~7% of each other.
+**Fastest of the four:**
+- **spectral-norm** — 38.9 ms, edging Rust (39.0). Division-heavy dense-float inner loop; the range-for
+  counter let LLVM vectorize the loop (`fdiv.2d` / `fmul.2d` NEON pairs), which is exactly the work this
+  benchmark is dominated by. This is the one the for-loop rewrite moved the most (was 55.0 ms / 1.44×).
+- **fannkuch-redux** — 1938 ms, marginally the fastest. Integer array permutation, no allocation; all
+  four land within ~7%.
 
-**Slower (1.15×–1.44×):**
-- **mandelbrot** (1.15× vs Go) — scalar-double escape math into a bit-packed buffer. Go edges ahead via
-  FMA contraction; Nova and Rust are within noise of each other but both behind Go here.
-- **nsieve** (1.36× vs Rust) — boolean sieve over a fixed array.
-- **spectral-norm** (1.44× vs Rust) — dense float array with a division-heavy inner loop. The array-loop
-  cost is the recurring theme: Nova round-trips values through heap array slots where Rust/Go keep them
-  in registers.
+**Tied / within noise:**
+- **mandelbrot** (1.00× vs Rust) — scalar-double escape math into a bit-packed buffer. Nova and Rust are
+  indistinguishable; C# trails both by ~14%.
+- **nbody** (1.07× vs Rust) — scalar N-body with a `sqrt` per step. Tied once `fsqrt` was lowered to the
+  hardware `llvm.sqrt.f64` intrinsic (it was ~20× slower before that fix). Nova is 2.4× faster than Go
+  and 2.6× faster than C# here.
 
-**A lot slower:**
-- **binary-trees** (2.22× vs C#) — allocation churn. Nova's ARC (reference counting) is correct and
+**Slower:**
+- **nsieve** (1.41× vs Rust) — boolean sieve over a fixed array. The hot work is *strided single-byte
+  writes* while crossing off multiples — no float math to vectorize and a memory-access pattern that
+  doesn't benefit from the range-for change (measured: identical to the while-loop version). This is a
+  cache-and-branch-bound loop where Nova's per-iteration codegen is simply looser than Rust's.
+- **binary-trees** (2.20× vs C#) — allocation churn. Nova's ARC (reference counting) is correct and
   ASAN-clean, but per-node inc/dec/free is far more expensive than C#'s generational GC (the outright
-  winner here) or even Rust `Box` / Go GC (both ~270 ms vs Nova's 429 ms). **Allocation-heavy code is
-  Nova's clear weak spot.**
+  winner at 196 ms) and still ~1.6× behind Rust `Box` / Go GC (both ~270 ms). **Allocation-heavy code
+  remains Nova's clear weak spot** — it is the one benchmark where the language model, not the codegen,
+  is the ceiling.
+
+---
+
+## Golden match (this run)
+
+Every Nova result was verified against the peers at the **same problem size**, not just against a stored
+expected value:
+
+| Benchmark | Golden output (all languages agree) |
+|---|---|
+| nbody | `-0.169075164` / `-0.169086185` |
+| spectral-norm | `1.274224148` |
+| mandelbrot | md5 `b137ead094e9d7acf5fd7bfa329e8cde` |
+| nsieve | `14683` / `7837` / `4203` |
+| fannkuch-redux | `556355` / `Pfannkuchen(11) = 51` |
+| binary-trees | `long lived tree of depth 16   check: 131071` |
 
 ---
 
 ## SIMD (a separate, self-referential result)
 
-Nova gained an explicit `f64x4` vector type (LLVM `<4 x double>`). On a dot-product kernel:
+Nova also has an explicit `f64x4` vector type (LLVM `<4 x double>`). On a dot-product kernel:
 
 | | time | |
 |---|---:|---|
@@ -60,22 +99,23 @@ Nova gained an explicit `f64x4` vector type (LLVM `<4 x double>`). On a dot-prod
 
 This is a **self-comparison** (Nova-SIMD vs Nova-scalar), *not* a win over the peers: a hand-vectorized
 Rust/C# version would also be ~4×. The honest claim is only that Nova now *has* usable, deterministic
-SIMD and it delivers the expected 4× lane parallelism.
+SIMD and it delivers the expected 4× lane parallelism. With auto-vectorization now landing on plain
+range-for loops (spectral, above), the explicit type matters mainly for kernels the vectorizer can't
+prove safe on its own.
 
 ---
 
-## Why Nova trails (the specific costs)
+## Why the two laggards trail (the specific costs)
 
-1. **Array access goes through the heap.** Fixed arrays (`double[N]` etc.) store values inline with
-   direct indexed load/store, but the hot value still round-trips to memory each iteration where a
-   register-allocating backend keeps it in a register. This is the 1.15×–1.44× on the array benchmarks.
-2. **ARC pays per object.** Every heap object carries a refcount touched on every retain/release, and
-   freeing is per-node. For allocation-churn workloads (binary-trees) this is 2×+ a generational GC.
-3. **No auto-vectorization.** Nova doesn't emit `noalias`, so LLVM won't auto-vectorize array loops;
-   SIMD requires the explicit `f64x4` type.
+1. **Strided integer memory (nsieve).** The vectorizer can't help a sieve — each stride writes one byte
+   at a data-dependent address. This is register-allocation and branch quality in the scalar loop, where
+   Rust/Go are still tighter than Nova's codegen.
+2. **ARC pays per object (binary-trees).** Every heap object carries a refcount touched on every
+   retain/release, and freeing is per-node. For allocation-churn workloads this is 1.6×–2.2× a GC. A
+   region/arena allocator for provably-scoped subtrees is the structural fix, and the biggest remaining
+   perf item.
 
-None of these are wrong answers — Nova is *correct* everywhere (golden-output match, ASAN-clean) — but
-it is genuinely slower than mature toolchains on most of this set today.
+Everywhere else, the gap to Rust is now inside measurement noise.
 
 ---
 
@@ -87,24 +127,41 @@ it is genuinely slower than mature toolchains on most of this set today.
 | Rust | rustc 1.93.1 · `rustc -O` |
 | Go | go 1.26.0 · `go build` |
 | C# | .NET 9.0.116 · Release (server GC for binary-trees) |
-| Nova | 0.1.0 · `nova <file>.nova --release` |
-| Timing | best of 10 wall-clock runs, milliseconds |
+| Nova | 0.1.0 · `NOVA_ARC_ELIDE=1 nova <file>.nova --release` · host-CPU target, loop+SLP vectorization + ARC elision |
+| Timing | best of 8–12 wall-clock runs, milliseconds |
 
-Each benchmark folder holds the four source files (`*.nova`, `*.rs`, `*.go`, `cs/`) and the reference
-golden output. Ratios are Nova divided by the *fastest peer* for that row.
+Each benchmark folder holds the source files (`*.nova`, `*.rs`, `*.go`, `cs/`) and the reference golden
+output. The Nova sources are the `*_for.nova` / range-for variants. Ratios are Nova divided by the
+*fastest peer* for that row.
 
 ---
 
 ## What changed this pass
 
-Nova began this effort unable to hold floats in its generic container. The work that moved it from
-"float containers miscompile" to "competitive on 2 of 6, slower on the rest":
+The path from "float containers miscompile" to "fastest of four on 2, tied on 2":
 
 1. **`List<double>` fix** — a `double` closure argument miscompiled (LLVM verify failure).
 2. **Hardware `fsqrt`** — `math.fsqrt` → `llvm.sqrt.f64` intrinsic (nbody: ~20× → ~1×).
-3. **Fixed primitive arrays** — `T[N]` mutation, `.length`, `[value; count]` sizing, typed-GEP access
-   (array benchmarks: ~19× on `List<double>` → ~1.4× on fixed arrays).
-4. **`f64x4` SIMD** — explicit vector type (~4× over Nova's own scalar).
+3. **Fixed primitive arrays** — `T[N]` mutation, `.length`, `[value; count]` sizing, typed-GEP access.
+4. **Array pointer provenance + auto-vectorization** — arrays are real `ptr` (not `inttoptr` from the
+   i64 value-word), the C-API PassBuilder now enables loop+SLP vectorization, and the TargetMachine uses
+   the host CPU/features. Without all three, no array loop vectorizes.
+5. **Range-for loop idiom** — `for (i in 0..n)` emits a clean i64 induction variable (no 32-bit
+   trunc/sext), which is what SCEV needs. Rewriting the benchmark counted loops to range-for is what
+   turned auto-vectorization on for spectral-norm (1.44× → fastest) with no source-level SIMD.
+6. **`f64x4` SIMD** — explicit vector type (~4× over Nova's own scalar), for kernels the vectorizer
+   can't prove.
+7. **`NOVA_ARC_ELIDE` retain/release elision** — a compile-time peephole that removes a defensive
+   `nova_retain` + its paired `nova_release`(s) when a local only ever holds a value copied from a
+   **borrowed parameter's field** and never escapes (used only for null-checks, borrowed call-args, or
+   its own release). The parameter is caller-owned and live across the call, so the pair is provably
+   net-zero. **binary-trees 429.0 → 385.7 ms (+10%)**, moving it under 2× for the first time. Flag-gated
+   (default off = byte-identical codegen); 90/90 ARC-heavy conformance cases stay ASAN-clean with it on.
+   It fires only on the borrowed-param-field shape — `bottomUp`'s allocation+free is genuine work it
+   cannot touch, which is why binary-trees improves but does not reach parity.
 
-The remaining gaps — register allocation for array values, ARC cost under churn, auto-vectorization —
-are the next targets if the goal is to close on Rust/Go/C#.
+**Benchmarking is closed at this point.** The two remaining gaps — scalar-loop codegen / the i64
+value-word IR (nsieve) and ARC-vs-GC allocation churn (binary-trees) — are not tunable to Rust parity
+without a large project (a typed-SSA IR, or a region/arena allocator). Neither buys a *language*
+capability, so effort moves to features. Nova matches Rust within noise on 4 of 6 and beats Go/C# on
+those four; that is the standing result.

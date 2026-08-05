@@ -386,7 +386,7 @@ turns a fake crypto module into a real one *and* unblocks D4's security work. A9
   escaped) data; a web/tcp stack that can safely serve real HTTP with routing, middleware, and TLS.
 - **Buildable, testable, documented** against an accurate spec.
 
-That is the level where **you and early adopters can build real services on it** — the BTreeDB
+That is the level where **you and early adopters can build real services on it** — the NovaDB
 integration, YCSB benchmarks, and real Nova web apps all become realistic.
 
 **What Beta still is NOT (the gap to a 1.0 you'd ask strangers to adopt):**

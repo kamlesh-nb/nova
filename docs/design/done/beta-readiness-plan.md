@@ -315,12 +315,12 @@ by runtime primitives, not logic.
 
 **🔑 DECISION (user, 2026-07-17) — no WatchClient, no change-stream, no separate service.**
 ssehub's WatchClient existed to fan a **change stream** out across **micro-services**. Neither applies here:
-a change stream is implementable on BTreeDB but **not** on Postgres/MySQL/MSSQL/Mongo, so it cannot be a
+a change stream is implementable on NovaDB but **not** on Postgres/MySQL/MSSQL/Mongo, so it cannot be a
 portable framework primitive; and Nova targets a **monolith**, not micro-services. Therefore:
 - **The bus is a library inside the web framework**, not a standalone service. It lives in-process with the
   app — `std/web/sse.nova` — and the app publishes to it directly.
 - **There is no upstream-watch concept at all.** The "source" is ordinary application code calling
-  `publish(topic, event)`. If BTreeDB change-streams ever land, they become *one caller* of `publish`, not
+  `publish(topic, event)`. If NovaDB change-streams ever land, they become *one caller* of `publish`, not
   a component of the bus.
 - This also **deletes the multi-process replay/resume complexity budget**: one process owns every topic.
 

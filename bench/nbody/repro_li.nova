@@ -1,0 +1,2 @@
+import list;
+fn main(): int { let a = list.List<int>(); a.push(7); console.log(`${a.get(0) ?? 0}`); return 0; }

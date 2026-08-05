@@ -1,0 +1,33 @@
+// binary-trees: allocate/reclaim many tree nodes. Nova nodes are ARC-managed heap structs; children are
+// optional (a leaf has none). maxDepth baked. Matches the reference golden output.
+struct Node { pub left: Node | undefined, pub right: Node | undefined }
+
+fn bottomUp(depth: int): Node {
+    if (depth <= 0) { return Node { left: undefined, right: undefined }; }
+    return Node { left: bottomUp(depth - 1), right: bottomUp(depth - 1) };
+}
+fn itemCheck(n: Node): int {
+    let l = n.left;
+    if (l == undefined) { return 1; }
+    return 1 + itemCheck(l as Node) + itemCheck(n.right as Node);
+}
+
+const MIN_DEPTH: int = 4;
+const MAX_DEPTH: int = 16;
+
+fn ipow2(e: int): int { let v = 1; let i = 0; while (i < e) { v = v * 2; i = i + 1; } return v; }
+
+fn main(): int {
+    let stretchDepth = MAX_DEPTH + 1;
+    console.log(`stretch tree of depth ${stretchDepth}\t check: ${itemCheck(bottomUp(stretchDepth))}`);
+    let longLived = bottomUp(MAX_DEPTH);
+    let depth = MIN_DEPTH;
+    while (depth <= MAX_DEPTH) {
+        let iterations = ipow2(MAX_DEPTH - depth + MIN_DEPTH);
+        let check = 0; for (i in 0..iterations) { check = check + itemCheck(bottomUp(depth)); }
+        console.log(`${iterations}\t trees of depth ${depth}\t check: ${check}`);
+        depth = depth + 2;
+    }
+    console.log(`long lived tree of depth ${MAX_DEPTH}\t check: ${itemCheck(longLived)}`);
+    return 0;
+}

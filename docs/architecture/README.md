@@ -19,7 +19,7 @@ Nova is composed of three cooperating codebases.
 | **Runtime** | C++20 | `src/runtime/` | Linked into every native binary. It provides the async scheduler (Boost.Asio with LLVM coroutines), non blocking sockets, TLS (wolfSSL), channels and actors, and the allocator. |
 | **Standard library** | Nova | `src/std/` | Collections, string, serde (JSON, YAML, BSON), decimal128, regex, crypto, the HTTP and web framework, and the database seam. It is compiled from source on every build. |
 
-Two sibling projects reside outside this repository, namely **BTreeDB** (the Zig storage engine,
+Two sibling projects reside outside this repository, namely **NovaDB** (the Zig storage engine,
 `../../btree/`) and **nova-orchestrator** along with the database drivers (which are published Nova
 packages). These are consumers of the language and are not a part of it.
 
@@ -58,7 +58,7 @@ Every stage corresponds to one directory or file, and each of them has a deep di
    structured and compiled, the `db` seam, and the MediatR style `App` HTTP framework.
 5. **[Adding a Feature](05-adding-a-feature.md).** The contributor workflow: where a new keyword, type,
    builtin, or standard library module is to be placed, and the conformance gate that must remain green.
-6. **[BTreeDB](06-btreedb.md).** The sibling storage engine (a separate repository, in Zig): the slotted
+6. **[NovaDB](06-btreedb.md).** The sibling storage engine (a separate repository, in Zig): the slotted
    page B+Tree, the segmented buffer pool, MVCC and the WAL, the SQL layer, and the binary wire protocol
    that Nova's driver speaks.
 7. **[The Orchestrator](07-orchestrator.md).** The sibling control plane (a separate Nova package): the L7

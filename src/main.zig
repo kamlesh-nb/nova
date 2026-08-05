@@ -468,12 +468,16 @@ fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocator: 
         return try std.fmt.allocPrint(allocator, "src/std/data/sql/pool.nova", .{});
     }
 
-    if (resolveFromLocalPackages(module_name, allocator, io)) |local_hit| {
-        return local_hit;
-    }
     const dir_end = std.mem.lastIndexOfScalar(u8, base_path, '/') orelse 0;
     const dir = if (dir_end == 0) "" else base_path[0..dir_end];
 
+    // Importer-relative resolution WINS over any global package match. A driver package's own
+    // `src/codec.nova` must resolve for `import codec` whether the importer is `src/postgres.nova`
+    // (same dir) or `tests/66_x.nova` (reaches it via ../src), even though several driver packages
+    // define a same-named `codec.nova`. Walking the importer's own tree first is what lets the
+    // internal modules drop their per-driver prefixes (pg_/my_/ms_/bt_/mongo_): without it the
+    // global scan below (resolveFromLocalPackages / resolveFromPackageCache) returns whichever
+    // package iterates first, so bare names could only stay unique via those prefixes.
     var current_len = dir.len;
     while (current_len > 0) {
         const current_dir = dir[0..current_len];
@@ -494,6 +498,10 @@ fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocator: 
 
         const last_slash = std.mem.lastIndexOfScalar(u8, current_dir, '/') orelse break;
         current_len = last_slash;
+    }
+
+    if (resolveFromLocalPackages(module_name, allocator, io)) |local_hit| {
+        return local_hit;
     }
 
     {

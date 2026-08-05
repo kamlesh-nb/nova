@@ -1,0 +1,44 @@
+// Mandelbrot (Computer Language Benchmarks Game): scalar-per-lane replica of the reference 1.go mbrot8
+// (10x5=50 z-iterations with tr/ti carry, membership = final zr^2+zi^2 <= 4). Packs 8 pixels/byte and
+// prints P4 header + md5 of the pixel bytes -- identical output contract to the Go/Rust/C# references.
+import bytes;
+import crypto.hash.md5;
+import crypto.hash.sha;
+
+const SIZE: int = 1600;               // must be a multiple of 8
+
+fn inSet(cr: double, ci: double): bool {
+    let zr = 0.0; let zi = 0.0; let tr = 0.0; let ti = 0.0;
+    for (o in 0..10) {
+        for (j in 0..5) {
+            let nzi = 2.0 * zr * zi + ci;
+            let nzr = (tr - ti) + cr;
+            zr = nzr; zi = nzi;
+            tr = zr * zr; ti = zi * zi;
+        }
+    }
+    return tr + ti <= 4.0;
+}
+
+fn main(): int {
+    let w = SIZE / 8;
+    let inv = 2.0 / (SIZE as double);
+    let pixels = bytes.alloc(SIZE * w);
+    for (py in 0..SIZE) {
+        let ci = (py as double) * inv - 1.0;
+        for (bx in 0..w) {
+            let accu = 0;
+            for (lane in 0..8) {
+                let cr = ((bx * 8 + lane) as double) * inv - 1.5;
+                if (inSet(cr, ci)) { accu = accu | ((0x80 >> lane)); }
+            }
+            bytes.write_byte(pixels, py * w + bx, accu);
+        }
+    }
+    let out = bytes.alloc(16);
+    md5.hashInto(pixels, SIZE * w, out);
+    console.log("P4");
+    console.log(`${SIZE} ${SIZE}`);
+    console.log(sha.toHex(out as string));
+    return 0;
+}

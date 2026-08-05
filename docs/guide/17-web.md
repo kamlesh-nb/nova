@@ -267,7 +267,7 @@ nova test tests/features/products_test.nova
 
 Data access goes through a repository written against the `Connection` trait and the micro-ORM, never
 against a concrete driver. The example registers an `InMemoryConnection` that implements the same
-`Connection` seam the real drivers (`nova-postgres`, `nova-mysql`, `nova-btreedb`, and the rest)
+`Connection` seam the real drivers (`nova-postgres`, `nova-mysql`, `nova-novadb`, and the rest)
 implement, so swapping in a live database is a one-line change in `main.nova` and nothing in the
 repository or the handlers moves.
 
@@ -424,7 +424,7 @@ You have now seen every core construct in Nova, from primitives to a working web
 steps:
 
 - The standard library packages. The database drivers (`nova-postgres`, `nova-mysql`, `nova-mssql`,
-  `nova-mongodb`, `nova-btreedb`) plug into the same app through repositories. See
+  `nova-mongodb`, `nova-novadb`) plug into the same app through repositories. See
   [`../packages.md`](../packages.md).
 - The [language specification](../language-specification.md) for the precise, citation backed
   contract behind everything in this guide.

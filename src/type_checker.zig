@@ -1147,7 +1147,7 @@ pub const TypeChecker = struct {
                         // Module-qualified constructor: `module.StructName(...)` -> StructName. The object
                         // is a module (not a typed value, so it resolves to null) and the field names a
                         // struct. Without this, any value derived from such a constructor (e.g.
-                        // `let d = btreedb.BTreeDriver()`) stays untyped, which blocks later type checks.
+                        // `let d = novadb.NovaDriver()`) stays untyped, which blocks later type checks.
                         if (self.structs.contains(fa.field)) return ast.TypeRef{ .ident = fa.field };
                         return null;
                     };

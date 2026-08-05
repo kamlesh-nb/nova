@@ -67,7 +67,7 @@ pub trait Connection {
 
 `exec`, `query`, and `prepare` are `async fn`, so that a driver's socket recv **parks the coroutine** (in
 a non blocking manner). `DbValue` is a tag struct union of the SQL value kinds; `ResultSet` and `Row`
-decode the typed cells. The concrete drivers (Postgres, MySQL, MSSQL, BTreeDB, MongoDB) are **separate
+decode the typed cells. The concrete drivers (Postgres, MySQL, MSSQL, NovaDB, MongoDB) are **separate
 published packages** (`nova-<name>`), fetched via `nova get`; only the seam and the generic connection pool
 reside in std. A repository merely constructs a driver and awaits it.
 

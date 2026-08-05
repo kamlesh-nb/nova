@@ -1,0 +1,38 @@
+// fannkuch-redux, scalar (Anderson/Rettig enumeration). n baked; prints checksum then Pfannkuchen(n).
+const N: int = 11;
+fn main(): int {
+    let perm: int[16] = [0; 16];
+    let perm1: int[16] = [0; 16];
+    let count: int[16] = [0; 16];
+    for (i in 0..N) { perm1[i] = i; }
+    let r = N; let maxFlips = 0; let checksum = 0; let permIndex = 0;
+    while (true) {
+        while (r != 1) { count[r - 1] = r; r = r - 1; }
+        for (j in 0..N) { perm[j] = perm1[j]; }
+        let flips = 0; let k = perm[0];
+        while (k != 0) {
+            let lo = 0; let hi = k;
+            while (lo < hi) { let t = perm[lo]; perm[lo] = perm[hi]; perm[hi] = t; lo = lo + 1; hi = hi - 1; }
+            flips = flips + 1; k = perm[0];
+        }
+        if (flips > maxFlips) { maxFlips = flips; }
+        if (permIndex - (permIndex / 2) * 2 == 0) { checksum = checksum + flips; } else { checksum = checksum - flips; }
+        // next permutation
+        let done = false;
+        while (true) {
+            if (r == N) { done = true; }
+            if (done) { break; }
+            let p0 = perm1[0]; let m = 0;
+            while (m < r) { perm1[m] = perm1[m + 1]; m = m + 1; }
+            perm1[r] = p0;
+            count[r] = count[r] - 1;
+            if (count[r] > 0) { break; }
+            r = r + 1;
+        }
+        if (done) { break; }
+        permIndex = permIndex + 1;
+    }
+    console.log(`${checksum}`);
+    console.log(`Pfannkuchen(${N}) = ${maxFlips}`);
+    return 0;
+}

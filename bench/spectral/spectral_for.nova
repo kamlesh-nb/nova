@@ -1,0 +1,22 @@
+import math;
+const N: int = 1000;
+fn evala(i: int, j: int): int { return (i + j) * (i + j + 1) / 2 + i + 1; }
+fn times(v: double[1000], u: double[1000]): void {
+    for (i in 0..N) { let a = 0.0; for (j in 0..N) { a = a + u[j] / (evala(i, j) as double); } v[i] = a; }
+}
+fn timesTrans(v: double[1000], u: double[1000]): void {
+    for (i in 0..N) { let a = 0.0; for (j in 0..N) { a = a + u[j] / (evala(j, i) as double); } v[i] = a; }
+}
+fn aTimesTransp(v: double[1000], u: double[1000], x: double[1000]): void { times(x, u); timesTrans(v, x); }
+fn pad9(n: long): string { let s = `${n}`; while (s.length < 9) { s = "0" + s; } return s; }
+fn fixed9(v: double): string { let neg = v < 0.0; let a = if (neg) 0.0 - v else v;
+    let scaled = (a * 1000000000.0 + 0.5) as long; let ip = scaled / 1000000000; let fp = scaled - ip * 1000000000;
+    return (if (neg) "-" else "") + `${ip}` + "." + pad9(fp); }
+fn main(): int {
+    let u: double[1000] = [1.0; 1000]; let v: double[1000] = [1.0; 1000]; let x: double[1000] = [0.0; 1000];
+    for (k in 0..10) { aTimesTransp(v, u, x); aTimesTransp(u, v, x); }
+    let vBv = 0.0; let vv = 0.0;
+    for (m in 0..N) { let vi = v[m]; vBv = vBv + u[m] * vi; vv = vv + vi * vi; }
+    console.log(fixed9(math.fsqrt(vBv / vv)));
+    return 0;
+}

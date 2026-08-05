@@ -1,7 +1,7 @@
 // YCSB A–F against PostgreSQL, via the driver-generic core (D5).
 // Run: with a running Postgres, then
 //   ./zig-out/bin/nova test --release repro/ycsb/ycsb_postgres.nova
-// DSN: postgres://user:pass@host:5432/db  (see data/sql/postgres.nova parseDsn).
+// DSN: postgres://user:pass@host:5432/db  (see data/sql/postgres.nova parse).
 import ycsb_core;
 import db;
 import postgres;

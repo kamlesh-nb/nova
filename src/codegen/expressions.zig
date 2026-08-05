@@ -2466,13 +2466,13 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 const obj_type = try self.resolveExpressionTypeName(fa.object);
                 if (obj_type) |struct_name| {
                     const base_struct = getStructBaseName(struct_name);
-                    if (std.mem.eql(u8, base_struct, "BTreeConnection") and
+                    if (std.mem.eql(u8, base_struct, "NovaConnection") and
                         (std.mem.eql(u8, fa.field, "query") or std.mem.eql(u8, fa.field, "queryStruct")))
                     {
                         const target_type = gc.type_args[0];
                         const sql_expr = gc.args[0];
                         const params_expr = gc.args[1];
-                        return try self.compileBTreeQuery(target_type, fa.object.*, sql_expr, params_expr);
+                        return try self.compileNovaQuery(target_type, fa.object.*, sql_expr, params_expr);
                     }
                 }
                 if (fa.object.kind == .ident and std.mem.eql(u8, fa.object.kind.ident, "Atomic") and std.mem.eql(u8, fa.field, "new"))
@@ -3897,7 +3897,7 @@ pub fn compileJsxElement(self: *LlvmCompiler, jsx: ast.JsxElement) anyerror!type
     return final_str;
 }
 
-pub fn compileBTreeQuery(
+pub fn compileNovaQuery(
     self: *LlvmCompiler,
     target_type: ast.TypeRef,
     conn_expr: ast.Expression,
@@ -3933,7 +3933,7 @@ pub fn compileBTreeQuery(
         core.LLVMPositionBuilderAtEnd(self.builder, current_bb);
     }
 
-    const query_internal_fn = self.func_map.get("BTreeConnection_queryInternal") orelse return error.QueryInternalNotFound;
+    const query_internal_fn = self.func_map.get("NovaConnection_queryInternal") orelse return error.QueryInternalNotFound;
     const query_internal_fn_t = core.LLVMGlobalGetValueType(query_internal_fn);
 
     const self_val = try self.compileExpression(conn_expr);

@@ -14,7 +14,7 @@ import string;
 import datetime;
 import math;
 import db;
-import btreedb;
+import novadb;
 
 struct Rng {
     pub state: long,
@@ -166,7 +166,7 @@ fn ycsb_af_suite(): void {
     let value = genValue(64);
 
     let rng = Rng(88172645463325252);
-    let drv = BTreeDriver();
+    let drv = NovaDriver();
     let conn = drv.connect("127.0.0.1:3009");
     conn.exec("CREATE TABLE ycsb_af (ykey TEXT PRIMARY KEY, ydata TEXT)", List<DbValue>());
 

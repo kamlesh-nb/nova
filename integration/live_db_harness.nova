@@ -19,14 +19,14 @@ import db;
 import postgres;
 import mysql;
 import mssql;
-import btreedb;
+import novadb;
 import mongodb;
 
 // A SQL CREATE/INSERT/SELECT/DROP roundtrip over any Connection-producing Driver. `textType` is the
 // column type for the name field (TEXT vs VARCHAR(32)) so each dialect gets a valid DDL. Returns "" on
 // success, else a human error string. Asserts one row decodes to (1, "Alice").
-fn sqlRoundtrip(drv: Driver, dsn: string, textType: string): string {
-    let conn = drv.connect(dsn);
+fn sqlRoundtrip(drv: Driver, connectionString: string, textType: string): string {
+    let conn = drv.connect(connectionString);
     let none = List<DbValue>();
     conn.exec("DROP TABLE IF EXISTS nova_live_probe", none);
     let c = conn.exec("CREATE TABLE nova_live_probe (id INT, name " + textType + ")", none);
@@ -52,42 +52,42 @@ fn skip(label: string, envVar: string): void {
 
 @test
 fn live_postgres(): void {
-    let dsn = env.get("NOVA_PG_DSN");
-    if (string.eql(dsn, "")) { skip("postgres", "NOVA_PG_DSN"); return; }
-    let err = sqlRoundtrip(PgDriver(), dsn, "TEXT");
+    let connectionString = env.get("NOVA_PG_DSN");
+    if (string.eql(connectionString, "")) { skip("postgres", "NOVA_PG_DSN"); return; }
+    let err = sqlRoundtrip(PgDriver(), connectionString, "TEXT");
     assert.equalStr("", err);
 }
 
 @test
 fn live_mysql(): void {
-    let dsn = env.get("NOVA_MYSQL_DSN");
-    if (string.eql(dsn, "")) { skip("mysql", "NOVA_MYSQL_DSN"); return; }
-    let err = sqlRoundtrip(MyDriver(), dsn, "VARCHAR(32)");
+    let connectionString = env.get("NOVA_MYSQL_DSN");
+    if (string.eql(connectionString, "")) { skip("mysql", "NOVA_MYSQL_DSN"); return; }
+    let err = sqlRoundtrip(MyDriver(), connectionString, "VARCHAR(32)");
     assert.equalStr("", err);
 }
 
 @test
 fn live_mssql(): void {
-    let dsn = env.get("NOVA_MSSQL_DSN");
-    if (string.eql(dsn, "")) { skip("mssql", "NOVA_MSSQL_DSN"); return; }
-    let err = sqlRoundtrip(MssqlDriver(), dsn, "VARCHAR(32)");
+    let connectionString = env.get("NOVA_MSSQL_DSN");
+    if (string.eql(connectionString, "")) { skip("mssql", "NOVA_MSSQL_DSN"); return; }
+    let err = sqlRoundtrip(MssqlDriver(), connectionString, "VARCHAR(32)");
     assert.equalStr("", err);
 }
 
 @test
 fn live_btreedb(): void {
-    let dsn = env.get("NOVA_BTREE_DSN");
-    if (string.eql(dsn, "")) { skip("btreedb", "NOVA_BTREE_DSN"); return; }
-    let err = sqlRoundtrip(BTreeDriver(), dsn, "TEXT");
+    let connectionString = env.get("NOVA_BTREE_DSN");
+    if (string.eql(connectionString, "")) { skip("novadb", "NOVA_BTREE_DSN"); return; }
+    let err = sqlRoundtrip(NovaDriver(), connectionString, "TEXT");
     assert.equalStr("", err);
 }
 
 @test
 fn live_mongodb(): void {
     // mongo is not SQL: exercise connect + a server ping command through the same seam.
-    let dsn = env.get("NOVA_MONGO_DSN");
-    if (string.eql(dsn, "")) { skip("mongodb", "NOVA_MONGO_DSN"); return; }
-    let conn = MongoDriver().connect(dsn);
+    let connectionString = env.get("NOVA_MONGO_DSN");
+    if (string.eql(connectionString, "")) { skip("mongodb", "NOVA_MONGO_DSN"); return; }
+    let conn = MongoDriver().connect(connectionString);
     let rs = conn.query("{\"ping\": 1}", List<DbValue>());
     conn.close();
     assert.isFalse(rs.hasError());

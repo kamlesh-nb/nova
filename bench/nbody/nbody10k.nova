@@ -1,0 +1,123 @@
+// N-body simulation (Computer Language Benchmarks Game), faithful port of the reference `1.go`.
+// SoA layout over List<double>. N is a compile-time const (Nova has no argv->int parse yet, and the
+// lexer has no `e` exponent literals, so the body constants are written expanded). Energy is printed
+// as %.9f to match the golden output (-0.169075164 / -0.169087605 for N=1000).
+import list;
+import math;
+
+const PI: double = 3.141592653589793;
+const SOLAR_MASS: double = 4.0 * PI * PI;
+const DAYS_PER_YEAR: double = 365.24;
+const NB: int = 5;
+const N: int = 10000;
+
+fn push7(x: list.List<double>, y: list.List<double>, z: list.List<double>,
+         vx: list.List<double>, vy: list.List<double>, vz: list.List<double>, mass: list.List<double>,
+         px: double, py: double, pz: double, pvx: double, pvy: double, pvz: double, pm: double): void {
+    x.push(px); y.push(py); z.push(pz);
+    vx.push(pvx * DAYS_PER_YEAR); vy.push(pvy * DAYS_PER_YEAR); vz.push(pvz * DAYS_PER_YEAR);
+    mass.push(pm * SOLAR_MASS);
+}
+
+fn g(a: list.List<double>, i: int): double { return a.get(i) ?? 0.0; }
+
+fn energy(x: list.List<double>, y: list.List<double>, z: list.List<double>,
+          vx: list.List<double>, vy: list.List<double>, vz: list.List<double>, mass: list.List<double>): double {
+    let e = 0.0;
+    let i = 0;
+    while (i < NB) {
+        e = e + 0.5 * g(mass, i) * (g(vx, i) * g(vx, i) + g(vy, i) * g(vy, i) + g(vz, i) * g(vz, i));
+        let j = i + 1;
+        while (j < NB) {
+            let dx = g(x, i) - g(x, j);
+            let dy = g(y, i) - g(y, j);
+            let dz = g(z, i) - g(z, j);
+            let dist = math.fsqrt(dx * dx + dy * dy + dz * dz);
+            e = e - (g(mass, i) * g(mass, j)) / dist;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return e;
+}
+
+fn advance(x: list.List<double>, y: list.List<double>, z: list.List<double>,
+           vx: list.List<double>, vy: list.List<double>, vz: list.List<double>, mass: list.List<double>, dt: double): void {
+    let i = 0;
+    while (i < NB) {
+        let ivx = g(vx, i); let ivy = g(vy, i); let ivz = g(vz, i);
+        let j = i + 1;
+        while (j < NB) {
+            let dx = g(x, i) - g(x, j);
+            let dy = g(y, i) - g(y, j);
+            let dz = g(z, i) - g(z, j);
+            let d2 = dx * dx + dy * dy + dz * dz;
+            let dist = math.fsqrt(d2);
+            let mag = dt / (d2 * dist);
+            let mi = g(mass, i); let mj = g(mass, j);
+            ivx = ivx - dx * mj * mag; ivy = ivy - dy * mj * mag; ivz = ivz - dz * mj * mag;
+            vx.set(j, g(vx, j) + dx * mi * mag);
+            vy.set(j, g(vy, j) + dy * mi * mag);
+            vz.set(j, g(vz, j) + dz * mi * mag);
+            j = j + 1;
+        }
+        vx.set(i, ivx); vy.set(i, ivy); vz.set(i, ivz);
+        x.set(i, g(x, i) + dt * ivx);
+        y.set(i, g(y, i) + dt * ivy);
+        z.set(i, g(z, i) + dt * ivz);
+        i = i + 1;
+    }
+}
+
+// %.9f for these magnitudes: scale by 1e9, round, split integer / 9-digit fraction.
+fn pad9(n: long): string {
+    let s = `${n}`;
+    while (s.length < 9) { s = "0" + s; }
+    return s;
+}
+fn fixed9(v: double): string {
+    let neg = v < 0.0;
+    let a = if (neg) 0.0 - v else v;
+    let scaled = (a * 1000000000.0 + 0.5) as long;
+    let ip = scaled / 1000000000;
+    let fp = scaled - ip * 1000000000;
+    let sign = if (neg) "-" else "";
+    return sign + `${ip}` + "." + pad9(fp);
+}
+
+fn main(): int {
+    let x = list.List<double>(); let y = list.List<double>(); let z = list.List<double>();
+    let vx = list.List<double>(); let vy = list.List<double>(); let vz = list.List<double>();
+    let mass = list.List<double>();
+
+    // sun
+    push7(x, y, z, vx, vy, vz, mass, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0);
+    // jupiter
+    push7(x, y, z, vx, vy, vz, mass,
+          4.8414314424647209, 0.0 - 1.16032004402742839, 0.0 - 0.103622044471123109,
+          0.00166007664274403694, 0.00769901118419740425, 0.0 - 0.0000690460016972063023, 0.000954791938424326609);
+    // saturn
+    push7(x, y, z, vx, vy, vz, mass,
+          8.34336671824457987, 4.12479856412430479, 0.0 - 0.403523417114321381,
+          0.0 - 0.00276742510726862411, 0.00499852801234917238, 0.0000230417297573763929, 0.000285885980666130812);
+    // uranus
+    push7(x, y, z, vx, vy, vz, mass,
+          12.8943695621391310, 0.0 - 15.1111514016986312, 0.0 - 0.223307578892655734,
+          0.00296460137564761618, 0.00237847173959480950, 0.0 - 0.0000296589568540237556, 0.0000436624404335156298);
+    // neptune
+    push7(x, y, z, vx, vy, vz, mass,
+          15.3796971148509165, 0.0 - 25.9193146099879641, 0.179258772950371181,
+          0.00268067772490389322, 0.00162824170038242295, 0.0 - 0.0000951592254519715870, 0.0000515138902046611451);
+
+    // offset momentum on the sun
+    let px = 0.0; let py = 0.0; let pz = 0.0;
+    let k = 0;
+    while (k < NB) { px = px + g(vx, k) * g(mass, k); py = py + g(vy, k) * g(mass, k); pz = pz + g(vz, k) * g(mass, k); k = k + 1; }
+    vx.set(0, 0.0 - px / SOLAR_MASS); vy.set(0, 0.0 - py / SOLAR_MASS); vz.set(0, 0.0 - pz / SOLAR_MASS);
+
+    console.log(fixed9(energy(x, y, z, vx, vy, vz, mass)));
+    let step = 0;
+    while (step < N) { advance(x, y, z, vx, vy, vz, mass, 0.01); step = step + 1; }
+    console.log(fixed9(energy(x, y, z, vx, vy, vz, mass)));
+    return 0;
+}

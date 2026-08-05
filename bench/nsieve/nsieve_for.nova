@@ -1,0 +1,19 @@
+const N: int = 4;
+const REPS: int = 400;
+fn sieve(flags: bool[160000], m: int): int {
+    for (i in 0..m) { flags[i] = true; }
+    let count = 0;
+    for (i in 2..m) {
+        if (flags[i]) { count = count + 1; let j = i + i; while (j < m) { flags[j] = false; j = j + i; } }
+    }
+    return count;
+}
+fn main(): int {
+    let flags: bool[160000] = [false; 160000];
+    let c0 = 0; let c1 = 0; let c2 = 0;
+    for (rep in 0..REPS) { c0 = sieve(flags, 10000*16); c1 = sieve(flags, 10000*8); c2 = sieve(flags, 10000*4); }
+    console.log(`Primes up to ${10000*16} ${c0}`);
+    console.log(`Primes up to ${10000*8} ${c1}`);
+    console.log(`Primes up to ${10000*4} ${c2}`);
+    return 0;
+}

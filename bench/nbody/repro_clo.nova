@@ -1,0 +1,6 @@
+fn main(): int {
+    let f = (x: double) => x * 2.0;
+    let r = f(3.0);
+    console.log(`${r}`);
+    return 0;
+}

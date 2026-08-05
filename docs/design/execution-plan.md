@@ -107,9 +107,9 @@ These are DONE and verified (ASAN + `NOVA_ARC_AUDIT` + corpus), not "compiles":
 - **Monomorphization COMPLETE** — abstract residue fully eliminated (`c8e1769`); worklist discovers
   method-return instantiations, spec-vs-base ARC reconciled, erased dead bodies dropped via reachability
   closure (M3-R1 `88db887` / R2 `992a6bb`).
-- **BTreeDB end-to-end LIVE** — Nova → running server: connect / DDL / insert / query / typed-decode,
+- **NovaDB end-to-end LIVE** — Nova → running server: connect / DDL / insert / query / typed-decode,
   ARC-clean (2 driver leaks fixed, `9a86f41`).
-- **D4 — YCSB A–F in Nova vs live BTreeDB** ✅ — full suite runs (release: ~20–30K ops/sec), ARC-clean,
+- **D4 — YCSB A–F in Nova vs live NovaDB** ✅ — full suite runs (release: ~20–30K ops/sec), ARC-clean,
   **measurably faster than the Python YCSB baseline** (`4c17abd`, `8a5da75`).
 - **Async runtime confirmed REAL** — multi-core (8 tasks 98 ms vs 616 ms serial; scales with
   `NOVA_THREADS`), async I/O (8 concurrent sleeps 201 ms on 1 thread). Not the "synchronous shim" the
@@ -144,7 +144,7 @@ toolchain/tooling (T1/T2/T4).
 
 ## Priority policy (user, 2026-07-24): **LANGUAGE FIRST**
 
-The compiler/runtime/stdlib — **Nova the language** — is ALWAYS the top execution priority. BTreeDB (a separate
+The compiler/runtime/stdlib — **Nova the language** — is ALWAYS the top execution priority. NovaDB (a separate
 engine) and the orchestrator/infrastructure items (**R1, I1, I2, I3, I4, BT1**) are valuable and user-requested, but
 they are **sequenced AFTER language work**. The `⭐user` tag marks *user interest*, not execution order. Global
 ordering:
@@ -180,9 +180,9 @@ not instead of finishing it.
 | **D1** | MySQL live verification (MySQL 9, caching_sha2 auth) | P3 | ✅ | live via `ycsb_mysql` (A–F) | (this session) |
 | **D2** | MSSQL driver (TDS 7.4) — offline codec + **live SQL-auth (cleartext AND TLS/ENCRYPT_ON)**, decimal/money/unicode exact; NTLM deferred | P3 | ✅ | `100_mssql_codec` | `d72dac1`, `d377cf1`, `1f8448b`, `48b47f2` |
 | **D3** | MongoDB driver (OP_MSG + SCRAM) — shipped as a **PACKAGE**; now **async/non-blocking** + all 4 SQL drivers ALSO moved to `packages/nova-<name>` (db seam + generic pool stay std) | ⭐P6 | ✅ | `90_bson_binary` + package `tests/` (17/17) + live vs mongod | (this session) |
-| **D4** | YCSB benchmarks in Nova vs BTreeDB | P2 | ✅ | bench A–F (live BTreeDB) | `4c17abd` `8a5da75` |
-| **D5** | YCSB over the `Driver` trait — driver-generic; **ALL FOUR engines (BTreeDB + Postgres + MySQL + MSSQL) live** ✅ by swapping only the Driver | ⭐P3 | ✅ | `repro/ycsb/` (4 engines live) | (this session) |
-| **D6** | Driver **hardening + completeness DONE**: timeouts + pooling + circuit-breaker + **all auth** (MySQL fast **& RSA full**, **PG SCRAM**) + **real server-side prepared statements on all 4 engines** (PG extended-query, MySQL COM_STMT binary, MSSQL sp_prepare RPC, BTreeDB); live on all. Async-recv now DONE under A1 (async-first seam → drivers non-blocking) | P3 | ✅ | `104`–`110` + driver gates + live | (this session) |
+| **D4** | YCSB benchmarks in Nova vs NovaDB | P2 | ✅ | bench A–F (live NovaDB) | `4c17abd` `8a5da75` |
+| **D5** | YCSB over the `Driver` trait — driver-generic; **ALL FOUR engines (NovaDB + Postgres + MySQL + MSSQL) live** ✅ by swapping only the Driver | ⭐P3 | ✅ | `repro/ycsb/` (4 engines live) | (this session) |
+| **D6** | Driver **hardening + completeness DONE**: timeouts + pooling + circuit-breaker + **all auth** (MySQL fast **& RSA full**, **PG SCRAM**) + **real server-side prepared statements on all 4 engines** (PG extended-query, MySQL COM_STMT binary, MSSQL sp_prepare RPC, NovaDB); live on all. Async-recv now DONE under A1 (async-first seam → drivers non-blocking) | P3 | ✅ | `104`–`110` + driver gates + live | (this session) |
 | **E1** | Error model `T \| Error` — `try`/`catch`/`catch (e)` + **`errdefer`** ✅; unguarded `.field` on `T\|E` = located typecheck error; `throw` removed (two-register-return = deferred perf opt) | P4 | ✅ | `32`/`33`/`45`/`101_errdefer` + `errunion_unguarded` | (this session) |
 | **A1** | async: **`future<T>` first-class** ✅ + **`when_all`/`parallel_for` fan-out/join** ✅ + **async METHODS + async TRAIT methods w/ dynamic dispatch** ✅ + **AsyncStream (parking socket I/O)** ✅ + **non-blocking TLS** (wolfSSL memory-BIO pumped by Nova async; crypto stays in wolfSSL) ✅ + **AsyncIO trait** ✅ + **async-first `Connection` seam — ALL 5 drivers non-blocking** ✅ (PG+MySQL LIVE-PROVEN: 5 concurrent server-side sleeps on ONE scheduler thread overlap ~0.3–0.7s vs ~1.5s serial; MSSQL TDS-tunneled async TLS; MongoDB async live) + **async `Driver.connect` → pooling works INSIDE coroutines** ✅ (live: concurrent handlers each `await pool.acquire()`+query+release, second wave reuses idle conns) + **awaited-deadline recv timeouts** ✅ (`Connection.setTimeout` real on the async transport — recv raced against a timer, `nova_arecv_deadline`; live: `pg_sleep(1)` under 150ms → empty in ~0.15s) + **`select` over futures** ✅ (`selectAny<T>` — await first of N, non-consuming) + **whole-query deadline** ✅ (`withTimeout<T>`/`selectTimeout<T>`; live: `pg_sleep(2)` bounded to 300ms) + **actor stdlib layer** ✅ (`Mailbox<M>`+`Behavior<M>` trait+`runActor<M>`; required **generic trait objects**, also fixed) + **generic-return typecheck** ✅ (`foo<int>()` result resolves `T`→`int`, `List<T>`→`List<int>`, etc.). **A1 COMPLETE** | P4 | ✅ | `102_future_first_class`, `103_async_when_all`, `111`–`119` (async_trait / stream / tls / timeout / select / whole_query_deadline / actor / generic_return) | `e645bb7`,`bdf60f2`,(this session) |
 | **A2** | **async function-coloring soundness + sync→async deadlock FIXED** ✅ — (1) runtime nested-block-drive guard (thread-local `io.run()` depth; `nova_run_root` aborts LOUD instead of hanging); (2) call-side coloring: a bare (non-`await`/`spawn`) async call inside an `async fn` is a typecheck error (caught 2 real latent bugs); (3) async web handler chain (`handle`/`send`/`dispatch`/`respondMiss` all async) → **per-request DB works** (flagship real query, was a hang). Narrower than "forbid all sync→async" so the sync-top-level drive (case 111) stays legal | P0 soundness | ✅ | `185_async_handler_chain` + `bare_async_call_in_async` | `dd2a9ea` (PR #2) |
@@ -211,7 +211,7 @@ not instead of finishing it.
 | **N1** | **Network I/O stack — share-nothing thread-per-core (Path A on Asio)** ✅. Decided over a from-scratch io_uring loop (`docs/design/network-io-stack-tradeoff.md`); Senders/Receivers rejected (Nova composes async in-language). Runtime is now **N=cores-1 independent reactors** (io_context per pinned thread), coroutines **PINNED** (no migration → per-coroutine strands are free no-ops), reactor-aware sockets + **SO_REUSEPORT per-reactor accept fan-out** (`spawnOn`=`nova_pin_next_coro` one-shot pin + persistence=`nova_hold_all_reactors` work_guards; the transient `nova_run` all gates use is UNTOUCHED). **Proxy pooling reuse gate LIFTED** — the original I1 per-coroutine-strand limit gone STRUCTURALLY. **P2** lock-striping (g_corostates/g_heldargs → 64 stripes) for contention relief. `NOVA_THREADS=1`=exact old behavior (rollback). Also T1 zlib cross-gap fixed (vendored zlib → full runtime cross-compiles to Linux) | ⭐user P1 | ✅ | 177/177 + ASAN 324/324 every phase; Linux SO_REUSEPORT distribution **Docker-verified with a real nova server** (90 conns even across 6 reactors) | P0 `cbdb71f`, P1 `c161d75`, P3 `f55cf5b`, P4a `c21a179`, P4c `a51f778`, P5 `9a665f6`, P2 `561d9de`, zlib `c93004d` |
 | **I1** | **Nova reverse proxy + load balancer + PID autoscaler** (⭐"most important", user) ✅ **DONE** — L4/L7 proxy on the async runtime + TCP server + **HAProxy-style per-reactor lock-free conn pool**, **share-nothing MULTI-CORE via N1** (per-reactor SO_REUSEPORT accept fan-out; `Proxy.run`; pooling reuse gate lifted). **LB algos** (`LbStrategy`: round-robin/weighted/least-conn/consistent-hash, all lock-free per-reactor; `178`). **Health-checked backend pool** (active TCP-connect / HTTP-GET probes, rise/fall drain hysteresis, drained backends excluded from every strategy; `179`). **PID autoscaler** (`net/autoscale`: anti-windup PID drives replica count from live in-flight metric, spawns/kills backends via R1, drain-before-kill; `180`, live-proven load=8→4 replicas, drain→1) | ⭐user P1 | ✅ | `167`+`178`+`179`+`180` + live | proxy `db492a9`/`423f666`; N1 multi-core; LB `ab07a2f`; health `b70d371`; autoscaler `ed00c5a` |
 | **I2** | **Nova orchestrator (native-k8s MVP)** ✅ **DONE (MVP)** — reconcile-loop node agent for **binaries (not containers)** in `std/orch/` (spec/supervisor/nativelet/isolation/autoscaler). Manifest-dir watch → desired-vs-actual reconcile (start/replace-changed/poll/stop-removed, filename-keyed presence robust to a SIGCHLD-EINTR read race), N **replicas**, **restart-on-crash** per policy (non-blocking `nova_process_try_wait`), graceful SIGTERM→SIGKILL stop, async **HTTP `/healthz` probes** (restart unhealthy, live-proven), **cgroups-v2** cpu/mem/pids via fs writes (`nova_process_pid` attach; Linux-only), **PID autoscaler** (reuses I1 controller, cgroup-CPU metric). One async coroutine drives it (no thread-per-workload). Deferred (full vision): multi-node/apiserver/scheduler, namespaces/seccomp/Landlock, service-VIP/DNS | ⭐user P2 | ✅ | `181` + live (deploy replicas:3→3, kill→restart, scale→5, delete→0; probe restarts 503, keeps 200) | `nova_process_try_wait`/`_pid` + `3f8e7e2` (core), `e18d586` (probe+cgroups), `d8054ed` (autoscaler) |
-| **BT1** | **BTreeDB concurrency → hundreds of clients** (SEPARATE btree repo) — Phase 0 wire the disconnected thread knob (`concurrent_limit` from config, trivial) + **re-benchmark under realistic YCSB** first; the global `db.rw_lock` removal needs a latch-safe B+tree SMO rewrite (Deep-P3, invasive) — **gate that on measured evidence** (the readiness plan itself walked back its urgency). NOT single-threaded (fibers on `std.Io.Threaded`); pool just isn't scaling | ⭐user P3 | ⬜ | (design below) | — |
+| **BT1** | **NovaDB concurrency → hundreds of clients** (SEPARATE btree repo) — Phase 0 wire the disconnected thread knob (`concurrent_limit` from config, trivial) + **re-benchmark under realistic YCSB** first; the global `db.rw_lock` removal needs a latch-safe B+tree SMO rewrite (Deep-P3, invasive) — **gate that on measured evidence** (the readiness plan itself walked back its urgency). NOT single-threaded (fibers on `std.Io.Threaded`); pool just isn't scaling | ⭐user P3 | ⬜ | (design below) | — |
 | **I3** | **Virtual network layer (k8s-Service-style VIPs)** ✅ **Tier 1 DONE** — `net/service`: `Service{name,vip,port,pool}` = a stable front address LB'ing to backend replicas on ephemeral ports over the I1 proxy, **health-gated membership** (drain via I1 checker), `ServiceRegistry` name→endpoint + `/etc/hosts`-style discovery file (`resolveFrom`). Runtime add `nova_aserver_listen_addr` (bind a specific VIP, not just INADDR_ANY) → `asyncio.serverListenAddr` + `proxy.serveAddr`. **Kernel tier (netns/veth/overlay/IPVS/eBPF) DEFERRED** (large FFI, Linux, root) — `veth` NOT implemented. Optional `nova_udp_*` DNS also deferred (discovery is file/registry-based) | infra (post-language) | ✅ (Tier 1) | `182` + live (stable :8080 → replicas 9101/9102 split 4/4; kill one → health-drained; registry discovery) | `1dfcbf0` |
 | **I4** | **Container-grade isolation (NATIVE kernel primitives — no bubblewrap/systemd/runc)** ✅ **Level 1 + seccomp DONE** — runtime `nova_process_spawn_isolated` shim (io.cpp, `__linux__`): `clone()` into namespaces (PID/mount/UTS/IPC/net/user) → sethostname → private mounts + `pivot_root` rootfs + fresh `/proc` → `no_new_privs` → drop ALL caps (bounding+capset, kernel headers not libcap → cross-compiles) → seccomp-BPF deny unshare/setns/mount/pivot_root/ptrace → `execve`. `os/sandbox` DIAL (level0/1/3) + `Process.spawnIsolated`. **I2 drives it** (Spec.isolationLevel+rootfs → supervisor). Off-Linux degrades to plain spawn | infra (post-language) | ✅ (L1+seccomp) | `183` + **Docker-verified** (native arm64 privileged: level-1 child PID=1 (own PID ns, host PIDs invisible) + HOST=novacontainer (UTS ns); seccomp `unshare`→EPERM) | `2d09a82` |
 | **Z1** | **Docs: technical architecture + contributor onboarding — DONE.** `docs/architecture/`: README overview + system map, 01-compiler, 02-codegen, 03-runtime, 04-stdlib/framework, 05-adding-a-feature onboarding, **06-btreedb**, **07-orchestrator**. All in a consistent formal register (no em-dashes), grounded in the real code | P3 | ✅ | `docs/architecture/*` | (this session) |
@@ -235,7 +235,7 @@ on `main` @ `a1dd076` (fast-forwarded; PRs #3–#6 landed):
   program cross-compiled macOS→Linux-arm64 (static ELF) **runs correctly in an Ubuntu container**
   (`sum=30 map=30 dec=20.00`); Windows PE32+ cross-build proven earlier.
 
-**Post-beta (not gating):** Z1 architecture docs **DONE** (`docs/architecture/`, 7 deep-dives incl. BTreeDB +
+**Post-beta (not gating):** Z1 architecture docs **DONE** (`docs/architecture/`, 7 deep-dives incl. NovaDB +
 orchestrator), WASM last mile **DONE** (`--wasm-run` 100/100 — the "`Storage<T>` OOB" was really the wasm
 function-as-value representation; see T2), native multi-OS *CI runners* (delivery already verified via
 cross-compile+Docker), D7/H3/BT1, F3/F4 partials.
@@ -263,7 +263,7 @@ planning passes. Pass 1 (framework/DB): W4 (DI via App), H3 (test infra), T7 (as
 production-readiness), D8 (micro-ORM). Pass 2 (HTTP/infra): W5 (REST client + auto-TLS), W6 (HTTP server hardening),
 W7 (compression), R1 (process runtime primitives), I1 (reverse proxy + LB + PID autoscaler), I2 (Nova
 orchestrator/native-k8s MVP), I3 (virtual network / k8s-Service VIPs), I4 (native container-grade isolation), BT1
-(BTreeDB concurrency); plus Z1 (architecture + onboarding docs — onboarding v1 authored). All designed below. Since the last update this session also: closed the last **A1** follow-ons
+(NovaDB concurrency); plus Z1 (architecture + onboarding docs — onboarding v1 authored). All designed below. Since the last update this session also: closed the last **A1** follow-ons
 (actor stdlib as `ActorCell.run()` generic-async METHOD + generic-trait-FIELD dispatch fix, gate 120; channel-gated
 fan-out overlap gate 121); fixed two real **sema** bugs found by running a scaffolded web app (enum-method return
 types + field-receiver closure param typing, gate 122); took the **web framework** to ~108k rps / 2.25× a same-machine
@@ -273,7 +273,7 @@ buffer addresses `long`); and advanced **T6** (dead-strip + per-file split incre
 COMPLETE** — the async-first DB seam plus the full async
 combinator set (timeouts, select, whole-query deadline, actors) and generic-return typechecking. All five
 drivers — Postgres,
-MySQL, MSSQL (TDS-tunneled async TLS), BTreeDB, MongoDB — are non-blocking over one `db.Connection`/`db.Driver`
+MySQL, MSSQL (TDS-tunneled async TLS), NovaDB, MongoDB — are non-blocking over one `db.Connection`/`db.Driver`
 seam, their socket recv PARKS the coroutine instead of holding the scheduler thread (PG+MySQL live-proven: 5
 concurrent server-side sleeps on ONE thread overlap ~0.3–0.7s vs ~1.5s serial). Non-blocking TLS was built the
 right way — wolfSSL keeps all crypto + cert-verification (memory-BIO), only the record pump is Nova async. The
@@ -298,7 +298,7 @@ typed materializer — reuses the serde `__bind`/`ValueSource` machinery, read-s
 fast `App` server), **W7** (gzip/deflate compression over the already-linked zlib — no new dep), **R1** (implement
 the process-spawn/kill runtime primitives — currently STUBS; blocks I2), **I1** (⭐ Nova reverse proxy + load
 balancer + PID autoscaler — the flagship "most important" app; every primitive already exists), **I2** (Nova
-orchestrator / native-k8s MVP for binaries not containers — ports the Zig PoC, gated on R1), **BT1** (BTreeDB
+orchestrator / native-k8s MVP for binaries not containers — ports the Zig PoC, gated on R1), **BT1** (NovaDB
 concurrency to hundreds of clients — Phase 0 config-knob + **re-benchmark first**; the latching rewrite is
 Deep-P3, gated on measured evidence per the readiness plan's own walk-back). **T6 Phase 1b DONE**
 (per-file `.o` split + content-hash cache + default-on; **F4-6 satisfied** — the generated serde/mediator units are
@@ -723,10 +723,10 @@ package's own `tests/` · fetch-and-consume demonstrated.
 # Driver distribution policy — seam + first-party in std, third-party drivers as PACKAGES
 
 **Question (user, 2026-07-22):** should mysql/postgres/mssql/btree drivers ship out-of-the-box in the stdlib?
-**Recommendation: NO for the third-party engines; keep only the SEAM + the first-party BTreeDB driver in std.**
+**Recommendation: NO for the third-party engines; keep only the SEAM + the first-party NovaDB driver in std.**
 
 - **In std (blessed, versioned with the language):** the DB abstraction — `db.Connection`/`db.Driver` traits,
-  `DbValue`, the binary-protocol helpers, `decimal128`/BSON codecs — plus **BTreeDB** (Nova's own engine, the
+  `DbValue`, the binary-protocol helpers, `decimal128`/BSON codecs — plus **NovaDB** (Nova's own engine, the
   batteries-included default so `nova init` apps work with zero deps).
 - **As packages (`nova get`):** PostgreSQL, MySQL, **MSSQL**, MongoDB. Each is a security-sensitive network
   client that tracks a database's own release cadence (new auth methods, protocol features); as a package it
@@ -737,33 +737,33 @@ package's own `tests/` · fetch-and-consume demonstrated.
   The consistent industry shape is **abstraction in std, drivers as packages** — which is exactly why the
   MongoDB driver is the package-manager's proving ground.
 - **Migration note:** postgres/mysql currently live under `src/std/data/sql/` (bundled). Long-term they move to
-  packages too; keep them in-tree until the package flow is battle-tested via MongoDB, then extract. BTreeDB
+  packages too; keep them in-tree until the package flow is battle-tested via MongoDB, then extract. NovaDB
   stays. (Not urgent — record the direction; don't churn working drivers yet.)
 
-# D4 — YCSB benchmarks in Nova vs BTreeDB (P2, CLAUDE.md goal) ✅
+# D4 — YCSB benchmarks in Nova vs NovaDB (P2, CLAUDE.md goal) ✅
 
-**Design:** YCSB core workloads (A–F) written in Nova against the BTreeDB driver: load phase + transaction
+**Design:** YCSB core workloads (A–F) written in Nova against the NovaDB driver: load phase + transaction
 phase, Zipfian (Gray et al., θ=0.99) / uniform key distributions via an LCG PRNG, latency/throughput reporting.
 **DoD:**
-- [x] Workloads **A–F** run against a live BTreeDB and report throughput+latency.
+- [x] Workloads **A–F** run against a live NovaDB and report throughput+latency.
 - [x] Load + transaction phases; zero-padded string keys (`user00000001`); typed row decode.
 - [x] ARC-clean under sustained load; release build ~20–30K ops/sec.
 - [x] Numbers recorded; **faster than the Python YCSB baseline**.
 
-**Status: ✅ COMPLETE.** BTreeDB (releasefast) + YCSB Nova (release), 10K-record run + full A–F sweep.
-**Deps:** BTreeDB driver (done), running engine. **Tracking:** ✅ 2026-07-21 · commits `4c17abd` `8a5da75` ·
-bench A–F live · Nova+BTreeDB both beat Python.
+**Status: ✅ COMPLETE.** NovaDB (releasefast) + YCSB Nova (release), 10K-record run + full A–F sweep.
+**Deps:** NovaDB driver (done), running engine. **Tracking:** ✅ 2026-07-21 · commits `4c17abd` `8a5da75` ·
+bench A–F live · Nova+NovaDB both beat Python.
 
 # D5 — YCSB over the `Driver` trait: PostgreSQL / MySQL / MSSQL (⭐user P3, driver test harness) ◑
 
 **Why (user, 2026-07-22):** YCSB is the best DRIVER test — one workload exercises a driver's whole surface end
 to end against a REAL server: connect, auth, DDL, parameterized statements, typed encode/decode across every
 column type, batching, range scans, and error paths. Unit tests miss protocol/codec bugs; YCSB (a behavioural
-test, not mocks) catches them — it already surfaced the BTreeDB driver leaks in D4. Running the SAME A–F
+test, not mocks) catches them — it already surfaced the NovaDB driver leaks in D4. Running the SAME A–F
 workloads across engines also yields an apples-to-apples correctness + performance matrix.
 
 **Design:** refactor the D4 YCSB core to run against **any** `db.Driver`/`db.Connection` — parameterize the
-harness by driver instead of hard-coding BTreeDB — then instantiate it for PostgreSQL, MySQL, and (once D2
+harness by driver instead of hard-coding NovaDB — then instantiate it for PostgreSQL, MySQL, and (once D2
 lands) MSSQL. Each run: load phase → transaction phase (A–F), typed reads validated, latency/throughput
 reported. The refactor is itself a proof the DB abstraction is real (same code, swapped driver).
 
@@ -779,7 +779,7 @@ those. YCSB is the PRIMARY driver test, not the only one.
   driver + DSN and passes the engine's CREATE-TABLE dialect (Postgres/BTree `TEXT PK`; MySQL `VARCHAR(64) PK`).
 - **Verified live against THREE engines by swapping only the driver** (proves the abstraction is real; same
   `runSuite`, same workload code, different `Driver`):
-  - **BTreeDB** — A 26.9K / B 26.6K / C 23.1K / D 29.0K / E 19.2K / F 17.3K ops/sec.
+  - **NovaDB** — A 26.9K / B 26.6K / C 23.1K / D 29.0K / E 19.2K / F 17.3K ops/sec.
   - **PostgreSQL** — A 10.5K / B 18.5K / C 20.0K / D 18.3K / E 1.9K / F 7.9K ops/sec (trust auth; `E` scans slow
     without an index, as expected).
   - **MySQL 9** — A 16.8K / B 15.2K / C 19.4K / D 15.7K / E 10.3K / F 11.2K ops/sec (caching_sha2, fast-auth).
@@ -796,16 +796,16 @@ those. YCSB is the PRIMARY driver test, not the only one.
   the driver's live-path ARC leaks (MyReader 64KB buffer via a `delete()` destructor; packet payload via
   bind-`as string` — same class as the BtReader fixes). MySQL query/scan return correct rows, ARC + ASAN clean.
 
-**Remaining:** [x] driver-generic core; [x] BTreeDB live; [x] PostgreSQL live; [x] **MySQL live**; [x] **MSSQL
+**Remaining:** [x] driver-generic core; [x] NovaDB live; [x] PostgreSQL live; [x] **MySQL live**; [x] **MSSQL
 live** (D2 landed); [ ] a persisted cross-driver table + per-driver feature smoke (non-CRUD). Note: `query`
 typed-row VALIDATION is light here (throughput focus) — pair with the drivers' own codec gates. **Deps:** D2 ✅.
-**Tracking:** ✅ 2026-07-22 · `repro/ycsb/` driver-generic; **ALL FOUR engines (BTreeDB + PostgreSQL + MySQL +
+**Tracking:** ✅ 2026-07-22 · `repro/ycsb/` driver-generic; **ALL FOUR engines (NovaDB + PostgreSQL + MySQL +
 MSSQL) live-verified** by swapping only the `Driver` — the abstraction is real.
 
 ## D5b — Concurrency-scaling benchmark (multi-process load generator) ⭐
 
 **Why:** the single-threaded YCSB numbers say nothing about how an engine behaves under CONCURRENT clients —
-the real production question (and the one that decides the "is BTreeDB fast enough" debate). The drivers'
+the real production question (and the one that decides the "is NovaDB fast enough" debate). The drivers'
 `readAll` is a synchronous blocking `recv`, so in-process `spawn` would need one OS thread per in-flight op and
 is fragile; the robust design (like pgbench/sysbench/memtier) is **multi-process**: C independent client
 PROCESSES, each its own connection, all running a fixed-duration workload at once, op-counts summed → aggregate
@@ -813,45 +813,45 @@ ops/sec. `repro/ycsb/`: `ycsb_client_core.nova` (env-configured load/run modes) 
 (`fn main()` binaries) + `conc_scaling.sh` (loads once, sweeps C=1,2,4,…, prints aggregate + per-client + scaling).
 
 **Findings (8-core box, 2026-07-22):**
-- **⚠️ BTreeDB CRASHES under concurrent WRITES** — the 2nd concurrent writer kills the server
+- **⚠️ NovaDB CRASHES under concurrent WRITES** — the 2nd concurrent writer kills the server
   (`error(wal): Failed to write WAL header during rotation: NotOpenForWriting` — a WAL-rotation race). A single
   writer is fine (~55K ops/s mixed). This is machine-independent, reproducible, and a hard production blocker:
-  BTreeDB cannot currently serve concurrent writers at all. **This reframes the "2× faster than Postgres" story
+  NovaDB cannot currently serve concurrent writers at all. **This reframes the "2× faster than Postgres" story
   — the single-threaded speed is moot until concurrent writes are safe.** (Tracks the readiness note's global
   `db.rw_lock` / ~5-thread ceiling, but the failure mode is a CRASH, not a plateau.)
-- **Read-only scaling is machine-bound here, not cleanly engine-bound** — BTreeDB and PostgreSQL BOTH plateau at
+- **Read-only scaling is machine-bound here, not cleanly engine-bound** — NovaDB and PostgreSQL BOTH plateau at
   ~3.2–3.6× (BTree ~105K, PG ~74K ops/s) around C=4–8. Since both hit the wall at the same place on an 8-core box,
   that plateau is the **heavy Nova clients + server competing for 8 cores**, NOT each engine's internal lock —
-  can't attribute BTreeDB's read plateau to the rw_lock without lighter clients or a separate load machine.
+  can't attribute NovaDB's read plateau to the rw_lock without lighter clients or a separate load machine.
   Honest read: read-concurrency is inconclusive on this single-box setup; the WRITE crash is the real result.
 - **PostgreSQL handles concurrent writes fine** — mixed 50/50 scales to 4.5×+ at C=16 and keeps climbing, never
-  crashes. The contrast with BTreeDB's write crash is the headline.
+  crashes. The contrast with NovaDB's write crash is the headline.
 
-**Driver hardening the benchmark forced (real bugs):** the BTreeDB/PostgreSQL drivers' `readFrame` did
+**Driver hardening the benchmark forced (real bugs):** the NovaDB/PostgreSQL drivers' `readFrame` did
 `bytes.alloc(len - 4)` with NO sanity check — when a server crashes mid-stream and sends a partial/corrupt
 frame, `plen` goes negative or multi-GB → **client SIGSEGV**. Added a guard (`plen < 0 || plen > 64MB` →
 treat as broken connection, return the -1 frame callers already handle). A DB client must never segfault on a
 dead socket. (MySQL's u24 length is self-bounding, already safe.)
 
 **Remaining:** the read-scaling measurement needs lighter clients (or a separate load box) to decouple client
-CPU from engine concurrency; and BTreeDB's WAL-rotation-under-concurrent-writes crash is a btree-side fix.
-**Tracking:** ⭐ 2026-07-22 · `repro/ycsb/conc_scaling.sh` + `client_*.nova`; found the BTreeDB concurrent-write
+CPU from engine concurrency; and NovaDB's WAL-rotation-under-concurrent-writes crash is a btree-side fix.
+**Tracking:** ⭐ 2026-07-22 · `repro/ycsb/conc_scaling.sh` + `client_*.nova`; found the NovaDB concurrent-write
 crash + hardened two drivers against dead-socket segfaults.
 
-> **BTreeDB is PARKED (separate project).** The concurrency crash + the go-forward engine plan (Phase 1 stop-
+> **NovaDB is PARKED (separate project).** The concurrency crash + the go-forward engine plan (Phase 1 stop-
 > the-crash: WAL mutex + BgWriter under the DB lock; Phase 2 lightweight latches + group-commit WAL for write
 > concurrency; Phase 3 multi-model SQL **and** NoSQL/document) are documented in **`btree/execution-plan-btree.md`**.
 > Not a Nova-language task — Nova's driver + benchmark harness are done and hardened. This plan resumes NOVA work.
 
 ## D6 — Driver hardening & completeness (found under concurrent load, 2026-07-22) ✅
 
-The D5b concurrency benchmark exercised the PostgreSQL / MySQL / BTreeDB drivers far harder than the codec
+The D5b concurrency benchmark exercised the PostgreSQL / MySQL / NovaDB drivers far harder than the codec
 gates did, and surfaced real robustness + completeness gaps. **Fixed** ones are recorded so they don't regress;
 **open** ones are the remaining driver work — the drivers today are single-connection, blocking, synchronous
 clients that are fine for a benchmark or a simple app but not yet production-grade under concurrency.
 
 **Fixed this session (regression-guard here):**
-- [x] **Dead-socket SIGSEGV (Postgres + BTreeDB).** `readFrame` did `bytes.alloc(len - 4)` with no bounds
+- [x] **Dead-socket SIGSEGV (Postgres + NovaDB).** `readFrame` did `bytes.alloc(len - 4)` with no bounds
       check — when a server crashed mid-stream and sent a partial/corrupt frame, `plen` went negative or
       multi-GB → **client segfault**. Guarded (`plen < 0 || plen > 64 MB` → treat as broken connection). A DB
       client must never segfault on a dead socket. (MySQL's u24 length is self-bounding — already safe.)
@@ -871,7 +871,7 @@ clients that are fine for a benchmark or a simple app but not yet production-gra
 - [x] **Connection pooling.** `data/sql/pool.nova` — a driver-generic `Pool` over the `Driver`/`Connection`
       seam: `acquire()` reuses a warm idle connection (LIFO) or opens a new one; `release(c)` returns it (or
       closes the surplus past `maxIdle`); `closeAll()` drains at shutdown; `opened`/`live`/`idle` diagnostics.
-      Programs against the traits, so the same pool serves BTreeDB/PG/MySQL/MSSQL by swapping the driver. Reuse
+      Programs against the traits, so the same pool serves NovaDB/PG/MySQL/MSSQL by swapping the driver. Reuse
       avoids paying the connect+auth handshake per request — what the async web app needs. Verified: live PG
       acquire→query→release→**reuse** (opened stays 1), concurrent checkout opens a 2nd, `closeAll` drains; a
       counting-mock gate (`104_conn_pool`, 9 assertions) proves the semantics offline. ARC+ASAN clean.
@@ -882,7 +882,7 @@ clients that are fine for a benchmark or a simple app but not yet production-gra
       statement object — all state stays on the connection; per-connection cache, deduped by SQL). **PostgreSQL:
       real server-side extended query** — Parse+Describe once (caching the assigned name + RowDescription
       columns, which Execute never resends), then Bind (text-format params) + Execute + Sync per run; the server
-      parses/plans a given SQL a single time. The other three drivers (MySQL/BTreeDB/MSSQL) + mocks get an
+      parses/plans a given SQL a single time. The other three drivers (MySQL/NovaDB/MSSQL) + mocks get an
       **emulated fallback** (client-side `$N` substitution via their own `query`/`exec` — same API +
       injection-safety, no server-side plan cache); real MySQL `COM_STMT_*` / MSSQL `sp_prepare` are follow-ons.
       Verified live: PG prepare→queryPrepared with two different param sets, dedup (same SQL → same handle, no
@@ -934,7 +934,7 @@ clients that are fine for a benchmark or a simple app but not yet production-gra
 **Deps:** SCRAM wiring depended on C1 (done); TLS-in-handshake shared with D2 (MSSQL). **Tracking:** ✅ 2026-07-23
 · dead-socket + ARC + **timeouts** + **connection pooling** + **circuit-breaker resilience** + **all auth**
 (MySQL native/caching_sha2 fast **and RSA full-auth**, **PG SCRAM-SHA-256**) + **real server-side prepared
-statements on ALL FOUR engines** (PG extended-query, MySQL COM_STMT binary, MSSQL sp_prepare RPC; BTreeDB
+statements on ALL FOUR engines** (PG extended-query, MySQL COM_STMT binary, MSSQL sp_prepare RPC; NovaDB
 emulated over its own protocol) all landed + live-verified. D6 driver hardening + completeness is DONE. The one
 remaining item (non-blocking async recv) is an async-first redesign of the `Connection` seam — A1 scope, not a
 D6 gap. En route also fixed two real pre-existing bugs (MySQL null-bitmap leak, MSSQL NBCROW NULL-row decode).
@@ -1080,7 +1080,7 @@ more numeric contexts (mixed int/decimal expr) still needs the no-implicit-coerc
 # S4 — text→decimal128 parser (shared dependency)
 
 **Problem.** No `string → decimal128` exists, so DB `numeric`/`DECIMAL` columns come back as text, not exact
-decimals (open across BTreeDB, Postgres, MySQL, and BSON/JSON serde). **Design:** parse a decimal string
+decimals (open across NovaDB, Postgres, MySQL, and BSON/JSON serde). **Design:** parse a decimal string
 (sign, integer, fraction, exponent) into the 128-bit BID representation, round-half-even to 34 digits —
 mirror the existing decimal literal path. Runtime primitive `nova_decimal_from_string` (or Nova-side).
 **DoD:** KAT `decimal_parse` (`"3.14"`, `"-0.1"`, `"1e10"`, edge exponents) exact; DB drivers switch numeric
@@ -1269,7 +1269,7 @@ MyApp/
 │   ├── entities/ (product.nova, order.nova)
 │   └── exceptions/ (domain_exception.nova)
 ├── Shared/
-│   ├── database/ (app_db.nova)              # DB context / connection wiring (BTreeDB driver)
+│   ├── database/ (app_db.nova)              # DB context / connection wiring (NovaDB driver)
 │   ├── behaviors/ (validation.nova, logging.nova)   # pipeline behaviors (X1 PipelineBehavior)
 │   └── middleware/ (exception_handling.nova)
 ├── main.nova                       # = Program.cs: DI registration + pipeline setup + app.run
@@ -1661,7 +1661,7 @@ write the `docs/specs.md` DI section before implementing.
 **Definition of Done:**
 - [ ] `addSingleton<T>`/`addTransient<T>`/`addScoped<T>` (type-keyed via `typeName<T>`) + `resolve<T>(): T`; three real lifetimes.
 - [ ] `App.withServices(sc)` owns a provider; `App()` still works (empty provider, zero-dep handlers unchanged).
-- [ ] A mediator handler with `init(logger, db)` gets those injected at dispatch — proven with a real `Logger` + a real DB connection (BTreeDB or a pooled PG conn) in a gate.
+- [ ] A mediator handler with `init(logger, db)` gets those injected at dispatch — proven with a real `Logger` + a real DB connection (NovaDB or a pooled PG conn) in a gate.
 - [ ] Per-request scope: a `Scoped` service is resolved once per request, reused within it, disposed after (observable via a counting factory).
 - [ ] New gate `NNN_di_handler_injection` (singleton logger + scoped db injected; transient freshness; scope disposal count) + full suite green + ASAN clean.
 - [ ] **DI is reached through `App`** — a `nova init app` scaffold registers services via the App-owned container and its `app.get<T>` handlers get injected; the `src/templates.zig:20` boilerplate is regenerated to the clean surface (no manual `resolve … as T` in user code).
@@ -1705,7 +1705,7 @@ via the import graph), matching the existing convention (fs/env/string/math/cryp
   MongoDB precedent). Route the engine-specific cases: MySQL `66`/`108`/`109` → `packages/nova-mysql`; Postgres
   `67`/`107` → `packages/nova-postgres`; MSSQL `100`/`110` → `packages/nova-mssql`; MongoDB driver-level OP_MSG/BSON
   `90` → `packages/nova-mongodb` (the BSON *codec* itself stays in std `serde/bson.nova`, so `51_bson_decimal` stays
-  with serde); BTreeDB `65` → the BTreeDB driver's own tests (BTreeDB driver stays in std per the distribution
+  with serde); NovaDB `65` → the NovaDB driver's own tests (NovaDB driver stays in std per the distribution
   policy, so its tests sit beside it). **Net: the corpus keeps ZERO engine-specific driver cases**; the std keeps
   only the seam + BSON-codec tests.
 - **Stay in `conformance/` (compiler/language-only, no module home):** closures (`04`–`06`/`27`/`35`/`49`),
@@ -2051,13 +2051,13 @@ container runtime.
 
 **Are we in a position? YES for the MVP — once R1 lands.** The Zig PoC is a clean blueprint: watch-dir reconcile +
 spawn + restart + cgroups + file-heartbeat. Nova already has the async control loop (timers/`spawn`), JSON/YAML
-manifest parsing, BTreeDB for desired-state, channels/actors for per-workload supervisors, an HTTP client for real
+manifest parsing, NovaDB for desired-state, channels/actors for per-workload supervisors, an HTTP client for real
 health probes, and cgroups-v2 via plain `fs.nova` writes to `/sys/fs/cgroup/…` (exactly the Zig trick). **The one
 hard blocker is R1** (process spawn/kill is a stub today).
 
 **Design — MVP (maps ~line-for-line onto the Zig PoC + three additions it lacks):**
 1. **Manifest / desired state** — parse `ProcessDeployment` (YAML via serde, or JSON like the PoC): replicas,
-   binary path, args, restart policy, resources, probes. Desired state from a manifest dir and/or BTreeDB.
+   binary path, args, restart policy, resources, probes. Desired state from a manifest dir and/or NovaDB.
 2. **Reconcile loop** — async `spawn` + timer every N s; diff desired vs actual (running supervisors); start new,
    restart on spec change, stop deleted (the PoC's `reconcile`/`specsEqual`).
 3. **Supervisor per workload** — spawn the binary (R1), capture stdout/stderr to a log, **restart-on-crash** per
@@ -2082,14 +2082,14 @@ userspace proxy building block); artifact fetch + Sigstore verify; tmpfs secrets
 - [ ] A live demo: deploy a Nova web-app binary at `replicas: 3`, kill one (auto-restarts), drive load (autoscaler adds replicas), delete the manifest (all stop). ARC/ASAN clean over a sustained run.
 
 **Dependencies:** **R1 (hard blocker)**, W5 (health probes), serde YAML (done), async runtime (done), optionally
-BTreeDB (desired-state) + I1 (proxy/autoscaler). **Tracking:** _pending._
+NovaDB (desired-state) + I1 (proxy/autoscaler). **Tracking:** _pending._
 
 ---
 
-# BT1 — BTreeDB concurrency to hundreds of clients (separate `btree` repo)
+# BT1 — NovaDB concurrency to hundreds of clients (separate `btree` repo)
 
-**Why (user, 2026-07-24).** Make BTreeDB usable by hundreds of simultaneous clients. **Correction (user, 2026-07-24):
-BTreeDB is NOT single-threaded** — it runs on Zig's `std.Io.Threaded` threadpool, executing per-connection work as
+**Why (user, 2026-07-24).** Make NovaDB usable by hundreds of simultaneous clients. **Correction (user, 2026-07-24):
+NovaDB is NOT single-threaded** — it runs on Zig's `std.Io.Threaded` threadpool, executing per-connection work as
 **fibers with colorless async** (no function-color split). Concurrency is real; the problem is **the pool does not
 scale**. Two distinct causes, not "single-threadedness":
 1. **The threadpool knob is disconnected** — `main.zig:151` hard-codes `concurrent_limit = .unlimited` and never
@@ -2163,7 +2163,7 @@ membership, ejection of unhealthy backends — **without kernel networking**. Tw
   configured-range loopback alias). Needs (a) an OS-level alias (`ifconfig lo0 alias …` / `ip addr add` — a host
   setup step, root, OUTSIDE Nova) and (b) a **small runtime change**: `nova_socket_listen`/the async listener bind
   `INADDR_ANY` only today (`io.cpp:355`) — add a bind-address argument so the proxy can bind a specific VIP.
-- **Service discovery / resolution:** a registry (BTreeDB or in-memory) maps `service-name → VIP:port`; the
+- **Service discovery / resolution:** a registry (NovaDB or in-memory) maps `service-name → VIP:port`; the
   orchestrator (I2) updates it as replicas come and go. Resolution options: **(i)** inject the endpoint into each
   spawned app's env/config (no new primitive — simplest); **(ii)** a `/etc/hosts`-style file the apps read; **(iii)**
   a real **DNS responder** (`service.local → VIP`) — this needs **UDP**, which does NOT exist in the runtime today
@@ -2179,7 +2179,7 @@ as the deferred namespaces/seccomp work in I2. **Out of near-term scope**; Tier 
    the reconcile loop keeps `backends` in sync with live, healthy replicas.
 2. **Proxy binds each Service's stable address (I1):** accepts on `VIP:port` (or `proxy:service_port`), picks a
    healthy backend via the `Balancer` trait, splices/forwards. Unhealthy backends ejected (health from I1's checks).
-3. **Registry + resolution:** BTreeDB/in-memory `name→endpoint`; env-injection into spawned apps first, DNS later.
+3. **Registry + resolution:** NovaDB/in-memory `name→endpoint`; env-injection into spawned apps first, DNS later.
 4. **Small runtime adds (only if IP-per-service / DNS wanted):** bind-to-address on the listener; `nova_udp_*` for a
    DNS responder.
 
@@ -2252,14 +2252,14 @@ Level-2 overlaps **I3** Tier-2 (net namespace). **Tracking:** _pending (infra ti
 
 # Z1 — Documentation: technical architecture + contributor onboarding
 
-**Why (user, 2026-07-24).** The ecosystem (Nova language, BTreeDB, orchestrator) needs (a) **technical architecture**
+**Why (user, 2026-07-24).** The ecosystem (Nova language, NovaDB, orchestrator) needs (a) **technical architecture**
 deep-dives so the design is captured beyond code + this plan, and (b) **contributor onboarding** guides so someone
 new can start on a given project — e.g. "I want to work on the compiler + LLVM; what are the steps to add a feature
-to the language?" — and the equivalents for BTreeDB and the orchestrator.
+to the language?" — and the equivalents for NovaDB and the orchestrator.
 
 **Scope:**
 - **Technical architecture docs (one per project)** — Nova language (lexer→parser→checker→sema→codegen→runtime
-  pipeline; ARC; monomorphization; traits/vtables; async coroutines; module scoping; C++ runtime + stdlib), BTreeDB
+  pipeline; ARC; monomorphization; traits/vtables; async coroutines; module scoping; C++ runtime + stdlib), NovaDB
   (pager/segmented-pool → B+tree + latching → WAL/group-commit → MVCC → SQL parser/executor → binary+JSON protocol →
   wasmer embedding), and the orchestrator (control loop/reconcile → supervisor → isolation → proxy/LB → service
   model), each linking the deeper in-tree design docs.
@@ -2273,7 +2273,7 @@ ecosystem index + the three contributor guides, incl. the compiler's end-to-end 
 
 **Definition of Done:**
 - [x] Onboarding guides for compiler (+LLVM), btree, and orchestrator, each with a concrete "add a feature" flow; an ecosystem README tying them together. (`docs/onboarding/`, 2026-07-24.)
-- [ ] Technical architecture deep-dive per project (Nova / BTreeDB / orchestrator).
+- [ ] Technical architecture deep-dive per project (Nova / NovaDB / orchestrator).
 - [ ] Cross-linked from each project's CLAUDE.md / README.
 
 **Dependencies:** none. **Tracking:** 🔨 2026-07-24 · onboarding v1 authored (`docs/onboarding/`); architecture
@@ -2318,11 +2318,11 @@ its section above. Items already ✅ are omitted. **Next pick: V1** (a real soun
 11. **I1** — Nova reverse proxy + load balancer + PID autoscaler (⭐ flagship app; every primitive exists).
 12. **I2** — orchestrator MVP (needs R1) → **I3** virtual network / k8s-Service VIPs → **I4** native container-grade
     isolation.
-13. **BT1** — BTreeDB concurrency (SEPARATE repo): Phase 0 wire the thread knob + **re-benchmark first**; gate the
+13. **BT1** — NovaDB concurrency (SEPARATE repo): Phase 0 wire the thread knob + **re-benchmark first**; gate the
     latch-safe rewrite on measured evidence.
 
 ### 📚 Docs
-- **Z1** — technical-architecture deep-dives (Nova / BTreeDB / orchestrator). Onboarding v1 already authored.
+- **Z1** — technical-architecture deep-dives (Nova / NovaDB / orchestrator). Onboarding v1 already authored.
 
 **Done this session (autonomous, language-first):** T7 ✅ · `any`-in-container crash fix ✅ · **W4 DI ✅ 100%** (Service
 container, 3 lifetimes + per-request scope, type-keyed generics, `handleFrom` transient factories) · 4 general

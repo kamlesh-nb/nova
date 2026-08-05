@@ -1,14 +1,14 @@
-# BTreeDB, Architecture
+# NovaDB, Architecture
 
-BTreeDB is a high performance, embeddable and serverable **B+Tree storage engine and SQL database**,
+NovaDB is a high performance, embeddable and serverable **B+Tree storage engine and SQL database**,
 written in **Zig**. It is the storage engine behind the Nova ecosystem, yet it stands alone as a database
-in its own right. Nova connects to it over a binary wire protocol; BTreeDB is intentionally a *separate*
+in its own right. Nova connects to it over a binary wire protocol; NovaDB is intentionally a *separate*
 project, and is to be built and versioned separately (it resides in `../../btree/`, not in this
 repository).
 
 > This is a navigable overview in the manner of the Nova architecture set. For the authoritative design
 > specification, including the exact page layout, the B+Tree invariants, and the concurrency protocols,
-> kindly refer to `btree/architecture.md` within the BTreeDB repository.
+> kindly refer to `btree/architecture.md` within the NovaDB repository.
 
 ## Layout (`btree/src/`)
 
@@ -105,10 +105,10 @@ wire protocol** (`proto/`) is the intended path for Nova's driver.
 
 ## Relationship to Nova
 
-Nova (the `lang` repository) talks to BTreeDB through this binary protocol, by way of the published
-**`nova-btreedb`** driver package, which implements the `db` seam (see [04-stdlib.md](04-stdlib.md)). From
-Nova's side, BTreeDB is simply one interchangeable backend behind the `Driver` and `Connection` traits; a
-program may swap it for Postgres, MySQL, MSSQL, or MongoDB without touching the call sites. BTreeDB, for its
+Nova (the `lang` repository) talks to NovaDB through this binary protocol, by way of the published
+**`nova-novadb`** driver package, which implements the `db` seam (see [04-stdlib.md](04-stdlib.md)). From
+Nova's side, NovaDB is simply one interchangeable backend behind the `Driver` and `Connection` traits; a
+program may swap it for Postgres, MySQL, MSSQL, or MongoDB without touching the call sites. NovaDB, for its
 part, remains independent, and knows nothing of Nova beyond the wire.
 
 ## Build, Run, Test

@@ -87,7 +87,7 @@ A STALE reference to a freed address then gets resumed. Two sub-cases:
 
 ### Reproduction
 
-`/tmp/connpass.nova` shape (needs a live BTreeDB on 127.0.0.1:3009):
+`/tmp/connpass.nova` shape (needs a live NovaDB on 127.0.0.1:3009):
 
 ```
 async fn doQuery(conn: btreedb.BTreeConnection): int {
@@ -115,7 +115,7 @@ whole reactor-server corpus passes). The bug BITES a connection POOL shared acro
 coroutines: connect on one coroutine, hand the connection to another to do I/O. That is a first-class server
 pattern, so this blocks connection pooling on the Nova reactor.
 
-Note this is a SEPARATE bug from the BTreeDB server WAL data race fixed in `btree@6600c4d` (that was a
+Note this is a SEPARATE bug from the NovaDB server WAL data race fixed in `btree@6600c4d` (that was a
 missing lock on the server side; this is a client-side Nova-runtime scheduler issue).
 
 ## What was tried and why it cannot work
@@ -249,7 +249,7 @@ surviving crash, so partial validation is worthless here.
    repros instead, and state which.
 4. The direct repros: `/tmp/connpass.nova`, `/tmp/connU.nova` must PASS; `/tmp/locq.nova`,
    `/tmp/connIn.nova` must stay passing.
-5. The 60-concurrent-client BTreeDB stress (the `stressclient` from this session) -- server AND clients
+5. The 60-concurrent-client NovaDB stress (the `stressclient` from this session) -- server AND clients
    clean, no SIGBUS on the client side.
 
 Diagnostics that cracked this: `NOVA_TRACE=<path>` (per-coroutine schedule/finish/resume log) and
@@ -343,7 +343,7 @@ reader is used. Do not assume the pure double-free shape; let ASAN name it.
 failure was a stale asan lib). Result:
 
 ```
-AddressSanitizer: BUS ... in ..packages_nova-btreedb_src_btreedb_fill.resume+0x250
+AddressSanitizer: BUS ... in ..packages_nova-novadb_src_btreedb_fill.resume+0x250
   #0 btreedb_fill.resume        <- BtReader.fill(), resuming after its await
   #1 test_connpass
 Register x[1] = 0xfcfcfcfcfcfcfcfc   <- ASAN heap-FREED poison

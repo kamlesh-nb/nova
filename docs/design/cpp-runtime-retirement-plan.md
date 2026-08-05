@@ -221,7 +221,7 @@ phase removes a real dependency and is independently verifiable.
   both made reactor-native in M2, so on a reactor thread the whole driver runs reactor-native with no
   driver change. Corpus case 205 proves the flagship pattern end to end: a real App (typed route plus
   handler) served on one reactor, whose handler does `await asyncio.asyncConnect(host, port)` then a
-  query round trip against a mock database server on the SAME reactor (standing in for a live BTreeDB,
+  query round trip against a mock database server on the SAME reactor (standing in for a live NovaDB,
   which uses the identical seam). Inbound accept, request parse, mediator dispatch, the handler's DB
   connect and query, and the response all run in one poll loop, no Asio. This closes the original PH6
   blocker (a handler's nested async DB call used to deadlock on the reactor). The M1 io-violation

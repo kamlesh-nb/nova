@@ -1,6 +1,6 @@
 // Infrastructure — a repository backed by a REAL database driver fetched via `nova get`
 // (nova-postgres, declared in project.json). Programs against the `db` seam (Driver/Connection), so the
-// backend is swappable for any declared driver (nova-mysql / nova-mssql / nova-btreedb / nova-mongodb).
+// backend is swappable for any declared driver (nova-mysql / nova-mssql / nova-novadb / nova-mongodb).
 // Degrades gracefully: if the database is offline the query returns nothing and we fall back, so the app
 // runs with or without a live DB.
 

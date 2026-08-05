@@ -143,7 +143,7 @@ Things that bite, recorded so they are not rediscovered:
   `run.sh` (the harness, self-tests its own negative-case classifier).
 - `docs/design/` — **`execution-plan.md`** (the master status table + per-item design — READ THIS for
   roadmap state), plus per-feature specs. `docs/specs.md` is the language spec.
-- `packages/nova-*` — the concrete DB drivers (postgres/mysql/mssql/btreedb/mongodb); the `db` seam +
+- `packages/nova-*` — the concrete DB drivers (postgres/mysql/mssql/novadb/mongodb); the `db` seam +
   generic pool stay in std.
 
 ## Core concepts (how it actually works)
@@ -351,5 +351,5 @@ See `docs/design/execution-plan.md` — the master table (27/31 items ✅). Rece
 DONE** (default-on, content-hash cache, F4-6 satisfied); **T1 cross-compilation** — from macOS build Linux
 x86_64/arm64 (static ELF) + Windows x86_64 (PE32+) via bundled `zig c++`; **build deps generalized off
 Homebrew** — vendored Boost.Asio subset (`deps/boost`) + static LLVM from a self-hosted lazy `build.zig.zon`
-mirror (`kamlesh-nb/llvm-dist`; tarballs staged in `~/.nova-llvmdist`, upload pending). Depends on **BTreeDB**
+mirror (`kamlesh-nb/llvm-dist`; tarballs staged in `~/.nova-llvmdist`, upload pending). Depends on **NovaDB**
 (separate repo) and pairs with **nls** (LSP) + the VSCode **extension**.
