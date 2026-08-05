@@ -460,15 +460,19 @@ fn reactorHandoffBody(app: App, sockPath: string): void {
     let ctrl = socket.newUnix();
     let ok = -1;
     let tries = 0;
-    while (tries < 2000000) {
+    // Retry with a real backoff (20ms) so the app reliably waits for the service to bind the rendezvous,
+    // regardless of launch ordering; ~500 tries ≈ 10s before giving up (a tight spin used to race the
+    // service and exhaust before the socket appeared).
+    while (tries < 500) {
         ok = socket.connectSock(ctrl, ua, socket.sockaddrUnLen());
         if (ok == 0) { break; }
         socket.close(ctrl);
         ctrl = socket.newUnix();
+        sys.nova_sleep_ms(20);
         tries = tries + 1;
     }
     bytes.free(ua);
-    if (ok != 0) { console.log("Nova web: could not reach proxyd handoff socket " + sockPath); return; }
+    if (ok != 0) { console.log("Nova web: could not reach the service handoff socket " + sockPath); return; }
     socket.setNonBlock(ctrl);
 
     let r = poller.Reactor(1024, 16384, 1024);

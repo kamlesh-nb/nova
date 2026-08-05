@@ -1128,7 +1128,7 @@ fn generateMediatorDispatch(allocator: std.mem.Allocator, declarations: *std.Arr
             // Raw-response escape hatch: a handler whose success type IS `Response` returns it verbatim
             // (its own status + Content-Type, e.g. text/html or text/event-stream from mediator.html/sse),
             // instead of the framework JSON-serialising a DTO. Detected by the response type name.
-            const raw_ok = std.mem.endsWith(u8, r_ok, "Response");
+            const raw_ok = std.mem.eql(u8, r_ok, "Response") or std.mem.eql(u8, r_ok, "response.Response");
             if (r_err != null) {
                 // ok helper returns `Response | E`, so `try` short-circuits the error out of it; the
                 // dispatch then maps that error to a Response via its `toResponse()`.
@@ -1315,7 +1315,7 @@ fn generateRuntimeMediator(allocator: std.mem.Allocator, declarations: *std.Arra
 
             // Raw-response escape hatch (see the runtime-dispatch site above): a `Response`-typed handler
             // result is emitted verbatim so a handler can return HTML / SSE / any content-type.
-            const raw_ok = std.mem.endsWith(u8, r_ok, "Response");
+            const raw_ok = std.mem.eql(u8, r_ok, "Response") or std.mem.eql(u8, r_ok, "response.Response");
             if (r_err != null) {
                 if (raw_ok) {
                     try serdeAppendf(&src, allocator,

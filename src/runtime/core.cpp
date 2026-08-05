@@ -304,6 +304,20 @@ long long nova_open(const char *path, long long flags, long long mode) {
   return (long long)::open(path, (int)flags, (unsigned int)mode);
 }
 
+// Blocking sleep for `ms` milliseconds (a coarse wait for polling/retry backoffs — e.g. an fd-handoff
+// app waiting for the service's rendezvous socket to appear). No reactor involved.
+void nova_sleep_ms(long long ms) {
+  if (ms <= 0) return;
+#ifdef _WIN32
+  ::Sleep((unsigned long)ms);
+#else
+  struct timespec ts;
+  ts.tv_sec = (time_t)(ms / 1000);
+  ts.tv_nsec = (long)((ms % 1000) * 1000000L);
+  ::nanosleep(&ts, nullptr);
+#endif
+}
+
 // --- fd passing (SCM_RIGHTS) -------------------------------------------------------------------
 // The "connection handoff" primitive: a process accepts a client socket and passes that open fd to
 // a sibling process over a connected AF_UNIX socket, so the sibling replies to the client directly

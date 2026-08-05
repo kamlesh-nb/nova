@@ -185,6 +185,7 @@ void        nova_coverage_dump(long long count);
 // src/std/io/dir.nova); the nova_file_*/nova_dir_* C surface is retired. The only remaining
 // shim is nova_open (variadic open(2)), declared inline where it is used.
 long long nova_open(const char *path, long long flags, long long mode);
+void nova_sleep_ms(long long ms);   // coarse blocking sleep (polling/retry backoffs)
 
 // fd passing (SCM_RIGHTS): the connection-handoff primitive for a fire-and-forget proxy. See core.cpp.
 long long nova_send_fd(long long sock, const char *data, long long len, long long fd);

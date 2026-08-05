@@ -29,6 +29,7 @@ import os.windows.winsock;
 // per-thread macro; nova_set_nonblock maps to ioctlsocket(FIONBIO) on Windows — see core.cpp).
 pub extern("c") fn nova_ffi_errno(): int;
 pub extern("c") fn nova_ffi_set_errno(v: int): void;
+pub extern("c") fn nova_sleep_ms(ms: long): void;   // coarse blocking sleep (Sleep on Windows)
 pub extern("c") fn nova_set_nonblock(fd: int): int;
 
 // Sockets: ws2_32 exports these under the POSIX names with compatible signatures, so they bind

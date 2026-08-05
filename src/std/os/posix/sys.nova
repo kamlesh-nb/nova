@@ -41,6 +41,9 @@ pub extern("c") fn close(fd: int): int;
 pub extern("c") fn nova_send_fd(sock: int, data: ptr, len: long, fd: int): long;
 pub extern("c") fn nova_recv_fd(sock: int, buf: ptr, cap: long, out_fd: ptr): long;
 
+// Coarse blocking sleep in milliseconds — for polling / retry backoffs (no reactor involved).
+pub extern("c") fn nova_sleep_ms(ms: long): void;
+
 // Process environment (M6: process shims in Nova over os/sys). getenv returns a pointer into the
 // process environment (do not free it); setenv copies. The string marshalling wrappers are in
 // std/env.nova, which owns the allocator import.
