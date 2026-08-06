@@ -151,6 +151,9 @@ pub struct ResultSet {
     // their wire ErrorResponse decoder; callers check `rs.ok()` / read `rs.err`. Defaulting to noError()
     // keeps existing `ResultSet()` construction and error-ignoring callers source-compatible.
     pub err: DbError,
+    // Additional result sets beyond this one, in order, when a single batch / stored procedure returned
+    // more than one SELECT. Empty for the common single-result case, so existing callers are unaffected.
+    pub more: List<ResultSet>,
 
     init() {
         self.columns = List<Column>();
@@ -158,6 +161,7 @@ pub struct ResultSet {
         self.tag = "";
         self.rows_affected = 0;
         self.err = noError();
+        self.more = List<ResultSet>();
     }
 
     pub fn rowCount(self: ResultSet): int { return self.rows.size(); }
@@ -165,6 +169,13 @@ pub struct ResultSet {
     pub fn row(self: ResultSet, i: int): Row { return self.rows.get(i) ?? Row(); }
     pub fn ok(self: ResultSet): bool { return self.err.isEmpty(); }
     pub fn hasError(self: ResultSet): bool { return !self.err.isEmpty(); }
+    // Total number of result sets (this one + any additional). 1 for a normal single-SELECT query.
+    pub fn resultSetCount(self: ResultSet): int { return 1 + self.more.size(); }
+    // The i-th result set (0 = this one, 1.. = the additional sets from a multi-statement batch).
+    pub fn resultSet(self: ResultSet, i: int): ResultSet {
+        if (i <= 0) { return self; }
+        return self.more.get(i - 1) ?? ResultSet();
+    }
 }
 
 pub struct ExecResult {
