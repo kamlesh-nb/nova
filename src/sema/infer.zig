@@ -1091,7 +1091,33 @@ pub const Inferer = struct {
                 if (self.symtab.findTypeInModule(ei.enum_name, self.current_module)) |sid| return self.ok(try self.store.intern(.{ .enum_ = sid }));
                 return self.unresolved("enum_init");
             },
-            .jsx_element => return self.unresolved("jsx"),
+            .jsx_element => |jsx| {
+                // An NSX element lowers to a StringBuilder-built `string` (see compileJsxElement). Infer
+                // it as `string` so it composes like any other string: as a `+` operand, a `{expr}` child,
+                // or a string-typed argument. Recurse into attribute/child expressions so their own types
+                // resolve (and any nested elements get walked).
+                try self.inferJsxElement(&jsx);
+                return self.ok(try self.store.stringT());
+            },
+        }
+    }
+
+    // Walk an NSX element's attribute-value and child expressions (recursing into nested elements and
+    // child statements) so every embedded `{expr}` is type-inferred. The element itself is `string`.
+    fn inferJsxElement(self: *Inferer, jsx: *const ast.JsxElement) anyerror!void {
+        for (jsx.attributes) |*attr| {
+            switch (attr.value) {
+                .expression => |*ex| _ = try self.inferExpr(ex),
+                .string_literal => {},
+            }
+        }
+        for (jsx.children) |*child| {
+            switch (child.*) {
+                .element => |*el| try self.inferJsxElement(el),
+                .expression => |*ex| _ = try self.inferExpr(ex),
+                .statement => |*st| try self.inferStmt(st),
+                .text => {},
+            }
         }
     }
 

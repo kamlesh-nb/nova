@@ -943,6 +943,69 @@ fn structHasNoArgCtor(self: *LlvmCompiler, struct_name: []const u8) bool {
     return true;
 }
 
+// A module-level `const` whose initializer is a trivial scalar literal can be inlined at each reference
+// (cheap, no allocation). Anything else — a function call, a string, an allocation, an array/struct
+// literal — must be evaluated ONCE, because re-running the initializer at every reference re-allocates
+// (an unbounded per-use leak: e.g. gzip's `const CRC_TABLE = crcTable()` was rebuilt on every byte).
+fn isTrivialConstLiteral(expr: ast.Expression) bool {
+    // Any literal (int/float/bool/string/decimal) is a compile-time constant: inlining it at each
+    // reference is cheap and allocation-free, so it must NOT get the memoization guard — guarding hot-path
+    // scalar/string consts (status codes, header names, MIME types) added a branch + global load per
+    // reference and tanked throughput. Only a NON-literal initializer (a function call, an allocation, an
+    // array/struct literal) needs evaluating once; those are the ones that re-allocate per reference.
+    return expr.kind == .literal;
+}
+
+// Reference to a module-level `const`. Trivial literals inline; everything else is lazily memoized into a
+// process-lifetime global (computed on the first reference reached at runtime, loaded thereafter) so the
+// initializer runs exactly once.
+pub fn compileConstRef(self: *LlvmCompiler, name: []const u8, val: ast.Expression) anyerror!types.LLVMValueRef {
+    if (isTrivialConstLiteral(val)) return try self.compileExpression(val);
+
+    const val_name = try std.fmt.allocPrint(self.allocator, "__const_{s}_val", .{name});
+    defer self.allocator.free(val_name);
+    const done_name = try std.fmt.allocPrint(self.allocator, "__const_{s}_done", .{name});
+    defer self.allocator.free(done_name);
+    const val_z = try self.allocator.dupeZ(u8, val_name);
+    defer self.allocator.free(val_z);
+    const done_z = try self.allocator.dupeZ(u8, done_name);
+    defer self.allocator.free(done_z);
+
+    var val_g = core.LLVMGetNamedGlobal(self.module, val_z.ptr);
+    if (val_g == null) {
+        // Internal linkage: the T6 per-file object split compiles each source file as its own module, so
+        // a const referenced from several files would emit this global in each object and clash at link.
+        // Private per-object caches are fine — the initializer still runs at most once per object file.
+        val_g = core.LLVMAddGlobal(self.module, self.val_type, val_z.ptr);
+        core.LLVMSetInitializer(val_g, core.LLVMConstInt(self.val_type, 0, 0));
+        core.LLVMSetLinkage(val_g, .LLVMInternalLinkage);
+        const done_new = core.LLVMAddGlobal(self.module, self.i1_type, done_z.ptr);
+        core.LLVMSetInitializer(done_new, core.LLVMConstInt(self.i1_type, 0, 0));
+        core.LLVMSetLinkage(done_new, .LLVMInternalLinkage);
+    }
+    const done_g = core.LLVMGetNamedGlobal(self.module, done_z.ptr);
+
+    const cur_bb = core.LLVMGetInsertBlock(self.builder);
+    const cur_fn = core.LLVMGetBasicBlockParent(cur_bb);
+    const init_bb = core.LLVMAppendBasicBlock(cur_fn, "const_init");
+    const cont_bb = core.LLVMAppendBasicBlock(cur_fn, "const_cont");
+
+    const done_v = core.LLVMBuildLoad2(self.builder, self.i1_type, done_g, "const_done");
+    const need = core.LLVMBuildICmp(self.builder, types.LLVMIntPredicate.LLVMIntEQ, done_v, core.LLVMConstInt(self.i1_type, 0, 0), "const_need");
+    _ = core.LLVMBuildCondBr(self.builder, need, init_bb, cont_bb);
+
+    core.LLVMPositionBuilderAtEnd(self.builder, init_bb);
+    // compileExpressionInner (NOT compileExpression): the value is MOVED into the global and lives for the
+    // program's lifetime, so it must not be tracked as a temporary and released at the statement boundary.
+    const computed = try compileExpressionInner(self, val);
+    _ = core.LLVMBuildStore(self.builder, self.coerceToSlotType(computed, self.val_type), val_g);
+    _ = core.LLVMBuildStore(self.builder, core.LLVMConstInt(self.i1_type, 1, 0), done_g);
+    _ = core.LLVMBuildBr(self.builder, cont_bb);
+
+    core.LLVMPositionBuilderAtEnd(self.builder, cont_bb);
+    return core.LLVMBuildLoad2(self.builder, self.val_type, val_g, "const_val");
+}
+
 pub fn compileExpression(self: *LlvmCompiler, expr: ast.Expression) anyerror!types.LLVMValueRef {
     const val = try compileExpressionInner(self, expr);
     switch (self.acquisitionDisposition(&expr)) {
@@ -1255,7 +1318,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 }
                 return loaded;
             } else if (self.constants.get(name)) |val| {
-                return try self.compileExpression(val);
+                return try self.compileConstRef(name, val);
             } else {
                 const resolved = try self.resolveCalleeName(name);
                 if (self.func_map.get(resolved)) |func_val| {
@@ -3026,7 +3089,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
 
                 if (!self.identNamesVariable(obj_name)) {
                     if (self.constants.get(fa.field)) |val| {
-                        return try self.compileExpression(val);
+                        return try self.compileConstRef(fa.field, val);
                     }
                 }
             }
@@ -3782,10 +3845,18 @@ pub fn compileJsxElement(self: *LlvmCompiler, jsx: ast.JsxElement) anyerror!type
     self.current_string_builder = sb_val;
     defer self.current_string_builder = outer_sb;
 
+    // StringBuilder.append/appendChar COPY the bytes into the builder's own buffer (see
+    // std/collections/string_builder.nova) and borrow `self` — they neither store the argument pointer
+    // nor consume the builder. So NO retain belongs at these call sites: `self` stays alive for the whole
+    // element (freed once via StringBuilder_delete below), and the appended value is either a borrowed
+    // variable (its owner releases it) or an owned temporary already tracked in pending_temps by
+    // compileExpression (released at the enclosing statement's boundary). A retain here has no matching
+    // release and leaks one ref per append — which, over a view rendered per request, is a large,
+    // unbounded server leak. (This was masked before jsx_element was typed as `string`, which routed far
+    // more children through the retaining path.)
     const append_val_fn = struct {
         fn run(c: *LlvmCompiler, sb: types.LLVMValueRef, append_func: types.LLVMValueRef, val: types.LLVMValueRef) void {
             const append_t = core.LLVMGlobalGetValueType(append_func);
-            c.compileRetain(sb) catch {};
             var args = [_]types.LLVMValueRef{ sb, val };
             _ = core.LLVMBuildCall2(c.builder, append_t, append_func, &args, 2, "");
         }
@@ -3796,7 +3867,6 @@ pub fn compileJsxElement(self: *LlvmCompiler, jsx: ast.JsxElement) anyerror!type
             const expr = ast.Expression{ .kind = .{ .literal = .{ .string = text } } };
             const str_val = try c.compileExpression(expr);
             const append_t = core.LLVMGlobalGetValueType(append_func);
-            try c.compileRetain(sb);
             var args = [_]types.LLVMValueRef{ sb, str_val };
             _ = core.LLVMBuildCall2(c.builder, append_t, append_func, &args, 2, "");
         }
@@ -3808,20 +3878,15 @@ pub fn compileJsxElement(self: *LlvmCompiler, jsx: ast.JsxElement) anyerror!type
             const val = try c.compileExpression(expr.*);
             const type_name = try c.resolveExpressionTypeName(expr);
             if (type_name) |t| {
-
-                if (c.isOwnedExpr(expr)) {
-                    const is_var = (expr.kind == .ident or expr.kind == .field_access or expr.kind == .index);
-                    if (is_var) {
-                        try c.compileRetain(val);
-                    }
-                }
                 if (std.mem.eql(u8, t, "string")) {
                     append_val_fn(c, sb, append_func, val);
                     return;
                 } else if (types_mod.isPrimitiveTypeName(t) and !std.mem.eql(u8, t, "void") and !std.mem.eql(u8, t, "any")) {
-
+                    // numToString mints a FRESH owned string (not tracked in pending_temps); append copies
+                    // it, so release it here or every numeric `{expr}` child leaks one string per render.
                     const str_temp = try c.numToString(val, t);
                     append_val_fn(c, sb, append_func, str_temp);
+                    try c.compileRelease(str_temp, null);
                     return;
                 }
             }
@@ -3863,8 +3928,13 @@ pub fn compileJsxElement(self: *LlvmCompiler, jsx: ast.JsxElement) anyerror!type
                     try append_literal_fn(self, sb_val, sb_append, txt);
                 },
                 .element => |sub_el| {
+                    // A nested <element> literal. compileJsxElement returns a FRESH owned string (its own
+                    // StringBuilder_toString) that nothing else holds and that append_val_fn copies into
+                    // this builder. It is built directly here (not via compileExpression), so it is not in
+                    // pending_temps — release it now, or every nested element leaks one string per render.
                     const sub_str = try self.compileJsxElement(sub_el);
                     append_val_fn(self, sb_val, sb_append, sub_str);
+                    try self.compileRelease(sub_str, null);
                 },
                 .expression => |*expr| {
                     try append_expr_fn(self, sb_val, sb_append, expr);
@@ -3893,6 +3963,12 @@ pub fn compileJsxElement(self: *LlvmCompiler, jsx: ast.JsxElement) anyerror!type
 
     const sb_delete_t = core.LLVMGlobalGetValueType(sb_delete);
     _ = core.LLVMBuildCall2(self.builder, sb_delete_t, sb_delete, &toString_args, 1, "");
+
+    // StringBuilder_delete frees the builder's INTERNAL buffer (and zeroes self.buf), but the builder
+    // STRUCT itself is a heap object from compileAlloc (nova_bytes_alloc) that nothing else owns or
+    // releases. Free it now with a null destructor — one leaked struct per NSX element would otherwise
+    // accumulate on every render (i.e. every request for a server-rendered view).
+    try self.compileRelease(sb_val, null);
 
     return final_str;
 }

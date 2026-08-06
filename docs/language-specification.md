@@ -298,7 +298,18 @@ switch (self) {
 - **`if` / block as expression** — `let x = if (c) a else b`; owned if-expressions balance per edge
   *(→ 47_ifexpr_owned)*.
 - **Tuples** — `(a, b)`; construction and returning tuples of heap elements is ARC-correct *(→ 28)*.
-- **JSX/NSX** — `jsx_element` exists 🔎 for hypermedia views; not corpus-covered.
+- **JSX/NSX** — HTML-like view expressions that lower to a `string` (built through a `StringBuilder`), for
+  server-rendered hypermedia views: `return <div class="card"><h3>{title}</h3></div>;`. Attribute values and
+  children may be `{expression}`; a string expression is inserted **raw** (NSX does not HTML-escape, so
+  fragments compose and you escape untrusted text yourself), and a numeric/primitive expression is
+  stringified. Attribute **names** may contain `-`, `:`, `.`, `@` and interior `_`, and may be **valueless**,
+  so every hypermedia convention parses: Datastar `data-on-click`, `data-on-interval__duration.2s`; HTMX
+  `hx-get`; Alpine `@click`, `:class`; and boolean attributes `readonly` / `selected` / `open` (emitted as
+  `name=""`). A void element must self-close (`<input .../>`). An NSX element expression has type `string`,
+  so it composes like any other string: a `+` operand, a `{expression}` child, or a string-typed argument
+  (`card("Title", <div>...</div>)`) all work without hoisting to a local first. View code may live in a
+  `.nsx` file, which the compiler treats exactly like `.nova` (same language) so JSX-heavy views file apart
+  from plain logic; imports are by module name and never mention the extension. *(→ nsx_attributes)*
 
 ---
 

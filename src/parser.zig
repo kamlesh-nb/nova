@@ -2055,6 +2055,38 @@ pub const Parser = struct {
         return expr;
     }
 
+    // Parse an NSX attribute NAME, which may contain characters no single Nova token covers: hyphens
+    // (`data-on-click`, `hx-get`), colons (`:class`), dots and double-underscores (Datastar modifiers like
+    // `data-on-interval__duration.2s`), and a leading `@` (`@click`). The lexer splits these into several
+    // tokens, so we reconstruct the name by taking the exact source span of the run of ADJACENT tokens
+    // (no whitespace between them) that make up the name. Returns a slice into the original source.
+    fn parseJsxAttrName(self: *Parser) ParserError![]const u8 {
+        const first = self.current();
+        const ok_start = first.type == .at or first.type == .colon or
+            (first.lexeme.len > 0 and (std.ascii.isAlphabetic(first.lexeme[0]) or first.lexeme[0] == '_'));
+        if (!ok_start) return error.UnexpectedToken;
+        // Concatenate the lexemes of the adjacent run into a fresh buffer. We cannot take a source-span
+        // slice here: punctuation tokens (`-`, `:`, `.`, `@`) carry STATIC string lexemes, not slices into
+        // the source, so their addresses are unrelated to the surrounding identifier tokens.
+        var buf = std.ArrayList(u8).empty;
+        try buf.appendSlice(self.allocator, first.lexeme);
+        var last = first;
+        self.advance();
+        while (true) {
+            const t = self.current();
+            if (t.line != last.line) break;
+            // adjacency: the next token must start exactly where the previous one ended (no space).
+            if (@as(usize, t.column) != @as(usize, last.column) + last.lexeme.len) break;
+            const cont = t.type == .minus or t.type == .colon or t.type == .dot or t.type == .at or
+                (t.lexeme.len > 0 and (std.ascii.isAlphanumeric(t.lexeme[0]) or t.lexeme[0] == '_'));
+            if (!cont) break;
+            try buf.appendSlice(self.allocator, t.lexeme);
+            last = t;
+            self.advance();
+        }
+        return buf.items;
+    }
+
     fn parseJsxElement(self: *Parser) ParserError!ast.Expression {
         try self.expect(.less);
         var tag: []const u8 = "";
@@ -2070,19 +2102,24 @@ pub const Parser = struct {
             if (self.current().type == .slash and self.peek().type == .greater) {
                 break;
             }
-            const attr_name = self.current().lexeme;
-            try self.expect(.identifier);
-            try self.expect(.equal);
+            const attr_name = try self.parseJsxAttrName();
             var val: ast.JsxAttributeValue = undefined;
-            if (self.current().type == .string) {
-                val = ast.JsxAttributeValue{ .string_literal = self.current().lexeme };
+            if (self.current().type == .equal) {
                 self.advance();
-            } else if (self.match(.left_brace)) {
-                const expr = try self.parseExpression();
-                try self.expect(.right_brace);
-                val = ast.JsxAttributeValue{ .expression = expr };
+                if (self.current().type == .string) {
+                    val = ast.JsxAttributeValue{ .string_literal = self.current().lexeme };
+                    self.advance();
+                } else if (self.match(.left_brace)) {
+                    const expr = try self.parseExpression();
+                    try self.expect(.right_brace);
+                    val = ast.JsxAttributeValue{ .expression = expr };
+                } else {
+                    return error.UnexpectedToken;
+                }
             } else {
-                return error.UnexpectedToken;
+                // Valueless boolean attribute (readonly, selected, checked, disabled, open, required...).
+                // Emitted as name="" which HTML treats as present, so it round-trips correctly.
+                val = ast.JsxAttributeValue{ .string_literal = "" };
             }
             try attributes.append(self.allocator, ast.JsxAttribute{
                 .name = attr_name,
@@ -2150,9 +2187,30 @@ pub const Parser = struct {
                         try children.append(self.allocator, ast.JsxChild{ .expression = child_expr });
                     }
                 } else {
-                    const text = self.current().lexeme;
-                    self.advance();
-                    try children.append(self.allocator, ast.JsxChild{ .text = text });
+                    // Accumulate a RUN of text tokens into a single text child, preserving the spacing
+                    // between words. The lexer drops whitespace and emits separate tokens ("Node",
+                    // "information"), so joining lexemes directly would give "Nodeinformation". We insert a
+                    // single space wherever the source had a gap between tokens (detected by column), which
+                    // is exactly HTML's own whitespace-collapsing rule. Lexemes are used by value, since
+                    // punctuation tokens carry static lexemes rather than source slices.
+                    var buf = std.ArrayList(u8).empty;
+                    var prev_end_line: usize = 0;
+                    var prev_end_col: usize = 0;
+                    var first = true;
+                    while (true) {
+                        const t = self.current();
+                        if (t.type == .less or t.type == .jsx_close or t.type == .left_brace or
+                            t.type == .greater or t.type == .eof) break;
+                        if (!first and (@as(usize, t.line) != prev_end_line or @as(usize, t.column) != prev_end_col)) {
+                            try buf.append(self.allocator, ' ');
+                        }
+                        try buf.appendSlice(self.allocator, t.lexeme);
+                        prev_end_line = @as(usize, t.line);
+                        prev_end_col = @as(usize, t.column) + t.lexeme.len;
+                        first = false;
+                        self.advance();
+                    }
+                    try children.append(self.allocator, ast.JsxChild{ .text = buf.items });
                 }
             }
         }

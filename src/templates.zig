@@ -183,12 +183,16 @@ pub const web_get_handler_sample =
 pub const web_view_sample =
     \\import web.response;
     \\
-    \\// A per-feature NSX/JSX view, returns an HTML string the handler (or a page route)
-    \\// can render. Feature views live beside the slices that use them.
+    \\// A per-feature NSX view. View code lives in `.nsx` files (same language as `.nova`, just filed apart
+    \\// so markup stays separate from logic) and returns an HTML string the handler or a page route renders.
+    \\// An NSX element is a `string`, so expressions embed inline with `{...}` and views compose directly.
+    \\//
+    \\// NSX inserts a `{expr}` string RAW so pre-rendered fragments compose; wrap any untrusted text in
+    \\// `response.escapeHtml(...)` (the one canonical escaper in the stdlib) so you never redefine your own.
     \\pub fn productCard(name: string, price: int): string {
-    \\    return <div class="card">
-    \\        <h3>{name}</h3>
-    \\        <p class="price">{price}</p>
+    \\    return <div class="rounded-lg border border-slate-200 p-4 shadow-sm">
+    \\        <h3 class="font-semibold text-slate-800">{response.escapeHtml(name)}</h3>
+    \\        <p class="mt-1 text-sm text-slate-500">{price}</p>
     \\    </div>;
     \\}
 ;
@@ -211,12 +215,61 @@ pub const web_domain_entity_sample =
 pub const web_index_html_sample =
     \\<!doctype html>
     \\<html lang="en">
-    \\<head><meta charset="utf-8"><title>Nova Web App</title></head>
-    \\<body style="font-family:system-ui;max-width:40rem;margin:4rem auto">
-    \\  <h1>Nova Web App</h1>
-    \\  <p>Vertical-slice API. Try <code>GET /api/products/1</code>.</p>
+    \\<head>
+    \\  <meta charset="utf-8">
+    \\  <meta name="viewport" content="width=device-width, initial-scale=1">
+    \\  <title>Nova Web App</title>
+    \\  <!-- Styles are built by Tailwind CLI from styles/app.css into wwwroot/app.css.
+    \\       Run `npm install` once, then `npm run css:watch` while developing. -->
+    \\  <link rel="stylesheet" href="/app.css">
+    \\</head>
+    \\<body class="mx-auto max-w-2xl p-10 font-sans text-slate-800">
+    \\  <h1 class="text-2xl font-bold tracking-tight">Nova Web App</h1>
+    \\  <p class="mt-2 text-slate-600">Vertical-slice API. Try <code class="rounded bg-slate-100 px-1.5 py-0.5">GET /api/products/1</code>.</p>
     \\</body>
     \\</html>
+;
+
+// Tailwind CLI project files. `npm install` pulls tailwindcss + the CLI; `npm run css` builds once and
+// `npm run css:watch` rebuilds wwwroot/app.css whenever a class changes in the NSX views or the shell.
+pub const web_package_json_sample =
+    \\{
+    \\  "name": "nova-web-app",
+    \\  "private": true,
+    \\  "scripts": {
+    \\    "css": "tailwindcss -i ./styles/app.css -o ./wwwroot/app.css --minify",
+    \\    "css:watch": "tailwindcss -i ./styles/app.css -o ./wwwroot/app.css --watch"
+    \\  },
+    \\  "devDependencies": {
+    \\    "@tailwindcss/cli": "^4.1.0",
+    \\    "tailwindcss": "^4.1.0"
+    \\  }
+    \\}
+;
+
+pub const web_tailwind_css_sample =
+    \\@import "tailwindcss";
+    \\
+    \\/* The content globs (which files Tailwind scans for class names, including the `.nsx` views) live in
+    \\   tailwind.config.js at the project root, loaded here. */
+    \\@config "../tailwind.config.js";
+;
+
+// The content globs Tailwind scans. The `.nsx` glob is essential: views live in `.nsx` files, so without
+// it every utility class used only in a view would be dropped from wwwroot/app.css.
+pub const web_tailwind_config_sample =
+    \\/** @type {import('tailwindcss').Config} */
+    \\module.exports = {
+    \\  content: [
+    \\    "./src/**/*.{nsx,nova}",
+    \\    "./wwwroot/*.html",
+    \\  ],
+    \\};
+;
+
+pub const web_gitignore_sample =
+    \\node_modules/
+    \\wwwroot/app.css
 ;
 
 pub const web_test_sample =
@@ -231,6 +284,7 @@ pub const web_test_sample =
     \\import Features.Products.CreateProduct.handler;
     \\import Features.Products.GetProductById.query;
     \\import Features.Products.GetProductById.handler;
+    \\import Features.Products.views.product_card;
     \\
     \\fn testApp(): App {
     \\    let services = ServiceCollection();
@@ -256,6 +310,14 @@ pub const web_test_sample =
     \\    let req = Request.fromString("POST /api/products HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"name\":\"Widget\",\"price\":9}");
     \\    let res = app.dispatch(req);
     \\    assert.isTrue(string.indexOf(res.body, "Widget") != -1);
+    \\}
+    \\
+    \\@test
+    \\fn test_product_card_view(): void {
+    \\    // The `.nsx` view renders, and untrusted text is HTML-escaped via response.escapeHtml.
+    \\    let html = productCard("<b>Gadget</b>", 42);
+    \\    assert.isTrue(string.indexOf(html, "&lt;b&gt;Gadget") != -1);
+    \\    assert.isTrue(string.indexOf(html, "42") != -1);
     \\}
 ;
 

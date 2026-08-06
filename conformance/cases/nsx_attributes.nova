@@ -1,0 +1,87 @@
+// NSX (JSX-like views) attribute coverage: hyphenated / colon / @ / dotted-modifier attribute NAMES that
+// every hypermedia framework needs (Datastar data-on-*, HTMX hx-*, Alpine @click / :class), dynamic
+// `{expr}` attribute values, valueless boolean attributes, and RAW embedding of a pre-rendered child
+// fragment via `{expr}` (NSX does not escape). Guards the parser's compound-attribute-name reconstruction.
+import assert;
+import string;
+
+fn control(sig: string): string {
+    return <button
+        data-on-click={sig}
+        data-on-interval__duration.2s="@get('/tick')"
+        hx-get="/frag"
+        hx-target="#out"
+        :class="active"
+        @click="toggle()"
+        class="btn"
+        type="submit">Go</button>;
+}
+
+fn fieldset(childrenHtml: string): string {
+    // childrenHtml is already HTML; NSX inserts a string expression RAW (no escaping), so fragments compose.
+    return <fieldset class="grp">{childrenHtml}</fieldset>;
+}
+
+fn boolInput(): string {
+    return <input type="text" readonly required/>;
+}
+
+@test
+fn test_hypermedia_attribute_names(): void {
+    let h = control("$open = !$open");
+    assert.isTrue(string.contains(h, "data-on-click=\"$open = !$open\""));   // hyphens + dynamic value
+    assert.isTrue(string.contains(h, "data-on-interval__duration.2s=\"@get('/tick')\""));  // dots + __
+    assert.isTrue(string.contains(h, "hx-get=\"/frag\""));
+    assert.isTrue(string.contains(h, "hx-target=\"#out\""));
+    assert.isTrue(string.contains(h, ":class=\"active\""));                  // leading colon
+    assert.isTrue(string.contains(h, "@click=\"toggle()\""));               // leading @
+    assert.isTrue(string.contains(h, ">Go</button>"));
+}
+
+@test
+fn test_valueless_boolean_attributes(): void {
+    let h = boolInput();
+    assert.isTrue(string.contains(h, "readonly=\"\""));
+    assert.isTrue(string.contains(h, "required=\"\""));
+    assert.isTrue(string.contains(h, "type=\"text\""));
+}
+
+@test
+fn test_raw_fragment_embedding(): void {
+    let inner = control("x") + control("y");
+    let wrapped = fieldset(inner);
+    // both controls embedded RAW inside the fieldset (not HTML-escaped)
+    assert.isTrue(string.contains(wrapped, "<fieldset class=\"grp\"><button"));
+    assert.isTrue(!string.contains(wrapped, "&lt;button"));
+}
+
+// An NSX element expression has type `string`, so it composes like any other string. These two forms used
+// to misbehave (a compound `{call(...)}` child crashed; an NSX element as a `+` operand rendered its
+// pointer as a number) before the inferer typed `jsx_element` as `string`.
+fn checkbox(label: string, sig: string): string {
+    return <label class="row"><input type="checkbox" data-bind={sig}/>{label}</label>;
+}
+fn section(title: string, body: string): string {
+    return <section><h3>{title}</h3>{body}</section>;
+}
+
+@test
+fn test_compound_expression_child(): void {
+    // a function CALL embedded directly in `{}` (not hoisted to a let first)
+    let h = <div class="wrap">{checkbox("Autoscale enabled", "auto")}</div>;
+    assert.isTrue(string.contains(h, "Autoscale enabled"));
+    assert.isTrue(string.contains(h, "data-bind=\"auto\""));
+    assert.isTrue(!string.contains(h, "1055"));   // no stray pointer-as-number
+}
+
+@test
+fn test_nsx_element_as_concat_operand(): void {
+    // an NSX element literal directly as a `+` operand, then wrapped
+    let body = checkbox("First", "a") + <div class="mt-3">{checkbox("Second", "b")}</div>;
+    let h = section("Options", body);
+    assert.isTrue(string.contains(h, "<section><h3>Options</h3>"));
+    assert.isTrue(string.contains(h, "First"));
+    assert.isTrue(string.contains(h, "Second"));
+    assert.isTrue(string.contains(h, "class=\"mt-3\""));
+    assert.isTrue(!string.contains(h, "1055"));
+}

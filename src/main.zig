@@ -424,6 +424,28 @@ fn targetVariantPath(path: []const u8, os_tag: []const u8, arch: []const u8, is_
     return null;
 }
 
+// A resolved import may be either `<path>.nova` or its `<path>.nsx` sibling. `.nsx` is the SAME Nova
+// language, filed under a distinct extension so view / JSX (NSX) code is kept apart from plain logic.
+// Given a freshly-allocated `.nova` candidate, return whichever of the two exists as an owned path;
+// otherwise free the candidate and return null. The `.nova` form is tried first so it wins on a tie.
+fn existingSource(nova_candidate: []const u8, allocator: std.mem.Allocator, io: std.Io) ?[]const u8 {
+    if (Io.Dir.access(.cwd(), io, nova_candidate, .{})) |_| {
+        return nova_candidate;
+    } else |_| {}
+    if (std.mem.endsWith(u8, nova_candidate, ".nova")) {
+        if (std.fmt.allocPrint(allocator, "{s}.nsx", .{nova_candidate[0 .. nova_candidate.len - 5]}) catch null) |nsx| {
+            if (Io.Dir.access(.cwd(), io, nsx, .{})) |_| {
+                allocator.free(nova_candidate);
+                return nsx;
+            } else |_| {
+                allocator.free(nsx);
+            }
+        }
+    }
+    allocator.free(nova_candidate);
+    return null;
+}
+
 fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocator: std.mem.Allocator, io: std.Io, home: ?[]const u8) ![]const u8 {
     if (std.mem.eql(u8, module_name, "platform")) {
         // Synthetic module — parsed from generated source (see loadProgram), but given a src/std path so
@@ -483,18 +505,10 @@ fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocator: 
         const current_dir = dir[0..current_len];
 
         const src_candidate = try std.fmt.allocPrint(allocator, "{s}/src/{s}.nova", .{ current_dir, module_name });
-        if (Io.Dir.access(.cwd(), io, src_candidate, .{})) |_| {
-            return src_candidate;
-        } else |_| {
-            allocator.free(src_candidate);
-        }
+        if (existingSource(src_candidate, allocator, io)) |hit| return hit;
 
         const dir_candidate = try std.fmt.allocPrint(allocator, "{s}/{s}.nova", .{ current_dir, module_name });
-        if (Io.Dir.access(.cwd(), io, dir_candidate, .{})) |_| {
-            return dir_candidate;
-        } else |_| {
-            allocator.free(dir_candidate);
-        }
+        if (existingSource(dir_candidate, allocator, io)) |hit| return hit;
 
         const last_slash = std.mem.lastIndexOfScalar(u8, current_dir, '/') orelse break;
         current_len = last_slash;
@@ -506,11 +520,7 @@ fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocator: 
 
     {
         const root_src = try std.fmt.allocPrint(allocator, "src/{s}.nova", .{module_name});
-        if (Io.Dir.access(.cwd(), io, root_src, .{})) |_| {
-            return root_src;
-        } else |_| {
-            allocator.free(root_src);
-        }
+        if (existingSource(root_src, allocator, io)) |hit| return hit;
     }
 
     if (resolveFromPackageCache(module_name, allocator, io, home)) |cache_hit| {
@@ -541,11 +551,7 @@ fn resolveFromPackageCache(module_name: []const u8, allocator: std.mem.Allocator
                 std.fmt.allocPrint(allocator, "{s}/{s}/{s}.nova", .{ cache_root, entry.name, module_name }) catch continue
             else
                 std.fmt.allocPrint(allocator, "{s}/{s}/{s}/{s}.nova", .{ cache_root, entry.name, suffix, module_name }) catch continue;
-            if (Io.Dir.access(.cwd(), io, candidate, .{})) |_| {
-                return candidate;
-            } else |_| {
-                allocator.free(candidate);
-            }
+            if (existingSource(candidate, allocator, io)) |hit| return hit;
         }
     }
     return null;
@@ -556,22 +562,14 @@ fn resolveFromPackageCache(module_name: []const u8, allocator: std.mem.Allocator
 // package, e.g. nova-datastar's `datastar`/`ds_sink`). Returns an owned path or null.
 fn scanPackageRoot(root: []const u8, module_name: []const u8, allocator: std.mem.Allocator, io: std.Io) ?[]const u8 {
     const direct = std.fmt.allocPrint(allocator, "{s}/nova-{s}/src/{s}.nova", .{ root, module_name, module_name }) catch return null;
-    if (Io.Dir.access(.cwd(), io, direct, .{})) |_| {
-        return direct;
-    } else |_| {
-        allocator.free(direct);
-    }
+    if (existingSource(direct, allocator, io)) |hit| return hit;
     const dir = Io.Dir.openDir(.cwd(), io, root, .{ .iterate = true }) catch return null;
     defer Io.Dir.close(dir, io);
     var it = Io.Dir.iterate(dir);
     while (it.next(io) catch null) |entry| {
         if (entry.kind != .directory) continue;
         const candidate = std.fmt.allocPrint(allocator, "{s}/{s}/src/{s}.nova", .{ root, entry.name, module_name }) catch continue;
-        if (Io.Dir.access(.cwd(), io, candidate, .{})) |_| {
-            return candidate;
-        } else |_| {
-            allocator.free(candidate);
-        }
+        if (existingSource(candidate, allocator, io)) |hit| return hit;
     }
     return null;
 }
@@ -1361,11 +1359,16 @@ fn generateRuntimeMediator(allocator: std.mem.Allocator, declarations: *std.Arra
                             "    async fn execute(self: {s}__Adapter, ctx: RequestContext): Response {{\n" ++
                             "        let __q = ctx.request as {s};\n" ++
                             "        let __h = {s};\n" ++
-                            "        let __resp = Response(Status.Ok, {s}__toJson({s}__h.handle(__q)));\n" ++
+                            // Hoist the handler result into a `let` (as the error-union case does) so the
+                            // ownership pass tracks and drops the response DTO after it is serialised.
+                            // Inlining `__toJson(await __h.handle(__q))` left that owned DTO temp unreleased
+                            // -- a per-request leak on every matched route.
+                            "        let __r = {s}__h.handle(__q);\n" ++
+                            "        let __resp = Response(Status.Ok, {s}__toJson(__r));\n" ++
                             "        __resp.setHeader(\"Content-Type\", \"application/json\");\n" ++
                             "        return __resp;\n" ++
                             "    }}\n" ++
-                            "}}\n\n", .{ q, q, q, handler_ctor, r_ok, await_kw });
+                            "}}\n\n", .{ q, q, q, handler_ctor, await_kw, r_ok });
                 }
             }
 
@@ -1571,11 +1574,19 @@ fn scaffoldWeb(allocator: std.mem.Allocator, io: std.Io, project: []const u8) !v
 
         .{ .rel = "src/Features/Products/Shared/repository.nova", .content = templates.web_repository_sample },
 
-        .{ .rel = "src/Features/Products/views/product_card.nova", .content = templates.web_view_sample },
+        // View code lives in a `.nsx` file (same language as `.nova`; the extension keeps markup apart).
+        .{ .rel = "src/Features/Products/views/product_card.nsx", .content = templates.web_view_sample },
 
         .{ .rel = "src/Domain/entities/product.nova", .content = templates.web_domain_entity_sample },
         .{ .rel = "wwwroot/index.html", .content = templates.web_index_html_sample },
         .{ .rel = "tests/features/products_test.nova", .content = templates.web_test_sample },
+
+        // Tailwind CLI styling pipeline: `npm install` then `npm run css:watch`. tailwind.config.js lists
+        // the content globs (including the `.nsx` views) so class changes hot-rebuild wwwroot/app.css.
+        .{ .rel = "package.json", .content = templates.web_package_json_sample },
+        .{ .rel = "tailwind.config.js", .content = templates.web_tailwind_config_sample },
+        .{ .rel = "styles/app.css", .content = templates.web_tailwind_css_sample },
+        .{ .rel = ".gitignore", .content = templates.web_gitignore_sample },
     };
     for (files) |file| try scaffoldFile(allocator, io, project, file.rel, file.content);
 }
@@ -1807,7 +1818,7 @@ fn findNovaFiles(allocator: std.mem.Allocator, io: Io, root_dir: Io.Dir, sub_pat
             try findNovaFiles(allocator, io, root_dir, entry_path, list);
             allocator.free(entry_path);
         } else if (entry.kind == .file) {
-            if (std.mem.endsWith(u8, entry.name, ".nova") and !std.mem.eql(u8, entry.name, "merged.nova")) {
+            if ((std.mem.endsWith(u8, entry.name, ".nova") or std.mem.endsWith(u8, entry.name, ".nsx")) and !std.mem.eql(u8, entry.name, "merged.nova")) {
                 try list.append(allocator, entry_path);
             } else {
                 allocator.free(entry_path);
