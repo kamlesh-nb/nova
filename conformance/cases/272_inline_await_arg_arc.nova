@@ -1,0 +1,44 @@
+// Regression: an owned value produced by an `await` expression used INLINE as a call argument (not
+// bound to a `let`) must be released at the statement boundary, exactly like a direct call result.
+// Before the fix, `principledDisposition` classified `await` as `.borrowed`, so `sink(await f(), await g())`
+// leaked both results (orchweb's GetTree handler `treeView(await nodes(), await services())` grew memory
+// per request). `let x = await f()` was safe only because the binding took ownership. Verified with
+// `conformance/run.sh --arc`.
+import list;
+import assert;
+
+async fn makeList(n: int): list.List<int> {
+    let out = list.List<int>();
+    let i = 0;
+    while (i < n) { out.push(i); i = i + 1; }
+    return out;
+}
+
+fn sink(a: list.List<int>, b: list.List<int>): int { return a.size() + b.size(); }
+
+// The leaking shape: two inline `await` results passed straight as arguments.
+async fn inlineArgs(): int {
+    return sink(await makeList(3), await makeList(4));
+}
+
+// An inline await result mixed with a hoisted one (the awaited result is still passed inline).
+async fn nestedInline(): int {
+    let base = await makeList(5);
+    return sink(await makeList(2), base);
+}
+
+@test
+fn test_inline_await_arg_released(): void {
+    let acc = 0;
+    let i = 0;
+    while (i < 50) { acc = acc + inlineArgs(); i = i + 1; }
+    assert.equalInt(acc, 350);   // (3 + 4) * 50
+}
+
+@test
+fn test_nested_inline_await_released(): void {
+    let acc = 0;
+    let i = 0;
+    while (i < 20) { acc = acc + nestedInline(); i = i + 1; }
+    assert.equalInt(acc, (2 + 5) * 20);
+}

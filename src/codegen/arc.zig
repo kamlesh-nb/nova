@@ -181,8 +181,21 @@ fn principledDisposition(self: *LlvmCompiler, expr: *const ast.Expression) Dispo
 
         .literal => |lit| if (lit != .decimal and lit != .array) return .borrowed,
 
-        .try_expr, .cast, .await_expr, .go_expr => return .borrowed,
+        .try_expr, .cast, .go_expr => return .borrowed,
 
+        // `await e` yields a FRESH owned value (the resolved result of the awaited fn), exactly like a
+        // direct call does — so it must be tracked as a temporary and released at the statement boundary
+        // unless a binding/return moves it out. Classifying it `.borrowed` (as it once was) left an inline
+        // `f(await g())` result untracked and leaked it; `let x = await g()` happened to be safe only
+        // because the binding takes ownership. Fall through to the owned-type check below.
+        .await_expr => {},
+
+        // `.cast` stays BORROWED deliberately. `ptr as string` ownership is genuinely ambiguous: it may
+        // hand a fresh bytes.alloc buffer to ARC (a driver frame payload) OR be a transient view over
+        // MANUALLY managed memory the caller still `bytes.free`s (utf8 `isValid(bad as string)` then
+        // `bytes.free(bad)`). The compiler cannot tell these apart, so it does not take ownership on a cast
+        // — the contract is: bind `let s = ptr as string` to transfer ownership to ARC; inline stays a
+        // borrow for manual-memory interop. (Marking casts owned double-freed the utf8 manual-free path.)
         .optional_chaining => return if (self.exprYieldsValoptBox(expr)) .owned else .borrowed,
 
         else => {},
