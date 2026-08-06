@@ -63,6 +63,42 @@ pub fn entryDecimal(key: string, val: decimal): BsonEntry {
     return BsonEntry{ type_id: 19, key: key, str_val: "", int_val: 0, int_val2: 0, dec_val: val };
 }
 
+// ObjectId (type 7). `hex` is the 24-char hex form; stored as its 12 raw bytes for serialisation, so
+// it round-trips against deserialize (which renders type 7 back to 24-char hex). Enables querying and
+// inserting by `_id` -- previously ObjectId was decode-only.
+pub fn entryObjectId(key: string, hex: string): BsonEntry {
+    return BsonEntry{ type_id: 7, key: key, str_val: hexToRaw12(hex), int_val: 0, int_val2: 0, dec_val: 0m };
+}
+// UTC datetime (type 9): milliseconds since the Unix epoch, stored as int64 (hi/lo 32-bit halves, the
+// wire layout serialize expects).
+pub fn entryDate(key: string, millis: long): BsonEntry {
+    return BsonEntry{ type_id: 9, key: key, str_val: "",
+        int_val: (millis >> 32) & 4294967295, int_val2: (millis & 4294967295) as int, dec_val: 0m };
+}
+// Full-value int64 builder (type 18). entryInt64(hi, lo) takes pre-split 32-bit halves; this takes the
+// whole long.
+pub fn entryInt64Val(key: string, val: long): BsonEntry {
+    return BsonEntry{ type_id: 18, key: key, str_val: "",
+        int_val: (val >> 32) & 4294967295, int_val2: (val & 4294967295) as int, dec_val: 0m };
+}
+fn hexNibbleVal(ch: int): int {
+    if (ch >= 48 && ch <= 57) { return ch - 48; }        // '0'-'9'
+    if (ch >= 97 && ch <= 102) { return ch - 97 + 10; }  // 'a'-'f'
+    if (ch >= 65 && ch <= 70) { return ch - 65 + 10; }   // 'A'-'F'
+    return 0;
+}
+fn hexToRaw12(hex: string): string {
+    let p = bytes.alloc(12);
+    let i = 0;
+    while (i < 12) {
+        let hiN = if (i * 2 < hex.length) hexNibbleVal(hex[i * 2] & 255) else 0;
+        let loN = if (i * 2 + 1 < hex.length) hexNibbleVal(hex[i * 2 + 1] & 255) else 0;
+        bytes.write_byte(p, i, hiN * 16 + loN);
+        i = i + 1;
+    }
+    return p as string;
+}
+
 fn writeCstring(ptr: ptr, offset: int, s: string): int {
     let len = s.length;
     let i = 0;
@@ -121,6 +157,12 @@ fn getDocSize(doc: BsonDocument): int {
             size = size + 1 + key_len + 1 + 8;
         }
         if (t == 18) {
+            size = size + 1 + key_len + 1 + 8;
+        }
+        if (t == 7) {                         // ObjectId: 12 raw bytes
+            size = size + 1 + key_len + 1 + 12;
+        }
+        if (t == 9 || t == 17) {              // UTC datetime / timestamp: int64
             size = size + 1 + key_len + 1 + 8;
         }
         if (t == 19) {
@@ -206,6 +248,23 @@ pub fn serialize(doc: BsonDocument): ptr {
         }
         if (t == 18) {
             bytes.write_byte(ptr, offset, 18);
+            offset = offset + 1;
+            offset = offset + writeCstring(ptr, offset, entry.key);
+            bytes.write_i32(ptr, offset, entry.int_val2);
+            offset = offset + 4;
+            bytes.write_i32(ptr, offset, entry.int_val);
+            offset = offset + 4;
+        }
+        if (t == 7) {                         // ObjectId: 12 raw bytes (str_val holds them)
+            bytes.write_byte(ptr, offset, 7);
+            offset = offset + 1;
+            offset = offset + writeCstring(ptr, offset, entry.key);
+            let j = 0;
+            while (j < 12) { bytes.write_byte(ptr, offset + j, bytes.read_byte(entry.str_val, j)); j = j + 1; }
+            offset = offset + 12;
+        }
+        if (t == 9 || t == 17) {              // datetime / timestamp: int64 as lo(i32) + hi(i32)
+            bytes.write_byte(ptr, offset, t);
             offset = offset + 1;
             offset = offset + writeCstring(ptr, offset, entry.key);
             bytes.write_i32(ptr, offset, entry.int_val2);
@@ -325,12 +384,13 @@ pub fn deserialize(ptr: ptr): BsonDocument {
             offset = offset + 12;
             doc.entries.push(BsonEntry{ type_id: 7, key: key, str_val: oid, int_val: 0, int_val2: 0, dec_val: 0m });
         }
-        if (type_byte == 9 || type_byte == 17) {   // UTC datetime / timestamp: int64 (ms / packed)
+        if (type_byte == 9 || type_byte == 17) {   // UTC datetime (9) / timestamp (17): int64
             let lo = bytes.read_i32(ptr, offset);
             offset = offset + 4;
             let hi = bytes.read_i32(ptr, offset);
             offset = offset + 4;
-            doc.entries.push(entryInt64(key, hi, lo));
+            // Keep the real type tag (was flattened to entryInt64/type-18, losing datetime vs int64).
+            doc.entries.push(BsonEntry{ type_id: type_byte, key: key, str_val: "", int_val: hi, int_val2: lo, dec_val: 0m });
         }
         if (type_byte == 16) {
             let val = bytes.read_i32(ptr, offset);
@@ -515,6 +575,23 @@ pub fn docGetInt(doc: BsonDocument, index: int): int {
     let entry = doc.entries.at(index);
     if (entry.type_id != 16) return 0;
     return entry.int_val;
+}
+// Read a 64-bit value (int64 type 18, or datetime/timestamp types 9/17) as a full long, reassembled
+// from the stored hi/lo 32-bit halves. int32 (type 16) also widens cleanly.
+pub fn docGetInt64(doc: BsonDocument, index: int): long {
+    if (index < 0 || index >= doc.entries.size()) return 0;
+    let e = doc.entries.at(index);
+    if (e.type_id == 16) { return e.int_val; }
+    let hi = e.int_val & 4294967295;               // unsigned high word
+    let lo = (e.int_val2 as long) & 4294967295;    // unsigned low word
+    return (hi << 32) + lo;
+}
+// A datetime (type 9) as milliseconds since the Unix epoch. Same reassembly as docGetInt64.
+pub fn docGetDate(doc: BsonDocument, index: int): long { return docGetInt64(doc, index); }
+// Read a double (type 1) as a native double (via the IEEE-LE bytes, like the SQL drivers).
+pub fn docGetDouble(doc: BsonDocument, index: int): double {
+    if (index < 0 || index >= doc.entries.size()) return 0.0;
+    return string.parseFloat(dblStr(doc.entries.at(index)));
 }
 
 pub fn docGetBool(doc: BsonDocument, index: int): int {
