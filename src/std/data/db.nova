@@ -17,6 +17,7 @@ pub enum DbType {
     Decimal,
     Uuid,
     Json,
+    Array,
 }
 
 pub struct DbValue {
@@ -25,6 +26,7 @@ pub struct DbValue {
     pub f: double,
     pub dec: decimal,
     pub s: string,
+    pub arr: List<DbValue>,   // element values when kind == Array (empty otherwise)
 
     init(kind: DbType, i: long, f: double, dec: decimal, s: string) {
         self.kind = kind;
@@ -32,7 +34,11 @@ pub struct DbValue {
         self.f = f;
         self.dec = dec;
         self.s = s;
+        self.arr = List<DbValue>();
     }
+
+    // Fluent: attach array elements. Returns self so `dbArray` composes without a second init.
+    pub fn withArr(self: DbValue, elems: List<DbValue>): DbValue { self.arr = elems; return self; }
 
     pub fn isNull(self: DbValue): bool { return self.kind == DbType.Null; }
     pub fn asBool(self: DbValue): bool { return self.i != 0; }
@@ -46,6 +52,8 @@ pub struct DbValue {
     pub fn asTimestamp(self: DbValue): string { return self.s; }
     pub fn asUuid(self: DbValue): string { return self.s; }   // canonical UUID string
     pub fn asJson(self: DbValue): string { return self.s; }   // raw JSON text
+    pub fn asArray(self: DbValue): List<DbValue> { return self.arr; }   // element values (kind == Array)
+    pub fn arrayLen(self: DbValue): int { return self.arr.size(); }
 
     // NULL-aware accessors: return the supplied default when the value is SQL NULL, instead of the
     // silent 0/"" the plain accessors give (which cannot distinguish NULL from a real 0 / empty string).
@@ -69,6 +77,7 @@ pub fn dbTimestamp(iso: string): DbValue { return DbValue(DbType.Timestamp, 0, 0
 // A UUID as its canonical 8-4-4-4-12 string, and a JSON/JSONB value as raw text.
 pub fn dbUuid(s: string): DbValue { return DbValue(DbType.Uuid, 0, 0.0, 0m, s); }
 pub fn dbJson(s: string): DbValue { return DbValue(DbType.Json, 0, 0.0, 0m, s); }
+pub fn dbArray(elems: List<DbValue>): DbValue { return DbValue(DbType.Array, 0, 0.0, 0m, "").withArr(elems); }
 
 pub struct Column {
     pub name: string,
@@ -92,6 +101,7 @@ pub struct Row {
     pub fn getDouble(self: Row, i: int): double { return self.get(i).asDouble(); }
     pub fn getDecimal(self: Row, i: int): decimal { return self.get(i).asDecimal(); }
     pub fn getText(self: Row, i: int): string { return self.get(i).asText(); }
+    pub fn getArray(self: Row, i: int): List<DbValue> { return self.get(i).asArray(); }
     pub fn getTimestamp(self: Row, i: int): string { return self.get(i).asTimestamp(); }
 }
 
