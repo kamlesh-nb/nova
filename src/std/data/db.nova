@@ -95,15 +95,49 @@ pub struct Row {
     pub fn getTimestamp(self: Row, i: int): string { return self.get(i).asTimestamp(); }
 }
 
+// Normalized, cross-driver error categories. Each driver maps its NATIVE code (SQLSTATE string /
+// MySQL or TDS number) onto one of these so callers can write portable retry/handling logic
+// (`if (err.isDeadlock()) retry;`) without knowing the backend's private code space.
+pub const DBERR_UNKNOWN: int = 0;
+pub const DBERR_UNIQUE_VIOLATION: int = 1;   // duplicate key
+pub const DBERR_NOT_NULL: int = 2;           // NOT NULL constraint
+pub const DBERR_FOREIGN_KEY: int = 3;        // FK constraint
+pub const DBERR_CHECK: int = 4;              // CHECK constraint
+pub const DBERR_DEADLOCK: int = 5;           // deadlock victim (retryable)
+pub const DBERR_SERIALIZATION: int = 6;      // serialization failure (retryable)
+pub const DBERR_LOCK_TIMEOUT: int = 7;       // lock wait timeout (retryable)
+pub const DBERR_SYNTAX: int = 8;             // SQL syntax / undefined object
+pub const DBERR_AUTH: int = 9;               // authentication / permission
+pub const DBERR_CONNECTION: int = 10;        // connection / network failure (retryable)
+
 pub struct DbError {
-    pub code: string,
+    pub code: string,        // native string code (Postgres SQLSTATE, or "" if numeric-only)
     pub message: string,
+    pub number: int,         // native numeric code (MySQL/TDS error number; 0 if none)
+    pub kind: int,           // normalized DBERR_* category (set by the driver)
     init(code: string, message: string) {
         self.code = code;
         self.message = message;
+        self.number = 0;
+        self.kind = 0;
+    }
+
+    // Fluent enrichment used by drivers after building the base error. Returns self so it composes:
+    // `DbError(sqlstate, msg).with(0, db.DBERR_DEADLOCK)`.
+    pub fn with(self: DbError, number: int, kind: int): DbError {
+        self.number = number;
+        self.kind = kind;
+        return self;
     }
 
     pub fn isEmpty(self: DbError): bool { return string.eql(self.code, "") && string.eql(self.message, ""); }
+    pub fn isUniqueViolation(self: DbError): bool { return self.kind == DBERR_UNIQUE_VIOLATION; }
+    pub fn isDeadlock(self: DbError): bool { return self.kind == DBERR_DEADLOCK; }
+    // Transient failures worth an automatic retry (deadlock, serialization, lock timeout, connection loss).
+    pub fn isTransient(self: DbError): bool {
+        return self.kind == DBERR_DEADLOCK || self.kind == DBERR_SERIALIZATION
+            || self.kind == DBERR_LOCK_TIMEOUT || self.kind == DBERR_CONNECTION;
+    }
 }
 
 pub fn noError(): DbError { return DbError("", ""); }

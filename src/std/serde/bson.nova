@@ -283,6 +283,17 @@ pub fn deserialize(ptr: ptr): BsonDocument {
 
         if (type_byte == 0) break;
 
+        // Guard: an UNHANDLED type would fall through every branch below, leaving `offset` advanced only
+        // past the key so the value bytes get misread as the next element (stream desync, and a
+        // 0-length key can stall progress). Stop cleanly on the first unsupported type instead. Types
+        // not yet decoded: 6 undefined, 11 regex, 12 dbpointer, 13/15 code, 14 symbol, 127/255 min/max key.
+        if (!(type_byte == 1 || type_byte == 2 || type_byte == 3 || type_byte == 4 || type_byte == 5
+           || type_byte == 7 || type_byte == 8 || type_byte == 9 || type_byte == 10 || type_byte == 16
+           || type_byte == 17 || type_byte == 18 || type_byte == 19)) {
+            console.log("bson: unsupported type " + `${type_byte}` + " -- stopping decode to avoid desync");
+            break;
+        }
+
         let remaining = total_size - offset;
         let key = readCstring(ptr, offset, remaining);
         offset = offset + key.length + 1;
