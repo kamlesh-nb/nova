@@ -11,17 +11,23 @@ import web.status;
 import web.static_content;
 
 @test
-fn test_lru_eviction_and_stats(): void {
-    let c = static_content.LruCache(2);
-    c.put("a", "1");
-    c.put("b", "2");
-    assert.equalStr(c.get("a") ?? "?", "1"); // a -> MRU
-    c.put("c", "3");                          // evicts LRU (b)
-    assert.isTrue(c.get("b") == undefined);   // evicted
-    assert.equalStr(c.get("a") ?? "?", "1");
-    assert.equalStr(c.get("c") ?? "?", "3");
-    assert.isTrue(c.hits > 0);
-    assert.isTrue(c.misses > 0);
+fn test_static_cache_persists(): void {
+    // A file is read from disk at most once; afterwards it is served from the in-memory Map, even if the
+    // file is deleted. This is what keeps static serving off the filesystem on the hot path.
+    let root = dir.Dir.tempDir();
+    let path = root + "/nova_static_cache_gate.txt";
+    file.File.writeText(path, "cached-body");
+
+    let mount = static_content.StaticMount("/s", root, 16);
+    let r1 = mount.serve("/s/nova_static_cache_gate.txt");
+    assert.isTrue(r1 != undefined);           // first request reads from disk and caches
+
+    let _ = dir.Dir.remove(path);             // remove the file from disk
+    let r2 = mount.serve("/s/nova_static_cache_gate.txt");
+    assert.isTrue(r2 != undefined);           // still served -> from the cache, not the (now gone) file
+
+    let miss = mount.serve("/s/never_existed.txt");
+    assert.isTrue(miss == undefined);         // uncached + absent -> undefined
 }
 
 @test

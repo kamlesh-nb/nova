@@ -43,7 +43,7 @@ pub struct StringBuilder {
         return sptr as string;
     }
 
-    fn ensureCapacity(self: StringBuilder, minCap: int): void {
+    pub fn ensureCapacity(self: StringBuilder, minCap: int): void {
         if (minCap <= self.cap) return;
         let newCap = self.cap * 2;
         if (newCap < minCap) newCap = minCap;

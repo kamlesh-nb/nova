@@ -121,6 +121,13 @@ pub struct ReactorStream {
     pub async fn recvInto(self: ReactorStream, buf: long, max: int): int {
         // Completion model: submit a recv op carrying this coroutine as the token, suspend, and read the
         // byte count the loop filled in. The op record + buf are on this frame, so they outlive the op.
+        // FAST PATH: try a direct read first. On a busy keep-alive connection the next request is often
+        // already in the socket buffer, so this returns immediately -- no op, no suspend. EAGAIN (no data
+        // yet) falls through to the completion op, which parks the coroutine until the fd is readable.
+        let r0 = socket.recvSock(self.fd, buf, max);
+        if (r0 > 0) { return r0 as int; }
+        if (r0 == 0) { return 0; }                 // peer closed
+        if (!socket.wouldBlock()) { return -1; }   // real error
         let op = nova_op_alloc(eventloop.OP_SIZE as long);
         eventloop.makeOp(op, eventloop.OP_RECV, self.fd, buf, max, currentCoro());
         // A FAILED submit posts NO completion, so suspending here waits forever. This is what every
@@ -179,10 +186,19 @@ pub struct ReactorStream {
 
     // Write all `len` bytes from `buf`, awaiting writability on EAGAIN(). Returns bytes sent, or -1.
     pub async fn sendBuf(self: ReactorStream, buf: long, len: int): int {
-        // Completion model: submit a send op per remaining chunk. The loop only completes a send once it
-        // has made progress (it re-arms on a spurious EAGAIN()), so opResult is the bytes written (>0) or a
-        // real error; a partial write loops to submit the remainder.
         let sent = 0;
+        // FAST PATH: a non-blocking socket is almost always writable, so write DIRECTLY first. This keeps
+        // the common send at one syscall -- no op alloc, no reactor submit, no coroutine suspend/resume --
+        // which is where the whole point of async is: pay the reactor cost only when you would actually
+        // block. Only a full kernel send buffer (EAGAIN / wouldBlock) drops us to the completion op below.
+        while (sent < len) {
+            let w = socket.sendSock(self.fd, buf + (sent as long), len - sent);
+            if (w > 0) { sent = sent + (w as int); }
+            else if (w == 0) { break; }
+            else if (socket.wouldBlock()) { break; }   // buffer full -> wait via the reactor
+            else { return -1; }                          // real error
+        }
+        // SLOW PATH: kernel buffer was full; park on writability via the completion op for the remainder.
         while (sent < len) {
             let op = nova_op_alloc(eventloop.OP_SIZE as long);
             eventloop.makeOp(op, eventloop.OP_SEND, self.fd, buf + (sent as long), len - sent, currentCoro());
@@ -196,17 +212,14 @@ pub struct ReactorStream {
         return sent;
     }
 
-    // Send a string. Copies into a scratch buffer once, then sends it reactor-natively. (A future
-    // step can pass the string's byte address directly to avoid the copy.)
+    // Send a string reactor-natively, passing the string's OWN byte buffer straight to the send op with no
+    // copy. The bytes stay valid for the whole send: `data` is a borrowed parameter, so the caller holds a
+    // live reference across the `await`. Copying byte-by-byte here (the previous approach) made send time
+    // linear in body size in Nova code and was the throughput ceiling for larger responses / static assets.
     pub async fn sendStr(self: ReactorStream, data: string): int {
         let len = data.length;
         if (len == 0) { return 0; }
-        let tmp = bytes.alloc(len);
-        let i = 0;
-        while (i < len) { bytes.write_byte(tmp, i, data[i]); i = i + 1; }
-        let r = await self.sendBuf(tmp, len);
-        bytes.free(tmp);
-        return r;
+        return await self.sendBuf(data as long, len);
     }
 
     pub fn fdOf(self: ReactorStream): int { return self.fd; }
@@ -299,5 +312,8 @@ pub async fn reactorAccept(listenFd: int, kq: int): ReactorStream {
     coroSuspend();
     let c = eventloop.opResult(op);
     nova_op_free(op);
+    // Turn off Nagle on the accepted connection so responses are not held back waiting for an ACK -- the
+    // request/response ping-pong of HTTP keep-alive otherwise serialises badly and caps throughput.
+    if (c >= 0) { let _ = socket.setTcpNoDelay(c); }
     return ReactorStream(c, kq);
 }

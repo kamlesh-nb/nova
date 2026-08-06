@@ -1,4 +1,10 @@
-
+// Static file serving. A file is read from disk at most ONCE -- the first time it is requested -- then its
+// bytes and precomputed Content-Type are held in a Map for the life of the process; every later request for
+// that path is answered from the Map with no filesystem access. The Map is unbounded and never evicts, so
+// a given asset is never re-read (this is deliberately lazy rather than walking the whole mount tree at
+// startup: a mount dir may be large, e.g. contain node_modules, so eagerly reading everything is unsafe).
+// All content types work (HTML, CSS, JS, images, fonts): readText is length-prefixed and byte-safe, so
+// binary assets are stored verbatim.
 import string;
 import map;
 import list;
@@ -7,83 +13,34 @@ import web.mime;
 import web.response;
 import web.status;
 
-pub struct LruCache {
-    pub capacity: int,
-    pub store: map.Map<string, string>,
-    pub order: list.List<string>,
-    pub hits: long,
-    pub misses: long,
-
-    init(cap: int) {
-        self.capacity = cap;
-        self.store = map.Map<string, string>(cap * 2, string.hash);
-        self.order = list.List<string>();
-        self.hits = 0;
-        self.misses = 0;
-    }
-
-    fn touch(self: LruCache, key: string): void {
-        let n = self.order.size();
-        let i = 0;
-        while (i < n) {
-            let k = self.order.get(i) ?? "";
-            if (string.eql(k, key)) {
-                self.order.remove(i);
-                i = n;
-            } else {
-                i = i + 1;
-            }
-        }
-        self.order.push(key);
-    }
-
-    pub fn get(self: LruCache, key: string): string | undefined {
-        if (self.store.has(key)) {
-            self.hits = self.hits + 1;
-            self.touch(key);
-            return self.store.get(key);
-        }
-        self.misses = self.misses + 1;
-        return undefined;
-    }
-
-    pub fn put(self: LruCache, key: string, value: string): void {
-        if (self.store.has(key)) {
-            self.store.set(key, value);
-            self.touch(key);
-            return;
-        }
-        if (self.store.size() >= self.capacity) {
-            let lru = self.order.get(0) ?? "";
-            self.order.remove(0);
-            self.store.delete_key(lru);
-        }
-        self.store.set(key, value);
-        self.order.push(key);
-    }
-
-    pub fn hitRate(self: LruCache): double {
-        let total = self.hits + self.misses;
-        if (total == 0) { return 0.0; }
-        return (self.hits as double) / (total as double);
-    }
-}
-
 fn fileExt(path: string): string {
     let dot = string.lastIndexOf(path, ".");
     if (dot == -1) { return ""; }
     return string.slice(path, dot + 1, path.length);
 }
 
+// One preloaded asset: the raw bytes and the Content-Type computed once from its extension.
+pub struct StaticAsset {
+    pub content: string,
+    pub contentType: string,
+
+    init(content: string, contentType: string) {
+        self.content = content;
+        self.contentType = contentType;
+    }
+}
+
 pub struct StaticMount {
     pub prefix: string,
     pub dir: string,
-    pub cache: LruCache,
+    pub assets: map.Map<string, StaticAsset>,
 
     init(prefix: string, dir: string, cacheCap: int) {
         self.prefix = prefix;
         self.dir = dir;
-        self.cache = LruCache(cacheCap);
+        // Keyed by the path RELATIVE to the mount dir (no leading slash), e.g. "index.html",
+        // "app.css", "img/logo.png" -- which is what serve() derives from the request path.
+        self.assets = map.Map<string, StaticAsset>(256, string.hash);
     }
 
     pub fn serve(self: StaticMount, reqPath: string): response.Response | undefined {
@@ -95,24 +52,28 @@ pub struct StaticMount {
             return response.Response(Status.Forbidden, "Forbidden");
         }
         if (string.eql(rel, "") || string.eql(rel, "/")) {
-            rel = "/index.html";
+            rel = "index.html";
         }
-        let fsPath = self.dir + rel;
-
-        let content = "";
-        let cached = self.cache.get(fsPath);
-        if (cached == undefined) {
-            if (!file.File.exists(fsPath)) {
-                return undefined;
-            }
-            content = file.File.readText(fsPath);
-            self.cache.put(fsPath, content);
-        } else {
-            content = cached ?? "";
+        // Map keys have no leading slash; the stripped request path may keep one (prefix "/" -> "/app.css").
+        if (string.startsWith(rel, "/")) {
+            rel = string.slice(rel, 1, rel.length);
         }
 
-        let mimeType = mime.contentType(fileExt(rel));
-        let resp = response.Response(Status.Ok, content);
-        return resp.setHeader("Content-Type", mimeType);
+        let hit = self.assets.get(rel);
+        if (hit != undefined) {
+            let asset = hit ?? StaticAsset("", "");
+            return response.Response(Status.Ok, asset.content).setHeader("Content-Type", asset.contentType);
+        }
+
+        // First time this path is seen: read it from disk once, then cache it forever.
+        let sep = if (string.startsWith(rel, "/")) "" else "/";
+        let fsPath = self.dir + sep + rel;
+        if (!file.File.exists(fsPath)) {
+            return undefined;
+        }
+        let content = file.File.readText(fsPath);
+        let contentType = mime.contentType(fileExt(rel));
+        self.assets.set(rel, StaticAsset(content, contentType));
+        return response.Response(Status.Ok, content).setHeader("Content-Type", contentType);
     }
 }

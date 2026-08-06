@@ -35,6 +35,27 @@ fn ciEquals(a: string, b: string): bool {
     return true;
 }
 
+// HTML-escape a string for safe interpolation into an NSX / hypermedia view. NSX inserts a `{expr}`
+// string RAW (so pre-rendered fragments compose), which means any text that could contain HTML-special
+// characters must be escaped by the caller. This is the one canonical escaper so views (and `.nsx` files)
+// do not each redefine their own: `{response.escapeHtml(user.name)}`. It replaces the five characters that
+// matter in element text and double-quoted attribute values: & < > " '.
+pub fn escapeHtml(s: string): string {
+    let sb = StringBuilder();
+    let i = 0;
+    while (i < string.len(s)) {
+        let c = s[i];
+        if (c == 38) { sb.append("&amp;"); }
+        else if (c == 60) { sb.append("&lt;"); }
+        else if (c == 62) { sb.append("&gt;"); }
+        else if (c == 34) { sb.append("&quot;"); }
+        else if (c == 39) { sb.append("&#39;"); }
+        else { sb.append(string.slice(s, i, i + 1)); }
+        i = i + 1;
+    }
+    return sb.toString();
+}
+
 // The standard error side of a typed handler's `TResp | HttpError` return. A handler returns the ok
 // DTO for success (the framework serialises it as 200 JSON) or an `HttpError` for failure, which the
 // framework turns into a Response via `toResponse()`: the given status code and the message as the body.
@@ -109,8 +130,10 @@ pub struct Response {
             self.headers.set("Content-Length", intToStr(self.body.length));
         }
 
-        // one growable buffer, no List/join/concat chain
+        // one growable buffer, no List/join/concat chain. Pre-size it to the body plus header headroom so
+        // a large body (e.g. a static asset) is copied once, not re-copied through ~log2(n) doublings.
         let sb = string_builder.StringBuilder();
+        sb.ensureCapacity(self.body.length + 512);
         sb.append("HTTP/1.1 ");
         sb.append(intToStr(Status.toCode(self.status)));
         sb.append(" ");

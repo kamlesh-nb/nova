@@ -34,8 +34,10 @@ pub struct ByteBuf {
             bytes.write_byte(nbuf, i, bytes.read_byte(self.buf, i));
             i = i + 1;
         }
+        let old = self.buf;
         self.buf = nbuf;
         self.cap = ncap;
+        bytes.free(old);   // the grown-past buffer is scratch; free it or every grow leaks it
     }
 
     pub fn push(self: ByteBuf, b: int): void {
@@ -60,6 +62,7 @@ pub struct ByteBuf {
     }
 
     pub fn delete(self: ByteBuf): void {
+        if (self.buf != 0) { bytes.free(self.buf); self.buf = 0; }
     }
 }
 
@@ -656,5 +659,8 @@ pub fn gzipCompress(data: string): string {
     out.push((isize >> 8) & 255);
     out.push((isize >> 16) & 255);
     out.push((isize >> 24) & 255);
-    return out.toString();
+    let s = out.toString();
+    out.delete();   // free the builder buffers now (toString copied the bytes out)
+    body.delete();
+    return s;
 }

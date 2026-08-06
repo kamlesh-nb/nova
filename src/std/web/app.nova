@@ -54,6 +54,11 @@ pub struct App {
     pub tlsCert: string,
     pub tlsKey: string,
 
+    // Response gzip is OFF by default: the pure-Nova DEFLATE is CPU-heavy (it dominated a profile of the
+    // server -- ~60% of CPU compressing every response), so paying it on every request is the wrong
+    // default. Opt in with `app.useGzip()` when responses are large/compressible enough to be worth it.
+    pub gzipEnabled: bool,
+
     // Port for the multi-core reactor server. Carried on the App so the reactor worker closure needs
     // only a single capture (the App); see runReactorMC.
     pub serverPort: int,
@@ -74,7 +79,14 @@ pub struct App {
         self.tlsEnabled = false;
         self.tlsCert = "";
         self.tlsKey = "";
+        self.gzipEnabled = false;
         self.serverPort = 0;
+    }
+
+    // Opt in to response gzip (Content-Encoding: gzip for compressible responses >= 256 bytes when the
+    // client sends Accept-Encoding: gzip). Off by default -- see the gzipEnabled field note.
+    pub fn useGzip(self: App): void {
+        self.gzipEnabled = true;
     }
 
     pub fn useTls(self: App, certPath: string, keyPath: string): void {
@@ -126,7 +138,7 @@ pub struct App {
 
         let ae = req.getHeader("accept-encoding") ?? "";
         let didGzip = false;
-        if (string.contains(ae, "gzip") && resp.body.length >= 256) {
+        if (self.gzipEnabled && string.contains(ae, "gzip") && resp.body.length >= 256) {
             let packed = gzip.compress(resp.body);
             if (packed.length > 0 && packed.length < resp.body.length) {
                 resp.body = packed;
@@ -173,7 +185,12 @@ pub struct App {
     // carry one, with the path params overlaid so a @fromRoute field wins over @fromBody. A GET has no
     // body, so it binds from the params alone.
     fn sourceFor(self: App, req: Request, params: Map<string, string>): ValueSource {
-        let paramSrc = source.ParamSource(params);
+        // Overlay route params on the query string so a GET binds both `?a=b` filters and `{id}` path
+        // params into its request DTO (route params win on a key clash).
+        let merged = Map<string, string>(8, string.hash);
+        req.query.forEach((k, v) => { merged.set(k, v); });
+        params.forEach((k, v) => { merged.set(k, v); });
+        let paramSrc = source.ParamSource(merged);
         if (string.eql(req.method, "POST") || string.eql(req.method, "PUT") || string.eql(req.method, "PATCH")) {
             let contentType = req.getHeader("content-type") ?? "";
             let ct = string.toLowerCase(contentType);

@@ -52,6 +52,15 @@ pub fn setReuseAddr(fd: int): int {
 // Windows has no SO_REUSEPORT; SO_REUSEADDR gives the closest (shared-port) behaviour there.
 pub fn setReusePort(fd: int): int { return setReuseAddr(fd); }
 
+// Disable Nagle on an accepted connection (IPPROTO_TCP=6, TCP_NODELAY=1, same on Windows).
+pub fn setTcpNoDelay(fd: int): int {
+    let one = bytes.alloc(4);
+    bytes.write_i32(one, 0, 1);
+    let r = winsock.setsockopt(fd as long, 6, 1, one, 4);
+    bytes.free(one);
+    return r;
+}
+
 pub fn sockError(fd: int): int {
     let val = bytes.alloc(4);
     let len = bytes.alloc(4);

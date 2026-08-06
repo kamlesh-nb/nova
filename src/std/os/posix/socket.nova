@@ -53,6 +53,17 @@ pub fn setReusePort(fd: int): int {
     return r;
 }
 
+// Disable Nagle's algorithm on an accepted connection. Without it the kernel holds a small response back
+// waiting for more data / an ACK, which serialises the request/response ping-pong of an HTTP keep-alive
+// connection and caps throughput. IPPROTO_TCP (6) and TCP_NODELAY (1) are the same on macOS and Linux.
+pub fn setTcpNoDelay(fd: int): int {
+    let one = bytes.alloc(4);
+    bytes.write_i32(one, 0, 1);
+    let r = sys.setsockopt(fd, 6, 1, one, 4);
+    bytes.free(one);
+    return r;
+}
+
 // Pending socket error via getsockopt(SO_ERROR): 0 = connect succeeded, non-zero = failure.
 pub fn sockError(fd: int): int {
     let val = bytes.alloc(4);
