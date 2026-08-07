@@ -78,6 +78,8 @@ pub fn dbTimestamp(iso: string): DbValue { return DbValue(DbType.Timestamp, 0, 0
 pub fn dbUuid(s: string): DbValue { return DbValue(DbType.Uuid, 0, 0.0, 0m, s); }
 pub fn dbJson(s: string): DbValue { return DbValue(DbType.Json, 0, 0.0, 0m, s); }
 pub fn dbArray(elems: List<DbValue>): DbValue { return DbValue(DbType.Array, 0, 0.0, 0m, "").withArr(elems); }
+// An empty parameter list, for a query/exec/queryStream with no bound parameters.
+pub fn noParams(): List<DbValue> { return List<DbValue>(); }
 
 pub struct Column {
     pub name: string,

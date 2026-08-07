@@ -194,6 +194,29 @@ behaviour (`TransactionBehavior` in `examples/webapp`): the mediator pipeline op
 every command, commits when the handler returns normally, and rolls back if it reports an error. Your
 handler code stays free of transaction plumbing, exactly as validation and logging do.
 
+## Streaming large result sets
+
+`query` buffers the whole result in memory, which is fine for a page of rows but not for a report over
+millions. Each SQL driver's concrete connection (from `postgres.open` / `mysql.open` / `mssql.open`, the
+same way `mongodb.open` returns the concrete Mongo connection) offers `queryStream`, which returns an
+async cursor that pulls rows from the server in batches so the full set never materialises:
+
+```nova
+import postgres;
+
+let conn = await postgres.open("postgresql://user@host/db");
+let cur = await conn.queryStream("SELECT id, body FROM events ORDER BY id", db.noParams(), 500);
+while (let row = await cur.next()) {      // fetches the next 500-row batch only when the current one drains
+    // ... process row ...
+}
+let _ = await cur.close();               // release the server-side cursor if you stop early
+```
+
+The API is identical across the drivers; only the wire mechanism differs (Postgres portals, MySQL a
+server-side cursor, SQL Server the TDS token stream, MongoDB `getMore`). The batch size is the third
+argument. Always `close()` the cursor when you finish, especially if you break out early, so the
+server-side cursor is released and the connection returns to a clean state for reuse.
+
 ## Running it live
 
 `examples/run-live.sh` runs the whole loop end to end: it builds and starts a NovaDB server on

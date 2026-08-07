@@ -33,9 +33,9 @@ has since been implemented and pushed. Current state per driver:
   uuid, TDS packet chunking, sp_reset_connection on pooled reuse, query cancellation via ATTENTION.
 
 **What remains for the three SQL drivers**, cross-cutting:
-- **X4 streaming ResultSet (Phase 3)**: the seam still buffers the whole result set; no cursor/iterator in
-  `db.nova`. This is the next item and it needs a seam change (plus an async wait primitive for idle
-  delivery). It benefits all four drivers.
+- **X4 streaming ResultSet (Phase 3): DONE.** Async `Cursor`/`RowBatchSource` seam in `db.nova` + native
+  streaming on postgres (portals), mysql (server-side cursor), mssql (incremental TDS decode); mongodb
+  already lazy. All verified live.
 - **X5 connection robustness (Phase 3)**: a hard pool cap with an async wait queue + bad-connection
   eviction; also blocked on the async wait primitive.
 - **Phase 4 long-tail**, per driver: postgres binary formats / COPY IN / multi-host; mysql compression /
@@ -233,10 +233,12 @@ typed binary prepared params + multi-resultset; mssql ENVCHANGE + multiple resul
 read/write + filter builder + ObjectId + getMore + killCursors. (Alt-auth mechanisms that need external
 infra, e.g. mysql ed25519, mssql integrated auth, mongodb AWS/LDAP/OIDC, roll into Phase 4.)
 
-**Phase 3 - streaming and architecture (needs seam/runtime work). IN PROGRESS (X4 next).** The mongodb
-native document API + lazy cursors + SRV/topology + sessions/transactions is DONE. Still open: **X4
-streaming ResultSet** (a cursor/iterator in `db.nova` so drivers yield rows instead of buffering) and
-**X5 pool hard-cap/eviction**, both needing an async wait primitive. X4 is the current target.
+**Phase 3 - streaming and architecture. X4 DONE; X5 open.** The mongodb native document API + lazy cursors
++ SRV/topology + sessions/transactions is DONE. **X4 streaming ResultSet is DONE**: the async `Cursor` /
+`RowBatchSource` seam in `db.nova`, with native streaming on postgres (portals + Flush), mysql (server-side
+cursor + COM_STMT_FETCH) and mssql (incremental TDS token decode), all verified live; mongodb already had a
+lazy cursor. Still open: **X5 pool hard-cap + bad-connection eviction** (the async wait primitive aio.delay
+now exists).
 
 **Phase 4 - long tail (open).**
 postgres binary formats + COPY IN + multi-host; mysql compression + LOAD DATA + ed25519; mssql TDS 8.0
