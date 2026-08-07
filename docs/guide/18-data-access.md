@@ -20,7 +20,7 @@ package that implements it:
 | PostgreSQL | `import postgres;`| `PgDriver().connect("postgresql://user:pass@127.0.0.1:5432/shop")` |
 | MySQL      | `import mysql;`   | `MyDriver().connect("mysql://user:pass@127.0.0.1:3306/shop")` |
 | SQL Server | `import mssql;`   | `MssqlDriver().connect("mssql://user:pass@127.0.0.1:1433/shop")` |
-| MongoDB    | `import mongodb;` | document API over the same package layout |
+| MongoDB    | `import mongodb;` | a native document API (see [MongoDB: the document API](#mongodb-the-document-api) below) |
 
 Because they share the `Connection` seam, the code you write against it does not change when you change
 databases. You pick the driver in one place, at startup, and everything above it is driver-agnostic.
@@ -200,6 +200,221 @@ handler code stays free of transaction plumbing, exactly as validation and loggi
 `127.0.0.1:3009`, builds `main_novadb`, starts the app, and curls a create and a read so you can watch a
 value travel from an HTTP request into NovaDB and back out. It then puts the app behind the orchestrator,
 which is the subject of Chapter 21.
+
+## MongoDB: the document API
+
+MongoDB is not relational, so it does not fit the `query`/`exec` seam the SQL drivers share. Instead the
+`mongodb` package gives you a native document API: typed documents, a fluent filter and update builder,
+lazy cursors, sessions and transactions, and a typed ORM that reads and writes your `@serializable`
+structs directly. `MongoConnection` still implements the `Connection` trait, so it can sit behind the
+same pool, but the document methods are what you use day to day.
+
+The package is laid out by responsibility, matching the Go driver's names: `wiremessage` (OP_MSG
+framing), `operation` (command builders), `dns` (the `mongodb+srv://` resolver), plus `document` (the
+typed model) and `mongodb` (the client seam you import).
+
+### Connecting
+
+`mongodb.open` returns a live `MongoConnection`. The DSN is a standard MongoDB URI:
+
+```nova
+import mongodb;
+
+// A single server.
+let conn = await mongodb.open("mongodb://user:pass@127.0.0.1:27017/shop");
+
+// A replica set from a seed list. Unreachable seeds are skipped; the driver discovers the primary.
+let rs = await mongodb.open("mongodb://h1:27017,h2:27017,h3:27017/shop?replicaSet=rs0");
+
+// mongodb+srv:// resolves the seed list and options from DNS (SRV + TXT), and defaults to TLS.
+let atlas = await mongodb.open("mongodb+srv://user:pass@cluster0.example.mongodb.net/shop");
+```
+
+The query options are `replicaSet`, `readPreference` (`primary` / `primaryPreferred` / `secondary` /
+`secondaryPreferred` / `nearest`), `retryWrites` (`false` to disable), `tls` (`true` / `verify`) and
+`tlsCAFile`. Authentication is SCRAM-SHA-256. A connection that could not reach a usable node comes back
+marked failed, so the first operation on it surfaces the reason rather than crashing.
+
+`conn.database(name).collection(name)` gives you a `Collection`, the handle for everything below.
+
+### Documents: build and read
+
+A `Doc` wraps a BSON document. You build one with fluent, typed setters, and read fields back with typed
+getters that return `T | undefined`, so a missing or wrong-typed field is never a silent zero:
+
+```nova
+let d = mongodb.doc()
+    .setStr("name", "Margherita")
+    .setInt("price", 9)
+    .setBool("vegetarian", true);
+
+let name = d.getStr("name");     // string | undefined
+let price = d.getInt("price");   // long | undefined
+```
+
+The getters cover `getStr` / `getInt` / `getDouble` / `getBool` / `getDecimal` / `getObjectId` /
+`getDate` / `getDoc` (a nested sub-document) / `getArray` (a list of typed `Value`s). `has(key)` tests
+presence.
+
+### Querying
+
+Build a filter with the fluent `Filter`, and options (projection, sort, skip, limit) with `FindOptions`:
+
+```nova
+let f = mongodb.filter()
+    .eqStr("category", "pizza")
+    .gtInt("price", 5);
+
+let opts = mongodb.findOptions()
+    .sortAsc("price")
+    .include("name").include("price")   // projection
+    .withLimit(20);
+
+// find returns a LAZY cursor: it fetches batches with getMore until the server cursor is exhausted.
+let cur = await coll.find(f, opts);
+while (let doc = await cur.next()) {    // undefined ends the loop
+    let n = doc.getStr("name");
+    // ...
+}
+let _ = await cur.close();              // releases the server cursor if not fully drained
+
+// Convenience: one document, or the whole result as a list.
+let one = await coll.findOne(mongodb.filter().eqStr("name", "Margherita"));   // Doc | undefined
+let all = await (await coll.find(mongodb.all(), mongodb.findOptions())).toList();
+```
+
+`Filter` also has `eqInt` / `eqBool` / `eqObjectId`, the range operators `gtInt` / `gteInt` / `ltInt` /
+`lteInt` / `neInt`, `inStr` (an `$in` list), `regexStr`, and `raw(doc)` as an escape hatch for any
+operator not wrapped yet. `mongodb.all()` is the empty filter that matches everything.
+
+### Writing
+
+Every write returns a small result carrying `.ok()` and a normalised `.err` (a `DbError` you can classify
+with `isUniqueViolation()` and friends):
+
+```nova
+let ins = await coll.insertOne(mongodb.doc().setStr("name", "Calzone").setInt("price", 11));
+// insertOne generates an ObjectId _id when the document has none, returned in ins.insertedIds.
+
+let upd = await coll.updateOne(
+    mongodb.filter().eqStr("name", "Calzone"),
+    mongodb.update().setInt("price", 12).incInt("stock", -1),   // { $set: {price}, $inc: {stock} }
+    false);                                                       // upsert?
+
+let del = await coll.deleteOne(mongodb.filter().eqStr("name", "Calzone"));
+
+// Atomic read-modify-write, returning the pre- or post-image.
+let doc = await coll.findOneAndUpdate(f, mongodb.update().incInt("views", 1), true, false);
+```
+
+The write methods are `insertOne` / `insertMany`, `updateOne` / `updateMany` / `replaceOne`,
+`deleteOne` / `deleteMany`, and `findOneAndUpdate`. The `Update` builder emits `$set` (`setStr` / `setInt`
+/ `setDouble` / `setBool`), `$inc` (`incInt`), and `$unset` (`unset`).
+
+Single-document writes are **retryable**: on a transient failure the driver retries once, idempotently.
+Multi-document writes stream their documents in an OP_MSG document sequence (the wire-efficient bulk
+form) rather than nesting a large array in the command.
+
+### Typed structs: the ORM both ways
+
+Hand-building a `Doc` per field is tedious. Mark a struct `@serializable` and let the driver serialise it:
+
+```nova
+@serializable pub struct Product {
+    pub name: string,
+    pub price: int,
+    pub inStock: bool,
+    init() { self.name = ""; self.price = 0; self.inStock = false; }   // @serializable needs a no-arg init
+}
+
+let p = Product();
+p.name = "Margherita"; p.price = 9; p.inStock = true;
+
+await coll.insertOne(mongodb.docOf<Product>(p));   // docOf serialises the struct to a Doc
+
+// Read documents straight back into typed structs.
+let products = mongodb.bindAll<Product>(await coll.find(mongodb.all(), mongodb.findOptions()).toList());
+let first    = mongodb.bindOne<Product>(await coll.findOne(mongodb.all()));   // narrow the Doc|undefined first
+```
+
+`docOf`, `bindAll`, and `bindOne` are **synchronous** on purpose: the compiler resolves the concrete type
+only outside an `async` frame, so you fetch first (the `await`) and then convert. It is the same fetch
+then bind split the SQL micro-ORM uses.
+
+### Typed values and decimals
+
+`distinct` returns strings; `distinctValues` returns a typed `Value` for each element, so numbers stay
+numbers:
+
+```nova
+let prices = await coll.distinctValues("price", mongodb.all());
+let i = 0;
+while (i < prices.size()) {
+    let v = prices.get(i);
+    if (v != undefined) {
+        let n = v.asInt();       // long | undefined; a cross-type accessor returns undefined
+    }
+    i = i + 1;
+}
+```
+
+`Value` has `asStr` / `asInt` / `asDouble` / `asDecimal` / `asBool` / `asObjectId` / `asDate` / `asDoc` /
+`asArray`, plus `toStr()` and `typeTag()`. BSON `decimal128` round-trips exactly through `getDecimal` and
+`asDecimal`.
+
+### Aggregation, counting, and indexes
+
+```nova
+let cur = await coll.aggregate(pipeline);              // a List<Doc> of stages, returns a lazy cursor
+let n   = await coll.countDocuments(mongodb.all());    // exact count
+let est = await coll.estimatedDocumentCount();         // fast metadata count
+let cats = await coll.distinct("category", mongodb.all());
+
+await coll.createIndex(mongodb.doc().setInt("name", 1), "name_idx", true);   // keys, name, unique?
+await coll.dropIndex("name_idx");
+```
+
+### Sessions and transactions
+
+Multi-document transactions need a replica set. Open a session, bind a collection to it, and commit or
+abort:
+
+```nova
+let s = await conn.startSession();
+s.startTransaction();
+let acct = s.collection("bank", "accounts");        // this collection's writes join the transaction
+let _ = await acct.updateOne(fromFilter, mongodb.update().incInt("balance", -100), false);
+let _ = await acct.updateOne(toFilter,   mongodb.update().incInt("balance",  100), false);
+let err = await s.commitTransaction();              // or s.abortTransaction() to roll back
+if (!err.isEmpty()) { /* both updates rolled back atomically */ }
+```
+
+### bulkWrite
+
+Queue a mix of operations and send them in grouped batches:
+
+```nova
+let res = await coll.bulk()
+    .insertOne(mongodb.doc().setStr("name", "A"))
+    .updateOne(mongodb.filter().eqStr("name", "B"), mongodb.update().setInt("price", 5), true)
+    .deleteOne(mongodb.filter().eqStr("name", "C"))
+    .execute(true);                                 // ordered?
+// res carries insertedCount / matchedCount / modifiedCount / deletedCount / upsertedCount.
+```
+
+### Replica sets and high availability
+
+Give the driver a replica-set seed list (or a `mongodb+srv://` URI) and it discovers the topology,
+connects to the primary, and heals on a failover **three ways**:
+
+- **Reactively**: a write that hits a stepped-down primary re-discovers the new primary and retries once,
+  transparently. You write no failover code.
+- **Proactively**: `conn.startMonitor(intervalMs)` spawns a background heartbeat that keeps the topology
+  fresh and reconnects on a change on its own; `conn.stopMonitor()` ends it.
+- **On demand**: `conn.heartbeat()` runs one check and reconnects if the primary has moved.
+
+`conn.serverType`, `conn.serverHost`, and `conn.members` expose what the driver resolved. Read
+preference (`readPreference=secondary`, etc.) selects which member reads go to.
 
 ## Where to go next
 

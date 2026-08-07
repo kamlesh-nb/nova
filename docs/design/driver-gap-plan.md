@@ -145,22 +145,33 @@ Severity H/M/L, effort S/M/L. Cross-cutting items above are not repeated here.
 | TVP (table-valued params) and BCP bulk insert absent | M | L |
 | No isolation-level API; no MARS; no connection resiliency | L-M | S-L |
 
-### MongoDB (vs mongo-go-driver) — largely architectural
-| Gap | Sev | Eff |
+### MongoDB (vs mongo-go-driver): native document API now SHIPPED
+
+**Status (updated).** The mongodb driver is no longer a wire proof-of-concept: it has a native document
+API (`Collection` / `Doc` / `Filter` / `Update` / lazy `Cursor`), the full read + write surface, sessions
+and multi-document transactions, replica-set topology with failover, and a typed ORM both ways. Almost
+every row below is now DONE and verified live against a real `mongod`; the remaining open items are the
+alternative auth mechanisms and the long-tail features (change streams, GridFS).
+
+| Gap | Sev | Status |
 |---|---|---|
-| The SQL seam blocks the document model: no filter/projection/sort/limit, writes have nowhere to go | H | (arch) |
-| No update/delete/replace/findAndModify/aggregate/count/distinct/bulkWrite builders | H | M-L |
-| No `mongodb+srv://` and no multi-host: cannot use standard Atlas / replica-set URIs | H | M-L |
-| No topology / SDAM / replica-set discovery / failover / read preference | H | L |
-| ObjectId is decode-only and has no serialise case: cannot query or round-trip by `_id` | H | M |
-| No client sessions (lsid) → no retryable writes; retryable reads/writes absent | M-H | M |
-| killCursors missing (server-side cursor leak once getMore lands) | M | S |
-| SCRAM-SHA-1 absent; authSource not honoured (defaults wrong); no x509/AWS/LDAP/GSSAPI/OIDC | M | S-L |
-| BSON gaps: dates/timestamps decode-only + indistinguishable, binary subtypes discarded, regex/code/minkey unhandled | M-H | M |
-| OP_MSG document sequences (kind 1), flag bits, OP_COMPRESSED absent | L-M | M-L |
-| No connection pool (single socket, busy-bool rejects concurrency) | M-H | M |
-| No max-message-size guard; short-read returns truncated buffer without error; auth failure swallowed | M | S |
-| Change streams, GridFS, index management absent | L-M | L |
+| The SQL seam blocks the document model: no filter/projection/sort/limit, writes have nowhere to go | H | DONE: native `Collection`/`Doc`/`Filter`/`FindOptions` + lazy `Cursor` (getMore/killCursors) |
+| No update/delete/replace/findAndModify/aggregate/count/distinct/bulkWrite builders | H | DONE: all present, incl. `bulkWrite` |
+| No `mongodb+srv://` and no multi-host: cannot use standard Atlas / replica-set URIs | H | DONE: seed lists + a `mongodb+srv://` DNS SRV/TXT resolver |
+| No topology / SDAM / replica-set discovery / failover / read preference | H | DONE: SDAM discovery, read preference, and failover three ways (background heartbeat monitor, reactive auto-failover on a not-primary error, on-demand `heartbeat`/`reconnect`) |
+| ObjectId is decode-only and has no serialise case: cannot query or round-trip by `_id` | H | DONE: build + query + round-trip by `_id` |
+| No client sessions (lsid), so no retryable writes; retryable reads/writes absent | M-H | DONE: client sessions, multi-document transactions, and retry-once retryable writes |
+| killCursors missing (server-side cursor leak once getMore lands) | M | DONE |
+| SCRAM-SHA-1 absent; authSource not honoured (defaults wrong); no x509/AWS/LDAP/GSSAPI/OIDC | M | OPEN: SCRAM-SHA-256 only; alt-auth mechanisms not built |
+| BSON gaps: dates/timestamps decode-only + indistinguishable, binary subtypes discarded, regex/code/minkey unhandled | M-H | MOSTLY DONE: typed date/timestamp/int64/double/decimal128 build+read; binary subtype preservation still open |
+| OP_MSG document sequences (kind 1), flag bits, OP_COMPRESSED absent | L-M | kind-1 DONE (all writes stream a document sequence); OP_COMPRESSED still open |
+| No connection pool (single socket, busy-bool rejects concurrency) | M-H | DONE: `data.sql.Pool(MongoDriver(), dsn, n)` is Mongo-aware for free |
+| No max-message-size guard; short-read returns truncated buffer without error; auth failure swallowed | M | DONE: 64 MiB frame bound, short-read returns "", auth failure marks the connection dead |
+| Change streams, GridFS, index management absent | L-M | index management DONE (`createIndex`/`dropIndex`); change streams + GridFS still open |
+
+Beyond this table, the driver also gained a typed ORM surface not originally scoped: `docOf<T>` (serialise
+a `@serializable` struct to a document) and `bindAll<T>`/`bindOne<T>` (read documents back into structs),
+plus a typed `Value` union for `distinct`/array reads.
 
 ## Phased roadmap
 
