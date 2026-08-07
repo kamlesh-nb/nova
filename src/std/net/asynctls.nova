@@ -112,6 +112,65 @@ pub async fn tlsConnect(host: string, port: int, verify: bool): TlsStream {
     return ts;
 }
 
+// Run the TLS handshake with each socket read bounded by `timeoutMs` (a per-recv deadline via
+// recvIntoDeadline), so a server that accepts the TCP connection and then stalls the handshake cannot
+// hang the coroutine. The deadline is cleared afterwards so normal application reads are unbounded.
+// timeoutMs <= 0 leaves the handshake unbounded (the old behaviour).
+async fn handshakeBounded(ts: TlsStream, timeoutMs: int): int {
+    if (timeoutMs > 0) { let _ = ts.setTimeout(timeoutMs); }
+    let hs = await ts.handshake();
+    if (timeoutMs > 0) { let _2 = ts.setTimeout(0); }
+    return hs;
+}
+
+// Deadline-bounded variants of the TLS connect helpers: the TCP connect is bounded by
+// asyncConnectDeadline and the handshake by handshakeBounded, so neither phase can hang on a
+// dead/firewalled/stalling host. On failure the returned stream's ok() is false.
+pub async fn tlsConnectDeadline(host: string, port: int, verify: bool, timeoutMs: int): TlsStream {
+    let base = await aio.asyncConnectDeadline(host, port, timeoutMs);
+    let bio: tlsmembio.TlsBio = tlsmembio.newClientBio(host);
+    let ts = TlsStream(base, bio);
+    if (!base.ok()) { return ts; }
+    let _ = await handshakeBounded(ts, timeoutMs);
+    return ts;
+}
+pub async fn tlsConnectVerifyDeadline(host: string, port: int, caPem: string, timeoutMs: int): TlsStream {
+    let base = await aio.asyncConnectDeadline(host, port, timeoutMs);
+    let store = truststore.loadPemBundle(caPem);
+    let bio: tlsmembio.TlsBio = tlsmembio.newClientBioVerify(host, store);
+    let ts = TlsStream(base, bio);
+    if (!base.ok()) { return ts; }
+    let _ = await handshakeBounded(ts, timeoutMs);
+    return ts;
+}
+pub async fn tlsConnectClientCertDeadline(host: string, port: int, caPem: string, certPem: string, keyPem: string, timeoutMs: int): TlsStream {
+    let base = await aio.asyncConnectDeadline(host, port, timeoutMs);
+    let bio: tlsmembio.TlsBio = tls12bio.newClient12BioClientCert(host, certPem, keyPem);
+    if (caPem.length > 0) {
+        bio = tls12bio.newClient12BioClientCertVerify(host, truststore.loadPemBundle(caPem), certPem, keyPem);
+    }
+    let ts = TlsStream(base, bio);
+    if (!base.ok()) { return ts; }
+    let _ = await handshakeBounded(ts, timeoutMs);
+    return ts;
+}
+// STARTTLS upgrade of an already-connected socket, with the handshake bounded by `timeoutMs`. Used by
+// the SQL drivers whose TCP connect was already bounded (asyncConnectDeadline) but whose post-
+// SSLRequest handshake was not.
+pub async fn tlsClientUpgradeDeadline(base: aio.AsyncStream, host: string, timeoutMs: int): TlsStream {
+    let bio: tlsmembio.TlsBio = tlsmembio.newClientBio(host);
+    let ts = TlsStream(base, bio);
+    let _ = await handshakeBounded(ts, timeoutMs);
+    return ts;
+}
+pub async fn tlsClientUpgradeVerifyDeadline(base: aio.AsyncStream, host: string, caPem: string, timeoutMs: int): TlsStream {
+    let store = truststore.loadPemBundle(caPem);
+    let bio: tlsmembio.TlsBio = tlsmembio.newClientBioVerify(host, store);
+    let ts = TlsStream(base, bio);
+    let _ = await handshakeBounded(ts, timeoutMs);
+    return ts;
+}
+
 // Connect and offer ALPN (comma-separated protocol list, e.g. "h2,http/1.1"); selectedAlpn() reports the
 // server's choice after the handshake.
 pub async fn tlsConnectAlpn(host: string, port: int, alpn: string): TlsStream {
