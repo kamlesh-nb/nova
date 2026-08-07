@@ -30,10 +30,10 @@ NovaDB      import novadb;    NovaDriver().connect("novadb://user:pass@127.0.0.1
 PostgreSQL  import postgres;  PgDriver().connect("postgresql://user:pass@127.0.0.1:5432/shop")
 MySQL       import mysql;     MyDriver().connect("mysql://user:pass@127.0.0.1:3306/shop")
 SQL Server  import mssql;     MssqlDriver().connect("mssql://user:pass@127.0.0.1:1433/shop")
-MongoDB     import mongodb;   document API over the same layout
+MongoDB     import mongodb;   mongodb.open("mongodb://user:pass@127.0.0.1:27017/shop")
 ```
 
-**Say:** Same seam, so the query code you write is identical whichever one of these you use. A driver package is organised by responsibility, not by prefixed file names: a `connection` module that parses the connection string, a `codec` for the wire protocol, `proto` for framing, `typemap`, `auth`. The one file you touch is the seam module named after the database.
+**Say:** For the four SQL databases it is the same seam, so the query code you write is identical whichever one you use. MongoDB is the exception: it is not relational, so instead of `query` and `exec` the `mongodb` package gives you a native document API, typed documents, a filter and update builder, lazy cursors, sessions and transactions, and a typed ORM that reads and writes your `@serializable` structs. Chapter 18 in the written guide has the full walkthrough. A driver package is organised by responsibility, not by prefixed file names: a `connection` module that parses the connection string, a `codec` for the wire protocol, `proto` for framing, `typemap`, `auth`. The one file you touch is the seam module named after the database.
 
 ## Segment: Connection strings (2:30)
 
