@@ -42,9 +42,21 @@ pub struct DbValue {
 
     pub fn isNull(self: DbValue): bool { return self.kind == DbType.Null; }
     pub fn asBool(self: DbValue): bool { return self.i != 0; }
-    pub fn asInt(self: DbValue): int { return self.i as int; }
-    pub fn asLong(self: DbValue): long { return self.i; }
-    pub fn asDouble(self: DbValue): double { return self.f; }
+    // For a DECIMAL/NUMERIC value the numeric is carried exactly in `dec` (and its text in `s`), not in
+    // the integer/float slots, so asInt/asLong/asDouble derive from the text instead of returning 0.
+    // asInt/asLong truncate toward zero (the integer part); asDouble parses the full value.
+    pub fn asInt(self: DbValue): int {
+        if (self.kind == DbType.Decimal) { return decimalIntPart(self.s) as int; }
+        return self.i as int;
+    }
+    pub fn asLong(self: DbValue): long {
+        if (self.kind == DbType.Decimal) { return decimalIntPart(self.s); }
+        return self.i;
+    }
+    pub fn asDouble(self: DbValue): double {
+        if (self.kind == DbType.Decimal) { return string.parseFloat(self.s); }
+        return self.f;
+    }
     pub fn asDecimal(self: DbValue): decimal { return self.dec; }
     pub fn asText(self: DbValue): string { return self.s; }
     // Temporal values are carried as their normalized ISO-8601 text (in `s`) under DbType.Timestamp,
@@ -57,11 +69,20 @@ pub struct DbValue {
 
     // NULL-aware accessors: return the supplied default when the value is SQL NULL, instead of the
     // silent 0/"" the plain accessors give (which cannot distinguish NULL from a real 0 / empty string).
-    pub fn asIntOr(self: DbValue, dflt: int): int { if (self.isNull()) { return dflt; } return self.i as int; }
-    pub fn asLongOr(self: DbValue, dflt: long): long { if (self.isNull()) { return dflt; } return self.i; }
-    pub fn asDoubleOr(self: DbValue, dflt: double): double { if (self.isNull()) { return dflt; } return self.f; }
+    pub fn asIntOr(self: DbValue, dflt: int): int { if (self.isNull()) { return dflt; } return self.asInt(); }
+    pub fn asLongOr(self: DbValue, dflt: long): long { if (self.isNull()) { return dflt; } return self.asLong(); }
+    pub fn asDoubleOr(self: DbValue, dflt: double): double { if (self.isNull()) { return dflt; } return self.asDouble(); }
     pub fn asTextOr(self: DbValue, dflt: string): string { if (self.isNull()) { return dflt; } return self.s; }
     pub fn asBoolOr(self: DbValue, dflt: bool): bool { if (self.isNull()) { return dflt; } return self.i != 0; }
+}
+
+// The integer part of a decimal's canonical text, truncated toward zero: "123.45" -> 123, "-7.9" -> -7,
+// "500500" -> 500500, "" / "-" / ".5" -> 0. Used by DbValue.asInt/asLong for a DECIMAL value.
+fn decimalIntPart(s: string): long {
+    let dot = string.indexOf(s, ".");
+    let intPart = if (dot >= 0) string.slice(s, 0, dot) else s;
+    if (string.eql(intPart, "") || string.eql(intPart, "-") || string.eql(intPart, "+")) { return 0; }
+    return string.parseI64(intPart);
 }
 
 pub fn dbNull(): DbValue { return DbValue(DbType.Null, 0, 0.0, 0m, ""); }
