@@ -232,8 +232,20 @@ let atlas = await mongodb.open("mongodb+srv://user:pass@cluster0.example.mongodb
 
 The query options are `replicaSet`, `readPreference` (`primary` / `primaryPreferred` / `secondary` /
 `secondaryPreferred` / `nearest`), `retryWrites` (`false` to disable), `tls` (`true` / `verify`) and
-`tlsCAFile`. Authentication is SCRAM-SHA-256. A connection that could not reach a usable node comes back
-marked failed, so the first operation on it surfaces the reason rather than crashing.
+`tlsCAFile`. A connection that could not reach a usable node comes back marked failed, so the first
+operation on it surfaces the reason rather than crashing.
+
+Authentication is SCRAM-SHA-256 by default (username and password in the URI). The driver also supports
+**X.509 client-certificate auth**, where the certificate presented during the TLS handshake is the
+credential:
+
+```nova
+// The client certificate is the identity: no password. tlsCertificateKeyFile is the combined cert+key
+// PEM. Add tls=verify + tlsCAFile to also verify the server's chain (fully mutual, verified TLS).
+let conn = await mongodb.open(
+    "mongodb://cluster.example:27017/shop?tls=verify&tlsCAFile=/etc/ca.pem"
+    + "&authMechanism=MONGODB-X509&tlsCertificateKeyFile=/etc/client.pem");
+```
 
 `conn.database(name).collection(name)` gives you a `Collection`, the handle for everything below.
 
