@@ -10,6 +10,40 @@ Scope: `packages/nova-{postgres,mysql,mssql,mongodb}/src/`, the shared seam
 
 ## Status (reconciled 2026-08-07)
 
+**Production-ready from a drivers perspective.** Every correctness and robustness defect that could
+corrupt data, leak resources, or desync a connection is fixed and verified live against a real server.
+What remains is enterprise-auth that needs external infrastructure to build and test, plus a few bulk
+and niche-type conveniences. None of it blocks a normal deployment.
+
+### Production-readiness pass (2026-08-07)
+
+The final round closed the Phase-4 items that actually affect a running app:
+
+- **MySQL** (`nova-mysql` origin `7262a05`): the server-side prepared-statement cache is now bounded and
+  flushed with COM_STMT_CLOSE (was a slow server-memory leak on long-lived pooled connections); an
+  unsolicited LOAD DATA LOCAL INFILE (`0xfb`) response is refused and the protocol resynchronised
+  instead of desyncing; YEAR decodes as an integer, DATE/NEWDATE as temporal, BIT/GEOMETRY as binary.
+- **MSSQL** (`nova-mssql` origin `2ca7a43`): VARCHAR/CHAR are decoded from Windows-1252 to UTF-8 (raw
+  single-byte passthrough silently corrupted any non-ASCII character); the DONE rowcount now honours the
+  DONE_COUNT bit and sums across a multi-statement batch instead of keeping only the last count.
+- **PostgreSQL** (`nova-postgres` origin `bd813b5`): the DSN percent-decodes credentials and the database
+  name and parses IPv6 bracket hosts (`[::1]:5432`); isolation levels, read-only transactions and
+  savepoints are first-class (`beginIsolation`/`beginReadOnly`/`savepoint`/`rollbackTo`/`releaseSavepoint`).
+- **BSON / MongoDB** (nova lang `d7b5af4`, `src/std/serde/bson.nova`): the scanner decodes every remaining
+  element type (regex, code, symbol, code_w_scope, dbpointer, undefined, min/max key); previously it
+  bailed at the first such element and silently dropped it and every field after it.
+- **Compiler enablers** (nova lang `57a026c`, `c41ee53`): importing two driver packages in one program
+  now compiles (was a module-scoping name clash), and the checker no longer validates a colliding struct
+  name against the wrong module's decl (`data.db.Cursor` vs a driver's own `Cursor`).
+
+**Explicitly deferred, infra-gated (a supported pathway, but needs external infrastructure to build and
+verify, so not part of this pass and not blocking a normal deployment):** Kerberos / GSSAPI / SSPI and
+integrated Windows auth; Azure AD / federated auth (mssql); AWS / LDAP / OIDC (mongodb); MariaDB ed25519
+and PAM/LDAP cleartext (mysql). **Also deferred (feature-completeness, not correctness):** a shared
+connect/handshake-deadline primitive across the three SQL drivers; bulk paths (postgres COPY IN, mssql
+TVP/BCP); mysql protocol compression; mssql RETURNSTATUS surfacing + ENVCHANGE routing; mongodb
+OP_COMPRESSED; postgres binary wire formats and multi-host failover.
+
 The rest of this document is the original 2026-08-06 gap analysis, kept as the reference list. Most of it
 has since been implemented and pushed. Current state per driver:
 
@@ -100,8 +134,8 @@ These are not feature gaps, they are latent defects that corrupt data or the con
 
 ## Cross-cutting workstreams
 
-> RECONCILED 2026-08-07: **X1, X2 and X3 are DONE** for postgres/mysql/mssql (the commits in the Status
-> section). **X4 and X5 remain** and are the next work.
+> RECONCILED 2026-08-07: **X1, X2, X3, X4 and X5 are all DONE** for postgres/mysql/mssql (the commits in
+> the Status section). The four cross-cutting weaknesses are closed.
 
 ### X1. Route the default query/exec path through server-bound parameters
 `query`/`exec` on postgres, mysql and mssql all inline-substitute values into SQL text. Each driver
@@ -234,16 +268,20 @@ typed binary prepared params + multi-resultset; mssql ENVCHANGE + multiple resul
 read/write + filter builder + ObjectId + getMore + killCursors. (Alt-auth mechanisms that need external
 infra, e.g. mysql ed25519, mssql integrated auth, mongodb AWS/LDAP/OIDC, roll into Phase 4.)
 
-**Phase 3 - streaming and architecture. X4 DONE; X5 open.** The mongodb native document API + lazy cursors
+**Phase 3 - streaming and architecture. DONE (X4 + X5).** The mongodb native document API + lazy cursors
 + SRV/topology + sessions/transactions is DONE. **X4 streaming ResultSet is DONE**: the async `Cursor` /
 `RowBatchSource` seam in `db.nova`, with native streaming on postgres (portals + Flush), mysql (server-side
 cursor + COM_STMT_FETCH) and mssql (incremental TDS token decode), all verified live; mongodb already had a
 lazy cursor. **X5 pool hard-cap + bad-connection eviction is DONE** (aio.delay-backoff wait queue, slot reserved
 before connect, Pool.evict). Phase 3 complete; only the Phase 4 long-tail remains per driver.
 
-**Phase 4 - long tail (open).**
-postgres binary formats + COPY IN + multi-host; mysql compression + LOAD DATA + ed25519; mssql TDS 8.0
-strict + TVP/BCP + Azure AD; mongodb OP_COMPRESSED + AWS/LDAP/OIDC auth + niche BSON types. (mongodb change
+**Phase 4 - long tail. Production-critical items DONE (2026-08-07 pass); the rest is infra-gated or bulk.**
+Shipped this pass: mysql prepared-statement-cache bound + LOAD DATA guard + typed YEAR/DATE/BIT; mssql
+VARCHAR CP1252 decode + DONE_COUNT rowcount; postgres DSN percent-decode + IPv6 + isolation/savepoints;
+BSON niche types (regex/code/minkey/maxkey/...). See the Status section for commits.
+Still open (not blocking a normal deployment): postgres binary formats + COPY IN + multi-host; mysql
+compression + ed25519 + PAM/LDAP; mssql TDS 8.0 strict + TVP/BCP + Azure AD + RETURNSTATUS/ENVCHANGE;
+mongodb OP_COMPRESSED + AWS/LDAP/OIDC auth; a shared connect/handshake-deadline primitive. (mongodb change
 streams, GridFS and indexes, originally listed here, are DONE.)
 
 ## Seam and runtime dependencies (not per-driver)
