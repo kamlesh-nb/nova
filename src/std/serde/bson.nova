@@ -601,6 +601,14 @@ pub fn docGetBool(doc: BsonDocument, index: int): int {
     return entry.int_val;
 }
 
+// decimal128 (type 19): deserialize already decoded the 16-byte value into dec_val, so just return it.
+pub fn docGetDecimal(doc: BsonDocument, index: int): decimal {
+    if (index < 0 || index >= doc.entries.size()) return 0m;
+    let entry = doc.entries.at(index);
+    if (entry.type_id != 19) return 0m;
+    return entry.dec_val;
+}
+
 pub fn docIsNull(doc: BsonDocument, index: int): int {
     if (index < 0 || index >= doc.entries.size()) return 0;
     return (doc.entries.at(index).type_id == 10) ? 1 : 0;
