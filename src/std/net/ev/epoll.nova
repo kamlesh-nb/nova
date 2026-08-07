@@ -6,11 +6,13 @@
 //
 // epoll is readiness (like kqueue), so this backend EMULATES completion: submit() arms interest and
 // poll() performs the recv/send/accept into the op buffer when the fd is ready, reporting the byte count.
-// A future io_uring backend would be genuinely completion-based (submit SQEs, reap CQEs) behind the same
-// trait. NOTE (runtime-verification pending on Linux): the read-deadline timer (nova_reactor_set_timer)
-// and the cross-reactor wake are kqueue-wired in the C runtime today; their epoll (timerfd/eventfd)
-// integration is a follow-on, so recvIntoDeadline and cross-reactor channels are not yet functional on
-// Linux even though the async I/O path here is. This file is compile-verified via cross-compilation.
+// The io_uring backend is genuinely completion-based (submit SQEs, reap CQEs) behind the same trait.
+// RUNTIME-VERIFIED on Linux (2026-08-07): the deadline-timer path (nova_reactor_set_timer + opDone +
+// abandonOp) that the connect/TLS/recv deadlines depend on fires correctly on BOTH Linux backends. The C
+// runtime wires it via a per-deadline timerfd (epoll) / IORING_OP_TIMEOUT (io_uring) and an eventfd for
+// the cross-reactor wake. A cross-compiled deadline test (a socketpair recvIntoDeadline) run in a Debian
+// container returned -2 on timeout and the byte count on completion on both epoll and io_uring, matching
+// kqueue. (The earlier "not yet functional on Linux" note was stale — that integration has since landed.)
 
 import bytes;
 import os.socket;

@@ -1,0 +1,61 @@
+// Runtime-parity check for the deadline-timer path (nova_reactor_set_timer + opDone + abandonOp) that
+// the connect/TLS/recv deadlines depend on. Self-contained (a socketpair, no network), so it behaves
+// identically on kqueue/epoll/io_uring/iocp. Two cases: (1) no data -> recvIntoDeadline TIMES OUT
+// (-2), proving the timer fires and abandonOp runs; (2) data sent -> recv COMPLETES (opDone=1),
+// proving a real completion is told apart from a timer fire.
+import bytes;
+import os.sys;
+import net.poller;
+import net.eventedio;
+
+async fn timedRecv(fd: int, kq: int, timeoutMs: int, result: long): void {
+    let s = eventedio.ReactorStream(fd, kq);
+    let buf = bytes.alloc(64);
+    let n = await s.recvIntoDeadline(buf, 64, timeoutMs);
+    bytes.write_i32(result, 0, (n + 1000) as long);
+    bytes.free(buf);
+    s.close();
+}
+async fn sender(fd: int, kq: int): void {
+    let s = eventedio.ReactorStream(fd, kq);
+    let msg = bytes.alloc(2);
+    bytes.write_byte(msg, 0, 104); bytes.write_byte(msg, 1, 105);
+    let _ = await s.sendBuf(msg, 2);
+    bytes.free(msg);
+}
+fn drive(r: poller.Reactor, result: long): void {
+    let guard = 0;
+    while ((bytes.read_i32(result, 0) as int) == 0 && guard < 400) {
+        let n = r.pollComplete(500);
+        poller.batchBegin();
+        let i = 0;
+        while (i < n) { nova_reactor_resume(r.completedToken(i)); i = i + 1; }
+        guard = guard + 1;
+    }
+}
+fn main(): void {
+    // Case 1: deadline fires (no data).
+    let (a1, b1) = sys.newSocketPair(sys.AF_UNIX, sys.SOCK_STREAM);
+    sys.setNonBlocking(a1); sys.setNonBlocking(b1);
+    let r1 = poller.Reactor(16, 1024, 4); poller.setCurrent(r1.kq);
+    let res1 = bytes.alloc(4); bytes.write_i32(res1, 0, 0);
+    coroStart(timedRecv(b1, r1.kq, 40, res1));
+    drive(r1, res1);
+    let v1 = bytes.read_i32(res1, 0) as int;
+    console.log("timeout case: got=" + `${v1}` + " (want 998 = -2 timed out)");
+    poller.setCurrent(0); bytes.free(res1); r1.destroy(); sys.close(a1);
+
+    // Case 2: read completes before the (generous) deadline (data sent).
+    let (a2, b2) = sys.newSocketPair(sys.AF_UNIX, sys.SOCK_STREAM);
+    sys.setNonBlocking(a2); sys.setNonBlocking(b2);
+    let r2 = poller.Reactor(16, 1024, 4); poller.setCurrent(r2.kq);
+    let res2 = bytes.alloc(4); bytes.write_i32(res2, 0, 0);
+    coroStart(sender(a2, r2.kq));
+    coroStart(timedRecv(b2, r2.kq, 5000, res2));
+    drive(r2, res2);
+    let v2 = bytes.read_i32(res2, 0) as int;
+    console.log("complete case: got=" + `${v2}` + " (want 1002 = 2 bytes read)");
+    poller.setCurrent(0); bytes.free(res2); r2.destroy(); sys.close(a2);
+
+    if (v1 == 998 && v2 == 1002) { console.log("PARITY OK"); } else { console.log("PARITY FAIL"); }
+}
