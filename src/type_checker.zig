@@ -121,6 +121,12 @@ pub const TypeChecker = struct {
     enums: std.StringHashMap(ast.EnumDecl),
     variables: std.StringHashMap(ast.TypeRef),
     structs: std.StringHashMap(ast.StructDecl),
+    // Struct names defined in MORE THAN ONE module (e.g. stdlib db.nova `Cursor` vs a driver's
+    // `Cursor`). `structs` is a flat name->decl map (last writer wins), so it cannot tell which
+    // module a bare `Cursor(...)` at a given call site means. The authoritative sema pass resolves
+    // that module-correctly; the legacy arity/narrowing checks below would validate against the
+    // WRONG decl, so they skip colliding names.
+    colliding_structs: std.StringHashMap(void),
     unions: std.StringHashMap(ast.UnionDecl),
     traits: std.StringHashMap(ast.TraitDecl),
     functions: std.StringHashMap(ast.FunctionDecl),
@@ -146,6 +152,7 @@ pub const TypeChecker = struct {
             .enums = std.StringHashMap(ast.EnumDecl).init(allocator),
             .variables = std.StringHashMap(ast.TypeRef).init(allocator),
             .structs = std.StringHashMap(ast.StructDecl).init(allocator),
+            .colliding_structs = std.StringHashMap(void).init(allocator),
             .unions = std.StringHashMap(ast.UnionDecl).init(allocator),
             .traits = std.StringHashMap(ast.TraitDecl).init(allocator),
             .functions = std.StringHashMap(ast.FunctionDecl).init(allocator),
@@ -170,6 +177,7 @@ pub const TypeChecker = struct {
         self.enums.deinit();
         self.variables.deinit();
         self.structs.deinit();
+        self.colliding_structs.deinit();
         self.unions.deinit();
         self.traits.deinit();
         self.functions.deinit();
@@ -231,7 +239,13 @@ pub const TypeChecker = struct {
                 try self.enums.put(decl.enum_decl.name, decl.enum_decl);
             }
             if (decl == .struct_decl) {
-
+                // A same-named struct from a DIFFERENT module is a collision (module scoping lets
+                // them coexist). Record it so the flat-map arity/narrowing checks below defer to sema.
+                if (self.structs.get(decl.struct_decl.name)) |existing| {
+                    if (!std.mem.eql(u8, existing.span.file, decl.struct_decl.span.file)) {
+                        try self.colliding_structs.put(decl.struct_decl.name, {});
+                    }
+                }
                 try self.structs.put(decl.struct_decl.name, decl.struct_decl);
             }
             if (decl == .union_decl) {
@@ -591,7 +605,7 @@ pub const TypeChecker = struct {
                         }
                     }
 
-                    if (self.structs.contains(name)) {
+                    if (self.structs.contains(name) and !self.colliding_structs.contains(name)) {
                         if (self.structInitParamCount(name)) |init_params| {
                             if (gc.args.len != init_params) {
                                 self.addError(gc.span, "constructor '{s}' expects {d} argument(s), got {d}", .{ name, init_params, gc.args.len });
@@ -614,7 +628,7 @@ pub const TypeChecker = struct {
                 if (c.callee.kind == .ident) {
                     const name = c.callee.kind.ident;
 
-                    if (!self.variables.contains(name) and self.structs.contains(name)) {
+                    if (!self.variables.contains(name) and self.structs.contains(name) and !self.colliding_structs.contains(name)) {
                         if (self.structInitParamCount(name)) |init_params| {
                             if (c.args.len != init_params) {
                                 self.addError(c.span, "constructor '{s}' expects {d} argument(s), got {d}", .{ name, init_params, c.args.len });
