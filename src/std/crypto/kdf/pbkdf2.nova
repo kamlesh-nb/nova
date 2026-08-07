@@ -3,6 +3,43 @@
 import bytes;
 import crypto.mac.hmac;
 
+// Derive dkLen bytes into out using PBKDF2 with HMAC-SHA1 as the PRF (RFC 6070). Legacy: SCRAM-SHA-1.
+pub fn pbkdf2Sha1(pw: ptr, pwLen: int, salt: ptr, saltLen: int, iters: int, out: ptr, dkLen: int): void {
+    let hLen = 20;
+    let block = bytes.alloc(saltLen + 4);
+    let u = bytes.alloc(hLen);
+    let t = bytes.alloc(hLen);
+    let done = 0;
+    let idx = 1;
+    while (done < dkLen) {
+        let i = 0;
+        while (i < saltLen) { bytes.write_byte(block, i, bytes.read_byte(salt, i)); i = i + 1; }
+        bytes.write_byte(block, saltLen, (idx >> 24) & 0xff);
+        bytes.write_byte(block, saltLen + 1, (idx >> 16) & 0xff);
+        bytes.write_byte(block, saltLen + 2, (idx >> 8) & 0xff);
+        bytes.write_byte(block, saltLen + 3, idx & 0xff);
+        hmac.hmacSha1(pw, pwLen, block, saltLen + 4, u);
+        let k = 0;
+        while (k < hLen) { bytes.write_byte(t, k, bytes.read_byte(u, k)); k = k + 1; }
+        let c = 1;
+        while (c < iters) {
+            hmac.hmacSha1(pw, pwLen, u, hLen, u);
+            k = 0;
+            while (k < hLen) { bytes.write_byte(t, k, bytes.read_byte(t, k) ^ bytes.read_byte(u, k)); k = k + 1; }
+            c = c + 1;
+        }
+        let take = hLen;
+        if (dkLen - done < take) { take = dkLen - done; }
+        k = 0;
+        while (k < take) { bytes.write_byte(out, done + k, bytes.read_byte(t, k)); k = k + 1; }
+        done = done + take;
+        idx = idx + 1;
+    }
+    bytes.free(block);
+    bytes.free(u);
+    bytes.free(t);
+}
+
 // Derive dkLen bytes into out using PBKDF2 with HMAC-SHA256 as the PRF.
 pub fn pbkdf2Sha256(pw: ptr, pwLen: int, salt: ptr, saltLen: int, iters: int, out: ptr, dkLen: int): void {
     let hLen = 32;

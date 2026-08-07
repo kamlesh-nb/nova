@@ -5,15 +5,55 @@
 // HMAC(K, m) = H((K' ^ opad) || H((K' ^ ipad) || m)), where K' is K hashed down to the block size if
 // it is longer, else K zero-padded to the block size. Verified against RFC 4231 (conformance case 218).
 import bytes;
+import crypto.hash.sha1;
 import crypto.hash.sha256;
 import crypto.hash.sha512;
 
 const IPAD: int = 0x36;
 const OPAD: int = 0x5c;
 
+pub const HMAC_SHA1_LEN: int = 20;
 pub const HMAC_SHA256_LEN: int = 32;
 pub const HMAC_SHA384_LEN: int = 48;
 pub const HMAC_SHA512_LEN: int = 64;
+
+// HMAC-SHA1. Writes 20 bytes to out. Legacy: needed for SCRAM-SHA-1 (MongoDB users created < 4.0) and
+// PBKDF2-HMAC-SHA1. Same composition as HMAC-SHA256, block size 64, digest 20.
+pub fn hmacSha1(key: ptr, keyLen: int, msg: ptr, msgLen: int, out: ptr): void {
+    let bs = sha1.SHA1_BLOCK_LEN;
+    let dl = sha1.SHA1_DIGEST_LEN;
+    let k0 = bytes.alloc(bs);
+    if (keyLen > bs) {
+        sha1.hashInto(key, keyLen, k0);
+    } else {
+        let i = 0;
+        while (i < keyLen) { bytes.write_byte(k0, i, bytes.read_byte(key, i)); i = i + 1; }
+    }
+    let ipad = bytes.alloc(bs);
+    let opad = bytes.alloc(bs);
+    let i = 0;
+    while (i < bs) {
+        let kb = bytes.read_byte(k0, i);
+        bytes.write_byte(ipad, i, kb ^ IPAD);
+        bytes.write_byte(opad, i, kb ^ OPAD);
+        i = i + 1;
+    }
+    let inner = sha1.Sha1.create();
+    inner.update(ipad, bs);
+    inner.update(msg, msgLen);
+    let ih = bytes.alloc(dl);
+    inner.final(ih);
+    inner.delete();
+    let outer = sha1.Sha1.create();
+    outer.update(opad, bs);
+    outer.update(ih, dl);
+    outer.final(out);
+    outer.delete();
+    bytes.free(k0);
+    bytes.free(ipad);
+    bytes.free(opad);
+    bytes.free(ih);
+}
 
 // HMAC-SHA256. Writes 32 bytes to out.
 pub fn hmacSha256(key: ptr, keyLen: int, msg: ptr, msgLen: int, out: ptr): void {

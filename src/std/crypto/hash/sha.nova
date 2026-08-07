@@ -49,6 +49,12 @@ pub fn hmacSha256Raw(key: string, msg: string): string {
     return out as string;
 }
 
+pub fn hmacSha1Raw(key: string, msg: string): string {
+    let out = bytes.alloc(20);
+    hmac.hmacSha1(key as ptr, key.length, msg as ptr, msg.length, out);
+    return out as string;
+}
+
 pub fn sha256(input: string): string { return toHex(sha256Raw(input)); }
 pub fn sha512(input: string): string { return toHex(sha512Raw(input)); }
 pub fn sha1(input: string): string { return toHex(sha1Raw(input)); }
@@ -57,6 +63,12 @@ pub fn hmacSha256(key: string, msg: string): string { return toHex(hmacSha256Raw
 pub fn pbkdf2HmacSha256(password: string, salt: string, iterations: int, dkLen: int): string {
     let out = bytes.alloc(dkLen);
     pbkdf2.pbkdf2Sha256(password as ptr, password.length, salt as ptr, salt.length, iterations, out, dkLen);
+    return out as string;
+}
+
+pub fn pbkdf2HmacSha1(password: string, salt: string, iterations: int, dkLen: int): string {
+    let out = bytes.alloc(dkLen);
+    pbkdf2.pbkdf2Sha1(password as ptr, password.length, salt as ptr, salt.length, iterations, out, dkLen);
     return out as string;
 }
 
@@ -72,6 +84,20 @@ fn test_sha_kats(): void {
 fn test_hmac_kat(): void {
     assert.equalStr(hmacSha256("Jefe", "what do ya want for nothing?"),
                     "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    // RFC 2202 HMAC-SHA1 test case 2.
+    assert.equalStr(toHex(hmacSha1Raw("Jefe", "what do ya want for nothing?")),
+                    "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79");
+}
+
+@test
+fn test_pbkdf2_sha1_kats(): void {
+    // RFC 6070 PBKDF2-HMAC-SHA1 vectors.
+    assert.equalStr(toHex(pbkdf2HmacSha1("password", "salt", 1, 20)),
+                    "0c60c80f961f0e71f3a9b524af6012062fe037a6");
+    assert.equalStr(toHex(pbkdf2HmacSha1("password", "salt", 2, 20)),
+                    "ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957");
+    assert.equalStr(toHex(pbkdf2HmacSha1("password", "salt", 4096, 20)),
+                    "4b007901b765489abead49d926f721d065a429c1");
 }
 
 @test

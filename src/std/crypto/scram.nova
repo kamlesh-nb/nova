@@ -59,6 +59,26 @@ pub fn computeServerSigB64(password: string, salt: string, iterations: int, auth
     return base64.encode(ss);
 }
 
+// --- SCRAM-SHA-1 variant (RFC 5802) -----------------------------------------------------------------
+// Same construction with SHA-1 as H everywhere (20-byte keys, PBKDF2-HMAC-SHA1). Legacy: MongoDB users
+// created before 4.0, or servers configured for SCRAM-SHA-1 only. Kept as a separate path so the
+// SHA-256 default is untouched (and the ScramClient struct stays 3-field for existing callers).
+pub fn saltedPasswordSha1(password: string, salt: string, iterations: int): string {
+    return sha.pbkdf2HmacSha1(password, salt, iterations, 20);
+}
+pub fn computeProofB64Sha1(password: string, salt: string, iterations: int, authMessage: string): string {
+    let sp = saltedPasswordSha1(password, salt, iterations);
+    let ck = sha.hmacSha1Raw(sp, "Client Key");
+    let sk = sha.sha1Raw(ck);
+    let cs = sha.hmacSha1Raw(sk, authMessage);
+    return base64.encode(clientProof(ck, cs));
+}
+pub fn computeServerSigB64Sha1(password: string, salt: string, iterations: int, authMessage: string): string {
+    let sp = saltedPasswordSha1(password, salt, iterations);
+    let servKey = sha.hmacSha1Raw(sp, "Server Key");
+    return base64.encode(sha.hmacSha1Raw(servKey, authMessage));
+}
+
 fn attrValue(part: string, key: string): string {
     if (string.startsWith(part, key)) {
         return string.slice(part, key.length, part.length);
@@ -95,6 +115,25 @@ pub struct ScramClient {
         let proof = computeProofB64(self.password, salt, iters, authMessage);
         return `${clientFinalNoProof},p=${proof}`;
     }
+
+    // The SCRAM-SHA-1 client-final message (proof computed with SHA-1). Used when the negotiated /
+    // requested mechanism is SCRAM-SHA-1 instead of the SHA-256 default.
+    pub fn clientFinalMessageSha1(self: ScramClient, serverFirst: string): string {
+        let combinedNonce = "";
+        let saltB64 = "";
+        let iters = 0;
+        let parts = string.split(serverFirst, ",");
+        for (p in parts) {
+            if (string.startsWith(p, "r=")) { combinedNonce = attrValue(p, "r="); }
+            if (string.startsWith(p, "s=")) { saltB64 = attrValue(p, "s="); }
+            if (string.startsWith(p, "i=")) { iters = string.parseI64(attrValue(p, "i=")) as int; }
+        }
+        let salt = base64.decode(saltB64);
+        let clientFinalNoProof = `c=biws,r=${combinedNonce}`;
+        let authMessage = `${self.clientFirstBare()},${serverFirst},${clientFinalNoProof}`;
+        let proof = computeProofB64Sha1(self.password, salt, iters, authMessage);
+        return `${clientFinalNoProof},p=${proof}`;
+    }
 }
 
 const RFC_AUTH: string =
@@ -107,6 +146,24 @@ fn test_scram_rfc7677_proof(): void {
                     "dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=");
     assert.equalStr(computeServerSigB64("pencil", salt, 4096, RFC_AUTH),
                     "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=");
+}
+
+@test
+fn test_scram_sha1_rfc5802(): void {
+    // RFC 5802 section 5 worked example (SCRAM-SHA-1): user "user", password "pencil".
+    let c = ScramClient{
+        username: "user",
+        password: "pencil",
+        clientNonce: "fyko+d2lbbFgONRv9qkxdawL",
+    };
+    assert.equalStr(c.clientFirstMessage(), "n,,n=user,r=fyko+d2lbbFgONRv9qkxdawL");
+    let serverFirst = "r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096";
+    assert.equalStr(c.clientFinalMessageSha1(serverFirst),
+                    "c=biws,r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,p=v0X8v3Bz2T0CJGbJQyF0X+HI4Ts=");
+    let authMessage = "n=user,r=fyko+d2lbbFgONRv9qkxdawL," + serverFirst
+        + ",c=biws,r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j";
+    let salt = base64.decode("QSXCR+Q6sek8bf92");
+    assert.equalStr(computeServerSigB64Sha1("pencil", salt, 4096, authMessage), "rmF9pqV8S7suAoZWja4dJRkFsKQ=");
 }
 
 @test
