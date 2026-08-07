@@ -15,6 +15,12 @@ pub fn newTcp(): int {
     winsock.startup();
     return winsock.socket(winsock.AF_INET, winsock.SOCK_STREAM, winsock.IPPROTO_TCP) as int;
 }
+// A UDP (SOCK_DGRAM=2, IPPROTO_UDP=17) socket -- e.g. for a one-shot DNS query. Winsock has no named
+// constant for these, so the literals are used directly (mirroring newTcp's IPPROTO_TCP).
+pub fn newUdp(): int {
+    winsock.startup();
+    return winsock.socket(winsock.AF_INET, 2, 17) as int;
+}
 // `close` is ALSO a compiler builtin name (it maps to the runtime's POSIX `nova_close`), and an
 // UNQUALIFIED `close(fd)` in this file can bind to that builtin instead of to this function --
 // which one wins depends on the rest of the import graph, so it presents as a heisenbug. On POSIX

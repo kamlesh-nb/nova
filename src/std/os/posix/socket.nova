@@ -25,6 +25,9 @@ fn soReusePort(): int { return if (platform.isLinux) 15 else 512; }
 const SO_REUSEADDR: int = 4;
 
 pub fn newTcp(): int { return sys.socket(AF_INET, SOCK_STREAM, 0); }
+// A UDP (SOCK_DGRAM) socket -- e.g. for a one-shot DNS query. `connect` it to the server, then the
+// normal send/recv (write/read) work on the connected datagram socket.
+pub fn newUdp(): int { return sys.socket(AF_INET, sys.SOCK_DGRAM, 0); }
 pub fn close(fd: int): int { return sys.close(fd); }
 pub fn bindSock(fd: int, addr: ptr, addrlen: int): int { return sys.bind(fd, addr, addrlen); }
 pub fn listenSock(fd: int, backlog: int): int { return sys.listen(fd, backlog); }
