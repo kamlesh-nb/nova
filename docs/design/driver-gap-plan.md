@@ -8,6 +8,42 @@ References: `lib/pq` (postgres), `go-sql-driver/mysql`, `microsoft/go-mssqldb`, 
 Scope: `packages/nova-{postgres,mysql,mssql,mongodb}/src/`, the shared seam
 `lang/src/std/data/db.nova` + `lang/src/std/data/sql/pool.nova`, and `lang/src/std/serde/bson.nova`.
 
+## Status (reconciled 2026-08-07)
+
+The rest of this document is the original 2026-08-06 gap analysis, kept as the reference list. Most of it
+has since been implemented and pushed. Current state per driver:
+
+- **MongoDB — feature-complete.** The whole native document API shipped and is verified live: read/write,
+  the typed `Doc`/`Filter`/`Update`/`FindOptions` model, lazy cursors, aggregate/count/distinct, index
+  management, sessions + multi-document transactions, replica-set discovery + SDAM failover
+  (proactive/reactive/on-demand), retryable writes, `bulkWrite`, `mongodb+srv://`, a typed ORM both ways
+  (`docOf`/`bindAll`), decimal128, OP_MSG kind-1 document sequences on all writes, change streams
+  (`watch`/resume/auto-recover), GridFS (pymongo-interop verified), auth SCRAM-SHA-256 + SCRAM-SHA-1 +
+  MONGODB-X509, and BSON binary-subtype preservation. Open: cloud/enterprise auth (AWS/LDAP/GSSAPI/OIDC,
+  infra-gated) and a few niche BSON types (regex/code/minkey-maxkey).
+
+- **PostgreSQL — Phase 0/1/2 done** (origin `6b3a296`): server-bound params, MD5 auth, fail-closed TLS,
+  error classification, the connection frame-leak fix, array decode, uuid/json OID mapping, LISTEN/NOTIFY,
+  COPY OUT, transactions, per-connection concurrency guard, query cancellation.
+- **MySQL — Phase 0/1/2 done** (origin `90d0350`): server-bound + typed-binary params, fail-closed TLS,
+  binary TIME / unsigned BIGINT / >64 KB packet fixes, caching_sha2_password, multi-resultset consumption,
+  >=16 MB multi-packet reassembly, transactions, correct datetime decode, query cancellation.
+- **MSSQL — Phase 0/1/2 done** (origin `d8a5079`): the temporal/XML/VARBINARY(MAX) decode desync fixes,
+  PLP terminator fix, sp_executesql server-bound params, error classification, multiple-result-set decode,
+  uuid, TDS packet chunking, sp_reset_connection on pooled reuse, query cancellation via ATTENTION.
+
+**What remains for the three SQL drivers**, cross-cutting:
+- **X4 streaming ResultSet (Phase 3)** — the seam still buffers the whole result set; no cursor/iterator in
+  `db.nova`. This is the next item and it needs a seam change (plus an async wait primitive for idle
+  delivery). It benefits all four drivers.
+- **X5 connection robustness (Phase 3)** — a hard pool cap with an async wait queue + bad-connection
+  eviction; also blocked on the async wait primitive.
+- **Phase 4 long-tail**, per driver: postgres binary formats / COPY IN / multi-host; mysql compression /
+  LOAD DATA / ed25519; mssql TVP / BCP / Azure AD / integrated auth; assorted niche column types.
+
+The per-driver tables below still list Phase-4 long-tail items accurately; their Phase-0/1/2 rows are now
+historical (done per the commits above).
+
 ## Executive summary
 
 The three SQL drivers (postgres, mysql, mssql) are competent happy-path implementations: connect,
@@ -31,6 +67,10 @@ Four cross-cutting workstreams account for the majority of the high-severity fin
    two drivers have a hard cap on a single value/packet size.
 
 ## Per-driver critical correctness bugs (break real apps, fix first)
+
+> RECONCILED 2026-08-07: every SQL-driver bug in this section is FIXED (postgres `6b3a296`, mysql
+> `90d0350`, mssql `d8a5079`), and every MongoDB bug listed here is fixed by the native document API. This
+> list is retained as the original analysis.
 
 These are not feature gaps, they are latent defects that corrupt data or the connection:
 
@@ -58,6 +98,9 @@ These are not feature gaps, they are latent defects that corrupt data or the con
   reply containing regex/code/minkey/timestamp-in-some-positions hangs the client (DoS).
 
 ## Cross-cutting workstreams
+
+> RECONCILED 2026-08-07: **X1, X2 and X3 are DONE** for postgres/mysql/mssql (the commits in the Status
+> section). **X4 and X5 remain** and are the next work.
 
 ### X1. Route the default query/exec path through server-bound parameters
 `query`/`exec` on postgres, mysql and mssql all inline-substitute values into SQL text. Each driver
@@ -176,30 +219,29 @@ plus a typed `Value` union for `distinct`/array reads.
 
 ## Phased roadmap
 
-**Phase 0 - correctness bugs (highest priority, mostly S-M).**
-mssql date/time + VARBINARY(MAX)/XML type-info cases (stop the desync); mssql return an error on login
-failure; mssql drain the attention-ack on cancel; mysql binary TIME decode; mysql grow the reader ring
-past 64 KB; mysql unsigned BIGINT; mongodb BSON unknown-type guard (stop the infinite loop); mongodb
-short-read and auth-failure error surfacing.
+**Phase 0 - correctness bugs. DONE** (postgres `6b3a296`, mysql `90d0350`, mssql `d8a5079`; mongodb via the
+document API). mssql date/time + VARBINARY(MAX)/XML type-info desync, login-failure error, attention-ack
+drain; mysql binary TIME decode, >64 KB reader ring, unsigned BIGINT; mongodb BSON unknown-type guard +
+short-read/auth-failure surfacing.
 
-**Phase 1 - the four cross-cutting workstreams.**
-X1 server-bound params (kills the injection default on all SQL drivers), X2 fail-closed TLS, X3 error
-code classification. These are the security and correctness backbone and share design across drivers.
+**Phase 1 - the cross-cutting workstreams X1/X2/X3. DONE.** X1 server-bound params (kills the injection
+default on all SQL drivers), X2 fail-closed TLS, X3 error-code classification, all shipped per the commits
+above.
 
-**Phase 2 - auth and type breadth (per driver).**
-postgres MD5 + arrays; mysql capability negotiation + cleartext/sha256 plugins + typed binary prepared
-params + COM_STMT_CLOSE; mssql ENVCHANGE (collation + txn descriptor) + multiple result sets + integrated
-auth; mongodb writes (real insert/update/delete) + a filter builder + ObjectId serialise + getMore +
-killCursors.
+**Phase 2 - auth and type breadth (per driver). DONE.** postgres MD5 + arrays; mysql caching_sha2 +
+typed binary prepared params + multi-resultset; mssql ENVCHANGE + multiple result sets; mongodb full
+read/write + filter builder + ObjectId + getMore + killCursors. (Alt-auth mechanisms that need external
+infra, e.g. mysql ed25519, mssql integrated auth, mongodb AWS/LDAP/OIDC, roll into Phase 4.)
 
-**Phase 3 - streaming and architecture (needs seam/runtime work).**
-X4 streaming ResultSet + X5 pool hard-cap/eviction (blocked on an async wait primitive); mongodb native
-document API (`Collection` with typed BSON docs and lazy cursors) + SRV/replica-set/topology + sessions
-and real transactions.
+**Phase 3 - streaming and architecture (needs seam/runtime work). IN PROGRESS (X4 next).** The mongodb
+native document API + lazy cursors + SRV/topology + sessions/transactions is DONE. Still open: **X4
+streaming ResultSet** (a cursor/iterator in `db.nova` so drivers yield rows instead of buffering) and
+**X5 pool hard-cap/eviction**, both needing an async wait primitive. X4 is the current target.
 
-**Phase 4 - long tail.**
+**Phase 4 - long tail (open).**
 postgres binary formats + COPY IN + multi-host; mysql compression + LOAD DATA + ed25519; mssql TDS 8.0
-strict + TVP/BCP + Azure AD; mongodb change streams + GridFS + indexes + compression + AWS/LDAP/OIDC auth.
+strict + TVP/BCP + Azure AD; mongodb OP_COMPRESSED + AWS/LDAP/OIDC auth + niche BSON types. (mongodb change
+streams, GridFS and indexes, originally listed here, are DONE.)
 
 ## Seam and runtime dependencies (not per-driver)
 
