@@ -123,3 +123,7 @@ pub async fn asyncConnect(host: string, port: int): AsyncStream {
 }
 
 pub fn sleep(ms: int): int { return 0; }
+
+// A real async delay: suspend the current coroutine for `ms` via a one-shot reactor timer, yielding the
+// reactor to other coroutines meanwhile. Reactor-thread only (no timer fires when block-driving).
+pub async fn delay(ms: int): void { await eventedio.delayMs(ms); }

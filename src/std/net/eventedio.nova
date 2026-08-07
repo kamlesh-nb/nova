@@ -185,6 +185,7 @@ pub struct ReactorStream {
     }
 
     // Write all `len` bytes from `buf`, awaiting writability on EAGAIN(). Returns bytes sent, or -1.
+    // (delayMs is a free function below -- kept out of the struct so it needs no stream.)
     pub async fn sendBuf(self: ReactorStream, buf: long, len: int): int {
         let sent = 0;
         // FAST PATH: a non-blocking socket is almost always writable, so write DIRECTLY first. This keeps
@@ -316,4 +317,13 @@ pub async fn reactorAccept(listenFd: int, kq: int): ReactorStream {
     // request/response ping-pong of HTTP keep-alive otherwise serialises badly and caps throughput.
     if (c >= 0) { let _ = socket.setTcpNoDelay(c); }
     return ReactorStream(c, kq);
+}
+
+// A pure async delay: arm a one-shot reactor timer and suspend this coroutine until it fires (no socket
+// op involved). Reactor-thread only -- there is no timer to fire when block-driving off the reactor.
+pub async fn delayMs(ms: int): void {
+    if (ms <= 0) { return; }
+    nova_reactor_set_timer(currentCoro(), ms as long);
+    coroSuspend();
+    nova_reactor_cancel_timer(currentCoro());
 }
