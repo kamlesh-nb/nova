@@ -24,6 +24,12 @@ pub fn entryBinary(key: string, data: string): BsonEntry {
     return BsonEntry{ type_id: 5, key: key, str_val: data, int_val: 0, int_val2: 0, dec_val: 0m };
 }
 
+// Binary with an explicit subtype (int_val carries the subtype byte): 0x00 generic, 0x04 UUID,
+// 0x03 legacy UUID, 0x80+ user-defined. entryBinary keeps the 0x00 default.
+pub fn entryBinarySubtype(key: string, data: string, subtype: int): BsonEntry {
+    return BsonEntry{ type_id: 5, key: key, str_val: data, int_val: subtype as long, int_val2: 0, dec_val: 0m };
+}
+
 pub fn entryInt(key: string, val: int): BsonEntry {
     return BsonEntry{ type_id: 16, key: key, str_val: "", int_val: val, int_val2: 0, dec_val: 0m };
 }
@@ -209,7 +215,7 @@ pub fn serialize(doc: BsonDocument): ptr {
             let data_len = entry.str_val.length;
             bytes.write_i32(ptr, offset, data_len);
             offset = offset + 4;
-            bytes.write_byte(ptr, offset, 0);
+            bytes.write_byte(ptr, offset, (entry.int_val & 0xff) as int);   // preserve the subtype byte
             offset = offset + 1;
             let j = 0;
             while (j < data_len) {
@@ -368,6 +374,7 @@ pub fn deserialize(ptr: ptr): BsonDocument {
         if (type_byte == 5) {
             let bin_len = bytes.read_i32(ptr, offset);
             offset = offset + 4;
+            let subtype = bytes.read_byte(ptr, offset);   // preserve the subtype byte (0x04 UUID, etc.)
             offset = offset + 1;
             let buf = bytes.alloc(if (bin_len > 0) bin_len else 1);
             let j = 0;
@@ -377,7 +384,7 @@ pub fn deserialize(ptr: ptr): BsonDocument {
             }
             offset = offset + bin_len;
 
-            doc.entries.push(BsonEntry{ type_id: 5, key: key, str_val: buf as string, int_val: 0, int_val2: 0, dec_val: 0m });
+            doc.entries.push(BsonEntry{ type_id: 5, key: key, str_val: buf as string, int_val: subtype as long, int_val2: 0, dec_val: 0m });
         }
         if (type_byte == 7) {                 // ObjectId: 12 bytes -> 24-hex-char string
             let oid = objectIdHex(ptr, offset);
@@ -568,6 +575,14 @@ pub fn docGetBinary(doc: BsonDocument, index: int): string {
     let entry = doc.entries.at(index);
     if (entry.type_id != 5) return "";
     return entry.str_val;
+}
+
+// The binary subtype byte (0x00 generic, 0x04 UUID, ...); -1 when the field is not binary.
+pub fn docGetBinarySubtype(doc: BsonDocument, index: int): int {
+    if (index < 0 || index >= doc.entries.size()) return 0 - 1;
+    let entry = doc.entries.at(index);
+    if (entry.type_id != 5) return 0 - 1;
+    return (entry.int_val & 0xff) as int;
 }
 
 pub fn docGetInt(doc: BsonDocument, index: int): int {
