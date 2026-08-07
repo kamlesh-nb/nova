@@ -251,6 +251,94 @@ pub struct RowStream {
 
 pub fn streamRows(rs: ResultSet): RowStream { return RowStream(rs); }
 
+// --- X4: true streaming (async cursor over a driver-provided lazy row source) -----------------------
+
+// A driver-provided source of row batches. `fetchBatch` returns the next batch of rows, awaiting the
+// server, and an EMPTY list when the result is exhausted. `columns` is valid after the first fetch;
+// `close` releases the server-side resource (a portal / cursor / statement); `err` surfaces a mid-stream
+// error. Drivers back this with their native lazy fetch: postgres portals (Execute with a row-count),
+// mysql row-by-row, mssql token streaming, mongodb getMore. `materializedSource` is the fallback that
+// wraps an already-buffered ResultSet, so a driver presents the streaming API before it is converted.
+pub trait RowBatchSource {
+    async fn fetchBatch(self): List<Row>;
+    fn columns(self): List<Column>;
+    fn err(self): DbError;
+    async fn close(self): void;
+}
+
+// An async forward cursor over a RowBatchSource. It holds one batch at a time and pulls the next
+// (awaiting the server) only when the current batch is drained, so a large result never materializes in
+// full. Iterate with `while (let row = await cur.next()) { ... }`, then `await cur.close()`.
+pub struct Cursor {
+    pub src: RowBatchSource,
+    pub batch: List<Row>,
+    pub pos: int,
+    pub exhausted: bool,
+
+    init(src: RowBatchSource) {
+        self.src = src;
+        self.batch = List<Row>();
+        self.pos = 0;
+        self.exhausted = false;
+    }
+
+    // The next row, or undefined when the stream is exhausted. Drives fetchBatch transparently.
+    pub async fn next(self: Cursor): Row | undefined {
+        if (self.pos < self.batch.size()) {
+            let r = self.batch.get(self.pos) ?? Row();
+            self.pos = self.pos + 1;
+            return r;
+        }
+        if (self.exhausted) { return undefined; }
+        self.batch = await self.src.fetchBatch();
+        self.pos = 0;
+        if (self.batch.size() == 0) { self.exhausted = true; return undefined; }
+        let r0 = self.batch.get(0) ?? Row();
+        self.pos = 1;
+        return r0;
+    }
+
+    // Drain the remaining rows into a list (bounded by the result size). Convenience for a caller that
+    // decides mid-stream to take the rest at once.
+    pub async fn toList(self: Cursor): List<Row> {
+        let out = List<Row>();
+        while (true) {
+            let r = await self.next();
+            if (r == undefined) { break; }
+            out.push(r);
+        }
+        return out;
+    }
+
+    pub fn columns(self: Cursor): List<Column> { return self.src.columns(); }
+    pub fn colCount(self: Cursor): int { return self.src.columns().size(); }
+    pub fn ok(self: Cursor): bool { return self.src.err().isEmpty(); }
+    pub fn err(self: Cursor): DbError { return self.src.err(); }
+    pub async fn close(self: Cursor): void { let _ = await self.src.close(); }
+}
+
+// A RowBatchSource over an already-materialized ResultSet: yields the whole set as one batch then
+// exhausts. This is the streaming-API adapter for any driver that has not yet gained true lazy fetch.
+pub struct MaterializedSource impl RowBatchSource {
+    pub rs: ResultSet,
+    pub served: bool,
+    init(rs: ResultSet) { self.rs = rs; self.served = false; }
+    async fn fetchBatch(self: MaterializedSource): List<Row> {
+        if (self.served) { return List<Row>(); }
+        self.served = true;
+        return self.rs.rows;
+    }
+    fn columns(self: MaterializedSource): List<Column> { return self.rs.columns; }
+    fn err(self: MaterializedSource): DbError { return self.rs.err; }
+    async fn close(self: MaterializedSource): void { return; }
+}
+
+// Wrap a materialized ResultSet in the async Cursor API (the fallback until a driver streams natively).
+pub fn cursorOver(rs: ResultSet): Cursor {
+    let src: RowBatchSource = MaterializedSource(rs);
+    return Cursor(src);
+}
+
 pub trait Connection {
 
     async fn exec(self, sql: string, params: List<DbValue>): ExecResult;
