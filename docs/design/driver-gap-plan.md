@@ -150,8 +150,8 @@ Severity H/M/L, effort S/M/L. Cross-cutting items above are not repeated here.
 **Status (updated).** The mongodb driver is no longer a wire proof-of-concept: it has a native document
 API (`Collection` / `Doc` / `Filter` / `Update` / lazy `Cursor`), the full read + write surface, sessions
 and multi-document transactions, replica-set topology with failover, and a typed ORM both ways. Almost
-every row below is now DONE and verified live against a real `mongod`; the remaining open items are the
-alternative auth mechanisms and GridFS.
+every row below is now DONE and verified live against a real `mongod`; the only remaining open items are the
+alternative auth mechanisms and BSON binary-subtype preservation.
 
 | Gap | Sev | Status |
 |---|---|---|
@@ -167,7 +167,7 @@ alternative auth mechanisms and GridFS.
 | OP_MSG document sequences (kind 1), flag bits, OP_COMPRESSED absent | L-M | kind-1 DONE (all writes stream a document sequence); OP_COMPRESSED still open |
 | No connection pool (single socket, busy-bool rejects concurrency) | M-H | DONE: `data.sql.Pool(MongoDriver(), dsn, n)` is Mongo-aware for free |
 | No max-message-size guard; short-read returns truncated buffer without error; auth failure swallowed | M | DONE: 64 MiB frame bound, short-read returns "", auth failure marks the connection dead |
-| Change streams, GridFS, index management absent | L-M | change streams DONE (`watch`/`watchAll`/`watchFrom` with resume tokens + auto-recovery) and index management DONE (`createIndex`/`dropIndex`); GridFS still open |
+| Change streams, GridFS, index management absent | L-M | ALL DONE: change streams (`watch`/`watchAll`/`watchFrom` with resume tokens + auto-recovery), GridFS (`gridfs.bucket` upload/download/delete/list, pymongo-interop verified), index management (`createIndex`/`dropIndex`) |
 
 Beyond this table, the driver also gained a typed ORM surface not originally scoped: `docOf<T>` (serialise
 a `@serializable` struct to a document) and `bindAll<T>`/`bindOne<T>` (read documents back into structs),

@@ -442,6 +442,34 @@ Every stream tracks a **resume token** (each event's `_id`, plus the cursor's po
 exactly where you left off. You rarely need this by hand for failover: a dropped primary is recovered
 automatically, the driver reconnects and reopens from the last token without dropping an event.
 
+### GridFS: large files
+
+BSON documents cap at 16 MB, so larger files (images, videos, backups) go in GridFS, which splits a file
+into fixed-size chunks across two collections (`<bucket>.files` for metadata, `<bucket>.chunks` for the
+bytes). The `gridfs` module is a separate import, matching the Go driver's layout:
+
+```nova
+import mongodb;
+import gridfs;
+
+let bk = gridfs.bucket(conn, "shop", "fs");   // the "fs" bucket on the "shop" database
+let _ = await bk.ensureIndexes();             // once, when provisioning: the standard GridFS indexes
+
+let up = await bk.upload("logo.png", bytes);  // bytes is a binary-carrying string; returns the hex _id
+let dl = await bk.download(up.id);            // reassembles the chunks in order
+if (dl.ok()) { /* dl.data is the file's bytes */ }
+
+let f = await bk.findByName("logo.png");      // GridFSFile | undefined (newest wins on duplicate names)
+let dl2 = await bk.downloadByName("logo.png");
+let files = await bk.listFiles();
+let _d = await bk.delete(up.id);              // removes the chunks and the files document
+```
+
+The default chunk size is 255 KiB; `gridfs.bucket(conn, db, "fs").withChunkSize(n)` overrides it. The
+upload writes all the chunks first and the files document last, so a partial upload leaves no visible
+file. The on-disk layout is the standard GridFS format, so files written here are readable by any other
+MongoDB driver, and vice versa.
+
 ## Where to go next
 
 - Chapter 17 for the web framework the repository plugs into.
