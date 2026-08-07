@@ -150,8 +150,9 @@ Severity H/M/L, effort S/M/L. Cross-cutting items above are not repeated here.
 **Status (updated).** The mongodb driver is no longer a wire proof-of-concept: it has a native document
 API (`Collection` / `Doc` / `Filter` / `Update` / lazy `Cursor`), the full read + write surface, sessions
 and multi-document transactions, replica-set topology with failover, and a typed ORM both ways. Almost
-every row below is now DONE and verified live against a real `mongod`; the only remaining open items are the
-cloud/enterprise auth mechanisms (AWS, LDAP, GSSAPI, OIDC) and BSON binary-subtype preservation.
+every row below is now DONE and verified live against a real `mongod`. The only remaining MongoDB items are
+the cloud/enterprise auth mechanisms (AWS, LDAP, GSSAPI, OIDC), which need external infrastructure to test,
+and a few niche BSON types (regex / code / minkey-maxkey). The MongoDB driver is otherwise feature-complete.
 
 | Gap | Sev | Status |
 |---|---|---|
@@ -163,7 +164,7 @@ cloud/enterprise auth mechanisms (AWS, LDAP, GSSAPI, OIDC) and BSON binary-subty
 | No client sessions (lsid), so no retryable writes; retryable reads/writes absent | M-H | DONE: client sessions, multi-document transactions, and retry-once retryable writes |
 | killCursors missing (server-side cursor leak once getMore lands) | M | DONE |
 | SCRAM-SHA-1 absent; authSource not honoured (defaults wrong); no x509/AWS/LDAP/GSSAPI/OIDC | M | PARTIAL: SCRAM-SHA-256 + SCRAM-SHA-1 (MONGODB-CR password digest) + MONGODB-X509 (client-cert mutual TLS), all verified live; AWS / LDAP / GSSAPI / OIDC not built |
-| BSON gaps: dates/timestamps decode-only + indistinguishable, binary subtypes discarded, regex/code/minkey unhandled | M-H | MOSTLY DONE: typed date/timestamp/int64/double/decimal128 build+read; binary subtype preservation still open |
+| BSON gaps: dates/timestamps decode-only + indistinguishable, binary subtypes discarded, regex/code/minkey unhandled | M-H | DONE: typed date/timestamp/int64/double/decimal128 build+read + binary subtype preservation (UUID etc., pymongo-interop verified); regex/code/minkey remain niche/unhandled |
 | OP_MSG document sequences (kind 1), flag bits, OP_COMPRESSED absent | L-M | kind-1 DONE (all writes stream a document sequence); OP_COMPRESSED still open |
 | No connection pool (single socket, busy-bool rejects concurrency) | M-H | DONE: `data.sql.Pool(MongoDriver(), dsn, n)` is Mongo-aware for free |
 | No max-message-size guard; short-read returns truncated buffer without error; auth failure swallowed | M | DONE: 64 MiB frame bound, short-read returns "", auth failure marks the connection dead |
