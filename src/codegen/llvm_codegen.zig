@@ -1731,7 +1731,26 @@ pub const LlvmCompiler = struct {
             defer self.allocator.free(cap_full_name);
 
             var resolved_name: ?[]const u8 = null;
-            if (self.func_map.get(full_name)) |_| {
+
+            // Importer-relative resolution FIRST: a qualified call `mod.fn()` must bind to the
+            // `mod` that THIS file imported, not to any same-named module elsewhere. The suffix
+            // scan below is module-blind and picks the shortest matching key, so two packages
+            // that both export e.g. `codec.buildSSLRequest` would collide (the shorter package
+            // path wins, silently calling the wrong one with mismatched arity). Ask the symbol
+            // table which module `mod` resolves to for the importing file, then take that
+            // function's exact mangled name.
+            if (sema_shadow.live_sema) |sm| {
+                if (sm.tab.findModuleByImportNameForImporter(fa.object.kind.ident, fa.span.file)) |mid| {
+                    if (sm.tab.findFunctionIn(mid, fa.field)) |sid| {
+                        const legacy = sm.tab.symbolAt(sid).legacy_mangled;
+                        if (self.func_map.contains(legacy)) resolved_name = legacy;
+                    }
+                }
+            }
+
+            if (resolved_name != null) {
+                // already bound importer-relative
+            } else if (self.func_map.get(full_name)) |_| {
                 resolved_name = full_name;
             } else if (self.func_map.get(cap_full_name)) |_| {
                 resolved_name = cap_full_name;
@@ -2453,7 +2472,12 @@ pub const LlvmCompiler = struct {
         var prefix = self.allocator.alloc(u8, base_path.len) catch return null;
         @memcpy(prefix, base_path);
         for (prefix, 0..) |char, idx| {
-            if (char == '/' or char == '\\') {
+            // Convert '.' as well as path separators so a package/relative path prefix
+            // (e.g. "../packages/nova-mysql/src/codec") becomes a dot-free identifier. A
+            // leftover '.' would (a) desync this emit name from the symbol table's
+            // legacy_mangled (which converts dots), breaking importer-relative qualified
+            // call resolution, and (b) make getStructBaseName truncate the name at that dot.
+            if (char == '/' or char == '\\' or char == '.') {
                 prefix[idx] = '_';
             }
         }

@@ -99,7 +99,7 @@ pub fn canonicalModulePrefix(allocator: std.mem.Allocator, file: []const u8, roo
     const ext = std.mem.lastIndexOfScalar(u8, path, '.') orelse path.len;
     const base = path[0..ext];
     const out = try allocator.alloc(u8, base.len);
-    for (base, 0..) |c, i| out[i] = if (c == '/' or c == '\\') '_' else c;
+    for (base, 0..) |c, i| out[i] = if (c == '/' or c == '\\' or c == '.') '_' else c;
     return out;
 }
 
@@ -116,7 +116,7 @@ pub fn legacyModulePrefix(allocator: std.mem.Allocator, file: []const u8, root_f
     const ext = std.mem.lastIndexOfScalar(u8, path, '.') orelse path.len;
     const base = path[0..ext];
     const out = try allocator.alloc(u8, base.len);
-    for (base, 0..) |c, i| out[i] = if (c == '/' or c == '\\') '_' else c;
+    for (base, 0..) |c, i| out[i] = if (c == '/' or c == '\\' or c == '.') '_' else c;
     return out;
 }
 
@@ -205,6 +205,35 @@ pub const SymbolTable = struct {
         const slash = std.mem.lastIndexOfScalar(u8, name, '/');
         const cut: ?usize = if (dot) |d| (if (slash) |s| @max(d, s) else d) else slash;
         return if (cut) |i| name[i + 1 ..] else name;
+    }
+
+    fn dirOf(path: []const u8) []const u8 {
+        const slash = std.mem.lastIndexOfAny(u8, path, "/\\") orelse return "";
+        return path[0..slash];
+    }
+    fn fileBaseNoExt(path: []const u8) []const u8 {
+        const slash = std.mem.lastIndexOfAny(u8, path, "/\\");
+        const base = if (slash) |s| path[s + 1 ..] else path;
+        const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return base;
+        return base[0..dot];
+    }
+
+    // Importer-relative module resolution. When the importing file has a SIBLING module (in the same
+    // directory) whose basename matches the import's last segment, prefer it. This makes two packages
+    // that each contain a same-named internal module (e.g. nova-mysql/src/connection.nova and
+    // nova-postgres/src/connection.nova) each resolve to their OWN module, instead of both binding to
+    // whichever bare-name `connection` module was registered first. Falls back to the global name-based
+    // lookup (stdlib and cross-package imports have unique names, so nothing changes for them).
+    pub fn findModuleByImportNameForImporter(self: *const SymbolTable, import_name: []const u8, importer_file: []const u8) ?ModuleId {
+        const imp_dir = dirOf(importer_file);
+        if (imp_dir.len > 0) {
+            const want = lastSegment(import_name);
+            for (self.modules.items) |m| {
+                if (std.mem.eql(u8, m.path, "<root>")) continue;
+                if (std.mem.eql(u8, dirOf(m.file), imp_dir) and std.mem.eql(u8, fileBaseNoExt(m.file), want)) return m.id;
+            }
+        }
+        return self.findModuleByImportName(import_name);
     }
 
     pub fn findModuleByImportName(self: *const SymbolTable, import_name: []const u8) ?ModuleId {
@@ -499,7 +528,7 @@ pub const SymbolTable = struct {
             const imp = decl_ptr.import_decl;
             if (std.mem.eql(u8, imp.module, "bytes")) continue;
             const importer = try self.internModule(imp.span.file);
-            const imported = self.findModuleByImportName(imp.module) orelse continue;
+            const imported = self.findModuleByImportNameForImporter(imp.module, imp.span.file) orelse continue;
 
             const dot = std.mem.lastIndexOfScalar(u8, imp.module, '.');
             const slash = std.mem.lastIndexOfScalar(u8, imp.module, '/');
