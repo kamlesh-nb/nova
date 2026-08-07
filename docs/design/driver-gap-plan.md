@@ -36,8 +36,9 @@ has since been implemented and pushed. Current state per driver:
 - **X4 streaming ResultSet (Phase 3): DONE.** Async `Cursor`/`RowBatchSource` seam in `db.nova` + native
   streaming on postgres (portals), mysql (server-side cursor), mssql (incremental TDS decode); mongodb
   already lazy. All verified live.
-- **X5 connection robustness (Phase 3)**: a hard pool cap with an async wait queue + bad-connection
-  eviction; also blocked on the async wait primitive.
+- **X5 connection robustness (Phase 3): DONE.** Hard pool cap with an async wait queue (aio.delay backoff,
+  slot reserved before the connect await) + bad-connection eviction (Pool.evict; poisoned conns never
+  rejoin idle); verified live. Phase 3 is now complete.
 - **Phase 4 long-tail**, per driver: postgres binary formats / COPY IN / multi-host; mysql compression /
   LOAD DATA / ed25519; mssql TVP / BCP / Azure AD / integrated auth; assorted niche column types.
 
@@ -237,8 +238,8 @@ infra, e.g. mysql ed25519, mssql integrated auth, mongodb AWS/LDAP/OIDC, roll in
 + SRV/topology + sessions/transactions is DONE. **X4 streaming ResultSet is DONE**: the async `Cursor` /
 `RowBatchSource` seam in `db.nova`, with native streaming on postgres (portals + Flush), mysql (server-side
 cursor + COM_STMT_FETCH) and mssql (incremental TDS token decode), all verified live; mongodb already had a
-lazy cursor. Still open: **X5 pool hard-cap + bad-connection eviction** (the async wait primitive aio.delay
-now exists).
+lazy cursor. **X5 pool hard-cap + bad-connection eviction is DONE** (aio.delay-backoff wait queue, slot reserved
+before connect, Pool.evict). Phase 3 complete; only the Phase 4 long-tail remains per driver.
 
 **Phase 4 - long tail (open).**
 postgres binary formats + COPY IN + multi-host; mysql compression + LOAD DATA + ed25519; mssql TDS 8.0
