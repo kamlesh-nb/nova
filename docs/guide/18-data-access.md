@@ -416,6 +416,32 @@ connects to the primary, and heals on a failover **three ways**:
 `conn.serverType`, `conn.serverHost`, and `conn.members` expose what the driver resolved. Read
 preference (`readPreference=secondary`, etc.) selects which member reads go to.
 
+### Change streams
+
+A change stream is a live feed of a collection's changes (insert, update, replace, delete). It needs a
+replica set, since it reads from the oplog. `watch` opens one; poll it for events:
+
+```nova
+let cs = await coll.watch(mongodb.docList(), "updateLookup");   // extra pipeline stages, fullDocument mode
+while (true) {
+    let ev = await cs.next(0);            // blocks for the next event (0 = poll forever)
+    if (ev == undefined) { break; }       // stream invalidated (e.g. collection dropped)
+    let op = ev.getStr("operationType") ?? "?";     // "insert" / "update" / "delete" / ...
+    let full = ev.getDoc("fullDocument");           // the post-image, present under "updateLookup"
+    // ... react to the change ...
+}
+let _ = await cs.close();
+```
+
+`coll.watchAll()` is the no-options form (no extra stages, default full-document). `next(maxPolls)` blocks
+across idle windows until an event arrives; `tryNext()` polls exactly once and returns `undefined` if the
+await window elapsed with nothing new, so you stay in control of the loop.
+
+Every stream tracks a **resume token** (each event's `_id`, plus the cursor's post-batch resume token).
+`cs.token()` gives you the latest one to persist; `coll.watchFrom(token, fullDocument)` reopens the stream
+exactly where you left off. You rarely need this by hand for failover: a dropped primary is recovered
+automatically, the driver reconnects and reopens from the last token without dropping an event.
+
 ## Where to go next
 
 - Chapter 17 for the web framework the repository plugs into.
