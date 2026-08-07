@@ -479,7 +479,11 @@ pub fn newClient12(): TlsClient12 {
 
 // mTLS: configure the client certificate + P-256 signing key to present on a CertificateRequest.
 pub fn setClientCert12(self: TlsClient12, certDer: ptr, certLen: int, key: ptr): void {
-    self.clientCertDer = certDer;
+    // COPY the cert DER into an owned buffer: callers pass a DER slice derived from a PEM string that may
+    // be freed before the handshake sends the client Certificate, which would dangle clientCertDer.
+    self.clientCertDer = bytes.alloc(if (certLen > 0) certLen else 1);
+    let j = 0;
+    while (j < certLen) { bytes.write_byte(self.clientCertDer, j, bytes.read_byte(certDer, j)); j = j + 1; }
     self.clientCertLen = certLen;
     let i = 0;
     while (i < 32) { bytes.write_byte(self.clientKey, i, bytes.read_byte(key, i)); i = i + 1; }

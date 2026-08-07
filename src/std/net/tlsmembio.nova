@@ -747,7 +747,7 @@ fn indexOf(hay: string, needle: string, from: int): int {
     return 0 - 1;
 }
 
-fn pemBody(pem: string, begin: string, end: string): string {
+pub fn pemBody(pem: string, begin: string, end: string): string {
     let bs = indexOf(pem, begin, 0);
     if (bs < 0) { return ""; }
     let bodyStart = bs + begin.length;
@@ -782,7 +782,7 @@ fn copyScalar32(derp: ptr, start: int, len: int): ptr {
     return out;
 }
 
-fn ecKeyScalar(keyPem: string): ptr {
+pub fn ecKeyScalar(keyPem: string): ptr {
     let der = pemBody(keyPem, "-----BEGIN EC PRIVATE KEY-----", "-----END EC PRIVATE KEY-----");
     let pkcs8 = false;
     if (der.length < 8) { der = pemBody(keyPem, "-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----"); pkcs8 = true; }

@@ -22,6 +22,7 @@ pub struct Client12Bio impl TlsBio {
     pub hs: ptr, pub hsLen: int, pub hsCap: int, pub consumed: int,
     pub svd: ptr,                   // expected server verify_data
     pub scratch: ptr, pub plain: ptr,
+    pub pendingOff: int, pub pendingLen: int,   // leftover decrypted plaintext (record > caller's max)
     pub verify: bool, pub host: string, pub store: truststore.TrustStore,   // CA trust policy (when verify)
 
     pub fn feed(self: Client12Bio, data: ptr, n: int): void { self.buf.feed(data, n); }
@@ -161,6 +162,18 @@ pub struct Client12Bio impl TlsBio {
     }
 
     pub fn readApp(self: Client12Bio, out: ptr, max: int): int {
+        // Serve any plaintext left over from a record whose length exceeded a previous caller's `max`.
+        // Without this, a single recvInto that reads the OP_MSG length header (max 4) would decrypt the
+        // WHOLE reply record and drop everything past byte 4, then block forever waiting for a record the
+        // server already sent.
+        if (self.pendingLen > self.pendingOff) {
+            let avail = self.pendingLen - self.pendingOff;
+            let take0 = if (avail > max) max else avail;
+            let k = 0;
+            while (k < take0) { bytes.write_byte(out, k, bytes.read_byte(self.plain, self.pendingOff + k)); k = k + 1; }
+            self.pendingOff = self.pendingOff + take0;
+            return take0;
+        }
         while (true) {
             let m = self.buf.nextRecord(self.scratch);
             if (m == 0) { if (self.buf.closed) { return 0 - 1; } return 0; }
@@ -168,10 +181,12 @@ pub struct Client12Bio impl TlsBio {
             if (ctype == 0x17) {
                 let pl = self.cl.openRecord(0x17, at(self.scratch, 5), m - 5, self.plain);
                 if (pl < 0) { return 0 - 1; }
-                let take = pl;
-                if (take > max) { take = max; }
+                if (pl == 0) { continue; }                // empty app record: keep reading
+                self.pendingLen = pl;
+                let take = if (pl > max) max else pl;
                 let i = 0;
                 while (i < take) { bytes.write_byte(out, i, bytes.read_byte(self.plain, i)); i = i + 1; }
+                self.pendingOff = take;                   // remainder (if any) served on the next call
                 return take;
             } else if (ctype == 0x16) {
                 // Post-handshake handshake record (e.g. NewSessionTicket): decrypt to advance seq, skip.
@@ -206,6 +221,7 @@ pub fn newClient12Bio(host: string): Client12Bio {
     bytes.free(ch);
     return Client12Bio { buf: mb, cl: cl, state: 1, hs: bytes.alloc(16384), hsLen: 0, hsCap: 16384,
                          consumed: 0, svd: bytes.alloc(12), scratch: bytes.alloc(33792), plain: bytes.alloc(33792),
+                         pendingOff: 0, pendingLen: 0,
                          verify: false, host: host, store: truststore.TrustStore { ders: List<long>(), lens: List<int>() } };
 }
 
@@ -215,5 +231,28 @@ pub fn newClient12BioVerify(host: string, store: truststore.TrustStore): Client1
     let b = newClient12Bio(host);
     b.verify = true;
     b.store = store;
+    return b;
+}
+
+// Parse a PEM cert + EC private key (either two blocks or the single tlsCertificateKeyFile MongoDB uses)
+// and configure them on the bio for mTLS: the client presents this certificate when the server sends a
+// CertificateRequest. certPem and keyPem may be the same string (a combined PEM).
+fn configureClientCertPem(b: Client12Bio, certPem: string, keyPem: string): void {
+    let certDer = tlsmembio.pemBody(certPem, "-----BEGIN CERTIFICATE-----", "-----END CERTIFICATE-----");
+    let scalar = tlsmembio.ecKeyScalar(keyPem);
+    b.configureClientCert(certDer as ptr, certDer.length, scalar);
+}
+
+// A TLS 1.2 client BIO that presents `certPem`/`keyPem` for mutual TLS (no server-chain verification).
+pub fn newClient12BioClientCert(host: string, certPem: string, keyPem: string): Client12Bio {
+    let b = newClient12Bio(host);
+    configureClientCertPem(b, certPem, keyPem);
+    return b;
+}
+
+// mTLS client BIO that ALSO verifies the server chain against `store` (the fully-hardened X.509 path).
+pub fn newClient12BioClientCertVerify(host: string, store: truststore.TrustStore, certPem: string, keyPem: string): Client12Bio {
+    let b = newClient12BioVerify(host, store);
+    configureClientCertPem(b, certPem, keyPem);
     return b;
 }

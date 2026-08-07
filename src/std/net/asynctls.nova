@@ -8,6 +8,7 @@
 import bytes;
 import net.aio;
 import net.tlsmembio;
+import net.tls12bio;
 import crypto.tls.truststore;
 
 fn bufToStr(buf: ptr, n: int): string {
@@ -149,6 +150,21 @@ pub async fn tlsClientUpgrade(base: aio.AsyncStream, host: string): TlsStream {
 pub async fn tlsClientUpgradeVerify(base: aio.AsyncStream, host: string, caPem: string): TlsStream {
     let store = truststore.loadPemBundle(caPem);
     let bio: tlsmembio.TlsBio = tlsmembio.newClientBioVerify(host, store);
+    let ts = TlsStream(base, bio);
+    let hs = await ts.handshake();
+    return ts;
+}
+
+// Connect and present a CLIENT certificate for mutual TLS (used by MongoDB's MONGODB-X509 auth). Runs
+// over TLS 1.2 (the Client12Bio mTLS path), which shares the TlsBio seam so the async pump is identical.
+// certPem/keyPem may be the same combined PEM (MongoDB's tlsCertificateKeyFile). When caPem is non-empty
+// the server chain is verified against it; otherwise the handshake authenticates but does not chain-check.
+pub async fn tlsConnectClientCert(host: string, port: int, caPem: string, certPem: string, keyPem: string): TlsStream {
+    let base = await aio.asyncConnect(host, port);
+    let bio: tlsmembio.TlsBio = tls12bio.newClient12BioClientCert(host, certPem, keyPem);
+    if (caPem.length > 0) {
+        bio = tls12bio.newClient12BioClientCertVerify(host, truststore.loadPemBundle(caPem), certPem, keyPem);
+    }
     let ts = TlsStream(base, bio);
     let hs = await ts.handshake();
     return ts;
