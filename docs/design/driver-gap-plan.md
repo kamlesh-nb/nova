@@ -32,6 +32,11 @@ The final round closed the Phase-4 items that actually affect a running app:
 - **BSON / MongoDB** (nova lang `d7b5af4`, `src/std/serde/bson.nova`): the scanner decodes every remaining
   element type (regex, code, symbol, code_w_scope, dbpointer, undefined, min/max key); previously it
   bailed at the first such element and silently dropped it and every field after it.
+- **Connect deadline** (nova lang `0fc45fd` + all four drivers `ca2a810`/`cdc041c`/`cc41217`/`502134f`):
+  a reactor-native `asyncConnectDeadline` (arm the connect op + a one-shot timer, abandon the op on
+  timeout) — a dead/firewalled host used to hang the connecting coroutine forever. Each driver bounds
+  the connect with `?connect_timeout=<seconds>` (default 10 s) and returns a failed connection instead
+  of hanging. Verified live (unroutable host → failure in ~2 s; real host still connects).
 - **Compiler enablers** (nova lang `57a026c`, `c41ee53`): importing two driver packages in one program
   now compiles (was a module-scoping name clash), and the checker no longer validates a colliding struct
   name against the wrong module's decl (`data.db.Cursor` vs a driver's own `Cursor`).
@@ -39,8 +44,7 @@ The final round closed the Phase-4 items that actually affect a running app:
 **Explicitly deferred, infra-gated (a supported pathway, but needs external infrastructure to build and
 verify, so not part of this pass and not blocking a normal deployment):** Kerberos / GSSAPI / SSPI and
 integrated Windows auth; Azure AD / federated auth (mssql); AWS / LDAP / OIDC (mongodb); MariaDB ed25519
-and PAM/LDAP cleartext (mysql). **Also deferred (feature-completeness, not correctness):** a shared
-connect/handshake-deadline primitive across the three SQL drivers; bulk paths (postgres COPY IN, mssql
+and PAM/LDAP cleartext (mysql). **Also deferred (feature-completeness, not correctness):** bulk paths (postgres COPY IN, mssql
 TVP/BCP); mysql protocol compression; mssql RETURNSTATUS surfacing + ENVCHANGE routing; mongodb
 OP_COMPRESSED; postgres binary wire formats and multi-host failover.
 
@@ -281,7 +285,7 @@ VARCHAR CP1252 decode + DONE_COUNT rowcount; postgres DSN percent-decode + IPv6 
 BSON niche types (regex/code/minkey/maxkey/...). See the Status section for commits.
 Still open (not blocking a normal deployment): postgres binary formats + COPY IN + multi-host; mysql
 compression + ed25519 + PAM/LDAP; mssql TDS 8.0 strict + TVP/BCP + Azure AD + RETURNSTATUS/ENVCHANGE;
-mongodb OP_COMPRESSED + AWS/LDAP/OIDC auth; a shared connect/handshake-deadline primitive. (mongodb change
+mongodb OP_COMPRESSED + AWS/LDAP/OIDC auth. (mongodb change
 streams, GridFS and indexes, originally listed here, are DONE.)
 
 ## Seam and runtime dependencies (not per-driver)
