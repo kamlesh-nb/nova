@@ -13,7 +13,7 @@ Scope: `packages/nova-{postgres,mysql,mssql,mongodb}/src/`, the shared seam
 The rest of this document is the original 2026-08-06 gap analysis, kept as the reference list. Most of it
 has since been implemented and pushed. Current state per driver:
 
-- **MongoDB — feature-complete.** The whole native document API shipped and is verified live: read/write,
+- **MongoDB: feature-complete.** The whole native document API shipped and is verified live: read/write,
   the typed `Doc`/`Filter`/`Update`/`FindOptions` model, lazy cursors, aggregate/count/distinct, index
   management, sessions + multi-document transactions, replica-set discovery + SDAM failover
   (proactive/reactive/on-demand), retryable writes, `bulkWrite`, `mongodb+srv://`, a typed ORM both ways
@@ -22,21 +22,21 @@ has since been implemented and pushed. Current state per driver:
   MONGODB-X509, and BSON binary-subtype preservation. Open: cloud/enterprise auth (AWS/LDAP/GSSAPI/OIDC,
   infra-gated) and a few niche BSON types (regex/code/minkey-maxkey).
 
-- **PostgreSQL — Phase 0/1/2 done** (origin `6b3a296`): server-bound params, MD5 auth, fail-closed TLS,
+- **PostgreSQL, Phase 0/1/2 done** (origin `6b3a296`): server-bound params, MD5 auth, fail-closed TLS,
   error classification, the connection frame-leak fix, array decode, uuid/json OID mapping, LISTEN/NOTIFY,
   COPY OUT, transactions, per-connection concurrency guard, query cancellation.
-- **MySQL — Phase 0/1/2 done** (origin `90d0350`): server-bound + typed-binary params, fail-closed TLS,
+- **MySQL, Phase 0/1/2 done** (origin `90d0350`): server-bound + typed-binary params, fail-closed TLS,
   binary TIME / unsigned BIGINT / >64 KB packet fixes, caching_sha2_password, multi-resultset consumption,
   >=16 MB multi-packet reassembly, transactions, correct datetime decode, query cancellation.
-- **MSSQL — Phase 0/1/2 done** (origin `d8a5079`): the temporal/XML/VARBINARY(MAX) decode desync fixes,
+- **MSSQL, Phase 0/1/2 done** (origin `d8a5079`): the temporal/XML/VARBINARY(MAX) decode desync fixes,
   PLP terminator fix, sp_executesql server-bound params, error classification, multiple-result-set decode,
   uuid, TDS packet chunking, sp_reset_connection on pooled reuse, query cancellation via ATTENTION.
 
 **What remains for the three SQL drivers**, cross-cutting:
-- **X4 streaming ResultSet (Phase 3)** — the seam still buffers the whole result set; no cursor/iterator in
+- **X4 streaming ResultSet (Phase 3)**: the seam still buffers the whole result set; no cursor/iterator in
   `db.nova`. This is the next item and it needs a seam change (plus an async wait primitive for idle
   delivery). It benefits all four drivers.
-- **X5 connection robustness (Phase 3)** — a hard pool cap with an async wait queue + bad-connection
+- **X5 connection robustness (Phase 3)**: a hard pool cap with an async wait queue + bad-connection
   eviction; also blocked on the async wait primitive.
 - **Phase 4 long-tail**, per driver: postgres binary formats / COPY IN / multi-host; mysql compression /
   LOAD DATA / ed25519; mssql TVP / BCP / Azure AD / integrated auth; assorted niche column types.
