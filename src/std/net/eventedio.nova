@@ -299,6 +299,65 @@ pub async fn reactorConnect(host: string, port: int, kq: int): ReactorStream {
     return ReactorStream(fd, kq);
 }
 
+// Like reactorConnect but bounded by a deadline. If the TCP connect has not completed within
+// `timeoutMs`, the still-armed connect op is abandoned (the kernel owns the record until it completes
+// or is cancelled, exactly as in recvIntoDeadline), the socket is closed, and a failed stream (fd -1)
+// is returned. A firewalled or dead host can therefore no longer hang the connecting coroutine
+// forever. `timeoutMs <= 0` means no deadline (delegates to reactorConnect). Same completion-vs-
+// readiness split as reactorConnect; the timer wraps the suspend on both paths and opDone(op)==1
+// distinguishes "connect finished" from "timer fired".
+pub async fn reactorConnectDeadline(host: string, port: int, kq: int, timeoutMs: int): ReactorStream {
+    if (timeoutMs <= 0) { return await reactorConnect(host, port, kq); }
+    let addr = resolveHost4(host);
+    if (addr == (-1 as long)) { return ReactorStream(-1, kq); }
+    let fd = socket.newTcp();
+    if (fd < 0) { return ReactorStream(-1, kq); }
+    socket.setNonBlock(fd);
+    let sa = socket.makeSockaddrIn(port, addr);
+
+    if (eventloop.connectIsSubmitted()) {
+        let cop = nova_op_alloc(eventloop.OP_SIZE as long);
+        eventloop.makeOp(cop, eventloop.OP_CONNECT, fd, sa, 16, currentCoro());
+        if (eventloop.submit(kq, cop) != 0) {
+            nova_op_free(cop); bytes.free(sa); socket.close(fd);
+            return ReactorStream(-1, kq);
+        }
+        nova_reactor_set_timer(currentCoro(), timeoutMs as long);
+        coroSuspend();
+        nova_reactor_cancel_timer(currentCoro());
+        bytes.free(sa);
+        if (eventloop.opDone(cop) == 1) {
+            let cres = eventloop.opResult(cop);
+            nova_op_free(cop);
+            if (cres < 0) { socket.close(fd); return ReactorStream(-1, kq); }
+            return ReactorStream(fd, kq);
+        }
+        if (!eventloop.abandonOp(kq, cop)) { nova_op_free(cop); }
+        socket.close(fd);
+        return ReactorStream(-1, kq);
+    }
+
+    let r = socket.connectSock(fd, sa, 16);
+    bytes.free(sa);
+    if (r == 0) { return ReactorStream(fd, kq); }   // connected immediately (loopback)
+    if (!socket.connectInProgress()) { socket.close(fd); return ReactorStream(-1, kq); }
+    let op = nova_op_alloc(eventloop.OP_SIZE as long);
+    eventloop.makeOp(op, eventloop.OP_CONNECT, fd, 0, 0, currentCoro());
+    if (eventloop.submit(kq, op) != 0) { nova_op_free(op); socket.close(fd); return ReactorStream(-1, kq); }
+    nova_reactor_set_timer(currentCoro(), timeoutMs as long);
+    coroSuspend();
+    nova_reactor_cancel_timer(currentCoro());
+    if (eventloop.opDone(op) == 1) {
+        let res = eventloop.opResult(op);
+        nova_op_free(op);
+        if (res != 0) { socket.close(fd); return ReactorStream(-1, kq); }
+        return ReactorStream(fd, kq);
+    }
+    if (!eventloop.abandonOp(kq, op)) { nova_op_free(op); }
+    socket.close(fd);
+    return ReactorStream(-1, kq);
+}
+
 // Accept one connection on a listening fd, awaiting readability while the backlog is empty. Returns
 // a ReactorStream for the accepted connection (fd -1 on error). The listener's read-interest is
 // removed on success so a later accept does not resume the wrong coroutine.

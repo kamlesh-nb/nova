@@ -95,6 +95,9 @@ pub struct AsyncStream impl AsyncIO {
         return await async_write(self.sock, data);
     }
     pub fn isOpen(self: AsyncStream): bool { return self.sock != 0; }
+    // A connected stream has a positive fd. asyncConnectDeadline returns sock -1 on a failed/timed-out
+    // connect, so callers check ok() to turn a hung connect into a clean error.
+    pub fn ok(self: AsyncStream): bool { return self.sock > (0 as long); }
     pub fn close(self: AsyncStream): void {
         if (self.sock != 0) {
             if (self.kq > 0) {
@@ -114,6 +117,22 @@ pub async fn asyncConnect(host: string, port: int): AsyncStream {
     let ck = poller.currentKq();
     if (ck > 0) {
         let rs = await eventedio.reactorConnect(host, port, ck);
+        let s = AsyncStream(rs.fdOf() as long);
+        s.kq = ck;
+        return s;
+    }
+    let s = await aconnect(host, port);
+    return AsyncStream(s);
+}
+
+// asyncConnect with a connect deadline. On a reactor thread a connect that does not complete within
+// `timeoutMs` returns a failed stream (ok() == false) instead of hanging on a dead/firewalled host.
+// `timeoutMs <= 0` means no deadline. Off the reactor (no kq) there is no async timer, so it falls
+// back to the plain blocking connect and the deadline is best-effort (documented limitation).
+pub async fn asyncConnectDeadline(host: string, port: int, timeoutMs: int): AsyncStream {
+    let ck = poller.currentKq();
+    if (ck > 0) {
+        let rs = await eventedio.reactorConnectDeadline(host, port, ck, timeoutMs);
         let s = AsyncStream(rs.fdOf() as long);
         s.kq = ck;
         return s;
