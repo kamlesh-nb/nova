@@ -4,6 +4,7 @@ import string;
 import datetime;
 import resilience.breaker;
 import net.httpsclient;
+import net.aio;
 import metrics;
 
 fn nowMs(): long { return datetime.nowNs() / 1000000; }
@@ -20,8 +21,8 @@ pub struct Pool {
     pub dsn: string,
     pub idle: List<Pooled>,
     pub maxIdle: int,
-    pub maxOpen: int,          // 0 = unlimited. A soft cap surfaced via borrowedCount/overflowCount:
-                              // a hard blocking cap needs an async wait primitive (aio.sleep is a stub).
+    pub maxOpen: int,          // 0 = unlimited. A HARD cap (X5): when reached, acquire waits (aio.delay
+                              // backoff) for a release instead of opening beyond it.
     pub maxLifetimeMs: long,   // 0 = unlimited; a pooled conn older than this is evicted on acquire.
     pub queryTimeoutMs: int,   // 0 = unlimited; applied via conn.setTimeout on every acquire so each
                               // borrowed connection carries a per-statement deadline (T8). The driver's
@@ -31,7 +32,12 @@ pub struct Pool {
     pub live: int,
     pub borrowed: int,         // currently checked-out connections
     pub highWater: int,        // max simultaneous borrowed seen (leak / sizing signal)
-    pub overflow: int,         // times a new conn was opened while borrowed >= maxOpen (cap exceeded)
+    pub overflow: int,         // times the acquire deadline expired at the cap and a conn was opened anyway
+    pub waiters: int,          // acquirers currently parked waiting for a slot (gauge)
+    pub waitedTotal: int,      // total acquire wait-steps taken (contention signal, monotonic)
+    pub evicted: int,          // connections dropped as bad (failed ping / caller-reported desync)
+    pub waitStepMs: int,       // acquire backoff granularity when at the cap
+    pub acquireTimeoutMs: int, // 0 = wait forever (a true hard cap); >0 = open beyond the cap after this
 
     init(driver: Driver, dsn: string, maxIdle: int) {
         self.driver = driver;
@@ -47,12 +53,25 @@ pub struct Pool {
         self.borrowed = 0;
         self.highWater = 0;
         self.overflow = 0;
+        self.waiters = 0;
+        self.waitedTotal = 0;
+        self.evicted = 0;
+        self.waitStepMs = 2;
+        self.acquireTimeoutMs = 0;
     }
 
     pub fn configure(self, maxOpen: int, maxLifetimeMs: long, validateOnBorrow: bool): void {
         self.maxOpen = maxOpen;
         self.maxLifetimeMs = maxLifetimeMs;
         self.validateOnBorrow = validateOnBorrow;
+    }
+
+    // Tune the hard-cap wait behaviour. acquireTimeoutMs 0 = block forever until a slot frees (a strict
+    // hard cap); >0 = after waiting that long, open a connection beyond the cap (recorded as an overflow)
+    // rather than deadlock. waitStepMs is the backoff granularity while parked (default 2ms).
+    pub fn configureWait(self, acquireTimeoutMs: int, waitStepMs: int): void {
+        self.acquireTimeoutMs = acquireTimeoutMs;
+        if (waitStepMs > 0) { self.waitStepMs = waitStepMs; }
     }
 
     // Set a per-statement deadline (ms) applied to every connection this pool hands out (T8). 0 clears
@@ -79,36 +98,59 @@ pub struct Pool {
     }
 
     pub async fn acquire(self): Connection {
-        let now = nowMs();
-        // Reuse the newest idle connection that is neither aged out nor dead; drop the rest.
-        while (self.idle.size() > 0) {
-            let last = self.idle.size() - 1;
-            let p = self.idle.at(last);
-            self.idle.remove(last);
-            if (self.maxLifetimeMs > 0 && now - p.born > self.maxLifetimeMs) {
-                p.conn.close();
-                if (self.live > 0) { self.live = self.live - 1; }
-                continue;                                   // aged out -> try the next idle
-            }
-            if (self.validateOnBorrow) {
-                let ok = await self.ping(p.conn);
-                if (!ok) {
+        let waited = 0;
+        while (true) {
+            let now = nowMs();
+            // Reuse the newest idle connection that is neither aged out nor dead; drop the rest. The borrow
+            // slot is RESERVED (markBorrowed) before the optional ping await so a concurrent acquirer sees
+            // the claim; on ping failure it is un-reserved.
+            while (self.idle.size() > 0) {
+                let last = self.idle.size() - 1;
+                let p = self.idle.at(last);
+                self.idle.remove(last);
+                if (self.maxLifetimeMs > 0 && now - p.born > self.maxLifetimeMs) {
                     p.conn.close();
                     if (self.live > 0) { self.live = self.live - 1; }
-                    continue;                               // dead -> reconnect (fall through / next idle)
+                    continue;                                   // aged out -> try the next idle
                 }
+                self.markBorrowed();
+                if (self.validateOnBorrow) {
+                    let ok = await self.ping(p.conn);
+                    if (!ok) {
+                        if (self.borrowed > 0) { self.borrowed = self.borrowed - 1; }   // un-reserve
+                        p.conn.close();
+                        if (self.live > 0) { self.live = self.live - 1; }
+                        self.evicted = self.evicted + 1;        // dead idle conn -> evict, try next
+                        continue;
+                    }
+                }
+                self.applyTimeout(p.conn);
+                return p.conn;
             }
-            self.markBorrowed();
-            self.applyTimeout(p.conn);
-            return p.conn;
+            // No idle connection. Under the cap (or unlimited): RESERVE the slot BEFORE awaiting newConn,
+            // so concurrent acquirers see the reservation and the cap is not blown past during the connect.
+            if (self.maxOpen <= 0 || self.borrowed < self.maxOpen) {
+                self.markBorrowed();
+                let c = await self.newConn();
+                self.applyTimeout(c);
+                return c;
+            }
+            // At the HARD cap. If the acquire deadline has passed, open beyond it (recorded) rather than
+            // deadlock; otherwise park briefly and retry -- a release makes a slot available.
+            if (self.acquireTimeoutMs > 0 && waited >= self.acquireTimeoutMs) {
+                self.overflow = self.overflow + 1;
+                self.markBorrowed();
+                let c = await self.newConn();
+                self.applyTimeout(c);
+                return c;
+            }
+            self.waiters = self.waiters + 1;
+            await aio.delay(self.waitStepMs);
+            self.waiters = self.waiters - 1;
+            waited = waited + self.waitStepMs;
+            self.waitedTotal = self.waitedTotal + 1;
         }
-        // No usable idle connection: open a new one. maxOpen is a soft cap (see field note); record when
-        // it is exceeded so leaks / undersizing are observable.
-        if (self.maxOpen > 0 && self.borrowed >= self.maxOpen) { self.overflow = self.overflow + 1; }
-        let c = await self.newConn();
-        self.markBorrowed();
-        self.applyTimeout(c);
-        return c;
+        return await self.newConn();   // unreachable; satisfies the type checker
     }
 
     pub fn release(self, c: Connection): void {
@@ -134,6 +176,14 @@ pub struct Pool {
         if (self.live > 0) { self.live = self.live - 1; }
     }
 
+    // Discard a borrowed connection the caller found to be BAD (a protocol desync / broken frame / server
+    // error): close it and never return it to the idle set, counting it as an eviction. Same effect as
+    // discard() but observable via evictedCount(), so poisoned connections do not silently rejoin the pool.
+    pub fn evict(self, c: Connection): void {
+        self.evicted = self.evicted + 1;
+        self.discard(c);
+    }
+
     // Publish the pool's counters/gauges into a metrics registry, under the given name prefix (e.g.
     // "pg"). Counters are monotonic totals since process start; gauges are point-in-time. Call this on
     // a scrape or periodically; it is a pure snapshot, no locking beyond field reads.
@@ -144,6 +194,9 @@ pub struct Pool {
         reg.setGauge(prefix + "_pool_high_water", self.highWater as long);
         reg.setGauge(prefix + "_pool_opened_total", self.opened as long);
         reg.setGauge(prefix + "_pool_overflow_total", self.overflow as long);
+        reg.setGauge(prefix + "_pool_waiters", self.waiters as long);
+        reg.setGauge(prefix + "_pool_waited_total", self.waitedTotal as long);
+        reg.setGauge(prefix + "_pool_evicted_total", self.evicted as long);
     }
 
     pub fn idleCount(self): int { return self.idle.size(); }
@@ -152,6 +205,9 @@ pub struct Pool {
     pub fn borrowedCount(self): int { return self.borrowed; }
     pub fn highWaterCount(self): int { return self.highWater; }
     pub fn overflowCount(self): int { return self.overflow; }
+    pub fn waitersCount(self): int { return self.waiters; }
+    pub fn waitedTotalCount(self): int { return self.waitedTotal; }
+    pub fn evictedCount(self): int { return self.evicted; }
 
     pub fn closeAll(self): void {
         while (self.idle.size() > 0) {
@@ -186,7 +242,7 @@ pub struct ResilientPool {
         // was available; rs.hasError() now catches a real SQL error on an otherwise-live connection.
         if (rs.hasError() || string.eql(rs.tag, "")) {
             self.breaker.recordFailure();
-            self.pool.discard(c);
+            self.pool.evict(c);
         } else {
             self.breaker.recordSuccess();
             self.pool.release(c);
@@ -202,7 +258,7 @@ pub struct ResilientPool {
         let ex = await c.exec(sql, params);
         if (ex.hasError() || string.eql(ex.tag, "")) {
             self.breaker.recordFailure();
-            self.pool.discard(c);
+            self.pool.evict(c);
         } else {
             self.breaker.recordSuccess();
             self.pool.release(c);
