@@ -235,9 +235,10 @@ The query options are `replicaSet`, `readPreference` (`primary` / `primaryPrefer
 `tlsCAFile`. A connection that could not reach a usable node comes back marked failed, so the first
 operation on it surfaces the reason rather than crashing.
 
-Authentication is SCRAM-SHA-256 by default (username and password in the URI). The driver also supports
-**X.509 client-certificate auth**, where the certificate presented during the TLS handshake is the
-credential:
+Authentication is SCRAM-SHA-256 by default (username and password in the URI). Add
+`authMechanism=SCRAM-SHA-1` for older servers or users created with SHA-1 credentials. The driver also
+supports **X.509 client-certificate auth**, where the certificate presented during the TLS handshake is
+the credential:
 
 ```nova
 // The client certificate is the identity: no password. tlsCertificateKeyFile is the combined cert+key

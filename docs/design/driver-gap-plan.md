@@ -151,8 +151,7 @@ Severity H/M/L, effort S/M/L. Cross-cutting items above are not repeated here.
 API (`Collection` / `Doc` / `Filter` / `Update` / lazy `Cursor`), the full read + write surface, sessions
 and multi-document transactions, replica-set topology with failover, and a typed ORM both ways. Almost
 every row below is now DONE and verified live against a real `mongod`; the only remaining open items are the
-non-X.509 alternative auth mechanisms (SCRAM-SHA-1, AWS, LDAP, GSSAPI, OIDC) and BSON binary-subtype
-preservation.
+cloud/enterprise auth mechanisms (AWS, LDAP, GSSAPI, OIDC) and BSON binary-subtype preservation.
 
 | Gap | Sev | Status |
 |---|---|---|
@@ -163,7 +162,7 @@ preservation.
 | ObjectId is decode-only and has no serialise case: cannot query or round-trip by `_id` | H | DONE: build + query + round-trip by `_id` |
 | No client sessions (lsid), so no retryable writes; retryable reads/writes absent | M-H | DONE: client sessions, multi-document transactions, and retry-once retryable writes |
 | killCursors missing (server-side cursor leak once getMore lands) | M | DONE |
-| SCRAM-SHA-1 absent; authSource not honoured (defaults wrong); no x509/AWS/LDAP/GSSAPI/OIDC | M | PARTIAL: SCRAM-SHA-256 + MONGODB-X509 (client-cert mutual TLS, verified live) done; SCRAM-SHA-1 / AWS / LDAP / GSSAPI / OIDC not built |
+| SCRAM-SHA-1 absent; authSource not honoured (defaults wrong); no x509/AWS/LDAP/GSSAPI/OIDC | M | PARTIAL: SCRAM-SHA-256 + SCRAM-SHA-1 (MONGODB-CR password digest) + MONGODB-X509 (client-cert mutual TLS), all verified live; AWS / LDAP / GSSAPI / OIDC not built |
 | BSON gaps: dates/timestamps decode-only + indistinguishable, binary subtypes discarded, regex/code/minkey unhandled | M-H | MOSTLY DONE: typed date/timestamp/int64/double/decimal128 build+read; binary subtype preservation still open |
 | OP_MSG document sequences (kind 1), flag bits, OP_COMPRESSED absent | L-M | kind-1 DONE (all writes stream a document sequence); OP_COMPRESSED still open |
 | No connection pool (single socket, busy-bool rejects concurrency) | M-H | DONE: `data.sql.Pool(MongoDriver(), dsn, n)` is Mongo-aware for free |
