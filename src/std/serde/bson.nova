@@ -350,11 +350,14 @@ pub fn deserialize(ptr: ptr): BsonDocument {
 
         // Guard: an UNHANDLED type would fall through every branch below, leaving `offset` advanced only
         // past the key so the value bytes get misread as the next element (stream desync, and a
-        // 0-length key can stall progress). Stop cleanly on the first unsupported type instead. Types
-        // not yet decoded: 6 undefined, 11 regex, 12 dbpointer, 13/15 code, 14 symbol, 127/255 min/max key.
+        // 0-length key can stall progress). Stop cleanly on the first genuinely unknown type instead.
+        // Every standard type is now decoded, including the previously-missing 6 undefined, 11 regex,
+        // 12 dbpointer, 13 code, 14 symbol, 15 code_w_scope, and 127/255 min/max key.
         if (!(type_byte == 1 || type_byte == 2 || type_byte == 3 || type_byte == 4 || type_byte == 5
-           || type_byte == 7 || type_byte == 8 || type_byte == 9 || type_byte == 10 || type_byte == 16
-           || type_byte == 17 || type_byte == 18 || type_byte == 19)) {
+           || type_byte == 6 || type_byte == 7 || type_byte == 8 || type_byte == 9 || type_byte == 10
+           || type_byte == 11 || type_byte == 12 || type_byte == 13 || type_byte == 14 || type_byte == 15
+           || type_byte == 16 || type_byte == 17 || type_byte == 18 || type_byte == 19
+           || type_byte == 127 || type_byte == 255)) {
             console.log("bson: unsupported type " + `${type_byte}` + " -- stopping decode to avoid desync");
             break;
         }
@@ -453,6 +456,46 @@ pub fn deserialize(ptr: ptr): BsonDocument {
             }
             offset = offset + arr_size;
             doc.entries.push(entryArray(key, arr_copy));
+        }
+        if (type_byte == 6 || type_byte == 127 || type_byte == 255) {
+            // undefined (6), maxkey (127), minkey (255): no value bytes. Keep the element (with its real
+            // type tag) so the document round-trips and the scan stays in sync.
+            doc.entries.push(BsonEntry{ type_id: type_byte, key: key, str_val: "", int_val: 0, int_val2: 0, dec_val: 0m });
+        }
+        if (type_byte == 11) {
+            // regex: two cstrings, pattern then flags. Store as "/pattern/flags" for a readable value.
+            let pat = readCstring(ptr, offset, total_size - offset);
+            offset = offset + pat.length + 1;
+            let flags = readCstring(ptr, offset, total_size - offset);
+            offset = offset + flags.length + 1;
+            doc.entries.push(BsonEntry{ type_id: 11, key: key, str_val: "/" + pat + "/" + flags, int_val: 0, int_val2: 0, dec_val: 0m });
+        }
+        if (type_byte == 13 || type_byte == 14) {
+            // javascript code (13) / symbol (14): int32 length (includes the trailing NUL) + string.
+            let slen = bytes.read_i32(ptr, offset);
+            offset = offset + 4;
+            let val = readCstring(ptr, offset, total_size - offset);
+            offset = offset + slen;
+            doc.entries.push(BsonEntry{ type_id: type_byte, key: key, str_val: val, int_val: 0, int_val2: 0, dec_val: 0m });
+        }
+        if (type_byte == 15) {
+            // code_w_scope: int32 total length (INCLUDING itself), then int32 code-len + code cstring +
+            // a scope document. Decode the code string; skip the whole element by its leading length.
+            let cws_total = bytes.read_i32(ptr, offset);
+            let code_len = bytes.read_i32(ptr, offset + 4);
+            let code = readCstring(ptr, offset + 8, total_size - (offset + 8));
+            offset = offset + cws_total;
+            doc.entries.push(BsonEntry{ type_id: 15, key: key, str_val: code, int_val: 0, int_val2: 0, dec_val: 0m });
+        }
+        if (type_byte == 12) {
+            // dbpointer (deprecated): int32 namespace-len + namespace string + 12-byte ObjectId.
+            let nslen = bytes.read_i32(ptr, offset);
+            offset = offset + 4;
+            let ns = readCstring(ptr, offset, total_size - offset);
+            offset = offset + nslen;
+            let oid = objectIdHex(ptr, offset);
+            offset = offset + 12;
+            doc.entries.push(BsonEntry{ type_id: 12, key: key, str_val: ns + "/" + oid, int_val: 0, int_val2: 0, dec_val: 0m });
         }
     }
 
