@@ -1586,7 +1586,10 @@ pub const LlvmCompiler = struct {
         }
 
         if (fa.object.kind == .ident) {
-            const obj_name = fa.object.kind.ident;
+            // Resolve a colliding enum (`Shape.Circle(x)` tagged construction) to the module-scoped enum
+            // this reference's file declares, so the right variant set/tags/layout are used (S3). Used for
+            // both the enum lookup and getEnumTagAndSize below.
+            const obj_name = self.scopedTypeName(fa.object.kind.ident, fa.span.file);
             if (self.enums.get(obj_name)) |enum_decl| {
                 var is_variant = false;
                 var variant_idx: usize = 0;

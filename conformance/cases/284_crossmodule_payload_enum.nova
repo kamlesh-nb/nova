@@ -1,0 +1,27 @@
+// S3 (payload enum construction across modules): two modules each declare a same-named PAYLOAD enum
+// `Shape` with different tagged variants. A tagged construction `Shape.Circle(10)` is a call node; for a
+// colliding enum the codegen construction site looked the enum up by bare name and missed the scoped
+// key, so it fell through to the method-call path and errored ("no method 'Circle' on 'Shape'"). Scoping
+// the enum lookup by the reference's own source file lets each module build its own variant/tag/layout.
+import assert;
+import scoped.shape_b;
+import scoped.shape_a;
+
+@test
+fn test_module_a_payload(): void {
+    let a = shape_a.mkA();     // A: Circle(10) -> r*r*3 = 300
+    assert.equalInt(a.area(), 300);
+}
+
+@test
+fn test_module_b_payload(): void {
+    let b = shape_b.mkB();     // B: Pent(4) -> p*5 = 20
+    assert.equalInt(b.area(), 20);
+}
+
+@test
+fn test_both_payload_enums_coexist(): void {
+    let a = shape_a.mkA();
+    let b = shape_b.mkB();
+    assert.equalInt(a.area() + b.area(), 320);   // 300 (A) + 20 (B), each at its own layout
+}

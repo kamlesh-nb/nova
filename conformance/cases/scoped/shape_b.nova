@@ -1,0 +1,13 @@
+import shape_a;
+// Module B: same-named payload enum Shape with DIFFERENT variants; imports A's Shape.
+pub enum Shape { Tri(int), Rect(int), Pent(int)
+    pub fn area(self: Shape): int {
+        switch (self) {
+            case Shape.Tri(b): { return b; }
+            case Shape.Rect(w): { return w * 2; }
+            case Shape.Pent(p): { return p * 5; }
+        }
+        return -1;
+    }
+}
+pub fn mkB(): Shape { return Shape.Pent(4); }
