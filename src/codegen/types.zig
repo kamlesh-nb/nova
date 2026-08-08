@@ -382,11 +382,26 @@ pub fn isOwnedExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool {
     }
 
     if (self.current_instantiation_id) |inst| {
-        if (ir.typeOfInst(expr_ptr.id, inst)) |ct| {
+        if (ir.typeOfInst(expr_ptr.id, inst)) |ct0| {
+            // A bare type-parameter carries no ownership of its own; resolve it through this
+            // instantiation's substitution so ownership is decided by the CONCRETE type.
+            const ct = if (st.get(ct0) == .type_param) (ir.tpResolve(ct0, inst) orelse ct0) else ct0;
             if (st.get(ct) != .unresolved and st.get(ct) != .type_param) return self.isOwnedTypeId(ct);
         }
     }
-    const t_opt = ir.typeOf(expr_ptr);
+    var t_opt = ir.typeOf(expr_ptr);
+
+    // If the static type is a type-parameter (e.g. returning a `U`-typed value from a generic fn), its
+    // ownership must be that of the concrete type it was monomorphised with. Without this, a generic fn
+    // returning an owned value emits no retain-on-return and the caller over-releases (a double-free).
+    // This is Swift's rule: a function result is +1, so a returned borrowed/parameter value is copied.
+    if (t_opt) |t| {
+        if (st.get(t) == .type_param) {
+            if (self.current_instantiation_id) |inst| {
+                if (ir.tpResolve(t, inst)) |sub| t_opt = sub;
+            }
+        }
+    }
 
     if (t_opt == null or st.get(t_opt.?) == .unresolved) {
         if (expr_ptr.kind == .ident) {

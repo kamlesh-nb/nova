@@ -1634,9 +1634,12 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     .div => return core.LLVMBuildFDiv(self.builder, l_val, r_val, "fdivtmp"),
                     .mod => return core.LLVMBuildFRem(self.builder, l_val, r_val, "fremtmp"),
                     .eq, .ne, .lt, .gt, .le, .ge => {
+                        // `!=` must be UNORDERED-not-equal (UNE): IEEE requires `nan != nan` to be
+                        // true, and ordered-not-equal (ONE) is false when either operand is NaN.
+                        // `==` stays ordered (OEQ) so `nan == nan` is false. This mirrors C `==`/`!=`.
                         const pred = switch (bin.op) {
                             .eq => types.LLVMRealPredicate.LLVMRealOEQ,
-                            .ne => types.LLVMRealPredicate.LLVMRealONE,
+                            .ne => types.LLVMRealPredicate.LLVMRealUNE,
                             .lt => types.LLVMRealPredicate.LLVMRealOLT,
                             .gt => types.LLVMRealPredicate.LLVMRealOGT,
                             .le => types.LLVMRealPredicate.LLVMRealOLE,
