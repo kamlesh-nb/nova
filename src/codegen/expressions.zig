@@ -2328,7 +2328,56 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     }
                     break :resolve try self.resolveCalleeName(name);
                 };
-                const fn_val = self.func_map.get(resolved_name) orelse {
+
+                // B1: a bare call to a generic free function (`fn(x)` with no explicit `<T>`) resolves to
+                // the base name, which is not emitted; only the monomorphised `fn__T` exists. Sema records
+                // the SOLVED concrete type args on this call expression, so rebuild the mono name from them.
+                var mono_name: ?[]const u8 = null;
+                defer if (mono_name) |m| self.allocator.free(m);
+                if (!self.func_map.contains(resolved_name)) {
+                    if (self.typed_ir) |ir| {
+                        if (ir.methodArgsOf(&expr)) |targs| {
+                            if (targs.len > 0) {
+                                if (self.type_store) |st| {
+                                    var nb = std.ArrayListUnmanaged(u8).empty;
+                                    var ok = true;
+                                    nb.appendSlice(self.allocator, resolved_name) catch {
+                                        ok = false;
+                                    };
+                                    for (targs) |ta| {
+                                        if (!ok) break;
+                                        const rendered = sema_shadow.renderLegacy(self.allocator, st, ta) catch {
+                                            ok = false;
+                                            break;
+                                        };
+                                        // renderLegacy returns a non-owned (store-interned) slice; do NOT free it.
+                                        const ma = types_mod.mangleTypeName(self.allocator, rendered) catch {
+                                            ok = false;
+                                            break;
+                                        };
+                                        defer self.allocator.free(ma);
+                                        nb.appendSlice(self.allocator, "__") catch {
+                                            ok = false;
+                                        };
+                                        nb.appendSlice(self.allocator, ma) catch {
+                                            ok = false;
+                                        };
+                                    }
+                                    if (ok) {
+                                        const cand = nb.toOwnedSlice(self.allocator) catch null;
+                                        if (cand) |c| {
+                                            if (self.func_map.contains(c)) mono_name = c else self.allocator.free(c);
+                                        }
+                                    } else {
+                                        nb.deinit(self.allocator);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                const lookup_name = mono_name orelse resolved_name;
+                const fn_val = self.func_map.get(lookup_name) orelse {
                     if (self.is_wasm) {
                         std.debug.print("error: '{s}' is native-only and not available on the wasm target (it resolves to a native runtime symbol with no wasm host import). Guard native code with `@native {{ ... }}`, or provide a `@wasm {{ ... }}` alternative.\n", .{resolved_name});
                     } else {

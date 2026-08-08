@@ -630,7 +630,7 @@ pub const Inferer = struct {
                             if (fd.ret_type) |r| {
 
                                 if (fd.type_params.len > 0) {
-                                    if (try self.freeFnReturn(sid, fd, r, arg_types.items)) |t| {
+                                    if (try self.freeFnReturn(sid, fd, r, arg_types.items, &e)) |t| {
                                         if (self.store.get(t) != .unresolved) return self.ok(t);
                                     }
                                 }
@@ -1170,6 +1170,7 @@ pub const Inferer = struct {
         fd: *const ast.FunctionDecl,
         ret_tr: ast.TypeRef,
         arg_types: []const TypeId,
+        call_expr: *const ast.Expression,
     ) !?TypeId {
 
         const saved = self.lowerer.param_scopes;
@@ -1195,6 +1196,37 @@ pub const Inferer = struct {
             const bound = maybe orelse continue;
             out = try subst.substituteOne(self.store, out, fid, @intCast(i), bound);
         }
+
+        // B1: register the INFERRED instantiation so codegen emits `fn__T` for a bare call `fn(x)`
+        // (the explicit `fn<T>(x)` path already does this at the .generic_call site). Only when every
+        // type parameter solved to a concrete type -- a still-abstract type_param arg would poison the
+        // monomorphised name and is handled by the enclosing generic's own instantiation instead.
+        if (fd.type_params.len > 0 and arg_types.len >= fd.params.len) {
+            var all_concrete = true;
+            const solved_args = self.allocator.alloc(TypeId, solved.len) catch return out;
+            defer self.allocator.free(solved_args);
+            for (solved, 0..) |maybe, i| {
+                const bound = maybe orelse {
+                    all_concrete = false;
+                    break;
+                };
+                switch (self.store.get(bound)) {
+                    .type_param, .unresolved => {
+                        all_concrete = false;
+                    },
+                    else => {},
+                }
+                solved_args[i] = bound;
+            }
+            if (all_concrete) {
+                mono.noteFreeFnInst(self.store, fd.name, fd.type_params, solved_args);
+                // Record the SOLVED concrete type args on the call expression so codegen can rebuild the
+                // monomorphised name `fn__T` for a bare `fn(x)` call (no explicit `<T>` to mangle from).
+                // Reuses the same per-expression side table method calls use.
+                if (self.ir) |ir| ir.recordMethodArgs(self.allocator, call_expr, solved_args) catch {};
+            }
+        }
+
         return out;
     }
 
