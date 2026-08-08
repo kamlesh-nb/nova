@@ -1,0 +1,34 @@
+// B2: a generic free function that forwards an enclosing type parameter to ANOTHER generic free
+// function (`inner<T>` called from inside `outer<T>`) must instantiate the callee too. Previously
+// only directly-called instances were collected, so `outer<int>` compiled but its `inner<T>` body
+// failed with "Function 'inner' not found". A transitive-closure pass now discovers instances reached
+// only through another generic, including multi-level chains and container-forwarding, and preserves
+// ownership of the forwarded value.
+import assert;
+import list;
+
+fn leaf<T>(x: T): T { return x; }
+fn mid<T>(x: T): T { return leaf<T>(x); }
+fn top<T>(x: T): T { return mid<T>(x); }
+
+fn firstOf<T>(xs: List<T>): T { return xs.at(0); }
+fn wrap<T>(xs: List<T>): T { return firstOf<T>(xs); }
+
+@test
+fn test_two_level_scalar(): void {
+    assert.equalInt(mid<int>(5), 5);
+}
+
+@test
+fn test_three_level_chain(): void {
+    assert.equalInt(top<int>(42), 42);
+    assert.equalStr(top<string>("deep"), "deep");   // owned string forwarded through 3 levels
+}
+
+@test
+fn test_container_forward(): void {
+    let xs = List<string>();
+    xs.push("owned-elem");
+    xs.push("second");
+    assert.equalStr(wrap<string>(xs), "owned-elem");   // T solved through List<T>, owned element
+}

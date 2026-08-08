@@ -130,6 +130,30 @@ pub fn noteFreeFnInst(
     free_fn_insts.append(a, .{ .fn_name = a.dupe(u8, fn_name) catch return, .params = pbuf, .args = abuf }) catch {};
 }
 
+// Register a free-generic function instantiation from already-rendered type-argument STRINGS
+// (codegen's transitive-closure pass produces these when a generic function forwards an enclosing
+// type parameter to another generic, e.g. `inner<T>` inside `outer<T>`). Dedups on (name, args) and
+// returns true if a NEW instance was added, so the caller can run a fixpoint. Strings are duped into
+// the page allocator to match noteFreeFnInst's storage.
+pub fn noteFreeFnInstStr(fn_name: []const u8, params: []const []const u8, args: []const []const u8) bool {
+    const a = std.heap.page_allocator;
+    for (free_fn_insts.items) |fi| {
+        if (!std.mem.eql(u8, fi.fn_name, fn_name)) continue;
+        if (fi.args.len != args.len) continue;
+        var same = true;
+        for (fi.args, args) |old, new| {
+            if (!std.mem.eql(u8, old, new)) same = false;
+        }
+        if (same) return false;
+    }
+    const abuf = a.alloc([]const u8, args.len) catch return false;
+    for (args, 0..) |an, i| abuf[i] = a.dupe(u8, an) catch return false;
+    const pbuf = a.alloc([]const u8, params.len) catch return false;
+    for (params, 0..) |p, i| pbuf[i] = a.dupe(u8, p) catch return false;
+    free_fn_insts.append(a, .{ .fn_name = a.dupe(u8, fn_name) catch return false, .params = pbuf, .args = abuf }) catch return false;
+    return true;
+}
+
 pub const mono_enabled: bool = true;
 
 pub const Worklist = struct {

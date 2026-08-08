@@ -2625,6 +2625,13 @@ pub const LlvmCompiler = struct {
             }
         }
 
+        // B2: transitively discover free-generic instances reached only through another generic. If
+        // `outer<int>` is instantiated and its body calls `inner<T>(x)`, `inner<int>` must be emitted
+        // too. sema registers the direct calls; this closes over the type-parameter-forwarding chain.
+        // Purely additive (worst case: an instance is missed and the same loud compile error as before
+        // results), so it cannot introduce a miscompile.
+        try self.expandFreeFnInstsTransitively(program);
+
         for (program.declarations) |decl| {
             if (decl == .fn_decl) {
                 const fn_decl = decl.fn_decl;
@@ -2702,6 +2709,177 @@ pub const LlvmCompiler = struct {
                 }
             }
         }
+    }
+
+    // Fixpoint over sema_mono.free_fn_insts: for each generic free-fn instance, walk its body under
+    // that instance's type-parameter binding and register any generic free-fn it calls with concrete
+    // (substituted) type arguments. Handles explicit `inner<T>(x)` where T is forwarded from the
+    // enclosing generic. Additive only.
+    pub fn expandFreeFnInstsTransitively(self: *LlvmCompiler, program: ast.Program) !void {
+        var gmap = std.StringHashMap(ast.FunctionDecl).init(self.allocator);
+        defer gmap.deinit();
+        for (program.declarations) |decl| {
+            if (decl == .fn_decl and decl.fn_decl.type_params.len > 0 and decl.fn_decl.extern_lib == null) {
+                try gmap.put(decl.fn_decl.name, decl.fn_decl);
+            }
+        }
+        if (gmap.count() == 0) return;
+
+        var guard: usize = 0;
+        var changed = true;
+        while (changed and guard < 100000) : (guard += 1) {
+            changed = false;
+            const n = sema_mono.free_fn_insts.items.len;
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                const fi = sema_mono.free_fn_insts.items[i];
+                const fd = gmap.get(fi.fn_name) orelse continue;
+                if (fi.params.len != fd.type_params.len) continue;
+
+                const subst = try self.allocator.alloc(MethodParamBinding, fi.params.len);
+                defer self.allocator.free(subst);
+                for (fi.params, fi.args, 0..) |pn, an, k| subst[k] = .{ .name = pn, .concrete = an };
+
+                const prev = self.current_method_subst;
+                self.current_method_subst = subst;
+                defer self.current_method_subst = prev;
+
+                if (try self.discoverGenericCallsInBlock(fd.body, &gmap)) changed = true;
+            }
+        }
+    }
+
+    fn discoverGenericCallsInBlock(self: *LlvmCompiler, block: ast.Block, gmap: *const std.StringHashMap(ast.FunctionDecl)) anyerror!bool {
+        var any = false;
+        for (block.statements) |stmt| {
+            if (try self.discoverGenericCallsInStmt(stmt, gmap)) any = true;
+        }
+        return any;
+    }
+
+    fn discoverGenericCallsInStmt(self: *LlvmCompiler, stmt: ast.Statement, gmap: *const std.StringHashMap(ast.FunctionDecl)) anyerror!bool {
+        var any = false;
+        switch (stmt) {
+            .expr_stmt => |es| any = try self.discoverGenericCallsInExpr(es.expr, gmap),
+            .let_stmt => |ls| if (ls.init) |init| {
+                any = try self.discoverGenericCallsInExpr(init, gmap);
+            },
+            .defer_stmt => |ds| any = try self.discoverGenericCallsInExpr(ds.expr, gmap),
+            .block => |b| any = try self.discoverGenericCallsInBlock(b, gmap),
+            .if_stmt => |is| {
+                if (try self.discoverGenericCallsInExpr(is.condition, gmap)) any = true;
+                if (try self.discoverGenericCallsInStmt(is.then_branch.*, gmap)) any = true;
+                if (is.else_branch) |eb| {
+                    if (try self.discoverGenericCallsInStmt(eb.*, gmap)) any = true;
+                }
+            },
+            .while_stmt => |ws| {
+                if (try self.discoverGenericCallsInExpr(ws.condition, gmap)) any = true;
+                if (try self.discoverGenericCallsInStmt(ws.body.*, gmap)) any = true;
+            },
+            .for_stmt => |fs| {
+                if (fs.initializer) |init| {
+                    if (try self.discoverGenericCallsInStmt(init.*, gmap)) any = true;
+                }
+                if (fs.condition) |c| {
+                    if (try self.discoverGenericCallsInExpr(c, gmap)) any = true;
+                }
+                if (fs.increment) |inc| {
+                    if (try self.discoverGenericCallsInExpr(inc, gmap)) any = true;
+                }
+                if (try self.discoverGenericCallsInStmt(fs.body.*, gmap)) any = true;
+            },
+            .switch_stmt => |ss| {
+                if (try self.discoverGenericCallsInExpr(ss.discriminant, gmap)) any = true;
+                for (ss.cases) |c| {
+                    if (try self.discoverGenericCallsInStmt(c.body.*, gmap)) any = true;
+                }
+                if (ss.default_case) |dc| {
+                    if (try self.discoverGenericCallsInStmt(dc.*, gmap)) any = true;
+                }
+            },
+            .return_stmt => |rs| if (rs.value) |v| {
+                any = try self.discoverGenericCallsInExpr(v, gmap);
+            },
+            else => {},
+        }
+        return any;
+    }
+
+    fn discoverGenericCallsInExpr(self: *LlvmCompiler, expr: ast.Expression, gmap: *const std.StringHashMap(ast.FunctionDecl)) anyerror!bool {
+        var any = false;
+        switch (expr.kind) {
+            .generic_call => |gc| {
+                if (gc.callee.kind == .ident) {
+                    if (gmap.get(gc.callee.kind.ident)) |callee_fd| {
+                        if (gc.type_args.len == callee_fd.type_params.len and gc.type_args.len > 0) {
+                            if (try self.registerGenericFnInst(callee_fd, gc.type_args)) any = true;
+                        }
+                    }
+                }
+                for (gc.args) |*a| {
+                    if (try self.discoverGenericCallsInExpr(a.*, gmap)) any = true;
+                }
+            },
+            .call => |c| {
+                for (c.args) |*a| {
+                    if (try self.discoverGenericCallsInExpr(a.*, gmap)) any = true;
+                }
+                if (try self.discoverGenericCallsInExpr(c.callee.*, gmap)) any = true;
+            },
+            .binary => |b| {
+                if (try self.discoverGenericCallsInExpr(b.left.*, gmap)) any = true;
+                if (try self.discoverGenericCallsInExpr(b.right.*, gmap)) any = true;
+            },
+            .unary => |u| any = try self.discoverGenericCallsInExpr(u.operand.*, gmap),
+            .field_access => |fa| any = try self.discoverGenericCallsInExpr(fa.object.*, gmap),
+            .index => |ix| {
+                if (try self.discoverGenericCallsInExpr(ix.object.*, gmap)) any = true;
+                if (try self.discoverGenericCallsInExpr(ix.index.*, gmap)) any = true;
+            },
+            .await_expr => |aw| any = try self.discoverGenericCallsInExpr(aw.operand.*, gmap),
+            .go_expr => |g| any = try self.discoverGenericCallsInExpr(g.operand.*, gmap),
+            .cast => |c| any = try self.discoverGenericCallsInExpr(c.expr.*, gmap),
+            .try_expr => |t| any = try self.discoverGenericCallsInExpr(t.*, gmap),
+            .nullish_coalesce => |nc| {
+                if (try self.discoverGenericCallsInExpr(nc.left.*, gmap)) any = true;
+                if (try self.discoverGenericCallsInExpr(nc.right.*, gmap)) any = true;
+            },
+            .if_expr => |ie| {
+                if (try self.discoverGenericCallsInExpr(ie.condition.*, gmap)) any = true;
+                if (try self.discoverGenericCallsInExpr(ie.then_branch.*, gmap)) any = true;
+                if (try self.discoverGenericCallsInExpr(ie.else_branch.*, gmap)) any = true;
+            },
+            .block_expr => |b| any = try self.discoverGenericCallsInBlock(b, gmap),
+            .tuple => |items| {
+                for (items) |*it| {
+                    if (try self.discoverGenericCallsInExpr(it.*, gmap)) any = true;
+                }
+            },
+            else => {},
+        }
+        return any;
+    }
+
+    // Render gc's type args under the current instance's subst; if all concrete, register the callee
+    // instance. Returns true if a NEW instance was added.
+    fn registerGenericFnInst(self: *LlvmCompiler, callee_fd: ast.FunctionDecl, type_args: []const ast.TypeRef) anyerror!bool {
+        const rendered = try self.allocator.alloc([]const u8, type_args.len);
+        defer {
+            for (rendered) |r| self.allocator.free(r);
+            self.allocator.free(rendered);
+        }
+        var all_concrete = true;
+        for (type_args, 0..) |ta, idx| {
+            rendered[idx] = try self.typeRefToString(ta);
+            // Still-abstract if the rendered arg is one of the callee's own type parameters (subst
+            // failed to resolve it), i.e. it names an unbound type variable rather than a real type.
+            for (callee_fd.type_params) |tp| {
+                if (std.mem.eql(u8, rendered[idx], tp)) all_concrete = false;
+            }
+        }
+        if (!all_concrete) return false;
+        return sema_mono.noteFreeFnInstStr(callee_fd.name, callee_fd.type_params, rendered);
     }
 
     pub fn collectStringLiterals(self: *LlvmCompiler, program: ast.Program) anyerror!void {
