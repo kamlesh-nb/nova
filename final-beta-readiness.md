@@ -56,6 +56,18 @@ Landed:
   `id<T>(x)` form always worked end to end, ownership included. The real gaps were in monomorphisation
   collection and call-site mangling, not ownership. What remains is a bare *inferred* nested call
   (`inner(x)` with no `<T>` inside a generic), which is a compile error, not a miscompile.
+- **A (value-optionals)** two fixes. Inserting a plain value into a `List<int | undefined>` crashed: the
+  read path unboxes but the insert path did not box, so a raw value was stored and later dereferenced as a
+  pointer. Fixed by boxing at the call argument, routing through the receiver's TypeId arguments (the
+  substituted parameter string drops `.optional`, so it could not see the value-optionality). `7a90915`
+- **S1 (the mongo cursor root cause)** `await`ing a value-optional returned the box pointer, not the value,
+  because the helper that decides whether a consuming `?? d` must unbox did not list `.await_expr`. One
+  line. This is the real `cursor.next` / `queryOne` corruption that `findList` only sidestepped. `62ca289`
+
+  On the rest of this cluster: the async scheduler defects (owned struct held across `await`, a generic
+  async method await hanging) did **not** reproduce in isolation and are ASAN-clean now, most likely fixed
+  as a side effect of the same-name-collision and free-generics work. A nested value-optional (`Map.get`
+  returning `(int | undefined) | undefined`) still crashes and is genuinely harder.
 
 Investigated and deferred, recorded rather than papered over:
 
