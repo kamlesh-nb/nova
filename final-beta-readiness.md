@@ -75,6 +75,18 @@ Landed:
   lowered the callee's return type in the **caller's** module scope. Fixed by lowering it in the callee's
   module (`moduleCallReturn`). No codegen change was needed. `6e1b977`
 
+- **S3 (colliding enums, an F2-6 item)** same-named enums in two modules collapsed to one: the checker's
+  exhaustiveness validated one module's switch against the other's variants (phantom errors), and codegen
+  keyed enums and enum methods by bare name, so construction, switch lowering and method dispatch resolved
+  to the wrong module's enum. Now enums are module-scoped end to end (sema collision detection + scoped
+  rendering + codegen keying and method mangling + per-reference scoped resolution), the same way structs
+  already were. `bfb341f`
+
+  Scope: struct and enum are now the module-scoped kinds. Traits stay bare (scoping them broke the
+  struct->trait return-widening check), and a same-named payload-enum construction across modules still
+  needs tagged-variant resolution work; both are narrower follow-ons that remain loud compile errors, not
+  silent corruption.
+
 Investigated and deferred, recorded rather than papered over:
 
 - `parseI64` on the `INT_MIN` string actually works (two two's-complement wraps cancel), so there was nothing
