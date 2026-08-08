@@ -48,7 +48,7 @@ Status legend: ✅ done · 🟢 built+validated (shadow agrees, not yet cut over
 | W8 | Cut `resolveExpressionTypeName` sites over to `typeOfExprConcrete`+scoped render | 🟡 | 66 call sites (expr 49 / llvm 12 / stmt 5 / arc 1 / types 1). Converted so far: struct field-offset (S2), enum construction+switch (S3), value-optional container | remaining ~60 sites, flip as W3/W5/W6 hit 0 |
 | W9 | Cut `typeRefToString` sites (drops `.optional` and scope) | 🟡 | 60 call sites. Known lossy: drops value-optional (fixed one path via TypeId in `List<int\|undefined>`), drops module scope (enums/structs now via `scopedTypeName`/`renderLegacy`) | audit each of 60; route through TypeId where identity matters |
 | W10 | Delete the string type path (`resolveExpressionTypeName`, lossy `typeRefToString`, `renderLegacy` as primary) | 🔴 | blocked on W7/W8/W9 reaching 0 | the deletion PR, once every consumer reads TypeId |
-| W11 | Codegen soundness fuzzer (gen well-typed → compile → ASAN → oracle) | 🔴 | `conformance/fuzz.sh` exists but is a **front-end crash fuzzer** (mutate → don't crash the compiler); it cannot catch a miscompile | build the typed generator + differential/oracle checker + wire into CI at ~1M programs |
+| W11 | Codegen soundness fuzzer (gen well-typed → compile → run → oracle) | 🟡 | **Landed** `conformance/codegen_fuzz.py` + `.sh`: generates well-typed int expressions, computes the exact answer with Nova's semantics (32-bit wrap, trunc div/mod, narrowing casts), compiles+runs, flags a MISCOMPILE on mismatch. **Teeth proven** (a wrong oracle is flagged); 120 programs/run, all match on the fixed compiler. Covers the H-cluster surface (arithmetic/cast). | broaden generator: comparisons/bool, `long`/mixed-width, then structs/generics/optionals/ownership (run under ASAN); wire into CI at scale |
 
 ## 3. What "finished" means, per milestone
 
@@ -60,7 +60,9 @@ Status legend: ✅ done · 🟢 built+validated (shadow agrees, not yet cut over
   the long tail of ~60+60 sites is mechanical but not yet swept.
 - **M-delete (W10)**: the string path is removed and cannot silently miscompile again. **Not started**
   (correctly gated behind M-cutover).
-- **M-fuzzer (W11)**: a generator proves the above holds over ~1M programs in CI. **Not started.**
+- **M-fuzzer (W11)**: a generator proves the above holds over many programs in CI. **Started** — a real
+  oracle fuzzer exists for the integer arithmetic/cast surface (the H-cluster), teeth-proven; broadening to
+  structs/generics/optionals/ownership-under-ASAN and CI-scale is the remaining work.
 
 ## 4. Ordered remaining work (the actual to-do)
 
