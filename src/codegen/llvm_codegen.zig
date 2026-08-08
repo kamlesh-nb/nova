@@ -652,8 +652,10 @@ pub const LlvmCompiler = struct {
         const tid = self.typeOfExprConcrete(e) orelse return false;
         if (self.valueOptionalInner(tid) == null) return false;
         return switch (e.kind) {
-
-            .ident, .field_access, .call, .generic_call, .index, .optional_chaining => true,
+            // `await f()` where f returns a value-optional yields the boxed representation, exactly like
+            // a plain call; without this a consuming `?? d` (or comparison) would treat the box pointer
+            // as the raw value and return garbage (silent corruption on every async optional API).
+            .ident, .field_access, .call, .generic_call, .index, .optional_chaining, .await_expr => true,
             else => false,
         };
     }
