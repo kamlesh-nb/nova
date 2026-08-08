@@ -1,0 +1,41 @@
+// H2: a narrowing integer cast (`long as int`, `int as byte`, `int as short`) must discard the
+// high bits, not silently keep the wider word. Previously the cast was a no-op in codegen, so a
+// narrowing `as` returned the untruncated value (silent corruption). Truncation now respects the
+// target width and its signedness (`byte`/`ubyte` unsigned, `sbyte`/`short`/`int`/`long` signed).
+import assert;
+
+@test
+fn test_long_to_int(): void {
+    let big: long = 4294967303;                 // 0x1_0000_0007
+    assert.equalInt(big as int, 7);
+}
+
+@test
+fn test_int_to_byte_unsigned(): void {
+    let x: int = 511;                            // low 8 bits = 0xFF
+    assert.equalInt((x as byte) as int, 255);    // byte is unsigned
+}
+
+@test
+fn test_int_to_sbyte_signed(): void {
+    let x: int = 511;                            // low 8 bits = 0xFF -> -1 signed
+    assert.equalInt((x as sbyte) as int, -1);
+}
+
+@test
+fn test_int_to_short(): void {
+    let x: int = 65537;                          // 0x1_0001 -> low 16 bits = 1
+    assert.equalInt((x as short) as int, 1);
+}
+
+@test
+fn test_long_to_short_negative(): void {
+    let x: long = 65535;                         // low 16 bits all set -> signed short = -1
+    assert.equalInt((x as short) as int, -1);
+}
+
+@test
+fn test_widening_is_identity(): void {
+    let x: int = 42;
+    assert.equalInt((x as long) as int, 42);     // widening unaffected
+}

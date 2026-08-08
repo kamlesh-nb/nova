@@ -3642,6 +3642,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 }
             }
 
+            var result = val;
             if (!self.is_wasm) {
                 const isFloatName = struct {
                     fn f(n: []const u8) bool {
@@ -3654,15 +3655,28 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 if (src_is_float and !target_is_float) {
 
                     const dbl = core.LLVMBuildBitCast(self.builder, val, core.LLVMDoubleType(), "cast_f2i_dbl");
-                    return core.LLVMBuildFPToSI(self.builder, dbl, self.val_type, "cast_f2i");
-                }
-                if (!src_is_float and target_is_float) {
+                    result = core.LLVMBuildFPToSI(self.builder, dbl, self.val_type, "cast_f2i");
+                    // fall through so `2.9 as byte` also gets narrowed to the byte width below
+                } else if (!src_is_float and target_is_float) {
 
                     const dbl = core.LLVMBuildSIToFP(self.builder, val, core.LLVMDoubleType(), "cast_i2f");
                     return core.LLVMBuildBitCast(self.builder, dbl, self.val_type, "cast_i2f_val");
                 }
+
+                // Narrowing integer cast: `long as int`, `int as byte`, `int as short` must discard
+                // the high bits, not silently keep the wider value. Values live in the i64 word, so
+                // truncate to the target integer width and re-extend by its signedness. Previously the
+                // cast was a no-op, so a narrowing `as` returned the untruncated word (silent corruption).
+                if (types_mod.cgPrim(target)) |p| {
+                    const is_int_repr = p.repr == .i8 or p.repr == .i16 or p.repr == .i32 or
+                        p.repr == .word or p.repr == .i64;
+                    if (is_int_repr) {
+                        const w = types_mod.reprBitWidth(p.repr);
+                        if (w < 64) result = self.canonicalizeInt(result, w, p.signed);
+                    }
+                }
             }
-            return val;
+            return result;
         },
         .await_expr => |aw| {
             return try self.buildAwait(aw);
