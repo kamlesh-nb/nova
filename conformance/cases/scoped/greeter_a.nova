@@ -1,0 +1,6 @@
+// Module A: trait Greeter + a struct implementing it (returns 111).
+pub trait Greeter { fn greet(self: Greeter): int; }
+pub struct HelloA impl Greeter { pub v: int, init() { self.v = 1; }
+    pub fn greet(self: HelloA): int { return 111; }
+}
+pub fn mkA(): Greeter { return HelloA(); }
