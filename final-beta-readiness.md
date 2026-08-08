@@ -24,6 +24,43 @@ ordering, heterogeneous lists, destructors) is sound. Monomorphisation identity 
 of the struct-collision bug). Most of the standard library round-trips correctly. So this is a strong engine
 with a well-defined set of holes, not a rotten foundation.
 
+## 0b. Fix progress (updated 2026-08-08, branch `fix/samename-type-resolution`)
+
+Executing the plan. Each fix followed repro-fails, fix, promote the repro to a conformance case, full corpus
+plus AddressSanitizer, commit.
+
+Landed:
+
+- **H1** `string + double` crashed (float-add path bit-cast the string pointer to a double). Fixed. `2cc3797`
+- **H5** float `!=` used ordered comparison, so `nan != nan` was false. Fixed to unordered. `85b348e`
+- **H2** a narrowing integer cast (`long as int`, `int as byte`) was a no-op, silently keeping the wide value.
+  Fixed to truncate by target width and signedness. The same change flushed out a latent reactor bug: the
+  `whenAny` primitives typed a heap address as `int` and relied on the old no-op, so they now take `long`.
+  `9756f7d`
+- **G1** a `Map` key of `0` was silently unretrievable (occupancy was inferred from `key == 0`). Replaced with
+  an explicit three-state slot array. `bbad50b`
+- **G2** a `switch` on an integer miscompiled (every case label collapsed to `0`); a `switch` on a string did
+  the same. Fixed integer switch to evaluate real labels, and the checker now rejects a non-enum, non-integer
+  discriminant. `29acad7`
+- **H** integer divide or modulo by zero, and the signed 64-bit `INT_MIN / -1` overflow, were silent
+  undefined behaviour. They now trap at runtime with a clear message. `9699959`
+
+Investigated and deferred, recorded rather than papered over:
+
+- `parseI64` on the `INT_MIN` string actually works (two two's-complement wraps cancel), so there was nothing
+  to fix there.
+- Payload-carrying enum `==` really does compare heap identity, not value. A checker rejection was inert
+  because the checker does not yet reliably track the type of an enum-valued local, so it has been left for a
+  proper fix (synthesised structural equality, or the type-tracking work in section 1). It is a real bug.
+- An integer literal above the `i64` range silently becomes `0` (the parser swallows the overflow). Rejecting
+  it needs parser diagnostic plumbing that does not exist yet.
+- A shift whose result type is left to inference (`let x = one << 63`) appears to truncate to 32 bits. A
+  separate inference issue.
+
+Deferred (larger, want a checkpoint before starting): the free-generics cluster (B1/B2/B3 share one root, see
+section 2), the structural async work and value-optionals (section 5, F1), and the codegen soundness fuzzer
+(section 5, the keystone).
+
 ## 1. Why these ship (the systemic root causes)
 
 **1a. No generative soundness testing.** `conformance/fuzz.sh` is a front-end crash fuzzer: it byte-mutates
