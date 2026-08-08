@@ -7,6 +7,13 @@ import assert;
 const TOMBSTONE_SIZE: int = 1;
 const LOAD_FACTOR_MAX: float = 0.75;
 
+// Per-slot state. Occupancy is tracked EXPLICITLY here rather than inferred from `key == 0`, so that
+// a value-type key of 0 (a legal `Map<int, V>` key) is not mistaken for an empty slot. The `slots`
+// byte array holds one of these for every bucket; allocZero leaves every slot EMPTY.
+const SLOT_EMPTY: int = 0;
+const SLOT_TOMBSTONE: int = 1;
+const SLOT_OCCUPIED: int = 2;
+
 fn allocZero(size: int): ptr {
     let ptr = bytes.alloc_persistent(size);
     let i = 0;
@@ -33,7 +40,7 @@ pub struct Map<K, V> {
 
     pub keys: Storage<K>,
     pub vals: Storage<V>,
-    pub tombstones: ptr,
+    pub slots: ptr,
     pub hashFn: (K) -> int,
 
     init(initialCap: int, hashFn: (K) -> int) {
@@ -43,7 +50,7 @@ pub struct Map<K, V> {
         self.len = 0;
         self.keys = Storage<K>(cap);
         self.vals = Storage<V>(cap);
-        self.tombstones = allocZero(cap);
+        self.slots = allocZero(cap);
         self.hashFn = hashFn;
     }
 
@@ -66,21 +73,20 @@ pub struct Map<K, V> {
         let firstTombstone = -1;
 
         while (true) {
-            let tomb = bytes.read_byte(self.tombstones, idx);
-            if (tomb == 1) {
+            let state = bytes.read_byte(self.slots, idx);
+            if (state == SLOT_EMPTY) {
+                let insertIdx = if (firstTombstone != -1) firstTombstone else idx;
+                self.keys.set(insertIdx, key);
+                self.vals.set(insertIdx, value);
+                bytes.write_byte(self.slots, insertIdx, SLOT_OCCUPIED);
+                self.len = self.len + 1;
+                return;
+            } else if (state == SLOT_TOMBSTONE) {
                 if (firstTombstone == -1) {
                     firstTombstone = idx;
                 }
             } else {
                 let curKey = self.keys.get(idx);
-                if (curKey == 0) {
-                    let insertIdx = if (firstTombstone != -1) firstTombstone else idx;
-                    self.keys.set(insertIdx, key);
-                    self.vals.set(insertIdx, value);
-                    bytes.write_byte(self.tombstones, insertIdx, 0);
-                    self.len = self.len + 1;
-                    return;
-                }
                 if (self.keysEqual(curKey, key)) {
                     self.vals.set(idx, value);
                     return;
@@ -92,7 +98,7 @@ pub struct Map<K, V> {
                 if (firstTombstone != -1) {
                     self.keys.set(firstTombstone, key);
                     self.vals.set(firstTombstone, value);
-                    bytes.write_byte(self.tombstones, firstTombstone, 0);
+                    bytes.write_byte(self.slots, firstTombstone, SLOT_OCCUPIED);
                     self.len = self.len + 1;
                     return;
                 }
@@ -113,12 +119,12 @@ pub struct Map<K, V> {
         let startIdx = idx;
 
         while (true) {
-            let tomb = bytes.read_byte(self.tombstones, idx);
-            if (tomb == 0) {
+            let state = bytes.read_byte(self.slots, idx);
+            if (state == SLOT_EMPTY) {
+                return undefined;
+            }
+            if (state == SLOT_OCCUPIED) {
                 let curKey = self.keys.get(idx);
-                if (curKey == 0) {
-                    return undefined;
-                }
                 if (self.keysEqual(curKey, key)) {
                     return self.vals.get(idx);
                 }
@@ -136,12 +142,12 @@ pub struct Map<K, V> {
             let idx = hash & (self.cap - 1);
             let startIdx = idx;
             while (true) {
-                let tomb = bytes.read_byte(self.tombstones, idx);
-                if (tomb == 0) {
+                let state = bytes.read_byte(self.slots, idx);
+                if (state == SLOT_EMPTY) {
+                    break;
+                }
+                if (state == SLOT_OCCUPIED) {
                     let curKey = self.keys.get(idx);
-                    if (curKey == 0) {
-                        break;
-                    }
                     if (self.keysEqual(curKey, key)) {
                         return self.vals.get(idx);
                     }
@@ -166,16 +172,16 @@ pub struct Map<K, V> {
         let startIdx = idx;
 
         while (true) {
-            let tomb = bytes.read_byte(self.tombstones, idx);
-            if (tomb == 0) {
+            let state = bytes.read_byte(self.slots, idx);
+            if (state == SLOT_EMPTY) {
+                return false;
+            }
+            if (state == SLOT_OCCUPIED) {
                 let curKey = self.keys.get(idx);
-                if (curKey == 0) {
-                    return false;
-                }
                 if (self.keysEqual(curKey, key)) {
                     self.keys.set(idx, 0);
                     self.vals.set(idx, 0);
-                    bytes.write_byte(self.tombstones, idx, 1);
+                    bytes.write_byte(self.slots, idx, SLOT_TOMBSTONE);
                     self.len = self.len - 1;
                     return true;
                 }
@@ -200,13 +206,11 @@ pub struct Map<K, V> {
         let ps = bytes.ptr_size();
         let i = 0;
         while (i < self.cap) {
-            let tomb = bytes.read_byte(self.tombstones, i);
-            if (tomb == 0) {
+            let state = bytes.read_byte(self.slots, i);
+            if (state == SLOT_OCCUPIED) {
                 let key = self.keys.get(i);
-                if (key != 0) {
-                    let val = self.vals.get(i);
-                    fn(key, val);
-                }
+                let val = self.vals.get(i);
+                fn(key, val);
             }
             i = i + 1;
         }
@@ -229,53 +233,49 @@ pub struct Map<K, V> {
         let oldCap = self.cap;
         let oldKeys = self.keys;
         let oldVals = self.vals;
-        let oldTombstones = self.tombstones;
+        let oldSlots = self.slots;
         let oldHashFn = self.hashFn;
 
         let newCap = oldCap * 2;
         let newKeys = Storage<K>(newCap);
         let newVals = Storage<V>(newCap);
-        let newTombstones = allocZero(newCap);
+        let newSlots = allocZero(newCap);
 
         let i = 0;
         while (i < oldCap) {
-            let tomb = bytes.read_byte(oldTombstones, i);
-            if (tomb == 0) {
+            let state = bytes.read_byte(oldSlots, i);
+            if (state == SLOT_OCCUPIED) {
                 let key = oldKeys.get(i);
-                if (key != 0) {
-                    let val = oldVals.get(i);
-                    let hash = (oldHashFn)(key);
-                    let idx = hash & (newCap - 1);
-                    while (true) {
-                        let nt = bytes.read_byte(newTombstones, idx);
-                        if (nt == 0) {
-                            let cur = newKeys.get(idx);
-                            if (cur == 0) {
-                                newKeys.set(idx, key);
-                                newVals.set(idx, val);
-                                bytes.write_byte(newTombstones, idx, 0);
-                                break;
-                            }
-                        }
-                        idx = (idx + 1) & (newCap - 1);
+                let val = oldVals.get(i);
+                let hash = (oldHashFn)(key);
+                let idx = hash & (newCap - 1);
+                // The new table has no tombstones yet, so probe for the first EMPTY slot.
+                while (true) {
+                    let ns = bytes.read_byte(newSlots, idx);
+                    if (ns == SLOT_EMPTY) {
+                        newKeys.set(idx, key);
+                        newVals.set(idx, val);
+                        bytes.write_byte(newSlots, idx, SLOT_OCCUPIED);
+                        break;
                     }
+                    idx = (idx + 1) & (newCap - 1);
                 }
             }
             i = i + 1;
         }
 
-        if (oldTombstones != 0) bytes.free(oldTombstones);
+        if (oldSlots != 0) bytes.free(oldSlots);
 
         self.cap = newCap;
         self.keys = newKeys;
         self.vals = newVals;
-        self.tombstones = newTombstones;
+        self.slots = newSlots;
     }
 
     fn delete(self: Map<K, V>): void {
-        if (self.tombstones != 0) {
-            bytes.free(self.tombstones);
-            self.tombstones = 0;
+        if (self.slots != 0) {
+            bytes.free(self.slots);
+            self.slots = 0;
         }
     }
 }

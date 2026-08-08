@@ -1,0 +1,63 @@
+// G1: a value-type key of 0 must be a legal `Map<int, V>` key. The map inferred slot occupancy from
+// `key == 0`, so an integer key of 0 was indistinguishable from an empty slot: get(0) returned
+// undefined, set(0) duplicate-inserted, delete_key(0) failed. Occupancy is now tracked explicitly in
+// a 3-state slot array (EMPTY/TOMBSTONE/OCCUPIED), so key 0 behaves like any other key.
+import assert;
+import map;
+import string;
+
+fn intHash(k: int): int { return k; }
+
+@test
+fn test_zero_key_get(): void {
+    let m = Map<int, int>(16, intHash);
+    m.set(0, 42);
+    m.set(7, 99);
+    assert.equalInt(2, m.size());
+    assert.equalInt(42, m.get(0) ?? -1);
+    assert.equalInt(99, m.get(7) ?? -1);
+    assert.isTrue(m.has(0));
+    assert.isFalse(m.has(123));
+}
+
+@test
+fn test_zero_key_overwrite(): void {
+    let m = Map<int, int>(16, intHash);
+    m.set(0, 1);
+    m.set(0, 2);
+    assert.equalInt(1, m.size());          // overwrite, not duplicate
+    assert.equalInt(2, m.get(0) ?? -1);
+}
+
+@test
+fn test_zero_key_delete(): void {
+    let m = Map<int, int>(16, intHash);
+    m.set(0, 5);
+    m.set(1, 6);
+    assert.isTrue(m.delete_key(0));
+    assert.isFalse(m.has(0));
+    assert.equalInt(1, m.size());
+    assert.equalInt(6, m.get(1) ?? -1);
+}
+
+@test
+fn test_zero_key_survives_resize(): void {
+    // Force several resizes with 0 present; it must survive rehashing.
+    let m = Map<int, int>(4, intHash);
+    m.set(0, 1000);
+    let i = 1;
+    while (i < 50) { m.set(i, i * 10); i = i + 1; }
+    assert.equalInt(1000, m.get(0) ?? -1);
+    assert.equalInt(490, m.get(49) ?? -1);
+    assert.equalInt(50, m.size());
+}
+
+@test
+fn test_string_keys_still_work(): void {
+    let m = Map<string, int>(16, string.hash);
+    m.set("alice", 1);
+    m.set("bob", 2);
+    assert.equalInt(1, m.get("alice") ?? -1);
+    assert.equalInt(2, m.get("bob") ?? -1);
+    assert.isFalse(m.has("carol"));
+}
