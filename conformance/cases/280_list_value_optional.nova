@@ -1,0 +1,37 @@
+// A (value-optionals in a container): inserting a plain value into a `List<int | undefined>` crashed.
+// The element type IS a value-optional (a present value is a heap box, `undefined` is 0), and the read
+// path (`at(i) ?? d`) correctly unboxes -- but the insert path did not box, so a raw value was stored
+// and the read dereferenced it as a pointer (SEGV). A plain value passed to a method parameter that,
+// for this receiver instance, resolves to a value-optional element is now boxed; `undefined` stays 0;
+// an already-boxed value-optional is left as is.
+import assert;
+import list;
+
+@test
+fn test_mixed_present_and_undefined(): void {
+    let xs = List<int | undefined>();
+    xs.push(7);
+    xs.push(undefined);
+    xs.push(9);
+    assert.equalInt(xs.size(), 3);
+    assert.equalInt(xs.at(0) ?? -1, 7);
+    assert.equalInt(xs.at(1) ?? -1, -1);   // undefined element
+    assert.equalInt(xs.at(2) ?? -1, 9);
+}
+
+@test
+fn test_all_present(): void {
+    let xs = List<int | undefined>();
+    let i = 0;
+    while (i < 5) { xs.push(i * 10); i = i + 1; }
+    assert.equalInt(xs.at(3) ?? -1, 30);
+}
+
+@test
+fn test_plain_int_list_unaffected(): void {
+    let xs = List<int>();
+    xs.push(1);
+    xs.push(2);
+    assert.equalInt(xs.at(0), 1);
+    assert.equalInt(xs.at(1), 2);
+}

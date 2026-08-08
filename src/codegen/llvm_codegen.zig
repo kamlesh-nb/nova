@@ -615,6 +615,39 @@ pub const LlvmCompiler = struct {
         return false;
     }
 
+    // Does a generic method's parameter (declared as the receiver struct's type parameter, e.g.
+    // `value: T` on `List<T>.push`) resolve, for THIS receiver instance, to a value-optional element
+    // type (`int | undefined`)? Routes through the receiver's TypeId arguments (which preserve
+    // optionality) rather than the substituted param string (typeRefToString drops `.optional`).
+    // `param_idx` is the call-argument index (self excluded).
+    pub fn methodParamIsValueOptional(self: *LlvmCompiler, recv_expr: *const ast.Expression, method_name: []const u8, param_idx: usize) bool {
+        const st = self.type_store orelse return false;
+        const recv_tid = self.typeOfExprConcrete(recv_expr) orelse return false;
+        const info = st.get(recv_tid);
+        if (info != .struct_) return false;
+        if (info.struct_.args.len == 0) return false;
+        const rendered = sema_shadow.renderLegacy(self.allocator, st, recv_tid) catch return false;
+        const base = getStructBaseName(rendered);
+        const sdecl = self.structs.get(base) orelse return false;
+        for (sdecl.methods) |m| {
+            if (!std.mem.eql(u8, m.decl.name, method_name)) continue;
+            // The method decl lists `self` as its first parameter; call arguments exclude it.
+            var off: usize = 0;
+            if (m.decl.params.len > 0 and std.mem.eql(u8, m.decl.params[0].name, "self")) off = 1;
+            const real_idx = off + param_idx;
+            if (real_idx >= m.decl.params.len) return false;
+            const ptr = m.decl.params[real_idx].type_name orelse return false;
+            if (ptr != .ident) return false;
+            for (sdecl.type_params, 0..) |tp, i| {
+                if (std.mem.eql(u8, tp, ptr.ident) and i < info.struct_.args.len) {
+                    return self.valueOptionalInner(info.struct_.args[i]) != null;
+                }
+            }
+            return false;
+        }
+        return false;
+    }
+
     pub fn exprYieldsValoptBox(self: *LlvmCompiler, e: *const ast.Expression) bool {
         const tid = self.typeOfExprConcrete(e) orelse return false;
         if (self.valueOptionalInner(tid) == null) return false;
@@ -1903,7 +1936,15 @@ pub const LlvmCompiler = struct {
                                 }
                             }
                         }
-
+                    }
+                    // Box a plain value being inserted into a value-optional element slot (`List<int |
+                    // undefined>.push(7)`), so the slot holds a box a later read can unbox rather than a
+                    // raw value it would dereference as a pointer. `undefined` stays 0 (a box holding 0
+                    // would read back as a present 0); an already-boxed value-optional is left as-is.
+                    if (!LlvmCompiler.isUndefinedLiteralExpr(arg) and !self.exprYieldsValoptBox(arg) and
+                        self.methodParamIsValueOptional(fa.object, fa.field, idx))
+                    {
+                        val = try self.buildValoptBox(self.coerceToSlotType(val, self.val_type));
                     }
                     args[idx + 1] = val;
                 }
