@@ -866,6 +866,18 @@ pub const TypeChecker = struct {
         }
     }
 
+    fn isSwitchableIntType(name: []const u8) bool {
+        const ints = [_][]const u8{
+            "int",   "uint",  "long",  "ulong", "short", "ushort", "byte", "ubyte", "sbyte",
+            "i8",    "i16",   "i32",   "i64",   "u8",    "u16",    "u32",  "u64",   "bool",
+            "char",
+        };
+        for (ints) |i| {
+            if (std.mem.eql(u8, name, i)) return true;
+        }
+        return false;
+    }
+
     fn checkSwitch(self: *TypeChecker, ss: ast.SwitchStmt) anyerror!void {
         const disc_type = self.resolveExprType(ss.discriminant) orelse return;
 
@@ -945,6 +957,12 @@ pub const TypeChecker = struct {
                             self.addError(ss.span, "Enum variant '{s}.{s}' not handled in switch statement", .{ enum_name, name });
                         }
                     }
+                } else if (!isSwitchableIntType(enum_name)) {
+                    // A switch lowers to an LLVM integer switch, so only enums and integer types are
+                    // valid discriminants. Strings/floats/structs used to compile to garbage (every
+                    // case label collapsed to 0 -> a "duplicate switch case" verifier crash or the
+                    // wrong branch). Reject them loudly instead.
+                    self.addError(ss.span, "switch discriminant must be an enum or integer type, got '{s}' — use if/else chains for strings and other types", .{enum_name});
                 }
             },
             else => {},

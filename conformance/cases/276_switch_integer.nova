@@ -1,0 +1,58 @@
+// G2: a switch over an integer discriminant must lower to a real integer switch. Previously the case
+// labels were only evaluated when the discriminant type was unknown; a discriminant with a known
+// integer type (`int`, `long`, ...) fell through with EVERY case label collapsed to 0, producing a
+// "duplicate switch case" LLVM verifier crash (or the wrong branch). Now integer literal labels
+// (including negative ones via unary `-`) are evaluated correctly. Enum switch is unaffected.
+import assert;
+
+fn classify(n: int): string {
+    switch (n) {
+        case 1: { return "one"; }
+        case 2: { return "two"; }
+        case 3: { return "three"; }
+    }
+    return "other";
+}
+
+fn sign(n: long): int {
+    switch (n) {
+        case -1: { return -10; }
+        case 0: { return 0; }
+        case 1: { return 10; }
+    }
+    return 99;
+}
+
+@test
+fn test_switch_int(): void {
+    assert.equalStr(classify(1), "one");
+    assert.equalStr(classify(2), "two");
+    assert.equalStr(classify(3), "three");
+    assert.equalStr(classify(9), "other");
+}
+
+@test
+fn test_switch_long_negative(): void {
+    assert.equalInt(sign(-1), -10);
+    assert.equalInt(sign(0), 0);
+    assert.equalInt(sign(1), 10);
+    assert.equalInt(sign(42), 99);
+}
+
+// Enum switch still works alongside the integer path.
+enum Color { Red, Green, Blue }
+
+fn name(c: Color): string {
+    switch (c) {
+        case Color.Red: { return "red"; }
+        case Color.Green: { return "green"; }
+        case Color.Blue: { return "blue"; }
+    }
+    return "?";
+}
+
+@test
+fn test_switch_enum_still_works(): void {
+    assert.equalStr(name(Color.Red), "red");
+    assert.equalStr(name(Color.Blue), "blue");
+}

@@ -585,9 +585,11 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
                 }
 
                 for (c.values) |val_expr| {
-                    var case_val: u32 = 0;
+                    var case_val: u64 = 0;
+                    var resolved_enum = false;
                     if (discr_type_name_opt) |dt| {
                         if (self.enums.get(dt)) |enum_decl| {
+                            resolved_enum = true;
                             var variant_name: ?[]const u8 = null;
                             switch (val_expr.kind) {
                                 .field_access => |fa| variant_name = fa.field,
@@ -603,15 +605,27 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
                                 for (enum_decl.variants, 0..) |v, idx| {
                                     if (std.mem.eql(u8, v.name, vn)) {
                                         const val = v.value orelse @as(i64, @intCast(idx));
-                                        case_val = @intCast(val);
+                                        case_val = @bitCast(val);
                                         break;
                                     }
                                 }
                             }
                         }
-                    } else {
-                        if (val_expr.kind == .literal and val_expr.kind.literal == .integer) {
-                            case_val = @intCast(val_expr.kind.literal.integer);
+                    }
+                    // Non-enum discriminant (int/long/short/byte/...): evaluate the integer literal case
+                    // label, supporting a negative label via unary `-`. Previously the tag was only
+                    // computed when the discriminant type was unknown (null), so a known integer type
+                    // fell through with every case label left at 0 -> duplicate switch cases / wrong branch.
+                    if (!resolved_enum) {
+                        var neg = false;
+                        var lit = val_expr.kind;
+                        if (val_expr.kind == .unary and val_expr.kind.unary.op == .neg) {
+                            neg = true;
+                            lit = val_expr.kind.unary.operand.*.kind;
+                        }
+                        if (lit == .literal and lit.literal == .integer) {
+                            const iv: i64 = @intCast(lit.literal.integer);
+                            case_val = @bitCast(if (neg) -iv else iv);
                         }
                     }
 
