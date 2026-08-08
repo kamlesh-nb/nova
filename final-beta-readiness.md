@@ -5,6 +5,56 @@ runtime, and standard library. Every defect below was reproduced by compiling an
 (usually under AddressSanitizer) or confirmed by reading the exact code path with a file:line citation.
 Claims taken on trust from prior docs were re-checked; several were stale in both directions.
 
+## Master tracking table (status at a glance)
+
+Updated 2026-08-08 (branch `fix/samename-type-resolution`). Legend: ✅ fixed + gated (conformance case +
+full corpus + ASAN green) · 🔵 investigated, not a live bug (recorded, no fix needed) · 🟡 in progress ·
+⬜ open / deferred. Severity: **S-crit** silent corruption/unsafety · **crash** · **wrong** silent wrong
+answer · **blk** does not compile/link · **gap** missing feature.
+
+**Score: 16 defect IDs fixed, 3 investigated-not-a-bug, ~18 open/deferred. Every fix is repro-first with a
+gating case (273–285) and stays corpus + ASAN green.**
+
+| ID | Cluster | Sev | Status | Commit / note |
+|----|---------|-----|--------|---------------|
+| H1 | H numeric | crash | ✅ | `2cc3797` string+float concat crash |
+| H5 | H numeric | wrong | ✅ | `85b348e` `nan != nan` (ordered→unordered), case 273 |
+| H2 | H numeric | S-crit | ✅ | `9756f7d` narrowing cast truncates; flushed a latent reactor ptr bug, case 274 |
+| H3 | H numeric | wrong | ✅ | `9699959` int div/mod by zero traps, case 277 |
+| H6 | H numeric | wrong | ✅ | `9699959` `INT_MIN / -1` overflow traps (same fix) |
+| G1 | G stdlib | wrong | ✅ | `bbad50b` Map key 0 (3-state slots), case 275 |
+| G2 | G stdlib | S-crit | ✅ | `29acad7` int switch lowers; checker rejects non-enum/int, case 276 + expect_fail |
+| B1 | B generics | blk | ✅ | `cc146ba` free-fn inference + solved-arg record, case 278 |
+| B3 | B generics | S-crit | ✅ | `cc146ba` owned generic return (same root as B1) |
+| B2 | B generics | blk | ✅ | `192f374` transitive generic composition, case 279 |
+| A1 | A value-opt | S-crit | ✅ | `62ca289` await of value-optional = box ptr (the mongo cursor root), case 281 |
+| A2 | A value-opt | crash | ✅ | `7a90915` `List<int\|undefined>` insert-box, case 280 |
+| A3 | A value-opt | wrong | ✅ | `7a90915` (same fix — read path already unboxed) |
+| C1 | C module-scope | S-crit | ✅ | `6e1b977` colliding-struct field access — was a SEMA return-type-scope bug, case 282 |
+| C2 | C module-scope | S-crit | ✅ | enums `bfb341f`+`87379e6` (plain+payload), cases 283/284 |
+| C2 | C module-scope (traits) | S-crit | 🔵 | `58257f9` traits already coexist (per-impl vtable); false alarm; case 285. Unions: not a functional construct |
+| E1 | E async | hang | 🔵 | did not reproduce in isolation; ASAN-clean — likely subsumed by C/B fixes |
+| E2/S7 | E async | S-crit | 🔵 | owned-struct-across-await did not reproduce; ASAN-clean now |
+| G4 | G stdlib | wrong | 🔵 (partial) | `parseI64` i64-MIN actually works (double wrap); non-digit/overflow parts still open |
+| A4 | A value-opt | wrong | ⬜ | interpolating a non-narrowed value-optional prints box ptr (footgun) |
+| A-nested | A value-opt | crash | ⬜ | `Map.get` returning `(int\|undefined)\|undefined` (nested optional) |
+| B4 | B generics | blk | ⬜ | `Set<T>` link fail (`_Map_keysEqual`) |
+| B5 | B generics | crash | ⬜ | generic `struct impl Trait` via trait object vtable |
+| B6 | B generics | blk | ⬜ | generic `async fn` cannot resolve `serde.bind<T>` |
+| D1/D2/D3 | D erased carriers | S-crit | ⬜ | `any` owning-heap UAF; any-downcast double-free; unchecked trait→concrete `as` |
+| E3 | E async | crash | ⬜ | reap-mark not cleared for awaited children (latent) |
+| F1 | F enum/union | crash | ⬜ | `T\|E\|undefined` value-arm SEGV |
+| F2 | F enum/union | wrong | ⬜ | payload-enum `==` = identity not value (real bug; checker can't track enum-local type yet) |
+| F3 | F enum/union | wrong | ⬜ | `switch` over error-union falls through |
+| G3 | G stdlib | S-crit | ⬜ | JSON `\uXXXX` surrogate-pair astral corruption |
+| G5 | G stdlib | wrong | ⬜ | `try` propagates mismatched error type |
+| H4 | H numeric | wrong | ⬜ | decimal >34 digits truncate not round-half-even |
+| lit-i64 | H numeric | wrong | ⬜ | integer literal above i64 range silently → 0 (parser diag plumbing needed) |
+| shift-infer | H numeric | wrong | ⬜ | `let x = one << 63` shift-result inferred 32-bit |
+| I | parser gaps | gap | ⬜ | sci-notation, `_` separators, tuple-payload, guards, while-let, `?.`-method, if-expr-in-interp, where-constraints, trait default bodies |
+| F4 | keystone | — | 🟡 | codegen soundness fuzzer STARTED (`3769458` `conformance/codegen_fuzz.py`, teeth-proven, int arith/cast) |
+| F2-6 | keystone | — | 🟡 | typed IR BUILT + shadow-validated (6723 agree / 0 disagree); tracker `docs/design/f2-6-keystone-tracking.md` |
+
 ## 0. Honest verdict
 
 Nova is a **broad, genuinely capable alpha**, not a beta. The breadth is real: a self-hosted async runtime on
