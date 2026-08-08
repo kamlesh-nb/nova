@@ -1715,6 +1715,8 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 .div => {
 
                     const unsigned = if (iop) |k| !k.signed else false;
+                    const width: u32 = if (iop) |k| k.width else 64;
+                    self.emitIntDivGuard(l_val, r_val, !unsigned, width, "integer division by zero", "integer division overflow (INT_MIN / -1)");
                     return if (unsigned)
                         core.LLVMBuildUDiv(self.builder, l_val, r_val, "udivtmp")
                     else
@@ -1722,6 +1724,8 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 },
                 .mod => {
                     const unsigned = if (iop) |k| !k.signed else false;
+                    const width: u32 = if (iop) |k| k.width else 64;
+                    self.emitIntDivGuard(l_val, r_val, !unsigned, width, "integer modulo by zero", "integer modulo overflow (INT_MIN % -1)");
                     return if (unsigned)
                         core.LLVMBuildURem(self.builder, l_val, r_val, "uremtmp")
                     else
@@ -3723,6 +3727,43 @@ fn intOpKind(left_name: ?[]const u8, right_name: ?[]const u8) ?IntOpKind {
 fn isWideIntTypeName(n: []const u8) bool {
     return std.mem.eql(u8, n, "long") or std.mem.eql(u8, n, "ulong") or
         std.mem.eql(u8, n, "i64") or std.mem.eql(u8, n, "u64");
+}
+
+// Emit `if (cond) nova_panic_cstr(msg)` inline, leaving the builder in the continuation block.
+pub fn emitTrapIf(self: *LlvmCompiler, cond: types.LLVMValueRef, msg: [:0]const u8) void {
+    const cur_fn = core.LLVMGetBasicBlockParent(core.LLVMGetInsertBlock(self.builder));
+    const panic_bb = core.LLVMAppendBasicBlock(cur_fn, "trap_panic");
+    const cont_bb = core.LLVMAppendBasicBlock(cur_fn, "trap_ok");
+    _ = core.LLVMBuildCondBr(self.builder, cond, panic_bb, cont_bb);
+
+    core.LLVMPositionBuilderAtEnd(self.builder, panic_bb);
+    const cstr = core.LLVMBuildGlobalString(self.builder, msg.ptr, "trap_msg");
+    const cstr_ptr = core.LLVMBuildBitCast(self.builder, cstr, self.ptr_type, "trap_msg_ptr");
+    if (self.func_map.get("nova_panic_cstr")) |pf| {
+        const pt = core.LLVMGlobalGetValueType(pf);
+        var args = [_]types.LLVMValueRef{cstr_ptr};
+        _ = core.LLVMBuildCall2(self.builder, pt, pf, &args, 1, "");
+    }
+    _ = core.LLVMBuildUnreachable(self.builder);
+
+    core.LLVMPositionBuilderAtEnd(self.builder, cont_bb);
+}
+
+pub fn emitIntDivGuard(self: *LlvmCompiler, l_val: types.LLVMValueRef, r_val: types.LLVMValueRef, signed: bool, width: u32, zero_msg: [:0]const u8, ovf_msg: [:0]const u8) void {
+    const zero = core.LLVMConstInt(self.val_type, 0, 0);
+    const is_zero = core.LLVMBuildICmp(self.builder, types.LLVMIntPredicate.LLVMIntEQ, r_val, zero, "div_zero");
+    self.emitTrapIf(is_zero, zero_msg);
+
+    if (signed and width >= 64) {
+        // Signed 64-bit i64 MIN / -1 overflows the machine op (UB). Narrower signed ops run at the
+        // i64 word so they cannot overflow the op; their result wraps on canonicalize (defined).
+        const imin = core.LLVMConstInt(self.val_type, @bitCast(@as(i64, std.math.minInt(i64))), 0);
+        const neg1 = core.LLVMConstInt(self.val_type, @bitCast(@as(i64, -1)), 0);
+        const l_is_min = core.LLVMBuildICmp(self.builder, types.LLVMIntPredicate.LLVMIntEQ, l_val, imin, "div_lmin");
+        const r_is_neg1 = core.LLVMBuildICmp(self.builder, types.LLVMIntPredicate.LLVMIntEQ, r_val, neg1, "div_rneg1");
+        const ovf = core.LLVMBuildAnd(self.builder, l_is_min, r_is_neg1, "div_ovf");
+        self.emitTrapIf(ovf, ovf_msg);
+    }
 }
 
 pub fn canonicalizeInt(self: *LlvmCompiler, val: types.LLVMValueRef, width: u32, signed: bool) types.LLVMValueRef {

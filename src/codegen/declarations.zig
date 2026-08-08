@@ -314,6 +314,11 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         const panic_fn = core.LLVMAddFunction(compiler.module, "nova_panic", core.LLVMFunctionType(compiler.void_type, &one_param_ptr, 1, 0));
         try compiler.func_map.put("nova_panic", panic_fn);
 
+        // nova_panic_cstr takes a plain C string (not a Nova string with an ARC header). Used by
+        // codegen to emit runtime traps such as integer division by zero.
+        const panic_cstr_fn = core.LLVMAddFunction(compiler.module, "nova_panic_cstr", core.LLVMFunctionType(compiler.void_type, &one_param_ptr, 1, 0));
+        try compiler.func_map.put("nova_panic_cstr", panic_cstr_fn);
+
         const test_begin_type = core.LLVMFunctionType(compiler.void_type, &one_param_ptr, 1, 0);
         const test_begin_fn = core.LLVMAddFunction(compiler.module, "nova_test_begin", test_begin_type);
         try compiler.func_map.put("nova_test_begin", test_begin_fn);
