@@ -5,20 +5,26 @@
 # runs each, and reports a MISCOMPILE when the program's answer differs from the oracle -- the class of
 # bug fuzz.sh cannot see.
 #
-# Coverage: `int` (i32) and `long` (i64) arithmetic (+ - * / % & | << >>) with two's-complement wrap,
-# truncate-toward-zero divide/modulo, narrowing-then-widening casts, and the six comparison operators
-# (== != < > <= >=). Two program shapes: a value assertion (`assert.equalInt`) and a boolean assertion
-# (`assert.isTrue`/`isFalse` on a comparison) -- the boolean shape also value-checks `long` without
-# emitting a 64-bit oracle literal.
+# Coverage:
+#   - int (i32) and long (i64) arithmetic (+ - * / % & | << >>) with two's-complement wrap,
+#     truncate-toward-zero divide/modulo, narrowing-then-widening casts, and the six comparisons.
+#   - STRUCTS: a generated struct with int/long fields is constructed with known values, its fields are
+#     read back and combined -> exercises field-offset codegen and struct lifecycle (cluster C).
+#   - GENERICS: a generic box `Box<T>`, a free generic fn `id<T>` called both explicitly (`id<int>(x)`)
+#     and via inference (`id(x)`), and generic composition (`outer<T>` calling `inner<T>`) -> exercises
+#     monomorphisation, free-fn inference and cross-generic instantiation (cluster B). T in {int, long}.
+#
+# The value is always ultimately an int/long/bool checked against the oracle, so structs and generics are
+# validated by round-tripping known values through them.
 #
 #   conformance/codegen_fuzz.py [--n N] [--seed S] [--keep]
 #
 # Exit non-zero and keep the offending .nova under fuzz-artifacts/ on the first miscompile or unexpected
 # compile error (the program is well-typed, so it MUST compile and run).
 #
-# Deliberately avoided (they are separately-tracked OPEN items, not what this fuzzer targets, and would be
-# false positives): divide/modulo by zero and i64 MIN / -1 (both now trap by design); integer literals at
-# the i64 boundary (a known lexer bug); an unannotated `<< 63` (a known shift-result-inference bug).
+# Deliberately avoided (separately-tracked OPEN items, would be false positives): divide/modulo by zero
+# and i64 MIN / -1 (both trap by design); i64-boundary integer literals (a lexer bug); an unannotated
+# `<< 63` (a shift-result-inference bug).
 import argparse
 import os
 import random
@@ -27,8 +33,8 @@ import sys
 import tempfile
 
 I32_MIN, I32_MAX = -(2**31), 2**31 - 1
-# Keep long leaf literals well inside the i64 range to dodge the known i64-boundary lexer bug.
-LONG_LIT_LIM = 2**60
+LONG_LIT_LIM = 2**60          # keep long leaf literals inside i64 to dodge the boundary lexer bug
+CMP = ["==", "!=", "<", ">", "<=", ">="]
 
 
 def wrap(v, bits):
@@ -39,33 +45,33 @@ def wrap(v, bits):
 
 
 def tdiv(a, b):
-    """Truncate-toward-zero division (Nova / on int/long), matching LLVM sdiv."""
     q = abs(a) // abs(b)
     return -q if (a < 0) != (b < 0) else q
 
 
 def tmod(a, b):
-    """Remainder with the sign of the dividend (Nova %), matching srem."""
     return a - tdiv(a, b) * b
-
-
-CMP = ["==", "!=", "<", ">", "<=", ">="]
 
 
 def cmp_eval(op, a, b):
     return {"==": a == b, "!=": a != b, "<": a < b, ">": a > b, "<=": a <= b, ">=": a >= b}[op]
 
 
+def lit_src(v, typ):
+    """A literal source for value `v` of type `typ`. Long literals are pinned `as long` so a sub-op is
+    never silently 32-bit (a bare small literal defaults to int)."""
+    s = f"({v})" if v < 0 else str(v)
+    return f"({s} as long)" if typ == "long" else s
+
+
 class Gen:
-    def __init__(self, rnd, nvars, typ):
+    """Builds an int/long expression tree over a fixed set of named leaves (name -> known value)."""
+
+    def __init__(self, rnd, typ, varmap):
         self.rnd = rnd
-        self.typ = typ                      # "int" or "long"
+        self.typ = typ
         self.bits = 32 if typ == "int" else 64
-        lim = I32_MAX if typ == "int" else LONG_LIT_LIM
-        self.vars = {}
-        for i in range(nvars):
-            v = rnd.randint(-lim - (1 if typ == "int" else 0), lim)
-            self.vars[f"v{i}"] = self.wrapT(v)
+        self.vars = dict(varmap)
 
     def wrapT(self, v):
         return wrap(v, self.bits)
@@ -73,28 +79,21 @@ class Gen:
     def _lit(self):
         r = self.rnd
         if self.typ == "int":
-            choices = [r.randint(-50, 50), r.randint(-1000, 1000), I32_MIN, I32_MAX, -1, 0, 1,
-                       r.randint(I32_MIN, I32_MAX)]
+            pool = [r.randint(-50, 50), r.randint(-1000, 1000), I32_MIN, I32_MAX, -1, 0, 1,
+                    r.randint(I32_MIN, I32_MAX)]
         else:
-            choices = [r.randint(-50, 50), r.randint(-1000, 1000), -1, 0, 1,
-                       r.randint(-LONG_LIT_LIM, LONG_LIT_LIM)]
-        return self.wrapT(r.choice(choices))
+            pool = [r.randint(-50, 50), r.randint(-1000, 1000), -1, 0, 1,
+                    r.randint(-LONG_LIT_LIM, LONG_LIT_LIM)]
+        return self.wrapT(r.choice(pool))
 
     def expr(self, depth):
-        """Return (nova_source, oracle_value) for an expression of type self.typ."""
         r = self.rnd
         if depth <= 0 or r.random() < 0.35:
-            if self.vars and r.random() < 0.5:
+            if self.vars and r.random() < 0.55:
                 name = r.choice(list(self.vars))
                 return name, self.vars[name]
             lit = self._lit()
-            src = f"({lit})" if lit < 0 else str(lit)
-            # A bare small literal defaults to `int` in Nova. In a `long` expression that would make a
-            # sub-operation 32-bit (e.g. a shift by >= 32 becomes UB) and diverge from the 64-bit oracle,
-            # so pin every literal leaf to the expression's type.
-            if self.typ == "long":
-                src = f"({src} as long)"
-            return src, lit
+            return lit_src(lit, self.typ), lit
 
         op = r.choice(["+", "-", "*", "/", "%", "&", "|", "<<", ">>"])
         la, lv = self.expr(depth - 1)
@@ -107,27 +106,23 @@ class Gen:
         elif op == "*":
             val = self.wrapT(lv * rv)
         elif op in ("/", "%"):
-            # Avoid the trapping cases (÷0, and long i64 MIN / -1). Replacing a -1 divisor with 1 is enough
-            # to sidestep the overflow, and forcing nonzero sidesteps the div-by-zero trap.
             if rv == 0 or (self.typ == "long" and rv == -1):
-                ra, rv = "1", 1
+                ra, rv = lit_src(1, self.typ), 1
             val = self.wrapT(tdiv(lv, rv) if op == "/" else tmod(lv, rv))
         elif op == "&":
             val = self.wrapT(lv & rv)
         elif op == "|":
             val = self.wrapT(lv | rv)
         elif op == "<<":
-            sh = rv & (self.bits - 1)       # masked, defined 0..bits-1
-            ra = str(sh)
-            val = self.wrapT(lv << sh)
-        else:  # ">>"
             sh = rv & (self.bits - 1)
             ra = str(sh)
-            val = self.wrapT(lv >> sh)      # arithmetic shift (Python >> on a signed int)
+            val = self.wrapT(lv << sh)
+        else:
+            sh = rv & (self.bits - 1)
+            ra = str(sh)
+            val = self.wrapT(lv >> sh)
 
         src = f"({la} {op} {ra})"
-
-        # Occasionally narrow-then-widen back to self.typ (exercises the H2 cast path at both widths).
         if r.random() < 0.3:
             kind, kbits, signed = r.choice(
                 [("byte", 8, False), ("sbyte", 8, True), ("short", 16, True), ("ushort", 16, False)])
@@ -138,28 +133,101 @@ class Gen:
         return src, val
 
 
-def make_program(rnd, nvars, typ):
-    gen = Gen(rnd, nvars, typ)
-    lines = ["import assert;", "", "@test", "fn t(): void {"]
-    for name, v in gen.vars.items():
-        lit = f"({v})" if v < 0 else str(v)
-        lines.append(f"    let {name}: {typ} = {lit};")
+def rand_val(rnd, typ):
+    lim = I32_MAX if typ == "int" else LONG_LIT_LIM
+    lo = I32_MIN if typ == "int" else -LONG_LIT_LIM
+    return wrap(rnd.randint(lo, lim), 32 if typ == "int" else 64)
 
-    # int values are checkable directly; long (and half the int cases) are checked via a comparison,
-    # which needs no 64-bit oracle literal.
+
+# ---- templates: each returns (top_decls, setup_lets, varmap) whose leaves have known values ----
+
+def tmpl_plain(rnd, typ):
+    lets, varmap = [], {}
+    for i in range(3):
+        v = rand_val(rnd, typ)
+        lets.append(f"    let v{i}: {typ} = {lit_src(v, typ)};")
+        varmap[f"v{i}"] = v
+    return [], lets, varmap
+
+
+def tmpl_struct(rnd, typ):
+    k = rnd.randint(2, 4)
+    fields = [f"f{i}" for i in range(k)]
+    vals = [rand_val(rnd, typ) for _ in range(k)]
+    field_decls = ", ".join(f"pub {f}: {typ}" for f in fields)
+    assigns = " ".join(f"self.{f} = a{i};" for i, f in enumerate(fields))
+    params = ", ".join(f"a{i}: {typ}" for i in range(k))
+    decl = [f"struct S {{ {field_decls}, init({params}) {{ {assigns} }} }}"]
+    args = ", ".join(lit_src(v, typ) for v in vals)
+    lets = [f"    let s = S({args});"]
+    varmap = {f"s.{f}": v for f, v in zip(fields, vals)}
+    return decl, lets, varmap
+
+
+def tmpl_gbox(rnd, typ):
+    # Generic box round-trip: the value must survive construction + field read at the concrete T.
+    val = rand_val(rnd, typ)
+    decl = ["struct Box<T> { pub v: T, init(x: T) { self.v = x; } }"]
+    lets = [f"    let b = Box<{typ}>({lit_src(val, typ)});"]
+    varmap = {"b.v": val}
+    # add a plain var too for richer expressions
+    v = rand_val(rnd, typ)
+    lets.append(f"    let w: {typ} = {lit_src(v, typ)};")
+    varmap["w"] = v
+    return decl, lets, varmap
+
+
+def tmpl_gfn(rnd, typ):
+    # Free generic fn. Explicit form uses a typed let; inference form drops the annotation (both compile).
+    # NOTE: `let g: T = ident(v)` -- inference INTO a typed let -- is a separate open checker gap, avoided.
+    val = rand_val(rnd, typ)
+    decl = ["fn ident<T>(x: T): T { return x; }"]
+    if rnd.random() < 0.5:
+        lets = [f"    let g = ident({lit_src(val, typ)});"]          # inference, no annotation (B1)
+    else:
+        lets = [f"    let g: {typ} = ident<{typ}>({lit_src(val, typ)});"]  # explicit type args
+    varmap = {"g": val}
+    return decl, lets, varmap
+
+
+def tmpl_gcompose(rnd, typ):
+    # Generic composition: outer<T> forwards its type param to inner<T> (exercises B2). Explicit args.
+    val = rand_val(rnd, typ)
+    decl = [
+        "fn inner<T>(x: T): T { return x; }",
+        "fn outer<T>(x: T): T { return inner<T>(x); }",
+    ]
+    lets = [f"    let g: {typ} = outer<{typ}>({lit_src(val, typ)});"]
+    varmap = {"g": val}
+    return decl, lets, varmap
+
+
+TEMPLATES = [tmpl_plain, tmpl_plain, tmpl_struct, tmpl_gbox, tmpl_gfn, tmpl_gcompose]
+
+
+def make_program(rnd):
+    typ = rnd.choice(["int", "long"])
+    top_decls, setup_lets, varmap = rnd.choice(TEMPLATES)(rnd, typ)
+    gen = Gen(rnd, typ, varmap)
+
+    lines = ["import assert;", ""]
+    lines += top_decls
+    if top_decls:
+        lines.append("")
+    lines += ["@test", "fn t(): void {"]
+    lines += setup_lets
+
     if typ == "int" and rnd.random() < 0.5:
         src, oracle = gen.expr(4)
         lines.append(f"    assert.equalInt({src}, {oracle});")
     else:
         la, lv = gen.expr(4)
-        # Bias toward operands that can actually be equal, so ==/<=/>= exercise their true branch.
         if rnd.random() < 0.4:
-            ra, rv = la, lv                 # identical operand -> == true, != false
+            ra, rv = la, lv
         else:
             ra, rv = gen.expr(4)
         op = rnd.choice(CMP)
-        truth = cmp_eval(op, lv, rv)
-        assertion = "isTrue" if truth else "isFalse"
+        assertion = "isTrue" if cmp_eval(op, lv, rv) else "isFalse"
         lines.append(f"    assert.{assertion}({la} {op} {ra});")
 
     lines.append("}")
@@ -170,7 +238,6 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=int(os.environ.get("NOVA_CGFUZZ_N", "200")))
     ap.add_argument("--seed", type=int, default=int(os.environ.get("NOVA_CGFUZZ_SEED", "1")))
-    ap.add_argument("--nvars", type=int, default=3)
     ap.add_argument("--keep", action="store_true")
     args = ap.parse_args()
 
@@ -181,8 +248,7 @@ def main():
     passed = 0
     for i in range(args.n):
         rnd = random.Random(args.seed + i)
-        typ = rnd.choice(["int", "long"])
-        prog = make_program(rnd, args.nvars, typ)
+        prog = make_program(rnd)
         with tempfile.NamedTemporaryFile("w", suffix=".nova", delete=False) as f:
             path = f.name
             f.write(prog)
@@ -196,8 +262,7 @@ def main():
                 with open(keep, "w") as kf:
                     kf.write(prog)
                 sys.stderr.write(
-                    f"\nMISCOMPILE at seed {args.seed + i} ({typ}, saved {keep}):\n{prog}\n"
-                    f"--- output ---\n{out}\n")
+                    f"\nMISCOMPILE at seed {args.seed + i} (saved {keep}):\n{prog}\n--- output ---\n{out}\n")
                 sys.exit(1)
             passed += 1
         finally:
@@ -210,7 +275,7 @@ def main():
             print(f"  {i + 1}/{args.n} ok")
 
     print(f"codegen_fuzz: {passed}/{args.n} programs matched the oracle "
-          f"(seed {args.seed}, int+long, arith/cast/compare).")
+          f"(seed {args.seed}, int+long, arith/cast/compare/struct/generic).")
 
 
 if __name__ == "__main__":

@@ -51,6 +51,7 @@ gating case (273–285) and stays corpus + ASAN green.**
 | H4 | H numeric | wrong | ⬜ | decimal >34 digits truncate not round-half-even |
 | lit-i64 | H numeric | wrong | ⬜ | integer literal above i64 range silently → 0 (parser diag plumbing needed) |
 | shift-infer | H numeric | wrong | ⬜ | `let x = one << 63` shift-result inferred 32-bit |
+| B1-let | B generics | blk | ⬜ | `let x: T = id(v)` — free-generic inference INTO a typed let is rejected (found by the fuzzer; inference in arg position, explicit `<T>`, and inference with no annotation all work) |
 | I | parser gaps | gap | ⬜ | sci-notation, `_` separators, tuple-payload, guards, while-let, `?.`-method, if-expr-in-interp, where-constraints, trait default bodies |
 | F4 | keystone | — | 🟡 | codegen soundness fuzzer STARTED (`3769458` `conformance/codegen_fuzz.py`, teeth-proven, int arith/cast) |
 | F2-6 | keystone | — | 🟡 | typed IR BUILT + shadow-validated (6723 agree / 0 disagree); tracker `docs/design/f2-6-keystone-tracking.md` |
