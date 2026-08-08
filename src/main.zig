@@ -2536,6 +2536,9 @@ fn compileProgram(
     // for --release. ASAN requires the clang link path (it pulls in the asan runtime + links the sanitized
     // novacore_asan), so it also disables the in-process-LLD fast path below.
     const asan = !is_wasm and (if (init.environ_map.get("NOVA_ASAN")) |v| !std.mem.eql(u8, v, "0") else !is_release);
+    // Opt-in: also instrument NOVA-GENERATED code with ASAN (not only the runtime), for provenance on a
+    // Nova-code UAF. Requires the runtime ASAN link (so it implies `asan`); off unless NOVA_ASAN_CODEGEN set.
+    codegen_arc.asan_codegen_enabled = asan and (init.environ_map.get("NOVA_ASAN_CODEGEN") != null);
 
     loadProgram(allocator, init, "src/std/collections/string_builder.nova", visited, &visiting, &merged, &declarations, is_wasm, &file_sources, tinfo) catch |err| {
         std.debug.print("Warning: Failed to load string_builder standard library: {any}\n", .{err});

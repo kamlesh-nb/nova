@@ -1300,6 +1300,27 @@ fn emitModule(
             std.debug.print("LLVM pass pipeline ('{s}') failed\n", .{passes});
             return error.LLVMPassError;
         }
+
+        // NOVA_ASAN_CODEGEN: instrument Nova-generated code so a UAF in *our* code (not just the runtime)
+        // is caught with provenance. LLVM's ASAN only touches functions carrying `sanitize_address`, so tag
+        // every defined function, then run the `asan` module pass after the main pipeline (post coro-split).
+        if (@import("arc.zig").asan_codegen_enabled) {
+            const ctx = core.LLVMGetModuleContext(module);
+            const kind = core.LLVMGetEnumAttributeKindForName("sanitize_address", "sanitize_address".len);
+            const attr = core.LLVMCreateEnumAttribute(ctx, kind, 0);
+            const fn_idx: types.LLVMAttributeIndex = @as(types.LLVMAttributeIndex, 0xFFFFFFFF); // LLVMAttributeFunctionIndex
+            var fnv = core.LLVMGetFirstFunction(module);
+            while (fnv != null) : (fnv = core.LLVMGetNextFunction(fnv)) {
+                if (core.LLVMCountBasicBlocks(fnv) == 0) continue; // skip declarations (ASAN skips them anyway)
+                core.LLVMAddAttributeAtIndex(fnv, fn_idx, attr);
+            }
+            const aerr = transform.LLVMRunPasses(module, "asan", compiler.target_machine, opts);
+            if (aerr != null) {
+                errors.LLVMConsumeError(aerr);
+                std.debug.print("LLVM ASAN instrumentation pass failed\n", .{});
+                return error.LLVMPassError;
+            }
+        }
     }
 
     const file_type = types.LLVMCodeGenFileType.LLVMObjectFile;

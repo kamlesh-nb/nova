@@ -134,6 +134,36 @@ to avoid false positives on Nova's `ptr-8` header idioms). Getting the exact pre
 would require adding the AddressSanitizer LLVM pass to the Nova codegen pipeline (`emitModule`), which is a
 larger, riskier change; the crash class is now confirmed without it.
 
+## Codegen-ASAN provenance (2026-08-08) — UAF proven
+
+Added opt-in `NOVA_ASAN_CODEGEN=1` (main.zig sets `codegen_arc.asan_codegen_enabled`; emitModule tags every
+defined function with `sanitize_address` and runs the LLVM `asan` module pass after the main pipeline). It
+does NOT false-positive on good Nova code (verified), and on the failing app it produces a clean report with
+allocation provenance:
+
+```
+ERROR: AddressSanitizer: heap-buffer-overflow  READ of size 4 at 0x6020000005e0
+    #0 List_Row_size+0x60                 <- Cursor.next() reading self.batch.size()
+    #1 web_app_reactorWorkerBody+0x364
+allocated by thread T0 here:
+    #1 nova_bytes_alloc  alloc.cpp:230
+    #2 string_allocString+0x10            <- that heap slot is now a STRING
+    #3 web_app_reactorWorkerBody+0x364
+```
+
+Definitive: `Cursor.batch` (a `List<Doc>`) was **freed and its heap slot recycled into a string**
+(`string_allocString`) within the SAME request, and `Cursor.next()` then read `List.size()` off that
+string -> out-of-bounds. This is the use-after-free, confirmed with provenance; it is exactly the earlier
+`"buha"` (string-bytes-as-pointer) tell. (It surfaces as heap-buffer-overflow rather than a still-freed UAF
+because the slot is LIVE as a string at read time; widening the ASAN quarantine did not change it, since the
+reuse is a legitimate same-request string alloc.) The read happens inside `web_app_reactorWorkerBody` -- the
+coroutine frame -- consistent with the owned `Cursor` (its `batch`) being released one drop early across the
+`await`.
+
+Still open: naming the exact premature `nova_release` on `batch`. ASAN can't (the slot is live-as-a-string,
+not poisoned, at the read). Next: an lldb write-watchpoint on the `batch` field once `find()` returns, or an
+ARC-audit trace of the Cursor's refcount across the `await cur.next()` loop.
+
 ## Proposed fix (direction)
 
 1. **Coroutine frame ARC discipline.** When an ARC-owned value (`isOwnedTypeId`) is captured into the

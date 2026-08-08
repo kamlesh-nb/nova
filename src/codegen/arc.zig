@@ -1292,6 +1292,11 @@ pub fn releaseLocalVariables(self: *LlvmCompiler) anyerror!void {
 pub var elide_enabled: bool = false;
 pub var elide_count: usize = 0;
 
+// Gated by NOVA_ASAN_CODEGEN (requires an ASAN/debug build so __asan_* resolve): when set, emitModule
+// tags every defined function with `sanitize_address` and runs LLVM's `asan` pass, so use-after-free /
+// out-of-bounds in NOVA-GENERATED code (not just the runtime) is caught with alloc/free provenance.
+pub var asan_codegen_enabled: bool = false;
+
 fn callTargetName(inst: types.LLVMValueRef) ?[]const u8 {
     if (core.LLVMGetInstructionOpcode(inst) != .LLVMCall) return null;
     const n = core.LLVMGetNumOperands(inst);
