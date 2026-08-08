@@ -82,10 +82,12 @@ Landed:
   rendering + codegen keying and method mangling + per-reference scoped resolution), the same way structs
   already were. `bfb341f`
 
-  Scope: struct and enum are now the module-scoped kinds. Traits stay bare (scoping them broke the
-  struct->trait return-widening check), and a same-named payload-enum construction across modules still
-  needs tagged-variant resolution work; both are narrower follow-ons that remain loud compile errors, not
-  silent corruption.
+  Struct and enum (plain and payload) are the module-scoped kinds. Traits need no scoping and were
+  confirmed to already coexist: a trait is dispatched through the per-implementation vtable in the fat
+  pointer, not by the trait name, so a same-named trait collapsing across modules is harmless. (The
+  earlier "trait scoping broke return-widening" was a false alarm from an invalid test.) User-facing
+  unions are not a functional construction feature, so there is no analogous union case. The same-name
+  collision family (S2 structs, S3 enums, traits) is now closed.
 
 Investigated and deferred, recorded rather than papered over:
 
