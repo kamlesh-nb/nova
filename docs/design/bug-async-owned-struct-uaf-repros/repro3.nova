@@ -1,0 +1,49 @@
+import list;
+
+struct Box {
+    pub batch: list.List<int>,
+    init() { self.batch = list.List<int>(); }
+    // async METHOD, self by value -- now also does List.get (like Cursor.next's self.batch.get(pos))
+    async fn readMethod(self: Box): int {
+        let n = self.batch.size();
+        if (n <= 0) { return -1; }
+        return self.batch.get(0) ?? -1;
+    }
+}
+
+async fn suspendOnce(): int { return 1; }
+
+// async make that SUSPENDS then returns the owned struct
+async fn makeAsync(): Box {
+    let _ = await suspendOnce();
+    let b = Box();
+    b.batch.push(10); b.batch.push(20); b.batch.push(30);
+    return b;
+}
+// sync make
+fn makeSync(): Box {
+    let b = Box();
+    b.batch.push(10); b.batch.push(20); b.batch.push(30);
+    return b;
+}
+async fn readFree(b: Box): int { return b.batch.size(); }
+
+async fn run(): void {
+    // X: async-suspending make + async FREE fn
+    let bx = await makeAsync();
+    console.log(`X (asyncMake + freeFn):   size=${await readFree(bx)}`);
+
+    // Y: sync make + async METHOD
+    let by = makeSync();
+    console.log(`Y (syncMake + method):     size=${await by.readMethod()}`);
+
+    // Z: async-suspending make + async METHOD  (== the mongo shape)
+    let bz = await makeAsync();
+    console.log(`Z (asyncMake + method):    size=${await bz.readMethod()}`);
+}
+
+fn main(): void {
+    console.log("start");
+    run();
+    console.log("done");
+}

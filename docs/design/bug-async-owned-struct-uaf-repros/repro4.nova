@@ -1,0 +1,45 @@
+// Closer to mongo: Box owns List<Item>, where each Item owns a STRING (like Doc owns its BSON/strings).
+// Built inside an async fn that SUSPENDS, then read back via an async METHOD that indexes the list and
+// reads the nested string -- the exact shape of: find() -> Cursor{batch: List<Doc>} -> next() ->
+// self.batch.get(pos) -> doc.getStr(...).
+import list;
+import string;
+
+struct Item {
+    pub name: string,
+    init(n: string) { self.name = n; }
+}
+
+struct Box {
+    pub batch: list.List<Item>,
+    init() { self.batch = list.List<Item>(); }
+
+    // async method, self by value, indexes the list and reads the nested struct's string field
+    pub async fn firstName(self: Box): string {
+        if (self.batch.size() <= 0) { return "EMPTY"; }
+        let it = self.batch.get(0) ?? Item("NONE");
+        return it.name;
+    }
+}
+
+async fn suspendOnce(): int { return 1; }
+
+async fn makeAsync(): Box {
+    let _ = await suspendOnce();                 // suspension, like find()'s await self.run(cmd)
+    let b = Box();
+    b.batch.push(Item("margherita"));
+    b.batch.push(Item("pepperoni"));
+    return b;
+}
+
+async fn run(): void {
+    let b = await makeAsync();                    // like `let cur = await coll.find(...)`
+    let nm = await b.firstName();                 // like `await cur.next()` then getStr
+    console.log(`firstName=${nm}`);
+}
+
+fn main(): void {
+    console.log("start");
+    run();
+    console.log("done");
+}

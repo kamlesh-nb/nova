@@ -1,0 +1,42 @@
+// Minimal repro for the suspected bug: an async fn that SUSPENDS, then returns a struct that OWNS a
+// heap List; the caller awaits it and reads the List afterwards. Mirrors mongodb find(): it does
+// `await self.run(cmd)` (a suspension), builds a Cursor that owns `batch: List<Doc>`, returns it; the
+// caller then does `cur.next()` which touches `self.batch`.
+import list;
+
+struct Box {
+    pub batch: list.List<int>,
+    init() { self.batch = list.List<int>(); }
+}
+
+async fn suspendOnce(): int { return 1; }
+
+// async fn that suspends (await) BEFORE building + returning a struct that owns a List.
+async fn make(): Box {
+    let _ = await suspendOnce();   // real suspension point, like find()'s `await self.run(cmd)`
+    let b = Box();
+    b.batch.push(10);
+    b.batch.push(20);
+    b.batch.push(30);
+    return b;                       // struct owning a List returned across the async frame
+}
+
+// async METHOD taking `self: Box` BY VALUE, reading self.batch at the top -- this is the exact shape of
+// Cursor.next(self: Cursor) reading self.batch.size()/self.batch.get(pos).
+async fn readFirst(self: Box): int {
+    let n = self.batch.size();                       // like `self.batch.size()` in next()
+    if (n <= 0) { return -1; }
+    return self.batch.get(0) ?? -1;                  // like `self.batch.get(self.pos)`
+}
+
+async fn run(): void {
+    let b = await make();                            // like `let cur = await coll.find(...)`
+    let v = await b.readFirst();                     // like `await cur.next()` -- self by value into async method
+    console.log(`readFirst=${v}`);
+}
+
+fn main(): void {
+    console.log("repro: async fn returning a struct that owns a List");
+    run();
+    console.log("done (no crash)");
+}

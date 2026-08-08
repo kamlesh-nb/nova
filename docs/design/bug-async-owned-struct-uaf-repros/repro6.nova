@@ -1,0 +1,53 @@
+// Model the EXACT store loop: async next() returns `Item | undefined` (optional STRUCT), caller loops
+// `while { let dn = await cur.next(); if (dn == undefined) break; use dn }`. This is the one shape I had
+// not tested -- returning an optional heap struct from an async method, per iteration.
+import list;
+import string;
+
+struct Item {
+    pub name: string,
+    init(n: string) { self.name = n; }
+}
+
+struct Cur {
+    pub batch: list.List<Item>,
+    pub pos: int,
+    init() { self.batch = list.List<Item>(); self.pos = 0; }
+
+    // returns `Item | undefined`, like Cursor.next(): `document.Doc | undefined`
+    pub async fn next(self: Cur): Item | undefined {
+        if (self.pos < self.batch.size()) {
+            let it = self.batch.get(self.pos) ?? Item("NONE");
+            self.pos = self.pos + 1;
+            return it;
+        }
+        return undefined;
+    }
+}
+
+async fn suspendOnce(): int { return 1; }
+
+async fn find(): Cur {
+    let _ = await suspendOnce();
+    let cur = Cur();
+    cur.batch.push(Item("marg" + "herita"));
+    cur.batch.push(Item("pep" + "peroni"));
+    return cur;
+}
+
+async fn run(): void {
+    let cur = await find();
+    let out = list.List<string>();
+    while (true) {
+        let dn = await cur.next();            // Item | undefined
+        if (dn == undefined) { break; }       // like `if (dn == undefined) break;`
+        out.push(dn.name);                    // like `out.push(categoryFromDoc(dn))`
+    }
+    console.log(`collected=${out.size()} first=${out.get(0) ?? "?"}`);
+}
+
+fn main(): void {
+    console.log("start");
+    run();
+    console.log("done");
+}

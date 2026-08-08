@@ -1,0 +1,40 @@
+// Characterize the trigger. Box owns a heap List<int>.
+import list;
+
+struct Box {
+    pub batch: list.List<int>,
+    init() { self.batch = list.List<int>(); }
+}
+
+async fn suspendOnce(): int { return 1; }
+
+fn makeBox(): Box {
+    let b = Box();
+    b.batch.push(10); b.batch.push(20); b.batch.push(30);
+    return b;
+}
+
+// A) free async fn taking an owned struct BY VALUE, reading its List (no suspension inside).
+async fn readViaFreeAsync(b: Box): int {
+    return b.batch.size();
+}
+
+// B) SYNC free fn taking the owned struct by value (control).
+fn readViaSync(b: Box): int {
+    return b.batch.size();
+}
+
+async fn run(): void {
+    let b1 = makeBox();
+    console.log(`SYNC pass-by-value:  size=${readViaSync(b1)}`);
+
+    let b2 = makeBox();
+    let r = await readViaFreeAsync(b2);          // owned struct by value INTO an async fn
+    console.log(`ASYNC pass-by-value: size=${r}`);
+}
+
+fn main(): void {
+    console.log("start");
+    run();
+    console.log("done");
+}

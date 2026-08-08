@@ -1,0 +1,59 @@
+// Closest yet to mongo's Cursor{ conn: MongoConnection (big, by value), batch: List<Item> }.
+// The cursor-like struct owns BOTH a large by-value struct AND the heap List, built in an async fn that
+// suspends, then read via an async method -- exactly Cursor{conn,batch} + next().
+import list;
+import string;
+
+struct Conn {                        // stand-in for MongoConnection: several fields incl strings + an int
+    pub dbName: string,
+    pub host: string,
+    pub nextId: int,
+    pub busy: bool,
+    pub failed: bool,
+    init(db: string) { self.dbName = db; self.host = "127.0.0.1"; self.nextId = 0; self.busy = false; self.failed = false; }
+}
+
+struct Item {
+    pub name: string,
+    init(n: string) { self.name = n; }
+}
+
+struct Cur {
+    pub conn: Conn,                  // big by-value struct field, like MongoConnection
+    pub batch: list.List<Item>,
+    pub pos: int,
+    init(c: Conn) { self.conn = c; self.batch = list.List<Item>(); self.pos = 0; }
+
+    pub async fn next(self: Cur): string {
+        if (self.pos < self.batch.size()) {
+            let it = self.batch.get(self.pos) ?? Item("NONE");
+            self.pos = self.pos + 1;
+            return it.name;
+        }
+        return "END";
+    }
+}
+
+async fn suspendOnce(): int { return 1; }
+
+// like Collection.find: awaits (suspends), builds a Cur owning conn+batch, returns it
+async fn find(): Cur {
+    let h = spawn suspendOnce(); let _ = await h;
+    let cur = Cur(Conn("pizzahub"));
+    cur.batch.push(Item("marg" + "herita"));
+    cur.batch.push(Item("pep" + "peroni"));
+    return cur;
+}
+
+async fn run(): void {
+    let cur = await find();          // let cur = await coll.find(...)
+    let a = await cur.next();        // await cur.next()
+    let b = await cur.next();
+    console.log(`next1=${a} next2=${b}`);
+}
+
+fn main(): void {
+    console.log("start");
+    run();
+    console.log("done");
+}

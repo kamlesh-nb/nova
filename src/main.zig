@@ -2484,8 +2484,8 @@ fn linkLibsStamp(allocator: std.mem.Allocator, init: std.process.Init) u64 {
 }
 
 const CACHE_VERSION: u64 = 1;
-fn sourcesHash(file_sources: *std.StringHashMap([]const u8), is_release: bool, link_stamp: u64) u64 {
-    var acc: u64 = CACHE_VERSION ^ link_stamp ^ (if (is_release) @as(u64, 0x9e3779b97f4a7c15) else 0);
+fn sourcesHash(file_sources: *std.StringHashMap([]const u8), is_release: bool, asan: bool, link_stamp: u64) u64 {
+    var acc: u64 = CACHE_VERSION ^ link_stamp ^ (if (is_release) @as(u64, 0x9e3779b97f4a7c15) else 0) ^ (if (asan) @as(u64, 0xa5a5_5a5a_c3c3_3c3c) else 0);
     var it = file_sources.iterator();
     while (it.next()) |e| {
         var h = std.hash.Wyhash.init(0);
@@ -2531,6 +2531,12 @@ fn compileProgram(
     const is_wasm = std.mem.eql(u8, target, "--wasm");
     const tinfo = deriveTargetInfo(target, target_triple_opt);
 
+    // AddressSanitizer for native builds: default ON for debug, OFF for --release (and never for wasm).
+    // NOVA_ASAN=0 forces it off (e.g. a debug build you want to benchmark), NOVA_ASAN=1 forces it on even
+    // for --release. ASAN requires the clang link path (it pulls in the asan runtime + links the sanitized
+    // novacore_asan), so it also disables the in-process-LLD fast path below.
+    const asan = !is_wasm and (if (init.environ_map.get("NOVA_ASAN")) |v| !std.mem.eql(u8, v, "0") else !is_release);
+
     loadProgram(allocator, init, "src/std/collections/string_builder.nova", visited, &visiting, &merged, &declarations, is_wasm, &file_sources, tinfo) catch |err| {
         std.debug.print("Warning: Failed to load string_builder standard library: {any}\n", .{err});
     };
@@ -2545,7 +2551,7 @@ fn compileProgram(
 
     var src_hash: u64 = 0;
     if (build_mode) {
-        src_hash = sourcesHash(&file_sources, is_release, linkLibsStamp(allocator, init));
+        src_hash = sourcesHash(&file_sources, is_release, asan, linkLibsStamp(allocator, init));
         const cur = std.fmt.allocPrint(allocator, "{x}", .{src_hash}) catch "";
         defer if (cur.len > 0) allocator.free(cur);
         if (Io.Dir.readFileAlloc(.cwd(), init.io, build_hash_path, allocator, .unlimited)) |prev| {
@@ -2715,6 +2721,7 @@ fn compileProgram(
             try clang_args.append(allocator, "-g");
             try clang_args.append(allocator, "-O0");
         }
+        if (asan) try clang_args.append(allocator, "-fsanitize=address");
         try clang_args.append(allocator, "-pthread");
         try clang_args.append(allocator, "-I.");
 
@@ -2739,7 +2746,7 @@ fn compileProgram(
             }
         }
 
-        if (build_options.inprocess_lld and builtin.target.os.tag == .macos and target_triple_opt == null) {
+        if (build_options.inprocess_lld and builtin.target.os.tag == .macos and target_triple_opt == null and !asan) {
             try linkNativeInProcessMacho(allocator, init.environ_map, init.io, link_objs, output_path, shared_nova, ffi_libs);
 
             if (init.environ_map.get("NOVA_KEEP_OBJ") == null and !build_mode)
@@ -2758,7 +2765,7 @@ fn compileProgram(
 
         for (link_objs) |o| try clang_args.append(allocator, o);
 
-        try appendRuntimeLink(&clang_args, allocator, shared_nova, "novacore");
+        try appendRuntimeLink(&clang_args, allocator, shared_nova, if (asan) "novacore_asan" else "novacore");
         try appendWolfsslLink(&clang_args, allocator, shared_nova, init.io);
         for (ffi_libs) |lib| {
             try appendFfiLib(&clang_args, allocator, shared_nova, init.io, lib);
@@ -2792,9 +2799,9 @@ fn compileProgram(
             const cur = std.fmt.allocPrint(allocator, "{x}", .{src_hash}) catch "";
             defer if (cur.len > 0) allocator.free(cur);
             _ = Io.Dir.writeFile(.cwd(), init.io, .{ .data = cur, .sub_path = build_hash_path, .flags = .{} }) catch {};
-            std.debug.print("Built {s} ({s}).\n", .{ output_path, if (is_release) "release" else "debug" });
+            std.debug.print("Built {s} ({s}{s}).\n", .{ output_path, if (is_release) "release" else "debug", if (asan) ", ASAN" else "" });
         } else {
-            std.debug.print("Native output written to {s}\n", .{output_path});
+            std.debug.print("Native output written to {s}{s}\n", .{ output_path, if (asan) " (ASAN)" else "" });
         }
     } else {
         std.debug.print("Unsupported target: {s}\n", .{target});
