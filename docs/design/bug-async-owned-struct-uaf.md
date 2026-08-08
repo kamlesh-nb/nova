@@ -164,6 +164,26 @@ Still open: naming the exact premature `nova_release` on `batch`. ASAN can't (th
 not poisoned, at the read). Next: an lldb write-watchpoint on the `batch` field once `find()` returns, or an
 ARC-audit trace of the Cursor's refcount across the `await cur.next()` loop.
 
+## lldb watchpoint (2026-08-08) — it's frame-slot recycling, not a stray release
+
+Clean symbolized stack under the codegen-ASAN build:
+```
+#1 List_Row_size+100
+#2 data_db_Cursor_next.resume+388     <- inside the RESUMED Cursor.next() coroutine
+#3 raw_coro_resume  #4 reactor_pump  #5 nova_reactor_resume
+```
+A conditional breakpoint on `nova_release` for the faulting address (`0x6020000005e0`) NEVER fired before
+the crash. That address is the STRING now in the slot ("allocated by string_allocString"), so the negative
+result only proves the string is live -- but combined with the stack it means: `self.batch` was not
+released-then-reused, it was **clobbered by coroutine-frame slot reuse**. The owned `Cursor` `cur` is live
+across `await cur.next()` (used every loop iteration), but its frame slot (holding `batch`) is being handed
+to a later `string_allocString` in the same handler, so `cur.batch` reads a string.
+
+So the precise root cause is: **an owned value live across a suspension point is not preserved in the
+coroutine frame** -- either the ARC/last-use analysis marks `cur` dead too early (so CoroSplit does not keep
+its slot), or the slot is reused despite `cur` being live. (Naming the batch List's own alloc/free would need
+its ORIGINAL address, captured inside find() by walking the Cursor.batch offset -- not yet done.)
+
 ## Proposed fix (direction)
 
 1. **Coroutine frame ARC discipline.** When an ARC-owned value (`isOwnedTypeId`) is captured into the
