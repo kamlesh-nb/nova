@@ -1417,8 +1417,9 @@ pub const Inferer = struct {
             else => return null,
         };
 
-        _ = self.symtab.findTypeInModule(type_name, self.current_module) orelse return null;
-        const mid = self.symtab.findMethod(type_name, fa.field) orelse return null;
+        const tsid = self.symtab.findTypeInModule(type_name, self.current_module) orelse return null;
+        const tmod = self.symtab.symbolAt(tsid).module;
+        const mid = self.symtab.findMethodInModule(type_name, fa.field, tmod) orelse return null;
         const m = self.symtab.symbolAt(mid);
         if (m.decl != .function) return null;
         const ret = m.decl.function.ret_type orelse return try self.store.voidT();
@@ -1451,7 +1452,7 @@ pub const Inferer = struct {
 
         if (t == .enum_) {
             const owner = self.symtab.symbolAt(t.enum_);
-            const mid = self.symtab.findMethod(owner.name, fa.field) orelse return null;
+            const mid = self.symtab.findMethodInModule(owner.name, fa.field, owner.module) orelse return null;
             out_sym.* = mid;
             const m = self.symtab.symbolAt(mid);
             if (m.decl != .function) return null;
@@ -1462,7 +1463,7 @@ pub const Inferer = struct {
         }
         if (t != .struct_) return null;
         const owner = self.symtab.symbolAt(t.struct_.decl);
-        const mid = self.symtab.findMethod(owner.name, fa.field) orelse return null;
+        const mid = self.symtab.findMethodInModule(owner.name, fa.field, owner.module) orelse return null;
 
         out_sym.* = mid;
         const m = self.symtab.symbolAt(mid);
@@ -1547,7 +1548,7 @@ pub const Inferer = struct {
         if (t == .optional) t = self.store.get(t.optional);
         if (t != .struct_) return null;
         const owner = self.symtab.symbolAt(t.struct_.decl);
-        const mid = self.symtab.findMethod(owner.name, fa.field) orelse return null;
+        const mid = self.symtab.findMethodInModule(owner.name, fa.field, owner.module) orelse return null;
         const m = self.symtab.symbolAt(mid);
         if (m.decl != .function) return null;
         const fd = m.decl.function;
@@ -1616,7 +1617,7 @@ pub const Inferer = struct {
                 const t = self.store.get(obj);
                 if (t != .struct_) return null;
                 const owner = self.symtab.symbolAt(t.struct_.decl);
-                const mid = self.symtab.findMethod(owner.name, fa.field) orelse return null;
+                const mid = self.symtab.findMethodInModule(owner.name, fa.field, owner.module) orelse return null;
                 const m = self.symtab.symbolAt(mid);
                 if (m.decl != .function) return null;
                 return try self.paramTypesOf(m.decl.function, t.struct_);

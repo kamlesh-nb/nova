@@ -1,3 +1,14 @@
+> **SUPERSEDED 2026-08-08 — the diagnosis below is WRONG.** This was never an ARC / coroutine-frame
+> liveness bug. Reading the app's IR proved the real cause: a same-named `struct Cursor` collision across
+> modules (`mongodb.nova` both `import db;` and declares its own `Cursor`). `find(): Cursor`'s return-type
+> annotation mis-binds to the imported `db.Cursor` while the body builds the local `mongodb.Cursor`, so the
+> caller dispatches `data_db_Cursor_next` (+ destructor) on a `mongodb.Cursor` and reads a conn pointer as
+> `batch: List<Row>` → `List_Row_size` faults. Deterministic repro (no async/reactor):
+> `bug-samename-type-repros/{seam,drv,main}.nova`. Real fix = module-scoped type-name resolution (local decl
+> shadows same-named import), the F1-4 work. The ASAN capabilities this investigation produced (`nova build`
+> ASAN-by-default + `NOVA_ASAN_CODEGEN=1`) are real and kept. The ARC/liveness narrative below is retained
+> only for the tool-method record (lldb, runtime-ASAN, codegen-ASAN provenance chain).
+
 # BUG: use-after-free of an owned struct held across `await` in the reactor path
 
 Status: OPEN (lang-track, runtime/ARC + coroutine lowering)

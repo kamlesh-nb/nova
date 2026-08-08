@@ -298,18 +298,48 @@ pub const SymbolTable = struct {
         return null;
     }
 
+    fn isTypeSym(k: SymbolKind) bool {
+        return k == .struct_ or k == .enum_ or k == .trait_ or k == .union_;
+    }
+
+    // Resolve a bare type name preferring, in order: (1) a type declared in the current module
+    // (a local declaration shadows a same-named import), (2) a type declared in a module the current
+    // module directly imports, (3) module-blind first-match as a last resort. Steps (1) and (2) matter
+    // only when the name collides across modules; for a unique name every step returns the same symbol.
     pub fn findTypeInModule(self: *const SymbolTable, name: []const u8, ctx: ?ModuleId) ?SymbolId {
         if (ctx) |cm| {
+            // (1) local declaration wins
             for (self.symbols.items, 0..) |sym, i| {
-                switch (sym.kind) {
-                    .struct_, .enum_, .trait_, .union_ => {
-                        if (sym.module == cm and std.mem.eql(u8, sym.name, name)) return @enumFromInt(@as(u32, @intCast(i)));
-                    },
-                    else => {},
+                if (isTypeSym(sym.kind) and sym.module == cm and std.mem.eql(u8, sym.name, name))
+                    return @enumFromInt(@as(u32, @intCast(i)));
+            }
+            // (2) a directly-imported module that declares the name
+            if (self.findTypeViaImports(name, cm)) |sid| return sid;
+        }
+        // (3) module-blind last resort
+        return self.findType(name);
+    }
+
+    // Among the modules `cm` directly imports, find one that declares a type named `name`. Returns null
+    // when none (or more than one distinct module) qualifies, so an ambiguous case falls through to the
+    // module-blind resort rather than guessing between two equally-visible imports.
+    fn findTypeViaImports(self: *const SymbolTable, name: []const u8, cm: ModuleId) ?SymbolId {
+        var found: ?SymbolId = null;
+        var found_mod: ?ModuleId = null;
+        for (self.imports.items) |imp| {
+            if (imp.importer != cm) continue;
+            for (self.symbols.items, 0..) |sym, i| {
+                if (!isTypeSym(sym.kind) or sym.module != imp.imported) continue;
+                if (!std.mem.eql(u8, sym.name, name)) continue;
+                if (found_mod) |fm| {
+                    if (fm != sym.module) return null; // two distinct imported modules declare it -> ambiguous
+                } else {
+                    found = @enumFromInt(@as(u32, @intCast(i)));
+                    found_mod = sym.module;
                 }
             }
         }
-        return self.findType(name);
+        return found;
     }
 
     pub fn findTypeAmbiguous(self: *const SymbolTable, name: []const u8) bool {
@@ -351,6 +381,20 @@ pub const SymbolTable = struct {
             }
         }
         return null;
+    }
+
+    // Like findMethod, but when the owner type name collides across modules, prefer the method declared
+    // in the SAME module as the receiver struct (owner_module). Falls back to the module-blind match so
+    // trait defaults / non-colliding owners behave exactly as before.
+    pub fn findMethodInModule(self: *const SymbolTable, type_name: []const u8, method: []const u8, owner_module: ModuleId) ?SymbolId {
+        for (self.symbols.items, 0..) |sym, i| {
+            if (sym.kind != .method or sym.module != owner_module) continue;
+            const o = sym.owner orelse continue;
+            if (std.mem.eql(u8, o, type_name) and std.mem.eql(u8, sym.name, method)) {
+                return @enumFromInt(@as(u32, @intCast(i)));
+            }
+        }
+        return self.findMethod(type_name, method);
     }
 
     pub fn findModuleBySegment(self: *const SymbolTable, name: []const u8) ?ModuleId {

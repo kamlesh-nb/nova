@@ -1,0 +1,10 @@
+// Module A ("seam"): declares `Holder` with an int-list body and kind()==111. Module B imports this
+// AND declares its own same-named `Holder`; a value of B's Holder must never dispatch A's methods.
+import list;
+pub struct Item { pub v: int, init(x: int) { self.v = x; } }
+pub struct Holder {
+    pub a: int,
+    pub xs: list.List<Item>,
+    init() { self.a = 0; self.xs = list.List<Item>(); }
+    pub fn kind(self: Holder): int { return 111; }
+}

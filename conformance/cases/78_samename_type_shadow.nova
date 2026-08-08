@@ -1,0 +1,14 @@
+// F1 module scoping: a local `pub struct` must shadow a same-named imported one, so a function that
+// returns its LOCAL type and a consumer that dispatches on the returned value both pick the local
+// struct's methods and layout -- NOT the imported same-named struct. This is the shape that crashed the
+// mongodb document API (`find(): Cursor` in a module that also `import db` which exports `Cursor`):
+// the caller dispatched the seam Cursor's next() on a driver Cursor and read a conn pointer as a List.
+import scoped.shadow_b;
+import assert;
+
+@test
+fn test_local_type_shadows_imported_samename(): void {
+    let h = shadow_b.make();            // B's Holder, though B imports A's same-named Holder
+    assert.equalInt(h.kind(), 222);     // dispatch B.Holder.kind (222), never A.Holder.kind (111)
+    assert.equalInt(h.count(), 2);      // reads B.Holder.ys (List<Doc>) at B's layout, not A's
+}

@@ -1,0 +1,21 @@
+// Module B: `import scoped.shadow_a;` pulls A's `Holder` into scope, AND B declares its OWN `Holder`
+// (different fields, kind()==222). `make(): Holder` must return B's local Holder. Before the local-shadows-
+// import fix, the return-type annotation `Holder` bound to A's imported Holder, so callers mis-dispatched.
+import list;
+import string;
+import shadow_a;
+pub struct Doc { pub s: string, init(t: string) { self.s = t; } }
+pub struct Holder {
+    pub p: int,
+    pub q: int,
+    pub ys: list.List<Doc>,
+    init() { self.p = 7; self.q = 9; self.ys = list.List<Doc>(); }
+    pub fn kind(self: Holder): int { return 222; }
+    pub fn count(self: Holder): int { return self.ys.size(); }
+}
+pub fn make(): Holder {
+    let h = Holder();
+    h.ys.push(Doc("x"));
+    h.ys.push(Doc("y"));
+    return h;
+}
