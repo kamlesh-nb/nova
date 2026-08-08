@@ -733,6 +733,17 @@ pub fn isCollidingStruct(self: *LlvmCompiler, name: []const u8) bool {
     return false;
 }
 
+// The module-scoped name of a colliding struct/enum/trait bound to `bare`, resolved from the module in
+// which `bare` appears (its file). Enum/trait references have no value-TypeId to read from, so scope by
+// the source file of the reference. Returns null (use the bare name) when `bare` is not colliding.
+pub fn scopedTypeName(self: *LlvmCompiler, bare: []const u8, file: []const u8) []const u8 {
+    _ = self;
+    if (sema_shadow.live_sema) |sm| {
+        if (sm.tab.scopedNameFor(bare, file)) |scoped| return scoped;
+    }
+    return bare;
+}
+
 pub fn resolveExpressionTypeName(self: *LlvmCompiler, expr_ptr: *const ast.Expression) anyerror!?[]const u8 {
     const ir = self.typed_ir orelse return null;
     const st = self.type_store orelse return null;

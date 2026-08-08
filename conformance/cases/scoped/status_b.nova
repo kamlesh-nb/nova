@@ -1,0 +1,13 @@
+import status_a;
+// Module B: same-named enum Status but DIFFERENT variants/order/codes. Imports A's same-named Status.
+pub enum Status { Start, Middle, End
+    pub fn code(self: Status): int {
+        switch (self) {
+            case Status.Start: { return 1; }
+            case Status.Middle: { return 2; }
+            case Status.End: { return 3; }
+        }
+        return -1;
+    }
+}
+pub fn getB(): Status { return Status.End; }

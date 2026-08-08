@@ -154,7 +154,7 @@ pub const SymbolTable = struct {
     pub fn scopedNameFor(self: *const SymbolTable, name: []const u8, file: []const u8) ?[]const u8 {
         if (!self.colliding_types.contains(name)) return null;
         for (self.symbols.items) |s| {
-            if (s.kind != .struct_ or !std.mem.eql(u8, s.name, name)) continue;
+            if (!isTypeSym(s.kind) or !std.mem.eql(u8, s.name, name)) continue;
             const mfile = self.modules.items[@intFromEnum(s.module)].file;
             if (std.mem.eql(u8, mfile, file)) return s.scoped_name;
         }
@@ -171,11 +171,19 @@ pub const SymbolTable = struct {
     }
 
     fn computeCollidingTypes(self: *SymbolTable) !void {
+        // Detect same-name STRUCT or ENUM declarations across modules (same-kind, cross-module). Codegen
+        // scopes these two kinds; traits/unions are not scoped in codegen yet, so leaving them unmarked
+        // keeps them at the pre-existing behaviour (S3: enums now handled, traits/unions a follow-on).
+        const scopable = struct {
+            fn f(k: SymbolKind) bool {
+                return k == .struct_ or k == .enum_;
+            }
+        }.f;
         for (self.symbols.items, 0..) |a, i| {
-            if (a.kind != .struct_) continue;
+            if (!scopable(a.kind)) continue;
             if (self.colliding_types.contains(a.name)) continue;
             for (self.symbols.items[i + 1 ..]) |b| {
-                if (b.kind != .struct_) continue;
+                if (b.kind != a.kind) continue;
                 if (a.module == b.module) continue;
                 if (std.mem.eql(u8, a.name, b.name)) {
                     try self.colliding_types.put(self.allocator, a.name, {});
@@ -184,7 +192,7 @@ pub const SymbolTable = struct {
             }
         }
         for (self.symbols.items) |*s| {
-            if (s.kind != .struct_) continue;
+            if (!scopable(s.kind)) continue;
             if (!self.colliding_types.contains(s.name)) continue;
             s.scoped_name = try self.computeScopedName(s.name, self.modules.items[@intFromEnum(s.module)].file);
         }

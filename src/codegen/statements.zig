@@ -470,7 +470,12 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
         .switch_stmt => |*ss| {
             const current_fn = core.LLVMGetBasicBlockParent(core.LLVMGetInsertBlock(self.builder));
             var discr_val = try self.compileExpression(ss.discriminant);
-            const discr_type_name_opt = try self.resolveExpressionTypeName(&ss.discriminant);
+            // Resolve a colliding enum discriminant to the module-scoped enum this switch's file declares,
+            // so variant tags and case-label lowering use the correct variant set (S3).
+            const discr_type_name_opt = if (try self.resolveExpressionTypeName(&ss.discriminant)) |dt|
+                self.scopedTypeName(dt, ss.span.file)
+            else
+                null;
 
             const is_tagged_union = blk: {
                 if (discr_type_name_opt) |dt| {

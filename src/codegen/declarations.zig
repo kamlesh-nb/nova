@@ -40,7 +40,10 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
     for (program.declarations) |decl| {
         switch (decl) {
             .const_decl => |c| try compiler.constants.put(c.name, c.value),
-            .enum_decl => |e| try compiler.enums.put(e.name, e),
+            // Key colliding enums by their module-scoped name (like structs), so two same-named enums in
+            // different modules don't overwrite each other (S3). Non-colliding keep the bare name. Traits
+            // stay bare-keyed (their scoping is a separate follow-on; see renderLegacy).
+            .enum_decl => |e| try compiler.enums.put(compiler.scopedStructName(e.name, e.span.file), e),
             .trait_decl => |t| try compiler.traits.put(t.name, t),
             else => {},
         }
@@ -721,7 +724,7 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
                 var matched = false;
                 for (e.methods) |method| {
                     const fn_decl = method.decl;
-                    const decl_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ e.name, fn_decl.name });
+                    const decl_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ compiler.scopedStructName(e.name, e.span.file), fn_decl.name });
                     defer allocator.free(decl_name);
 
                     if (std.mem.eql(u8, decl_name, func.name)) {
@@ -912,7 +915,7 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
                 var matched = false;
                 for (e.methods) |method| {
                     const fn_decl = method.decl;
-                    const decl_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ e.name, fn_decl.name });
+                    const decl_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ compiler.scopedStructName(e.name, e.span.file), fn_decl.name });
                     defer allocator.free(decl_name);
 
                     if (std.mem.eql(u8, decl_name, func.name)) {

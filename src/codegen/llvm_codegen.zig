@@ -2633,7 +2633,8 @@ pub const LlvmCompiler = struct {
                 }
             } else if (decl == .enum_decl) {
                 const e = decl.enum_decl;
-                try self.enums.put(e.name, e);
+                const e_owner = self.scopedStructName(e.name, e.span.file);
+                try self.enums.put(e_owner, e);
                 for (e.methods) |method| {
                     const fn_decl = method.decl;
                     const is_constructor = std.mem.eql(u8, fn_decl.name, "new") or std.mem.eql(u8, fn_decl.name, "init");
@@ -2649,7 +2650,7 @@ pub const LlvmCompiler = struct {
                         }
                     }
 
-                    const full_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ e.name, fn_decl.name });
+                    const full_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ e_owner, fn_decl.name });
                     const info = FunctionInfo{
                         .name = full_name,
                         .param_count = if (is_constructor) fn_decl.params.len + 1 else fn_decl.params.len,
@@ -3328,6 +3329,7 @@ pub const LlvmCompiler = struct {
 
     pub const resolveExpressionTypeName = types_mod.resolveExpressionTypeName;
     pub const scopedStructName = types_mod.scopedStructName;
+    pub const scopedTypeName = types_mod.scopedTypeName;
     pub const isCollidingStruct = types_mod.isCollidingStruct;
     pub const isOptionalExpr = types_mod.isOptionalExpr;
     pub const typeOfExprConcrete = types_mod.typeOfExprConcrete;

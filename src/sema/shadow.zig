@@ -809,7 +809,14 @@ fn renderUncached(allocator: std.mem.Allocator, store: *const typesys.TypeStore,
             render_bytes += r.len;
             break :blk r;
         },
-        .enum_ => |sid| diff_tab.?.symbolAt(sid).name,
+        // Prefer the module-scoped name for a colliding enum (as structs do above), so a same-named enum
+        // in another module renders to its own identity and codegen dispatches/keys correctly (S3). Traits
+        // keep the bare name for now: scoping them broke the struct->trait return-widening check, and a
+        // same-named trait across modules is a rarer, separate follow-on.
+        .enum_ => |sid| blk: {
+            const sym = diff_tab.?.symbolAt(sid);
+            break :blk sym.scoped_name orelse sym.name;
+        },
         .trait_ => |sid| diff_tab.?.symbolAt(sid).name,
 
         .func => |ft| blk: {

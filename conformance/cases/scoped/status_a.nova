@@ -1,0 +1,11 @@
+// Module A: enum Status (Ok, Fail) with distinct codes.
+pub enum Status { Ok, Fail
+    pub fn code(self: Status): int {
+        switch (self) {
+            case Status.Ok: { return 100; }
+            case Status.Fail: { return 200; }
+        }
+        return -1;
+    }
+}
+pub fn getA(): Status { return Status.Fail; }

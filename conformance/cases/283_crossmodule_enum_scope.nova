@@ -1,0 +1,29 @@
+// S3 (codegen enum module-scoping): two modules each declare `enum Status` with different variant sets
+// and different `code()` results. Before, same-named enums were never marked colliding, so they
+// collapsed to one -- the checker's exhaustiveness validated A's switch against B's variants (phantom
+// "unhandled variant" errors), and codegen keyed enums/methods by bare name so construction, switch
+// lowering and method dispatch all resolved to the wrong module's enum. Now enums are module-scoped end
+// to end (sema collision detection + scoped rendering + codegen keying and method mangling), so each
+// module's Status keeps its own identity.
+import assert;
+import scoped.status_b;
+import scoped.status_a;
+
+@test
+fn test_module_a_enum(): void {
+    let a = status_a.getA();       // A.Status.Fail
+    assert.equalInt(a.code(), 200);
+}
+
+@test
+fn test_module_b_enum(): void {
+    let b = status_b.getB();       // B.Status.End
+    assert.equalInt(b.code(), 3);
+}
+
+@test
+fn test_both_coexist(): void {
+    let a = status_a.getA();
+    let b = status_b.getB();
+    assert.equalInt(a.code() + b.code(), 203);   // 200 (A) + 3 (B), each dispatched to its own enum
+}

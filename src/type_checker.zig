@@ -127,6 +127,10 @@ pub const TypeChecker = struct {
     // that module-correctly; the legacy arity/narrowing checks below would validate against the
     // WRONG decl, so they skip colliding names.
     colliding_structs: std.StringHashMap(void),
+    // Same as colliding_structs but for enums: a same-named enum in another module. The exhaustiveness
+    // check keys enums by bare name, so it would validate one module's switch against the OTHER module's
+    // variant set. Defer to the authoritative sema pass for colliding enums (S3).
+    colliding_enums: std.StringHashMap(void),
     unions: std.StringHashMap(ast.UnionDecl),
     traits: std.StringHashMap(ast.TraitDecl),
     functions: std.StringHashMap(ast.FunctionDecl),
@@ -153,6 +157,7 @@ pub const TypeChecker = struct {
             .variables = std.StringHashMap(ast.TypeRef).init(allocator),
             .structs = std.StringHashMap(ast.StructDecl).init(allocator),
             .colliding_structs = std.StringHashMap(void).init(allocator),
+            .colliding_enums = std.StringHashMap(void).init(allocator),
             .unions = std.StringHashMap(ast.UnionDecl).init(allocator),
             .traits = std.StringHashMap(ast.TraitDecl).init(allocator),
             .functions = std.StringHashMap(ast.FunctionDecl).init(allocator),
@@ -178,6 +183,7 @@ pub const TypeChecker = struct {
         self.variables.deinit();
         self.structs.deinit();
         self.colliding_structs.deinit();
+        self.colliding_enums.deinit();
         self.unions.deinit();
         self.traits.deinit();
         self.functions.deinit();
@@ -236,6 +242,11 @@ pub const TypeChecker = struct {
     pub fn check(self: *TypeChecker, program: ast.Program) !void {
         for (program.declarations) |decl| {
             if (decl == .enum_decl) {
+                if (self.enums.get(decl.enum_decl.name)) |existing| {
+                    if (!std.mem.eql(u8, existing.span.file, decl.enum_decl.span.file)) {
+                        try self.colliding_enums.put(decl.enum_decl.name, {});
+                    }
+                }
                 try self.enums.put(decl.enum_decl.name, decl.enum_decl);
             }
             if (decl == .struct_decl) {
@@ -883,6 +894,9 @@ pub const TypeChecker = struct {
 
         switch (disc_type) {
             .ident => |enum_name| {
+                // A colliding enum's bare-name entry may be the WRONG module's decl, so exhaustiveness
+                // here would report phantom "unhandled variant" errors. Sema resolves it module-correctly.
+                if (self.colliding_enums.contains(enum_name)) return;
                 if (self.enums.get(enum_name)) |enum_decl| {
                     const variants = enum_decl.variants;
                     var covered = std.StringHashMap(bool).init(self.allocator);

@@ -3115,7 +3115,10 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 .field_access => |inner| if (inner.object.kind == .ident and !self.identNamesVariable(inner.object.kind.ident)) inner.field else null,
                 else => null,
             };
-            if (enum_obj_name) |obj_name| {
+            if (enum_obj_name) |obj_name_bare| {
+                // Resolve a colliding enum (`Status.Ok`) to the module-scoped enum that THIS reference's
+                // source file declares, so two same-named enums pick the right variant set/tags (S3).
+                const obj_name = self.scopedTypeName(obj_name_bare, fa.span.file);
                 if (self.enums.get(obj_name)) |enum_decl| {
                     var is_tagged = false;
                     for (enum_decl.variants) |v| {
