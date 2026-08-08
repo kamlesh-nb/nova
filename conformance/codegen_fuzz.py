@@ -202,7 +202,38 @@ def tmpl_gcompose(rnd, typ):
     return decl, lets, varmap
 
 
-TEMPLATES = [tmpl_plain, tmpl_plain, tmpl_struct, tmpl_gbox, tmpl_gfn, tmpl_gcompose]
+def tmpl_valopt_list(rnd, typ):
+    # A value-optional container: push a random mix of known values and `undefined` into a
+    # List<T | undefined>, then read each back with `at(k) ?? default`. The oracle knows each read is the
+    # pushed value if present (INCLUDING a present 0, which must read back as 0, not the default) or the
+    # default if it was undefined -> exercises box-on-insert / unbox-on-read (cluster A, cases 280/281).
+    bits = 32 if typ == "int" else 64
+    # Push a mix of known values and `undefined` across ENOUGH elements to force a storage growth (the
+    # initial capacity is 4), then read each element back. This is the shape that surfaced A3-read: a
+    # `List<T | undefined>` monomorphised to the same symbol as a plain `List<int>` (the legacy type-name
+    # path rendered `int | undefined` as `int`), so a >=2-element read dereferenced a mis-typed slot. It is
+    # fixed (case 286: value-optionals render distinctly); the fuzzer now reads multiple elements again.
+    n = rnd.randint(2, 6)
+    lets = [f"    let xs = List<{typ} | undefined>();"]
+    reads = []
+    varmap = {}
+    for k in range(n):
+        d = rnd.randint(1, 40)
+        if rnd.random() < 0.6:
+            v = rand_val(rnd, typ)
+            lets.append(f"    xs.push({lit_src(v, typ)});")
+            leafval = v
+        else:
+            lets.append("    xs.push(undefined);")
+            leafval = wrap(d, bits)
+        # Read each element ONCE into a local, then the expression combines the locals. The oracle knows
+        # each read is the pushed value if present (INCLUDING a present 0) or the default if it was undefined.
+        reads.append(f"    let r{k}: {typ} = xs.at({k}) ?? {lit_src(d, typ)};")
+        varmap[f"r{k}"] = leafval
+    return [], lets + reads, varmap
+
+
+TEMPLATES = [tmpl_plain, tmpl_plain, tmpl_struct, tmpl_gbox, tmpl_gfn, tmpl_gcompose, tmpl_valopt_list]
 
 
 def make_program(rnd):
@@ -210,7 +241,10 @@ def make_program(rnd):
     top_decls, setup_lets, varmap = rnd.choice(TEMPLATES)(rnd, typ)
     gen = Gen(rnd, typ, varmap)
 
-    lines = ["import assert;", ""]
+    imports = ["import assert;"]
+    if any("List<" in l for l in setup_lets):
+        imports.append("import list;")
+    lines = imports + [""]
     lines += top_decls
     if top_decls:
         lines.append("")
@@ -275,7 +309,7 @@ def main():
             print(f"  {i + 1}/{args.n} ok")
 
     print(f"codegen_fuzz: {passed}/{args.n} programs matched the oracle "
-          f"(seed {args.seed}, int+long, arith/cast/compare/struct/generic).")
+          f"(seed {args.seed}, int+long, arith/cast/compare/struct/generic/valopt).")
 
 
 if __name__ == "__main__":

@@ -12,7 +12,8 @@ full corpus + ASAN green) · 🔵 investigated, not a live bug (recorded, no fix
 ⬜ open / deferred. Severity: **S-crit** silent corruption/unsafety · **crash** · **wrong** silent wrong
 answer · **blk** does not compile/link · **gap** missing feature.
 
-**Score: 16 defect IDs fixed, 3 investigated-not-a-bug, ~18 open/deferred. Every fix is repro-first with a
+**Score: 17 defect IDs fixed, 3 investigated-not-a-bug, ~18 open/deferred. A3-read (a value-optional
+monomorphisation collision) was found by the codegen fuzzer and fixed. Every fix is repro-first with a
 gating case (273–285) and stays corpus + ASAN green.**
 
 | ID | Cluster | Sev | Status | Commit / note |
@@ -29,7 +30,8 @@ gating case (273–285) and stays corpus + ASAN green.**
 | B2 | B generics | blk | ✅ | `192f374` transitive generic composition, case 279 |
 | A1 | A value-opt | S-crit | ✅ | `62ca289` await of value-optional = box ptr (the mongo cursor root), case 281 |
 | A2 | A value-opt | crash | ✅ | `7a90915` `List<int\|undefined>` insert-box, case 280 |
-| A3 | A value-opt | wrong | ✅ | `7a90915` (same fix — read path already unboxed) |
+| A3 | A value-opt | wrong | ✅ | `7a90915` (same fix — single read/narrow unboxes correctly) |
+| A3-read | A value-opt | crash | ✅ | value-optional monomorphisation collision. A `List<int \| undefined>` mangled to the SAME symbol as a plain `List<int>` (the legacy type-name path rendered `int \| undefined` as just `int`), so a program using BOTH (directly, or via the stdlib's own `List<int>`) shared one body and mixed a boxed value-optional layout with a raw i32 layout → any read of a ≥2-element value-optional list dereferenced a mis-typed slot (UAF/SEGV in `nova_retain`). Found by the codegen fuzzer. Fix: render value-optionals distinctly in `renderLegacy` (`int \| undefined`, not `int`) + mangle `\|`, so the two instantiations get distinct names and layouts. Cases 286 + fuzzer multi-element valopt; corpus + ASAN green. (The suspected "borrow over-release" was a red herring — string-model `set`/`get` retain is correct and `grow()` relies on it.) |
 | C1 | C module-scope | S-crit | ✅ | `6e1b977` colliding-struct field access — was a SEMA return-type-scope bug, case 282 |
 | C2 | C module-scope | S-crit | ✅ | enums `bfb341f`+`87379e6` (plain+payload), cases 283/284 |
 | C2 | C module-scope (traits) | S-crit | 🔵 | `58257f9` traits already coexist (per-impl vtable); false alarm; case 285. Unions: not a functional construct |
@@ -227,7 +229,17 @@ slot, or a container.
   cursor root cause that `findList` only dodged.
 - **A2** a value-optional stored as a **generic container element** (`List<int|undefined>`,
   `Map<_, int|undefined>`) SEGVs on read (`nova_valopt_unbox` / `nova_retain`).
-- **A3** reading such a container back also yields box pointers when it does not crash.
+- **A3** a **single** read/narrow of such a container element is now correct (unboxes to the value, `7a90915`).
+- **A3-read** (fixed, fuzzer-found) a `List<int | undefined>` monomorphised to the SAME symbol as a plain
+  `List<int>`, because the legacy type-name path (`renderLegacy`) rendered `int | undefined` as just `int`.
+  A program that used both (directly, or via the stdlib's own `List<int>`, which is why it only reproduced
+  under `nova test`) shared one body, mixing a boxed value-optional layout with a raw i32 layout, so a read
+  of a ≥2-element value-optional list dereferenced a mis-typed slot (UAF/SEGV in `nova_retain`). Fixed by
+  rendering value-optionals distinctly (`int | undefined`, not `int`) plus mangling `|`, so the two
+  instantiations get distinct names and layouts (cases 286 + the fuzzer's multi-element valopt template; corpus
+  + ASAN green). Root cause is squarely the F2-6/W9 "string path drops `.optional`" class, fixed reactively.
+  The earlier "borrow over-release" theory was disproved: the string-model `set`/`get` retains are correct and
+  `grow()` depends on them.
 - **A4** interpolating a **non-narrowed** value-optional (`${x}` on `int|undefined`) prints the box pointer.
   Footgun, not corruption (narrow or `?? default` first).
 Bounded clean: value-optional as a **struct field** works; `undefined` alone works; heap-typed optionals

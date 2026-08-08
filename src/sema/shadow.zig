@@ -833,7 +833,21 @@ fn renderUncached(allocator: std.mem.Allocator, store: *const typesys.TypeStore,
             render_bytes += r.len;
             break :blk r;
         },
-        .optional => |inner| try renderLegacy(allocator, store, inner),
+        // A VALUE-optional (`int | undefined`) is a BOXED heap pointer with a different ABI and layout than
+        // its inner value type, so it must render DISTINCTLY: otherwise `List<int | undefined>` renders as
+        // `List<int>` and monomorphises to the SAME symbol as a genuine `List<int>`, mixing boxed and raw
+        // element layouts (a catastrophic UAF once both instantiations exist -- e.g. a program plus the
+        // stdlib's own `List<int>`). A heap-optional keeps the inner rendering: same pointer repr, 0 == none.
+        .optional => |inner| blk: {
+            const inner_r = try renderLegacy(allocator, store, inner);
+            const boxed = switch (store.get(inner)) {
+                .prim => |p| p.kind != .void_,
+                .enum_ => !store.isOwned(inner),
+                else => false,
+            };
+            if (!boxed) break :blk inner_r;
+            break :blk try std.fmt.allocPrint(allocator, "{s} | undefined", .{inner_r});
+        },
 
         .future => "i64",
 

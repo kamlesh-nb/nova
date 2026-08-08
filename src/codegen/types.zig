@@ -64,6 +64,10 @@ pub fn mangleTypeName(allocator: std.mem.Allocator, type_name: []const u8) ![]u8
             ')' => try buf.appendSlice(allocator, "_rp"),
             '-' => try buf.appendSlice(allocator, "_da"),
             '=' => try buf.appendSlice(allocator, "_eq"),
+            // `|` appears in a value-optional element name (`int | undefined`): map it so the mangled
+            // symbol stays linker-safe AND stays distinct from the bare inner type. Without a distinct
+            // mangling, `List<int | undefined>` collides with `List<int>` at the monomorphised name.
+            '|' => try buf.appendSlice(allocator, "_or"),
             else => try buf.append(allocator, c),
         }
         i += 1;
