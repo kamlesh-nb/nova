@@ -68,6 +68,12 @@ Landed:
   async method await hanging) did **not** reproduce in isolation and are ASAN-clean now, most likely fixed
   as a side effect of the same-name-collision and free-generics work. A nested value-optional (`Map.get`
   returning `(int | undefined) | undefined`) still crashes and is genuinely harder.
+- **S2 (colliding-struct field access, an F2-6 item)** two modules each declare `struct Rec` with
+  different layouts; a consumer that imports both and does `let b = other.makeB()` mistyped `b` to the
+  wrong module's `Rec`, so field access read the wrong layout and crashed. This corrected the report's own
+  theory: codegen already resolves field layout by the scoped struct identity; the root was that sema
+  lowered the callee's return type in the **caller's** module scope. Fixed by lowering it in the callee's
+  module (`moduleCallReturn`). No codegen change was needed. `6e1b977`
 
 Investigated and deferred, recorded rather than papered over:
 
