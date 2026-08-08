@@ -44,6 +44,18 @@ Landed:
   discriminant. `29acad7`
 - **H** integer divide or modulo by zero, and the signed 64-bit `INT_MIN / -1` overflow, were silent
   undefined behaviour. They now trap at runtime with a clear message. `9699959`
+- **B1 / B3** a bare call to a generic free function (`id(x)` with no explicit `<T>`) failed with "Function
+  not found" because the inferred instance was never collected; the owned-return case shared the root. Sema
+  now registers the inferred instantiation and records the solved type arguments, and codegen rebuilds the
+  monomorphised name. `cc146ba`
+- **B2** a generic that forwards its type parameter to another generic (`inner<T>` inside `outer<T>`) failed
+  to instantiate the callee. A transitive-closure pass now collects instances reached only through another
+  generic, including multi-level chains and container forwarding. `192f374`
+
+  This corrected the earlier theory that free generics lacked codegen instantiation context: the explicit
+  `id<T>(x)` form always worked end to end, ownership included. The real gaps were in monomorphisation
+  collection and call-site mangling, not ownership. What remains is a bare *inferred* nested call
+  (`inner(x)` with no `<T>` inside a generic), which is a compile error, not a miscompile.
 
 Investigated and deferred, recorded rather than papered over:
 
