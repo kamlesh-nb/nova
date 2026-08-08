@@ -1619,7 +1619,11 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 }
             }
 
-            if (is_float_op) {
+            // String concatenation takes precedence over float arithmetic: `"s" + f` is a concat where the
+            // float operand is formatted (via numToString below), NOT a float-add of the string pointer.
+            // Without this guard, `is_float_op` wins and the string pointer is bit-cast to a double and FAdd'd,
+            // producing garbage that later crashes when read back as a string.
+            if (is_float_op and !is_string_concat) {
 
                 l_val = core.LLVMBuildBitCast(self.builder, l_val, core.LLVMDoubleType(), "l_double");
                 r_val = core.LLVMBuildBitCast(self.builder, r_val, core.LLVMDoubleType(), "r_double");

@@ -1,0 +1,20 @@
+// H1: `string + float` must concatenate (formatting the float), not take the float-add path (which bit-cast
+// the string pointer to a double and crashed). Both operand orders, plus a pure float-add control.
+import assert;
+
+@test
+fn test_string_plus_float(): void {
+    let f = 2.5;
+    assert.equalStr("v=" + f, "v=2.5");        // string + float
+    assert.equalStr(f + " end", "2.5 end");     // float + string
+    let g = 0.5;
+    assert.equalStr("a" + f + "b" + g, "a2.5b0.5");  // chained
+}
+
+@test
+fn test_float_add_still_works(): void {
+    let a = 2.5;
+    let b = 0.5;
+    let c = a + b;                               // pure float add (no string) unaffected
+    assert.equalStr(`${c}`, "3");
+}
