@@ -1424,6 +1424,13 @@ pub const Inferer = struct {
 
         out_sym.* = sid;
         if (sym.decl.function.ret_type) |r| {
+            // Lower the return type in the CALLEE's module scope, not the caller's. A bare type name in
+            // the signature (e.g. `Rec`) must bind to the module that DECLARED the function -- otherwise,
+            // when the caller also imports a same-named type, the return value is mistyped to the caller's
+            // version and later field access reads the wrong layout (S2). Save/restore the module context.
+            const saved_mod = self.lowerer.current_module;
+            self.lowerer.current_module = sym.module;
+            defer self.lowerer.current_module = saved_mod;
             const t = try self.lowerer.lower(r);
             if (self.store.get(t) == .unresolved) return null;
             return t;

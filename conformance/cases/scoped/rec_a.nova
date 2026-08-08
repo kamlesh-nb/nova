@@ -1,0 +1,7 @@
+// Module A: struct Rec with two ints (int at offset 0). makeA returns A's Rec.
+pub struct Rec {
+    pub x: int,
+    pub y: int,
+    init(a: int, b: int) { self.x = a; self.y = b; }
+}
+pub fn makeA(): Rec { return Rec(10, 20); }
