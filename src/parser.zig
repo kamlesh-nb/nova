@@ -2580,9 +2580,11 @@ pub const Parser = struct {
 
                     const trimmed = std.mem.trim(u8, sub_source, " \t\r\n");
                     const is_stmt = blk: {
+                        // A bare `${if (c) a else b}` is an if-EXPRESSION (it yields the interpolated value),
+                        // so `if` is NOT treated as a statement here -- `parseExpression` handles it. A
+                        // multi-statement body still routes to the block path via its `;`.
                         if (std.mem.startsWith(u8, trimmed, "for") or
                             std.mem.startsWith(u8, trimmed, "while") or
-                            std.mem.startsWith(u8, trimmed, "if") or
                             std.mem.startsWith(u8, trimmed, "switch") or
                             std.mem.startsWith(u8, trimmed, "let") or
                             std.mem.indexOfScalar(u8, trimmed, ';') != null) {
@@ -2671,9 +2673,11 @@ pub const Parser = struct {
 
                     const trimmed = std.mem.trim(u8, sub_source, " \t\r\n");
                     const is_stmt = blk: {
+                        // A bare `${if (c) a else b}` is an if-EXPRESSION (it yields the interpolated value),
+                        // so `if` is NOT treated as a statement here -- `parseExpression` handles it. A
+                        // multi-statement body still routes to the block path via its `;`.
                         if (std.mem.startsWith(u8, trimmed, "for") or
                             std.mem.startsWith(u8, trimmed, "while") or
-                            std.mem.startsWith(u8, trimmed, "if") or
                             std.mem.startsWith(u8, trimmed, "switch") or
                             std.mem.startsWith(u8, trimmed, "let") or
                             std.mem.indexOfScalar(u8, trimmed, ';') != null) {

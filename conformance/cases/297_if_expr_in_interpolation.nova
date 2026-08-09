@@ -1,0 +1,30 @@
+// I (parser gaps): a bare `if`-expression inside a string interpolation (`${if (c) a else b}`) was
+// rejected. The interpolation parser force-classified anything starting with `if` as a STATEMENT and
+// parsed it as an if-statement (which requires `{}` blocks), so the expression form failed with
+// "expected ; got else". If-expressions already work everywhere else (e.g. `let s = if (c) a else b`).
+// Fix: do not treat a leading `if` as a statement in interpolation -- route it through parseExpression,
+// which parses the if-expression. A genuinely multi-statement body (one containing `;`) still reaches the
+// block path unchanged.
+
+import assert;
+
+@test
+fn test_string_branches(): void {
+    let x = 5;
+    assert.equalStr(`${if (x > 3) "big" else "small"}`, "big");
+    let y = 1;
+    assert.equalStr(`${if (y > 3) "big" else "small"}`, "small");
+}
+
+@test
+fn test_embedded_in_surrounding_text(): void {
+    let n = 7;
+    assert.equalStr(`n = ${if (n > 3) "big" else "small"}!`, "n = big!");
+}
+
+@test
+fn test_numeric_branches(): void {
+    let x = 5;
+    assert.equalStr(`${if (x == 5) x else 0}`, "5");
+    assert.equalStr(`${if (x == 5) x * 2 else 0}`, "10");
+}

@@ -100,6 +100,8 @@ A UTF-8 byte buffer with a length prefix. Concatenation `+`, `.length`, indexing
 stdlib are ASCII/byte-level; `text.utf8` provides real codepoint iteration *(→ 03_strings, 26_utf8)*.
 Template strings are the canonical way to format values: `` `count = ${n}` `` — `${…}` stringifies
 `int`/`long`/`float`/`bool`/`decimal`/`string` via runtime helpers *(→ 24_stringify, 18_float_interp)*.
+The embedded `${…}` holds any expression, including an if-expression: `` `${if (x > 3) "big" else "small"}` ``
+*(→ 297)*.
 
 ### 3.4 Optionals — `T | undefined`
 
