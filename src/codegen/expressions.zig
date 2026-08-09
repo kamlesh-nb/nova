@@ -456,7 +456,7 @@ pub fn awaitedCallHandle(self: *LlvmCompiler, operand: ast.Expression, is_spawn:
             const exp_base = getStructBaseName(expected_type);
             if (self.traits.contains(exp_base)) {
                 if (try self.resolveExpressionTypeName(arg)) |struct_name| {
-                    if (self.structs.contains(struct_name)) {
+                    if (self.structs.contains(getStructBaseName(struct_name))) {
                         val = try self.constructTraitObject(val, struct_name, expected_type);
                         if (is_spawn) {
                             try self.compileRetain(val);
@@ -2314,7 +2314,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                             if (self.getFunctionParamType(actual_fn_name, idx + 1)) |expected_type| {
                                 if (self.traits.contains(getStructBaseName(expected_type))) {
                                     if (try self.resolveExpressionTypeName(arg)) |struct_name| {
-                                        if (self.structs.contains(struct_name)) {
+                                        if (self.structs.contains(getStructBaseName(struct_name))) {
                                             val = try self.constructTraitObject(val, struct_name, expected_type);
                                         }
                                     }
@@ -2472,7 +2472,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     if (self.getFunctionParamType(resolved_name, idx)) |expected_type| {
                         if (self.traits.contains(getStructBaseName(expected_type))) {
                             if (try self.resolveExpressionTypeName(arg)) |struct_name| {
-                                if (self.structs.contains(struct_name)) {
+                                if (self.structs.contains(getStructBaseName(struct_name))) {
                                     val = try self.constructTraitObject(val, struct_name, expected_type);
                                 }
                             }
@@ -2773,7 +2773,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                                             const expected_type = try self.typeRefToString(trt);
                                             if (self.traits.contains(getStructBaseName(expected_type))) {
                                                 if (try self.resolveExpressionTypeName(&arg)) |struct_name| {
-                                                    if (self.structs.contains(struct_name)) {
+                                                    if (self.structs.contains(getStructBaseName(struct_name))) {
                                                         val = try self.constructTraitObject(val, struct_name, expected_type);
                                                     }
                                                 }
@@ -2818,7 +2818,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                                 if (self.getFunctionParamType(cfa.field, idx)) |expected_type| {
                                     if (self.traits.contains(getStructBaseName(expected_type))) {
                                         if (try self.resolveExpressionTypeName(arg)) |struct_name| {
-                                            if (self.structs.contains(struct_name)) {
+                                            if (self.structs.contains(getStructBaseName(struct_name))) {
                                                 val = try self.constructTraitObject(val, struct_name, expected_type);
                                             }
                                         }
@@ -2939,7 +2939,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                                         const expected_type = try self.typeRefToString(trt);
                                         if (self.traits.contains(getStructBaseName(expected_type))) {
                                             if (try self.resolveExpressionTypeName(&arg)) |struct_name| {
-                                                if (self.structs.contains(struct_name)) {
+                                                if (self.structs.contains(getStructBaseName(struct_name))) {
                                                     val = try self.constructTraitObject(val, struct_name, expected_type);
                                                 }
                                             }
@@ -3003,7 +3003,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     if (self.getFunctionParamType(name, idx)) |expected_type| {
                         if (self.traits.contains(getStructBaseName(expected_type))) {
                             if (try self.resolveExpressionTypeName(arg)) |struct_name| {
-                                if (self.structs.contains(struct_name)) {
+                                if (self.structs.contains(getStructBaseName(struct_name))) {
                                     val = try self.constructTraitObject(val, struct_name, expected_type);
                                 }
                             }

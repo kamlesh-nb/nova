@@ -1413,7 +1413,9 @@ pub const LlvmCompiler = struct {
         const addr1 = core.LLVMBuildAdd(self.builder, trait_obj, core.LLVMConstInt(self.val_type, ptr_size, 0), "vtable_addr");
         const ptr1 = core.LLVMBuildIntToPtr(self.builder, addr1, core.LLVMPointerType(self.val_type, 0), "trait_vtable_ptr");
 
-        const vtable_global = try self.getGlobalVTable(struct_name, trait_name);
+        // Generic trait objects share ONE vtable per (base struct, trait) -- the type arg is erased for
+        // dispatch (`_vtable_Cell_Shape`, methods `Cell_area`), so look it up by the base struct name.
+        const vtable_global = try self.getGlobalVTable(getStructBaseName(struct_name), trait_name);
         const vtable_int = core.LLVMBuildPtrToInt(self.builder, vtable_global, self.val_type, "vtable_int");
         _ = core.LLVMBuildStore(self.builder, vtable_int, ptr1);
 
@@ -1581,7 +1583,7 @@ pub const LlvmCompiler = struct {
                     const expected_type = try self.typeRefToString(tr);
                     if (self.traits.contains(getStructBaseName(expected_type))) {
                         if (try self.resolveExpressionTypeName(arg)) |struct_name| {
-                            if (self.structs.contains(struct_name)) {
+                            if (self.structs.contains(getStructBaseName(struct_name))) {
                                 val = try self.constructTraitObject(val, struct_name, expected_type);
                             }
                         }
@@ -1945,7 +1947,7 @@ pub const LlvmCompiler = struct {
                         const widen_to = self.resolveParamTypeForWiden(obj_type, expected_type);
                         if (self.traits.contains(getStructBaseName(widen_to))) {
                             if (try self.resolveExpressionTypeName(arg)) |struct_name| {
-                                if (self.structs.contains(struct_name)) {
+                                if (self.structs.contains(getStructBaseName(struct_name))) {
                                     val = try self.constructTraitObject(val, struct_name, widen_to);
                                 }
                             }
@@ -1985,7 +1987,7 @@ pub const LlvmCompiler = struct {
                         const widen_to = self.resolveParamTypeForWiden(obj_type, expected_type);
                         if (self.traits.contains(getStructBaseName(widen_to))) {
                             if (try self.resolveExpressionTypeName(arg)) |struct_name| {
-                                if (self.structs.contains(struct_name)) {
+                                if (self.structs.contains(getStructBaseName(struct_name))) {
                                     val = try self.constructTraitObject(val, struct_name, widen_to);
                                 }
                             }
@@ -2014,7 +2016,7 @@ pub const LlvmCompiler = struct {
                         const widen_to = self.resolveParamTypeForWiden(obj_type, expected_type);
                         if (self.traits.contains(getStructBaseName(widen_to))) {
                             if (try self.resolveExpressionTypeName(arg)) |struct_name| {
-                                if (self.structs.contains(struct_name)) {
+                                if (self.structs.contains(getStructBaseName(struct_name))) {
                                     val = try self.constructTraitObject(val, struct_name, widen_to);
                                 }
                             }
@@ -2048,7 +2050,7 @@ pub const LlvmCompiler = struct {
                         const widen_to = self.resolveParamTypeForWiden(obj_type, expected_type);
                         if (self.traits.contains(getStructBaseName(widen_to))) {
                             if (try self.resolveExpressionTypeName(arg)) |struct_name| {
-                                if (self.structs.contains(struct_name)) {
+                                if (self.structs.contains(getStructBaseName(struct_name))) {
                                     val = try self.constructTraitObject(val, struct_name, widen_to);
                                 }
                             }

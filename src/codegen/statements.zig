@@ -5,6 +5,7 @@ const types = llvm.types;
 const core = llvm.core;
 const sema_types = @import("../types.zig");
 
+const getStructBaseName = @import("types.zig").getStructBaseName;
 const LlvmCompiler = @import("llvm_codegen.zig").LlvmCompiler;
 const FunctionInfo = @import("llvm_codegen.zig").FunctionInfo;
 const Scope = @import("llvm_codegen.zig").Scope;
@@ -143,7 +144,11 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
                         if (trait_decl_name) |expected_type| {
                             if (self.traits.contains(expected_type)) {
                                 if (try self.resolveExpressionTypeName(init_ptr)) |struct_name| {
-                                    if (self.structs.contains(struct_name)) {
+                                    // Check the BASE name so a generic instantiation (`Cell<int>`) widens too --
+                                    // `structs` is keyed by base name, so `contains("Cell<int>")` is false and
+                                    // the widening would be skipped, storing the raw struct pointer where a
+                                    // trait fat-pointer is expected (B5 SEGV on the first vtable dispatch).
+                                    if (self.structs.contains(getStructBaseName(struct_name))) {
                                         const orig_struct = val;
                                         val = try self.constructTraitObject(orig_struct, struct_name, expected_type);
 
