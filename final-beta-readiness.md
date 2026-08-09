@@ -12,7 +12,7 @@ full corpus + ASAN green) · 🔵 investigated, not a live bug (recorded, no fix
 ⬜ open / deferred. Severity: **S-crit** silent corruption/unsafety · **crash** · **wrong** silent wrong
 answer · **blk** does not compile/link · **gap** missing feature.
 
-**Score: 20 defect IDs fixed, 3 investigated-not-a-bug, ~14 open/deferred. Recent: A3-read (value-optional
+**Score: 20 defect IDs fixed, 4 investigated-not-a-bug, ~13 open/deferred. Recent: A3-read (value-optional
 monomorphisation collision, fuzzer-found); G3 (JSON surrogate-pair astral corruption); shift-infer (integer
 literals in a `long` context computed in 32 bits); lit-i64 (decimal literal above i64 range silently → 0);
 F2 (payload-enum `==` compared identity not value). Every fix is repro-first with a
@@ -49,7 +49,7 @@ gating case (273–285) and stays corpus + ASAN green.**
 | E3 | E async | crash | ⬜ | reap-mark not cleared for awaited children (latent) |
 | F1 | F enum/union | crash | ⬜ | `T\|E\|undefined` value-arm SEGV |
 | F2 | F enum/union | wrong | ✅ | payload-enum `==` now compares by VALUE (word-by-word over the same-size zero-padded box), not heap identity. Value payloads compare by value; string/heap payload fields stay identity (documented). Case 290 |
-| F3 | F enum/union | wrong | ⬜ | `switch` over error-union falls through |
+| F3 | F enum/union | — | 🔵 | NOT a needed construct. Per spec §3.5 an error union `T \| E` is handled with `try`/`catch`; to branch on error variants you `catch (e) helper(e)` (or use the exception's `message()`) and `switch` on the UNWRAPPED enum error, which works (cases 266, 32). A raw `switch` over `T \| E` is not in the language. Follow-on (minor): have the checker reject it outright instead of falling through |
 | G3 | G stdlib | S-crit | ✅ | JSON `\uXXXX` surrogate pairs now combine into one astral code point (4-byte UTF-8); decoder was encoding each surrogate independently → 6 bytes of mojibake. Case 287 |
 | G5 | G stdlib | wrong | ⬜ | `try` propagates mismatched error type |
 | H4 | H numeric | wrong | ⬜ | decimal >34 digits truncate not round-half-even |
@@ -313,7 +313,11 @@ Root: 1b.
   (`src/codegen/expressions.zig`, `payloadEnumBoxWords`). Value-type payloads compare by value; a string /
   heap payload field still compares by pointer identity (a documented limitation, since a fully structural
   compare would dispatch per field type). Payload-less enum `==` was already correct (integer tags). Case 290.
-- **F3** `switch` over an error-union always falls through to `default` (never matches a variant).
+- **F3** (not a needed construct) a raw `switch` over an error-union `T | E` falls through to `default`.
+  This is not part of the language: per spec §3.5, errors are handled with `try`/`catch`, and to branch on
+  the error variants you `catch (e) helper(e)` (or rely on the exception's `message()`) and `switch` on the
+  UNWRAPPED enum error `E`, which works (cases 266, 32). Reclassified as investigated-not-a-bug; a minor
+  follow-on is to have the checker reject a `switch` over `T | E` outright rather than silently fall through.
 
 ### Cluster G: standard library and checker correctness  [wrong + crash]
 - **G1** `Map` with an integer or enum key of value **0** is silently unretrievable: `map.nova` uses `key==0`
@@ -424,7 +428,8 @@ first; they make whole classes impossible rather than patching instances.
    a runtime check to trait-to-concrete downcast.
 
 ### Phase F3: the checker and stdlib correctness bugs
-7. **G2** reject or correctly lower non-enum `switch`; **F3** the error-union switch; **G1** the Map key-0
+7. **G2** reject or correctly lower non-enum `switch`; ~~**F3** the error-union switch~~ (reclassified: not a
+   language construct, use `catch` + enum switch on the unwrapped error, §3.5); **G1** the Map key-0
    sentinel; **G5** the loose-`try` error-type check; **H3** integer div-by-zero trap; **H4** decimal >34-digit
    round-half-even; **H5** float `!=` predicate; **G3** JSON surrogate pairs; **G4** parseI64.
 
