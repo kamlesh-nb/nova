@@ -12,6 +12,7 @@ const LlvmCompiler = @import("llvm_codegen.zig").LlvmCompiler;
 const getStructBaseName = @import("types.zig").getStructBaseName;
 const isPrimitiveTypeName = @import("types.zig").isPrimitiveTypeName;
 const mangleTypeName = @import("types.zig").mangleTypeName;
+const valueOptionalName = @import("types.zig").valueOptionalName;
 
 pub fn enumIsTaggedUnion(self: *LlvmCompiler, enum_name: []const u8) bool {
     const enum_decl = self.enums.get(enum_name) orelse return false;
@@ -373,15 +374,24 @@ fn storageElem(type_name: []const u8) ?[]const u8 {
 }
 
 fn buildStorageDestructor(self: *LlvmCompiler, dest_fn: types.LLVMValueRef, elem: []const u8) anyerror!void {
-    const owned = self.isOwnedStorageElemByName(elem);
-    const elem_dest = if (owned) try self.getOrCreateDestructor(elem) else null;
-    try buildStorageDestructorLoop(self, dest_fn, owned, elem_dest);
+    // See buildStorageDestructorByTypeId: a value-optional element is a heap box the container owns and
+    // must free on drop (a plain value-optional's destructor is null, which frees the box).
+    const should_free = self.isOwnedStorageElemByName(elem) or valueOptionalName(elem);
+    const elem_dest = if (should_free) try self.getOrCreateDestructor(elem) else null;
+    try buildStorageDestructorLoop(self, dest_fn, should_free, elem_dest);
 }
 
 fn buildStorageDestructorByTypeId(self: *LlvmCompiler, dest_fn: types.LLVMValueRef, elem_tid: typesys.TypeId) anyerror!void {
-    const owned = self.isOwnedTypeId(elem_tid);
-    const elem_dest = if (owned) try self.getOrCreateDestructorByTypeId(elem_tid) else null;
-    try buildStorageDestructorLoop(self, dest_fn, owned, elem_dest);
+    // A value-optional element (`int | undefined`) is a heap BOX even though it is not "owned" in the deep
+    // sense (its payload is a value), so the container OWNS its element boxes and must free each one on
+    // drop -- else a `List<int | undefined>` / `Map<K, int | undefined>` leaks its present-value boxes.
+    // `nova_release` with the element's destructor (null for a plain value-optional) frees the box; an
+    // `undefined` element is 0 and released as a no-op. Balanced against Storage.set retaining the box and
+    // the insert-argument temporary being drained (see the valopt arg-box sites in llvm_codegen.zig).
+    const is_valopt = self.valueOptionalInner(elem_tid) != null;
+    const should_free = self.isOwnedTypeId(elem_tid) or is_valopt;
+    const elem_dest = if (should_free) try self.getOrCreateDestructorByTypeId(elem_tid) else null;
+    try buildStorageDestructorLoop(self, dest_fn, should_free, elem_dest);
 }
 
 fn buildStorageDestructorLoop(self: *LlvmCompiler, dest_fn: types.LLVMValueRef, owned: bool, elem_dest: ?types.LLVMValueRef) anyerror!void {

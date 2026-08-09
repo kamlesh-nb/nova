@@ -1,0 +1,54 @@
+// A value-optional container element (`List<int | undefined>`, `Map<K, int | undefined>`) is stored as a
+// heap BOX. The container OWNS those boxes: it must free them on drop. It used to LEAK them --
+// `buildStorageDestructorLoop` returned early for a not-"owned" element type (a value-optional is not
+// deeply owned since its payload is a value), so `Storage<int | undefined>`'s destructor was a no-op, and
+// the value-optional box created for each insert argument was never drained. Fix: the Storage destructor
+// frees value-optional element boxes, AND the insert-argument box is registered as a temporary so the
+// caller's reference is released at statement end (Storage.set takes its own reference). create(+1) +
+// set-retain(+1) balance drain(-1) + container-release(-1).
+//
+// This is an ARC/leak gate: run under `--arc` (leak) and `--asan` (no double-free from grow/realloc moving
+// element boxes between the old and new Storage). Reading a value-optional element uses `at` (returns the
+// element directly); `get` returns `T | undefined`, which for a value-optional `T` is a NESTED optional
+// (the separate, still-open A-nested case), so it is intentionally not exercised here.
+
+import assert;
+import list;
+import map;
+
+@test
+fn test_list_value_optional_lifecycle(): void {
+    let xs = List<int | undefined>();
+    xs.push(5);
+    xs.push(undefined);
+    xs.push(7);
+    assert.equalInt(3, xs.size());
+    assert.equalInt(5, xs.at(0) ?? -1);
+    assert.equalInt(-1, xs.at(1) ?? -1);   // present-undefined reads as its default via at
+    assert.equalInt(7, xs.at(2) ?? -1);
+}
+
+@test
+fn test_list_value_optional_grow(): void {
+    // Force several grow()/realloc cycles: element boxes are moved between the old and new Storage; the
+    // old Storage must NOT double-free them, the new one must free them on drop.
+    let xs = List<int | undefined>();
+    let i = 0;
+    while (i < 40) {
+        xs.push(i);
+        i = i + 1;
+    }
+    assert.equalInt(40, xs.size());
+    assert.equalInt(0, xs.at(0) ?? -1);
+    assert.equalInt(39, xs.at(39) ?? -1);
+}
+
+@test
+fn test_map_value_optional_lifecycle(): void {
+    let m = Map<string, int | undefined>(8, string.hash);
+    m.set("a", 3);
+    m.set("b", undefined);
+    m.set("c", 9);
+    assert.equalInt(3, m.at("a") ?? -1);
+    assert.equalInt(9, m.at("c") ?? -1);
+}

@@ -2012,7 +2012,9 @@ pub const LlvmCompiler = struct {
                 for (args_exprs, 0..) |*arg, idx| {
                     var val = try self.compileCallArgument(arg.*);
                     var widened_any = false;
+                    var elem_type_name: ?[]const u8 = null;
                     if (self.getFunctionParamType(func_name, idx + 1)) |expected_type| {
+                        elem_type_name = expected_type;
                         const widen_to = self.resolveParamTypeForWiden(obj_type, expected_type);
                         if (self.traits.contains(getStructBaseName(widen_to))) {
                             if (try self.resolveExpressionTypeName(arg)) |struct_name| {
@@ -2036,10 +2038,16 @@ pub const LlvmCompiler = struct {
                     // undefined>.push(7)`), so the slot holds a box a later read can unbox rather than a
                     // raw value it would dereference as a pointer. `undefined` stays 0 (a box holding 0
                     // would read back as a present 0); an already-boxed value-optional is left as-is.
+                    // The box is a fresh OWNED temporary: register it so its caller-side reference is
+                    // released at statement end. `Storage.set` takes its OWN reference (retain-on-store) and
+                    // the container frees it on drop (buildStorageDestructor), so create(+1) / set-retain(+1)
+                    // balance drain(-1) / container-release(-1) -- else a `List<int|undefined>` leaks its
+                    // present-value boxes.
                     if (!widened_any and !LlvmCompiler.isUndefinedLiteralExpr(arg) and !self.exprYieldsValoptBox(arg) and
                         self.methodParamIsValueOptional(fa.object, fa.field, idx))
                     {
                         val = try self.buildValoptBox(self.coerceToSlotType(val, self.val_type));
+                        if (elem_type_name) |etn| try self.registerTemporary(val, try self.allocator.dupe(u8, etn));
                     }
                     args[idx + 1] = val;
                 }
