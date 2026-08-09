@@ -86,7 +86,7 @@ A program's entry is `fn main(): void`. Command-line arguments are read via `env
 | `decimal` | IEEE 754-2008 decimal128 (BID) | 16-byte ARC heap object; §3.6 |
 | `ptr` | opaque machine word | first-class, **non-owned** address value *(→ 17_ptr)* |
 | `void` | no value | |
-| `any` | 🔎 present, not rejected | no type-system meaning; avoid |
+| `any` | owned refcounted carrier | boxes a value as `{payload, dtor}`; widen boxes + retains, `x as T` unboxes; §3.8 |
 
 ### 3.2 Value vs reference
 
@@ -224,6 +224,22 @@ struct Point { pub x: int, pub y: int
   instantiation), so codegen is unchanged. *(→ 55_generic_traits)*. Foundation for the
   typed-mediator routing framework (`docs/design/done/route-handling-via-mediator.md`).
 - **Unions** — `union_decl` exists 🔎 (not corpus-verified as a user feature).
+
+### 3.8 `any` — an owned refcounted carrier
+
+`any` is a memory-safe, type-erased carrier, not an opaque pointer. A value widened into `any` (by an
+`any`-typed binding, argument, or container element such as `Map<string, any>`) is **boxed** into a
+small refcounted object holding `{payload, dtor}`, where `dtor` is the payload's destructor when the
+payload is a heap type (a struct, string, list, and so on) and null for a plain value. Widening a live
+binding **retains** the payload, so the boxed value outlives the source binding: storing a heap struct
+into a container as `any` and reading it back after the original binding has dropped is safe, and the
+container releases the box exactly once when it drops, releasing the payload through the recorded `dtor`
+(no dangling read, no leak, no double-free).
+
+Reading a concrete value back out uses `as`: `x as T` **unboxes** the carrier and yields the payload
+(retaining it for a heap target). As with any downcast, `x as T` assumes the stored type really is `T`;
+the trait-object form is runtime-checked (§7), the plain-value form is not. Prefer a concrete type where
+one is known; `any` exists for genuinely heterogeneous storage (for example a DI container's service map).
 
 ---
 

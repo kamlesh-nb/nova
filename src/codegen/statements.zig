@@ -165,9 +165,25 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
                     if (self.current_local_types) |lt| {
                         target_type = lt.get(ls.name);
                     }
+                    // Widen a value into an owning `any` local: box it into a `{payload, dtor}` carrier so the
+                    // local owns a real refcounted box. Skip the generic owned-retain below -- coerceToAny has
+                    // already balanced the payload's refcount.
+                    var widened_to_any = false;
+                    if (target_type) |tt| {
+                        if (!widened_to_trait and std.mem.eql(u8, tt, "any")) {
+                            const src = (try self.resolveExpressionTypeName(init_ptr)) orelse "";
+                            if (!std.mem.eql(u8, src, "any")) {
+                                val = try self.coerceToAny(val, init_ptr);
+                                // The local takes ownership of the box; drop the temp registration so it is
+                                // not double-released at statement end (the local's own drop releases it).
+                                self.consumeTemporary(val);
+                                widened_to_any = true;
+                            }
+                        }
+                    }
                     if (target_type) |tt| {
 
-                        if (!widened_to_trait and self.isOwnedLocal(ls.name, tt)) {
+                        if (!widened_to_trait and !widened_to_any and self.isOwnedLocal(ls.name, tt)) {
 
                             const is_enum_variant_ctor = init.kind == .field_access and
                                 init.kind.field_access.object.kind == .ident and

@@ -48,6 +48,9 @@ pub const Type = union(enum) {
     decimal,
 
     ptr,
+    // `any` -- a type-erased OWNING carrier. Distinct from `ptr` (unowned/manual) so the ownership machinery
+    // releases it. At runtime an `any` value is a refcounted `nova_any_box { payload, dtor }`.
+    any_,
     struct_: StructType,
     enum_: SymbolId,
     trait_: SymbolId,
@@ -75,7 +78,7 @@ fn hashType(t: Type) u64 {
             h.update(std.mem.asBytes(&p.bits));
             h.update(&[_]u8{@intFromBool(p.signed)});
         },
-        .string, .decimal, .ptr, .unresolved => {},
+        .string, .decimal, .ptr, .any_, .unresolved => {},
         .error_union => |eu| {
             h.update(std.mem.asBytes(&eu.ok));
             h.update(std.mem.asBytes(&eu.err));
@@ -149,7 +152,7 @@ fn eqlType(a: Type, b: Type) bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     return switch (a) {
         .prim => |p| p.eql(b.prim),
-        .string, .decimal, .ptr, .unresolved => true,
+        .string, .decimal, .ptr, .any_, .unresolved => true,
         .struct_ => |s| s.decl == b.struct_.decl and eqlIds(s.args, b.struct_.args),
         .enum_ => |x| x == b.enum_,
         .error_union => |eu| eu.ok == b.error_union.ok and eu.err == b.error_union.err,
@@ -267,6 +270,9 @@ pub const TypeStore = struct {
     pub fn ptrT(self: *TypeStore) !TypeId {
         return self.intern(.ptr);
     }
+    pub fn anyT(self: *TypeStore) !TypeId {
+        return self.intern(.any_);
+    }
     pub fn unresolvedT(self: *TypeStore) !TypeId {
         return self.intern(.unresolved);
     }
@@ -274,6 +280,7 @@ pub const TypeStore = struct {
     pub fn isOwned(self: *const TypeStore, id: TypeId) bool {
         return switch (self.get(id)) {
             .prim, .ptr => false,
+            .any_ => true,
             .string, .decimal, .struct_, .array, .tuple => true,
 
             .error_union => true,

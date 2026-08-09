@@ -605,6 +605,61 @@ pub const LlvmCompiler = struct {
         return core.LLVMBuildCall2(self.builder, ft, f, &args, 1, "valopt_unbox");
     }
 
+    pub fn buildAnyBox(self: *LlvmCompiler, payload: types.LLVMValueRef, dtor: types.LLVMValueRef) anyerror!types.LLVMValueRef {
+        const f = if (self.func_map.get("nova_any_box")) |g| g else blk: {
+            var at = [_]types.LLVMTypeRef{ self.val_type, self.val_type };
+            const ft = core.LLVMFunctionType(self.val_type, &at, 2, 0);
+            const g = core.LLVMAddFunction(self.module, "nova_any_box", ft);
+            try self.func_map.put("nova_any_box", g);
+            break :blk g;
+        };
+        const ft = core.LLVMGlobalGetValueType(f);
+        var args = [_]types.LLVMValueRef{ payload, dtor };
+        return core.LLVMBuildCall2(self.builder, ft, f, &args, 2, "any_box");
+    }
+
+    pub fn buildAnyUnbox(self: *LlvmCompiler, box: types.LLVMValueRef) anyerror!types.LLVMValueRef {
+        const f = if (self.func_map.get("nova_any_unbox")) |g| g else blk: {
+            var at = [_]types.LLVMTypeRef{self.val_type};
+            const ft = core.LLVMFunctionType(self.val_type, &at, 1, 0);
+            const g = core.LLVMAddFunction(self.module, "nova_any_unbox", ft);
+            try self.func_map.put("nova_any_unbox", g);
+            break :blk g;
+        };
+        const ft = core.LLVMGlobalGetValueType(f);
+        var args = [_]types.LLVMValueRef{box};
+        return core.LLVMBuildCall2(self.builder, ft, f, &args, 1, "any_unbox");
+    }
+
+    // Widen a value of `src_expr` into an owning `any` carrier. A heap payload is retained when the source
+    // is a live borrow (an owned temp transfers its ref to the box); the box records the payload's
+    // destructor so dropping the `any` releases the payload.
+    pub fn coerceToAny(self: *LlvmCompiler, val: types.LLVMValueRef, src_expr: *const ast.Expression) anyerror!types.LLVMValueRef {
+        const payload = self.coerceToSlotType(val, self.val_type);
+        const src_name = (try self.resolveExpressionTypeName(src_expr)) orelse "";
+        if (std.mem.eql(u8, src_name, "any")) return payload; // already a carrier
+        var dtor = core.LLVMConstInt(self.val_type, 0, 0);
+        const src_tid = self.typeOfExprConcrete(src_expr);
+        const heap = if (src_tid) |t| self.type_store.?.isOwnedSafe(t) else self.ownedByName(src_name);
+        if (heap) {
+            if (try self.getOrCreateDestructorPreferId(src_name, src_tid)) |dfn| {
+                dtor = core.LLVMBuildPtrToInt(self.builder, dfn, self.val_type, "any_dtor");
+            }
+            const is_borrow = src_expr.kind == .ident or src_expr.kind == .field_access or src_expr.kind == .index;
+            if (is_borrow) {
+                try self.compileRetain(payload);
+            } else {
+                self.consumeTemporary(payload);
+            }
+        }
+        const box = try self.buildAnyBox(payload, dtor);
+        // The box is a fresh owned temporary (rc=1). Register it so a call that stores it (and retains)
+        // has its extra caller-side reference released at statement end; a let-init that takes ownership
+        // consumes this registration instead (see the widen path in statements.zig).
+        try self.registerTemporary(box, "any");
+        return box;
+    }
+
     pub fn valoptTypeRefIsValue(self: *LlvmCompiler, tr: ast.TypeRef) bool {
         if (tr != .optional) return false;
         const inner = self.typeRefToString(tr.optional.*) catch return false;
@@ -1167,6 +1222,13 @@ pub const LlvmCompiler = struct {
                             const actual_idx = if (is_constructor) param_idx - 1 else param_idx;
                             if (actual_idx < m.decl.params.len) {
                                 if (m.decl.params[actual_idx].type_name) |t| {
+                                    // Render the param under the CALLEE's instantiation (`owner` is the angle-form
+                                    // `Map<string, any>`), so a struct type-param like `V` resolves to its concrete
+                                    // (`any`) even though this is reached from the caller's context. Without this the
+                                    // param reads back as the bare type-param name.
+                                    const saved = self.current_instantiation;
+                                    self.current_instantiation = owner;
+                                    defer self.current_instantiation = saved;
                                     return self.typeRefToString(t) catch null;
                                 }
                             }
@@ -1230,7 +1292,19 @@ pub const LlvmCompiler = struct {
         return null;
     }
 
-    pub fn coerceValoptArg(self: *LlvmCompiler, val: types.LLVMValueRef, arg: *const ast.Expression, param_tr_opt: ?ast.TypeRef) anyerror!types.LLVMValueRef {
+    pub fn coerceValoptArg(self: *LlvmCompiler, val: types.LLVMValueRef, arg: *const ast.Expression, param_tr_opt: ?ast.TypeRef, param_str_opt: ?[]const u8) anyerror!types.LLVMValueRef {
+        // Widen an argument into an `any` parameter: box it into an owning carrier. The parameter type is
+        // taken from the callee's INSTANTIATION-substituted string (`getFunctionParamType`), not the raw AST
+        // ref -- so a generic `set(v: V)` on `Map<K, any>`, whose ref renders `V` but whose substituted type
+        // is `any`, boxes too. The container then only ever stores real heap boxes, so its element
+        // retain/release works unchanged.
+        if (param_str_opt) |param_str| {
+            if (std.mem.eql(u8, param_str, "any")) {
+                const src = (try self.resolveExpressionTypeName(arg)) orelse "";
+                if (!std.mem.eql(u8, src, "any")) return try self.coerceToAny(val, arg);
+                return val;
+            }
+        }
         const param_tr = param_tr_opt orelse return val;
         if (self.valoptTypeRefIsValue(param_tr) and
             !LlvmCompiler.isUndefinedLiteralExpr(arg) and
@@ -1935,6 +2009,7 @@ pub const LlvmCompiler = struct {
                 try self.guardOptionalDeref(fa.object, args[0], fa.span);
                 for (args_exprs, 0..) |*arg, idx| {
                     var val = try self.compileCallArgument(arg.*);
+                    var widened_any = false;
                     if (self.getFunctionParamType(func_name, idx + 1)) |expected_type| {
                         const widen_to = self.resolveParamTypeForWiden(obj_type, expected_type);
                         if (self.traits.contains(getStructBaseName(widen_to))) {
@@ -1943,13 +2018,23 @@ pub const LlvmCompiler = struct {
                                     val = try self.constructTraitObject(val, struct_name, widen_to);
                                 }
                             }
+                        } else if (std.mem.eql(u8, widen_to, "any")) {
+                            // Widen a value inserted into an owning `any` element slot (`Map<K, any>.set(k, v)`):
+                            // box it into a `{payload, dtor}` carrier so the container stores a real heap box
+                            // and its element retain/release stays uniform. The callee param resolves to `any`
+                            // via the instantiation even though the generic ref is a bare type-param.
+                            const src = (try self.resolveExpressionTypeName(arg)) orelse "";
+                            if (!std.mem.eql(u8, src, "any")) {
+                                val = try self.coerceToAny(val, arg);
+                                widened_any = true;
+                            }
                         }
                     }
                     // Box a plain value being inserted into a value-optional element slot (`List<int |
                     // undefined>.push(7)`), so the slot holds a box a later read can unbox rather than a
                     // raw value it would dereference as a pointer. `undefined` stays 0 (a box holding 0
                     // would read back as a present 0); an already-boxed value-optional is left as-is.
-                    if (!LlvmCompiler.isUndefinedLiteralExpr(arg) and !self.exprYieldsValoptBox(arg) and
+                    if (!widened_any and !LlvmCompiler.isUndefinedLiteralExpr(arg) and !self.exprYieldsValoptBox(arg) and
                         self.methodParamIsValueOptional(fa.object, fa.field, idx))
                     {
                         val = try self.buildValoptBox(self.coerceToSlotType(val, self.val_type));

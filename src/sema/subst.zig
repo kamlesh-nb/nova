@@ -81,7 +81,7 @@ pub fn substitute(
             break :blk try store.intern(.{ .tuple = es });
         },
 
-        .prim, .string, .decimal, .ptr, .enum_, .trait_, .unresolved => t,
+        .prim, .string, .decimal, .ptr, .any_, .enum_, .trait_, .unresolved => t,
     };
 }
 

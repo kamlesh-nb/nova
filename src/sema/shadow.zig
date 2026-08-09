@@ -780,6 +780,7 @@ fn renderUncached(allocator: std.mem.Allocator, store: *const typesys.TypeStore,
         .unresolved => "<unresolved>",
         .string => "string",
         .decimal => "decimal",
+        .any_ => "any",
 
         .error_union => |eu| blk: {
             var buf = std.ArrayListUnmanaged(u8).empty;

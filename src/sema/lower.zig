@@ -141,7 +141,7 @@ pub const Lowerer = struct {
 
                 if (std.mem.eql(u8, name, "any")) {
                     self.stats.lowered += 1;
-                    return self.store.ptrT();
+                    return self.store.anyT();
                 }
                 return self.unresolved(name);
             },

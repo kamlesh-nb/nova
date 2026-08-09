@@ -596,6 +596,17 @@ pub fn getOrCreateDestructorPreferId(self: *LlvmCompiler, name_str: []const u8, 
 
 pub fn getOrCreateDestructor(self: *LlvmCompiler, type_name: []const u8) anyerror!?types.LLVMValueRef {
 
+    // `any` is a refcounted `nova_any_box {payload, dtor}`; nova_any_box_dtor releases the payload via the
+    // stored dtor before the box is freed.
+    if (std.mem.eql(u8, type_name, "any")) {
+        if (self.func_map.get("nova_any_box_dtor")) |f| return f;
+        var one = [_]types.LLVMTypeRef{self.val_type};
+        const ft = core.LLVMFunctionType(self.void_type, &one, 1, 0);
+        const f = core.LLVMAddFunction(self.module, "nova_any_box_dtor", ft);
+        try self.func_map.put("nova_any_box_dtor", f);
+        return f;
+    }
+
     if (self.traits.contains(type_name)) return try getOrCreateTraitDestructor(self);
 
     if (isFunctionType(type_name)) {

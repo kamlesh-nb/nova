@@ -8,13 +8,13 @@
 // — a RESOLVED, non-owned type. Importing `web.di` (which is built on `Map<string, any>`) used to
 // abort the compile; it now works.
 //
-// KNOWN LIMITATION (documented, follow-up — NOT tested here because it is unsafe today): because
-// `any` is non-owned (`.ptr`), a HEAP value (a struct) stored into a container AS `any` is not
-// retained by the container, so once the original binding is released the container holds a dangling
-// pointer. Storing an `int` (value, test 1) is safe; using an `any` immediately from a factory call
-// (test 4, the real DI resolve path) is safe; a direct `any`→downcast of a live binding (test 2) is
-// safe. A proper fix for "heap value parked in a container as `any`" needs a design decision — box
-// value types, or give `any` owned-retain semantics — and is tracked as follow-up (W4 / `any` model).
+// OWNING `any` (D1/D2, fixed): `any` is now an OWNED carrier. Widening a value into `any` boxes it into
+// a refcounted `{payload, dtor}` box (`nova_any_box`); reading `x as T` unboxes it. A HEAP value (a
+// struct or string) stored into a container as `any` is therefore RETAINED by the container, so it
+// survives after the original binding is released (no dangling pointer, test 6/7), and the container
+// releases it exactly once when it drops (no leak, no double-free — the box records the payload's
+// destructor). Storing an `int` value (test 1), an immediate factory `any` (test 4), and a live-binding
+// downcast (test 2) all remain correct.
 import assert;
 import map;
 import web.di;
@@ -90,6 +90,39 @@ fn test_di_singleton_cached_reresolve(): void {
     switch (second) {
         case Resolved.Ok(v): { assert.equalInt(11, (v as Logger).tag); }
         case Resolved.NotRegistered(k): { assert.fail("cached resolve"); }
+    }
+}
+
+// (6) D1/D2: a HEAP struct stored into a container as `any`, where the ORIGINAL binding is released
+//     before the read. The owning `any` box retains the struct, so the container still holds a live
+//     object after `b` drops (no dangling read), and releases it exactly once on drop (no leak).
+struct Box { pub v: int, init(x: int) { self.v = x; } }
+@test
+fn test_heap_struct_any_survives_binding(): void {
+    let m = Map<string, any>(8, string.hash);
+    {
+        let b = Box(99);
+        m.set("k", b);
+    }
+    let got = m.get("k");
+    if (got != undefined) {
+        let bb = (got ?? Box(0)) as Box;
+        assert.equalInt(99, bb.v);
+    } else {
+        assert.fail("heap struct should survive in the container");
+    }
+}
+
+// (7) A heap string parked as `any` and read back.
+@test
+fn test_heap_string_any_roundtrip(): void {
+    let m = Map<string, any>(8, string.hash);
+    m.set("s", "payload string in an any slot");
+    let got = m.get("s");
+    if (got != undefined) {
+        assert.equalStr("payload string in an any slot", (got ?? "") as string);
+    } else {
+        assert.fail("string should be present");
     }
 }
 

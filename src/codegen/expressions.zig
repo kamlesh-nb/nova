@@ -449,7 +449,7 @@ pub fn awaitedCallHandle(self: *LlvmCompiler, operand: ast.Expression, is_spawn:
     for (call_args, 0..) |*arg, idx| {
         var val = try self.compileCallArgument(arg.*);
 
-        val = try self.coerceValoptArg(val, arg, self.getFunctionParamTypeRef(resolved, idx + recv_off));
+        val = try self.coerceValoptArg(val, arg, self.getFunctionParamTypeRef(resolved, idx + recv_off), self.getFunctionParamType(resolved, idx + recv_off));
 
         const pidx = idx + recv_off;
         if (self.getFunctionParamType(resolved, pidx)) |expected_type| {
@@ -2310,7 +2310,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                         for (call.args, 0..) |*arg, idx| {
                             var val = try self.compileCallArgument(arg.*);
 
-                            val = try self.coerceValoptArg(val, arg, self.getFunctionParamTypeRef(actual_fn_name, idx + 1));
+                            val = try self.coerceValoptArg(val, arg, self.getFunctionParamTypeRef(actual_fn_name, idx + 1), self.getFunctionParamType(actual_fn_name, idx + 1));
                             if (self.getFunctionParamType(actual_fn_name, idx + 1)) |expected_type| {
                                 if (self.traits.contains(getStructBaseName(expected_type))) {
                                     if (try self.resolveExpressionTypeName(arg)) |struct_name| {
@@ -2468,7 +2468,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 for (call.args, 0..) |*arg, idx| {
                     var val = try self.compileCallArgument(arg.*);
 
-                    val = try self.coerceValoptArg(val, arg, self.getFunctionParamTypeRef(resolved_name, idx));
+                    val = try self.coerceValoptArg(val, arg, self.getFunctionParamTypeRef(resolved_name, idx), self.getFunctionParamType(resolved_name, idx));
                     if (self.getFunctionParamType(resolved_name, idx)) |expected_type| {
                         if (self.traits.contains(getStructBaseName(expected_type))) {
                             if (try self.resolveExpressionTypeName(arg)) |struct_name| {
@@ -3729,9 +3729,23 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             return final_str;
         },
         .cast => |c| {
-            const val = try self.compileExpression(c.expr.*);
+            var val = try self.compileExpression(c.expr.*);
             const target = try self.typeRefToString(c.target_type);
             const src_opt = try self.resolveExpressionTypeName(c.expr);
+
+            // Reading a concrete value out of an `any` carrier: unbox the `{payload, dtor}` box. The payload
+            // is a new reference, so retain it when the target is heap-owned (the box keeps its own ref
+            // until it drops).
+            if (src_opt) |src| {
+                if (std.mem.eql(u8, src, "any") and !std.mem.eql(u8, target, "any")) {
+                    val = try self.buildAnyUnbox(self.coerceToSlotType(val, self.val_type));
+                    if (self.ownedByName(target) or self.isStructType(target) or self.traits.contains(target)) {
+                        try self.compileRetain(val);
+                        try registerTemporary(self, val, try self.allocator.dupe(u8, target));
+                    }
+                    return val;
+                }
+            }
 
             if (src_opt) |src| {
                 if (self.traits.contains(src) and self.isStructType(target)) {
