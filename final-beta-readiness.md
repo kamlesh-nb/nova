@@ -291,9 +291,24 @@ Monomorphisation identity is sound, but the surrounding machinery is not. This i
 - **B3** a generic function **returning a value of its owned type-parameter type double-frees** (heap UAF):
   the borrowed `U` argument is not retained on return. Invisible to the `--arc` gate (double-free leaves zero
   live objects). Blast radius: `List.reduce<U>` and any combinator returning its accumulator.
-- **B4** `Set<T>` fails to **link** (`_Map_keysEqual` undefined): nested-generic mono references a private
-  method of `Map<T,bool>` by its unmangled base name when `Map` is a field of `Set`. A whole stdlib collection
-  is unusable; merely `import set;` breaks the build.
+- **B4** `Set<T>` is broken in TWO stacked layers (investigated 2026-08-09; NOT yet fixed, tree kept
+  known-good). A whole stdlib collection is unusable. Minimal repro of each below.
+  - **Layer 1 — link-order DCE race.** The erased `Map.set`/`get`/`delete_key` (internal fallback bodies)
+    call the *private* `Map.keysEqual`, but the erased-body emitter (`declarations.zig` ~850) skips an
+    erased body whose fn has *no uses at that instant*; `keysEqual` is declared before `set`, so it is
+    visited first with no use yet and skipped, then `set` (emitted later) references it -> `_Map_keysEqual`
+    undefined at link. Order-dependent. FIX (validated locally, then reverted to keep the tree clean since
+    layer 2 still crashes): make that emission a FIXPOINT -- keep emitting erased bodies that have *gained*
+    a use until none newly qualify (each body emitted at most once). This makes `Set<int>` LINK.
+  - **Layer 2 — value-optional through a generic method is released as owned (crash).** With layer 1
+    fixed, `Set<int>` links but `has()` crashes. Minimal repro: a generic `struct S<T> { m: Map<T, bool> ...
+    fn has(self, e: T): bool { return self.m.get(e) != undefined; } }` called at runtime. `get` returns
+    `V | undefined`; in the mono `S_i32_has` codegen the get-result is registered as an OWNED temporary and
+    `nova_release(result, null)`d, but for `V=bool` the value-optional is not a releasable heap object ->
+    frees garbage -> SIGSEGV in `nova_release`. The IDENTICAL direct `Map<int,bool>.get(k) != undefined`
+    (outside a generic method) is correct -- so the bug is the owned-temp classification of a `V|undefined`
+    result inside a generic method body. Likely more layers after (the mono `Storage_<T>` destructor is a
+    no-op, i.e. a leak). Needs a dedicated multi-part pass, not a single fix.
 - **B5** generic `struct impl Trait` called **through a trait object** SEGVs (malformed vtable).
 - **B6** generic `async fn` cannot resolve `serde.bind<T>` (T erased through the async frame).
 Bounded clean: nested and recursive generics, generic trait objects, mono identity and distinct layouts all
