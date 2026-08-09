@@ -1922,6 +1922,14 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
         },
         .call => |call| {
 
+            // Optional-chaining METHOD call: `obj?.method(args)` where `obj` is `T | undefined`. Evaluate
+            // `obj` once; if present, call `T.method(args)` and yield the result as `R | undefined`; if
+            // absent, yield `undefined`. The checker already permits this form; codegen used to treat
+            // `method` as a field and fail with FieldNotFound.
+            if (call.callee.kind == .optional_chaining) {
+                if (try self.compileOptionalMethodCall(call, &expr)) |v| return v;
+            }
+
             if (call.callee.kind == .field_access) {
                 const fa = call.callee.kind.field_access;
                 if (fa.object.kind == .ident and std.mem.eql(u8, fa.object.kind.ident, "simd")) {
@@ -3903,6 +3911,76 @@ pub fn numToStringT(self: *LlvmCompiler, val: types.LLVMValueRef, tid: sema_type
         },
         else => return null,
     }
+}
+
+// Lower `obj?.method(args)` (optional-chaining method call). Returns null if the receiver's inner type or
+// the method function cannot be resolved (the caller then falls through to its normal error path).
+pub fn compileOptionalMethodCall(self: *LlvmCompiler, call: ast.CallExpr, expr_ptr: *const ast.Expression) anyerror!?types.LLVMValueRef {
+    const oc = call.callee.kind.optional_chaining;
+    const st = self.type_store orelse return null;
+
+    // The receiver's inner (non-optional) type -> the struct that owns the method.
+    const obj_tid = self.typeOfExprConcrete(oc.object) orelse return null;
+    const obj_info = st.get(obj_tid);
+    const inner_tid = if (obj_info == .optional) obj_info.optional else return null;
+    const inner_name = sema_shadow.renderLegacy(self.allocator, st, inner_tid) catch return null;
+    const base = getStructBaseName(inner_name);
+
+    // Resolve the method function `{Struct}_{method}` (try the exact name, then the lowercased struct, as
+    // the vtable builder does).
+    const method_fn = blk: {
+        const exact = std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ base, oc.field }) catch return null;
+        defer self.allocator.free(exact);
+        if (self.func_map.get(exact)) |f| break :blk f;
+        const lower = self.allocator.alloc(u8, base.len) catch return null;
+        defer self.allocator.free(lower);
+        _ = std.ascii.lowerString(lower, base);
+        const lname = std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ lower, oc.field }) catch return null;
+        defer self.allocator.free(lname);
+        if (self.func_map.get(lname)) |f| break :blk f;
+        break :blk null;
+    } orelse return null;
+
+    const cur_fn = core.LLVMGetBasicBlockParent(core.LLVMGetInsertBlock(self.builder));
+
+    // Evaluate the receiver ONCE. A struct/heap optional is a pointer (0 == absent).
+    const obj_raw = self.coerceToSlotType(try self.compileExpression(oc.object.*), self.val_type);
+
+    const present_bb = core.LLVMAppendBasicBlock(cur_fn, "ocm_present");
+    const null_bb = core.LLVMAppendBasicBlock(cur_fn, "ocm_null");
+    const merge_bb = core.LLVMAppendBasicBlock(cur_fn, "ocm_merge");
+    const present = core.LLVMBuildICmp(self.builder, types.LLVMIntPredicate.LLVMIntNE, obj_raw, core.LLVMConstInt(self.val_type, 0, 0), "ocm_present_c");
+    _ = core.LLVMBuildCondBr(self.builder, present, present_bb, null_bb);
+
+    // Present: call the method with the receiver as the leading `self` argument.
+    core.LLVMPositionBuilderAtEnd(self.builder, present_bb);
+    const nargs = call.args.len + 1;
+    const args = try self.allocator.alloc(types.LLVMValueRef, nargs);
+    defer self.allocator.free(args);
+    args[0] = obj_raw;
+    for (call.args, 0..) |*a, i| {
+        args[i + 1] = self.coerceToSlotType(try self.compileCallArgument(a.*), self.val_type);
+    }
+    const fn_t = core.LLVMGlobalGetValueType(method_fn);
+    var res = core.LLVMBuildCall2(self.builder, fn_t, method_fn, args.ptr, @intCast(nargs), "ocm_call");
+    // The result is `R | undefined`. If R is a value type, box it so the present arm matches the optional
+    // representation; a heap R is the pointer itself.
+    if (self.typeOfExprConcrete(expr_ptr)) |et| {
+        if (self.valueOptionalInner(et) != null) res = try self.buildValoptBox(self.coerceToSlotType(res, self.val_type));
+    }
+    _ = core.LLVMBuildBr(self.builder, merge_bb);
+    const present_end = core.LLVMGetInsertBlock(self.builder);
+
+    // Absent: undefined (0).
+    core.LLVMPositionBuilderAtEnd(self.builder, null_bb);
+    _ = core.LLVMBuildBr(self.builder, merge_bb);
+
+    core.LLVMPositionBuilderAtEnd(self.builder, merge_bb);
+    const phi = core.LLVMBuildPhi(self.builder, self.val_type, "ocm_phi");
+    var iv = [_]types.LLVMValueRef{ res, core.LLVMConstInt(self.val_type, 0, 0) };
+    var ib = [_]types.LLVMBasicBlockRef{ present_end, null_bb };
+    core.LLVMAddIncoming(phi, &iv, &ib, 2);
+    return phi;
 }
 
 pub fn compileAppendToStringBuilder(self: *LlvmCompiler, sb_val: types.LLVMValueRef, val: types.LLVMValueRef, expr_type_opt: ?[]const u8, opt_part: ?ast.Expression) !void {

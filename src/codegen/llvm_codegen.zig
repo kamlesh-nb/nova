@@ -3435,6 +3435,7 @@ pub const LlvmCompiler = struct {
     pub const awaitAsyncIoCall = expressions_mod.awaitAsyncIoCall;
     pub const buildAsyncIo = expressions_mod.buildAsyncIo;
     pub const compileAppendToStringBuilder = expressions_mod.compileAppendToStringBuilder;
+    pub const compileOptionalMethodCall = expressions_mod.compileOptionalMethodCall;
     pub const canonicalizeInt = expressions_mod.canonicalizeInt;
     pub const emitIntDivGuard = expressions_mod.emitIntDivGuard;
     pub const emitTrapIf = expressions_mod.emitTrapIf;

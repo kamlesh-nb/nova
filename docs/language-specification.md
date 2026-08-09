@@ -59,7 +59,8 @@ A program's entry is `fn main(): void`. Command-line arguments are read via `env
     `0xFF_FF`, `0b1010_1010`, `3.141_592`, `1_000.5m` *(→ 296)*.
 - **Operators:** arithmetic `+ - * / %`; comparison `== != < > <= >=`; logical `&& ||`; bitwise `& ^ |`,
   shifts `<< >>`; range `..` (exclusive), `..=` (inclusive) *(→ 53_for_loops)*; assign `=`; nullish
-  coalesce `??`; optional chaining `?.`; cast `as`; closure arrow `=>`; type union `|` (optionals /
+  coalesce `??`; optional chaining `?.` (field `x?.f` and method `x?.m(args)`, yielding `undefined` when the
+  receiver is absent) *(→ 303_optional_chaining_method_call)*; cast `as`; closure arrow `=>`; type union `|` (optionals /
   error unions).
   - Bitwise `^` is XOR (integers only), with C-family precedence: `&` binds tighter than `^`, which binds
     tighter than `|` — so `a & b ^ c | d` parses as `((a & b) ^ c) | d`. *(→ 88_bitwise_xor)*
