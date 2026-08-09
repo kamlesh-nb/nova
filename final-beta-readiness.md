@@ -12,7 +12,11 @@ full corpus + ASAN green) · 🔵 investigated, not a live bug (recorded, no fix
 ⬜ open / deferred. Severity: **S-crit** silent corruption/unsafety · **crash** · **wrong** silent wrong
 answer · **blk** does not compile/link · **gap** missing feature.
 
-**Score: 28 defect IDs fixed, 4 investigated-not-a-bug, ~8 open/deferred. Recent: I-numeric (the lexer
+**Score: 29 defect IDs fixed (B5 direct case), 4 investigated-not-a-bug, ~8 open/deferred. Recent: B5-direct
+(a generic struct init `Cell<int>{...}` inferred with no type args left `T`-typed fields/returns erased, so
+interpolating one stringified a raw int as a pointer → SEGV; struct-init inference now recovers the
+instantiation from the field values — the trait-object vtable sub-case remains open); tuple-payload-multi
+enums; if-expr in interpolation; I-numeric (the lexer
 accepted neither `_` digit separators nor scientific notation; both now scan); H4 (a decimal literal
 with more than 34 significant digits was truncated instead of rounding half-even like the arithmetic path;
 fixed in the literal parser); B1-let (free-generic
@@ -24,7 +28,7 @@ mismatched error type); A4 (interpolating a non-narrowed optional printed the bo
 monomorphisation collision, fuzzer-found); G3 (JSON surrogate-pair astral corruption); shift-infer (integer
 literals in a `long` context computed in 32 bits); lit-i64 (decimal literal above i64 range silently → 0);
 F2 (payload-enum `==` compared identity not value). Every fix is repro-first with a
-gating case (273–298) and stays corpus + ASAN green.**
+gating case (273–299) and stays corpus + ASAN green.**
 
 | ID | Cluster | Sev | Status | Commit / note |
 |----|---------|-----|--------|---------------|
@@ -51,7 +55,7 @@ gating case (273–298) and stays corpus + ASAN green.**
 | A4 | A value-opt | wrong | ✅ | interpolating a non-narrowed optional printed the box ptr; now renders the inner value when present and `undefined` when absent (value-optional + heap-optional string). Case 291 |
 | A-nested | A value-opt | wrong | ⬜ | `Map<K, V\|undefined>.get()` returns `(V\|undefined)\|undefined`. Root cause pinned: an outer optional over a value-optional inner reuses 0 as its `none` sentinel, so *present-holding-undefined* (inner == 0) collides with *absent* (0) -> `m.set(k, undefined); m.get(k)` reads as a miss (silent wrong value, not a crash). Fix requires the OUTER optional to be boxed so `box(0)` != `0`. Blocked like B4 by monomorphisation: the producer is a generic method whose return TypeRef is `.optional(.ident("V"))` -- the nested optionality is hidden behind an unsubstituted type-param and string substitution collapses it (F1-class), so the producer can't tell it must add a box level. Needs mono-aware optional-depth resolution + ARC handling of the double-box. NB: surface syntax cannot express this (`(int\|undefined)` parses as a TUPLE; `int\|undefined\|undefined` flattens), so it only arises through generics |
 | B4 | B generics | blk | ⬜ | `Set<T>` (over `Map<T, bool>`) fails. Root cause pinned: `Set<int>` monomorphises its OWN methods (`Set_i32_*`) but the nested generic `Map<int, bool>` is never instantiated, so `self.map.get(...)` falls to the ERASED `Map_*`. Two symptoms: (1) the private erased `Map_keysEqual` is DCE-dropped because it is emitted before its callers `Map_set`/`get` create a use → undefined symbol at link; (2) even emitted, the erased Map↔`Set_i32` ARC boundary releases a bogus pointer → SEGV in `Set_i32_has`. Real fix = instantiate the nested generic `Map<int,bool>` through `Set<int>` and route the calls to `Map_i32_bool_*` (a nested-generic monomorphisation fix, F2-6-adjacent), NOT just the emission-drop |
-| B5 | B generics | crash | ⬜ | generic `struct impl Trait` via trait object vtable |
+| B5 | B generics | crash | 🔵 (partial) | ✅ DIRECT case fixed: a generic struct init `Cell<int>{...}` was inferred with NO type args, so a `T`-typed field/return stayed an erased type-param — interpolating such a value (`${self.value}`) stringified a raw int as a pointer → SEGV in StringBuilder_append. Fix: struct-init inference recovers the instantiation from the field values (solve the struct's type params against the inferred field-value types). Case 299. ⬜ STILL OPEN: dispatch through a TRAIT OBJECT vtable, where the vtable points to the erased shared method body instead of the per-instantiation monomorphisation — needs per-instantiation vtables for a generic struct impl'ing a trait (codegen) |
 | B6 | B generics | blk | ⬜ | generic `async fn` cannot resolve `serde.bind<T>` |
 | D1/D2/D3 | D erased carriers | S-crit | ⬜ | `any` owning-heap UAF; any-downcast double-free; unchecked trait→concrete `as` |
 | E3 | E async | crash | ⬜ | reap-mark not cleared for awaited children (latent) |

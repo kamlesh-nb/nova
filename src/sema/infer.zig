@@ -861,23 +861,56 @@ pub const Inferer = struct {
             .struct_init => |si| {
 
                 const decl_sid = self.symtab.findTypeInModule(si.type_name, self.current_module);
+
+                // The struct's type parameters, so we can recover the instantiation (`Cell<int>`) from the
+                // field values. A generic struct init previously interned with NO args, so any `T`-typed
+                // field or method return stayed an erased type-param -- interpolating such a value then
+                // stringified a raw int as a pointer and SEGV'd (B5).
+                var type_params: []const []const u8 = &.{};
+                if (decl_sid) |sid| {
+                    const sym = self.symtab.symbolAt(sid);
+                    if (sym.decl == .struct_) type_params = sym.decl.struct_.type_params;
+                }
+                const solved = try self.allocator.alloc(?TypeId, type_params.len);
+                defer self.allocator.free(solved);
+                @memset(solved, null);
+
                 for (si.fields) |*f| {
                     var expected_field: ?TypeId = null;
+                    var declared_in_scope: ?TypeId = null;
                     if (decl_sid) |sid| {
                         const sym = self.symtab.symbolAt(sid);
                         if (sym.decl == .struct_) {
                             for (sym.decl.struct_.fields) |sf| {
                                 if (std.mem.eql(u8, sf.name, f.name)) {
                                     expected_field = self.lowerer.lower(sf.type_name) catch null;
+                                    // Lower the declared field type in the struct's param scope so `T`
+                                    // becomes a type-param we can solve against the actual value type.
+                                    if (type_params.len > 0) {
+                                        const saved = self.lowerer.param_scopes;
+                                        const scopes = [_]lower.ParamScope{.{ .owner = sid, .names = type_params }};
+                                        self.lowerer.param_scopes = &scopes;
+                                        declared_in_scope = self.lowerer.lower(sf.type_name) catch null;
+                                        self.lowerer.param_scopes = saved;
+                                    }
                                     break;
                                 }
                             }
                         }
                     }
-                    _ = try self.inferExprExpecting(&f.value, expected_field);
+                    const actual = try self.inferExprExpecting(&f.value, expected_field);
+                    if (declared_in_scope) |dts| {
+                        if (decl_sid) |sid| subst.solveParams(self.store, dts, actual, sid, solved);
+                    }
                 }
                 self.recordTypeVis(si.type_name, si.span);
                 if (decl_sid) |sid| {
+                    if (type_params.len > 0) {
+                        const args = try self.allocator.alloc(TypeId, type_params.len);
+                        defer self.allocator.free(args);
+                        for (solved, 0..) |m, i| args[i] = m orelse try self.store.unresolvedT();
+                        return self.ok(try self.store.intern(.{ .struct_ = .{ .decl = sid, .args = args } }));
+                    }
                     return self.ok(try self.store.intern(.{ .struct_ = .{ .decl = sid } }));
                 }
                 return self.unresolved("struct_init");
