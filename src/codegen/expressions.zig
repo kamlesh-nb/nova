@@ -3649,11 +3649,35 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             const left_present = if (nc_is_valopt) try self.buildValoptUnbox(left_val) else left_val;
             const left_bb_end = core.LLVMGetInsertBlock(self.builder);
 
+            // A NESTED value-optional peel (`g ?? d` where `g : (int | undefined) | undefined`, from
+            // `Map<K, int | undefined>.get()`): the peeled value is the INNER value-optional box, still OWNED
+            // by the container it came from. It binds to an owned value-optional local whose scope-end release
+            // would double-free the container's box. So co-own it: retain the result (below, after the phi).
+            // The phi is 0 for the absent/present-holding-undefined arms, and `nova_retain(0)` is a no-op, so
+            // this is null-safe and only bumps the refcount when a real inner box is peeled.
+            const nested_valopt_peel = nc_is_valopt and blk: {
+                const lt = self.typeOfExprConcrete(nc.left) orelse break :blk false;
+                const inner_tid = self.valueOptionalInner(lt) orelse break :blk false;
+                break :blk self.valueOptionalInner(inner_tid) != null;
+            };
+
             const rhs_bb = core.LLVMAppendBasicBlock(current_fn, "nc_rhs");
             const merge_bb = core.LLVMAppendBasicBlock(current_fn, "nc_merge");
+            // For a nested value-optional peel, the present arm co-owns the container's inner box, so it must
+            // retain it -- but ONLY on the present path (the absent path yields the raw RHS default, which may
+            // be a non-pointer int like `999` that must NOT be retained). Route present through its own block.
+            const present_bb = if (nested_valopt_peel) core.LLVMAppendBasicBlock(current_fn, "nc_present") else null;
 
             const cond_i1 = core.LLVMBuildICmp(self.builder, types.LLVMIntPredicate.LLVMIntNE, left_val, core.LLVMConstInt(self.val_type, 0, 0), "is_not_null");
-            _ = core.LLVMBuildCondBr(self.builder, cond_i1, merge_bb, rhs_bb);
+            _ = core.LLVMBuildCondBr(self.builder, cond_i1, present_bb orelse merge_bb, rhs_bb);
+
+            var left_incoming_bb = left_bb_end;
+            if (present_bb) |pbb| {
+                core.LLVMPositionBuilderAtEnd(self.builder, pbb);
+                try self.compileRetain(left_present);
+                _ = core.LLVMBuildBr(self.builder, merge_bb);
+                left_incoming_bb = core.LLVMGetInsertBlock(self.builder);
+            }
 
             core.LLVMPositionBuilderAtEnd(self.builder, rhs_bb);
             var rhs_val = self.coerceToSlotType(try self.compileExpression(nc.right.*), self.val_type);
@@ -3668,6 +3692,18 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 }
             }
 
+            // For a nested value-optional peel, the result type is the INNER value-optional (`int | undefined`),
+            // so both phi arms must share that boxed representation. The present arm is already the inner box;
+            // box the RHS default too -- unless it is `undefined` (which stays 0 = the inner's undefined) or
+            // already a value-optional box. Without this, `g ?? 999` mixes a boxed present arm with a raw int
+            // 999, and the downstream `?? d` unboxes 999 as a pointer -> SEGV.
+            if (nested_valopt_peel and
+                !LlvmCompiler.isUndefinedLiteralExpr(nc.right) and
+                !self.exprYieldsValoptBox(nc.right))
+            {
+                rhs_val = try self.buildValoptBox(self.coerceToSlotType(rhs_val, self.val_type));
+            }
+
             if (!nc_is_valopt and namesExistingOwner(nc.right.kind) and self.isOwnedExpr(nc.right)) {
                 try self.compileRetain(rhs_val);
             }
@@ -3677,7 +3713,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             core.LLVMPositionBuilderAtEnd(self.builder, merge_bb);
             const phi = core.LLVMBuildPhi(self.builder, self.val_type, "nc_phi");
             var incoming_vals = [_]types.LLVMValueRef{ left_present, rhs_val };
-            var incoming_bbs = [_]types.LLVMBasicBlockRef{ left_bb_end, rhs_bb_end };
+            var incoming_bbs = [_]types.LLVMBasicBlockRef{ left_incoming_bb, rhs_bb_end };
             core.LLVMAddIncoming(phi, &incoming_vals, &incoming_bbs, 2);
 
             if (!nc_is_valopt) {

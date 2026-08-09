@@ -365,9 +365,18 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
             if (rs.value) |*v| {
                 if (ret_val_opt) |rv| {
                     if (func.ret_type_ref) |rtr| {
+                        // NESTED value-optional return (`(int | undefined) | undefined`, e.g.
+                        // `Map<K, int | undefined>.get()` returning `self.vals.get(idx)`): the returned
+                        // expression ALREADY yields the inner value-optional box, which normally suppresses
+                        // re-boxing. But here the KEY WAS FOUND, so the OUTER level must be materialised as a
+                        // present box wrapping the inner (box or 0) -- otherwise present-holding-undefined
+                        // (inner 0) is indistinguishable from absent (the `return undefined` arm, which yields
+                        // 0 and is correctly NOT boxed by the isUndefinedLiteralExpr guard). The outer box
+                        // BORROWS the inner; see valoptTypeRefIsValue's nested comment for the ARC ledger.
+                        const nested_ret = self.valoptTypeRefIsNested(rtr);
                         if (self.valoptTypeRefIsValue(rtr) and
                             !LlvmCompiler.isUndefinedLiteralExpr(v) and
-                            !self.exprYieldsValoptBox(v))
+                            (!self.exprYieldsValoptBox(v) or nested_ret))
                         {
                             ret_val_opt = try self.buildValoptBox(self.coerceToSlotType(rv, self.val_type));
                         }

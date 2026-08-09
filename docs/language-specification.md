@@ -109,7 +109,12 @@ The embedded `${…}` holds any expression, including an if-expression: `` `${if
 An optional is written `T | undefined`. `undefined` means **absence** (not an error). Member access
 **through** an optional is memory-safe: it is guarded, not a null-deref *(→ 30_optional_member_access,
 38_optional_deref_guard)*. Narrowing: `if (x != undefined) { use(x) }` narrows `x` to `T` in the branch.
-`List<T>.get(i)` and `Map<K,V>.get(k)` return `T | undefined`.
+`List<T>.get(i)` and `Map<K,V>.get(k)` return `T | undefined`. When the element type is itself optional
+(`Map<K, int | undefined>`), `get` returns a **nested** optional `(int | undefined) | undefined`: the outer
+level distinguishes a present key from an absent one, and the inner level distinguishes the stored value
+from `undefined`, so `m.set(k, undefined); m.get(k)` is a present key holding `undefined`, not a miss
+*(→ 312_nested_value_optional)*. This only arises through generics; the surface syntax cannot write it
+directly (`(int | undefined)` parses as a tuple).
 
 ### 3.5 Error unions — `T | E`
 

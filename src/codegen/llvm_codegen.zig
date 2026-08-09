@@ -575,6 +575,12 @@ pub const LlvmCompiler = struct {
             .prim => info.optional,
 
             .enum_ => if (st.isOwned(info.optional)) null else info.optional,
+            // A NESTED value-optional (`(int | undefined) | undefined`, produced only through generics,
+            // e.g. `Map<K, int | undefined>.get()`): the inner is itself a value-optional, so the whole
+            // thing is a value-optional whose payload is the inner box. Recursing lets the box/unbox seam
+            // add/remove exactly one level per site, so present-holding-undefined (inner 0) stays distinct
+            // from absent (outer 0). See A-nested in final-beta-readiness.md.
+            .optional => if (self.valueOptionalInner(info.optional) != null) info.optional else null,
             else => null,
         };
     }
@@ -665,10 +671,26 @@ pub const LlvmCompiler = struct {
         const inner = self.typeRefToString(tr.optional.*) catch return false;
         if (std.mem.eql(u8, inner, "ptr")) return false;
         if (types_mod.cgPrim(inner) != null) return true;
+        // A NESTED value-optional return (`(int | undefined) | undefined`, produced only through generics,
+        // e.g. `Map<K, int | undefined>.get()`): the inner is itself a value-optional name, so the outer
+        // level is boxed like any value-optional. The outer box BORROWS the inner box (its dtor is the plain
+        // value-optional NULL dtor, it does NOT free the inner) -- the container owns the inner box and frees
+        // it on drop (see buildStorageDestructor / f6e7b86), and the consuming `??` peel retains a ref for the
+        // bound local. So no owner double-frees. See A-nested in final-beta-readiness.md.
+        if (valueOptionalName(inner)) return true;
 
         const base = getStructBaseName(inner);
         if (self.enums.contains(base) and !arc_mod.enumIsTaggedUnion(self, base)) return true;
         return false;
+    }
+
+    // Is this TypeRef a NESTED value-optional (`(int | undefined) | undefined`)? i.e. an optional whose
+    // inner type is itself a value-optional. Used to force the outer box on return even when the returned
+    // expression already yields the inner value-optional box (which normally suppresses re-boxing).
+    pub fn valoptTypeRefIsNested(self: *LlvmCompiler, tr: ast.TypeRef) bool {
+        if (tr != .optional) return false;
+        const inner = self.typeRefToString(tr.optional.*) catch return false;
+        return valueOptionalName(inner);
     }
 
     // Does a generic method's parameter (declared as the receiver struct's type parameter, e.g.
@@ -714,6 +736,12 @@ pub const LlvmCompiler = struct {
             // `try`/`catch` over a `T | undefined | E` yield the value-optional ok arm (a box) too, so a
             // consuming `?? d` must unbox it rather than return the raw pointer (F1).
             .ident, .field_access, .call, .generic_call, .index, .optional_chaining, .await_expr, .catch_expr, .try_expr => true,
+            // A NESTED value-optional peeled by `??` (`let inner = g ?? undefined` where
+            // `g : (int | undefined) | undefined`) yields the INNER value-optional box, itself a
+            // value-optional. Whitelisting it lets a further consumer unbox exactly one level rather than
+            // double-boxing the already-boxed inner. Gated by the value-optional type check above, so a plain
+            // `x ?? 0` yielding a raw `int` is unaffected.
+            .nullish_coalesce => true,
             else => false,
         };
     }
