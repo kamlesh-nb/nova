@@ -245,6 +245,20 @@ pub const Worklist = struct {
                 const concrete = subst.substitute(&self.sema.store, raw, ty.struct_.decl, ty.struct_.args) catch continue;
                 try self.note(concrete);
             }
+            // Also note FIELD types substituted with this instantiation's args. A generic struct that stores
+            // another generic as a field (`Set<T> { map: Map<T, bool> }`) must monomorphise that field type
+            // (`Map<int, bool>`), or the field's method calls fall back to the erased container path, which
+            // has the wrong value-optional representation and crashes on `get() != undefined` (B4 layer 2).
+            for (decl.fields) |f| {
+                var l = lower.Lowerer.init(self.allocator, &self.sema.store);
+                defer l.deinit();
+                l.symtab = &self.sema.tab;
+                const scopes = [_]lower.ParamScope{.{ .owner = ty.struct_.decl, .names = decl.type_params }};
+                l.param_scopes = &scopes;
+                const raw = l.lower(f.type_name) catch continue;
+                const concrete = subst.substitute(&self.sema.store, raw, ty.struct_.decl, ty.struct_.args) catch continue;
+                try self.note(concrete);
+            }
         }
     }
 
