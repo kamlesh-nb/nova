@@ -43,7 +43,7 @@ gating case (273–285) and stays corpus + ASAN green.**
 | G4 | G stdlib | wrong | 🔵 (partial) | `parseI64` i64-MIN actually works (double wrap); non-digit/overflow parts still open |
 | A4 | A value-opt | wrong | ✅ | interpolating a non-narrowed optional printed the box ptr; now renders the inner value when present and `undefined` when absent (value-optional + heap-optional string). Case 291 |
 | A-nested | A value-opt | crash | ⬜ | `Map.get` returning `(int\|undefined)\|undefined` (nested optional) |
-| B4 | B generics | blk | ⬜ | `Set<T>` link fail (`_Map_keysEqual`) |
+| B4 | B generics | blk | ⬜ | `Set<T>` (over `Map<T, bool>`) fails. Root cause pinned: `Set<int>` monomorphises its OWN methods (`Set_i32_*`) but the nested generic `Map<int, bool>` is never instantiated, so `self.map.get(...)` falls to the ERASED `Map_*`. Two symptoms: (1) the private erased `Map_keysEqual` is DCE-dropped because it is emitted before its callers `Map_set`/`get` create a use → undefined symbol at link; (2) even emitted, the erased Map↔`Set_i32` ARC boundary releases a bogus pointer → SEGV in `Set_i32_has`. Real fix = instantiate the nested generic `Map<int,bool>` through `Set<int>` and route the calls to `Map_i32_bool_*` (a nested-generic monomorphisation fix, F2-6-adjacent), NOT just the emission-drop |
 | B5 | B generics | crash | ⬜ | generic `struct impl Trait` via trait object vtable |
 | B6 | B generics | blk | ⬜ | generic `async fn` cannot resolve `serde.bind<T>` |
 | D1/D2/D3 | D erased carriers | S-crit | ⬜ | `any` owning-heap UAF; any-downcast double-free; unchecked trait→concrete `as` |
