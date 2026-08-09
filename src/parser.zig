@@ -340,6 +340,22 @@ pub const Parser = struct {
         };
     }
 
+    // Parse and DISCARD an optional `where` clause (`where T: Show, U: Ord + Clone`). Generic dispatch in
+    // Nova is structural -- a call resolves against the concrete instantiation regardless of a declared
+    // bound -- so the constraints are advisory documentation. Accept them so the signature parses; a real
+    // constraint checker can consume the same grammar later.
+    fn skipWhereClause(self: *Parser) ParserError!void {
+        if (!(self.current().type == .identifier and std.mem.eql(u8, self.current().lexeme, "where"))) return;
+        self.advance();
+        while (true) {
+            _ = try self.parseTypeRef(); // the constrained type (e.g. `T`)
+            try self.expect(.colon);
+            _ = try self.parseTypeRef(); // the first bound
+            while (self.match(.plus)) _ = try self.parseTypeRef(); // `+ Bound2 + ...`
+            if (!self.match(.comma)) break;
+        }
+    }
+
     fn parseFunctionDecl(self: *Parser, is_exported: bool) ParserError!ast.FunctionDecl {
         const start_span = self.span();
         const is_async = self.match(.keyword_async);
@@ -377,6 +393,7 @@ pub const Parser = struct {
 
         try self.expect(.right_paren);
         const ret_type = if (self.match(.colon)) try self.parseTypeRef() else null;
+        try self.skipWhereClause();
         const body = try self.parseBlock();
 
         const end_span = self.span();

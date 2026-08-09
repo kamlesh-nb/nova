@@ -249,7 +249,10 @@ payloads. Not owned: `int`/`long`/`float`/`bool`/`ptr`/enums.
 ```nova
 fn add(a: int, b: int): int { return a + b }
 fn id<T>(x: T): T { return x }            // generic
+fn show<T>(x: T): string where T: Show { return x.show() }   // `where` clause: accepted, advisory
 ```
+A `where` clause (`where T: Bound + Bound2, U: Other`) may follow the return type. Dispatch is structural,
+so the constraints are documentation rather than checked bounds *(→ 300_where_clause_constraints)*.
 Methods take `self: T` as the first parameter; static/associated methods are called `Struct.method()`
 *(→ 22_static_methods)*. A module-qualified constructor/static call is `module.Struct()` /
 `module.Struct.method()` *(→ 23_module_qualified_calls)*.
