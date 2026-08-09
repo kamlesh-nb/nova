@@ -12,8 +12,9 @@ full corpus + ASAN green) · 🔵 investigated, not a live bug (recorded, no fix
 ⬜ open / deferred. Severity: **S-crit** silent corruption/unsafety · **crash** · **wrong** silent wrong
 answer · **blk** does not compile/link · **gap** missing feature.
 
-**Score: 17 defect IDs fixed, 3 investigated-not-a-bug, ~18 open/deferred. A3-read (a value-optional
-monomorphisation collision) was found by the codegen fuzzer and fixed. Every fix is repro-first with a
+**Score: 18 defect IDs fixed, 3 investigated-not-a-bug, ~17 open/deferred. A3-read (a value-optional
+monomorphisation collision) was found by the codegen fuzzer and fixed; G3 (JSON surrogate-pair astral
+corruption) fixed. Every fix is repro-first with a
 gating case (273–285) and stays corpus + ASAN green.**
 
 | ID | Cluster | Sev | Status | Commit / note |
@@ -48,7 +49,7 @@ gating case (273–285) and stays corpus + ASAN green.**
 | F1 | F enum/union | crash | ⬜ | `T\|E\|undefined` value-arm SEGV |
 | F2 | F enum/union | wrong | ⬜ | payload-enum `==` = identity not value (real bug; checker can't track enum-local type yet) |
 | F3 | F enum/union | wrong | ⬜ | `switch` over error-union falls through |
-| G3 | G stdlib | S-crit | ⬜ | JSON `\uXXXX` surrogate-pair astral corruption |
+| G3 | G stdlib | S-crit | ✅ | JSON `\uXXXX` surrogate pairs now combine into one astral code point (4-byte UTF-8); decoder was encoding each surrogate independently → 6 bytes of mojibake. Case 287 |
 | G5 | G stdlib | wrong | ⬜ | `try` propagates mismatched error type |
 | H4 | H numeric | wrong | ⬜ | decimal >34 digits truncate not round-half-even |
 | lit-i64 | H numeric | wrong | ⬜ | integer literal above i64 range silently → 0 (parser diag plumbing needed) |
@@ -304,9 +305,13 @@ Root: 1b.
 - **G2** `switch` on a **non-enum** discriminant (int, string) silently miscompiles: every case label lowers
   to the constant 0, so one case always hits `default` and multiple cases emit an LLVM duplicate-case verify
   error. The checker does not reject it.
-- **G3** JSON `\uXXXX\uDXXX` **surrogate pairs corrupt astral characters** (emoji become mojibake): the
-  decoder UTF-8-encodes each surrogate independently. Data corruption in the shared JSON parser, so every HTTP
-  and DB path that receives JS-escaped emoji is affected.
+- **G3** (fixed) JSON `\uXXXX\uDXXX` **surrogate pairs corrupted astral characters** (emoji became mojibake):
+  the decoder UTF-8-encoded each surrogate independently (two invalid 3-byte sequences) with no 4-byte branch.
+  Data corruption in the shared JSON parser, so every HTTP and DB path that received JS-escaped emoji was
+  affected. Fixed in `appendUnicode` (`src/std/serde/json.nova`): combine a high surrogate (D800..DBFF) with a
+  following low surrogate (DC00..DFFF) into one code point and add the 4-byte UTF-8 branch; a lone/invalid
+  surrogate is left as-is and does not consume following text. Case 287 (surrogate pair, both range ends,
+  BMP/2-byte/ASCII unaffected, lone high surrogate, pair surrounded by ASCII).
 - **G4** `string.parseI64` is wrong for i64 MIN (magnitude overflow), silently ignores non-digits, and has no
   overflow detection. Also used by `serde.getInt`.
 - **G5** `try` silently propagates a **mismatched error type** out of a narrower error-union signature (a
@@ -351,8 +356,8 @@ Trait` constraints, and trait **default method** bodies are all unsupported at t
   instantiations get distinct symbols and layouts; nested and recursive generics produce correct values.
 - **String-based ownership residue is guarded** by a loud exit-70 tripwire, not a silent guess. Undefined
   identifiers and unresolved namespaced calls are fatal.
-- **Most of the standard library round-trips correctly**: serde JSON/YAML/BSON (except astral surrogates),
-  List, Map (string-keyed and non-zero int-keyed), String, regex, math, decimal arithmetic.
+- **Most of the standard library round-trips correctly**: serde JSON/YAML/BSON (including astral surrogate
+  pairs), List, Map (string-keyed and non-zero int-keyed), String, regex, math, decimal arithmetic.
 - **All three primary platforms run the async runtime end-to-end** (macOS kqueue, Linux epoll and io_uring,
   Windows IOCP). WASM works for trivial programs and about 45 percent of the corpus.
 - **The gates that exist are strong sanitizers** (`--asan`, `--shadow`, `--arc`, a harness self-test,

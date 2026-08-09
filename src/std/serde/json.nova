@@ -158,7 +158,9 @@ struct JsonParser {
         return 0;
     }
 
-    fn appendUnicode(self: JsonParser, sb: StringBuilder): void {
+    // Reads exactly four hex digits of a `\uXXXX` escape. On entry `self.pos` is at the `u`; on exit it
+    // points just past the fourth hex digit.
+    fn readHex4(self: JsonParser): int {
         self.pos = self.pos + 1;
         let cp = 0;
         let k = 0;
@@ -167,16 +169,48 @@ struct JsonParser {
             self.pos = self.pos + 1;
             k = k + 1;
         }
+        return cp;
+    }
+
+    fn encodeUtf8(self: JsonParser, sb: StringBuilder, cp: int): void {
         if (cp < 128) {
             sb.appendChar(cp);
         } else if (cp < 2048) {
             sb.appendChar(192 + (cp / 64));
             sb.appendChar(128 + (cp % 64));
-        } else {
+        } else if (cp < 65536) {
             sb.appendChar(224 + (cp / 4096));
             sb.appendChar(128 + ((cp / 64) % 64));
             sb.appendChar(128 + (cp % 64));
+        } else {
+            // Astral plane (U+10000..U+10FFFF): four UTF-8 bytes.
+            sb.appendChar(240 + (cp / 262144));
+            sb.appendChar(128 + ((cp / 4096) % 64));
+            sb.appendChar(128 + ((cp / 64) % 64));
+            sb.appendChar(128 + (cp % 64));
         }
+    }
+
+    fn appendUnicode(self: JsonParser, sb: StringBuilder): void {
+        // `self.pos` is at the `u` of the first `\uXXXX`.
+        let cp = self.readHex4();
+        // A high surrogate (U+D800..U+DBFF) combines with a following `\uDC00..\uDFFF` low surrogate into
+        // one astral code point. Encoding each half on its own (the previous behaviour) produced two
+        // invalid 3-byte sequences -- mojibake for every emoji / astral character in JSON input.
+        if (cp >= 55296 && cp <= 56319) {
+            if (self.pos + 1 < self.src.length && self.src[self.pos] == 92 && self.src[self.pos + 1] == 117) {
+                let save = self.pos;
+                self.pos = self.pos + 1;   // step onto the `u` of the second escape
+                let lo = self.readHex4();
+                if (lo >= 56320 && lo <= 57343) {
+                    cp = 65536 + (cp - 55296) * 1024 + (lo - 56320);
+                } else {
+                    // Not a valid low surrogate: rewind so the second escape is processed normally.
+                    self.pos = save;
+                }
+            }
+        }
+        self.encodeUtf8(sb, cp);
     }
 
     fn parseRawString(self: JsonParser): string {
