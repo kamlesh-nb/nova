@@ -1994,10 +1994,19 @@ pub const Inferer = struct {
                     const variant_name = call.callee.kind.field_access.field;
                     for (enum_decl.variants) |variant| {
                         if (!std.mem.eql(u8, variant.name, variant_name)) continue;
-                        const payload_ref = variant.type_name orelse break;
-                        if (call.args.len == 0) break;
-                        if (call.args[0].kind != .ident) break;
-                        try self.bind(call.args[0].kind.ident, try self.lowerer.lower(payload_ref));
+                        if (variant.type_name) |payload_ref| {
+                            if (call.args.len == 0) break;
+                            if (call.args[0].kind != .ident) break;
+                            try self.bind(call.args[0].kind.ident, try self.lowerer.lower(payload_ref));
+                        } else if (variant.fields) |vfields| {
+                            // Tuple-form multi-payload pattern `Rect(w, h)`: bind each positional binding to
+                            // the matching payload field's type.
+                            for (call.args, 0..) |arg, i| {
+                                if (i < vfields.len and arg.kind == .ident) {
+                                    try self.bind(arg.kind.ident, try self.lowerer.lower(vfields[i].type_name));
+                                }
+                            }
+                        }
                         break;
                     }
                 },

@@ -1,0 +1,54 @@
+// I (parser gaps): a tuple-form enum variant with MORE THAN ONE payload -- `Rect(int, int)` -- failed to
+// parse (the declaration stopped at the first comma), so only single-payload tuple variants `Circle(int)`
+// and the struct-form `Rect{w: int, h: int}` worked. The multi-field payload construction and pattern
+// paths already existed for the struct form. Fix: the parser desugars `Variant(T1, T2, ...)` into positional
+// payload fields `_0`, `_1`, ...; construction `Shape.Rect(3, 4)` already fills those fields by position, and
+// the switch-pattern binding (checker, sema, and codegen) now binds `case Shape.Rect(w, h)` positionally.
+
+import assert;
+
+enum Shape {
+    Circle(int),
+    Rect(int, int),
+    Named(string, int)
+}
+
+fn area(s: Shape): int {
+    switch (s) {
+        case Shape.Circle(r): { return r * r * 3; }
+        case Shape.Rect(w, h): { return w * h; }
+        case Shape.Named(n, v): { return v; }
+    }
+}
+
+@test
+fn test_rect_two_payloads(): void {
+    assert.equalInt(area(Shape.Rect(3, 4)), 12);
+}
+
+@test
+fn test_single_payload_still_works(): void {
+    assert.equalInt(area(Shape.Circle(2)), 12);
+}
+
+@test
+fn test_owned_string_payload(): void {
+    let s = Shape.Named("hello", 9);
+    switch (s) {
+        case Shape.Named(n, v): {
+            assert.equalStr(n, "hello");
+            assert.equalInt(v, 9);
+        }
+        case Shape.Circle(r): { assert.isTrue(false); }
+        case Shape.Rect(w, h): { assert.isTrue(false); }
+    }
+}
+
+enum Triple { T(int, int, int) }
+
+@test
+fn test_three_payloads(): void {
+    switch (Triple.T(1, 2, 3)) {
+        case Triple.T(a, b, c): { assert.equalInt(a + b + c, 6); }
+    }
+}

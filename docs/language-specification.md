@@ -190,8 +190,11 @@ struct Point { pub x: int, pub y: int
   ```nova
   enum Color { Red, Green, Blue }          // Color.Red
   enum Tagged { N(int), S(string) }        // Tagged.N(3)
+  enum Shape { Rect(int, int) }            // tuple-form, multiple payloads; matched positionally
   ```
   A payload-less variant `E.A` is a value; methods dispatch on it (`E.A.code()`) *(→ 36_enum_method_dispatch)*.
+  A tuple-form variant may carry more than one payload; `case Shape.Rect(w, h)` binds them by position, and
+  a struct-form variant (`Rect { w: int, h: int }`) binds by name *(→ 298_tuple_payload_multi_enum)*.
 - **Traits** are interfaces with dynamic dispatch (vtables):
   ```nova
   trait Speaker { fn speak(self: Speaker): int; }

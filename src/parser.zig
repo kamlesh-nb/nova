@@ -716,8 +716,37 @@ pub const Parser = struct {
                     try self.expect(.right_brace);
                     fields = try payload_fields.toOwnedSlice(self.allocator);
                 } else if (self.match(.left_paren)) {
-                    type_name = try self.parseTypeRef();
-                    try self.expect(.right_paren);
+                    const first_type = try self.parseTypeRef();
+                    if (self.current().type == .comma) {
+                        // Tuple-form variant with MULTIPLE payloads (`Rect(int, int)`): desugar to positional
+                        // struct fields `_0`, `_1`, ... so it reuses the (working) multi-field payload
+                        // construction and pattern paths. Single-payload `Circle(int)` keeps `type_name`.
+                        var payload_fields = std.ArrayList(ast.Field).empty;
+                        defer payload_fields.deinit(self.allocator);
+                        try payload_fields.append(self.allocator, ast.Field{
+                            .name = "_0",
+                            .type_name = first_type,
+                            .is_public = true,
+                            .span = var_span,
+                        });
+                        var pidx: usize = 1;
+                        while (self.match(.comma)) {
+                            const ft = try self.parseTypeRef();
+                            const nm = try std.fmt.allocPrint(self.allocator, "_{d}", .{pidx});
+                            try payload_fields.append(self.allocator, ast.Field{
+                                .name = nm,
+                                .type_name = ft,
+                                .is_public = true,
+                                .span = var_span,
+                            });
+                            pidx += 1;
+                        }
+                        try self.expect(.right_paren);
+                        fields = try payload_fields.toOwnedSlice(self.allocator);
+                    } else {
+                        try self.expect(.right_paren);
+                        type_name = first_type;
+                    }
                 }
 
                 try variants.append(self.allocator, ast.Variant{

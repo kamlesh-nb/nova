@@ -549,6 +549,26 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
                                                 }
                                                 _ = core.LLVMBuildStore(self.builder, loaded_val, var_alloca);
                                             }
+                                        } else if (v.fields) |payload_fields| {
+                                            // Tuple-form multi-payload pattern `Rect(w, h)`: load each payload
+                                            // field (at slot `ptr_size + idx*ptr_size`) into its positional binding.
+                                            for (call.args, 0..) |arg, idx| {
+                                                if (idx >= payload_fields.len or arg.kind != .ident) continue;
+                                                const var_name = arg.kind.ident;
+                                                const var_alloca = self.locals.get(var_name) orelse return error.VariableNotFound;
+                                                const pf = payload_fields[idx];
+                                                const offset = core.LLVMConstInt(self.val_type, ptr_size + idx * ptr_size, 0);
+                                                const addr = core.LLVMBuildAdd(self.builder, union_ptr_val, offset, "payload_addr");
+                                                const src_ptr = core.LLVMBuildIntToPtr(self.builder, addr, core.LLVMPointerType(self.val_type, 0), "payload_ptr");
+                                                const loaded_val = core.LLVMBuildLoad2(self.builder, self.val_type, src_ptr, "payload_val");
+                                                const t_str = try self.typeRefToString(pf.type_name);
+
+                                                if (self.isOwnedDeclaredType(pf.type_name, t_str)) {
+                                                    try self.compileRetain(loaded_val);
+                                                    try retained_payloads.append(self.allocator, .{ .name = var_name, .type_name = t_str });
+                                                }
+                                                _ = core.LLVMBuildStore(self.builder, loaded_val, var_alloca);
+                                            }
                                         }
                                         break;
                                     }

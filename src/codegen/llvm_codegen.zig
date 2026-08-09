@@ -3173,6 +3173,14 @@ pub const LlvmCompiler = struct {
                                                     if (call.args.len > 0 and call.args[0].kind == .ident) {
                                                         try list.append(self.allocator, call.args[0].kind.ident);
                                                     }
+                                                } else if (v.fields) |payload_fields| {
+                                                    // Tuple-form multi-payload pattern `Rect(w, h)`: bind each
+                                                    // positional arg to the matching payload field.
+                                                    for (call.args, 0..) |arg, i| {
+                                                        if (i < payload_fields.len and arg.kind == .ident) {
+                                                            try list.append(self.allocator, arg.kind.ident);
+                                                        }
+                                                    }
                                                 }
                                                 break;
                                             }
@@ -3300,6 +3308,15 @@ pub const LlvmCompiler = struct {
                                                     if (call.args.len > 0 and call.args[0].kind == .ident) {
                                                         const p_type_str = try self.typeRefToString(payload_type);
                                                         try map.put(call.args[0].kind.ident, p_type_str);
+                                                    }
+                                                } else if (v.fields) |payload_fields| {
+                                                    // Tuple-form multi-payload pattern `Rect(w, h)`: type each
+                                                    // positional binding from the matching payload field.
+                                                    for (call.args, 0..) |arg, i| {
+                                                        if (i < payload_fields.len and arg.kind == .ident) {
+                                                            const p_type_str = try self.typeRefToString(payload_fields[i].type_name);
+                                                            try map.put(arg.kind.ident, p_type_str);
+                                                        }
                                                     }
                                                 }
                                                 break;

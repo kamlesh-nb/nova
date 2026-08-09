@@ -926,6 +926,14 @@ pub const TypeChecker = struct {
                                                         const arg_name = call.args[0].kind.ident;
                                                         try self.variables.put(arg_name, payload_type);
                                                     }
+                                                } else if (v.fields) |payload_fields| {
+                                                    // Tuple-form multi-payload pattern `Rect(w, h)`: bind each
+                                                    // positional binding to the matching payload field's type.
+                                                    for (call.args, 0..) |arg, i| {
+                                                        if (i < payload_fields.len and arg.kind == .ident) {
+                                                            try self.variables.put(arg.kind.ident, payload_fields[i].type_name);
+                                                        }
+                                                    }
                                                 }
                                                 break;
                                             }
