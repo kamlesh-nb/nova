@@ -357,8 +357,14 @@ Root: 1b.
   following low surrogate (DC00..DFFF) into one code point and add the 4-byte UTF-8 branch; a lone/invalid
   surrogate is left as-is and does not consume following text. Case 287 (surrogate pair, both range ends,
   BMP/2-byte/ASCII unaffected, lone high surrogate, pair surrounded by ASCII).
-- **G4** `string.parseI64` is wrong for i64 MIN (magnitude overflow), silently ignores non-digits, and has no
-  overflow detection. Also used by `serde.getInt`.
+- **G4** (fixed) `string.parseI64` accumulated magnitude in POSITIVE space (a near-miss at i64 MIN, which only
+  worked by a coincidental double-overflow), SILENTLY SKIPPED embedded non-digits (so `"1a2"` parsed as 12,
+  not 1), and had NO overflow detection (large inputs wrapped to garbage). Also used by `serde.getInt`, so
+  DB/JSON/form numeric binding inherited it. Rewritten to the standard negative-accumulation algorithm: an
+  optional leading `+`/`-`, then digits accumulated in negative space (so i64 MIN is representable), each step
+  overflow-checked; it STOPS at the first non-digit (a lenient tail like C `strtol`, so `"12abc"` is 12 but
+  `"1a2"` is 1) and CLAMPS to the signed 64-bit bound on overflow instead of wrapping. Case 175 extended
+  (exact MIN/MAX, leading `+`, embedded-non-digit stop, overflow clamp both directions, sign-only → 0).
 - **G5** (fixed) `try` silently propagated a **mismatched error type** out of a narrower error-union
   signature. `try g()` re-raises the callee's error UNCHANGED into the enclosing function, so that error must
   match the function's declared error type; propagating a foreign error (`fn f(): T | E1 { return try g() }`
