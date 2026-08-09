@@ -439,6 +439,16 @@ pub fn isOwnedExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool {
         }
         return false;
     }
+    // A FREE generic fn's spec binds its type parameters through `current_method_subst` (name -> concrete
+    // strings), not `current_instantiation_id`, so the TypeId-based resolution above cannot resolve a bare
+    // `T`. Fall back to the string substitution (`resolveExpressionTypeName` applies `method_subst`) and
+    // decide ownership by the concrete name. Without this, `fn id<T>(v: T): T { return v; }` emits no
+    // retain-on-return and the caller over-releases the returned arg -> double-free (B3-family).
+    if (st.get(t_opt.?) == .type_param) {
+        if (self.resolveExpressionTypeName(expr_ptr) catch null) |nm| {
+            return self.ownedByName(getStructBaseName(nm));
+        }
+    }
     return self.isOwnedTypeId(t_opt.?);
 }
 
