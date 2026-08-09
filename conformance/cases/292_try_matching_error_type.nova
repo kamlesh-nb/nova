@@ -1,0 +1,45 @@
+// G5 (positive side): `try` propagates the callee's error UNCHANGED, so it is valid exactly when the callee's
+// error type matches the enclosing function's declared error type. This case pins that the matching case
+// compiles and runs; the mismatched case is rejected in expect_fail/try_error_type_mismatch.
+
+import assert;
+
+exception E {
+    NotFound,
+    fn message(self: E): string { return "not found"; }
+}
+
+fn inner(fail: bool): int | E {
+    if (fail) { return E.NotFound; }
+    return 7;
+}
+
+// Same error type E on both sides -> `try` is allowed; the ok value flows through.
+fn outer(fail: bool): int | E {
+    let x = try inner(fail);
+    return x + 1;
+}
+
+@test
+fn test_try_ok_path(): void {
+    let r = outer(false) catch (e) -1;
+    assert.equalInt(r, 8);
+}
+
+@test
+fn test_try_error_propagates(): void {
+    let r = outer(true) catch (e) -1;
+    assert.equalInt(r, -1);
+}
+
+// A `try` chain across two frames with the same error type also type-checks and runs.
+fn middle(fail: bool): int | E {
+    let x = try outer(fail);
+    return x * 2;
+}
+
+@test
+fn test_try_two_frames(): void {
+    assert.equalInt(middle(false) catch (e) -1, 16);   // outer(false)=8 -> *2 = 16
+    assert.equalInt(middle(true) catch (e) -1, -1);
+}

@@ -350,6 +350,19 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
         std.process.exit(1);
     }
 
+    if (inf.try_error_mismatch_errors.items.len > 0) {
+        std.debug.print("Type checking failed with {d} error(s):\n", .{inf.try_error_mismatch_errors.items.len});
+        for (inf.try_error_mismatch_errors.items) |te| {
+            const callee_name = renderLegacy(allocator, store, te.callee_err) catch "<type>";
+            const fn_name = renderLegacy(allocator, store, te.fn_err) catch "<type>";
+            std.debug.print(
+                "  \x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m `try` propagates an error of type '{s}', but the enclosing function is declared to fail with '{s}'. `try` re-raises the error unchanged, so the types must match — `catch` and map to '{s}', or widen the function's error type.\x1b[0m\n",
+                .{ te.span.file, te.span.line, te.span.col, callee_name, fn_name, fn_name },
+            );
+        }
+        std.process.exit(1);
+    }
+
     {
         var count: usize = 0;
         for (program.declarations) |decl| {

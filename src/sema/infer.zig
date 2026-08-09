@@ -255,6 +255,15 @@ pub const CatchMismatchError = struct {
     handler: TypeId,
 };
 
+// A `try g()` whose propagated error type does not match the enclosing function's declared error type.
+// `try` re-raises the callee's error unchanged, so `fn f(): T | E1 { return try g() }` where g fails with
+// E2 is a soundness hole -- the caller's contract says E1 but an E2 escapes (G5).
+pub const TryErrorMismatch = struct {
+    span: ast.Span,
+    callee_err: TypeId,
+    fn_err: TypeId,
+};
+
 pub const Inferer = struct {
     allocator: std.mem.Allocator,
     store: *types.TypeStore,
@@ -278,6 +287,8 @@ pub const Inferer = struct {
     // unify (the catch yields the ok type), so e.g. `intFn() catch (e) e.describe()` (ok=int,
     // handler=string) is a soundness error, not silent garbage.
     catch_mismatch_errors: std.ArrayListUnmanaged(CatchMismatchError) = .empty,
+
+    try_error_mismatch_errors: std.ArrayListUnmanaged(TryErrorMismatch) = .empty,
 
     fatal_unresolved_idents: usize = 0,
 
@@ -320,6 +331,7 @@ pub const Inferer = struct {
         self.const_reassign_errors.deinit(self.allocator);
         self.optional_deref_errors.deinit(self.allocator);
         self.catch_mismatch_errors.deinit(self.allocator);
+        self.try_error_mismatch_errors.deinit(self.allocator);
     }
 
     fn push(self: *Inferer) !void {
@@ -422,6 +434,19 @@ pub const Inferer = struct {
         if ((ko == .string) != (kh == .string)) return false;
         if ((ko == .decimal) != (kh == .decimal)) return false;
         return true;
+    }
+
+    // Two error types match if they are the same declared type (same enum/exception SymbolId, or same
+    // struct decl, or the identical TypeId). An unresolved side is never flagged (avoid false positives on
+    // types sema could not pin). Nova has no error-type subtyping, so a mismatch is always a G5 error.
+    fn errorTypesCompatible(self: *Inferer, a: TypeId, b: TypeId) bool {
+        if (a == b) return true;
+        const sa = self.store.get(a);
+        const sb = self.store.get(b);
+        if (sa == .unresolved or sb == .unresolved) return true;
+        if (sa == .enum_ and sb == .enum_) return sa.enum_ == sb.enum_;
+        if (sa == .struct_ and sb == .struct_) return sa.struct_.decl == sb.struct_.decl;
+        return false;
     }
 
     pub fn inferExpr(self: *Inferer, ep: *const ast.Expression) anyerror!TypeId {
@@ -992,7 +1017,23 @@ pub const Inferer = struct {
             .try_expr => |inner| {
                 const it = try self.inferExpr(inner);
                 const ity = self.store.get(it);
-                if (ity == .error_union) return self.ok(ity.error_union.ok);
+                if (ity == .error_union) {
+                    // `try` re-raises the callee's error UNCHANGED into the enclosing function, so that
+                    // error must match the function's declared error type (G5). Only flag when both are
+                    // resolved error unions with genuinely different error types.
+                    if (self.current_ret) |rt| {
+                        const rty = self.store.get(rt);
+                        if (rty == .error_union and !self.errorTypesCompatible(ity.error_union.err, rty.error_union.err)) {
+                            const sp = if (e.span.line > 0) e.span else inner.span;
+                            self.try_error_mismatch_errors.append(self.allocator, .{
+                                .span = sp,
+                                .callee_err = ity.error_union.err,
+                                .fn_err = rty.error_union.err,
+                            }) catch {};
+                        }
+                    }
+                    return self.ok(ity.error_union.ok);
+                }
 
                 return self.ok(it);
             },

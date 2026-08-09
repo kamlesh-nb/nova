@@ -12,8 +12,8 @@ full corpus + ASAN green) · 🔵 investigated, not a live bug (recorded, no fix
 ⬜ open / deferred. Severity: **S-crit** silent corruption/unsafety · **crash** · **wrong** silent wrong
 answer · **blk** does not compile/link · **gap** missing feature.
 
-**Score: 21 defect IDs fixed, 4 investigated-not-a-bug, ~12 open/deferred. Recent: A4 (interpolating a
-non-narrowed optional printed the box pointer); A3-read (value-optional
+**Score: 22 defect IDs fixed, 4 investigated-not-a-bug, ~11 open/deferred. Recent: G5 (`try` propagated a
+mismatched error type); A4 (interpolating a non-narrowed optional printed the box pointer); A3-read (value-optional
 monomorphisation collision, fuzzer-found); G3 (JSON surrogate-pair astral corruption); shift-infer (integer
 literals in a `long` context computed in 32 bits); lit-i64 (decimal literal above i64 range silently → 0);
 F2 (payload-enum `==` compared identity not value). Every fix is repro-first with a
@@ -52,7 +52,7 @@ gating case (273–285) and stays corpus + ASAN green.**
 | F2 | F enum/union | wrong | ✅ | payload-enum `==` now compares by VALUE (word-by-word over the same-size zero-padded box), not heap identity. Value payloads compare by value; string/heap payload fields stay identity (documented). Case 290 |
 | F3 | F enum/union | — | 🔵 | NOT a needed construct. Per spec §3.5 an error union `T \| E` is handled with `try`/`catch`; to branch on error variants you `catch (e) helper(e)` (or use the exception's `message()`) and `switch` on the UNWRAPPED enum error, which works (cases 266, 32). A raw `switch` over `T \| E` is not in the language. Follow-on (minor): have the checker reject it outright instead of falling through |
 | G3 | G stdlib | S-crit | ✅ | JSON `\uXXXX` surrogate pairs now combine into one astral code point (4-byte UTF-8); decoder was encoding each surrogate independently → 6 bytes of mojibake. Case 287 |
-| G5 | G stdlib | wrong | ⬜ | `try` propagates mismatched error type |
+| G5 | G stdlib | wrong | ✅ | `try g()` re-raises the callee's error unchanged, so it must match the enclosing function's declared error type; the checker now rejects a mismatch (`fn f(): T\|E1 { return try g() }` where g fails with E2). Case 292 + expect_fail |
 | H4 | H numeric | wrong | ⬜ | decimal >34 digits truncate not round-half-even |
 | lit-i64 | H numeric | wrong | ✅ | a decimal literal above i64 range was silently parsed to 0 (`catch 0`); now a hard parse error. Hex/bin/oct keep their bit pattern to u64; `-9223372036854775808` (i64 MIN) works. Case 289 + expect_fail |
 | shift-infer | H numeric | wrong | ✅ | an integer literal in a `long` context stayed `int`, so `let x: long = 1 << 40` (and `1000000 * 1000000`) computed in 32 bits and overflowed before widening. Literals now adopt an integer expected type (>= 32 bits) and arithmetic propagates it. Case 288 |
@@ -340,8 +340,13 @@ Root: 1b.
   BMP/2-byte/ASCII unaffected, lone high surrogate, pair surrounded by ASCII).
 - **G4** `string.parseI64` is wrong for i64 MIN (magnitude overflow), silently ignores non-digits, and has no
   overflow detection. Also used by `serde.getInt`.
-- **G5** `try` silently propagates a **mismatched error type** out of a narrower error-union signature (a
-  soundness looseness in the type checker).
+- **G5** (fixed) `try` silently propagated a **mismatched error type** out of a narrower error-union
+  signature. `try g()` re-raises the callee's error UNCHANGED into the enclosing function, so that error must
+  match the function's declared error type; propagating a foreign error (`fn f(): T | E1 { return try g() }`
+  where g fails with E2) let an E2 escape a function whose contract says E1. The checker now flags it in the
+  `.try_expr` inference against `current_ret` (`src/sema/infer.zig`, `errorTypesCompatible`); Nova has no
+  error subtyping, so only an exact match of the declared error type passes (an unresolved side is never
+  flagged). Case 292 + expect_fail/try_error_type_mismatch.
 
 ### Cluster H: numeric correctness  [crash + wrong]
 - **H1** `string + double` (the `+` operator) **SIGSEGVs**: the raw double is handed to the string layer as a
