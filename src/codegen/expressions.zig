@@ -421,6 +421,30 @@ pub fn awaitedCallHandle(self: *LlvmCompiler, operand: ast.Expression, is_spawn:
             }
         }
         const base = try self.resolveCalleeName(callee_ident);
+
+        // A generic async call (`await queryAs<Dto>(js)`) must resolve to the per-instantiation SPEC
+        // (`queryAs__Dto`), whose body carries the concrete type argument -- NOT the erased base body
+        // (whose `serde.bind<T>` etc. trap at runtime). Check the spec BEFORE the base name, since the
+        // erased base is also in async_fns (B6).
+        if (operand.kind == .generic_call) {
+            const gc = operand.kind.generic_call;
+            if (gc.type_args.len > 0) {
+                var nb = std.ArrayListUnmanaged(u8).empty;
+                errdefer nb.deinit(self.allocator);
+                try nb.appendSlice(self.allocator, base);
+                for (gc.type_args) |ta| {
+                    const rendered = try self.typeRefToString(ta);
+                    const ma = try types_mod.mangleTypeName(self.allocator, rendered);
+                    defer self.allocator.free(ma);
+                    try nb.appendSlice(self.allocator, "__");
+                    try nb.appendSlice(self.allocator, ma);
+                }
+                const cand = try nb.toOwnedSlice(self.allocator);
+                if (self.async_fns.contains(cand)) break :resolve cand;
+                self.allocator.free(cand);
+            }
+        }
+
         if (self.async_fns.contains(base)) break :resolve base;
 
         if (obj_name) |on| {
@@ -2566,6 +2590,15 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     defer self.allocator.free(binder_name);
                     const resolved_binder = try self.resolveCalleeName(binder_name);
                     const fn_val = self.func_map.get(resolved_binder) orelse self.func_map.get(binder_name) orelse {
+                        // In the ERASED body of a generic `fn f<T>(){ serde.bind<T> }`, T is unbound, so no
+                        // `T__bind` exists. That erased body is a fallback that never runs at runtime (real
+                        // calls route to the per-instantiation spec, which carries the concrete binder), so
+                        // emit a trap rather than failing the whole compile (B6). A genuinely-missing binder
+                        // for a real (known) struct still hard-errors.
+                        if (!self.structs.contains(getStructBaseName(rendered))) {
+                            self.emitTrapIf(core.LLVMConstInt(core.LLVMInt1Type(), 1, 0), "unreachable: serde.bind on an unresolved type parameter (erased generic body)");
+                            return core.LLVMConstInt(self.val_type, 0, 0);
+                        }
                         std.debug.print("serde.bind: binder '{s}' not found\n", .{binder_name});
                         return error.FunctionNotFound;
                     };
@@ -3010,6 +3043,14 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                         }
                     }
                     args[idx] = val;
+                }
+
+                // A generic call to an async fn (`makeGeneric<Dto>(d)` where the mono spec is async) must be
+                // DRIVEN to completion and its result extracted from the coroutine promise, exactly like a
+                // plain async call -- otherwise the raw ramp handle is returned and read as the result
+                // (garbage). The plain-call path already does this; the generic path did not (B6).
+                if (self.async_fns.contains(callee_name)) {
+                    return try self.buildDriveAsyncCall(fn_val, args);
                 }
 
                 return try self.buildCallWithCasts(fn_val, args);
