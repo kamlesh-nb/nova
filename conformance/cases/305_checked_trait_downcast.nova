@@ -1,0 +1,55 @@
+// D3: a trait->concrete downcast (`traitObj as Square`) was UNCHECKED. If the trait object's actual type
+// was not the target, codegen silently reinterpreted the memory as the target type -- e.g. `Circle as
+// Square` handed back a "Square" whose fields aliased the Circle's, a soundness hole. Fix: the downcast now
+// loads the trait object's vtable (which uniquely identifies the concrete type for that trait) and compares
+// it against the target's expected vtable, trapping via nova_panic_cstr on a mismatch.
+//
+// This positive case proves the check does NOT disturb a CORRECT downcast: the right concrete type, several
+// impls of one trait, a factory-returned trait object, and plain vtable dispatch without a downcast all
+// work. The wrong-downcast trap aborts the process (like the div-by-zero guard in 277_int_div_mod), so it
+// is verified manually rather than in this @test suite.
+
+import assert;
+
+trait Animal { fn speak(self: Self): string; }
+
+struct Dog impl Animal {
+    name: string,
+    fn speak(self: Dog): string { return self.name; }
+}
+
+struct Cat impl Animal {
+    fn speak(self: Cat): string { return "meow"; }
+}
+
+fn make(dog: bool): Animal {
+    if (dog) { return Dog{ name: "rex" }; }
+    return Cat{};
+}
+
+@test
+fn test_correct_downcast_dog(): void {
+    let a: Animal = Dog{ name: "fido" };
+    let d = a as Dog;
+    assert.equalStr(d.name, "fido");
+}
+
+@test
+fn test_correct_downcast_cat(): void {
+    let a: Animal = Cat{};
+    let c = a as Cat;
+    assert.equalStr(c.speak(), "meow");
+}
+
+@test
+fn test_factory_return_then_downcast(): void {
+    let a = make(true);
+    let d = a as Dog;
+    assert.equalStr(d.speak(), "rex");
+}
+
+@test
+fn test_dispatch_without_downcast(): void {
+    let a: Animal = Cat{};
+    assert.equalStr(a.speak(), "meow");
+}

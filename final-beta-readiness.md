@@ -12,7 +12,9 @@ full corpus + ASAN green) · 🔵 investigated, not a live bug (recorded, no fix
 ⬜ open / deferred. Severity: **S-crit** silent corruption/unsafety · **crash** · **wrong** silent wrong
 answer · **blk** does not compile/link · **gap** missing feature.
 
-**Score: 29 defect IDs fixed (B5 direct case), 4 investigated-not-a-bug, ~8 open/deferred. Recent: B5-direct
+**Score: 30 defect IDs fixed (D3 + B5 direct case), 4 investigated-not-a-bug, ~7 open/deferred. Recent:
+D3 (an unchecked trait→concrete downcast silently reinterpreted memory when the actual type differed;
+the downcast now checks the trait object's vtable against the target and traps on mismatch); B5-direct
 (a generic struct init `Cell<int>{...}` inferred with no type args left `T`-typed fields/returns erased, so
 interpolating one stringified a raw int as a pointer → SEGV; struct-init inference now recovers the
 instantiation from the field values — the trait-object vtable sub-case remains open); tuple-payload-multi
@@ -28,7 +30,7 @@ mismatched error type); A4 (interpolating a non-narrowed optional printed the bo
 monomorphisation collision, fuzzer-found); G3 (JSON surrogate-pair astral corruption); shift-infer (integer
 literals in a `long` context computed in 32 bits); lit-i64 (decimal literal above i64 range silently → 0);
 F2 (payload-enum `==` compared identity not value). Every fix is repro-first with a
-gating case (273–304) and stays corpus + ASAN green.**
+gating case (273–305) and stays corpus + ASAN green.**
 
 | ID | Cluster | Sev | Status | Commit / note |
 |----|---------|-----|--------|---------------|
@@ -57,7 +59,7 @@ gating case (273–304) and stays corpus + ASAN green.**
 | B4 | B generics | blk | ⬜ | `Set<T>` (over `Map<T, bool>`) fails. Root cause pinned: `Set<int>` monomorphises its OWN methods (`Set_i32_*`) but the nested generic `Map<int, bool>` is never instantiated, so `self.map.get(...)` falls to the ERASED `Map_*`. Two symptoms: (1) the private erased `Map_keysEqual` is DCE-dropped because it is emitted before its callers `Map_set`/`get` create a use → undefined symbol at link; (2) even emitted, the erased Map↔`Set_i32` ARC boundary releases a bogus pointer → SEGV in `Set_i32_has`. Real fix = instantiate the nested generic `Map<int,bool>` through `Set<int>` and route the calls to `Map_i32_bool_*` (a nested-generic monomorphisation fix, F2-6-adjacent), NOT just the emission-drop |
 | B5 | B generics | crash | 🔵 (partial) | ✅ DIRECT case fixed: a generic struct init `Cell<int>{...}` was inferred with NO type args, so a `T`-typed field/return stayed an erased type-param — interpolating such a value (`${self.value}`) stringified a raw int as a pointer → SEGV in StringBuilder_append. Fix: struct-init inference recovers the instantiation from the field values (solve the struct's type params against the inferred field-value types). Case 299. ⬜ STILL OPEN: dispatch through a TRAIT OBJECT vtable, where the vtable points to the erased shared method body instead of the per-instantiation monomorphisation — needs per-instantiation vtables for a generic struct impl'ing a trait (codegen) |
 | B6 | B generics | blk | ⬜ | generic `async fn` cannot resolve `serde.bind<T>` |
-| D1/D2/D3 | D erased carriers | S-crit | ⬜ | `any` owning-heap UAF; any-downcast double-free; unchecked trait→concrete `as` |
+| D1/D2/D3 | D erased carriers | S-crit | 🔵 (partial) | ✅ D3 fixed: a trait→concrete downcast (`traitObj as Square`) was UNCHECKED and silently reinterpreted memory when the actual type differed (`Circle as Square` handed back a bogus Square). Now the downcast loads the trait object's vtable (which uniquely identifies the concrete type for that trait) and traps via `nova_panic_cstr` on mismatch. Case 305 (positives; the wrong-downcast trap aborts, verified manually like 277). ⬜ D1 (`any` owning-heap UAF) and D2 (any-downcast double-free) did not reproduce in quick probes (`let a: any = <string>; a as string` is ASAN-clean) — need targeted repros before fixing |
 | E3 | E async | crash | ⬜ | reap-mark not cleared for awaited children (latent) |
 | F1 | F enum/union | crash | ✅ | `T\|E\|undefined` value-arm SEGV: `typeRefToString` dropped the `.optional`, so the error-union ok arm collapsed from `int\|undefined` to `int`. Producer stored a raw int; every consumer unboxed a value-optional → SEGV. Fixed across the seam: render value-optionals distinctly, box the ok value on return, treat `try`/`catch` as value-optional boxes, box the catch handler. Case 293 |
 | F2 | F enum/union | wrong | ✅ | payload-enum `==` now compares by VALUE (word-by-word over the same-size zero-padded box), not heap identity. Value payloads compare by value; string/heap payload fields stay identity (documented). Case 290 |

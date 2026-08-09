@@ -3735,6 +3735,20 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
 
             if (src_opt) |src| {
                 if (self.traits.contains(src) and self.isStructType(target)) {
+                    // A trait->concrete downcast (`x as Square`) is only sound when the trait object's actual
+                    // concrete type IS the target. The trait object is `{struct_ptr @0, vtable @ptr_size}` and
+                    // the vtable global uniquely identifies the concrete type for this trait, so compare the
+                    // runtime vtable against the target's expected vtable and TRAP on mismatch (D3). Without
+                    // this, `Circle as Square` silently reinterpreted the memory as a Square.
+                    const ptr_size = @as(u64, 8);
+                    const vt_addr = core.LLVMBuildAdd(self.builder, val, core.LLVMConstInt(self.val_type, ptr_size, 0), "downcast_vt_addr");
+                    const vt_ptr = core.LLVMBuildIntToPtr(self.builder, vt_addr, core.LLVMPointerType(self.val_type, 0), "downcast_vt_ptr");
+                    const actual_vt = core.LLVMBuildLoad2(self.builder, self.val_type, vt_ptr, "downcast_actual_vt");
+                    const expected_vt_global = try self.getGlobalVTable(getStructBaseName(target), getStructBaseName(src));
+                    const expected_vt = core.LLVMBuildPtrToInt(self.builder, expected_vt_global, self.val_type, "downcast_expected_vt");
+                    const mismatch = core.LLVMBuildICmp(self.builder, types.LLVMIntPredicate.LLVMIntNE, actual_vt, expected_vt, "downcast_bad");
+                    self.emitTrapIf(mismatch, "invalid downcast: trait object is not the target concrete type");
+
                     const sp_ptr = core.LLVMBuildIntToPtr(self.builder, val, core.LLVMPointerType(self.val_type, 0), "downcast_sp_ptr");
                     const struct_ptr = core.LLVMBuildLoad2(self.builder, self.val_type, sp_ptr, "downcast_struct_ptr");
 

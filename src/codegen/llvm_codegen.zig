@@ -1266,7 +1266,7 @@ pub const LlvmCompiler = struct {
         return null;
     }
 
-    fn getGlobalVTable(self: *LlvmCompiler, struct_name: []const u8, trait_name: []const u8) !types.LLVMValueRef {
+    pub fn getGlobalVTable(self: *LlvmCompiler, struct_name: []const u8, trait_name: []const u8) !types.LLVMValueRef {
         const base_name = try std.fmt.allocPrint(self.allocator, "_vtable_{s}_{s}", .{ struct_name, trait_name });
         defer self.allocator.free(base_name);
         const vtable_name = try self.allocator.dupeZ(u8, base_name);
