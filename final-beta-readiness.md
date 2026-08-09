@@ -12,7 +12,8 @@ full corpus + ASAN green) · 🔵 investigated, not a live bug (recorded, no fix
 ⬜ open / deferred. Severity: **S-crit** silent corruption/unsafety · **crash** · **wrong** silent wrong
 answer · **blk** does not compile/link · **gap** missing feature.
 
-**Score: 20 defect IDs fixed, 4 investigated-not-a-bug, ~13 open/deferred. Recent: A3-read (value-optional
+**Score: 21 defect IDs fixed, 4 investigated-not-a-bug, ~12 open/deferred. Recent: A4 (interpolating a
+non-narrowed optional printed the box pointer); A3-read (value-optional
 monomorphisation collision, fuzzer-found); G3 (JSON surrogate-pair astral corruption); shift-infer (integer
 literals in a `long` context computed in 32 bits); lit-i64 (decimal literal above i64 range silently → 0);
 F2 (payload-enum `==` compared identity not value). Every fix is repro-first with a
@@ -40,7 +41,7 @@ gating case (273–285) and stays corpus + ASAN green.**
 | E1 | E async | hang | 🔵 | did not reproduce in isolation; ASAN-clean — likely subsumed by C/B fixes |
 | E2/S7 | E async | S-crit | 🔵 | owned-struct-across-await did not reproduce; ASAN-clean now |
 | G4 | G stdlib | wrong | 🔵 (partial) | `parseI64` i64-MIN actually works (double wrap); non-digit/overflow parts still open |
-| A4 | A value-opt | wrong | ⬜ | interpolating a non-narrowed value-optional prints box ptr (footgun) |
+| A4 | A value-opt | wrong | ✅ | interpolating a non-narrowed optional printed the box ptr; now renders the inner value when present and `undefined` when absent (value-optional + heap-optional string). Case 291 |
 | A-nested | A value-opt | crash | ⬜ | `Map.get` returning `(int\|undefined)\|undefined` (nested optional) |
 | B4 | B generics | blk | ⬜ | `Set<T>` link fail (`_Map_keysEqual`) |
 | B5 | B generics | crash | ⬜ | generic `struct impl Trait` via trait object vtable |
@@ -254,8 +255,12 @@ slot, or a container.
   + ASAN green). Root cause is squarely the F2-6/W9 "string path drops `.optional`" class, fixed reactively.
   The earlier "borrow over-release" theory was disproved: the string-model `set`/`get` retains are correct and
   `grow()` depends on them.
-- **A4** interpolating a **non-narrowed** value-optional (`${x}` on `int|undefined`) prints the box pointer.
-  Footgun, not corruption (narrow or `?? default` first).
+- **A4** (fixed) interpolating a **non-narrowed** optional (`${x}` on `int | undefined`) printed the box
+  pointer. The template stringifier only handled string/prim/decimal parts and fell through for an
+  `.optional`, appending the raw box. It now branches on presence: a value-optional renders its unboxed inner
+  value (int/long/bool/...), a heap-optional string renders the string, and an absent optional renders
+  `undefined` (`src/codegen/expressions.zig`, `compileAppendToStringBuilder`). Narrowing first (`?? d` or an
+  `if (x != undefined)` guard) already worked and still does. Case 291.
 Bounded clean: value-optional as a **struct field** works; `undefined` alone works; heap-typed optionals
 (`string|undefined`) work. So the fault is specifically the value scalar plus the box, on compound paths.
 

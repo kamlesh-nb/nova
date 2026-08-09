@@ -3934,6 +3934,43 @@ pub fn compileAppendToStringBuilder(self: *LlvmCompiler, sb_val: types.LLVMValue
                             return;
                         },
 
+                        // Interpolating a NON-narrowed optional must print the inner value when present and
+                        // "undefined" when absent -- not the raw box pointer (A4). A value-optional is a boxed
+                        // value (0 == undefined); a heap-optional string is the pointer itself (0 == none).
+                        .optional => {
+                            const cur = core.LLVMGetInsertBlock(self.builder);
+                            const func = core.LLVMGetBasicBlockParent(cur);
+                            const present_bb = core.LLVMAppendBasicBlock(func, "interp_opt_present");
+                            const absent_bb = core.LLVMAppendBasicBlock(func, "interp_opt_absent");
+                            const merge_bb = core.LLVMAppendBasicBlock(func, "interp_opt_done");
+                            const is_null = core.LLVMBuildICmp(self.builder, types.LLVMIntPredicate.LLVMIntEQ, val, core.LLVMConstInt(self.val_type, 0, 0), "interp_opt_null");
+                            _ = core.LLVMBuildCondBr(self.builder, is_null, absent_bb, present_bb);
+
+                            core.LLVMPositionBuilderAtEnd(self.builder, present_bb);
+                            if (self.valueOptionalInner(tid)) |inner_tid| {
+                                const inner_val = try self.buildValoptUnbox(val);
+                                if (try self.numToStringT(inner_val, inner_tid)) |str_temp| {
+                                    var pa = [_]types.LLVMValueRef{ sb_val, str_temp };
+                                    _ = core.LLVMBuildCall2(self.builder, sb_append_t, sb_append, &pa, 2, "");
+                                    try self.compileRelease(str_temp, null);
+                                }
+                            } else if (st.get(st.get(tid).optional) == .string) {
+                                // Heap-optional string: the present value IS the string pointer.
+                                var pa = [_]types.LLVMValueRef{ sb_val, val };
+                                _ = core.LLVMBuildCall2(self.builder, sb_append_t, sb_append, &pa, 2, "");
+                            }
+                            _ = core.LLVMBuildBr(self.builder, merge_bb);
+
+                            core.LLVMPositionBuilderAtEnd(self.builder, absent_bb);
+                            const undef_str = try self.getOrCreateStringLiteral("undefined");
+                            var aa = [_]types.LLVMValueRef{ sb_val, undef_str };
+                            _ = core.LLVMBuildCall2(self.builder, sb_append_t, sb_append, &aa, 2, "");
+                            _ = core.LLVMBuildBr(self.builder, merge_bb);
+
+                            core.LLVMPositionBuilderAtEnd(self.builder, merge_bb);
+                            return;
+                        },
+
                         else => {},
                     }
                 }

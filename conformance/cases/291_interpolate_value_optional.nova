@@ -1,0 +1,49 @@
+// A4: interpolating a NON-narrowed optional printed the raw box pointer (`v=*0x...`) instead of the value.
+// The template stringifier only handled string/prim/decimal parts and appended the box pointer for an
+// `.optional`. It now renders a value-optional's inner value when present and "undefined" when absent, and a
+// heap-optional string likewise. Narrowing first (`x ?? d`, or an `if (x != undefined)` guard) already
+// worked and still does.
+
+import assert;
+
+fn getInt(present: bool): int | undefined { if (present) { return 42; } return undefined; }
+fn getLong(present: bool): long | undefined { if (present) { return 5000000000; } return undefined; }
+fn getStr(present: bool): string | undefined { if (present) { return "hi"; } return undefined; }
+
+@test
+fn test_value_optional_present(): void {
+    let x = getInt(true);
+    assert.equalStr(`v=${x}`, "v=42");
+}
+
+@test
+fn test_value_optional_absent(): void {
+    let x = getInt(false);
+    assert.equalStr(`v=${x}`, "v=undefined");
+}
+
+@test
+fn test_long_optional_present(): void {
+    let x = getLong(true);
+    assert.equalStr(`v=${x}`, "v=5000000000");
+}
+
+@test
+fn test_heap_optional_string_present(): void {
+    let s = getStr(true);
+    assert.equalStr(`s=${s}`, "s=hi");
+}
+
+@test
+fn test_heap_optional_string_absent(): void {
+    let s = getStr(false);
+    assert.equalStr(`s=${s}`, "s=undefined");
+}
+
+@test
+fn test_narrowed_interpolation_still_works(): void {
+    let x = getInt(true);
+    assert.equalStr(`v=${x ?? -1}`, "v=42");
+    let y = getInt(false);
+    assert.equalStr(`v=${y ?? -1}`, "v=-1");
+}
