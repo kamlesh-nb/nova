@@ -275,7 +275,8 @@ Type annotations are optional when inferable: `let x: int = 0` or `let x = 0`. D
 
 ### 6.1 `if` / `while`
 `if (cond) { … } else { … }` and `while (cond) { … }`. **The condition must be `bool`** (enforced —
-`non_bool_condition`). `if` is also an expression (§7).
+`non_bool_condition`). `if` is also an expression (§7). `while (let x = opt) { … }` is an
+optional-binding loop: it runs while `opt` is present, binding the narrowed value to `x` *(→ 302_while_let)*.
 
 ### 6.2 `for` — all four forms
 The increment lives in its own block, so `continue` runs it for every form *(→ 53_for_loops)*:

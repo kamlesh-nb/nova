@@ -1321,6 +1321,61 @@ pub const Parser = struct {
     fn parseWhileStmt(self: *Parser) ParserError!ast.WhileStmt {
         try self.expect(.keyword_while);
         try self.expect(.left_paren);
+
+        // `while (let x = expr)` -- optional-binding loop. Iterate while `expr` is present, binding the
+        // narrowed value to `x`. Desugar to `while (true) { let x = expr; if (x == undefined) { break; }
+        // <body> }`, reusing the (already working) guard-break optional narrowing.
+        if (self.current().type == .keyword_let) {
+            const sp = self.span();
+            self.advance();
+            const bind_name = self.current().lexeme;
+            try self.expect(.identifier);
+            try self.expect(.equal);
+            const bound_expr = try self.parseExpression();
+            try self.expect(.right_paren);
+            const user_body = try self.parseStatementOrBlock();
+
+            // let x = expr;
+            const let_stmt = ast.Statement{ .let_stmt = ast.LetStmt{
+                .name = bind_name,
+                .names = null,
+                .type_name = null,
+                .init = bound_expr,
+                .is_const = false,
+                .span = sp,
+            } };
+            // if (x == undefined) { break; }
+            const lhs = try self.allocExpression(ast.Expression{ .kind = .{ .ident = bind_name } });
+            const rhs = try self.allocExpression(ast.Expression{ .kind = .{ .literal = .undefined } });
+            const cmp = ast.Expression{ .kind = .{ .binary = ast.BinaryExpr{ .left = lhs, .op = .eq, .right = rhs, .span = sp } } };
+            const break_block = try self.allocStatement(ast.Statement{ .block = ast.Block{
+                .statements = try self.allocator.dupe(ast.Statement, &.{ast.Statement{ .break_stmt = ast.BreakStmt{ .span = sp } }}),
+                .span = sp,
+            } });
+            const guard = ast.Statement{ .if_stmt = ast.IfStmt{
+                .condition = cmp,
+                .then_branch = break_block,
+                .else_branch = null,
+                .span = sp,
+            } };
+
+            var stmts = std.ArrayList(ast.Statement).empty;
+            defer stmts.deinit(self.allocator);
+            try stmts.append(self.allocator, let_stmt);
+            try stmts.append(self.allocator, guard);
+            try stmts.append(self.allocator, user_body);
+
+            const loop_body = ast.Statement{ .block = ast.Block{
+                .statements = try stmts.toOwnedSlice(self.allocator),
+                .span = sp,
+            } };
+            return ast.WhileStmt{
+                .condition = ast.Expression{ .kind = .{ .literal = .{ .bool = true } } },
+                .body = try self.allocStatement(loop_body),
+                .span = sp,
+            };
+        }
+
         const cond = try self.parseExpression();
         try self.expect(.right_paren);
         const body = try self.parseStatementOrBlock();

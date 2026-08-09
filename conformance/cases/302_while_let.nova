@@ -1,0 +1,46 @@
+// I (parser gaps): `while (let x = expr) { ... }` -- an optional-binding loop -- failed to parse (`let`
+// was rejected in the condition position). It iterates while `expr` is present, binding the narrowed value
+// to `x`. Fix: the parser desugars it to `while (true) { let x = expr; if (x == undefined) { break; }
+// <body> }`, reusing the (already working) guard-break optional narrowing so `x` is the non-optional value
+// inside the body.
+
+import assert;
+
+fn find(n: int): int | undefined {
+    if (n < 3) { return n; }
+    return undefined;
+}
+
+@test
+fn test_counts_up(): void {
+    let i = 0;
+    let sum = 0;
+    while (let x = find(i)) {
+        sum = sum + x;      // x is the narrowed `int`
+        i = i + 1;
+    }
+    assert.equalInt(sum, 3);   // 0 + 1 + 2
+    assert.equalInt(i, 3);     // stopped when find(3) was undefined
+}
+
+@test
+fn test_empty_immediately(): void {
+    let iters = 0;
+    while (let x = find(99)) { iters = iters + 1; }
+    assert.equalInt(iters, 0);
+}
+
+fn word(n: int): string | undefined {
+    if (n == 0) { return "hi"; }
+    return undefined;
+}
+
+@test
+fn test_string_binding(): void {
+    let got = "";
+    while (let w = word(0)) {
+        got = w;
+        break;
+    }
+    assert.equalStr(got, "hi");
+}
