@@ -480,6 +480,23 @@ pub const Lexer = struct {
         return Token{ .type = types, .lexeme = lexeme, .line = self.line, .column = self.column - lexeme.len };
     }
 
+    // Consume a run of base-10 digits, allowing `_` as a separator between digits (a `_` is consumed only
+    // when a digit follows it, so a trailing or doubled `_` ends the run).
+    fn scanDigitRun(self: *Lexer) void {
+        while (self.pos < self.source.len) {
+            const c = self.source[self.pos];
+            if (c >= '0' and c <= '9') {
+                self.pos += 1;
+                self.column += 1;
+            } else if (c == '_' and self.pos + 1 < self.source.len and
+                self.source[self.pos + 1] >= '0' and self.source[self.pos + 1] <= '9')
+            {
+                self.pos += 1;
+                self.column += 1;
+            } else break;
+        }
+    }
+
     fn readNumber(self: *Lexer) Token {
         const start = self.pos;
         // Radix-prefixed integer literals: 0x.. (hex), 0b.. (binary), 0o.. (octal). The lexeme keeps
@@ -496,7 +513,11 @@ pub const Lexer = struct {
             if (base != 0) {
                 self.pos += 2;
                 self.column += 2;
-                while (self.pos < self.source.len and isBaseDigit(self.source[self.pos], base)) {
+                // `_` is a digit separator (e.g. `0xFF_FF`), allowed only between base digits.
+                while (self.pos < self.source.len and
+                    (isBaseDigit(self.source[self.pos], base) or
+                        (self.source[self.pos] == '_' and self.pos + 1 < self.source.len and isBaseDigit(self.source[self.pos + 1], base))))
+                {
                     self.pos += 1;
                     self.column += 1;
                 }
@@ -504,23 +525,27 @@ pub const Lexer = struct {
                 return Token{ .type = .integer, .lexeme = lexeme, .line = self.line, .column = self.column - (self.pos - start) };
             }
         }
-        while (self.pos < self.source.len and
-            self.source[self.pos] >= '0' and self.source[self.pos] <= '9')
-        {
-            self.pos += 1;
-            self.column += 1;
-        }
+        // `_` is a digit separator (`1_000_000`), allowed only between digits: it must be followed by a
+        // digit (and the loop is only entered after a digit), so `1_`/`1__2` stop the number scan.
+        self.scanDigitRun();
         var is_float = false;
         if (self.pos < self.source.len and self.source[self.pos] == '.') {
             if (self.pos + 1 < self.source.len and self.source[self.pos + 1] >= '0' and self.source[self.pos + 1] <= '9') {
                 self.pos += 1;
                 self.column += 1;
-                while (self.pos < self.source.len and
-                    self.source[self.pos] >= '0' and self.source[self.pos] <= '9')
-                {
-                    self.pos += 1;
-                    self.column += 1;
-                }
+                self.scanDigitRun();
+                is_float = true;
+            }
+        }
+        // Scientific-notation exponent: `e`/`E`, an optional sign, then a digit run. Present on both float
+        // and integer mantissas (`1e3` is a float). Consumed only when a digit actually follows, so an `e`
+        // that begins an identifier is left alone.
+        if (self.pos < self.source.len and (self.source[self.pos] == 'e' or self.source[self.pos] == 'E')) {
+            var q = self.pos + 1;
+            if (q < self.source.len and (self.source[q] == '+' or self.source[q] == '-')) q += 1;
+            if (q < self.source.len and self.source[q] >= '0' and self.source[q] <= '9') {
+                while (self.pos < q) : (self.pos += 1) self.column += 1; // consume 'e' and optional sign
+                self.scanDigitRun();
                 is_float = true;
             }
         }

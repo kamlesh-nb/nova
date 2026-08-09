@@ -46,8 +46,8 @@ A program's entry is `fn main(): void`. Command-line arguments are read via `env
 - **Literals:**
   | Kind | Example | Type |
   |---|---|---|
-  | integer | `42`, `-7`, `0xff`, `0b1010`, `0o17` | `int` (32-bit); a radix-prefixed literal (`0x` hex, `0b` binary, `0o` octal) is read at its base and fits `long` when it exceeds 32 bits |
-  | float | `1.5`, `3.14` | `f64` (`double`) |
+  | integer | `42`, `-7`, `0xff`, `0b1010`, `0o17`, `1_000_000` | `int` (32-bit); a radix-prefixed literal (`0x` hex, `0b` binary, `0o` octal) is read at its base and fits `long` when it exceeds 32 bits |
+  | float | `1.5`, `3.14`, `1e3`, `1.25e-2` | `f64` (`double`); a scientific-notation exponent (`e`/`E` + optional sign) makes a literal a float *(→ 296)* |
   | string | `"hello"` | `string` (UTF-8 bytes) |
   | bool | `true` `false` | `bool` |
   | decimal | `9.99m`, `0.1m`, `-3.14m` | `decimal` (128-bit BID) *(→ 50_decimal)* |
@@ -55,6 +55,8 @@ A program's entry is `fn main(): void`. Command-line arguments are read via `env
   | array | `[1, 2, 3]` | `T[N]` |
   | tuple | `(a, b)` | tuple *(→ 28_tuple_return_heap)* |
   | null / undefined | `null`, `undefined` | absence (§3.5) |
+  - `_` is a digit separator in any numeric literal, permitted only between digits: `1_000_000`,
+    `0xFF_FF`, `0b1010_1010`, `3.141_592`, `1_000.5m` *(→ 296)*.
 - **Operators:** arithmetic `+ - * / %`; comparison `== != < > <= >=`; logical `&& ||`; bitwise `& ^ |`,
   shifts `<< >>`; range `..` (exclusive), `..=` (inclusive) *(→ 53_for_loops)*; assign `=`; nullish
   coalesce `??`; optional chaining `?.`; cast `as`; closure arrow `=>`; type union `|` (optionals /

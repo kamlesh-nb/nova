@@ -12,7 +12,8 @@ full corpus + ASAN green) · 🔵 investigated, not a live bug (recorded, no fix
 ⬜ open / deferred. Severity: **S-crit** silent corruption/unsafety · **crash** · **wrong** silent wrong
 answer · **blk** does not compile/link · **gap** missing feature.
 
-**Score: 25 defect IDs fixed, 4 investigated-not-a-bug, ~8 open/deferred. Recent: H4 (a decimal literal
+**Score: 26 defect IDs fixed, 4 investigated-not-a-bug, ~8 open/deferred. Recent: I-numeric (the lexer
+accepted neither `_` digit separators nor scientific notation; both now scan); H4 (a decimal literal
 with more than 34 significant digits was truncated instead of rounding half-even like the arithmetic path;
 fixed in the literal parser); B1-let (free-generic
 inference into a typed let `let x: int = id(42)` was rejected -- the call resolved to the raw type-param;
@@ -23,7 +24,7 @@ mismatched error type); A4 (interpolating a non-narrowed optional printed the bo
 monomorphisation collision, fuzzer-found); G3 (JSON surrogate-pair astral corruption); shift-infer (integer
 literals in a `long` context computed in 32 bits); lit-i64 (decimal literal above i64 range silently → 0);
 F2 (payload-enum `==` compared identity not value). Every fix is repro-first with a
-gating case (273–295) and stays corpus + ASAN green.**
+gating case (273–296) and stays corpus + ASAN green.**
 
 | ID | Cluster | Sev | Status | Commit / note |
 |----|---------|-----|--------|---------------|
@@ -63,7 +64,7 @@ gating case (273–295) and stays corpus + ASAN green.**
 | lit-i64 | H numeric | wrong | ✅ | a decimal literal above i64 range was silently parsed to 0 (`catch 0`); now a hard parse error. Hex/bin/oct keep their bit pattern to u64; `-9223372036854775808` (i64 MIN) works. Case 289 + expect_fail |
 | shift-infer | H numeric | wrong | ✅ | an integer literal in a `long` context stayed `int`, so `let x: long = 1 << 40` (and `1000000 * 1000000`) computed in 32 bits and overflowed before widening. Literals now adopt an integer expected type (>= 32 bits) and arithmetic propagates it. Case 288 |
 | B1-let | B generics | blk | ✅ | `let x: int = id(42)` — free-generic inference INTO a typed let. The checker resolved the call to the raw return type `T` (unresolved type-param), which failed the compat check against `int`. Fix: when a generic fn is called without explicit `<T>`, infer the type args by unifying each declared param type against the actual argument type, then substitute into the return type. Genuine mismatches still rejected. Cases 294 + expect_fail/generic_infer_typed_let_mismatch |
-| I | parser gaps | gap | ⬜ | sci-notation, `_` separators, tuple-payload, guards, while-let, `?.`-method, if-expr-in-interp, where-constraints, trait default bodies |
+| I | parser gaps | gap | 🔵 (partial) | ✅ DONE: `_` digit separators (`1_000_000`, `0xFF_FF`, `3.141_592`, `1_000.5m`) + scientific notation (`1e3`, `1.25e-2`, `1.5e2m`) — lexer scans them, Zig parseInt/parseFloat already ignore `_`, decimal runtime skips `_`. Case 296. STILL OPEN: tuple-payload, guards, while-let, `?.`-method, if-expr-in-interp, where-constraints, trait default bodies |
 | F4 | keystone | — | 🟡 | codegen soundness fuzzer STARTED (`3769458` `conformance/codegen_fuzz.py`, teeth-proven, int arith/cast) |
 | F2-6 | keystone | — | 🟡 | typed IR BUILT + shadow-validated (6723 agree / 0 disagree); tracker `docs/design/f2-6-keystone-tracking.md` |
 

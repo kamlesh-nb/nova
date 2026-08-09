@@ -1,0 +1,56 @@
+// I (parser gaps): the lexer's number scanner accepted neither `_` digit separators nor scientific
+// notation, so `1_000_000` lexed as `1` followed by an identifier `_000_000`, and `1e3` as `1` followed
+// by `e3`. Fix in the lexer: `_` is consumed as a separator wherever it sits between digits (decimal,
+// hex, binary, fractional, and the exponent), and an `e`/`E` + optional sign + digit run is scanned as a
+// scientific-notation exponent (making the literal a float). An `e` not followed by a digit still begins
+// an identifier. Zig's parseInt/parseFloat already ignore `_`, and the decimal runtime now skips it too.
+
+import assert;
+
+@test
+fn test_underscore_integer(): void {
+    assert.equalInt(1_000_000, 1000000);
+    assert.isTrue(1_000_000_000_000 == 1000000000000);
+}
+
+@test
+fn test_underscore_radix(): void {
+    assert.equalInt(0xFF_FF, 65535);
+    assert.equalInt(0b1010_1010, 170);
+    assert.equalInt(0o1_7, 15);
+}
+
+@test
+fn test_underscore_float_and_decimal(): void {
+    assert.isTrue(3.141_592 == 3.141592);
+    assert.isTrue(1_000.5m == 1000.5m);
+}
+
+@test
+fn test_scientific_float(): void {
+    assert.isTrue(1e3 == 1000.0);
+    assert.isTrue(1.5e2 == 150.0);
+    assert.isTrue(2e-1 == 0.2);
+    assert.isTrue(1E6 == 1000000.0);
+    assert.isTrue(1.25e-2 == 0.0125);
+}
+
+@test
+fn test_scientific_decimal(): void {
+    assert.equalStr(`${1.5e2m}`, "150");
+    assert.equalStr(`${25e-1m}`, "2.5");
+}
+
+@test
+fn test_e_prefixed_identifier_untouched(): void {
+    let e9 = 42;   // an identifier that begins with `e`, not an exponent on a preceding number
+    assert.equalInt(e9, 42);
+}
+
+@test
+fn test_range_still_lexes(): void {
+    // `0..3` must not be mis-scanned as a float: the `.` is not followed by a digit.
+    let sum = 0;
+    for (i in 0..3) { sum = sum + i; }
+    assert.equalInt(sum, 3);
+}

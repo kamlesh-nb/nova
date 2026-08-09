@@ -52,6 +52,7 @@ static long long dec_parse_bounded(const char *s, long long len) {
   bool sticky = false;
   for (; p < e_end; p++) {
     char c = *p;
+    if (c == '_') continue; // digit separator (1_000_000.5m)
     if (c == '.') { if (seen_dot) break; seen_dot = true; continue; }
     if (c == 'e' || c == 'E') break;
     if (c < '0' || c > '9') break;
