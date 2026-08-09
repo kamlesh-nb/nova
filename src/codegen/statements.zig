@@ -378,8 +378,20 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
 
                         const is_err = if (vt) |x| std.mem.eql(u8, x, parts.err) else false;
 
+                        // `T | E | undefined` reads as `(T | undefined) | E`, so the OK arm is a value-optional
+                        // box. A plain `return 42` yields a RAW int, which every consumer (`catch`, `try`, `??`)
+                        // then treats as a boxed value-optional and ARC-releases as a pointer -> SEGV (F1). Box
+                        // the ok value first, unless it is `undefined` (0 is the undefined box) or already a
+                        // value-optional box.
+                        var ok_rv: types.LLVMValueRef = rv;
+                        if (!is_err and LlvmCompiler.valueOptionalName(parts.ok) and
+                            !LlvmCompiler.isUndefinedLiteralExpr(v) and !self.exprYieldsValoptBox(v))
+                        {
+                            ok_rv = try self.buildValoptBox(self.coerceToSlotType(rv, self.val_type));
+                        }
+
                         if (is_err) try self.runErrdefers();
-                        ret_val_opt = try self.buildErrUnion(rv, is_err, func.return_type);
+                        ret_val_opt = try self.buildErrUnion(ok_rv, is_err, func.return_type);
                         wrapped_erru = true;
                     }
                 }

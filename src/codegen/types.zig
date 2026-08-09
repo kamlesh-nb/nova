@@ -154,6 +154,19 @@ pub fn cgPrim(name: []const u8) ?CgPrim {
     return null;
 }
 
+// True when `name` is a BOXED value-optional: `<value-type> | undefined` (e.g. `int | undefined`). A
+// heap-optional (`string | undefined`) is a plain pointer optional (0 == none), NOT boxed, so it is excluded.
+pub fn valueOptionalName(name: []const u8) bool {
+    const bar = std.mem.indexOfScalar(u8, name, '|') orelse return false;
+    const lhs = std.mem.trim(u8, name[0..bar], " ");
+    const rhs = std.mem.trim(u8, name[bar + 1 ..], " ");
+    if (std.mem.indexOfScalar(u8, rhs, '|') != null) return false; // more than two arms
+    const value_arm = if (std.mem.eql(u8, rhs, "undefined")) lhs else if (std.mem.eql(u8, lhs, "undefined")) rhs else return false;
+    return isPrimitiveTypeName(value_arm) and
+        !std.mem.eql(u8, value_arm, "any") and
+        !std.mem.eql(u8, value_arm, "void");
+}
+
 pub fn isPrimitiveTypeName(type_name: []const u8) bool {
 
     return cgPrim(type_name) != null or
@@ -311,7 +324,18 @@ pub fn typeRefToString(self: *LlvmCompiler, type_ref: ast.TypeRef) anyerror![]co
     switch (type_ref) {
 
         .ident => |name| return try self.substTypeParams(name),
-        .optional => |opt| return try self.typeRefToString(opt.*),
+        // A VALUE-optional (`int | undefined`) is a BOXED representation distinct from its inner value type;
+        // rendering it as just the inner drops the optionality. That made an error-union ok arm
+        // `int | undefined` collapse to `int` (`ErrUnion(int, E)`), so the producer stored a raw int while
+        // the consumer (typed path) unboxed it -> SEGV (F1). Render value-optionals distinctly, matching
+        // the typed path (`renderLegacy`); a heap-optional keeps the inner rendering (same pointer repr).
+        .optional => |opt| {
+            const inner = try self.typeRefToString(opt.*);
+            if (opt.* == .ident and cgPrim(opt.*.ident) != null) {
+                return try std.fmt.allocPrint(self.allocator, "{s} | undefined", .{inner});
+            }
+            return inner;
+        },
 
         .error_union => |eu| {
             var list = std.ArrayList(u8).empty;

@@ -3474,11 +3474,13 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
 
             var parts_ok_refcounted = false;
             var parts_err_refcounted = false;
+            var ok_is_valopt = false;
             if (self.errUnionParts(try self.resolveExpressionTypeName(ce.expr) orelse "")) |pp| {
                 defer self.allocator.free(pp.ok);
                 defer self.allocator.free(pp.err);
                 parts_ok_refcounted = self.isOwnedErrUnionOk(ce.expr, pp.ok);
                 parts_err_refcounted = self.isOwnedErrUnionErr(ce.expr, pp.err);
+                ok_is_valopt = types_mod.valueOptionalName(pp.ok);
             }
             const err_bb = core.LLVMAppendBasicBlock(cur_fn, "catch_err");
             const ok_bb = core.LLVMAppendBasicBlock(cur_fn, "catch_ok");
@@ -3514,7 +3516,14 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 if (parts_err_refcounted) try self.compileRetain(err_val);
                 _ = core.LLVMBuildStore(self.builder, err_val, alloca_val.?);
             }
-            const hv = try self.compileExpression(ce.handler.*);
+            var hv = try self.compileExpression(ce.handler.*);
+            // A `catch` yields the ok type. When that ok type is a value-optional (`int | undefined`, from a
+            // `T | undefined | E`), the ok arm is a boxed value-optional, so the handler value must be boxed
+            // too -- otherwise a raw handler value reaches a consuming `?? d`, which unboxes it as a pointer
+            // and SEGVs (F1). `undefined` (0) and an already-boxed value-optional handler are left as-is.
+            if (ok_is_valopt and !LlvmCompiler.isUndefinedLiteralExpr(ce.handler) and !self.exprYieldsValoptBox(ce.handler)) {
+                hv = try self.buildValoptBox(self.coerceToSlotType(hv, self.val_type));
+            }
             if (core.LLVMGetBasicBlockTerminator(core.LLVMGetInsertBlock(self.builder)) == null) {
                 _ = core.LLVMBuildStore(self.builder, self.coerceToSlotType(hv, self.val_type), slot);
                 _ = core.LLVMBuildBr(self.builder, done_bb);

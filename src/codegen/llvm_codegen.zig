@@ -398,6 +398,7 @@ pub const LlvmCompiler = struct {
     }
 
     pub const isStructType = types_mod.isStructType;
+    pub const valueOptionalName = types_mod.valueOptionalName;
 
     pub fn closureKey(self: *LlvmCompiler, span: ast.Span, inst: ?[]const u8) ![]const u8 {
         return self.closureKeyM(span, inst, self.closureKeyActiveSubst());
@@ -655,7 +656,9 @@ pub const LlvmCompiler = struct {
             // `await f()` where f returns a value-optional yields the boxed representation, exactly like
             // a plain call; without this a consuming `?? d` (or comparison) would treat the box pointer
             // as the raw value and return garbage (silent corruption on every async optional API).
-            .ident, .field_access, .call, .generic_call, .index, .optional_chaining, .await_expr => true,
+            // `try`/`catch` over a `T | undefined | E` yield the value-optional ok arm (a box) too, so a
+            // consuming `?? d` must unbox it rather than return the raw pointer (F1).
+            .ident, .field_access, .call, .generic_call, .index, .optional_chaining, .await_expr, .catch_expr, .try_expr => true,
             else => false,
         };
     }

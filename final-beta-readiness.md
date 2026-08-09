@@ -12,12 +12,14 @@ full corpus + ASAN green) · 🔵 investigated, not a live bug (recorded, no fix
 ⬜ open / deferred. Severity: **S-crit** silent corruption/unsafety · **crash** · **wrong** silent wrong
 answer · **blk** does not compile/link · **gap** missing feature.
 
-**Score: 22 defect IDs fixed, 4 investigated-not-a-bug, ~11 open/deferred. Recent: G5 (`try` propagated a
+**Score: 23 defect IDs fixed, 4 investigated-not-a-bug, ~10 open/deferred. Recent: F1 (`T|undefined|E`
+value-arm SEGV: the codegen string path dropped the ok arm's `.optional`, so the producer stored a raw
+value while every consumer unboxed a value-optional); G5 (`try` propagated a
 mismatched error type); A4 (interpolating a non-narrowed optional printed the box pointer); A3-read (value-optional
 monomorphisation collision, fuzzer-found); G3 (JSON surrogate-pair astral corruption); shift-infer (integer
 literals in a `long` context computed in 32 bits); lit-i64 (decimal literal above i64 range silently → 0);
 F2 (payload-enum `==` compared identity not value). Every fix is repro-first with a
-gating case (273–285) and stays corpus + ASAN green.**
+gating case (273–293) and stays corpus + ASAN green.**
 
 | ID | Cluster | Sev | Status | Commit / note |
 |----|---------|-----|--------|---------------|
@@ -48,7 +50,7 @@ gating case (273–285) and stays corpus + ASAN green.**
 | B6 | B generics | blk | ⬜ | generic `async fn` cannot resolve `serde.bind<T>` |
 | D1/D2/D3 | D erased carriers | S-crit | ⬜ | `any` owning-heap UAF; any-downcast double-free; unchecked trait→concrete `as` |
 | E3 | E async | crash | ⬜ | reap-mark not cleared for awaited children (latent) |
-| F1 | F enum/union | crash | ⬜ | `T\|E\|undefined` value-arm SEGV |
+| F1 | F enum/union | crash | ✅ | `T\|E\|undefined` value-arm SEGV: `typeRefToString` dropped the `.optional`, so the error-union ok arm collapsed from `int\|undefined` to `int`. Producer stored a raw int; every consumer unboxed a value-optional → SEGV. Fixed across the seam: render value-optionals distinctly, box the ok value on return, treat `try`/`catch` as value-optional boxes, box the catch handler. Case 293 |
 | F2 | F enum/union | wrong | ✅ | payload-enum `==` now compares by VALUE (word-by-word over the same-size zero-padded box), not heap identity. Value payloads compare by value; string/heap payload fields stay identity (documented). Case 290 |
 | F3 | F enum/union | — | 🔵 | NOT a needed construct. Per spec §3.5 an error union `T \| E` is handled with `try`/`catch`; to branch on error variants you `catch (e) helper(e)` (or use the exception's `message()`) and `switch` on the UNWRAPPED enum error, which works (cases 266, 32). A raw `switch` over `T \| E` is not in the language. Follow-on (minor): have the checker reject it outright instead of falling through |
 | G3 | G stdlib | S-crit | ✅ | JSON `\uXXXX` surrogate pairs now combine into one astral code point (4-byte UTF-8); decoder was encoding each surrogate independently → 6 bytes of mojibake. Case 287 |
