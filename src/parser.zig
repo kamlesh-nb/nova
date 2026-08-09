@@ -151,6 +151,78 @@ pub const Parser = struct {
         }
     }
 
+    // Copy each trait's DEFAULT-bodied methods onto every struct that impls the trait and does not override
+    // them, so the synthesised methods flow through the normal method machinery (checker, mono, codegen,
+    // vtable). Same-file only for now: the trait and the impl'ing struct must be declared in one module.
+    fn expandTraitDefaults(self: *Parser, decls: []ast.Declaration) ParserError!void {
+        for (decls) |*d| {
+            if (d.* != .struct_decl) continue;
+            const sd = &d.struct_decl;
+            if (sd.impls.len == 0) continue;
+
+            var methods = std.ArrayList(ast.MethodDecl).empty;
+            defer methods.deinit(self.allocator);
+            try methods.appendSlice(self.allocator, sd.methods);
+
+            for (sd.impls) |impl| {
+                const trait = findTraitDecl(decls, impl.name) orelse continue;
+                for (trait.methods) |tm| {
+                    const body = tm.default_body orelse continue;
+                    if (structHasMethod(methods.items, tm.name)) continue;
+
+                    // Retype the leading `self` parameter to the impl'ing struct (generic form if the
+                    // struct has type parameters). Non-self params carry over unchanged.
+                    const new_params = try self.allocator.alloc(ast.Param, tm.params.len);
+                    for (tm.params, 0..) |p, i| {
+                        if (i == 0 and std.mem.eql(u8, p.name, "self")) {
+                            new_params[i] = .{ .name = p.name, .type_name = try self.selfTypeRefFor(sd.*), .span = p.span };
+                        } else {
+                            new_params[i] = p;
+                        }
+                    }
+
+                    try methods.append(self.allocator, ast.MethodDecl{
+                        .is_public = true,
+                        .is_static = false,
+                        .decl = ast.FunctionDecl{
+                            .name = tm.name,
+                            .params = new_params,
+                            .ret_type = tm.ret_type,
+                            .body = body,
+                            .is_exported = false,
+                            .attributes = &.{},
+                            .type_params = sd.type_params,
+                            .is_async = tm.is_async,
+                            .span = tm.span,
+                        },
+                    });
+                }
+            }
+            sd.methods = try methods.toOwnedSlice(self.allocator);
+        }
+    }
+
+    fn selfTypeRefFor(self: *Parser, sd: ast.StructDecl) ParserError!ast.TypeRef {
+        if (sd.type_params.len == 0) return ast.TypeRef{ .ident = sd.name };
+        const params = try self.allocator.alloc(ast.TypeRef, sd.type_params.len);
+        for (sd.type_params, 0..) |tp, i| params[i] = ast.TypeRef{ .ident = tp };
+        return ast.TypeRef{ .generic = .{ .name = sd.name, .params = params } };
+    }
+
+    fn findTraitDecl(decls: []ast.Declaration, name: []const u8) ?ast.TraitDecl {
+        for (decls) |d| {
+            if (d == .trait_decl and std.mem.eql(u8, d.trait_decl.name, name)) return d.trait_decl;
+        }
+        return null;
+    }
+
+    fn structHasMethod(methods: []const ast.MethodDecl, name: []const u8) bool {
+        for (methods) |m| {
+            if (std.mem.eql(u8, m.decl.name, name)) return true;
+        }
+        return false;
+    }
+
     pub fn parseProgram(self: *Parser) ParserError!ast.Program {
         var declarations = std.ArrayList(ast.Declaration).empty;
         defer declarations.deinit(self.allocator);
@@ -202,8 +274,10 @@ pub const Parser = struct {
             try declarations.append(self.allocator, try self.parseDeclaration());
         }
 
+        const decls = try declarations.toOwnedSlice(self.allocator);
+        try self.expandTraitDefaults(decls);
         return ast.Program{
-            .declarations = try declarations.toOwnedSlice(self.allocator),
+            .declarations = decls,
             .span = self.span(),
         };
     }
@@ -850,13 +924,23 @@ pub const Parser = struct {
             try self.expect(.right_paren);
 
             const ret_type = if (self.match(.colon)) try self.parseTypeRef() else null;
-            if (self.current().type == .semicolon) self.advance();
+            try self.skipWhereClause();
+            // A trait method is either a signature (`fn f(self): T;`) or a DEFAULT method with a body
+            // (`fn f(self): T { ... }`). The default is inherited by an impl'ing struct that does not
+            // override it (see expandTraitDefaults).
+            var default_body: ?ast.Block = null;
+            if (self.current().type == .left_brace) {
+                default_body = try self.parseBlock();
+            } else if (self.current().type == .semicolon) {
+                self.advance();
+            }
 
             try methods.append(self.allocator, ast.TraitMethodDecl{
                 .name = fn_name,
                 .params = try params.toOwnedSlice(self.allocator),
                 .ret_type = ret_type,
                 .is_async = m_is_async,
+                .default_body = default_body,
                 .span = self.span(),
             });
         }

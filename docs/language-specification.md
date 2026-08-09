@@ -203,6 +203,10 @@ struct Point { pub x: int, pub y: int
   ```
   Trait-typed bindings, downcasts (`x as T`), and factory returns all work *(→ 12_traits_dispatch,
   44_downcast_and_struct_literal_args)*.
+  A trait method may carry a **default body** (`fn greet(self: Self): string { … }`); an impl'ing struct
+  inherits it unless it defines its own. The default is copied onto the struct, so it works on a concrete
+  value and through a trait object *(→ 301_trait_default_methods)*. (Same-file only for now: the trait and
+  the impl'ing struct must be declared in one module.)
 - **Generic traits** — a trait may take type parameters that appear in its method
   signatures, and an impl supplies concrete type arguments:
   ```nova

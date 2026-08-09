@@ -120,6 +120,9 @@ pub const TraitMethodDecl = struct {
     ret_type: ?TypeRef,
 
     is_async: bool = false,
+    // A default method body: `fn greet(self: Self): string { return "hi"; }`. When an impl'ing struct does
+    // not override the method, the default is copied onto the struct (see expandTraitDefaults).
+    default_body: ?Block = null,
     span: Span,
 };
 
