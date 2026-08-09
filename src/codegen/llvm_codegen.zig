@@ -3072,6 +3072,29 @@ pub const LlvmCompiler = struct {
         return null;
     }
 
+    // If `lt` and `rt` name the SAME payload-carrying enum, return the number of 8-byte words in its box
+    // (tag + max payload words) so a fixed-width structural `==` compare can be emitted; else null. Every
+    // variant box for the enum is allocated at this same size and zero-padded (see getEnumTagAndSize),
+    // which is what makes the fixed-width compare correct.
+    pub fn payloadEnumBoxWords(self: *LlvmCompiler, lt: ?[]const u8, rt: ?[]const u8) ?u32 {
+        const l = lt orelse return null;
+        const r = rt orelse return null;
+        if (!std.mem.eql(u8, l, r)) return null;
+        const decl = self.enums.get(l) orelse return null;
+        var has_payload = false;
+        for (decl.variants) |v| {
+            if (v.fields != null or v.type_name != null) {
+                has_payload = true;
+                break;
+            }
+        }
+        if (!has_payload or decl.variants.len == 0) return null;
+        var tag: u32 = 0;
+        var size: u32 = 0;
+        self.getEnumTagAndSize(l, decl.variants[0].name, &tag, &size) catch return null;
+        return size / 8;
+    }
+
     pub fn getEnumTagAndSize(self: *LlvmCompiler, enum_name: []const u8, variant_name: []const u8, tag_out: *u32, max_size_out: *u32) !void {
         const enum_decl = self.enums.get(enum_name) orelse return error.EnumNotFound;
         const ptr_size = @as(u32, 8);

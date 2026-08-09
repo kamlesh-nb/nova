@@ -1751,6 +1751,35 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 .Or, .bit_or => return core.LLVMBuildOr(self.builder, l_val, r_val, "ortmp"),
                 .bit_xor => return core.LLVMBuildXor(self.builder, l_val, r_val, "xortmp"),
                 .eq, .ne, .lt, .gt, .le, .ge => {
+                    // Payload-carrying enum equality: `E.A(3) == E.A(3)` must compare by VALUE, not heap
+                    // identity. Every variant box of an enum is allocated at the SAME size (tag + max payload
+                    // words) and zero-padded, and a given tag always means the same variant/layout, so a
+                    // fixed-width word-by-word compare of the two boxes is correct for value-type payloads.
+                    // (A string / heap payload field still compares by pointer identity -- a documented
+                    // limitation; a fully structural compare would dispatch per field type.) Payload-LESS
+                    // enums are plain integer tags and already compare correctly via the integer path below.
+                    if (bin.op == .eq or bin.op == .ne) {
+                        if (self.payloadEnumBoxWords(left_type, right_type)) |nwords| {
+                            var acc = core.LLVMConstInt(self.i1_type, 1, 0);
+                            var i: u32 = 0;
+                            while (i < nwords) : (i += 1) {
+                                const off = core.LLVMConstInt(self.val_type, @as(u64, i) * 8, 0);
+                                const la = core.LLVMBuildAdd(self.builder, l_val, off, "eeq_la");
+                                const ra = core.LLVMBuildAdd(self.builder, r_val, off, "eeq_ra");
+                                const lp = core.LLVMBuildIntToPtr(self.builder, la, core.LLVMPointerType(self.val_type, 0), "eeq_lp");
+                                const rp = core.LLVMBuildIntToPtr(self.builder, ra, core.LLVMPointerType(self.val_type, 0), "eeq_rp");
+                                const lw = core.LLVMBuildLoad2(self.builder, self.val_type, lp, "eeq_lw");
+                                const rw = core.LLVMBuildLoad2(self.builder, self.val_type, rp, "eeq_rw");
+                                const weq = core.LLVMBuildICmp(self.builder, types.LLVMIntPredicate.LLVMIntEQ, lw, rw, "eeq_w");
+                                acc = core.LLVMBuildAnd(self.builder, acc, weq, "eeq_acc");
+                            }
+                            // Same box pointer (incl. an aliased value) is trivially equal.
+                            const same = core.LLVMBuildICmp(self.builder, types.LLVMIntPredicate.LLVMIntEQ, l_val, r_val, "eeq_same");
+                            var res = core.LLVMBuildOr(self.builder, acc, same, "eeq_eq");
+                            if (bin.op == .ne) res = core.LLVMBuildXor(self.builder, res, core.LLVMConstInt(self.i1_type, 1, 0), "eeq_ne");
+                            return core.LLVMBuildZExt(self.builder, res, self.val_type, "eeq_ext");
+                        }
+                    }
                     if (is_string_comparison and (bin.op == .eq or bin.op == .ne)) {
                         var eql_fn = self.func_map.get("string_eql");
                         if (eql_fn == null) {

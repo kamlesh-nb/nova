@@ -12,10 +12,10 @@ full corpus + ASAN green) · 🔵 investigated, not a live bug (recorded, no fix
 ⬜ open / deferred. Severity: **S-crit** silent corruption/unsafety · **crash** · **wrong** silent wrong
 answer · **blk** does not compile/link · **gap** missing feature.
 
-**Score: 20 defect IDs fixed, 3 investigated-not-a-bug, ~15 open/deferred. Recent: A3-read (value-optional
+**Score: 21 defect IDs fixed, 3 investigated-not-a-bug, ~14 open/deferred. Recent: A3-read (value-optional
 monomorphisation collision, fuzzer-found); G3 (JSON surrogate-pair astral corruption); shift-infer (integer
-literals in a `long` context computed in 32 bits); lit-i64 (decimal literal above i64 range silently → 0).
-Every fix is repro-first with a
+literals in a `long` context computed in 32 bits); lit-i64 (decimal literal above i64 range silently → 0);
+F2 (payload-enum `==` compared identity not value). Every fix is repro-first with a
 gating case (273–285) and stays corpus + ASAN green.**
 
 | ID | Cluster | Sev | Status | Commit / note |
@@ -48,7 +48,7 @@ gating case (273–285) and stays corpus + ASAN green.**
 | D1/D2/D3 | D erased carriers | S-crit | ⬜ | `any` owning-heap UAF; any-downcast double-free; unchecked trait→concrete `as` |
 | E3 | E async | crash | ⬜ | reap-mark not cleared for awaited children (latent) |
 | F1 | F enum/union | crash | ⬜ | `T\|E\|undefined` value-arm SEGV |
-| F2 | F enum/union | wrong | ⬜ | payload-enum `==` = identity not value (real bug; checker can't track enum-local type yet) |
+| F2 | F enum/union | wrong | ✅ | payload-enum `==` now compares by VALUE (word-by-word over the same-size zero-padded box), not heap identity. Value payloads compare by value; string/heap payload fields stay identity (documented). Case 290 |
 | F3 | F enum/union | wrong | ⬜ | `switch` over error-union falls through |
 | G3 | G stdlib | S-crit | ✅ | JSON `\uXXXX` surrogate pairs now combine into one astral code point (4-byte UTF-8); decoder was encoding each surrogate independently → 6 bytes of mojibake. Case 287 |
 | G5 | G stdlib | wrong | ⬜ | `try` propagates mismatched error type |
@@ -307,8 +307,12 @@ Root: 1b.
 ### Cluster F: enum and union value semantics  [crash + wrong]
 - **F1** `T | E | undefined`: the **value arm** is ARC-treated as a heap pointer and SEGVs on a plain int
   return.
-- **F2** `==` on payload-carrying enum variants compares heap identity, not value (`E.A(3) == E.A(3)` is
-  false). Payload-less enum `==` is correct.
+- **F2** (fixed) `==` on payload-carrying enum variants compared heap identity, not value (`E.A(3) == E.A(3)`
+  was false). Every variant box of an enum is allocated at the same size (tag + max payload words) and
+  zero-padded, so codegen now compares the two boxes word-by-word (tag + payload) at the `==`/`!=` site
+  (`src/codegen/expressions.zig`, `payloadEnumBoxWords`). Value-type payloads compare by value; a string /
+  heap payload field still compares by pointer identity (a documented limitation, since a fully structural
+  compare would dispatch per field type). Payload-less enum `==` was already correct (integer tags). Case 290.
 - **F3** `switch` over an error-union always falls through to `default` (never matches a variant).
 
 ### Cluster G: standard library and checker correctness  [wrong + crash]
