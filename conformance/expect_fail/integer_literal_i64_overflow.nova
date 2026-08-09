@@ -1,0 +1,11 @@
+// EXPECT-FAIL: parse
+// lit-i64: a decimal integer literal that exceeds the 64-bit range used to be silently parsed to 0
+// (`catch 0`), losing the value with no diagnostic. It must now be a HARD parse error. 9999999999999999999
+// is greater than i64 max (9223372036854775807), so this must be rejected. If it ever compiles, the
+// literal-range check in the parser has regressed. (A large UNSIGNED value that only fits u64 should be
+// written in hex, e.g. 0x8AC7230489E7FFFF, which keeps its bit pattern.)
+@test
+fn test_i64_overflow_literal_rejected(): void {
+    let x: long = 9999999999999999999;
+    assert.isTrue(x == x);
+}

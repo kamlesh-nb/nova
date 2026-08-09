@@ -692,7 +692,7 @@ pub const Parser = struct {
                 if (self.match(.equal)) {
                     const val_token = self.current();
                     try self.expect(.integer);
-                    value = parseIntLexeme(val_token.lexeme);
+                    value = try self.parseIntLexeme(val_token);
                 } else if (self.match(.left_brace)) {
                     var payload_fields = std.ArrayList(ast.Field).empty;
                     defer payload_fields.deinit(self.allocator);
@@ -2462,7 +2462,13 @@ pub const Parser = struct {
     // Parse an integer-literal lexeme, honoring a 0x/0b/0o radix prefix (decimal otherwise). The
     // radix forms are read as u64 and bit-cast to i64 so the whole 64-bit range is expressible (for
     // example 0xffffffffffffffff is -1), while a plain decimal keeps its signed base-10 value.
-    fn parseIntLexeme(lexeme: []const u8) i64 {
+    // Parse an integer literal token to its 64-bit value. An out-of-range literal is a HARD ERROR, not a
+    // silent 0 (the previous `catch 0` turned `9999999999999999999` into 0 -- silent data loss). Hex / binary
+    // / octal literals keep their bit pattern up to u64 (so masks like `0xFFFFFFFFFFFFFFFF` work); a decimal
+    // literal must fit signed i64, with the single exception of 2^63 (`9223372036854775808`), the magnitude
+    // of i64 MIN, stored as its bit pattern so `-9223372036854775808` yields i64 MIN.
+    fn parseIntLexeme(self: *Parser, token: lexer.Token) ParserError!i64 {
+        const lexeme = token.lexeme;
         if (lexeme.len > 2 and lexeme[0] == '0') {
             const base: u8 = switch (lexeme[1]) {
                 'x', 'X' => 16,
@@ -2471,18 +2477,31 @@ pub const Parser = struct {
                 else => 0,
             };
             if (base != 0) {
-                const u = std.fmt.parseInt(u64, lexeme[2..], base) catch 0;
+                const u = std.fmt.parseInt(u64, lexeme[2..], base) catch return self.intOutOfRange(token);
                 return @bitCast(u);
             }
         }
-        return std.fmt.parseInt(i64, lexeme, 10) catch 0;
+        if (std.fmt.parseInt(i64, lexeme, 10)) |v| {
+            return v;
+        } else |_| {
+            if (std.mem.eql(u8, lexeme, "9223372036854775808")) return @bitCast(@as(u64, 9223372036854775808));
+            return self.intOutOfRange(token);
+        }
+    }
+
+    fn intOutOfRange(self: *Parser, token: lexer.Token) ParserError {
+        std.debug.print(
+            "Parser error: {s}:{}:{}: integer literal '{s}' is out of range for a 64-bit integer (i64: -9223372036854775808..9223372036854775807; hex/bin/oct up to 0xFFFFFFFFFFFFFFFF).\n",
+            .{ self.file_path, token.line, token.column, token.lexeme },
+        );
+        return error.UnexpectedToken;
     }
 
     fn parseLiteral(self: *Parser) ParserError!ast.Literal {
         const token = self.current();
         self.advance();
         return switch (token.type) {
-            .integer => ast.Literal{ .integer = parseIntLexeme(token.lexeme) },
+            .integer => ast.Literal{ .integer = try self.parseIntLexeme(token) },
             .float => ast.Literal{ .float = std.fmt.parseFloat(f64, token.lexeme) catch 0.0 },
             .decimal => ast.Literal{ .decimal = token.lexeme },
             .string => ast.Literal{ .string = token.lexeme },

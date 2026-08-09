@@ -12,9 +12,10 @@ full corpus + ASAN green) · 🔵 investigated, not a live bug (recorded, no fix
 ⬜ open / deferred. Severity: **S-crit** silent corruption/unsafety · **crash** · **wrong** silent wrong
 answer · **blk** does not compile/link · **gap** missing feature.
 
-**Score: 19 defect IDs fixed, 3 investigated-not-a-bug, ~16 open/deferred. Recent: A3-read (value-optional
+**Score: 20 defect IDs fixed, 3 investigated-not-a-bug, ~15 open/deferred. Recent: A3-read (value-optional
 monomorphisation collision, fuzzer-found); G3 (JSON surrogate-pair astral corruption); shift-infer (integer
-literals in a `long` context computed in 32 bits). Every fix is repro-first with a
+literals in a `long` context computed in 32 bits); lit-i64 (decimal literal above i64 range silently → 0).
+Every fix is repro-first with a
 gating case (273–285) and stays corpus + ASAN green.**
 
 | ID | Cluster | Sev | Status | Commit / note |
@@ -52,7 +53,7 @@ gating case (273–285) and stays corpus + ASAN green.**
 | G3 | G stdlib | S-crit | ✅ | JSON `\uXXXX` surrogate pairs now combine into one astral code point (4-byte UTF-8); decoder was encoding each surrogate independently → 6 bytes of mojibake. Case 287 |
 | G5 | G stdlib | wrong | ⬜ | `try` propagates mismatched error type |
 | H4 | H numeric | wrong | ⬜ | decimal >34 digits truncate not round-half-even |
-| lit-i64 | H numeric | wrong | ⬜ | integer literal above i64 range silently → 0 (parser diag plumbing needed) |
+| lit-i64 | H numeric | wrong | ✅ | a decimal literal above i64 range was silently parsed to 0 (`catch 0`); now a hard parse error. Hex/bin/oct keep their bit pattern to u64; `-9223372036854775808` (i64 MIN) works. Case 289 + expect_fail |
 | shift-infer | H numeric | wrong | ✅ | an integer literal in a `long` context stayed `int`, so `let x: long = 1 << 40` (and `1000000 * 1000000`) computed in 32 bits and overflowed before widening. Literals now adopt an integer expected type (>= 32 bits) and arithmetic propagates it. Case 288 |
 | B1-let | B generics | blk | ⬜ | `let x: T = id(v)` — free-generic inference INTO a typed let is rejected (found by the fuzzer; inference in arg position, explicit `<T>`, and inference with no annotation all work) |
 | I | parser gaps | gap | ⬜ | sci-notation, `_` separators, tuple-payload, guards, while-let, `?.`-method, if-expr-in-interp, where-constraints, trait default bodies |
@@ -150,8 +151,14 @@ Investigated and deferred, recorded rather than papered over:
 - Payload-carrying enum `==` really does compare heap identity, not value. A checker rejection was inert
   because the checker does not yet reliably track the type of an enum-valued local, so it has been left for a
   proper fix (synthesised structural equality, or the type-tracking work in section 1). It is a real bug.
-- An integer literal above the `i64` range silently becomes `0` (the parser swallows the overflow). Rejecting
-  it needs parser diagnostic plumbing that does not exist yet.
+- (fixed) A decimal integer literal above the `i64` range silently became `0` (`parseIntLexeme` did
+  `parseInt(i64, ...) catch 0`, swallowing the overflow). It is now a hard parse error with a location
+  (`src/parser.zig`): hex/bin/oct literals keep their bit pattern up to `u64` (so masks like
+  `0xFFFFFFFFFFFFFFFF` still work), a decimal literal must fit signed `i64`, and `2^63` is accepted as the
+  magnitude of i64 MIN so `-9223372036854775808` yields i64 MIN. This complements the existing checker-side
+  narrowing check (which caught `int`-range overflow but never saw the `long` case, because the parser had
+  already turned it into `0`). A large UNSIGNED decimal literal that only fits `u64` should be written in hex;
+  a type-aware decimal `ulong` literal is a separate follow-on. Case 289 + expect_fail.
 - (fixed) An all-literal integer expression in a wider context truncated to 32 bits: `let x: long = 1 << 40`
   gave `1 << 8` (256), `1000000 * 1000000` and `2000000000 + 2000000000` wrapped. The literals defaulted to
   `int` regardless of the `long` expected type, so the whole expression was computed in 32 bits and overflowed
