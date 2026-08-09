@@ -56,7 +56,7 @@ gating case (273–305) and stays corpus + ASAN green.**
 | C2 | C module-scope | S-crit | ✅ | enums `bfb341f`+`87379e6` (plain+payload), cases 283/284 |
 | C2 | C module-scope (traits) | S-crit | 🔵 | `58257f9` traits already coexist (per-impl vtable); false alarm; case 285. Unions: not a functional construct |
 | E1 | E async | hang | 🔵 | did not reproduce in isolation; ASAN-clean — likely subsumed by C/B fixes |
-| E2/S7 | E async | S-crit | 🔵 | owned-struct-across-await did not reproduce; ASAN-clean now |
+| E2/S7 | E async | S-crit | ✅ | owned-struct-across-await no longer reproduces (fixed as part of the async-lowering owned-across-await/reap-mark work). Now GATED: case 308 exercises an owned struct with a heap `string` field read AFTER an await on the Nova reactor (`coroStart`) across five shapes -- single spawn+await, between two awaits, method-receiver after await, await inside a loop, and read-then-return. Corpus + ASAN + ARC all clean |
 | G4 | G stdlib | wrong | 🔵 (partial) | `parseI64` i64-MIN actually works (double wrap); non-digit/overflow parts still open |
 | A4 | A value-opt | wrong | ✅ | interpolating a non-narrowed optional printed the box ptr; now renders the inner value when present and `undefined` when absent (value-optional + heap-optional string). Case 291 |
 | A-nested | A value-opt | wrong | ⬜ | `Map<K, V\|undefined>.get()` returns `(V\|undefined)\|undefined`. Root cause pinned: an outer optional over a value-optional inner reuses 0 as its `none` sentinel, so *present-holding-undefined* (inner == 0) collides with *absent* (0) -> `m.set(k, undefined); m.get(k)` reads as a miss (silent wrong value, not a crash). Fix requires the OUTER optional to be boxed so `box(0)` != `0`. Blocked like B4 by monomorphisation: the producer is a generic method whose return TypeRef is `.optional(.ident("V"))` -- the nested optionality is hidden behind an unsubstituted type-param and string substitution collapses it (F1-class), so the producer can't tell it must add a box level. Needs mono-aware optional-depth resolution + ARC handling of the double-box. NB: surface syntax cannot express this (`(int\|undefined)` parses as a TUPLE; `int\|undefined\|undefined` flattens), so it only arises through generics |
@@ -338,7 +338,10 @@ Root: 1b.
   (`src/codegen/expressions.zig:805`, `buildAwait` fallback to `buildAwaitFuture`), so a cross-package or
   erased-generic async method await **silently hangs** with the reactor idle. This is a second, independent
   root cause of the mongo cursor stall (Cluster A is the corruption, this is the hang).
-- **E2** an owned struct held in a local across `await` on the reactor path is freed one drop early (UAF).
+- **E2** (fixed + gated) an owned struct held in a local across `await` on the reactor path used to be
+  freed one drop early (UAF). It no longer reproduces (resolved with the async-lowering owned-across-await
+  work) and is now pinned by case 308 (five reactor-path shapes, each reading an owned struct with a heap
+  `string` field after the await; ASAN + ARC clean).
 - **E3** the recycled-frame reap-mark is not cleared for **awaited** children (only for detached ones), a
   latent lost-wakeup on frame reuse within a batch.
 
