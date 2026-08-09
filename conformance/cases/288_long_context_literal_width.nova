@@ -1,0 +1,55 @@
+// shift-infer / long-context literal width: an untyped integer literal defaulted to `int` (32-bit) even in a
+// `long` context, so an all-literal expression was computed in 32 bits and overflowed BEFORE the widening to
+// `long` -- silent wrong values. `let x: long = 1 << 40` gave `1 << 8` (256), `1000000 * 1000000` wrapped,
+// `2000000000 + 2000000000` wrapped. Fix: an integer literal adopts an integer expected type of >= 32 bits
+// (int/uint/long/ulong), and arithmetic binary ops propagate the expected type into their operands (the shift
+// amount excepted) with the result taking the wider operand type. Narrower contexts (short/byte) are
+// unchanged -- a bare literal still defaults to `int` there so the explicit-narrowing rule (F3 §6) is intact.
+
+import assert;
+
+@test
+fn test_shift_in_long_context(): void {
+    let x: long = 1 << 40;
+    assert.isTrue(x == 1099511627776);   // 2^40; a 32-bit shift would give 1 << 8 == 256
+}
+
+@test
+fn test_multiply_overflowing_int(): void {
+    let x: long = 1000000 * 1000000;     // 10^12 overflows int
+    assert.isTrue(x == 1000000000000);
+}
+
+@test
+fn test_add_overflowing_int(): void {
+    let x: long = 2000000000 + 2000000000;   // 4e9 overflows int
+    assert.isTrue(x == 4000000000);
+}
+
+@test
+fn test_nested_literal_arithmetic(): void {
+    let x: long = (1 << 20) * (1 << 20);     // (2^20)^2 == 2^40
+    assert.isTrue(x == 1099511627776);
+}
+
+fn shl40(): long { return 1 << 40; }
+fn takesLong(x: long): long { return x; }
+
+@test
+fn test_return_and_call_arg_contexts(): void {
+    // The expected type flows through a `long` return and a `long` parameter too.
+    assert.isTrue(shl40() == 1099511627776);
+    assert.isTrue(takesLong(1 << 40) == 1099511627776);
+}
+
+@test
+fn test_plain_int_default_unchanged(): void {
+    // With no expected type, integer literals still default to int.
+    let x = 2 + 3;
+    assert.isTrue(x == 5);
+    // Mixed-width arithmetic keeps working (codegen coerces).
+    let a: long = 5000000000;
+    let b: int = 3;
+    assert.isTrue(a + b == 5000000003);
+    assert.isTrue(b + a == 5000000003);
+}

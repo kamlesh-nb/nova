@@ -461,7 +461,20 @@ pub const Inferer = struct {
             },
             .literal => |lit| return switch (lit) {
 
-                .integer => self.ok(try self.store.intT()),
+                // An untyped integer literal adopts an integer `expected` type. Without this,
+                // `let x: long = 1 << 40` (or `1000000 * 1000000`) types the literals as `int`, computes the
+                // whole expression in 32 bits, and overflows BEFORE the widening to `long` -- silent wrong
+                // values. Only integer expected types apply; a non-integer context falls back to `int`.
+                .integer => {
+                    if (expected) |exp| {
+                        const et = self.store.get(exp);
+                        // Only WIDEN (>= 32 bits: int/uint/long/ulong). Adopting a narrower expected type
+                        // (short/byte) would collide with the explicit-narrowing rule (F3 §6); a bare
+                        // literal keeps defaulting to `int` there.
+                        if (et == .prim and et.prim.kind == .int and et.prim.bits >= 32) return self.ok(exp);
+                    }
+                    return self.ok(try self.store.intT());
+                },
                 .float => self.ok(try self.store.doubleT()),
                 .string => self.ok(try self.store.stringT()),
                 .bool => self.ok(try self.store.boolT()),
@@ -522,17 +535,16 @@ pub const Inferer = struct {
                 return self.unresolved("ident");
             },
             .binary => |b| {
-                const lt = try self.inferExpr(b.left);
-
                 switch (b.op) {
 
                     .eq, .ne, .lt, .gt, .le, .ge, .And, .Or => {
+                        _ = try self.inferExpr(b.left);
                         _ = try self.inferExpr(b.right);
                         return self.ok(try self.store.boolT());
                     },
 
                     .assign => {
-
+                        const lt = try self.inferExpr(b.left);
                         if (b.left.kind == .ident and self.lookupIsConst(b.left.kind.ident)) {
                             self.const_reassign_errors.append(self.allocator, .{ .span = b.span, .name = b.left.kind.ident }) catch {};
                         }
@@ -547,7 +559,20 @@ pub const Inferer = struct {
                     },
                     else => {},
                 }
-                const rt = try self.inferExpr(b.right);
+
+                // Arithmetic / bitwise / shift. An integer `expected` type propagates into the operands so an
+                // all-literal expression is computed at the target width (`let x: long = 1 << 40` runs in 64
+                // bits, not 32-then-widen). The shift AMOUNT is left as-is (a widened count would fight the
+                // value width), and the result takes the WIDER of the two operand integer types so a single
+                // widened literal lifts the whole expression.
+                const int_expected: ?TypeId = blk: {
+                    const exp = expected orelse break :blk null;
+                    const et = self.store.get(exp);
+                    break :blk if (et == .prim and et.prim.kind == .int) exp else null;
+                };
+                const is_shift = (b.op == .shl or b.op == .shr);
+                const lt = try self.inferExprExpecting(b.left, int_expected);
+                const rt = if (is_shift) try self.inferExpr(b.right) else try self.inferExprExpecting(b.right, int_expected);
 
                 if (b.op == .add and (self.store.get(lt) == .string or self.store.get(rt) == .string)) {
                     return self.ok(try self.store.stringT());
@@ -555,6 +580,13 @@ pub const Inferer = struct {
                 if (self.store.get(lt) == .unresolved) {
 
                     return if (self.store.get(rt) == .unresolved) self.unresolved("binary") else self.ok(rt);
+                }
+                if (!is_shift) {
+                    const lk = self.store.get(lt);
+                    const rk = self.store.get(rt);
+                    if (lk == .prim and lk.prim.kind == .int and rk == .prim and rk.prim.kind == .int and rk.prim.bits > lk.prim.bits) {
+                        return self.ok(rt);
+                    }
                 }
                 return self.ok(lt);
             },

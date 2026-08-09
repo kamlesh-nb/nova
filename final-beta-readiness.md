@@ -12,9 +12,9 @@ full corpus + ASAN green) · 🔵 investigated, not a live bug (recorded, no fix
 ⬜ open / deferred. Severity: **S-crit** silent corruption/unsafety · **crash** · **wrong** silent wrong
 answer · **blk** does not compile/link · **gap** missing feature.
 
-**Score: 18 defect IDs fixed, 3 investigated-not-a-bug, ~17 open/deferred. A3-read (a value-optional
-monomorphisation collision) was found by the codegen fuzzer and fixed; G3 (JSON surrogate-pair astral
-corruption) fixed. Every fix is repro-first with a
+**Score: 19 defect IDs fixed, 3 investigated-not-a-bug, ~16 open/deferred. Recent: A3-read (value-optional
+monomorphisation collision, fuzzer-found); G3 (JSON surrogate-pair astral corruption); shift-infer (integer
+literals in a `long` context computed in 32 bits). Every fix is repro-first with a
 gating case (273–285) and stays corpus + ASAN green.**
 
 | ID | Cluster | Sev | Status | Commit / note |
@@ -53,7 +53,7 @@ gating case (273–285) and stays corpus + ASAN green.**
 | G5 | G stdlib | wrong | ⬜ | `try` propagates mismatched error type |
 | H4 | H numeric | wrong | ⬜ | decimal >34 digits truncate not round-half-even |
 | lit-i64 | H numeric | wrong | ⬜ | integer literal above i64 range silently → 0 (parser diag plumbing needed) |
-| shift-infer | H numeric | wrong | ⬜ | `let x = one << 63` shift-result inferred 32-bit |
+| shift-infer | H numeric | wrong | ✅ | an integer literal in a `long` context stayed `int`, so `let x: long = 1 << 40` (and `1000000 * 1000000`) computed in 32 bits and overflowed before widening. Literals now adopt an integer expected type (>= 32 bits) and arithmetic propagates it. Case 288 |
 | B1-let | B generics | blk | ⬜ | `let x: T = id(v)` — free-generic inference INTO a typed let is rejected (found by the fuzzer; inference in arg position, explicit `<T>`, and inference with no annotation all work) |
 | I | parser gaps | gap | ⬜ | sci-notation, `_` separators, tuple-payload, guards, while-let, `?.`-method, if-expr-in-interp, where-constraints, trait default bodies |
 | F4 | keystone | — | 🟡 | codegen soundness fuzzer STARTED (`3769458` `conformance/codegen_fuzz.py`, teeth-proven, int arith/cast) |
@@ -152,8 +152,14 @@ Investigated and deferred, recorded rather than papered over:
   proper fix (synthesised structural equality, or the type-tracking work in section 1). It is a real bug.
 - An integer literal above the `i64` range silently becomes `0` (the parser swallows the overflow). Rejecting
   it needs parser diagnostic plumbing that does not exist yet.
-- A shift whose result type is left to inference (`let x = one << 63`) appears to truncate to 32 bits. A
-  separate inference issue.
+- (fixed) An all-literal integer expression in a wider context truncated to 32 bits: `let x: long = 1 << 40`
+  gave `1 << 8` (256), `1000000 * 1000000` and `2000000000 + 2000000000` wrapped. The literals defaulted to
+  `int` regardless of the `long` expected type, so the whole expression was computed in 32 bits and overflowed
+  BEFORE the widening to `long`. Fixed in the checker (`src/sema/infer.zig`): an integer literal adopts an
+  integer expected type of >= 32 bits (int/uint/long/ulong), and arithmetic/shift binary ops propagate that
+  expected type into their operands (the shift amount excepted), with the result taking the wider operand.
+  Narrower contexts (short/byte) are unchanged, so the explicit-narrowing rule (F3 §6) is intact. The expected
+  type also flows through `long` return and `long` call-argument contexts. Case 288.
 
 Deferred (larger, want a checkpoint before starting): the free-generics cluster (B1/B2/B3 share one root, see
 section 2), the structural async work and value-optionals (section 5, F1), and the codegen soundness fuzzer
