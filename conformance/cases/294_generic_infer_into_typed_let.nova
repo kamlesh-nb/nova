@@ -1,0 +1,44 @@
+// B1-let: free-generic inference INTO a typed let. `let x: int = id(42)` was rejected because the
+// checker resolved the call `id(42)` to the raw return type `T` (unresolved type-parameter), which is
+// not assignable to `int`. Inference in argument position (`id(7)`), with an explicit `<int>`, and with
+// no annotation all worked -- only the annotated-let path failed. Fix: when a generic function is called
+// without explicit type args, the checker infers the type args from the argument types (unifying each
+// declared parameter type against the actual argument type) and substitutes them into the return type,
+// so a typed context checks against the concrete type. A genuine mismatch is still rejected (see the
+// expect_fail companion generic_infer_typed_let_mismatch).
+
+import assert;
+
+fn id<T>(v: T): T { return v; }
+fn firstOr<T>(v: T, d: T): T { return v; }
+
+@test
+fn test_infer_into_typed_let(): void {
+    let x: int = id(42);          // T inferred as int from the argument
+    assert.equalInt(x, 42);
+}
+
+@test
+fn test_still_works_arg_position(): void {
+    assert.equalInt(id(7), 7);    // inference in argument position (already worked)
+}
+
+@test
+fn test_still_works_explicit(): void {
+    let y: int = id<int>(9);      // explicit <int> (already worked)
+    assert.equalInt(y, 9);
+}
+
+@test
+fn test_still_works_no_annotation(): void {
+    let z = id(5);                // no annotation (already worked)
+    assert.equalInt(z, 5);
+}
+
+@test
+fn test_wide_and_bool(): void {
+    let a: long = firstOr(5000000000, 0);   // T = long
+    assert.isTrue(a == 5000000000);
+    let b: bool = firstOr(true, false);     // T = bool
+    assert.isTrue(b);
+}

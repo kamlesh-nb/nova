@@ -1076,6 +1076,51 @@ pub const TypeChecker = struct {
         }
     }
 
+    // Unify a declared parameter type against an actual argument type, binding any type parameters it
+    // names (`v: T` binds T; `xs: List<T>` binds T against a `List<Dog>` argument, etc.). Writes into
+    // `binds` (parallel to `tparams`); a param already bound is left as-is (first binding wins).
+    fn unifyTypeParam(self: *TypeChecker, decl: ast.TypeRef, actual: ast.TypeRef, tparams: []const []const u8, binds: []?ast.TypeRef) void {
+        switch (decl) {
+            .ident => |nm| {
+                for (tparams, 0..) |tp, i| {
+                    if (std.mem.eql(u8, tp, nm)) {
+                        if (binds[i] == null) binds[i] = actual;
+                        return;
+                    }
+                }
+            },
+            .optional => |inner| {
+                if (actual == .optional) self.unifyTypeParam(inner.*, actual.optional.*, tparams, binds);
+            },
+            .generic => |g| {
+                if (actual == .generic and g.params.len == actual.generic.params.len) {
+                    for (g.params, 0..) |p, i| self.unifyTypeParam(p, actual.generic.params[i], tparams, binds);
+                }
+            },
+            else => {},
+        }
+    }
+
+    // Infer the type arguments of a generic function call from its argument types (no explicit `<T>`).
+    // Returns a slice parallel to `f.type_params`, or null if any parameter could not be bound (leave
+    // the return type unresolved rather than guess). Enables `let x: int = id(42)` where `id<T>(v: T): T`
+    // -- inference INTO a typed let, which previously returned the raw `T` and failed the compat check (B1-let).
+    fn inferGenericTypeArgs(self: *TypeChecker, f: ast.FunctionDecl, args: []const ast.Expression) ?[]ast.TypeRef {
+        if (f.type_params.len == 0) return null;
+        const binds = self.allocator.alloc(?ast.TypeRef, f.type_params.len) catch return null;
+        for (binds) |*b| b.* = null;
+        const n = @min(f.params.len, args.len);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const decl = f.params[i].type_name orelse continue;
+            const actual = self.resolveExprType(args[i]) orelse continue;
+            self.unifyTypeParam(decl, actual, f.type_params, binds);
+        }
+        const out = self.allocator.alloc(ast.TypeRef, f.type_params.len) catch return null;
+        for (binds, 0..) |b, k| out[k] = b orelse return null;
+        return out;
+    }
+
     fn resolveExprType(self: *TypeChecker, expr: ast.Expression) ?ast.TypeRef {
         switch (expr.kind) {
             .ident => |name| {
@@ -1232,7 +1277,16 @@ pub const TypeChecker = struct {
                 if (call.callee.kind == .ident) {
                     const name = call.callee.kind.ident;
                     if (self.functions.get(name)) |f| {
-                        return f.ret_type orelse ast.TypeRef{ .ident = "void" };
+                        const rt = f.ret_type orelse return ast.TypeRef{ .ident = "void" };
+                        // A generic function called without explicit `<T>` (inference): resolve the return
+                        // type by inferring the type args from the arguments, so a typed context can check
+                        // against the concrete type instead of the raw type-parameter (B1-let).
+                        if (f.type_params.len > 0) {
+                            if (self.inferGenericTypeArgs(f, call.args)) |targs| {
+                                return self.substReturnType(rt, f.type_params, targs);
+                            }
+                        }
+                        return rt;
                     }
                     if (self.structs.contains(name)) {
                         return ast.TypeRef{ .ident = name };

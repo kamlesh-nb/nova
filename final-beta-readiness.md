@@ -12,14 +12,16 @@ full corpus + ASAN green) · 🔵 investigated, not a live bug (recorded, no fix
 ⬜ open / deferred. Severity: **S-crit** silent corruption/unsafety · **crash** · **wrong** silent wrong
 answer · **blk** does not compile/link · **gap** missing feature.
 
-**Score: 23 defect IDs fixed, 4 investigated-not-a-bug, ~10 open/deferred. Recent: F1 (`T|undefined|E`
+**Score: 24 defect IDs fixed, 4 investigated-not-a-bug, ~9 open/deferred. Recent: B1-let (free-generic
+inference into a typed let `let x: int = id(42)` was rejected -- the call resolved to the raw type-param;
+now the checker infers the type args from the argument types); F1 (`T|undefined|E`
 value-arm SEGV: the codegen string path dropped the ok arm's `.optional`, so the producer stored a raw
 value while every consumer unboxed a value-optional); G5 (`try` propagated a
 mismatched error type); A4 (interpolating a non-narrowed optional printed the box pointer); A3-read (value-optional
 monomorphisation collision, fuzzer-found); G3 (JSON surrogate-pair astral corruption); shift-infer (integer
 literals in a `long` context computed in 32 bits); lit-i64 (decimal literal above i64 range silently → 0);
 F2 (payload-enum `==` compared identity not value). Every fix is repro-first with a
-gating case (273–293) and stays corpus + ASAN green.**
+gating case (273–294) and stays corpus + ASAN green.**
 
 | ID | Cluster | Sev | Status | Commit / note |
 |----|---------|-----|--------|---------------|
@@ -44,7 +46,7 @@ gating case (273–293) and stays corpus + ASAN green.**
 | E2/S7 | E async | S-crit | 🔵 | owned-struct-across-await did not reproduce; ASAN-clean now |
 | G4 | G stdlib | wrong | 🔵 (partial) | `parseI64` i64-MIN actually works (double wrap); non-digit/overflow parts still open |
 | A4 | A value-opt | wrong | ✅ | interpolating a non-narrowed optional printed the box ptr; now renders the inner value when present and `undefined` when absent (value-optional + heap-optional string). Case 291 |
-| A-nested | A value-opt | crash | ⬜ | `Map.get` returning `(int\|undefined)\|undefined` (nested optional) |
+| A-nested | A value-opt | wrong | ⬜ | `Map<K, V\|undefined>.get()` returns `(V\|undefined)\|undefined`. Root cause pinned: an outer optional over a value-optional inner reuses 0 as its `none` sentinel, so *present-holding-undefined* (inner == 0) collides with *absent* (0) -> `m.set(k, undefined); m.get(k)` reads as a miss (silent wrong value, not a crash). Fix requires the OUTER optional to be boxed so `box(0)` != `0`. Blocked like B4 by monomorphisation: the producer is a generic method whose return TypeRef is `.optional(.ident("V"))` -- the nested optionality is hidden behind an unsubstituted type-param and string substitution collapses it (F1-class), so the producer can't tell it must add a box level. Needs mono-aware optional-depth resolution + ARC handling of the double-box. NB: surface syntax cannot express this (`(int\|undefined)` parses as a TUPLE; `int\|undefined\|undefined` flattens), so it only arises through generics |
 | B4 | B generics | blk | ⬜ | `Set<T>` (over `Map<T, bool>`) fails. Root cause pinned: `Set<int>` monomorphises its OWN methods (`Set_i32_*`) but the nested generic `Map<int, bool>` is never instantiated, so `self.map.get(...)` falls to the ERASED `Map_*`. Two symptoms: (1) the private erased `Map_keysEqual` is DCE-dropped because it is emitted before its callers `Map_set`/`get` create a use → undefined symbol at link; (2) even emitted, the erased Map↔`Set_i32` ARC boundary releases a bogus pointer → SEGV in `Set_i32_has`. Real fix = instantiate the nested generic `Map<int,bool>` through `Set<int>` and route the calls to `Map_i32_bool_*` (a nested-generic monomorphisation fix, F2-6-adjacent), NOT just the emission-drop |
 | B5 | B generics | crash | ⬜ | generic `struct impl Trait` via trait object vtable |
 | B6 | B generics | blk | ⬜ | generic `async fn` cannot resolve `serde.bind<T>` |
@@ -58,7 +60,7 @@ gating case (273–293) and stays corpus + ASAN green.**
 | H4 | H numeric | wrong | ⬜ | decimal >34 digits truncate not round-half-even |
 | lit-i64 | H numeric | wrong | ✅ | a decimal literal above i64 range was silently parsed to 0 (`catch 0`); now a hard parse error. Hex/bin/oct keep their bit pattern to u64; `-9223372036854775808` (i64 MIN) works. Case 289 + expect_fail |
 | shift-infer | H numeric | wrong | ✅ | an integer literal in a `long` context stayed `int`, so `let x: long = 1 << 40` (and `1000000 * 1000000`) computed in 32 bits and overflowed before widening. Literals now adopt an integer expected type (>= 32 bits) and arithmetic propagates it. Case 288 |
-| B1-let | B generics | blk | ⬜ | `let x: T = id(v)` — free-generic inference INTO a typed let is rejected (found by the fuzzer; inference in arg position, explicit `<T>`, and inference with no annotation all work) |
+| B1-let | B generics | blk | ✅ | `let x: int = id(42)` — free-generic inference INTO a typed let. The checker resolved the call to the raw return type `T` (unresolved type-param), which failed the compat check against `int`. Fix: when a generic fn is called without explicit `<T>`, infer the type args by unifying each declared param type against the actual argument type, then substitute into the return type. Genuine mismatches still rejected. Cases 294 + expect_fail/generic_infer_typed_let_mismatch |
 | I | parser gaps | gap | ⬜ | sci-notation, `_` separators, tuple-payload, guards, while-let, `?.`-method, if-expr-in-interp, where-constraints, trait default bodies |
 | F4 | keystone | — | 🟡 | codegen soundness fuzzer STARTED (`3769458` `conformance/codegen_fuzz.py`, teeth-proven, int arith/cast) |
 | F2-6 | keystone | — | 🟡 | typed IR BUILT + shadow-validated (6723 agree / 0 disagree); tracker `docs/design/f2-6-keystone-tracking.md` |
