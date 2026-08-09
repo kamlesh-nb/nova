@@ -294,10 +294,15 @@ for ((k, v) in m) { … }                         // map — over keys()/get()
 ```nova
 switch (self) {
     case Color.Red:   { return 1; }
-    case Tagged.N(v): { return v; }             // binds the payload
+    case Tagged.N(v): { return v; }                    // binds the payload
+    case Tagged.N(v) if v > 0: { return v; }           // case guard (falls to `default` when false)
+    default: { return 0; }
 }
 ```
-`match` is reserved-unimplemented; `switch` is the real construct.
+`match` is reserved-unimplemented; `switch` is the real construct. A case may carry a guard
+(`case v if cond:`) that is checked after any payload bindings are in scope; a matched-but-guard-false
+case falls through to `default`, so a guarded case requires a `default` *(→ 304_switch_case_guards)*.
+Because a switch lowers to an integer jump table, each value/variant appears in at most one case.
 
 ### 6.4 `return`, `break`, `continue`, `defer`
 `defer expr` runs `expr` at scope exit 🔎 (present; lightly covered).

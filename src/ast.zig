@@ -290,6 +290,9 @@ pub const SwitchStmt = struct {
 
 pub const SwitchCase = struct {
     values: []Expression,
+    // An optional guard: `case v if cond:`. The case matches only when the value matches AND the guard is
+    // true; a matched-but-guard-false case falls through to `default`.
+    guard: ?Expression = null,
     body: *Statement,
     span: Span,
 };

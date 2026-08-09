@@ -907,18 +907,21 @@ pub const TypeChecker = struct {
                     }
 
                     for (ss.cases) |case| {
+                        // A guarded case may not match even when its value does, so it does NOT satisfy
+                        // exhaustiveness -- the switch still needs a `default`.
+                        const covers = case.guard == null;
                         for (case.values) |val| {
                             if (val.kind == .field_access) {
                                 const fa = val.kind.field_access;
                                 if (fa.object.kind == .ident and std.mem.eql(u8, fa.object.kind.ident, enum_name)) {
-                                    try covered.put(fa.field, true);
+                                    if (covers) try covered.put(fa.field, true);
                                 }
                             } else if (val.kind == .call) {
                                 const call = val.kind.call;
                                 if (call.callee.kind == .field_access) {
                                     const fa = call.callee.kind.field_access;
                                     if (fa.object.kind == .ident and std.mem.eql(u8, fa.object.kind.ident, enum_name)) {
-                                        try covered.put(fa.field, true);
+                                        if (covers) try covered.put(fa.field, true);
                                         for (variants) |v| {
                                             if (std.mem.eql(u8, v.name, fa.field)) {
                                                 if (v.type_name) |payload_type| {
@@ -942,7 +945,7 @@ pub const TypeChecker = struct {
                                 }
                             } else if (val.kind == .struct_init) {
                                 const si = val.kind.struct_init;
-                                try covered.put(si.type_name, true);
+                                if (covers) try covered.put(si.type_name, true);
                                 for (variants) |v| {
                                     if (std.mem.eql(u8, v.name, si.type_name)) {
                                         if (v.fields) |payload_fields| {
@@ -962,6 +965,8 @@ pub const TypeChecker = struct {
                                 }
                             }
                         }
+                        // The guard is checked after the payload bindings it may reference are in scope.
+                        if (case.guard) |g| try self.checkExpr(g);
                     }
 
                     var unhandled = std.ArrayList([]const u8).empty;

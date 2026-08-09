@@ -216,6 +216,7 @@ pub const Renamer = struct {
                 try self.walkExpr(&sw.discriminant);
                 for (sw.cases) |*c| {
                     for (c.values) |*v| try self.walkExpr(v);
+                    if (c.guard) |*g| try self.walkExpr(g);
                     try self.walkStmt(c.body);
                 }
                 if (sw.default_case) |d| try self.walkStmt(d);

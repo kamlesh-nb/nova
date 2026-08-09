@@ -72,6 +72,7 @@ pub const Assigner = struct {
                 try self.walkExpr(&ss.discriminant);
                 for (ss.cases) |*c| {
                     for (c.values) |*v| try self.walkExpr(v);
+                    if (c.guard) |*g| try self.walkExpr(g);
                     try self.walkStmt(c.body);
                 }
                 if (ss.default_case) |dc| try self.walkStmt(dc);

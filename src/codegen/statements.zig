@@ -609,6 +609,21 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
                     }
                 }
 
+                // A case guard (`case v if cond:`) is evaluated after the payload bindings it may reference.
+                // If it is false, release any retained payloads and fall through to `default`.
+                if (c.guard) |g| {
+                    const gfn = core.LLVMGetBasicBlockParent(core.LLVMGetInsertBlock(self.builder));
+                    const gval = self.coerceToSlotType(try self.compileExpression(g), self.val_type);
+                    const gi1 = core.LLVMBuildICmp(self.builder, types.LLVMIntPredicate.LLVMIntNE, gval, core.LLVMConstInt(self.val_type, 0, 0), "case_guard");
+                    const guard_body_bb = core.LLVMAppendBasicBlock(gfn, "switch_guard_body");
+                    const guard_fail_bb = core.LLVMAppendBasicBlock(gfn, "switch_guard_fail");
+                    _ = core.LLVMBuildCondBr(self.builder, gi1, guard_body_bb, guard_fail_bb);
+                    core.LLVMPositionBuilderAtEnd(self.builder, guard_fail_bb);
+                    for (retained_payloads.items) |rp| try self.releaseLocalByName(rp.name, rp.type_name);
+                    _ = core.LLVMBuildBr(self.builder, default_bb);
+                    core.LLVMPositionBuilderAtEnd(self.builder, guard_body_bb);
+                }
+
                 try self.compileStatement(c.body.*, func);
 
                 if (core.LLVMGetBasicBlockTerminator(core.LLVMGetInsertBlock(self.builder)) == null) {

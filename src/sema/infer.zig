@@ -1996,6 +1996,7 @@ pub const Inferer = struct {
 
                     try self.bindSwitchPayloads(disc_t, c);
                     for (c.values) |*v| _ = try self.inferExpr(v);
+                    if (c.guard) |*g| _ = try self.inferExpr(g);
                     try self.inferStmt(c.body);
                 }
                 if (sw.default_case) |d| try self.inferStmt(d);

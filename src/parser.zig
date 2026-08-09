@@ -1616,10 +1616,17 @@ pub const Parser = struct {
                 try values.append(self.allocator, try self.parseExpression());
                 if (!self.match(.comma)) break;
             }
+            // Optional guard: `case v if cond:`.
+            var guard: ?ast.Expression = null;
+            if (self.current().type == .keyword_if) {
+                self.advance();
+                guard = try self.parseExpression();
+            }
             try self.expect(.colon);
             const body = try self.parseBlock();
             try cases.append(self.allocator, ast.SwitchCase{
                 .values = try values.toOwnedSlice(self.allocator),
+                .guard = guard,
                 .body = try self.allocStatement(ast.Statement{ .block = body }),
                 .span = self.span(),
             });
