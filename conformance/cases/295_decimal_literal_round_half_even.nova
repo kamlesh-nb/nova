@@ -1,0 +1,49 @@
+// H4: a decimal128 literal may carry more than the 34 significant digits the format can hold. The extra
+// digits must ROUND the coefficient using round-half-even (banker's rounding, IEEE 754-2008 default and
+// what the arithmetic path dec_round_drop already does), not be TRUNCATED. The literal parser previously
+// dropped every digit past the 34th on the floor: fractional overflow vanished, integer overflow only
+// scaled the exponent. So `...235.5m` truncated to `...235` instead of rounding half-even to `...236`.
+// Fix: track the first dropped digit (round) and whether any later dropped digit is nonzero (sticky), and
+// apply round-half-even to the coefficient, renormalising a carry that overflows the 34-digit limit.
+
+import assert;
+
+@test
+fn test_tie_rounds_to_even(): void {
+    // last kept digit even (4): the exact half is dropped, coefficient stays.
+    assert.equalStr(`${1234567890123456789012345678901234.5m}`, "1234567890123456789012345678901234");
+    // last kept digit odd (5): the exact half rounds up to the even neighbour (6).
+    assert.equalStr(`${1234567890123456789012345678901235.5m}`, "1234567890123456789012345678901236");
+}
+
+@test
+fn test_above_half_rounds_up(): void {
+    // dropped 6 (> half): round up regardless of parity.
+    assert.equalStr(`${1234567890123456789012345678901234.6m}`, "1234567890123456789012345678901235");
+    // dropped tail 51 (5 then a nonzero sticky digit): strictly above half, rounds up even off an even.
+    assert.equalStr(`${1234567890123456789012345678901234.51m}`, "1234567890123456789012345678901235");
+}
+
+@test
+fn test_below_half_rounds_down(): void {
+    assert.equalStr(`${1234567890123456789012345678901234.4m}`, "1234567890123456789012345678901234");
+}
+
+@test
+fn test_carry_renormalises(): void {
+    // 34 nines rounded up carries to 10^34 (35 digits); renormalise to a 34-digit coefficient + exponent.
+    assert.equalStr(`${9999999999999999999999999999999999.5m}`, "10000000000000000000000000000000000");
+}
+
+@test
+fn test_integer_overflow_rounds(): void {
+    // 35 integer digits: the 35th (6) rounds the 34-digit result up, and the exponent absorbs the drop.
+    assert.equalStr(`${12345678901234567890123456789012346m}`, "12345678901234567890123456789012350");
+}
+
+@test
+fn test_within_precision_unchanged(): void {
+    // Values within 34 significant digits are exact -- no rounding applied.
+    assert.equalStr(`${2.5m}`, "2.5");
+    assert.equalStr(`${12345678901234567890123456789012.34m}`, "12345678901234567890123456789012.34");
+}

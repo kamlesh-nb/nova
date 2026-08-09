@@ -13,6 +13,8 @@ static const int NOVA_DEC128_BIAS = 6176;
 static const int NOVA_DEC128_MAX_DIGITS = 34;
 static const int NOVA_DEC128_MAX_BIASED = 12287;
 
+static int dec_num_digits(nova_u128 v);
+
 static void nova_dec128_pack(unsigned char *out, int sign, nova_u128 coeff, int exp) {
   int biased = exp + NOVA_DEC128_BIAS;
   if (biased < 0) biased = 0;
@@ -42,22 +44,46 @@ static long long dec_parse_bounded(const char *s, long long len) {
   int digits = 0;
   int frac = 0;
   bool seen_dot = false;
+  // A literal may carry more than the 34 significant digits decimal128 can hold. The digits past the
+  // limit must ROUND the coefficient (round-half-even, matching the arithmetic path dec_round_drop),
+  // not be truncated (H4). Track the first dropped digit (round) and whether any later dropped digit is
+  // nonzero (sticky) -- the standard guard/round/sticky decision.
+  int round_digit = -1;
+  bool sticky = false;
   for (; p < e_end; p++) {
     char c = *p;
     if (c == '.') { if (seen_dot) break; seen_dot = true; continue; }
     if (c == 'e' || c == 'E') break;
     if (c < '0' || c > '9') break;
+    int dv = c - '0';
     if (digits < NOVA_DEC128_MAX_DIGITS) {
-      coeff = coeff * 10 + (nova_u128)(c - '0');
+      coeff = coeff * 10 + (nova_u128)dv;
       digits++;
       if (seen_dot) frac++;
-    } else if (!seen_dot) {
-
-      frac--;
+    } else {
+      // Beyond 34 significant digits: this digit is dropped from the coefficient. An integer-position
+      // drop still scales the exponent up (frac--); a fractional-position drop just vanishes. Either way
+      // it feeds the rounding decision.
+      if (!seen_dot) frac--;
+      if (round_digit < 0) round_digit = dv;
+      else if (dv != 0) sticky = true;
     }
-
   }
   int exp = -frac;
+  if (round_digit >= 0) {
+    bool round_up = false;
+    if (round_digit > 5) round_up = true;
+    else if (round_digit == 5) round_up = sticky ? true : ((coeff & 1) != 0);
+    if (round_up) {
+      coeff += 1;
+      // A carry can push the coefficient to 10^34 (35 digits); renormalise by dropping the now-trailing
+      // zero and bumping the exponent (e.g. 9.99e0 -> 1.00e1). The division is exact.
+      if (dec_num_digits(coeff) > NOVA_DEC128_MAX_DIGITS) {
+        coeff /= 10;
+        exp += 1;
+      }
+    }
+  }
   if (p < e_end && (*p == 'e' || *p == 'E')) {
     p++;
     int esign = 1;

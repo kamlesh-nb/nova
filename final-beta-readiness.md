@@ -12,7 +12,9 @@ full corpus + ASAN green) · 🔵 investigated, not a live bug (recorded, no fix
 ⬜ open / deferred. Severity: **S-crit** silent corruption/unsafety · **crash** · **wrong** silent wrong
 answer · **blk** does not compile/link · **gap** missing feature.
 
-**Score: 24 defect IDs fixed, 4 investigated-not-a-bug, ~9 open/deferred. Recent: B1-let (free-generic
+**Score: 25 defect IDs fixed, 4 investigated-not-a-bug, ~8 open/deferred. Recent: H4 (a decimal literal
+with more than 34 significant digits was truncated instead of rounding half-even like the arithmetic path;
+fixed in the literal parser); B1-let (free-generic
 inference into a typed let `let x: int = id(42)` was rejected -- the call resolved to the raw type-param;
 now the checker infers the type args from the argument types); F1 (`T|undefined|E`
 value-arm SEGV: the codegen string path dropped the ok arm's `.optional`, so the producer stored a raw
@@ -21,7 +23,7 @@ mismatched error type); A4 (interpolating a non-narrowed optional printed the bo
 monomorphisation collision, fuzzer-found); G3 (JSON surrogate-pair astral corruption); shift-infer (integer
 literals in a `long` context computed in 32 bits); lit-i64 (decimal literal above i64 range silently → 0);
 F2 (payload-enum `==` compared identity not value). Every fix is repro-first with a
-gating case (273–294) and stays corpus + ASAN green.**
+gating case (273–295) and stays corpus + ASAN green.**
 
 | ID | Cluster | Sev | Status | Commit / note |
 |----|---------|-----|--------|---------------|
@@ -57,7 +59,7 @@ gating case (273–294) and stays corpus + ASAN green.**
 | F3 | F enum/union | — | 🔵 | NOT a needed construct. Per spec §3.5 an error union `T \| E` is handled with `try`/`catch`; to branch on error variants you `catch (e) helper(e)` (or use the exception's `message()`) and `switch` on the UNWRAPPED enum error, which works (cases 266, 32). A raw `switch` over `T \| E` is not in the language. Follow-on (minor): have the checker reject it outright instead of falling through |
 | G3 | G stdlib | S-crit | ✅ | JSON `\uXXXX` surrogate pairs now combine into one astral code point (4-byte UTF-8); decoder was encoding each surrogate independently → 6 bytes of mojibake. Case 287 |
 | G5 | G stdlib | wrong | ✅ | `try g()` re-raises the callee's error unchanged, so it must match the enclosing function's declared error type; the checker now rejects a mismatch (`fn f(): T\|E1 { return try g() }` where g fails with E2). Case 292 + expect_fail |
-| H4 | H numeric | wrong | ⬜ | decimal >34 digits truncate not round-half-even |
+| H4 | H numeric | wrong | ✅ | decimal literal >34 digits truncated instead of rounding. The arithmetic path (`dec_round_drop`/`dec_encode`) already did round-half-even, but the literal parser `dec_parse_bounded` dropped over-precision digits on the floor (fractional overflow vanished, integer overflow only scaled the exponent). Fix: track guard/round/sticky of the dropped tail and apply round-half-even (with carry renormalisation) in the parser, matching the arithmetic path. Case 295 |
 | lit-i64 | H numeric | wrong | ✅ | a decimal literal above i64 range was silently parsed to 0 (`catch 0`); now a hard parse error. Hex/bin/oct keep their bit pattern to u64; `-9223372036854775808` (i64 MIN) works. Case 289 + expect_fail |
 | shift-infer | H numeric | wrong | ✅ | an integer literal in a `long` context stayed `int`, so `let x: long = 1 << 40` (and `1000000 * 1000000`) computed in 32 bits and overflowed before widening. Literals now adopt an integer expected type (>= 32 bits) and arithmetic propagates it. Case 288 |
 | B1-let | B generics | blk | ✅ | `let x: int = id(42)` — free-generic inference INTO a typed let. The checker resolved the call to the raw return type `T` (unresolved type-param), which failed the compat check against `int`. Fix: when a generic fn is called without explicit `<T>`, infer the type args by unifying each declared param type against the actual argument type, then substitute into the return type. Genuine mismatches still rejected. Cases 294 + expect_fail/generic_infer_typed_let_mismatch |

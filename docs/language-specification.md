@@ -146,7 +146,9 @@ stack unwinding**: `try`/`catch` are branches on a value — nothing leaks, no U
 
 `decimal` is IEEE 754-2008 decimal128 in **BID** encoding — a 16-byte ARC heap object, wire-identical to
 BSON's decimal128. It exists for exactness (`0.1m` is exact) and for the MongoDB driver.
-- **Literals:** `m`/`M` suffix — `10.5m`, `-3.14m`, up to 34 significant digits *(→ 50_decimal)*.
+- **Literals:** `m`/`M` suffix — `10.5m`, `-3.14m`, up to 34 significant digits *(→ 50_decimal)*. A
+  literal with more than 34 significant digits is rounded (round-half-even) to fit, the same rule the
+  arithmetic path uses, not truncated *(→ 295_decimal_literal_round_half_even)*.
 - **Arithmetic + compare:** `+ - * / %` and all six relations, base-10 with round-half-even to 34
   digits; `0.1m + 0.2m` is exactly `0.3` *(→ 52_decimal_arith)*. **No implicit int↔decimal** conversion
   — a mixed operand is a compile error (`2m`, not `2`). Div-by-zero yields `0` (a stub).
