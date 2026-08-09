@@ -1,5 +1,6 @@
 
 #include "nova_abi.h"
+#include <csignal>       // SIGPIPE ignore at process entry (see main)
 #ifndef _WIN32
 #include <sys/socket.h>
 #endif
@@ -1327,6 +1328,15 @@ long long nova_sched_next(void) { return 0; }
 
 void nova_set_args(int argc, char **argv);
 int main(int argc, char **argv) {
+    // Ignore SIGPIPE process-wide. A network server writes to sockets whose peer may have closed
+    // (a client that hung up mid-response, a DB connection the server reaped). With the default
+    // disposition, ANY such write kills the whole process instead of returning EPIPE to the caller
+    // -- a latent, timing-dependent way for a healthy server to die under concurrent load. Every Unix
+    // server must mask this; the reactor's non-blocking writes then surface a broken peer as a normal
+    // I/O error (EPIPE) that the driver/HTTP layer already handles. No SIGPIPE on Windows.
+#ifndef _WIN32
+    std::signal(SIGPIPE, SIG_IGN);
+#endif
     nova_set_args(argc, argv);
     return static_cast<int>(__nova_main());
 }
