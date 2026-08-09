@@ -12,7 +12,7 @@ full corpus + ASAN green) · 🔵 investigated, not a live bug (recorded, no fix
 ⬜ open / deferred. Severity: **S-crit** silent corruption/unsafety · **crash** · **wrong** silent wrong
 answer · **blk** does not compile/link · **gap** missing feature.
 
-**Score: 21 defect IDs fixed, 3 investigated-not-a-bug, ~14 open/deferred. Recent: A3-read (value-optional
+**Score: 20 defect IDs fixed, 3 investigated-not-a-bug, ~14 open/deferred. Recent: A3-read (value-optional
 monomorphisation collision, fuzzer-found); G3 (JSON surrogate-pair astral corruption); shift-infer (integer
 literals in a `long` context computed in 32 bits); lit-i64 (decimal literal above i64 range silently → 0);
 F2 (payload-enum `==` compared identity not value). Every fix is repro-first with a
