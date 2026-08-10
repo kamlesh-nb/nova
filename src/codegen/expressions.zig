@@ -30,6 +30,24 @@ pub fn buildValueStructStorage(self: *LlvmCompiler, size: u32) anyerror!types.LL
 // M-1 copy-on-assign: `let b = a` for a value struct must give `b` its own storage with `a`'s bytes
 // copied in (value semantics), not alias `a`. Allocates fresh stack storage and memcpies `size`
 // bytes from `src` via nova_bytes_copy, returning the new address.
+// M-1 owned-field value structs: after a value struct's bytes are byte-copied, each OWNED
+// (reference) field is now aliased by two structs, so the copy must RETAIN it -- otherwise the
+// destination's later field-drop (or the source's) double-frees. Walks the struct's fields and
+// retains every owned one at the destination address `structAddr`.
+pub fn retainValueStructOwnedFields(self: *LlvmCompiler, structAddr: types.LLVMValueRef, struct_name: []const u8) anyerror!void {
+    const base = getStructBaseName(struct_name);
+    const sd = self.structs.get(base) orelse return;
+    for (sd.fields) |fld| {
+        const fts = self.typeRefToString(fld.type_name) catch continue;
+        if (!self.isOwnedDeclaredType(fld.type_name, fts)) continue;
+        const off = self.getFieldOffset(base, fld.name) catch continue;
+        const addr = core.LLVMBuildAdd(self.builder, structAddr, core.LLVMConstInt(self.val_type, off, 0), "vs_ofld_addr");
+        const ptr = core.LLVMBuildIntToPtr(self.builder, addr, core.LLVMPointerType(self.val_type, 0), "vs_ofld_ptr");
+        const fv = core.LLVMBuildLoad2(self.builder, self.val_type, ptr, "vs_ofld");
+        try self.compileRetain(fv);
+    }
+}
+
 // M-10/M-1: memcpy `size` bytes from `src` into an EXISTING destination address `dst` (e.g. a
 // container slot), via nova_bytes_copy. Returns dst.
 pub fn buildValueStructCopyInto(self: *LlvmCompiler, dst: types.LLVMValueRef, src: types.LLVMValueRef, size: u32) anyerror!types.LLVMValueRef {

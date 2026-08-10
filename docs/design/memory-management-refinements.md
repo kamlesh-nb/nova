@@ -117,8 +117,24 @@ soundness-critical slice. So the flip stays **opt-in** (default OFF -> all-refer
 all done and verified. The remaining work for a *default-on* flip, in order: (1) uniform inline
 value-struct storage in the other aggregates (tuple, `any`, closure, async) OR a per-use borrow
 model; (2) **owned-field value structs** (generated copy = memcpy + retain-refs, generated drop =
-release-refs + no-free) -- required before `DbValue`/`ProductView` themselves can be value types;
-(3) M-9 DbValue slimming. Items (1) and (2) are the genuinely hard, soundness-critical parts.
+release-refs + no-free) -- required before `DbValue`/`ProductView` themselves can be value types.
+M-9 DbValue slimming is DONE (the 16-byte decimal field is gone). Items (1) and (2) are the
+genuinely hard, soundness-critical parts.
+
+**Owned-field value structs (started; blocker pinned).** The COPY half is built and sound:
+`retainValueStructOwnedFields(structAddr, name)` walks a value struct's fields and retains each
+owned (reference) field after a byte-copy, so `let b = a` for an owned-field value struct gives
+`b` its own refs. The DROP half is a value struct calling its destructor DIRECTLY at scope end
+(release owned fields, NO nova_release/free -- it is a stack alloca). But wiring these to actually
+enable owned-field value structs hits the same wall as the aggregates: a value struct entering a
+CONTAINER needs MOVE semantics (memcpy, no retain, source consumed), and `list.push(Foo(...))`
+(a temp) is a move while `list.push(existingFoo)` (a live var) is a copy -- a per-USE distinction
+the per-TYPE value/reference model cannot express. Since exclusion is per-type, allowing an
+owned-field struct to be a value local ALSO allows it as a container element, which then needs
+the move/copy decision. So both (1) and (2) reduce to the same root: **per-use move/copy/borrow
+tracking** (an ownership pass extension). That is the single keystone for finishing M-1's
+default flip; it is a substantial, soundness-critical slice, not a same-session task. The
+copy-retain helper is landed as its foundation.
 
 **Progress (foundation, gated).** The core mechanism works end to end behind a per-type
 rollout gate (`NOVA_VALUE_TYPES=A,B` or `NOVA_VALUE_STRUCTS_ALL`; default off, so codegen is
