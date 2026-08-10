@@ -2,7 +2,7 @@
 import bytes;
 import net.tcp.stream;
 
-pub struct TcpClient {
+pub class TcpClient {
     pub fn connect(host: string, port: int): stream.TcpStream {
         let fd = stream.connect(host, port);
         if (fd < 0) {

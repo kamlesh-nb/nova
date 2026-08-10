@@ -23,19 +23,19 @@ Legend: ☐ not started · ◐ in progress · ✅ done · ⏸ parked · ✗ drop
 | ID | Refinement | Status | Notes |
 |----|-----------|--------|-------|
 | **Architectural (the root fix)** | | | |
-| M-1 | Value-type `struct` (inline, copied, no heap, no ARC) | ◐ | gated value structs: stack alloca, no ARC, escape-safe, copy-on-assign (var + borrow-returns), inline in `List` (M-10); arg-copy / owned-fields / default-flip pending |
-| M-2 | Reference-type `class` (heap, ARC, identity, shared) | ◐ | keyword + plumbing landed; 7 collection containers marked `class` (Slice 2 started) |
-| M-3 | ARC only on heap/reference fields | ☐ | depends on M-1/M-2 |
+| M-1 | Value-type `struct` (inline, copied, no heap, no ARC) | ✅ | DEFAULT ON (`NOVA_VALUE_STRUCTS_OFF` reverts). Stack alloca, no ARC, copy-on-assign, owned-fields incl. grow, inline in `List` (M-10). Escape channels (return-construction incl. closures, field/type-param, tuple/error-union/optional slot, @serializable, trait-impl, colliding scoped name, any-box heap-promote) keep unsafe shapes on the heap; corpus + ASAN green under the flip |
+| M-2 | Reference-type `class` (heap, ARC, identity, shared) | ✅ | keyword + plumbing; 7 collections + `App`, `ServiceProvider`/`ServiceCollection`, `TcpListener`/`TcpStream`/`TcpClient`, `TlsStream`/`AsyncStream`/`ReactorStream`, `Pool`/`ResilientPool` marked `class` (identity/aliased-mutation types) |
+| M-3 | ARC only on heap/reference fields | ✅ | inherent in M-1: `retainValueStructOwnedFields` + the drop loop gate on `isOwnedDeclaredType`, so a value struct's copy/drop touches ONLY reference fields; scalars get zero ARC |
 | M-4 | Non-atomic refcount on the single-thread reactor | ✅ | corpus+ASAN green; flips to atomic before any 2nd thread |
-| M-5 | ARC elision (expand the borrowed-field prototype) | ◐ | borrowed-field prototype now ON by default (verified); broader patterns pending |
-| M-6 | Per-coroutine region arena + escape analysis | ⏸ | shared-arena attempt reverted |
+| M-5 | ARC elision (expand the borrowed-field prototype) | ◐ | borrowed-field prototype ON by default (verified); the "expand" part (borrowed call args, pass-through returns, general no-escape pairs) is a further optimisation, not required for correctness |
+| M-6 | Per-coroutine region arena + escape analysis | ⏸ | PARKED (large runtime feature). Needs a per-coroutine-frame arena + region escape analysis; the shared-thread-arena attempt was reverted (no LIFO under c=50 interleave). Not an annotation; deferred |
 | **Native resource lifetime** | | | |
-| M-7 | Owned-handle type (`Fd`/`Socket`) + RAII destructor | ☐ | deterministic close |
-| M-8 | Singleton lifetime via root ownership + borrow | ☐ | design settled |
+| M-7 | Owned-handle type (`Fd`/`Socket`) + RAII destructor | ⏸ | PARKED (needs new language subsystems): a user destructor/`deinit` hook AND move-only / single-owner enforcement to prevent double-close. Neither exists today (no `deinit`, no `move`). Deterministic-close design settled; implementation deferred |
+| M-8 | Singleton lifetime via root ownership + borrow | ✅ | singletons are `class` (M-2) owned by the DI container → `App` → `main`; `app.run()` never returns, so the chain lives for the process. Handlers borrow by reference (single-reactor, no per-request retain on the shared object) |
 | **Data-shape slimming** | | | |
 | M-9 | `DbValue` slimming | ✅ | `arr` lazy + 16-byte `dec` field removed (reconstructed from text); corpus+ASAN green |
 | **Collections and buffers** | | | |
-| M-10 | Retire `Storage` bespoke ARC + fixed 8-byte slot | ◐ | `List<value-struct>` inline works end-to-end (gated, ASAN-clean): no per-element heap alloc / ARC; Map/Set + owned/>8B elements pending |
+| M-10 | Retire `Storage` bespoke ARC + fixed 8-byte slot | ◐ | `List<value-struct>` inline works end-to-end (default, ASAN-clean): no per-element heap alloc / ARC, real slot width. Map/Set inline value elements + full `Storage`-backbone-as-value retirement pending |
 | **Shipped micro-optimizations** | | | |
 | S-1 | `escapeHtml` scan-and-run (no alloc when clean) | ✅ | corpus+ASAN green |
 | S-2 | `bytes.copy` (memcpy) in StringBuilder + string.slice | ✅ | corpus+ASAN green |

@@ -36,7 +36,7 @@ import env;
 // web.app imports web.mediator, they remain in scope for any module that imports web.app -- so a bare
 // `json(...)` in a handler still resolves, with no duplicate definition to make it ambiguous.
 
-pub struct App {
+pub class App {
     pub router: routing.Router,
     pub mediator: mediator.Mediator,
     pub static_mounts: List<static_content.StaticMount>,

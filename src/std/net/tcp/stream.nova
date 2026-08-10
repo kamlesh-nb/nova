@@ -6,7 +6,7 @@ import os.socket;
 // os.socket module; net/tcp/{client,server} and web/client go through the facade fns below so they never
 // import os.socket directly (its qualifier would collide with this module's `socket` qualifier).
 
-pub struct TcpStream {
+pub class TcpStream {
     pub fd: int,
 
     init(fd: int) {

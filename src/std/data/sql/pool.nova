@@ -16,7 +16,7 @@ struct Pooled {
     init(conn: Connection, born: long) { self.conn = conn; self.born = born; }
 }
 
-pub struct Pool {
+pub class Pool {
     pub driver: Driver,
     pub dsn: string,
     pub idle: List<Pooled>,
@@ -220,7 +220,7 @@ pub struct Pool {
     }
 }
 
-pub struct ResilientPool {
+pub class ResilientPool {
     pub pool: Pool,
     pub breaker: breaker.CircuitBreaker,
 

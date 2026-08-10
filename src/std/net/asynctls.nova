@@ -19,7 +19,7 @@ fn bufToStr(buf: ptr, n: int): string {
     return out as string;
 }
 
-pub struct TlsStream impl AsyncIO {
+pub class TlsStream impl AsyncIO {
     pub base: aio.AsyncStream,
     pub bio: tlsmembio.TlsBio,
     pub scratch: ptr,

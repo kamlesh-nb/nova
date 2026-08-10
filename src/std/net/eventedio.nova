@@ -107,7 +107,7 @@ pub fn resolveHost4(host: string): long {
     return addr;
 }
 
-pub struct ReactorStream {
+pub class ReactorStream {
     pub fd: int,
     pub kq: int,
 

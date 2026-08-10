@@ -24,7 +24,7 @@ pub fn resolvedReason(r: Resolved): string {
 struct NullService impl Service {
 }
 
-pub struct ServiceProvider {
+pub class ServiceProvider {
     pub factories: Map<string, (ServiceProvider) -> Service>,
     pub singletons: Map<string, Service>,
     pub lifetimes: Map<string, int>,
@@ -116,7 +116,7 @@ pub struct ServiceScope {
     }
 }
 
-pub struct ServiceCollection {
+pub class ServiceCollection {
     pub factories: Map<string, (ServiceProvider) -> Service>,
     pub singletons: Map<string, Service>,
     pub lifetimes: Map<string, int>,

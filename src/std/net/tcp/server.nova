@@ -3,7 +3,7 @@ import bytes;
 import mem.allocator;
 import net.tcp.stream;
 
-pub struct TcpListener {
+pub class TcpListener {
     pub fd: int,
 
     pub fn bind(port: int): TcpListener {

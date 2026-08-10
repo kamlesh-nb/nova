@@ -67,7 +67,7 @@ pub trait AsyncIO {
 // `sock` is a raw fd and recv/send delegate to net/reactorio over os/sys with no Asio. Drivers and
 // the app framework are written against this one type and the AsyncIO trait, so they pick up the
 // reactor path with no change simply by running on a reactor thread.
-pub struct AsyncStream impl AsyncIO {
+pub class AsyncStream impl AsyncIO {
     pub sock: long,
     pub timeoutMs: int,
     pub kq: int,
