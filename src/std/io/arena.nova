@@ -24,6 +24,7 @@ pub class Arena {
     cur: int,                  // index of the block we are bumping in
     used: int,                 // bytes used in the current block
     total: int,                // total bytes handed out since the last reset (for stats)
+    freed: bool,               // guards delete()/destroy() so an explicit free + the destructor do not double-free
 
     init(cap: int) {
         let c = if (cap <= 0) 4096 else cap;
@@ -34,6 +35,7 @@ pub class Arena {
         self.cur = 0;
         self.used = 0;
         self.total = 0;
+        self.freed = false;
     }
 
     fn addBlock(self: Arena, need: int): void {
@@ -81,11 +83,21 @@ pub class Arena {
     pub fn blockCount(self: Arena): int { return self.blocks.size(); }
 
     // Destructor hook (M-7 `delete`): free every backing block when the arena's owner is destroyed.
+    // Idempotent -- an explicit destroy()/delete() plus the destructor's automatic call do not
+    // double-free the raw blocks.
     pub fn delete(self: Arena): void {
+        if (self.freed) { return; }
+        self.freed = true;
         let i = 0;
         while (i < self.blocks.size()) {
             bytes.free(self.blocks.at(i));
             i = i + 1;
         }
     }
+
+    // Explicit free for the eager path (the destructor is the safety net). Idempotent.
+    pub fn destroy(self: Arena): void { self.delete(); }
+
+    // Bytes still available in the CURRENT block before it chains a new one.
+    pub fn remaining(self: Arena): int { return self.sizes.at(self.cur) - self.used; }
 }

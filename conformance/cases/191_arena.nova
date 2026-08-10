@@ -26,12 +26,16 @@ fn test_arena_bump_and_reset(): void {
     ar.destroy();
 }
 
+// M-6: the arena now GROWS on overflow (chains a new block) instead of failing, so one big
+// request cannot starve the others. alloc never returns 0.
 @test
-fn test_arena_exhaustion(): void {
+fn test_arena_grows_past_first_block(): void {
     let ar = arena.Arena(16);
-    let a = ar.alloc(16);
+    assert.equalInt(ar.blockCount(), 1);
+    let a = ar.alloc(16);                // fills the first block
     assert.isTrue(a != 0);
-    let b = ar.alloc(8);                 // over capacity
-    assert.equalInt(b as int, 0);
+    let b = ar.alloc(8);                 // over the first block -> chains a new one, never 0
+    assert.isTrue(b != 0);
+    assert.isTrue(ar.blockCount() > 1);
     ar.destroy();
 }
