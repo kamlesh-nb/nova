@@ -1,0 +1,93 @@
+// mem/rawbuffer: the raw indexable element run the collections are built on (M-10 Storage
+// retirement). This is the Nova equivalent of Swift's `__ContiguousArrayStorage` / Rust's `RawVec`:
+// a UNIQUELY-OWNED `class` holding one `bytes.alloc` run, whose element get/set/drop go entirely
+// through the typed value witnesses (`mem/witness`) so the compiler manages element copy/drop the
+// same way it does a struct's fields -- no `.storage` intrinsic, no bespoke element ARC.
+//
+// "Uniquely owned" means the owning collection is the buffer's sole owner: there is no separate
+// buffer refcount to maintain (only the class's own ARC header), and the buffer is freed
+// deterministically by `delete()` when the collection is destroyed (Rust `Vec`, not Swift COW).
+//
+// Slot model (from mem/witness): a value struct element occupies its real width inline; every other
+// element occupies one 8-byte slot. `witness.sizeOf<T>()` is that width.
+import bytes;
+import mem.witness;
+
+pub class RawBuffer<T> {
+    data: long,   // base address of the element run
+    cap: int,     // capacity in ELEMENTS
+    len: int,     // number of live (initialised) elements at the front
+
+    init(capElems: int) {
+        let c = if (capElems <= 0) 1 else capElems;
+        self.data = bytes.alloc(c * witness.sizeOf<T>());
+        self.cap = c;
+        self.len = 0;
+    }
+
+    pub fn capacity(self: RawBuffer<T>): int { return self.cap; }
+    pub fn count(self: RawBuffer<T>): int { return self.len; }
+    pub fn base(self: RawBuffer<T>): long { return self.data; }
+
+    fn slot(self: RawBuffer<T>, i: int): long {
+        return self.data + (i as long) * (witness.sizeOf<T>() as long);
+    }
+
+    // Append `value`, doubling capacity when full. Takes a reference where the element owns one.
+    pub fn push(self: RawBuffer<T>, value: T): void {
+        if (self.len >= self.cap) {
+            let nc = if (self.cap < 1) 1 else self.cap * 2;
+            self.reserveExact(nc);
+        }
+        witness.store<T>(self.slot(self.len), value);
+        self.len = self.len + 1;
+    }
+
+    // Read element `i` (a value struct comes back as a borrow of its inline bytes, a reference comes
+    // back retained, a scalar by value).
+    pub fn at(self: RawBuffer<T>, i: int): T {
+        return witness.load<T>(self.slot(i));
+    }
+
+    // Overwrite element `i` in place, releasing the element already there.
+    pub fn set(self: RawBuffer<T>, i: int, value: T): void {
+        witness.storeOver<T>(self.slot(i), value);
+    }
+
+    // Remove and return the last element (a MOVE: the caller takes the reference, the slot is
+    // vacated without a drop). undefined when empty.
+    pub fn pop(self: RawBuffer<T>): T | undefined {
+        if (self.len == 0) { return undefined; }
+        self.len = self.len - 1;
+        return witness.load<T>(self.slot(self.len));
+    }
+
+    // Grow the backing run to at least `nc` elements, MOVING the live prefix wholesale (a raw byte
+    // copy transfers ownership; the old run is freed without dropping -- the references moved).
+    fn reserveExact(self: RawBuffer<T>, nc: int): void {
+        if (nc <= self.cap) { return; }
+        let w = witness.sizeOf<T>() as long;
+        let nd = bytes.alloc(nc * witness.sizeOf<T>());
+        if (self.len > 0) {
+            bytes.copy(nd, self.data, (self.len as long) * w);
+        }
+        bytes.free(self.data);
+        self.data = nd;
+        self.cap = nc;
+    }
+
+    // Drop every live element (releasing its owned reference), then free the run. The M-7 destructor
+    // hook: runs when the owning collection is destroyed.
+    pub fn delete(self: RawBuffer<T>): void {
+        let i = 0;
+        while (i < self.len) {
+            witness.dropElem<T>(self.slot(i));
+            i = i + 1;
+        }
+        if (self.data != 0) {
+            bytes.free(self.data);
+            self.data = 0;
+            self.len = 0;
+        }
+    }
+}

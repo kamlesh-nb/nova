@@ -22,3 +22,18 @@ pub fn copyElem<T>(dst: long, src: long): void { }
 // Drop the element at slot address `addr`, releasing any reference it owns (a value struct's owned
 // fields; a reference element's pointer). A no-op for scalar elements.
 pub fn dropElem<T>(addr: long): void { }
+
+// Store `value` (in T's native representation -- an address for a value struct, an 8-byte value or
+// pointer otherwise) into an EMPTY slot at `slot`, taking a reference where the element owns one.
+// Use for building/appending, where there is no prior element to release.
+pub fn store<T>(slot: long, value: T): void { }
+
+// Store `value` into an OCCUPIED slot: releases the element already there, then stores the new one
+// with a reference. Use for overwriting an existing index.
+pub fn storeOver<T>(slot: long, value: T): void { }
+
+// Load the element at `slot`, returning it in T's native representation (a value struct comes back as
+// its inline slot address, a borrow; a reference comes back retained so the caller owns it, matching
+// the collections' get semantics; a scalar comes back by value). The `slot as T` body is a dead
+// fallback -- the compiler intercepts the call.
+pub fn load<T>(slot: long): T { return slot as T; }

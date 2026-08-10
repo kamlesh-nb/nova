@@ -1,0 +1,44 @@
+// M-10 Storage retirement, P2: a pure-Nova `class RawBuffer<T>` (mem/rawbuffer) built on the typed
+// value witnesses (mem/witness) replaces the `.storage` intrinsic. It stores elements of ALL three
+// representations correctly and ARC-cleanly -- a scalar (int, no ARC), a reference (string: retained
+// on store, released on overwrite/drop), and an inline value struct (Point) -- across grows and
+// overwrites, with no bespoke Storage codegen. This is Swift's __ContiguousArrayStorage in Nova.
+import assert;
+import mem.rawbuffer;
+
+struct Point { pub x: int, pub y: int, init(x: int, y: int) { self.x = x; self.y = y; } }
+
+@test
+fn test_scalar(): void {
+    let b = rawbuffer.RawBuffer<int>(2);
+    let i = 0;
+    while (i < 10) { b.push(i * 3); i = i + 1; }   // forces grow past cap 2
+    assert.equalInt(b.count(), 10);
+    assert.equalInt(b.at(0), 0);
+    assert.equalInt(b.at(9), 27);
+    b.set(0, 99);
+    assert.equalInt(b.at(0), 99);
+}
+
+@test
+fn test_string_reference(): void {
+    let b = rawbuffer.RawBuffer<string>(1);
+    b.push("alpha");
+    b.push("beta");
+    b.push("gamma");                                // grew
+    assert.equalStr(b.at(1), "beta");
+    b.set(1, "delta");                              // releases old "beta", retains "delta"
+    assert.equalStr(b.at(1), "delta");
+    assert.equalInt(b.count(), 3);
+}
+
+@test
+fn test_value_struct(): void {
+    let b = rawbuffer.RawBuffer<Point>(1);
+    b.push(Point(10, 20));
+    b.push(Point(30, 40));                          // grew, inline
+    assert.equalInt(b.at(0).x, 10);
+    assert.equalInt(b.at(1).y, 40);
+    b.set(0, Point(11, 21));
+    assert.equalInt(b.at(0).x, 11);
+}

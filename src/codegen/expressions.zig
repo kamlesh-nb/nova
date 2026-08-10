@@ -118,23 +118,58 @@ pub fn compileElemWitness(self: *LlvmCompiler, wn: []const u8, gc: ast.GenericCa
     if (std.mem.eql(u8, wn, "dropElem")) {
         if (gc.args.len != 1) return null;
         const addr = try self.compileExpression(gc.args[0]);
+        try dropElemAt(self, t, is_vs, addr);
+        return core.LLVMConstInt(self.val_type, 0, 0);
+    }
+    // store<T>(slot, value): write value (native repr) into an EMPTY slot, take a reference where owned.
+    // storeOver<T>(slot, value): release the element already at slot, then store the new one.
+    if (std.mem.eql(u8, wn, "store") or std.mem.eql(u8, wn, "storeOver")) {
+        if (gc.args.len != 2) return null;
+        const slot = try self.compileExpression(gc.args[0]);
+        const value = try self.compileExpression(gc.args[1]);
+        if (std.mem.eql(u8, wn, "storeOver")) try dropElemAt(self, t, is_vs, slot);
         if (is_vs) {
-            if (self.valueStructHasOwnedFields(t)) {
-                if (try self.getOrCreateDestructor(t)) |d| {
-                    const dt = core.LLVMGlobalGetValueType(d);
-                    var args = [_]types.LLVMValueRef{addr};
-                    _ = core.LLVMBuildCall2(self.builder, dt, d, &args, 1, "");
-                }
-            }
-        } else if (self.ownedByName(t)) {
-            const p = core.LLVMBuildIntToPtr(self.builder, addr, valptr_t, "we_dp");
-            const v = core.LLVMBuildLoad2(self.builder, self.val_type, p, "we_dv");
-            const d = try self.getOrCreateDestructor(t);
-            try self.compileRelease(v, d);
+            _ = try self.buildValueStructCopyInto(slot, value, @intCast(width_u));
+            try self.retainValueStructOwnedFields(slot, t);
+        } else {
+            const p = core.LLVMBuildIntToPtr(self.builder, slot, valptr_t, "we_sp");
+            _ = core.LLVMBuildStore(self.builder, value, p);
+            if (self.ownedByName(t)) try self.compileRetain(value);
         }
         return core.LLVMConstInt(self.val_type, 0, 0);
     }
+    // load<T>(slot): T -- a value struct comes back as its inline slot address (a borrow); a reference
+    // comes back retained (the caller owns it, matching Storage.get); a scalar comes back by value.
+    if (std.mem.eql(u8, wn, "load")) {
+        if (gc.args.len != 1) return null;
+        const slot = try self.compileExpression(gc.args[0]);
+        if (is_vs) return slot; // the element IS the inline bytes; its value is its address
+        const p = core.LLVMBuildIntToPtr(self.builder, slot, valptr_t, "we_lp");
+        const v = core.LLVMBuildLoad2(self.builder, self.val_type, p, "we_lv");
+        if (self.ownedByName(t)) try self.compileRetain(v);
+        return v;
+    }
     return null;
+}
+
+// Release the element at slot address `addr`: a value struct's owned fields via its destructor; a
+// reference element's pointer via nova_release. A no-op for scalar elements.
+fn dropElemAt(self: *LlvmCompiler, t: []const u8, is_vs: bool, addr: types.LLVMValueRef) anyerror!void {
+    const valptr_t = core.LLVMPointerType(self.val_type, 0);
+    if (is_vs) {
+        if (self.valueStructHasOwnedFields(t)) {
+            if (try self.getOrCreateDestructor(t)) |d| {
+                const dt = core.LLVMGlobalGetValueType(d);
+                var args = [_]types.LLVMValueRef{addr};
+                _ = core.LLVMBuildCall2(self.builder, dt, d, &args, 1, "");
+            }
+        }
+    } else if (self.ownedByName(t)) {
+        const p = core.LLVMBuildIntToPtr(self.builder, addr, valptr_t, "we_dp");
+        const v = core.LLVMBuildLoad2(self.builder, self.val_type, p, "we_dv");
+        const d = try self.getOrCreateDestructor(t);
+        try self.compileRelease(v, d);
+    }
 }
 
 pub fn widenBranchToTrait(self: *LlvmCompiler, branch: *const ast.Expression, val: *types.LLVMValueRef, trait_name: ?[]const u8) anyerror!bool {
@@ -2733,13 +2768,17 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             // pure-Nova RawBuffer<T> can own its elements without the `.storage` intrinsic. Called
             // qualified (`witness.sizeOf<T>()`) or bare after import.
             if (gc.type_args.len == 1) {
+                // Only intercept the `witness.<fn><T>(...)` module-qualified form, so a user method
+                // named store/load/... never collides with a value-witness call.
                 const wcallee: ?[]const u8 = switch (gc.callee.kind) {
-                    .field_access => |fa| fa.field,
-                    .ident => |nm| nm,
+                    .field_access => |fa| if (fa.object.kind == .ident and std.mem.eql(u8, fa.object.kind.ident, "witness")) fa.field else null,
                     else => null,
                 };
                 if (wcallee) |wn| {
-                    if (std.mem.eql(u8, wn, "sizeOf") or std.mem.eql(u8, wn, "copyElem") or std.mem.eql(u8, wn, "dropElem")) {
+                    if (std.mem.eql(u8, wn, "sizeOf") or std.mem.eql(u8, wn, "copyElem") or
+                        std.mem.eql(u8, wn, "dropElem") or std.mem.eql(u8, wn, "store") or
+                        std.mem.eql(u8, wn, "storeOver") or std.mem.eql(u8, wn, "load"))
+                    {
                         if (try self.compileElemWitness(wn, gc)) |v| return v;
                     }
                 }
