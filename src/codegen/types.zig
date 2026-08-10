@@ -572,6 +572,15 @@ fn computeValueEscapeSet(self: *LlvmCompiler) void {
     var it = self.structs.iterator();
     while (it.next()) |e| {
         if (e.value_ptr.impls.len > 0) addName(self, &set, e.key_ptr.*);
+        // A @serializable struct is constructed and returned by a generated `<T>__bind` binder, and
+        // through a type-parameter-erased generic (`serde.bind<T>` returning `T`) whose declared
+        // return type is the bare param `T`, not the concrete struct -- so the return-construction
+        // channel (1) cannot see it. Exclude it directly: serde-bound structs stay on the heap until
+        // the binder/generic-return path is inline-aware.
+        for (e.value_ptr.attributes) |a| if (a == .serializable) {
+            addName(self, &set, e.key_ptr.*);
+            break;
+        };
         for (e.value_ptr.fields) |fld| {
             const fs = self.typeRefToString(fld.type_name) catch continue;
             addName(self, &set, fs);
