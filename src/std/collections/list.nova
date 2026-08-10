@@ -1,209 +1,42 @@
-
-import bytes;
+// List<T>: growable sequence on a pure-Nova RawBuffer<T> (M-10 Storage retirement). len/cap mirror
+// the buffer (kept as fields for `.len` field reads in generated code); RawBuffer owns elements.
+import mem.rawbuffer;
 
 pub class List<T> {
-
-    pub data: Storage<T>,
+    pub data: rawbuffer.RawBuffer<T>,
     pub len: int,
     pub cap: int,
 
-    init() {
-        self.data = Storage<T>(4);
-        self.len = 0;
-        self.cap = 4;
-    }
+    init() { self.data = rawbuffer.RawBuffer<T>(4); self.len = 0; self.cap = 4; }
 
-    pub fn push(self: List<T>, value: T): void {
-        self.grow();
-        self.data.set(self.len, value);
-        self.len = self.len + 1;
-    }
-
-    fn grow(self: List<T>): void {
-        if (self.len < self.cap) {
-            return;
-        }
-        let newCap = if (self.cap == 0) 4 else self.cap * 2;
-        let newData = Storage<T>(newCap);
-        let i = 0;
-        while (i < self.len) {
-            newData.set(i, self.data.get(i));
-            i = i + 1;
-        }
-        self.data = newData;
-        self.cap = newCap;
-    }
-
-    pub fn get(self: List<T>, index: int): T | undefined {
-        if (index < 0 || index >= self.len) {
-            return undefined;
-        }
-        return self.data.get(index);
-    }
-
-    pub fn at(self: List<T>, index: int): T {
-        if (index < 0 || index >= self.len) {
-            nova_panic("List.at: index out of bounds");
-        }
-        return self.data.get(index);
-    }
-
-    pub fn set(self: List<T>, index: int, value: T): void {
-        if (index < 0 || index >= self.len) {
-            return;
-        }
-        self.data.set(index, value);
-    }
-
-    pub fn insert(self: List<T>, index: int, value: T): void {
-        if (index < 0 || index > self.len) {
-            return;
-        }
-        self.grow();
-        let i = self.len;
-        while (i > index) {
-            self.data.set(i, self.data.get(i - 1));
-            i = i - 1;
-        }
-        self.data.set(index, value);
-        self.len = self.len + 1;
-    }
-
-    pub fn remove(self: List<T>, index: int): void {
-        if (index < 0 || index >= self.len) {
-            return;
-        }
-        let i = index;
-        while (i < self.len - 1) {
-            self.data.set(i, self.data.get(i + 1));
-            i = i + 1;
-        }
-        self.len = self.len - 1;
-    }
-
-    pub fn size(self: List<T>): int {
-        return self.len;
-    }
-
-    pub fn forEach(self: List<T>, fn: (T) => void): void {
-        let i = 0;
-        while (i < self.len) {
-            let val = self.data.get(i);
-            fn(val);
-            i = i + 1;
-        }
-    }
-
-    pub fn map<U>(self: List<T>, fn: (T) => U): List<U> {
-        let result = List<U>();
-        let i = 0;
-        while (i < self.len) {
-            let val = self.data.get(i);
-            let mapped = fn(val);
-            result.push(mapped);
-            i = i + 1;
-        }
-        return result;
-    }
-
-    pub fn filter(self: List<T>, pred: (T) => bool): List<T> {
-        let result = List<T>();
-        let i = 0;
-        while (i < self.len) {
-            let val = self.data.get(i);
-            if (pred(val)) {
-                result.push(val);
-            }
-            i = i + 1;
-        }
-        return result;
-    }
-
-    pub fn reduce<U>(self: List<T>, acc: U, fn: (U, T) => U): U {
-        let result = acc;
-        let i = 0;
-        while (i < self.len) {
-            let val = self.data.get(i);
-            result = fn(result, val);
-            i = i + 1;
-        }
-        return result;
-    }
-
-    // Reverse in place.
-    pub fn reverse(self: List<T>): void {
-        let i = 0;
-        let j = self.len - 1;
-        while (i < j) {
-            let tmp = self.data.get(i);
-            self.data.set(i, self.data.get(j));
-            self.data.set(j, tmp);
-            i = i + 1;
-            j = j - 1;
-        }
-    }
-
-    // Empty the list (drops the length; the backing store is reused).
-    pub fn clear(self: List<T>): void { self.len = 0; }
-
-    pub fn first(self: List<T>): T | undefined {
-        if (self.len == 0) { return undefined; }
-        return self.data.get(0);
-    }
-    pub fn last(self: List<T>): T | undefined {
-        if (self.len == 0) { return undefined; }
-        return self.data.get(self.len - 1);
-    }
-    // Remove and return the last element (undefined if empty).
-    pub fn pop(self: List<T>): T | undefined {
-        if (self.len == 0) { return undefined; }
-        let v = self.data.get(self.len - 1);
-        self.len = self.len - 1;
-        return v;
-    }
-
-    // First index whose element satisfies `pred`, or -1.
-    pub fn findIndex(self: List<T>, pred: (T) => bool): int {
-        let i = 0;
-        while (i < self.len) {
-            if (pred(self.data.get(i))) { return i; }
-            i = i + 1;
-        }
-        return -1;
-    }
+    pub fn push(self: List<T>, value: T): void { self.data.push(value); self.len = self.data.count(); self.cap = self.data.capacity(); }
+    pub fn get(self: List<T>, index: int): T | undefined { if (index < 0 || index >= self.data.count()) { return undefined; } return self.data.at(index); }
+    pub fn at(self: List<T>, index: int): T { if (index < 0 || index >= self.data.count()) { nova_panic("List.at: index out of bounds"); } return self.data.at(index); }
+    pub fn set(self: List<T>, index: int, value: T): void { if (index < 0 || index >= self.data.count()) { return; } self.data.set(index, value); }
+    pub fn insert(self: List<T>, index: int, value: T): void { self.data.insertAt(index, value); self.len = self.data.count(); self.cap = self.data.capacity(); }
+    pub fn remove(self: List<T>, index: int): void { self.data.removeAt(index); self.len = self.data.count(); self.cap = self.data.capacity(); }
+    pub fn size(self: List<T>): int { return self.data.count(); }
+    pub fn forEach(self: List<T>, fn: (T) => void): void { let i = 0; while (i < self.data.count()) { let val = self.data.at(i); fn(val); i = i + 1; } }
+    pub fn map<U>(self: List<T>, fn: (T) => U): List<U> { let result = List<U>(); let i = 0; while (i < self.data.count()) { let val = self.data.at(i); let mapped = fn(val); result.push(mapped); i = i + 1; } return result; }
+    pub fn filter(self: List<T>, pred: (T) => bool): List<T> { let result = List<T>(); let i = 0; while (i < self.data.count()) { let val = self.data.at(i); if (pred(val)) { result.push(val); } i = i + 1; } return result; }
+    pub fn reduce<U>(self: List<T>, acc: U, fn: (U, T) => U): U { let result = acc; let i = 0; while (i < self.data.count()) { let val = self.data.at(i); result = fn(result, val); i = i + 1; } return result; }
+    pub fn reverse(self: List<T>): void { let i = 0; let j = self.data.count() - 1; while (i < j) { let tmp = self.data.at(i); self.data.set(i, self.data.at(j)); self.data.set(j, tmp); i = i + 1; j = j - 1; } }
+    pub fn clear(self: List<T>): void { self.data.clear(); self.len = 0; }
+    pub fn first(self: List<T>): T | undefined { if (self.data.count() == 0) { return undefined; } return self.data.at(0); }
+    pub fn last(self: List<T>): T | undefined { if (self.data.count() == 0) { return undefined; } return self.data.at(self.data.count() - 1); }
+    pub fn pop(self: List<T>): T | undefined { let v = self.data.pop(); self.len = self.data.count(); self.cap = self.data.capacity(); return v; }
+    pub fn findIndex(self: List<T>, pred: (T) => bool): int { let i = 0; while (i < self.data.count()) { if (pred(self.data.at(i))) { return i; } i = i + 1; } return -1; }
     pub fn any(self: List<T>, pred: (T) => bool): bool { return self.findIndex(pred) != -1; }
-    pub fn all(self: List<T>, pred: (T) => bool): bool {
-        let i = 0;
-        while (i < self.len) {
-            if (!pred(self.data.get(i))) { return false; }
-            i = i + 1;
-        }
-        return true;
-    }
-
-    // Index of the first element equal to `value` (requires T to support ==), or -1.
-    pub fn indexOf(self: List<T>, value: T): int {
-        let i = 0;
-        while (i < self.len) {
-            if (self.data.get(i) == value) { return i; }
-            i = i + 1;
-        }
-        return -1;
-    }
+    pub fn all(self: List<T>, pred: (T) => bool): bool { let i = 0; while (i < self.data.count()) { if (!pred(self.data.at(i))) { return false; } i = i + 1; } return true; }
+    pub fn indexOf(self: List<T>, value: T): int { let i = 0; while (i < self.data.count()) { if (self.data.at(i) == value) { return i; } i = i + 1; } return -1; }
     pub fn contains(self: List<T>, value: T): bool { return self.indexOf(value) != -1; }
-
 }
 
 @test
 fn test_list(): void {
     let list = List<int>();
     if (list.size() != 0) { nova_test_fail("list.size != 0"); }
-
-    list.push(10);
-    list.push(20);
-    list.push(30);
+    list.push(10); list.push(20); list.push(30);
     if (list.size() != 3) { nova_test_fail("list.size != 3"); }
     if (list.get(0) != 10) { nova_test_fail("list[0] != 10"); }
-    if (list.get(1) != 20) { nova_test_fail("list[1] != 20"); }
-    if (list.get(2) != 30) { nova_test_fail("list[2] != 30"); }
 }

@@ -95,7 +95,13 @@ pub fn isUntypeablePlaceholder(name: []const u8) bool {
 pub fn compileCallArgument(self: *LlvmCompiler, arg: ast.Expression) anyerror!types.LLVMValueRef {
     const val = try self.compileExpression(arg);
 
-    if (self.exprYieldsValoptBox(&arg)) {
+    // A value-optional argument is normally unboxed to its raw value for the call ABI, then the call site
+    // re-boxes via coerceValoptArg when the parameter is itself a value-optional. That re-box relies on the
+    // parameter's TypeRef being syntactically `T | undefined`; for a generic container parameter (`T`) whose
+    // value-optional type arg was collapsed by monomorphisation the re-box never fires, so the box would be
+    // stripped and stored as a raw value. suppress_valopt_unbox is set by such call sites to keep the box
+    // intact all the way into the element slot.
+    if (self.exprYieldsValoptBox(&arg) and !self.suppress_valopt_unbox) {
         return try self.buildValoptUnbox(self.coerceToSlotType(val, self.val_type));
     }
     return val;

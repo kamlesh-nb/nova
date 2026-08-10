@@ -653,9 +653,12 @@ pub fn awaitedCallHandle(self: *LlvmCompiler, operand: ast.Expression, is_spawn:
     defer spawn_held.deinit(self.allocator);
     if (recv_expr) |re| args[0] = try self.compileCallArgument(re.*);
     for (call_args, 0..) |*arg, idx| {
+        const psup = self.getFunctionParamType(resolved, idx + recv_off);
+        self.suppress_valopt_unbox = psup != null and types_mod.valueOptionalName(psup.?);
         var val = try self.compileCallArgument(arg.*);
+        self.suppress_valopt_unbox = false;
 
-        val = try self.coerceValoptArg(val, arg, self.getFunctionParamTypeRef(resolved, idx + recv_off), self.getFunctionParamType(resolved, idx + recv_off));
+        val = try self.coerceValoptArg(val, arg, self.getFunctionParamTypeRef(resolved, idx + recv_off), psup);
 
         const pidx = idx + recv_off;
         if (self.getFunctionParamType(resolved, pidx)) |expected_type| {
@@ -1555,7 +1558,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                                     const uk = st.get(ut);
                                     break :blk uk == .prim or (uk == .enum_ and !st.isOwned(ut));
                                 } else false;
-                                if (use_is_bare_value) {
+                                if (use_is_bare_value and !self.suppress_valopt_unbox) {
                                     return try self.buildValoptUnbox(self.coerceToSlotType(loaded, self.val_type));
                                 }
                             }
@@ -2633,9 +2636,12 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                         args[0] = instance_ptr;
                         const actual_fn_name = if (mono_init) |mi| mi else if (self.func_map.get(init_name) != null) init_name else new_name;
                         for (call.args, 0..) |*arg, idx| {
+                            const psup = self.getFunctionParamType(actual_fn_name, idx + 1);
+                            self.suppress_valopt_unbox = psup != null and types_mod.valueOptionalName(psup.?);
                             var val = try self.compileCallArgument(arg.*);
+                            self.suppress_valopt_unbox = false;
 
-                            val = try self.coerceValoptArg(val, arg, self.getFunctionParamTypeRef(actual_fn_name, idx + 1), self.getFunctionParamType(actual_fn_name, idx + 1));
+                            val = try self.coerceValoptArg(val, arg, self.getFunctionParamTypeRef(actual_fn_name, idx + 1), psup);
                             if (self.getFunctionParamType(actual_fn_name, idx + 1)) |expected_type| {
                                 if (self.traits.contains(getStructBaseName(expected_type))) {
                                     if (try self.resolveExpressionTypeName(arg)) |struct_name| {
@@ -2791,9 +2797,12 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 const args = try self.allocator.alloc(types.LLVMValueRef, call.args.len);
                 defer self.allocator.free(args);
                 for (call.args, 0..) |*arg, idx| {
+                    const psup = self.getFunctionParamType(resolved_name, idx);
+                    self.suppress_valopt_unbox = psup != null and types_mod.valueOptionalName(psup.?);
                     var val = try self.compileCallArgument(arg.*);
+                    self.suppress_valopt_unbox = false;
 
-                    val = try self.coerceValoptArg(val, arg, self.getFunctionParamTypeRef(resolved_name, idx), self.getFunctionParamType(resolved_name, idx));
+                    val = try self.coerceValoptArg(val, arg, self.getFunctionParamTypeRef(resolved_name, idx), psup);
                     if (self.getFunctionParamType(resolved_name, idx)) |expected_type| {
                         if (self.traits.contains(getStructBaseName(expected_type))) {
                             if (try self.resolveExpressionTypeName(arg)) |struct_name| {

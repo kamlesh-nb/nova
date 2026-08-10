@@ -143,6 +143,13 @@ pub const LlvmCompiler = struct {
 
     current_instantiation_id: ?sema_types.TypeId = null,
 
+    // Set while compiling a call argument whose (substituted) parameter type is itself a value-optional.
+    // The speculative ident-unbox in compileExpr (a valopt local used where the checker recorded a BARE
+    // type) must NOT fire in that position: the box has to survive into a value-optional parameter (e.g.
+    // `List<T|undefined>.push(value)` forwarding to `RawBuffer<T|undefined>.push`). Without this the box
+    // is stripped to a raw value, stored, and a later read `?? d` unboxes the raw value as a pointer.
+    suppress_valopt_unbox: bool = false,
+
     current_method_subst: ?[]const MethodParamBinding = null,
 
     default_ctor_depth: u32 = 0,
@@ -726,6 +733,19 @@ pub const LlvmCompiler = struct {
     // type (`int | undefined`)? Routes through the receiver's TypeId arguments (which preserve
     // optionality) rather than the substituted param string (typeRefToString drops `.optional`).
     // `param_idx` is the call-argument index (self excluded).
+    // True when `arg` is a bare identifier whose local slot is a value-optional. Passing such an ident to
+    // a method argument must keep the BOX intact (the speculative ident-unbox must not fire): a generic
+    // container parameter's value-optional type arg is collapsed by monomorphisation, so the callee-param
+    // signal is unreliable, but the arg's own slot type is authoritative. Narrowing a value-optional to a
+    // bare parameter requires an explicit `?? d` at the call site, so the bare ident never legitimately
+    // needs unboxing here.
+    pub fn argIsValoptLocal(self: *LlvmCompiler, arg: *const ast.Expression) bool {
+        if (arg.kind != .ident) return false;
+        const ids = self.current_local_type_ids orelse return false;
+        const slot_tid = ids.get(arg.kind.ident) orelse return false;
+        return self.valueOptionalInner(slot_tid) != null;
+    }
+
     pub fn methodParamIsValueOptional(self: *LlvmCompiler, recv_expr: *const ast.Expression, method_name: []const u8, param_idx: usize) bool {
         const st = self.type_store orelse return false;
         const recv_tid = self.typeOfExprConcrete(recv_expr) orelse return false;
@@ -2066,7 +2086,13 @@ pub const LlvmCompiler = struct {
 
                 try self.guardOptionalDeref(fa.object, args[0], fa.span);
                 for (args_exprs, 0..) |*arg, idx| {
+                    // A value-optional element parameter must receive the BOX, not a raw value. Suppress the
+                    // speculative ident-unbox (which fires when the checker recorded a bare use-type for a
+                    // value-optional local) so a `List<T|undefined>.push(value)` forwards the box intact.
+                    const arg_param_valopt = self.methodParamIsValueOptional(fa.object, fa.field, idx) or self.argIsValoptLocal(arg);
+                    self.suppress_valopt_unbox = arg_param_valopt;
                     var val = try self.compileCallArgument(arg.*);
+                    self.suppress_valopt_unbox = false;
                     var widened_any = false;
                     var elem_type_name: ?[]const u8 = null;
                     if (self.getFunctionParamType(func_name, idx + 1)) |expected_type| {
@@ -2575,12 +2601,32 @@ pub const LlvmCompiler = struct {
                 if (lambda_locals.contains(name)) return;
                 if (self.constants.contains(name)) return;
 
-                for (self.functions.items) |f| {
-                    if (std.mem.eql(u8, f.name, name)) return;
+                // A name that is a PARAMETER of the enclosing function is always a captured free variable,
+                // never a global function reference. Detect it before the loose `_name` function-suffix
+                // heuristic below, which otherwise matches an unrelated struct method (e.g. `RawBuffer_base`
+                // for a local `base`) and wrongly drops the capture -- silently corrupting any closure over
+                // a variable whose name collides with some method's suffix.
+                var is_parent_param = false;
+                for (self.functions.items) |pf| {
+                    if (std.mem.eql(u8, pf.name, parent_name)) {
+                        for (pf.param_names) |pn| {
+                            if (std.mem.eql(u8, pn, name)) {
+                                is_parent_param = true;
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                }
 
-                    const suffix = try std.fmt.allocPrint(self.allocator, "_{s}", .{name});
-                    defer self.allocator.free(suffix);
-                    if (std.mem.endsWith(u8, f.name, suffix)) return;
+                if (!is_parent_param) {
+                    for (self.functions.items) |f| {
+                        if (std.mem.eql(u8, f.name, name)) return;
+
+                        const suffix = try std.fmt.allocPrint(self.allocator, "_{s}", .{name});
+                        defer self.allocator.free(suffix);
+                        if (std.mem.endsWith(u8, f.name, suffix)) return;
+                    }
                 }
 
                 if (self.structs.contains(name)) return;

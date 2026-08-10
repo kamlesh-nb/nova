@@ -35,7 +35,7 @@ Legend: ☐ not started · ◐ in progress · ✅ done · ⏸ parked · ✗ drop
 | **Data-shape slimming** | | | |
 | M-9 | `DbValue` slimming | ✅ | `arr` lazy + 16-byte `dec` field removed (reconstructed from text); corpus+ASAN green |
 | **Collections and buffers** | | | |
-| M-10 | Retire `Storage` bespoke ARC + fixed 8-byte slot | ◐ | `List<value-struct>` inline COMPLETE (default, ARC-clean, case 317): scalar + owned-field value structs inline at real slot width. NOW IN PROGRESS: FULL retirement of the `.storage` intrinsic, Swift-grounded (`__ContiguousArrayStorage` = a `class` + `UnsafeMutablePointer` + `MemoryLayout.stride`). Split the two roles Nova's `.storage` conflates -> (P1) typed-element intrinsics `mem/witness.{sizeOf,copyElem,dropElem}<T>` = value witnesses, lowered to the struct field-walk's copy/drop [DONE, builds]; (P2) pure-Nova `class RawBuffer<T>` on them; (P3) `List` on `RawBuffer`; (P4) `Map`/`Set` on it, then DELETE `.storage` + `isOwnedStorageElem` + `buildStorageDestructor` (~52 touchpoints -> 3 intrinsics), buffer becomes uniquely-owned (no buffer refcount). See the "Full retirement" subsection below. (Map/Set inline-of-value-optional + a pre-existing `Map<K,struct-with-owned-field>` leak remain, logged in the backlog.) |
+| M-10 | Retire `Storage` bespoke ARC + fixed 8-byte slot | ◐ | `List<value-struct>` inline COMPLETE (default, ARC-clean, case 317): scalar + owned-field value structs inline at real slot width. NOW IN PROGRESS: FULL retirement of the `.storage` intrinsic, Swift-grounded (`__ContiguousArrayStorage` = a `class` + `UnsafeMutablePointer` + `MemoryLayout.stride`). Split the two roles Nova's `.storage` conflates -> (P1) typed-element intrinsics `mem/witness.{sizeOf,copyElem,dropElem}<T>` = value witnesses, lowered to the struct field-walk's copy/drop [DONE, builds]; (P2) pure-Nova `class RawBuffer<T>` on them [DONE]; (P3) `List` on `RawBuffer` [DONE, corpus 319/320 + ASAN green: needed mono-worklist-follows-backing, a value-optional element ABI fix, and a closure-capture-vs-method-name fix]; (P4) `Map`/`Set` on it, then DELETE `.storage` + `isOwnedStorageElem` + `buildStorageDestructor` (~52 touchpoints -> 3 intrinsics), buffer becomes uniquely-owned (no buffer refcount). See the "Full retirement" subsection below. (Map/Set inline-of-value-optional + a pre-existing `Map<K,struct-with-owned-field>` leak remain, logged in the backlog.) |
 | **Shipped micro-optimizations** | | | |
 | S-1 | `escapeHtml` scan-and-run (no alloc when clean) | ✅ | corpus+ASAN green |
 | S-2 | `bytes.copy` (memcpy) in StringBuilder + string.slice | ✅ | corpus+ASAN green |
@@ -526,19 +526,36 @@ witness** (copy/drop/stride for `T`, which Nova buries in `isOwnedStorageElem` +
    `store`/`storeOver`/`load`/`moveElem`/`moveOut`), grow MOVES the live prefix wholesale, `delete()`
    (the M-7 hook) drops every live element then frees the run. Uniquely owned -> no buffer refcount.
    Verified for scalar / reference / value-struct elements.
-3. **Rebuild `List`/`Map`/`Set` on `RawBuffer<T>` [P3 -- BLOCKED, reverted to keep the tree green].**
-   Swapping `List`'s `data: Storage<T>` for `data: RawBuffer<T>` compiles and is ARC-clean in
-   isolation (int/string/value-struct, all mutators), BUT the full corpus fell to 284/320: the
-   intrinsic `.storage` hid a **monomorphization-infrastructure gap** that a real generic
-   `RawBuffer<T>` exposes -- in erased / default-ctor / nested-generic contexts, `List<T>` references
-   the ERASED `RawBuffer_init`/`RawBuffer_delete` (undefined at link) because the mono worklist does
-   not instantiate `RawBuffer<X>` for every `List<X>` (the same class of bug as the B4 Set
-   field-noting fix, now across a Nova-level backing type). Two further issues surfaced:
-   `List<T | undefined>` value-optional elements, and a generic-method-mono `Identifier 'base'`
-   compile error. So P3 needs: (a) the mono worklist to follow `List<X> -> RawBuffer<X> -> witness<X>`
-   including erased/default-ctor sites, (b) value-optional element handling in the witnesses, before
-   `List` can move. P1+P2 (the witnesses + `RawBuffer`) are landed and green; P3/P4 (delete
-   `.storage`, `isOwnedStorageElem`, `buildStorageDestructor`) wait on the mono work.
+3. **Rebuild `List` on `RawBuffer<T>` [P3 -- DONE, corpus 319/320 + ASAN green].**
+   `List`'s backing is now `data: RawBuffer<T>`, not `data: Storage<T>`. Getting there needed three
+   codegen fixes, each a real defect the intrinsic `.storage` had hidden by never being a genuine
+   generic Nova class:
+   - **Mono worklist follows the backing chain.** In erased / default-ctor / nested-generic contexts
+     `List<T>` referenced the ERASED `RawBuffer_init`/`RawBuffer_delete` (undefined at link) because
+     the worklist did not instantiate `RawBuffer<X>` for every `List<X>` (same class as the B4 Set
+     field-noting fix). Default-ctor field construction now substitutes type args, and RawBuffer
+     erased fallbacks are emitted unconditionally (internal linkage, DCE-dropped if unreachable).
+   - **Value-optional element ABI.** A `List<T | undefined>` stores each element as a heap value-box
+     (0 = undefined, ptr = present); the box is created at the call site and must survive INTACT into
+     the element slot. Two speculative unboxes stripped it -- the ident-unbox in `compileExpression`
+     (fires when the checker records a bare use-type for a value-optional local) and the arg-unbox in
+     `compileCallArgument`. Both are now gated by `suppress_valopt_unbox`, set on any method argument
+     whose parameter (or whose own local slot) is a value-optional -- because monomorphisation
+     collapses a generic container's value-optional type arg, so only the arg's slot type is reliable.
+     The witness `store`/`load`/`dropElem` treat the box as an ordinary owned heap reference
+     (retain-on-store, release-on-drop), balancing the call-site temp. Cases 280/286/311/312 pass
+     ARC-clean.
+   - **Closure capture vs method-name collision.** `scanExprCaptures` skipped a captured free
+     variable when SOME function name ended in `_<name>` -- so a local `base` stopped being captured
+     the moment a `RawBuffer_base` method existed, silently dropping the capture (case 68, a closure
+     in a generic method). A name that is a PARAMETER of the enclosing function is now always treated
+     as a capture, ahead of that loose function-suffix heuristic.
+
+   P1+P2 (witnesses + `RawBuffer`) and now P3 (`List`) are landed and green.
+
+4. **`Map`/`Set` on `RawBuffer<T>`, then delete `.storage` [P4 -- next].** With the mono, value-optional
+   and capture fixes in place, `Map`/`Set` follow the same swap, after which `.storage`,
+   `isOwnedStorageElem` and `buildStorageDestructor` (~52 touchpoints) can be deleted.
 
 Expected perf: the largest memory win (inline value elements, no per-element box/ARC) already
 landed with M-1 + List-inline; this adds dropping the buffer's own atomic refcount (one fewer ARC
