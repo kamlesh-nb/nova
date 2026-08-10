@@ -3574,6 +3574,7 @@ pub const LlvmCompiler = struct {
     pub const buildValueStructStorage = expressions_mod.buildValueStructStorage;
     pub const buildValueStructCopy = expressions_mod.buildValueStructCopy;
     pub const buildValueStructCopyInto = expressions_mod.buildValueStructCopyInto;
+    pub const compileElemWitness = expressions_mod.compileElemWitness;
     pub const retainValueStructOwnedFields = expressions_mod.retainValueStructOwnedFields;
     pub const buildDriveAsyncCall = expressions_mod.buildDriveAsyncCall;
     pub const buildDriveAsyncHandle = expressions_mod.buildDriveAsyncHandle;

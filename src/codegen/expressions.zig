@@ -85,6 +85,58 @@ pub fn buildValueStructCopy(self: *LlvmCompiler, src: types.LLVMValueRef, size: 
     return dst;
 }
 
+// M-10 Storage retirement: lower a typed-element value-witness call (mem/witness.nova) to the same
+// typed copy/drop the struct field-walk emits. Slot model: a VALUE struct occupies its real width
+// inline; everything else is one 8-byte slot holding its value/pointer. Returns null if the call
+// does not match a witness shape (arity mismatch) so it falls through to normal dispatch.
+pub fn compileElemWitness(self: *LlvmCompiler, wn: []const u8, gc: ast.GenericCallExpr) anyerror!?types.LLVMValueRef {
+    const t = self.typeRefToString(gc.type_args[0]) catch return null;
+    const is_vs = self.isValueStructName(t);
+    const width_u: u64 = if (is_vs) @max(self.getTypeSize(ast.TypeRef{ .ident = getStructBaseName(t) }, false), 1) else 8;
+    const valptr_t = core.LLVMPointerType(self.val_type, 0);
+
+    if (std.mem.eql(u8, wn, "sizeOf")) {
+        if (gc.args.len != 0) return null;
+        return core.LLVMConstInt(self.val_type, width_u, 0);
+    }
+    if (std.mem.eql(u8, wn, "copyElem")) {
+        if (gc.args.len != 2) return null;
+        const dst = try self.compileExpression(gc.args[0]);
+        const src = try self.compileExpression(gc.args[1]);
+        if (is_vs) {
+            _ = try self.buildValueStructCopyInto(dst, src, @intCast(width_u));
+            try self.retainValueStructOwnedFields(dst, t);
+        } else {
+            const sptr = core.LLVMBuildIntToPtr(self.builder, src, valptr_t, "we_sptr");
+            const v = core.LLVMBuildLoad2(self.builder, self.val_type, sptr, "we_v");
+            const dptr = core.LLVMBuildIntToPtr(self.builder, dst, valptr_t, "we_dptr");
+            _ = core.LLVMBuildStore(self.builder, v, dptr);
+            if (self.ownedByName(t)) try self.compileRetain(v);
+        }
+        return core.LLVMConstInt(self.val_type, 0, 0);
+    }
+    if (std.mem.eql(u8, wn, "dropElem")) {
+        if (gc.args.len != 1) return null;
+        const addr = try self.compileExpression(gc.args[0]);
+        if (is_vs) {
+            if (self.valueStructHasOwnedFields(t)) {
+                if (try self.getOrCreateDestructor(t)) |d| {
+                    const dt = core.LLVMGlobalGetValueType(d);
+                    var args = [_]types.LLVMValueRef{addr};
+                    _ = core.LLVMBuildCall2(self.builder, dt, d, &args, 1, "");
+                }
+            }
+        } else if (self.ownedByName(t)) {
+            const p = core.LLVMBuildIntToPtr(self.builder, addr, valptr_t, "we_dp");
+            const v = core.LLVMBuildLoad2(self.builder, self.val_type, p, "we_dv");
+            const d = try self.getOrCreateDestructor(t);
+            try self.compileRelease(v, d);
+        }
+        return core.LLVMConstInt(self.val_type, 0, 0);
+    }
+    return null;
+}
+
 pub fn widenBranchToTrait(self: *LlvmCompiler, branch: *const ast.Expression, val: *types.LLVMValueRef, trait_name: ?[]const u8) anyerror!bool {
     const tn = trait_name orelse return false;
     const st = (try self.resolveExpressionTypeName(branch)) orelse return false;
@@ -2676,6 +2728,22 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             return try self.buildClosureCall(box_val, call.args);
         },
         .generic_call => |gc| {
+            // M-10 Storage retirement: the typed-element value-witnesses (mem/witness.nova). The
+            // compiler lowers these to the SAME typed copy/drop it emits for struct fields, so a
+            // pure-Nova RawBuffer<T> can own its elements without the `.storage` intrinsic. Called
+            // qualified (`witness.sizeOf<T>()`) or bare after import.
+            if (gc.type_args.len == 1) {
+                const wcallee: ?[]const u8 = switch (gc.callee.kind) {
+                    .field_access => |fa| fa.field,
+                    .ident => |nm| nm,
+                    else => null,
+                };
+                if (wcallee) |wn| {
+                    if (std.mem.eql(u8, wn, "sizeOf") or std.mem.eql(u8, wn, "copyElem") or std.mem.eql(u8, wn, "dropElem")) {
+                        if (try self.compileElemWitness(wn, gc)) |v| return v;
+                    }
+                }
+            }
             if (gc.callee.kind == .field_access) {
                 const fa = gc.callee.kind.field_access;
 

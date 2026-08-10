@@ -35,7 +35,7 @@ Legend: ☐ not started · ◐ in progress · ✅ done · ⏸ parked · ✗ drop
 | **Data-shape slimming** | | | |
 | M-9 | `DbValue` slimming | ✅ | `arr` lazy + 16-byte `dec` field removed (reconstructed from text); corpus+ASAN green |
 | **Collections and buffers** | | | |
-| M-10 | Retire `Storage` bespoke ARC + fixed 8-byte slot | ◐ | `List<value-struct>` inline COMPLETE (default, ARC-clean, case 317): scalar AND owned-field value structs stored inline at real slot width via the general typed copy/drop -- no per-element heap alloc / ARC. **Map/Set inline is BLOCKED by value-structs-in-optionals**: `Map.get`/`Set` return `V \| undefined`, so the optional escape channel excludes the struct and it stays heap -- inline needs the deferred value-optional-of-struct work. Full `Storage`-as-value-backbone retirement (delete `isOwnedStorageElem` + bespoke destructor) is the larger follow-on. Separately found: a PRE-EXISTING `Map<K, struct-with-owned-field>` leak (reproduces with `class`, flip OFF) -- orthogonal, logged in the backlog |
+| M-10 | Retire `Storage` bespoke ARC + fixed 8-byte slot | ◐ | `List<value-struct>` inline COMPLETE (default, ARC-clean, case 317): scalar + owned-field value structs inline at real slot width. NOW IN PROGRESS: FULL retirement of the `.storage` intrinsic, Swift-grounded (`__ContiguousArrayStorage` = a `class` + `UnsafeMutablePointer` + `MemoryLayout.stride`). Split the two roles Nova's `.storage` conflates -> (P1) typed-element intrinsics `mem/witness.{sizeOf,copyElem,dropElem}<T>` = value witnesses, lowered to the struct field-walk's copy/drop [DONE, builds]; (P2) pure-Nova `class RawBuffer<T>` on them; (P3) `List` on `RawBuffer`; (P4) `Map`/`Set` on it, then DELETE `.storage` + `isOwnedStorageElem` + `buildStorageDestructor` (~52 touchpoints -> 3 intrinsics), buffer becomes uniquely-owned (no buffer refcount). See the "Full retirement" subsection below. (Map/Set inline-of-value-optional + a pre-existing `Map<K,struct-with-owned-field>` leak remain, logged in the backlog.) |
 | **Shipped micro-optimizations** | | | |
 | S-1 | `escapeHtml` scan-and-run (no alloc when clean) | ✅ | corpus+ASAN green |
 | S-2 | `bytes.copy` (memcpy) in StringBuilder + string.slice | ✅ | corpus+ASAN green |
@@ -493,6 +493,42 @@ query, see M-9) directly and is arguably the largest single win in this row.
 **Landing order.** This depends on M-1 (value control block, inline value elements), M-3 (typed
 copy/drop replacing the bespoke element ARC), and pairs with M-9 (a slim, inline `DbValue` in a
 real-width `List<DbValue>` slot). Do it after M-1/M-3 are stable.
+
+**Full retirement, Swift-grounded (2026-08-10 — revises point 3 above).** Point 3 claimed a
+`class` cannot be the raw run. Swift shows it can, and that there is no need for a separate
+"storage type" at all -- so we retire the `.storage` INTRINSIC entirely rather than demote it.
+Swift's array is `Array<T>` (value, copy-on-write) -> `_ContiguousArrayBuffer` ->
+`__ContiguousArrayStorage`, and that last one is a **`class`**. The only primitives are:
+`Builtin.allocWithTailElems` (tail-allocate the element run right after the class header),
+`UnsafeMutablePointer<Element>` with `.initialize`/`.deinitialize`/`.move` (typed element
+copy/drop), and `MemoryLayout<Element>.stride` (real slot width). Element cleanup is the storage
+class's `deinit` calling the element type's value witness.
+
+Nova's `.storage` conflates two roles Swift keeps apart: the **buffer object** (a `class` + a
+`ptr`/`cap` field can be this -- `bytes.alloc` already gives the run) and the **typed element
+witness** (copy/drop/stride for `T`, which Nova buries in `isOwnedStorageElem` +
+`buildStorageDestructor`). Split them:
+
+1. **Typed-element intrinsics = Nova's value witnesses.** Add `__sizeof<T>()` (already computed
+   as `getTypeSize`), `__copyElem<T>(dst, src)` (typed copy: memcpy + retain owned fields, the
+   value-struct copy path) and `__dropElem<T>(addr)` (typed drop: release owned fields / the
+   element pointer). The compiler lowers these to exactly the code the struct field-walk (M-3)
+   already emits -- no new ownership logic, just exposing it to Nova source. These are Nova's
+   `UnsafeMutablePointer.initialize`/`.deinitialize` + `MemoryLayout.stride`.
+2. **Pure-Nova `class RawBuffer<T>`** holding `ptr`/`cap`: `get(i)` reads the slot at
+   `i * __sizeof<T>()`, `set(i, v)` uses `__copyElem<T>`, `delete()` (the M-7 hook) loops
+   `__dropElem<T>` over the live prefix. This is `__ContiguousArrayStorage` in ordinary Nova.
+3. **Rebuild `List`/`Map`/`Set` on `RawBuffer<T>`**, then DELETE `.storage`, `isOwnedStorageElem`,
+   `buildStorageDestructor`, and the ~52 bespoke touchpoints -- they collapse to the three
+   intrinsics. The buffer stops being a refcounted persistent object: `RawBuffer` is uniquely
+   owned by its collection, freed by its destructor (Rust `Vec` / one owner, no buffer refcount).
+
+Expected perf: the largest memory win (inline value elements, no per-element box/ARC) already
+landed with M-1 + List-inline; this adds dropping the buffer's own atomic refcount (one fewer ARC
+object + its ops per collection) and removes the bespoke-ARC dispatch, plus a much simpler
+compiler. Phased with a corpus+ASAN checkpoint after (a) the intrinsics, (b) `List` on
+`RawBuffer`, (c) `Map`/`Set`, because it swaps hand-written retain/release for the generated
+equivalents and the ARC balance must stay exact.
 
 **Progress (Storage inline core done + a coupling found).** The `Storage<T>` intrinsic now
 stores a value-struct element INLINE at its real width instead of as an 8-byte pointer slot

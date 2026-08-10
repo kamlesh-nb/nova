@@ -1,0 +1,24 @@
+// mem/witness: the typed value-witnesses for a generic element type `T` (M-10 Storage retirement,
+// memory-management-refinements.md). These are Nova's equivalent of Swift's `MemoryLayout<T>.stride`
+// and `UnsafeMutablePointer<T>.initialize`/`.deinitialize`, and Rust's `ptr::copy` + `drop_in_place`.
+//
+// The compiler INTERCEPTS every call to these three functions and lowers it to the SAME typed
+// copy/drop it already emits for a struct's fields: nothing new about ownership, just exposed to Nova
+// source so a pure-Nova buffer (`RawBuffer<T>`) can manage its own elements instead of the codegen
+// baking it into the `.storage` intrinsic. The bodies below are dead fallbacks -- the interception
+// always fires -- but keep them valid so sema resolves and monomorphizes the call per `T`.
+//
+// Slot model (matches the collections' storage): a VALUE struct element occupies its real width in
+// bytes inline; every other element (scalar, string, class, trait object, ...) occupies one 8-byte
+// slot holding its value or pointer. Addresses are plain `long`.
+
+// Real per-element slot width in bytes (inline size for a value struct, else 8).
+pub fn sizeOf<T>(): int { return 8; }
+
+// Copy the element at slot address `src` into slot address `dst`, taking a reference where the
+// element owns one (a value struct's owned fields are retained; a reference element is retained).
+pub fn copyElem<T>(dst: long, src: long): void { }
+
+// Drop the element at slot address `addr`, releasing any reference it owns (a value struct's owned
+// fields; a reference element's pointer). A no-op for scalar elements.
+pub fn dropElem<T>(addr: long): void { }
