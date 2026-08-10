@@ -1,0 +1,48 @@
+// M-7 (memory-management-refinements.md): an owned handle for a native OS resource -- a file
+// descriptor or socket. It is a single-owner reference type (`class`), so exactly ONE destructor
+// runs at its last release and the underlying fd is closed exactly once. That is deterministic RAII
+// close, the same guarantee as Rust `Drop`, Swift `deinit`, C++ destructors and C# `Dispose`, and
+// strictly better than a GC finaliser (which can leak fds under load).
+//
+// Single owner, no double-close. A `class` is never value-copied, so there is no way to obtain two
+// live handles to the same fd; the resource has one owner and one close. `close()` is idempotent, so
+// the error path may close eagerly and the destructor's later close is a harmless no-op.
+//
+// The destructor hook: the compiler calls a type's `delete(self)` method (if present) when the
+// object is destroyed at its last release. `Fd.delete` is the safety net that closes an fd the
+// caller never closed explicitly. Composition propagates automatically: any `class` (or value
+// struct) that owns an `Fd` field has that field released when the owner is destroyed, which runs
+// the fd's close -- so a connection/stream/bio that holds an `Fd` closes it with no hand-written
+// cleanup at the call site.
+import os.socket;
+
+pub class Fd {
+    raw: int,
+    closed: bool,
+
+    init(raw: int) {
+        self.raw = raw;
+        self.closed = false;
+    }
+
+    // Borrow the raw descriptor for a syscall. Do NOT close it directly -- the handle owns it.
+    pub fn get(self: Fd): int { return self.raw; }
+
+    pub fn isClosed(self: Fd): bool { return self.closed; }
+
+    // Idempotent explicit close, for the error path. Returns 0 when already closed or on success,
+    // or the OS return code on failure. After this the destructor's close is a no-op.
+    pub fn close(self: Fd): int {
+        if (self.closed) { return 0; }
+        self.closed = true;
+        return socket.close(self.raw);
+    }
+
+    // Destructor hook (`<Type>_delete`). Closes the fd if the caller never called `close()`.
+    pub fn delete(self: Fd): void {
+        if (!self.closed) {
+            self.closed = true;
+            let _ = socket.close(self.raw);
+        }
+    }
+}
