@@ -131,13 +131,22 @@ clean for value structs with `int`+`string` fields (e.g. a `ProductView`-shape) 
   - the `Storage` destructor gained an inline-element loop (`buildInlineValueStructStorageLoop`) that releases each inline element's owned fields in place;
   - `buildValueStructStorage` now ZERO-inits the alloca, so an owned field's init "release the old value" sees null (a fresh raw alloca is garbage -> that first release would nova_release a junk pointer, SIGSEGV -- fixed);
   - the scalar-only fail-safe was relaxed to also allow `string` fields.
-KNOWN BUG (gated, opt-in only): a value struct with an owned field in a List that GROWS past its
-initial capacity double-frees the owned field during `grow()` (the grow-copy retain and the old/new
-buffer destructors do not balance across the realloc). ASAN pins it (heap-use-after-free in
-`nova_retain`, freed by `List_..._grow -> __destruct`). The zeroed-buffer / erased-elem-type theories
-were ruled out (buffers are memset-zeroed; scalar `List<Point>` grows correctly). It needs runtime
-refcount tracing to resolve. So owned-field value structs are sound for locals / copies / small
-(non-growing) containers; growing containers await this fix. This unblocks `ProductView` once fixed.
+GROW DOUBLE-FREE -- FIXED. The bug was that `newData.set(i, self.data.get(i))` in `grow()` treats
+`self.data.get(i)` (a value struct BORROW -- the old buffer slot address) as an OWNED temporary and
+drops it at statement end, releasing the buffer element it aliases. Fix: register a value struct as
+a droppable temp ONLY when it is a CONSTRUCTION, not a borrow (`compileExpression` now checks
+`returnIsBorrow`). Verified: `List<ProductView>` (int + 3 strings + double), 50 elements across
+several grows, ASAN clean AND ARC-audit clean. Owned-field value structs are now sound for locals,
+copies, and GROWING containers.
+
+REMAINING (exposed by the full flip): with `string` fields allowed, `NOVA_VALUE_STRUCTS_ALL` drops
+from 313/316 to 304/316 -- nine new failures in **serde-binding, `try`/error-union, `??` coalesce,
+and async** contexts (`13_serde`, `159_micro_orm`, `309_generic_async_serde_bind`, `45_try_returns_owned`,
+`78_coalesce_owned_default`, `269_async_try_propagate`, ...). So a string-field value struct that flows
+through those paths is not yet handled (each is another aggregate/coercion site like tuple/`any` that
+needs inline-aware copy/drop). The catalog `ProductView` is serde-bound, so the real hot type needs
+those before it can be value-lowered by default. For NON-serde use (construct + List + read), owned-field
+value structs are complete and verified. The DEFAULT gate stays OFF, corpus 315/316.
 
 **Copy foundation (superseded by the above).** The COPY half is built and sound:
 `retainValueStructOwnedFields(structAddr, name)` walks a value struct's fields and retains each

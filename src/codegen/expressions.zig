@@ -1106,10 +1106,13 @@ pub fn compileExpression(self: *LlvmCompiler, expr: ast.Expression) anyerror!typ
         .owned => {},
     }
     const t = (try self.resolveExpressionTypeName(&expr)) orelse return val;
-    // M-1: a scalar-only value struct is never ARC-owned -- don't register it (a drain nova_release
-    // would free a stack alloca -> SIGBUS). An owned-field value struct IS registered so the drain
-    // drops its owned FIELDS (via dropValueStruct, not nova_release -- see drainTemporaries).
-    if (self.isValueStructName(t) and !self.valueStructHasOwnedFields(t)) return val;
+    // M-1: value-struct temp registration. A scalar-only value struct is never ARC-owned, so skip it
+    // (a drain nova_release would free a stack alloca -> SIGBUS). An owned-field value struct is
+    // registered ONLY when it is a CONSTRUCTION (owned temp) -- then the drain drops its owned fields
+    // via dropValueStruct. A BORROW (a container get / field / variable) is a VIEW whose owner lives
+    // elsewhere, so it must NOT be dropped -- dropping it would release the buffer element it aliases
+    // (the grow-copy `newData.set(i, self.data.get(i))` double-free).
+    if (self.isValueStructName(t) and (!self.valueStructHasOwnedFields(t) or self.returnIsBorrow(&expr))) return val;
     const slot = try spillTemp(self, val);
     try self.pending_temps.append(self.allocator, .{ .val = val, .slot = slot, .type_name = t, .expr_id = expr.id });
     return val;
