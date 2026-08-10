@@ -613,11 +613,33 @@ fn computeValueEscapeSet(self: *LlvmCompiler) void {
                         }
                     }
                 },
+                // A value struct that lands in a tuple element, an error-union payload, or an
+                // optional inner is stored as a raw 8-byte slot holding a pointer to a stack alloca
+                // -> it would dangle. These aggregate/coercion slots are not yet inline-aware, so any
+                // value struct reaching one is excluded (kept on the heap). Over-exclusion is safe;
+                // under-exclusion is a UAF, so this scans the whole interned type store (complete).
+                .tuple => |items| for (items) |elt| excludeIfStruct(self, store, &set, elt),
+                .error_union => |eu| {
+                    excludeIfStruct(self, store, &set, eu.ok);
+                    excludeIfStruct(self, store, &set, eu.err);
+                },
+                .optional => |inner| excludeIfStruct(self, store, &set, inner),
                 else => {},
             }
         }
     }
     self.value_escape_set = set;
+}
+
+// M-1: if `id` renders to a known struct base name, exclude it from value-lowering (keep it on the
+// heap). Used for aggregate/coercion slots (tuple/error-union/optional) that hold a pointer, not an
+// inline value. renderLegacy returns a BORROWED string — do not free it.
+fn excludeIfStruct(self: *LlvmCompiler, store: *const typesys.TypeStore, set: *std.StringHashMap(void), id: typesys.TypeId) void {
+    const rendered = sema_shadow.renderLegacy(self.allocator, store, id) catch return;
+    const base = getStructBaseName(rendered);
+    if (base.len == 0 or !self.structs.contains(base) or set.contains(base)) return;
+    const owned = self.allocator.dupe(u8, base) catch return;
+    set.put(owned, {}) catch {};
 }
 
 // M-1: a value-lowered struct by base name (rollout-gated). When disabled (default) this is
