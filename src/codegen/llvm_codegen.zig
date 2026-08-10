@@ -652,6 +652,28 @@ pub const LlvmCompiler = struct {
         if (std.mem.eql(u8, src_name, "any")) return payload; // already a carrier
         var dtor = core.LLVMConstInt(self.val_type, 0, 0);
         const src_tid = self.typeOfExprConcrete(src_expr);
+        // M-1: a VALUE struct has no heap identity -- `payload` is a STACK alloca address that the
+        // any-box would outlive (case 123: use-after-return). Heap-promote it: copy the struct into a
+        // fresh ARC-headed heap block and box THAT, with the struct's own destructor. Its owned fields
+        // are now aliased by the original local and the heap copy, so retain them in the copy (the
+        // local still drops its own copy at scope end; the box's nova_release drops the heap copy's).
+        const is_vstruct = if (src_tid) |t| self.isValueStructTid(t) else self.isValueStructName(src_name);
+        if (is_vstruct) {
+            var vname = src_name;
+            if (vname.len == 0) {
+                if (src_tid) |t| vname = sema_shadow.renderLegacy(self.allocator, self.type_store.?, t) catch "";
+            }
+            const vsz = self.getTypeSize(ast.TypeRef{ .ident = types_mod.getStructBaseName(vname) }, false);
+            const heap_ptr = try self.compileAlloc(core.LLVMConstInt(self.val_type, if (vsz == 0) 8 else vsz, 0));
+            _ = try self.buildValueStructCopyInto(heap_ptr, payload, vsz);
+            try self.retainValueStructOwnedFields(heap_ptr, vname);
+            if (try self.getOrCreateDestructorPreferId(vname, src_tid)) |dfn| {
+                dtor = core.LLVMBuildPtrToInt(self.builder, dfn, self.val_type, "any_dtor");
+            }
+            const box_vs = try self.buildAnyBox(heap_ptr, dtor);
+            try self.registerTemporary(box_vs, "any");
+            return box_vs;
+        }
         const heap = if (src_tid) |t| self.type_store.?.isOwnedSafe(t) else self.ownedByName(src_name);
         if (heap) {
             if (try self.getOrCreateDestructorPreferId(src_name, src_tid)) |dfn| {

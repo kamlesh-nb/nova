@@ -1,0 +1,9 @@
+import assert;
+
+struct S { pub f0: int, pub f1: int, pub f2: int, init(a0: int, a1: int, a2: int) { self.f0 = a0; self.f1 = a1; self.f2 = a2; } }
+
+@test
+fn t(): void {
+    let s = S((-1604896559), 879682010, (-1781615711));
+    assert.equalInt(((((1 / (-166)) << 14) + (-2147483648)) / 1), -2147483648);
+}

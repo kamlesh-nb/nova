@@ -1,0 +1,9 @@
+import assert;
+
+@test
+fn t(): void {
+    let v0: long = (1078496926228868424 as long);
+    let v1: long = (723363654920785682 as long);
+    let v2: long = ((-418981828718180865) as long);
+    assert.isTrue((((((v0 + v1) as short) as long) & (((0 as long) + v2) << 63)) | (v2 + (((((-560101861448661656) as long) << 0) as sbyte) as long))) < (((((-1) as long) / v0) | ((-231) as long)) / ((((((-1) as long) * ((-40) as long)) * (v1 / (v2 % v0))) as sbyte) as long)));
+}

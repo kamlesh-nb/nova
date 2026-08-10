@@ -1,0 +1,12 @@
+import assert;
+import list;
+
+@test
+fn t(): void {
+    let xs = List<int | undefined>();
+    xs.push(undefined);
+    xs.push(undefined);
+    let r0: int = xs.at(0) ?? 16;
+    let r1: int = xs.at(1) ?? 15;
+    assert.equalInt(((((((r1 & r0) & r1) >> 16) >> 0) as short) as int), 0);
+}

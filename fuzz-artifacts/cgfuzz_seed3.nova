@@ -1,0 +1,9 @@
+import assert;
+
+fn ident<T>(x: T): T { return x; }
+
+@test
+fn t(): void {
+    let g = ident(189963082);
+    assert.isFalse(((g << 0) - (((2147483647 * g) << 10) | ((((g % g) as byte) as int) / (g * 1)))) <= (g % (g | ((-229) & (((g >> 0) as ushort) as int)))));
+}

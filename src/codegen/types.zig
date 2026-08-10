@@ -516,7 +516,11 @@ pub fn returnIsBorrow(self: *LlvmCompiler, expr: *const ast.Expression) bool {
         // `undefined`), arithmetic, casts, ranges, and calls to a non-constructor callee (that
         // callee returns its own safe value). A struct_init / `Ctor(...)` / selector (if_expr,
         // nullish, tuple, closure, ...) may, so it falls to the conservative `false` -> excluded.
-        .literal, .ident, .binary, .unary, .field_access, .index, .cast, .range => true,
+        // A bare `.ident` is NOT safe: `return localStruct` returns a value struct held in THIS
+        // frame's alloca by value, and we do not copy-return -> it dangles. Only reads that alias
+        // longer-lived storage are true borrows: `self.field` (into the receiver), a container
+        // `get`/index (into the container's heap buffer), literals, arithmetic, casts, ranges.
+        .literal, .binary, .unary, .field_access, .index, .cast, .range => true,
         .call => |c| !calleeNamesStruct(self, c.callee),
         .generic_call => |gc| !calleeNamesStruct(self, gc.callee),
         else => false,
@@ -543,6 +547,54 @@ fn blockHasNonBorrowReturn(self: *LlvmCompiler, stmts: []const ast.Statement) bo
     return false;
 }
 
+// M-1: the base name of the struct CONSTRUCTED by `expr` in a return position (a fresh alloca), or
+// null if `expr` is not a struct construction. Recurses selector expressions (if/nullish) whose
+// branches may each construct. `Ctor(...)` and `Struct{...}` construct; a bare read/call does not.
+fn returnedConstructedStruct(self: *LlvmCompiler, expr: *const ast.Expression, set: *std.StringHashMap(void)) void {
+    switch (expr.kind) {
+        .struct_init => |si| excludeStructByName(self, set, si.type_name),
+        .call => |c| if (c.callee.kind == .ident) excludeStructByName(self, set, c.callee.kind.ident),
+        .generic_call => |gc| if (gc.callee.kind == .ident) excludeStructByName(self, set, gc.callee.kind.ident),
+        .if_expr => |ie| {
+            returnedConstructedStruct(self, ie.then_branch, set);
+            returnedConstructedStruct(self, ie.else_branch, set);
+        },
+        else => {},
+    }
+}
+
+fn excludeStructByName(self: *LlvmCompiler, set: *std.StringHashMap(void), name: []const u8) void {
+    const base = getStructBaseName(name);
+    if (base.len == 0 or !self.structs.contains(base) or set.contains(base)) return;
+    const owned = self.allocator.dupe(u8, base) catch return;
+    set.put(owned, {}) catch {};
+}
+
+// Walk a body; for every non-borrow return whose value CONSTRUCTS a value struct, exclude that
+// struct. Mirrors stmtHasNonBorrowReturn's control-flow recursion (blocks, if/while/for/switch).
+fn scanReturnConstructions(self: *LlvmCompiler, stmts: []const ast.Statement, set: *std.StringHashMap(void)) void {
+    for (stmts) |*st| scanStmtReturnConstructions(self, st, set);
+}
+fn scanStmtReturnConstructions(self: *LlvmCompiler, stmt: *const ast.Statement, set: *std.StringHashMap(void)) void {
+    switch (stmt.*) {
+        .return_stmt => |rs| if (rs.value) |*v| {
+            if (!returnIsBorrow(self, v)) returnedConstructedStruct(self, v, set);
+        },
+        .block => |b| scanReturnConstructions(self, b.statements, set),
+        .if_stmt => |i| {
+            scanStmtReturnConstructions(self, i.then_branch, set);
+            if (i.else_branch) |e| scanStmtReturnConstructions(self, e, set);
+        },
+        .while_stmt => |w| scanStmtReturnConstructions(self, w.body, set),
+        .for_stmt => |f| scanStmtReturnConstructions(self, f.body, set),
+        .switch_stmt => |s| {
+            for (s.cases) |c| scanStmtReturnConstructions(self, c.body, set);
+            if (s.default_case) |d| scanStmtReturnConstructions(self, d, set);
+        },
+        else => {},
+    }
+}
+
 // M-1: whole-program escape set. A value struct escapes (and must stay heap) when it is
 // CONSTRUCTED-and-returned (a fresh stack alloca that outlives the frame), stored as a direct
 // struct field, or used as a direct type-param field. A value struct returned only by borrow
@@ -558,13 +610,23 @@ fn computeValueEscapeSet(self: *LlvmCompiler) void {
             st.put(owned, {}) catch {};
         }
     }.f;
-    // 1. a value struct that is CONSTRUCTED in a return position escapes (dangling stack alloca);
-    //    one returned only by borrow (e.g. List.at -> self.data.get(i)) does NOT, so it can inline.
+    // 1. a value struct CONSTRUCTED in a return position escapes (a fresh stack alloca that outlives
+    //    the frame); one returned only by borrow (e.g. List.at -> self.data.get(i)) does NOT. We scan
+    //    the BODY and exclude the struct actually constructed in the return -- NOT the function's
+    //    declared return type: a lifted CLOSURE carries a useless "i32" return_type (only trait
+    //    returns are recorded), so keying on the declared type misses `() => Point(3,4)`. Every
+    //    lifted closure is appended to self.functions, so this scan covers them.
     for (self.functions.items) |f| {
+        // (a) exclude the struct CONSTRUCTED in a return -- covers lifted closures, whose declared
+        //     return_type is a useless "i32".
+        scanReturnConstructions(self, f.body.statements, &set);
+        // (b) a non-borrow return of a bare local (`return r` where r: R) has no construction node
+        //     to key on, so exclude the function's DECLARED return type. Skipped for classes.
         const rbase = getStructBaseName(f.return_type);
-        const rsd = self.structs.get(rbase) orelse continue;
-        if (rsd.is_reference) continue; // classes are never value-lowered anyway
-        if (blockHasNonBorrowReturn(self, f.body.statements)) addName(self, &set, f.return_type);
+        if (self.structs.get(rbase)) |rsd| {
+            if (!rsd.is_reference and blockHasNonBorrowReturn(self, f.body.statements))
+                addName(self, &set, f.return_type);
+        }
     }
     // 2. every struct field type (a value struct stored as a field escapes with its container);
     //    also: a struct that IMPLEMENTS A TRAIT can be widened to that trait's fat pointer, which
@@ -657,6 +719,12 @@ pub fn isValueStructName(self: *LlvmCompiler, name: []const u8) bool {
     if (!arc_mod.value_structs_enabled) return false;
     const base = getStructBaseName(name);
     const sd = self.structs.get(base) orelse return false;
+    // A COLLIDING struct (same bare name in two modules) reaches here under a fully MANGLED scoped
+    // key (`conformance_cases_scoped_rec_a_Rec`), which the escape channels -- keyed on the SOURCE
+    // name `Rec` -- never match, so its returned-by-value alloca would dangle undetected (case 282).
+    // The decl still carries the original bare name; use it. Colliding structs are rare; keep them
+    // all on the heap rather than thread the scoped/mangled/base name duality through value lowering.
+    if (self.isCollidingStruct(sd.name)) return false;
     if (sd.is_reference) return false; // `class` stays a reference type
     if (self.value_escape_set == null) computeValueEscapeSet(self);
     if (self.value_escape_set.?.contains(base)) return false; // escapes -> keep on heap

@@ -255,18 +255,13 @@ const codegen_arc = @import("codegen/arc.zig");
 //   NOVA_VALUE_STRUCTS_ALL -> every is_reference==false struct is value-lowered.
 //   NOVA_VALUE_TYPES=A,B,C -> only the named base types. Default: neither, so gate stays off.
 fn configureValueStructs(allocator: std.mem.Allocator, environ: anytype) void {
-    // M-1 value structs. The machinery (stack alloca, no ARC, escape analysis, copy-on-assign,
-    // inline container storage) is complete and verified, but the DEFAULT flip (struct=value for
-    // the whole stdlib) still needs more escape channels wired -- a value struct widened to a trait,
-    // captured by a closure, or held across an await also escapes, and those channels are not yet
-    // covered, so turning it on globally crashes (traits/map). Until that sweep is done the flip is
-    // OPT-IN: NOVA_VALUE_STRUCTS_ALL turns it on for every non-`class` struct; NOVA_VALUE_TYPES=A,B
-    // narrows to named types. Default OFF keeps the tree all-reference and green.
-    if (environ.get("NOVA_VALUE_STRUCTS_ALL") != null) {
-        codegen_arc.value_structs_enabled = true;
-        codegen_arc.value_structs_all = true;
-        return;
-    }
+    // M-1 value structs -- DEFAULT ON. Every non-`class` struct is value-lowered (stack alloca, no
+    // ARC, copy-on-assign) unless it escapes. The escape channels (return-construction incl. lifted
+    // closures, struct/type-param field, tuple/error-union/optional slot, @serializable binder,
+    // trait impl, colliding module-scoped name, non-scalar/non-string field) keep every unsafe shape
+    // on the heap; corpus + ASAN are green under the flip. NOVA_VALUE_STRUCTS_OFF is the escape hatch
+    // (reverts to the all-reference model); NOVA_VALUE_TYPES=A,B narrows to named types for A/B tests.
+    if (environ.get("NOVA_VALUE_STRUCTS_OFF") != null) return; // all-reference model
     if (environ.get("NOVA_VALUE_TYPES")) |list| {
         var set = std.StringHashMap(void).init(allocator);
         var it = std.mem.tokenizeScalar(u8, list, ',');
