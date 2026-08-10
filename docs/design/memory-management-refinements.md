@@ -521,12 +521,24 @@ witness** (copy/drop/stride for `T`, which Nova buries in `isOwnedStorageElem` +
    `MemoryLayout.stride`. STILL TO ADD for P2: value-in / value-out witnesses (`store`/`load`), since
    `copyElem` is slot-to-slot (addresses) but a collection pushes/reads a `T` in its native
    representation (address for a value struct, an 8-byte value for a scalar/reference).
-2. **Pure-Nova `class RawBuffer<T>`** holding `ptr`/`cap`: `get(i)` reads the slot at
-   `i * witness.sizeOf<T>()`, `set(i, v)` stores through the value witness, `delete()` (the M-7 hook)
-   loops `witness.dropElem<T>` over the live prefix; grow copies old->new with `witness.copyElem<T>`.
-   This is `__ContiguousArrayStorage` in ordinary Nova. Uniquely owned -> no buffer refcount.
-3. **Rebuild `List`/`Map`/`Set` on `RawBuffer<T>`**, then DELETE `.storage`, `isOwnedStorageElem`,
-   `buildStorageDestructor`, and the ~52 bespoke touchpoints -- they collapse to the witnesses.
+2. **Pure-Nova `class RawBuffer<T>` [P2 -- LANDED (commit 9020fa8), ARC-clean case 319].** Holds
+   `data`/`cap`/`len`; push/at/set/pop/insertAt/removeAt/clear go through the witnesses (incl.
+   `store`/`storeOver`/`load`/`moveElem`/`moveOut`), grow MOVES the live prefix wholesale, `delete()`
+   (the M-7 hook) drops every live element then frees the run. Uniquely owned -> no buffer refcount.
+   Verified for scalar / reference / value-struct elements.
+3. **Rebuild `List`/`Map`/`Set` on `RawBuffer<T>` [P3 -- BLOCKED, reverted to keep the tree green].**
+   Swapping `List`'s `data: Storage<T>` for `data: RawBuffer<T>` compiles and is ARC-clean in
+   isolation (int/string/value-struct, all mutators), BUT the full corpus fell to 284/320: the
+   intrinsic `.storage` hid a **monomorphization-infrastructure gap** that a real generic
+   `RawBuffer<T>` exposes -- in erased / default-ctor / nested-generic contexts, `List<T>` references
+   the ERASED `RawBuffer_init`/`RawBuffer_delete` (undefined at link) because the mono worklist does
+   not instantiate `RawBuffer<X>` for every `List<X>` (the same class of bug as the B4 Set
+   field-noting fix, now across a Nova-level backing type). Two further issues surfaced:
+   `List<T | undefined>` value-optional elements, and a generic-method-mono `Identifier 'base'`
+   compile error. So P3 needs: (a) the mono worklist to follow `List<X> -> RawBuffer<X> -> witness<X>`
+   including erased/default-ctor sites, (b) value-optional element handling in the witnesses, before
+   `List` can move. P1+P2 (the witnesses + `RawBuffer`) are landed and green; P3/P4 (delete
+   `.storage`, `isOwnedStorageElem`, `buildStorageDestructor`) wait on the mono work.
 
 Expected perf: the largest memory win (inline value elements, no per-element box/ARC) already
 landed with M-1 + List-inline; this adds dropping the buffer's own atomic refcount (one fewer ARC

@@ -37,3 +37,12 @@ pub fn storeOver<T>(slot: long, value: T): void { }
 // the collections' get semantics; a scalar comes back by value). The `slot as T` body is a dead
 // fallback -- the compiler intercepts the call.
 pub fn load<T>(slot: long): T { return slot as T; }
+
+// MOVE the element bytes from slot `src` to slot `dst` -- a raw copy that takes NO reference (the
+// element's ownership transfers). Use for shifting/growing a buffer: the source slot is left stale
+// and must not be dropped. Swift's `UnsafeMutablePointer.moveInitialize`.
+pub fn moveElem<T>(dst: long, src: long): void { }
+
+// MOVE the element OUT of `slot`, returning it without taking a reference (the caller takes the
+// element's existing ownership; the slot is vacated and must not be dropped). Use for pop/removeAt.
+pub fn moveOut<T>(slot: long): T { return slot as T; }

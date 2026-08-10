@@ -125,29 +125,55 @@ pub fn compileElemWitness(self: *LlvmCompiler, wn: []const u8, gc: ast.GenericCa
     // storeOver<T>(slot, value): release the element already at slot, then store the new one.
     if (std.mem.eql(u8, wn, "store") or std.mem.eql(u8, wn, "storeOver")) {
         if (gc.args.len != 2) return null;
+        const over = std.mem.eql(u8, wn, "storeOver");
         const slot = try self.compileExpression(gc.args[0]);
         const value = try self.compileExpression(gc.args[1]);
-        if (std.mem.eql(u8, wn, "storeOver")) try dropElemAt(self, t, is_vs, slot);
         if (is_vs) {
+            // release the old element's owned fields before the memcpy overwrites them, then copy the
+            // new element in and retain its owned fields. (An exact self-overwrite where the new value
+            // struct shares a reference with the old is not handled -- Storage never handled VS
+            // overwrite at all; this at least stops the leak.)
+            if (over) try dropElemAt(self, t, true, slot);
             _ = try self.buildValueStructCopyInto(slot, value, @intCast(width_u));
             try self.retainValueStructOwnedFields(slot, t);
         } else {
+            // retain the NEW element BEFORE releasing the old (matches Storage.set), so an
+            // aliasing overwrite / a shift like List.insert stays refcount-positive throughout.
+            if (self.ownedByName(t)) try self.compileRetain(value);
+            if (over) try dropElemAt(self, t, false, slot);
             const p = core.LLVMBuildIntToPtr(self.builder, slot, valptr_t, "we_sp");
             _ = core.LLVMBuildStore(self.builder, value, p);
-            if (self.ownedByName(t)) try self.compileRetain(value);
         }
         return core.LLVMConstInt(self.val_type, 0, 0);
     }
     // load<T>(slot): T -- a value struct comes back as its inline slot address (a borrow); a reference
     // comes back retained (the caller owns it, matching Storage.get); a scalar comes back by value.
-    if (std.mem.eql(u8, wn, "load")) {
+    // moveOut<T>(slot): T -- same, but WITHOUT the retain: the caller takes the slot's existing
+    // ownership (the slot is vacated). Used by pop/removeAt.
+    if (std.mem.eql(u8, wn, "load") or std.mem.eql(u8, wn, "moveOut")) {
         if (gc.args.len != 1) return null;
         const slot = try self.compileExpression(gc.args[0]);
         if (is_vs) return slot; // the element IS the inline bytes; its value is its address
         const p = core.LLVMBuildIntToPtr(self.builder, slot, valptr_t, "we_lp");
         const v = core.LLVMBuildLoad2(self.builder, self.val_type, p, "we_lv");
-        if (self.ownedByName(t)) try self.compileRetain(v);
+        if (std.mem.eql(u8, wn, "load") and self.ownedByName(t)) try self.compileRetain(v);
         return v;
+    }
+    // moveElem<T>(dst, src) -- raw MOVE of the element bytes, no reference taken (ownership transfers,
+    // source left stale). Value struct: memcpy the width; scalar/reference: copy the 8-byte slot.
+    if (std.mem.eql(u8, wn, "moveElem")) {
+        if (gc.args.len != 2) return null;
+        const dst = try self.compileExpression(gc.args[0]);
+        const src = try self.compileExpression(gc.args[1]);
+        if (is_vs) {
+            _ = try self.buildValueStructCopyInto(dst, src, @intCast(width_u));
+        } else {
+            const sp = core.LLVMBuildIntToPtr(self.builder, src, valptr_t, "we_msp");
+            const v = core.LLVMBuildLoad2(self.builder, self.val_type, sp, "we_mv");
+            const dp = core.LLVMBuildIntToPtr(self.builder, dst, valptr_t, "we_mdp");
+            _ = core.LLVMBuildStore(self.builder, v, dp);
+        }
+        return core.LLVMConstInt(self.val_type, 0, 0);
     }
     return null;
 }
@@ -2777,7 +2803,8 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 if (wcallee) |wn| {
                     if (std.mem.eql(u8, wn, "sizeOf") or std.mem.eql(u8, wn, "copyElem") or
                         std.mem.eql(u8, wn, "dropElem") or std.mem.eql(u8, wn, "store") or
-                        std.mem.eql(u8, wn, "storeOver") or std.mem.eql(u8, wn, "load"))
+                        std.mem.eql(u8, wn, "storeOver") or std.mem.eql(u8, wn, "load") or
+                        std.mem.eql(u8, wn, "moveElem") or std.mem.eql(u8, wn, "moveOut"))
                     {
                         if (try self.compileElemWitness(wn, gc)) |v| return v;
                     }

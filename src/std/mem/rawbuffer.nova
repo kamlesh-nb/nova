@@ -54,12 +54,51 @@ pub class RawBuffer<T> {
         witness.storeOver<T>(self.slot(i), value);
     }
 
-    // Remove and return the last element (a MOVE: the caller takes the reference, the slot is
-    // vacated without a drop). undefined when empty.
+    // Remove and return the last element (a MOVE: the caller takes the element's existing ownership,
+    // the slot is vacated without a drop). undefined when empty.
     pub fn pop(self: RawBuffer<T>): T | undefined {
         if (self.len == 0) { return undefined; }
         self.len = self.len - 1;
-        return witness.load<T>(self.slot(self.len));
+        return witness.moveOut<T>(self.slot(self.len));
+    }
+
+    // Insert `value` at index `i` (0..len), shifting the tail up by one. Grows if full.
+    pub fn insertAt(self: RawBuffer<T>, i: int, value: T): void {
+        if (i < 0 || i > self.len) { return; }
+        if (self.len >= self.cap) {
+            let nc = if (self.cap < 1) 1 else self.cap * 2;
+            self.reserveExact(nc);
+        }
+        // shift [i, len) up by one, moving from the back so no slot is clobbered before it is read
+        let j = self.len;
+        while (j > i) {
+            witness.moveElem<T>(self.slot(j), self.slot(j - 1));
+            j = j - 1;
+        }
+        witness.store<T>(self.slot(i), value);   // empty slot now -- store (retain), no old to drop
+        self.len = self.len + 1;
+    }
+
+    // Remove the element at index `i`, dropping it and shifting the tail down by one.
+    pub fn removeAt(self: RawBuffer<T>, i: int): void {
+        if (i < 0 || i >= self.len) { return; }
+        witness.dropElem<T>(self.slot(i));       // release the removed element
+        let j = i;
+        while (j < self.len - 1) {                // shift [i+1, len) down, front to back
+            witness.moveElem<T>(self.slot(j), self.slot(j + 1));
+            j = j + 1;
+        }
+        self.len = self.len - 1;                  // the last (now-stale) slot drops out
+    }
+
+    // Drop every live element and reset to empty (the buffer is kept for reuse).
+    pub fn clear(self: RawBuffer<T>): void {
+        let i = 0;
+        while (i < self.len) {
+            witness.dropElem<T>(self.slot(i));
+            i = i + 1;
+        }
+        self.len = 0;
     }
 
     // Grow the backing run to at least `nc` elements, MOVING the live prefix wholesale (a raw byte
