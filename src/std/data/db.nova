@@ -24,20 +24,24 @@ pub struct DbValue {
     pub kind: DbType,
     pub i: long,
     pub f: double,
-    pub dec: decimal,
     pub s: string,
     // element values when kind == Array. LAZY: `undefined` for the common scalar case so a plain cell
     // does NOT allocate an empty list. A result set is ~columns×rows scalar cells, and eagerly allocating
     // an empty List per cell was ~2000 wasted allocations per query on the driver decode hot path.
     pub arr: List<DbValue> | undefined,
 
+    // M-9 slimming: the DECIMAL value is NOT stored inline (a decimal is 16 bytes -- ~30% of every
+    // cell, on thousands of cells per result set). It is carried exactly by its canonical text in `s`
+    // (every driver already passes both `decimal.fromString(raw)` AND `raw`), so `asDecimal()`
+    // reconstructs it on demand from `s`. The `dec` init parameter is kept for driver ABI compatibility
+    // but no longer stored; `_ = dec;` marks it intentionally unused.
     init(kind: DbType, i: long, f: double, dec: decimal, s: string) {
         self.kind = kind;
         self.i = i;
         self.f = f;
-        self.dec = dec;
         self.s = s;
         self.arr = undefined;
+        let _ = dec;
     }
 
     // Fluent: attach array elements. Returns self so `dbArray` composes without a second init.
@@ -60,7 +64,7 @@ pub struct DbValue {
         if (self.kind == DbType.Decimal) { return string.parseFloat(self.s); }
         return self.f;
     }
-    pub fn asDecimal(self: DbValue): decimal { return self.dec; }
+    pub fn asDecimal(self: DbValue): decimal { return decimal.fromString(self.s); }
     pub fn asText(self: DbValue): string { return self.s; }
     // Temporal values are carried as their normalized ISO-8601 text (in `s`) under DbType.Timestamp,
     // so a driver never lossily forces a date string through parseI64. asTimestamp == asText.
@@ -101,7 +105,9 @@ pub fn dbBool(b: bool): DbValue { return DbValue(DbType.Bool, b ? 1 : 0, 0.0, 0m
 pub fn dbInt(n: int): DbValue { return DbValue(DbType.Int4, n, 0.0, 0m, ""); }
 pub fn dbLong(n: long): DbValue { return DbValue(DbType.Int8, n, 0.0, 0m, ""); }
 pub fn dbDouble(d: double): DbValue { return DbValue(DbType.Float8, 0, d, 0m, ""); }
-pub fn dbDecimal(d: decimal): DbValue { return DbValue(DbType.Decimal, 0, 0.0, d, ""); }
+// M-9: carry the decimal's canonical text in `s` (asDecimal reconstructs from it), so the 16-byte
+// `dec` field is unnecessary. Drivers already pass the raw text as `s`; this makes the helper match.
+pub fn dbDecimal(d: decimal): DbValue { return DbValue(DbType.Decimal, 0, 0.0, d, `${d}`); }
 pub fn dbText(s: string): DbValue { return DbValue(DbType.Text, 0, 0.0, 0m, s); }
 pub fn dbBlob(s: string): DbValue { return DbValue(DbType.Blob, 0, 0.0, 0m, s); }
 // A temporal value as normalized ISO-8601 text (date / time / timestamp / timestamptz).

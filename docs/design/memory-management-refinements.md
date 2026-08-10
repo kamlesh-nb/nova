@@ -33,7 +33,7 @@ Legend: ☐ not started · ◐ in progress · ✅ done · ⏸ parked · ✗ drop
 | M-7 | Owned-handle type (`Fd`/`Socket`) + RAII destructor | ☐ | deterministic close |
 | M-8 | Singleton lifetime via root ownership + borrow | ☐ | design settled |
 | **Data-shape slimming** | | | |
-| M-9 | `DbValue` slimming | ◐ | `arr` made lazy/optional |
+| M-9 | `DbValue` slimming | ✅ | `arr` lazy + 16-byte `dec` field removed (reconstructed from text); corpus+ASAN green |
 | **Collections and buffers** | | | |
 | M-10 | Retire `Storage` bespoke ARC + fixed 8-byte slot | ◐ | `List<value-struct>` inline works end-to-end (gated, ASAN-clean): no per-element heap alloc / ARC; Map/Set + owned/>8B elements pending |
 | **Shipped micro-optimizations** | | | |
@@ -375,12 +375,16 @@ Slimming the shape is complementary to M-1: fewer and smaller allocations per ro
 - Done so far (S-6): `arr` was made lazy and optional. It initialises to `undefined` and the
   array accessors (`asArray`, `arrayLen`) are guarded, so scalar cells no longer allocate a
   `List<DbValue>` they never use.
-- Next: collapse the scalar payload. Options are a tagged union / variant so a cell holds one
-  active payload instead of one slot per type, or splitting the rarely-used `decimal` out of
-  the common path. Under M-1 (value struct) a slim `DbValue` becomes an inline value with no
-  per-cell heap allocation at all, which is the end state.
-- Gate: driver codec tests plus corpus and ASAN; the drivers already round-trip `DbValue`
-  through the zero-copy decode path (S-5).
+- Done (M-9): the 16-byte inline `decimal` field (`dec`) was removed -- it was ~30% of every
+  cell across thousands of cells per result set. A DECIMAL value is carried exactly by its
+  canonical text in `s` (every driver already passed both `decimal.fromString(raw)` and `raw`),
+  so `asDecimal()` reconstructs it on demand via `decimal.fromString(self.s)`; `dbDecimal(d)` now
+  stores `` `${d}` `` in `s` to match. The 5-argument `init(kind,i,f,dec,s)` signature is kept
+  (the `dec` param is accepted and ignored, `_ = dec;`) so the five drivers compile unchanged.
+  Verified: decimal round-trips exact, corpus 315/316, ASAN clean on the decimal cases.
+- Still open (needs M-1 value structs): the remaining `i`/`f` overlap, and ultimately making
+  `DbValue` itself an inline value with NO per-cell heap allocation -- that is the end state and
+  is gated on owned-field value structs (DbValue has a `string` field).
 
 ### M-10 Retire `Storage` bespoke ARC + fixed 8-byte slot
 
