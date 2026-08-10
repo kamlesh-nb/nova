@@ -1439,7 +1439,64 @@ pub fn elideBorrowedArc(self: *LlvmCompiler, module: types.LLVMModuleRef) void {
     var fnv = core.LLVMGetFirstFunction(module);
     while (fnv != null) : (fnv = core.LLVMGetNextFunction(fnv)) {
         elideBorrowedArcInFn(self, fnv);
+        elideRedundantPairsInFn(self, fnv);
     }
+}
+
+fn instUsesValue(inst: types.LLVMValueRef, v: types.LLVMValueRef) bool {
+    const n = core.LLVMGetNumOperands(inst);
+    var i: c_uint = 0;
+    while (i < n) : (i += 1) {
+        if (core.LLVMGetOperand(inst, i) == v) return true;
+    }
+    return false;
+}
+
+// M-5 expand (memory-management-refinements.md): elide a retain/release PAIR with no escaping use
+// of the value between them. Within a single basic block, if `nova_retain(v)` is followed -- with NO
+// intervening instruction that references `v` -- by `nova_release(v, ...)`, the pair is net-zero and
+// `v` is untouched across it, so both are redundant and removed. This is provably safe: the temporary
+// +1 has no observable effect when nothing reads `v` (or its refcount) in the span, and any later use
+// of `v` is unaffected because the count is unchanged end-to-end. Conservative: the FIRST use of `v`
+// after the retain must be the release; any other use (a second retain, a store, a return) stops it.
+// Covers the "pass-through" and "borrowed call-arg" shapes the prototype misses when the source is not
+// a param field, without needing arg-ownership metadata.
+fn elideRedundantPairsInFn(self: *LlvmCompiler, fnv: types.LLVMValueRef) void {
+    const a = self.allocator;
+    var to_erase = std.ArrayList(types.LLVMValueRef).empty;
+    defer to_erase.deinit(a);
+    var erased = std.AutoHashMap(types.LLVMValueRef, void).init(a);
+    defer erased.deinit();
+
+    var bb = core.LLVMGetFirstBasicBlock(fnv);
+    while (bb != null) : (bb = core.LLVMGetNextBasicBlock(bb)) {
+        var insts = std.ArrayList(types.LLVMValueRef).empty;
+        defer insts.deinit(a);
+        var inst = core.LLVMGetFirstInstruction(bb);
+        while (inst != null) : (inst = core.LLVMGetNextInstruction(inst)) insts.append(a, inst) catch {};
+
+        for (insts.items, 0..) |ri, i| {
+            if (erased.contains(ri)) continue;
+            if (!isNamedCall(ri, "nova_retain")) continue;
+            const v = core.LLVMGetOperand(ri, 0); // nova_retain(v): arg 0 (callee is the last operand)
+            var j = i + 1;
+            while (j < insts.items.len) : (j += 1) {
+                const uj = insts.items[j];
+                if (erased.contains(uj)) continue;
+                if (!instUsesValue(uj, v)) continue; // no reference to v -> keep scanning
+                // first use of v after the retain: it must be the matching release for a net-zero pair
+                if (isNamedCall(uj, "nova_release") and core.LLVMGetOperand(uj, 0) == v) {
+                    to_erase.append(a, ri) catch {};
+                    to_erase.append(a, uj) catch {};
+                    erased.put(ri, {}) catch {};
+                    erased.put(uj, {}) catch {};
+                    elide_count += 1;
+                }
+                break; // either paired-and-elided, or a non-release use stops this retain
+            }
+        }
+    }
+    for (to_erase.items) |ins| core.LLVMInstructionEraseFromParent(ins);
 }
 
 fn elideBorrowedArcInFn(self: *LlvmCompiler, fnv: types.LLVMValueRef) void {
