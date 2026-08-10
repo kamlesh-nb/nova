@@ -35,7 +35,7 @@ Legend: ☐ not started · ◐ in progress · ✅ done · ⏸ parked · ✗ drop
 | **Data-shape slimming** | | | |
 | M-9 | `DbValue` slimming | ✅ | `arr` lazy + 16-byte `dec` field removed (reconstructed from text); corpus+ASAN green |
 | **Collections and buffers** | | | |
-| M-10 | Retire `Storage` bespoke ARC + fixed 8-byte slot | ◐ | `List<value-struct>` inline works end-to-end (default, ASAN-clean): no per-element heap alloc / ARC, real slot width. Map/Set inline value elements + full `Storage`-backbone-as-value retirement pending |
+| M-10 | Retire `Storage` bespoke ARC + fixed 8-byte slot | ◐ | `List<value-struct>` inline COMPLETE (default, ARC-clean, case 317): scalar AND owned-field value structs stored inline at real slot width via the general typed copy/drop -- no per-element heap alloc / ARC. **Map/Set inline is BLOCKED by value-structs-in-optionals**: `Map.get`/`Set` return `V \| undefined`, so the optional escape channel excludes the struct and it stays heap -- inline needs the deferred value-optional-of-struct work. Full `Storage`-as-value-backbone retirement (delete `isOwnedStorageElem` + bespoke destructor) is the larger follow-on. Separately found: a PRE-EXISTING `Map<K, struct-with-owned-field>` leak (reproduces with `class`, flip OFF) -- orthogonal, logged in the backlog |
 | **Shipped micro-optimizations** | | | |
 | S-1 | `escapeHtml` scan-and-run (no alloc when clean) | ✅ | corpus+ASAN green |
 | S-2 | `bytes.copy` (memcpy) in StringBuilder + string.slice | ✅ | corpus+ASAN green |
