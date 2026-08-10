@@ -119,11 +119,11 @@ pub fn slice(s: string, start: int, end: int): string {
         return "";
     }
     let ptr = allocString(len);
-    let i = 0;
-    while (i < len) {
-        bytes.write_byte(ptr, i, s[start_clamped + i]);
-        i = i + 1;
-    }
+    // Bulk memcpy the slice instead of a per-byte Nova loop. slice is on the hot path for the DB drivers
+    // (every result cell), escapeHtml, the static-file cache copy, and response assembly, so this is a
+    // broad win. `(s as long) + start` keeps the source address 64-bit (an int add would truncate a
+    // >4GB heap address).
+    bytes.copy(ptr as long, (s as long) + (start_clamped as long), len);
     return ptr;
 }
 

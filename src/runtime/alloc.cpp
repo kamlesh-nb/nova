@@ -217,6 +217,16 @@ inline void write_header(char *base, long long size) {
   std::memset(base + NOVA_OBJ_HEADER_SIZE, 0, (size_t)size);
 }
 
+// Header WITHOUT zeroing the payload. Two callers rely on this being safe: (1) the bump arena, whose
+// pages come from mmap(MAP_ANON) already zero-filled and which never reuses memory, so the payload is
+// already zero; (2) buffers the caller fills completely before any read (StringBuilder). Skipping the
+// memset removes a redundant second write over every byte -- on a large response body that memset was
+// half the buffer's memory traffic.
+inline void write_header_nozero(char *base, long long size) {
+  *reinterpret_cast<int32_t *>(base) = 1;
+  *reinterpret_cast<int32_t *>(base + 4) = (int32_t)size;
+}
+
 }
 
 extern "C" {
@@ -250,7 +260,7 @@ long long nova_bytes_alloc(long long size) {
     write_header(ptr, size);
     return (long long)(ptr + NOVA_OBJ_HEADER_SIZE);
   }
-  write_header(curr, size);
+  write_header_nozero(curr, size);   // arena pages are mmap-zero already; skip the redundant memset
   t_arena_current = curr + alloc_size;
   return (long long)(curr + NOVA_OBJ_HEADER_SIZE);
 }
@@ -260,6 +270,23 @@ long long nova_bytes_alloc(long long size) {
 // docs/design/perf-ceiling.md.
 extern "C" void *nova_array_alloc(long long size) {
   return (void *)nova_bytes_alloc(size);
+}
+
+// --- Request-scoped region (arena mark / reset) -------------------------------
+// Return the current bump position. Save it before a request, pass it to nova_arena_reset after, and the
+// whole request's arena allocations are reclaimed in O(1) (no per-object free/ARC/memset). ONLY safe when
+// nothing allocated after the mark outlives the reset -- escaping objects (persistent state) must use the
+// malloc path (nova_bytes_alloc_persistent). This is a measurement prototype for region allocation.
+extern "C" long long nova_arena_mark() {
+  return (long long)t_arena_current;
+}
+extern "C" void nova_arena_reset(long long mark) {
+  char *m = (char *)mark;
+  // Only rewind within the live arena; ignore a mark taken before the arena existed or after an overflow
+  // fell back to malloc (those objects are freed by ARC as usual).
+  if (t_arena_start && m >= t_arena_start && m <= t_arena_current) {
+    t_arena_current = m;
+  }
 }
 
 extern "C" void nova_release(long long ptr_val, void (*destructor)(long long));
@@ -319,6 +346,20 @@ long long nova_bytes_alloc_persistent(long long size) {
   return (long long)(ptr + NOVA_OBJ_HEADER_SIZE);
 }
 
+// Persistent (malloc-backed) allocation that does NOT zero the payload. ONLY for callers that fill the
+// buffer completely before reading it (StringBuilder's buffer and toString result). malloc memory is not
+// zero, so this is unsafe for anything that reads uninitialised bytes -- do not wire it in generally.
+extern "C" long long nova_bytes_alloc_persistent_nz(long long size) {
+  if (size < 0)
+    size = 0;
+  char *ptr = (char *)std::malloc((size_t)size + NOVA_OBJ_HEADER_SIZE);
+  if (!ptr)
+    return 0;
+  write_header_nozero(ptr, size);
+  audit_alloc(ptr, size, __builtin_return_address(0));
+  return (long long)(ptr + NOVA_OBJ_HEADER_SIZE);
+}
+
 void nova_bytes_free(long long ptr_val) {
   if (!ptr_val)
     return;
@@ -329,6 +370,37 @@ void nova_bytes_free(long long ptr_val) {
   std::free(ptr - NOVA_OBJ_HEADER_SIZE);
 }
 
+// Bulk byte copy: memcpy `len` bytes from absolute address `src` to absolute address `dst`. Backs the
+// `bytes.copy` intrinsic so hot paths (StringBuilder append/toString/grow, buffer assembly) copy at
+// memcpy speed instead of a per-byte Nova loop, which was the response-render throughput ceiling. dst/src
+// are raw addresses the caller has already offset; memmove is used so overlapping ranges are safe.
+extern "C" void nova_bytes_copy(long long dst, long long src, long long len) {
+  if (!dst || !src || len <= 0)
+    return;
+  std::memmove((void *)dst, (void *)src, (size_t)len);
+}
+
+// M-4 (memory-management-refinements.md): single-thread fast path for ARC.
+//
+// The default web runtime is single-reactor-per-process; request-scoped objects live and die on one
+// OS thread, so paying an atomic read-modify-write (plus an ACQ_REL barrier on every release) is pure
+// waste. `g_arc_multithreaded` starts false and flips to true exactly once, just BEFORE any second OS
+// thread is created (see nova_arc_go_multithreaded call sites: nova_run_reactors and the debug
+// watchdog). Thread creation is a happens-before edge: every non-atomic op done while the flag was
+// false completed before the new thread started, and every op after the flip is atomic. It never flips
+// back. So a false reading is only ever observed while genuinely single-threaded, and the plain
+// integer arithmetic below is race-free. This shaves most of the ARC cost on the hot single-threaded
+// path without changing any observable semantics.
+static std::atomic<bool> g_arc_multithreaded{false};
+
+extern "C" void nova_arc_go_multithreaded(void) {
+  g_arc_multithreaded.store(true, std::memory_order_release);
+}
+
+extern "C" bool nova_arc_is_multithreaded(void) {
+  return g_arc_multithreaded.load(std::memory_order_acquire);
+}
+
 void nova_retain(long long ptr_val) {
   if (!ptr_val)
     return;
@@ -336,6 +408,12 @@ void nova_retain(long long ptr_val) {
   if (is_in_arena(ptr))
     return;
   int32_t *rc = reinterpret_cast<int32_t *>(ptr - NOVA_OBJ_HEADER_SIZE);
+  if (!g_arc_multithreaded.load(std::memory_order_acquire)) {
+    if (*rc < 0)
+      return;
+    *rc += 1;
+    return;
+  }
   if (__atomic_load_n(rc, __ATOMIC_RELAXED) < 0)
     return;
   __atomic_fetch_add(rc, 1, __ATOMIC_RELAXED);
@@ -349,6 +427,19 @@ void nova_release(long long ptr_val, void (*destructor)(long long)) {
     return;
   check_release_of_dead(ptr);
   int32_t *rc = reinterpret_cast<int32_t *>(ptr - NOVA_OBJ_HEADER_SIZE);
+  if (!g_arc_multithreaded.load(std::memory_order_acquire)) {
+    if (*rc < 0)
+      return;
+    *rc -= 1;
+    if (*rc == 0) {
+      *rc = -999;
+      if (destructor)
+        destructor(ptr_val);
+      audit_free(ptr - NOVA_OBJ_HEADER_SIZE, audit_size_of(ptr - NOVA_OBJ_HEADER_SIZE));
+      std::free(ptr - NOVA_OBJ_HEADER_SIZE);
+    }
+    return;
+  }
   if (__atomic_load_n(rc, __ATOMIC_ACQUIRE) < 0)
     return;
   if (__atomic_fetch_sub(rc, 1, __ATOMIC_ACQ_REL) == 1) {

@@ -4,7 +4,7 @@
 
 import list;
 
-pub struct Heap<T> {
+pub class Heap<T> {
     pub data: List<T>,
     pub less: (T, T) -> bool,
 

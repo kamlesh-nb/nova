@@ -213,6 +213,20 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
                         }
                     }
 
+                    // M-1 copy-on-assign: `let b = a` where `a` is a value struct must copy `a`'s
+                    // bytes into `b`'s own storage, not alias it. Only the plain-variable RHS needs
+                    // this; a fresh `Point(...)` construction already yields distinct storage. (Value
+                    // structs live only as locals — field/return/container uses are escape-excluded.)
+                    // Copy when the RHS is a BORROW of a value struct (a variable, field, index, or a
+                    // container get like list.at(i)) so the local is independent of the source buffer.
+                    // A fresh `Point(...)` construction already yields its own storage (not a borrow).
+                    if (target_type) |tt| {
+                        if (self.isValueStructName(tt) and self.returnIsBorrow(&init)) {
+                            const vsz = self.getTypeSize(ast.TypeRef{ .ident = getStructBaseName(tt) }, false);
+                            val = try self.buildValueStructCopy(val, vsz);
+                        }
+                    }
+
                     const slot_ty = if (core.LLVMIsAAllocaInst(alloca_val) != null)
                         core.LLVMGetAllocatedType(alloca_val)
                     else

@@ -4,7 +4,7 @@
 
 import list;
 
-pub struct Deque<T> {
+pub class Deque<T> {
     pub front: List<T>,   // head-side, stored reversed (top of stack == logical front)
     pub back: List<T>,    // tail-side, stored in order (top of stack == logical back)
 

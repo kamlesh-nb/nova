@@ -120,6 +120,11 @@ pub const LlvmCompiler = struct {
     // owned type-name string; callers own their result, so a hit returns a fresh dupe (cheap next
     // to the scan it avoids). Both keys and stored value strings are freed on deinit.
     param_type_str_cache: std.StringHashMap(?[]const u8),
+    // M-1: base names of structs that ESCAPE their constructing frame (used as a function/method
+    // return type, a struct field type, or a container element / generic arg). Such a struct must
+    // NOT be value-lowered while escape handling (sret/heap-promote) is unimplemented, else a stack
+    // alloca outlives its frame -> UAF. Computed lazily on first isValueStructName. null = not yet.
+    value_escape_set: ?std.StringHashMap(void) = null,
     structs: std.StringHashMap(ast.StructDecl),
     unions: std.StringHashMap(ast.UnionDecl),
     enums: std.StringHashMap(ast.EnumDecl),
@@ -3505,6 +3510,9 @@ pub const LlvmCompiler = struct {
     pub const isOwnedExpr = types_mod.isOwnedExpr;
     pub const isOwnedTypeId = types_mod.isOwnedTypeId;
     pub const isOwnedLocal = types_mod.isOwnedLocal;
+    pub const isValueStructName = types_mod.isValueStructName;
+    pub const isValueStructTid = types_mod.isValueStructTid;
+    pub const returnIsBorrow = types_mod.returnIsBorrow;
     pub const isOwnedErrUnionOk = types_mod.isOwnedErrUnionOk;
     pub const isStringExpr = types_mod.isStringExpr;
     pub const tupleElemTraitName = types_mod.tupleElemTraitName;
@@ -3539,6 +3547,9 @@ pub const LlvmCompiler = struct {
     pub const fnRefInt = expressions_mod.fnRefInt;
     pub const identNamesVariable = expressions_mod.identNamesVariable;
     pub const widenBranchToTrait = expressions_mod.widenBranchToTrait;
+    pub const buildValueStructStorage = expressions_mod.buildValueStructStorage;
+    pub const buildValueStructCopy = expressions_mod.buildValueStructCopy;
+    pub const buildValueStructCopyInto = expressions_mod.buildValueStructCopyInto;
     pub const buildDriveAsyncCall = expressions_mod.buildDriveAsyncCall;
     pub const buildDriveAsyncHandle = expressions_mod.buildDriveAsyncHandle;
     pub const coroPromiseType = expressions_mod.coroPromiseType;
@@ -3566,6 +3577,10 @@ pub const LlvmCompiler = struct {
     pub const numToStringImpl = expressions_mod.numToStringImpl;
     pub const numToStringT = expressions_mod.numToStringT;
     pub const compileJsxElement = expressions_mod.compileJsxElement;
+    pub const emitJsxInto = expressions_mod.emitJsxInto;
+    pub const jsxAppendVal = expressions_mod.jsxAppendVal;
+    pub const jsxAppendLiteral = expressions_mod.jsxAppendLiteral;
+    pub const jsxAppendExpr = expressions_mod.jsxAppendExpr;
     pub const compileGenericParse = expressions_mod.compileGenericParse;
     pub const compileDecodeBinaryRow = expressions_mod.compileDecodeBinaryRow;
     pub const compileNovaQuery = expressions_mod.compileNovaQuery;

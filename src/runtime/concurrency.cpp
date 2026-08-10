@@ -399,6 +399,9 @@ static void iocp_timer_arm(long long handle, long long ms) {
 
     NovaIocpTimer *t = new NovaIocpTimer{nullptr, port, handle};
     HANDLE h = nullptr;
+    // M-4: the timer callback runs on an OS threadpool thread; switch ARC to atomic
+    // before arming so no non-atomic op can race that thread (Windows-only path).
+    nova_arc_go_multithreaded();
     if (!CreateTimerQueueTimer(&h, nullptr, nova_iocp_timer_cb, t,
                                (DWORD)(ms < 0 ? 0 : ms), 0, WT_EXECUTEONLYONCE)) {
         delete t;
@@ -493,8 +496,12 @@ inline bool raw_coro_done(long long h) {
     return reinterpret_cast<void **>(h)[0] == nullptr;
 }
 
-std::mutex &g_waiters_mu = *new std::mutex();
-std::unordered_map<long long, long long> &g_waiters = *new std::unordered_map<long long, long long>();
+// The child-coroutine -> awaiting-parent map. Coroutines never migrate between reactor threads
+// (share-nothing reactors), so this is thread_local and needs NO lock: each reactor owns its own map.
+// Previously a single global mutex-guarded map, which (a) cost an uncontended lock on every await/resume
+// even on one reactor and (b) serialised every await across worker reactors -- the multi-core scaling
+// wall. The 7 `lock_guard(g_waiters_mu)` sites that guarded it are removed with this change.
+thread_local std::unordered_map<long long, long long> g_waiters;
 
 extern "C++" {
 constexpr size_t NSTRIPES = 64;
@@ -534,7 +541,6 @@ static void nova_coro_release_held(long long coro) {
 }
 
 long long take_waiter(long long child) {
-    std::lock_guard<std::mutex> lk(g_waiters_mu);
     auto it = g_waiters.find(child);
     if (it == g_waiters.end()) return 0;
     long long w = it->second;
@@ -546,13 +552,11 @@ long long take_waiter(long long child) {
 
 void nova_register_waiter(long long child, long long parent) {
     if (!child || !parent) return;
-    std::lock_guard<std::mutex> lk(g_waiters_mu);
     g_waiters[child] = parent;
 }
 
 long long nova_when_any(long long buf, long long n, long long self) {
     const long long *h = reinterpret_cast<const long long *>(buf);
-    std::lock_guard<std::mutex> lk(g_waiters_mu);
     for (long long i = 0; i < n; ++i) {
         if (h[i] && raw_coro_done(h[i])) {
             for (long long j = 0; j < n; ++j) {
@@ -583,7 +587,6 @@ void wadl_clear(long long self) {
 }
 
 void wadl_disarm(const long long *h, long long n, long long self) {
-    std::lock_guard<std::mutex> lk(g_waiters_mu);
     for (long long j = 0; j < n; ++j) {
         auto it = g_waiters.find(h[j]);
         if (it != g_waiters.end() && it->second == self) g_waiters.erase(it);
@@ -596,7 +599,6 @@ long long nova_when_any_deadline(long long buf, long long n, long long ms, long 
 
     long long found = -1;
     {
-        std::lock_guard<std::mutex> lk(g_waiters_mu);
         for (long long i = 0; i < n; ++i)
             if (h[i] && raw_coro_done(h[i])) { found = i; break; }
         if (found >= 0) {
@@ -630,7 +632,6 @@ long long nova_when_any_deadline(long long buf, long long n, long long ms, long 
     if (timed_out) { wadl_disarm(h, n, self); return -2; }
 
     {
-        std::lock_guard<std::mutex> lk(g_waiters_mu);
         for (long long i = 0; i < n; ++i)
             if (h[i]) g_waiters[h[i]] = self;
     }
@@ -656,7 +657,6 @@ long long nova_when_any_deadline(long long buf, long long n, long long ms, long 
 
 long long nova_await_future(long long future, long long waiter) {
     if (!future) return 1;
-    std::lock_guard<std::mutex> lk(g_waiters_mu);
     if (raw_coro_done(future)) return 1;
     if (waiter) g_waiters[future] = waiter;
     return 0;
@@ -944,6 +944,9 @@ extern "C" void nova_run_reactors(long long n, long long box) {
     long long fn_ptr = *reinterpret_cast<long long *>(box);
     long long env = *reinterpret_cast<long long *>(box + sizeof(long long));
     typedef void (*worker_fn)(long long, long long);
+    // M-4: about to run reactors on multiple OS threads, so switch ARC to atomic ops
+    // BEFORE any worker thread starts (thread creation is the happens-before edge).
+    nova_arc_go_multithreaded();
     std::vector<std::thread> ts;
     ts.reserve(static_cast<size_t>(n));
     for (long long i = 0; i < n; i++) {

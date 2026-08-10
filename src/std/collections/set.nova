@@ -4,7 +4,7 @@ import bytes;
 import list;
 import assert;
 
-pub struct Set<T> {
+pub class Set<T> {
     pub map: map.Map<T, bool>,
 
     init(initialCap: int, hashFn: (T) -> int) {

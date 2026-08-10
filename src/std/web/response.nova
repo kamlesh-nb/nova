@@ -41,18 +41,39 @@ fn ciEquals(a: string, b: string): bool {
 // do not each redefine their own: `{response.escapeHtml(user.name)}`. It replaces the five characters that
 // matter in element text and double-quoted attribute values: & < > " '.
 pub fn escapeHtml(s: string): string {
+    let n = string.len(s);
+    // Fast path: scan once for anything needing escaping. The overwhelming majority of interpolated
+    // values (names, descriptions, URLs) contain no HTML metacharacters, so return the input UNCHANGED
+    // with zero allocation. The old code allocated a one-character string per byte (string.slice(s,i,i+1))
+    // even for clean text, which made rendering O(bytes) allocations and was the response-build throughput
+    // ceiling (~43 MB/s) -- a large product page is mostly clean description text.
+    let first = -1;
+    let k = 0;
+    while (k < n) {
+        let c = s[k];
+        if (c == 38 || c == 60 || c == 62 || c == 34 || c == 39) { first = k; break; }
+        k = k + 1;
+    }
+    if (first == -1) { return s; }
+    // Slow path: copy safe RUNS between metacharacters in one slice each, not byte by byte.
     let sb = StringBuilder();
-    let i = 0;
-    while (i < string.len(s)) {
+    if (first > 0) { sb.append(string.slice(s, 0, first)); }
+    let i = first;
+    let runStart = first;
+    while (i < n) {
         let c = s[i];
-        if (c == 38) { sb.append("&amp;"); }
-        else if (c == 60) { sb.append("&lt;"); }
-        else if (c == 62) { sb.append("&gt;"); }
-        else if (c == 34) { sb.append("&quot;"); }
-        else if (c == 39) { sb.append("&#39;"); }
-        else { sb.append(string.slice(s, i, i + 1)); }
+        if (c == 38 || c == 60 || c == 62 || c == 34 || c == 39) {
+            if (i > runStart) { sb.append(string.slice(s, runStart, i)); }
+            if (c == 38) { sb.append("&amp;"); }
+            else if (c == 60) { sb.append("&lt;"); }
+            else if (c == 62) { sb.append("&gt;"); }
+            else if (c == 34) { sb.append("&quot;"); }
+            else { sb.append("&#39;"); }
+            runStart = i + 1;
+        }
         i = i + 1;
     }
+    if (i > runStart) { sb.append(string.slice(s, runStart, i)); }
     return sb.toString();
 }
 

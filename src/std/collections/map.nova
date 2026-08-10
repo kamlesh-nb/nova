@@ -34,7 +34,7 @@ fn nextPowerOfTwo(n: int): int {
     return v + 1;
 }
 
-pub struct Map<K, V> {
+pub class Map<K, V> {
     pub cap: int,
     pub len: int,
 

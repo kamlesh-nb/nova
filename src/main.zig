@@ -250,6 +250,37 @@ const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const llvm_codegen = @import("codegen/llvm_codegen.zig");
 const codegen_arc = @import("codegen/arc.zig");
+
+// M-1 value-type structs: configure the per-type rollout gate from the environment.
+//   NOVA_VALUE_STRUCTS_ALL -> every is_reference==false struct is value-lowered.
+//   NOVA_VALUE_TYPES=A,B,C -> only the named base types. Default: neither, so gate stays off.
+fn configureValueStructs(allocator: std.mem.Allocator, environ: anytype) void {
+    // M-1 value structs. The machinery (stack alloca, no ARC, escape analysis, copy-on-assign,
+    // inline container storage) is complete and verified, but the DEFAULT flip (struct=value for
+    // the whole stdlib) still needs more escape channels wired -- a value struct widened to a trait,
+    // captured by a closure, or held across an await also escapes, and those channels are not yet
+    // covered, so turning it on globally crashes (traits/map). Until that sweep is done the flip is
+    // OPT-IN: NOVA_VALUE_STRUCTS_ALL turns it on for every non-`class` struct; NOVA_VALUE_TYPES=A,B
+    // narrows to named types. Default OFF keeps the tree all-reference and green.
+    if (environ.get("NOVA_VALUE_STRUCTS_ALL") != null) {
+        codegen_arc.value_structs_enabled = true;
+        codegen_arc.value_structs_all = true;
+        return;
+    }
+    if (environ.get("NOVA_VALUE_TYPES")) |list| {
+        var set = std.StringHashMap(void).init(allocator);
+        var it = std.mem.tokenizeScalar(u8, list, ',');
+        while (it.next()) |name| {
+            const trimmed = std.mem.trim(u8, name, " \t");
+            if (trimmed.len == 0) continue;
+            const owned = allocator.dupe(u8, trimmed) catch continue;
+            set.put(owned, {}) catch {};
+        }
+        codegen_arc.value_type_set = set;
+        codegen_arc.value_structs_enabled = true;
+    }
+}
+
 const type_checker = @import("type_checker.zig");
 const sema_shadow = @import("sema/shadow.zig");
 const sema_alpha = @import("sema/alpha.zig");
@@ -456,7 +487,7 @@ fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocator: 
         const sub = module_name[4..];
         return try std.fmt.allocPrint(allocator, "src/std/{s}.nova", .{sub});
     }
-    const std_modules = [_][]const u8{ "net/tcp/stream", "net/tcp/server", "net/tcp/client", "net/url", "net/dns", "net/dial", "net/aio", "net/asynctls", "web/request", "web/response", "web/mime", "web/status", "web/methods", "web/client", "web/mediator", "web/routing", "web/middleware", "web/url", "web/cookie", "web/cors", "web/request_id", "web/redact", "web/secure_headers", "web/body_limit", "web/recovery", "web/rate_limit", "web/multipart", "web/session", "web/csrf", "web/di", "web/controller", "web/app", "web/logger", "web/httpparser", "concurrency/fiber", "concurrency/channel", "concurrency/asyncchan", "concurrency/atomic", "concurrency/async_util", "concurrency/actor", "concurrency/asynclock", "io/file", "io/dir", "collections/list", "collections/map", "collections/set", "collections/string_builder", "collections/deque", "collections/heap", "collections/ordered_map", "serde/json", "serde/source", "serde/bson", "serde/yaml", "mem/allocator", "mem/memory", "string", "datetime", "math", "assert", "traits", "env", "log", "config", "metrics", "crypto/hash/sha", "crypto/hash/md5", "crypto/base64", "crypto/random", "crypto/scram", "crypto/hash/sha256", "crypto/hash/sha512", "crypto/hash/sha1", "crypto/mac/hmac", "crypto/kdf/hkdf", "crypto/kdf/pbkdf2", "crypto/cipher/chacha20", "crypto/mac/poly1305", "crypto/aead/chachapoly", "crypto/cipher/aes", "crypto/mac/ghash", "crypto/aead/aesgcm", "crypto/cipher/aesctr", "crypto/ecc/x25519", "crypto/ecc/p256", "crypto/ecc/p384", "crypto/rsa", "crypto/x509", "crypto/ocsp", "crypto/crl", "crypto/tls/13/tls", "crypto/tls/13/handshake", "crypto/tls/13/tlsClient", "crypto/tls/13/tlsServer", "crypto/tls/12/prf", "crypto/tls/truststore", "crypto/tls/revocation", "crypto/tls/12/client12", "process", "fs", "exception", "data/db", "data/sql/pool", "text/utf8", "text/regex", "webview", "web/static_content", "web/circuit_breaker", "resilience/breaker", "compress/gzip", "compress/deflate", "compress/lz4", "data/orm", "os/sys", "os/backend", "os/socket", "os/darwin/kqueue", "os/linux/epoll", "os/windows/win32", "os/windows/fs", "os/windows/proc", "os/windows/winsock", "io/slab", "io/arena", "net/poller", "net/eventedio", "net/tls13async", "net/tlsmembio", "net/tls12bio", "net/httpsclient", "net/eventloop" };
+    const std_modules = [_][]const u8{ "net/tcp/stream", "net/tcp/server", "net/tcp/client", "net/url", "net/dns", "net/dial", "net/aio", "net/asynctls", "web/request", "web/response", "web/mime", "web/status", "web/methods", "web/client", "web/mediator", "web/routing", "web/middleware", "web/url", "web/cookie", "web/cors", "web/request_id", "web/redact", "web/secure_headers", "web/body_limit", "web/recovery", "web/rate_limit", "web/multipart", "web/session", "web/csrf", "web/di", "web/controller", "web/app", "web/logger", "web/httpparser", "concurrency/fiber", "concurrency/channel", "concurrency/asyncchan", "concurrency/atomic", "concurrency/async_util", "concurrency/actor", "concurrency/asynclock", "io/file", "io/dir", "collections/list", "collections/map", "collections/set", "collections/string_builder", "collections/deque", "collections/heap", "collections/ordered_map", "serde/json", "serde/source", "serde/bson", "serde/yaml", "mem/allocator", "mem/memory", "string", "datetime", "stopwatch", "math", "assert", "traits", "env", "log", "config", "metrics", "crypto/hash/sha", "crypto/hash/md5", "crypto/base64", "crypto/random", "crypto/scram", "crypto/hash/sha256", "crypto/hash/sha512", "crypto/hash/sha1", "crypto/mac/hmac", "crypto/kdf/hkdf", "crypto/kdf/pbkdf2", "crypto/cipher/chacha20", "crypto/mac/poly1305", "crypto/aead/chachapoly", "crypto/cipher/aes", "crypto/mac/ghash", "crypto/aead/aesgcm", "crypto/cipher/aesctr", "crypto/ecc/x25519", "crypto/ecc/p256", "crypto/ecc/p384", "crypto/rsa", "crypto/x509", "crypto/ocsp", "crypto/crl", "crypto/tls/13/tls", "crypto/tls/13/handshake", "crypto/tls/13/tlsClient", "crypto/tls/13/tlsServer", "crypto/tls/12/prf", "crypto/tls/truststore", "crypto/tls/revocation", "crypto/tls/12/client12", "process", "fs", "exception", "data/db", "data/sql/pool", "text/utf8", "text/regex", "webview", "web/static_content", "web/circuit_breaker", "resilience/breaker", "compress/gzip", "compress/deflate", "compress/lz4", "data/orm", "os/sys", "os/backend", "os/socket", "os/darwin/kqueue", "os/linux/epoll", "os/windows/win32", "os/windows/fs", "os/windows/proc", "os/windows/winsock", "io/slab", "io/arena", "net/poller", "net/eventedio", "net/tls13async", "net/tlsmembio", "net/tls12bio", "net/httpsclient", "net/eventloop" };
     for (std_modules) |m| {
         if (std.mem.eql(u8, module_name, m)) {
             return try std.fmt.allocPrint(allocator, "src/std/{s}.nova", .{module_name});
@@ -2338,7 +2369,11 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
     try tc.check(program);
 
     sema_shadow.report_enabled = init.environ_map.get("NOVA_SEMA_SHADOW") != null;
-    codegen_arc.elide_enabled = init.environ_map.get("NOVA_ARC_ELIDE") != null;
+    // M-5 (memory-management-refinements.md): borrowed-field ARC elision is ON by default
+    // (verified: corpus + ASAN clean, differential ARC audit identical off vs on). Set
+    // NOVA_ARC_ELIDE_OFF to disable it for debugging a suspected elision regression.
+    codegen_arc.elide_enabled = init.environ_map.get("NOVA_ARC_ELIDE_OFF") == null;
+    configureValueStructs(allocator, init.environ_map);
     sema_shadow.trace_resolution = sema_shadow.report_enabled;
     sema_shadow.f2_types_enabled = true;
 
@@ -2624,7 +2659,11 @@ fn compileProgram(
     try tc.check(program);
 
     sema_shadow.report_enabled = init.environ_map.get("NOVA_SEMA_SHADOW") != null;
-    codegen_arc.elide_enabled = init.environ_map.get("NOVA_ARC_ELIDE") != null;
+    // M-5 (memory-management-refinements.md): borrowed-field ARC elision is ON by default
+    // (verified: corpus + ASAN clean, differential ARC audit identical off vs on). Set
+    // NOVA_ARC_ELIDE_OFF to disable it for debugging a suspected elision regression.
+    codegen_arc.elide_enabled = init.environ_map.get("NOVA_ARC_ELIDE_OFF") == null;
+    configureValueStructs(allocator, init.environ_map);
     sema_shadow.trace_resolution = sema_shadow.report_enabled;
     sema_shadow.f2_types_enabled = true;
 

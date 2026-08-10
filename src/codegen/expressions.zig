@@ -16,6 +16,53 @@ const unescapeString = @import("llvm_codegen.zig").unescapeString;
 const FunctionInfo = @import("llvm_codegen.zig").FunctionInfo;
 const Scope = @import("llvm_codegen.zig").Scope;
 
+// M-1: inline (stack) storage for a value struct. Allocates `size` bytes as an i8 array on the
+// stack and returns its address as an i64 (the same representation a heap struct pointer uses), so
+// field writes/reads at 0-based offsets are identical to the heap path. No ARC header is reserved:
+// a value struct is never retained/released/freed (isOwnedTypeId returns false for it).
+pub fn buildValueStructStorage(self: *LlvmCompiler, size: u32) anyerror!types.LLVMValueRef {
+    const n: c_uint = if (size == 0) 8 else @intCast(size);
+    const arr_t = core.LLVMArrayType(self.i8_type, n);
+    const a = core.LLVMBuildAlloca(self.builder, arr_t, "vstruct");
+    return core.LLVMBuildPtrToInt(self.builder, a, self.val_type, "vstruct_addr");
+}
+
+// M-1 copy-on-assign: `let b = a` for a value struct must give `b` its own storage with `a`'s bytes
+// copied in (value semantics), not alias `a`. Allocates fresh stack storage and memcpies `size`
+// bytes from `src` via nova_bytes_copy, returning the new address.
+// M-10/M-1: memcpy `size` bytes from `src` into an EXISTING destination address `dst` (e.g. a
+// container slot), via nova_bytes_copy. Returns dst.
+pub fn buildValueStructCopyInto(self: *LlvmCompiler, dst: types.LLVMValueRef, src: types.LLVMValueRef, size: u32) anyerror!types.LLVMValueRef {
+    const copy_fn = if (self.func_map.get("nova_bytes_copy")) |f| f else blk: {
+        var at = [_]types.LLVMTypeRef{ self.val_type, self.val_type, self.val_type };
+        const ft = core.LLVMFunctionType(core.LLVMVoidType(), &at, 3, 0);
+        const f = core.LLVMAddFunction(self.module, "nova_bytes_copy", ft);
+        try self.func_map.put("nova_bytes_copy", f);
+        break :blk f;
+    };
+    const fn_t = core.LLVMGlobalGetValueType(copy_fn);
+    const n: u64 = if (size == 0) 8 else size;
+    var args = [_]types.LLVMValueRef{ dst, src, core.LLVMConstInt(self.val_type, n, 0) };
+    _ = core.LLVMBuildCall2(self.builder, fn_t, copy_fn, &args, 3, "");
+    return dst;
+}
+
+pub fn buildValueStructCopy(self: *LlvmCompiler, src: types.LLVMValueRef, size: u32) anyerror!types.LLVMValueRef {
+    const dst = try self.buildValueStructStorage(size);
+    const copy_fn = if (self.func_map.get("nova_bytes_copy")) |f| f else blk: {
+        var at = [_]types.LLVMTypeRef{ self.val_type, self.val_type, self.val_type };
+        const ft = core.LLVMFunctionType(core.LLVMVoidType(), &at, 3, 0);
+        const f = core.LLVMAddFunction(self.module, "nova_bytes_copy", ft);
+        try self.func_map.put("nova_bytes_copy", f);
+        break :blk f;
+    };
+    const fn_t = core.LLVMGlobalGetValueType(copy_fn);
+    const n: u64 = if (size == 0) 8 else size;
+    var args = [_]types.LLVMValueRef{ dst, src, core.LLVMConstInt(self.val_type, n, 0) };
+    _ = core.LLVMBuildCall2(self.builder, fn_t, copy_fn, &args, 3, "");
+    return dst;
+}
+
 pub fn widenBranchToTrait(self: *LlvmCompiler, branch: *const ast.Expression, val: *types.LLVMValueRef, trait_name: ?[]const u8) anyerror!bool {
     const tn = trait_name orelse return false;
     const st = (try self.resolveExpressionTypeName(branch)) orelse return false;
@@ -1037,6 +1084,9 @@ pub fn compileExpression(self: *LlvmCompiler, expr: ast.Expression) anyerror!typ
         .owned => {},
     }
     const t = (try self.resolveExpressionTypeName(&expr)) orelse return val;
+    // M-1: a value struct is never ARC-owned, so it must not be registered as a temporary that the
+    // end-of-statement drain would nova_release -- that would free a stack alloca (SIGBUS).
+    if (self.isValueStructName(t)) return val;
     const slot = try spillTemp(self, val);
     try self.pending_temps.append(self.allocator, .{ .val = val, .slot = slot, .type_name = t, .expr_id = expr.id });
     return val;
@@ -2042,12 +2092,18 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     if (std.mem.startsWith(u8, obj_t, "Storage<")) {
                         const elem = obj_t["Storage<".len .. obj_t.len - 1];
                         const base = try self.compileExpression(fa.object.*);
-                        const eight = core.LLVMConstInt(self.val_type, 8, 0);
+                        // M-10: a value-struct element is stored INLINE in the buffer at its real width,
+                        // not as an 8-byte pointer slot. get() returns the slot ADDRESS (the element is
+                        // the buffer bytes themselves); set() memcpies the element's bytes in. No ARC.
+                        const inline_vs = self.isValueStructName(elem);
+                        const slot_w: u64 = if (inline_vs) @max(self.getTypeSize(ast.TypeRef{ .ident = getStructBaseName(elem) }, false), 1) else 8;
+                        const width = core.LLVMConstInt(self.val_type, slot_w, 0);
 
                         if (std.mem.eql(u8, fa.field, "get")) {
                             const idx = try self.compileExpression(call.args[0]);
-                            const off = core.LLVMBuildMul(self.builder, idx, eight, "stg_g_off");
+                            const off = core.LLVMBuildMul(self.builder, idx, width, "stg_g_off");
                             const addr = core.LLVMBuildAdd(self.builder, base, off, "stg_g_addr");
+                            if (inline_vs) return addr; // element IS the inline bytes; its value is its address
                             const ptr = core.LLVMBuildIntToPtr(self.builder, addr, core.LLVMPointerType(self.val_type, 0), "stg_g_ptr");
                             const loaded = core.LLVMBuildLoad2(self.builder, self.val_type, ptr, "stg_g");
 
@@ -2059,8 +2115,13 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                         if (std.mem.eql(u8, fa.field, "set")) {
                             const idx = try self.compileExpression(call.args[0]);
                             const val = try self.compileExpression(call.args[1]);
-                            const off = core.LLVMBuildMul(self.builder, idx, eight, "stg_s_off");
+                            const off = core.LLVMBuildMul(self.builder, idx, width, "stg_s_off");
                             const addr = core.LLVMBuildAdd(self.builder, base, off, "stg_s_addr");
+                            if (inline_vs) {
+                                // memcpy the element's bytes into the slot (buffer now owns the copy).
+                                _ = try self.buildValueStructCopyInto(addr, val, @intCast(slot_w));
+                                return core.LLVMConstInt(self.val_type, 0, 0);
+                            }
                             const ptr = core.LLVMBuildIntToPtr(self.builder, addr, core.LLVMPointerType(self.val_type, 0), "stg_s_ptr");
 
                             if (self.isOwnedStorageElem(fa.object, elem)) {
@@ -2118,9 +2179,70 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                         const size = try self.compileExpression(call.args[0]);
                         return try self.compileAllocPersistent(size);
                     }
+                    // bytes.alloc_persistent_nz(size): persistent alloc WITHOUT zeroing the payload. Only
+                    // safe for buffers the caller fills completely before reading (StringBuilder).
+                    if (std.mem.eql(u8, fa.field, "alloc_persistent_nz")) {
+                        const size = try self.compileExpression(call.args[0]);
+                        const nz_fn = if (self.func_map.get("nova_bytes_alloc_persistent_nz")) |f| f else blk: {
+                            var arg_types = [_]types.LLVMTypeRef{self.val_type};
+                            const fn_type = core.LLVMFunctionType(self.val_type, &arg_types, 1, 0);
+                            const f = core.LLVMAddFunction(self.module, "nova_bytes_alloc_persistent_nz", fn_type);
+                            try self.func_map.put("nova_bytes_alloc_persistent_nz", f);
+                            break :blk f;
+                        };
+                        const fn_t = core.LLVMGlobalGetValueType(nz_fn);
+                        var args = [_]types.LLVMValueRef{size};
+                        return core.LLVMBuildCall2(self.builder, fn_t, nz_fn, &args, 1, "alloc_persistent_nz_tmp");
+                    }
                     if (std.mem.eql(u8, fa.field, "free")) {
                         const ptr = try self.compileExpression(call.args[0]);
                         return try self.compileFree(ptr);
+                    }
+                    // bytes.arenaMark(): current bump position. bytes.arenaReset(mark): rewind to it,
+                    // bulk-freeing every arena allocation made since (request-scoped region allocation).
+                    if (std.mem.eql(u8, fa.field, "arenaMark")) {
+                        const f = if (self.func_map.get("nova_arena_mark")) |g| g else blk: {
+                            const t = core.LLVMFunctionType(self.val_type, &[_]types.LLVMTypeRef{}, 0, 0);
+                            const g = core.LLVMAddFunction(self.module, "nova_arena_mark", t);
+                            try self.func_map.put("nova_arena_mark", g);
+                            break :blk g;
+                        };
+                        const ft = core.LLVMGlobalGetValueType(f);
+                        var noargs = [_]types.LLVMValueRef{};
+                        return core.LLVMBuildCall2(self.builder, ft, f, &noargs, 0, "arena_mark");
+                    }
+                    if (std.mem.eql(u8, fa.field, "arenaReset")) {
+                        const mark = try self.compileExpression(call.args[0]);
+                        const f = if (self.func_map.get("nova_arena_reset")) |g| g else blk: {
+                            var a = [_]types.LLVMTypeRef{self.val_type};
+                            const t = core.LLVMFunctionType(self.void_type, &a, 1, 0);
+                            const g = core.LLVMAddFunction(self.module, "nova_arena_reset", t);
+                            try self.func_map.put("nova_arena_reset", g);
+                            break :blk g;
+                        };
+                        const ft = core.LLVMGlobalGetValueType(f);
+                        var args = [_]types.LLVMValueRef{mark};
+                        _ = core.LLVMBuildCall2(self.builder, ft, f, &args, 1, "");
+                        return core.LLVMConstInt(self.val_type, 0, 0);
+                    }
+                    // bytes.copy(dst, src, len): bulk memcpy. dst/src are absolute addresses (the caller
+                    // adds any offset). Backs StringBuilder's fast path so response assembly is memcpy-speed,
+                    // not a per-byte Nova loop.
+                    if (std.mem.eql(u8, fa.field, "copy")) {
+                        const dst = try self.compileExpression(call.args[0]);
+                        const src = try self.compileExpression(call.args[1]);
+                        const len = try self.compileExpression(call.args[2]);
+                        const copy_fn = if (self.func_map.get("nova_bytes_copy")) |f| f else blk: {
+                            var arg_types = [_]types.LLVMTypeRef{ self.val_type, self.val_type, self.val_type };
+                            const fn_type = core.LLVMFunctionType(self.void_type, &arg_types, 3, 0);
+                            const f = core.LLVMAddFunction(self.module, "nova_bytes_copy", fn_type);
+                            try self.func_map.put("nova_bytes_copy", f);
+                            break :blk f;
+                        };
+                        const fn_t = core.LLVMGlobalGetValueType(copy_fn);
+                        var args = [_]types.LLVMValueRef{ dst, src, len };
+                        _ = core.LLVMBuildCall2(self.builder, fn_t, copy_fn, &args, 3, "");
+                        return core.LLVMConstInt(self.val_type, 0, 0);
                     }
                     if (std.mem.eql(u8, fa.field, "write_byte")) {
                         const ptr_val = try self.compileExpression(call.args[0]);
@@ -2305,7 +2427,11 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     }
                 if (self.isStructType(resolved_struct_name)) {
                     const struct_size = self.getTypeSize(ast.TypeRef{ .ident = resolved_struct_name }, false);
-                    const instance_ptr = try self.compileAlloc(core.LLVMConstInt(self.val_type, struct_size, 0));
+                    // M-1: value struct -> inline (stack) storage instead of heap.
+                    const instance_ptr = if (self.isValueStructName(resolved_struct_name))
+                        try self.buildValueStructStorage(struct_size)
+                    else
+                        try self.compileAlloc(core.LLVMConstInt(self.val_type, struct_size, 0));
 
                     const init_name = try self.methodSymbol(resolved_struct_name, "init");
                     defer self.allocator.free(init_name);
@@ -2771,7 +2897,11 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     {
                         const g_ref = ast.TypeRef{ .generic = .{ .name = cfa.field, .params = gc.type_args } };
                         const struct_size = self.getTypeSize(g_ref, false);
-                        const instance_ptr = try self.compileAlloc(core.LLVMConstInt(self.val_type, struct_size, 0));
+                        // M-1: value struct -> inline (stack) storage instead of heap.
+                        const instance_ptr = if (self.isValueStructName(cfa.field))
+                            try self.buildValueStructStorage(struct_size)
+                        else
+                            try self.compileAlloc(core.LLVMConstInt(self.val_type, struct_size, 0));
                         var mono_init: ?[]const u8 = null;
                         if (try self.resolveExpressionTypeName(&expr)) |inst| {
                             if (!std.mem.eql(u8, getStructBaseName(inst), inst)) {
@@ -2901,8 +3031,15 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
 
                 if (std.mem.eql(u8, resolved_struct_name, "Storage")) {
                     const n = try self.compileExpression(gc.args[0]);
-                    const eight = core.LLVMConstInt(self.val_type, 8, 0);
-                    const bytes_needed = core.LLVMBuildMul(self.builder, n, eight, "stg_bytes");
+                    // M-10: size the buffer by the element's real slot width. A value-struct element is
+                    // stored inline at getTypeSize bytes; everything else uses an 8-byte pointer slot.
+                    var slot_w: u64 = 8;
+                    if (gc.type_args.len > 0) {
+                        const en = self.typeRefToString(gc.type_args[0]) catch "";
+                        if (self.isValueStructName(en)) slot_w = @max(self.getTypeSize(ast.TypeRef{ .ident = getStructBaseName(en) }, false), 1);
+                    }
+                    const width = core.LLVMConstInt(self.val_type, slot_w, 0);
+                    const bytes_needed = core.LLVMBuildMul(self.builder, n, width, "stg_bytes");
                     return try self.compileAllocPersistent(bytes_needed);
                 }
 
@@ -2914,7 +3051,11 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                         }
                     };
                     const struct_size = self.getTypeSize(g_ref, false);
-                    const instance_ptr = try self.compileAlloc(core.LLVMConstInt(self.val_type, struct_size, 0));
+                    // M-1: value struct constructed via its init() method is stored inline (stack).
+                    const instance_ptr = if (self.isValueStructName(resolved_struct_name))
+                        try self.buildValueStructStorage(struct_size)
+                    else
+                        try self.compileAlloc(core.LLVMConstInt(self.val_type, struct_size, 0));
 
                     var gen_name = try self.allocator.dupe(u8, resolved_struct_name);
                     for (gc.type_args) |t| {
@@ -3132,7 +3273,13 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             const total_size = self.getTypeSize(ast.TypeRef{ .ident = si.type_name }, false);
             const size_val = core.LLVMConstInt(self.val_type, total_size, 0);
 
-            const struct_ptr_val = try self.compileAlloc(size_val);
+            // M-1: a value struct is stored inline on the stack (alloca), with no ARC header and no
+            // retain/release/free (isOwnedTypeId returns false for it). Fields are written below at the
+            // same 0-based offsets used for the heap payload, so the rest of the path is unchanged.
+            const struct_ptr_val = if (self.isValueStructName(si.type_name))
+                try self.buildValueStructStorage(total_size)
+            else
+                try self.compileAlloc(size_val);
 
             for (si.fields) |f_init| {
                 const offset = try self.getFieldOffset(si.type_name, f_init.name);
@@ -3761,6 +3908,39 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             return core.LLVMConstInt(self.val_type, 0, 0);
         },
         .template_expr => |te| {
+            // Fast path: a template with a single interpolation and no surrounding literal text -- `${x}`
+            // -- does not need a StringBuilder. Convert the value to a string directly. This removes a
+            // StringBuilder alloc + append + toString + delete for every bare `${x}` (very common in
+            // templated markup: ids, prices, counts). Only strings/prims/decimals take it; optionals and
+            // anything else fall through to the general StringBuilder path below.
+            if (te.parts.len == 1 and te.parts[0].kind != .block_expr) {
+                if (self.typed_ir) |ir| {
+                    if (self.type_store) |st| {
+                        const part0 = te.parts[0];
+                        if (ir.typeOf(&part0)) |tid| {
+                            switch (st.get(tid)) {
+                                // NOTE: the `.string` case (retain-and-return the interpolated string) is
+                                // deliberately NOT fast-pathed -- aliasing an owned temporary as the template
+                                // result has subtle ownership pitfalls, so strings fall through to the safe
+                                // StringBuilder copy. prim/decimal produce a FRESH owned string (no aliasing),
+                                // so they are unambiguously safe to return directly.
+                                .prim => {
+                                    const v = try self.compileExpression(part0);
+                                    if (try self.numToStringT(v, tid)) |s| return s;
+                                },
+                                .decimal => {
+                                    const v = try self.compileExpression(part0);
+                                    const to_fn = self.func_map.get("nova_decimal_to_string").?;
+                                    const to_t = core.LLVMGlobalGetValueType(to_fn);
+                                    var da = [_]types.LLVMValueRef{v};
+                                    return core.LLVMBuildCall2(self.builder, to_t, to_fn, &da, 1, "dec_to_str");
+                                },
+                                else => {},
+                            }
+                        }
+                    }
+                }
+            }
             const sb_new = self.getFunc("StringBuilder_init") orelse {
                 std.debug.print("Error: 'StringBuilder_init' not found. Make sure to import collections/string_builder.\n", .{});
                 return error.StringBuilderNewNotFound;
@@ -4189,14 +4369,105 @@ pub fn compileAppendToStringBuilder(self: *LlvmCompiler, sb_val: types.LLVMValue
     _ = core.LLVMBuildCall2(self.builder, sb_append_t, sb_append, &args, 2, "");
 }
 
+// Append a value that is ALREADY a string into `sb`. StringBuilder.append COPIES the bytes and borrows
+// both args, so no retain belongs here (see the long note that used to live in compileJsxElement).
+pub fn jsxAppendVal(self: *LlvmCompiler, sb: types.LLVMValueRef, val: types.LLVMValueRef) !void {
+    const sb_append = self.getFunc("StringBuilder_append") orelse return error.StringBuilderAppendNotFound;
+    const append_t = core.LLVMGlobalGetValueType(sb_append);
+    var args = [_]types.LLVMValueRef{ sb, val };
+    _ = core.LLVMBuildCall2(self.builder, append_t, sb_append, &args, 2, "");
+}
+
+// Append a compile-time string literal into `sb`.
+pub fn jsxAppendLiteral(self: *LlvmCompiler, sb: types.LLVMValueRef, text: []const u8) !void {
+    const expr = ast.Expression{ .kind = .{ .literal = .{ .string = text } } };
+    const str_val = try self.compileExpression(expr);
+    try self.jsxAppendVal(sb, str_val);
+}
+
+// Append an interpolated `{expr}` child into `sb`: strings append directly; numeric/bool/etc. go through
+// numToString (a FRESH owned string that append copies, so it is released here to avoid a per-render leak).
+pub fn jsxAppendExpr(self: *LlvmCompiler, sb: types.LLVMValueRef, expr: *const ast.Expression) !void {
+    const val = try self.compileExpression(expr.*);
+    const type_name = try self.resolveExpressionTypeName(expr);
+    if (type_name) |t| {
+        if (std.mem.eql(u8, t, "string")) {
+            try self.jsxAppendVal(sb, val);
+            return;
+        } else if (types_mod.isPrimitiveTypeName(t) and !std.mem.eql(u8, t, "void") and !std.mem.eql(u8, t, "any")) {
+            const str_temp = try self.numToString(val, t);
+            try self.jsxAppendVal(sb, str_temp);
+            try self.compileRelease(str_temp, null);
+            return;
+        }
+    }
+    try self.jsxAppendVal(sb, val);
+}
+
+// Render the whole element tree DIRECTLY into `sb_val` -- ONE StringBuilder for every tag in the tree,
+// including the ones generated dynamically inside `{for ...}` statement children. A nested <element>
+// recurses into the SAME builder instead of building its own string and copying it up, which used to
+// cost one StringBuilder alloc + toString + copy + free PER nested tag (≈8 per card × 200 cards). This
+// is the render throughput fix: allocation/zeroing/ARC churn dominated the profile, and it all lived in
+// that per-element build-then-copy cascade.
+pub fn emitJsxInto(self: *LlvmCompiler, sb_val: types.LLVMValueRef, jsx: ast.JsxElement) anyerror!void {
+    const outer_sb = self.current_string_builder;
+    self.current_string_builder = sb_val;
+    defer self.current_string_builder = outer_sb;
+
+    const tag_open = try std.fmt.allocPrint(self.allocator, "<{s}", .{jsx.tag});
+    defer self.allocator.free(tag_open);
+    try self.jsxAppendLiteral(sb_val, tag_open);
+
+    for (jsx.attributes) |attr| {
+        const attr_prefix = try std.fmt.allocPrint(self.allocator, " {s}=\"", .{attr.name});
+        defer self.allocator.free(attr_prefix);
+        try self.jsxAppendLiteral(sb_val, attr_prefix);
+        switch (attr.value) {
+            .string_literal => |lit| try self.jsxAppendLiteral(sb_val, lit),
+            .expression => |*expr| try self.jsxAppendExpr(sb_val, expr),
+        }
+        try self.jsxAppendLiteral(sb_val, "\"");
+    }
+
+    if (jsx.children.len == 0) {
+        try self.jsxAppendLiteral(sb_val, "/>");
+        return;
+    }
+    try self.jsxAppendLiteral(sb_val, ">");
+    for (jsx.children) |child| {
+        switch (child) {
+            .text => |txt| try self.jsxAppendLiteral(sb_val, txt),
+            // A nested <element> renders into the SAME builder -- no child StringBuilder, no toString,
+            // no copy-up. This is the whole point of the single-builder render.
+            .element => |sub_el| try self.emitJsxInto(sb_val, sub_el),
+            .expression => |*expr| try self.jsxAppendExpr(sb_val, expr),
+            .statement => |stmt| {
+                // A `{for ...}`/`{if ...}` block. Its body appends into current_string_builder, which is
+                // sb_val here, so the dynamically generated tags land in the SAME single builder.
+                const dummy_func = FunctionInfo{
+                    .name = self.current_function_name orelse "main",
+                    .param_count = 0,
+                    .param_names = &[_][]const u8{},
+                    .return_type = "void",
+                    .body = ast.Block{ .statements = &[_]ast.Statement{}, .span = ast.Span{ .file = "", .line = 0, .col = 0, .start = 0, .end = 0 } },
+                };
+                try self.compileStatement(stmt, dummy_func);
+            },
+        }
+    }
+    const tag_close = try std.fmt.allocPrint(self.allocator, "</{s}>", .{jsx.tag});
+    defer self.allocator.free(tag_close);
+    try self.jsxAppendLiteral(sb_val, tag_close);
+}
+
+// The expression entry point for a JSX element: allocate ONE StringBuilder, render the whole tree into it
+// via emitJsxInto, then toString it once and return that string. Nested elements no longer allocate their
+// own builders -- see emitJsxInto.
 pub fn compileJsxElement(self: *LlvmCompiler, jsx: ast.JsxElement) anyerror!types.LLVMValueRef {
     const sb_new = self.getFunc("StringBuilder_init") orelse {
         std.debug.print("Error: 'StringBuilder_init' not found. Make sure to import collections/string_builder.\n", .{});
         return error.StringBuilderNewNotFound;
-    };
-    const sb_append = self.getFunc("StringBuilder_append") orelse {
-        std.debug.print("Error: 'StringBuilder_append' not found.\n", .{});
-        return error.StringBuilderAppendNotFound;
     };
     const sb_toString = self.getFunc("StringBuilder_toString") orelse {
         std.debug.print("Error: 'StringBuilder_toString' not found.\n", .{});
@@ -4213,121 +4484,7 @@ pub fn compileJsxElement(self: *LlvmCompiler, jsx: ast.JsxElement) anyerror!type
     var sb_args = [_]types.LLVMValueRef{sb_val};
     _ = core.LLVMBuildCall2(self.builder, sb_new_t, sb_new, &sb_args, 1, "");
 
-    const outer_sb = self.current_string_builder;
-    self.current_string_builder = sb_val;
-    defer self.current_string_builder = outer_sb;
-
-    // StringBuilder.append/appendChar COPY the bytes into the builder's own buffer (see
-    // std/collections/string_builder.nova) and borrow `self` — they neither store the argument pointer
-    // nor consume the builder. So NO retain belongs at these call sites: `self` stays alive for the whole
-    // element (freed once via StringBuilder_delete below), and the appended value is either a borrowed
-    // variable (its owner releases it) or an owned temporary already tracked in pending_temps by
-    // compileExpression (released at the enclosing statement's boundary). A retain here has no matching
-    // release and leaks one ref per append — which, over a view rendered per request, is a large,
-    // unbounded server leak. (This was masked before jsx_element was typed as `string`, which routed far
-    // more children through the retaining path.)
-    const append_val_fn = struct {
-        fn run(c: *LlvmCompiler, sb: types.LLVMValueRef, append_func: types.LLVMValueRef, val: types.LLVMValueRef) void {
-            const append_t = core.LLVMGlobalGetValueType(append_func);
-            var args = [_]types.LLVMValueRef{ sb, val };
-            _ = core.LLVMBuildCall2(c.builder, append_t, append_func, &args, 2, "");
-        }
-    }.run;
-
-    const append_literal_fn = struct {
-        fn run(c: *LlvmCompiler, sb: types.LLVMValueRef, append_func: types.LLVMValueRef, text: []const u8) !void {
-            const expr = ast.Expression{ .kind = .{ .literal = .{ .string = text } } };
-            const str_val = try c.compileExpression(expr);
-            const append_t = core.LLVMGlobalGetValueType(append_func);
-            var args = [_]types.LLVMValueRef{ sb, str_val };
-            _ = core.LLVMBuildCall2(c.builder, append_t, append_func, &args, 2, "");
-        }
-    }.run;
-
-    const append_expr_fn = struct {
-
-        fn run(c: *LlvmCompiler, sb: types.LLVMValueRef, append_func: types.LLVMValueRef, expr: *const ast.Expression) !void {
-            const val = try c.compileExpression(expr.*);
-            const type_name = try c.resolveExpressionTypeName(expr);
-            if (type_name) |t| {
-                if (std.mem.eql(u8, t, "string")) {
-                    append_val_fn(c, sb, append_func, val);
-                    return;
-                } else if (types_mod.isPrimitiveTypeName(t) and !std.mem.eql(u8, t, "void") and !std.mem.eql(u8, t, "any")) {
-                    // numToString mints a FRESH owned string (not tracked in pending_temps); append copies
-                    // it, so release it here or every numeric `{expr}` child leaks one string per render.
-                    const str_temp = try c.numToString(val, t);
-                    append_val_fn(c, sb, append_func, str_temp);
-                    try c.compileRelease(str_temp, null);
-                    return;
-                }
-            }
-
-            append_val_fn(c, sb, append_func, val);
-        }
-    }.run;
-
-    const tag_open = try std.fmt.allocPrint(self.allocator, "<{s}", .{jsx.tag});
-    defer self.allocator.free(tag_open);
-    try append_literal_fn(self, sb_val, sb_append, tag_open);
-
-    for (jsx.attributes) |attr| {
-        const attr_prefix = try std.fmt.allocPrint(self.allocator, " {s}=\"", .{attr.name});
-        defer self.allocator.free(attr_prefix);
-        try append_literal_fn(self, sb_val, sb_append, attr_prefix);
-
-        switch (attr.value) {
-            .string_literal => |lit| {
-                try append_literal_fn(self, sb_val, sb_append, lit);
-            },
-            .expression => |*expr| {
-                try append_expr_fn(self, sb_val, sb_append, expr);
-            },
-        }
-
-        try append_literal_fn(self, sb_val, sb_append, "\"");
-    }
-
-    const has_children = jsx.children.len > 0;
-    if (!has_children) {
-        try append_literal_fn(self, sb_val, sb_append, "/>");
-    } else {
-        try append_literal_fn(self, sb_val, sb_append, ">");
-
-        for (jsx.children) |child| {
-            switch (child) {
-                .text => |txt| {
-                    try append_literal_fn(self, sb_val, sb_append, txt);
-                },
-                .element => |sub_el| {
-                    // A nested <element> literal. compileJsxElement returns a FRESH owned string (its own
-                    // StringBuilder_toString) that nothing else holds and that append_val_fn copies into
-                    // this builder. It is built directly here (not via compileExpression), so it is not in
-                    // pending_temps — release it now, or every nested element leaks one string per render.
-                    const sub_str = try self.compileJsxElement(sub_el);
-                    append_val_fn(self, sb_val, sb_append, sub_str);
-                    try self.compileRelease(sub_str, null);
-                },
-                .expression => |*expr| {
-                    try append_expr_fn(self, sb_val, sb_append, expr);
-                },
-                .statement => |stmt| {
-                    const dummy_func = FunctionInfo{
-                        .name = self.current_function_name orelse "main",
-                        .param_count = 0,
-                        .param_names = &[_][]const u8{},
-                        .return_type = "void",
-                        .body = ast.Block{ .statements = &[_]ast.Statement{}, .span = ast.Span{ .file = "", .line = 0, .col = 0, .start = 0, .end = 0 } },
-                    };
-                    try self.compileStatement(stmt, dummy_func);
-                },
-            }
-        }
-
-        const tag_close = try std.fmt.allocPrint(self.allocator, "</{s}>", .{jsx.tag});
-        defer self.allocator.free(tag_close);
-        try append_literal_fn(self, sb_val, sb_append, tag_close);
-    }
+    try self.emitJsxInto(sb_val, jsx);
 
     const sb_toString_t = core.LLVMGlobalGetValueType(sb_toString);
     var toString_args = [_]types.LLVMValueRef{sb_val};
@@ -4336,10 +4493,9 @@ pub fn compileJsxElement(self: *LlvmCompiler, jsx: ast.JsxElement) anyerror!type
     const sb_delete_t = core.LLVMGlobalGetValueType(sb_delete);
     _ = core.LLVMBuildCall2(self.builder, sb_delete_t, sb_delete, &toString_args, 1, "");
 
-    // StringBuilder_delete frees the builder's INTERNAL buffer (and zeroes self.buf), but the builder
-    // STRUCT itself is a heap object from compileAlloc (nova_bytes_alloc) that nothing else owns or
-    // releases. Free it now with a null destructor — one leaked struct per NSX element would otherwise
-    // accumulate on every render (i.e. every request for a server-rendered view).
+    // StringBuilder_delete frees the builder's INTERNAL buffer; the builder STRUCT itself is a heap object
+    // from compileAlloc that nothing else owns, so release it here (null destructor) to avoid one leaked
+    // struct per rendered view.
     try self.compileRelease(sb_val, null);
 
     return final_str;

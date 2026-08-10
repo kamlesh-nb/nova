@@ -493,6 +493,160 @@ fn tdShadowDiff(self: *LlvmCompiler, t: typesys.TypeId) void {
     }
 }
 
+// M-1/M-10: a return expression is a CONFIRMED BORROW (its value lives outside this frame, so
+// returning it is safe) iff it is a variable/field/index read, or a call whose callee is NOT a
+// struct constructor (that callee returns its own safe value). Anything else -- a struct_init, a
+// `Ctor(...)` call, a ternary, etc. -- may materialise a fresh stack alloca, so it is conservatively
+// treated as a non-borrow (an escape). Failing safe here means an unclassified shape excludes.
+// M-1 fail-safe: a field type that is a trivially-copyable scalar primitive (no heap, no ARC, no
+// non-trivial copy). Only structs whose fields are ALL such scalars are value-lowered for now.
+fn isScalarFieldTypeName(name: []const u8) bool {
+    const scalars = [_][]const u8{ "int", "long", "short", "byte", "bool", "float", "double", "char", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64", "word", "usize", "isize" };
+    for (scalars) |s| if (std.mem.eql(u8, name, s)) return true;
+    return false;
+}
+
+fn calleeNamesStruct(self: *LlvmCompiler, callee: *const ast.Expression) bool {
+    if (callee.kind == .ident) return self.structs.contains(getStructBaseName(callee.kind.ident));
+    return false;
+}
+pub fn returnIsBorrow(self: *LlvmCompiler, expr: *const ast.Expression) bool {
+    return switch (expr.kind) {
+        // These never materialise a fresh value-struct stack alloca: reads, literals (incl.
+        // `undefined`), arithmetic, casts, ranges, and calls to a non-constructor callee (that
+        // callee returns its own safe value). A struct_init / `Ctor(...)` / selector (if_expr,
+        // nullish, tuple, closure, ...) may, so it falls to the conservative `false` -> excluded.
+        .literal, .ident, .binary, .unary, .field_access, .index, .cast, .range => true,
+        .call => |c| !calleeNamesStruct(self, c.callee),
+        .generic_call => |gc| !calleeNamesStruct(self, gc.callee),
+        else => false,
+    };
+}
+fn stmtHasNonBorrowReturn(self: *LlvmCompiler, stmt: *const ast.Statement) bool {
+    return switch (stmt.*) {
+        .return_stmt => |rs| if (rs.value) |*v| !returnIsBorrow(self, v) else false,
+        .block => |b| blockHasNonBorrowReturn(self, b.statements),
+        .if_stmt => |i| stmtHasNonBorrowReturn(self, i.then_branch) or
+            (if (i.else_branch) |e| stmtHasNonBorrowReturn(self, e) else false),
+        .while_stmt => |w| stmtHasNonBorrowReturn(self, w.body),
+        .for_stmt => |f| stmtHasNonBorrowReturn(self, f.body),
+        .switch_stmt => |s| blk: {
+            for (s.cases) |c| if (stmtHasNonBorrowReturn(self, c.body)) break :blk true;
+            if (s.default_case) |d| break :blk stmtHasNonBorrowReturn(self, d);
+            break :blk false;
+        },
+        else => false,
+    };
+}
+fn blockHasNonBorrowReturn(self: *LlvmCompiler, stmts: []const ast.Statement) bool {
+    for (stmts) |*st| if (stmtHasNonBorrowReturn(self, st)) return true;
+    return false;
+}
+
+// M-1: whole-program escape set. A value struct escapes (and must stay heap) when it is
+// CONSTRUCTED-and-returned (a fresh stack alloca that outlives the frame), stored as a direct
+// struct field, or used as a direct type-param field. A value struct returned only by borrow
+// (a container get, a field/var read) does NOT escape and can be value-lowered inline. Computed
+// once, lazily, only when the value-struct gate is on.
+fn computeValueEscapeSet(self: *LlvmCompiler) void {
+    var set = std.StringHashMap(void).init(self.allocator);
+    const addName = struct {
+        fn f(s: *LlvmCompiler, st: *std.StringHashMap(void), name: []const u8) void {
+            const base = getStructBaseName(name);
+            if (base.len == 0 or !s.structs.contains(base) or st.contains(base)) return;
+            const owned = s.allocator.dupe(u8, base) catch return;
+            st.put(owned, {}) catch {};
+        }
+    }.f;
+    // 1. a value struct that is CONSTRUCTED in a return position escapes (dangling stack alloca);
+    //    one returned only by borrow (e.g. List.at -> self.data.get(i)) does NOT, so it can inline.
+    for (self.functions.items) |f| {
+        const rbase = getStructBaseName(f.return_type);
+        const rsd = self.structs.get(rbase) orelse continue;
+        if (rsd.is_reference) continue; // classes are never value-lowered anyway
+        if (blockHasNonBorrowReturn(self, f.body.statements)) addName(self, &set, f.return_type);
+    }
+    // 2. every struct field type (a value struct stored as a field escapes with its container);
+    //    also: a struct that IMPLEMENTS A TRAIT can be widened to that trait's fat pointer, which
+    //    stores a pointer to the struct -> it must live on the heap, so exclude it from value-lowering.
+    var it = self.structs.iterator();
+    while (it.next()) |e| {
+        if (e.value_ptr.impls.len > 0) addName(self, &set, e.key_ptr.*);
+        for (e.value_ptr.fields) |fld| {
+            const fs = self.typeRefToString(fld.type_name) catch continue;
+            addName(self, &set, fs);
+            // Fail-safe: only a struct whose fields are ALL scalar primitives is value-lowered.
+            // A string/decimal/function/struct/container/optional field is owned or non-trivially
+            // copied, which the inline byte-copy path does not yet handle (leak/double-free/recursion),
+            // so any such field forces the whole struct to stay on the heap. (Owned-field value structs
+            // and larger inline elements are a later slice.)
+            if (!isScalarFieldTypeName(fs)) addName(self, &set, e.key_ptr.*);
+        }
+    }
+    // 3. Generic struct args that land in a DIRECT type-param field escape (that field is a raw
+    //    8-byte slot holding a pointer to a stack alloca -> dangling). But a type param used only
+    //    inside a container (e.g. `data: Storage<T>`) is inline-safe (M-10), so it does NOT escape.
+    //    Storage<X> elements themselves are inline (M-10) and are NOT excluded. renderLegacy returns
+    //    a BORROWED string — do not free it.
+    if (self.type_store) |store| {
+        const n = store.count();
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const id: typesys.TypeId = @enumFromInt(i);
+            switch (store.get(id)) {
+                .struct_ => |s| {
+                    if (s.args.len == 0) continue;
+                    const inst = sema_shadow.renderLegacy(self.allocator, store, id) catch continue;
+                    const decl = self.structs.get(getStructBaseName(inst)) orelse continue;
+                    for (decl.fields) |fld| {
+                        // A field typed DIRECTLY as a bare type param (`p: T`) makes that param escape.
+                        const tp_name: ?[]const u8 = switch (fld.type_name) {
+                            .ident => |nm| nm,
+                            else => null,
+                        };
+                        if (tp_name) |tpn| {
+                            for (decl.type_params, 0..) |p, pi| {
+                                if (std.mem.eql(u8, p, tpn) and pi < s.args.len) {
+                                    const an = sema_shadow.renderLegacy(self.allocator, store, s.args[pi]) catch continue;
+                                    addName(self, &set, an);
+                                }
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    self.value_escape_set = set;
+}
+
+// M-1: a value-lowered struct by base name (rollout-gated). When disabled (default) this is
+// always false, so codegen is unchanged. Escaping structs are excluded (safety, see above).
+pub fn isValueStructName(self: *LlvmCompiler, name: []const u8) bool {
+    if (!arc_mod.value_structs_enabled) return false;
+    const base = getStructBaseName(name);
+    const sd = self.structs.get(base) orelse return false;
+    if (sd.is_reference) return false; // `class` stays a reference type
+    if (self.value_escape_set == null) computeValueEscapeSet(self);
+    if (self.value_escape_set.?.contains(base)) return false; // escapes -> keep on heap
+    if (arc_mod.value_structs_all) return true;
+    if (arc_mod.value_type_set) |set| return set.contains(base);
+    return false;
+}
+
+// M-1: same decision from a struct TypeId (for ownership). Only pays the name render when the
+// rollout gate is on; off by default => zero overhead on the hot ownership path.
+pub fn isValueStructTid(self: *LlvmCompiler, t: typesys.TypeId) bool {
+    if (!arc_mod.value_structs_enabled) return false;
+    const st = self.type_store orelse return false;
+    if (st.get(t) != .struct_) return false;
+    // renderLegacy may return a BORROWED (interned) or static string — never free it, matching
+    // every other codegen caller. Freeing it corrupts sema's name cache (method resolution reads it).
+    const nm = sema_shadow.renderLegacy(self.allocator, st, t) catch return false;
+    return self.isValueStructName(nm);
+}
+
 pub fn isOwnedTypeId(self: *LlvmCompiler, t: typesys.TypeId) bool {
     const st = self.type_store.?;
     if (sema_shadow.report_enabled) tdShadowDiff(self, t);
@@ -521,6 +675,12 @@ pub fn isOwnedTypeId(self: *LlvmCompiler, t: typesys.TypeId) bool {
         .enum_ => st.isOwned(t),
 
         .optional => |inner| if (self.valueOptionalInner(t) != null) true else self.isOwnedTypeId(inner),
+
+        // M-1: a value-lowered struct is NOT owned — inline storage, no ARC (no retain/release/free).
+        // Its owned FIELDS are still dropped by the struct's generated destructor when it is a
+        // reference; a value struct with owned fields is out of scope for the initial rollout
+        // (all-primitive value structs only), so this simple gate suffices for now.
+        .struct_ => if (self.isValueStructTid(t)) false else st.isOwned(t),
 
         else => st.isOwned(t),
     };

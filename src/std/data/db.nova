@@ -26,7 +26,10 @@ pub struct DbValue {
     pub f: double,
     pub dec: decimal,
     pub s: string,
-    pub arr: List<DbValue>,   // element values when kind == Array (empty otherwise)
+    // element values when kind == Array. LAZY: `undefined` for the common scalar case so a plain cell
+    // does NOT allocate an empty list. A result set is ~columns×rows scalar cells, and eagerly allocating
+    // an empty List per cell was ~2000 wasted allocations per query on the driver decode hot path.
+    pub arr: List<DbValue> | undefined,
 
     init(kind: DbType, i: long, f: double, dec: decimal, s: string) {
         self.kind = kind;
@@ -34,7 +37,7 @@ pub struct DbValue {
         self.f = f;
         self.dec = dec;
         self.s = s;
-        self.arr = List<DbValue>();
+        self.arr = undefined;
     }
 
     // Fluent: attach array elements. Returns self so `dbArray` composes without a second init.
@@ -64,8 +67,16 @@ pub struct DbValue {
     pub fn asTimestamp(self: DbValue): string { return self.s; }
     pub fn asUuid(self: DbValue): string { return self.s; }   // canonical UUID string
     pub fn asJson(self: DbValue): string { return self.s; }   // raw JSON text
-    pub fn asArray(self: DbValue): List<DbValue> { return self.arr; }   // element values (kind == Array)
-    pub fn arrayLen(self: DbValue): int { return self.arr.size(); }
+    pub fn asArray(self: DbValue): List<DbValue> {   // element values (kind == Array)
+        let a = self.arr;
+        if (a != undefined) { return a; }
+        return List<DbValue>();
+    }
+    pub fn arrayLen(self: DbValue): int {
+        let a = self.arr;
+        if (a != undefined) { return a.size(); }
+        return 0;
+    }
 
     // NULL-aware accessors: return the supplied default when the value is SQL NULL, instead of the
     // silent 0/"" the plain accessors give (which cannot distinguish NULL from a real 0 / empty string).

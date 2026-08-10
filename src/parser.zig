@@ -346,7 +346,7 @@ pub const Parser = struct {
                 fd.attributes = attrs;
                 return ast.Declaration{ .fn_decl = fd };
             },
-            .keyword_struct => {
+            .keyword_struct, .keyword_class => {
                 var sd = try self.parseStructDecl(is_public);
                 sd.attributes = attrs;
                 return ast.Declaration{ .struct_decl = sd };
@@ -584,7 +584,11 @@ pub const Parser = struct {
 
     fn parseStructDecl(self: *Parser, is_public: bool) ParserError!ast.StructDecl {
         const start_span = self.span();
-        try self.expect(.keyword_struct);
+        // `class` = reference type (heap + ARC + identity); `struct` = value type.
+        // See memory-management-refinements.md (M-1/M-2). The bit is recorded here and
+        // ignored by codegen until Slice 3 wires value-type lowering.
+        const is_class = (self.current().type == .keyword_class);
+        if (is_class) try self.expect(.keyword_class) else try self.expect(.keyword_struct);
         const name = self.current().lexeme;
         try self.expect(.identifier);
         var type_params = std.ArrayList([]const u8).empty;
@@ -689,6 +693,7 @@ pub const Parser = struct {
             .attributes = &.{},
             .impls = try impls.toOwnedSlice(self.allocator),
             .is_public = is_public,
+            .is_reference = is_class,
             .type_params = try type_params.toOwnedSlice(self.allocator),
             .span = .{
                 .start = start_span.start,

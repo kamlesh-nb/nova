@@ -2,7 +2,7 @@
 import bytes;
 import assert;
 
-pub struct StringBuilder {
+pub class StringBuilder {
     pub buf: ptr,
     pub len: int,
     pub cap: int,
@@ -10,18 +10,17 @@ pub struct StringBuilder {
     init() {
         self.cap = 16;
         self.len = 0;
-        self.buf = bytes.alloc_persistent(16);
+        self.buf = bytes.alloc_persistent_nz(16);
     }
 
     pub fn append(self: StringBuilder, s: string): void {
         let slen = s.length;
         if (slen == 0) return;
         self.ensureCapacity(self.len + slen);
-        let i = 0;
-        while (i < slen) {
-            bytes.write_byte(self.buf, self.len + i, bytes.read_byte(s, i));
-            i = i + 1;
-        }
+        // Bulk memcpy the string's bytes in at the write cursor. The old per-byte loop made append O(n)
+        // Nova calls and was the response-render throughput ceiling. `(buf as long)+(len as long)` keeps
+        // the destination address 64-bit (an int add would truncate a >4GB heap address).
+        bytes.copy((self.buf as long) + (self.len as long), s as long, slen);
         self.len = self.len + slen;
     }
 
@@ -34,12 +33,8 @@ pub struct StringBuilder {
     pub fn toString(self: StringBuilder): string {
         if (self.len == 0) return "";
 
-        let sptr = bytes.alloc_persistent(self.len);
-        let i = 0;
-        while (i < self.len) {
-            bytes.write_byte(sptr, i, bytes.read_byte(self.buf, i));
-            i = i + 1;
-        }
+        let sptr = bytes.alloc_persistent_nz(self.len);
+        bytes.copy(sptr as long, self.buf as long, self.len);
         return sptr as string;
     }
 
@@ -47,12 +42,8 @@ pub struct StringBuilder {
         if (minCap <= self.cap) return;
         let newCap = self.cap * 2;
         if (newCap < minCap) newCap = minCap;
-        let newBuf = bytes.alloc_persistent(newCap);
-        let i = 0;
-        while (i < self.len) {
-            bytes.write_byte(newBuf, i, bytes.read_byte(self.buf, i));
-            i = i + 1;
-        }
+        let newBuf = bytes.alloc_persistent_nz(newCap);
+        bytes.copy(newBuf as long, self.buf as long, self.len);
         if (self.buf != 0) {
             bytes.free(self.buf);
         }

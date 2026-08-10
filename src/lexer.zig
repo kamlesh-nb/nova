@@ -8,6 +8,7 @@ pub const TokenType = enum {
     keyword_spawn,
     keyword_extern,
     keyword_struct,
+    keyword_class,
     keyword_import,
     keyword_trait,
     keyword_impl,
@@ -699,6 +700,7 @@ fn tokenTypeFromKeyword(lexeme: []const u8) TokenType {
     if (std.mem.eql(u8, lexeme, "spawn")) return .keyword_spawn;
     if (std.mem.eql(u8, lexeme, "extern")) return .keyword_extern;
     if (std.mem.eql(u8, lexeme, "struct")) return .keyword_struct;
+    if (std.mem.eql(u8, lexeme, "class")) return .keyword_class;
     if (std.mem.eql(u8, lexeme, "import")) return .keyword_import;
     if (std.mem.eql(u8, lexeme, "trait")) return .keyword_trait;
     if (std.mem.eql(u8, lexeme, "impl")) return .keyword_impl;

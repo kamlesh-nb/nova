@@ -56,6 +56,13 @@ pub const StructDecl = struct {
     impls: []TraitImpl,
     is_public: bool,
 
+    // Value vs reference semantics (M-1/M-2, memory-management-refinements.md).
+    // `class` declarations are reference types (heap + ARC + identity); `struct`
+    // declarations are value types. Defaults to true so any synthetically built
+    // StructDecl (tuples, closures, serde helpers) keeps today's reference behaviour.
+    // Codegen ignores this bit until Slice 3 wires value-type lowering.
+    is_reference: bool = true,
+
     type_params: []const []const u8 = &.{},
     span: Span,
 };

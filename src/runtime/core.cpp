@@ -267,6 +267,8 @@ extern "C" void nova_io_watchdog_start(void) {
   if (!std::getenv("NOVA_IO_WATCHDOG")) return;
   bool expected = false;
   if (!g_io_watchdog_started.compare_exchange_strong(expected, true)) return;
+  // M-4: the watchdog runs on its own thread; switch ARC to atomic before it starts.
+  nova_arc_go_multithreaded();
   std::thread([] {
     long long prev_i = -1, prev_c = -1;
     for (;;) {

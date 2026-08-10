@@ -1313,6 +1313,20 @@ pub fn releaseLocalVariables(self: *LlvmCompiler) anyerror!void {
 pub var elide_enabled: bool = false;
 pub var elide_count: usize = 0;
 
+// ---------------------------------------------------------------------------
+// M-1 value-type structs (memory-management-refinements.md) — per-type rollout gate.
+//
+// A `struct` (is_reference == false) becomes a VALUE type: allocated inline (stack alloca),
+// no ARC header, no retain/release/free. A `class` (is_reference == true) stays a reference type.
+// Because a naive global flip breaks every mutating method and every alias-mutation at once, the
+// flip is rolled out per type behind these gates, verified one type at a time:
+//   NOVA_VALUE_STRUCTS_ALL  -> every is_reference==false struct is value-lowered.
+//   NOVA_VALUE_TYPES=A,B,C  -> only the named base types are value-lowered.
+// Default (neither set): value_structs_enabled == false, so codegen is UNCHANGED (all reference).
+pub var value_structs_enabled: bool = false;
+pub var value_structs_all: bool = false;
+pub var value_type_set: ?std.StringHashMap(void) = null;
+
 // Gated by NOVA_ASAN_CODEGEN (requires an ASAN/debug build so __asan_* resolve): when set, emitModule
 // tags every defined function with `sanitize_address` and runs LLVM's `asan` pass, so use-after-free /
 // out-of-bounds in NOVA-GENERATED code (not just the runtime) is caught with alloc/free provenance.

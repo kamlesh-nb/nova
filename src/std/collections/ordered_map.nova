@@ -5,7 +5,7 @@
 
 import list;
 
-pub struct OrderedMap<K, V> {
+pub class OrderedMap<K, V> {
     pub ks: List<K>,
     pub vs: List<V>,
     pub less: (K, K) -> bool,

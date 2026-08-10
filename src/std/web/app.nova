@@ -287,7 +287,6 @@ async fn handleConn(app: App, io: AsyncIO): int {
 
     let _ = io.setTimeout(tmo);
     while (alive) {
-
         let hdrEnd = request.bufFindHeaderEnd(buf, 0, len);
         while (hdrEnd == -1) {
             if (len >= app.maxHeaderBytes || len >= cap) {

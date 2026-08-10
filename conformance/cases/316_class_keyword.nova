@@ -1,0 +1,55 @@
+// M-1/M-2 Slice 1: the `class` keyword parses as a reference-type struct declaration.
+//
+// `class` is the reference-type spelling of a struct (heap + ARC + identity); `struct` is the
+// value-type spelling. See docs/design/memory-management-refinements.md. In Slice 1 the parser
+// records the distinction on StructDecl.is_reference but codegen ignores it, so a `class` behaves
+// exactly like today's struct: this case pins that a class declaration parses, type-checks, holds
+// owned fields, dispatches methods, and implements traits. When Slice 3 wires value-type lowering,
+// this case keeps the reference path honest.
+import assert;
+import list;
+import string;
+
+pub class Point {
+    x: int,
+    y: int,
+    init(x: int, y: int) { self.x = x; self.y = y; }
+    pub fn sum(self: Point): int { return self.x + self.y; }
+}
+
+// A class holding an owned (reference) field, to exercise ARC through the reference path.
+pub class Bag {
+    items: list.List<string>,
+    init() { self.items = list.List<string>(); }
+    pub fn add(self: Bag, s: string): void { self.items.push(s); }
+    pub fn count(self: Bag): int { return self.items.size(); }
+}
+
+trait Named { fn name(self): string; }
+
+pub class Widget impl Named {
+    label: string,
+    init(label: string) { self.label = label; }
+    fn name(self: Widget): string { return self.label; }
+}
+
+@test
+fn test_class_value_fields() {
+    let p = Point(3, 4);
+    assert.equalInt(p.sum(), 7);
+}
+
+@test
+fn test_class_owned_field() {
+    let b = Bag();
+    b.add("a");
+    b.add("b");
+    assert.equalInt(b.count(), 2);
+}
+
+@test
+fn test_class_trait_dispatch() {
+    let w = Widget("gear");
+    let n: Named = w;
+    assert.equalStr(n.name(), "gear");
+}

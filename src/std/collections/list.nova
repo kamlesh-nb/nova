@@ -1,7 +1,7 @@
 
 import bytes;
 
-pub struct List<T> {
+pub class List<T> {
 
     pub data: Storage<T>,
     pub len: int,
