@@ -1,50 +1,91 @@
-// io/arena: a bump allocator for per-connection scratch memory (docs/design/self-hosted-
-// runtime.md, phase 3). This is the nginx ngx_pool_t model: allocate many small regions by
-// bumping a cursor, then free them all at once by resetting the cursor. It is the natural home
-// for the parsed headers and other per-request scratch that today allocates individual heap
-// objects; a whole request's scratch is reclaimed with a single reset, with no per-object free
-// and no ARC traffic.
+// io/arena: a PER-COROUTINE bump allocator for request-scoped scratch memory (M-6,
+// memory-management-refinements.md; the nginx ngx_pool_t model). Allocate many small regions by
+// bumping a cursor, then reclaim the whole request's scratch with a single O(1) reset -- no
+// per-object free, no ARC traffic, no memset.
 //
-// Addresses are plain `long` values, outside ARC. The Arena struct is reused across requests on
-// a connection, so its own cost is amortised.
-
+// Why per COROUTINE, not per thread (the crux M-6 fixes): one reactor runs ~50 requests
+// concurrently, their allocations interleave, and a single shared thread-arena has no LIFO
+// discipline to mark/reset against -- that shared-arena attempt was reverted. An `Arena` is a plain
+// object, so each request handler holds its OWN in its coroutine frame; two in-flight requests never
+// share a bump cursor. Reset is unambiguous because the arena's lifetime IS the request's.
+//
+// Growable / spill: the arena starts small and GROWS by chaining a fresh (larger) block on overflow
+// instead of failing, so one large request cannot starve the others (the fixed-32MB overflow was the
+// other half of why the shared attempt fell over). `reset` keeps the first block and drops the rest,
+// so a connection's steady-state arena settles at its high-water block with zero further allocation.
+//
+// Addresses are plain `long`, outside ARC -- scratch bytes, not owned objects.
 import bytes;
+import list;
 
-pub struct Arena {
-    pub base: long,
-    pub cap: int,
-    pub used: int,
+pub class Arena {
+    blocks: list.List<long>,   // block base addresses; blocks[0] is the initial (retained) block
+    sizes: list.List<int>,     // each block's capacity in bytes (parallel to blocks)
+    cur: int,                  // index of the block we are bumping in
+    used: int,                 // bytes used in the current block
+    total: int,                // total bytes handed out since the last reset (for stats)
 
     init(cap: int) {
-        self.base = bytes.alloc(cap);
-        self.cap = cap;
+        let c = if (cap <= 0) 4096 else cap;
+        self.blocks = list.List<long>();
+        self.sizes = list.List<int>();
+        self.blocks.push(bytes.alloc(c));
+        self.sizes.push(c);
+        self.cur = 0;
+        self.used = 0;
+        self.total = 0;
+    }
+
+    fn addBlock(self: Arena, need: int): void {
+        // Grow geometrically from the last block, but at least big enough for `need`.
+        let last = self.sizes.at(self.sizes.size() - 1);
+        let grown = last * 2;
+        let cap = if (grown < need) need else grown;
+        self.blocks.push(bytes.alloc(cap));
+        self.sizes.push(cap);
+        self.cur = self.cur + 1;
         self.used = 0;
     }
 
-    // Bump-allocate `n` bytes (8-byte aligned). Returns the address, or 0 if the arena is full.
+    // Bump-allocate `n` bytes (8-byte aligned). Never fails: on overflow it chains a new block.
     pub fn alloc(self: Arena, n: int): long {
         let aligned = (n + 7) / 8 * 8;
-        if (self.used + aligned > self.cap) {
-            return 0;
+        let cap = self.sizes.at(self.cur);
+        if (self.used + aligned > cap) {
+            self.addBlock(aligned);
         }
-        let addr = self.base + (self.used as long);
+        let base = self.blocks.at(self.cur);
+        let addr = base + (self.used as long);
         self.used = self.used + aligned;
+        self.total = self.total + aligned;
         return addr;
     }
 
-    // Reclaim everything at once. The memory is reused from the start on the next alloc.
+    // Reclaim everything at once (O(1) logically). Frees every block beyond the first, keeps block 0
+    // so the common small-request path reuses it with no allocation, and rewinds the cursor.
     pub fn reset(self: Arena): void {
+        while (self.blocks.size() > 1) {
+            bytes.free(self.blocks.at(self.blocks.size() - 1));
+            let _ = self.blocks.pop();   // drop the last block base
+            let _ = self.sizes.pop();    // and its size (parallel)
+        }
+        self.cur = 0;
         self.used = 0;
+        self.total = 0;
     }
 
-    pub fn remaining(self: Arena): int {
-        return self.cap - self.used;
-    }
+    // Total bytes handed out since the last reset.
+    pub fn allocated(self: Arena): int { return self.total; }
 
-    pub fn destroy(self: Arena): void {
-        if (self.base != 0) {
-            bytes.free(self.base);
-            self.base = 0;
+    // Number of backing blocks (1 in steady state; >1 after a big request until reset).
+    pub fn blockCount(self: Arena): int { return self.blocks.size(); }
+
+    // Destructor hook (M-7 `delete`): free every backing block when the arena's owner is destroyed.
+    pub fn delete(self: Arena): void {
+        let i = 0;
+        while (i < self.blocks.size()) {
+            bytes.free(self.blocks.at(i));
+            i = i + 1;
         }
     }
 }

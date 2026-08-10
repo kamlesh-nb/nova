@@ -1,0 +1,52 @@
+// M-6 (memory-management-refinements.md): a PER-COROUTINE region arena. Each request handler holds
+// its OWN Arena in its coroutine frame, so concurrent requests never share a bump cursor (the crux
+// that sank the reverted shared-thread-arena). The arena GROWS on overflow instead of failing (so one
+// big request cannot starve others) and reclaims a whole request's scratch with a single O(1) reset.
+import assert;
+import io.arena;
+import bytes;
+
+// Two independent arenas do not interfere -- the per-coroutine isolation the shared arena lacked.
+@test
+fn test_two_arenas_isolated(): void {
+    let a = arena.Arena(64);
+    let b = arena.Arena(64);
+    let pa = a.alloc(16);
+    let pb = b.alloc(16);
+    bytes.write_byte(pa as ptr, 0, 65);   // 'A' in arena a
+    bytes.write_byte(pb as ptr, 0, 66);   // 'B' in arena b
+    assert.equalInt(bytes.read_byte(pa as ptr, 0), 65);
+    assert.equalInt(bytes.read_byte(pb as ptr, 0), 66);  // unaffected by a
+    assert.equalInt(a.allocated(), 16);
+    assert.equalInt(b.allocated(), 16);
+}
+
+// Overflow GROWS the arena (chains a new block) rather than returning 0.
+@test
+fn test_arena_grows_on_overflow(): void {
+    let a = arena.Arena(64);          // small initial block
+    assert.equalInt(a.blockCount(), 1);
+    let i = 0;
+    while (i < 20) {                  // 20 * 16 = 320 bytes > 64 -> must chain blocks
+        let p = a.alloc(16);
+        assert.isTrue(p != 0);        // never fails
+        i = i + 1;
+    }
+    assert.isTrue(a.blockCount() > 1);      // grew
+    assert.equalInt(a.allocated(), 320);
+}
+
+// A single O(1) reset reclaims everything and settles back to one block for reuse.
+@test
+fn test_reset_reclaims_and_settles(): void {
+    let a = arena.Arena(64);
+    let j = 0;
+    while (j < 20) { let _ = a.alloc(16); j = j + 1; }
+    assert.isTrue(a.blockCount() > 1);
+    a.reset();
+    assert.equalInt(a.blockCount(), 1);     // dropped extra blocks, kept block 0
+    assert.equalInt(a.allocated(), 0);
+    let p = a.alloc(8);                     // reuses block 0 with no new allocation
+    assert.isTrue(p != 0);
+    assert.equalInt(a.blockCount(), 1);
+}
