@@ -24,6 +24,10 @@ pub fn buildValueStructStorage(self: *LlvmCompiler, size: u32) anyerror!types.LL
     const n: c_uint = if (size == 0) 8 else @intCast(size);
     const arr_t = core.LLVMArrayType(self.i8_type, n);
     const a = core.LLVMBuildAlloca(self.builder, arr_t, "vstruct");
+    // Zero-init: a heap struct's fresh memory is zeroed, so an owned field's init assignment (which
+    // "releases the old value" before storing the new) sees old = null (a no-op). A raw alloca is
+    // garbage, so without this the first owned-field write would nova_release a junk pointer (SIGSEGV).
+    _ = core.LLVMBuildStore(self.builder, core.LLVMConstNull(arr_t), a);
     return core.LLVMBuildPtrToInt(self.builder, a, self.val_type, "vstruct_addr");
 }
 
@@ -1102,9 +1106,10 @@ pub fn compileExpression(self: *LlvmCompiler, expr: ast.Expression) anyerror!typ
         .owned => {},
     }
     const t = (try self.resolveExpressionTypeName(&expr)) orelse return val;
-    // M-1: a value struct is never ARC-owned, so it must not be registered as a temporary that the
-    // end-of-statement drain would nova_release -- that would free a stack alloca (SIGBUS).
-    if (self.isValueStructName(t)) return val;
+    // M-1: a scalar-only value struct is never ARC-owned -- don't register it (a drain nova_release
+    // would free a stack alloca -> SIGBUS). An owned-field value struct IS registered so the drain
+    // drops its owned FIELDS (via dropValueStruct, not nova_release -- see drainTemporaries).
+    if (self.isValueStructName(t) and !self.valueStructHasOwnedFields(t)) return val;
     const slot = try spillTemp(self, val);
     try self.pending_temps.append(self.allocator, .{ .val = val, .slot = slot, .type_name = t, .expr_id = expr.id });
     return val;
@@ -1269,10 +1274,15 @@ pub fn drainTemporaries(self: *LlvmCompiler, mark: usize) anyerror!void {
 
         if (sema_shadow.report_enabled) diffDtorName(self, t);
 
-        const dest = drainDtor(self, t) catch null;
-
         const loaded = core.LLVMBuildLoad2(self.builder, self.val_type, t.slot, "tmp_rel");
-        try self.compileRelease(loaded, dest);
+        // M-1: an owned-field value struct temp is inline stack storage -- drop its owned fields via
+        // the destructor directly, never nova_release (which would free a stack address).
+        if (self.isValueStructName(t.type_name)) {
+            try self.dropValueStruct(loaded, t.type_name, null);
+        } else {
+            const dest = drainDtor(self, t) catch null;
+            try self.compileRelease(loaded, dest);
+        }
 
         _ = core.LLVMBuildStore(self.builder, core.LLVMConstInt(self.val_type, 0, 0), t.slot);
     }
@@ -2136,8 +2146,11 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                             const off = core.LLVMBuildMul(self.builder, idx, width, "stg_s_off");
                             const addr = core.LLVMBuildAdd(self.builder, base, off, "stg_s_addr");
                             if (inline_vs) {
-                                // memcpy the element's bytes into the slot (buffer now owns the copy).
+                                // memcpy the element's bytes into the slot, then retain its owned
+                                // (reference) fields so the buffer owns them; the caller's element temp
+                                // drops its own refs, keeping the ledger balanced (uniform copy semantics).
                                 _ = try self.buildValueStructCopyInto(addr, val, @intCast(slot_w));
+                                try self.retainValueStructOwnedFields(addr, elem);
                                 return core.LLVMConstInt(self.val_type, 0, 0);
                             }
                             const ptr = core.LLVMBuildIntToPtr(self.builder, addr, core.LLVMPointerType(self.val_type, 0), "stg_s_ptr");

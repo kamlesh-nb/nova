@@ -79,15 +79,16 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
 
                         for (names) |n| {
                             if (lt.get(n)) |vt| {
-
-                                if (self.isOwnedLocal(n, vt)) {
+                                // A value struct with owned fields also needs a scope-end drop (to
+                                // release those fields via dropValueStruct, not nova_release).
+                                if (self.isOwnedLocal(n, vt) or (self.isValueStructName(vt) and self.valueStructHasOwnedFields(vt))) {
                                     const sc = &self.scopes.items[self.scopes.items.len - 1];
                                     try sc.owned_locals.append(self.allocator, .{ .name = n, .type_name = vt });
                                 }
                             }
                         }
                     } else if (lt.get(ls.name)) |vt| {
-                        if (self.isOwnedLocal(ls.name, vt)) {
+                        if (self.isOwnedLocal(ls.name, vt) or (self.isValueStructName(vt) and self.valueStructHasOwnedFields(vt))) {
                             const sc = &self.scopes.items[self.scopes.items.len - 1];
                             try sc.owned_locals.append(self.allocator, .{ .name = ls.name, .type_name = vt });
                         }
@@ -224,6 +225,9 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
                         if (self.isValueStructName(tt) and self.returnIsBorrow(&init)) {
                             const vsz = self.getTypeSize(ast.TypeRef{ .ident = getStructBaseName(tt) }, false);
                             val = try self.buildValueStructCopy(val, vsz);
+                            // Owned (reference) fields are now aliased by source + copy; retain them
+                            // in the copy so its own scope-end drop is balanced (uniform copy semantics).
+                            try self.retainValueStructOwnedFields(val, tt);
                         }
                     }
 

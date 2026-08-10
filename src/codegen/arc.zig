@@ -373,7 +373,51 @@ fn storageElem(type_name: []const u8) ?[]const u8 {
     return type_name["Storage<".len .. type_name.len - 1];
 }
 
+// M-1: destructor loop for INLINE value-struct elements. Each element lives IN the buffer at
+// `elem_width` bytes; releasing it means calling the element's destructor DIRECTLY on the slot
+// address to drop its owned fields -- never nova_release (the slot is inline bytes, not a pointer).
+fn buildInlineValueStructStorageLoop(self: *LlvmCompiler, dest_fn: types.LLVMValueRef, elem: []const u8) anyerror!void {
+    const elem_dest = (try self.getOrCreateDestructor(elem)) orelse return;
+    const dest_ft = core.LLVMGlobalGetValueType(elem_dest);
+    const width_u = @max(self.getTypeSize(ast.TypeRef{ .ident = getStructBaseName(elem) }, false), 1);
+    const width = core.LLVMConstInt(self.val_type, width_u, 0);
+    const self_val = core.LLVMGetParam(dest_fn, 0);
+
+    const four = core.LLVMConstInt(self.val_type, 4, 0);
+    const len_addr = core.LLVMBuildSub(self.builder, self_val, four, "istg_len_addr");
+    const len_ptr = core.LLVMBuildIntToPtr(self.builder, len_addr, core.LLVMPointerType(self.i32_type, 0), "istg_len_ptr");
+    const len_i32 = core.LLVMBuildLoad2(self.builder, self.i32_type, len_ptr, "istg_len");
+    const len_val = core.LLVMBuildZExt(self.builder, len_i32, self.val_type, "istg_len_ext");
+    const n_slots = core.LLVMBuildUDiv(self.builder, len_val, width, "istg_slots");
+
+    const i_alloca = core.LLVMBuildAlloca(self.builder, self.val_type, "istg_i");
+    _ = core.LLVMBuildStore(self.builder, core.LLVMConstInt(self.val_type, 0, 0), i_alloca);
+    const cond_bb = core.LLVMAppendBasicBlock(dest_fn, "istg_cond");
+    const body_bb = core.LLVMAppendBasicBlock(dest_fn, "istg_body");
+    const exit_bb = core.LLVMAppendBasicBlock(dest_fn, "istg_exit");
+    _ = core.LLVMBuildBr(self.builder, cond_bb);
+    core.LLVMPositionBuilderAtEnd(self.builder, cond_bb);
+    const i_cur = core.LLVMBuildLoad2(self.builder, self.val_type, i_alloca, "istg_i_cur");
+    const cmp = core.LLVMBuildICmp(self.builder, types.LLVMIntPredicate.LLVMIntULT, i_cur, n_slots, "istg_cmp");
+    _ = core.LLVMBuildCondBr(self.builder, cmp, body_bb, exit_bb);
+    core.LLVMPositionBuilderAtEnd(self.builder, body_bb);
+    const i_b = core.LLVMBuildLoad2(self.builder, self.val_type, i_alloca, "istg_i_b");
+    const off = core.LLVMBuildMul(self.builder, i_b, width, "istg_off");
+    const slot_addr = core.LLVMBuildAdd(self.builder, self_val, off, "istg_slot_addr");
+    var args = [_]types.LLVMValueRef{slot_addr};
+    _ = core.LLVMBuildCall2(self.builder, dest_ft, elem_dest, &args, 1, "");
+    const i_next = core.LLVMBuildAdd(self.builder, i_b, core.LLVMConstInt(self.val_type, 1, 0), "istg_i_next");
+    _ = core.LLVMBuildStore(self.builder, i_next, i_alloca);
+    _ = core.LLVMBuildBr(self.builder, cond_bb);
+    core.LLVMPositionBuilderAtEnd(self.builder, exit_bb);
+}
+
 fn buildStorageDestructor(self: *LlvmCompiler, dest_fn: types.LLVMValueRef, elem: []const u8) anyerror!void {
+    // M-1: an inline value-struct element is NOT a pointer -- drop its owned fields in place.
+    if (self.isValueStructName(elem)) {
+        if (self.valueStructHasOwnedFields(elem)) try buildInlineValueStructStorageLoop(self, dest_fn, elem);
+        return; // scalar-only inline element: nothing to release
+    }
     // See buildStorageDestructorByTypeId: a value-optional element is a heap box the container owns and
     // must free on drop (a plain value-optional's destructor is null, which frees the box).
     const should_free = self.isOwnedStorageElemByName(elem) or valueOptionalName(elem);
@@ -1240,11 +1284,27 @@ pub fn buildErrUnion(self: *LlvmCompiler, val: types.LLVMValueRef, is_err: bool,
     return box;
 }
 
+// M-1: drop a value struct -- call its destructor DIRECTLY to release owned (reference) fields,
+// but do NOT nova_release/free it (it is inline stack storage, not a heap object with a header).
+pub fn dropValueStruct(self: *LlvmCompiler, struct_addr: types.LLVMValueRef, type_name: []const u8, tid: ?typesys.TypeId) anyerror!void {
+    const dest = (try self.getOrCreateDestructorPreferId(type_name, tid)) orelse return;
+    var args = [_]types.LLVMValueRef{struct_addr};
+    const fn_t = core.LLVMGlobalGetValueType(dest);
+    _ = core.LLVMBuildCall2(self.builder, fn_t, dest, &args, 1, "");
+}
+
 pub fn releaseLocalByName(self: *LlvmCompiler, name: []const u8, type_name: []const u8) anyerror!void {
     const alloca_val = self.locals.get(name) orelse return;
     const loaded = core.LLVMBuildLoad2(self.builder, self.val_type, alloca_val, "blk_rel_load");
 
     const tid: ?typesys.TypeId = if (self.current_local_type_ids) |ids| ids.get(name) else null;
+    // A value struct is inline stack storage: release its owned fields via the destructor directly,
+    // never nova_release (which would read a refcount header off the stack and free a stack address).
+    if (self.isValueStructName(type_name)) {
+        try self.dropValueStruct(loaded, type_name, tid);
+        _ = core.LLVMBuildStore(self.builder, core.LLVMConstInt(self.val_type, 0, 0), alloca_val);
+        return;
+    }
     const dest = try self.getOrCreateDestructorPreferId(type_name, tid);
     try self.compileRelease(loaded, dest);
 

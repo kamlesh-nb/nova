@@ -121,7 +121,25 @@ release-refs + no-free) -- required before `DbValue`/`ProductView` themselves ca
 M-9 DbValue slimming is DONE (the 16-byte decimal field is gone). Items (1) and (2) are the
 genuinely hard, soundness-critical parts.
 
-**Owned-field value structs (started; blocker pinned).** The COPY half is built and sound:
+**Owned-field value structs (implemented; works except container grow).** This turned out NOT to
+need move semantics -- uniform COPY semantics (retain on every duplication, release on every drop,
+exactly how reference types already balance) is sound. Implemented and verified ASAN + ARC-audit
+clean for value structs with `int`+`string` fields (e.g. a `ProductView`-shape) as LOCALS, under
+`let b = a` COPY, and in NON-growing `List`s:
+  - `retainValueStructOwnedFields` retains a struct's owned fields after a byte-copy (copy / container-insert);
+  - `dropValueStruct` calls the struct's destructor DIRECTLY at scope/temp end to release owned fields with NO free (it is a stack alloca) -- wired into `releaseLocalByName`, the temp drain, and owned-field-value-struct locals are registered for scope drop;
+  - the `Storage` destructor gained an inline-element loop (`buildInlineValueStructStorageLoop`) that releases each inline element's owned fields in place;
+  - `buildValueStructStorage` now ZERO-inits the alloca, so an owned field's init "release the old value" sees null (a fresh raw alloca is garbage -> that first release would nova_release a junk pointer, SIGSEGV -- fixed);
+  - the scalar-only fail-safe was relaxed to also allow `string` fields.
+KNOWN BUG (gated, opt-in only): a value struct with an owned field in a List that GROWS past its
+initial capacity double-frees the owned field during `grow()` (the grow-copy retain and the old/new
+buffer destructors do not balance across the realloc). ASAN pins it (heap-use-after-free in
+`nova_retain`, freed by `List_..._grow -> __destruct`). The zeroed-buffer / erased-elem-type theories
+were ruled out (buffers are memset-zeroed; scalar `List<Point>` grows correctly). It needs runtime
+refcount tracing to resolve. So owned-field value structs are sound for locals / copies / small
+(non-growing) containers; growing containers await this fix. This unblocks `ProductView` once fixed.
+
+**Copy foundation (superseded by the above).** The COPY half is built and sound:
 `retainValueStructOwnedFields(structAddr, name)` walks a value struct's fields and retains each
 owned (reference) field after a byte-copy, so `let b = a` for an owned-field value struct gives
 `b` its own refs. The DROP half is a value struct calling its destructor DIRECTLY at scope end

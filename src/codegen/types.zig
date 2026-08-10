@@ -575,12 +575,11 @@ fn computeValueEscapeSet(self: *LlvmCompiler) void {
         for (e.value_ptr.fields) |fld| {
             const fs = self.typeRefToString(fld.type_name) catch continue;
             addName(self, &set, fs);
-            // Fail-safe: only a struct whose fields are ALL scalar primitives is value-lowered.
-            // A string/decimal/function/struct/container/optional field is owned or non-trivially
-            // copied, which the inline byte-copy path does not yet handle (leak/double-free/recursion),
-            // so any such field forces the whole struct to stay on the heap. (Owned-field value structs
-            // and larger inline elements are a later slice.)
-            if (!isScalarFieldTypeName(fs)) addName(self, &set, e.key_ptr.*);
+            // A field must be a scalar primitive OR a `string` (an owned reference the copy/drop paths
+            // now handle: retain-on-copy, release-on-drop). Any other field -- decimal, function,
+            // nested struct, container/optional -- is not yet handled inline, so it forces the whole
+            // struct to the heap. (Those are the next slices: nested-value-struct + container fields.)
+            if (!isScalarFieldTypeName(fs) and !std.mem.eql(u8, fs, "string")) addName(self, &set, e.key_ptr.*);
         }
     }
     // 3. Generic struct args that land in a DIRECT type-param field escape (that field is a raw
@@ -632,6 +631,18 @@ pub fn isValueStructName(self: *LlvmCompiler, name: []const u8) bool {
     if (self.value_escape_set.?.contains(base)) return false; // escapes -> keep on heap
     if (arc_mod.value_structs_all) return true;
     if (arc_mod.value_type_set) |set| return set.contains(base);
+    return false;
+}
+
+// M-1: does a value struct have any OWNED (reference) field that needs retain-on-copy /
+// release-on-drop? A scalar-only value struct has none, so it needs no drop at all.
+pub fn valueStructHasOwnedFields(self: *LlvmCompiler, name: []const u8) bool {
+    const base = getStructBaseName(name);
+    const sd = self.structs.get(base) orelse return false;
+    for (sd.fields) |fld| {
+        const fts = self.typeRefToString(fld.type_name) catch continue;
+        if (self.isOwnedDeclaredType(fld.type_name, fts)) return true;
+    }
     return false;
 }
 
