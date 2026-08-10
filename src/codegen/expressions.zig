@@ -92,6 +92,12 @@ pub fn buildValueStructCopy(self: *LlvmCompiler, src: types.LLVMValueRef, size: 
 pub fn compileElemWitness(self: *LlvmCompiler, wn: []const u8, gc: ast.GenericCallExpr) anyerror!?types.LLVMValueRef {
     const t = self.typeRefToString(gc.type_args[0]) catch return null;
     const is_vs = self.isValueStructName(t);
+    // `any` is an OWNED heap box ({payload, dtor}) even though it is passed by an 8-byte value slot, so
+    // `ownedByName` (which treats `any` as a primitive) reports it non-owned. The old Storage decided
+    // element ownership via the element TypeId (`isOwnedTypeId(any)` = true) and retained it; keep that
+    // parity here or a `Map<K, any>` / `List<any>` element is stored without a reference and freed while
+    // still slotted (case 123).
+    const elem_owned = self.ownedByName(t) or std.mem.eql(u8, t, "any");
     const width_u: u64 = if (is_vs) @max(self.getTypeSize(ast.TypeRef{ .ident = getStructBaseName(t) }, false), 1) else 8;
     const valptr_t = core.LLVMPointerType(self.val_type, 0);
 
@@ -111,7 +117,7 @@ pub fn compileElemWitness(self: *LlvmCompiler, wn: []const u8, gc: ast.GenericCa
             const v = core.LLVMBuildLoad2(self.builder, self.val_type, sptr, "we_v");
             const dptr = core.LLVMBuildIntToPtr(self.builder, dst, valptr_t, "we_dptr");
             _ = core.LLVMBuildStore(self.builder, v, dptr);
-            if (self.ownedByName(t)) try self.compileRetain(v);
+            if (elem_owned) try self.compileRetain(v);
         }
         return core.LLVMConstInt(self.val_type, 0, 0);
     }
@@ -139,7 +145,7 @@ pub fn compileElemWitness(self: *LlvmCompiler, wn: []const u8, gc: ast.GenericCa
         } else {
             // retain the NEW element BEFORE releasing the old (matches Storage.set), so an
             // aliasing overwrite / a shift like List.insert stays refcount-positive throughout.
-            if (self.ownedByName(t)) try self.compileRetain(value);
+            if (elem_owned) try self.compileRetain(value);
             if (over) try dropElemAt(self, t, false, slot);
             const p = core.LLVMBuildIntToPtr(self.builder, slot, valptr_t, "we_sp");
             _ = core.LLVMBuildStore(self.builder, value, p);
@@ -156,7 +162,7 @@ pub fn compileElemWitness(self: *LlvmCompiler, wn: []const u8, gc: ast.GenericCa
         if (is_vs) return slot; // the element IS the inline bytes; its value is its address
         const p = core.LLVMBuildIntToPtr(self.builder, slot, valptr_t, "we_lp");
         const v = core.LLVMBuildLoad2(self.builder, self.val_type, p, "we_lv");
-        if (std.mem.eql(u8, wn, "load") and self.ownedByName(t)) try self.compileRetain(v);
+        if (std.mem.eql(u8, wn, "load") and elem_owned) try self.compileRetain(v);
         return v;
     }
     // moveElem<T>(dst, src) -- raw MOVE of the element bytes, no reference taken (ownership transfers,
@@ -190,7 +196,7 @@ fn dropElemAt(self: *LlvmCompiler, t: []const u8, is_vs: bool, addr: types.LLVMV
                 _ = core.LLVMBuildCall2(self.builder, dt, d, &args, 1, "");
             }
         }
-    } else if (self.ownedByName(t) or types_mod.valueOptionalName(t)) {
+    } else if (self.ownedByName(t) or types_mod.valueOptionalName(t) or std.mem.eql(u8, t, "any")) {
         const p = core.LLVMBuildIntToPtr(self.builder, addr, valptr_t, "we_dp");
         const v = core.LLVMBuildLoad2(self.builder, self.val_type, p, "we_dv");
         const d = try self.getOrCreateDestructor(t);

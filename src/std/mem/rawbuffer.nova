@@ -29,6 +29,13 @@ pub class RawBuffer<T> {
     pub fn count(self: RawBuffer<T>): int { return self.len; }
     pub fn base(self: RawBuffer<T>): long { return self.data; }
 
+    // Present all `n` slots as live (n <= capacity). Used by the open-addressing Map/Set, which index
+    // the buffer directly by hash rather than push/pop: every bucket must be a valid `at`/`set` target
+    // from the start. The backing run came zero-filled from bytes.alloc, so the slots read back as the
+    // element's zero value (an EMPTY bucket) until written. delete()/clear() then drop all n slots; a
+    // zero slot drops to nothing, so unwritten buckets and tombstones (reset to 0) are safe.
+    pub fn fill(self: RawBuffer<T>, n: int): void { self.len = n; }
+
     fn slot(self: RawBuffer<T>, i: int): long {
         return self.data + (i as long) * (witness.sizeOf<T>() as long);
     }
