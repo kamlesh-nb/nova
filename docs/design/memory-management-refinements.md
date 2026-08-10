@@ -509,24 +509,29 @@ Nova's `.storage` conflates two roles Swift keeps apart: the **buffer object** (
 witness** (copy/drop/stride for `T`, which Nova buries in `isOwnedStorageElem` +
 `buildStorageDestructor`). Split them:
 
-1. **Typed-element intrinsics = Nova's value witnesses.** Add `__sizeof<T>()` (already computed
-   as `getTypeSize`), `__copyElem<T>(dst, src)` (typed copy: memcpy + retain owned fields, the
-   value-struct copy path) and `__dropElem<T>(addr)` (typed drop: release owned fields / the
-   element pointer). The compiler lowers these to exactly the code the struct field-walk (M-3)
-   already emits -- no new ownership logic, just exposing it to Nova source. These are Nova's
-   `UnsafeMutablePointer.initialize`/`.deinitialize` + `MemoryLayout.stride`.
+1. **Typed-element intrinsics = Nova's value witnesses. [P1 -- LANDED (commit 231762f), builds.]**
+   `mem/witness.nova` declares `sizeOf<T>(): int`, `copyElem<T>(dst, src)` and `dropElem<T>(addr)`;
+   codegen (`compileElemWitness` in `expressions.zig`, intercepted at the top of the `.generic_call`
+   arm) lowers each call to exactly the typed copy/drop the struct field-walk (M-3) already emits --
+   no new ownership logic, just exposed to Nova source. Slot model: a value struct occupies its real
+   width inline (`copyElem` = `buildValueStructCopyInto` + `retainValueStructOwnedFields`; `dropElem`
+   = the value-struct destructor); everything else is one 8-byte slot (load/store the value/pointer;
+   `compileRetain`/`compileRelease` when `ownedByName`). Bodies are dead fallbacks so sema resolves +
+   monomorphizes per `T`. These are Nova's `UnsafeMutablePointer.initialize`/`.deinitialize` +
+   `MemoryLayout.stride`. STILL TO ADD for P2: value-in / value-out witnesses (`store`/`load`), since
+   `copyElem` is slot-to-slot (addresses) but a collection pushes/reads a `T` in its native
+   representation (address for a value struct, an 8-byte value for a scalar/reference).
 2. **Pure-Nova `class RawBuffer<T>`** holding `ptr`/`cap`: `get(i)` reads the slot at
-   `i * __sizeof<T>()`, `set(i, v)` uses `__copyElem<T>`, `delete()` (the M-7 hook) loops
-   `__dropElem<T>` over the live prefix. This is `__ContiguousArrayStorage` in ordinary Nova.
+   `i * witness.sizeOf<T>()`, `set(i, v)` stores through the value witness, `delete()` (the M-7 hook)
+   loops `witness.dropElem<T>` over the live prefix; grow copies old->new with `witness.copyElem<T>`.
+   This is `__ContiguousArrayStorage` in ordinary Nova. Uniquely owned -> no buffer refcount.
 3. **Rebuild `List`/`Map`/`Set` on `RawBuffer<T>`**, then DELETE `.storage`, `isOwnedStorageElem`,
-   `buildStorageDestructor`, and the ~52 bespoke touchpoints -- they collapse to the three
-   intrinsics. The buffer stops being a refcounted persistent object: `RawBuffer` is uniquely
-   owned by its collection, freed by its destructor (Rust `Vec` / one owner, no buffer refcount).
+   `buildStorageDestructor`, and the ~52 bespoke touchpoints -- they collapse to the witnesses.
 
 Expected perf: the largest memory win (inline value elements, no per-element box/ARC) already
 landed with M-1 + List-inline; this adds dropping the buffer's own atomic refcount (one fewer ARC
 object + its ops per collection) and removes the bespoke-ARC dispatch, plus a much simpler
-compiler. Phased with a corpus+ASAN checkpoint after (a) the intrinsics, (b) `List` on
+compiler. Phased with a corpus+ASAN checkpoint after (a) the intrinsics [done], (b) `List` on
 `RawBuffer`, (c) `Map`/`Set`, because it swaps hand-written retain/release for the generated
 equivalents and the ARC balance must stay exact.
 
