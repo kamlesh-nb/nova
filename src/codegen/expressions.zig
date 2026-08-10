@@ -190,7 +190,7 @@ fn dropElemAt(self: *LlvmCompiler, t: []const u8, is_vs: bool, addr: types.LLVMV
                 _ = core.LLVMBuildCall2(self.builder, dt, d, &args, 1, "");
             }
         }
-    } else if (self.ownedByName(t)) {
+    } else if (self.ownedByName(t) or types_mod.valueOptionalName(t)) {
         const p = core.LLVMBuildIntToPtr(self.builder, addr, valptr_t, "we_dp");
         const v = core.LLVMBuildLoad2(self.builder, self.val_type, p, "we_dv");
         const d = try self.getOrCreateDestructor(t);
@@ -1085,7 +1085,32 @@ fn buildClosureCleanup(self: *LlvmCompiler, lambda_name: []const u8, span: ast.S
     return try self.fnRefInt(clean_fn, name);
 }
 
-pub fn initDefaultContainerFields(self: *LlvmCompiler, struct_name: []const u8, instance_ptr: types.LLVMValueRef, span: ast.Span) anyerror!void {
+// Substitute a struct's type params in a field's type args with the instantiation's concrete args,
+// so a generic struct's `List<T>` field default-constructs the CONCRETE `List<int>` -- not the erased
+// `List<T>`, which (now that the backing store is a real generic RawBuffer, not the Storage intrinsic)
+// links against an un-monomorphised RawBuffer_init/_delete. One level plus nested generics.
+fn substFieldTypeArgs(self: *LlvmCompiler, params: []const ast.TypeRef, tparams: []const []const u8, targs: []const ast.TypeRef) anyerror![]ast.TypeRef {
+    const out = try self.allocator.alloc(ast.TypeRef, params.len);
+    for (params, 0..) |p, i| out[i] = try substOneTypeRef(self, p, tparams, targs);
+    return out;
+}
+fn substOneTypeRef(self: *LlvmCompiler, p: ast.TypeRef, tparams: []const []const u8, targs: []const ast.TypeRef) anyerror!ast.TypeRef {
+    switch (p) {
+        .ident => |nm| {
+            for (tparams, 0..) |tp, i| {
+                if (i < targs.len and std.mem.eql(u8, nm, tp)) return targs[i];
+            }
+            return p;
+        },
+        .generic => |g| {
+            const np = try substFieldTypeArgs(self, g.params, tparams, targs);
+            return ast.TypeRef{ .generic = .{ .name = g.name, .params = np } };
+        },
+        else => return p,
+    }
+}
+
+pub fn initDefaultContainerFields(self: *LlvmCompiler, struct_name: []const u8, instance_ptr: types.LLVMValueRef, span: ast.Span, type_args: []const ast.TypeRef) anyerror!void {
     const sd = self.structs.get(struct_name) orelse return;
     if (self.default_ctor_depth > 24) return;
     self.default_ctor_depth += 1;
@@ -1097,10 +1122,13 @@ pub fn initDefaultContainerFields(self: *LlvmCompiler, struct_name: []const u8, 
         const zero_expr: ?ast.Expression = switch (f.type_name) {
             .generic => |g| blk: {
                 if (!std.mem.eql(u8, g.name, "List")) break :blk null;
+                // Substitute the struct's type params (e.g. T) with this instantiation's args (e.g. int)
+                // so we build the concrete List<int>, not the erased List<T>.
+                const cparams = substFieldTypeArgs(self, g.params, sd.type_params, type_args) catch g.params;
                 callee_expr = ast.Expression{ .kind = .{ .ident = "List" } };
                 break :blk ast.Expression{ .kind = .{ .generic_call = .{
                     .callee = &callee_expr,
-                    .type_args = g.params,
+                    .type_args = cparams,
                     .args = &[_]ast.Expression{},
                     .span = span,
                 } } };
@@ -2622,7 +2650,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
 
                         _ = try self.buildCallWithCasts(fn_val, args);
                     } else {
-                        try self.initDefaultContainerFields(resolved_struct_name, instance_ptr, call.span);
+                        try self.initDefaultContainerFields(resolved_struct_name, instance_ptr, call.span, &[_]ast.TypeRef{});
                     }
                     return instance_ptr;
                 }
@@ -3294,7 +3322,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
 
                         _ = try self.buildCallWithCasts(fn_val, args);
                     } else {
-                        try self.initDefaultContainerFields(resolved_struct_name, instance_ptr, gc.span);
+                        try self.initDefaultContainerFields(resolved_struct_name, instance_ptr, gc.span, gc.type_args);
                     }
                     return instance_ptr;
                 }

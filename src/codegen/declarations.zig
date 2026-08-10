@@ -850,7 +850,15 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
     for (compiler.functions.items) |func| {
         const fn_val = compiler.func_map.get(func.name).?;
 
-        if (func.erased_generic and core.LLVMGetFirstUse(fn_val) == null) continue;
+        // Skip a use-less erased fallback -- EXCEPT for RawBuffer, the universal container backing
+        // (M-10). An erased container body (e.g. erased List_init) constructs an erased RawBuffer_init
+        // whose use is only created once the container body is emitted; if RawBuffer was visited first
+        // it would be skipped here and left undefined at link. RawBuffer's erased bodies codegen
+        // cleanly, so emit them unconditionally (internal linkage); globalDCE drops them if the whole
+        // erased chain is unreachable. Everything else keeps the no-use skip (some erased bodies -- a
+        // closure in an erased generic method, etc. -- do not codegen when erased and must stay elided).
+        const is_rawbuf_backing = std.mem.startsWith(u8, func.name, "RawBuffer_");
+        if (func.erased_generic and !is_rawbuf_backing and core.LLVMGetFirstUse(fn_val) == null) continue;
 
         if (func.erased_generic and !t6_split) core.LLVMSetLinkage(fn_val, types.LLVMLinkage.LLVMInternalLinkage);
 
