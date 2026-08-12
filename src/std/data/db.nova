@@ -76,6 +76,14 @@ pub struct DbValue {
             bytes.copy(out as long, self.i + (self.off as long), self.len);
             return out as string;
         }
+        // Eager string-carried types (Text/Timestamp/Uuid/Json/Decimal) keep their text in `s`. Numeric and
+        // bool cells keep their value in the typed slots (`i`/`f`) with `s` empty -- e.g. the MySQL/TDS TEXT
+        // protocols decode ints/floats EAGERLY. asText() must stringify those on demand, else it returns ""
+        // for them (the bug the wire-rows fallback exposed; the native paths read asInt/asDouble directly).
+        if (!string.eql(self.s, "")) { return self.s; }
+        if (self.kind == DbType.Int4 || self.kind == DbType.Uint4 || self.kind == DbType.Int8 || self.kind == DbType.Uint8) { return `${self.i}`; }
+        if (self.kind == DbType.Bool) { return if (self.i != 0) "true" else "false"; }
+        if (self.kind == DbType.Float4 || self.kind == DbType.Float8) { return `${self.f}`; }
         return self.s;
     }
 
