@@ -1,0 +1,40 @@
+// P10: the borrowed string type.
+//
+// `Str` is a BORROWED string: {ptr, len} into bytes it does NOT own -- no ARC header, no allocation, no
+// retain/release. Because it is a VALUE struct (the M-1/2/3 value-struct path), it is passed inline with
+// zero refcount traffic; it is Nova's `&str`. The caller GUARANTEES the backing bytes outlive the view
+// (lifetime is manual and request-scoped, exactly like Rust's &str -- there is no borrow checker). It
+// borrows a slice of an owned `string` (a constant template literal or a materialised value) or a slice of
+// a foreign buffer (a DB row's `Row.raw`, via `DbValue.asView`). Materialise with `toOwned()` ONLY when the
+// value must escape its buffer's scope.
+import bytes;
+
+pub struct Str {
+    pub ptr: long,
+    pub len: int,
+    init(ptr: long, len: int) { self.ptr = ptr; self.len = len; }
+
+    pub fn size(self: Str): int { return self.len; }
+    pub fn byteAt(self: Str, i: int): int { return bytes.read_byte(self.ptr, i); }
+    // Copy the borrowed bytes into a fresh OWNED heap string. Use only at an escape boundary.
+    pub fn toOwned(self: Str): string {
+        if (self.len <= 0) { return ""; }
+        let out = bytes.alloc(self.len);
+        bytes.copy(out as long, self.ptr, self.len);
+        return out as string;
+    }
+}
+
+// Borrow a slice [start, end) of an owned string -- NO copy, no allocation. (Named `sub`, not `slice`, to
+// avoid colliding with `string.slice` under unqualified cross-module call resolution.)
+pub fn sub(s: string, start: int, end: int): Str {
+    return Str((s as long) + (start as long), end - start);
+}
+// Borrow a whole owned string.
+pub fn of(s: string): Str {
+    return Str(s as long, s.length);
+}
+// Borrow a raw {ptr, len} span directly (e.g. a DB row-buffer slice).
+pub fn raw(ptr: long, n: int): Str {
+    return Str(ptr, n);
+}

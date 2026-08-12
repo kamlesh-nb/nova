@@ -22,6 +22,8 @@ struct Counter {
 }
 
 struct CountingConn impl Connection {
+    // queryWire (trait): mocks use the generic fallback that re-encodes a ResultSet.
+    async fn queryWire(self, sql: string, params: List<DbValue>): WireRows { return wireRowsFromResultSet(await self.query(sql, params)); }
     pub id: int,
     pub ctr: Counter,
     pub prepared: List<string>,

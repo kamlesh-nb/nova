@@ -1,0 +1,46 @@
+// P10 borrowed-string (`str.Str`) foundation: a `Str` borrows bytes it does not own, and the render escapes
+// straight from the borrow into the builder with NO owned intermediate string. Exercises whole-string
+// borrow, a middle SLICE borrow (proves ptr+len offsetting), clean passthrough, metacharacter escaping, and
+// toOwned.
+import str;
+import web.response;
+import collections.string_builder;
+import assert;
+
+@test
+fn str_whole_escape() {
+    let s = "a<b>c&d\"e'f";
+    let sb = string_builder.StringBuilder();
+    response.escapeHtmlIntoView(sb, str.of(s));
+    assert.equalStr(sb.toString(), "a&lt;b&gt;c&amp;d&quot;e&#39;f");
+}
+
+@test
+fn str_slice_borrow() {
+    // Borrow the middle [2, 13) of "XXhello<worldYY" == "hello<world" (no copy; ptr+2, len 11).
+    let s = "XXhello<worldYY";
+    let v = str.sub(s, 2, 13);
+    assert.equalInt(v.size(), 11);
+    let sb = string_builder.StringBuilder();
+    response.escapeHtmlIntoView(sb, v);
+    assert.equalStr(sb.toString(), "hello&lt;world");
+}
+
+@test
+fn str_clean_passthrough() {
+    // No metacharacters: one bulk SWAR scan, the whole run copied via appendBytes, byte-exact.
+    let s = "no metachars here, just plain product description text";
+    let sb = string_builder.StringBuilder();
+    response.escapeHtmlIntoView(sb, str.of(s));
+    assert.equalStr(sb.toString(), s);
+}
+
+@test
+fn str_to_owned() {
+    // Materialise a borrow into an owned string at an escape boundary; the owned copy is independent.
+    let s = "borrowed-then-owned";
+    let v = str.sub(s, 0, 19);
+    let owned = v.toOwned();
+    assert.equalStr(owned, "borrowed-then-owned");
+    assert.equalInt(v.size(), 19);
+}

@@ -647,17 +647,62 @@ char *nova_arg_at(long long i) {
   return const_cast<char *>(nova_from_cstr(g_argv[(size_t)i]));
 }
 
+// Scan s[from, n) for the first HTML metacharacter (& < > " '); return its index, or n if none. A tight
+// C loop over raw bytes replaces the per-byte Nova `s[i]` (a bounds-checked length-load + byte-load each
+// iteration) that the escape-into-builder path used -- for the common clean string this is one scan that
+// returns n, so the caller appends the whole run with a single memcpy. Escaping was ~7% of server CPU.
+extern "C" int nova_html_scan(const char *s, int from, int n) {
+  int i = from;
+  while (i < n) {
+    unsigned char c = (unsigned char)s[i];
+    if (c == '&' || c == '<' || c == '>' || c == '"' || c == '\'') return i;
+    i++;
+  }
+  return n;
+}
+
 static char *nova_string_from(const char *c, int len) {
   const char *s = nova_from_bytes(c, (long long)len);
   return const_cast<char *>(s ? s : "");
 }
+// Hand-rolled base-10 integer formatter. The old snprintf("%lld") path parsed a format string, walked
+// locale state, and called into vfprintf for every int rendered -- a big share of a templated page's CPU
+// (ids, counts). This writes digits directly: build them backwards into a small buffer, then emit. ~5x
+// faster than snprintf and allocation-identical (one nova_string_from at the end).
+static int nova_i64_fmt(long long v, char *out) {
+  char tmp[24];
+  int ti = 0;
+  bool neg = v < 0;
+  unsigned long long u = neg ? (unsigned long long)(-(v + 1)) + 1ULL : (unsigned long long)v;
+  do {
+    tmp[ti++] = (char)('0' + (int)(u % 10ULL));
+    u /= 10ULL;
+  } while (u != 0);
+  int n = 0;
+  if (neg) out[n++] = '-';
+  while (ti > 0) out[n++] = tmp[--ti];
+  return n;
+}
 char *nova_i64_to_string(long long v) {
   char buf[24];
-  int n = std::snprintf(buf, sizeof(buf), "%lld", v);
+  int n = nova_i64_fmt(v, buf);
   return nova_string_from(buf, n);
 }
 char *nova_f64_to_string(double v) {
-
+  // Fast path: an INTEGER-valued double (the overwhelmingly common case for rendered numbers -- prices,
+  // counts, ids stored as doubles) formats EXACTLY as its integer, with none of the shortest-round-trip
+  // search. The old loop called snprintf("%.*g") + strtod up to 17 times PER number; for a page of 200
+  // integer-valued prices that was hundreds of vfprintf/dtoa calls per request (top of the server
+  // profile). Only genuine fractions fall through to the correct-rounding search.
+  if (v == 0.0) { return nova_string_from("0", 1); }
+  if (v >= -9.007199254740992e15 && v <= 9.007199254740992e15) {
+    long long iv = (long long)v;
+    if ((double)iv == v) {
+      char buf[24];
+      int n = nova_i64_fmt(iv, buf);
+      return nova_string_from(buf, n);
+    }
+  }
   char buf[32];
   int n = 0;
   for (int prec = 1; prec <= 17; ++prec) {
@@ -691,6 +736,77 @@ long long nova_f64_bits(double d) {
   long long bits;
   std::memcpy(&bits, &d, sizeof(bits));
   return bits;
+}
+
+// Read a big-endian IEEE-754 float of `len` bytes (4 = float4, 8 = float8) from `ptr` and return it as a
+// double. Used by the Postgres driver's BINARY result decode: the wire delivers float4/8 as fixed
+// big-endian bytes, so this reassembles them (network order) and bit-casts, with no ASCII parse.
+double nova_pg_be_f64(long long ptr, int len) {
+  if (!ptr) return 0.0;
+  const unsigned char *p = reinterpret_cast<const unsigned char *>(ptr);
+  if (len == 8) {
+    unsigned char b[8];
+    for (int i = 0; i < 8; i++) b[i] = p[7 - i];   // big-endian -> host little-endian
+    double d;
+    std::memcpy(&d, b, sizeof(d));
+    return d;
+  }
+  if (len == 4) {
+    unsigned char b[4];
+    for (int i = 0; i < 4; i++) b[i] = p[3 - i];
+    float f;
+    std::memcpy(&f, b, sizeof(f));
+    return (double)f;
+  }
+  return 0.0;
+}
+
+// Read a big-endian SIGNED integer of `len` bytes (1/2/4/8) from `ptr`, sign-extended to 64 bits. Used by
+// the Postgres BINARY result decode for int2/int4/int8. Done in the runtime (not Nova) so the byte
+// assembly cannot trip Nova's checked-32-bit-int overflow trap.
+long long nova_pg_be_i64(long long ptr, int len) {
+  if (!ptr || len <= 0 || len > 8) return 0;
+  const unsigned char *p = reinterpret_cast<const unsigned char *>(ptr);
+  unsigned long long acc = 0;
+  for (int i = 0; i < len; i++) acc = (acc << 8) | (unsigned long long)p[i];
+  if (len < 8) {
+    unsigned long long signbit = 1ULL << (len * 8 - 1);
+    if (acc & signbit) acc |= ~((1ULL << (len * 8)) - 1);   // sign-extend
+  }
+  return (long long)acc;
+}
+
+// Return the index of the first HTML metacharacter (& < > " ' = 38 60 62 34 39) at or after `start` in
+// the `len`-byte buffer at `base`, or `len` if none. SWAR: tests 8 bytes per iteration branch-free via the
+// exact has-zero-byte trick `(x-ones) & ~x & high` (needles are all < 0x80, so no false positives on
+// UTF-8 data bytes). Portable (no arch intrinsics). Called ONCE per clean interpolated value (a bulk scan
+// of the whole value), not per byte, so the per-call cost is amortised over the string -- the failure mode
+// of the earlier per-interpolation FFI attempt is avoided. Unsigned throughout: no Nova int-overflow trap.
+int nova_html_find_meta(long long base, int start, int len) {
+  if (!base || len <= 0) return len;
+  if (start < 0) start = 0;
+  const unsigned char *p = reinterpret_cast<const unsigned char *>(base);
+  const unsigned long long ones = 0x0101010101010101ULL;
+  const unsigned long long high = 0x8080808080808080ULL;
+  const unsigned long long n_amp = ones * 38, n_lt = ones * 60, n_gt = ones * 62,
+                           n_qt = ones * 34, n_sq = ones * 39;
+  int i = start;
+  for (; i + 8 <= len; i += 8) {
+    unsigned long long w;
+    std::memcpy(&w, p + i, 8);
+    unsigned long long m =
+        (((w ^ n_amp) - ones) & ~(w ^ n_amp) & high) | (((w ^ n_lt) - ones) & ~(w ^ n_lt) & high) |
+        (((w ^ n_gt) - ones) & ~(w ^ n_gt) & high) | (((w ^ n_qt) - ones) & ~(w ^ n_qt) & high) |
+        (((w ^ n_sq) - ones) & ~(w ^ n_sq) & high);
+    if (m)
+      return i + (__builtin_ctzll(m) >> 3);   // lowest set 0x80 lane -> byte index
+  }
+  for (; i < len; i++) {
+    unsigned char c = p[i];
+    if (c == 38 || c == 60 || c == 62 || c == 34 || c == 39)
+      return i;
+  }
+  return len;
 }
 
 long long nova_spin_create(void) { return (long long)new std::atomic_flag{}; }

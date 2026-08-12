@@ -240,6 +240,17 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
             }
         },
         .expr_stmt => |*es| {
+            // A bare JSX element inside a parent element's builder (e.g. `{for x in xs { <div>..</div>; }}`)
+            // renders DIRECTLY into the current builder -- no per-iteration StringBuilder + toString +
+            // copy-up. This makes a loop of cards a single-buffer render (Go strings.Builder / Rust
+            // String::push_str shape) instead of one intermediate string per element.
+            if (self.current_string_builder) |sb| {
+                if (es.expr.kind == .jsx_element) {
+                    try self.emitJsxInto(sb, es.expr.kind.jsx_element);
+                    try self.jsxFlushLiteral(sb); // emit this element's trailing static run
+                    return;
+                }
+            }
             const val = if (es.expr.kind == .go_expr)
                 try self.buildGo(es.expr.kind.go_expr, true)
             else

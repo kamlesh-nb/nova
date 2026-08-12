@@ -59,8 +59,8 @@ pub class App {
     // default. Opt in with `app.useGzip()` when responses are large/compressible enough to be worth it.
     pub gzipEnabled: bool,
 
-    // Port for the multi-core reactor server. Carried on the App so the reactor worker closure needs
-    // only a single capture (the App); see runReactorMC.
+    // The port the single reactor binds/serves on. Carried on the App so the reactor serve body reads it
+    // off the App rather than threading a separate parameter through.
     pub serverPort: int,
 
     init() {
@@ -132,7 +132,11 @@ pub class App {
         return undefined;
     }
 
-    pub async fn respondMiss(self: App, raw: string, method: string, path: string): string {
+    // Dispatch a request and WRITE the response straight to the socket. The common (non-cacheable) path
+    // writes the header block and the body as two separate sends, so a large body is written directly from
+    // its own buffer -- avoiding the serialize()-into-a-buffer + toString() double-copy (two full body
+    // copies per request). Cacheable GET responses still build one string (the cache stores it).
+    pub async fn respondMissTo(self: App, io: aio.AsyncIO, raw: string, method: string, path: string): int {
         let req = request.Request.fromString(raw);
         let resp = await self.dispatch(req);
 
@@ -148,13 +152,19 @@ pub class App {
             }
         }
 
-        let out = resp.serialize();
-        if (string.eql(method, "GET") && !didGzip) {
-            if (self.cacheable.get(path) != undefined) {
-                self.cache.set(path, string.slice(out, 0, out.length));
-            }
+        if (string.eql(method, "GET") && !didGzip && self.cacheable.get(path) != undefined) {
+            let out = resp.serialize();                       // cacheable: one string, stored in the cache
+            self.cache.set(path, string.slice(out, 0, out.length));
+            return await io.sendStr(out);
         }
-        return out;
+        // Response write. For a SMALL body, concatenate the header block + body and send in ONE syscall --
+        // one write beats two when the extra copy is cheap. For a LARGE body (>= 64 KB) keep the two-part
+        // write (header first, then the body from its own buffer) so we never re-copy a big payload.
+        let hdrs = resp.serializeHeaders();
+        if (resp.body.length == 0) { return await io.sendStr(hdrs); }
+        if (resp.body.length < 65536) { return await io.sendStr(hdrs + resp.body); }
+        let hn = await io.sendStr(hdrs);
+        return await io.sendStr(resp.body);
     }
 
     pub fn useStatic(self: App, prefix: string, dir: string): void {
@@ -239,16 +249,15 @@ pub class App {
     }
 
     pub fn run(self: App, port: int): void {
-        // A web app is single-reactor by default: share-nothing per PROCESS. The reactor runs INLINE on
-        // this (the calling) thread, so the App and its DI provider never cross a thread boundary, which
-        // is what keeps per-request service resolution correct. TLS is included (serveReactorConn
-        // tlsAccepts when useTls is set). No Asio: the reactor path carries the whole server (M4).
+        // A web app is ALWAYS single-reactor: one reactor, one thread, per PROCESS. The reactor runs
+        // INLINE on this (the calling) thread, so the App and its DI provider never cross a thread
+        // boundary, which is what keeps per-request service resolution correct and lets ARC stay
+        // non-atomic. TLS is included (serveReactorConn tlsAccepts when useTls is set). No Asio: the
+        // reactor path carries the whole server (M4).
         //
         // To use more cores, run more INSTANCES of the binary (each with its own NOVA_PORT) behind proxyd
-        // and let the orchestrator manage the replicas -- see the deployment guide. That is the supported
-        // scaling model. In-process multi-reactor is still available as an explicit opt-in via
-        // NOVA_WEB_WORKERS>1 (share-nothing per worker; the App config is read-only during serving), but
-        // it is not the default.
+        // and let the orchestrator manage the replicas -- see the deployment guide. That is the one
+        // supported scaling model; there is no in-process multi-reactor worker mode.
         self.serverPort = port;
         // fd-passing handoff mode: when NOVA_HANDOFF_SOCK names proxyd's AF_UNIX rendezvous, this app
         // does NOT bind a TCP port. Instead it connects to proxyd and serves client SOCKETS that proxyd
@@ -259,13 +268,10 @@ pub class App {
             reactorHandoffBody(self, handoff);
             return;
         }
-        let requested = env.get("NOVA_WEB_WORKERS");
-        let n = if (string.eql(requested, "")) 1 else (string.parseI64(requested) as int);
-        if (n <= 1) {
-            reactorWorkerBody(self, 0);
-        } else {
-            self.runReactorMC(port, n);
-        }
+        // Nova web is SINGLE-REACTOR by design: one reactor, one thread, per process. To use more cores,
+        // run more INSTANCES of the binary behind proxyd and let the orchestrator manage the replicas --
+        // that is the one supported scaling model. There is no in-process multi-reactor worker mode.
+        reactorWorkerBody(self, 0);
     }
 }
 
@@ -349,21 +355,20 @@ async fn handleConn(app: App, io: AsyncIO): int {
         let wantClose = request.bufFindCI(buf, 0, hdrEnd, "connection: close") != -1;
 
         let (method, path) = request.bufMethodPath(buf, len);
-        let out = "";
         let served = false;
         if (string.eql(method, "GET") && !usedChunked) {
             let c = app.cachedCopy(path);
-            if (c != undefined) { out = c ?? ""; served = true; }
+            if (c != undefined) { await io.sendStr(c ?? ""); served = true; }
         }
         if (!served) {
-
             let raw = if (usedChunked)
                 bytes.read_string(buf, hdrEnd) + "\r\n\r\n" + chunkedBody
             else
                 bytes.read_string(buf, reqEnd);
-            out = await app.respondMiss(raw, method, path);
+            // P2: respondMissTo writes the header block and the body as two separate sends, so a large body
+            // is written straight from its own buffer -- no serialize append + toString double-copy.
+            let sent = await app.respondMissTo(io, raw, method, path);
         }
-        await io.sendStr(out);
 
         let leftover = len - reqEnd;
         if (leftover > 0) {
@@ -504,18 +509,6 @@ fn reactorHandoffBody(app: App, sockPath: string): void {
             i = i + 1;
         }
     }
-}
-
-// Run the web server share-nothing across `workers` Nova reactor threads (no Asio), one reactor per
-// thread with a SO_REUSEPORT listener on `port`. The worker closure carries only the App (a single
-// capture; the port rides on the App), because a lambda passed to runReactors resolves just its first
-// capture. Blocks until the workers return (they loop forever).
-pub fn runReactorMC(self: App, port: int, workers: int): void {
-    self.serverPort = port;
-    let srv = self;
-    poller.runReactors(workers, (idx) => {
-        reactorWorkerBody(srv, idx);
-    });
 }
 
 // Run the web server on a single Nova reactor (no Asio). Opt-in via runReactor; the default run()

@@ -1,5 +1,6 @@
 
 import string;
+import str;
 import list;
 import map;
 import bytes;
@@ -387,6 +388,9 @@ pub struct MultiMapSource impl ValueSource {
         let l = self.fields.get(key);
         if (l == undefined) { return ""; }
         return (l ?? List<string>()).get(0) ?? "";
+    }
+    pub fn getStr(self: MultiMapSource, key: string): str.Str {
+        return str.of(self.getString(key));   // borrows the string held in self.fields
     }
     pub fn getInt(self: MultiMapSource, key: string): long { return string.parseI64(self.getString(key)); }
     pub fn getBool(self: MultiMapSource, key: string): bool { return string.eql(self.getString(key), "true"); }

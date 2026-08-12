@@ -68,6 +68,9 @@ pub const externs = [_]Builtin{
     .{ .receiver = "", .name = "nova_arg_at", .ret = .string },
 
     .{ .receiver = "", .name = "nova_f64_bits", .ret = .long },
+    .{ .receiver = "", .name = "nova_pg_be_f64", .ret = .double },
+    .{ .receiver = "", .name = "nova_pg_be_i64", .ret = .long },
+    .{ .receiver = "", .name = "nova_html_find_meta", .ret = .int },
 
     // Lowered directly to the llvm.sqrt.f64 intrinsic (hardware fsqrt) in codegen -- not a runtime
     // symbol. math.fsqrt calls this so float-heavy code gets one instruction, not a Newton loop.

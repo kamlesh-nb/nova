@@ -1,5 +1,6 @@
 
 import string;
+import str;
 import list;
 import map;
 import bytes;
@@ -40,6 +41,57 @@ fn ciEquals(a: string, b: string): bool {
 // characters must be escaped by the caller. This is the one canonical escaper so views (and `.nsx` files)
 // do not each redefine their own: `{response.escapeHtml(user.name)}`. It replaces the five characters that
 // matter in element text and double-quoted attribute values: & < > " '.
+// Escape `s` and append the result DIRECTLY into a render StringBuilder -- no intermediate string. This
+// is the hot path the NSX codegen calls for every `{expr}` interpolation: clean runs are memcpy'd in via
+// appendRange (zero allocation) and only the five metacharacters expand to entity literals (which are
+// immortal string constants, so also allocation-free). A 200-card page interpolates ~1200 values; the old
+// escapeHtml(...)->append allocated one escaped string per value, which this eliminates entirely.
+pub fn escapeHtmlInto(sb: StringBuilder, s: string): void {
+    let n = string.len(s);
+    let base = s as long;
+    let runStart = 0;
+    // SWAR bulk scan: `nova_html_find_meta` returns the next metacharacter index (8 bytes/iteration,
+    // branch-free) or `n`. For clean text (the overwhelming majority of interpolated values) this is ONE
+    // call that scans the whole value; each metacharacter then costs one more call. The clean runs between
+    // metacharacters are copied wholesale via appendRange (zero per-byte work).
+    let m = nova_html_find_meta(base, 0, n);
+    while (m < n) {
+        if (m > runStart) { sb.appendRange(s, runStart, m); }
+        let c = s[m];
+        if (c == 38) { sb.append("&amp;"); }
+        else if (c == 60) { sb.append("&lt;"); }
+        else if (c == 62) { sb.append("&gt;"); }
+        else if (c == 34) { sb.append("&quot;"); }
+        else { sb.append("&#39;"); }
+        runStart = m + 1;
+        m = nova_html_find_meta(base, runStart, n);
+    }
+    if (n > runStart) { sb.appendRange(s, runStart, n); }
+}
+
+// P10: HTML-escape a BORROWED view straight into the builder -- the clean runs are copied byte-for-byte
+// out of the borrowed buffer (appendBytes), so NO owned intermediate string is minted. This is the render
+// sink that lets a DB cell (a StrView over the row buffer) or a constant template chunk flow to the output
+// without the ~1 owned-string allocation per interpolated value that escapeHtmlInto(string) costs.
+pub fn escapeHtmlIntoView(sb: StringBuilder, v: str.Str): void {
+    let base = v.ptr;
+    let n = v.len;
+    let runStart = 0;
+    let m = nova_html_find_meta(base, 0, n);
+    while (m < n) {
+        if (m > runStart) { sb.appendBytes(base + (runStart as long), m - runStart); }
+        let c = bytes.read_byte(base, m);
+        if (c == 38) { sb.append("&amp;"); }
+        else if (c == 60) { sb.append("&lt;"); }
+        else if (c == 62) { sb.append("&gt;"); }
+        else if (c == 34) { sb.append("&quot;"); }
+        else { sb.append("&#39;"); }
+        runStart = m + 1;
+        m = nova_html_find_meta(base, runStart, n);
+    }
+    if (n > runStart) { sb.appendBytes(base + (runStart as long), n - runStart); }
+}
+
 pub fn escapeHtml(s: string): string {
     let n = string.len(s);
     // Fast path: scan once for anything needing escaping. The overwhelming majority of interpolated
@@ -175,6 +227,38 @@ pub struct Response {
         });
         sb.append("\r\n");
         sb.append(self.body);
+        return sb.toString();
+    }
+
+    // Just the status line + headers + cookies + the blank line -- NOT the body. Lets the server write the
+    // header block and the (large) body as two separate sends, so the body is written straight from its
+    // existing buffer instead of being appended into a serialize buffer AND copied out by toString (two
+    // full body copies). Content-Length is set from the body length the caller will send next.
+    pub fn serializeHeaders(self: Response): string {
+        if (self.headers.get("Content-Length") == undefined) {
+            self.headers.set("Content-Length", intToStr(self.body.length));
+        }
+        let sb = string_builder.StringBuilder();
+        sb.ensureCapacity(512);
+        sb.append("HTTP/1.1 ");
+        sb.append(intToStr(Status.toCode(self.status)));
+        sb.append(" ");
+        sb.append(Status.reasonPhrase(self.status));
+        sb.append("\r\n");
+        self.headers.forEach((key, value) => {
+            sb.append(key);
+            sb.append(": ");
+            sb.append(value);
+            sb.append("\r\n");
+        });
+        self.cookies.forEach((key, value) => {
+            sb.append("Set-Cookie: ");
+            sb.append(key);
+            sb.append("=");
+            sb.append(value);
+            sb.append("; Path=/\r\n");
+        });
+        sb.append("\r\n");
         return sb.toString();
     }
 

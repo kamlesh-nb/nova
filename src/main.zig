@@ -278,6 +278,7 @@ fn configureValueStructs(allocator: std.mem.Allocator, environ: anytype) void {
 
 const type_checker = @import("type_checker.zig");
 const sema_shadow = @import("sema/shadow.zig");
+const sema_escape = @import("sema/escape.zig");
 const sema_alpha = @import("sema/alpha.zig");
 const sema_ids = @import("sema/ids.zig");
 const sema_mod = @import("sema/sema.zig");
@@ -482,7 +483,7 @@ fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocator: 
         const sub = module_name[4..];
         return try std.fmt.allocPrint(allocator, "src/std/{s}.nova", .{sub});
     }
-    const std_modules = [_][]const u8{ "net/tcp/stream", "net/tcp/server", "net/tcp/client", "net/url", "net/dns", "net/dial", "net/aio", "net/asynctls", "web/request", "web/response", "web/mime", "web/status", "web/methods", "web/client", "web/mediator", "web/routing", "web/middleware", "web/url", "web/cookie", "web/cors", "web/request_id", "web/redact", "web/secure_headers", "web/body_limit", "web/recovery", "web/rate_limit", "web/multipart", "web/session", "web/csrf", "web/di", "web/controller", "web/app", "web/logger", "web/httpparser", "concurrency/fiber", "concurrency/channel", "concurrency/asyncchan", "concurrency/atomic", "concurrency/async_util", "concurrency/actor", "concurrency/asynclock", "io/file", "io/dir", "collections/list", "collections/map", "collections/set", "collections/string_builder", "collections/deque", "collections/heap", "collections/ordered_map", "serde/json", "serde/source", "serde/bson", "serde/yaml", "mem/allocator", "mem/memory", "mem/witness", "mem/rawbuffer", "string", "datetime", "stopwatch", "math", "assert", "traits", "env", "log", "config", "metrics", "crypto/hash/sha", "crypto/hash/md5", "crypto/base64", "crypto/random", "crypto/scram", "crypto/hash/sha256", "crypto/hash/sha512", "crypto/hash/sha1", "crypto/mac/hmac", "crypto/kdf/hkdf", "crypto/kdf/pbkdf2", "crypto/cipher/chacha20", "crypto/mac/poly1305", "crypto/aead/chachapoly", "crypto/cipher/aes", "crypto/mac/ghash", "crypto/aead/aesgcm", "crypto/cipher/aesctr", "crypto/ecc/x25519", "crypto/ecc/p256", "crypto/ecc/p384", "crypto/rsa", "crypto/x509", "crypto/ocsp", "crypto/crl", "crypto/tls/13/tls", "crypto/tls/13/handshake", "crypto/tls/13/tlsClient", "crypto/tls/13/tlsServer", "crypto/tls/12/prf", "crypto/tls/truststore", "crypto/tls/revocation", "crypto/tls/12/client12", "process", "fs", "exception", "data/db", "data/sql/pool", "text/utf8", "text/regex", "webview", "web/static_content", "web/circuit_breaker", "resilience/breaker", "compress/gzip", "compress/deflate", "compress/lz4", "data/orm", "os/sys", "os/backend", "os/socket", "os/handle", "os/darwin/kqueue", "os/linux/epoll", "os/windows/win32", "os/windows/fs", "os/windows/proc", "os/windows/winsock", "io/slab", "io/arena", "net/poller", "net/eventedio", "net/tls13async", "net/tlsmembio", "net/tls12bio", "net/httpsclient", "net/eventloop" };
+    const std_modules = [_][]const u8{ "net/tcp/stream", "net/tcp/server", "net/tcp/client", "net/url", "net/dns", "net/dial", "net/aio", "net/asynctls", "web/request", "web/response", "web/mime", "web/status", "web/methods", "web/client", "web/mediator", "web/routing", "web/middleware", "web/url", "web/cookie", "web/cors", "web/request_id", "web/redact", "web/secure_headers", "web/body_limit", "web/recovery", "web/rate_limit", "web/multipart", "web/session", "web/csrf", "web/di", "web/controller", "web/app", "web/logger", "web/httpparser", "concurrency/fiber", "concurrency/channel", "concurrency/asyncchan", "concurrency/atomic", "concurrency/async_util", "concurrency/actor", "concurrency/asynclock", "io/file", "io/dir", "collections/list", "collections/map", "collections/set", "collections/string_builder", "collections/deque", "collections/heap", "collections/ordered_map", "serde/json", "serde/source", "serde/bson", "serde/yaml", "mem/allocator", "mem/memory", "mem/witness", "mem/rawbuffer", "mem/region", "string", "str", "datetime", "stopwatch", "math", "assert", "traits", "env", "log", "config", "metrics", "crypto/hash/sha", "crypto/hash/md5", "crypto/base64", "crypto/random", "crypto/scram", "crypto/hash/sha256", "crypto/hash/sha512", "crypto/hash/sha1", "crypto/mac/hmac", "crypto/kdf/hkdf", "crypto/kdf/pbkdf2", "crypto/cipher/chacha20", "crypto/mac/poly1305", "crypto/aead/chachapoly", "crypto/cipher/aes", "crypto/mac/ghash", "crypto/aead/aesgcm", "crypto/cipher/aesctr", "crypto/ecc/x25519", "crypto/ecc/p256", "crypto/ecc/p384", "crypto/rsa", "crypto/x509", "crypto/ocsp", "crypto/crl", "crypto/tls/13/tls", "crypto/tls/13/handshake", "crypto/tls/13/tlsClient", "crypto/tls/13/tlsServer", "crypto/tls/12/prf", "crypto/tls/truststore", "crypto/tls/revocation", "crypto/tls/12/client12", "process", "fs", "exception", "data/db", "data/sql/pool", "text/utf8", "text/regex", "webview", "web/static_content", "web/circuit_breaker", "resilience/breaker", "compress/gzip", "compress/deflate", "compress/lz4", "data/orm", "os/sys", "os/backend", "os/socket", "os/handle", "os/darwin/kqueue", "os/linux/epoll", "os/windows/win32", "os/windows/fs", "os/windows/proc", "os/windows/winsock", "io/slab", "io/arena", "net/poller", "net/eventedio", "net/tls13async", "net/tlsmembio", "net/tls12bio", "net/httpsclient", "net/eventloop" };
     for (std_modules) |m| {
         if (std.mem.eql(u8, module_name, m)) {
             return try std.fmt.allocPrint(allocator, "src/std/{s}.nova", .{module_name});
@@ -817,6 +818,27 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
         }
     }
 
+    // The positional binder (T__planFor/T__bindRow) references the DB seam (Row, Column, colIndexOf). Only
+    // emit it when that seam is actually in the program (i.e. data.db was imported); a hermetic program with
+    // @serializable structs but no DB import must not gain undefined references.
+    var has_db = false;
+    {
+        var have_row = false;
+        var have_colidx = false;
+        for (declarations.items) |decl| {
+            switch (decl) {
+                .struct_decl => |sd| {
+                    if (std.mem.eql(u8, sd.name, "Row")) have_row = true;
+                },
+                .fn_decl => |fd| {
+                    if (std.mem.eql(u8, fd.name, "colIndexOf")) have_colidx = true;
+                },
+                else => {},
+            }
+        }
+        has_db = have_row and have_colidx;
+    }
+
     var src = std.ArrayList(u8).empty;
 
     var needed_enums = std.StringHashMap(void).init(allocator);
@@ -866,6 +888,12 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
                     // zero-filled the field, so a partial JSON/YAML document silently wiped the defaults.
                     if (std.mem.eql(u8, tn, "string")) {
                         try serdeAppendf(&src, allocator, "    if (src.has(\"{s}\")) {{ obj.{s} = src.getString(\"{s}\"); }}\n", .{ fname, fname, fname });
+                    } else if (std.mem.eql(u8, tn, "Str")) {
+                        // A borrowed-string field (P10 Str): bind a zero-copy VIEW instead of an owned
+                        // string. From a DB RowSource this borrows Row.raw (owned by the ResultSet, which
+                        // outlives the bind); from JSON/YAML it borrows the source node's bytes. The
+                        // caller carries the same manual-lifetime contract as Str everywhere.
+                        try serdeAppendf(&src, allocator, "    if (src.has(\"{s}\")) {{ obj.{s} = src.getStr(\"{s}\"); }}\n", .{ fname, fname, fname });
                     } else if (serdeIsInt(tn)) {
                         try serdeAppendf(&src, allocator, "    if (src.has(\"{s}\")) {{ obj.{s} = src.getInt(\"{s}\"); }}\n", .{ fname, fname, fname });
                     } else if (std.mem.eql(u8, tn, "bool")) {
@@ -886,6 +914,8 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
                         const itn = inner.ident;
                         if (std.mem.eql(u8, itn, "string")) {
                             try serdeAppendf(&src, allocator, "    if (src.has(\"{s}\")) {{ obj.{s} = src.getString(\"{s}\"); }}\n", .{ fname, fname, fname });
+                        } else if (std.mem.eql(u8, itn, "Str")) {
+                            try serdeAppendf(&src, allocator, "    if (src.has(\"{s}\")) {{ obj.{s} = src.getStr(\"{s}\"); }}\n", .{ fname, fname, fname });
                         } else if (serdeIsInt(itn)) {
                             try serdeAppendf(&src, allocator, "    if (src.has(\"{s}\")) {{ obj.{s} = src.getInt(\"{s}\"); }}\n", .{ fname, fname, fname });
                         } else if (std.mem.eql(u8, itn, "bool")) {
@@ -933,6 +963,152 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
             }
         }
         try src.appendSlice(allocator, "    return obj;\n}\n\n");
+
+        // Level A positional binder (DB ORM path). `{s}__planFor` resolves each field to its column index
+        // ONCE per result set (by name, case-insensitive); `{s}__bindRow` then reads `row.cells[pos]` by
+        // index -- no per-field name Map, no ValueSource trait dispatch. Additive: the name-based `{s}__bind`
+        // above is untouched, so JSON/YAML/web binding is unaffected. Only scalar column types are bound
+        // positionally; a field with no matching column keeps its init default (plan entry -1). Emitted only
+        // when the DB seam (Row/Column/colIndexOf) is in the program, so hermetic non-DB programs are safe.
+        if (has_db) {
+        try serdeAppendf(&src, allocator, "fn {s}__planFor(cols: List<Column>): List<int> {{\n    let plan = List<int>();\n", .{s.name});
+        for (s.fields) |f| {
+            try serdeAppendf(&src, allocator, "    plan.push(colIndexOf(cols, \"{s}\"));\n", .{f.name});
+        }
+        try src.appendSlice(allocator, "    return plan;\n}\n\n");
+
+        try serdeAppendf(&src, allocator, "fn {s}__bindRow(row: Row, plan: List<int>): {s} {{\n    let obj = {s}();\n", .{ s.name, s.name, s.name });
+        var __k: usize = 0;
+        for (s.fields) |f| {
+            const fname = f.name;
+            var acc: ?[]const u8 = null;
+            var enumName: ?[]const u8 = null;
+            const tnOpt: ?[]const u8 = switch (f.type_name) {
+                .ident => |tn| tn,
+                .optional => |inner| if (inner.* == .ident) inner.ident else null,
+                else => null,
+            };
+            if (tnOpt) |tn| {
+                if (std.mem.eql(u8, tn, "string")) {
+                    acc = "asText";
+                } else if (std.mem.eql(u8, tn, "Str")) {
+                    acc = "asView";
+                } else if (serdeIsInt(tn)) {
+                    // Match the field width so there is no narrowing: `int` -> asInt(), `long` -> asLong().
+                    acc = if (std.mem.eql(u8, tn, "int") or std.mem.eql(u8, tn, "i32")) "asInt" else "asLong";
+                } else if (std.mem.eql(u8, tn, "bool")) {
+                    acc = "asBool";
+                } else if (std.mem.eql(u8, tn, "decimal")) {
+                    acc = "asDecimal";
+                } else if (serdeIsFloat(tn)) {
+                    acc = "asDouble";
+                } else if (enums.contains(tn)) {
+                    acc = "asText";
+                    enumName = tn;
+                }
+            }
+            if (acc) |a| {
+                if (enumName) |en| {
+                    try serdeAppendf(&src, allocator, "    {{ let __p = plan.get({d}) ?? -1; if (__p >= 0) {{ obj.{s} = {s}__fromName(row.get(__p).{s}()); }} }}\n", .{ __k, fname, en, a });
+                } else {
+                    try serdeAppendf(&src, allocator, "    {{ let __p = plan.get({d}) ?? -1; if (__p >= 0) {{ obj.{s} = row.get(__p).{s}(); }} }}\n", .{ __k, fname, a });
+                }
+            }
+            __k += 1;
+        }
+        try src.appendSlice(allocator, "    return obj;\n}\n\n");
+
+        // Level B fused binder: `{s}__bindAll` decodes a WHOLE result set in one function -- the column
+        // indices are resolved ONCE into LOCALS (not a per-row `plan` List) and each row is bound in a
+        // tight inline loop with the direct accessor, exactly like a hand-rolled positional decode
+        // (`obj.f = row.get(idx).asX()`). This removes the `planFor` List allocation and the per-row
+        // `bindRow` call + `plan.get(k)` indirection that separated the generic binder from hand-decode.
+        // Driver-agnostic: any @serializable T bound via orm.bindAll<T> over any driver's ResultSet.
+        try serdeAppendf(&src, allocator, "fn {s}__bindAll(rs: ResultSet): List<{s}> {{\n    let out = List<{s}>();\n    let __n = rs.rows.size();\n    if (__n == 0) {{ return out; }}\n", .{ s.name, s.name, s.name });
+        for (s.fields, 0..) |f, fi| {
+            try serdeAppendf(&src, allocator, "    let __i{d} = colIndexOf(rs.columns, \"{s}\");\n", .{ fi, f.name });
+        }
+        try src.appendSlice(allocator, "    let __r = 0;\n    while (__r < __n) {\n        let __row = rs.rows.get(__r) ?? Row();\n");
+        try serdeAppendf(&src, allocator, "        let obj = {s}();\n", .{s.name});
+        for (s.fields, 0..) |f, fi| {
+            const fname = f.name;
+            var acc: ?[]const u8 = null;
+            var enumName: ?[]const u8 = null;
+            const tnOpt: ?[]const u8 = switch (f.type_name) {
+                .ident => |tn| tn,
+                .optional => |inner| if (inner.* == .ident) inner.ident else null,
+                else => null,
+            };
+            if (tnOpt) |tn| {
+                if (std.mem.eql(u8, tn, "string")) {
+                    acc = "asText";
+                } else if (std.mem.eql(u8, tn, "Str")) {
+                    acc = "asView";
+                } else if (serdeIsInt(tn)) {
+                    acc = if (std.mem.eql(u8, tn, "int") or std.mem.eql(u8, tn, "i32")) "asInt" else "asLong";
+                } else if (std.mem.eql(u8, tn, "bool")) {
+                    acc = "asBool";
+                } else if (std.mem.eql(u8, tn, "decimal")) {
+                    acc = "asDecimal";
+                } else if (serdeIsFloat(tn)) {
+                    acc = "asDouble";
+                } else if (enums.contains(tn)) {
+                    acc = "asText";
+                    enumName = tn;
+                }
+            }
+            if (acc) |a| {
+                if (enumName) |en| {
+                    try serdeAppendf(&src, allocator, "        if (__i{d} >= 0) {{ obj.{s} = {s}__fromName(__row.get(__i{d}).{s}()); }}\n", .{ fi, fname, en, fi, a });
+                } else {
+                    try serdeAppendf(&src, allocator, "        if (__i{d} >= 0) {{ obj.{s} = __row.get(__i{d}).{s}(); }}\n", .{ fi, fname, fi, a });
+                }
+            }
+        }
+        try src.appendSlice(allocator, "        out.push(obj);\n        __r = __r + 1;\n    }\n    return out;\n}\n\n");
+
+        // Buffer->struct binder: `{s}__bindWire` decodes a WHOLE response held as WireRows (one owned
+        // buffer + per-row offsets) STRAIGHT into structs -- NO per-row Row/RawBuffer/DbValue materialised.
+        // Each field reads its column's bytes directly from the shared buffer (Str fields borrow it). This
+        // is the buffer->struct path that eliminates the ~400 refcounted per-row objects a ResultSet builds.
+        // Covers string/Str/int/long/float; bool/decimal/enum are skipped (keep their init default).
+        try serdeAppendf(&src, allocator, "fn {s}__bindWire(w: WireRows): List<{s}> {{\n    let out = List<{s}>();\n    let __n = w.count();\n    if (__n == 0) {{ return out; }}\n", .{ s.name, s.name, s.name });
+        for (s.fields, 0..) |f, fi| {
+            try serdeAppendf(&src, allocator, "    let __i{d} = colIndexOf(w.cols, \"{s}\");\n", .{ fi, f.name });
+        }
+        try src.appendSlice(allocator, "    let __b = w.base;\n    let __r = 0;\n    while (__r < __n) {\n        let __off = w.offs.at(__r);\n");
+        try serdeAppendf(&src, allocator, "        let obj = {s}();\n", .{s.name});
+        for (s.fields, 0..) |f, fi| {
+            const fname = f.name;
+            const tnOpt: ?[]const u8 = switch (f.type_name) {
+                .ident => |tn| tn,
+                .optional => |inner| if (inner.* == .ident) inner.ident else null,
+                else => null,
+            };
+            var call: ?[]const u8 = null; // the wire accessor expression (with a trailing cast if needed)
+            if (tnOpt) |tn| {
+                if (std.mem.eql(u8, tn, "string")) {
+                    call = "wireTextAt(__b, __off, IDX)";
+                } else if (std.mem.eql(u8, tn, "Str")) {
+                    call = "wireViewAt(__b, __off, IDX)";
+                } else if (std.mem.eql(u8, tn, "int") or std.mem.eql(u8, tn, "i32")) {
+                    call = "wireIntAt(__b, __off, IDX) as int";
+                } else if (serdeIsInt(tn)) {
+                    call = "wireIntAt(__b, __off, IDX)";
+                } else if (serdeIsFloat(tn)) {
+                    call = "wireDoubleAt(__b, __off, IDX)";
+                }
+            }
+            if (call) |c| {
+                // Substitute IDX -> __i{fi}.
+                var it = std.mem.splitSequence(u8, c, "IDX");
+                const first = it.next().?;
+                const rest = it.next() orelse "";
+                try serdeAppendf(&src, allocator, "        if (__i{d} >= 0) {{ obj.{s} = {s}__i{d}{s}; }}\n", .{ fi, fname, first, fi, rest });
+            }
+        }
+        try src.appendSlice(allocator, "        out.push(obj);\n        __r = __r + 1;\n    }\n    return out;\n}\n\n");
+        }   // if (has_db)
 
         try serdeAppendf(&src, allocator, "fn {s}__toJson(obj: {s}): string {{\n    let out = \"{{\";\n    let __sep = \"\";\n", .{ s.name, s.name });
         for (s.fields) |f| {
@@ -2391,6 +2567,10 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
         }
     }
 
+    // P7 Stage 1: report-only escape gauge (no codegen effect). See docs/design/p7-sound-arena.md.
+    sema_escape.report_enabled = init.environ_map.get("NOVA_ESCAPE_REPORT") != null;
+    if (sema_escape.report_enabled) _ = sema_escape.analyze(allocator, &owned_sema.store, &owned_sema.ir, &program);
+
     const output_path = "__nova_test";
     const obj_path = try std.fmt.allocPrint(allocator, "{s}.o", .{output_path});
     defer allocator.free(obj_path);
@@ -2680,6 +2860,10 @@ fn compileProgram(
             @import("sema/inst_disp.zig").run(allocator, &owned_sema.store, &owned_sema.tab, &owned_sema.ir, ids);
         }
     }
+
+    // P7 Stage 1: report-only escape gauge (no codegen effect). See docs/design/p7-sound-arena.md.
+    sema_escape.report_enabled = init.environ_map.get("NOVA_ESCAPE_REPORT") != null;
+    if (sema_escape.report_enabled) _ = sema_escape.analyze(allocator, &owned_sema.store, &owned_sema.ir, &program);
 
     if (std.mem.eql(u8, target, "--wasm")) {
         const obj_path = try std.fmt.allocPrint(allocator, "{s}.o", .{output_path});

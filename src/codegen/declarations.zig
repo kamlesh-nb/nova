@@ -131,7 +131,11 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
 
         const str_z = try allocator.dupeZ(u8, unescaped);
         defer allocator.free(str_z);
-        const ref_const = core.LLVMConstInt(compiler.i32_type, 100000000, 0);
+        // Immortal constant: NEGATIVE refcount => nova_retain/nova_release are no-ops (both early-return on
+        // `*rc < 0`). +100000000 was decremented per use (literal stored without a matching retain, released
+        // on drop), so a literal reused >1e8 times drifted to zero, freed the shared global, and double-freed.
+        // Must match getOrCreateStringLiteral in llvm_codegen.zig (the other string-literal emitter).
+        const ref_const = core.LLVMConstInt(compiler.i32_type, @as(c_ulonglong, @bitCast(@as(i64, -1000000000))), 0);
         const len_const = core.LLVMConstInt(compiler.i32_type, @intCast(unescaped.len), 0);
         const chars_const = core.LLVMConstString(str_z.ptr, @intCast(unescaped.len), 1);
 
@@ -156,6 +160,16 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
 
         var f64bits_p = [_]types.LLVMTypeRef{core.LLVMDoubleType()};
         try compiler.func_map.put("nova_f64_bits", core.LLVMAddFunction(compiler.module, "nova_f64_bits", core.LLVMFunctionType(compiler.val_type, &f64bits_p, 1, 0)));
+
+        // nova_pg_be_f64(ptr: long, len: int) -> double : big-endian IEEE float read for the pg BINARY decode.
+        var pgbe_p = [_]types.LLVMTypeRef{ compiler.val_type, compiler.i32_type };
+        try compiler.func_map.put("nova_pg_be_f64", core.LLVMAddFunction(compiler.module, "nova_pg_be_f64", core.LLVMFunctionType(core.LLVMDoubleType(), &pgbe_p, 2, 0)));
+        // nova_pg_be_i64(ptr: long, len: int) -> long : big-endian signed int read for the pg BINARY decode.
+        var pgbei_p = [_]types.LLVMTypeRef{ compiler.val_type, compiler.i32_type };
+        try compiler.func_map.put("nova_pg_be_i64", core.LLVMAddFunction(compiler.module, "nova_pg_be_i64", core.LLVMFunctionType(compiler.val_type, &pgbei_p, 2, 0)));
+        // nova_html_find_meta(base: long, start: int, len: int) -> int : SWAR scan for next HTML metachar.
+        var hfm_p = [_]types.LLVMTypeRef{ compiler.val_type, compiler.i32_type, compiler.i32_type };
+        try compiler.func_map.put("nova_html_find_meta", core.LLVMAddFunction(compiler.module, "nova_html_find_meta", core.LLVMFunctionType(compiler.i32_type, &hfm_p, 3, 0)));
 
         // nova_f64_sqrt IS the llvm.sqrt.f64 intrinsic (double -> double), lowered by LLVM to a hardware
         // fsqrt. Registering it under this name lets math.fsqrt call it like any extern; no runtime symbol.

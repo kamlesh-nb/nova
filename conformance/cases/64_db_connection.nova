@@ -9,6 +9,8 @@ import db;
 
 // A trivial in-memory table: SELECT returns its rows; anything else is an exec that counts.
 struct MockConn impl Connection {
+    // queryWire (trait): mocks use the generic fallback that re-encodes a ResultSet.
+    async fn queryWire(self, sql: string, params: List<DbValue>): WireRows { return wireRowsFromResultSet(await self.query(sql, params)); }
     pub rows: List<Row>,
     pub prepared: List<string>,
     init() { self.rows = List<Row>(); self.prepared = List<string>(); }

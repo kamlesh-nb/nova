@@ -193,6 +193,11 @@ pub const LlvmCompiler = struct {
     coverage_enabled: bool,
     cov_registry: ?CoverageRegistry,
     current_string_builder: ?types.LLVMValueRef = null,
+    // Compile-time accumulator for adjacent NSX static text (tag opens, attributes, closes, literal text).
+    // jsxAppendLiteral appends bytes here instead of emitting a StringBuilder.append per chunk; the buffer
+    // is flushed as ONE append right before any dynamic part ({expr}, a `{for}` block) and at element end.
+    // Turns ~25 append calls per card into ~5, closing most of the gap to a hand-written builder.
+    jsx_pending_literal: std.ArrayListUnmanaged(u8) = .empty,
     current_param_names: ?[]const []const u8 = null,
 
     current_async_promise: ?types.LLVMValueRef = null,
@@ -212,6 +217,9 @@ pub const LlvmCompiler = struct {
     val_type: types.LLVMTypeRef,
 
     string_globals: std.StringHashMap(types.LLVMValueRef),
+    // Interns decimal literals (`0m`, `2m`, ...) to a lazily-initialised, immortal-pinned global so a literal
+    // parses+allocates ONCE per program run instead of on every evaluation. Keyed by the literal's digits.
+    decimal_globals: std.StringHashMap(types.LLVMValueRef),
 
     puts_fn: ?types.LLVMValueRef = null,
     printf_fn: ?types.LLVMValueRef = null,
@@ -306,6 +314,7 @@ pub const LlvmCompiler = struct {
             .ffi_externs = std.StringHashMap(ast.FunctionDecl).init(allocator),
             .constants = std.StringHashMap(ast.Expression).init(allocator),
             .string_globals = std.StringHashMap(types.LLVMValueRef).init(allocator),
+            .decimal_globals = std.StringHashMap(types.LLVMValueRef).init(allocator),
             .current_local_types = null,
             .current_local_type_ids = null,
             .current_struct_name = null,
@@ -383,6 +392,7 @@ pub const LlvmCompiler = struct {
         self.traits.deinit();
         self.constants.deinit();
         self.string_globals.deinit();
+        self.decimal_globals.deinit();
         self.lambda_parents.deinit();
         var captured_global_iter = self.captured_globals.iterator();
         while (captured_global_iter.next()) |entry| {
@@ -504,7 +514,12 @@ pub const LlvmCompiler = struct {
 
         const str_z = try self.allocator.dupeZ(u8, unescaped);
         defer self.allocator.free(str_z);
-        const ref_const = core.LLVMConstInt(self.i32_type, 100000000, 0);
+        // Immortal constant: a NEGATIVE refcount makes nova_retain/nova_release full no-ops (both early-return
+        // on `*rc < 0`). The old value was +100000000, which is NOT immortal -- it was decremented on every
+        // use (a literal is stored without a matching retain but released on drop), so a string literal reused
+        // >1e8 times drifted the count to zero, freed the shared global, and double-freed -> SIGABRT. A
+        // negative sentinel never drifts and never frees, and it also skips the per-use ARC inc/dec entirely.
+        const ref_const = core.LLVMConstInt(self.i32_type, @as(c_ulonglong, @bitCast(@as(i64, -1000000000))), 0);
         const len_const = core.LLVMConstInt(self.i32_type, @intCast(unescaped.len), 0);
         const chars_const = core.LLVMConstString(str_z.ptr, @intCast(unescaped.len), 1);
 
@@ -517,6 +532,59 @@ pub const LlvmCompiler = struct {
 
         const chars_ptr = core.LLVMBuildStructGEP2(self.builder, struct_type, global_var, 2, "chars_ptr");
         return core.LLVMBuildPtrToInt(self.builder, chars_ptr, self.val_type, "str_ptr_int");
+    }
+
+    // A decimal literal (`0m`, `2m`, ...) used to lower to an unconditional nova_decimal_from_string call --
+    // a heap alloc + ASCII parse on EVERY evaluation. In hot paths (e.g. every DbValue carries a `0m`
+    // placeholder) that is thousands of throwaway allocations per request. This interns each distinct literal
+    // to a lazily-initialised global: the parse+alloc runs once, and every later use is a load + a predicted
+    // branch. The cached value is pinned immortal (negative refcount) so sharing it across owners is safe --
+    // nova_retain/nova_release early-return on `*rc < 0`, so it never drifts or frees.
+    pub fn getOrCreateDecimalLiteral(self: *LlvmCompiler, digits: []const u8) anyerror!types.LLVMValueRef {
+        const cache_g = if (self.decimal_globals.get(digits)) |g| g else blk: {
+            const g = core.LLVMAddGlobal(self.module, self.val_type, "dec_cache");
+            core.LLVMSetLinkage(g, types.LLVMLinkage.LLVMInternalLinkage);
+            core.LLVMSetInitializer(g, core.LLVMConstInt(self.val_type, 0, 0));
+            const dup = try self.allocator.dupe(u8, digits);
+            try self.decimal_globals.put(dup, g);
+            break :blk g;
+        };
+
+        const from_fn = self.func_map.get("nova_decimal_from_string").?;
+        const from_t = core.LLVMGlobalGetValueType(from_fn);
+
+        const cur_fn = core.LLVMGetBasicBlockParent(core.LLVMGetInsertBlock(self.builder));
+        const entry_bb = core.LLVMGetInsertBlock(self.builder);
+        const init_bb = core.LLVMAppendBasicBlock(cur_fn, "dec_init");
+        const cont_bb = core.LLVMAppendBasicBlock(cur_fn, "dec_cont");
+
+        const cached = core.LLVMBuildLoad2(self.builder, self.val_type, cache_g, "dec_cached");
+        const is_zero = core.LLVMBuildICmp(self.builder, .LLVMIntEQ, cached, core.LLVMConstInt(self.val_type, 0, 0), "dec_uninit");
+        _ = core.LLVMBuildCondBr(self.builder, is_zero, init_bb, cont_bb);
+
+        // init_bb: parse once, pin immortal, cache.
+        core.LLVMPositionBuilderAtEnd(self.builder, init_bb);
+        const dz = try self.allocator.dupeZ(u8, digits);
+        defer self.allocator.free(dz);
+        const str_global = core.LLVMBuildGlobalString(self.builder, dz.ptr, "dec_lit");
+        const str_ptr = core.LLVMBuildBitCast(self.builder, str_global, self.ptr_type, "dec_lit_ptr");
+        var args = [_]types.LLVMValueRef{str_ptr};
+        const parsed = core.LLVMBuildCall2(self.builder, from_t, from_fn, &args, 1, "dec_parse_once");
+        // Pin: *(i32*)(parsed - 8) = -1000000000  => immortal to ARC (safe whether arena- or malloc-backed).
+        const hdr_addr = core.LLVMBuildSub(self.builder, parsed, core.LLVMConstInt(self.val_type, 8, 0), "dec_hdr_addr");
+        const hdr_ptr = core.LLVMBuildIntToPtr(self.builder, hdr_addr, self.ptr_type, "dec_hdr_ptr");
+        _ = core.LLVMBuildStore(self.builder, core.LLVMConstInt(self.i32_type, @as(c_ulonglong, @bitCast(@as(i64, -1000000000))), 0), hdr_ptr);
+        _ = core.LLVMBuildStore(self.builder, parsed, cache_g);
+        _ = core.LLVMBuildBr(self.builder, cont_bb);
+        const init_end_bb = core.LLVMGetInsertBlock(self.builder);
+
+        // cont_bb: phi of the cached-or-just-parsed value.
+        core.LLVMPositionBuilderAtEnd(self.builder, cont_bb);
+        const phi = core.LLVMBuildPhi(self.builder, self.val_type, "dec_val");
+        var inc_vals = [_]types.LLVMValueRef{ cached, parsed };
+        var inc_bbs = [_]types.LLVMBasicBlockRef{ entry_bb, init_end_bb };
+        core.LLVMAddIncoming(phi, &inc_vals, &inc_bbs, 2);
+        return phi;
     }
 
     pub const compileRetain = arc_mod.compileRetain;
@@ -3410,7 +3478,22 @@ pub const LlvmCompiler = struct {
                 for (ss.cases) |c| try self.collectLocalVarNamesFromStatement(list, c.body.*);
                 if (ss.default_case) |dc| try self.collectLocalVarNamesFromStatement(list, dc.*);
             },
+            // A `let` can live inside an NSX element's `{for}`/`{if}` block (e.g. a returned view). Descend
+            // into the JSX so its locals get allocas -- without this, `{for x { let p = ..; <card/> }}`
+            // fails with "variable not found" because the pre-pass never saw the `let`.
+            .expr_stmt => |es| if (es.expr.kind == .jsx_element) try self.collectLocalVarNamesFromJsx(list, es.expr.kind.jsx_element),
+            .return_stmt => |rs| if (rs.value) |v| if (v.kind == .jsx_element) try self.collectLocalVarNamesFromJsx(list, v.kind.jsx_element),
             else => {},
+        }
+    }
+
+    fn collectLocalVarNamesFromJsx(self: *LlvmCompiler, list: *std.ArrayList([]const u8), jsx: ast.JsxElement) anyerror!void {
+        for (jsx.children) |child| {
+            switch (child) {
+                .statement => |stmt| try self.collectLocalVarNamesFromStatement(list, stmt),
+                .element => |sub| try self.collectLocalVarNamesFromJsx(list, sub),
+                else => {},
+            }
         }
     }
 
@@ -3548,7 +3631,20 @@ pub const LlvmCompiler = struct {
                 for (ss.cases) |c| try self.collectLocalVarTypesFromStatement(map, c.body);
                 if (ss.default_case) |dc| try self.collectLocalVarTypesFromStatement(map, dc);
             },
+            // Same as the name pass: pick up the TYPES of `let`s nested inside an NSX element's blocks.
+            .expr_stmt => |es| if (es.expr.kind == .jsx_element) try self.collectLocalVarTypesFromJsx(map, es.expr.kind.jsx_element),
+            .return_stmt => |rs| if (rs.value) |v| if (v.kind == .jsx_element) try self.collectLocalVarTypesFromJsx(map, v.kind.jsx_element),
             else => {},
+        }
+    }
+
+    fn collectLocalVarTypesFromJsx(self: *LlvmCompiler, map: *std.StringHashMap([]const u8), jsx: ast.JsxElement) anyerror!void {
+        for (jsx.children) |child| {
+            switch (child) {
+                .statement => |stmt| try self.collectLocalVarTypesFromStatement(map, &stmt),
+                .element => |sub| try self.collectLocalVarTypesFromJsx(map, sub),
+                else => {},
+            }
         }
     }
 
@@ -3652,6 +3748,7 @@ pub const LlvmCompiler = struct {
     pub const emitJsxInto = expressions_mod.emitJsxInto;
     pub const jsxAppendVal = expressions_mod.jsxAppendVal;
     pub const jsxAppendLiteral = expressions_mod.jsxAppendLiteral;
+    pub const jsxFlushLiteral = expressions_mod.jsxFlushLiteral;
     pub const jsxAppendExpr = expressions_mod.jsxAppendExpr;
     pub const compileGenericParse = expressions_mod.compileGenericParse;
     pub const compileDecodeBinaryRow = expressions_mod.compileDecodeBinaryRow;

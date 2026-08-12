@@ -15,17 +15,14 @@ pub fn concat(a: string, b: string): string {
     let len_a = a.length;
     let len_b = b.length;
     let total_len = len_a + len_b;
+    if (total_len == 0) { return ""; }
     let ptr = allocString(total_len);
-    let i = 0;
-    while (i < len_a) {
-        bytes.write_byte(ptr, i, a[i]);
-        i = i + 1;
-    }
-    let j = 0;
-    while (j < len_b) {
-        bytes.write_byte(ptr, len_a + j, b[j]);
-        j = j + 1;
-    }
+    // Bulk memcpy each half in at its offset. The old per-byte loop made `+` on strings O(n) Nova calls
+    // (bounds-checked a[i] + write_byte per byte), so a large `prof + html` (~190KB) copied byte-by-byte
+    // every request -- it dominated the server profile (string_concat = ~21% of CPU under load). bytes.copy
+    // is a single memmove; `(ptr as long)+len_a` keeps the destination address 64-bit.
+    if (len_a > 0) { bytes.copy(ptr as long, a as long, len_a); }
+    if (len_b > 0) { bytes.copy((ptr as long) + (len_a as long), b as long, len_b); }
     return ptr;
 }
 

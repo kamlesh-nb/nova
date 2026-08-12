@@ -488,9 +488,85 @@ namespace {
 thread_local int g_reactor_id = 0;
 thread_local int g_pin_next = -1;
 
+// ---- Per-request (per-coroutine) region arena coordination -------------------------------------------
+// The arena region (alloc.cpp) that a coroutine allocates into is swapped in on every resume, so requests
+// interleaving at await points never share a bump pointer. A coroutine inherits the region active when it
+// was created (nova_coro_region_track), so a request's nested async work lands in the same region; the
+// region is created/reset at the request boundary by nova_web_region_enter/exit. When no region has ever
+// been created on this thread (every non-web program) g_region_active stays false and all of this is a
+// single predictable branch -- zero overhead off the web path.
+extern "C" void *nova_region_current(void);
+extern "C" void nova_region_set(void *r);
+extern "C" void *nova_region_new(void);
+extern "C" void nova_region_free(void *r);
+extern "C" unsigned long long nova_region_gen(void *r);
+
+// A binding captures BOTH the region pointer and the generation it had when captured. On use we re-read
+// the region's current generation: if it no longer matches (the region was freed, or its pooled struct was
+// reused for a different region), the binding is stale and we fall back to the default arena -- safe, no
+// crash, no cross-request contamination. This monotonic-generation check is what makes the per-coroutine
+// binding robust where the address/magic-only version was not.
+struct RegionBind { void *region; unsigned long long gen; };
+
+thread_local bool g_region_active = false;                 // any region ever created on this thread?
+thread_local long long g_current_coro = 0;                 // coroutine currently executing (for enter/exit)
+thread_local std::unordered_map<long long, RegionBind> g_coro_region;  // coro frame -> its region binding
+
+static inline void *validated_region(const RegionBind &b) {
+    return (b.region && nova_region_gen(b.region) == b.gen) ? b.region : nullptr;
+}
+
+extern "C" void nova_coro_region_track(long long frame) {
+    if (!g_region_active) return;                          // off the web path: no map growth
+    void *r = nova_region_current();
+    if (r) g_coro_region[frame] = RegionBind{ r, nova_region_gen(r) };  // inherit creator's region + gen
+}
+extern "C" void nova_coro_region_untrack(long long frame) {
+    if (!g_region_active) return;
+    g_coro_region.erase(frame);
+}
+
 using nova_coro_fn = void (*)(void *);
+inline bool raw_coro_done(long long h);   // defined just below
 inline void raw_coro_resume(long long h) {
+    long long prev_coro = g_current_coro;
+    g_current_coro = h;                                    // always tracked, so region_enter sees the right coro
+    if (!g_region_active) {                                // fast path: no regions in play at all
+        reinterpret_cast<nova_coro_fn *>(h)[0](reinterpret_cast<void *>(h));
+        g_current_coro = prev_coro;
+        return;
+    }
+    void *prev_region = nova_region_current();
+    auto it = g_coro_region.find(h);
+    nova_region_set(it != g_coro_region.end() ? validated_region(it->second) : nullptr);  // gen-validated
     reinterpret_cast<nova_coro_fn *>(h)[0](reinterpret_cast<void *>(h));
+    // A coroutine that has run to completion must not leave its region binding behind: frame addresses are
+    // recycled, and a stale entry would hand a freed region to the next coroutine at that address. The
+    // frame is still allocated here (freed later by nova_coro_release), so raw_coro_done reads it safely.
+    if (g_region_active && raw_coro_done(h)) g_coro_region.erase(h);
+    nova_region_set(prev_region);
+    g_current_coro = prev_coro;
+}
+
+// Called by the web serve loop around one request: enter creates a fresh region and binds it to the running
+// (serve) coroutine so its resumes and its nested coroutines allocate there; exit reclaims the whole region
+// in O(chunks) -- no per-object ARC/free. The response body lives in a persistent (malloc) buffer, so it
+// survives the reset and is safe to write after exit.
+// NOTE: the blanket per-request web region (enter/exit + the per-coroutine swap above) is DISABLED at the
+// call sites (web/app.nova) -- under real concurrency the frame-address binding produced stale regions.
+// The safe, shipping form is the SYNCHRONOUS region scope in mem/region.runStr (no awaits in the span).
+// These are kept for the future frame-carried-region design (Design B) but are currently unused.
+extern "C" void nova_web_region_enter(void) {
+    g_region_active = true;
+    void *r = nova_region_new();
+    nova_region_set(r);
+    if (g_current_coro) g_coro_region[g_current_coro] = RegionBind{ r, nova_region_gen(r) };
+}
+extern "C" void nova_web_region_exit(void) {
+    void *r = nova_region_current();
+    nova_region_set(nullptr);
+    if (g_current_coro) g_coro_region.erase(g_current_coro);
+    if (r) nova_region_free(r);
 }
 inline bool raw_coro_done(long long h) {
     return reinterpret_cast<void **>(h)[0] == nullptr;

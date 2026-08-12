@@ -21,6 +21,8 @@ struct Flag {
 }
 
 struct FlakyConn impl Connection {
+    // queryWire (trait): mocks use the generic fallback that re-encodes a ResultSet.
+    async fn queryWire(self, sql: string, params: List<DbValue>): WireRows { return wireRowsFromResultSet(await self.query(sql, params)); }
     pub flag: Flag,
     pub prepared: List<string>,
     init(flag: Flag) { self.flag = flag; self.prepared = List<string>(); }

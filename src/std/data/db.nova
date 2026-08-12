@@ -1,6 +1,10 @@
 
 import list;
 import string;
+import str;
+import bytes;
+import mem.rawbuffer;
+import collections.string_builder;
 
 pub enum DbType {
     Null,
@@ -25,6 +29,17 @@ pub struct DbValue {
     pub i: long,
     pub f: double,
     pub s: string,
+    // P4 lazy/borrowed cell. When `lazy` is true the cell's text has NOT been copied out of the driver's
+    // response buffer: `i` holds the base address of an ARC-held byte buffer (the Row's `raw`) and the
+    // cell occupies `[off, off+len)` within it. `asText`/`asDecimal`/etc materialise a Nova string ON
+    // DEMAND (and only for the columns a caller actually reads), so columns the view never touches are
+    // never copied. Only string-carried types are ever lazy (Text/Timestamp/Uuid/Json/Decimal) -- the
+    // types `decodeCell` keeps verbatim in `s`; Bool/Array/Blob/numeric stay eager. The buffer the cell
+    // points into is kept alive by the owning Row (`Row.raw`), so a lazy cell is valid for as long as
+    // its Row is -- exactly the window in which callers read it.
+    pub off: int,
+    pub len: int,
+    pub lazy: bool,
     // element values when kind == Array. LAZY: `undefined` for the common scalar case so a plain cell
     // does NOT allocate an empty list. A result set is ~columns×rows scalar cells, and eagerly allocating
     // an empty List per cell was ~2000 wasted allocations per query on the driver decode hot path.
@@ -41,11 +56,28 @@ pub struct DbValue {
         self.f = f;
         self.s = s;
         self.arr = undefined;
+        self.off = 0;
+        self.len = 0;
+        self.lazy = false;
         let _ = dec;
     }
 
     // Fluent: attach array elements. Returns self so `dbArray` composes without a second init.
     pub fn withArr(self: DbValue, elems: List<DbValue>): DbValue { self.arr = elems; return self; }
+
+    // The cell's text form. For a lazy/borrowed cell this materialises a fresh Nova string by copying
+    // `[off, off+len)` out of the ARC-held source buffer (its address is in `i`); for an eager cell it is
+    // just `s`. Every text-returning accessor and the decimal reconstruction routes through here, so a
+    // lazy cell copies its bytes exactly once, only when read, and only if read.
+    fn textOf(self: DbValue): string {
+        if (self.lazy) {
+            if (self.len <= 0) { return ""; }
+            let out = bytes.alloc(self.len);
+            bytes.copy(out as long, self.i + (self.off as long), self.len);
+            return out as string;
+        }
+        return self.s;
+    }
 
     pub fn isNull(self: DbValue): bool { return self.kind == DbType.Null; }
     pub fn asBool(self: DbValue): bool { return self.i != 0; }
@@ -53,24 +85,34 @@ pub struct DbValue {
     // the integer/float slots, so asInt/asLong/asDouble derive from the text instead of returning 0.
     // asInt/asLong truncate toward zero (the integer part); asDouble parses the full value.
     pub fn asInt(self: DbValue): int {
-        if (self.kind == DbType.Decimal) { return decimalIntPart(self.s) as int; }
+        if (self.kind == DbType.Decimal) { return decimalIntPart(self.textOf()) as int; }
+        if (self.lazy) { return string.parseI64(self.textOf()) as int; }
         return self.i as int;
     }
     pub fn asLong(self: DbValue): long {
-        if (self.kind == DbType.Decimal) { return decimalIntPart(self.s); }
+        if (self.kind == DbType.Decimal) { return decimalIntPart(self.textOf()); }
+        if (self.lazy) { return string.parseI64(self.textOf()); }
         return self.i;
     }
     pub fn asDouble(self: DbValue): double {
-        if (self.kind == DbType.Decimal) { return string.parseFloat(self.s); }
+        if (self.kind == DbType.Decimal) { return string.parseFloat(self.textOf()); }
+        if (self.lazy) { return string.parseFloat(self.textOf()); }
         return self.f;
     }
-    pub fn asDecimal(self: DbValue): decimal { return decimal.fromString(self.s); }
-    pub fn asText(self: DbValue): string { return self.s; }
+    pub fn asDecimal(self: DbValue): decimal { return decimal.fromString(self.textOf()); }
+    pub fn asText(self: DbValue): string { return self.textOf(); }
+    // P10: a BORROWED view of the cell's text -- no materialisation. For a lazy cell it points straight into
+    // the Row's `raw` buffer (valid while the Row/ResultSet lives); for an eager cell it borrows the owned
+    // `s`. The render escapes from this view (escapeHtmlIntoView) instead of minting an owned string.
+    pub fn asView(self: DbValue): str.Str {
+        if (self.lazy) { return str.raw(self.i + (self.off as long), self.len); }
+        return str.of(self.s);
+    }
     // Temporal values are carried as their normalized ISO-8601 text (in `s`) under DbType.Timestamp,
     // so a driver never lossily forces a date string through parseI64. asTimestamp == asText.
-    pub fn asTimestamp(self: DbValue): string { return self.s; }
-    pub fn asUuid(self: DbValue): string { return self.s; }   // canonical UUID string
-    pub fn asJson(self: DbValue): string { return self.s; }   // raw JSON text
+    pub fn asTimestamp(self: DbValue): string { return self.textOf(); }
+    pub fn asUuid(self: DbValue): string { return self.textOf(); }   // canonical UUID string
+    pub fn asJson(self: DbValue): string { return self.textOf(); }   // raw JSON text
     pub fn asArray(self: DbValue): List<DbValue> {   // element values (kind == Array)
         let a = self.arr;
         if (a != undefined) { return a; }
@@ -87,7 +129,7 @@ pub struct DbValue {
     pub fn asIntOr(self: DbValue, dflt: int): int { if (self.isNull()) { return dflt; } return self.asInt(); }
     pub fn asLongOr(self: DbValue, dflt: long): long { if (self.isNull()) { return dflt; } return self.asLong(); }
     pub fn asDoubleOr(self: DbValue, dflt: double): double { if (self.isNull()) { return dflt; } return self.asDouble(); }
-    pub fn asTextOr(self: DbValue, dflt: string): string { if (self.isNull()) { return dflt; } return self.s; }
+    pub fn asTextOr(self: DbValue, dflt: string): string { if (self.isNull()) { return dflt; } return self.textOf(); }
     pub fn asBoolOr(self: DbValue, dflt: bool): bool { if (self.isNull()) { return dflt; } return self.i != 0; }
 }
 
@@ -116,6 +158,16 @@ pub fn dbTimestamp(iso: string): DbValue { return DbValue(DbType.Timestamp, 0, 0
 pub fn dbUuid(s: string): DbValue { return DbValue(DbType.Uuid, 0, 0.0, 0m, s); }
 pub fn dbJson(s: string): DbValue { return DbValue(DbType.Json, 0, 0.0, 0m, s); }
 pub fn dbArray(elems: List<DbValue>): DbValue { return DbValue(DbType.Array, 0, 0.0, 0m, "").withArr(elems); }
+// P4 lazy/borrowed cell: the text lives at `[off, off+len)` inside the ARC-held buffer at address `base`
+// (the owning Row's `raw`), NOT copied. Materialised on demand by the accessors. Only the string-carried
+// types `decodeCell` keeps verbatim (Text/Timestamp/Uuid/Json/Decimal) may be constructed this way.
+pub fn dbLazy(kind: DbType, base: long, off: int, len: int): DbValue {
+    let v = DbValue(kind, base, 0.0, 0m, "");
+    v.off = off;
+    v.len = len;
+    v.lazy = true;
+    return v;
+}
 // An empty parameter list, for a query/exec/queryStream with no bound parameters.
 pub fn noParams(): List<DbValue> { return List<DbValue>(); }
 
@@ -128,12 +180,38 @@ pub struct Column {
     }
 }
 
-pub struct Row {
-    pub cells: List<DbValue>,
-    init() { self.cells = List<DbValue>(); }
+// Case-insensitive column lookup by name -> index, or -1 if absent. Used by the ORM's positional binder
+// to resolve each struct field to its column position ONCE per result set (not per row/field).
+pub fn colIndexOf(cols: List<Column>, name: string): int {
+    let want = string.toLowerCase(name);
+    let i = 0;
+    while (i < cols.size()) {
+        let c = cols.get(i) ?? Column("", DbType.Null);
+        if (string.eql(string.toLowerCase(c.name), want)) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
 
-    pub fn size(self: Row): int { return self.cells.size(); }
-    pub fn get(self: Row, i: int): DbValue { return self.cells.get(i) ?? dbNull(); }
+pub struct Row {
+    // P6: cells live directly in a RawBuffer, NOT a `List<DbValue>`. A `List` is a heap object that merely
+    // wraps a RawBuffer, so `List<DbValue>` cost TWO heap allocations per row (list object + buffer); a
+    // ~200-row result was ~400 wasted allocations. `RawBuffer<DbValue>` is the buffer directly = one alloc
+    // per row. Drivers still `row.cells.push(...)` unchanged (RawBuffer has push). DbValue's owned fields
+    // (the string `s`, the array) are retained/dropped by the buffer's value witnesses exactly as before.
+    pub cells: rawbuffer.RawBuffer<DbValue>,
+    // P4: the row's raw response bytes, held as ONE ARC string per row. Any lazy/borrowed cell in `cells`
+    // points into this buffer, so keeping the Row alive keeps its cells' backing bytes alive (and copying
+    // the Row ARC-retains it). Empty ("") for drivers that build eager cells. A driver that produces lazy
+    // cells assigns `raw` FIRST, then pushes cells referencing `raw as long`.
+    pub raw: string,
+    init() { self.cells = rawbuffer.RawBuffer<DbValue>(8); self.raw = ""; }
+
+    pub fn size(self: Row): int { return self.cells.count(); }
+    pub fn get(self: Row, i: int): DbValue {
+        if (i < 0 || i >= self.cells.count()) { return dbNull(); }
+        return self.cells.at(i);
+    }
     pub fn isNull(self: Row, i: int): bool { return self.get(i).isNull(); }
     pub fn getBool(self: Row, i: int): bool { return self.get(i).asBool(); }
     pub fn getInt(self: Row, i: int): int { return self.get(i).asInt(); }
@@ -141,6 +219,7 @@ pub struct Row {
     pub fn getDouble(self: Row, i: int): double { return self.get(i).asDouble(); }
     pub fn getDecimal(self: Row, i: int): decimal { return self.get(i).asDecimal(); }
     pub fn getText(self: Row, i: int): string { return self.get(i).asText(); }
+    pub fn getView(self: Row, i: int): str.Str { return self.get(i).asView(); }
     pub fn getArray(self: Row, i: int): List<DbValue> { return self.get(i).asArray(); }
     pub fn getTimestamp(self: Row, i: int): string { return self.get(i).asTimestamp(); }
 }
@@ -226,6 +305,128 @@ pub struct ResultSet {
         if (i <= 0) { return self; }
         return self.more.get(i - 1) ?? ResultSet();
     }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// WIRE ROWS -- zero-materialisation result for the buffer->struct path.
+//
+// A normal ResultSet materialises a per-row object graph (per row: an owned `raw` string + a
+// RawBuffer<DbValue> of cells; plus List<Row>), so a 200-row query allocates ~400 refcounted objects
+// that dominate ARC (`nova_release`). WireRows instead holds the WHOLE response in ONE owned buffer and
+// records each DataRow's byte range; the generated `T__bindWire` decodes each column straight into the
+// target struct (Str fields borrow `buf`). One buffer + the typed list, instead of ~400 objects. The
+// buffer must outlive the bound rows (their Str fields borrow it), so the caller keeps WireRows alive
+// until the rows are rendered -- exactly like a held-open ResultSet, but with a fraction of the objects.
+pub struct WireRows {
+    pub buf: string,                      // every DataRow's payload bytes, concatenated (one alloc)
+    pub base: long,                       // buf's data address (cells borrow base+off)
+    pub offs: rawbuffer.RawBuffer<int>,   // per-row start offset of the payload within buf
+    pub cols: List<Column>,
+    init(cols: List<Column>) {
+        self.buf = "";
+        self.base = 0;
+        self.offs = rawbuffer.RawBuffer<int>(8);
+        self.cols = cols;
+    }
+    pub fn count(self: WireRows): int { return self.offs.count(); }
+    // Finalise: take ownership of the concatenated payloads and cache the base address.
+    pub fn setBuf(self: WireRows, b: string): void { self.buf = b; self.base = b as long; }
+}
+
+// A single field's byte range within the wire buffer (value struct -- no allocation). len < 0 = SQL NULL.
+pub struct WireField {
+    pub off: int,
+    pub len: int,
+    init(off: int, len: int) { self.off = off; self.len = len; }
+}
+
+fn wireU16(base: long, p: int): int {
+    return bytes.read_byte(base, p) * 256 + bytes.read_byte(base, p + 1);
+}
+// A DataRow field length: i32 big-endian, with 0xFFFFFFFF meaning NULL. A real length never has its top
+// byte set (results are far below 16 MB), so a 0xFF top byte unambiguously flags NULL and avoids the
+// 32-bit overflow of computing 0xFFFFFFFF.
+fn wireLen(base: long, p: int): int {
+    let a = bytes.read_byte(base, p);
+    if (a == 255) { return -1; }
+    let b = bytes.read_byte(base, p + 1);
+    let c = bytes.read_byte(base, p + 2);
+    let d = bytes.read_byte(base, p + 3);
+    return ((a * 256 + b) * 256 + c) * 256 + d;
+}
+
+// Locate column `col` within the DataRow payload starting at `rowOff`. Payload = [i16 fieldCount]
+// [per field: i32 len (-1=NULL), bytes]. Walks the length-prefixed fields (O(col), cheap for wide rows).
+pub fn wireField(base: long, rowOff: int, col: int): WireField {
+    let p = rowOff + 2;                    // skip the i16 field count
+    let j = 0;
+    while (j < col) {
+        let l = wireLen(base, p);
+        p = p + 4;
+        if (l > 0) { p = p + l; }
+        j = j + 1;
+    }
+    return WireField(p + 4, wireLen(base, p));
+}
+
+// BORROWED view of column `col` straight into the wire buffer -- no copy (the field's zero-copy accessor).
+pub fn wireViewAt(base: long, rowOff: int, col: int): str.Str {
+    let f = wireField(base, rowOff, col);
+    if (f.len <= 0) { return str.of(""); }
+    return str.raw(base + (f.off as long), f.len);
+}
+// Owned copy of column `col` (for `string` fields that must outlive the buffer).
+pub fn wireTextAt(base: long, rowOff: int, col: int): string {
+    let f = wireField(base, rowOff, col);
+    if (f.len <= 0) { return ""; }
+    let out = bytes.alloc(f.len);
+    bytes.copy(out as long, base + (f.off as long), f.len);
+    return out as string;
+}
+// Parse an ASCII integer (text result format) straight from the buffer -- no intermediate string.
+pub fn wireIntAt(base: long, rowOff: int, col: int): long {
+    let f = wireField(base, rowOff, col);
+    if (f.len <= 0) { return 0; }
+    let i = 0;
+    let neg = false;
+    if (bytes.read_byte(base, f.off) == 45) { neg = true; i = 1; }   // '-'
+    let v: long = 0;
+    while (i < f.len) {
+        let ch = bytes.read_byte(base, f.off + i);
+        if (ch < 48 || ch > 57) { break; }
+        v = v * 10 + ((ch - 48) as long);
+        i = i + 1;
+    }
+    if (neg) { return 0 - v; }
+    return v;
+}
+// Parse an ASCII decimal (no scientific notation -- pg numeric/float text form) straight from the buffer.
+pub fn wireDoubleAt(base: long, rowOff: int, col: int): double {
+    let f = wireField(base, rowOff, col);
+    if (f.len <= 0) { return 0.0; }
+    let i = 0;
+    let neg = false;
+    if (bytes.read_byte(base, f.off) == 45) { neg = true; i = 1; }
+    let v: double = 0.0;
+    while (i < f.len) {
+        let ch = bytes.read_byte(base, f.off + i);
+        if (ch < 48 || ch > 57) { break; }
+        v = v * 10.0 + ((ch - 48) as double);
+        i = i + 1;
+    }
+    if (i < f.len && bytes.read_byte(base, f.off + i) == 46) {   // '.'
+        i = i + 1;
+        let scale = 0.1;
+        while (i < f.len) {
+            let ch = bytes.read_byte(base, f.off + i);
+            if (ch < 48 || ch > 57) { break; }
+            v = v + ((ch - 48) as double) * scale;
+            scale = scale * 0.1;
+            i = i + 1;
+        }
+    }
+    if (neg) { return 0.0 - v; }
+    return v;
 }
 
 pub struct ExecResult {
@@ -391,6 +592,12 @@ pub trait Connection {
     async fn queryPrepared(self, stmt: int, params: List<DbValue>): ResultSet;
     async fn execPrepared(self, stmt: int, params: List<DbValue>): ExecResult;
 
+    // Buffer->struct read: return the whole result as WireRows (one owned buffer + per-row offsets), so a
+    // caller's `db.query<T>` can decode straight into structs with no per-row Row/RawBuffer/DbValue. A
+    // driver whose wire text protocol matches (pg/mysql) overrides this with a direct, zero-materialisation
+    // path; others use `wireRowsFromResultSet(await self.query(...))` -- correct, but re-encodes.
+    async fn queryWire(self, sql: string, params: List<DbValue>): WireRows;
+
     // Transaction control. SQL drivers issue their dialect's BEGIN/COMMIT/ROLLBACK; the ExecResult
     // carries a DbError (via the T1 error channel) if the statement failed, so a caller can check
     // `.ok()` and, on error mid-transaction, `rollback()`. There is no auto-rollback-on-drop yet (a
@@ -403,4 +610,60 @@ pub trait Connection {
 pub trait Driver {
 
     async fn connect(self, dsn: string): Connection;
+}
+
+// Generic fallback for queryWire: re-encode a materialised ResultSet into WireRows' canonical layout
+// ([i16 fieldCount][per field: i32 len (-1=NULL), text bytes]). Correct for any driver; drivers whose
+// native wire format already matches (pg/mysql text) override queryWire with a direct, no-materialise path.
+pub fn wireRowsFromResultSet(rs: ResultSet): WireRows {
+    let w = WireRows(rs.columns);
+    let sb = string_builder.StringBuilder();
+    let nc = rs.columns.size();
+    let pos = 0;
+    let ri = 0;
+    while (ri < rs.rows.size()) {
+        let row = rs.rows.get(ri) ?? Row();
+        w.offs.push(pos);
+        sb.appendChar((nc / 256) % 256); sb.appendChar(nc % 256);           // i16 field count
+        pos = pos + 2;
+        let ci = 0;
+        while (ci < nc) {
+            let cell = row.get(ci);
+            if (cell.isNull()) {
+                sb.appendChar(255); sb.appendChar(255); sb.appendChar(255); sb.appendChar(255);
+                pos = pos + 4;
+            } else {
+                let t = cell.asText();
+                let l = t.length;
+                sb.appendChar((l / 16777216) % 256); sb.appendChar((l / 65536) % 256);
+                sb.appendChar((l / 256) % 256); sb.appendChar(l % 256);
+                sb.append(t);
+                pos = pos + 4 + l;
+            }
+            ci = ci + 1;
+        }
+        ri = ri + 1;
+    }
+    w.setBuf(sb.toString());
+    return w;
+}
+
+// A typed result that OWNS its backing buffer. When T has borrowed str.Str fields (the fast path) those
+// views point into `w.buf`, so Rows<T> must stay alive while `items` are read/rendered -- holding the ONE
+// buffer, not the ~400 per-row objects a ResultSet would. `items` is the plain typed list to iterate.
+pub struct Rows<T> {
+    pub w: WireRows,
+    pub items: List<T>,
+    init(w: WireRows, items: List<T>) { self.w = w; self.items = items; }
+    pub fn size(self: Rows<T>): int { return self.items.size(); }
+    pub fn get(self: Rows<T>, i: int): T | undefined { return self.items.get(i); }
+}
+
+// One-call typed read: fetch the whole result as ONE buffer and decode every row STRAIGHT into T (no
+// per-row Row/RawBuffer/DbValue). Returns Rows<T> which owns the buffer, so borrowed str.Str fields stay
+// valid for as long as the caller holds it. This is the buffer->struct API -- the app never types
+// serde.bindWire; it is an internal codegen detail.
+pub async fn query<T>(conn: Connection, sql: string, params: List<DbValue>): Rows<T> {
+    let w = await conn.queryWire(sql, params);
+    return Rows<T>(w, serde.bindWire<T>(w));
 }

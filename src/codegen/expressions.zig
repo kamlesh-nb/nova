@@ -629,6 +629,23 @@ pub fn awaitedCallHandle(self: *LlvmCompiler, operand: ast.Expression, is_spawn:
                 }
                 const cand = try nb.toOwnedSlice(self.allocator);
                 if (self.async_fns.contains(cand)) break :resolve cand;
+                // The spec is created under the MODULE-SCOPED base name (e.g. `data_orm_queryAs__Dto`), but
+                // `base` here is the unscoped callee (`queryAs`), so the direct candidate `queryAs__Dto` is
+                // just the SUFFIX of the real spec. Match it by suffix (with a `_` boundary), the same way
+                // the non-generic obj-qualified case below does. Without this a cross-module generic ASYNC
+                // call falls through to the erased base body and traps at runtime.
+                {
+                    var it = self.async_fns.keyIterator();
+                    while (it.next()) |k| {
+                        const key = k.*;
+                        if (key.len > cand.len + 1 and key[key.len - cand.len - 1] == '_' and
+                            std.mem.endsWith(u8, key, cand))
+                        {
+                            self.allocator.free(cand);
+                            break :resolve key;
+                        }
+                    }
+                }
                 self.allocator.free(cand);
             }
         }
@@ -1515,15 +1532,9 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     return core.LLVMConstReal(core.LLVMDoubleType(), val);
                 },
                 .decimal => |digits| {
-
-                    const cstr = try self.allocator.dupeZ(u8, digits);
-                    defer self.allocator.free(cstr);
-                    const str_global = core.LLVMBuildGlobalString(self.builder, cstr.ptr, "dec_lit");
-                    const str_ptr = core.LLVMBuildBitCast(self.builder, str_global, self.ptr_type, "dec_lit_ptr");
-                    const from_fn = self.func_map.get("nova_decimal_from_string").?;
-                    const from_t = core.LLVMGlobalGetValueType(from_fn);
-                    var args = [_]types.LLVMValueRef{str_ptr};
-                    return core.LLVMBuildCall2(self.builder, from_t, from_fn, &args, 1, "dec_from_str");
+                    // Interned + lazily-initialised: the parse+alloc runs once per distinct literal, then every
+                    // use is a load. Removes thousands of throwaway `0m` allocations per request in hot paths.
+                    return try self.getOrCreateDecimalLiteral(digits);
                 },
                 else => {
                     std.debug.print("Literal type not supported yet: {s}\n", .{@tagName(lit)});
@@ -2971,6 +2982,93 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     }
                     var dargs = [_]types.LLVMValueRef{ obj_val, sink_val };
                     return try self.buildCallWithCasts(fn_val, &dargs);
+                }
+
+                // serde.planFor<T>(cols) -> T__planFor(cols): resolve field->column positions once.
+                if (fa.object.kind == .ident and std.mem.eql(u8, fa.object.kind.ident, "serde") and
+                    std.mem.eql(u8, fa.field, "planFor") and gc.type_args.len == 1 and gc.args.len == 1)
+                {
+                    const rendered = try self.resolveReifyTypeName(gc.type_args[0]);
+                    const name = try std.fmt.allocPrint(self.allocator, "{s}__planFor", .{rendered});
+                    defer self.allocator.free(name);
+                    const resolved = try self.resolveCalleeName(name);
+                    const fn_val = self.func_map.get(resolved) orelse self.func_map.get(name) orelse {
+                        if (!self.structs.contains(getStructBaseName(rendered))) {
+                            self.emitTrapIf(core.LLVMConstInt(core.LLVMInt1Type(), 1, 0), "unreachable: serde.planFor on an unresolved type parameter (erased generic body)");
+                            return core.LLVMConstInt(self.val_type, 0, 0);
+                        }
+                        std.debug.print("serde.planFor: '{s}' not found\n", .{name});
+                        return error.FunctionNotFound;
+                    };
+                    const cols_val = try self.compileCallArgument(gc.args[0]);
+                    var pargs = [_]types.LLVMValueRef{cols_val};
+                    return try self.buildCallWithCasts(fn_val, &pargs);
+                }
+
+                // serde.bindRow<T>(row, plan) -> T__bindRow(row, plan): positional bind, no name Map / trait.
+                if (fa.object.kind == .ident and std.mem.eql(u8, fa.object.kind.ident, "serde") and
+                    std.mem.eql(u8, fa.field, "bindRow") and gc.type_args.len == 1 and gc.args.len == 2)
+                {
+                    const rendered = try self.resolveReifyTypeName(gc.type_args[0]);
+                    const name = try std.fmt.allocPrint(self.allocator, "{s}__bindRow", .{rendered});
+                    defer self.allocator.free(name);
+                    const resolved = try self.resolveCalleeName(name);
+                    const fn_val = self.func_map.get(resolved) orelse self.func_map.get(name) orelse {
+                        if (!self.structs.contains(getStructBaseName(rendered))) {
+                            self.emitTrapIf(core.LLVMConstInt(core.LLVMInt1Type(), 1, 0), "unreachable: serde.bindRow on an unresolved type parameter (erased generic body)");
+                            return core.LLVMConstInt(self.val_type, 0, 0);
+                        }
+                        std.debug.print("serde.bindRow: '{s}' not found\n", .{name});
+                        return error.FunctionNotFound;
+                    };
+                    const row_val = try self.compileCallArgument(gc.args[0]);
+                    const plan_val = try self.compileCallArgument(gc.args[1]);
+                    var bargs = [_]types.LLVMValueRef{ row_val, plan_val };
+                    return try self.buildCallWithCasts(fn_val, &bargs);
+                }
+
+                // serde.bindAll<T>(rs) -> T__bindAll(rs): fused whole-result-set positional bind (indices as
+                // locals, tight loop) -- matches a hand-rolled decode, no planFor List / per-row bindRow call.
+                if (fa.object.kind == .ident and std.mem.eql(u8, fa.object.kind.ident, "serde") and
+                    std.mem.eql(u8, fa.field, "bindAll") and gc.type_args.len == 1 and gc.args.len == 1)
+                {
+                    const rendered = try self.resolveReifyTypeName(gc.type_args[0]);
+                    const name = try std.fmt.allocPrint(self.allocator, "{s}__bindAll", .{rendered});
+                    defer self.allocator.free(name);
+                    const resolved = try self.resolveCalleeName(name);
+                    const fn_val = self.func_map.get(resolved) orelse self.func_map.get(name) orelse {
+                        if (!self.structs.contains(getStructBaseName(rendered))) {
+                            self.emitTrapIf(core.LLVMConstInt(core.LLVMInt1Type(), 1, 0), "unreachable: serde.bindAll on an unresolved type parameter (erased generic body)");
+                            return core.LLVMConstInt(self.val_type, 0, 0);
+                        }
+                        std.debug.print("serde.bindAll: '{s}' not found\n", .{name});
+                        return error.FunctionNotFound;
+                    };
+                    const rs_val = try self.compileCallArgument(gc.args[0]);
+                    var bargs = [_]types.LLVMValueRef{rs_val};
+                    return try self.buildCallWithCasts(fn_val, &bargs);
+                }
+
+                // serde.bindWire<T>(w) -> T__bindWire(w): decode WireRows (one buffer + offsets) STRAIGHT
+                // into structs, no per-row Row/RawBuffer/DbValue -- the buffer->struct path.
+                if (fa.object.kind == .ident and std.mem.eql(u8, fa.object.kind.ident, "serde") and
+                    std.mem.eql(u8, fa.field, "bindWire") and gc.type_args.len == 1 and gc.args.len == 1)
+                {
+                    const rendered = try self.resolveReifyTypeName(gc.type_args[0]);
+                    const name = try std.fmt.allocPrint(self.allocator, "{s}__bindWire", .{rendered});
+                    defer self.allocator.free(name);
+                    const resolved = try self.resolveCalleeName(name);
+                    const fn_val = self.func_map.get(resolved) orelse self.func_map.get(name) orelse {
+                        if (!self.structs.contains(getStructBaseName(rendered))) {
+                            self.emitTrapIf(core.LLVMConstInt(core.LLVMInt1Type(), 1, 0), "unreachable: serde.bindWire on an unresolved type parameter (erased generic body)");
+                            return core.LLVMConstInt(self.val_type, 0, 0);
+                        }
+                        std.debug.print("serde.bindWire: '{s}' not found\n", .{name});
+                        return error.FunctionNotFound;
+                    };
+                    const w_val = try self.compileCallArgument(gc.args[0]);
+                    var bargs = [_]types.LLVMValueRef{w_val};
+                    return try self.buildCallWithCasts(fn_val, &bargs);
                 }
 
                 if (fa.object.kind == .ident and std.mem.eql(u8, fa.object.kind.ident, "serde") and
@@ -4591,19 +4689,58 @@ pub fn jsxAppendVal(self: *LlvmCompiler, sb: types.LLVMValueRef, val: types.LLVM
 
 // Append a compile-time string literal into `sb`.
 pub fn jsxAppendLiteral(self: *LlvmCompiler, sb: types.LLVMValueRef, text: []const u8) !void {
-    const expr = ast.Expression{ .kind = .{ .literal = .{ .string = text } } };
+    _ = sb;
+    // Accumulate static text; a single append is emitted at the next flush point (see jsx_pending_literal).
+    try self.jsx_pending_literal.appendSlice(self.allocator, text);
+}
+
+// Emit the accumulated static text as ONE StringBuilder.append, then clear. Called before every dynamic
+// part and at element end so adjacent literals collapse into a single append.
+pub fn jsxFlushLiteral(self: *LlvmCompiler, sb: types.LLVMValueRef) !void {
+    if (self.jsx_pending_literal.items.len == 0) return;
+    const expr = ast.Expression{ .kind = .{ .literal = .{ .string = self.jsx_pending_literal.items } } };
     const str_val = try self.compileExpression(expr);
     try self.jsxAppendVal(sb, str_val);
+    self.jsx_pending_literal.clearRetainingCapacity();
 }
 
 // Append an interpolated `{expr}` child into `sb`: strings append directly; numeric/bool/etc. go through
 // numToString (a FRESH owned string that append copies, so it is released here to avoid a per-render leak).
 pub fn jsxAppendExpr(self: *LlvmCompiler, sb: types.LLVMValueRef, expr: *const ast.Expression) !void {
+    try self.jsxFlushLiteral(sb); // emit the static run that precedes this interpolation
     const val = try self.compileExpression(expr.*);
     const type_name = try self.resolveExpressionTypeName(expr);
     if (type_name) |t| {
         if (std.mem.eql(u8, t, "string")) {
-            try self.jsxAppendVal(sb, val);
+            // Auto-escape untrusted data interpolations, like Go's html/template and Rust's esc(): every
+            // `{stringExpr}` is HTML-escaped as it is appended, so app code never calls escapeHtml by hand
+            // and the output is XSS-safe by default. Component/markup calls flow through the `{for}`/`{if}`
+            // STATEMENT path (compileAppendToStringBuilder), not here, so generated markup is left intact.
+            // Escape-INTO-the-builder: escapeHtmlInto(sb, val) writes the escaped bytes straight into the
+            // render buffer -- no intermediate escaped string is allocated (the old path allocated one per
+            // interpolation, ~1200 per product page). It neither retains nor releases `val`, which is the
+            // same net-zero ARC effect the old retain-in-escapeHtml + release-of-result had, and matches the
+            // unescaped else branch (which also appends `val` without releasing it).
+            if (self.getFunc("web_response_escapeHtmlInto")) |escInto| {
+                const escInto_t = core.LLVMGlobalGetValueType(escInto);
+                var ea = [_]types.LLVMValueRef{ sb, self.coerceToSlotType(val, self.val_type) };
+                _ = core.LLVMBuildCall2(self.builder, escInto_t, escInto, &ea, 2, "");
+            } else {
+                try self.jsxAppendVal(sb, val);
+            }
+            return;
+        } else if (std.mem.eql(u8, t, "Str")) {
+            // P10: `{v}` where `v` is a borrowed `str.Str` escapes STRAIGHT from the borrow into the builder
+            // (escapeHtmlIntoView) -- no owned intermediate string, unlike the `string` branch above. `Str`
+            // is a VALUE STRUCT: pass `val` DIRECTLY, exactly as compileCallArgument does for a normal call
+            // (do NOT coerce it to an i64 -- that mangles the {ptr,len} struct and yields garbage).
+            if (self.getFunc("web_response_escapeHtmlIntoView")) |escView| {
+                const escView_t = core.LLVMGlobalGetValueType(escView);
+                var ea = [_]types.LLVMValueRef{ sb, val };
+                _ = core.LLVMBuildCall2(self.builder, escView_t, escView, &ea, 2, "");
+            } else {
+                try self.jsxAppendVal(sb, val);
+            }
             return;
         } else if (types_mod.isPrimitiveTypeName(t) and !std.mem.eql(u8, t, "void") and !std.mem.eql(u8, t, "any")) {
             const str_temp = try self.numToString(val, t);
@@ -4654,6 +4791,7 @@ pub fn emitJsxInto(self: *LlvmCompiler, sb_val: types.LLVMValueRef, jsx: ast.Jsx
             .element => |sub_el| try self.emitJsxInto(sb_val, sub_el),
             .expression => |*expr| try self.jsxAppendExpr(sb_val, expr),
             .statement => |stmt| {
+                try self.jsxFlushLiteral(sb_val); // emit static before the control-flow block
                 // A `{for ...}`/`{if ...}` block. Its body appends into current_string_builder, which is
                 // sb_val here, so the dynamically generated tags land in the SAME single builder.
                 const dummy_func = FunctionInfo{
@@ -4696,6 +4834,7 @@ pub fn compileJsxElement(self: *LlvmCompiler, jsx: ast.JsxElement) anyerror!type
     _ = core.LLVMBuildCall2(self.builder, sb_new_t, sb_new, &sb_args, 1, "");
 
     try self.emitJsxInto(sb_val, jsx);
+    try self.jsxFlushLiteral(sb_val); // emit the trailing static run before materialising the string
 
     const sb_toString_t = core.LLVMGlobalGetValueType(sb_toString);
     var toString_args = [_]types.LLVMValueRef{sb_val};

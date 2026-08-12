@@ -1098,9 +1098,21 @@ pub const Inferer = struct {
                 if (g.callee.kind == .field_access) {
                     const sfa = g.callee.kind.field_access;
                     if (sfa.object.kind == .ident and std.mem.eql(u8, sfa.object.kind.ident, "serde") and g.type_args.len == 1) {
-                        if (std.mem.eql(u8, sfa.field, "bind")) {
+                        if (std.mem.eql(u8, sfa.field, "bind") or std.mem.eql(u8, sfa.field, "bindRow")) {
                             for (g.args) |*a| _ = try self.inferExpr(a);
                             return self.ok(try self.lowerer.lower(g.type_args[0]));
+                        }
+                        if (std.mem.eql(u8, sfa.field, "bindAll") or std.mem.eql(u8, sfa.field, "bindWire")) {
+                            for (g.args) |*a| _ = try self.inferExpr(a);
+                            var params = [_]ast.TypeRef{g.type_args[0]};
+                            const list_ref = ast.TypeRef{ .generic = .{ .name = "List", .params = &params } };
+                            return self.ok(try self.lowerer.lower(list_ref));
+                        }
+                        if (std.mem.eql(u8, sfa.field, "planFor")) {
+                            for (g.args) |*a| _ = try self.inferExpr(a);
+                            var params = [_]ast.TypeRef{ast.TypeRef{ .ident = "int" }};
+                            const list_ref = ast.TypeRef{ .generic = .{ .name = "List", .params = &params } };
+                            return self.ok(try self.lowerer.lower(list_ref));
                         }
                         if (std.mem.eql(u8, sfa.field, "typeName")) {
                             return self.ok(try self.store.stringT());

@@ -1,0 +1,32 @@
+// Synchronous arena scope (Design A).
+//
+// `runStr` runs `body` with a fresh per-request region active, then reclaims the WHOLE region in O(1) --
+// no per-object ARC, no per-object free -- for every allocation `body` made. It is SAFE BY CONSTRUCTION:
+//
+//   * `body` is a NON-ASYNC closure, so it cannot `await`. The span therefore has no yield points: nothing
+//     else runs on the reactor thread during it, so no other request's allocations can interleave into
+//     this region and none of this region's objects can leak into another request. This is exactly why the
+//     blanket per-coroutine binding was unsafe and this scoped form is not.
+//   * Because there is no I/O in the span, no reactor op-records or pooled structures are allocated here,
+//     so nothing that outlives the request lands in the region.
+//   * The only value that escapes is the return. The contract is that `body` returns a value NOT allocated
+//     in the region -- in practice a `StringBuilder.toString()` result, which is allocated on the
+//     persistent (malloc) heap via `alloc_persistent_nz` and so is untouched by the region reset.
+//
+// Intended use: wrap a synchronous, allocation-heavy render, e.g.
+//     let html = region.runStr(() => catalog.productGrid(prods));
+
+extern("c") fn nova_region_current(): long;
+extern("c") fn nova_region_set(r: long): void;
+extern("c") fn nova_region_new(): long;
+extern("c") fn nova_region_free(r: long): void;
+
+pub fn runStr(body: () -> string): string {
+    let saved = nova_region_current();
+    let r = nova_region_new();
+    nova_region_set(r);
+    let result = body();            // synchronous: allocates in the region; returns a persistent string
+    nova_region_set(saved);         // restore the (usually null) outer region
+    nova_region_free(r);            // reclaim the region's chunks in O(1); `result` (persistent) survives
+    return result;
+}

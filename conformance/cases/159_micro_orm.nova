@@ -22,6 +22,8 @@ fn row(id: int, name: string, active: bool): Row {
 // A stand-in Connection whose `query` returns a fixed users result — the SAME seam a real driver
 // implements, so `queryAs<T>` is driver-agnostic.
 struct MockConn impl Connection {
+    // queryWire (trait): mocks use the generic fallback that re-encodes a ResultSet.
+    async fn queryWire(self, sql: string, params: List<DbValue>): WireRows { return wireRowsFromResultSet(await self.query(sql, params)); }
     async fn exec(self: MockConn, sql: string, params: List<DbValue>): ExecResult {
         return ExecResult(0, "MOCK");
     }
@@ -53,7 +55,7 @@ fn test_query_materializes_typed_rows(): void {
     let conn = MockConn{};
     let params = List<DbValue>();
     params.push(db.dbInt(1)); // bound out-of-band — never interpolated into the SQL string
-    let users = orm.queryAs<UserDto>(conn, "SELECT id, name, active FROM users WHERE tenant = $1", params);
+    let users = orm.queryAsBlocking<UserDto>(conn, "SELECT id, name, active FROM users WHERE tenant = $1", params);
 
     assert.equalInt(users.size(), 2);
     let u0 = users.get(0) ?? UserDto{ id: -1, name: "", active: false };
@@ -70,7 +72,7 @@ fn test_query_materializes_typed_rows(): void {
 @test
 fn test_query_one(): void {
     let conn = MockConn{};
-    let one = orm.queryOne<UserDto>(conn, "SELECT id, name, active FROM users LIMIT 1", List<DbValue>());
+    let one = orm.queryOneBlocking<UserDto>(conn, "SELECT id, name, active FROM users LIMIT 1", List<DbValue>());
     assert.isTrue(one != undefined);
     let u = one ?? UserDto{ id: -1, name: "", active: false };
     assert.equalInt(u.id, 7);
