@@ -2657,6 +2657,12 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                         const byte_val = core.LLVMBuildLoad2(self.builder, self.i8_type, ptr, "byte_val");
                         return core.LLVMBuildZExt(self.builder, byte_val, self.val_type, "byte_val_ext");
                     }
+                    // FR-mem-4: bytes.read_i32/write_i32 (and the u16/i16 pair above) are the native-endian
+                    // raw accessors. They emit exactly what mem.load/store<int> with Endian.little lowers to
+                    // on a little-endian host: an unaligned iN load/store plus the sext/zext. The mem builtins
+                    // are the endianness-explicit superset; new wire codecs should reach for those, while these
+                    // stay as the terse in-memory fast path. Same emitted IR, so they are reconciled by
+                    // construction rather than by routing one through the other.
                     if (std.mem.eql(u8, fa.field, "read_i32")) {
                         const ptr_val = try self.compileExpression(call.args[0]);
                         const offset_val = try self.compileExpression(call.args[1]);
