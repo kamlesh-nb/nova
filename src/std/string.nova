@@ -529,6 +529,121 @@ pub fn parseFloat(s: string): double {
     return result;
 }
 
+// A2 (further-refinement.md, gaps.md E-parse): the failure-surfacing parse family. Unlike parseI64/parseFloat
+// (which return 0 on garbage, truncate at the first non-digit, and saturate on overflow -- silent wrong
+// values), these return `undefined` on ANY invalid input: empty, a lone sign, a non-digit anywhere, trailing
+// garbage, or overflow. Valid input returns the value. This is the sound primitive new code should use;
+// parseI64/parseFloat are kept unchanged for the drivers that already depend on their exact behaviour.
+
+pub fn parseLong(s: string): long | undefined {
+    let len = s.length;
+    if (len == 0) { return undefined; }
+
+    let i = 0;
+    let neg = false;
+    if (s[0] == 45) {          // '-'
+        neg = true;
+        i = 1;
+    } else if (s[0] == 43) {   // '+'
+        i = 1;
+    }
+    if (i >= len) { return undefined; }   // a sign with no digits
+
+    let LONG_MIN: long = -9223372036854775807 - 1;
+    let LONG_MAX: long = 9223372036854775807;
+    let limit: long = 0 - LONG_MAX;
+    if (neg) { limit = LONG_MIN; }
+    let multmin: long = limit / 10;
+
+    // Accumulate on the NEGATIVE side so the most-negative value has a representation (the positive side
+    // cannot hold LONG_MIN's magnitude). The final negate lifts a non-negative result back.
+    let acc: long = 0;
+    while (i < len) {
+        let c = s[i];
+        if (c < 48 || c > 57) { return undefined; }   // strict: any non-digit is a failure
+        let d: long = (c - 48) as long;
+        if (acc < multmin) { return undefined; }        // acc * 10 would overflow
+        acc = acc * 10;
+        if (acc < limit + d) { return undefined; }      // acc - d would overflow
+        acc = acc - d;
+        i = i + 1;
+    }
+    if (neg) { return acc; }
+    return 0 - acc;
+}
+
+pub fn parseInt(s: string): int | undefined {
+    let v = parseLong(s);
+    if (v == undefined) { return undefined; }
+    let INT_MIN: long = -2147483648;
+    let INT_MAX: long = 2147483647;
+    if (v < INT_MIN || v > INT_MAX) { return undefined; }   // out of 32-bit range
+    return v as int;
+}
+
+// Grammar: optional sign, an integer part and/or a fractional part (at least one digit overall), and an
+// optional `e`/`E` exponent with an optional sign and at least one digit. Anything else (a lone `.`, a
+// dangling exponent, trailing text, or `inf`/`nan` text which this reference parser does not accept) returns
+// undefined. This fixes the parseFloat exponent bug (`"1e3"` decoded as 13, not 1000) for new callers.
+pub fn parseDouble(s: string): double | undefined {
+    let len = s.length;
+    if (len == 0) { return undefined; }
+
+    let i = 0;
+    let neg = false;
+    if (s[0] == 45) {          // '-'
+        neg = true;
+        i = 1;
+    } else if (s[0] == 43) {   // '+'
+        i = 1;
+    }
+
+    let sawDigit = false;
+    let intPart = 0.0;
+    while (i < len && s[i] >= 48 && s[i] <= 57) {
+        intPart = intPart * 10.0 + ((s[i] - 48) as double);
+        sawDigit = true;
+        i = i + 1;
+    }
+
+    let frac = 0.0;
+    let scale = 1.0;
+    if (i < len && s[i] == 46) {   // '.'
+        i = i + 1;
+        while (i < len && s[i] >= 48 && s[i] <= 57) {
+            scale = scale / 10.0;
+            frac = frac + ((s[i] - 48) as double) * scale;
+            sawDigit = true;
+            i = i + 1;
+        }
+    }
+    if (!sawDigit) { return undefined; }   // no mantissa digits: "", ".", "+", "e5"
+    let mant = intPart + frac;
+
+    if (i < len && (s[i] == 101 || s[i] == 69)) {   // 'e' or 'E'
+        i = i + 1;
+        let expNeg = false;
+        if (i < len && s[i] == 45) { expNeg = true; i = i + 1; }
+        else if (i < len && s[i] == 43) { i = i + 1; }
+        let sawExpDigit = false;
+        let exp = 0;
+        while (i < len && s[i] >= 48 && s[i] <= 57) {
+            exp = exp * 10 + (s[i] - 48);
+            sawExpDigit = true;
+            i = i + 1;
+        }
+        if (!sawExpDigit) { return undefined; }   // 'e' with no exponent digits
+        let p = 0;
+        let factor = 1.0;
+        while (p < exp) { factor = factor * 10.0; p = p + 1; }
+        if (expNeg) { mant = mant / factor; } else { mant = mant * factor; }
+    }
+
+    if (i != len) { return undefined; }   // trailing garbage
+    if (neg) { mant = 0.0 - mant; }
+    return mant;
+}
+
 pub fn delete(self: string): void {
 }
 
@@ -553,4 +668,27 @@ fn test_string_helpers(): void {
 
     if (parseI64("1234") != 1234) { nova_test_fail("parseI64 positive fail"); }
     if (parseI64("-56") != -56) { nova_test_fail("parseI64 negative fail"); }
+
+    // A2 failure-surfacing parse family.
+    if ((parseLong("1234") ?? -1) != 1234) { nova_test_fail("parseLong ok fail"); }
+    if ((parseLong("-56") ?? 1) != -56) { nova_test_fail("parseLong neg fail"); }
+    if (parseLong("") != undefined) { nova_test_fail("parseLong empty should be undefined"); }
+    if (parseLong("12x") != undefined) { nova_test_fail("parseLong trailing garbage should be undefined"); }
+    if (parseLong("+") != undefined) { nova_test_fail("parseLong lone sign should be undefined"); }
+    if (parseLong("99999999999999999999") != undefined) { nova_test_fail("parseLong overflow should be undefined"); }
+
+    if ((parseInt("42") ?? -1) != 42) { nova_test_fail("parseInt ok fail"); }
+    if (parseInt("3000000000") != undefined) { nova_test_fail("parseInt out-of-i32-range should be undefined"); }
+    if (parseInt("abc") != undefined) { nova_test_fail("parseInt non-numeric should be undefined"); }
+
+    let d1 = (parseDouble("1e3") ?? 0.0) - 1000.0;
+    if (d1 > 0.0001 || d1 < -0.0001) { nova_test_fail("parseDouble exponent fail"); }
+    let d2 = (parseDouble("2.5") ?? 0.0) - 2.5;
+    if (d2 > 0.0001 || d2 < -0.0001) { nova_test_fail("parseDouble frac fail"); }
+    let d3 = (parseDouble("-1.5e2") ?? 0.0) + 150.0;
+    if (d3 > 0.0001 || d3 < -0.0001) { nova_test_fail("parseDouble neg exp fail"); }
+    if (parseDouble("") != undefined) { nova_test_fail("parseDouble empty should be undefined"); }
+    if (parseDouble("1.2.3") != undefined) { nova_test_fail("parseDouble double-dot should be undefined"); }
+    if (parseDouble("1e") != undefined) { nova_test_fail("parseDouble dangling exp should be undefined"); }
+    if (parseDouble("5x") != undefined) { nova_test_fail("parseDouble trailing garbage should be undefined"); }
 }

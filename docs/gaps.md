@@ -37,7 +37,7 @@ Mx / Ax / Sx / Ex / Tx) link to the detail sections below.
 | Primitives, sized ints | 3.1 | ok | ~ (honest-int overflow pending) | ok | ok | - | K7 |
 | `string` | 3.3 | ok | ok | ok | ok | - | |
 | Value vs reference structs | 3.2 | ok | ok | ok | ok | - | |
-| Optionals `T?` (`T \| undefined`) | 3.4 | **NO** | **NO** | ok | ~ | **NO** | C3, C6 |
+| Optionals `T?` (`T \| undefined`) | 3.4 | ~ (A1: return-optional-as-plain now checked; assign/pass C6 open) | **NO** | ok | ~ (return_optional_as_plain) | **NO** | C3, C6 |
 | Error unions (`T \| E`) | 3.5 | ~ | **NO** (`T\|E\|undefined`) | ok | ~ | **NO** | C2 |
 | `decimal` | 3.6 | ok | ok | ok | ok | - | |
 | Containers / generics | 3.7 | ~ | **NO** (`Set<T>` erased) | ok | ~ | **NO** | C5, K2, K8 |
@@ -47,9 +47,9 @@ Mx / Ax / Sx / Ex / Tx) link to the detail sections below.
 | Trait default methods | 3.8 | - | - (unsupported) | - | - | - | T3 |
 | `any` | 3.8 | ~ | **NO** (ARC bypass) | ok | NO | **NO** | K3 |
 | Ownership / ARC | 4 | - | ~ (fail-open owned) | ok | - | **NO** | C1, C3, M1..M4 |
-| Functions, methods, closures | 5.1 | **NO** (method arity) | **NO** (stored closure) | ok | ~ | **NO** | C1(chk), C4 |
+| Functions, methods, closures | 5.1 | ~ (A1: method arity now checked; closure arity C4 open) | **NO** (stored closure) | ok | ok (method_arity_mismatch) | ~ | C1(chk) done, C4 |
 | Unresolved call | 5.1 / 8 | **NO** (N3) | crash no-span | - | ~ | **NO** | C2(chk) |
-| `if` / `while` condition | 6.1 | **NO** (blocklist) | miscompile | ok | ~ | **NO** | C4(chk) |
+| `if` / `while` condition | 6.1 | ok (A1: sema requires bool, fail-closed) | miscompile | ok | ok (if_optional_condition) | ~ | C4(chk) done |
 | `for` (all forms) | 6.2 | ok | ok | ok | ok | - | |
 | `switch` exhaustiveness | 6.3 | **NO** | UB fall-through | ok | NO | **NO** | C5(chk) |
 | `defer` / `break` / `continue` | 6.4 | - | **NO** (skipped on loop jump; no all-path defer) | ~ | NO | - | K1, E-defer |

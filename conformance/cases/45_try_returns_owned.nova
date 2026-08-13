@@ -38,7 +38,7 @@ fn test_try_returns_owned_list(): void {
 fn firstOf(): string {
     let l = try getList(true);
     l.push("gamma");
-    return l.get(2);
+    return l.get(2) ?? "";
 }
 
 @test
@@ -84,7 +84,7 @@ fn getMap(ok: bool): Map<string, string> | Err {
 
 fn mapValue(): string {
     let m = try getMap(true);
-    return m.get("k");
+    return m.get("k") ?? "";
 }
 
 @test

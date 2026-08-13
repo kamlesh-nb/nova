@@ -264,6 +264,38 @@ pub const TryErrorMismatch = struct {
     fn_err: TypeId,
 };
 
+// A1 fail-closed soundness pass (gaps.md C-chk-4). A condition in `if` / `while` / `for` must be a `bool`.
+// A non-bool condition (int/long/enum/optional/string) was silently accepted and its discriminant/word used
+// as truthiness -- silent wrong control flow. `.unresolved` is left alone (fail-open only where sema genuinely
+// could not type the expression, to avoid false positives from the incomplete inferrer).
+pub const CondTypeError = struct {
+    span: ast.Span,
+    got: TypeId,
+    ctx: []const u8,
+};
+
+// A1 (gaps.md C-chk-3). Returning a `T | undefined` value where the function is declared to return a plain
+// non-optional `T`. The unwrapped path reads the value word of an absent optional and dereferences the
+// `undefined` sentinel -- a runtime SEGV with no compile error. Narrowing-safe: sema rebinds a narrowed
+// optional to its non-optional inner type in scope, so a guarded `return x` inside `if (x != undefined)` is
+// already non-optional here and does not fire.
+pub const RetOptionalError = struct {
+    span: ast.Span,
+    ret: TypeId,
+    val: TypeId,
+};
+
+// A1 (gaps.md C-chk-1). A method call `obj.m(...)` whose argument count does not match the method's declared
+// parameters (Nova has no default or variadic params, so the arity is exact). Was previously unchecked and
+// produced an LLVMVerificationError with no source span; free-function/constructor arity was already checked
+// in the legacy pass.
+pub const MethodArityError = struct {
+    span: ast.Span,
+    name: []const u8,
+    expected: usize,
+    got: usize,
+};
+
 pub const Inferer = struct {
     allocator: std.mem.Allocator,
     store: *types.TypeStore,
@@ -289,6 +321,12 @@ pub const Inferer = struct {
     catch_mismatch_errors: std.ArrayListUnmanaged(CatchMismatchError) = .empty,
 
     try_error_mismatch_errors: std.ArrayListUnmanaged(TryErrorMismatch) = .empty,
+
+    cond_type_errors: std.ArrayListUnmanaged(CondTypeError) = .empty,
+
+    ret_optional_errors: std.ArrayListUnmanaged(RetOptionalError) = .empty,
+
+    method_arity_errors: std.ArrayListUnmanaged(MethodArityError) = .empty,
 
     fatal_unresolved_idents: usize = 0,
 
@@ -1613,6 +1651,7 @@ pub const Inferer = struct {
             out_sym.* = mid;
             const m = self.symtab.symbolAt(mid);
             if (m.decl != .function) return null;
+            self.checkMethodArity(m.decl.function.params, args, fa, owner.name, fa.span);
             const ret = m.decl.function.ret_type orelse return try self.store.voidT();
             const lowered = try self.lowerer.lower(ret);
             if (self.store.get(lowered) == .unresolved) return null;
@@ -1625,6 +1664,7 @@ pub const Inferer = struct {
         out_sym.* = mid;
         const m = self.symtab.symbolAt(mid);
         if (m.decl != .function) return null;
+        self.checkMethodArity(m.decl.function.params, args, fa, owner.name, fa.span);
         const ret = m.decl.function.ret_type orelse return try self.store.voidT();
 
         const fd0 = m.decl.function;
@@ -1965,7 +2005,7 @@ pub const Inferer = struct {
             },
             .expr_stmt => |*es| _ = try self.inferExpr(&es.expr),
             .if_stmt => |*i| {
-                _ = try self.inferExpr(&i.condition);
+                try self.checkCond(&i.condition, "if");
 
                 const narrow: ?Narrowing = if (i.condition.kind == .binary)
                     narrowedBinding(i.condition.kind.binary)
@@ -1976,7 +2016,7 @@ pub const Inferer = struct {
                 if (i.else_branch) |e| try self.narrowedBranch(narrow, false, e);
             },
             .while_stmt => |*w| {
-                _ = try self.inferExpr(&w.condition);
+                try self.checkCond(&w.condition, "while");
                 try self.inferStmt(w.body);
             },
             .for_stmt => |*f| {
@@ -1984,7 +2024,7 @@ pub const Inferer = struct {
                 defer self.pop();
 
                 if (f.initializer) |i| try self.inferStmt(i);
-                if (f.condition) |*c| _ = try self.inferExpr(c);
+                if (f.condition) |*c| try self.checkCond(c, "for");
                 if (f.increment) |*inc| _ = try self.inferExpr(inc);
 
                 if (f.iterator) |*it| {
@@ -2018,11 +2058,53 @@ pub const Inferer = struct {
                 if (r.value) |*v| {
                     const rt = try self.inferExprExpecting(v, self.current_ret);
 
+                    // A1 (C-chk-3): returning an optional where a plain non-optional is declared. `rt` is the
+                    // value's type AFTER narrowing, so a guarded `return x` is already non-optional and safe.
+                    if (self.current_ret) |crt| {
+                        const rtk = self.store.get(rt);
+                        const crtk = self.store.get(crt);
+                        const declared_plain = crtk != .optional and crtk != .unresolved and
+                            crtk != .any_ and crtk != .error_union;
+                        if (rtk == .optional and declared_plain) {
+                            self.ret_optional_errors.append(self.allocator, .{ .span = v.span, .ret = crt, .val = rt }) catch {};
+                        }
+                    }
+
                     if (self.store.get(rt) != .unresolved) self.captured_return = rt;
                 }
             },
             .defer_stmt => |*d| _ = try self.inferExpr(&d.expr),
 .break_stmt, .continue_stmt => {},
+        }
+    }
+
+    // A1 (C-chk-4): a control-flow condition must be a `bool`. Infer it (so its subexpressions are still typed
+    // and any narrowing bindings are computed by the caller), then reject a resolved non-bool. `.unresolved` is
+    // exempt so the incomplete inferrer does not raise false positives on expressions it cannot type.
+    fn checkCond(self: *Inferer, cond: *const ast.Expression, ctx: []const u8) !void {
+        const t = try self.inferExpr(cond);
+        const ty = self.store.get(t);
+        const is_bool = ty == .prim and ty.prim.kind == .bool;
+        if (!is_bool and ty != .unresolved) {
+            self.cond_type_errors.append(self.allocator, .{ .span = cond.span, .got = t, .ctx = ctx }) catch {};
+        }
+    }
+
+    // A1 (C-chk-1): exact method-call arity. `fnp` includes the leading `self`. Two call forms reach here and
+    // pass `self` differently: an INSTANCE call `x.m(a)` passes only the explicit args (self is the receiver,
+    // implicit), whereas a STATIC/UFCS call `Type.m(x, a)` passes the receiver as the FIRST explicit arg (self
+    // is explicit). We detect the static form by the receiver being the bare owner type name and not a bound
+    // local, and count `self` in the expected total there. Nova has no default/variadic params, so this is
+    // exact equality once the form is known.
+    fn checkMethodArity(self: *Inferer, fnp: []const ast.Param, args: []const ast.Expression, fa: ast.FieldAccess, owner_name: []const u8, span: ast.Span) void {
+        const has_self = fnp.len > 0 and std.mem.eql(u8, fnp[0].name, "self");
+        const self_explicit = fa.object.kind == .ident and
+            self.lookup(fa.object.kind.ident) == null and
+            std.mem.eql(u8, fa.object.kind.ident, owner_name);
+        var expected: usize = fnp.len;
+        if (has_self and !self_explicit) expected -= 1;
+        if (args.len != expected) {
+            self.method_arity_errors.append(self.allocator, .{ .span = span, .name = fa.field, .expected = expected, .got = args.len }) catch {};
         }
     }
 

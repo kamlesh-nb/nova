@@ -1,0 +1,13 @@
+// EXPECT-FAIL: typecheck
+// A1 fail-closed soundness (gaps.md C-chk-3). Returning a `T | undefined` value where the function is
+// declared to return a plain non-optional `T`. Unwrapping an absent optional dereferences the `undefined`
+// sentinel -- a runtime SEGV with NO compile error before this check. Must be REJECTED at compile time.
+// The fix is `x ?? default`, or narrow with `if (x != undefined) { return x; }` and return a fallback.
+fn lookup(hit: bool): string {
+    let x: string | undefined = if (hit) "found" else undefined;
+    return x;
+}
+@test
+fn t(): void {
+    let s = lookup(false);
+}

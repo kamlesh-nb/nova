@@ -49,8 +49,8 @@ Workstream A are in scope; the performance, crypto, SIMD, and arena work is defe
 
 | ID | Item | Master | Priority | Status |
 |----|------|--------|----------|--------|
-| A-1 | Fail-closed soundness pass (checker + codegen loud on unresolved type) | A-1 | P0 | not started |
-| A-2 | Parse-family (parseInt/parseLong/parseDouble optionals) + small stdlib gaps | A-2 | P0 | not started |
+| A-1 | Fail-closed soundness pass (checker + codegen loud on unresolved type) | A-1 | P0 | in progress (3 confirmed defects landed: non-bool condition C-chk-4, return-optional-as-plain C-chk-3, method arity C-chk-1; each with an expect_fail guard; corpus green 323/324) |
+| A-2 | Parse-family (parseInt/parseLong/parseDouble optionals) + small stdlib gaps | A-2 | P0 | in progress (parseInt/parseLong/parseDouble optionals landed in std/string.nova with strict-fail + exponent grammar + tests; parseI64/parseFloat kept unchanged for drivers; further small helpers added on demand as the slice app needs them) |
 | FR-mem | The `mem` byte/bit builtins (mem.load<T>/store<T> + Endian) | none | P3 | deferred |
 | FR-A | Phase A: pure-Nova algorithm fixes on the mem builtins | none | P3 | deferred |
 | FR-tls | TLS AES-GCM record-layer fixes (GHASH Shoup table, key-schedule cache) | none | P3 | deferred |

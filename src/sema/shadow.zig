@@ -363,6 +363,42 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
         std.process.exit(1);
     }
 
+    if (inf.cond_type_errors.items.len > 0) {
+        std.debug.print("Type checking failed with {d} error(s):\n", .{inf.cond_type_errors.items.len});
+        for (inf.cond_type_errors.items) |ce| {
+            const got_name = renderLegacy(allocator, store, ce.got) catch "<type>";
+            std.debug.print(
+                "  \x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m the condition of `{s}` must be a `bool`, but this expression has type '{s}'. Compare explicitly (e.g. `x != 0`, `x != undefined`, `x == SomeEnum.Case`); a non-bool value is not implicitly truthy.\x1b[0m\n",
+                .{ ce.span.file, ce.span.line, ce.span.col, ce.ctx, got_name },
+            );
+        }
+        std.process.exit(1);
+    }
+
+    if (inf.ret_optional_errors.items.len > 0) {
+        std.debug.print("Type checking failed with {d} error(s):\n", .{inf.ret_optional_errors.items.len});
+        for (inf.ret_optional_errors.items) |re| {
+            const ret_name = renderLegacy(allocator, store, re.ret) catch "<type>";
+            const val_name = renderLegacy(allocator, store, re.val) catch "<type>";
+            std.debug.print(
+                "  \x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m returning a possibly-`undefined` value of type '{s}' where the function is declared to return '{s}'. Make it present first: `x ?? default`, or narrow with `if (x != undefined) {{ return x; }}` and return a fallback otherwise, or widen the return type to '{s}'.\x1b[0m\n",
+                .{ re.span.file, re.span.line, re.span.col, val_name, ret_name, val_name },
+            );
+        }
+        std.process.exit(1);
+    }
+
+    if (inf.method_arity_errors.items.len > 0) {
+        std.debug.print("Type checking failed with {d} error(s):\n", .{inf.method_arity_errors.items.len});
+        for (inf.method_arity_errors.items) |me| {
+            std.debug.print(
+                "  \x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m method '{s}' expects {d} argument(s), got {d}.\x1b[0m\n",
+                .{ me.span.file, me.span.line, me.span.col, me.name, me.expected, me.got },
+            );
+        }
+        std.process.exit(1);
+    }
+
     {
         var count: usize = 0;
         for (program.declarations) |decl| {
