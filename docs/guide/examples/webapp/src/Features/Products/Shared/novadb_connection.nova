@@ -71,6 +71,14 @@ pub struct NovaDbConnection impl Connection, Service {
         return await c.query(sql, params);
     }
 
+    // T1: the Connection seam requires queryWire; delegate to the opened connection (NovaConnection returns
+    // the generic re-encode fallback). Without this the wrapper does not satisfy the trait and the app fails
+    // to build.
+    async fn queryWire(self: NovaDbConnection, sql: string, params: List<DbValue>): WireRows {
+        let c = await self.ensure();
+        return await c.queryWire(sql, params);
+    }
+
     fn close(self: NovaDbConnection): void {
         let existing = self.conn;
         if (existing != undefined) { existing.close(); }
