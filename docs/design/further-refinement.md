@@ -47,17 +47,28 @@ Status values: `not started`, `in progress`, `blocked`, `done`, `deferred`. "Mas
 consolidated plan at `../../../PLATFORM-PLAN.md`. For the current push only the soundness items that feed
 Workstream A are in scope; the performance, crypto, SIMD, and arena work is deferred.
 
-| ID | Item | Master | Priority | Status |
-|----|------|--------|----------|--------|
-| A-1 | Fail-closed soundness pass (checker + codegen loud on unresolved type) | A-1 | P0 | in progress (3 confirmed defects landed: non-bool condition C-chk-4, return-optional-as-plain C-chk-3, method arity C-chk-1; each with an expect_fail guard; corpus green 323/324) |
-| A-2 | Parse-family (parseInt/parseLong/parseDouble optionals) + small stdlib gaps | A-2 | P0 | in progress (parseInt/parseLong/parseDouble optionals landed in std/string.nova with strict-fail + exponent grammar + tests; parseI64/parseFloat kept unchanged for drivers; further small helpers added on demand as the slice app needs them) |
-| FR-mem | The `mem` byte/bit builtins (mem.load<T>/store<T> + Endian) | none | P3 | deferred |
-| FR-A | Phase A: pure-Nova algorithm fixes on the mem builtins | none | P3 | deferred |
-| FR-tls | TLS AES-GCM record-layer fixes (GHASH Shoup table, key-schedule cache) | none | P3 | deferred |
-| FR-deflate | DEFLATE match-search fixes (bestLen-skip, SWAR compare) | none | P3 | deferred |
-| FR-simd | Phase B: the SIMD facility (portable int vectors + crypto intrinsics) | none | P3 | deferred |
-| FR-arena | Remove the parked per-request region arena | none | P3 | deferred |
-| FR-safety | Nova-native safety ergonomics (T? sugar, all-path defer, exhaustive switch, try?) | none | P3 | deferred |
+Granular per sub-item so "what is done" is unambiguous. Status: `not started`, `in progress`, `done`,
+`deferred`. Every `done` row names its verification.
+
+| ID | Item | Priority | Status |
+|----|------|----------|--------|
+| A-1 | Fail-closed soundness pass (checker + codegen loud on unresolved type) | P0 | done (3 defects landed with expect_fail guards; slice 7/7; corpus green) |
+| A-2 | Parse-family (parseInt/parseLong/parseDouble optionals) + small stdlib gaps | P0 | done (optionals + exponent grammar in std/string.nova; parseI64/parseFloat kept for drivers) |
+| **FR-mem-1** | `mem.load<T>` / `mem.store<T>` + `Endian` enum (Tier 1 builtins) | P2 | not started (foundation for FR-deflate/FR-tls; lower to unaligned load/store + bswap in codegen/expressions.zig, type from T in sema/infer.zig, per the simd/serde template) |
+| **FR-mem-2** | `rotl` / `rotr` / `ctz` / `clz` / `bswap` scalar bit builtins (Tier 2) | P2 | not started (lower to llvm.fshl/fshr/cttz/ctlz/bswap) |
+| **FR-mem-3** | `xorBytes(dst,a,b,len)` (Tier 3, AES-GCM keystream/tag XOR) | P2 | not started (word-at-a-time XOR loop) |
+| **FR-mem-4** | Reconcile `bytes.read_i32`/`write_i32` through `mem.load/store<int>` | P3 | not started |
+| **FR-deflate-3** | Best-length-first skip in the chain walk | P2 | not started (biggest DEFLATE win; needs FR-mem) |
+| **FR-deflate-4** | SWAR word-at-a-time match extension (64-bit load + ctz) | P2 | not started (needs FR-mem-1 + FR-mem-2) |
+| **FR-deflate-5** | Per-matched-byte hash-update + BitWriter output review | P3 | not started |
+| **FR-tls-1** | Shoup-table GHASH (4-bit table, per-key) | P2 | not started (biggest TLS win; ~60% GHASH is bitwise gmult) |
+| **FR-tls-2** | Cache AES key schedule + H (+ GHASH table) per cipher context | P2 | not started (stop recomputing per record) |
+| **FR-simd-L1** | Integer-vector SIMD (u8x16/u32x4/u64x2/i128 + ops + movemask) | P3 | not started (extend the f64x4 codegen-builtin mechanism) |
+| **FR-simd-L2** | Target crypto intrinsics (AES-NI, PCLMULQDQ, ARM pmull) + fallback | P3 | not started (target-gated; FR-tls software path is the fallback) |
+| **FR-arena** | Remove the parked per-request region arena (region.nova + runtime state) | P3 | not started (ONE isolated commit; keep io/arena.nova) |
+| **FR-safety** | Nova-native safety ergonomics (T? sugar, all-path defer, exhaustive switch, try?, default trait methods, Result, @deprecated) | P1 | not started (language features; the soundness floor) |
+| aux-deflate-verify | Confirm DEFLATE byte-correctness / gzip interop before the perf rewrites | P2 | done (bidirectional system-gzip interop verified; corpus case 320 added as the regression guard the perf rewrites must not break) |
+| aux-wasm-gate | Restore the `--wasm-run` behavioural gate | P2 | done (harness env was missing nova_bytes_copy + nova_bytes_alloc_persistent_nz; added; instantiate restored. Residual: string.parseDouble asserts diverge under WASM, a narrow tracked wasm-float item) |
 
 ## Finding 1: TLS AES-GCM record layer
 

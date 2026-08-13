@@ -1,5 +1,20 @@
 # P7 — Sound per-request arena via compiler escape analysis
 
+## Master tracking table
+
+Status: `not started`, `in progress`, `done`, `deferred`, `superseded`.
+
+| ID | Item | Status |
+|----|------|--------|
+| P7-S1 | Stage 1: escape gauge, report-only (NOVA_ESCAPE_REPORT, escape.zig) | done (shipped report-only; ~10% of sites classified function-local) |
+| P7-S2 | Stage 2: interprocedural summaries (param-escapes / return-fresh), still report-only | done (shipped report-only) |
+| P7-S3+ | Stage 3+: request-escape (persistent-sink) analysis + arena enablement | superseded (function-escape is the wrong granularity; blanket arena was 28% slower + GB RSS; the churn it targeted was largely captured by the wire-to-struct + str.Str borrow work, so /products already beats Rust) |
+| P7-remove | Remove the parked scaffolding (region.nova, runtime region state, escape.zig gauge) | not started (tracked as FR-arena in [further-refinement.md](further-refinement.md); ONE isolated commit) |
+
+The sound arena is NOT the next move (see the Stage-3 reasoning below and the FR-arena decision in
+`further-refinement.md`). This document is retained for the analysis; the actionable outcome is the FR-arena
+removal, not a resumed arena build.
+
 ## Why
 
 A `sample` of the pizza web app under load (byte-matched 194 KB `/products`, fused Level-B binder,
