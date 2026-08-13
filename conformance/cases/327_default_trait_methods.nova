@@ -1,0 +1,44 @@
+// FR-safety-3: default trait-method bodies. A trait method may carry a default body; an impl that does
+// not override it inherits the default (the parser copies it onto the struct in expandTraitDefaults). This
+// is the ecosystem fix for the trait-break class: a trait can grow a method with a sensible default (the
+// wireRowsFromResultSet fallback that broke four drivers) without forcing every conformer to change.
+import assert;
+
+trait Greeter {
+    fn name(self: Self): string;                 // required
+    fn greet(self: Self): string {               // default body, calls the required method
+        return "Hello, " + self.name();
+    }
+}
+
+// Uses the default greet.
+struct English impl Greeter {
+    pub fn name(self: English): string { return "World"; }
+}
+
+// Overrides the default greet.
+struct Loud impl Greeter {
+    pub fn name(self: Loud): string { return "everyone"; }
+    pub fn greet(self: Loud): string { return "HEY " + self.name(); }
+}
+
+// Dynamic dispatch through the trait must land on the default for a non-overriding conformer.
+fn greetVia(g: Greeter): string {
+    return g.greet();
+}
+
+@test
+fn default_used_and_overridden(): void {
+    let e = English {};
+    assert.equalStr(e.greet(), "Hello, World");   // default
+    let l = Loud {};
+    assert.equalStr(l.greet(), "HEY everyone");   // override
+}
+
+@test
+fn default_through_dyn_dispatch(): void {
+    let e = English {};
+    assert.equalStr(greetVia(e), "Hello, World"); // default reached via the trait object
+    let l = Loud {};
+    assert.equalStr(greetVia(l), "HEY everyone"); // override reached via the trait object
+}
