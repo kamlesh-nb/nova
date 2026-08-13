@@ -1093,6 +1093,13 @@ pub const Parser = struct {
                     err_ptr.* = et;
                     base_type = ast.TypeRef{ .error_union = .{ .ok = ok_ptr, .err = err_ptr } };
                 }
+            } else if (self.match(.question)) {
+                // FR-safety-1: `T?` is pure sugar for `T | undefined`. It wraps the same .optional node the
+                // union path produces, so `string?` and `string | undefined` are the identical type. Chains
+                // (`T??`) just wrap again, harmless and idempotent for the checker's narrowing.
+                const opt_ptr = try self.allocator.create(ast.TypeRef);
+                opt_ptr.* = base_type;
+                base_type = ast.TypeRef{ .optional = opt_ptr };
             } else if (self.match(.left_bracket)) {
                 const len_token = self.current();
                 try self.expect(.integer);

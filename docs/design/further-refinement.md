@@ -66,7 +66,12 @@ Granular per sub-item so "what is done" is unambiguous. Status: `not started`, `
 | **FR-simd-L1** | Integer-vector SIMD (u8x16/u32x4/u64x2/i128 + ops + movemask) | P3 | not started (extend the f64x4 codegen-builtin mechanism) |
 | **FR-simd-L2** | Target crypto intrinsics (AES-NI, PCLMULQDQ, ARM pmull) + fallback | P3 | not started (target-gated; FR-tls software path is the fallback) |
 | **FR-arena** | Remove the parked per-request region arena (region.nova + runtime state) | P3 | done (deleted mem/region.nova + its std_modules entry, the Region machinery in alloc.cpp, and the per-coroutine region swap in concurrency.cpp; coroutine resume now runs the frame directly and coro frames are plain malloc/free; the synchronous request arena bytes.arenaMark/arenaReset is KEPT; corpus 328/329, reactor cases ASAN-clean) |
-| **FR-safety** | Nova-native safety ergonomics (T? sugar, all-path defer, exhaustive switch, try?, default trait methods, Result, @deprecated) | P1 | not started (language features; the soundness floor) |
+| **FR-safety-1** | `T?` sugar for `T \| undefined` | P1 | done (parser wraps a postfix `?` on a type into the same .optional node the union produces, so `string?` IS `string \| undefined`; works in return/param/field/let positions; verified corpus case 325. Surfaced a SEPARATE pre-existing crash: a value-optional call result passed directly as a nested arg, unrelated to the sugar, worked around in the case + logged) |
+| **FR-safety-2** | `defer` all-path cleanup (extends errdefer) | P1 | not started (runs on every scope exit, reverse order) |
+| **FR-safety-3** | Default trait-method bodies | P1 | not started (highest-leverage ecosystem fix; impls may omit a method that has a default) |
+| **FR-safety-4** | Enforced exhaustive `switch` over enums | P1 | not started (missing arm without default = compile error) |
+| **FR-safety-5** | Error ergonomics: `try?` + `Result<T,E>` alias | P1 | not started (thin layers over the T\|E union) |
+| **FR-safety-6** | `@deprecated` attribute (warn + suggested replacement) | P1 | not started (stdlib evolution past beta) |
 | aux-deflate-verify | Confirm DEFLATE byte-correctness / gzip interop before the perf rewrites | P2 | done (bidirectional system-gzip interop verified; corpus case 320 added as the regression guard the perf rewrites must not break) |
 | aux-wasm-gate | Restore the `--wasm-run` behavioural gate | P2 | done (harness env was missing nova_bytes_copy + nova_bytes_alloc_persistent_nz; added; instantiate restored. Residual: string.parseDouble asserts diverge under WASM, a narrow tracked wasm-float item) |
 
