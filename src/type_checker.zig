@@ -117,9 +117,27 @@ fn stringScalarClash(a: ast.TypeRef, b: ast.TypeRef) bool {
     return false;
 }
 
+/// A structured, span-carrying diagnostic, kept alongside the pretty-printed
+/// `errors` strings so tooling (the language server) can map each error back to
+/// a source range instead of scraping the ANSI-formatted text. The message here
+/// is the plain, human-readable text with no terminal colour codes.
+pub const Diagnostic = struct {
+    file: []const u8,
+    /// Byte offset of the reported node's start (reliable, unlike span.end).
+    start: usize,
+    line: usize,
+    col: usize,
+    message: []const u8,
+};
+
 pub const TypeChecker = struct {
     allocator: std.mem.Allocator,
     errors: std.ArrayList([]const u8),
+    /// Span-carrying view of the same errors, for tooling (see `Diagnostic`).
+    structured: std.ArrayList(Diagnostic),
+    /// When true, `check` does not print the failure summary to stderr. The
+    /// language server sets this so its stderr stays clean; the CLI leaves it off.
+    silent: bool = false,
     file_sources: *std.StringHashMap([]const u8),
     enums: std.StringHashMap(ast.EnumDecl),
     variables: std.StringHashMap(ast.TypeRef),
@@ -155,6 +173,7 @@ pub const TypeChecker = struct {
         return TypeChecker{
             .allocator = allocator,
             .errors = std.ArrayList([]const u8).empty,
+            .structured = std.ArrayList(Diagnostic).empty,
             .file_sources = file_sources,
             .enums = std.StringHashMap(ast.EnumDecl).init(allocator),
             .variables = std.StringHashMap(ast.TypeRef).init(allocator),
@@ -182,6 +201,10 @@ pub const TypeChecker = struct {
             self.allocator.free(err);
         }
         self.errors.deinit(self.allocator);
+        for (self.structured.items) |d| {
+            self.allocator.free(d.message);
+        }
+        self.structured.deinit(self.allocator);
         self.enums.deinit();
         self.variables.deinit();
         self.structs.deinit();
@@ -199,6 +222,18 @@ pub const TypeChecker = struct {
     fn addError(self: *TypeChecker, span: ast.Span, comptime fmt: []const u8, args: anytype) void {
         const user_msg = std.fmt.allocPrint(self.allocator, fmt, args) catch return;
         defer self.allocator.free(user_msg);
+
+        // Keep a span-carrying copy for tooling (the language server maps these
+        // onto editor ranges). Best-effort: a failed dupe just skips the entry.
+        if (self.allocator.dupe(u8, user_msg)) |plain| {
+            self.structured.append(self.allocator, .{
+                .file = span.file,
+                .start = span.start,
+                .line = span.line,
+                .col = span.col,
+                .message = plain,
+            }) catch self.allocator.free(plain);
+        } else |_| {}
 
         const src = self.file_sources.get(span.file) orelse "";
 
@@ -304,9 +339,11 @@ pub const TypeChecker = struct {
         }
 
         if (self.errors.items.len > 0) {
-            std.debug.print("Type checking failed with {d} error(s):\n", .{self.errors.items.len});
-            for (self.errors.items) |err| {
-                std.debug.print("  {s}\n", .{err});
+            if (!self.silent) {
+                std.debug.print("Type checking failed with {d} error(s):\n", .{self.errors.items.len});
+                for (self.errors.items) |err| {
+                    std.debug.print("  {s}\n", .{err});
+                }
             }
             return error.TypeCheckError;
         }
@@ -865,11 +902,11 @@ pub const TypeChecker = struct {
             },
             .go_expr => |g| {
                 if (self.is_wasm) {
-                    self.addError(g.span, "'spawn'/'go' is not available on the wasm target — there is no coroutine runtime in wasm. Guard native code with `@native {{ ... }}`.", .{});
+                    self.addError(g.span, "'spawn' is not available on the wasm target — there is no coroutine runtime in wasm. Guard native code with `@native {{ ... }}`.", .{});
                 }
 
                 if (!self.in_async) {
-                    self.addError(g.span, "'go' is only allowed inside an 'async fn'", .{});
+                    self.addError(g.span, "'spawn' is only allowed inside an 'async fn'", .{});
                 }
                 const saved = self.in_awaited;
                 self.in_awaited = true;

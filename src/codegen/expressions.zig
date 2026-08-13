@@ -1204,7 +1204,7 @@ pub fn buildWhenAny(self: *LlvmCompiler, buf_expr: ast.Expression, n_expr: ast.E
 pub fn buildGo(self: *LlvmCompiler, g: ast.AwaitExpr, is_detached: bool) anyerror!types.LLVMValueRef {
 
     const inner_hi = (try self.awaitedCallHandle(g.operand.*, true)) orelse {
-        std.debug.print("'go' requires a direct async fn call (M3-D-4)\n", .{});
+        std.debug.print("'spawn' requires a direct async fn call (M3-D-4)\n", .{});
         return error.GoUnsupportedOperand;
     };
     const fname = if (is_detached) "nova_sched_schedule_detached" else "nova_sched_schedule";
