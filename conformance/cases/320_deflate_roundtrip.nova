@@ -24,3 +24,19 @@ fn deflate_empty_and_short(): void {
     assert.equalStr(deflate.gunzip(deflate.gzipCompress("")), "");
     assert.equalStr(deflate.gunzip(deflate.gzipCompress("x")), "x");
 }
+
+// FR-deflate-4 guard: a long, highly repetitive payload forces matches well past 8 bytes, so the
+// word-at-a-time (SWAR) match extension runs both its 8-byte window and its byte tail. Round-tripping
+// it proves the wide compare picks exactly the byte-by-byte match length across the word boundary.
+@test
+fn deflate_long_match_swar(): void {
+    let unit = "the quick brown fox jumps over the lazy dog 0123456789 ";
+    let data = "";
+    let i = 0;
+    while (i < 64) {          // ~3.5 KiB of repeats, matches run to the 258-byte cap
+        data = data + unit;
+        i = i + 1;
+    }
+    assert.equalStr(deflate.inflate(deflate.deflateRaw(data).toString()).toString(), data);
+    assert.equalStr(deflate.gunzip(deflate.gzipCompress(data)), data);
+}

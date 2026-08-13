@@ -8,6 +8,7 @@
 
 import bytes;
 import string;
+import mem.endian;   // FR-deflate-4: mem.load<ulong>/ctz for the word-at-a-time match extension
 
 // ------------------------------------------------------------------------------------------------
 // Growable byte buffer (INFLATE output size is not known up front, and LZ77 back-references need
@@ -606,7 +607,23 @@ pub fn deflateRaw(data: string): ByteBuf {
                         }
                     }
                     if (!skip) {
+                        // FR-deflate-4: SWAR word-at-a-time compare. Load 8 bytes from each side, XOR, and
+                        // if any byte differs the little-endian trailing-zero count over 8 gives how many
+                        // low bytes matched. Only used while a full 8-byte window stays inside maxLen (so it
+                        // never reads past pos + maxLen <= n); the remainder falls to the byte loop. On the
+                        // long matches HTML produces this is several times faster than one byte per step.
                         let l = 0;
+                        while (l + 8 <= maxLen) {
+                            let wa = mem.load<ulong>(data, cand + l, endian.Endian.little);
+                            let wb = mem.load<ulong>(data, pos + l, endian.Endian.little);
+                            let x = wa ^ wb;
+                            if (x == 0) {
+                                l = l + 8;
+                            } else {
+                                l = l + (mem.ctz<ulong>(x) >> 3);
+                                break;
+                            }
+                        }
                         while (l < maxLen && bytes.read_byte(data, cand + l) == bytes.read_byte(data, pos + l)) {
                             l = l + 1;
                         }
