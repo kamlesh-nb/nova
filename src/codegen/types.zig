@@ -1188,6 +1188,16 @@ pub fn resolveExpressionTypeName(self: *LlvmCompiler, expr_ptr: *const ast.Expre
     return try self.substTypeParams(try sema_shadow.renderLegacy(self.allocator, st, t));
 }
 
+// Phase-3 foundation: the SINGLE sanctioned TypeId -> string boundary for the string->TypeId cutover.
+// Returns the mangled/rendered symbol name for a TypeId, mirroring the tail of resolveExpressionTypeName
+// (renderLegacy, then substTypeParams to resolve lingering type-parameters through the active
+// method/instantiation substitution). All remaining places that still need a NAME from a TypeId should
+// eventually route through here, so the one place that turns a type into a string is auditable.
+pub fn symbolName(self: *LlvmCompiler, tid: typesys.TypeId) anyerror![]const u8 {
+    const st = self.type_store.?;
+    return try self.substTypeParams(try sema_shadow.renderLegacy(self.allocator, st, tid));
+}
+
 pub fn resolveCalleeName(self: *LlvmCompiler, callee_name: []const u8) ![]const u8 {
     if (self.hasFunction(callee_name)) {
         return callee_name;

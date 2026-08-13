@@ -3761,6 +3761,7 @@ pub const LlvmCompiler = struct {
     pub const isVoidExpr = types_mod.isVoidExpr;
     pub const isAnyExpr = types_mod.isAnyExpr;
     pub const isDecimalExpr = types_mod.isDecimalExpr;
+    pub const symbolName = types_mod.symbolName;
     pub const tupleElemTraitName = types_mod.tupleElemTraitName;
     pub const isOwnedErrUnionErr = types_mod.isOwnedErrUnionErr;
     pub const isOwnedStorageElem = types_mod.isOwnedStorageElem;
