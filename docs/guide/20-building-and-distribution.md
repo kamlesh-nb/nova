@@ -124,6 +124,29 @@ NOVA_VERSION=v0.1.0 NOVA_LLVM_PREFIX=<arm64 Windows LLVM> \
   zig build archive -Dtarget=aarch64-windows -Dstatic-llvm
 ```
 
+### The full host build matrix
+
+Builds are done on the host, and each operating system produces both of its architectures. The target
+is always a Zig triple passed with `-Dtarget`, and you point `NOVA_LLVM_PREFIX` at that architecture's
+LLVM static archives. A native build (the host's own architecture) needs no `-Dtarget`. The six
+supported host builds:
+
+| Host | Build for | Invocation |
+|------|-----------|------------|
+| macOS | macOS arm64 (native on Apple silicon) | `zig build archive -Dstatic-llvm` |
+| macOS | macOS x86_64 (Intel) | `NOVA_LLVM_PREFIX=<x86_64 macOS LLVM> zig build archive -Dtarget=x86_64-macos -Dstatic-llvm` |
+| Windows | Windows x86_64 (native on x64) | `zig build archive -Dstatic-llvm` |
+| Windows | Windows arm64 | `NOVA_LLVM_PREFIX=<arm64 Windows LLVM> zig build archive -Dtarget=aarch64-windows -Dstatic-llvm` |
+| WSL2 / Linux | Linux x86_64 (native on x64) | `zig build archive -Dstatic-llvm` |
+| WSL2 / Linux | Linux arm64 | `NOVA_LLVM_PREFIX=<arm64 Linux LLVM> zig build archive -Dtarget=aarch64-linux-gnu -Dstatic-llvm` |
+
+The one input Zig cannot synthesise is the target architecture's LLVM, so a second-architecture build
+on the same host needs that architecture's LLVM install pointed at by `NOVA_LLVM_PREFIX`. The native
+build needs no target flag and links the host LLVM (the hardcoded dev prefix, or your
+`NOVA_LLVM_PREFIX`). The same matrix applies to the sibling toolchain repos (nls, NovaDB, the
+orchestrator): each uses the same `-Dtarget` pass-through, and only the ones that link LLVM (the
+compiler and nls) need the per-architecture `NOVA_LLVM_PREFIX`.
+
 What makes this work:
 
 - The **compiler** is cross-compiled by Zig for the target, linking the target architecture's LLVM that
