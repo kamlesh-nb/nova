@@ -129,9 +129,29 @@ It closes the entire C-series soundness-bug class at the root (one source of tru
 cognitive and testing burden, deletes the shadow scaffolding, and drops the per-call string allocation on hot
 codegen paths. The result is uniform: decisions on TypeId, names from one mangler, enforced by a lint.
 
-## Status
+## Status (2026-08-13)
 
-- Prerequisite already done (2026-08-13): decisions run TypeId-first; shadow gate at 0 disagreements; C7/C8/
-  C10 fail-closed; the `any` ownership under-claim fixed; codegen string-type comparisons reduced 73 -> 55
-  with the non-convertible ones proven load-bearing (they are the Phase 1 worklist).
-- Next actionable step: Phase 0.
+Done and gated (corpus + --asan + shadow gate + lint, all green):
+
+- **Phase 0**: `NOVA_TID_CENSUS` instrument added; the null-coverage census is 0 corpus-wide (every
+  expression the string engine resolves, the TypeId engine now resolves too). Shadow gate wired into
+  `gate.sh` (`conformance/shadow-gate.sh`), asserting 0 ownership + keystone disagreements.
+- **Phase 1 (partial)**: `typeOfExprConcrete` gained an ident fallback to `current_local_type_ids` and now
+  REJECTS a non-concrete `type_param`/unresolved result (falling through to the concrete id). The let-init
+  collector round-trips a resolved name to a TypeId via `tidForName` when the typed IR has no concrete id.
+  Biggest win: `for (s in xs)` now binds its element with `.at(i)` (concrete `T`) instead of `.get(i)`
+  (`T | undefined`), which typed collection-element loop variables concretely and unblocked the whole class.
+- **Phase 2 (partial)**: string-index, decimal binop operands, and the redundant `or eql(t,"any")` tails
+  converted to TypeId predicates. Line-based codegen string type-decisions 55 -> 49.
+- **Phase 5**: `conformance/string-typedecision-lint.sh` (baseline 49, ratcheting to 0) in `gate.sh` bans any
+  NEW codegen string type-decision.
+
+Remaining (the honest deep blocker for full deletion):
+
+- Some expression shapes make the typed IR give a WRONG or non-`.string` answer where the name path is
+  right, so the predicate disagrees and the conversion regresses (proven: the string-concat operand check
+  regressed 163_process; a collection-element loop var is typed `T | undefined` before the `.at()` fix). The
+  remaining ~49 comparisons are there because the typed IR is not yet accurate enough for them; closing them
+  needs value-optional-aware and per-shape typing accuracy in sema (Phase 1a/1b), which is the genuine
+  multi-day-to-week work. The lint guarantees the count only ratchets DOWN as that accuracy lands; the
+  string engine cannot be deleted (Phases 3/4) until it reaches 0.

@@ -7,7 +7,7 @@
 set -uo pipefail
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
-BASELINE=55
+BASELINE=49
 count=$(grep -rcE 'std\.mem\.eql\(u8, [a-z_]+, "(int|long|string|bool|byte|short|double|float|void|any|char|f32|f64|decimal|i32|i64|u32|u64)"\)' src/codegen/*.zig | awk -F: '{s+=$2} END {print s+0}')
 echo "codegen string type-decisions: $count (baseline $BASELINE, target 0)"
 if [ "$count" -gt "$BASELINE" ]; then
