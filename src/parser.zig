@@ -1964,6 +1964,18 @@ pub const Parser = struct {
 
         if (self.current().type == .keyword_try) {
             self.advance();
+            // FR-safety-5: `try? e` turns a throwing / error-union call into an optional (the value, or
+            // `undefined` on error). It is pure sugar for `e catch undefined`, which the checker already
+            // types as `T | undefined` and which composes with `??`. Plain `try e` still propagates.
+            if (self.match(.question)) {
+                const operand = try self.parseUnary();
+                const undef = try self.allocExpression(ast.Expression{ .kind = .{ .literal = .undefined } });
+                return ast.Expression{ .kind = .{ .catch_expr = .{
+                    .expr = try self.allocExpression(operand),
+                    .err_name = null,
+                    .handler = undef,
+                } } };
+            }
             const operand = try self.parseUnary();
             return ast.Expression{ .kind = .{ .try_expr = try self.allocExpression(operand) } };
         }

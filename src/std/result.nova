@@ -1,0 +1,53 @@
+// FR-safety-5: `Result<T, E>` as a named, value-style error type for the callback and async seams where
+// a returned value reads better than try/catch. Nova's primary error model is the `T | E` error union
+// with try / try? / catch / ??; Result is the explicit, method-carrying companion for code that wants to
+// pass an outcome around and inspect it later. It is a value struct, so it costs no heap allocation.
+//
+// A union cannot carry methods, so Result is a small wrapper: `ok(v)` and `err(e)` build one, and the
+// methods below are its map / unwrap surface. Bridge from the union model with `Result.ok(try? call() ?? d)`
+// or by constructing in a catch handler.
+
+pub struct Result<T, E> {
+    pub isOk: bool,
+    pub value: T,
+    pub error: E,
+
+    // True when this holds a value; `isErr` is its inverse.
+    pub fn ok(self: Result<T, E>): bool { return self.isOk; }
+    pub fn isErr(self: Result<T, E>): bool { return !self.isOk; }
+
+    // The value if ok, otherwise the supplied default. This is the Result form of `??`.
+    pub fn getOr(self: Result<T, E>, d: T): T {
+        if (self.isOk) { return self.value; }
+        return d;
+    }
+
+    // The contained error (only meaningful when isErr; returns the stored error field regardless).
+    pub fn errorOr(self: Result<T, E>, d: E): E {
+        if (self.isOk) { return d; }
+        return self.error;
+    }
+
+    // Apply f to the value when ok (same value type), passing an error through unchanged.
+    pub fn map(self: Result<T, E>, f: (T) -> T): Result<T, E> {
+        if (self.isOk) { return Result<T, E> { isOk: true, value: f(self.value), error: self.error }; }
+        return self;
+    }
+
+    // Chain a fallible step: when ok, run f (which itself returns a Result); an error short-circuits.
+    pub fn flatMap(self: Result<T, E>, f: (T) -> Result<T, E>): Result<T, E> {
+        if (self.isOk) { return f(self.value); }
+        return self;
+    }
+}
+
+// Construct an ok Result. The error field is left at the caller-provided zero for E (Nova has no universal
+// zero value, so ok/err take both slots; callers usually build via the two helpers with a natural zero).
+pub fn ok<T, E>(value: T, errZero: E): Result<T, E> {
+    return Result<T, E> { isOk: true, value: value, error: errZero };
+}
+
+// Construct an error Result, carrying the error and a zero value for T.
+pub fn err<T, E>(error: E, valZero: T): Result<T, E> {
+    return Result<T, E> { isOk: false, value: valZero, error: error };
+}
