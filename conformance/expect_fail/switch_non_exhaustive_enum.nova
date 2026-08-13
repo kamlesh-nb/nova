@@ -1,0 +1,20 @@
+// EXPECT-FAIL: typecheck
+// FR-safety-4: a `switch` over an enum with no `default` must cover EVERY variant. This one omits
+// `Color.Blue`, so it must be rejected (checker gap 5: a silent fall-through would be UB). The check
+// lives in type_checker.zig and correctly treats a guarded case as NOT covering its variant.
+// NEGATIVE test: must FAIL to compile.
+
+enum Color { Red, Green, Blue }
+
+fn name(c: Color): string {
+    switch (c) {
+        case Color.Red: { return "r"; }
+        case Color.Green: { return "g"; }
+        // Blue is missing and there is no default -> compile error.
+    }
+    return "?";
+}
+
+fn main(): void {
+    name(Color.Red);
+}
