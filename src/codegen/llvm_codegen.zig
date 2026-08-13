@@ -1274,6 +1274,22 @@ pub const LlvmCompiler = struct {
     pub fn buildCallWithCasts(self: *LlvmCompiler, fn_val: types.LLVMValueRef, args: []const types.LLVMValueRef) anyerror!types.LLVMValueRef {
         const fn_t = core.LLVMGlobalGetValueType(fn_val);
         const param_count = core.LLVMCountParamTypes(fn_t);
+        // C7 fail-closed: a non-vararg function called with the wrong argument count used to build a
+        // malformed LLVM call (extra args passed, or fewer than the signature) which either fails
+        // verification or is silent UB. Sema must have caught a real arity error long before codegen, so
+        // reaching here with a mismatch on a fixed-arity function is a COMPILER bug -- surface it loudly
+        // instead of emitting a broken call.
+        if (core.LLVMIsFunctionVarArg(fn_t) == 0 and args.len != param_count) {
+            const name = std.mem.span(core.LLVMGetValueName(fn_val));
+            std.debug.print(
+                "\x1b[1m\x1b[31mcompiler error:\x1b[0m\x1b[1m call built with {d} argument(s) for a function taking {d}\x1b[0m\n" ++
+                "  '{s}' has a fixed arity; codegen must not emit a call with a different count. This is a\n" ++
+                "  COMPILER bug (sema should have rejected the arity), not user code. Please report.\n",
+                .{ args.len, param_count, if (name.len == 0) "<anonymous>" else name },
+            );
+            std.debug.print("(compilation failed)\n", .{});
+            std.process.exit(70);
+        }
         const param_types = try self.allocator.alloc(types.LLVMTypeRef, param_count);
         defer self.allocator.free(param_types);
         core.LLVMGetParamTypes(fn_t, param_types.ptr);

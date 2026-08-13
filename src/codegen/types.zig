@@ -990,6 +990,11 @@ fn nameResolvable(store: *const typesys.TypeStore, t: typesys.TypeId) bool {
 // discards. This is what lets the string ownership engine be retired for all real types.
 pub fn ownedByName(self: *LlvmCompiler, name: []const u8) bool {
     sema_shadow.irct_live_calls += 1;
+    // `any` is an OWNED heap carrier (nova_any_box), but isPrimitiveTypeName lumps it with the value
+    // primitives (convenient for the value-optional value-arm check). Decide it as owned BEFORE the
+    // primitive short-circuit, otherwise this LIVE string fallback under-claims ownership on an `any` value
+    // and leaks its box. Matches isOwnedTypeId (the TypeId engine) and the legacyStringOwnership baseline.
+    if (std.mem.eql(u8, name, "any")) return true;
     if (isPrimitiveTypeName(name)) {
         sema_shadow.irct_primitive += 1;
         return false;

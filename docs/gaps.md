@@ -93,11 +93,22 @@ hard error).
 
 ## Codegen soundness (crashes / miscompiles a valid program)
 
-Root: ARC ownership, destructor dispatch, and field/payload layout are chosen from rendered type-name STRINGS
-with a fail-OPEN default (unknown name assume owned; unknown field/atomic assume `i32`).
+Root: ARC ownership, destructor dispatch, and field/payload layout were historically chosen from rendered
+type-name STRINGS with a fail-OPEN default. STATUS (2026-08-13, measured with the `NOVA_SEMA_SHADOW` gate):
+the ownership/dtor/layout DECISIONS now run on the resolved-TypeId engine (`isOwnedTypeId`,
+`getOrCreateDestructorPreferId`, `buildStorageDestructorByTypeId`); across 232 corpus cases the gate reports
+`ownership td_disagree = 0` and `keystone_disagree = 0` (the TypeId engine and the string baseline agree on
+every decision, so the string engine is now cut-over-ready / vestigial). The remaining risk is the fail-OPEN
+DEFAULTS reached only when NO TypeId resolves; those are being flipped fail-CLOSED one by one (C7, C8, C10
+done; the `any` under-claim in the live `ownedByName` fallback fixed). The ~300 residual string CALLS produce
+identical answers to the TypeId engine and are a cleanup, not active miscompiles.
 
-- **C1 `erasedOwnershipDefault` returns owned for any unresolved composite name** (`arc.zig:47`): frees a
-  non-pointer word.
+- **C1 [gated] `erasedOwnershipDefault`** (`arc.zig:34`) is now reached ONLY from `ownedByName` AFTER the
+  primitive short-circuit and after `tidForName` fails, i.e. for a bare type-param or an instantiation-free
+  erased generic body that monomorphisation dead-strips -- never for a resolvable live type (those go through
+  `isOwnedTypeId`). It returns false for a lone type-param and keeps a loud exit-70 guard for an untypeable
+  placeholder (a sema bug). Live under-claim fixed: `ownedByName("any")` used to hit `isPrimitiveTypeName`
+  and return not-owned (leaking the `any` box); it now decides `any` owned before the primitive check.
 - **C2 `T | E | undefined`** modeled by string-splitting an ErrUnion plus a primitive-only value-optional test
   (`arc.zig:1247`, `types.zig:159`): a non-primitive ok-arm value-optional segfaults.
 - **C3 Destructor dispatch is name-string keyed** (`arc.zig:660-745`): an unknown name gets no free (leak) or
@@ -108,7 +119,10 @@ with a fail-OPEN default (unknown name assume owned; unknown field/atomic assume
   (`mono.zig:265`, `declarations.zig:867`): the `Set<T>` crash.
 - **C6 / C-lit `@serializable` struct-literal vs NSX layout divergence** (`expressions.zig:3510-3629`,
   field type defaults to `i32`): the literal-plus-render crash.
-- **C7 `buildCallWithCasts` silently ignores an arg-count mismatch** (`llvm_codegen.zig:1264`).
+- **C7 [FIXED] `buildCallWithCasts`** now fail-closes on an arg-count mismatch for a non-vararg function
+  (`LLVMIsFunctionVarArg` == 0 and `args.len != param_count` -> exit 70) instead of building a malformed call
+  (`llvm_codegen.zig`). Corpus green (no legitimate site trips it -- sema catches real arity errors first,
+  regression `expect_fail/constructor_arg_count`).
 - **C8 Generic/aliased atomics pick element width by name-whitelist else `i32`** (`llvm_codegen.zig:1576`):
   a 64-bit `Atomic<long>` under an alias truncates to 32 bits, an address-dependent SIGSEGV.
 - **C9 Non-primitive types load as one `ptr`/`i32` word when the field type is not matched**
@@ -131,7 +145,10 @@ with a fail-OPEN default (unknown name assume owned; unknown field/atomic assume
   that is the separate value-optional-zero limitation, not this ABI bug.
 
 Two takeaways: flip the fallbacks to FAIL CLOSED (unknown type -> borrowed / hard error), and add
-crash-regression cases (none exist).
+crash-regression cases. Progress: C7/C8/C10 are fail-closed; the ownership/dtor/layout decisions are on the
+TypeId engine with the `NOVA_SEMA_SHADOW` gate at 0 disagreements. Regression cases DO exist for several
+(`expect_fail/atomic_unsupported_type` C8, `constructor_arg_count`, `array_string_element`,
+`array_struct_element`); the earlier "none exist" was stale. C8 is also fail-closed for float atomics.
 
 ## K. Type-system and ARC gaps (from the earlier spec-vs-impl pass)
 

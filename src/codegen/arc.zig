@@ -62,6 +62,13 @@ pub fn legacyStringOwnership(self: *LlvmCompiler, type_name: []const u8) bool {
             return false;
         }
     }
+    // `any` is an OWNED heap carrier (nova_any_box), not a value primitive: it must be released or its box
+    // leaks. isPrimitiveTypeName lumps `any` in with the value primitives (it is convenient there for the
+    // value-optional value-arm check), so it would fall through to `return false` below and under-claim
+    // ownership. The resolved-TypeId engine (isOwnedTypeId) already classifies `any` as owned -- codegen
+    // uses that and 123_any_container is ASAN-clean -- so this baseline must agree, otherwise the shadow
+    // gate reports a spurious ownership disagreement for every `any`. Decide it BEFORE the primitive check.
+    if (std.mem.eql(u8, type_name, "any")) return true;
     if (isPrimitiveTypeName(type_name)) {
         return false;
     }
