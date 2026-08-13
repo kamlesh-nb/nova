@@ -1,0 +1,10 @@
+// EXPECT-FAIL: codegen
+// Atomic<T> is sound only for integer and bool types (the runtime nova_atomic_* helpers). A non-primitive
+// T (here `string`) used to silently default to the 32-bit atomic path and treat a pointer as an i32,
+// corrupting memory. The compiler now rejects it fail-closed. NEGATIVE test: must FAIL to compile.
+import assert;
+@test
+fn atomic_string_rejected(): void {
+    let a = Atomic<string>("hi");
+    assert.equalStr(a.load(), "hi");
+}

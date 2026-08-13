@@ -1568,7 +1568,32 @@ fn spillTemp(self: *LlvmCompiler, val: types.LLVMValueRef) anyerror!types.LLVMVa
 }
 
 pub fn atomicCell(self: *LlvmCompiler, t_name: []const u8) struct { bits: u32, is_i64: bool, size: usize, ty: types.LLVMTypeRef } {
-    const bits: u32 = if (types_mod.cgPrim(t_name)) |pr| types_mod.reprBitWidth(pr.repr) else 32;
+    // FR/soundness: Atomic<T> is only sound for the integer and bool widths the runtime nova_atomic_*
+    // helpers support (i8..i64 / u8..u64 / bool). A non-primitive or float T used to default to 32 bits
+    // silently, so Atomic<string> / Atomic<SomeStruct> treated a pointer as an i32 and corrupted memory.
+    // Fail closed: reject anything that is not an integer or bool primitive, loudly, rather than guessing.
+    const pr = types_mod.cgPrim(t_name) orelse {
+        std.debug.print(
+            "\x1b[1m\x1b[31mcompiler error:\x1b[0m\x1b[1m Atomic<{s}> is not supported\x1b[0m\n" ++
+            "  Atomic<T> works only for integer and bool types (byte/short/int/long and their unsigned\n" ++
+            "  forms, or bool). '{s}' is not one of these, so there is no sound atomic representation for\n" ++
+            "  it. Use an integer/bool Atomic, or guard the value with an AsyncLock instead.\n",
+            .{ t_name, t_name },
+        );
+        std.debug.print("(compilation failed)\n", .{});
+        std.process.exit(70);
+    };
+    const bits: u32 = types_mod.reprBitWidth(pr.repr);
+    if (pr.repr == .f32 or pr.repr == .f64) {
+        std.debug.print(
+            "\x1b[1m\x1b[31mcompiler error:\x1b[0m\x1b[1m Atomic<{s}> (floating point) is not supported\x1b[0m\n" ++
+            "  Atomic<T> works only for integer and bool types. Store the bits in an Atomic<long> if you\n" ++
+            "  need an atomic float, or guard the value with an AsyncLock.\n",
+            .{t_name},
+        );
+        std.debug.print("(compilation failed)\n", .{});
+        std.process.exit(70);
+    }
     const is_i64 = bits == 64;
     const llvm_ty = if (is_i64) self.i64_type else if (bits == 1) self.i1_type else self.i32_type;
     return .{ .bits = bits, .is_i64 = is_i64, .size = @max(1, bits / 8), .ty = llvm_ty };
