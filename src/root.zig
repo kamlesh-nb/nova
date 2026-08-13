@@ -5,6 +5,7 @@ pub const parser = @import("parser.zig");
 pub const formatter = @import("formatter.zig");
 pub const ast = @import("ast.zig");
 pub const lexer = @import("lexer.zig");
+pub const type_checker = @import("type_checker.zig");
 
 pub const types = @import("types.zig");
 
