@@ -664,7 +664,7 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         compiler.current_module_prefix = null;
 
         compiler.current_instantiation = func.instantiation;
-        compiler.current_instantiation_id = if (func.instantiation) |inst| sema_mono.live_inst_ids.get(inst) else null;
+        compiler.current_instantiation_id = func.instantiation_id orelse (if (func.instantiation) |inst| sema_mono.live_inst_ids.get(inst) else null);
 
         compiler.current_method_subst = func.method_subst;
 
@@ -892,7 +892,7 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         compiler.current_module_prefix = null;
 
         compiler.current_instantiation = func.instantiation;
-        compiler.current_instantiation_id = if (func.instantiation) |inst| sema_mono.live_inst_ids.get(inst) else null;
+        compiler.current_instantiation_id = func.instantiation_id orelse (if (func.instantiation) |inst| sema_mono.live_inst_ids.get(inst) else null);
         compiler.current_method_subst = func.method_subst;
 
         if (func.instantiation) |inst| {

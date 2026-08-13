@@ -2566,6 +2566,7 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
             defer allocator.free(ids);
             @import("sema/inst_disp.zig").run(allocator, &owned_sema.store, &owned_sema.tab, &owned_sema.ir, ids);
             @import("sema/inst_disp.zig").runFreeFns(allocator, &owned_sema.store, &owned_sema.ir, program);
+            @import("sema/inst_disp.zig").runMethods(allocator, &owned_sema.store, &owned_sema.tab, &owned_sema.ir);
         }
     }
 
@@ -2863,6 +2864,7 @@ fn compileProgram(
             defer allocator.free(ids);
             @import("sema/inst_disp.zig").run(allocator, &owned_sema.store, &owned_sema.tab, &owned_sema.ir, ids);
             @import("sema/inst_disp.zig").runFreeFns(allocator, &owned_sema.store, &owned_sema.ir, program);
+            @import("sema/inst_disp.zig").runMethods(allocator, &owned_sema.store, &owned_sema.tab, &owned_sema.ir);
         }
     }
 

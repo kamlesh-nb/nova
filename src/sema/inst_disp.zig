@@ -92,6 +92,51 @@ fn findFreeFn(program: ast.Program, name: []const u8) ?*const ast.FunctionDecl {
     return null;
 }
 
+// B2: TypeId overlay for generic METHOD instances (`List<T>.map<U>`). For each recorded method instance,
+// record tp_resolve for BOTH the struct T-params (from the receiver struct instance) AND the method U-params,
+// under a COMBINED inst_key, then walk the method body applying both substitutions. This makes the method
+// body's type-params (T and U) resolve via TypeIds under current_instantiation_id = inst_key.
+pub fn runMethods(
+    allocator: std.mem.Allocator,
+    store: *TypeStore,
+    tab: *const SymbolTable,
+    ir: *TypedIr,
+) void {
+    const mono = @import("mono.zig");
+    for (mono.method_insts.items) |mi| {
+        const key = mi.inst_key orelse continue;
+        const recv = mi.recv orelse continue;
+        const mowner = mi.method_owner orelse continue;
+        const margs = mi.args_tids orelse continue;
+        if (store.get(recv) != .struct_) continue;
+        const si = store.get(recv).struct_;
+        // struct T-params
+        for (si.args, 0..) |arg, j| {
+            const tp = store.intern(.{ .type_param = .{ .owner = si.decl, .index = @intCast(j) } }) catch continue;
+            ir.recordTpResolve(allocator, tp, key, arg) catch {};
+        }
+        // method U-params
+        for (margs, 0..) |arg, i| {
+            const tp = store.intern(.{ .type_param = .{ .owner = mowner, .index = @intCast(i) } }) catch continue;
+            ir.recordTpResolve(allocator, tp, key, arg) catch {};
+        }
+        const msym = tab.symbolAt(mowner);
+        if (msym.decl != .function) continue;
+        const fd = msym.decl.function;
+        const ctx = Ctx{
+            .allocator = allocator,
+            .store = store,
+            .ir = ir,
+            .decl = si.decl,
+            .args = si.args,
+            .inst = key,
+            .decl2 = mowner,
+            .args2 = margs,
+        };
+        for (fd.body.statements) |*s| ctx.stmt(s);
+    }
+}
+
 const Ctx = struct {
     allocator: std.mem.Allocator,
     store: *TypeStore,
@@ -99,10 +144,21 @@ const Ctx = struct {
     decl: types.SymbolId,
     args: []const TypeId,
     inst: TypeId,
+    // Optional SECOND (owner, args) substitution, applied after the first. For a generic METHOD body (B2) the
+    // first is the struct's (decl, T-args) and the second the method's (mid, <U>-args), so both the struct's
+    // T and the method's U resolve. Null for struct/free-fn bodies (single owner).
+    decl2: ?types.SymbolId = null,
+    args2: []const TypeId = &.{},
+
+    fn concreteOf(self: Ctx, t: TypeId) TypeId {
+        var c = subst.substitute(self.store, t, self.decl, self.args) catch t;
+        if (self.decl2) |d2| c = subst.substitute(self.store, c, d2, self.args2) catch c;
+        return c;
+    }
 
     fn visit(self: Ctx, e: *const ast.Expression) void {
         if (self.ir.typeOf(e)) |t| {
-            const concrete = subst.substitute(self.store, t, self.decl, self.args) catch t;
+            const concrete = self.concreteOf(t);
             self.ir.recordOwnedInst(self.allocator, e.id, self.inst, disposition(e.kind, concrete, self.store)) catch {};
 
             if (concrete != t) self.ir.recordTypeInst(self.allocator, e.id, self.inst, concrete) catch {};

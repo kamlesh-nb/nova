@@ -32,6 +32,14 @@ pub const MethodInst = struct {
     method: []const u8,
     params: []const []const u8,
     args: []const []const u8,
+    // String-engine-removal (B2, method-level <U>): the receiver struct instance, the method's SymbolId
+    // (owner of the method type-params <U>), the concrete method-type-arg TypeIds, and a COMBINED inst_key
+    // = .struct_{method_owner, [recv] ++ args} that distinguishes e.g. List<i32>.map<string> from
+    // List<i32>.map<int>. The overlay resolves BOTH the struct T (via recv) and the method U under this key.
+    recv: ?TypeId = null,
+    method_owner: ?types.SymbolId = null,
+    args_tids: ?[]const TypeId = null,
+    inst_key: ?TypeId = null,
 };
 pub var method_insts: std.ArrayListUnmanaged(MethodInst) = .empty;
 
@@ -68,6 +76,7 @@ pub fn dumpMethodInsts() void {
 pub fn noteMethodInst(
     store: *types.TypeStore,
     recv_tid: TypeId,
+    method_owner: types.SymbolId,
     method: []const u8,
     params: []const []const u8,
     args: []const TypeId,
@@ -94,7 +103,23 @@ pub fn noteMethodInst(
     }
     const pbuf = a.alloc([]const u8, params.len) catch return;
     for (params, 0..) |p, i| pbuf[i] = a.dupe(u8, p) catch return;
-    method_insts.append(a, .{ .inst_name = inst_name, .method = a.dupe(u8, method) catch return, .params = pbuf, .args = abuf }) catch {};
+    // Keep TypeIds and intern the COMBINED key = .struct_{method_owner, [recv] ++ args}.
+    const tbuf = a.alloc(TypeId, args.len) catch return;
+    for (args, 0..) |at, i| tbuf[i] = at;
+    const kbuf = a.alloc(TypeId, args.len + 1) catch return;
+    kbuf[0] = recv_tid;
+    for (args, 0..) |at, i| kbuf[i + 1] = at;
+    const key = store.intern(.{ .struct_ = .{ .decl = method_owner, .args = kbuf } }) catch null;
+    method_insts.append(a, .{
+        .inst_name = inst_name,
+        .method = a.dupe(u8, method) catch return,
+        .params = pbuf,
+        .args = abuf,
+        .recv = recv_tid,
+        .method_owner = method_owner,
+        .args_tids = tbuf,
+        .inst_key = key,
+    }) catch {};
 }
 
 pub const FreeFnInst = struct {

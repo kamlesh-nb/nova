@@ -64,6 +64,9 @@ pub const FunctionInfo = struct {
     is_async: bool = false,
 
     instantiation: ?[]const u8 = null,
+    // String-engine-removal: the explicit TypeId instantiation key for this spec (free-fn or method),
+    // used to set current_instantiation_id directly, bypassing the fragile name->live_inst_ids lookup.
+    instantiation_id: ?sema_types.TypeId = null,
 
     method_subst: ?[]const MethodParamBinding = null,
 
@@ -2932,6 +2935,7 @@ pub const LlvmCompiler = struct {
                                     .body = fn_decl.body,
                                     .is_async = fn_decl.is_async,
                                     .instantiation = inst_opt,
+                                    .instantiation_id = mi.inst_key,
                                     .method_subst = subst,
                                     .source_file = fn_decl.span.file,
                                 });
@@ -3065,14 +3069,9 @@ pub const LlvmCompiler = struct {
                         self.current_method_subst = prev_ms;
 
                         // String-engine-removal: bind this free-fn spec to its TypeId instantiation key so
-                        // current_instantiation_id resolves inside its body (declarations.zig:667). The sema
-                        // free-fn overlay (inst_disp.runFreeFns) recorded tp_resolve/expr_types_inst under the
-                        // SAME inst_key = .struct_{owner, args_tids}. Both sides must agree on the key: here we
-                        // publish live_inst_ids[spec_name] = fi.inst_key and set .instantiation = spec_name.
-                        if (fi.inst_key) |key| {
-                            sema_mono.live_inst_ids.put(self.allocator, spec_name, key) catch {};
-                        }
-
+                        // current_instantiation_id resolves inside its body. The sema free-fn overlay
+                        // (inst_disp.runFreeFns/recordFreeFnInst) recorded tp_resolve/expr_types_inst under the
+                        // SAME inst_key = .struct_{owner, args_tids}.
                         try self.functions.append(self.allocator, .{
                             .name = spec_name,
                             .param_count = fn_decl.params.len,
@@ -3082,7 +3081,7 @@ pub const LlvmCompiler = struct {
                             .body = fn_decl.body,
                             .is_async = fn_decl.is_async,
                             .method_subst = subst,
-                            .instantiation = if (fi.inst_key != null) spec_name else null,
+                            .instantiation_id = fi.inst_key,
                             .source_file = fn_decl.span.file,
                         });
                     }

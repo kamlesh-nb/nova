@@ -1741,7 +1741,7 @@ pub const Inferer = struct {
                 for (solved, 0..) |ma, i| buf[i] = ma.?;
                 try ir.recordMethodArgs(self.allocator, call_ep, buf);
 
-                mono.noteMethodInst(self.store, obj, fa.field, fd.type_params, buf);
+                mono.noteMethodInst(self.store, obj, mid, fa.field, fd.type_params, buf);
 
                 mono.noteBaseNeeded(self.store, obj, fa.field);
             }
@@ -1798,7 +1798,7 @@ pub const Inferer = struct {
                 }
             }
             if (all_concrete) {
-                mono.noteMethodInst(self.store, obj, fa.field, fd.type_params, solved);
+                mono.noteMethodInst(self.store, obj, mid, fa.field, fd.type_params, solved);
             }
         }
 
