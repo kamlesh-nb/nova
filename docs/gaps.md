@@ -241,8 +241,11 @@ length fields capped before alloc.
 - **T3 Trait default methods unsupported** (§3.8): every impl must define every method, which is what makes a
   trait change a breaking change. This is a LANGUAGE gap, not just tooling.
 - **T4 No `library` init template; desktop template is a single file** (`main.zig:1811`, `templates.zig`).
-- **T5 LSP (nls) missing rename, find-references, code-actions, semantic tokens** (`nls/src/server.zig`);
-  hover/goto/completion/diagnostics exist.
+- **T5 LSP (nls)** now has rename, find-references, code-actions, semantic tokens, and workspace symbols on
+  top of hover/goto/completion/diagnostics (`nls/src/server.zig`). References/rename are binding-accurate for
+  function-locals (confined to the enclosing function's brace-matched extent); non-locals fall back to the
+  cross-file whole-word match. Remaining: intra-function shadowing is not split, and cross-file binding
+  resolution for globals/members is still name-based rather than resolved through the symbol table.
 - **T6 WASM product build disabled + contradictory docs** (§1, `build.zig:284-301` commented out; the spec
   says "fails on trivial programs", the archived execution-plan claims 104/104). Reconcile and wire the
   product path.
