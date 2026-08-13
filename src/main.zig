@@ -3246,6 +3246,8 @@ fn mainInner(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, ct, "windows-x86_64")) {
 
             target_triple_opt = "x86_64-pc-windows-gnu";
+        } else if (std.mem.eql(u8, ct, "windows-arm64")) {
+            target_triple_opt = "aarch64-pc-windows-gnu";
         } else {
             std.debug.print("Unsupported target switch: {s}\n", .{ct});
             return error.UnsupportedTarget;
