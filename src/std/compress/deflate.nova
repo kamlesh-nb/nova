@@ -303,7 +303,7 @@ fn inflateBlock(br: BitReader, out: ByteBuf, lit: Huffman, dist: Huffman, ownTab
         if (br.pos > br.len + 4) { break; }
         let sym = lit.decode(br);
         if (sym == 256) { break; }
-        if (sym < 0) { break; }           // bad code — stop rather than run off the buffer
+        if (sym < 0) { break; }           // bad code: stop rather than run off the buffer
         if (sym < 256) {
             out.push(sym);
         } else {
@@ -313,7 +313,7 @@ fn inflateBlock(br: BitReader, out: ByteBuf, lit: Huffman, dist: Huffman, ownTab
             if (ds < 0) { break; }
             let distance = rd16(DIST_BASE, ds) + br.bits(bytes.read_byte(DIST_EXTRA, ds));
             let start = out.len - distance;
-            if (start < 0) { break; }      // corrupt distance — never read before the buffer start
+            if (start < 0) { break; }      // corrupt distance: never read before the buffer start
             let k = 0;
             while (k < length) {
                 out.push(out.at(start + k));
@@ -590,14 +590,31 @@ pub fn deflateRaw(data: string): ByteBuf {
             if (maxLen > 258) { maxLen = 258; }
             while (cand >= 0 && chain < 256) {
                 if (pos - cand <= 32768) {
-                    let l = 0;
-                    while (l < maxLen && bytes.read_byte(data, cand + l) == bytes.read_byte(data, pos + l)) {
-                        l = l + 1;
+                    // FR-deflate-3: best-length-first skip. A candidate can only beat the current best
+                    // if the byte at offset bestLen matches (and the one just before it). On real HTML
+                    // most candidates are killed by this one comparison, before any full compare. The
+                    // chosen match is unchanged: the full loop already keeps the first (nearest) match of
+                    // a given length via `l > bestLen`, so rejecting candidates that cannot exceed bestLen
+                    // is bit-identical output, only faster. bestLen < maxLen here (a full match sets
+                    // cand = -1 and exits), so cand + bestLen and pos + bestLen stay in bounds.
+                    let skip = false;
+                    if (bestLen > 0) {
+                        if (bytes.read_byte(data, cand + bestLen) != bytes.read_byte(data, pos + bestLen)) {
+                            skip = true;
+                        } else if (bytes.read_byte(data, cand + bestLen - 1) != bytes.read_byte(data, pos + bestLen - 1)) {
+                            skip = true;
+                        }
                     }
-                    if (l > bestLen) {
-                        bestLen = l;
-                        bestDist = pos - cand;
-                        if (l >= maxLen) { cand = -1; }
+                    if (!skip) {
+                        let l = 0;
+                        while (l < maxLen && bytes.read_byte(data, cand + l) == bytes.read_byte(data, pos + l)) {
+                            l = l + 1;
+                        }
+                        if (l > bestLen) {
+                            bestLen = l;
+                            bestDist = pos - cand;
+                            if (l >= maxLen) { cand = -1; }
+                        }
                     }
                 }
                 if (cand >= 0) { cand = rd32(prev, cand); }
