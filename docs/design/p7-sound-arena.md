@@ -9,7 +9,7 @@ Status: `not started`, `in progress`, `done`, `deferred`, `superseded`.
 | P7-S1 | Stage 1: escape gauge, report-only (NOVA_ESCAPE_REPORT, escape.zig) | done (shipped report-only; ~10% of sites classified function-local) |
 | P7-S2 | Stage 2: interprocedural summaries (param-escapes / return-fresh), still report-only | done (shipped report-only) |
 | P7-S3+ | Stage 3+: request-escape (persistent-sink) analysis + arena enablement | superseded (function-escape is the wrong granularity; blanket arena was 28% slower + GB RSS; the churn it targeted was largely captured by the wire-to-struct + str.Str borrow work, so /products already beats Rust) |
-| P7-remove | Remove the parked scaffolding (region.nova, runtime region state, escape.zig gauge) | not started (tracked as FR-arena in [further-refinement.md](further-refinement.md); ONE isolated commit) |
+| P7-remove | Remove the parked scaffolding (region.nova, runtime region state, escape.zig gauge) | done for the region arena (FR-arena, commit 088d9b6: deleted mem/region.nova, the Region machinery in alloc.cpp, and the per-coro region swap in concurrency.cpp; corpus 328/329, reactor cases ASAN-clean). The escape.zig report-only gauge is KEPT (harmless, still useful for future request-escape analysis) |
 
 The sound arena is NOT the next move (see the Stage-3 reasoning below and the FR-arena decision in
 `further-refinement.md`). This document is retained for the analysis; the actionable outcome is the FR-arena
@@ -40,9 +40,10 @@ was fully attempted and ROLLED BACK (see [[nova-p7-request-arena-infra]]): it be
 SLOWER (range-check keeps every chunk mapped → 6-10x working set, cache thrash) and leaked RSS to
 3.5-8.3 GB. Root cause is structural: **ARC follows pointers across the region boundary**, so freeing the
 arena decrements persistent strings the arena borrowed (UAF), and hand-guarding every crossing does not
-converge. The runtime region primitives survive (`nova_region_new/set/free/gen`, `region_alloc`,
-`nova_web_region_enter/exit`, the gen-validated per-coro region swap in `concurrency.cpp`); what was removed
-is the stdlib wiring and the escape pass.
+converge. (Historical: the runtime region primitives `nova_region_new/set/free/gen`, `region_alloc`, and
+the gen-validated per-coro region swap once survived here as parked scaffolding; FR-arena has since deleted
+all of them, see the P7-remove row above. Only the analysis in this document and the `escape.zig` gauge
+remain.)
 
 ## The sound approach
 
