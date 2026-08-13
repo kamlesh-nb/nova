@@ -496,6 +496,12 @@ pub fn parseI64(s: string): long {
 }
 
 pub fn parseFloat(s: string): double {
+    // Prefer the strict, exponent-aware parseDouble: it handles `1e3`, `1.5E-2`, signs, etc. correctly,
+    // which the lenient hand-rolled path below does NOT (it read "1e3" as 13). Fall back to the lenient
+    // path only when parseDouble rejects the input, so callers that relied on the old permissive
+    // behaviour for partly-numeric strings keep working.
+    let parsed = parseDouble(s);
+    if (parsed != undefined) { return parsed; }
     let len = s.length;
     let i = 0;
     let neg = false;

@@ -30,6 +30,46 @@ pub class List<T> {
     pub fn all(self: List<T>, pred: (T) => bool): bool { let i = 0; while (i < self.data.count()) { if (!pred(self.data.at(i))) { return false; } i = i + 1; } return true; }
     pub fn indexOf(self: List<T>, value: T): int { let i = 0; while (i < self.data.count()) { if (self.data.at(i) == value) { return i; } i = i + 1; } return -1; }
     pub fn contains(self: List<T>, value: T): bool { return self.indexOf(value) != -1; }
+
+    // Copy the half-open range [start, end) into a new list. Indices are clamped to the list bounds, so
+    // slice(0, size()) is a shallow copy and out-of-range ends do not panic.
+    pub fn slice(self: List<T>, start: int, end: int): List<T> {
+        let n = self.data.count();
+        let s = if (start < 0) 0 else if (start > n) n else start;
+        let e = if (end < 0) 0 else if (end > n) n else end;
+        let out = List<T>();
+        let i = s;
+        while (i < e) { out.push(self.data.at(i)); i = i + 1; }
+        return out;
+    }
+
+    // A new list with this list's elements followed by other's. Neither input is modified.
+    pub fn concat(self: List<T>, other: List<T>): List<T> {
+        let out = List<T>();
+        let i = 0;
+        while (i < self.data.count()) { out.push(self.data.at(i)); i = i + 1; }
+        let j = 0;
+        while (j < other.size()) { out.push(other.at(j)); j = j + 1; }
+        return out;
+    }
+
+    // Sort in place with a comparator returning negative / zero / positive for a<b / a==b / a>b. Stable
+    // insertion sort: fine for the small-to-medium lists typical of server request handling, and stable so
+    // equal keys keep their input order.
+    pub fn sort(self: List<T>, cmp: (T, T) => int): void {
+        let n = self.data.count();
+        let i = 1;
+        while (i < n) {
+            let key = self.data.at(i);
+            let j = i - 1;
+            while (j >= 0 && cmp(self.data.at(j), key) > 0) {
+                self.data.set(j + 1, self.data.at(j));
+                j = j - 1;
+            }
+            self.data.set(j + 1, key);
+            i = i + 1;
+        }
+    }
 }
 
 @test
