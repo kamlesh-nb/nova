@@ -1,0 +1,14 @@
+// R5 honest-int overflow: math.checked*/sat* helpers. Nova's +/-/* wrap (defined two's-complement,
+// relied on by hashers), so these opt-in forms are how callers get overflow honesty: checked* returns
+// undefined on overflow, sat* clamps to the type bound.
+import math;
+import assert;
+
+@test
+fn test_checked(): void {
+    assert.equalInt(5, math.checkedAddInt(2, 3) ?? -1);
+    assert.equalInt(1, if (math.checkedAddInt(math.intMax(), 1) == undefined) 1 else 0);
+    assert.equalInt(math.intMax(), math.satAddInt(math.intMax(), 1000));
+    assert.equalInt(math.intMin(), math.satSubInt(math.intMin(), 1000));
+    assert.equalInt(1, if (math.checkedMulLong(math.checkedAddLong(1, 1) ?? 0, 3) == 6) 1 else 0);
+}

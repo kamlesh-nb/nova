@@ -306,6 +306,104 @@ fn test_float_math(): void {
     assert.isTrue(fpow(2.0, 3) > 7.9);
 }
 
+// --- Honest (checked / saturating) integer arithmetic ---------------------------------------------
+// Nova's `+`/`-`/`*` on `int` (32-bit) and `long` (64-bit) WRAP on overflow, which is defined
+// two's-complement behaviour and is exactly what hashers and bit-mixers below rely on. These helpers
+// are the opt-in "be honest about overflow" path: the checked* forms return `undefined` instead of a
+// wrapped value, the saturating* forms clamp to the type's bound. Use them when a wrapped result would
+// be a silent wrong answer (sizes, counters, money-as-integer, index maths).
+
+pub fn intMax(): int { return 2147483647; }
+pub fn intMin(): int { return -2147483647 - 1; }
+
+fn longMax(): long { return 9223372036854775807; }
+fn longMin(): long { return -9223372036854775807 - 1; }
+
+// 32-bit checked ops: compute in 64-bit and reject a result outside int's range.
+pub fn checkedAddInt(a: int, b: int): int | undefined {
+    let r: long = (a as long) + (b as long);
+    if (r > (intMax() as long) || r < (intMin() as long)) { return undefined; }
+    return r as int;
+}
+
+pub fn checkedSubInt(a: int, b: int): int | undefined {
+    let r: long = (a as long) - (b as long);
+    if (r > (intMax() as long) || r < (intMin() as long)) { return undefined; }
+    return r as int;
+}
+
+pub fn checkedMulInt(a: int, b: int): int | undefined {
+    let r: long = (a as long) * (b as long);
+    if (r > (intMax() as long) || r < (intMin() as long)) { return undefined; }
+    return r as int;
+}
+
+// 32-bit saturating ops: clamp to intMax()/intMin() instead of wrapping.
+pub fn satAddInt(a: int, b: int): int {
+    let r: long = (a as long) + (b as long);
+    if (r > (intMax() as long)) { return intMax(); }
+    if (r < (intMin() as long)) { return intMin(); }
+    return r as int;
+}
+
+pub fn satSubInt(a: int, b: int): int {
+    let r: long = (a as long) - (b as long);
+    if (r > (intMax() as long)) { return intMax(); }
+    if (r < (intMin() as long)) { return intMin(); }
+    return r as int;
+}
+
+pub fn satMulInt(a: int, b: int): int {
+    let r: long = (a as long) * (b as long);
+    if (r > (intMax() as long)) { return intMax(); }
+    if (r < (intMin() as long)) { return intMin(); }
+    return r as int;
+}
+
+// 64-bit checked ops: no wider type to fall back on, so detect overflow directly.
+pub fn checkedAddLong(a: long, b: long): long | undefined {
+    // a + b overflows iff b > 0 and a > MAX - b, or b < 0 and a < MIN - b.
+    if (b > 0 && a > longMax() - b) { return undefined; }
+    if (b < 0 && a < longMin() - b) { return undefined; }
+    return a + b;
+}
+
+pub fn checkedSubLong(a: long, b: long): long | undefined {
+    if (b < 0 && a > longMax() + b) { return undefined; }
+    if (b > 0 && a < longMin() + b) { return undefined; }
+    return a - b;
+}
+
+pub fn checkedMulLong(a: long, b: long): long | undefined {
+    if (a == 0 || b == 0) { return 0; }
+    let r: long = a * b;
+    // Recover an operand by dividing back; a mismatch (or the MIN/-1 special case) means it overflowed.
+    if (a == -1 && b == longMin()) { return undefined; }
+    if (b == -1 && a == longMin()) { return undefined; }
+    if (r / b != a) { return undefined; }
+    return r;
+}
+
+@test
+fn test_checked_arith(): void {
+    // int checked: normal and boundary.
+    assert.equalInt(5, checkedAddInt(2, 3) ?? -999);
+    assert.equalInt(1, if (checkedAddInt(intMax(), 1) == undefined) 1 else 0);
+    assert.equalInt(1, if (checkedSubInt(intMin(), 1) == undefined) 1 else 0);
+    assert.equalInt(1, if (checkedMulInt(100000, 100000) == undefined) 1 else 0);
+    assert.equalInt(6, checkedMulInt(2, 3) ?? -999);
+    // int saturating.
+    assert.equalInt(intMax(), satAddInt(intMax(), 100));
+    assert.equalInt(intMin(), satSubInt(intMin(), 100));
+    assert.equalInt(intMax(), satMulInt(100000, 100000));
+    // long checked: normal and boundary.
+    assert.isTrue((checkedAddLong(longMax() as long, 0) ?? 0) == longMax());
+    assert.equalInt(1, if (checkedAddLong(longMax(), 1) == undefined) 1 else 0);
+    assert.equalInt(1, if (checkedSubLong(longMin(), 1) == undefined) 1 else 0);
+    assert.equalInt(1, if (checkedMulLong(longMax(), 2) == undefined) 1 else 0);
+    assert.isTrue((checkedMulLong(1000000, 1000000) ?? 0) == (1000000000000 as long));
+}
+
 @test
 fn test_math(): void {
     assert.equalInt(5, abs(-5));
