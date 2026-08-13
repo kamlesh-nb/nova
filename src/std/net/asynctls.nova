@@ -101,6 +101,13 @@ pub class TlsStream impl AsyncIO {
             self.base.close();
             self.open = false;
         }
+        // Free the 16 KB record scratch buffer. Without this it leaked once per TLS connection (M1),
+        // which sinks any long-running server that opens many TLS connections (every driver-over-TLS and
+        // every HTTPS client). Guarded so a double close is safe.
+        if (self.scratch != 0) {
+            bytes.free(self.scratch);
+            self.scratch = 0;
+        }
     }
 }
 
