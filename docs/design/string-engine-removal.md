@@ -92,3 +92,52 @@ Multi-day, memory-safety-critical. The novel pieces are the shared `inst_key` he
 and moving the transitive fixpoint into sema as TypeId-native (thin corpus coverage there). Every mistake in
 this territory is a double-free, so land it as one coherent change verified under ASAN, not incrementally with
 string fallbacks half-removed.
+
+## Execution progress (2026-08-14)
+
+The build (steps 1-5) is DONE and the overlay is proven total for decisions. What survives is NAME
+substitution for dispatch/mangling, not any decision.
+
+**Landed + committed (each ASAN-verified on guard cases):**
+- **SE-A overlay total.** `inst_disp.run` (structs) + `runFreeFns` (direct + transitive free-fns, B1) +
+  `runMethods` (generic methods, B2), all keyed by the shared `inst_key`. `current_instantiation_id` is
+  set for free-fn/method specs.
+- **SE-B: the ownership DECISION string fallback is deleted** (commit "SE-B delete the ownership string
+  fallback"). Proof it was redundant, not a guess: instrumented the `isOwnedExpr` `.type_param` fallback
+  to print its answer and swept the whole corpus -- **327 hits, every one `owned=false`**, identical to
+  `isOwnedTypeId(.type_param)` when no instantiation resolves it. Every hit is a genuinely erased body
+  (RawBuffer_at/pop, the async-util fns, ORM helpers, one lambda). So the fallback fell through to
+  `isOwnedTypeId`.
+- **B3: `valoptTypeRefIsValue` is TypeId-native** (commit "SE-B/B3 ..."). It resolves the value-optional
+  inner via `concreteTidForTypeRef` + `symbolName` instead of `typeRefToString` -> `substMethodParams`,
+  so no boxing decision is backed by the string engine any more. Gating case 119 + the value-optional
+  set pass under `--asan`.
+- **`resolveExpressionTypeName` is TypeId-first.** Where the overlay resolves the expr it returns
+  `renderLegacy(concreteTid)` (type-params reified through TypeIds, value-optional wrapper rendered
+  faithfully -- the string engine dropped `| undefined` on a type-param inner); the string-substituted
+  base render survives only as the null-branch fallback. Full plain corpus 340/341 (only
+  `189_epoll_event_layout`, off-platform). [ASAN gate result pending in this same run.]
+
+**The precise residual (what still calls the string substitution, and why):** measured with
+`NOVA_TID_CENSUS=1` across the whole corpus.
+- Null-branch of `resolveExpressionTypeName`: **exactly ONE** expr in the entire corpus differs if
+  `substMethodParams` is dropped -- a lambda reifying its parent generic method's `<T>`
+  (`68_generic_method_mono`, `(s) => serde.bind<T>(s)...`). The lifted `__lambda_*` is compiled with a
+  null `instantiation_id`, so `typeOfExprConcrete` cannot reach the overlay entry the method recorded.
+  Closing it = give a lifted lambda its parent spec's `inst_key` (intricate lambda-monomorphization
+  plumbing, one case).
+- `substMethodParams` remains **load-bearing for monomorphized-spec NAME MANGLING** -- turning a generic
+  body's `T` into the concrete spec name (`typeRefToString`'s `.ident` arm, the spec loop's
+  `current_method_subst`, ~25 sites). This is name generation fundamental to how mono names functions,
+  NOT a type decision. Excising it is task #172 "collapse name layer to `symbolName(tid)`": derive the
+  concrete spec name from the `inst_key` TypeId args instead of string bindings.
+
+**Remaining deletion map (the coherent, ASAN-gated finale):** close the one lambda case; convert the 8
+`substTypeParams` callers (`llvm_codegen.zig:1998,3659`; `types.zig:337,1162,1266`; `expressions.zig:1693`;
+plus the census/shadow baselines) to derive names from concrete TypeIds; remove the spec-loop
+`current_method_subst` assignments; then delete `substTypeParams`, `substMethodParams`,
+`current_method_subst`, `MethodParamBinding`, and demote `renderLegacy` behind `symbolName(tid)`. The
+dev-only shadow scaffolding (`tid_census`, `legacyStringOwnership` baseline, `tdShadowDiff`) comes out
+last. **No decision is left on the string engine; the maintainer hazard (ownership/boxing by spelling)
+is gone.** What remains is bounded, mapped, and non-corrupting (a wrong dispatch name is a loud link
+error, not a UAF).

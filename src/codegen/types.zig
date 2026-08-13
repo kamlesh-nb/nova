@@ -1244,6 +1244,15 @@ pub fn resolveExpressionTypeName(self: *LlvmCompiler, expr_ptr: *const ast.Expre
         }
     }
 
+    // String-engine-removal (SE-C): where the instantiation overlay resolves this expr to a CONCRETE
+    // TypeId, return that id's render -- type-parameters are reified through TypeIds, not substMethodParams
+    // string substitution, and the value-optional wrapper is rendered faithfully (the string engine drops
+    // `| undefined` on a type-param inner, renderLegacy(ctid) does not). Only the residual erased cases the
+    // overlay cannot reach (a lambda reifying its parent method's `<T>`, 68_generic_method_mono) fall back
+    // to the string-substituted base render -- the last remaining substMethodParams users.
+    if (typeOfExprConcrete(self, expr_ptr)) |ctid| {
+        return try sema_shadow.renderLegacy(self.allocator, st, ctid);
+    }
     return s_name;
 }
 
