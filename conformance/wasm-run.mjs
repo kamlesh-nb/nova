@@ -286,6 +286,38 @@ const env = {
   nova_atomic_store_i32: atomicRW.store_i32, nova_atomic_store_i64: atomicRW.store_i64, nova_atomic_store_bool: atomicRW.store_bool,
   nova_atomic_add_i32: atomicRW.add_i32, nova_atomic_add_i64: atomicRW.add_i64, nova_atomic_sub_i32: atomicRW.sub_i32,
   nova_atomic_cas_i32: atomicRW.cas_i32, nova_atomic_cas_i64: atomicRW.cas_i64, nova_atomic_cas_bool: atomicRW.cas_bool,
+
+  // Non-zeroed persistent allocation: delegate to the module's own exported allocator (persistent if it
+  // exports one, else the plain bump allocator). The gate does not free, so "persistent" is a no-op here.
+  nova_bytes_alloc_persistent_nz: (size) =>
+    (exports.nova_bytes_alloc_persistent ? exports.nova_bytes_alloc_persistent(size) : exports.nova_bytes_alloc(size)),
+
+  // Bulk memory primitives over the module's own linear memory (memmove/memset/memcmp/memchr). These are
+  // imported by any module that uses RawBuffer/string copies or the mem.memory module.
+  nova_bytes_copy: (dst, src, len) => {
+    const d = ptr32(dst), s = ptr32(src), n = Number(len);
+    if (!d || !s || n <= 0) return;
+    u8().copyWithin(d, s, s + n);          // copyWithin is overlap-safe (memmove semantics)
+  },
+  nova_mem_set: (dst, val, len) => {
+    const d = ptr32(dst), n = Number(len);
+    if (!d || n <= 0) return;
+    u8().fill(Number(val) & 0xff, d, d + n);
+  },
+  nova_mem_cmp: (a, b, len) => {
+    const pa = ptr32(a), pb = ptr32(b), n = Number(len);
+    if (n <= 0) return 0n;
+    const arr = u8();
+    for (let i = 0; i < n; i++) { const d = arr[pa + i] - arr[pb + i]; if (d !== 0) return BigInt(d < 0 ? -1 : 1); }
+    return 0n;
+  },
+  nova_mem_find: (p, val, len) => {
+    const pp = ptr32(p), n = Number(len), v = Number(val) & 0xff;
+    if (!pp || n <= 0) return -1n;
+    const arr = u8();
+    for (let i = 0; i < n; i++) if (arr[pp + i] === v) return BigInt(i);
+    return -1n;
+  },
 };
 
 const mod = await WebAssembly.instantiate(wasmBytes, { env }).catch((e) => {
