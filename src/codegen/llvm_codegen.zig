@@ -673,6 +673,19 @@ pub const LlvmCompiler = struct {
         };
     }
 
+    // How many value-optional levels wrap this type (0 = not a value-optional, 1 = `int | undefined`,
+    // 2 = `(int | undefined) | undefined`). Each level is one heap box, so the depth is the number of
+    // box/unbox peels between two value-optional representations.
+    pub fn valoptDepth(self: *LlvmCompiler, tid: sema_types.TypeId) usize {
+        var d: usize = 0;
+        var cur = tid;
+        while (self.valueOptionalInner(cur)) |inner| {
+            d += 1;
+            cur = inner;
+        }
+        return d;
+    }
+
     pub fn buildValoptBox(self: *LlvmCompiler, value: types.LLVMValueRef) anyerror!types.LLVMValueRef {
         const f = if (self.func_map.get("nova_valopt_box")) |g| g else blk: {
             var at = [_]types.LLVMTypeRef{self.val_type};
@@ -1457,6 +1470,27 @@ pub const LlvmCompiler = struct {
             }
         }
         const param_tr = param_tr_opt orelse return val;
+        // A NESTED value-optional argument (`(int | undefined) | undefined`, e.g. from
+        // `List<int | undefined>.get()`) passed to a flatter value-optional parameter: deliver a box at the
+        // PARAMETER's declared depth, not the argument's. The value-optional param ABI is uniformly boxed at
+        // the declared depth (the callee unboxes exactly that many levels on `??`/comparison -- see the C10
+        // param-TypeId change in declarations.zig), so peel the surplus levels here. suppress_valopt_unbox
+        // kept the full box through compileCallArgument (now uniform across ident/call after the save-restore
+        // above), so the surplus is exactly arg_depth - param_depth. Gated on the parameter being
+        // SYNTACTICALLY a value-optional, which excludes the generic-container element slot whose `T` param is
+        // collapsed by monomorphisation and must keep the full box.
+        if (self.valoptTypeRefIsValue(param_tr) and self.exprYieldsValoptBox(arg)) {
+            if (self.typeOfExprConcrete(arg)) |arg_tid| {
+                const arg_depth = self.valoptDepth(arg_tid);
+                const param_depth: usize = if (self.valoptTypeRefIsNested(param_tr)) 2 else 1;
+                if (arg_depth > param_depth) {
+                    var out = val;
+                    var n = arg_depth - param_depth;
+                    while (n > 0) : (n -= 1) out = try self.buildValoptUnbox(out);
+                    return out;
+                }
+            }
+        }
         if (self.valoptTypeRefIsValue(param_tr) and
             !LlvmCompiler.isUndefinedLiteralExpr(arg) and
             !self.exprYieldsValoptBox(arg))

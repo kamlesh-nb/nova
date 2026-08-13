@@ -93,7 +93,14 @@ pub fn isUntypeablePlaceholder(name: []const u8) bool {
 }
 
 pub fn compileCallArgument(self: *LlvmCompiler, arg: ast.Expression) anyerror!types.LLVMValueRef {
+    // compileExpression clobbers suppress_valopt_unbox as a side effect when `arg` contains a nested call
+    // (each sub-call sets it for its own args and leaves it false). The unbox decision below must see the
+    // suppress value the CALLER set for THIS argument, so save and restore around the sub-evaluation --
+    // otherwise a `.call` argument silently gets a baseline unbox that a `.ident` argument does not, which
+    // desynchronises the value-optional box depth across the call boundary (the C10 nested-valopt arg bug).
+    const saved_suppress = self.suppress_valopt_unbox;
     const val = try self.compileExpression(arg);
+    self.suppress_valopt_unbox = saved_suppress;
 
     // A value-optional argument is normally unboxed to its raw value for the call ABI, then the call site
     // re-boxes via coerceValoptArg when the parameter is itself a value-optional. That re-box relies on the

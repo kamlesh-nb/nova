@@ -1,0 +1,67 @@
+// C10 / R2: a value-optional passed to a value-optional parameter. The param ABI is a BOX at the
+// parameter's declared depth; the callee unboxes exactly that many levels on `??`/comparison regardless of
+// flow narrowing (param-TypeId change), and the caller peels a nested argument down to the parameter's
+// depth. This must hold for BOTH callee shapes (a plain `o ?? d`, and one that narrows with
+// `if (x == undefined)` first) and BOTH argument forms (direct call result, and a `let`-bound local), flat
+// and nested (`List<int | undefined>.get()` yields `(int | undefined) | undefined`). Present values are
+// non-zero to stay clear of the orthogonal value-optional-zero limitation.
+import list;
+import map;
+import assert;
+
+// Callee WITHOUT narrowing: unboxes its param directly.
+fn plain(o: int | undefined): int { return o ?? -1; }
+
+// Callee WITH narrowing: the `if` must not change the param's boxed representation.
+fn narrow(x: int | undefined): int {
+    if (x == undefined) { return -1; }
+    return x ?? -2;
+}
+
+fn hh(k: int): int { return k; }
+
+@test
+fn flat_direct(): void {
+    let l = list.List<int>();
+    l.push(10);
+    assert.equalInt(plain(l.get(0)), 10);
+    assert.equalInt(narrow(l.get(0)), 10);
+    assert.equalInt(plain(l.get(99)), -1);
+    assert.equalInt(narrow(l.get(99)), -1);
+}
+
+@test
+fn flat_local(): void {
+    let l = list.List<int>();
+    l.push(10);
+    let g = l.get(0);
+    assert.equalInt(plain(g), 10);
+    assert.equalInt(narrow(g), 10);
+}
+
+@test
+fn nested_direct(): void {
+    let l = list.List<int | undefined>();
+    l.push(10);
+    assert.equalInt(plain(l.get(0)), 10);
+    assert.equalInt(narrow(l.get(0)), 10);
+}
+
+@test
+fn nested_local(): void {
+    let l = list.List<int | undefined>();
+    l.push(10);
+    let g = l.get(0);          // (int | undefined) | undefined, boxed twice
+    assert.equalInt(plain(g), 10);
+    assert.equalInt(narrow(g), 10);
+}
+
+@test
+fn map_local(): void {
+    let m = map.Map<int, int>(16, hh);
+    m.set(5, 42);
+    let g = m.get(5);
+    assert.equalInt(plain(g), 42);
+    assert.equalInt(narrow(g), 42);
+    assert.equalInt(plain(m.get(7)), -1);
+}

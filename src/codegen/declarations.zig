@@ -701,6 +701,11 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
                         if (p.type_name) |t| {
                             const p_type = try compiler.typeRefToString(t);
                             try local_types.put(p.name, p_type);
+                            // Also record the param's TypeId (optionality PRESERVED, unlike typeRefToString
+                            // which drops `.optional`). This lets value-use codegen recognise a value-optional
+                            // PARAMETER as a boxed slot and unbox it on `??`/comparison irrespective of flow
+                            // narrowing -- the C10 fix (uniform boxed value-optional param ABI).
+                            if (compiler.tidForTypeRef(t)) |tid| try local_type_ids.put(p.name, tid);
                         }
                     }
                     break;
@@ -726,6 +731,7 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
 
                                 const p_type = try compiler.typeRefToString(t);
                                 try local_types.put(p.name, p_type);
+                                if (compiler.tidForTypeRef(t)) |tid| try local_type_ids.put(p.name, tid);
                             }
                         }
                         matched = true;
@@ -747,6 +753,7 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
                             if (p.type_name) |t| {
                                 const p_type = try compiler.typeRefToString(t);
                                 try local_types.put(p.name, p_type);
+                                if (compiler.tidForTypeRef(t)) |tid| try local_type_ids.put(p.name, tid);
                             }
                         }
                         matched = true;
