@@ -1,0 +1,157 @@
+import list;
+import data.db;
+import data.sql.pool;
+import web.di;
+import novadb;
+
+// A pooled `Connection` for serving CONCURRENT requests correctly.
+//
+// The single-connection `NovaDbConnection` is a fine teaching example, but a NovaDB connection is a single
+// request/response channel with a `busy` guard: a second in-flight request on the same connection is
+// refused. On the single-threaded reactor, several requests are in flight at once (each a coroutine), so
+// they collide on one shared connection and all but one get an error (a 404 for a product that exists).
+// Under load that is most requests. The fix is a pool of connections, one checked out per request.
+//
+// The shape that makes transactions correct: the app wraps every request in begin/commit via the
+// `TransactionBehavior`, on the connection it gets from the (request-scoped) repository. So each request
+// must PIN one pooled connection for the whole begin -> query -> commit sequence, and release it at the
+// end. Concurrent requests, being separate scopes, pin different connections and never collide. This file
+// has two pieces:
+//
+//   NovaPool         a singleton holding the shared Pool (+ one-time schema create/seed).
+//   RequestConnection a request-scoped Connection that pins one pooled connection per request.
+
+// The shared pool. Registered as a singleton so every request draws from the same set of connections.
+pub class NovaPool impl Service {
+    pool: pool.Pool,
+    seeded: bool,
+
+    init(dsn: string, size: int) {
+        self.pool = pool.Pool(NovaDriver(), dsn, size);
+        // maxOpen = size: a hard cap. When every connection is busy, acquire() parks on aio.delay and
+        // retries; on the single reactor that yields, so an in-flight request can finish and release one.
+        // No request is refused, it just waits briefly. maxIdle defaulted to size so released connections
+        // are kept warm rather than reconnected.
+        self.pool.configure(size, 0, false);
+        self.seeded = false;
+    }
+
+    // Borrow a connection, creating the schema and seeding a few known rows the first time. CREATE TABLE
+    // IF NOT EXISTS and the SELECT-then-INSERT seed are idempotent, so the benign race where two first
+    // requests both seed before `seeded` flips is harmless (the second INSERT is a no-op or a swallowed
+    // duplicate-key). NovaDB has no auto-increment, so the seed rows carry explicit ids (1..3).
+    pub async fn acquireSeeded(self: NovaPool): Connection {
+        let c = await self.pool.acquire();
+        if (!self.seeded) {
+            let _ = await c.exec("CREATE TABLE IF NOT EXISTS products (id INT PRIMARY KEY, name TEXT, price INT)", List<DbValue>());
+            await self.seedRow(c, 1, "Keyboard", 4500);
+            await self.seedRow(c, 2, "Mouse", 1800);
+            await self.seedRow(c, 3, "Monitor", 22000);
+            self.seeded = true;
+        }
+        return c;
+    }
+
+    async fn seedRow(self: NovaPool, c: Connection, id: int, name: string, price: int): void {
+        let key = List<DbValue>();
+        key.push(db.dbInt(id));
+        let rs = await c.query("SELECT id FROM products WHERE id = $1", key);
+        if (rs.rows.size() > 0) { return; }
+        let p = List<DbValue>();
+        p.push(db.dbInt(id));
+        p.push(db.dbText(name));
+        p.push(db.dbInt(price));
+        let _ = await c.exec("INSERT INTO products (id, name, price) VALUES ($1, $2, $3)", p);
+    }
+
+    pub fn release(self: NovaPool, c: Connection): void { self.pool.release(c); }
+}
+
+// One per request scope. Pins a single pooled connection for the request's transaction, so begin, the
+// query/exec, and commit all run on the SAME connection, and two concurrent requests use two different
+// connections. Outside a transaction (no begin), each call borrows and returns a connection on its own.
+pub class RequestConnection impl Connection, Service {
+    np: NovaPool,
+    pinned: Connection | undefined,
+    inTx: bool,
+
+    init(np: NovaPool) {
+        self.np = np;
+        self.pinned = undefined;
+        self.inTx = false;
+    }
+
+    // Return the pinned connection, acquiring and pinning one if this is the first use in the transaction.
+    async fn pin(self: RequestConnection): Connection {
+        let ex = self.pinned;
+        if (ex != undefined) { return ex; }
+        let c = await self.np.acquireSeeded();
+        self.pinned = c;
+        return c;
+    }
+
+    async fn query(self: RequestConnection, sql: string, params: List<DbValue>): ResultSet {
+        if (self.inTx) { let c = await self.pin(); return await c.query(sql, params); }
+        let c = await self.np.acquireSeeded();
+        let r = await c.query(sql, params);
+        self.np.release(c);
+        return r;
+    }
+
+    async fn exec(self: RequestConnection, sql: string, params: List<DbValue>): ExecResult {
+        if (self.inTx) { let c = await self.pin(); return await c.exec(sql, params); }
+        let c = await self.np.acquireSeeded();
+        let r = await c.exec(sql, params);
+        self.np.release(c);
+        return r;
+    }
+
+    async fn queryWire(self: RequestConnection, sql: string, params: List<DbValue>): WireRows {
+        if (self.inTx) { let c = await self.pin(); return await c.queryWire(sql, params); }
+        let c = await self.np.acquireSeeded();
+        let r = await c.queryWire(sql, params);
+        self.np.release(c);
+        return r;
+    }
+
+    async fn begin(self: RequestConnection): ExecResult {
+        let c = await self.pin();
+        self.inTx = true;
+        return await c.begin();
+    }
+
+    async fn commit(self: RequestConnection): ExecResult {
+        let c = await self.pin();
+        let r = await c.commit();
+        self.np.release(c);
+        self.pinned = undefined;
+        self.inTx = false;
+        return r;
+    }
+
+    async fn rollback(self: RequestConnection): ExecResult {
+        let c = await self.pin();
+        let r = await c.rollback();
+        self.np.release(c);
+        self.pinned = undefined;
+        self.inTx = false;
+        return r;
+    }
+
+    fn close(self: RequestConnection): void {
+        // Defensive: if a request ended without commit/rollback (it should not, the behaviour brackets
+        // every request), return the pinned connection to the pool rather than leak it.
+        let ex = self.pinned;
+        if (ex != undefined) { self.np.release(ex); self.pinned = undefined; self.inTx = false; }
+    }
+
+    fn setTimeout(self: RequestConnection, ms: int): int { return 0; }
+
+    async fn prepare(self: RequestConnection, sql: string): int { return 0; }
+    async fn queryPrepared(self: RequestConnection, stmt: int, params: List<DbValue>): ResultSet {
+        return await self.query("", params);
+    }
+    async fn execPrepared(self: RequestConnection, stmt: int, params: List<DbValue>): ExecResult {
+        return await self.exec("", params);
+    }
+}

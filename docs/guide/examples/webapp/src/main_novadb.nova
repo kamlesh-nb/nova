@@ -20,6 +20,7 @@ import string;
 import env;
 import data.db;
 import Features.Products.Shared.novadb_connection;
+import Features.Products.Shared.pooled_connection;
 import Features.Products.Shared.repository;
 import Features.Products.Shared.behaviours;
 import Features.Products.CreateProduct.command;
@@ -33,8 +34,17 @@ import Features.Products.GetProductById.handler;
 // a concrete type, nothing downstream notices.
 fn configureServices(): ServiceCollection {
     let services = ServiceCollection();
-    services.addSingleton("Connection", (sp) => { return NovaDbConnection("novadb://admin@127.0.0.1:3009?db=nova"); });
-    services.addScoped("ProductRepository", (sp) => { return ProductRepository(sp.require("Connection") as NovaDbConnection); });
+    // A shared connection POOL (singleton) so concurrent requests do not collide on one busy connection,
+    // and a request-scoped `Connection` that pins ONE pooled connection for the request's transaction. Pool
+    // size honours NOVA_DB_POOL (default 16); size it at or above the reactor's expected concurrency so an
+    // acquire rarely has to wait. This is the one change that makes the app correct under load; the
+    // repository, handlers, and behaviours are unchanged (they depend only on the Connection seam).
+    let poolSize = 16;
+    let ps = env.get("NOVA_DB_POOL");
+    if (!string.eql(ps, "")) { poolSize = string.parseInt(ps) ?? 16; }
+    services.addSingleton("NovaPool", (sp) => { return NovaPool("novadb://admin@127.0.0.1:3009?db=nova", poolSize); });
+    services.addScoped("Connection", (sp) => { return RequestConnection(sp.require("NovaPool") as NovaPool); });
+    services.addScoped("ProductRepository", (sp) => { return ProductRepository(sp.require("Connection") as RequestConnection); });
     return services;
 }
 
