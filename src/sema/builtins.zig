@@ -85,6 +85,11 @@ pub const table = [_]Builtin{
     .{ .receiver = "simd", .name = "shlU64x2", .ret = .vec_u64x2 },
     .{ .receiver = "simd", .name = "shrU64x2", .ret = .vec_u64x2 },
 
+    // FR-simd-L2: carryless multiply of two 64-bit scalars -> 128-bit product as u64x2. The GHASH
+    // accelerator. Lowers to llvm.aarch64.neon.pmull64 on ARM, llvm.x86.pclmulqdq on x86, and a portable
+    // inline software multiply otherwise. Named with the U64x2 suffix so it routes through compileIntSimd.
+    .{ .receiver = "simd", .name = "clmulU64x2", .ret = .vec_u64x2 },
+
     // FR-mem Tier 3: raw-address XOR. The generic mem builtins (load/store/rotl/rotr/ctz/clz/bswap) are
     // typed by the special-case in infer.zig; xorBytes is non-generic, so it lives in this table.
     .{ .receiver = "mem", .name = "xorBytes", .ret = .void_ },

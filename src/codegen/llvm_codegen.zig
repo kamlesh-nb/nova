@@ -100,6 +100,10 @@ pub const MethodParamBinding = struct {
     concrete: []const u8,
 };
 
+// FR-simd-L2: which family of hardware crypto intrinsics the compile target provides. Decided once from
+// the target triple; the SIMD builtins pick the right LLVM intrinsic (or the software fallback) from it.
+pub const SimdTarget = enum { none, aarch64, x86_64 };
+
 pub const LlvmCompiler = struct {
     allocator: std.mem.Allocator,
     module: types.LLVMModuleRef,
@@ -190,6 +194,8 @@ pub const LlvmCompiler = struct {
     closure_lambdas: std.StringHashMapUnmanaged([]const u8),
     current_saved_captures: std.StringHashMap(types.LLVMValueRef),
     is_wasm: bool,
+    // FR-simd-L2: which target crypto-intrinsic family is available, decided from the target triple.
+    simd_target: SimdTarget = .none,
     coverage_enabled: bool,
     cov_registry: ?CoverageRegistry,
     current_string_builder: ?types.LLVMValueRef = null,
@@ -340,6 +346,7 @@ pub const LlvmCompiler = struct {
             .closure_lambdas = .{},
             .current_saved_captures = std.StringHashMap(types.LLVMValueRef).init(allocator),
             .is_wasm = is_wasm,
+            .simd_target = if (is_wasm) .none else if (std.mem.indexOf(u8, triple_z, "aarch64") != null or std.mem.indexOf(u8, triple_z, "arm64") != null) .aarch64 else if (std.mem.indexOf(u8, triple_z, "x86_64") != null) .x86_64 else .none,
             .coverage_enabled = coverage_enabled,
             .cov_registry = if (coverage_enabled) CoverageRegistry.init(allocator) else null,
             .current_string_builder = null,
@@ -3707,6 +3714,7 @@ pub const LlvmCompiler = struct {
     pub const buildClosureCall = expressions_mod.buildClosureCall;
     pub const compileSimdCall = expressions_mod.compileSimdCall;
     pub const compileIntSimd = expressions_mod.compileIntSimd;
+    pub const compileClmul64 = expressions_mod.compileClmul64;
     pub const compileMemCall = expressions_mod.compileMemCall;
     pub const arrayElemFloatLLVM = expressions_mod.arrayElemFloatLLVM;
     pub const arrayBasePtr = expressions_mod.arrayBasePtr;

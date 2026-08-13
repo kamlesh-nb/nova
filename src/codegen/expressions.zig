@@ -511,6 +511,12 @@ pub fn compileIntSimd(self: *LlvmCompiler, field: []const u8, args: []const ast.
         if (std.mem.eql(u8, op, "shl")) return core.LLVMBuildShl(self.builder, v, amt, "simd_shl");
         return core.LLVMBuildLShr(self.builder, v, amt, "simd_shr"); // logical (unsigned lanes)
     }
+    if (std.mem.eql(u8, op, "clmul")) {
+        // FR-simd-L2: carryless 64x64 -> 128 multiply. a and b are Nova longs (i64 in the value slot).
+        const a64 = core.LLVMBuildTrunc(self.builder, try self.compileExpression(args[0]), core.LLVMInt64Type(), "clmul_a");
+        const b64 = core.LLVMBuildTrunc(self.builder, try self.compileExpression(args[1]), core.LLVMInt64Type(), "clmul_b");
+        return try self.compileClmul64(a64, b64, vt);
+    }
 
     // binary lane ops
     const a = try self.compileExpression(args[0]);
@@ -526,6 +532,55 @@ pub fn compileIntSimd(self: *LlvmCompiler, field: []const u8, args: []const ast.
     }
     std.debug.print("unknown int-simd op: {s}\n", .{op});
     return error.UnknownSimdOp;
+}
+
+// FR-simd-L2: carryless 64x64 -> 128 multiply, returned as vt (<2 x i64>). Uses the hardware intrinsic
+// for the compile target (pmull64 on ARM, pclmulqdq on x86) and a portable inline software multiply
+// otherwise. This is the GHASH primitive; the pure-Nova software GHASH remains the higher-level fallback.
+pub fn compileClmul64(self: *LlvmCompiler, a64: types.LLVMValueRef, b64: types.LLVMValueRef, vt: types.LLVMTypeRef) anyerror!types.LLVMValueRef {
+    const ctx = core.LLVMGetModuleContext(self.module);
+    switch (self.simd_target) {
+        .aarch64 => {
+            const name: [:0]const u8 = "llvm.aarch64.neon.pmull64";
+            const id = core.LLVMLookupIntrinsicID(name.ptr, name.len);
+            const fn_val = core.LLVMGetIntrinsicDeclaration(self.module, id, null, 0);
+            const fn_ty = core.LLVMIntrinsicGetType(ctx, id, null, 0);
+            var cargs = [_]types.LLVMValueRef{ a64, b64 };
+            const res = core.LLVMBuildCall2(self.builder, fn_ty, fn_val, &cargs, 2, "clmul_pmull"); // <16 x i8>
+            return core.LLVMBuildBitCast(self.builder, res, vt, "clmul_v");
+        },
+        .x86_64 => {
+            const name: [:0]const u8 = "llvm.x86.pclmulqdq";
+            const id = core.LLVMLookupIntrinsicID(name.ptr, name.len);
+            const fn_val = core.LLVMGetIntrinsicDeclaration(self.module, id, null, 0);
+            const fn_ty = core.LLVMIntrinsicGetType(ctx, id, null, 0);
+            // Place a and b in lane 0 of two <2 x i64> operands; imm 0 selects lane 0 of each.
+            const i64t = core.LLVMInt64Type();
+            var av = core.LLVMGetUndef(vt);
+            av = core.LLVMBuildInsertElement(self.builder, av, a64, core.LLVMConstInt(self.i32_type, 0, 0), "clmul_av0");
+            av = core.LLVMBuildInsertElement(self.builder, av, core.LLVMConstInt(i64t, 0, 0), core.LLVMConstInt(self.i32_type, 1, 0), "clmul_av1");
+            var bv = core.LLVMGetUndef(vt);
+            bv = core.LLVMBuildInsertElement(self.builder, bv, b64, core.LLVMConstInt(self.i32_type, 0, 0), "clmul_bv0");
+            bv = core.LLVMBuildInsertElement(self.builder, bv, core.LLVMConstInt(i64t, 0, 0), core.LLVMConstInt(self.i32_type, 1, 0), "clmul_bv1");
+            var cargs = [_]types.LLVMValueRef{ av, bv, core.LLVMConstInt(self.i8_type, 0, 0) };
+            return core.LLVMBuildCall2(self.builder, fn_ty, fn_val, &cargs, 3, "clmul_pclmul");
+        },
+        .none => {
+            // Portable software carryless multiply in i128: XOR of (a << i) for every set bit i of b.
+            const i128t = core.LLVMIntType(128);
+            const a128 = core.LLVMBuildZExt(self.builder, a64, i128t, "clmul_a128");
+            var acc = core.LLVMConstInt(i128t, 0, 0);
+            var i: c_uint = 0;
+            while (i < 64) : (i += 1) {
+                const bit = core.LLVMBuildAnd(self.builder, core.LLVMBuildLShr(self.builder, b64, core.LLVMConstInt(core.LLVMInt64Type(), i, 0), "clmul_sh"), core.LLVMConstInt(core.LLVMInt64Type(), 1, 0), "clmul_bit");
+                const bit128 = core.LLVMBuildZExt(self.builder, bit, i128t, "clmul_bit128");
+                const mask = core.LLVMBuildNeg(self.builder, bit128, "clmul_mask"); // 0 or all-ones
+                const shifted = core.LLVMBuildShl(self.builder, a128, core.LLVMConstInt(i128t, i, 0), "clmul_shl");
+                acc = core.LLVMBuildXor(self.builder, acc, core.LLVMBuildAnd(self.builder, shifted, mask, "clmul_and"), "clmul_acc");
+            }
+            return core.LLVMBuildBitCast(self.builder, acc, vt, "clmul_vsw");
+        },
+    }
 }
 
 // FR-mem: width (bits) and signedness of an integer type name, for the mem.load/store builtins.

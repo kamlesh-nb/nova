@@ -1,0 +1,49 @@
+// FR-simd-L2: hardware carryless multiply, the GHASH accelerator. simd.clmulU64x2(a, b) computes the
+// carryless 64x64 -> 128 product of two longs and returns it as u64x2. It lowers to the target crypto
+// intrinsic (llvm.aarch64.neon.pmull64 on ARM, llvm.x86.pclmulqdq on x86) or a portable inline software
+// multiply otherwise; the result is identical across paths, so these assertions hold on every target.
+// The pure-Nova software GHASH (crypto/mac/ghash) remains the higher-level fallback.
+import assert;
+import bytes;
+
+@test
+fn clmul_identity(): void {
+    // clmul(a, 1) = a in the low 64 bits, 0 in the high (bit 0 of b only).
+    let out = bytes.alloc(16);
+    simd.storeU64x2(out, 0, simd.clmulU64x2(0x1122334455667788, 1));
+    assert.equalInt(bytes.read_i32(out, 0), 0x55667788);
+    assert.equalInt(bytes.read_i32(out, 4), 0x11223344);
+    assert.equalInt(bytes.read_i32(out, 8), 0);
+    assert.equalInt(bytes.read_i32(out, 12), 0);
+}
+
+@test
+fn clmul_shift(): void {
+    // clmul(a, 2) = a << 1, no carries (bit 1 of b only).
+    let out = bytes.alloc(16);
+    simd.storeU64x2(out, 0, simd.clmulU64x2(0x8, 2));
+    assert.equalInt(bytes.read_i32(out, 0), 0x10);
+    assert.equalInt(bytes.read_i32(out, 8), 0);
+}
+
+@test
+fn clmul_is_carryless(): void {
+    // clmul(3, 3) = (3<<0) ^ (3<<1) = 0b11 ^ 0b110 = 0b101 = 5. An ordinary multiply gives 9, so this
+    // proves the operation is genuinely carryless (the GF(2) multiply GHASH needs).
+    let out = bytes.alloc(16);
+    simd.storeU64x2(out, 0, simd.clmulU64x2(3, 3));
+    assert.equalInt(bytes.read_i32(out, 0), 5);
+    assert.equalInt(bytes.read_i32(out, 8), 0);
+}
+
+@test
+fn clmul_high_bits(): void {
+    // clmul of two high values spills into the upper 64 bits: clmul(1<<40, 1<<40) = 1<<80, which lands
+    // in the high lane at bit (80-64)=16.
+    let out = bytes.alloc(16);
+    let hi: long = 1;                 // long, so the shift does not wrap at 32 bits
+    let shifted = hi << 40;
+    simd.storeU64x2(out, 0, simd.clmulU64x2(shifted, shifted));
+    assert.equalInt(bytes.read_i32(out, 0), 0);       // low 64 = 0
+    assert.equalInt(bytes.read_i32(out, 8), 1 << 16); // high 64, bit 16 set
+}
