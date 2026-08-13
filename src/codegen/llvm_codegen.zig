@@ -3124,6 +3124,13 @@ pub const LlvmCompiler = struct {
                 self.current_method_subst = subst;
                 defer self.current_method_subst = prev;
 
+                // B1: also expose the TypeId instantiation of THIS instance so registerGenericFnInst can
+                // resolve inner type-args to concrete TypeIds (not just strings) and make the transitive
+                // callee TypeId-native too.
+                const prev_iid = self.current_instantiation_id;
+                self.current_instantiation_id = fi.inst_key;
+                defer self.current_instantiation_id = prev_iid;
+
                 if (try self.discoverGenericCallsInBlock(fd.body, &gmap)) changed = true;
             }
         }
@@ -3259,6 +3266,36 @@ pub const LlvmCompiler = struct {
             }
         }
         if (!all_concrete) return false;
+
+        // B1 TypeId-native path: resolve the type-args to CONCRETE TypeIds under the current instance and
+        // register the callee as a TypeId-native instance (noteFreeFnInst), then record its overlay so the
+        // fixpoint can resolve ITS type-params next round. Falls back to the string-only path when a TypeId
+        // is not recoverable (e.g. the current instance itself has no inst_key yet).
+        if (sema_shadow.live_sema) |sm| {
+            if (sm.tab.findFunction(callee_fd.name)) |callee_fid| {
+                var tids = try self.allocator.alloc(sema_types.TypeId, type_args.len);
+                defer self.allocator.free(tids);
+                var all_tid = true;
+                for (type_args, 0..) |ta, idx| {
+                    tids[idx] = self.concreteTidForTypeRef(ta) orelse {
+                        all_tid = false;
+                        break;
+                    };
+                }
+                if (all_tid) {
+                    const added = sema_mono.noteFreeFnInst(&sm.store, callee_fd.name, callee_fid, callee_fd.type_params, tids);
+                    if (added) {
+                        // The inst_key is a deterministic intern of .struct_{callee_fid, tids}, so it equals
+                        // whatever noteFreeFnInst stored; record the overlay directly from what we computed.
+                        const key = sm.store.intern(.{ .struct_ = .{ .decl = callee_fid, .args = tids } }) catch null;
+                        @import("../sema/inst_disp.zig").recordFreeFnInst(self.allocator, &sm.store, &sm.ir, self.program, callee_fd.name, callee_fid, tids, key);
+                        return true;
+                    }
+                    return false;
+                }
+            }
+        }
+
         return sema_mono.noteFreeFnInstStr(callee_fd.name, callee_fd.type_params, rendered);
     }
 
@@ -3781,6 +3818,7 @@ pub const LlvmCompiler = struct {
     pub const isOwnedTupleElemByName = types_mod.isOwnedTupleElemByName;
     pub const isOwnedDeclaredType = types_mod.isOwnedDeclaredType;
     pub const tidForTypeRef = types_mod.tidForTypeRef;
+    pub const concreteTidForTypeRef = types_mod.concreteTidForTypeRef;
     pub const tidForName = types_mod.tidForName;
     pub const ownedByName = types_mod.ownedByName;
 

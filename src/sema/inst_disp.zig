@@ -54,17 +54,33 @@ pub fn runFreeFns(
 ) void {
     const mono = @import("mono.zig");
     for (mono.free_fn_insts.items) |fi| {
-        const owner = fi.owner orelse continue;
-        const args = fi.args_tids orelse continue;
-        const key = fi.inst_key orelse continue;
-        for (args, 0..) |arg, i| {
-            const tp = store.intern(.{ .type_param = .{ .owner = owner, .index = @intCast(i) } }) catch continue;
-            ir.recordTpResolve(allocator, tp, key, arg) catch {};
-        }
-        const fd = findFreeFn(program, fi.fn_name) orelse continue;
-        const ctx = Ctx{ .allocator = allocator, .store = store, .ir = ir, .decl = owner, .args = args, .inst = key };
-        for (fd.body.statements) |*s| ctx.stmt(s);
+        recordFreeFnInst(allocator, store, ir, program, fi.fn_name, fi.owner, fi.args_tids, fi.inst_key);
     }
+}
+
+// Record the TypeId overlay (tp_resolve + expr_types_inst/owned_inst) for ONE free-fn instance. Callable
+// both from sema (runFreeFns, direct instances) and from codegen's transitive fixpoint as new TypeId-native
+// instances are discovered (B1). No-op unless owner/args/key are all present.
+pub fn recordFreeFnInst(
+    allocator: std.mem.Allocator,
+    store: *TypeStore,
+    ir: *TypedIr,
+    program: ast.Program,
+    fn_name: []const u8,
+    owner_opt: ?types.SymbolId,
+    args_opt: ?[]const TypeId,
+    key_opt: ?TypeId,
+) void {
+    const owner = owner_opt orelse return;
+    const args = args_opt orelse return;
+    const key = key_opt orelse return;
+    for (args, 0..) |arg, i| {
+        const tp = store.intern(.{ .type_param = .{ .owner = owner, .index = @intCast(i) } }) catch continue;
+        ir.recordTpResolve(allocator, tp, key, arg) catch {};
+    }
+    const fd = findFreeFn(program, fn_name) orelse return;
+    const ctx = Ctx{ .allocator = allocator, .store = store, .ir = ir, .decl = owner, .args = args, .inst = key };
+    for (fd.body.statements) |*s| ctx.stmt(s);
 }
 
 fn findFreeFn(program: ast.Program, name: []const u8) ?*const ast.FunctionDecl {

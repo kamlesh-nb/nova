@@ -1250,7 +1250,7 @@ pub const Inferer = struct {
                                     }
                                 }
                                 if (all_concrete) {
-                                    mono.noteFreeFnInst(self.store, n, fid, fd.type_params, args);
+                                    _ = mono.noteFreeFnInst(self.store, n, fid, fd.type_params, args);
                                 }
                                 return self.ok(sub);
                             }
@@ -1393,7 +1393,7 @@ pub const Inferer = struct {
                 solved_args[i] = bound;
             }
             if (all_concrete) {
-                mono.noteFreeFnInst(self.store, fd.name, fid, fd.type_params, solved_args);
+                _ = mono.noteFreeFnInst(self.store, fd.name, fid, fd.type_params, solved_args);
                 // Record the SOLVED concrete type args on the call expression so codegen can rebuild the
                 // monomorphised name `fn__T` for a bare `fn(x)` call (no explicit `<T>` to mangle from).
                 // Reuses the same per-expression side table method calls use.

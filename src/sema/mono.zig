@@ -116,36 +116,46 @@ pub fn noteFreeFnInst(
     owner: types.SymbolId,
     params: []const []const u8,
     args: []const TypeId,
-) void {
+) bool {
     const a = std.heap.page_allocator;
-    const abuf = a.alloc([]const u8, args.len) catch return;
+    const abuf = a.alloc([]const u8, args.len) catch return false;
     for (args, 0..) |at, i| {
-        const ar = render.renderLegacy(a, store, at) catch return;
-        abuf[i] = a.dupe(u8, ar) catch return;
+        const ar = render.renderLegacy(a, store, at) catch return false;
+        abuf[i] = a.dupe(u8, ar) catch return false;
     }
-    for (free_fn_insts.items) |fi| {
+    const tbuf = a.alloc(TypeId, args.len) catch return false;
+    for (args, 0..) |at, i| tbuf[i] = at;
+    const key = store.intern(.{ .struct_ = .{ .decl = owner, .args = tbuf } }) catch null;
+    // Dedup by (name, string args). If a string-only entry (from the transitive path) already exists, UPGRADE
+    // it in place with the TypeId args/owner/inst_key so the overlay can be recorded for it (B1). Returns true
+    // when something is newly TypeId-native (a fresh entry, or an upgraded one) so the fixpoint can react.
+    for (free_fn_insts.items) |*fi| {
         if (!std.mem.eql(u8, fi.fn_name, fn_name)) continue;
         if (fi.args.len != abuf.len) continue;
         var same = true;
         for (fi.args, abuf) |old, new| {
             if (!std.mem.eql(u8, old, new)) same = false;
         }
-        if (same) return;
+        if (!same) continue;
+        if (fi.inst_key == null and key != null) {
+            fi.owner = owner;
+            fi.args_tids = tbuf;
+            fi.inst_key = key;
+            return true;
+        }
+        return false;
     }
-    const pbuf = a.alloc([]const u8, params.len) catch return;
-    for (params, 0..) |p, i| pbuf[i] = a.dupe(u8, p) catch return;
-    // Keep the TypeId args and intern the instantiation key (page allocator: matches the string storage).
-    const tbuf = a.alloc(TypeId, args.len) catch return;
-    for (args, 0..) |at, i| tbuf[i] = at;
-    const key = store.intern(.{ .struct_ = .{ .decl = owner, .args = tbuf } }) catch null;
+    const pbuf = a.alloc([]const u8, params.len) catch return false;
+    for (params, 0..) |p, i| pbuf[i] = a.dupe(u8, p) catch return false;
     free_fn_insts.append(a, .{
-        .fn_name = a.dupe(u8, fn_name) catch return,
+        .fn_name = a.dupe(u8, fn_name) catch return false,
         .params = pbuf,
         .args = abuf,
         .owner = owner,
         .args_tids = tbuf,
         .inst_key = key,
-    }) catch {};
+    }) catch return false;
+    return true;
 }
 
 // Register a free-generic function instantiation from already-rendered type-argument STRINGS

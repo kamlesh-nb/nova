@@ -1114,6 +1114,41 @@ pub fn tidForTypeRef(self: *LlvmCompiler, tr: ast.TypeRef) ?typesys.TypeId {
     return t;
 }
 
+// The CONCRETE TypeId a type-ref lowers to under the CURRENT instantiation: lower it, then substitute any
+// type-params using the active instance's (owner, args) recovered from current_instantiation_id
+// (= .struct_{owner, args}). Returns null if it does not fully resolve (still contains a type-param /
+// unresolved). Used by the transitive free-fn discovery to compute concrete TypeId args instead of strings.
+pub fn concreteTidForTypeRef(self: *LlvmCompiler, tr: ast.TypeRef) ?typesys.TypeId {
+    const st = sema_shadow.live_store orelse return null;
+    // Fast path: a bare type-param NAME forwarded from the current instance (e.g. `mid<T>` inside
+    // `top<string>`). The lowerer cannot resolve `T` without a param scope, so map the name straight to the
+    // current instance's arg TypeId via current_method_subst (name -> index) and the inst_key struct's args
+    // (index -> concrete TypeId, same order).
+    if (tr == .ident) {
+        if (self.current_instantiation_id) |inst| {
+            if (st.get(inst) == .struct_) {
+                const si = st.get(inst).struct_;
+                if (self.current_method_subst) |ms| {
+                    for (ms, 0..) |b, i| {
+                        if (i < si.args.len and std.mem.eql(u8, b.name, tr.ident)) return si.args[i];
+                    }
+                }
+            }
+        }
+    }
+    var t = self.tidForTypeRef(tr) orelse return null;
+    if (self.current_instantiation_id) |inst| {
+        if (st.get(inst) == .struct_) {
+            const si = st.get(inst).struct_;
+            t = @import("../sema/subst.zig").substitute(st, t, si.decl, si.args) catch t;
+        }
+    }
+    return switch (st.get(t)) {
+        .unresolved, .type_param => null,
+        else => t,
+    };
+}
+
 fn decidedDirectly(store: *const typesys.TypeStore, t: typesys.TypeId) bool {
     return switch (store.get(t)) {
         .enum_, .type_param, .unresolved => false,
