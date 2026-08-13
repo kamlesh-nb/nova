@@ -13,6 +13,9 @@ fn builtinRetType(r: builtins.Ret) ?ast.TypeRef {
         .decimal => ast.TypeRef{ .ident = "decimal" },
         .double => ast.TypeRef{ .ident = "f64" },
         .vec4 => ast.TypeRef{ .ident = "f64x4" },
+        .vec_u8x16 => ast.TypeRef{ .ident = "u8x16" },
+        .vec_u32x4 => ast.TypeRef{ .ident = "u32x4" },
+        .vec_u64x2 => ast.TypeRef{ .ident = "u64x2" },
     };
 }
 

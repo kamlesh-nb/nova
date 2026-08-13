@@ -255,6 +255,19 @@ pub const TypeStore = struct {
     pub fn vecF64x4T(self: *TypeStore) !TypeId {
         return self.intern(.{ .prim = .{ .kind = .float, .bits = 256 } });
     }
+    // FR-simd-L1 integer vectors. All three are 128-bit and would collide on total bits, so they are
+    // encoded with a bijective sentinel in the `bits` field: bits = elementBits*1000 + laneCount. This
+    // never collides with a real integer type (max real width is 64) and is decoded back to a name
+    // ("u8x16" etc.) in renderLegacy and to an LLVM vector type in the codegen slot picker.
+    pub fn vecU8x16T(self: *TypeStore) !TypeId {
+        return self.intern(.{ .prim = .{ .kind = .int, .bits = 8 * 1000 + 16, .signed = false } });
+    }
+    pub fn vecU32x4T(self: *TypeStore) !TypeId {
+        return self.intern(.{ .prim = .{ .kind = .int, .bits = 32 * 1000 + 4, .signed = false } });
+    }
+    pub fn vecU64x2T(self: *TypeStore) !TypeId {
+        return self.intern(.{ .prim = .{ .kind = .int, .bits = 64 * 1000 + 2, .signed = false } });
+    }
     pub fn floatT(self: *TypeStore) !TypeId {
         return self.intern(.{ .prim = .{ .kind = .float, .bits = 32 } });
     }

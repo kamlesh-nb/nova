@@ -2,7 +2,7 @@
 const std = @import("std");
 const types = @import("../types.zig");
 
-pub const Ret = enum { void_, int, long, ptr, string, bool_, decimal, double, vec4 };
+pub const Ret = enum { void_, int, long, ptr, string, bool_, decimal, double, vec4, vec_u8x16, vec_u32x4, vec_u64x2 };
 
 pub const Builtin = struct {
 
@@ -48,6 +48,42 @@ pub const table = [_]Builtin{
     .{ .receiver = "simd", .name = "fma4", .ret = .vec4 },
     .{ .receiver = "simd", .name = "sum4", .ret = .double },
     .{ .receiver = "simd", .name = "store4", .ret = .void_ },
+
+    // FR-simd-L1 integer vectors. u8x16 (<16 x i8>), u32x4 (<4 x i32>), u64x2 (<2 x i64>). Codegen lowers
+    // each to native LLVM vector ops (see compileSimdCall). load/store move a lane group to/from a byte
+    // buffer at a byte offset; movemask collapses the sign bits of the 16 bytes to a 16-bit int.
+    .{ .receiver = "simd", .name = "splatU8x16", .ret = .vec_u8x16 },
+    .{ .receiver = "simd", .name = "loadU8x16", .ret = .vec_u8x16 },
+    .{ .receiver = "simd", .name = "storeU8x16", .ret = .void_ },
+    .{ .receiver = "simd", .name = "addU8x16", .ret = .vec_u8x16 },
+    .{ .receiver = "simd", .name = "subU8x16", .ret = .vec_u8x16 },
+    .{ .receiver = "simd", .name = "andU8x16", .ret = .vec_u8x16 },
+    .{ .receiver = "simd", .name = "orU8x16", .ret = .vec_u8x16 },
+    .{ .receiver = "simd", .name = "xorU8x16", .ret = .vec_u8x16 },
+    .{ .receiver = "simd", .name = "eqU8x16", .ret = .vec_u8x16 },
+    .{ .receiver = "simd", .name = "movemaskU8x16", .ret = .int },
+
+    .{ .receiver = "simd", .name = "splatU32x4", .ret = .vec_u32x4 },
+    .{ .receiver = "simd", .name = "loadU32x4", .ret = .vec_u32x4 },
+    .{ .receiver = "simd", .name = "storeU32x4", .ret = .void_ },
+    .{ .receiver = "simd", .name = "addU32x4", .ret = .vec_u32x4 },
+    .{ .receiver = "simd", .name = "subU32x4", .ret = .vec_u32x4 },
+    .{ .receiver = "simd", .name = "andU32x4", .ret = .vec_u32x4 },
+    .{ .receiver = "simd", .name = "orU32x4", .ret = .vec_u32x4 },
+    .{ .receiver = "simd", .name = "xorU32x4", .ret = .vec_u32x4 },
+    .{ .receiver = "simd", .name = "shlU32x4", .ret = .vec_u32x4 },
+    .{ .receiver = "simd", .name = "shrU32x4", .ret = .vec_u32x4 },
+
+    .{ .receiver = "simd", .name = "splatU64x2", .ret = .vec_u64x2 },
+    .{ .receiver = "simd", .name = "loadU64x2", .ret = .vec_u64x2 },
+    .{ .receiver = "simd", .name = "storeU64x2", .ret = .void_ },
+    .{ .receiver = "simd", .name = "addU64x2", .ret = .vec_u64x2 },
+    .{ .receiver = "simd", .name = "subU64x2", .ret = .vec_u64x2 },
+    .{ .receiver = "simd", .name = "andU64x2", .ret = .vec_u64x2 },
+    .{ .receiver = "simd", .name = "orU64x2", .ret = .vec_u64x2 },
+    .{ .receiver = "simd", .name = "xorU64x2", .ret = .vec_u64x2 },
+    .{ .receiver = "simd", .name = "shlU64x2", .ret = .vec_u64x2 },
+    .{ .receiver = "simd", .name = "shrU64x2", .ret = .vec_u64x2 },
 
     // FR-mem Tier 3: raw-address XOR. The generic mem builtins (load/store/rotl/rotr/ctz/clz/bswap) are
     // typed by the special-case in infer.zig; xorBytes is non-generic, so it lives in this table.
@@ -156,6 +192,9 @@ pub fn retType(store: *types.TypeStore, r: Ret) !types.TypeId {
         .decimal => store.decimalT(),
         .double => store.doubleT(),
         .vec4 => store.vecF64x4T(),
+        .vec_u8x16 => store.vecU8x16T(),
+        .vec_u32x4 => store.vecU32x4T(),
+        .vec_u64x2 => store.vecU64x2T(),
     };
 }
 

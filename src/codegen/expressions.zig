@@ -366,6 +366,12 @@ pub fn arrayBasePtr(self: *LlvmCompiler, base: types.LLVMValueRef) types.LLVMVal
 }
 
 pub fn compileSimdCall(self: *LlvmCompiler, field: []const u8, args: []const ast.Expression) anyerror!types.LLVMValueRef {
+    // FR-simd-L1: integer vectors u8x16/u32x4/u64x2. Detect them by the type suffix in the op name and
+    // handle before the f64x4 (float) path below.
+    if (std.mem.endsWith(u8, field, "U8x16")) return try self.compileIntSimd(field, args, 8, 16);
+    if (std.mem.endsWith(u8, field, "U32x4")) return try self.compileIntSimd(field, args, 32, 4);
+    if (std.mem.endsWith(u8, field, "U64x2")) return try self.compileIntSimd(field, args, 64, 2);
+
     const vecTy = self.vecF64x4Type();
     const dbl = core.LLVMDoubleType();
 
@@ -434,6 +440,91 @@ pub fn compileSimdCall(self: *LlvmCompiler, field: []const u8, args: []const ast
     }
     _ = dbl;
     std.debug.print("unknown simd op: {s}\n", .{field});
+    return error.UnknownSimdOp;
+}
+
+// FR-simd-L1: lower an integer-vector op. `elem` is the element bit width (8/32/64) and `lanes` the count
+// (16/4/2), so the vector is <lanes x i{elem}>. Load/store use alignment 1 (buffers may be unaligned).
+// The op is the field name with the type suffix stripped.
+pub fn compileIntSimd(self: *LlvmCompiler, field: []const u8, args: []const ast.Expression, elem: c_uint, lanes: c_uint) anyerror!types.LLVMValueRef {
+    const et = core.LLVMIntType(elem);
+    const vt = core.LLVMVectorType(et, lanes);
+    const suffix_len: usize = if (elem == 8) "U8x16".len else "U32x4".len; // U32x4 and U64x2 are both 5
+    const op = field[0 .. field.len - suffix_len];
+
+    // splat a scalar (Nova i64) across all lanes: insert into lane 0, shuffle with an all-zero mask.
+    const splat = struct {
+        fn make(c: *LlvmCompiler, scalar: types.LLVMValueRef, e_ty: types.LLVMTypeRef, v_ty: types.LLVMTypeRef, n: c_uint) types.LLVMValueRef {
+            const sc = core.LLVMBuildTrunc(c.builder, scalar, e_ty, "simd_splat_tr");
+            var undef = core.LLVMGetUndef(v_ty);
+            undef = core.LLVMBuildInsertElement(c.builder, undef, sc, core.LLVMConstInt(c.i32_type, 0, 0), "simd_splat0");
+            var masks: [16]types.LLVMValueRef = undefined;
+            var i: c_uint = 0;
+            while (i < n) : (i += 1) masks[i] = core.LLVMConstInt(c.i32_type, 0, 0);
+            const maskv = core.LLVMConstVector(&masks, n);
+            return core.LLVMBuildShuffleVector(c.builder, undef, core.LLVMGetUndef(v_ty), maskv, "simd_splat");
+        }
+    }.make;
+
+    // address (buf + off) as a vt* for load/store.
+    const vecPtr = struct {
+        fn get(c: *LlvmCompiler, buf: types.LLVMValueRef, off: types.LLVMValueRef, v_ty: types.LLVMTypeRef) types.LLVMValueRef {
+            const addr = core.LLVMBuildAdd(c.builder, buf, off, "simd_vaddr");
+            return core.LLVMBuildIntToPtr(c.builder, addr, core.LLVMPointerType(v_ty, 0), "simd_vptr");
+        }
+    }.get;
+
+    if (std.mem.eql(u8, op, "splat")) {
+        const s = try self.compileExpression(args[0]);
+        return splat(self, s, et, vt, lanes);
+    }
+    if (std.mem.eql(u8, op, "load")) {
+        const buf = try self.compileExpression(args[0]);
+        const off = try self.compileExpression(args[1]);
+        const p = vecPtr(self, buf, off, vt);
+        const ld = core.LLVMBuildLoad2(self.builder, vt, p, "simd_load");
+        core.LLVMSetAlignment(ld, 1);
+        return ld;
+    }
+    if (std.mem.eql(u8, op, "store")) {
+        const buf = try self.compileExpression(args[0]);
+        const off = try self.compileExpression(args[1]);
+        const v = try self.compileExpression(args[2]);
+        const p = vecPtr(self, buf, off, vt);
+        const st = core.LLVMBuildStore(self.builder, v, p);
+        core.LLVMSetAlignment(st, 1);
+        return core.LLVMConstInt(self.val_type, 0, 0);
+    }
+    if (std.mem.eql(u8, op, "movemask")) {
+        // sign bit of each lane -> one bit. icmp slt v, 0 gives <lanes x i1>; bitcast packs it; zext to int.
+        const v = try self.compileExpression(args[0]);
+        const zero = core.LLVMConstNull(vt);
+        const signs = core.LLVMBuildICmp(self.builder, .LLVMIntSLT, v, zero, "simd_signs");
+        const packed_ty = core.LLVMIntType(lanes);
+        const bits = core.LLVMBuildBitCast(self.builder, signs, packed_ty, "simd_mask");
+        return core.LLVMBuildZExt(self.builder, bits, self.val_type, "simd_mask_ext");
+    }
+    if (std.mem.eql(u8, op, "shl") or std.mem.eql(u8, op, "shr")) {
+        const v = try self.compileExpression(args[0]);
+        const n = try self.compileExpression(args[1]);
+        const amt = splat(self, n, et, vt, lanes);
+        if (std.mem.eql(u8, op, "shl")) return core.LLVMBuildShl(self.builder, v, amt, "simd_shl");
+        return core.LLVMBuildLShr(self.builder, v, amt, "simd_shr"); // logical (unsigned lanes)
+    }
+
+    // binary lane ops
+    const a = try self.compileExpression(args[0]);
+    const b = try self.compileExpression(args[1]);
+    if (std.mem.eql(u8, op, "add")) return core.LLVMBuildAdd(self.builder, a, b, "simd_add");
+    if (std.mem.eql(u8, op, "sub")) return core.LLVMBuildSub(self.builder, a, b, "simd_sub");
+    if (std.mem.eql(u8, op, "and")) return core.LLVMBuildAnd(self.builder, a, b, "simd_and");
+    if (std.mem.eql(u8, op, "or")) return core.LLVMBuildOr(self.builder, a, b, "simd_or");
+    if (std.mem.eql(u8, op, "xor")) return core.LLVMBuildXor(self.builder, a, b, "simd_xor");
+    if (std.mem.eql(u8, op, "eq")) {
+        const c = core.LLVMBuildICmp(self.builder, .LLVMIntEQ, a, b, "simd_eqcmp");
+        return core.LLVMBuildSExt(self.builder, c, vt, "simd_eq"); // 0xFF.. where equal, 0 else
+    }
+    std.debug.print("unknown int-simd op: {s}\n", .{op});
     return error.UnknownSimdOp;
 }
 

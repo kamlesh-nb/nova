@@ -172,7 +172,17 @@ pub fn isPrimitiveTypeName(type_name: []const u8) bool {
     return cgPrim(type_name) != null or
         std.mem.eql(u8, type_name, "void") or
         std.mem.eql(u8, type_name, "f64x4") or   // SIMD vector: a value type, never ARC-owned
+        simdVecName(type_name) != null or        // FR-simd-L1 integer vectors, also value types
         std.mem.eql(u8, type_name, "any");
+}
+
+// FR-simd-L1: the LLVM vector type for one of the integer-vector type names, or null. One place so the
+// builtins, the slot picker, and the ownership check all agree.
+pub fn simdVecName(type_name: []const u8) ?struct { elem: c_uint, lanes: c_uint } {
+    if (std.mem.eql(u8, type_name, "u8x16")) return .{ .elem = 8, .lanes = 16 };
+    if (std.mem.eql(u8, type_name, "u32x4")) return .{ .elem = 32, .lanes = 4 };
+    if (std.mem.eql(u8, type_name, "u64x2")) return .{ .elem = 64, .lanes = 2 };
+    return null;
 }
 
 pub fn llvmForRepr(self: *LlvmCompiler, repr: CgRepr) types.LLVMTypeRef {
@@ -214,6 +224,7 @@ pub fn slotTypeForLocalId(self: *LlvmCompiler, type_name: ?[]const u8, type_id: 
     }
     if (type_name) |tn| {
         if (std.mem.eql(u8, tn, "f64x4")) return core.LLVMVectorType(core.LLVMDoubleType(), 4);
+        if (simdVecName(tn)) |v| return core.LLVMVectorType(core.LLVMIntType(v.elem), v.lanes);
         if (std.mem.indexOfScalar(u8, tn, '[') != null) return self.ptr_type; // T[N] array by name
         if (cgPrim(tn)) |p| {
             if (p.repr == .f64 or p.repr == .f32) return core.LLVMDoubleType();
