@@ -141,3 +141,27 @@ dev-only shadow scaffolding (`tid_census`, `legacyStringOwnership` baseline, `td
 last. **No decision is left on the string engine; the maintainer hazard (ownership/boxing by spelling)
 is gone.** What remains is bounded, mapped, and non-corrupting (a wrong dispatch name is a loud link
 error, not a UAF).
+
+### Update: the resolver foundation is TypeId-native (2026-08-14)
+
+`concreteTidForTypeRef` (the TypeRef analog of `typeOfExprConcrete`) no longer reads
+`current_method_subst`. Its fast path recovers a bare type-param's LEAF from the owner declaration's
+`type_param` names -- the free-fn/method owner (`inst_key.decl`) and, for a method inst, the receiver
+struct (`inst_key.args[0]`) -- and resolves it through the overlay's `tp_resolve`; its general path
+substitutes every leaf via a new `substViaOverlay` walk (both owners, both recorded under the shared
+`inst_key`). This also fixed a latent off-by-one: a method `inst_key` is
+`.struct_{method_owner, [recv] ++ U-args}`, so the old raw-index lookup pointed at the recv for `U0`;
+`tp_resolve` is keyed on the leaf so there is no offset. Behaviour-preserving (full plain + `--asan`
+340/341). This is the resolver the whole finale sits on -- it is now TypeId-native.
+
+**`current_method_subst` now has exactly three readers left:** `substMethodParams` (the token
+substituter) and the two serde-reify sites (`expressions.zig` json/yaml-parse type-arg, and
+`resolveReifyTypeName`). The next coherent batch (deletes the field): reimplement `substMethodParams`
+to resolve each type-param token via `paramLeafByName` + `tp_resolve` + `symbolName` (so the concrete
+comes from the overlay, not the string bindings) with `current_instantiation_id = inst_key` set in the
+three spec loops (`llvm_codegen.zig:2936,3079,3135`) so it is live when spec return-types render;
+convert the two reify sites to `concreteTidForTypeRef` + `symbolName`; then delete
+`current_method_subst` / `MethodParamBinding` / the `method_subst` FunctionInfo field / the spec-loop
+assignments. This batch is high-risk (it touches spec return-type mangling, a core mono path that
+breaks corpus-wide if wrong, and interacts with the struct-T substitution `substituteFieldType` via
+`current_instantiation`), so it must land as one change under the full `--asan` gate.
