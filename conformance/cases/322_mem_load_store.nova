@@ -1,0 +1,28 @@
+// FR-mem Tier 1: mem.load<T>/store<T> with Endian. Zero-alloc typed read/write into a caller-owned buffer,
+// endianness- and signedness-aware. The load/store are compiler builtins (no import needed, like simd.*);
+// only the Endian enum is imported.
+import bytes;
+import mem.endian;
+import assert;
+
+@test
+fn mem_load_store_endian(): void {
+    let b = bytes.alloc(16);
+    mem.store<int>(b, 0, 0x11223344, endian.Endian.little);
+    assert.equalInt(bytes.read_byte(b, 0), 0x44);
+    assert.equalInt(bytes.read_byte(b, 3), 0x11);
+    assert.equalInt(mem.load<int>(b, 0, endian.Endian.little), 0x11223344);
+    mem.store<int>(b, 0, 0x11223344, endian.Endian.big);
+    assert.equalInt(bytes.read_byte(b, 0), 0x11);
+    assert.equalInt(bytes.read_byte(b, 3), 0x44);
+    assert.equalInt(mem.load<int>(b, 0, endian.Endian.big), 0x11223344);
+    mem.store<short>(b, 0, 0x0ABC, endian.Endian.big);
+    assert.equalInt(bytes.read_byte(b, 0), 0x0A);
+    assert.equalInt(bytes.read_byte(b, 1), 0xBC);
+    mem.store<long>(b, 0, 0x1122334455667788, endian.Endian.little);
+    assert.isTrue(mem.load<long>(b, 0, endian.Endian.little) == 0x1122334455667788);
+    mem.store<byte>(b, 0, 255, endian.Endian.little);
+    assert.equalInt(mem.load<byte>(b, 0, endian.Endian.little), -1);
+    assert.equalInt(mem.load<ubyte>(b, 0, endian.Endian.little), 255);
+    bytes.free(b);
+}

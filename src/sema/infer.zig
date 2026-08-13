@@ -1161,6 +1161,23 @@ pub const Inferer = struct {
                             return self.ok(try self.store.voidT());
                         }
                     }
+                    // FR-mem: the mem byte/bit builtins. mem.load<T>/rotl<T>/rotr<T>/bswap<T> return T;
+                    // mem.ctz<T>/clz<T> return int; mem.store<T> returns void. All take T as the single
+                    // type argument and lower to one or two LLVM instructions in codegen.
+                    if (sfa.object.kind == .ident and std.mem.eql(u8, sfa.object.kind.ident, "mem") and g.type_args.len == 1) {
+                        for (g.args) |*a| _ = try self.inferExpr(a);
+                        if (std.mem.eql(u8, sfa.field, "load") or std.mem.eql(u8, sfa.field, "rotl") or
+                            std.mem.eql(u8, sfa.field, "rotr") or std.mem.eql(u8, sfa.field, "bswap"))
+                        {
+                            return self.ok(try self.lowerer.lower(g.type_args[0]));
+                        }
+                        if (std.mem.eql(u8, sfa.field, "ctz") or std.mem.eql(u8, sfa.field, "clz")) {
+                            return self.ok(try self.store.intT());
+                        }
+                        if (std.mem.eql(u8, sfa.field, "store")) {
+                            return self.ok(try self.store.voidT());
+                        }
+                    }
                 }
                 _ = try self.inferExpr(g.callee);
                 self.stats.typed -|= 1;

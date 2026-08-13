@@ -3706,6 +3706,7 @@ pub const LlvmCompiler = struct {
     pub const drainTemporaries = expressions_mod.drainTemporaries;
     pub const buildClosureCall = expressions_mod.buildClosureCall;
     pub const compileSimdCall = expressions_mod.compileSimdCall;
+    pub const compileMemCall = expressions_mod.compileMemCall;
     pub const arrayElemFloatLLVM = expressions_mod.arrayElemFloatLLVM;
     pub const arrayBasePtr = expressions_mod.arrayBasePtr;
     pub const buildBareFnBox = expressions_mod.buildBareFnBox;

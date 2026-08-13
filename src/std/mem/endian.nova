@@ -1,0 +1,8 @@
+// mem.endian: the Endian enum for the mem byte/bit builtins (mem.load<T>/store<T>). The load/store/rotl/
+// rotr/ctz/clz/bswap/xorBytes operations themselves are compiler-recognised generic builtins (see
+// sema/builtins.zig + codegen/expressions.zig compileMemCall), lowering to one or two LLVM instructions;
+// only this enum is a normal Nova declaration.
+pub enum Endian {
+    little,   // tag 0
+    big,      // tag 1
+}

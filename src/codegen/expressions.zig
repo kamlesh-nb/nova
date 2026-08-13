@@ -437,6 +437,88 @@ pub fn compileSimdCall(self: *LlvmCompiler, field: []const u8, args: []const ast
     return error.UnknownSimdOp;
 }
 
+// FR-mem: width (bits) and signedness of an integer type name, for the mem.load/store builtins.
+fn memWidthSign(tname: []const u8) struct { w: c_uint, signed: bool } {
+    const M = struct { n: []const u8, w: c_uint, s: bool };
+    const tbl = [_]M{
+        .{ .n = "byte", .w = 8, .s = true },    .{ .n = "ubyte", .w = 8, .s = false },
+        .{ .n = "i8", .w = 8, .s = true },      .{ .n = "u8", .w = 8, .s = false },
+        .{ .n = "short", .w = 16, .s = true },  .{ .n = "ushort", .w = 16, .s = false },
+        .{ .n = "i16", .w = 16, .s = true },    .{ .n = "u16", .w = 16, .s = false },
+        .{ .n = "int", .w = 32, .s = true },    .{ .n = "uint", .w = 32, .s = false },
+        .{ .n = "i32", .w = 32, .s = true },    .{ .n = "u32", .w = 32, .s = false },
+        .{ .n = "long", .w = 64, .s = true },   .{ .n = "ulong", .w = 64, .s = false },
+        .{ .n = "i64", .w = 64, .s = true },    .{ .n = "u64", .w = 64, .s = false },
+        .{ .n = "word", .w = 64, .s = false },  .{ .n = "usize", .w = 64, .s = false },
+    };
+    for (tbl) |m| if (std.mem.eql(u8, tname, m.n)) return .{ .w = m.w, .signed = m.s };
+    return .{ .w = 32, .signed = true };
+}
+
+// Reverse the `w`-bit integer value `v` byte-by-byte (compile-time-unrolled shift/or; LLVM folds it to a
+// single bswap). Used for the big-endian path of mem.load/store.
+fn memByteReverse(self: *LlvmCompiler, v: types.LLVMValueRef, iw: types.LLVMTypeRef, w: c_uint) types.LLVMValueRef {
+    const bytes = w / 8;
+    if (bytes <= 1) return v;
+    var acc = core.LLVMConstInt(iw, 0, 0);
+    var i: c_uint = 0;
+    while (i < bytes) : (i += 1) {
+        const shifted = core.LLVMBuildLShr(self.builder, v, core.LLVMConstInt(iw, i * 8, 0), "br_sh");
+        const masked = core.LLVMBuildAnd(self.builder, shifted, core.LLVMConstInt(iw, 0xff, 0), "br_mask");
+        const placed = core.LLVMBuildShl(self.builder, masked, core.LLVMConstInt(iw, (bytes - 1 - i) * 8, 0), "br_place");
+        acc = core.LLVMBuildOr(self.builder, acc, placed, "br_or");
+    }
+    return acc;
+}
+
+// FR-mem Tier 1: mem.load<T>(p, off, e) and mem.store<T>(p, off, v, e). Zero-alloc typed read/write into a
+// caller-owned buffer at a byte offset, with compile-time-constant-folded endianness (a literal .little or
+// .big picks the branch-free path). T fixes width and signedness.
+pub fn compileMemCall(self: *LlvmCompiler, field: []const u8, type_arg: ast.TypeRef, args: []const ast.Expression) anyerror!types.LLVMValueRef {
+    const tname = try self.typeRefToString(type_arg);
+    const ws = memWidthSign(tname);
+    const iw = core.LLVMIntType(ws.w);
+    const iwptr = core.LLVMPointerType(iw, 0);
+
+    if (std.mem.eql(u8, field, "load")) {
+        const p = try self.compileExpression(args[0]);
+        const off = try self.compileExpression(args[1]);
+        const endv = try self.compileExpression(args[2]); // Endian tag (0 little / 1 big)
+        const addr = core.LLVMBuildAdd(self.builder, p, off, "mem_addr");
+        const ptr = core.LLVMBuildIntToPtr(self.builder, addr, iwptr, "mem_ptr");
+        const loaded = core.LLVMBuildLoad2(self.builder, iw, ptr, "mem_load");
+        var val = loaded;
+        if (ws.w > 8) {
+            const swapped = memByteReverse(self, loaded, iw, ws.w);
+            // Endian tag: little = 0, big = 1. big-endian picks the byte-swapped value; LLVM constant-folds
+            // this select when the Endian argument is a literal.
+            const big = core.LLVMBuildICmp(self.builder, .LLVMIntEQ, endv, core.LLVMConstInt(core.LLVMTypeOf(endv), 1, 0), "mem_big");
+            val = core.LLVMBuildSelect(self.builder, big, swapped, loaded, "mem_endsel");
+        }
+        if (ws.signed) return core.LLVMBuildSExt(self.builder, val, self.val_type, "mem_sext");
+        return core.LLVMBuildZExt(self.builder, val, self.val_type, "mem_zext");
+    }
+    if (std.mem.eql(u8, field, "store")) {
+        const p = try self.compileExpression(args[0]);
+        const off = try self.compileExpression(args[1]);
+        const v = try self.compileExpression(args[2]);
+        const endv = try self.compileExpression(args[3]);
+        const truncated = core.LLVMBuildTrunc(self.builder, v, iw, "mem_trunc");
+        var to_store = truncated;
+        if (ws.w > 8) {
+            const swapped = memByteReverse(self, truncated, iw, ws.w);
+            const big = core.LLVMBuildICmp(self.builder, .LLVMIntEQ, endv, core.LLVMConstInt(core.LLVMTypeOf(endv), 1, 0), "mem_big");
+            to_store = core.LLVMBuildSelect(self.builder, big, swapped, truncated, "mem_endsel");
+        }
+        const addr = core.LLVMBuildAdd(self.builder, p, off, "mem_addr");
+        const ptr = core.LLVMBuildIntToPtr(self.builder, addr, iwptr, "mem_ptr");
+        _ = core.LLVMBuildStore(self.builder, to_store, ptr);
+        return core.LLVMConstInt(self.val_type, 0, 0);
+    }
+    std.debug.print("unknown mem op: {s}\n", .{field});
+    return error.UnknownMemOp;
+}
+
 pub fn buildClosureCall(self: *LlvmCompiler, box_val: types.LLVMValueRef, call_args: []const ast.Expression) anyerror!types.LLVMValueRef {
     const es = self.valSlotSize();
     const box_ptr = core.LLVMBuildIntToPtr(self.builder, box_val, self.ptr_type, "clo_box");
@@ -2927,6 +3009,13 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     }
                     const input_expr = gc.args[0];
                     return try self.compileGenericParse(is_yaml, target_type, input_expr);
+                }
+
+                if (fa.object.kind == .ident and std.mem.eql(u8, fa.object.kind.ident, "mem") and
+                    gc.type_args.len == 1 and
+                    (std.mem.eql(u8, fa.field, "load") or std.mem.eql(u8, fa.field, "store")))
+                {
+                    return try self.compileMemCall(fa.field, gc.type_args[0], gc.args);
                 }
 
                 if (fa.object.kind == .ident and std.mem.eql(u8, fa.object.kind.ident, "serde") and
