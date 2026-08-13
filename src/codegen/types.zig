@@ -828,7 +828,29 @@ pub fn typeOfExprConcrete(self: *LlvmCompiler, expr_ptr: *const ast.Expression) 
     if (self.current_instantiation_id) |inst| {
         if (ir.typeOfInst(expr_ptr.id, inst)) |ct| return ct;
     }
-    return ir.typeOf(expr_ptr);
+    if (ir.typeOf(expr_ptr)) |t| {
+        if (self.type_store) |st| {
+            if (st.get(t) != .unresolved) return t;
+        } else {
+            return t;
+        }
+    }
+    // Phase 1 (string->TypeId cutover): fall back to the local TypeId slot for an ident, mirroring the
+    // string engine's `resolveExpressionTypeName -> current_local_types.get(ident)` fallback but keeping a
+    // real TypeId. current_local_type_ids is populated for params (C10) and for `let`/`const` locals
+    // (collectLocalVarTypes), so an ident whose typed-IR node is missing/unresolved still resolves here.
+    if (expr_ptr.kind == .ident) {
+        if (self.current_local_type_ids) |ids| {
+            if (ids.get(expr_ptr.kind.ident)) |tid| {
+                if (self.type_store) |st| {
+                    if (st.get(tid) != .unresolved) return tid;
+                } else {
+                    return tid;
+                }
+            }
+        }
+    }
+    return null;
 }
 
 pub fn isStringExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool {
