@@ -229,173 +229,13 @@ inline void write_header_nozero(char *base, long long size) {
 
 }  // end anonymous namespace
 
-// ---- Per-request (per-coroutine) region arena --------------------------------------------------------
-// A region is a chain of mmap'd chunks; allocation bump-pointers within the active chunk and grabs a new
-// chunk (from a capped free-list, else fresh mmap) when the current one is full, so a big request just
-// chains more chunks. Request-region objects are stamped with a NEGATIVE sentinel refcount, so the
-// EXISTING `*rc < 0` guards in nova_retain/nova_release/nova_bytes_free already treat them as immortal --
-// no per-object ARC, no per-object free. The whole region is reclaimed in O(chunks) on reset (chunks go
-// back to the pool). When no region is active (t_region == nullptr) allocation uses the default 32MB
-// thread arena UNCHANGED, so non-web programs and startup allocations are entirely unaffected.
-constexpr size_t REGION_CHUNK_SIZE = 512 * 1024;
-constexpr int MAX_POOLED_CHUNKS = 16;               // cap idle chunks per thread (16 * 512KB = 8MB)
-constexpr int32_t REGION_RC = -1431655765;          // negative => immortal to ARC (any negative works)
-
-struct RegionChunk {
-  char *base;
-  char *cur;
-  char *end;
-  size_t size;
-  RegionChunk *next;
-};
-struct Region {
-  RegionChunk *chunks;         // linked list; head is the active (bump target)
-  unsigned magic;              // 0x9E90 while live, cleared on free (belt-and-suspenders guard)
-  bool freed;                  // set on reset/free
-  Region *pool_next;           // free-list link when this struct sits in the Region pool
-  unsigned long long gen;      // MONOTONIC generation: uniquely identifies this region's current lifetime
-};
-static const unsigned REGION_MAGIC = 0x9E90;
-static std::atomic<long long> g_region_stale_hits{0};
-static std::atomic<unsigned long long> g_region_gen_ctr{1};   // never reuses a value (0 = invalid)
-
-thread_local Region *t_region = nullptr;            // active region, or null = default arena
-thread_local RegionChunk *t_free_chunks = nullptr;  // capped pool of reusable chunks
-thread_local int t_free_count = 0;
-thread_local Region *t_region_pool = nullptr;       // pool of reusable Region structs (never std::free'd)
-thread_local int t_region_pool_count = 0;
-constexpr int MAX_POOLED_REGIONS = 512;             // >> realistic concurrency; bounds struct memory
-
-static RegionChunk *region_chunk_new(size_t need) {
-  size_t sz = need > REGION_CHUNK_SIZE ? need : REGION_CHUNK_SIZE;
-  if (t_free_chunks && sz <= REGION_CHUNK_SIZE) {   // reuse a pooled default-size chunk
-    RegionChunk *c = t_free_chunks;
-    t_free_chunks = c->next;
-    t_free_count--;
-    c->cur = c->base;
-    c->next = nullptr;
-    return c;
-  }
-  RegionChunk *c = (RegionChunk *)std::malloc(sizeof(RegionChunk));
-  if (!c) return nullptr;
-  c->base = arena_page_alloc(sz);
-  if (!c->base) { std::free(c); return nullptr; }
-  c->cur = c->base;
-  c->end = c->base + sz;
-  c->size = sz;
-  c->next = nullptr;
-  return c;
-}
-
-// Return a region's chunks to the pool (default-size ones, up to the cap) or unmap them (oversized/excess),
-// then release the Region record. O(number of chunks).
-static void region_recycle_chunks(Region *r) {
-  RegionChunk *c = r->chunks;
-  while (c) {
-    RegionChunk *nxt = c->next;
-    if (c->size == REGION_CHUNK_SIZE && t_free_count < MAX_POOLED_CHUNKS) {
-      c->next = t_free_chunks;
-      t_free_chunks = c;
-      t_free_count++;
-    } else {
-#ifdef _WIN32
-      std::free(c->base);
-#else
-      ::munmap(c->base, c->size);
-#endif
-      std::free(c);
-    }
-    c = nxt;
-  }
-  r->chunks = nullptr;
-}
-
-// Bump `size+header` from the active region, chaining a chunk if needed. Writes the negative sentinel
-// refcount + the length; payload of an mmap chunk is zero-filled by the kernel and never reused across a
-// live region, so no memset is needed (matches write_header_nozero on the default arena).
-extern "C" long long nova_bytes_alloc(long long size);   // fwd for diagnostic fallback
-static long long region_alloc(Region *r, long long size) {
-  if (r->magic != REGION_MAGIC || r->freed) {   // DIAGNOSTIC: stale region use -> log once, don't crash
-    long long n = g_region_stale_hits.fetch_add(1, std::memory_order_relaxed);
-    if (n < 12)
-      std::fprintf(stderr, "*** STALE REGION USE #%lld: region=%p magic=%x freed=%d (falling back)\n",
-                   n + 1, (void *)r, r->magic, (int)r->freed);
-    Region *saved = t_region;
-    t_region = nullptr;
-    long long p = nova_bytes_alloc(size);   // allocate from the default arena instead of the freed region
-    t_region = saved;
-    return p;
-  }
-  size_t need = arena_align((size_t)size + NOVA_OBJ_HEADER_SIZE);
-  RegionChunk *c = r->chunks;
-  if (!c || c->cur + need > c->end) {
-    RegionChunk *nc = region_chunk_new(need);
-    if (!nc) return 0;
-    nc->next = r->chunks;   // new chunk becomes the active head
-    r->chunks = nc;
-    c = nc;
-  }
-  char *base = c->cur;
-  c->cur = base + need;
-  *reinterpret_cast<int32_t *>(base) = REGION_RC;
-  *reinterpret_cast<int32_t *>(base + 4) = (int32_t)size;
-  return (long long)(base + NOVA_OBJ_HEADER_SIZE);
-}
 
 extern "C" {
 
-// Region control (void* handles for clean cross-TU use by concurrency.cpp's coroutine machinery).
-void *nova_region_current(void) { return (void *)t_region; }
-void nova_region_set(void *r) { t_region = (Region *)r; }
-void *nova_region_new(void) {
-  Region *r;
-  if (t_region_pool) {                       // reuse a pooled Region struct (chunks field links the pool)
-    r = t_region_pool;
-    t_region_pool = r->pool_next;
-    t_region_pool_count--;
-  } else {
-    r = (Region *)std::malloc(sizeof(Region));
-    if (!r) return nullptr;
-  }
-  r->chunks = nullptr;
-  r->magic = REGION_MAGIC;
-  r->freed = false;
-  r->gen = g_region_gen_ctr.fetch_add(1, std::memory_order_relaxed);   // fresh, unique generation
-  return (void *)r;
-}
-// Current generation of a region (0 if it has been freed). A binding stores the generation it captured;
-// concurrency.cpp validates region->gen against it on every resume so a stale or reused struct is rejected.
-unsigned long long nova_region_gen(void *rr) { return rr ? ((Region *)rr)->gen : 0ULL; }
-// Reclaim a region: recycle its chunks to the chunk pool, then return the Region STRUCT to a bounded pool.
-// The struct is NEVER std::free'd within the cap -- doing so was the crash (a coroutine's stale binding
-// dereferenced the freed struct). Pooled structs stay valid memory; a rare stale binding aliases a live
-// pooled struct, and the permanent magic/freed guard in region_alloc still routes any freed region's
-// allocation to the default arena rather than faulting.
-void nova_region_reset(void *rr) { if (rr) { Region *r = (Region *)rr; region_recycle_chunks(r); r->freed = true; } }
-void nova_region_free(void *rr) {
-  if (!rr) return;
-  Region *r = (Region *)rr;
-  region_recycle_chunks(r);
-  r->freed = true;
-  r->magic = 0;
-  r->gen = 0;   // invalidate: any binding holding the old generation now fails validation
-  if (t_region_pool_count < MAX_POOLED_REGIONS) {
-    r->pool_next = t_region_pool;   // link into the struct pool
-    t_region_pool = r;
-    t_region_pool_count++;
-  }
-  // else: leak this struct (bounded event) rather than std::free -- a stale binding must never hit free memory.
-}
 
 long long nova_bytes_alloc(long long size) {
   if (size < 0)
     size = 0;
-  // Per-request region: when a region is active (a synchronous region-scope, mem/region.runStr), bump-
-  // allocate there (stamped with the REGION_RC sentinel so ARC leaves it alone); the whole region is
-  // reclaimed in O(1) at scope end. No region active -> the default arena / malloc path below, unchanged.
-  if (t_region) {
-    return region_alloc(t_region, size);
-  }
 #ifdef NOVA_DROP_ARENA
 
   {
@@ -486,24 +326,16 @@ extern "C" long long nova_valopt_unbox(long long box) {
   return *(long long *)box;
 }
 
-// A new coroutine inherits the region active at its creation (so a request's nested async calls -- the DB
-// query, its framing coroutines -- allocate into the SAME per-request region as the serve coroutine).
-// nova_coro_region_track / _untrack live in concurrency.cpp (they own the coro->region map); when no region
-// is active anywhere they are near-free (a single flag check).
-extern "C" void nova_coro_region_track(long long frame);
-extern "C" void nova_coro_region_untrack(long long frame);
-
+// Coroutine frames are plain malloc/free. (FR-arena: the per-request region binding that used to be
+// tracked here was removed along with the parked region arena.)
 long long nova_coro_alloc(long long size) {
   if (size < 0)
     size = 0;
-  long long frame = (long long)std::malloc((size_t)size);
-  if (frame) nova_coro_region_track(frame);
-  return frame;
+  return (long long)std::malloc((size_t)size);
 }
 
 void nova_coro_free(long long frame) {
   if (frame) {
-    nova_coro_region_untrack(frame);
     std::free((void *)frame);
   }
 }
