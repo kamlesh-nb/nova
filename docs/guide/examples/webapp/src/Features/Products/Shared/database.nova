@@ -44,12 +44,19 @@ pub struct InMemoryConnection impl Connection, Service {
                 rs.rows.push(r);
             } else {
                 let want = (params.get(0) ?? db.dbNull()).asLong();
-                let idv = (r.cells.get(0) ?? db.dbNull()).asLong();
+                let idv = r.get(0).asLong();
                 if (idv == want) { rs.rows.push(r); }
             }
             i = i + 1;
         }
         return rs;
+    }
+
+    // The Connection seam requires queryWire; the in-memory store has no native wire format, so it
+    // re-encodes the materialised ResultSet through the generic fallback, exactly like a driver whose
+    // wire layout does not already match.
+    async fn queryWire(self: InMemoryConnection, sql: string, params: List<DbValue>): WireRows {
+        return db.wireRowsFromResultSet(await self.query(sql, params));
     }
 
     fn close(self: InMemoryConnection): void {}
