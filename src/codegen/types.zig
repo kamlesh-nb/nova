@@ -3,6 +3,7 @@ const ast = @import("../ast.zig");
 const sema_shadow = @import("../sema/shadow.zig");
 const sema_mono = @import("../sema/mono.zig");
 const subst_mod = @import("../sema/subst.zig");
+const sema_infer = @import("../sema/infer.zig");
 const lower = @import("../sema/lower.zig");
 const arc_mod = @import("arc.zig");
 const typesys = @import("../types.zig");
@@ -1119,31 +1120,133 @@ pub fn tidForTypeRef(self: *LlvmCompiler, tr: ast.TypeRef) ?typesys.TypeId {
 // unresolved). Used by the transitive free-fn discovery to compute concrete TypeId args instead of strings.
 pub fn concreteTidForTypeRef(self: *LlvmCompiler, tr: ast.TypeRef) ?typesys.TypeId {
     const st = sema_shadow.live_store orelse return null;
-    // Fast path: a bare type-param NAME forwarded from the current instance (e.g. `mid<T>` inside
-    // `top<string>`). The lowerer cannot resolve `T` without a param scope, so map the name straight to the
-    // current instance's arg TypeId via current_method_subst (name -> index) and the inst_key struct's args
-    // (index -> concrete TypeId, same order).
+    const ir = self.typed_ir orelse return null;
+    const inst_opt = self.current_instantiation_id;
+
+    // Fast path: a bare type-param NAME the lowerer cannot resolve without a param scope (e.g. `T`/`U`
+    // forwarded inside a generic body). Recover its type-param LEAF from the owner decl's type_param names
+    // -- the free-fn/method owner (inst_key.decl) and, for a method inst, the receiver struct
+    // (inst_key.args[0]) -- then resolve it through the overlay's tp_resolve. This replaces the former
+    // current_method_subst (name -> index -> arg) lookup: tp_resolve carries the correct concrete for BOTH
+    // struct-T and method-U under this inst_key, without the receiver off-by-one that a raw index has (a
+    // method inst_key is .struct_{method_owner, [recv] ++ U-args}).
     if (tr == .ident) {
-        if (self.current_instantiation_id) |inst| {
-            if (st.get(inst) == .struct_) {
-                const si = st.get(inst).struct_;
-                if (self.current_method_subst) |ms| {
-                    for (ms, 0..) |b, i| {
-                        if (i < si.args.len and std.mem.eql(u8, b.name, tr.ident)) return si.args[i];
-                    }
+        if (inst_opt) |inst| {
+            if (paramLeafByName(tr.ident, inst)) |leaf| {
+                if (ir.tpResolve(leaf, inst)) |c| {
+                    return switch (st.get(c)) {
+                        .unresolved, .type_param => null,
+                        else => c,
+                    };
                 }
             }
         }
     }
     var t = self.tidForTypeRef(tr) orelse return null;
-    if (self.current_instantiation_id) |inst| {
-        if (st.get(inst) == .struct_) {
-            const si = st.get(inst).struct_;
-            t = @import("../sema/subst.zig").substitute(st, t, si.decl, si.args) catch t;
-        }
-    }
+    if (inst_opt) |inst| t = substViaOverlay(st, ir, t, inst);
     return switch (st.get(t)) {
         .unresolved, .type_param => null,
+        else => t,
+    };
+}
+
+// Resolve a bare type-parameter NAME to its interned type-param LEAF under the current instantiation, using
+// the owner declaration's type_param names. Checks the inst_key owner (a free-fn or a method's <U>) first,
+// then -- for a method inst, whose key is .struct_{method_owner, [recv] ++ args} -- the receiver struct's
+// own type-params (its T). Interning is deterministic, so the leaf equals the one the sema overlay recorded
+// tp_resolve for, and the caller's tp_resolve lookup hits.
+fn paramLeafByName(name: []const u8, inst: typesys.TypeId) ?typesys.TypeId {
+    const st = sema_shadow.live_store orelse return null;
+    const sm = sema_shadow.live_sema orelse return null;
+    if (st.get(inst) != .struct_) return null;
+    const si = st.get(inst).struct_;
+    if (paramIndexIn(sm, si.decl, name)) |idx| {
+        return st.intern(.{ .type_param = .{ .owner = si.decl, .index = idx } }) catch null;
+    }
+    if (si.args.len > 0 and st.get(si.args[0]) == .struct_) {
+        const rs = st.get(si.args[0]).struct_;
+        if (paramIndexIn(sm, rs.decl, name)) |idx| {
+            return st.intern(.{ .type_param = .{ .owner = rs.decl, .index = idx } }) catch null;
+        }
+    }
+    return null;
+}
+
+fn paramIndexIn(sm: anytype, decl: typesys.SymbolId, name: []const u8) ?u32 {
+    const sym = sm.tab.symbolAt(decl);
+    const tps: []const []const u8 = switch (sym.decl) {
+        .function => |f| f.type_params,
+        .struct_ => |s| s.type_params,
+        else => return null,
+    };
+    for (tps, 0..) |tp, i| if (std.mem.eql(u8, tp, name)) return @intCast(i);
+    return null;
+}
+
+// Substitute every type-parameter LEAF in `t` with its concrete TypeId from the overlay's tp_resolve under
+// `inst`, re-interning composites as needed. The TypeId-native replacement for the string engine's
+// substTypeParams/substMethodParams: it resolves BOTH struct-T and method-U (both recorded by
+// inst_disp.runFreeFns/runMethods under the shared inst_key) with no receiver off-by-one, since tp_resolve
+// is keyed on the leaf itself. Composite shapes mirror sema/subst.substitute; leaves it cannot resolve are
+// returned unchanged (caller treats a still-param result as "no concrete id").
+fn substViaOverlay(st: *typesys.TypeStore, ir: *const sema_infer.TypedIr, t: typesys.TypeId, inst: typesys.TypeId) typesys.TypeId {
+    return switch (st.get(t)) {
+        .type_param => ir.tpResolve(t, inst) orelse t,
+        .struct_ => |s| blk: {
+            if (s.args.len == 0 or s.args.len > 16) break :blk t;
+            var buf: [16]typesys.TypeId = undefined;
+            var changed = false;
+            for (s.args, 0..) |a, i| {
+                buf[i] = substViaOverlay(st, ir, a, inst);
+                if (buf[i] != a) changed = true;
+            }
+            if (!changed) break :blk t;
+            break :blk st.intern(.{ .struct_ = .{ .decl = s.decl, .args = buf[0..s.args.len] } }) catch t;
+        },
+        .optional => |inner| blk: {
+            const s2 = substViaOverlay(st, ir, inner, inst);
+            break :blk if (s2 == inner) t else (st.intern(.{ .optional = s2 }) catch t);
+        },
+        .future => |inner| blk: {
+            const s2 = substViaOverlay(st, ir, inner, inst);
+            break :blk if (s2 == inner) t else (st.intern(.{ .future = s2 }) catch t);
+        },
+        .storage => |inner| blk: {
+            const s2 = substViaOverlay(st, ir, inner, inst);
+            break :blk if (s2 == inner) t else (st.intern(.{ .storage = s2 }) catch t);
+        },
+        .array => |arr| blk: {
+            const s2 = substViaOverlay(st, ir, arr.elem, inst);
+            break :blk if (s2 == arr.elem) t else (st.intern(.{ .array = .{ .elem = s2, .len = arr.len } }) catch t);
+        },
+        .error_union => |eu| blk: {
+            const ok2 = substViaOverlay(st, ir, eu.ok, inst);
+            const err2 = substViaOverlay(st, ir, eu.err, inst);
+            break :blk if (ok2 == eu.ok and err2 == eu.err) t else (st.intern(.{ .error_union = .{ .ok = ok2, .err = err2 } }) catch t);
+        },
+        .tuple => |elems| blk: {
+            if (elems.len == 0 or elems.len > 16) break :blk t;
+            var buf: [16]typesys.TypeId = undefined;
+            var changed = false;
+            for (elems, 0..) |e, i| {
+                buf[i] = substViaOverlay(st, ir, e, inst);
+                if (buf[i] != e) changed = true;
+            }
+            if (!changed) break :blk t;
+            break :blk st.intern(.{ .tuple = buf[0..elems.len] }) catch t;
+        },
+        .func => |ft| blk: {
+            if (ft.params.len > 16) break :blk t;
+            var buf: [16]typesys.TypeId = undefined;
+            var changed = false;
+            for (ft.params, 0..) |p, i| {
+                buf[i] = substViaOverlay(st, ir, p, inst);
+                if (buf[i] != p) changed = true;
+            }
+            const ret2 = substViaOverlay(st, ir, ft.ret, inst);
+            if (!changed and ret2 == ft.ret) break :blk t;
+            break :blk st.intern(.{ .func = .{ .params = buf[0..ft.params.len], .ret = ret2 } }) catch t;
+        },
         else => t,
     };
 }
