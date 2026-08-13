@@ -113,6 +113,25 @@ with a fail-OPEN default (unknown name assume owned; unknown field/atomic assume
   a 64-bit `Atomic<long>` under an alias truncates to 32 bits, an address-dependent SIGSEGV.
 - **C9 Non-primitive types load as one `ptr`/`i32` word when the field type is not matched**
   (`types.zig:192`).
+- **C10 value-optional PARAMETER representation is inconsistent (raw vs boxed), so passing a value-optional
+  into a value-optional parameter miscompiles.** Two compounding causes, both TypeId->string:
+  (1) `typeRefToString` DROPS `.optional`, so a param declared `int | undefined` is registered as `"int"`
+  in `current_local_types` and gets NO entry in `current_local_type_ids` (`declarations.zig:700-705,724-729`);
+  (2) flow-narrowing after `if (x == undefined)` records the param as bare `int` in the typed IR. The upshot:
+  a callee whose value-optional param is narrowed (or otherwise seen as bare) treats it as the RAW value and
+  does NOT unbox on `??`/use, while a callee with a plain `o ?? d` and no narrowing DOES unbox (expects a
+  BOX). The two ABIs are contradictory for the SAME signature. Callers cannot satisfy both without reading
+  the callee body: delivering raw crashes the boxing callee (`nova_valopt_unbox` on a raw int -> SIGSEGV),
+  delivering a box makes the narrowing callee return the box pointer as the value. Nesting compounds it:
+  `List<int | undefined>.get()` returns `(int | undefined) | undefined` (box-of-box), so the correct number
+  of peels is the type's value-optional depth, which the current single-level `??` peel does not honour.
+  Repro (all four fail today; corpus stays green only because 325 uses the no-narrowing form and binds the
+  arg to a local): `fn f(x: int|undefined): int { if (x==undefined) return -1; return x ?? 0; }` called with
+  a `let`-bound `List.get`/`Map.get` result, flat or nested. Correct fix belongs with **R1/string->TypeId**:
+  give value-optional params their real value-optional TypeId (preserving optionality and depth), make the
+  `??`/comparison/narrowing codegen unbox by the SLOT's value-optional depth regardless of flow narrowing,
+  and pick ONE param ABI (boxed) uniformly. Attempted caller-only peel (2026-08-13) was reverted: it cannot
+  reconcile the contradictory callee ABIs. Validate any fix with `--asan` (this is boxed-pointer ARC).
 
 Two takeaways: flip the fallbacks to FAIL CLOSED (unknown type -> borrowed / hard error), and add
 crash-regression cases (none exist).
