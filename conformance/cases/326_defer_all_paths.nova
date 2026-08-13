@@ -1,0 +1,53 @@
+// FR-safety-2: plain `defer` is the all-path cleanup twin of `errdefer`. It runs at EVERY scope exit
+// (normal fall-through, ok return, and early return), in reverse order of declaration. This is the
+// unwind-safe fix for the resource-leak cluster: `let c = acquire(); defer release(c);` frees on any exit.
+// Contrast with case 101, which proves errdefer fires ONLY on the error path.
+import assert;
+import bytes;
+
+// Returns on the OK path (no error). Plain defer must still fire here, where errdefer would NOT.
+fn okReturn(log: ptr): int {
+    defer bytes.write_byte(log, 0, bytes.read_byte(log, 0) + 1);
+    return 7;
+}
+
+// Early return before the end of the body: defer still runs.
+fn earlyReturn(log: ptr, x: int): int {
+    defer bytes.write_byte(log, 0, bytes.read_byte(log, 0) + 1);
+    if (x > 0) { return 10; }
+    return 20;
+}
+
+// Two defers: the later-declared one runs first (reverse order). We record which ran first.
+fn reverseOrder(log: ptr): void {
+    defer bytes.write_byte(log, 1, 1);    // declared first -> runs LAST -> overwrites to 1
+    defer bytes.write_byte(log, 1, 2);    // declared last  -> runs FIRST -> writes 2
+}
+
+@test
+fn defer_runs_on_ok_return(): void {
+    let log = bytes.alloc(4);
+    bytes.write_byte(log, 0, 0);
+    let r = okReturn(log);
+    assert.equalInt(r, 7);
+    assert.equalInt(bytes.read_byte(log, 0), 1);   // fired on the OK path (errdefer would not)
+}
+
+@test
+fn defer_runs_on_every_exit(): void {
+    let log = bytes.alloc(4);
+    bytes.write_byte(log, 0, 0);
+    earlyReturn(log, 5);                            // early return path
+    assert.equalInt(bytes.read_byte(log, 0), 1);
+    earlyReturn(log, -1);                           // fall-through return path
+    assert.equalInt(bytes.read_byte(log, 0), 2);
+}
+
+@test
+fn defer_reverse_order(): void {
+    let log = bytes.alloc(4);
+    bytes.write_byte(log, 1, 0);
+    reverseOrder(log);
+    // last-run defer is the first-declared, which writes 1, so the final byte is 1.
+    assert.equalInt(bytes.read_byte(log, 1), 1);
+}
