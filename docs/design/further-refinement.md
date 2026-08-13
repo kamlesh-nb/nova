@@ -55,7 +55,7 @@ Granular per sub-item so "what is done" is unambiguous. Status: `not started`, `
 | A-1 | Fail-closed soundness pass (checker + codegen loud on unresolved type) | P0 | done (3 defects landed with expect_fail guards; slice 7/7; corpus green) |
 | A-2 | Parse-family (parseInt/parseLong/parseDouble optionals) + small stdlib gaps | P0 | done (optionals + exponent grammar in std/string.nova; parseI64/parseFloat kept for drivers) |
 | **FR-mem-1** | `mem.load<T>` / `mem.store<T>` + `Endian` enum (Tier 1 builtins) | P2 | done (compiler builtins: sema/infer.zig types the return from T, codegen/expressions.zig compileMemCall lowers to unaligned load/store + compile-time-folded byte swap; Endian enum in std/mem/endian.nova; verified LE/BE + signedness across byte..long in corpus case 322; corpus 326/327, only the off-platform epoll case failing) |
-| **FR-mem-2** | `rotl` / `rotr` / `ctz` / `clz` / `bswap` scalar bit builtins (Tier 2) | P2 | not started (lower to llvm.fshl/fshr/cttz/ctlz/bswap) |
+| **FR-mem-2** | `rotl` / `rotr` / `ctz` / `clz` / `bswap` scalar bit builtins (Tier 2) | P2 | done (rotl/rotr lower to llvm.fshl/fshr, ctz/clz to llvm.cttz/ctlz, bswap reuses the folded byte-reverse; return-type from T in sema/infer.zig, ctz/clz return int; verified across u32/u64/u16 in corpus case 323; corpus 327/328, only the off-platform epoll case failing) |
 | **FR-mem-3** | `xorBytes(dst,a,b,len)` (Tier 3, AES-GCM keystream/tag XOR) | P2 | not started (word-at-a-time XOR loop) |
 | **FR-mem-4** | Reconcile `bytes.read_i32`/`write_i32` through `mem.load/store<int>` | P3 | not started |
 | **FR-deflate-3** | Best-length-first skip in the chain walk | P2 | not started (biggest DEFLATE win; needs FR-mem) |

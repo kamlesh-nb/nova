@@ -515,6 +515,44 @@ pub fn compileMemCall(self: *LlvmCompiler, field: []const u8, type_arg: ast.Type
         _ = core.LLVMBuildStore(self.builder, to_store, ptr);
         return core.LLVMConstInt(self.val_type, 0, 0);
     }
+    // FR-mem Tier 2: scalar bit builtins. rotl/rotr/bswap return T; ctz/clz return int.
+    if (std.mem.eql(u8, field, "bswap")) {
+        const x = try self.compileExpression(args[0]);
+        const xw = core.LLVMBuildTrunc(self.builder, x, iw, "bsw_tr");
+        const rev = if (ws.w > 8) memByteReverse(self, xw, iw, ws.w) else xw;
+        if (ws.signed) return core.LLVMBuildSExt(self.builder, rev, self.val_type, "bsw_sx");
+        return core.LLVMBuildZExt(self.builder, rev, self.val_type, "bsw_zx");
+    }
+    if (std.mem.eql(u8, field, "rotl") or std.mem.eql(u8, field, "rotr")) {
+        // Funnel shift: fshl(x, x, n) is rotate-left, fshr(x, x, n) is rotate-right. The intrinsic takes
+        // the shift amount modulo the bit width, so no zero-guard is needed.
+        const x = try self.compileExpression(args[0]);
+        const n = try self.compileExpression(args[1]);
+        const xw = core.LLVMBuildTrunc(self.builder, x, iw, "rot_x");
+        const nw = core.LLVMBuildTrunc(self.builder, n, iw, "rot_n");
+        const iname: [:0]const u8 = if (std.mem.eql(u8, field, "rotl")) "llvm.fshl" else "llvm.fshr";
+        const id = core.LLVMLookupIntrinsicID(iname.ptr, iname.len);
+        var ptypes = [_]types.LLVMTypeRef{iw};
+        const fn_val = core.LLVMGetIntrinsicDeclaration(self.module, id, &ptypes, 1);
+        const fn_ty = core.LLVMIntrinsicGetType(core.LLVMGetModuleContext(self.module), id, &ptypes, 1);
+        var cargs = [_]types.LLVMValueRef{ xw, xw, nw };
+        const res = core.LLVMBuildCall2(self.builder, fn_ty, fn_val, &cargs, 3, "rot");
+        if (ws.signed) return core.LLVMBuildSExt(self.builder, res, self.val_type, "rot_sx");
+        return core.LLVMBuildZExt(self.builder, res, self.val_type, "rot_zx");
+    }
+    if (std.mem.eql(u8, field, "ctz") or std.mem.eql(u8, field, "clz")) {
+        // llvm.cttz/ctlz(x, is_zero_poison=false): count is non-negative, always zero-extended to int.
+        const x = try self.compileExpression(args[0]);
+        const xw = core.LLVMBuildTrunc(self.builder, x, iw, "cnt_x");
+        const iname: [:0]const u8 = if (std.mem.eql(u8, field, "ctz")) "llvm.cttz" else "llvm.ctlz";
+        const id = core.LLVMLookupIntrinsicID(iname.ptr, iname.len);
+        var ptypes = [_]types.LLVMTypeRef{iw};
+        const fn_val = core.LLVMGetIntrinsicDeclaration(self.module, id, &ptypes, 1);
+        const fn_ty = core.LLVMIntrinsicGetType(core.LLVMGetModuleContext(self.module), id, &ptypes, 1);
+        var cargs = [_]types.LLVMValueRef{ xw, core.LLVMConstInt(self.i1_type, 0, 0) };
+        const res = core.LLVMBuildCall2(self.builder, fn_ty, fn_val, &cargs, 2, "cnt");
+        return core.LLVMBuildZExt(self.builder, res, self.val_type, "cnt_z");
+    }
     std.debug.print("unknown mem op: {s}\n", .{field});
     return error.UnknownMemOp;
 }
@@ -3013,7 +3051,10 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
 
                 if (fa.object.kind == .ident and std.mem.eql(u8, fa.object.kind.ident, "mem") and
                     gc.type_args.len == 1 and
-                    (std.mem.eql(u8, fa.field, "load") or std.mem.eql(u8, fa.field, "store")))
+                    (std.mem.eql(u8, fa.field, "load") or std.mem.eql(u8, fa.field, "store") or
+                        std.mem.eql(u8, fa.field, "rotl") or std.mem.eql(u8, fa.field, "rotr") or
+                        std.mem.eql(u8, fa.field, "ctz") or std.mem.eql(u8, fa.field, "clz") or
+                        std.mem.eql(u8, fa.field, "bswap")))
                 {
                     return try self.compileMemCall(fa.field, gc.type_args[0], gc.args);
                 }
