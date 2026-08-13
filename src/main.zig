@@ -2540,6 +2540,7 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
     try tc.check(program);
 
     sema_shadow.report_enabled = init.environ_map.get("NOVA_SEMA_SHADOW") != null;
+    sema_shadow.tid_census = init.environ_map.get("NOVA_TID_CENSUS") != null;
     // M-5 (memory-management-refinements.md): borrowed-field ARC elision is ON by default
     // (verified: corpus + ASAN clean, differential ARC audit identical off vs on). Set
     // NOVA_ARC_ELIDE_OFF to disable it for debugging a suspected elision regression.
@@ -2587,6 +2588,7 @@ fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const [
     const link_objs: []const []const u8 = if (split_objs.items.len > 0) split_objs.items else &[_][]const u8{obj_path};
     sema_shadow.reportDiff();
     sema_shadow.reportTypeIdDiff();
+    sema_shadow.tidCensusReport();
     sema_shadow.reportF45();
     sema_mono.dumpMethodInsts();
 
@@ -2834,6 +2836,7 @@ fn compileProgram(
     try tc.check(program);
 
     sema_shadow.report_enabled = init.environ_map.get("NOVA_SEMA_SHADOW") != null;
+    sema_shadow.tid_census = init.environ_map.get("NOVA_TID_CENSUS") != null;
     // M-5 (memory-management-refinements.md): borrowed-field ARC elision is ON by default
     // (verified: corpus + ASAN clean, differential ARC audit identical off vs on). Set
     // NOVA_ARC_ELIDE_OFF to disable it for debugging a suspected elision regression.
@@ -2920,6 +2923,7 @@ fn compileProgram(
         sema_shadow.reportResolution();
         sema_shadow.reportDiff();
     sema_shadow.reportTypeIdDiff();
+    sema_shadow.tidCensusReport();
     sema_shadow.reportF45();
     sema_mono.dumpMethodInsts();
 

@@ -12,6 +12,27 @@ pub var trace_resolution: bool = false;
 
 pub var report_enabled: bool = false;
 
+// Phase-1 census (string->TypeId cutover): counts expressions where the STRING engine
+// (resolveExpressionTypeName) resolves a concrete type name but the TypeId engine (typeOfExprConcrete)
+// returns null. Those are exactly the coverage gaps that block deleting the string fallback. Enabled by
+// NOVA_TID_CENSUS; printed by tidCensusReport().
+pub var tid_census: bool = false;
+pub var census_total: usize = 0;
+pub var census_kind_ident: usize = 0;
+pub var census_kind_index: usize = 0;
+pub var census_kind_call: usize = 0;
+pub var census_kind_field: usize = 0;
+pub var census_kind_method: usize = 0;
+pub var census_kind_other: usize = 0;
+
+pub fn tidCensusReport() void {
+    if (!tid_census) return;
+    std.debug.print("=== TID census: string resolves, TypeId null (Phase-1 gaps) ===\n", .{});
+    std.debug.print("  total={d}  ident={d} index={d} call={d} field={d} method_call={d} other={d}\n", .{
+        census_total, census_kind_ident, census_kind_index, census_kind_call, census_kind_field, census_kind_method, census_kind_other,
+    });
+}
+
 fn out(comptime fmt: []const u8, args: anytype) void {
     if (report_enabled) std.debug.print(fmt, args);
 }

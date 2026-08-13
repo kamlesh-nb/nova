@@ -1161,6 +1161,18 @@ pub fn resolveExpressionTypeName(self: *LlvmCompiler, expr_ptr: *const ast.Expre
     }
     const t = t_opt.?;
 
+    if (sema_shadow.tid_census and typeOfExprConcrete(self, expr_ptr) == null) {
+        sema_shadow.census_total += 1;
+        switch (expr_ptr.kind) {
+            .ident => sema_shadow.census_kind_ident += 1,
+            .index => sema_shadow.census_kind_index += 1,
+            .call => sema_shadow.census_kind_call += 1,
+            .generic_call => sema_shadow.census_kind_method += 1,
+            .field_access => sema_shadow.census_kind_field += 1,
+            else => sema_shadow.census_kind_other += 1,
+        }
+    }
+
     return try self.substTypeParams(try sema_shadow.renderLegacy(self.allocator, st, t));
 }
 
