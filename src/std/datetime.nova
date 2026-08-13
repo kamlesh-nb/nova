@@ -61,15 +61,15 @@ fn parseIso(s: string): int | undefined {
         return undefined;
     }
 
-    let year = parseInt(s, 0, 4);
+    let year = parseIntRange(s, 0, 4);
     if (year == undefined) return undefined;
     if (s[4] != 45 && s[4] != 45) {
 
         if (s[4] != 45) return undefined;
     }
-    let month = parseInt(s, 5, 7);
+    let month = parseIntRange(s, 5, 7);
     if (month == undefined) return undefined;
-    let day = parseInt(s, 8, 10);
+    let day = parseIntRange(s, 8, 10);
     if (day == undefined) return undefined;
 
     if (month < 1 || month > 12) return undefined;
@@ -86,9 +86,9 @@ fn parseIso(s: string): int | undefined {
             if (len < 19) {
 
             } else {
-                hour = parseInt(s, 11, 13) ?? 0;
-                minute = parseInt(s, 14, 16) ?? 0;
-                second = parseInt(s, 17, 19) ?? 0;
+                hour = parseIntRange(s, 11, 13) ?? 0;
+                minute = parseIntRange(s, 14, 16) ?? 0;
+                second = parseIntRange(s, 17, 19) ?? 0;
 
                 if (hour < 0 || hour > 23) return undefined;
                 if (minute < 0 || minute > 59) return undefined;
@@ -102,7 +102,7 @@ fn parseIso(s: string): int | undefined {
     return timestamp;
 }
 
-fn parseInt(s: string, start: int, end: int): int | undefined {
+fn parseIntRange(s: string, start: int, end: int): int | undefined {
     if (start < 0 || end > s.length || start >= end) {
         return undefined;
     }
@@ -400,13 +400,13 @@ pub fn tzOffsetSeconds(s: string): int | undefined {
             let hh = 0;
             let mm = 0;
             if (rest == 5) {          // +HH:MM
-                hh = parseInt(s, i + 1, i + 3) ?? -1;
-                mm = parseInt(s, i + 4, i + 6) ?? -1;
+                hh = parseIntRange(s, i + 1, i + 3) ?? -1;
+                mm = parseIntRange(s, i + 4, i + 6) ?? -1;
             } else if (rest == 4) {   // +HHMM
-                hh = parseInt(s, i + 1, i + 3) ?? -1;
-                mm = parseInt(s, i + 3, i + 5) ?? -1;
+                hh = parseIntRange(s, i + 1, i + 3) ?? -1;
+                mm = parseIntRange(s, i + 3, i + 5) ?? -1;
             } else if (rest == 2) {   // +HH
-                hh = parseInt(s, i + 1, i + 3) ?? -1;
+                hh = parseIntRange(s, i + 1, i + 3) ?? -1;
                 mm = 0;
             } else {
                 return undefined;
