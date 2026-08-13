@@ -1,0 +1,67 @@
+// FR-mem Tier 3: mem.xorBytes(dst, a, b, len) writes dst[i] = a[i] ^ b[i] over raw addresses,
+// word-at-a-time with a byte tail. Backs the AES-GCM keystream and tag XOR.
+import bytes;
+import assert;
+
+@test
+fn xor_full_words(): void {
+    // 16 bytes = two full 64-bit words, no tail.
+    let a = bytes.alloc(16);
+    let b = bytes.alloc(16);
+    let d = bytes.alloc(16);
+    let i = 0;
+    while (i < 16) {
+        bytes.write_byte(a, i, i);          // 0,1,2,...,15
+        bytes.write_byte(b, i, 0xff);       // all ones
+        i = i + 1;
+    }
+    mem.xorBytes(d, a, b, 16);
+    i = 0;
+    while (i < 16) {
+        // x ^ 0xff = 255 - x for x in 0..255.
+        assert.equalInt(bytes.read_byte(d, i), 255 - i);
+        i = i + 1;
+    }
+}
+
+@test
+fn xor_with_tail(): void {
+    // 13 bytes = one 64-bit word + a 5-byte tail; exercises both loops.
+    let a = bytes.alloc(13);
+    let b = bytes.alloc(13);
+    let d = bytes.alloc(13);
+    let i = 0;
+    while (i < 13) {
+        bytes.write_byte(a, i, 0xa5);
+        bytes.write_byte(b, i, 0x5a);
+        i = i + 1;
+    }
+    mem.xorBytes(d, a, b, 13);
+    i = 0;
+    while (i < 13) {
+        // 0xa5 ^ 0x5a = 0xff.
+        assert.equalInt(bytes.read_byte(d, i), 0xff);
+        i = i + 1;
+    }
+}
+
+@test
+fn xor_in_place(): void {
+    // dst may alias a: d = d ^ b, the common keystream-into-buffer shape.
+    let d = bytes.alloc(4);
+    let b = bytes.alloc(4);
+    bytes.write_byte(d, 0, 0x12);
+    bytes.write_byte(d, 1, 0x34);
+    bytes.write_byte(d, 2, 0x56);
+    bytes.write_byte(d, 3, 0x78);
+    let i = 0;
+    while (i < 4) {
+        bytes.write_byte(b, i, 0x0f);
+        i = i + 1;
+    }
+    mem.xorBytes(d, d, b, 4);
+    assert.equalInt(bytes.read_byte(d, 0), 0x1d);
+    assert.equalInt(bytes.read_byte(d, 1), 0x3b);
+    assert.equalInt(bytes.read_byte(d, 2), 0x59);
+    assert.equalInt(bytes.read_byte(d, 3), 0x77);
+}

@@ -2485,6 +2485,27 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     }
                 }
 
+                // FR-mem Tier 3: mem.xorBytes(dst, a, b, len) writes dst[i]=a[i]^b[i] over raw addresses,
+                // word-at-a-time in the runtime. Non-generic, so it comes through the plain-call path.
+                if (fa.object.kind == .ident and std.mem.eql(u8, fa.object.kind.ident, "mem") and
+                    std.mem.eql(u8, fa.field, "xorBytes"))
+                {
+                    const dst = try self.compileExpression(call.args[0]);
+                    const a = try self.compileExpression(call.args[1]);
+                    const b = try self.compileExpression(call.args[2]);
+                    const len = try self.compileExpression(call.args[3]);
+                    const xor_fn = if (self.func_map.get("nova_mem_xor")) |f| f else blk: {
+                        var arg_types = [_]types.LLVMTypeRef{ self.val_type, self.val_type, self.val_type, self.val_type };
+                        const fn_type = core.LLVMFunctionType(self.void_type, &arg_types, 4, 0);
+                        const f = core.LLVMAddFunction(self.module, "nova_mem_xor", fn_type);
+                        try self.func_map.put("nova_mem_xor", f);
+                        break :blk f;
+                    };
+                    const fn_t = core.LLVMGlobalGetValueType(xor_fn);
+                    var args = [_]types.LLVMValueRef{ dst, a, b, len };
+                    _ = core.LLVMBuildCall2(self.builder, fn_t, xor_fn, &args, 4, "");
+                    return core.LLVMConstInt(self.val_type, 0, 0);
+                }
                 if (fa.object.kind == .ident and std.mem.eql(u8, fa.object.kind.ident, "bytes")) {
                     if (std.mem.eql(u8, fa.field, "alloc")) {
                         const size = try self.compileExpression(call.args[0]);

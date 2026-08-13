@@ -597,6 +597,26 @@ extern "C" long long nova_mem_find(long long p, long long byte_val, long long le
   return r ? ((long long)r - p) : -1;
 }
 
+// FR-mem Tier 3: dst[i] = a[i] ^ b[i] for i in [0,len). Word-at-a-time, then a byte tail. Backs the
+// AES-GCM keystream and tag XOR (crypto/aead/aesgcm), which is otherwise a per-byte Nova loop.
+extern "C" void nova_mem_xor(long long dst, long long a, long long b, long long len) {
+  if (!dst || !a || !b || len <= 0)
+    return;
+  unsigned char *pd = (unsigned char *)dst;
+  const unsigned char *pa = (const unsigned char *)a;
+  const unsigned char *pb = (const unsigned char *)b;
+  long long i = 0;
+  for (; i + 8 <= len; i += 8) {
+    unsigned long long wa, wb;
+    std::memcpy(&wa, pa + i, 8);
+    std::memcpy(&wb, pb + i, 8);
+    unsigned long long wx = wa ^ wb;
+    std::memcpy(pd + i, &wx, 8);
+  }
+  for (; i < len; i++)
+    pd[i] = pa[i] ^ pb[i];
+}
+
 // M-4 (memory-management-refinements.md): single-thread fast path for ARC.
 //
 // The default web runtime is single-reactor-per-process; request-scoped objects live and die on one

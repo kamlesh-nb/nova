@@ -49,6 +49,10 @@ pub const table = [_]Builtin{
     .{ .receiver = "simd", .name = "sum4", .ret = .double },
     .{ .receiver = "simd", .name = "store4", .ret = .void_ },
 
+    // FR-mem Tier 3: raw-address XOR. The generic mem builtins (load/store/rotl/rotr/ctz/clz/bswap) are
+    // typed by the special-case in infer.zig; xorBytes is non-generic, so it lives in this table.
+    .{ .receiver = "mem", .name = "xorBytes", .ret = .void_ },
+
     .{ .receiver = "console", .name = "log", .ret = .void_ },
     .{ .receiver = "console", .name = "info", .ret = .void_ },
     .{ .receiver = "console", .name = "err", .ret = .void_ },
