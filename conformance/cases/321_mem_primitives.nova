@@ -1,0 +1,23 @@
+// mem.memory: raw bulk memory primitives (memcpy/memmove/memset/memcmp/memchr) over addresses.
+import mem.memory;
+import bytes;
+import assert;
+
+@test
+fn mem_bulk_ops(): void {
+    let a = bytes.alloc(16);
+    let b = bytes.alloc(16);
+    memory.set(a, 65, 16 as long);
+    assert.equalInt(bytes.read_byte(a, 0), 65);
+    memory.zero(a + (8 as long), 8 as long);
+    assert.equalInt(bytes.read_byte(a, 8), 0);
+    memory.copy(b, a, 16 as long);
+    assert.isTrue(memory.equal(a, b, 16 as long));
+    assert.equalInt(memory.compare(a, b, 16 as long), 0);
+    bytes.write_byte(b, 3, 90);
+    assert.isFalse(memory.equal(a, b, 16 as long));
+    assert.equalInt(memory.find(b, 90, 16 as long) as int, 3);
+    assert.equalInt(memory.find(b, 99, 16 as long) as int, -1);
+    bytes.free(a);
+    bytes.free(b);
+}

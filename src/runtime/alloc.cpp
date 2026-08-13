@@ -577,6 +577,26 @@ extern "C" void nova_bytes_copy(long long dst, long long src, long long len) {
   std::memmove((void *)dst, (void *)src, (size_t)len);
 }
 
+// Bulk memory primitives for the `mem` stdlib module (memset/memcmp/memchr over raw addresses).
+extern "C" void nova_mem_set(long long dst, long long byte_val, long long len) {
+  if (!dst || len <= 0)
+    return;
+  std::memset((void *)dst, (int)(byte_val & 0xff), (size_t)len);
+}
+extern "C" long long nova_mem_cmp(long long a, long long b, long long len) {
+  if (len <= 0)
+    return 0;
+  if (!a || !b)
+    return (a == b) ? 0 : (a ? 1 : -1);
+  return (long long)std::memcmp((void *)a, (void *)b, (size_t)len);
+}
+extern "C" long long nova_mem_find(long long p, long long byte_val, long long len) {
+  if (!p || len <= 0)
+    return -1;
+  void *r = std::memchr((void *)p, (int)(byte_val & 0xff), (size_t)len);
+  return r ? ((long long)r - p) : -1;
+}
+
 // M-4 (memory-management-refinements.md): single-thread fast path for ARC.
 //
 // The default web runtime is single-reactor-per-process; request-scoped objects live and die on one
