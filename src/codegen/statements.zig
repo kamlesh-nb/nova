@@ -177,8 +177,7 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
                     var widened_to_any = false;
                     if (target_type) |tt| {
                         if (!widened_to_trait and std.mem.eql(u8, tt, "any")) {
-                            const src = (try self.resolveExpressionTypeName(init_ptr)) orelse "";
-                            if (!std.mem.eql(u8, src, "any")) {
+                            if (!self.isAnyExpr(init_ptr)) {
                                 val = try self.coerceToAny(val, init_ptr);
                                 // The local takes ownership of the box; drop the temp registration so it is
                                 // not double-released at statement end (the local's own drop releases it).

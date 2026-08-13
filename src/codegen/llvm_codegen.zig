@@ -1480,8 +1480,7 @@ pub const LlvmCompiler = struct {
         // retain/release works unchanged.
         if (param_str_opt) |param_str| {
             if (std.mem.eql(u8, param_str, "any")) {
-                const src = (try self.resolveExpressionTypeName(arg)) orelse "";
-                if (!std.mem.eql(u8, src, "any")) return try self.coerceToAny(val, arg);
+                if (!self.isAnyExpr(arg)) return try self.coerceToAny(val, arg);
                 return val;
             }
         }
@@ -2234,8 +2233,7 @@ pub const LlvmCompiler = struct {
                             // box it into a `{payload, dtor}` carrier so the container stores a real heap box
                             // and its element retain/release stays uniform. The callee param resolves to `any`
                             // via the instantiation even though the generic ref is a bare type-param.
-                            const src = (try self.resolveExpressionTypeName(arg)) orelse "";
-                            if (!std.mem.eql(u8, src, "any")) {
+                            if (!self.isAnyExpr(arg)) {
                                 val = try self.coerceToAny(val, arg);
                                 widened_any = true;
                             }

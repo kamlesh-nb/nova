@@ -2045,6 +2045,9 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                         const base = try self.compileExpression(idx.object.*);
                         try self.guardOptionalDeref(idx.object, base, idx.span);
                         const off = try self.compileExpression(idx.index.*);
+                        // NOTE: string via NAME (resolveExpressionTypeName), not isStringExpr: a collection
+                        // ELEMENT that is a string has no concrete TypeId at the index expr, so isStringExpr
+                        // would miss it and take the array path (corpus 53_for_loops test_collection_string).
                         const obj_type = try self.resolveExpressionTypeName(idx.object);
                         const is_string = if (obj_type) |t| std.mem.eql(u8, t, "string") else false;
                         if (is_string) {
