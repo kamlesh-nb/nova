@@ -293,6 +293,17 @@ pub const Parser = struct {
                 try attrs.append(self.allocator, .serializable);
             } else if (std.mem.eql(u8, name, "test")) {
                 try attrs.append(self.allocator, .@"test");
+            } else if (std.mem.eql(u8, name, "deprecated")) {
+                // FR-safety-6: `@deprecated` or `@deprecated("use parseLong instead")`.
+                var note: ?[]const u8 = null;
+                if (self.match(.left_paren)) {
+                    if (self.current().type == .string) {
+                        note = try self.allocator.dupe(u8, self.current().lexeme);
+                        self.advance();
+                    }
+                    try self.expect(.right_paren);
+                }
+                try attrs.append(self.allocator, .{ .deprecated = note });
             } else if (std.mem.eql(u8, name, "route")) {
                 try self.expect(.left_paren);
                 if (self.current().type != .string) return error.UnexpectedToken;

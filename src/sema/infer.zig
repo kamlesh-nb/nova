@@ -722,6 +722,7 @@ pub const Inferer = struct {
                                 if (self.ir) |ir| try ir.recordSym(self.allocator, &e, sid);
                             }
                             const fd = sym.decl.function;
+                            self.warnIfDeprecated(fd, c.span); // FR-safety-6
                             if (fd.ret_type) |r| {
 
                                 if (fd.type_params.len > 0) {
@@ -2122,6 +2123,27 @@ pub const Inferer = struct {
         if (has_self and !self_explicit) expected -= 1;
         if (args.len != expected) {
             self.method_arity_errors.append(self.allocator, .{ .span = span, .name = fa.field, .expected = expected, .got = args.len }) catch {};
+        }
+    }
+
+    // FR-safety-6: emit a compile-time WARNING (not an error) at a call site whose callee function carries
+    // `@deprecated`, including the optional suggested replacement. Warnings go to stderr and never fail the
+    // build, which is the whole point: the stdlib can deprecate `parseI64` in favour of `parseLong`, give
+    // users a migration window, then remove it.
+    fn warnIfDeprecated(self: *Inferer, fd: *const ast.FunctionDecl, span: ast.Span) void {
+        _ = self;
+        for (fd.attributes) |attr| {
+            switch (attr) {
+                .deprecated => |dep_note| {
+                    if (dep_note) |msg| {
+                        std.debug.print("  \x1b[1m{s}:{d}:{d}: \x1b[33mwarning:\x1b[0m\x1b[1m '{s}' is deprecated: {s}\x1b[0m\n", .{ span.file, span.line, span.col, fd.name, msg });
+                    } else {
+                        std.debug.print("  \x1b[1m{s}:{d}:{d}: \x1b[33mwarning:\x1b[0m\x1b[1m '{s}' is deprecated\x1b[0m\n", .{ span.file, span.line, span.col, fd.name });
+                    }
+                    return;
+                },
+                else => {},
+            }
         }
     }
 

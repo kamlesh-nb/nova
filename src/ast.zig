@@ -173,6 +173,9 @@ pub const Attribute = union(enum) {
     tags: [][]const u8,
     request_body: TypeRef,
     response: ResponseAttr,
+    // FR-safety-6: `@deprecated` or `@deprecated("use X instead")` on a function. Compiling a call to
+    // the function emits a warning (not an error) carrying the optional replacement note.
+    deprecated: ?[]const u8,
 };
 
 pub const RouteAttr = struct {
