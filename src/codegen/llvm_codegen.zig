@@ -794,7 +794,20 @@ pub const LlvmCompiler = struct {
 
     pub fn valoptTypeRefIsValue(self: *LlvmCompiler, tr: ast.TypeRef) bool {
         if (tr != .optional) return false;
-        const inner = self.typeRefToString(tr.optional.*) catch return false;
+        // B3 (string-engine-removal): resolve the inner through the CURRENT instantiation so a
+        // `T | undefined` parameter decides value-vs-reference on its CONCRETE argument, not on the
+        // unresolved type-parameter. concreteTidForTypeRef applies the instantiation overlay and
+        // symbolName renders that concrete id (the sanctioned TypeId->name boundary); this drops the
+        // former dependence on typeRefToString -> substMethodParams (the deletable string engine). The
+        // declared-TypeRef string render survives ONLY as the fallback when no concrete id is recoverable
+        // -- a genuinely erased body, where a bare type-param inner is not a value-prim and so is not
+        // boxed either way, matching this path. Gating case: 119_generic_return (maybe<int> must box).
+        const inner = blk: {
+            if (self.concreteTidForTypeRef(tr.optional.*)) |itid| {
+                break :blk self.symbolName(itid) catch (self.typeRefToString(tr.optional.*) catch return false);
+            }
+            break :blk self.typeRefToString(tr.optional.*) catch return false;
+        };
         if (std.mem.eql(u8, inner, "ptr")) return false;
         if (types_mod.cgPrim(inner) != null) return true;
         // A NESTED value-optional return (`(int | undefined) | undefined`, produced only through generics,
