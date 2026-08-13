@@ -97,7 +97,7 @@ pub fn compileElemWitness(self: *LlvmCompiler, wn: []const u8, gc: ast.GenericCa
     // element ownership via the element TypeId (`isOwnedTypeId(any)` = true) and retained it; keep that
     // parity here or a `Map<K, any>` / `List<any>` element is stored without a reference and freed while
     // still slotted (case 123).
-    const elem_owned = self.ownedByName(t) or std.mem.eql(u8, t, "any");
+    const elem_owned = self.ownedByName(t);
     const width_u: u64 = if (is_vs) @max(self.getTypeSize(ast.TypeRef{ .ident = getStructBaseName(t) }, false), 1) else 8;
     const valptr_t = core.LLVMPointerType(self.val_type, 0);
 
@@ -196,7 +196,7 @@ fn dropElemAt(self: *LlvmCompiler, t: []const u8, is_vs: bool, addr: types.LLVMV
                 _ = core.LLVMBuildCall2(self.builder, dt, d, &args, 1, "");
             }
         }
-    } else if (self.ownedByName(t) or types_mod.valueOptionalName(t) or std.mem.eql(u8, t, "any")) {
+    } else if (self.ownedByName(t) or types_mod.valueOptionalName(t)) {
         const p = core.LLVMBuildIntToPtr(self.builder, addr, valptr_t, "we_dp");
         const v = core.LLVMBuildLoad2(self.builder, self.val_type, p, "we_dv");
         const d = try self.getOrCreateDestructor(t);
@@ -2048,8 +2048,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                         // NOTE: string via NAME (resolveExpressionTypeName), not isStringExpr: a collection
                         // ELEMENT that is a string has no concrete TypeId at the index expr, so isStringExpr
                         // would miss it and take the array path (corpus 53_for_loops test_collection_string).
-                        const obj_type = try self.resolveExpressionTypeName(idx.object);
-                        const is_string = if (obj_type) |t| std.mem.eql(u8, t, "string") else false;
+                        const is_string = self.isStringExpr(idx.object);
                         if (is_string) {
                             const saddr = core.LLVMBuildAdd(self.builder, base, off, "idx_store_addr");
                             const sptr = core.LLVMBuildIntToPtr(self.builder, saddr, self.ptr_type, "idx_store_ptr");
@@ -2108,8 +2107,8 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             }
 
             {
-                const l_is_dec = if (left_type) |lt| std.mem.eql(u8, lt, "decimal") else false;
-                const r_is_dec = if (right_type) |rt| std.mem.eql(u8, rt, "decimal") else false;
+                const l_is_dec = self.isDecimalExpr(bin.left);
+                const r_is_dec = self.isDecimalExpr(bin.right);
 
                 const other_is_null_lit =
                     (bin.left.kind == .literal and (bin.left.kind.literal == .null or bin.left.kind.literal == .undefined)) or
@@ -4170,8 +4169,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             try self.guardOptionalDeref(idx.object, obj_ptr, idx.span);
             const offset_val = try self.compileExpression(idx.index.*);
 
-            const obj_type = try self.resolveExpressionTypeName(idx.object);
-            const is_string = if (obj_type) |t| std.mem.eql(u8, t, "string") else false;
+            const is_string = self.isStringExpr(idx.object);
 
             if (is_string) {
                 const addr = core.LLVMBuildAdd(self.builder, obj_ptr, offset_val, "index_addr");

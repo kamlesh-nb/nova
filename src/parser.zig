@@ -1472,7 +1472,7 @@ pub const Parser = struct {
 
         const get_args = try self.allocator.alloc(ast.Expression, 1);
         get_args[0] = ast.Expression{ .kind = .{ .ident = fi } };
-        const get_call = try self.mkMethodCall(fc, "get", get_args, sp);
+        const get_call = try self.mkMethodCall(fc, "at", get_args, sp);
         const x_let = ast.Statement{ .let_stmt = .{ .name = name, .names = null, .type_name = null, .init = get_call, .is_const = false, .span = sp } };
 
         const inner_stmts = try self.allocator.alloc(ast.Statement, 2);
