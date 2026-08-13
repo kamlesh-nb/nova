@@ -840,14 +840,53 @@ pub fn isStringExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool {
     return false;
 }
 
-// TypeId-based "is this expression a floating-point value" — the string->TypeId replacement for
-// `resolveExpressionTypeName(e) == "float"/"double"/"f32"/"f64"`. Returns false when no concrete TypeId is
-// available (matching the old `if (name) |n| ... else false` shape).
+// TypeId-based expression-type predicates — the string->TypeId replacements for
+// `resolveExpressionTypeName(e) == "float"/"bool"/"void"/"any"/"decimal"`. Each returns false when no
+// concrete TypeId is available (matching the old `if (name) |n| ... else false` shape), so a caller that
+// used the string compare as a redundant fallback behind one of these can drop the string compare.
 pub fn isFloatExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool {
     if (self.type_store) |st| {
         if (typeOfExprConcrete(self, expr_ptr)) |tid| {
             const info = st.get(tid);
             return info == .prim and info.prim.kind == .float;
+        }
+    }
+    return false;
+}
+
+pub fn isBoolExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool {
+    if (self.type_store) |st| {
+        if (typeOfExprConcrete(self, expr_ptr)) |tid| {
+            const info = st.get(tid);
+            return info == .prim and info.prim.kind == .bool;
+        }
+    }
+    return false;
+}
+
+pub fn isVoidExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool {
+    if (self.type_store) |st| {
+        if (typeOfExprConcrete(self, expr_ptr)) |tid| {
+            const info = st.get(tid);
+            return info == .prim and info.prim.kind == .void_;
+        }
+    }
+    return false;
+}
+
+pub fn isAnyExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool {
+    if (self.type_store) |st| {
+        if (typeOfExprConcrete(self, expr_ptr)) |tid| {
+            return st.get(tid) == .any_;
+        }
+    }
+    return false;
+}
+
+pub fn isDecimalExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool {
+    if (self.type_store) |st| {
+        if (typeOfExprConcrete(self, expr_ptr)) |tid| {
+            return st.get(tid) == .decimal;
         }
     }
     return false;
