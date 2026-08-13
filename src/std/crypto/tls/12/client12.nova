@@ -47,6 +47,9 @@ pub struct TlsClient12 {
 
     pub master: ptr,                         // 48-byte master secret
     pub cWriteKey: ptr, pub sWriteKey: ptr,
+    // FR-tls-2: per-direction AES-GCM contexts, built lazily from the write/read keys on first record and
+    // reused for every record after (one key schedule + H + GHASH table per connection, not per record).
+    pub cGcm: aesgcm.GcmContext | undefined, pub sGcm: aesgcm.GcmContext | undefined,
     pub cIV: ptr, pub sIV: ptr,              // 4-byte GCM salts
     pub cSeq: ulong, pub sSeq: ulong,
 
@@ -321,7 +324,9 @@ pub struct TlsClient12 {
         bytes.write_byte(aad, 8, ctype); bytes.write_byte(aad, 9, 0x03); bytes.write_byte(aad, 10, 0x03);
         bytes.write_byte(aad, 11, (ptLen >> 8) & 0xff); bytes.write_byte(aad, 12, ptLen & 0xff);
         let tag = bytes.alloc(16);
-        aesgcm.seal(self.cWriteKey, self.keyLen, nonce, 12, aad, 13, pt, ptLen, at(out, 8), tag);
+        if (self.cGcm == undefined) { self.cGcm = aesgcm.GcmContext.create(self.cWriteKey, self.keyLen); }
+        let cg = self.cGcm;
+        if (cg != undefined) { cg.seal(nonce, 12, aad, 13, pt, ptLen, at(out, 8), tag); }
         i = 0;
         while (i < 16) { bytes.write_byte(out, 8 + ptLen + i, bytes.read_byte(tag, i)); i = i + 1; }
         self.cSeq = self.cSeq + 1;
@@ -345,7 +350,10 @@ pub struct TlsClient12 {
         let tag = bytes.alloc(16);
         i = 0;
         while (i < 16) { bytes.write_byte(tag, i, bytes.read_byte(frag, 8 + ctLen + i)); i = i + 1; }
-        let ok = aesgcm.open(self.sWriteKey, self.keyLen, nonce, 12, aad, 13, at(frag, 8), ctLen, tag, out);
+        if (self.sGcm == undefined) { self.sGcm = aesgcm.GcmContext.create(self.sWriteKey, self.keyLen); }
+        let sg = self.sGcm;
+        let ok = false;
+        if (sg != undefined) { ok = sg.open(nonce, 12, aad, 13, at(frag, 8), ctLen, tag, out); }
         self.sSeq = self.sSeq + 1;
         bytes.free(nonce); bytes.free(aad); bytes.free(tag);
         if (!ok) { return 0 - 1; }
@@ -471,6 +479,7 @@ pub fn newClient12(): TlsClient12 {
         ems: false, keyType: -1, rsaN: bytes.alloc(1), rsaNLen: 0, rsaE: bytes.alloc(1), rsaELen: 0, ecPub: bytes.alloc(65),
         certList: bytes.alloc(1), certListLen: 0,
         master: bytes.alloc(48), cWriteKey: bytes.alloc(1), sWriteKey: bytes.alloc(1),
+        cGcm: undefined, sGcm: undefined,
         cIV: bytes.alloc(4), sIV: bytes.alloc(4), cSeq: 0, sSeq: 0,
         tr: bytes.alloc(8192), trLen: 0, trCap: 8192,
         certRequested: false, haveClientCert: false, clientCertDer: bytes.alloc(1), clientCertLen: 0, clientKey: bytes.alloc(32),

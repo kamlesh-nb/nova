@@ -8,6 +8,7 @@
 import bytes;
 import crypto.cipher.aes;
 import crypto.mac.ghash;
+import mem.allocator;   // FR-tls-2: GcmContext is heap-allocated via the global allocator
 
 pub const GCM_TAG_LEN: int = 16;
 
@@ -63,7 +64,9 @@ fn computeH(ctx: aes.Aes, h: ptr): void {
     bytes.free(zero);
 }
 
-fn computeJ0(h: ptr, iv: ptr, ivLen: int, j0: ptr): void {
+// J0 with a caller-owned GHASH (whose H is already the cached hash subkey). The 12-byte IV fast path
+// touches no GHASH; the rare longer-IV path resets and reuses the passed hash so no table is rebuilt.
+fn computeJ0(g: ghash.Ghash, iv: ptr, ivLen: int, j0: ptr): void {
     if (ivLen == 12) {
         let i = 0;
         while (i < 12) { bytes.write_byte(j0, i, bytes.read_byte(iv, i)); i = i + 1; }
@@ -73,7 +76,7 @@ fn computeJ0(h: ptr, iv: ptr, ivLen: int, j0: ptr): void {
         bytes.write_byte(j0, 15, 1);
     } else {
         // J0 = GHASH_H(IV || pad || 0^64 || len64(ivbits)).
-        let g = ghash.Ghash.create(h);
+        g.reset();
         g.update(iv, ivLen);
         let lb = bytes.alloc(16);
         let k = 0;
@@ -81,14 +84,14 @@ fn computeJ0(h: ptr, iv: ptr, ivLen: int, j0: ptr): void {
         putLen64(lb, 8, (ivLen as long) * 8);
         g.block(lb, 0);
         g.final(j0);
-        g.delete();
         bytes.free(lb);
     }
 }
 
-// GHASH over aad || pad || ct || pad || len64(aadbits) || len64(ctbits), into s.
-fn computeS(h: ptr, aad: ptr, aadLen: int, ct: ptr, ctLen: int, s: ptr): void {
-    let g = ghash.Ghash.create(h);
+// GHASH over aad || pad || ct || pad || len64(aadbits) || len64(ctbits), into s. The caller-owned GHASH
+// carries the cached H and tables; we just reset the running value and feed this record.
+fn computeS(g: ghash.Ghash, aad: ptr, aadLen: int, ct: ptr, ctLen: int, s: ptr): void {
+    g.reset();
     g.update(aad, aadLen);
     g.update(ct, ctLen);
     let lens = bytes.alloc(16);
@@ -96,69 +99,104 @@ fn computeS(h: ptr, aad: ptr, aadLen: int, ct: ptr, ctLen: int, s: ptr): void {
     putLen64(lens, 8, (ctLen as long) * 8);
     g.block(lens, 0);
     g.final(s);
-    g.delete();
     bytes.free(lens);
 }
 
+// FR-tls-2: a per-connection AES-GCM context. The AES key schedule, the hash subkey H, and the GHASH
+// tables built from H are all a pure function of the key, so a TLS endpoint that protects many records
+// under one traffic key should build them once and reuse them. seal/open below still exist as one-shot
+// wrappers, but a caller holding a GcmContext across records pays the setup exactly once.
+pub struct GcmContext {
+    pub ctx: aes.Aes,     // cached AES key schedule
+    pub h: ptr,           // cached hash subkey H = E_K(0)
+    pub g: ghash.Ghash,   // cached GHASH state (H tables built once; y reset per record)
+
+    pub fn create(key: ptr, keyLen: int): GcmContext {
+        let c = bytes.new_with_allocator<GcmContext>(allocator.globalAllocator());
+        c.ctx = aes.Aes.create(key, keyLen);
+        c.h = bytes.alloc(16);
+        computeH(c.ctx, c.h);
+        c.g = ghash.Ghash.create(c.h);
+        return c;
+    }
+
+    // Encrypt ptLen bytes at pt into ctOut and write the 16-byte tag to tagOut, reusing the cached schedule.
+    pub fn seal(self: GcmContext, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
+                pt: ptr, ptLen: int, ctOut: ptr, tagOut: ptr): void {
+        let j0 = bytes.alloc(16);
+        computeJ0(self.g, iv, ivLen, j0);
+
+        let icb = bytes.alloc(16);
+        let i = 0;
+        while (i < 16) { bytes.write_byte(icb, i, bytes.read_byte(j0, i)); i = i + 1; }
+        inc32(icb);
+        gctr(self.ctx, icb, pt, ptLen, ctOut);
+
+        let s = bytes.alloc(16);
+        computeS(self.g, aad, aadLen, ctOut, ptLen, s);
+        let ej0 = bytes.alloc(16);
+        self.ctx.encryptBlock(j0, ej0);
+        i = 0;
+        while (i < 16) { bytes.write_byte(tagOut, i, bytes.read_byte(s, i) ^ bytes.read_byte(ej0, i)); i = i + 1; }
+
+        bytes.free(j0); bytes.free(icb); bytes.free(s); bytes.free(ej0);
+    }
+
+    // Verify the tag and, on success, decrypt ct into ptOut and return true. A false return means the tag
+    // did not verify; ptOut must not be used.
+    pub fn open(self: GcmContext, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
+                ct: ptr, ctLen: int, tag: ptr, ptOut: ptr): bool {
+        let j0 = bytes.alloc(16);
+        computeJ0(self.g, iv, ivLen, j0);
+
+        let s = bytes.alloc(16);
+        computeS(self.g, aad, aadLen, ct, ctLen, s);
+        let ej0 = bytes.alloc(16);
+        self.ctx.encryptBlock(j0, ej0);
+
+        let diff = 0;
+        let i = 0;
+        while (i < 16) {
+            diff = diff | ((bytes.read_byte(s, i) ^ bytes.read_byte(ej0, i)) ^ bytes.read_byte(tag, i));
+            i = i + 1;
+        }
+        let ok = diff == 0;
+        if (ok) {
+            let icb = bytes.alloc(16);
+            i = 0;
+            while (i < 16) { bytes.write_byte(icb, i, bytes.read_byte(j0, i)); i = i + 1; }
+            inc32(icb);
+            gctr(self.ctx, icb, ct, ctLen, ptOut);
+            bytes.free(icb);
+        }
+
+        bytes.free(j0); bytes.free(s); bytes.free(ej0);
+        return ok;
+    }
+
+    pub fn delete(self: GcmContext): void {
+        self.ctx.delete();
+        self.g.delete();
+        if (self.h != 0) { bytes.free(self.h); self.h = 0; }
+    }
+}
+
 // Seal: encrypt ptLen bytes at pt to ctOut and write the 16-byte tag to tagOut. keyLen is 16 or 32.
+// One-shot wrapper: builds a context, uses it once, tears it down. Callers protecting many records under
+// the same key should hold a GcmContext instead.
 pub fn seal(key: ptr, keyLen: int, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
             pt: ptr, ptLen: int, ctOut: ptr, tagOut: ptr): void {
-    let ctx = aes.Aes.create(key, keyLen);
-    let h = bytes.alloc(16);
-    computeH(ctx, h);
-    let j0 = bytes.alloc(16);
-    computeJ0(h, iv, ivLen, j0);
-
-    let icb = bytes.alloc(16);
-    let i = 0;
-    while (i < 16) { bytes.write_byte(icb, i, bytes.read_byte(j0, i)); i = i + 1; }
-    inc32(icb);
-    gctr(ctx, icb, pt, ptLen, ctOut);
-
-    let s = bytes.alloc(16);
-    computeS(h, aad, aadLen, ctOut, ptLen, s);
-    let ej0 = bytes.alloc(16);
-    ctx.encryptBlock(j0, ej0);
-    i = 0;
-    while (i < 16) { bytes.write_byte(tagOut, i, bytes.read_byte(s, i) ^ bytes.read_byte(ej0, i)); i = i + 1; }
-
-    ctx.delete();
-    bytes.free(h); bytes.free(j0); bytes.free(icb); bytes.free(s); bytes.free(ej0);
+    let c = GcmContext.create(key, keyLen);
+    c.seal(iv, ivLen, aad, aadLen, pt, ptLen, ctOut, tagOut);
+    c.delete();
 }
 
 // Open: verify the tag, and on success decrypt ct to ptOut and return true. A false return means the
-// tag did not verify; ptOut must not be used.
+// tag did not verify; ptOut must not be used. One-shot wrapper over GcmContext.
 pub fn open(key: ptr, keyLen: int, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
             ct: ptr, ctLen: int, tag: ptr, ptOut: ptr): bool {
-    let ctx = aes.Aes.create(key, keyLen);
-    let h = bytes.alloc(16);
-    computeH(ctx, h);
-    let j0 = bytes.alloc(16);
-    computeJ0(h, iv, ivLen, j0);
-
-    let s = bytes.alloc(16);
-    computeS(h, aad, aadLen, ct, ctLen, s);
-    let ej0 = bytes.alloc(16);
-    ctx.encryptBlock(j0, ej0);
-
-    // Constant-time tag compare.
-    let diff = 0;
-    let i = 0;
-    while (i < 16) {
-        diff = diff | ((bytes.read_byte(s, i) ^ bytes.read_byte(ej0, i)) ^ bytes.read_byte(tag, i));
-        i = i + 1;
-    }
-    let ok = diff == 0;
-    if (ok) {
-        let icb = bytes.alloc(16);
-        i = 0;
-        while (i < 16) { bytes.write_byte(icb, i, bytes.read_byte(j0, i)); i = i + 1; }
-        inc32(icb);
-        gctr(ctx, icb, ct, ctLen, ptOut);
-        bytes.free(icb);
-    }
-
-    ctx.delete();
-    bytes.free(h); bytes.free(j0); bytes.free(s); bytes.free(ej0);
+    let c = GcmContext.create(key, keyLen);
+    let ok = c.open(iv, ivLen, aad, aadLen, ct, ctLen, tag, ptOut);
+    c.delete();
     return ok;
 }
