@@ -39,6 +39,43 @@ pub fn run(
     }
 }
 
+// String-engine-removal (free-fn overlay): give free generic FUNCTION instantiations the same TypeId
+// overlay struct methods already get. For each recorded free-fn instance (mono.free_fn_insts) with a
+// concrete inst_key, record tp_resolve[{fn-type-param, inst_key}] and walk the fn body recording
+// expr_types_inst + owned_inst via subst.substitute. This makes typeOfExprConcrete and isOwnedTypeId total
+// inside free-generic-fn bodies (current_instantiation_id = inst_key), so decisions there no longer need the
+// string engine. Directly-discovered instances only; the transitive path (noteFreeFnInstStr) has no
+// inst_key yet (B1).
+pub fn runFreeFns(
+    allocator: std.mem.Allocator,
+    store: *TypeStore,
+    ir: *TypedIr,
+    program: ast.Program,
+) void {
+    const mono = @import("mono.zig");
+    for (mono.free_fn_insts.items) |fi| {
+        const owner = fi.owner orelse continue;
+        const args = fi.args_tids orelse continue;
+        const key = fi.inst_key orelse continue;
+        for (args, 0..) |arg, i| {
+            const tp = store.intern(.{ .type_param = .{ .owner = owner, .index = @intCast(i) } }) catch continue;
+            ir.recordTpResolve(allocator, tp, key, arg) catch {};
+        }
+        const fd = findFreeFn(program, fi.fn_name) orelse continue;
+        const ctx = Ctx{ .allocator = allocator, .store = store, .ir = ir, .decl = owner, .args = args, .inst = key };
+        for (fd.body.statements) |*s| ctx.stmt(s);
+    }
+}
+
+fn findFreeFn(program: ast.Program, name: []const u8) ?*const ast.FunctionDecl {
+    for (program.declarations) |*d| {
+        if (d.* == .fn_decl and std.mem.eql(u8, d.fn_decl.name, name) and d.fn_decl.type_params.len > 0) {
+            return &d.fn_decl;
+        }
+    }
+    return null;
+}
+
 const Ctx = struct {
     allocator: std.mem.Allocator,
     store: *TypeStore,

@@ -101,12 +101,19 @@ pub const FreeFnInst = struct {
     fn_name: []const u8,
     params: []const []const u8,
     args: []const []const u8,
+    // String-engine-removal overlay: the concrete TypeId args, the fn's SymbolId (type-param owner), and the
+    // interned instantiation key = .struct_{decl=owner, args=args_tids}. Null for instances discovered by the
+    // legacy string-only transitive path (noteFreeFnInstStr) until B1 makes that TypeId-native.
+    owner: ?types.SymbolId = null,
+    args_tids: ?[]const TypeId = null,
+    inst_key: ?TypeId = null,
 };
 pub var free_fn_insts: std.ArrayListUnmanaged(FreeFnInst) = .empty;
 
 pub fn noteFreeFnInst(
     store: *types.TypeStore,
     fn_name: []const u8,
+    owner: types.SymbolId,
     params: []const []const u8,
     args: []const TypeId,
 ) void {
@@ -127,7 +134,18 @@ pub fn noteFreeFnInst(
     }
     const pbuf = a.alloc([]const u8, params.len) catch return;
     for (params, 0..) |p, i| pbuf[i] = a.dupe(u8, p) catch return;
-    free_fn_insts.append(a, .{ .fn_name = a.dupe(u8, fn_name) catch return, .params = pbuf, .args = abuf }) catch {};
+    // Keep the TypeId args and intern the instantiation key (page allocator: matches the string storage).
+    const tbuf = a.alloc(TypeId, args.len) catch return;
+    for (args, 0..) |at, i| tbuf[i] = at;
+    const key = store.intern(.{ .struct_ = .{ .decl = owner, .args = tbuf } }) catch null;
+    free_fn_insts.append(a, .{
+        .fn_name = a.dupe(u8, fn_name) catch return,
+        .params = pbuf,
+        .args = abuf,
+        .owner = owner,
+        .args_tids = tbuf,
+        .inst_key = key,
+    }) catch {};
 }
 
 // Register a free-generic function instantiation from already-rendered type-argument STRINGS

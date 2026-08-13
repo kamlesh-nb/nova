@@ -3064,6 +3064,15 @@ pub const LlvmCompiler = struct {
                         const spec_ret = if (fn_decl.ret_type) |ret| try self.typeRefToString(ret) else "void";
                         self.current_method_subst = prev_ms;
 
+                        // String-engine-removal: bind this free-fn spec to its TypeId instantiation key so
+                        // current_instantiation_id resolves inside its body (declarations.zig:667). The sema
+                        // free-fn overlay (inst_disp.runFreeFns) recorded tp_resolve/expr_types_inst under the
+                        // SAME inst_key = .struct_{owner, args_tids}. Both sides must agree on the key: here we
+                        // publish live_inst_ids[spec_name] = fi.inst_key and set .instantiation = spec_name.
+                        if (fi.inst_key) |key| {
+                            sema_mono.live_inst_ids.put(self.allocator, spec_name, key) catch {};
+                        }
+
                         try self.functions.append(self.allocator, .{
                             .name = spec_name,
                             .param_count = fn_decl.params.len,
@@ -3073,6 +3082,7 @@ pub const LlvmCompiler = struct {
                             .body = fn_decl.body,
                             .is_async = fn_decl.is_async,
                             .method_subst = subst,
+                            .instantiation = if (fi.inst_key != null) spec_name else null,
                             .source_file = fn_decl.span.file,
                         });
                     }
