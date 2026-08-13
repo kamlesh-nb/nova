@@ -1085,7 +1085,7 @@ void nova_run_root(long long root) {
 
     if (g_run_depth > 0) {
         std::fprintf(stderr,
-                     "nova: fatal — an async call was block-driven from inside the event loop "
+                     "nova: fatal: an async call was block-driven from inside the event loop "
                      "(a sync function awaiting async work while running as a coroutine). This "
                      "would deadlock. Make the calling function `async fn` and `await` the call, "
                      "or move the work off the request path.\n");
@@ -1138,7 +1138,7 @@ void nova_run_root(long long root) {
     g_reactor_mode = false;
     if (!raw_coro_done(root)) {
         std::fprintf(stderr,
-                     "nova: fatal — async root %p never completed (lost wakeup); "
+                     "nova: fatal: async root %p never completed (lost wakeup); "
                      "refusing to read its unwritten result\n",
                      reinterpret_cast<void *>(root));
         std::abort();
@@ -1179,7 +1179,7 @@ void nova_run_root(long long root) {
     g_reactor_mode = false;
     if (!raw_coro_done(root)) {
         std::fprintf(stderr,
-                     "nova: fatal — async root %p never completed (lost wakeup); "
+                     "nova: fatal: async root %p never completed (lost wakeup); "
                      "refusing to read its unwritten result\n",
                      reinterpret_cast<void *>(root));
         std::abort();
@@ -1228,7 +1228,7 @@ void nova_run_root(long long root) {
             g_reactor_mode = false;
             if (!raw_coro_done(root)) {
                 std::fprintf(stderr,
-                             "nova: fatal — async root %p never completed (lost wakeup); "
+                             "nova: fatal: async root %p never completed (lost wakeup); "
                              "refusing to read its unwritten result\n",
                              reinterpret_cast<void *>(root));
                 std::abort();
@@ -1261,7 +1261,7 @@ void nova_run_root(long long root) {
     g_reactor_mode = false;
     if (!raw_coro_done(root)) {
         std::fprintf(stderr,
-                     "nova: fatal — async root %p never completed (lost wakeup); "
+                     "nova: fatal: async root %p never completed (lost wakeup); "
                      "refusing to read its unwritten result\n",
                      reinterpret_cast<void *>(root));
         std::abort();
@@ -1269,7 +1269,7 @@ void nova_run_root(long long root) {
 #else
     // Neither kqueue, IOCP nor epoll: no reactor driver exists for this target.
     (void)root;
-    std::fprintf(stderr, "nova: fatal — no reactor driver on this platform\n");
+    std::fprintf(stderr, "nova: fatal: no reactor driver on this platform\n");
     std::abort();
 #endif
 }

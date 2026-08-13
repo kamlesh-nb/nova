@@ -656,7 +656,7 @@ long long nova_arc_audit_report(void) {
   const long long live = g_audit_live.load(std::memory_order_acquire);
   const long long bytes = g_audit_bytes.load(std::memory_order_acquire);
   if (live <= 0) {
-    std::fprintf(stderr, "\nARC audit: clean — every object released.\n");
+    std::fprintf(stderr, "\nARC audit: clean. every object released.\n");
     return 0;
   }
   std::fprintf(stderr,

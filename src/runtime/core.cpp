@@ -485,7 +485,7 @@ void nova_test_fail(const char *msg) {
                  t_msg[0] ? t_msg : "assertion failed");
   else
     std::fprintf(stderr, "\nAssertion failed: %s\n", t_msg[0] ? t_msg : "(no message)");
-  std::fprintf(stderr, "\n  (the suite aborts at the first failing assertion — a test cannot be\n"
+  std::fprintf(stderr, "\n  (the suite aborts at the first failing assertion, a test cannot be\n"
                        "   unwound out of, so later tests do not run. Fix this one and re-run.)\n");
   std::_Exit(1);
 }
