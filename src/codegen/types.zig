@@ -825,15 +825,27 @@ pub fn isOwnedLocal(self: *LlvmCompiler, name: []const u8, type_string: []const 
 
 pub fn typeOfExprConcrete(self: *LlvmCompiler, expr_ptr: *const ast.Expression) ?typesys.TypeId {
     const ir = self.typed_ir orelse return null;
+    const st_opt = self.type_store;
+    // A type_param or unresolved id is NOT a usable decision id: in an instantiated body the typed IR may
+    // hand back the raw type-param `T` (the string engine substitutes it to the concrete arg via
+    // substTypeParams; the TypeId path must reach the same concrete id). Reject those and fall through to
+    // the local-slot fallback, which holds the concrete id (populated with the substituted type).
+    const concrete = struct {
+        fn ok(st: ?*const typesys.TypeStore, t: typesys.TypeId) bool {
+            const s = st orelse return true;
+            return switch (s.get(t)) {
+                .unresolved, .type_param => false,
+                else => true,
+            };
+        }
+    }.ok;
     if (self.current_instantiation_id) |inst| {
-        if (ir.typeOfInst(expr_ptr.id, inst)) |ct| return ct;
+        if (ir.typeOfInst(expr_ptr.id, inst)) |ct| {
+            if (concrete(st_opt, ct)) return ct;
+        }
     }
     if (ir.typeOf(expr_ptr)) |t| {
-        if (self.type_store) |st| {
-            if (st.get(t) != .unresolved) return t;
-        } else {
-            return t;
-        }
+        if (concrete(st_opt, t)) return t;
     }
     // Phase 1 (string->TypeId cutover): fall back to the local TypeId slot for an ident, mirroring the
     // string engine's `resolveExpressionTypeName -> current_local_types.get(ident)` fallback but keeping a

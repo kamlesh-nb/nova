@@ -29,6 +29,16 @@ if [ $fail -eq 0 ]; then
   NOVA_FUZZ_N="${NOVA_FUZZ_N:-40}" conformance/fuzz.sh || fail=1
 fi
 
+if [ $fail -eq 0 ]; then
+  step "string->TypeId shadow gate (0 disagreements: TypeId engine == string engine)"
+  bash conformance/shadow-gate.sh || fail=1
+fi
+
+if [ $fail -eq 0 ]; then
+  step "string type-decision lint (no NEW codegen string type-decisions; ratchet toward 0)"
+  bash conformance/string-typedecision-lint.sh || fail=1
+fi
+
 echo
 if [ $fail -eq 0 ]; then echo "GATE PASS  nova (lang)  [$OS]"; else echo "GATE FAIL  nova (lang)  [$OS]"; fi
 exit $fail

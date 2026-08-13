@@ -3602,15 +3602,35 @@ pub const LlvmCompiler = struct {
                             try map.put(ls.name, name);
 
                             if (self.current_local_type_ids) |ids| {
+                                var stored = false;
                                 if (self.typed_ir) |ir| {
                                     if (ir.typeOf(init)) |tid| {
-
                                         const store_tid = if (self.current_instantiation_id) |inst|
                                             (ir.typeOfInst(init.id, inst) orelse tid)
                                         else
                                             tid;
-                                        try ids.put(ls.name, store_tid);
+                                        // Only accept a CONCRETE id. `let s = xs.get(i)` from a desugared
+                                        // `for (s in xs)` types its init as the container's type-param (`T`)
+                                        // or unresolved, which is NOT a usable decision id.
+                                        if (self.type_store) |st| {
+                                            const k = st.get(store_tid);
+                                            if (k != .unresolved and k != .type_param) {
+                                                try ids.put(ls.name, store_tid);
+                                                stored = true;
+                                            }
+                                        } else {
+                                            try ids.put(ls.name, store_tid);
+                                            stored = true;
+                                        }
                                     }
+                                }
+                                // Phase 1 bridge (string->TypeId cutover): when the typed IR has no CONCRETE id
+                                // for the initialiser (the generic-container element case above), round-trip
+                                // the resolved NAME back to a TypeId via tidForName. This gives loop/element
+                                // bindings a real TypeId so isStringExpr/isOwnedTypeId etc. work on them,
+                                // instead of only the string engine being able to resolve them.
+                                if (!stored) {
+                                    if (self.tidForName(name)) |tid| try ids.put(ls.name, tid);
                                 }
                             }
                         }
