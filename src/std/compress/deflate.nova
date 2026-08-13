@@ -486,17 +486,15 @@ pub fn gunzip(src: string): string {
 // leak for now (a --asan pass will free them). The output ByteBuf is a struct field -> ARC-managed.
 // ================================================================================================
 
+// FR-deflate-5: the hash-chain slots (head/prev) are written once per matched byte, so these are hot.
+// One wide little-endian store/load replaces four byte ops each. rd32's old raw byte-OR and mem.load<int>'s
+// sign-extension agree on every value stored here: positions are non-negative and below 2^31 (high bit
+// clear), and the -1 sentinel is 0xFFFFFFFF, which both forms read back as -1 in a 32-bit int slot.
 fn wr32(p: ptr, i: int, v: int): void {
-    bytes.write_byte(p, i * 4, v & 255);
-    bytes.write_byte(p, i * 4 + 1, (v >> 8) & 255);
-    bytes.write_byte(p, i * 4 + 2, (v >> 16) & 255);
-    bytes.write_byte(p, i * 4 + 3, (v >> 24) & 255);
+    mem.store<int>(p, i * 4, v, endian.Endian.little);
 }
 fn rd32(p: ptr, i: int): int {
-    return bytes.read_byte(p, i * 4)
-        | (bytes.read_byte(p, i * 4 + 1) << 8)
-        | (bytes.read_byte(p, i * 4 + 2) << 16)
-        | (bytes.read_byte(p, i * 4 + 3) << 24);
+    return mem.load<int>(p, i * 4, endian.Endian.little);
 }
 
 // LSB-first bit writer over a growable ByteBuf.
@@ -520,10 +518,17 @@ pub struct BitWriter {
             self.bitcnt = 0;
         }
     }
-    // extra bits / header fields: LSB first
+    // extra bits / header fields: LSB first. FR-deflate-5: accumulate all n bits at once and drain whole
+    // bytes, instead of a branch per bit. n stays small here (<= 13 for distance extra bits) so bitcnt + n
+    // never exceeds the 32-bit accumulator. Same LSB-first packing, same output, fewer operations.
     pub fn writeBits(self: BitWriter, v: int, n: int): void {
-        let i = 0;
-        while (i < n) { self.writeBit((v >> i) & 1); i = i + 1; }
+        self.bitbuf = self.bitbuf | ((v & ((1 << n) - 1)) << self.bitcnt);
+        self.bitcnt = self.bitcnt + n;
+        while (self.bitcnt >= 8) {
+            self.out.push(self.bitbuf & 255);
+            self.bitbuf = self.bitbuf >> 8;
+            self.bitcnt = self.bitcnt - 8;
+        }
     }
     // Huffman codes: packed MSB first (RFC 1951 3.1.1)
     pub fn writeHuff(self: BitWriter, code: int, n: int): void {
