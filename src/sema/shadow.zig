@@ -25,12 +25,34 @@ pub var census_kind_field: usize = 0;
 pub var census_kind_method: usize = 0;
 pub var census_kind_other: usize = 0;
 
+// Phase-1a census: the string path and the TypeId path BOTH resolve but DISAGREE (typed IR gives a
+// different / wrong name). This is the accuracy gap that blocks routing decisions through TypeId.
+pub var census_disagree: usize = 0;
+pub var census_dis_ident: usize = 0;
+pub var census_dis_index: usize = 0;
+pub var census_dis_call: usize = 0;
+pub var census_dis_gcall: usize = 0;
+pub var census_dis_field: usize = 0;
+pub var census_dis_binary: usize = 0;
+pub var census_dis_other: usize = 0;
+pub var census_dis_last_str: [128]u8 = undefined;
+pub var census_dis_last_str_len: usize = 0;
+pub var census_dis_last_tid: [128]u8 = undefined;
+pub var census_dis_last_tid_len: usize = 0;
+
 pub fn tidCensusReport() void {
     if (!tid_census) return;
     std.debug.print("=== TID census: string resolves, TypeId null (Phase-1 gaps) ===\n", .{});
-    std.debug.print("  total={d}  ident={d} index={d} call={d} field={d} method_call={d} other={d}\n", .{
+    std.debug.print("  null_total={d}  ident={d} index={d} call={d} field={d} method_call={d} other={d}\n", .{
         census_total, census_kind_ident, census_kind_index, census_kind_call, census_kind_field, census_kind_method, census_kind_other,
     });
+    std.debug.print("=== TID census: string vs TypeId DISAGREE (Phase-1a accuracy gaps) ===\n", .{});
+    std.debug.print("  disagree_total={d}  ident={d} index={d} call={d} gcall={d} field={d} binary={d} other={d}\n", .{
+        census_disagree, census_dis_ident, census_dis_index, census_dis_call, census_dis_gcall, census_dis_field, census_dis_binary, census_dis_other,
+    });
+    if (census_disagree > 0) {
+        std.debug.print("  e.g. string='{s}' typeid='{s}'\n", .{ census_dis_last_str[0..census_dis_last_str_len], census_dis_last_tid[0..census_dis_last_tid_len] });
+    }
 }
 
 fn out(comptime fmt: []const u8, args: anytype) void {

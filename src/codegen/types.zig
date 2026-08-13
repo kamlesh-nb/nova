@@ -1173,19 +1173,44 @@ pub fn resolveExpressionTypeName(self: *LlvmCompiler, expr_ptr: *const ast.Expre
     }
     const t = t_opt.?;
 
-    if (sema_shadow.tid_census and typeOfExprConcrete(self, expr_ptr) == null) {
-        sema_shadow.census_total += 1;
-        switch (expr_ptr.kind) {
-            .ident => sema_shadow.census_kind_ident += 1,
-            .index => sema_shadow.census_kind_index += 1,
-            .call => sema_shadow.census_kind_call += 1,
-            .generic_call => sema_shadow.census_kind_method += 1,
-            .field_access => sema_shadow.census_kind_field += 1,
-            else => sema_shadow.census_kind_other += 1,
+    const s_name = try self.substTypeParams(try sema_shadow.renderLegacy(self.allocator, st, t));
+
+    if (sema_shadow.tid_census) {
+        if (typeOfExprConcrete(self, expr_ptr)) |ctid| {
+            // Both engines resolved: do they AGREE? A disagreement is a typed-IR accuracy gap (P1a).
+            const t_name = self.substTypeParams(sema_shadow.renderLegacy(self.allocator, st, ctid) catch "") catch "";
+            if (!std.mem.eql(u8, s_name, t_name)) {
+                sema_shadow.census_disagree += 1;
+                switch (expr_ptr.kind) {
+                    .ident => sema_shadow.census_dis_ident += 1,
+                    .index => sema_shadow.census_dis_index += 1,
+                    .call => sema_shadow.census_dis_call += 1,
+                    .generic_call => sema_shadow.census_dis_gcall += 1,
+                    .field_access => sema_shadow.census_dis_field += 1,
+                    .binary => sema_shadow.census_dis_binary += 1,
+                    else => sema_shadow.census_dis_other += 1,
+                }
+                const sl = @min(s_name.len, sema_shadow.census_dis_last_str.len);
+                @memcpy(sema_shadow.census_dis_last_str[0..sl], s_name[0..sl]);
+                sema_shadow.census_dis_last_str_len = sl;
+                const tl = @min(t_name.len, sema_shadow.census_dis_last_tid.len);
+                @memcpy(sema_shadow.census_dis_last_tid[0..tl], t_name[0..tl]);
+                sema_shadow.census_dis_last_tid_len = tl;
+            }
+        } else {
+            sema_shadow.census_total += 1;
+            switch (expr_ptr.kind) {
+                .ident => sema_shadow.census_kind_ident += 1,
+                .index => sema_shadow.census_kind_index += 1,
+                .call => sema_shadow.census_kind_call += 1,
+                .generic_call => sema_shadow.census_kind_method += 1,
+                .field_access => sema_shadow.census_kind_field += 1,
+                else => sema_shadow.census_kind_other += 1,
+            }
         }
     }
 
-    return try self.substTypeParams(try sema_shadow.renderLegacy(self.allocator, st, t));
+    return s_name;
 }
 
 // Phase-3 foundation: the SINGLE sanctioned TypeId -> string boundary for the string->TypeId cutover.
