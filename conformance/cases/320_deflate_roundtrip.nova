@@ -1,0 +1,26 @@
+// DEFLATE / gzip: round-trip and gzip-format correctness. inflate(deflateRaw(x)) == x, gunzip(gzipCompress(x))
+// == x, and the gzip module compress/decompress path. Interop with the system gzip/gunzip is proven by the
+// host tests; this case is the in-corpus regression guard for the pure-Nova codec.
+import compress.deflate;
+import compress.gzip;
+import assert;
+
+@test
+fn deflate_inflate_roundtrip(): void {
+    let data = "The quick brown fox jumps over the lazy dog. aaaaaaaaaa bbbbbbbbbb 1234567890 repeated repeated repeated";
+    let comp = deflate.deflateRaw(data);
+    assert.equalStr(deflate.inflate(comp.toString()).toString(), data);
+}
+
+@test
+fn gzip_roundtrip_full(): void {
+    let data = "gzip payload with redundancy redundancy redundancy and a tail 0987654321";
+    assert.equalStr(deflate.gunzip(deflate.gzipCompress(data)), data);
+    assert.equalStr(gzip.decompress(gzip.compress(data)), data);
+}
+
+@test
+fn deflate_empty_and_short(): void {
+    assert.equalStr(deflate.gunzip(deflate.gzipCompress("")), "");
+    assert.equalStr(deflate.gunzip(deflate.gzipCompress("x")), "x");
+}
