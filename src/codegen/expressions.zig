@@ -2074,43 +2074,21 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 }
             }
 
+            // left_type/right_type stay: they are load-bearing NAME inputs to numToString / intOpKind /
+            // payloadEnumBoxWords below (those take a rendered type name, not a TypeId). What DID move to the
+            // typed IR are the three operand-type PREDICATES, which used to string-compare these names against
+            // "string"/"float"/...: they now use isStringExpr / isFloatExpr. The string compares were a
+            // redundant fallback behind the same isStringExpr check; corpus + --asan confirm nothing needed it.
             const left_type = try self.resolveExpressionTypeName(bin.left);
             const right_type = try self.resolveExpressionTypeName(bin.right);
 
-            const is_string_concat = blk: {
-                if (self.isStringExpr(bin.left) or self.isStringExpr(bin.right)) break :blk true;
-                if (left_type) |lt| {
-                    if (std.mem.eql(u8, lt, "string")) break :blk true;
-                }
-                if (right_type) |rt| {
-                    if (std.mem.eql(u8, rt, "string")) break :blk true;
-                }
-                break :blk false;
-            };
+            const is_string_concat = self.isStringExpr(bin.left) or self.isStringExpr(bin.right);
             const is_string_comparison = blk: {
                 if (bin.left.kind == .literal and (bin.left.kind.literal == .null or bin.left.kind.literal == .undefined)) break :blk false;
                 if (bin.right.kind == .literal and (bin.right.kind.literal == .null or bin.right.kind.literal == .undefined)) break :blk false;
-
-                if (self.isStringExpr(bin.left) or self.isStringExpr(bin.right)) break :blk true;
-                if (left_type) |lt| {
-                    if (std.mem.eql(u8, lt, "string")) break :blk true;
-                }
-                if (right_type) |rt| {
-                    if (std.mem.eql(u8, rt, "string")) break :blk true;
-                }
-                break :blk false;
+                break :blk self.isStringExpr(bin.left) or self.isStringExpr(bin.right);
             };
-            const is_float_op = blk: {
-                if (left_type) |lt| {
-                    if (std.mem.eql(u8, lt, "f32") or std.mem.eql(u8, lt, "float") or
-                        std.mem.eql(u8, lt, "f64") or std.mem.eql(u8, lt, "double")) break :blk true;
-                }
-                if (right_type) |rt| {
-                    if (std.mem.eql(u8, rt, "f32") or std.mem.eql(u8, rt, "float") or
-                        std.mem.eql(u8, rt, "f64") or std.mem.eql(u8, rt, "double")) break :blk true;
-                }
-                break :blk false;
-            };
+            const is_float_op = self.isFloatExpr(bin.left) or self.isFloatExpr(bin.right);
 
             var l_val = try self.compileExpression(bin.left.*);
             var r_val = try self.compileExpression(bin.right.*);

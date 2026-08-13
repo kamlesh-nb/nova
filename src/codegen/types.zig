@@ -840,6 +840,19 @@ pub fn isStringExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool {
     return false;
 }
 
+// TypeId-based "is this expression a floating-point value" — the string->TypeId replacement for
+// `resolveExpressionTypeName(e) == "float"/"double"/"f32"/"f64"`. Returns false when no concrete TypeId is
+// available (matching the old `if (name) |n| ... else false` shape).
+pub fn isFloatExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool {
+    if (self.type_store) |st| {
+        if (typeOfExprConcrete(self, expr_ptr)) |tid| {
+            const info = st.get(tid);
+            return info == .prim and info.prim.kind == .float;
+        }
+    }
+    return false;
+}
+
 pub fn tupleElemTraitName(self: *LlvmCompiler, expr_ptr: *const ast.Expression, idx: usize) ?[]const u8 {
     if (self.type_store) |st| {
         if (typeOfExprConcrete(self, expr_ptr)) |tid| {

@@ -3738,6 +3738,7 @@ pub const LlvmCompiler = struct {
     pub const returnIsBorrow = types_mod.returnIsBorrow;
     pub const isOwnedErrUnionOk = types_mod.isOwnedErrUnionOk;
     pub const isStringExpr = types_mod.isStringExpr;
+    pub const isFloatExpr = types_mod.isFloatExpr;
     pub const tupleElemTraitName = types_mod.tupleElemTraitName;
     pub const isOwnedErrUnionErr = types_mod.isOwnedErrUnionErr;
     pub const isOwnedStorageElem = types_mod.isOwnedStorageElem;
