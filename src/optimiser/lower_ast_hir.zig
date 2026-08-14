@@ -221,7 +221,8 @@ fn lowerExpr(ctx: *Ctx, expr: ast.Expression) anyerror!HirId {
         .call => |c| blk: {
             const callee = try lowerExpr(ctx, c.callee.*);
             const owned = try lowerExprSlice(ctx, c.args);
-            break :blk try func.add(a, .{ .kind = .{ .call = .{ .callee = callee, .args = owned } }, .span = span });
+            const sym = if (ctx.ir) |ir| ir.symOf(&expr) else null; // resolved callee (emit-path call graph)
+            break :blk try func.add(a, .{ .kind = .{ .call = .{ .callee = callee, .args = owned, .sym = sym } }, .span = span });
         },
         .field_access => |fa| blk: {
             const object = try lowerExpr(ctx, fa.object.*);
@@ -263,7 +264,8 @@ fn lowerExpr(ctx: *Ctx, expr: ast.Expression) anyerror!HirId {
         .generic_call => |gc| blk: {
             const callee = try lowerExpr(ctx, gc.callee.*);
             const owned = try lowerExprSlice(ctx, gc.args);
-            break :blk try func.add(a, .{ .kind = .{ .generic_call = .{ .callee = callee, .args = owned } }, .span = span });
+            const sym = if (ctx.ir) |ir| ir.symOf(&expr) else null;
+            break :blk try func.add(a, .{ .kind = .{ .generic_call = .{ .callee = callee, .args = owned, .sym = sym } }, .span = span });
         },
         .struct_init => |si| blk: {
             const owned = try lowerFieldSlice(ctx, si.fields);

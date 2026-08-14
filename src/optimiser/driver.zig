@@ -60,6 +60,8 @@ pub const Coverage = struct {
     arc_removed: usize = 0, // retain/release ops removed (mostly by arc_elision)
     typed_values: usize = 0, // MIR values carrying a real (non-placeholder) TypeId
     total_values: usize = 0,
+    calls_total: usize = 0,
+    calls_resolved: usize = 0, // call ops whose callee SymbolId is resolved (not the unresolved sentinel)
 };
 
 // M1a shadow: lower every function in the program AST->HIR and report coverage. Does NOT emit; the AST
@@ -85,9 +87,11 @@ pub fn lowerProgramShadow(allocator: std.mem.Allocator, program: ast.Program, ir
         cov.mir_blocks, cov.mir_insts, cov.verify_errors, cov.insts_removed,
         cov.lir_ops, cov.arc_ops, cov.arc_removed,
     });
-    std.debug.print("[opt]   type-threading: {d}/{d} MIR values typed ({d:.1}%)\n", .{
+    std.debug.print("[opt]   type-threading: {d}/{d} MIR values typed ({d:.1}%); call callees resolved: {d}/{d} ({d:.1}%)\n", .{
         cov.typed_values, cov.total_values,
         if (cov.total_values == 0) @as(f64, 0.0) else 100.0 * @as(f64, @floatFromInt(cov.typed_values)) / @as(f64, @floatFromInt(cov.total_values)),
+        cov.calls_resolved, cov.calls_total,
+        if (cov.calls_total == 0) @as(f64, 0.0) else 100.0 * @as(f64, @floatFromInt(cov.calls_resolved)) / @as(f64, @floatFromInt(cov.calls_total)),
     });
     if (verbose) {
         var it = unsupported_by_tag.iterator();
@@ -123,6 +127,12 @@ fn lowerOneShadow(allocator: std.mem.Allocator, fd: ast.FunctionDecl, ir: ?*cons
     for (mfunc.value_types.items) |vt| {
         if (@intFromEnum(vt) != 0) cov.typed_values += 1;
     }
+    for (mfunc.blocks.items) |b| for (b.insts.items) |inst| {
+        if (inst.op == .call) {
+            cov.calls_total += 1;
+            if (inst.op.call.callee != lower_hir_mir.unresolved_callee) cov.calls_resolved += 1;
+        }
+    };
 
     // Verify the structural MIR (M2).
     const violations = try verify.verify(allocator, &mfunc);

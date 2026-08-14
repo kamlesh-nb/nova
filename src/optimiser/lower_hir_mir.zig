@@ -101,8 +101,8 @@ fn lowerNode(ctx: *Ctx, id: HirId) anyerror!Value {
             break :blk try mf.emit(a, ctx.cur, nty, .{ .cast = .{ .val = operand } });
         },
 
-        .call => |c| try lowerCall(ctx, c.callee, c.args),
-        .generic_call => |c| try lowerCall(ctx, c.callee, c.args),
+        .call => |c| try lowerCall(ctx, c.callee, c.args, c.sym),
+        .generic_call => |c| try lowerCall(ctx, c.callee, c.args, c.sym),
 
         .field => |f| blk: {
             const object = try lowerNode(ctx, f.object);
@@ -217,7 +217,10 @@ fn lowerNode(ctx: *Ctx, id: HirId) anyerror!Value {
     };
 }
 
-fn lowerCall(ctx: *Ctx, callee: HirId, call_args: []const HirId) !Value {
+// SymbolId 0xFFFF_FFFF marks an unresolved callee (the sema could not name the target).
+pub const unresolved_callee: mir.SymbolId = @enumFromInt(0xFFFF_FFFF);
+
+fn lowerCall(ctx: *Ctx, callee: HirId, call_args: []const HirId, sym: ?hir.SymbolId) !Value {
     const mf = ctx.mf;
     const a = ctx.allocator;
     var args = std.ArrayListUnmanaged(Value).empty;
@@ -227,7 +230,8 @@ fn lowerCall(ctx: *Ctx, callee: HirId, call_args: []const HirId) !Value {
     const owned = try a.dupe(Value, args.items);
     const owns = try a.alloc(bool, owned.len);
     @memset(owns, false);
-    return mf.emit(a, ctx.cur, placeholder_ty, .{ .call = .{ .callee = @enumFromInt(0), .args = owned, .takes_ownership = owns } });
+    const target: mir.SymbolId = if (sym) |s| s else unresolved_callee;
+    return mf.emit(a, ctx.cur, placeholder_ty, .{ .call = .{ .callee = target, .args = owned, .takes_ownership = owns } });
 }
 
 fn lowerAggregate(ctx: *Ctx, fields: []const HirId) !Value {

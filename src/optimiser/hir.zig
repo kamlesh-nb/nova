@@ -52,9 +52,9 @@ pub const Node = struct {
         // operators
         binop: struct { op: BinOp, lhs: HirId, rhs: HirId },
         unop: struct { op: UnOp, operand: HirId },
-        // calls
-        call: struct { callee: HirId, args: []const HirId },
-        generic_call: struct { callee: HirId, args: []const HirId }, // type_args resolved via TypeId later
+        // calls (sym = the resolved callee function, from the sema TypedIr, when known)
+        call: struct { callee: HirId, args: []const HirId, sym: ?SymbolId = null },
+        generic_call: struct { callee: HirId, args: []const HirId, sym: ?SymbolId = null },
         // aggregates
         struct_init: struct { type_name: []const u8, fields: []const HirId },
         enum_init: struct { name: []const u8, variant: []const u8, fields: []const HirId },
