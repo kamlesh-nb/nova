@@ -191,7 +191,9 @@ struct Point { pub x: int, pub y: int
 }
 ```
 - **Structs** have `pub`/private fields, an `init` constructor, and methods (`self: T` first param).
-  Field/method visibility is enforced within a struct *(→ 12, 39_declared_type_ownership)*.
+  Field/method visibility is **module-private** (per §8): a non-`pub` field or method is accessible from
+  anywhere in the same module (source file), and requires `pub` to be reached across modules
+  *(→ 12, 337_module_private, 39_declared_type_ownership)*.
 - **Enums** are tagged; variants may be payload-less or carry a payload:
   ```nova
   enum Color { Red, Green, Blue }          // Color.Red

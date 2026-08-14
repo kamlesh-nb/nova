@@ -1217,11 +1217,28 @@ pub const TypeChecker = struct {
         };
     }
 
+    // Module-private visibility (§8): a non-`pub` member is accessible from anywhere in the SAME MODULE
+    // (source file) as its declaration, not only from within the declaring type's own methods. Cross-module
+    // access still requires `pub`. This matches how Nova is actually used (a same-file test reads a non-pub
+    // field, e.g. corpus 260). `decl_file`/`access_file` come from the decl's and the access's spans.
+    fn memberAccessible(self: *TypeChecker, decl_file: []const u8, access_file: []const u8, type_name: []const u8) bool {
+        if (std.mem.eql(u8, decl_file, access_file)) return true; // same module
+        if (self.current_struct) |curr| {
+            if (std.mem.eql(u8, curr, type_name)) return true; // within the type's own methods
+        }
+        return false;
+    }
+
     fn resolveExprType(self: *TypeChecker, expr: ast.Expression) ?ast.TypeRef {
         switch (expr.kind) {
             .ident => |name| {
                 return self.variables.get(name);
             },
+            // An inferred `let p = P{...}` / `E.Variant(...)` binds p to the named type, so index/other
+            // checks that resolve the variable's type see the struct/enum. Safe now that privacy is
+            // module-private (same-file member access no longer false-fires; L1/K6 inferred case is caught).
+            .struct_init => |si| return ast.TypeRef{ .ident = si.type_name },
+            .enum_init => |ei| return ast.TypeRef{ .ident = ei.enum_name },
             .cast => |c| {
                 return c.target_type;
             },
@@ -1294,11 +1311,8 @@ pub const TypeChecker = struct {
                         if (self.structs.get(struct_name)) |s| {
                             for (s.fields) |field| {
                                 if (std.mem.eql(u8, field.name, fa.field)) {
-                                    if (!field.is_public) {
-                                        const in_same_struct = if (self.current_struct) |curr| std.mem.eql(u8, curr, struct_name) else false;
-                                        if (!in_same_struct) {
-                                            self.addError(fa.span, "Field '{s}' of struct '{s}' is private", .{ fa.field, struct_name });
-                                        }
+                                    if (!field.is_public and !self.memberAccessible(s.span.file, fa.span.file, struct_name)) {
+                                        self.addError(fa.span, "Field '{s}' of struct '{s}' is private — it is accessible only within its own module (add `pub` to use it across modules)", .{ fa.field, struct_name });
                                     }
                                     return field.type_name;
                                 }
@@ -1306,11 +1320,8 @@ pub const TypeChecker = struct {
                         } else if (self.unions.get(struct_name)) |u| {
                             for (u.fields) |field| {
                                 if (std.mem.eql(u8, field.name, fa.field)) {
-                                    if (!field.is_public) {
-                                        const in_same_struct = if (self.current_struct) |curr| std.mem.eql(u8, curr, struct_name) else false;
-                                        if (!in_same_struct) {
-                                            self.addError(fa.span, "Field '{s}' of union '{s}' is private", .{ fa.field, struct_name });
-                                        }
+                                    if (!field.is_public and !self.memberAccessible(u.span.file, fa.span.file, struct_name)) {
+                                        self.addError(fa.span, "Field '{s}' of union '{s}' is private — it is accessible only within its own module (add `pub` to use it across modules)", .{ fa.field, struct_name });
                                     }
                                     return field.type_name;
                                 }
@@ -1343,11 +1354,8 @@ pub const TypeChecker = struct {
                             if (self.structs.get(struct_name)) |s| {
                                 for (s.methods) |m| {
                                     if (std.mem.eql(u8, m.decl.name, fa.field)) {
-                                        if (!m.is_public) {
-                                            const in_same_struct = if (self.current_struct) |curr| std.mem.eql(u8, curr, struct_name) else false;
-                                            if (!in_same_struct and !self.methodIsTraitContract(s, fa.field)) {
-                                                self.addError(fa.span, "Method '{s}' of struct '{s}' is private", .{ fa.field, struct_name });
-                                            }
+                                        if (!m.is_public and !self.memberAccessible(s.span.file, fa.span.file, struct_name) and !self.methodIsTraitContract(s, fa.field)) {
+                                            self.addError(fa.span, "Method '{s}' of struct '{s}' is private — it is accessible only within its own module (add `pub` to use it across modules)", .{ fa.field, struct_name });
                                         }
                                         return m.decl.ret_type orelse ast.TypeRef{ .ident = "void" };
                                     }
@@ -1355,11 +1363,8 @@ pub const TypeChecker = struct {
                             } else if (self.enums.get(struct_name)) |e| {
                                 for (e.methods) |m| {
                                     if (std.mem.eql(u8, m.decl.name, fa.field)) {
-                                        if (!m.is_public) {
-                                            const in_same_struct = if (self.current_struct) |curr| std.mem.eql(u8, curr, struct_name) else false;
-                                            if (!in_same_struct) {
-                                                self.addError(fa.span, "Method '{s}' of enum '{s}' is private", .{ fa.field, struct_name });
-                                            }
+                                        if (!m.is_public and !self.memberAccessible(e.span.file, fa.span.file, struct_name)) {
+                                            self.addError(fa.span, "Method '{s}' of enum '{s}' is private — it is accessible only within its own module (add `pub` to use it across modules)", .{ fa.field, struct_name });
                                         }
                                         return m.decl.ret_type orelse ast.TypeRef{ .ident = "void" };
                                     }

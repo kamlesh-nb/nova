@@ -1,0 +1,19 @@
+// Module-private visibility (spec §8): `pub` exports a declaration from its MODULE (source file). A
+// non-`pub` field or method is accessible from anywhere in the SAME module, not only from the declaring
+// type's own methods (matches Zig-style `pub`, and how the corpus uses non-pub fields). Cross-module
+// access still requires `pub` (guarded by expect_fail/private_fn_cross_module). Previously the checker
+// enforced STRUCT-private for members, which contradicted both the spec and same-file field access.
+import assert;
+
+struct S {
+    x: int,                                  // non-pub field
+    init(v: int) { self.x = v; }
+    fn secret(self: S): int { return self.x * 2; }   // non-pub method
+}
+
+@test
+fn same_module_access_to_non_pub_members(): void {
+    let s = S(21);
+    assert.equalInt(s.x, 21);          // same-module non-pub FIELD access — allowed
+    assert.equalInt(s.secret(), 42);   // same-module non-pub METHOD call — allowed
+}
