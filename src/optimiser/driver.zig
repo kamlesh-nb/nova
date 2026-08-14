@@ -54,6 +54,7 @@ pub const Coverage = struct {
     mir_insts: usize = 0,
     verify_errors: usize = 0,
     insts_removed: usize = 0, // by the optimiser pipeline (mem2reg/constfold/dce/...)
+    lir_ops: usize = 0,
 };
 
 // M1a shadow: lower every function in the program AST->HIR and report coverage. Does NOT emit; the AST
@@ -73,10 +74,11 @@ pub fn lowerProgramShadow(allocator: std.mem.Allocator, program: ast.Program, ve
         }
     }
 
-    std.debug.print("[opt] AST->HIR->MIR shadow: {d} fns, {d} HIR nodes ({d} unsupported, {d:.1}% covered), {d} MIR blocks, {d} MIR insts, {d} verify errors, {d} insts removed by opt\n", .{
+    std.debug.print("[opt] AST->HIR->MIR->LIR shadow: {d} fns, {d} HIR nodes ({d} unsupported, {d:.1}% covered), {d} MIR blocks, {d} MIR insts, {d} verify errors, {d} insts removed by opt, {d} LIR ops\n", .{
         cov.funcs, cov.nodes, cov.unsupported,
         if (cov.nodes == 0) @as(f64, 100.0) else 100.0 * @as(f64, @floatFromInt(cov.nodes - cov.unsupported)) / @as(f64, @floatFromInt(cov.nodes)),
         cov.mir_blocks, cov.mir_insts, cov.verify_errors, cov.insts_removed,
+        cov.lir_ops,
     });
     if (verbose) {
         var it = unsupported_by_tag.iterator();
@@ -117,6 +119,11 @@ fn lowerOneShadow(allocator: std.mem.Allocator, fd: ast.FunctionDecl, cov: *Cove
     _ = optimise(allocator, &mfunc) catch 0;
     const after = countInsts(&mfunc);
     if (before > after) cov.insts_removed += before - after;
+
+    // MIR -> LIR: complete the tier chain (the decision-free stream the backend will emit from).
+    var lfunc = try lower_mir_lir.lowerFunc(allocator, mfunc);
+    defer lfunc.deinit(allocator);
+    cov.lir_ops += lfunc.ops.items.len;
 }
 
 fn countInsts(mf: *const mir.Func) usize {

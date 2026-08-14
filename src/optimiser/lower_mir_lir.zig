@@ -1,13 +1,77 @@
-// lower_mir_lir.zig — MIR (optimised) -> LIR (resolve SSA, linearise).
+// lower_mir_lir.zig — MIR (optimised) -> LIR (resolve the CFG into a linear op stream).
 //
-// Resolve SSA block arguments into a linear op stream and reduce every MIR instruction to a near-LLVM
-// LIR op, so the backend emitter is a mechanical 1:1 translation. See docs/design/optimiser.md. M0: stub.
+// After the optimiser, lower each MIR basic block to a LIR label followed by its instructions as
+// near-LLVM ops, and its terminator as an explicit jmp / condjmp / ret. MIR Values map 1:1 to LIR Regs
+// (our memory-based lowering produces no block-argument phis, so there is nothing to resolve here beyond
+// the block->label mapping). LIR is the decision-free stream the backend emitter consumes: every op maps
+// onto one LLVMBuild* call. See docs/design/optimiser.md.
 
 const std = @import("std");
 const mir = @import("mir.zig");
 const lir = @import("lir.zig");
 
+fn reg(v: mir.Value) lir.Reg {
+    return @enumFromInt(@intFromEnum(v));
+}
+fn label(b: mir.Block) lir.Label {
+    return @enumFromInt(@intFromEnum(b));
+}
+
 pub fn lowerFunc(allocator: std.mem.Allocator, func: mir.Func) !lir.Func {
-    _ = allocator;
-    return lir.Func{ .sym = func.sym, .inst = func.inst };
+    var lf = lir.Func{ .sym = func.sym, .inst = func.inst };
+    errdefer lf.deinit(allocator);
+
+    // Reg types mirror MIR value types 1:1.
+    try lf.reg_types.appendSlice(allocator, func.value_types.items);
+
+    for (func.blocks.items, 0..) |b, bi| {
+        try lf.ops.append(allocator, .{ .label = label(@enumFromInt(@as(u32, @intCast(bi)))) });
+        for (b.insts.items) |inst| try lowerInst(allocator, &lf, inst);
+        try lowerTerm(allocator, &lf, b.term);
+    }
+    return lf;
+}
+
+fn lowerInst(allocator: std.mem.Allocator, lf: *lir.Func, inst: mir.Inst) !void {
+    const r: ?lir.Reg = if (inst.result != .invalid) reg(inst.result) else null;
+    switch (inst.op) {
+        .binop => |x| try lf.ops.append(allocator, .{ .binop = .{ .result = r.?, .op = mapBin(x.op), .lhs = reg(x.lhs), .rhs = reg(x.rhs) } }),
+        .load => |x| try lf.ops.append(allocator, .{ .load = .{ .result = r.?, .addr = reg(x.addr) } }),
+        .store => |x| try lf.ops.append(allocator, .{ .store = .{ .addr = reg(x.addr), .val = reg(x.val) } }),
+        .alloc => |x| try lf.ops.append(allocator, .{ .alloc = .{ .result = r.?, .ty = x.ty } }),
+        .gep => |x| try lf.ops.append(allocator, .{ .gep = .{ .result = r.?, .base = reg(x.base), .offset = x.offset } }),
+        .cast => |x| try lf.ops.append(allocator, .{ .cast = .{ .result = r.?, .val = reg(x.val), .to = inst.ty } }),
+        .const_int => |v| try lf.ops.append(allocator, .{ .const_int = .{ .result = r.?, .val = v } }),
+        .call => |x| try lf.ops.append(allocator, .{ .call = .{ .result = r, .callee = x.callee, .args = try regs(allocator, x.args) } }),
+        .indirect_call => |x| try lf.ops.append(allocator, .{ .indirect_call = .{ .result = r, .receiver = reg(x.receiver), .slot = x.slot, .args = try regs(allocator, x.args) } }),
+        .retain => |x| try lf.ops.append(allocator, .{ .retain = .{ .val = reg(x.val) } }),
+        .release => |x| try lf.ops.append(allocator, .{ .release = .{ .val = reg(x.val), .dtor = null } }),
+        .await_ => |x| try lf.ops.append(allocator, .{ .await_ = .{ .result = r, .fut = reg(x.fut) } }),
+        .spawn_ => |x| try lf.ops.append(allocator, .{ .spawn_ = .{ .result = r.?, .callee = x.callee, .args = try regs(allocator, x.args) } }),
+    }
+}
+
+fn lowerTerm(allocator: std.mem.Allocator, lf: *lir.Func, term: mir.Terminator) !void {
+    switch (term) {
+        .br => |x| try lf.ops.append(allocator, .{ .jmp = label(x.dest) }),
+        .condbr => |x| try lf.ops.append(allocator, .{ .condjmp = .{ .cond = reg(x.cond), .then = label(x.then), .else_ = label(x.else_) } }),
+        .ret => |x| try lf.ops.append(allocator, .{ .ret = if (x) |v| reg(v) else null }),
+        // a switch lowers to a chain of condjmps in the emitter; represent structurally as a jmp to default.
+        .switch_ => |x| try lf.ops.append(allocator, .{ .jmp = label(x.default) }),
+        .unreachable_ => try lf.ops.append(allocator, .{ .ret = null }),
+    }
+}
+
+fn regs(allocator: std.mem.Allocator, vals: []const mir.Value) ![]const lir.Reg {
+    const out = try allocator.alloc(lir.Reg, vals.len);
+    for (vals, 0..) |v, i| out[i] = reg(v);
+    return out;
+}
+
+fn mapBin(op: mir.BinOp) lir.BinOp {
+    return switch (op) {
+        .add => .add, .sub => .sub, .mul => .mul, .div => .div, .mod => .mod,
+        .eq => .eq, .ne => .ne, .lt => .lt, .le => .le, .gt => .gt, .ge => .ge,
+        .bit_and => .bit_and, .bit_or => .bit_or, .bit_xor => .bit_xor, .shl => .shl, .shr => .shr,
+    };
 }

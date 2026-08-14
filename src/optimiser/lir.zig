@@ -16,11 +16,13 @@ pub const SymbolId = types.SymbolId;
 pub const Reg = enum(u32) { _ };
 pub const Label = enum(u32) { _ };
 
+pub const BinOp = enum { add, sub, mul, div, mod, eq, ne, lt, le, gt, ge, bit_and, bit_or, bit_xor, shl, shr };
+
 // A linear op. After SSA resolution these run top-to-bottom within a labelled region; control flow is
 // explicit jumps. This is intentionally close to the LLVM builder surface so lir_to_llvm is trivial.
 pub const Op = union(enum) {
     // arithmetic / memory
-    binop: struct { result: Reg, op: enum { add, sub, mul, div, mod, eq, ne, lt, le, gt, ge, bit_and, bit_or, bit_xor, shl, shr }, lhs: Reg, rhs: Reg },
+    binop: struct { result: Reg, op: BinOp, lhs: Reg, rhs: Reg },
     load: struct { result: Reg, addr: Reg },
     store: struct { addr: Reg, val: Reg },
     alloc: struct { result: Reg, ty: TypeId },
