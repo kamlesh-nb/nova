@@ -1251,6 +1251,85 @@ fn substViaOverlay(st: *typesys.TypeStore, ir: *const sema_infer.TypedIr, t: typ
     };
 }
 
+fn isIdentByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+// SE-C monomorphized-spec NAME MANGLING, overlay-primary. Replaces every type-parameter identifier token
+// in `type_str` (a rendered type spelling) with the concrete type's rendered name. The concrete comes from
+// the TypeId overlay -- paramLeafByName (recover the type-param LEAF from the active decl's names) ->
+// tp_resolve -> renderLegacy -- the SAME resolver the decision path uses, so a name and a decision can no
+// longer disagree. `current_method_subst` (the old string bindings) survives ONLY as a per-token fallback
+// for erased contexts the overlay cannot reach (a lifted lambda reifying its parent method's <T>, no
+// inst_key -- 68_generic_method_mono). NOVA_TID_CENSUS counts when that fallback is load-bearing and any
+// overlay-vs-legacy divergence, so the field's deletion can be proven, not guessed. A wrong name here is a
+// loud link error, never a UAF.
+pub fn substMethodParams(self: *LlvmCompiler, type_str: []const u8) anyerror![]const u8 {
+    const inst_opt = self.current_instantiation_id;
+    const bindings = self.current_method_subst;
+    if (inst_opt == null and bindings == null) return type_str;
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(self.allocator);
+    var replaced = false;
+    var j: usize = 0;
+    while (j < type_str.len) {
+        const at_start = j == 0 or !isIdentByte(type_str[j - 1]);
+        if (at_start and (std.ascii.isAlphabetic(type_str[j]) or type_str[j] == '_')) {
+            var e = j;
+            while (e < type_str.len and isIdentByte(type_str[e])) e += 1;
+            const tok = type_str[j..e];
+
+            var sub: ?[]const u8 = null;
+            // Overlay-primary: is this token a type-param of the active instance? Resolve it TypeId-native.
+            if (inst_opt) |inst| {
+                if (paramLeafByName(tok, inst)) |leaf| {
+                    if (self.typed_ir) |ir| {
+                        if (sema_shadow.live_store) |ls| {
+                            if (ir.tpResolve(leaf, inst)) |c| switch (ls.get(c)) {
+                                .unresolved, .type_param => {},
+                                else => sub = sema_shadow.renderLegacy(self.allocator, ls, c) catch null,
+                            };
+                        }
+                    }
+                }
+            }
+            // Per-token fallback to the legacy string binding (erased-lambda case), plus measurement.
+            if (bindings) |bs| {
+                for (bs) |b| {
+                    if (!std.mem.eql(u8, b.name, tok)) continue;
+                    if (sub == null) {
+                        sub = b.concrete;
+                        if (sema_shadow.tid_census and inst_opt != null) sema_shadow.subst_legacy_only += 1;
+                    } else if (sema_shadow.tid_census and !std.mem.eql(u8, b.concrete, sub.?)) {
+                        sema_shadow.subst_diverge += 1;
+                        const dl = @min(tok.len, sema_shadow.subst_diverge_last.len);
+                        @memcpy(sema_shadow.subst_diverge_last[0..dl], tok[0..dl]);
+                        sema_shadow.subst_diverge_last_len = dl;
+                    }
+                    break;
+                }
+            }
+
+            if (sub) |s| {
+                try out.appendSlice(self.allocator, s);
+                replaced = true;
+            } else {
+                try out.appendSlice(self.allocator, tok);
+            }
+            j = e;
+            continue;
+        }
+        try out.append(self.allocator, type_str[j]);
+        j += 1;
+    }
+    if (!replaced) {
+        out.deinit(self.allocator);
+        return type_str;
+    }
+    return out.toOwnedSlice(self.allocator);
+}
+
 fn decidedDirectly(store: *const typesys.TypeStore, t: typesys.TypeId) bool {
     return switch (store.get(t)) {
         .enum_, .type_param, .unresolved => false,

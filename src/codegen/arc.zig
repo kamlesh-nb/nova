@@ -332,36 +332,8 @@ pub fn substTypeParams(self: *LlvmCompiler, type_str: []const u8) anyerror![]con
     return try self.substMethodParams(after_struct);
 }
 
-pub fn substMethodParams(self: *LlvmCompiler, type_str: []const u8) anyerror![]const u8 {
-    const bindings = self.current_method_subst orelse return type_str;
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(self.allocator);
-    var replaced = false;
-    var j: usize = 0;
-    outer: while (j < type_str.len) {
-        const at_start = j == 0 or !isIdentCh(type_str[j - 1]);
-        if (at_start) {
-            for (bindings) |b| {
-                if (std.mem.startsWith(u8, type_str[j..], b.name)) {
-                    const end = j + b.name.len;
-                    if (end == type_str.len or !isIdentCh(type_str[end])) {
-                        try out.appendSlice(self.allocator, b.concrete);
-                        j = end;
-                        replaced = true;
-                        continue :outer;
-                    }
-                }
-            }
-        }
-        try out.append(self.allocator, type_str[j]);
-        j += 1;
-    }
-    if (!replaced) {
-        out.deinit(self.allocator);
-        return type_str;
-    }
-    return out.toOwnedSlice(self.allocator);
-}
+// substMethodParams moved to types.zig (SE-C): it is now overlay-primary (TypeId-native), with the legacy
+// string bindings kept only as a measured per-token fallback. The alias in llvm_codegen.zig points there.
 
 fn isIdentCh(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';

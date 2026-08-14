@@ -611,7 +611,7 @@ pub const LlvmCompiler = struct {
     pub const dropValueStruct = arc_mod.dropValueStruct;
     pub const substituteFieldType = arc_mod.substituteFieldType;
     pub const substTypeParams = arc_mod.substTypeParams;
-    pub const substMethodParams = arc_mod.substMethodParams;
+    pub const substMethodParams = types_mod.substMethodParams;
     pub const methodSymbol = types_mod.methodSymbol;
     pub const instantiationsOf = types_mod.instantiationsOf;
     pub const qualifySelfType = types_mod.qualifySelfType;
@@ -2934,9 +2934,12 @@ pub const LlvmCompiler = struct {
                                 const spec_name = try name_buf.toOwnedSlice(self.allocator);
 
                                 const prev_ms = self.current_method_subst;
+                                const prev_iid = self.current_instantiation_id;
                                 self.current_method_subst = subst;
+                                self.current_instantiation_id = mi.inst_key;
                                 const spec_ret = if (fn_decl.ret_type) |ret| try self.typeRefToString(ret) else "void";
                                 self.current_method_subst = prev_ms;
+                                self.current_instantiation_id = prev_iid;
 
                                 try self.functions.append(self.allocator, .{
                                     .name = spec_name,
@@ -3077,9 +3080,12 @@ pub const LlvmCompiler = struct {
                         for (fn_decl.params, 0..) |p, i| spec_params[i] = p.name;
 
                         const prev_ms = self.current_method_subst;
+                        const prev_iid2 = self.current_instantiation_id;
                         self.current_method_subst = subst;
+                        self.current_instantiation_id = fi.inst_key;
                         const spec_ret = if (fn_decl.ret_type) |ret| try self.typeRefToString(ret) else "void";
                         self.current_method_subst = prev_ms;
+                        self.current_instantiation_id = prev_iid2;
 
                         // String-engine-removal: bind this free-fn spec to its TypeId instantiation key so
                         // current_instantiation_id resolves inside its body. The sema free-fn overlay
