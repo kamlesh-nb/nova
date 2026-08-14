@@ -1,5 +1,5 @@
 const std = @import("std");
-const ast = @import("../ast.zig");
+const ast = @import("../../frontend/ast.zig");
 
 extern fn fopen(filename: [*c]const u8, modes: [*c]const u8) ?*anyopaque;
 extern fn fclose(stream: ?*anyopaque) c_int;

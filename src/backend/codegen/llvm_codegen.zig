@@ -1,7 +1,7 @@
 
 const std = @import("std");
-const ast = @import("../ast.zig");
-const sema_mono = @import("../sema/mono.zig");
+const ast = @import("../../frontend/ast.zig");
+const sema_mono = @import("../../frontend/sema/mono.zig");
 const llvm = @import("llvm");
 
 const types = llvm.types;
@@ -14,9 +14,9 @@ pub const CoverageBlock = coverage_mod.CoverageBlock;
 pub const CoverageRegistry = coverage_mod.CoverageRegistry;
 
 const types_mod = @import("types.zig");
-const sema_infer = @import("../sema/infer.zig");
-const sema_types = @import("../types.zig");
-const sema_shadow = @import("../sema/shadow.zig");
+const sema_infer = @import("../../frontend/sema/infer.zig");
+const sema_types = @import("../../frontend/types.zig");
+const sema_shadow = @import("../../frontend/sema/shadow.zig");
 const getStructBaseName = types_mod.getStructBaseName;
 const isPrimitiveTypeName = types_mod.isPrimitiveTypeName;
 const arc_mod = @import("arc.zig");
@@ -3270,7 +3270,7 @@ pub const LlvmCompiler = struct {
                         // The inst_key is a deterministic intern of .struct_{callee_fid, tids}, so it equals
                         // whatever noteFreeFnInst stored; record the overlay directly from what we computed.
                         const key = sm.store.intern(.{ .struct_ = .{ .decl = callee_fid, .args = tids } }) catch null;
-                        @import("../sema/inst_disp.zig").recordFreeFnInst(self.allocator, &sm.store, &sm.ir, self.program, callee_fd.name, callee_fid, tids, key);
+                        @import("../../frontend/sema/inst_disp.zig").recordFreeFnInst(self.allocator, &sm.store, &sm.ir, self.program, callee_fd.name, callee_fid, tids, key);
                         return true;
                     }
                     return false;

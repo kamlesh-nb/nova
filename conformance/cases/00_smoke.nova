@@ -18,7 +18,6 @@ fn test_control_flow(): void {
         i = i + 1;
     }
     assert.equalInt(sum, 10);
-
     if (sum > 5) {
         assert.isTrue(true);
     } else {

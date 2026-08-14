@@ -1,13 +1,13 @@
 const std = @import("std");
-const ast = @import("../ast.zig");
+const ast = @import("../../frontend/ast.zig");
 const llvm = @import("llvm");
 const types = llvm.types;
 const core = llvm.core;
 
 const LlvmCompiler = @import("llvm_codegen.zig").LlvmCompiler;
-const sema_shadow = @import("../sema/shadow.zig");
-const sema_infer = @import("../sema/infer.zig");
-const sema_types = @import("../types.zig");
+const sema_shadow = @import("../../frontend/sema/shadow.zig");
+const sema_infer = @import("../../frontend/sema/infer.zig");
+const sema_types = @import("../../frontend/types.zig");
 const types_mod = @import("types.zig");
 const getStructBaseName = @import("types.zig").getStructBaseName;
 const namesExistingOwner = @import("arc.zig").namesExistingOwner;

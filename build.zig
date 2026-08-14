@@ -137,13 +137,13 @@ fn configureLlvmLink(b: *std.Build, m: *std.Build.Module, static: bool, os_tag: 
 // (`…-native/`) has only lib/; headers come from the original drop's include/.
 const llvm_headers_prefix = "/Users/kamlesh/LLVM-22.1.0-macOS-ARM64";
 
-// Compile src/linker/lld_link.cpp into `m` and link the native liblld*.a so
+// Compile src/backend/linker/lld_link.cpp into `m` and link the native liblld*.a so
 // nova can call lld::{macho,wasm,elf}::link() in-process. Requires the static
 // LLVM link (configureLlvmLink) to already be on the same module tree.
 fn addInprocessLld(b: *std.Build, m: *std.Build.Module) void {
     const headers = b.graph.environ_map.get("NOVA_LLVM_HEADERS") orelse llvm_headers_prefix;
     m.addCSourceFile(.{
-        .file = b.path("src/linker/lld_link.cpp"),
+        .file = b.path("src/backend/linker/lld_link.cpp"),
         .flags = &.{
             "-std=c++20", "-fno-rtti",
             b.fmt("-I{s}/include", .{headers}),
@@ -477,7 +477,7 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile, target: std.Build
             \\$ErrorActionPreference = "Stop"
             \\New-Item -ItemType Directory -Force -Path "{[bin]s}","{[std]s}","{[home]s}/.nova/src/runtime","{[home]s}/.nova/deps","{[home]s}/.nova/lib" | Out-Null
             \\Copy-Item -Force zig-out/bin/nova.exe "{[bin]s}/nova.exe"
-            \\Copy-Item -Recurse -Force src/std/* "{[std]s}/"
+            \\Copy-Item -Recurse -Force src/lib/std/* "{[std]s}/"
             \\Copy-Item -Recurse -Force src/runtime/* "{[home]s}/.nova/src/runtime/"
             \\Copy-Item -Recurse -Force deps/* "{[home]s}/.nova/deps/"
             \\Write-Host "Building libnovacore.a (Windows; reactor runtime + Win32 syscall shims) ..."
@@ -502,7 +502,7 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile, target: std.Build
         \\mkdir -p "{[home]s}/.nova/deps"
         \\mkdir -p "{[home]s}/.nova/lib"
         \\cp zig-out/bin/nova "{[bin]s}/nova"
-        \\rsync -a --exclude=".git" src/std/ "{[std]s}/"
+        \\rsync -a --exclude=".git" src/lib/std/ "{[std]s}/"
         \\rsync -a --exclude=".git" src/runtime/ "{[home]s}/.nova/src/runtime/"
         \\# W1: build the vendored webview static lib once (FFI `extern("webview")`). macOS
         \\# Cocoa/WKWebView backend (Objective-C++). Built BEFORE the deps rsync so the fresh

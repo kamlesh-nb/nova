@@ -28,3 +28,6 @@ __nova_test.pdb
 
 # Debug dump of the merged front-end source (NOVA_DUMP_MERGED=1); never part of the build
 merged.nova
+
+# Claude Code session worktrees/artifacts
+.claude/

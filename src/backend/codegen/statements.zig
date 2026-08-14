@@ -1,9 +1,9 @@
 const std = @import("std");
-const ast = @import("../ast.zig");
+const ast = @import("../../frontend/ast.zig");
 const llvm = @import("llvm");
 const types = llvm.types;
 const core = llvm.core;
-const sema_types = @import("../types.zig");
+const sema_types = @import("../../frontend/types.zig");
 
 const getStructBaseName = @import("types.zig").getStructBaseName;
 const LlvmCompiler = @import("llvm_codegen.zig").LlvmCompiler;

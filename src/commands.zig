@@ -251,10 +251,10 @@ fn appendWolfsslLink(args: *std.ArrayList([]const u8), allocator: std.mem.Alloca
     _ = io;
 }
 
-const lexer = @import("lexer.zig");
-const parser = @import("parser.zig");
-const llvm_codegen = @import("codegen/llvm_codegen.zig");
-const codegen_arc = @import("codegen/arc.zig");
+const lexer = @import("frontend/lexer.zig");
+const parser = @import("frontend/parser.zig");
+const llvm_codegen = @import("backend/codegen/llvm_codegen.zig");
+const codegen_arc = @import("backend/codegen/arc.zig");
 
 // M-1 value-type structs: configure the per-type rollout gate from the environment.
 //   NOVA_VALUE_STRUCTS_ALL -> every is_reference==false struct is value-lowered.
@@ -281,15 +281,15 @@ fn configureValueStructs(allocator: std.mem.Allocator, environ: anytype) void {
     }
 }
 
-const type_checker = @import("type_checker.zig");
-const sema_shadow = @import("sema/shadow.zig");
-const sema_escape = @import("sema/escape.zig");
-const sema_alpha = @import("sema/alpha.zig");
-const sema_ids = @import("sema/ids.zig");
-const sema_mod = @import("sema/sema.zig");
-const sema_mono = @import("sema/mono.zig");
-const ast = @import("ast.zig");
-const formatter = @import("formatter.zig");
+const type_checker = @import("frontend/type_checker.zig");
+const sema_shadow = @import("frontend/sema/shadow.zig");
+const sema_escape = @import("frontend/sema/escape.zig");
+const sema_alpha = @import("frontend/sema/alpha.zig");
+const sema_ids = @import("frontend/sema/ids.zig");
+const sema_mod = @import("frontend/sema/sema.zig");
+const sema_mono = @import("frontend/sema/mono.zig");
+const ast = @import("frontend/ast.zig");
+const formatter = @import("frontend/formatter.zig");
 
 const templates = @import("templates.zig");
 
@@ -2569,9 +2569,9 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
 
         if (wl.instIds(allocator) catch null) |ids| {
             defer allocator.free(ids);
-            @import("sema/inst_disp.zig").run(allocator, &owned_sema.store, &owned_sema.tab, &owned_sema.ir, ids);
-            @import("sema/inst_disp.zig").runFreeFns(allocator, &owned_sema.store, &owned_sema.ir, program);
-            @import("sema/inst_disp.zig").runMethods(allocator, &owned_sema.store, &owned_sema.tab, &owned_sema.ir);
+            @import("frontend/sema/inst_disp.zig").run(allocator, &owned_sema.store, &owned_sema.tab, &owned_sema.ir, ids);
+            @import("frontend/sema/inst_disp.zig").runFreeFns(allocator, &owned_sema.store, &owned_sema.ir, program);
+            @import("frontend/sema/inst_disp.zig").runMethods(allocator, &owned_sema.store, &owned_sema.tab, &owned_sema.ir);
         }
     }
 
@@ -2867,9 +2867,9 @@ fn compileProgram(
 
         if (wl.instIds(allocator) catch null) |ids| {
             defer allocator.free(ids);
-            @import("sema/inst_disp.zig").run(allocator, &owned_sema.store, &owned_sema.tab, &owned_sema.ir, ids);
-            @import("sema/inst_disp.zig").runFreeFns(allocator, &owned_sema.store, &owned_sema.ir, program);
-            @import("sema/inst_disp.zig").runMethods(allocator, &owned_sema.store, &owned_sema.tab, &owned_sema.ir);
+            @import("frontend/sema/inst_disp.zig").run(allocator, &owned_sema.store, &owned_sema.tab, &owned_sema.ir, ids);
+            @import("frontend/sema/inst_disp.zig").runFreeFns(allocator, &owned_sema.store, &owned_sema.ir, program);
+            @import("frontend/sema/inst_disp.zig").runMethods(allocator, &owned_sema.store, &owned_sema.tab, &owned_sema.ir);
         }
     }
 
