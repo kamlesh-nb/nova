@@ -165,3 +165,33 @@ convert the two reify sites to `concreteTidForTypeRef` + `symbolName`; then dele
 assignments. This batch is high-risk (it touches spec return-type mangling, a core mono path that
 breaks corpus-wide if wrong, and interacts with the struct-T substitution `substituteFieldType` via
 `current_instantiation`), so it must land as one change under the full `--asan` gate.
+
+### DONE: the method-U string engine is deleted (2026-08-14)
+
+`substMethodParams` is now TypeId-native (overlay only): each type-parameter token is resolved via
+`paramLeafByName` + `tp_resolve` + `renderLegacy`. Enablers, each proven before deletion:
+`current_instantiation_id` is set in the method + free-fn spec loops (so the overlay is live when spec
+return-types render); a lifted lambda inherits its parent's `inst_key`
+(`current_collecting_instantiation_id`), closing the one erased-lambda case (`68_generic_method_mono`)
+the overlay previously could not reach; closure keys discriminate by `inst_key` (which encodes both the
+receiver struct-T and the method `<U>`) instead of the `method_subst` signature, with registration and
+lookup deriving the id identically; the two serde-reify sites use `concreteTidForTypeRef` + `symbolName`.
+
+**Proof, not a guess:** a full-corpus `NOVA_TID_CENSUS` sweep showed the legacy string bindings were
+never the sole resolver and never diverged from the overlay (`legacy_only=0`, `diverge=0`) on every
+case, including `68`. Then **deleted**: `current_method_subst`, `MethodParamBinding`, the `method_subst`
+FunctionInfo field, `current_collecting_method_subst`, all spec-loop `subst` allocations, and the
+`arc.zig` save/restore bookkeeping. Gate: full plain corpus 340/341 AND `--asan` 340/341 (only
+off-platform `189`), zero ASAN errors.
+
+**What remains (NOT a decision, so not the hazard):** the struct-T path, `substTypeParams` ->
+`substituteFieldType` (string) -> `substMethodParams` (now TypeId-native). It is used ONLY for NAME
+rendering, the dev-only `NOVA_SEMA_SHADOW` report (`tdShadowDiff`/`isOwnedRenderedFallback`/
+`legacyStringOwnership`), and a `live_sema`-null fallback destructor -- no live type DECISION rides on
+it. A measured attempt to fold `substituteFieldType` into the overlay diverged on 292/341 cases: the
+overlay cannot resolve struct-T wherever `current_instantiation` (string) is set but
+`current_instantiation_id` (TypeId) is not (the string destructor path, various name-render contexts).
+So the struct-T name path stays until `current_instantiation_id` is threaded everywhere
+`current_instantiation` is -- a broader migration (P2/task #171), loud-failure (a wrong name is a link
+error), not a corruption risk. **The string engine is decision-free; the maintainer hazard
+(ownership/boxing by spelling) is gone.**

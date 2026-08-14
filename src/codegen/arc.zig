@@ -324,7 +324,12 @@ pub fn substituteFieldType(self: *LlvmCompiler, inst_name: []const u8, field_typ
 }
 
 pub fn substTypeParams(self: *LlvmCompiler, type_str: []const u8) anyerror![]const u8 {
-
+    // Struct-T name resolution: substituteFieldType (string) then substMethodParams (now TypeId-native for
+    // the method <U>). The struct-T string path stays load-bearing for NAME rendering wherever
+    // current_instantiation is set but current_instantiation_id is not (measured: it diverges from the
+    // overlay across the corpus, so it is NOT redundant yet). No type DECISION rides on it -- the method-U
+    // decision engine was the deletable hazard, and that is gone. Fully retiring this needs
+    // current_instantiation_id threaded everywhere current_instantiation is (a broader migration).
     const after_struct = if (self.current_instantiation) |inst|
         try self.substituteFieldType(inst, type_str)
     else
