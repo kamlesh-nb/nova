@@ -11,7 +11,24 @@ fixed**. What actually remains is a small set of **checker fail-open** holes (th
 ill-typed programs), **one codegen crash** (indexing a non-indexable type), one **stdlib correctness**
 gap (JSON on malformed input), and one **unsupported syntax** form (tuple `.0`).
 
-## LIVE defects (the exact scope to fix)
+## STATUS: all five RESOLVED (2026-08-14)
+
+Every LIVE defect below has since been fixed, each gated by the full corpus (and an `expect_fail`
+regression for the checker rejections):
+- **L1 (K6)** — FIXED (`0ca999b`). Checker rejects `[]` on a scalar/struct/enum (fail-closed); guard
+  `expect_fail/index_non_indexable`. Known follow-up: the inferred `let p = P{...}; p[0]` case needs the
+  separate privacy-model fix (see the detail note below).
+- **L2 (C-chk-6)** — FIXED (`8a4a63f`). Optional-where-plain now rejected at let-binding and argument
+  positions, and a narrowing is invalidated on reassignment; guards `assign_optional_to_plain`,
+  `pass_optional_to_plain_param`.
+- **L3 (C-chk-7)** — FIXED (`3f81640`). Tuple destructure arity checked + elements bound; guard
+  `tuple_destructure_arity`.
+- **L4 (E7)** — FIXED (`b35bc71`). `json.tryParse` returns `undefined` on malformed input; case 335.
+- **L5 (K8 `.0`)** — FIXED (`31f3c47`). `tuple.N` desugars to `tuple[N]`; case 336.
+
+The original analysis is preserved below.
+
+## LIVE defects (the exact scope to fix) [now all RESOLVED — see status above]
 
 | ID | Class | Severity | One line |
 |---|---|---|---|
