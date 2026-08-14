@@ -19,6 +19,7 @@ const sema_ids = @import("frontend/sema/ids.zig");
 const sema_mod = @import("frontend/sema/sema.zig");
 const sema_mono = @import("frontend/sema/mono.zig");
 const pipeline = @import("pipeline.zig");
+const packages = @import("packages.zig");
 
 
 fn collectTestFunctions(declarations: []const ast.Declaration, allocator: std.mem.Allocator) ![][]const u8 {
@@ -84,6 +85,9 @@ fn generateTestHarness(test_fn_names: []const []const u8, allocator: std.mem.All
 }
 
 pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const []const u8) !void {
+    // Auto-fetch: clone any project.json dependency missing from the package cache before compiling.
+    // Silent when there is no project.json (a bare `nova test <file>`).
+    try packages.ensureDependencies(allocator, init);
 
     var file_path: []const u8 = "";
     var target: []const u8 = "--native";

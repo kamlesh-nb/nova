@@ -64,6 +64,39 @@ fn cloneIntoCache(allocator: std.mem.Allocator, init: std.process.Init, git_url:
     return true;
 }
 
+// Auto-fetch dependencies before a build/test. Read project.json and, for every declared dependency
+// not already in the package cache (~/.nova/cache/<repo>), clone it (the same path `nova get` uses).
+// This makes `git clone <app> && nova build` just work. Deliberately quiet and non-fatal in the common
+// cases: it returns silently when there is no project.json (a bare-file compile) and prints nothing when
+// every dependency is already cached, so a normal build sees no extra output. A clone failure IS fatal
+// (the build would fail on the missing import anyway, with a worse message).
+pub fn ensureDependencies(allocator: std.mem.Allocator, init: std.process.Init) !void {
+    const json_data = Io.Dir.readFileAlloc(.cwd(), init.io, "project.json", allocator, .unlimited) catch return;
+    defer allocator.free(json_data);
+
+    var parsed = std.json.parseFromSlice(pipeline.ProjectJson, allocator, json_data, .{ .ignore_unknown_fields = true }) catch return;
+    defer parsed.deinit();
+    if (parsed.value.dependencies.len == 0) return;
+
+    const home_path = init.environ_map.get("HOME") orelse init.environ_map.get("USERPROFILE") orelse "/";
+    var fetched: usize = 0;
+    for (parsed.value.dependencies) |dep| {
+        const repo_name = repoNameFromUrl(dep) orelse continue;
+        const cache_dir = try std.fs.path.join(allocator, &[_][]const u8{ home_path, ".nova", "cache", repo_name });
+        defer allocator.free(cache_dir);
+        // Already cached? Nothing to do (stay silent -- the normal case on every build).
+        if (Io.Dir.access(.cwd(), init.io, cache_dir, .{})) |_| continue else |_| {}
+
+        std.debug.print("[deps] {s} not in cache; fetching...\n", .{repo_name});
+        _ = cloneIntoCache(allocator, init, dep) catch |err| {
+            std.debug.print("[deps] failed to fetch {s}: {any}\n", .{ repo_name, err });
+            return err;
+        };
+        fetched += 1;
+    }
+    if (fetched > 0) std.debug.print("[deps] fetched {d} missing dependenc{s}.\n", .{ fetched, if (fetched == 1) "y" else "ies" });
+}
+
 pub fn cmdRestore(allocator: std.mem.Allocator, init: std.process.Init) !void {
     const json_data = Io.Dir.readFileAlloc(.cwd(), init.io, "project.json", allocator, .unlimited) catch {
         std.debug.print("Error: project.json not found. Run 'nova init' first.\n", .{});

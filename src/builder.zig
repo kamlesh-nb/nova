@@ -19,6 +19,7 @@ const sema_ids = @import("frontend/sema/ids.zig");
 const sema_mod = @import("frontend/sema/sema.zig");
 const sema_mono = @import("frontend/sema/mono.zig");
 const pipeline = @import("pipeline.zig");
+const packages = @import("packages.zig");
 
 
 fn compileProgram(
@@ -351,6 +352,10 @@ fn compileProgram(
 // cmdBuild: the `nova build ...` and bare `nova <file> ...` path (arg parsing + watch + compile).
 // Extracted verbatim from the tail of the former mainInner; cli.run dispatches here for both forms.
 pub fn cmdBuild(allocator: std.mem.Allocator, init: std.process.Init, args: []const []const u8) !void {
+    // Auto-fetch: clone any project.json dependency missing from the package cache before compiling, so
+    // a freshly cloned app builds without a manual `nova get`. Silent when there is no project.json.
+    try packages.ensureDependencies(allocator, init);
+
     var file_path: []const u8 = "";
 
     var target: []const u8 = "--native";
