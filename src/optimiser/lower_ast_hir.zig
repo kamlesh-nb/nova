@@ -118,10 +118,78 @@ fn lowerExpr(allocator: std.mem.Allocator, func: *hir.Func, expr: ast.Expression
             const operand = try lowerExpr(allocator, func, aw.operand.*);
             break :blk func.add(allocator, .{ .kind = .{ .await_ = operand }, .span = span });
         },
-        // struct_init, generic_call, if_expr, closure, template, try/catch, cast, optional-chaining,
-        // nullish-coalesce, tuple, range, enum_init, jsx, go: later checkpoints. Mark for coverage.
+        .go_expr => |aw| blk: {
+            const operand = try lowerExpr(allocator, func, aw.operand.*);
+            break :blk func.add(allocator, .{ .kind = .{ .spawn_ = operand }, .span = span });
+        },
+        .cast => |c| blk: {
+            const operand = try lowerExpr(allocator, func, c.expr.*);
+            break :blk func.add(allocator, .{ .kind = .{ .cast = operand }, .span = span });
+        },
+        .if_expr => |ie| blk: {
+            const cond = try lowerExpr(allocator, func, ie.condition.*);
+            const then_v = try lowerExpr(allocator, func, ie.then_branch.*);
+            const else_v = try lowerExpr(allocator, func, ie.else_branch.*);
+            break :blk func.add(allocator, .{ .kind = .{ .if_expr = .{ .cond = cond, .then = then_v, .else_ = else_v } }, .span = span });
+        },
+        .nullish_coalesce => |nc| blk: {
+            const lhs = try lowerExpr(allocator, func, nc.left.*);
+            const rhs = try lowerExpr(allocator, func, nc.right.*);
+            break :blk func.add(allocator, .{ .kind = .{ .nullish = .{ .lhs = lhs, .rhs = rhs } }, .span = span });
+        },
+        .optional_chaining => |oc| blk: {
+            const object = try lowerExpr(allocator, func, oc.object.*);
+            break :blk func.add(allocator, .{ .kind = .{ .optional_chain = .{ .object = object, .name = oc.field } }, .span = span });
+        },
+        .generic_call => |gc| blk: {
+            const callee = try lowerExpr(allocator, func, gc.callee.*);
+            const owned = try lowerExprSlice(allocator, func, gc.args);
+            break :blk func.add(allocator, .{ .kind = .{ .generic_call = .{ .callee = callee, .args = owned } }, .span = span });
+        },
+        .struct_init => |si| blk: {
+            const owned = try lowerFieldSlice(allocator, func, si.fields);
+            break :blk func.add(allocator, .{ .kind = .{ .struct_init = .{ .type_name = si.type_name, .fields = owned } }, .span = span });
+        },
+        .enum_init => |ei| blk: {
+            const owned = try lowerFieldSlice(allocator, func, ei.fields);
+            break :blk func.add(allocator, .{ .kind = .{ .enum_init = .{ .name = ei.enum_name, .variant = ei.variant, .fields = owned } }, .span = span });
+        },
+        .tuple => |elems| blk: {
+            const owned = try lowerExprSlice(allocator, func, elems);
+            break :blk func.add(allocator, .{ .kind = .{ .tuple = owned }, .span = span });
+        },
+        .template_expr => |te| blk: {
+            const owned = try lowerExprSlice(allocator, func, te.parts);
+            break :blk func.add(allocator, .{ .kind = .{ .template = owned }, .span = span });
+        },
+        .range => |r| blk: {
+            const start = try lowerExpr(allocator, func, r.start.*);
+            const end = try lowerExpr(allocator, func, r.end.*);
+            break :blk func.add(allocator, .{ .kind = .{ .range = .{ .start = start, .end = end, .inclusive = r.inclusive } }, .span = span });
+        },
+        .try_expr => |inner| blk: {
+            const operand = try lowerExpr(allocator, func, inner.*);
+            break :blk func.add(allocator, .{ .kind = .{ .try_ = operand }, .span = span });
+        },
+        // closure bodies are lifted by the backend; represent as an opaque node so the tree stays whole.
+        .closure => func.add(allocator, .{ .kind = .{ .closure = .{ .body = HirId.none } }, .span = span }),
+        // catch_expr, jsx_element: later checkpoints. Mark for coverage.
         else => func.add(allocator, .{ .kind = .{ .unsupported = @tagName(expr.kind) }, .span = span }),
     };
+}
+
+fn lowerExprSlice(allocator: std.mem.Allocator, func: *hir.Func, exprs: []const ast.Expression) ![]const HirId {
+    var out = std.ArrayListUnmanaged(HirId).empty;
+    defer out.deinit(allocator);
+    for (exprs) |e| try out.append(allocator, try lowerExpr(allocator, func, e));
+    return allocator.dupe(HirId, out.items);
+}
+
+fn lowerFieldSlice(allocator: std.mem.Allocator, func: *hir.Func, fields: []const ast.ObjectFieldInit) ![]const HirId {
+    var out = std.ArrayListUnmanaged(HirId).empty;
+    defer out.deinit(allocator);
+    for (fields) |f| try out.append(allocator, try lowerExpr(allocator, func, f.value));
+    return allocator.dupe(HirId, out.items);
 }
 
 fn mapBinOp(op: ast.BinaryOp) hir.BinOp {

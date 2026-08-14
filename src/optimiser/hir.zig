@@ -53,6 +53,20 @@ pub const Node = struct {
         unop: struct { op: UnOp, operand: HirId },
         // calls
         call: struct { callee: HirId, args: []const HirId },
+        generic_call: struct { callee: HirId, args: []const HirId }, // type_args resolved via TypeId later
+        // aggregates
+        struct_init: struct { type_name: []const u8, fields: []const HirId },
+        enum_init: struct { name: []const u8, variant: []const u8, fields: []const HirId },
+        tuple: []const HirId,
+        // desugar targets that keep a value
+        if_expr: struct { cond: HirId, then: HirId, else_: HirId },
+        nullish: struct { lhs: HirId, rhs: HirId }, // a ?? b
+        optional_chain: struct { object: HirId, name: []const u8 },
+        template: []const HirId,
+        range: struct { start: HirId, end: HirId, inclusive: bool },
+        cast: HirId, // operand; target type carried in .ty once threaded
+        closure: struct { body: HirId }, // lifted separately by the backend; opaque body ref for now
+        try_: HirId,
         // ARC (made explicit as ownership threading lands)
         retain: HirId,
         release: HirId,

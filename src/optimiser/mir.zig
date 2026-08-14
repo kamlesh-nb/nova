@@ -74,4 +74,38 @@ pub const Func = struct {
     pub fn typeOf(self: *const Func, v: Value) TypeId {
         return self.value_types.items[@intFromEnum(v)];
     }
+
+    // --- builder helpers ---
+
+    pub fn newValue(self: *Func, allocator: std.mem.Allocator, ty: TypeId) !Value {
+        const v: Value = @enumFromInt(self.value_types.items.len);
+        try self.value_types.append(allocator, ty);
+        return v;
+    }
+
+    pub fn newBlock(self: *Func, allocator: std.mem.Allocator) !Block {
+        const b: Block = @enumFromInt(self.blocks.items.len);
+        try self.blocks.append(allocator, .{});
+        return b;
+    }
+
+    pub fn block(self: *Func, b: Block) *BasicBlock {
+        return &self.blocks.items[@intFromEnum(b)];
+    }
+
+    // Append a value-producing instruction to block `b`; returns its result Value.
+    pub fn emit(self: *Func, allocator: std.mem.Allocator, b: Block, ty: TypeId, op: Inst.Op) !Value {
+        const v = try self.newValue(allocator, ty);
+        try self.blocks.items[@intFromEnum(b)].insts.append(allocator, .{ .result = v, .ty = ty, .op = op });
+        return v;
+    }
+
+    // Append a value-less instruction (store, release, ...) to block `b`.
+    pub fn emitVoid(self: *Func, allocator: std.mem.Allocator, b: Block, op: Inst.Op) !void {
+        try self.blocks.items[@intFromEnum(b)].insts.append(allocator, .{ .result = .invalid, .ty = @enumFromInt(0), .op = op });
+    }
+
+    pub fn setTerm(self: *Func, b: Block, term: Terminator) void {
+        self.blocks.items[@intFromEnum(b)].term = term;
+    }
 };

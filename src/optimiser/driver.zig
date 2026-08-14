@@ -50,6 +50,10 @@ pub const Coverage = struct {
     funcs: usize = 0,
     nodes: usize = 0,
     unsupported: usize = 0,
+    mir_blocks: usize = 0,
+    mir_insts: usize = 0,
+    verify_errors: usize = 0,
+    insts_removed: usize = 0, // by the optimiser pipeline (mem2reg/constfold/dce/...)
 };
 
 // M1a shadow: lower every function in the program AST->HIR and report coverage. Does NOT emit; the AST
@@ -69,9 +73,10 @@ pub fn lowerProgramShadow(allocator: std.mem.Allocator, program: ast.Program, ve
         }
     }
 
-    std.debug.print("[opt] AST->HIR shadow: {d} functions, {d} HIR nodes, {d} unsupported ({d:.1}% covered)\n", .{
+    std.debug.print("[opt] AST->HIR->MIR shadow: {d} fns, {d} HIR nodes ({d} unsupported, {d:.1}% covered), {d} MIR blocks, {d} MIR insts, {d} verify errors, {d} insts removed by opt\n", .{
         cov.funcs, cov.nodes, cov.unsupported,
         if (cov.nodes == 0) @as(f64, 100.0) else 100.0 * @as(f64, @floatFromInt(cov.nodes - cov.unsupported)) / @as(f64, @floatFromInt(cov.nodes)),
+        cov.mir_blocks, cov.mir_insts, cov.verify_errors, cov.insts_removed,
     });
     if (verbose) {
         var it = unsupported_by_tag.iterator();
@@ -82,17 +87,42 @@ pub fn lowerProgramShadow(allocator: std.mem.Allocator, program: ast.Program, ve
 
 fn lowerOneShadow(allocator: std.mem.Allocator, fd: ast.FunctionDecl, cov: *Coverage, hist: *std.StringHashMap(usize)) !void {
     if (fd.extern_lib != null) return; // no body to lower
-    var func = try lower_ast_hir.lowerFunc(allocator, fd, null);
-    defer func.deinit(allocator);
+
+    // AST -> HIR
+    var hfunc = try lower_ast_hir.lowerFunc(allocator, fd, null);
+    defer hfunc.deinit(allocator);
     cov.funcs += 1;
-    cov.nodes += func.nodes.items.len;
-    for (func.nodes.items) |node| {
+    cov.nodes += hfunc.nodes.items.len;
+    for (hfunc.nodes.items) |node| {
         if (node.kind == .unsupported) {
             cov.unsupported += 1;
             const gop = try hist.getOrPut(node.kind.unsupported);
             gop.value_ptr.* = (if (gop.found_existing) gop.value_ptr.* else 0) + 1;
         }
     }
+
+    // HIR -> MIR
+    var mfunc = try lower_hir_mir.lowerFunc(allocator, hfunc);
+    defer mfunc.deinit(allocator);
+    cov.mir_blocks += mfunc.blocks.items.len;
+    const before = countInsts(&mfunc);
+    cov.mir_insts += before;
+
+    // Verify the structural MIR (M2).
+    const violations = try verify.verify(allocator, &mfunc);
+    defer allocator.free(violations);
+    cov.verify_errors += violations.len;
+
+    // Run the optimiser pipeline (M3/M4) and measure what it removed.
+    _ = optimise(allocator, &mfunc) catch 0;
+    const after = countInsts(&mfunc);
+    if (before > after) cov.insts_removed += before - after;
+}
+
+fn countInsts(mf: *const mir.Func) usize {
+    var n: usize = 0;
+    for (mf.blocks.items) |b| n += b.insts.items.len;
+    return n;
 }
 
 pub const enabled: bool = false;
