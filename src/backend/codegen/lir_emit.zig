@@ -47,39 +47,55 @@ fn reject(comptime why: []const u8) bool {
 }
 
 fn tryEmitInner(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, func: anytype) !bool {
-    if (func.param_count != 0) return reject("has params");
     const ir = compiler.typed_ir; // may be null; lowering still works, just fewer types
 
-    // AST -> HIR for this function body.
+    // Parameters. `func.params` is populated only for FREE functions (methods leave it empty because their
+    // implicit `self` shifts the LLVM argument indices), so `params.len != param_count` means a method or an
+    // otherwise-unmodelled signature -> fall back. Every param must be a signed int / bool primitive: those
+    // flow as the i64 word (declarations.zig gives every non-array param val_type), which is exactly what
+    // LLVMGetParam yields and what the emitter treats values as. Anything else (arrays -> ptr, structs,
+    // strings, floats, unsigned) is rejected.
+    if (func.params.len != func.param_count) return reject("param count mismatch (method/self?)");
+    if (func.params.len > 16) return reject("too many params");
+    var ptbuf: [16]mir.TypeId = undefined;
+    for (func.params, 0..) |p, i| {
+        const tr = p.type_name orelse return reject("untyped param");
+        const ptid = compiler.concreteTidForTypeRef(tr) orelse return reject("unresolved param type");
+        const pk = intKindForTid(compiler, ptid) orelse return reject("non-int/bool param");
+        if (!pk.signed and !pk.is_bool) return reject("unsigned param");
+        ptbuf[i] = ptid;
+    }
+    const param_types = ptbuf[0..func.params.len];
+
+    // AST -> HIR for this function body (params modelled as `let name = param(i)`).
     const fd = ast.FunctionDecl{
         .name = func.name,
-        .params = &.{},
+        .params = @constCast(func.params), // lowerFunc only reads params; FunctionDecl declares them mutable
         .ret_type = func.ret_type_ref,
         .body = func.body,
         .is_exported = false,
         .attributes = &.{},
         .span = func.body.span,
     };
-    var hfunc = try lower_ast_hir.lowerFunc(compiler.allocator, fd, ir);
+    var hfunc = try lower_ast_hir.lowerFuncTyped(compiler.allocator, fd, ir, param_types);
     defer hfunc.deinit(compiler.allocator);
     if (!hirEmittable(&hfunc)) return reject("non-emittable HIR node");
 
-    // HIR -> MIR, then run the optimiser pipeline. Emittable HIR has no ARC ops, calls, or control flow,
-    // so the MIR is a single straight-line block and the only value-computing pass that can fire is
-    // constfold, which is now width-honest (wraps folded ints to the result type's width via the store, so
-    // it matches codegen's canonicalizeInt) -- see passes/constfold.zig. mem2reg/copyprop/dce/simplifycfg
-    // are structural and do not change computed values. The store must be set for constfold's width lookup.
+    // HIR -> MIR, then run the optimiser pipeline. The only value-computing pass that can fire on this
+    // subset is constfold, which is width-honest (wraps folded ints to the result type's width via the
+    // store, matching codegen's canonicalizeInt) -- see passes/constfold.zig. mem2reg/copyprop/dce/
+    // simplifycfg are structural and do not change computed values. The store must be set for constfold's
+    // width lookup.
     mir.type_store = compiler.type_store;
     var mfunc = try lower_hir_mir.lowerFunc(compiler.allocator, hfunc);
     defer mfunc.deinit(compiler.allocator);
-    if (mfunc.blocks.items.len != 1) return reject("multi-block MIR");
     _ = opt_driver.optimise(compiler.allocator, &mfunc) catch return reject("optimise failed");
-    if (mfunc.blocks.items.len != 1) return reject("multi-block after opt");
 
-    // Validate the whole function BEFORE emitting any IR (a mid-stream reject would corrupt the entry block).
+    // Validate the whole function BEFORE emitting any IR (a mid-stream reject would corrupt a block).
     if (!mirEmittable(compiler, &mfunc)) return reject("MIR outside emittable subset");
 
-    try emitStraightLine(compiler, fn_val, &mfunc);
+    const entry_bb = core.LLVMGetInsertBlock(compiler.builder);
+    try emitFunc(compiler, fn_val, &mfunc, entry_bb);
     if (emit_verbose) std.debug.print("[opt-emit] emitted fn `{s}` via LIR path\n", .{func.name});
     return true;
 }
@@ -90,10 +106,12 @@ fn tryEmitInner(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, func: anyty
 fn hirEmittable(hf: *const hir.Func) bool {
     for (hf.nodes.items) |node| {
         switch (node.kind) {
-            .int, .bool, .ident, .binop, .unop, .let, .assign, .ret, .block => {},
+            .int, .bool, .param, .ident, .binop, .unop, .let, .assign, .ret, .block,
+            // control flow (M6-B): the MIR CFG + emitFunc handle these; if_expr lowers through a result slot
+            .if_, .loop_, .if_expr, .brk, .cont => {},
             else => {
                 if (emit_verbose) std.debug.print("[opt-emit]   non-emittable node: {s}\n", .{@tagName(node.kind)});
-                return false; // str/float/null/call/if_/loop_/struct_init/cast/... -> fall back
+                return false; // str/float/null/call/struct_init/cast/... -> fall back
             },
         }
     }
@@ -126,90 +144,121 @@ fn intKindForTid(compiler: *LlvmCompiler, tid: mir.TypeId) ?IntKind {
     };
 }
 
-// Dry validation: return false if any instruction is outside the emittable subset, building NO IR. This
-// MUST run before emitStraightLine touches the builder -- otherwise a mid-stream reject would leave a
-// half-emitted entry block that the AST fallback then double-fills. Only binop and cast can reject (const/
-// alloc/load/store are always emittable), so those are the two gates mirrored here. Keep in sync with
-// emitBinop / the cast arm below.
+// Dry validation: return false if any instruction OR terminator is outside the emittable subset, building
+// NO IR. This MUST run before emitFunc touches the builder -- otherwise a mid-stream reject would leave a
+// half-emitted block that the AST fallback then double-fills. Keep the per-op gates in sync with emitBinop /
+// the cast arm, and the terminator gates in sync with emitFunc.
 fn mirEmittable(compiler: *LlvmCompiler, mf: *const mir.Func) bool {
-    const b = &mf.blocks.items[0];
-    for (b.insts.items) |inst| {
-        switch (inst.op) {
-            .binop => |x| {
-                const lk = intKindForTid(compiler, mf.typeOf(x.lhs)) orelse return false;
-                const rk = intKindForTid(compiler, mf.typeOf(x.rhs)) orelse return false;
-                switch (x.op) {
-                    .div, .mod, .shr => return false,
-                    .add, .sub, .mul, .shl => {
-                        if (!lk.signed or !rk.signed or lk.is_bool or rk.is_bool) return false;
-                        const rez = intKindForTid(compiler, inst.ty) orelse return false;
-                        if (rez.is_bool) return false;
-                    },
-                    .bit_and, .bit_or, .bit_xor => {
-                        if ((!lk.signed and !lk.is_bool) or (!rk.signed and !rk.is_bool)) return false;
-                    },
-                    .eq, .ne, .lt, .le, .gt, .ge => {
-                        const ordering = (x.op == .lt or x.op == .le or x.op == .gt or x.op == .ge);
-                        if (ordering and (!lk.signed or !rk.signed or lk.is_bool or rk.is_bool)) return false;
-                        if (!ordering and ((!lk.signed and !lk.is_bool) or (!rk.signed and !rk.is_bool))) return false;
-                    },
-                }
-            },
-            .cast => if (intKindForTid(compiler, inst.ty) == null) return false,
-            .const_int, .alloc, .load, .store => {},
-            else => return false, // filtered by hirEmittable, but stay safe
+    for (mf.blocks.items) |*b| {
+        for (b.insts.items) |inst| {
+            switch (inst.op) {
+                .binop => |x| {
+                    const lk = intKindForTid(compiler, mf.typeOf(x.lhs)) orelse return false;
+                    const rk = intKindForTid(compiler, mf.typeOf(x.rhs)) orelse return false;
+                    switch (x.op) {
+                        .div, .mod, .shr => return false,
+                        .add, .sub, .mul, .shl => {
+                            if (!lk.signed or !rk.signed or lk.is_bool or rk.is_bool) return false;
+                            const rez = intKindForTid(compiler, inst.ty) orelse return false;
+                            if (rez.is_bool) return false;
+                        },
+                        .bit_and, .bit_or, .bit_xor => {
+                            if ((!lk.signed and !lk.is_bool) or (!rk.signed and !rk.is_bool)) return false;
+                        },
+                        .eq, .ne, .lt, .le, .gt, .ge => {
+                            const ordering = (x.op == .lt or x.op == .le or x.op == .gt or x.op == .ge);
+                            if (ordering and (!lk.signed or !rk.signed or lk.is_bool or rk.is_bool)) return false;
+                            if (!ordering and ((!lk.signed and !lk.is_bool) or (!rk.signed and !rk.is_bool))) return false;
+                        },
+                    }
+                },
+                .cast => if (intKindForTid(compiler, inst.ty) == null) return false,
+                .const_int, .alloc, .load, .store, .param => {},
+                else => return false, // call/gep/retain/release/await/spawn/indirect_call -> not yet
+            }
+        }
+        switch (b.term) {
+            .ret, .br, .condbr, .unreachable_ => {},
+            .switch_ => return false, // dense/sparse switch lowering not emitted yet
         }
     }
     return true;
 }
 
-fn emitStraightLine(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, mf: *const mir.Func) !void {
-    _ = fn_val;
-    const b = &mf.blocks.items[0];
+// Emit one MIR instruction into the builder's current block; returns its LLVM value (null for value-less
+// ops). `vals` maps MIR Value -> LLVM value across the whole function (SSA is globally numbered).
+fn emitInst(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, inst: mir.Inst, mf: *const mir.Func, vals: []?types.LLVMValueRef) !?types.LLVMValueRef {
     const vt = compiler.val_type;
+    return switch (inst.op) {
+        // A const may be a constfold result computed at i64 precision; canonicalise it to the slot's
+        // declared int width so a folded value that overflows `int` wraps exactly as the AST path would.
+        .const_int => |v| blk: {
+            const c = core.LLVMConstInt(vt, @bitCast(v), 1);
+            const rk = intKindForTid(compiler, inst.ty) orelse break :blk c;
+            break :blk if (rk.is_bool) c else compiler.canonicalizeInt(c, rk.width, rk.signed);
+        },
+        // A parameter's value is the Nth LLVM function argument. Every non-array param flows as the i64
+        // word (declarations.zig builds the signature with val_type), matching how we treat all values.
+        .param => |i| core.LLVMGetParam(fn_val, i),
+        .binop => |x| try emitBinop(compiler, inst, x.op, mf, vals[@intFromEnum(x.lhs)].?, vals[@intFromEnum(x.rhs)].?),
+        .alloc => core.LLVMBuildAlloca(compiler.builder, vt, ""),
+        .load => |x| core.LLVMBuildLoad2(compiler.builder, vt, vals[@intFromEnum(x.addr)].?, ""),
+        .store => |x| blk: {
+            _ = core.LLVMBuildStore(compiler.builder, vals[@intFromEnum(x.val)].?, vals[@intFromEnum(x.addr)].?);
+            break :blk null;
+        },
+        // A cast between int types must narrow/widen to the TARGET width (an int<-long cast truncates);
+        // a raw passthrough would silently keep the wrong width. Canonicalise to the result TypeId's kind.
+        .cast => |x| blk: {
+            const src = vals[@intFromEnum(x.val)] orelse return error.Unemittable;
+            const rk = intKindForTid(compiler, inst.ty) orelse return error.Unemittable;
+            break :blk if (rk.is_bool) src else compiler.canonicalizeInt(src, rk.width, rk.signed);
+        },
+        else => return error.Unemittable, // filtered by mirEmittable, but stay safe
+    };
+}
 
-    // MIR Value -> LLVM value (null = not yet defined; every use is dominated by its def in one block).
+// Emit `mf` into `fn_val`. `entry_bb` is the already-created + positioned entry block (MIR block 0). Every
+// other MIR block gets a fresh LLVM block; instructions are emitted in block-index order, which satisfies
+// SSA define-before-use for the structured CFGs this lowering produces (locals are memory, so the only
+// cross-block values are entry-dominating allocas; loop back-edges carry control only, no phis).
+fn emitFunc(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, mf: *const mir.Func, entry_bb: types.LLVMBasicBlockRef) !void {
+    const vt = compiler.val_type;
+    const nblocks = mf.blocks.items.len;
+
+    const llb = try compiler.allocator.alloc(types.LLVMBasicBlockRef, nblocks);
+    defer compiler.allocator.free(llb);
+    llb[0] = entry_bb;
+    for (1..nblocks) |i| llb[i] = core.LLVMAppendBasicBlock(fn_val, "");
+
     const vals = try compiler.allocator.alloc(?types.LLVMValueRef, mf.value_types.items.len);
     defer compiler.allocator.free(vals);
     @memset(vals, null);
 
-    for (b.insts.items) |inst| {
-        const r: ?types.LLVMValueRef = switch (inst.op) {
-            // A const may be a constfold result computed at i64 precision; canonicalise it to the slot's
-            // declared int width so a folded value that overflows `int` wraps exactly as the AST path would.
-            .const_int => |v| blk: {
-                const c = core.LLVMConstInt(vt, @bitCast(v), 1);
-                const rk = intKindForTid(compiler, inst.ty) orelse break :blk c;
-                break :blk if (rk.is_bool) c else compiler.canonicalizeInt(c, rk.width, rk.signed);
+    for (mf.blocks.items, 0..) |*b, bi| {
+        core.LLVMPositionBuilderAtEnd(compiler.builder, llb[bi]);
+        for (b.insts.items) |inst| {
+            const r = try emitInst(compiler, fn_val, inst, mf, vals);
+            if (inst.result != .invalid) vals[@intFromEnum(inst.result)] = r;
+        }
+        switch (b.term) {
+            .ret => |x| {
+                if (x) |v| {
+                    _ = core.LLVMBuildRet(compiler.builder, vals[@intFromEnum(v)] orelse core.LLVMConstInt(vt, 0, 0));
+                } else {
+                    _ = core.LLVMBuildRetVoid(compiler.builder);
+                }
             },
-            .binop => |x| try emitBinop(compiler, inst, x.op, mf, vals[@intFromEnum(x.lhs)].?, vals[@intFromEnum(x.rhs)].?),
-            .alloc => core.LLVMBuildAlloca(compiler.builder, vt, ""),
-            .load => |x| core.LLVMBuildLoad2(compiler.builder, vt, vals[@intFromEnum(x.addr)].?, ""),
-            .store => |x| blk: {
-                _ = core.LLVMBuildStore(compiler.builder, vals[@intFromEnum(x.val)].?, vals[@intFromEnum(x.addr)].?);
-                break :blk null;
+            .br => |x| _ = core.LLVMBuildBr(compiler.builder, llb[@intFromEnum(x.dest)]),
+            .condbr => |x| {
+                // The condition is a bool word (0/1); branch on nonzero, exactly as the AST path does.
+                const c = vals[@intFromEnum(x.cond)] orelse return error.Unemittable;
+                const i1v = core.LLVMBuildICmp(compiler.builder, .LLVMIntNE, c, core.LLVMConstInt(vt, 0, 0), "");
+                _ = core.LLVMBuildCondBr(compiler.builder, i1v, llb[@intFromEnum(x.then)], llb[@intFromEnum(x.else_)]);
             },
-            // A cast between int types must narrow/widen to the TARGET width (an int<-long cast truncates);
-            // a raw passthrough would silently keep the wrong width. Canonicalise to the result TypeId's kind.
-            .cast => |x| blk: {
-                const src = vals[@intFromEnum(x.val)] orelse return error.Unemittable;
-                const rk = intKindForTid(compiler, inst.ty) orelse return error.Unemittable;
-                break :blk if (rk.is_bool) src else compiler.canonicalizeInt(src, rk.width, rk.signed);
-            },
-            else => return error.Unemittable, // filtered by hirEmittable, but stay safe
-        };
-        if (inst.result != .invalid) vals[@intFromEnum(inst.result)] = r;
-    }
-
-    switch (b.term) {
-        .ret => |x| {
-            if (x) |v| {
-                _ = core.LLVMBuildRet(compiler.builder, vals[@intFromEnum(v)] orelse core.LLVMConstInt(vt, 0, 0));
-            } else {
-                _ = core.LLVMBuildRetVoid(compiler.builder);
-            }
-        },
-        else => return error.Unemittable,
+            .unreachable_ => _ = core.LLVMBuildUnreachable(compiler.builder),
+            else => return error.Unemittable, // switch_ -> rejected by mirEmittable
+        }
     }
 }
 

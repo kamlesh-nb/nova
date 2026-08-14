@@ -29,6 +29,7 @@ pub const Op = union(enum) {
     gep: struct { result: Reg, base: Reg, offset: u32 },
     cast: struct { result: Reg, val: Reg, to: TypeId },
     const_int: struct { result: Reg, val: i64 },
+    param: struct { result: Reg, index: u32 }, // Nth function argument
     // calls
     call: struct { result: ?Reg, callee: SymbolId, args: []const Reg },
     indirect_call: struct { result: ?Reg, receiver: Reg, slot: u32, args: []const Reg },

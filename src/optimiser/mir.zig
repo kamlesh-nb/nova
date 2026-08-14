@@ -73,6 +73,8 @@ pub const Inst = struct {
         spawn_: struct { callee: SymbolId, args: []Value },
         // constants materialised by const-folding
         const_int: i64,
+        // function parameter N (its value is the Nth LLVM function argument)
+        param: u32,
     };
 };
 
@@ -109,7 +111,7 @@ pub fn instOperands(op: Inst.Op, buf: *[8]Value) []Value {
         },
         .call => |x| for (x.args) |arg| push(buf, &n, arg),
         .spawn_ => |x| for (x.args) |arg| push(buf, &n, arg),
-        .alloc, .const_int => {},
+        .alloc, .const_int, .param => {},
     }
     return buf[0..n];
 }
@@ -168,7 +170,7 @@ fn rewriteInst(op: *Inst.Op, from: Value, to: Value) void {
         },
         .call => |*x| for (x.args) |*arg| sw(arg, from, to),
         .spawn_ => |*x| for (x.args) |*arg| sw(arg, from, to),
-        .alloc, .const_int => {},
+        .alloc, .const_int, .param => {},
     }
 }
 
@@ -185,7 +187,7 @@ fn rewriteTerm(term: *Terminator, from: Value, to: Value) void {
 pub fn hasSideEffects(op: Inst.Op) bool {
     return switch (op) {
         .store, .call, .indirect_call, .retain, .release, .await_, .spawn_ => true,
-        .binop, .load, .alloc, .gep, .cast, .const_int => false,
+        .binop, .load, .alloc, .gep, .cast, .const_int, .param => false,
     };
 }
 

@@ -42,6 +42,7 @@ fn lowerInst(allocator: std.mem.Allocator, lf: *lir.Func, inst: mir.Inst) !void 
         .gep => |x| try lf.ops.append(allocator, .{ .gep = .{ .result = r.?, .base = reg(x.base), .offset = x.offset } }),
         .cast => |x| try lf.ops.append(allocator, .{ .cast = .{ .result = r.?, .val = reg(x.val), .to = inst.ty } }),
         .const_int => |v| try lf.ops.append(allocator, .{ .const_int = .{ .result = r.?, .val = v } }),
+        .param => |i| try lf.ops.append(allocator, .{ .param = .{ .result = r.?, .index = i } }),
         .call => |x| try lf.ops.append(allocator, .{ .call = .{ .result = r, .callee = x.callee, .args = try regs(allocator, x.args) } }),
         .indirect_call => |x| try lf.ops.append(allocator, .{ .indirect_call = .{ .result = r, .receiver = reg(x.receiver), .slot = x.slot, .args = try regs(allocator, x.args) } }),
         .retain => |x| try lf.ops.append(allocator, .{ .retain = .{ .val = reg(x.val) } }),

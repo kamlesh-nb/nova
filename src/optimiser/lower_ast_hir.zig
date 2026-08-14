@@ -80,12 +80,42 @@ const Ctx = struct {
 };
 
 pub fn lowerFunc(allocator: std.mem.Allocator, fn_decl: ast.FunctionDecl, ir: ?*const infer.TypedIr) !hir.Func {
+    return lowerFuncTyped(allocator, fn_decl, ir, null);
+}
+
+// As lowerFunc, but with resolved parameter TypeIds (emit path). Stamping the param nodes matters because
+// mem2reg forwards a param store->load, so the param VALUE itself becomes an arithmetic operand -- if it
+// were left unset, the emit gate could not prove its width. Pass null (shadow) to leave params unset.
+pub fn lowerFuncTyped(allocator: std.mem.Allocator, fn_decl: ast.FunctionDecl, ir: ?*const infer.TypedIr, param_types: ?[]const hir.TypeId) !hir.Func {
     var func = hir.Func{ .name = fn_decl.name };
     errdefer func.deinit(allocator);
     var ctx = Ctx{ .allocator = allocator, .func = &func, .ir = ir };
     defer ctx.deinit();
 
-    func.entry = try lowerBlock(&ctx, fn_decl.body);
+    // Parameters: bind each to its name with a synthesized `let name = param(i)` at function entry, so body
+    // idents resolve to the argument (HIR->MIR turns the let into a slot; the emit path maps param(i) to the
+    // LLVM function argument). Params flow as the i64 word (see declarations.zig: the signature uses val_type
+    // for every non-array param), so no coercion is modelled here.
+    var pre = std.ArrayListUnmanaged(HirId).empty;
+    defer pre.deinit(allocator);
+    for (fn_decl.params, 0..) |p, i| {
+        const pty: hir.TypeId = if (param_types) |pts| (if (i < pts.len) pts[i] else hir.unset_ty) else hir.unset_ty;
+        const pnode = try func.add(allocator, .{ .kind = .{ .param = @intCast(i) }, .ty = pty, .span = fn_decl.body.span });
+        const binding = try func.add(allocator, .{ .kind = .{ .let = .{ .name = p.name, .value = pnode } }, .span = fn_decl.body.span });
+        try pre.append(allocator, binding);
+    }
+
+    const body = try lowerBlock(&ctx, fn_decl.body);
+    if (pre.items.len == 0) {
+        func.entry = body;
+    } else {
+        var all = std.ArrayListUnmanaged(HirId).empty;
+        errdefer all.deinit(allocator);
+        try all.appendSlice(allocator, pre.items);
+        try all.appendSlice(allocator, body.nodes);
+        allocator.free(@constCast(body.nodes));
+        func.entry = hir.Block{ .nodes = try all.toOwnedSlice(allocator) };
+    }
     return func;
 }
 

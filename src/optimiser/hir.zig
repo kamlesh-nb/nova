@@ -51,6 +51,7 @@ pub const Node = struct {
         undefined,
         // references
         ident: []const u8,
+        param: u32, // function parameter N (bound to its name via a synthesized `let` in lowerFunc)
         field: struct { object: HirId, name: []const u8 },
         index: struct { object: HirId, idx: HirId },
         // operators

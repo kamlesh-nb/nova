@@ -32,6 +32,27 @@ fn shl(): int { let s = 1; return s << 5; }
 fn main(): void { console.log(`${a()} ${ov()} ${chain()} ${modw()} ${cmp()} ${bits()} ${shl()}`); }
 '
 
+# Parameters (M6-A): int/bool params flow as the i64 word; the param VALUE becomes an operand after mem2reg,
+# so its width must be threaded (regression guard for the param-type stamping).
+emit_case params '
+fn add(a: int, b: int): int { return a + b; }
+fn poly(x: int, y: int): int { return x * x + y * 2 - 1; }
+fn less(a: int, b: int): bool { return a < b; }
+fn dbl(x: int): int { return x + x; }                        // param used in arithmetic
+fn povf(x: int): int { return x + x; }                       // 4e9 -> wrap at call site
+fn main(): void { console.log(`${add(3, 4)} ${poly(5, 6)} ${less(2, 9)} ${dbl(21)} ${povf(2000000000)}`); }
+'
+
+# Control flow (M6-B): multi-block CFG (if/else, nested if, while loops with mutated locals). Exercises
+# condbr/br terminators and mem2reg across blocks.
+emit_case control '
+fn absv(x: int): int { if (x < 0) { return 0 - x; } return x; }
+fn clamp(x: int): int { if (x > 100) { return 100; } else { if (x < 0) { return 0; } } return x; }
+fn sumto(n: int): int { let s = 0; let i = 1; while (i <= n) { s = s + i; i = i + 1; } return s; }
+fn count(flag: bool): int { let c = 0; if (flag) { c = c + 10; } else { c = c + 20; } return c; }
+fn main(): void { console.log(`${absv(0-7)} ${absv(5)} ${clamp(250)} ${clamp(0-5)} ${clamp(42)} ${sumto(100)} ${count(true)} ${count(false)}`); }
+'
+
 for f in "$TMP"/*.nova; do
     name="$(basename "$f" .nova)"
     if ! "$NOVA" "$f" -o "$TMP/${name}_ast" >/dev/null 2>&1; then

@@ -119,7 +119,7 @@ fn remapOp(op: *mir.Inst.Op, vmap: []const mir.Value) void {
         .spawn_ => |*x| for (x.args) |*arg| {
             arg.* = vmap[@intFromEnum(arg.*)];
         },
-        .alloc, .const_int => {},
+        .alloc, .const_int, .param => {},
     }
 }
 

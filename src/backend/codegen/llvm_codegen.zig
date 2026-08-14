@@ -60,6 +60,10 @@ pub const FunctionInfo = struct {
 
     ret_type_ref: ?ast.TypeRef = null,
     body: ast.Block,
+    // The declared parameters (free functions only; left empty for methods, whose implicit `self` shifts the
+    // argument indices). The optimiser emit path uses this to model params; empty => it treats the function
+    // as paramless-or-unmodelled and falls back. See lir_emit.zig.
+    params: []const ast.Param = &.{},
 
     is_async: bool = false,
 
@@ -3031,6 +3035,7 @@ pub const LlvmCompiler = struct {
                     .return_type = if (fn_decl.ret_type) |ret| try self.typeRefToString(ret) else "void",
                     .ret_type_ref = fn_decl.ret_type,
                     .body = fn_decl.body,
+                    .params = fn_decl.params, // free function: argument index i == declared param i (no self)
                     .is_async = fn_decl.is_async,
                     .source_file = fn_decl.span.file,
                 };
