@@ -61,7 +61,7 @@ pub const Node = struct {
         call: struct { callee: HirId, args: []const HirId, sym: ?SymbolId = null },
         generic_call: struct { callee: HirId, args: []const HirId, sym: ?SymbolId = null },
         // aggregates
-        struct_init: struct { type_name: []const u8, fields: []const HirId },
+        struct_init: struct { type_name: []const u8, fields: []const HirId, field_names: []const []const u8 = &.{} },
         enum_init: struct { name: []const u8, variant: []const u8, fields: []const HirId },
         tuple: []const HirId,
         // desugar targets that keep a value

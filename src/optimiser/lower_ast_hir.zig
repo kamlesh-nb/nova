@@ -299,7 +299,9 @@ fn lowerExpr(ctx: *Ctx, expr: ast.Expression) anyerror!HirId {
         },
         .struct_init => |si| blk: {
             const owned = try lowerFieldSlice(ctx, si.fields);
-            break :blk try func.add(a, .{ .kind = .{ .struct_init = .{ .type_name = si.type_name, .fields = owned } }, .span = span });
+            const names = try a.alloc([]const u8, si.fields.len);
+            for (si.fields, 0..) |f, i| names[i] = f.name;
+            break :blk try func.add(a, .{ .kind = .{ .struct_init = .{ .type_name = si.type_name, .fields = owned, .field_names = names } }, .span = span });
         },
         .enum_init => |ei| blk: {
             const owned = try lowerFieldSlice(ctx, ei.fields);

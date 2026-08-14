@@ -119,6 +119,14 @@ fn remapOp(op: *mir.Inst.Op, vmap: []const mir.Value) void {
         .spawn_ => |*x| for (x.args) |*arg| {
             arg.* = vmap[@intFromEnum(arg.*)];
         },
+        .struct_new => |*x| for (x.args) |*arg| {
+            arg.* = vmap[@intFromEnum(arg.*)];
+        },
+        .field_get => |*x| x.base = vmap[@intFromEnum(x.base)],
+        .field_set => |*x| {
+            x.base = vmap[@intFromEnum(x.base)];
+            x.val = vmap[@intFromEnum(x.val)];
+        },
         .alloc, .const_int, .param => {},
     }
 }

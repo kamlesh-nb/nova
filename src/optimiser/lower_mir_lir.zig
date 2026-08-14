@@ -43,6 +43,11 @@ fn lowerInst(allocator: std.mem.Allocator, lf: *lir.Func, inst: mir.Inst) !void 
         .cast => |x| try lf.ops.append(allocator, .{ .cast = .{ .result = r.?, .val = reg(x.val), .to = inst.ty } }),
         .const_int => |v| try lf.ops.append(allocator, .{ .const_int = .{ .result = r.?, .val = v } }),
         .param => |i| try lf.ops.append(allocator, .{ .param = .{ .result = r.?, .index = i } }),
+        // aggregates: the emit path drives these from MIR, so LIR only needs a structural stand-in for the
+        // shadow's op count (alloc for the new object, load/store for a field access).
+        .struct_new => try lf.ops.append(allocator, .{ .alloc = .{ .result = r.?, .ty = inst.ty } }),
+        .field_get => |x| try lf.ops.append(allocator, .{ .load = .{ .result = r.?, .addr = reg(x.base) } }),
+        .field_set => |x| try lf.ops.append(allocator, .{ .store = .{ .addr = reg(x.base), .val = reg(x.val) } }),
         .call => |x| try lf.ops.append(allocator, .{ .call = .{ .result = r, .callee = x.callee, .args = try regs(allocator, x.args) } }),
         .indirect_call => |x| try lf.ops.append(allocator, .{ .indirect_call = .{ .result = r, .receiver = reg(x.receiver), .slot = x.slot, .args = try regs(allocator, x.args) } }),
         .retain => |x| try lf.ops.append(allocator, .{ .retain = .{ .val = reg(x.val) } }),

@@ -75,6 +75,12 @@ pub const Inst = struct {
         const_int: i64,
         // function parameter N (its value is the Nth LLVM function argument)
         param: u32,
+        // aggregates (emit path M6-D): atomic struct ops carrying the names a backend needs to resolve
+        // layout (field offsets/widths) via the type store. struct_new allocates + initialises; field_get/
+        // field_set read/write one field at its real width.
+        struct_new: struct { type_name: []const u8, field_names: []const []const u8, args: []Value },
+        field_get: struct { base: Value, field: []const u8 },
+        field_set: struct { base: Value, field: []const u8, val: Value },
     };
 };
 
@@ -111,6 +117,12 @@ pub fn instOperands(op: Inst.Op, buf: *[8]Value) []Value {
         },
         .call => |x| for (x.args) |arg| push(buf, &n, arg),
         .spawn_ => |x| for (x.args) |arg| push(buf, &n, arg),
+        .struct_new => |x| for (x.args) |arg| push(buf, &n, arg),
+        .field_get => |x| push(buf, &n, x.base),
+        .field_set => |x| {
+            push(buf, &n, x.base);
+            push(buf, &n, x.val);
+        },
         .alloc, .const_int, .param => {},
     }
     return buf[0..n];
@@ -170,6 +182,12 @@ fn rewriteInst(op: *Inst.Op, from: Value, to: Value) void {
         },
         .call => |*x| for (x.args) |*arg| sw(arg, from, to),
         .spawn_ => |*x| for (x.args) |*arg| sw(arg, from, to),
+        .struct_new => |*x| for (x.args) |*arg| sw(arg, from, to),
+        .field_get => |*x| sw(&x.base, from, to),
+        .field_set => |*x| {
+            sw(&x.base, from, to);
+            sw(&x.val, from, to);
+        },
         .alloc, .const_int, .param => {},
     }
 }
@@ -187,7 +205,9 @@ fn rewriteTerm(term: *Terminator, from: Value, to: Value) void {
 pub fn hasSideEffects(op: Inst.Op) bool {
     return switch (op) {
         .store, .call, .indirect_call, .retain, .release, .await_, .spawn_ => true,
-        .binop, .load, .alloc, .gep, .cast, .const_int, .param => false,
+        // struct_new allocates + writes memory; field_set writes memory -> keep them.
+        .struct_new, .field_set => true,
+        .binop, .load, .alloc, .gep, .cast, .const_int, .param, .field_get => false,
     };
 }
 

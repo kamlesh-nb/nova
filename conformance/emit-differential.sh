@@ -65,6 +65,20 @@ fn fib(n: int): int { if (n < 2) { return n; } return fib(n - 1) + fib(n - 2); }
 fn main(): void { console.log(`${sq(7)} ${add(3, 4)} ${hyp(3, 4)} ${fact(5)} ${fib(10)}`); }
 '
 
+# Structs (M6-D): heap struct with scalar fields -- construction (fresh, rc=1 return), field read/write on
+# a param. Uses `class` because a plain `struct` is now a VALUE type (stack alloca, a different ABI the emit
+# path leaves to the AST); `class` is the heap/reference case this slice emits. `shift` returns a BORROWED
+# param, which needs a retain the emit path does not do, so it MUST fall back -- the binaries are ASAN-linked,
+# so a wrongly-emitted shift would double-free and diverge here.
+emit_case structs '
+class Point { x: int, y: int }
+fn mk(a: int, b: int): Point { return Point{x: a, y: b}; }
+fn getx(p: Point): int { return p.x; }
+fn dist2(p: Point): int { return p.x * p.x + p.y * p.y; }
+fn shift(p: Point, dx: int): Point { p.x = p.x + dx; return p; }
+fn main(): void { let p = mk(3, 4); console.log(`${getx(p)} ${dist2(p)} ${getx(shift(p, 10))}`); }
+'
+
 for f in "$TMP"/*.nova; do
     name="$(basename "$f" .nova)"
     if ! "$NOVA" "$f" -o "$TMP/${name}_ast" >/dev/null 2>&1; then

@@ -51,18 +51,18 @@ fn tryEmitInner(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, func: anyty
 
     // Parameters. `func.params` is populated only for FREE functions (methods leave it empty because their
     // implicit `self` shifts the LLVM argument indices), so `params.len != param_count` means a method or an
-    // otherwise-unmodelled signature -> fall back. Every param must be a signed int / bool primitive: those
-    // flow as the i64 word (declarations.zig gives every non-array param val_type), which is exactly what
-    // LLVMGetParam yields and what the emitter treats values as. Anything else (arrays -> ptr, structs,
-    // strings, floats, unsigned) is rejected.
+    // otherwise-unmodelled signature -> fall back. A param must flow as the i64 word (which is what
+    // LLVMGetParam yields and what the emitter treats values as): that means a signed int / bool primitive,
+    // or a heap struct/class (its address). Arrays (-> ptr), floats, strings, unsigned, value structs are
+    // rejected.
     if (func.params.len != func.param_count) return reject("param count mismatch (method/self?)");
     if (func.params.len > 16) return reject("too many params");
     var ptbuf: [16]mir.TypeId = undefined;
     for (func.params, 0..) |p, i| {
         const tr = p.type_name orelse return reject("untyped param");
         const ptid = compiler.concreteTidForTypeRef(tr) orelse return reject("unresolved param type");
-        const pk = intKindForTid(compiler, ptid) orelse return reject("non-int/bool param");
-        if (!pk.signed and !pk.is_bool) return reject("unsigned param");
+        const scalar_ok = if (intKindForTid(compiler, ptid)) |pk| (pk.signed or pk.is_bool) else false;
+        if (!scalar_ok and !emittableHeapStructTid(compiler, ptid)) return reject("param not int/bool/heap-struct");
         ptbuf[i] = ptid;
     }
     const param_types = ptbuf[0..func.params.len];
@@ -110,7 +110,9 @@ fn hirEmittable(hf: *const hir.Func) bool {
             // control flow (M6-B): the MIR CFG + emitFunc handle these; if_expr lowers through a result slot
             .if_, .loop_, .if_expr, .brk, .cont,
             // direct calls (M6-C): validated + emitted from the MIR call op (callee resolved by name)
-            .call, .generic_call => {},
+            .call, .generic_call,
+            // structs (M6-D): construction + field read/write, validated + emitted from struct_new/field_*
+            .struct_init, .field => {},
             else => {
                 if (emit_verbose) std.debug.print("[opt-emit]   non-emittable node: {s}\n", .{@tagName(node.kind)});
                 return false; // str/float/null/call/struct_init/cast/... -> fall back
@@ -171,6 +173,43 @@ fn resolveCallee(compiler: *LlvmCompiler, name: []const u8, nargs: usize) ?Calle
     return .{ .fn_val = fn_val, .fn_type = fn_type };
 }
 
+// The declared base name of the struct/class a value holds (via its threaded TypeId), or null if the value
+// is not a known struct type. Used to resolve field layout from the base of a field_get/field_set.
+fn structBaseNameOf(compiler: *LlvmCompiler, mf: *const mir.Func, v: mir.Value) ?[]const u8 {
+    const tid = mf.typeOf(v);
+    if (tid == mir.unset_ty) return null;
+    const nm = compiler.symbolName(tid) catch return null;
+    const base = types_mod.getStructBaseName(nm);
+    if (!compiler.structs.contains(base)) return null;
+    return base;
+}
+
+fn fieldTypeRef(compiler: *LlvmCompiler, struct_name: []const u8, field_name: []const u8) ?ast.TypeRef {
+    const sd = compiler.structs.get(struct_name) orelse return null;
+    for (sd.fields) |f| if (std.mem.eql(u8, f.name, field_name)) return f.type_name;
+    return null;
+}
+
+// A field this slice can store at its real width: a bare int/bool primitive. Floats, strings, nested
+// structs, optionals, arrays etc. need the float-store path or ARC (owned fields) and are left to the AST.
+fn isScalarFieldTypeRef(tr: ast.TypeRef) bool {
+    return switch (tr) {
+        .ident => |n| if (types_mod.cgPrim(n)) |p| (p.repr != .f32 and p.repr != .f64) else false,
+        else => false,
+    };
+}
+
+// A heap struct/class usable as an i64-word param/value in the emit subset: a known struct that is NOT a
+// value struct (value structs use a stack alloca, a separate ABI not handled yet). Fields are validated at
+// each field access, not here.
+fn emittableHeapStructTid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
+    if (tid == mir.unset_ty) return false;
+    const nm = compiler.symbolName(tid) catch return false;
+    const base = types_mod.getStructBaseName(nm);
+    if (!compiler.structs.contains(base)) return false;
+    return !compiler.isValueStructName(base);
+}
+
 // Dry validation: return false if any instruction OR terminator is outside the emittable subset, building
 // NO IR. This MUST run before emitFunc touches the builder -- otherwise a mid-stream reject would leave a
 // half-emitted block that the AST fallback then double-fills. Keep the per-op gates in sync with emitBinop /
@@ -206,16 +245,54 @@ fn mirEmittable(compiler: *LlvmCompiler, mf: *const mir.Func) bool {
                     const nm = x.name orelse return false;
                     if (resolveCallee(compiler, nm, x.args.len) == null) return false;
                 },
+                // Heap struct with all-scalar fields, fully initialised (every declared field supplied so we
+                // never rely on zero-init of an omitted field). Value structs + owned-field structs fall back.
+                .struct_new => |x| {
+                    if (compiler.isValueStructName(x.type_name)) return false;
+                    const sd = compiler.structs.get(x.type_name) orelse return false;
+                    if (sd.fields.len != x.args.len or sd.fields.len != x.field_names.len) return false;
+                    for (sd.fields) |f| if (!isScalarFieldTypeRef(f.type_name)) return false;
+                },
+                .field_get => |x| {
+                    const sname = structBaseNameOf(compiler, mf, x.base) orelse return false;
+                    if (compiler.isValueStructName(sname)) return false;
+                    const ftr = fieldTypeRef(compiler, sname, x.field) orelse return false;
+                    if (!isScalarFieldTypeRef(ftr)) return false;
+                },
+                .field_set => |x| {
+                    const sname = structBaseNameOf(compiler, mf, x.base) orelse return false;
+                    if (compiler.isValueStructName(sname)) return false;
+                    const ftr = fieldTypeRef(compiler, sname, x.field) orelse return false;
+                    if (!isScalarFieldTypeRef(ftr)) return false;
+                },
                 .const_int, .alloc, .load, .store, .param => {},
                 else => return false, // gep/retain/release/await/spawn/indirect_call -> not yet
             }
         }
         switch (b.term) {
-            .ret, .br, .condbr, .unreachable_ => {},
+            // Returning a heap struct is only safe when it is a FRESH construction (rc=1, moved to the
+            // caller). Returning a BORROWED struct (a param, a field, an owned local not moved out) requires a
+            // retain the emit path does not yet emit -- the AST caller would treat the result as an owned
+            // temporary and release it, double-freeing. So restrict to struct_new results (mem2reg forwards a
+            // `let t = Type{...}; return t` to the struct_new too). This is the ARC boundary for M6-D.
+            .ret => |x| if (x) |rv| {
+                if (emittableHeapStructTid(compiler, mf.typeOf(rv)) and !isStructNewResult(mf, rv)) return false;
+            },
+            .br, .condbr, .unreachable_ => {},
             .switch_ => return false, // dense/sparse switch lowering not emitted yet
         }
     }
     return true;
+}
+
+// True if Value `v` is defined by a struct_new instruction (a freshly-constructed, rc=1 heap object).
+fn isStructNewResult(mf: *const mir.Func, v: mir.Value) bool {
+    for (mf.blocks.items) |*b| {
+        for (b.insts.items) |inst| {
+            if (inst.result == v) return inst.op == .struct_new;
+        }
+    }
+    return false;
 }
 
 // Emit one MIR instruction into the builder's current block; returns its LLVM value (null for value-less
@@ -246,6 +323,49 @@ fn emitInst(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, inst: mir.Inst,
             const src = vals[@intFromEnum(x.val)] orelse return error.Unemittable;
             const rk = intKindForTid(compiler, inst.ty) orelse return error.Unemittable;
             break :blk if (rk.is_bool) src else compiler.canonicalizeInt(src, rk.width, rk.signed);
+        },
+        // Heap struct construction: allocate the payload, then store each field at its real offset/width --
+        // the same nova_bytes_alloc + add/inttoptr/store sequence the AST path emits (expressions.zig), reusing
+        // the same layout + cast helpers. Owned-field structs are rejected by mirEmittable (they need a retain).
+        .struct_new => |x| blk: {
+            const total = compiler.getTypeSize(ast.TypeRef{ .ident = x.type_name }, false);
+            const struct_ptr = try compiler.compileAlloc(core.LLVMConstInt(vt, total, 0));
+            for (x.field_names, x.args) |fname, arg| {
+                const off = compiler.getFieldOffset(x.type_name, fname) catch return error.Unemittable;
+                const ftr = fieldTypeRef(compiler, x.type_name, fname) orelse return error.Unemittable;
+                const flt = compiler.toLLVMType(ftr);
+                const addr = core.LLVMBuildAdd(compiler.builder, struct_ptr, core.LLVMConstInt(vt, off, 0), "");
+                const fptr = core.LLVMBuildIntToPtr(compiler.builder, addr, core.LLVMPointerType(flt, 0), "");
+                const av = vals[@intFromEnum(arg)] orelse return error.Unemittable;
+                _ = core.LLVMBuildStore(compiler.builder, compiler.castFromValType(av, flt), fptr);
+            }
+            break :blk struct_ptr;
+        },
+        // Field read: base + offset, inttoptr to the field's real type, load, widen back to the i64 word.
+        .field_get => |x| blk: {
+            const sname = structBaseNameOf(compiler, mf, x.base) orelse return error.Unemittable;
+            const off = compiler.getFieldOffset(sname, x.field) catch return error.Unemittable;
+            const ftr = fieldTypeRef(compiler, sname, x.field) orelse return error.Unemittable;
+            const flt = compiler.toLLVMType(ftr);
+            const base_v = vals[@intFromEnum(x.base)] orelse return error.Unemittable;
+            const addr = core.LLVMBuildAdd(compiler.builder, base_v, core.LLVMConstInt(vt, off, 0), "");
+            const fptr = core.LLVMBuildIntToPtr(compiler.builder, addr, core.LLVMPointerType(flt, 0), "");
+            const raw = core.LLVMBuildLoad2(compiler.builder, flt, fptr, "");
+            break :blk compiler.castToValType(raw, ftr);
+        },
+        // Field write (scalar only in this slice, so no retain-old/release semantics): base + offset, narrow
+        // the word to the field type, store.
+        .field_set => |x| blk: {
+            const sname = structBaseNameOf(compiler, mf, x.base) orelse return error.Unemittable;
+            const off = compiler.getFieldOffset(sname, x.field) catch return error.Unemittable;
+            const ftr = fieldTypeRef(compiler, sname, x.field) orelse return error.Unemittable;
+            const flt = compiler.toLLVMType(ftr);
+            const base_v = vals[@intFromEnum(x.base)] orelse return error.Unemittable;
+            const av = vals[@intFromEnum(x.val)] orelse return error.Unemittable;
+            const addr = core.LLVMBuildAdd(compiler.builder, base_v, core.LLVMConstInt(vt, off, 0), "");
+            const fptr = core.LLVMBuildIntToPtr(compiler.builder, addr, core.LLVMPointerType(flt, 0), "");
+            _ = core.LLVMBuildStore(compiler.builder, compiler.castFromValType(av, flt), fptr);
+            break :blk null;
         },
         // Direct call: resolve the callee (all-word signature, verified by mirEmittable), pass the arg words
         // straight through (no coercion), return the result word. The callee returns an already-canonical

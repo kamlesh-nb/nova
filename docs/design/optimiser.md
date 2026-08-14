@@ -339,6 +339,14 @@ EMIT cutover is deliberately NOT faked. Precisely:
   - **M6-C direct calls**: a call resolved by source name to an all-word LLVM function (`resolveCallee`:
     N word params, word/void return, else fall back), args passed straight through. Leaf, nested, and
     recursive (`fact`, `fib`).
+  - **M6-D structs (heap/reference)**: three atomic MIR ops — `struct_new` / `field_get` / `field_set` —
+    carrying the type/field names a backend needs to resolve layout, driving the SAME codegen helpers the AST
+    path uses (`compileAlloc`, `getFieldOffset`, `toLLVMType`, `castFrom/ToValType`). Scoped to heap structs
+    (`class`, or `struct` that escapes) with scalar fields and no ARC: the gate rejects owned-field structs,
+    value structs, and any `retain`/`release`. Returning a heap struct is allowed only when it is a fresh
+    `struct_new` (rc=1, moved out) — returning a BORROWED struct needs a retain the emit path does not do, so
+    it falls back (an ASAN-caught double-free if it did not). Verified: construction, field read/write on a
+    param, differential + ASAN.
   The optimiser pipeline (constfold/mem2reg/copyprop/dce/simplifycfg) runs before every emit. M6-C surfaced
   and fixed a real **mem2reg correctness bug**: full promotion removed a single-block slot's alloc+store even
   when an opaque call between store and load had blocked that load's forwarding, leaving a load of freed

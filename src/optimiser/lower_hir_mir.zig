@@ -107,7 +107,7 @@ fn lowerNode(ctx: *Ctx, id: HirId) anyerror!Value {
 
         .field => |f| blk: {
             const object = try lowerNode(ctx, f.object);
-            break :blk try mf.emit(a, ctx.cur, nty, .{ .gep = .{ .base = object, .offset = 0 } });
+            break :blk try mf.emit(a, ctx.cur, nty, .{ .field_get = .{ .base = object, .field = f.name } });
         },
         .optional_chain => |oc| blk: {
             const object = try lowerNode(ctx, oc.object);
@@ -119,7 +119,13 @@ fn lowerNode(ctx: *Ctx, id: HirId) anyerror!Value {
             break :blk try mf.emit(a, ctx.cur, nty, .{ .load = .{ .addr = object } });
         },
 
-        .struct_init => |si| try lowerAggregate(ctx, si.fields),
+        .struct_init => |si| blk: {
+            var args = std.ArrayListUnmanaged(Value).empty;
+            defer args.deinit(a);
+            for (si.fields) |fid| try args.append(a, try lowerNode(ctx, fid));
+            const owned = try a.dupe(Value, args.items);
+            break :blk try mf.emit(a, ctx.cur, nty, .{ .struct_new = .{ .type_name = si.type_name, .field_names = si.field_names, .args = owned } });
+        },
         .enum_init => |ei| try lowerAggregate(ctx, ei.fields),
         .tuple => |elems| try lowerAggregate(ctx, elems),
         .template => |parts| try lowerAggregate(ctx, parts),
@@ -169,6 +175,13 @@ fn lowerNode(ctx: *Ctx, id: HirId) anyerror!Value {
                     try mf.emitVoid(a, ctx.cur, .{ .store = .{ .addr = addr, .val = v } });
                     break :blk Value.invalid;
                 }
+            }
+            // `obj.field = v` is an lvalue field write, NOT a load: emit field_set (a field_get here would
+            // read the field instead of taking its address).
+            if (target_node.kind == .field) {
+                const base = try lowerNode(ctx, target_node.kind.field.object);
+                try mf.emitVoid(a, ctx.cur, .{ .field_set = .{ .base = base, .field = target_node.kind.field.name, .val = v } });
+                break :blk Value.invalid;
             }
             const addr = try lowerNode(ctx, asg.target);
             try mf.emitVoid(a, ctx.cur, .{ .store = .{ .addr = addr, .val = v } });
