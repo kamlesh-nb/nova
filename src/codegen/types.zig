@@ -1300,7 +1300,9 @@ pub fn substMethodParams(self: *LlvmCompiler, type_str: []const u8) anyerror![]c
                     if (!std.mem.eql(u8, b.name, tok)) continue;
                     if (sub == null) {
                         sub = b.concrete;
-                        if (sema_shadow.tid_census and inst_opt != null) sema_shadow.subst_legacy_only += 1;
+                        // Count whenever the legacy binding is the SOLE resolver -- including the
+                        // erased-lambda case (inst_opt == null), which is exactly the residual to prove.
+                        if (sema_shadow.tid_census) sema_shadow.subst_legacy_only += 1;
                     } else if (sema_shadow.tid_census and !std.mem.eql(u8, b.concrete, sub.?)) {
                         sema_shadow.subst_diverge += 1;
                         const dl = @min(tok.len, sema_shadow.subst_diverge_last.len);

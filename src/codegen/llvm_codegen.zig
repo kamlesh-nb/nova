@@ -170,6 +170,11 @@ pub const LlvmCompiler = struct {
 
     current_collecting_instantiation: ?[]const u8,
 
+    // SE-C: the TypeId inst_key of the function whose body is being scanned for closures. A lifted lambda
+    // inherits it as its own instantiation_id so the overlay can reify the parent's type-params (e.g. a
+    // lambda inside a generic method reifying its <T>) without the string method_subst.
+    current_collecting_instantiation_id: ?sema_types.TypeId = null,
+
     current_collecting_method_subst: ?[]const MethodParamBinding = null,
 
     current_collecting_erased_generic: bool = false,
@@ -433,26 +438,23 @@ pub const LlvmCompiler = struct {
     pub const valueOptionalName = types_mod.valueOptionalName;
 
     pub fn closureKey(self: *LlvmCompiler, span: ast.Span, inst: ?[]const u8) ![]const u8 {
-        return self.closureKeyM(span, inst, self.closureKeyActiveSubst());
+        return self.closureKeyM(span, inst, self.closureKeyActiveInstId());
     }
 
-    fn closureKeyActiveSubst(self: *LlvmCompiler) ?[]const MethodParamBinding {
-        return self.current_collecting_method_subst orelse self.current_method_subst;
+    // SE-C: the instantiation discriminator for closure keys is now the TypeId inst_key (which encodes BOTH
+    // the receiver's struct-T and the method's <U>), not the string method_subst. Sourced consistently at
+    // registration (current_collecting_instantiation_id) and lookup (current_instantiation_id), both from
+    // the same FunctionInfo.instantiation_id, so the keys still match -- and it is a strictly stronger
+    // discriminator than the old name=concrete signature.
+    fn closureKeyActiveInstId(self: *LlvmCompiler) ?sema_types.TypeId {
+        return self.current_collecting_instantiation_id orelse self.current_instantiation_id;
     }
 
-    pub fn closureKeyM(self: *LlvmCompiler, span: ast.Span, inst: ?[]const u8, msubst: ?[]const MethodParamBinding) ![]const u8 {
-        var sig = std.ArrayListUnmanaged(u8).empty;
-        defer sig.deinit(self.allocator);
-        if (msubst) |bs| for (bs) |b| {
-            try sig.appendSlice(self.allocator, b.name);
-            try sig.append(self.allocator, '=');
-            try sig.appendSlice(self.allocator, b.concrete);
-            try sig.append(self.allocator, ';');
-        };
-        return std.fmt.allocPrint(self.allocator, "{d}|{s}|{s}", .{
+    pub fn closureKeyM(self: *LlvmCompiler, span: ast.Span, inst: ?[]const u8, inst_id: ?sema_types.TypeId) ![]const u8 {
+        return std.fmt.allocPrint(self.allocator, "{d}|{s}|{d}", .{
             getClosureUniqueId(span),
             inst orelse "",
-            sig.items,
+            if (inst_id) |id| @intFromEnum(id) else 0,
         });
     }
 
@@ -2566,6 +2568,7 @@ pub const LlvmCompiler = struct {
                     .body = body_block,
 
                     .instantiation = self.current_collecting_instantiation,
+                    .instantiation_id = self.current_collecting_instantiation_id,
 
                     .method_subst = self.current_collecting_method_subst,
 

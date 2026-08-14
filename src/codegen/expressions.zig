@@ -3215,12 +3215,10 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     const is_yaml = std.mem.eql(u8, fa.object.kind.ident, "yaml") or std.mem.eql(u8, fa.object.kind.ident, "YamlValue");
                     var target_type = gc.type_args[0];
 
-                    if (target_type == .ident and self.current_method_subst != null) {
-                        for (self.current_method_subst.?) |b| {
-                            if (std.mem.eql(u8, b.name, target_type.ident)) {
-                                target_type = ast.TypeRef{ .ident = b.concrete };
-                                break;
-                            }
+                    // SE-C: reify the parse target type-param via the TypeId overlay, not current_method_subst.
+                    if (target_type == .ident) {
+                        if (self.concreteTidForTypeRef(target_type)) |ctid| {
+                            target_type = ast.TypeRef{ .ident = try self.symbolName(ctid) };
                         }
                     }
                     const input_expr = gc.args[0];
@@ -5391,10 +5389,12 @@ pub fn getFunc(self: *LlvmCompiler, name: []const u8) ?types.LLVMValueRef {
 }
 
 pub fn resolveReifyTypeName(self: *LlvmCompiler, type_ref: ast.TypeRef) anyerror![]const u8 {
-    if (type_ref == .ident and self.current_method_subst != null) {
-        for (self.current_method_subst.?) |b| {
-            if (std.mem.eql(u8, b.name, type_ref.ident)) return b.concrete;
-        }
+    // SE-C: reify a type-param to its concrete NAME via the TypeId overlay. typeRefToString already routes
+    // a bare .ident through the overlay-primary substMethodParams, so it covers both the resolvable and the
+    // erased-lambda case (whose inst_key the lifted lambda now inherits) -- current_method_subst is no
+    // longer read here directly.
+    if (type_ref == .ident) {
+        if (self.concreteTidForTypeRef(type_ref)) |ctid| return try self.symbolName(ctid);
     }
     return try self.typeRefToString(type_ref);
 }

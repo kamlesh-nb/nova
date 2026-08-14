@@ -56,6 +56,10 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         compiler.current_collecting_function_name = compiler.functions.items[i].name;
 
         compiler.current_collecting_instantiation = compiler.functions.items[i].instantiation;
+        // Derive the inst_key IDENTICALLY to the body-compile lookup (see line ~669) so a closure's
+        // registration key and its lookup key agree: raw instantiation_id, else the name->live_inst_ids map.
+        compiler.current_collecting_instantiation_id = compiler.functions.items[i].instantiation_id orelse
+            (if (compiler.functions.items[i].instantiation) |inst| sema_mono.live_inst_ids.get(inst) else null);
         compiler.current_collecting_method_subst = compiler.functions.items[i].method_subst;
         compiler.current_collecting_erased_generic = compiler.functions.items[i].erased_generic;
         try compiler.collectClosuresFromBlock(compiler.functions.items[i].body);
@@ -63,6 +67,7 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
     }
     compiler.current_collecting_function_name = null;
     compiler.current_collecting_instantiation = null;
+    compiler.current_collecting_instantiation_id = null;
     compiler.current_collecting_method_subst = null;
 
     if (t6_split) {
