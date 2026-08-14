@@ -313,6 +313,41 @@ ARC-elision is the reason we are here.
 - **Non-goal: replacing sema.** The frontend, the TypeId type system, and monomorphisation are
   unchanged. The middle-end consumes their output.
 
+## Implementation status (2026-08-14) — honest milestone accounting
+
+The optimiser MACHINERY is built, tested, and proven on real code via the `NOVA_OPT` shadow. The backend
+EMIT cutover is deliberately NOT faked. Precisely:
+
+- **M0 scaffold — DONE.** `src/optimiser/` with the IR types + pass registry, compiled by `zig build`.
+- **M1 lowering — DONE.** AST→HIR (100% of node forms), HIR→MIR (CFG, locals as memory), MIR→LIR
+  (linear near-LLVM). Exercised over the whole corpus: 0 crashes, every function lowers through all four
+  tiers. **The EMIT half of M1 (codegen emitting from LIR, byte-equivalent) is NOT done** — there is no
+  LIR→LLVM emitter yet; codegen still lowers from the AST. So the pipeline is a shadow.
+- **M2 verifier — DONE.** SSA/terminator/operand-range checks, corpus-clean (0 verify errors) including
+  after block-renumbering passes. The ARC-balance check is present but dormant (no ARC ops yet). The
+  differential AST-vs-LIR shadow is N/A until the emitter exists.
+- **M3 safe passes — DONE and firing.** mem2reg (local load-forwarding), constfold, copyprop (algebraic
+  identities), dce, simplifycfg (const/dup-target branch folding + dead-block elimination with renumber).
+  Measured over the whole corpus: **~27% of all MIR instructions removed** (871k / 3.11M), 0 verify errors.
+- **M4 arc_elision — algorithm DONE + unit-tested; DORMANT on real code.** The balanced retain/release
+  cancellation is implemented and has passing unit tests. It finds nothing yet because HIR does not thread
+  explicit ARC ops. **Activation prerequisite: the ownership pass** that reads `TypedIr.expr_owned` and
+  emits `hir.Retain`/`hir.Release` at acquisitions/scope-exits. That is the piece that makes M4 deliver
+  the perf win, and it is real, scoped work not yet done.
+- **M5 inline — algorithm DONE + unit-tested; DORMANT on real code.** Single-block callee splicing is
+  implemented and unit-tested. **Activation prerequisite: a MIR call graph** (symbol resolution wiring
+  each `call` to its callee `MirFunc`); the lowering currently leaves callees as placeholders.
+- **M6 cut over — NOT done.** Requires the LIR→LLVM emitter reproducing the full existing backend (traits,
+  async coroutines, closures, ARC, value structs, error unions, optionals, generics) and certifying it on
+  the `--asan` corpus, then retiring the AST path. This is the genuinely multi-week backend rewrite; doing
+  it half-way would produce exactly the miscompiling result the shadow-first method exists to avoid, so it
+  is left as the honest next phase rather than faked.
+
+**Bottom line:** the middle-end and its optimiser are real, correct (verifier + unit tests), and
+measurably effective (27% MIR reduction) on the whole corpus, entirely behind `NOVA_OPT` with the trusted
+AST path untouched (corpus 340/341). What remains is the backend emit-cutover and the two threading
+prerequisites (ownership→ARC ops, symbols→call graph) that switch M4/M5 from unit-tested to firing.
+
 ## One-paragraph summary
 
 Insert a three-tier middle-end (`src/optimiser/`): HIR makes Nova semantics and ARC explicit, MIR puts

@@ -4,10 +4,10 @@
 // every pass in debug builds. This is what builder.zig calls between sema and codegen (gated by NOVA_OPT
 // during the rollout; see docs/design/optimiser.md).
 //
-// Status: M1a. The middle-end does not yet EMIT (codegen still lowers from the AST). What runs today,
-// when NOVA_OPT is set, is `lowerProgramShadow`: lower every function AST->HIR and report coverage. This
-// exercises the lowering on real corpus code with zero risk to the emitted program, exactly the
-// shadow-first method that de-risked the string-engine removal. HIR->MIR->LIR emission is the next work.
+// Status: M1 lowering complete (AST->HIR->MIR->LIR) + M2 verifier + M3 passes (mem2reg/constfold/
+// copyprop/dce/simplifycfg) firing; M4 arc_elision + M5 inline implemented + unit-tested but dormant
+// until ARC-op / call-graph threading. The middle-end does NOT yet EMIT (codegen still lowers from the
+// AST); NOVA_OPT runs the whole chain as a shadow and reports coverage. See docs/design/optimiser.md.
 
 const std = @import("std");
 const builtin = @import("builtin");
