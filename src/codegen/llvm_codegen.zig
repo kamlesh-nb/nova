@@ -68,8 +68,6 @@ pub const FunctionInfo = struct {
     // used to set current_instantiation_id directly, bypassing the fragile name->live_inst_ids lookup.
     instantiation_id: ?sema_types.TypeId = null,
 
-    method_subst: ?[]const MethodParamBinding = null,
-
     erased_generic: bool = false,
 
     source_file: []const u8 = "",
@@ -96,11 +94,6 @@ pub const PendingTemp = struct {
     type_name: []const u8,
 
     expr_id: ast.ExprId = .unassigned,
-};
-
-pub const MethodParamBinding = struct {
-    name: []const u8,
-    concrete: []const u8,
 };
 
 // FR-simd-L2: which family of hardware crypto intrinsics the compile target provides. Decided once from
@@ -157,8 +150,6 @@ pub const LlvmCompiler = struct {
     // is stripped to a raw value, stored, and a later read `?? d` unboxes the raw value as a pointer.
     suppress_valopt_unbox: bool = false,
 
-    current_method_subst: ?[]const MethodParamBinding = null,
-
     default_ctor_depth: u32 = 0,
 
     rendered_name_ids: ?std.StringHashMapUnmanaged(sema_types.TypeId) = null,
@@ -174,8 +165,6 @@ pub const LlvmCompiler = struct {
     // inherits it as its own instantiation_id so the overlay can reify the parent's type-params (e.g. a
     // lambda inside a generic method reifying its <T>) without the string method_subst.
     current_collecting_instantiation_id: ?sema_types.TypeId = null,
-
-    current_collecting_method_subst: ?[]const MethodParamBinding = null,
 
     current_collecting_erased_generic: bool = false,
     lambda_parents: std.StringHashMap([]const u8),
@@ -2570,8 +2559,6 @@ pub const LlvmCompiler = struct {
                     .instantiation = self.current_collecting_instantiation,
                     .instantiation_id = self.current_collecting_instantiation_id,
 
-                    .method_subst = self.current_collecting_method_subst,
-
                     .erased_generic = self.current_collecting_erased_generic,
                     .source_file = cl.span.file,
                 };                try self.functions.append(self.allocator, info);
@@ -2921,11 +2908,6 @@ pub const LlvmCompiler = struct {
                                 if (!std.mem.eql(u8, mi.method, fn_decl.name)) continue;
                                 if (mi.params.len != fn_decl.type_params.len) continue;
 
-                                const subst = try self.allocator.alloc(MethodParamBinding, mi.params.len);
-                                for (mi.params, mi.args, 0..) |pn, an, i| {
-                                    subst[i] = .{ .name = pn, .concrete = an };
-                                }
-
                                 var name_buf = std.ArrayListUnmanaged(u8).empty;
                                 try name_buf.appendSlice(self.allocator, full_name);
                                 for (mi.args) |an| {
@@ -2936,12 +2918,9 @@ pub const LlvmCompiler = struct {
                                 }
                                 const spec_name = try name_buf.toOwnedSlice(self.allocator);
 
-                                const prev_ms = self.current_method_subst;
                                 const prev_iid = self.current_instantiation_id;
-                                self.current_method_subst = subst;
                                 self.current_instantiation_id = mi.inst_key;
                                 const spec_ret = if (fn_decl.ret_type) |ret| try self.typeRefToString(ret) else "void";
-                                self.current_method_subst = prev_ms;
                                 self.current_instantiation_id = prev_iid;
 
                                 try self.functions.append(self.allocator, .{
@@ -2955,7 +2934,6 @@ pub const LlvmCompiler = struct {
                                     .is_async = fn_decl.is_async,
                                     .instantiation = inst_opt,
                                     .instantiation_id = mi.inst_key,
-                                    .method_subst = subst,
                                     .source_file = fn_decl.span.file,
                                 });
                             }
@@ -3064,11 +3042,6 @@ pub const LlvmCompiler = struct {
                         if (!std.mem.eql(u8, fi.fn_name, fn_decl.name)) continue;
                         if (fi.params.len != fn_decl.type_params.len) continue;
 
-                        const subst = try self.allocator.alloc(MethodParamBinding, fi.params.len);
-                        for (fi.params, fi.args, 0..) |pn, an, i| {
-                            subst[i] = .{ .name = pn, .concrete = an };
-                        }
-
                         var nb = std.ArrayListUnmanaged(u8).empty;
                         try nb.appendSlice(self.allocator, name);
                         for (fi.args) |an| {
@@ -3082,12 +3055,9 @@ pub const LlvmCompiler = struct {
                         const spec_params = try self.allocator.alloc([]const u8, fn_decl.params.len);
                         for (fn_decl.params, 0..) |p, i| spec_params[i] = p.name;
 
-                        const prev_ms = self.current_method_subst;
                         const prev_iid2 = self.current_instantiation_id;
-                        self.current_method_subst = subst;
                         self.current_instantiation_id = fi.inst_key;
                         const spec_ret = if (fn_decl.ret_type) |ret| try self.typeRefToString(ret) else "void";
-                        self.current_method_subst = prev_ms;
                         self.current_instantiation_id = prev_iid2;
 
                         // String-engine-removal: bind this free-fn spec to its TypeId instantiation key so
@@ -3102,7 +3072,6 @@ pub const LlvmCompiler = struct {
                             .ret_type_ref = fn_decl.ret_type,
                             .body = fn_decl.body,
                             .is_async = fn_decl.is_async,
-                            .method_subst = subst,
                             .instantiation_id = fi.inst_key,
                             .source_file = fn_decl.span.file,
                         });
@@ -3137,15 +3106,7 @@ pub const LlvmCompiler = struct {
                 const fd = gmap.get(fi.fn_name) orelse continue;
                 if (fi.params.len != fd.type_params.len) continue;
 
-                const subst = try self.allocator.alloc(MethodParamBinding, fi.params.len);
-                defer self.allocator.free(subst);
-                for (fi.params, fi.args, 0..) |pn, an, k| subst[k] = .{ .name = pn, .concrete = an };
-
-                const prev = self.current_method_subst;
-                self.current_method_subst = subst;
-                defer self.current_method_subst = prev;
-
-                // B1: also expose the TypeId instantiation of THIS instance so registerGenericFnInst can
+                // B1: expose the TypeId instantiation of THIS instance so registerGenericFnInst can
                 // resolve inner type-args to concrete TypeIds (not just strings) and make the transitive
                 // callee TypeId-native too.
                 const prev_iid = self.current_instantiation_id;

@@ -691,12 +691,13 @@ pub fn getOrCreateDestructor(self: *LlvmCompiler, type_name: []const u8) anyerro
     const dest_fn = core.LLVMAddFunction(self.module, dest_name_z, fn_type);
 
     const saved_instantiation = self.current_instantiation;
-    const saved_method_subst = self.current_method_subst;
+    const saved_inst_id = self.current_instantiation_id;
     self.current_instantiation = type_name;
-    self.current_method_subst = null;
+    // Isolate destructor name-mangling from any enclosing generic instance (was: null current_method_subst).
+    self.current_instantiation_id = null;
     defer {
         self.current_instantiation = saved_instantiation;
-        self.current_method_subst = saved_method_subst;
+        self.current_instantiation_id = saved_inst_id;
     }
 
     const entry_bb = core.LLVMAppendBasicBlock(dest_fn, "entry");
@@ -792,12 +793,13 @@ fn getOrCreateStructDestructorByTypeId(self: *LlvmCompiler, t: typesys.TypeId) a
     const dest_fn = core.LLVMAddFunction(self.module, dest_name_z, fn_type);
 
     const saved_instantiation = self.current_instantiation;
-    const saved_method_subst = self.current_method_subst;
+    const saved_inst_id = self.current_instantiation_id;
     self.current_instantiation = type_name;
-    self.current_method_subst = null;
+    // Isolate destructor name-mangling from any enclosing generic instance (was: null current_method_subst).
+    self.current_instantiation_id = null;
     defer {
         self.current_instantiation = saved_instantiation;
-        self.current_method_subst = saved_method_subst;
+        self.current_instantiation_id = saved_inst_id;
     }
 
     const entry_bb = core.LLVMAppendBasicBlock(dest_fn, "entry");

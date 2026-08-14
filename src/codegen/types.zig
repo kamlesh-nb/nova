@@ -1255,19 +1255,18 @@ fn isIdentByte(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
-// SE-C monomorphized-spec NAME MANGLING, overlay-primary. Replaces every type-parameter identifier token
-// in `type_str` (a rendered type spelling) with the concrete type's rendered name. The concrete comes from
-// the TypeId overlay -- paramLeafByName (recover the type-param LEAF from the active decl's names) ->
-// tp_resolve -> renderLegacy -- the SAME resolver the decision path uses, so a name and a decision can no
-// longer disagree. `current_method_subst` (the old string bindings) survives ONLY as a per-token fallback
-// for erased contexts the overlay cannot reach (a lifted lambda reifying its parent method's <T>, no
-// inst_key -- 68_generic_method_mono). NOVA_TID_CENSUS counts when that fallback is load-bearing and any
-// overlay-vs-legacy divergence, so the field's deletion can be proven, not guessed. A wrong name here is a
-// loud link error, never a UAF.
+// SE-C monomorphized-spec NAME MANGLING, TypeId-native. Replaces every type-parameter identifier token in
+// `type_str` (a rendered type spelling) with the concrete type's rendered name, resolved through the TypeId
+// overlay -- paramLeafByName (recover the type-param LEAF from the active decl's names) -> tp_resolve ->
+// renderLegacy -- the SAME resolver the decision path uses, so a monomorphized NAME and a type DECISION can
+// no longer disagree. This replaced the old `current_method_subst` string bindings; that path was proven
+// dead by a full-corpus NOVA_TID_CENSUS sweep (legacy_only=0, diverge=0) before deletion, including the one
+// lifted-lambda case (68_generic_method_mono), which now inherits its parent's inst_key. A wrong name here
+// is a loud link error, never a UAF.
 pub fn substMethodParams(self: *LlvmCompiler, type_str: []const u8) anyerror![]const u8 {
-    const inst_opt = self.current_instantiation_id;
-    const bindings = self.current_method_subst;
-    if (inst_opt == null and bindings == null) return type_str;
+    const inst = self.current_instantiation_id orelse return type_str;
+    const ir = self.typed_ir orelse return type_str;
+    const ls = sema_shadow.live_store orelse return type_str;
 
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(self.allocator);
@@ -1281,36 +1280,12 @@ pub fn substMethodParams(self: *LlvmCompiler, type_str: []const u8) anyerror![]c
             const tok = type_str[j..e];
 
             var sub: ?[]const u8 = null;
-            // Overlay-primary: is this token a type-param of the active instance? Resolve it TypeId-native.
-            if (inst_opt) |inst| {
-                if (paramLeafByName(tok, inst)) |leaf| {
-                    if (self.typed_ir) |ir| {
-                        if (sema_shadow.live_store) |ls| {
-                            if (ir.tpResolve(leaf, inst)) |c| switch (ls.get(c)) {
-                                .unresolved, .type_param => {},
-                                else => sub = sema_shadow.renderLegacy(self.allocator, ls, c) catch null,
-                            };
-                        }
-                    }
-                }
-            }
-            // Per-token fallback to the legacy string binding (erased-lambda case), plus measurement.
-            if (bindings) |bs| {
-                for (bs) |b| {
-                    if (!std.mem.eql(u8, b.name, tok)) continue;
-                    if (sub == null) {
-                        sub = b.concrete;
-                        // Count whenever the legacy binding is the SOLE resolver -- including the
-                        // erased-lambda case (inst_opt == null), which is exactly the residual to prove.
-                        if (sema_shadow.tid_census) sema_shadow.subst_legacy_only += 1;
-                    } else if (sema_shadow.tid_census and !std.mem.eql(u8, b.concrete, sub.?)) {
-                        sema_shadow.subst_diverge += 1;
-                        const dl = @min(tok.len, sema_shadow.subst_diverge_last.len);
-                        @memcpy(sema_shadow.subst_diverge_last[0..dl], tok[0..dl]);
-                        sema_shadow.subst_diverge_last_len = dl;
-                    }
-                    break;
-                }
+            // Is this token a type-param of the active instance? Resolve it TypeId-native.
+            if (paramLeafByName(tok, inst)) |leaf| {
+                if (ir.tpResolve(leaf, inst)) |c| switch (ls.get(c)) {
+                    .unresolved, .type_param => {},
+                    else => sub = sema_shadow.renderLegacy(self.allocator, ls, c) catch null,
+                };
             }
 
             if (sub) |s| {

@@ -60,7 +60,6 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         // registration key and its lookup key agree: raw instantiation_id, else the name->live_inst_ids map.
         compiler.current_collecting_instantiation_id = compiler.functions.items[i].instantiation_id orelse
             (if (compiler.functions.items[i].instantiation) |inst| sema_mono.live_inst_ids.get(inst) else null);
-        compiler.current_collecting_method_subst = compiler.functions.items[i].method_subst;
         compiler.current_collecting_erased_generic = compiler.functions.items[i].erased_generic;
         try compiler.collectClosuresFromBlock(compiler.functions.items[i].body);
         i += 1;
@@ -68,7 +67,6 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
     compiler.current_collecting_function_name = null;
     compiler.current_collecting_instantiation = null;
     compiler.current_collecting_instantiation_id = null;
-    compiler.current_collecting_method_subst = null;
 
     if (t6_split) {
         var by_file = std.StringHashMap(usize).init(allocator);
@@ -671,8 +669,6 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         compiler.current_instantiation = func.instantiation;
         compiler.current_instantiation_id = func.instantiation_id orelse (if (func.instantiation) |inst| sema_mono.live_inst_ids.get(inst) else null);
 
-        compiler.current_method_subst = func.method_subst;
-
         if (func.instantiation) |inst| {
 
             compiler.current_struct_name = getStructBaseName(inst);
@@ -725,7 +721,7 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
                     const decl_name = try compiler.methodSymbol(owner, fn_decl.name);
                     defer allocator.free(decl_name);
 
-                    const is_spec = func.method_subst != null and
+                    const is_spec = func.instantiation_id != null and
                         std.mem.startsWith(u8, func.name, decl_name) and
                         func.name.len > decl_name.len + 2 and
                         std.mem.eql(u8, func.name[decl_name.len .. decl_name.len + 2], "__");
@@ -898,7 +894,6 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
 
         compiler.current_instantiation = func.instantiation;
         compiler.current_instantiation_id = func.instantiation_id orelse (if (func.instantiation) |inst| sema_mono.live_inst_ids.get(inst) else null);
-        compiler.current_method_subst = func.method_subst;
 
         if (func.instantiation) |inst| {
             compiler.current_struct_name = getStructBaseName(inst);

@@ -40,22 +40,8 @@ pub var census_dis_last_str_len: usize = 0;
 pub var census_dis_last_tid: [128]u8 = undefined;
 pub var census_dis_last_tid_len: usize = 0;
 
-// SE-C name-mangling cutover measurement: substMethodParams is now overlay-primary (paramLeafByName ->
-// tp_resolve -> renderLegacy). current_method_subst survives only as a per-token fallback. These count
-// where that fallback is still load-bearing (overlay null but a legacy binding matched) and where the
-// two resolvers DISAGREE on a token's concrete name (must be 0 -- a divergence is a real name bug).
-pub var subst_legacy_only: usize = 0;
-pub var subst_diverge: usize = 0;
-pub var subst_diverge_last: [128]u8 = undefined;
-pub var subst_diverge_last_len: usize = 0;
-
 pub fn tidCensusReport() void {
     if (!tid_census) return;
-    std.debug.print("=== SE-C substMethodParams: overlay-primary, legacy fallback usage ===\n", .{});
-    std.debug.print("  legacy_only_tokens={d}  overlay_vs_legacy_DIVERGE={d}\n", .{ subst_legacy_only, subst_diverge });
-    if (subst_diverge > 0) {
-        std.debug.print("  e.g. token diverged: '{s}'\n", .{subst_diverge_last[0..subst_diverge_last_len]});
-    }
     std.debug.print("=== TID census: string resolves, TypeId null (Phase-1 gaps) ===\n", .{});
     std.debug.print("  null_total={d}  ident={d} index={d} call={d} field={d} method_call={d} other={d}\n", .{
         census_total, census_kind_ident, census_kind_index, census_kind_call, census_kind_field, census_kind_method, census_kind_other,
