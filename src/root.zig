@@ -43,4 +43,9 @@ test {
     _ = @import("frontend/parser.zig");
     _ = @import("frontend/ast.zig");
     _ = @import("frontend/formatter.zig");
+
+    // Middle-end scaffold (M0): force full analysis of the optimiser IR + pass registry (refAllDecls,
+    // not a bare import -- Zig lazily skips unreferenced decls) even though it is not yet on the compile
+    // critical path. See docs/design/optimiser.md.
+    std.testing.refAllDeclsRecursive(@import("optimiser/driver.zig"));
 }
