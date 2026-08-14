@@ -17,7 +17,7 @@ const mir = @import("mir.zig");
 const HirId = hir.HirId;
 const Value = mir.Value;
 const Block = mir.Block;
-const placeholder_ty: mir.TypeId = @enumFromInt(0);
+const placeholder_ty: mir.TypeId = mir.unset_ty;
 
 const Ctx = struct {
     allocator: std.mem.Allocator,
@@ -71,7 +71,7 @@ fn lowerNode(ctx: *Ctx, id: HirId) anyerror!Value {
     const a = ctx.allocator;
     // Use the node's real (sema-threaded) TypeId for the values it produces; fall back to the placeholder
     // only where sema could not type it. This carries real types into MIR (and thence LIR) for the emit path.
-    const nty: mir.TypeId = if (@intFromEnum(node.ty) == 0) placeholder_ty else node.ty;
+    const nty: mir.TypeId = if (node.ty == hir.unset_ty) placeholder_ty else node.ty;
     return switch (node.kind) {
         .int => |v| mf.emit(a, ctx.cur, nty, .{ .const_int = v }),
         .bool => |v| mf.emit(a, ctx.cur, nty, .{ .const_int = if (v) 1 else 0 }),

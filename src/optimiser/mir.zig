@@ -12,6 +12,40 @@ const types = @import("../frontend/types.zig");
 pub const TypeId = types.TypeId;
 pub const SymbolId = types.SymbolId;
 
+// "No type threaded here yet." TypeId 0 is a REAL type (`int`), so 0 cannot mean unset; this out-of-range
+// value never collides with a real store index. Mirrors hir.unset_ty.
+pub const unset_ty: TypeId = @enumFromInt(0xFFFF_FFFF);
+
+// The sema TypeStore, set by the driver / emit path so passes (constfold) can resolve a TypeId's integer
+// width and stay width-honest (Nova's `int` is 32-bit; folding at i64 would miscompile a chained overflow).
+// Null when unset -> width-dependent folding is skipped (conservative, never wrong).
+pub var type_store: ?*const types.TypeStore = null;
+
+pub const IntWidth = struct { width: u16, signed: bool };
+
+// Resolve `tid` to its integer machine width/signedness via the store, or null if not an int prim / no store.
+pub fn intWidthOf(tid: TypeId) ?IntWidth {
+    const st = type_store orelse return null;
+    if (tid == unset_ty or @intFromEnum(tid) >= st.count()) return null;
+    return switch (st.get(tid)) {
+        .prim => |p| if (p.kind == .int) IntWidth{ .width = p.bits, .signed = p.signed } else null,
+        else => null,
+    };
+}
+
+// Wrap `v` into `width` bits (Nova's honest-int semantics): truncate, then sign- or zero-extend back to i64.
+// This is the i64-domain twin of codegen's canonicalizeInt, so a folded constant equals the runtime result.
+pub fn wrapToWidth(v: i64, width: u16, signed: bool) i64 {
+    if (width == 0 or width >= 64) return v;
+    if (signed) {
+        const shift: u6 = @intCast(64 - width);
+        const u = @as(u64, @bitCast(v)) << shift; // logical shift in the u64 domain (well-defined wrap)
+        return @as(i64, @bitCast(u)) >> shift; // arithmetic shift sign-extends from bit (width-1)
+    }
+    const mask: u64 = (@as(u64, 1) << @intCast(width)) - 1;
+    return @bitCast(@as(u64, @bitCast(v)) & mask);
+}
+
 pub const Value = enum(u32) { invalid = 0xFFFF_FFFF, _ };
 pub const Block = enum(u32) { _ };
 
@@ -215,7 +249,7 @@ pub const Func = struct {
 
     // Append a value-less instruction (store, release, ...) to block `b`.
     pub fn emitVoid(self: *Func, allocator: std.mem.Allocator, b: Block, op: Inst.Op) !void {
-        try self.blocks.items[@intFromEnum(b)].insts.append(allocator, .{ .result = .invalid, .ty = @enumFromInt(0), .op = op });
+        try self.blocks.items[@intFromEnum(b)].insts.append(allocator, .{ .result = .invalid, .ty = unset_ty, .op = op });
     }
 
     pub fn setTerm(self: *Func, b: Block, term: Terminator) void {

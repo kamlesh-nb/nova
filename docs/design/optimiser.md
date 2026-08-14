@@ -321,8 +321,36 @@ EMIT cutover is deliberately NOT faked. Precisely:
 - **M0 scaffold — DONE.** `src/optimiser/` with the IR types + pass registry, compiled by `zig build`.
 - **M1 lowering — DONE.** AST→HIR (100% of node forms), HIR→MIR (CFG, locals as memory), MIR→LIR
   (linear near-LLVM). Exercised over the whole corpus: 0 crashes, every function lowers through all four
-  tiers. **The EMIT half of M1 (codegen emitting from LIR, byte-equivalent) is NOT done** — there is no
-  LIR→LLVM emitter yet; codegen still lowers from the AST. So the pipeline is a shadow.
+  tiers.
+- **M1 emit half — WIRED, airtight, and EMITTING the optimised IR for its subset.** `src/backend/codegen/lir_emit.zig`
+  emits an LLVM function body from the optimised MIR, hooked into `declarations.zig` and gated by a SEPARATE
+  opt-in `NOVA_OPT_EMIT` (off by default, so default builds are byte-identical). It is a per-function
+  FALLBACK: `tryEmit` returns false for anything outside a provable subset and codegen then emits that
+  function from the AST unchanged. The subset is deliberately tiny (paramless, single straight-line block,
+  signed-int/bool only) and every emit is validated by a dry pass (`mirEmittable`) BEFORE any IR is built,
+  so a reject can never leave a half-filled entry block. Verified by differential execution over int
+  arithmetic, 32-bit overflow, chained overflow, comparisons and bitops: EMIT output is byte-identical to
+  the AST path, and the optimiser pipeline (constfold/mem2reg/copyprop/dce/simplifycfg) runs before the
+  emit. Getting here required fixing three real defects that the emit-first-slice surfaced:
+  1. **TypeId-0 / unset collision (the reason the subset looked empty).** Store TypeIds are dense indices
+     from 0, and `int` is interned first, so TypeId 0 is a REAL type — but the optimiser used `@intFromEnum(ty)==0`
+     to mean "no type threaded". Every `int`-typed value therefore read as untyped, and the airtight gate
+     rejected even `2 + 3*4`. Fixed with an out-of-range sentinel `unset_ty = 0xFFFF_FFFF` (`hir.zig`,
+     `mir.zig`) used everywhere the optimiser meant "unset"; the shadow's type-threading coverage jumps
+     accordingly and `int` values now resolve.
+  2. **constfold was not width-honest.** It folded integer arithmetic at i64 (`+%`/`*%`), so a chained
+     overflow like `(2e9 + 2e9) >> 20` diverged from the runtime's per-step 32-bit wrap. Fixed by giving the
+     optimiser the sema `TypeStore` (`mir.type_store`, set by the driver + emit path) and wrapping every
+     folded result to its MIR result-type width via `mir.wrapToWidth` — the i64-domain twin of codegen's
+     `canonicalizeInt`. (The "synthesised const has an invalid TypeId" symptom was a misdiagnosis: constfold
+     folds in place and keeps the binop's valid result type; the segfault was a `symbolName`-result
+     double-free in the emit path, also fixed — that string is not caller-owned.)
+  3. **Emit-time canonicalisation for narrowing/folded consts.** The emitter canonicalises each `const_int`
+     and `cast` to its result-type width, so a folded constant that overflows `int` wraps exactly as the AST
+     path would even when it reaches the emitter pre-wrapped.
+  Coverage note: the subset is still small by construction (paramless straight-line int/bool), so most
+  functions correctly fall back to the AST; growing it (params, control flow, calls, ARC, traits) is the
+  M6 work below, each increment gated the same way (dry-validate, differential, corpus + ASAN).
 - **M2 verifier — DONE.** SSA/terminator/operand-range checks, corpus-clean (0 verify errors) including
   after block-renumbering passes. The ARC-balance check is present but dormant (no ARC ops yet). The
   differential AST-vs-LIR shadow is N/A until the emitter exists.
@@ -350,8 +378,12 @@ EMIT cutover is deliberately NOT faked. Precisely:
 
 **Bottom line:** the middle-end and its optimiser are real, correct (verifier + unit tests), and
 measurably effective (27% MIR reduction) on the whole corpus, entirely behind `NOVA_OPT` with the trusted
-AST path untouched (corpus 340/341). What remains is the backend emit-cutover and the two threading
-prerequisites (ownership→ARC ops, symbols→call graph) that switch M4/M5 from unit-tested to firing.
+AST path untouched. The backend EMIT path now exists and emits the OPTIMISED IR for a small, airtight,
+differentially-verified subset behind `NOVA_OPT_EMIT` (default corpus + `NOVA_OPT_EMIT=1` corpus + ASAN all
+346/347). Unblocking it fixed a real whole-optimiser bug (the TypeId-0/unset collision — type-threading
+47%→84%) and made constfold width-honest. What remains is GROWING the emitted subset (params, control flow,
+calls, ARC, traits) toward the full backend and the two threading prerequisites (ownership→ARC ops,
+symbols→call graph) that switch M4/M5 from unit-tested to firing — the M6 cutover.
 
 ## One-paragraph summary
 

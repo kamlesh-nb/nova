@@ -187,6 +187,12 @@ fn compileProgram(
     // Optimiser middle-end (M1a, shadow). With NOVA_OPT set, lower every function AST->HIR and report
     // coverage -- exercised on real code, but does NOT emit (codegen below still lowers from the AST), so
     // it cannot change the produced program. See docs/design/optimiser.md.
+    // Emit-path (NOVA_OPT_EMIT) is a SEPARATE opt-in from the NOVA_OPT shadow: it makes codegen emit the
+    // emittable subset from the optimiser IR (see lir_emit.zig). Independent of the shadow reporting below.
+    @import("backend/codegen/lir_emit.zig").emit_enabled = init.environ_map.get("NOVA_OPT_EMIT") != null;
+    @import("backend/codegen/lir_emit.zig").emit_verbose = init.environ_map.get("NOVA_OPT_EMIT_VERBOSE") != null;
+    // Let optimiser passes (constfold width-honesty) resolve TypeId widths via the store.
+    @import("optimiser/mir.zig").type_store = &owned_sema.store;
     if (init.environ_map.get("NOVA_OPT") != null) {
         const verbose = init.environ_map.get("NOVA_OPT_VERBOSE") != null;
         _ = optimiser.lowerProgramShadow(allocator, program, &owned_sema.ir, &owned_sema.tab, verbose) catch |e| {

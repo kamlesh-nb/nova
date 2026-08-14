@@ -14,6 +14,10 @@ const ast = @import("../frontend/ast.zig");
 const types = @import("../frontend/types.zig");
 
 pub const TypeId = types.TypeId;
+
+// "No type threaded here yet." Store TypeIds are dense indices from 0 (TypeId 0 is a REAL type -- `int` is
+// interned first), so 0 cannot mean "unset". This out-of-range value can never collide with a real TypeId.
+pub const unset_ty: TypeId = @enumFromInt(0xFFFF_FFFF);
 pub const SymbolId = types.SymbolId;
 
 pub const HirId = enum(u32) { none = 0xFFFF_FFFF, _ };
@@ -33,7 +37,7 @@ pub const Arm = struct {
 
 pub const Node = struct {
     kind: Kind,
-    ty: TypeId = @enumFromInt(0), // filled by lowering once ExprId->TypeId threading lands (M1b)
+    ty: TypeId = unset_ty, // filled by lowering from the sema TypedIr; unset_ty until threaded
     span: ast.Span,
     expr_id: ast.ExprId = .unassigned, // source expression, for ownership lookup + diagnostics
 

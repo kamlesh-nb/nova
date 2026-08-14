@@ -188,7 +188,7 @@ fn lowerToMir(
     // Type-threading + call-resolution coverage (measured before opt/inline).
     cov.total_values += mfunc.value_types.items.len;
     for (mfunc.value_types.items) |vt| {
-        if (@intFromEnum(vt) != 0) cov.typed_values += 1;
+        if (vt != mir.unset_ty) cov.typed_values += 1;
     }
     for (mfunc.blocks.items) |b| for (b.insts.items) |inst| {
         if (inst.op == .call) {

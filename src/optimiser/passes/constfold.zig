@@ -34,7 +34,13 @@ fn run(allocator: std.mem.Allocator, func: *mir.Func) anyerror!bool {
                     const lk = konst[@intFromEnum(bin.lhs)];
                     const rk = konst[@intFromEnum(bin.rhs)];
                     if (lk != null and rk != null) {
-                        if (fold(bin.op, lk.?, rk.?)) |result| {
+                        if (fold(bin.op, lk.?, rk.?)) |raw| {
+                            // Width-honesty: Nova's `int` is 32-bit, so a folded arithmetic result must wrap
+                            // to the RESULT type's width exactly as the runtime does (codegen's
+                            // canonicalizeInt). Folding purely at i64 would miscompile a chained overflow such
+                            // as `(2e9 + 2e9) >> 20`. If the result type's width is unknown (no store / not an
+                            // int prim, e.g. a bool compare result), leave the raw fold -- it is already 0/1.
+                            const result = if (mir.intWidthOf(inst.ty)) |w| mir.wrapToWidth(raw, w.width, w.signed) else raw;
                             inst.op = .{ .const_int = result };
                             if (inst.result != .invalid) konst[@intFromEnum(inst.result)] = result;
                             changed = true;
