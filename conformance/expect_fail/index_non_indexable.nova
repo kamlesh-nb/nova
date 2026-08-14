@@ -1,0 +1,16 @@
+// EXPECT-FAIL: typecheck
+// L1 / K6: indexing a non-indexable type with `[]` must be rejected. Before the fix, `p[0]` on a struct
+// (or a scalar) was never type-checked and lowered to raw pointer arithmetic — it silently read the first
+// field and segfaulted (ASAN BUS) on a large index. `[]` is valid only on strings, arrays, tuples, and
+// byte buffers; List/Map are indexed via `.get`. This case must FAIL to compile — if it ever compiles,
+// the index type-check has regressed.
+
+struct P {
+    pub x: int,
+}
+
+@test
+fn indexing_a_struct_is_rejected(): void {
+    let p: P = P{ x: 5 };
+    let bad = p[0];   // rejected: cannot index a value of type 'P' with `[]`
+}

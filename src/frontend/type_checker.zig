@@ -820,6 +820,13 @@ pub const TypeChecker = struct {
             .index => |idx| {
                 try self.checkExpr(idx.object.*);
                 try self.checkExpr(idx.index.*);
+                // L1/K6: reject `[]` on a definitely-non-indexable type (a scalar, user struct, or enum).
+                // Fail-open on unknowns/type-params/generics so valid generic code is never rejected.
+                if (self.resolveExprType(idx.object.*)) |obj_ty| {
+                    if (self.indexableTypeStatus(obj_ty)) |ok| {
+                        if (!ok) self.addError(idx.object.*.span, "cannot index a value of type '{s}' with `[]` — `[]` is only valid on strings, arrays, tuples, and byte buffers (List/Map use `.get`)", .{typeRefName(obj_ty)});
+                    }
+                }
             },
             .struct_init => |si| {
                 for (si.fields) |field| try self.checkExpr(field.value);
@@ -1172,6 +1179,25 @@ pub const TypeChecker = struct {
         const out = self.allocator.alloc(ast.TypeRef, f.type_params.len) catch return null;
         for (binds, 0..) |b, k| out[k] = b orelse return null;
         return out;
+    }
+
+    // L1/K6 fail-closed index check: is `[]` valid on a value of this type? Returns true (indexable),
+    // false (definitely NOT -- reject), or null (unknown / type-param -- allow, stay fail-open). `[]` is
+    // valid on string, ptr/byte buffers, fixed arrays, and tuples; List/Map are indexed via `.get`, not
+    // `[]`, so a plain struct/enum/scalar is never `[]`-indexable.
+    fn indexableTypeStatus(self: *TypeChecker, tr: ast.TypeRef) ?bool {
+        return switch (tr) {
+            .fixed_array, .tuple => true,
+            .ident => |name| blk: {
+                const n = canonicalizeTypeName(name);
+                if (std.mem.eql(u8, n, "string") or std.mem.eql(u8, n, "ptr") or
+                    std.mem.eql(u8, n, "bytes") or std.mem.eql(u8, n, "RawBuffer")) break :blk true;
+                if (isScalarPrimitiveName(n)) break :blk false;
+                if (self.structs.contains(name) or self.enums.contains(name)) break :blk false;
+                break :blk null; // unknown / type-param -> allow
+            },
+            else => null, // generic (List/Map use .get), optional, error_union, func -> do not reject
+        };
     }
 
     fn resolveExprType(self: *TypeChecker, expr: ast.Expression) ?ast.TypeRef {
@@ -1552,6 +1578,12 @@ pub const TypeChecker = struct {
         _ = c;
     }
 };
+
+fn isScalarPrimitiveName(n: []const u8) bool {
+    const scalars = [_][]const u8{ "int", "long", "short", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "usize", "uint", "ulong", "ushort", "f32", "f64", "float", "double", "bool", "decimal", "byte", "char", "void" };
+    for (scalars) |s| if (std.mem.eql(u8, n, s)) return true;
+    return false;
+}
 
 fn canonicalizeTypeName(name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "byte") or std.mem.eql(u8, name, "ubyte")) return "i8";
