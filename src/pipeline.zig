@@ -281,8 +281,9 @@ pub fn configureValueStructs(allocator: std.mem.Allocator, environ: anytype) voi
     // trait impl, colliding module-scoped name, non-scalar/non-string field) keep every unsafe shape
     // on the heap; corpus + ASAN are green under the flip. NOVA_VALUE_STRUCTS_OFF is the escape hatch
     // (reverts to the all-reference model); NOVA_VALUE_TYPES=A,B narrows to named types for A/B tests.
-    if (environ.get("NOVA_VALUE_STRUCTS_OFF") != null) return; // all-reference model
+    if (environ.get("NOVA_VALUE_STRUCTS_OFF") != null) return; // escape hatch: all-reference model
     if (environ.get("NOVA_VALUE_TYPES")) |list| {
+        // A/B narrowing: value-lower only the named types (leave the rest reference).
         var set = std.StringHashMap(void).init(allocator);
         var it = std.mem.tokenizeScalar(u8, list, ',');
         while (it.next()) |name| {
@@ -293,7 +294,14 @@ pub fn configureValueStructs(allocator: std.mem.Allocator, environ: anytype) voi
         }
         codegen_arc.value_type_set = set;
         codegen_arc.value_structs_enabled = true;
+        return;
     }
+    // DEFAULT: `struct` is a value type, `class` is reference. Every non-`class` struct is value-lowered
+    // (stack alloca, no ARC, copy-on-assign) unless the escape analysis (isValueStructName +
+    // computeValueEscapeSet) keeps it on the heap for safety. This makes the language's stated semantics
+    // (struct = value, class = reference) the actual default; NOVA_VALUE_STRUCTS_OFF reverts to all-reference.
+    codegen_arc.value_structs_enabled = true;
+    codegen_arc.value_structs_all = true;
 }
 
 const type_checker = @import("frontend/type_checker.zig");

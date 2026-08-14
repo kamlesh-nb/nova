@@ -221,7 +221,13 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
                     // container get like list.at(i)) so the local is independent of the source buffer.
                     // A fresh `Point(...)` construction already yields its own storage (not a borrow).
                     if (target_type) |tt| {
-                        if (self.isValueStructName(tt) and self.returnIsBorrow(&init)) {
+                        // A value struct assigned FROM a borrow must copy into its own storage, else `b` aliases
+                        // `a` and `b.x = ...` mutates `a` (reference semantics -- the bug). A borrow here is a
+                        // bare variable (`.ident`), a field/index read, or a container get; a fresh
+                        // construction (`Struct{...}`/`Ctor(...)`) already owns distinct storage. NOTE:
+                        // `returnIsBorrow` deliberately answers FALSE for `.ident` (a return of a frame-local
+                        // dangles), so it is the wrong predicate alone -- `.ident` is exactly the copy case.
+                        if (self.isValueStructName(tt) and (init.kind == .ident or self.returnIsBorrow(&init))) {
                             const vsz = self.getTypeSize(ast.TypeRef{ .ident = getStructBaseName(tt) }, false);
                             val = try self.buildValueStructCopy(val, vsz);
                             // Owned (reference) fields are now aliased by source + copy; retain them

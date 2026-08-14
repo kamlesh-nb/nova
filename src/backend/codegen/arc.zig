@@ -1381,7 +1381,9 @@ pub var elide_count: usize = 0;
 // flip is rolled out per type behind these gates, verified one type at a time:
 //   NOVA_VALUE_STRUCTS_ALL  -> every is_reference==false struct is value-lowered.
 //   NOVA_VALUE_TYPES=A,B,C  -> only the named base types are value-lowered.
-// Default (neither set): value_structs_enabled == false, so codegen is UNCHANGED (all reference).
+// Set by configureValueStructs at startup. DEFAULT is now value-structs-ON (struct = value, class =
+// reference); NOVA_VALUE_STRUCTS_OFF reverts to the all-reference model. These start false and are flipped
+// on before codegen; a unit test / bare codegen call with no configure step stays all-reference.
 pub var value_structs_enabled: bool = false;
 pub var value_structs_all: bool = false;
 pub var value_type_set: ?std.StringHashMap(void) = null;
