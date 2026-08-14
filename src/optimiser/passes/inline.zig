@@ -29,23 +29,29 @@ fn run(allocator: std.mem.Allocator, func: *mir.Func) anyerror!bool {
 pub const Callee = struct { sym: mir.SymbolId, func: *const mir.Func };
 
 // Inline every call in `caller` to a small single-block callee from `callees`. Returns true if anything
-// was inlined. `max_insts` bounds the callee size that will be inlined.
+// was inlined. `max_insts` bounds the callee size. Rebuilds each block's instruction list rather than
+// mutating in place, so spliced instructions are never re-examined (single-level inlining per invocation;
+// nested inlining would come from re-running the pass). A callee's `ret v` supplies the value that
+// replaces the call's result.
 pub fn inlineSmallCallees(allocator: std.mem.Allocator, caller: *mir.Func, callees: []const Callee, max_insts: usize) !bool {
     var changed = false;
     for (caller.blocks.items) |*b| {
-        var i: usize = 0;
-        while (i < b.insts.items.len) : (i += 1) {
-            const inst = b.insts.items[i];
-            if (inst.op != .call) continue;
-            const target = findCallee(callees, inst.op.call.callee) orelse continue;
-            if (target.blocks.items.len != 1) continue; // single-block callees only, for now
-            if (target.blocks.items[0].insts.items.len > max_insts) continue;
-
-            try spliceSingleBlock(allocator, caller, b, i, inst.result, target);
-            changed = true;
-            // the call at i was replaced by the splice; continue after the inserted body
-            i = i; // re-evaluate from the same index (spliceSingleBlock removed the call)
+        var out = std.ArrayListUnmanaged(mir.Inst).empty;
+        errdefer out.deinit(allocator);
+        for (b.insts.items) |inst| {
+            if (inst.op == .call) {
+                if (findCallee(callees, inst.op.call.callee)) |target| {
+                    if (target != caller and target.blocks.items.len == 1 and target.blocks.items[0].insts.items.len <= max_insts) {
+                        try spliceInto(allocator, caller, &out, inst.result, target);
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
+            try out.append(allocator, inst);
         }
+        b.insts.deinit(allocator);
+        b.insts = out;
     }
     return changed;
 }
@@ -55,38 +61,34 @@ fn findCallee(callees: []const Callee, sym: mir.SymbolId) ?*const mir.Func {
     return null;
 }
 
-// Splice a single-block callee's instructions into `b` at index `call_idx`, replacing the call. New
-// caller Values are minted for each callee Value; the callee's `ret v` supplies the value that replaces
-// the call's result.
-fn spliceSingleBlock(allocator: std.mem.Allocator, caller: *mir.Func, b: *mir.BasicBlock, call_idx: usize, call_result: mir.Value, callee: *const mir.Func) !void {
+// Append a single-block callee's instructions (with operands remapped to fresh caller Values) onto `out`,
+// and replace uses of the call's result with the callee's returned value.
+fn spliceInto(allocator: std.mem.Allocator, caller: *mir.Func, out: *std.ArrayListUnmanaged(mir.Inst), call_result: mir.Value, callee: *const mir.Func) !void {
     const cblock = callee.blocks.items[0];
 
-    // Map callee Value -> caller Value.
     const vmap = try allocator.alloc(mir.Value, callee.value_types.items.len);
     defer allocator.free(vmap);
     for (0..callee.value_types.items.len) |k| {
         vmap[k] = try caller.newValue(allocator, callee.value_types.items[k]);
     }
 
-    // Build the spliced instructions with remapped operands.
-    var spliced = std.ArrayListUnmanaged(mir.Inst).empty;
-    defer spliced.deinit(allocator);
     for (cblock.insts.items) |cinst| {
         var ni = cinst;
         if (cinst.result != .invalid) ni.result = vmap[@intFromEnum(cinst.result)];
+        // Duplicate any args slice before remapping: `ni = cinst` shares the callee's slice, and remapOp
+        // mutates operands in place -- without a copy it would corrupt the (const) callee body.
+        switch (ni.op) {
+            .call => |*x| x.args = try allocator.dupe(mir.Value, x.args),
+            .indirect_call => |*x| x.args = try allocator.dupe(mir.Value, x.args),
+            .spawn_ => |*x| x.args = try allocator.dupe(mir.Value, x.args),
+            else => {},
+        }
         remapOp(&ni.op, vmap);
-        try spliced.append(allocator, ni);
+        try out.append(allocator, ni);
     }
 
-    // Insert the spliced instructions in place of the call.
-    _ = b.insts.orderedRemove(call_idx);
-    try b.insts.insertSlice(allocator, call_idx, spliced.items);
-
-    // Replace uses of the call's result with the callee's returned value (remapped).
-    if (call_result != .invalid) {
-        if (cblock.term == .ret) {
-            if (cblock.term.ret) |rv| mir.replaceUses(caller, call_result, vmap[@intFromEnum(rv)]);
-        }
+    if (call_result != .invalid and cblock.term == .ret) {
+        if (cblock.term.ret) |rv| mir.replaceUses(caller, call_result, vmap[@intFromEnum(rv)]);
     }
 }
 

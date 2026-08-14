@@ -14,6 +14,8 @@ const builtin = @import("builtin");
 
 const ast = @import("../frontend/ast.zig");
 const infer = @import("../frontend/sema/infer.zig");
+const symbols = @import("../frontend/sema/symbols.zig");
+const inline_pass = @import("passes/inline.zig");
 const hir = @import("hir.zig");
 const mir = @import("mir.zig");
 const lir = @import("lir.zig");
@@ -62,23 +64,73 @@ pub const Coverage = struct {
     total_values: usize = 0,
     calls_total: usize = 0,
     calls_resolved: usize = 0, // call ops whose callee SymbolId is resolved (not the unresolved sentinel)
+    calls_inlined: usize = 0, // calls replaced by inlining a small callee (M5)
 };
 
 // M1a shadow: lower every function in the program AST->HIR and report coverage. Does NOT emit; the AST
 // path still produces the program. Gated by NOVA_OPT in builder.zig. Never fatal: a lowering that hits a
 // not-yet-handled form records it as `.unsupported` and keeps going, so this is safe to run over the whole
 // corpus. Prints a summary and, with NOVA_OPT_VERBOSE, the unsupported-tag histogram.
-pub fn lowerProgramShadow(allocator: std.mem.Allocator, program: ast.Program, ir: ?*const infer.TypedIr, verbose: bool) !Coverage {
+pub fn lowerProgramShadow(allocator: std.mem.Allocator, program: ast.Program, ir: ?*const infer.TypedIr, tab: ?*const symbols.SymbolTable, verbose: bool) !Coverage {
     var cov = Coverage{};
     var unsupported_by_tag = std.StringHashMap(usize).init(allocator);
     defer unsupported_by_tag.deinit();
 
+    // Two-pass: lower ALL functions to MIR first (so a call graph exists), then inline + optimise each.
+    var funcs = std.ArrayListUnmanaged(mir.Func).empty;
+    defer {
+        for (funcs.items) |*f| f.deinit(allocator);
+        funcs.deinit(allocator);
+    }
+    var own_syms = std.ArrayListUnmanaged(?mir.SymbolId).empty;
+    defer own_syms.deinit(allocator);
+
     for (program.declarations) |decl| {
         switch (decl) {
-            .fn_decl => |fd| try lowerOneShadow(allocator, fd, ir, &cov, &unsupported_by_tag),
-            .struct_decl => |sd| for (sd.methods) |m| try lowerOneShadow(allocator, m.decl, ir, &cov, &unsupported_by_tag),
+            .fn_decl => |fd| {
+                const s: ?mir.SymbolId = if (tab) |t| t.findFunction(fd.name) else null;
+                try lowerToMir(allocator, fd, ir, s, &cov, &unsupported_by_tag, &funcs, &own_syms);
+            },
+            .struct_decl => |sd| for (sd.methods) |m| {
+                try lowerToMir(allocator, m.decl, ir, null, &cov, &unsupported_by_tag, &funcs, &own_syms);
+            },
             else => {},
         }
+    }
+
+    // Build the call graph: single-block, small, symbol-resolved functions are the inline candidates.
+    for (funcs.items, own_syms.items) |*f, s| {
+        if (s) |sv| f.sym = sv;
+    }
+    var callees = std.ArrayListUnmanaged(inline_pass.Callee).empty;
+    defer callees.deinit(allocator);
+    for (funcs.items, own_syms.items) |*f, s| {
+        if (s) |sv| {
+            if (f.blocks.items.len == 1 and countInsts(f) <= 16) {
+                try callees.append(allocator, .{ .sym = sv, .func = f });
+            }
+        }
+    }
+
+    // Pass 2: inline small callees (M5), then run the optimiser pipeline + lower to LIR, measuring.
+    for (funcs.items) |*f| {
+        const calls_before = countCalls(f);
+        _ = inline_pass.inlineSmallCallees(allocator, f, callees.items, 16) catch false;
+        const calls_after = countCalls(f);
+        if (calls_before > calls_after) cov.calls_inlined += calls_before - calls_after;
+
+        const before = countInsts(f);
+        const arc_before = countArc(f);
+        cov.arc_ops += arc_before;
+        _ = optimise(allocator, f) catch 0;
+        const after = countInsts(f);
+        if (before > after) cov.insts_removed += before - after;
+        const arc_after = countArc(f);
+        if (arc_before > arc_after) cov.arc_removed += arc_before - arc_after;
+
+        var lfunc = lower_mir_lir.lowerFunc(allocator, f.*) catch continue;
+        defer lfunc.deinit(allocator);
+        cov.lir_ops += lfunc.ops.items.len;
     }
 
     std.debug.print("[opt] AST->HIR->MIR->LIR shadow: {d} fns, {d} HIR nodes ({d:.1}% covered), {d} MIR blocks, {d} MIR insts, {d} verify errors, {d} insts removed, {d} LIR ops | ARC: {d} ops threaded, {d} removed by arc_elision\n", .{
@@ -93,6 +145,7 @@ pub fn lowerProgramShadow(allocator: std.mem.Allocator, program: ast.Program, ir
         cov.calls_resolved, cov.calls_total,
         if (cov.calls_total == 0) @as(f64, 0.0) else 100.0 * @as(f64, @floatFromInt(cov.calls_resolved)) / @as(f64, @floatFromInt(cov.calls_total)),
     });
+    std.debug.print("[opt]   call graph: {d} calls inlined by M5\n", .{cov.calls_inlined});
     if (verbose) {
         var it = unsupported_by_tag.iterator();
         while (it.next()) |e| std.debug.print("[opt]   unsupported {s}: {d}\n", .{ e.key_ptr.*, e.value_ptr.* });
@@ -100,7 +153,19 @@ pub fn lowerProgramShadow(allocator: std.mem.Allocator, program: ast.Program, ir
     return cov;
 }
 
-fn lowerOneShadow(allocator: std.mem.Allocator, fd: ast.FunctionDecl, ir: ?*const infer.TypedIr, cov: *Coverage, hist: *std.StringHashMap(usize)) !void {
+// Pass 1: lower one function AST -> HIR -> MIR, count coverage, and STORE the MIR (kept alive so a call
+// graph across all functions exists). Optimisation + LIR happen in pass 2. `own_sym` is the function's own
+// SymbolId (free fns; null for methods), the key it is entered into the call graph under.
+fn lowerToMir(
+    allocator: std.mem.Allocator,
+    fd: ast.FunctionDecl,
+    ir: ?*const infer.TypedIr,
+    own_sym: ?mir.SymbolId,
+    cov: *Coverage,
+    hist: *std.StringHashMap(usize),
+    funcs: *std.ArrayListUnmanaged(mir.Func),
+    own_syms: *std.ArrayListUnmanaged(?mir.SymbolId),
+) !void {
     if (fd.extern_lib != null) return; // no body to lower
 
     // AST -> HIR (with ARC ops threaded when the TypedIr is available)
@@ -116,13 +181,11 @@ fn lowerOneShadow(allocator: std.mem.Allocator, fd: ast.FunctionDecl, ir: ?*cons
         }
     }
 
-    // HIR -> MIR
+    // HIR -> MIR (kept; freed by lowerProgramShadow's defer)
     var mfunc = try lower_hir_mir.lowerFunc(allocator, hfunc);
-    defer mfunc.deinit(allocator);
     cov.mir_blocks += mfunc.blocks.items.len;
-    const before = countInsts(&mfunc);
-    cov.mir_insts += before;
-    // Type-threading coverage (emit-path prerequisite): how many MIR values carry a real TypeId.
+    cov.mir_insts += countInsts(&mfunc);
+    // Type-threading + call-resolution coverage (measured before opt/inline).
     cov.total_values += mfunc.value_types.items.len;
     for (mfunc.value_types.items) |vt| {
         if (@intFromEnum(vt) != 0) cov.typed_values += 1;
@@ -139,19 +202,16 @@ fn lowerOneShadow(allocator: std.mem.Allocator, fd: ast.FunctionDecl, ir: ?*cons
     defer allocator.free(violations);
     cov.verify_errors += violations.len;
 
-    // Count ARC ops threaded into MIR, then run the optimiser pipeline (M3/M4) and measure removals.
-    const arc_before = countArc(&mfunc);
-    cov.arc_ops += arc_before;
-    _ = optimise(allocator, &mfunc) catch 0;
-    const after = countInsts(&mfunc);
-    if (before > after) cov.insts_removed += before - after;
-    const arc_after = countArc(&mfunc);
-    if (arc_before > arc_after) cov.arc_removed += arc_before - arc_after;
+    try funcs.append(allocator, mfunc);
+    try own_syms.append(allocator, own_sym);
+}
 
-    // MIR -> LIR: complete the tier chain (the decision-free stream the backend will emit from).
-    var lfunc = try lower_mir_lir.lowerFunc(allocator, mfunc);
-    defer lfunc.deinit(allocator);
-    cov.lir_ops += lfunc.ops.items.len;
+fn countCalls(mf: *const mir.Func) usize {
+    var n: usize = 0;
+    for (mf.blocks.items) |b| for (b.insts.items) |inst| {
+        if (inst.op == .call) n += 1;
+    };
+    return n;
 }
 
 fn countInsts(mf: *const mir.Func) usize {
