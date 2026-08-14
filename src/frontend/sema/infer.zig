@@ -285,6 +285,17 @@ pub const RetOptionalError = struct {
     val: TypeId,
 };
 
+// L2 (gaps.md C-chk-6). A possibly-`undefined` value used where a plain (non-optional) type is required,
+// at a position OTHER than return: a let-binding with a declared plain type, or a call argument bound to a
+// plain parameter. The return position is C-chk-3 (RetOptionalError). `ctx` names the position for the
+// diagnostic. `want` is the required plain type, `got` the optional value type (post-narrowing).
+pub const ValoptPosError = struct {
+    span: ast.Span,
+    want: TypeId,
+    got: TypeId,
+    ctx: []const u8,
+};
+
 // A1 (gaps.md C-chk-1). A method call `obj.m(...)` whose argument count does not match the method's declared
 // parameters (Nova has no default or variadic params, so the arity is exact). Was previously unchecked and
 // produced an LLVMVerificationError with no source span; free-function/constructor arity was already checked
@@ -325,6 +336,7 @@ pub const Inferer = struct {
     cond_type_errors: std.ArrayListUnmanaged(CondTypeError) = .empty,
 
     ret_optional_errors: std.ArrayListUnmanaged(RetOptionalError) = .empty,
+    valopt_pos_errors: std.ArrayListUnmanaged(ValoptPosError) = .empty,
 
     method_arity_errors: std.ArrayListUnmanaged(MethodArityError) = .empty,
 
@@ -612,6 +624,13 @@ pub const Inferer = struct {
                             self.const_reassign_errors.append(self.allocator, .{ .span = b.span, .name = b.left.kind.ident }) catch {};
                         }
                         const at = try self.inferExpr(b.right);
+                        // L2/C-chk-6 part 3: reassigning a narrowed variable to a possibly-`undefined` value
+                        // invalidates the narrowing, so a later plain use of it is caught (before, the stale
+                        // narrowing let the reassigned optional be read as present -> crash). Targeted: only
+                        // when the RHS is optional and the current binding is not, so no broad flow change.
+                        if (b.left.kind == .ident and self.store.get(at) == .optional and self.store.get(lt) != .optional) {
+                            self.rebind(b.left.kind.ident, at);
+                        }
                         if (self.store.get(lt) == .unresolved) {
                             return if (self.store.get(at) == .unresolved)
                                 self.unresolved("assign")
@@ -700,6 +719,7 @@ pub const Inferer = struct {
                 for (c.args, 0..) |*a, i| {
                     const exp: ?TypeId = if (want) |w| (if (i < w.len) w[i] else null) else null;
                     const at = try self.inferExprExpecting(a, exp);
+                    if (exp) |pe| self.checkPlainTarget(a.span, pe, at, "passed as an argument to a parameter of type"); // L2/C-chk-6
                     try arg_types.append(self.allocator, at);
                 }
                 if (c.callee.kind == .ident) {
@@ -1990,7 +2010,10 @@ pub const Inferer = struct {
                     t = try self.lowerer.lower(declared);
                     self.checkTypeRefVis(declared, ls.span);
 
-                    if (ls.init) |*i| _ = try self.inferExprExpecting(i, t);
+                    if (ls.init) |*i| {
+                        const it = try self.inferExprExpecting(i, t);
+                        self.checkPlainTarget(i.span, t, it, "assigned to a variable of type"); // L2/C-chk-6
+                    }
                 } else if (ls.init) |*i| {
                     // A closure whose param types cannot be pinned from its body alone (e.g.
                     // `let add = (a, b) => a + b`) infers as unresolved on its own. Look ahead to a
@@ -2093,6 +2116,17 @@ pub const Inferer = struct {
             },
             .defer_stmt => |*d| _ = try self.inferExpr(&d.expr),
 .break_stmt, .continue_stmt => {},
+        }
+    }
+
+    // L2 (C-chk-6): flag a possibly-`undefined` value (`got` == optional, post-narrowing) used where a plain
+    // non-optional type (`want`) is required, at a let-binding or call-argument position. Fail-closed only
+    // on a resolved plain want and a resolved optional got, so unresolved/generic positions never false-fire.
+    fn checkPlainTarget(self: *Inferer, span: ast.Span, want: TypeId, got: TypeId, ctx: []const u8) void {
+        const wk = self.store.get(want);
+        const plain = wk != .optional and wk != .unresolved and wk != .any_ and wk != .error_union and wk != .type_param;
+        if (plain and self.store.get(got) == .optional) {
+            self.valopt_pos_errors.append(self.allocator, .{ .span = span, .want = want, .got = got, .ctx = ctx }) catch {};
         }
     }
 

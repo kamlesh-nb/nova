@@ -1,0 +1,12 @@
+// EXPECT-FAIL: typecheck
+// L2 / C-chk-6: passing a possibly-`undefined` value to a plain (non-optional) parameter must be rejected.
+// This must FAIL to compile.
+import assert;
+fn need(s: string): int { return 1; }
+fn get(b: bool): string | undefined { if (b) { return "x"; } return undefined; }
+@test
+fn optional_to_plain_arg_is_rejected(): void {
+    let x = get(false);
+    let r = need(x);     // rejected: possibly-undefined passed to plain 'string' param
+    assert.isTrue(r > 0);
+}

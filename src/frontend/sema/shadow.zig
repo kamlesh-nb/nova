@@ -431,6 +431,19 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
         std.process.exit(1);
     }
 
+    if (inf.valopt_pos_errors.items.len > 0) {
+        std.debug.print("Type checking failed with {d} error(s):\n", .{inf.valopt_pos_errors.items.len});
+        for (inf.valopt_pos_errors.items) |ve| {
+            const want_name = renderLegacy(allocator, store, ve.want) catch "<type>";
+            const got_name = renderLegacy(allocator, store, ve.got) catch "<type>";
+            std.debug.print(
+                "  \x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m a possibly-`undefined` value of type '{s}' {s} '{s}'. Make it present first: `x ?? default`, or narrow with `if (x != undefined) {{ … }}`.\x1b[0m\n",
+                .{ ve.span.file, ve.span.line, ve.span.col, got_name, ve.ctx, want_name },
+            );
+        }
+        std.process.exit(1);
+    }
+
     if (inf.method_arity_errors.items.len > 0) {
         std.debug.print("Type checking failed with {d} error(s):\n", .{inf.method_arity_errors.items.len});
         for (inf.method_arity_errors.items) |me| {
