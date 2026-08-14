@@ -329,14 +329,16 @@ EMIT cutover is deliberately NOT faked. Precisely:
 - **M3 safe passes — DONE and firing.** mem2reg (local load-forwarding), constfold, copyprop (algebraic
   identities), dce, simplifycfg (const/dup-target branch folding + dead-block elimination with renumber).
   Measured over the whole corpus: **~27% of all MIR instructions removed** (871k / 3.11M), 0 verify errors.
-- **M4 arc_elision — FIRING on real code.** The ownership pass now threads explicit ARC ops into HIR from
-  `TypedIr.ownedOf` (owned `let` -> owned local -> `release` at every function exit; owned-local copy ->
-  `retain`), mem2reg fully promotes non-escaping single-block slots (removing the dead stores that were
-  falsely reading as escapes), and arc_elision cancels the balanced pairs. Over the full corpus: **32,050
-  ARC ops threaded, 1,007 redundant retain/release pairs cancelled**, 0 verify errors, 0 crashes. This is
-  a first ownership model (function-scope releases; over-releases a returned value, harmless in the
-  shadow). Refinements: precise per-scope / move-out placement, and cross-block arc_elision, will raise
-  the cancellation rate.
+- **M4 arc_elision — FIRING on real code.** The ownership pass threads explicit ARC ops into HIR from
+  `TypedIr.ownedOf` (owned `let` -> owned local; owned-local copy -> `retain`). Releases are placed by
+  lexical SCOPE as HIR nodes: at the end of the declaring block, before a `return` (all enclosing owned
+  locals except one moved out by `return x`), and before `break`/`continue` (the scopes the jump exits).
+  mem2reg fully promotes non-escaping single-block slots (removing the dead stores that were falsely
+  reading as escapes), and arc_elision cancels balanced pairs over straight-line block TRACES (a chain of
+  blocks joined by unconditional `br` into single-predecessor successors), not just within one block.
+  Over the full corpus: **24,498 ARC ops threaded, 1,651 pairs cancelled (6.7%)**, 0 verify errors, 0
+  crashes. Remaining headroom: dominance-based cross-branch elision, and retain/release motion into +1
+  call sinks.
 - **M5 inline — algorithm DONE + unit-tested; DORMANT on real code.** Single-block callee splicing is
   implemented and unit-tested. **Activation prerequisite: a MIR call graph** (symbol resolution wiring
   each `call` to its callee `MirFunc`); the lowering currently leaves callees as placeholders.
