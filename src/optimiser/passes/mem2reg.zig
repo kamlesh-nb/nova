@@ -46,6 +46,29 @@ fn run(allocator: std.mem.Allocator, func: *mir.Func) anyerror!bool {
         for (mir.termOperands(b.term, &tbuf)) |v| escaped[@intFromEnum(v)] = true;
     }
 
+    // Which block each slot is used in (as load/store addr). block_of[slot] = the single block index, or
+    // sentinel "many" if it appears in more than one block. Used to fully promote single-block slots.
+    const many = std.math.maxInt(u32);
+    const block_of = try allocator.alloc(u32, nvalues);
+    defer allocator.free(block_of);
+    @memset(block_of, many - 1); // "unset"
+    for (func.blocks.items, 0..) |b, bi| {
+        for (b.insts.items) |inst| {
+            const addr: ?mir.Value = switch (inst.op) {
+                .load => |x| x.addr,
+                .store => |x| x.addr,
+                .alloc => inst.result,
+                else => null,
+            };
+            if (addr) |v| {
+                if (@intFromEnum(v) < nvalues and is_slot[@intFromEnum(v)]) {
+                    const cur = block_of[@intFromEnum(v)];
+                    if (cur == many - 1) block_of[@intFromEnum(v)] = @intCast(bi) else if (cur != bi) block_of[@intFromEnum(v)] = many;
+                }
+            }
+        }
+    }
+
     // Intra-block load-forwarding.
     var changed = false;
     // last[slot] = most recent stored value within the current block, or .invalid if unknown.
@@ -75,6 +98,30 @@ fn run(allocator: std.mem.Allocator, func: *mir.Func) anyerror!bool {
                 else => {},
             }
         }
+    }
+
+    // Full promotion: a non-escaping slot confined to ONE block has had every load forwarded, so its
+    // stores are dead-writes and its alloc is dead memory. Remove them (the forwarded loads are unused and
+    // fall to dce). This clears false "escapes into a slot" that would otherwise block arc_elision.
+    for (func.blocks.items) |*b| {
+        var w: usize = 0;
+        for (b.insts.items) |inst| {
+            const slot: ?mir.Value = switch (inst.op) {
+                .store => |x| x.addr,
+                .alloc => inst.result,
+                else => null,
+            };
+            if (slot) |s| {
+                const si = @intFromEnum(s);
+                if (si < nvalues and is_slot[si] and !escaped[si] and block_of[si] != many) {
+                    changed = true;
+                    continue; // drop the dead store / alloc
+                }
+            }
+            b.insts.items[w] = inst;
+            w += 1;
+        }
+        b.insts.items.len = w;
     }
     return changed;
 }

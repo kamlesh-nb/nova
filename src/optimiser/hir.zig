@@ -35,6 +35,7 @@ pub const Node = struct {
     kind: Kind,
     ty: TypeId = @enumFromInt(0), // filled by lowering once ExprId->TypeId threading lands (M1b)
     span: ast.Span,
+    expr_id: ast.ExprId = .unassigned, // source expression, for ownership lookup + diagnostics
 
     pub const Kind = union(enum) {
         // literals
@@ -94,6 +95,8 @@ pub const Func = struct {
     inst: ?TypeId = null,
     nodes: std.ArrayListUnmanaged(Node) = .empty,
     entry: Block = .{},
+    // Names of owned locals (from the ownership pass). HIR->MIR emits a `release` of each at every exit.
+    owned_locals: []const []const u8 = &.{},
 
     pub fn deinit(self: *Func, allocator: std.mem.Allocator) void {
         self.nodes.deinit(allocator);

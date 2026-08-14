@@ -189,7 +189,7 @@ fn compileProgram(
     // it cannot change the produced program. See docs/design/optimiser.md.
     if (init.environ_map.get("NOVA_OPT") != null) {
         const verbose = init.environ_map.get("NOVA_OPT_VERBOSE") != null;
-        _ = optimiser.lowerProgramShadow(allocator, program, verbose) catch |e| {
+        _ = optimiser.lowerProgramShadow(allocator, program, &owned_sema.ir, verbose) catch |e| {
             std.debug.print("[opt] shadow lowering error: {any}\n", .{e});
         };
     }
