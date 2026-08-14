@@ -16,7 +16,7 @@
 
 import bytes;
 
-pub struct SlabPool {
+pub class SlabPool {
     pub base: long,
     pub stride: int,
     pub blockSize: int,

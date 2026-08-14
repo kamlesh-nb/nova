@@ -13,7 +13,7 @@ import pool;
 import metrics;
 import string;
 
-struct Counter {
+class Counter {
     pub opens: int,
     pub closes: int,
     pub sick: bool,          // when true, a conn's query fails (drives validate-on-borrow reconnect)

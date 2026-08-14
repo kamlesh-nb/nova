@@ -656,11 +656,18 @@ fn computeValueEscapeSet(self: *LlvmCompiler) void {
         };
         for (e.value_ptr.fields) |fld| {
             const fs = self.typeRefToString(fld.type_name) catch continue;
-            addName(self, &set, fs);
-            // A field must be a scalar primitive OR a `string` (an owned reference the copy/drop paths
-            // now handle: retain-on-copy, release-on-drop). Any other field -- decimal, function,
-            // nested struct, container/optional -- is not yet handled inline, so it forces the whole
-            // struct to the heap. (Those are the next slices: nested-value-struct + container fields.)
+            const fbase = getStructBaseName(fs);
+            // A nested `struct` (VALUE) field is stored INLINE by value (Swift model) -- the parent memcpy
+            // deep-copies it, so it does NOT force the parent to the heap. But ONLY a value struct: a `class`
+            // field is a shared-mutable reference (e.g. a Map's RawBuffer). If the container were value-lowered,
+            // a copy would share that reference while copying the container's own scalar fields independently
+            // (len says 5, the shared buffer is resized to 10) -> corruption. So a `class` field forces the
+            // container to the heap (reference), as before.
+            if (self.structs.get(fbase)) |fsd| {
+                if (!fsd.is_reference) continue; // inline value-struct field -> safe, no escape
+            }
+            // Otherwise a field must be a scalar OR a `string`. A class field, container/optional/array,
+            // decimal or function forces the whole struct to the heap (reference semantics).
             if (!isScalarFieldTypeName(fs) and !std.mem.eql(u8, fs, "string")) addName(self, &set, e.key_ptr.*);
         }
     }

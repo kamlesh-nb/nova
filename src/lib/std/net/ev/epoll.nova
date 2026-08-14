@@ -501,7 +501,7 @@ pub trait EventLoop {
 }
 
 // epoll-backed completion emulation (Linux).
-pub struct Poller impl EventLoop {
+pub class Poller impl EventLoop {
     pub kq: int,             // the epoll fd (named `kq` to match the reactor's field for both backends)
     pub ring: long,          // the io_uring handle when that backend is selected, else 0
     pub eventBuf: long,

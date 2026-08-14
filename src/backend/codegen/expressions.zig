@@ -1449,9 +1449,19 @@ pub fn initDefaultContainerFields(self: *LlvmCompiler, struct_name: []const u8, 
         const offset = try self.getFieldOffset(struct_name, f.name);
         const offset_val = core.LLVMConstInt(self.val_type, offset, 0);
         const addr = core.LLVMBuildAdd(self.builder, instance_ptr, offset_val, "cf_addr");
-        const llvm_ft = self.toLLVMType(f.type_name);
-        const fptr = core.LLVMBuildIntToPtr(self.builder, addr, core.LLVMPointerType(llvm_ft, 0), "cf_ptr");
-        _ = core.LLVMBuildStore(self.builder, self.castFromValType(fv, llvm_ft), fptr);
+        const f_tstr = self.typeRefToString(f.type_name) catch "";
+        const ftbase = getStructBaseName(f_tstr);
+        if (self.structs.contains(ftbase) and self.fieldStoredInline(ftbase)) {
+            // Inline nested value-struct field: copy the default-constructed struct's bytes INTO the slot,
+            // matching the inline layout (struct_init does the same). Storing a pointer here would leave the
+            // inline region uninitialised -> garbage reads (the default-ctor nested-struct case).
+            const fsz = self.getTypeSize(f.type_name, false);
+            _ = try self.buildValueStructCopyInto(addr, fv, fsz);
+        } else {
+            const llvm_ft = self.toLLVMType(f.type_name);
+            const fptr = core.LLVMBuildIntToPtr(self.builder, addr, core.LLVMPointerType(llvm_ft, 0), "cf_ptr");
+            _ = core.LLVMBuildStore(self.builder, self.castFromValType(fv, llvm_ft), fptr);
+        }
     }
 }
 
@@ -1993,6 +2003,20 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                                 const ptr = core.LLVMBuildIntToPtr(self.builder, addr, core.LLVMPointerType(llvm_field_type, 0), "field_ptr");
 
                                 const f_type_str = try self.typeRefToString(field_type_ref);
+
+                                // Inline nested value-struct field: the slot holds the struct's bytes
+                                // inline, not an 8-byte pointer. `self.field = StructInit(...)` must
+                                // memcpy the RHS struct into the inline region (Swift value semantics),
+                                // not store its address as a pointer (which the later read would then
+                                // misinterpret field-by-field as garbage).
+                                {
+                                    const fw_base = getStructBaseName(f_type_str);
+                                    if (self.structs.contains(fw_base) and self.fieldStoredInline(fw_base)) {
+                                        const fsz = self.getTypeSize(field_type_ref, false);
+                                        _ = try self.buildValueStructCopyInto(addr, r_val, fsz);
+                                        return r_val;
+                                    }
+                                }
 
                                 if (self.isOwnedDeclaredType(field_type_ref, f_type_str)) {
                                     const is_r_var = (bin.right.kind == .ident or bin.right.kind == .field_access or bin.right.kind == .index);
@@ -3940,10 +3964,19 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 }
 
                 const addr = core.LLVMBuildAdd(self.builder, struct_ptr_val, offset_val, "field_addr");
-                const llvm_field_type = self.toLLVMType(field_type_ref);
-                const ptr = core.LLVMBuildIntToPtr(self.builder, addr, core.LLVMPointerType(llvm_field_type, 0), "field_ptr");
-                const casted_field_val = self.castFromValType(field_val, llvm_field_type);
-                _ = core.LLVMBuildStore(self.builder, casted_field_val, ptr);
+                const fbase = getStructBaseName(f_type_str);
+                if (!widened_field and self.structs.contains(fbase) and self.fieldStoredInline(fbase)) {
+                    // Inline value-struct field (Swift model): field_val is the address of the constructed
+                    // nested struct; copy its bytes INTO the parent's field slot rather than storing a pointer.
+                    // A flat copy of the parent then deep-copies this field for free.
+                    const fsz = self.getTypeSize(field_type_ref, false);
+                    _ = try self.buildValueStructCopyInto(addr, field_val, fsz);
+                } else {
+                    const llvm_field_type = self.toLLVMType(field_type_ref);
+                    const ptr = core.LLVMBuildIntToPtr(self.builder, addr, core.LLVMPointerType(llvm_field_type, 0), "field_ptr");
+                    const casted_field_val = self.castFromValType(field_val, llvm_field_type);
+                    _ = core.LLVMBuildStore(self.builder, casted_field_val, ptr);
+                }
             }
 
             return struct_ptr_val;
@@ -4105,6 +4138,12 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             const offset = try self.getFieldOffset(obj_type, fa.field);
             const offset_val = core.LLVMConstInt(self.val_type, offset, 0);
             const addr = core.LLVMBuildAdd(self.builder, obj_ptr, offset_val, "field_addr");
+            // An inline value-struct field IS its bytes; its "value" is the address of that inline storage
+            // (a value-struct value is an address), so return the address without loading a pointer.
+            const ftbase = getStructBaseName(try self.typeRefToString(field_type_ref));
+            if (self.structs.contains(ftbase) and self.fieldStoredInline(ftbase)) {
+                return addr;
+            }
             const llvm_field_type = self.toLLVMType(field_type_ref);
             const ptr = core.LLVMBuildIntToPtr(self.builder, addr, core.LLVMPointerType(llvm_field_type, 0), "field_ptr");
             const raw_val = core.LLVMBuildLoad2(self.builder, llvm_field_type, ptr, "field_val");

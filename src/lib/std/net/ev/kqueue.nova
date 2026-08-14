@@ -135,7 +135,7 @@ pub trait EventLoop {
 }
 
 // kqueue-backed completion emulation (macOS/BSD).
-pub struct Poller impl EventLoop {
+pub class Poller impl EventLoop {
     pub kq: int,
     pub eventBuf: long,
     pub compBuf: long,       // maxEvents * 8: coroutine tokens to resume from the last poll

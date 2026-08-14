@@ -339,7 +339,7 @@ pub trait EventLoop {
 }
 
 // IOCP-backed native completion (Windows).
-pub struct Poller impl EventLoop {
+pub class Poller impl EventLoop {
     pub port: long,          // the completion port HANDLE (full width; does not fit the reactor's int kq)
     pub kq: int,             // truncated port, for the reactor's shared `kq` field (runtime caveat above)
     pub eventBuf: long,      // maxEvents * OVERLAPPED_ENTRY_SIZE, drained by GetQueuedCompletionStatusEx

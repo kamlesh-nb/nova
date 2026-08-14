@@ -12,9 +12,9 @@ import db;
 import pool;
 import resilience.breaker;
 
-// Shared control block (Nova structs are ARC ref types → the test, the driver, and every conn
-// see the same instance).
-struct Flag {
+// Shared control block: a class (reference type) so the test, the driver, and every conn
+// see and mutate the same instance.
+class Flag {
     pub fail: bool,
     pub calls: int,      // number of times the backend query/exec actually ran
     init() { self.fail = false; self.calls = 0; }

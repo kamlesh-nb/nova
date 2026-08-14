@@ -1190,22 +1190,52 @@ pub const LlvmCompiler = struct {
         return false;
     }
 
+    // A `struct` (value type) FIELD is stored INLINE by value (Swift's value-type model), so it takes its
+    // full size; a `class` (reference) field is an 8-byte pointer. This is the single decision that makes
+    // nested value structs deep-copy for free (a flat memcpy of the parent copies the inline bytes).
+    pub fn fieldStoredInline(self: *LlvmCompiler, base: []const u8) bool {
+        // A field is stored INLINE only if its type is a VALUE-LOWERED struct -- i.e. the ESCAPE-AWARE
+        // predicate, not is_reference alone. A struct the escape analysis keeps on the heap (e.g. `Aes`,
+        // returned as a bare local; or a `class`) is a POINTER field. Using is_reference here would inline a
+        // heap-kept struct while the rest of codegen (isValueStructName) treats it as a pointer -> layout
+        // mismatch and corruption (the aes.gcm null-skey crash). This keeps the inline decision consistent.
+        return self.isValueStructName(base);
+    }
+
+    // Natural alignment of a type used as a field: a scalar aligns to its width; an inline value struct to
+    // the max of its fields' alignments; a pointer (class/string/other) to 8. Kept separate from getTypeSize
+    // because an inline struct's SIZE is the sum of its fields but its ALIGNMENT is only the widest field.
+    pub fn getTypeAlign(self: *LlvmCompiler, type_ref: ast.TypeRef) u32 {
+        switch (type_ref) {
+            .ident => |name| {
+                if (types_mod.cgPrim(name)) |p| return switch (p.repr) {
+                    .i1, .i8 => 1,
+                    .i16 => 2,
+                    .i32, .f32 => 4,
+                    .word, .i64, .f64 => 8,
+                };
+                const base = getStructBaseName(name);
+                if (self.fieldStoredInline(base)) {
+                    const s = self.structs.get(base).?;
+                    var a: u32 = 1;
+                    for (s.fields) |f| {
+                        const fa = self.getTypeAlign(f.type_name);
+                        if (fa > a) a = fa;
+                    }
+                    return a;
+                }
+                return 8;
+            },
+            else => return 8,
+        }
+    }
+
     pub fn getTypeSize(self: *LlvmCompiler, type_ref: ast.TypeRef, is_field: bool) u32 {
         switch (type_ref) {
             .generic => |g| {
-                if (is_field) {
-                    return 8;
-                }
+                if (is_field) return 8;
                 const base = getStructBaseName(g.name);
-                if (self.structs.get(base)) |s| {
-                    var size: u32 = 0;
-                    for (s.fields) |f| {
-                        const f_size = self.getTypeSize(f.type_name, true);
-                        size = (size + f_size - 1) / f_size * f_size;
-                        size += f_size;
-                    }
-                    return size;
-                }
+                if (self.structs.get(base)) |s| return self.structPayloadSize(s);
                 return 8;
             },
             .ident => |name| {
@@ -1225,16 +1255,9 @@ pub const LlvmCompiler = struct {
                 }
                 const base = getStructBaseName(name);
                 if (self.structs.get(base)) |s| {
-                    if (is_field) {
-                        return 8;
-                    }
-                    var size: u32 = 0;
-                    for (s.fields) |f| {
-                        const f_size = self.getTypeSize(f.type_name, true);
-                        size = (size + f_size - 1) / f_size * f_size;
-                        size += f_size;
-                    }
-                    return size;
+                    // As a FIELD: a value struct is stored inline (its full size); a class is a pointer (8).
+                    if (is_field and !self.fieldStoredInline(base)) return 8;
+                    return self.structPayloadSize(s);
                 }
                 if (self.unions.get(base)) |u| {
                     if (is_field) {
@@ -1251,6 +1274,23 @@ pub const LlvmCompiler = struct {
             },
             else => return 8,
         }
+    }
+
+    // Total inline payload size of a struct: each field placed at its natural alignment, size summed, then
+    // the whole rounded up to the struct's own alignment (so an array/inline-nesting of the struct stays
+    // aligned -- matches C/Swift struct layout).
+    fn structPayloadSize(self: *LlvmCompiler, s: ast.StructDecl) u32 {
+        var size: u32 = 0;
+        var struct_align: u32 = 1;
+        for (s.fields) |f| {
+            const f_size = self.getTypeSize(f.type_name, true);
+            const f_align = self.getTypeAlign(f.type_name);
+            if (f_align > struct_align) struct_align = f_align;
+            size = (size + f_align - 1) / f_align * f_align;
+            size += f_size;
+        }
+        size = (size + struct_align - 1) / struct_align * struct_align;
+        return size;
     }
 
     pub const toLLVMType = types_mod.toLLVMType;
@@ -1273,7 +1313,8 @@ pub const LlvmCompiler = struct {
         var offset: u32 = 0;
         for (s.fields) |field| {
             const f_size = self.getTypeSize(field.type_name, true);
-            offset = (offset + f_size - 1) / f_size * f_size;
+            const f_align = self.getTypeAlign(field.type_name);
+            offset = (offset + f_align - 1) / f_align * f_align;
             if (std.mem.eql(u8, field.name, field_name)) {
                 return offset;
             }
