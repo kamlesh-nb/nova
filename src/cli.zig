@@ -1,14 +1,19 @@
 // cli.zig — Nova command-line dispatch.
 //
-// The thin routing layer between the process entry (main.zig) and the command implementations
-// (commands.zig). `run` parses argv[1], prints version/usage, and delegates to the matching command.
-// All the real work — the compile/link/test pipeline, scaffolding, formatting, package fetch — lives in
-// commands.zig; this file stays a readable table of "which subcommand does what".
+// The thin routing layer between the process entry (main.zig) and the command implementations. `run`
+// parses argv[1], prints version/usage, and delegates to the matching command module. Each subcommand
+// lives in its own file — scaffold (init/add), tester (test), format (fmt), packages (get), builder
+// (build/bare-file) — all sitting on the shared pipeline.zig compile machinery.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const commands = @import("commands.zig");
+
+const scaffold = @import("scaffold.zig");
+const tester = @import("tester.zig");
+const format = @import("format.zig");
+const packages = @import("packages.zig");
+const builder = @import("builder.zig");
 
 pub fn run(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -42,30 +47,48 @@ pub fn run(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, args[1], "init")) {
-        try commands.cmdInit(allocator, init, args);
+        try scaffold.cmdInit(allocator, init, args);
         return;
     }
     if (std.mem.eql(u8, args[1], "add")) {
         if (args.len >= 4 and std.mem.eql(u8, args[2], "feature")) {
-            try commands.cmdAddFeature(allocator, init, args[3]);
+            try scaffold.cmdAddFeature(allocator, init, args[3]);
             return;
         }
         std.debug.print("Usage: nova add feature <name>\n", .{});
         return;
     }
     if (std.mem.eql(u8, args[1], "test")) {
-        try commands.cmdTest(allocator, init, args);
+        try tester.cmdTest(allocator, init, args);
         return;
     }
     if (std.mem.eql(u8, args[1], "fmt")) {
-        try commands.cmdFmt(allocator, init, args);
+        try format.cmdFmt(allocator, init, args);
         return;
     }
     if (std.mem.eql(u8, args[1], "get")) {
-        try commands.cmdGet(allocator, init, args);
+        try packages.cmdGet(allocator, init, args);
         return;
     }
 
     // `nova build ...` and the bare `nova <file> ...` compile form.
-    try commands.cmdBuild(allocator, init, args);
+    try builder.cmdBuild(allocator, init, args);
+}
+
+// A user-facing compilation error (as opposed to a compiler bug) gets a clean one-line message and a
+// non-zero exit instead of a Zig stack trace. Return null for errors that should surface as internal.
+pub fn userErrorHint(e: anyerror) ?[]const u8 {
+    return switch (e) {
+        error.TypeCheckError => "",
+        error.ExpectedToken, error.UnexpectedToken => "",
+
+        error.IdentifierNotFound => "undefined identifier",
+        error.FunctionNotFound => "undefined function",
+        error.VariableNotFound => "undefined variable",
+        error.MethodOrFunctionNotFound => "no such method or function",
+        error.AmbiguousName => "ambiguous name",
+        error.StructTypeNotFound => "unknown struct type",
+        error.FieldAccessObjectNotStruct => "field access on a non-struct value",
+        else => null,
+    };
 }

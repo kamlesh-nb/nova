@@ -1,4 +1,8 @@
-// commands.zig — Nova CLI command handlers + the compile/link/test pipeline.
+// pipeline.zig — shared compile/link/load machinery for the CLI commands.
+// The frontend->backend driver core: import resolution, source loading, the codegen prelude
+// (route/serde/mediator generation), target derivation, native/wasm/cross linking, and build
+// bookkeeping. builder/tester/format/packages call into this; nothing here calls them.
+
 // Extracted from main.zig (SE-refactor 2026-08-14): main.zig is now a thin entry, cli.zig the
 // dispatch, and this module holds every command (init/add/test/fmt/get/build) and the shared
 // compile pipeline (loadProgram, import resolution, codegen prelude, linking, compileProgram).
@@ -18,9 +22,9 @@ extern fn nova_lld_link_wasm(argv: [*]const [*:0]const u8, argc: c_int) c_int;
 // making a PIE object"), so the link fails for any program whose layout produces one. Tell the
 // driver what codegen actually emitted. The alternative is a PIC target machine, which is a codegen
 // change affecting every target; this is the narrow, matching fix.
-const pie_flags: []const []const u8 = if (builtin.target.os.tag == .linux) &.{"-no-pie"} else &.{};
+pub const pie_flags: []const []const u8 = if (builtin.target.os.tag == .linux) &.{"-no-pie"} else &.{};
 
-const dead_strip_flag: []const u8 = switch (builtin.target.os.tag) {
+pub const dead_strip_flag: []const u8 = switch (builtin.target.os.tag) {
     .macos => "-Wl,-dead_strip",
     // clang++ on Windows drives MSVC's link.exe, which does not understand --gc-sections
     // (it arrives as `/-gc-sections` → LNK4044 and no stripping). /OPT:REF is its equivalent.
@@ -28,7 +32,8 @@ const dead_strip_flag: []const u8 = switch (builtin.target.os.tag) {
     else => "-Wl,--gc-sections",
 };
 
-fn macSdkPath(environ: anytype, io: std.Io) []const u8 {
+
+pub fn macSdkPath(environ: anytype, io: std.Io) []const u8 {
     if (environ.get("SDKROOT")) |s| return s;
     const clt = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk";
     Io.Dir.access(.cwd(), io, clt, .{}) catch {
@@ -37,7 +42,8 @@ fn macSdkPath(environ: anytype, io: std.Io) []const u8 {
     return clt;
 }
 
-fn collectFfiLibs(allocator: std.mem.Allocator, program: ast.Program) ![]const []const u8 {
+
+pub fn collectFfiLibs(allocator: std.mem.Allocator, program: ast.Program) ![]const []const u8 {
     var libs = std.ArrayList([]const u8).empty;
     for (program.declarations) |decl| {
         if (decl != .fn_decl) continue;
@@ -54,7 +60,8 @@ fn collectFfiLibs(allocator: std.mem.Allocator, program: ast.Program) ![]const [
     return libs.toOwnedSlice(allocator);
 }
 
-fn appendFfiLib(args: *std.ArrayList([]const u8), allocator: std.mem.Allocator, shared_nova: []const u8, io: std.Io, lib: []const u8) !void {
+
+pub fn appendFfiLib(args: *std.ArrayList([]const u8), allocator: std.mem.Allocator, shared_nova: []const u8, io: std.Io, lib: []const u8) !void {
     if (std.mem.eql(u8, lib, "webview")) {
         const lib_path = try std.fmt.allocPrint(allocator, "{s}/deps/webview/build/libwebview.a", .{shared_nova});
         Io.Dir.access(.cwd(), io, lib_path, .{}) catch {
@@ -78,7 +85,8 @@ fn appendFfiLib(args: *std.ArrayList([]const u8), allocator: std.mem.Allocator, 
     try args.append(allocator, try std.fmt.allocPrint(allocator, "-l{s}", .{lib}));
 }
 
-fn linkNativeInProcessMacho(
+
+pub fn linkNativeInProcessMacho(
     allocator: std.mem.Allocator,
     environ: anytype,
     io: std.Io,
@@ -118,8 +126,10 @@ fn linkNativeInProcessMacho(
     }
 }
 
-const CrossTarget = struct { zig: []const u8, static: bool };
-fn mapCrossTarget(llvm_triple: []const u8) ?CrossTarget {
+
+pub const CrossTarget = struct { zig: []const u8, static: bool };
+
+pub fn mapCrossTarget(llvm_triple: []const u8) ?CrossTarget {
     const has = struct {
         fn f(h: []const u8, n: []const u8) bool {
             return std.mem.indexOf(u8, h, n) != null;
@@ -139,7 +149,8 @@ fn mapCrossTarget(llvm_triple: []const u8) ?CrossTarget {
     return null;
 }
 
-fn crossLinkViaZig(
+
+pub fn crossLinkViaZig(
     allocator: std.mem.Allocator,
     environ: anytype,
     io: std.Io,
@@ -195,7 +206,8 @@ fn crossLinkViaZig(
     return true;
 }
 
-fn linkWasmInProcess(allocator: std.mem.Allocator, obj_path: []const u8, output_path: []const u8) !void {
+
+pub fn linkWasmInProcess(allocator: std.mem.Allocator, obj_path: []const u8, output_path: []const u8) !void {
     const argv = [_][]const u8{
         "wasm-ld", "--no-entry", "--export-all", "--export-memory", "--allow-undefined",
 
@@ -213,13 +225,14 @@ fn linkWasmInProcess(allocator: std.mem.Allocator, obj_path: []const u8, output_
     }
 }
 
+
 /// Append the Nova C++ runtime to a clang++ link line.
 ///
 /// On Windows clang++ targets MSVC, whose link.exe resolves `-lnovacore` to `novacore.lib`
 /// and cannot read the GNU-format `libnovacore.a` that llvm-ar writes (LNK1104). The runtime is
 /// a unity build — one `runtime.cpp` → one object — so the COFF object is linked directly there:
 /// identical to demand-loading the archive's single member, minus the archive-format question.
-fn appendRuntimeLink(
+pub fn appendRuntimeLink(
     args: *std.ArrayList([]const u8),
     allocator: std.mem.Allocator,
     shared_nova: []const u8,
@@ -242,7 +255,8 @@ fn appendRuntimeLink(
     try args.append(allocator, "-L/opt/homebrew/lib");
 }
 
-fn appendWolfsslLink(args: *std.ArrayList([]const u8), allocator: std.mem.Allocator, shared_nova: []const u8, io: std.Io) !void {
+
+pub fn appendWolfsslLink(args: *std.ArrayList([]const u8), allocator: std.mem.Allocator, shared_nova: []const u8, io: std.Io) !void {
     // wolfSSL was retired in M13 (TLS is pure Nova). Nothing to link; kept as a no-op so the three
     // link sites need no change. getentropy() (crypto.cpp) is in libSystem/glibc, no framework needed.
     _ = args;
@@ -256,10 +270,11 @@ const parser = @import("frontend/parser.zig");
 const llvm_codegen = @import("backend/codegen/llvm_codegen.zig");
 const codegen_arc = @import("backend/codegen/arc.zig");
 
+
 // M-1 value-type structs: configure the per-type rollout gate from the environment.
 //   NOVA_VALUE_STRUCTS_ALL -> every is_reference==false struct is value-lowered.
 //   NOVA_VALUE_TYPES=A,B,C -> only the named base types. Default: neither, so gate stays off.
-fn configureValueStructs(allocator: std.mem.Allocator, environ: anytype) void {
+pub fn configureValueStructs(allocator: std.mem.Allocator, environ: anytype) void {
     // M-1 value structs -- DEFAULT ON. Every non-`class` struct is value-lowered (stack alloca, no
     // ARC, copy-on-assign) unless it escapes. The escape channels (return-construction incl. lifted
     // closures, struct/type-param field, tuple/error-union/optional slot, @serializable binder,
@@ -293,7 +308,8 @@ const formatter = @import("frontend/formatter.zig");
 
 const templates = @import("templates.zig");
 
-fn getSharedAssetPath(allocator: std.mem.Allocator, init: std.process.Init, relative_path: []const u8) ![]const u8 {
+
+pub fn getSharedAssetPath(allocator: std.mem.Allocator, init: std.process.Init, relative_path: []const u8) ![]const u8 {
     if (Io.Dir.access(.cwd(), init.io, relative_path, .{})) |_| {
         return try allocator.dupe(u8, relative_path);
     } else |_| {}
@@ -302,16 +318,18 @@ fn getSharedAssetPath(allocator: std.mem.Allocator, init: std.process.Init, rela
     return try std.fmt.allocPrint(allocator, "{s}/.nova/{s}", .{ home, relative_path });
 }
 
+
 // Compile-target facts, derived once per compilation from `--target`/triple (or the host for --native)
 // and exposed to Nova source as the synthesized `builtin` module + used to pick target-conditional files.
-const TargetInfo = struct {
+pub const TargetInfo = struct {
     os: []const u8, // "darwin" | "linux" | "windows" | "wasm"
     arch: []const u8, // "aarch64" | "x86_64" | "wasm32"
     ptr_size: u8,
     is_posix: bool,
 };
 
-fn hostOs() []const u8 {
+
+pub fn hostOs() []const u8 {
     return switch (builtin.target.os.tag) {
         .macos => "darwin",
         .linux => "linux",
@@ -319,7 +337,8 @@ fn hostOs() []const u8 {
         else => "darwin",
     };
 }
-fn hostArch() []const u8 {
+
+pub fn hostArch() []const u8 {
     return switch (builtin.target.cpu.arch) {
         .aarch64 => "aarch64",
         .x86_64 => "x86_64",
@@ -327,7 +346,8 @@ fn hostArch() []const u8 {
     };
 }
 
-fn deriveTargetInfo(target: []const u8, triple: ?[]const u8) TargetInfo {
+
+pub fn deriveTargetInfo(target: []const u8, triple: ?[]const u8) TargetInfo {
     if (std.mem.eql(u8, target, "--wasm")) {
         return .{ .os = "wasm", .arch = "wasm32", .ptr_size = 4, .is_posix = false };
     }
@@ -355,8 +375,9 @@ fn deriveTargetInfo(target: []const u8, triple: ?[]const u8) TargetInfo {
     return .{ .os = os, .arch = arch, .ptr_size = 8, .is_posix = std.mem.eql(u8, os, "darwin") or std.mem.eql(u8, os, "linux") };
 }
 
+
 // Source of the compiler-synthesized `platform` module (never a file on disk).
-fn genPlatformSource(allocator: std.mem.Allocator, t: TargetInfo) ![]const u8 {
+pub fn genPlatformSource(allocator: std.mem.Allocator, t: TargetInfo) ![]const u8 {
     const b = struct {
         fn s(v: bool) []const u8 {
             return if (v) "true" else "false";
@@ -380,8 +401,9 @@ fn genPlatformSource(allocator: std.mem.Allocator, t: TargetInfo) ![]const u8 {
     });
 }
 
+
 // True if `cand` (a `.nova` path) exists, in cwd or the installed ~/.nova/std fallback.
-fn suffixedFileExists(cand: []const u8, allocator: std.mem.Allocator, io: std.Io, home: ?[]const u8) bool {
+pub fn suffixedFileExists(cand: []const u8, allocator: std.mem.Allocator, io: std.Io, home: ?[]const u8) bool {
     if (Io.Dir.access(.cwd(), io, cand, .{})) |_| {
         return true;
     } else |_| {}
@@ -397,6 +419,7 @@ fn suffixedFileExists(cand: []const u8, allocator: std.mem.Allocator, io: std.Io
     return false;
 }
 
+
 // Platform-axis variant selection (restructure R1): given a resolved `dir/name.nova`, pick the
 // most-specific existing target variant, keyed off the SAME os/arch the synthesized `platform` module
 // exposes. Search order (first existing wins):
@@ -405,7 +428,7 @@ fn suffixedFileExists(cand: []const u8, allocator: std.mem.Allocator, io: std.Io
 //   5. dir/name_<os>.nova            (LEGACY suffix -- kept so un-migrated modules still resolve)
 // Returns null when none exists (the caller then reads the flat base path). Module identity stays the
 // BASE path so `import foo` links regardless of which file's bytes were read.
-fn targetVariantPath(path: []const u8, os_tag: []const u8, arch: []const u8, is_posix: bool, allocator: std.mem.Allocator, io: std.Io, home: ?[]const u8) ?[]const u8 {
+pub fn targetVariantPath(path: []const u8, os_tag: []const u8, arch: []const u8, is_posix: bool, allocator: std.mem.Allocator, io: std.Io, home: ?[]const u8) ?[]const u8 {
     if (!std.mem.endsWith(u8, path, ".nova")) return null;
     const stem = path[0 .. path.len - 5];
     const slash = std.mem.lastIndexOfScalar(u8, stem, '/') orelse stem.len;
@@ -456,11 +479,12 @@ fn targetVariantPath(path: []const u8, os_tag: []const u8, arch: []const u8, is_
     return null;
 }
 
+
 // A resolved import may be either `<path>.nova` or its `<path>.nsx` sibling. `.nsx` is the SAME Nova
 // language, filed under a distinct extension so view / JSX (NSX) code is kept apart from plain logic.
 // Given a freshly-allocated `.nova` candidate, return whichever of the two exists as an owned path;
 // otherwise free the candidate and return null. The `.nova` form is tried first so it wins on a tie.
-fn existingSource(nova_candidate: []const u8, allocator: std.mem.Allocator, io: std.Io) ?[]const u8 {
+pub fn existingSource(nova_candidate: []const u8, allocator: std.mem.Allocator, io: std.Io) ?[]const u8 {
     if (Io.Dir.access(.cwd(), io, nova_candidate, .{})) |_| {
         return nova_candidate;
     } else |_| {}
@@ -478,7 +502,8 @@ fn existingSource(nova_candidate: []const u8, allocator: std.mem.Allocator, io: 
     return null;
 }
 
-fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocator: std.mem.Allocator, io: std.Io, home: ?[]const u8) ![]const u8 {
+
+pub fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocator: std.mem.Allocator, io: std.Io, home: ?[]const u8) ![]const u8 {
     if (std.mem.eql(u8, module_name, "platform")) {
         // Synthetic module — parsed from generated source (see loadProgram), but given a src/std path so
         // canonicalModulePrefix maps its declarations to module "platform" (the import's qualifier).
@@ -565,7 +590,8 @@ fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocator: 
     return try std.fmt.allocPrint(allocator, "{s}/{s}.nova", .{ dir, module_name });
 }
 
-fn resolveFromPackageCache(module_name: []const u8, allocator: std.mem.Allocator, io: std.Io, home: ?[]const u8) ?[]const u8 {
+
+pub fn resolveFromPackageCache(module_name: []const u8, allocator: std.mem.Allocator, io: std.Io, home: ?[]const u8) ?[]const u8 {
     const home_dir = home orelse return null;
 
     const cache_root = std.fmt.allocPrint(allocator, "{s}/.nova/cache", .{home_dir}) catch return null;
@@ -589,10 +615,11 @@ fn resolveFromPackageCache(module_name: []const u8, allocator: std.mem.Allocator
     return null;
 }
 
+
 // Scan a single `packages/` root for a module: first `<root>/nova-<module>/src/<module>.nova` (the
 // package's own top module), then `<root>/<any-pkg>/src/<module>.nova` (a flat module inside any
 // package, e.g. nova-datastar's `datastar`/`ds_sink`). Returns an owned path or null.
-fn scanPackageRoot(root: []const u8, module_name: []const u8, allocator: std.mem.Allocator, io: std.Io) ?[]const u8 {
+pub fn scanPackageRoot(root: []const u8, module_name: []const u8, allocator: std.mem.Allocator, io: std.Io) ?[]const u8 {
     const direct = std.fmt.allocPrint(allocator, "{s}/nova-{s}/src/{s}.nova", .{ root, module_name, module_name }) catch return null;
     if (existingSource(direct, allocator, io)) |hit| return hit;
     const dir = Io.Dir.openDir(.cwd(), io, root, .{ .iterate = true }) catch return null;
@@ -606,11 +633,12 @@ fn scanPackageRoot(root: []const u8, module_name: []const u8, allocator: std.mem
     return null;
 }
 
+
 // Resolve `module_name` from a sibling `packages/` directory. Searches the CWD-relative roots
 // (`packages`, `../packages`) AND a `packages/` dir at every ANCESTOR of the importing file, so a
 // cross-package import (e.g. an app under packages/nova-orchestrator/examples importing nova-datastar's
 // `datastar`) resolves no matter what the process CWD is — `nova build --file <deep/path>` included.
-fn resolveFromLocalPackages(module_name: []const u8, importer_dir: []const u8, allocator: std.mem.Allocator, io: std.Io) ?[]const u8 {
+pub fn resolveFromLocalPackages(module_name: []const u8, importer_dir: []const u8, allocator: std.mem.Allocator, io: std.Io) ?[]const u8 {
     // CWD-relative `packages/` at several parent depths. `nova build --file <deep/path>` and `nova test`
     // run from different CWDs (the project dir, the lang dir, the file's dir), so probe a few `../` levels
     // rather than assume one. First existing package with the module wins.
@@ -637,7 +665,8 @@ fn resolveFromLocalPackages(module_name: []const u8, importer_dir: []const u8, a
     return null;
 }
 
-fn generateControllerRoutes(allocator: std.mem.Allocator, declarations: *std.ArrayList(ast.Declaration)) !void {
+
+pub fn generateControllerRoutes(allocator: std.mem.Allocator, declarations: *std.ArrayList(ast.Declaration)) !void {
     for (declarations.items) |*decl| {
         if (decl.* == .struct_decl) {
             var s = &decl.struct_decl;
@@ -777,30 +806,35 @@ fn generateControllerRoutes(allocator: std.mem.Allocator, declarations: *std.Arr
     }
 }
 
-fn serdeIsInt(n: []const u8) bool {
+
+pub fn serdeIsInt(n: []const u8) bool {
     const ints = [_][]const u8{ "i8", "u8", "byte", "i16", "u16", "short", "ushort", "i32", "u32", "int", "uint", "i64", "u64", "long", "ulong" };
     for (ints) |x| if (std.mem.eql(u8, n, x)) return true;
     return false;
 }
-fn serdeIsFloat(n: []const u8) bool {
+
+pub fn serdeIsFloat(n: []const u8) bool {
 
     const fs = [_][]const u8{ "f32", "f64", "float", "double" };
     for (fs) |x| if (std.mem.eql(u8, n, x)) return true;
     return false;
 }
 
-fn serdeEnumPayloadless(e: ast.EnumDecl) bool {
+
+pub fn serdeEnumPayloadless(e: ast.EnumDecl) bool {
     for (e.variants) |v| {
         if (v.type_name != null or v.fields != null) return false;
     }
     return true;
 }
-fn serdeAppendf(list: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
+
+pub fn serdeAppendf(list: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
     const s = try std.fmt.allocPrint(allocator, fmt, args);
     try list.appendSlice(allocator, s);
 }
 
-fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayList(ast.Declaration), is_wasm: bool) !void {
+
+pub fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayList(ast.Declaration), is_wasm: bool) !void {
     var serializable = std.StringHashMap(void).init(allocator);
     defer serializable.deinit();
     for (declarations.items) |decl| {
@@ -1247,7 +1281,8 @@ fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayLi
     }
 }
 
-fn generateMediatorDispatch(allocator: std.mem.Allocator, declarations: *std.ArrayList(ast.Declaration), is_wasm: bool) !void {
+
+pub fn generateMediatorDispatch(allocator: std.mem.Allocator, declarations: *std.ArrayList(ast.Declaration), is_wasm: bool) !void {
     var src = std.ArrayList(u8).empty;
     var by_name = std.ArrayList(u8).empty;
     var seen_q = std.StringHashMap(void).init(allocator);
@@ -1413,13 +1448,14 @@ fn generateMediatorDispatch(allocator: std.mem.Allocator, declarations: *std.Arr
     }
 }
 
+
 // The RUNTIME mediator glue (web/rmediator.nova). For each `impl RequestHandler<Q,R>` this emits the
 // tiny type-directed Nova the runtime cannot write itself: a widen `Q__asMessage`, an adapter
 // `Q__Adapter` (downcast the erased request, build the handler with DI from the request scope, run it,
 // serialise R), and it accumulates a `__registerHandlers(m)` that registers every adapter. The
 // framework (dispatch, pipeline, DI, scopes, validation) lives in stdlib; this pass only writes the
 // per-type glue. Emitted ALONGSIDE the legacy baked dispatch during the transition.
-fn generateRuntimeMediator(allocator: std.mem.Allocator, declarations: *std.ArrayList(ast.Declaration), is_wasm: bool) !void {
+pub fn generateRuntimeMediator(allocator: std.mem.Allocator, declarations: *std.ArrayList(ast.Declaration), is_wasm: bool) !void {
     var src = std.ArrayList(u8).empty;
     var reg = std.ArrayList(u8).empty;
     defer reg.deinit(allocator);
@@ -1657,7 +1693,8 @@ fn generateRuntimeMediator(allocator: std.mem.Allocator, declarations: *std.Arra
     }
 }
 
-fn loadProgram(allocator: std.mem.Allocator, init: std.process.Init, file_path: []const u8, visited: *std.StringHashMap(void), visiting: *std.StringHashMap(void), merged: *std.ArrayList(u8), declarations: *std.ArrayList(ast.Declaration), is_wasm: bool, file_sources: *std.StringHashMap([]const u8), tinfo: TargetInfo) anyerror!void {
+
+pub fn loadProgram(allocator: std.mem.Allocator, init: std.process.Init, file_path: []const u8, visited: *std.StringHashMap(void), visiting: *std.StringHashMap(void), merged: *std.ArrayList(u8), declarations: *std.ArrayList(ast.Declaration), is_wasm: bool, file_sources: *std.StringHashMap([]const u8), tinfo: TargetInfo) anyerror!void {
     if (visiting.contains(file_path)) return error.CyclicImport;
     if (visited.contains(file_path)) return;
 
@@ -1746,268 +1783,16 @@ fn loadProgram(allocator: std.mem.Allocator, init: std.process.Init, file_path: 
     try merged.append(allocator, '\n');
 }
 
-fn basenameWithoutExtension(path: []const u8, allocator: std.mem.Allocator) ![]const u8 {
+
+pub fn basenameWithoutExtension(path: []const u8, allocator: std.mem.Allocator) ![]const u8 {
     const base = std.fs.path.basename(path);
     const ext_pos = std.mem.lastIndexOfScalar(u8, base, '.') orelse base.len;
     const name = try allocator.dupe(u8, base[0..ext_pos]);
     return name;
 }
 
-fn scaffoldFile(allocator: std.mem.Allocator, io: std.Io, project: []const u8, rel: []const u8, content: []const u8) !void {
-    const full = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ project, rel });
-    defer allocator.free(full);
-    if (std.mem.lastIndexOfScalar(u8, full, '/')) |slash| {
-        const dir = full[0..slash];
-        Io.Dir.createDirPath(.cwd(), io, dir) catch |err| {
-            if (err != error.PathAlreadyExists) return err;
-        };
-    }
-    try Io.Dir.writeFile(.cwd(), io, .{ .data = content, .sub_path = full, .flags = .{} });
-}
 
-fn scaffoldWeb(allocator: std.mem.Allocator, io: std.Io, project: []const u8) !void {
-    const f = struct { rel: []const u8, content: []const u8 };
-    const files = [_]f{
-        .{ .rel = "src/main.nova", .content = templates.web_main_sample },
-
-        .{ .rel = "src/Features/Products/CreateProduct/command.nova", .content = templates.web_create_command_sample },
-        .{ .rel = "src/Features/Products/CreateProduct/response.nova", .content = templates.web_create_response_sample },
-        .{ .rel = "src/Features/Products/CreateProduct/validator.nova", .content = templates.web_create_validator_sample },
-        .{ .rel = "src/Features/Products/CreateProduct/handler.nova", .content = templates.web_create_handler_sample },
-
-        .{ .rel = "src/Features/Products/GetProductById/query.nova", .content = templates.web_get_query_sample },
-        .{ .rel = "src/Features/Products/GetProductById/response.nova", .content = templates.web_get_response_sample },
-        .{ .rel = "src/Features/Products/GetProductById/handler.nova", .content = templates.web_get_handler_sample },
-
-        .{ .rel = "src/Features/Products/Shared/repository.nova", .content = templates.web_repository_sample },
-
-        // View code lives in a `.nsx` file (same language as `.nova`; the extension keeps markup apart).
-        .{ .rel = "src/Features/Products/views/product_card.nsx", .content = templates.web_view_sample },
-
-        .{ .rel = "src/Domain/entities/product.nova", .content = templates.web_domain_entity_sample },
-        .{ .rel = "wwwroot/index.html", .content = templates.web_index_html_sample },
-        .{ .rel = "tests/features/products_test.nova", .content = templates.web_test_sample },
-
-        // Tailwind CLI styling pipeline: `npm install` then `npm run css:watch`. tailwind.config.js lists
-        // the content globs (including the `.nsx` views) so class changes hot-rebuild wwwroot/app.css.
-        .{ .rel = "package.json", .content = templates.web_package_json_sample },
-        .{ .rel = "tailwind.config.js", .content = templates.web_tailwind_config_sample },
-        .{ .rel = "styles/app.css", .content = templates.web_tailwind_css_sample },
-        .{ .rel = ".gitignore", .content = templates.web_gitignore_sample },
-    };
-    for (files) |file| try scaffoldFile(allocator, io, project, file.rel, file.content);
-}
-
-fn scaffoldDesktop(allocator: std.mem.Allocator, io: std.Io, project: []const u8) !void {
-    try scaffoldFile(allocator, io, project, "src/main.nova", templates.desktop_main_sample);
-}
-
-pub fn cmdInit(allocator: std.mem.Allocator, init: std.process.Init, args: []const []const u8) !void {
-    if (args.len < 3) {
-        std.debug.print("Usage: nova init <console|web|desktop> --name <project_name>\n", .{});
-        return;
-    }
-    var template_type = args[2];
-
-    if (std.mem.eql(u8, template_type, "app")) {
-        std.debug.print("note: `nova init app` is deprecated — use `nova init web` (or `desktop`). Scaffolding a web app.\n", .{});
-        template_type = "web";
-    }
-    if (!std.mem.eql(u8, template_type, "console") and
-        !std.mem.eql(u8, template_type, "web") and
-        !std.mem.eql(u8, template_type, "desktop"))
-    {
-        std.debug.print("Invalid template type '{s}'. Expected 'console', 'web', or 'desktop'.\n", .{template_type});
-        std.debug.print("Usage: nova init <console|web|desktop> --name <project_name>\n", .{});
-        return;
-    }
-
-    var project_name: ?[]const u8 = null;
-    var i: usize = 3;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--name") or std.mem.eql(u8, args[i], "-n")) {
-            if (i + 1 < args.len) {
-                i += 1;
-                project_name = args[i];
-            } else {
-                std.debug.print("Missing argument for name flag.\n", .{});
-                return error.MissingNameArgument;
-            }
-        }
-    }
-
-    if (project_name == null) {
-        std.debug.print("Error: Project name must be specified with --name <name> or -n <name>.\n", .{});
-        std.debug.print("Usage: nova init <console|app> --name <project_name>\n", .{});
-        return;
-    }
-
-    Io.Dir.createDirPath(.cwd(), init.io, project_name.?) catch |err| {
-        if (err != error.PathAlreadyExists) {
-            std.debug.print("Error creating directory '{s}': {any}\n", .{ project_name.?, err });
-            return err;
-        }
-    };
-
-    if (std.mem.eql(u8, template_type, "console")) {
-        const src_dir = try std.fmt.allocPrint(allocator, "{s}/src", .{project_name.?});
-        defer allocator.free(src_dir);
-        Io.Dir.createDirPath(.cwd(), init.io, src_dir) catch |err| {
-            if (err != error.PathAlreadyExists) return err;
-        };
-
-        const tests_dir = try std.fmt.allocPrint(allocator, "{s}/tests", .{project_name.?});
-        defer allocator.free(tests_dir);
-        Io.Dir.createDirPath(.cwd(), init.io, tests_dir) catch |err| {
-            if (err != error.PathAlreadyExists) return err;
-        };
-
-        const main_path = try std.fmt.allocPrint(allocator, "{s}/src/main.nova", .{project_name.?});
-        defer allocator.free(main_path);
-        try Io.Dir.writeFile(.cwd(), init.io, .{ .data = templates.console_main_sample, .sub_path = main_path, .flags = .{} });
-
-        const test_path = try std.fmt.allocPrint(allocator, "{s}/tests/main_test.nova", .{project_name.?});
-        defer allocator.free(test_path);
-        try Io.Dir.writeFile(.cwd(), init.io, .{ .data = templates.console_test_sample, .sub_path = test_path, .flags = .{} });
-    } else if (std.mem.eql(u8, template_type, "web")) {
-        try scaffoldWeb(allocator, init.io, project_name.?);
-    } else {
-        try scaffoldDesktop(allocator, init.io, project_name.?);
-    }
-
-    const project_json_content = try std.fmt.allocPrint(allocator,
-        \\{{
-        \\  "name": "{s}",
-        \\  "version": "0.1.0",
-        \\  "type": "{s}",
-        \\  "dependencies": []
-        \\}}
-        , .{ project_name.?, template_type });
-    defer allocator.free(project_json_content);
-
-    const project_json_path = try std.fmt.allocPrint(allocator, "{s}/project.json", .{project_name.?});
-    defer allocator.free(project_json_path);
-    try Io.Dir.writeFile(.cwd(), init.io, .{ .data = project_json_content, .sub_path = project_json_path, .flags = .{} });
-
-    const gitignore_path = try std.fmt.allocPrint(allocator, "{s}/.gitignore", .{project_name.?});
-    defer allocator.free(gitignore_path);
-    Io.Dir.writeFile(.cwd(), init.io, .{ .data = "build/\n*.o\n", .sub_path = gitignore_path, .flags = .{} }) catch {};
-
-    std.debug.print("Project '{s}' initialized successfully.\n", .{project_name.?});
-}
-
-pub fn cmdAddFeature(allocator: std.mem.Allocator, init: std.process.Init, name: []const u8) !void {
-    const feature_dir_path = try std.fmt.allocPrint(allocator, "features/{s}", .{name});
-    defer allocator.free(feature_dir_path);
-    Io.Dir.createDirPath(.cwd(), init.io, feature_dir_path) catch |err| {
-        if (err != error.PathAlreadyExists) return err;
-    };
-    const model_path = try std.fmt.allocPrint(allocator, "features/{s}/model.nova", .{name});
-    defer allocator.free(model_path);
-    try Io.Dir.writeFile(.cwd(), init.io, .{ .data = "// Model layer\n", .sub_path = model_path, .flags = .{} });
-    const service_path = try std.fmt.allocPrint(allocator, "features/{s}/service.nova", .{name});
-    defer allocator.free(service_path);
-    try Io.Dir.writeFile(.cwd(), init.io, .{ .data = "// Service layer\n", .sub_path = service_path, .flags = .{} });
-    const view_path = try std.fmt.allocPrint(allocator, "features/{s}/view.nova", .{name});
-    defer allocator.free(view_path);
-    try Io.Dir.writeFile(.cwd(), init.io, .{ .data = "// View layer\n", .sub_path = view_path, .flags = .{} });
-    const handler_path = try std.fmt.allocPrint(allocator, "features/{s}/{s}.nova", .{ name, name });
-    defer allocator.free(handler_path);
-    const handler_content = try std.fmt.allocPrint(allocator, "// Handler layer for {s}\n", .{name});
-    defer allocator.free(handler_content);
-    try Io.Dir.writeFile(.cwd(), init.io, .{ .data = handler_content, .sub_path = handler_path, .flags = .{} });
-
-    const json_data = Io.Dir.readFileAlloc(.cwd(), init.io, "project.json", allocator, .unlimited) catch {
-        std.debug.print("No project.json found, skipping registration.\n", .{});
-        return;
-    };
-    defer allocator.free(json_data);
-
-    var new_json = std.ArrayList(u8).empty;
-    defer new_json.deinit(allocator);
-
-    const match_str = "\"features\": [";
-    if (std.mem.indexOf(u8, json_data, match_str)) |pos| {
-        try new_json.appendSlice(allocator, json_data[0 .. pos + match_str.len]);
-        const is_empty = std.mem.indexOf(u8, json_data[pos + match_str.len ..], "\"") == null or
-            (std.mem.indexOf(u8, json_data[pos + match_str.len ..], "]") orelse 0) < (std.mem.indexOf(u8, json_data[pos + match_str.len ..], "\"") orelse 0);
-
-        const feature_item = if (is_empty)
-            try std.fmt.allocPrint(allocator, "\n    \"{s}\"", .{name})
-        else
-            try std.fmt.allocPrint(allocator, "\n    \"{s}\",", .{name});
-        defer allocator.free(feature_item);
-        try new_json.appendSlice(allocator, feature_item);
-        try new_json.appendSlice(allocator, json_data[pos + match_str.len ..]);
-
-        try Io.Dir.writeFile(.cwd(), init.io, .{ .data = new_json.items, .sub_path = "project.json", .flags = .{} });
-    }
-    std.debug.print("Feature '{s}' scaffolded and registered successfully.\n", .{name});
-}
-
-fn collectTestFunctions(declarations: []const ast.Declaration, allocator: std.mem.Allocator) ![][]const u8 {
-    var test_fns = std.ArrayList([]const u8).empty;
-    defer test_fns.deinit(allocator);
-    for (declarations) |decl| {
-        switch (decl) {
-            .fn_decl => |fd| {
-                for (fd.attributes) |attr| {
-                    switch (attr) {
-                        .@"test" => {
-                            try test_fns.append(allocator, fd.name);
-                            break;
-                        },
-                        else => {},
-                    }
-                }
-            },
-            else => {},
-        }
-    }
-    return try test_fns.toOwnedSlice(allocator);
-}
-
-fn generateTestHarness(test_fn_names: []const []const u8, allocator: std.mem.Allocator) ![]const u8 {
-    var src = std.ArrayList(u8).empty;
-    defer src.deinit(allocator);
-
-    try src.appendSlice(allocator, "fn main(): void {\n");
-    try src.print(allocator, "    let __test_total = {d};\n", .{test_fn_names.len});
-    try src.appendSlice(allocator, "    let __test_passed = 0;\n");
-    try src.appendSlice(allocator, "    let __test_failed = 0;\n");
-    try src.print(allocator, "    console.log(\"Running {d} test(s)...\");\n", .{test_fn_names.len});
-    try src.appendSlice(allocator, "    console.log(\"\");\n");
-
-    for (test_fn_names) |name| {
-        try src.appendSlice(allocator, "    nova_test_reset();\n");
-        try src.print(allocator, "    nova_test_begin(\"{s}\");\n", .{name});
-        try src.print(allocator, "    {s}();\n", .{name});
-        try src.appendSlice(allocator, "    if (nova_test_did_fail() == 0) {\n");
-        try src.print(allocator, "        console.log(\"  PASS  {s}\");\n", .{name});
-        try src.appendSlice(allocator, "        __test_passed = __test_passed + 1;\n");
-        try src.appendSlice(allocator, "    } else {\n");
-        try src.print(allocator, "        console.log(\"  FAIL  {s}\");\n", .{name});
-        try src.appendSlice(allocator, "        let msg = nova_test_fail_message();\n");
-        try src.appendSlice(allocator, "        console.log(\"        \" + msg);\n");
-        try src.appendSlice(allocator, "        __test_failed = __test_failed + 1;\n");
-        try src.appendSlice(allocator, "    }\n");
-    }
-
-    try src.appendSlice(allocator, "    console.log(\"\");\n");
-    try src.appendSlice(allocator, "    console.log(\"Results: \" + __test_passed + \" passed, \" + __test_failed + \" failed, \" + __test_total + \" total\");\n");
-
-    try src.appendSlice(allocator, "    if (nova_arc_audit_report() > 0) {\n");
-    try src.appendSlice(allocator, "        nova_exit(1);\n");
-    try src.appendSlice(allocator, "    }\n");
-    try src.appendSlice(allocator, "    if (__test_failed > 0) {\n");
-    try src.appendSlice(allocator, "        nova_exit(1);\n");
-    try src.appendSlice(allocator, "    }\n");
-    try src.appendSlice(allocator, "}\n");
-
-    return try src.toOwnedSlice(allocator);
-}
-
-fn findNovaFiles(allocator: std.mem.Allocator, io: Io, root_dir: Io.Dir, sub_path: []const u8, list: *std.ArrayList([]const u8)) !void {
+pub fn findNovaFiles(allocator: std.mem.Allocator, io: Io, root_dir: Io.Dir, sub_path: []const u8, list: *std.ArrayList([]const u8)) !void {
     const dir = try Io.Dir.openDir(root_dir, io, sub_path, .{ .iterate = true });
     defer Io.Dir.close(dir, io);
     var it = Io.Dir.iterate(dir);
@@ -2036,658 +1821,22 @@ fn findNovaFiles(allocator: std.mem.Allocator, io: Io, root_dir: Io.Dir, sub_pat
     }
 }
 
-fn sameTokenStream(a: []const u8, b: []const u8) bool {
-    var la = lexer.Lexer.init(a);
-    var lb = lexer.Lexer.init(b);
-    while (true) {
-        const ta = la.nextToken();
-        const tb = lb.nextToken();
-        if (ta.type != tb.type) return false;
-        if (!std.mem.eql(u8, ta.lexeme, tb.lexeme)) return false;
-        if (ta.type == .eof) return true;
-    }
-}
 
-const TokenSpan = struct { start: usize, end: usize };
-
-fn codeTokenSpans(allocator: std.mem.Allocator, text: []const u8) ![]TokenSpan {
-    var spans = std.ArrayList(TokenSpan).empty;
-    errdefer spans.deinit(allocator);
-    var lx = lexer.Lexer.init(text);
-    while (true) {
-        const t = lx.nextToken();
-        if (t.type == .eof) break;
-        try spans.append(allocator, .{ .start = lx.tok_start, .end = lx.pos });
-    }
-    return spans.toOwnedSlice(allocator);
-}
-
-const CommentIns = struct {
-    offset: usize,
-    text: []const u8,
-    order: usize,
-};
-
-fn reinjectComments(allocator: std.mem.Allocator, source: []const u8, formatted: []const u8) ![]u8 {
-    const s_spans = try codeTokenSpans(allocator, source);
-    defer allocator.free(s_spans);
-    const f_spans = try codeTokenSpans(allocator, formatted);
-    defer allocator.free(f_spans);
-
-    const n = s_spans.len;
-
-    if (n != f_spans.len) return allocator.dupe(u8, formatted);
-
-    var inserts = std.ArrayList(CommentIns).empty;
-    defer inserts.deinit(allocator);
-    var order: usize = 0;
-
-    var i: usize = 0;
-    while (i <= n) : (i += 1) {
-        const gap_start = if (i == 0) 0 else s_spans[i - 1].end;
-        const gap_end = if (i < n) s_spans[i].start else source.len;
-        const has_prev = i > 0;
-        var seen_nl = false;
-        var j = gap_start;
-        while (j < gap_end) {
-            const c = source[j];
-            if (c == '\n') {
-                seen_nl = true;
-                j += 1;
-                continue;
-            }
-            if (c == ' ' or c == '\t' or c == '\r') {
-                j += 1;
-                continue;
-            }
-            if (c == '/' and j + 1 < gap_end and source[j + 1] == '/') {
-                var k = j;
-                while (k < gap_end and source[k] != '\n') k += 1;
-                var te = k;
-                while (te > j and (source[te - 1] == ' ' or source[te - 1] == '\t' or source[te - 1] == '\r')) te -= 1;
-                const text = source[j..te];
-                const trailing = has_prev and !seen_nl;
-                try appendCommentInsert(allocator, &inserts, &order, formatted, f_spans, i, n, text, trailing);
-                j = k;
-                seen_nl = false;
-            } else if (c == '/' and j + 1 < gap_end and source[j + 1] == '*') {
-                var k = j + 2;
-                while (k + 1 < gap_end and !(source[k] == '*' and source[k + 1] == '/')) k += 1;
-                k = if (k + 1 < gap_end) k + 2 else gap_end;
-                const text = source[j..k];
-                const trailing = has_prev and !seen_nl;
-                try appendCommentInsert(allocator, &inserts, &order, formatted, f_spans, i, n, text, trailing);
-                j = k;
-                seen_nl = false;
-            } else {
-
-                break;
-            }
-        }
-    }
-
-    if (inserts.items.len == 0) return allocator.dupe(u8, formatted);
-
-    std.mem.sort(CommentIns, inserts.items, {}, struct {
-        fn lt(_: void, a: CommentIns, b: CommentIns) bool {
-            if (a.offset != b.offset) return a.offset < b.offset;
-            return a.order < b.order;
-        }
-    }.lt);
-
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
-    var cursor: usize = 0;
-    for (inserts.items) |ins| {
-        const off = @min(ins.offset, formatted.len);
-        if (off > cursor) try out.appendSlice(allocator, formatted[cursor..off]);
-        try out.appendSlice(allocator, ins.text);
-        cursor = off;
-    }
-    if (cursor < formatted.len) try out.appendSlice(allocator, formatted[cursor..]);
-
-    for (inserts.items) |ins| allocator.free(ins.text);
-    return out.toOwnedSlice(allocator);
-}
-
-fn appendCommentInsert(
-    allocator: std.mem.Allocator,
-    inserts: *std.ArrayList(CommentIns),
-    order: *usize,
-    formatted: []const u8,
-    f_spans: []const TokenSpan,
-    i: usize,
-    n: usize,
-    text: []const u8,
-    trailing: bool,
-) !void {
-    if (trailing and i >= 1) {
-
-        const base = f_spans[i - 1].start;
-        const line_end = std.mem.indexOfScalarPos(u8, formatted, base, '\n') orelse formatted.len;
-        const rendered = try std.fmt.allocPrint(allocator, " {s}", .{text});
-        try inserts.append(allocator, .{ .offset = line_end, .text = rendered, .order = order.* });
-    } else if (i < n) {
-
-        const base = f_spans[i].start;
-        const line_start = if (std.mem.lastIndexOfScalar(u8, formatted[0..base], '\n')) |nl| nl + 1 else 0;
-        var ind_end = line_start;
-        while (ind_end < base and (formatted[ind_end] == ' ' or formatted[ind_end] == '\t')) ind_end += 1;
-        const indent = formatted[line_start..ind_end];
-        const rendered = try std.fmt.allocPrint(allocator, "{s}{s}\n", .{ indent, text });
-        try inserts.append(allocator, .{ .offset = line_start, .text = rendered, .order = order.* });
-    } else {
-
-        const rendered = try std.fmt.allocPrint(allocator, "{s}\n", .{text});
-        try inserts.append(allocator, .{ .offset = formatted.len, .text = rendered, .order = order.* });
-    }
-    order.* += 1;
-}
-
-fn formatFile(allocator: std.mem.Allocator, init: std.process.Init, file_path: []const u8) !void {
-    const source = try Io.Dir.readFileAlloc(.cwd(), init.io, file_path, allocator, .unlimited);
-    defer allocator.free(source);
-
-    var p = try parser.Parser.init(allocator, source, file_path, false);
-    defer p.deinit();
-    const program = p.parseProgram() catch |err| {
-        std.debug.print("Parser error in file: {s}\n", .{file_path});
-        return err;
-    };
-
-    var f = formatter.Formatter.init(allocator, source);
-    defer f.deinit();
-
-    const formatted = try f.formatProgram(program);
-    defer allocator.free(formatted);
-
-    if (!sameTokenStream(source, formatted)) {
-        if (init.environ_map.get("NOVA_FMT_DEBUG") != null) {
-            var la = lexer.Lexer.init(source);
-            var lb = lexer.Lexer.init(formatted);
-            while (true) {
-                const ta = la.nextToken();
-                const tb = lb.nextToken();
-                if (ta.type != tb.type or !std.mem.eql(u8, ta.lexeme, tb.lexeme)) {
-                    std.debug.print("  [fmt-diff] src={s}'{s}' (L{d}) vs fmt={s}'{s}' (L{d})\n", .{ @tagName(ta.type), ta.lexeme, ta.line, @tagName(tb.type), tb.lexeme, tb.line });
-                    break;
-                }
-                if (ta.type == .eof) break;
-            }
-        }
-        std.debug.print("skipped '{s}': formatter would alter code (unsupported construct) — file left unchanged\n", .{file_path});
-        return;
-    }
-
-    const with_comments = try reinjectComments(allocator, source, formatted);
-    defer allocator.free(with_comments);
-    if (!sameTokenStream(source, with_comments)) {
-        std.debug.print("skipped '{s}': comment reinjection would alter code — file left unchanged\n", .{file_path});
-        return;
-    }
-
-    try Io.Dir.writeFile(.cwd(), init.io, .{ .data = with_comments, .sub_path = file_path, .flags = .{} });
-}
-
-pub fn cmdFmt(allocator: std.mem.Allocator, init: std.process.Init, args: []const []const u8) !void {
-    if (args.len >= 3) {
-        const file_path = args[2];
-        formatFile(allocator, init, file_path) catch |err| {
-            std.debug.print("Error formatting file '{s}': {any}\n", .{ file_path, err });
-        };
-    } else {
-        var list = std.ArrayList([]const u8).empty;
-        defer {
-            for (list.items) |item| allocator.free(item);
-            list.deinit(allocator);
-        }
-        try findNovaFiles(allocator, init.io, .cwd(), ".", &list);
-        if (list.items.len == 0) {
-            std.debug.print("No .nova files found to format.\n", .{});
-            return;
-        }
-        var formatted_count: usize = 0;
-        for (list.items) |file_path| {
-            formatFile(allocator, init, file_path) catch |err| {
-                std.debug.print("Error formatting file '{s}': {any}\n", .{ file_path, err });
-                continue;
-            };
-            formatted_count += 1;
-        }
-        std.debug.print("Formatted {d} files.\n", .{formatted_count});
-    }
-}
-
-const ProjectJson = struct {
+pub const ProjectJson = struct {
     name: []const u8,
     version: []const u8,
     type: ?[]const u8 = null,
     dependencies: [][]const u8,
 };
 
-fn repoNameFromUrl(git_url: []const u8) ?[]const u8 {
-    var len = git_url.len;
-    while (len > 0 and git_url[len - 1] == '/') len -= 1;
-    const trimmed = git_url[0..len];
-    const last_slash = std.mem.lastIndexOfScalar(u8, trimmed, '/') orelse return null;
-    var repo = trimmed[last_slash + 1 ..];
-    if (std.mem.endsWith(u8, repo, ".git")) repo = repo[0 .. repo.len - 4];
-    if (repo.len == 0) return null;
-    return repo;
-}
 
-fn cloneIntoCache(allocator: std.mem.Allocator, init: std.process.Init, git_url: []const u8) !bool {
-    const repo_name = repoNameFromUrl(git_url) orelse {
-        std.debug.print("Invalid git URL format: {s}\n", .{git_url});
-        return error.InvalidGitUrl;
-    };
-    const home_path = init.environ_map.get("HOME") orelse init.environ_map.get("USERPROFILE") orelse "/";
-    const target_dir = try std.fs.path.join(allocator, &[_][]const u8{ home_path, ".nova", "cache", repo_name });
-    defer allocator.free(target_dir);
-
-    if (Io.Dir.access(.cwd(), init.io, target_dir, .{})) |_| {
-        std.debug.print("  {s} already cached ({s})\n", .{ repo_name, target_dir });
-        return false;
-    } else |_| {}
-
-    std.debug.print("Cloning {s} into {s}...\n", .{ git_url, target_dir });
-    var git_child = try std.process.spawn(init.io, .{
-        .argv = &[_][]const u8{ "git", "clone", "--depth", "1", git_url, target_dir },
-    });
-    const git_term = try git_child.wait(init.io);
-    switch (git_term) {
-        .exited => |code| if (code != 0) {
-            std.debug.print("git clone failed with exit code {d}\n", .{code});
-            return error.GitCloneFailed;
-        },
-        else => {
-            std.debug.print("git clone failed abnormally\n", .{});
-            return error.GitCloneFailed;
-        },
-    }
-    return true;
-}
-
-fn cmdRestore(allocator: std.mem.Allocator, init: std.process.Init) !void {
-    const json_data = Io.Dir.readFileAlloc(.cwd(), init.io, "project.json", allocator, .unlimited) catch {
-        std.debug.print("Error: project.json not found. Run 'nova init' first.\n", .{});
-        return;
-    };
-    defer allocator.free(json_data);
-
-    var parsed = std.json.parseFromSlice(ProjectJson, allocator, json_data, .{ .ignore_unknown_fields = true }) catch |err| {
-        std.debug.print("Failed to parse project.json: {any}\n", .{err});
-        return err;
-    };
-    defer parsed.deinit();
-
-    if (parsed.value.dependencies.len == 0) {
-        std.debug.print("No dependencies to restore.\n", .{});
-        return;
-    }
-    std.debug.print("Restoring {d} dependenc{s} from project.json...\n", .{
-        parsed.value.dependencies.len,
-        if (parsed.value.dependencies.len == 1) "y" else "ies",
-    });
-    var fetched: usize = 0;
-    for (parsed.value.dependencies) |dep| {
-        if (try cloneIntoCache(allocator, init, dep)) fetched += 1;
-    }
-    std.debug.print("Restore complete: {d} fetched, {d} already cached.\n", .{ fetched, parsed.value.dependencies.len - fetched });
-}
-
-pub fn cmdGet(allocator: std.mem.Allocator, init: std.process.Init, args: []const []const u8) !void {
-    if (args.len < 3) {
-
-        return cmdRestore(allocator, init);
-    }
-    const git_url = args[2];
-    _ = cloneIntoCache(allocator, init, git_url) catch |err| return err;
-
-    const json_data = Io.Dir.readFileAlloc(.cwd(), init.io, "project.json", allocator, .unlimited) catch {
-        std.debug.print("Error: project.json not found in current directory. Run 'nova init' first.\n", .{});
-        return;
-    };
-    defer allocator.free(json_data);
-
-    var parsed = std.json.parseFromSlice(ProjectJson, allocator, json_data, .{ .ignore_unknown_fields = true }) catch |err| {
-        std.debug.print("Failed to parse project.json: {any}\n", .{err});
-        return err;
-    };
-    defer parsed.deinit();
-
-    var deps_list = std.ArrayList([]const u8).empty;
-    defer deps_list.deinit(allocator);
-    for (parsed.value.dependencies) |dep| {
-        try deps_list.append(allocator, dep);
-    }
-
-    var already_exists = false;
-    for (deps_list.items) |dep| {
-        if (std.mem.eql(u8, dep, git_url)) {
-            already_exists = true;
-            break;
-        }
-    }
-
-    if (!already_exists) {
-        try deps_list.append(allocator, git_url);
-    }
-
-    const updated_project = ProjectJson{
-        .name = parsed.value.name,
-        .version = parsed.value.version,
-        .type = parsed.value.type,
-        .dependencies = deps_list.items,
-    };
-
-    var out = std.Io.Writer.Allocating.init(allocator);
-    defer out.deinit();
-    try std.json.Stringify.value(updated_project, .{}, &out.writer);
-
-    try Io.Dir.writeFile(.cwd(), init.io, .{ .data = out.written(), .sub_path = "project.json", .flags = .{} });
-    std.debug.print("Dependency locked in project.json successfully.\n", .{});
-}
-
-pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const []const u8) !void {
-
-    var file_path: []const u8 = "";
-    var target: []const u8 = "--native";
-
-    var i: usize = 2;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (std.mem.eql(u8, arg, "--wasm") or std.mem.eql(u8, arg, "--native")) {
-            target = arg;
-        } else {
-            file_path = arg;
-        }
-    }
-
-    var file_paths = std.ArrayList([]const u8).empty;
-    defer {
-        for (file_paths.items) |p| {
-            allocator.free(p);
-        }
-        file_paths.deinit(allocator);
-    }
-
-    if (file_path.len == 0) {
-        findNovaFiles(allocator, init.io, .cwd(), ".", &file_paths) catch |err| {
-            std.debug.print("Failed to scan project directory: {any}\n", .{err});
-            return;
-        };
-        if (file_paths.items.len == 0) {
-            std.debug.print("No .nova files found in the current directory.\n", .{});
-            return;
-        }
-    } else {
-        const dup = try allocator.dupe(u8, file_path);
-        try file_paths.append(allocator, dup);
-    }
-
-    var visited = std.StringHashMap(void).init(allocator);
-    defer {
-        var iter = visited.keyIterator();
-        while (iter.next()) |k| {
-            allocator.free(k.*);
-        }
-        visited.deinit();
-    }
-    var visiting = std.StringHashMap(void).init(allocator);
-    defer visiting.deinit();
-    var merged = std.ArrayList(u8).empty;
-    defer merged.deinit(allocator);
-
-    var file_sources = std.StringHashMap([]const u8).init(allocator);
-    defer {
-        var iter = file_sources.keyIterator();
-        while (iter.next()) |k| {
-            allocator.free(k.*);
-        }
-        file_sources.deinit();
-    }
-
-    var declarations = std.ArrayList(ast.Declaration).empty;
-    defer declarations.deinit(allocator);
-
-    const is_wasm = std.mem.eql(u8, target, "--wasm");
-    const tinfo = deriveTargetInfo(target, null);
-
-    loadProgram(allocator, init, "src/std/collections/string_builder.nova", &visited, &visiting, &merged, &declarations, is_wasm, &file_sources, tinfo) catch |err| {
-        std.debug.print("Warning: Failed to load string_builder in test harness: {any}\n", .{err});
-    };
-
-    for (file_paths.items) |path| {
-        loadProgram(allocator, init, path, &visited, &visiting, &merged, &declarations, is_wasm, &file_sources, tinfo) catch |err| {
-            std.debug.print("Failed to load program {s}: {any}\n", .{ path, err });
-
-            return err;
-        };
-    }
-
-    const test_fn_names = try collectTestFunctions(declarations.items, allocator);
-    if (test_fn_names.len == 0) {
-        if (file_path.len == 0) {
-            std.debug.print("No @test functions found in project directory\n", .{});
-        } else {
-            std.debug.print("No @test functions found in {s}\n", .{file_path});
-        }
-        return;
-    }
-    std.debug.print("Found {d} test function(s)\n", .{test_fn_names.len});
-
-    const harness_src = try generateTestHarness(test_fn_names, allocator);
-
-    var filtered_decls = std.ArrayList(ast.Declaration).empty;
-    defer filtered_decls.deinit(allocator);
-    for (declarations.items) |decl| {
-        switch (decl) {
-            .fn_decl => |fd| {
-                if (std.mem.eql(u8, fd.name, "main")) continue;
-                try filtered_decls.append(allocator, decl);
-            },
-            else => try filtered_decls.append(allocator, decl),
-        }
-    }
-
-    var harness_parser = try parser.Parser.init(allocator, harness_src, "test_harness.nova", is_wasm);
-    defer harness_parser.deinit();
-    const harness_prog = try harness_parser.parseProgram();
-    try filtered_decls.appendSlice(allocator, harness_prog.declarations);
-
-    const helpers =
-        \\fn __log_i32(val: i32): void {
-        \\    console.log(`${val}`);
-        \\}
-        \\fn __log_bool(val: bool): void {
-        \\    if (val) {
-        \\        console.log("true");
-        \\    } else {
-        \\        console.log("false");
-        \\    }
-        \\}
-        \\fn __read_string(ptr: i32, len: i32): string {
-        \\    let new_ptr = bytes.alloc(len);
-        \\    let i = 0;
-        \\    while (i < len) {
-        \\        bytes.write_byte(new_ptr, i, bytes.read_byte(ptr, i));
-        \\        i = i + 1;
-        \\    }
-        \\    return new_ptr as string;
-        \\}
-        \\
-    ;
-    var helpers_p = try parser.Parser.init(allocator, helpers, "helpers.nova", is_wasm);
-    defer helpers_p.deinit();
-    const helpers_prog = try helpers_p.parseProgram();
-    try filtered_decls.appendSlice(allocator, helpers_prog.declarations);
-
-    try generateControllerRoutes(allocator, &filtered_decls);
-    try generateSerdeBinders(allocator, &filtered_decls, is_wasm);
-    try generateMediatorDispatch(allocator, &filtered_decls, is_wasm);
-    try generateRuntimeMediator(allocator, &filtered_decls, is_wasm);
-
-    const program = ast.Program{
-        .declarations = filtered_decls.items,
-        .span = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = file_path },
-    };
-    std.debug.print("Parsed {d} top-level declaration(s).\n", .{program.declarations.len});
-
-    try sema_alpha.run(allocator, program);
-
-    var id_assigner = sema_ids.Assigner.init();
-    try id_assigner.run(program);
-
-    var tc = type_checker.TypeChecker.init(allocator, &file_sources);
-    defer tc.deinit();
-    tc.is_wasm = is_wasm;
-    try tc.check(program);
-
-    sema_shadow.report_enabled = init.environ_map.get("NOVA_SEMA_SHADOW") != null;
-    sema_shadow.tid_census = init.environ_map.get("NOVA_TID_CENSUS") != null;
-    // M-5 (memory-management-refinements.md): borrowed-field ARC elision is ON by default
-    // (verified: corpus + ASAN clean, differential ARC audit identical off vs on). Set
-    // NOVA_ARC_ELIDE_OFF to disable it for debugging a suspected elision regression.
-    codegen_arc.elide_enabled = init.environ_map.get("NOVA_ARC_ELIDE_OFF") == null;
-    configureValueStructs(allocator, init.environ_map);
-    sema_shadow.trace_resolution = sema_shadow.report_enabled;
-    sema_shadow.f2_types_enabled = true;
-
-    const owned_sema = try sema_mod.Sema.create(allocator);
-    defer owned_sema.destroy();
-    sema_shadow.run(allocator, program, owned_sema) catch |e| {
-        std.debug.print("sema failed: {any}\n", .{e});
-    };
-
-    {
-        var wl = sema_mono.Worklist.init(allocator, owned_sema);
-        defer wl.deinit();
-        wl.compute(program) catch |e| std.debug.print("F4 worklist failed: {any}\n", .{e});
-        sema_mono.live_instantiations = wl.names(allocator) catch null;
-        if (sema_shadow.report_enabled) wl.report();
-
-        if (wl.instIds(allocator) catch null) |ids| {
-            defer allocator.free(ids);
-            @import("frontend/sema/inst_disp.zig").run(allocator, &owned_sema.store, &owned_sema.tab, &owned_sema.ir, ids);
-            @import("frontend/sema/inst_disp.zig").runFreeFns(allocator, &owned_sema.store, &owned_sema.ir, program);
-            @import("frontend/sema/inst_disp.zig").runMethods(allocator, &owned_sema.store, &owned_sema.tab, &owned_sema.ir);
-        }
-    }
-
-    // P7 Stage 1: report-only escape gauge (no codegen effect). See docs/design/p7-sound-arena.md.
-    sema_escape.report_enabled = init.environ_map.get("NOVA_ESCAPE_REPORT") != null;
-    if (sema_escape.report_enabled) _ = sema_escape.analyze(allocator, &owned_sema.store, &owned_sema.ir, &program);
-
-    const output_path = "__nova_test";
-    const obj_path = try std.fmt.allocPrint(allocator, "{s}.o", .{output_path});
-    defer allocator.free(obj_path);
-    const t6_split = init.environ_map.get("NOVA_T6_SPLIT") != null;
-    var split_objs = std.ArrayList([]const u8).empty;
-    defer {
-        for (split_objs.items) |o| {
-            Io.Dir.deleteFile(.cwd(), init.io, o) catch {};
-            allocator.free(o);
-        }
-        split_objs.deinit(allocator);
-    }
-    try llvm_codegen.compile(allocator, program, is_wasm, false, null, obj_path, false, t6_split, if (t6_split) &split_objs else null, null, init.io);
-    const link_objs: []const []const u8 = if (split_objs.items.len > 0) split_objs.items else &[_][]const u8{obj_path};
-    sema_shadow.reportDiff();
-    sema_shadow.reportTypeIdDiff();
-    sema_shadow.tidCensusReport();
-    sema_shadow.reportF45();
-    sema_mono.dumpMethodInsts();
-
-    const home = init.environ_map.get("HOME") orelse init.environ_map.get("USERPROFILE") orelse "/";
-    const shared_nova = try std.fmt.allocPrint(allocator, "{s}/.nova", .{ home });
-    const shared_nova_arg = try std.fmt.allocPrint(allocator, "-I{s}", .{shared_nova});
-
-    const asan = if (init.environ_map.get("NOVA_ASAN")) |v| !std.mem.eql(u8, v, "0") else false;
-    const tsan = if (init.environ_map.get("NOVA_TSAN")) |v| !std.mem.eql(u8, v, "0") else false;
-
-    var test_clang_args = std.ArrayList([]const u8).empty;
-    try test_clang_args.append(allocator, "clang++");
-    try test_clang_args.append(allocator, "-std=c++20");
-    try test_clang_args.append(allocator, "-g");
-    try test_clang_args.append(allocator, "-O0");
-    try test_clang_args.append(allocator, "-pthread");
-
-    try test_clang_args.append(allocator, dead_strip_flag);
-    try test_clang_args.appendSlice(allocator, pie_flags);
-    try test_clang_args.append(allocator, "-I.");
-    try test_clang_args.append(allocator, shared_nova_arg);
-    if (asan) {
-        try test_clang_args.append(allocator, "-fsanitize=address");
-        try test_clang_args.append(allocator, "-fno-omit-frame-pointer");
-    } else if (tsan) {
-        try test_clang_args.append(allocator, "-fsanitize=thread");
-        try test_clang_args.append(allocator, "-fno-omit-frame-pointer");
-    }
-
-    for (link_objs) |o| try test_clang_args.append(allocator, o);
-
-    try appendRuntimeLink(&test_clang_args, allocator, shared_nova, if (asan)
-        "novacore_asan"
-    else if (tsan)
-        "novacore_tsan"
-    else
-        "novacore");
-    try appendWolfsslLink(&test_clang_args, allocator, shared_nova, init.io);
-
-    for (try collectFfiLibs(allocator, program)) |lib| {
-        try appendFfiLib(&test_clang_args, allocator, shared_nova, init.io, lib);
-    }
-    try test_clang_args.append(allocator, "-o");
-    try test_clang_args.append(allocator, output_path);
-
-    var child = try std.process.spawn(init.io, .{
-        .argv = test_clang_args.items,
-    });
-    const term = try child.wait(init.io);
-    switch (term) {
-        .exited => |code| {
-            if (code != 0) {
-                std.debug.print("Linking test binary failed with code {d}\n", .{code});
-                return error.LinkerFailed;
-            }
-        },
-        else => {
-            std.debug.print("Linking test binary failed abnormally\n", .{});
-            return error.LinkerFailed;
-        },
-    }
-    Io.Dir.deleteFile(.cwd(), init.io, obj_path) catch {};
-
-    std.debug.print("\n", .{});
-    var test_child = try std.process.spawn(init.io, .{
-        .argv = &[_][]const u8{"./__nova_test"},
-    });
-    const test_term = try test_child.wait(init.io);
-
-    var suite_failed = false;
-    switch (test_term) {
-        .exited => |code| {
-            if (code != 0) {
-                suite_failed = true;
-                std.debug.print("\nTest suite FAILED (exit code {d})\n", .{code});
-            }
-        },
-        else => {
-            suite_failed = true;
-            std.debug.print("\nTest process terminated abnormally\n", .{});
-        },
-    }
-
-    if (suite_failed) std.process.exit(1);
-}
-
-fn getFileMtime(io: Io, path: []const u8) !i96 {
+pub fn getFileMtime(io: Io, path: []const u8) !i96 {
     const stat = try Io.Dir.statFile(.cwd(), io, path, .{});
     return stat.mtime.nanoseconds;
 }
 
-fn linkLibsStamp(allocator: std.mem.Allocator, init: std.process.Init) u64 {
+
+pub fn linkLibsStamp(allocator: std.mem.Allocator, init: std.process.Init) u64 {
     const home = init.environ_map.get("HOME") orelse init.environ_map.get("USERPROFILE") orelse "/";
     const libs = [_][]const u8{
         "/.nova/lib/libnovacore.a",
@@ -2703,7 +1852,8 @@ fn linkLibsStamp(allocator: std.mem.Allocator, init: std.process.Init) u64 {
 }
 
 const CACHE_VERSION: u64 = 1;
-fn sourcesHash(file_sources: *std.StringHashMap([]const u8), is_release: bool, asan: bool, link_stamp: u64) u64 {
+
+pub fn sourcesHash(file_sources: *std.StringHashMap([]const u8), is_release: bool, asan: bool, link_stamp: u64) u64 {
     var acc: u64 = CACHE_VERSION ^ link_stamp ^ (if (is_release) @as(u64, 0x9e3779b97f4a7c15) else 0) ^ (if (asan) @as(u64, 0xa5a5_5a5a_c3c3_3c3c) else 0);
     var it = file_sources.iterator();
     while (it.next()) |e| {
@@ -2714,567 +1864,4 @@ fn sourcesHash(file_sources: *std.StringHashMap([]const u8), is_release: bool, a
         acc ^= h.final();
     }
     return acc;
-}
-
-fn compileProgram(
-    allocator: std.mem.Allocator,
-    init: std.process.Init,
-    file_path: []const u8,
-    target: []const u8,
-    output_path: []const u8,
-    is_release: bool,
-    target_triple_opt: ?[]const u8,
-    visited: *std.StringHashMap(void),
-
-    build_mode: bool,
-    build_obj_dir: []const u8,
-    build_hash_path: []const u8,
-) !void {
-    var visiting = std.StringHashMap(void).init(allocator);
-    defer visiting.deinit();
-    var merged = std.ArrayList(u8).empty;
-    defer merged.deinit(allocator);
-
-    var file_sources = std.StringHashMap([]const u8).init(allocator);
-    defer {
-        var iter = file_sources.keyIterator();
-        while (iter.next()) |k| {
-            allocator.free(k.*);
-        }
-        file_sources.deinit();
-    }
-
-    var declarations = std.ArrayList(ast.Declaration).empty;
-    defer declarations.deinit(allocator);
-
-    const is_wasm = std.mem.eql(u8, target, "--wasm");
-    const tinfo = deriveTargetInfo(target, target_triple_opt);
-
-    // AddressSanitizer for native builds: default ON for debug, OFF for --release (and never for wasm).
-    // NOVA_ASAN=0 forces it off (e.g. a debug build you want to benchmark), NOVA_ASAN=1 forces it on even
-    // for --release. ASAN requires the clang link path (it pulls in the asan runtime + links the sanitized
-    // novacore_asan), so it also disables the in-process-LLD fast path below.
-    const asan = !is_wasm and (if (init.environ_map.get("NOVA_ASAN")) |v| !std.mem.eql(u8, v, "0") else !is_release);
-    // Opt-in: also instrument NOVA-GENERATED code with ASAN (not only the runtime), for provenance on a
-    // Nova-code UAF. Requires the runtime ASAN link (so it implies `asan`); off unless NOVA_ASAN_CODEGEN set.
-    codegen_arc.asan_codegen_enabled = asan and (init.environ_map.get("NOVA_ASAN_CODEGEN") != null);
-
-    loadProgram(allocator, init, "src/std/collections/string_builder.nova", visited, &visiting, &merged, &declarations, is_wasm, &file_sources, tinfo) catch |err| {
-        std.debug.print("Warning: Failed to load string_builder standard library: {any}\n", .{err});
-    };
-
-    try loadProgram(allocator, init, file_path, visited, &visiting, &merged, &declarations, is_wasm, &file_sources, tinfo);
-
-    if (init.environ_map.get("NOVA_DUMP_MERGED") != null) {
-        _ = Io.Dir.writeFile(.cwd(), init.io, .{ .data = merged.items, .sub_path = "merged.nova", .flags = .{} }) catch |err| {
-            std.debug.print("Failed to write merged.nova: {s}\n", .{@errorName(err)});
-        };
-    }
-
-    var src_hash: u64 = 0;
-    if (build_mode) {
-        src_hash = sourcesHash(&file_sources, is_release, asan, linkLibsStamp(allocator, init));
-        const cur = std.fmt.allocPrint(allocator, "{x}", .{src_hash}) catch "";
-        defer if (cur.len > 0) allocator.free(cur);
-        if (Io.Dir.readFileAlloc(.cwd(), init.io, build_hash_path, allocator, .unlimited)) |prev| {
-            defer allocator.free(prev);
-            const binary_exists = if (Io.Dir.access(.cwd(), init.io, output_path, .{})) |_| true else |_| false;
-            if (binary_exists and std.mem.eql(u8, std.mem.trim(u8, prev, " \n"), cur)) {
-                std.debug.print("{s} is up to date ({s}) — nothing to rebuild.\n", .{ output_path, if (is_release) "release" else "debug" });
-                return;
-            }
-        } else |_| {}
-    }
-    if (std.mem.eql(u8, target, "--wasm") or std.mem.eql(u8, target, "--native")) {
-        const helpers =
-            \\fn __log_i32(val: i32): void {
-            \\    console.log(`${val}`);
-            \\}
-            \\fn __log_bool(val: bool): void {
-            \\    if (val) {
-            \\        console.log("true");
-            \\    } else {
-            \\        console.log("false");
-            \\    }
-            \\}
-            \\fn __read_string(ptr: i32, len: i32): string {
-            \\    let new_ptr = bytes.alloc(len);
-            \\    let i = 0;
-            \\    while (i < len) {
-            \\        bytes.write_byte(new_ptr, i, bytes.read_byte(ptr, i));
-            \\        i = i + 1;
-            \\    }
-            \\    return new_ptr as string;
-            \\}
-            \\
-        ;
-        var helpers_p = try parser.Parser.init(allocator, helpers, "helpers.nova", is_wasm);
-        defer helpers_p.deinit();
-        const helpers_prog = try helpers_p.parseProgram();
-        try declarations.appendSlice(allocator, helpers_prog.declarations);
-    }
-    try generateControllerRoutes(allocator, &declarations);
-    try generateSerdeBinders(allocator, &declarations, is_wasm);
-    try generateMediatorDispatch(allocator, &declarations, is_wasm);
-    try generateRuntimeMediator(allocator, &declarations, is_wasm);
-    const source = try merged.toOwnedSlice(allocator);
-    defer allocator.free(source);
-
-    const program = ast.Program{
-        .declarations = declarations.items,
-        .span = ast.Span{
-            .start = 0,
-            .end = 0,
-            .line = 1,
-            .col = 1,
-            .file = file_path,
-        },
-    };
-    std.debug.print("Parsed {d} top-level declaration(s).\n", .{program.declarations.len});
-
-    try sema_alpha.run(allocator, program);
-
-    var id_assigner = sema_ids.Assigner.init();
-    try id_assigner.run(program);
-
-    var tc = type_checker.TypeChecker.init(allocator, &file_sources);
-    defer tc.deinit();
-    tc.is_wasm = is_wasm;
-    try tc.check(program);
-
-    sema_shadow.report_enabled = init.environ_map.get("NOVA_SEMA_SHADOW") != null;
-    sema_shadow.tid_census = init.environ_map.get("NOVA_TID_CENSUS") != null;
-    // M-5 (memory-management-refinements.md): borrowed-field ARC elision is ON by default
-    // (verified: corpus + ASAN clean, differential ARC audit identical off vs on). Set
-    // NOVA_ARC_ELIDE_OFF to disable it for debugging a suspected elision regression.
-    codegen_arc.elide_enabled = init.environ_map.get("NOVA_ARC_ELIDE_OFF") == null;
-    configureValueStructs(allocator, init.environ_map);
-    sema_shadow.trace_resolution = sema_shadow.report_enabled;
-    sema_shadow.f2_types_enabled = true;
-
-    const owned_sema = try sema_mod.Sema.create(allocator);
-    defer owned_sema.destroy();
-    sema_shadow.run(allocator, program, owned_sema) catch |e| {
-        std.debug.print("sema failed: {any}\n", .{e});
-    };
-
-    {
-        var wl = sema_mono.Worklist.init(allocator, owned_sema);
-        defer wl.deinit();
-        wl.compute(program) catch |e| std.debug.print("F4 worklist failed: {any}\n", .{e});
-        sema_mono.live_instantiations = wl.names(allocator) catch null;
-        if (sema_shadow.report_enabled) wl.report();
-
-        if (wl.instIds(allocator) catch null) |ids| {
-            defer allocator.free(ids);
-            @import("frontend/sema/inst_disp.zig").run(allocator, &owned_sema.store, &owned_sema.tab, &owned_sema.ir, ids);
-            @import("frontend/sema/inst_disp.zig").runFreeFns(allocator, &owned_sema.store, &owned_sema.ir, program);
-            @import("frontend/sema/inst_disp.zig").runMethods(allocator, &owned_sema.store, &owned_sema.tab, &owned_sema.ir);
-        }
-    }
-
-    // P7 Stage 1: report-only escape gauge (no codegen effect). See docs/design/p7-sound-arena.md.
-    sema_escape.report_enabled = init.environ_map.get("NOVA_ESCAPE_REPORT") != null;
-    if (sema_escape.report_enabled) _ = sema_escape.analyze(allocator, &owned_sema.store, &owned_sema.ir, &program);
-
-    if (std.mem.eql(u8, target, "--wasm")) {
-        const obj_path = try std.fmt.allocPrint(allocator, "{s}.o", .{output_path});
-        defer allocator.free(obj_path);
-        try llvm_codegen.compile(allocator, program, true, is_release, target_triple_opt, obj_path, false, init.environ_map.get("NOVA_T6_SPLIT") != null, null, null, init.io);
-
-        if (build_options.inprocess_lld) {
-            try linkWasmInProcess(allocator, obj_path, output_path);
-            Io.Dir.deleteFile(.cwd(), init.io, obj_path) catch {};
-            std.debug.print("WASM output written to {s}\n", .{output_path});
-            return;
-        }
-
-        var child = try std.process.spawn(init.io, .{
-            .argv = &[_][]const u8{ "clang", "-target", "wasm32", "-nostdlib", "-Wl,--no-entry", "-Wl,--export-all", "-Wl,--export-memory", "-Wl,--allow-undefined", "-Wl,--initial-memory=134217728", obj_path, "-o", output_path },
-        });
-        const term = try child.wait(init.io);
-        switch (term) {
-            .exited => |code| {
-                if (code != 0) {
-                    std.debug.print("Linking WASM binary failed with code {d}\n", .{code});
-                    return error.LinkFailed;
-                }
-            },
-            else => {
-                std.debug.print("Linking WASM binary failed abnormally\n", .{});
-                return error.LinkFailed;
-            },
-        }
-        Io.Dir.deleteFile(.cwd(), init.io, obj_path) catch {};
-        std.debug.print("WASM output written to {s}\n", .{output_path});
-    } else if (std.mem.eql(u8, target, "--native")) {
-
-        const obj_path = if (build_mode)
-            try std.fmt.allocPrint(allocator, "{s}/{s}.o", .{ build_obj_dir, std.fs.path.basename(output_path) })
-        else
-            try std.fmt.allocPrint(allocator, "{s}.o", .{output_path});
-        defer allocator.free(obj_path);
-
-        const t6_split = if (build_mode)
-            init.environ_map.get("NOVA_T6_NOSPLIT") == null
-        else
-            init.environ_map.get("NOVA_T6_SPLIT") != null;
-        var split_objs = std.ArrayList([]const u8).empty;
-        defer {
-            for (split_objs.items) |o| {
-                if (init.environ_map.get("NOVA_KEEP_OBJ") == null and !build_mode) Io.Dir.deleteFile(.cwd(), init.io, o) catch {};
-                allocator.free(o);
-            }
-            split_objs.deinit(allocator);
-        }
-        try llvm_codegen.compile(allocator, program, false, is_release, target_triple_opt, obj_path, false, t6_split, if (t6_split) &split_objs else null, if (build_mode) build_obj_dir else null, init.io);
-        const link_objs: []const []const u8 = if (split_objs.items.len > 0) split_objs.items else &[_][]const u8{obj_path};
-        sema_shadow.reportResolution();
-        sema_shadow.reportDiff();
-    sema_shadow.reportTypeIdDiff();
-    sema_shadow.tidCensusReport();
-    sema_shadow.reportF45();
-    sema_mono.dumpMethodInsts();
-
-        var clang_args = std.ArrayList([]const u8).empty;
-        defer clang_args.deinit(allocator);
-
-        try clang_args.append(allocator, "clang++");
-        try clang_args.append(allocator, "-std=c++20");
-
-        try clang_args.append(allocator, dead_strip_flag);
-        try clang_args.appendSlice(allocator, pie_flags);
-        if (target_triple_opt) |triple| {
-            try clang_args.append(allocator, "-target");
-            try clang_args.append(allocator, triple);
-        }
-        if (is_release) {
-            try clang_args.append(allocator, "-O3");
-            try clang_args.append(allocator, "-DNDEBUG");
-        } else {
-            try clang_args.append(allocator, "-g");
-            try clang_args.append(allocator, "-O0");
-        }
-        if (asan) try clang_args.append(allocator, "-fsanitize=address");
-        try clang_args.append(allocator, "-pthread");
-        try clang_args.append(allocator, "-I.");
-
-        const home = init.environ_map.get("HOME") orelse init.environ_map.get("USERPROFILE") orelse "/";
-        const shared_nova = try std.fmt.allocPrint(allocator, "{s}/.nova", .{ home });
-
-        const ffi_libs = try collectFfiLibs(allocator, program);
-
-        if (target_triple_opt) |triple| {
-            if (try crossLinkViaZig(allocator, init.environ_map, init.io, triple, link_objs, output_path, shared_nova, is_release)) {
-                if (init.environ_map.get("NOVA_KEEP_OBJ") == null and !build_mode)
-                    Io.Dir.deleteFile(.cwd(), init.io, obj_path) catch {};
-                if (build_mode) {
-                    const cur = std.fmt.allocPrint(allocator, "{x}", .{src_hash}) catch "";
-                    defer if (cur.len > 0) allocator.free(cur);
-                    _ = Io.Dir.writeFile(.cwd(), init.io, .{ .data = cur, .sub_path = build_hash_path, .flags = .{} }) catch {};
-                    std.debug.print("Built {s} ({s}, cross {s}).\n", .{ output_path, if (is_release) "release" else "debug", triple });
-                } else {
-                    std.debug.print("Native output written to {s} (cross {s})\n", .{ output_path, triple });
-                }
-                return;
-            }
-        }
-
-        if (build_options.inprocess_lld and builtin.target.os.tag == .macos and target_triple_opt == null and !asan) {
-            try linkNativeInProcessMacho(allocator, init.environ_map, init.io, link_objs, output_path, shared_nova, ffi_libs);
-
-            if (init.environ_map.get("NOVA_KEEP_OBJ") == null and !build_mode)
-                Io.Dir.deleteFile(.cwd(), init.io, obj_path) catch {};
-            if (build_mode) {
-                const cur = std.fmt.allocPrint(allocator, "{x}", .{src_hash}) catch "";
-                defer if (cur.len > 0) allocator.free(cur);
-                _ = Io.Dir.writeFile(.cwd(), init.io, .{ .data = cur, .sub_path = build_hash_path, .flags = .{} }) catch {};
-                std.debug.print("Built {s} ({s}).\n", .{ output_path, if (is_release) "release" else "debug" });
-            }
-            return;
-        }
-
-        const shared_nova_arg = try std.fmt.allocPrint(allocator, "-I{s}", .{shared_nova});
-        try clang_args.append(allocator, shared_nova_arg);
-
-        for (link_objs) |o| try clang_args.append(allocator, o);
-
-        try appendRuntimeLink(&clang_args, allocator, shared_nova, if (asan) "novacore_asan" else "novacore");
-        try appendWolfsslLink(&clang_args, allocator, shared_nova, init.io);
-        for (ffi_libs) |lib| {
-            try appendFfiLib(&clang_args, allocator, shared_nova, init.io, lib);
-        }
-        try clang_args.append(allocator, "-o");
-        try clang_args.append(allocator, output_path);
-
-        var child = try std.process.spawn(init.io, .{
-            .argv = clang_args.items,
-        });
-        const term = try child.wait(init.io);
-        switch (term) {
-            .exited => |code| {
-                if (code != 0) {
-                    std.debug.print("Linking native binary failed with code {d}\n", .{code});
-                    return error.LinkFailed;
-                }
-            },
-            else => {
-                std.debug.print("Linking native binary failed abnormally\n", .{});
-                return error.LinkFailed;
-            },
-        }
-
-        if (init.environ_map.get("NOVA_KEEP_OBJ") == null and !build_mode) {
-            Io.Dir.deleteFile(.cwd(), init.io, obj_path) catch {};
-        } else if (!build_mode) {
-            std.debug.print("Kept object file {s} (NOVA_KEEP_OBJ)\n", .{obj_path});
-        }
-        if (build_mode) {
-            const cur = std.fmt.allocPrint(allocator, "{x}", .{src_hash}) catch "";
-            defer if (cur.len > 0) allocator.free(cur);
-            _ = Io.Dir.writeFile(.cwd(), init.io, .{ .data = cur, .sub_path = build_hash_path, .flags = .{} }) catch {};
-            std.debug.print("Built {s} ({s}{s}).\n", .{ output_path, if (is_release) "release" else "debug", if (asan) ", ASAN" else "" });
-        } else {
-            std.debug.print("Native output written to {s}{s}\n", .{ output_path, if (asan) " (ASAN)" else "" });
-        }
-    } else {
-        std.debug.print("Unsupported target: {s}\n", .{target});
-        return error.UnsupportedTarget;
-    }
-}
-
-pub fn userErrorHint(e: anyerror) ?[]const u8 {
-    return switch (e) {
-
-        error.TypeCheckError => "",
-        error.ExpectedToken, error.UnexpectedToken => "",
-
-        error.IdentifierNotFound => "undefined identifier",
-        error.FunctionNotFound => "undefined function",
-        error.VariableNotFound => "undefined variable",
-        error.MethodOrFunctionNotFound => "no such method or function",
-        error.AmbiguousName => "ambiguous name",
-        error.StructTypeNotFound => "unknown struct type",
-        error.FieldAccessObjectNotStruct => "field access on a non-struct value",
-        else => null,
-    };
-}
-
-// cmdBuild: the `nova build ...` and bare `nova <file> ...` path (arg parsing + watch + compile).
-// Extracted verbatim from the tail of the former mainInner; cli.run dispatches here for both forms.
-pub fn cmdBuild(allocator: std.mem.Allocator, init: std.process.Init, args: []const []const u8) !void {
-    var file_path: []const u8 = "";
-
-    var target: []const u8 = "--native";
-    var output_path: []const u8 = "";
-    var is_release = false;
-    var cross_target: ?[]const u8 = null;
-    var watch_mode = false;
-
-    const build_mode = std.mem.eql(u8, args[1], "build");
-
-    if (std.mem.eql(u8, args[1], "build")) {
-        var i: usize = 2;
-        while (i < args.len) : (i += 1) {
-            const arg = args[i];
-            if (std.mem.eql(u8, arg, "--target")) {
-                if (i + 1 < args.len) {
-                    i += 1;
-                    const val = args[i];
-                    if (std.mem.eql(u8, val, "wasm")) {
-                        target = "--wasm";
-                    } else if (std.mem.eql(u8, val, "native")) {
-                        target = "--native";
-                    } else {
-                        cross_target = val;
-                        target = "--native";
-                    }
-                } else {
-                    std.debug.print("Missing argument for --target\n", .{});
-                    return;
-                }
-            } else if (std.mem.eql(u8, arg, "--file")) {
-                if (i + 1 < args.len) {
-                    i += 1;
-                    file_path = args[i];
-                } else {
-                    std.debug.print("Missing argument for --file\n", .{});
-                    return;
-                }
-            } else if (std.mem.eql(u8, arg, "-o")) {
-                if (i + 1 < args.len) {
-                    i += 1;
-                    output_path = args[i];
-                } else {
-                    std.debug.print("Missing argument for -o\n", .{});
-                    return;
-                }
-            } else if (std.mem.eql(u8, arg, "--release") or std.mem.eql(u8, arg, "-r")) {
-                is_release = true;
-            } else if (std.mem.eql(u8, arg, "--debug") or std.mem.eql(u8, arg, "-d")) {
-                is_release = false;
-            } else if (std.mem.eql(u8, arg, "--watch") or std.mem.eql(u8, arg, "-w")) {
-                watch_mode = true;
-            }
-        }
-    } else {
-        file_path = args[1];
-        var i: usize = 2;
-        while (i < args.len) : (i += 1) {
-            const arg = args[i];
-            if (std.mem.eql(u8, arg, "--wasm") or std.mem.eql(u8, arg, "--native")) {
-                target = arg;
-            } else if (std.mem.eql(u8, arg, "--release") or std.mem.eql(u8, arg, "-r")) {
-                is_release = true;
-            } else if (std.mem.eql(u8, arg, "--debug") or std.mem.eql(u8, arg, "-d")) {
-                is_release = false;
-            } else if (std.mem.eql(u8, arg, "--watch") or std.mem.eql(u8, arg, "-w")) {
-                watch_mode = true;
-            } else if (std.mem.eql(u8, arg, "--target") or std.mem.eql(u8, arg, "-t")) {
-                if (i + 1 < args.len) {
-                    i += 1;
-                    cross_target = args[i];
-                } else {
-                    std.debug.print("Missing argument for --target\n", .{});
-                    return;
-                }
-            } else if (std.mem.eql(u8, arg, "-o")) {
-                if (i + 1 < args.len) {
-                    i += 1;
-                    output_path = args[i];
-                } else {
-                    std.debug.print("Missing argument for -o\n", .{});
-                    return;
-                }
-            }
-        }
-    }
-
-    const profile: []const u8 = if (is_release) "release" else "debug";
-    var build_obj_dir: []const u8 = "";
-    var build_hash_path: []const u8 = "";
-    if (build_mode) {
-
-        if (file_path.len == 0) file_path = "src/main.nova";
-
-        var proj_name: []const u8 = std.fs.path.stem(file_path);
-        if (Io.Dir.readFileAlloc(.cwd(), init.io, "project.json", allocator, .unlimited)) |pj| {
-            defer allocator.free(pj);
-            if (std.json.parseFromSlice(ProjectJson, allocator, pj, .{ .ignore_unknown_fields = true })) |parsed| {
-                proj_name = allocator.dupe(u8, parsed.value.name) catch proj_name;
-                parsed.deinit();
-            } else |_| {}
-        } else |_| {}
-
-        const bin_dir = try std.fmt.allocPrint(allocator, "build/{s}/bin", .{profile});
-        build_obj_dir = try std.fmt.allocPrint(allocator, "build/{s}/obj", .{profile});
-        Io.Dir.createDirPath(.cwd(), init.io, bin_dir) catch {};
-        Io.Dir.createDirPath(.cwd(), init.io, build_obj_dir) catch {};
-        if (output_path.len == 0)
-            output_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ bin_dir, proj_name });
-        build_hash_path = try std.fmt.allocPrint(allocator, "build/{s}/.build-hash", .{profile});
-    }
-
-    if (file_path.len == 0) {
-        std.debug.print("Error: No input file specified.\n", .{});
-        return;
-    }
-
-    var target_triple_opt: ?[]const u8 = null;
-    if (cross_target) |ct| {
-        if (std.mem.eql(u8, ct, "linux-arm64")) {
-            target_triple_opt = "aarch64-unknown-linux-gnu";
-        } else if (std.mem.eql(u8, ct, "linux-x86_64")) {
-            target_triple_opt = "x86_64-unknown-linux-gnu";
-        } else if (std.mem.eql(u8, ct, "macos-arm64")) {
-            target_triple_opt = "aarch64-apple-darwin";
-        } else if (std.mem.eql(u8, ct, "macos-x86_64")) {
-            target_triple_opt = "x86_64-apple-darwin";
-        } else if (std.mem.eql(u8, ct, "windows-x86_64")) {
-
-            target_triple_opt = "x86_64-pc-windows-gnu";
-        } else if (std.mem.eql(u8, ct, "windows-arm64")) {
-            target_triple_opt = "aarch64-pc-windows-gnu";
-        } else {
-            std.debug.print("Unsupported target switch: {s}\n", .{ct});
-            return error.UnsupportedTarget;
-        }
-    }
-
-    if (output_path.len == 0) {
-        const base_name = try basenameWithoutExtension(file_path, allocator);
-        defer allocator.free(base_name);
-        if (std.mem.eql(u8, target, "--wasm")) {
-            output_path = try std.fmt.allocPrint(allocator, "{s}.wasm", .{base_name});
-        } else {
-            output_path = try allocator.dupe(u8, base_name);
-        }
-    }
-
-    if (watch_mode) {
-        std.debug.print("[watch] Watching for changes...\n", .{});
-        var mtimes = std.StringHashMap(i96).init(allocator);
-        defer {
-            var iter = mtimes.keyIterator();
-            while (iter.next()) |k| allocator.free(k.*);
-            mtimes.deinit();
-        }
-
-        while (true) {
-            var pass_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-            const pass_allocator = pass_arena.allocator();
-
-            var visited = std.StringHashMap(void).init(pass_allocator);
-
-            compileProgram(pass_allocator, init, file_path, target, output_path, is_release, target_triple_opt, &visited, build_mode, build_obj_dir, build_hash_path) catch |err| {
-                std.debug.print("Compilation failed: {any}\n", .{err});
-            };
-
-            var file_iter = visited.keyIterator();
-            while (file_iter.next()) |file| {
-                if (!mtimes.contains(file.*)) {
-                    if (getFileMtime(init.io, file.*)) |mt| {
-                        const dup_key = try allocator.dupe(u8, file.*);
-                        try mtimes.put(dup_key, mt);
-                    } else |_| {}
-                }
-            }
-
-            pass_arena.deinit();
-
-            var changed = false;
-            while (!changed) {
-                init.io.sleep(std.Io.Duration.fromMilliseconds(500), .boot) catch {};
-
-                if (mtimes.count() == 0) {
-                    if (getFileMtime(init.io, file_path)) |mt| {
-                        const dup_key = try allocator.dupe(u8, file_path);
-                        try mtimes.put(dup_key, mt);
-                    } else |_| {}
-                }
-
-                var iter = mtimes.iterator();
-                while (iter.next()) |entry| {
-                    const file = entry.key_ptr.*;
-                    const old_mt = entry.value_ptr.*;
-                    if (getFileMtime(init.io, file)) |new_mt| {
-                        if (new_mt > old_mt) {
-                            std.debug.print("\n[watch] File changed: {s}. Recompiling...\n", .{file});
-                            entry.value_ptr.* = new_mt;
-                            changed = true;
-                            break;
-                        }
-                    } else |_| {}
-                }
-            }
-        }
-    } else {
-        var visited = std.StringHashMap(void).init(allocator);
-        defer {
-            var iter = visited.keyIterator();
-            while (iter.next()) |k| allocator.free(k.*);
-            visited.deinit();
-        }
-        try compileProgram(allocator, init, file_path, target, output_path, is_release, target_triple_opt, &visited, build_mode, build_obj_dir, build_hash_path);
-    }
 }

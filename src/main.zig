@@ -6,11 +6,10 @@
 
 const std = @import("std");
 const cli = @import("cli.zig");
-const commands = @import("commands.zig");
 
 pub fn main(init: std.process.Init) !void {
     cli.run(init) catch |e| {
-        if (commands.userErrorHint(e)) |hint| {
+        if (cli.userErrorHint(e)) |hint| {
             if (hint.len > 0) {
                 std.debug.print("\x1b[1m\x1b[31merror:\x1b[0m\x1b[1m {s}\x1b[0m (compilation failed)\n", .{hint});
             }
