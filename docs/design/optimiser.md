@@ -313,6 +313,35 @@ ARC-elision is the reason we are here.
 - **Non-goal: replacing sema.** The frontend, the TypeId type system, and monomorphisation are
   unchanged. The middle-end consumes their output.
 
+## ⚠️ Correction (2026-08-15) — the NOVA_OPT_EMIT corpus gate was VACUOUS; genuine emit is 272/348
+
+Every prior claim below of "NOVA_OPT_EMIT=1 corpus 346/347" was measured through `nova test`, and
+`nova test` (tester.zig) NEVER set `lir_emit.emit_enabled` — only the `nova build` path (builder.zig:192)
+did. So `NOVA_OPT_EMIT=1 conformance/run.sh` ran the AST path the whole time: the emit gate proved nothing.
+Per-increment BUILD-path differentials (M6-A..E) were real, but the corpus-wide emit gate was not.
+
+Fixed 2026-08-15: tester.zig now sets `emit_enabled`/`emit_verbose`/`mir.type_store` from the same env the
+build path reads, so `nova test` genuinely exercises emit. With the gate honest, the numbers are:
+- **Default build (emit off): 347/348** (only 189_epoll, expected off-Linux) — unchanged, users unaffected.
+- **NOVA_OPT_EMIT=1 (genuine): 272/348 — 75 real failures.** The emit path (M6-A..D) is NOT corpus-correct;
+  it was hardened against a gate that didn't run it.
+
+Two representative defects found immediately (there are ~75):
+1. **Over-acceptance of non-plain types** (FIXED 2026-08-15). `mirEmittable`/`tryEmitInner` accepted functions
+   with value-optional (`int | undefined`) params/returns because `concreteTidForTypeRef` strips the optional
+   to its inner int, which then reads as a plain scalar. e.g. `checkedAddInt(): int | undefined` emitted and
+   returned `undefined` for a valid value. Fix: reject `.optional` param/return type-refs before the strip,
+   and gate the return type to void / scalar-int-bool / fresh-heap-struct only. Recovered ~5 cases.
+2. **INT_MIN boundary miscompile** (OPEN — example of the remaining 75). `intMin(): int { return -2147483647
+   - 1; }` — the value `-2147483648` (0x80000000) is ZERO-extended to the i64 word instead of sign-extended,
+   so `intMin() < 0` reads false. Both the const-folded and the runtime (`x - 1`) forms hit it identically;
+   ordinary negatives (-3, -4) are fine, so it is specific to the high-bit-set boundary. This is a miscompile
+   of an IN-SUBSET construct (plain int arithmetic), so it must be fixed, not gated — it means other
+   boundary-int functions may be subtly wrong.
+
+**The genuine 75-case gap is now the real "M6 remaining" work, and it is measurable for the first time.**
+Everything below predates this correction; read it with the vacuous-gate caveat in mind.
+
 ## Implementation status (2026-08-14) — honest milestone accounting
 
 The optimiser MACHINERY is built, tested, and proven on real code via the `NOVA_OPT` shadow. The backend

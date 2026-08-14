@@ -60,12 +60,32 @@ fn tryEmitInner(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, func: anyty
     var ptbuf: [16]mir.TypeId = undefined;
     for (func.params, 0..) |p, i| {
         const tr = p.type_name orelse return reject("untyped param");
+        // An OPTIONAL param (`T | undefined`) is boxed/encoded specially and concreteTidForTypeRef strips
+        // it to the inner tid -- which would masquerade as a plain scalar. The emit path does not model
+        // optionals, so reject at the type-ref level before the tid is stripped.
+        if (tr == .optional) return reject("optional param");
         const ptid = compiler.concreteTidForTypeRef(tr) orelse return reject("unresolved param type");
         const scalar_ok = if (intKindForTid(compiler, ptid)) |pk| (pk.signed or pk.is_bool) else false;
         if (!scalar_ok and !emittableHeapStructTid(compiler, ptid)) return reject("param not int/bool/heap-struct");
         ptbuf[i] = ptid;
     }
     const param_types = ptbuf[0..func.params.len];
+
+    // Return type must be plainly emittable: void (no ret_type_ref), a signed int/bool scalar, or an
+    // emittable heap struct (the fresh-construction case, further restricted in mirEmittable's `.ret`).
+    // A value-optional (`int | undefined`), float, string, union or error-union return is NOT correctly
+    // encoded yet and must fall back to AST. Without this, e.g. `checkedAddInt(): int | undefined` emitted
+    // and returned `undefined` for a perfectly valid value -- concreteTidForTypeRef strips the optional to
+    // the inner int, so the scalar check alone lets it through; gate on the type-ref shape too.
+    if (func.ret_type_ref) |rtr| {
+        if (rtr == .optional) return reject("optional return");
+        const is_void = (rtr == .ident and std.mem.eql(u8, rtr.ident, "void"));
+        if (!is_void) {
+            const rtid = compiler.concreteTidForTypeRef(rtr) orelse return reject("unresolved return type");
+            const ret_scalar = if (intKindForTid(compiler, rtid)) |rk| (rk.signed or rk.is_bool) else false;
+            if (!ret_scalar and !emittableHeapStructTid(compiler, rtid)) return reject("return type not int/bool/heap-struct");
+        }
+    }
 
     // AST -> HIR for this function body (params modelled as `let name = param(i)`).
     const fd = ast.FunctionDecl{
@@ -222,8 +242,10 @@ fn mirEmittable(compiler: *LlvmCompiler, mf: *const mir.Func) bool {
                     const lk = intKindForTid(compiler, mf.typeOf(x.lhs)) orelse return false;
                     const rk = intKindForTid(compiler, mf.typeOf(x.rhs)) orelse return false;
                     switch (x.op) {
-                        .div, .mod, .shr => return false,
-                        .add, .sub, .mul, .shl => {
+                        // Arithmetic + shifts (incl. div/mod/shr): signed non-bool operands, non-bool int
+                        // result. div/mod carry the AST path's div-by-zero (+ i64 MIN/-1) guard; shr is an
+                        // arithmetic shift of the sign-extended word. Same operand gate as the others.
+                        .add, .sub, .mul, .shl, .div, .mod, .shr => {
                             if (!lk.signed or !rk.signed or lk.is_bool or rk.is_bool) return false;
                             const rez = intKindForTid(compiler, inst.ty) orelse return false;
                             if (rez.is_bool) return false;
@@ -429,8 +451,9 @@ fn emitFunc(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, mf: *const mir.
 
 // Airtight binop emit: reproduces the AST path's integer semantics EXACTLY for the subset it accepts, and
 // returns error.Unemittable (fall back to AST) for anything it cannot prove. Accepts SIGNED int / bool
-// operands only. div/mod/shr are rejected (they need the AST path's div-by-zero guard / signed-shift and
-// unsigned-canonicalisation, which introduce branches or sign logic outside this straight-line slice).
+// operands only. div/mod reuse the AST path's exact div-by-zero (+ i64 MIN/-1) guard (which splits the
+// block, leaving the builder at the continuation), and shr is an arithmetic shift of the sign-extended
+// word. Unsigned div/mod/shr (which need unsigned-canonicalisation) still fall back to the AST path.
 fn emitBinop(compiler: *LlvmCompiler, inst: mir.Inst, op: mir.BinOp, mf: *const mir.Func, l: types.LLVMValueRef, r: types.LLVMValueRef) !types.LLVMValueRef {
     const bld = compiler.builder;
     const vt = compiler.val_type;
@@ -480,7 +503,25 @@ fn emitBinop(compiler: *LlvmCompiler, inst: mir.Inst, op: mir.BinOp, mf: *const 
             const cmp = core.LLVMBuildICmp(bld, pred, l, r, "");
             return core.LLVMBuildZExt(bld, cmp, vt, "");
         },
-        // div / mod / shr: need the AST path's guard / sign handling -> fall back.
-        .div, .mod, .shr => return error.Unemittable,
+        // div / mod: same div-by-zero (+ i64 MIN/-1 at width 64) guard the AST path emits, then a signed
+        // divide/remainder. NOT canonicalised: for width<64 the sign-extended i64 operands cannot overflow
+        // sdiv/srem and the result already fits; width==64 is caught by the guard. Matches the AST path.
+        .div, .mod => {
+            if (!lk.signed or !rk.signed or lk.is_bool or rk.is_bool) return error.Unemittable;
+            const rez = intKindForTid(compiler, inst.ty) orelse return error.Unemittable;
+            if (rez.is_bool) return error.Unemittable;
+            if (op == .div) {
+                compiler.emitIntDivGuard(l, r, true, lk.width, "integer division by zero", "integer division overflow (INT_MIN / -1)");
+                return core.LLVMBuildSDiv(bld, l, r, "");
+            }
+            compiler.emitIntDivGuard(l, r, true, lk.width, "integer modulo by zero", "integer modulo overflow (INT_MIN % -1)");
+            return core.LLVMBuildSRem(bld, l, r, "");
+        },
+        // shr: signed operands arrive as sign-extended i64 words, so an arithmetic shift right is exact
+        // (matches the AST path's signed branch). No canonicalise.
+        .shr => {
+            if (!lk.signed or !rk.signed or lk.is_bool or rk.is_bool) return error.Unemittable;
+            return core.LLVMBuildAShr(bld, l, r, "");
+        },
     }
 }

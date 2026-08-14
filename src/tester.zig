@@ -277,6 +277,14 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
     sema_escape.report_enabled = init.environ_map.get("NOVA_ESCAPE_REPORT") != null;
     if (sema_escape.report_enabled) _ = sema_escape.analyze(allocator, &owned_sema.store, &owned_sema.ir, &program);
 
+    // Emit-path (NOVA_OPT_EMIT): honour the SAME opt-in the build path sets (builder.zig), so the corpus
+    // gate run via `nova test` genuinely exercises the LIR emit path rather than silently staying on the
+    // AST path. type_store lets the optimiser's width-honest constfold resolve TypeId widths.
+    // See docs/design/optimiser.md / lir_emit.zig.
+    @import("backend/codegen/lir_emit.zig").emit_enabled = init.environ_map.get("NOVA_OPT_EMIT") != null;
+    @import("backend/codegen/lir_emit.zig").emit_verbose = init.environ_map.get("NOVA_OPT_EMIT_VERBOSE") != null;
+    @import("optimiser/mir.zig").type_store = &owned_sema.store;
+
     const output_path = "__nova_test";
     const obj_path = try std.fmt.allocPrint(allocator, "{s}.o", .{output_path});
     defer allocator.free(obj_path);
