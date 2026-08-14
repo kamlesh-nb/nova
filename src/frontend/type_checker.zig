@@ -544,6 +544,23 @@ pub const TypeChecker = struct {
             .block => |b| try self.checkBlock(b),
             .let_stmt => |ls| {
                 if (ls.init) |init_walk| try self.checkExpr(init_walk);
+                // L3/C-chk-7: tuple destructuring `let (a,b,...) = e` must bind exactly as many names as
+                // the tuple has elements; a mismatch bound garbage. Bind each name to its element type.
+                if (ls.names) |names| {
+                    if (ls.init) |init_expr| {
+                        if (self.resolveExprType(init_expr)) |it| {
+                            if (it == .tuple) {
+                                const arity = it.tuple.len;
+                                if (names.len != arity) {
+                                    self.addError(ls.span, "tuple destructuring binds {d} name(s) but the tuple has {d} element(s) — the counts must match", .{ names.len, arity });
+                                }
+                                for (names, 0..) |nm, i| {
+                                    if (i < arity) try self.variables.put(nm, it.tuple[i]);
+                                }
+                            }
+                        }
+                    }
+                }
                 if (ls.type_name) |t| {
                     self.rejectUnimplementedType(t, ls.span);
                     try self.variables.put(ls.name, t);
