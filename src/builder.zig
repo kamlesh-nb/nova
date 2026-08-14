@@ -20,6 +20,7 @@ const sema_mod = @import("frontend/sema/sema.zig");
 const sema_mono = @import("frontend/sema/mono.zig");
 const pipeline = @import("pipeline.zig");
 const packages = @import("packages.zig");
+const optimiser = @import("optimiser/driver.zig");
 
 
 fn compileProgram(
@@ -182,6 +183,16 @@ fn compileProgram(
     // P7 Stage 1: report-only escape gauge (no codegen effect). See docs/design/p7-sound-arena.md.
     sema_escape.report_enabled = init.environ_map.get("NOVA_ESCAPE_REPORT") != null;
     if (sema_escape.report_enabled) _ = sema_escape.analyze(allocator, &owned_sema.store, &owned_sema.ir, &program);
+
+    // Optimiser middle-end (M1a, shadow). With NOVA_OPT set, lower every function AST->HIR and report
+    // coverage -- exercised on real code, but does NOT emit (codegen below still lowers from the AST), so
+    // it cannot change the produced program. See docs/design/optimiser.md.
+    if (init.environ_map.get("NOVA_OPT") != null) {
+        const verbose = init.environ_map.get("NOVA_OPT_VERBOSE") != null;
+        _ = optimiser.lowerProgramShadow(allocator, program, verbose) catch |e| {
+            std.debug.print("[opt] shadow lowering error: {any}\n", .{e});
+        };
+    }
 
     if (std.mem.eql(u8, target, "--wasm")) {
         const obj_path = try std.fmt.allocPrint(allocator, "{s}.o", .{output_path});

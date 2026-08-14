@@ -1,10 +1,13 @@
-// hir.zig — High-level IR: a typed, desugared tree.
+// hir.zig — High-level IR: a typed, desugared tree over a flat node table.
 //
-// HIR is the AST with Nova sugar removed and every node carrying a concrete post-monomorphisation
-// TypeId. Desugaring makes implicit work explicit (for/while-let/optional-chaining/coalesce/if-expr/
-// interpolation/ternary -> if+loop+match; try/? -> explicit error-union branch) and, crucially, makes
-// ARC explicit: each owned acquisition emits a Retain, each owned scope-exit a Release, so later tiers
-// can see and cancel them. See docs/design/optimiser.md. M0: definitions only.
+// HIR is the AST with Nova sugar being removed and (as lowering matures) every node carrying a concrete
+// post-monomorphisation TypeId. It is stored as a flat table addressed by HirId so later tiers walk it
+// cheaply. ARC becomes explicit here: each owned acquisition emits a Retain, each owned scope-exit a
+// Release (added once ownership threading lands). See docs/design/optimiser.md.
+//
+// M1a: the node set + a builder. AST->HIR lowering (lower_ast_hir.zig) targets the core forms; anything
+// not yet handled lowers to `.unsupported` so the pass never crashes on real code and coverage is
+// measurable. HIR->MIR->LIR are the next checkpoints.
 
 const std = @import("std");
 const ast = @import("../frontend/ast.zig");
@@ -13,66 +16,92 @@ const types = @import("../frontend/types.zig");
 pub const TypeId = types.TypeId;
 pub const SymbolId = types.SymbolId;
 
-pub const HirId = enum(u32) { none = 0, _ };
+pub const HirId = enum(u32) { none = 0xFFFF_FFFF, _ };
 
-pub const BinOp = enum { add, sub, mul, div, mod, @"and", @"or", eq, ne, lt, le, gt, ge, bit_and, bit_or, shl, shr };
-pub const UnOp = enum { neg, not };
+pub const BinOp = enum { add, sub, mul, div, mod, @"and", @"or", eq, ne, lt, le, gt, ge, bit_and, bit_or, bit_xor, shl, shr, assign };
+pub const UnOp = enum { neg, not, bit_not };
 
-pub const Arm = struct {
-    // A match arm: a pattern discriminant (variant symbol or literal) and its body.
-    tag: ?SymbolId,
-    body: Block,
-};
-
+// A desugared block: an ordered list of statement/expression node ids.
 pub const Block = struct {
     nodes: []const HirId = &.{},
 };
 
-// A HIR node. Every node has a TypeId (void for statements) and a source span for diagnostics and the
-// differential shadow. This is illustrative of the intended set; it grows as lowering is implemented.
+pub const Arm = struct {
+    tag: ?SymbolId,
+    body: Block,
+};
+
 pub const Node = struct {
     kind: Kind,
-    ty: TypeId,
+    ty: TypeId = @enumFromInt(0), // filled by lowering once ExprId->TypeId threading lands (M1b)
     span: ast.Span,
 
     pub const Kind = union(enum) {
-        // values
-        literal: void,
-        ident: SymbolId,
-        field: struct { object: HirId, field: SymbolId },
+        // literals
+        int: i64,
+        float: f64,
+        bool: bool,
+        str: []const u8,
+        null,
+        undefined,
+        // references
+        ident: []const u8,
+        field: struct { object: HirId, name: []const u8 },
         index: struct { object: HirId, idx: HirId },
+        // operators
         binop: struct { op: BinOp, lhs: HirId, rhs: HirId },
         unop: struct { op: UnOp, operand: HirId },
-        call: struct { callee: SymbolId, args: []const HirId, takes_ownership: []const bool },
-        indirect_call: struct { receiver: HirId, slot: u32, args: []const HirId },
-        struct_init: struct { ty: TypeId, fields: []const HirId },
-
-        // ARC, made explicit here (the whole point of the tier)
+        // calls
+        call: struct { callee: HirId, args: []const HirId },
+        // ARC (made explicit as ownership threading lands)
         retain: HirId,
         release: HirId,
-
-        // control flow, desugared
-        if_: struct { cond: HirId, then: Block, else_: Block },
-        loop_: Block,
-        match_: struct { scrutinee: HirId, arms: []const Arm },
+        // statements / control (desugared)
+        let: struct { name: []const u8, value: ?HirId },
+        assign: struct { target: HirId, value: HirId },
         ret: ?HirId,
-        brk: void,
-        cont: void,
-
-        // async, survives to LIR
+        brk,
+        cont,
+        if_: struct { cond: HirId, then: Block, else_: Block },
+        loop_: struct { cond: ?HirId, body: Block }, // cond == null => infinite loop
+        block: Block,
+        // async
         await_: HirId,
         spawn_: HirId,
+        // a form not yet lowered; carries the AST tag name for coverage reporting
+        unsupported: []const u8,
     };
 };
 
-// A lowered function: a flat node table addressed by HirId plus the entry block.
+// A lowered function: a flat node table plus the entry block.
 pub const Func = struct {
-    sym: SymbolId,
-    inst: ?TypeId = null, // monomorphisation instance key, null for a non-generic function
+    name: []const u8,
+    sym: ?SymbolId = null,
+    inst: ?TypeId = null,
     nodes: std.ArrayListUnmanaged(Node) = .empty,
     entry: Block = .{},
 
     pub fn deinit(self: *Func, allocator: std.mem.Allocator) void {
         self.nodes.deinit(allocator);
+    }
+
+    // Append a node and return its id.
+    pub fn add(self: *Func, allocator: std.mem.Allocator, node: Node) !HirId {
+        const id: HirId = @enumFromInt(self.nodes.items.len);
+        try self.nodes.append(allocator, node);
+        return id;
+    }
+
+    pub fn get(self: *const Func, id: HirId) Node {
+        return self.nodes.items[@intFromEnum(id)];
+    }
+
+    // Count nodes that are still `.unsupported` (a coverage metric for the shadow harness).
+    pub fn unsupportedCount(self: *const Func) usize {
+        var n: usize = 0;
+        for (self.nodes.items) |node| {
+            if (node.kind == .unsupported) n += 1;
+        }
+        return n;
     }
 };
