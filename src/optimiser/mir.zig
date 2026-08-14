@@ -28,19 +28,132 @@ pub const Inst = struct {
         store: struct { addr: Value, val: Value },
         alloc: struct { ty: TypeId },
         gep: struct { base: Value, offset: u32 }, // field / element address
-        call: struct { callee: SymbolId, args: []const Value, takes_ownership: []const bool },
-        indirect_call: struct { receiver: Value, slot: u32, args: []const Value },
+        call: struct { callee: SymbolId, args: []Value, takes_ownership: []const bool },
+        indirect_call: struct { receiver: Value, slot: u32, args: []Value },
         cast: struct { val: Value },
         // ARC — first-class so the elision pass can see and cancel balanced pairs
         retain: struct { val: Value },
         release: struct { val: Value },
         // async
         await_: struct { fut: Value },
-        spawn_: struct { callee: SymbolId, args: []const Value },
+        spawn_: struct { callee: SymbolId, args: []Value },
         // constants materialised by const-folding
         const_int: i64,
     };
 };
+
+// Collect the Value operands an instruction reads into `buf`, returning the used slice. Callals/args are
+// bounded in practice; long arg lists are truncated for the fixed buffer (analysis stays conservative).
+pub fn instOperands(op: Inst.Op, buf: *[8]Value) []Value {
+    var n: usize = 0;
+    const push = struct {
+        fn f(b: *[8]Value, i: *usize, v: Value) void {
+            if (i.* < b.len and v != .invalid) {
+                b[i.*] = v;
+                i.* += 1;
+            }
+        }
+    }.f;
+    switch (op) {
+        .binop => |x| {
+            push(buf, &n, x.lhs);
+            push(buf, &n, x.rhs);
+        },
+        .load => |x| push(buf, &n, x.addr),
+        .store => |x| {
+            push(buf, &n, x.addr);
+            push(buf, &n, x.val);
+        },
+        .gep => |x| push(buf, &n, x.base),
+        .cast => |x| push(buf, &n, x.val),
+        .retain => |x| push(buf, &n, x.val),
+        .release => |x| push(buf, &n, x.val),
+        .await_ => |x| push(buf, &n, x.fut),
+        .indirect_call => |x| {
+            push(buf, &n, x.receiver);
+            for (x.args) |arg| push(buf, &n, arg);
+        },
+        .call => |x| for (x.args) |arg| push(buf, &n, arg),
+        .spawn_ => |x| for (x.args) |arg| push(buf, &n, arg),
+        .alloc, .const_int => {},
+    }
+    return buf[0..n];
+}
+
+pub fn termOperands(term: Terminator, buf: *[2]Value) []Value {
+    switch (term) {
+        .condbr => |x| {
+            buf[0] = x.cond;
+            return buf[0..1];
+        },
+        .switch_ => |x| {
+            buf[0] = x.scrutinee;
+            return buf[0..1];
+        },
+        .ret => |x| if (x) |v| {
+            buf[0] = v;
+            return buf[0..1];
+        },
+        else => {},
+    }
+    return buf[0..0];
+}
+
+// Rewrite every operand equal to `from` to `to`, across every instruction and terminator in the function.
+// Used by copy propagation and load-forwarding. Definitions (results) are not touched.
+pub fn replaceUses(func: *Func, from: Value, to: Value) void {
+    for (func.blocks.items) |*b| {
+        for (b.insts.items) |*inst| rewriteInst(&inst.op, from, to);
+        rewriteTerm(&b.term, from, to);
+    }
+}
+
+fn sw(v: *Value, from: Value, to: Value) void {
+    if (v.* == from) v.* = to;
+}
+
+fn rewriteInst(op: *Inst.Op, from: Value, to: Value) void {
+    switch (op.*) {
+        .binop => |*x| {
+            sw(&x.lhs, from, to);
+            sw(&x.rhs, from, to);
+        },
+        .load => |*x| sw(&x.addr, from, to),
+        .store => |*x| {
+            sw(&x.addr, from, to);
+            sw(&x.val, from, to);
+        },
+        .gep => |*x| sw(&x.base, from, to),
+        .cast => |*x| sw(&x.val, from, to),
+        .retain => |*x| sw(&x.val, from, to),
+        .release => |*x| sw(&x.val, from, to),
+        .await_ => |*x| sw(&x.fut, from, to),
+        .indirect_call => |*x| {
+            sw(&x.receiver, from, to);
+            for (x.args) |*arg| sw(arg, from, to);
+        },
+        .call => |*x| for (x.args) |*arg| sw(arg, from, to),
+        .spawn_ => |*x| for (x.args) |*arg| sw(arg, from, to),
+        .alloc, .const_int => {},
+    }
+}
+
+fn rewriteTerm(term: *Terminator, from: Value, to: Value) void {
+    switch (term.*) {
+        .condbr => |*x| sw(&x.cond, from, to),
+        .switch_ => |*x| sw(&x.scrutinee, from, to),
+        .ret => |*x| if (x.*) |*v| sw(v, from, to),
+        else => {},
+    }
+}
+
+// True if the instruction has an observable effect and must not be removed even if its result is unused.
+pub fn hasSideEffects(op: Inst.Op) bool {
+    return switch (op) {
+        .store, .call, .indirect_call, .retain, .release, .await_, .spawn_ => true,
+        .binop, .load, .alloc, .gep, .cast, .const_int => false,
+    };
+}
 
 pub const Terminator = union(enum) {
     br: struct { dest: Block, args: []const Value },
