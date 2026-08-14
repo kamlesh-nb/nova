@@ -2206,13 +2206,26 @@ pub const Parser = struct {
                 },
                 .dot => {
                     self.advance();
-                    const field = self.current().lexeme;
-                    try self.expect(.identifier);
-                    expr = ast.Expression{ .kind = .{ .field_access = ast.FieldAccess{
-                        .object = try self.allocExpression(expr),
-                        .field = field,
-                        .span = self.span(),
-                    } } };
+                    // L5/K8: `tuple.N` positional access desugars to `tuple[N]`, reusing the index path.
+                    if (self.current().type == .integer) {
+                        const n = try self.parseIntLexeme(self.current());
+                        const sp = self.span();
+                        self.advance();
+                        const idx_lit = ast.Expression{ .kind = .{ .literal = .{ .integer = n } }, .span = sp };
+                        expr = ast.Expression{ .kind = .{ .index = ast.IndexExpr{
+                            .object = try self.allocExpression(expr),
+                            .index = try self.allocExpression(idx_lit),
+                            .span = sp,
+                        } } };
+                    } else {
+                        const field = self.current().lexeme;
+                        try self.expect(.identifier);
+                        expr = ast.Expression{ .kind = .{ .field_access = ast.FieldAccess{
+                            .object = try self.allocExpression(expr),
+                            .field = field,
+                            .span = self.span(),
+                        } } };
+                    }
                 },
                 .left_brace => {
                     self.advance();
