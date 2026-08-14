@@ -69,33 +69,36 @@ fn lowerNode(ctx: *Ctx, id: HirId) anyerror!Value {
     const node = ctx.hf.get(id);
     const mf = ctx.mf;
     const a = ctx.allocator;
+    // Use the node's real (sema-threaded) TypeId for the values it produces; fall back to the placeholder
+    // only where sema could not type it. This carries real types into MIR (and thence LIR) for the emit path.
+    const nty: mir.TypeId = if (@intFromEnum(node.ty) == 0) placeholder_ty else node.ty;
     return switch (node.kind) {
-        .int => |v| mf.emit(a, ctx.cur, placeholder_ty, .{ .const_int = v }),
-        .bool => |v| mf.emit(a, ctx.cur, placeholder_ty, .{ .const_int = if (v) 1 else 0 }),
+        .int => |v| mf.emit(a, ctx.cur, nty, .{ .const_int = v }),
+        .bool => |v| mf.emit(a, ctx.cur, nty, .{ .const_int = if (v) 1 else 0 }),
         // structural placeholders for non-integer literals (real materialisation is an emit-time concern)
-        .float, .str, .null, .undefined => mf.emit(a, ctx.cur, placeholder_ty, .{ .const_int = 0 }),
+        .float, .str, .null, .undefined => mf.emit(a, ctx.cur, nty, .{ .const_int = 0 }),
 
         .ident => |name| blk: {
             if (ctx.slots.get(name)) |addr| {
-                break :blk try mf.emit(a, ctx.cur, placeholder_ty, .{ .load = .{ .addr = addr } });
+                break :blk try mf.emit(a, ctx.cur, nty, .{ .load = .{ .addr = addr } });
             }
             // param / global / function reference: opaque value for the structural IR.
-            break :blk try mf.emit(a, ctx.cur, placeholder_ty, .{ .const_int = 0 });
+            break :blk try mf.emit(a, ctx.cur, nty, .{ .const_int = 0 });
         },
 
         .binop => |b| blk: {
             const lhs = try lowerNode(ctx, b.lhs);
             const rhs = try lowerNode(ctx, b.rhs);
-            break :blk try mf.emit(a, ctx.cur, placeholder_ty, .{ .binop = .{ .op = mapBin(b.op), .lhs = lhs, .rhs = rhs } });
+            break :blk try mf.emit(a, ctx.cur, nty, .{ .binop = .{ .op = mapBin(b.op), .lhs = lhs, .rhs = rhs } });
         },
         .unop => |u| blk: {
             const operand = try lowerNode(ctx, u.operand);
             // model unary as binop against a constant where convenient; structurally a cast-through.
-            break :blk try mf.emit(a, ctx.cur, placeholder_ty, .{ .cast = .{ .val = operand } });
+            break :blk try mf.emit(a, ctx.cur, nty, .{ .cast = .{ .val = operand } });
         },
         .cast => |operand_id| blk: {
             const operand = try lowerNode(ctx, operand_id);
-            break :blk try mf.emit(a, ctx.cur, placeholder_ty, .{ .cast = .{ .val = operand } });
+            break :blk try mf.emit(a, ctx.cur, nty, .{ .cast = .{ .val = operand } });
         },
 
         .call => |c| try lowerCall(ctx, c.callee, c.args),
@@ -103,16 +106,16 @@ fn lowerNode(ctx: *Ctx, id: HirId) anyerror!Value {
 
         .field => |f| blk: {
             const object = try lowerNode(ctx, f.object);
-            break :blk try mf.emit(a, ctx.cur, placeholder_ty, .{ .gep = .{ .base = object, .offset = 0 } });
+            break :blk try mf.emit(a, ctx.cur, nty, .{ .gep = .{ .base = object, .offset = 0 } });
         },
         .optional_chain => |oc| blk: {
             const object = try lowerNode(ctx, oc.object);
-            break :blk try mf.emit(a, ctx.cur, placeholder_ty, .{ .gep = .{ .base = object, .offset = 0 } });
+            break :blk try mf.emit(a, ctx.cur, nty, .{ .gep = .{ .base = object, .offset = 0 } });
         },
         .index => |ix| blk: {
             const object = try lowerNode(ctx, ix.object);
             _ = try lowerNode(ctx, ix.idx);
-            break :blk try mf.emit(a, ctx.cur, placeholder_ty, .{ .load = .{ .addr = object } });
+            break :blk try mf.emit(a, ctx.cur, nty, .{ .load = .{ .addr = object } });
         },
 
         .struct_init => |si| try lowerAggregate(ctx, si.fields),
@@ -122,17 +125,17 @@ fn lowerNode(ctx: *Ctx, id: HirId) anyerror!Value {
         .range => |r| blk: {
             _ = try lowerNode(ctx, r.start);
             _ = try lowerNode(ctx, r.end);
-            break :blk try mf.emit(a, ctx.cur, placeholder_ty, .{ .const_int = 0 });
+            break :blk try mf.emit(a, ctx.cur, nty, .{ .const_int = 0 });
         },
-        .closure => mf.emit(a, ctx.cur, placeholder_ty, .{ .const_int = 0 }),
+        .closure => mf.emit(a, ctx.cur, nty, .{ .const_int = 0 }),
 
         .await_ => |operand_id| blk: {
             const fut = try lowerNode(ctx, operand_id);
-            break :blk try mf.emit(a, ctx.cur, placeholder_ty, .{ .await_ = .{ .fut = fut } });
+            break :blk try mf.emit(a, ctx.cur, nty, .{ .await_ = .{ .fut = fut } });
         },
         .spawn_ => |operand_id| blk: {
             _ = try lowerNode(ctx, operand_id);
-            break :blk try mf.emit(a, ctx.cur, placeholder_ty, .{ .spawn_ = .{ .callee = @enumFromInt(0), .args = &.{} } });
+            break :blk try mf.emit(a, ctx.cur, nty, .{ .spawn_ = .{ .callee = @enumFromInt(0), .args = &.{} } });
         },
         .try_ => |operand_id| lowerNode(ctx, operand_id),
         .retain => |operand_id| blk: {
@@ -148,7 +151,7 @@ fn lowerNode(ctx: *Ctx, id: HirId) anyerror!Value {
 
         // statements
         .let => |l| blk: {
-            const addr = try mf.emit(a, ctx.cur, placeholder_ty, .{ .alloc = .{ .ty = placeholder_ty } });
+            const addr = try mf.emit(a, ctx.cur, nty, .{ .alloc = .{ .ty = nty } });
             try ctx.slots.put(a, l.name, addr);
             if (l.value) |vid| {
                 const v = try lowerNode(ctx, vid);
@@ -193,24 +196,24 @@ fn lowerNode(ctx: *Ctx, id: HirId) anyerror!Value {
         },
         .if_expr => |ie| blk: {
             // value-producing: a result slot the arms store into, loaded at the merge.
-            const slot = try mf.emit(a, ctx.cur, placeholder_ty, .{ .alloc = .{ .ty = placeholder_ty } });
+            const slot = try mf.emit(a, ctx.cur, nty, .{ .alloc = .{ .ty = nty } });
             try lowerIfExpr(ctx, ie.cond, ie.then, ie.else_, slot);
-            break :blk try mf.emit(a, ctx.cur, placeholder_ty, .{ .load = .{ .addr = slot } });
+            break :blk try mf.emit(a, ctx.cur, nty, .{ .load = .{ .addr = slot } });
         },
         .nullish => |nc| blk: {
-            const slot = try mf.emit(a, ctx.cur, placeholder_ty, .{ .alloc = .{ .ty = placeholder_ty } });
+            const slot = try mf.emit(a, ctx.cur, nty, .{ .alloc = .{ .ty = nty } });
             // a ?? b : evaluate a, store; a present-check would branch to b. Structural: store a then b path.
             const lhs = try lowerNode(ctx, nc.lhs);
             try mf.emitVoid(a, ctx.cur, .{ .store = .{ .addr = slot, .val = lhs } });
             const rhs = try lowerNode(ctx, nc.rhs);
             try mf.emitVoid(a, ctx.cur, .{ .store = .{ .addr = slot, .val = rhs } });
-            break :blk try mf.emit(a, ctx.cur, placeholder_ty, .{ .load = .{ .addr = slot } });
+            break :blk try mf.emit(a, ctx.cur, nty, .{ .load = .{ .addr = slot } });
         },
         .loop_ => |lp| blk: {
             try lowerLoop(ctx, lp.cond, lp.body);
             break :blk Value.invalid;
         },
-        .unsupported => mf.emit(a, ctx.cur, placeholder_ty, .{ .const_int = 0 }),
+        .unsupported => mf.emit(a, ctx.cur, nty, .{ .const_int = 0 }),
     };
 }
 

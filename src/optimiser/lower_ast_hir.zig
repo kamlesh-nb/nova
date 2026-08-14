@@ -294,6 +294,12 @@ fn lowerExpr(ctx: *Ctx, expr: ast.Expression) anyerror!HirId {
         else => try func.add(a, .{ .kind = .{ .unsupported = @tagName(expr.kind) }, .span = span }),
     };
     ctx.func.nodes.items[@intFromEnum(id)].expr_id = eid;
+    // Thread the concrete post-inference TypeId from the sema TypedIr (emit-path prerequisite: MIR/LIR
+    // values must carry real types, not the placeholder). Leaves the placeholder where sema could not type
+    // the expr (erased/generic positions) -- measured as coverage in the shadow.
+    if (ctx.ir) |ir| {
+        if (ir.typeOf2(eid)) |t| ctx.func.nodes.items[@intFromEnum(id)].ty = t;
+    }
     return id;
 }
 
