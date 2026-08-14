@@ -315,6 +315,11 @@ pub const Inferer = struct {
 
     scopes: std.ArrayListUnmanaged(std.ArrayListUnmanaged(Binding)) = .empty,
     const_depth: usize = 0,
+    // Guards against unbounded expression-inference recursion from a cyclic type (e.g. a self-referential
+    // value struct, or a generated dispatch whose type resolution loops). Real expressions never nest
+    // thousands deep, so hitting the cap means a genuine cycle -> error out cleanly instead of hanging.
+    infer_depth: u32 = 0,
+    infer_overflow: bool = false,
 
     current_ret: ?TypeId = null,
 
@@ -527,6 +532,17 @@ pub const Inferer = struct {
     }
 
     fn inferExprInner(self: *Inferer, e: ast.Expression, expected: ?TypeId) anyerror!TypeId {
+        // Cyclic-type recursion guard: a self-referential type (or a generated dispatch whose type
+        // resolution loops) recurses here without bound. Real expressions never nest thousands deep. The
+        // `infer_overflow` latch stays set once tripped, so a caller that swallows the error cannot restart
+        // the loop -- the whole inference walk aborts cleanly instead of hanging.
+        if (self.infer_overflow) return error.TypeInferenceRecursionLimit;
+        self.infer_depth += 1;
+        defer self.infer_depth -= 1;
+        if (self.infer_depth > 2000) {
+            self.infer_overflow = true;
+            return error.TypeInferenceRecursionLimit;
+        }
         switch (e.kind) {
 
             .range => |r| {
