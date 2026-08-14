@@ -386,11 +386,13 @@ EMIT cutover is deliberately NOT faked. Precisely:
 - **M5 inline — algorithm DONE + unit-tested; DORMANT on real code.** Single-block callee splicing is
   implemented and unit-tested. **Activation prerequisite: a MIR call graph** (symbol resolution wiring
   each `call` to its callee `MirFunc`); the lowering currently leaves callees as placeholders.
-- **M6 cut over — NOT done.** Requires the LIR→LLVM emitter reproducing the full existing backend (traits,
-  async coroutines, closures, ARC, value structs, error unions, optionals, generics) and certifying it on
-  the `--asan` corpus, then retiring the AST path. This is the genuinely multi-week backend rewrite; doing
-  it half-way would produce exactly the miscompiling result the shadow-first method exists to avoid, so it
-  is left as the honest next phase rather than faked.
+- **M6 cut over — IN PROGRESS (subset emits; AST path still the fallback).** The LIR→LLVM emitter now
+  reproduces the AST path for int/bool functions with parameters, control flow and direct calls (M6-A/B/C
+  above), all gated. Retiring the AST emitter requires reproducing the REST of the backend — ARC
+  (retain/release/destructors), aggregates (structs/value-structs/enums + pattern matching), traits/vtables,
+  closures, async coroutines, strings/floats, optionals, error unions, generics — and certifying each on the
+  `--asan` corpus. That is the genuinely multi-week remainder; it is being grown one differentially-verified
+  increment at a time (never a half-cutover) with the trusted AST path covering everything not yet emitted.
 
 **Bottom line:** the middle-end and its optimiser are real, correct (verifier + unit tests), and
 measurably effective (27% MIR reduction) on the whole corpus, entirely behind `NOVA_OPT` with the trusted
