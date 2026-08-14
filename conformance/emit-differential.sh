@@ -53,6 +53,18 @@ fn count(flag: bool): int { let c = 0; if (flag) { c = c + 10; } else { c = c + 
 fn main(): void { console.log(`${absv(0-7)} ${absv(5)} ${clamp(250)} ${clamp(0-5)} ${clamp(42)} ${sumto(100)} ${count(true)} ${count(false)}`); }
 '
 
+# Direct calls (M6-C): resolved by name to an all-word LLVM function; leaf, nested, and recursive. The
+# nested case (add(sq(a),sq(b))) is the mem2reg-dangling-load regression guard (a load kept live by an
+# opaque call between store and load must NOT have its slot removed by full promotion).
+emit_case calls '
+fn sq(x: int): int { return x * x; }
+fn add(a: int, b: int): int { return a + b; }
+fn hyp(a: int, b: int): int { return add(sq(a), sq(b)); }
+fn fact(n: int): int { if (n <= 1) { return 1; } return n * fact(n - 1); }
+fn fib(n: int): int { if (n < 2) { return n; } return fib(n - 1) + fib(n - 2); }
+fn main(): void { console.log(`${sq(7)} ${add(3, 4)} ${hyp(3, 4)} ${fact(5)} ${fib(10)}`); }
+'
+
 for f in "$TMP"/*.nova; do
     name="$(basename "$f" .nova)"
     if ! "$NOVA" "$f" -o "$TMP/${name}_ast" >/dev/null 2>&1; then

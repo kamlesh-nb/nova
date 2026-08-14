@@ -74,6 +74,13 @@ fn run(allocator: std.mem.Allocator, func: *mir.Func) anyerror!bool {
     // last[slot] = most recent stored value within the current block, or .invalid if unknown.
     const last = try allocator.alloc(mir.Value, nvalues);
     defer allocator.free(last);
+    // A slot has a "live load" if any load of it could NOT be forwarded (no prior store this block, or an
+    // opaque call cleared the known value in between). Such a load INSTRUCTION survives, so the slot's
+    // alloc/store must NOT be removed by full promotion below -- doing so would leave a load of freed
+    // memory (a real miscompile the emit path would then materialise). This was the M6-C crash.
+    const live_load = try allocator.alloc(bool, nvalues);
+    defer allocator.free(live_load);
+    @memset(live_load, false);
 
     for (func.blocks.items) |*b| {
         @memset(last, mir.Value.invalid);
@@ -90,6 +97,8 @@ fn run(allocator: std.mem.Allocator, func: *mir.Func) anyerror!bool {
                         if (lv != .invalid) {
                             mir.replaceUses(func, inst.result, lv);
                             changed = true;
+                        } else {
+                            live_load[@intFromEnum(l.addr)] = true; // a load that stays -> keep the slot
                         }
                     }
                 },
@@ -100,9 +109,9 @@ fn run(allocator: std.mem.Allocator, func: *mir.Func) anyerror!bool {
         }
     }
 
-    // Full promotion: a non-escaping slot confined to ONE block has had every load forwarded, so its
-    // stores are dead-writes and its alloc is dead memory. Remove them (the forwarded loads are unused and
-    // fall to dce). This clears false "escapes into a slot" that would otherwise block arc_elision.
+    // Full promotion: a non-escaping single-block slot with NO surviving load has had every load forwarded,
+    // so its stores are dead-writes and its alloc is dead memory. Remove them (the forwarded loads are unused
+    // and fall to dce). A slot with a live load is left entirely intact.
     for (func.blocks.items) |*b| {
         var w: usize = 0;
         for (b.insts.items) |inst| {
@@ -113,7 +122,7 @@ fn run(allocator: std.mem.Allocator, func: *mir.Func) anyerror!bool {
             };
             if (slot) |s| {
                 const si = @intFromEnum(s);
-                if (si < nvalues and is_slot[si] and !escaped[si] and block_of[si] != many) {
+                if (si < nvalues and is_slot[si] and !escaped[si] and block_of[si] != many and !live_load[si]) {
                     changed = true;
                     continue; // drop the dead store / alloc
                 }

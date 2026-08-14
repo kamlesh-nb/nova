@@ -322,16 +322,30 @@ EMIT cutover is deliberately NOT faked. Precisely:
 - **M1 lowering — DONE.** AST→HIR (100% of node forms), HIR→MIR (CFG, locals as memory), MIR→LIR
   (linear near-LLVM). Exercised over the whole corpus: 0 crashes, every function lowers through all four
   tiers.
-- **M1 emit half — WIRED, airtight, and EMITTING the optimised IR for its subset.** `src/backend/codegen/lir_emit.zig`
+- **M1 emit half — WIRED, airtight, and EMITTING the optimised IR for a growing subset.** `src/backend/codegen/lir_emit.zig`
   emits an LLVM function body from the optimised MIR, hooked into `declarations.zig` and gated by a SEPARATE
   opt-in `NOVA_OPT_EMIT` (off by default, so default builds are byte-identical). It is a per-function
   FALLBACK: `tryEmit` returns false for anything outside a provable subset and codegen then emits that
-  function from the AST unchanged. The subset is deliberately tiny (paramless, single straight-line block,
-  signed-int/bool only) and every emit is validated by a dry pass (`mirEmittable`) BEFORE any IR is built,
-  so a reject can never leave a half-filled entry block. Verified by differential execution over int
-  arithmetic, 32-bit overflow, chained overflow, comparisons and bitops: EMIT output is byte-identical to
-  the AST path, and the optimiser pipeline (constfold/mem2reg/copyprop/dce/simplifycfg) runs before the
-  emit. Getting here required fixing three real defects that the emit-first-slice surfaced:
+  function from the AST unchanged. Every emit is validated by a dry pass (`mirEmittable`) BEFORE any IR is
+  built, so a reject can never leave a half-filled block. The subset grew in gated increments (M6-A/B/C),
+  each differentially verified (`conformance/emit-differential.sh`) + corpus + ASAN:
+  - **base**: paramless straight-line signed-int/bool (arithmetic, 32-bit + chained overflow, comparisons, bitops).
+  - **M6-A parameters**: int/bool params, modelled as `let name = param(i)` (LLVMGetParam; every non-array
+    param flows as the i64 word). The param node is stamped with its resolved TypeId because mem2reg forwards
+    the param store->load, making the param value itself an arithmetic operand. Free functions only.
+  - **M6-B control flow**: multi-block CFG — `emitFunc` emits one LLVM block per MIR block with ret/br/condbr
+    (branch on `cond != 0`) / unreachable terminators. if/else, nested if, while loops with mutated and
+    body-local variables, nested loops.
+  - **M6-C direct calls**: a call resolved by source name to an all-word LLVM function (`resolveCallee`:
+    N word params, word/void return, else fall back), args passed straight through. Leaf, nested, and
+    recursive (`fact`, `fib`).
+  The optimiser pipeline (constfold/mem2reg/copyprop/dce/simplifycfg) runs before every emit. M6-C surfaced
+  and fixed a real **mem2reg correctness bug**: full promotion removed a single-block slot's alloc+store even
+  when an opaque call between store and load had blocked that load's forwarding, leaving a load of freed
+  memory. `mem2reg.zig` now tracks slots with a surviving (`live_load`) load and never promotes them. (This
+  is also a `verify.zig` gap — it did not flag the dangling load; hardening it is a follow-up.)
+
+  Getting the base working first required fixing three defects the emit-first-slice surfaced:
   1. **TypeId-0 / unset collision (the reason the subset looked empty).** Store TypeIds are dense indices
      from 0, and `int` is interned first, so TypeId 0 is a REAL type — but the optimiser used `@intFromEnum(ty)==0`
      to mean "no type threaded". Every `int`-typed value therefore read as untyped, and the airtight gate
@@ -348,9 +362,11 @@ EMIT cutover is deliberately NOT faked. Precisely:
   3. **Emit-time canonicalisation for narrowing/folded consts.** The emitter canonicalises each `const_int`
      and `cast` to its result-type width, so a folded constant that overflows `int` wraps exactly as the AST
      path would even when it reaches the emitter pre-wrapped.
-  Coverage note: the subset is still small by construction (paramless straight-line int/bool), so most
-  functions correctly fall back to the AST; growing it (params, control flow, calls, ARC, traits) is the
-  M6 work below, each increment gated the same way (dry-validate, differential, corpus + ASAN).
+  Coverage note: the subset now covers int/bool functions with parameters, control flow and direct calls,
+  but is still bounded by construction — anything touching ARC, aggregates (structs/value-structs/enums),
+  traits/vtables, closures, async, strings/floats, optionals or error unions correctly falls back to the
+  AST. Extending to those is the remaining M6 work below, each increment gated the same way (dry-validate,
+  differential, corpus + ASAN) before the AST emitter can be retired.
 - **M2 verifier — DONE.** SSA/terminator/operand-range checks, corpus-clean (0 verify errors) including
   after block-renumbering passes. The ARC-balance check is present but dormant (no ARC ops yet). The
   differential AST-vs-LIR shadow is N/A until the emitter exists.

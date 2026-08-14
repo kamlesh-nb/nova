@@ -62,7 +62,7 @@ pub const Inst = struct {
         store: struct { addr: Value, val: Value },
         alloc: struct { ty: TypeId },
         gep: struct { base: Value, offset: u32 }, // field / element address
-        call: struct { callee: SymbolId, args: []Value, takes_ownership: []const bool },
+        call: struct { callee: SymbolId, args: []Value, takes_ownership: []const bool, name: ?[]const u8 = null },
         indirect_call: struct { receiver: Value, slot: u32, args: []Value },
         cast: struct { val: Value },
         // ARC — first-class so the elision pass can see and cancel balanced pairs

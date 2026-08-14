@@ -108,7 +108,9 @@ fn hirEmittable(hf: *const hir.Func) bool {
         switch (node.kind) {
             .int, .bool, .param, .ident, .binop, .unop, .let, .assign, .ret, .block,
             // control flow (M6-B): the MIR CFG + emitFunc handle these; if_expr lowers through a result slot
-            .if_, .loop_, .if_expr, .brk, .cont => {},
+            .if_, .loop_, .if_expr, .brk, .cont,
+            // direct calls (M6-C): validated + emitted from the MIR call op (callee resolved by name)
+            .call, .generic_call => {},
             else => {
                 if (emit_verbose) std.debug.print("[opt-emit]   non-emittable node: {s}\n", .{@tagName(node.kind)});
                 return false; // str/float/null/call/struct_init/cast/... -> fall back
@@ -144,6 +146,31 @@ fn intKindForTid(compiler: *LlvmCompiler, tid: mir.TypeId) ?IntKind {
     };
 }
 
+const Callee = struct { fn_val: types.LLVMValueRef, fn_type: types.LLVMTypeRef };
+
+// Resolve a direct call by source name to an LLVM function the emitter can call, but ONLY if its signature
+// is all-word: `nargs` word (i64) parameters and a word or void return. Nova passes every non-array param as
+// the i64 word, so such a call needs no argument/return coercion -- the MIR arg values are already words.
+// Anything else (array=ptr params, wider/narrower ABI) returns null so the call falls back to the AST path.
+fn resolveCallee(compiler: *LlvmCompiler, name: []const u8, nargs: usize) ?Callee {
+    const resolved = compiler.resolveCalleeName(name) catch return null;
+    const fn_val = compiler.func_map.get(resolved) orelse return null;
+    const fn_type = core.LLVMGlobalGetValueType(fn_val);
+    if (core.LLVMGetTypeKind(fn_type) != .LLVMFunctionTypeKind) return null;
+    if (core.LLVMIsFunctionVarArg(fn_type) != 0) return null;
+    if (core.LLVMCountParamTypes(fn_type) != @as(c_uint, @intCast(nargs))) return null;
+    const vt = compiler.val_type;
+    if (nargs > 0) {
+        var ptypes: [16]types.LLVMTypeRef = undefined;
+        if (nargs > ptypes.len) return null;
+        core.LLVMGetParamTypes(fn_type, &ptypes);
+        for (ptypes[0..nargs]) |pt| if (pt != vt) return null;
+    }
+    const ret = core.LLVMGetReturnType(fn_type);
+    if (ret != vt and ret != compiler.void_type) return null;
+    return .{ .fn_val = fn_val, .fn_type = fn_type };
+}
+
 // Dry validation: return false if any instruction OR terminator is outside the emittable subset, building
 // NO IR. This MUST run before emitFunc touches the builder -- otherwise a mid-stream reject would leave a
 // half-emitted block that the AST fallback then double-fills. Keep the per-op gates in sync with emitBinop /
@@ -173,8 +200,14 @@ fn mirEmittable(compiler: *LlvmCompiler, mf: *const mir.Func) bool {
                     }
                 },
                 .cast => if (intKindForTid(compiler, inst.ty) == null) return false,
+                // A direct call is emittable if its callee resolves to an all-word LLVM function (below).
+                // The result type, if the value is used arithmetically, is gated by the consuming binop.
+                .call => |x| {
+                    const nm = x.name orelse return false;
+                    if (resolveCallee(compiler, nm, x.args.len) == null) return false;
+                },
                 .const_int, .alloc, .load, .store, .param => {},
-                else => return false, // call/gep/retain/release/await/spawn/indirect_call -> not yet
+                else => return false, // gep/retain/release/await/spawn/indirect_call -> not yet
             }
         }
         switch (b.term) {
@@ -213,6 +246,18 @@ fn emitInst(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, inst: mir.Inst,
             const src = vals[@intFromEnum(x.val)] orelse return error.Unemittable;
             const rk = intKindForTid(compiler, inst.ty) orelse return error.Unemittable;
             break :blk if (rk.is_bool) src else compiler.canonicalizeInt(src, rk.width, rk.signed);
+        },
+        // Direct call: resolve the callee (all-word signature, verified by mirEmittable), pass the arg words
+        // straight through (no coercion), return the result word. The callee returns an already-canonical
+        // value for its declared width, so nothing more is needed here.
+        .call => |x| blk: {
+            const nm = x.name orelse return error.Unemittable;
+            const c = resolveCallee(compiler, nm, x.args.len) orelse return error.Unemittable;
+            var argbuf: [16]types.LLVMValueRef = undefined;
+            if (x.args.len > argbuf.len) return error.Unemittable;
+            for (x.args, 0..) |arg, i| argbuf[i] = vals[@intFromEnum(arg)] orelse return error.Unemittable;
+            const call = core.LLVMBuildCall2(compiler.builder, c.fn_type, c.fn_val, &argbuf, @intCast(x.args.len), "");
+            break :blk if (inst.result != .invalid) call else null;
         },
         else => return error.Unemittable, // filtered by mirEmittable, but stay safe
     };

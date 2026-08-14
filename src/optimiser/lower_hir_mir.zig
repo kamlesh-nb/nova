@@ -102,8 +102,8 @@ fn lowerNode(ctx: *Ctx, id: HirId) anyerror!Value {
             break :blk try mf.emit(a, ctx.cur, nty, .{ .cast = .{ .val = operand } });
         },
 
-        .call => |c| try lowerCall(ctx, c.callee, c.args, c.sym),
-        .generic_call => |c| try lowerCall(ctx, c.callee, c.args, c.sym),
+        .call => |c| try lowerCall(ctx, c.callee, c.args, c.sym, nty),
+        .generic_call => |c| try lowerCall(ctx, c.callee, c.args, c.sym, nty),
 
         .field => |f| blk: {
             const object = try lowerNode(ctx, f.object);
@@ -221,18 +221,23 @@ fn lowerNode(ctx: *Ctx, id: HirId) anyerror!Value {
 // SymbolId 0xFFFF_FFFF marks an unresolved callee (the sema could not name the target).
 pub const unresolved_callee: mir.SymbolId = @enumFromInt(0xFFFF_FFFF);
 
-fn lowerCall(ctx: *Ctx, callee: HirId, call_args: []const HirId, sym: ?hir.SymbolId) !Value {
+fn lowerCall(ctx: *Ctx, callee: HirId, call_args: []const HirId, sym: ?hir.SymbolId, result_ty: mir.TypeId) !Value {
     const mf = ctx.mf;
     const a = ctx.allocator;
+    // A direct call to a named function keeps that source name, so a backend can resolve it (emit path)
+    // without a symbol table. Only a bare identifier callee is a candidate; anything else stays nameless.
+    const callee_name: ?[]const u8 = switch (ctx.hf.get(callee).kind) {
+        .ident => |n| n,
+        else => null,
+    };
     var args = std.ArrayListUnmanaged(Value).empty;
     defer args.deinit(a);
-    _ = try lowerNode(ctx, callee); // evaluate callee for effect/opaqueness
     for (call_args) |arg| try args.append(a, try lowerNode(ctx, arg));
     const owned = try a.dupe(Value, args.items);
     const owns = try a.alloc(bool, owned.len);
     @memset(owns, false);
     const target: mir.SymbolId = if (sym) |s| s else unresolved_callee;
-    return mf.emit(a, ctx.cur, placeholder_ty, .{ .call = .{ .callee = target, .args = owned, .takes_ownership = owns } });
+    return mf.emit(a, ctx.cur, result_ty, .{ .call = .{ .callee = target, .args = owned, .takes_ownership = owns, .name = callee_name } });
 }
 
 fn lowerAggregate(ctx: *Ctx, fields: []const HirId) !Value {
