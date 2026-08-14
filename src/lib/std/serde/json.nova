@@ -99,10 +99,12 @@ pub fn size(val: JsonValue): int {
 struct JsonParser {
     src: string,
     pos: int,
+    failed: bool,   // L4/E7: set on malformed input (EOF where a value/close is expected, or an unexpected char)
 
     init(src: string) {
         self.src = src;
         self.pos = 0;
+        self.failed = false;
     }
 
     fn skipWs(self: JsonParser): void {
@@ -116,7 +118,7 @@ struct JsonParser {
 
     pub fn parseValue(self: JsonParser): JsonValue {
         self.skipWs();
-        if (self.pos >= self.src.length) { return JsonValue(0); }
+        if (self.pos >= self.src.length) { self.failed = true; return JsonValue(0); }   // L4/E7: EOF, no value
         let c = self.src[self.pos];
         if (c == 110) { return self.parseNull(); }
         if (c == 116 || c == 102) { return self.parseBool(); }
@@ -124,6 +126,7 @@ struct JsonParser {
         if ((c >= 48 && c <= 57) || c == 45) { return self.parseNumber(); }
         if (c == 91) { return self.parseArray(); }
         if (c == 123) { return self.parseObject(); }
+        self.failed = true;   // L4/E7: an unrecognized character where a value was expected
         return JsonValue(0);
     }
 
@@ -274,11 +277,11 @@ struct JsonParser {
             let v = self.parseValue();
             node.arr.push(v);
             self.skipWs();
-            if (self.pos >= self.src.length) { break; }
+            if (self.pos >= self.src.length) { self.failed = true; break; }   // L4/E7: unterminated array
             let c = self.src[self.pos];
             if (c == 44) { self.pos = self.pos + 1; self.skipWs(); }
             else if (c == 93) { self.pos = self.pos + 1; break; }
-            else { break; }
+            else { self.failed = true; break; }   // L4/E7: expected ',' or ']'
         }
         return node;
     }
@@ -293,7 +296,7 @@ struct JsonParser {
         }
         while (true) {
             self.skipWs();
-            if (self.pos >= self.src.length || self.src[self.pos] != 34) { break; }
+            if (self.pos >= self.src.length || self.src[self.pos] != 34) { self.failed = true; break; }   // L4/E7: expected a "key"
             let key = self.parseRawString();
             self.skipWs();
             if (self.pos < self.src.length && self.src[self.pos] == 58) {
@@ -302,12 +305,13 @@ struct JsonParser {
                 let v = self.parseValue();
                 node.obj.set(key, v);
                 self.skipWs();
-                if (self.pos >= self.src.length) { break; }
+                if (self.pos >= self.src.length) { self.failed = true; break; }   // L4/E7: unterminated object
                 let c = self.src[self.pos];
                 if (c == 44) { self.pos = self.pos + 1; }
                 else if (c == 125) { self.pos = self.pos + 1; break; }
-                else { break; }
+                else { self.failed = true; break; }   // L4/E7: expected ',' or '}'
             } else {
+                self.failed = true;   // L4/E7: expected ':'
                 break;
             }
         }
@@ -318,6 +322,17 @@ struct JsonParser {
 pub fn parse(src: string): JsonValue {
     let p = JsonParser(src);
     return p.parseValue();
+}
+
+// L4/E7: the CHECKED parse. Returns `undefined` when the input is malformed — an unterminated array/object,
+// a missing value, an unexpected character, or trailing garbage after the top-level value. Use this when the
+// input is untrusted; `parse` above stays lenient (a partial value, no error) for back-compatible callers.
+pub fn tryParse(src: string): JsonValue | undefined {
+    let p = JsonParser(src);
+    let v = p.parseValue();
+    p.skipWs();
+    if (p.failed || p.pos < p.src.length) { return undefined; }   // malformed, or unconsumed trailing input
+    return v;
 }
 
 pub fn stringify(val: JsonValue): string {
