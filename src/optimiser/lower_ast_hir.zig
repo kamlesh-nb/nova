@@ -1,13 +1,16 @@
-// lower_ast_hir.zig — AST -> HIR, with ARC ops threaded in.
+// lower_ast_hir.zig — AST -> HIR, with ARC ops threaded in (scope-accurate placement).
 //
 // Walks a function body and builds the flat HIR node table, and -- when a sema TypedIr is supplied --
-// makes ARC explicit: a `let` whose initialiser sema marks OWNED (TypedIr.ownedOf) makes an owned local,
-// which gets a `release` at the end of the function body; binding an owned local FROM another owned local
-// (a copy) emits a `retain` for the new owner. This is the first ownership model (straight-line, function
-// -scope releases); precise per-scope / per-exit placement is a refinement. It is what gives arc_elision
-// (M4) balanced retain/release pairs to cancel. Correctness note: this runs only in the NOVA_OPT shadow
-// today (nothing is emitted from HIR yet), so an imperfect placement cannot affect the produced program;
-// it only affects how many pairs the elision pass can prove balanced. See docs/design/optimiser.md.
+// makes ARC explicit. A `let` whose initialiser sema marks OWNED (TypedIr.ownedOf) declares an owned
+// local in the current lexical scope; binding an owned local FROM another owned local (a copy) emits a
+// `retain` for the new owner. Releases are placed by scope, as HIR nodes:
+//   - at the end of the block that declared the local,
+//   - before a `return` (all enclosing owned locals, EXCEPT one being moved out by `return x`),
+//   - before a `break`/`continue` (the owned locals of the scopes the jump exits).
+// Placing releases as HIR nodes BEFORE the exit node is what makes HIR->MIR lower them (a release after a
+// return would be dropped when the block terminates). This gives arc_elision (M4) balanced pairs to
+// cancel. Runs only in the NOVA_OPT shadow today, so an imperfect placement cannot affect the produced
+// program. See docs/design/optimiser.md.
 
 const std = @import("std");
 const ast = @import("../frontend/ast.zig");
@@ -16,14 +19,21 @@ const infer = @import("../frontend/sema/infer.zig");
 
 const HirId = hir.HirId;
 
+const Scope = std.ArrayListUnmanaged([]const u8);
+
 const Ctx = struct {
     allocator: std.mem.Allocator,
     func: *hir.Func,
     ir: ?*const infer.TypedIr,
-    owned_locals: std.StringHashMapUnmanaged(void) = .empty, // names of owned locals (function-scoped, v1)
+    scopes: std.ArrayListUnmanaged(Scope) = .empty, // lexical scope stack; each holds owned local names
+    owned: std.StringHashMapUnmanaged(void) = .empty, // all currently in-scope owned local names
+    loop_depths: std.ArrayListUnmanaged(usize) = .empty, // scope-stack depth at each enclosing loop
 
     fn deinit(self: *Ctx) void {
-        self.owned_locals.deinit(self.allocator);
+        for (self.scopes.items) |*s| s.deinit(self.allocator);
+        self.scopes.deinit(self.allocator);
+        self.owned.deinit(self.allocator);
+        self.loop_depths.deinit(self.allocator);
     }
 
     fn ownedExpr(self: *Ctx, e: *const ast.Expression) bool {
@@ -31,8 +41,42 @@ const Ctx = struct {
         return ir.ownedOf(e) orelse false;
     }
 
-    pub var arc_retains: usize = 0; // process-wide counters for the shadow report
-    pub var arc_releases: usize = 0;
+    fn pushScope(self: *Ctx) !void {
+        try self.scopes.append(self.allocator, .empty);
+    }
+
+    fn declareOwned(self: *Ctx, name: []const u8) !void {
+        try self.scopes.items[self.scopes.items.len - 1].append(self.allocator, name);
+        try self.owned.put(self.allocator, name, {});
+    }
+
+    // Emit `release` nodes for the owned locals of the top scope into `ids`, then pop it.
+    fn popScopeReleases(self: *Ctx, ids: *std.ArrayListUnmanaged(HirId)) !void {
+        var scope = self.scopes.pop().?;
+        defer scope.deinit(self.allocator);
+        for (scope.items) |name| {
+            try self.appendRelease(ids, name);
+            _ = self.owned.remove(name);
+        }
+    }
+
+    // Emit releases for scopes [from_depth .. top], skipping `skip` (a moved-out local). Does not pop.
+    fn releaseScopesDownTo(self: *Ctx, ids: *std.ArrayListUnmanaged(HirId), from_depth: usize, skip: ?[]const u8) !void {
+        var d = self.scopes.items.len;
+        while (d > from_depth) {
+            d -= 1;
+            for (self.scopes.items[d].items) |name| {
+                if (skip) |s| if (std.mem.eql(u8, s, name)) continue;
+                try self.appendRelease(ids, name);
+            }
+        }
+    }
+
+    fn appendRelease(self: *Ctx, ids: *std.ArrayListUnmanaged(HirId), name: []const u8) !void {
+        const load = try self.func.add(self.allocator, .{ .kind = .{ .ident = name }, .span = zeroSpan() });
+        const rel = try self.func.add(self.allocator, .{ .kind = .{ .release = load }, .span = zeroSpan() });
+        try ids.append(self.allocator, rel);
+    }
 };
 
 pub fn lowerFunc(allocator: std.mem.Allocator, fn_decl: ast.FunctionDecl, ir: ?*const infer.TypedIr) !hir.Func {
@@ -41,81 +85,107 @@ pub fn lowerFunc(allocator: std.mem.Allocator, fn_decl: ast.FunctionDecl, ir: ?*
     var ctx = Ctx{ .allocator = allocator, .func = &func, .ir = ir };
     defer ctx.deinit();
 
-    var ids = std.ArrayListUnmanaged(HirId).empty;
-    defer ids.deinit(allocator);
-    for (fn_decl.body.statements) |stmt| {
-        try ids.append(allocator, try lowerStmt(&ctx, stmt));
-    }
-    func.entry = hir.Block{ .nodes = try allocator.dupe(HirId, ids.items) };
-
-    // Publish the owned locals; HIR->MIR emits a `release` of each at every function exit (before ret),
-    // which is where they belong (a release after a return would be dropped when the block terminates).
-    var names = std.ArrayListUnmanaged([]const u8).empty;
-    defer names.deinit(allocator);
-    var it = ctx.owned_locals.keyIterator();
-    while (it.next()) |name| try names.append(allocator, name.*);
-    func.owned_locals = try allocator.dupe([]const u8, names.items);
+    func.entry = try lowerBlock(&ctx, fn_decl.body);
     return func;
 }
 
 fn lowerBlock(ctx: *Ctx, block: ast.Block) !hir.Block {
     var ids = std.ArrayListUnmanaged(HirId).empty;
     defer ids.deinit(ctx.allocator);
+    try ctx.pushScope();
+    var terminated = false;
     for (block.statements) |stmt| {
-        try ids.append(ctx.allocator, try lowerStmt(ctx, stmt));
+        try lowerStmt(ctx, &ids, stmt);
+        // If this statement is a control exit, later statements are dead and the scope releases were
+        // already emitted before the exit node; do not emit block-end releases on top.
+        if (isExitStmt(stmt)) {
+            terminated = true;
+            break;
+        }
+    }
+    if (terminated) {
+        // Pop the scope WITHOUT block-end releases (the exit path emitted its own).
+        var scope = ctx.scopes.pop().?;
+        for (scope.items) |name| _ = ctx.owned.remove(name);
+        scope.deinit(ctx.allocator);
+    } else {
+        try ctx.popScopeReleases(&ids);
     }
     return hir.Block{ .nodes = try ctx.allocator.dupe(HirId, ids.items) };
 }
 
-fn lowerStmt(ctx: *Ctx, stmt: ast.Statement) anyerror!HirId {
+fn isExitStmt(stmt: ast.Statement) bool {
+    return stmt == .return_stmt or stmt == .break_stmt or stmt == .continue_stmt;
+}
+
+fn lowerStmt(ctx: *Ctx, ids: *std.ArrayListUnmanaged(HirId), stmt: ast.Statement) anyerror!void {
     const a = ctx.allocator;
     const func = ctx.func;
-    return switch (stmt) {
-        .block => |b| func.add(a, .{ .kind = .{ .block = try lowerBlock(ctx, b) }, .span = b.span }),
-        .let_stmt => |ls| blk: {
+    switch (stmt) {
+        .block => |b| try ids.append(a, try func.add(a, .{ .kind = .{ .block = try lowerBlock(ctx, b) }, .span = b.span })),
+        .let_stmt => |ls| {
             var value: ?HirId = null;
             if (ls.init) |e| {
                 var v = try lowerExpr(ctx, e);
-                // Copying an owned local into a new binding takes a new reference -> retain.
-                if (e.kind == .ident and ctx.owned_locals.contains(e.kind.ident)) {
+                const is_copy = e.kind == .ident and ctx.owned.contains(e.kind.ident);
+                if (is_copy) {
                     v = try func.add(a, .{ .kind = .{ .retain = v }, .span = ls.span });
-                    Ctx.arc_retains += 1;
                 }
                 value = v;
-                // Track ownership of the new local.
-                if (ctx.ownedExpr(&e) or (e.kind == .ident and ctx.owned_locals.contains(e.kind.ident))) {
-                    try ctx.owned_locals.put(a, ls.name, {});
-                }
+                if (ctx.ownedExpr(&e) or is_copy) try ctx.declareOwned(ls.name);
             }
-            break :blk func.add(a, .{ .kind = .{ .let = .{ .name = ls.name, .value = value } }, .span = ls.span });
+            try ids.append(a, try func.add(a, .{ .kind = .{ .let = .{ .name = ls.name, .value = value } }, .span = ls.span }));
         },
-        .expr_stmt => |es| lowerExpr(ctx, es.expr),
-        .return_stmt => |rs| blk: {
+        .expr_stmt => |es| try ids.append(a, try lowerExpr(ctx, es.expr)),
+        .return_stmt => |rs| {
             const value: ?HirId = if (rs.value) |e| try lowerExpr(ctx, e) else null;
-            break :blk func.add(a, .{ .kind = .{ .ret = value }, .span = rs.span });
+            // Move-out: a `return x` that returns an owned local must not release it.
+            const moved: ?[]const u8 = if (rs.value) |e| (if (e.kind == .ident and ctx.owned.contains(e.kind.ident)) e.kind.ident else null) else null;
+            try ctx.releaseScopesDownTo(ids, 0, moved);
+            try ids.append(a, try func.add(a, .{ .kind = .{ .ret = value }, .span = rs.span }));
         },
-        .if_stmt => |is| blk: {
+        .if_stmt => |is| {
             const cond = try lowerExpr(ctx, is.condition);
             const then_block = try lowerStmtAsBlock(ctx, is.then_branch.*);
             const else_block = if (is.else_branch) |e| try lowerStmtAsBlock(ctx, e.*) else hir.Block{};
-            break :blk func.add(a, .{ .kind = .{ .if_ = .{ .cond = cond, .then = then_block, .else_ = else_block } }, .span = is.span });
+            try ids.append(a, try func.add(a, .{ .kind = .{ .if_ = .{ .cond = cond, .then = then_block, .else_ = else_block } }, .span = is.span }));
         },
-        .while_stmt => |ws| blk: {
+        .while_stmt => |ws| {
             const cond = try lowerExpr(ctx, ws.condition);
+            try ctx.loop_depths.append(a, ctx.scopes.items.len);
             const body = try lowerStmtAsBlock(ctx, ws.body.*);
-            break :blk func.add(a, .{ .kind = .{ .loop_ = .{ .cond = cond, .body = body } }, .span = ws.span });
+            _ = ctx.loop_depths.pop();
+            try ids.append(a, try func.add(a, .{ .kind = .{ .loop_ = .{ .cond = cond, .body = body } }, .span = ws.span }));
         },
-        .break_stmt => |bs| func.add(a, .{ .kind = .brk, .span = bs.span }),
-        .continue_stmt => |cs| func.add(a, .{ .kind = .cont, .span = cs.span }),
-        else => func.add(a, .{ .kind = .{ .unsupported = @tagName(stmt) }, .span = zeroSpan() }),
-    };
+        .break_stmt => |bs| {
+            const loop_depth = if (ctx.loop_depths.items.len > 0) ctx.loop_depths.items[ctx.loop_depths.items.len - 1] else ctx.scopes.items.len;
+            try ctx.releaseScopesDownTo(ids, loop_depth, null);
+            try ids.append(a, try func.add(a, .{ .kind = .brk, .span = bs.span }));
+        },
+        .continue_stmt => |cs| {
+            const loop_depth = if (ctx.loop_depths.items.len > 0) ctx.loop_depths.items[ctx.loop_depths.items.len - 1] else ctx.scopes.items.len;
+            try ctx.releaseScopesDownTo(ids, loop_depth, null);
+            try ids.append(a, try func.add(a, .{ .kind = .cont, .span = cs.span }));
+        },
+        else => try ids.append(a, try func.add(a, .{ .kind = .{ .unsupported = @tagName(stmt) }, .span = zeroSpan() })),
+    }
 }
 
 fn lowerStmtAsBlock(ctx: *Ctx, stmt: ast.Statement) anyerror!hir.Block {
     if (stmt == .block) return lowerBlock(ctx, stmt.block);
-    const one = try ctx.allocator.alloc(HirId, 1);
-    one[0] = try lowerStmt(ctx, stmt);
-    return hir.Block{ .nodes = one };
+    // Wrap a single statement in its own scope so its releases are placed correctly.
+    var ids = std.ArrayListUnmanaged(HirId).empty;
+    defer ids.deinit(ctx.allocator);
+    try ctx.pushScope();
+    try lowerStmt(ctx, &ids, stmt);
+    if (isExitStmt(stmt)) {
+        var scope = ctx.scopes.pop().?;
+        for (scope.items) |name| _ = ctx.owned.remove(name);
+        scope.deinit(ctx.allocator);
+    } else {
+        try ctx.popScopeReleases(&ids);
+    }
+    return hir.Block{ .nodes = try ctx.allocator.dupe(HirId, ids.items) };
 }
 
 fn lowerExpr(ctx: *Ctx, expr: ast.Expression) anyerror!HirId {
@@ -223,7 +293,6 @@ fn lowerExpr(ctx: *Ctx, expr: ast.Expression) anyerror!HirId {
         .closure => try func.add(a, .{ .kind = .{ .closure = .{ .body = HirId.none } }, .span = span }),
         else => try func.add(a, .{ .kind = .{ .unsupported = @tagName(expr.kind) }, .span = span }),
     };
-    // Stamp source provenance for ownership + diagnostics.
     ctx.func.nodes.items[@intFromEnum(id)].expr_id = eid;
     return id;
 }

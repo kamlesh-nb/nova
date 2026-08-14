@@ -18,49 +18,139 @@ const Pass = @import("../pass.zig").Pass;
 pub const pass = Pass{ .name = "arc_elision", .run = run };
 
 fn run(allocator: std.mem.Allocator, func: *mir.Func) anyerror!bool {
+    return cancelOverTraces(allocator, func);
+}
+
+// A position in the function: (block index, instruction index within that block).
+const Pos = struct { b: usize, i: usize };
+
+// Cross-block cancellation over straight-line TRACES. A trace is a maximal chain b0 -> b1 -> ... where
+// each block ends in an unconditional `br` to the next and the next block has exactly one predecessor
+// (so there is no branching or merge between them). Concatenating a trace's instructions and applying the
+// within-block matching is sound: with no branch on the path, a retain(v) followed by a release(v) with
+// no interleaved observer is balanced exactly as within a single block. This catches the common case of a
+// retain in one block and the scope-end release in a straight-line successor. Branching regions still fall
+// back to per-block cancellation (each block is its own length-1 trace).
+fn cancelOverTraces(allocator: std.mem.Allocator, func: *mir.Func) !bool {
+    const nblocks = func.blocks.items.len;
+    if (nblocks == 0) return false;
+
+    const preds = try predCounts(allocator, func);
+    defer allocator.free(preds);
+
+    const in_trace = try allocator.alloc(bool, nblocks);
+    defer allocator.free(in_trace);
+    @memset(in_trace, false);
+
+    var trace = std.ArrayListUnmanaged(usize).empty;
+    defer trace.deinit(allocator);
+
     var changed = false;
-    for (func.blocks.items) |*b| {
-        if (try cancelInBlock(allocator, b)) changed = true;
+    for (0..nblocks) |start| {
+        if (in_trace[start]) continue;
+        trace.clearRetainingCapacity();
+        var cur = start;
+        while (!in_trace[cur]) {
+            in_trace[cur] = true;
+            try trace.append(allocator, cur);
+            switch (func.blocks.items[cur].term) {
+                .br => |x| {
+                    const dest = @intFromEnum(x.dest);
+                    if (dest < nblocks and preds[dest] == 1 and !in_trace[dest]) {
+                        cur = dest;
+                        continue;
+                    }
+                },
+                else => {},
+            }
+            break;
+        }
+        if (try cancelInTrace(allocator, func, trace.items)) changed = true;
     }
     return changed;
 }
 
-// Returns true if any pair was cancelled in this block. Marks the paired retain and release for removal
-// and compacts the instruction list.
-fn cancelInBlock(allocator: std.mem.Allocator, b: *mir.BasicBlock) !bool {
-    const n = b.insts.items.len;
+fn predCounts(allocator: std.mem.Allocator, func: *mir.Func) ![]u32 {
+    const n = func.blocks.items.len;
+    const preds = try allocator.alloc(u32, n);
+    @memset(preds, 0);
+    for (func.blocks.items) |b| {
+        switch (b.term) {
+            .br => |x| bump(preds, x.dest),
+            .condbr => |x| {
+                bump(preds, x.then);
+                bump(preds, x.else_);
+            },
+            .switch_ => |x| {
+                bump(preds, x.default);
+                for (x.cases) |c| bump(preds, c.dest);
+            },
+            else => {},
+        }
+    }
+    return preds;
+}
+
+fn bump(preds: []u32, b: mir.Block) void {
+    const i = @intFromEnum(b);
+    if (i < preds.len) preds[i] += 1;
+}
+
+// Match retains to releases over the flat instruction stream of a trace (blocks concatenated in order),
+// then remove the cancelled pairs from their blocks.
+fn cancelInTrace(allocator: std.mem.Allocator, func: *mir.Func, blocks: []const usize) !bool {
+    // Flat list of positions across the trace.
+    var flat = std.ArrayListUnmanaged(Pos).empty;
+    defer flat.deinit(allocator);
+    for (blocks) |bi| {
+        for (0..func.blocks.items[bi].insts.items.len) |ii| try flat.append(allocator, .{ .b = bi, .i = ii });
+    }
+    const n = flat.items.len;
     if (n == 0) return false;
+
     const dead = try allocator.alloc(bool, n);
     defer allocator.free(dead);
     @memset(dead, false);
 
     var any = false;
-    // For each retain, scan forward for a cancelling release of the same value.
-    for (b.insts.items, 0..) |inst, i| {
-        if (dead[i] or inst.op != .retain) continue;
+    for (flat.items, 0..) |p, k| {
+        if (dead[k]) continue;
+        const inst = func.blocks.items[p.b].insts.items[p.i];
+        if (inst.op != .retain) continue;
         const v = inst.op.retain.val;
-        var j = i + 1;
-        while (j < n) : (j += 1) {
-            if (dead[j]) continue;
-            const other = b.insts.items[j].op;
+        var m = k + 1;
+        while (m < n) : (m += 1) {
+            if (dead[m]) continue;
+            const q = flat.items[m];
+            const other = func.blocks.items[q.b].insts.items[q.i].op;
             if (other == .release and other.release.val == v) {
-                dead[i] = true;
-                dead[j] = true;
+                dead[k] = true;
+                dead[m] = true;
                 any = true;
                 break;
             }
-            if (observesRef(other, v)) break; // something relies on the +1; keep the pair
+            if (observesRef(other, v)) break;
         }
     }
     if (!any) return false;
 
-    var w: usize = 0;
-    for (b.insts.items, 0..) |inst, i| {
-        if (dead[i]) continue;
-        b.insts.items[w] = inst;
-        w += 1;
+    // Mark per-block which instruction indices are dead, then compact each block.
+    for (blocks) |bi| {
+        var w: usize = 0;
+        for (func.blocks.items[bi].insts.items, 0..) |inst, ii| {
+            var is_dead = false;
+            for (flat.items, 0..) |p, k| {
+                if (p.b == bi and p.i == ii and dead[k]) {
+                    is_dead = true;
+                    break;
+                }
+            }
+            if (is_dead) continue;
+            func.blocks.items[bi].insts.items[w] = inst;
+            w += 1;
+        }
+        func.blocks.items[bi].insts.items.len = w;
     }
-    b.insts.items.len = w;
     return true;
 }
 

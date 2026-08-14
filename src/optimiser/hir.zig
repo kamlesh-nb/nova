@@ -95,8 +95,6 @@ pub const Func = struct {
     inst: ?TypeId = null,
     nodes: std.ArrayListUnmanaged(Node) = .empty,
     entry: Block = .{},
-    // Names of owned locals (from the ownership pass). HIR->MIR emits a `release` of each at every exit.
-    owned_locals: []const []const u8 = &.{},
 
     pub fn deinit(self: *Func, allocator: std.mem.Allocator) void {
         self.nodes.deinit(allocator);

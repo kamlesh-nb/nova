@@ -25,7 +25,6 @@ const Ctx = struct {
     mf: *mir.Func,
     cur: Block,
     slots: std.StringHashMapUnmanaged(Value) = .empty, // local name -> alloc address value
-    owned_locals: []const []const u8 = &.{}, // released at every function exit
     // innermost loop targets for break/continue; null outside a loop
     loop_header: ?Block = null,
     loop_exit: ?Block = null,
@@ -41,31 +40,15 @@ pub fn lowerFunc(allocator: std.mem.Allocator, func: hir.Func) !mir.Func {
     const entry = try mf.newBlock(allocator);
     mf.entry = entry;
 
-    var ctx = Ctx{ .allocator = allocator, .hf = &func, .mf = &mf, .cur = entry, .owned_locals = func.owned_locals };
+    var ctx = Ctx{ .allocator = allocator, .hf = &func, .mf = &mf, .cur = entry };
     defer ctx.deinit();
 
     try lowerBlock(&ctx, func.entry);
 
-    // Implicit `ret void` at the end of a void function: release owned locals first.
-    if (mf.block(ctx.cur).term == .unreachable_) {
-        try emitReleases(&ctx);
-        mf.setTerm(ctx.cur, .{ .ret = null });
-    }
+    // Implicit `ret void` at the end of a void function. (Scope-end releases are already HIR `release`
+    // nodes emitted by lower_ast_hir, so there is nothing to add here.)
+    if (mf.block(ctx.cur).term == .unreachable_) mf.setTerm(ctx.cur, .{ .ret = null });
     return mf;
-}
-
-// Emit `release` for each owned local that has a live slot, at a function exit. (v1: releases every
-// owned local at every exit; a value being moved out via `return` is over-released, which is harmless in
-// the shadow since nothing is emitted from MIR yet. Precise move-out handling is a refinement.)
-fn emitReleases(ctx: *Ctx) !void {
-    const mf = ctx.mf;
-    const a = ctx.allocator;
-    for (ctx.owned_locals) |name| {
-        if (ctx.slots.get(name)) |addr| {
-            const v = try mf.emit(a, ctx.cur, placeholder_ty, .{ .load = .{ .addr = addr } });
-            try mf.emitVoid(a, ctx.cur, .{ .release = .{ .val = v } });
-        }
-    }
 }
 
 fn lowerBlock(ctx: *Ctx, block: hir.Block) !void {
@@ -189,7 +172,6 @@ fn lowerNode(ctx: *Ctx, id: HirId) anyerror!Value {
         },
         .ret => |vid| blk: {
             const rv: ?Value = if (vid) |x| try lowerNode(ctx, x) else null;
-            try emitReleases(ctx); // release owned locals before the return
             mf.setTerm(ctx.cur, .{ .ret = rv });
             break :blk Value.invalid;
         },
