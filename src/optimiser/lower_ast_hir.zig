@@ -24,6 +24,12 @@ const HirId = hir.HirId;
 // `string_<method>` (owned by `func`), else null. This lets the emit path resolve what is otherwise a
 // nameless field-access callee. Scoped to string receivers, whose mangled type name is just `string`; other
 // receivers (generics, user structs) need the general type-name mangling and stay nameless for now.
+fn isStringTid(tid: hir.TypeId) bool {
+    const st = mir.type_store orelse return false;
+    if (tid == hir.unset_ty or @intFromEnum(tid) >= st.count()) return false;
+    return st.get(tid) == .string;
+}
+
 fn stringMethodName(ctx: *Ctx, fa: ast.FieldAccess) ?[]const u8 {
     const ir = ctx.ir orelse return null;
     const st = mir.type_store orelse return null; // set by the emit path / driver; null in bare shadow
@@ -196,11 +202,38 @@ fn lowerStmt(ctx: *Ctx, ids: *std.ArrayListUnmanaged(HirId), stmt: ast.Statement
         },
         .expr_stmt => |es| try ids.append(a, try lowerExpr(ctx, es.expr)),
         .return_stmt => |rs| {
-            const value: ?HirId = if (rs.value) |e| try lowerExpr(ctx, e) else null;
-            // Move-out: a `return x` that returns an owned local must not release it.
-            const moved: ?[]const u8 = if (rs.value) |e| (if (e.kind == .ident and ctx.owned.contains(e.kind.ident)) e.kind.ident else null) else null;
-            try ctx.releaseScopesDownTo(ids, 0, moved);
-            try ids.append(a, try func.add(a, .{ .kind = .{ .ret = value }, .span = rs.span }));
+            if (rs.value) |*e| {
+                const raw = try lowerExpr(ctx, e.*);
+                // Move-out: a `return x` that returns an owned local must not release it.
+                const moved: ?[]const u8 = if (e.kind == .ident and ctx.owned.contains(e.kind.ident)) e.kind.ident else null;
+                // Bind the return value to a temp FIRST so its expression (which may READ a local the scope
+                // releases below would free) is evaluated BEFORE those releases -- otherwise a release is
+                // lowered ahead of the use (a use-after-free: `return s.len()` released `s` before the call).
+                // A raw let (constructed here, not via let_stmt) never triggers the copy-retain, so a moved
+                // owned local is aliased, not retained.
+                const rname = try std.fmt.allocPrint(a, "__ret{d}", .{ctx.tmp_ctr});
+                ctx.tmp_ctr += 1;
+                const rn = try func.internName(a, rname);
+                try ids.append(a, try func.add(a, .{ .kind = .{ .let = .{ .name = rn, .value = raw } }, .span = rs.span }));
+
+                try ctx.releaseScopesDownTo(ids, 0, moved);
+
+                // Return-acquisition (string returns): the AST RETAINS a returned BORROWED owned value (the
+                // caller gets a new owner). A moved owned local (`moved != null`) or a fresh owned temporary
+                // (`ownedExpr`) already transfers ownership and must NOT be retained. Only `string` is an
+                // emittable owned return today.
+                const rref = try func.add(a, .{ .kind = .{ .ident = rn }, .span = rs.span });
+                if (moved == null and !ctx.ownedExpr(e)) {
+                    if (ctx.ir) |ir| if (ir.typeOf(e)) |tid| if (isStringTid(tid)) {
+                        func.nodes.items[@intFromEnum(rref)].ty = tid;
+                        try ids.append(a, try func.add(a, .{ .kind = .{ .retain = rref }, .span = rs.span }));
+                    };
+                }
+                try ids.append(a, try func.add(a, .{ .kind = .{ .ret = rref }, .span = rs.span }));
+            } else {
+                try ctx.releaseScopesDownTo(ids, 0, null);
+                try ids.append(a, try func.add(a, .{ .kind = .{ .ret = null }, .span = rs.span }));
+            }
         },
         .if_stmt => |is| {
             const cond = try lowerExpr(ctx, is.condition);

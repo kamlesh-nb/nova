@@ -96,7 +96,10 @@ fn tryEmitInner(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, func: anyty
             const ret_scalar = if (intKindForTid(compiler, rtid)) |rk| (rk.signed or rk.is_bool) else false;
             // f64 returns flow as the double's bits in the i64 word (the signature returns the word), matching
             // how the emit path represents a float value -- so a float-returning function is emittable.
-            if (!ret_scalar and !emittableHeapStructTid(compiler, rtid) and !isF64Tid(compiler, rtid)) return reject("return type not int/bool/heap-struct/f64");
+            // A string return is emittable: lower_ast_hir threads the return-acquisition retain (a borrowed
+            // string returned is retained; a moved owned local / fresh temporary is not), so ownership out is
+            // balanced -- validated by the --arc gate.
+            if (!ret_scalar and !emittableHeapStructTid(compiler, rtid) and !isF64Tid(compiler, rtid) and !isStringTid(compiler, rtid)) return reject("return type not int/bool/heap-struct/f64/string");
         }
     }
 
