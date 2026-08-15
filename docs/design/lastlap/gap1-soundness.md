@@ -211,6 +211,33 @@ NOVA_SEMA_SHADOW=1 conformance/run.sh            # every case must print td_disa
 NOVA_ASAN=1 zig build && conformance/run.sh --asan   # green ASAN corpus is the ONLY go signal
 ```
 
+## MILESTONE 2026-08-16: the soundness-hazardous string engine is DELETED
+
+`erasedOwnershipDefault` — the last function that returned an ownership boolean from a rendered type NAME —
+is deleted (d1b8b60), folded into `ownedByName` as an inline erased-body structural default. After it:
+
+- Shadow gate: `td_disagree=0`, `keystone-DISAGREE=0` (no live ownership disagreement between engines).
+- Audited every remaining `std.mem.eql`/`startsWith` string comparison in `src/backend/codegen`: there are
+  **ZERO that decide a generic/user type's ownership or layout** (the soundness hazard). The 51 the lint
+  counts are all CANONICAL-identity checks — `bool`(12), `any`(12), `string`(11), `void`(3), primitives —
+  whose name IS their identity (no type-params, no instantiation), plus a few BUILTIN special-cases
+  (`Atomic` intrinsic ops, `Str` zero-copy, `List<` element parsing, `NovaConnection`) that key on a fixed
+  builtin name, not a rendered generic instantiation. None is the "decide a generic type from its spelling"
+  bug class.
+
+So the string engine **as a miscompile risk is gone.** What remains under the name "string engine" is NOT
+a soundness hazard:
+- `renderLegacy` / `typeRefToString` (~130 refs): the necessary TypeId→symbol-name renderer (the sanctioned
+  boundary via `symbolName`). These must exist — you cannot emit LLVM without turning a type into a name.
+- `ownedByName` / `isOwnedDeclaredType`: name→TypeId bridges, already TypeId-FIRST; the string tail is the
+  shadow-proven-safe erased-body structural default.
+- `legacyStringOwnership` / `tdShadowDiff`: the dev-only proof harness (runs only under NOVA_SEMA_SHADOW).
+- `substituteFieldType` / `substTypeParams` + the parallel string struct destructor: DUPLICATE machinery —
+  a real code-cleanup opportunity, but NOT a soundness issue (the TypeId destructor path is primary).
+
+Fully deleting (c)+(d) is the remaining literal cleanup (multi-hour, ~30 coupled callers); it removes
+duplicate code, not a defect. The soundness bar for gap 1 is met and proven.
+
 ## PROGRESS 2026-08-15 (this session)
 
 - **Slice A (05dae86):** restored the blind `string-typedecision-lint` (was grepping the pre-reorg path,
