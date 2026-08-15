@@ -43,13 +43,13 @@ activates arc-elision (the perf win). Re-sequenced: D1 before the rest of B.
 | ID | Item | Priority | Status | Notes |
 |----|------|----------|--------|-------|
 | C1 | `switch_` / match lowering | P1 | TODO | Rejected in both `hirEmittable` and `mirEmittable` (dense/sparse lowering not emitted). |
-| C2 | `cast` to non-int (float / ptr) | P2 | TODO | Only int-to-int casts handled. |
+| C2 | `cast` (int<->int) | P2 | DONE (int<->int) | 2026-08-15 (commit 5cb7ec1): allow `.cast`; mirEmittable gates operand AND result to int kinds (canonicalise to result width). float<->int / pointer casts still fall back. |
 | C3 | `index` (array / list element access) | P2 | DONE (string byte + array word) | 2026-08-15 (commit 7331294): new `index_get` MIR op. String indexes a byte (obj+idx, load i8, zext); array GEPs the i64-word element. Float arrays + lists (method-call access) fall back. String byte index emits now; array-index functions need array params (B4) so the array path is latent. NB: eliminated `index` rejects but ~0 function-coverage gain -- string bodies hit C8 (str literals) / C2 (casts) next. |
 | C4 | `optional_chain` / `nullish` | P2 | TODO | Not in the allowlist. |
 | C5 | `tuple`, `enum_init`, `template`, `range` | P2 | TODO | Aggregate and interpolation forms. |
 | C6 | `closure` | P3 | TODO | Capture handling not modelled. |
 | C7 | `try_` (error handling / errdefer) | P2 | TODO | Not modelled. |
-| C8 | String / float literals in the body | P1 | TODO | MIR collapses str/float to `const_int 0`, so `hirEmittable` rejects them; needs real materialisation. |
+| C8 | String / float literals in the body | P1 | DONE (string) | 2026-08-15 (commit 5cb7ec1): new `const_str` MIR op materialised via the immortal interned global (`getOrCreateStringLiteral`, no ARC). Float literals still fall back (need float handling). With C0/C3/D2 a whole string function body now emits (str/cast/index rejects -> 0 on the stdlib string files). Remaining gate on those functions is B-tier SIGNATURES (optional/string returns, array/value-struct params). |
 
 ## D. ARC and async tier (the performance payoff)
 
