@@ -230,6 +230,32 @@ NOVA_ASAN=1 zig build && conformance/run.sh --asan   # green ASAN corpus is the 
   now grounded in the code rather than a doc guess. **erasedOwnershipDefault is irreducible by a TypeId
   engine by construction** (it fires only when a name has NO TypeId — a bare type-param in an erased body).
 
+### Safe-reductions track EXHAUSTED (2026-08-15) — the residual is ALL the erased-body core
+
+Three safe reductions landed and verified: slice A (05dae86), slice B (5d3341b), dtor str_blk (68e1dee).
+Then I measured the destructor bridge's `phaseA_split` (the count of release sites where the TypeId path
+is NOT taken because its rendered name differs from the string name) corpus-wide:
+
+```
+366_map_ops:            flip=1060  split=75  no-id=0
+365_list_combinators:   flip=541   split=33  no-id=0
+02_generics_destructor: flip=532   split=33  no-id=0
+   last split: id='RawBuffer<<unresolved>>'  str='RawBuffer<T>'
+```
+
+The code comment labels split "(i32/int, kept string)" but that is STALE. The actual split cause is an
+UNRESOLVED TYPE-PARAM: in an erased/generic destructor context the TypeId path renders `RawBuffer<<unresolved>>`
+(T has no concrete id) while the string engine keeps `RawBuffer<T>`. Forcing the TypeId path there would
+emit a WRONG destructor symbol. So every remaining split is the SAME irreducible root as `erasedOwnershipDefault`
+and the `resolveExpressionTypeName` fallback: **type-params with no concrete TypeId in erased bodies.** There
+is no i32/int spelling slice to do; normalizing renderLegacy would not move `split`.
+
+CONCLUSION: the string→TypeId gap-1 cleanup has no remaining CLEAN (behaviour-preserving, corpus-proven)
+reduction. What is left is the design change deferred by the user (task #191): make the TypeId path resolve
+type-params inside used-erased/RawBuffer bodies, or stop emitting those bodies. Until then the string engine
+survives as the correct name source for exactly those contexts, and the shadow gate proves it makes NO live
+ownership disagreement (td_disagree=0) — i.e. no live corruption, only residual name-generation surface.
+
 There is a THIRD, cheaper ratchet gate that runs in `gate.sh`:
 
 ```bash

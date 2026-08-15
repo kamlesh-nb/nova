@@ -683,7 +683,7 @@ pub fn reportTypeIdDiff() void {
         if (storage_elem_disagree > 0) out("    last storage mismatch: '{s}'\n", .{storage_elem_last});
         out("  stage 4 struct fields store-vs-parse: agree={d}  DISAGREE={d}  (0 ⇒ build struct dtor from store fields)\n", .{ struct_field_agree, struct_field_disagree });
         if (struct_field_disagree > 0) out("    last struct mismatch: '{s}'\n", .{struct_field_last});
-        out("  stage 5 PhaseA release-site flip: flip={d} (store-native selected)  split={d} (i32/int, kept string)  no-id={d}\n", .{ phaseA_flip, phaseA_split, phaseA_no_id });
+        out("  stage 5 PhaseA release-site flip: flip={d} (store-native selected)  split={d} (unresolved type-param in erased body, kept string)  no-id={d}\n", .{ phaseA_flip, phaseA_split, phaseA_no_id });
         if (phaseA_split > 0) out("    last split: '{s}'\n", .{phaseA_split_last});
         out("  ownedByName split: primitive={d}  resolved-by-TypeId={d}  erased-residual={d}  (L1 migration: only bare type-params in dead erased bodies should remain in erased-residual)\n", .{ irct_primitive, irct_resolved, irct_string_decided });
         out("  legacyStringOwnership calls (shadow baseline only): {d}\n", .{a2_irct_calls});
