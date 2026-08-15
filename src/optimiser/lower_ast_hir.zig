@@ -24,6 +24,52 @@ const HirId = hir.HirId;
 // `string_<method>` (owned by `func`), else null. This lets the emit path resolve what is otherwise a
 // nameless field-access callee. Scoped to string receivers, whose mangled type name is just `string`; other
 // receivers (generics, user structs) need the general type-name mangling and stay nameless for now.
+// True if `stmt` contains a `continue` that belongs to the ENCLOSING loop (i.e. not inside a nested loop of
+// its own). A nested for/while owns its continues, so we stop the walk there; a switch does NOT (a continue
+// in a case targets the enclosing loop), so we walk its cases.
+fn hasEnclosingContinue(stmt: ast.Statement) bool {
+    return switch (stmt) {
+        .continue_stmt => true,
+        .block => |b| blk: {
+            for (b.statements) |s| if (hasEnclosingContinue(s)) break :blk true;
+            break :blk false;
+        },
+        .if_stmt => |is| hasEnclosingContinue(is.then_branch.*) or (if (is.else_branch) |e| hasEnclosingContinue(e.*) else false),
+        .switch_stmt => |ss| blk: {
+            for (ss.cases) |c| if (hasEnclosingContinue(c.body.*)) break :blk true;
+            if (ss.default_case) |d| if (hasEnclosingContinue(d.*)) break :blk true;
+            break :blk false;
+        },
+        .for_stmt, .while_stmt => false, // a nested loop owns its own continues
+        else => false,
+    };
+}
+
+// Desugar a C-style `for (init; cond; incr) body` to `{ init; while (cond) { body; incr } }`. A `continue`
+// in the body must still run the increment; a naive while would skip it, so a for whose body has an
+// enclosing continue (or an iterator form `for x in ...`) lowers to `.unsupported` (AST fallback).
+fn lowerFor(ctx: *Ctx, ids: *std.ArrayListUnmanaged(HirId), fs: ast.ForStmt) anyerror!void {
+    const a = ctx.allocator;
+    const func = ctx.func;
+    if (fs.iterator != null or hasEnclosingContinue(fs.body.*)) {
+        try ids.append(a, try func.add(a, .{ .kind = .{ .unsupported = "for" }, .span = fs.span }));
+        return;
+    }
+    if (fs.initializer) |init| try lowerStmt(ctx, ids, init.*);
+    const cond: HirId = if (fs.condition) |c| try lowerExpr(ctx, c) else try func.add(a, .{ .kind = .{ .bool = true }, .span = fs.span });
+    try ctx.loop_depths.append(a, ctx.scopes.items.len);
+    // Loop body = the user body, then the increment expression (runs at the end of each iteration).
+    var body_ids = std.ArrayListUnmanaged(HirId).empty;
+    defer body_ids.deinit(a);
+    try ctx.pushScope();
+    try lowerStmt(ctx, &body_ids, fs.body.*);
+    if (fs.increment) |inc| try body_ids.append(a, try lowerExpr(ctx, inc));
+    try ctx.popScopeReleases(&body_ids);
+    _ = ctx.loop_depths.pop();
+    const body = hir.Block{ .nodes = try a.dupe(HirId, body_ids.items) };
+    try ids.append(a, try func.add(a, .{ .kind = .{ .loop_ = .{ .cond = cond, .body = body } }, .span = fs.span }));
+}
+
 fn isStringTid(tid: hir.TypeId) bool {
     const st = mir.type_store orelse return false;
     if (tid == hir.unset_ty or @intFromEnum(tid) >= st.count()) return false;
@@ -259,6 +305,7 @@ fn lowerStmt(ctx: *Ctx, ids: *std.ArrayListUnmanaged(HirId), stmt: ast.Statement
             try ids.append(a, try func.add(a, .{ .kind = .cont, .span = cs.span }));
         },
         .switch_stmt => |ss| try lowerSwitch(ctx, ids, ss),
+        .for_stmt => |fs| try lowerFor(ctx, ids, fs),
         else => try ids.append(a, try func.add(a, .{ .kind = .{ .unsupported = @tagName(stmt) }, .span = zeroSpan() })),
     }
 }

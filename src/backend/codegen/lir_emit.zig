@@ -130,6 +130,15 @@ fn tryEmitInner(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, func: anyty
     defer mfunc.deinit(compiler.allocator);
     _ = opt_driver.optimise(compiler.allocator, &mfunc) catch return reject("optimise failed");
 
+    // Structural verify (A3): reject the function if the MIR violates a basic invariant (use-before-def,
+    // out-of-range operand/result, bad block target, unterminated block). Defence in depth -- a pass bug that
+    // produced e.g. a dangling load must not reach LLVM. The AST fallback then emits the function unchanged.
+    {
+        const violations = @import("../../optimiser/verify.zig").verify(compiler.allocator, &mfunc) catch return reject("verify failed");
+        defer compiler.allocator.free(violations);
+        if (violations.len > 0) return reject("MIR verify violation");
+    }
+
     // Validate the whole function BEFORE emitting any IR (a mid-stream reject would corrupt a block).
     if (!mirEmittable(compiler, &mfunc)) return reject("MIR outside emittable subset");
 

@@ -1,0 +1,38 @@
+// Emit-subset growth: C-style `for (init; cond; incr) body` now emits. lower_ast_hir desugars it to
+// `{ init; while (cond) { body; incr } }`. A `continue` in the body must still run the increment, which a
+// naive while would skip, so a for whose body has an enclosing `continue` (or the iterator form
+// `for x in ...`) falls back to the AST. Under NOVA_OPT_EMIT these helpers compile from the emit path; both
+// must agree, across a plain counting loop, an early `break`, and nested loops.
+import assert;
+
+fn sumTo(n: int): int {
+    let s = 0;
+    for (let i = 0; i < n; i = i + 1) { s = s + i; }
+    return s;
+}
+
+fn sumUntil(n: int, stop: int): int {
+    let s = 0;
+    for (let i = 0; i < n; i = i + 1) {
+        if (i == stop) { break; }
+        s = s + i;
+    }
+    return s;
+}
+
+fn grid(n: int): int {
+    let c = 0;
+    for (let i = 0; i < n; i = i + 1) {
+        for (let j = 0; j < n; j = j + 1) { c = c + 1; }
+    }
+    return c;
+}
+
+@test
+fn test_for_loops(): void {
+    assert.equalInt(sumTo(5), 10);   // 0+1+2+3+4
+    assert.equalInt(sumTo(1), 0);
+    assert.equalInt(sumUntil(10, 3), 3); // 0+1+2
+    assert.equalInt(grid(3), 9);
+    assert.equalInt(grid(0), 0);
+}

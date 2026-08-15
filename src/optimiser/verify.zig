@@ -19,6 +19,7 @@ pub const Error = struct {
         bad_block_target, // a terminator jumps to a non-existent block
         use_out_of_range, // an operand Value id is >= the number of defined values
         result_out_of_range, // an instruction result id is out of range
+        use_before_def, // an operand is used before (or without) its defining instruction in program order
         arc_imbalance, // retains/releases do not net to the ownership contract (dormant until ARC threaded)
     };
 };
@@ -29,6 +30,36 @@ pub fn verify(allocator: std.mem.Allocator, func: *const mir.Func) ![]Error {
 
     const nvalues = func.value_types.items.len;
     const nblocks = func.blocks.items.len;
+
+    // Program-order definition position of each value (block-major, then instruction index), for the
+    // use-before-def check below. The emit path's MIR flows values forward only (cross-block values live in
+    // memory via alloc/load/store, no back-edge SSA), so a valid def always precedes its use in this order.
+    // A value never defined stays at `undefined_pos` and any use of it is flagged. This is what would have
+    // caught the M6-C dangling load (a load promoted away while a use survived).
+    const undefined_pos: u64 = std.math.maxInt(u64);
+    const def_pos = allocator.alloc(u64, nvalues) catch return errs.toOwnedSlice(allocator);
+    defer allocator.free(def_pos);
+    @memset(def_pos, undefined_pos);
+    for (func.blocks.items, 0..) |b, bi| {
+        for (b.insts.items, 0..) |inst, ii| {
+            if (inst.result != .invalid and @intFromEnum(inst.result) < nvalues) {
+                def_pos[@intFromEnum(inst.result)] = (@as(u64, @intCast(bi)) << 32) | @as(u64, @intCast(ii));
+            }
+        }
+    }
+
+    for (func.blocks.items, 0..) |b, bi| {
+        for (b.insts.items, 0..) |inst, ii| {
+            const use_pos = (@as(u64, @intCast(bi)) << 32) | @as(u64, @intCast(ii));
+            var ubuf: [8]mir.Value = undefined;
+            for (mir.instOperands(inst.op, &ubuf)) |v| {
+                if (@intFromEnum(v) >= nvalues) continue; // already flagged out-of-range below
+                if (def_pos[@intFromEnum(v)] >= use_pos) {
+                    try errs.append(allocator, .{ .kind = .use_before_def, .block = @intCast(bi), .detail = "operand used before its definition" });
+                }
+            }
+        }
+    }
 
     for (func.blocks.items, 0..) |b, bi| {
         // 1. every instruction's operands and result are in range
