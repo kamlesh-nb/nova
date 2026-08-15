@@ -1,3 +1,8 @@
+> # ⛔ SCRAPPED 2026-08-16 — this optimiser was REMOVED (discards/optimiser-2026-08-16, commit 57da4cf).
+> It delivered ~0 realized optimisation over AST+LLVM O3 (see the "HONEST REALITY CHECK" below). The
+> forward plan is **docs/design/sil-arc-optimiser-direction.md** (Swift-SIL ARC optimisation, go/scrap-gated
+> on a measured perf delta). Everything below is retained as the HISTORICAL record + the reusable analysis.
+
 # Gap analysis: completing the Nova optimiser EMIT PATH
 
 > **2026-08-16 empirical measurement (build path, `NOVA_OPT=1`):** on `03_strings` the shadow lowers
