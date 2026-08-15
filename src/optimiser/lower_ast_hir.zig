@@ -76,6 +76,18 @@ fn isStringTid(tid: hir.TypeId) bool {
     return st.get(tid) == .string;
 }
 
+// True if `tid` names a struct type (a `.struct_` in the store: user struct/class OR a monomorphised
+// generic like `List<int>`). The retain-on-returned-borrow (D4) fires for these too, matching the AST,
+// which retains a returned borrowed reference struct so the caller gets a new owner. This is deliberately
+// BROAD: the actual emit decision (heap/class vs value struct) is made downstream by lir_emit's
+// `emittableHeapStructTid` gate -- a value struct or a non-emittable struct just falls the whole function
+// back to the AST path (the retain node is then unused), so an over-broad match here can never miscompile.
+fn isStructTid(tid: hir.TypeId) bool {
+    const st = mir.type_store orelse return false;
+    if (tid == hir.unset_ty or @intFromEnum(tid) >= st.count()) return false;
+    return st.get(tid) == .struct_;
+}
+
 fn stringMethodName(ctx: *Ctx, fa: ast.FieldAccess) ?[]const u8 {
     const ir = ctx.ir orelse return null;
     const st = mir.type_store orelse return null; // set by the emit path / driver; null in bare shadow
@@ -264,13 +276,15 @@ fn lowerStmt(ctx: *Ctx, ids: *std.ArrayListUnmanaged(HirId), stmt: ast.Statement
 
                 try ctx.releaseScopesDownTo(ids, 0, moved);
 
-                // Return-acquisition (string returns): the AST RETAINS a returned BORROWED owned value (the
-                // caller gets a new owner). A moved owned local (`moved != null`) or a fresh owned temporary
-                // (`ownedExpr`) already transfers ownership and must NOT be retained. Only `string` is an
-                // emittable owned return today.
+                // Return-acquisition (string + heap-struct returns): the AST RETAINS a returned BORROWED
+                // owned value (the caller gets a new owner). A moved owned local (`moved != null`) or a fresh
+                // owned temporary (`ownedExpr`) already transfers ownership and must NOT be retained. Emittable
+                // owned returns today: `string` and a heap (class / reference) struct -- for both the retain is
+                // a plain `nova_retain(ptr)`. lir_emit's `emittableHeapStructTid` gate is the precise arbiter
+                // (a value struct / non-emittable struct falls the whole function back to the AST path).
                 const rref = try func.add(a, .{ .kind = .{ .ident = rn }, .span = rs.span });
                 if (moved == null and !ctx.ownedExpr(e)) {
-                    if (ctx.ir) |ir| if (ir.typeOf(e)) |tid| if (isStringTid(tid)) {
+                    if (ctx.ir) |ir| if (ir.typeOf(e)) |tid| if (isStringTid(tid) or isStructTid(tid)) {
                         func.nodes.items[@intFromEnum(rref)].ty = tid;
                         try ids.append(a, try func.add(a, .{ .kind = .{ .retain = rref }, .span = rs.span }));
                     };

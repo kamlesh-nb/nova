@@ -2,8 +2,11 @@
 // if-chain -- the discriminant is bound once, each case tests `disc == v0 | disc == v1 | ...` (an OR of eq
 // compares, which are side-effect-free so no short-circuit is needed) and runs its body, falling through to
 // the default otherwise. A GUARDED case (`case v if cond`) has fall-to-default-on-guard-false semantics this
-// desugaring does not model, so a guarded switch falls back to the AST. Under NOVA_OPT_EMIT these helpers
-// compile from the emit path; both must agree.
+// desugaring does not model, so a guarded switch falls back to the AST. ENUM and STRING discriminants are out
+// of the emit subset here (enum awaits enum-in-emit; string is rejected language-wide), and fall back too.
+// Under NOVA_OPT_EMIT these integer-discriminant helpers compile from the emit path; both must agree, so this
+// case exercises multi-value cases, a default, a no-default fall-through, a `long` discriminant with a NEGATIVE
+// label, an expression discriminant, and a nested switch.
 import assert;
 
 fn classify(x: int): int {
@@ -24,6 +27,39 @@ fn parity(x: int): int {
     return -1;
 }
 
+// No default: an unmatched discriminant falls through to the code AFTER the switch.
+fn noDefault(x: int): int {
+    switch (x) {
+        case 7: { return 70; }
+        case 8, 9: { return 89; }
+    }
+    return -5;
+}
+
+// `long` discriminant, including a NEGATIVE case label (unary `-` on the label).
+fn sign(n: long): int {
+    switch (n) {
+        case -1: { return -10; }
+        case 0: { return 0; }
+        case 1: { return 10; }
+    }
+    return 99;
+}
+
+// Nested switch: the inner switch lives inside a case body of the outer one.
+fn nested(x: int, y: int): int {
+    switch (x) {
+        case 0: {
+            switch (y) {
+                case 0: { return 1; }
+                default: { return 2; }
+            }
+        }
+        default: { return 3; }
+    }
+    return 0;
+}
+
 @test
 fn test_switch(): void {
     assert.equalInt(classify(0), 100);
@@ -33,4 +69,15 @@ fn test_switch(): void {
     assert.equalInt(classify(9), -1);
     assert.equalInt(parity(6), 1);
     assert.equalInt(parity(7), 0);
+    assert.equalInt(noDefault(7), 70);
+    assert.equalInt(noDefault(8), 89);
+    assert.equalInt(noDefault(9), 89);
+    assert.equalInt(noDefault(2), -5);
+    assert.equalInt(sign(-1), -10);
+    assert.equalInt(sign(0), 0);
+    assert.equalInt(sign(1), 10);
+    assert.equalInt(sign(42), 99);
+    assert.equalInt(nested(0, 0), 1);
+    assert.equalInt(nested(0, 5), 2);
+    assert.equalInt(nested(9, 9), 3);
 }

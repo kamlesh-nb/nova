@@ -1,14 +1,21 @@
-// Emit-subset growth (B5, read + construct + mutate): a value `struct` flows as the address of its inline
-// bytes (no ARC header), so field READS are `base + offset` + load exactly like a heap struct, CONSTRUCTION
-// uses an inline stack alloca (buildValueStructStorage), and a scalar field WRITE (`s.f = v`) is the same
-// `base + offset` + store the AST emits on that address, so mutation is emittable too. A value struct that
-// would ESCAPE (RETURNED -- a dead stack address after the frame goes -- or stored into a heap field) is
-// rejected by the return / field gates, so its stack storage cannot outlive the function.
+// Emit-subset growth (B5, read + construct + mutate + return): a value `struct` flows as the address of its
+// inline bytes (no ARC header), so field READS are `base + offset` + load exactly like a heap struct,
+// CONSTRUCTION uses an inline stack alloca (buildValueStructStorage), and a scalar field WRITE (`s.f = v`) is
+// the same `base + offset` + store the AST emits on that address, so mutation is emittable too.
+//
+// RETURNS (mkVec/mkVec3 below): there is NO by-value copy-out / sret ABI in this backend. The whole-program
+// escape analysis HEAP-PROMOTES any struct that is constructed-and-returned, so a returned struct is a
+// reference-counted HEAP struct (nova_bytes_alloc + return the payload pointer), NOT a dead stack address --
+// byte-identical to the AST, ASAN-clean even with an intervening call between the return and the field read.
+// A struct that STAYS value-lowered (Rect / P3 here, only read/constructed/mutated locally) never reaches a
+// return position, which is exactly what escape analysis guarantees.
 // Under NOVA_OPT_EMIT these helpers compile from the emit path; both must agree.
 import assert;
 
 struct Rect { pub w: int, pub h: int }
 struct P3 { pub x: int, pub y: int, pub z: int }
+struct Vec2 { pub x: int, pub y: int }                  // constructed-and-returned -> heap-promoted
+struct Vec3 { pub a: int, pub b: int, pub c: int }      // >2 fields, constructed-and-returned
 
 fn area(r: Rect): int { return r.w * r.h; }             // read a value-struct param
 fn perimeter(r: Rect): int { return 2 * (r.w + r.h); }
@@ -22,6 +29,8 @@ fn mutate(): int {                                       // construct, MUTATE fi
     p.z = p.x + p.y;
     return p.x + p.y + p.z;
 }
+fn mkVec(a: int, b: int): Vec2 { return Vec2{ x: a, y: b }; }               // construct-and-RETURN
+fn mkVec3(a: int, b: int, c: int): Vec3 { return Vec3{ a: a, b: b, c: c }; } // >2-field construct-and-RETURN
 
 @test
 fn test_value_struct(): void {
@@ -30,4 +39,14 @@ fn test_value_struct(): void {
     assert.equalInt(perimeter(rc), 18);
     assert.equalInt(build(), 23);   // 3 + 4*5
     assert.equalInt(mutate(), 26);  // x=11, y=2, z=13 -> 11+2+13 = 26
+}
+
+@test
+fn test_value_struct_return(): void {
+    let p = mkVec(1, 2);            // returned struct read immediately
+    assert.equalInt(p.x + p.y, 3);
+    let q = mkVec(10, 20);         // two returns, read fields of both
+    assert.equalInt(p.x + p.y + q.x + q.y, 33);
+    let r = mkVec3(3, 4, 5);       // >2-field returned struct
+    assert.equalInt(r.a + r.b + r.c, 12);
 }

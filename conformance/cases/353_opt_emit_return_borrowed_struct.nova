@@ -1,0 +1,40 @@
+// Emit-subset growth (D4): a function that RETURNS a BORROWED heap (class / reference) struct now emits.
+// A borrowed return is a param (or, in general, any value that is neither a fresh `struct_new` nor a moved
+// owned local). The caller treats the returned value as an owned temporary and releases it, so the callee
+// must RETAIN it before returning -- exactly the return-acquisition the string-return path already does.
+// Without that retain the shared object would be double-freed; with it, ownership out is balanced.
+//
+// `pick` and `firstU` below both return a borrowed param. Under NOVA_OPT_EMIT they compile from the LIR
+// emit path (not the AST fallback); under the default path they compile from the AST. Both must agree AND
+// stay ARC-balanced (validated by --asan and the --arc audit), which is what this case pins.
+import assert;
+
+pub class User {
+    name: string,
+    age: int,
+    init(name: string, age: int) { self.name = name; self.age = age; }
+}
+
+fn pick(a: User, b: User, f: int): User {   // borrowed param, chosen by a condition -> retained
+    if (f > 0) { return a; }
+    return b;
+}
+fn firstU(a: User, b: User): User { return a; } // borrowed param -> retained
+
+@test
+fn test_return_borrowed_struct(): void {
+    // A loop so any ARC imbalance (double-free / leak) accumulates for --asan / the --arc audit.
+    let sum = 0;
+    let i = 0;
+    while (i < 1000) {
+        let a = User("alice", 30);
+        let b = User("bob", 40);
+        let c = pick(a, b, i % 2);   // c aliases a or b; using its field must be safe (no premature free)
+        sum = sum + c.age;
+        let d = firstU(a, b);        // d aliases a
+        sum = sum + d.age;
+        i = i + 1;
+    }
+    // Each iteration adds (30 or 40) + 30. Just assert it accumulated and the objects survived their use.
+    assert.equalInt(sum > 0, true);
+}

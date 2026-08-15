@@ -99,8 +99,19 @@ fn tryEmitInner(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, func: anyty
             // A string return is emittable: lower_ast_hir threads the return-acquisition retain (a borrowed
             // string returned is retained; a moved owned local / fresh temporary is not), so ownership out is
             // balanced -- validated by the --arc gate.
-            // NB: value structs are NOT allowed as a RETURN type -- a value struct is its inline stack bytes,
-            // so returning it would return a dead stack address (use-after-return). Needs a real copy-out ABI.
+            // B5 value-struct RETURNS: there is NO separate by-value copy-out / sret ABI in this backend. The
+            // whole-program escape analysis (computeValueEscapeSet, honoured by isValueStructName) HEAP-PROMOTES
+            // any struct that is constructed-and-returned -- a returned struct is therefore a reference-counted
+            // HEAP struct, not inline stack bytes, so `emittableHeapStructTid` accepts it here and it flows out
+            // as the payload pointer word exactly like the AST (which uses the same nova_bytes_alloc + return-
+            // pointer sequence -- differential byte-identical + ASAN-clean, incl. an intervening call between
+            // the return and the field read). A struct that STAYS value-lowered never reaches a return position
+            // (returning it would dangle, which escape analysis is precisely what prevents), so no dead-stack
+            // return is reachable. The one shape still NOT emitted is a returned heap-struct BORROW (`return p`
+            // / `return aLocal`), which the AST retains on the way out (nova_retain + the caller's __destruct_*
+            // release): mirEmittable's `.ret` gate restricts heap-struct returns to a FRESH construction
+            // (isStructNewResult), and the retain/release gates are string-only, so the borrow-return is left to
+            // the AST until struct-destructor ARC threading lands. That is an ARC slice, not a value-struct ABI.
             if (!ret_scalar and !emittableHeapStructTid(compiler, rtid) and !isF64Tid(compiler, rtid) and !isStringTid(compiler, rtid) and !emittableRefOptionalTid(compiler, rtid)) return reject("return type not int/bool/heap-struct/f64/string/ref-optional");
         }
     }
@@ -356,6 +367,51 @@ fn emittableHeapStructTid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
     return !compiler.isValueStructName(base);
 }
 
+// True if `tr` is the bare `string` type-ref. `string` is the one OWNED (non-scalar) field the emit path
+// can construct + release: a struct whose only owned fields are strings is released via its real
+// `__destruct_<Struct>`, which releases each string field with a null dtor (a single heap allocation, no
+// further owned fields). Any other owned field (class/list/nested struct/error-union/optional) is excluded.
+fn isStringFieldTypeRef(tr: ast.TypeRef) bool {
+    return tr == .ident and std.mem.eql(u8, tr.ident, "string");
+}
+
+// How a struct-with-string-fields local is dropped at scope end:
+//   .heap  -- a reference/heap struct (class, or an escaping struct): `nova_release(ptr, __destruct_*)`
+//             decrefs, runs the destructor (which releases the string fields), then frees the payload.
+//   .value -- a value struct (inline stack bytes, no ARC header): `dropValueStruct` calls __destruct_*
+//             DIRECTLY on the storage address to release the string fields, and does NOT free (it is stack).
+const StructDropKind = enum { heap, value };
+
+// D3: classify a struct whose owned fields are ALL bare strings (every field is scalar or `string`). Returns
+// how to drop it, or null if `tid` is not such a struct. The `__destruct_<Struct>` the AST backend generates
+// releases each string field (null dtor). Any field that is not scalar-or-string (class/list/nested struct/
+// error-union/optional/type-param) yields null -> the whole function falls back to the AST.
+fn stringFieldStructDropKind(compiler: *LlvmCompiler, tid: mir.TypeId) ?StructDropKind {
+    if (tid == mir.unset_ty) return null;
+    const nm = compiler.symbolName(tid) catch return null;
+    const base = types_mod.getStructBaseName(nm);
+    const sd = compiler.structs.get(base) orelse return null;
+    for (sd.fields) |f| {
+        if (isScalarFieldTypeRef(f.type_name)) continue;
+        if (isStringFieldTypeRef(f.type_name)) continue;
+        return null; // any other owned field kind -> fall back
+    }
+    return if (compiler.isValueStructName(base)) .value else .heap;
+}
+
+// True if Value `v` is defined by a `const_str` (an immortal interned string literal). A literal stored
+// into a struct's string field is MOVED in with NO retain (immortal: retain/release are no-ops), so no ARC
+// threading is needed at construction. A NON-literal string field arg (a named owner) would need a retain
+// the emit path does not thread at struct_new, so only const_str string fields are admitted for construction.
+fn isConstStrResult(mf: *const mir.Func, v: mir.Value) bool {
+    for (mf.blocks.items) |*b| {
+        for (b.insts.items) |inst| {
+            if (inst.result == v) return inst.op == .const_str;
+        }
+    }
+    return false;
+}
+
 // True if `tid` is a REFERENCE (pointer) word: a string, a reference optional, or a heap struct. These all
 // flow as an i64 pointer word, so an `eq`/`ne` compare between two of them -- or between one and the null
 // word (`undefined`/`null` == const_int 0) -- is a plain `icmp eq/ne i64`, exactly what the AST emits for a
@@ -450,7 +506,12 @@ fn mirEmittable(compiler: *LlvmCompiler, mf: *const mir.Func) bool {
         }
         switch (b.term) {
             .ret => |x| if (x) |rv| {
-                if (emittableHeapStructTid(compiler, mf.typeOf(rv)) and !isStructNewResult(mf, rv)) return false;
+                // A heap-struct return must transfer a balanced +1 to the caller (which releases it as an
+                // owned temporary). Two shapes qualify: (1) a FRESH construction (`struct_new`, rc=1, moved
+                // out) -- also covers a returned owned LOCAL, whose slot forwards to its struct_new; and
+                // (2) a BORROWED value (a param / field) that the return path RETAINED (D4). Anything else
+                // (an un-retained borrow) would under-retain -> double-free, so reject it.
+                if (emittableHeapStructTid(compiler, mf.typeOf(rv)) and !isStructNewResult(mf, rv) and !isRetainedResult(mf, rv)) return false;
             },
             .br, .condbr, .unreachable_ => {},
             .switch_ => return false,
@@ -512,15 +573,28 @@ fn mirInstEmittable(compiler: *LlvmCompiler, mf: *const mir.Func, inst: mir.Inst
                     const nm = x.name orelse return false;
                     if (resolveCallee(compiler, nm, x.args.len) == null) return false;
                 },
-                // Heap struct with all-scalar fields, fully initialised (every declared field supplied so we
-                // never rely on zero-init of an omitted field). Value structs + owned-field structs fall back.
+                // Heap OR value struct, fully initialised (every declared field supplied so we never rely on
+                // zero-init), whose fields are all scalar or bare-`string`-with-a-const_str-literal value (D3).
                 .struct_new => |x| {
-                    // Heap OR value struct, all-scalar fields, fully initialised. A value struct constructs
-                    // into inline stack bytes (emit uses buildValueStructStorage); it must not escape, which
-                    // the return gate (no value-struct returns) + field gates (no struct-in-struct) enforce.
+                    // Fully initialised (every declared field supplied so we never rely on zero-init). A value
+                    // struct constructs into inline stack bytes (buildValueStructStorage) and must not escape;
+                    // escape analysis HEAP-PROMOTES any struct that is constructed-and-returned (so a returned
+                    // struct is `!isValueStructName` here and takes the heap alloc branch instead), and the
+                    // field gates reject struct-in-struct -- so a value-lowered construction cannot outlive the fn.
                     const sd = compiler.structs.get(x.type_name) orelse return false;
                     if (sd.fields.len != x.args.len or sd.fields.len != x.field_names.len) return false;
-                    for (sd.fields) |f| if (!isScalarFieldTypeRef(f.type_name)) return false;
+                    // Scalar fields, OR a bare `string` field whose arg is a const_str literal -- an immortal
+                    // literal moved in needs NO retain, so no ARC threading at construction. A non-literal
+                    // string field (a named owner) would need a retain we do not thread here, so it falls back.
+                    // Holds for BOTH a heap struct (released via nova_release + real __destruct_<Struct>) and a
+                    // value struct (inline stack bytes, dropped via dropValueStruct -- direct destructor call,
+                    // no free). The .release gate/emit picks the right drop by the value's type.
+                    for (x.field_names, x.args) |fname, arg| {
+                        const ftr = fieldTypeRef(compiler, x.type_name, fname) orelse return false;
+                        if (isScalarFieldTypeRef(ftr)) continue;
+                        if (isStringFieldTypeRef(ftr) and isConstStrResult(mf, arg)) continue;
+                        return false;
+                    }
                 },
                 .field_get => |x| {
                     // Reads work for BOTH a heap struct (payload pointer) and a value struct (its inline byte
@@ -545,13 +619,17 @@ fn mirInstEmittable(compiler: *LlvmCompiler, mf: *const mir.Func, inst: mir.Inst
                     if (!compiler.constants.contains(name)) return false;
                     if (intKindForTid(compiler, inst.ty) == null) return false;
                 },
-                // ARC (D2): retain/release are emittable ONLY on a `string` operand -- a single heap
-                // allocation whose release needs no destructor (null dtor). Any other owned type (structs,
-                // lists, error unions) needs a real `__destruct_*` we do not resolve yet -> reject the whole
-                // function. Capturing a string into a struct field is separately blocked by the field gates
-                // (a string field is non-scalar).
-                .retain => |x| if (!isStringTid(compiler, mf.typeOf(x.val)) and !isStringRefOptionalTid(compiler, mf.typeOf(x.val))) return false,
-                .release => |x| if (!isStringTid(compiler, mf.typeOf(x.val)) and !isStringRefOptionalTid(compiler, mf.typeOf(x.val))) return false,
+                // ARC gates, merged D3 + D4:
+                // A RETAIN is a plain refcount bump (`nova_retain(ptr)`) that needs NO destructor, so it is
+                // emittable on a string, a string-optional, OR a heap (class / reference) struct pointer word
+                // (D4: the return-acquisition retain of a borrowed struct return -- the caller owns the
+                // matching release).
+                .retain => |x| if (!isStringTid(compiler, mf.typeOf(x.val)) and !isStringRefOptionalTid(compiler, mf.typeOf(x.val)) and !emittableHeapStructTid(compiler, mf.typeOf(x.val))) return false,
+                // A RELEASE is emittable on a string / string-optional (null dtor), OR a struct whose owned
+                // fields are all strings (D3) -- released via its real `__destruct_<Struct>` (heap) or a direct
+                // destructor call on its inline storage (value struct). Other owned types (class-with-non-
+                // string-fields / list / nested-struct / error-union) still need dtor resolution -> fall back.
+                .release => |x| if (!isStringTid(compiler, mf.typeOf(x.val)) and !isStringRefOptionalTid(compiler, mf.typeOf(x.val)) and stringFieldStructDropKind(compiler, mf.typeOf(x.val)) == null) return false,
                 // element read (C3): only a string (byte index) or a non-float array (i64-word element).
                 .index_get => |x| if (indexKind(compiler, mf.typeOf(x.object)) == null) return false,
                 // A string literal materialises to an immortal interned global -> always emittable, no ARC.
@@ -575,6 +653,18 @@ fn isStructNewResult(mf: *const mir.Func, v: mir.Value) bool {
     for (mf.blocks.items) |*b| {
         for (b.insts.items) |inst| {
             if (inst.result == v) return inst.op == .struct_new;
+        }
+    }
+    return false;
+}
+
+// True if Value `v` is the operand of a `retain` in this function -- i.e. the return path bumped its
+// refcount (D4's return-acquisition of a borrowed struct). Paired with the caller releasing the returned
+// temporary, this balances ownership out. Used only to admit a borrowed heap-struct return.
+fn isRetainedResult(mf: *const mir.Func, v: mir.Value) bool {
+    for (mf.blocks.items) |*b| {
+        for (b.insts.items) |inst| {
+            if (inst.op == .retain and inst.op.retain.val == v) return true;
         }
     }
     return false;
@@ -692,7 +782,29 @@ fn emitInst(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, inst: mir.Inst,
             break :blk null;
         },
         .release => |x| blk: {
-            try compiler.compileRelease(vals[@intFromEnum(x.val)] orelse return error.Unemittable, null);
+            const v = vals[@intFromEnum(x.val)] orelse return error.Unemittable;
+            const tid = mf.typeOf(x.val);
+            // A string / string-optional releases with a NULL dtor (single allocation, no owned fields). A
+            // string-owned-field heap struct (D3) releases via its REAL __destruct_<Struct>, resolved here
+            // exactly as the AST path does (getOrCreateDestructorPreferId, keyed on the value's TypeId), so
+            // its string fields are released and there is no duplicate destructor. The gate proved it is one
+            // of these two shapes.
+            if (isStringTid(compiler, tid) or isStringRefOptionalTid(compiler, tid)) {
+                try compiler.compileRelease(v, null);
+            } else {
+                const sname = structBaseNameOf(compiler, mf, x.val) orelse return error.Unemittable;
+                switch (stringFieldStructDropKind(compiler, tid) orelse return error.Unemittable) {
+                    // Heap/reference struct: nova_release with the real destructor (decref -> dtor -> free).
+                    .heap => {
+                        const dtor = (compiler.getOrCreateDestructorPreferId(sname, tid) catch return error.Unemittable) orelse return error.Unemittable;
+                        try compiler.compileRelease(v, dtor);
+                    },
+                    // Value struct: `v` is the inline-storage address word. Drop its string fields via the
+                    // destructor DIRECTLY (no nova_release/free -- it is stack storage), exactly as the AST
+                    // path's releaseLocalByName does for a value-struct local.
+                    .value => try compiler.dropValueStruct(v, sname, tid),
+                }
+            }
             break :blk null;
         },
         // Field write (scalar only in this slice, so no retain-old/release semantics): base + offset, narrow
