@@ -492,7 +492,6 @@ pub const LlvmCompiler = struct {
     }
 
     pub const legacyStringOwnership = arc_mod.legacyStringOwnership;
-    pub const erasedOwnershipDefault = arc_mod.erasedOwnershipDefault;
     pub const compileCallArgument = arc_mod.compileCallArgument;
     pub const acquisitionDisposition = arc_mod.acquisitionDisposition;
     pub const takeOwnedElement = arc_mod.takeOwnedElement;

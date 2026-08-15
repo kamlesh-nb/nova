@@ -1097,7 +1097,22 @@ pub fn ownedByName(self: *LlvmCompiler, name: []const u8) bool {
         return self.isOwnedTypeId(tid);
     }
     sema_shadow.irct_string_decided += 1;
-    return self.erasedOwnershipDefault(name);
+    // Erased-body structural default (folded in from the former erasedOwnershipDefault). Reached ONLY when
+    // the value has no recoverable concrete TypeId: a bare type-parameter or instantiation-free generic in
+    // an ERASED body that monomorphization dead-strips, whose IR must still verify. NOT ownership-by-user-
+    // type-name: every resolvable type was decided by isOwnedTypeId above. An untypeable placeholder means
+    // sema failed to type a LIVE value that reached ARC -- a compiler bug -- so fail loud, not guess.
+    if (arc_mod.isUntypeablePlaceholder(name)) {
+        std.debug.print(
+            "\x1b[1m\x1b[31mcompiler error:\x1b[0m\x1b[1m ARC ownership asked of an un-typeable value '{s}'\x1b[0m\n" ++
+            "  sema failed to type a value that reached a retain/release. This is a COMPILER bug\n" ++
+            "  (not user code): freeing it would corrupt memory. Please report.\n",
+            .{name});
+        std.process.exit(70);
+    }
+    // A bare, undeclared single-letter name is a type parameter; its slot holds no owned reference.
+    if (name.len == 1 and name[0] >= 'A' and name[0] <= 'Z') return false;
+    return true;
 }
 
 pub fn isOwnedDeclaredType(self: *LlvmCompiler, tr: ast.TypeRef, string_fallback: []const u8) bool {

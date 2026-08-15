@@ -22,30 +22,6 @@ pub fn enumIsTaggedUnion(self: *LlvmCompiler, enum_name: []const u8) bool {
     return false;
 }
 
-// Ownership default for a value with NO recoverable concrete TypeId. Reached ONLY from
-// types.ownedByName -- after the primitive short-circuit and after tidForName failed -- i.e. a bare
-// type parameter or an instantiation-free generic/function type from an ERASED generic body, which
-// monomorphization dead-strips (but whose IR must still verify, so a decision is unavoidable). This
-// is a STRUCTURAL default over dead code, NOT ownership-by-user-type-name: every RESOLVABLE type is
-// decided by the TypeId engine (isOwnedTypeId) before reaching here. A lone type-parameter slot
-// carries no owned reference; every other shape (a function value, a List/Map container) is
-// heap-owned. An untypeable placeholder means sema failed to type a LIVE value that reached ARC -- a
-// compiler bug -- so keep the loud guard rather than silently guessing.
-pub fn erasedOwnershipDefault(self: *LlvmCompiler, type_name: []const u8) bool {
-    _ = self;
-    if (isUntypeablePlaceholder(type_name)) {
-        std.debug.print(
-            "\x1b[1m\x1b[31mcompiler error:\x1b[0m\x1b[1m ARC ownership asked of an un-typeable value '{s}'\x1b[0m\n" ++
-            "  sema failed to type a value that reached a retain/release. This is a COMPILER bug\n" ++
-            "  (not user code): freeing it would corrupt memory. Please report.\n",
-            .{type_name});
-        std.process.exit(70);
-    }
-    // A bare, undeclared single-letter name is a type parameter (a declared one-letter type would
-    // have resolved via tidForName). Its slot holds no owned reference in an erased body.
-    if (type_name.len == 1 and type_name[0] >= 'A' and type_name[0] <= 'Z') return false;
-    return true;
-}
 
 // GAP-1: fail-loud used by the TypeId-native struct destructor when a field's concrete type does not
 // lower under the struct's own (decl, args). Proven unreachable corpus-wide (NOVA_DTOR_STRBLK sweep, 0
