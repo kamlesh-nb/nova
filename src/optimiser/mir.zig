@@ -33,6 +33,18 @@ pub fn intWidthOf(tid: TypeId) ?IntWidth {
     };
 }
 
+// True if `tid` is a float primitive. Used to keep constfold from folding a float binop as an integer op
+// (a float value flows as the i64 bit pattern of the double, so `l +% r` on two float const_ints would add
+// the bit patterns -- garbage).
+pub fn isFloatTy(tid: TypeId) bool {
+    const st = type_store orelse return false;
+    if (tid == unset_ty or @intFromEnum(tid) >= st.count()) return false;
+    return switch (st.get(tid)) {
+        .prim => |p| p.kind == .float,
+        else => false,
+    };
+}
+
 // Wrap `v` into `width` bits (Nova's honest-int semantics): truncate, then sign- or zero-extend back to i64.
 // This is the i64-domain twin of codegen's canonicalizeInt, so a folded constant equals the runtime result.
 pub fn wrapToWidth(v: i64, width: u16, signed: bool) i64 {

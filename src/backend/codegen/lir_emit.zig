@@ -77,7 +77,7 @@ fn tryEmitInner(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, func: anyty
         // (via string_* method calls, now named by C0) needs no ARC; an owned string LOCAL created in the body
         // gets its scope-end release from the threaded ARC ops (D2). Capturing a string into a struct field is
         // blocked by the field gates (string fields are non-scalar); returning a string is blocked below.
-        if (!scalar_ok and !emittableHeapStructTid(compiler, ptid) and !isStringTid(compiler, ptid) and !isArrayWordTid(compiler, ptid)) return reject("param not int/bool/heap-struct/string/array");
+        if (!scalar_ok and !emittableHeapStructTid(compiler, ptid) and !isStringTid(compiler, ptid) and !isArrayWordTid(compiler, ptid) and !isF64Tid(compiler, ptid)) return reject("param not int/bool/heap-struct/string/array/f64");
         ptbuf[i] = ptid;
     }
     const param_types = ptbuf[0..func.params.len];
@@ -94,7 +94,9 @@ fn tryEmitInner(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, func: anyty
         if (!is_void) {
             const rtid = compiler.concreteTidForTypeRef(rtr) orelse return reject("unresolved return type");
             const ret_scalar = if (intKindForTid(compiler, rtid)) |rk| (rk.signed or rk.is_bool) else false;
-            if (!ret_scalar and !emittableHeapStructTid(compiler, rtid)) return reject("return type not int/bool/heap-struct");
+            // f64 returns flow as the double's bits in the i64 word (the signature returns the word), matching
+            // how the emit path represents a float value -- so a float-returning function is emittable.
+            if (!ret_scalar and !emittableHeapStructTid(compiler, rtid) and !isF64Tid(compiler, rtid)) return reject("return type not int/bool/heap-struct/f64");
         }
     }
 
@@ -154,7 +156,9 @@ fn hirEmittable(hf: *const hir.Func) bool {
             // int<->int casts (C2): `x as long` / `x as int`; mirEmittable gates operand AND result to int.
             .cast,
             // string literals (C8): materialised as an immortal interned global (no ARC).
-            .str => {},
+            .str,
+            // float literals (B3): f64 flows as the double's bit pattern in the word; mirEmittable gates ops.
+            .float => {},
             else => {
                 if (emit_verbose) std.debug.print("[opt-emit]   non-emittable node: {s}\n", .{@tagName(node.kind)});
                 return false; // str/float/null/call/struct_init/cast/... -> fall back
@@ -187,6 +191,18 @@ fn intKindForTid(compiler: *LlvmCompiler, tid: mir.TypeId) ?IntKind {
         .i1 => .{ .width = 1, .signed = false, .is_bool = true },
         .i8, .i16, .i32, .i64, .word => .{ .width = types_mod.reprBitWidth(p.repr), .signed = p.signed, .is_bool = false },
         else => null, // f32/f64
+    };
+}
+
+// True if `tid` is a 64-bit float (`double`). A float value flows as the i64 word = the double's bit
+// pattern; ops bitcast i64<->double transiently. Scoped to f64 (8 bytes, clean i64 bitcast); f32 and decimal
+// (which pack differently in the word) fall back.
+fn isF64Tid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
+    const st = compiler.type_store orelse return false;
+    if (tid == mir.unset_ty or @intFromEnum(tid) >= st.count()) return false;
+    return switch (st.get(tid)) {
+        .prim => |p| p.kind == .float and p.bits == 64,
+        else => false,
     };
 }
 
@@ -314,6 +330,17 @@ fn mirEmittable(compiler: *LlvmCompiler, mf: *const mir.Func) bool {
         for (b.insts.items) |inst| {
             switch (inst.op) {
                 .binop => |x| {
+                    // FLOAT (f64) binop (B3): both operands f64; arithmetic (add/sub/mul/div) or a compare.
+                    // No mod/shift/bitwise on float. The emit path bitcasts to double and back.
+                    if (isF64Tid(compiler, mf.typeOf(x.lhs))) {
+                        if (!isF64Tid(compiler, mf.typeOf(x.rhs))) return false;
+                        switch (x.op) {
+                            .add, .sub, .mul, .div => if (!isF64Tid(compiler, inst.ty)) return false,
+                            .eq, .ne, .lt, .le, .gt, .ge => {}, // result is bool (word 0/1)
+                            else => return false,
+                        }
+                        continue;
+                    }
                     const lk = intKindForTid(compiler, mf.typeOf(x.lhs)) orelse return false;
                     const rk = intKindForTid(compiler, mf.typeOf(x.rhs)) orelse return false;
                     switch (x.op) {
@@ -612,6 +639,37 @@ fn emitFunc(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, mf: *const mir.
 fn emitBinop(compiler: *LlvmCompiler, inst: mir.Inst, op: mir.BinOp, mf: *const mir.Func, l: types.LLVMValueRef, r: types.LLVMValueRef) !types.LLVMValueRef {
     const bld = compiler.builder;
     const vt = compiler.val_type;
+
+    // FLOAT (f64) path (B3): operands are the double's bit pattern in the i64 word. Bitcast to double, do the
+    // FP op, then bitcast the arithmetic result back to the i64 word (compares zext an i1). Both operands must
+    // be f64; f32, decimal, and mixed int/float fall back. No mod/shift/bitwise on float.
+    if (isF64Tid(compiler, mf.typeOf(inst.op.binop.lhs))) {
+        if (!isF64Tid(compiler, mf.typeOf(inst.op.binop.rhs))) return error.Unemittable;
+        const dbl = core.LLVMDoubleType();
+        const ld = core.LLVMBuildBitCast(bld, l, dbl, "");
+        const rd = core.LLVMBuildBitCast(bld, r, dbl, "");
+        switch (op) {
+            .add => return core.LLVMBuildBitCast(bld, core.LLVMBuildFAdd(bld, ld, rd, ""), vt, ""),
+            .sub => return core.LLVMBuildBitCast(bld, core.LLVMBuildFSub(bld, ld, rd, ""), vt, ""),
+            .mul => return core.LLVMBuildBitCast(bld, core.LLVMBuildFMul(bld, ld, rd, ""), vt, ""),
+            .div => return core.LLVMBuildBitCast(bld, core.LLVMBuildFDiv(bld, ld, rd, ""), vt, ""),
+            .eq, .ne, .lt, .le, .gt, .ge => {
+                const pred: types.LLVMRealPredicate = switch (op) {
+                    .eq => .LLVMRealOEQ,
+                    .ne => .LLVMRealONE,
+                    .lt => .LLVMRealOLT,
+                    .le => .LLVMRealOLE,
+                    .gt => .LLVMRealOGT,
+                    .ge => .LLVMRealOGE,
+                    else => unreachable,
+                };
+                const cmp = core.LLVMBuildFCmp(bld, pred, ld, rd, "");
+                return core.LLVMBuildZExt(bld, cmp, vt, "");
+            },
+            else => return error.Unemittable, // mod / shifts / bitwise are not valid on float
+        }
+    }
+
     const lk = intKindForTid(compiler, mf.typeOf(inst.op.binop.lhs)) orelse return error.Unemittable;
     const rk = intKindForTid(compiler, mf.typeOf(inst.op.binop.rhs)) orelse return error.Unemittable;
     switch (op) {

@@ -33,7 +33,12 @@ fn run(allocator: std.mem.Allocator, func: *mir.Func) anyerror!bool {
                 .binop => |bin| {
                     const lk = konst[@intFromEnum(bin.lhs)];
                     const rk = konst[@intFromEnum(bin.rhs)];
-                    if (lk != null and rk != null) {
+                    // NEVER fold a float binop: a float const_int holds the double's BIT PATTERN, so the
+                    // integer `fold` (l +% r) would add bit patterns -> garbage. Float const-folding would
+                    // need real FP arithmetic; the emit path materialises the operands instead.
+                    if (lk != null and rk != null and !mir.isFloatTy(inst.ty) and
+                        !mir.isFloatTy(func.typeOf(bin.lhs)) and !mir.isFloatTy(func.typeOf(bin.rhs)))
+                    {
                         if (fold(bin.op, lk.?, rk.?)) |raw| {
                             // Width-honesty: Nova's `int` is 32-bit, so a folded arithmetic result must wrap
                             // to the RESULT type's width exactly as the runtime does (codegen's

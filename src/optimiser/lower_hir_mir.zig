@@ -78,7 +78,10 @@ fn lowerNode(ctx: *Ctx, id: HirId) anyerror!Value {
         .param => |i| mf.emit(a, ctx.cur, nty, .{ .param = i }),
         // structural placeholders for non-integer literals (real materialisation is an emit-time concern)
         .str => |s| mf.emit(a, ctx.cur, nty, .{ .const_str = s }),
-        .float, .null, .undefined => mf.emit(a, ctx.cur, nty, .{ .const_int = 0 }),
+        // A float literal flows as the double's bit pattern in the i64 word (the emit path bitcasts to double
+        // for ops). Carry the bits in const_int; its FLOAT type keeps constfold from folding it as an integer.
+        .float => |fv| mf.emit(a, ctx.cur, nty, .{ .const_int = @as(i64, @bitCast(fv)) }),
+        .null, .undefined => mf.emit(a, ctx.cur, nty, .{ .const_int = 0 }),
 
         .ident => |name| blk: {
             if (ctx.slots.get(name)) |addr| {

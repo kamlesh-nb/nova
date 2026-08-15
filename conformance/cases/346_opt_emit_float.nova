@@ -1,0 +1,31 @@
+// Emit-subset growth (B3, f64 only): float (double) arithmetic now emits. A float value flows as the i64
+// word holding the double's bit pattern; the emit path bitcasts to double, does the FP op (fadd/fsub/fmul/
+// fdiv or fcmp), then bitcasts the arithmetic result back to the word. Float params, returns, locals, and
+// literals are handled; f32, decimal, and mixed int/float ops fall back, and float const-folding is disabled
+// in constfold (a float const_int holds the double's BITS, which must not be folded as an integer). Under
+// NOVA_OPT_EMIT these helpers compile from the emit path; both must agree.
+import assert;
+
+fn addD(x: double, y: double): double { return x + y; }
+fn mulD(x: double): double { return x * 2.0; }
+fn poly(x: double): double { return x * x - 2.0 * x + 1.0; } // (x-1)^2
+fn negD(x: double): double { return -x; }
+fn lessThan(x: double, y: double): bool { return x < y; }
+fn divD(a: double, b: double): double { return a / b; }
+
+@test
+fn test_float_arithmetic(): void {
+    assert.isTrue(addD(1.5, 2.5) == 4.0);
+    assert.isTrue(mulD(3.5) == 7.0);
+    assert.isTrue(poly(3.0) == 4.0);   // (3-1)^2 = 4
+    assert.isTrue(poly(1.0) == 0.0);
+    assert.isTrue(negD(2.0) == 0.0 - 2.0);
+    assert.isTrue(divD(10.0, 4.0) == 2.5);
+}
+
+@test
+fn test_float_compare(): void {
+    assert.isTrue(lessThan(1.0, 2.0));
+    assert.isTrue(!lessThan(2.0, 1.0));
+    assert.isTrue(!lessThan(2.0, 2.0));
+}
