@@ -97,6 +97,13 @@ if [[ "${1:-}" == "--asan" ]]; then ASAN_MODE=1; shift; fi
 # cannot. This is the gate for the self-hosted runtime work — any race becomes a located
 # report naming both accesses. Requires: NOVA_TSAN=1 zig build first.
 if [[ "${1:-}" == "--tsan" ]]; then TSAN_MODE=1; shift; fi
+# --dogfood : compile-and-run a suite of realistic, whole-program feature COMBINATIONS under ASAN, each
+# expected to exit 0. Unlike cases/ (which are @test suites), these are full main()-driven programs that
+# exercise generics + closures + traits + optionals + error-unions + async together -- the "can I build a
+# real program without hitting a compiler bug" net. Grown from the last-lap crash hunt; add a program here
+# whenever a new crash class is found + fixed, so it can never silently return.
+DOGFOOD_MODE=0
+if [[ "${1:-}" == "--dogfood" ]]; then DOGFOOD_MODE=1; shift; fi
 # -j [N] / --parallel [N] : run the positive corpus N-way parallel (default: cores-1). Each case runs
 # in its own temp dir so the hardcoded __nova_test output cannot collide, with packages/ symlinked in so
 # driver-importing cases still resolve; server cases use ephemeral ports so they parallelise cleanly.
@@ -117,6 +124,32 @@ FILTER="${1:-}"
 if [[ ! -x "$NOVA" ]]; then
   echo "ERROR: nova compiler not found at $NOVA (build with 'zig build' in lang/)" >&2
   exit 2
+fi
+
+if [[ $DOGFOOD_MODE -eq 1 ]]; then
+  # Inherits NOVA_ASAN from the environment: plain run catches crashes (a hard SEGV exits non-zero
+  # regardless of ASAN); `NOVA_ASAN=1 run.sh --dogfood` (after a `NOVA_ASAN=1 zig build`) adds silent
+  # use-after-free detection. Either way each program must compile and exit 0.
+  asan_note=""; [[ -n "${NOVA_ASAN:-}" ]] && asan_note=" +ASAN"
+  echo "--- dogfood suite: realistic feature-combination programs (expect exit 0${asan_note}) ---"
+  dg_pass=0; dg_fail=0; dg_failed=()
+  dg_tmp="$(mktemp -d)"
+  for f in "$HERE"/dogfood/*.nova; do
+    [ -e "$f" ] || continue
+    name="$(basename "$f" .nova)"
+    if ! "$NOVA" "$f" -o "$dg_tmp/$name" >/dev/null 2>&1; then
+      printf "  \033[31mFAIL\033[0m  %-34s (compile)\n" "$name"; dg_fail=$((dg_fail+1)); dg_failed+=("$name:compile"); continue
+    fi
+    if "$dg_tmp/$name" >/dev/null 2>&1; then
+      dg_pass=$((dg_pass+1))
+    else
+      printf "  \033[31mFAIL\033[0m  %-34s (run/crash)\n" "$name"; dg_fail=$((dg_fail+1)); dg_failed+=("$name:run")
+    fi
+  done
+  rm -rf "$dg_tmp"
+  echo "Cases: $((dg_pass+dg_fail))  Passed: $dg_pass  Failed: $dg_fail"
+  if [[ $dg_fail -gt 0 ]]; then echo "Failed: ${dg_failed[*]}"; exit 1; fi
+  exit 0
 fi
 
 pass=0; fail=0; failed_cases=()

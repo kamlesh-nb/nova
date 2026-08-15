@@ -1,0 +1,6 @@
+struct Inner { pub v: int, init(v: int){ self.v = v; } }
+struct Outer { pub inner: Inner, pub tag: string, init(i: Inner, t: string){ self.inner=i; self.tag=t; } }
+fn main(): void {
+  let o = Outer(Inner(42), "hello");
+  console.log(`${o.tag}=${o.inner.v}`);
+}

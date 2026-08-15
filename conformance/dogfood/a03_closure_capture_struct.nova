@@ -1,0 +1,9 @@
+import list;
+struct Cfg { pub base: int, init(b: int){ self.base = b; } }
+fn main(): void {
+  let c = Cfg(100);
+  let fns = List<(int) -> int>();
+  fns.push((x) => x + c.base);
+  let f = fns.get(0);
+  if (f != undefined) { console.log(`${f(5)}`); }
+}

@@ -1,0 +1,15 @@
+import list;
+enum Cmd { Say(string), Add(int) }
+fn main(): void {
+  let cmds = List<Cmd>();
+  cmds.push(Cmd.Say("hi"));
+  cmds.push(Cmd.Add(5));
+  let acc = 0;
+  for (c in cmds) {
+    switch (c) {
+      case Cmd.Say(s): { console.log(`say ${s}`); }
+      case Cmd.Add(n): { acc = acc + n; }
+    }
+  }
+  console.log(`acc=${acc}`);
+}

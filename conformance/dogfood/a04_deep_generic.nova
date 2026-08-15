@@ -1,0 +1,12 @@
+import map; import list; import string;
+fn main(): void {
+  let m = Map<string, List<List<int>>>(8, string.hash);
+  let outer = List<List<int>>();
+  let inner = List<int>(); inner.push(7);
+  outer.push(inner);
+  m.set("k", outer);
+  let g = m.get("k");
+  if (g != undefined) {
+    for (row in g) { for (v in row) { console.log(`v=${v}`); } }
+  }
+}

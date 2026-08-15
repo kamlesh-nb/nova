@@ -1,0 +1,9 @@
+trait Box<T> { fn wrap(self, v: T): string; }
+struct IntBox impl Box<int> { fn wrap(self, v: int): string { return `i:${v}`; } }
+struct StrBox impl Box<string> { fn wrap(self, v: string): string { return `s:${v}`; } }
+fn main(): void {
+  let a = IntBox{};
+  let b = StrBox{};
+  console.log(a.wrap(7));
+  console.log(b.wrap("hi"));
+}

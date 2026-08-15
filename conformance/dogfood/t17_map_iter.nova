@@ -1,0 +1,9 @@
+import map;
+import string;
+fn main(): void {
+  let scores = Map<string, int>(16, string.hash);
+  scores.set("a", 10); scores.set("b", 20); scores.set("c", 30);
+  let total = 0;
+  for ((k, v) in scores) { total = total + v; }
+  console.log(`total=${total} keys=${scores.keys().size()}`);
+}

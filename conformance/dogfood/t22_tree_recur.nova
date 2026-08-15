@@ -1,0 +1,13 @@
+import list;
+struct Node { pub val: int, pub kids: List<Node>, init(v: int){ self.val = v; self.kids = List<Node>(); } }
+fn total(n: Node): int {
+  let s = n.val;
+  for (k in n.kids) { s = s + total(k); }
+  return s;
+}
+fn main(): void {
+  let root = Node(1);
+  let c1 = Node(2); let c2 = Node(3);
+  root.kids.push(c1); root.kids.push(c2);
+  console.log(`total=${total(root)}`);
+}

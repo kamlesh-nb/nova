@@ -1,0 +1,12 @@
+enum Tree { Leaf(int), Node(int) }
+fn eval(t: Tree): int {
+  switch (t) {
+    case Tree.Leaf(v): { return v; }
+    case Tree.Node(v): { return v * 2; }
+  }
+  return 0;
+}
+fn fib(n: int): int { if (n < 2) { return n; } return fib(n-1) + fib(n-2); }
+fn main(): void {
+  console.log(`leaf=${eval(Tree.Leaf(5))} node=${eval(Tree.Node(5))} fib10=${fib(10)}`);
+}

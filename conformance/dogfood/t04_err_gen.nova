@@ -1,0 +1,7 @@
+exception E { Bad(int), fn message(self: E): string { switch(self){ case E.Bad(n): { return `bad ${n}`; } } return "?"; } }
+fn checked<T>(x: T, ok: bool): T | E { if (!ok) { return E.Bad(1); } return x; }
+fn main(): void {
+  let a = checked<int>(5, true) catch -1;
+  let b = checked<int>(9, false) catch -2;
+  console.log(`a=${a} b=${b}`);
+}

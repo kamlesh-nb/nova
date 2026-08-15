@@ -1,0 +1,6 @@
+import list;
+fn getOpt(x: int): int | undefined { if (x > 0) { return x; } return undefined; }
+fn use2(a: int | undefined, b: int): int { if (a != undefined) { return a + b; } return b; }
+fn main(): void {
+  console.log(`${use2(getOpt(5), 10)}`);
+}

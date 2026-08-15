@@ -1,0 +1,12 @@
+trait Named { fn label(self: Named): string; }
+struct Item<T> impl Named {
+  pub val: T,
+  pub note: string | undefined,
+  init(v: T){ self.val = v; self.note = undefined; }
+  pub fn label(self: Item<T>): string { return `${self.val}`; }
+}
+fn main(): void {
+  let it = Item<int>(99);
+  console.log(it.label());
+  console.log(`note=${it.note ?? "none"}`);
+}

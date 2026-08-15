@@ -1,0 +1,11 @@
+import list;
+struct Txn { pub amt: int, pub note: string, init(a: int, n: string){ self.amt = a; self.note = n; } }
+fn main(): void {
+  let txns = List<Txn>();
+  txns.push(Txn(100, "deposit"));
+  txns.push(Txn(-30, "coffee"));
+  txns.push(Txn(-20, "lunch"));
+  let bal = 0;
+  for (t in txns) { bal = bal + t.amt; console.log(`${t.note}: ${t.amt} -> ${bal}`); }
+  console.log(`final=${bal}`);
+}

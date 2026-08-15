@@ -1,0 +1,6 @@
+fn adder(n: int): (int) -> int { return (x) => x + n; }
+fn main(): void {
+  let add5 = adder(5);
+  let add10 = adder(10);
+  console.log(`${add5(1)} ${add10(1)}`);
+}

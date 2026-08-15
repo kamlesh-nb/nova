@@ -1,0 +1,4 @@
+trait Render { fn render(self: Render): string; }
+struct Box impl Render { pub v: int, pub fn render(self: Box): string { return `[${self.v}]`; } }
+fn show(r: Render): void { console.log(r.render()); }
+fn main(): void { show(Box{ v: 42 }); }

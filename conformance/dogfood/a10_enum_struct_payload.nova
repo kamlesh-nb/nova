@@ -1,0 +1,10 @@
+struct Point { pub x: int, pub y: int, init(x: int, y: int){ self.x = x; self.y = y; } }
+enum Shape { Dot(Point), Empty }
+fn area(s: Shape): int {
+  switch (s) {
+    case Shape.Dot(p): { return p.x * p.y; }
+    case Shape.Empty: { return 0; }
+  }
+  return -1;
+}
+fn main(): void { console.log(`${area(Shape.Dot(Point(3, 4)))} ${area(Shape.Empty)}`); }

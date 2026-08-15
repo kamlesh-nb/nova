@@ -1,0 +1,12 @@
+enum Msg { Move(int, int), Quit }
+fn describe(m: Msg): string {
+  switch (m) {
+    case Msg.Move(x, y): { return `move ${x},${y}`; }
+    case Msg.Quit: { return "quit"; }
+  }
+  return "?";
+}
+fn main(): void {
+  console.log(describe(Msg.Move(3, 4)));
+  console.log(describe(Msg.Quit));
+}

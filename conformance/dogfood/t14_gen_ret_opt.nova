@@ -1,0 +1,12 @@
+import list;
+fn firstMatch<T>(xs: List<T>, want: T): T | undefined {
+  for (x in xs) { if (x == want) { return x; } }
+  return undefined;
+}
+fn main(): void {
+  let xs = List<int>();
+  xs.push(1); xs.push(2); xs.push(3);
+  let r = firstMatch<int>(xs, 2) ?? -1;
+  let n = firstMatch<int>(xs, 9) ?? -1;
+  console.log(`r=${r} n=${n}`);
+}

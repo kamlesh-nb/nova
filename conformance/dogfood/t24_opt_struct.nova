@@ -1,0 +1,8 @@
+struct R { pub code: int, init(c: int){ self.code = c; } }
+fn lookup(x: int): R | undefined { if (x > 0) { return R(x); } return undefined; }
+fn main(): void {
+  let r = lookup(7);
+  if (r != undefined) { console.log(`code=${r.code}`); } else { console.log("none"); }
+  let n = lookup(-1);
+  if (n != undefined) { console.log(`code=${n.code}`); } else { console.log("none"); }
+}

@@ -1,0 +1,10 @@
+import list;
+fn main(): void {
+  let xs = List<int | undefined>();
+  xs.push(1);
+  xs.push(undefined);
+  xs.push(3);
+  let sum = 0;
+  for (v in xs) { if (v != undefined) { sum = sum + v; } }
+  console.log(`sum=${sum}`);
+}

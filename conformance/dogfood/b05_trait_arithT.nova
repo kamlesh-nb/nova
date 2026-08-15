@@ -1,0 +1,11 @@
+trait Valued { fn plus(self: Valued): int; }
+struct Cell<T> impl Valued {
+  pub v: T,
+  init(v: T){ self.v = v; }
+  pub fn plus(self: Cell<T>): int { return self.v + 100; }
+}
+fn main(): void {
+  let c = Cell<int>{ v: 5 };
+  let d: Valued = c;
+  console.log(`${d.plus()}`);
+}

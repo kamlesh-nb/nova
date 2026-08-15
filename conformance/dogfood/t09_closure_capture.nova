@@ -1,0 +1,6 @@
+fn main(): void {
+  let prefix = "user:";
+  let make = (id: int) => `${prefix}${id}`;
+  console.log(make(1));
+  console.log(make(2));
+}

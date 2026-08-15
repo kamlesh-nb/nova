@@ -1,0 +1,14 @@
+import map;
+import list;
+import string;
+fn main(): void {
+  let m = Map<string, List<int>>(16, string.hash);
+  let a = List<int>(); a.push(1); a.push(2);
+  m.set("a", a);
+  let got = m.get("a");
+  if (got != undefined) {
+    let sum = 0;
+    for (v in got) { sum = sum + v; }
+    console.log(`sum=${sum}`);
+  }
+}

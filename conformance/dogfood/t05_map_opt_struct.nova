@@ -1,0 +1,8 @@
+import map;
+import string;
+struct P { pub name: string, pub age: int, init(n: string, a: int){ self.name=n; self.age=a; } }
+fn main(): void {
+  let m = Map<string, P>(16, string.hash);
+  m.set("ada", P("Ada", 36));
+  console.log(`name=${m.get("ada")?.name ?? "?"} miss=${m.get("x")?.name ?? "?"}`);
+}

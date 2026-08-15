@@ -1,0 +1,9 @@
+trait Animal { fn sound(self: Animal): string; }
+struct Dog impl Animal { pub name: string, pub fn sound(self: Dog): string { return "woof"; } }
+fn make(): Animal { return Dog{ name: "Rex" }; }
+fn main(): void {
+  let a = make();
+  console.log(a.sound());
+  let d = a as Dog;
+  console.log(d.name);
+}

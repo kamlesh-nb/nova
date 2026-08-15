@@ -1,0 +1,11 @@
+import map;
+import string;
+fn main(): void {
+  let m = Map<string, int | undefined>(16, string.hash);
+  m.set("present", 5);
+  m.set("null", undefined);
+  let a = m.get("present");
+  let b = m.get("null");
+  let c = m.get("absent");
+  console.log(`a_present=${a != undefined} b_present=${b != undefined} c_present=${c != undefined}`);
+}

@@ -1,0 +1,13 @@
+import list;
+struct Box<T> {
+  pub items: List<T>,
+  init(){ self.items = List<T>(); }
+  pub fn first(self: Box<T>): T | undefined { return self.items.get(0); }
+}
+fn main(): void {
+  let b = Box<int>();
+  b.items.push(9);
+  console.log(`${b.first() ?? -1}`);
+  let e = Box<int>();
+  console.log(`${e.first() ?? -1}`);
+}

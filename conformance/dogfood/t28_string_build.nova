@@ -1,0 +1,7 @@
+import string;
+fn main(): void {
+  let sb = "";
+  let i = 0;
+  while (i < 5) { sb = sb + `${i},`; i = i + 1; }
+  console.log(sb);
+}

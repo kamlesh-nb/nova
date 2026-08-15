@@ -1,0 +1,7 @@
+async fn work(n: int): int { return n * n; }
+async fn run(): int {
+  let h1 = spawn work(3);
+  let h2 = spawn work(4);
+  return await h1 + await h2;
+}
+fn main(): void { console.log(`r=${run()}`); }

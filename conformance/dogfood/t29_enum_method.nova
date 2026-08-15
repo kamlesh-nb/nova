@@ -1,0 +1,9 @@
+import list;
+enum Status { Ok, Fail(int), fn code(self: Status): int { switch(self){ case Status.Ok: { return 0; } case Status.Fail(n): { return n; } } return -1; } }
+fn main(): void {
+  let xs = List<Status>();
+  xs.push(Status.Ok); xs.push(Status.Fail(5));
+  let sum = 0;
+  for (s in xs) { sum = sum + s.code(); }
+  console.log(`sum=${sum}`);
+}

@@ -1,0 +1,7 @@
+fn main(): void {
+  let i = 42;
+  let b = true;
+  let s = "hi";
+  let f = 3.5;
+  console.log(`i=${i} b=${b} s=${s} f=${f} expr=${i * 2 + 1}`);
+}

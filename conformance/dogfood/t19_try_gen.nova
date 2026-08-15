@@ -1,0 +1,6 @@
+exception E { Neg, fn message(self: E): string { return "neg"; } }
+fn mustPos(x: int): int | E { if (x < 0) { return E.Neg; } return x; }
+fn doubleIt(x: int): int | E { let v = try mustPos(x); return v * 2; }
+fn main(): void {
+  console.log(`ok=${doubleIt(5) catch -1} bad=${doubleIt(-3) catch -1}`);
+}

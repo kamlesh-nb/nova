@@ -1,0 +1,13 @@
+import list;
+exception E { Bad, fn message(self: E): string { return "bad"; } }
+fn parse(x: int): int | E { if (x < 0) { return E.Bad; } return x * 2; }
+fn sumAll(xs: List<int>): int | E {
+  let s = 0;
+  for (x in xs) { s = s + try parse(x); }
+  return s;
+}
+fn main(): void {
+  let ok = List<int>(); ok.push(1); ok.push(2);
+  let bad = List<int>(); bad.push(1); bad.push(-1);
+  console.log(`ok=${sumAll(ok) catch -1} bad=${sumAll(bad) catch -1}`);
+}

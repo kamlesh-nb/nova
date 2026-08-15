@@ -1,0 +1,7 @@
+async fn ident<T>(x: T): T { return x; }
+async fn run(): int {
+  let a = await ident<int>(5);
+  let b = await ident<int>(7);
+  return a + b;
+}
+fn main(): void { console.log(`r=${run()}`); }

@@ -1,0 +1,6 @@
+fn main(): void {
+  let a = 1;
+  let b = 2;
+  let (x, y) = (b, a);
+  console.log(`x=${x} y=${y}`);
+}

@@ -1,0 +1,12 @@
+import list;
+struct Stack<T> {
+  pub items: List<T>,
+  init(){ self.items = List<T>(); }
+  pub fn push(self: Stack<T>, v: T): void { self.items.push(v); }
+  pub fn size(self: Stack<T>): int { return self.items.size(); }
+}
+fn main(): void {
+  let s = Stack<int>();
+  s.push(1); s.push(2); s.push(3);
+  console.log(`size=${s.size()}`);
+}

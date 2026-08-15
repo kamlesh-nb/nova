@@ -1,0 +1,6 @@
+import list;
+fn main(): void {
+  let fns = List<() -> int>();
+  for (i in 1..=3) { fns.push(() => i); }
+  for (f in fns) { console.log(`${f()}`); }
+}

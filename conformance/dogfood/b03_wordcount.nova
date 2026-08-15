@@ -1,0 +1,8 @@
+import map; import list; import string;
+fn main(): void {
+  let words = List<string>();
+  words.push("a"); words.push("b"); words.push("a"); words.push("c"); words.push("a");
+  let counts = Map<string, int>(16, string.hash);
+  for (w in words) { counts.set(w, (counts.get(w) ?? 0) + 1); }
+  for ((k, v) in counts) { console.log(`${k}=${v}`); }
+}

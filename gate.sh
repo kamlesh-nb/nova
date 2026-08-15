@@ -25,6 +25,13 @@ if [ $fail -eq 0 ]; then
 fi
 
 if [ $fail -eq 0 ]; then
+  step "dogfood suite (realistic feature-combination whole programs; must compile + exit 0)"
+  # Inherits NOVA_ASAN: plain here catches crashes; run `NOVA_ASAN=1 conformance/run.sh --dogfood`
+  # separately (after a sanitized build) for use-after-free coverage.
+  conformance/run.sh --dogfood || fail=1
+fi
+
+if [ $fail -eq 0 ]; then
   step "compiler fuzz (fixed-seed regression smoke; scale via NOVA_FUZZ_N/SEED for exploration)"
   NOVA_FUZZ_N="${NOVA_FUZZ_N:-40}" conformance/fuzz.sh || fail=1
 fi

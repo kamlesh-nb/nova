@@ -1,0 +1,9 @@
+import map;
+import string;
+struct Addr { pub city: string, init(c: string){ self.city = c; } }
+struct User { pub addr: Addr, init(a: Addr){ self.addr = a; } }
+fn main(): void {
+  let m = Map<string, User>(16, string.hash);
+  m.set("a", User(Addr("Pune")));
+  console.log(`${m.get("a")?.addr?.city ?? "?"}`);
+}

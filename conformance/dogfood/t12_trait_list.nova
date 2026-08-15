@@ -1,0 +1,12 @@
+import list;
+trait Shape { fn area(self: Shape): int; }
+struct Sq impl Shape { pub s: int, pub fn area(self: Sq): int { return self.s * self.s; } }
+struct Rect impl Shape { pub w: int, pub h: int, pub fn area(self: Rect): int { return self.w * self.h; } }
+fn main(): void {
+  let shapes = List<Shape>();
+  shapes.push(Sq{ s: 3 });
+  shapes.push(Rect{ w: 2, h: 5 });
+  let total = 0;
+  for (sh in shapes) { total = total + sh.area(); }
+  console.log(`total=${total}`);
+}

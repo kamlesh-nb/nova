@@ -1,0 +1,11 @@
+import list;
+fn main(): void {
+  let grid = List<List<int>>();
+  let row = List<int>(); row.push(1); row.push(2);
+  grid.push(row);
+  let row2 = List<int>(); row2.push(3); row2.push(4);
+  grid.push(row2);
+  let sum = 0;
+  for (r in grid) { for (v in r) { sum = sum + v; } }
+  console.log(`sum=${sum}`);
+}

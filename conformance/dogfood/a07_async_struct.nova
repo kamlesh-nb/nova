@@ -1,0 +1,4 @@
+struct Res { pub v: int, init(v: int){ self.v = v; } }
+async fn fetch(n: int): Res { return Res(n * 3); }
+async fn run(): int { let r = await fetch(7); return r.v; }
+fn main(): void { console.log(`${run()}`); }

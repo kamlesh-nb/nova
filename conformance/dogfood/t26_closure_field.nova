@@ -1,0 +1,5 @@
+struct Handler { pub fn0: (int) -> int, init(f: (int) -> int){ self.fn0 = f; } }
+fn main(): void {
+  let h = Handler((x) => x * 10);
+  console.log(`${h.fn0(5)}`);
+}

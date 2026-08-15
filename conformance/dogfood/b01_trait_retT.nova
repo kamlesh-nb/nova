@@ -1,0 +1,7 @@
+trait Doubler { fn go(self: Doubler): int; }
+struct Cell<T> impl Doubler {
+  pub v: T,
+  init(v: T){ self.v = v; }
+  pub fn go(self: Cell<T>): int { return 1; }
+}
+fn main(): void { let c = Cell<int>{ v: 5 }; let d: Doubler = c; console.log(`${d.go()}`); }

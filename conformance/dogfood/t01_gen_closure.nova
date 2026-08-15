@@ -1,0 +1,9 @@
+import list;
+fn apply<T>(x: T, f: (T) -> T): T { return f(x); }
+fn main(): void {
+  let xs = List<int>();
+  for (i in 1..=5) { xs.push(i); }
+  let out = xs.map((n) => n * 3).filter((n) => n > 6).reduce(0, (a, n) => a + n);
+  console.log(`out=${out}`);
+  console.log(`apply=${apply<int>(10, (v) => v + 1)}`);
+}
