@@ -26,10 +26,14 @@ Status legend: TODO (not started), WIP (in progress), DONE. Priority: P0 highest
 | ID | Item | Priority | Status | Notes |
 |----|------|----------|--------|-------|
 | B1 | Methods / `self` params | P0 | DONE | 2026-08-15. `self` is an EXPLICIT params[0] (`fn m(self: T, ...)`), so AST params line up 1:1 with the LLVM args and no shift was needed. The method FunctionInfo sites just were not setting `.params = fn_decl.params` (constructors stay empty, self is synthetic there). Coverage jumped ~1->13 emitted in a sha256 build; the reject dropped from ~99 to ~6 (constructors). Pinned by `341_opt_emit_methods.nova`. Gates: emit 349/350. Class methods emit (heap `self`); value-struct methods and constructors fall back. |
-| B2 | String params / returns / locals | P1 | TODO | Rejected today (not int/bool/heap-struct). |
-| B3 | Float params / returns / locals | P1 | TODO | f32/f64 are excluded from `intKindForTid`. |
-| B4 | Array / pointer params | P2 | TODO | Arrays flow as `ptr`; rejected. |
-| B5 | Value-struct params / returns | P2 | TODO | Today only heap/`class` structs emit (M6-D). Value structs reject. |
+| B2 | String params / returns / locals | P1 | BLOCKED on D1 | 2026-08-15 investigation: strings are ~152 of the param rejects (by far the biggest), BUT a `string` is an ARC-managed heap pointer and retain/release are not threaded into MIR yet (D1). A borrowed string is only sound while it never transfers ownership (no call, struct_new, or field_set) -- and EVERY useful string op (`.length()`, `==`, concat) is a call, so a sound pre-D1 gate emits +1 function (measured on a sha256 build). Not worth a gate that will be reworked at D1. Do D1 first, then strings gate on real retain/release ops. |
+| B3 | Float params / returns / locals | P2 | TODO | f32/f64 excluded from `intKindForTid`. SOUND (no ARC) but needs float arithmetic ops (fadd/fmul/fcmp + i64<->double bitcasts) in the emit path. Low value: negligible in the measured builds. |
+| B4 | Array / pointer params | P2 | TODO | Arrays flow as `ptr` (not the i64 word), and array use needs C3 (index). Low value in the measured builds. |
+| B5 | Value-struct params / returns | P2 | TODO | Only heap/`class` structs emit (M6-D). Plain (scalar-field) value structs are SOUND (no ARC) but need by-value ABI + inline field access. Low value in the measured builds. |
+
+**B-group finding (2026-08-15):** the dominant lever (B2 strings) is ARC-blocked; B3/B4/B5 are sound but
+low-value. So the productive next step is **D1 (thread ARC into HIR/MIR)**, which unblocks strings *and*
+activates arc-elision (the perf win). Re-sequenced: D1 before the rest of B.
 | B6 | Optional (`T \| undefined`) params / returns | P2 | TODO | Deliberately rejected at the type-ref level (concreteTidForTypeRef strips the optional). |
 | B7 | Error-union (`T \| E`) returns | P2 | TODO | Not encoded yet. |
 | B8 | `>16` params | P3 | TODO | Minor fixed-buffer cap in `tryEmitInner`. |
