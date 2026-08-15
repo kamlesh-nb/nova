@@ -31,6 +31,27 @@ sub-items (whole-program MIR, async coroutines) are genuine multi-week rearchite
 
 ---
 
+## ⚠️ HONEST REALITY CHECK (2026-08-16) — the optimiser currently delivers ~0 optimisation
+
+The whole LLVM module gets `default<O3>` + loop/SLP vectorization in RELEASE (declarations.zig:1337),
+whether a function came from the AST path OR the emit path. Consequences, stated plainly:
+
+1. The Nova optimiser's generic passes — mem2reg, constfold, copyprop, dce, inline, simplifycfg — are
+   REDUNDANT with LLVM O3, which does all of them (plus GVN/LICM/vectorization) on the final module. They
+   change NOTHING about the shipped binary.
+2. The ONLY thing the Nova optimiser can do that LLVM cannot is ARC ELISION (LLVM sees nova_retain/
+   nova_release as opaque calls). That is the sole non-redundant pass, and it fires 0x (measured, 0/44).
+3. So for the ~10-12% that "emit", the optimiser produces code LLVM O3 optimises IDENTICALLY to the AST
+   path — the differential test proves the outputs are byte-identical. There is no observable difference
+   between "emitted via optimiser" and "fell back to AST".
+
+**Net realized optimisation today = 0.** The emit path is an alternative front-end lowering, not an
+optimiser-in-effect. Expanding coverage (B6/B7/closures/async) only widens a path that currently buys
+nothing. The ONLY route to real perf is the ARC-semantic moves LLVM can't do — arc_elision firing +
+borrow-skip + release-sink — which are dormant/unbuilt. Any future "optimiser" work should LEAD with
+making those fire and measuring a real delta (E2), NOT with coverage. Coverage without a working
+ARC-semantic pass is motion without progress on the actual goal (perf).
+
 ## 0. REMAINING ITEMS — GRANULAR CHECKLIST (every small item left in gap 3)
 
 Exhaustive, small-grain list of what is left to make the optimiser emit path complete + perf-positive.
