@@ -211,6 +211,25 @@ NOVA_SEMA_SHADOW=1 conformance/run.sh            # every case must print td_disa
 NOVA_ASAN=1 zig build && conformance/run.sh --asan   # green ASAN corpus is the ONLY go signal
 ```
 
+## PROGRESS 2026-08-15 (this session)
+
+- **Slice A (05dae86):** restored the blind `string-typedecision-lint` (was grepping the pre-reorg path,
+  false green; true count 51, re-baselined). See below.
+- **Slice B (5d3341b):** `resolveExpressionTypeName`'s PRODUCTION path is now TypeId-only. The erased-body
+  fallback returned `substTypeParams(renderLegacy(t))`; a corpus sweep (`NOVA_RESOLVE_FALLBACK`, 230
+  samples, 0 DIFF) proved it is always a bare type-param there and `substTypeParams` is an identity, so it
+  now renders the TypeId directly. `substTypeParams` survives only under the census baseline. Verified:
+  14/14 generic/dtor/stdlib guard cases, shadow MUST-be-0 invariants all 0, 10/10 ASAN-clean.
+- **Slices C/D BLOCKER pinned in code (declarations.zig:884):** the compiler already SKIPS unused erased
+  generic bodies — `if (func.erased_generic and !is_rawbuf_backing and LLVMGetFirstUse(fn_val) == null)
+  continue;`. It still emits (a) `is_rawbuf_backing` RawBuffer intrinsics and (b) erased bodies that HAVE
+  uses. Those two are load-bearing and are exactly what the string fallback (`erasedOwnershipDefault`,
+  the struct-T `substituteFieldType` dtor path) serves. So "delete the string engine" is NOT mechanical:
+  it requires proving every used-erased body + RawBuffer intrinsic is safe to resolve via TypeId or drop,
+  a multi-day change with soundness risk, gated behind full corpus+ASAN. This is the genuine design fork,
+  now grounded in the code rather than a doc guess. **erasedOwnershipDefault is irreducible by a TypeId
+  engine by construction** (it fires only when a name has NO TypeId — a bare type-param in an erased body).
+
 There is a THIRD, cheaper ratchet gate that runs in `gate.sh`:
 
 ```bash
