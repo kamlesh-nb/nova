@@ -1,5 +1,17 @@
 # Gap analysis: completing the Nova optimiser EMIT PATH
 
+> **2026-08-16 empirical measurement (build path, `NOVA_OPT=1`):** on `03_strings` the shadow lowers
+> **100% of HIR** (5150 nodes), the pipeline removes **895 insts** (mem2reg/constfold/copyprop/dce) and
+> inlines **7 calls**, but **`arc_elision` removes 0 of 44 threaded ARC ops** — confirmed firing 0x, and
+> NOT stale: the ARC threading is already tight (no balanced-adjacent retain/release pairs to cancel), so
+> local cancellation finds nothing. Realizable ARC perf needs the **unbuilt** borrow-skip / release-sink
+> moves, not this pass. Callee resolution is **45.5%** (65/143), which caps inlining. The 895 removals are
+> real optimisation but live only in the SHADOW; the emit path that would REALISE them covers ~10-12% of
+> functions and is off by default (E1). **Honest conclusion: gap 3 has no safe, bounded, in-session-
+> verifiable slice** — every lever (value-optional/error-union/closure/async coverage; borrow-skip perf;
+> default-on flip) is multi-day AND needs a full `--asan` corpus to land safely. It is a dedicated multi-
+> session effort, not a quick win. This is the one gap where the honest answer is "scope it, don't slice it."
+
 Scope: the `NOVA_OPT_EMIT` LIR to LLVM emit path (`src/optimiser/*`, `src/optimiser/passes/*`,
 `src/backend/codegen/lir_emit.zig`). Verified against code and live repros on 2026-08-15, working dir
 `/Users/kamlesh/nova-lang/lang`. The status table read is `docs/design/optimiser-pending.md`; the design
