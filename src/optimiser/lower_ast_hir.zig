@@ -46,6 +46,7 @@ const Ctx = struct {
     scopes: std.ArrayListUnmanaged(Scope) = .empty, // lexical scope stack; each holds owned local names
     owned: std.StringHashMapUnmanaged(hir.TypeId) = .empty, // in-scope owned local name -> TypeId (lets the emit path gate ARC ops by type; unset_ty when sema could not type it)
     loop_depths: std.ArrayListUnmanaged(usize) = .empty, // scope-stack depth at each enclosing loop
+    tmp_ctr: usize = 0, // fresh-name counter for synthesised locals (e.g. a switch discriminant temp)
 
     fn deinit(self: *Ctx) void {
         for (self.scopes.items) |*s| s.deinit(self.allocator);
@@ -224,6 +225,7 @@ fn lowerStmt(ctx: *Ctx, ids: *std.ArrayListUnmanaged(HirId), stmt: ast.Statement
             try ctx.releaseScopesDownTo(ids, loop_depth, null);
             try ids.append(a, try func.add(a, .{ .kind = .cont, .span = cs.span }));
         },
+        .switch_stmt => |ss| try lowerSwitch(ctx, ids, ss),
         else => try ids.append(a, try func.add(a, .{ .kind = .{ .unsupported = @tagName(stmt) }, .span = zeroSpan() })),
     }
 }
@@ -243,6 +245,60 @@ fn lowerStmtAsBlock(ctx: *Ctx, stmt: ast.Statement) anyerror!hir.Block {
         try ctx.popScopeReleases(&ids);
     }
     return hir.Block{ .nodes = try ctx.allocator.dupe(HirId, ids.items) };
+}
+
+// Desugar a `switch` to an if-chain: bind the discriminant once (it may have side effects), then for each
+// case test `disc == v0 | disc == v1 | ...` (a side-effect-free OR of eq compares, so bit_or of the bool
+// words is exact and needs no short-circuit) and run its body, falling through to the default otherwise.
+// A GUARDED case (`case v if cond`) has fall-to-default-on-guard-false semantics that this desugaring does
+// not model, so a switch with any guard lowers to `.unsupported` (the emit path falls back to the AST).
+fn lowerSwitch(ctx: *Ctx, ids: *std.ArrayListUnmanaged(HirId), ss: ast.SwitchStmt) anyerror!void {
+    const a = ctx.allocator;
+    const func = ctx.func;
+    for (ss.cases) |c| if (c.guard != null) {
+        try ids.append(a, try func.add(a, .{ .kind = .{ .unsupported = "switch_guard" }, .span = ss.span }));
+        return;
+    };
+
+    // Bind the discriminant once. Thread its TypeId onto the references below so the `disc == v` compares can
+    // prove an integer kind (an untyped ident load would make the emit path reject the whole function).
+    const dty: hir.TypeId = if (ctx.ir) |ir| (ir.typeOf(&ss.discriminant) orelse hir.unset_ty) else hir.unset_ty;
+    const disc_v = try lowerExpr(ctx, ss.discriminant);
+    const nm = try std.fmt.allocPrint(a, "__sw{d}", .{ctx.tmp_ctr});
+    ctx.tmp_ctr += 1;
+    const dname = try func.internName(a, nm);
+    try ids.append(a, try func.add(a, .{ .kind = .{ .let = .{ .name = dname, .value = disc_v } }, .span = ss.span }));
+
+    // else-of-the-chain starts as the default body (or empty).
+    var else_block: hir.Block = if (ss.default_case) |d| try lowerStmtAsBlock(ctx, d.*) else hir.Block{};
+
+    // Build the chain from the LAST case to the FIRST, nesting each into the running else block.
+    var i: usize = ss.cases.len;
+    while (i > 0) {
+        i -= 1;
+        const c = ss.cases[i];
+        // cond = OR over the case values of `disc == value`.
+        var cond: ?HirId = null;
+        for (c.values) |cv| {
+            const disc_ref = try func.add(a, .{ .kind = .{ .ident = dname }, .ty = dty, .span = ss.span });
+            const val_id = try lowerExpr(ctx, cv);
+            // Stamp the eq/bit_or results with the discriminant type: their VALUE is 0/1, and typing them as
+            // the (int/bool) discriminant type lets the emit path's bit_or/branch gates accept them (an untyped
+            // result would be rejected). The OR of eq compares is exact + side-effect-free, so no short-circuit.
+            const eq = try func.add(a, .{ .kind = .{ .binop = .{ .op = .eq, .lhs = disc_ref, .rhs = val_id } }, .ty = dty, .span = ss.span });
+            cond = if (cond) |prev|
+                try func.add(a, .{ .kind = .{ .binop = .{ .op = .bit_or, .lhs = prev, .rhs = eq } }, .ty = dty, .span = ss.span })
+            else
+                eq;
+        }
+        const then_block = try lowerStmtAsBlock(ctx, c.body.*);
+        const if_id = try func.add(a, .{ .kind = .{ .if_ = .{ .cond = cond orelse unreachable, .then = then_block, .else_ = else_block } }, .span = ss.span });
+        else_block = hir.Block{ .nodes = try a.dupe(HirId, &.{if_id}) };
+    }
+
+    // Emit the head of the chain (each case's if node lives inside `else_block`). The block slice itself is
+    // not freed here -- like the other `lowerStmtAsBlock` blocks stored in if_ nodes, it lives with the func.
+    for (else_block.nodes) |n| try ids.append(a, n);
 }
 
 fn lowerExpr(ctx: *Ctx, expr: ast.Expression) anyerror!HirId {

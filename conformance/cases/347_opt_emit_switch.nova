@@ -1,0 +1,36 @@
+// Emit-subset growth (C1): a `switch` on an integer discriminant now emits. lower_ast_hir desugars it to an
+// if-chain -- the discriminant is bound once, each case tests `disc == v0 | disc == v1 | ...` (an OR of eq
+// compares, which are side-effect-free so no short-circuit is needed) and runs its body, falling through to
+// the default otherwise. A GUARDED case (`case v if cond`) has fall-to-default-on-guard-false semantics this
+// desugaring does not model, so a guarded switch falls back to the AST. Under NOVA_OPT_EMIT these helpers
+// compile from the emit path; both must agree.
+import assert;
+
+fn classify(x: int): int {
+    switch (x) {
+        case 0: { return 100; }
+        case 1, 2, 3: { return 200; }
+        case 4: { return 400; }
+        default: { return -1; }
+    }
+    return -999;
+}
+
+fn parity(x: int): int {
+    switch (x % 2) {
+        case 0: { return 1; }
+        default: { return 0; }
+    }
+    return -1;
+}
+
+@test
+fn test_switch(): void {
+    assert.equalInt(classify(0), 100);
+    assert.equalInt(classify(2), 200);
+    assert.equalInt(classify(3), 200);
+    assert.equalInt(classify(4), 400);
+    assert.equalInt(classify(9), -1);
+    assert.equalInt(parity(6), 1);
+    assert.equalInt(parity(7), 0);
+}

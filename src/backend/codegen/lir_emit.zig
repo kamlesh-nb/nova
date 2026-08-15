@@ -63,8 +63,8 @@ fn tryEmitInner(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, func: anyty
     // or a heap struct/class (its address). Arrays (-> ptr), floats, strings, unsigned, value structs are
     // rejected.
     if (func.params.len != func.param_count) return reject("param count mismatch (method/self?)");
-    if (func.params.len > 16) return reject("too many params");
-    var ptbuf: [16]mir.TypeId = undefined;
+    if (func.params.len > 32) return reject("too many params (>32)");
+    var ptbuf: [32]mir.TypeId = undefined;
     for (func.params, 0..) |p, i| {
         const tr = p.type_name orelse return reject("untyped param");
         // An OPTIONAL param (`T | undefined`) is boxed/encoded specially and concreteTidForTypeRef strips
@@ -221,7 +221,7 @@ fn resolveCallee(compiler: *LlvmCompiler, name: []const u8, nargs: usize) ?Calle
     if (core.LLVMCountParamTypes(fn_type) != @as(c_uint, @intCast(nargs))) return null;
     const vt = compiler.val_type;
     if (nargs > 0) {
-        var ptypes: [16]types.LLVMTypeRef = undefined;
+        var ptypes: [32]types.LLVMTypeRef = undefined;
         if (nargs > ptypes.len) return null;
         core.LLVMGetParamTypes(fn_type, &ptypes);
         for (ptypes[0..nargs]) |pt| if (pt != vt) return null;
@@ -577,7 +577,7 @@ fn emitInst(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, inst: mir.Inst,
         .call => |x| blk: {
             const nm = x.name orelse return error.Unemittable;
             const c = resolveCallee(compiler, nm, x.args.len) orelse return error.Unemittable;
-            var argbuf: [16]types.LLVMValueRef = undefined;
+            var argbuf: [32]types.LLVMValueRef = undefined;
             if (x.args.len > argbuf.len) return error.Unemittable;
             for (x.args, 0..) |arg, i| argbuf[i] = vals[@intFromEnum(arg)] orelse return error.Unemittable;
             const call = core.LLVMBuildCall2(compiler.builder, c.fn_type, c.fn_val, &argbuf, @intCast(x.args.len), "");
