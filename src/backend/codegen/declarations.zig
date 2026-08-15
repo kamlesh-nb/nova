@@ -7,7 +7,6 @@ const getStructBaseName = @import("types.zig").getStructBaseName;
 const llvm = @import("llvm");
 const types = llvm.types;
 const core = llvm.core;
-const lir_emit = @import("lir_emit.zig");
 const analysis = llvm.analysis;
 const target_machine = llvm.target_machine;
 const transform = llvm.transform;
@@ -963,13 +962,9 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         const entry_bb = core.LLVMAppendBasicBlock(fn_val, "entry");
         core.LLVMPositionBuilderAtEnd(compiler.builder, entry_bb);
 
-        // Emit-path (NOVA_OPT_EMIT): for a function in the emittable subset, emit its body from the
-        // optimiser IR (so ARC-elision/inlining/const-fold reach the binary) and skip the AST body. A
-        // per-function fallback: tryEmit returns false for anything it cannot prove correct, and the AST
-        // path below runs unchanged. See lir_emit.zig.
-        if (lir_emit.emit_enabled and lir_emit.tryEmit(&compiler, fn_val, func)) {
-            continue;
-        }
+        // (The HIR/MIR/LIR LLVM-emit optimiser was scrapped 2026-08-16 -- it delivered ~0 optimisation over
+        // AST+LLVM O3; see docs/design/sil-arc-optimiser-direction.md. Every function is compiled from the
+        // AST below, as it always effectively was.)
 
         {
             var iter = compiler.current_saved_captures.iterator();

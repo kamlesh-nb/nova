@@ -62,7 +62,7 @@ pub const FunctionInfo = struct {
     body: ast.Block,
     // The declared parameters (free functions only; left empty for methods, whose implicit `self` shifts the
     // argument indices). The optimiser emit path uses this to model params; empty => it treats the function
-    // as paramless-or-unmodelled and falls back. See lir_emit.zig.
+    // as unmodelled and compiles from the AST.
     params: []const ast.Param = &.{},
 
     is_async: bool = false,
@@ -3009,7 +3009,7 @@ pub const LlvmCompiler = struct {
                                     // AST params line up 1:1 with the LLVM arguments (self at index 0) and the
                                     // optimiser emit path can model them. A constructor's `self` is synthetic
                                     // (prepended above, not in fn_decl.params), so leave params empty -> the emit
-                                    // path sees the count mismatch and falls back. See lir_emit.zig.
+                                    // path sees the count mismatch and falls back.
                                     .params = if (is_constructor) &.{} else fn_decl.params,
                                     .is_async = fn_decl.is_async,
                                     .instantiation = inst_opt,
@@ -3030,7 +3030,7 @@ pub const LlvmCompiler = struct {
                                 .body = fn_decl.body,
                                 // Non-constructor method: `self` is an explicit params[0], so params line up 1:1
                                 // with the LLVM arguments and the emit path can model them. Constructor `self` is
-                                // synthetic -> leave empty so the emit path falls back. See lir_emit.zig.
+                                // synthetic -> leave empty so the emit path falls back.
                                 .params = if (is_constructor) &.{} else fn_decl.params,
                                 .is_async = fn_decl.is_async,
                                 .instantiation = inst_opt,

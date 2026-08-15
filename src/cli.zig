@@ -15,20 +15,9 @@ const format = @import("format.zig");
 const packages = @import("packages.zig");
 const builder = @import("builder.zig");
 
-// Middle-end (M0 scaffold): dormant. `enabled` is false, so `run` never fires and codegen keeps its AST
-// path. Referenced here so the exe build compiles the optimiser tree on the real path. See
-// docs/design/optimiser.md; the rollout wires this into builder.zig between sema and codegen.
-const optimiser = @import("optimiser/driver.zig");
+// (HIR/MIR/LIR LLVM-emit optimiser scrapped 2026-08-16; see docs/design/sil-arc-optimiser-direction.md.)
 
 pub fn run(init: std.process.Init) !void {
-    // Force the exe build to compile the whole optimiser tree (IR + passes + lowering + verifier), even
-    // though the middle-end is dormant at M0. No runtime cost: the comptime block only references decls.
-    comptime {
-        _ = optimiser.pipeline;
-        _ = &optimiser.optimise;
-    }
-    if (optimiser.enabled) optimiser.run();
-
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();

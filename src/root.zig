@@ -44,11 +44,5 @@ test {
     _ = @import("frontend/ast.zig");
     _ = @import("frontend/formatter.zig");
 
-    // Middle-end (M0-M5): force full analysis of the optimiser IR + pass registry (refAllDecls, not a
-    // bare import -- Zig lazily skips unreferenced decls) even though it is not yet on the compile critical
-    // path. See docs/design/optimiser.md.
-    std.testing.refAllDeclsRecursive(@import("optimiser/driver.zig"));
-    // Files with their own `test` blocks must be listed so the harness runs them (see the guard below).
-    _ = @import("optimiser/passes/arc_elision.zig");
-    _ = @import("optimiser/passes/inline.zig");
+    // (HIR/MIR/LIR LLVM-emit optimiser scrapped 2026-08-16; see docs/design/sil-arc-optimiser-direction.md.)
 }
