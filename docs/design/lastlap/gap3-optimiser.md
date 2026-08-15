@@ -31,6 +31,96 @@ sub-items (whole-program MIR, async coroutines) are genuine multi-week rearchite
 
 ---
 
+## 0. REMAINING ITEMS — GRANULAR CHECKLIST (every small item left in gap 3)
+
+Exhaustive, small-grain list of what is left to make the optimiser emit path complete + perf-positive.
+`[x]` done/verified, `[~]` partial (some sub-cases emit), `[ ]` not started. Grouped by area; each line is
+one landable, differential+ASAN-gated slice. Ordered roughly by dependency, not priority.
+
+### B6 — value-optional emit (ACTIVE, multi-session #193)
+- [x] valopt_box / valopt_unbox MIR ops + operand/effect/rewrite/lower-LIR/inline switches (bcfe63e)
+- [x] valopt_box / valopt_unbox LLVM emit arms (call nova_valopt_box/unbox) (bcfe63e)
+- [x] value-optional RETURN of a scalar int/bool: box at `.ret`, undefined stays null, no double-box (f14f793)
+- [ ] value-optional RETURN of a **float/double** (f32/f64 bits in the word) — op gate currently int/bool only
+- [ ] value-optional **PARAM**: unbox on read inside the body (valopt_unbox at each param use)
+- [ ] value-optional **call ARGUMENT**: box at the call site when the callee param is value-optional (the
+      `f(undefined)` present-0-as-absent hazard — the single riskiest B6 slice; today `callTargetsValueOptionalParam` rejects)
+- [ ] value-optional **LOCAL** (`let y: int|undefined = ...`): box on store, unbox on read, scope-end release of the box
+- [ ] admit `.undefined` / `.null` literal in hirEmittable ONLY in value-optional context (currently whole-function reject)
+- [ ] **narrowing**: `if (x != undefined) { ...x... }` — flow-sensitive unbox of the narrowed variable
+- [ ] value-optional of a **value-struct** (inner larger than the 8-byte word box) — different ABI than scalar box
+- [ ] nested value-optional (the error-union ok arm — shared with B7)
+- [ ] drop the `optional param` / `optional return` fallbacks fully once the above hold; re-gate hardening
+
+### B5 — value-struct signatures (PARTIAL)
+- [~] value-struct read / construct / mutate / return already emit (string fields via D3)
+- [ ] value-struct **params** (by-value struct argument ABI)
+- [ ] value-struct **methods** (value `self`) — currently fall back (only class/heap `self` emits)
+- [ ] **constructors** (the 547 "param count mismatch" rejects: `params=&.{}`, `param_count=len+1`) — allocate + init self
+- [ ] value-struct with **non-string owned fields** (needs the D3 owned-field ARC beyond strings)
+
+### B7 — error-union `T | E` + C7 try/errdefer (FALLBACK; depends on B6)
+- [ ] `errunion_box {tag, payload}` MIR op — 16-byte tagged ARC box {tag@0, payload@8}
+- [ ] error-union RETURN: build the box (ok arm is nested value-optional-boxed → needs B6 box)
+- [ ] error-union **param**
+- [ ] `try_` real propagating lowering (today a passthrough `lowerNode(operand)` at lower_hir_mir.zig:249)
+- [ ] `errdefer` HIR lowering — scope-keyed deferred-node list, error-path-only, LIFO (today `unsupported`)
+- [ ] tag-branch CFG at emit (load tag@0, branch, run errdefers on error, unbox payload on ok)
+- [ ] `__destruct_ErrUnion_*` retain-into-box + release-by-tag threading
+- [ ] `catch` / `??`-on-error unbox paths
+- [ ] `try` inside loops / nested scopes
+
+### C — remaining body constructs
+- [~] C4 `optional_chain` `a?.b`: nullish `??` emits for REF optionals only
+- [ ] C4 optional-chain on a **value-field** `a?.b` (boxed value optional — depends on B6)
+- [ ] C4 optional-chain on a **reference field** (the chain itself, not just `??`)
+- [~] C5: `for`, payloadless enum, scalar tuple, all-string template already emit
+- [ ] C5 enum **with payload** (multi-payload enum construct/match)
+- [ ] C5 **non-scalar tuple** (owned/float element)
+- [ ] C5 **non-string template** part (int/float/optional/decimal → needs type-dispatched append + release)
+- [ ] C5 `range` as a first-class value
+- [ ] C6 **closures** — needs whole-program MIR (Blocker A) + `closure_new {fn_sym, captures[]}` op + lambda
+      discovery + capture-set materialisation into a lambda MIR func
+- [ ] B3 **decimal** params/returns/locals (falls back today)
+- [ ] float **arrays / fields**, float **mod/shift/bitwise** (scalar-only float gates today)
+
+### D — ARC + async + passes
+- [~] D5 sync trait dispatch emits (self-only, scalar result)
+- [ ] D5 trait dispatch with **extra args** and **non-scalar return** (void/string/struct)
+- [ ] D5-async: `await_` / `spawn_` — LLVM coroutine lowering (coro.id/begin/suspend/end, frame, resume/destroy)
+      — MULTI-WEEK, highest risk, least tractable
+- [ ] D6 **arc_elision actually fires**: needs the UNBUILT borrow-skip move (elide retain/release around a
+      value that is only BORROWED between them) — measured 0/44 today because threading is already tight
+- [ ] D6 **release-sink** move (sink a release past non-consuming uses)
+- [ ] D7 **inline pass activation** — BLOCKED on whole-program MIR; transform already written + unit-tested,
+      just needs the SymbolId→mir.Func callee map (the most tractable Blocker-A payoff)
+- [ ] D4 returned heap-struct **BORROW** (`return p` / `return aLocal`) — needs struct-destructor ARC threading
+      (today only FRESH construction returns emit)
+
+### Blocker A — whole-program MIR (gates closures + inline)
+- [ ] Move the emit decision out of the per-decl loop into a pre-pass that lowers ALL fns to a keyed table
+- [ ] Preserve / re-establish each function's codegen context (typed_ir, type_store, constants, live_sema,
+      builder position) when emitting from the table — the emit is NOT context-free today
+- [ ] Discover + lower **lambdas** (synthesised during codegen, not in program.declarations)
+- [ ] Verify monomorphised method/generic instances key cleanly into the SymbolId table
+- [ ] Confirm emitting out of declaration order breaks no forward-reference assumption
+
+### Cross-cutting / perf-realisation
+- [ ] **Callee resolution 45.5% → higher** (65/143): more resolved callees ⇒ more inlining ⇒ realised perf
+- [ ] Full ARC threading beyond strings (D3 owned-field for list/nested-struct/error-union releases)
+
+### E — rollout / meta
+- [ ] E1 **default-on flip** (`driver.zig:235` + builder/tester env) — gated on coverage being high enough to
+      buy real perf (today ~10-12% ⇒ ~0 gain, so premature)
+- [ ] E2 measure actual perf once default-on (informational)
+- [ ] E3 retire the M0-M5 shadow scaffolding (destructive; only after emit is the sole path)
+- [ ] E4 Windows / wasm emit validation (off-default today)
+
+### Definition of "gap 3 DONE"
+Emit path is default-on (E1), covers the whole language (all B/C/D items above `[x]`), the arc_elision +
+borrow-skip + inline passes fire and E2 shows a measured perf win over the AST backend, and the shadow
+scaffolding is retired (E3). Until then it is a correctness-preserving partial accelerator, off by default.
+
 ## 1. Gap (verified)
 
 ### What the emit path IS
