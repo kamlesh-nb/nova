@@ -100,9 +100,20 @@ pub const Func = struct {
     inst: ?TypeId = null,
     nodes: std.ArrayListUnmanaged(Node) = .empty,
     entry: Block = .{},
+    // Synthesised strings the lowering had to allocate (e.g. a `string_<method>` callee name for a method
+    // call, which is not a slice into the AST). Owned here so they outlive lowering + emit and are freed once.
+    owned_strings: std.ArrayListUnmanaged([]u8) = .empty,
 
     pub fn deinit(self: *Func, allocator: std.mem.Allocator) void {
+        for (self.owned_strings.items) |s| allocator.free(s);
+        self.owned_strings.deinit(allocator);
         self.nodes.deinit(allocator);
+    }
+
+    // Intern a heap-allocated name owned by this Func (freed in deinit). Returns a stable slice.
+    pub fn internName(self: *Func, allocator: std.mem.Allocator, name: []u8) ![]const u8 {
+        try self.owned_strings.append(allocator, name);
+        return name;
     }
 
     // Append a node and return its id.

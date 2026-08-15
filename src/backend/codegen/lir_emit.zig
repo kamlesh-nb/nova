@@ -73,7 +73,11 @@ fn tryEmitInner(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, func: anyty
         if (tr == .optional) return reject("optional param");
         const ptid = compiler.concreteTidForTypeRef(tr) orelse return reject("unresolved param type");
         const scalar_ok = if (intKindForTid(compiler, ptid)) |pk| (pk.signed or pk.is_bool) else false;
-        if (!scalar_ok and !emittableHeapStructTid(compiler, ptid)) return reject("param not int/bool/heap-struct");
+        // A string param flows as the i64 pointer word like a class param. It is BORROWED, so read-only use
+        // (via string_* method calls, now named by C0) needs no ARC; an owned string LOCAL created in the body
+        // gets its scope-end release from the threaded ARC ops (D2). Capturing a string into a struct field is
+        // blocked by the field gates (string fields are non-scalar); returning a string is blocked below.
+        if (!scalar_ok and !emittableHeapStructTid(compiler, ptid) and !isStringTid(compiler, ptid)) return reject("param not int/bool/heap-struct/string");
         ptbuf[i] = ptid;
     }
     const param_types = ptbuf[0..func.params.len];
@@ -104,6 +108,9 @@ fn tryEmitInner(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, func: anyty
         .attributes = &.{},
         .span = func.body.span,
     };
+    // Set the sema store BEFORE lowering: AST->HIR needs it too now (lower_ast_hir's C0 method-call naming
+    // resolves the receiver type via mir.type_store), not only constfold below.
+    mir.type_store = compiler.type_store;
     var hfunc = try lower_ast_hir.lowerFuncTyped(compiler.allocator, fd, ir, param_types);
     defer hfunc.deinit(compiler.allocator);
     if (!hirEmittable(&hfunc)) return reject("non-emittable HIR node");
@@ -139,7 +146,9 @@ fn hirEmittable(hf: *const hir.Func) bool {
             // direct calls (M6-C): validated + emitted from the MIR call op (callee resolved by name)
             .call, .generic_call,
             // structs (M6-D): construction + field read/write, validated + emitted from struct_new/field_*
-            .struct_init, .field => {},
+            .struct_init, .field,
+            // ARC (D2): retain/release threaded by lower_ast_hir; mirEmittable gates them to string operands.
+            .retain, .release => {},
             else => {
                 if (emit_verbose) std.debug.print("[opt-emit]   non-emittable node: {s}\n", .{@tagName(node.kind)});
                 return false; // str/float/null/call/struct_init/cast/... -> fall back
@@ -198,6 +207,15 @@ fn resolveCallee(compiler: *LlvmCompiler, name: []const u8, nargs: usize) ?Calle
     const ret = core.LLVMGetReturnType(fn_type);
     if (ret != vt and ret != compiler.void_type) return null;
     return .{ .fn_val = fn_val, .fn_type = fn_type };
+}
+
+// True if `tid` is the `string` primitive. A string is an ARC-managed heap pointer that flows as the i64
+// word like a class param, but its release needs no destructor (single allocation, no nested owned fields),
+// so it is the one owned type the D1/D2 ARC slice can emit (retain/release with a null dtor).
+fn isStringTid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
+    const st = compiler.type_store orelse return false;
+    if (tid == mir.unset_ty or @intFromEnum(tid) >= st.count()) return false;
+    return st.get(tid) == .string;
 }
 
 // The declared base name of the struct/class a value holds (via its threaded TypeId), or null if the value
@@ -301,8 +319,15 @@ fn mirEmittable(compiler: *LlvmCompiler, mf: *const mir.Func) bool {
                     if (!compiler.constants.contains(name)) return false;
                     if (intKindForTid(compiler, inst.ty) == null) return false;
                 },
+                // ARC (D2): retain/release are emittable ONLY on a `string` operand -- a single heap
+                // allocation whose release needs no destructor (null dtor). Any other owned type (structs,
+                // lists, error unions) needs a real `__destruct_*` we do not resolve yet -> reject the whole
+                // function. Capturing a string into a struct field is separately blocked by the field gates
+                // (a string field is non-scalar).
+                .retain => |x| if (!isStringTid(compiler, mf.typeOf(x.val))) return false,
+                .release => |x| if (!isStringTid(compiler, mf.typeOf(x.val))) return false,
                 .const_int, .alloc, .load, .store, .param => {},
-                else => return false, // gep/retain/release/await/spawn/indirect_call -> not yet
+                else => return false, // gep/await/spawn/indirect_call -> not yet
             }
         }
         switch (b.term) {
@@ -399,6 +424,18 @@ fn emitInst(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, inst: mir.Inst,
             const fptr = core.LLVMBuildIntToPtr(compiler.builder, addr, core.LLVMPointerType(flt, 0), "");
             const raw = core.LLVMBuildLoad2(compiler.builder, flt, fptr, "");
             break :blk compiler.castToValType(raw, ftr);
+        },
+        // ARC (D2, strings only -- gated by mirEmittable to string operands). A string is a single heap
+        // allocation with no nested owned fields, so its release needs NO destructor (nova_release(ptr, null)
+        // just decrefs and frees). retain is nova_retain(ptr). These reproduce the AST path's ARC calls;
+        // arc_elision may already have cancelled balanced pairs before we get here.
+        .retain => |x| blk: {
+            try compiler.compileRetain(vals[@intFromEnum(x.val)] orelse return error.Unemittable);
+            break :blk null;
+        },
+        .release => |x| blk: {
+            try compiler.compileRelease(vals[@intFromEnum(x.val)] orelse return error.Unemittable, null);
+            break :blk null;
         },
         // Field write (scalar only in this slice, so no retain-old/release semantics): base + offset, narrow
         // the word to the field type, store.

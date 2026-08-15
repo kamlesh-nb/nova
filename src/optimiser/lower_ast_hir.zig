@@ -15,9 +15,27 @@
 const std = @import("std");
 const ast = @import("../frontend/ast.zig");
 const hir = @import("hir.zig");
+const mir = @import("mir.zig");
 const infer = @import("../frontend/sema/infer.zig");
 
 const HirId = hir.HirId;
+
+// If `fa` is a method access on a STRING receiver (`s.method`), return the mangled callee name
+// `string_<method>` (owned by `func`), else null. This lets the emit path resolve what is otherwise a
+// nameless field-access callee. Scoped to string receivers, whose mangled type name is just `string`; other
+// receivers (generics, user structs) need the general type-name mangling and stay nameless for now.
+fn stringMethodName(ctx: *Ctx, fa: ast.FieldAccess) ?[]const u8 {
+    const ir = ctx.ir orelse return null;
+    const st = mir.type_store orelse return null; // set by the emit path / driver; null in bare shadow
+    const rtid = ir.typeOf(fa.object) orelse return null;
+    if (@intFromEnum(rtid) >= st.count()) return null;
+    if (st.get(rtid) != .string) return null;
+    const nm = std.fmt.allocPrint(ctx.allocator, "string_{s}", .{fa.field}) catch return null;
+    return ctx.func.internName(ctx.allocator, nm) catch {
+        ctx.allocator.free(nm);
+        return null;
+    };
+}
 
 const Scope = std.ArrayListUnmanaged([]const u8);
 
@@ -26,7 +44,7 @@ const Ctx = struct {
     func: *hir.Func,
     ir: ?*const infer.TypedIr,
     scopes: std.ArrayListUnmanaged(Scope) = .empty, // lexical scope stack; each holds owned local names
-    owned: std.StringHashMapUnmanaged(void) = .empty, // all currently in-scope owned local names
+    owned: std.StringHashMapUnmanaged(hir.TypeId) = .empty, // in-scope owned local name -> TypeId (lets the emit path gate ARC ops by type; unset_ty when sema could not type it)
     loop_depths: std.ArrayListUnmanaged(usize) = .empty, // scope-stack depth at each enclosing loop
 
     fn deinit(self: *Ctx) void {
@@ -45,9 +63,9 @@ const Ctx = struct {
         try self.scopes.append(self.allocator, .empty);
     }
 
-    fn declareOwned(self: *Ctx, name: []const u8) !void {
+    fn declareOwned(self: *Ctx, name: []const u8, ty: hir.TypeId) !void {
         try self.scopes.items[self.scopes.items.len - 1].append(self.allocator, name);
-        try self.owned.put(self.allocator, name, {});
+        try self.owned.put(self.allocator, name, ty);
     }
 
     // Emit `release` nodes for the owned locals of the top scope into `ids`, then pop it.
@@ -73,7 +91,10 @@ const Ctx = struct {
     }
 
     fn appendRelease(self: *Ctx, ids: *std.ArrayListUnmanaged(HirId), name: []const u8) !void {
-        const load = try self.func.add(self.allocator, .{ .kind = .{ .ident = name }, .span = zeroSpan() });
+        // Stamp the released value with the owned local's TypeId so HIR->MIR carries it and the emit path can
+        // gate the release by type (only strings, whose dtor is null, are emittable ARC today).
+        const ty = self.owned.get(name) orelse hir.unset_ty;
+        const load = try self.func.add(self.allocator, .{ .kind = .{ .ident = name }, .ty = ty, .span = zeroSpan() });
         const rel = try self.func.add(self.allocator, .{ .kind = .{ .release = load }, .span = zeroSpan() });
         try ids.append(self.allocator, rel);
     }
@@ -158,11 +179,17 @@ fn lowerStmt(ctx: *Ctx, ids: *std.ArrayListUnmanaged(HirId), stmt: ast.Statement
             if (ls.init) |e| {
                 var v = try lowerExpr(ctx, e);
                 const is_copy = e.kind == .ident and ctx.owned.contains(e.kind.ident);
+                // Owned local's TypeId: a copy inherits the copied-from local's type; otherwise the
+                // initialiser's sema type. Threaded so the emit path can gate ARC ops (retain/release) by type.
+                const oty: hir.TypeId = if (is_copy)
+                    (ctx.owned.get(e.kind.ident) orelse hir.unset_ty)
+                else if (ctx.ir) |ir| (ir.typeOf(&e) orelse hir.unset_ty) else hir.unset_ty;
                 if (is_copy) {
+                    func.nodes.items[@intFromEnum(v)].ty = oty; // stamp the retained (copied-from) value too
                     v = try func.add(a, .{ .kind = .{ .retain = v }, .span = ls.span });
                 }
                 value = v;
-                if (ctx.ownedExpr(&e) or is_copy) try ctx.declareOwned(ls.name);
+                if (ctx.ownedExpr(&e) or is_copy) try ctx.declareOwned(ls.name, oty);
             }
             try ids.append(a, try func.add(a, .{ .kind = .{ .let = .{ .name = ls.name, .value = value } }, .span = ls.span }));
         },
@@ -249,9 +276,25 @@ fn lowerExpr(ctx: *Ctx, expr: ast.Expression) anyerror!HirId {
             break :blk try func.add(a, .{ .kind = .{ .unop = .{ .op = mapUnOp(u.op), .operand = operand } }, .span = span });
         },
         .call => |c| blk: {
+            const sym = if (ctx.ir) |ir| ir.symOf(&expr) else null; // resolved callee (emit-path call graph)
+            // Method-call fast path: `recv.method(args)` on a string receiver lowers to a NAMED call
+            // `string_<method>(recv, args...)` -- the receiver becomes the first argument (self), matching the
+            // AST calling convention. A bare field-access callee is nameless and the emit path would reject
+            // it; naming it here is what makes string methods emittable (C0).
+            if (c.callee.kind == .field_access) {
+                if (stringMethodName(ctx, c.callee.kind.field_access)) |mname| {
+                    const recv = try lowerExpr(ctx, c.callee.kind.field_access.object.*);
+                    var args = std.ArrayListUnmanaged(HirId).empty;
+                    defer args.deinit(a);
+                    try args.append(a, recv);
+                    for (c.args) |arg| try args.append(a, try lowerExpr(ctx, arg));
+                    const owned_m = try a.dupe(HirId, args.items);
+                    const callee_ident = try func.add(a, .{ .kind = .{ .ident = mname }, .span = span });
+                    break :blk try func.add(a, .{ .kind = .{ .call = .{ .callee = callee_ident, .args = owned_m, .sym = sym } }, .span = span });
+                }
+            }
             const callee = try lowerExpr(ctx, c.callee.*);
             const owned = try lowerExprSlice(ctx, c.args);
-            const sym = if (ctx.ir) |ir| ir.symOf(&expr) else null; // resolved callee (emit-path call graph)
             break :blk try func.add(a, .{ .kind = .{ .call = .{ .callee = callee, .args = owned, .sym = sym } }, .span = span });
         },
         .field_access => |fa| blk: {
