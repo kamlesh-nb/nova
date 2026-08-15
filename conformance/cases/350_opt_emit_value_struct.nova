@@ -1,9 +1,9 @@
-// Emit-subset growth (B5, read + construct): a value `struct` flows as the address of its inline bytes (no
-// ARC header), so field READS are `base + offset` + load exactly like a heap struct, and CONSTRUCTION uses
-// an inline stack alloca (buildValueStructStorage). This lets functions that build a value struct locally and
-// read its fields, or take a value-struct param and read it, compile from the optimised IR. A value struct
-// that would ESCAPE (returned, or stored into a heap field) is rejected by the return / field gates, so its
-// stack storage cannot outlive the function; field WRITES (mutation) still fall back (value-semantics ABI).
+// Emit-subset growth (B5, read + construct + mutate): a value `struct` flows as the address of its inline
+// bytes (no ARC header), so field READS are `base + offset` + load exactly like a heap struct, CONSTRUCTION
+// uses an inline stack alloca (buildValueStructStorage), and a scalar field WRITE (`s.f = v`) is the same
+// `base + offset` + store the AST emits on that address, so mutation is emittable too. A value struct that
+// would ESCAPE (RETURNED -- a dead stack address after the frame goes -- or stored into a heap field) is
+// rejected by the return / field gates, so its stack storage cannot outlive the function.
 // Under NOVA_OPT_EMIT these helpers compile from the emit path; both must agree.
 import assert;
 
@@ -16,11 +16,18 @@ fn build(): int {                                        // construct locally, r
     let p = P3{ x: 3, y: 4, z: 5 };
     return p.x + p.y * p.z;
 }
+fn mutate(): int {                                       // construct, MUTATE fields, read (no escape)
+    let p = P3{ x: 1, y: 2, z: 3 };
+    p.x = p.x + 10;
+    p.z = p.x + p.y;
+    return p.x + p.y + p.z;
+}
 
 @test
 fn test_value_struct(): void {
     let rc = Rect{ w: 4, h: 5 };
     assert.equalInt(area(rc), 20);
     assert.equalInt(perimeter(rc), 18);
-    assert.equalInt(build(), 23); // 3 + 4*5
+    assert.equalInt(build(), 23);   // 3 + 4*5
+    assert.equalInt(mutate(), 26);  // x=11, y=2, z=13 -> 11+2+13 = 26
 }

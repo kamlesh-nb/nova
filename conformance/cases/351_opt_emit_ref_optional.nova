@@ -1,0 +1,39 @@
+// Emit-subset growth (B6, reference optionals only): a REFERENCE optional (`string | undefined`, or a
+// class `T | undefined`) is a plain nullable pointer word -- `undefined` is the null word (0), present is the
+// payload pointer -- and the AST does NOT box it. So a `string | undefined` param/return threads through the
+// emit path as the string pointer word, `== undefined` is a bare `icmp eq/ne i64` against 0, and the payload
+// string's ARC (retain/release, null destructor) is a plain string's. These helpers only READ or COMPARE a
+// passed-in optional, never materialise `undefined` in the body, so they compile from the optimised IR.
+//
+// A VALUE optional (`int | undefined`) is deliberately excluded: it is BOXED (a present 0 must be
+// distinguishable from absent), so its encoding is not the null word and it stays on the AST path. This case
+// pairs one with the reference optionals to lock that split in: both AST and emit must agree on all of them.
+import assert;
+
+fn tag(s: string | undefined): int {          // reference-optional PARAM, compared and read
+    if (s == undefined) { return -1; }
+    return len(s);
+}
+
+fn firstNonEmpty(a: string | undefined, b: string | undefined): int {
+    if (a != undefined) { return len(a); }
+    if (b != undefined) { return len(b); }
+    return 0;
+}
+
+// value optional (BOXED) -- stays on the AST path; included so both engines agree on it too.
+fn clamp(v: int | undefined): int {
+    if (v == undefined) { return 0; }
+    return v;
+}
+
+@test
+fn test_ref_optional(): void {
+    assert.equalInt(tag("hello"), 5);
+    assert.equalInt(tag(undefined), -1);
+    assert.equalInt(firstNonEmpty(undefined, "bc"), 2);
+    assert.equalInt(firstNonEmpty("abcd", "z"), 4);
+    assert.equalInt(firstNonEmpty(undefined, undefined), 0);
+    assert.equalInt(clamp(7), 7);
+    assert.equalInt(clamp(undefined), 0);
+}

@@ -70,14 +70,14 @@ fn tryEmitInner(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, func: anyty
         // An OPTIONAL param (`T | undefined`) is boxed/encoded specially and concreteTidForTypeRef strips
         // it to the inner tid -- which would masquerade as a plain scalar. The emit path does not model
         // optionals, so reject at the type-ref level before the tid is stripped.
-        if (tr == .optional) return reject("optional param");
+        if (tr == .optional and !isRefOptionalTypeRef(compiler, tr)) return reject("optional param");
         const ptid = compiler.concreteTidForTypeRef(tr) orelse return reject("unresolved param type");
         const scalar_ok = if (intKindForTid(compiler, ptid)) |pk| (pk.signed or pk.is_bool) else false;
         // A string param flows as the i64 pointer word like a class param. It is BORROWED, so read-only use
         // (via string_* method calls, now named by C0) needs no ARC; an owned string LOCAL created in the body
         // gets its scope-end release from the threaded ARC ops (D2). Capturing a string into a struct field is
         // blocked by the field gates (string fields are non-scalar); returning a string is blocked below.
-        if (!scalar_ok and !emittableHeapStructTid(compiler, ptid) and !isStringTid(compiler, ptid) and !isArrayWordTid(compiler, ptid) and !isF64Tid(compiler, ptid) and !emittableValueStructParamTid(compiler, ptid)) return reject("param not int/bool/heap-struct/string/array/f64/value-struct");
+        if (!scalar_ok and !emittableHeapStructTid(compiler, ptid) and !isStringTid(compiler, ptid) and !isArrayWordTid(compiler, ptid) and !isF64Tid(compiler, ptid) and !emittableValueStructParamTid(compiler, ptid) and !emittableRefOptionalTid(compiler, ptid)) return reject("param not int/bool/heap-struct/string/array/f64/value-struct/ref-optional");
         ptbuf[i] = ptid;
     }
     const param_types = ptbuf[0..func.params.len];
@@ -89,7 +89,7 @@ fn tryEmitInner(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, func: anyty
     // and returned `undefined` for a perfectly valid value -- concreteTidForTypeRef strips the optional to
     // the inner int, so the scalar check alone lets it through; gate on the type-ref shape too.
     if (func.ret_type_ref) |rtr| {
-        if (rtr == .optional) return reject("optional return");
+        if (rtr == .optional and !isRefOptionalTypeRef(compiler, rtr)) return reject("optional return");
         const is_void = (rtr == .ident and std.mem.eql(u8, rtr.ident, "void"));
         if (!is_void) {
             const rtid = compiler.concreteTidForTypeRef(rtr) orelse return reject("unresolved return type");
@@ -99,7 +99,9 @@ fn tryEmitInner(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, func: anyty
             // A string return is emittable: lower_ast_hir threads the return-acquisition retain (a borrowed
             // string returned is retained; a moved owned local / fresh temporary is not), so ownership out is
             // balanced -- validated by the --arc gate.
-            if (!ret_scalar and !emittableHeapStructTid(compiler, rtid) and !isF64Tid(compiler, rtid) and !isStringTid(compiler, rtid)) return reject("return type not int/bool/heap-struct/f64/string");
+            // NB: value structs are NOT allowed as a RETURN type -- a value struct is its inline stack bytes,
+            // so returning it would return a dead stack address (use-after-return). Needs a real copy-out ABI.
+            if (!ret_scalar and !emittableHeapStructTid(compiler, rtid) and !isF64Tid(compiler, rtid) and !isStringTid(compiler, rtid) and !emittableRefOptionalTid(compiler, rtid)) return reject("return type not int/bool/heap-struct/f64/string/ref-optional");
         }
     }
 
@@ -171,6 +173,13 @@ fn hirEmittable(hf: *const hir.Func) bool {
             .str,
             // float literals (B3): f64 flows as the double's bit pattern in the word; mirEmittable gates ops.
             .float => {},
+            // NB: `undefined` / `null` are deliberately NOT in this allowlist. They lower to `const_int 0`,
+            // which is exact for a REFERENCE optional (0 == absent) but WRONG for a VALUE optional, where the
+            // AST boxes them to a non-zero absent-sentinel. The HIR gate is whole-function and cannot tell the
+            // two apart per node, and admitting `.undefined` was verified to MISCOMPILE `f(undefined)` for a
+            // value-optional param (the arg is passed as 0, not the boxed sentinel). So a function containing
+            // any `undefined`/`null` literal falls back to the AST. Reference-optional signatures that never
+            // materialise `undefined` in the body (only read/compare a passed-in optional) still emit.
             else => {
                 if (emit_verbose) std.debug.print("[opt-emit]   non-emittable node: {s}\n", .{@tagName(node.kind)});
                 return false; // str/float/null/call/struct_init/cast/... -> fall back
@@ -347,6 +356,89 @@ fn emittableHeapStructTid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
     return !compiler.isValueStructName(base);
 }
 
+// True if `tid` is a REFERENCE (pointer) word: a string, a reference optional, or a heap struct. These all
+// flow as an i64 pointer word, so an `eq`/`ne` compare between two of them -- or between one and the null
+// word (`undefined`/`null` == const_int 0) -- is a plain `icmp eq/ne i64`, exactly what the AST emits for a
+// nullable-pointer comparison. Ordering (<,>) is meaningless on pointers, so only eq/ne uses this.
+fn isRefWordTid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
+    if (isStringTid(compiler, tid) or emittableRefOptionalTid(compiler, tid) or emittableHeapStructTid(compiler, tid)) return true;
+    // `ptr` -- the raw unsigned pointer word a reference-optional param/local is often typed as inside the
+    // body -- is a word-repr primitive. It is not a signed int, so the ordinary int eq/ne arm rejects it, but
+    // `icmp eq/ne i64` on the pointer word is exactly right (and sign-agnostic), so treat it as a ref word.
+    if (tid != mir.unset_ty) {
+        if (compiler.symbolName(tid) catch null) |nm| {
+            if (types_mod.cgPrim(nm)) |p| return p.repr == .word;
+        }
+    }
+    return false;
+}
+
+// True if `tr` is an OPTIONAL type-ref whose present arm is a reference type (string or a heap/class struct).
+// Such an optional is a plain nullable pointer word, so concreteTidForTypeRef can strip it to the inner
+// reference tid and the string / heap-struct param/return gate accepts it. A VALUE optional (`int|undefined`,
+// a value struct | undefined) is boxed and must stay on the AST path, so this returns false for it.
+fn isRefOptionalTypeRef(compiler: *LlvmCompiler, tr: ast.TypeRef) bool {
+    if (tr != .optional) return false;
+    const itid = compiler.concreteTidForTypeRef(tr.optional.*) orelse return false;
+    return isStringTid(compiler, itid) or emittableHeapStructTid(compiler, itid);
+}
+
+// True if the two operands of an `eq`/`ne` are a reference-word comparison the emit path handles as a bare
+// `icmp` on the words: at least one side is a reference word, and the other is a reference word OR an integer
+// (the null literal `undefined`/`null` lowers to `const_int 0`, an int-typed word). Pure int/bool eq/ne does
+// NOT match here (neither side is a reference word) and stays on the existing signed-word compare arm.
+fn isRefWordEq(compiler: *LlvmCompiler, mf: *const mir.Func, x: anytype) bool {
+    const lt = mf.typeOf(x.lhs);
+    const rt = mf.typeOf(x.rhs);
+    const lref = isRefWordTid(compiler, lt);
+    const rref = isRefWordTid(compiler, rt);
+    if (!lref and !rref) return false; // pure int/bool: handled elsewhere
+    const lok = lref or intKindForTid(compiler, lt) != null;
+    const rok = rref or intKindForTid(compiler, rt) != null;
+    return lok and rok;
+}
+
+// True if `tid` is a REFERENCE optional -- `<reference-type> | undefined` (e.g. `string | undefined`,
+// `Foo | undefined`). A reference optional is a plain nullable pointer: `undefined` is the null word (0),
+// present is the payload pointer, and the AST does NOT box it (types_mod.valueOptionalName is false). The
+// emit path already lowers `.undefined` to `const_int 0` (lower_hir_mir) and flows the present value as its
+// word, so a reference optional is byte-identical to the AST. A VALUE optional (`int | undefined`) IS boxed
+// (nova_valopt_box, so a present 0 is distinguishable from absent) -- that encoding is not emitted here, so
+// valueOptionalName-typed optionals are excluded and fall back.
+fn emittableRefOptionalTid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
+    if (tid == mir.unset_ty) return false;
+    const nm = compiler.symbolName(tid) catch return false;
+    if (std.mem.indexOfScalar(u8, nm, '|') == null) return false; // not a union/optional
+    if (types_mod.valueOptionalName(nm)) return false; // boxed value-optional: not emitted here
+    // Must be exactly `<arm> | undefined` (two arms, one of them `undefined`), and the present arm a
+    // reference type: a string or a known (non-value) struct/class. Anything else falls back.
+    const bar = std.mem.indexOfScalar(u8, nm, '|').?;
+    const lhs = std.mem.trim(u8, nm[0..bar], " ");
+    const rhs = std.mem.trim(u8, nm[bar + 1 ..], " ");
+    if (std.mem.indexOfScalar(u8, rhs, '|') != null) return false; // more than two arms
+    const arm = if (std.mem.eql(u8, rhs, "undefined")) lhs else if (std.mem.eql(u8, lhs, "undefined")) rhs else return false;
+    if (std.mem.eql(u8, arm, "string")) return true;
+    const base = types_mod.getStructBaseName(arm);
+    if (compiler.structs.contains(base) and !compiler.isValueStructName(base)) return true;
+    return false;
+}
+
+// True if `tid` is `string | undefined` specifically: a reference optional whose present payload is a
+// `string`. Its ARC contract is a plain string's -- single allocation, null destructor, and releasing the
+// null word (absent) is a no-op -- so retain/release on it is emittable exactly like a bare string. A
+// class-payload optional (`Foo | undefined`) needs the struct's `__destruct_*` and is excluded here.
+fn isStringRefOptionalTid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
+    if (tid == mir.unset_ty) return false;
+    const nm = compiler.symbolName(tid) catch return false;
+    const bar = std.mem.indexOfScalar(u8, nm, '|') orelse return false;
+    if (types_mod.valueOptionalName(nm)) return false;
+    const lhs = std.mem.trim(u8, nm[0..bar], " ");
+    const rhs = std.mem.trim(u8, nm[bar + 1 ..], " ");
+    if (std.mem.indexOfScalar(u8, rhs, '|') != null) return false;
+    const arm = if (std.mem.eql(u8, rhs, "undefined")) lhs else if (std.mem.eql(u8, lhs, "undefined")) rhs else return false;
+    return std.mem.eql(u8, arm, "string");
+}
+
 // Dry validation: return false if any instruction OR terminator is outside the emittable subset, building
 // NO IR. This MUST run before emitFunc touches the builder -- otherwise a mid-stream reject would leave a
 // half-emitted block that the AST fallback then double-fills. Keep the per-op gates in sync with emitBinop /
@@ -354,6 +446,22 @@ fn emittableHeapStructTid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
 fn mirEmittable(compiler: *LlvmCompiler, mf: *const mir.Func) bool {
     for (mf.blocks.items) |*b| {
         for (b.insts.items) |inst| {
+            if (!mirInstEmittable(compiler, mf, inst)) return false;
+        }
+        switch (b.term) {
+            .ret => |x| if (x) |rv| {
+                if (emittableHeapStructTid(compiler, mf.typeOf(rv)) and !isStructNewResult(mf, rv)) return false;
+            },
+            .br, .condbr, .unreachable_ => {},
+            .switch_ => return false,
+        }
+    }
+    return true;
+}
+
+fn mirInstEmittable(compiler: *LlvmCompiler, mf: *const mir.Func, inst: mir.Inst) bool {
+    {
+        {
             switch (inst.op) {
                 .binop => |x| {
                     // FLOAT (f64) binop (B3): both operands f64; arithmetic (add/sub/mul/div) or a compare.
@@ -365,8 +473,11 @@ fn mirEmittable(compiler: *LlvmCompiler, mf: *const mir.Func) bool {
                             .eq, .ne, .lt, .le, .gt, .ge => {}, // result is bool (word 0/1)
                             else => return false,
                         }
-                        continue;
+                        return true;
                     }
+                    // Reference-word eq/ne (string / ref-optional / heap pointer vs another such, or vs the
+                    // null word): a bare `icmp eq/ne i64`, result bool. Ordering never applies to pointers.
+                    if ((x.op == .eq or x.op == .ne) and isRefWordEq(compiler, mf, x)) return true;
                     const lk = intKindForTid(compiler, mf.typeOf(x.lhs)) orelse return false;
                     const rk = intKindForTid(compiler, mf.typeOf(x.rhs)) orelse return false;
                     switch (x.op) {
@@ -420,8 +531,10 @@ fn mirEmittable(compiler: *LlvmCompiler, mf: *const mir.Func) bool {
                     if (!isScalarFieldTypeRef(ftr)) return false;
                 },
                 .field_set => |x| {
+                    // Scalar-field write into a heap OR value struct: `base + offset` + store, identical to the
+                    // AST for the same address, so it matches whatever the value-struct aliasing semantics are.
+                    // Owned/float/nested fields (ARC / float path) stay on the AST.
                     const sname = structBaseNameOf(compiler, mf, x.base) orelse return false;
-                    if (compiler.isValueStructName(sname)) return false;
                     const ftr = fieldTypeRef(compiler, sname, x.field) orelse return false;
                     if (!isScalarFieldTypeRef(ftr)) return false;
                 },
@@ -437,8 +550,8 @@ fn mirEmittable(compiler: *LlvmCompiler, mf: *const mir.Func) bool {
                 // lists, error unions) needs a real `__destruct_*` we do not resolve yet -> reject the whole
                 // function. Capturing a string into a struct field is separately blocked by the field gates
                 // (a string field is non-scalar).
-                .retain => |x| if (!isStringTid(compiler, mf.typeOf(x.val))) return false,
-                .release => |x| if (!isStringTid(compiler, mf.typeOf(x.val))) return false,
+                .retain => |x| if (!isStringTid(compiler, mf.typeOf(x.val)) and !isStringRefOptionalTid(compiler, mf.typeOf(x.val))) return false,
+                .release => |x| if (!isStringTid(compiler, mf.typeOf(x.val)) and !isStringRefOptionalTid(compiler, mf.typeOf(x.val))) return false,
                 // element read (C3): only a string (byte index) or a non-float array (i64-word element).
                 .index_get => |x| if (indexKind(compiler, mf.typeOf(x.object)) == null) return false,
                 // A string literal materialises to an immortal interned global -> always emittable, no ARC.
@@ -452,18 +565,6 @@ fn mirEmittable(compiler: *LlvmCompiler, mf: *const mir.Func) bool {
                 .const_int, .alloc, .load, .param => {},
                 else => return false, // gep/await/spawn/indirect_call -> not yet
             }
-        }
-        switch (b.term) {
-            // Returning a heap struct is only safe when it is a FRESH construction (rc=1, moved to the
-            // caller). Returning a BORROWED struct (a param, a field, an owned local not moved out) requires a
-            // retain the emit path does not yet emit -- the AST caller would treat the result as an owned
-            // temporary and release it, double-freeing. So restrict to struct_new results (mem2reg forwards a
-            // `let t = Type{...}; return t` to the struct_new too). This is the ARC boundary for M6-D.
-            .ret => |x| if (x) |rv| {
-                if (emittableHeapStructTid(compiler, mf.typeOf(rv)) and !isStructNewResult(mf, rv)) return false;
-            },
-            .br, .condbr, .unreachable_ => {},
-            .switch_ => return false, // dense/sparse switch lowering not emitted yet
         }
     }
     return true;
@@ -705,6 +806,15 @@ fn emitBinop(compiler: *LlvmCompiler, inst: mir.Inst, op: mir.BinOp, mf: *const 
             },
             else => return error.Unemittable, // mod / shifts / bitwise are not valid on float
         }
+    }
+
+    // Reference-word eq/ne (string / ref-optional / heap pointer, incl. vs the null word): a bare word
+    // compare. The operands are already the i64 pointer words; icmp eq/ne then zext to the bool word. This
+    // mirrors how the AST compiles a nullable-pointer `== undefined` / `== null`.
+    if ((op == .eq or op == .ne) and isRefWordEq(compiler, mf, inst.op.binop)) {
+        const pred: types.LLVMIntPredicate = if (op == .eq) .LLVMIntEQ else .LLVMIntNE;
+        const cmp = core.LLVMBuildICmp(bld, pred, l, r, "");
+        return core.LLVMBuildZExt(bld, cmp, vt, "");
     }
 
     const lk = intKindForTid(compiler, mf.typeOf(inst.op.binop.lhs)) orelse return error.Unemittable;
