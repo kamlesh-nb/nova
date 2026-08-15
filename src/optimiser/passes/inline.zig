@@ -100,6 +100,8 @@ fn remapOp(op: *mir.Inst.Op, vmap: []const mir.Value) void {
             x.rhs = vmap[@intFromEnum(x.rhs)];
         },
         .load => |*x| x.addr = vmap[@intFromEnum(x.addr)],
+        .valopt_box => |*x| x.val = vmap[@intFromEnum(x.val)],
+        .valopt_unbox => |*x| x.val = vmap[@intFromEnum(x.val)],
         .store => |*x| {
             x.addr = vmap[@intFromEnum(x.addr)];
             x.val = vmap[@intFromEnum(x.val)];

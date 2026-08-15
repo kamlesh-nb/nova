@@ -1120,6 +1120,17 @@ fn emitInst(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, inst: mir.Inst,
             const rk = intKindForTid(compiler, inst.ty) orelse return error.Unemittable;
             break :blk if (rk.is_bool) src else compiler.canonicalizeInt(src, rk.width, rk.signed);
         },
+        // B6: value-optional box/unbox via the SAME runtime helpers the AST path uses (nova_valopt_box /
+        // nova_valopt_unbox), so a value-optional produced here is byte-for-byte compatible with AST code.
+        // box: raw word -> heap box (null word = `undefined`); unbox: box -> raw word (null box reads 0).
+        .valopt_box => |x| blk: {
+            const v = vals[@intFromEnum(x.val)] orelse return error.Unemittable;
+            break :blk try compiler.buildValoptBox(v);
+        },
+        .valopt_unbox => |x| blk: {
+            const v = vals[@intFromEnum(x.val)] orelse return error.Unemittable;
+            break :blk try compiler.buildValoptUnbox(v);
+        },
         // Heap struct construction: allocate the payload, then store each field at its real offset/width --
         // the same nova_bytes_alloc + add/inttoptr/store sequence the AST path emits (expressions.zig), reusing
         // the same layout + cast helpers. Owned-field structs are rejected by mirEmittable (they need a retain).

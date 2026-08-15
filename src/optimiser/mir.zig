@@ -88,6 +88,11 @@ pub const Inst = struct {
         // the receiver (the backend prepends struct_ptr as self, matching the AST calling convention).
         indirect_call: struct { receiver: Value, slot: u32, args: []Value, name: ?[]const u8 = null },
         cast: struct { val: Value },
+        // value-optional box/unbox (B6). box: raw word -> heap box (a null word = absent / `undefined`);
+        // unbox: box -> raw word (null box reads as 0). Both lower on the emit path to the runtime helpers
+        // nova_valopt_box / nova_valopt_unbox (buildValoptBox/buildValoptUnbox), mirroring the AST backend.
+        valopt_box: struct { val: Value },
+        valopt_unbox: struct { val: Value },
         // ARC — first-class so the elision pass can see and cancel balanced pairs
         retain: struct { val: Value },
         release: struct { val: Value },
@@ -160,6 +165,8 @@ pub fn instOperands(op: Inst.Op, buf: *[8]Value) []Value {
         },
         .gep => |x| push(buf, &n, x.base),
         .cast => |x| push(buf, &n, x.val),
+        .valopt_box => |x| push(buf, &n, x.val),
+        .valopt_unbox => |x| push(buf, &n, x.val),
         .retain => |x| push(buf, &n, x.val),
         .release => |x| push(buf, &n, x.val),
         .await_ => |x| push(buf, &n, x.fut),
@@ -231,6 +238,8 @@ fn rewriteInst(op: *Inst.Op, from: Value, to: Value) void {
         },
         .gep => |*x| sw(&x.base, from, to),
         .cast => |*x| sw(&x.val, from, to),
+        .valopt_box => |*x| sw(&x.val, from, to),
+        .valopt_unbox => |*x| sw(&x.val, from, to),
         .retain => |*x| sw(&x.val, from, to),
         .release => |*x| sw(&x.val, from, to),
         .await_ => |*x| sw(&x.fut, from, to),
@@ -273,7 +282,10 @@ pub fn hasSideEffects(op: Inst.Op) bool {
         .struct_new, .tuple_new, .field_set => true,
         // template allocates a StringBuilder + calls into it -> observable, keep it even if the result is dead.
         .template => true,
-        .binop, .load, .alloc, .gep, .cast, .const_int, .const_str, .global_const, .param, .field_get, .index_get => false,
+        // valopt_box allocates a heap box -> keep it even if the result looks dead. valopt_unbox is a pure
+        // read of its input (box==0 ? 0 : *box), no writes -> safe to DCE when its result is unused.
+        .valopt_box => true,
+        .binop, .load, .alloc, .gep, .cast, .valopt_unbox, .const_int, .const_str, .global_const, .param, .field_get, .index_get => false,
     };
 }
 

@@ -41,6 +41,10 @@ fn lowerInst(allocator: std.mem.Allocator, lf: *lir.Func, inst: mir.Inst) !void 
         .alloc => |x| try lf.ops.append(allocator, .{ .alloc = .{ .result = r.?, .ty = x.ty } }),
         .gep => |x| try lf.ops.append(allocator, .{ .gep = .{ .result = r.?, .base = reg(x.base), .offset = x.offset } }),
         .cast => |x| try lf.ops.append(allocator, .{ .cast = .{ .result = r.?, .val = reg(x.val), .to = inst.ty } }),
+        // valopt_box/unbox are driven from MIR by the emit path (runtime nova_valopt_box/unbox calls); the
+        // shadow LIR only needs a structural stand-in for the op count that preserves the value dependency.
+        .valopt_box => |x| try lf.ops.append(allocator, .{ .cast = .{ .result = r.?, .val = reg(x.val), .to = inst.ty } }),
+        .valopt_unbox => |x| try lf.ops.append(allocator, .{ .cast = .{ .result = r.?, .val = reg(x.val), .to = inst.ty } }),
         .const_int => |v| try lf.ops.append(allocator, .{ .const_int = .{ .result = r.?, .val = v } }),
         // The shadow LIR only needs a structural stand-in for the op count -- the emit path resolves the real
         // const via compiler.constants. Represent it as an opaque const_int 0 (its value is unknown here).
