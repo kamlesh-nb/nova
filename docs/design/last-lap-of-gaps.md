@@ -20,11 +20,15 @@ Nothing here is called "done." Done is what *you* verify after it exists, using 
 
 ## Scope decisions (recorded 2026-08-15)
 
-- **Debugger: use lldb, do not build a bespoke debugger.** The chosen path is to emit DWARF debug info from
-  codegen (LLVM DIBuilder) so lldb works at source level. Honest caveat: the compiler emits NO debug info
-  today, so lldb is assembly-level only until the DWARF work is done. First cut is line-level stepping +
-  backtraces; variable inspection is a follow-on (ARC and coroutine-split frames make it hard). This shrinks
-  gap 5's debugger item from "build a debugger" to "emit DWARF for lldb," but it is not zero.
+- **DECISION: Road B chosen (full vision), WASM dropped, debugger IN.** Execution is incremental: one gap item closed to zero and verified at a time, no "done" until the verify command passes. Sequence by priority + the dependency matrix (crash fix, then soundness + stdlib in parallel, then debugger + tooling, then the optimiser rearchitecture, then ecosystem).
+
+- **Debugger: IN SCOPE, via lldb, no bespoke debugger.** We will emit DWARF debug info from codegen (LLVM
+  DIBuilder) so lldb works at source level. Honest caveat: the compiler emits NO debug info today, so lldb is
+  assembly-level only until this lands. Scope of the item: line tables + subprograms + backtraces first (the
+  "beta-adequate" cut = source-level stepping and stack traces in lldb), then local-variable locations as a
+  follow-on (ARC and coroutine-split frames make the variable side genuinely hard). Effort GUESS: ~2-3 weeks
+  for the first cut, more for variable inspection. It is independent of the other gaps, so it can run in
+  parallel.
 - **WASM: dropped, not a priority.** Removed from scope. Native + cross-compile (~90%, verified) stays; the
   WASM host-ABI work (weeks-plus) is out. Gap 7 therefore reduces to the days-scale Windows test-gate wiring,
   and even that is optional.
