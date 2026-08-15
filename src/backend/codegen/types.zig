@@ -1373,9 +1373,10 @@ pub fn resolveExpressionTypeName(self: *LlvmCompiler, expr_ptr: *const ast.Expre
     }
     const t = t_opt.?;
 
-    const s_name = try self.substTypeParams(try sema_shadow.renderLegacy(self.allocator, st, t));
-
     if (sema_shadow.tid_census) {
+        // Census/shadow baseline only: the string engine's rendered+substituted name, compared against the
+        // TypeId engine to prove agreement. NOT on the production path (see the return below).
+        const s_name = try self.substTypeParams(try sema_shadow.renderLegacy(self.allocator, st, t));
         if (typeOfExprConcrete(self, expr_ptr)) |ctid| {
             // Both engines resolved: do they AGREE? A disagreement is a typed-IR accuracy gap (P1a).
             const t_name = self.substTypeParams(sema_shadow.renderLegacy(self.allocator, st, ctid) catch "") catch "";
@@ -1419,7 +1420,15 @@ pub fn resolveExpressionTypeName(self: *LlvmCompiler, expr_ptr: *const ast.Expre
     if (typeOfExprConcrete(self, expr_ptr)) |ctid| {
         return try sema_shadow.renderLegacy(self.allocator, st, ctid);
     }
-    return s_name;
+    // GAP-1 (slice B): the residual erased-body fallback. The overlay cannot resolve this expr, which
+    // empirically means the type is a bare type-parameter in an erased (internal-linkage, DCE-dropped)
+    // generic body. A corpus-wide sweep (NOVA_RESOLVE_FALLBACK, 230 samples, 0 DIFF) proved substTypeParams
+    // is an IDENTITY here -- with no active string instantiation on this path it only ever re-renders the
+    // same `T`/`K`/`V` name -- so the production path renders the TypeId directly and substTypeParams is no
+    // longer a live caller from resolveExpressionTypeName (it now survives only under the census baseline
+    // above). If this ever needs a concrete name it will be because the overlay should have resolved it;
+    // that is a typed-IR accuracy gap to fix at the overlay, not to paper over with string substitution.
+    return try sema_shadow.renderLegacy(self.allocator, st, t);
 }
 
 // Phase-3 foundation: the SINGLE sanctioned TypeId -> string boundary for the string->TypeId cutover.
