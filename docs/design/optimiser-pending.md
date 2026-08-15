@@ -44,7 +44,7 @@ activates arc-elision (the perf win). Re-sequenced: D1 before the rest of B.
 |----|------|----------|--------|-------|
 | C1 | `switch_` / match lowering | P1 | TODO | Rejected in both `hirEmittable` and `mirEmittable` (dense/sparse lowering not emitted). |
 | C2 | `cast` to non-int (float / ptr) | P2 | TODO | Only int-to-int casts handled. |
-| C3 | `index` (array / list element access) | P2 | TODO | Node kind not in the allowlist. |
+| C3 | `index` (array / list element access) | P2 | DONE (string byte + array word) | 2026-08-15 (commit 7331294): new `index_get` MIR op. String indexes a byte (obj+idx, load i8, zext); array GEPs the i64-word element. Float arrays + lists (method-call access) fall back. String byte index emits now; array-index functions need array params (B4) so the array path is latent. NB: eliminated `index` rejects but ~0 function-coverage gain -- string bodies hit C8 (str literals) / C2 (casts) next. |
 | C4 | `optional_chain` / `nullish` | P2 | TODO | Not in the allowlist. |
 | C5 | `tuple`, `enum_init`, `template`, `range` | P2 | TODO | Aggregate and interpolation forms. |
 | C6 | `closure` | P3 | TODO | Capture handling not modelled. |
