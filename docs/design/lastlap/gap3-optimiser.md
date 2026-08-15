@@ -140,6 +140,35 @@ prerequisite for D5-async (which additionally needs coroutine lowering).
 
 ---
 
+## B6 MULTI-SESSION LOG (value-optional emit)
+
+**Session 1 DONE (bcfe63e):** MIR ops `valopt_box`/`valopt_unbox` + emit arms (call the runtime
+`nova_valopt_box`/`nova_valopt_unbox`, byte-compatible with AST). Wired through all MIR switches. Additive;
+no producer yet; 5/5 emit-subset cases unregressed. This is the ABI foundation.
+
+**Session 2 PLAN (return-boxing, the first producer) -- exact steps:**
+1. `hir.Func` has NO return type today (hir.zig:97). Add `ret_valopt: bool = false`; populate it in
+   lower_ast_hir where the AST `fn_decl.return_type` is in scope (value-optional = `.optional` type-ref whose
+   inner is NOT a reference type -- reuse `isRefOptionalTypeRef`'s logic).
+2. Thread it into `Ctx` (lower_hir_mir.zig:23) and, in the `.ret => |vid|` arm (lower_hir_mir.zig:292), when
+   `ctx.ret_valopt` AND the HIR node at `vid` is NOT `.undefined`/`.null`, wrap `rv` in a `valopt_box` MIR op
+   before `setTerm(.ret)`. Leave `.undefined`/`.null` as `const_int 0` (absent) -- boxing it would recreate the
+   C10 present-0-as-absent bug.
+3. **ARC:** a returned value-optional box moves ownership OUT to the caller, so the callee does NOT release it
+   (the AST caller's `__destruct_*` frees it). So no release threading is needed for the return case -- but a
+   value-optional LOCAL (session 3) does need a scope-end release.
+4. **Gate (the risk):** lifting the per-function reject at lir_emit.zig:114 makes EVERY return emittable, incl.
+   a pass-through `return alreadyValopt` (would double-box) and a value-optional produced by a call. Gate
+   conservatively: only admit a value-optional return function when every `.ret` operand is a scalar-int
+   expression or `.undefined`/`.null`; otherwise keep the fallback. This needs a per-`.ret` operand-type check
+   in the emittability pass, not just the signature reject.
+5. **Verify:** hand-write value-optional return cases (`return 5`, `return undefined`, `return x+1`), confirm
+   NOVA_OPT_EMIT output == AST output AND `NOVA_ASAN=1` + `--arc` clean. Then a full `--asan` corpus before
+   flipping the reject in the committed build.
+
+**Sessions 3+:** value-optional PARAMS (unbox on read, the call-site box), value-optional LOCALS (box on store,
+unbox on read, scope-end release), narrowing (`if (x != undefined)` flow-sensitive unbox). Each its own gate.
+
 ## 3. Design to complete (PLAN -- per sub-item, confidence + unknowns)
 
 Ordered as requested: whole-program MIR first (unblocks closures + inline), then box-op MIR (value optional,
