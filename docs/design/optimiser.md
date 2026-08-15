@@ -313,6 +313,9 @@ ARC-elision is the reason we are here.
 - **Non-goal: replacing sema.** The frontend, the TypeId type system, and monomorphisation are
   unchanged. The middle-end consumes their output.
 
+> Remaining work is tracked as a checklist in **`optimiser-pending.md`** (methods, ARC threading,
+> default-on flip, and the rest of the coverage/activation backlog).
+
 ## ✅ Resolution (2026-08-15) — genuine emit is now 348/349 (was 272/348 when the gate went honest)
 
 Once the gate was honest (below), the 75-case gap turned out to be three root causes, each fixed as a
