@@ -73,6 +73,10 @@ pub const Inst = struct {
         spawn_: struct { callee: SymbolId, args: []Value },
         // constants materialised by const-folding
         const_int: i64,
+        // A string literal (the raw source bytes). The emit path materialises it via
+        // getOrCreateStringLiteral -> an IMMORTAL interned global (retain/release are no-ops on it), so it
+        // needs no ARC. The shadow lowers it to a structural const_int 0 for op counts.
+        const_str: []const u8,
         // A reference to a module-level `const` by name. Its VALUE is unknown to the optimiser (a const can
         // be a runtime-computed expression), so it is deliberately OPAQUE: the folding passes must not treat
         // it as any particular constant (that is the whole point -- lowering a global const to `const_int 0`
@@ -139,7 +143,7 @@ pub fn instOperands(op: Inst.Op, buf: *[8]Value) []Value {
             push(buf, &n, x.object);
             push(buf, &n, x.idx);
         },
-        .alloc, .const_int, .global_const, .param => {},
+        .alloc, .const_int, .const_str, .global_const, .param => {},
     }
     return buf[0..n];
 }
@@ -208,7 +212,7 @@ fn rewriteInst(op: *Inst.Op, from: Value, to: Value) void {
             sw(&x.object, from, to);
             sw(&x.idx, from, to);
         },
-        .alloc, .const_int, .global_const, .param => {},
+        .alloc, .const_int, .const_str, .global_const, .param => {},
     }
 }
 
@@ -227,7 +231,7 @@ pub fn hasSideEffects(op: Inst.Op) bool {
         .store, .call, .indirect_call, .retain, .release, .await_, .spawn_ => true,
         // struct_new allocates + writes memory; field_set writes memory -> keep them.
         .struct_new, .field_set => true,
-        .binop, .load, .alloc, .gep, .cast, .const_int, .global_const, .param, .field_get, .index_get => false,
+        .binop, .load, .alloc, .gep, .cast, .const_int, .const_str, .global_const, .param, .field_get, .index_get => false,
     };
 }
 

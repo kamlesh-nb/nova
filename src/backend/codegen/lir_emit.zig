@@ -150,7 +150,11 @@ fn hirEmittable(hf: *const hir.Func) bool {
             // ARC (D2): retain/release threaded by lower_ast_hir; mirEmittable gates them to string operands.
             .retain, .release,
             // element read (C3): `object[idx]` -> index_get; mirEmittable gates it to string / non-float array.
-            .index => {},
+            .index,
+            // int<->int casts (C2): `x as long` / `x as int`; mirEmittable gates operand AND result to int.
+            .cast,
+            // string literals (C8): materialised as an immortal interned global (no ARC).
+            .str => {},
             else => {
                 if (emit_verbose) std.debug.print("[opt-emit]   non-emittable node: {s}\n", .{@tagName(node.kind)});
                 return false; // str/float/null/call/struct_init/cast/... -> fall back
@@ -305,7 +309,13 @@ fn mirEmittable(compiler: *LlvmCompiler, mf: *const mir.Func) bool {
                         },
                     }
                 },
-                .cast => if (intKindForTid(compiler, inst.ty) == null) return false,
+                // Cast is int<->int only: both operand and result must be integer kinds. The emitter
+                // canonicalises to the result width (trunc+sext/zext), which is exact for int<->int but wrong
+                // for float<->int (that needs fptosi/sitofp) or pointer casts -- so gate the OPERAND too.
+                .cast => |x| {
+                    if (intKindForTid(compiler, mf.typeOf(x.val)) == null) return false;
+                    if (intKindForTid(compiler, inst.ty) == null) return false;
+                },
                 // A direct call is emittable if its callee resolves to an all-word LLVM function (below).
                 // The result type, if the value is used arithmetically, is gated by the consuming binop.
                 .call => |x| {
@@ -348,6 +358,8 @@ fn mirEmittable(compiler: *LlvmCompiler, mf: *const mir.Func) bool {
                 .release => |x| if (!isStringTid(compiler, mf.typeOf(x.val))) return false,
                 // element read (C3): only a string (byte index) or a non-float array (i64-word element).
                 .index_get => |x| if (indexKind(compiler, mf.typeOf(x.object)) == null) return false,
+                // A string literal materialises to an immortal interned global -> always emittable, no ARC.
+                .const_str => {},
                 .const_int, .alloc, .load, .store, .param => {},
                 else => return false, // gep/await/spawn/indirect_call -> not yet
             }
@@ -390,6 +402,10 @@ fn emitInst(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, inst: mir.Inst,
             const rk = intKindForTid(compiler, inst.ty) orelse break :blk c;
             break :blk if (rk.is_bool) c else compiler.canonicalizeInt(c, rk.width, rk.signed);
         },
+        // A string literal (C8): materialise it via the SAME interned immortal global the AST path uses, so a
+        // literal shared with AST-compiled code is the same object. Immortal (negative refcount) -> retain/
+        // release are no-ops, so no ARC is needed even though it is a string.
+        .const_str => |s| try compiler.getOrCreateStringLiteral(s),
         // A module-level const reference: resolve it via the SAME lazy-init per-module global-load the AST
         // path uses (compileConstRef compiles the initializer once, caches it in `__const_<name>_val`), so a
         // literal const and a runtime-computed const both work and match the AST byte-for-byte. Return the

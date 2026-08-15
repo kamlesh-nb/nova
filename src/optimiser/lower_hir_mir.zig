@@ -77,7 +77,8 @@ fn lowerNode(ctx: *Ctx, id: HirId) anyerror!Value {
         .bool => |v| mf.emit(a, ctx.cur, nty, .{ .const_int = if (v) 1 else 0 }),
         .param => |i| mf.emit(a, ctx.cur, nty, .{ .param = i }),
         // structural placeholders for non-integer literals (real materialisation is an emit-time concern)
-        .float, .str, .null, .undefined => mf.emit(a, ctx.cur, nty, .{ .const_int = 0 }),
+        .str => |s| mf.emit(a, ctx.cur, nty, .{ .const_str = s }),
+        .float, .null, .undefined => mf.emit(a, ctx.cur, nty, .{ .const_int = 0 }),
 
         .ident => |name| blk: {
             if (ctx.slots.get(name)) |addr| {
