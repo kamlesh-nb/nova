@@ -47,6 +47,18 @@ pub fn erasedOwnershipDefault(self: *LlvmCompiler, type_name: []const u8) bool {
     return true;
 }
 
+// GAP-1: fail-loud used by the TypeId-native struct destructor when a field's concrete type does not
+// lower under the struct's own (decl, args). Proven unreachable corpus-wide (NOVA_DTOR_STRBLK sweep, 0
+// hits); reaching it means a typed-IR accuracy bug, so exit rather than fall back to the string engine.
+fn unresolvedDtorField(struct_name: []const u8, field_name: []const u8) noreturn {
+    std.debug.print(
+        "\x1b[1m\x1b[31mcompiler error:\x1b[0m\x1b[1m struct '{s}' field '{s}' has no concrete TypeId in destructor codegen\x1b[0m\n" ++
+        "  the field did not lower under the struct's own type arguments. This is a COMPILER bug\n" ++
+        "  (typed-IR accuracy), not user code. Please report.\n",
+        .{ struct_name, field_name });
+    std.process.exit(70);
+}
+
 // LEGACY string ownership classifier. As of the L1 string->TypeId migration this is NO LONGER a
 // codegen ownership decider -- codegen uses the resolved-TypeId engine (isOwnedTypeId) for every
 // real type, and erasedOwnershipDefault for dead erased bodies. This survives ONLY as the SHADOW
@@ -835,18 +847,18 @@ fn getOrCreateStructDestructorByTypeId(self: *LlvmCompiler, t: typesys.TypeId) a
         const scopes = [_]lower.ParamScope{.{ .owner = stype.decl, .names = decl.type_params }};
         l.param_scopes = &scopes;
 
-        const concrete: ?typesys.TypeId = blk: {
-            const raw = l.lower(field.type_name) catch break :blk null;
-            break :blk subst.substitute(&sm.store, raw, stype.decl, stype.args) catch null;
+        // GAP-1 safe reduction (user-chosen track): resolve the field's concrete TypeId from this struct's
+        // own (decl, args) via the TypeId engine. A corpus sweep (NOVA_DTOR_STRBLK, 0 hits) proved this is
+        // total on the TypeId-native dtor path, so the former substituteFieldType(string)/getOrCreateDestructor
+        // fallback arms are removed -- the field loop is now purely TypeId-driven. A null here is a typed-IR
+        // accuracy bug (a struct field that would not lower under its own args); fail LOUD rather than either
+        // silently skipping an owned field (leak) or mis-keying a destructor off a rendered name.
+        const c: typesys.TypeId = blk: {
+            const raw = l.lower(field.type_name) catch break :blk unresolvedDtorField(type_name, field.name);
+            break :blk subst.substitute(&sm.store, raw, stype.decl, stype.args) catch unresolvedDtorField(type_name, field.name);
         };
-        const is_ref = if (concrete) |c|
-            self.isOwnedTypeId(c)
-        else str_blk: {
-            const fs = self.typeRefToString(field.type_name) catch break :str_blk false;
-            const ft = self.substituteFieldType(type_name, fs) catch break :str_blk false;
-            break :str_blk self.isOwnedDeclaredType(field.type_name, ft);
-        };
-        if (!is_ref) continue;
+
+        if (!self.isOwnedTypeId(c)) continue;
 
         const offset = try self.getFieldOffset(base_struct, field.name);
         const offset_val = core.LLVMConstInt(self.val_type, offset, 0);
@@ -856,13 +868,7 @@ fn getOrCreateStructDestructorByTypeId(self: *LlvmCompiler, t: typesys.TypeId) a
         const loaded_field_val = core.LLVMBuildLoad2(self.builder, llvm_field_type, ptr, "field_load");
         const casted_field_val = self.castToValType(loaded_field_val, field.type_name);
 
-        const field_dest = if (concrete) |c|
-            try self.getOrCreateDestructorByTypeId(c)
-        else str_blk: {
-            const fs = self.typeRefToString(field.type_name) catch break :str_blk null;
-            const ft = self.substituteFieldType(type_name, fs) catch break :str_blk null;
-            break :str_blk try self.getOrCreateDestructor(ft);
-        };
+        const field_dest = try self.getOrCreateDestructorByTypeId(c);
         try self.compileRelease(casted_field_val, field_dest);
     }
 
