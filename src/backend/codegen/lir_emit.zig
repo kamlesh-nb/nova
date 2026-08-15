@@ -47,6 +47,13 @@ fn reject(comptime why: []const u8) bool {
 }
 
 fn tryEmitInner(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, func: anytype) !bool {
+    // An `async fn` is compiled as an LLVM coroutine: `fn_val` already carries the `presplitcoroutine`
+    // attribute and its callers `spawn`/`await` it expecting a coroutine frame. Emitting a plain body here
+    // (and skipping the coro prologue) produces a malformed coroutine that CoroSplit turns into a crash --
+    // even when the body itself is trivial int arithmetic (e.g. `async fn square(n){return n*n}`, which the
+    // node gate otherwise accepts). Coroutine lowering is not in the emit subset, so reject async up front.
+    if (func.is_async) return reject("async fn (coroutine)");
+
     const ir = compiler.typed_ir; // may be null; lowering still works, just fewer types
 
     // Parameters. `func.params` is populated only for FREE functions (methods leave it empty because their
@@ -235,6 +242,9 @@ fn emittableHeapStructTid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
 // half-emitted block that the AST fallback then double-fills. Keep the per-op gates in sync with emitBinop /
 // the cast arm, and the terminator gates in sync with emitFunc.
 fn mirEmittable(compiler: *LlvmCompiler, mf: *const mir.Func) bool {
+    // Lowering flagged a faithless structural placeholder (e.g. an unresolved global-const ident lowered to
+    // const_int 0). Emitting would be a silent miscompile -> reject the whole function (AST fallback).
+    if (mf.emit_poison) return false;
     for (mf.blocks.items) |*b| {
         for (b.insts.items) |inst| {
             switch (inst.op) {

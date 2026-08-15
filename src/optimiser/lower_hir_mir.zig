@@ -83,7 +83,12 @@ fn lowerNode(ctx: *Ctx, id: HirId) anyerror!Value {
             if (ctx.slots.get(name)) |addr| {
                 break :blk try mf.emit(a, ctx.cur, nty, .{ .load = .{ .addr = addr } });
             }
-            // param / global / function reference: opaque value for the structural IR.
+            // global / function reference / capture: no faithful value here, so this is a structural
+            // PLACEHOLDER (const 0). Fine for the report-only shadow, but the emit path must NOT emit a
+            // function that reads a global const as 0 (that miscompiled every `& MASK32` in the crypto
+            // stdlib). Poison the function so mirEmittable rejects it -> AST fallback. (Resolving the const
+            // value to grow the emittable subset is a separate, additive increment.)
+            mf.emit_poison = true;
             break :blk try mf.emit(a, ctx.cur, nty, .{ .const_int = 0 });
         },
 
@@ -94,8 +99,27 @@ fn lowerNode(ctx: *Ctx, id: HirId) anyerror!Value {
         },
         .unop => |u| blk: {
             const operand = try lowerNode(ctx, u.operand);
-            // model unary as binop against a constant where convenient; structurally a cast-through.
-            break :blk try mf.emit(a, ctx.cur, nty, .{ .cast = .{ .val = operand } });
+            const oty = mf.typeOf(operand);
+            // A unary op is NOT a cast-through -- lowering it that way silently DROPS the operator (e.g.
+            // `-x` became `x`, miscompiling every negative literal). Model each as its exact binop identity
+            // so the emit path reproduces the AST semantics (and constfold folds the constant forms):
+            //   neg     -> 0 - x        (sub, canonicalised to the result width by emitBinop)
+            //   bit_not -> x ^ -1       (bitwise, representation-preserving)
+            //   not     -> x == 0       (logical, on a bool operand)
+            break :blk switch (u.op) {
+                .neg => neg: {
+                    const zero = try mf.emit(a, ctx.cur, oty, .{ .const_int = 0 });
+                    break :neg try mf.emit(a, ctx.cur, nty, .{ .binop = .{ .op = .sub, .lhs = zero, .rhs = operand } });
+                },
+                .bit_not => bn: {
+                    const allones = try mf.emit(a, ctx.cur, oty, .{ .const_int = -1 });
+                    break :bn try mf.emit(a, ctx.cur, nty, .{ .binop = .{ .op = .bit_xor, .lhs = operand, .rhs = allones } });
+                },
+                .not => ln: {
+                    const zero = try mf.emit(a, ctx.cur, oty, .{ .const_int = 0 });
+                    break :ln try mf.emit(a, ctx.cur, nty, .{ .binop = .{ .op = .eq, .lhs = operand, .rhs = zero } });
+                },
+            };
         },
         .cast => |operand_id| blk: {
             const operand = try lowerNode(ctx, operand_id);

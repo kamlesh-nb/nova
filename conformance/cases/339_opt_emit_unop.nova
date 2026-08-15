@@ -1,0 +1,39 @@
+// Regression: the optimiser LIR emit path (NOVA_OPT_EMIT) lowered EVERY unary operator as a no-op
+// cast-through, silently dropping the operator -- `-x` became `x`, so every negative literal (and `~`
+// and `!`) miscompiled. These free, all-int/bool functions are in the emittable subset, so under the
+// emit gate they compile from the optimised IR and under the default build from the AST; both must agree.
+// The INT_MIN boundary (-2147483648 = 0x80000000) is the tell: a dropped negation reads the operand as a
+// large positive value, so a signed `< 0` comparison flips.
+import assert;
+
+fn neg(a: int): int { return -a; }
+fn intMin(): int { return -2147483647 - 1; }
+fn bitNot(a: int): int { return ~a; }
+fn lnot(a: bool): bool { return !a; }
+fn dblNeg(a: int): int { return -(-a); }
+fn negExpr(a: int, b: int): int { return -a * b + 10; }
+
+@test
+fn test_negation(): void {
+    assert.equalInt(neg(42), -42);
+    assert.equalInt(neg(-42), 42);
+    assert.equalInt(neg(0), 0);
+    // High-bit-set boundary: a dropped negation would read this as positive and fail `< 0`.
+    assert.isTrue(intMin() < 0);
+    assert.equalInt(intMin(), -2147483648);
+    assert.equalInt(dblNeg(5), 5);
+    assert.equalInt(negExpr(3, 2), 4); // -3 * 2 + 10 = 4
+}
+
+@test
+fn test_bit_not(): void {
+    assert.equalInt(bitNot(0), -1);
+    assert.equalInt(bitNot(5), -6);
+    assert.equalInt(bitNot(-1), 0);
+}
+
+@test
+fn test_logical_not(): void {
+    assert.isTrue(lnot(false));
+    assert.isTrue(!lnot(true));
+}

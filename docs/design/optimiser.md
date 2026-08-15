@@ -313,6 +313,35 @@ ARC-elision is the reason we are here.
 - **Non-goal: replacing sema.** The frontend, the TypeId type system, and monomorphisation are
   unchanged. The middle-end consumes their output.
 
+## ✅ Resolution (2026-08-15) — genuine emit is now 348/349 (was 272/348 when the gate went honest)
+
+Once the gate was honest (below), the 75-case gap turned out to be three root causes, each fixed as a
+clean, differentially-verified increment. Genuine `NOVA_OPT_EMIT=1 conformance/run.sh -j` is now **348/349**
+(only `189_epoll_event_layout`, the expected off-Linux structural fail) — identical to the default build,
+and clean under `--asan`. Default build (emit off) stays **348/349**, users unaffected.
+
+1. **Unary operators were silently dropped (miscompile).** `lower_hir_mir` lowered every `.unop` as a no-op
+   `cast` "cast-through", so `-x` became `x`, `~x` became `x`, `!b` became `b`. This is why the INT_MIN
+   probe failed: `-2147483647 - 1` emitted as `2147483647 - 1`. Fix: lower each unop to its exact binop
+   identity — `neg`→`0 - x` (sub, canonicalised to width), `bit_not`→`x ^ -1`, `not`→`x == 0`. constfold then
+   folds the constant forms. +10 cases. (The "INT_MIN is zero-extended" hypothesis was wrong — the value was
+   never negated at all.)
+2. **Global-const references lowered to 0 (miscompile).** The `.ident` lowering mapped any name not in the
+   local-slot map to `const_int 0` — a fine opaque placeholder for the report-only shadow, but a silent
+   miscompile under emit: every `& MASK32` in the crypto/TLS stdlib became `& 0`. Fix (fail-closed): a new
+   `mir.Func.emit_poison` flag is set when lowering hits this placeholder; `mirEmittable` rejects a poisoned
+   function → AST fallback. The shadow still sees `const 0` (unchanged). Cleared the whole crypto/TLS/DB/
+   mediator/web cluster, ~57 cases. (Resolving the const value to GROW the subset is a separate additive
+   increment; today it just falls back.)
+3. **`async fn` with a trivial body was emitted as a plain function (crash).** An `async fn` is compiled as
+   an LLVM coroutine (`presplitcoroutine`, spawned/awaited by callers), but if its body had no await/spawn
+   node (e.g. `async fn square(n){return n*n}`) the node gate accepted it, the emit path emitted a plain body
+   and `continue`d before the coro prologue → malformed coroutine → CoroSplit crash. Fix (fail-closed):
+   `tryEmitInner` rejects `func.is_async` up front. Cleared the 9-case async cluster.
+
+Pinned by `conformance/cases/339_opt_emit_unop.nova` (neg/bit_not/not + INT_MIN boundary, AST vs emit).
+The history below (the vacuous-gate correction) is kept for the record.
+
 ## ⚠️ Correction (2026-08-15) — the NOVA_OPT_EMIT corpus gate was VACUOUS; genuine emit is 272/348
 
 Every prior claim below of "NOVA_OPT_EMIT=1 corpus 346/347" was measured through `nova test`, and

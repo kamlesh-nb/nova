@@ -233,6 +233,11 @@ pub const Func = struct {
     blocks: std.ArrayListUnmanaged(BasicBlock) = .empty,
     value_types: std.ArrayListUnmanaged(TypeId) = .empty, // Value -> TypeId, indexed by @intFromEnum
     entry: Block = @enumFromInt(0),
+    // Set when lowering produced a structural PLACEHOLDER whose value is not faithful (e.g. an unresolved
+    // ident lowered to `const_int 0`). The shadow analysis (M0-M5) is report-only and tolerates these, but
+    // the emit path (NOVA_OPT_EMIT) must NOT emit a function that contains one -- it would be a silent
+    // miscompile (a global-const reference reading as 0). mirEmittable rejects on this -> AST fallback.
+    emit_poison: bool = false,
 
     pub fn deinit(self: *Func, allocator: std.mem.Allocator) void {
         for (self.blocks.items) |*b| b.insts.deinit(allocator);
