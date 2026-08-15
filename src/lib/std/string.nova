@@ -145,6 +145,70 @@ pub fn trim(s: string): string {
     return slice(s, start, end);
 }
 
+// Trim only leading ASCII whitespace (space/tab/newline/carriage-return).
+pub fn trimStart(s: string): string {
+    let len = s.length;
+    let start = 0;
+    while (start < len) {
+        let c = s[start];
+        if (c != 32 && c != 9 && c != 10 && c != 13) { break; }
+        start = start + 1;
+    }
+    return slice(s, start, len);
+}
+
+// Trim only trailing ASCII whitespace.
+pub fn trimEnd(s: string): string {
+    let len = s.length;
+    let end = len;
+    while (end > 0) {
+        let c = s[end - 1];
+        if (c != 32 && c != 9 && c != 10 && c != 13) { break; }
+        end = end - 1;
+    }
+    return slice(s, 0, end);
+}
+
+// The substring from `start` (inclusive) to `end` (exclusive), clamped to the string. Alias for slice.
+pub fn substring(s: string, start: int, end: int): string {
+    return slice(s, start, end);
+}
+
+// The one-character string at `i`, or "" if out of range.
+pub fn charAt(s: string, i: int): string {
+    if (i < 0 || i >= s.length) { return ""; }
+    return slice(s, i, i + 1);
+}
+
+// `s` repeated `n` times ("" for n <= 0).
+pub fn repeat(s: string, n: int): string {
+    let out = "";
+    let i = 0;
+    while (i < n) { out = concat(out, s); i = i + 1; }
+    return out;
+}
+
+// Left-pad `s` with `pad` (repeated) until it is at least `targetLen` long. If `s` is already long
+// enough, or `pad` is empty, `s` is returned unchanged.
+pub fn padStart(s: string, targetLen: int, pad: string): string {
+    if (pad.length == 0) { return s; }
+    let deficit = targetLen - s.length;
+    if (deficit <= 0) { return s; }
+    let prefix = "";
+    while (prefix.length < deficit) { prefix = concat(prefix, pad); }
+    return concat(slice(prefix, 0, deficit), s);
+}
+
+// Right-pad `s` with `pad` (repeated) until it is at least `targetLen` long.
+pub fn padEnd(s: string, targetLen: int, pad: string): string {
+    if (pad.length == 0) { return s; }
+    let deficit = targetLen - s.length;
+    if (deficit <= 0) { return s; }
+    let suffix = "";
+    while (suffix.length < deficit) { suffix = concat(suffix, pad); }
+    return concat(s, slice(suffix, 0, deficit));
+}
+
 pub fn replace(s: string, old: string, new: string): string {
     let s_len = s.length;
     let old_len = old.length;

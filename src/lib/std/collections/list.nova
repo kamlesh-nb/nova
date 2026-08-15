@@ -70,6 +70,92 @@ pub class List<T> {
             i = i + 1;
         }
     }
+
+    // The first `n` elements as a NEW list (n clamped to [0, size]); the receiver is unchanged.
+    pub fn take(self: List<T>, n: int): List<T> {
+        let out = List<T>();
+        let count = self.data.count();
+        let lim = n; if (lim < 0) { lim = 0; } if (lim > count) { lim = count; }
+        let i = 0;
+        while (i < lim) { out.push(self.data.at(i)); i = i + 1; }
+        return out;
+    }
+
+    // All but the first `n` elements as a NEW list (n clamped to [0, size]); the receiver is unchanged.
+    pub fn drop(self: List<T>, n: int): List<T> {
+        let out = List<T>();
+        let count = self.data.count();
+        let start = n; if (start < 0) { start = 0; } if (start > count) { start = count; }
+        let i = start;
+        while (i < count) { out.push(self.data.at(i)); i = i + 1; }
+        return out;
+    }
+
+    // How many elements satisfy `pred`.
+    pub fn count(self: List<T>, pred: (T) => bool): int {
+        let c = 0;
+        let i = 0;
+        while (i < self.data.count()) { if (pred(self.data.at(i))) { c = c + 1; } i = i + 1; }
+        return c;
+    }
+
+    // Map each element to a list and concatenate the results (map then flatten one level).
+    pub fn flatMap<U>(self: List<T>, fn: (T) => List<U>): List<U> {
+        let out = List<U>();
+        let i = 0;
+        while (i < self.data.count()) {
+            let sub = fn(self.data.at(i));
+            let j = 0;
+            while (j < sub.size()) { out.push(sub.at(j)); j = j + 1; }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    // Split into consecutive lists of at most `size` elements (the last may be shorter). `size <= 0`
+    // returns an empty list.
+    pub fn chunk(self: List<T>, size: int): List<List<T>> {
+        let out = List<List<T>>();
+        if (size <= 0) { return out; }
+        let count = self.data.count();
+        let i = 0;
+        while (i < count) {
+            let piece = List<T>();
+            let j = 0;
+            while (j < size && (i + j) < count) { piece.push(self.data.at(i + j)); j = j + 1; }
+            out.push(piece);
+            i = i + size;
+        }
+        return out;
+    }
+
+    // Pair each element with the element at the same index in `other`, up to the shorter length.
+    pub fn zip<U>(self: List<T>, other: List<U>): List<(T, U)> {
+        let out = List<(T, U)>();
+        let n = self.data.count();
+        let m = other.size();
+        let lim = n; if (m < lim) { lim = m; }
+        let i = 0;
+        while (i < lim) { out.push((self.data.at(i), other.at(i))); i = i + 1; }
+        return out;
+    }
+
+    // Sort in place by an integer key, ascending and stable (insertion sort, matching `sort`).
+    pub fn sortBy(self: List<T>, key: (T) => int): void {
+        let n = self.data.count();
+        let i = 1;
+        while (i < n) {
+            let cur = self.data.at(i);
+            let ck = key(cur);
+            let j = i - 1;
+            while (j >= 0 && key(self.data.at(j)) > ck) {
+                self.data.set(j + 1, self.data.at(j));
+                j = j - 1;
+            }
+            self.data.set(j + 1, cur);
+            i = i + 1;
+        }
+    }
 }
 
 @test

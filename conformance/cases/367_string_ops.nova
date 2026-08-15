@@ -1,0 +1,17 @@
+// Gap 8 stdlib depth: String conveniences (padStart/padEnd/repeat/substring/charAt/trimStart/trimEnd).
+import assert;
+import string;
+
+@test
+fn test_string_ops(): void {
+    assert.equalStr(string.repeat("ab", 3), "ababab");
+    assert.equalStr(string.repeat("x", 0), "");
+    assert.equalStr(string.padStart("42", 5, "0"), "00042");
+    assert.equalStr(string.padStart("hello", 3, "0"), "hello");  // already long
+    assert.equalStr(string.padEnd("42", 5, "-"), "42---");
+    assert.equalStr(string.substring("hello", 1, 4), "ell");
+    assert.equalStr(string.charAt("hello", 1), "e");
+    assert.equalStr(string.charAt("hello", 99), "");             // out of range
+    assert.equalStr(string.trimStart("  hi  "), "hi  ");
+    assert.equalStr(string.trimEnd("  hi  "), "  hi");
+}

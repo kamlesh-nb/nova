@@ -1,0 +1,42 @@
+// Gap 8 stdlib depth: List convenience combinators (take/drop/count/flatMap/chunk/zip/sortBy).
+import assert;
+import list;
+
+@test
+fn test_list_combinators(): void {
+    let l = List<int>();
+    l.push(3); l.push(1); l.push(4); l.push(1); l.push(5);
+
+    let t = l.take(3);
+    assert.equalInt(t.size(), 3);
+    assert.equalInt(t.at(0), 3);
+    assert.equalInt(l.take(99).size(), 5);   // clamp
+    assert.equalInt(l.take(-1).size(), 0);
+
+    let d = l.drop(2);
+    assert.equalInt(d.size(), 3);
+    assert.equalInt(d.at(0), 4);
+    assert.equalInt(l.drop(99).size(), 0);   // clamp
+
+    assert.equalInt(l.count((x: int) => x == 1), 2);
+    assert.equalInt(l.count((x: int) => x > 2), 3);
+
+    let fm = l.flatMap<int>((x: int) => { let r = List<int>(); r.push(x); r.push(x * 10); return r; });
+    assert.equalInt(fm.size(), 10);
+    assert.equalInt(fm.at(1), 30);
+
+    let ch = l.chunk(2);
+    assert.equalInt(ch.size(), 3);        // [3,1][4,1][5]
+    assert.equalInt(ch.at(0).size(), 2);
+    assert.equalInt(ch.at(2).size(), 1);
+    assert.equalInt(l.chunk(0).size(), 0);
+
+    let names = List<string>();
+    names.push("a"); names.push("b");
+    let z = l.zip<string>(names);
+    assert.equalInt(z.size(), 2);         // shorter length
+
+    l.sortBy((x: int) => x);
+    assert.equalInt(l.at(0), 1);
+    assert.equalInt(l.at(4), 5);
+}
