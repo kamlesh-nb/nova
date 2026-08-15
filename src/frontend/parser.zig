@@ -1026,6 +1026,13 @@ pub const Parser = struct {
                     const ret_ptr = try self.allocator.create(ast.TypeRef);
                     ret_ptr.* = ret;
                     break :blk ast.TypeRef{ .func = .{ .params = try items.toOwnedSlice(self.allocator), .ret = ret_ptr } };
+                } else if (items.items.len == 1) {
+                    // A single parenthesised type is GROUPING, not a one-tuple: `(T)` is just `T`. Building a
+                    // 1-element `.tuple` here made `(int | undefined)` a one-tuple, so `(int | undefined) |
+                    // undefined` became Optional<Tuple<Optional<int>>> and assigning a scalar to it miscompiled
+                    // (SIGSEGV in nova_retain on unbox). A real tuple needs at least two elements. The inner
+                    // TypeRef's nodes are separately allocated, so copying it out before `items.deinit` is safe.
+                    break :blk items.items[0];
                 } else {
                     break :blk ast.TypeRef{ .tuple = try items.toOwnedSlice(self.allocator) };
                 }
@@ -1092,7 +1099,12 @@ pub const Parser = struct {
                     }
                     if (!self.match(.pipe)) break;
                 }
-                if (saw_undefined) {
+                if (saw_undefined and base_type != .optional) {
+                    // An optional is idempotent: `(T | undefined) | undefined` is just `T | undefined`.
+                    // Wrapping an already-optional base in another `.optional` builds a double box that
+                    // codegen mis-handles (SIGSEGV on unbox), so collapse it by only wrapping a non-optional
+                    // base. The legit `(T | undefined) | E` triple union is the error_union path below and is
+                    // untouched.
                     const opt_ptr = try self.allocator.create(ast.TypeRef);
                     opt_ptr.* = base_type;
                     base_type = ast.TypeRef{ .optional = opt_ptr };
@@ -1106,11 +1118,15 @@ pub const Parser = struct {
                 }
             } else if (self.match(.question)) {
                 // FR-safety-1: `T?` is pure sugar for `T | undefined`. It wraps the same .optional node the
-                // union path produces, so `string?` and `string | undefined` are the identical type. Chains
-                // (`T??`) just wrap again, harmless and idempotent for the checker's narrowing.
-                const opt_ptr = try self.allocator.create(ast.TypeRef);
-                opt_ptr.* = base_type;
-                base_type = ast.TypeRef{ .optional = opt_ptr };
+                // union path produces, so `string?` and `string | undefined` are the identical type. A chain
+                // (`T??`) must NOT wrap again: an optional is idempotent, and a double `.optional` builds a
+                // codegen double box that SIGSEGVs on unbox, so collapse `T??` to `T?` by only wrapping a
+                // non-optional base.
+                if (base_type != .optional) {
+                    const opt_ptr = try self.allocator.create(ast.TypeRef);
+                    opt_ptr.* = base_type;
+                    base_type = ast.TypeRef{ .optional = opt_ptr };
+                }
             } else if (self.match(.left_bracket)) {
                 const len_token = self.current();
                 try self.expect(.integer);
@@ -1125,6 +1141,16 @@ pub const Parser = struct {
             } else {
                 break;
             }
+        }
+
+        // Collapse redundant nested optionals: an optional is idempotent, so `(T | undefined) | undefined`,
+        // `T??`, and any parenthesised nesting are all just `T | undefined`. A double `.optional` would build
+        // a value-optional box that holds another box, which codegen unboxes as a raw pointer and SIGSEGVs in
+        // nova_retain. Normalising at this single exit covers every construction path (the union `| undefined`
+        // loop, the `?` sugar, and a parenthesised `(T | undefined)` atom). The legit `(T | undefined) | E`
+        // triple union is an `.error_union`, not a nested `.optional`, so it is untouched.
+        while (base_type == .optional and base_type.optional.* == .optional) {
+            base_type = base_type.optional.*;
         }
 
         return base_type;
