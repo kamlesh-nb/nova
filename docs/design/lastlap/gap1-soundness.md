@@ -211,6 +211,20 @@ NOVA_SEMA_SHADOW=1 conformance/run.sh            # every case must print td_disa
 NOVA_ASAN=1 zig build && conformance/run.sh --asan   # green ASAN corpus is the ONLY go signal
 ```
 
+There is a THIRD, cheaper ratchet gate that runs in `gate.sh`:
+
+```bash
+bash conformance/string-typedecision-lint.sh    # raw count of std.mem.eql string type-name decisions
+```
+
+**2026-08-15 finding (05dae86):** this lint had been BLIND since the compiler reorg -- it grepped the
+pre-reorg `src/codegen/*.zig`, matched an empty glob, and reported a false `0 (baseline 49)` for weeks.
+The true count against `src/backend/codegen/*.zig` is **51** (it had crept +2 unguarded). The lint is now
+fixed and re-baselined to 51. Caveat kept in the script: the raw 51 also counts sanctioned canonical-name
+checks (`any`/`void`/`string`/primitives, which have fixed identity and are not the generic-type hazard),
+so the genuine hazard is a subset; gate (a)'s `td_disagree=0` remains the soundness proof, and this raw
+count is the hazard-surface ratchet the gap-1 deletions drive toward 0.
+
 "Done" = the string engine is deleted (grep for `substTypeParams`, `substituteFieldType`,
 `erasedOwnershipDefault`, `legacyStringOwnership` returns **0 live callers**, only `symbolName(tid)`
 remains as the TypeId→string boundary), AND both gates green. Today, gate (a) already reports
