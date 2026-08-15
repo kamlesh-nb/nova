@@ -18,6 +18,17 @@ it can be trusted:
 Nothing here is called "done." Done is what *you* verify after it exists, using the command in each gap's
 "Verify" line.
 
+## Scope decisions (recorded 2026-08-15)
+
+- **Debugger: use lldb, do not build a bespoke debugger.** The chosen path is to emit DWARF debug info from
+  codegen (LLVM DIBuilder) so lldb works at source level. Honest caveat: the compiler emits NO debug info
+  today, so lldb is assembly-level only until the DWARF work is done. First cut is line-level stepping +
+  backtraces; variable inspection is a follow-on (ARC and coroutine-split frames make it hard). This shrinks
+  gap 5's debugger item from "build a debugger" to "emit DWARF for lldb," but it is not zero.
+- **WASM: dropped, not a priority.** Removed from scope. Native + cross-compile (~90%, verified) stays; the
+  WASM host-ABI work (weeks-plus) is out. Gap 7 therefore reduces to the days-scale Windows test-gate wiring,
+  and even that is optional.
+
 ## What the verification changed about the percentage report
 
 Six agents each built or read the real code to prove their gap. The result corrected my earlier percentage
@@ -53,7 +64,7 @@ Severity is "how much this blocks a usable, buildable-on beta," not how much wor
 | 3 | Optimiser completion (perf) | Low for beta, High for the vision | ~40% of goal, ~10-12% real coverage, perf ~0% realised | months (rearchitecture) | [gap3](lastlap/gap3-optimiser.md) |
 | 5 | Tooling (LSP/fmt/pkg/debugger) | Medium | LSP + fmt real; package manager a git-clone stub; no debugger | days (LSP/fmt) to large (debugger) | [gap56](lastlap/gap56-tooling-ecosystem.md) |
 | 6 | Ecosystem (drivers/web/orch/DB) | Medium | Broad, single-request-proven, integration + robustness unhardened | weeks+ (separate repos) | [gap56](lastlap/gap56-tooling-ecosystem.md) |
-| 7 | Cross-platform (WASM/Windows) | Low-Medium | Native+cross ~90% verified; WASM best-effort; Windows test gates unwired | days (Windows gates) to weeks (WASM host) | [gap7](lastlap/gap7-crossplatform.md) |
+| 7 | Cross-platform (Windows gates only; WASM DROPPED) | Low | Native+cross ~90% verified; WASM out of scope by decision | days (Windows test gates, optional) | [gap7](lastlap/gap7-crossplatform.md) |
 | 8 | Stdlib depth (coverage/leaves) | Medium | Deep spine, thin leaves; 34/144 files tested; no crypto KATs | ~2.5-3 weeks | [gap8](lastlap/gap8-stdlib.md) |
 
 ## The gaps in one paragraph each (design summary; full design in the detail files)
@@ -161,10 +172,10 @@ debugger, WASM, or a mature ecosystem. Those become post-beta iterations. The sc
 has a verify command you run yourself.
 
 **Road B - the full vision. Months.**
-Everything in Road A, plus the optimiser rearchitecture (gap 3, the big one), a debugger (gap 5), WASM host
-support (gap 7), and ecosystem hardening (gap 6, across separate repos). This is where the real perf story and
-the polished platform live, and it is a genuine multi-month effort with the optimiser and the async-coroutine
-emit as the highest-risk pieces.
+Everything in Road A, plus the optimiser rearchitecture (gap 3, the big one), source-level debugging via
+emitted DWARF for lldb (gap 5, no bespoke debugger), and ecosystem hardening (gap 6, across separate repos).
+WASM is dropped. This is where the real perf story and the polished platform live, and it is a genuine
+multi-month effort with the optimiser and the async-coroutine emit as the highest-risk pieces.
 
 **The honest recommendation, stated as opinion not fact:** if the goal is "a real language people can use,"
 Road A is the finishable target and it is close, and the discipline that makes it real is exactly what was
