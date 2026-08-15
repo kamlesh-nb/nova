@@ -11,6 +11,14 @@
 > verifiable slice** — every lever (value-optional/error-union/closure/async coverage; borrow-skip perf;
 > default-on flip) is multi-day AND needs a full `--asan` corpus to land safely. It is a dedicated multi-
 > session effort, not a quick win. This is the one gap where the honest answer is "scope it, don't slice it."
+>
+> **Reject-distribution (why there is no cheap gate fix), measured across 6 cases:** param-type not in
+> allowlist 2154, return-type not in allowlist 1269, **param-count-mismatch 547 (these are CONSTRUCTORS —
+> `params=&.{}`, `param_count=len+1` — a real unimplemented feature, NOT a gate bug)**, optional-return 76,
+> non-emittable-HIR 48, unresolved-param 28. Every category maps to a WEEKS-scale feature (value-optional
+> B6, error-union B7, constructor emit B5, optional-return B6). Confirmed: no reject is a one-line gate
+> loosening the way string-engine slice B was. The realistic next unit is B6 (value-optional, MEDIUM
+> confidence, documented ABI) as a multi-session effort with a full `--asan` gate.
 
 Scope: the `NOVA_OPT_EMIT` LIR to LLVM emit path (`src/optimiser/*`, `src/optimiser/passes/*`,
 `src/backend/codegen/lir_emit.zig`). Verified against code and live repros on 2026-08-15, working dir
