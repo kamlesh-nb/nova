@@ -77,7 +77,7 @@ fn tryEmitInner(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, func: anyty
         // (via string_* method calls, now named by C0) needs no ARC; an owned string LOCAL created in the body
         // gets its scope-end release from the threaded ARC ops (D2). Capturing a string into a struct field is
         // blocked by the field gates (string fields are non-scalar); returning a string is blocked below.
-        if (!scalar_ok and !emittableHeapStructTid(compiler, ptid) and !isStringTid(compiler, ptid)) return reject("param not int/bool/heap-struct/string");
+        if (!scalar_ok and !emittableHeapStructTid(compiler, ptid) and !isStringTid(compiler, ptid) and !isArrayWordTid(compiler, ptid)) return reject("param not int/bool/heap-struct/string/array");
         ptbuf[i] = ptid;
     }
     const param_types = ptbuf[0..func.params.len];
@@ -227,6 +227,21 @@ fn isStringTid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
 // How to emit `object[idx]` for a given object TypeId. `string` indexes a byte; `array_word` GEPs the
 // i64-word element base. Null (fall back) for anything else, incl. float-element arrays (they need a float
 // load type + GEP the emit path does not yet do) and lists/maps (their element access is a method call).
+// True if `tid` is a non-float array. Such a param flows as a clean `ptr` argument (the signature builder
+// makes array params ptr_type); it round-trips through the i64 slot (both 8 bytes) and index_get's
+// arrayBasePtr handles it. Only used read-only via index_get in this slice.
+fn isArrayWordTid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
+    const st = compiler.type_store orelse return false;
+    if (tid == mir.unset_ty or @intFromEnum(tid) >= st.count()) return false;
+    return switch (st.get(tid)) {
+        .array => |ar| blk: {
+            const et = st.get(ar.elem);
+            break :blk !(et == .prim and et.prim.kind == .float);
+        },
+        else => false,
+    };
+}
+
 const IndexKind = enum { string, array_word };
 fn indexKind(compiler: *LlvmCompiler, otid: mir.TypeId) ?IndexKind {
     const st = compiler.type_store orelse return null;
@@ -240,6 +255,17 @@ fn indexKind(compiler: *LlvmCompiler, otid: mir.TypeId) ?IndexKind {
         },
         else => null,
     };
+}
+
+// True if `addr` is defined by an `alloc` (a real stack slot, i.e. a valid pointer to store into). Any other
+// store target -- e.g. the index_get result an unmodelled `a[i] = v` lvalue lowers to -- is not a pointer.
+fn storeAddrIsAlloc(mf: *const mir.Func, addr: mir.Value) bool {
+    for (mf.blocks.items) |*b| {
+        for (b.insts.items) |inst| {
+            if (inst.result == addr) return inst.op == .alloc;
+        }
+    }
+    return false;
 }
 
 // The declared base name of the struct/class a value holds (via its threaded TypeId), or null if the value
@@ -360,7 +386,13 @@ fn mirEmittable(compiler: *LlvmCompiler, mf: *const mir.Func) bool {
                 .index_get => |x| if (indexKind(compiler, mf.typeOf(x.object)) == null) return false,
                 // A string literal materialises to an immortal interned global -> always emittable, no ARC.
                 .const_str => {},
-                .const_int, .alloc, .load, .store, .param => {},
+                // A store must target a real slot (an `alloc`). The lowering of an lvalue it does not model --
+                // notably an array-element write `a[i] = v` -- falls back to `store <value-as-address>`, i.e.
+                // the address is a computed i64 (an index_get result), not a pointer. Emitting that yields
+                // `store i64 %v, i64 %addr` which fails LLVM verification. Restricting stores to alloc targets
+                // rejects those functions (field writes use field_set, not store).
+                .store => |x| if (!storeAddrIsAlloc(mf, x.addr)) return false,
+                .const_int, .alloc, .load, .param => {},
                 else => return false, // gep/await/spawn/indirect_call -> not yet
             }
         }
