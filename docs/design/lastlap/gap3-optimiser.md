@@ -148,8 +148,14 @@ no producer yet; 5/5 emit-subset cases unregressed. This is the ABI foundation.
 
 **Session 2 PLAN (return-boxing, the first producer) -- exact steps:**
 1. `hir.Func` has NO return type today (hir.zig:97). Add `ret_valopt: bool = false`; populate it in
-   lower_ast_hir where the AST `fn_decl.return_type` is in scope (value-optional = `.optional` type-ref whose
-   inner is NOT a reference type -- reuse `isRefOptionalTypeRef`'s logic).
+   lower_ast_hir where the AST `fn_decl.return_type` is in scope. **REFINED BLOCKER (found by reading the
+   code):** the value-vs-reference-optional test `isRefOptionalTypeRef` (lir_emit.zig:703) is BACKEND-only --
+   it calls `compiler.concreteTidForTypeRef` + `isStringTid`/`emittableHeapStructTid`, none available in the
+   optimiser. So the real first task is a TypeId-store query in the optimiser that answers "is this optional's
+   inner a VALUE type (int/bool/float/value-struct -> box) vs a REFERENCE type (string/class -> nullable
+   pointer, no box)". The optimiser has `infer.TypedIr` + the sema type store; the query is a `typesys`-level
+   question (inner kind), NOT a backend one, so it can be answered there -- but it must be WIRED, it is not a
+   one-liner. This is the genuine "careful TypeId threading" the B6 label warns about.
 2. Thread it into `Ctx` (lower_hir_mir.zig:23) and, in the `.ret => |vid|` arm (lower_hir_mir.zig:292), when
    `ctx.ret_valopt` AND the HIR node at `vid` is NOT `.undefined`/`.null`, wrap `rv` in a `valopt_box` MIR op
    before `setTerm(.ret)`. Leave `.undefined`/`.null` as `const_int 0` (absent) -- boxing it would recreate the
