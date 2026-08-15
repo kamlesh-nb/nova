@@ -98,6 +98,10 @@ pub const Func = struct {
     name: []const u8,
     sym: ?SymbolId = null,
     inst: ?TypeId = null,
+    // B6: the function's return type is a SCALAR value-optional (`int | undefined` etc, inner is a value
+    // prim). Set by AST->HIR from fn_decl.return_type. Drives the return-site valopt_box in HIR->MIR: a
+    // scalar returned into this slot is boxed, `undefined`/`null` stays the null word (absent).
+    ret_valopt: bool = false,
     nodes: std.ArrayListUnmanaged(Node) = .empty,
     entry: Block = .{},
     // Synthesised strings the lowering had to allocate (e.g. a `string_<method>` callee name for a method

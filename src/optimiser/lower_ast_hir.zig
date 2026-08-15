@@ -172,8 +172,24 @@ pub fn lowerFunc(allocator: std.mem.Allocator, fn_decl: ast.FunctionDecl, ir: ?*
 // As lowerFunc, but with resolved parameter TypeIds (emit path). Stamping the param nodes matters because
 // mem2reg forwards a param store->load, so the param VALUE itself becomes an arithmetic operand -- if it
 // were left unset, the emit gate could not prove its width. Pass null (shadow) to leave params unset.
+// B6: a SCALAR value-optional type-ref: `<scalar-prim> | undefined`. The inner must be a value prim that
+// fits the i64 word (int family, bool, float/double as bits) -- string/class inners are REFERENCE optionals
+// (nullable pointer, no box) and a type-parameter inner is not concrete, so both return false and fall back.
+fn isScalarValoptTypeRef(tr: ast.TypeRef) bool {
+    if (tr != .optional) return false;
+    const inner = tr.optional.*;
+    if (inner != .ident) return false;
+    const scalars = [_][]const u8{
+        "int", "long", "short", "byte", "sbyte", "bool", "float", "double", "char",
+        "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "uint", "ulong", "ushort", "word", "usize", "isize",
+    };
+    for (scalars) |s| if (std.mem.eql(u8, inner.ident, s)) return true;
+    return false;
+}
+
 pub fn lowerFuncTyped(allocator: std.mem.Allocator, fn_decl: ast.FunctionDecl, ir: ?*const infer.TypedIr, param_types: ?[]const hir.TypeId) !hir.Func {
     var func = hir.Func{ .name = fn_decl.name };
+    if (fn_decl.ret_type) |rt| func.ret_valopt = isScalarValoptTypeRef(rt);
     errdefer func.deinit(allocator);
     var ctx = Ctx{ .allocator = allocator, .func = &func, .ir = ir };
     defer ctx.deinit();

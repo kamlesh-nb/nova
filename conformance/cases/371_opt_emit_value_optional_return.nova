@@ -1,0 +1,25 @@
+// B6 (optimiser emit path): a SCALAR value-optional return `int | undefined` emits through the LIR path,
+// boxing the returned scalar via valopt_box. The present-0 case is the critical one -- it must read back
+// as PRESENT 0, not absent. Verified byte-identical to the AST backend under NOVA_OPT_EMIT + ASAN + ARC.
+import assert;
+
+fn boxit(x: int): int | undefined { return x; }
+
+fn pick(x: int): int | undefined {
+    if (x > 0) { return x; }
+    return 0 - x;
+}
+
+@test
+fn test_valopt_return_roundtrip(): void {
+    assert.equalInt(42, boxit(42) ?? 0);
+    // present 0 must NOT read as absent
+    assert.equalInt(0, boxit(0) ?? 0 - 1);
+}
+
+@test
+fn test_valopt_conditional_return(): void {
+    assert.equalInt(5, pick(5) ?? 0);
+    assert.equalInt(3, pick(0 - 3) ?? 0);
+    assert.equalInt(0, pick(0) ?? 0 - 1);
+}

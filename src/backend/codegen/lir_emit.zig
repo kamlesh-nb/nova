@@ -111,7 +111,12 @@ fn tryEmitInner(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, func: anyty
     // and returned `undefined` for a perfectly valid value -- concreteTidForTypeRef strips the optional to
     // the inner int, so the scalar check alone lets it through; gate on the type-ref shape too.
     if (func.ret_type_ref) |rtr| {
-        if (rtr == .optional and !isRefOptionalTypeRef(compiler, rtr)) return reject("optional return");
+        // B6 (session 2): a SCALAR value-optional return (`int | undefined`) now emits -- the HIR->MIR
+        // lowering boxes a scalar `.ret` operand via valopt_box (undefined stays the null word). Functions
+        // that materialise an `undefined`/`null` literal anywhere still fall back (hirEmittable rejects the
+        // node), so the value-optional-param `f(undefined)` hazard is unaffected; this only turns on the
+        // return-boxing path. Reference optionals keep their existing (no-box) handling.
+        if (rtr == .optional and !isRefOptionalTypeRef(compiler, rtr) and !isScalarValoptTypeRefLE(rtr)) return reject("optional return");
         // B7 (FALLBACK, documented in docs/design/optimiser-pending.md): an error-union return `T | E` is a
         // tagged HEAP box built by arc.buildErrUnion -- 16 bytes = {i64 tag @0 (0=ok,1=err), i64 payload @8},
         // a nova_bytes_alloc ARC object whose per-union __destruct_ErrUnion_* releases the payload by tag. The
@@ -145,7 +150,10 @@ fn tryEmitInner(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, func: anyty
             // release): mirEmittable's `.ret` gate restricts heap-struct returns to a FRESH construction
             // (isStructNewResult), and the retain/release gates are string-only, so the borrow-return is left to
             // the AST until struct-destructor ARC threading lands. That is an ARC slice, not a value-struct ABI.
-            if (!ret_scalar and !emittableHeapStructTid(compiler, rtid) and !isFloatWordTid(compiler, rtid) and !isStringTid(compiler, rtid) and !emittableRefOptionalTid(compiler, rtid)) return reject("return type not int/bool/heap-struct/f32/f64/string/ref-optional");
+            // B6: a VALUE optional return is admitted here; the HIR->MIR lowering boxes the scalar (valopt_box)
+            // and a non-scalar value optional (value-struct) is rejected downstream by the valopt_box op gate
+            // (it requires an int/bool operand), so only the scalar case actually emits.
+            if (!ret_scalar and !emittableHeapStructTid(compiler, rtid) and !isFloatWordTid(compiler, rtid) and !isStringTid(compiler, rtid) and !emittableRefOptionalTid(compiler, rtid) and !tidIsValueOptional(compiler, rtid)) return reject("return type not int/bool/heap-struct/f32/f64/string/ref-optional");
         }
     }
 
@@ -706,6 +714,20 @@ fn isRefOptionalTypeRef(compiler: *LlvmCompiler, tr: ast.TypeRef) bool {
     return isStringTid(compiler, itid) or emittableHeapStructTid(compiler, itid);
 }
 
+// B6: a SCALAR value-optional type-ref (`<scalar-prim> | undefined`). Mirrors lower_ast_hir's
+// isScalarValoptTypeRef so the emit gate and the HIR->MIR box-insertion agree on which returns are boxed.
+fn isScalarValoptTypeRefLE(tr: ast.TypeRef) bool {
+    if (tr != .optional) return false;
+    const inner = tr.optional.*;
+    if (inner != .ident) return false;
+    const scalars = [_][]const u8{
+        "int", "long", "short", "byte", "sbyte", "bool", "float", "double", "char",
+        "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "uint", "ulong", "ushort", "word", "usize", "isize",
+    };
+    for (scalars) |s| if (std.mem.eql(u8, inner.ident, s)) return true;
+    return false;
+}
+
 // True if the two operands of an `eq`/`ne` are a reference-word comparison the emit path handles as a bare
 // `icmp` on the words: at least one side is a reference word, and the other is a reference word OR an integer
 // (the null literal `undefined`/`null` lowers to `const_int 0`, an int-typed word). Pure int/bool eq/ne does
@@ -1047,6 +1069,12 @@ fn mirInstEmittable(compiler: *LlvmCompiler, mf: *const mir.Func, inst: mir.Inst
                     if (x.args.len != 0) return false;
                     if (intKindForTid(compiler, inst.ty) == null) return false;
                 },
+                // B6: box a SCALAR (int/bool) into a value-optional. The result is the box POINTER word,
+                // threaded as placeholder_ty so line 903's value-optional check does not fire on it; the AST
+                // caller reads it back via its own unbox. valopt_unbox is a pure read of a box word (not
+                // produced until the param/local slice, but harmless to admit).
+                .valopt_box => |x| if (intKindForTid(compiler, mf.typeOf(x.val)) == null) return false,
+                .valopt_unbox => {},
                 else => return false, // gep/await/spawn -> not yet
             }
         }

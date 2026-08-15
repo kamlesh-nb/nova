@@ -29,6 +29,8 @@ const Ctx = struct {
     // innermost loop targets for break/continue; null outside a loop
     loop_header: ?Block = null,
     loop_exit: ?Block = null,
+    // B6: the function returns a scalar value-optional; a scalar `.ret` operand is boxed (valopt_box).
+    ret_valopt: bool = false,
 
     fn deinit(self: *Ctx) void {
         self.slots.deinit(self.allocator);
@@ -41,7 +43,7 @@ pub fn lowerFunc(allocator: std.mem.Allocator, func: hir.Func) !mir.Func {
     const entry = try mf.newBlock(allocator);
     mf.entry = entry;
 
-    var ctx = Ctx{ .allocator = allocator, .hf = &func, .mf = &mf, .cur = entry };
+    var ctx = Ctx{ .allocator = allocator, .hf = &func, .mf = &mf, .cur = entry, .ret_valopt = func.ret_valopt };
     defer ctx.deinit();
 
     try lowerBlock(&ctx, func.entry);
@@ -290,7 +292,24 @@ fn lowerNode(ctx: *Ctx, id: HirId) anyerror!Value {
             break :blk Value.invalid;
         },
         .ret => |vid| blk: {
-            const rv: ?Value = if (vid) |x| try lowerNode(ctx, x) else null;
+            var rv: ?Value = if (vid) |x| try lowerNode(ctx, x) else null;
+            // B6: box a scalar returned into a value-optional slot (valopt_box). Skip `undefined`/`null`
+            // (already the null word = absent; boxing it would read back as a PRESENT 0 -- the C10 bug), and
+            // skip an operand whose type is ALREADY optional (a pass-through) to avoid a double box.
+            if (ctx.ret_valopt) {
+                if (vid) |x| {
+                    const opnode = ctx.hf.get(x);
+                    const is_null = opnode.kind == .undefined or opnode.kind == .null;
+                    const already_opt = blkopt: {
+                        const st = mir.type_store orelse break :blkopt false;
+                        if (opnode.ty == hir.unset_ty or @intFromEnum(opnode.ty) >= st.count()) break :blkopt false;
+                        break :blkopt st.get(opnode.ty) == .optional;
+                    };
+                    if (!is_null and !already_opt) {
+                        rv = try mf.emit(a, ctx.cur, placeholder_ty, .{ .valopt_box = .{ .val = rv.? } });
+                    }
+                }
+            }
             mf.setTerm(ctx.cur, .{ .ret = rv });
             break :blk Value.invalid;
         },
