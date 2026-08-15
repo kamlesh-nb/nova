@@ -83,13 +83,12 @@ fn lowerNode(ctx: *Ctx, id: HirId) anyerror!Value {
             if (ctx.slots.get(name)) |addr| {
                 break :blk try mf.emit(a, ctx.cur, nty, .{ .load = .{ .addr = addr } });
             }
-            // global / function reference / capture: no faithful value here, so this is a structural
-            // PLACEHOLDER (const 0). Fine for the report-only shadow, but the emit path must NOT emit a
-            // function that reads a global const as 0 (that miscompiled every `& MASK32` in the crypto
-            // stdlib). Poison the function so mirEmittable rejects it -> AST fallback. (Resolving the const
-            // value to grow the emittable subset is a separate, additive increment.)
-            mf.emit_poison = true;
-            break :blk try mf.emit(a, ctx.cur, nty, .{ .const_int = 0 });
+            // Not a local slot: a module-level const, a bare function reference, or a capture. Carry the
+            // NAME as an OPAQUE global_const so (a) the emit path can resolve a scalar const via
+            // compiler.constants (mirEmittable rejects a non-const / non-scalar name -> AST fallback), and
+            // (b) the folding passes never treat it as a known value. Lowering it to `const_int 0` instead
+            // miscompiled every `& MASK32` in the crypto stdlib (constfold folded `x & 0` -> 0).
+            break :blk try mf.emit(a, ctx.cur, nty, .{ .global_const = name });
         },
 
         .binop => |b| blk: {

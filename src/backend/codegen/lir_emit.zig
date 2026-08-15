@@ -242,9 +242,6 @@ fn emittableHeapStructTid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
 // half-emitted block that the AST fallback then double-fills. Keep the per-op gates in sync with emitBinop /
 // the cast arm, and the terminator gates in sync with emitFunc.
 fn mirEmittable(compiler: *LlvmCompiler, mf: *const mir.Func) bool {
-    // Lowering flagged a faithless structural placeholder (e.g. an unresolved global-const ident lowered to
-    // const_int 0). Emitting would be a silent miscompile -> reject the whole function (AST fallback).
-    if (mf.emit_poison) return false;
     for (mf.blocks.items) |*b| {
         for (b.insts.items) |inst| {
             switch (inst.op) {
@@ -297,6 +294,13 @@ fn mirEmittable(compiler: *LlvmCompiler, mf: *const mir.Func) bool {
                     const ftr = fieldTypeRef(compiler, sname, x.field) orelse return false;
                     if (!isScalarFieldTypeRef(ftr)) return false;
                 },
+                // A module-level const reference is emittable iff the name IS a const (not a bare function
+                // reference or a capture) AND its value is a scalar int/bool (arrays/structs/strings fall
+                // back). The result type carries the const's declared type.
+                .global_const => |name| {
+                    if (!compiler.constants.contains(name)) return false;
+                    if (intKindForTid(compiler, inst.ty) == null) return false;
+                },
                 .const_int, .alloc, .load, .store, .param => {},
                 else => return false, // gep/retain/release/await/spawn/indirect_call -> not yet
             }
@@ -338,6 +342,17 @@ fn emitInst(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, inst: mir.Inst,
             const c = core.LLVMConstInt(vt, @bitCast(v), 1);
             const rk = intKindForTid(compiler, inst.ty) orelse break :blk c;
             break :blk if (rk.is_bool) c else compiler.canonicalizeInt(c, rk.width, rk.signed);
+        },
+        // A module-level const reference: resolve it via the SAME lazy-init per-module global-load the AST
+        // path uses (compileConstRef compiles the initializer once, caches it in `__const_<name>_val`), so a
+        // literal const and a runtime-computed const both work and match the AST byte-for-byte. Return the
+        // loaded word directly -- compileConstRef already produced it canonical for the const's DECLARED type
+        // (the AST ident path uses it verbatim too). Do NOT re-canonicalise here: the value's threaded MIR
+        // type can be narrower than the const's real type (e.g. a `long` mask read as `int`), and a width-32
+        // sign-extend would turn 0xffffffff into -1, unmasking `x & MASK32`.
+        .global_const => |name| blk: {
+            const init_expr = compiler.constants.get(name) orelse return error.Unemittable;
+            break :blk try compiler.compileConstRef(name, init_expr);
         },
         // A parameter's value is the Nth LLVM function argument. Every non-array param flows as the i64
         // word (declarations.zig builds the signature with val_type), matching how we treat all values.

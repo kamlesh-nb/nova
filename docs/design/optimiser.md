@@ -342,6 +342,26 @@ and clean under `--asan`. Default build (emit off) stays **348/349**, users unaf
 Pinned by `conformance/cases/339_opt_emit_unop.nova` (neg/bit_not/not + INT_MIN boundary, AST vs emit).
 The history below (the vacuous-gate correction) is kept for the record.
 
+### Subset growth (2026-08-15) — module-level const references now emit
+
+Fix #2 above made global-const references FALL BACK; they now EMIT. A new opaque MIR op `global_const`
+carries the const NAME (opaque so the folding passes never treat it as a known value), and the emit path
+resolves it at emit time via `compiler.constants` + `compileConstRef` — the SAME lazy-init per-module
+`__const_<name>_val` load the AST path uses, so a literal const and a runtime-computed const both work and
+match the AST byte-for-byte. `mirEmittable` accepts it only when the name is a real const whose value is a
+scalar int/bool (arrays/structs/strings and bare function references fall back). The resolved word is used
+verbatim (NOT re-canonicalised: a `long` mask whose threaded MIR type reads as `int` would otherwise be
+width-32 sign-extended, turning `0xffffffff` into `-1` and unmasking `x & MASK32`). Gates: default / emit /
+emit-`--asan` all 349/350 (only off-Linux `189_epoll`). Pinned by
+`conformance/cases/340_opt_emit_global_const.nova` (mask/rotate idiom + scalar/bool/computed consts).
+
+**Known orthogonal follow-up (pre-existing, exposed by more functions now emitting):** a hex literal with
+bit 31 set (e.g. `0x80000000`) used in a `== long` comparison is emitted as a 32-bit int (INT_MIN,
+sign-extended) rather than a `long`, so the compare fails. It does NOT regress the corpus (crypto masks the
+value before comparing), but `fn f(x:long){return x<<31;} … r == 0x80000000` diverges. Root cause is the
+literal's threaded width in the emit const path — the same `long`-vs-`int` threading weakness — not the
+global-const work. Fix is a separate increment.
+
 ## ⚠️ Correction (2026-08-15) — the NOVA_OPT_EMIT corpus gate was VACUOUS; genuine emit is 272/348
 
 Every prior claim below of "NOVA_OPT_EMIT=1 corpus 346/347" was measured through `nova test`, and

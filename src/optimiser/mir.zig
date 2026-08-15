@@ -73,6 +73,14 @@ pub const Inst = struct {
         spawn_: struct { callee: SymbolId, args: []Value },
         // constants materialised by const-folding
         const_int: i64,
+        // A reference to a module-level `const` by name. Its VALUE is unknown to the optimiser (a const can
+        // be a runtime-computed expression), so it is deliberately OPAQUE: the folding passes must not treat
+        // it as any particular constant (that is the whole point -- lowering a global const to `const_int 0`
+        // let constfold turn `x & MASK32` into 0). The emit path resolves it at emit time via
+        // compiler.constants + compileConstRef (the same lazy-init global-load the AST path uses); mirEmittable
+        // only accepts it when the named const is a scalar int/bool. The shadow lowers it to a structural
+        // const_int 0 purely for op counts.
+        global_const: []const u8,
         // function parameter N (its value is the Nth LLVM function argument)
         param: u32,
         // aggregates (emit path M6-D): atomic struct ops carrying the names a backend needs to resolve
@@ -123,7 +131,7 @@ pub fn instOperands(op: Inst.Op, buf: *[8]Value) []Value {
             push(buf, &n, x.base);
             push(buf, &n, x.val);
         },
-        .alloc, .const_int, .param => {},
+        .alloc, .const_int, .global_const, .param => {},
     }
     return buf[0..n];
 }
@@ -188,7 +196,7 @@ fn rewriteInst(op: *Inst.Op, from: Value, to: Value) void {
             sw(&x.base, from, to);
             sw(&x.val, from, to);
         },
-        .alloc, .const_int, .param => {},
+        .alloc, .const_int, .global_const, .param => {},
     }
 }
 
@@ -207,7 +215,7 @@ pub fn hasSideEffects(op: Inst.Op) bool {
         .store, .call, .indirect_call, .retain, .release, .await_, .spawn_ => true,
         // struct_new allocates + writes memory; field_set writes memory -> keep them.
         .struct_new, .field_set => true,
-        .binop, .load, .alloc, .gep, .cast, .const_int, .param, .field_get => false,
+        .binop, .load, .alloc, .gep, .cast, .const_int, .global_const, .param, .field_get => false,
     };
 }
 
@@ -233,11 +241,6 @@ pub const Func = struct {
     blocks: std.ArrayListUnmanaged(BasicBlock) = .empty,
     value_types: std.ArrayListUnmanaged(TypeId) = .empty, // Value -> TypeId, indexed by @intFromEnum
     entry: Block = @enumFromInt(0),
-    // Set when lowering produced a structural PLACEHOLDER whose value is not faithful (e.g. an unresolved
-    // ident lowered to `const_int 0`). The shadow analysis (M0-M5) is report-only and tolerates these, but
-    // the emit path (NOVA_OPT_EMIT) must NOT emit a function that contains one -- it would be a silent
-    // miscompile (a global-const reference reading as 0). mirEmittable rejects on this -> AST fallback.
-    emit_poison: bool = false,
 
     pub fn deinit(self: *Func, allocator: std.mem.Allocator) void {
         for (self.blocks.items) |*b| b.insts.deinit(allocator);

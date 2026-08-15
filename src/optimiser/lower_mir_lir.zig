@@ -42,6 +42,9 @@ fn lowerInst(allocator: std.mem.Allocator, lf: *lir.Func, inst: mir.Inst) !void 
         .gep => |x| try lf.ops.append(allocator, .{ .gep = .{ .result = r.?, .base = reg(x.base), .offset = x.offset } }),
         .cast => |x| try lf.ops.append(allocator, .{ .cast = .{ .result = r.?, .val = reg(x.val), .to = inst.ty } }),
         .const_int => |v| try lf.ops.append(allocator, .{ .const_int = .{ .result = r.?, .val = v } }),
+        // The shadow LIR only needs a structural stand-in for the op count -- the emit path resolves the real
+        // const via compiler.constants. Represent it as an opaque const_int 0 (its value is unknown here).
+        .global_const => try lf.ops.append(allocator, .{ .const_int = .{ .result = r.?, .val = 0 } }),
         .param => |i| try lf.ops.append(allocator, .{ .param = .{ .result = r.?, .index = i } }),
         // aggregates: the emit path drives these from MIR, so LIR only needs a structural stand-in for the
         // shadow's op count (alloc for the new object, load/store for a field access).
