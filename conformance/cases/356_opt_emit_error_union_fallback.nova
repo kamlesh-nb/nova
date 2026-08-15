@@ -1,0 +1,52 @@
+// B7 (FALLBACK, NOT emitted) — an error-union return `T | E` must fall back to the AST under NOVA_OPT_EMIT,
+// byte-identically, because the emit path does not model its representation. Reverse-engineered layout (see
+// docs/design/optimiser-pending.md B7 + case 33): the value is a POINTER to a 16-byte nova_bytes_alloc box
+// { i64 tag @0 (0=ok, 1=err), i64 payload @8 }; the ok arm is itself value-optional-boxed, so `T | E` reads
+// as `(T | undefined) | E` and a plain ok return nests TWO heap boxes; the box owns + ARC-releases its
+// payload by tag in __destruct_ErrUnion_*, and the error path runs errdefers before boxing. None of that has
+// a MIR op, so `lir_emit.zig` rejects an error-union return/param at the type-ref shape ("error-union
+// return"/"error-union param"). A raw-word emit would return an ok value as a bare int that `catch`/`try`/`??`
+// then dereference as a box pointer -> SEGV (the F1 class). This case pins the fallback: the results below
+// must be identical whether NOVA_OPT_EMIT is on or off.
+import assert;
+
+enum ConfigError {
+    NotFound(string),
+    BadPort(int),
+}
+
+// string-ok arm
+fn readConfig(path: string): string | ConfigError {
+    if (path == "missing") { return ConfigError.NotFound(path); }
+    return "8080";
+}
+
+// int value-ok arm -> the `(int | undefined) | E` nested-boxing shape
+fn safeDiv(a: int, b: int): int | ConfigError {
+    if (b == 0) { return ConfigError.BadPort(0); }
+    return a / b;
+}
+
+// `try` propagation across a function boundary (double error-union fn)
+fn loadPort(path: string): string | ConfigError {
+    let raw = try readConfig(path);
+    return "port=" + raw;
+}
+
+@test
+fn test_string_ok_and_err(): void {
+    assert.equalStr(readConfig("app.toml") catch "FB", "8080");
+    assert.equalStr(readConfig("missing") catch "FB", "FB");
+}
+
+@test
+fn test_int_value_arm_ok_and_err(): void {
+    assert.equalInt(safeDiv(20, 4) catch -1, 5);
+    assert.equalInt(safeDiv(1, 0) catch -1, -1);
+}
+
+@test
+fn test_try_propagates_and_unwraps(): void {
+    assert.equalStr(loadPort("app.toml") catch "FB", "port=8080");
+    assert.equalStr(loadPort("missing") catch "FB", "FB");
+}

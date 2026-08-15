@@ -21,6 +21,12 @@ pub const unset_ty: TypeId = @enumFromInt(0xFFFF_FFFF);
 // Null when unset -> width-dependent folding is skipped (conservative, never wrong).
 pub var type_store: ?*const types.TypeStore = null;
 
+// Set true by the LIR emit path (lir_emit.zig) around its own HIR->MIR lowering, false for the NOVA_OPT
+// shadow. It gates lowerings that produce a DEDICATED emit-path op (currently `.template`): the shadow keeps
+// its structural placeholder so its op counts stay byte-identical, while the emit path gets a real op it can
+// reproduce. Always reset (defer) by the setter so it never leaks into a subsequent shadow lowering.
+pub var emit_mode: bool = false;
+
 pub const IntWidth = struct { width: u16, signed: bool };
 
 // Resolve `tid` to its integer machine width/signedness via the store, or null if not an int prim / no store.
@@ -75,7 +81,12 @@ pub const Inst = struct {
         alloc: struct { ty: TypeId },
         gep: struct { base: Value, offset: u32 }, // field / element address
         call: struct { callee: SymbolId, args: []Value, takes_ownership: []const bool, name: ?[]const u8 = null },
-        indirect_call: struct { receiver: Value, slot: u32, args: []Value },
+        // Dynamic dispatch through a trait fat pointer (D5). `receiver` is the trait-object word (a pointer
+        // to a {struct_ptr, vtable} pair); `name` is the trait method's source name. The vtable slot is NOT
+        // resolvable here (the optimiser has no trait table) -- `slot` stays a placeholder and the backend
+        // resolves the real slot from the receiver's TypeId + trait declaration at emit time. `args` excludes
+        // the receiver (the backend prepends struct_ptr as self, matching the AST calling convention).
+        indirect_call: struct { receiver: Value, slot: u32, args: []Value, name: ?[]const u8 = null },
         cast: struct { val: Value },
         // ARC — first-class so the elision pass can see and cancel balanced pairs
         retain: struct { val: Value },
@@ -109,6 +120,19 @@ pub const Inst = struct {
         // string indexes a byte (obj+idx, load i8, zext); an array GEPs the i64-word element base. Carries no
         // element type -- the emit path reads it from the TypeId (rejecting float-element arrays for now).
         index_get: struct { object: Value, idx: Value },
+        // Tuple construction `(a, b, ...)`. A positional heap aggregate: N i64 words (nova_bytes_alloc),
+        // element k at offset k*8, each arg stored as the raw i64 word (no per-field type). Distinct from
+        // struct_new because a tuple has no named struct / field names -- the layout is purely positional.
+        // The emit path gates it to all-scalar (int/bool) element tuples; owned-element tuples need element
+        // ARC + a tuple destructor and stay on the AST.
+        tuple_new: struct { args: []Value },
+        // String interpolation `` `${a} text ${b}` `` (C5). Carries the ORDERED part values; every part is a
+        // `string` (an interpolated string var OR a literal-text run materialised as a const_str). The emit
+        // path reproduces the AST's StringBuilder lowering: alloc + StringBuilder_init, one StringBuilder_
+        // append per part (append COPIES + BORROWS, so no per-part ARC), StringBuilder_toString (the owned
+        // result), StringBuilder_delete, then nova_release(sb, null). Produced ONLY under `emit_mode` (the
+        // shadow keeps the aggregate placeholder); mirEmittable admits it only when every part is a string.
+        template: struct { parts: []Value },
     };
 };
 
@@ -155,6 +179,8 @@ pub fn instOperands(op: Inst.Op, buf: *[8]Value) []Value {
             push(buf, &n, x.object);
             push(buf, &n, x.idx);
         },
+        .tuple_new => |x| for (x.args) |arg| push(buf, &n, arg),
+        .template => |x| for (x.parts) |p| push(buf, &n, p),
         .alloc, .const_int, .const_str, .global_const, .param => {},
     }
     return buf[0..n];
@@ -224,6 +250,8 @@ fn rewriteInst(op: *Inst.Op, from: Value, to: Value) void {
             sw(&x.object, from, to);
             sw(&x.idx, from, to);
         },
+        .tuple_new => |*x| for (x.args) |*arg| sw(arg, from, to),
+        .template => |*x| for (x.parts) |*p| sw(p, from, to),
         .alloc, .const_int, .const_str, .global_const, .param => {},
     }
 }
@@ -241,8 +269,10 @@ fn rewriteTerm(term: *Terminator, from: Value, to: Value) void {
 pub fn hasSideEffects(op: Inst.Op) bool {
     return switch (op) {
         .store, .call, .indirect_call, .retain, .release, .await_, .spawn_ => true,
-        // struct_new allocates + writes memory; field_set writes memory -> keep them.
-        .struct_new, .field_set => true,
+        // struct_new / tuple_new allocate + write memory; field_set writes memory -> keep them.
+        .struct_new, .tuple_new, .field_set => true,
+        // template allocates a StringBuilder + calls into it -> observable, keep it even if the result is dead.
+        .template => true,
         .binop, .load, .alloc, .gep, .cast, .const_int, .const_str, .global_const, .param, .field_get, .index_get => false,
     };
 }

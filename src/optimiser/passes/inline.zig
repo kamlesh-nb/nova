@@ -131,6 +131,12 @@ fn remapOp(op: *mir.Inst.Op, vmap: []const mir.Value) void {
             x.object = vmap[@intFromEnum(x.object)];
             x.idx = vmap[@intFromEnum(x.idx)];
         },
+        .tuple_new => |*x| for (x.args) |*arg| {
+            arg.* = vmap[@intFromEnum(arg.*)];
+        },
+        .template => |*x| for (x.parts) |*p| {
+            p.* = vmap[@intFromEnum(p.*)];
+        },
         .alloc, .const_int, .const_str, .global_const, .param => {},
     }
 }

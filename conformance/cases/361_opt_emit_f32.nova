@@ -1,0 +1,38 @@
+// Emit-subset growth (B3, f32): 32-bit float (`f32`/`float`) arithmetic now emits too. In this backend an
+// f32 is PROMOTED to double everywhere in scalar code: its slot is `double`, its i64 word carries the
+// DOUBLE's 64-bit bit pattern (an f32 value is FPExt'd to double at the value-word boundary), and the AST
+// binop path bitcasts the word straight to DoubleType and computes at double precision. So the emit path
+// handles f32 with the IDENTICAL DoubleType bitcast as f64 (using the 32-bit LLVMFloatType width would
+// reinterpret garbage), and mixed f32/f64 is byte-identical because both are double-repr in the word.
+// Float const-folding stays disabled in constfold (a float const_int holds the double's BITS). Under
+// NOVA_OPT_EMIT these helpers compile from the emit path; both must agree. Scalar f32 only -- f32 struct
+// fields and f32 arrays keep real 32-bit storage and fall back.
+import assert;
+
+fn addF(x: f32, y: f32): f32 { return x + y; }
+fn mulF(x: f32): f32 { return x * 2.0; }
+fn poly(x: f32): f32 { return x * x - 2.0 * x + 1.0; } // (x-1)^2
+fn negF(x: f32): f32 { return -x; }
+fn lessThan(x: f32, y: f32): bool { return x < y; }
+fn divF(a: f32, b: f32): f32 { return a / b; }
+fn locals(a: f32): f32 { let t: f32 = a * 2.0; let u: f32 = t + 1.0; return u; }
+fn mixed(a: f32, b: f64): f64 { return a + b; } // f32 promoted to double; both are double-repr
+
+@test
+fn test_f32_arithmetic(): void {
+    assert.isTrue(addF(1.5, 2.5) == 4.0);
+    assert.isTrue(mulF(3.5) == 7.0);
+    assert.isTrue(poly(3.0) == 4.0);   // (3-1)^2 = 4
+    assert.isTrue(poly(1.0) == 0.0);
+    assert.isTrue(negF(2.0) == 0.0 - 2.0);
+    assert.isTrue(divF(10.0, 4.0) == 2.5);
+    assert.isTrue(locals(3.0) == 7.0); // 3*2 + 1
+    assert.isTrue(mixed(1.5, 2.5) == 4.0);
+}
+
+@test
+fn test_f32_compare(): void {
+    assert.isTrue(lessThan(1.0, 2.0));
+    assert.isTrue(!lessThan(2.0, 1.0));
+    assert.isTrue(!lessThan(2.0, 2.0));
+}

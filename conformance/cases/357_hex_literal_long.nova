@@ -1,0 +1,55 @@
+// A1/A2 — a hex integer literal with bit 31 set (e.g. 0x80000000 == 2147483648) must carry its full
+// value in a `long` context, exactly like the decimal form. The concern was that the hex form could be
+// typed/emitted as a 32-bit `int` (0x80000000 -> INT_MIN, sign-extended to -2147483648), so a `== long`
+// compare against the true value 2147483648 would fail while the decimal literal `2147483648` worked.
+// The default (AST) backend emits every integer literal at the full 64-bit value-word from its i64 bit
+// pattern, so no truncation happens; this case pins that the hex and decimal forms agree in `long`
+// context, and that a hex literal still inside signed-int range (0x7FFFFFFF) is unaffected.
+
+import assert;
+
+fn shiftHigh(x: long): long { return x << 31; }
+fn takesLong(x: long): long { return x; }
+fn retHigh(): long { return 0x80000000; }
+
+@test
+fn hex_high_bit_compare(): void {
+    // The exact repro: r == 0x80000000 must be true (r is the runtime long 2147483648).
+    let r = shiftHigh(1);
+    assert.isTrue(r == 0x80000000);
+    assert.isTrue(r == 2147483648);           // hex and decimal agree
+}
+
+@test
+fn hex_in_long_assignment(): void {
+    let a: long = 0x80000000;
+    assert.isTrue(a == 2147483648);           // bit 31 set
+    let c: long = 0xFFFFFFFF;
+    assert.isTrue(c == 4294967295);           // all low 32 bits set
+    let d: long = 0x100000000;
+    assert.isTrue(d == 4294967296);           // 2^32, beyond 32 bits
+    let e: long = 0xFFFFFFFFFF;
+    assert.isTrue(e == 1099511627775);        // 40-bit hex literal
+}
+
+@test
+fn hex_within_int_range_unchanged(): void {
+    // 0x7FFFFFFF is int max: still a valid int literal, and equals its decimal.
+    assert.equalInt(0x7FFFFFFF, 2147483647);
+    let f: long = 0x7FFFFFFF;
+    assert.isTrue(f == 2147483647);
+}
+
+@test
+fn hex_high_bit_in_arg_and_return(): void {
+    assert.isTrue(takesLong(0x80000000) == 2147483648);
+    assert.isTrue(retHigh() == 2147483648);
+}
+
+@test
+fn hex_high_bit_in_arithmetic(): void {
+    let a: long = 0x80000000 + 1;
+    assert.isTrue(a == 2147483649);
+    let b: long = 0x80000000 * 2;
+    assert.isTrue(b == 4294967296);
+}

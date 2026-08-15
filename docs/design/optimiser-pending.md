@@ -9,19 +9,23 @@ with per-function AST fallback (an unhandled construct never breaks a build -- i
 
 | Bucket | Count | IDs |
 |---|---|---|
-| DONE | 16 | A3, B1, B2, B3(f64), B4(ro), B8, C0, C1, C2, C3, C8, D1, D2, D3(string-field), D4 |
-| PARTIAL | 3 | B5 (read/construct/mutate/return), B6 (reference optionals), C5 (C-style `for`) |
-| FALLBACK (safe, not yet emitted) | 5 | B7, C4, C6, C7, D7 |
-| TODO | 1 | D6 arc-elision (dormant until threaded) |
-| DEFERRED (correctness / product / async) | 6 | A1, A2, D5, E1, E3, E4 |
+| DONE | 19 | A3, B1, B2, B3, B4(ro), B8, C0, C1, C2, C3, C5(enum/tuple/template), C8, D1, D2, D3(string-field), D4, D5(sync trait) |
+| PARTIAL | 3 | B5 (read/construct/mutate/return; string-field), B6 (reference optionals + nullish; value optionals gated-fallback), C4 (nullish done; optional-chain falls back) |
+| FALLBACK (safe, documented ABI) | 4 | B7 (error-union box), C6 (closures), C7 (try/errdefer), D7 (inline) |
+| WIRED | 1 | D6 arc-elision (in pipeline, proven no-op on current subset) |
+| DEFERRED (deep / product) | 6 | A1/A2 (emit-path literal only, not shipping), D5-async, E1, E3, E4 |
 
-Parallel-agent session (2026-08-15, four isolated worktrees, each gated to prove byte-identical + ASAN-clean
-or fall back): **C1** switch was already emitting for int/long (doc was stale) → DONE + case 347 enriched.
-**D3** string-owned-field struct destructors now emit (real `__destruct_*` for heap / `dropValueStruct` for
-value structs) → DONE, case 352. **D4** return-of-a-borrowed heap struct now emits with the return-retain
-threaded, ARC-balanced → DONE, case 353. **B5** returns need NO sret ABI — escape analysis heap-promotes any
-construct-and-returned struct, so the existing fresh-construction heap-return path already emits it (verified
-ASAN-clean incl. an intervening-call test) → B5 now read/construct/mutate/**return**, case 350 extended.
+Two parallel-agent sessions (2026-08-15, ~10 isolated worktrees, each gated to prove byte-identical +
+ASAN-clean or fall back). Wave 1: C1 switch (already emitting int/long; doc was stale), D3 string-owned-field
+struct destructors, D4 return-borrowed heap struct, B5 value-struct returns (no sret needed — escape analysis
+heap-promotes). Wave 2: **C5** payloadless enums (+ enum switch for free) + scalar tuples + all-string
+templates, **C4** `a ?? b` nullish for reference optionals, **D5** SYNCHRONOUS trait dynamic dispatch
+(fat-pointer + vtable), **B3** f32 (promoted-to-double ABI). FALLBACK-with-documented-ABI: B7 error-union
+box, C6 closures, C7 try/errdefer. **Three latent miscompiles in `791c696` were found and closed by the
+reverse-engineering:** B6 value-optional caller (a scalar-signature caller passed the raw word to a
+value-optional param — present-0 read as absent), D5 trait construct-and-pass (raw struct pointer instead of
+a fat pointer → BUS), and B7's fragile heap-struct-tid gate (now rejects at the `error_union` type-ref shape).
+New MIR ops: `tuple_new`, `indirect_call`, `template`. Cases 354-362 pin the new coverage.
 
 Legend: **DONE** emitted + gated · **PARTIAL** a subset emits, rest falls back · **FALLBACK** always AST today ·
 **TODO** not started · **DEFERRED** blocked on sema, a product call, or destructive teardown. Priority P0 highest.
@@ -31,8 +35,8 @@ Legend: **DONE** emitted + gated · **PARTIAL** a subset emits, rest falls back 
 ### A. Correctness fixes
 | ID | Item | Pri | Status |
 |----|------|-----|--------|
-| A1 | `0x80000000` hex-literal width in `== long` | P1 | DEFERRED (sema-rooted, latent) |
-| A2 | Wider `long`-vs-`int` threading audit | P1 | DEFERRED (same root as A1) |
+| A1 | `0x80000000` hex-literal width in `== long` | P1 | NOT-A-BUG on shipping backend (emit-path literal only) |
+| A2 | Wider `long`-vs-`int` threading audit | P1 | N/A on shipping backend (see A1) |
 | A3 | `verify.zig` use-before-def check | P1 | DONE |
 
 ### B. Signatures (params / returns)
@@ -40,11 +44,11 @@ Legend: **DONE** emitted + gated · **PARTIAL** a subset emits, rest falls back 
 |----|------|-----|--------|
 | B1 | Methods / `self` params | P0 | DONE |
 | B2 | String params / returns / locals | P1 | DONE |
-| B3 | Float params / returns / locals | P2 | DONE (f64; f32/decimal fall back) |
+| B3 | Float params / returns / locals | P2 | DONE (f32 + f64; decimal falls back) |
 | B4 | Array / pointer params | P2 | DONE (read-only, non-float) |
 | B5 | Value-struct params / returns | P2 | PARTIAL (read + construct + mutate + return; string-field via D3) |
-| B6 | Optional (`T \| undefined`) params / returns | P2 | PARTIAL (reference optionals; value optionals fall back) |
-| B7 | Error-union (`T \| E`) returns | P2 | FALLBACK |
+| B6 | Optional (`T \| undefined`) params / returns | P2 | PARTIAL (reference optionals + nullish; value optionals gated-fallback) |
+| B7 | Error-union (`T \| E`) returns | P2 | FALLBACK (box ABI documented + gate hardened) |
 | B8 | `>16` params | P3 | DONE (cap 32) |
 
 ### C. Body constructs
@@ -54,8 +58,8 @@ Legend: **DONE** emitted + gated · **PARTIAL** a subset emits, rest falls back 
 | C1 | `switch_` / match lowering | P1 | DONE (int/long) |
 | C2 | `cast` (int<->int) | P2 | DONE (int<->int) |
 | C3 | `index` (element access) | P2 | DONE (string byte + array word) |
-| C4 | `optional_chain` / `nullish` | P2 | FALLBACK |
-| C5 | `tuple`/`enum_init`/`template`/`range`; C-style `for` | P2 | PARTIAL (`for` done) |
+| C4 | `optional_chain` / `nullish` | P2 | PARTIAL (nullish for ref optionals; optional-chain falls back) |
+| C5 | `tuple`/`enum_init`/`template`/`range`; C-style `for` | P2 | PARTIAL (`for`, payloadless enum, scalar tuple, all-string template) |
 | C6 | `closure` | P3 | FALLBACK |
 | C7 | `try_` / errdefer | P2 | FALLBACK |
 | C8 | String / float literals in the body | P1 | DONE (string) |
@@ -67,8 +71,8 @@ Legend: **DONE** emitted + gated · **PARTIAL** a subset emits, rest falls back 
 | D2 | Emit `retain`/`release` (strings) | P1 | DONE (strings) |
 | D3 | Owned-field structs / aggregates | P2 | DONE (string fields) |
 | D4 | Return a borrowed struct | P2 | DONE (heap/class) |
-| D5 | `await_` / `spawn_` / `indirect_call` | P2 | DEFERRED (async coroutine + trait dispatch) |
-| D6 | Activate `arc_elision` pass | P1 | TODO (dormant) |
+| D5 | `await_` / `spawn_` / `indirect_call` | P2 | PARTIAL (sync trait dispatch DONE; async deferred) |
+| D6 | Activate `arc_elision` pass | P1 | WIRED (in pipeline, no-op on current subset) |
 | D7 | Activate `inline` pass | P2 | BLOCKED (no whole-program MIR) |
 
 ### E. Meta / rollout
@@ -89,12 +93,13 @@ the same differential + corpus + ASAN discipline as the landed ones.
 
 Design notes and the *why* behind each status. New entries are appended; a status flip updates its entry here.
 
-**A1** — Only the HEX form `0x80000000` mis-types (decimal `2147483648` is fine). Sema types the hex literal
-as `int` (INT_MIN, sign-extended) while a `== long` context wants `2147483648`. The fix belongs in sema (type
-hex literals by value, or coerce in the compare), not a hacky emit workaround. No emittable function hits it,
-so it does not regress the corpus.
-**A2** — Same sema literal-typing weakness as A1; the mask-read-as-int case was already fixed (C0 verbatim
-const). What remains is A1's hex-literal typing.
+**A1** — CORRECTED (this session): NOT a bug on the shipping (AST) backend. The parser reads a radix literal
+as `u64`→`i64` (full value `2147483648`) and codegen materializes every integer literal at full i64 width, so
+`0x80000000 == long` succeeds; verified across `0xFFFFFFFF`, `0x100000000`, 40-bit forms. Regression-guard
+case `357_hex_literal_long`. The earlier "sema-rooted / typed as int" note was WRONG. The only place a hex
+literal could still mistype is the emit path's SEPARATE literal-typing (via the threaded TypeId) — latent, no
+emittable corpus function hits it.
+**A2** — N/A on the shipping backend (see A1). The mask-read-as-int case was already fixed (C0 verbatim const).
 **A3** — 2026-08-15: program-order use-before-def check (the emit path's MIR flows values forward, so a valid
 def precedes its use in block-major order; a never-defined value is flagged). `tryEmitInner` now rejects a
 function on ANY verify violation → AST fallback. Would have caught the M6-C dangling load.
@@ -109,7 +114,11 @@ retained; a latent release-before-use ordering bug was fixed. String literals (C
 Remaining string gaps: capture-into-field (needs D3) and f32/decimal.
 **B3** — 2026-08-15 (be6c9ac): f64/double arithmetic emits (value is the double's bits in the i64 word;
 bitcast to double, fadd/fsub/fmul/fdiv/fcmp, bitcast back). Float literal → const_int(bits); constfold
-hardened never to fold a float binop. f32, decimal, mixed int/float, and float mod/shift/bitwise fall back.
+hardened never to fold a float binop. **f32 too (this session, 7d42c29):** reverse-engineering found this
+backend PROMOTES f32 to double everywhere in scalar code (an f32 local gets a Double slot, values are FPExt'd,
+the word carries the double's 64-bit pattern) — so f32 uses the IDENTICAL double bitcast as f64 (using a
+32-bit LLVMFloatType bitcast would reinterpret garbage). Added `isFloatWordTid` (f32||f64) across the param/
+return/binop gates. Decimal, f32 struct fields / arrays, and float mod/shift/bitwise still fall back.
 **B4** — 2026-08-15 (238e8a8): a non-float array param flows as `ptr`, round-trips the i64 slot, index_get
 resolves it. Array WRITE `a[i]=v` falls back (unmodelled lvalue → bad `store <i64 addr>`; mirEmittable now
 requires a store target to be an `alloc`, which also caught a 260 regression). Float arrays fall back.
@@ -133,11 +142,24 @@ Pinned by `351_opt_emit_ref_optional.nova`. A function that MATERIALISES `undefi
 falls back: `.undefined` lowers to `const_int 0`, exact for a reference optional but WRONG for a VALUE
 optional, which boxes to a non-zero absent-sentinel. **Verified this session that admitting `.undefined`
 MISCOMPILES `f(undefined)` for a value-optional param (AST=10 vs EMIT=134 + ASAN errors): the arg is passed
-as 0, not the boxed sentinel.** So value optionals stay fallback. Full value-optional emit needs the AST's
-present/absent boxing modelled node-by-node (the HIR gate is whole-function and cannot tell ref from value
-per node) — higher risk (valopt-zero history).
-**B7** — full emit needs the `(T|undefined)|E` boxing the AST return path does (statements.zig). Similar
-complexity to value optionals.
+as 0, not the boxed sentinel.** So value optionals stay fallback. **VALUE-OPTIONAL BOX ABI (reverse-engineered
+this session):** a value optional is a nullable pointer to an 8-byte ARC box — `nova_valopt_box(word)` =
+`nova_bytes_alloc(8)` storing the raw i64 word; unbox = `box==0 ? 0 : *box`; absent = the NULL word `0`;
+a present value (even `0`) is a NON-null box (that is why boxing exists). The AST boxes on every store into a
+value-optional slot (arg into a valopt param, let/assign, valopt return) and unboxes on every payload read.
+**A second latent miscompile was found + closed (591153e):** the whole-function gate rejected a value-optional
+SIGNATURE, but an emittable scalar-signature CALLER could still call a value-optional-param function and pass
+the raw word — proven live: `f(0)` gave AST=222 vs EMIT=111 (present-0 read as absent), `f(5)` gave AST=6 vs
+EMIT=134 + ASAN. Fixed with two `mirInstEmittable` guards: reject any instruction producing a value optional,
+and reject any call whose callee declares a value-optional param. Case `359`. Faithful *emit* (node-by-node
+box/unbox) remains the deferred slice.
+**B7** — FALLBACK, gate hardened (7417725). **ERROR-UNION BOX ABI (reverse-engineered):** `T | E` is a tagged
+16-byte ARC heap box — `tag@0` (0=ok, 1=err), `payload@8` (the ok or err value in the i64 slot), owned payload
+retained into the box, released by tag in `__destruct_ErrUnion_*`. The ok arm is itself value-optional-boxed
+(`(T|undefined)|E`), so a plain `return 42` is TWO nested heap boxes. The error path runs `runErrdefers()`
+before the box is built. Emit needs a heap-box-alloc-with-tag op + nested valopt boxing + errdefer + the
+try/catch unbox control-flow (C7) — none in MIR yet. The gate now rejects at the `error_union` type-ref shape
+(the box IS a heap object, so relying on `emittableHeapStructTid` failing was fragile). Case `356`.
 **B8** — 2026-08-15 (0016f3c): cap raised 16→32 (ptbuf / resolveCallee ptypes / call argbuf).
 
 **C0** — 2026-08-15 (334ccf5): `lower_ast_hir` rewrites a method call on a STRING receiver `s.m(a)` → named
@@ -157,12 +179,35 @@ to result width). float<->int / pointer casts fall back.
 **C3** — 2026-08-15 (7331294): new `index_get` MIR op. String indexes a byte (obj+idx, load i8, zext); array
 GEPs the i64-word element. Float arrays + lists (method-call access) fall back. ~0 function-coverage gain on
 its own (string bodies hit C8/C2 next).
-**C4** — coupled to optional modelling (B6): `a?.b` / `a ?? b` need present/absent branching.
-**C5** — 2026-08-15: C-style `for (init; cond; incr)` emits (desugared to a while; continue-bodies + iterator
-`for x in` fall back). tuple / enum_init / template / bare range values remain fallback (aggregate/interp,
-low value).
-**C6** — capture environment not modelled.
-**C7** — error-union control flow + errdefer not modelled.
+**C4** — PARTIAL (8bb73be). `a ?? b` NULLISH now emits for a REFERENCE optional `a`: lowered to a present-check
+branch on the pointer word (`a != 0 ? a : b`), a `condbr` on `icmp ne i64 a, 0`. Value-optional nullish falls
+back (the synthesized `a != null` isn't a reference-word compare → non-emittable → whole function reverts).
+`a?.b` optional-chain stays fallback: a scalar field ⇒ value-optional result (absent≠0), a reference field ⇒
+field_get ARC not modelled. Case `355`. Also landed 3 fixes: ref-optional PARAM inner-tid threading (case 351's
+`tag`/`firstNonEmpty` were falling back), store-authoritative ref-optional detection, and a value-optional
+safety gate.
+**C5** — 2026-08-15: C-style `for` emits (desugar to while; continue-bodies + iterator `for x in` fall back).
+**Payloadless ENUMS emit (4130c17):** a HIR post-pass folds `EnumName.Variant` → an int discriminant node,
+and `intKindForTid` classifies a payloadless-enum TypeId as a signed 64-bit int — so enum values, `==`/`!=`,
+params, returns, locals, AND `switch`-on-enum (C1's if-chain, for free) emit. Case `354`. **Scalar TUPLES emit
+(1d222dc):** new `tuple_new` op; a tuple is a positional heap aggregate (`nova_bytes_alloc(N*8)`, element k at
+`k*8`), `t.N` is desugared by the parser to `t[N]` → `index_get`. Landmine fixed: a tuple element is a raw
+64-bit word with NO 32-bit wrap (unlike an `int` local), so it must be word-typed. Case `358`. **All-string
+TEMPLATES emit (a4dc6f8):** new `template` op; reverse-engineering found this backend lowers `` `${…}` `` to a
+StringBuilder (`init`/`append` [copies+borrows, no per-part ARC]/`toString`/`delete`+`release`), NOT a concat
+chain. Non-string parts (need `numToString` + temp release) fall back. Case `362`. Tagged enums, owned-element
+tuples, tuple returns, and `range`-as-value still fall back.
+**C6** — FALLBACK, ABI documented. **CLOSURE ABI (reverse-engineered):** the value is a pointer to a 3-slot ARC
+heap box `{fn_ptr@0, env_ptr@8, __clocleanup@16}`; the env is a separate block of by-value capture words (one
+i64 per captured var, owned captures retained in); call = load box[0]/box[1], indirect-call passing env as
+arg0. Emit is INFEASIBLE without whole-program MIR: the HIR closure node is OPAQUE (`body = HirId.none`), all
+capture/env/lambda state is AST-span-keyed, and the lambda is a separate function the (one-function-at-a-time)
+emit path never sees. Same structural blocker as D7.
+**C7** — FALLBACK, ABI documented. `try expr`: load `tag=box[0]`, `is_err=(tag==1)`, cond-branch; on error run
+`runErrdefers()` (innermost→outermost, reverse within a scope, error-path only) then early-return the box; on
+ok load `payload=box[8]` + retain if owned. Three independent blockers: the B7 signature gate (a `try` is only
+legal in an error-union-returning fn, rejected at its signature), `try_` is a no-op in HIR→MIR (would drop
+propagation), and `errdefer`/`defer_stmt` has no HIR lowering. Emit is a slice on top of B7's box modelling.
 **C8** — 2026-08-15 (5cb7ec1): new `const_str` MIR op via the immortal interned global (no ARC). With
 C0/C3/D2 a whole string function BODY emits; the remaining gate on those functions is B-tier SIGNATURES. Float
 literals fall back.
@@ -189,12 +234,21 @@ needs no dtor), and the `.ret` gate admits a retained result (`isRetainedResult`
 `struct_new` case. Verified byte-identical + ASAN-clean + ARC-audit-clean incl. a 1000-iteration loop (case
 353). The `.release` gate stays string/string-field-struct-only, so a function with a releasable heap-struct
 LOCAL still falls back (that needs general class-dtor threading, out of D4 scope).
-**D5** — DEFERRED. Async is compiled as an LLVM coroutine (presplitcoroutine → CoroSplit), rejected up front
-(`func.is_async`); `spawn`/`await`/`indirect_call` (trait dynamic dispatch) are unmodelled. These are the
-deepest remaining subsystems — each is a multi-day slice with real miscompile risk, so they stay on the AST
-until designed properly.
-**D6** — `arc_elision` is implemented + unit-tested but dormant; this is the actual perf win, activate once
-ARC threading is broadly trusted.
+**D5** — PARTIAL: SYNCHRONOUS trait dynamic dispatch (`indirect_call`) now emits (0e7f0e6). **TRAIT ABI
+(reverse-engineered):** a trait object is a 16-byte ARC fat pointer `{struct_ptr@0, vtable@8}`; the vtable is
+a global `_vtable_<Struct>_<Trait>` where slot 0 = the destructor and method k = slot k+1; dispatch loads
+`struct_ptr`, `vtable`, `fn_ptr = *(vtable + (k+1)*8)`, then an indirect call passing `struct_ptr` as self; a
+trait PARAM is borrowed (no ARC). New `indirect_call` MIR op carrying the method name (the optimiser has no
+trait table; the backend resolves the slot from the receiver TypeId). Gated to sync + zero extra args + scalar
+result + a caller-built fat-pointer receiver. Case `360`. **A latent miscompile was closed:** the baseline
+emitted functions that CONSTRUCT a trait object and pass it to a trait-param callee, sending the raw struct
+pointer (not a fat pointer) → BUS; the new `.call` gate makes those fall back. Async (`await`/`spawn`,
+`func.is_async`), trait construction/widening, dispatch-with-args, and non-scalar returns stay deferred.
+**D6** — WIRED (98db0f9). `arc_elision` is ALREADY in `driver.pipeline` and runs on the emit path (no gate)
+now that D1-D4 thread ARC. Instrumented: it fires 0 times on the current subset (a retained string is always
+subsequently used → `observesRef` blocks the cancel; a D4 return-retain's matching release is in the CALLER).
+So it is active + provably byte-identical, but the perf win awaits the subset growing to produce a genuinely
+redundant retain/release pair.
 **D7** — the emit path lowers ONE function at a time, so there is no MIR callee map to inline from. Needs
 whole-program MIR (a larger restructuring). Implemented + unit-tested; stays dormant.
 

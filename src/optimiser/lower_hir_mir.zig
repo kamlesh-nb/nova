@@ -13,6 +13,7 @@
 const std = @import("std");
 const hir = @import("hir.zig");
 const mir = @import("mir.zig");
+const types = @import("../frontend/types.zig");
 
 const HirId = hir.HirId;
 const Value = mir.Value;
@@ -98,7 +99,15 @@ fn lowerNode(ctx: *Ctx, id: HirId) anyerror!Value {
         .binop => |b| blk: {
             const lhs = try lowerNode(ctx, b.lhs);
             const rhs = try lowerNode(ctx, b.rhs);
-            break :blk try mf.emit(a, ctx.cur, nty, .{ .binop = .{ .op = mapBin(b.op), .lhs = lhs, .rhs = rhs } });
+            // Result-type recovery: an arithmetic/bitwise/shift binop's result has the SAME type as its
+            // operands. Sema leaves the result UNRESOLVED whenever a sub-expression was unresolved -- notably
+            // `t.k` tuple-element access, whose type sema does not thread (see the .index case). When that
+            // happens, take the (now-resolved) lhs operand type so the emit path's result-width gate sees a
+            // concrete int. Only fires for a genuinely unresolved result on a same-type op -- resolved nodes
+            // and comparisons (whose result is bool, not the operand type) are untouched, so no behaviour
+            // changes for anything sema already typed.
+            const rty = inferSameTypeResult(ctx, b.op, nty, lhs);
+            break :blk try mf.emit(a, ctx.cur, rty, .{ .binop = .{ .op = mapBin(b.op), .lhs = lhs, .rhs = rhs } });
         },
         .unop => |u| blk: {
             const operand = try lowerNode(ctx, u.operand);
@@ -137,13 +146,61 @@ fn lowerNode(ctx: *Ctx, id: HirId) anyerror!Value {
             break :blk try mf.emit(a, ctx.cur, nty, .{ .field_get = .{ .base = object, .field = f.name } });
         },
         .optional_chain => |oc| blk: {
+            // `a?.b` == `a == null ? null : a.b`. For a REFERENCE optional `a` (nullable pointer word), branch
+            // on `a != 0`: present -> read the field; absent -> null (0). The result defaults to 0 on the
+            // absent path, which is correct ONLY when the whole `a?.b` is itself a REFERENCE optional (0 ==
+            // absent). When `a.b` is a value-type field, `a?.b` is a boxed VALUE optional (`int | undefined`),
+            // whose absent sentinel is NOT 0 -- so this lowering would miscompile it; the emit path's value-
+            // optional gate rejects any value-optional-typed result and the whole function falls back to the
+            // AST (which boxes). The field_get gate additionally rejects non-scalar (reference) fields, so a
+            // reference-field chain (whose result WOULD be a ref optional) also currently falls back. This
+            // lowering is therefore correct for any case the gates admit, and safe (fallback) for the rest.
             const object = try lowerNode(ctx, oc.object);
-            break :blk try mf.emit(a, ctx.cur, nty, .{ .gep = .{ .base = object, .offset = 0 } });
+            const obj_ty = mf.typeOf(object);
+            const slot = try mf.emit(a, ctx.cur, nty, .{ .alloc = .{ .ty = nty } });
+            const zero_res = try mf.emit(a, ctx.cur, nty, .{ .const_int = 0 });
+            try mf.emitVoid(a, ctx.cur, .{ .store = .{ .addr = slot, .val = zero_res } }); // absent default = null
+            const zero = try mf.emit(a, ctx.cur, obj_ty, .{ .const_int = 0 });
+            const present = try mf.emit(a, ctx.cur, obj_ty, .{ .binop = .{ .op = .ne, .lhs = object, .rhs = zero } });
+            const then_blk = try mf.newBlock(a);
+            const merge = try mf.newBlock(a);
+            mf.setTerm(ctx.cur, .{ .condbr = .{ .cond = present, .then = then_blk, .else_ = merge } });
+            ctx.cur = then_blk;
+            const field = try mf.emit(a, ctx.cur, nty, .{ .field_get = .{ .base = object, .field = oc.name } });
+            try mf.emitVoid(a, ctx.cur, .{ .store = .{ .addr = slot, .val = field } });
+            if (!mirTerminated(ctx)) mf.setTerm(ctx.cur, .{ .br = .{ .dest = merge, .args = &.{} } });
+            ctx.cur = merge;
+            break :blk try mf.emit(a, ctx.cur, nty, .{ .load = .{ .addr = slot } });
         },
         .index => |ix| blk: {
             const object = try lowerNode(ctx, ix.object);
             const idx = try lowerNode(ctx, ix.idx);
-            break :blk try mf.emit(a, ctx.cur, nty, .{ .index_get = .{ .object = object, .idx = idx } });
+            // Tuple positional access `t.k` desugars (in the parser) to `t[k]`, so it arrives here as an index
+            // whose result type sema leaves UNRESOLVED (tuple-element types are not threaded through the index
+            // expression). Recover the real element TypeId from the tuple's own type + the CONSTANT index, so
+            // the emit path's operand gates (e.g. a following int binop) see a concrete int/bool. Arrays keep
+            // `nty` (sema resolves their element type); only tuples fall through unresolved.
+            var rty = nty;
+            if (mir.type_store) |st| {
+                const otid = mf.typeOf(object);
+                if (otid != placeholder_ty and @intFromEnum(otid) < st.count() and st.get(otid) == .tuple) {
+                    const idx_node = ctx.hf.get(ix.idx);
+                    if (idx_node.kind == .int) {
+                        const k: i64 = idx_node.kind.int;
+                        const elems = st.get(otid).tuple;
+                        if (k >= 0 and @as(usize, @intCast(k)) < elems.len) {
+                            // Type the element read as the raw 64-bit WORD, not its declared 32-bit `int`. The
+                            // AST loads a tuple element as an i64 word and does 64-bit arithmetic on it with NO
+                            // width canonicalisation (a tuple element carries no int-width in the AST). Typing
+                            // it `int` here would make the emit path's binop wrap at 32 bits and DIVERGE from
+                            // the AST on overflow. The stored value already occupies the full word, so reading
+                            // it as `long` is byte-identical for every use (read / arithmetic / compare).
+                            rty = wordTid(st) orelse elems[@intCast(k)];
+                        }
+                    }
+                }
+            }
+            break :blk try mf.emit(a, ctx.cur, rty, .{ .index_get = .{ .object = object, .idx = idx } });
         },
 
         .struct_init => |si| blk: {
@@ -154,8 +211,26 @@ fn lowerNode(ctx: *Ctx, id: HirId) anyerror!Value {
             break :blk try mf.emit(a, ctx.cur, nty, .{ .struct_new = .{ .type_name = si.type_name, .field_names = si.field_names, .args = owned } });
         },
         .enum_init => |ei| try lowerAggregate(ctx, ei.fields),
-        .tuple => |elems| try lowerAggregate(ctx, elems),
-        .template => |parts| try lowerAggregate(ctx, parts),
+        .tuple => |elems| blk: {
+            // A tuple is a positional heap aggregate. Carry the element Values in a dedicated tuple_new op so
+            // the emit path can reproduce the AST's nova_bytes_alloc + offset-store sequence exactly; the
+            // shadow/structural path treats it as an alloc. (lowerAggregate would drop the elements.)
+            var args = std.ArrayListUnmanaged(Value).empty;
+            defer args.deinit(a);
+            for (elems) |eid| try args.append(a, try lowerNode(ctx, eid));
+            const owned = try a.dupe(Value, args.items);
+            break :blk try mf.emit(a, ctx.cur, nty, .{ .tuple_new = .{ .args = owned } });
+        },
+        // A template lowers to a dedicated `.template` op ONLY on the emit path (mir.emit_mode); the shadow
+        // keeps the structural placeholder so its op counts are unchanged. `nty` is the node's sema type
+        // (`string`); mirEmittable only admits it when every part is a string, else the function falls back.
+        .template => |parts| if (mir.emit_mode) blk: {
+            var pv = std.ArrayListUnmanaged(Value).empty;
+            defer pv.deinit(a);
+            for (parts) |p| try pv.append(a, try lowerNode(ctx, p));
+            const owned = try a.dupe(Value, pv.items);
+            break :blk try mf.emit(a, ctx.cur, nty, .{ .template = .{ .parts = owned } });
+        } else try lowerAggregate(ctx, parts),
         .range => |r| blk: {
             _ = try lowerNode(ctx, r.start);
             _ = try lowerNode(ctx, r.end);
@@ -242,12 +317,33 @@ fn lowerNode(ctx: *Ctx, id: HirId) anyerror!Value {
             break :blk try mf.emit(a, ctx.cur, nty, .{ .load = .{ .addr = slot } });
         },
         .nullish => |nc| blk: {
+            // `a ?? b` == `a != null ? a : b`. For a REFERENCE optional `a` (a nullable pointer word, 0 ==
+            // absent), this is a present-check branch on the word: evaluate `a` once, test `a != 0`, take
+            // `a` when present else evaluate + take `b`. A value-optional `a` is BOXED (absent is a non-zero
+            // sentinel, NOT 0), so treating `undefined` as 0 would miscompile -- but the present-check compare
+            // below is a reference-WORD eq (const 0 typed as `a`'s type), which the emit path's `isRefWordEq`
+            // gate admits ONLY for a reference word; a boxed value-optional's non-word type makes the compare
+            // non-emittable and the whole function falls back to the AST. So this stays airtight for value
+            // optionals without a separate check here.
             const slot = try mf.emit(a, ctx.cur, nty, .{ .alloc = .{ .ty = nty } });
-            // a ?? b : evaluate a, store; a present-check would branch to b. Structural: store a then b path.
             const lhs = try lowerNode(ctx, nc.lhs);
+            const lhs_ty = mf.typeOf(lhs);
+            const zero = try mf.emit(a, ctx.cur, lhs_ty, .{ .const_int = 0 });
+            const present = try mf.emit(a, ctx.cur, lhs_ty, .{ .binop = .{ .op = .ne, .lhs = lhs, .rhs = zero } });
+            const then_blk = try mf.newBlock(a);
+            const else_blk = try mf.newBlock(a);
+            const merge = try mf.newBlock(a);
+            mf.setTerm(ctx.cur, .{ .condbr = .{ .cond = present, .then = then_blk, .else_ = else_blk } });
+            // present: yield `a`.
+            ctx.cur = then_blk;
             try mf.emitVoid(a, ctx.cur, .{ .store = .{ .addr = slot, .val = lhs } });
+            if (!mirTerminated(ctx)) mf.setTerm(ctx.cur, .{ .br = .{ .dest = merge, .args = &.{} } });
+            // absent: evaluate + yield `b` (evaluated only on this path, matching the AST's short-circuit).
+            ctx.cur = else_blk;
             const rhs = try lowerNode(ctx, nc.rhs);
             try mf.emitVoid(a, ctx.cur, .{ .store = .{ .addr = slot, .val = rhs } });
+            if (!mirTerminated(ctx)) mf.setTerm(ctx.cur, .{ .br = .{ .dest = merge, .args = &.{} } });
+            ctx.cur = merge;
             break :blk try mf.emit(a, ctx.cur, nty, .{ .load = .{ .addr = slot } });
         },
         .loop_ => |lp| blk: {
@@ -264,9 +360,24 @@ pub const unresolved_callee: mir.SymbolId = @enumFromInt(0xFFFF_FFFF);
 fn lowerCall(ctx: *Ctx, callee: HirId, call_args: []const HirId, sym: ?hir.SymbolId, result_ty: mir.TypeId) !Value {
     const mf = ctx.mf;
     const a = ctx.allocator;
+    const callee_kind = ctx.hf.get(callee).kind;
+    // A method call `recv.method(args)` has a FIELD-ACCESS callee (the string-method fast path in
+    // lower_ast_hir already rewrote its calls to a NAMED ident callee, so a field callee here is a
+    // non-string method). Lower it to an `indirect_call` carrying the receiver + method name: the backend
+    // resolves the vtable slot from the receiver's TypeId when (and only when) it is a genuine trait object
+    // (D5). For a non-trait receiver (a static struct method) the backend gate rejects it and the function
+    // falls back to the AST -- exactly as a nameless `.call` did before, so no emittable case regresses.
+    if (callee_kind == .field) {
+        const recv = try lowerNode(ctx, callee_kind.field.object);
+        var margs = std.ArrayListUnmanaged(Value).empty;
+        defer margs.deinit(a);
+        for (call_args) |arg| try margs.append(a, try lowerNode(ctx, arg));
+        const mowned = try a.dupe(Value, margs.items);
+        return mf.emit(a, ctx.cur, result_ty, .{ .indirect_call = .{ .receiver = recv, .slot = 0, .args = mowned, .name = callee_kind.field.name } });
+    }
     // A direct call to a named function keeps that source name, so a backend can resolve it (emit path)
     // without a symbol table. Only a bare identifier callee is a candidate; anything else stays nameless.
-    const callee_name: ?[]const u8 = switch (ctx.hf.get(callee).kind) {
+    const callee_name: ?[]const u8 = switch (callee_kind) {
         .ident => |n| n,
         else => null,
     };
@@ -278,6 +389,39 @@ fn lowerCall(ctx: *Ctx, callee: HirId, call_args: []const HirId, sym: ?hir.Symbo
     @memset(owns, false);
     const target: mir.SymbolId = if (sym) |s| s else unresolved_callee;
     return mf.emit(a, ctx.cur, result_ty, .{ .call = .{ .callee = target, .args = owned, .takes_ownership = owns, .name = callee_name } });
+}
+
+// The interned 64-bit signed int ("long") TypeId, i.e. the raw machine word. Found by scan because the MIR
+// type_store is const here (cannot intern). `long`/`int` are interned early, so a real program always has it.
+fn wordTid(st: *const types.TypeStore) ?mir.TypeId {
+    var i: usize = 0;
+    while (i < st.count()) : (i += 1) {
+        const t = st.get(@enumFromInt(@as(u32, @intCast(i))));
+        if (t == .prim and t.prim.kind == .int and t.prim.bits == 64 and t.prim.signed) return @enumFromInt(@as(u32, @intCast(i)));
+    }
+    return null;
+}
+
+// True if `tid` is not usable as a concrete type: out of range, the unset sentinel, or a store `.unresolved`.
+fn tyUnresolved(st: anytype, tid: mir.TypeId) bool {
+    if (tid == placeholder_ty or @intFromEnum(tid) >= st.count()) return true;
+    return st.get(tid) == .unresolved;
+}
+
+// For a binop whose RESULT has the same type as its operands (arithmetic / bitwise / shift), recover an
+// unresolved result type from the lhs operand's (resolved) type. Comparisons are excluded -- their result is
+// bool, not the operand type. Returns `nty` unchanged when it is already resolved or cannot be recovered, so
+// nothing sema already typed is disturbed.
+fn inferSameTypeResult(ctx: *Ctx, op: hir.BinOp, nty: mir.TypeId, lhs: Value) mir.TypeId {
+    const st = mir.type_store orelse return nty;
+    if (!tyUnresolved(st, nty)) return nty;
+    switch (op) {
+        .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor, .shl, .shr => {
+            const lt = ctx.mf.typeOf(lhs);
+            return if (tyUnresolved(st, lt)) nty else lt;
+        },
+        else => return nty,
+    }
 }
 
 fn lowerAggregate(ctx: *Ctx, fields: []const HirId) !Value {

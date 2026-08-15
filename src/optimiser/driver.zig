@@ -5,9 +5,13 @@
 // during the rollout; see docs/design/optimiser.md).
 //
 // Status: M1 lowering complete (AST->HIR->MIR->LIR) + M2 verifier + M3 passes (mem2reg/constfold/
-// copyprop/dce/simplifycfg) firing; M4 arc_elision + M5 inline implemented + unit-tested but dormant
-// until ARC-op / call-graph threading. The middle-end does NOT yet EMIT (codegen still lowers from the
-// AST); NOVA_OPT runs the whole chain as a shadow and reports coverage. See docs/design/optimiser.md.
+// copyprop/dce/simplifycfg) firing; M4 arc_elision runs in the pipeline on both the NOVA_OPT shadow and
+// the NOVA_OPT_EMIT emit path now that D1-D4 thread retain/release, but on the current emit subset it
+// finds no cancellable pairs (a retained string is always subsequently used; a return-acquisition retain's
+// matching release lives in the caller), so it is a proven NO-OP there -- it cannot imbalance ARC, and the
+// perf win waits on the emit subset growing to include functions with genuinely redundant pairs. M5 inline
+// implemented + unit-tested but dormant (no whole-program MIR to inline from on the emit path).
+// See docs/design/optimiser.md and optimiser-pending.md (D6).
 
 const std = @import("std");
 const builtin = @import("builtin");

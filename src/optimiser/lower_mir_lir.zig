@@ -50,6 +50,13 @@ fn lowerInst(allocator: std.mem.Allocator, lf: *lir.Func, inst: mir.Inst) !void 
         // aggregates: the emit path drives these from MIR, so LIR only needs a structural stand-in for the
         // shadow's op count (alloc for the new object, load/store for a field access).
         .struct_new => try lf.ops.append(allocator, .{ .alloc = .{ .result = r.?, .ty = inst.ty } }),
+        // tuple_new is a positional heap aggregate; the emit path drives it from MIR, so the shadow LIR only
+        // needs a structural stand-in for the op count (the alloc of the new object).
+        .tuple_new => try lf.ops.append(allocator, .{ .alloc = .{ .result = r.?, .ty = inst.ty } }),
+        // `.template` is produced ONLY on the emit path (emit_mode), which drives emission from MIR and never
+        // lowers to LIR -- so this arm is unreachable at runtime; keep a structural alloc stand-in for the
+        // exhaustive switch (matching the aggregate placeholder the shadow uses).
+        .template => try lf.ops.append(allocator, .{ .alloc = .{ .result = r.?, .ty = inst.ty } }),
         .field_get => |x| try lf.ops.append(allocator, .{ .load = .{ .result = r.?, .addr = reg(x.base) } }),
         // The shadow LIR only needs a structural stand-in for the op count; the emit path resolves the real
         // element address from the object's TypeId. Represent it as a load off the object register.

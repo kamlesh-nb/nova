@@ -28,6 +28,7 @@ const opt_driver = @import("../../optimiser/driver.zig");
 const llvm_codegen = @import("llvm_codegen.zig");
 const types_mod = @import("types.zig");
 const expressions_mod = @import("expressions.zig");
+const sema_shadow = @import("../../frontend/sema/shadow.zig");
 const LlvmCompiler = llvm_codegen.LlvmCompiler;
 
 // Opt-in: set from NOVA_OPT_EMIT in builder.zig. Off by default, so default builds are byte-identical.
@@ -71,13 +72,34 @@ fn tryEmitInner(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, func: anyty
         // it to the inner tid -- which would masquerade as a plain scalar. The emit path does not model
         // optionals, so reject at the type-ref level before the tid is stripped.
         if (tr == .optional and !isRefOptionalTypeRef(compiler, tr)) return reject("optional param");
-        const ptid = compiler.concreteTidForTypeRef(tr) orelse return reject("unresolved param type");
+        // B7: an error-union param (`T | E`) is a tagged HEAP box {tag@0, payload@8} (nova_bytes_alloc,
+        // ARC-owned, __destruct_ErrUnion_* branches on the tag), and its ok arm is itself value-optional-
+        // boxed `(T|undefined)`. concreteTidForTypeRef could resolve it to a box tid that emittableHeapStruct
+        // Tid mistakes for a plain heap struct -> the body would read payload as raw struct fields. The emit
+        // path models none of the box/tag/unbox/errdefer machinery, so reject at the type-ref shape.
+        if (tr == .error_union) return reject("error-union param");
+        // For a REFERENCE optional param (`string | undefined`, class `T | undefined`), thread the INNER
+        // reference tid, not `concreteTidForTypeRef(tr)`: the latter strips the optional to a distinct
+        // "string"/struct tid that lands in a different slot than the canonical reference tid (a tid-space
+        // artefact), so `isStringTid`/`emittableHeapStructTid` reject it and the param falls back. A reference
+        // optional IS a plain nullable pointer word (0 == absent), identical at the word level to its payload
+        // reference, so threading the inner tid is exact (B6). A VALUE optional never reaches here (rejected
+        // above), so the boxed encoding is untouched.
+        const ptid = blk_ptid: {
+            if (tr == .optional) {
+                if (compiler.concreteTidForTypeRef(tr.optional.*)) |inner| break :blk_ptid inner;
+            }
+            break :blk_ptid compiler.concreteTidForTypeRef(tr) orelse return reject("unresolved param type");
+        };
         const scalar_ok = if (intKindForTid(compiler, ptid)) |pk| (pk.signed or pk.is_bool) else false;
         // A string param flows as the i64 pointer word like a class param. It is BORROWED, so read-only use
         // (via string_* method calls, now named by C0) needs no ARC; an owned string LOCAL created in the body
         // gets its scope-end release from the threaded ARC ops (D2). Capturing a string into a struct field is
         // blocked by the field gates (string fields are non-scalar); returning a string is blocked below.
-        if (!scalar_ok and !emittableHeapStructTid(compiler, ptid) and !isStringTid(compiler, ptid) and !isArrayWordTid(compiler, ptid) and !isF64Tid(compiler, ptid) and !emittableValueStructParamTid(compiler, ptid) and !emittableRefOptionalTid(compiler, ptid)) return reject("param not int/bool/heap-struct/string/array/f64/value-struct/ref-optional");
+        // A TRAIT-typed param is a borrowed fat-pointer word: the body may dispatch sync trait methods on it
+        // (D5). No ARC is threaded for it (a param is never an owned local), matching the AST borrow contract.
+        // isFloatWordTid admits both f32 (promoted-to-double ABI) and f64.
+        if (!scalar_ok and !emittableHeapStructTid(compiler, ptid) and !isStringTid(compiler, ptid) and !isArrayWordTid(compiler, ptid) and !isFloatWordTid(compiler, ptid) and !emittableValueStructParamTid(compiler, ptid) and !emittableRefOptionalTid(compiler, ptid) and !emittableTraitParamTid(compiler, ptid)) return reject("param not int/bool/heap-struct/string/array/f32/f64/value-struct/ref-optional/trait");
         ptbuf[i] = ptid;
     }
     const param_types = ptbuf[0..func.params.len];
@@ -90,6 +112,17 @@ fn tryEmitInner(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, func: anyty
     // the inner int, so the scalar check alone lets it through; gate on the type-ref shape too.
     if (func.ret_type_ref) |rtr| {
         if (rtr == .optional and !isRefOptionalTypeRef(compiler, rtr)) return reject("optional return");
+        // B7 (FALLBACK, documented in docs/design/optimiser-pending.md): an error-union return `T | E` is a
+        // tagged HEAP box built by arc.buildErrUnion -- 16 bytes = {i64 tag @0 (0=ok,1=err), i64 payload @8},
+        // a nova_bytes_alloc ARC object whose per-union __destruct_ErrUnion_* releases the payload by tag. The
+        // ok arm is NESTED value-optional-boxed: `T | E` reads as `(T|undefined) | E`, so `return 42` produces
+        // TWO nested heap boxes (outer errunion box holding a pointer to an inner valopt box). The error path
+        // also runs runErrdefers() before boxing, and an owned payload is retained INTO the box. None of this
+        // (heap-box alloc + tag/payload stores, nested valopt boxing, errdefer side effects, retain-into-box,
+        // and the try/catch/?? unbox control flow) has a MIR representation, so a raw-word emit would miscompile
+        // (an ok value returned as a bare int is read back as a box pointer -> SEGV). Reject at the type-ref
+        // shape -- do NOT rely on the tid failing emittableHeapStructTid below (the box IS a heap object).
+        if (rtr == .error_union) return reject("error-union return");
         const is_void = (rtr == .ident and std.mem.eql(u8, rtr.ident, "void"));
         if (!is_void) {
             const rtid = compiler.concreteTidForTypeRef(rtr) orelse return reject("unresolved return type");
@@ -112,7 +145,7 @@ fn tryEmitInner(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, func: anyty
             // release): mirEmittable's `.ret` gate restricts heap-struct returns to a FRESH construction
             // (isStructNewResult), and the retain/release gates are string-only, so the borrow-return is left to
             // the AST until struct-destructor ARC threading lands. That is an ARC slice, not a value-struct ABI.
-            if (!ret_scalar and !emittableHeapStructTid(compiler, rtid) and !isF64Tid(compiler, rtid) and !isStringTid(compiler, rtid) and !emittableRefOptionalTid(compiler, rtid)) return reject("return type not int/bool/heap-struct/f64/string/ref-optional");
+            if (!ret_scalar and !emittableHeapStructTid(compiler, rtid) and !isFloatWordTid(compiler, rtid) and !isStringTid(compiler, rtid) and !emittableRefOptionalTid(compiler, rtid)) return reject("return type not int/bool/heap-struct/f32/f64/string/ref-optional");
         }
     }
 
@@ -131,6 +164,9 @@ fn tryEmitInner(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, func: anyty
     mir.type_store = compiler.type_store;
     var hfunc = try lower_ast_hir.lowerFuncTyped(compiler.allocator, fd, ir, param_types);
     defer hfunc.deinit(compiler.allocator);
+    // C5: fold payloadless enum values (`Color.Red`) to their integer discriminant BEFORE the HIR gate, so a
+    // function that reads/compares enum values emits instead of falling back on the `.field`->field_get shape.
+    rewriteEnumValueNodes(compiler, &hfunc);
     if (!hirEmittable(&hfunc)) return reject("non-emittable HIR node");
 
     // HIR -> MIR, then run the optimiser pipeline. The only value-computing pass that can fire on this
@@ -139,6 +175,10 @@ fn tryEmitInner(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, func: anyty
     // simplifycfg are structural and do not change computed values. The store must be set for constfold's
     // width lookup.
     mir.type_store = compiler.type_store;
+    // Emit-path lowering: produce dedicated emit ops (e.g. `.template`) the shadow does not. Reset after so a
+    // later shadow lowering is unaffected.
+    mir.emit_mode = true;
+    defer mir.emit_mode = false;
     var mfunc = try lower_hir_mir.lowerFunc(compiler.allocator, hfunc);
     defer mfunc.deinit(compiler.allocator);
     _ = opt_driver.optimise(compiler.allocator, &mfunc) catch return reject("optimise failed");
@@ -170,10 +210,19 @@ fn hirEmittable(hf: *const hir.Func) bool {
             .int, .bool, .param, .ident, .binop, .unop, .let, .assign, .ret, .block,
             // control flow (M6-B): the MIR CFG + emitFunc handle these; if_expr lowers through a result slot
             .if_, .loop_, .if_expr, .brk, .cont,
+            // nullish `a ?? b` (C4): lowers to a present-check branch on the pointer word (`a != 0 ? a : b`).
+            // Emittable ONLY for a REFERENCE optional -- the synthesized `a != null` compare is a reference-
+            // WORD eq that mirEmittable's isRefWordEq gate admits solely for a reference word, so a boxed
+            // value optional makes the compare non-emittable and the whole function falls back. See the
+            // lower_hir_mir `.nullish` note for why treating value-optional `undefined` as 0 is unsafe.
+            .nullish,
             // direct calls (M6-C): validated + emitted from the MIR call op (callee resolved by name)
             .call, .generic_call,
             // structs (M6-D): construction + field read/write, validated + emitted from struct_new/field_*
             .struct_init, .field,
+            // tuples (C5): construction `(a, b)` -> tuple_new; element read `t.0` desugars to the index form
+            // `t[0]` (a `.index` node, already allowed). mirEmittable gates both to all-scalar tuples.
+            .tuple,
             // ARC (D2): retain/release threaded by lower_ast_hir; mirEmittable gates them to string operands.
             .retain, .release,
             // element read (C3): `object[idx]` -> index_get; mirEmittable gates it to string / non-float array.
@@ -182,6 +231,9 @@ fn hirEmittable(hf: *const hir.Func) bool {
             .cast,
             // string literals (C8): materialised as an immortal interned global (no ARC).
             .str,
+            // string interpolation (C5): `` `${a}b` ``; mirEmittable gates it to all-string parts and
+            // reproduces the AST StringBuilder lowering (alloc/init/append*/toString/delete/release).
+            .template,
             // float literals (B3): f64 flows as the double's bit pattern in the word; mirEmittable gates ops.
             .float => {},
             // NB: `undefined` / `null` are deliberately NOT in this allowlist. They lower to `const_int 0`,
@@ -207,11 +259,85 @@ fn hirEmittable(hf: *const hir.Func) bool {
 // canonicalisation + predicates the AST path applies conditionally); float/string/struct too.
 const IntKind = struct { width: u32, signed: bool, is_bool: bool };
 
+// The AST EnumDecl a TypeId names, but ONLY if the enum is PAYLOADLESS (no variant carries a `type_name`
+// or `fields`). A payloadless enum value is a plain integer discriminant word (expressions.zig materialises
+// `Color.Red` as `LLVMConstInt(val_type, discriminant)` and a `Color` param flows as that i64 word), so the
+// emit path can treat it exactly like a signed 64-bit int. A TAGGED enum is a heap `{tag, payload...}` box
+// with a different ABI -> null (fall back). Resolves the enum SymbolId via the live sema symbol table.
+fn payloadlessEnumDeclForTid(compiler: *LlvmCompiler, tid: mir.TypeId) ?*const ast.EnumDecl {
+    const st = compiler.type_store orelse return null;
+    if (tid == mir.unset_ty or @intFromEnum(tid) >= st.count()) return null;
+    const sid = switch (st.get(tid)) {
+        .enum_ => |s| s,
+        else => return null,
+    };
+    const sm = sema_shadow.live_sema orelse return null;
+    const ed = switch (sm.tab.symbolAt(sid).decl) {
+        .enum_ => |e| e,
+        else => return null,
+    };
+    for (ed.variants) |v| if (v.type_name != null or v.fields != null) return null;
+    return ed;
+}
+
+// True if the HIR function binds a local (or parameter) called `name`. Parameters are lowered as
+// `let name = param(i)`, so a `.let` scan covers both. Used to distinguish a genuine field read on a
+// same-named variable from a payloadless enum-value access (`Color.Red`).
+fn hirBindsLocal(hf: *const hir.Func, name: []const u8) bool {
+    for (hf.nodes.items) |n| {
+        if (n.kind == .let and std.mem.eql(u8, n.kind.let.name, name)) return true;
+    }
+    return false;
+}
+
+// Rewrite a payloadless enum VALUE (`Color.Red`) from a `.field` on a type-name ident into an `.int`
+// discriminant constant, exactly what the AST backend materialises (expressions.zig: `LLVMConstInt(val_type,
+// v.value orelse idx)`). Without this the `.field` lowers to a `field_get` on a base that is not a struct
+// value, and the whole function falls back. The node KEEPS its sema TypeId (the enum type), so intKindForTid
+// still classifies it as an enum-int word and `disc == Color.Red` compares as a plain i64 -- byte-identical
+// to the AST. The now-orphaned type-name `.ident` node is unreferenced; lower_hir_mir only lowers nodes
+// reachable from the block tree, so it is never emitted. Only PAYLOADLESS enums are rewritten (a tagged
+// `E.Variant` builds a heap box with a different ABI and stays on the AST).
+fn rewriteEnumValueNodes(compiler: *LlvmCompiler, hf: *hir.Func) void {
+    const nodes = hf.nodes.items;
+    for (nodes) |*node| {
+        if (node.kind != .field) continue;
+        const fld = node.kind.field;
+        const obj = nodes[@intFromEnum(fld.object)];
+        if (obj.kind != .ident) continue;
+        const type_name = obj.kind.ident;
+        if (hirBindsLocal(hf, type_name)) continue; // a same-named variable -> real field read
+        const scoped = compiler.scopedTypeName(type_name, node.span.file);
+        const ed = compiler.enums.get(scoped) orelse compiler.enums.get(type_name) orelse continue;
+        var tagged = false;
+        for (ed.variants) |v| {
+            if (v.type_name != null or v.fields != null) {
+                tagged = true;
+                break;
+            }
+        }
+        if (tagged) continue;
+        for (ed.variants, 0..) |v, idx| {
+            if (std.mem.eql(u8, v.name, fld.name)) {
+                const disc: i64 = v.value orelse @intCast(idx);
+                node.kind = .{ .int = disc }; // keep node.ty (the enum tid): the compare stays enum-typed
+                break;
+            }
+        }
+    }
+}
+
 fn intKindForTid(compiler: *LlvmCompiler, tid: mir.TypeId) ?IntKind {
     if (tid == mir.unset_ty) {
         if (emit_verbose) std.debug.print("[opt-emit]     tid=unset (placeholder)\n", .{});
         return null; // placeholder: unknown type -> cannot prove semantics
     }
+    // A payloadless enum is a discriminant word: the AST represents both the value (`LLVMConstInt(val_type,
+    // tag)`) and a `Color` param as the i64 word, and compares two of them with a plain signed `icmp` (see
+    // expressions.zig: "non-tagged enums are plain integer tags and already compare correctly via the integer
+    // path"). So it is a signed 64-bit int for every gate: param/return admit it as a scalar, and `==`/`!=`
+    // (and any incidental ordering) emit the identical i64 compare. No narrowing ever applies (val_type width).
+    if (payloadlessEnumDeclForTid(compiler, tid) != null) return .{ .width = 64, .signed = true, .is_bool = false };
     // symbolName's result is a transient compile-time string not owned by the caller (every other caller
     // treats it the same way and never frees it), so we do not free it here.
     const name = compiler.symbolName(tid) catch return null;
@@ -236,6 +362,30 @@ fn isF64Tid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
         .prim => |p| p.kind == .float and p.bits == 64,
         else => false,
     };
+}
+
+// True if `tid` is a 32-bit float (`f32`/`float`). B3 f32 extension: in THIS backend an f32 is PROMOTED to
+// double everywhere in scalar code -- its local/param slot is `double`, its i64 word carries the DOUBLE's
+// 64-bit bit pattern (castToValType FPExts f32->double then bitcasts), and the AST binop path bitcasts the
+// word straight to DoubleType and computes at double precision (never FPTrunc'ing between ops). A float
+// literal is `LLVMConstReal(DoubleType, val)` for f32 too. So an f32 value is bit-for-bit a double in the
+// word, and the emit path handles it with the SAME DoubleType bitcast as f64 -- using LLVMFloatType (the
+// 32-bit width) would reinterpret garbage. Scalar f32 only: f32 struct FIELDS and f32 ARRAYS keep the real
+// 32-bit storage and still fall back.
+fn isF32Tid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
+    const st = compiler.type_store orelse return false;
+    if (tid == mir.unset_ty or @intFromEnum(tid) >= st.count()) return false;
+    return switch (st.get(tid)) {
+        .prim => |p| p.kind == .float and p.bits == 32,
+        else => false,
+    };
+}
+
+// A scalar float that flows as the DOUBLE's bit pattern in the i64 word: f64, or f32 (promoted to double).
+// Both take the identical DoubleType-bitcast emit path; the only difference is the source width, which is
+// invisible here because f32 was already FPExt'd to double at the value-word boundary.
+fn isFloatWordTid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
+    return isF64Tid(compiler, tid) or isF32Tid(compiler, tid);
 }
 
 const Callee = struct { fn_val: types.LLVMValueRef, fn_type: types.LLVMTypeRef };
@@ -290,6 +440,25 @@ fn isArrayWordTid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
     };
 }
 
+// True if `tid` is a tuple whose EVERY element is a scalar int/bool. A tuple is a positional heap aggregate
+// (N i64 words, element k at k*8). A scalar tuple has no owned elements, so its construction needs no element
+// retain and its element reads load the i64 word directly -- exactly what the AST emits. A tuple with a
+// string / float / nested-aggregate element needs element ARC (or a float/bit read) the AST threads but this
+// slice does not, so it falls back. The tuple's OWN heap release (a no-op-body tuple destructor + free) is
+// still emitted for the scalar case (see the .release gate/emit).
+fn isScalarTupleTid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
+    const st = compiler.type_store orelse return false;
+    if (tid == mir.unset_ty or @intFromEnum(tid) >= st.count()) return false;
+    return switch (st.get(tid)) {
+        .tuple => |elems| blk: {
+            if (elems.len == 0) break :blk false;
+            for (elems) |et| if (intKindForTid(compiler, et) == null) break :blk false;
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
 const IndexKind = enum { string, array_word };
 fn indexKind(compiler: *LlvmCompiler, otid: mir.TypeId) ?IndexKind {
     const st = compiler.type_store orelse return null;
@@ -301,6 +470,10 @@ fn indexKind(compiler: *LlvmCompiler, otid: mir.TypeId) ?IndexKind {
             if (et == .prim and et.prim.kind == .float) break :blk null; // float arrays: deferred
             break :blk .array_word;
         },
+        // A scalar tuple indexes exactly like an array of words: `t[k]` inttoptr's the base + GEPs the k-th
+        // i64 word. (indexKind takes only the object type; gating to all-scalar tuples keeps every element a
+        // word, byte-identical to the AST index path, which never takes the float branch for a tuple.)
+        .tuple => if (isScalarTupleTid(compiler, otid)) .array_word else null,
         else => null,
     };
 }
@@ -365,6 +538,100 @@ fn emittableHeapStructTid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
     const base = types_mod.getStructBaseName(nm);
     if (!compiler.structs.contains(base)) return false;
     return !compiler.isValueStructName(base);
+}
+
+// True if `tid` is a TRAIT type (a trait object). A trait object is a fat pointer -- a heap-allocated
+// {struct_ptr, vtable} pair -- that flows as the i64 pointer word (declarations.zig types every non-array
+// param as val_type). It is BORROWED when passed as a param: the callee dispatches through it read-only and
+// does NOT retain/release it (the caller owns the object), so a trait param needs no ARC threading -- which
+// matches lower_ast_hir, which threads releases only for owned LOCALS, never params. Only used to admit a
+// trait-typed param whose body dispatches one or more sync trait methods on it (D5).
+fn emittableTraitParamTid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
+    if (tid == mir.unset_ty) return false;
+    const nm = compiler.symbolName(tid) catch return false;
+    const base = types_mod.getStructBaseName(nm);
+    return compiler.traits.contains(base);
+}
+
+// D5: resolve a MIR `indirect_call` to a concrete trait vtable slot, or null (-> fall back to the AST). The
+// receiver's threaded TypeId must name a known TRAIT, and the method name must be one of that trait's
+// methods; the returned index is the method's position in the trait declaration (the vtable stores the
+// destructor at slot 0 and method k at slot k+1, so the emit adds 1). An ASYNC trait method is a coroutine
+// (spawn/await + a driven handle) that this path does not model -- rejected here so async stays on the AST.
+fn traitDispatchSlot(compiler: *LlvmCompiler, mf: *const mir.Func, x: anytype) ?u32 {
+    const mname = x.name orelse return null;
+    const rtid = mf.typeOf(x.receiver);
+    if (rtid == mir.unset_ty) return null;
+    const nm = compiler.symbolName(rtid) catch return null;
+    const base = types_mod.getStructBaseName(nm);
+    const trait = compiler.traits.get(base) orelse return null;
+    for (trait.methods, 0..) |tm, idx| {
+        if (std.mem.eql(u8, tm.name, mname)) {
+            if (tm.is_async) return null; // async trait dispatch (coroutine) is not modelled here
+            return @intCast(idx);
+        }
+    }
+    return null;
+}
+
+// True if Value `v` is defined by a `.param` instruction -- i.e. it is a function argument, not a local.
+fn valueIsParam(mf: *const mir.Func, v: mir.Value) bool {
+    for (mf.blocks.items) |*b| {
+        for (b.insts.items) |inst| {
+            if (inst.result == v) return inst.op == .param;
+        }
+    }
+    return false;
+}
+
+// True if a trait dispatch receiver `v` is a caller-built fat pointer: it is a function PARAM directly, OR
+// a LOAD from a slot that is stored ONLY param values (a repeated `sh.method()` that mem2reg left as a load
+// of the param slot rather than forwarding the `.param` value). This EXCLUDES a trait LOCAL that could hold
+// a struct implicitly WIDENED to the trait (`let a: Shape = Sq{...}`) -- a conversion the emit path does not
+// model: such a slot's stored value is a struct_new / widened value, not a param, so it is rejected here
+// (and, being an owned trait local, it is also rejected by the string-only .release gate). A trait object
+// passed in as a param is always well-formed (the caller ran constructTraitObject), so dispatching on it is
+// safe. Anything else (a field/array/call-result trait value) falls back to the AST.
+fn receiverIsParamBacked(mf: *const mir.Func, v: mir.Value) bool {
+    for (mf.blocks.items) |*b| {
+        for (b.insts.items) |inst| {
+            if (inst.result != v) continue;
+            switch (inst.op) {
+                .param => return true,
+                .load => |ld| {
+                    // The slot must receive at least one store, and every store into it must be a param.
+                    var any = false;
+                    for (mf.blocks.items) |*b2| {
+                        for (b2.insts.items) |s| {
+                            if (s.op == .store and s.op.store.addr == ld.addr) {
+                                any = true;
+                                if (!valueIsParam(mf, s.op.store.val)) return false;
+                            }
+                        }
+                    }
+                    return any;
+                },
+                else => return false,
+            }
+        }
+    }
+    return false;
+}
+
+// True if the callee named `name` declares a TRAIT-typed parameter among its first `nargs` params. Passing
+// an argument to a trait param may require implicit struct->trait WIDENING at the call site (the AST builds
+// the fat pointer via constructTraitObject); the emit path passes args as raw words with NO coercion, so it
+// cannot widen. Such a call is rejected -> the function falls back to the AST. This also closes a pre-existing
+// emit-path miscompile: a function that constructs a trait object and passes it to a trait-param free
+// function emitted the raw struct pointer (a non-fat pointer), crashing the callee's first vtable load.
+fn calleeHasTraitParam(compiler: *LlvmCompiler, name: []const u8, nargs: usize) bool {
+    var i: usize = 0;
+    while (i < nargs) : (i += 1) {
+        const ptn = compiler.getFunctionParamType(name, i) orelse continue;
+        defer compiler.allocator.free(ptn);
+        if (compiler.traits.contains(types_mod.getStructBaseName(ptn))) return true;
+    }
+    return false;
 }
 
 // True if `tr` is the bare `string` type-ref. `string` is the one OWNED (non-scalar) field the emit path
@@ -461,8 +728,48 @@ fn isRefWordEq(compiler: *LlvmCompiler, mf: *const mir.Func, x: anytype) bool {
 // word, so a reference optional is byte-identical to the AST. A VALUE optional (`int | undefined`) IS boxed
 // (nova_valopt_box, so a present 0 is distinguishable from absent) -- that encoding is not emitted here, so
 // valueOptionalName-typed optionals are excluded and fall back.
+// If `tid` is a store `.optional` whose inner is a REFERENCE type (string or a non-value struct/class),
+// return that inner tid; else null. The type_store is authoritative and, crucially, sees the `.optional`
+// even when its rendered NAME drops the `| undefined` (e.g. `string | undefined` renders as `string`, which
+// the name-based path below cannot recognise -- that is why B6's string-optional params were not emitting).
+// A VALUE optional (`.optional` inner prim/decimal/value-struct) returns null: its boxed encoding is NOT a
+// nullable word and must fall back.
+fn refOptionalInner(compiler: *LlvmCompiler, tid: mir.TypeId) ?mir.TypeId {
+    const st = compiler.type_store orelse return null;
+    if (tid == mir.unset_ty or @intFromEnum(tid) >= st.count()) return null;
+    const t = st.get(tid);
+    if (t != .optional) return null;
+    const inner = t.optional;
+    if (isStringTid(compiler, inner)) return inner;
+    if (emittableHeapStructTid(compiler, inner)) return inner;
+    return null;
+}
+
+// True if `tid` is a BOXED VALUE optional: a store `.optional` whose inner is a VALUE type (int/bool/float/
+// decimal/value-struct). The AST path boxes such a value (nova_valopt_box) so that a present 0 is
+// distinguishable from absent, but the emit path has no boxing and would flow the raw word -- which
+// miscompiles both a materialised `let z: int | undefined = 0` (stored as raw 0, then unboxed by a callee as
+// a pointer) and `f(undefined)` (passed as 0, not the sentinel). The whole-function HIR `.undefined` guard
+// only catches a MATERIALISED `undefined` literal, not a value-optional that arrives via a typed local or a
+// call result, so gate on the TYPE here: any value-optional-typed MIR value forces the function to the AST.
+fn isValueOptionalTid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
+    const st = compiler.type_store orelse return false;
+    if (tid == mir.unset_ty or @intFromEnum(tid) >= st.count()) return false;
+    const t = st.get(tid);
+    if (t != .optional) return false;
+    return refOptionalInner(compiler, tid) == null; // an optional that is NOT a reference optional == value optional
+}
+
 fn emittableRefOptionalTid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
     if (tid == mir.unset_ty) return false;
+    // Store-authoritative first: a `.optional` type is decided purely by its inner's reference-ness (this
+    // catches the `string | undefined` case whose rendered name is just `string`). A store `.optional` with a
+    // VALUE inner is a boxed value optional -> reject here, do NOT fall through to the name heuristic.
+    if (compiler.type_store) |st| {
+        if (@intFromEnum(tid) < st.count() and st.get(tid) == .optional) {
+            return refOptionalInner(compiler, tid) != null;
+        }
+    }
     const nm = compiler.symbolName(tid) catch return false;
     if (std.mem.indexOfScalar(u8, nm, '|') == null) return false; // not a union/optional
     if (types_mod.valueOptionalName(nm)) return false; // boxed value-optional: not emitted here
@@ -485,6 +792,12 @@ fn emittableRefOptionalTid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
 // class-payload optional (`Foo | undefined`) needs the struct's `__destruct_*` and is excluded here.
 fn isStringRefOptionalTid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
     if (tid == mir.unset_ty) return false;
+    // Store-authoritative: a `.optional` whose inner is a `string` (the rendered name would just be `string`).
+    if (compiler.type_store) |st| {
+        if (@intFromEnum(tid) < st.count() and st.get(tid) == .optional) {
+            return isStringTid(compiler, st.get(tid).optional);
+        }
+    }
     const nm = compiler.symbolName(tid) catch return false;
     const bar = std.mem.indexOfScalar(u8, nm, '|') orelse return false;
     if (types_mod.valueOptionalName(nm)) return false;
@@ -495,6 +808,39 @@ fn isStringRefOptionalTid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
     return std.mem.eql(u8, arm, "string");
 }
 
+// True if `tid` is a VALUE optional (`int | undefined`, `bool | undefined`, `f64 | undefined`, or a value
+// struct | undefined): one the AST BOXES via nova_valopt_box, so a present 0 is a NON-NULL heap box and only
+// absent is the null word. The emit path does NOT model that box/unbox (it would need node-by-node boxing on
+// every store/return/arg into the optional and an unbox on every payload read, plus the box temporary's ARC
+// release -- see optimiser-pending.md B6), so ANY value flowing as a value optional falls back to the AST.
+// This is the guard that keeps the two engines byte-identical: without it a present 0 emits as the absent
+// word (miscompile) and a payload read dereferences the raw scalar as a pointer (ASAN). A REFERENCE optional
+// (`string | undefined`, class `T | undefined`) is NOT boxed (0 == absent, present is the payload pointer),
+// so valueOptionalName is false for it and it stays emittable -- see isStringRefOptionalTid / case 351.
+fn tidIsValueOptional(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
+    if (tid == mir.unset_ty) return false;
+    const nm = compiler.symbolName(tid) catch return false;
+    return types_mod.valueOptionalName(nm);
+}
+
+// True if a direct call to `name` with `nargs` arguments delivers ANY argument into a value-optional
+// PARAMETER. The AST boxes such an argument at the call site (compileCallArgument -> buildValoptBox); the emit
+// path passes the raw word, so the callee -- whether AST or emitted -- reads a present value as absent (a
+// present 0 is the null word) or dereferences the raw scalar on unbox. resolveCallee accepts the callee
+// because a boxed value optional IS an i64 word in the signature, which is exactly why the plain all-word
+// check is not enough. We recover the callee's declared parameter TypeRefs by name and reject if any is a
+// value optional. Checked under both the resolved (module-namespaced) and the raw source name.
+fn callTargetsValueOptionalParam(compiler: *LlvmCompiler, name: []const u8, nargs: usize) bool {
+    const resolved = compiler.resolveCalleeName(name) catch name;
+    var i: usize = 0;
+    while (i < nargs) : (i += 1) {
+        const tr = compiler.getFunctionParamTypeRef(resolved, i) orelse
+            compiler.getFunctionParamTypeRef(name, i) orelse continue;
+        if (compiler.valoptTypeRefIsValue(tr)) return true;
+    }
+    return false;
+}
+
 // Dry validation: return false if any instruction OR terminator is outside the emittable subset, building
 // NO IR. This MUST run before emitFunc touches the builder -- otherwise a mid-stream reject would leave a
 // half-emitted block that the AST fallback then double-fills. Keep the per-op gates in sync with emitBinop /
@@ -502,6 +848,10 @@ fn isStringRefOptionalTid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
 fn mirEmittable(compiler: *LlvmCompiler, mf: *const mir.Func) bool {
     for (mf.blocks.items) |*b| {
         for (b.insts.items) |inst| {
+            // A boxed value optional cannot be represented on the emit path (no boxing) -- reject the whole
+            // function so it falls back to the AST, which boxes it. Every MIR Value is an inst result, so
+            // gating each inst's type covers all value-optional-typed values (locals, call results, params).
+            if (isValueOptionalTid(compiler, inst.ty)) return false;
             if (!mirInstEmittable(compiler, mf, inst)) return false;
         }
         switch (b.term) {
@@ -523,14 +873,23 @@ fn mirEmittable(compiler: *LlvmCompiler, mf: *const mir.Func) bool {
 fn mirInstEmittable(compiler: *LlvmCompiler, mf: *const mir.Func, inst: mir.Inst) bool {
     {
         {
+            // A value flowing AS a value optional is never emittable: whatever instruction produces it (a call
+            // that RETURNS `int | undefined`, a `let` / temp typed as one) would have to box the payload, and
+            // every downstream read would have to unbox -- neither modelled here (see tidIsValueOptional). The
+            // whole-function param/return gate already rejects a value-optional signature; this catches a value
+            // optional materialised or bound INSIDE an otherwise-scalar function (e.g. a local from a valopt
+            // call). Reject the function so it falls back to the AST, which boxes/unboxes correctly.
+            if (tidIsValueOptional(compiler, inst.ty)) return false;
             switch (inst.op) {
                 .binop => |x| {
-                    // FLOAT (f64) binop (B3): both operands f64; arithmetic (add/sub/mul/div) or a compare.
-                    // No mod/shift/bitwise on float. The emit path bitcasts to double and back.
-                    if (isF64Tid(compiler, mf.typeOf(x.lhs))) {
-                        if (!isF64Tid(compiler, mf.typeOf(x.rhs))) return false;
+                    // FLOAT (f64/f32) binop (B3): both operands float; arithmetic (add/sub/mul/div) or a
+                    // compare. No mod/shift/bitwise on float. The emit path bitcasts to double and back.
+                    // f32 is promoted to double in this backend, so an f32 operand takes the identical path
+                    // (double bits in the word); mixed f32/f64 is fine because both are double-repr.
+                    if (isFloatWordTid(compiler, mf.typeOf(x.lhs))) {
+                        if (!isFloatWordTid(compiler, mf.typeOf(x.rhs))) return false;
                         switch (x.op) {
-                            .add, .sub, .mul, .div => if (!isF64Tid(compiler, inst.ty)) return false,
+                            .add, .sub, .mul, .div => if (!isFloatWordTid(compiler, inst.ty)) return false,
                             .eq, .ne, .lt, .le, .gt, .ge => {}, // result is bool (word 0/1)
                             else => return false,
                         }
@@ -572,6 +931,15 @@ fn mirInstEmittable(compiler: *LlvmCompiler, mf: *const mir.Func, inst: mir.Inst
                 .call => |x| {
                     const nm = x.name orelse return false;
                     if (resolveCallee(compiler, nm, x.args.len) == null) return false;
+                    // A callee with a trait-typed param may need the arg WIDENED to a trait object (a
+                    // fat pointer) at the call site; the emit path cannot widen, so fall back (D5).
+                    if (calleeHasTraitParam(compiler, nm, x.args.len)) return false;
+                    // An argument delivered into a value-optional PARAMETER must be boxed at the call site (the
+                    // AST does this); the emit path passes the raw word, so it would pass a present 0 as the
+                    // absent null word and a present value's raw scalar where the callee expects a box pointer
+                    // to unbox. resolveCallee cannot see this (a boxed value optional is an i64 word), so gate
+                    // on the callee's declared parameter types and fall back if any target is a value optional.
+                    if (callTargetsValueOptionalParam(compiler, nm, x.args.len)) return false;
                 },
                 // Heap OR value struct, fully initialised (every declared field supplied so we never rely on
                 // zero-init), whose fields are all scalar or bare-`string`-with-a-const_str-literal value (D3).
@@ -595,6 +963,13 @@ fn mirInstEmittable(compiler: *LlvmCompiler, mf: *const mir.Func, inst: mir.Inst
                         if (isStringFieldTypeRef(ftr) and isConstStrResult(mf, arg)) continue;
                         return false;
                     }
+                },
+                // Tuple construction: emittable iff EVERY element is a scalar int/bool (no owned/float element
+                // to retain or bit-read). The result TypeId must itself be a scalar tuple. This mirrors the
+                // AST's nova_bytes_alloc + offset-store sequence with no element ARC.
+                .tuple_new => |x| {
+                    if (!isScalarTupleTid(compiler, inst.ty)) return false;
+                    for (x.args) |arg| if (intKindForTid(compiler, mf.typeOf(arg)) == null) return false;
                 },
                 .field_get => |x| {
                     // Reads work for BOTH a heap struct (payload pointer) and a value struct (its inline byte
@@ -629,9 +1004,27 @@ fn mirInstEmittable(compiler: *LlvmCompiler, mf: *const mir.Func, inst: mir.Inst
                 // fields are all strings (D3) -- released via its real `__destruct_<Struct>` (heap) or a direct
                 // destructor call on its inline storage (value struct). Other owned types (class-with-non-
                 // string-fields / list / nested-struct / error-union) still need dtor resolution -> fall back.
-                .release => |x| if (!isStringTid(compiler, mf.typeOf(x.val)) and !isStringRefOptionalTid(compiler, mf.typeOf(x.val)) and stringFieldStructDropKind(compiler, mf.typeOf(x.val)) == null) return false,
+                // ... OR a scalar tuple (D-tuple): its own heap allocation is freed via the tuple destructor
+                // (a no-op body -- no owned elements -- so `nova_release(ptr, __destruct_<tuple>)` just decrefs
+                // + frees the N words), byte-identical to the AST tuple release.
+                .release => |x| if (!isStringTid(compiler, mf.typeOf(x.val)) and !isStringRefOptionalTid(compiler, mf.typeOf(x.val)) and stringFieldStructDropKind(compiler, mf.typeOf(x.val)) == null and !isScalarTupleTid(compiler, mf.typeOf(x.val))) return false,
                 // element read (C3): only a string (byte index) or a non-float array (i64-word element).
                 .index_get => |x| if (indexKind(compiler, mf.typeOf(x.object)) == null) return false,
+                // String interpolation (C5): emittable only when EVERY part is a `string` (interpolated string
+                // var or a const_str literal-text run) -- so each append is a plain borrow-copy with no per-part
+                // toString/ARC, reproducing the AST StringBuilder path exactly. A non-string part (int/float/
+                // optional/decimal) needs the AST's type-dispatched append (numToString + release), not modelled
+                // here, so it falls back. Also require the StringBuilder helpers to be resolvable in func_map
+                // (any template-using program imports them, but stay safe: fall back if absent).
+                .template => |x| {
+                    for (x.parts) |p| {
+                        if (!isStringTid(compiler, mf.typeOf(p))) return false;
+                    }
+                    if (compiler.func_map.get("StringBuilder_init") == null) return false;
+                    if (compiler.func_map.get("StringBuilder_append") == null) return false;
+                    if (compiler.func_map.get("StringBuilder_toString") == null) return false;
+                    if (compiler.func_map.get("StringBuilder_delete") == null) return false;
+                },
                 // A string literal materialises to an immortal interned global -> always emittable, no ARC.
                 .const_str => {},
                 // A store must target a real slot (an `alloc`). The lowering of an lvalue it does not model --
@@ -641,7 +1034,20 @@ fn mirInstEmittable(compiler: *LlvmCompiler, mf: *const mir.Func, inst: mir.Inst
                 // rejects those functions (field writes use field_set, not store).
                 .store => |x| if (!storeAddrIsAlloc(mf, x.addr)) return false,
                 .const_int, .alloc, .load, .param => {},
-                else => return false, // gep/await/spawn/indirect_call -> not yet
+                // Trait dynamic dispatch (D5): a method call through a trait fat pointer. Emittable only when
+                // the receiver resolves to a known trait + the method resolves to a vtable slot (sync only).
+                // Minimal slice: NO extra args (self only) and a SCALAR int/bool result -- so there is no
+                // argument-ARC or non-word return to reproduce. A void / string / struct-returning method, or
+                // one taking extra args, falls back to the AST until those ABIs are threaded.
+                .indirect_call => |x| {
+                    if (traitDispatchSlot(compiler, mf, x) == null) return false;
+                    // Receiver must be a caller-built trait fat pointer (a param, or a param-backed slot
+                    // load), never a local that could hold an un-widened struct. See receiverIsParamBacked.
+                    if (!receiverIsParamBacked(mf, x.receiver)) return false;
+                    if (x.args.len != 0) return false;
+                    if (intKindForTid(compiler, inst.ty) == null) return false;
+                },
+                else => return false, // gep/await/spawn -> not yet
             }
         }
     }
@@ -738,6 +1144,21 @@ fn emitInst(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, inst: mir.Inst,
             }
             break :blk struct_ptr;
         },
+        // Tuple construction: allocate N i64 words (nova_bytes_alloc), store each element word at offset k*8 --
+        // the exact nova_bytes_alloc + add/inttoptr/store sequence the AST tuple path emits (expressions.zig).
+        // Every element is a scalar word (gated by mirEmittable), so no per-element cast or retain is needed.
+        .tuple_new => |x| blk: {
+            const total: u64 = @as(u64, x.args.len) * 8;
+            const tuple_ptr = try compiler.compileAlloc(core.LLVMConstInt(vt, total, 0));
+            for (x.args, 0..) |arg, idx| {
+                const off = core.LLVMConstInt(vt, idx * 8, 0);
+                const addr = core.LLVMBuildAdd(compiler.builder, tuple_ptr, off, "");
+                const eptr = core.LLVMBuildIntToPtr(compiler.builder, addr, compiler.ptr_type, "");
+                const av = vals[@intFromEnum(arg)] orelse return error.Unemittable;
+                _ = core.LLVMBuildStore(compiler.builder, av, eptr);
+            }
+            break :blk tuple_ptr;
+        },
         // Field read: base + offset, inttoptr to the field's real type, load, widen back to the i64 word.
         .field_get => |x| blk: {
             const sname = structBaseNameOf(compiler, mf, x.base) orelse return error.Unemittable;
@@ -791,6 +1212,12 @@ fn emitInst(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, inst: mir.Inst,
             // of these two shapes.
             if (isStringTid(compiler, tid) or isStringRefOptionalTid(compiler, tid)) {
                 try compiler.compileRelease(v, null);
+            } else if (isScalarTupleTid(compiler, tid)) {
+                // A scalar tuple: free its N-word heap allocation via the tuple destructor resolved by TypeId
+                // (getOrCreateDestructorByTypeId dispatches to the tuple dtor). Its body releases no elements
+                // (all scalar), so this is decref -> dtor -> free, exactly as the AST tuple release does.
+                const dtor = (compiler.getOrCreateDestructorByTypeId(tid) catch return error.Unemittable) orelse return error.Unemittable;
+                try compiler.compileRelease(v, dtor);
             } else {
                 const sname = structBaseNameOf(compiler, mf, x.val) orelse return error.Unemittable;
                 switch (stringFieldStructDropKind(compiler, tid) orelse return error.Unemittable) {
@@ -832,6 +1259,71 @@ fn emitInst(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, inst: mir.Inst,
             for (x.args, 0..) |arg, i| argbuf[i] = vals[@intFromEnum(arg)] orelse return error.Unemittable;
             const call = core.LLVMBuildCall2(compiler.builder, c.fn_type, c.fn_val, &argbuf, @intCast(x.args.len), "");
             break :blk if (inst.result != .invalid) call else null;
+        },
+        // Trait dynamic dispatch (D5): reproduce the AST path's buildTraitVtableCall exactly. The receiver
+        // is the trait-object word (a pointer to a {struct_ptr, vtable} pair). Load struct_ptr from offset 0,
+        // the vtable from offset ptr_size, then the fn pointer from vtable slot (slot+1)*ptr_size (slot 0 is
+        // the destructor), and do an indirect call passing struct_ptr as self. All params/return are the i64
+        // word, the fixed trait-method ABI. Gated to sync + zero extra args + scalar result by mirEmittable.
+        .indirect_call => |x| blk: {
+            const slot = traitDispatchSlot(compiler, mf, x) orelse return error.Unemittable;
+            const recv = vals[@intFromEnum(x.receiver)] orelse return error.Unemittable;
+            const ptr_size = compiler.ptrElemSize();
+            // struct_ptr = *(recv)
+            const sp_ptr = core.LLVMBuildIntToPtr(compiler.builder, recv, core.LLVMPointerType(vt, 0), "");
+            const struct_ptr = core.LLVMBuildLoad2(compiler.builder, vt, sp_ptr, "");
+            // vtable = *(recv + ptr_size)
+            const vt_addr = core.LLVMBuildAdd(compiler.builder, recv, core.LLVMConstInt(vt, ptr_size, 0), "");
+            const vt_ptr = core.LLVMBuildIntToPtr(compiler.builder, vt_addr, core.LLVMPointerType(vt, 0), "");
+            const vtable_int = core.LLVMBuildLoad2(compiler.builder, vt, vt_ptr, "");
+            // fn_ptr = *(vtable + (slot+1)*ptr_size)
+            const fn_offset = core.LLVMConstInt(vt, (@as(u64, slot) + 1) * ptr_size, 0);
+            const fn_addr = core.LLVMBuildAdd(compiler.builder, vtable_int, fn_offset, "");
+            const fn_ptr_ptr = core.LLVMBuildIntToPtr(compiler.builder, fn_addr, core.LLVMPointerType(compiler.ptr_type, 0), "");
+            const fn_ptr = core.LLVMBuildLoad2(compiler.builder, compiler.ptr_type, fn_ptr_ptr, "");
+            // indirect call fn_ptr(struct_ptr): 1 word param (self), word return.
+            var params = [_]types.LLVMTypeRef{vt};
+            const fn_t = core.LLVMFunctionType(vt, &params, 1, 0);
+            var cargs = [_]types.LLVMValueRef{struct_ptr};
+            break :blk core.LLVMBuildCall2(compiler.builder, fn_t, fn_ptr, &cargs, 1, "");
+        },
+        // String interpolation (C5), all-string parts (gated by mirEmittable). Reproduces the AST template
+        // lowering (expressions.zig `.template_expr`) EXACTLY for the all-string case:
+        //   sb = compileAlloc(sizeof StringBuilder); StringBuilder_init(sb)
+        //   for each part v:  StringBuilder_append(sb, v)     // append COPIES + BORROWS -> no per-part ARC
+        //   final = StringBuilder_toString(sb)                // the owned result string
+        //   StringBuilder_delete(sb); nova_release(sb, null)  // free the StringBuilder itself (null dtor)
+        // The part values are borrowed here; any owned string temporary among them gets its own scope-end
+        // release from the D2 ARC threading (independent of this op), so ARC stays balanced.
+        .template => |x| blk: {
+            const sb_init = compiler.func_map.get("StringBuilder_init") orelse return error.Unemittable;
+            const sb_append = compiler.func_map.get("StringBuilder_append") orelse return error.Unemittable;
+            const sb_toString = compiler.func_map.get("StringBuilder_toString") orelse return error.Unemittable;
+            const sb_delete = compiler.func_map.get("StringBuilder_delete") orelse return error.Unemittable;
+
+            const sb_size = compiler.getTypeSize(ast.TypeRef{ .ident = "StringBuilder" }, false);
+            const sb_val = try compiler.compileAlloc(core.LLVMConstInt(vt, sb_size, 0));
+
+            const init_t = core.LLVMGlobalGetValueType(sb_init);
+            var init_args = [_]types.LLVMValueRef{sb_val};
+            _ = core.LLVMBuildCall2(compiler.builder, init_t, sb_init, &init_args, 1, "");
+
+            const append_t = core.LLVMGlobalGetValueType(sb_append);
+            for (x.parts) |p| {
+                const pv = vals[@intFromEnum(p)] orelse return error.Unemittable;
+                var append_args = [_]types.LLVMValueRef{ sb_val, pv };
+                _ = core.LLVMBuildCall2(compiler.builder, append_t, sb_append, &append_args, 2, "");
+            }
+
+            const toString_t = core.LLVMGlobalGetValueType(sb_toString);
+            var to_args = [_]types.LLVMValueRef{sb_val};
+            const final_str = core.LLVMBuildCall2(compiler.builder, toString_t, sb_toString, &to_args, 1, "final_str");
+
+            const delete_t = core.LLVMGlobalGetValueType(sb_delete);
+            _ = core.LLVMBuildCall2(compiler.builder, delete_t, sb_delete, &to_args, 1, "");
+
+            try compiler.compileRelease(sb_val, null);
+            break :blk final_str;
         },
         else => return error.Unemittable, // filtered by mirEmittable, but stay safe
     };
@@ -890,11 +1382,14 @@ fn emitBinop(compiler: *LlvmCompiler, inst: mir.Inst, op: mir.BinOp, mf: *const 
     const bld = compiler.builder;
     const vt = compiler.val_type;
 
-    // FLOAT (f64) path (B3): operands are the double's bit pattern in the i64 word. Bitcast to double, do the
-    // FP op, then bitcast the arithmetic result back to the i64 word (compares zext an i1). Both operands must
-    // be f64; f32, decimal, and mixed int/float fall back. No mod/shift/bitwise on float.
-    if (isF64Tid(compiler, mf.typeOf(inst.op.binop.lhs))) {
-        if (!isF64Tid(compiler, mf.typeOf(inst.op.binop.rhs))) return error.Unemittable;
+    // FLOAT (f64/f32) path (B3): operands are the double's bit pattern in the i64 word. Bitcast to double, do
+    // the FP op, then bitcast the arithmetic result back to the i64 word (compares zext an i1). Both operands
+    // must be float; f32 is PROMOTED to double in this backend (its word already carries the double's 64-bit
+    // pattern -- so DoubleType is the correct bitcast width for f32 too, NOT LLVMFloatType), so it takes the
+    // identical path and mixed f32/f64 is byte-identical. Decimal and mixed int/float fall back. No
+    // mod/shift/bitwise on float.
+    if (isFloatWordTid(compiler, mf.typeOf(inst.op.binop.lhs))) {
+        if (!isFloatWordTid(compiler, mf.typeOf(inst.op.binop.rhs))) return error.Unemittable;
         const dbl = core.LLVMDoubleType();
         const ld = core.LLVMBuildBitCast(bld, l, dbl, "");
         const rd = core.LLVMBuildBitCast(bld, r, dbl, "");
