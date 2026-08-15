@@ -77,7 +77,7 @@ fn tryEmitInner(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, func: anyty
         // (via string_* method calls, now named by C0) needs no ARC; an owned string LOCAL created in the body
         // gets its scope-end release from the threaded ARC ops (D2). Capturing a string into a struct field is
         // blocked by the field gates (string fields are non-scalar); returning a string is blocked below.
-        if (!scalar_ok and !emittableHeapStructTid(compiler, ptid) and !isStringTid(compiler, ptid) and !isArrayWordTid(compiler, ptid) and !isF64Tid(compiler, ptid)) return reject("param not int/bool/heap-struct/string/array/f64");
+        if (!scalar_ok and !emittableHeapStructTid(compiler, ptid) and !isStringTid(compiler, ptid) and !isArrayWordTid(compiler, ptid) and !isF64Tid(compiler, ptid) and !emittableValueStructParamTid(compiler, ptid)) return reject("param not int/bool/heap-struct/string/array/f64/value-struct");
         ptbuf[i] = ptid;
     }
     const param_types = ptbuf[0..func.params.len];
@@ -325,6 +325,20 @@ fn isScalarFieldTypeRef(tr: ast.TypeRef) bool {
 // A heap struct/class usable as an i64-word param/value in the emit subset: a known struct that is NOT a
 // value struct (value structs use a stack alloca, a separate ABI not handled yet). Fields are validated at
 // each field access, not here.
+// A value struct usable as a read-only i64-word param: a known value struct whose fields are all scalar. It
+// flows as the address of its inline bytes; field reads are base+offset like a heap struct. Construction,
+// mutation (field_set), copy-on-assign, and returns of a value struct need the by-value copy ABI and stay on
+// the AST path (rejected by their gates), so a value-struct param that is only READ is what this admits.
+fn emittableValueStructParamTid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
+    if (tid == mir.unset_ty) return false;
+    const nm = compiler.symbolName(tid) catch return false;
+    const base = types_mod.getStructBaseName(nm);
+    const sd = compiler.structs.get(base) orelse return false;
+    if (!compiler.isValueStructName(base)) return false;
+    for (sd.fields) |f| if (!isScalarFieldTypeRef(f.type_name)) return false;
+    return true;
+}
+
 fn emittableHeapStructTid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
     if (tid == mir.unset_ty) return false;
     const nm = compiler.symbolName(tid) catch return false;
@@ -390,14 +404,18 @@ fn mirEmittable(compiler: *LlvmCompiler, mf: *const mir.Func) bool {
                 // Heap struct with all-scalar fields, fully initialised (every declared field supplied so we
                 // never rely on zero-init of an omitted field). Value structs + owned-field structs fall back.
                 .struct_new => |x| {
-                    if (compiler.isValueStructName(x.type_name)) return false;
+                    // Heap OR value struct, all-scalar fields, fully initialised. A value struct constructs
+                    // into inline stack bytes (emit uses buildValueStructStorage); it must not escape, which
+                    // the return gate (no value-struct returns) + field gates (no struct-in-struct) enforce.
                     const sd = compiler.structs.get(x.type_name) orelse return false;
                     if (sd.fields.len != x.args.len or sd.fields.len != x.field_names.len) return false;
                     for (sd.fields) |f| if (!isScalarFieldTypeRef(f.type_name)) return false;
                 },
                 .field_get => |x| {
+                    // Reads work for BOTH a heap struct (payload pointer) and a value struct (its inline byte
+                    // address): field offsets are payload-relative in both, so `base + offset` + load is the
+                    // same. Only scalar fields (owned/float/nested fields need ARC / the float path).
                     const sname = structBaseNameOf(compiler, mf, x.base) orelse return false;
-                    if (compiler.isValueStructName(sname)) return false;
                     const ftr = fieldTypeRef(compiler, sname, x.field) orelse return false;
                     if (!isScalarFieldTypeRef(ftr)) return false;
                 },
@@ -510,7 +528,14 @@ fn emitInst(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, inst: mir.Inst,
         // the same layout + cast helpers. Owned-field structs are rejected by mirEmittable (they need a retain).
         .struct_new => |x| blk: {
             const total = compiler.getTypeSize(ast.TypeRef{ .ident = x.type_name }, false);
-            const struct_ptr = try compiler.compileAlloc(core.LLVMConstInt(vt, total, 0));
+            // A value struct constructs into INLINE STACK bytes (no ARC header), same address representation as
+            // a heap payload; a class/heap struct allocates the ref-counted payload. Field stores below are
+            // identical for both (base + offset). A value struct that would ESCAPE (returned, or stored into a
+            // heap field) is rejected by the return / field gates, so its stack storage cannot outlive the fn.
+            const struct_ptr = if (compiler.isValueStructName(x.type_name))
+                try compiler.buildValueStructStorage(total)
+            else
+                try compiler.compileAlloc(core.LLVMConstInt(vt, total, 0));
             for (x.field_names, x.args) |fname, arg| {
                 const off = compiler.getFieldOffset(x.type_name, fname) catch return error.Unemittable;
                 const ftr = fieldTypeRef(compiler, x.type_name, fname) orelse return error.Unemittable;
