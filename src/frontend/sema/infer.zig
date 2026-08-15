@@ -984,7 +984,9 @@ pub const Inferer = struct {
                         const args = try self.allocator.alloc(TypeId, type_params.len);
                         defer self.allocator.free(args);
                         for (solved, 0..) |m, i| args[i] = m orelse try self.store.unresolvedT();
-                        return self.ok(try self.store.intern(.{ .struct_ = .{ .decl = sid, .args = args } }));
+                        const inst_tid = try self.store.intern(.{ .struct_ = .{ .decl = sid, .args = args } });
+                        mono.noteForcedStructInst(inst_tid);
+                        return self.ok(inst_tid);
                     }
                     return self.ok(try self.store.intern(.{ .struct_ = .{ .decl = sid } }));
                 }

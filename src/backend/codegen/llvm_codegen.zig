@@ -1592,8 +1592,30 @@ pub const LlvmCompiler = struct {
         return null;
     }
 
+    // True when EVERY method of `trait_name` has a concrete per-instantiation body emitted for `struct_name`
+    // (e.g. `Cell_i32_render` for `Cell<i32>`). Used to decide whether constructTraitObject can build a
+    // per-instantiation vtable (correct for a T-typed method) or must fall back to the erased shared vtable.
+    // For a base/erased name the concrete name equals the erased name, so this returns true iff the shared
+    // body exists -- i.e. the base path is unchanged.
+    pub fn hasConcreteTraitMethods(self: *LlvmCompiler, struct_name: []const u8, trait_name: []const u8) !bool {
+        const trait_decl = self.traits.get(getStructBaseName(trait_name)) orelse return false;
+        for (trait_decl.methods) |tm| {
+            const mn = try self.methodSymbol(struct_name, tm.name);
+            defer self.allocator.free(mn);
+            if (!self.func_map.contains(mn)) return false;
+        }
+        return true;
+    }
+
     pub fn getGlobalVTable(self: *LlvmCompiler, struct_name: []const u8, trait_name: []const u8) !types.LLVMValueRef {
-        const base_name = try std.fmt.allocPrint(self.allocator, "_vtable_{s}_{s}", .{ struct_name, trait_name });
+        // Mangle the (possibly instantiated) struct name so the vtable global has a valid symbol name and is
+        // PER-INSTANTIATION: `Cell<i32>` -> `_vtable_Cell_i32_Render`, whose slots point at the concrete
+        // `Cell_i32_render`. For a plain base name mangling is the identity, so base-name callers are
+        // unchanged. This is what lets a generic struct with a T-typed method dispatch correctly through a
+        // trait object (the erased shared body mishandled the concrete field, SEGV -- case 299).
+        const mangled = try types_mod.mangleTypeName(self.allocator, struct_name);
+        defer self.allocator.free(mangled);
+        const base_name = try std.fmt.allocPrint(self.allocator, "_vtable_{s}_{s}", .{ mangled, trait_name });
         defer self.allocator.free(base_name);
         const vtable_name = try self.allocator.dupeZ(u8, base_name);
         defer self.allocator.free(vtable_name);
@@ -1620,7 +1642,10 @@ pub const LlvmCompiler = struct {
         for (trait_decl.methods, 0..) |tm, idx0| {
             const idx = idx0 + 1;
             var found_method: ?types.LLVMValueRef = null;
-            const method_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ struct_name, tm.name });
+            // methodSymbol mangles the (possibly instantiated) owner: `Cell<i32>` + `render` ->
+            // `Cell_i32_render` (the per-instantiation body), and for a base name it equals the raw
+            // `{owner}_{method}`, so base-name callers see no change.
+            const method_name = try self.methodSymbol(struct_name, tm.name);
             defer self.allocator.free(method_name);
 
             if (self.func_map.get(method_name)) |fn_val| {
@@ -1665,9 +1690,14 @@ pub const LlvmCompiler = struct {
         const addr1 = core.LLVMBuildAdd(self.builder, trait_obj, core.LLVMConstInt(self.val_type, ptr_size, 0), "vtable_addr");
         const ptr1 = core.LLVMBuildIntToPtr(self.builder, addr1, core.LLVMPointerType(self.val_type, 0), "trait_vtable_ptr");
 
-        // Generic trait objects share ONE vtable per (base struct, trait) -- the type arg is erased for
-        // dispatch (`_vtable_Cell_Shape`, methods `Cell_area`), so look it up by the base struct name.
-        const vtable_global = try self.getGlobalVTable(getStructBaseName(struct_name), trait_name);
+        // Prefer a PER-INSTANTIATION vtable when the concrete methods are emitted: `Cell<i32>` ->
+        // `_vtable_Cell_i32_Render` whose slots are the concrete `Cell_i32_render`, so a T-typed method
+        // dispatches correctly (case 299). Fall back to the base-erased vtable (`_vtable_Cell_Render` ->
+        // `Cell_render`) only for a genuinely erased generic context where no concrete body exists.
+        const vtable_global = if (try self.hasConcreteTraitMethods(struct_name, trait_name))
+            try self.getGlobalVTable(struct_name, trait_name)
+        else
+            try self.getGlobalVTable(getStructBaseName(struct_name), trait_name);
         const vtable_int = core.LLVMBuildPtrToInt(self.builder, vtable_global, self.val_type, "vtable_int");
         _ = core.LLVMBuildStore(self.builder, vtable_int, ptr1);
 

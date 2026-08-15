@@ -43,6 +43,11 @@ pub const MethodInst = struct {
 };
 pub var method_insts: std.ArrayListUnmanaged(MethodInst) = .empty;
 
+pub var forced_struct_insts: std.ArrayListUnmanaged(TypeId) = .empty;
+pub fn noteForcedStructInst(tid: TypeId) void {
+    forced_struct_insts.append(std.heap.page_allocator, tid) catch {};
+}
+
 pub var base_needed: std.StringHashMapUnmanaged(void) = .empty;
 
 pub fn noteBaseNeeded(store: *types.TypeStore, recv_tid: TypeId, method: []const u8) void {
@@ -318,6 +323,7 @@ pub const Worklist = struct {
     pub fn compute(self: *Worklist, program: ast.Program) !void {
         var it = self.sema.ir.expr_types.valueIterator();
         while (it.next()) |t| try self.note(t.*);
+        for (forced_struct_insts.items) |t| try self.note(t);
 
         for (program.declarations) |d| {
             switch (d) {
