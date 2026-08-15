@@ -146,7 +146,12 @@ prerequisite for D5-async (which additionally needs coroutine lowering).
 `nova_valopt_box`/`nova_valopt_unbox`, byte-compatible with AST). Wired through all MIR switches. Additive;
 no producer yet; 5/5 emit-subset cases unregressed. This is the ABI foundation.
 
-**Session 2 PLAN (return-boxing, the first producer) -- exact steps:**
+**Session 2 DONE (f14f793): value-optional RETURN emits.** hir.Func.ret_valopt (from fn_decl.ret_type),
+threaded to Ctx; `.ret` boxes a scalar via valopt_box (undefined stays null; no double-box); both return
+gates + mirInstEmittable admit it. VERIFIED: AST==EMIT byte-identical incl. present-0 round-trip, ASAN
+clean, ARC audit clean, no emit-subset regression, default path untouched. Case 371. `boxit`/`pick` emit.
+
+**Session 2 PLAN (return-boxing, the first producer) -- exact steps [DONE, kept for reference]:**
 1. `hir.Func` has NO return type today (hir.zig:97). Add `ret_valopt: bool = false`; populate it in
    lower_ast_hir where the AST `fn_decl.return_type` is in scope. **REFINED BLOCKER (found by reading the
    code):** the value-vs-reference-optional test `isRefOptionalTypeRef` (lir_emit.zig:703) is BACKEND-only --
