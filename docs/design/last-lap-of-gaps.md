@@ -61,6 +61,27 @@ full-vision line (perf-positive optimiser, mature ecosystem) is months.
 
 Severity is "how much this blocks a usable, buildable-on beta," not how much work it is.
 
+## ⭐ REFRAMING 2026-08-16 (after the Swift architectural comparison) — READ THIS
+
+Gap 1 (soundness) and Gap 3 (perf) are NOT two gaps. They are ONE: **Nova has no ownership IR** (no
+Swift-SIL/OSSA analog). See `swift-arch-comparison.md`. Consequences:
+- Nova's memory safety is **ASAN-TESTED at runtime, not compile-time VERIFIED** (no OSSA verifier). "Gap 1
+  soundness fixed" honestly means "no live UAF found by ASAN + the shadow engines agree" — not "proven safe".
+- Nova has **nowhere to do ARC optimisation** (the scrapped optimiser's arc_elision fired 0×). That is Gap 3.
+- ONE investment closes both: an OSSA-lite ownership IR + a build-gating verifier (soundness) + a borrow-skip
+  ARC pass on the same IR (perf, gated on a measured delta).
+
+**HONEST SCALE — it is NOT 20-30 years.** That figure is the FULL Swift SIL (SILGen + OSSA + ~100 passes +
+generic specialization + devirt), a large team over 10+ years. Nova needs a MINIMAL version and already has
+most raw materials: typed sema (TypedIr), monomorphisation, ownership.zig (move-check), escape.zig (escape
+analysis), and a typed-SSA IR (mir.zig, in discards). Nova's language is also SIMPLER than Swift (no
+protocol-associated-types, no exclusivity model, mono-only generics). A minimal ownership-IR + verifier +
+one ARC pass is a **months-scale** focused project (rough, high-uncertainty: ~3-6 months single-dev), NOT
+decades. **And critically: Nova does NOT need it to be usable.** It already has ASAN-tested safety (works on
+the corpus + real apps) and competitive AST+LLVM-O3 perf (beat Rust/Go per-core on some benchmarks). The
+ownership IR upgrades tested→verified safety and adds ARC perf — REFINEMENTS of a working system, an optional
+future investment, NOT a beta blocker. Do NOT re-enter the endless-gap loop treating it as one.
+
 | # | Gap | Beta severity | Verified state | Effort to close (GUESS) | Detail |
 |---|---|---|---|---|---|
 | 1 | Soundness name-layer cleanup | Low | **Soundness-hazardous string engine DELETED** (2026-08-16). `erasedOwnershipDefault` (last ownership-decision-by-name fn) gone (d1b8b60); audited codegen = 0 std.mem.eql decisions on a generic/user type's ownership/layout (51 lint hits are all canonical prim/any/void/string + builtin Atomic/Str/List). Shadow gate td_disagree=0. Slices A/B/dtor-str_blk committed (05dae86/5d3341b/68e1dee). REMAINING = literal DUPLICATE-machinery cleanup only (substituteFieldType/substTypeParams/parallel string dtor + shadow scaffolding) = code hygiene, ZERO behaviour change, NOT soundness | soundness bar MET; hygiene cleanup optional | [gap1](lastlap/gap1-soundness.md) |
