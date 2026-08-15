@@ -1,0 +1,47 @@
+// Emit-subset growth (B1): non-constructor methods now emit from the optimiser IR. A method declares `self`
+// explicitly as params[0], so its AST params line up 1:1 with the LLVM arguments (self at index 0) and the
+// emit path can model them. Previously every method fell back (params list left empty -> count mismatch),
+// which was ~99 of ~146 rejects in a real build. Under NOVA_OPT_EMIT these methods compile from the optimised
+// IR; under the default build from the AST. Both must agree, across field reads/writes, a self.method() call,
+// control flow, and the mask idiom. Value-struct methods and constructors deliberately still fall back
+// (self is a value / synthetic), so they are exercised here only for AST==emit agreement, not coverage.
+import assert;
+
+class Counter {
+    n: int,
+
+    fn get(self: Counter): int { return self.n; }
+    fn addN(self: Counter, k: int): int { return self.n + k; }
+    fn bump(self: Counter, d: int): int { self.n = self.n + d; return self.n; }
+    fn doubled(self: Counter): int { return self.get() * 2; }
+    fn clamp(self: Counter, lo: int, hi: int): int {
+        if (self.n < lo) { return lo; }
+        if (self.n > hi) { return hi; }
+        return self.n;
+    }
+    fn maskLow(self: Counter): int { return self.n & 255; }
+}
+
+@test
+fn test_field_read_and_args(): void {
+    let c = Counter{ n: 10 };
+    assert.equalInt(c.get(), 10);
+    assert.equalInt(c.addN(5), 15);
+    assert.equalInt(c.doubled(), 20);
+}
+
+@test
+fn test_field_write(): void {
+    let c = Counter{ n: 5 };
+    assert.equalInt(c.bump(4), 9);
+    assert.equalInt(c.get(), 9);
+}
+
+@test
+fn test_control_and_mask(): void {
+    let c = Counter{ n: 50 };
+    assert.equalInt(c.clamp(0, 20), 20);
+    assert.equalInt(c.clamp(100, 200), 100);
+    let d = Counter{ n: 0x1ff };
+    assert.equalInt(d.maskLow(), 255);
+}

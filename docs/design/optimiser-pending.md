@@ -25,7 +25,7 @@ Status legend: TODO (not started), WIP (in progress), DONE. Priority: P0 highest
 
 | ID | Item | Priority | Status | Notes |
 |----|------|----------|--------|-------|
-| B1 | Methods / `self` params | P0 | TODO | The single biggest blocker: about 99 of ~146 rejects. `func.params` is empty for methods because `self` shifts LLVM argument indices. Populate params and handle the shift in `tryEmitInner` and `resolveCallee`. |
+| B1 | Methods / `self` params | P0 | DONE | 2026-08-15. `self` is an EXPLICIT params[0] (`fn m(self: T, ...)`), so AST params line up 1:1 with the LLVM args and no shift was needed. The method FunctionInfo sites just were not setting `.params = fn_decl.params` (constructors stay empty, self is synthetic there). Coverage jumped ~1->13 emitted in a sha256 build; the reject dropped from ~99 to ~6 (constructors). Pinned by `341_opt_emit_methods.nova`. Gates: emit 349/350. Class methods emit (heap `self`); value-struct methods and constructors fall back. |
 | B2 | String params / returns / locals | P1 | TODO | Rejected today (not int/bool/heap-struct). |
 | B3 | Float params / returns / locals | P1 | TODO | f32/f64 are excluded from `intKindForTid`. |
 | B4 | Array / pointer params | P2 | TODO | Arrays flow as `ptr`; rejected. |

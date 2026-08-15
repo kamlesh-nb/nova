@@ -2976,6 +2976,12 @@ pub const LlvmCompiler = struct {
 
                                     .ret_type_ref = fn_decl.ret_type,
                                     .body = fn_decl.body,
+                                    // A non-constructor method declares `self` explicitly as params[0], so the
+                                    // AST params line up 1:1 with the LLVM arguments (self at index 0) and the
+                                    // optimiser emit path can model them. A constructor's `self` is synthetic
+                                    // (prepended above, not in fn_decl.params), so leave params empty -> the emit
+                                    // path sees the count mismatch and falls back. See lir_emit.zig.
+                                    .params = if (is_constructor) &.{} else fn_decl.params,
                                     .is_async = fn_decl.is_async,
                                     .instantiation = inst_opt,
                                     .instantiation_id = mi.inst_key,
@@ -2993,6 +2999,10 @@ pub const LlvmCompiler = struct {
                                 .return_type = if (fn_decl.ret_type) |ret| try self.typeRefToString(ret) else "void",
                                 .ret_type_ref = fn_decl.ret_type,
                                 .body = fn_decl.body,
+                                // Non-constructor method: `self` is an explicit params[0], so params line up 1:1
+                                // with the LLVM arguments and the emit path can model them. Constructor `self` is
+                                // synthetic -> leave empty so the emit path falls back. See lir_emit.zig.
+                                .params = if (is_constructor) &.{} else fn_decl.params,
                                 .is_async = fn_decl.is_async,
                                 .instantiation = inst_opt,
 
@@ -3030,6 +3040,9 @@ pub const LlvmCompiler = struct {
                         .return_type = if (fn_decl.ret_type) |ret| try self.typeRefToString(ret) else "void",
                         .ret_type_ref = fn_decl.ret_type,
                         .body = fn_decl.body,
+                        // Non-constructor method: explicit `self` params[0] lines up with the LLVM args (emit
+                        // path can model it); constructor `self` is synthetic -> empty -> emit path falls back.
+                        .params = if (is_constructor) &.{} else fn_decl.params,
                         .is_async = fn_decl.is_async,
                         .source_file = fn_decl.span.file,
                     };
@@ -3117,6 +3130,8 @@ pub const LlvmCompiler = struct {
                             .return_type = spec_ret,
                             .ret_type_ref = fn_decl.ret_type,
                             .body = fn_decl.body,
+                            // Generic free-function spec: argument index i == declared param i (no self).
+                            .params = fn_decl.params,
                             .is_async = fn_decl.is_async,
                             .instantiation_id = fi.inst_key,
                             .source_file = fn_decl.span.file,
