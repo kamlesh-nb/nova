@@ -268,6 +268,72 @@ pub fn atan2(y: double, x: double): double {
     return 0.0;
 }
 
+// Inverse sine, in radians, for x in [-1, 1]. asin(x) = atan(x / sqrt(1 - x^2)); the endpoints are
+// special-cased because there the argument to atan diverges. Out-of-domain inputs are clamped.
+pub fn asin(x: double): double {
+    let c = fclamp(x, 0.0 - 1.0, 1.0);
+    if (c >= 1.0) { return pi() / 2.0; }
+    if (c <= 0.0 - 1.0) { return 0.0 - (pi() / 2.0); }
+    return atan(c / fsqrt(1.0 - (c * c)));
+}
+
+// Inverse cosine, in radians, for x in [-1, 1]. acos(x) = pi/2 - asin(x).
+pub fn acos(x: double): double {
+    return (pi() / 2.0) - asin(x);
+}
+
+// Hyperbolic sine/cosine/tangent, built on fexp. tanh is written as a single exp to stay well behaved
+// for large |x| (a direct sinh/cosh ratio overflows both parts first).
+pub fn sinh(x: double): double {
+    let ex = fexp(x);
+    return (ex - (1.0 / ex)) / 2.0;
+}
+pub fn cosh(x: double): double {
+    let ex = fexp(x);
+    return (ex + (1.0 / ex)) / 2.0;
+}
+pub fn tanh(x: double): double {
+    let e2 = fexp(2.0 * x);
+    return (e2 - 1.0) / (e2 + 1.0);
+}
+
+// Greatest common divisor (Euclid), on the absolute values; gcd(0, 0) is 0.
+pub fn gcd(a: int, b: int): int {
+    let x = abs(a);
+    let y = abs(b);
+    while (y != 0) {
+        let t = x % y;
+        x = y;
+        y = t;
+    }
+    return x;
+}
+
+// Least common multiple; lcm(x, 0) = lcm(0, x) = 0. Divides before multiplying to keep the product small.
+pub fn lcm(a: int, b: int): int {
+    if (a == 0 || b == 0) { return 0; }
+    return abs(a / gcd(a, b) * b);
+}
+
+@test
+fn test_asin_acos_hyperbolic_gcd(): void {
+    assert.isTrue(fabs(asin(0.5) - (pi() / 6.0)) < 0.0005);
+    assert.isTrue(fabs(acos(0.5) - (pi() / 3.0)) < 0.0005);
+    assert.isTrue(fabs(asin(1.0) - (pi() / 2.0)) < 0.0001);
+    // sinh(0)=0, cosh(0)=1, tanh(0)=0
+    assert.isTrue(fabs(sinh(0.0)) < 0.0001);
+    assert.isTrue(fabs(cosh(0.0) - 1.0) < 0.0001);
+    assert.isTrue(fabs(tanh(0.0)) < 0.0001);
+    // identity cosh^2 - sinh^2 == 1
+    assert.isTrue(fabs((cosh(1.3) * cosh(1.3)) - (sinh(1.3) * sinh(1.3)) - 1.0) < 0.0005);
+    // tanh saturates towards 1 for large x
+    assert.isTrue(tanh(10.0) > 0.999);
+    assert.equalInt(6, gcd(54, 24));
+    assert.equalInt(0, gcd(0, 0));
+    assert.equalInt(36, lcm(12, 18));
+    assert.equalInt(0, lcm(5, 0));
+}
+
 @test
 fn test_trig_log(): void {
     // sin(pi/6) ~= 0.5, cos(pi/3) ~= 0.5
