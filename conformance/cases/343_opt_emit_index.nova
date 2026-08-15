@@ -1,0 +1,21 @@
+// Emit-subset growth (C3): element read `object[idx]` now emits from the optimiser IR. A string indexes a
+// byte (obj+idx address, load i8, zero-extend to the word); an array GEPs the i64-word element base (arrays
+// store every element as the word). The object's layout is resolved from its threaded TypeId; float-element
+// arrays and lists/maps (whose element access is a method call) still fall back. Under NOVA_OPT_EMIT these
+// helpers compile from the emit path; both paths must agree. No bounds check -- the AST index path emits none
+// here either. Array-index functions additionally need array-param support (B4), so this case pins the string
+// byte-index path (string params already flow as the pointer word).
+import assert;
+
+fn byteAt(s: string, i: int): int { return s[i]; }
+fn firstByte(s: string): int { return s[0]; }
+fn sumFirst3(s: string): int { return s[0] + s[1] + s[2]; }
+
+@test
+fn test_string_byte_index(): void {
+    assert.equalInt(firstByte("A"), 65);
+    assert.equalInt(byteAt("ABC", 1), 66);
+    assert.equalInt(byteAt("ABC", 2), 67);
+    // 'a'(97) + 'b'(98) + 'c'(99) = 294
+    assert.equalInt(sumFirst3("abc"), 294);
+}

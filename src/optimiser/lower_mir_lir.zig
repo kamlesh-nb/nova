@@ -50,6 +50,9 @@ fn lowerInst(allocator: std.mem.Allocator, lf: *lir.Func, inst: mir.Inst) !void 
         // shadow's op count (alloc for the new object, load/store for a field access).
         .struct_new => try lf.ops.append(allocator, .{ .alloc = .{ .result = r.?, .ty = inst.ty } }),
         .field_get => |x| try lf.ops.append(allocator, .{ .load = .{ .result = r.?, .addr = reg(x.base) } }),
+        // The shadow LIR only needs a structural stand-in for the op count; the emit path resolves the real
+        // element address from the object's TypeId. Represent it as a load off the object register.
+        .index_get => |x| try lf.ops.append(allocator, .{ .load = .{ .result = r.?, .addr = reg(x.object) } }),
         .field_set => |x| try lf.ops.append(allocator, .{ .store = .{ .addr = reg(x.base), .val = reg(x.val) } }),
         .call => |x| try lf.ops.append(allocator, .{ .call = .{ .result = r, .callee = x.callee, .args = try regs(allocator, x.args) } }),
         .indirect_call => |x| try lf.ops.append(allocator, .{ .indirect_call = .{ .result = r, .receiver = reg(x.receiver), .slot = x.slot, .args = try regs(allocator, x.args) } }),

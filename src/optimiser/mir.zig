@@ -89,6 +89,10 @@ pub const Inst = struct {
         struct_new: struct { type_name: []const u8, field_names: []const []const u8, args: []Value },
         field_get: struct { base: Value, field: []const u8 },
         field_set: struct { base: Value, field: []const u8, val: Value },
+        // Element read `object[idx]`. The backend resolves the layout from the object's threaded TypeId: a
+        // string indexes a byte (obj+idx, load i8, zext); an array GEPs the i64-word element base. Carries no
+        // element type -- the emit path reads it from the TypeId (rejecting float-element arrays for now).
+        index_get: struct { object: Value, idx: Value },
     };
 };
 
@@ -130,6 +134,10 @@ pub fn instOperands(op: Inst.Op, buf: *[8]Value) []Value {
         .field_set => |x| {
             push(buf, &n, x.base);
             push(buf, &n, x.val);
+        },
+        .index_get => |x| {
+            push(buf, &n, x.object);
+            push(buf, &n, x.idx);
         },
         .alloc, .const_int, .global_const, .param => {},
     }
@@ -196,6 +204,10 @@ fn rewriteInst(op: *Inst.Op, from: Value, to: Value) void {
             sw(&x.base, from, to);
             sw(&x.val, from, to);
         },
+        .index_get => |*x| {
+            sw(&x.object, from, to);
+            sw(&x.idx, from, to);
+        },
         .alloc, .const_int, .global_const, .param => {},
     }
 }
@@ -215,7 +227,7 @@ pub fn hasSideEffects(op: Inst.Op) bool {
         .store, .call, .indirect_call, .retain, .release, .await_, .spawn_ => true,
         // struct_new allocates + writes memory; field_set writes memory -> keep them.
         .struct_new, .field_set => true,
-        .binop, .load, .alloc, .gep, .cast, .const_int, .global_const, .param, .field_get => false,
+        .binop, .load, .alloc, .gep, .cast, .const_int, .global_const, .param, .field_get, .index_get => false,
     };
 }
 

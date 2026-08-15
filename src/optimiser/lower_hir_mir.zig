@@ -138,8 +138,8 @@ fn lowerNode(ctx: *Ctx, id: HirId) anyerror!Value {
         },
         .index => |ix| blk: {
             const object = try lowerNode(ctx, ix.object);
-            _ = try lowerNode(ctx, ix.idx);
-            break :blk try mf.emit(a, ctx.cur, nty, .{ .load = .{ .addr = object } });
+            const idx = try lowerNode(ctx, ix.idx);
+            break :blk try mf.emit(a, ctx.cur, nty, .{ .index_get = .{ .object = object, .idx = idx } });
         },
 
         .struct_init => |si| blk: {

@@ -148,7 +148,9 @@ fn hirEmittable(hf: *const hir.Func) bool {
             // structs (M6-D): construction + field read/write, validated + emitted from struct_new/field_*
             .struct_init, .field,
             // ARC (D2): retain/release threaded by lower_ast_hir; mirEmittable gates them to string operands.
-            .retain, .release => {},
+            .retain, .release,
+            // element read (C3): `object[idx]` -> index_get; mirEmittable gates it to string / non-float array.
+            .index => {},
             else => {
                 if (emit_verbose) std.debug.print("[opt-emit]   non-emittable node: {s}\n", .{@tagName(node.kind)});
                 return false; // str/float/null/call/struct_init/cast/... -> fall back
@@ -216,6 +218,24 @@ fn isStringTid(compiler: *LlvmCompiler, tid: mir.TypeId) bool {
     const st = compiler.type_store orelse return false;
     if (tid == mir.unset_ty or @intFromEnum(tid) >= st.count()) return false;
     return st.get(tid) == .string;
+}
+
+// How to emit `object[idx]` for a given object TypeId. `string` indexes a byte; `array_word` GEPs the
+// i64-word element base. Null (fall back) for anything else, incl. float-element arrays (they need a float
+// load type + GEP the emit path does not yet do) and lists/maps (their element access is a method call).
+const IndexKind = enum { string, array_word };
+fn indexKind(compiler: *LlvmCompiler, otid: mir.TypeId) ?IndexKind {
+    const st = compiler.type_store orelse return null;
+    if (otid == mir.unset_ty or @intFromEnum(otid) >= st.count()) return null;
+    return switch (st.get(otid)) {
+        .string => .string,
+        .array => |ar| blk: {
+            const et = st.get(ar.elem);
+            if (et == .prim and et.prim.kind == .float) break :blk null; // float arrays: deferred
+            break :blk .array_word;
+        },
+        else => null,
+    };
 }
 
 // The declared base name of the struct/class a value holds (via its threaded TypeId), or null if the value
@@ -326,6 +346,8 @@ fn mirEmittable(compiler: *LlvmCompiler, mf: *const mir.Func) bool {
                 // (a string field is non-scalar).
                 .retain => |x| if (!isStringTid(compiler, mf.typeOf(x.val))) return false,
                 .release => |x| if (!isStringTid(compiler, mf.typeOf(x.val))) return false,
+                // element read (C3): only a string (byte index) or a non-float array (i64-word element).
+                .index_get => |x| if (indexKind(compiler, mf.typeOf(x.object)) == null) return false,
                 .const_int, .alloc, .load, .store, .param => {},
                 else => return false, // gep/await/spawn/indirect_call -> not yet
             }
@@ -424,6 +446,29 @@ fn emitInst(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, inst: mir.Inst,
             const fptr = core.LLVMBuildIntToPtr(compiler.builder, addr, core.LLVMPointerType(flt, 0), "");
             const raw = core.LLVMBuildLoad2(compiler.builder, flt, fptr, "");
             break :blk compiler.castToValType(raw, ftr);
+        },
+        // Element read `object[idx]` (C3). String: obj+idx is a byte address (load i8, zext to the word).
+        // Array: GEP the i64-word element base (arrays store every element as the word; float arrays are
+        // rejected by mirEmittable). Mirrors the AST index path (expressions.zig). No bounds check -- the AST
+        // path emits none here either.
+        .index_get => |x| blk: {
+            const obj = vals[@intFromEnum(x.object)] orelse return error.Unemittable;
+            const idx = vals[@intFromEnum(x.idx)] orelse return error.Unemittable;
+            const kind = indexKind(compiler, mf.typeOf(x.object)) orelse return error.Unemittable;
+            switch (kind) {
+                .string => {
+                    const addr = core.LLVMBuildAdd(compiler.builder, obj, idx, "");
+                    const p = core.LLVMBuildIntToPtr(compiler.builder, addr, compiler.ptr_type, "");
+                    const byte = core.LLVMBuildLoad2(compiler.builder, compiler.i8_type, p, "");
+                    break :blk core.LLVMBuildZExt(compiler.builder, byte, vt, "");
+                },
+                .array_word => {
+                    const base = compiler.arrayBasePtr(obj);
+                    var idxs = [_]types.LLVMValueRef{idx};
+                    const ep = core.LLVMBuildInBoundsGEP2(compiler.builder, vt, base, &idxs, 1, "");
+                    break :blk core.LLVMBuildLoad2(compiler.builder, vt, ep, "");
+                },
+            }
         },
         // ARC (D2, strings only -- gated by mirEmittable to string operands). A string is a single heap
         // allocation with no nested owned fields, so its release needs NO destructor (nova_release(ptr, null)

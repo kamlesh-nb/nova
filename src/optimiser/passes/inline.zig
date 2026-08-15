@@ -127,6 +127,10 @@ fn remapOp(op: *mir.Inst.Op, vmap: []const mir.Value) void {
             x.base = vmap[@intFromEnum(x.base)];
             x.val = vmap[@intFromEnum(x.val)];
         },
+        .index_get => |*x| {
+            x.object = vmap[@intFromEnum(x.object)];
+            x.idx = vmap[@intFromEnum(x.idx)];
+        },
         .alloc, .const_int, .global_const, .param => {},
     }
 }
