@@ -69,7 +69,7 @@ Severity is "how much this blocks a usable, buildable-on beta," not how much wor
 | 5 | Tooling (LSP/fmt/pkg/debugger) | Medium | LSP + fmt real; package manager a git-clone stub; no debugger | days (LSP/fmt) to large (debugger) | [gap56](lastlap/gap56-tooling-ecosystem.md) |
 | 6 | Ecosystem (drivers/web/orch/DB) | Medium | Broad, single-request-proven, integration + robustness unhardened | weeks+ (separate repos) | [gap56](lastlap/gap56-tooling-ecosystem.md) |
 | 7 | Cross-platform (Windows gates only; WASM DROPPED) | Low | Native+cross ~90% verified; WASM out of scope by decision | days (Windows test gates, optional) | [gap7](lastlap/gap7-crossplatform.md) |
-| 8 | Stdlib depth (coverage/leaves) | Medium | PARTIAL: list/map/string convenience methods + tests DONE (b623fe9, cases 365/366/367). Remaining: math (gcd/asin/hyperbolic), url encode/decode, crypto KAT vectors, per-module @test coverage | list/map/string DONE; rest ~2 weeks | [gap8](lastlap/gap8-stdlib.md) |
+| 8 | Stdlib depth (coverage/leaves) | Medium | PARTIAL. DONE: list/map/string convenience (b623fe9, 365/366/367); math leaves asin/acos/sinh/cosh/tanh/gcd/lcm (f2f0ec5, 368); crypto KATs md5+chacha20poly1305+hkdf+pbkdf2 (1bb7878, 369/370); url encode/decode already present. REMAINING: broad per-module @test coverage (~34/144 files carry @tests) — a long-tail sweep, not a bounded fix | leaves DONE; coverage-sweep is open-ended | [gap8](lastlap/gap8-stdlib.md) |
 
 ## The gaps in one paragraph each (design summary; full design in the detail files)
 
