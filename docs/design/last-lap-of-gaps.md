@@ -64,7 +64,7 @@ Severity is "how much this blocks a usable, buildable-on beta," not how much wor
 | # | Gap | Beta severity | Verified state | Effort to close (GUESS) | Detail |
 |---|---|---|---|---|---|
 | 1 | Soundness name-layer cleanup | Low | Corruption closed (0 shadow disagreements); ~150 name-based mangling sites remain, fail loudly | 1-2 weeks | [gap1](lastlap/gap1-soundness.md) |
-| 2 | Crash surface / stability | **High (but small)** | The 1 known crash (trait-vtable generic) FIXED (commit 5bcebd1, case 364, corpus 373/374); the dogfood harness (Track 2) remains | fix DONE; harness ongoing | [gap2](lastlap/gap2-crashes.md) |
+| 2 | Crash surface / stability | **High (but small)** | Track 1 (the 1 known crash) FIXED (5bcebd1, case 364, corpus 373/374); Track 2 dogfood harness DONE (b9b9299, 44 programs green, in gate.sh). Note: a standing net, not a proof of zero crashes | both tracks DONE | [gap2](lastlap/gap2-crashes.md) |
 | 3 | Optimiser completion (perf) | Low for beta, High for the vision | ~40% of goal, ~10-12% real coverage, perf ~0% realised | months (rearchitecture) | [gap3](lastlap/gap3-optimiser.md) |
 | 5 | Tooling (LSP/fmt/pkg/debugger) | Medium | LSP + fmt real; package manager a git-clone stub; no debugger | days (LSP/fmt) to large (debugger) | [gap56](lastlap/gap56-tooling-ecosystem.md) |
 | 6 | Ecosystem (drivers/web/orch/DB) | Medium | Broad, single-request-proven, integration + robustness unhardened | weeks+ (separate repos) | [gap56](lastlap/gap56-tooling-ecosystem.md) |
