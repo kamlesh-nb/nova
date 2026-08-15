@@ -1,0 +1,15 @@
+// MD5 known-answer tests from RFC 1321, Appendix A.5. MD5 is cryptographically broken and kept only
+// for legacy interop (e.g. some auth handshakes); these vectors pin that the implementation is correct.
+import crypto.hash.md5;
+import assert;
+
+@test
+fn md5_rfc1321_vectors(): void {
+    assert.equalStr("d41d8cd98f00b204e9800998ecf8427e", md5.md5(""));
+    assert.equalStr("0cc175b9c0f1b6a831c399e269772661", md5.md5("a"));
+    assert.equalStr("900150983cd24fb0d6963f7d28e17f72", md5.md5("abc"));
+    assert.equalStr("f96b697d7cb7938d525a2f31aaf161d0", md5.md5("message digest"));
+    assert.equalStr("c3fcd3d76192e4007dfb496cca67e13b", md5.md5("abcdefghijklmnopqrstuvwxyz"));
+    assert.equalStr("9e107d9d372bb6826bd81d3542a419d6",
+        md5.md5("The quick brown fox jumps over the lazy dog"));
+}

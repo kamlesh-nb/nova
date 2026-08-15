@@ -1,0 +1,94 @@
+// Known-answer tests for the AEAD and KDF primitives that lacked corpus coverage:
+//   - ChaCha20-Poly1305 AEAD  (RFC 8439 section 2.8.2)
+//   - HKDF-SHA256             (RFC 5869 Test Case 1)
+//   - PBKDF2-HMAC-SHA1        (RFC 6070)
+import crypto.aead.chachapoly;
+import crypto.kdf.hkdf;
+import crypto.kdf.pbkdf2;
+import bytes;
+import assert;
+
+fn hexNib(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return 0;
+}
+
+// A byte buffer decoded from a hex string.
+fn hexBuf(hex: string): ptr {
+    let n = hex.length / 2;
+    let b = bytes.alloc(if (n == 0) 1 else n);
+    let i = 0;
+    while (i < n) { bytes.write_byte(b, i, hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1])); i = i + 1; }
+    return b;
+}
+
+fn eqHex(buf: ptr, n: int, hex: string): bool {
+    if (hex.length != n * 2) { return false; }
+    let i = 0;
+    while (i < n) {
+        if (bytes.read_byte(buf, i) != hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1])) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn strBuf(s: string): ptr {
+    let n = s.length;
+    let b = bytes.alloc(n + 1);
+    let i = 0;
+    while (i < n) { bytes.write_byte(b, i, s[i]); i = i + 1; }
+    return b;
+}
+
+@test
+fn chacha20poly1305_rfc8439(): void {
+    let key = hexBuf("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f");
+    let nonce = hexBuf("070000004041424344454647");
+    let aad = hexBuf("50515253c0c1c2c3c4c5c6c7");
+    let pt = strBuf("Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.");
+    let ptLen = 114;
+    let ct = bytes.alloc(ptLen);
+    let tag = bytes.alloc(16);
+    chachapoly.seal(key, nonce, aad, 12, pt, ptLen, ct, tag);
+    assert.isTrue(eqHex(ct, ptLen,
+        "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b6116"));
+    assert.isTrue(eqHex(tag, 16, "1ae10b594f09e26a7e902ecbd0600691"));
+
+    // Round-trip: open recovers the plaintext and verifies the tag.
+    let rt = bytes.alloc(ptLen);
+    let ok = chachapoly.open(key, nonce, aad, 12, ct, ptLen, tag, rt);
+    assert.isTrue(ok);
+    let i = 0;
+    while (i < ptLen) { assert.equalInt(bytes.read_byte(pt, i), bytes.read_byte(rt, i)); i = i + 1; }
+
+    // A tampered tag must be rejected.
+    bytes.write_byte(tag, 0, (bytes.read_byte(tag, 0) + 1) & 255);
+    assert.isFalse(chachapoly.open(key, nonce, aad, 12, ct, ptLen, tag, rt));
+}
+
+@test
+fn hkdf_sha256_rfc5869_tc1(): void {
+    let ikm = hexBuf("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b");
+    let salt = hexBuf("000102030405060708090a0b0c");
+    let info = hexBuf("f0f1f2f3f4f5f6f7f8f9");
+    let prk = bytes.alloc(32);
+    hkdf.extract(hkdf.SHA256, salt, 13, ikm, 22, prk);
+    assert.isTrue(eqHex(prk, 32, "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5"));
+    let okm = bytes.alloc(42);
+    hkdf.expand(hkdf.SHA256, prk, 32, info, 10, okm, 42);
+    assert.isTrue(eqHex(okm, 42,
+        "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"));
+}
+
+@test
+fn pbkdf2_sha1_rfc6070(): void {
+    let pw = strBuf("password");
+    let salt = strBuf("salt");
+    let dk = bytes.alloc(20);
+    pbkdf2.pbkdf2Sha1(pw, 8, salt, 4, 1, dk, 20);
+    assert.isTrue(eqHex(dk, 20, "0c60c80f961f0e71f3a9b524af6012062fe037a6"));
+    pbkdf2.pbkdf2Sha1(pw, 8, salt, 4, 2, dk, 20);
+    assert.isTrue(eqHex(dk, 20, "ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957"));
+}
