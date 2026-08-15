@@ -55,8 +55,9 @@ activates arc-elision (the perf win). Re-sequenced: D1 before the rest of B.
 
 | ID | Item | Priority | Status | Notes |
 |----|------|----------|--------|-------|
-| D1 | Thread explicit `retain`/`release` into HIR | P0 | TODO | Keystone. Ownership pass reads `TypedIr.expr_owned`. Activates D2 and the dormant `arc_elision`. |
-| D2 | Emit `retain`/`release` in the emit path | P1 | TODO | Currently `else => return false` in `mirEmittable`. |
+| C0 | **Method / builtin call NAME resolution** (prerequisite for strings) | P1 | TODO | 2026-08-15 finding: a method call (`s.length()`) lowers with a `.field` callee, so `lowerCall` sets `name = null` and `mirEmittable` rejects the nameless call; the resolved `callee: SymbolId` has no `SymbolId`->mangled-name bridge exposed to the emit path. So NO string op emits (all are calls). This gates all of B2 (strings) together with D2. Needs a `SymbolId`->LLVM-name resolution (or set `callee_name` at lower time from the resolved method). This is the real string unlock, paired with D2. |
+| D1 | Thread explicit `retain`/`release` into HIR | P0 | ALREADY DONE (in shadow) | `lower_ast_hir` ALREADY threads retain (owned-copy) + releases (scope-end / pre-return-except-moved / pre-break) from `TypedIr.ownedOf`, and the emit path already supplies `typed_ir`. So the ops exist; the emit path just rejects them. The remaining work is D2 (emit them) + the C0 prerequisite below. |
+| D2 | Emit `retain`/`release` in the emit path | P1 | PROTOTYPED, reverted; blocked on C0 | 2026-08-15: built + validated a strings-only ARC emit slice (retain=`nova_retain`, release=`nova_release(ptr,null)` -- a string needs no dtor; threaded owned-local TypeIds to gate ARC ops to strings). Emit/ASAN/ARC all green. BUT reverted: it emits ~0 useful functions, because every string operation is a CALL the emit path cannot name-resolve (see C0). ARC has nothing to apply to without C0. Strings need C0 + D2 TOGETHER. |
 | D3 | Owned-field structs / aggregates | P2 | TODO | Beyond the scalar-field case; need retains. |
 | D4 | Return a borrowed struct | P2 | TODO | Today only fresh `struct_new` results may be returned (a borrowed struct needs a retain). |
 | D5 | `await_` / `spawn_` / `indirect_call` | P2 | TODO | Async plus trait dynamic dispatch. |
