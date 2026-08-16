@@ -9,30 +9,40 @@ Every factual claim is tagged **[verified]** (checked against the code this sess
 
 ---
 
-## Gap 2 — Toolchain distribution (LLVM per host)
-**Problem.** `build.zig` needs an LLVM install per host; there is **no fetched static-LLVM mirror**
-(`-Dstatic-llvm` 404s; mirror upload "pending"), so every host brings its own LLVM, with a brittle
-hardcoded dev-prefix fallback. `build.zig` already branches per OS and honours `NOVA_LLVM_PREFIX`, and a
-`release.yml` installs LLVM 21 per host. **[verified]** Unknown: whether `nls` builds through the same
-`build.zig`. **[recall]**
+## Gap 2 — Toolchain distribution (LLVM) — CORRECTED: delivery already works
+**Correction (2026-08-16):** an earlier draft claimed "no static-LLVM mirror; every host brings its own
+LLVM" and recommended bring-your-own. That was WRONG, from stale recall. Verified against `build.zig`,
+`build.zig.zon`, `deps/llvm-zig/README-static-llvm.md`, and `.github/workflows/release.yml`:
 
-**Options.**
-- **A — Finish the self-contained static-LLVM mirror.** Upload per-triple static LLVM tarballs to the lazy
-  `build.zig.zon` mirror; `zig build -Dstatic-llvm` fetches + links a pinned LLVM → reproducible bare
-  `zig build` anywhere, no system LLVM. Cost: build + host ~GB tarballs per triple, maintain the mirror.
-- **B — Standardise bring-your-own-LLVM.** "Install `llvm@21` (apt/brew) + set `NOVA_LLVM_PREFIX`", drop
-  the hardcoded fallback, write a `BUILDING.md` per host, CI runners install `llvm@21`. Cost: docs + runner
-  setup; no mirror. Downside: contributors must install LLVM (normal for an LLVM compiler, but a barrier).
-- **C — Hybrid: B now, A later.** B unblocks multi-host CI cheaply; do A only when shipping binaries to
-  end-users who will not install LLVM.
+**Self-contained delivery already exists and ships.** **[verified]**
+- `zig build -Dstatic-llvm=true` static-links LLVM's component archives into `nova` → a **~132 MB
+  self-contained binary** (only system dylibs; no `libLLVM.dylib`), gates green. "Users deploy only `nova`".
+- The LLVM.org LTO-bitcode blocker (Zig's linker can't consume bitcode) is **RESOLVED** by
+  `convert-drop-to-native.sh` (runs each archive member through `llc -filetype=obj`, re-archives native).
+- `release.yml` builds **6 bundles** and publishes them: macOS {arm64, x86_64} and Linux {arm64, x86_64}
+  are **statically linked** (`-Dstatic-llvm=true`, globbing the OS package-manager's `libLLVM*.a`);
+  Windows {x86_64, arm64} ships `nova.exe` + a **bundled `LLVM-C.dll`** in the zip (dynamic, still one
+  self-contained archive). In every case the end user downloads an archive and never installs LLVM.
+- The old fetched `llvm-dist` mirror was **removed on purpose** — CI uses the OS package manager's static
+  archives instead, which is reproducible without hosting ~GB tarballs. So "finish the mirror" is NOT a task.
 
-**Recommendation: C.** B now (cheap, unblocks the mac-arm64/intel + linux/wsl + windows CI matrix); A is a
-real storage/maintenance commitment justified only for distributing to non-contributors. Verify `nls`'s
-build path as part of B.
+**Actual remaining items (all narrow):**
+1. **Windows single-file static.** Windows currently bundles `LLVM-C.dll` beside `nova.exe` rather than
+   static-linking (needs static LLVM `.lib` + `link.exe` static link). Arguably unnecessary — the bundle
+   is still "download the zip and run" — so this is polish, not a blocker.
+2. **Un-hardcode the local static default.** `build.zig`'s `static_llvm_prefix` is a hardcoded dev-machine
+   path; it only affects a `-Dstatic-llvm` build run locally off that box without `NOVA_LLVM_PREFIX`. CI
+   overrides it, so this is cosmetic — make it a sensible per-OS default or require `NOVA_LLVM_PREFIX`.
+3. **`nls` in the bundles?** Verify whether the LSP server ships in the release archives; if not, add it.
+4. **Contributor dev builds** use dynamic system LLVM (fast) — fine; only release needs static.
 
-**Decision to lock:** C (B-now / A-later)? And is `nls` in scope for the same per-host build story?
+**Recommendation:** delivery is DONE for the web-developer story. Treat 1-3 as small polish items, not a
+gap. Do #3 (verify/bundle `nls`) and #2 (un-hardcode) opportunistically; #1 only if single-file Windows
+matters.
 
-**Effort:** B = days (docs + CI). A = week+ (per-triple static LLVM builds + mirror hosting).
+**Decision to lock:** agree delivery is solved (no mirror work); pick up #2/#3 as polish? Pursue #1 or not?
+
+**Effort:** #2/#3 = hours. #1 (Windows static) = days, finicky, optional.
 
 ---
 

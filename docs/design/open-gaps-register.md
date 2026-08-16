@@ -64,8 +64,11 @@ re-opened by mistake. Reverify a specific one only if it resurfaces.
 - **Windows `--asan` / `--arc` gates** not wired (the install step skips those runtimes). **[register]**
 - **Windows IOCP readiness** cases 192/194/195 — a proactor has no "tell me when readable"; needs the
   completion-API conversion the design notes plan. **[register]**
-- **`build.zig` per-host bring-up** — ~70% there; the real gap is the missing static-LLVM mirror (every
-  host must bring its own LLVM). Detail in Appendix 1. **[verified]**
+- **`build.zig` delivery — CORRECTED: already solved.** Self-contained static binaries ship: `release.yml`
+  publishes 6 bundles (macOS/Linux arm64+x86_64 static via `-Dstatic-llvm`; Windows bundles `LLVM-C.dll`).
+  End users never install LLVM. The old static-LLVM mirror was removed on purpose (CI uses OS-package static
+  archives). Remaining is polish only: Windows single-file static (optional), un-hardcode the local static
+  default, verify `nls` is in the bundles. See `remaining-gaps-design.md` Gap 2. **[verified]**
 - **WASM** is best-effort (deliberately dropped as the primary target, 2026-07-28). **[register]**
 
 ## E. Ecosystem (Gap 6) — not started; separate repos, weeks+. **[register]**
@@ -79,23 +82,27 @@ The real risk is TEST COVERAGE, not missing features: a broad per-module `@test`
 
 ---
 
-## Appendix 1 — `build.zig` per host (mac arm64/intel, Windows, WSL/Ubuntu)
-Already ~70% there, not greenfield: `build.zig` has `os_tag` branches (Windows/Linux/macOS), separate LLVM
-lib manifests (`llvm-libs.txt` / `llvm-libs-linux.txt`), a `NOVA_LLVM_PREFIX` override, and a `release.yml`
-CI that installs LLVM 21 per host. **[verified]**
+## Appendix 1 — `build.zig` delivery (CORRECTED — already solved)
+Earlier text here claimed a missing static-LLVM mirror was the root gap. That was wrong. Verified against
+`build.zig`, `deps/llvm-zig/README-static-llvm.md`, and `release.yml`:
 
-| Host | State | Gap |
+**Self-contained static delivery already ships.** `release.yml` builds+publishes 6 bundles:
+
+| Bundle | Link | End-user gets |
 |---|---|---|
-| macOS arm64 | works | falls back to a **hardcoded dev prefix** — brittle across machines |
-| macOS x86_64 | handled in the macos-13 release cell | needs `NOVA_LLVM_PREFIX`; not a clean bare `zig build` |
-| WSL / Ubuntu | works (Linux path) | must point `NOVA_LLVM_PREFIX` at apt `llvm@21` |
-| Windows | works | needs `NOVA_LLVM_PREFIX` + LLVM `bin` on PATH at build AND run time |
+| macOS arm64 | **static** (`-Dstatic-llvm`) | single self-contained `nova` |
+| macOS x86_64 | **static** | single self-contained `nova` |
+| Linux x86_64 | **static** | single self-contained `nova` |
+| Linux arm64 | **static** | single self-contained `nova` |
+| Windows x86_64 | dynamic + **bundled `LLVM-C.dll`** | `nova.exe` + dll, one zip |
+| Windows arm64 | dynamic + bundled dll | `nova.exe` + dll, one zip |
 
-**Root gap:** there is **no fetched static-LLVM mirror** (`-Dstatic-llvm` 404s; mirror upload "pending" per
-CLAUDE.md), so every host brings its own LLVM. To close for clean per-host CI, either (a) finish the
-static-LLVM mirror upload, or (b) standardise "provision `llvm@21` + set `NOVA_LLVM_PREFIX`" in each host's
-runner and drop the hardcoded dev-prefix fallback. **nls** (the LSP server) likely needs the same treatment
-— NOT yet verified whether it builds through this `build.zig` or a separate one; scope that first. **[verified/reverify]**
+The LTO-bitcode blocker is resolved (`convert-drop-to-native.sh`); CI static-links the OS package manager's
+`libLLVM*.a` (no mirror needed — the old fetched `llvm-dist` was removed on purpose). Web developers download
+an archive and never install LLVM. Remaining is **polish only**: (1) Windows single-file static (optional —
+the bundle is still one download), (2) un-hardcode `build.zig`'s local `static_llvm_prefix` (cosmetic; CI
+overrides via `NOVA_LLVM_PREFIX`), (3) verify `nls` is inside the release archives. See
+`remaining-gaps-design.md` Gap 2. Contributor DEV builds use dynamic system LLVM (fast); only release is static.
 
 ## Appendix 2 — optimiser switches vs `--release`
 **`--release` handles all optimisation; do not add optimiser switches.** **[verified]**
