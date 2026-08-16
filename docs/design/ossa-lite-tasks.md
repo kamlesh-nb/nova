@@ -72,15 +72,22 @@ soundness property, and NEITHER existing analysis proves it.
 - Note: keep `NOVA_OWN_VERIFY` infra (V1/V2) — the structured-diagnostic + reporter plumbing is reused by
   V4'. Only the PROPERTY being checked changes (from the dead move-walk to real ARC-balance).
 
-## Track I — ownership IR (OSSA-lite). Needed for Track A, NOT for Track V.
-- [ ] **I1** Salvage `mir.zig` as `src/frontend/sema/ossa/ir.zig` — typed-SSA value/op types ONLY, compile-gated,
-      unused. Verify: builds.
-- [ ] **I2** Minimal SILGen: lower ONE straight-line function body into the OSSA IR with explicit
-      retain/release/borrow ops, seeded from ownership.zig (moves/drops) + escape.zig (borrows). Report-only.
-- [ ] **I3** OSSA VERIFIER on the IR (salvage `verify.zig`): every value consumed exactly once; no
-      use-after-consume. This is the IR-level restatement of Track V; converges with V4.
-- [ ] **I4** Extend SILGen coverage function-by-function until it matches the AST codegen's ARC decisions
-      (cross-check against `NOVA_ARC_AUDIT`). Each function = one verified slice.
+## Track I — ownership IR (OSSA-lite). The SHARED substrate for BOTH gaps (verifier + ownership-forwarding).
+- [x] **I1** DONE. Purpose-built minimal ownership IR at `src/frontend/sema/ossa/ir.zig` (NOT a salvage of
+      the emit-optimiser's general mir.zig — that modelled arithmetic; this models ONLY ownership).
+      Value/Block/Ownership{trivial,owned,borrowed}; ownership-event ops make_owned/make_trivial/copy/
+      borrow/destroy/move_out/borrow_use/end_borrow; Terminator; Func builder. `consumesOperand()` is the
+      single consumption classifier both later passes share. INVARIANT (for I3): every owned value is
+      consumed exactly once per path. Wired into root.zig test aggregation; 3 unit tests PASS (verified by
+      deliberate-break: pass 104->103). Compiler builds clean; corpus green. Not yet produced/checked.
+- [ ] **I2** Minimal lowering (SILGen): produce the OSSA IR for ONE straight-line function from Nova source,
+      seeding owned-births/copies/destroys from codegen's ARC decisions + borrows from escape.zig. Report-only.
+      NOTE: this is where the V4' blocker is solved — codegen KNOWS ownership; lowering records it as IR
+      events (make_owned/copy/destroy) instead of reverse-engineering from LLVM IR shapes.
+- [ ] **I3** OSSA VERIFIER on the IR: every owned value consumed exactly once; no use-after-consume; no
+      double-consume. IR-level restatement of Track V; this is the REAL, non-vacuous soundness verifier.
+- [ ] **I4** Extend lowering coverage function-by-function until it matches AST codegen's ARC decisions
+      (cross-check `NOVA_ARC_AUDIT`). Then ownership-forwarding (Track A) becomes possible ON this IR.
 
 ## Track A — ARC optimisation (perf). GATED on measured delta. LOWEST priority.
 - [ ] **A1** borrow-skip / release-sink pass on the OSSA IR (the one non-redundant-with-LLVM opt).

@@ -38,6 +38,7 @@ test {
     _ = @import("frontend/sema/sema.zig");
     _ = @import("frontend/sema/mono.zig");
     _ = @import("frontend/sema/shadow.zig");
+    _ = @import("frontend/sema/ossa/ir.zig");
 
     _ = @import("frontend/lexer.zig");
     _ = @import("frontend/parser.zig");
