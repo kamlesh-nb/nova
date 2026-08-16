@@ -102,28 +102,44 @@ neither a debugger nor a DAP server.
 - Rejected alternative: a NATIVE Nova DAP server. Far more work, less robust, and STILL needs a debug engine
   + DWARF underneath. Only worth it if lldb-dap ever proves inadequate for Nova's semantics.
 
-**Nova types must display well (the part that is Nova-specific).** lldb won't render Nova strings (heap
-object, 8-byte header: refcount@-8, len@-4), `List`/`Map`, optionals, or ARC boxes without help. Two levers:
-accurate `DIType` in the DWARF, plus **lldb data formatters** (Python summaries, shipped with the toolchain)
-for the stdlib types. Without these, "inspect a variable" shows raw pointers.
+**HARD REQUIREMENT: show VALUES, not addresses — C#-quality.** A debugger that shows `0x6000000…` instead
+of `"hello"` / `[1,2,3]` / `{name:"x", age:3}` "does not add much value" (the user's words; this is exactly
+the Zig-in-DAP experience). So value display is not phase-2 polish — it is the bar for shipping anything.
 
-**Phases.**
-1. **Line-table DWARF → breakpoints + step + call stack in VS Code via lldb-dap.** The ~80%. Ship the VS
-   Code launch config + locate/bundle `lldb-dap` per platform.
-2. **Variable/type DWARF + lldb data formatters for stdlib types → useful inspection** (string/List/Map/
-   optional render properly).
-3. **Async/coroutine stepping** — Nova async is LLVM coroutines (split frames), so stepping across `await`
-   is inherently confusing; polish last.
+Why native languages hit the addresses-not-values trap, and how to avoid it:
+- **Primitives** (int/bool/float) show values from standard DWARF base types — free.
+- **Plain structs/enums** render IF the DWARF carries complete `DIType` + member info (lldb walks fields).
+- **Heap/generic types** — Nova `string` (ptr → `{refcount@-8, len@-4, bytes}`), `List`/`Map`/`Set`,
+  optionals, ARC boxes — show only a POINTER from DWARF alone. To print their CONTENTS you must ship **lldb
+  data formatters** (Python summaries + synthetic children) that deref the pointer, read the length from the
+  ARC header, and format the payload. This is precisely how Rust (`rust-lldb`), Swift, and C++ (libc++
+  pretty-printers) get C#-grade display on native binaries. C# gets it from a managed-runtime debugger; the
+  native-AOT equivalent is **rich DWARF + formatters** — there is no free lunch.
+- **Build mode matters:** locals are only reliable in a DEBUG (`-O0`) build; `--release` (`default<O3>`)
+  clobbers them. `nova build` defaults to debug, so debugging is a debug-build activity (state this to users).
 
-**Recommendation: DWARF + lldb-dap, phase 1 first.** **Spike first** to confirm (a) the LLVM-zig bindings
-expose DIBuilder, and (b) `lldb-dap` is available/bundleable on mac/Linux/Windows. Almost certainly
-**post-beta**, but phase 1 is high-value and self-contained.
+**Deliverable (MVP = all of this together; less is the addresses-only trap):**
+1. **Line-table DWARF** → breakpoints, step, call stack via `lldb-dap` + a VS Code launch config.
+2. **Complete `DIType`/`DILocalVariable`** for primitives, user structs, and enums → those show real values
+   directly.
+3. **lldb data formatters for the runtime types** (`string`, `List`, `Map`, `Set`, optional, ARC box) →
+   the heap/generic types show their CONTENTS, not pointers. Shipped with the toolchain, defensive against
+   released objects.
 
-**Decision to lock:** (1) DWARF + lldb-dap (vs a native DAP server)? (2) bundle `lldb-dap` in the toolchain
-or require the user's LLVM/VS Code lldb? (3) debugger = post-beta?
+**Later (post-MVP):** async/coroutine stepping — Nova async is LLVM coroutines (split frames), so stepping
+across `await` is inherently confusing; polish last. Full expression evaluation in the debug console (typing
+`xs.len()`) needs more than formatters (a language plugin, Swift-style) — out of scope for value display.
 
-**Effort:** phase 1 (line tables + VS Code launch + lldb-dap wiring) = ~1-2 weeks incl. the two spikes.
-Phase 2 (types + formatters) = several more. Phase 3 (async) = open-ended.
+**Recommendation: DWARF + lldb-dap, and treat items 1-3 as ONE deliverable** (do not ship lines-only).
+**Spike first**: confirm (a) the LLVM-zig bindings expose DIBuilder, (b) `lldb-dap` is bundleable on
+mac/Linux/Windows, and (c) an lldb Python data-formatter can read Nova's ARC header layout. Post-beta, but
+when built it must clear the C#-quality value-display bar or it is not worth shipping.
+
+**Decision to lock:** (1) DWARF + lldb-dap + formatters as one MVP (vs a native DAP server)? (2) bundle
+`lldb-dap` + the formatters in the toolchain or lean on the user's LLVM? (3) debugger = post-beta?
+
+**Effort:** items 1-3 together = ~3-5 weeks incl. the three spikes (line tables are quick; complete DIType
+for generics/enums and the data formatters are the real work). Async stepping = open-ended.
 
 ---
 
