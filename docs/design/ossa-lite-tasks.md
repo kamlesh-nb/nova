@@ -115,8 +115,18 @@ soundness property, and NEITHER existing analysis proves it.
       the back-edge decreases in index). Body may only BORROW outer locals; a body that declares its own
       owned local defers (needs per-iteration scoping). MEASURED: coverage **47% -> 75%** (58 -> 91 fns),
       still 0 imbalanced; scans over string/list/map/loop/while/serde/closure/trait = 0 false positives.
-      NEXT slice-5: for-loops (init/cond/incr/iterator) + per-iteration scoping so loop/branch bodies can
-      declare owned locals (the main remaining defer class). Also `switch`.
+      SLICE 5 DONE — lexical scoping + for-loops (47%... 75% -> 86%). Replaced the append-only names/vals
+      with a proper `Local` list + `lowerBlockScope`: each block (function body, if-branch, loop body) is a
+      lexical scope that drops the locals IT declared at fall-through and truncates them. So branch AND
+      loop bodies may now declare their own owned locals (dropped at scope end / each iteration) — this
+      removed the growth-check defers and made inner-local loops verify (body-exit live == header entry).
+      Added C-style for-loops (init var scoped to the loop, dropped after; increment = trivial borrow;
+      for-in iterator form still defers). MEASURED: coverage 75% -> **86%** (91 -> 105 fns), still 0
+      imbalanced; 10 varied cases (for/while/loop/string/list/map/struct/enum) = 0 false positives. Unit
+      test now `resolveLocal` (innermost-shadow). Remaining ~14% defers = switch, destructuring lets,
+      for-in iterators, bare-local reassignment, defer-stmt, nested bare blocks.
+      NEXT slice-6: switch statements + for-in iterators (element ownership) + destructuring; then I4 is
+      effectively met and ownership-forwarding (Track A perf) can be built ON this IR.
 - [ ] **I3** OSSA VERIFIER on the IR: every owned value consumed exactly once; no use-after-consume; no
       double-consume. IR-level restatement of Track V; this is the REAL, non-vacuous soundness verifier.
 - [ ] **I4** Extend lowering coverage function-by-function until it matches AST codegen's ARC decisions

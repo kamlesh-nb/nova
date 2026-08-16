@@ -43,15 +43,18 @@ const Flow = union(enum) {
     fallthrough: ir.Block,
 };
 
-// Threaded lowering state. `names`/`vals` are function-scoped and append-only (owned locals in
-// declaration order); `live` is per-PATH (a branch works on a clone) — a bool per local index.
+// One owned local in the current PATH: its name, its IR value, and whether it is still live. The list
+// grows as blocks nest (a lexical scope = the tail beyond a saved `mark`) and shrinks at scope end
+// (dropScope drops the tail's still-live locals and truncates). Branches/loop bodies work on a CLONE so
+// their declarations and consumes do not leak into sibling paths.
+const Local = struct { name: []const u8, value: ir.Value, live: bool };
+const Locals = std.ArrayListUnmanaged(Local);
+
 const Ctx = struct {
     gpa: std.mem.Allocator,
     store: *const TypeStore,
     tir: *const TypedIr,
     f: *ir.Func,
-    names: *std.ArrayListUnmanaged([]const u8),
-    vals: *std.ArrayListUnmanaged(ir.Value),
 };
 
 pub fn lowerFunction(
@@ -64,16 +67,12 @@ pub fn lowerFunction(
     errdefer f.deinit(gpa);
     const entry = try f.newBlock(gpa);
 
-    var names = std.ArrayListUnmanaged([]const u8).empty;
-    defer names.deinit(gpa);
-    var vals = std.ArrayListUnmanaged(ir.Value).empty;
-    defer vals.deinit(gpa);
-    var live = std.ArrayListUnmanaged(bool).empty;
-    defer live.deinit(gpa);
+    var locals: Locals = .empty;
+    defer locals.deinit(gpa);
+    var ctx = Ctx{ .gpa = gpa, .store = store, .tir = tir, .f = &f };
 
-    var ctx = Ctx{ .gpa = gpa, .store = store, .tir = tir, .f = &f, .names = &names, .vals = &vals };
-
-    const flow = lowerSeq(&ctx, entry, fn_decl.body.statements, &live) catch |e| switch (e) {
+    // The function body is the outermost lexical scope (mark 0 = drop everything at the end).
+    const flow = lowerBlockScope(&ctx, entry, fn_decl.body.statements, &locals) catch |e| switch (e) {
         error.Defer => {
             f.deinit(gpa);
             return .{ .outcome = .deferred };
@@ -82,82 +81,90 @@ pub fn lowerFunction(
     };
     switch (flow) {
         .terminated => {},
-        .fallthrough => |b| {
-            // Fell out of the body: destroy every still-live owned local, then return void.
-            try dropLive(&ctx, b, &live, null);
-            f.setTerm(b, .ret_void);
-        },
+        .fallthrough => |b| f.setTerm(b, .ret_void),
     }
     return .{ .outcome = .lowered, .func = f };
 }
 
-/// Lower a statement sequence into `block`, threading the per-path `live` set. Returns whether it
-/// terminated (a return) or fell through (with the block execution continues in).
-fn lowerSeq(ctx: *Ctx, block: ir.Block, stmts: []const ast.Statement, live: *std.ArrayListUnmanaged(bool)) LowerError!Flow {
+/// Lower a lexical scope: run `stmts`, and on fall-through destroy the locals THIS scope declared
+/// (those appended at index >= the entry mark), truncating them back out of scope.
+fn lowerBlockScope(ctx: *Ctx, block: ir.Block, stmts: []const ast.Statement, locals: *Locals) LowerError!Flow {
+    const mark = locals.items.len;
+    switch (try lowerSeq(ctx, block, stmts, locals)) {
+        .terminated => return .terminated, // a return already dropped every enclosing scope
+        .fallthrough => |b| {
+            try dropScope(ctx, b, locals, mark);
+            return .{ .fallthrough = b };
+        },
+    }
+}
+
+/// Lower a statement sequence into `block` (no scope handling of its own — the caller wraps it in a
+/// lowerBlockScope). Mutates `locals` (the current path). Returns terminated (a return) or fallthrough.
+fn lowerSeq(ctx: *Ctx, block: ir.Block, stmts: []const ast.Statement, locals: *Locals) LowerError!Flow {
     var cur = block;
     for (stmts) |*s| {
         switch (s.*) {
-            .let_stmt => |ls| {
-                if (ls.names != null) return error.Defer; // destructuring
-                const init = ls.init orelse continue;
-                if (!isOwnedInit(ctx.store, ctx.tir, &init)) continue; // trivial local: ignore
-
-                // `let y = x` where x is a tracked owned local -> a dup (copy, retains). Otherwise a fresh
-                // birth: any other owned initializer produces a NEW owned value bound to `ls.name`. Under
-                // Nova's ARC model any local mentioned inside the initializer is BORROWED (the callee
-                // retains its own copies; the caller keeps its +1), so it needs no consume here — see the
-                // E2 census finding that caller-side call args carry no retain/release. So we do NOT defer
-                // on a local-mentioning init; we just model the new binding.
-                var v: ir.Value = undefined;
-                if (init.kind == .ident and findLocalIdx(ctx.names.items, init.kind.ident) != null) {
-                    v = try ctx.f.copy(ctx.gpa, cur, ctx.vals.items[findLocalIdx(ctx.names.items, init.kind.ident).?]);
-                } else {
-                    v = try ctx.f.makeOwned(ctx.gpa, cur, ctx.tir.typeOf(&init));
-                }
-                try ctx.names.append(ctx.gpa, ls.name);
-                try ctx.vals.append(ctx.gpa, v);
-                try live.append(ctx.gpa, true);
-            },
+            .let_stmt => |ls| try lowerLet(ctx, cur, &ls, locals),
             .return_stmt => |r| {
-                // A bare `return x` where x is a tracked owned local MOVES x out (ret_owned). Any other
-                // return expression BORROWS the locals it mentions (their +1s are still dropped here) and
-                // returns a fresh value we don't track -> drop all live locals, ret_void.
+                // A bare `return x` where x is an owned local MOVES x out (ret_owned). Any other return
+                // expression BORROWS the locals it mentions -> drop all live locals, ret_void.
                 var returned_idx: ?usize = null;
                 if (r.value) |val| {
-                    if (val.kind == .ident) returned_idx = findLocalIdx(ctx.names.items, val.kind.ident);
+                    if (val.kind == .ident) returned_idx = resolveLocal(locals.items, val.kind.ident);
                 }
-                try dropLive(ctx, cur, live, returned_idx);
+                try dropAll(ctx, cur, locals, returned_idx);
                 if (returned_idx) |ri| {
-                    ctx.f.setTerm(cur, .{ .ret_owned = ctx.vals.items[ri] });
+                    ctx.f.setTerm(cur, .{ .ret_owned = locals.items[ri].value });
                 } else {
                     ctx.f.setTerm(cur, .ret_void);
                 }
                 return .terminated;
             },
             .expr_stmt => |es| {
-                // A bare-local REASSIGNMENT (`x = ...`) drops the old value and rebinds — not modelled in
-                // this slice, so defer. Every other expression statement (a call/method that mentions
-                // locals) BORROWS them: no ownership change, no balance effect -> skip.
-                if (isLocalReassign(&es.expr, ctx.names.items)) return error.Defer;
+                // A bare-local REASSIGNMENT (`x = ...`) drops the old value and rebinds — not modelled
+                // yet, so defer. Any other expression statement borrows the locals it touches: no effect.
+                if (isLocalReassign(&es.expr, locals.items)) return error.Defer;
             },
             .if_stmt => |iff| {
-                switch (try lowerIf(ctx, cur, &iff, live)) {
-                    .terminated => return .terminated, // both branches diverged: rest is unreachable
+                switch (try lowerIf(ctx, cur, &iff, locals)) {
+                    .terminated => return .terminated,
                     .fallthrough => |join| cur = join,
                 }
             },
-            .while_stmt => |w| cur = try lowerWhile(ctx, cur, &w, live),
+            .while_stmt => |w| cur = try lowerWhile(ctx, cur, &w, locals),
+            .for_stmt => |fr| {
+                switch (try lowerFor(ctx, cur, &fr, locals)) {
+                    .terminated => return .terminated,
+                    .fallthrough => |exit| cur = exit,
+                }
+            },
             .defer_stmt => return error.Defer,
-            else => return error.Defer, // for/switch/nested-block: not modelled yet
+            else => return error.Defer, // switch / nested bare block: not modelled yet
         }
     }
     return .{ .fallthrough = cur };
 }
 
-/// Lower an if/else. `entry_block` is where the branch is taken from. Returns the join block to
-/// continue in, or `.terminated` when BOTH paths diverge (join unreachable). The join block is
-/// allocated LAST so every edge is index-increasing (keeps the verifier's topological order valid).
-fn lowerIf(ctx: *Ctx, entry_block: ir.Block, iff: *const ast.IfStmt, live: *std.ArrayListUnmanaged(bool)) LowerError!Flow {
+/// `let name = init;` — record an owned binding. `let y = x` (x an owned local) is a dup (copy);
+/// any other owned initializer is a fresh birth (locals it mentions are borrowed, so no consume here).
+/// A trivial (non-owned) local is ignored.
+fn lowerLet(ctx: *Ctx, block: ir.Block, ls: *const ast.LetStmt, locals: *Locals) LowerError!void {
+    if (ls.names != null) return error.Defer; // destructuring
+    const init = ls.init orelse return;
+    if (!isOwnedInit(ctx.store, ctx.tir, &init)) return; // trivial local: ignore
+    const v = if (init.kind == .ident and resolveLocal(locals.items, init.kind.ident) != null)
+        try ctx.f.copy(ctx.gpa, block, locals.items[resolveLocal(locals.items, init.kind.ident).?].value)
+    else
+        try ctx.f.makeOwned(ctx.gpa, block, ctx.tir.typeOf(&init));
+    try locals.append(ctx.gpa, .{ .name = ls.name, .value = v, .live = true });
+}
+
+/// Lower an if/else. Branches get a CLONE of `locals` and are each their own lexical scope, so a
+/// branch may now declare its own owned locals (dropped at the branch end). The join block is allocated
+/// LAST so every edge is index-increasing. The caller's `locals` is unchanged (a fall-through branch
+/// consumes no outer local — only a `return` does, and that terminates the branch).
+fn lowerIf(ctx: *Ctx, entry_block: ir.Block, iff: *const ast.IfStmt, locals: *Locals) LowerError!Flow {
     const then_stmts = branchStmts(iff.then_branch) orelse return error.Defer;
     const else_stmts: ?[]const ast.Statement = if (iff.else_branch) |e| (branchStmts(e) orelse return error.Defer) else null;
 
@@ -165,21 +172,15 @@ fn lowerIf(ctx: *Ctx, entry_block: ir.Block, iff: *const ast.IfStmt, live: *std.
     const then_block = try ctx.f.newBlock(ctx.gpa);
     const else_block: ?ir.Block = if (else_stmts != null) try ctx.f.newBlock(ctx.gpa) else null;
 
-    // A branch must NOT declare a new owned local (that would make the live-set sizes differ across
-    // paths). Detect by a growth check and defer.
-    const nlocals_before = ctx.names.items.len;
-
-    var then_live = try cloneLive(ctx.gpa, live);
-    defer then_live.deinit(ctx.gpa);
-    const then_flow = try lowerSeq(ctx, then_block, then_stmts, &then_live);
-    if (ctx.names.items.len != nlocals_before) return error.Defer;
+    var then_locals = try cloneLocals(ctx.gpa, locals);
+    defer then_locals.deinit(ctx.gpa);
+    const then_flow = try lowerBlockScope(ctx, then_block, then_stmts, &then_locals);
 
     var else_flow: ?Flow = null;
     if (else_stmts) |es| {
-        var else_live = try cloneLive(ctx.gpa, live);
-        defer else_live.deinit(ctx.gpa);
-        else_flow = try lowerSeq(ctx, else_block.?, es, &else_live);
-        if (ctx.names.items.len != nlocals_before) return error.Defer;
+        var else_locals = try cloneLocals(ctx.gpa, locals);
+        defer else_locals.deinit(ctx.gpa);
+        else_flow = try lowerBlockScope(ctx, else_block.?, es, &else_locals);
     }
 
     const join_block = try ctx.f.newBlock(ctx.gpa); // highest index
@@ -202,20 +203,16 @@ fn lowerIf(ctx: *Ctx, entry_block: ir.Block, iff: *const ast.IfStmt, live: *std.
             .terminated => {},
         }
     } else {
-        // no else: the entry's else edge goes straight to join, carrying `live` unchanged.
-        any_fallthrough = true;
+        any_fallthrough = true; // no else: the else edge goes straight to join, carrying `locals`
     }
 
     return if (any_fallthrough) .{ .fallthrough = join_block } else .terminated;
 }
 
-/// Lower a `while (cond) body` loop. Returns the exit block to continue in. The body may only BORROW
-/// owned locals declared outside the loop; if it declares an owned local of its own (which would need
-/// per-iteration scoping) the whole function defers. Blocks: entry -> header; header -cond-> body/exit;
-/// body -> header (back-edge). The exit block is allocated LAST so forward edges stay index-increasing;
-/// the single back-edge (body -> header) is the only decreasing edge, which the verifier handles by
-/// requiring the body-exit live set to equal the header entry set (no per-iteration ownership drift).
-fn lowerWhile(ctx: *Ctx, entry_block: ir.Block, w: *const ast.WhileStmt, live: *std.ArrayListUnmanaged(bool)) LowerError!ir.Block {
+/// Lower `while (cond) body`. The body is its own lexical scope on a CLONE of `locals`, so it may now
+/// declare its own owned locals (dropped at the end of each iteration). That keeps the body-exit live
+/// set equal to the header entry set, which is exactly what the verifier's back-edge check requires.
+fn lowerWhile(ctx: *Ctx, entry_block: ir.Block, w: *const ast.WhileStmt, locals: *Locals) LowerError!ir.Block {
     const body_stmts = branchStmts(w.body) orelse return error.Defer;
 
     const header = try ctx.f.newBlock(ctx.gpa);
@@ -223,42 +220,87 @@ fn lowerWhile(ctx: *Ctx, entry_block: ir.Block, w: *const ast.WhileStmt, live: *
     const cond = try ctx.f.makeTrivial(ctx.gpa, header, null);
     const body_block = try ctx.f.newBlock(ctx.gpa);
 
-    const nlocals_before = ctx.names.items.len;
-    var body_live = try cloneLive(ctx.gpa, live);
-    defer body_live.deinit(ctx.gpa);
-    const body_flow = try lowerSeq(ctx, body_block, body_stmts, &body_live);
-    if (ctx.names.items.len != nlocals_before) return error.Defer; // body declared an owned local
+    var body_locals = try cloneLocals(ctx.gpa, locals);
+    defer body_locals.deinit(ctx.gpa);
+    const body_flow = try lowerBlockScope(ctx, body_block, body_stmts, &body_locals);
 
     const exit_block = try ctx.f.newBlock(ctx.gpa); // highest index
     ctx.f.setTerm(header, .{ .cond_br = .{ .cond = cond, .then_blk = body_block, .else_blk = exit_block } });
     switch (body_flow) {
         .fallthrough => |b| ctx.f.setTerm(b, .{ .br = header }), // back-edge
-        .terminated => {}, // body returns on every path: no back-edge
+        .terminated => {},
     }
-    return exit_block; // outer locals are unchanged across the loop; continue with `live`
+    return exit_block;
 }
 
-/// Destroy every still-live owned local in `block`, except `keep` (the returned one). Marks them dead
-/// in `live`. Iterates in reverse declaration order (scope-end drop order).
-fn dropLive(ctx: *Ctx, block: ir.Block, live: *std.ArrayListUnmanaged(bool), keep: ?usize) !void {
-    var i: usize = live.items.len;
+/// Lower a C-style `for (init; cond; incr) body`. The for-in iterator form defers (element ownership is
+/// a later slice). The initializer's binding is scoped to the loop (dropped after). The increment is a
+/// trivial-counter update (a borrow) and is not modelled. The body is its own scope on a clone.
+fn lowerFor(ctx: *Ctx, entry_block: ir.Block, fr: *const ast.ForStmt, locals: *Locals) LowerError!Flow {
+    if (fr.iterator != null) return error.Defer; // for-in: element ownership not modelled yet
+    const body_stmts = branchStmts(fr.body) orelse return error.Defer;
+
+    const for_mark = locals.items.len;
+
+    // initializer (usually `let i = 0` — trivial, ignored; an owned init is recorded and dropped after).
+    if (fr.initializer) |istmt| switch (istmt.*) {
+        .let_stmt => |ls| try lowerLet(ctx, entry_block, &ls, locals),
+        .expr_stmt => |es| if (isLocalReassign(&es.expr, locals.items)) return error.Defer,
+        else => return error.Defer,
+    };
+
+    const header = try ctx.f.newBlock(ctx.gpa);
+    ctx.f.setTerm(entry_block, .{ .br = header });
+    const cond = try ctx.f.makeTrivial(ctx.gpa, header, null);
+    const body_block = try ctx.f.newBlock(ctx.gpa);
+
+    var body_locals = try cloneLocals(ctx.gpa, locals);
+    defer body_locals.deinit(ctx.gpa);
+    const body_flow = try lowerBlockScope(ctx, body_block, body_stmts, &body_locals);
+
+    const exit_block = try ctx.f.newBlock(ctx.gpa); // highest index
+    ctx.f.setTerm(header, .{ .cond_br = .{ .cond = cond, .then_blk = body_block, .else_blk = exit_block } });
+    switch (body_flow) {
+        .fallthrough => |b| ctx.f.setTerm(b, .{ .br = header }), // back-edge
+        .terminated => {},
+    }
+    // Drop the for-scope binding(s) (the loop variable if it was owned) after the loop.
+    try dropScope(ctx, exit_block, locals, for_mark);
+    return .{ .fallthrough = exit_block };
+}
+
+/// Destroy the still-live locals THIS scope declared (index >= mark) in `block`, in reverse order, then
+/// truncate them out of scope.
+fn dropScope(ctx: *Ctx, block: ir.Block, locals: *Locals, mark: usize) !void {
+    var i: usize = locals.items.len;
+    while (i > mark) {
+        i -= 1;
+        if (locals.items[i].live) try ctx.f.destroy(ctx.gpa, block, locals.items[i].value);
+    }
+    locals.shrinkRetainingCapacity(mark);
+}
+
+/// Destroy every still-live local (all enclosing scopes) in `block`, except `keep` (returned). Used at
+/// a `return`, which exits all scopes at once. Marks consumed locals dead.
+fn dropAll(ctx: *Ctx, block: ir.Block, locals: *Locals, keep: ?usize) !void {
+    var i: usize = locals.items.len;
     while (i > 0) {
         i -= 1;
-        if (!live.items[i]) continue;
+        if (!locals.items[i].live) continue;
         if (keep != null and i == keep.?) continue;
-        try ctx.f.destroy(ctx.gpa, block, ctx.vals.items[i]);
-        live.items[i] = false;
+        try ctx.f.destroy(ctx.gpa, block, locals.items[i].value);
+        locals.items[i].live = false;
     }
-    if (keep) |k| live.items[k] = false; // returned value is consumed by the terminator
+    if (keep) |k| locals.items[k].live = false; // returned value consumed by the terminator
 }
 
-fn cloneLive(gpa: std.mem.Allocator, live: *const std.ArrayListUnmanaged(bool)) !std.ArrayListUnmanaged(bool) {
-    var out = std.ArrayListUnmanaged(bool).empty;
-    try out.appendSlice(gpa, live.items);
+fn cloneLocals(gpa: std.mem.Allocator, locals: *const Locals) !Locals {
+    var out: Locals = .empty;
+    try out.appendSlice(gpa, locals.items);
     return out;
 }
 
-/// The statement list of a branch (must be a block for slice 2; a bare single statement defers).
+/// The statement list of a branch/body (must be a block; a bare single statement defers).
 fn branchStmts(s: *const ast.Statement) ?[]const ast.Statement {
     return switch (s.*) {
         .block => |b| b.statements,
@@ -272,27 +314,27 @@ fn isOwnedInit(store: *const TypeStore, tir: *const TypedIr, e: *const ast.Expre
     return store.isOwnedSafe(tid);
 }
 
-fn findLocalIdx(names: []const []const u8, want: []const u8) ?usize {
-    for (names, 0..) |n, i| if (std.mem.eql(u8, n, want)) return i;
+/// Resolve a name to its local index, innermost (last-declared) shadow winning.
+fn resolveLocal(locals: []const Local, want: []const u8) ?usize {
+    var i: usize = locals.len;
+    while (i > 0) {
+        i -= 1;
+        if (std.mem.eql(u8, locals[i].name, want)) return i;
+    }
     return null;
-}
-
-fn mentionsAnyLocal(e: *const ast.Expression, names: []const []const u8) bool {
-    for (names) |n| if (exprMentions(e, n)) return true;
-    return false;
 }
 
 /// True if `e` is a bare assignment `local = ...` to a tracked owned local (which drops the old value —
 /// a rebinding this slice does not yet model, so the caller defers it).
-fn isLocalReassign(e: *const ast.Expression, names: []const []const u8) bool {
+fn isLocalReassign(e: *const ast.Expression, locals: []const Local) bool {
     if (e.kind != .binary) return false;
     const b = e.kind.binary;
     if (b.op != .assign) return false;
-    return b.left.kind == .ident and findLocalIdx(names, b.left.kind.ident) != null;
+    return b.left.kind == .ident and resolveLocal(locals, b.left.kind.ident) != null;
 }
 
-// A minimal name-mention check (idents only, recursive over common expression shapes). Enough for the
-// slice-1 "does an owned local appear in this expression" guard.
+// A minimal name-mention check (idents only, recursive over common expression shapes), kept for the
+// exprMentions helper used by tests.
 fn exprMentions(e: *const ast.Expression, name: []const u8) bool {
     switch (e.kind) {
         .ident => |n| return std.mem.eql(u8, n, name),
@@ -376,8 +418,13 @@ fn lowerAndCheck(gpa: std.mem.Allocator, store: *const TypeStore, tir: *const Ty
 // (Lowering needs a real TypedIr, which is heavy to construct in a unit test; end-to-end lowering is
 //  exercised via the NOVA_OSSA corpus report. These tests cover the pure helpers.)
 
-test "findLocalIdx locates a name by declaration order" {
-    const names = [_][]const u8{ "a", "b", "c" };
-    try std.testing.expectEqual(@as(?usize, 1), findLocalIdx(&names, "b"));
-    try std.testing.expectEqual(@as(?usize, null), findLocalIdx(&names, "z"));
+test "resolveLocal returns the innermost (last-declared) shadow" {
+    const locals = [_]Local{
+        .{ .name = "a", .value = @enumFromInt(0), .live = true },
+        .{ .name = "b", .value = @enumFromInt(1), .live = true },
+        .{ .name = "b", .value = @enumFromInt(2), .live = true }, // shadows the earlier b
+    };
+    try std.testing.expectEqual(@as(?usize, 2), resolveLocal(&locals, "b"));
+    try std.testing.expectEqual(@as(?usize, 0), resolveLocal(&locals, "a"));
+    try std.testing.expectEqual(@as(?usize, null), resolveLocal(&locals, "z"));
 }
