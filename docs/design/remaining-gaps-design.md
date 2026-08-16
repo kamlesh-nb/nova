@@ -84,26 +84,46 @@ in the lowering.
 
 ---
 
-## Gap 4 — Debugger
-**Problem.** **No debug info is emitted at all** (no DWARF / DIBuilder anywhere in codegen). **[verified]**
-So stepping, breakpoints, and variable inspection are impossible today; the debugger is greenfield.
+## Gap 4 — Debugger (DAP-in-editor required; no lldb CLI)
+**Problem.** **No debug info is emitted at all** (no DWARF / DIBuilder in codegen). **[verified]** The
+requirement (per user): a web developer debugs **in the editor** — breakpoints, step, variables via **F5 in
+VS Code** — and NEVER touches `lldb` on the command line.
 
-**Options.**
-- **A — DWARF via LLVM DIBuilder + external debugger (lldb/gdb).** Emit line tables first (breakpoints +
-  step = ~80% of the value), then `DISubprogram`/`DILocalVariable`/`DIType` for variable inspection. Reuses
-  the entire mature debugger ecosystem; the standard path for an LLVM language. Complications: attach a
-  `DILocation` to every instruction, map Nova types → DWARF, and ARC/coroutine frames make locals tricky.
-- **B — DAP (Debug Adapter Protocol) server for editors.** DAP is the *transport* for editor integration;
-  it still needs debug info underneath. So A is a prerequisite for a good B, not an alternative.
+**These are two layers, both required — not alternatives:**
+- **DWARF** = the debug info emitted into the binary (line tables → variables → types). Nova must emit it.
+- **DAP** (Debug Adapter Protocol) = what the editor speaks to a debug adapter. The adapter drives an actual
+  debug engine over the DWARF.
 
-**Recommendation: A, staged — line tables first, locals/types second.** The design decision is committing
-to DWARF-via-DIBuilder. **Needs a spike** to confirm the LLVM-zig bindings expose DIBuilder before scoping.
-This is a multi-week effort and is almost certainly **post-beta**.
+**Architecture — DWARF (DIBuilder) + `lldb-dap`.** `lldb-dap` (shipped by LLVM; formerly `lldb-vscode`)
+already implements DAP and drives lldb underneath. So: Nova emits DWARF; the VS Code **extension** (already
+in the repo) provides a launch config that starts `lldb-dap` against the built `nova` binary; the developer
+presses F5 and debugs in-editor. This reuses LLVM's mature debug engine AND its DAP frontend — Nova writes
+neither a debugger nor a DAP server.
+- Rejected alternative: a NATIVE Nova DAP server. Far more work, less robust, and STILL needs a debug engine
+  + DWARF underneath. Only worth it if lldb-dap ever proves inadequate for Nova's semantics.
 
-**Decision to lock:** (1) DWARF-via-DIBuilder, line-tables-first? (2) Is a debugger a beta requirement or
-post-beta? (I recommend post-beta.)
+**Nova types must display well (the part that is Nova-specific).** lldb won't render Nova strings (heap
+object, 8-byte header: refcount@-8, len@-4), `List`/`Map`, optionals, or ARC boxes without help. Two levers:
+accurate `DIType` in the DWARF, plus **lldb data formatters** (Python summaries, shipped with the toolchain)
+for the stdlib types. Without these, "inspect a variable" shows raw pointers.
 
-**Effort:** line tables = ~1-2 weeks incl. the binding spike. Full locals/types = several more.
+**Phases.**
+1. **Line-table DWARF → breakpoints + step + call stack in VS Code via lldb-dap.** The ~80%. Ship the VS
+   Code launch config + locate/bundle `lldb-dap` per platform.
+2. **Variable/type DWARF + lldb data formatters for stdlib types → useful inspection** (string/List/Map/
+   optional render properly).
+3. **Async/coroutine stepping** — Nova async is LLVM coroutines (split frames), so stepping across `await`
+   is inherently confusing; polish last.
+
+**Recommendation: DWARF + lldb-dap, phase 1 first.** **Spike first** to confirm (a) the LLVM-zig bindings
+expose DIBuilder, and (b) `lldb-dap` is available/bundleable on mac/Linux/Windows. Almost certainly
+**post-beta**, but phase 1 is high-value and self-contained.
+
+**Decision to lock:** (1) DWARF + lldb-dap (vs a native DAP server)? (2) bundle `lldb-dap` in the toolchain
+or require the user's LLVM/VS Code lldb? (3) debugger = post-beta?
+
+**Effort:** phase 1 (line tables + VS Code launch + lldb-dap wiring) = ~1-2 weeks incl. the two spikes.
+Phase 2 (types + formatters) = several more. Phase 3 (async) = open-ended.
 
 ---
 
