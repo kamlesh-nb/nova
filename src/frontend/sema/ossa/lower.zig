@@ -146,8 +146,9 @@ fn lowerSeq(ctx: *Ctx, block: ir.Block, stmts: []const ast.Statement, live: *std
                     .fallthrough => |join| cur = join,
                 }
             },
+            .while_stmt => |w| cur = try lowerWhile(ctx, cur, &w, live),
             .defer_stmt => return error.Defer,
-            else => return error.Defer, // while/for/switch/nested-block: not modelled yet
+            else => return error.Defer, // for/switch/nested-block: not modelled yet
         }
     }
     return .{ .fallthrough = cur };
@@ -206,6 +207,35 @@ fn lowerIf(ctx: *Ctx, entry_block: ir.Block, iff: *const ast.IfStmt, live: *std.
     }
 
     return if (any_fallthrough) .{ .fallthrough = join_block } else .terminated;
+}
+
+/// Lower a `while (cond) body` loop. Returns the exit block to continue in. The body may only BORROW
+/// owned locals declared outside the loop; if it declares an owned local of its own (which would need
+/// per-iteration scoping) the whole function defers. Blocks: entry -> header; header -cond-> body/exit;
+/// body -> header (back-edge). The exit block is allocated LAST so forward edges stay index-increasing;
+/// the single back-edge (body -> header) is the only decreasing edge, which the verifier handles by
+/// requiring the body-exit live set to equal the header entry set (no per-iteration ownership drift).
+fn lowerWhile(ctx: *Ctx, entry_block: ir.Block, w: *const ast.WhileStmt, live: *std.ArrayListUnmanaged(bool)) LowerError!ir.Block {
+    const body_stmts = branchStmts(w.body) orelse return error.Defer;
+
+    const header = try ctx.f.newBlock(ctx.gpa);
+    ctx.f.setTerm(entry_block, .{ .br = header });
+    const cond = try ctx.f.makeTrivial(ctx.gpa, header, null);
+    const body_block = try ctx.f.newBlock(ctx.gpa);
+
+    const nlocals_before = ctx.names.items.len;
+    var body_live = try cloneLive(ctx.gpa, live);
+    defer body_live.deinit(ctx.gpa);
+    const body_flow = try lowerSeq(ctx, body_block, body_stmts, &body_live);
+    if (ctx.names.items.len != nlocals_before) return error.Defer; // body declared an owned local
+
+    const exit_block = try ctx.f.newBlock(ctx.gpa); // highest index
+    ctx.f.setTerm(header, .{ .cond_br = .{ .cond = cond, .then_blk = body_block, .else_blk = exit_block } });
+    switch (body_flow) {
+        .fallthrough => |b| ctx.f.setTerm(b, .{ .br = header }), // back-edge
+        .terminated => {}, // body returns on every path: no back-edge
+    }
+    return exit_block; // outer locals are unchanged across the loop; continue with `live`
 }
 
 /// Destroy every still-live owned local in `block`, except `keep` (the returned one). Marks them dead

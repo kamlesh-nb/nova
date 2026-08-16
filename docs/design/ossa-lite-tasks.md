@@ -106,9 +106,17 @@ soundness property, and NEITHER existing analysis proves it.
       imbalanced; ~18 varied cases scanned (incl closure/serde/json/error/trait) = 0 false positives —
       end-to-end confirmation the E2-derived borrow model is correct. The +4% is modest because most
       remaining defers are LOOPS.
-      NEXT slice-4: loops (while/for). Requires lifting the I3 verifier's loop-deferral (a fixpoint over
-      back-edges: the loop-header entry set must equal both the pre-loop and back-edge exit sets). This is
-      where the bulk of remaining coverage is.
+      SLICE 4 DONE — while loops. Two coordinated changes: (1) VERIFIER lifted its loop-deferral — the
+      back-edge to an already-processed header must carry a live set EQUAL to the header entry set (a
+      forward edge sets/merges; a back edge, i.e. successor already fixed, compares). An inner value left
+      live on the back-edge, or an outer value consumed, is a path_imbalance. Two new verifier unit tests
+      (balanced loop clean; per-iteration inner leak flagged) prove it non-vacuous. (2) LOWERING builds the
+      while CFG (entry->header; header-cond->body/exit; body->header back-edge; exit allocated LAST so only
+      the back-edge decreases in index). Body may only BORROW outer locals; a body that declares its own
+      owned local defers (needs per-iteration scoping). MEASURED: coverage **47% -> 75%** (58 -> 91 fns),
+      still 0 imbalanced; scans over string/list/map/loop/while/serde/closure/trait = 0 false positives.
+      NEXT slice-5: for-loops (init/cond/incr/iterator) + per-iteration scoping so loop/branch bodies can
+      declare owned locals (the main remaining defer class). Also `switch`.
 - [ ] **I3** OSSA VERIFIER on the IR: every owned value consumed exactly once; no use-after-consume; no
       double-consume. IR-level restatement of Track V; this is the REAL, non-vacuous soundness verifier.
 - [ ] **I4** Extend lowering coverage function-by-function until it matches AST codegen's ARC decisions

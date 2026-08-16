@@ -48,20 +48,6 @@ pub fn verify(gpa: std.mem.Allocator, func: *const ir.Func) !Result {
     const nvals = func.values.items.len;
     if (nblocks == 0) return .{ .diagnostics = try diags.toOwnedSlice(gpa), .complete = true };
 
-    // Predecessor count + a simple back-edge (loop) detector: a successor with index <= current.
-    var has_loop = false;
-    for (func.blocks.items, 0..) |*b, i| {
-        if (b.term) |t| forEachSucc(t, struct {
-            fn f(idx: usize, cur: usize, loop: *bool) void {
-                if (idx <= cur) loop.* = true;
-            }
-        }.f, i, &has_loop);
-    }
-    if (has_loop) {
-        try diags.append(gpa, .{ .kind = .deferred_loop, .value = .none });
-        return .{ .diagnostics = try diags.toOwnedSlice(gpa), .complete = false };
-    }
-
     // entry[b]: the live-owned set on entry to block b (null until first predecessor sets it).
     const entry = try gpa.alloc(?Set, nblocks);
     defer {
@@ -70,7 +56,10 @@ pub fn verify(gpa: std.mem.Allocator, func: *const ir.Func) !Result {
     }
     for (entry) |*e| e.* = null;
 
-    // Acyclic ⇒ index order is a valid topological order for our constructed IR (entry = block 0).
+    // Blocks are emitted so that every FORWARD edge is index-increasing; the only index-decreasing edges
+    // are loop BACK-edges (body -> header). So index order is a valid processing order: when we reach a
+    // block, its entry set is already fixed by its forward (pre-loop) predecessor, and a back-edge is
+    // handled by COMPARING (the loop must not change the live set) rather than propagating.
     entry[0] = try Set.initEmpty(gpa, nvals);
 
     var b: usize = 0;
@@ -105,10 +94,10 @@ pub fn verify(gpa: std.mem.Allocator, func: *const ir.Func) !Result {
                 var it = live.iterator(.{});
                 while (it.next()) |vi| try diags.append(gpa, .{ .kind = .leak, .value = @enumFromInt(@as(u32, @intCast(vi))) });
             },
-            .br => |succ| try propagate(gpa, &diags, entry, @intFromEnum(succ), &live),
+            .br => |succ| try edge(gpa, &diags, entry, @intFromEnum(succ), &live),
             .cond_br => |cb| {
-                try propagate(gpa, &diags, entry, @intFromEnum(cb.then_blk), &live);
-                try propagate(gpa, &diags, entry, @intFromEnum(cb.else_blk), &live);
+                try edge(gpa, &diags, entry, @intFromEnum(cb.then_blk), &live);
+                try edge(gpa, &diags, entry, @intFromEnum(cb.else_blk), &live);
             },
             .unreach => {},
         };
@@ -133,11 +122,16 @@ fn checkUse(gpa: std.mem.Allocator, diags: *std.ArrayListUnmanaged(Diagnostic), 
     }
 }
 
-/// Merge this block's exit live-set into a successor's entry set. On a join, the sets must be EQUAL;
-/// a mismatch means one predecessor consumed a value another did not = a path imbalance.
-fn propagate(gpa: std.mem.Allocator, diags: *std.ArrayListUnmanaged(Diagnostic), entry: []?Set, succ: usize, live: *const Set) !void {
+/// Handle a CFG edge cur -> succ carrying `live`.
+///   FORWARD edge (succ not yet fixed): set/merge the successor's entry set. If it was already set by
+///     another forward predecessor (a join), the two exit sets must be EQUAL — a mismatch means one path
+///     consumed a value another did not (a path imbalance).
+///   BACK edge (succ already fixed, i.e. a loop header we already processed): the live set arriving on
+///     the back-edge must EQUAL the header's entry set, or the loop body changed net ownership per
+///     iteration (an inner value left live = leak, or an outer value consumed = use-after-consume next
+///     iteration). Either way, a path imbalance.
+fn edge(gpa: std.mem.Allocator, diags: *std.ArrayListUnmanaged(Diagnostic), entry: []?Set, succ: usize, live: *const Set) !void {
     if (entry[succ]) |*existing| {
-        // report each value that differs between the two predecessor exit sets.
         var vi: usize = 0;
         while (vi < existing.bit_length) : (vi += 1) {
             if (existing.isSet(vi) != live.isSet(vi)) {
@@ -146,17 +140,6 @@ fn propagate(gpa: std.mem.Allocator, diags: *std.ArrayListUnmanaged(Diagnostic),
         }
     } else {
         entry[succ] = try live.clone(gpa);
-    }
-}
-
-fn forEachSucc(t: ir.Terminator, comptime f: anytype, cur: usize, ctx: anytype) void {
-    switch (t) {
-        .br => |s| f(@intFromEnum(s), cur, ctx),
-        .cond_br => |cb| {
-            f(@intFromEnum(cb.then_blk), cur, ctx);
-            f(@intFromEnum(cb.else_blk), cur, ctx);
-        },
-        else => {},
     }
 }
 
@@ -276,4 +259,54 @@ test "balanced across both branches verifies clean" {
     var r = try verify(gpa, &f);
     defer r.deinit(gpa);
     try testing.expect(r.ok());
+}
+
+test "balanced loop (owned local borrowed across the loop) verifies clean" {
+    const gpa = testing.allocator;
+    var f = ir.Func{ .name = "loop_ok" };
+    defer f.deinit(gpa);
+    const e = try f.newBlock(gpa); // 0: pre-loop
+    const header = try f.newBlock(gpa); // 1
+    const body = try f.newBlock(gpa); // 2
+    const exit = try f.newBlock(gpa); // 3
+
+    const x = try f.makeOwned(gpa, e, null);
+    f.setTerm(e, .{ .br = header });
+    const c = try f.makeTrivial(gpa, header, null);
+    f.setTerm(header, .{ .cond_br = .{ .cond = c, .then_blk = body, .else_blk = exit } });
+    try f.borrowUse(gpa, body, x); // read x each iteration (borrow, no consume)
+    f.setTerm(body, .{ .br = header }); // back-edge
+    try f.destroy(gpa, exit, x); // drop after the loop
+    f.setTerm(exit, .ret_void);
+
+    var r = try verify(gpa, &f);
+    defer r.deinit(gpa);
+    try testing.expect(r.complete);
+    try testing.expect(r.ok());
+}
+
+test "loop that leaks an inner owned value each iteration is flagged" {
+    const gpa = testing.allocator;
+    var f = ir.Func{ .name = "loop_leak" };
+    defer f.deinit(gpa);
+    const e = try f.newBlock(gpa); // 0
+    const header = try f.newBlock(gpa); // 1
+    const body = try f.newBlock(gpa); // 2
+    const exit = try f.newBlock(gpa); // 3
+
+    f.setTerm(e, .{ .br = header });
+    const c = try f.makeTrivial(gpa, header, null);
+    f.setTerm(header, .{ .cond_br = .{ .cond = c, .then_blk = body, .else_blk = exit } });
+    _ = try f.makeOwned(gpa, body, null); // an owned value born each iteration, never destroyed
+    f.setTerm(body, .{ .br = header }); // back-edge: live set now has the extra value -> mismatch
+    f.setTerm(exit, .ret_void);
+
+    var r = try verify(gpa, &f);
+    defer r.deinit(gpa);
+    try testing.expect(r.complete);
+    var saw = false;
+    for (r.diagnostics) |d| if (d.kind == .path_imbalance) {
+        saw = true;
+    };
+    try testing.expect(saw);
 }
