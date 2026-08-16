@@ -89,8 +89,15 @@ soundness property, and NEITHER existing analysis proves it.
       actual functions. lower.zig unit test passes; corpus green; no regressions. This solved the V4'
       blocker: ownership comes from sema's TypedIr (ownedOf/isOwnedSafe = codegen's ARC info), recorded as
       IR events, NOT reverse-engineered from LLVM shapes.
-      NEXT slice-2: model owned values flowing into calls (borrow vs consume — needs callee ownership) and
-      simple if/else (the verifier already handles branches + joins), lifting coverage past 30%.
+      SLICE 2 DONE — if/else control flow. Rewrote the lowering into a recursive CFG builder (Ctx +
+      Flow{terminated,fallthrough}, per-path live set cloned into each branch, `Defer` error bubbles up on
+      anything unmodelled). Join block allocated LAST so every edge is index-increasing (keeps the
+      verifier's topological order valid, no false loop-detection). Branch-declared owned locals + bare
+      (non-block) branches + while/for/switch still defer. MEASURED: coverage **30% -> 43%** (37->53 fns),
+      still ALL BALANCED, 0 imbalanced; scanned 12 varied cases (struct/enum/closure/trait/option/generic/…)
+      = 0 false positives. Unit tests pass.
+      NEXT slice-3: owned values flowing into CALLS (borrow vs consume — seed from escape.zig's param-escape
+      summaries) + while/for (needs the verifier's loop path lifted from deferral), lifting coverage further.
 - [ ] **I3** OSSA VERIFIER on the IR: every owned value consumed exactly once; no use-after-consume; no
       double-consume. IR-level restatement of Track V; this is the REAL, non-vacuous soundness verifier.
 - [ ] **I4** Extend lowering coverage function-by-function until it matches AST codegen's ARC decisions
