@@ -154,15 +154,40 @@ proxyd state]**
    handed off, and — the payoff — a **zero-downtime deploy** where in-flight connections survive a replica
    swap. This is the acceptance the whole handoff design exists for.
 
-**Recommendation:** treat this as an integration + test task on an existing primitive, not new design. The
-one design question, if wiring is still needed: does `proxyd` hand off EVERY connection (fire-and-forget) or
-only during drain/deploy? (fire-and-forget takes the proxy out of the steady-state data path = faster, but
-changes proxyd's role.)
+**Platform-conditional forwarding (locked by user).** `proxyd` forwards client connections to app replicas
+using the best NATIVE mechanism per OS, hidden behind one `proxyd` forwarding interface (the same way the
+reactor abstracts kqueue/epoll/io_uring/IOCP):
+- **macOS + Windows → socket handoff, by default.** The accepted client socket is passed to the app
+  (SCM_RIGHTS over AF_UNIX on macOS; `WSADuplicateSocket`/handle duplication on Windows). The app then owns
+  the connection and writes to the client directly — the proxy leaves the data path. (These platforms have
+  no veth.)
+- **Linux → veth.** Each replica sits behind a veth pair (network-namespace isolation); `proxyd` forwards
+  in-kernel over the veth. Native to Linux, gives per-replica isolation, and near-zero-copy forwarding.
 
-**Decision to lock:** (1) handoff-always vs handoff-on-drain-only? (2) is the zero-downtime-deploy handoff
-test a beta requirement?
+**Honest implications to confirm — these two mechanisms are NOT the same shape:**
+1. **Proxy in vs out of the data path.** fd-handoff takes the proxy OUT of the steady-state path (app talks
+   to the client). veth keeps the proxy/kernel routing IN the path (it forwards). So steady-state semantics
+   differ by platform. Acceptable, but it means benchmarks and behaviour will differ mac/Windows vs Linux.
+2. **Common app-facing contract.** With handoff the app receives a raw socket fd; with veth the app just
+   listens on its own interface. The `proxyd` forwarding interface must hide this so app/handler code is
+   identical on all three — define that seam.
+3. **Privilege.** Creating netns + veth pairs needs `CAP_NET_ADMIN`/root on Linux; fd-handoff needs no
+   elevated privilege. So the Linux path has a privilege requirement the others do not — decide how `orchd`
+   obtains it (run privileged, setcap, or a small helper).
+4. **fd-handoff also works on Linux** (it is the classic SCM_RIGHTS platform). veth is chosen on Linux for
+   ISOLATION + in-kernel forwarding, not necessity — worth confirming that isolation is the goal (else the
+   simpler common fd-handoff path would cover all three POSIX platforms).
 
-**Effort:** test-only (if already wired) = days. Wire + test = ~1 week.
+**Open design question (independent of platform):** does `proxyd` forward EVERY connection, or only during
+drain/deploy? Fire-and-forget (every connection) is faster on the handoff platforms (proxy out of the path)
+but changes proxyd's steady-state role.
+
+**Decision to lock:** (1) confirm veth-for-isolation is the Linux goal (vs just using fd-handoff there too);
+(2) how `orchd` gets `CAP_NET_ADMIN` on Linux; (3) forward-always vs forward-on-drain; (4) is the
+zero-downtime-deploy handoff test a beta requirement?
+
+**Effort:** fd-handoff platforms, test-only if wired = days. The Linux veth path (netns + veth + routing +
+privilege) is the larger piece — ~1-2 weeks and needs a Linux host to verify.
 
 ---
 
