@@ -154,40 +154,42 @@ proxyd state]**
    handed off, and — the payoff — a **zero-downtime deploy** where in-flight connections survive a replica
    swap. This is the acceptance the whole handoff design exists for.
 
-**Platform-conditional forwarding (locked by user).** `proxyd` forwards client connections to app replicas
-using the best NATIVE mechanism per OS, hidden behind one `proxyd` forwarding interface (the same way the
-reactor abstracts kqueue/epoll/io_uring/IOCP):
-- **macOS + Windows → socket handoff, by default.** The accepted client socket is passed to the app
-  (SCM_RIGHTS over AF_UNIX on macOS; `WSADuplicateSocket`/handle duplication on Windows). The app then owns
-  the connection and writes to the client directly — the proxy leaves the data path. (These platforms have
-  no veth.)
-- **Linux → veth.** Each replica sits behind a veth pair (network-namespace isolation); `proxyd` forwards
-  in-kernel over the veth. Native to Linux, gives per-replica isolation, and near-zero-copy forwarding.
+**LOCKED design — fd-handoff is the data path on ALL platforms; veth is the Linux ISOLATION fence, not the
+data path.** The key systems fact: netns isolation and fd-handoff are ORTHOGONAL, so we use both on Linux.
+- A socket's network namespace is fixed at CREATION and does NOT change when the fd is passed; SCM_RIGHTS
+  travels over an AF_UNIX channel that lives in the mount (not network) namespace. So `proxyd` (host netns,
+  public IP) `accept()`s the client, hands the socket fd to the app in its OWN isolated netns, and the app
+  does I/O on it directly — the kernel routes that through the socket's original (host) netns stack. The
+  app is unreachable directly (pod-style isolation) AND the proxy is out of the data path (best perf).
+- **Data path (all three platforms): fd-handoff.** macOS/Linux = SCM_RIGHTS over AF_UNIX; Windows =
+  `WSADuplicateSocket`/handle duplication. Proxy leaves the steady-state path everywhere.
+- **Isolation (Linux): netns + veth** = the fence (the "k8s pod": app not directly reachable). veth is NOT
+  in the client data path — it carries the app's OTHER traffic (egress to the DB, health/metrics). macOS/
+  Windows have no netns; they get handoff without the pod fence (or Job Objects / sandbox if wanted later).
 
-**Honest implications to confirm — these two mechanisms are NOT the same shape:**
-1. **Proxy in vs out of the data path.** fd-handoff takes the proxy OUT of the steady-state path (app talks
-   to the client). veth keeps the proxy/kernel routing IN the path (it forwards). So steady-state semantics
-   differ by platform. Acceptable, but it means benchmarks and behaviour will differ mac/Windows vs Linux.
-2. **Common app-facing contract.** With handoff the app receives a raw socket fd; with veth the app just
-   listens on its own interface. The `proxyd` forwarding interface must hide this so app/handler code is
-   identical on all three — define that seam.
-3. **Privilege.** Creating netns + veth pairs needs `CAP_NET_ADMIN`/root on Linux; fd-handoff needs no
-   elevated privilege. So the Linux path has a privilege requirement the others do not — decide how `orchd`
-   obtains it (run privileged, setcap, or a small helper).
-4. **fd-handoff also works on Linux** (it is the classic SCM_RIGHTS platform). veth is chosen on Linux for
-   ISOLATION + in-kernel forwarding, not necessity — worth confirming that isolation is the goal (else the
-   simpler common fd-handoff path would cover all three POSIX platforms).
+**Mechanism (Nova already has the primitives).** To hand fds across BOTH a netns and a mount namespace,
+don't depend on a shared AF_UNIX path: `orchd` creates a socketpair (`os.socket.unixPair`), spawns the
+replica with one end as an inherited fd, THEN the replica enters its netns/pod. `proxyd` sends each client
+fd over that pre-established socketpair (`sendFd`/`recvFd`, already built). No shared filesystem; clean
+privilege boundary.
 
-**Open design question (independent of platform):** does `proxyd` forward EVERY connection, or only during
-drain/deploy? Fire-and-forget (every connection) is faster on the handoff platforms (proxy out of the path)
-but changes proxyd's steady-state role.
+**Common app-facing seam.** On every platform the app receives a client socket fd from its handoff channel
+and serves it — identical handler code; the platform difference (SCM_RIGHTS vs WSADuplicateSocket) and the
+Linux isolation fence are hidden in `orchd`/`proxyd`.
 
-**Decision to lock:** (1) confirm veth-for-isolation is the Linux goal (vs just using fd-handoff there too);
-(2) how `orchd` gets `CAP_NET_ADMIN` on Linux; (3) forward-always vs forward-on-drain; (4) is the
-zero-downtime-deploy handoff test a beta requirement?
+**Privilege.** Creating netns + veth needs `CAP_NET_ADMIN`/root on Linux; the fd-handoff itself needs no
+elevated privilege. So only the Linux ISOLATION setup is privileged — decide how `orchd` gets it (run
+privileged, `setcap`, or a small privileged helper that sets up the pod then drops).
 
-**Effort:** fd-handoff platforms, test-only if wired = days. The Linux veth path (netns + veth + routing +
-privilege) is the larger piece — ~1-2 weeks and needs a Linux host to verify.
+**Open design question (independent of platform):** does `proxyd` hand off EVERY connection (fire-and-forget,
+proxy fully out of the steady path) or only pool/route normally and hand off during drain/deploy?
+
+**Decision to lock:** (1) fire-and-forget every connection vs handoff-on-drain; (2) how `orchd` obtains
+`CAP_NET_ADMIN` for the Linux pod setup; (3) is the zero-downtime-deploy handoff test a beta requirement?
+
+**Effort:** the handoff data path (all platforms) = integration + test on the existing primitive, ~days.
+The Linux isolation fence (netns + veth + privilege + spawn-with-inherited-fd) is the larger, separable
+piece — ~1-2 weeks, needs a Linux host to verify. Ship handoff first; add the Linux fence second.
 
 ---
 
