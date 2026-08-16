@@ -1426,6 +1426,136 @@ pub fn elideBorrowedArc(self: *LlvmCompiler, module: types.LLVMModuleRef) void {
     }
 }
 
+// ── OSSA-lite Track V (V4'): static ARC release-balance verifier ──────────────
+// Set by builder/tester from NOVA_OWN_VERIFY. `hard` (=hard) fails the build on imbalance.
+pub var balance_verify: bool = false;
+pub var balance_hard: bool = false;
+
+const BalanceReport = struct {
+    fns: usize = 0,
+    checkable_slots: usize = 0, // slots we could PROVE non-escaping + owned-via-retain
+    imbalanced: usize = 0, // checkable slots where acquires != releases
+    skipped: usize = 0, // slots skipped (escaping / uncertain store / non-ARC load use)
+    first: []const u8 = "",
+};
+
+// Run on the RAW codegen module (before LLVM -O), where every nova_retain/nova_release is intact.
+// SOUND because it only judges slots it can PROVE are (a) non-escaping and (b) owned-via-retain:
+// for such a slot the value's entire lifetime is visible in this function, so acquires (owned stores +
+// retains) MUST equal releases, or codegen leaked / double-freed. Any uncertainty -> skip (no false
+// positive). Narrow coverage by design; this is slice 1. See docs/design/ossa-lite-tasks.md.
+pub fn verifyArcBalance(self: *LlvmCompiler, module: types.LLVMModuleRef) void {
+    if (!balance_verify) return;
+    var rep = BalanceReport{};
+    var fnv = core.LLVMGetFirstFunction(module);
+    while (fnv != null) : (fnv = core.LLVMGetNextFunction(fnv)) {
+        if (core.LLVMIsDeclaration(fnv) != 0) continue;
+        rep.fns += 1;
+        verifyArcBalanceInFn(self, fnv, &rep);
+    }
+    std.debug.print(
+        "=== ARC release-balance verifier (NOVA_OWN_VERIFY, V4' slice 1) ===\n" ++
+        "  functions (defined)     : {d}\n" ++
+        "  checkable owned slots   : {d}   (proved non-escaping + owned-via-retain)\n" ++
+        "  skipped (conservative)  : {d}\n" ++
+        "  BALANCE IMBALANCES      : {d}\n",
+        .{ rep.fns, rep.checkable_slots, rep.skipped, rep.imbalanced },
+    );
+    if (rep.imbalanced > 0) std.debug.print("    first imbalanced fn: {s}\n", .{rep.first});
+    std.debug.print("=== end ARC release-balance verifier ===\n", .{});
+    if (balance_hard and rep.imbalanced > 0) {
+        std.debug.print(
+            "\x1b[1m\x1b[31mARC BALANCE VERIFIER FAILED:\x1b[0m {d} non-escaping owned slot(s) with acquires != releases (leak or double-free in codegen).\n",
+            .{rep.imbalanced},
+        );
+        std.process.exit(1);
+    }
+}
+
+// The value stored into `slot` stays LOCAL iff its ONLY uses are: the nova_retain that gave it its
+// owned +1, the store into `slot`, and harmless compares. Any other use (ret, store into another
+// location, call argument, etc.) means the same +1 also leaves through that path, so the slot's
+// balance is not locally determined and the slot must be skipped.
+fn storedValueStaysLocal(sv: types.LLVMValueRef, slot: types.LLVMValueRef) bool {
+    var use = core.LLVMGetFirstUse(sv);
+    while (use != null) : (use = core.LLVMGetNextUse(use)) {
+        const user = core.LLVMGetUser(use);
+        if (isNamedCall(user, "nova_retain")) continue;
+        if (core.LLVMGetInstructionOpcode(user) == .LLVMICmp) continue;
+        if (core.LLVMGetInstructionOpcode(user) == .LLVMStore and core.LLVMGetOperand(user, 0) == sv and core.LLVMGetOperand(user, 1) == slot) continue;
+        return false; // any other use aliases/escapes the value
+    }
+    return true;
+}
+
+fn verifyArcBalanceInFn(self: *LlvmCompiler, fnv: types.LLVMValueRef, rep: *BalanceReport) void {
+    _ = self;
+    var bb = core.LLVMGetFirstBasicBlock(fnv);
+    while (bb != null) : (bb = core.LLVMGetNextBasicBlock(bb)) {
+        var inst = core.LLVMGetFirstInstruction(bb);
+        while (inst != null) : (inst = core.LLVMGetNextInstruction(inst)) {
+            if (core.LLVMIsAAllocaInst(inst) == null) continue;
+            const slot = inst;
+            var acquires: usize = 0;
+            var releases: usize = 0;
+            var checkable = true;
+
+            var use = core.LLVMGetFirstUse(slot);
+            scan: while (use != null) : (use = core.LLVMGetNextUse(use)) {
+                const user = core.LLVMGetUser(use);
+                const opc = core.LLVMGetInstructionOpcode(user);
+                if (opc == .LLVMStore and core.LLVMGetOperand(user, 1) == slot) {
+                    // store INTO the slot
+                    const sv = core.LLVMGetOperand(user, 0);
+                    if (core.LLVMIsAConstantInt(sv) != null) continue :scan; // zero-init: no owned ref
+                    // Only count an owned store when the stored value is retained AND stays LOCAL:
+                    // if the same SSA value also escapes (returned / stored elsewhere / passed to a
+                    // call), its +1 is transferred out and its balance is NOT locally determined -> skip.
+                    if (valueIsRetained(sv) != null and storedValueStaysLocal(sv, slot)) {
+                        acquires += 1; // provably +1 owned value enters the slot and lives only here
+                        continue :scan;
+                    }
+                    checkable = false; // uncertain / escaping store -> skip the slot
+                    break :scan;
+                } else if (opc == .LLVMStore and core.LLVMGetOperand(user, 0) == slot) {
+                    checkable = false; // slot ADDRESS stored -> escapes
+                    break :scan;
+                } else if (opc == .LLVMLoad and core.LLVMGetOperand(user, 0) == slot) {
+                    // every consumer of the loaded value must be a known ARC op or a harmless compare
+                    var luse = core.LLVMGetFirstUse(user);
+                    while (luse != null) : (luse = core.LLVMGetNextUse(luse)) {
+                        const luser = core.LLVMGetUser(luse);
+                        if (isNamedCall(luser, "nova_release")) {
+                            releases += 1;
+                        } else if (isNamedCall(luser, "nova_retain")) {
+                            acquires += 1;
+                        } else if (core.LLVMGetInstructionOpcode(luser) == .LLVMICmp) {
+                            // null/identity compare: does not move the refcount
+                        } else {
+                            checkable = false; // loaded value used in an unknown way -> may escape
+                            break;
+                        }
+                    }
+                    if (!checkable) break :scan;
+                } else {
+                    checkable = false; // slot referenced in an unmodelled way -> skip
+                    break :scan;
+                }
+            }
+
+            if (!checkable or acquires == 0) {
+                if (acquires > 0 or !checkable) rep.skipped += 1;
+                continue;
+            }
+            rep.checkable_slots += 1;
+            if (acquires != releases) {
+                rep.imbalanced += 1;
+                if (rep.first.len == 0) rep.first = std.mem.span(core.LLVMGetValueName(fnv));
+            }
+        }
+    }
+}
+
 fn instUsesValue(inst: types.LLVMValueRef, v: types.LLVMValueRef) bool {
     const n = core.LLVMGetNumOperands(inst);
     var i: c_uint = 0;

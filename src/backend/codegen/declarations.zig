@@ -1295,6 +1295,10 @@ fn emitModule(
     // retain/release pairs before the IR is dumped / verified / emitted.
     compiler.elideBorrowedArc(module);
 
+    // OSSA-lite Track V (V4'): static ARC release-balance verifier on the raw module
+    // (before LLVM -O strips ARC calls). Opt-in via NOVA_OWN_VERIFY. See docs/design/ossa-lite-tasks.md.
+    compiler.verifyArcBalance(module);
+
     if (dump_ll_name) |nm| {
         const nm_z = try allocator.dupeZ(u8, nm);
         defer allocator.free(nm_z);

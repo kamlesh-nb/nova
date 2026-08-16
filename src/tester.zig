@@ -279,8 +279,11 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
     if (sema_escape.report_enabled) _ = sema_escape.analyze(allocator, &owned_sema.store, &owned_sema.ir, &program);
 
     // OSSA-lite Track V: opt-in ownership verifier. See docs/design/ossa-lite-tasks.md.
+    // Drives both the sema-level coverage report and the codegen ARC release-balance verifier (V4').
     if (init.environ_map.get("NOVA_OWN_VERIFY")) |v| {
         sema_ownership.runVerify(allocator, &owned_sema.store, &owned_sema.ir, &program, std.mem.eql(u8, v, "hard"));
+        codegen_arc.balance_verify = true;
+        codegen_arc.balance_hard = std.mem.eql(u8, v, "hard");
     }
 
     // (HIR/MIR/LIR LLVM-emit optimiser scrapped 2026-08-16; see docs/design/sil-arc-optimiser-direction.md.)

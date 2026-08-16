@@ -48,9 +48,25 @@ the retain/release codegen (`arc.zig`) actually inserts. That is a real, non-vac
 soundness property, and NEITHER existing analysis proves it.
 - [ ] **V3'** Define the ARC-balance property precisely against what `arc.zig` emits (retain on
       acquire/dup, release on scope-end/consume). Enumerate the acquire/consume sites per owned value.
-- [ ] **V4'** Build a per-path balance checker on the typed IR (not the syntactic move-walk): for each
-      owned SSA value, prove acquires == releases on every path; flag any imbalance (leak or double-release).
-      This is the OSSA-lite verifier and converges with Track I's I3.
+- [~] **V4'** IN PROGRESS — slice 1 built. `arc.zig:verifyArcBalance` runs on the RAW codegen module
+      (before LLVM -O), gated by NOVA_OWN_VERIFY (=hard fails). For each alloca slot it PROVES
+      non-escaping + owned, it checks acquires==releases. Findings, verified empirically:
+      - It FIRES (non-vacuous): the first cut reported 31/31 checkable slots imbalanced — the
+        `acquires != releases` branch is reachable, unlike the dead move-check. That was a real
+        false-positive (a retained value stored into a local slot ALSO escaped via `ret %sv`); fixed
+        with `storedValueStaysLocal` (the stored value's only uses must be retain/store/compare).
+      - After the fix: 0 false positives, 0 crashes on the corpus — BUT **checkable slots ≈ 0**. Slice 1
+        only recognises an owned value that enters a slot via `nova_retain` AND stays purely local. That
+        intersection is nearly empty in real code: a fresh `List.new()` local is born +1 by the ALLOCATOR,
+        not via nova_retain, so it is not counted; borrowed/dup values that stay local are rare.
+      - CONCLUSION (the real V3' prerequisite, now proven concrete): a balance verifier with useful
+        coverage MUST recognise every OWNED-PRODUCTION site — allocator births, constructor returns,
+        retained borrows — i.e. the ownership-production catalog. That catalog IS V3', and building it is
+        the genuine multi-session core (matches the Swift-scale honesty). Slice 1 is committed as SOUND,
+        ZERO-FALSE-POSITIVE, opt-in scaffolding whose coverage is ~0 until V3' lands. It never blocks a
+        clean build (0 checkable -> 0 imbalance).
+      - NEXT SLICE (V3'/V4' slice 2): recognise fresh owned allocations as +1 acquires (map the runtime
+        allocator call shape to an owned birth), which is where real coverage starts.
 - [ ] **V5'** expect_fail case = a program `arc.zig` would MIS-balance (e.g. a known string→TypeId shape),
       confirm the balance checker rejects it; clean corpus passes. THEN consider default-on.
 - Note: keep `NOVA_OWN_VERIFY` infra (V1/V2) — the structured-diagnostic + reporter plumbing is reused by

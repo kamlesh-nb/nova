@@ -186,9 +186,13 @@ fn compileProgram(
 
     // OSSA-lite Track V: opt-in ownership verifier. See docs/design/ossa-lite-tasks.md.
     //   NOVA_OWN_VERIFY=1        -> run, report (does not fail the build).
-    //   NOVA_OWN_VERIFY=hard     -> also fail the build on a use-after-move violation.
+    //   NOVA_OWN_VERIFY=hard     -> also fail the build on an imbalance.
+    // Drives BOTH the sema-level owned-local coverage report AND the real codegen-level
+    // ARC release-balance verifier (V4', set below and run inside declarations.zig).
     if (init.environ_map.get("NOVA_OWN_VERIFY")) |v| {
         sema_ownership.runVerify(allocator, &owned_sema.store, &owned_sema.ir, &program, std.mem.eql(u8, v, "hard"));
+        codegen_arc.balance_verify = true;
+        codegen_arc.balance_hard = std.mem.eql(u8, v, "hard");
     }
 
     // (HIR/MIR/LIR LLVM-emit optimiser scrapped 2026-08-16; see docs/design/sil-arc-optimiser-direction.md.)
