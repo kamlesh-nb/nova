@@ -1291,9 +1291,15 @@ fn emitModule(
     is_release: bool,
     dump_ll_name: ?[]const u8,
 ) !void {
+    // Gap3-A/E2 ARC-traffic census: raw retain/release traffic BEFORE elision.
+    compiler.arcCensusBefore(module);
+
     // Prototype ARC elision (NOVA_ARC_ELIDE): remove provably-redundant borrowed
     // retain/release pairs before the IR is dumped / verified / emitted.
     compiler.elideBorrowedArc(module);
+
+    // Gap3-A/E2 ARC-traffic census: surviving traffic AFTER elision (the borrow-skip target).
+    compiler.arcCensusAfter(module);
 
     // OSSA-lite Track V (V4'): static ARC release-balance verifier on the raw module
     // (before LLVM -O strips ARC calls). Opt-in via NOVA_OWN_VERIFY. See docs/design/ossa-lite-tasks.md.

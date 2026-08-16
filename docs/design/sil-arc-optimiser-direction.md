@@ -63,3 +63,32 @@ pass shows a measured perf delta over AST+LLVM O3. Motion on coverage is not pro
   (that is the string→TypeId SOUNDNESS gate + `renderLegacy`, NOT the optimiser — used across codegen).
 - The compiler is unchanged in observable behaviour: it already compiled everything via the AST path; the
   emit path was off by default and a no-op on the binary.
+
+## E2 gate MEASURED (2026-08-16) — peephole borrow-skip has ~0 headroom; the lever is ownership-forwarding
+
+Per the standing rule (measure before building), an ARC-traffic census was added (`arc.zig`, opt-in via
+`NOVA_ARC_CENSUS`; runs around the elision call in `declarations.zig`). It counts nova_retain/nova_release
+sites before/after elision, plus borrow-skip CANDIDATE pairs by two definitions (analysis-only, nothing
+removed). Measured across the full stdlib + test corpus (~1530 defined functions, ~1645 ARC calls):
+
+- current M-5 `elideBorrowedArc` removes **0** on these programs (0% of raw traffic);
+- borrow-skip candidates, **intra-block** (retain→borrow-only-uses→release in one block): **0**;
+- borrow-skip candidates, **function-scope / inter-block** (a retained SSA value whose every use is a
+  borrow — load / call-argument / compare — plus exactly one release): **0**;
+- unchanged with `NOVA_ARC_ELIDE_OFF=1`, so M-5 is not hiding candidates.
+
+**Reading:** Nova's ARC traffic is GENUINE OWNERSHIP, not redundant borrow pairs. A retain is a
+dup/acquire whose value is then STORED into an owned slot/field and released at scope end, with the value
+LIVE (owned, used via loads of the slot) in between — not a borrow-only region. So a cheap
+peephole/direct-SSA borrow-skip pass (the E2 candidate) would remove ~0 and move perf ~0.
+
+**Honest caveat:** the counters treat a store-into-local-slot as an escape, so they do NOT judge the
+slot-stored ownership pattern; deciding whether THAT is borrow-only needs slot-level borrow analysis =
+the OSSA borrow pass itself. So the precise verdict is: **the cheap peephole borrow-skip is ruled out
+(0 headroom); the only remaining lever is OWNERSHIP-FORWARDING** (convert an owned binding into a borrow
+where no callee consumes it), which requires the full typed-ownership IR + borrow analysis (Track I/V).
+
+**Gate outcome:** the peephole perf half stays SCRAPPED (0 measured headroom). The real perf lever
+converges with the SAME OSSA-lite ownership IR as the soundness verifier — i.e. Gap-3-perf and Gap-1-
+soundness are one investment, exactly the reframing. Do NOT build a borrow-skip peephole; if perf is
+pursued it must be ownership-forwarding on the OSSA IR, still gated on a measured runtime delta.

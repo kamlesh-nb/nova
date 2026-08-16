@@ -249,6 +249,7 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
     // (verified: corpus + ASAN clean, differential ARC audit identical off vs on). Set
     // NOVA_ARC_ELIDE_OFF to disable it for debugging a suspected elision regression.
     codegen_arc.elide_enabled = init.environ_map.get("NOVA_ARC_ELIDE_OFF") == null;
+    codegen_arc.arc_census = init.environ_map.get("NOVA_ARC_CENSUS") != null;
     pipeline.configureValueStructs(allocator, init.environ_map);
     sema_shadow.trace_resolution = sema_shadow.report_enabled;
     sema_shadow.f2_types_enabled = true;

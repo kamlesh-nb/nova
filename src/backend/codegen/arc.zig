@@ -1354,6 +1354,152 @@ pub fn releaseLocalVariables(self: *LlvmCompiler) anyerror!void {
 pub var elide_enabled: bool = false;
 pub var elide_count: usize = 0;
 
+// ── Gap3-A/E2: ARC-traffic census (NOVA_ARC_CENSUS) — the go/scrap headroom measure ──
+// Counts nova_retain/nova_release call sites in the module. Called twice: BEFORE elision
+// (raw traffic) and AFTER (surviving traffic). elide_count is how many the current pass removed.
+// The gap between "surviving" and what a full borrow-skip could reach is the perf headroom.
+pub var arc_census: bool = false;
+pub var census_retain_before: usize = 0;
+pub var census_release_before: usize = 0;
+
+fn countArcCalls(module: types.LLVMModuleRef, retains: *usize, releases: *usize) void {
+    var fnv = core.LLVMGetFirstFunction(module);
+    while (fnv != null) : (fnv = core.LLVMGetNextFunction(fnv)) {
+        if (core.LLVMIsDeclaration(fnv) != 0) continue;
+        var bb = core.LLVMGetFirstBasicBlock(fnv);
+        while (bb != null) : (bb = core.LLVMGetNextBasicBlock(bb)) {
+            var inst = core.LLVMGetFirstInstruction(bb);
+            while (inst != null) : (inst = core.LLVMGetNextInstruction(inst)) {
+                if (isNamedCall(inst, "nova_retain")) retains.* += 1;
+                if (isNamedCall(inst, "nova_release")) releases.* += 1;
+            }
+        }
+    }
+}
+
+pub fn arcCensusBefore(_: *LlvmCompiler, module: types.LLVMModuleRef) void {
+    if (!arc_census) return;
+    census_retain_before = 0;
+    census_release_before = 0;
+    countArcCalls(module, &census_retain_before, &census_release_before);
+}
+
+// Borrow-skip headroom: count retain/release pairs a borrow-skip pass COULD remove that the current
+// adjacent-only elision does NOT. A pair is a candidate when, scanning forward from nova_retain(v) in
+// the same block to the matching nova_release(v), every intervening use of v is a BORROW (a call
+// ARGUMENT, a load, or a compare) — i.e. v does not escape (is not stored to a sink, returned, or
+// re-retained) between the two. Analysis-only (nothing removed): this is the go/scrap number.
+fn countBorrowSkipCandidates(a: std.mem.Allocator, module: types.LLVMModuleRef) usize {
+    var candidates: usize = 0;
+    var fnv = core.LLVMGetFirstFunction(module);
+    while (fnv != null) : (fnv = core.LLVMGetNextFunction(fnv)) {
+        if (core.LLVMIsDeclaration(fnv) != 0) continue;
+        var bb = core.LLVMGetFirstBasicBlock(fnv);
+        while (bb != null) : (bb = core.LLVMGetNextBasicBlock(bb)) {
+            var insts = std.ArrayList(types.LLVMValueRef).empty;
+            defer insts.deinit(a);
+            var inst = core.LLVMGetFirstInstruction(bb);
+            while (inst != null) : (inst = core.LLVMGetNextInstruction(inst)) insts.append(a, inst) catch {};
+
+            for (insts.items, 0..) |ri, i| {
+                if (!isNamedCall(ri, "nova_retain")) continue;
+                const v = core.LLVMGetOperand(ri, 0);
+                var j = i + 1;
+                var escaped = false;
+                while (j < insts.items.len) : (j += 1) {
+                    const uj = insts.items[j];
+                    if (isNamedCall(uj, "nova_release") and core.LLVMGetOperand(uj, 0) == v) {
+                        if (!escaped) candidates += 1; // borrow-only region -> removable pair
+                        break;
+                    }
+                    if (!instUsesValue(uj, v)) continue;
+                    // uj references v: classify borrow vs escape
+                    const opc = core.LLVMGetInstructionOpcode(uj);
+                    if (opc == .LLVMLoad or opc == .LLVMICmp) continue; // borrow
+                    if (opc == .LLVMCall) {
+                        // v as a call ARGUMENT is a borrow; v as the callee, or a re-retain, escapes
+                        if (isNamedCall(uj, "nova_retain")) { escaped = true; break; }
+                        const n = core.LLVMGetNumOperands(uj);
+                        if (n >= 1 and core.LLVMGetOperand(uj, @intCast(n - 1)) == v) { escaped = true; break; }
+                        continue; // ordinary arg: borrow
+                    }
+                    escaped = true; // store / ret / anything else -> v may escape
+                    break;
+                }
+            }
+        }
+    }
+    return candidates;
+}
+
+// Function-scope borrow-skip headroom (catches inter-block too): a nova_retain(v) is redundant if,
+// across the WHOLE function, every use of v is a borrow (load / call-argument / compare) plus exactly
+// one nova_release(v) — v is never stored to a sink, returned, used as a callee, or re-retained. Such
+// a retain/release pair can be removed because the value is only borrowed for its whole live range.
+fn countBorrowSkipFnScope(module: types.LLVMModuleRef) usize {
+    var candidates: usize = 0;
+    var fnv = core.LLVMGetFirstFunction(module);
+    while (fnv != null) : (fnv = core.LLVMGetNextFunction(fnv)) {
+        if (core.LLVMIsDeclaration(fnv) != 0) continue;
+        var bb = core.LLVMGetFirstBasicBlock(fnv);
+        while (bb != null) : (bb = core.LLVMGetNextBasicBlock(bb)) {
+            var inst = core.LLVMGetFirstInstruction(bb);
+            while (inst != null) : (inst = core.LLVMGetNextInstruction(inst)) {
+                if (!isNamedCall(inst, "nova_retain")) continue;
+                const v = core.LLVMGetOperand(inst, 0);
+                var releases: usize = 0;
+                var escapes = false;
+                var use = core.LLVMGetFirstUse(v);
+                while (use != null) : (use = core.LLVMGetNextUse(use)) {
+                    const user = core.LLVMGetUser(use);
+                    if (user == inst) continue; // the retain itself
+                    if (isNamedCall(user, "nova_release")) { releases += 1; continue; }
+                    if (isNamedCall(user, "nova_retain")) { escapes = true; break; } // another +1
+                    const opc = core.LLVMGetInstructionOpcode(user);
+                    if (opc == .LLVMLoad or opc == .LLVMICmp) continue; // borrow
+                    if (opc == .LLVMCall) {
+                        const n = core.LLVMGetNumOperands(user);
+                        if (n >= 1 and core.LLVMGetOperand(user, @intCast(n - 1)) == v) { escapes = true; break; } // callee
+                        continue; // ordinary call argument: borrow
+                    }
+                    escapes = true; // store / ret / gep-into-sink / etc.
+                    break;
+                }
+                if (!escapes and releases == 1) candidates += 1;
+            }
+        }
+    }
+    return candidates;
+}
+
+pub fn arcCensusAfter(self: *LlvmCompiler, module: types.LLVMModuleRef) void {
+    if (!arc_census) return;
+    var r_after: usize = 0;
+    var rel_after: usize = 0;
+    countArcCalls(module, &r_after, &rel_after);
+    const borrow_skip = countBorrowSkipCandidates(self.allocator, module);
+    const borrow_skip_fn = countBorrowSkipFnScope(module);
+    const before = census_retain_before + census_release_before;
+    const after = r_after + rel_after;
+    const removed = before -| after;
+    const pct: usize = if (before == 0) 0 else (removed * 100) / before;
+    const bs_pct: usize = if (after == 0) 0 else (borrow_skip * 2 * 100) / after;
+    std.debug.print(
+        "=== ARC-traffic census (NOVA_ARC_CENSUS, Gap3-A/E2 headroom) ===\n" ++
+        "  nova_retain  : before={d}  after={d}\n" ++
+        "  nova_release : before={d}  after={d}\n" ++
+        "  total ARC calls : before={d}  after(surviving)={d}\n" ++
+        "  removed by current elision : {d} ({d}% of raw traffic)\n" ++
+        "  elide_count (pairs the pass reported removing) : {d}\n" ++
+        "  BORROW-SKIP CANDIDATE PAIRS (intra-block, borrow-only region) : {d}\n" ++
+        "    -> would remove ~{d} ARC calls = {d}% of surviving traffic (static, intra-block LOWER bound)\n" ++
+        "  BORROW-SKIP CANDIDATE PAIRS (function-scope, inter-block) : {d}\n" ++
+        "    -> would remove ~{d} ARC calls (retain whose value is borrow-only across the whole fn)\n" ++
+        "=== end ARC-traffic census ===\n",
+        .{ census_retain_before, r_after, census_release_before, rel_after, before, after, removed, pct, elide_count, borrow_skip, borrow_skip * 2, bs_pct, borrow_skip_fn, borrow_skip_fn * 2 },
+    );
+}
+
 // ---------------------------------------------------------------------------
 // M-1 value-type structs (memory-management-refinements.md) — per-type rollout gate.
 //
