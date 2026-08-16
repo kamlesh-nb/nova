@@ -46,6 +46,13 @@ inline bool audit_enabled() { return g_audit_enabled_v; }
 std::atomic<long long> g_audit_live{0};
 std::atomic<long long> g_audit_bytes{0};
 
+// Gap 5 perf: cumulative count of every nova object birth (each nova_bytes_alloc call), regardless of
+// whether it lands in the bump arena or falls back to malloc. This is the allocation CHURN — the number
+// the per-request perf work targets (each birth costs a header write + ARC retain/release traffic + cache
+// pressure even when the bump itself is cheap). Always counted (one relaxed atomic add); read via
+// nova_alloc_total(), and printed at process exit when NOVA_ALLOC_COUNT is set.
+std::atomic<long long> g_alloc_total{0};
+
 const bool g_dump_enabled_v = std::getenv("NOVA_ARC_DUMP") != nullptr;
 inline bool dump_enabled() { return g_dump_enabled_v; }
 
@@ -234,6 +241,7 @@ extern "C" {
 
 
 long long nova_bytes_alloc(long long size) {
+  g_alloc_total.fetch_add(1, std::memory_order_relaxed);
   if (size < 0)
     size = 0;
 #ifdef NOVA_DROP_ARENA
@@ -266,6 +274,22 @@ long long nova_bytes_alloc(long long size) {
   t_arena_current = curr + alloc_size;
   return (long long)(curr + NOVA_OBJ_HEADER_SIZE);
 }
+
+// Gap 5 perf measurement: read the cumulative object-birth count (callable from Nova via FFI to bracket a
+// hot region), and print it at process exit when NOVA_ALLOC_COUNT is set.
+extern "C" long long nova_alloc_total(void) {
+  return g_alloc_total.load(std::memory_order_relaxed);
+}
+namespace {
+struct AllocCountReporter {
+  ~AllocCountReporter() {
+    if (std::getenv("NOVA_ALLOC_COUNT") != nullptr)
+      std::fprintf(stderr, "\n[alloc] total nova object births: %lld\n",
+                   g_alloc_total.load(std::memory_order_relaxed));
+  }
+};
+AllocCountReporter g_alloc_count_reporter;
+} // namespace
 
 // Same allocation as nova_bytes_alloc, but returns a real pointer so codegen keeps pointer provenance
 // for fixed arrays (perf: lets LLVM disambiguate arrays and vectorize/hoist array loops). See
