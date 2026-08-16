@@ -5,8 +5,9 @@ sequence to beta. Every claim is tagged **[verified]** (checked against code thi
 (from a doc/note) / **[reverify]** (recall, must re-run before trusting).
 
 ## 1. Where Nova is (honest one-paragraph)
-Nova compiles Nova → LLVM IR → native, ARC-managed, with a C++/Boost.Asio async runtime (reactor backends
-kqueue/epoll/io_uring/IOCP all tested). This cycle closed the reframed "no ownership IR" gap: a real
+Nova compiles Nova → LLVM IR → native, ARC-managed, with a **self-hosted C++20 reactor runtime** — its own
+async event loop over kqueue/epoll/io_uring/IOCP (all tested). Boost.Asio is retired and wolfSSL deleted
+(build.zig: "no Boost, no wolfSSL; reactor runtime"); TLS and crypto are pure Nova. This cycle closed the reframed "no ownership IR" gap: a real
 compile-time ownership (ARC release-balance) verifier now covers **100% of functions**, 0 false positives,
 and is **gated** in CI; the in-house LLVM-emit optimiser was **scrapped** (measured ~0 realized perf) and
 the ARC-optimisation perf lever was **measured to have ~0 headroom** and closed. Self-contained static
