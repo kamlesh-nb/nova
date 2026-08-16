@@ -33,16 +33,30 @@ LLVM" and recommended bring-your-own. That was WRONG, from stale recall. Verifie
 2. **Un-hardcode the local static default.** `build.zig`'s `static_llvm_prefix` is a hardcoded dev-machine
    path; it only affects a `-Dstatic-llvm` build run locally off that box without `NOVA_LLVM_PREFIX`. CI
    overrides it, so this is cosmetic — make it a sensible per-OS default or require `NOVA_LLVM_PREFIX`.
-3. **`nls` in the bundles?** Verify whether the LSP server ships in the release archives; if not, add it.
+3. **Ship `nls` in the bundles (user request: "make nls same as language").** `nls` is a SEPARATE project
+   (`/nova-lang/nls`, own `build.zig`) currently SKIPPED in release.yml (`NOVA_ARCHIVE_SKIP_NLS=1`). Good
+   news: `nls` is a **pure-Zig binary with NO LLVM link** (the LSP uses only the frontend re-exports via
+   `-Dnova-src=…/lang/src/root.zig`; codegen/`llvm` is not reachable), ~5.8 MB, and "cross-compiles
+   unchanged". **[verified]** So "same as language" is straightforward and actually EASIER than the
+   compiler:
+   - Build `nls` for all 6 targets — and because it is pure Zig, it can be **cross-compiled from a single
+     runner** (no per-host LLVM), unlike the compiler.
+   - Pin it to the SAME lang source revision (`-Dnova-src`) so `nls` and `nova` never drift, and stamp the
+     SAME version (extend `check-version-sync.sh` to cover nls).
+   - Include the `nls` binary in each release archive (drop `NOVA_ARCHIVE_SKIP_NLS`, or a companion
+     `nls-<triple>` artifact) so an install carries the compiler + LSP together.
 4. **Contributor dev builds** use dynamic system LLVM (fast) — fine; only release needs static.
 
-**Recommendation:** delivery is DONE for the web-developer story. Treat 1-3 as small polish items, not a
-gap. Do #3 (verify/bundle `nls`) and #2 (un-hardcode) opportunistically; #1 only if single-file Windows
+**Recommendation:** delivery is DONE for the web-developer story. #3 (ship `nls`) is the one the user
+explicitly wants and is small — a cross-compiled pure-Zig binary bundled alongside `nova`, version-locked to
+the same lang source. Do #2 (un-hardcode) opportunistically; #1 (Windows single-file static) only if it
 matters.
 
-**Decision to lock:** agree delivery is solved (no mirror work); pick up #2/#3 as polish? Pursue #1 or not?
+**Decision to lock:** (1) agree delivery is solved (no mirror work). (2) ship `nls` in the SAME archive as
+`nova` vs a companion artifact? (3) version-lock `nls` to lang via `check-version-sync.sh`?
 
-**Effort:** #2/#3 = hours. #1 (Windows static) = days, finicky, optional.
+**Effort:** #3 (nls) = ~1 day (add an nls build+bundle leg, cross-compiled; extend version-sync). #2 = hours.
+#1 (Windows static) = days, optional.
 
 ---
 
@@ -119,23 +133,36 @@ request/persistent-sink escape). **[recall]**
 
 ---
 
-## Gap 6 — Windows IOCP readiness (cases 192/194/195)
-**Problem.** `armRead`/`armWrite` (readiness: "tell me when readable") have no proactor analog on IOCP. The
-design already exists in the notes: a **zero-byte receive** whose completion IS the readiness edge, with the
-draining half (`waitReady`/`ev*`) already implemented sharing the completion path; io_uring shares the arm
-records. **[recall — from CLAUDE.md]** So this is largely execution of a known design, not a design fork.
+## Gap 6 — CORRECTED: reactor backends done; the item is orchestrator fd-handoff
+**Correction (per user).** All four reactor backends are TESTED — kqueue (macOS), epoll + io_uring
+(Linux), IOCP (Windows). The earlier "Windows IOCP readiness (192/194/195)" framing is retired; that is
+not the open item. **[user-asserted]**
 
-**Options.**
-- **A — Implement the zero-byte-receive arming** for readiness on IOCP (+ shared io_uring records).
-- **B — Leave readiness-style APIs unsupported on Windows; document it** (readiness is emulated on a
-  proactor and rarely needed if apps use the completion API directly).
+**The actual remaining networking item: fd-handoff through the orchestrator.** The SCM_RIGHTS fd-passing
+primitive is built and the STANDALONE handoff demo works (`lang/docs/guide/examples/fd-handoff/` — a
+service binds a TCP front port + an AF_UNIX rendezvous and hands each accepted client SOCKET to a backend
+app; the app writes the response directly, proxy out of the data path). Runtime shims `nova_send_fd` /
+`nova_recv_fd` + `os.socket.sendFd`/`recvFd`/AF_UNIX helpers exist. **[verified: demo + primitive]** Per the
+fd-passing note, it was **not yet wired into `proxyd`** and not exercised end-to-end through `orchd`/`proxyd`
+— that (wire if needed + TEST the orchestrator handoff path) is the open work. **[recall — reverify current
+proxyd state]**
 
-**Recommendation: A** — it is well-scoped (design known, draining half done). But it is Windows-only polish;
-sequence it after the CI/toolchain (Gap 2) so it can actually be run-verified on a Windows host.
+**Scope.**
+1. Confirm current state: is fd-handoff already wired into `proxyd`, or only the standalone demo? (reverify)
+2. If not wired: wire `proxyd` to hand accepted client fds to app replicas over the AF_UNIX rendezvous.
+3. **Test the orchestrator handoff end-to-end**: `orchd` + `proxyd` + N app replicas, a client connection
+   handed off, and — the payoff — a **zero-downtime deploy** where in-flight connections survive a replica
+   swap. This is the acceptance the whole handoff design exists for.
 
-**Decision to lock:** commit to execute A, or accept B as a documented limitation for beta?
+**Recommendation:** treat this as an integration + test task on an existing primitive, not new design. The
+one design question, if wiring is still needed: does `proxyd` hand off EVERY connection (fire-and-forget) or
+only during drain/deploy? (fire-and-forget takes the proxy out of the steady-state data path = faster, but
+changes proxyd's role.)
 
-**Effort:** A = days (execution of a known design) + Windows-host verification.
+**Decision to lock:** (1) handoff-always vs handoff-on-drain-only? (2) is the zero-downtime-deploy handoff
+test a beta requirement?
+
+**Effort:** test-only (if already wired) = days. Wire + test = ~1 week.
 
 ---
 
@@ -179,5 +206,6 @@ Signing / allow-lists / a registry come later and only if the ecosystem grows.
 2. **Gap 2 (C: bring-your-own-LLVM now)** — unblocks the multi-host CI matrix.
 3. **Package manager** implementation (Gap 1, already designed) — after the resolver spike.
 4. **Gap 7 beta checklist** — adopt it; it drives everything else.
-5. **Gap 6 (Windows readiness)** and the **§B bug reverify** — narrow, do when the host/CI is ready.
+5. **Gap 6 (orchestrator fd-handoff: wire-if-needed + zero-downtime-deploy test)** and the **§B bug
+   reverify** — integration + test on an existing primitive.
 6. **Gap 5 (perf-B)** and **Gap 4 (debugger)** — bigger, post-beta unless a use-case forces them early.
