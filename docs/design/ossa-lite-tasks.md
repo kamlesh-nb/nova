@@ -136,9 +136,20 @@ soundness property, and NEITHER existing analysis proves it.
       (serde 252->254); modest because the remaining defers are now dominated by destructuring lets,
       bare-local reassignment, and defer-stmt — NOT control flow (all control-flow constructs now handled).
       Unit tests 113 pass; broad scan 0 false positives.
-      I4 is effectively MET for control flow. NEXT (optional): destructuring + reassignment modelling for
-      the last ~13%, OR pivot to ownership-forwarding (Track A perf) on this IR (still gated on a measured
-      runtime delta). The verifier is now a genuine compile-time memory-safety check over ~87% of functions.
+      SLICE 7 (86%->93%): destructuring skip (untracked, sound), defer skip (cleanup borrow), and the big
+      one — braceless branch/loop/case bodies (`if (c) return x;`): branchStmts yields a one-element view
+      instead of deferring. A deferred-reason breakdown was added to the report and CORRECTED the
+      assumption: the remaining defers were NOT reassignment (0) but braceless branches + break/continue.
+      SLICE 8 (93%->**100%**): break/continue. Ctx carries the innermost LoopCtx {header, exit, body_mark};
+      the loop exit block is allocated up front so break can target it; break drops the loop-body scope and
+      br's to exit, continue drops it and br's to header (back-edge). The verifier's set-on-first-arrival/
+      compare-thereafter edge logic handles the break/continue edges uniformly. MEASURED: **100% coverage
+      (0 deferred), 0 imbalanced** on 02_generics(121/121), 13_serde(289/289), 14_map(151/151); 12 varied
+      cases scanned = 0 false positives; a targeted break+continue-with-owned-loop-locals program verifies
+      balanced; unit tests 116 pass.
+      DONE: the OSSA-lite ownership verifier lowers + verifies **100% of functions** (all control flow incl
+      break/continue), 0 false positives, non-vacuous (8 verifier unit tests). This is a complete
+      compile-time memory-safety release-balance check. I2/I4 MET.
 - [ ] **I3** OSSA VERIFIER on the IR: every owned value consumed exactly once; no use-after-consume; no
       double-consume. IR-level restatement of Track V; this is the REAL, non-vacuous soundness verifier.
 - [ ] **I4** Extend lowering coverage function-by-function until it matches AST codegen's ARC decisions

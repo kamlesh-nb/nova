@@ -55,12 +55,17 @@ const Locals = std.ArrayListUnmanaged(Local);
 /// Why a function was deferred (for the NOVA_OSSA report's coverage-gap breakdown).
 pub const DeferReason = enum { reassign, break_continue, switch_guard, nonblock_branch, other };
 
+/// The innermost enclosing loop, for lowering `break`/`continue`. `body_mark` is the locals count at the
+/// loop body's entry, so break/continue know which locals to drop (everything declared in the body).
+const LoopCtx = struct { header: ir.Block, exit: ir.Block, body_mark: usize };
+
 const Ctx = struct {
     gpa: std.mem.Allocator,
     store: *const TypeStore,
     tir: *const TypedIr,
     f: *ir.Func,
     defer_reason: DeferReason = .other,
+    loop: ?LoopCtx = null,
 };
 
 /// Record why we are about to defer, then return the Defer error.
@@ -176,7 +181,18 @@ fn lowerSeq(ctx: *Ctx, block: ir.Block, stmts: []const ast.Statement, locals: *L
                 // defer would be the only concern, and that is as unmodelled as elsewhere -> defer then.
                 if (isLocalReassign(&s.defer_stmt.expr, locals.items)) return deferBecause(ctx, .reassign);
             },
-            .break_stmt, .continue_stmt => return deferBecause(ctx, .break_continue),
+            .break_stmt => {
+                const lp = ctx.loop orelse return deferBecause(ctx, .break_continue);
+                try dropScope(ctx, cur, locals, lp.body_mark); // exit the loop scope
+                ctx.f.setTerm(cur, .{ .br = lp.exit });
+                return .terminated;
+            },
+            .continue_stmt => {
+                const lp = ctx.loop orelse return deferBecause(ctx, .break_continue);
+                try dropScope(ctx, cur, locals, lp.body_mark); // end this iteration's scope
+                ctx.f.setTerm(cur, .{ .br = lp.header }); // back-edge
+                return .terminated;
+            },
         }
     }
     return .{ .fallthrough = cur };
@@ -258,15 +274,22 @@ fn lowerLoop(ctx: *Ctx, entry_block: ir.Block, body_stmts: []const ast.Statement
     ctx.f.setTerm(entry_block, .{ .br = header });
     const cond = try ctx.f.makeTrivial(ctx.gpa, header, null);
     const body_block = try ctx.f.newBlock(ctx.gpa);
+    // The exit block is allocated NOW (before the body) so `break` can target it. Its index sits between
+    // the body block and any nested blocks the body allocates; the verifier's edge logic (set on first
+    // arrival via the header's cond-false edge, compare thereafter) handles both the forward break edge
+    // and back edges uniformly, so the ordering is sound.
+    const exit_block = try ctx.f.newBlock(ctx.gpa);
+    ctx.f.setTerm(header, .{ .cond_br = .{ .cond = cond, .then_blk = body_block, .else_blk = exit_block } });
 
+    const saved = ctx.loop;
+    ctx.loop = .{ .header = header, .exit = exit_block, .body_mark = locals.items.len };
     var body_locals = try cloneLocals(ctx.gpa, locals);
     defer body_locals.deinit(ctx.gpa);
     const body_flow = try lowerBlockScope(ctx, body_block, body_stmts, &body_locals);
+    ctx.loop = saved;
 
-    const exit_block = try ctx.f.newBlock(ctx.gpa); // highest index
-    ctx.f.setTerm(header, .{ .cond_br = .{ .cond = cond, .then_blk = body_block, .else_blk = exit_block } });
     switch (body_flow) {
-        .fallthrough => |b| ctx.f.setTerm(b, .{ .br = header }), // back-edge
+        .fallthrough => |b| ctx.f.setTerm(b, .{ .br = header }), // back-edge (normal iteration)
         .terminated => {},
     }
     return exit_block;
