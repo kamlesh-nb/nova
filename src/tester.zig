@@ -15,6 +15,7 @@ const codegen_arc = @import("backend/codegen/arc.zig");
 const sema_shadow = @import("frontend/sema/shadow.zig");
 const sema_escape = @import("frontend/sema/escape.zig");
 const sema_ownership = @import("frontend/sema/ownership.zig");
+const sema_ossa_lower = @import("frontend/sema/ossa/lower.zig");
 const sema_alpha = @import("frontend/sema/alpha.zig");
 const sema_ids = @import("frontend/sema/ids.zig");
 const sema_mod = @import("frontend/sema/sema.zig");
@@ -285,6 +286,11 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
         sema_ownership.runVerify(allocator, &owned_sema.store, &owned_sema.ir, &program, std.mem.eql(u8, v, "hard"));
         codegen_arc.balance_verify = true;
         codegen_arc.balance_hard = std.mem.eql(u8, v, "hard");
+    }
+
+    // OSSA-lite Track I / I2: lower functions into the ownership IR and run the verifier (report-only).
+    if (init.environ_map.get("NOVA_OSSA") != null) {
+        sema_ossa_lower.report(allocator, &owned_sema.store, &owned_sema.ir, &program);
     }
 
     // (HIR/MIR/LIR LLVM-emit optimiser scrapped 2026-08-16; see docs/design/sil-arc-optimiser-direction.md.)

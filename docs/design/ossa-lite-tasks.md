@@ -80,10 +80,17 @@ soundness property, and NEITHER existing analysis proves it.
       single consumption classifier both later passes share. INVARIANT (for I3): every owned value is
       consumed exactly once per path. Wired into root.zig test aggregation; 3 unit tests PASS (verified by
       deliberate-break: pass 104->103). Compiler builds clean; corpus green. Not yet produced/checked.
-- [ ] **I2** Minimal lowering (SILGen): produce the OSSA IR for ONE straight-line function from Nova source,
-      seeding owned-births/copies/destroys from codegen's ARC decisions + borrows from escape.zig. Report-only.
-      NOTE: this is where the V4' blocker is solved — codegen KNOWS ownership; lowering records it as IR
-      events (make_owned/copy/destroy) instead of reverse-engineering from LLVM IR shapes.
+- [~] **I2** SLICE 1 DONE — end-to-end lowering + verify on REAL code. `ossa/lower.zig` lowers
+      straight-line functions (owned let-locals modelled: make_owned births, copy dups, destroy/ret_owned
+      consumes; uses skipped as balance-irrelevant), defers anything with control flow / a local flowing
+      into a call/store/return-expr (sound-by-deferral, no wrong lowering). Report via NOVA_OSSA runs
+      lower->verify per fn. MEASURED (nova test on a case, ~121 fns): **37 lowered = 30% coverage, all 37
+      verified BALANCED, 0 imbalanced**. This is the FIRST run of the real (non-vacuous) verifier on
+      actual functions. lower.zig unit test passes; corpus green; no regressions. This solved the V4'
+      blocker: ownership comes from sema's TypedIr (ownedOf/isOwnedSafe = codegen's ARC info), recorded as
+      IR events, NOT reverse-engineered from LLVM shapes.
+      NEXT slice-2: model owned values flowing into calls (borrow vs consume — needs callee ownership) and
+      simple if/else (the verifier already handles branches + joins), lifting coverage past 30%.
 - [ ] **I3** OSSA VERIFIER on the IR: every owned value consumed exactly once; no use-after-consume; no
       double-consume. IR-level restatement of Track V; this is the REAL, non-vacuous soundness verifier.
 - [ ] **I4** Extend lowering coverage function-by-function until it matches AST codegen's ARC decisions
