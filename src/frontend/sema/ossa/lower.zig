@@ -31,6 +31,7 @@ pub const Outcome = enum { lowered, deferred };
 pub const LowerResult = struct {
     outcome: Outcome,
     func: ?ir.Func = null,
+    reason: DeferReason = .other,
 };
 
 /// Lower one function. Returns `.deferred` (with no Func) when the body is outside slice-1 scope.
@@ -51,12 +52,22 @@ const Flow = union(enum) {
 const Local = struct { name: []const u8, value: ir.Value, live: bool };
 const Locals = std.ArrayListUnmanaged(Local);
 
+/// Why a function was deferred (for the NOVA_OSSA report's coverage-gap breakdown).
+pub const DeferReason = enum { reassign, break_continue, switch_guard, nonblock_branch, other };
+
 const Ctx = struct {
     gpa: std.mem.Allocator,
     store: *const TypeStore,
     tir: *const TypedIr,
     f: *ir.Func,
+    defer_reason: DeferReason = .other,
 };
+
+/// Record why we are about to defer, then return the Defer error.
+fn deferBecause(ctx: *Ctx, reason: DeferReason) LowerError {
+    ctx.defer_reason = reason;
+    return error.Defer;
+}
 
 pub fn lowerFunction(
     gpa: std.mem.Allocator,
@@ -76,7 +87,7 @@ pub fn lowerFunction(
     const flow = lowerBlockScope(&ctx, entry, fn_decl.body.statements, &locals) catch |e| switch (e) {
         error.Defer => {
             f.deinit(gpa);
-            return .{ .outcome = .deferred };
+            return .{ .outcome = .deferred, .reason = ctx.defer_reason };
         },
         else => return e,
     };
@@ -125,7 +136,7 @@ fn lowerSeq(ctx: *Ctx, block: ir.Block, stmts: []const ast.Statement, locals: *L
             .expr_stmt => |es| {
                 // A bare-local REASSIGNMENT (`x = ...`) drops the old value and rebinds — not modelled
                 // yet, so defer. Any other expression statement borrows the locals it touches: no effect.
-                if (isLocalReassign(&es.expr, locals.items)) return error.Defer;
+                if (isLocalReassign(&es.expr, locals.items)) return deferBecause(ctx, .reassign);
             },
             .if_stmt => |iff| {
                 switch (try lowerIf(ctx, cur, &iff, locals)) {
@@ -158,8 +169,14 @@ fn lowerSeq(ctx: *Ctx, block: ir.Block, stmts: []const ast.Statement, locals: *L
                     },
                 }
             },
-            .defer_stmt => return error.Defer,
-            else => return error.Defer,
+            .defer_stmt => {
+                // `defer expr` / `errdefer expr` runs a cleanup at scope exit. In Nova that expression is
+                // a BORROW (a method call like `x.close()`; there is no manual drop), so it has no
+                // ownership effect on the locals we track — skip it. A bare-local reassignment inside a
+                // defer would be the only concern, and that is as unmodelled as elsewhere -> defer then.
+                if (isLocalReassign(&s.defer_stmt.expr, locals.items)) return deferBecause(ctx, .reassign);
+            },
+            .break_stmt, .continue_stmt => return deferBecause(ctx, .break_continue),
         }
     }
     return .{ .fallthrough = cur };
@@ -169,7 +186,10 @@ fn lowerSeq(ctx: *Ctx, block: ir.Block, stmts: []const ast.Statement, locals: *L
 /// any other owned initializer is a fresh birth (locals it mentions are borrowed, so no consume here).
 /// A trivial (non-owned) local is ignored.
 fn lowerLet(ctx: *Ctx, block: ir.Block, ls: *const ast.LetStmt, locals: *Locals) LowerError!void {
-    if (ls.names != null) return error.Defer; // destructuring
+    // Destructuring (`let {a, b} = …` / `let [a, b] = …`): we have no per-binding type here, so we do NOT
+    // track the destructured names. That is SOUND — an untracked owned binding carries no balance
+    // obligation, so the worst case is missing a leak (a false negative), never a false imbalance.
+    if (ls.names != null) return;
     const init = ls.init orelse return;
     if (!isOwnedInit(ctx.store, ctx.tir, &init)) return; // trivial local: ignore
     const v = if (init.kind == .ident and resolveLocal(locals.items, init.kind.ident) != null)
@@ -184,8 +204,8 @@ fn lowerLet(ctx: *Ctx, block: ir.Block, ls: *const ast.LetStmt, locals: *Locals)
 /// LAST so every edge is index-increasing. The caller's `locals` is unchanged (a fall-through branch
 /// consumes no outer local — only a `return` does, and that terminates the branch).
 fn lowerIf(ctx: *Ctx, entry_block: ir.Block, iff: *const ast.IfStmt, locals: *Locals) LowerError!Flow {
-    const then_stmts = branchStmts(iff.then_branch) orelse return error.Defer;
-    const else_stmts: ?[]const ast.Statement = if (iff.else_branch) |e| (branchStmts(e) orelse return error.Defer) else null;
+    const then_stmts = branchStmts(iff.then_branch) orelse return deferBecause(ctx, .nonblock_branch);
+    const else_stmts: ?[]const ast.Statement = if (iff.else_branch) |e| (branchStmts(e) orelse return deferBecause(ctx, .nonblock_branch)) else null;
 
     const cond = try ctx.f.makeTrivial(ctx.gpa, entry_block, null);
     const then_block = try ctx.f.newBlock(ctx.gpa);
@@ -253,7 +273,7 @@ fn lowerLoop(ctx: *Ctx, entry_block: ir.Block, body_stmts: []const ast.Statement
 }
 
 fn lowerWhile(ctx: *Ctx, entry_block: ir.Block, w: *const ast.WhileStmt, locals: *Locals) LowerError!ir.Block {
-    const body_stmts = branchStmts(w.body) orelse return error.Defer;
+    const body_stmts = branchStmts(w.body) orelse return deferBecause(ctx, .nonblock_branch);
     return lowerLoop(ctx, entry_block, body_stmts, locals);
 }
 
@@ -263,7 +283,7 @@ fn lowerWhile(ctx: *Ctx, entry_block: ir.Block, w: *const ast.WhileStmt, locals:
 /// own storage), so it is not tracked — modelling it as a borrow is sound (it can only miss an owned
 /// element leak, never invent a false imbalance). Either way the body is its own scope on a clone.
 fn lowerFor(ctx: *Ctx, entry_block: ir.Block, fr: *const ast.ForStmt, locals: *Locals) LowerError!Flow {
-    const body_stmts = branchStmts(fr.body) orelse return error.Defer;
+    const body_stmts = branchStmts(fr.body) orelse return deferBecause(ctx, .nonblock_branch);
 
     if (fr.iterator != null) {
         // for-in: loop variable borrowed, no init/increment scope to drop.
@@ -273,8 +293,8 @@ fn lowerFor(ctx: *Ctx, entry_block: ir.Block, fr: *const ast.ForStmt, locals: *L
     const for_mark = locals.items.len;
     if (fr.initializer) |istmt| switch (istmt.*) {
         .let_stmt => |ls| try lowerLet(ctx, entry_block, &ls, locals),
-        .expr_stmt => |es| if (isLocalReassign(&es.expr, locals.items)) return error.Defer,
-        else => return error.Defer,
+        .expr_stmt => |es| if (isLocalReassign(&es.expr, locals.items)) return deferBecause(ctx, .reassign),
+        else => return deferBecause(ctx, .other),
     };
     const exit_block = try lowerLoop(ctx, entry_block, body_stmts, locals);
     try dropScope(ctx, exit_block, locals, for_mark); // drop the loop variable if it was owned
@@ -286,7 +306,7 @@ fn lowerFor(ctx: *Ctx, entry_block: ir.Block, fr: *const ast.ForStmt, locals: *L
 /// set to match. Cases with a guard (`case v if cond:`) fall through to default on guard-false, which is
 /// a control-flow shape this slice does not model, so a guarded switch defers.
 fn lowerSwitch(ctx: *Ctx, entry_block: ir.Block, sw: *const ast.SwitchStmt, locals: *Locals) LowerError!Flow {
-    for (sw.cases) |c| if (c.guard != null) return error.Defer;
+    for (sw.cases) |c| if (c.guard != null) return deferBecause(ctx, .switch_guard);
 
     const case_blocks = try ctx.gpa.alloc(ir.Block, sw.cases.len);
     errdefer ctx.gpa.free(case_blocks);
@@ -295,7 +315,7 @@ fn lowerSwitch(ctx: *Ctx, entry_block: ir.Block, sw: *const ast.SwitchStmt, loca
 
     // Lower each case body into its own block+scope. Blocks are allocated before the join (below).
     for (sw.cases, 0..) |c, i| {
-        const body_stmts = branchStmts(c.body) orelse return error.Defer; // errdefer frees case_blocks
+        const body_stmts = branchStmts(c.body) orelse return deferBecause(ctx, .nonblock_branch); // errdefer frees case_blocks
         case_blocks[i] = try ctx.f.newBlock(ctx.gpa);
         var case_locals = try cloneLocals(ctx.gpa, locals);
         defer case_locals.deinit(ctx.gpa);
@@ -307,7 +327,7 @@ fn lowerSwitch(ctx: *Ctx, entry_block: ir.Block, sw: *const ast.SwitchStmt, loca
     var default_flow: Flow = .{ .fallthrough = undefined };
     var has_default_fallthrough = true; // no default => the no-match path falls straight to join
     if (sw.default_case) |dstmt| {
-        const dstmts = branchStmts(dstmt) orelse return error.Defer; // errdefer frees case_blocks
+        const dstmts = branchStmts(dstmt) orelse return deferBecause(ctx, .nonblock_branch); // errdefer frees case_blocks
         default_block = try ctx.f.newBlock(ctx.gpa);
         var default_locals = try cloneLocals(ctx.gpa, locals);
         defer default_locals.deinit(ctx.gpa);
@@ -365,11 +385,12 @@ fn cloneLocals(gpa: std.mem.Allocator, locals: *const Locals) !Locals {
     return out;
 }
 
-/// The statement list of a branch/body (must be a block; a bare single statement defers).
+/// The statement list of a branch/body. A `{ … }` block yields its statements; a braceless single
+/// statement (`if (c) return x;`) yields a one-element view of that statement (safe: it outlives lowering).
 fn branchStmts(s: *const ast.Statement) ?[]const ast.Statement {
     return switch (s.*) {
         .block => |b| b.statements,
-        else => null,
+        else => @as([*]const ast.Statement, @ptrCast(s))[0..1],
     };
 }
 
@@ -431,6 +452,7 @@ const Counts = struct {
     first_imbalance_fn: []const u8 = "",
     fwd_copies: usize = 0,
     fwd_candidates: usize = 0,
+    defer_reasons: [5]usize = .{0} ** 5,
 };
 
 pub fn report(gpa: std.mem.Allocator, store: *const TypeStore, tir: *const TypedIr, program: *const ast.Program) void {
@@ -455,6 +477,16 @@ pub fn report(gpa: std.mem.Allocator, store: *const TypeStore, tir: *const Typed
     );
     if (c.imbalanced > 0) std.debug.print("    first imbalanced fn: {s}\n", .{c.first_imbalance_fn});
     std.debug.print(
+        "  deferred breakdown: reassign={d} break/continue={d} switch-guard={d} nonblock-branch={d} other={d}\n",
+        .{
+            c.defer_reasons[@intFromEnum(DeferReason.reassign)],
+            c.defer_reasons[@intFromEnum(DeferReason.break_continue)],
+            c.defer_reasons[@intFromEnum(DeferReason.switch_guard)],
+            c.defer_reasons[@intFromEnum(DeferReason.nonblock_branch)],
+            c.defer_reasons[@intFromEnum(DeferReason.other)],
+        },
+    );
+    std.debug.print(
         "  ownership-forwarding (Track A, E2-gated headroom):\n" ++
         "    owned-dup copies emitted : {d}\n" ++
         "    of those, forwardable    : {d}   (only borrowed+destroyed, never moved/returned)\n",
@@ -470,7 +502,10 @@ fn lowerAndCheck(gpa: std.mem.Allocator, store: *const TypeStore, tir: *const Ty
         return;
     };
     switch (res.outcome) {
-        .deferred => c.deferred += 1,
+        .deferred => {
+            c.deferred += 1;
+            c.defer_reasons[@intFromEnum(res.reason)] += 1;
+        },
         .lowered => {
             c.lowered += 1;
             var f = res.func.?;
