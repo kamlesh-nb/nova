@@ -41,6 +41,7 @@ test {
     _ = @import("frontend/sema/ossa/ir.zig");
     _ = @import("frontend/sema/ossa/verify.zig");
     _ = @import("frontend/sema/ossa/lower.zig");
+    _ = @import("frontend/sema/ossa/forward.zig");
 
     _ = @import("frontend/lexer.zig");
     _ = @import("frontend/parser.zig");

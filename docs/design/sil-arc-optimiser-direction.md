@@ -92,3 +92,29 @@ where no callee consumes it), which requires the full typed-ownership IR + borro
 converges with the SAME OSSA-lite ownership IR as the soundness verifier — i.e. Gap-3-perf and Gap-1-
 soundness are one investment, exactly the reframing. Do NOT build a borrow-skip peephole; if perf is
 pursued it must be ownership-forwarding on the OSSA IR, still gated on a measured runtime delta.
+
+## Track A ownership-forwarding MEASURED on the OSSA IR (2026-08-16) — also ~0 headroom, PERF HALF CLOSED
+
+After the OSSA-lite ownership IR + verifier landed (Track I, ~87% coverage), the perf half was re-measured
+on the IR itself (`ossa/forward.zig`, reported via NOVA_OSSA). The clearest OSSA-level forwarding pattern
+is a REDUNDANT COPY: an owned dup (`let y = x`, which retains) whose result is only borrowed and then
+destroyed, never moved out or returned — its +1 is dead weight a forwarding pass could elide.
+
+Measured across the corpus: **owned-dup copies emitted = 0**, hence forwardable candidates = 0. Real Nova
+code essentially never creates a redundant owned ALIAS; owned bindings are fresh births (`let y = expr`),
+stores into owned slots/fields, or genuine transfers — not `let y = x` dups that are merely borrowed. The
+forward.zig detector is unit-tested to fire on constructed IR (a copy-only-destroyed IS flagged; a copy
+returned or moved is NOT), so the 0 is a real measurement, not a dead check.
+
+**Two independent measurements now agree there is no ARC-elision headroom:**
+- E2 (LLVM level): 0 borrow-skip candidates — the retain/release traffic is retain-for-store into
+  genuinely-owned slots/fields, which the callee needs.
+- Track A (OSSA level): 0 redundant-copy candidates — no forwardable owned aliases.
+
+**DECISION: the ARC-optimisation perf half is CLOSED (scrapped), not merely deferred.** Nova's ARC cost is
+the fundamental per-object retain/release for values that are genuinely owned; forwarding cannot remove it.
+The real per-core perf lever is REDUCING THE ALLOCATION COUNT (per the perf notes: ~3000 ARC objects per
+request vs ~50 for Rust) — an ARCHITECTURAL lever (arena / value types / fewer per-request allocations,
+partly explored in P7), NOT an ARC-semantic pass on any IR. The OSSA IR's justified, delivered value is the
+SOUNDNESS verifier (Track V/I), not perf. This is the honest, final answer to "is there an in-house ARC
+optimisation worth building": no.

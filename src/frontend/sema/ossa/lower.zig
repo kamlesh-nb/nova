@@ -21,6 +21,7 @@ const types = @import("../../types.zig");
 const infer = @import("../infer.zig");
 const ir = @import("ir.zig");
 const verify = @import("verify.zig");
+const forward = @import("forward.zig");
 
 const TypeStore = types.TypeStore;
 const TypedIr = infer.TypedIr;
@@ -428,6 +429,8 @@ const Counts = struct {
     balanced: usize = 0,
     imbalanced: usize = 0,
     first_imbalance_fn: []const u8 = "",
+    fwd_copies: usize = 0,
+    fwd_candidates: usize = 0,
 };
 
 pub fn report(gpa: std.mem.Allocator, store: *const TypeStore, tir: *const TypedIr, program: *const ast.Program) void {
@@ -451,6 +454,12 @@ pub fn report(gpa: std.mem.Allocator, store: *const TypeStore, tir: *const Typed
         .{ c.total, c.lowered, cov, c.deferred, c.balanced, c.imbalanced },
     );
     if (c.imbalanced > 0) std.debug.print("    first imbalanced fn: {s}\n", .{c.first_imbalance_fn});
+    std.debug.print(
+        "  ownership-forwarding (Track A, E2-gated headroom):\n" ++
+        "    owned-dup copies emitted : {d}\n" ++
+        "    of those, forwardable    : {d}   (only borrowed+destroyed, never moved/returned)\n",
+        .{ c.fwd_copies, c.fwd_candidates },
+    );
     std.debug.print("=== end OSSA-lite lowering ===\n", .{});
 }
 
@@ -474,6 +483,9 @@ fn lowerAndCheck(gpa: std.mem.Allocator, store: *const TypeStore, tir: *const Ty
                 c.imbalanced += 1;
                 if (c.first_imbalance_fn.len == 0) c.first_imbalance_fn = fd.name;
             }
+            const fc = forward.count(&f);
+            c.fwd_copies += fc.copies;
+            c.fwd_candidates += fc.candidates;
         },
     }
 }
