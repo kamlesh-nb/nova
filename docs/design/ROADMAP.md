@@ -46,8 +46,9 @@ designed, not built), a handful of narrow polish items, and the bigger post-beta
 - **Forwarding (Gap 6):** fire-and-forget every connection vs handoff-on-drain? how `orchd` gets
   `CAP_NET_ADMIN`? is the zero-downtime-deploy test a beta requirement?
 - **Debugger (Gap 4):** DWARF+lldb-dap+formatters as one MVP? bundle `lldb-dap`+formatters? post-beta?
-- **Perf (Gap 5):** is per-core perf a priority now? if yes, targeted hot-path reduction before any
-  escape-arena rework (the P7 blanket arena already regressed 28%).
+- **Perf (Gap 5): ACTIVE** — targeted, measure-first allocation reduction. Harness built; win #1 landed
+  (JSON parse+bind 114→58 allocs, 49%). Next candidates in `gap5-perf-plan.md`. Not a stop condition that
+  we beat Rust/Go.
 - **nls:** ship in the same archive as `nova` vs a companion artifact? version-lock via `check-version-sync.sh`?
 - **Beta bar (Gap 7):** lock the 6-item release checklist.
 
@@ -66,8 +67,10 @@ designed, not built), a handful of narrow polish items, and the bigger post-beta
 
 **Post-beta (bigger):**
 8. Orchestrator fd-handoff test + the Linux veth isolation fence.
-9. Perf (Gap 5) — only against a measured target.
-10. Debugger (Gap 4) — DWARF + lldb-dap + formatters, must clear the value-display bar.
+9. Debugger (Gap 4) — DWARF + lldb-dap + formatters, must clear the value-display bar.
+
+*(Gap 5 perf is CLOSED as accepted — not on the roadmap; reopen only against a specific measured failing
+target, per its standing rule.)*
 
 ## 6. Beta bar (the checklist — lock its contents)
 Nothing ships "beta" until, by command:

@@ -10,17 +10,36 @@ pub struct JsonValue {
     pub bval: bool,
     pub num: string,
     pub sval: string,
-    pub arr: List<JsonValue>,
-    pub obj: Map<string, JsonValue>,
+    // arr/obj are allocated LAZILY — only array (kind 4) and object (kind 5) nodes need them. A scalar
+    // (null/bool/number/string) leaves them undefined, so parsing a scalar allocates just this struct
+    // instead of also a List + a Map + the Map's backing (Gap 5: ~114 -> fewer allocs per parse).
+    pub arr: List<JsonValue> | undefined,
+    pub obj: Map<string, JsonValue> | undefined,
 
     init(kind: int) {
         self.kind = kind;
         self.bval = false;
         self.num = "";
         self.sval = "";
-        self.arr = List<JsonValue>();
-        self.obj = Map<string, JsonValue>(8, string.hash);
+        self.arr = undefined;
+        self.obj = undefined;
+        if (kind == 4) { self.arr = List<JsonValue>(); }
+        if (kind == 5) { self.obj = Map<string, JsonValue>(8, string.hash); }
     }
+}
+
+// The arr/obj of a kind-4/kind-5 node, narrowed. Callers guard on kind first, so the value is always
+// present and the trailing empty is unreachable (no allocation on the hot path); it only satisfies the
+// type. Collections are reference types, so mutating the returned value mutates the node's field.
+fn arrOf(val: JsonValue): List<JsonValue> {
+    let a = val.arr;
+    if (a != undefined) { return a; }
+    return List<JsonValue>();
+}
+fn objOf(val: JsonValue): Map<string, JsonValue> {
+    let o = val.obj;
+    if (o != undefined) { return o; }
+    return Map<string, JsonValue>(8, string.hash);
 }
 
 pub fn null(): JsonValue { return JsonValue(0); }
@@ -66,7 +85,7 @@ pub fn asObject(val: JsonValue): Map<string, JsonValue> | undefined {
 
 pub fn get(val: JsonValue, key: string): JsonValue {
     if (val.kind == 5) {
-        let r = val.obj.get(key);
+        let r = objOf(val).get(key);
         if (r == undefined) { return JsonValue(0); }
         return r ?? JsonValue(0);
     }
@@ -75,7 +94,7 @@ pub fn get(val: JsonValue, key: string): JsonValue {
 
 pub fn has(val: JsonValue, key: string): bool {
     if (val.kind == 5) {
-        let r = val.obj.get(key);
+        let r = objOf(val).get(key);
         if (r == undefined) { return false; }
         return true;
     }
@@ -84,15 +103,15 @@ pub fn has(val: JsonValue, key: string): bool {
 
 pub fn at(val: JsonValue, index: int): JsonValue {
     if (val.kind == 4) {
-        if (index < 0 || index >= val.arr.size()) { return JsonValue(0); }
-        return val.arr.get(index) ?? JsonValue(0);
+        if (index < 0 || index >= arrOf(val).size()) { return JsonValue(0); }
+        return arrOf(val).get(index) ?? JsonValue(0);
     }
     return JsonValue(0);
 }
 
 pub fn size(val: JsonValue): int {
-    if (val.kind == 4) { return val.arr.size(); }
-    if (val.kind == 5) { return val.obj.size(); }
+    if (val.kind == 4) { return arrOf(val).size(); }
+    if (val.kind == 5) { return objOf(val).size(); }
     return 0;
 }
 
@@ -275,7 +294,7 @@ struct JsonParser {
         }
         while (true) {
             let v = self.parseValue();
-            node.arr.push(v);
+            arrOf(node).push(v);
             self.skipWs();
             if (self.pos >= self.src.length) { self.failed = true; break; }   // L4/E7: unterminated array
             let c = self.src[self.pos];
@@ -303,7 +322,7 @@ struct JsonParser {
                 self.pos = self.pos + 1;
                 self.skipWs();
                 let v = self.parseValue();
-                node.obj.set(key, v);
+                objOf(node).set(key, v);
                 self.skipWs();
                 if (self.pos >= self.src.length) { self.failed = true; break; }   // L4/E7: unterminated object
                 let c = self.src[self.pos];
@@ -343,19 +362,19 @@ pub fn stringify(val: JsonValue): string {
     if (val.kind == 4) {
         let parts = List<string>();
         let i = 0;
-        while (i < val.arr.size()) {
-            parts.push(stringify(val.arr.get(i) ?? JsonValue(0)));
+        while (i < arrOf(val).size()) {
+            parts.push(stringify(arrOf(val).get(i) ?? JsonValue(0)));
             i = i + 1;
         }
         return "[" + string.join(parts, ",") + "]";
     }
     if (val.kind == 5) {
         let parts = List<string>();
-        let keys = val.obj.keys();
+        let keys = objOf(val).keys();
         let i = 0;
         while (i < keys.size()) {
             let k = keys.get(i) ?? "";
-            parts.push(quoteString(k) + ":" + stringify(val.obj.get(k) ?? JsonValue(0)));
+            parts.push(quoteString(k) + ":" + stringify(objOf(val).get(k) ?? JsonValue(0)));
             i = i + 1;
         }
         return "{" + string.join(parts, ",") + "}";

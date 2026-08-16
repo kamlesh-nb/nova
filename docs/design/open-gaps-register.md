@@ -34,8 +34,14 @@ The reframing (`swift-arch-comparison.md`) established these were one gap: Nova 
   measurements (E2 borrow-skip at the LLVM level, Track A redundant-copy on the OSSA IR) both found ~0
   headroom, re-verified fresh on `13_serde` (borrow-skip 0/0, forwarding 0/0). Nova's ARC cost is
   fundamental per-object retain/release; forwarding cannot remove it; LLVM O3 already gives competitive
-  codegen. The only remaining perf lever = per-request allocation COUNT = **Gap 5, separate + optional**.
+  codegen. The only remaining perf lever = per-request allocation COUNT = Gap 5 (below).
   Full closure of record: `done/gap3-closed.md`. **[verified]**
+- 🔧 **Perf (Gap 5, allocation count) — ACTIVE (reopened 2026-08-16).** "Beating Rust/Go is not a stop
+  condition." Built an allocation-count harness (`NOVA_ALLOC_COUNT` / `nova_alloc_total`). Measured profile:
+  collections ~0 allocs/op, strings ~1/op (builder remedy), JSON parse+bind = the hotspot. **Win #1 landed:
+  lazy JsonValue arr/obj → 114 → 58 allocs/parse (49%), all serde cases green, ASAN + ARC audit clean.**
+  Targeted + measure-first (the P7 blanket arena stays scrapped; escape-arena is low-headroom at 4% local).
+  Plan + method + next candidates: `gap5-perf-plan.md`. **[verified]**
 
 ## B. Previously-tracked language crash bugs — ALL MARKED FIXED (do not treat as open) **[register]**
 Each has a memory note stating it is resolved, with a pinned conformance case. Listed so they are not
