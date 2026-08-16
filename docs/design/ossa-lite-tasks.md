@@ -96,8 +96,19 @@ soundness property, and NEITHER existing analysis proves it.
       (non-block) branches + while/for/switch still defer. MEASURED: coverage **30% -> 43%** (37->53 fns),
       still ALL BALANCED, 0 imbalanced; scanned 12 varied cases (struct/enum/closure/trait/option/generic/…)
       = 0 false positives. Unit tests pass.
-      NEXT slice-3: owned values flowing into CALLS (borrow vs consume — seed from escape.zig's param-escape
-      summaries) + while/for (needs the verifier's loop path lifted from deferral), lifting coverage further.
+      SLICE 3 DONE — calls/borrows. KEY: the E2 census showed caller-side call args carry NO retain/release,
+      i.e. in Nova's ARC model passing an owned value to a call is a BORROW from the caller (the callee
+      retains its own copies; the caller keeps its +1 and drops at scope end). So owned-local-into-call
+      needs NO escape.zig consume/borrow distinction — it is always a borrow. The ONLY move is a bare
+      `return x`. Lifted the defers: let-init mentioning a local (borrow -> makeOwned/copy), return-expr
+      mentioning locals (drop all, ret_void), call expr-stmts (borrow, skip). Still defer only bare-local
+      REASSIGNMENT (`x = ...`, drops old value — unmodelled). MEASURED: coverage 43% -> 47%, still 0
+      imbalanced; ~18 varied cases scanned (incl closure/serde/json/error/trait) = 0 false positives —
+      end-to-end confirmation the E2-derived borrow model is correct. The +4% is modest because most
+      remaining defers are LOOPS.
+      NEXT slice-4: loops (while/for). Requires lifting the I3 verifier's loop-deferral (a fixpoint over
+      back-edges: the loop-header entry set must equal both the pre-loop and back-edge exit sets). This is
+      where the bulk of remaining coverage is.
 - [ ] **I3** OSSA VERIFIER on the IR: every owned value consumed exactly once; no use-after-consume; no
       double-consume. IR-level restatement of Track V; this is the REAL, non-vacuous soundness verifier.
 - [ ] **I4** Extend lowering coverage function-by-function until it matches AST codegen's ARC decisions

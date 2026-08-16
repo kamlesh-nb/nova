@@ -102,11 +102,15 @@ fn lowerSeq(ctx: *Ctx, block: ir.Block, stmts: []const ast.Statement, live: *std
                 const init = ls.init orelse continue;
                 if (!isOwnedInit(ctx.store, ctx.tir, &init)) continue; // trivial local: ignore
 
+                // `let y = x` where x is a tracked owned local -> a dup (copy, retains). Otherwise a fresh
+                // birth: any other owned initializer produces a NEW owned value bound to `ls.name`. Under
+                // Nova's ARC model any local mentioned inside the initializer is BORROWED (the callee
+                // retains its own copies; the caller keeps its +1), so it needs no consume here — see the
+                // E2 census finding that caller-side call args carry no retain/release. So we do NOT defer
+                // on a local-mentioning init; we just model the new binding.
                 var v: ir.Value = undefined;
                 if (init.kind == .ident and findLocalIdx(ctx.names.items, init.kind.ident) != null) {
                     v = try ctx.f.copy(ctx.gpa, cur, ctx.vals.items[findLocalIdx(ctx.names.items, init.kind.ident).?]);
-                } else if (mentionsAnyLocal(&init, ctx.names.items)) {
-                    return error.Defer; // owned init derived from a local in a way we can't model
                 } else {
                     v = try ctx.f.makeOwned(ctx.gpa, cur, ctx.tir.typeOf(&init));
                 }
@@ -115,13 +119,12 @@ fn lowerSeq(ctx: *Ctx, block: ir.Block, stmts: []const ast.Statement, live: *std
                 try live.append(ctx.gpa, true);
             },
             .return_stmt => |r| {
+                // A bare `return x` where x is a tracked owned local MOVES x out (ret_owned). Any other
+                // return expression BORROWS the locals it mentions (their +1s are still dropped here) and
+                // returns a fresh value we don't track -> drop all live locals, ret_void.
                 var returned_idx: ?usize = null;
                 if (r.value) |val| {
-                    if (val.kind == .ident) {
-                        returned_idx = findLocalIdx(ctx.names.items, val.kind.ident);
-                    } else if (mentionsAnyLocal(&val, ctx.names.items)) {
-                        return error.Defer; // owned local flows into a return expression
-                    }
+                    if (val.kind == .ident) returned_idx = findLocalIdx(ctx.names.items, val.kind.ident);
                 }
                 try dropLive(ctx, cur, live, returned_idx);
                 if (returned_idx) |ri| {
@@ -132,7 +135,10 @@ fn lowerSeq(ctx: *Ctx, block: ir.Block, stmts: []const ast.Statement, live: *std
                 return .terminated;
             },
             .expr_stmt => |es| {
-                if (mentionsAnyLocal(&es.expr, ctx.names.items)) return error.Defer; // maybe-consuming use
+                // A bare-local REASSIGNMENT (`x = ...`) drops the old value and rebinds — not modelled in
+                // this slice, so defer. Every other expression statement (a call/method that mentions
+                // locals) BORROWS them: no ownership change, no balance effect -> skip.
+                if (isLocalReassign(&es.expr, ctx.names.items)) return error.Defer;
             },
             .if_stmt => |iff| {
                 switch (try lowerIf(ctx, cur, &iff, live)) {
@@ -244,6 +250,15 @@ fn findLocalIdx(names: []const []const u8, want: []const u8) ?usize {
 fn mentionsAnyLocal(e: *const ast.Expression, names: []const []const u8) bool {
     for (names) |n| if (exprMentions(e, n)) return true;
     return false;
+}
+
+/// True if `e` is a bare assignment `local = ...` to a tracked owned local (which drops the old value —
+/// a rebinding this slice does not yet model, so the caller defers it).
+fn isLocalReassign(e: *const ast.Expression, names: []const []const u8) bool {
+    if (e.kind != .binary) return false;
+    const b = e.kind.binary;
+    if (b.op != .assign) return false;
+    return b.left.kind == .ident and findLocalIdx(names, b.left.kind.ident) != null;
 }
 
 // A minimal name-mention check (idents only, recursive over common expression shapes). Enough for the
