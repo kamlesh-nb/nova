@@ -21,10 +21,76 @@ pub const Stats = struct {
 
     temp_moves: usize = 0,
     temp_drops: usize = 0,
+
+    // V1: optional structured-diagnostic sink. When non-null, each use-after-move
+    // violation is appended with its enclosing function + local name. `analyze()`
+    // leaves it null (identical behaviour to before); `verify()` supplies a list.
+    diags: ?*std.ArrayListUnmanaged(Diagnostic) = null,
+    diag_alloc: std.mem.Allocator = undefined,
+    // Name of the function currently being walked, for diagnostic attribution.
+    cur_fn: []const u8 = "",
 };
 
+/// One structured verifier finding: a use-after-move on an owned local.
+pub const Diagnostic = struct {
+    fn_name: []const u8,
+    local: []const u8,
+};
+
+pub const VerifyResult = struct {
+    stats: Stats,
+    diagnostics: []Diagnostic,
+};
+
+/// Report-only entry point (unchanged behaviour): compute ownership stats.
 pub fn analyze(allocator: std.mem.Allocator, store: *const TypeStore, ir: *TypedIr, program: *const ast.Program) Stats {
-    var st = Stats{};
+    return run(allocator, store, ir, program, null);
+}
+
+/// Verifier entry point: same walk as `analyze`, but also collects a structured
+/// list of every use-after-move violation (enclosing function + local name).
+/// Caller owns the returned slice (allocated with `allocator`).
+pub fn verify(allocator: std.mem.Allocator, store: *const TypeStore, ir: *TypedIr, program: *const ast.Program) !VerifyResult {
+    var list: std.ArrayListUnmanaged(Diagnostic) = .empty;
+    const st = run(allocator, store, ir, program, &list);
+    return .{ .stats = st, .diagnostics = try list.toOwnedSlice(allocator) };
+}
+
+/// Standalone verifier entry used by the pipeline (independent of the SEMA_SHADOW report path).
+/// Runs `verify`, prints a compact summary + per-violation lines, and — when `hard_fail` is set —
+/// exits(1) if any use-after-move violation is found. Report-only when `hard_fail` is false.
+pub fn runVerify(allocator: std.mem.Allocator, store: *const TypeStore, ir: *TypedIr, program: *const ast.Program, hard_fail: bool) void {
+    const res = verify(allocator, store, ir, program) catch return;
+    const s = res.stats;
+    const total = s.owned_locals;
+    const proved = s.analyzed;
+    const deferred = s.deferred_cfg + s.deferred_untyped;
+    const cov: usize = if (total == 0) 100 else (proved * 100) / total;
+    std.debug.print(
+        "=== ownership verifier (NOVA_OWN_VERIFY) ===\n" ++
+        "  functions walked        : {d}\n" ++
+        "  owned let-locals        : {d}\n" ++
+        "    proved (balance held) : {d}\n" ++
+        "    deferred (unchecked)  : {d}   (CFG/reassign/shadow {d} + untyped-init {d})\n" ++
+        "    coverage              : {d}% proved of owned locals\n" ++
+        "  USE-AFTER-MOVE VIOLATIONS: {d}\n",
+        .{ s.fns_walked, total, proved, deferred, s.deferred_cfg, s.deferred_untyped, cov, res.diagnostics.len },
+    );
+    for (res.diagnostics) |d| {
+        std.debug.print("    violation: fn '{s}', owned local '{s}' used after move\n", .{ d.fn_name, d.local });
+    }
+    std.debug.print("=== end ownership verifier ===\n", .{});
+    if (hard_fail and res.diagnostics.len > 0) {
+        std.debug.print(
+            "\x1b[1m\x1b[31mOWNERSHIP VERIFIER FAILED:\x1b[0m {d} use-after-move violation(s); an owned value is used after it was moved.\n",
+            .{res.diagnostics.len},
+        );
+        std.process.exit(1);
+    }
+}
+
+fn run(allocator: std.mem.Allocator, store: *const TypeStore, ir: *TypedIr, program: *const ast.Program, diags: ?*std.ArrayListUnmanaged(Diagnostic)) Stats {
+    var st = Stats{ .diags = diags, .diag_alloc = allocator };
     for (program.declarations) |decl| {
         switch (decl) {
             .fn_decl => |f| analyzeFn(allocator, &f, store, ir, &st),
@@ -38,6 +104,7 @@ pub fn analyze(allocator: std.mem.Allocator, store: *const TypeStore, ir: *Typed
 
 fn analyzeFn(allocator: std.mem.Allocator, f: *const ast.FunctionDecl, store: *const TypeStore, ir: *TypedIr, st: *Stats) void {
     st.fns_walked += 1;
+    st.cur_fn = f.name;
     analyzeStmts(f.body.statements, store, ir, st);
     for (f.body.statements) |*s| tempStmt(allocator, ir, s, st);
 }
@@ -209,6 +276,7 @@ fn analyzeOwnedLocal(name: []const u8, rest: []const ast.Statement, st: *Stats) 
         .violation => {
             st.balance_violations += 1;
             if (st.first_violation.len == 0) st.first_violation = name;
+            if (st.diags) |d| d.append(st.diag_alloc, .{ .fn_name = st.cur_fn, .local = name }) catch {};
         },
     }
 }

@@ -14,6 +14,7 @@ const llvm_codegen = @import("backend/codegen/llvm_codegen.zig");
 const codegen_arc = @import("backend/codegen/arc.zig");
 const sema_shadow = @import("frontend/sema/shadow.zig");
 const sema_escape = @import("frontend/sema/escape.zig");
+const sema_ownership = @import("frontend/sema/ownership.zig");
 const sema_alpha = @import("frontend/sema/alpha.zig");
 const sema_ids = @import("frontend/sema/ids.zig");
 const sema_mod = @import("frontend/sema/sema.zig");
@@ -276,6 +277,11 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
     // P7 Stage 1: report-only escape gauge (no codegen effect). See docs/design/p7-sound-arena.md.
     sema_escape.report_enabled = init.environ_map.get("NOVA_ESCAPE_REPORT") != null;
     if (sema_escape.report_enabled) _ = sema_escape.analyze(allocator, &owned_sema.store, &owned_sema.ir, &program);
+
+    // OSSA-lite Track V: opt-in ownership verifier. See docs/design/ossa-lite-tasks.md.
+    if (init.environ_map.get("NOVA_OWN_VERIFY")) |v| {
+        sema_ownership.runVerify(allocator, &owned_sema.store, &owned_sema.ir, &program, std.mem.eql(u8, v, "hard"));
+    }
 
     // (HIR/MIR/LIR LLVM-emit optimiser scrapped 2026-08-16; see docs/design/sil-arc-optimiser-direction.md.)
 
