@@ -288,9 +288,9 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
         codegen_arc.balance_hard = std.mem.eql(u8, v, "hard");
     }
 
-    // OSSA-lite Track I / I2: lower functions into the ownership IR and run the verifier (report-only).
-    if (init.environ_map.get("NOVA_OSSA") != null) {
-        sema_ossa_lower.report(allocator, &owned_sema.store, &owned_sema.ir, &program);
+    // OSSA-lite Track I: lower + verify. NOVA_OSSA=1 reports; NOVA_OSSA=hard also fails on an imbalance.
+    if (init.environ_map.get("NOVA_OSSA")) |v| {
+        sema_ossa_lower.report(allocator, &owned_sema.store, &owned_sema.ir, &program, std.mem.eql(u8, v, "hard"));
     }
 
     // (HIR/MIR/LIR LLVM-emit optimiser scrapped 2026-08-16; see docs/design/sil-arc-optimiser-direction.md.)

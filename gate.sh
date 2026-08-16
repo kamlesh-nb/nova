@@ -46,6 +46,11 @@ if [ $fail -eq 0 ]; then
   bash conformance/string-typedecision-lint.sh || fail=1
 fi
 
+if [ $fail -eq 0 ]; then
+  step "OSSA ownership gate (release-balance verifier: 0 proven leaks/double-frees)"
+  bash conformance/ossa-gate.sh || fail=1
+fi
+
 echo
 if [ $fail -eq 0 ]; then echo "GATE PASS  nova (lang)  [$OS]"; else echo "GATE FAIL  nova (lang)  [$OS]"; fi
 exit $fail

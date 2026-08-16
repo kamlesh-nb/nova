@@ -478,7 +478,7 @@ const Counts = struct {
     defer_reasons: [5]usize = .{0} ** 5,
 };
 
-pub fn report(gpa: std.mem.Allocator, store: *const TypeStore, tir: *const TypedIr, program: *const ast.Program) void {
+pub fn report(gpa: std.mem.Allocator, store: *const TypeStore, tir: *const TypedIr, program: *const ast.Program, hard: bool) void {
     var c = Counts{};
     for (program.declarations) |decl| {
         switch (decl) {
@@ -516,6 +516,17 @@ pub fn report(gpa: std.mem.Allocator, store: *const TypeStore, tir: *const Typed
         .{ c.fwd_copies, c.fwd_candidates },
     );
     std.debug.print("=== end OSSA-lite lowering ===\n", .{});
+
+    // Gate mode (NOVA_OSSA=hard): a proven imbalance = a leak or double-free in a function the verifier
+    // fully modelled. Fail the build. (Deferred functions are unchecked, not accused — they do not fail.)
+    if (hard and c.imbalanced > 0) {
+        std.debug.print(
+            "\x1b[1m\x1b[31mOSSA OWNERSHIP GATE FAILED:\x1b[0m {d} function(s) have an ARC release imbalance " ++
+            "(a leak or double-free the release-balance verifier proved). First: '{s}'.\n",
+            .{ c.imbalanced, c.first_imbalance_fn },
+        );
+        std.process.exit(1);
+    }
 }
 
 fn lowerAndCheck(gpa: std.mem.Allocator, store: *const TypeStore, tir: *const TypedIr, fd: *const ast.FunctionDecl, c: *Counts) void {
