@@ -18,9 +18,10 @@ designed, not built), a handful of narrow polish items, and the bigger post-beta
 - **Ownership verifier (soundness).** OSSA-lite lowering + release-balance verifier, 100% coverage, 0 false
   positives (329-case sweep), enforced via `NOVA_OSSA=hard` + `conformance/ossa-gate.sh` in `gate.sh`.
   Rationale + IR: `swift-arch-comparison.md`, `ossa-lite-tasks.md`. Verify: `bash conformance/ossa-gate.sh`.
-- **Optimiser scrapped + perf closed.** No in-house optimiser; `--release` = LLVM `default<O3>` +
-  vectorization. ARC-forwarding measured at ~0 headroom (two independent measurements). Rationale:
-  `sil-arc-optimiser-direction.md`. Do NOT reintroduce an optimiser without a measured delta.
+- **Gap 3 (optimiser / ARC-perf) CLOSED.** No in-house optimiser; `--release` = LLVM `default<O3>` +
+  vectorization. ARC-forwarding measured at ~0 headroom twice (E2 + Track A), re-verified fresh. The only
+  perf lever left = allocation count = Gap 5 (separate/optional). Closure of record: `done/gap3-closed.md`;
+  rationale: `sil-arc-optimiser-direction.md`. Do NOT reintroduce an optimiser without a measured delta.
 - **Static delivery.** `release.yml` publishes 6 self-contained bundles (mac/linux static, windows +bundled
   `LLVM-C.dll`). See `remaining-gaps-design.md` Gap 2. No mirror work needed.
 

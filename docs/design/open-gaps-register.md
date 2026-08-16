@@ -30,11 +30,12 @@ The reframing (`swift-arch-comparison.md`) established these were one gap: Nova 
   stdlib). Could widen the case list or make `NOVA_OSSA=hard` a dedicated CI leg over the whole corpus.
   A full-corpus sweep this session confirmed **0 imbalances across 329 cases** (`bad=[]`), so the hard gate
   cannot false-fail a legitimate build and widening the gate's case list is safe. **[verified]**
-- ✅ **Perf — measured and CLOSED, not deferred.** Two independent measurements (E2 borrow-skip at the
-  LLVM level, Track A redundant-copy on the OSSA IR) both found ~0 headroom. Nova's ARC cost is
-  fundamental per-object retain/release for genuinely-owned values; forwarding cannot remove it. No work
-  item unless the real lever — reducing per-request allocation COUNT (arena/value-types, architectural,
-  partly explored in P7) — is pursued. **[verified]** Doc: `sil-arc-optimiser-direction.md`.
+- ✅ **Perf (Gap 3) — CLOSED as resolved (2026-08-16), not deferred.** Optimiser scrapped; two independent
+  measurements (E2 borrow-skip at the LLVM level, Track A redundant-copy on the OSSA IR) both found ~0
+  headroom, re-verified fresh on `13_serde` (borrow-skip 0/0, forwarding 0/0). Nova's ARC cost is
+  fundamental per-object retain/release; forwarding cannot remove it; LLVM O3 already gives competitive
+  codegen. The only remaining perf lever = per-request allocation COUNT = **Gap 5, separate + optional**.
+  Full closure of record: `done/gap3-closed.md`. **[verified]**
 
 ## B. Previously-tracked language crash bugs — ALL MARKED FIXED (do not treat as open) **[register]**
 Each has a memory note stating it is resolved, with a pinned conformance case. Listed so they are not
