@@ -139,8 +139,26 @@ fn lowerSeq(ctx: *Ctx, block: ir.Block, stmts: []const ast.Statement, locals: *L
                     .fallthrough => |exit| cur = exit,
                 }
             },
+            .switch_stmt => |sw| {
+                switch (try lowerSwitch(ctx, cur, &sw, locals)) {
+                    .terminated => return .terminated,
+                    .fallthrough => |join| cur = join,
+                }
+            },
+            .block => |b| {
+                // A nested bare block is a lexical scope in the SAME control-flow path: its locals are
+                // dropped at its end. (Also how the for-in desugaring nests the user's original body.)
+                const mark = locals.items.len;
+                switch (try lowerSeq(ctx, cur, b.statements, locals)) {
+                    .terminated => return .terminated,
+                    .fallthrough => |nb| {
+                        cur = nb;
+                        try dropScope(ctx, cur, locals, mark);
+                    },
+                }
+            },
             .defer_stmt => return error.Defer,
-            else => return error.Defer, // switch / nested bare block: not modelled yet
+            else => return error.Defer,
         }
     }
     return .{ .fallthrough = cur };
@@ -209,12 +227,12 @@ fn lowerIf(ctx: *Ctx, entry_block: ir.Block, iff: *const ast.IfStmt, locals: *Lo
     return if (any_fallthrough) .{ .fallthrough = join_block } else .terminated;
 }
 
-/// Lower `while (cond) body`. The body is its own lexical scope on a CLONE of `locals`, so it may now
-/// declare its own owned locals (dropped at the end of each iteration). That keeps the body-exit live
-/// set equal to the header entry set, which is exactly what the verifier's back-edge check requires.
-fn lowerWhile(ctx: *Ctx, entry_block: ir.Block, w: *const ast.WhileStmt, locals: *Locals) LowerError!ir.Block {
-    const body_stmts = branchStmts(w.body) orelse return error.Defer;
-
+/// The shared loop shape: entry -> header; header -cond-> body/exit; body -> header (back-edge). The
+/// body is its own lexical scope on a CLONE of `locals`, so it may declare its own owned locals (dropped
+/// at the end of each iteration) — which keeps the body-exit live set equal to the header entry set, the
+/// verifier's back-edge requirement. The exit block is allocated LAST so only the back-edge decreases in
+/// index. Returns the exit block.
+fn lowerLoop(ctx: *Ctx, entry_block: ir.Block, body_stmts: []const ast.Statement, locals: *Locals) LowerError!ir.Block {
     const header = try ctx.f.newBlock(ctx.gpa);
     ctx.f.setTerm(entry_block, .{ .br = header });
     const cond = try ctx.f.makeTrivial(ctx.gpa, header, null);
@@ -233,40 +251,86 @@ fn lowerWhile(ctx: *Ctx, entry_block: ir.Block, w: *const ast.WhileStmt, locals:
     return exit_block;
 }
 
-/// Lower a C-style `for (init; cond; incr) body`. The for-in iterator form defers (element ownership is
-/// a later slice). The initializer's binding is scoped to the loop (dropped after). The increment is a
-/// trivial-counter update (a borrow) and is not modelled. The body is its own scope on a clone.
+fn lowerWhile(ctx: *Ctx, entry_block: ir.Block, w: *const ast.WhileStmt, locals: *Locals) LowerError!ir.Block {
+    const body_stmts = branchStmts(w.body) orelse return error.Defer;
+    return lowerLoop(ctx, entry_block, body_stmts, locals);
+}
+
+/// Lower a `for` loop, both the C-style `for (init; cond; incr)` and the `for (item in iterable)` form.
+/// C-style: the init binding is scoped to the loop (dropped after); the increment is a trivial-counter
+/// borrow (not modelled). For-in: the loop variable is a BORROW of an element (the iterable retains its
+/// own storage), so it is not tracked — modelling it as a borrow is sound (it can only miss an owned
+/// element leak, never invent a false imbalance). Either way the body is its own scope on a clone.
 fn lowerFor(ctx: *Ctx, entry_block: ir.Block, fr: *const ast.ForStmt, locals: *Locals) LowerError!Flow {
-    if (fr.iterator != null) return error.Defer; // for-in: element ownership not modelled yet
     const body_stmts = branchStmts(fr.body) orelse return error.Defer;
 
-    const for_mark = locals.items.len;
+    if (fr.iterator != null) {
+        // for-in: loop variable borrowed, no init/increment scope to drop.
+        return .{ .fallthrough = try lowerLoop(ctx, entry_block, body_stmts, locals) };
+    }
 
-    // initializer (usually `let i = 0` — trivial, ignored; an owned init is recorded and dropped after).
+    const for_mark = locals.items.len;
     if (fr.initializer) |istmt| switch (istmt.*) {
         .let_stmt => |ls| try lowerLet(ctx, entry_block, &ls, locals),
         .expr_stmt => |es| if (isLocalReassign(&es.expr, locals.items)) return error.Defer,
         else => return error.Defer,
     };
-
-    const header = try ctx.f.newBlock(ctx.gpa);
-    ctx.f.setTerm(entry_block, .{ .br = header });
-    const cond = try ctx.f.makeTrivial(ctx.gpa, header, null);
-    const body_block = try ctx.f.newBlock(ctx.gpa);
-
-    var body_locals = try cloneLocals(ctx.gpa, locals);
-    defer body_locals.deinit(ctx.gpa);
-    const body_flow = try lowerBlockScope(ctx, body_block, body_stmts, &body_locals);
-
-    const exit_block = try ctx.f.newBlock(ctx.gpa); // highest index
-    ctx.f.setTerm(header, .{ .cond_br = .{ .cond = cond, .then_blk = body_block, .else_blk = exit_block } });
-    switch (body_flow) {
-        .fallthrough => |b| ctx.f.setTerm(b, .{ .br = header }), // back-edge
-        .terminated => {},
-    }
-    // Drop the for-scope binding(s) (the loop variable if it was owned) after the loop.
-    try dropScope(ctx, exit_block, locals, for_mark);
+    const exit_block = try lowerLoop(ctx, entry_block, body_stmts, locals);
+    try dropScope(ctx, exit_block, locals, for_mark); // drop the loop variable if it was owned
     return .{ .fallthrough = exit_block };
+}
+
+/// Lower a `switch`. The discriminant is a borrow. Each case body and the default are their own lexical
+/// scopes (on clones) that join afterwards; the verifier requires every joining predecessor's exit live
+/// set to match. Cases with a guard (`case v if cond:`) fall through to default on guard-false, which is
+/// a control-flow shape this slice does not model, so a guarded switch defers.
+fn lowerSwitch(ctx: *Ctx, entry_block: ir.Block, sw: *const ast.SwitchStmt, locals: *Locals) LowerError!Flow {
+    for (sw.cases) |c| if (c.guard != null) return error.Defer;
+
+    const case_blocks = try ctx.gpa.alloc(ir.Block, sw.cases.len);
+    errdefer ctx.gpa.free(case_blocks);
+    const case_flows = try ctx.gpa.alloc(Flow, sw.cases.len);
+    defer ctx.gpa.free(case_flows);
+
+    // Lower each case body into its own block+scope. Blocks are allocated before the join (below).
+    for (sw.cases, 0..) |c, i| {
+        const body_stmts = branchStmts(c.body) orelse return error.Defer; // errdefer frees case_blocks
+        case_blocks[i] = try ctx.f.newBlock(ctx.gpa);
+        var case_locals = try cloneLocals(ctx.gpa, locals);
+        defer case_locals.deinit(ctx.gpa);
+        case_flows[i] = try lowerBlockScope(ctx, case_blocks[i], body_stmts, &case_locals);
+    }
+
+    // default (if present): its own block+scope.
+    var default_block: ?ir.Block = null;
+    var default_flow: Flow = .{ .fallthrough = undefined };
+    var has_default_fallthrough = true; // no default => the no-match path falls straight to join
+    if (sw.default_case) |dstmt| {
+        const dstmts = branchStmts(dstmt) orelse return error.Defer; // errdefer frees case_blocks
+        default_block = try ctx.f.newBlock(ctx.gpa);
+        var default_locals = try cloneLocals(ctx.gpa, locals);
+        defer default_locals.deinit(ctx.gpa);
+        default_flow = try lowerBlockScope(ctx, default_block.?, dstmts, &default_locals);
+        has_default_fallthrough = (default_flow == .fallthrough);
+    }
+
+    const join_block = try ctx.f.newBlock(ctx.gpa); // highest index
+    ctx.f.setTerm(entry_block, .{ .switch_br = .{ .cases = case_blocks, .default_blk = default_block orelse join_block } });
+
+    var any_fallthrough = has_default_fallthrough;
+    for (case_flows) |cf| switch (cf) {
+        .fallthrough => |b| {
+            ctx.f.setTerm(b, .{ .br = join_block });
+            any_fallthrough = true;
+        },
+        .terminated => {},
+    };
+    if (default_block) |_| switch (default_flow) {
+        .fallthrough => |b| ctx.f.setTerm(b, .{ .br = join_block }),
+        .terminated => {},
+    };
+
+    return if (any_fallthrough) .{ .fallthrough = join_block } else .terminated;
 }
 
 /// Destroy the still-live locals THIS scope declared (index >= mark) in `block`, in reverse order, then

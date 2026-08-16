@@ -99,6 +99,10 @@ pub fn verify(gpa: std.mem.Allocator, func: *const ir.Func) !Result {
                 try edge(gpa, &diags, entry, @intFromEnum(cb.then_blk), &live);
                 try edge(gpa, &diags, entry, @intFromEnum(cb.else_blk), &live);
             },
+            .switch_br => |sb| {
+                for (sb.cases) |c| try edge(gpa, &diags, entry, @intFromEnum(c), &live);
+                try edge(gpa, &diags, entry, @intFromEnum(sb.default_blk), &live);
+            },
             .unreach => {},
         };
     }

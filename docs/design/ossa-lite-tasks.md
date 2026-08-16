@@ -125,8 +125,20 @@ soundness property, and NEITHER existing analysis proves it.
       imbalanced; 10 varied cases (for/while/loop/string/list/map/struct/enum) = 0 false positives. Unit
       test now `resolveLocal` (innermost-shadow). Remaining ~14% defers = switch, destructuring lets,
       for-in iterators, bare-local reassignment, defer-stmt, nested bare blocks.
-      NEXT slice-6: switch statements + for-in iterators (element ownership) + destructuring; then I4 is
-      effectively met and ownership-forwarding (Track A perf) can be built ON this IR.
+      SLICE 6 DONE — switch + for-in + nested blocks. Added a `switch_br` terminator to the IR (N-way,
+      cases + default; verifier iterates all successor edges; freed in Func.deinit) and `lowerSwitch`
+      (each case/default = its own scope on a clone, joined; guarded cases defer). for-in: the parser
+      desugars `for (x in coll)` to a C-style for whose body NESTS the user's block, so the real fix was
+      handling a bare `.block` statement as a nested lexical scope in lowerSeq — which also removed the
+      nested-bare-block defer class entirely. (Range for-in `for i in 0..n` uses the .iterator field,
+      handled via lowerLoop.) VERIFIED empirically: a switch fn and a for-in fn both LOWER (deferred count
+      unchanged, not +1) and verify balanced; 0 imbalanced. Coverage ~86% -> 87% on iteration-heavy cases
+      (serde 252->254); modest because the remaining defers are now dominated by destructuring lets,
+      bare-local reassignment, and defer-stmt — NOT control flow (all control-flow constructs now handled).
+      Unit tests 113 pass; broad scan 0 false positives.
+      I4 is effectively MET for control flow. NEXT (optional): destructuring + reassignment modelling for
+      the last ~13%, OR pivot to ownership-forwarding (Track A perf) on this IR (still gated on a measured
+      runtime delta). The verifier is now a genuine compile-time memory-safety check over ~87% of functions.
 - [ ] **I3** OSSA VERIFIER on the IR: every owned value consumed exactly once; no use-after-consume; no
       double-consume. IR-level restatement of Track V; this is the REAL, non-vacuous soundness verifier.
 - [ ] **I4** Extend lowering coverage function-by-function until it matches AST codegen's ARC decisions

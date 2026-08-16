@@ -82,6 +82,10 @@ pub const Terminator = union(enum) {
     br: Block,
     /// conditional branch on a trivial value.
     cond_br: struct { cond: Value, then_blk: Block, else_blk: Block },
+    /// N-way dispatch (a `switch`): one successor per case plus a default. The discriminant is a borrow,
+    /// so it is not represented — only the ownership-relevant successor edges are. `cases` is owned by the
+    /// Func and freed in deinit.
+    switch_br: struct { cases: []Block, default_blk: Block },
     /// no successor (diverges / trap).
     unreach,
 };
@@ -110,7 +114,13 @@ pub const Func = struct {
     blocks: std.ArrayListUnmanaged(BasicBlock) = .empty,
 
     pub fn deinit(self: *Func, gpa: std.mem.Allocator) void {
-        for (self.blocks.items) |*b| b.instrs.deinit(gpa);
+        for (self.blocks.items) |*b| {
+            b.instrs.deinit(gpa);
+            if (b.term) |t| switch (t) {
+                .switch_br => |sb| gpa.free(sb.cases),
+                else => {},
+            };
+        }
         self.blocks.deinit(gpa);
         self.values.deinit(gpa);
     }
