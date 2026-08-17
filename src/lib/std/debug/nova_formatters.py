@@ -82,8 +82,86 @@ def _count(n):
     return "%d element%s" % (n, "" if n == 1 else "s")
 
 
-# List<T> is a value struct { data ptr @0 -> RawBuffer, len int @8, cap int @12 }. size() is
-# data.count() = the shared RawBuffer's len @12, which is authoritative; read via the data pointer.
+# The compiler names a container DIType with its element type: List<i32>, List<string>, List<Point>,
+# List<List<i32>>, ... Parse the OUTERMOST element out of "List<...>".
+def _elem_name(type_name):
+    if not type_name:
+        return None
+    i = type_name.find("<")
+    if i < 0 or not type_name.endswith(">"):
+        return None
+    return type_name[i + 1:-1].strip()
+
+
+# RawBuffer slots are UNIFORM 8 bytes (Nova's i64 value-slot model): a primitive occupies the low bytes
+# of an 8-byte slot, a boxed element (string/class/nested container) is an 8-byte pointer. So the element
+# STRIDE is always 8; only the DISPLAY type varies (an `int` reads 4 bytes at the slot start, etc.).
+# (Inline value-struct elements, which have a real-width stride, are a known follow-up.)
+_ELEM_SLOT = 8
+_PRIM = {
+    "i8": "signed char", "u8": "unsigned char", "bool": "bool",
+    "i16": "short", "u16": "unsigned short",
+    "i32": "int", "u32": "unsigned int", "int": "int", "uint": "unsigned int",
+    "i64": "long long", "u64": "unsigned long long", "long": "long long",
+    "f32": "float", "f64": "double", "float": "double",
+}
+
+
+def _elem_type(target, elem):
+    # returns the SBType to display an element as (or None). Stride is always _ELEM_SLOT.
+    if elem in _PRIM:
+        t = target.FindFirstType(_PRIM[elem])
+        return t if t and t.IsValid() else None
+    # string / class / nested container: the slot holds an 8-byte pointer; render via the Nova type's own
+    # typedef (its summary/synthetic then applies) -- e.g. `string`, a struct typedef, or `List<...>`.
+    t = target.FindFirstType(elem)
+    if not (t and t.IsValid()):
+        t = target.FindFirstType("string")
+    return t if t and t.IsValid() else None
+
+
+# List<T> value struct { data ptr @0 -> RawBuffer, len @8, cap @12 }; RawBuffer { data @0 (element run),
+# cap @8, len @12 }. The synthetic children read the run and present each element as its real type.
+class ListChildren(object):
+    def __init__(self, valobj, internal_dict):
+        self.valobj = valobj
+        self.count = 0
+        self.base = 0
+        self.etype = None
+
+    def update(self):
+        try:
+            proc = self.valobj.GetProcess()
+            lp = self.valobj.GetValueAsUnsigned(0)
+            rb = _read_ptr(proc, lp)
+            if not rb:
+                self.count = 0
+                return False
+            self.count = max(0, _read_i32(proc, rb + 12) or 0)
+            self.base = _read_ptr(proc, rb) or 0
+            self.etype = _elem_type(self.valobj.GetTarget(), _elem_name(self.valobj.GetTypeName()) or "")
+        except Exception:
+            self.count = 0
+        return False
+
+    def num_children(self):
+        return min(self.count, 4096)
+
+    def get_child_index(self, name):
+        try:
+            return int(name.strip("[]"))
+        except Exception:
+            return -1
+
+    def get_child_at_index(self, i):
+        if i < 0 or i >= self.count or not self.etype or not _plausible(self.base):
+            return None
+        try:
+            return self.valobj.CreateValueFromAddress("[%d]" % i, self.base + i * _ELEM_SLOT, self.etype)
+        except Exception:
+            return None
+
+
 def nova_list_summary(valobj, internal_dict):
     try:
         ptr = valobj.GetValueAsUnsigned(0)
@@ -97,7 +175,8 @@ def nova_list_summary(valobj, internal_dict):
         return "List"
 
 
-# Map<K,V> is a class { cap int @0, len int @4, ... }. len is the live count.
+# Map<K,V> class { cap @0, len @4, ... }; Set<T> class { map ptr @0 }. Count only (open-addressing makes
+# element expansion non-trivial; a follow-up can walk the slot table).
 def nova_map_summary(valobj, internal_dict):
     try:
         ptr = valobj.GetValueAsUnsigned(0)
@@ -108,7 +187,6 @@ def nova_map_summary(valobj, internal_dict):
         return "Map"
 
 
-# Set<T> is a class { map: Map<T,bool> ptr @0 }, so its count is that Map's len @4.
 def nova_set_summary(valobj, internal_dict):
     try:
         ptr = valobj.GetValueAsUnsigned(0)
@@ -124,12 +202,11 @@ def nova_set_summary(valobj, internal_dict):
 
 
 def __lldb_init_module(debugger, internal_dict):
-    debugger.HandleCommand(
-        "type summary add -F nova_formatters.nova_string_summary string"
-    )
-    # Container element COUNT (T-independent). Reliable at a statement boundary now that expression
-    # statements carry the correct line (the earlier "stale count" was a debug line off-by-one, not a
-    # value-struct-copy divergence). Per-element expansion still needs the element type in the DIType name.
-    debugger.HandleCommand("type summary add -F nova_formatters.nova_list_summary List")
-    debugger.HandleCommand("type summary add -F nova_formatters.nova_map_summary Map")
-    debugger.HandleCommand("type summary add -F nova_formatters.nova_set_summary Set")
+    debugger.HandleCommand("type summary add -F nova_formatters.nova_string_summary string")
+    # Containers are named with their element type (List<i32>, List<string>, ...). Match by regex.
+    # List gets a summary (element count) AND a synthetic child provider so it expands to [0],[1],... .
+    # The summary also overrides the bogus char* rendering of the typedef's u8 pointee.
+    debugger.HandleCommand('type summary add -x "^List<" -F nova_formatters.nova_list_summary')
+    debugger.HandleCommand('type synthetic add -x "^List<" --python-class nova_formatters.ListChildren')
+    debugger.HandleCommand('type summary add -x "^Map<" -F nova_formatters.nova_map_summary')
+    debugger.HandleCommand('type summary add -x "^Set<" -F nova_formatters.nova_set_summary')

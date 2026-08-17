@@ -601,12 +601,14 @@ pub const LlvmCompiler = struct {
             // Python. Nested struct/container FIELDS still render as opaque addresses (see diFieldType);
             // the optional Python formatter enriches containers.
             const base = getStructBaseName(tn);
-            if (self.structs.get(base) != null) return self.diStructType(base);
-            // Containers (List/Map/Set): dynamic length is not expressible via the LLVM C DWARF API, so
-            // give the local a NAMED pointer typedef (name carries the instantiation, e.g. "List<int>")
-            // so it appears in the Variables panel, and the optional Python formatter reads its elements.
+            // Containers (List/Map/Set) FIRST -- even though List is a struct, showing its raw data/len/cap
+            // fields is useless; instead give it a NAMED pointer typedef whose name carries the element
+            // type (e.g. "List<int>") so the Python synthetic-children provider can expand its elements.
             if (std.mem.eql(u8, base, "List") or std.mem.eql(u8, base, "Map") or std.mem.eql(u8, base, "Set"))
                 return self.diContainerType(tn);
+            // A struct local: the i64 slot holds a POINTER to the heap struct. Native pointer-to-struct
+            // DIType so lldb / the VS Code Variables panel expand its fields with no Python.
+            if (self.structs.get(base) != null) return self.diStructType(base);
         }
         return null;
     }

@@ -284,6 +284,25 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
                                 }
                             }
                         }
+                        // Containers: the element type is what makes the debugger able to expand elements,
+                        // but current_local_types/resolveExpressionTypeName often give the bare base ("List").
+                        // Override with the fully-qualified symbolName(tid) (e.g. "List_i32") when the resolved
+                        // name is a bare container base, so diContainerType names the typedef with the element.
+                        if (lt_name) |ln| {
+                            const b = @import("types.zig").getStructBaseName(ln);
+                            const is_container = std.mem.eql(u8, b, "List") or std.mem.eql(u8, b, "Map") or std.mem.eql(u8, b, "Set");
+                            if (is_container and std.mem.eql(u8, ln, b)) { // bare "List"/"Map"/"Set", no args
+                                if (self.current_local_type_ids) |ids| {
+                                    if (ids.get(ls.name)) |tid| {
+                                        if (self.symbolName(tid)) |nm| {
+                                            if (owned) |o| self.allocator.free(o);
+                                            owned = nm;
+                                            lt_name = nm;
+                                        } else |_| {}
+                                    }
+                                }
+                            }
+                        }
                         self.declareLocalVar(alloca_val, ls.name, lt_name, slot_ty);
                         if (owned) |o| self.allocator.free(o);
                     }
