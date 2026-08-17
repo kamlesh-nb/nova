@@ -2,11 +2,13 @@
 const std = @import("std");
 const ast = @import("../../frontend/ast.zig");
 const sema_mono = @import("../../frontend/sema/mono.zig");
+const sema_reach = @import("../../frontend/sema/reach.zig");
 const llvm = @import("llvm");
 
 const types = llvm.types;
 const core = llvm.core;
 const target = llvm.target;
+const debug = llvm.debug;
 const target_machine = llvm.target_machine;
 const analysis = llvm.analysis;
 const coverage_mod = @import("coverage.zig");
@@ -104,11 +106,33 @@ pub const PendingTemp = struct {
 // the target triple; the SIMD builtins pick the right LLVM intrinsic (or the software fallback) from it.
 pub const SimdTarget = enum { none, aarch64, x86_64 };
 
+// Identity key for interning substTypeParams results. Interned/AST strings have stable pointers for the
+// duration of a compile, so (ptr,len) identifies the input and current instantiation uniquely.
+pub const SubstKey = struct { in_ptr: usize, in_len: usize, inst_ptr: usize, inst_id: u32 };
+
 pub const LlvmCompiler = struct {
     allocator: std.mem.Allocator,
     module: types.LLVMModuleRef,
     builder: types.LLVMBuilderRef,
     target_machine: types.LLVMTargetMachineRef,
+    // DWARF debug info (Gap 4). Only populated in debug (non-release) builds: locals are only
+    // reliable at -O0, so debugging is a debug-build activity. `di_builder` null => emit nothing.
+    // `di_scope` is the current function's DISubprogram, set per-function so statement debug
+    // locations attach to the right scope.
+    di_builder: types.LLVMDIBuilderRef = null,
+    di_cu: types.LLVMMetadataRef = null,
+    di_file: types.LLVMMetadataRef = null,
+    di_scope: types.LLVMMetadataRef = null,
+    di_scope_file: types.LLVMMetadataRef = null,
+    debug_enabled: bool = false,
+    // DIFile per source path (Span.file), so per-function debug info attributes to the right file
+    // in a merged multi-file program. Keyed by the source path string.
+    di_files: std.StringHashMap(types.LLVMMetadataRef) = undefined,
+    // Cached DIType per primitive type name (int/bool/f64/...), so N variables share one type node.
+    di_types: std.StringHashMap(types.LLVMMetadataRef) = undefined,
+    // Names already given a DILocalVariable in the current function, so the pre-alloc declare and the
+    // per-let declare don't emit two for the same variable. Cleared per function.
+    dbg_declared: std.StringHashMap(void) = undefined,
     functions: std.ArrayList(FunctionInfo),
     strings: std.ArrayList([]const u8),
     scopes: std.ArrayList(Scope),
@@ -224,6 +248,15 @@ pub const LlvmCompiler = struct {
     val_type: types.LLVMTypeRef,
 
     string_globals: std.StringHashMap(types.LLVMValueRef),
+    // Interns rendered type names by TypeId. resolveExpressionTypeName is called per-expression across the
+    // whole program and used to allocate a fresh renderLegacy string every call that NO caller freed -- a
+    // codegen-wide leak (tens of GB on a large app). Rendering is a pure function of the TypeId, so cache it:
+    // one owned string per distinct TypeId, freed at deinit; callers borrow and never free.
+    type_name_cache: std.AutoHashMapUnmanaged(sema_types.TypeId, []const u8) = .empty,
+    // Interns substTypeParams results. Keyed by (input string identity, current instantiation string
+    // identity, current instantiation id). substTypeParams allocates a fresh substituted name per call
+    // that callers (symbolName/resolveExpressionTypeName) never freed -- a per-expression codegen leak.
+    subst_cache: std.AutoHashMapUnmanaged(SubstKey, []const u8) = .empty,
     // Interns decimal literals (`0m`, `2m`, ...) to a lazily-initialised, immortal-pinned global so a literal
     // parses+allocates ONCE per program run instead of on every evaluation. Keyed by the literal's digits.
     decimal_globals: std.StringHashMap(types.LLVMValueRef),
@@ -298,7 +331,26 @@ pub const LlvmCompiler = struct {
         const layout = target_machine.LLVMCreateTargetDataLayout(tm);
         target.LLVMSetModuleDataLayout(module, layout);
 
+        // DWARF debug info (Gap 4): only in debug builds (locals are unreliable at -O3). Create the
+        // DIBuilder now; the compile unit + per-file DIFiles are built lazily on first function emit
+        // (the source path lives on each node's Span, not available here). Module flags declare the
+        // DWARF + debug-metadata versions so lldb reads the info.
+        const dbg_on = !is_release and !is_wasm;
+        var di_builder: types.LLVMDIBuilderRef = null;
+        if (dbg_on) {
+            di_builder = debug.LLVMCreateDIBuilder(module);
+            const md_dwarf = core.LLVMValueAsMetadata(core.LLVMConstInt(core.LLVMInt32Type(), 4, 0));
+            const md_debug = core.LLVMValueAsMetadata(core.LLVMConstInt(core.LLVMInt32Type(), 3, 0));
+            core.LLVMAddModuleFlag(module, .LLVMModuleFlagBehaviorWarning, "Dwarf Version", "Dwarf Version".len, md_dwarf);
+            core.LLVMAddModuleFlag(module, .LLVMModuleFlagBehaviorWarning, "Debug Info Version", "Debug Info Version".len, md_debug);
+        }
+
         const compiler = LlvmCompiler{
+            .di_builder = di_builder,
+            .debug_enabled = dbg_on,
+            .di_files = std.StringHashMap(types.LLVMMetadataRef).init(allocator),
+            .di_types = std.StringHashMap(types.LLVMMetadataRef).init(allocator),
+            .dbg_declared = std.StringHashMap(void).init(allocator),
             .allocator = allocator,
             .module = module,
             .builder = builder,
@@ -365,12 +417,212 @@ pub const LlvmCompiler = struct {
         return compiler;
     }
 
+    // --- DWARF debug info (Gap 4) -----------------------------------------------------------------
+    // A DIFile for `path`, cached so a merged multi-file program reuses one file node per source.
+    // LLVM copies the name/dir into its context, so the null-terminated dupes are freed after the call.
+    fn diFileFor(self: *LlvmCompiler, path: []const u8) types.LLVMMetadataRef {
+        if (self.di_builder == null) return null;
+        if (self.di_files.get(path)) |f| return f;
+        const slash = std.mem.lastIndexOfScalar(u8, path, '/');
+        const dir_s = if (slash) |s| path[0..s] else ".";
+        const base_s = if (slash) |s| path[s + 1 ..] else path;
+        const base_z = self.allocator.dupeZ(u8, base_s) catch return null;
+        defer self.allocator.free(base_z);
+        const dir_z = self.allocator.dupeZ(u8, dir_s) catch return null;
+        defer self.allocator.free(dir_z);
+        const f = debug.LLVMDIBuilderCreateFile(self.di_builder, base_z.ptr, base_s.len, dir_z.ptr, dir_s.len);
+        self.di_files.put(path, f) catch {};
+        return f;
+    }
+
+    // Lazily create the compile unit on the first function emitted, using its source file as primary.
+    fn ensureDebugCU(self: *LlvmCompiler, path: []const u8) void {
+        if (self.di_builder == null or self.di_cu != null) return;
+        self.di_file = self.diFileFor(path);
+        self.di_cu = debug.LLVMDIBuilderCreateCompileUnit(
+            self.di_builder,
+            .LLVMDWARFSourceLanguageC99,
+            self.di_file,
+            "nova",
+            "nova".len,
+            0,
+            "",
+            0,
+            0,
+            "",
+            0,
+            .LLVMDWARFEmissionFull,
+            0,
+            0,
+            0,
+            "",
+            0,
+            "",
+            0,
+        );
+    }
+
+    // Attach a DISubprogram to `fn_val` and set it as the active scope, so breakpoints / step / call
+    // stack resolve to this function. Item-2 will flesh out the subroutine type with real DITypes;
+    // for the line-table MVP a "void()" signature is enough for line/scope info.
+    pub fn beginFunctionDebug(self: *LlvmCompiler, fn_val: types.LLVMValueRef, name: []const u8, file: []const u8, line: usize) void {
+        self.di_scope = null; // reset first so a no-file function never inherits the prior scope
+        self.di_scope_file = null;
+        if (self.debug_enabled) self.dbg_declared.clearRetainingCapacity();
+        // Clear the builder's current debug location too: instructions in a function WITHOUT a
+        // DISubprogram must carry no !dbg (else the verifier rejects a location whose scope is another
+        // function). This runs for every function, so cross-function contamination cannot happen.
+        core.LLVMSetCurrentDebugLocation2(self.builder, null);
+        if (self.di_builder == null or file.len == 0) return;
+        self.ensureDebugCU(file);
+        const dif = self.diFileFor(file);
+        self.di_scope_file = dif;
+        var params0 = [_]types.LLVMMetadataRef{null}; // element 0 = return type (null => void)
+        const subr = debug.LLVMDIBuilderCreateSubroutineType(self.di_builder, dif, &params0, 1, .LLVMDIFlagZero);
+        const name_z = self.allocator.dupeZ(u8, name) catch return;
+        defer self.allocator.free(name_z);
+        const ln: c_uint = @intCast(if (line == 0) 1 else line);
+        const sp = debug.LLVMDIBuilderCreateFunction(
+            self.di_builder,
+            dif,
+            name_z.ptr,
+            name.len,
+            name_z.ptr,
+            name.len,
+            dif,
+            ln,
+            subr,
+            0,
+            1,
+            ln,
+            .LLVMDIFlagZero,
+            0,
+        );
+        debug.LLVMSetSubprogram(fn_val, sp);
+        self.di_scope = sp;
+        // Initial location at the function line so prologue instructions (allocas, ARC retains)
+        // carry a !dbg before the first statement updates it -- the verifier requires it on calls.
+        self.setDebugLoc(line, 0);
+    }
+
+    // Set the IR builder's current debug location to (line, col) within the active function scope.
+    // A no-op unless a DISubprogram scope is live. Instructions emitted after this carry the location.
+    pub fn setDebugLoc(self: *LlvmCompiler, line: usize, col: usize) void {
+        if (self.di_scope == null) return;
+        const loc = debug.LLVMDIBuilderCreateDebugLocation(
+            core.LLVMGetGlobalContext(),
+            @intCast(if (line == 0) 1 else line),
+            @intCast(col),
+            self.di_scope,
+            null,
+        );
+        core.LLVMSetCurrentDebugLocation2(self.builder, loc);
+    }
+
+    // Cached DIBasicType for a primitive. `encoding` is a raw DWARF DW_ATE_* value.
+    fn diBasicType(self: *LlvmCompiler, name: []const u8, size_bits: u64, encoding: c_uint) types.LLVMMetadataRef {
+        if (self.di_types.get(name)) |t| return t;
+        const name_z = self.allocator.dupeZ(u8, name) catch return null;
+        defer self.allocator.free(name_z);
+        const t = debug.LLVMDIBuilderCreateBasicType(self.di_builder, name_z.ptr, name.len, size_bits, encoding, .LLVMDIFlagZero);
+        self.di_types.put(name, t) catch {};
+        return t;
+    }
+
+    // DIType for a local's declared type + its LLVM slot type. Item 2 slice A handles only the
+    // primitives whose value is the slot itself: float (double slot) and int/bool (i64 slot). Pointer /
+    // struct / string / any slots return null and stay undeclared until their DITypes + lldb formatters
+    // land (items 2b/2c/3) -- better an omitted variable than one that shows a raw pointer as an int.
+    // DWARF encodings: DW_ATE_boolean=2, DW_ATE_float=4, DW_ATE_signed=5.
+    fn diTypeFor(self: *LlvmCompiler, type_name: ?[]const u8, slot_ty: types.LLVMTypeRef) types.LLVMMetadataRef {
+        if (self.di_builder == null) return null;
+        const kind = core.LLVMGetTypeKind(slot_ty);
+        // float / f32 / f64 all live in a DOUBLE slot -> size to the slot (64 bits), DW_ATE_float=4.
+        if (kind == .LLVMDoubleTypeKind) return self.diBasicType("f64", 64, 4);
+        if (kind == .LLVMIntegerTypeKind) {
+            const tn = type_name orelse return null;
+            // Nova `string` is a pointer (i64 slot) to ARC-headered bytes (len i32 @ ptr-4, data @ ptr).
+            // Emit it as a pointer type NAMED "string" so lldb reports `(string)` and an lldb Python
+            // summary (item 3) can deref + read the length to show the CONTENTS instead of an address.
+            if (std.mem.eql(u8, tn, "string")) {
+                if (self.di_types.get("string")) |t| return t;
+                const char_t = self.diBasicType("char", 8, 6); // DW_ATE_signed_char
+                const strp = debug.LLVMDIBuilderCreatePointerType(self.di_builder, char_t, 64, 0, 0, "char", "char".len);
+                // Typedef the char pointer to "string" so lldb reports `(string)`, which the Nova lldb
+                // Python summary matches to read len@ptr-4 + the bytes (Nova strings are NOT NUL-terminated).
+                const strtd = debug.LLVMDIBuilderCreateTypedef(self.di_builder, strp, "string", "string".len, self.di_file, 0, self.di_cu, 0);
+                self.di_types.put("string", strtd) catch {};
+                return strtd;
+            }
+            if (types_mod.cgPrim(tn)) |p| {
+                if (p.repr == .word) return null; // raw ptr -> not a displayable scalar here
+                if (p.repr == .i1) return self.diBasicType("bool", 8, 2); // DW_ATE_boolean, reads low byte
+                if (p.repr == .f32 or p.repr == .f64) return null; // a float never lands in an int slot
+                // int-like: the value occupies the low bits of the i64 slot; DW_ATE_signed=5/unsigned=7.
+                return self.diBasicType(tn, 64, if (p.signed) 5 else 7);
+            }
+        }
+        return null;
+    }
+
+    // Emit a DILocalVariable + llvm.dbg.declare so `frame variable` / hover shows this local's real
+    // value. `storage` is the variable's alloca. No-op unless a debug scope is active and the declared
+    // type is a supported primitive.
+    pub fn declareLocalVar(self: *LlvmCompiler, storage: types.LLVMValueRef, name: []const u8, type_name: ?[]const u8, slot_ty: types.LLVMTypeRef) void {
+        if (self.di_scope == null or self.di_builder == null) return;
+        if (self.dbg_declared.contains(name)) return; // one DILocalVariable per name per function
+        const dtype = self.diTypeFor(type_name, slot_ty) orelse return;
+        self.dbg_declared.put(name, {}) catch {};
+        const name_z = self.allocator.dupeZ(u8, name) catch return;
+        defer self.allocator.free(name_z);
+        const v = debug.LLVMDIBuilderCreateAutoVariable(self.di_builder, self.di_scope, name_z.ptr, name.len, self.di_scope_file, 0, dtype, 0, .LLVMDIFlagZero, 0);
+        const expr = debug.LLVMDIBuilderCreateExpression(self.di_builder, null, 0);
+        var loc = core.LLVMGetCurrentDebugLocation2(self.builder);
+        if (loc == null) loc = debug.LLVMDIBuilderCreateDebugLocation(core.LLVMGetGlobalContext(), 1, 0, self.di_scope, null);
+        const bb = core.LLVMGetInsertBlock(self.builder);
+        _ = debug.LLVMDIBuilderInsertDeclareRecordAtEnd(self.di_builder, storage, v, expr, loc, bb);
+    }
+
+    // Sanitize + resolve debug metadata for `module` before it is verified/emitted. Runs per emitted
+    // module, so it must operate on the passed module (which under T6 split is a per-file CLONE), not
+    // self.module. A function DECLARATION (no basic blocks) must NOT carry a DISubprogram definition --
+    // the verifier rejects it ("declaration may only have a unique !dbg attachment"). We attach the
+    // subprogram when a body is emitted, but under T6 split a function defined in another file appears
+    // here as an external declaration still carrying its subprogram; strip it. LLVMDIBuilderFinalize
+    // resolves temporary MD in the original module and is a harmless no-op on the clones.
+    pub fn finalizeDebug(self: *LlvmCompiler, module: types.LLVMModuleRef) void {
+        const dib = self.di_builder orelse return;
+        var f = core.LLVMGetFirstFunction(module);
+        while (f != null) : (f = core.LLVMGetNextFunction(f)) {
+            if (core.LLVMCountBasicBlocks(f) == 0 and debug.LLVMGetSubprogram(f) != null) {
+                debug.LLVMSetSubprogram(f, null);
+            }
+        }
+        debug.LLVMDIBuilderFinalize(dib);
+    }
+
     pub fn deinit(self: *LlvmCompiler) void {
+        if (self.debug_enabled) {
+            self.di_files.deinit();
+            self.di_types.deinit();
+            self.dbg_declared.deinit();
+        }
         core.LLVMDisposeBuilder(self.builder);
         core.LLVMDisposeModule(self.module);
         target_machine.LLVMDisposeTargetMachine(self.target_machine);
-        for (self.functions.items) |func| {
-            self.allocator.free(func.param_names);
+        // param_names is allocated ONCE per method and SHARED across all its instantiations' FunctionInfos,
+        // so freeing per-FunctionInfo double-frees the same array. Dedup by pointer identity. (Under the old
+        // arena, free() was a no-op so this was harmless; under a real allocator it is a double-free.)
+        {
+            var freed = std.AutoHashMap(usize, void).init(self.allocator);
+            defer freed.deinit();
+            for (self.functions.items) |func| {
+                if (func.param_names.len == 0) continue;
+                const key = @intFromPtr(func.param_names.ptr);
+                if (freed.contains(key)) continue;
+                freed.put(key, {}) catch {};
+                self.allocator.free(func.param_names);
+            }
         }
         self.functions.deinit(self.allocator);
         self.strings.deinit(self.allocator);
@@ -1409,18 +1661,24 @@ pub const LlvmCompiler = struct {
 
     pub fn getFunctionParamType(self: *LlvmCompiler, func_name: []const u8, param_idx: usize) ?[]const u8 {
         const key = std.fmt.allocPrint(self.allocator, "{s}\x00{d}", .{ func_name, param_idx }) catch return self.getFunctionParamTypeUncached(func_name, param_idx);
+        // Return a BORROWED cache-owned pointer (the cache is freed at compiler deinit); callers never free it.
+        // Returning a fresh per-call dup instead leaked one allocation on EVERY call -- and this is called
+        // millions of times during codegen, so it accumulated to tens of GB on a large build.
         if (self.param_type_str_cache.get(key)) |cached| {
             self.allocator.free(key);
-            return if (cached) |c| (self.allocator.dupe(u8, c) catch null) else null;
+            return cached; // borrowed
         }
         const result = self.getFunctionParamTypeUncached(func_name, param_idx);
-        // Store an independent copy in the cache; the caller keeps `result`.
+        // Cache OWNS an independent copy and we return THAT (borrowed). `result` may be owned (typeRefToString)
+        // or borrowed (AST s.name) -- we can't tell, so we don't free it; it leaks at most once per distinct
+        // (func,param) key (bounded to thousands), never per-call.
         const stored: ?[]const u8 = if (result) |r| (self.allocator.dupe(u8, r) catch null) else null;
         self.param_type_str_cache.put(key, stored) catch {
             if (stored) |s| self.allocator.free(s);
             self.allocator.free(key);
+            return stored; // borrowed
         };
-        return result;
+        return stored; // borrowed
     }
 
     fn getFunctionParamTypeUncached(self: *LlvmCompiler, func_name: []const u8, param_idx: usize) ?[]const u8 {
@@ -1428,12 +1686,15 @@ pub const LlvmCompiler = struct {
             switch (decl) {
                 .fn_decl => |f| {
                     var name = f.name;
+                    var name_owned = false;
                     if (self.getModulePrefix(f.span)) |mod_prefix| {
+                        defer self.allocator.free(mod_prefix); // getModulePrefix returns owned memory
                         if (!LlvmCompiler.isAlreadyNamespaced(f.name)) {
                             name = std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ mod_prefix, f.name }) catch return null;
+                            name_owned = true;
                         }
                     }
-
+                    defer if (name_owned) self.allocator.free(name); // temp only used for the comparison
                     if (std.mem.eql(u8, name, func_name) or std.mem.eql(u8, f.name, func_name)) {
                         if (param_idx < f.params.len) {
                             if (f.params[param_idx].type_name) |t| {
@@ -1444,12 +1705,16 @@ pub const LlvmCompiler = struct {
                     }
                 },
                 .struct_decl => |s| {
+                    // instantiationsOf returns an OWNED slice (its ?[]const u8 elements are borrowed). It
+                    // depends only on `s`, so compute it ONCE per struct, free it, and reuse across methods --
+                    // computing+leaking it per method was O(structs*methods) leaked slices per call.
+                    const insts = self.instantiationsOf(s) catch continue;
+                    defer self.allocator.free(insts);
                     for (s.methods) |m| {
-
-                        const insts = self.instantiationsOf(s) catch continue;
                         for (insts) |inst_opt| {
                             const owner = inst_opt orelse s.name;
                             const full_name = self.methodSymbol(owner, m.decl.name) catch continue;
+                            defer self.allocator.free(full_name); // methodSymbol returns owned memory
                             if (!std.mem.eql(u8, full_name, func_name)) continue;
                             if (param_idx == 0) return s.name;
                             const is_constructor = std.mem.eql(u8, m.decl.name, "init") or std.mem.eql(u8, m.decl.name, "new");
@@ -1495,22 +1760,28 @@ pub const LlvmCompiler = struct {
             switch (decl) {
                 .fn_decl => |f| {
                     var name = f.name;
+                    var name_owned = false;
                     if (self.getModulePrefix(f.span)) |mod_prefix| {
+                        defer self.allocator.free(mod_prefix); // getModulePrefix returns owned memory
                         if (!LlvmCompiler.isAlreadyNamespaced(f.name)) {
                             name = std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ mod_prefix, f.name }) catch return null;
+                            name_owned = true;
                         }
                     }
+                    defer if (name_owned) self.allocator.free(name);
                     if (std.mem.eql(u8, name, func_name)) {
                         if (param_idx < f.params.len) return f.params[param_idx].type_name;
                         return null;
                     }
                 },
                 .struct_decl => |s| {
+                    const insts = self.instantiationsOf(s) catch continue; // owned slice; depends only on `s`
+                    defer self.allocator.free(insts);
                     for (s.methods) |m| {
-                        const insts = self.instantiationsOf(s) catch continue;
                         for (insts) |inst_opt| {
                             const owner = inst_opt orelse s.name;
                             const full_name = self.methodSymbol(owner, m.decl.name) catch continue;
+                            defer self.allocator.free(full_name); // methodSymbol returns owned memory
                             if (!std.mem.eql(u8, full_name, func_name)) continue;
                             if (param_idx == 0) return null;
                             const is_constructor = std.mem.eql(u8, m.decl.name, "init") or std.mem.eql(u8, m.decl.name, "new");
@@ -2108,7 +2379,7 @@ pub const LlvmCompiler = struct {
                 if (sema_shadow.report_enabled) {
                     if (!std.mem.eql(u8, mono_name, full_name)) {
                         sema_shadow.f45_erased_fallback += 1;
-                        sema_shadow.noteF45Erased(mono_name);
+                        sema_shadow.noteF45Erased(self.allocator, mono_name);
                     } else sema_shadow.f45_erased_nongeneric += 1;
                 }
             } else if (self.func_map.get(full_name_lower)) |val| {
@@ -2957,6 +3228,9 @@ pub const LlvmCompiler = struct {
                 try self.structs.put(self.scopedStructName(s.name, s.span.file), s);
                 for (s.methods) |method| {
                     const fn_decl = method.decl;
+                    // Gap 8 demand-mono gate: drop an uncalled non-constructor method of a GENERIC struct
+                    // for all its instantiations (context-insensitive). No-op unless NOVA_REACH_ON.
+                    if (s.type_params.len > 0 and !sema_reach.methodIsReachable(s.name, fn_decl.name)) continue;
                     const is_constructor = std.mem.eql(u8, fn_decl.name, "new") or std.mem.eql(u8, fn_decl.name, "init");
                     const param_names = try self.allocator.alloc([]const u8, if (is_constructor) fn_decl.params.len + 1 else fn_decl.params.len);
                     if (is_constructor) {
@@ -3358,7 +3632,7 @@ pub const LlvmCompiler = struct {
                     };
                 }
                 if (all_tid) {
-                    const added = sema_mono.noteFreeFnInst(&sm.store, callee_fd.name, callee_fid, callee_fd.type_params, tids);
+                    const added = sema_mono.noteFreeFnInst(self.allocator, &sm.store, callee_fd.name, callee_fid, callee_fd.type_params, tids);
                     if (added) {
                         // The inst_key is a deterministic intern of .struct_{callee_fid, tids}, so it equals
                         // whatever noteFreeFnInst stored; record the overlay directly from what we computed.
@@ -3371,7 +3645,7 @@ pub const LlvmCompiler = struct {
             }
         }
 
-        return sema_mono.noteFreeFnInstStr(callee_fd.name, callee_fd.type_params, rendered);
+        return sema_mono.noteFreeFnInstStr(self.allocator, callee_fd.name, callee_fd.type_params, rendered);
     }
 
     pub fn collectStringLiterals(self: *LlvmCompiler, program: ast.Program) anyerror!void {
@@ -3864,6 +4138,7 @@ pub const LlvmCompiler = struct {
     }
 
     pub const resolveExpressionTypeName = types_mod.resolveExpressionTypeName;
+    pub const cachedTypeName = types_mod.cachedTypeName;
     pub const scopedStructName = types_mod.scopedStructName;
     pub const scopedTypeName = types_mod.scopedTypeName;
     pub const isCollidingStruct = types_mod.isCollidingStruct;

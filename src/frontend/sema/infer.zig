@@ -59,8 +59,19 @@ pub const TypedIr = struct {
     pub fn deinit(self: *TypedIr, allocator: std.mem.Allocator) void {
         self.expr_types.deinit(allocator);
         self.expr_syms.deinit(allocator);
+        // Method-arg slices can alias (same heap slice reachable via more than one expr id), so a per-entry
+        // free double-frees under a real allocator. Dedup by pointer. (ArenaAllocator masked this: free was a no-op.)
+        var freed = std.AutoHashMap(usize, void).init(allocator);
         var mit = self.expr_method_args.valueIterator();
-        while (mit.next()) |v| allocator.free(v.*);
+        while (mit.next()) |v| {
+            if (v.*.len == 0) continue;
+            const gop = freed.getOrPut(@intFromPtr(v.*.ptr)) catch {
+                allocator.free(v.*);
+                continue;
+            };
+            if (!gop.found_existing) allocator.free(v.*);
+        }
+        freed.deinit();
         self.expr_method_args.deinit(allocator);
         self.expr_owned.deinit(allocator);
         self.expr_op.deinit(allocator);
@@ -985,7 +996,7 @@ pub const Inferer = struct {
                         defer self.allocator.free(args);
                         for (solved, 0..) |m, i| args[i] = m orelse try self.store.unresolvedT();
                         const inst_tid = try self.store.intern(.{ .struct_ = .{ .decl = sid, .args = args } });
-                        mono.noteForcedStructInst(inst_tid);
+                        mono.noteForcedStructInst(self.allocator, inst_tid);
                         return self.ok(inst_tid);
                     }
                     return self.ok(try self.store.intern(.{ .struct_ = .{ .decl = sid } }));
@@ -1288,7 +1299,7 @@ pub const Inferer = struct {
                                     }
                                 }
                                 if (all_concrete) {
-                                    _ = mono.noteFreeFnInst(self.store, n, fid, fd.type_params, args);
+                                    _ = mono.noteFreeFnInst(self.allocator, self.store, n, fid, fd.type_params, args);
                                 }
                                 return self.ok(sub);
                             }
@@ -1431,7 +1442,7 @@ pub const Inferer = struct {
                 solved_args[i] = bound;
             }
             if (all_concrete) {
-                _ = mono.noteFreeFnInst(self.store, fd.name, fid, fd.type_params, solved_args);
+                _ = mono.noteFreeFnInst(self.allocator, self.store, fd.name, fid, fd.type_params, solved_args);
                 // Record the SOLVED concrete type args on the call expression so codegen can rebuild the
                 // monomorphised name `fn__T` for a bare `fn(x)` call (no explicit `<T>` to mangle from).
                 // Reuses the same per-expression side table method calls use.
@@ -1779,9 +1790,9 @@ pub const Inferer = struct {
                 for (solved, 0..) |ma, i| buf[i] = ma.?;
                 try ir.recordMethodArgs(self.allocator, call_ep, buf);
 
-                mono.noteMethodInst(self.store, obj, mid, fa.field, fd.type_params, buf);
+                mono.noteMethodInst(self.allocator, self.store, obj, mid, fa.field, fd.type_params, buf);
 
-                mono.noteBaseNeeded(self.store, obj, fa.field);
+                mono.noteBaseNeeded(self.allocator, self.store, obj, fa.field);
             }
         }
         if (self.store.get(out) == .unresolved) return null;
@@ -1836,7 +1847,7 @@ pub const Inferer = struct {
                 }
             }
             if (all_concrete) {
-                mono.noteMethodInst(self.store, obj, mid, fa.field, fd.type_params, solved);
+                mono.noteMethodInst(self.allocator, self.store, obj, mid, fa.field, fd.type_params, solved);
             }
         }
 

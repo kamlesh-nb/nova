@@ -44,17 +44,20 @@ pub const MethodInst = struct {
 pub var method_insts: std.ArrayListUnmanaged(MethodInst) = .empty;
 
 pub var forced_struct_insts: std.ArrayListUnmanaged(TypeId) = .empty;
-pub fn noteForcedStructInst(tid: TypeId) void {
-    forced_struct_insts.append(std.heap.page_allocator, tid) catch {};
+pub fn noteForcedStructInst(a: std.mem.Allocator, tid: TypeId) void {
+    forced_struct_insts.append(a, tid) catch {};
 }
 
 pub var base_needed: std.StringHashMapUnmanaged(void) = .empty;
 
-pub fn noteBaseNeeded(store: *types.TypeStore, recv_tid: TypeId, method: []const u8) void {
-    const a = std.heap.page_allocator;
-    const rn = render.renderLegacy(a, store, recv_tid) catch return;
+pub fn noteBaseNeeded(a: std.mem.Allocator, store: *types.TypeStore, recv_tid: TypeId, method: []const u8) void {
+    const rn = render.renderLegacy(a, store, recv_tid) catch return; // BORROWED (Sema-owned) -- do not free
     const key = std.fmt.allocPrint(a, "{s}|{s}", .{ rn, method }) catch return;
-    base_needed.put(a, key, {}) catch {};
+    const gop = base_needed.getOrPut(a, key) catch {
+        a.free(key);
+        return;
+    };
+    if (gop.found_existing) a.free(key); // key already present: don't leak the duplicate
 }
 
 pub fn baseIsNeeded(owner: []const u8, method: []const u8) bool {
@@ -79,6 +82,7 @@ pub fn dumpMethodInsts() void {
 }
 
 pub fn noteMethodInst(
+    a: std.mem.Allocator,
     store: *types.TypeStore,
     recv_tid: TypeId,
     method_owner: types.SymbolId,
@@ -86,14 +90,28 @@ pub fn noteMethodInst(
     params: []const []const u8,
     args: []const TypeId,
 ) void {
-    const a = std.heap.page_allocator;
-
+    // renderLegacy returns a BORROWED interned name (owned by Sema). The worklist outlives individual
+    // renders and dedups/frees its own entries, so it must own its strings: DUP the borrowed renders. Do NOT
+    // free the borrowed originals. On the dedup-hit path below we free only these owned dupes.
     const rn0 = render.renderLegacy(a, store, recv_tid) catch return;
     const inst_name = a.dupe(u8, rn0) catch return;
-    const abuf = a.alloc([]const u8, args.len) catch return;
+    const abuf = a.alloc([]const u8, args.len) catch {
+        a.free(inst_name);
+        return;
+    };
     for (args, 0..) |at, i| {
-        const ar = render.renderLegacy(a, store, at) catch return;
-        abuf[i] = a.dupe(u8, ar) catch return;
+        const ar = render.renderLegacy(a, store, at) catch {
+            for (abuf[0..i]) |s| a.free(s);
+            a.free(abuf);
+            a.free(inst_name);
+            return;
+        };
+        abuf[i] = a.dupe(u8, ar) catch {
+            for (abuf[0..i]) |s| a.free(s);
+            a.free(abuf);
+            a.free(inst_name);
+            return;
+        };
     }
 
     for (method_insts.items) |mi| {
@@ -104,7 +122,13 @@ pub fn noteMethodInst(
         for (mi.args, abuf) |old, new| {
             if (!std.mem.eql(u8, old, new)) same = false;
         }
-        if (same) return;
+        if (same) {
+            // Already recorded: free the renders we just built rather than leaking them.
+            for (abuf) |s| a.free(s);
+            a.free(abuf);
+            a.free(inst_name);
+            return;
+        }
     }
     const pbuf = a.alloc([]const u8, params.len) catch return;
     for (params, 0..) |p, i| pbuf[i] = a.dupe(u8, p) catch return;
@@ -141,19 +165,33 @@ pub const FreeFnInst = struct {
 pub var free_fn_insts: std.ArrayListUnmanaged(FreeFnInst) = .empty;
 
 pub fn noteFreeFnInst(
+    a: std.mem.Allocator,
     store: *types.TypeStore,
     fn_name: []const u8,
     owner: types.SymbolId,
     params: []const []const u8,
     args: []const TypeId,
 ) bool {
-    const a = std.heap.page_allocator;
+    // renderLegacy returns a BORROWED interned name (Sema-owned); DUP into worklist-owned strings and do not
+    // free the borrowed originals. On any early return (dedup hit / upgrade) we own abuf+tbuf and free them.
     const abuf = a.alloc([]const u8, args.len) catch return false;
     for (args, 0..) |at, i| {
-        const ar = render.renderLegacy(a, store, at) catch return false;
-        abuf[i] = a.dupe(u8, ar) catch return false;
+        const ar = render.renderLegacy(a, store, at) catch {
+            for (abuf[0..i]) |s| a.free(s);
+            a.free(abuf);
+            return false;
+        };
+        abuf[i] = a.dupe(u8, ar) catch {
+            for (abuf[0..i]) |s| a.free(s);
+            a.free(abuf);
+            return false;
+        };
     }
-    const tbuf = a.alloc(TypeId, args.len) catch return false;
+    const tbuf = a.alloc(TypeId, args.len) catch {
+        for (abuf) |s| a.free(s);
+        a.free(abuf);
+        return false;
+    };
     for (args, 0..) |at, i| tbuf[i] = at;
     const key = store.intern(.{ .struct_ = .{ .decl = owner, .args = tbuf } }) catch null;
     // Dedup by (name, string args). If a string-only entry (from the transitive path) already exists, UPGRADE
@@ -167,12 +205,16 @@ pub fn noteFreeFnInst(
             if (!std.mem.eql(u8, old, new)) same = false;
         }
         if (!same) continue;
+        // Matched an existing entry: free the renders we just built.
+        for (abuf) |s| a.free(s);
+        a.free(abuf);
         if (fi.inst_key == null and key != null) {
             fi.owner = owner;
             fi.args_tids = tbuf;
             fi.inst_key = key;
             return true;
         }
+        a.free(tbuf);
         return false;
     }
     const pbuf = a.alloc([]const u8, params.len) catch return false;
@@ -193,8 +235,7 @@ pub fn noteFreeFnInst(
 // type parameter to another generic, e.g. `inner<T>` inside `outer<T>`). Dedups on (name, args) and
 // returns true if a NEW instance was added, so the caller can run a fixpoint. Strings are duped into
 // the page allocator to match noteFreeFnInst's storage.
-pub fn noteFreeFnInstStr(fn_name: []const u8, params: []const []const u8, args: []const []const u8) bool {
-    const a = std.heap.page_allocator;
+pub fn noteFreeFnInstStr(a: std.mem.Allocator, fn_name: []const u8, params: []const []const u8, args: []const []const u8) bool {
     for (free_fn_insts.items) |fi| {
         if (!std.mem.eql(u8, fi.fn_name, fn_name)) continue;
         if (fi.args.len != args.len) continue;

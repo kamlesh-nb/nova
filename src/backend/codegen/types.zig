@@ -1369,6 +1369,16 @@ pub fn scopedTypeName(self: *LlvmCompiler, bare: []const u8, file: []const u8) [
     return bare;
 }
 
+// Render a TypeId to its legacy name, interned per-TypeId. Returns a BORROWED string owned by the cache
+// (freed at compiler deinit); callers must NOT free it. This replaces the per-call renderLegacy allocation
+// in resolveExpressionTypeName that no caller freed -- the codegen-wide memory leak.
+pub fn cachedTypeName(self: *LlvmCompiler, st: *const typesys.TypeStore, tid: typesys.TypeId) anyerror![]const u8 {
+    if (self.type_name_cache.get(tid)) |cached| return cached;
+    const rendered = try sema_shadow.renderLegacy(self.allocator, st, tid);
+    try self.type_name_cache.put(self.allocator, tid, rendered);
+    return rendered;
+}
+
 pub fn resolveExpressionTypeName(self: *LlvmCompiler, expr_ptr: *const ast.Expression) anyerror!?[]const u8 {
     const ir = self.typed_ir orelse return null;
     const st = self.type_store orelse return null;

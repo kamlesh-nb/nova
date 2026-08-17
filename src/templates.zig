@@ -7,6 +7,46 @@ pub const console_main_sample =
     \\}
 ;
 
+// VS Code F5 debugging (Gap 4): lldb-dap over the debug build, auto-loading the Nova lldb data
+// formatters so string/List/Map show contents. Requires the "LLDB DAP" VS Code extension (ships with
+// LLVM). `nova build` produces the debug binary with DWARF; the debug profile keeps the object files
+// that lldb reads. `${workspaceFolderBasename}` is the project (binary) name.
+pub const vscode_launch_json =
+    \\{
+    \\  "version": "0.2.0",
+    \\  "configurations": [
+    \\    {
+    \\      "type": "lldb-dap",
+    \\      "request": "launch",
+    \\      "name": "Debug Nova (debug build)",
+    \\      "program": "${workspaceFolder}/build/debug/bin/${workspaceFolderBasename}",
+    \\      "cwd": "${workspaceFolder}",
+    \\      "preLaunchTask": "nova: build (debug)",
+    \\      "initCommands": [
+    \\        "command script import ~/.nova/std/debug/nova_formatters.py"
+    \\      ]
+    \\    }
+    \\  ]
+    \\}
+    \\
+;
+
+pub const vscode_tasks_json =
+    \\{
+    \\  "version": "2.0.0",
+    \\  "tasks": [
+    \\    {
+    \\      "label": "nova: build (debug)",
+    \\      "type": "shell",
+    \\      "command": "nova build",
+    \\      "problemMatcher": [],
+    \\      "group": { "kind": "build", "isDefault": true }
+    \\    }
+    \\  ]
+    \\}
+    \\
+;
+
 pub const console_test_sample =
     \\import assert;
     \\

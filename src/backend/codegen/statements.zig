@@ -44,6 +44,25 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
         return;
     }
 
+    // DWARF (Gap 4): set the current debug location to this statement so breakpoints / single-step
+    // land on the right source line. No-op unless a DISubprogram scope is active (debug builds).
+    if (self.di_scope != null) {
+        const dbg_span = switch (stmt) {
+            .block => |s| s.span,
+            .let_stmt => |s| s.span,
+            .expr_stmt => |s| s.span,
+            .if_stmt => |s| s.span,
+            .while_stmt => |s| s.span,
+            .for_stmt => |s| s.span,
+            .switch_stmt => |s| s.span,
+            .return_stmt => |s| s.span,
+            .break_stmt => |s| s.span,
+            .continue_stmt => |s| s.span,
+            .defer_stmt => |s| s.span,
+        };
+        self.setDebugLoc(dbg_span.line, dbg_span.col);
+    }
+
     const temp_mark = self.pending_temps.items.len;
     defer self.drainTemporaries(temp_mark) catch {};
     if (self.coverage_enabled and stmt != .block) {
@@ -241,6 +260,33 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
                     else
                         self.val_type;
                     _ = core.LLVMBuildStore(self.builder, self.coerceToSlotType(val, slot_ty), alloca_val);
+
+                    // DWARF (Gap 4, item 2): declare the local here too. An inferred local (e.g.
+                    // `let s = a + b`) may not be in current_local_types at the pre-alloc loop, but its
+                    // init type resolves now; the dbg_declared dedup set prevents a second declare for
+                    // locals already handled at pre-alloc. resolveExpressionTypeName returns a borrowed
+                    // slice (not freed).
+                    if (self.di_scope != null and ls.names == null) {
+                        // Prefer the local's own declared type; else the init expression's type; else
+                        // resolve the local's TypeId to a name (safe here -- instantiation context is set,
+                        // unlike the pre-alloc loop where symbolName crashes). `owned` is freed; the map
+                        // lookups and resolveExpressionTypeName return borrowed slices.
+                        var lt_name: ?[]const u8 = if (self.current_local_types) |ltm| ltm.get(ls.name) else null;
+                        if (lt_name == null) lt_name = self.resolveExpressionTypeName(init_ptr) catch null;
+                        var owned: ?[]const u8 = null;
+                        if (lt_name == null) {
+                            if (self.current_local_type_ids) |ids| {
+                                if (ids.get(ls.name)) |tid| {
+                                    if (self.symbolName(tid)) |nm| {
+                                        owned = nm;
+                                        lt_name = nm;
+                                    } else |_| {}
+                                }
+                            }
+                        }
+                        self.declareLocalVar(alloca_val, ls.name, lt_name, slot_ty);
+                        if (owned) |o| self.allocator.free(o);
+                    }
                 }
             }
         },

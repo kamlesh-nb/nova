@@ -17,6 +17,17 @@ const unescapeString = @import("llvm_codegen.zig").unescapeString;
 const FunctionInfo = @import("llvm_codegen.zig").FunctionInfo;
 const Scope = @import("llvm_codegen.zig").Scope;
 
+// NOVA_MEM_STATS phase profiler: prints peak RSS (ru_maxrss, bytes on macOS) reached so far, so we can see
+// which codegen phase pushes the high-water mark. Zero-cost unless the env var is set.
+var mem_phase_on: ?bool = null;
+fn memPhase(label: []const u8) void {
+    if (mem_phase_on == null) mem_phase_on = (std.c.getenv("NOVA_MEM_STATS") != null);
+    if (!(mem_phase_on.?)) return;
+    const ru = std.posix.getrusage(std.posix.rusage.SELF);
+    const mb = @as(u64, @intCast(ru.maxrss)) / (1024 * 1024); // macOS: bytes
+    std.debug.print("[MEM] {s:<28} peak={d} MB\n", .{ label, mb });
+}
+
 fn ffiCType(compiler: *LlvmCompiler, type_name: []const u8) types.LLVMTypeRef {
     if (std.mem.eql(u8, type_name, "int")) return compiler.i32_type;
     if (std.mem.eql(u8, type_name, "long")) return compiler.i64_type;
@@ -24,6 +35,23 @@ fn ffiCType(compiler: *LlvmCompiler, type_name: []const u8) types.LLVMTypeRef {
     if (std.mem.eql(u8, type_name, "void")) return compiler.void_type;
 
     return compiler.ptr_type;
+}
+
+// The source span of a statement, whichever variant it is (used for DWARF line attribution).
+fn stmtSpan(stmt: ast.Statement) ast.Span {
+    return switch (stmt) {
+        .block => |s| s.span,
+        .let_stmt => |s| s.span,
+        .expr_stmt => |s| s.span,
+        .if_stmt => |s| s.span,
+        .while_stmt => |s| s.span,
+        .for_stmt => |s| s.span,
+        .switch_stmt => |s| s.span,
+        .return_stmt => |s| s.span,
+        .break_stmt => |s| s.span,
+        .continue_stmt => |s| s.span,
+        .defer_stmt => |s| s.span,
+    };
 }
 
 pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool, is_release: bool, target_triple_opt: ?[]const u8, output_path: []const u8, coverage_enabled: bool, t6_split: bool, objs_out: ?*std.ArrayList([]const u8), cache_dir: ?[]const u8, io: std.Io) !void {
@@ -36,6 +64,7 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
     defer compiler.deinit();
 
     compiler.program = program;
+    memPhase("compile start");
 
     for (program.declarations) |decl| {
         switch (decl) {
@@ -50,6 +79,7 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
     }
 
     try compiler.collectFunctions(program);
+    memPhase("after collectFunctions");
 
     var i: usize = 0;
     while (i < compiler.functions.items.len) {
@@ -687,16 +717,22 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         for (program.declarations) |decl| {
             if (decl == .fn_decl) {
                 var decl_name = decl.fn_decl.name;
+                var decl_name_owned = false;
                 if (compiler.getStructPrefix(decl.fn_decl)) |prefix| {
                     decl_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ prefix, decl.fn_decl.name });
+                    decl_name_owned = true;
                 } else if (compiler.getModulePrefix(decl.fn_decl.span)) |mod_prefix| {
+                    defer allocator.free(mod_prefix);
                     if (LlvmCompiler.isAlreadyNamespaced(decl.fn_decl.name)) {
                         decl_name = decl.fn_decl.name;
                     } else {
                         decl_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ mod_prefix, decl.fn_decl.name });
+                        decl_name_owned = true;
                     }
                 }
-                if (std.mem.eql(u8, decl_name, func.name)) {
+                const dn_match = std.mem.eql(u8, decl_name, func.name);
+                if (decl_name_owned) allocator.free(decl_name);
+                if (dn_match) {
                     compiler.current_module_prefix = compiler.getModulePrefix(decl.fn_decl.span);
                     for (decl.fn_decl.params) |p| {
                         if (p.type_name) |t| {
@@ -869,6 +905,7 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         @memcpy(compiler.functions.items, reordered.items);
     }
 
+    memPhase("before body emit");
     for (compiler.functions.items) |func| {
         const fn_val = compiler.func_map.get(func.name).?;
 
@@ -910,16 +947,22 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         for (program.declarations) |decl| {
             if (decl == .fn_decl) {
                 var decl_name = decl.fn_decl.name;
+                var decl_name_owned = false;
                 if (compiler.getStructPrefix(decl.fn_decl)) |prefix| {
                     decl_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ prefix, decl.fn_decl.name });
+                    decl_name_owned = true;
                 } else if (compiler.getModulePrefix(decl.fn_decl.span)) |mod_prefix| {
+                    defer allocator.free(mod_prefix); // getModulePrefix returns owned memory
                     if (LlvmCompiler.isAlreadyNamespaced(decl.fn_decl.name)) {
                         decl_name = decl.fn_decl.name;
                     } else {
                         decl_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ mod_prefix, decl.fn_decl.name });
+                        decl_name_owned = true;
                     }
                 }
-                if (std.mem.eql(u8, decl_name, func.name)) {
+                const dn_matches = std.mem.eql(u8, decl_name, func.name);
+                if (decl_name_owned) allocator.free(decl_name);
+                if (dn_matches) {
                     compiler.current_module_prefix = compiler.getModulePrefix(decl.fn_decl.span);
                     break;
                 }
@@ -962,6 +1005,16 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         const entry_bb = core.LLVMAppendBasicBlock(fn_val, "entry");
         core.LLVMPositionBuilderAtEnd(compiler.builder, entry_bb);
 
+        // DWARF (Gap 4): attach this function's DISubprogram + set it as the active debug scope, so
+        // statement debug locations (set during body emission) resolve to it. Self-guards on debug mode.
+        // The function line comes from the first statement (reliably inside the body) rather than the
+        // block span, which points past the closing brace for some declarations.
+        const fn_dbg_line = if (func.body.statements.len > 0)
+            stmtSpan(func.body.statements[0]).line
+        else
+            func.body.span.line;
+        compiler.beginFunctionDebug(fn_val, func.name, func.source_file, fn_dbg_line);
+
         // (The HIR/MIR/LIR LLVM-emit optimiser was scrapped 2026-08-16 -- it delivered ~0 optimisation over
         // AST+LLVM O3; see docs/design/sil-arc-optimiser-direction.md. Every function is compiled from the
         // AST below, as it always effectively was.)
@@ -1001,6 +1054,8 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
             }
             _ = core.LLVMBuildStore(compiler.builder, compiler.coerceToSlotType(arg_val, slot_ty), alloca_val);
             try compiler.locals.put(arg_name, alloca_val);
+            // DWARF (Gap 4, item 2): declare the parameter so the debugger shows its value.
+            compiler.declareLocalVar(alloca_val, arg_name, if (compiler.current_local_types) |lt| lt.get(arg_name) else null, slot_ty);
         }
 
         var local_names = std.ArrayList([]const u8).empty;
@@ -1044,6 +1099,8 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
                 core.LLVMConstNull(slot_ty);
             _ = core.LLVMBuildStore(compiler.builder, zero, alloca_val);
             try compiler.locals.put(name, alloca_val);
+            // DWARF (Gap 4, item 2): declare the local so the debugger shows its value.
+            compiler.declareLocalVar(alloca_val, name, if (compiler.current_local_types) |lt| lt.get(name) else null, slot_ty);
         }
 
         const is_main = std.mem.eql(u8, func.name, "main");
@@ -1208,6 +1265,7 @@ fn compileSplitEmit(
         }
     }
 
+    memPhase("after body emit + vtables");
     var all_syms = std.StringHashMap(void).init(allocator);
     defer all_syms.deinit();
     var file_syms = std.StringHashMap(std.StringHashMap(void)).init(allocator);
@@ -1305,6 +1363,10 @@ fn emitModule(
     // (before LLVM -O strips ARC calls). Opt-in via NOVA_OWN_VERIFY. See docs/design/ossa-lite-tasks.md.
     compiler.verifyArcBalance(module);
 
+    // DWARF (Gap 4): sanitize + resolve debug metadata for this exact module (a per-file clone under
+    // T6 split) before it is dumped/verified/emitted.
+    compiler.finalizeDebug(module);
+
     if (dump_ll_name) |nm| {
         const nm_z = try allocator.dupeZ(u8, nm);
         defer allocator.free(nm_z);
@@ -1344,6 +1406,7 @@ fn emitModule(
             transform.LLVMPassBuilderOptionsSetSLPVectorization(opts, 1);
             transform.LLVMPassBuilderOptionsSetLoopUnrolling(opts, 1);
         }
+        memPhase("before LLVM opt passes");
         const passes: [*:0]const u8 = if (is_release) "default<O3>,globaldce" else "default<O0>,globaldce";
         const perr = transform.LLVMRunPasses(module, passes, compiler.target_machine, opts);
         if (perr != null) {
@@ -1374,6 +1437,7 @@ fn emitModule(
         }
     }
 
+    memPhase("after LLVM opt passes");
     const file_type = types.LLVMCodeGenFileType.LLVMObjectFile;
     var err_msg: [*c]u8 = null;
     const obj_path_c = try allocator.dupeZ(u8, obj_path);
@@ -1389,6 +1453,7 @@ fn emitModule(
         std.debug.print("Failed to emit object file: {s}\n", .{span_msg});
         return error.LLVMEmitFileError;
     }
+    memPhase("after emit object");
 }
 
 fn declareCoroIntrinsic(compiler: *LlvmCompiler, name: [:0]const u8, overload: ?types.LLVMTypeRef) !void {

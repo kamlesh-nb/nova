@@ -739,8 +739,8 @@ pub var f1_3b_last_disagree_sym: []const u8 = "";
 pub var f1_3b_last_disagree_scan: []const u8 = "";
 
 pub var f1_3b_absent_names: std.StringHashMapUnmanaged(usize) = .empty;
-pub fn noteF13bAbsent(name: []const u8) void {
-    const gop = f1_3b_absent_names.getOrPut(std.heap.page_allocator, name) catch return;
+pub fn noteF13bAbsent(a: std.mem.Allocator, name: []const u8) void {
+    const gop = f1_3b_absent_names.getOrPut(a, name) catch return;
     if (gop.found_existing) gop.value_ptr.* += 1 else gop.value_ptr.* = 1;
 }
 
@@ -748,14 +748,14 @@ pub var f45_mono_hit: usize = 0;
 pub var f45_erased_fallback: usize = 0;
 pub var f45_erased_nongeneric: usize = 0;
 pub var f45_erased_by_name: std.StringHashMapUnmanaged(usize) = .empty;
-pub fn noteF45Erased(missing_mono: []const u8) void {
+pub fn noteF45Erased(a: std.mem.Allocator, missing_mono: []const u8) void {
     if (!report_enabled) return;
 
-    const gop = f45_erased_by_name.getOrPut(std.heap.page_allocator, missing_mono) catch return;
+    const gop = f45_erased_by_name.getOrPut(a, missing_mono) catch return;
     if (gop.found_existing) {
         gop.value_ptr.* += 1;
     } else {
-        gop.key_ptr.* = std.heap.page_allocator.dupe(u8, missing_mono) catch missing_mono;
+        gop.key_ptr.* = a.dupe(u8, missing_mono) catch missing_mono;
         gop.value_ptr.* = 1;
     }
 }
@@ -844,18 +844,28 @@ fn isIdentChar(c: u8) bool {
 
 pub fn renderLegacy(allocator: std.mem.Allocator, store: *const typesys.TypeStore, id: typesys.TypeId) anyerror![]const u8 {
     render_calls += 1;
+    // Ownership contract: when a live Sema exists, renderLegacy returns a BORROWED interned name (owned by
+    // Sema.names, freed once by Sema.destroy). Callers must NOT free it. This is what makes rendering cheap:
+    // interning deduplicates by TypeId, so a type is allocated ONCE regardless of how many times it is
+    // rendered. (Returning a fresh per-call dup instead turned millions of renders into millions of leaked
+    // allocations -- tens of GB on a large build.) internName dups into Sema's OWN allocator, so there is no
+    // cross-allocator free even though `rendered` here comes from the caller's (codegen's) allocator.
     if (live_sema) |sm| {
         if (sm.cachedName(id)) |n| {
             render_cache_hits += 1;
-            return n;
+            return n; // borrowed
         }
+        const rendered = try renderUncached(allocator, store, id);
+        if (allocatesFor(store.get(id))) {
+            const interned = try sm.internName(id, rendered); // stable copy in Sema's allocator
+            allocator.free(rendered); // allocatesFor => renderUncached allocated it; free the codegen temp
+            return interned; // borrowed
+        }
+        // Non-interned: a static literal ("int") or a symbol-table-owned name -- not this allocator's memory,
+        // so returning it borrowed is correct and callers must not free it.
+        return rendered;
     }
-    const rendered = try renderUncached(allocator, store, id);
-
-    if (live_sema) |sm| {
-        if (allocatesFor(store.get(id))) return try sm.internName(id, rendered);
-    }
-    return rendered;
+    return try renderUncached(allocator, store, id);
 }
 
 fn allocatesFor(t: typesys.Type) bool {
@@ -877,9 +887,11 @@ fn renderUncached(allocator: std.mem.Allocator, store: *const typesys.TypeStore,
         .error_union => |eu| blk: {
             var buf = std.ArrayListUnmanaged(u8).empty;
             try buf.appendSlice(allocator, "ErrUnion(");
-            try buf.appendSlice(allocator, try renderUncached(allocator, store, eu.ok));
+            // Use renderLegacy (interned/borrowed) for the nested renders, NOT renderUncached, which
+            // returned fresh allocations that were appended-and-leaked here.
+            try buf.appendSlice(allocator, try renderLegacy(allocator, store, eu.ok));
             try buf.append(allocator, ',');
-            try buf.appendSlice(allocator, try renderUncached(allocator, store, eu.err));
+            try buf.appendSlice(allocator, try renderLegacy(allocator, store, eu.err));
             try buf.append(allocator, ')');
             break :blk try buf.toOwnedSlice(allocator);
         },

@@ -3031,7 +3031,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     }
                     if (sema_shadow.report_enabled) {
                         sema_shadow.f1_3b_sym_absent += 1;
-                        sema_shadow.noteF13bAbsent(name);
+                        sema_shadow.noteF13bAbsent(self.allocator, name);
                     }
                     break :resolve try self.resolveCalleeName(name);
                 };
@@ -5061,10 +5061,11 @@ pub fn jsxAppendExpr(self: *LlvmCompiler, sb: types.LLVMValueRef, expr: *const a
             // and the output is XSS-safe by default. Component/markup calls flow through the `{for}`/`{if}`
             // STATEMENT path (compileAppendToStringBuilder), not here, so generated markup is left intact.
             // Escape-INTO-the-builder: escapeHtmlInto(sb, val) writes the escaped bytes straight into the
-            // render buffer -- no intermediate escaped string is allocated (the old path allocated one per
-            // interpolation, ~1200 per product page). It neither retains nor releases `val`, which is the
-            // same net-zero ARC effect the old retain-in-escapeHtml + release-of-result had, and matches the
-            // unescaped else branch (which also appends `val` without releasing it).
+            // render buffer -- no intermediate escaped string is allocated. escapeHtmlInto does not touch
+            // `val`'s refcount, so if `val` is a FRESHLY-OWNED temporary (a `${...}` template_expr, a string
+            // concat, a call result) we must release it here or it leaks once PER INTERPOLATION -- ~1200 per
+            // product page, the dominant per-request leak. A BORROWED value (a plain string field of a row)
+            // is owned by its container and must NOT be released.
             if (self.getFunc("web_response_escapeHtmlInto")) |escInto| {
                 const escInto_t = core.LLVMGlobalGetValueType(escInto);
                 var ea = [_]types.LLVMValueRef{ sb, self.coerceToSlotType(val, self.val_type) };

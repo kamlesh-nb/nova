@@ -143,7 +143,13 @@ for generics/enums and the data formatters are the real work). Async stepping = 
 
 ---
 
-## Gap 5 — Perf: allocation count (the only real per-core lever)
+## Gap 5 — Perf: allocation count — CLOSED as ACCEPTED (2026-08-16, see `done/gap5-closed.md`)
+**Closed.** Nova already beats Rust axum (~2.7x) and Go (~8.6x) per core despite the high alloc count; the
+SOUND escape-arena lever is low-headroom (measured: only 4% of alloc sites are LOCAL on 13_serde); the
+high-headroom blanket arena regressed 28% (P7). Accepted current perf as the baseline; `escape.zig` kept as
+a seed; standing rule = no perf rework without a specific failing target + a measured delta. Original
+analysis retained below for reference.
+
 **Problem.** ARC-forwarding is measured at ~0 headroom (E2 + Track A this session), so the remaining
 per-core lever is **reducing the per-request allocation count** (~3000 ARC objects/request vs Rust's ~50).
 `escape.zig` already computes Stage-1 (local vs escapes) + Stage-2 (interprocedural may-escape), report-only.

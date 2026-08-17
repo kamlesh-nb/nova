@@ -29,6 +29,7 @@ pub const Sema = struct {
     }
 
     pub fn destroy(self: *Sema) void {
+        // internName stores a per-id copy owned by self.allocator, so names never alias; free each once.
         var it = self.names.valueIterator();
         while (it.next()) |n| self.allocator.free(n.*);
         self.names.deinit(self.allocator);
@@ -39,14 +40,16 @@ pub const Sema = struct {
         a.destroy(self);
     }
 
+    // Interns a stable name for `id`. IMPORTANT: does NOT take ownership of `name` — it copies into
+    // self.allocator so every entry in self.names is owned by, and freed with, THIS Sema's allocator.
+    // (renderLegacy is called with codegen's allocator, which differs from sema.allocator; storing the
+    // caller's pointer and freeing it here in destroy aborts with a cross-allocator free.) The caller
+    // still owns `name` and frees it.
     pub fn internName(self: *Sema, id: TypeId, name: []const u8) ![]const u8 {
         const gop = try self.names.getOrPut(self.allocator, id);
-        if (gop.found_existing) {
-            self.allocator.free(name);
-            return gop.value_ptr.*;
-        }
-        gop.value_ptr.* = name;
-        return name;
+        if (gop.found_existing) return gop.value_ptr.*;
+        gop.value_ptr.* = try self.allocator.dupe(u8, name);
+        return gop.value_ptr.*;
     }
 
     pub fn cachedName(self: *const Sema, id: TypeId) ?[]const u8 {

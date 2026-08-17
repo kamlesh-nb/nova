@@ -18,9 +18,23 @@ const builder = @import("builder.zig");
 // (HIR/MIR/LIR LLVM-emit optimiser scrapped 2026-08-16; see docs/design/sil-arc-optimiser-direction.md.)
 
 pub fn run(init: std.process.Init) !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
+    // The whole compiler ran on an ArenaAllocator where free() is a NO-OP, so nothing was ever released
+    // until process exit -- a <1MB program's transient codegen strings accumulated to tens of GB. Use a
+    // real allocator so free() actually returns pages: DebugAllocator (with leak detection) in Debug, the
+    // C allocator in Release (it releases pages fully; Zig's arena/GPA retain them).
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    const base_allocator = if (builtin.mode == .Debug) gpa.allocator() else std.heap.c_allocator;
+    defer if (builtin.mode == .Debug) {
+        if (gpa.detectLeaks() > 0) std.process.exit(1);
+    };
+
+    // Opt-in allocation profiler (NOVA_ALLOC_PROFILE): attributes compiler allocations to their call site so a
+    // leak's dominant site is visible at exit. See allocprof.zig.
+    const allocprof = @import("allocprof.zig");
+    const profile_alloc = std.c.getenv("NOVA_ALLOC_PROFILE") != null;
+    var prof = allocprof.Profiler.init(base_allocator, std.heap.c_allocator);
+    const allocator = if (profile_alloc) prof.allocator() else base_allocator;
+    defer if (profile_alloc) prof.dump();
 
     const args = try init.minimal.args.toSlice(allocator);
 

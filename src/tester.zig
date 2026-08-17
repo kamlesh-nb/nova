@@ -276,6 +276,23 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
         }
     }
 
+    // Gap 8: demand-driven monomorphization reachability (test path). Roots = @test fns (is_test=true).
+    // Shadow report under NOVA_REACH_SHADOW; emission-gating under NOVA_REACH_ON. See demand-driven-mono.md.
+    {
+        const reach = @import("frontend/sema/reach.zig");
+        const shadow = init.environ_map.get("NOVA_REACH_SHADOW") != null;
+        const gate = init.environ_map.get("NOVA_REACH_ON") != null;
+        if (shadow or gate) {
+            var rr = reach.compute(allocator, &owned_sema.tab, &owned_sema.ir, program, true) catch reach.Result{};
+            defer rr.deinit(allocator);
+            if (shadow) reach.report(&rr, &owned_sema.tab);
+            if (gate) {
+                reach.publish(allocator, &rr, &owned_sema.tab);
+                reach.gate_on = true;
+            }
+        }
+    }
+
     // P7 Stage 1: report-only escape gauge (no codegen effect). See docs/design/p7-sound-arena.md.
     sema_escape.report_enabled = init.environ_map.get("NOVA_ESCAPE_REPORT") != null;
     if (sema_escape.report_enabled) _ = sema_escape.analyze(allocator, &owned_sema.store, &owned_sema.ir, &program);

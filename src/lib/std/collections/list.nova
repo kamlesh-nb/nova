@@ -1,62 +1,212 @@
-// List<T>: growable sequence on a pure-Nova RawBuffer<T> (M-10 Storage retirement). len/cap mirror
-// the buffer (kept as fields for `.len` field reads in generated code); RawBuffer owns elements.
 import mem.rawbuffer;
 
-pub class List<T> {
-    pub data: rawbuffer.RawBuffer<T>,
+pub struct List<T> {
+    pub data: RawBuffer<T>,
     pub len: int,
     pub cap: int,
 
-    init() { self.data = rawbuffer.RawBuffer<T>(4); self.len = 0; self.cap = 4; }
+    init() {
+        self.data = rawbuffer.RawBuffer<T>(4);
+        self.len = 0;
+        self.cap = 4;
+    }
 
-    pub fn push(self: List<T>, value: T): void { self.data.push(value); self.len = self.data.count(); self.cap = self.data.capacity(); }
-    pub fn get(self: List<T>, index: int): T | undefined { if (index < 0 || index >= self.data.count()) { return undefined; } return self.data.at(index); }
-    pub fn at(self: List<T>, index: int): T { if (index < 0 || index >= self.data.count()) { nova_panic("List.at: index out of bounds"); } return self.data.at(index); }
-    pub fn set(self: List<T>, index: int, value: T): void { if (index < 0 || index >= self.data.count()) { return; } self.data.set(index, value); }
-    pub fn insert(self: List<T>, index: int, value: T): void { self.data.insertAt(index, value); self.len = self.data.count(); self.cap = self.data.capacity(); }
-    pub fn remove(self: List<T>, index: int): void { self.data.removeAt(index); self.len = self.data.count(); self.cap = self.data.capacity(); }
-    pub fn size(self: List<T>): int { return self.data.count(); }
-    pub fn forEach(self: List<T>, fn: (T) => void): void { let i = 0; while (i < self.data.count()) { let val = self.data.at(i); fn(val); i = i + 1; } }
-    pub fn map<U>(self: List<T>, fn: (T) => U): List<U> { let result = List<U>(); let i = 0; while (i < self.data.count()) { let val = self.data.at(i); let mapped = fn(val); result.push(mapped); i = i + 1; } return result; }
-    pub fn filter(self: List<T>, pred: (T) => bool): List<T> { let result = List<T>(); let i = 0; while (i < self.data.count()) { let val = self.data.at(i); if (pred(val)) { result.push(val); } i = i + 1; } return result; }
-    pub fn reduce<U>(self: List<T>, acc: U, fn: (U, T) => U): U { let result = acc; let i = 0; while (i < self.data.count()) { let val = self.data.at(i); result = fn(result, val); i = i + 1; } return result; }
-    pub fn reverse(self: List<T>): void { let i = 0; let j = self.data.count() - 1; while (i < j) { let tmp = self.data.at(i); self.data.set(i, self.data.at(j)); self.data.set(j, tmp); i = i + 1; j = j - 1; } }
-    pub fn clear(self: List<T>): void { self.data.clear(); self.len = 0; }
-    pub fn first(self: List<T>): T | undefined { if (self.data.count() == 0) { return undefined; } return self.data.at(0); }
-    pub fn last(self: List<T>): T | undefined { if (self.data.count() == 0) { return undefined; } return self.data.at(self.data.count() - 1); }
-    pub fn pop(self: List<T>): T | undefined { let v = self.data.pop(); self.len = self.data.count(); self.cap = self.data.capacity(); return v; }
-    pub fn findIndex(self: List<T>, pred: (T) => bool): int { let i = 0; while (i < self.data.count()) { if (pred(self.data.at(i))) { return i; } i = i + 1; } return -1; }
-    pub fn any(self: List<T>, pred: (T) => bool): bool { return self.findIndex(pred) != -1; }
-    pub fn all(self: List<T>, pred: (T) => bool): bool { let i = 0; while (i < self.data.count()) { if (!pred(self.data.at(i))) { return false; } i = i + 1; } return true; }
-    pub fn indexOf(self: List<T>, value: T): int { let i = 0; while (i < self.data.count()) { if (self.data.at(i) == value) { return i; } i = i + 1; } return -1; }
-    pub fn contains(self: List<T>, value: T): bool { return self.indexOf(value) != -1; }
+    pub fn push(self: List<T>, value: T): void {
+        self.data.push(value);
+        self.len = self.data.count();
+        self.cap = self.data.capacity();
+    }
 
-    // Copy the half-open range [start, end) into a new list. Indices are clamped to the list bounds, so
-    // slice(0, size()) is a shallow copy and out-of-range ends do not panic.
+    pub fn get(self: List<T>, index: int): T | undefined {
+        if (index < 0 || index >= self.data.count()) {
+            return undefined;
+        }
+        return self.data.at(index);
+    }
+
+    pub fn at(self: List<T>, index: int): T {
+        if (index < 0 || index >= self.data.count()) {
+            nova_panic("List.at: index out of bounds");
+        }
+        return self.data.at(index);
+    }
+
+    pub fn set(self: List<T>, index: int, value: T): void {
+        if (index < 0 || index >= self.data.count()) {
+            return;
+        }
+        self.data.set(index, value);
+    }
+
+    pub fn insert(self: List<T>, index: int, value: T): void {
+        self.data.insertAt(index, value);
+        self.len = self.data.count();
+        self.cap = self.data.capacity();
+    }
+
+    pub fn remove(self: List<T>, index: int): void {
+        self.data.removeAt(index);
+        self.len = self.data.count();
+        self.cap = self.data.capacity();
+    }
+
+    pub fn size(self: List<T>): int {
+        return self.data.count();
+    }
+
+    pub fn forEach(self: List<T>, fn: (T) -> void): void {
+        let i = 0;
+        while (i < self.data.count()) {
+            let val = self.data.at(i);
+            fn(val);
+            i = i + 1;
+        }
+    }
+
+    pub fn map<U>(self: List<T>, fn: (T) -> U): List<U> {
+        let result = List<U>();
+        let i = 0;
+        while (i < self.data.count()) {
+            let val = self.data.at(i);
+            let mapped = fn(val);
+            result.push(mapped);
+            i = i + 1;
+        }
+        return result;
+    }
+
+    pub fn filter(self: List<T>, pred: (T) -> bool): List<T> {
+        let result = List<T>();
+        let i = 0;
+        while (i < self.data.count()) {
+            let val = self.data.at(i);
+            if (pred(val)) {
+                result.push(val);
+            }
+            i = i + 1;
+        }
+        return result;
+    }
+
+    pub fn reduce<U>(self: List<T>, acc: U, fn: (U, T) -> U): U {
+        let result = acc;
+        let i = 0;
+        while (i < self.data.count()) {
+            let val = self.data.at(i);
+            result = fn(result, val);
+            i = i + 1;
+        }
+        return result;
+    }
+
+    pub fn reverse(self: List<T>): void {
+        let i = 0;
+        let j = self.data.count() - 1;
+        while (i < j) {
+            let tmp = self.data.at(i);
+            self.data.set(i, self.data.at(j));
+            self.data.set(j, tmp);
+            i = i + 1;
+            j = j - 1;
+        }
+    }
+
+    pub fn clear(self: List<T>): void {
+        self.data.clear();
+        self.len = 0;
+    }
+
+    pub fn first(self: List<T>): T | undefined {
+        if (self.data.count() == 0) {
+            return undefined;
+        }
+        return self.data.at(0);
+    }
+
+    pub fn last(self: List<T>): T | undefined {
+        if (self.data.count() == 0) {
+            return undefined;
+        }
+        return self.data.at(self.data.count() - 1);
+    }
+
+    pub fn pop(self: List<T>): T | undefined {
+        let v = self.data.pop();
+        self.len = self.data.count();
+        self.cap = self.data.capacity();
+        return v;
+    }
+
+    pub fn findIndex(self: List<T>, pred: (T) -> bool): int {
+        let i = 0;
+        while (i < self.data.count()) {
+            if (pred(self.data.at(i))) {
+                return i;
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    pub fn any(self: List<T>, pred: (T) -> bool): bool {
+        return self.findIndex(pred) != -1;
+    }
+
+    pub fn all(self: List<T>, pred: (T) -> bool): bool {
+        let i = 0;
+        while (i < self.data.count()) {
+            if (!pred(self.data.at(i))) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    pub fn indexOf(self: List<T>, value: T): int {
+        let i = 0;
+        while (i < self.data.count()) {
+            if (self.data.at(i) == value) {
+                return i;
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    pub fn contains(self: List<T>, value: T): bool {
+        return self.indexOf(value) != -1;
+    }
+
     pub fn slice(self: List<T>, start: int, end: int): List<T> {
         let n = self.data.count();
         let s = if (start < 0) 0 else if (start > n) n else start;
         let e = if (end < 0) 0 else if (end > n) n else end;
         let out = List<T>();
         let i = s;
-        while (i < e) { out.push(self.data.at(i)); i = i + 1; }
+        while (i < e) {
+            out.push(self.data.at(i));
+            i = i + 1;
+        }
         return out;
     }
 
-    // A new list with this list's elements followed by other's. Neither input is modified.
     pub fn concat(self: List<T>, other: List<T>): List<T> {
         let out = List<T>();
         let i = 0;
-        while (i < self.data.count()) { out.push(self.data.at(i)); i = i + 1; }
+        while (i < self.data.count()) {
+            out.push(self.data.at(i));
+            i = i + 1;
+        }
         let j = 0;
-        while (j < other.size()) { out.push(other.at(j)); j = j + 1; }
+        while (j < other.size()) {
+            out.push(other.at(j));
+            j = j + 1;
+        }
         return out;
     }
 
-    // Sort in place with a comparator returning negative / zero / positive for a<b / a==b / a>b. Stable
-    // insertion sort: fine for the small-to-medium lists typical of server request handling, and stable so
-    // equal keys keep their input order.
-    pub fn sort(self: List<T>, cmp: (T, T) => int): void {
+    pub fn sort(self: List<T>, cmp: (T, T) -> int): void {
         let n = self.data.count();
         let i = 1;
         while (i < n) {
@@ -71,77 +221,106 @@ pub class List<T> {
         }
     }
 
-    // The first `n` elements as a NEW list (n clamped to [0, size]); the receiver is unchanged.
     pub fn take(self: List<T>, n: int): List<T> {
         let out = List<T>();
         let count = self.data.count();
-        let lim = n; if (lim < 0) { lim = 0; } if (lim > count) { lim = count; }
+        let lim = n;
+        if (lim < 0) {
+            lim = 0;
+        }
+        if (lim > count) {
+            lim = count;
+        }
         let i = 0;
-        while (i < lim) { out.push(self.data.at(i)); i = i + 1; }
-        return out;
-    }
-
-    // All but the first `n` elements as a NEW list (n clamped to [0, size]); the receiver is unchanged.
-    pub fn drop(self: List<T>, n: int): List<T> {
-        let out = List<T>();
-        let count = self.data.count();
-        let start = n; if (start < 0) { start = 0; } if (start > count) { start = count; }
-        let i = start;
-        while (i < count) { out.push(self.data.at(i)); i = i + 1; }
-        return out;
-    }
-
-    // How many elements satisfy `pred`.
-    pub fn count(self: List<T>, pred: (T) => bool): int {
-        let c = 0;
-        let i = 0;
-        while (i < self.data.count()) { if (pred(self.data.at(i))) { c = c + 1; } i = i + 1; }
-        return c;
-    }
-
-    // Map each element to a list and concatenate the results (map then flatten one level).
-    pub fn flatMap<U>(self: List<T>, fn: (T) => List<U>): List<U> {
-        let out = List<U>();
-        let i = 0;
-        while (i < self.data.count()) {
-            let sub = fn(self.data.at(i));
-            let j = 0;
-            while (j < sub.size()) { out.push(sub.at(j)); j = j + 1; }
+        while (i < lim) {
+            out.push(self.data.at(i));
             i = i + 1;
         }
         return out;
     }
 
-    // Split into consecutive lists of at most `size` elements (the last may be shorter). `size <= 0`
-    // returns an empty list.
+    pub fn drop(self: List<T>, n: int): List<T> {
+        let out = List<T>();
+        let count = self.data.count();
+        let start = n;
+        if (start < 0) {
+            start = 0;
+        }
+        if (start > count) {
+            start = count;
+        }
+        let i = start;
+        while (i < count) {
+            out.push(self.data.at(i));
+            i = i + 1;
+        }
+        return out;
+    }
+
+    pub fn count(self: List<T>, pred: (T) -> bool): int {
+        let c = 0;
+        let i = 0;
+        while (i < self.data.count()) {
+            if (pred(self.data.at(i))) {
+                c = c + 1;
+            }
+            i = i + 1;
+        }
+        return c;
+    }
+
+    pub fn flatMap<U>(self: List<T>, fn: (T) -> List<U>): List<U> {
+        let out = List<U>();
+        let i = 0;
+        while (i < self.data.count()) {
+            let sub = fn(self.data.at(i));
+            let j = 0;
+            while (j < sub.size()) {
+                out.push(sub.at(j));
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+
     pub fn chunk(self: List<T>, size: int): List<List<T>> {
         let out = List<List<T>>();
-        if (size <= 0) { return out; }
+        if (size <= 0) {
+            return out;
+        }
         let count = self.data.count();
         let i = 0;
         while (i < count) {
             let piece = List<T>();
             let j = 0;
-            while (j < size && (i + j) < count) { piece.push(self.data.at(i + j)); j = j + 1; }
+            while (j < size && i + j < count) {
+                piece.push(self.data.at(i + j));
+                j = j + 1;
+            }
             out.push(piece);
             i = i + size;
         }
         return out;
     }
 
-    // Pair each element with the element at the same index in `other`, up to the shorter length.
     pub fn zip<U>(self: List<T>, other: List<U>): List<(T, U)> {
         let out = List<(T, U)>();
         let n = self.data.count();
         let m = other.size();
-        let lim = n; if (m < lim) { lim = m; }
+        let lim = n;
+        if (m < lim) {
+            lim = m;
+        }
         let i = 0;
-        while (i < lim) { out.push((self.data.at(i), other.at(i))); i = i + 1; }
+        while (i < lim) {
+            out.push((self.data.at(i), other.at(i)));
+            i = i + 1;
+        }
         return out;
     }
 
-    // Sort in place by an integer key, ascending and stable (insertion sort, matching `sort`).
-    pub fn sortBy(self: List<T>, key: (T) => int): void {
+    pub fn sortBy(self: List<T>, key: (T) -> int): void {
         let n = self.data.count();
         let i = 1;
         while (i < n) {
@@ -161,8 +340,16 @@ pub class List<T> {
 @test
 fn test_list(): void {
     let list = List<int>();
-    if (list.size() != 0) { nova_test_fail("list.size != 0"); }
-    list.push(10); list.push(20); list.push(30);
-    if (list.size() != 3) { nova_test_fail("list.size != 3"); }
-    if (list.get(0) != 10) { nova_test_fail("list[0] != 10"); }
+    if (list.size() != 0) {
+        nova_test_fail("list.size != 0");
+    }
+    list.push(10);
+    list.push(20);
+    list.push(30);
+    if (list.size() != 3) {
+        nova_test_fail("list.size != 3");
+    }
+    if (list.get(0) != 10) {
+        nova_test_fail("list[0] != 10");
+    }
 }

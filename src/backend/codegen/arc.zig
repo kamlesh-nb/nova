@@ -318,11 +318,18 @@ pub fn substTypeParams(self: *LlvmCompiler, type_str: []const u8) anyerror![]con
     // overlay across the corpus, so it is NOT redundant yet). No type DECISION rides on it -- the method-U
     // decision engine was the deletable hazard, and that is gone. Fully retiring this needs
     // current_instantiation_id threaded everywhere current_instantiation is (a broader migration).
-    const after_struct = if (self.current_instantiation) |inst|
-        try self.substituteFieldType(inst, type_str)
-    else
-        type_str;
-    return try self.substMethodParams(after_struct);
+    // Return OWNED-or-borrowed (never cached): callers free the result when it differs from their input
+    // (e.g. llvm_codegen.zig:2081). Caching here would hand callers a cache-owned pointer they then free.
+    // Free the intermediate `after_struct` when it is a fresh allocation not passed through as the result.
+    if (self.current_instantiation) |inst| {
+        const after_struct = try self.substituteFieldType(inst, type_str);
+        const result = try self.substMethodParams(after_struct);
+        if (after_struct.ptr != type_str.ptr and after_struct.ptr != result.ptr) {
+            self.allocator.free(after_struct);
+        }
+        return result;
+    }
+    return try self.substMethodParams(type_str);
 }
 
 // substMethodParams moved to types.zig (SE-C): it is now overlay-primary (TypeId-native), with the legacy
@@ -741,6 +748,19 @@ pub fn getOrCreateDestructor(self: *LlvmCompiler, type_name: []const u8) anyerro
 
                 const field_dest = try self.getOrCreateDestructor(field_type);
                 try self.compileRelease(casted_field_val, field_dest);
+            } else if (self.structs.contains(getStructBaseName(field_type))) {
+                // Inline VALUE-STRUCT field (stored by value, not a heap reference). It is not released, but
+                // its OWNED sub-fields (e.g. a `string` inside it) still leak unless we recursively destruct
+                // them. Run the nested type's destructor ON THE INLINE FIELD ADDRESS: that destructor releases
+                // the nested struct's owned fields WITHOUT freeing anything (the field is inline, not heap).
+                if (try self.getOrCreateDestructor(field_type)) |field_dest| {
+                    const offset = try self.getFieldOffset(base_struct, field.name);
+                    const offset_val = core.LLVMConstInt(self.val_type, offset, 0);
+                    const faddr = core.LLVMBuildAdd(self.builder, self_val, offset_val, "vfield_addr");
+                    const fdt = core.LLVMGlobalGetValueType(field_dest);
+                    var da = [_]types.LLVMValueRef{faddr};
+                    _ = core.LLVMBuildCall2(self.builder, fdt, field_dest, &da, 1, "");
+                }
             }
         }
     }
@@ -834,7 +854,24 @@ fn getOrCreateStructDestructorByTypeId(self: *LlvmCompiler, t: typesys.TypeId) a
             break :blk subst.substitute(&sm.store, raw, stype.decl, stype.args) catch unresolvedDtorField(type_name, field.name);
         };
 
-        if (!self.isOwnedTypeId(c)) continue;
+        if (!self.isOwnedTypeId(c)) {
+            // Inline VALUE-STRUCT field (stored by value, not a heap reference): not released, but its OWNED
+            // sub-fields (e.g. a `string` inside it) still leak unless we recursively destruct them. Run the
+            // nested type's destructor ON THE INLINE FIELD ADDRESS -- it releases the nested struct's owned
+            // fields WITHOUT freeing anything (the field is inline). Without this, any struct holding a nested
+            // value-struct-with-heap-data leaks that data on every drop (e.g. db.Rows<ProductView>).
+            if (st.get(c) == .struct_) {
+                if (try self.getOrCreateDestructorByTypeId(c)) |field_dest| {
+                    const offset = try self.getFieldOffset(base_struct, field.name);
+                    const offset_val = core.LLVMConstInt(self.val_type, offset, 0);
+                    const faddr = core.LLVMBuildAdd(self.builder, self_val, offset_val, "vfield_addr");
+                    const fdt = core.LLVMGlobalGetValueType(field_dest);
+                    var da = [_]types.LLVMValueRef{faddr};
+                    _ = core.LLVMBuildCall2(self.builder, fdt, field_dest, &da, 1, "");
+                }
+            }
+            continue;
+        }
 
         const offset = try self.getFieldOffset(base_struct, field.name);
         const offset_val = core.LLVMConstInt(self.val_type, offset, 0);

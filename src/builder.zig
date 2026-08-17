@@ -182,6 +182,26 @@ fn compileProgram(
         }
     }
 
+    // Gap 8: demand-driven monomorphization -- "compile only what the app uses". Computes the set of
+    // function/method decls reachable from main() (call graph + vtable/serde/closure roots) and gates
+    // codegen emission on it, so uncalled generic methods (List/RawBuffer's 93% dead surface) and unreached
+    // subsystems (crypto in a plaintext app) are never emitted. Default ON for build (huge memory+speed win);
+    // NOVA_REACH_OFF disables. See docs/design/demand-driven-mono.md.
+    {
+        const reach = @import("frontend/sema/reach.zig");
+        const shadow = init.environ_map.get("NOVA_REACH_SHADOW") != null;
+        const gate = init.environ_map.get("NOVA_REACH_OFF") == null;
+        if (shadow or gate) {
+            var rr = reach.compute(allocator, &owned_sema.tab, &owned_sema.ir, program, false) catch reach.Result{};
+            defer rr.deinit(allocator);
+            if (shadow) reach.report(&rr, &owned_sema.tab);
+            if (gate) {
+                reach.publish(allocator, &rr, &owned_sema.tab);
+                reach.gate_on = true;
+            }
+        }
+    }
+
     // P7 Stage 1: report-only escape gauge (no codegen effect). See docs/design/p7-sound-arena.md.
     sema_escape.report_enabled = init.environ_map.get("NOVA_ESCAPE_REPORT") != null;
     if (sema_escape.report_enabled) _ = sema_escape.analyze(allocator, &owned_sema.store, &owned_sema.ir, &program);
@@ -264,6 +284,34 @@ fn compileProgram(
     sema_shadow.tidCensusReport();
     sema_shadow.reportF45();
     sema_mono.dumpMethodInsts();
+
+    if (init.environ_map.get("NOVA_MEM_STATS") != null) {
+        const store_types: usize = if (sema_shadow.live_sema) |sm| sm.store.count() else 0;
+        const interned_names: usize = if (sema_shadow.live_sema) |sm| sm.names.count() else 0;
+        std.debug.print(
+            \\=== NOVA_MEM_STATS ===
+            \\  program.declarations : {d}
+            \\  method_insts         : {d}
+            \\  free_fn_insts        : {d}
+            \\  forced_struct_insts  : {d}
+            \\  store types          : {d}
+            \\  interned names       : {d}
+            \\  renderLegacy calls   : {d}  (cache hits {d})
+            \\  render allocs        : {d}  bytes {d}
+            \\
+        , .{
+            program.declarations.len,
+            sema_mono.method_insts.items.len,
+            sema_mono.free_fn_insts.items.len,
+            sema_mono.forced_struct_insts.items.len,
+            store_types,
+            interned_names,
+            sema_shadow.render_calls,
+            sema_shadow.render_cache_hits,
+            sema_shadow.render_allocs,
+            sema_shadow.render_bytes,
+        });
+    }
 
         var clang_args = std.ArrayList([]const u8).empty;
         defer clang_args.deinit(allocator);
@@ -537,7 +585,9 @@ pub fn cmdBuild(allocator: std.mem.Allocator, init: std.process.Init, args: []co
         }
 
         while (true) {
-            var pass_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            // Back the per-iteration arena with the command allocator, never page_allocator (which never
+            // returns pages). The arena is deinit'd at the end of each watch iteration below.
+            var pass_arena = std.heap.ArenaAllocator.init(allocator);
             const pass_allocator = pass_arena.allocator();
 
             var visited = std.StringHashMap(void).init(pass_allocator);
