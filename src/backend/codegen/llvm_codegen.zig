@@ -550,9 +550,8 @@ pub const LlvmCompiler = struct {
                 // int-like: the value occupies the low bits of the i64 slot; DW_ATE_signed=5/unsigned=7.
                 return self.diBasicType(tn, 64, if (p.signed) 5 else 7);
             }
-            // Struct DITypes DISABLED: diStructType corrupted the compiler heap on large builds
-            // (nova-pg-web: malloc tiny_free_list invariant). Structs render as opaque pointers until the
-            // corruption is root-caused. Primitives + strings still show natively (no Python).
+            // Structs/containers are shown via the optional Python lldb formatter (per user decision),
+            // not native DITypes. Primitives + strings show natively.
         }
         return null;
     }
