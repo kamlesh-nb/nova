@@ -59,10 +59,14 @@ fn compileProgram(
     const tinfo = pipeline.deriveTargetInfo(target, target_triple_opt);
 
     // AddressSanitizer for native builds: default ON for debug, OFF for --release (and never for wasm).
-    // NOVA_ASAN=0 forces it off (e.g. a debug build you want to benchmark), NOVA_ASAN=1 forces it on even
-    // for --release. ASAN requires the clang link path (it pulls in the asan runtime + links the sanitized
-    // novacore_asan), so it also disables the in-process-LLD fast path below.
-    const asan = !is_wasm and (if (init.environ_map.get("NOVA_ASAN")) |v| !std.mem.eql(u8, v, "0") else !is_release);
+    // ASAN is OPT-IN (NOVA_ASAN=1), NOT a debug-build default. It is a memory-bug testing tool, not
+    // something an app developer stepping through code needs, and defaulting it on made debug builds
+    // depend on the linker's clang matching the exact ASAN runtime version that built libnovacore_asan.a
+    // -- when they differ (e.g. a VS Code task shell finds Apple clang 17 while the runtime was built with
+    // Homebrew clang 21) the link fails with `__asan_version_mismatch_check_v*` undefined. Off by default
+    // means plain debug builds link with any clang and run faster; the conformance --asan gate sets
+    // NOVA_ASAN=1 explicitly so it is unaffected. NOVA_ASAN=0 also forces off.
+    const asan = !is_wasm and (if (init.environ_map.get("NOVA_ASAN")) |v| !std.mem.eql(u8, v, "0") else false);
     // Opt-in: also instrument NOVA-GENERATED code with ASAN (not only the runtime), for provenance on a
     // Nova-code UAF. Requires the runtime ASAN link (so it implies `asan`); off unless NOVA_ASAN_CODEGEN set.
     codegen_arc.asan_codegen_enabled = asan and (init.environ_map.get("NOVA_ASAN_CODEGEN") != null);
