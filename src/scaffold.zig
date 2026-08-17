@@ -66,6 +66,20 @@ fn scaffoldWeb(allocator: std.mem.Allocator, io: std.Io, project: []const u8) !v
     for (files) |file| try scaffoldFile(allocator, io, project, file.rel, file.content);
 }
 
+fn writeVscodeConfig(allocator: std.mem.Allocator, io: std.Io, project: []const u8) !void {
+    const vscode_dir = try std.fmt.allocPrint(allocator, "{s}/.vscode", .{project});
+    defer allocator.free(vscode_dir);
+    Io.Dir.createDirPath(.cwd(), io, vscode_dir) catch |err| {
+        if (err != error.PathAlreadyExists) return err;
+    };
+    const launch_path = try std.fmt.allocPrint(allocator, "{s}/.vscode/launch.json", .{project});
+    defer allocator.free(launch_path);
+    try Io.Dir.writeFile(.cwd(), io, .{ .data = templates.vscode_launch_json, .sub_path = launch_path, .flags = .{} });
+    const tasks_path = try std.fmt.allocPrint(allocator, "{s}/.vscode/tasks.json", .{project});
+    defer allocator.free(tasks_path);
+    try Io.Dir.writeFile(.cwd(), io, .{ .data = templates.vscode_tasks_json, .sub_path = tasks_path, .flags = .{} });
+}
+
 fn scaffoldDesktop(allocator: std.mem.Allocator, io: std.Io, project: []const u8) !void {
     try scaffoldFile(allocator, io, project, "src/main.nova", templates.desktop_main_sample);
 }
@@ -137,25 +151,16 @@ pub fn cmdInit(allocator: std.mem.Allocator, init: std.process.Init, args: []con
         const test_path = try std.fmt.allocPrint(allocator, "{s}/tests/main_test.nova", .{project_name.?});
         defer allocator.free(test_path);
         try Io.Dir.writeFile(.cwd(), init.io, .{ .data = templates.console_test_sample, .sub_path = test_path, .flags = .{} });
-
-        // VS Code F5 debugging: lldb-dap launch config + build task (Gap 4). Auto-loads the Nova lldb
-        // data formatters so string/List/Map show their contents.
-        const vscode_dir = try std.fmt.allocPrint(allocator, "{s}/.vscode", .{project_name.?});
-        defer allocator.free(vscode_dir);
-        Io.Dir.createDirPath(.cwd(), init.io, vscode_dir) catch |err| {
-            if (err != error.PathAlreadyExists) return err;
-        };
-        const launch_path = try std.fmt.allocPrint(allocator, "{s}/.vscode/launch.json", .{project_name.?});
-        defer allocator.free(launch_path);
-        try Io.Dir.writeFile(.cwd(), init.io, .{ .data = templates.vscode_launch_json, .sub_path = launch_path, .flags = .{} });
-        const tasks_path = try std.fmt.allocPrint(allocator, "{s}/.vscode/tasks.json", .{project_name.?});
-        defer allocator.free(tasks_path);
-        try Io.Dir.writeFile(.cwd(), init.io, .{ .data = templates.vscode_tasks_json, .sub_path = tasks_path, .flags = .{} });
     } else if (std.mem.eql(u8, template_type, "web")) {
         try scaffoldWeb(allocator, init.io, project_name.?);
     } else {
         try scaffoldDesktop(allocator, init.io, project_name.?);
     }
+
+    // VS Code F5 debugging: lldb-dap launch config + build task (Gap 4), for EVERY template (the binary is
+    // always build/debug/bin/<project>). Auto-loads the Nova lldb formatters so string/struct/List/Map
+    // show their contents.
+    try writeVscodeConfig(allocator, init.io, project_name.?);
 
     const project_json_content = try std.fmt.allocPrint(allocator,
         \\{{

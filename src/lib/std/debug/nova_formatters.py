@@ -38,16 +38,67 @@ def nova_string_summary(valobj, internal_dict):
     return '"' + data.decode("utf-8", "replace") + '"'
 
 
-# NOTE on containers (List/Map/Set): a reliable count/element view is NOT done here on purpose. `size()`
-# is `data.count()` (the shared RawBuffer's len), but under value-struct copy semantics the len field in
-# the debugger-visible alloca can be a STALE copy while the program's own size() reads a different (live)
-# copy -- so a raw-memory read can report e.g. 2 for a list the program correctly sees as 3. Showing a
-# count that can disagree with the program is worse than showing none, so containers currently display as
-# their address only (via the compiler's named pointer typedef). A reliable view needs either evaluating
-# size() at the stop, or the value-struct-copy len update to be made consistent -- tracked as follow-up.
+def _read_i32(process, addr):
+    err = lldb.SBError()
+    raw = process.ReadMemory(addr, 4, err)
+    if err.Fail() or raw is None:
+        return None
+    return int.from_bytes(raw, "little", signed=True)
+
+
+def _read_ptr(process, addr):
+    err = lldb.SBError()
+    raw = process.ReadMemory(addr, 8, err)
+    if err.Fail() or raw is None:
+        return None
+    return int.from_bytes(raw, "little", signed=False)
+
+
+def _count(n):
+    if n is None or n < 0 or n > 64 * 1024 * 1024:
+        return None
+    return "%d element%s" % (n, "" if n == 1 else "s")
+
+
+# List<T> is a value struct { data ptr @0 -> RawBuffer, len int @8, cap int @12 }. size() is
+# data.count() = the shared RawBuffer's len @12, which is authoritative; read via the data pointer.
+def nova_list_summary(valobj, internal_dict):
+    ptr = valobj.GetValueAsUnsigned(0)
+    if ptr == 0:
+        return "(empty)"
+    proc = valobj.GetProcess()
+    rb = _read_ptr(proc, ptr)
+    n = _read_i32(proc, rb + 12) if rb else _read_i32(proc, ptr + 8)
+    return _count(n) or "List"
+
+
+# Map<K,V> is a class { cap int @0, len int @4, ... }. len is the live count.
+def nova_map_summary(valobj, internal_dict):
+    ptr = valobj.GetValueAsUnsigned(0)
+    if ptr == 0:
+        return "(empty)"
+    return _count(_read_i32(valobj.GetProcess(), ptr + 4)) or "Map"
+
+
+# Set<T> is a class { map: Map<T,bool> ptr @0 }, so its count is that Map's len @4.
+def nova_set_summary(valobj, internal_dict):
+    ptr = valobj.GetValueAsUnsigned(0)
+    if ptr == 0:
+        return "(empty)"
+    proc = valobj.GetProcess()
+    mp = _read_ptr(proc, ptr)
+    if not mp:
+        return "Set"
+    return _count(_read_i32(proc, mp + 4)) or "Set"
 
 
 def __lldb_init_module(debugger, internal_dict):
     debugger.HandleCommand(
         "type summary add -F nova_formatters.nova_string_summary string"
     )
+    # Container element COUNT (T-independent). Reliable at a statement boundary now that expression
+    # statements carry the correct line (the earlier "stale count" was a debug line off-by-one, not a
+    # value-struct-copy divergence). Per-element expansion still needs the element type in the DIType name.
+    debugger.HandleCommand("type summary add -F nova_formatters.nova_list_summary List")
+    debugger.HandleCommand("type summary add -F nova_formatters.nova_map_summary Map")
+    debugger.HandleCommand("type summary add -F nova_formatters.nova_set_summary Set")

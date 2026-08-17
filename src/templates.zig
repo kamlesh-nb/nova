@@ -21,12 +21,18 @@ pub const vscode_launch_json =
     \\      "name": "Debug Nova (debug build)",
     \\      "program": "${workspaceFolder}/build/debug/bin/${workspaceFolderBasename}",
     \\      "cwd": "${workspaceFolder}",
-    \\      "preLaunchTask": "nova: build (debug)"
+    \\      "preLaunchTask": "nova: build (debug)",
+    \\      "initCommands": [
+    \\        "command script import ~/.nova/std/debug/nova_formatters.py"
+    \\      ]
     \\    }
     \\  ]
     \\}
     \\
 ;
+// initCommands loads the OPTIONAL Nova lldb formatters (string contents + List/Map/Set counts). If
+// Python is unavailable lldb prints one import error and the session continues -- primitives, strings
+// (NUL-terminated), and structs still display natively without it.
 
 pub const vscode_tasks_json =
     \\{
