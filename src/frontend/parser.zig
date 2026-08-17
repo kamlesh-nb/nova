@@ -1701,6 +1701,10 @@ pub const Parser = struct {
     }
 
     fn parseExprStmt(self: *Parser) ParserError!ast.ExprStmt {
+        // Capture the span at the FIRST token of the statement. Using self.span() AFTER expect(.semicolon)
+        // returned the span of the NEXT token (next line) -- a +1 line off-by-one that put breakpoints on
+        // the wrong statement (a `foo();` on line N reported line N+1, colliding with the next statement).
+        const start = self.span();
         const expr = try self.parseExpression();
         if (expr.kind != .jsx_element) {
             try self.expect(.semicolon);
@@ -1709,7 +1713,7 @@ pub const Parser = struct {
         }
         return ast.ExprStmt{
             .expr = expr,
-            .span = self.span(),
+            .span = start,
         };
     }
 
