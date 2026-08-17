@@ -28,6 +28,15 @@ fn memPhase(label: []const u8) void {
     std.debug.print("[MEM] {s:<28} peak={d} MB\n", .{ label, mb });
 }
 
+// Demand pruning: drop functions unreachable from the program entry so a source file the app never
+// calls (crypto/tls/bson in a plain web app) produces NO object at all. On by default for builds;
+// set NOVA_NO_PRUNE=1 to fall back to compiling every imported file's object.
+var prune_on: ?bool = null;
+fn pruneEnabled() bool {
+    if (prune_on == null) prune_on = (std.c.getenv("NOVA_NO_PRUNE") == null);
+    return prune_on.?;
+}
+
 fn ffiCType(compiler: *LlvmCompiler, type_name: []const u8) types.LLVMTypeRef {
     if (std.mem.eql(u8, type_name, "int")) return compiler.i32_type;
     if (std.mem.eql(u8, type_name, "long")) return compiler.i64_type;
@@ -1276,6 +1285,73 @@ fn compileSplitEmit(
     }
 
     memPhase("after body emit + vtables");
+
+    // Symbol-name -> owning source file, built BEFORE any pruning while every func_map value is still
+    // live. Keys are duped because demand pruning below deletes the dead functions (and with them the
+    // LLVM name strings we'd otherwise alias).
+    var sym_to_file = std.StringHashMap([]const u8).init(allocator);
+    defer {
+        var kit = sym_to_file.keyIterator();
+        while (kit.next()) |k| allocator.free(k.*);
+        sym_to_file.deinit();
+    }
+    for (compiler.functions.items) |func| {
+        const v = compiler.func_map.get(func.name) orelse continue;
+        const sym = std.mem.span(core.LLVMGetValueName(v));
+        const file = if (func.source_file.len > 0) func.source_file else "<uncategorized>";
+        if (sym_to_file.contains(sym)) continue;
+        try sym_to_file.put(try allocator.dupe(u8, sym), file);
+    }
+
+    // Demand pruning (task #205): remove functions unreachable from __nova_main, so a wholly-unused
+    // source file emits no object. T6 needs surviving functions to keep their ORIGINAL (external)
+    // linkage for cross-object references, so this is two-phase: (1) compute the reachable set on a
+    // throwaway clone by internalizing everything but the entry and running globaldce; (2) on the real
+    // module, internalize only the DEAD functions and globaldce them away, leaving reachable functions'
+    // linkage untouched. globaldce is address-aware, so pointer-referenced coroutine/callback bodies
+    // reachable from main are retained. After this, func_map holds dangling refs to deleted functions
+    // -- everything downstream reads the MODULE, not func_map.
+    if (pruneEnabled()) {
+        var reachable = std.StringHashMap(void).init(allocator);
+        defer {
+            var kit = reachable.keyIterator();
+            while (kit.next()) |k| allocator.free(k.*);
+            reachable.deinit();
+        }
+        {
+            const clone = core.LLVMCloneModule(compiler.module);
+            defer core.LLVMDisposeModule(clone);
+            var cf = core.LLVMGetFirstFunction(clone);
+            while (cf != null) : (cf = core.LLVMGetNextFunction(cf)) {
+                const nm = std.mem.span(core.LLVMGetValueName(cf));
+                if (!std.mem.eql(u8, nm, "__nova_main")) core.LLVMSetLinkage(cf, .LLVMInternalLinkage);
+            }
+            const opts = transform.LLVMCreatePassBuilderOptions();
+            defer transform.LLVMDisposePassBuilderOptions(opts);
+            const perr = transform.LLVMRunPasses(clone, "globaldce", compiler.target_machine, opts);
+            if (perr != null) errors.LLVMConsumeError(perr);
+            var sf = core.LLVMGetFirstFunction(clone);
+            while (sf != null) : (sf = core.LLVMGetNextFunction(sf)) {
+                const nm = std.mem.span(core.LLVMGetValueName(sf));
+                try reachable.put(try allocator.dupe(u8, nm), {});
+            }
+        }
+        var rf = core.LLVMGetFirstFunction(compiler.module);
+        while (rf != null) : (rf = core.LLVMGetNextFunction(rf)) {
+            const nm = std.mem.span(core.LLVMGetValueName(rf));
+            if (std.mem.eql(u8, nm, "__nova_main")) continue;
+            if (!reachable.contains(nm)) core.LLVMSetLinkage(rf, .LLVMInternalLinkage);
+        }
+        const opts2 = transform.LLVMCreatePassBuilderOptions();
+        defer transform.LLVMDisposePassBuilderOptions(opts2);
+        const perr2 = transform.LLVMRunPasses(compiler.module, "globaldce", compiler.target_machine, opts2);
+        if (perr2 != null) errors.LLVMConsumeError(perr2);
+        memPhase("after demand prune");
+    }
+
+    // Group the SURVIVING owned function definitions by source file. Iterating the module (not
+    // func_map) is required post-prune: deleted functions are simply absent. Declarations (no body)
+    // are cross-object references or runtime symbols -- skipped, they have no owning file here.
     var all_syms = std.StringHashMap(void).init(allocator);
     defer all_syms.deinit();
     var file_syms = std.StringHashMap(std.StringHashMap(void)).init(allocator);
@@ -1284,14 +1360,17 @@ fn compileSplitEmit(
         while (it.next()) |v| v.deinit();
         file_syms.deinit();
     }
-    for (compiler.functions.items) |func| {
-        const v = compiler.func_map.get(func.name) orelse continue;
-        const sym = std.mem.span(core.LLVMGetValueName(v));
-        try all_syms.put(sym, {});
-        const file = if (func.source_file.len > 0) func.source_file else "<uncategorized>";
-        const gop = try file_syms.getOrPut(file);
-        if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap(void).init(allocator);
-        try gop.value_ptr.put(sym, {});
+    {
+        var mf = core.LLVMGetFirstFunction(compiler.module);
+        while (mf != null) : (mf = core.LLVMGetNextFunction(mf)) {
+            if (core.LLVMGetFirstBasicBlock(mf) == null) continue; // declaration, not owned here
+            const sym = std.mem.span(core.LLVMGetValueName(mf));
+            const file = sym_to_file.get(sym) orelse continue;
+            try all_syms.put(sym, {});
+            const gop = try file_syms.getOrPut(file);
+            if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap(void).init(allocator);
+            try gop.value_ptr.put(sym, {});
+        }
     }
 
     // Bump T6_CACHE_VERSION whenever codegen changes in a way that alters emitted objects, so every
