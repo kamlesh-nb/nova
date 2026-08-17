@@ -1293,8 +1293,11 @@ fn compileSplitEmit(
     // the whole-build content hash already skips no-change rebuilds entirely, so that saving was
     // marginal. Set NOVA_T6_SPLIT=1 to force the old per-file split (e.g. to inspect per-file objects).
     if (std.c.getenv("NOVA_T6_SPLIT") == null) {
+        // Name the single object after the app, e.g. build/<p>/obj/myapp.o. `stem` drops any extension
+        // on output_path (it can already carry a .o), so we don't produce myapp.o.o.
+        const app_name = std.fs.path.stem(output_path);
         const obj_path = if (cache_dir) |cdir|
-            try std.fmt.allocPrint(allocator, "{s}/_combined.o", .{cdir})
+            try std.fmt.allocPrint(allocator, "{s}/{s}.o", .{ cdir, app_name })
         else
             try std.fmt.allocPrint(allocator, "{s}.o", .{output_path});
         try emitModule(compiler, allocator, compiler.module, obj_path, false, is_release, null);
