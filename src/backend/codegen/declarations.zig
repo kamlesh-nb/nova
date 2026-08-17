@@ -63,6 +63,16 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
     compiler.f2_types = sema_shadow.f2_types_enabled;
     defer compiler.deinit();
 
+    // Resolve the absolute cwd once so DWARF records absolute source dirs (lldb-dap matches
+    // breakpoints by absolute path; a relative dir only binds by basename, which it won't do).
+    {
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.Io.Dir.realPathFile(.cwd(), io, ".", &cwd_buf)) |n| {
+            compiler.di_cwd = allocator.dupe(u8, cwd_buf[0..n]) catch null;
+        } else |_| {}
+    }
+    defer if (compiler.di_cwd) |c| allocator.free(c);
+
     compiler.program = program;
     memPhase("compile start");
 

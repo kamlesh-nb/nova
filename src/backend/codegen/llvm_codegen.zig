@@ -122,6 +122,9 @@ pub const LlvmCompiler = struct {
     di_builder: types.LLVMDIBuilderRef = null,
     di_cu: types.LLVMMetadataRef = null,
     di_file: types.LLVMMetadataRef = null,
+    // Absolute process cwd, resolved once, so relative source dirs become absolute DWARF paths a
+    // debugger can match against an absolute-path breakpoint. Null => leave dirs relative (fallback).
+    di_cwd: ?[]const u8 = null,
     di_scope: types.LLVMMetadataRef = null,
     di_scope_file: types.LLVMMetadataRef = null,
     debug_enabled: bool = false,
@@ -425,8 +428,19 @@ pub const LlvmCompiler = struct {
         if (self.di_builder == null) return null;
         if (self.di_files.get(path)) |f| return f;
         const slash = std.mem.lastIndexOfScalar(u8, path, '/');
-        const dir_s = if (slash) |s| path[0..s] else ".";
+        const dir_rel = if (slash) |s| path[0..s] else ".";
         const base_s = if (slash) |s| path[s + 1 ..] else path;
+        // DWARF must carry ABSOLUTE directories so a debugger (lldb-dap / VS Code) can match a
+        // breakpoint it sets by absolute file path. A relative dir binds only by basename, which
+        // lldb CLI tolerates but lldb-dap does not — the breakpoint stays pending and never fires.
+        // Prefix the process cwd for relative source dirs; leave already-absolute paths untouched.
+        var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dir_s: []const u8 = blk: {
+            if (dir_rel.len > 0 and dir_rel[0] == '/') break :blk dir_rel;
+            const cwd = self.di_cwd orelse break :blk dir_rel;
+            const joined = std.fmt.bufPrint(&abs_buf, "{s}/{s}", .{ cwd, dir_rel }) catch break :blk dir_rel;
+            break :blk joined;
+        };
         const base_z = self.allocator.dupeZ(u8, base_s) catch return null;
         defer self.allocator.free(base_z);
         const dir_z = self.allocator.dupeZ(u8, dir_s) catch return null;
