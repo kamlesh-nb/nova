@@ -1285,6 +1285,23 @@ fn compileSplitEmit(
         }
     }
 
+    // DEFAULT: emit ONE object. The per-file split cloned the whole module once PER FILE (97x on the
+    // pizza app) -- O(files x functions) redundant work that DOMINATED the build AND used more memory
+    // (each clone is a transient full copy). Measured on nova-pg-web: split 146s / 1031MB peak vs
+    // single-object 38s / 332MB (debug), 45s / 547MB (release). The whole-module codegen (the real cost)
+    // runs either way, so per-file caching only ever saved the small per-file EMIT of unchanged files;
+    // the whole-build content hash already skips no-change rebuilds entirely, so that saving was
+    // marginal. Set NOVA_T6_SPLIT=1 to force the old per-file split (e.g. to inspect per-file objects).
+    if (std.c.getenv("NOVA_T6_SPLIT") == null) {
+        const obj_path = if (cache_dir) |cdir|
+            try std.fmt.allocPrint(allocator, "{s}/_combined.o", .{cdir})
+        else
+            try std.fmt.allocPrint(allocator, "{s}.o", .{output_path});
+        try emitModule(compiler, allocator, compiler.module, obj_path, false, is_release, null);
+        try objs.append(allocator, obj_path);
+        return;
+    }
+
     memPhase("after body emit + vtables");
 
     var all_syms = std.StringHashMap(void).init(allocator);
