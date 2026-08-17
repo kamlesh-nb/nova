@@ -564,8 +564,14 @@ pub const LlvmCompiler = struct {
                 // int-like: the value occupies the low bits of the i64 slot; DW_ATE_signed=5/unsigned=7.
                 return self.diBasicType(tn, 64, if (p.signed) 5 else 7);
             }
-            // Structs/containers are shown via the optional Python lldb formatter (per user decision),
-            // not native DITypes. Primitives + strings show natively.
+            // A struct local: the i64 slot holds a POINTER to the heap struct. Give it a native
+            // pointer-to-struct DIType so lldb / the VS Code Variables panel expand its fields with no
+            // Python. Nested struct/container FIELDS still render as opaque addresses (see diFieldType);
+            // the optional Python formatter enriches containers.
+            const base = getStructBaseName(tn);
+            if (self.structs.get(base) != null) return self.diStructType(base);
+            // Containers (List/Map/Set) + other boxed aggregates: no native DIType (dynamic length is
+            // not expressible via the LLVM C DWARF API) -- shown via the optional Python formatter.
         }
         return null;
     }
@@ -585,15 +591,28 @@ pub const LlvmCompiler = struct {
     // DIType for a struct FIELD, by type name. Primitives + string get real value types; nested structs
     // and everything else (decimal/containers/optionals) render as an opaque pointer (address only) --
     // keeps this non-recursive and cycle-safe for the first cut.
-    fn diFieldType(self: *LlvmCompiler, tn: []const u8) types.LLVMMetadataRef {
+    // Create a DIBasicType WITHOUT the di_types name-cache. Needed for struct fields: the same display
+    // name (e.g. "int") is a 64-bit local slot but a 32-bit field, and a name-keyed cache would hand one
+    // the other's width. LLVM uniques DIBasicTypes by content, so skipping our cache costs nothing.
+    fn diBasicTypeUncached(self: *LlvmCompiler, name: []const u8, size_bits: u64, encoding: c_uint) types.LLVMMetadataRef {
+        const name_z = self.allocator.dupeZ(u8, name) catch return null;
+        defer self.allocator.free(name_z);
+        return debug.LLVMDIBuilderCreateBasicType(self.di_builder, name_z.ptr, name.len, size_bits, encoding, .LLVMDIFlagZero);
+    }
+
+    // DIType for a struct FIELD. Unlike a local (which sits in a 64-bit slot), a field is stored at its
+    // REAL width inside the heap struct, so the basic type must be sized to getTypeSize(tn)*8 -- a
+    // 32-bit `int` field declared as 64-bit makes lldb read 8 bytes and swallow the next field.
+    fn diFieldType(self: *LlvmCompiler, tn: []const u8, f_size: u32) types.LLVMMetadataRef {
         if (std.mem.eql(u8, tn, "string")) return self.diStringType();
         if (types_mod.cgPrim(tn)) |p| {
-            if (p.repr == .i1) return self.diBasicType("bool", 8, 2);
-            if (p.repr == .f32 or p.repr == .f64) return self.diBasicType("f64", 64, 4);
-            if (p.repr == .word) return self.diBasicType("uptr", 64, 7);
-            return self.diBasicType(tn, 64, if (p.signed) 5 else 7);
+            const bits: u64 = if (f_size == 0) 64 else @as(u64, f_size) * 8;
+            if (p.repr == .i1) return self.diBasicTypeUncached("bool", bits, 2);
+            if (p.repr == .f32 or p.repr == .f64) return self.diBasicTypeUncached(tn, bits, 4);
+            if (p.repr == .word) return self.diBasicTypeUncached("uptr", 64, 7);
+            return self.diBasicTypeUncached(tn, bits, if (p.signed) 5 else 7);
         }
-        return self.diBasicType("uptr", 64, 7); // opaque: show the address
+        return self.diBasicTypeUncached("uptr", 64, 7); // opaque: show the address
     }
 
     // A pointer-to-struct DIType with a member per field (name, DIType, byte offset), so lldb natively
@@ -614,7 +633,10 @@ pub const LlvmCompiler = struct {
             // Not freed: typeRefToString's ownership via substTypeParams is ambiguous, and diStructType is
             // cached (runs once per struct type), so the leak is a few bytes in a short-lived compiler.
             const fname = self.typeRefToString(field.type_name) catch "";
-            const f_di = self.diFieldType(fname);
+            // Pass the SAME f_size used for the member offset/size, so the field's basic-type width can't
+            // diverge from its slot (getTypeSize("int") the string returns the 8-byte slot size, but the
+            // packed field is f_size bytes -- a mismatch made lldb read 8 bytes and swallow the next field).
+            const f_di = self.diFieldType(fname, f_size);
             const nm_z = self.allocator.dupeZ(u8, field.name) catch continue;
             defer self.allocator.free(nm_z);
             const m = debug.LLVMDIBuilderCreateMemberType(self.di_builder, self.di_cu, nm_z.ptr, field.name.len, self.di_file, 0, @as(u64, f_size) * 8, 0, @as(u64, offset) * 8, .LLVMDIFlagZero, f_di);
