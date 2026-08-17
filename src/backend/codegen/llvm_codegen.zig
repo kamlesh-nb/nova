@@ -125,6 +125,7 @@ pub const LlvmCompiler = struct {
     di_scope: types.LLVMMetadataRef = null,
     di_scope_file: types.LLVMMetadataRef = null,
     debug_enabled: bool = false,
+    di_finalized: bool = false,
     // DIFile per source path (Span.file), so per-function debug info attributes to the right file
     // in a merged multi-file program. Keyed by the source path string.
     di_files: std.StringHashMap(types.LLVMMetadataRef) = undefined,
@@ -549,10 +550,9 @@ pub const LlvmCompiler = struct {
                 // int-like: the value occupies the low bits of the i64 slot; DW_ATE_signed=5/unsigned=7.
                 return self.diBasicType(tn, 64, if (p.signed) 5 else 7);
             }
-            // A user struct/class local is an i64 slot holding a pointer to the heap object -> emit a
-            // pointer-to-struct DIType so lldb shows the fields natively (no Python).
-            const base = types_mod.getStructBaseName(tn);
-            if (self.structs.contains(base)) return self.diStructType(base);
+            // Struct DITypes DISABLED: diStructType corrupted the compiler heap on large builds
+            // (nova-pg-web: malloc tiny_free_list invariant). Structs render as opaque pointers until the
+            // corruption is root-caused. Primitives + strings still show natively (no Python).
         }
         return null;
     }
@@ -652,7 +652,13 @@ pub const LlvmCompiler = struct {
                 debug.LLVMSetSubprogram(f, null);
             }
         }
-        debug.LLVMDIBuilderFinalize(dib);
+        // Finalize EXACTLY ONCE. emitModule runs per emitted module (97x under T6 split), but
+        // LLVMDIBuilderFinalize must be called once -- repeated calls double-free the DIBuilder's
+        // temporary nodes (malloc "tiny_free_list_remove_ptr" heap corruption on multi-file builds).
+        if (!self.di_finalized) {
+            debug.LLVMDIBuilderFinalize(dib);
+            self.di_finalized = true;
+        }
     }
 
     pub fn deinit(self: *LlvmCompiler) void {
