@@ -15,7 +15,7 @@
 
 namespace {
 
-constexpr size_t FALLBACK_ARENA_SIZE = 32 * 1024 * 1024;
+constexpr size_t FALLBACK_ARENA_SIZE = 8 * 1024 * 1024;
 inline size_t arena_align(size_t s) { return (s + 7) & ~size_t(7); }
 
 thread_local char *t_arena_start = nullptr;

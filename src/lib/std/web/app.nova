@@ -442,7 +442,7 @@ fn reactorWorkerBody(app: App, idx: int): void {
     sys.listen(lfd, 512);
     sys.setNonBlocking(lfd);
 
-    let r = poller.Reactor(1024, 16384, 1024);
+    let r = poller.Reactor(1024, 16384, 256);
     poller.setCurrent(r.kq);
     coroStart(reactorAcceptLoop(app, lfd, r.kq));
 
@@ -496,7 +496,7 @@ fn reactorHandoffBody(app: App, sockPath: string): void {
     if (ok != 0) { console.log("Nova web: could not reach the service handoff socket " + sockPath); return; }
     socket.setNonBlock(ctrl);
 
-    let r = poller.Reactor(1024, 16384, 1024);
+    let r = poller.Reactor(1024, 16384, 256);
     poller.setCurrent(r.kq);
     coroStart(handoffRecvLoop(app, ctrl, r.kq));
     console.log("Nova web server listening (fd-handoff receiver on " + sockPath + ")");
@@ -529,7 +529,7 @@ pub fn runReactor(self: App, port: int): void {
     sys.listen(lfd, 512);
     sys.setNonBlocking(lfd);
 
-    let r = poller.Reactor(1024, 16384, 1024);
+    let r = poller.Reactor(1024, 16384, 256);
     poller.setCurrent(r.kq);
     coroStart(reactorAcceptLoop(self, lfd, r.kq));
     console.log("Nova web server listening (Nova reactor)");
