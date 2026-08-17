@@ -441,10 +441,33 @@ pub const LlvmCompiler = struct {
         const dir_s: []const u8 = blk: {
             if (synthetic) break :blk dir_rel;
             if (dir_rel.len > 0 and dir_rel[0] == '/') break :blk dir_rel;
+            // The stdlib is compiled under the logical prefix `src/std/...` but its SOURCE actually lives
+            // at ~/.nova/std/... . Prefixing the app cwd would point the debugger at <app>/src/std/... ,
+            // which does not exist -> "the editor could not be opened, file not found" the moment you step
+            // into List/string/etc. Map the stdlib prefix to the real install dir instead.
+            if (std.mem.startsWith(u8, dir_rel, "src/std")) {
+                if (std.c.getenv("HOME")) |home_c| {
+                    const rest = dir_rel["src/std".len..]; // "" or "/collections" ...
+                    const joined = std.fmt.bufPrint(&abs_buf, "{s}/.nova/std{s}", .{ std.mem.span(home_c), rest }) catch break :blk dir_rel;
+                    break :blk joined;
+                }
+            }
             const cwd = self.di_cwd orelse break :blk dir_rel;
             const joined = std.fmt.bufPrint(&abs_buf, "{s}/{s}", .{ cwd, dir_rel }) catch break :blk dir_rel;
             break :blk joined;
         };
+        // Catch-all: if the resolved source does not exist on disk (target-conditional stdlib logical names
+        // like net/eventloop.nova -> net/ev/kqueue.nova, injected helpers.nova, cache/package paths, ...),
+        // emit NO debug info for it. A DIFile pointing at a missing path makes VS Code pop "the editor
+        // could not be opened, file not found" when you step into that frame. Better to step over silently.
+        if (dir_s.len > 0 and dir_s[0] == '/') {
+            var chk_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const full_z = std.fmt.bufPrintZ(&chk_buf, "{s}/{s}", .{ dir_s, base_s }) catch null;
+            if (full_z == null or std.c.access(full_z.?.ptr, 0) != 0) {
+                self.di_files.put(path, null) catch {};
+                return null;
+            }
+        }
         const base_z = self.allocator.dupeZ(u8, base_s) catch return null;
         defer self.allocator.free(base_z);
         const dir_z = self.allocator.dupeZ(u8, dir_s) catch return null;
@@ -499,7 +522,7 @@ pub const LlvmCompiler = struct {
         // steps over with no source, which is correct.
         if (self.di_builder == null or file.len == 0 or file[0] == '<') return;
         self.ensureDebugCU(file);
-        const dif = self.diFileFor(file);
+        const dif = self.diFileFor(file) orelse return; // missing source on disk -> no debug info (steps over)
         self.di_scope_file = dif;
         var params0 = [_]types.LLVMMetadataRef{null}; // element 0 = return type (null => void)
         const subr = debug.LLVMDIBuilderCreateSubroutineType(self.di_builder, dif, &params0, 1, .LLVMDIFlagZero);
