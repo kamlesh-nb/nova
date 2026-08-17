@@ -570,10 +570,27 @@ pub const LlvmCompiler = struct {
             // the optional Python formatter enriches containers.
             const base = getStructBaseName(tn);
             if (self.structs.get(base) != null) return self.diStructType(base);
-            // Containers (List/Map/Set) + other boxed aggregates: no native DIType (dynamic length is
-            // not expressible via the LLVM C DWARF API) -- shown via the optional Python formatter.
+            // Containers (List/Map/Set): dynamic length is not expressible via the LLVM C DWARF API, so
+            // give the local a NAMED pointer typedef (name carries the instantiation, e.g. "List<int>")
+            // so it appears in the Variables panel, and the optional Python formatter reads its elements.
+            if (std.mem.eql(u8, base, "List") or std.mem.eql(u8, base, "Map") or std.mem.eql(u8, base, "Set"))
+                return self.diContainerType(tn);
         }
         return null;
+    }
+
+    // A pointer typedef named after the container instantiation (e.g. "List<int>"), so an lldb type
+    // synthetic/summary can match it by name and read elements. The pointee is opaque here.
+    fn diContainerType(self: *LlvmCompiler, tn: []const u8) types.LLVMMetadataRef {
+        if (self.di_builder == null) return null;
+        if (self.di_types.get(tn)) |t| return t;
+        const byte_t = self.diBasicType("u8", 8, 7);
+        const ptr = debug.LLVMDIBuilderCreatePointerType(self.di_builder, byte_t, 64, 0, 0, "", 0);
+        const tn_z = self.allocator.dupeZ(u8, tn) catch return null;
+        defer self.allocator.free(tn_z);
+        const td = debug.LLVMDIBuilderCreateTypedef(self.di_builder, ptr, tn_z.ptr, tn.len, self.di_file, 0, self.di_cu, 0);
+        self.di_types.put(tn, td) catch {};
+        return td;
     }
 
     // Nova `string` as a typedef over a char* named "string" -- NUL-terminated, so lldb's built-in char*
