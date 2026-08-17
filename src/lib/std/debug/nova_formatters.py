@@ -11,8 +11,21 @@
 
 import lldb
 
+# A formatter must NEVER raise -- an exception breaks the whole Variables panel for that frame (which is
+# how "cannot debug handlers" happened: an uninitialised/garbage `string` slot in an async handler frame
+# made ReadMemory(ptr-4) underflow addr_t and throw). Guard every pointer and wrap every provider so a
+# bad value degrades to a placeholder, never a traceback.
+_MIN_PTR = 0x1000
+_MAX_PTR = 1 << 48
+
+
+def _plausible(ptr):
+    return isinstance(ptr, int) and _MIN_PTR <= ptr < _MAX_PTR
+
 
 def _arc_len(process, ptr):
+    if not _plausible(ptr):
+        return None
     err = lldb.SBError()
     raw = process.ReadMemory(ptr - 4, 4, err)
     if err.Fail() or raw is None:
@@ -22,23 +35,30 @@ def _arc_len(process, ptr):
 
 
 def nova_string_summary(valobj, internal_dict):
-    ptr = valobj.GetValueAsUnsigned(0)
-    if ptr == 0:
-        return '""'
-    process = valobj.GetProcess()
-    n = _arc_len(process, ptr)
-    if n is None:
-        return "<string len?>"
-    if n == 0:
-        return '""'
-    err = lldb.SBError()
-    data = process.ReadMemory(ptr, n, err)
-    if err.Fail() or data is None:
-        return "<string ?>"
-    return '"' + data.decode("utf-8", "replace") + '"'
+    try:
+        ptr = valobj.GetValueAsUnsigned(0)
+        if ptr == 0:
+            return '""'
+        if not _plausible(ptr):
+            return "<str?>"
+        process = valobj.GetProcess()
+        n = _arc_len(process, ptr)
+        if n is None:
+            return "<str?>"
+        if n == 0:
+            return '""'
+        err = lldb.SBError()
+        data = process.ReadMemory(ptr, n, err)
+        if err.Fail() or data is None:
+            return "<str?>"
+        return '"' + data.decode("utf-8", "replace") + '"'
+    except Exception:
+        return "<str?>"
 
 
 def _read_i32(process, addr):
+    if not _plausible(addr):
+        return None
     err = lldb.SBError()
     raw = process.ReadMemory(addr, 4, err)
     if err.Fail() or raw is None:
@@ -47,6 +67,8 @@ def _read_i32(process, addr):
 
 
 def _read_ptr(process, addr):
+    if not _plausible(addr):
+        return None
     err = lldb.SBError()
     raw = process.ReadMemory(addr, 8, err)
     if err.Fail() or raw is None:
@@ -63,33 +85,42 @@ def _count(n):
 # List<T> is a value struct { data ptr @0 -> RawBuffer, len int @8, cap int @12 }. size() is
 # data.count() = the shared RawBuffer's len @12, which is authoritative; read via the data pointer.
 def nova_list_summary(valobj, internal_dict):
-    ptr = valobj.GetValueAsUnsigned(0)
-    if ptr == 0:
-        return "(empty)"
-    proc = valobj.GetProcess()
-    rb = _read_ptr(proc, ptr)
-    n = _read_i32(proc, rb + 12) if rb else _read_i32(proc, ptr + 8)
-    return _count(n) or "List"
+    try:
+        ptr = valobj.GetValueAsUnsigned(0)
+        if ptr == 0:
+            return "(empty)"
+        proc = valobj.GetProcess()
+        rb = _read_ptr(proc, ptr)
+        n = _read_i32(proc, rb + 12) if rb else _read_i32(proc, ptr + 8)
+        return _count(n) or "List"
+    except Exception:
+        return "List"
 
 
 # Map<K,V> is a class { cap int @0, len int @4, ... }. len is the live count.
 def nova_map_summary(valobj, internal_dict):
-    ptr = valobj.GetValueAsUnsigned(0)
-    if ptr == 0:
-        return "(empty)"
-    return _count(_read_i32(valobj.GetProcess(), ptr + 4)) or "Map"
+    try:
+        ptr = valobj.GetValueAsUnsigned(0)
+        if ptr == 0:
+            return "(empty)"
+        return _count(_read_i32(valobj.GetProcess(), ptr + 4)) or "Map"
+    except Exception:
+        return "Map"
 
 
 # Set<T> is a class { map: Map<T,bool> ptr @0 }, so its count is that Map's len @4.
 def nova_set_summary(valobj, internal_dict):
-    ptr = valobj.GetValueAsUnsigned(0)
-    if ptr == 0:
-        return "(empty)"
-    proc = valobj.GetProcess()
-    mp = _read_ptr(proc, ptr)
-    if not mp:
+    try:
+        ptr = valobj.GetValueAsUnsigned(0)
+        if ptr == 0:
+            return "(empty)"
+        proc = valobj.GetProcess()
+        mp = _read_ptr(proc, ptr)
+        if not mp:
+            return "Set"
+        return _count(_read_i32(proc, mp + 4)) or "Set"
+    except Exception:
         return "Set"
-    return _count(_read_i32(proc, mp + 4)) or "Set"
 
 
 def __lldb_init_module(debugger, internal_dict):
