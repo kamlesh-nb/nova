@@ -541,19 +541,7 @@ pub const LlvmCompiler = struct {
         if (kind == .LLVMDoubleTypeKind) return self.diBasicType("f64", 64, 4);
         if (kind == .LLVMIntegerTypeKind) {
             const tn = type_name orelse return null;
-            // Nova `string` is a pointer (i64 slot) to ARC-headered bytes (len i32 @ ptr-4, data @ ptr).
-            // Emit it as a pointer type NAMED "string" so lldb reports `(string)` and an lldb Python
-            // summary (item 3) can deref + read the length to show the CONTENTS instead of an address.
-            if (std.mem.eql(u8, tn, "string")) {
-                if (self.di_types.get("string")) |t| return t;
-                const char_t = self.diBasicType("char", 8, 6); // DW_ATE_signed_char
-                const strp = debug.LLVMDIBuilderCreatePointerType(self.di_builder, char_t, 64, 0, 0, "char", "char".len);
-                // Typedef the char pointer to "string" so lldb reports `(string)`, which the Nova lldb
-                // Python summary matches to read len@ptr-4 + the bytes (Nova strings are NOT NUL-terminated).
-                const strtd = debug.LLVMDIBuilderCreateTypedef(self.di_builder, strp, "string", "string".len, self.di_file, 0, self.di_cu, 0);
-                self.di_types.put("string", strtd) catch {};
-                return strtd;
-            }
+            if (std.mem.eql(u8, tn, "string")) return self.diStringType();
             if (types_mod.cgPrim(tn)) |p| {
                 if (p.repr == .word) return null; // raw ptr -> not a displayable scalar here
                 if (p.repr == .i1) return self.diBasicType("bool", 8, 2); // DW_ATE_boolean, reads low byte
@@ -561,8 +549,74 @@ pub const LlvmCompiler = struct {
                 // int-like: the value occupies the low bits of the i64 slot; DW_ATE_signed=5/unsigned=7.
                 return self.diBasicType(tn, 64, if (p.signed) 5 else 7);
             }
+            // A user struct/class local is an i64 slot holding a pointer to the heap object -> emit a
+            // pointer-to-struct DIType so lldb shows the fields natively (no Python).
+            const base = types_mod.getStructBaseName(tn);
+            if (self.structs.contains(base)) return self.diStructType(base);
         }
         return null;
+    }
+
+    // Nova `string` as a typedef over a char* named "string" -- NUL-terminated, so lldb's built-in char*
+    // summary shows the contents natively (no Python). Cached.
+    fn diStringType(self: *LlvmCompiler) types.LLVMMetadataRef {
+        if (self.di_builder == null) return null;
+        if (self.di_types.get("string")) |t| return t;
+        const char_t = self.diBasicType("char", 8, 6); // DW_ATE_signed_char
+        const strp = debug.LLVMDIBuilderCreatePointerType(self.di_builder, char_t, 64, 0, 0, "char", "char".len);
+        const strtd = debug.LLVMDIBuilderCreateTypedef(self.di_builder, strp, "string", "string".len, self.di_file, 0, self.di_cu, 0);
+        self.di_types.put("string", strtd) catch {};
+        return strtd;
+    }
+
+    // DIType for a struct FIELD, by type name. Primitives + string get real value types; nested structs
+    // and everything else (decimal/containers/optionals) render as an opaque pointer (address only) --
+    // keeps this non-recursive and cycle-safe for the first cut.
+    fn diFieldType(self: *LlvmCompiler, tn: []const u8) types.LLVMMetadataRef {
+        if (std.mem.eql(u8, tn, "string")) return self.diStringType();
+        if (types_mod.cgPrim(tn)) |p| {
+            if (p.repr == .i1) return self.diBasicType("bool", 8, 2);
+            if (p.repr == .f32 or p.repr == .f64) return self.diBasicType("f64", 64, 4);
+            if (p.repr == .word) return self.diBasicType("uptr", 64, 7);
+            return self.diBasicType(tn, 64, if (p.signed) 5 else 7);
+        }
+        return self.diBasicType("uptr", 64, 7); // opaque: show the address
+    }
+
+    // A pointer-to-struct DIType with a member per field (name, DIType, byte offset), so lldb natively
+    // shows `(T) x = { field = value, ... }`. Field offsets mirror getFieldOffset (aligned, getTypeSize).
+    // Cached by base name; struct-typed fields are shown as opaque pointers (see diFieldType) so this is
+    // non-recursive and cannot cycle.
+    fn diStructType(self: *LlvmCompiler, base: []const u8) types.LLVMMetadataRef {
+        if (self.di_builder == null) return null;
+        if (self.di_types.get(base)) |t| return t;
+        const s = self.structs.get(base) orelse return null;
+        var members: std.ArrayListUnmanaged(types.LLVMMetadataRef) = .empty;
+        defer members.deinit(self.allocator);
+        var offset: u32 = 0;
+        for (s.fields) |field| {
+            const f_size = self.getTypeSize(field.type_name, true);
+            const f_align = self.getTypeAlign(field.type_name);
+            if (f_align != 0) offset = (offset + f_align - 1) / f_align * f_align;
+            // Not freed: typeRefToString's ownership via substTypeParams is ambiguous, and diStructType is
+            // cached (runs once per struct type), so the leak is a few bytes in a short-lived compiler.
+            const fname = self.typeRefToString(field.type_name) catch "";
+            const f_di = self.diFieldType(fname);
+            const nm_z = self.allocator.dupeZ(u8, field.name) catch continue;
+            defer self.allocator.free(nm_z);
+            const m = debug.LLVMDIBuilderCreateMemberType(self.di_builder, self.di_cu, nm_z.ptr, field.name.len, self.di_file, 0, @as(u64, f_size) * 8, 0, @as(u64, offset) * 8, .LLVMDIFlagZero, f_di);
+            members.append(self.allocator, m) catch {};
+            offset += f_size;
+        }
+        const base_z = self.allocator.dupeZ(u8, base) catch return null;
+        defer self.allocator.free(base_z);
+        const st = debug.LLVMDIBuilderCreateStructType(self.di_builder, self.di_cu, base_z.ptr, base.len, self.di_file, 0, @as(u64, offset) * 8, 0, .LLVMDIFlagZero, null, members.items.ptr, @intCast(members.items.len), 0, null, "", 0);
+        // The local holds a POINTER to the heap struct; typedef the pointer to the struct name so lldb
+        // reports `(T)` and expands the fields.
+        const ptr = debug.LLVMDIBuilderCreatePointerType(self.di_builder, st, 64, 0, 0, "", 0);
+        const td = debug.LLVMDIBuilderCreateTypedef(self.di_builder, ptr, base_z.ptr, base.len, self.di_file, 0, self.di_cu, 0);
+        self.di_types.put(base, td) catch {};
+        return td;
     }
 
     // Emit a DILocalVariable + llvm.dbg.declare so `frame variable` / hover shows this local's real
