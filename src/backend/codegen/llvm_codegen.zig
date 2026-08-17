@@ -434,8 +434,12 @@ pub const LlvmCompiler = struct {
         // breakpoint it sets by absolute file path. A relative dir binds only by basename, which
         // lldb CLI tolerates but lldb-dap does not — the breakpoint stays pending and never fires.
         // Prefix the process cwd for relative source dirs; leave already-absolute paths untouched.
+        // EXCEPT synthetic generated "files" (<mediator-generated> etc.): never make those absolute, or
+        // lldb/VS Code tries to open a nonexistent `<cwd>/./<...>` path.
+        const synthetic = base_s.len > 0 and base_s[0] == '<';
         var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
         const dir_s: []const u8 = blk: {
+            if (synthetic) break :blk dir_rel;
             if (dir_rel.len > 0 and dir_rel[0] == '/') break :blk dir_rel;
             const cwd = self.di_cwd orelse break :blk dir_rel;
             const joined = std.fmt.bufPrint(&abs_buf, "{s}/{s}", .{ cwd, dir_rel }) catch break :blk dir_rel;
@@ -488,7 +492,12 @@ pub const LlvmCompiler = struct {
         // DISubprogram must carry no !dbg (else the verifier rejects a location whose scope is another
         // function). This runs for every function, so cross-function contamination cannot happen.
         core.LLVMSetCurrentDebugLocation2(self.builder, null);
-        if (self.di_builder == null or file.len == 0) return;
+        // Synthetic compiler-generated "files" (<mediator-generated>, <serde-generated>, <rmediator-...>)
+        // are not real source. Emitting a DISubprogram for them made lldb/VS Code try to OPEN (or create)
+        // a path like `<cwd>/./<mediator-generated>` when stepping through the dispatch that every handler
+        // goes through -- the crash/"tries to create a file" report. Skip debug info: generated code just
+        // steps over with no source, which is correct.
+        if (self.di_builder == null or file.len == 0 or file[0] == '<') return;
         self.ensureDebugCU(file);
         const dif = self.diFileFor(file);
         self.di_scope_file = dif;
