@@ -10,7 +10,13 @@ const subst = @import("subst.zig");
 
 pub const TypeId = types.TypeId;
 
-pub const max_depth: u32 = 16;
+// Generic container nesting cap. Was 16, which let `List<T>.chunk(): List<List<T>>` (and zip/etc.)
+// cascade via return-type noting into List<List<List<...>>> up to 16 levels deep FOR EVERY element
+// type -- ~85% of the RawBuffer instantiation bloat was these never-used deep nestings. Real code
+// nests containers 1-2 deep; 2 keeps legitimate List<List<T>>/Map<K,List<V>> while cutting the
+// pathological cascade. Refused-deeper types are dead (reach.zig never emits their bodies), so
+// refusing to instantiate their type metadata is harmless.
+pub const max_depth: u32 = 2;
 
 pub const Stats = struct {
 
