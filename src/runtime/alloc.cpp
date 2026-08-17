@@ -1,3 +1,4 @@
+#include <csignal>
 
 #include "nova_abi.h"
 #include <atomic>
@@ -379,6 +380,15 @@ long long nova_bytes_alloc_persistent(long long size) {
 // lift a value out of a per-request region before caching it in longer-lived state (e.g. a driver's
 // prepared-statement cache): the region is reclaimed on request completion, so anything that outlives the
 // request must be persisted first. A null/empty input yields "".
+// Backward-compat no-op shims for the removed per-request region arena (commit 088d9b6). Packages
+// compiled against the old runtime (e.g. the DB drivers' prepared-statement caching path) still emit
+// `nova_region_current()`/`nova_region_set()` calls to suspend/restore the arena. With no arena there is
+// nothing to suspend: current is always 0 and set is a no-op. Keeping these as stubs lets that code link
+// and run correctly (the deep copies simply land on the normal malloc heap) without re-introducing the
+// arena. Safe to delete once every package is rebuilt without the region calls.
+extern "C" long long nova_region_current() { return 0; }
+extern "C" void nova_region_set(long long) {}
+
 extern "C" long long nova_bytes_persist(long long s) {
   if (!s) return 0;
   // Only region- or literal-backed objects (negative refcount) need copying out; a value already on the
@@ -546,6 +556,18 @@ void nova_release(long long ptr_val, void (*destructor)(long long)) {
 
 void nova_arc_dump_survivors(void);
 
+// Diagnostic: dump ARC survivors on SIGUSR1 without exiting, so a long-running server (which never reaches
+// the exit-time audit) can be inspected mid-run. Enable with NOVA_ARC_AUDIT=1 NOVA_ARC_DUMP=1, then
+// `kill -USR1 <pid>`. Async-signal-safety is intentionally relaxed here (diagnostic only).
+static void nova_arc_sigusr1(int) {
+  std::fprintf(stderr, "\n=== SIGUSR1: live=%lld bytes=%lld ===\n",
+               (long long)0, (long long)0);
+  nova_arc_dump_survivors();
+}
+__attribute__((constructor)) static void nova_arc_install_sigusr1(void) {
+  signal(SIGUSR1, nova_arc_sigusr1);
+}
+
 long long nova_arc_audit_report(void) {
   if (!audit_enabled())
     return 0;
@@ -568,6 +590,43 @@ void nova_arc_dump_survivors(void) {
     return;
   live_lock();
   std::fprintf(stderr, "\n--- ARC survivors (NOVA_ARC_DUMP) ---\n");
+
+#ifndef _WIN32
+  // Per-site histogram across ALL live objects (not just the 25 clusters below): the single most
+  // useful view of "what is leaking" -- total object count + total bytes per allocation site.
+  {
+    struct SiteAgg { const void *site; const char *name; long long count; long long bytes; };
+    SiteAgg *agg = (SiteAgg *)std::calloc(g_live_n + 1, sizeof(SiteAgg));
+    if (agg) {
+      size_t na = 0;
+      for (size_t i = 0; i < g_live_n; i++) {
+        const void *s = g_live[i].site;
+        size_t k = 0;
+        for (; k < na; k++) if (agg[k].site == s) break;
+        if (k == na) {
+          const char *nm = "?";
+          Dl_info dli;
+          if (s && dladdr(s, &dli) && dli.dli_sname) nm = dli.dli_sname;
+          agg[na].site = s; agg[na].name = nm; agg[na].count = 0; agg[na].bytes = 0; na++;
+        }
+        agg[k].count++;
+        agg[k].bytes += g_live[i].size;
+      }
+      // simple selection sort by bytes desc, print top 40
+      std::fprintf(stderr, "  -- leak-by-site histogram (count, total bytes) --\n");
+      size_t shown = 0;
+      for (size_t r = 0; r < na && shown < 40; r++) {
+        size_t best = r;
+        for (size_t t = r + 1; t < na; t++) if (agg[t].bytes > agg[best].bytes) best = t;
+        SiteAgg tmp = agg[r]; agg[r] = agg[best]; agg[best] = tmp;
+        std::fprintf(stderr, "    x%-6lld  %10lld B   @ %s\n", agg[r].count, agg[r].bytes, agg[r].name);
+        shown++;
+      }
+      std::fprintf(stderr, "  -- end histogram (%zu distinct sites) --\n", na);
+      std::free(agg);
+    }
+  }
+#endif
 
   bool *seen = (bool *)std::calloc(g_live_n, sizeof(bool));
   if (!seen) {
