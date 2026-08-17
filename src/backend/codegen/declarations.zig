@@ -1262,7 +1262,15 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         }
     }
 
-    try emitModule(&compiler, allocator, compiler.module, output_path, is_wasm, is_release, "__nova_test.ll");
+    // The post-optimisation IR dump is OPT-IN (NOVA_DUMP_IR=1). It was written on EVERY non-split
+    // compile (~70MB per `nova test`/single-file build) and nothing reads it. When requested, write it
+    // beside the object so it stays inside the caller's output dir (e.g. build/test/), not the cwd.
+    var ll_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const ll_name: ?[]const u8 = if (std.c.getenv("NOVA_DUMP_IR") != null) blk: {
+        const dir = std.fs.path.dirname(output_path) orelse ".";
+        break :blk std.fmt.bufPrint(&ll_buf, "{s}/nova_ir.ll", .{dir}) catch "nova_ir.ll";
+    } else null;
+    try emitModule(&compiler, allocator, compiler.module, output_path, is_wasm, is_release, ll_name);
 }
 
 fn compileSplitEmit(

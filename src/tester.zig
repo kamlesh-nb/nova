@@ -312,7 +312,11 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
 
     // (HIR/MIR/LIR LLVM-emit optimiser scrapped 2026-08-16; see docs/design/sil-arc-optimiser-direction.md.)
 
-    const output_path = "__nova_test";
+    // Keep test artifacts OUT of the project root: build them under build/test/ and delete that dir when
+    // the run finishes (see cleanup before the final return/exit below).
+    const test_dir = "build/test";
+    Io.Dir.createDirPath(.cwd(), init.io, test_dir) catch {};
+    const output_path = "build/test/__nova_test";
     const obj_path = try std.fmt.allocPrint(allocator, "{s}.o", .{output_path});
     defer allocator.free(obj_path);
     const t6_split = init.environ_map.get("NOVA_T6_SPLIT") != null;
@@ -394,7 +398,7 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
 
     std.debug.print("\n", .{});
     var test_child = try std.process.spawn(init.io, .{
-        .argv = &[_][]const u8{"./__nova_test"},
+        .argv = &[_][]const u8{"./build/test/__nova_test"},
     });
     const test_term = try test_child.wait(init.io);
 
@@ -411,6 +415,10 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
             std.debug.print("\nTest process terminated abnormally\n", .{});
         },
     }
+
+    // Remove the whole build/test scratch dir (binary + object) now the run is done. Done explicitly
+    // (not via defer) because std.process.exit below skips defers on the failure path.
+    Io.Dir.deleteTree(.cwd(), init.io, test_dir) catch {};
 
     if (suite_failed) std.process.exit(1);
 }
