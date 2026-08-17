@@ -201,8 +201,31 @@ def nova_set_summary(valobj, internal_dict):
         return "Set"
 
 
+# lldb-dap (VS Code) shows a variable's SUMMARY as its value when the variable is backed by a synthetic
+# provider, but shows the raw pointer address for a plain pointer type (which `string` is: char*). So a
+# string displayed as a u64 address in VS Code even though its summary is correct. Giving `string` a
+# synthetic provider with ZERO children flips it into the same rendering path as List/Map/Set -> lldb-dap
+# then shows the summary ("nova") and does not offer a useless *char expansion.
+class NoChildren(object):
+    def __init__(self, valobj, internal_dict):
+        pass
+
+    def update(self):
+        return False
+
+    def num_children(self):
+        return 0
+
+    def get_child_at_index(self, i):
+        return None
+
+    def has_children(self):
+        return False
+
+
 def __lldb_init_module(debugger, internal_dict):
     debugger.HandleCommand("type summary add -F nova_formatters.nova_string_summary string")
+    debugger.HandleCommand("type synthetic add string --python-class nova_formatters.NoChildren")
     # Containers are named with their element type (List<i32>, List<string>, ...). Match by regex.
     # List gets a summary (element count) AND a synthetic child provider so it expands to [0],[1],... .
     # The summary also overrides the bogus char* rendering of the typedef's u8 pointee.
