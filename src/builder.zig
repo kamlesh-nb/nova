@@ -23,6 +23,13 @@ const sema_mono = @import("frontend/sema/mono.zig");
 const pipeline = @import("pipeline.zig");
 const packages = @import("packages.zig");
 
+// User-facing build options, set from CLI flags in cmdBuild (see pipeline.hasFlag). Builder-level knobs
+// live here; the codegen-deep ones (--split-objects/--prune/--emit-llvm/--mem-stats) live on
+// llvm_codegen.flags. Replaces the former NOVA_ASAN / NOVA_KEEP_OBJ / NOVA_DUMP_MERGED env vars.
+var want_asan: bool = false;
+var want_keep_obj: bool = false;
+var want_dump_merged: bool = false;
+
 
 fn compileProgram(
     allocator: std.mem.Allocator,
@@ -58,17 +65,15 @@ fn compileProgram(
     const is_wasm = std.mem.eql(u8, target, "--wasm");
     const tinfo = pipeline.deriveTargetInfo(target, target_triple_opt);
 
-    // AddressSanitizer for native builds: default ON for debug, OFF for --release (and never for wasm).
-    // ASAN is OPT-IN (NOVA_ASAN=1), NOT a debug-build default. It is a memory-bug testing tool, not
-    // something an app developer stepping through code needs, and defaulting it on made debug builds
-    // depend on the linker's clang matching the exact ASAN runtime version that built libnovacore_asan.a
-    // -- when they differ (e.g. a VS Code task shell finds Apple clang 17 while the runtime was built with
-    // Homebrew clang 21) the link fails with `__asan_version_mismatch_check_v*` undefined. Off by default
-    // means plain debug builds link with any clang and run faster; the conformance --asan gate sets
-    // NOVA_ASAN=1 explicitly so it is unaffected. NOVA_ASAN=0 also forces off.
-    const asan = !is_wasm and (if (init.environ_map.get("NOVA_ASAN")) |v| !std.mem.eql(u8, v, "0") else false);
+    // AddressSanitizer is OPT-IN via --asan (never for wasm). It is a memory-bug testing tool, not a
+    // debug-build default: defaulting it on made debug builds depend on the linker's clang matching the
+    // exact ASAN runtime version that built libnovacore_asan.a -- when they differ (e.g. a VS Code task
+    // shell finds Apple clang 17 while the runtime was built with Homebrew clang 21) the link fails with
+    // `__asan_version_mismatch_check_v*` undefined. Off by default means plain debug builds link with any
+    // clang and run faster; the conformance --asan gate passes --asan explicitly.
+    const asan = !is_wasm and want_asan;
     // Opt-in: also instrument NOVA-GENERATED code with ASAN (not only the runtime), for provenance on a
-    // Nova-code UAF. Requires the runtime ASAN link (so it implies `asan`); off unless NOVA_ASAN_CODEGEN set.
+    // Nova-code UAF. Requires the runtime ASAN link (so it implies `asan`); niche dev knob, stays env.
     codegen_arc.asan_codegen_enabled = asan and (init.environ_map.get("NOVA_ASAN_CODEGEN") != null);
 
     pipeline.loadProgram(allocator, init, "src/std/collections/string_builder.nova", visited, &visiting, &merged, &declarations, is_wasm, &file_sources, tinfo) catch |err| {
@@ -77,7 +82,7 @@ fn compileProgram(
 
     try pipeline.loadProgram(allocator, init, file_path, visited, &visiting, &merged, &declarations, is_wasm, &file_sources, tinfo);
 
-    if (init.environ_map.get("NOVA_DUMP_MERGED") != null) {
+    if (want_dump_merged) {
         _ = Io.Dir.writeFile(.cwd(), init.io, .{ .data = merged.items, .sub_path = "merged.nova", .flags = .{} }) catch |err| {
             std.debug.print("Failed to write merged.nova: {s}\n", .{@errorName(err)});
         };
@@ -233,7 +238,7 @@ fn compileProgram(
     if (std.mem.eql(u8, target, "--wasm")) {
         const obj_path = try std.fmt.allocPrint(allocator, "{s}.o", .{output_path});
         defer allocator.free(obj_path);
-        try llvm_codegen.compile(allocator, program, true, is_release, target_triple_opt, obj_path, false, init.environ_map.get("NOVA_T6_SPLIT") != null, null, null, init.io);
+        try llvm_codegen.compile(allocator, program, true, is_release, target_triple_opt, obj_path, false, false, null, null, init.io);
 
         if (build_options.inprocess_lld) {
             try pipeline.linkWasmInProcess(allocator, obj_path, output_path);
@@ -268,14 +273,14 @@ fn compileProgram(
             try std.fmt.allocPrint(allocator, "{s}.o", .{output_path});
         defer allocator.free(obj_path);
 
-        const t6_split = if (build_mode)
-            init.environ_map.get("NOVA_T6_NOSPLIT") == null
-        else
-            init.environ_map.get("NOVA_T6_SPLIT") != null;
+        // A project build always produces linkable object(s) (the objs path); single-file compiles emit
+        // one object directly. --split-objects (llvm_codegen.flags.split_per_file) then chooses per-file
+        // vs one combined object INSIDE the objs path.
+        const t6_split = build_mode;
         var split_objs = std.ArrayList([]const u8).empty;
         defer {
             for (split_objs.items) |o| {
-                if (init.environ_map.get("NOVA_KEEP_OBJ") == null and !build_mode) Io.Dir.deleteFile(.cwd(), init.io, o) catch {};
+                if (!want_keep_obj and !build_mode) Io.Dir.deleteFile(.cwd(), init.io, o) catch {};
                 allocator.free(o);
             }
             split_objs.deinit(allocator);
@@ -289,11 +294,11 @@ fn compileProgram(
     sema_shadow.reportF45();
     sema_mono.dumpMethodInsts();
 
-    if (init.environ_map.get("NOVA_MEM_STATS") != null) {
+    if (llvm_codegen.flags.mem_stats) {
         const store_types: usize = if (sema_shadow.live_sema) |sm| sm.store.count() else 0;
         const interned_names: usize = if (sema_shadow.live_sema) |sm| sm.names.count() else 0;
         std.debug.print(
-            \\=== NOVA_MEM_STATS ===
+            \\=== mem-stats ===
             \\  program.declarations : {d}
             \\  method_insts         : {d}
             \\  free_fn_insts        : {d}
@@ -347,7 +352,7 @@ fn compileProgram(
 
         if (target_triple_opt) |triple| {
             if (try pipeline.crossLinkViaZig(allocator, init.environ_map, init.io, triple, link_objs, output_path, shared_nova, is_release)) {
-                if (init.environ_map.get("NOVA_KEEP_OBJ") == null and !build_mode)
+                if (!want_keep_obj and !build_mode)
                     Io.Dir.deleteFile(.cwd(), init.io, obj_path) catch {};
                 if (build_mode) {
                     const cur = std.fmt.allocPrint(allocator, "{x}", .{src_hash}) catch "";
@@ -364,7 +369,7 @@ fn compileProgram(
         if (build_options.inprocess_lld and builtin.target.os.tag == .macos and target_triple_opt == null and !asan) {
             try pipeline.linkNativeInProcessMacho(allocator, init.environ_map, init.io, link_objs, output_path, shared_nova, ffi_libs);
 
-            if (init.environ_map.get("NOVA_KEEP_OBJ") == null and !build_mode)
+            if (!want_keep_obj and !build_mode)
                 Io.Dir.deleteFile(.cwd(), init.io, obj_path) catch {};
             if (build_mode) {
                 const cur = std.fmt.allocPrint(allocator, "{x}", .{src_hash}) catch "";
@@ -405,10 +410,10 @@ fn compileProgram(
             },
         }
 
-        if (init.environ_map.get("NOVA_KEEP_OBJ") == null and !build_mode) {
+        if (!want_keep_obj and !build_mode) {
             Io.Dir.deleteFile(.cwd(), init.io, obj_path) catch {};
         } else if (!build_mode) {
-            std.debug.print("Kept object file {s} (NOVA_KEEP_OBJ)\n", .{obj_path});
+            std.debug.print("Kept object file {s} (--keep-obj)\n", .{obj_path});
         }
         if (build_mode) {
             const cur = std.fmt.allocPrint(allocator, "{x}", .{src_hash}) catch "";
@@ -430,6 +435,16 @@ pub fn cmdBuild(allocator: std.mem.Allocator, init: std.process.Init, args: []co
     // Auto-fetch: clone any project.json dependency missing from the package cache before compiling, so
     // a freshly cloned app builds without a manual `nova get`. Silent when there is no project.json.
     try packages.ensureDependencies(allocator, init);
+
+    // User-facing build options as CLI flags (were NOVA_* env vars). Parsed once here; builder-level
+    // knobs go to module globals, codegen-deep ones to llvm_codegen.flags, before any compile runs.
+    want_asan = pipeline.hasFlag(args, "--asan");
+    want_keep_obj = pipeline.hasFlag(args, "--keep-obj");
+    want_dump_merged = pipeline.hasFlag(args, "--dump-merged");
+    llvm_codegen.flags.split_per_file = pipeline.hasFlag(args, "--split-objects");
+    llvm_codegen.flags.prune = pipeline.hasFlag(args, "--prune");
+    llvm_codegen.flags.dump_ir = pipeline.hasFlag(args, "--emit-llvm");
+    llvm_codegen.flags.mem_stats = pipeline.hasFlag(args, "--mem-stats");
 
     var file_path: []const u8 = "";
 

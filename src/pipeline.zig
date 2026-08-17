@@ -1873,3 +1873,13 @@ pub fn sourcesHash(file_sources: *std.StringHashMap([]const u8), is_release: boo
     }
     return acc;
 }
+
+/// True if `name` (a `--flag`) appears anywhere in argv. Used to route user-facing build options
+/// (--asan, --prune, --split-objects, --keep-obj, --emit-llvm, --dump-merged, --mem-stats, --tsan)
+/// as real CLI switches instead of NOVA_* env vars.
+pub fn hasFlag(args: []const []const u8, name: []const u8) bool {
+    for (args) |a| {
+        if (std.mem.eql(u8, a, name)) return true;
+    }
+    return false;
+}

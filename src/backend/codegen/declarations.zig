@@ -17,25 +17,30 @@ const unescapeString = @import("llvm_codegen.zig").unescapeString;
 const FunctionInfo = @import("llvm_codegen.zig").FunctionInfo;
 const Scope = @import("llvm_codegen.zig").Scope;
 
-// NOVA_MEM_STATS phase profiler: prints peak RSS (ru_maxrss, bytes on macOS) reached so far, so we can see
-// which codegen phase pushes the high-water mark. Zero-cost unless the env var is set.
-var mem_phase_on: ?bool = null;
+// User-facing build options, set from CLI flags by builder/tester before compile() runs (see
+// pipeline.hasFlag). These replace the former NOVA_* env vars for the codegen-deep knobs.
+pub const flags = struct {
+    pub var split_per_file: bool = false; // --split-objects: per-file objects instead of one combined
+    pub var prune: bool = false; // --prune: demand-prune unreachable functions (opt-in)
+    pub var dump_ir: bool = false; // --emit-llvm: write the post-opt IR next to the object
+    pub var mem_stats: bool = false; // --mem-stats: print per-phase peak RSS
+};
+
+// Phase profiler: prints peak RSS (ru_maxrss, bytes on macOS) reached so far, so we can see which codegen
+// phase pushes the high-water mark. Zero-cost unless --mem-stats is passed.
 fn memPhase(label: []const u8) void {
-    if (mem_phase_on == null) mem_phase_on = (std.c.getenv("NOVA_MEM_STATS") != null);
-    if (!(mem_phase_on.?)) return;
+    if (!flags.mem_stats) return;
     const ru = std.posix.getrusage(std.posix.rusage.SELF);
     const mb = @as(u64, @intCast(ru.maxrss)) / (1024 * 1024); // macOS: bytes
     std.debug.print("[MEM] {s:<28} peak={d} MB\n", .{ label, mb });
 }
 
 // Demand pruning: drop functions unreachable from the program entry so a source file the app never
-// calls (crypto/tls/bson in a plain web app) produces NO object at all. OPT-IN (NOVA_PRUNE=1) while an
+// calls (crypto/tls/bson in a plain web app) produces NO object at all. OPT-IN (--prune) while an
 // intermittent heap-corruption during --release emit is investigated -- default builds compile every
 // imported file's object, which is the known-good behaviour.
-var prune_on: ?bool = null;
 fn pruneEnabled() bool {
-    if (prune_on == null) prune_on = (std.c.getenv("NOVA_PRUNE") != null);
-    return prune_on.?;
+    return flags.prune;
 }
 
 fn ffiCType(compiler: *LlvmCompiler, type_name: []const u8) types.LLVMTypeRef {
@@ -1262,11 +1267,11 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         }
     }
 
-    // The post-optimisation IR dump is OPT-IN (NOVA_DUMP_IR=1). It was written on EVERY non-split
-    // compile (~70MB per `nova test`/single-file build) and nothing reads it. When requested, write it
-    // beside the object so it stays inside the caller's output dir (e.g. build/test/), not the cwd.
+    // The post-optimisation IR dump is OPT-IN (--emit-llvm). It was written on EVERY non-split compile
+    // (~70MB per `nova test`/single-file build) and nothing reads it. When requested, write it beside
+    // the object so it stays inside the caller's output dir (e.g. build/test/), not the cwd.
     var ll_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const ll_name: ?[]const u8 = if (std.c.getenv("NOVA_DUMP_IR") != null) blk: {
+    const ll_name: ?[]const u8 = if (flags.dump_ir) blk: {
         const dir = std.fs.path.dirname(output_path) orelse ".";
         break :blk std.fmt.bufPrint(&ll_buf, "{s}/nova_ir.ll", .{dir}) catch "nova_ir.ll";
     } else null;
@@ -1299,8 +1304,8 @@ fn compileSplitEmit(
     // single-object 38s / 332MB (debug), 45s / 547MB (release). The whole-module codegen (the real cost)
     // runs either way, so per-file caching only ever saved the small per-file EMIT of unchanged files;
     // the whole-build content hash already skips no-change rebuilds entirely, so that saving was
-    // marginal. Set NOVA_T6_SPLIT=1 to force the old per-file split (e.g. to inspect per-file objects).
-    if (std.c.getenv("NOVA_T6_SPLIT") == null) {
+    // marginal. Pass --split-objects to force the old per-file split (e.g. to inspect per-file objects).
+    if (!flags.split_per_file) {
         // Name the single object after the app, e.g. build/<p>/obj/myapp.o. `stem` drops any extension
         // on output_path (it can already carry a .o), so we don't produce myapp.o.o.
         const app_name = std.fs.path.stem(output_path);
@@ -1308,7 +1313,12 @@ fn compileSplitEmit(
             try std.fmt.allocPrint(allocator, "{s}/{s}.o", .{ cdir, app_name })
         else
             try std.fmt.allocPrint(allocator, "{s}.o", .{output_path});
-        try emitModule(compiler, allocator, compiler.module, obj_path, false, is_release, null);
+        var ll_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const ll_name: ?[]const u8 = if (flags.dump_ir) blk: {
+            const dir = std.fs.path.dirname(obj_path) orelse ".";
+            break :blk std.fmt.bufPrint(&ll_buf, "{s}/{s}.ll", .{ dir, app_name }) catch null;
+        } else null;
+        try emitModule(compiler, allocator, compiler.module, obj_path, false, is_release, ll_name);
         try objs.append(allocator, obj_path);
         return;
     }

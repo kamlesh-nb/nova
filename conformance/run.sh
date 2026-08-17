@@ -10,6 +10,8 @@
 set -u
 
 NOVA="${NOVA:-$HOME/.nova/bin/nova}"
+# Dogfood mode inherits NOVA_ASAN as a convenience signal; nova now takes it as --asan (see cmdTest).
+ASAN_FLAG=""; [[ -n "${NOVA_ASAN:-}" ]] && ASAN_FLAG="--asan"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 # --arc : run every positive case under NOVA_ARC_AUDIT=1 and gate LEAK REGRESSIONS
@@ -29,7 +31,7 @@ HAVE_TIMEOUT="$(command -v timeout || true)"   # coreutils on Linux/Git-Bash; ab
 run_case() {
   local rc out
   if [[ -n "$HAVE_TIMEOUT" ]]; then
-    out="$("$HAVE_TIMEOUT" -k 5 "$CASE_TIMEOUT" "$NOVA" test "$1" 2>&1)"; rc=$?
+    out="$("$HAVE_TIMEOUT" -k 5 "$CASE_TIMEOUT" "$NOVA" test $ASAN_FLAG "$1" 2>&1)"; rc=$?
   else
     # No coreutils timeout (stock macOS): kill from a background sleeper. The sleeper is NOT
     # waited on — killing the subshell does not necessarily reap its `sleep` child, and waiting
@@ -37,7 +39,7 @@ run_case() {
     # exists to prevent.
     local tmp cpid kpid
     tmp="$(mktemp -t novacase.XXXXXX)"
-    ( "$NOVA" test "$1" >"$tmp" 2>&1 ) & cpid=$!
+    ( "$NOVA" test $ASAN_FLAG "$1" >"$tmp" 2>&1 ) & cpid=$!
     ( sleep "$CASE_TIMEOUT"; kill -9 "$cpid" 2>/dev/null ) & kpid=$!
     wait "$cpid" 2>/dev/null; rc=$?
     kill "$kpid" 2>/dev/null
@@ -172,9 +174,9 @@ if [[ $PARALLEL -gt 0 && $WASM_MODE -eq 0 && $WASMRUN_MODE -eq 0 && $ASAN_MODE -
 f="$1"; name="$(basename "$f")"; wd="$(mktemp -d)"
 ln -s "$ROOT/packages" "$wd/packages" 2>/dev/null
 cd "$wd" || exit 0
-if command -v timeout >/dev/null 2>&1; then out="$(timeout -k 5 "$CASE_TIMEOUT" "$NOVA" test "$f" 2>&1)"; code=$?
-elif command -v gtimeout >/dev/null 2>&1; then out="$(gtimeout -k 5 "$CASE_TIMEOUT" "$NOVA" test "$f" 2>&1)"; code=$?
-else out="$(perl -e "alarm $CASE_TIMEOUT; exec @ARGV" "$NOVA" test "$f" 2>&1)"; code=$?; fi
+if command -v timeout >/dev/null 2>&1; then out="$(timeout -k 5 "$CASE_TIMEOUT" "$NOVA" test $ASAN_FLAG "$f" 2>&1)"; code=$?
+elif command -v gtimeout >/dev/null 2>&1; then out="$(gtimeout -k 5 "$CASE_TIMEOUT" "$NOVA" test $ASAN_FLAG "$f" 2>&1)"; code=$?
+else out="$(perl -e "alarm $CASE_TIMEOUT; exec @ARGV" "$NOVA" test $ASAN_FLAG "$f" 2>&1)"; code=$?; fi
 cd / ; rm -rf "$wd"
 res="$(printf '%s\n' "$out" | grep -E '^Results:' | tail -1)"
 if [ "$code" -eq 0 ] && printf '%s' "$res" | grep -q '0 failed'; then printf 'PASS\t%s\t%s\n' "$name" "$res"
@@ -373,7 +375,7 @@ if [[ -d "$HERE/expect_fail" && $WASM_MODE -ne 1 && $WASMRUN_MODE -ne 1 ]]; then
     [[ -n "$FILTER" && "$name" != *"$FILTER"* ]] && continue
     expected="$(grep -m1 -oE '^// EXPECT-FAIL:[[:space:]]*[a-z-]+' "$f" | sed -E 's|^// EXPECT-FAIL:[[:space:]]*||')"
     expected="${expected:-typecheck}"
-    out="$("$NOVA" test "$f" 2>&1)"; code=$?
+    out="$("$NOVA" test $ASAN_FLAG "$f" 2>&1)"; code=$?
     actual="$(classify_failure "$out" "$code")"
     if [[ "$actual" == "$expected" ]]; then
       printf "  \033[32mPASS\033[0m  %-32s %s\n" "$name" "(rejected: $actual)"
@@ -408,9 +410,9 @@ if [[ $ASAN_MODE -eq 1 ]]; then
 f="$1"; name="$(basename "$f" .nova)"; wd="$(mktemp -d)"
 ln -s "$ROOT/packages" "$wd/packages" 2>/dev/null
 cd "$wd" || exit 0
-if command -v timeout >/dev/null 2>&1; then out="$(NOVA_ASAN=1 timeout -k 5 "$CASE_TIMEOUT" "$NOVA" test "$f" 2>&1)"
-elif command -v gtimeout >/dev/null 2>&1; then out="$(NOVA_ASAN=1 gtimeout -k 5 "$CASE_TIMEOUT" "$NOVA" test "$f" 2>&1)"
-else out="$(NOVA_ASAN=1 perl -e "alarm $CASE_TIMEOUT; exec @ARGV" "$NOVA" test "$f" 2>&1)"; fi
+if command -v timeout >/dev/null 2>&1; then out="$(timeout -k 5 "$CASE_TIMEOUT" "$NOVA" test --asan "$f" 2>&1)"
+elif command -v gtimeout >/dev/null 2>&1; then out="$(gtimeout -k 5 "$CASE_TIMEOUT" "$NOVA" test --asan "$f" 2>&1)"
+else out="$(perl -e "alarm $CASE_TIMEOUT; exec @ARGV" "$NOVA" test --asan "$f" 2>&1)"; fi
 cd / ; rm -rf "$wd"
 if printf '%s' "$out" | grep -q "ERROR: AddressSanitizer"; then
   kind="$(printf '%s' "$out" | grep -m1 -oE 'AddressSanitizer: [a-z-]+' | sed 's/AddressSanitizer: //')"
@@ -434,7 +436,7 @@ AWORKER
   for f in "$HERE"/cases/*.nova; do
     name="$(basename "$f" .nova)"
     [[ -n "$FILTER" && "$name" != *"$FILTER"* ]] && continue
-    out="$(NOVA_ASAN=1 "$NOVA" test "$f" 2>&1)"
+    out="$("$NOVA" test --asan "$f" 2>&1)"
     if printf '%s' "$out" | grep -q "ERROR: AddressSanitizer"; then
       kind="$(printf '%s' "$out" | grep -m1 -oE 'AddressSanitizer: [a-z-]+' | sed 's/AddressSanitizer: //')"
       where="$(printf '%s' "$out" | grep -m1 -oE '#0 0x[0-9a-f]+ in [A-Za-z_][A-Za-z0-9_]*' | sed 's/.* in //')"
@@ -530,7 +532,7 @@ if [[ $SHADOW_MODE -eq 1 ]]; then
   for f in "$HERE"/cases/*.nova; do
     name="$(basename "$f" .nova)"
     [[ -n "$FILTER" && "$name" != *"$FILTER"* ]] && continue
-    out="$(NOVA_SEMA_SHADOW=1 "$NOVA" test "$f" 2>&1)"; code=$?
+    out="$(NOVA_SEMA_SHADOW=1 "$NOVA" test $ASAN_FLAG "$f" 2>&1)"; code=$?
     if printf '%s' "$out" | grep -q "FOUNDATION GATE FAILED"; then
       printf "  \033[31mFAIL\033[0m  %-32s \033[31m(ownership engines DISAGREE)\033[0m\n" "$name"
       printf '%s' "$out" | grep -A3 "FOUNDATION GATE FAILED" | sed 's/^/          /'

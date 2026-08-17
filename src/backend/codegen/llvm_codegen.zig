@@ -4356,3 +4356,4 @@ pub const LlvmCompiler = struct {
 };
 
 pub const compile = declarations_mod.compile;
+pub const flags = declarations_mod.flags;

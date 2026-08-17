@@ -91,6 +91,12 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
     // Silent when there is no project.json (a bare `nova test <file>`).
     try packages.ensureDependencies(allocator, init);
 
+    // User-facing build options as CLI flags (were NOVA_* env vars). --asan/--tsan are read below.
+    llvm_codegen.flags.split_per_file = pipeline.hasFlag(args, "--split-objects");
+    llvm_codegen.flags.prune = pipeline.hasFlag(args, "--prune");
+    llvm_codegen.flags.dump_ir = pipeline.hasFlag(args, "--emit-llvm");
+    llvm_codegen.flags.mem_stats = pipeline.hasFlag(args, "--mem-stats");
+
     var file_path: []const u8 = "";
     var target: []const u8 = "--native";
 
@@ -319,7 +325,7 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
     const output_path = "build/test/__nova_test";
     const obj_path = try std.fmt.allocPrint(allocator, "{s}.o", .{output_path});
     defer allocator.free(obj_path);
-    const t6_split = init.environ_map.get("NOVA_T6_SPLIT") != null;
+    const t6_split = llvm_codegen.flags.split_per_file;
     var split_objs = std.ArrayList([]const u8).empty;
     defer {
         for (split_objs.items) |o| {
@@ -340,8 +346,8 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
     const shared_nova = try std.fmt.allocPrint(allocator, "{s}/.nova", .{ home });
     const shared_nova_arg = try std.fmt.allocPrint(allocator, "-I{s}", .{shared_nova});
 
-    const asan = if (init.environ_map.get("NOVA_ASAN")) |v| !std.mem.eql(u8, v, "0") else false;
-    const tsan = if (init.environ_map.get("NOVA_TSAN")) |v| !std.mem.eql(u8, v, "0") else false;
+    const asan = pipeline.hasFlag(args, "--asan");
+    const tsan = pipeline.hasFlag(args, "--tsan");
 
     var test_clang_args = std.ArrayList([]const u8).empty;
     try test_clang_args.append(allocator, "clang++");
