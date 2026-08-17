@@ -2,13 +2,18 @@
 import list;
 import bytes;
 
+// Allocate a NUL-terminated string buffer of logical length `len` (reserves len+1 bytes, terminator at
+// [len]) so the debugger's built-in char* view + C-FFI work without Python formatters. Returns a raw
+// `long` reinterpreted with `as string` -- the exact pattern `bytes.alloc(len) as string` uses; declaring
+// the extern to return `string` directly makes Nova apply string-return semantics that mangle it.
+extern("c") fn nova_str_alloc(len: int): long;
+
 pub fn len(s: string): int {
     return s.length;
 }
 
 fn allocString(len: int): string {
-
-    return bytes.alloc(len) as string;
+    return nova_str_alloc(len) as string;
 }
 
 pub fn concat(a: string, b: string): string {

@@ -761,7 +761,10 @@ pub const LlvmCompiler = struct {
         const unescaped = try unescapeString(self.allocator, str);
         defer self.allocator.free(unescaped);
 
-        var field_types = [_]types.LLVMTypeRef{ self.i32_type, self.i32_type, core.LLVMArrayType(self.i8_type, @intCast(unescaped.len)) };
+        // Reserve one extra byte for a NUL terminator (chars array is len+1) so the debugger's built-in
+        // char* view + C-FFI read the string without Python formatters. The len field stays the logical
+        // length; the trailing NUL is padding beyond it.
+        var field_types = [_]types.LLVMTypeRef{ self.i32_type, self.i32_type, core.LLVMArrayType(self.i8_type, @intCast(unescaped.len + 1)) };
         const struct_type = core.LLVMStructType(&field_types, 3, 1);
 
         const global_var = core.LLVMAddGlobal(self.module, struct_type, "str_literal");
@@ -777,7 +780,7 @@ pub const LlvmCompiler = struct {
         // negative sentinel never drifts and never frees, and it also skips the per-use ARC inc/dec entirely.
         const ref_const = core.LLVMConstInt(self.i32_type, @as(c_ulonglong, @bitCast(@as(i64, -1000000000))), 0);
         const len_const = core.LLVMConstInt(self.i32_type, @intCast(unescaped.len), 0);
-        const chars_const = core.LLVMConstString(str_z.ptr, @intCast(unescaped.len), 1);
+        const chars_const = core.LLVMConstString(str_z.ptr, @intCast(unescaped.len), 0); // 0 => append a NUL (len+1 bytes)
 
         var field_values = [_]types.LLVMValueRef{ ref_const, len_const, chars_const };
         const init_const = core.LLVMConstStruct(&field_values, 3, 1);

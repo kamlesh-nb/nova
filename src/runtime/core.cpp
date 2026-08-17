@@ -665,6 +665,19 @@ static char *nova_string_from(const char *c, int len) {
   const char *s = nova_from_bytes(c, (long long)len);
   return const_cast<char *>(s ? s : "");
 }
+
+// Allocate an (uninitialised) Nova string buffer of LOGICAL length `len`, NUL-terminated at [len], so
+// the debugger's built-in char* view + C-FFI work without Python formatters. The stdlib's allocString
+// routes through this instead of `bytes.alloc(len)` (which reserves no terminator). Over-allocate one
+// byte via nova_bytes_alloc(len+1), then rewrite the ARC length field (i32 @ ptr-4) to the logical len.
+extern "C" long long nova_str_alloc(long long len) {
+  if (len < 0) len = 0;
+  char *p = (char *)nova_bytes_alloc(len + 1);
+  if (!p) return 0;
+  p[len] = '\0';
+  *reinterpret_cast<int *>(p - 4) = (int)len;
+  return (long long)p;
+}
 // Hand-rolled base-10 integer formatter. The old snprintf("%lld") path parsed a format string, walked
 // locale state, and called into vfprintf for every int rendered -- a big share of a templated page's CPU
 // (ids, counts). This writes digits directly: build them backwards into a small buffer, then emit. ~5x
