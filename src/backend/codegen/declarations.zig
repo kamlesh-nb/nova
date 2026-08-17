@@ -1284,11 +1284,53 @@ fn compileSplitEmit(
         try gop.value_ptr.put(sym, {});
     }
 
+    // Bump T6_CACHE_VERSION whenever codegen changes in a way that alters emitted objects, so every
+    // cached object gets a new filename and the stale ones are ignored (mtime alone can't see a
+    // compiler change -- source files did not move). Folded into the per-object name hash below.
+    const T6_CACHE_VERSION: u64 = 2;
+
     var idx: usize = 0;
     var hits: usize = 0;
     var misses: usize = 0;
     var fit = file_syms.iterator();
     while (fit.next()) |entry| : (idx += 1) {
+        const src_path = entry.key_ptr.*;
+
+        // Readable, stable, unique object name derived from the SOURCE file: `<stem>_<pathhash>.o`
+        // (e.g. json_1a2b3c.o). The stem is the source basename; the path hash disambiguates same-named
+        // files in different dirs (e.g. two query.nova). Falls back to `<out>.<idx>.o` with no cache dir.
+        var obj_path: []const u8 = undefined;
+        if (cache_dir) |cdir| {
+            const base = std.fs.path.basename(src_path);
+            const stem = if (std.mem.endsWith(u8, base, ".nova")) base[0 .. base.len - 5] else base;
+            // Path hash disambiguates same-named files in different dirs; version + release bit keep
+            // release/debug and pre/post-codegen-change objects from aliasing.
+            const ph: u32 = @truncate(std.hash.Wyhash.hash(T6_CACHE_VERSION ^ (if (is_release) @as(u64, 1) else 0), src_path));
+            obj_path = try std.fmt.allocPrint(allocator, "{s}/{s}_{x}.o", .{ cdir, stem, ph });
+
+            // Freshness: if the object exists (and, for app files, is newer than its source), skip this
+            // file ENTIRELY -- no clone, no globaldce, no emit. This is what lets an incremental build
+            // skip the whole (unchanged) stdlib instead of re-emitting it every time. Stdlib sources
+            // (`src/std/...`) are installed and don't change during app dev, and a compiler change bumps
+            // T6_CACHE_VERSION (new filename), so an existing stdlib object is always fresh. App sources
+            // are cwd-relative and stat-able. (Cross-file signature changes aren't tracked; do a clean
+            // rebuild -- `rm -rf build` -- after changing a shared signature.)
+            fresh: {
+                const om = (std.Io.Dir.statFile(.cwd(), io, obj_path, .{}) catch break :fresh).mtime.nanoseconds;
+                if (!std.mem.startsWith(u8, src_path, "src/std/")) {
+                    const sm = (std.Io.Dir.statFile(.cwd(), io, src_path, .{}) catch break :fresh).mtime.nanoseconds;
+                    if (om < sm) break :fresh;
+                }
+                hits += 1;
+                try objs.append(allocator, obj_path);
+                continue; // fresh: reuse the object, do no per-file work
+            }
+        } else {
+            obj_path = try std.fmt.allocPrint(allocator, "{s}.{d}.o", .{ output_path, idx });
+        }
+
+        // Stale (or no cache): build this file's object. Clone the module and strip every function that
+        // this file does not OWN down to a bare declaration.
         const owner = entry.value_ptr;
         const clone = core.LLVMCloneModule(compiler.module);
         defer core.LLVMDisposeModule(clone);
@@ -1307,36 +1349,19 @@ fn compileSplitEmit(
             }
         }
 
-        if (cache_dir) |cdir| {
-
-            {
-                const opts = transform.LLVMCreatePassBuilderOptions();
-                defer transform.LLVMDisposePassBuilderOptions(opts);
-                const perr = transform.LLVMRunPasses(clone, "globaldce", compiler.target_machine, opts);
-                if (perr != null) errors.LLVMConsumeError(perr);
-            }
-
-            const ir_c = core.LLVMPrintModuleToString(clone);
-            const ir = std.mem.span(ir_c);
-            const key = std.hash.Wyhash.hash(if (is_release) 1 else 0, ir);
-            core.LLVMDisposeMessage(ir_c);
-            const obj_path = try std.fmt.allocPrint(allocator, "{s}/nova_split_{x}.o", .{ cdir, key });
-            if (std.Io.Dir.access(.cwd(), io, obj_path, .{})) |_| {
-                hits += 1;
-            } else |_| {
-                misses += 1;
-                try emitModule(compiler, allocator, clone, obj_path, false, is_release, null);
-            }
-            try objs.append(allocator, obj_path);
-        } else {
-
-            const obj_path = try std.fmt.allocPrint(allocator, "{s}.{d}.o", .{ output_path, idx });
-            try emitModule(compiler, allocator, clone, obj_path, false, is_release, null);
-            try objs.append(allocator, obj_path);
+        if (cache_dir != null) {
+            const opts = transform.LLVMCreatePassBuilderOptions();
+            defer transform.LLVMDisposePassBuilderOptions(opts);
+            const perr = transform.LLVMRunPasses(clone, "globaldce", compiler.target_machine, opts);
+            if (perr != null) errors.LLVMConsumeError(perr);
         }
+
+        misses += 1;
+        try emitModule(compiler, allocator, clone, obj_path, false, is_release, null);
+        try objs.append(allocator, obj_path);
     }
     if (cache_dir != null) {
-        std.debug.print("[T6] per-file objects: {d} total, {d} cached (reused), {d} rebuilt\n", .{ idx, hits, misses });
+        std.debug.print("[T6] per-file objects: {d} total, {d} reused (mtime), {d} rebuilt\n", .{ idx, hits, misses });
     }
 }
 
