@@ -29,11 +29,12 @@ fn memPhase(label: []const u8) void {
 }
 
 // Demand pruning: drop functions unreachable from the program entry so a source file the app never
-// calls (crypto/tls/bson in a plain web app) produces NO object at all. On by default for builds;
-// set NOVA_NO_PRUNE=1 to fall back to compiling every imported file's object.
+// calls (crypto/tls/bson in a plain web app) produces NO object at all. OPT-IN (NOVA_PRUNE=1) while an
+// intermittent heap-corruption during --release emit is investigated -- default builds compile every
+// imported file's object, which is the known-good behaviour.
 var prune_on: ?bool = null;
 fn pruneEnabled() bool {
-    if (prune_on == null) prune_on = (std.c.getenv("NOVA_NO_PRUNE") == null);
+    if (prune_on == null) prune_on = (std.c.getenv("NOVA_PRUNE") != null);
     return prune_on.?;
 }
 
@@ -1286,32 +1287,49 @@ fn compileSplitEmit(
 
     memPhase("after body emit + vtables");
 
-    // Symbol-name -> owning source file, built BEFORE any pruning while every func_map value is still
-    // live. Keys are duped because demand pruning below deletes the dead functions (and with them the
-    // LLVM name strings we'd otherwise alias).
-    var sym_to_file = std.StringHashMap([]const u8).init(allocator);
+    var all_syms = std.StringHashMap(void).init(allocator);
+    defer all_syms.deinit();
+    var file_syms = std.StringHashMap(std.StringHashMap(void)).init(allocator);
     defer {
-        var kit = sym_to_file.keyIterator();
-        while (kit.next()) |k| allocator.free(k.*);
-        sym_to_file.deinit();
-    }
-    for (compiler.functions.items) |func| {
-        const v = compiler.func_map.get(func.name) orelse continue;
-        const sym = std.mem.span(core.LLVMGetValueName(v));
-        const file = if (func.source_file.len > 0) func.source_file else "<uncategorized>";
-        if (sym_to_file.contains(sym)) continue;
-        try sym_to_file.put(try allocator.dupe(u8, sym), file);
+        var it = file_syms.valueIterator();
+        while (it.next()) |v| v.deinit();
+        file_syms.deinit();
     }
 
-    // Demand pruning (task #205): remove functions unreachable from __nova_main, so a wholly-unused
-    // source file emits no object. T6 needs surviving functions to keep their ORIGINAL (external)
-    // linkage for cross-object references, so this is two-phase: (1) compute the reachable set on a
-    // throwaway clone by internalizing everything but the entry and running globaldce; (2) on the real
-    // module, internalize only the DEAD functions and globaldce them away, leaving reachable functions'
-    // linkage untouched. globaldce is address-aware, so pointer-referenced coroutine/callback bodies
-    // reachable from main are retained. After this, func_map holds dangling refs to deleted functions
-    // -- everything downstream reads the MODULE, not func_map.
-    if (pruneEnabled()) {
+    if (!pruneEnabled()) {
+        // DEFAULT PATH (known-good, unchanged): group every emitted function by its source file
+        // straight from func_map. No pruning, no module mutation.
+        for (compiler.functions.items) |func| {
+            const v = compiler.func_map.get(func.name) orelse continue;
+            const sym = std.mem.span(core.LLVMGetValueName(v));
+            try all_syms.put(sym, {});
+            const file = if (func.source_file.len > 0) func.source_file else "<uncategorized>";
+            const gop = try file_syms.getOrPut(file);
+            if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap(void).init(allocator);
+            try gop.value_ptr.put(sym, {});
+        }
+    } else {
+        // OPT-IN demand pruning (task #205, NOVA_PRUNE=1): remove functions unreachable from __nova_main
+        // so a wholly-unused source file emits no object. T6 needs surviving functions to keep their
+        // ORIGINAL (external) linkage for cross-object references, so this is two-phase: (1) compute the
+        // reachable set on a throwaway clone by internalizing everything but the entry and running
+        // globaldce; (2) on the real module, internalize only the DEAD functions and globaldce them away.
+        // A symbol->file map is captured FIRST (func_map dangles after globaldce deletes functions), then
+        // file_syms is rebuilt from the SURVIVING module definitions.
+        var sym_to_file = std.StringHashMap([]const u8).init(allocator);
+        defer {
+            var kit = sym_to_file.keyIterator();
+            while (kit.next()) |k| allocator.free(k.*);
+            sym_to_file.deinit();
+        }
+        for (compiler.functions.items) |func| {
+            const v = compiler.func_map.get(func.name) orelse continue;
+            const sym = std.mem.span(core.LLVMGetValueName(v));
+            const file = if (func.source_file.len > 0) func.source_file else "<uncategorized>";
+            if (sym_to_file.contains(sym)) continue;
+            try sym_to_file.put(try allocator.dupe(u8, sym), file);
+        }
+
         var reachable = std.StringHashMap(void).init(allocator);
         defer {
             var kit = reachable.keyIterator();
@@ -1347,20 +1365,7 @@ fn compileSplitEmit(
         const perr2 = transform.LLVMRunPasses(compiler.module, "globaldce", compiler.target_machine, opts2);
         if (perr2 != null) errors.LLVMConsumeError(perr2);
         memPhase("after demand prune");
-    }
 
-    // Group the SURVIVING owned function definitions by source file. Iterating the module (not
-    // func_map) is required post-prune: deleted functions are simply absent. Declarations (no body)
-    // are cross-object references or runtime symbols -- skipped, they have no owning file here.
-    var all_syms = std.StringHashMap(void).init(allocator);
-    defer all_syms.deinit();
-    var file_syms = std.StringHashMap(std.StringHashMap(void)).init(allocator);
-    defer {
-        var it = file_syms.valueIterator();
-        while (it.next()) |v| v.deinit();
-        file_syms.deinit();
-    }
-    {
         var mf = core.LLVMGetFirstFunction(compiler.module);
         while (mf != null) : (mf = core.LLVMGetNextFunction(mf)) {
             if (core.LLVMGetFirstBasicBlock(mf) == null) continue; // declaration, not owned here
