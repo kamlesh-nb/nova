@@ -621,8 +621,8 @@ fn addNovaArchive(b: *std.Build, exe: *std.Build.Step.Compile, target: std.Build
             \\if (Test-Path $stage) {{ Remove-Item -Recurse -Force $stage }}
             \\New-Item -ItemType Directory -Force -Path "$stage/bin","$stage/lib" | Out-Null
             \\Copy-Item -Force "{[home]s}/.nova/bin/nova.exe" "$stage/bin/nova.exe"
-            \\# nls: build from the sibling repo unless skipped (NOVA_ARCHIVE_SKIP_NLS=1), matching the
-            \\# Unix path -- used where the private nls repo is not checked out (e.g. CI).
+            \\# nls: PURE ZIG (no LLVM link), built from the sibling repo unless NOVA_ARCHIVE_SKIP_NLS=1,
+            \\# matching the Unix path -- skip only when the nls repo is not checked out.
             \\if ($env:NOVA_ARCHIVE_SKIP_NLS -eq "1") {{ Write-Host "archive: NOVA_ARCHIVE_SKIP_NLS=1 -- bundling without nls" }}
             \\else {{ Push-Location ../nls; zig build -Dnova-src=../lang/src/root.zig; Pop-Location; Copy-Item -Force "{[home]s}/.nova/bin/nls.exe" "$stage/bin/nls.exe" }}
             \\# nova.exe dynamically links LLVM-C.dll on Windows; bundle it next to the exe so the
@@ -661,10 +661,11 @@ fn addNovaArchive(b: *std.Build, exe: *std.Build.Step.Compile, target: std.Build
         \\rm -rf "$STAGE"
         \\mkdir -p "$STAGE/bin" "$STAGE/lib"
         \\cp "{[home]s}/.nova/bin/nova" "$STAGE/bin/nova"
-        \\# nls: build fresh from the sibling compiler repo (installs to ~/.nova/bin/nls). It links
-        \\# LLVM the same way the compiler does; where that toolchain is not set up (e.g. a Linux CI
-        \\# runner without system LLVM), set NOVA_ARCHIVE_SKIP_NLS=1 to ship a nova+stdlib bundle
-        \\# without the language server rather than fail the release.
+        \\# nls: build fresh from the sibling compiler repo (installs to ~/.nova/bin/nls). It is PURE ZIG
+        \\# (no LLVM link -- the LSP only touches the frontend re-exports, not codegen), so it builds on
+        \\# any runner with the bundled Zig toolchain alone; pinned to THIS lang checkout via -Dnova-src.
+        \\# Set NOVA_ARCHIVE_SKIP_NLS=1 only to intentionally ship a nova+stdlib bundle without the LSP
+        \\# (e.g. when the nls repo is not checked out).
         \\if [ "${{NOVA_ARCHIVE_SKIP_NLS:-0}}" = "1" ]; then
         \\  echo "archive: NOVA_ARCHIVE_SKIP_NLS=1 -- bundling without nls (language server)"
         \\else

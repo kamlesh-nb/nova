@@ -6,7 +6,12 @@ name: release
 #   * LLVM 21 is installed from the OS package manager and the build is pointed at it via
 #     NOVA_LLVM_PREFIX. macOS/Linux static-link (build.zig globs the install's libLLVM*.a);
 #     Windows dynamic-links LLVM-C and bundles LLVM-C.dll next to nova.exe.
-#   * nls (a separate private repo) is not built here (NOVA_ARCHIVE_SKIP_NLS=1).
+#   * nls (the language server) IS bundled: each runner checks out the sibling `nls` repo and the
+#     archive step builds it from that source, pinned to THIS lang checkout via `-Dnova-src`. nls is
+#     pure-Zig (no LLVM link), so it builds on every runner without extra toolchain. If the `nls` repo
+#     is private, set the `NLS_TOKEN` secret to a PAT with read access (else the checkout falls back to
+#     the workflow's GITHUB_TOKEN, which only works when nls is in the same repo/owner and permitted).
+#     To ship a nova-only bundle, set the repo variable `SKIP_NLS=1`.
 #   * NOTE: arm64 Linux/Windows runners are BILLED on private repos.
 #
 # Trigger: push a tag `v*`, or run manually (Actions -> release -> Run workflow) with a version.
@@ -26,7 +31,8 @@ permissions:
 
 env:
   NOVA_VERSION: ${{ github.event.inputs.version || github.ref_name }}
-  NOVA_ARCHIVE_SKIP_NLS: "1"
+  # Bundle nls unless the repo variable SKIP_NLS is set to 1 (archive step reads NOVA_ARCHIVE_SKIP_NLS).
+  NOVA_ARCHIVE_SKIP_NLS: ${{ vars.SKIP_NLS || '0' }}
 
 jobs:
   build-macos:
@@ -38,6 +44,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { path: lang }
+      # nls (language server): checked out as a SIBLING of lang so the archive step builds it from
+      # source, version-pinned to this lang checkout via -Dnova-src. Skipped only if SKIP_NLS=1.
+      - uses: actions/checkout@v4
+        if: ${{ vars.SKIP_NLS != '1' }}
+        with:
+          repository: kamlesh-nb/nls
+          path: nls
+          token: ${{ secrets.NLS_TOKEN || github.token }}
       - uses: mlugg/setup-zig@v2
         with: { version: 0.16.0 }
       - name: Install LLVM 21 (Homebrew) and point the build at it
@@ -68,6 +82,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { path: lang }
+      # nls (language server): checked out as a SIBLING of lang so the archive step builds it from
+      # source, version-pinned to this lang checkout via -Dnova-src. Skipped only if SKIP_NLS=1.
+      - uses: actions/checkout@v4
+        if: ${{ vars.SKIP_NLS != '1' }}
+        with:
+          repository: kamlesh-nb/nls
+          path: nls
+          token: ${{ secrets.NLS_TOKEN || github.token }}
       - uses: mlugg/setup-zig@v2
         with: { version: 0.16.0 }
       - name: Install LLVM 21 (apt.llvm.org) + static-link deps, point the build at it
@@ -101,6 +123,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { path: lang }
+      # nls (language server): checked out as a SIBLING of lang so the archive step builds it from
+      # source, version-pinned to this lang checkout via -Dnova-src. Skipped only if SKIP_NLS=1.
+      - uses: actions/checkout@v4
+        if: ${{ vars.SKIP_NLS != '1' }}
+        with:
+          repository: kamlesh-nb/nls
+          path: nls
+          token: ${{ secrets.NLS_TOKEN || github.token }}
       - uses: mlugg/setup-zig@v2
         with: { version: 0.16.0 }
       - name: Ensure LLVM (with C-API dev libs) and point the build at it

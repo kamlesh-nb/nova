@@ -24,4 +24,21 @@ if [ "$bz_abi" != "$h_abi" ]; then
   echo "ERROR: build.zig nova_abi_version ($bz_abi) != nova_abi.h NOVA_ABI_VERSION ($h_abi)"; fail=1
 fi
 
+# nls (the language server) ships in the SAME release archive as nova, built from source pinned to this
+# lang checkout, so its version MUST match. Only checked when the nls repo is present as a sibling (a
+# lang-only clone skips it); the release runners always have it checked out, so a drift fails the release.
+NLS_ZON=""
+for p in "$ROOT/../nls/build.zig.zon" "$ROOT/nls/build.zig.zon"; do
+  [ -f "$p" ] && { NLS_ZON="$p"; break; }
+done
+if [ -n "$NLS_ZON" ]; then
+  nls_ver="$(grep -oE '\.version = "[^"]+"' "$NLS_ZON" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+  echo "nls:     build.zig.zon=$nls_ver  (lang=$bz_ver)"
+  if [ "$nls_ver" != "$bz_ver" ]; then
+    echo "ERROR: nls version ($nls_ver) != nova_version ($bz_ver) -- bump nls/build.zig.zon to match"; fail=1
+  fi
+else
+  echo "nls:     (repo not present as a sibling -- version-lock check skipped)"
+fi
+
 [ "$fail" -eq 0 ] && echo "version sync OK" || { echo "version drift -- fix the sites above"; exit 1; }
