@@ -373,6 +373,30 @@ pub const TypeChecker = struct {
         }
     }
 
+    // Does executing this statement GUARANTEE the function returns/diverges (never falls through to the
+    // next statement)? Conservative: anything uncertain answers TRUE so a valid function is never flagged.
+    // In particular an expr-statement (which may be a call that panics/exits/throws) and loops/switch are
+    // treated as returning; only a `let`/`break`/`continue`/`defer`, or an `if` without a returning `else`,
+    // clearly falls through.
+    fn stmtDefinitelyReturns(self: *TypeChecker, stmt: ast.Statement) bool {
+        return switch (stmt) {
+            .return_stmt => true,
+            .block => |b| self.blockDefinitelyReturns(b),
+            .if_stmt => |ifs| blk: {
+                const eb = ifs.else_branch orelse break :blk false; // no else -> can fall through
+                break :blk self.stmtDefinitelyReturns(ifs.then_branch.*) and self.stmtDefinitelyReturns(eb.*);
+            },
+            .while_stmt, .for_stmt, .switch_stmt => true, // may diverge or be exhaustive -> never flag
+            .expr_stmt => true, // may be a call that panics/exits/throws -> never flag a call ending
+            .let_stmt, .break_stmt, .continue_stmt, .defer_stmt => false,
+        };
+    }
+
+    fn blockDefinitelyReturns(self: *TypeChecker, b: ast.Block) bool {
+        if (b.statements.len == 0) return false;
+        return self.stmtDefinitelyReturns(b.statements[b.statements.len - 1]);
+    }
+
     fn checkFunction(self: *TypeChecker, func: ast.FunctionDecl) anyerror!void {
         self.checkDuplicateTypeParams(func.name, func.type_params, func.span);
         self.variables.clearRetainingCapacity();
@@ -384,6 +408,18 @@ pub const TypeChecker = struct {
             }
         }
         if (func.ret_type) |rt| self.rejectUnimplementedType(rt, func.span, func.type_params, true);
+
+        // Missing-return: a non-void function whose body can fall off the end returns garbage on that path.
+        // Only for a concrete non-void return, an in-repo body (not extern), and using the conservative
+        // "definitely returns" analysis above so nothing valid is flagged.
+        if (func.extern_lib == null) {
+            if (func.ret_type) |rt| {
+                const is_voidish = rt == .ident and (std.mem.eql(u8, rt.ident, "void") or std.mem.eql(u8, rt.ident, "any"));
+                if (!is_voidish and !self.blockDefinitelyReturns(func.body)) {
+                    self.addError(func.span, "function '{s}' has return type '{s}' but can finish without returning a value — add a `return` on every path (or an ending loop/return)", .{ func.name, typeRefName(rt) });
+                }
+            }
+        }
 
         if (self.is_wasm and func.is_async) {
             self.addError(func.span, "'async fn {s}' is not available on the wasm target — async has no coroutine runtime in wasm. Move it into a `@native {{ ... }}` block (and provide a synchronous or host-imported `@wasm {{ ... }}` alternative).", .{func.name});

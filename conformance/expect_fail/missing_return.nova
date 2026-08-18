@@ -1,0 +1,10 @@
+// NEGATIVE test: must FAIL to compile.
+// A non-void function whose body can fall off the end without returning would return garbage on that
+// path; the checker must reject it.
+// EXPECT-FAIL: typecheck
+import assert;
+fn noReturn(): int { let x = 1; }   // declares x, then falls off the end -> no value returned
+@test
+fn run() {
+    assert.equalInt(noReturn(), 1);
+}
