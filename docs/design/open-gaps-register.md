@@ -53,13 +53,15 @@ re-opened by mistake. Reverify a specific one only if it resurfaces.
 - Value-optional 0/undefined collision (Map/List storing 0) — FIXED 2026-07-24 (V1 boxing, f9bfc60). **[register]**
 - mongodb Cursor crash (same-named struct collision) — FIXED 2026-08-08 (43be68e); case `78`. **[register]**
 
-### Genuinely-uncertain residuals in this area (do reverify)
-- **mongo async-handler HANG** at concurrency > 1 — the async_owned_struct note says a "separate
-  app-level async-handler hang remains (not the compiler bug)". Status unclear. **[reverify]**
-  Check: run the mongo driver at c>1 and observe.
-- **Possible value-optional PARAM present-0-as-absent variant** — a 2026-08-13 note flagged "valopt-zero
-  (present 0 reads absent) still open, orthogonal" *after* the value-level fix; may be a param-passing
-  variant of the same class (or already covered by the R2/C10 param-ABI fix). **[reverify]**
+### Genuinely-uncertain residuals in this area — BOTH RESOLVED (2026-08-18, re-verified) **[verified]**
+- **mongo async-handler HANG** at concurrency > 1 — **FIXED.** Root cause = concurrent `runCommand` on the
+  SHARED cached connection interleaving frames on the socket; fix = reactor-aware `AsyncLock` guarding
+  `runCommand` (nova-mongodb `2e4b6f8`). Bench: c=50 crash → 100% success, bench4 green. A live re-run needs
+  a running `mongod` + a concurrent app; the fix + bench are the evidence of record.
+- **Value-optional PARAM present-0-as-absent variant** — **RESOLVED (re-run, not recall).** A present
+  `0`/`false`/`0.0` passed as a value-optional ARG reads PRESENT (the R2/C10 param-ABI fix covers it). Now a
+  permanent regression guard: `127_value_optional_zero.nova` `test_param_widths`. Both are beta-checklist
+  item 3 (`docs/design/beta-checklist.md`), now green.
 
 ## C. Tooling (Gap 5) — open **[register]**
 - **Package manager** is a git-clone stub — no lockfile, versioning, or registry. (Network-dependent to

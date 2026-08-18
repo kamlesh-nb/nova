@@ -65,9 +65,37 @@ fn test_local_widths() {
     assert.equalInt(u ?? 7, 7);
 }
 
+// ---- value-optional PARAMETERS: a present 0/false/0.0 passed as an ARG must read PRESENT ------------
+// Regression guard for the §B residual "value-optional PARAM present-0-as-absent variant": the value-level
+// boxing fixed locals + Map storage, but passing a present-0 optional ACROSS a call boundary is a separate
+// ABI path (the R2/C10 param-ABI fix). Verified here so a present-0 arg never narrows as absent again.
+fn viaParam(x: int | undefined): int {
+    if (x != undefined) { return x; }
+    return -1;                              // absent branch — must NOT be taken for a present 0
+}
+fn viaDefault(x: int | undefined): int { return x ?? 99; }
+fn boolParam(b: bool | undefined): int {
+    if (b != undefined) { return if (b) 1 else 0; }
+    return -1;
+}
+fn dblParam(d: double | undefined): int { return if (d != undefined) 1 else -1; }
+
+fn test_param_widths() {
+    assert.zero(viaParam(0));                 // present-0 arg → 0, not the -1 absent branch
+    assert.equalInt(viaParam(5), 5);
+    assert.equalInt(viaParam(undefined), -1);
+    assert.zero(viaDefault(0));               // `??` yields the passed 0, not the default
+    assert.equalInt(viaDefault(undefined), 99);
+    assert.equalInt(boolParam(false), 0);     // present-false arg → present
+    assert.equalInt(boolParam(undefined), -1);
+    assert.equalInt(dblParam(0.0), 1);        // present-0.0 arg → present
+    assert.equalInt(dblParam(undefined), -1);
+}
+
 @test
 fn run() {
     test_map_int_zero();
     test_narrowed_zero();
     test_local_widths();
+    test_param_widths();
 }
