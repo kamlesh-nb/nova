@@ -625,9 +625,15 @@ pub const LlvmCompiler = struct {
         const ptr = debug.LLVMDIBuilderCreatePointerType(self.di_builder, byte_t, 64, 0, 0, "", 0);
         const tn_z = self.allocator.dupeZ(u8, tn) catch return null;
         defer self.allocator.free(tn_z);
-        const td = debug.LLVMDIBuilderCreateTypedef(self.di_builder, ptr, tn_z.ptr, tn.len, self.di_file, 0, self.di_cu, 0);
-        self.di_types.put(tn, td) catch {};
-        return td;
+        // A single-member STRUCT { ptr } named after the instantiation (e.g. "List<int>"), NOT a pointer
+        // typedef. An aggregate has an empty SBValue::GetValue(), so lldb-dap shows only the summary/
+        // synthetic (the element list) and drops the raw `0x…` address prefix -- same trick as `string`.
+        // The Python provider reads the underlying pointer from the variable's storage (its load address).
+        const member = debug.LLVMDIBuilderCreateMemberType(self.di_builder, self.di_cu, "ptr", "ptr".len, self.di_file, 0, 64, 0, 0, .LLVMDIFlagZero, ptr);
+        var members = [_]types.LLVMMetadataRef{member};
+        const st = debug.LLVMDIBuilderCreateStructType(self.di_builder, self.di_cu, tn_z.ptr, tn.len, self.di_file, 0, 64, 0, .LLVMDIFlagZero, null, &members, 1, 0, null, "", 0);
+        self.di_types.put(tn, st) catch {};
+        return st;
     }
 
     // Nova `string` as a single-member STRUCT { data: u8* } named "string", NOT a bare pointer/typedef.
@@ -678,16 +684,19 @@ pub const LlvmCompiler = struct {
         const int_t = self.diBasicType("int", 32, 5);
         const m_ptr = debug.LLVMDIBuilderCreateMemberType(self.di_builder, self.di_cu, "ptr", "ptr".len, self.di_file, 0, 64, 0, 0, .LLVMDIFlagZero, long_t);
         const m_len = debug.LLVMDIBuilderCreateMemberType(self.di_builder, self.di_cu, "len", "len".len, self.di_file, 0, 32, 0, 64, .LLVMDIFlagZero, int_t);
-        var members = [_]types.LLVMMetadataRef{ m_ptr, m_len };
-        const body = debug.LLVMDIBuilderCreateStructType(self.di_builder, self.di_cu, "Str", "Str".len, self.di_file, 0, 128, 0, .LLVMDIFlagZero, null, &members, 2, 0, null, "", 0);
+        var body_members = [_]types.LLVMMetadataRef{ m_ptr, m_len };
+        const body = debug.LLVMDIBuilderCreateStructType(self.di_builder, self.di_cu, "StrData", "StrData".len, self.di_file, 0, 128, 0, .LLVMDIFlagZero, null, &body_members, 2, 0, null, "", 0);
         // Str is NOT stored inline (fieldStoredInline("Str") == false -- the escape analysis keeps it on the
-        // heap), so a Str field/local is an 8-byte POINTER to the { ptr, len } payload. Typedef the pointer
-        // to "Str" so lldb reports `(Str)` and GetChildMemberWithName("ptr"/"len") derefs correctly; the
-        // summary then shows the borrowed text.
-        const p = debug.LLVMDIBuilderCreatePointerType(self.di_builder, body, 64, 0, 0, "", 0);
-        const td = debug.LLVMDIBuilderCreateTypedef(self.di_builder, p, "Str", "Str".len, self.di_file, 0, self.di_cu, 0);
-        self.di_types.put("Str", td) catch {};
-        return td;
+        // heap), so a Str field/local is an 8-byte POINTER to the { ptr, len } payload. Wrap that pointer in
+        // a single-member STRUCT named "Str" (an aggregate, empty GetValue()) so lldb-dap shows only the
+        // summary -- clean `"Alpha"`, no `0x…` prefix, consistent with string/List/Map/Set. nova_str_summary
+        // reads the object pointer from the variable's storage, then ptr/len from the payload.
+        const objp = debug.LLVMDIBuilderCreatePointerType(self.di_builder, body, 64, 0, 0, "", 0);
+        const m_obj = debug.LLVMDIBuilderCreateMemberType(self.di_builder, self.di_cu, "obj", "obj".len, self.di_file, 0, 64, 0, 0, .LLVMDIFlagZero, objp);
+        var members = [_]types.LLVMMetadataRef{m_obj};
+        const st = debug.LLVMDIBuilderCreateStructType(self.di_builder, self.di_cu, "Str", "Str".len, self.di_file, 0, 64, 0, .LLVMDIFlagZero, null, &members, 1, 0, null, "", 0);
+        self.di_types.put("Str", st) catch {};
+        return st;
     }
 
     fn diFieldType(self: *LlvmCompiler, tn: []const u8, f_size: u32) types.LLVMMetadataRef {
