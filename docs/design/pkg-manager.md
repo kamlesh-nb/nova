@@ -1,5 +1,12 @@
 # Nova package manager — locked design (2026-08-16)
 
+> **STATUS: IMPLEMENTED (2026-08-18).** All of §1-§8 are built in `src/packages.zig` (+ version-aware
+> import resolution in `src/pipeline.zig`). The §10 acceptance passes end-to-end, fully local (no network),
+> via `conformance/pkg-acceptance.sh` — wired into `gate.sh`. The §5/§9 supply-chain caveat (the recursive
+> fetch trusts each package's declared dep list) remains the documented out-of-scope limitation; `nova
+> vendor` is the recorded first future step (remaining-gaps-design.md Gap 8).
+
+
 The deliberately-small package manager for Nova. It is **Cargo-flavoured** in identity (clean by-NAME
 imports; the name comes from each package's own manifest; multiple versions may coexist) and
 **Zig-flavoured** in resolution (exact git-ref pins, git as the source of truth, no registry, no semver

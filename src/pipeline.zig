@@ -579,6 +579,14 @@ pub fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocat
         current_len = last_slash;
     }
 
+    // Version-aware resolution (pkg-manager.md §6): when a lockfile exists, `import X` binds through the
+    // owning package's manifest + the flat lock to a version-keyed cache dir. Wins over the legacy scans
+    // so a package-managed app gets the EXACT pinned version (and multi-version coexistence). Inert (null)
+    // when there is no lock, so the packages/-based dev setup and the corpus are unchanged.
+    if (try resolveVersioned(module_name, base_path, allocator, io, home)) |ver_hit| {
+        return ver_hit;
+    }
+
     if (resolveFromLocalPackages(module_name, dir, allocator, io)) |local_hit| {
         return local_hit;
     }
@@ -598,6 +606,97 @@ pub fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocat
     return try std.fmt.allocPrint(allocator, "{s}/{s}.nova", .{ dir, module_name });
 }
 
+
+// -------------------------------------------------------------------------------------------------
+// Version-aware import resolution (pkg-manager.md §6). When a project.lock.json exists, an `import X`
+// binds PER OWNING PACKAGE: find the file's owning manifest (nearest project.json up its tree), look up
+// X among that manifest's dependencies via the flat lock (url[#ref] -> declared name + resolved SHA),
+// and resolve to the version-keyed cache dir `~/.nova/cache/<name>-<sha8>`. Because two versions live at
+// different paths and mangling is path-derived, they coexist. Returns null (fall through to the legacy
+// scan) when there is no lock — so the corpus and packages/-based dev setup are unaffected.
+const PkgLockEntry = struct { url: []const u8, ref: ?[]const u8 = null, resolved: ?[]const u8 = null, name: []const u8 };
+const PkgLockFile = struct { lockfileVersion: u32 = 1, dependencies: []PkgLockEntry = &[_]PkgLockEntry{} };
+
+fn pkgParseDep(dep: []const u8) struct { url: []const u8, ref: ?[]const u8 } {
+    if (std.mem.lastIndexOfScalar(u8, dep, '#')) |h|
+        return .{ .url = dep[0..h], .ref = if (h + 1 < dep.len) dep[h + 1 ..] else null };
+    return .{ .url = dep, .ref = null };
+}
+
+fn pkgCacheDirName(allocator: std.mem.Allocator, name: []const u8, sha: ?[]const u8) ?[]const u8 {
+    if (sha) |s| return std.fmt.allocPrint(allocator, "{s}-{s}", .{ name, s[0..@min(s.len, 8)] }) catch null;
+    return std.fmt.allocPrint(allocator, "{s}-branch", .{name}) catch null;
+}
+
+fn refEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+// The nearest ancestor directory of `importer_file` that contains a project.json (its owning package).
+// A top-level app file (e.g. "src/main.nova") is owned by the CWD project — so once the walk exhausts the
+// path's own directories, fall back to the CWD's project.json (returned as ".").
+fn findOwningManifestDir(allocator: std.mem.Allocator, io: std.Io, importer_file: []const u8) ?[]const u8 {
+    var end = std.mem.lastIndexOfScalar(u8, importer_file, '/') orelse 0;
+    while (end > 0) {
+        const dir = importer_file[0..end];
+        const mpath = std.fmt.allocPrint(allocator, "{s}/project.json", .{dir}) catch return null;
+        if (Io.Dir.access(.cwd(), io, mpath, .{})) |_| return allocator.dupe(u8, dir) catch null else |_| {}
+        end = std.mem.lastIndexOfScalar(u8, dir, '/') orelse break;
+    }
+    // CWD project (the app being built) owns any file not under a nested package dir.
+    if (Io.Dir.access(.cwd(), io, "project.json", .{})) |_| return allocator.dupe(u8, ".") catch null else |_| {}
+    return null;
+}
+
+fn findModuleInPackageDir(allocator: std.mem.Allocator, io: std.Io, pkg_dir: []const u8, module_name: []const u8) ?[]const u8 {
+    const src = std.fmt.allocPrint(allocator, "{s}/src/{s}.nova", .{ pkg_dir, module_name }) catch return null;
+    if (existingSource(src, allocator, io)) |hit| return hit;
+    const flat = std.fmt.allocPrint(allocator, "{s}/{s}.nova", .{ pkg_dir, module_name }) catch return null;
+    if (existingSource(flat, allocator, io)) |hit| return hit;
+    return null;
+}
+
+pub const PkgResolveError = error{PackageNameCollision};
+
+pub fn resolveVersioned(module_name: []const u8, importer_file: []const u8, allocator: std.mem.Allocator, io: std.Io, home: ?[]const u8) PkgResolveError!?[]const u8 {
+    const home_dir = home orelse return null;
+    // The flat lock is the ROOT project's (cwd) — it holds the whole tree, keyed by url (+ref).
+    const lock_data = Io.Dir.readFileAlloc(.cwd(), io, "project.lock.json", allocator, .unlimited) catch return null;
+    const lock = std.json.parseFromSlice(PkgLockFile, allocator, lock_data, .{ .ignore_unknown_fields = true }) catch return null;
+
+    const owner_dir = findOwningManifestDir(allocator, io, importer_file) orelse return null;
+    const owner_manifest = std.fmt.allocPrint(allocator, "{s}/project.json", .{owner_dir}) catch return null;
+    const mdata = Io.Dir.readFileAlloc(.cwd(), io, owner_manifest, allocator, .unlimited) catch return null;
+    const manifest = std.json.parseFromSlice(ProjectJson, allocator, mdata, .{ .ignore_unknown_fields = true }) catch return null;
+
+    // Among THIS owning package's deps, find the one whose declared name (from the lock) == module_name.
+    // Two different urls in the SAME scope declaring the same name is an identity clash (§6 name-collision).
+    var match_url: ?[]const u8 = null;
+    var match_entry: ?PkgLockEntry = null;
+    for (manifest.value.dependencies) |dep| {
+        const spec = pkgParseDep(dep);
+        for (lock.value.dependencies) |e| {
+            if (!std.mem.eql(u8, e.url, spec.url)) continue;
+            if (!refEql(e.ref, spec.ref)) continue;
+            if (!std.mem.eql(u8, e.name, module_name)) continue;
+            if (match_url) |mu| {
+                if (!std.mem.eql(u8, mu, e.url)) {
+                    std.debug.print("package name collision: import \"{s}\" is declared by TWO urls in {s}:\n  {s}\n  {s}\n", .{ module_name, owner_dir, mu, e.url });
+                    return PkgResolveError.PackageNameCollision;
+                }
+            } else {
+                match_url = e.url;
+                match_entry = e;
+            }
+        }
+    }
+    const entry = match_entry orelse return null;
+    const dirname = pkgCacheDirName(allocator, entry.name, entry.resolved) orelse return null;
+    const pkg_dir = std.fmt.allocPrint(allocator, "{s}/.nova/cache/{s}", .{ home_dir, dirname }) catch return null;
+    return findModuleInPackageDir(allocator, io, pkg_dir, module_name);
+}
 
 pub fn resolveFromPackageCache(module_name: []const u8, allocator: std.mem.Allocator, io: std.Io, home: ?[]const u8) ?[]const u8 {
     const home_dir = home orelse return null;

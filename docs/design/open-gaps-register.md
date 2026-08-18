@@ -63,10 +63,15 @@ re-opened by mistake. Reverify a specific one only if it resurfaces.
   permanent regression guard: `127_value_optional_zero.nova` `test_param_widths`. Both are beta-checklist
   item 3 (`docs/design/beta-checklist.md`), now green.
 
-## C. Tooling (Gap 5) — open **[register]**
-- **Package manager** is a git-clone stub — no lockfile, versioning, or registry. (Network-dependent to
-  verify; not startable in the sandbox.)
-- **No debugger** — no DWARF/lldb integration. Large; independent of other gaps.
+## C. Tooling (Gap 5) — **[register]**
+- **Package manager — IMPLEMENTED (2026-08-18).** The git-clone stub is replaced by the full
+  `pkg-manager.md` design: `project.lock.json` (flat, declared name + resolved SHA per dep), version-keyed
+  cache `~/.nova/cache/<name>-<sha8>`, transitive cache-deduped resolution, build-honors-lock, `get`/
+  `restore`/`update`/`publish`, and version-aware per-owner import resolution (multi-version coexistence +
+  name-collision guard). All six §10 acceptance items pass locally (`conformance/pkg-acceptance.sh`, no
+  network); wired into `gate.sh`. **[verified]**
+- **Debugger — DONE (2026-08-18).** In-editor DWARF + lldb-dap + formatters (C#-quality value display).
+  **[verified]**
 - **LSP** improved (R4 binding-accurate rename/refs) but still broad-but-basic.
 
 ## D. Cross-platform / CI (Gap 7) — open; see also the build.zig appendix **[verified build.zig / register]**

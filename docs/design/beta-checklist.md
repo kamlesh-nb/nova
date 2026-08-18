@@ -12,7 +12,7 @@ line here is green only when its **Verify** command passes on the spot.
 | 1 | `gate.sh` green on every supported host (mac arm64/x86_64, linux/WSL, Windows) | 🟡 partial | Gap 2 (CI matrix) |
 | 2 | Ownership verifier enforced corpus-wide | ✅ done | Gap 3 enforcement-B |
 | 3 | Zero KNOWN live crash bugs, verified by re-running (not recall) | ✅ done | — |
-| 4 | Package manager to `pkg-manager.md` §10 (or explicitly labelled "tooling: alpha") | 🔴 open | Gap 1 |
+| 4 | Package manager to `pkg-manager.md` §10 (or explicitly labelled "tooling: alpha") | ✅ done | Gap 1 |
 | 5 | `docs/guide` compiles and its examples run | ✅ done | dogfood gate |
 | 6 | Debugger is NOT required for beta (post-beta) | ✅ n/a (shipped anyway) | — |
 
@@ -53,13 +53,16 @@ genuinely-uncertain residuals are now resolved and RE-VERIFIED, not taken from r
   interleaving frames on the socket. Bench evidence: c=50 crash → 100% success, bench4 green. A live re-run
   needs a running `mongod` + a concurrent mongo app; the fix + bench stand as the evidence of record.
 
-## 4 — Package manager  🔴
+## 4 — Package manager  ✅
 
-The package manager is still a git-clone stub (no lockfile / versioning / registry). Either implement to
-`pkg-manager.md` §10 acceptance, OR explicitly ship it labelled "tooling: alpha" with the limitation
-documented in the guide. This is the main open beta-blocker.
+Implemented to `pkg-manager.md`: `project.json` deps as `url[#ref]`, a flat `project.lock.json` over the
+whole tree (declared name + resolved git SHA per dep), version-keyed cache `~/.nova/cache/<name>-<sha8>`,
+transitive cache-deduped resolution, build-honors-lock (never moves a pin; offline once restored),
+`get`/`restore`/`update`/`publish`, and version-aware per-owner import resolution (multi-version
+coexistence + name-collision guard).
 
-**Verify (when built):** `pkg-manager.md` §10 acceptance passing.
+**Verify:** `cd lang && bash conformance/pkg-acceptance.sh` → `PKG ACCEPTANCE: PASS` (all six §10 items,
+fully local via `file://` repos, no network). Wired into `gate.sh`.
 
 ## 5 — `docs/guide` compiles and its examples run  ✅
 
@@ -79,4 +82,6 @@ C#-quality value display) landed this session, so it is a bonus rather than a ga
 
 - 🟡 partial = green locally / mechanism in place, needs the remaining hosts or a CI run to confirm.
 - Green (✅) requires the **Verify** command to pass now, on this checkout.
-- The only remaining hard blocker is **#4 (package manager)** — everything else is green or CI-gated.
+- All hard blockers are green. The only non-green item is **#1** (all-host gate), which is a CI-matrix
+  confirmation, not a feature gap: `gate.sh` is green locally and the release workflow exercises all six
+  hosts. So beta rests on running the existing gate on each host, not on building anything more.

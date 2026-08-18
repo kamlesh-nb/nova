@@ -101,6 +101,67 @@ JSON
 # re-publish must refuse
 if ( cd "$PUB" && nova publish ) >/dev/null 2>&1; then bad "re-publish succeeded (should refuse)"; else ok "re-publish refused"; fi
 
+# ===== Acceptance 4: multi-version coexistence — app pins X#v1, dep B pins X#v2; both compile =====
+# X has two tags with DIFFERENT function names, so a successful compile PROVES each package resolved its
+# OWN pinned version (app -> xv1, B2 -> xv2): a wrong resolution would be an "unknown function" error.
+say "4. multi-version coexistence (per-owner import resolution)"
+XBARE="$WS/xpkg.git"; git init -q --bare "$XBARE"
+git init -q "$WS/X"; ( cd "$WS/X"
+  cat > project.json <<JSON
+{ "name": "xpkg", "version": "1.0.0", "type": "library", "repository": "file://$XBARE", "dependencies": [] }
+JSON
+  mkdir -p src; printf 'pub fn xv1(): string { return "1"; }\n' > src/xpkg.nova
+  git add -A; git commit -qm v1; git tag -a v1.0.0 -m v1.0.0; git remote add origin "$XBARE"; git push -q origin HEAD:refs/heads/main; git push -q origin v1.0.0
+  # v2: a DIFFERENT api (xv2), bump version
+  printf 'pub fn xv2(): string { return "2"; }\n' > src/xpkg.nova
+  sed -i '' 's/"version": "1.0.0"/"version": "2.0.0"/' project.json
+  git commit -qam v2; git tag -a v2.0.0 -m v2.0.0; git push -q origin v2.0.0
+)
+B2BARE="$WS/b2pkg.git"; git init -q --bare "$B2BARE"
+git init -q "$WS/B2"; ( cd "$WS/B2"
+  cat > project.json <<JSON
+{ "name": "b2pkg", "version": "1.0.0", "type": "library", "repository": "file://$B2BARE", "dependencies": ["file://$XBARE#v2.0.0"] }
+JSON
+  mkdir -p src; printf 'import xpkg;\npub fn b2(): string { return xpkg.xv2(); }\n' > src/b2pkg.nova
+  git add -A; git commit -qm init; git remote add origin "$B2BARE"; git push -q origin HEAD:refs/heads/main; git push -q origin v1.0.0 2>/dev/null || true
+)
+MV="$WS/mvapp"; mkdir -p "$MV/src"; ( cd "$MV"
+  cat > project.json <<JSON
+{ "name": "mvapp", "version": "0.1.0", "type": "console", "dependencies": ["file://$XBARE#v1.0.0", "file://$B2BARE"] }
+JSON
+  printf 'import string;\nimport xpkg;\nimport b2pkg;\nfn main(): void { console.log(xpkg.xv1()); console.log(b2pkg.b2()); }\n' > src/main.nova
+)
+( cd "$MV" && nova restore ) >/dev/null 2>&1
+ls -d "$CACHE/xpkg-"* 2>/dev/null | wc -l | grep -q 2 && ok "both xpkg versions cached (xpkg-<sha1>, xpkg-<sha2>)" || bad "expected 2 xpkg cache dirs"
+if ( cd "$MV" && nova build ) >/dev/null 2>&1; then
+  ok "app compiles: its import xpkg -> v1 (xv1), b2pkg's import xpkg -> v2 (xv2)"
+else
+  bad "multi-version app failed to compile (wrong per-owner resolution)"
+fi
+
+# ===== Acceptance 5: name collision — two DIFFERENT urls declaring the SAME name in one scope =====
+say "5. name-collision hard error"
+DBARE="$WS/dupB.git"; git init -q --bare "$DBARE"; ABARE="$WS/dupA.git"; git init -q --bare "$ABARE"
+for r in dupA dupB; do
+  bare="$WS/$r.git"
+  git init -q "$WS/$r"; ( cd "$WS/$r"
+    cat > project.json <<JSON
+{ "name": "dupx", "version": "1.0.0", "type": "library", "repository": "file://$bare", "dependencies": [] }
+JSON
+    mkdir -p src; printf 'pub fn who(): string { return "%s"; }\n' "$r" > src/dupx.nova
+    git add -A; git commit -qm init; git tag -a v1.0.0 -m v1.0.0; git remote add origin "$bare"; git push -q origin HEAD:refs/heads/main; git push -q origin v1.0.0
+  )
+done
+COL="$WS/colapp"; mkdir -p "$COL/src"; ( cd "$COL"
+  cat > project.json <<JSON
+{ "name": "colapp", "version": "0.1.0", "type": "console", "dependencies": ["file://$ABARE#v1.0.0", "file://$DBARE#v1.0.0"] }
+JSON
+  printf 'import string;\nimport dupx;\nfn main(): void { console.log(dupx.who()); }\n' > src/main.nova
+)
+( cd "$COL" && nova restore ) >/dev/null 2>&1
+colout="$( cd "$COL" && nova build 2>&1 )"
+if printf '%s' "$colout" | grep -qi "name collision"; then ok "build fails with a name-collision error naming both urls"; else bad "collision not detected (build did not error on duplicate name)"; fi
+
 echo
 if [ $fail -eq 0 ]; then echo "PKG ACCEPTANCE: PASS"; else echo "PKG ACCEPTANCE: FAIL"; fi
 exit $fail

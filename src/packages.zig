@@ -142,9 +142,17 @@ fn readLock(allocator: std.mem.Allocator, io: std.Io) LockFile {
     return parsed.value;
 }
 
-fn lockLookup(lock: LockFile, url: []const u8) ?LockEntry {
+fn refEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+// Match a dependency to its lock entry by (url, ref) — the SAME url at two DIFFERENT refs is two distinct
+// pins (multi-version, pkg-manager.md §6), so ref must be part of the key, not url alone.
+fn lockLookup(lock: LockFile, url: []const u8, ref: ?[]const u8) ?LockEntry {
     for (lock.dependencies) |e| {
-        if (std.mem.eql(u8, e.url, url)) return e;
+        if (std.mem.eql(u8, e.url, url) and refEql(e.ref, ref)) return e;
     }
     return null;
 }
@@ -227,7 +235,7 @@ fn resolveTree(allocator: std.mem.Allocator, init: std.process.Init, mode: Mode,
     while (work.items.len > 0) {
         const dep = work.orderedRemove(0);
         const spec = parseDep(dep);
-        const locked = lockLookup(existing, spec.url);
+        const locked = lockLookup(existing, spec.url, spec.ref);
 
         const moving = mode == .update and (update_target == null or std.mem.eql(u8, spec.url, update_target.?));
 
