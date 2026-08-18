@@ -379,11 +379,11 @@ pub const TypeChecker = struct {
 
         for (func.params) |param| {
             if (param.type_name) |t| {
-                self.rejectUnimplementedType(t, param.span);
+                self.rejectUnimplementedType(t, param.span, func.type_params, true);
                 try self.variables.put(param.name, t);
             }
         }
-        if (func.ret_type) |rt| self.rejectUnimplementedType(rt, func.span);
+        if (func.ret_type) |rt| self.rejectUnimplementedType(rt, func.span, func.type_params, true);
 
         if (self.is_wasm and func.is_async) {
             self.addError(func.span, "'async fn {s}' is not available on the wasm target — async has no coroutine runtime in wasm. Move it into a `@native {{ ... }}` block (and provide a synchronous or host-imported `@wasm {{ ... }}` alternative).", .{func.name});
@@ -404,25 +404,58 @@ pub const TypeChecker = struct {
         };
     }
 
-    fn rejectUnimplementedType(self: *TypeChecker, t: ast.TypeRef, span: ast.Span) void {
+    // A type name is KNOWN if it is a builtin primitive, an in-scope type parameter, `Self`, or a declared
+    // struct/trait/enum/union (all modules are merged before checking, so imported types are registered).
+    fn isKnownTypeName(self: *TypeChecker, name: []const u8, tparams: []const []const u8) bool {
+        for (tparams) |tp| if (std.mem.eql(u8, name, tp)) return true;
+        if (std.mem.eql(u8, name, "Self")) return true;
+        const c = canonicalizeTypeName(name); // int->i32, long->i64, byte->i8, ...
+        const builtin_types = [_][]const u8{
+            "i8", "i16", "i32", "i64", "i128", "f32", "f64", "bool", "string", "void",
+            "any", "char", "ptr", "uptr", "usize", "isize", "never", "unit", "decimal", "byte",
+            "future", "channel", // compiler builtin generics (future<T> is special-cased in sema/lower)
+        };
+        for (builtin_types) |b| if (std.mem.eql(u8, c, b) or std.mem.eql(u8, name, b)) return true;
+        return self.structs.contains(name) or self.traits.contains(name) or self.enums.contains(name) or
+            self.unions.contains(name) or self.structs.contains(c);
+    }
+
+    // `check_unknown` gates the undefined-type rejection: true only where the type-param scope handed in
+    // `tparams` is exactly right (top-level function signatures and struct fields). Elsewhere (e.g. a `let`
+    // annotation inside a generic method, whose type params are not threaded here) it stays false so the
+    // pass keeps its original i128-only behavior and can never false-flag an in-scope type parameter.
+    fn rejectUnimplementedType(self: *TypeChecker, t: ast.TypeRef, span: ast.Span, tparams: []const []const u8, check_unknown_in: bool) void {
+        // Never flag unknowns in COMPILER-GENERATED sources (`<mediator-generated>` etc.): they reference
+        // framework types the generator knows are valid, and are not user-authored, so a diagnostic there is
+        // noise. The i128 removal check still runs everywhere.
+        const check_unknown = check_unknown_in and !(span.file.len > 0 and span.file[0] == '<');
         switch (t) {
             .ident => |n| {
                 if (std.mem.eql(u8, n, "i128") or std.mem.eql(u8, n, "u128")) {
                     self.addError(span, "type '128-bit integer' was removed (F3 §3.1); use 'long' or 'i64'", .{});
+                    return;
+                }
+                if (check_unknown and !self.isKnownTypeName(n, tparams)) {
+                    self.addError(span, "unknown type '{s}' — not a primitive, type parameter, or declared struct/enum/trait", .{n});
                 }
             },
-            .optional => |inner| self.rejectUnimplementedType(inner.*, span),
+            .optional => |inner| self.rejectUnimplementedType(inner.*, span, tparams, check_unknown),
             .error_union => |eu| {
-                self.rejectUnimplementedType(eu.ok.*, span);
-                self.rejectUnimplementedType(eu.err.*, span);
+                self.rejectUnimplementedType(eu.ok.*, span, tparams, check_unknown);
+                self.rejectUnimplementedType(eu.err.*, span, tparams, check_unknown);
             },
-            .fixed_array => |fa| self.rejectUnimplementedType(fa.element.*, span),
-            .generic => |g| for (g.params) |p| self.rejectUnimplementedType(p, span),
+            .fixed_array => |fa| self.rejectUnimplementedType(fa.element.*, span, tparams, check_unknown),
+            .generic => |g| {
+                if (check_unknown and !self.isKnownTypeName(g.name, tparams)) {
+                    self.addError(span, "unknown type '{s}' — not a primitive, type parameter, or declared struct/enum/trait", .{g.name});
+                }
+                for (g.params) |p| self.rejectUnimplementedType(p, span, tparams, check_unknown);
+            },
             .func => |f| {
-                for (f.params) |p| self.rejectUnimplementedType(p, span);
-                self.rejectUnimplementedType(f.ret.*, span);
+                for (f.params) |p| self.rejectUnimplementedType(p, span, tparams, check_unknown);
+                self.rejectUnimplementedType(f.ret.*, span, tparams, check_unknown);
             },
-            .tuple => |items| for (items) |i| self.rejectUnimplementedType(i, span),
+            .tuple => |items| for (items) |i| self.rejectUnimplementedType(i, span, tparams, check_unknown),
         }
     }
 
@@ -588,7 +621,7 @@ pub const TypeChecker = struct {
                     }
                 }
                 if (ls.type_name) |t| {
-                    self.rejectUnimplementedType(t, ls.span);
+                    self.rejectUnimplementedType(t, ls.span, &[_][]const u8{}, false);
                     try self.variables.put(ls.name, t);
                     if (ls.init) |init_expr| {
 
@@ -1483,7 +1516,7 @@ pub const TypeChecker = struct {
                 }
             }
         }
-        for (s.fields) |f| self.rejectUnimplementedType(f.type_name, f.span);
+        for (s.fields) |f| self.rejectUnimplementedType(f.type_name, f.span, s.type_params, true);
         for (s.methods) |m| {
             self.variables.clearRetainingCapacity();
 

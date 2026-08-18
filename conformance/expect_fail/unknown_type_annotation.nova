@@ -1,0 +1,10 @@
+// NEGATIVE test: must FAIL to compile.
+// A type annotation naming an undefined type (a typo, or a type that was never declared) must be a hard
+// error, not silently treated as `any` and miscompiled.
+// EXPECT-FAIL: typecheck
+import assert;
+fn takesFrob(a: Frob): int { return 1; }
+@test
+fn run() {
+    assert.equalInt(takesFrob(0), 1);
+}
