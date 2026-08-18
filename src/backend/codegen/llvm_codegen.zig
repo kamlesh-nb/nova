@@ -4390,6 +4390,7 @@ pub const LlvmCompiler = struct {
     pub const jsxAppendLiteral = expressions_mod.jsxAppendLiteral;
     pub const jsxFlushLiteral = expressions_mod.jsxFlushLiteral;
     pub const jsxAppendExpr = expressions_mod.jsxAppendExpr;
+    pub const jsxSetLoc = expressions_mod.jsxSetLoc;
     pub const compileGenericParse = expressions_mod.compileGenericParse;
     pub const compileDecodeBinaryRow = expressions_mod.compileDecodeBinaryRow;
     pub const compileNovaQuery = expressions_mod.compileNovaQuery;

@@ -2358,6 +2358,7 @@ pub const Parser = struct {
     }
 
     fn parseJsxElement(self: *Parser) ParserError!ast.Expression {
+        const start_span = self.span(); // the opening `<` -- the element's true source line (for debug info)
         try self.expect(.less);
         var tag: []const u8 = "";
         if (self.current().type == .identifier) {
@@ -2489,7 +2490,7 @@ pub const Parser = struct {
             .tag = tag,
             .attributes = try attributes.toOwnedSlice(self.allocator),
             .children = try children.toOwnedSlice(self.allocator),
-            .span = self.span(),
+            .span = start_span,
         } } };
     }
 

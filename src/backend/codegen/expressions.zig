@@ -5024,6 +5024,14 @@ pub fn compileAppendToStringBuilder(self: *LlvmCompiler, sb_val: types.LLVMValue
 
 // Append a value that is ALREADY a string into `sb`. StringBuilder.append COPIES the bytes and borrows
 // both args, so no retain belongs here (see the long note that used to live in compileJsxElement).
+// Set the current debug location from a JSX node's span, but ONLY when the span is real (line > 0).
+// Many desugared/synthesized JSX expressions carry an unset span (line 0); setDebugLoc clamps 0 -> 1, so
+// calling it blindly would stamp line 1 and send a breakpoint to the top of the file. Skipping unset
+// spans keeps the enclosing element's line instead, which is the correct fallback.
+pub fn jsxSetLoc(self: *LlvmCompiler, span: ast.Span) void {
+    if (span.line > 0) self.setDebugLoc(span.line, span.col);
+}
+
 pub fn jsxAppendVal(self: *LlvmCompiler, sb: types.LLVMValueRef, val: types.LLVMValueRef) !void {
     const sb_append = self.getFunc("StringBuilder_append") orelse return error.StringBuilderAppendNotFound;
     const append_t = core.LLVMGlobalGetValueType(sb_append);
@@ -5108,6 +5116,14 @@ pub fn emitJsxInto(self: *LlvmCompiler, sb_val: types.LLVMValueRef, jsx: ast.Jsx
     self.current_string_builder = sb_val;
     defer self.current_string_builder = outer_sb;
 
+    // Anchor the debug location to THIS element's source line before emitting any of its append
+    // instructions. Without this, NSX/JSX code inherits whatever !dbg was last set -- typically the line
+    // of the call that ran just before the view (e.g. a repository's SQL string in store.nova) -- so
+    // breakpoints in a `.nsx` bind nowhere and stepping through the view surfaces unrelated source. Each
+    // interpolated `{expr}` and nested element re-anchors to its own span below, so a breakpoint on any
+    // markup line resolves inside the `.nsx`.
+    self.jsxSetLoc(jsx.span);
+
     const tag_open = try std.fmt.allocPrint(self.allocator, "<{s}", .{jsx.tag});
     defer self.allocator.free(tag_open);
     try self.jsxAppendLiteral(sb_val, tag_open);
@@ -5118,7 +5134,10 @@ pub fn emitJsxInto(self: *LlvmCompiler, sb_val: types.LLVMValueRef, jsx: ast.Jsx
         try self.jsxAppendLiteral(sb_val, attr_prefix);
         switch (attr.value) {
             .string_literal => |lit| try self.jsxAppendLiteral(sb_val, lit),
-            .expression => |*expr| try self.jsxAppendExpr(sb_val, expr),
+            .expression => |*expr| {
+                self.jsxSetLoc(expr.span);
+                try self.jsxAppendExpr(sb_val, expr);
+            },
         }
         try self.jsxAppendLiteral(sb_val, "\"");
     }
@@ -5134,7 +5153,10 @@ pub fn emitJsxInto(self: *LlvmCompiler, sb_val: types.LLVMValueRef, jsx: ast.Jsx
             // A nested <element> renders into the SAME builder -- no child StringBuilder, no toString,
             // no copy-up. This is the whole point of the single-builder render.
             .element => |sub_el| try self.emitJsxInto(sb_val, sub_el),
-            .expression => |*expr| try self.jsxAppendExpr(sb_val, expr),
+            .expression => |*expr| {
+                self.jsxSetLoc(expr.span);
+                try self.jsxAppendExpr(sb_val, expr);
+            },
             .statement => |stmt| {
                 try self.jsxFlushLiteral(sb_val); // emit static before the control-flow block
                 // A `{for ...}`/`{if ...}` block. Its body appends into current_string_builder, which is
