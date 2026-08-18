@@ -5122,6 +5122,15 @@ pub fn emitJsxInto(self: *LlvmCompiler, sb_val: types.LLVMValueRef, jsx: ast.Jsx
     // breakpoints in a `.nsx` bind nowhere and stepping through the view surfaces unrelated source. Each
     // interpolated `{expr}` and nested element re-anchors to its own span below, so a breakpoint on any
     // markup line resolves inside the `.nsx`.
+    //
+    // jsxAppendLiteral ACCUMULATES static markup and emits it as ONE append at the next flush, which is
+    // the render-throughput optimisation -- but that single append carries only its flush-point line, so
+    // a bare markup line (a `<div>` with no `{expr}`) gets no line-table row and a breakpoint on it stays
+    // pending, then VS Code may slide it to unrelated code. In DEBUG builds only, flush at each element
+    // boundary under that element's own line, so every `<tag>` line becomes a bindable location inside the
+    // `.nsx`. Release builds keep the single merged append (debug_enabled is false), so throughput is
+    // unchanged.
+    if (self.debug_enabled) try self.jsxFlushLiteral(sb_val); // emit prior static under the OUTER line
     self.jsxSetLoc(jsx.span);
 
     const tag_open = try std.fmt.allocPrint(self.allocator, "<{s}", .{jsx.tag});
@@ -5137,6 +5146,7 @@ pub fn emitJsxInto(self: *LlvmCompiler, sb_val: types.LLVMValueRef, jsx: ast.Jsx
             .expression => |*expr| {
                 self.jsxSetLoc(expr.span);
                 try self.jsxAppendExpr(sb_val, expr);
+                self.jsxSetLoc(jsx.span); // back to the element line for the rest of the open tag
             },
         }
         try self.jsxAppendLiteral(sb_val, "\"");
@@ -5144,9 +5154,11 @@ pub fn emitJsxInto(self: *LlvmCompiler, sb_val: types.LLVMValueRef, jsx: ast.Jsx
 
     if (jsx.children.len == 0) {
         try self.jsxAppendLiteral(sb_val, "/>");
+        if (self.debug_enabled) try self.jsxFlushLiteral(sb_val); // the whole `<tag .../>` on its line
         return;
     }
     try self.jsxAppendLiteral(sb_val, ">");
+    if (self.debug_enabled) try self.jsxFlushLiteral(sb_val); // the `<tag ...>` open on its own line
     for (jsx.children) |child| {
         switch (child) {
             .text => |txt| try self.jsxAppendLiteral(sb_val, txt),
@@ -5172,6 +5184,7 @@ pub fn emitJsxInto(self: *LlvmCompiler, sb_val: types.LLVMValueRef, jsx: ast.Jsx
             },
         }
     }
+    self.jsxSetLoc(jsx.span); // re-anchor to the element line for the closing tag
     const tag_close = try std.fmt.allocPrint(self.allocator, "</{s}>", .{jsx.tag});
     defer self.allocator.free(tag_close);
     try self.jsxAppendLiteral(sb_val, tag_close);
