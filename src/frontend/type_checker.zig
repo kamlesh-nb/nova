@@ -455,6 +455,32 @@ pub const TypeChecker = struct {
         return false;
     }
 
+    // Reject a call argument whose scalar CATEGORY differs from the parameter's (a string where an int is
+    // expected, a bool where a string is expected, ...). Without this the arg's bits are silently read as
+    // the wrong scalar at runtime -- e.g. `f("hi")` for `f(a: int)` printed a garbage 33914905. Deliberately
+    // narrow: fires ONLY when BOTH arg and param resolve to KNOWN scalar primitives in DIFFERENT categories,
+    // so structs, generics/type-params, traits, optionals, `any`, and all numeric-vs-numeric pairs are left
+    // to the existing `assignable`/narrowing rules and can never be false-flagged here.
+    fn checkArgTypes(self: *TypeChecker, args: []const ast.Expression, params: []const ast.Param, call_span: ast.Span) void {
+        const n = @min(args.len, params.len);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const pt = params[i].type_name orelse continue;
+            if (pt != .ident) continue;
+            const pcat = primCategory(pt.ident);
+            if (pcat == .other) continue; // param is not a scalar primitive -> not our concern
+            if (intLiteralValue(args[i]) != null) continue; // an int/float literal is fine for any numeric param
+            const at = self.resolveExprType(args[i]) orelse continue;
+            if (at != .ident) continue;
+            const acat = primCategory(at.ident);
+            if (acat == .other) continue; // arg type not a known scalar primitive -> skip (conservative)
+            if (acat != pcat) {
+                const sp = if (args[i].span.line != 0) args[i].span else call_span;
+                self.addError(sp, "argument {d}: cannot pass '{s}' where parameter '{s}: {s}' expects '{s}'", .{ i + 1, typeRefName(at), params[i].name, typeRefName(pt), typeRefName(pt) });
+            }
+        }
+    }
+
     // Reject implicit TRAIT -> CONCRETE narrowing for each (arg, param) pair. A trait value is a fat
     // pointer {struct_ptr, vtable} that may hold ANY implementation, so it cannot be silently treated as a
     // specific concrete struct (previously miscompiled into a use-after-free). Require an explicit `as`
@@ -705,7 +731,7 @@ pub const TypeChecker = struct {
                         // Soundness: a constructor arg passed to a CONCRETE init parameter cannot be a trait
                         // object (same unsound trait->concrete narrowing as a call arg -- e.g. Holder(traitVal)
                         // where init(d: Dog)). Reject it; require an explicit `as` downcast.
-                        if (self.structInitParams(name)) |ip| self.rejectNarrowingArgs(c.args, ip);
+                        if (self.structInitParams(name)) |ip| { self.rejectNarrowingArgs(c.args, ip); self.checkArgTypes(c.args, ip, c.span); }
                     }
                     if (!self.ambiguous_fns.contains(name) and !self.variables.contains(name)) {
                         if (self.functions.get(name)) |f| {
@@ -718,6 +744,7 @@ pub const TypeChecker = struct {
                             // implicitly is unsound (and previously miscompiled into a use-after-free). Make
                             // the intent explicit with a downcast. Concrete -> trait widening stays allowed.
                             self.rejectNarrowingArgs(c.args, f.params);
+                            self.checkArgTypes(c.args, f.params, c.span);
                         }
                     }
 
@@ -737,6 +764,8 @@ pub const TypeChecker = struct {
                                         var mparams = m.decl.params;
                                         if (mparams.len > 0 and std.mem.eql(u8, mparams[0].name, "self")) mparams = mparams[1..];
                                         self.rejectNarrowingArgs(c.args, mparams);
+
+                                        self.checkArgTypes(c.args, mparams, c.span);
                                         break;
                                     }
                                 }
@@ -1663,6 +1692,19 @@ fn isNumericTypeName(name: []const u8) bool {
     return std.mem.eql(u8, c, "i8") or std.mem.eql(u8, c, "i16") or std.mem.eql(u8, c, "i32") or
            std.mem.eql(u8, c, "i64") or std.mem.eql(u8, c, "i128") or std.mem.eql(u8, c, "f32") or
            std.mem.eql(u8, c, "f64");
+}
+
+// Coarse category of a SCALAR primitive, used only to reject a CROSS-CATEGORY call argument (e.g. a
+// string where an int is expected) — the silent-garbage class where the arg pointer/bits are read as the
+// wrong scalar. Same-category pairs (int vs long, etc.) return the SAME category so they are never flagged
+// here: numeric widening/narrowing stays governed by the existing `assignable` rules, not this check.
+const PrimCat = enum { numeric, boolean, text, other };
+fn primCategory(name: []const u8) PrimCat {
+    if (isNumericTypeName(name)) return .numeric;
+    const c = canonicalizeTypeName(name);
+    if (std.mem.eql(u8, c, "bool")) return .boolean;
+    if (std.mem.eql(u8, c, "string")) return .text;
+    return .other;
 }
 
 fn isTypeCompatible(from: ast.TypeRef, to: ast.TypeRef) bool {

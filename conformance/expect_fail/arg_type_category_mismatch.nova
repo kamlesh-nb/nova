@@ -1,0 +1,10 @@
+// NEGATIVE test: must FAIL to compile.
+// A call argument whose scalar CATEGORY differs from the parameter's (a string where an int is expected)
+// must be a type error, not a silently-miscompiled garbage int at runtime.
+// EXPECT-FAIL: typecheck
+import assert;
+fn takesInt(a: int): int { return a + 1; }
+@test
+fn run() {
+    assert.equalInt(takesInt("hello"), 6);   // string -> int param: rejected
+}
