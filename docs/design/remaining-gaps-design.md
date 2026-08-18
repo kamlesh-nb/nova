@@ -79,6 +79,14 @@ now; it cannot break a build; close later only if destructuring-heavy code appea
 
 **Decision to lock:** corpus-wide gate (enforcement-B) + accept destructuring hole (completeness-B)?
 
+**DONE 2026-08-18 — enforcement-B landed.** `conformance/run.sh --ossa [-j]` compiles every positive case
+under `NOVA_OSSA=hard` (the verifier fires during sema, so it is a pure front-end pass with a per-case
+timeout for hanging reactor cases); `gate.sh` now runs it in place of the 6-case `ossa-gate.sh` (kept as a
+seconds-long local smoke). Baseline sweep before wiring: **329/329 positive cases, 0 proven imbalances**;
+wired gate: **381/381, 0 failed**. Completeness-B accepted: the destructuring-binding hole is a false
+NEGATIVE (never blocks correct code) and stays documented in `ossa-gate.sh` / the tasks doc; close only if
+destructuring-heavy code appears.
+
 **Effort:** enforcement-B = hours (extend the gate script/harness). completeness-A (if chosen) = a slice
 in the lowering.
 

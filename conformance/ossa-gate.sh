@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# QUICK spot-check (6 type-heavy cases) for fast local iteration. The AUTHORITATIVE gate is now
+# CORPUS-WIDE: `conformance/run.sh --ossa [-j]` compiles every positive case under NOVA_OSSA=hard, and
+# gate.sh runs THAT (Gap 3 enforcement-B, remaining-gaps-design.md). This script stays as a seconds-long
+# smoke you can run by hand without sweeping the whole corpus.
+#
 # OSSA ownership gate: the OSSA-lite lowering + release-balance verifier (docs/design/ossa-lite-tasks.md)
 # must find ZERO release imbalances (a leak or double-free it proved) on every function it fully models.
 # Run with NOVA_OSSA=hard so a proven imbalance fails the compile; this script asserts no gate failure on

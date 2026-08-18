@@ -47,8 +47,11 @@ if [ $fail -eq 0 ]; then
 fi
 
 if [ $fail -eq 0 ]; then
-  step "OSSA ownership gate (release-balance verifier: 0 proven leaks/double-frees)"
-  bash conformance/ossa-gate.sh || fail=1
+  step "OSSA ownership gate, CORPUS-WIDE (release-balance verifier: 0 proven leaks/double-frees)"
+  # Enforcement-B (remaining-gaps-design.md, Gap 3): compile EVERY positive case under NOVA_OSSA=hard, not
+  # the 6-case spot-check in ossa-gate.sh. The verifier runs during sema (cheap), so this only adds a
+  # compile pass; -j runs it across cores-1 workers. Verified 381/381 clean when wired.
+  conformance/run.sh --ossa -j || fail=1
 fi
 
 echo

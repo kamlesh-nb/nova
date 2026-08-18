@@ -56,6 +56,7 @@ run_case() {
 ARC_MODE=0
 ASAN_MODE=0
 TSAN_MODE=0
+OSSA_MODE=0
 SHADOW_MODE=0
 WASM_MODE=0
 # --wasm : compile every positive case to a wasm module (`nova <file> --wasm`) and
@@ -99,6 +100,12 @@ if [[ "${1:-}" == "--asan" ]]; then ASAN_MODE=1; shift; fi
 # cannot. This is the gate for the self-hosted runtime work — any race becomes a located
 # report naming both accesses. Requires: NOVA_TSAN=1 zig build first.
 if [[ "${1:-}" == "--tsan" ]]; then TSAN_MODE=1; shift; fi
+# --ossa : compile every positive case under NOVA_OSSA=hard so the OSSA-lite release-balance verifier
+# runs corpus-wide (it fires during sema, before the test binary), and FAIL on any function it proves has
+# a leak or double-free ("OSSA OWNERSHIP GATE FAILED"). This is the corpus-wide enforcement of the gate
+# that conformance/ossa-gate.sh only spot-checks on 6 cases. Sound (never falsely accuses) but incomplete
+# (destructured bindings untracked) -- so it proves "no proven imbalance", not "no possible leak".
+if [[ "${1:-}" == "--ossa" ]]; then OSSA_MODE=1; shift; fi
 # --dogfood : compile-and-run a suite of realistic, whole-program feature COMBINATIONS under ASAN, each
 # expected to exit 0. Unlike cases/ (which are @test suites), these are full main()-driven programs that
 # exercise generics + closures + traits + optionals + error-unions + async together -- the "can I build a
@@ -155,7 +162,7 @@ if [[ $DOGFOOD_MODE -eq 1 ]]; then
 fi
 
 pass=0; fail=0; failed_cases=()
-if [[ $PARALLEL -gt 0 && $WASM_MODE -eq 0 && $WASMRUN_MODE -eq 0 && $ASAN_MODE -eq 0 && $ARC_MODE -eq 0 && $TSAN_MODE -eq 0 ]]; then
+if [[ $PARALLEL -gt 0 && $WASM_MODE -eq 0 && $WASMRUN_MODE -eq 0 && $ASAN_MODE -eq 0 && $ARC_MODE -eq 0 && $TSAN_MODE -eq 0 && $OSSA_MODE -eq 0 ]]; then
   # ---- parallel default corpus (opt-in -j) : per-case temp dir + packages symlink ----
   # Self-contained worker (plain exported env vars propagate into the xargs child; an exported
   # function does not, reliably). Timeout via coreutils timeout/gtimeout, else a perl alarm.
@@ -209,6 +216,8 @@ for f in "$HERE"/cases/*.nova; do
   # ASAN mode has its own dedicated gate below (each case is run under NOVA_ASAN=1 there); skip the
   # redundant plain run so `--asan` is a focused gate like `--wasm`/`--tsan`, not a double run.
   [[ $ASAN_MODE -eq 1 ]] && continue
+  # OSSA mode likewise has its own dedicated gate below (each case compiled under NOVA_OSSA=hard).
+  [[ $OSSA_MODE -eq 1 ]] && continue
   if [[ $WASM_MODE -eq 1 ]]; then
     base="$HERE/cases/$name"
     wout="$(mktemp -t novawasm.XXXXXX)"; wout="$wout.wasm"
@@ -449,6 +458,62 @@ AWORKER
     else
       printf "  \033[31mFAIL\033[0m  %-32s %s\n" "$name" "(did not run cleanly under asan)"
       fail=$((fail+1)); failed_cases+=("$name:asan-run")
+    fi
+  done
+  fi
+fi
+
+# OSSA ownership gate, CORPUS-WIDE (opt-in: ./run.sh --ossa [-j]). Compiles every positive case under
+# NOVA_OSSA=hard; the OSSA-lite release-balance verifier runs during sema and prints
+# "OSSA OWNERSHIP GATE FAILED" for any function it PROVES leaks or double-frees. The verdict is emitted at
+# COMPILE time, so a per-case timeout that kills a hanging reactor/server test still captures it. No
+# sanitized runtime needed (unlike --asan/--tsan) -- this is a pure front-end check.
+if [[ $OSSA_MODE -eq 1 ]]; then
+  echo "--- OSSA ownership gate, corpus-wide (release-balance verifier: 0 proven leaks/double-frees) ---"
+  if [[ $PARALLEL -gt 0 ]]; then
+    ROOT="$(cd "$HERE/.." && pwd)"
+    export NOVA ROOT CASE_TIMEOUT
+    echo "--- parallel: ${PARALLEL} workers (per-case temp dir; packages symlinked; NOVA_OSSA=hard) ---"
+    _overd="$(mktemp)"; _oworker="$(mktemp)"
+    cat > "$_oworker" <<'OWORKER'
+f="$1"; name="$(basename "$f" .nova)"; wd="$(mktemp -d)"
+ln -s "$ROOT/packages" "$wd/packages" 2>/dev/null
+cd "$wd" || exit 0
+if command -v timeout >/dev/null 2>&1; then out="$(NOVA_OSSA=hard timeout -k 5 "$CASE_TIMEOUT" "$NOVA" test "$f" 2>&1)"
+elif command -v gtimeout >/dev/null 2>&1; then out="$(NOVA_OSSA=hard gtimeout -k 5 "$CASE_TIMEOUT" "$NOVA" test "$f" 2>&1)"
+else out="$(NOVA_OSSA=hard perl -e "alarm $CASE_TIMEOUT; exec @ARGV" "$NOVA" test "$f" 2>&1)"; fi
+cd / ; rm -rf "$wd"
+if printf '%s' "$out" | grep -q "OSSA OWNERSHIP GATE FAILED"; then
+  n="$(printf '%s' "$out" | grep -oE '[0-9]+ function' | head -1)"
+  printf 'FAIL\t%s\tossa-imbalance %s\n' "$name" "${n:-?}"
+else printf 'PASS\t%s\t(0 proven imbalances)\n' "$name"; fi
+OWORKER
+    for f in "$HERE"/cases/*.nova; do
+      n="$(basename "$f")"; [[ -n "$FILTER" && "$n" != *"$FILTER"* ]] && continue
+      if grep -qE '^[[:space:]]*import[[:space:]]+(web|net|reactor|flagship|asynctls|tls|crypto|data)\b' "$f" 2>/dev/null; then
+        printf '0\t%s\n' "$f"; else printf '1\t%s\n' "$f"; fi
+    done | sort | cut -f2- | xargs -P "$PARALLEL" -n1 bash "$_oworker" >> "$_overd"
+    rm -f "$_oworker"
+    while IFS="$(printf '\t')" read -r v nm info; do
+      if [[ "$v" == "PASS" ]]; then printf "  \033[32mPASS\033[0m  %-32s %s\n" "$nm" "$info"; pass=$((pass+1))
+      else printf "  \033[31mFAIL\033[0m  %-32s \033[31m%s\033[0m\n" "$nm" "$info"; fail=$((fail+1)); failed_cases+=("$nm:$info"); fi
+    done < <(sort "$_overd")
+    rm -f "$_overd"
+  else
+  for f in "$HERE"/cases/*.nova; do
+    name="$(basename "$f" .nova)"
+    [[ -n "$FILTER" && "$name" != *"$FILTER"* ]] && continue
+    if command -v timeout >/dev/null 2>&1; then out="$(NOVA_OSSA=hard timeout -k 5 "$CASE_TIMEOUT" "$NOVA" test "$f" 2>&1)"
+    elif command -v gtimeout >/dev/null 2>&1; then out="$(NOVA_OSSA=hard gtimeout -k 5 "$CASE_TIMEOUT" "$NOVA" test "$f" 2>&1)"
+    else out="$(NOVA_OSSA=hard perl -e "alarm $CASE_TIMEOUT; exec @ARGV" "$NOVA" test "$f" 2>&1)"; fi
+    if printf '%s' "$out" | grep -q "OSSA OWNERSHIP GATE FAILED"; then
+      n="$(printf '%s' "$out" | grep -oE '[0-9]+ function' | head -1)"
+      printf "  \033[31mFAIL\033[0m  %-32s \033[31mossa-imbalance %s\033[0m\n" "$name" "${n:-?}"
+      printf '%s' "$out" | grep -A3 "OSSA OWNERSHIP GATE FAILED" | sed 's/^/          /'
+      fail=$((fail+1)); failed_cases+=("$name:ossa-imbalance")
+    else
+      printf "  \033[32mPASS\033[0m  %-32s %s\n" "$name" "(0 proven imbalances)"
+      pass=$((pass+1))
     fi
   done
   fi
