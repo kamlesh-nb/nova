@@ -1834,6 +1834,7 @@ pub const ProjectJson = struct {
     name: []const u8,
     version: []const u8,
     type: ?[]const u8 = null,
+    repository: ?[]const u8 = null, // canonical git URL; required by `nova publish` (pkg-manager.md §1)
     dependencies: [][]const u8,
 };
 

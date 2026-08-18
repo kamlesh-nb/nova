@@ -86,6 +86,18 @@ pub fn run(init: std.process.Init) !void {
         try packages.cmdGet(allocator, init, args);
         return;
     }
+    if (std.mem.eql(u8, args[1], "restore")) {
+        try packages.cmdRestore(allocator, init);
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "update")) {
+        try packages.cmdUpdate(allocator, init, args);
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "publish")) {
+        try packages.cmdPublish(allocator, init);
+        return;
+    }
 
     // `nova build ...` and the bare `nova <file> ...` compile form.
     try builder.cmdBuild(allocator, init, args);
