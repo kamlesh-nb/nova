@@ -606,6 +606,9 @@ pub const LlvmCompiler = struct {
             // type (e.g. "List<int>") so the Python synthetic-children provider can expand its elements.
             if (std.mem.eql(u8, base, "List") or std.mem.eql(u8, base, "Map") or std.mem.eql(u8, base, "Set"))
                 return self.diContainerType(tn);
+            // A borrowed `str.Str` local: the value struct { ptr, len } is stored INLINE in the slot, so
+            // give it the inline struct type (not a pointer) -- nova_str_summary then shows its text.
+            if (std.mem.eql(u8, base, "Str")) return self.diStrType();
             // A struct local: the i64 slot holds a POINTER to the heap struct. Native pointer-to-struct
             // DIType so lldb / the VS Code Variables panel expand its fields with no Python.
             if (self.structs.get(base) != null) return self.diStructType(base);
@@ -663,8 +666,33 @@ pub const LlvmCompiler = struct {
     // DIType for a struct FIELD. Unlike a local (which sits in a 64-bit slot), a field is stored at its
     // REAL width inside the heap struct, so the basic type must be sized to getTypeSize(tn)*8 -- a
     // 32-bit `int` field declared as 64-bit makes lldb read 8 bytes and swallow the next field.
+    // Nova `str.Str` is a BORROWED string view: a value struct { ptr: long @0, len: int @8 } pointing into
+    // some backing buffer (e.g. a DB row), NOT NUL-terminated. Emit it as a real inline struct so its
+    // fields read correctly; the Python formatter's nova_str_summary reads ptr+len and shows the text. This
+    // is the pervasive text type in ORM-backed views (every borrowed column), so without this a struct's
+    // text fields show a raw pointer number instead of their contents. Cached.
+    fn diStrType(self: *LlvmCompiler) types.LLVMMetadataRef {
+        if (self.di_builder == null) return null;
+        if (self.di_types.get("Str")) |t| return t;
+        const long_t = self.diBasicType("long", 64, 5); // DW_ATE_signed
+        const int_t = self.diBasicType("int", 32, 5);
+        const m_ptr = debug.LLVMDIBuilderCreateMemberType(self.di_builder, self.di_cu, "ptr", "ptr".len, self.di_file, 0, 64, 0, 0, .LLVMDIFlagZero, long_t);
+        const m_len = debug.LLVMDIBuilderCreateMemberType(self.di_builder, self.di_cu, "len", "len".len, self.di_file, 0, 32, 0, 64, .LLVMDIFlagZero, int_t);
+        var members = [_]types.LLVMMetadataRef{ m_ptr, m_len };
+        const body = debug.LLVMDIBuilderCreateStructType(self.di_builder, self.di_cu, "Str", "Str".len, self.di_file, 0, 128, 0, .LLVMDIFlagZero, null, &members, 2, 0, null, "", 0);
+        // Str is NOT stored inline (fieldStoredInline("Str") == false -- the escape analysis keeps it on the
+        // heap), so a Str field/local is an 8-byte POINTER to the { ptr, len } payload. Typedef the pointer
+        // to "Str" so lldb reports `(Str)` and GetChildMemberWithName("ptr"/"len") derefs correctly; the
+        // summary then shows the borrowed text.
+        const p = debug.LLVMDIBuilderCreatePointerType(self.di_builder, body, 64, 0, 0, "", 0);
+        const td = debug.LLVMDIBuilderCreateTypedef(self.di_builder, p, "Str", "Str".len, self.di_file, 0, self.di_cu, 0);
+        self.di_types.put("Str", td) catch {};
+        return td;
+    }
+
     fn diFieldType(self: *LlvmCompiler, tn: []const u8, f_size: u32) types.LLVMMetadataRef {
         if (std.mem.eql(u8, tn, "string")) return self.diStringType();
+        if (std.mem.eql(u8, getStructBaseName(tn), "Str")) return self.diStrType();
         if (types_mod.cgPrim(tn)) |p| {
             const bits: u64 = if (f_size == 0) 64 else @as(u64, f_size) * 8;
             if (p.repr == .i1) return self.diBasicTypeUncached("bool", bits, 2);

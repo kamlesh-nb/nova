@@ -72,6 +72,30 @@ def nova_string_summary(valobj, internal_dict):
         return "<str?>"
 
 
+# `str.Str` is a BORROWED string view -- a struct { ptr: long, len: int } into a backing buffer, NOT
+# NUL-terminated. Read exactly `len` bytes at `ptr` (no ARC header, unlike `string`). Shows the text of
+# every borrowed ORM column so a struct's Str fields read as "..." instead of a raw pointer number.
+def nova_str_summary(valobj, internal_dict):
+    try:
+        ptr_c = valobj.GetChildMemberWithName("ptr")
+        len_c = valobj.GetChildMemberWithName("len")
+        if not (ptr_c and ptr_c.IsValid() and len_c and len_c.IsValid()):
+            return "<str?>"
+        ptr = ptr_c.GetValueAsUnsigned(0)
+        n = len_c.GetValueAsSigned(0)
+        if n == 0:
+            return '""'
+        if not _plausible(ptr) or n < 0 or n > 64 * 1024 * 1024:
+            return "<str?>"
+        err = lldb.SBError()
+        data = valobj.GetProcess().ReadMemory(ptr, n, err)
+        if err.Fail() or data is None:
+            return "<str?>"
+        return '"' + data.decode("utf-8", "replace") + '"'
+    except Exception:
+        return "<str?>"
+
+
 def _read_i32(process, addr):
     if not _plausible(addr):
         return None
@@ -224,6 +248,8 @@ def nova_set_summary(valobj, internal_dict):
 # shows only the summary below. nova_string_summary reads the pointer from member 0 via _str_ptr.
 def __lldb_init_module(debugger, internal_dict):
     debugger.HandleCommand("type summary add -F nova_formatters.nova_string_summary string")
+    # str.Str -- borrowed string view { ptr, len }. Show its text; the ptr/len members stay expandable.
+    debugger.HandleCommand("type summary add -F nova_formatters.nova_str_summary Str")
     # Containers are named with their element type (List<i32>, List<string>, ...). Match by regex.
     # List gets a summary (element count) AND a synthetic child provider so it expands to [0],[1],... .
     # The summary also overrides the bogus char* rendering of the typedef's u8 pointee.
