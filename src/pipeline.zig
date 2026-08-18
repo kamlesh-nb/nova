@@ -1848,6 +1848,12 @@ pub fn linkLibsStamp(allocator: std.mem.Allocator, init: std.process.Init) u64 {
     const home = init.environ_map.get("HOME") orelse init.environ_map.get("USERPROFILE") orelse "/";
     const libs = [_][]const u8{
         "/.nova/lib/libnovacore.a",
+        // The compiler binary itself: a `zig build` reinstalls it and bumps its mtime, so folding it in
+        // means a toolchain change (new codegen, new DWARF, new ABI) invalidates every project's build
+        // cache and forces a rebuild. Without this, `nova build` reports "up to date" after a compiler
+        // upgrade and silently reruns a stale binary -- e.g. an old debug binary keeps showing the old
+        // string DWARF, so a debugger fix looks like it did not land.
+        "/.nova/bin/nova",
     };
     var acc: u64 = 0;
     for (libs) |suffix| {
