@@ -34,9 +34,25 @@ def _arc_len(process, ptr):
     return n if 0 <= n <= 64 * 1024 * 1024 else None
 
 
+def _str_ptr(valobj):
+    # `string` is a single-member struct { data: u8* } in DWARF (so lldb-dap shows the summary, not the
+    # raw pointer address). The pointer lives in member 0; older/plain char* strings put it in the scalar
+    # value. Try the scalar first, then fall back to child 0 ("data").
+    ptr = valobj.GetValueAsUnsigned(0)
+    if _plausible(ptr):
+        return ptr
+    try:
+        ch = valobj.GetChildAtIndex(0)
+        if ch and ch.IsValid():
+            return ch.GetValueAsUnsigned(0)
+    except Exception:
+        pass
+    return ptr
+
+
 def nova_string_summary(valobj, internal_dict):
     try:
-        ptr = valobj.GetValueAsUnsigned(0)
+        ptr = _str_ptr(valobj)
         if ptr == 0:
             return '""'
         if not _plausible(ptr):
@@ -201,31 +217,13 @@ def nova_set_summary(valobj, internal_dict):
         return "Set"
 
 
-# lldb-dap (VS Code) shows a variable's SUMMARY as its value when the variable is backed by a synthetic
-# provider, but shows the raw pointer address for a plain pointer type (which `string` is: char*). So a
-# string displayed as a u64 address in VS Code even though its summary is correct. Giving `string` a
-# synthetic provider with ZERO children flips it into the same rendering path as List/Map/Set -> lldb-dap
-# then shows the summary ("nova") and does not offer a useless *char expansion.
-class NoChildren(object):
-    def __init__(self, valobj, internal_dict):
-        pass
-
-    def update(self):
-        return False
-
-    def num_children(self):
-        return 0
-
-    def get_child_at_index(self, i):
-        return None
-
-    def has_children(self):
-        return False
-
-
+# How VS Code shows a clean `"nova"` and not a raw address: lldb-dap builds the displayed value from
+# SBValue::GetValue(), which for a POINTER type is the address -- so a pointer-typed string always showed
+# `0x… "nova"`, address first, whatever summary we registered. The compiler now emits `string` as a
+# single-member STRUCT { data: u8* } (see diStringType); an aggregate has an empty GetValue(), so lldb-dap
+# shows only the summary below. nova_string_summary reads the pointer from member 0 via _str_ptr.
 def __lldb_init_module(debugger, internal_dict):
     debugger.HandleCommand("type summary add -F nova_formatters.nova_string_summary string")
-    debugger.HandleCommand("type synthetic add string --python-class nova_formatters.NoChildren")
     # Containers are named with their element type (List<i32>, List<string>, ...). Match by regex.
     # List gets a summary (element count) AND a synthetic child provider so it expands to [0],[1],... .
     # The summary also overrides the bogus char* rendering of the typedef's u8 pointee.

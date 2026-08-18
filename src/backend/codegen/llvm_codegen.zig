@@ -627,14 +627,23 @@ pub const LlvmCompiler = struct {
         return td;
     }
 
-    // Nova `string` as a typedef over a char* named "string" -- NUL-terminated, so lldb's built-in char*
-    // summary shows the contents natively (no Python). Cached.
+    // Nova `string` as a single-member STRUCT { data: u8* } named "string", NOT a bare pointer/typedef.
+    // Why a struct and not a `char*` typedef: lldb-dap builds a variable's displayed value from
+    // SBValue::GetValue(), which for ANY pointer type is the raw address -- so a pointer-typed string
+    // always renders `0x… "nova"` in VS Code, address first, no matter what summary we register (this is
+    // also why List/Map/Set carry an address prefix). For an AGGREGATE, GetValue() is empty, so lldb-dap
+    // shows only the summary -> a clean `"nova"`, C#-style. The local's 8 bytes ARE the struct; member
+    // `data` at offset 0 holds the char pointer, which the Python summary (nova_string_summary) reads via
+    // child 0. Graceful degradation without the Python formatter: lldb shows `string @ <addr>` and the
+    // `data` child still renders the text natively (unsigned char* -> "nova"), one expand away. Cached.
     fn diStringType(self: *LlvmCompiler) types.LLVMMetadataRef {
         if (self.di_builder == null) return null;
         if (self.di_types.get("string")) |t| return t;
-        const char_t = self.diBasicType("char", 8, 6); // DW_ATE_signed_char
-        const strp = debug.LLVMDIBuilderCreatePointerType(self.di_builder, char_t, 64, 0, 0, "char", "char".len);
-        const strtd = debug.LLVMDIBuilderCreateTypedef(self.di_builder, strp, "string", "string".len, self.di_file, 0, self.di_cu, 0);
+        const byte_t = self.diBasicType("u8", 8, 7);
+        const datap = debug.LLVMDIBuilderCreatePointerType(self.di_builder, byte_t, 64, 0, 0, "", 0);
+        const member = debug.LLVMDIBuilderCreateMemberType(self.di_builder, self.di_cu, "data", "data".len, self.di_file, 0, 64, 0, 0, .LLVMDIFlagZero, datap);
+        var members = [_]types.LLVMMetadataRef{member};
+        const strtd = debug.LLVMDIBuilderCreateStructType(self.di_builder, self.di_cu, "string", "string".len, self.di_file, 0, 64, 0, .LLVMDIFlagZero, null, &members, 1, 0, null, "", 0);
         self.di_types.put("string", strtd) catch {};
         return strtd;
     }
