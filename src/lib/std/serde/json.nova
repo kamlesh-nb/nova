@@ -8,7 +8,14 @@ import collections.string_builder;
 pub struct JsonValue {
     pub kind: int,
     pub bval: bool,
+    // A number (kind 2) is stored EITHER as `inum` (when numIsInt, a plain integer that fits in i64) OR as
+    // the textual `num` (floats, exponents, decimals, and integers too big for i64). The integer fast-path
+    // avoids a per-number string allocation on parse AND on `number()`-built values, while `num`-as-string
+    // preserves full float/decimal/bignum fidelity and byte-exact round-trip for everything else. Readers
+    // (asNumber/asFloat/asDecimal/stringify) check numIsInt first.
     pub num: string,
+    pub inum: long,
+    pub numIsInt: bool,
     pub sval: string,
     // arr/obj are allocated LAZILY — only array (kind 4) and object (kind 5) nodes need them. A scalar
     // (null/bool/number/string) leaves them undefined, so parsing a scalar allocates just this struct
@@ -20,6 +27,8 @@ pub struct JsonValue {
         self.kind = kind;
         self.bval = false;
         self.num = "";
+        self.inum = 0;
+        self.numIsInt = false;
         self.sval = "";
         self.arr = undefined;
         self.obj = undefined;
@@ -44,7 +53,7 @@ fn objOf(val: JsonValue): Map<string, JsonValue> {
 
 pub fn null(): JsonValue { return JsonValue(0); }
 pub fn bool(val: bool): JsonValue { let v = JsonValue(1); v.bval = val; return v; }
-pub fn number(val: long): JsonValue { let v = JsonValue(2); v.num = i64ToString(val); return v; }
+pub fn number(val: long): JsonValue { let v = JsonValue(2); v.inum = val; v.numIsInt = true; return v; }
 
 pub fn decimalValue(val: decimal): JsonValue { let v = JsonValue(2); v.num = `${val}`; return v; }
 pub fn str(val: string): JsonValue { let v = JsonValue(3); v.sval = val; return v; }
@@ -58,16 +67,16 @@ pub fn asBool(val: JsonValue): bool | undefined {
     return undefined;
 }
 pub fn asNumber(val: JsonValue): long | undefined {
-    if (val.kind == 2) { return string.parseI64(val.num); }
+    if (val.kind == 2) { if (val.numIsInt) { return val.inum; } return string.parseI64(val.num); }
     return undefined;
 }
 pub fn asFloat(val: JsonValue): double | undefined {
-    if (val.kind == 2) { return string.parseFloat(val.num); }
+    if (val.kind == 2) { if (val.numIsInt) { return val.inum as double; } return string.parseFloat(val.num); }
     return undefined;
 }
 
 pub fn asDecimal(val: JsonValue): decimal | undefined {
-    if (val.kind == 2) { return decimal.fromString(val.num); }
+    if (val.kind == 2) { if (val.numIsInt) { return decimal.fromString(i64ToString(val.inum)); } return decimal.fromString(val.num); }
     return undefined;
 }
 pub fn asString(val: JsonValue): string | undefined {
@@ -268,18 +277,40 @@ struct JsonParser {
     fn parseNumber(self: JsonParser): JsonValue {
         let len = self.src.length;
         let start = self.pos;
-        if (self.src[self.pos] == 45) { self.pos = self.pos + 1; }
+        let is_int = true;
+        let neg = false;
+        if (self.src[self.pos] == 45) { neg = true; self.pos = self.pos + 1; }
         while (self.pos < len) {
             let c = self.src[self.pos];
             if (c >= 48 && c <= 57) {
                 self.pos = self.pos + 1;
             } else if (c == 46 || c == 101 || c == 69 || c == 43 || c == 45) {
+                // A '.', exponent, or embedded sign means this is NOT a plain integer: keep the text.
+                is_int = false;
                 self.pos = self.pos + 1;
             } else {
                 break;
             }
         }
         let v = JsonValue(2);
+        let digit_start = if (neg) start + 1 else start;
+        let digits = self.pos - digit_start;
+        // Integer fast-path: a plain integer with at most 18 digits fits in i64 with no overflow (i64 max is
+        // 19 digits), so we accumulate it straight from the source bytes and store `inum` with NO string
+        // allocation. Everything else (floats, exponents, and 19+ digit integers that might overflow i64)
+        // falls back to the textual `num`, preserving full fidelity for parseFloat / decimal / round-trip.
+        if (is_int && digits >= 1 && digits <= 18) {
+            let acc: long = 0;
+            let j = digit_start;
+            while (j < self.pos) {
+                acc = acc * 10 + ((self.src[j] - 48) as long);
+                j = j + 1;
+            }
+            if (neg) { acc = 0 - acc; }
+            v.inum = acc;
+            v.numIsInt = true;
+            return v;
+        }
         v.num = string.slice(self.src, start, self.pos);
         return v;
     }
@@ -357,7 +388,7 @@ pub fn tryParse(src: string): JsonValue | undefined {
 pub fn stringify(val: JsonValue): string {
     if (val.kind == 0) { return "null"; }
     if (val.kind == 1) { return if (val.bval) "true" else "false"; }
-    if (val.kind == 2) { return val.num; }
+    if (val.kind == 2) { if (val.numIsInt) { return i64ToString(val.inum); } return val.num; }
     if (val.kind == 3) { return quoteString(val.sval); }
     if (val.kind == 4) {
         let parts = List<string>();
