@@ -272,6 +272,37 @@ _nova_aes_ctr:
     eor     v1.16b, v1.16b, v14.16b     // {r0=p0^c0^o0, r1=p1^c1^d0}
 .endm
 
+// Multiply the std-order block \va by the std-order key power \vhp and XOR the UN-reduced 256-bit product
+// into the accumulator {v28=lo128, v29=hi128}. Scratch v4..v9. (Karatsuba, no reduction.)
+.macro MULACC va, vhp
+    pmull   v4.1q,  \va\().1d, \vhp\().1d
+    pmull2  v5.1q,  \va\().2d, \vhp\().2d
+    ext     v6.16b, \va\().16b, \va\().16b, #8
+    eor     v6.16b, v6.16b, \va\().16b
+    ext     v7.16b, \vhp\().16b, \vhp\().16b, #8
+    eor     v7.16b, v7.16b, \vhp\().16b
+    pmull   v6.1q,  v6.1d, v7.1d
+    eor     v6.16b, v6.16b, v4.16b
+    eor     v6.16b, v6.16b, v5.16b
+    ext     v8.16b, v31.16b, v6.16b, #8
+    eor     v8.16b, v4.16b, v8.16b     // lo128 = {p0, p1}
+    ext     v9.16b, v6.16b, v31.16b, #8
+    eor     v9.16b, v5.16b, v9.16b     // hi128 = {p2, p3}
+    eor     v28.16b, v28.16b, v8.16b
+    eor     v29.16b, v29.16b, v9.16b
+.endm
+// Reduce the accumulated {v28=lo128, v29=hi128} mod P (0x87) into v1. Scratch v11..v14.
+.macro REDUCE_ACC
+    pmull   v11.1q, v29.1d, v30.1d
+    pmull2  v12.1q, v29.2d, v30.2d
+    ext     v13.16b, v12.16b, v31.16b, #8
+    pmull   v13.1q, v13.1d, v30.1d
+    eor     v1.16b, v28.16b, v11.16b
+    mov     v14.d[0], v13.d[0]
+    mov     v14.d[1], v12.d[0]
+    eor     v1.16b, v1.16b, v14.16b
+.endm
+
 .global _nova_ghash
 .align 4
 _nova_ghash:
@@ -280,6 +311,41 @@ _nova_ghash:
     movi    v31.16b, #0                // ZERO
     mov     x9, #0x87
     dup     v30.2d, x9                 // poly = {0x87, 0x87}
+    // 4-way key-power aggregation for buffers >= 4 blocks. GHASH reduction is GF(2)-linear, so 4 blocks'
+    // un-reduced products sum and reduce ONCE: y' = (y^X0)*H^4 ^ X1*H^3 ^ X2*H^2 ^ X3*H. Precompute H^2..H^4
+    // ONLY here (skipped for small AAD / length blocks, which take the single-block path below).
+    cmp     w2, #64
+    b.lt    10f
+    mov     v2.16b, v1.16b             // save Y
+    mov     v1.16b, v0.16b             // v1 = H
+    GFMUL                              // v1 = H^2
+    mov     v25.16b, v1.16b
+    GFMUL                              // v1 = H^3
+    mov     v26.16b, v1.16b
+    GFMUL                              // v1 = H^4
+    mov     v27.16b, v1.16b
+    mov     v1.16b, v2.16b             // restore Y
+20:
+    cmp     w2, #64
+    b.lt    10f
+    ld1     {v3.16b}, [x1], #16
+    rbit    v3.16b, v3.16b
+    eor     v3.16b, v3.16b, v1.16b     // (X0 ^ Y)
+    ld1     {v16.16b}, [x1], #16
+    rbit    v16.16b, v16.16b
+    ld1     {v17.16b}, [x1], #16
+    rbit    v17.16b, v17.16b
+    ld1     {v18.16b}, [x1], #16
+    rbit    v18.16b, v18.16b
+    movi    v28.16b, #0                // clear accumulator
+    movi    v29.16b, #0
+    MULACC  v3,  v27                   // (Y^X0) * H^4
+    MULACC  v16, v26                   // X1 * H^3
+    MULACC  v17, v25                   // X2 * H^2
+    MULACC  v18, v0                    // X3 * H^1
+    REDUCE_ACC                         // v1 = new Y
+    sub     w2, w2, #64
+    b       20b
 10:
     cmp     w2, #16
     b.lt    12f
