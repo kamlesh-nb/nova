@@ -213,8 +213,257 @@ fn feInvert(out: ptr, z: ptr): void {
     bytes.free(t0); bytes.free(t1); bytes.free(t2); bytes.free(t3);
 }
 
-// X25519: scalarMult(out, scalar[32], point[32]). out = scalar * point on Curve25519.
+// ---------------------------------------------------------------------------------------------------------
+// Radix-2^51 field + ladder (the fast path). Uses simd.mulhi64 (the unsigned 64x64->high64 primitive, umulh
+// on aarch64 / mulx on x86) to get the top half of each 64x64 product, which lets a 5-limb radix-2^51 field
+// be expressed in pure Nova. This is exactly Go's arm64 model for curve25519 (generic code over the widening
+// multiply, no hand-written asm), and it is target-independent, so x86 gets it for free. Field element = 5
+// u64 limbs in a 40-byte buffer. Byte-identical to the ref10 scalarMultRef below (differential-fuzzed).
+const M51: ulong = 0x7ffffffffffff;
+
+// Unsigned 64x64 -> high 64 bits (the codegen primitive returns a signed i64; reinterpret to ulong).
+fn mulhi(a: ulong, b: ulong): ulong { return simd.mulhi64(a, b) as ulong; }
+
+fn newFe51(): ptr { return bytes.alloc(40); }
+fn g51(f: ptr, i: int): ulong { return bytes.read_ptr(f, i * 8) as ulong; }
+fn s51(f: ptr, i: int, v: ulong): void { bytes.write_ptr(f, i * 8, v as ptr); }
+
+fn load64le(s: ptr, off: int): ulong {
+    let v: ulong = 0; let i = 0;
+    while (i < 8) { v = v | ((bytes.read_byte(s, off + i) as ulong) << (i * 8)); i = i + 1; }
+    return v;
+}
+fn store64le(s: ptr, off: int, v: ulong): void {
+    let i = 0; while (i < 8) { bytes.write_byte(s, off + i, ((v >> (i * 8)) & 0xff) as int); i = i + 1; }
+}
+
+fn fromBytes51(h: ptr, s: ptr): void {
+    let t0 = load64le(s, 0); let t1 = load64le(s, 8); let t2 = load64le(s, 16); let t3 = load64le(s, 24);
+    s51(h, 0, t0 & M51);
+    s51(h, 1, ((t0 >> 51) | (t1 << 13)) & M51);
+    s51(h, 2, ((t1 >> 38) | (t2 << 26)) & M51);
+    s51(h, 3, ((t2 >> 25) | (t3 << 39)) & M51);
+    s51(h, 4, (t3 >> 12) & M51);          // drops bit 255 (RFC 7748 masks the high bit of the u-coordinate)
+}
+
+// One carry-propagation pass: reduce each limb to 51 bits, folding the 2^255 carry back by *19.
+fn carry51(h: ptr): void {
+    let h0 = g51(h,0); let h1 = g51(h,1); let h2 = g51(h,2); let h3 = g51(h,3); let h4 = g51(h,4);
+    let c0 = h0 >> 51; let c1 = h1 >> 51; let c2 = h2 >> 51; let c3 = h3 >> 51; let c4 = h4 >> 51;
+    s51(h,0, (h0 & M51) + c4 * 19);
+    s51(h,1, (h1 & M51) + c0);
+    s51(h,2, (h2 & M51) + c1);
+    s51(h,3, (h3 & M51) + c2);
+    s51(h,4, (h4 & M51) + c3);
+}
+
+fn add51(out: ptr, a: ptr, b: ptr): void {
+    let i = 0; while (i < 5) { s51(out, i, g51(a, i) + g51(b, i)); i = i + 1; }
+    carry51(out);
+}
+
+// out = a - b, using the 2*p bias so every limb stays non-negative (inputs must be carry-reduced).
+fn sub51(out: ptr, a: ptr, b: ptr): void {
+    s51(out, 0, (g51(a,0) + 0xFFFFFFFFFFFDA) - g51(b,0));   // 2*(2^51-19) = 2^52-38
+    s51(out, 1, (g51(a,1) + 0xFFFFFFFFFFFFE) - g51(b,1));   // 2*(2^51-1)  = 2^52-2
+    s51(out, 2, (g51(a,2) + 0xFFFFFFFFFFFFE) - g51(b,2));
+    s51(out, 3, (g51(a,3) + 0xFFFFFFFFFFFFE) - g51(b,3));
+    s51(out, 4, (g51(a,4) + 0xFFFFFFFFFFFFE) - g51(b,4));
+    carry51(out);
+}
+
+// out = a * b mod (2^255-19). Schoolbook 5x5 with the 2^255->19 fold; each output limb is a full 128-bit
+// accumulator (lo + hi via mulhi64), then one carry pass. Mirrors Go's feMulGeneric.
+fn mul51(out: ptr, a: ptr, b: ptr): void {
+    let a0 = g51(a,0); let a1 = g51(a,1); let a2 = g51(a,2); let a3 = g51(a,3); let a4 = g51(a,4);
+    let b0 = g51(b,0); let b1 = g51(b,1); let b2 = g51(b,2); let b3 = g51(b,3); let b4 = g51(b,4);
+    let b1_19 = b1 * 19; let b2_19 = b2 * 19; let b3_19 = b3 * 19; let b4_19 = b4 * 19;
+
+    // r0 = a0*b0 + a1*b4_19 + a2*b3_19 + a3*b2_19 + a4*b1_19
+    let lo: ulong = a0*b0; let hi: ulong = mulhi(a0,b0);
+    let pl: ulong = a1*b4_19; let ph: ulong = mulhi(a1,b4_19); let nl = lo+pl; hi = hi+ph+(if(nl<lo)(1 as ulong) else (0 as ulong)); lo = nl;
+    pl = a2*b3_19; ph = mulhi(a2,b3_19); nl = lo+pl; hi = hi+ph+(if(nl<lo)(1 as ulong) else (0 as ulong)); lo = nl;
+    pl = a3*b2_19; ph = mulhi(a3,b2_19); nl = lo+pl; hi = hi+ph+(if(nl<lo)(1 as ulong) else (0 as ulong)); lo = nl;
+    pl = a4*b1_19; ph = mulhi(a4,b1_19); nl = lo+pl; hi = hi+ph+(if(nl<lo)(1 as ulong) else (0 as ulong)); lo = nl;
+    let lo0 = lo; let hi0 = hi;
+
+    // r1 = a0*b1 + a1*b0 + a2*b4_19 + a3*b3_19 + a4*b2_19
+    lo = a0*b1; hi = mulhi(a0,b1);
+    pl = a1*b0; ph = mulhi(a1,b0); nl = lo+pl; hi = hi+ph+(if(nl<lo)(1 as ulong) else (0 as ulong)); lo = nl;
+    pl = a2*b4_19; ph = mulhi(a2,b4_19); nl = lo+pl; hi = hi+ph+(if(nl<lo)(1 as ulong) else (0 as ulong)); lo = nl;
+    pl = a3*b3_19; ph = mulhi(a3,b3_19); nl = lo+pl; hi = hi+ph+(if(nl<lo)(1 as ulong) else (0 as ulong)); lo = nl;
+    pl = a4*b2_19; ph = mulhi(a4,b2_19); nl = lo+pl; hi = hi+ph+(if(nl<lo)(1 as ulong) else (0 as ulong)); lo = nl;
+    let lo1 = lo; let hi1 = hi;
+
+    // r2 = a0*b2 + a1*b1 + a2*b0 + a3*b4_19 + a4*b3_19
+    lo = a0*b2; hi = mulhi(a0,b2);
+    pl = a1*b1; ph = mulhi(a1,b1); nl = lo+pl; hi = hi+ph+(if(nl<lo)(1 as ulong) else (0 as ulong)); lo = nl;
+    pl = a2*b0; ph = mulhi(a2,b0); nl = lo+pl; hi = hi+ph+(if(nl<lo)(1 as ulong) else (0 as ulong)); lo = nl;
+    pl = a3*b4_19; ph = mulhi(a3,b4_19); nl = lo+pl; hi = hi+ph+(if(nl<lo)(1 as ulong) else (0 as ulong)); lo = nl;
+    pl = a4*b3_19; ph = mulhi(a4,b3_19); nl = lo+pl; hi = hi+ph+(if(nl<lo)(1 as ulong) else (0 as ulong)); lo = nl;
+    let lo2 = lo; let hi2 = hi;
+
+    // r3 = a0*b3 + a1*b2 + a2*b1 + a3*b0 + a4*b4_19
+    lo = a0*b3; hi = mulhi(a0,b3);
+    pl = a1*b2; ph = mulhi(a1,b2); nl = lo+pl; hi = hi+ph+(if(nl<lo)(1 as ulong) else (0 as ulong)); lo = nl;
+    pl = a2*b1; ph = mulhi(a2,b1); nl = lo+pl; hi = hi+ph+(if(nl<lo)(1 as ulong) else (0 as ulong)); lo = nl;
+    pl = a3*b0; ph = mulhi(a3,b0); nl = lo+pl; hi = hi+ph+(if(nl<lo)(1 as ulong) else (0 as ulong)); lo = nl;
+    pl = a4*b4_19; ph = mulhi(a4,b4_19); nl = lo+pl; hi = hi+ph+(if(nl<lo)(1 as ulong) else (0 as ulong)); lo = nl;
+    let lo3 = lo; let hi3 = hi;
+
+    // r4 = a0*b4 + a1*b3 + a2*b2 + a3*b1 + a4*b0
+    lo = a0*b4; hi = mulhi(a0,b4);
+    pl = a1*b3; ph = mulhi(a1,b3); nl = lo+pl; hi = hi+ph+(if(nl<lo)(1 as ulong) else (0 as ulong)); lo = nl;
+    pl = a2*b2; ph = mulhi(a2,b2); nl = lo+pl; hi = hi+ph+(if(nl<lo)(1 as ulong) else (0 as ulong)); lo = nl;
+    pl = a3*b1; ph = mulhi(a3,b1); nl = lo+pl; hi = hi+ph+(if(nl<lo)(1 as ulong) else (0 as ulong)); lo = nl;
+    pl = a4*b0; ph = mulhi(a4,b0); nl = lo+pl; hi = hi+ph+(if(nl<lo)(1 as ulong) else (0 as ulong)); lo = nl;
+    let lo4 = lo; let hi4 = hi;
+
+    // carry each 128-bit r down by 51 (c = hi<<13 | lo>>51), fold r4 -> r0 by *19, then one carry pass.
+    let cc0 = (hi0 << 13) | (lo0 >> 51);
+    let cc1 = (hi1 << 13) | (lo1 >> 51);
+    let cc2 = (hi2 << 13) | (lo2 >> 51);
+    let cc3 = (hi3 << 13) | (lo3 >> 51);
+    let cc4 = (hi4 << 13) | (lo4 >> 51);
+    s51(out, 0, (lo0 & M51) + cc4 * 19);
+    s51(out, 1, (lo1 & M51) + cc0);
+    s51(out, 2, (lo2 & M51) + cc1);
+    s51(out, 3, (lo3 & M51) + cc2);
+    s51(out, 4, (lo4 & M51) + cc3);
+    carry51(out);
+}
+
+fn sq51(out: ptr, a: ptr): void { mul51(out, a, a); }
+
+// out = a * 121665 mod p (the Montgomery a24 constant).
+fn mul121665_51(out: ptr, a: ptr): void {
+    let c: ulong = 121665;
+    let lo0 = g51(a,0)*c; let hi0 = mulhi(g51(a,0),c);
+    let lo1 = g51(a,1)*c; let hi1 = mulhi(g51(a,1),c);
+    let lo2 = g51(a,2)*c; let hi2 = mulhi(g51(a,2),c);
+    let lo3 = g51(a,3)*c; let hi3 = mulhi(g51(a,3),c);
+    let lo4 = g51(a,4)*c; let hi4 = mulhi(g51(a,4),c);
+    let cc0 = (hi0 << 13) | (lo0 >> 51);
+    let cc1 = (hi1 << 13) | (lo1 >> 51);
+    let cc2 = (hi2 << 13) | (lo2 >> 51);
+    let cc3 = (hi3 << 13) | (lo3 >> 51);
+    let cc4 = (hi4 << 13) | (lo4 >> 51);
+    s51(out, 0, (lo0 & M51) + cc4 * 19);
+    s51(out, 1, (lo1 & M51) + cc0);
+    s51(out, 2, (lo2 & M51) + cc1);
+    s51(out, 3, (lo3 & M51) + cc2);
+    s51(out, 4, (lo4 & M51) + cc3);
+    carry51(out);
+}
+
+fn cswap51(a: ptr, b: ptr, swap: long): void {
+    let mask: ulong = (0 - swap) as ulong;
+    let i = 0;
+    while (i < 5) {
+        let x = (g51(a,i) ^ g51(b,i)) & mask;
+        s51(a, i, g51(a,i) ^ x);
+        s51(b, i, g51(b,i) ^ x);
+        i = i + 1;
+    }
+}
+
+fn copy51(out: ptr, a: ptr): void { let i = 0; while (i < 5) { s51(out, i, g51(a,i)); i = i + 1; } }
+
+fn invert51(out: ptr, z: ptr): void {
+    let t0 = newFe51(); let t1 = newFe51(); let t2 = newFe51(); let t3 = newFe51();
+    let i = 0;
+    sq51(t0, z);
+    sq51(t1, t0); sq51(t1, t1); mul51(t1, z, t1);
+    mul51(t0, t0, t1);
+    sq51(t2, t0); mul51(t1, t1, t2);
+    sq51(t2, t1); i = 1; while (i < 5) { sq51(t2, t2); i = i + 1; } mul51(t1, t2, t1);
+    sq51(t2, t1); i = 1; while (i < 10) { sq51(t2, t2); i = i + 1; } mul51(t2, t2, t1);
+    sq51(t3, t2); i = 1; while (i < 20) { sq51(t3, t3); i = i + 1; } mul51(t2, t3, t2);
+    sq51(t2, t2); i = 1; while (i < 10) { sq51(t2, t2); i = i + 1; } mul51(t1, t2, t1);
+    sq51(t2, t1); i = 1; while (i < 50) { sq51(t2, t2); i = i + 1; } mul51(t2, t2, t1);
+    sq51(t3, t2); i = 1; while (i < 100) { sq51(t3, t3); i = i + 1; } mul51(t2, t3, t2);
+    sq51(t2, t2); i = 1; while (i < 50) { sq51(t2, t2); i = i + 1; } mul51(t1, t2, t1);
+    sq51(t1, t1); i = 1; while (i < 5) { sq51(t1, t1); i = i + 1; } mul51(out, t1, t0);
+    bytes.free(t0); bytes.free(t1); bytes.free(t2); bytes.free(t3);
+}
+
+fn toBytes51(s: ptr, h: ptr): void {
+    carry51(h); carry51(h);
+    let h0 = g51(h,0); let h1 = g51(h,1); let h2 = g51(h,2); let h3 = g51(h,3); let h4 = g51(h,4);
+    // conditional subtract of p: c = 1 iff h >= p.
+    let c = (h0 + 19) >> 51;
+    c = (h1 + c) >> 51;
+    c = (h2 + c) >> 51;
+    c = (h3 + c) >> 51;
+    c = (h4 + c) >> 51;
+    h0 = h0 + 19 * c;
+    h1 = h1 + (h0 >> 51); h0 = h0 & M51;
+    h2 = h2 + (h1 >> 51); h1 = h1 & M51;
+    h3 = h3 + (h2 >> 51); h2 = h2 & M51;
+    h4 = h4 + (h3 >> 51); h3 = h3 & M51;
+    h4 = h4 & M51;
+    store64le(s, 0,  h0 | (h1 << 51));
+    store64le(s, 8,  (h1 >> 13) | (h2 << 38));
+    store64le(s, 16, (h2 >> 26) | (h3 << 25));
+    store64le(s, 24, (h3 >> 39) | (h4 << 12));
+}
+
+// The Montgomery ladder over the radix-2^51 field. Same structure as scalarMultRef, faster field.
+fn scalarMult51(out: ptr, scalar: ptr, point: ptr): void {
+    let e = bytes.alloc(32);
+    let i = 0;
+    while (i < 32) { bytes.write_byte(e, i, bytes.read_byte(scalar, i)); i = i + 1; }
+    bytes.write_byte(e, 0, bytes.read_byte(e, 0) & 248);
+    bytes.write_byte(e, 31, (bytes.read_byte(e, 31) & 127) | 64);
+
+    let x1 = newFe51(); fromBytes51(x1, point);
+    let x2 = newFe51(); let z2 = newFe51(); let x3 = newFe51(); let z3 = newFe51();
+    i = 0; while (i < 5) { s51(x2, i, 0); s51(z2, i, 0); s51(z3, i, 0); i = i + 1; }
+    s51(x2, 0, 1); s51(z3, 0, 1); copy51(x3, x1);
+
+    let a = newFe51(); let aa = newFe51(); let b = newFe51(); let bb = newFe51(); let ee = newFe51();
+    let c = newFe51(); let d = newFe51(); let da = newFe51(); let cb = newFe51(); let t = newFe51();
+
+    let swap: long = 0;
+    let pos = 254;
+    while (pos >= 0) {
+        let kt = (bytes.read_byte(e, pos >> 3) >> (pos & 7)) & 1;
+        swap = swap ^ (kt as long);
+        cswap51(x2, x3, swap);
+        cswap51(z2, z3, swap);
+        swap = kt as long;
+
+        add51(a, x2, z2); sq51(aa, a);
+        sub51(b, x2, z2); sq51(bb, b);
+        sub51(ee, aa, bb);
+        add51(c, x3, z3); sub51(d, x3, z3);
+        mul51(da, d, a); mul51(cb, c, b);
+        add51(t, da, cb); sq51(x3, t);
+        sub51(t, da, cb); sq51(t, t); mul51(z3, x1, t);
+        mul51(x2, aa, bb);
+        mul121665_51(t, ee); add51(t, aa, t); mul51(z2, ee, t);
+        pos = pos - 1;
+    }
+    cswap51(x2, x3, swap);
+    cswap51(z2, z3, swap);
+
+    invert51(z2, z2);
+    mul51(x2, x2, z2);
+    toBytes51(out, x2);
+
+    bytes.free(e); bytes.free(x1); bytes.free(x2); bytes.free(z2); bytes.free(x3); bytes.free(z3);
+    bytes.free(a); bytes.free(aa); bytes.free(b); bytes.free(bb); bytes.free(ee);
+    bytes.free(c); bytes.free(d); bytes.free(da); bytes.free(cb); bytes.free(t);
+}
+
+// X25519: scalarMult(out, scalar[32], point[32]). out = scalar * point on Curve25519. Dispatches to the
+// radix-2^51 ladder (fast, target-independent via simd.mulhi64); scalarMultRef is the ref10 oracle.
 pub fn scalarMult(out: ptr, scalar: ptr, point: ptr): void {
+    scalarMult51(out, scalar, point);
+}
+
+// The ref10 radix-2^25.5 ladder, kept as the differential-test oracle for scalarMult51.
+pub fn scalarMultRef(out: ptr, scalar: ptr, point: ptr): void {
     // Clamp the scalar.
     let e = bytes.alloc(32);
     let i = 0;

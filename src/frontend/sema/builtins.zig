@@ -94,6 +94,11 @@ pub const table = [_]Builtin{
     // register-level alternative to store+reload for pulling a clmul product's lo/hi halves back to scalars.
     .{ .receiver = "simd", .name = "laneU64x2", .ret = .long },
 
+    // FR-simd-L7: unsigned 64x64 -> high 64 bits of the product (umulh / mulx). The low half is Nova's own
+    // wrapping ulong multiply, so this completes the 128-bit multiply needed for bignum field arithmetic
+    // (X25519, P-256). Scalar in / scalar out; no vector suffix.
+    .{ .receiver = "simd", .name = "mulhi64", .ret = .long },
+
     // FR-simd-L6: bitcast a 128-bit vector to another lane shape (no data movement). The suffix names the
     // RESULT shape, so castU64x2(u8x16) reinterprets the 16 bytes as two u64 lanes and vice-versa.
     .{ .receiver = "simd", .name = "castU64x2", .ret = .vec_u64x2 },

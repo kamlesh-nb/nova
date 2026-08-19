@@ -366,6 +366,23 @@ pub fn arrayBasePtr(self: *LlvmCompiler, base: types.LLVMValueRef) types.LLVMVal
 }
 
 pub fn compileSimdCall(self: *LlvmCompiler, field: []const u8, args: []const ast.Expression) anyerror!types.LLVMValueRef {
+    // FR-simd-L7: unsigned 64x64 -> HIGH 64 bits of the product. Lowers to `umulh` on aarch64 and `mulx`/
+    // `mulq` on x86 (LLVM widens the i128 multiply per target). This is the one primitive Nova cannot express
+    // itself (no native 128-bit integer): with it plus the wrapping i64 multiply (the low half, which Nova's
+    // `ulong` `*` already gives) and carry-detect via unsigned compare, the whole radix-2^51 / radix-2^64
+    // bignum field arithmetic for X25519 and P-256 is writable in pure Nova. This is exactly Go's arm64 model
+    // for curve25519 (generic Go over math/bits.Mul64, no hand asm). Target-independent.
+    if (std.mem.eql(u8, field, "mulhi64")) {
+        const i128t = core.LLVMIntType(128);
+        const a64 = core.LLVMBuildTrunc(self.builder, try self.compileExpression(args[0]), core.LLVMInt64Type(), "mh_a");
+        const b64 = core.LLVMBuildTrunc(self.builder, try self.compileExpression(args[1]), core.LLVMInt64Type(), "mh_b");
+        const az = core.LLVMBuildZExt(self.builder, a64, i128t, "mh_az");
+        const bz = core.LLVMBuildZExt(self.builder, b64, i128t, "mh_bz");
+        const prod = core.LLVMBuildMul(self.builder, az, bz, "mh_mul");
+        const sh = core.LLVMBuildLShr(self.builder, prod, core.LLVMConstInt(i128t, 64, 0), "mh_hi");
+        return core.LLVMBuildTrunc(self.builder, sh, self.val_type, "mh_hitr");
+    }
+
     // FR-simd-L1: integer vectors u8x16/u32x4/u64x2. Detect them by the type suffix in the op name and
     // handle before the f64x4 (float) path below.
     if (std.mem.endsWith(u8, field, "U8x16")) return try self.compileIntSimd(field, args, 8, 16);
