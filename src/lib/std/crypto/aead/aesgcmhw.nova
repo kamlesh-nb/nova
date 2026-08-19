@@ -85,12 +85,57 @@ fn putLen64(buf: ptr, off: int, bits: long): void {
     let i = 0; while (i < 8) { bytes.write_byte(buf, off + i, ((bits >> ((7 - i) * 8)) & 0xff) as int); i = i + 1; }
 }
 
-// AES-CTR keystream XOR over len bytes, hardware block cipher. Counter starts at icb.
+// AES-CTR keystream XOR over len bytes, hardware block cipher. Counter starts at icb. Processes EIGHT
+// counter blocks per iteration (interleaved) so the AES-instruction latency is hidden by independent work,
+// and each round key is loaded once per group and reused across the 8 lanes; the keystream is XORed into
+// the plaintext with SIMD (u8x16). The tail (< 8 blocks) falls back to the single-block encBlock.
 fn gctrHw(rk: ptr, nr: int, icb: ptr, dataIn: ptr, len: int, out: ptr): void {
     let ctr = bytes.alloc(16);
     let i = 0; while (i < 16) { bytes.write_byte(ctr, i, bytes.read_byte(icb, i)); i = i + 1; }
-    let ks = bytes.alloc(16);
+    let cb = bytes.alloc(128);
     let done = 0;
+    while (len - done >= 128) {
+        let j = 0;
+        while (j < 8) {
+            let m = 0; while (m < 16) { bytes.write_byte(cb, j * 16 + m, bytes.read_byte(ctr, m)); m = m + 1; }
+            inc32(ctr);
+            j = j + 1;
+        }
+        let k0 = simd.loadU8x16(rk, 0);
+        let s0 = simd.xorU8x16(simd.loadU8x16(cb, 0), k0);
+        let s1 = simd.xorU8x16(simd.loadU8x16(cb, 16), k0);
+        let s2 = simd.xorU8x16(simd.loadU8x16(cb, 32), k0);
+        let s3 = simd.xorU8x16(simd.loadU8x16(cb, 48), k0);
+        let s4 = simd.xorU8x16(simd.loadU8x16(cb, 64), k0);
+        let s5 = simd.xorU8x16(simd.loadU8x16(cb, 80), k0);
+        let s6 = simd.xorU8x16(simd.loadU8x16(cb, 96), k0);
+        let s7 = simd.xorU8x16(simd.loadU8x16(cb, 112), k0);
+        let r = 1;
+        while (r < nr) {
+            let kr = simd.loadU8x16(rk, r * 16);
+            s0 = simd.aesencU8x16(s0, kr); s1 = simd.aesencU8x16(s1, kr);
+            s2 = simd.aesencU8x16(s2, kr); s3 = simd.aesencU8x16(s3, kr);
+            s4 = simd.aesencU8x16(s4, kr); s5 = simd.aesencU8x16(s5, kr);
+            s6 = simd.aesencU8x16(s6, kr); s7 = simd.aesencU8x16(s7, kr);
+            r = r + 1;
+        }
+        let kl = simd.loadU8x16(rk, nr * 16);
+        s0 = simd.aesenclastU8x16(s0, kl); s1 = simd.aesenclastU8x16(s1, kl);
+        s2 = simd.aesenclastU8x16(s2, kl); s3 = simd.aesenclastU8x16(s3, kl);
+        s4 = simd.aesenclastU8x16(s4, kl); s5 = simd.aesenclastU8x16(s5, kl);
+        s6 = simd.aesenclastU8x16(s6, kl); s7 = simd.aesenclastU8x16(s7, kl);
+        // XOR keystream over plaintext with SIMD, straight to out.
+        simd.storeU8x16(out, done + 0, simd.xorU8x16(s0, simd.loadU8x16(dataIn, done + 0)));
+        simd.storeU8x16(out, done + 16, simd.xorU8x16(s1, simd.loadU8x16(dataIn, done + 16)));
+        simd.storeU8x16(out, done + 32, simd.xorU8x16(s2, simd.loadU8x16(dataIn, done + 32)));
+        simd.storeU8x16(out, done + 48, simd.xorU8x16(s3, simd.loadU8x16(dataIn, done + 48)));
+        simd.storeU8x16(out, done + 64, simd.xorU8x16(s4, simd.loadU8x16(dataIn, done + 64)));
+        simd.storeU8x16(out, done + 80, simd.xorU8x16(s5, simd.loadU8x16(dataIn, done + 80)));
+        simd.storeU8x16(out, done + 96, simd.xorU8x16(s6, simd.loadU8x16(dataIn, done + 96)));
+        simd.storeU8x16(out, done + 112, simd.xorU8x16(s7, simd.loadU8x16(dataIn, done + 112)));
+        done = done + 128;
+    }
+    let ks = bytes.alloc(16);
     while (done < len) {
         encBlock(rk, nr, ctr, ks);
         let n = if (len - done < 16) (len - done) else 16;
@@ -99,7 +144,7 @@ fn gctrHw(rk: ptr, nr: int, icb: ptr, dataIn: ptr, len: int, out: ptr): void {
         inc32(ctr);
         done = done + n;
     }
-    bytes.free(ctr); bytes.free(ks);
+    bytes.free(ctr); bytes.free(cb); bytes.free(ks);
 }
 
 
