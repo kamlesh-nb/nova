@@ -184,7 +184,6 @@ fn reflectBlk(e: ptr, eoff: int, out: ptr, ooff: int): void {
     v = simd.orU8x16(simd.shrU8x16(simd.andU8x16(v, mAA), 1), simd.shlU8x16(simd.andU8x16(v, m55), 1)); // swap adjacent bits
     simd.storeU8x16(out, ooff, v);
 }
-fn cl(a: ulong, b: ulong, tmp: ptr): void { simd.storeU64x2(tmp, 0, simd.clmulU64x2(a as long, b as long)); }
 
 // ---- GHASH 4-way key-power aggregation. The GHASH reduction (mod x^128+x^7+x^2+x+1) is GF(2)-linear, so
 // reduce(P_a ^ P_b) == reduce(P_a) ^ reduce(P_b). That lets a group of blocks be multiplied by the
@@ -198,9 +197,14 @@ fn clmulAccBuf(buf: ptr, off: int, hb: ptr, acc: ptr, t: ptr): void {
     let le = endian.Endian.little;
     let a0 = mem.load<ulong>(buf, off, le); let a1 = mem.load<ulong>(buf, off + 8, le);
     let b0 = mem.load<ulong>(hb, 0, le); let b1 = mem.load<ulong>(hb, 8, le);
-    cl(a0, b0, t); let l0 = mem.load<ulong>(t, 0, le); let l1 = mem.load<ulong>(t, 8, le);
-    cl(a1, b1, t); let h0 = mem.load<ulong>(t, 0, le); let h1 = mem.load<ulong>(t, 8, le);
-    cl(a0 ^ a1, b0 ^ b1, t); let m0 = mem.load<ulong>(t, 0, le) ^ l0 ^ h0; let m1 = mem.load<ulong>(t, 8, le) ^ l1 ^ h1;
+    // Karatsuba: keep each clmul product in a vector register and pull its lo/hi halves with laneU64x2,
+    // rather than storing to a scratch buffer and reloading (no per-multiply memory traffic).
+    let lp = simd.clmulU64x2(a0 as long, b0 as long);
+    let l0 = simd.laneU64x2(lp, 0) as ulong; let l1 = simd.laneU64x2(lp, 1) as ulong;
+    let hp = simd.clmulU64x2(a1 as long, b1 as long);
+    let h0 = simd.laneU64x2(hp, 0) as ulong; let h1 = simd.laneU64x2(hp, 1) as ulong;
+    let mp = simd.clmulU64x2((a0 ^ a1) as long, (b0 ^ b1) as long);
+    let m0 = (simd.laneU64x2(mp, 0) as ulong) ^ l0 ^ h0; let m1 = (simd.laneU64x2(mp, 1) as ulong) ^ l1 ^ h1;
     let p0 = l0; let p1 = l1 ^ m0; let p2 = h0 ^ m1; let p3 = h1;
     mem.store<ulong>(acc, 0, mem.load<ulong>(acc, 0, le) ^ p0, le);
     mem.store<ulong>(acc, 8, mem.load<ulong>(acc, 8, le) ^ p1, le);
@@ -214,10 +218,12 @@ fn reduceAcc(acc: ptr, out: ptr, t: ptr): void {
     let le = endian.Endian.little;
     let p0 = mem.load<ulong>(acc, 0, le); let p1 = mem.load<ulong>(acc, 8, le);
     let p2 = mem.load<ulong>(acc, 16, le); let p3 = mem.load<ulong>(acc, 24, le);
-    cl(p2, 135 as ulong, t); let c0 = mem.load<ulong>(t, 0, le); let c1 = mem.load<ulong>(t, 8, le);
-    cl(p3, 135 as ulong, t); let d0 = mem.load<ulong>(t, 0, le); let d1 = mem.load<ulong>(t, 8, le);
+    let cp = simd.clmulU64x2(p2 as long, 135 as long);
+    let c0 = simd.laneU64x2(cp, 0) as ulong; let c1 = simd.laneU64x2(cp, 1) as ulong;
+    let dp = simd.clmulU64x2(p3 as long, 135 as long);
+    let d0 = simd.laneU64x2(dp, 0) as ulong; let d1 = simd.laneU64x2(dp, 1) as ulong;
     let r0 = p0 ^ c0; let r1 = p1 ^ c1 ^ d0;
-    cl(d1, 135 as ulong, t); let o0 = mem.load<ulong>(t, 0, le);
+    let op = simd.clmulU64x2(d1 as long, 135 as long); let o0 = simd.laneU64x2(op, 0) as ulong;
     r0 = r0 ^ o0;
     mem.store<ulong>(out, 0, r0, le); mem.store<ulong>(out, 8, r1, le);
 }
@@ -227,14 +233,19 @@ fn gfmul(a: ptr, b: ptr, out: ptr, t: ptr): void {
     let le = endian.Endian.little;
     let a0 = mem.load<ulong>(a, 0, le); let a1 = mem.load<ulong>(a, 8, le);
     let b0 = mem.load<ulong>(b, 0, le); let b1 = mem.load<ulong>(b, 8, le);
-    cl(a0, b0, t); let l0 = mem.load<ulong>(t, 0, le); let l1 = mem.load<ulong>(t, 8, le);
-    cl(a1, b1, t); let h0 = mem.load<ulong>(t, 0, le); let h1 = mem.load<ulong>(t, 8, le);
-    cl(a0 ^ a1, b0 ^ b1, t); let m0 = mem.load<ulong>(t, 0, le) ^ l0 ^ h0; let m1 = mem.load<ulong>(t, 8, le) ^ l1 ^ h1;
+    let lp = simd.clmulU64x2(a0 as long, b0 as long);
+    let l0 = simd.laneU64x2(lp, 0) as ulong; let l1 = simd.laneU64x2(lp, 1) as ulong;
+    let hp = simd.clmulU64x2(a1 as long, b1 as long);
+    let h0 = simd.laneU64x2(hp, 0) as ulong; let h1 = simd.laneU64x2(hp, 1) as ulong;
+    let mp = simd.clmulU64x2((a0 ^ a1) as long, (b0 ^ b1) as long);
+    let m0 = (simd.laneU64x2(mp, 0) as ulong) ^ l0 ^ h0; let m1 = (simd.laneU64x2(mp, 1) as ulong) ^ l1 ^ h1;
     let p0 = l0; let p1 = l1 ^ m0; let p2 = h0 ^ m1; let p3 = h1;
-    cl(p2, 135 as ulong, t); let c0 = mem.load<ulong>(t, 0, le); let c1 = mem.load<ulong>(t, 8, le);
-    cl(p3, 135 as ulong, t); let d0 = mem.load<ulong>(t, 0, le); let d1 = mem.load<ulong>(t, 8, le);
+    let cp = simd.clmulU64x2(p2 as long, 135 as long);
+    let c0 = simd.laneU64x2(cp, 0) as ulong; let c1 = simd.laneU64x2(cp, 1) as ulong;
+    let dp = simd.clmulU64x2(p3 as long, 135 as long);
+    let d0 = simd.laneU64x2(dp, 0) as ulong; let d1 = simd.laneU64x2(dp, 1) as ulong;
     let r0 = p0 ^ c0; let r1 = p1 ^ c1 ^ d0;
-    cl(d1, 135 as ulong, t); let o0 = mem.load<ulong>(t, 0, le);
+    let op = simd.clmulU64x2(d1 as long, 135 as long); let o0 = simd.laneU64x2(op, 0) as ulong;
     r0 = r0 ^ o0;
     mem.store<ulong>(out, 0, r0, le); mem.store<ulong>(out, 8, r1, le);
 }

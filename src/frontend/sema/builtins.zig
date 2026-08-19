@@ -90,6 +90,10 @@ pub const table = [_]Builtin{
     // inline software multiply otherwise. Named with the U64x2 suffix so it routes through compileIntSimd.
     .{ .receiver = "simd", .name = "clmulU64x2", .ret = .vec_u64x2 },
 
+    // FR-simd-L5: extract lane `i` of a u64x2 as a 64-bit scalar (bit-exact; the value slot is i64). The
+    // register-level alternative to store+reload for pulling a clmul product's lo/hi halves back to scalars.
+    .{ .receiver = "simd", .name = "laneU64x2", .ret = .long },
+
     // FR-mem Tier 3: raw-address XOR. The generic mem builtins (load/store/rotl/rotr/ctz/clz/bswap) are
     // typed by the special-case in infer.zig; xorBytes is non-generic, so it lives in this table.
     .{ .receiver = "mem", .name = "xorBytes", .ret = .void_ },

@@ -511,6 +511,18 @@ pub fn compileIntSimd(self: *LlvmCompiler, field: []const u8, args: []const ast.
         if (std.mem.eql(u8, op, "shl")) return core.LLVMBuildShl(self.builder, v, amt, "simd_shl");
         return core.LLVMBuildLShr(self.builder, v, amt, "simd_shr"); // logical (unsigned lanes)
     }
+    if (std.mem.eql(u8, op, "lane")) {
+        // FR-simd-L5: extract lane `idx` of the vector as a Nova scalar (zero-extended to the i64 value slot).
+        // This is the register-level counterpart to store+reload: it pulls a lane straight out of a vector
+        // register instead of round-tripping it through a heap buffer, so a clmul result can feed the next
+        // scalar op with no memory traffic (the GHASH hot path).
+        const v = try self.compileExpression(args[0]);
+        const idxv = try self.compileExpression(args[1]);
+        const idx32 = core.LLVMBuildTrunc(self.builder, idxv, self.i32_type, "lane_idx");
+        const el = core.LLVMBuildExtractElement(self.builder, v, idx32, "lane_ex");
+        if (elem >= 64) return el; // already i64; avoid a zero-width ZExt
+        return core.LLVMBuildZExt(self.builder, el, self.val_type, "lane_ext");
+    }
     if (std.mem.eql(u8, op, "clmul")) {
         // FR-simd-L2: carryless 64x64 -> 128 multiply. a and b are Nova longs (i64 in the value slot).
         const a64 = core.LLVMBuildTrunc(self.builder, try self.compileExpression(args[0]), core.LLVMInt64Type(), "clmul_a");
