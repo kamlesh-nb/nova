@@ -237,4 +237,80 @@ _nova_aes_ctr:
     str     w11, [x2, #12]
     ret
 
+// ---- Register-resident GHASH (stitched-seal step 2) --------------------------------------------------
+// void nova_ghash(const uint8_t* hStd, const uint8_t* data, int len, uint8_t* y)
+//   x0=hStd (H in "standard" bit order, per-byte bit-reversed E_K(0)), x1=data, w2=len, x3=y (16B acc, std
+//   order, in/out). Absorbs len bytes (16B blocks, final <16 zero-padded) into y: for each block X,
+//   y = (y ^ bitreverse_per_byte(X)) * H  in GF(2^128) with the forward poly (constant 0x87). H and the
+//   accumulator stay in NEON registers; RBIT does the per-byte reflection in ONE instruction (the thing the
+//   LLVM overloaded-intrinsic path miscompiled to v8i8). Byte-identical to the pure-Nova ghUpdate (gated 378).
+// The reflect-back to GCM order is done by the caller (matches ghUpdate leaving y in standard order).
+
+// v1 = v1 * v0 mod P (both operands std-order 128-bit). Karatsuba (3 pmull) + 0x87 reduction, faithful to
+// the Nova gfmul. Scratch: v4..v14. v0=H, v30=poly{0x87,0x87}, v31=0 are preserved.
+.macro GFMUL
+    pmull   v4.1q,  v1.1d, v0.1d        // lo = a0*b0
+    pmull2  v5.1q,  v1.2d, v0.2d        // hi = a1*b1
+    ext     v6.16b, v1.16b, v1.16b, #8
+    eor     v6.16b, v6.16b, v1.16b      // {a0^a1, a0^a1}
+    ext     v7.16b, v0.16b, v0.16b, #8
+    eor     v7.16b, v7.16b, v0.16b      // {b0^b1, b0^b1}
+    pmull   v6.1q,  v6.1d, v7.1d        // mid_raw = (a0^a1)*(b0^b1)
+    eor     v6.16b, v6.16b, v4.16b      // mid ^= lo
+    eor     v6.16b, v6.16b, v5.16b      // mid = {m0, m1}
+    ext     v8.16b, v31.16b, v6.16b, #8 // {0, m0}
+    eor     v8.16b, v4.16b, v8.16b      // lo128 = {p0=l0, p1=l1^m0}
+    ext     v9.16b, v6.16b, v31.16b, #8 // {m1, 0}
+    eor     v9.16b, v5.16b, v9.16b      // hi128 = {p2=h0^m1, p3=h1}
+    pmull   v11.1q, v9.1d, v30.1d       // cp = p2*0x87 -> {c0, c1}
+    pmull2  v12.1q, v9.2d, v30.2d       // dp = p3*0x87 -> {d0, d1}
+    ext     v13.16b, v12.16b, v31.16b, #8 // {d1, 0}
+    pmull   v13.1q, v13.1d, v30.1d      // op = d1*0x87 -> {o0, .}
+    eor     v1.16b, v8.16b, v11.16b     // {p0^c0, p1^c1}
+    mov     v14.d[0], v13.d[0]          // o0
+    mov     v14.d[1], v12.d[0]          // d0
+    eor     v1.16b, v1.16b, v14.16b     // {r0=p0^c0^o0, r1=p1^c1^d0}
+.endm
+
+.global _nova_ghash
+.align 4
+_nova_ghash:
+    ld1     {v0.16b}, [x0]              // H (standard order)
+    ld1     {v1.16b}, [x3]             // Y (standard order)
+    movi    v31.16b, #0                // ZERO
+    mov     x9, #0x87
+    dup     v30.2d, x9                 // poly = {0x87, 0x87}
+10:
+    cmp     w2, #16
+    b.lt    12f
+    ld1     {v3.16b}, [x1], #16
+    rbit    v3.16b, v3.16b            // per-byte bit reverse -> standard order
+    eor     v1.16b, v1.16b, v3.16b    // Y ^= X'
+    GFMUL
+    sub     w2, w2, #16
+    b       10b
+12:
+    cmp     w2, #0
+    b.le    14f
+    // final partial block: copy w2 bytes to a zero-filled 16B stack slot, then absorb
+    sub     sp, sp, #16
+    stp     xzr, xzr, [sp]
+    mov     w10, #0
+13:
+    cmp     w10, w2
+    b.ge    135f
+    ldrb    w11, [x1, w10, uxtw]
+    strb    w11, [sp, w10, uxtw]
+    add     w10, w10, #1
+    b       13b
+135:
+    ld1     {v3.16b}, [sp]
+    add     sp, sp, #16
+    rbit    v3.16b, v3.16b
+    eor     v1.16b, v1.16b, v3.16b
+    GFMUL
+14:
+    st1     {v1.16b}, [x3]            // store Y (standard order; caller reflects back)
+    ret
+
 #endif // __aarch64__

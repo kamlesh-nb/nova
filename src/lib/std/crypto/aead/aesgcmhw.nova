@@ -18,6 +18,7 @@ import mem.memory;
 // call (bl), no FFI marshalling — the Go/BoringSSL model.
 extern("c") fn nova_has_asm_crypto(): int;
 extern("c") fn nova_aes_ctr(rk: ptr, nr: int, ctr: ptr, dataIn: ptr, len: int, out: ptr): void;
+extern("c") fn nova_ghash(hStd: ptr, data: ptr, len: int, y: ptr): void;
 
 // AES S-box, used ONLY by the key schedule (one-time per key). The BULK cipher below is fully constant-time
 // (the AES instruction, no tables). A table-based key schedule has a theoretical cache-timing side channel
@@ -349,6 +350,18 @@ fn computeJ0(hStd: ptr, brev: ptr, iv: ptr, ivLen: int, j0: ptr, t: ptr, scr: pt
 }
 fn computeS(hStd: ptr, brev: ptr, aad: ptr, aadLen: int, ct: ptr, ctLen: int, s: ptr, t: ptr, scr: ptr, pad: ptr): void {
     let y = bytes.alloc(16); let k = 0; while (k < 16) { bytes.write_byte(y, k, 0); k = k + 1; }
+    if (nova_has_asm_crypto() == 1) {
+        // Asm GHASH (register-resident accumulator + PMULL) over AAD, ciphertext, and the length block; y
+        // stays in standard order, reflected to s at the end (matches the Nova path exactly).
+        nova_ghash(hStd, aad, aadLen, y);
+        nova_ghash(hStd, ct, ctLen, y);
+        let lens = bytes.alloc(16);
+        putLen64(lens, 0, (aadLen as long) * 8); putLen64(lens, 8, (ctLen as long) * 8);
+        nova_ghash(hStd, lens, 16, y);
+        reflect(brev, y, s);
+        bytes.free(y); bytes.free(lens);
+        return;
+    }
     // Precompute the key powers H^2/H^3/H^4 once per record (3 gfmuls, negligible vs the block count) so the
     // bulk absorb below aggregates 4 blocks per reduction.
     let h2 = bytes.alloc(16); gfmul(hStd, hStd, h2, t);
