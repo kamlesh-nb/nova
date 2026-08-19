@@ -533,7 +533,16 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile, target: std.Build
         \\# (no load-bearing thread-local arena). Required for multi-core + clean ARC.
         \\{[cxx]s} -std=c++20 -O2 -pthread -DNOVA_DROP_ARENA -c \
         \\    src/runtime/runtime.cpp -o "{[home]s}/.nova/lib/novacore.o"
-        \\ar rcs "{[home]s}/.nova/lib/libnovacore.a" "{[home]s}/.nova/lib/novacore.o"
+        \\# Integrated-assembly crypto path (Go/BoringSSL model): on an aarch64 host, assemble the
+        \\# hand-written AES/GHASH AArch64 routines and bundle their object into libnovacore.a, so every
+        \\# Nova binary links them and calls them by symbol (extern "c") with NO cgo/FFI marshalling.
+        \\# On other hosts the same symbols come from the C fallbacks in crypto.cpp, so nothing to assemble.
+        \\NOVA_ASM_OBJ=""
+        \\if [ "$(uname -m)" = "arm64" ] || [ "$(uname -m)" = "aarch64" ]; then
+        \\  {[cxx]s} -O2 -c src/runtime/nova_crypto_arm64.S -o "{[home]s}/.nova/lib/nova_crypto.o" \
+        \\    && NOVA_ASM_OBJ="{[home]s}/.nova/lib/nova_crypto.o"
+        \\fi
+        \\ar rcs "{[home]s}/.nova/lib/libnovacore.a" "{[home]s}/.nova/lib/novacore.o" $NOVA_ASM_OBJ
         \\# T1: the cross-compilation cache (novacore_<triple>.o, built lazily by `nova build
         \\# --target ...`) is keyed only by triple, so it must be invalidated whenever the runtime
         \\# source changes. Clear it here — triples contain dashes, so this glob spares novacore_asan.o.
@@ -558,7 +567,7 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile, target: std.Build
         \\  clang++ -std=c++20 -O1 -g -fsanitize=address -fno-omit-frame-pointer \
         \\      -pthread -DNOVA_DROP_ARENA -c \
         \\      src/runtime/runtime.cpp -o "{[home]s}/.nova/lib/novacore_asan.o"
-        \\  ar rcs "{[home]s}/.nova/lib/libnovacore_asan.a" "{[home]s}/.nova/lib/novacore_asan.o"
+        \\  ar rcs "{[home]s}/.nova/lib/libnovacore_asan.a" "{[home]s}/.nova/lib/novacore_asan.o" $NOVA_ASM_OBJ
         \\  echo "ASAN runtime built. Use: NOVA_ASAN=1 nova test <file>"
         \\fi
         \\# NOVA_TSAN=1: additionally build a ThreadSanitizer runtime. This is the gate for the
