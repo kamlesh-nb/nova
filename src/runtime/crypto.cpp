@@ -146,4 +146,6 @@ extern "C" void nova_aes_ctr(const unsigned char* rk, int nr, unsigned char* ctr
 extern "C" void nova_ghash(const unsigned char*, const unsigned char*, int, unsigned char*) { __builtin_trap(); }
 extern "C" void nova_gcm_seal(const unsigned char*, int, const unsigned char*, unsigned char*,
                               const unsigned char*, int, unsigned char*, unsigned char*) { __builtin_trap(); }
+extern "C" void nova_chacha20_xor(const unsigned char*, unsigned int, const unsigned char*,
+                                  const unsigned char*, int, unsigned char*) { __builtin_trap(); }
 #endif

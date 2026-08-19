@@ -6,6 +6,11 @@
 // Reference: RFC 8439 and Zig std.crypto chacha20. Verified against the RFC 8439 vectors (case 219).
 import bytes;
 
+// Integrated-assembly fast path (src/runtime/nova_crypto_arm64.S): on an aarch64 host, the ChaCha20
+// keystream XOR runs 4-way in hand-written NEON (no per-block lane shuffle). Plain extern call, no FFI.
+extern("c") fn nova_has_asm_crypto(): int;
+extern("c") fn nova_chacha20_xor(key: ptr, counter: int, nonce: ptr, dataIn: ptr, len: int, out: ptr): void;
+
 const MASK32: ulong = 0xffffffff;
 
 pub const CHACHA_KEY_LEN: int = 32;
@@ -128,9 +133,18 @@ pub fn keystreamBlock(key: ptr, counter: ulong, nonce: ptr, out: ptr): void {
 // starts at the given block counter. RFC 8439 AEAD uses counter 1 for the payload (0 makes the
 // Poly1305 key).
 pub fn applyKeystream(key: ptr, counter0: ulong, nonce: ptr, dataIn: ptr, len: int, out: ptr): void {
-    let ks = bytes.alloc(64);
     let done = 0;
     let ctr = counter0;
+    if (nova_has_asm_crypto() == 1) {
+        // Bulk 256-byte (4-block) groups in NEON asm; the <256 remainder falls to the scalar loop below.
+        let fused = len - (len % 256);
+        if (fused > 0) {
+            nova_chacha20_xor(key, counter0 as int, nonce, dataIn, fused, out);
+            done = fused;
+            ctr = counter0 + (fused / 64) as ulong;
+        }
+    }
+    let ks = bytes.alloc(64);
     while (done < len) {
         keystreamBlock(key, ctr, nonce, ks);
         let n = if (len - done < 64) (len - done) else 64;

@@ -546,4 +546,178 @@ _nova_gcm_seal:
     RESTORE_D8_D15
     ret
 
+// ---- ChaCha20 4-way keystream XOR (RFC 8439) ---------------------------------------------------------
+// void nova_chacha20_xor(const uint8_t* key, uint32_t counter, const uint8_t* nonce,
+//                        const uint8_t* in, int len, uint8_t* out)
+//   x0=key(32B) w1=counter(base block index) x2=nonce(12B) x3=in w4=len (MULTIPLE OF 256) x5=out
+// Processes FOUR ChaCha blocks in parallel: each of the 16 state words is a u32x4 whose lane j is block
+// (base+j)'s word, so the quarter-round is pure lane-wise add/xor/rotate with NO cross-lane shuffle (the
+// thing that made single-block SIMD lose). After 20 rounds the 4x4 word groups are transposed (zip) to
+// per-block order, XORed with the input, and stored. The <256-byte tail is the caller's (scalar Nova).
+// Byte-identical to the pure-Nova keystream (RFC 8439 KAT-gated, 219/220/370).
+
+.macro CC_ROTL v, n
+    ushr v16.4s, \v\().4s, #(32 - \n)
+    shl  \v\().4s, \v\().4s, #\n
+    orr  \v\().16b, \v\().16b, v16.16b
+.endm
+.macro CC_QR a, b, c, d
+    add \a\().4s, \a\().4s, \b\().4s
+    eor \d\().16b, \d\().16b, \a\().16b
+    CC_ROTL \d, 16
+    add \c\().4s, \c\().4s, \d\().4s
+    eor \b\().16b, \b\().16b, \c\().16b
+    CC_ROTL \b, 12
+    add \a\().4s, \a\().4s, \b\().4s
+    eor \d\().16b, \d\().16b, \a\().16b
+    CC_ROTL \d, 8
+    add \c\().4s, \c\().4s, \d\().4s
+    eor \b\().16b, \b\().16b, \c\().16b
+    CC_ROTL \b, 7
+.endm
+.global _nova_chacha20_xor
+.align 4
+_nova_chacha20_xor:
+    SAVE_D8_D15
+    sub     sp, sp, #256               // initial-state save area
+    adrp    x8, Lcc_const@PAGE
+    add     x8, x8, Lcc_const@PAGEOFF
+    adrp    x9, Lcc_incr@PAGE
+    add     x9, x9, Lcc_incr@PAGEOFF
+    ld1     {v20.4s}, [x9]             // [0,1,2,3] for per-lane counter
+1:
+    cmp     w4, #0
+    b.le    9f
+    // build 4-way state: constants (v0-3), key (v4-11), counter (v12), nonce (v13-15)
+    mov     x10, x8
+    ld1r    {v0.4s}, [x10], #4
+    ld1r    {v1.4s}, [x10], #4
+    ld1r    {v2.4s}, [x10], #4
+    ld1r    {v3.4s}, [x10], #4
+    mov     x10, x0
+    ld1r    {v4.4s}, [x10], #4
+    ld1r    {v5.4s}, [x10], #4
+    ld1r    {v6.4s}, [x10], #4
+    ld1r    {v7.4s}, [x10], #4
+    ld1r    {v8.4s}, [x10], #4
+    ld1r    {v9.4s}, [x10], #4
+    ld1r    {v10.4s}, [x10], #4
+    ld1r    {v11.4s}, [x10], #4
+    dup     v12.4s, w1
+    add     v12.4s, v12.4s, v20.4s     // counter base + [0,1,2,3]
+    mov     x10, x2
+    ld1r    {v13.4s}, [x10], #4
+    ld1r    {v14.4s}, [x10], #4
+    ld1r    {v15.4s}, [x10], #4
+    // save initial state (st1 has no immediate offset form; advance a cursor)
+    mov     x12, sp
+    st1     {v0.4s, v1.4s, v2.4s, v3.4s},    [x12], #64
+    st1     {v4.4s, v5.4s, v6.4s, v7.4s},    [x12], #64
+    st1     {v8.4s, v9.4s, v10.4s, v11.4s},  [x12], #64
+    st1     {v12.4s, v13.4s, v14.4s, v15.4s},[x12]
+    // 10 double-rounds
+    mov     w11, #10
+2:
+    CC_QR v0, v4, v8,  v12
+    CC_QR v1, v5, v9,  v13
+    CC_QR v2, v6, v10, v14
+    CC_QR v3, v7, v11, v15
+    CC_QR v0, v5, v10, v15
+    CC_QR v1, v6, v11, v12
+    CC_QR v2, v7, v8,  v13
+    CC_QR v3, v4, v9,  v14
+    subs    w11, w11, #1
+    b.ne    2b
+    // add initial state (cursor over the stack save area)
+    mov     x12, sp
+    ld1     {v16.4s, v17.4s, v18.4s, v19.4s}, [x12], #64
+    add     v0.4s, v0.4s, v16.4s
+    add     v1.4s, v1.4s, v17.4s
+    add     v2.4s, v2.4s, v18.4s
+    add     v3.4s, v3.4s, v19.4s
+    ld1     {v16.4s, v17.4s, v18.4s, v19.4s}, [x12], #64
+    add     v4.4s, v4.4s, v16.4s
+    add     v5.4s, v5.4s, v17.4s
+    add     v6.4s, v6.4s, v18.4s
+    add     v7.4s, v7.4s, v19.4s
+    ld1     {v16.4s, v17.4s, v18.4s, v19.4s}, [x12], #64
+    add     v8.4s,  v8.4s,  v16.4s
+    add     v9.4s,  v9.4s,  v17.4s
+    add     v10.4s, v10.4s, v18.4s
+    add     v11.4s, v11.4s, v19.4s
+    ld1     {v16.4s, v17.4s, v18.4s, v19.4s}, [x12]
+    add     v12.4s, v12.4s, v16.4s
+    add     v13.4s, v13.4s, v17.4s
+    add     v14.4s, v14.4s, v18.4s
+    add     v15.4s, v15.4s, v19.4s
+    // Transpose each word-group to per-block, XOR input, store. Row group words 0-3 (v0-3):
+    zip1 v16.4s, v0.4s, v2.4s
+    zip2 v17.4s, v0.4s, v2.4s
+    zip1 v18.4s, v1.4s, v3.4s
+    zip2 v19.4s, v1.4s, v3.4s
+    zip1 v0.4s, v16.4s, v18.4s
+    zip2 v1.4s, v16.4s, v18.4s
+    zip1 v2.4s, v17.4s, v19.4s
+    zip2 v3.4s, v17.4s, v19.4s
+    // words 4-7 (v4-7):
+    zip1 v16.4s, v4.4s, v6.4s
+    zip2 v17.4s, v4.4s, v6.4s
+    zip1 v18.4s, v5.4s, v7.4s
+    zip2 v19.4s, v5.4s, v7.4s
+    zip1 v4.4s, v16.4s, v18.4s
+    zip2 v5.4s, v16.4s, v18.4s
+    zip1 v6.4s, v17.4s, v19.4s
+    zip2 v7.4s, v17.4s, v19.4s
+    // words 8-11 (v8-11):
+    zip1 v16.4s, v8.4s, v10.4s
+    zip2 v17.4s, v8.4s, v10.4s
+    zip1 v18.4s, v9.4s, v11.4s
+    zip2 v19.4s, v9.4s, v11.4s
+    zip1 v8.4s,  v16.4s, v18.4s
+    zip2 v9.4s,  v16.4s, v18.4s
+    zip1 v10.4s, v17.4s, v19.4s
+    zip2 v11.4s, v17.4s, v19.4s
+    // words 12-15 (v12-15):
+    zip1 v16.4s, v12.4s, v14.4s
+    zip2 v17.4s, v12.4s, v14.4s
+    zip1 v18.4s, v13.4s, v15.4s
+    zip2 v19.4s, v13.4s, v15.4s
+    zip1 v12.4s, v16.4s, v18.4s
+    zip2 v13.4s, v16.4s, v18.4s
+    zip1 v14.4s, v17.4s, v19.4s
+    zip2 v15.4s, v17.4s, v19.4s
+    // Now: block j's four rows are v0/v4/v8/v12 (j=0), v1/v5/v9/v13 (j=1), v2/v6/v10/v14 (j=2), v3/v7/v11/v15 (j=3).
+    // Block j occupies out[j*64 .. j*64+64]: row0 at +0, row1 at +16, row2 at +32, row3 at +48.
+    ldr q16, [x3, #0];   eor v0.16b,  v0.16b,  v16.16b; str q0,  [x5, #0]
+    ldr q16, [x3, #16];  eor v4.16b,  v4.16b,  v16.16b; str q4,  [x5, #16]
+    ldr q16, [x3, #32];  eor v8.16b,  v8.16b,  v16.16b; str q8,  [x5, #32]
+    ldr q16, [x3, #48];  eor v12.16b, v12.16b, v16.16b; str q12, [x5, #48]
+    ldr q16, [x3, #64];  eor v1.16b,  v1.16b,  v16.16b; str q1,  [x5, #64]
+    ldr q16, [x3, #80];  eor v5.16b,  v5.16b,  v16.16b; str q5,  [x5, #80]
+    ldr q16, [x3, #96];  eor v9.16b,  v9.16b,  v16.16b; str q9,  [x5, #96]
+    ldr q16, [x3, #112]; eor v13.16b, v13.16b, v16.16b; str q13, [x5, #112]
+    ldr q16, [x3, #128]; eor v2.16b,  v2.16b,  v16.16b; str q2,  [x5, #128]
+    ldr q16, [x3, #144]; eor v6.16b,  v6.16b,  v16.16b; str q6,  [x5, #144]
+    ldr q16, [x3, #160]; eor v10.16b, v10.16b, v16.16b; str q10, [x5, #160]
+    ldr q16, [x3, #176]; eor v14.16b, v14.16b, v16.16b; str q14, [x5, #176]
+    ldr q16, [x3, #192]; eor v3.16b,  v3.16b,  v16.16b; str q3,  [x5, #192]
+    ldr q16, [x3, #208]; eor v7.16b,  v7.16b,  v16.16b; str q7,  [x5, #208]
+    ldr q16, [x3, #224]; eor v11.16b, v11.16b, v16.16b; str q11, [x5, #224]
+    ldr q16, [x3, #240]; eor v15.16b, v15.16b, v16.16b; str q15, [x5, #240]
+    add     x3, x3, #256
+    add     x5, x5, #256
+    add     w1, w1, #4                 // 4 blocks consumed
+    sub     w4, w4, #256
+    b       1b
+9:
+    add     sp, sp, #256
+    RESTORE_D8_D15
+    ret
+
+.align 4
+Lcc_const:
+    .word 0x61707865, 0x3320646e, 0x79622d32, 0x6b206574
+Lcc_incr:
+    .word 0, 1, 2, 3
+
 #endif // __aarch64__
