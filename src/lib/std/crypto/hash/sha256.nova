@@ -8,6 +8,12 @@
 import bytes;
 import mem.allocator;
 
+// Integrated-assembly fast path (src/runtime/nova_crypto_arm64.S): on an aarch64 host the block compression
+// uses the ARMv8 SHA-256 instructions (SHA256H/SU0/SU1), ~200x the software round loop. The state buffer `h`
+// (8 words, big-endian) is passed straight through; the asm byteswaps it. Plain extern call, no FFI.
+extern("c") fn nova_has_asm_crypto(): int;
+extern("c") fn nova_sha256_blocks(state: ptr, data: ptr, blocks: int): void;
+
 const MASK32: long = 0xffffffff;
 
 // Round constants: the first 32 bits of the fractional parts of the cube roots of the first 64 primes.
@@ -149,6 +155,11 @@ pub struct Sha256 {
                 self.compress(self.block, 0);
                 self.blockLen = 0;
             }
+        }
+        let nb = (len - i) / SHA256_BLOCK_LEN;
+        if (nb > 0 && nova_has_asm_crypto() == 1) {
+            nova_sha256_blocks(self.h, (data as long + i) as ptr, nb);
+            i = i + nb * SHA256_BLOCK_LEN;
         }
         while (len - i >= SHA256_BLOCK_LEN) {
             self.compress(data, i);
