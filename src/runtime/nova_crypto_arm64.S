@@ -12,6 +12,23 @@
 
 .text
 
+// The AArch64 PCS requires the LOW 64 bits of v8..v15 (d8..d15) to be preserved across a call. All the
+// multi-register routines below use v8..v15 as round-key / scratch registers, so they must save and restore
+// d8..d15 or they will silently corrupt a caller that had live values there (a latent bug the 8-way seal
+// finally surfaced). 64-byte frame, 16-byte aligned.
+.macro SAVE_D8_D15
+    stp d8, d9,   [sp, #-64]!
+    stp d10, d11, [sp, #16]
+    stp d12, d13, [sp, #32]
+    stp d14, d15, [sp, #48]
+.endm
+.macro RESTORE_D8_D15
+    ldp d10, d11, [sp, #16]
+    ldp d12, d13, [sp, #32]
+    ldp d14, d15, [sp, #48]
+    ldp d8, d9,   [sp], #64
+.endm
+
 // void nova_aes_encrypt_block(const uint8_t* rk, int nr, const uint8_t* in, uint8_t* out)
 //   x0 = rk (packed round keys, (nr+1)*16 bytes), w1 = nr (10 or 14), x2 = in, x3 = out
 // ARM AESE(d,k) = ShiftRows(SubBytes(d EOR k)); AESMC = MixColumns. So the sequence is
@@ -69,6 +86,7 @@ _nova_aes_encrypt_block:
 .global _nova_aes_ctr
 .align 4
 _nova_aes_ctr:
+    SAVE_D8_D15
     ldr     w9, [x2, #12]           // native low-32 counter (stored big-endian)
     rev     w9, w9
     ld1     {v24.16b}, [x2]         // counter-block template (bytes 0..11 = prefix; lane 3 overwritten)
@@ -235,6 +253,7 @@ _nova_aes_ctr:
 9:
     rev     w11, w9                 // write the advanced counter back (big-endian)
     str     w11, [x2, #12]
+    RESTORE_D8_D15
     ret
 
 // ---- Register-resident GHASH (stitched-seal step 2) --------------------------------------------------
@@ -306,6 +325,7 @@ _nova_aes_ctr:
 .global _nova_ghash
 .align 4
 _nova_ghash:
+    SAVE_D8_D15
     ld1     {v0.16b}, [x0]              // H (standard order)
     ld1     {v1.16b}, [x3]             // Y (standard order)
     movi    v31.16b, #0                // ZERO
@@ -377,6 +397,7 @@ _nova_ghash:
     GFMUL
 14:
     st1     {v1.16b}, [x3]            // store Y (standard order; caller reflects back)
+    RESTORE_D8_D15
     ret
 
 // ---- Fused stitched seal (stitched-seal step 3b) -----------------------------------------------------
@@ -425,6 +446,7 @@ _nova_ghash:
 .global _nova_gcm_seal
 .align 4
 _nova_gcm_seal:
+    SAVE_D8_D15
     ldr     w9, [x3, #12]
     rev     w9, w9
     ld1     {v24.16b}, [x3]           // counter template
@@ -521,6 +543,7 @@ _nova_gcm_seal:
     st1     {v25.16b}, [x7]             // store Y
     rev     w11, w9
     str     w11, [x3, #12]             // store advanced counter
+    RESTORE_D8_D15
     ret
 
 #endif // __aarch64__
