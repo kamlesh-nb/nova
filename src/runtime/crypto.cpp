@@ -66,6 +66,15 @@ extern "C" void nova_getrandom(char *buf, long long n) {
 // symbols are provided here as portable C so a Nova program that references them still links; these are the
 // correctness fallbacks (a host without the asm also lacks the hardware anyway, so the Nova SIMD path is
 // what actually runs there — these are only reached if a caller invokes the symbol directly).
+// 1 when the hand-written AArch64 crypto assembly is compiled into this runtime (aarch64 host). Nova's
+// GcmContext dispatches the hot AES-GCM routines to the asm only when this is 1; every other host runs the
+// pure-Nova SIMD path (the C fallbacks below exist only so the symbols resolve at link time).
+#if defined(__aarch64__) || defined(__arm64__)
+  extern "C" int nova_has_asm_crypto(void) { return 1; }
+#else
+  extern "C" int nova_has_asm_crypto(void) { return 0; }
+#endif
+
 #if !(defined(__aarch64__) || defined(__arm64__))
 namespace {
   // FIPS-197 AES S-box.
@@ -114,5 +123,22 @@ extern "C" void nova_aes_encrypt_block(const unsigned char* rk, int nr, const un
     for (int i = 0; i < 16; i++) s[i] ^= rk[round*16 + i];  // AddRoundKey(Kround)
   }
   for (int i = 0; i < 16; i++) out[i] = s[i];
+}
+
+// Portable AES-CTR fallback matching nova_crypto_arm64.S nova_aes_ctr. ctr's low 32 bits are a big-endian
+// counter, advanced in place. Not perf-critical (used only on hosts without the asm, which run the Nova
+// SIMD path anyway); correctness only, via the single-block routine above.
+extern "C" void nova_aes_ctr(const unsigned char* rk, int nr, unsigned char* ctr,
+                             const unsigned char* in, int len, unsigned char* out) {
+  unsigned char ks[16];
+  int done = 0;
+  while (done < len) {
+    nova_aes_encrypt_block(rk, nr, ctr, ks);
+    int n = (len - done < 16) ? (len - done) : 16;
+    for (int i = 0; i < n; i++) out[done + i] = in[done + i] ^ ks[i];
+    // increment the big-endian 32-bit counter in ctr[12..15]
+    for (int i = 15; i >= 12; i--) { if (++ctr[i] != 0) break; }
+    done += n;
+  }
 }
 #endif

@@ -12,6 +12,13 @@ import bytes;
 import mem.endian;
 import mem.memory;
 
+// Integrated-assembly fast path (see src/runtime/nova_crypto_arm64.S). nova_has_asm_crypto() is 1 only on an
+// aarch64 host where the hand-written AES routines are linked in; there the AES-CTR keystream runs in the asm
+// (register-resident round keys + 4-way), otherwise the pure-Nova SIMD gctrHw below runs. A plain extern
+// call (bl), no FFI marshalling — the Go/BoringSSL model.
+extern("c") fn nova_has_asm_crypto(): int;
+extern("c") fn nova_aes_ctr(rk: ptr, nr: int, ctr: ptr, dataIn: ptr, len: int, out: ptr): void;
+
 // AES S-box, used ONLY by the key schedule (one-time per key). The BULK cipher below is fully constant-time
 // (the AES instruction, no tables). A table-based key schedule has a theoretical cache-timing side channel
 // on the key; that is a known, accepted tradeoff (constant-time key expansion via the AES instruction is a
@@ -90,6 +97,7 @@ fn putLen64(buf: ptr, off: int, bits: long): void {
 // and each round key is loaded once per group and reused across the 8 lanes; the keystream is XORed into
 // the plaintext with SIMD (u8x16). The tail (< 8 blocks) falls back to the single-block encBlock.
 fn gctrHw(rk: ptr, nr: int, icb: ptr, dataIn: ptr, len: int, out: ptr): void {
+    if (nova_has_asm_crypto() == 1) { nova_aes_ctr(rk, nr, icb, dataIn, len, out); return; }
     let ctr = bytes.alloc(16);
     let i = 0; while (i < 16) { bytes.write_byte(ctr, i, bytes.read_byte(icb, i)); i = i + 1; }
     let cb = bytes.alloc(128);
