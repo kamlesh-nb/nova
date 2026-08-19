@@ -1,0 +1,46 @@
+// FR-simd-L1: SIMD vector types (u8x16 / u32x4 / u64x2) are first-class VALUES — usable as function
+// parameters, return types, and named locals with a type annotation, not only as inline simd.* call
+// results. This keeps vector data in a register across a call boundary (no memory round-trip), the enabler
+// for register-resident crypto/compression inner loops. Struct fields are a separate slice.
+import bytes;
+import assert;
+
+// vector parameter + vector return
+fn dbl(v: u8x16): u8x16 { return simd.addU8x16(v, v); }
+fn xorPair(a: u64x2, b: u64x2): u64x2 { return simd.xorU64x2(a, b); }
+fn revBits(v: u8x16): u8x16 {
+    let mF0 = simd.splatU8x16(0xF0); let m0F = simd.splatU8x16(0x0F);
+    let mCC = simd.splatU8x16(0xCC); let m33 = simd.splatU8x16(0x33);
+    let mAA = simd.splatU8x16(0xAA); let m55 = simd.splatU8x16(0x55);
+    let r = simd.orU8x16(simd.shrU8x16(simd.andU8x16(v, mF0), 4), simd.shlU8x16(simd.andU8x16(v, m0F), 4));
+    r = simd.orU8x16(simd.shrU8x16(simd.andU8x16(r, mCC), 2), simd.shlU8x16(simd.andU8x16(r, m33), 2));
+    r = simd.orU8x16(simd.shrU8x16(simd.andU8x16(r, mAA), 1), simd.shlU8x16(simd.andU8x16(r, m55), 1));
+    return r;
+}
+fn brev8(b: int): int { let r = 0; let k = 0; let x = b; while (k < 8) { r = (r << 1) | (x & 1); x = x >> 1; k = k + 1; } return r & 0xff; }
+
+@test
+fn vec_param_return(): void {
+    let buf = bytes.alloc(16); let i = 0; while (i < 16) { bytes.write_byte(buf, i, (i * 9 + 1) & 0xff); i = i + 1; }
+    // named vector local, passed to a fn, result stored
+    let v: u8x16 = simd.loadU8x16(buf, 0);
+    let d: u8x16 = dbl(v);
+    let out = bytes.alloc(16); simd.storeU8x16(out, 0, d);
+    i = 0; while (i < 16) { assert.equalInt(bytes.read_byte(out, i), ((i * 9 + 1) * 2) & 0xff); i = i + 1; }
+}
+
+@test
+fn vec_u64x2_roundtrip(): void {
+    let a = bytes.alloc(16); let b = bytes.alloc(16); let i = 0;
+    while (i < 16) { bytes.write_byte(a, i, i & 0xff); bytes.write_byte(b, i, (255 - i) & 0xff); i = i + 1; }
+    let r: u64x2 = xorPair(simd.loadU64x2(a, 0), simd.loadU64x2(b, 0));
+    let o = bytes.alloc(16); simd.storeU64x2(o, 0, r);
+    i = 0; while (i < 16) { assert.equalInt(bytes.read_byte(o, i), (i ^ (255 - i)) & 0xff); i = i + 1; }
+}
+
+@test
+fn vec_bitrev_via_fn(): void {
+    let data = bytes.alloc(16); let i = 0; while (i < 16) { bytes.write_byte(data, i, (i * 37 + 5) & 0xff); i = i + 1; }
+    let out = bytes.alloc(16); simd.storeU8x16(out, 0, revBits(simd.loadU8x16(data, 0)));
+    i = 0; while (i < 16) { assert.equalInt(bytes.read_byte(out, i), brev8(bytes.read_byte(data, i))); i = i + 1; }
+}

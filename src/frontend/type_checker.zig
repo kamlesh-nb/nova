@@ -450,6 +450,7 @@ pub const TypeChecker = struct {
             "i8", "i16", "i32", "i64", "i128", "f32", "f64", "bool", "string", "void",
             "any", "char", "ptr", "uptr", "usize", "isize", "never", "unit", "decimal", "byte",
             "future", "channel", // compiler builtin generics (future<T> is special-cased in sema/lower)
+            "u8x16", "u32x4", "u64x2", "f64x4", // FR-simd-L1 SIMD vector types (spellable, see sema/lower)
         };
         for (builtin_types) |b| if (std.mem.eql(u8, c, b) or std.mem.eql(u8, name, b)) return true;
         return self.structs.contains(name) or self.traits.contains(name) or self.enums.contains(name) or

@@ -4,6 +4,7 @@ const sema_shadow = @import("../../frontend/sema/shadow.zig");
 const sema_mono = @import("../../frontend/sema/mono.zig");
 const sema_types = @import("../../frontend/types.zig");
 const getStructBaseName = @import("types.zig").getStructBaseName;
+const simdVecName = @import("types.zig").simdVecName;
 const llvm = @import("llvm");
 const types = llvm.types;
 const core = llvm.core;
@@ -894,7 +895,13 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         if (compiler.function_local_types.get(func.name)) |lt| {
             for (0..func.param_count) |pi| {
                 if (lt.get(func.param_names[pi])) |tn| {
-                    if (std.mem.indexOfScalar(u8, tn, '[') != null) params[pi] = compiler.ptr_type;
+                    if (std.mem.indexOfScalar(u8, tn, '[') != null) {
+                        params[pi] = compiler.ptr_type;
+                    } else if (simdVecName(tn) != null or std.mem.eql(u8, tn, "f64x4")) {
+                        // FR-simd-L1: a SIMD-vector parameter travels as its real <N x iM> LLVM type (in a
+                        // vector register), not the i64 word, so it stays register-resident across the call.
+                        params[pi] = compiler.slotTypeForLocal(tn);
+                    }
                 }
             }
         }
@@ -904,7 +911,9 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
 
         const is_async_native = func.is_async and !is_wasm;
 
-        const ret_t = if (is_main) compiler.val_type else if (is_async_native) compiler.val_type else if (is_void) compiler.void_type else compiler.val_type;
+        // A SIMD-vector return also travels as the vector type (see the parameter note above).
+        const is_vec_ret = simdVecName(func.return_type) != null or std.mem.eql(u8, func.return_type, "f64x4");
+        const ret_t = if (is_main) compiler.val_type else if (is_async_native) compiler.val_type else if (is_void) compiler.void_type else if (is_vec_ret) compiler.slotTypeForLocal(func.return_type) else compiler.val_type;
 
         const fn_type = core.LLVMFunctionType(ret_t, params.ptr, @intCast(func.param_count), 0);
         const real_name = if (is_main) "__nova_main" else func.name;

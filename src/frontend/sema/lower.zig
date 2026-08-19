@@ -122,6 +122,26 @@ pub const Lowerer = struct {
                     self.stats.lowered += 1;
                     return self.store.ptrT();
                 }
+                // FR-simd-L1: the SIMD vector types are spellable as ordinary type names, so a value can be a
+                // named local, a function parameter/return, or a struct field (not just an inline simd.* call
+                // result). Their TypeIds are the same sentinel-encoded prims the codegen slot picker already
+                // maps to <N x iM>, so no further codegen wiring is needed for params/returns/fields.
+                if (std.mem.eql(u8, name, "u8x16")) {
+                    self.stats.lowered += 1;
+                    return self.store.vecU8x16T();
+                }
+                if (std.mem.eql(u8, name, "u32x4")) {
+                    self.stats.lowered += 1;
+                    return self.store.vecU32x4T();
+                }
+                if (std.mem.eql(u8, name, "u64x2")) {
+                    self.stats.lowered += 1;
+                    return self.store.vecU64x2T();
+                }
+                if (std.mem.eql(u8, name, "f64x4")) {
+                    self.stats.lowered += 1;
+                    return self.store.vecF64x4T();
+                }
 
                 if (self.typeParamRef(name)) |tp| {
                     self.stats.lowered += 1;
