@@ -444,6 +444,13 @@ pub const Parser = struct {
     fn parseFunctionDecl(self: *Parser, is_exported: bool) ParserError!ast.FunctionDecl {
         const start_span = self.span();
         const is_async = self.match(.keyword_async);
+        // Accept BOTH modifier orders: `pub async fn` (the caller consumed `pub` before us and passed
+        // is_exported=true) and `async pub fn` (a `pub` follows `async`, consumed here). Only look for the
+        // trailing `pub` when we just saw `async` and were not already told this is exported, so a normal
+        // `pub fn` / `async fn` never consumes a stray token. The method-declaration path (parseStructDecl)
+        // reads this back via the returned decl's is_exported to set MethodDecl.is_public.
+        var exported = is_exported;
+        if (!exported and is_async and self.match(.keyword_pub)) exported = true;
         try self.expect(.keyword_fn);
         const name = self.current().lexeme;
         try self.expect(.identifier);
@@ -487,7 +494,7 @@ pub const Parser = struct {
             .params = try params.toOwnedSlice(self.allocator),
             .ret_type = ret_type,
             .body = body,
-            .is_exported = is_exported,
+            .is_exported = exported,
             .attributes = &.{},
             .type_params = try type_params.toOwnedSlice(self.allocator),
             .is_async = is_async,
@@ -664,7 +671,9 @@ pub const Parser = struct {
                     is_static = false;
                 }
                 try methods.append(self.allocator, ast.MethodDecl{
-                    .is_public = field_is_pub,
+                    // `field_is_pub` catches `pub` written before `fn`/`async`; `fd.is_exported` catches the
+                    // `async pub fn` order, where parseFunctionDecl consumed the `pub` that follows `async`.
+                    .is_public = field_is_pub or fd.is_exported,
                     .is_static = is_static,
                     .decl = fd,
                 });
@@ -782,7 +791,9 @@ pub const Parser = struct {
                     is_static = false;
                 }
                 try methods.append(self.allocator, ast.MethodDecl{
-                    .is_public = is_pub,
+                    // `is_pub` catches `pub` written before `async`; `fd.is_exported` catches the
+                    // `async pub fn` order, where parseFunctionDecl consumed the `pub` after `async`.
+                    .is_public = is_pub or fd.is_exported,
                     .is_static = is_static,
                     .decl = fd,
                 });

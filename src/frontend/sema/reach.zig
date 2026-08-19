@@ -159,9 +159,21 @@ pub fn compute(
     // method that NO reachable code calls. Trades a little raw win for provable soundness.
     var generic_structs: std.StringHashMapUnmanaged(void) = .empty;
     defer generic_structs.deinit(gpa);
+    // A generic struct that IMPLS a trait has its trait methods invoked through a VTABLE (dynamic
+    // dispatch), which is an edge the call-graph walk below does not model. Pruning such a method leaves
+    // the vtable slot pointing at a dropped function -> a runtime crash on the first trait call (this was
+    // 307_generic_struct_impl_trait / 364_generic_struct_trait_dispatch). So we treat a generic struct
+    // with any trait impl as NON-prunable: all its methods are rooted, exactly like a non-generic struct.
+    // Over-approximate (a non-trait method of such a struct is kept too) but sound; only affects generic
+    // structs that actually implement a trait, so the extra emission is small.
+    var generic_trait_structs: std.StringHashMapUnmanaged(void) = .empty;
+    defer generic_trait_structs.deinit(gpa);
     for (program.declarations) |d| {
         if (d == .struct_decl and d.struct_decl.type_params.len > 0) {
             generic_structs.put(gpa, d.struct_decl.name, {}) catch {};
+            if (d.struct_decl.impls.len > 0) {
+                generic_trait_structs.put(gpa, d.struct_decl.name, {}) catch {};
+            }
         }
     }
 
@@ -170,7 +182,7 @@ pub fn compute(
         res.total_fn_decls += 1;
         const sid: SymbolId = @enumFromInt(@as(u32, @intCast(i)));
         const is_generic_method = sym.kind == .method and
-            (if (sym.owner) |o| generic_structs.contains(o) else false);
+            (if (sym.owner) |o| (generic_structs.contains(o) and !generic_trait_structs.contains(o)) else false);
         // Seed everything the gate can't prune. Generic-struct methods are left for the walk to reach.
         if (!is_generic_method) {
             ctx.enqueue(sid);

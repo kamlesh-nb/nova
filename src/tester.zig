@@ -24,12 +24,26 @@ const pipeline = @import("pipeline.zig");
 const packages = @import("packages.zig");
 
 
-fn collectTestFunctions(declarations: []const ast.Declaration, allocator: std.mem.Allocator) ![][]const u8 {
+// Collect the @test functions to run. Only functions defined in the USER's own file(s) count: `nova test`
+// merges the whole import graph (the force-preloaded string_builder, plus every stdlib and package module
+// an import pulls in), and those modules carry their own @test functions which are already covered by the
+// compiler's conformance corpus. Running them again on every `nova test` is noise, so we filter by the
+// source file each declaration was parsed from (`fd.span.file`, set by the parser to its file path) against
+// the set of files the user actually asked to test (`user_files` = the given file, or the scanned project).
+fn collectTestFunctions(declarations: []const ast.Declaration, user_files: []const []const u8, allocator: std.mem.Allocator) ![][]const u8 {
     var test_fns = std.ArrayList([]const u8).empty;
     defer test_fns.deinit(allocator);
     for (declarations) |decl| {
         switch (decl) {
             .fn_decl => |fd| {
+                var from_user_file = false;
+                for (user_files) |uf| {
+                    if (std.mem.eql(u8, fd.span.file, uf)) {
+                        from_user_file = true;
+                        break;
+                    }
+                }
+                if (!from_user_file) continue;
                 for (fd.attributes) |attr| {
                     switch (attr) {
                         .@"test" => {
@@ -172,16 +186,22 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
         };
     }
 
-    const test_fn_names = try collectTestFunctions(declarations.items, allocator);
+    const test_fn_names = try collectTestFunctions(declarations.items, file_paths.items, allocator);
+    // A file may legitimately have no @test of its own (a cross-module fixture, or an expect_fail case that
+    // is only there to be REJECTED). We must NOT return early here: the compile below is what validates the
+    // file and, crucially, is what type-checks and rejects an expect_fail case. Returning before
+    // `tc.check` would let a non-exhaustive-switch (or any other) error slip through unchecked. So with zero
+    // tests we fall through and build a trivial 0-test harness, which compiles the program and then reports
+    // "0 passed, 0 failed" (or, for a bad file, fails to compile exactly as it should).
     if (test_fn_names.len == 0) {
         if (file_path.len == 0) {
-            std.debug.print("No @test functions found in project directory\n", .{});
+            std.debug.print("No @test functions found in project directory; compiling only.\n", .{});
         } else {
-            std.debug.print("No @test functions found in {s}\n", .{file_path});
+            std.debug.print("No @test functions found in {s}; compiling only.\n", .{file_path});
         }
-        return;
+    } else {
+        std.debug.print("Found {d} test function(s)\n", .{test_fn_names.len});
     }
-    std.debug.print("Found {d} test function(s)\n", .{test_fn_names.len});
 
     const harness_src = try generateTestHarness(test_fn_names, allocator);
 

@@ -81,16 +81,24 @@ runtime provides (nova_* externs) is untouched.
 - **R2 — incremental follow-up (optional).** Finer partition granularity so the `List` partition is not
   one monolith (helps incremental rebuilds further). Not required for the headline win.
 
-## Status (2026-08-16) — R0 + R1 landed, opt-in, sound on hard cases
+## Status (2026-08-19) — SOUND, default-ON for `nova build`, corpus-gated
 
-Implemented in `src/frontend/sema/reach.zig` (walk + gate), wired in `builder.zig` (build path) and
-`tester.zig` (test path). **Default OFF** (`NOVA_REACH_ON` opt-in; `NOVA_REACH_SHADOW` report). The
-final root design is stronger than the original plan: **auto-root every free function + every method of
-a NON-generic struct as walk seeds**, so the walk is sound against edges `expr_syms` doesn't model
-(trait/vtable dispatch, address-taken serde binders, closures into higher-order fns). The gate then
-prunes only a **generic-struct non-constructor method that NO reachable code calls**. Constructors
-(`init`/`new`) are always kept; `struct_init` and `Type(...)`/`mod.Type(...)` construction sites root
-ctors explicitly.
+Implemented in `src/frontend/sema/reach.zig` (walk + gate). **`nova build`: default-ON** (`NOVA_REACH_OFF`
+is the escape hatch). `nova test`: default-OFF, `NOVA_REACH_ON` opt-in (`NOVA_REACH_SHADOW` reports without
+gating). The root design auto-roots **every free function + every method of a NON-generic struct** as walk
+seeds, so the walk is sound against edges `expr_syms` doesn't model (trait/vtable dispatch, address-taken
+serde binders, closures into higher-order fns). The gate then prunes only a **generic-struct non-constructor
+method that NO reachable code calls**. Constructors (`init`/`new`) are always kept; `struct_init` and
+`Type(...)`/`mod.Type(...)` construction sites root ctors explicitly.
+
+**Soundness fix (2026-08-19): generic struct + trait impl.** A generic struct that IMPLS a trait has its
+trait methods called through a VTABLE (dynamic dispatch), an edge the call-graph walk does not model.
+Pruning such a method left the vtable slot pointing at a dropped function, so the first trait call CRASHED
+at runtime (`307_generic_struct_impl_trait`, `364_generic_struct_trait_dispatch` compiled + linked, then
+`Test process terminated abnormally`). Fix: a generic struct with any trait impl is treated as NON-prunable,
+so all its methods are rooted (over-approximate, sound; only touches generic structs that actually implement
+a trait). This bug was invisible to the plain corpus because that runs `nova test` with the gate OFF, so a
+new gate leg now re-runs the whole corpus with `NOVA_REACH_ON=1` (`gate.sh`) to keep the gate honest.
 
 Measured on the pizza app (`plancksystems/perf/compare/nova`, `[T6]` partition):
 

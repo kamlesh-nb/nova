@@ -59,6 +59,15 @@ if [ $fail -eq 0 ]; then
   conformance/run.sh --ossa -j || fail=1
 fi
 
+if [ $fail -eq 0 ]; then
+  step "demand-mono reachability gate, CORPUS-WIDE (NOVA_REACH_ON: no reachable method pruned)"
+  # The reachability gate (Gap 8 / demand-driven-mono.md) is default-ON for `nova build` but the plain
+  # corpus above runs `nova test` with it OFF, so a gate soundness gap is INVISIBLE to the normal run.
+  # That is exactly how 307/364 (generic-struct trait dispatch pruned -> vtable-slot crash) slipped past.
+  # Re-run the whole corpus with the gate FORCED ON so any over-pruning surfaces as a failing case.
+  NOVA_REACH_ON=1 conformance/run.sh -j || fail=1
+fi
+
 echo
 if [ $fail -eq 0 ]; then echo "GATE PASS  nova (lang)  [$OS]"; else echo "GATE FAIL  nova (lang)  [$OS]"; fi
 exit $fail
