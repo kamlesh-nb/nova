@@ -1,0 +1,34 @@
+// Hardware AES-GCM (crypto.aead.aesgcmhw) using the AES instruction (simd.aesenc) for the block cipher.
+// Verified byte-for-byte against the constant-time software crypto.aead.aesgcm (which is itself NIST-KAT
+// gated by 223) across AES-128 / AES-256, several plaintext lengths, and with/without AAD; plus open
+// round-trips and rejects a tampered tag. This gates the hardware AES-CTR + packed key schedule. (The MAC
+// currently reuses the software GHASH; a clmul-based GHASH is the pending throughput piece.)
+import assert;
+import bytes;
+import crypto.aead.aesgcm;
+import crypto.aead.aesgcmhw;
+
+fn fill(p: ptr, n: int, seed: int): void { let i = 0; while (i < n) { bytes.write_byte(p, i, (i * 7 + seed) & 0xff); i = i + 1; } }
+
+fn diffTest(keyLen: int, ptLen: int, aadLen: int, seed: int): void {
+    let key = bytes.alloc(keyLen); fill(key, keyLen, seed);
+    let iv = bytes.alloc(12); fill(iv, 12, seed + 1);
+    let aad = bytes.alloc(if (aadLen > 0) aadLen else 1); fill(aad, aadLen, seed + 2);
+    let pt = bytes.alloc(if (ptLen > 0) ptLen else 1); fill(pt, ptLen, seed + 3);
+    let ctSw = bytes.alloc(if (ptLen > 0) ptLen else 1); let tagSw = bytes.alloc(16);
+    let ctHw = bytes.alloc(if (ptLen > 0) ptLen else 1); let tagHw = bytes.alloc(16);
+    aesgcm.seal(key, keyLen, iv, 12, aad, aadLen, pt, ptLen, ctSw, tagSw);
+    aesgcmhw.seal(key, keyLen, iv, 12, aad, aadLen, pt, ptLen, ctHw, tagHw);
+    let i = 0; while (i < ptLen) { assert.equalInt(bytes.read_byte(ctHw, i), bytes.read_byte(ctSw, i)); i = i + 1; }
+    i = 0; while (i < 16) { assert.equalInt(bytes.read_byte(tagHw, i), bytes.read_byte(tagSw, i)); i = i + 1; }
+    let dec = bytes.alloc(if (ptLen > 0) ptLen else 1);
+    assert.isTrue(aesgcmhw.open(key, keyLen, iv, 12, aad, aadLen, ctHw, ptLen, tagHw, dec));
+    i = 0; while (i < ptLen) { assert.equalInt(bytes.read_byte(dec, i), bytes.read_byte(pt, i)); i = i + 1; }
+    bytes.write_byte(tagHw, 0, bytes.read_byte(tagHw, 0) ^ 1);
+    assert.isFalse(aesgcmhw.open(key, keyLen, iv, 12, aad, aadLen, ctHw, ptLen, tagHw, dec));
+}
+
+@test
+fn aes256_gcm_hw(): void { diffTest(32, 64, 20, 1); diffTest(32, 16, 0, 2); diffTest(32, 1024, 13, 3); diffTest(32, 0, 16, 4); }
+@test
+fn aes128_gcm_hw(): void { diffTest(16, 64, 20, 5); diffTest(16, 255, 0, 6); diffTest(16, 17, 7, 7); }

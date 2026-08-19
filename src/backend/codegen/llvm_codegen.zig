@@ -4382,6 +4382,7 @@ pub const LlvmCompiler = struct {
     pub const compileSimdCall = expressions_mod.compileSimdCall;
     pub const compileIntSimd = expressions_mod.compileIntSimd;
     pub const compileClmul64 = expressions_mod.compileClmul64;
+    pub const compileAesRound = expressions_mod.compileAesRound;
     pub const compileMemCall = expressions_mod.compileMemCall;
     pub const arrayElemFloatLLVM = expressions_mod.arrayElemFloatLLVM;
     pub const arrayBasePtr = expressions_mod.arrayBasePtr;

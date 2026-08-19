@@ -517,6 +517,15 @@ pub fn compileIntSimd(self: *LlvmCompiler, field: []const u8, args: []const ast.
         const b64 = core.LLVMBuildTrunc(self.builder, try self.compileExpression(args[1]), core.LLVMInt64Type(), "clmul_b");
         return try self.compileClmul64(a64, b64, vt);
     }
+    if (std.mem.eql(u8, op, "aesenc") or std.mem.eql(u8, op, "aesenclast")) {
+        // FR-simd-L3: one AES encryption round on a u8x16 state with a u8x16 round key. `aesenc` is a full
+        // round (SubBytes -> ShiftRows -> MixColumns -> AddRoundKey); `aesenclast` omits MixColumns (final
+        // round). Semantics are x86 AES-NI's, mapped to ARM's aese/aesmc on aarch64. This is the AES bulk
+        // cipher primitive; it lowers to the hardware AES instruction (no table lookups -> constant time).
+        const state = try self.compileExpression(args[0]);
+        const rk = try self.compileExpression(args[1]);
+        return try self.compileAesRound(state, rk, vt, std.mem.eql(u8, op, "aesenclast"));
+    }
 
     // binary lane ops
     const a = try self.compileExpression(args[0]);
@@ -580,6 +589,50 @@ pub fn compileClmul64(self: *LlvmCompiler, a64: types.LLVMValueRef, b64: types.L
             }
             return core.LLVMBuildBitCast(self.builder, acc, vt, "clmul_vsw");
         },
+    }
+}
+
+// FR-simd-L3: one AES encryption round mapped to the hardware AES instruction. `state` and `rk` are
+// <16 x i8>. Semantics are x86 AES-NI's: aesenc(state,rk) = MixColumns(ShiftRows(SubBytes(state))) ^ rk;
+// aesenclast omits MixColumns. On aarch64 the same result is built from aese + aesmc (ARM's aese does
+// ShiftRows(SubBytes(data ^ key)), so we feed a ZERO key and do the real AddRoundKey with an explicit XOR,
+// which reproduces x86 ordering exactly). Constant-time (no S-box tables). `.none` (targets without AES
+// instructions, e.g. wasm) is unsupported here on purpose: callers keep the pure-Nova bitsliced AES for
+// those, and must not reach this op; a hardware AES-GCM is gated to native aarch64/x86_64.
+pub fn compileAesRound(self: *LlvmCompiler, state: types.LLVMValueRef, rk: types.LLVMValueRef, vt: types.LLVMTypeRef, last: bool) anyerror!types.LLVMValueRef {
+    const ctx = core.LLVMGetModuleContext(self.module);
+    switch (self.simd_target) {
+        .aarch64 => {
+            const zero = core.LLVMConstNull(vt); // <16 x i8> zero key -> no-op AddRoundKey inside aese
+            const aese_name: [:0]const u8 = "llvm.aarch64.crypto.aese";
+            const aese_id = core.LLVMLookupIntrinsicID(aese_name.ptr, aese_name.len);
+            const aese_fn = core.LLVMGetIntrinsicDeclaration(self.module, aese_id, null, 0);
+            const aese_ty = core.LLVMIntrinsicGetType(ctx, aese_id, null, 0);
+            var aese_args = [_]types.LLVMValueRef{ state, zero };
+            var t = core.LLVMBuildCall2(self.builder, aese_ty, aese_fn, &aese_args, 2, "aese"); // ShiftRows(SubBytes(state))
+            if (!last) {
+                const mc_name: [:0]const u8 = "llvm.aarch64.crypto.aesmc";
+                const mc_id = core.LLVMLookupIntrinsicID(mc_name.ptr, mc_name.len);
+                const mc_fn = core.LLVMGetIntrinsicDeclaration(self.module, mc_id, null, 0);
+                const mc_ty = core.LLVMIntrinsicGetType(ctx, mc_id, null, 0);
+                var mc_args = [_]types.LLVMValueRef{t};
+                t = core.LLVMBuildCall2(self.builder, mc_ty, mc_fn, &mc_args, 1, "aesmc"); // MixColumns
+            }
+            return core.LLVMBuildXor(self.builder, t, rk, "aes_ark"); // AddRoundKey
+        },
+        .x86_64 => {
+            const i64x2 = core.LLVMVectorType(core.LLVMInt64Type(), 2);
+            const s2 = core.LLVMBuildBitCast(self.builder, state, i64x2, "aes_s2");
+            const k2 = core.LLVMBuildBitCast(self.builder, rk, i64x2, "aes_k2");
+            const name: [:0]const u8 = if (last) "llvm.x86.aesni.aesenclast" else "llvm.x86.aesni.aesenc";
+            const id = core.LLVMLookupIntrinsicID(name.ptr, name.len);
+            const fn_val = core.LLVMGetIntrinsicDeclaration(self.module, id, null, 0);
+            const fn_ty = core.LLVMIntrinsicGetType(ctx, id, null, 0);
+            var cargs = [_]types.LLVMValueRef{ s2, k2 };
+            const r = core.LLVMBuildCall2(self.builder, fn_ty, fn_val, &cargs, 2, "aesni");
+            return core.LLVMBuildBitCast(self.builder, r, vt, "aes_v");
+        },
+        .none => return error.UnknownSimdOp,
     }
 }
 

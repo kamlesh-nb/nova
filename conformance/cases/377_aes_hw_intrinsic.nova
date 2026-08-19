@@ -1,0 +1,46 @@
+// FR-simd-L3: the hardware AES round intrinsic (simd.aesencU8x16 / simd.aesenclastU8x16), which lowers
+// to the CPU's AES instruction (ARM aese+aesmc / x86 AES-NI) with no S-box tables (constant time). This
+// is the AES bulk-cipher primitive; combined with the clmul GHASH it gives a hardware-fast AES-GCM in
+// pure Nova, no FFI. Verified against the FIPS-197 C.3 AES-256 single-block known-answer vector.
+import assert;
+import bytes;
+const SBOX: string = "637c777bf26b6fc53001672bfed7ab76ca82c97dfa5947f0add4a2af9ca472c0b7fd9326363ff7cc34a5e5f171d8311504c723c31896059a071280e2eb27b27509832c1a1b6e5aa0523bd6b329e32f8453d100ed20fcb15b6acbbe394a4c58cfd0efaafb434d338545f9027f503c9fa851a3408f929d38f5bcb6da2110fff3d2cd0c13ec5f974417c4a77e3d645d197360814fdc222a908846eeb814de5e0bdbe0323a0a4906245cc2d3ac629195e479e7c8376d8dd54ea96c56f4ea657aae08ba78252e1ca6b4c6e8dd741f4bbd8b8a703eb5664803f60e613557b986c11d9ee1f8981169d98e949b1e87e9ce5528df8ca1890dbfe6426841992d0fb054bb16";
+fn hexNib(c: int): int { if (c >= 48 && c <= 57) { return c - 48; } if (c >= 97 && c <= 102) { return c - 87; } return 0; }
+fn hexBuf(hex: string): ptr { let n = hex.length / 2; let b = bytes.alloc(n); let i = 0; while (i < n) { bytes.write_byte(b, i, hexNib(hex[i * 2]) * 16 + hexNib(hex[i * 2 + 1])); i = i + 1; } return b; }
+fn xtime(a: int): int { let r = (a << 1) & 0xff; if ((a & 0x80) != 0) { r = r ^ 0x1b; } return r; }
+fn sub(sbox: ptr, b: int): int { return bytes.read_byte(sbox, b & 0xff); }
+// Scalar AES-256 key expansion (one-time; the bulk cipher is the hardware round below).
+fn keyExpand256(sbox: ptr, key: ptr, rk: ptr): void {
+    let i = 0; while (i < 32) { bytes.write_byte(rk, i, bytes.read_byte(key, i)); i = i + 1; }
+    let rcon = 1; let w = 8;
+    while (w < 60) {
+        let t0 = bytes.read_byte(rk, (w-1)*4+0); let t1 = bytes.read_byte(rk, (w-1)*4+1);
+        let t2 = bytes.read_byte(rk, (w-1)*4+2); let t3 = bytes.read_byte(rk, (w-1)*4+3);
+        if (w % 8 == 0) {
+            let n0 = sub(sbox, t1) ^ rcon; let n1 = sub(sbox, t2); let n2 = sub(sbox, t3); let n3 = sub(sbox, t0);
+            t0 = n0; t1 = n1; t2 = n2; t3 = n3; rcon = xtime(rcon);
+        } else if (w % 8 == 4) {
+            t0 = sub(sbox, t0); t1 = sub(sbox, t1); t2 = sub(sbox, t2); t3 = sub(sbox, t3);
+        }
+        bytes.write_byte(rk, w*4+0, bytes.read_byte(rk, (w-8)*4+0) ^ t0);
+        bytes.write_byte(rk, w*4+1, bytes.read_byte(rk, (w-8)*4+1) ^ t1);
+        bytes.write_byte(rk, w*4+2, bytes.read_byte(rk, (w-8)*4+2) ^ t2);
+        bytes.write_byte(rk, w*4+3, bytes.read_byte(rk, (w-8)*4+3) ^ t3);
+        w = w + 1;
+    }
+}
+@test
+fn aes256_hw_block(): void {
+    let sbox = hexBuf(SBOX);
+    let key = hexBuf("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+    let pt  = hexBuf("00112233445566778899aabbccddeeff");
+    let rk = bytes.alloc(240);
+    keyExpand256(sbox, key, rk);
+    let out = bytes.alloc(16);
+    let state = simd.xorU8x16(simd.loadU8x16(pt, 0), simd.loadU8x16(rk, 0));
+    let r = 1; while (r < 14) { state = simd.aesencU8x16(state, simd.loadU8x16(rk, r*16)); r = r + 1; }
+    state = simd.aesenclastU8x16(state, simd.loadU8x16(rk, 14*16));
+    simd.storeU8x16(out, 0, state);
+    let want = hexBuf("8ea2b7ca516745bfeafc49904b496089");
+    let i = 0; while (i < 16) { assert.equalInt(bytes.read_byte(out, i), bytes.read_byte(want, i)); i = i + 1; }
+}

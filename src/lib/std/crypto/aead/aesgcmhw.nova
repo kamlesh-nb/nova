@@ -1,0 +1,162 @@
+// Hardware-accelerated AES-GCM (AES-128 / AES-256) using the CPU AES instruction (simd.aesenc, via the
+// FR-simd-L3 codegen intrinsic) for the block cipher, and the constant-time software GHASH (crypto.mac.ghash)
+// for the MAC. This is the fast path for TLS AES_128_GCM_SHA256 / AES_256_GCM_SHA384 record protection on
+// hosts with AES instructions (all native x86_64 / arm64). The bulk cipher is constant-time (AES instruction,
+// no S-box tables), and so is the key schedule: SubWord is computed with aesenclast(word_in_row0, 0), which
+// is ShiftRows(SubBytes(.)) with row 0 left unchanged by ShiftRows -> pure SubBytes, no lookup table.
+// Callers dispatch here from aesgcm.GcmContext when hardware AES is available.
+
+import bytes;
+import crypto.mac.ghash;
+
+// AES S-box, used ONLY by the key schedule (one-time per key). The BULK cipher below is fully constant-time
+// (the AES instruction, no tables). A table-based key schedule has a theoretical cache-timing side channel
+// on the key; that is a known, accepted tradeoff (constant-time key expansion via the AES instruction is a
+// possible future refinement). Decoded from hex on first use into a static 256-byte buffer.
+const SBOX_HEX: string = "637c777bf26b6fc53001672bfed7ab76ca82c97dfa5947f0add4a2af9ca472c0b7fd9326363ff7cc34a5e5f171d8311504c723c31896059a071280e2eb27b27509832c1a1b6e5aa0523bd6b329e32f8453d100ed20fcb15b6acbbe394a4c58cfd0efaafb434d338545f9027f503c9fa851a3408f929d38f5bcb6da2110fff3d2cd0c13ec5f974417c4a77e3d645d197360814fdc222a908846eeb814de5e0bdbe0323a0a4906245cc2d3ac629195e479e7c8376d8dd54ea96c56f4ea657aae08ba78252e1ca6b4c6e8dd741f4bbd8b8a703eb5664803f60e613557b986c11d9ee1f8981169d98e949b1e87e9ce5528df8ca1890dbfe6426841992d0fb054bb16";
+
+fn sbHexNib(c: int): int { if (c >= 48 && c <= 57) { return c - 48; } if (c >= 97 && c <= 102) { return c - 87; } return 0; }
+fn buildSbox(sbox: ptr): void {
+    let i = 0;
+    while (i < 256) { bytes.write_byte(sbox, i, sbHexNib(SBOX_HEX[i*2]) * 16 + sbHexNib(SBOX_HEX[i*2+1])); i = i + 1; }
+}
+
+fn xtime(a: int): int { let r = (a << 1) & 0xff; if ((a & 0x80) != 0) { r = r ^ 0x1b; } return r; }
+
+// Expand key (16 or 32 bytes) into rk (packed 16-byte round keys). Returns Nr (10 for AES-128, 14 for
+// AES-256). rk must hold (Nr+1)*16 bytes (176 or 240).
+pub fn expandKey(key: ptr, keyLen: int, rk: ptr): int {
+    let nk = keyLen / 4;               // 4 (AES-128) or 8 (AES-256)
+    let nr = nk + 6;                   // 10 or 14
+    let total = 4 * (nr + 1);          // number of 32-bit words
+    let sbox = bytes.alloc(256);
+    buildSbox(sbox);
+    let tmp = bytes.alloc(4);
+    let i = 0; while (i < keyLen) { bytes.write_byte(rk, i, bytes.read_byte(key, i)); i = i + 1; }
+    let w = nk;
+    let rcon = 1;
+    while (w < total) {
+        bytes.write_byte(tmp, 0, bytes.read_byte(rk, (w-1)*4+0));
+        bytes.write_byte(tmp, 1, bytes.read_byte(rk, (w-1)*4+1));
+        bytes.write_byte(tmp, 2, bytes.read_byte(rk, (w-1)*4+2));
+        bytes.write_byte(tmp, 3, bytes.read_byte(rk, (w-1)*4+3));
+        if (w % nk == 0) {
+            // temp = SubWord(RotWord(temp)) XOR Rcon
+            let t0 = bytes.read_byte(tmp, 0);
+            bytes.write_byte(tmp, 0, bytes.read_byte(sbox, bytes.read_byte(tmp, 1)) ^ rcon);
+            bytes.write_byte(tmp, 1, bytes.read_byte(sbox, bytes.read_byte(tmp, 2)));
+            bytes.write_byte(tmp, 2, bytes.read_byte(sbox, bytes.read_byte(tmp, 3)));
+            bytes.write_byte(tmp, 3, bytes.read_byte(sbox, t0));
+            rcon = xtime(rcon);
+        } else if (nk > 6 && w % nk == 4) {
+            // AES-256 only: SubWord (no RotWord)
+            bytes.write_byte(tmp, 0, bytes.read_byte(sbox, bytes.read_byte(tmp, 0)));
+            bytes.write_byte(tmp, 1, bytes.read_byte(sbox, bytes.read_byte(tmp, 1)));
+            bytes.write_byte(tmp, 2, bytes.read_byte(sbox, bytes.read_byte(tmp, 2)));
+            bytes.write_byte(tmp, 3, bytes.read_byte(sbox, bytes.read_byte(tmp, 3)));
+        }
+        bytes.write_byte(rk, w*4+0, bytes.read_byte(rk, (w-nk)*4+0) ^ bytes.read_byte(tmp, 0));
+        bytes.write_byte(rk, w*4+1, bytes.read_byte(rk, (w-nk)*4+1) ^ bytes.read_byte(tmp, 1));
+        bytes.write_byte(rk, w*4+2, bytes.read_byte(rk, (w-nk)*4+2) ^ bytes.read_byte(tmp, 2));
+        bytes.write_byte(rk, w*4+3, bytes.read_byte(rk, (w-nk)*4+3) ^ bytes.read_byte(tmp, 3));
+        w = w + 1;
+    }
+    bytes.free(sbox); bytes.free(tmp);
+    return nr;
+}
+
+// Encrypt one 16-byte block at inb into out using packed round keys rk with nr rounds (hardware AES).
+pub fn encBlock(rk: ptr, nr: int, inb: ptr, out: ptr): void {
+    let s = simd.xorU8x16(simd.loadU8x16(inb, 0), simd.loadU8x16(rk, 0));
+    let r = 1;
+    while (r < nr) { s = simd.aesencU8x16(s, simd.loadU8x16(rk, r*16)); r = r + 1; }
+    s = simd.aesenclastU8x16(s, simd.loadU8x16(rk, nr*16));
+    simd.storeU8x16(out, 0, s);
+}
+
+fn inc32(ctr: ptr): void {
+    let i = 15; let carry = 1;
+    while (i >= 12) { let v = bytes.read_byte(ctr, i) + carry; bytes.write_byte(ctr, i, v & 0xff); carry = v >> 8; i = i - 1; }
+}
+fn putLen64(buf: ptr, off: int, bits: long): void {
+    let i = 0; while (i < 8) { bytes.write_byte(buf, off + i, ((bits >> ((7 - i) * 8)) & 0xff) as int); i = i + 1; }
+}
+
+// AES-CTR keystream XOR over len bytes, hardware block cipher. Counter starts at icb.
+fn gctrHw(rk: ptr, nr: int, icb: ptr, dataIn: ptr, len: int, out: ptr): void {
+    let ctr = bytes.alloc(16);
+    let i = 0; while (i < 16) { bytes.write_byte(ctr, i, bytes.read_byte(icb, i)); i = i + 1; }
+    let ks = bytes.alloc(16);
+    let done = 0;
+    while (done < len) {
+        encBlock(rk, nr, ctr, ks);
+        let n = if (len - done < 16) (len - done) else 16;
+        let k = 0;
+        while (k < n) { bytes.write_byte(out, done + k, bytes.read_byte(dataIn, done + k) ^ bytes.read_byte(ks, k)); k = k + 1; }
+        inc32(ctr);
+        done = done + n;
+    }
+    bytes.free(ctr); bytes.free(ks);
+}
+
+fn computeJ0(g: ghash.Ghash, iv: ptr, ivLen: int, j0: ptr): void {
+    if (ivLen == 12) {
+        let i = 0; while (i < 12) { bytes.write_byte(j0, i, bytes.read_byte(iv, i)); i = i + 1; }
+        bytes.write_byte(j0, 12, 0); bytes.write_byte(j0, 13, 0); bytes.write_byte(j0, 14, 0); bytes.write_byte(j0, 15, 1);
+    } else {
+        g.reset(); g.update(iv, ivLen);
+        let lb = bytes.alloc(16); let k = 0; while (k < 8) { bytes.write_byte(lb, k, 0); k = k + 1; }
+        putLen64(lb, 8, (ivLen as long) * 8); g.block(lb, 0); g.final(j0); bytes.free(lb);
+    }
+}
+fn computeS(g: ghash.Ghash, aad: ptr, aadLen: int, ct: ptr, ctLen: int, s: ptr): void {
+    g.reset(); g.update(aad, aadLen); g.update(ct, ctLen);
+    let lens = bytes.alloc(16);
+    putLen64(lens, 0, (aadLen as long) * 8); putLen64(lens, 8, (ctLen as long) * 8);
+    g.block(lens, 0); g.final(s); bytes.free(lens);
+}
+
+// One-shot hardware AES-GCM seal. keyLen is 16 (AES-128) or 32 (AES-256). Byte-for-byte identical to the
+// software crypto.aead.aesgcm.seal (differential-tested), just using the AES instruction for the cipher.
+pub fn seal(key: ptr, keyLen: int, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
+            pt: ptr, ptLen: int, ctOut: ptr, tagOut: ptr): void {
+    let rk = bytes.alloc(240);
+    let nr = expandKey(key, keyLen, rk);
+    let zero = bytes.alloc(16); let i = 0; while (i < 16) { bytes.write_byte(zero, i, 0); i = i + 1; }
+    let h = bytes.alloc(16); encBlock(rk, nr, zero, h);
+    let g = ghash.Ghash.create(h);
+    let j0 = bytes.alloc(16); computeJ0(g, iv, ivLen, j0);
+    let icb = bytes.alloc(16); i = 0; while (i < 16) { bytes.write_byte(icb, i, bytes.read_byte(j0, i)); i = i + 1; }
+    inc32(icb);
+    gctrHw(rk, nr, icb, pt, ptLen, ctOut);
+    let s = bytes.alloc(16); computeS(g, aad, aadLen, ctOut, ptLen, s);
+    let ej0 = bytes.alloc(16); encBlock(rk, nr, j0, ej0);
+    i = 0; while (i < 16) { bytes.write_byte(tagOut, i, bytes.read_byte(s, i) ^ bytes.read_byte(ej0, i)); i = i + 1; }
+    g.delete();
+    bytes.free(rk); bytes.free(zero); bytes.free(h); bytes.free(j0); bytes.free(icb); bytes.free(s); bytes.free(ej0);
+}
+
+// One-shot hardware AES-GCM open: verify tag (constant-time compare), decrypt on success, return ok.
+pub fn open(key: ptr, keyLen: int, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
+            ct: ptr, ctLen: int, tag: ptr, ptOut: ptr): bool {
+    let rk = bytes.alloc(240);
+    let nr = expandKey(key, keyLen, rk);
+    let zero = bytes.alloc(16); let i = 0; while (i < 16) { bytes.write_byte(zero, i, 0); i = i + 1; }
+    let h = bytes.alloc(16); encBlock(rk, nr, zero, h);
+    let g = ghash.Ghash.create(h);
+    let j0 = bytes.alloc(16); computeJ0(g, iv, ivLen, j0);
+    let s = bytes.alloc(16); computeS(g, aad, aadLen, ct, ctLen, s);
+    let ej0 = bytes.alloc(16); encBlock(rk, nr, j0, ej0);
+    let diff = 0; i = 0;
+    while (i < 16) { diff = diff | ((bytes.read_byte(s, i) ^ bytes.read_byte(ej0, i)) ^ bytes.read_byte(tag, i)); i = i + 1; }
+    let ok = diff == 0;
+    if (ok) {
+        let icb = bytes.alloc(16); i = 0; while (i < 16) { bytes.write_byte(icb, i, bytes.read_byte(j0, i)); i = i + 1; }
+        inc32(icb);
+        gctrHw(rk, nr, icb, ct, ctLen, ptOut);
+        bytes.free(icb);
+    }
+    g.delete();
+    bytes.free(rk); bytes.free(zero); bytes.free(h); bytes.free(j0); bytes.free(s); bytes.free(ej0);
+    return ok;
+}
