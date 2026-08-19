@@ -170,6 +170,42 @@ fn reflect(brev: ptr, e: ptr, out: ptr): void {
 }
 fn cl(a: ulong, b: ulong, tmp: ptr): void { simd.storeU64x2(tmp, 0, simd.clmulU64x2(a as long, b as long)); }
 
+// ---- GHASH 4-way key-power aggregation. The GHASH reduction (mod x^128+x^7+x^2+x+1) is GF(2)-linear, so
+// reduce(P_a ^ P_b) == reduce(P_a) ^ reduce(P_b). That lets a group of blocks be multiplied by the
+// precomputed key powers, the UN-reduced 256-bit carryless products XOR-summed, and the sum reduced ONCE:
+//   y' = (y ^ X0)*H^4 ^ X1*H^3 ^ X2*H^2 ^ X3*H^1   (Horner over X0..X3, expanded)
+// This replaces 4 reductions (3 clmuls each) with 1, so per-block clmul count drops from 6 to ~3.75.
+
+// Multiply the std-order 16-byte block at buf+off by the std-order key power hb, XOR the un-reduced 256-bit
+// carryless product (Karatsuba: lo, hi, middle) into the 32-byte accumulator acc. t is 16-byte scratch.
+fn clmulAccBuf(buf: ptr, off: int, hb: ptr, acc: ptr, t: ptr): void {
+    let le = endian.Endian.little;
+    let a0 = mem.load<ulong>(buf, off, le); let a1 = mem.load<ulong>(buf, off + 8, le);
+    let b0 = mem.load<ulong>(hb, 0, le); let b1 = mem.load<ulong>(hb, 8, le);
+    cl(a0, b0, t); let l0 = mem.load<ulong>(t, 0, le); let l1 = mem.load<ulong>(t, 8, le);
+    cl(a1, b1, t); let h0 = mem.load<ulong>(t, 0, le); let h1 = mem.load<ulong>(t, 8, le);
+    cl(a0 ^ a1, b0 ^ b1, t); let m0 = mem.load<ulong>(t, 0, le) ^ l0 ^ h0; let m1 = mem.load<ulong>(t, 8, le) ^ l1 ^ h1;
+    let p0 = l0; let p1 = l1 ^ m0; let p2 = h0 ^ m1; let p3 = h1;
+    mem.store<ulong>(acc, 0, mem.load<ulong>(acc, 0, le) ^ p0, le);
+    mem.store<ulong>(acc, 8, mem.load<ulong>(acc, 8, le) ^ p1, le);
+    mem.store<ulong>(acc, 16, mem.load<ulong>(acc, 16, le) ^ p2, le);
+    mem.store<ulong>(acc, 24, mem.load<ulong>(acc, 24, le) ^ p3, le);
+}
+
+// Reduce the accumulated 256-bit product in acc (32 bytes) mod P into the 16-byte out (std order). Same
+// fold as gfmul's reduction (constant 135 = 0x87), applied once to the summed products. t is 16-byte scratch.
+fn reduceAcc(acc: ptr, out: ptr, t: ptr): void {
+    let le = endian.Endian.little;
+    let p0 = mem.load<ulong>(acc, 0, le); let p1 = mem.load<ulong>(acc, 8, le);
+    let p2 = mem.load<ulong>(acc, 16, le); let p3 = mem.load<ulong>(acc, 24, le);
+    cl(p2, 135 as ulong, t); let c0 = mem.load<ulong>(t, 0, le); let c1 = mem.load<ulong>(t, 8, le);
+    cl(p3, 135 as ulong, t); let d0 = mem.load<ulong>(t, 0, le); let d1 = mem.load<ulong>(t, 8, le);
+    let r0 = p0 ^ c0; let r1 = p1 ^ c1 ^ d0;
+    cl(d1, 135 as ulong, t); let o0 = mem.load<ulong>(t, 0, le);
+    r0 = r0 ^ o0;
+    mem.store<ulong>(out, 0, r0, le); mem.store<ulong>(out, 8, r1, le);
+}
+
 // (a * b) mod P over standard-order 16-byte operands, result to out (standard order). t is 16-byte scratch.
 fn gfmul(a: ptr, b: ptr, out: ptr, t: ptr): void {
     let le = endian.Endian.little;
@@ -204,6 +240,34 @@ fn ghUpdate(y: ptr, hStd: ptr, brev: ptr, data: ptr, len: int, t: ptr, scr: ptr,
     }
 }
 
+// Absorb len bytes into y using 4-way key-power aggregation. h2/h3/h4 are H^2/H^3/H^4 (std order),
+// precomputed by the caller. acc is 32-byte scratch, gb is a 64-byte group buffer, t/pad are 16-byte
+// scratch. Full 4-block groups aggregate to one reduction; the <4-block and partial tail use ghBlock.
+fn ghUpdateAgg(y: ptr, hStd: ptr, h2: ptr, h3: ptr, h4: ptr, brev: ptr, data: ptr, len: int,
+               acc: ptr, gb: ptr, t: ptr, pad: ptr): void {
+    let le = endian.Endian.little;
+    let i = 0;
+    while (len - i >= 64) {
+        // Reflect the 4 blocks into gb (std order), then fold the running y into block 0 only.
+        let j = 0; while (j < 64) { bytes.write_byte(gb, j, bytes.read_byte(brev, bytes.read_byte(data, i + j))); j = j + 1; }
+        let k = 0; while (k < 16) { bytes.write_byte(gb, k, bytes.read_byte(gb, k) ^ bytes.read_byte(y, k)); k = k + 1; }
+        mem.store<ulong>(acc, 0, 0 as ulong, le); mem.store<ulong>(acc, 8, 0 as ulong, le);
+        mem.store<ulong>(acc, 16, 0 as ulong, le); mem.store<ulong>(acc, 24, 0 as ulong, le);
+        clmulAccBuf(gb, 0, h4, acc, t);      // (y ^ X0) * H^4
+        clmulAccBuf(gb, 16, h3, acc, t);     // X1 * H^3
+        clmulAccBuf(gb, 32, h2, acc, t);     // X2 * H^2
+        clmulAccBuf(gb, 48, hStd, acc, t);   // X3 * H^1
+        reduceAcc(acc, y, t);
+        i = i + 64;
+    }
+    while (len - i >= 16) { ghBlock(y, hStd, brev, data, i, t, gb); i = i + 16; }
+    let rem = len - i;
+    if (rem > 0) {
+        let k = 0; while (k < 16) { bytes.write_byte(pad, k, if (k < rem) bytes.read_byte(data, i + k) else 0); k = k + 1; }
+        ghBlock(y, hStd, brev, pad, 0, t, gb);
+    }
+}
+
 fn computeJ0(hStd: ptr, brev: ptr, iv: ptr, ivLen: int, j0: ptr, t: ptr, scr: ptr, pad: ptr): void {
     if (ivLen == 12) {
         let i = 0; while (i < 12) { bytes.write_byte(j0, i, bytes.read_byte(iv, i)); i = i + 1; }
@@ -220,13 +284,19 @@ fn computeJ0(hStd: ptr, brev: ptr, iv: ptr, ivLen: int, j0: ptr, t: ptr, scr: pt
 }
 fn computeS(hStd: ptr, brev: ptr, aad: ptr, aadLen: int, ct: ptr, ctLen: int, s: ptr, t: ptr, scr: ptr, pad: ptr): void {
     let y = bytes.alloc(16); let k = 0; while (k < 16) { bytes.write_byte(y, k, 0); k = k + 1; }
-    ghUpdate(y, hStd, brev, aad, aadLen, t, scr, pad);
-    ghUpdate(y, hStd, brev, ct, ctLen, t, scr, pad);
+    // Precompute the key powers H^2/H^3/H^4 once per record (3 gfmuls, negligible vs the block count) so the
+    // bulk absorb below aggregates 4 blocks per reduction.
+    let h2 = bytes.alloc(16); gfmul(hStd, hStd, h2, t);
+    let h3 = bytes.alloc(16); gfmul(h2, hStd, h3, t);
+    let h4 = bytes.alloc(16); gfmul(h3, hStd, h4, t);
+    let acc = bytes.alloc(32); let gb = bytes.alloc(64);
+    ghUpdateAgg(y, hStd, h2, h3, h4, brev, aad, aadLen, acc, gb, t, pad);
+    ghUpdateAgg(y, hStd, h2, h3, h4, brev, ct, ctLen, acc, gb, t, pad);
     let lens = bytes.alloc(16);
     putLen64(lens, 0, (aadLen as long) * 8); putLen64(lens, 8, (ctLen as long) * 8);
     ghBlock(y, hStd, brev, lens, 0, t, scr);
     reflect(brev, y, s);
-    bytes.free(y); bytes.free(lens);
+    bytes.free(y); bytes.free(lens); bytes.free(h2); bytes.free(h3); bytes.free(h4); bytes.free(acc); bytes.free(gb);
 }
 
 
