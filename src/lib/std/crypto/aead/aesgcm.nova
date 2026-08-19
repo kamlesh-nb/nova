@@ -124,6 +124,7 @@ pub struct GcmContext {
     pub hwRk: ptr,
     pub hwHStd: ptr,
     pub hwBrev: ptr,
+    pub hwHpows: ptr,   // cached 64B H^1..H^4 table for the fused-seal GHASH aggregation
 
     pub fn create(key: ptr, keyLen: int): GcmContext {
         let c = bytes.new_with_allocator<GcmContext>(allocator.globalAllocator());
@@ -136,9 +137,10 @@ pub struct GcmContext {
             c.hwRk = bytes.alloc(240);
             c.hwHStd = bytes.alloc(16);
             c.hwBrev = bytes.alloc(256);
-            c.hwNr = aesgcmhw.setup(key, keyLen, c.hwRk, c.hwHStd, c.hwBrev);
+            c.hwHpows = bytes.alloc(64);
+            c.hwNr = aesgcmhw.setup(key, keyLen, c.hwRk, c.hwHStd, c.hwBrev, c.hwHpows);
         } else {
-            c.hwNr = 0; c.hwRk = 0; c.hwHStd = 0; c.hwBrev = 0;
+            c.hwNr = 0; c.hwRk = 0; c.hwHStd = 0; c.hwBrev = 0; c.hwHpows = 0;
         }
         return c;
     }
@@ -147,7 +149,7 @@ pub struct GcmContext {
     pub fn seal(self: GcmContext, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
                 pt: ptr, ptLen: int, ctOut: ptr, tagOut: ptr): void {
         if (self.hwAes) {
-            aesgcmhw.sealWith(self.hwRk, self.hwNr, self.hwHStd, self.hwBrev,
+            aesgcmhw.sealWith(self.hwRk, self.hwNr, self.hwHStd, self.hwBrev, self.hwHpows,
                               iv, ivLen, aad, aadLen, pt, ptLen, ctOut, tagOut);
             return;
         }
@@ -213,6 +215,7 @@ pub struct GcmContext {
         if (self.hwRk != 0) { bytes.free(self.hwRk); self.hwRk = 0; }
         if (self.hwHStd != 0) { bytes.free(self.hwHStd); self.hwHStd = 0; }
         if (self.hwBrev != 0) { bytes.free(self.hwBrev); self.hwBrev = 0; }
+        if (self.hwHpows != 0) { bytes.free(self.hwHpows); self.hwHpows = 0; }
     }
 }
 

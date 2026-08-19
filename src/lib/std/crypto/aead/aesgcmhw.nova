@@ -384,20 +384,30 @@ fn computeS(hStd: ptr, brev: ptr, aad: ptr, aadLen: int, ct: ptr, ctLen: int, s:
 // ---- Cached context API: expand the key + GHASH setup ONCE, then seal/open many records. TLS holds a
 // GcmContext across a traffic key, so the setup (key schedule, H, brev table, H in std order) is done once.
 
-// Prepare cached state for `key` (keyLen 16 or 32) into caller buffers: rk (240), hStd (16), brev (256).
-// Returns Nr (10 or 14).
-pub fn setup(key: ptr, keyLen: int, rk: ptr, hStd: ptr, brev: ptr): int {
+// Prepare cached state for `key` (keyLen 16 or 32) into caller buffers: rk (240), hStd (16), brev (256),
+// hpows (64 = H^1..H^4 std order, for the fused-seal GHASH aggregation — key-dependent, so computed ONCE
+// here rather than per record). Returns Nr (10 or 14).
+pub fn setup(key: ptr, keyLen: int, rk: ptr, hStd: ptr, brev: ptr, hpows: ptr): int {
     let nr = expandKey(key, keyLen, rk);
     let zero = bytes.alloc(16); let i = 0; while (i < 16) { bytes.write_byte(zero, i, 0); i = i + 1; }
     let h = bytes.alloc(16); encBlock(rk, nr, zero, h);
     buildBrev(brev);
     reflect(brev, h, hStd);
-    bytes.free(zero); bytes.free(h);
+    // H^1..H^4 into hpows (ping-pong cur; nothing leaks).
+    let t = bytes.alloc(16); let cur = bytes.alloc(16); let nxt = bytes.alloc(16);
+    let z = 0; while (z < 16) { let hv = bytes.read_byte(hStd, z); bytes.write_byte(hpows, z, hv); bytes.write_byte(cur, z, hv); z = z + 1; }
+    let hk = 1;
+    while (hk < 4) {
+        gfmul(cur, hStd, nxt, t);
+        z = 0; while (z < 16) { let hv = bytes.read_byte(nxt, z); bytes.write_byte(hpows, hk * 16 + z, hv); bytes.write_byte(cur, z, hv); z = z + 1; }
+        hk = hk + 1;
+    }
+    bytes.free(zero); bytes.free(h); bytes.free(t); bytes.free(cur); bytes.free(nxt);
     return nr;
 }
 
-// Seal one record with the cached state (no key re-expansion).
-pub fn sealWith(rk: ptr, nr: int, hStd: ptr, brev: ptr, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
+// Seal one record with the cached state (no key re-expansion). hpows = cached 64B H^1..H^4 table (from setup).
+pub fn sealWith(rk: ptr, nr: int, hStd: ptr, brev: ptr, hpows: ptr, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
                 pt: ptr, ptLen: int, ctOut: ptr, tagOut: ptr): void {
     let t = bytes.alloc(16); let scr = bytes.alloc(16); let pad = bytes.alloc(16);
     let j0 = bytes.alloc(16); computeJ0(hStd, brev, iv, ivLen, j0, t, scr, pad);
@@ -406,20 +416,11 @@ pub fn sealWith(rk: ptr, nr: int, hStd: ptr, brev: ptr, iv: ptr, ivLen: int, aad
     let s = bytes.alloc(16);
     if (nova_has_asm_crypto() == 1) {
         // Fused stitched path: GHASH the AAD, then encrypt+GHASH the plaintext's full 64-byte groups in one
-        // interleaved asm loop, then finish the <64 tail (CTR + GHASH) and the length block, all in std order.
+        // interleaved asm loop (using the cached H-power table), then the <64 tail + length block.
         let y = bytes.alloc(16); let z = 0; while (z < 16) { bytes.write_byte(y, z, 0); z = z + 1; }
         nova_ghash(hStd, aad, aadLen, y);
-        // H-power table {H, H^2, H^3, H^4} for the aggregated GHASH inside the fused loop.
-        let hp = bytes.alloc(64);
-        let h2 = bytes.alloc(16); gfmul(hStd, hStd, h2, t);
-        let h3 = bytes.alloc(16); gfmul(h2, hStd, h3, t);
-        let h4 = bytes.alloc(16); gfmul(h3, hStd, h4, t);
-        z = 0; while (z < 16) { bytes.write_byte(hp, z, bytes.read_byte(hStd, z));
-            bytes.write_byte(hp, 16 + z, bytes.read_byte(h2, z));
-            bytes.write_byte(hp, 32 + z, bytes.read_byte(h3, z));
-            bytes.write_byte(hp, 48 + z, bytes.read_byte(h4, z)); z = z + 1; }
         let fused = ptLen - (ptLen % 64);
-        nova_gcm_seal(rk, nr, hp, icb, pt, fused, ctOut, y);
+        nova_gcm_seal(rk, nr, hpows, icb, pt, fused, ctOut, y);
         let rem = ptLen - fused;
         if (rem > 0) {
             nova_aes_ctr(rk, nr, icb, (pt as long + fused) as ptr, rem, (ctOut as long + fused) as ptr);
@@ -431,7 +432,7 @@ pub fn sealWith(rk: ptr, nr: int, hStd: ptr, brev: ptr, iv: ptr, ivLen: int, aad
         reflect(brev, y, s);
         let ej0a = bytes.alloc(16); encBlock(rk, nr, j0, ej0a);
         i = 0; while (i < 16) { bytes.write_byte(tagOut, i, bytes.read_byte(s, i) ^ bytes.read_byte(ej0a, i)); i = i + 1; }
-        bytes.free(y); bytes.free(hp); bytes.free(h2); bytes.free(h3); bytes.free(h4); bytes.free(lens); bytes.free(ej0a);
+        bytes.free(y); bytes.free(lens); bytes.free(ej0a);
         bytes.free(t); bytes.free(scr); bytes.free(pad); bytes.free(j0); bytes.free(icb); bytes.free(s);
         return;
     }
@@ -465,18 +466,18 @@ pub fn openWith(rk: ptr, nr: int, hStd: ptr, brev: ptr, iv: ptr, ivLen: int, aad
 // One-shot seal: set up + seal one record + tear down. keyLen 16 or 32.
 pub fn seal(key: ptr, keyLen: int, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
             pt: ptr, ptLen: int, ctOut: ptr, tagOut: ptr): void {
-    let rk = bytes.alloc(240); let hStd = bytes.alloc(16); let brev = bytes.alloc(256);
-    let nr = setup(key, keyLen, rk, hStd, brev);
-    sealWith(rk, nr, hStd, brev, iv, ivLen, aad, aadLen, pt, ptLen, ctOut, tagOut);
-    bytes.free(rk); bytes.free(hStd); bytes.free(brev);
+    let rk = bytes.alloc(240); let hStd = bytes.alloc(16); let brev = bytes.alloc(256); let hpows = bytes.alloc(64);
+    let nr = setup(key, keyLen, rk, hStd, brev, hpows);
+    sealWith(rk, nr, hStd, brev, hpows, iv, ivLen, aad, aadLen, pt, ptLen, ctOut, tagOut);
+    bytes.free(rk); bytes.free(hStd); bytes.free(brev); bytes.free(hpows);
 }
 
 // One-shot open.
 pub fn open(key: ptr, keyLen: int, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
             ct: ptr, ctLen: int, tag: ptr, ptOut: ptr): bool {
-    let rk = bytes.alloc(240); let hStd = bytes.alloc(16); let brev = bytes.alloc(256);
-    let nr = setup(key, keyLen, rk, hStd, brev);
+    let rk = bytes.alloc(240); let hStd = bytes.alloc(16); let brev = bytes.alloc(256); let hpows = bytes.alloc(64);
+    let nr = setup(key, keyLen, rk, hStd, brev, hpows);
     let ok = openWith(rk, nr, hStd, brev, iv, ivLen, aad, aadLen, ct, ctLen, tag, ptOut);
-    bytes.free(rk); bytes.free(hStd); bytes.free(brev);
+    bytes.free(rk); bytes.free(hStd); bytes.free(brev); bytes.free(hpows);
     return ok;
 }
