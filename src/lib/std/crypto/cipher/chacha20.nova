@@ -49,44 +49,79 @@ fn qr(s: ptr, a: int, b: int, c: int, d: int): void {
 }
 
 // Produce one 64-byte keystream block for the given key (32 bytes), block counter, and nonce (12
-// bytes), writing it to out.
+// bytes), writing it to out. REGISTER-RESIDENT: the 16 state words live in local variables so the 20
+// rounds run in registers, with NO per-block heap buffers and NO 4-bytes-per-word memory assembly (the
+// previous version alloc'd two 64-byte scratch buffers PER 64-byte block and rebuilt every word from 4
+// bytes on every quarter-round). Semantics are byte-for-byte identical; KAT-gated by conformance
+// 219_chacha_poly / 220_chachapoly_aead and every TLS ChaCha20-Poly1305 case.
 pub fn keystreamBlock(key: ptr, counter: ulong, nonce: ptr, out: ptr): void {
-    let s = bytes.alloc(64);
-    // "expand 32-byte k" constants.
-    putLe(s, 0, 0x61707865);
-    putLe(s, 4, 0x3320646e);
-    putLe(s, 8, 0x79622d32);
-    putLe(s, 12, 0x6b206574);
-    let i = 0;
-    while (i < 8) { putLe(s, (4 + i) * 4, leWord(key, i * 4)); i = i + 1; }
-    putLe(s, 12 * 4, counter & MASK32);
-    i = 0;
-    while (i < 3) { putLe(s, (13 + i) * 4, leWord(nonce, i * 4)); i = i + 1; }
+    // Initial state (RFC 8439 2.3): 4 "expand 32-byte k" constants, 8 key words, 1 counter, 3 nonce words.
+    let j0: ulong = 0x61707865; let j1: ulong = 0x3320646e; let j2: ulong = 0x79622d32; let j3: ulong = 0x6b206574;
+    let j4 = leWord(key, 0);    let j5 = leWord(key, 4);    let j6 = leWord(key, 8);    let j7 = leWord(key, 12);
+    let j8 = leWord(key, 16);   let j9 = leWord(key, 20);   let j10 = leWord(key, 24);  let j11 = leWord(key, 28);
+    let j12: ulong = counter & MASK32;
+    let j13 = leWord(nonce, 0); let j14 = leWord(nonce, 4); let j15 = leWord(nonce, 8);
 
-    let w = bytes.alloc(64);
-    i = 0;
-    while (i < 64) { bytes.write_byte(w, i, bytes.read_byte(s, i)); i = i + 1; }
+    let x0 = j0;   let x1 = j1;   let x2 = j2;   let x3 = j3;
+    let x4 = j4;   let x5 = j5;   let x6 = j6;   let x7 = j7;
+    let x8 = j8;   let x9 = j9;   let x10 = j10; let x11 = j11;
+    let x12 = j12; let x13 = j13; let x14 = j14; let x15 = j15;
 
     let r = 0;
     while (r < 10) {
-        qr(w, 0, 4, 8, 12);
-        qr(w, 1, 5, 9, 13);
-        qr(w, 2, 6, 10, 14);
-        qr(w, 3, 7, 11, 15);
-        qr(w, 0, 5, 10, 15);
-        qr(w, 1, 6, 11, 12);
-        qr(w, 2, 7, 8, 13);
-        qr(w, 3, 4, 9, 14);
+        // Column rounds: QR(0,4,8,12) QR(1,5,9,13) QR(2,6,10,14) QR(3,7,11,15)
+        x0 = (x0 + x4) & MASK32;   x12 = rotl(x12 ^ x0, 16);
+        x8 = (x8 + x12) & MASK32;  x4 = rotl(x4 ^ x8, 12);
+        x0 = (x0 + x4) & MASK32;   x12 = rotl(x12 ^ x0, 8);
+        x8 = (x8 + x12) & MASK32;  x4 = rotl(x4 ^ x8, 7);
+
+        x1 = (x1 + x5) & MASK32;   x13 = rotl(x13 ^ x1, 16);
+        x9 = (x9 + x13) & MASK32;  x5 = rotl(x5 ^ x9, 12);
+        x1 = (x1 + x5) & MASK32;   x13 = rotl(x13 ^ x1, 8);
+        x9 = (x9 + x13) & MASK32;  x5 = rotl(x5 ^ x9, 7);
+
+        x2 = (x2 + x6) & MASK32;   x14 = rotl(x14 ^ x2, 16);
+        x10 = (x10 + x14) & MASK32; x6 = rotl(x6 ^ x10, 12);
+        x2 = (x2 + x6) & MASK32;   x14 = rotl(x14 ^ x2, 8);
+        x10 = (x10 + x14) & MASK32; x6 = rotl(x6 ^ x10, 7);
+
+        x3 = (x3 + x7) & MASK32;   x15 = rotl(x15 ^ x3, 16);
+        x11 = (x11 + x15) & MASK32; x7 = rotl(x7 ^ x11, 12);
+        x3 = (x3 + x7) & MASK32;   x15 = rotl(x15 ^ x3, 8);
+        x11 = (x11 + x15) & MASK32; x7 = rotl(x7 ^ x11, 7);
+
+        // Diagonal rounds: QR(0,5,10,15) QR(1,6,11,12) QR(2,7,8,13) QR(3,4,9,14)
+        x0 = (x0 + x5) & MASK32;   x15 = rotl(x15 ^ x0, 16);
+        x10 = (x10 + x15) & MASK32; x5 = rotl(x5 ^ x10, 12);
+        x0 = (x0 + x5) & MASK32;   x15 = rotl(x15 ^ x0, 8);
+        x10 = (x10 + x15) & MASK32; x5 = rotl(x5 ^ x10, 7);
+
+        x1 = (x1 + x6) & MASK32;   x12 = rotl(x12 ^ x1, 16);
+        x11 = (x11 + x12) & MASK32; x6 = rotl(x6 ^ x11, 12);
+        x1 = (x1 + x6) & MASK32;   x12 = rotl(x12 ^ x1, 8);
+        x11 = (x11 + x12) & MASK32; x6 = rotl(x6 ^ x11, 7);
+
+        x2 = (x2 + x7) & MASK32;   x13 = rotl(x13 ^ x2, 16);
+        x8 = (x8 + x13) & MASK32;  x7 = rotl(x7 ^ x8, 12);
+        x2 = (x2 + x7) & MASK32;   x13 = rotl(x13 ^ x2, 8);
+        x8 = (x8 + x13) & MASK32;  x7 = rotl(x7 ^ x8, 7);
+
+        x3 = (x3 + x4) & MASK32;   x14 = rotl(x14 ^ x3, 16);
+        x9 = (x9 + x14) & MASK32;  x4 = rotl(x4 ^ x9, 12);
+        x3 = (x3 + x4) & MASK32;   x14 = rotl(x14 ^ x3, 8);
+        x9 = (x9 + x14) & MASK32;  x4 = rotl(x4 ^ x9, 7);
+
         r = r + 1;
     }
 
-    i = 0;
-    while (i < 16) {
-        putLe(out, i * 4, (leWord(w, i * 4) + leWord(s, i * 4)) & MASK32);
-        i = i + 1;
-    }
-    bytes.free(s);
-    bytes.free(w);
+    putLe(out, 0,  (x0 + j0) & MASK32);   putLe(out, 4,  (x1 + j1) & MASK32);
+    putLe(out, 8,  (x2 + j2) & MASK32);   putLe(out, 12, (x3 + j3) & MASK32);
+    putLe(out, 16, (x4 + j4) & MASK32);   putLe(out, 20, (x5 + j5) & MASK32);
+    putLe(out, 24, (x6 + j6) & MASK32);   putLe(out, 28, (x7 + j7) & MASK32);
+    putLe(out, 32, (x8 + j8) & MASK32);   putLe(out, 36, (x9 + j9) & MASK32);
+    putLe(out, 40, (x10 + j10) & MASK32); putLe(out, 44, (x11 + j11) & MASK32);
+    putLe(out, 48, (x12 + j12) & MASK32); putLe(out, 52, (x13 + j13) & MASK32);
+    putLe(out, 56, (x14 + j14) & MASK32); putLe(out, 60, (x15 + j15) & MASK32);
 }
 
 // Encrypt (or decrypt; ChaCha20 is symmetric) len bytes at `in` to out, XORing the keystream that

@@ -101,7 +101,7 @@ pub fn buildClientHelloEx(random: ptr, sessionId: ptr, ephPub: ptr, ephPubP256: 
     i = 0;
     while (i < 32) { bytes.write_byte(out, p + i, bytes.read_byte(sessionId, i)); i = i + 1; }
     p = p + 32;
-    p = putHex(out, p, "0006130113021303");        // cipher_suites: AES-128-GCM-SHA256, AES-256-GCM-SHA384, CHACHA20-POLY1305-SHA256
+    p = putHex(out, p, "0006130113021303");        // cipher_suites: AES-128-GCM-SHA256, AES-256-GCM-SHA384, CHACHA20-POLY1305-SHA256. Order is fixed (resumption/0-RTT binder KATs hash these exact bytes); throughput preference is enforced SERVER-side instead (tlsServer prefers ChaCha), which is what real servers honour.
     p = putHex(out, p, "0100");                    // legacy_compression_methods: null
 
     let extLenPos = p; p = p + 2;                  // extensions length (backpatched)
