@@ -4,6 +4,8 @@
 // for register-resident crypto/compression inner loops. Struct fields are a separate slice.
 import bytes;
 import assert;
+import mem.endian;
+import mem.memory;
 
 // vector parameter + vector return
 fn dbl(v: u8x16): u8x16 { return simd.addU8x16(v, v); }
@@ -36,6 +38,22 @@ fn vec_u64x2_roundtrip(): void {
     let r: u64x2 = xorPair(simd.loadU64x2(a, 0), simd.loadU64x2(b, 0));
     let o = bytes.alloc(16); simd.storeU64x2(o, 0, r);
     i = 0; while (i < 16) { assert.equalInt(bytes.read_byte(o, i), (i ^ (255 - i)) & 0xff); i = i + 1; }
+}
+
+@test
+fn vec_bitcast_and_lane(): void {
+    // FR-simd-L6 bitcast + FR-simd-L5 lane extract: view a u8x16 as u64x2 and pull each 64-bit half, then
+    // round-trip back to u8x16 — a pure reinterpret of the same 128 bits, no data movement.
+    let b = bytes.alloc(16); let i = 0; while (i < 16) { bytes.write_byte(b, i, (i * 17 + 3) & 0xff); i = i + 1; }
+    let v8: u8x16 = simd.loadU8x16(b, 0);
+    let v64: u64x2 = simd.castU64x2(v8);
+    let lo = simd.laneU64x2(v64, 0); let hi = simd.laneU64x2(v64, 1);
+    // reconstruct the two 8-byte halves from the extracted lanes and compare
+    let chk = bytes.alloc(16); mem.store<ulong>(chk, 0, lo as ulong, endian.Endian.little); mem.store<ulong>(chk, 8, hi as ulong, endian.Endian.little);
+    i = 0; while (i < 16) { assert.equalInt(bytes.read_byte(chk, i), bytes.read_byte(b, i)); i = i + 1; }
+    let back: u8x16 = simd.castU8x16(v64);
+    let o = bytes.alloc(16); simd.storeU8x16(o, 0, back);
+    i = 0; while (i < 16) { assert.equalInt(bytes.read_byte(o, i), bytes.read_byte(b, i)); i = i + 1; }
 }
 
 @test

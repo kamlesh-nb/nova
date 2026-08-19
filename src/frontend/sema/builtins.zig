@@ -94,6 +94,12 @@ pub const table = [_]Builtin{
     // register-level alternative to store+reload for pulling a clmul product's lo/hi halves back to scalars.
     .{ .receiver = "simd", .name = "laneU64x2", .ret = .long },
 
+    // FR-simd-L6: bitcast a 128-bit vector to another lane shape (no data movement). The suffix names the
+    // RESULT shape, so castU64x2(u8x16) reinterprets the 16 bytes as two u64 lanes and vice-versa.
+    .{ .receiver = "simd", .name = "castU64x2", .ret = .vec_u64x2 },
+    .{ .receiver = "simd", .name = "castU8x16", .ret = .vec_u8x16 },
+    .{ .receiver = "simd", .name = "castU32x4", .ret = .vec_u32x4 },
+
     // FR-mem Tier 3: raw-address XOR. The generic mem builtins (load/store/rotl/rotr/ctz/clz/bswap) are
     // typed by the special-case in infer.zig; xorBytes is non-generic, so it lives in this table.
     .{ .receiver = "mem", .name = "xorBytes", .ret = .void_ },

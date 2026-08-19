@@ -511,6 +511,14 @@ pub fn compileIntSimd(self: *LlvmCompiler, field: []const u8, args: []const ast.
         if (std.mem.eql(u8, op, "shl")) return core.LLVMBuildShl(self.builder, v, amt, "simd_shl");
         return core.LLVMBuildLShr(self.builder, v, amt, "simd_shr"); // logical (unsigned lanes)
     }
+    if (std.mem.eql(u8, op, "cast")) {
+        // FR-simd-L6: reinterpret a 128-bit vector as another lane shape (u8x16 <-> u64x2 <-> u32x4) with a
+        // pure bitcast (no data movement). Lets the GHASH path hold a block as u8x16 for the SIMD reflect and
+        // then view it as u64x2 to feed clmul lanes, all in a register. The result lane shape is vt (from the
+        // U..x.. suffix on the call), so simd.castU64x2(u8x16v) yields a u64x2 over the same 128 bits.
+        const v = try self.compileExpression(args[0]);
+        return core.LLVMBuildBitCast(self.builder, v, vt, "simd_cast");
+    }
     if (std.mem.eql(u8, op, "lane")) {
         // FR-simd-L5: extract lane `idx` of the vector as a Nova scalar (zero-extended to the i64 value slot).
         // This is the register-level counterpart to store+reload: it pulls a lane straight out of a vector

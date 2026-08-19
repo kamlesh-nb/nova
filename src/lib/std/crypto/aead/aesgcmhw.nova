@@ -174,15 +174,17 @@ fn reflect(brev: ptr, e: ptr, out: ptr): void {
 // This replaces the 16-iteration scalar brev table walk on the GHASH hot path (per absorbed block). It does
 // NOT use an LLVM byte-shuffle/bitreverse intrinsic: those resolve to the wrong vector width (v8i8) via the
 // C-API overload path in this toolchain, silently zeroing the upper 8 lanes.
-fn reflectBlk(e: ptr, eoff: int, out: ptr, ooff: int): void {
-    let v = simd.loadU8x16(e, eoff);
+// Register-resident form of the same reflection: takes the block as a u8x16 VALUE and returns the reflected
+// block as a value, so it stays in a vector register (no store to a buffer + reload). Used by the GHASH hot
+// path, which then casts to u64x2 to feed clmul lanes. FR-simd-L1 (vector params/returns) makes this legal.
+fn reflectVec(v: u8x16): u8x16 {
     let mF0 = simd.splatU8x16(0xF0); let m0F = simd.splatU8x16(0x0F);
     let mCC = simd.splatU8x16(0xCC); let m33 = simd.splatU8x16(0x33);
     let mAA = simd.splatU8x16(0xAA); let m55 = simd.splatU8x16(0x55);
-    v = simd.orU8x16(simd.shrU8x16(simd.andU8x16(v, mF0), 4), simd.shlU8x16(simd.andU8x16(v, m0F), 4)); // swap nibbles
-    v = simd.orU8x16(simd.shrU8x16(simd.andU8x16(v, mCC), 2), simd.shlU8x16(simd.andU8x16(v, m33), 2)); // swap bit-pairs
-    v = simd.orU8x16(simd.shrU8x16(simd.andU8x16(v, mAA), 1), simd.shlU8x16(simd.andU8x16(v, m55), 1)); // swap adjacent bits
-    simd.storeU8x16(out, ooff, v);
+    let r = simd.orU8x16(simd.shrU8x16(simd.andU8x16(v, mF0), 4), simd.shlU8x16(simd.andU8x16(v, m0F), 4)); // swap nibbles
+    r = simd.orU8x16(simd.shrU8x16(simd.andU8x16(r, mCC), 2), simd.shlU8x16(simd.andU8x16(r, m33), 2)); // swap bit-pairs
+    r = simd.orU8x16(simd.shrU8x16(simd.andU8x16(r, mAA), 1), simd.shlU8x16(simd.andU8x16(r, m55), 1)); // swap adjacent bits
+    return r;
 }
 
 // ---- GHASH 4-way key-power aggregation. The GHASH reduction (mod x^128+x^7+x^2+x+1) is GF(2)-linear, so
@@ -193,12 +195,14 @@ fn reflectBlk(e: ptr, eoff: int, out: ptr, ooff: int): void {
 
 // Multiply the std-order 16-byte block at buf+off by the std-order key power hb, XOR the un-reduced 256-bit
 // carryless product (Karatsuba: lo, hi, middle) into the 32-byte accumulator acc. t is 16-byte scratch.
-fn clmulAccBuf(buf: ptr, off: int, hb: ptr, acc: ptr, t: ptr): void {
+// Multiply the std-order block held in the u8x16 VALUE a8 by the std-order key power hb, XOR the un-reduced
+// 256-bit product into the 32-byte accumulator acc. The block arrives in a register (from reflectVec) and is
+// viewed as u64x2 with a bitcast to feed clmul lanes — no reflect-to-buffer + reload.
+fn clmulAccV(a8: u8x16, hb: ptr, acc: ptr): void {
     let le = endian.Endian.little;
-    let a0 = mem.load<ulong>(buf, off, le); let a1 = mem.load<ulong>(buf, off + 8, le);
+    let av = simd.castU64x2(a8);
+    let a0 = simd.laneU64x2(av, 0) as ulong; let a1 = simd.laneU64x2(av, 1) as ulong;
     let b0 = mem.load<ulong>(hb, 0, le); let b1 = mem.load<ulong>(hb, 8, le);
-    // Karatsuba: keep each clmul product in a vector register and pull its lo/hi halves with laneU64x2,
-    // rather than storing to a scratch buffer and reloading (no per-multiply memory traffic).
     let lp = simd.clmulU64x2(a0 as long, b0 as long);
     let l0 = simd.laneU64x2(lp, 0) as ulong; let l1 = simd.laneU64x2(lp, 1) as ulong;
     let hp = simd.clmulU64x2(a1 as long, b1 as long);
@@ -210,6 +214,30 @@ fn clmulAccBuf(buf: ptr, off: int, hb: ptr, acc: ptr, t: ptr): void {
     mem.store<ulong>(acc, 8, mem.load<ulong>(acc, 8, le) ^ p1, le);
     mem.store<ulong>(acc, 16, mem.load<ulong>(acc, 16, le) ^ p2, le);
     mem.store<ulong>(acc, 24, mem.load<ulong>(acc, 24, le) ^ p3, le);
+}
+
+// Single-block y = (a8) * b, reduced, into out. a8 is the std-order block in a register (reflected + folded);
+// b is a std-order 16-byte operand (H) in memory. The register-resident counterpart of gfmul for ghBlock.
+fn gfmulVec(a8: u8x16, b: ptr, out: ptr): void {
+    let le = endian.Endian.little;
+    let av = simd.castU64x2(a8);
+    let a0 = simd.laneU64x2(av, 0) as ulong; let a1 = simd.laneU64x2(av, 1) as ulong;
+    let b0 = mem.load<ulong>(b, 0, le); let b1 = mem.load<ulong>(b, 8, le);
+    let lp = simd.clmulU64x2(a0 as long, b0 as long);
+    let l0 = simd.laneU64x2(lp, 0) as ulong; let l1 = simd.laneU64x2(lp, 1) as ulong;
+    let hp = simd.clmulU64x2(a1 as long, b1 as long);
+    let h0 = simd.laneU64x2(hp, 0) as ulong; let h1 = simd.laneU64x2(hp, 1) as ulong;
+    let mp = simd.clmulU64x2((a0 ^ a1) as long, (b0 ^ b1) as long);
+    let m0 = (simd.laneU64x2(mp, 0) as ulong) ^ l0 ^ h0; let m1 = (simd.laneU64x2(mp, 1) as ulong) ^ l1 ^ h1;
+    let p0 = l0; let p1 = l1 ^ m0; let p2 = h0 ^ m1; let p3 = h1;
+    let cp = simd.clmulU64x2(p2 as long, 135 as long);
+    let c0 = simd.laneU64x2(cp, 0) as ulong; let c1 = simd.laneU64x2(cp, 1) as ulong;
+    let dp = simd.clmulU64x2(p3 as long, 135 as long);
+    let d0 = simd.laneU64x2(dp, 0) as ulong; let d1 = simd.laneU64x2(dp, 1) as ulong;
+    let r0 = p0 ^ c0; let r1 = p1 ^ c1 ^ d0;
+    let op = simd.clmulU64x2(d1 as long, 135 as long); let o0 = simd.laneU64x2(op, 0) as ulong;
+    r0 = r0 ^ o0;
+    mem.store<ulong>(out, 0, r0, le); mem.store<ulong>(out, 8, r1, le);
 }
 
 // Reduce the accumulated 256-bit product in acc (32 bytes) mod P into the 16-byte out (std order). Same
@@ -251,11 +279,10 @@ fn gfmul(a: ptr, b: ptr, out: ptr, t: ptr): void {
 }
 
 // Absorb one 16-byte GCM block at data+off into the running std accumulator y (std order): y = (y ^ block)*H.
-// The reflect + xor-with-y is vectorised (reflectBlk then one SIMD xor); brev is no longer read here.
+// The block is reflected and folded with y entirely in registers, then multiplied register-resident.
 fn ghBlock(y: ptr, hStd: ptr, brev: ptr, data: ptr, off: int, t: ptr, scr: ptr): void {
-    reflectBlk(data, off, scr, 0);
-    simd.storeU8x16(scr, 0, simd.xorU8x16(simd.loadU8x16(scr, 0), simd.loadU8x16(y, 0)));
-    gfmul(scr, hStd, y, t);
+    let rv = simd.xorU8x16(reflectVec(simd.loadU8x16(data, off)), simd.loadU8x16(y, 0));
+    gfmulVec(rv, hStd, y);
 }
 // Absorb len bytes (16-byte blocks, zero-pad final).
 fn ghUpdate(y: ptr, hStd: ptr, brev: ptr, data: ptr, len: int, t: ptr, scr: ptr, pad: ptr): void {
@@ -276,16 +303,17 @@ fn ghUpdateAgg(y: ptr, hStd: ptr, h2: ptr, h3: ptr, h4: ptr, brev: ptr, data: pt
     let le = endian.Endian.little;
     let i = 0;
     while (len - i >= 64) {
-        // Reflect the 4 blocks into gb (std order) with SIMD, then fold the running y into block 0 only.
-        reflectBlk(data, i, gb, 0); reflectBlk(data, i + 16, gb, 16);
-        reflectBlk(data, i + 32, gb, 32); reflectBlk(data, i + 48, gb, 48);
-        simd.storeU8x16(gb, 0, simd.xorU8x16(simd.loadU8x16(gb, 0), simd.loadU8x16(y, 0)));
+        // Reflect the 4 blocks into REGISTERS (no group buffer), fold the running y into block 0 only.
+        let r0 = simd.xorU8x16(reflectVec(simd.loadU8x16(data, i)), simd.loadU8x16(y, 0));
+        let r1 = reflectVec(simd.loadU8x16(data, i + 16));
+        let r2 = reflectVec(simd.loadU8x16(data, i + 32));
+        let r3 = reflectVec(simd.loadU8x16(data, i + 48));
         mem.store<ulong>(acc, 0, 0 as ulong, le); mem.store<ulong>(acc, 8, 0 as ulong, le);
         mem.store<ulong>(acc, 16, 0 as ulong, le); mem.store<ulong>(acc, 24, 0 as ulong, le);
-        clmulAccBuf(gb, 0, h4, acc, t);      // (y ^ X0) * H^4
-        clmulAccBuf(gb, 16, h3, acc, t);     // X1 * H^3
-        clmulAccBuf(gb, 32, h2, acc, t);     // X2 * H^2
-        clmulAccBuf(gb, 48, hStd, acc, t);   // X3 * H^1
+        clmulAccV(r0, h4, acc);      // (y ^ X0) * H^4
+        clmulAccV(r1, h3, acc);      // X1 * H^3
+        clmulAccV(r2, h2, acc);      // X2 * H^2
+        clmulAccV(r3, hStd, acc);    // X3 * H^1
         reduceAcc(acc, y, t);
         i = i + 64;
     }
