@@ -15,6 +15,10 @@ import crypto.hash.sha256;
 import crypto.hash.sha512;
 import crypto.mac.hmac;
 
+// Runtime CPU-feature probe (crypto.cpp): 1 when the host has AES + CLMUL, so a fresh handshake prefers
+// the hardware-accelerated AES-GCM suites; on a software-only host it prefers ChaCha20-Poly1305 instead.
+extern("c") fn nova_cpu_has_aes(): int;
+
 fn at(b: ptr, off: int): ptr { return (b as long + off) as ptr; }
 fn w3(buf: ptr, off: int, v: int): void {
     bytes.write_byte(buf, off, (v >> 16) & 0xff);
@@ -257,9 +261,22 @@ pub fn processClientHello(self: TlsServer, ch: ptr, chLen: int): void {
             sp = sp + 4 + el;
         }
     }
+    // Fresh-handshake preference. With hardware AES (AES-NI + CLMUL) the hardware AES-GCM path (aesgcmhw,
+    // dispatched by GcmContext) is the fastest AEAD, so prefer AES-GCM. We pick AES-128-GCM (0x1301, the
+    // TLS 1.3 mandatory suite) FIRST rather than AES-256-GCM: 0x1301 is SHA-256, the same hash as the
+    // client's first-offered suite (`firstOffered`, 0x1301 here), which the resumption path reuses. If a
+    // fresh handshake issued a ticket under AES-256-GCM (0x1302, SHA-384) the resume-side firstOffered
+    // (SHA-256) would mismatch the ticket's transcript hash and break resumption (case 243). AES-256-GCM
+    // is still chosen when the client does not offer AES-128. Without hardware AES, this stack's AES is
+    // bitsliced constant-time software (~10x slower), so prefer ChaCha20-Poly1305 instead.
+    let hwAes = nova_cpu_has_aes() == 1;
     let chosen = 0;
     if (hasPsk) {
         chosen = firstOffered;
+    } else if (hwAes) {
+        if (off1301) { chosen = 0x1301; }
+        else if (off1302) { chosen = 0x1302; }
+        else if (off1303) { chosen = 0x1303; }
     } else if (off1303) {
         chosen = 0x1303;
     } else if (off1302) {

@@ -34,3 +34,29 @@ extern "C" void nova_getrandom(char *buf, long long n) {
   }
 }
 #endif
+
+// Runtime detection of the CPU's AES + carryless-multiply instructions, so the hardware AES-GCM
+// (crypto/aead/aesgcmhw, which lowers simd.aesenc/simd.clmul to those instructions) is only used when the
+// host actually has them; otherwise callers fall back to the constant-time bitsliced AES + software GHASH.
+// Returns 1 if both AES and PMULL/PCLMULQDQ are available, else 0.
+#if defined(__aarch64__)
+  #if defined(__APPLE__)
+    extern "C" int nova_cpu_has_aes(void) { return 1; }   // Apple Silicon always has the crypto extensions
+  #elif defined(__linux__)
+    #include <sys/auxv.h>
+    #include <asm/hwcap.h>
+    extern "C" int nova_cpu_has_aes(void) {
+      unsigned long hw = getauxval(AT_HWCAP);
+      return ((hw & HWCAP_AES) && (hw & HWCAP_PMULL)) ? 1 : 0;
+    }
+  #else
+    extern "C" int nova_cpu_has_aes(void) { return 0; }   // conservative on unknown aarch64
+  #endif
+#elif (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+  extern "C" int nova_cpu_has_aes(void) {
+    __builtin_cpu_init();
+    return (__builtin_cpu_supports("aes") && __builtin_cpu_supports("pclmul")) ? 1 : 0;
+  }
+#else
+  extern "C" int nova_cpu_has_aes(void) { return 0; }
+#endif

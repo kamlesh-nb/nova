@@ -8,7 +8,12 @@
 import bytes;
 import crypto.cipher.aes;
 import crypto.mac.ghash;
+import crypto.aead.aesgcmhw;   // hardware AES-GCM (CPU AES + CLMUL); used when the host supports it
 import mem.allocator;   // FR-tls-2: GcmContext is heap-allocated via the global allocator
+
+// Runtime CPU-feature probe: 1 when the host has the AES + carryless-multiply instructions, so GcmContext
+// can dispatch to the hardware AES-GCM (aesgcmhw) and fall back to the constant-time bitsliced path otherwise.
+extern("c") fn nova_cpu_has_aes(): int;
 
 pub const GCM_TAG_LEN: int = 16;
 
@@ -107,9 +112,18 @@ fn computeS(g: ghash.Ghash, aad: ptr, aadLen: int, ct: ptr, ctLen: int, s: ptr):
 // under one traffic key should build them once and reuse them. seal/open below still exist as one-shot
 // wrappers, but a caller holding a GcmContext across records pays the setup exactly once.
 pub struct GcmContext {
-    pub ctx: aes.Aes,     // cached AES key schedule
+    pub ctx: aes.Aes,     // cached AES key schedule (software / bitsliced path)
     pub h: ptr,           // cached hash subkey H = E_K(0)
     pub g: ghash.Ghash,   // cached GHASH state (H tables built once; y reset per record)
+
+    // Hardware fast path (CPU AES + CLMUL). When hwAes is true, seal/open dispatch to aesgcmhw using the
+    // cached key schedule (hwRk), GHASH subkey in standard order (hwHStd) and the bit-reverse table (hwBrev),
+    // all built once at create() time. When false these are unused and the software path above runs.
+    pub hwAes: bool,
+    pub hwNr: int,
+    pub hwRk: ptr,
+    pub hwHStd: ptr,
+    pub hwBrev: ptr,
 
     pub fn create(key: ptr, keyLen: int): GcmContext {
         let c = bytes.new_with_allocator<GcmContext>(allocator.globalAllocator());
@@ -117,12 +131,26 @@ pub struct GcmContext {
         c.h = bytes.alloc(16);
         computeH(c.ctx, c.h);
         c.g = ghash.Ghash.create(c.h);
+        c.hwAes = nova_cpu_has_aes() == 1;
+        if (c.hwAes) {
+            c.hwRk = bytes.alloc(240);
+            c.hwHStd = bytes.alloc(16);
+            c.hwBrev = bytes.alloc(256);
+            c.hwNr = aesgcmhw.setup(key, keyLen, c.hwRk, c.hwHStd, c.hwBrev);
+        } else {
+            c.hwNr = 0; c.hwRk = 0; c.hwHStd = 0; c.hwBrev = 0;
+        }
         return c;
     }
 
     // Encrypt ptLen bytes at pt into ctOut and write the 16-byte tag to tagOut, reusing the cached schedule.
     pub fn seal(self: GcmContext, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
                 pt: ptr, ptLen: int, ctOut: ptr, tagOut: ptr): void {
+        if (self.hwAes) {
+            aesgcmhw.sealWith(self.hwRk, self.hwNr, self.hwHStd, self.hwBrev,
+                              iv, ivLen, aad, aadLen, pt, ptLen, ctOut, tagOut);
+            return;
+        }
         let j0 = bytes.alloc(16);
         computeJ0(self.g, iv, ivLen, j0);
 
@@ -146,6 +174,10 @@ pub struct GcmContext {
     // did not verify; ptOut must not be used.
     pub fn open(self: GcmContext, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
                 ct: ptr, ctLen: int, tag: ptr, ptOut: ptr): bool {
+        if (self.hwAes) {
+            return aesgcmhw.openWith(self.hwRk, self.hwNr, self.hwHStd, self.hwBrev,
+                                     iv, ivLen, aad, aadLen, ct, ctLen, tag, ptOut);
+        }
         let j0 = bytes.alloc(16);
         computeJ0(self.g, iv, ivLen, j0);
 
@@ -178,6 +210,9 @@ pub struct GcmContext {
         self.ctx.delete();
         self.g.delete();
         if (self.h != 0) { bytes.free(self.h); self.h = 0; }
+        if (self.hwRk != 0) { bytes.free(self.hwRk); self.hwRk = 0; }
+        if (self.hwHStd != 0) { bytes.free(self.hwHStd); self.hwHStd = 0; }
+        if (self.hwBrev != 0) { bytes.free(self.hwBrev); self.hwBrev = 0; }
     }
 }
 

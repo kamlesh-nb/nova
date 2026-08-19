@@ -229,41 +229,44 @@ fn computeS(hStd: ptr, brev: ptr, aad: ptr, aadLen: int, ct: ptr, ctLen: int, s:
     bytes.free(y); bytes.free(lens);
 }
 
-// One-shot hardware AES-GCM seal (AES + GHASH both hardware). keyLen 16 or 32. Byte-identical to software.
-pub fn seal(key: ptr, keyLen: int, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
-            pt: ptr, ptLen: int, ctOut: ptr, tagOut: ptr): void {
-    let rk = bytes.alloc(240);
+
+// ---- Cached context API: expand the key + GHASH setup ONCE, then seal/open many records. TLS holds a
+// GcmContext across a traffic key, so the setup (key schedule, H, brev table, H in std order) is done once.
+
+// Prepare cached state for `key` (keyLen 16 or 32) into caller buffers: rk (240), hStd (16), brev (256).
+// Returns Nr (10 or 14).
+pub fn setup(key: ptr, keyLen: int, rk: ptr, hStd: ptr, brev: ptr): int {
     let nr = expandKey(key, keyLen, rk);
     let zero = bytes.alloc(16); let i = 0; while (i < 16) { bytes.write_byte(zero, i, 0); i = i + 1; }
     let h = bytes.alloc(16); encBlock(rk, nr, zero, h);
-    let brev = bytes.alloc(256); buildBrev(brev);
-    let hStd = bytes.alloc(16); reflect(brev, h, hStd);
+    buildBrev(brev);
+    reflect(brev, h, hStd);
+    bytes.free(zero); bytes.free(h);
+    return nr;
+}
+
+// Seal one record with the cached state (no key re-expansion).
+pub fn sealWith(rk: ptr, nr: int, hStd: ptr, brev: ptr, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
+                pt: ptr, ptLen: int, ctOut: ptr, tagOut: ptr): void {
     let t = bytes.alloc(16); let scr = bytes.alloc(16); let pad = bytes.alloc(16);
     let j0 = bytes.alloc(16); computeJ0(hStd, brev, iv, ivLen, j0, t, scr, pad);
-    let icb = bytes.alloc(16); i = 0; while (i < 16) { bytes.write_byte(icb, i, bytes.read_byte(j0, i)); i = i + 1; }
+    let icb = bytes.alloc(16); let i = 0; while (i < 16) { bytes.write_byte(icb, i, bytes.read_byte(j0, i)); i = i + 1; }
     inc32(icb);
     gctrHw(rk, nr, icb, pt, ptLen, ctOut);
     let s = bytes.alloc(16); computeS(hStd, brev, aad, aadLen, ctOut, ptLen, s, t, scr, pad);
     let ej0 = bytes.alloc(16); encBlock(rk, nr, j0, ej0);
     i = 0; while (i < 16) { bytes.write_byte(tagOut, i, bytes.read_byte(s, i) ^ bytes.read_byte(ej0, i)); i = i + 1; }
-    bytes.free(rk); bytes.free(zero); bytes.free(h); bytes.free(brev); bytes.free(hStd);
     bytes.free(t); bytes.free(scr); bytes.free(pad); bytes.free(j0); bytes.free(icb); bytes.free(s); bytes.free(ej0);
 }
 
-// One-shot hardware AES-GCM open: verify tag (constant-time), decrypt on success, return ok.
-pub fn open(key: ptr, keyLen: int, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
-            ct: ptr, ctLen: int, tag: ptr, ptOut: ptr): bool {
-    let rk = bytes.alloc(240);
-    let nr = expandKey(key, keyLen, rk);
-    let zero = bytes.alloc(16); let i = 0; while (i < 16) { bytes.write_byte(zero, i, 0); i = i + 1; }
-    let h = bytes.alloc(16); encBlock(rk, nr, zero, h);
-    let brev = bytes.alloc(256); buildBrev(brev);
-    let hStd = bytes.alloc(16); reflect(brev, h, hStd);
+// Open one record with the cached state: verify tag (constant-time), decrypt on success, return ok.
+pub fn openWith(rk: ptr, nr: int, hStd: ptr, brev: ptr, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
+                ct: ptr, ctLen: int, tag: ptr, ptOut: ptr): bool {
     let t = bytes.alloc(16); let scr = bytes.alloc(16); let pad = bytes.alloc(16);
     let j0 = bytes.alloc(16); computeJ0(hStd, brev, iv, ivLen, j0, t, scr, pad);
     let s = bytes.alloc(16); computeS(hStd, brev, aad, aadLen, ct, ctLen, s, t, scr, pad);
     let ej0 = bytes.alloc(16); encBlock(rk, nr, j0, ej0);
-    let diff = 0; i = 0;
+    let diff = 0; let i = 0;
     while (i < 16) { diff = diff | ((bytes.read_byte(s, i) ^ bytes.read_byte(ej0, i)) ^ bytes.read_byte(tag, i)); i = i + 1; }
     let ok = diff == 0;
     if (ok) {
@@ -272,7 +275,25 @@ pub fn open(key: ptr, keyLen: int, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
         gctrHw(rk, nr, icb, ct, ctLen, ptOut);
         bytes.free(icb);
     }
-    bytes.free(rk); bytes.free(zero); bytes.free(h); bytes.free(brev); bytes.free(hStd);
     bytes.free(t); bytes.free(scr); bytes.free(pad); bytes.free(j0); bytes.free(s); bytes.free(ej0);
+    return ok;
+}
+
+// One-shot seal: set up + seal one record + tear down. keyLen 16 or 32.
+pub fn seal(key: ptr, keyLen: int, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
+            pt: ptr, ptLen: int, ctOut: ptr, tagOut: ptr): void {
+    let rk = bytes.alloc(240); let hStd = bytes.alloc(16); let brev = bytes.alloc(256);
+    let nr = setup(key, keyLen, rk, hStd, brev);
+    sealWith(rk, nr, hStd, brev, iv, ivLen, aad, aadLen, pt, ptLen, ctOut, tagOut);
+    bytes.free(rk); bytes.free(hStd); bytes.free(brev);
+}
+
+// One-shot open.
+pub fn open(key: ptr, keyLen: int, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
+            ct: ptr, ctLen: int, tag: ptr, ptOut: ptr): bool {
+    let rk = bytes.alloc(240); let hStd = bytes.alloc(16); let brev = bytes.alloc(256);
+    let nr = setup(key, keyLen, rk, hStd, brev);
+    let ok = openWith(rk, nr, hStd, brev, iv, ivLen, aad, aadLen, ct, ctLen, tag, ptOut);
+    bytes.free(rk); bytes.free(hStd); bytes.free(brev);
     return ok;
 }
