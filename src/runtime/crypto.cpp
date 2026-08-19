@@ -149,6 +149,7 @@ extern "C" void nova_gcm_seal(const unsigned char*, int, const unsigned char*, u
 extern "C" void nova_chacha20_xor(const unsigned char*, unsigned int, const unsigned char*,
                                   const unsigned char*, int, unsigned char*) { __builtin_trap(); }
 extern "C" void nova_sha256_blocks(unsigned int*, const unsigned char*, int) { __builtin_trap(); }
+extern "C" void nova_sha512_blocks(unsigned long long*, const unsigned char*, int) { __builtin_trap(); }
 extern "C" void nova_poly1305(const unsigned char*, const unsigned char*, int, unsigned char*) { __builtin_trap(); }
 extern "C" void nova_poly1305_blocks(unsigned long long*, const unsigned char*, int) { __builtin_trap(); }
 extern "C" void nova_poly1305_finish(unsigned long long*, const unsigned char*, int, unsigned char*,

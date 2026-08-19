@@ -8,7 +8,7 @@
 // interleaved by hand — exactly what a high-level compiler will not schedule.
 
 #if defined(__aarch64__) || defined(__arm64__)
-.arch armv8-a+crypto+aes
+.arch armv8.2-a+crypto+aes+sha3   // +sha3 enables the ARMv8.2 SHA-512 instructions (FEAT_SHA512)
 
 .text
 
@@ -1244,5 +1244,157 @@ Lsha256_k:
     .word 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3
     .word 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208
     .word 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+
+// ---- SHA-512 / SHA-384 block compression using the ARMv8.2 SHA-512 instructions ----------------------
+// void nova_sha512_blocks(uint64_t state[8], const uint8_t* data, int blocks)
+//   x0=state (H0..H7, stored BIG-ENDIAN like the Nova software sha512), x1=data (128-byte blocks), w2=blocks.
+// This is a faithful GNU-syntax translation of Go's sha512block_arm64.s (itself the Linux kernel sha512-ce
+// routine by Ard Biesheuvel). Go's asm reverses the two source operands vs GNU and puts the destination last;
+// that reversal is folded into the macro BODIES below, so the macro CALL sequence is byte-for-byte Go's and
+// stays auditable against it. SHA-384 shares this exact compression (only IV + output length differ).
+// State v8..v11 and message v12..v15 occupy d8..d15 (callee-saved low 64 bits) -> SAVE_D8_D15.
+//
+// SHA512TRANS: the shared prologue (rc0 = round-const reg already loaded, in0 = message reg).
+.macro SHA512TRANS i0,i1,i2,i3,i4,rc0,in0
+    add     v5.2d, v\rc0\().2d, v\in0\().2d
+    ext     v6.16b, v\i2\().16b, v\i3\().16b, #8
+    ext     v5.16b, v5.16b, v5.16b, #8
+    ext     v7.16b, v\i1\().16b, v\i2\().16b, #8
+    add     v\i3\().2d, v\i3\().2d, v5.2d
+.endm
+// Full round: load next round const into rc1, advance the message schedule (su0/su1).
+.macro SHA512ROUND i0,i1,i2,i3,i4,rc0,rc1,in0,in1,in2,in3,in4
+    ld1     {v\rc1\().2d}, [x4], #16
+    SHA512TRANS \i0,\i1,\i2,\i3,\i4,\rc0,\in0
+    ext     v5.16b, v\in3\().16b, v\in4\().16b, #8
+    sha512su0 v\in0\().2d, v\in1\().2d
+    sha512h   q\i3, q6, v7.2d
+    sha512su1 v\in0\().2d, v\in2\().2d, v5.2d
+    add     v\i4\().2d, v\i3\().2d, v\i1\().2d
+    sha512h2  q\i3, q\i1, v\i0\().2d
+.endm
+// Round with no message-schedule update (rounds where the schedule is complete) but still loads a const.
+.macro SHA512ROUND_NU i0,i1,i2,i3,i4,rc0,rc1,in0
+    ld1     {v\rc1\().2d}, [x4], #16
+    SHA512TRANS \i0,\i1,\i2,\i3,\i4,\rc0,\in0
+    sha512h   q\i3, q6, v7.2d
+    add     v\i4\().2d, v\i3\().2d, v\i1\().2d
+    sha512h2  q\i3, q\i1, v\i0\().2d
+.endm
+// Final 4 rounds: the consts are already resident, no load.
+.macro SHA512ROUND_LAST i0,i1,i2,i3,i4,rc0,in0
+    SHA512TRANS \i0,\i1,\i2,\i3,\i4,\rc0,\in0
+    sha512h   q\i3, q6, v7.2d
+    add     v\i4\().2d, v\i3\().2d, v\i1\().2d
+    sha512h2  q\i3, q\i1, v\i0\().2d
+.endm
+
+.global _nova_sha512_blocks
+.align 4
+_nova_sha512_blocks:
+    SAVE_D8_D15
+    ld1     {v8.2d, v9.2d, v10.2d, v11.2d}, [x0]   // digest: {H0,H1} {H2,H3} {H4,H5} {H6,H7}
+    rev64   v8.16b, v8.16b                          // Nova stores H big-endian; convert to native u64
+    rev64   v9.16b, v9.16b
+    rev64   v10.16b, v10.16b
+    rev64   v11.16b, v11.16b
+    adrp    x3, Lsha512_k@PAGE
+    add     x3, x3, Lsha512_k@PAGEOFF
+Lsha512_loop:
+    cmp     w2, #0
+    b.le    Lsha512_done
+    mov     v0.16b, v8.16b                          // working copy of the digest
+    mov     v1.16b, v9.16b
+    mov     v2.16b, v10.16b
+    mov     v3.16b, v11.16b
+    ld1     {v12.2d, v13.2d, v14.2d, v15.2d}, [x1], #64   // 128 bytes of message
+    ld1     {v16.2d, v17.2d, v18.2d, v19.2d}, [x1], #64
+    rev64   v12.16b, v12.16b                        // message words are big-endian
+    rev64   v13.16b, v13.16b
+    rev64   v14.16b, v14.16b
+    rev64   v15.16b, v15.16b
+    rev64   v16.16b, v16.16b
+    rev64   v17.16b, v17.16b
+    rev64   v18.16b, v18.16b
+    rev64   v19.16b, v19.16b
+    mov     x4, x3                                  // K512 cursor
+    ld1     {v20.2d, v21.2d, v22.2d, v23.2d}, [x4], #64   // preload first 8 round constants
+    SHA512ROUND 0,1,2,3,4,20,24,12,13,19,16,17
+    SHA512ROUND 3,0,4,2,1,21,25,13,14,12,17,18
+    SHA512ROUND 2,3,1,4,0,22,26,14,15,13,18,19
+    SHA512ROUND 4,2,0,1,3,23,27,15,16,14,19,12
+    SHA512ROUND 1,4,3,0,2,24,28,16,17,15,12,13
+    SHA512ROUND 0,1,2,3,4,25,29,17,18,16,13,14
+    SHA512ROUND 3,0,4,2,1,26,30,18,19,17,14,15
+    SHA512ROUND 2,3,1,4,0,27,31,19,12,18,15,16
+    SHA512ROUND 4,2,0,1,3,28,24,12,13,19,16,17
+    SHA512ROUND 1,4,3,0,2,29,25,13,14,12,17,18
+    SHA512ROUND 0,1,2,3,4,30,26,14,15,13,18,19
+    SHA512ROUND 3,0,4,2,1,31,27,15,16,14,19,12
+    SHA512ROUND 2,3,1,4,0,24,28,16,17,15,12,13
+    SHA512ROUND 4,2,0,1,3,25,29,17,18,16,13,14
+    SHA512ROUND 1,4,3,0,2,26,30,18,19,17,14,15
+    SHA512ROUND 0,1,2,3,4,27,31,19,12,18,15,16
+    SHA512ROUND 3,0,4,2,1,28,24,12,13,19,16,17
+    SHA512ROUND 2,3,1,4,0,29,25,13,14,12,17,18
+    SHA512ROUND 4,2,0,1,3,30,26,14,15,13,18,19
+    SHA512ROUND 1,4,3,0,2,31,27,15,16,14,19,12
+    SHA512ROUND 0,1,2,3,4,24,28,16,17,15,12,13
+    SHA512ROUND 3,0,4,2,1,25,29,17,18,16,13,14
+    SHA512ROUND 2,3,1,4,0,26,30,18,19,17,14,15
+    SHA512ROUND 4,2,0,1,3,27,31,19,12,18,15,16
+    SHA512ROUND 1,4,3,0,2,28,24,12,13,19,16,17
+    SHA512ROUND 0,1,2,3,4,29,25,13,14,12,17,18
+    SHA512ROUND 3,0,4,2,1,30,26,14,15,13,18,19
+    SHA512ROUND 2,3,1,4,0,31,27,15,16,14,19,12
+    SHA512ROUND 4,2,0,1,3,24,28,16,17,15,12,13
+    SHA512ROUND 1,4,3,0,2,25,29,17,18,16,13,14
+    SHA512ROUND 0,1,2,3,4,26,30,18,19,17,14,15
+    SHA512ROUND 3,0,4,2,1,27,31,19,12,18,15,16
+    SHA512ROUND_NU 2,3,1,4,0,28,24,12
+    SHA512ROUND_NU 4,2,0,1,3,29,25,13
+    SHA512ROUND_NU 1,4,3,0,2,30,26,14
+    SHA512ROUND_NU 0,1,2,3,4,31,27,15
+    SHA512ROUND_LAST 3,0,4,2,1,24,16
+    SHA512ROUND_LAST 2,3,1,4,0,25,17
+    SHA512ROUND_LAST 4,2,0,1,3,26,18
+    SHA512ROUND_LAST 1,4,3,0,2,27,19
+    add     v8.2d, v8.2d, v0.2d                     // digest += working state
+    add     v9.2d, v9.2d, v1.2d
+    add     v10.2d, v10.2d, v2.2d
+    add     v11.2d, v11.2d, v3.2d
+    sub     w2, w2, #1
+    b       Lsha512_loop
+Lsha512_done:
+    rev64   v8.16b, v8.16b                          // native u64 -> big-endian for the Nova state buffer
+    rev64   v9.16b, v9.16b
+    rev64   v10.16b, v10.16b
+    rev64   v11.16b, v11.16b
+    st1     {v8.2d, v9.2d, v10.2d, v11.2d}, [x0]
+    RESTORE_D8_D15
+    ret
+
+.align 4
+Lsha512_k:
+    .quad 0x428a2f98d728ae22, 0x7137449123ef65cd, 0xb5c0fbcfec4d3b2f, 0xe9b5dba58189dbbc
+    .quad 0x3956c25bf348b538, 0x59f111f1b605d019, 0x923f82a4af194f9b, 0xab1c5ed5da6d8118
+    .quad 0xd807aa98a3030242, 0x12835b0145706fbe, 0x243185be4ee4b28c, 0x550c7dc3d5ffb4e2
+    .quad 0x72be5d74f27b896f, 0x80deb1fe3b1696b1, 0x9bdc06a725c71235, 0xc19bf174cf692694
+    .quad 0xe49b69c19ef14ad2, 0xefbe4786384f25e3, 0x0fc19dc68b8cd5b5, 0x240ca1cc77ac9c65
+    .quad 0x2de92c6f592b0275, 0x4a7484aa6ea6e483, 0x5cb0a9dcbd41fbd4, 0x76f988da831153b5
+    .quad 0x983e5152ee66dfab, 0xa831c66d2db43210, 0xb00327c898fb213f, 0xbf597fc7beef0ee4
+    .quad 0xc6e00bf33da88fc2, 0xd5a79147930aa725, 0x06ca6351e003826f, 0x142929670a0e6e70
+    .quad 0x27b70a8546d22ffc, 0x2e1b21385c26c926, 0x4d2c6dfc5ac42aed, 0x53380d139d95b3df
+    .quad 0x650a73548baf63de, 0x766a0abb3c77b2a8, 0x81c2c92e47edaee6, 0x92722c851482353b
+    .quad 0xa2bfe8a14cf10364, 0xa81a664bbc423001, 0xc24b8b70d0f89791, 0xc76c51a30654be30
+    .quad 0xd192e819d6ef5218, 0xd69906245565a910, 0xf40e35855771202a, 0x106aa07032bbd1b8
+    .quad 0x19a4c116b8d2d0c8, 0x1e376c085141ab53, 0x2748774cdf8eeb99, 0x34b0bcb5e19b48a8
+    .quad 0x391c0cb3c5c95a63, 0x4ed8aa4ae3418acb, 0x5b9cca4f7763e373, 0x682e6ff3d6b2b8a3
+    .quad 0x748f82ee5defb2fc, 0x78a5636f43172f60, 0x84c87814a1f0ab72, 0x8cc702081a6439ec
+    .quad 0x90befffa23631e28, 0xa4506cebde82bde9, 0xbef9a3f7b2c67915, 0xc67178f2e372532b
+    .quad 0xca273eceea26619c, 0xd186b8c721c0c207, 0xeada7dd6cde0eb1e, 0xf57d4f7fee6ed178
+    .quad 0x06f067aa72176fba, 0x0a637dc5a2c898a6, 0x113f9804bef90dae, 0x1b710b35131c471b
+    .quad 0x28db77f523047d84, 0x32caab7b40c72493, 0x3c9ebe0a15c9bebc, 0x431d67c49c100d4c
+    .quad 0x4cc5d4becb3e42b6, 0x597f299cfc657e2a, 0x5fcb6fab3ad6faec, 0x6c44198c4a475817
 
 #endif // __aarch64__
