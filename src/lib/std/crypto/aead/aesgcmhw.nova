@@ -168,6 +168,22 @@ fn buildBrev(t: ptr): void {
 fn reflect(brev: ptr, e: ptr, out: ptr): void {
     let i = 0; while (i < 16) { bytes.write_byte(out, i, bytes.read_byte(brev, bytes.read_byte(e, i))); i = i + 1; }
 }
+// SIMD per-byte bit-reversal of the 16-byte block at (e + eoff) into (out + ooff). Same result as `reflect`
+// (out[i] = bitreverse(e[i])) but vectorised over all 16 bytes via the branchless swap-nibbles / swap-pairs
+// / swap-adjacent sequence using only lane-wise and/or/shl/shr (each verified to operate on all 16 lanes).
+// This replaces the 16-iteration scalar brev table walk on the GHASH hot path (per absorbed block). It does
+// NOT use an LLVM byte-shuffle/bitreverse intrinsic: those resolve to the wrong vector width (v8i8) via the
+// C-API overload path in this toolchain, silently zeroing the upper 8 lanes.
+fn reflectBlk(e: ptr, eoff: int, out: ptr, ooff: int): void {
+    let v = simd.loadU8x16(e, eoff);
+    let mF0 = simd.splatU8x16(0xF0); let m0F = simd.splatU8x16(0x0F);
+    let mCC = simd.splatU8x16(0xCC); let m33 = simd.splatU8x16(0x33);
+    let mAA = simd.splatU8x16(0xAA); let m55 = simd.splatU8x16(0x55);
+    v = simd.orU8x16(simd.shrU8x16(simd.andU8x16(v, mF0), 4), simd.shlU8x16(simd.andU8x16(v, m0F), 4)); // swap nibbles
+    v = simd.orU8x16(simd.shrU8x16(simd.andU8x16(v, mCC), 2), simd.shlU8x16(simd.andU8x16(v, m33), 2)); // swap bit-pairs
+    v = simd.orU8x16(simd.shrU8x16(simd.andU8x16(v, mAA), 1), simd.shlU8x16(simd.andU8x16(v, m55), 1)); // swap adjacent bits
+    simd.storeU8x16(out, ooff, v);
+}
 fn cl(a: ulong, b: ulong, tmp: ptr): void { simd.storeU64x2(tmp, 0, simd.clmulU64x2(a as long, b as long)); }
 
 // ---- GHASH 4-way key-power aggregation. The GHASH reduction (mod x^128+x^7+x^2+x+1) is GF(2)-linear, so
@@ -224,9 +240,10 @@ fn gfmul(a: ptr, b: ptr, out: ptr, t: ptr): void {
 }
 
 // Absorb one 16-byte GCM block at data+off into the running std accumulator y (std order): y = (y ^ block)*H.
+// The reflect + xor-with-y is vectorised (reflectBlk then one SIMD xor); brev is no longer read here.
 fn ghBlock(y: ptr, hStd: ptr, brev: ptr, data: ptr, off: int, t: ptr, scr: ptr): void {
-    let i = 0;
-    while (i < 16) { bytes.write_byte(scr, i, bytes.read_byte(brev, bytes.read_byte(data, off + i)) ^ bytes.read_byte(y, i)); i = i + 1; }
+    reflectBlk(data, off, scr, 0);
+    simd.storeU8x16(scr, 0, simd.xorU8x16(simd.loadU8x16(scr, 0), simd.loadU8x16(y, 0)));
     gfmul(scr, hStd, y, t);
 }
 // Absorb len bytes (16-byte blocks, zero-pad final).
@@ -248,9 +265,10 @@ fn ghUpdateAgg(y: ptr, hStd: ptr, h2: ptr, h3: ptr, h4: ptr, brev: ptr, data: pt
     let le = endian.Endian.little;
     let i = 0;
     while (len - i >= 64) {
-        // Reflect the 4 blocks into gb (std order), then fold the running y into block 0 only.
-        let j = 0; while (j < 64) { bytes.write_byte(gb, j, bytes.read_byte(brev, bytes.read_byte(data, i + j))); j = j + 1; }
-        let k = 0; while (k < 16) { bytes.write_byte(gb, k, bytes.read_byte(gb, k) ^ bytes.read_byte(y, k)); k = k + 1; }
+        // Reflect the 4 blocks into gb (std order) with SIMD, then fold the running y into block 0 only.
+        reflectBlk(data, i, gb, 0); reflectBlk(data, i + 16, gb, 16);
+        reflectBlk(data, i + 32, gb, 32); reflectBlk(data, i + 48, gb, 48);
+        simd.storeU8x16(gb, 0, simd.xorU8x16(simd.loadU8x16(gb, 0), simd.loadU8x16(y, 0)));
         mem.store<ulong>(acc, 0, 0 as ulong, le); mem.store<ulong>(acc, 8, 0 as ulong, le);
         mem.store<ulong>(acc, 16, 0 as ulong, le); mem.store<ulong>(acc, 24, 0 as ulong, le);
         clmulAccBuf(gb, 0, h4, acc, t);      // (y ^ X0) * H^4
