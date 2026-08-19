@@ -720,6 +720,446 @@ Lcc_const:
 Lcc_incr:
     .word 0, 1, 2, 3
 
+// ---- Poly1305 (donna64, 3x44-bit limbs) --------------------------------------------------------------
+// The hot AEAD path lives in nova_poly1305_blocks (full-block absorb into a running state) + nova_poly1305_finish
+// (padded tail + finalize). nova_poly1305 is a self-contained one-shot kept for direct callers/tests. The
+// shared clamp is POLY_SETUP; POLY_LOOP is the one-shot absorb loop (full blocks + a padded tail).
+.macro POLY_SETUP
+    mov     x9, #1
+    lsl     x9, x9, #44
+    sub     x9, x9, #1                 // mask44
+    mov     x10, #1
+    lsl     x10, x10, #42
+    sub     x10, x10, #1               // mask42
+    ldr     x12, [x0]
+    ldr     x13, [x0, #8]
+    movz    x14, #0xffff
+    movk    x14, #0x0fff, lsl #16
+    movk    x14, #0x0ffc, lsl #32
+    and     x22, x12, x14              // r0
+    extr    x15, x13, x12, #44
+    movz    x14, #0xffff
+    movk    x14, #0xffc0, lsl #16
+    movk    x14, #0x0fff, lsl #32
+    and     x23, x15, x14              // r1
+    lsr     x15, x13, #24
+    movz    x14, #0xfc0f
+    movk    x14, #0xffff, lsl #16
+    movk    x14, #0x000f, lsl #32
+    and     x24, x15, x14              // r2 (clamp mask 0x00ffffffc0f)
+    add     x25, x23, x23, lsl #2
+    lsl     x25, x25, #2               // s1 = r1*20
+    add     x26, x24, x24, lsl #2
+    lsl     x26, x26, #2               // s2 = r2*20
+    mov     x19, xzr
+    mov     x20, xzr
+    mov     x21, xzr                   // h = 0
+    mov     x27, x1
+    mov     w28, w2
+    mov     x11, #1
+    lsl     x11, x11, #40              // hibit
+.endm
+.macro POLY_LOOP name
+Lploop_\name:
+    cmp     w28, #16
+    b.lt    Ltail_\name
+    ldr     x12, [x27]
+    ldr     x13, [x27, #8]
+    add     x27, x27, #16
+    sub     w28, w28, #16
+    b       Labs_\name
+Ltail_\name:
+    cbz     w28, Lfin_\name
+    sub     sp, sp, #16
+    stp     xzr, xzr, [sp]
+    mov     w4, wzr
+1:
+    cmp     w4, w28
+    b.ge    2f
+    ldrb    w5, [x27, w4, uxtw]
+    strb    w5, [sp, w4, uxtw]
+    add     w4, w4, #1
+    b       1b
+2:
+    mov     w5, #1
+    strb    w5, [sp, w4, uxtw]
+    ldr     x12, [sp]
+    ldr     x13, [sp, #8]
+    add     sp, sp, #16
+    mov     x11, xzr
+    mov     w28, wzr
+Labs_\name:
+    and     x14, x12, x9
+    add     x19, x19, x14
+    extr    x14, x13, x12, #44
+    and     x14, x14, x9
+    add     x20, x20, x14
+    lsr     x14, x13, #24
+    and     x14, x14, x10
+    orr     x14, x14, x11
+    add     x21, x21, x14
+    mul     x14, x19, x22
+    umulh   x15, x19, x22
+    mul     x6, x20, x26
+    umulh   x7, x20, x26
+    adds    x14, x14, x6
+    adc     x15, x15, x7
+    mul     x6, x21, x25
+    umulh   x7, x21, x25
+    adds    x14, x14, x6
+    adc     x15, x15, x7
+    mul     x16, x19, x23
+    umulh   x17, x19, x23
+    mul     x6, x20, x22
+    umulh   x7, x20, x22
+    adds    x16, x16, x6
+    adc     x17, x17, x7
+    mul     x6, x21, x26
+    umulh   x7, x21, x26
+    adds    x16, x16, x6
+    adc     x17, x17, x7
+    mul     x4, x19, x24
+    umulh   x5, x19, x24
+    mul     x6, x20, x23
+    umulh   x7, x20, x23
+    adds    x4, x4, x6
+    adc     x5, x5, x7
+    mul     x6, x21, x22
+    umulh   x7, x21, x22
+    adds    x4, x4, x6
+    adc     x5, x5, x7
+    extr    x8, x15, x14, #44
+    and     x19, x14, x9
+    adds    x16, x16, x8
+    adc     x17, x17, xzr
+    extr    x8, x17, x16, #44
+    and     x20, x16, x9
+    adds    x4, x4, x8
+    adc     x5, x5, xzr
+    extr    x8, x5, x4, #42
+    and     x21, x4, x10
+    add     x19, x19, x8, lsl #2
+    add     x19, x19, x8
+    lsr     x8, x19, #44
+    and     x19, x19, x9
+    add     x20, x20, x8
+    b       Lploop_\name
+Lfin_\name:
+.endm
+
+// void nova_poly1305_blocks(state, data, nblocks) — absorb nblocks full 16-byte blocks into the running
+// accumulator. state is 8 u64: [r0,r1,r2,s1,s2,h0,h1,h2] at offsets 0,8,16,24,32,40,48,56. h is updated
+// in place; r/s are read-only. Callers do clamp (create) and finalize (final) themselves. This is the hot
+// path: the AEAD ciphertext is absorbed here, ~one call per record.
+.global _nova_poly1305_blocks
+.align 4
+_nova_poly1305_blocks:
+    stp     x19, x20, [sp, #-96]!
+    stp     x21, x22, [sp, #16]
+    stp     x23, x24, [sp, #32]
+    stp     x25, x26, [sp, #48]
+    stp     x27, x28, [sp, #64]
+    mov     x9, #1
+    lsl     x9, x9, #44
+    sub     x9, x9, #1                 // mask44
+    mov     x10, #1
+    lsl     x10, x10, #42
+    sub     x10, x10, #1               // mask42
+    ldr     x22, [x0]                  // r0
+    ldr     x23, [x0, #8]              // r1
+    ldr     x24, [x0, #16]             // r2
+    ldr     x25, [x0, #24]            // s1
+    ldr     x26, [x0, #32]            // s2
+    ldr     x19, [x0, #40]            // h0
+    ldr     x20, [x0, #48]            // h1
+    ldr     x21, [x0, #56]            // h2
+    mov     x27, x1                    // data cursor
+    mov     w28, w2                     // nblocks
+    mov     x11, #1
+    lsl     x11, x11, #40              // hibit (full block)
+Lblk_loop:
+    cbz     w28, Lblk_done
+    ldr     x12, [x27]
+    ldr     x13, [x27, #8]
+    add     x27, x27, #16
+    sub     w28, w28, #1
+    and     x14, x12, x9
+    add     x19, x19, x14
+    extr    x14, x13, x12, #44
+    and     x14, x14, x9
+    add     x20, x20, x14
+    lsr     x14, x13, #24
+    and     x14, x14, x10
+    orr     x14, x14, x11
+    add     x21, x21, x14
+    mul     x14, x19, x22
+    umulh   x15, x19, x22
+    mul     x6, x20, x26
+    umulh   x7, x20, x26
+    adds    x14, x14, x6
+    adc     x15, x15, x7
+    mul     x6, x21, x25
+    umulh   x7, x21, x25
+    adds    x14, x14, x6
+    adc     x15, x15, x7
+    mul     x16, x19, x23
+    umulh   x17, x19, x23
+    mul     x6, x20, x22
+    umulh   x7, x20, x22
+    adds    x16, x16, x6
+    adc     x17, x17, x7
+    mul     x6, x21, x26
+    umulh   x7, x21, x26
+    adds    x16, x16, x6
+    adc     x17, x17, x7
+    mul     x4, x19, x24
+    umulh   x5, x19, x24
+    mul     x6, x20, x23
+    umulh   x7, x20, x23
+    adds    x4, x4, x6
+    adc     x5, x5, x7
+    mul     x6, x21, x22
+    umulh   x7, x21, x22
+    adds    x4, x4, x6
+    adc     x5, x5, x7
+    extr    x8, x15, x14, #44
+    and     x19, x14, x9
+    adds    x16, x16, x8
+    adc     x17, x17, xzr
+    extr    x8, x17, x16, #44
+    and     x20, x16, x9
+    adds    x4, x4, x8
+    adc     x5, x5, xzr
+    extr    x8, x5, x4, #42
+    and     x21, x4, x10
+    add     x19, x19, x8, lsl #2
+    add     x19, x19, x8
+    lsr     x8, x19, #44
+    and     x19, x19, x9
+    add     x20, x20, x8
+    b       Lblk_loop
+Lblk_done:
+    str     x19, [x0, #40]
+    str     x20, [x0, #48]
+    str     x21, [x0, #56]
+    ldp     x27, x28, [sp, #64]
+    ldp     x25, x26, [sp, #48]
+    ldp     x23, x24, [sp, #32]
+    ldp     x21, x22, [sp, #16]
+    ldp     x19, x20, [sp], #96
+    ret
+
+// void nova_poly1305_finish(state, tail, taillen, out16, pad_lo, pad_hi)
+// state = [r0,r1,r2,s1,s2,h0,h1,h2]. If taillen>0 absorb the padded final block (0x01 after the bytes,
+// hibit=0). Then fully carry, constant-time g-select, serialize, add the 128-bit pad, write 16 bytes.
+.global _nova_poly1305_finish
+.align 4
+_nova_poly1305_finish:
+    stp     x19, x20, [sp, #-96]!
+    stp     x21, x22, [sp, #16]
+    stp     x23, x24, [sp, #32]
+    stp     x25, x26, [sp, #48]
+    stp     x27, x28, [sp, #64]
+    mov     x9, #1
+    lsl     x9, x9, #44
+    sub     x9, x9, #1
+    mov     x10, #1
+    lsl     x10, x10, #42
+    sub     x10, x10, #1
+    ldr     x22, [x0]
+    ldr     x23, [x0, #8]
+    ldr     x24, [x0, #16]
+    ldr     x25, [x0, #24]
+    ldr     x26, [x0, #32]
+    ldr     x19, [x0, #40]
+    ldr     x20, [x0, #48]
+    ldr     x21, [x0, #56]
+    mov     x27, x4                    // pad_lo (saved now: the tail absorb clobbers x4/x5 as scratch)
+    mov     x28, x5                    // pad_hi
+    cbz     x2, Lfinish_reduce
+    // build padded tail block on the stack: bytes[0..taillen], 0x01 at taillen, zero rest
+    sub     sp, sp, #16
+    stp     xzr, xzr, [sp]
+    mov     w4, wzr
+1:
+    cmp     w4, w2
+    b.ge    2f
+    ldrb    w5, [x1, w4, uxtw]
+    strb    w5, [sp, w4, uxtw]
+    add     w4, w4, #1
+    b       1b
+2:
+    mov     w5, #1
+    strb    w5, [sp, w4, uxtw]
+    ldr     x12, [sp]
+    ldr     x13, [sp, #8]
+    add     sp, sp, #16
+    // absorb with hibit=0
+    and     x14, x12, x9
+    add     x19, x19, x14
+    extr    x14, x13, x12, #44
+    and     x14, x14, x9
+    add     x20, x20, x14
+    lsr     x14, x13, #24
+    and     x14, x14, x10
+    add     x21, x21, x14
+    mul     x14, x19, x22
+    umulh   x15, x19, x22
+    mul     x6, x20, x26
+    umulh   x7, x20, x26
+    adds    x14, x14, x6
+    adc     x15, x15, x7
+    mul     x6, x21, x25
+    umulh   x7, x21, x25
+    adds    x14, x14, x6
+    adc     x15, x15, x7
+    mul     x16, x19, x23
+    umulh   x17, x19, x23
+    mul     x6, x20, x22
+    umulh   x7, x20, x22
+    adds    x16, x16, x6
+    adc     x17, x17, x7
+    mul     x6, x21, x26
+    umulh   x7, x21, x26
+    adds    x16, x16, x6
+    adc     x17, x17, x7
+    mul     x4, x19, x24
+    umulh   x5, x19, x24
+    mul     x6, x20, x23
+    umulh   x7, x20, x23
+    adds    x4, x4, x6
+    adc     x5, x5, x7
+    mul     x6, x21, x22
+    umulh   x7, x21, x22
+    adds    x4, x4, x6
+    adc     x5, x5, x7
+    extr    x8, x15, x14, #44
+    and     x19, x14, x9
+    adds    x16, x16, x8
+    adc     x17, x17, xzr
+    extr    x8, x17, x16, #44
+    and     x20, x16, x9
+    adds    x4, x4, x8
+    adc     x5, x5, xzr
+    extr    x8, x5, x4, #42
+    and     x21, x4, x10
+    add     x19, x19, x8, lsl #2
+    add     x19, x19, x8
+    lsr     x8, x19, #44
+    and     x19, x19, x9
+    add     x20, x20, x8
+Lfinish_reduce:
+    // fully carry h (pad already saved in x27/x28 at entry)
+    lsr     x8, x20, #44
+    and     x20, x20, x9
+    add     x21, x21, x8
+    lsr     x8, x21, #42
+    and     x21, x21, x10
+    add     x19, x19, x8, lsl #2
+    add     x19, x19, x8
+    lsr     x8, x19, #44
+    and     x19, x19, x9
+    add     x20, x20, x8
+    // g = h + 5, constant-time select
+    add     x12, x19, #5
+    lsr     x8, x12, #44
+    and     x12, x12, x9
+    add     x13, x20, x8
+    lsr     x8, x13, #44
+    and     x13, x13, x9
+    add     x14, x21, x8
+    mov     x15, #1
+    lsl     x15, x15, #42
+    sub     x14, x14, x15
+    asr     x15, x14, #63
+    mvn     x15, x15
+    and     x12, x12, x15
+    and     x13, x13, x15
+    and     x14, x14, x15
+    mvn     x16, x15
+    and     x19, x19, x16
+    and     x20, x20, x16
+    and     x21, x21, x16
+    orr     x19, x19, x12
+    orr     x20, x20, x13
+    orr     x21, x21, x14
+    // collapse 3x44 -> 128 bits
+    orr     x19, x19, x20, lsl #44
+    lsr     x20, x20, #20
+    orr     x20, x20, x21, lsl #24
+    // add pad
+    adds    x19, x19, x27
+    adc     x20, x20, x28
+    str     x19, [x3]
+    str     x20, [x3, #8]
+    ldp     x27, x28, [sp, #64]
+    ldp     x25, x26, [sp, #48]
+    ldp     x23, x24, [sp, #32]
+    ldp     x21, x22, [sp, #16]
+    ldp     x19, x20, [sp], #96
+    ret
+
+// void nova_poly1305(key, msg, len, out16)
+.global _nova_poly1305
+.align 4
+_nova_poly1305:
+    stp     x19, x20, [sp, #-96]!
+    stp     x21, x22, [sp, #16]
+    stp     x23, x24, [sp, #32]
+    stp     x25, x26, [sp, #48]
+    stp     x27, x28, [sp, #64]
+    POLY_SETUP
+    POLY_LOOP real
+    // finalize: fully carry h
+    lsr     x8, x20, #44
+    and     x20, x20, x9
+    add     x21, x21, x8
+    lsr     x8, x21, #42
+    and     x21, x21, x10
+    add     x19, x19, x8, lsl #2
+    add     x19, x19, x8
+    lsr     x8, x19, #44
+    and     x19, x19, x9
+    add     x20, x20, x8
+    // g = h + 5, select
+    add     x12, x19, #5
+    lsr     x8, x12, #44
+    and     x12, x12, x9
+    add     x13, x20, x8
+    lsr     x8, x13, #44
+    and     x13, x13, x9
+    add     x14, x21, x8
+    mov     x15, #1
+    lsl     x15, x15, #42
+    sub     x14, x14, x15
+    asr     x15, x14, #63
+    mvn     x15, x15
+    and     x12, x12, x15
+    and     x13, x13, x15
+    and     x14, x14, x15
+    mvn     x16, x15
+    and     x19, x19, x16
+    and     x20, x20, x16
+    and     x21, x21, x16
+    orr     x19, x19, x12
+    orr     x20, x20, x13
+    orr     x21, x21, x14
+    orr     x19, x19, x20, lsl #44
+    lsr     x20, x20, #20
+    orr     x20, x20, x21, lsl #24
+    ldr     x12, [x0, #16]
+    ldr     x13, [x0, #24]
+    adds    x19, x19, x12
+    adc     x20, x20, x13
+    str     x19, [x3]
+    str     x20, [x3, #8]
+    ldp     x27, x28, [sp, #64]
+    ldp     x25, x26, [sp, #48]
+    ldp     x23, x24, [sp, #32]
+    ldp     x21, x22, [sp, #16]
+    ldp     x19, x20, [sp], #96
+    ret
+
 // ---- SHA-256 block compression using the ARMv8 SHA-256 instructions -----------------------------------
 // void nova_sha256_blocks(uint32_t state[8], const uint8_t* data, int blocks)
 //   x0=state (H0..H7), x1=data, w2=number of 64-byte blocks. Standard SHA256H/SHA256H2 + SHA256SU0/SU1

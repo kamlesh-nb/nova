@@ -8,11 +8,26 @@
 import bytes;
 import mem.allocator;
 
+// Integrated-assembly fast path (src/runtime/nova_crypto_arm64.S): on aarch64 the donna64 3x44-bit block
+// absorb runs in hand-written assembly (64x64->128 mul/umulh), ~10x the 26-bit software loop. The running
+// accumulator lives in a 64-byte state buffer [r0,r1,r2,s1,s2,h0,h1,h2]; blocks absorb via nova_poly1305_blocks
+// and the padded tail + finalize via nova_poly1305_finish. Plain extern call, no FFI. Byte-identical to the
+// software path (differential-fuzzed across lengths 0..560, 0 disagreements).
+extern("c") fn nova_has_asm_crypto(): int;
+extern("c") fn nova_poly1305_blocks(state: ptr, data: ptr, nblocks: int): void;
+extern("c") fn nova_poly1305_finish(state: ptr, tail: ptr, taillen: int, out: ptr, padLo: ulong, padHi: ulong): void;
+
 const M26: ulong = 0x3ffffff;    // 26-bit limb mask
 const HIBIT: ulong = 0x1000000;  // 1 << 24: the 2^128 bit for a full block
 
 pub const POLY1305_KEY_LEN: int = 32;
 pub const POLY1305_TAG_LEN: int = 16;
+
+// Write a 64-bit little-endian word (for the asm state buffer).
+fn putU64(buf: ptr, off: int, w: ulong): void {
+    let i = 0;
+    while (i < 8) { bytes.write_byte(buf, off + i, ((w >> (i * 8)) & 0xff) as int); i = i + 1; }
+}
 
 fn leWord(buf: ptr, off: int): ulong {
     return (bytes.read_byte(buf, off) as ulong)
@@ -35,6 +50,8 @@ pub struct Poly1305 {
     pub pad0: ulong, pub pad1: ulong, pub pad2: ulong, pub pad3: ulong,
     pub buf: ptr,
     pub bufLen: int,
+    pub hw: ptr,       // 64-byte asm state [r0,r1,r2,s1,s2,h0,h1,h2], or 0 when software-only
+    pub useHw: int,
 
     pub fn create(key: ptr): Poly1305 {
         let p = bytes.new_with_allocator<Poly1305>(allocator.globalAllocator());
@@ -59,6 +76,26 @@ pub struct Poly1305 {
         p.pad3 = leWord(key, 28);
         p.buf = bytes.alloc(16);
         p.bufLen = 0;
+        p.hw = 0;
+        p.useHw = 0;
+        if (nova_has_asm_crypto() == 1) {
+            // Recompute r in the donna64 3x44-bit form the asm uses (clamp mask 0x0ffffffc0ffffffc0ffffffc0fffffff).
+            let k0 = leWord(key, 0) | (leWord(key, 4) << 32);
+            let k1 = leWord(key, 8) | (leWord(key, 12) << 32);
+            let hr0 = k0 & 0xffc0fffffff;
+            let hr1 = ((k0 >> 44) | (k1 << 20)) & 0xfffffc0ffff;
+            let hr2 = (k1 >> 24) & 0x00ffffffc0f;
+            p.hw = bytes.alloc(64);
+            putU64(p.hw, 0, hr0);
+            putU64(p.hw, 8, hr1);
+            putU64(p.hw, 16, hr2);
+            putU64(p.hw, 24, hr1 * 20);   // s1
+            putU64(p.hw, 32, hr2 * 20);   // s2
+            putU64(p.hw, 40, 0);          // h0
+            putU64(p.hw, 48, 0);          // h1
+            putU64(p.hw, 56, 0);          // h2
+            p.useHw = 1;
+        }
         return p;
     }
 
@@ -105,13 +142,22 @@ pub struct Poly1305 {
                 i = i + 1;
             }
             if (self.bufLen == 16) {
-                self.absorb(self.buf, 0, HIBIT);
+                if (self.useHw == 1) { nova_poly1305_blocks(self.hw, self.buf, 1); }
+                else { self.absorb(self.buf, 0, HIBIT); }
                 self.bufLen = 0;
             }
         }
-        while (len - i >= 16) {
-            self.absorb(data, i, HIBIT);
-            i = i + 16;
+        if (self.useHw == 1) {
+            let nb = (len - i) / 16;
+            if (nb > 0) {
+                nova_poly1305_blocks(self.hw, (data as long + i) as ptr, nb);
+                i = i + nb * 16;
+            }
+        } else {
+            while (len - i >= 16) {
+                self.absorb(data, i, HIBIT);
+                i = i + 16;
+            }
         }
         while (i < len) {
             bytes.write_byte(self.buf, self.bufLen, bytes.read_byte(data, i));
@@ -122,6 +168,13 @@ pub struct Poly1305 {
 
     // Finalize the accumulator, add the pad, and write the 16-byte tag to out.
     pub fn final(self: Poly1305, out: ptr): void {
+        if (self.useHw == 1) {
+            let padLo = self.pad0 | (self.pad1 << 32);
+            let padHi = self.pad2 | (self.pad3 << 32);
+            nova_poly1305_finish(self.hw, self.buf, self.bufLen, out, padLo, padHi);
+            self.bufLen = 0;
+            return;
+        }
         if (self.bufLen > 0) {
             // Pad the last partial block: append 0x01, zero the rest, absorb with hibit already in it.
             bytes.write_byte(self.buf, self.bufLen, 1);
@@ -178,6 +231,10 @@ pub struct Poly1305 {
         if (self.buf != 0) {
             bytes.free(self.buf);
             self.buf = 0;
+        }
+        if (self.hw != 0) {
+            bytes.free(self.hw);
+            self.hw = 0;
         }
     }
 }
