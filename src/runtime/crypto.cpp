@@ -144,4 +144,6 @@ extern "C" void nova_aes_ctr(const unsigned char* rk, int nr, unsigned char* ctr
 // nova_ghash off-aarch64: never reached (callers gate on nova_has_asm_crypto()==0 and run the Nova GHASH),
 // but the symbol must resolve. Trap rather than return a wrong tag if a future caller forgets the gate.
 extern "C" void nova_ghash(const unsigned char*, const unsigned char*, int, unsigned char*) { __builtin_trap(); }
+extern "C" void nova_gcm_seal(const unsigned char*, int, const unsigned char*, unsigned char*,
+                              const unsigned char*, int, unsigned char*, unsigned char*) { __builtin_trap(); }
 #endif

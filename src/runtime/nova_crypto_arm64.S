@@ -379,4 +379,148 @@ _nova_ghash:
     st1     {v1.16b}, [x3]            // store Y (standard order; caller reflects back)
     ret
 
+// ---- Fused stitched seal (stitched-seal step 3b) -----------------------------------------------------
+// void nova_gcm_seal(const uint8_t* rk, int nr, const uint8_t* hpows, uint8_t* ctr,
+//                    const uint8_t* in, int len, uint8_t* out, uint8_t* y)
+//   x0=rk w1=nr x2=hpows (64B: H,H^2,H^3,H^4 std order) x3=ctr x4=in w5=len (MULTIPLE OF 64) x6=out x7=y.
+// Encrypts `in` to `out` and GHASHes the ciphertext into y IN ONE LOOP: each group's AES-CTR (4-way,
+// register-resident round keys) is immediately followed by the 4-block aggregated GHASH of the ciphertext it
+// just produced — so the ct never round-trips to memory for GHASH, and the OoO core overlaps this group's
+// GHASH PMULLs with the next group's AES AESEs (the AES unit and PMULL unit run in parallel). The <64-byte
+// and length-block tail is handled by the caller via nova_aes_ctr + nova_ghash. y in/out (std order).
+// Byte-identical to the separate CTR + GHASH passes (gated 378).
+
+// Multiply block \va by H^k (loaded from [x2, #\hpoff]) and XOR the un-reduced product into acc {v28,v29}.
+// Scratch v20..v23, v26, v27, v15 — all OUTSIDE the resident round keys v0..v14 and blocks v16..v19.
+.macro MULACC_LD va, hpoff
+    ldr     q26, [x2, #\hpoff]
+    pmull   v20.1q, \va\().1d, v26.1d
+    pmull2  v21.1q, \va\().2d, v26.2d
+    ext     v22.16b, \va\().16b, \va\().16b, #8
+    eor     v22.16b, v22.16b, \va\().16b
+    ext     v23.16b, v26.16b, v26.16b, #8
+    eor     v23.16b, v23.16b, v26.16b
+    pmull   v22.1q, v22.1d, v23.1d
+    eor     v22.16b, v22.16b, v20.16b
+    eor     v22.16b, v22.16b, v21.16b
+    ext     v27.16b, v31.16b, v22.16b, #8
+    eor     v27.16b, v20.16b, v27.16b      // lo128
+    ext     v15.16b, v22.16b, v31.16b, #8
+    eor     v15.16b, v21.16b, v15.16b      // hi128
+    eor     v28.16b, v28.16b, v27.16b
+    eor     v29.16b, v29.16b, v15.16b
+.endm
+// Reduce acc {v28=lo, v29=hi} into Y (v25). Scratch v20..v23.
+.macro REDUCE_SEAL
+    pmull   v20.1q, v29.1d, v30.1d
+    pmull2  v21.1q, v29.2d, v30.2d
+    ext     v22.16b, v21.16b, v31.16b, #8
+    pmull   v22.1q, v22.1d, v30.1d
+    eor     v25.16b, v28.16b, v20.16b
+    mov     v23.d[0], v22.d[0]
+    mov     v23.d[1], v21.d[0]
+    eor     v25.16b, v25.16b, v23.16b
+.endm
+
+.global _nova_gcm_seal
+.align 4
+_nova_gcm_seal:
+    ldr     w9, [x3, #12]
+    rev     w9, w9
+    ld1     {v24.16b}, [x3]           // counter template
+    ld1     {v25.16b}, [x7]          // Y
+    movi    v31.16b, #0
+    mov     x10, #0x87
+    dup     v30.2d, x10
+    cmp     w1, #14
+    b.eq    200f
+    ld1     {v0.16b, v1.16b, v2.16b, v3.16b}, [x0], #64
+    ld1     {v4.16b, v5.16b, v6.16b, v7.16b}, [x0], #64
+    ld1     {v8.16b, v9.16b, v10.16b}, [x0]
+    b       201f
+200:
+    ld1     {v0.16b, v1.16b, v2.16b, v3.16b}, [x0], #64
+    ld1     {v4.16b, v5.16b, v6.16b, v7.16b}, [x0], #64
+    ld1     {v8.16b, v9.16b, v10.16b, v11.16b}, [x0], #64
+    ld1     {v12.16b, v13.16b, v14.16b}, [x0]
+201:
+    cmp     w5, #0
+    b.le    209f
+202:
+    // build 4 counter blocks
+    mov     v16.16b, v24.16b
+    rev     w11, w9
+    mov     v16.s[3], w11
+    add     w10, w9, #1
+    mov     v17.16b, v24.16b
+    rev     w11, w10
+    mov     v17.s[3], w11
+    add     w10, w9, #2
+    mov     v18.16b, v24.16b
+    rev     w11, w10
+    mov     v18.s[3], w11
+    add     w10, w9, #3
+    mov     v19.16b, v24.16b
+    rev     w11, w10
+    mov     v19.s[3], w11
+    // AES-CTR 4-way (register-resident keys)
+    cmp     w1, #14
+    b.eq    203f
+    RK4 v0
+    RK4 v1
+    RK4 v2
+    RK4 v3
+    RK4 v4
+    RK4 v5
+    RK4 v6
+    RK4 v7
+    RK4 v8
+    RKL4 v9, v10
+    b       204f
+203:
+    RK4 v0
+    RK4 v1
+    RK4 v2
+    RK4 v3
+    RK4 v4
+    RK4 v5
+    RK4 v6
+    RK4 v7
+    RK4 v8
+    RK4 v9
+    RK4 v10
+    RK4 v11
+    RK4 v12
+    RKL4 v13, v14
+204:
+    // XOR plaintext -> ciphertext, store
+    ld1     {v20.16b, v21.16b, v22.16b, v23.16b}, [x4], #64
+    eor     v16.16b, v16.16b, v20.16b
+    eor     v17.16b, v17.16b, v21.16b
+    eor     v18.16b, v18.16b, v22.16b
+    eor     v19.16b, v19.16b, v23.16b
+    st1     {v16.16b, v17.16b, v18.16b, v19.16b}, [x6], #64
+    // GHASH the 4 ct blocks straight from registers (aggregated)
+    rbit    v16.16b, v16.16b
+    eor     v16.16b, v16.16b, v25.16b    // block0 ^ Y
+    rbit    v17.16b, v17.16b
+    rbit    v18.16b, v18.16b
+    rbit    v19.16b, v19.16b
+    movi    v28.16b, #0
+    movi    v29.16b, #0
+    MULACC_LD v16, 48                    // (Y^X0) * H^4
+    MULACC_LD v17, 32                    // X1 * H^3
+    MULACC_LD v18, 16                    // X2 * H^2
+    MULACC_LD v19, 0                     // X3 * H^1
+    REDUCE_SEAL                          // Y = reduce(acc)
+    add     w9, w9, #4
+    sub     w5, w5, #64
+    cmp     w5, #0
+    b.gt    202b
+209:
+    st1     {v25.16b}, [x7]             // store Y
+    rev     w11, w9
+    str     w11, [x3, #12]             // store advanced counter
+    ret
+
 #endif // __aarch64__
