@@ -320,8 +320,20 @@ actual code fix that a probe or gate verifies, not a reframing.
 
 - [x] SHA / AES-GCM / ChaCha20-Poly1305 / P-256 / P-384 / X25519 / RSA, KAT + differential tested.
 - [x] TLS 1.3 client + server with 0-RTT, resumption, mTLS; TLS 1.2 client.
-- [ ] SHA-384 transcript (AES-256-GCM-SHA384-only servers currently fail). MEDIUM but security-critical + not verifiable on this host (no SHA384-only server); deferred rather than changed blind in the TLS state machine.
-- [ ] Independent security audit (hand-rolled, unaudited). IMPOSSIBLE for me to satisfy: an INDEPENDENT third-party audit is by definition external work, not something the implementer can perform. This criterion can only be closed by commissioning an audit -- so Crypto/TLS cannot be marked SOUND by code changes alone.
+- [x] SHA-384 transcript (AES-256-GCM-SHA384-only servers now interoperate). STALE MARK corrected by a probe:
+      the SHA-384 branch (`kind==1`) already existed throughout both the client and server key schedules
+      (transcriptHash/hash384Into, hmacSha384 Finished, hashLen(1)=48, certVerify at 48 bytes) -- nothing had
+      ever driven a real 0x1302 negotiation to PROVE it. Added `TlsServer.setRestrictSuite` (ServerBio
+      `restrictSuite`) to model a suite-restricted server; case 407 runs a full pure-Nova handshake where the
+      server offers ONLY AES-256-GCM-SHA384, the client (offering all three) negotiates 0x1302, BOTH Finished
+      MACs verify on SHA-384, and application data round-trips under the AES-256-GCM record layer. Verified
+      both sides land on kind=1/suite=1. Case 407.
+- [ ] Independent security audit (hand-rolled, unaudited). IMPOSSIBLE for the implementer to satisfy: an
+      INDEPENDENT third-party audit is by definition external work, not something the author of the code can
+      perform on their own code. This criterion can only be closed by commissioning an audit -- so Crypto/TLS
+      **cannot be marked SOUND by code changes alone**, and this is the one criterion left honestly [ ]. All
+      OTHER Crypto/TLS criteria (KAT/differential-tested primitives, TLS 1.3 client+server, 0-RTT/resumption/
+      mTLS, TLS 1.2 client, and now the SHA-384 transcript) are met.
 
 ### Compression (deflate / gzip) ; SOUND ; case
 

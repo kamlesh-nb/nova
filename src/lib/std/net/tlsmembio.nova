@@ -338,6 +338,9 @@ pub struct ClientBio impl TlsBio {
 
     // The ALPN protocol the server selected during the handshake ("" if none was negotiated).
     pub fn selectedAlpn(self: ClientBio): string { return self.cl.selectedAlpn(); }
+    // The negotiated cipher suite kind (0 = SHA-256, 1 = SHA-384) and suite index, for test assertions.
+    pub fn negotiatedKind(self: ClientBio): int { return self.cl.kind; }
+    pub fn negotiatedSuite(self: ClientBio): int { return self.cl.suite; }
 
     // Session-ticket accessors (populated once the server sends a NewSessionTicket). Hand these to a
     // session cache and pass them back to newClientBioResume to resume a later connection.
@@ -549,6 +552,11 @@ pub struct ServerBio impl TlsBio {
     // mTLS: request a client certificate (send a CertificateRequest); after the handshake, clientAuthOk()
     // reports whether the client presented a cert whose CertificateVerify validated.
     pub fn requestClientCert(self: ServerBio, on: bool): void { self.srv.setRequestClientCert(on); }
+    // Restrict this server to a single cipher suite (0x1301/0x1302/0x1303), e.g. AES-256-GCM-SHA384 only.
+    pub fn restrictSuite(self: ServerBio, suite: int): void { self.srv.setRestrictSuite(suite); }
+    // The negotiated cipher suite kind (0 = SHA-256, 1 = SHA-384) and suite index, for test assertions.
+    pub fn negotiatedKind(self: ServerBio): int { return self.srv.kind; }
+    pub fn negotiatedSuite(self: ServerBio): int { return self.srv.suite; }
     // OCSP stapling: staple this OCSP response in the leaf CertificateEntry (verifying clients check it).
     pub fn setStapledOcsp(self: ServerBio, der: ptr, len: int): void { self.srv.setStapleOcsp(der, len); }
     pub fn clientAuthOk(self: ServerBio): bool { return self.srv.clientAuthOk(); }

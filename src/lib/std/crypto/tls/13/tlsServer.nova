@@ -76,6 +76,7 @@ struct TlsServer {
     pub clientCertPresent: bool,         // the client presented a non-empty certificate
     pub clientCertOk: bool,              // the client's CertificateVerify signature validated
     pub stapleOcsp: ptr, pub stapleOcspLen: int,   // OCSP response to staple in the leaf CertificateEntry (0 = none)
+    pub restrictSuite: int,              // if non-zero, only this cipher suite may be negotiated (models a suite-restricted server, e.g. AES-256-GCM-SHA384-only)
 }
 
 pub fn newServer(certDer: ptr, certLen: int, signKey: ptr, ephPriv: ptr, ephPrivP256: ptr, ephPrivP384: ptr): TlsServer {
@@ -98,8 +99,13 @@ pub fn newServer(certDer: ptr, certLen: int, signKey: ptr, ephPriv: ptr, ephPriv
         chTruncHash: bytes.alloc(48), offeredBinder: bytes.alloc(48), pskId: bytes.alloc(1024),
         requestClientCert: false, clientCertProcessed: false, clientCertPresent: false, clientCertOk: false,
         stapleOcsp: bytes.alloc(1), stapleOcspLen: 0,
+        restrictSuite: 0,
     };
 }
+
+// Restrict negotiation to a single cipher suite (0x1301/0x1302/0x1303), modelling a server configured to
+// offer only that suite. Used to exercise the AES-256-GCM-SHA384 (0x1302) transcript path end to end.
+pub fn setRestrictSuite(self: TlsServer, suite: int): void { self.restrictSuite = suite; }
 
 // OCSP stapling: include this OCSP response in the leaf CertificateEntry's status_request extension.
 pub fn setStapleOcsp(self: TlsServer, der: ptr, len: int): void { self.stapleOcsp = der; self.stapleOcspLen = len; }
@@ -272,7 +278,11 @@ pub fn processClientHello(self: TlsServer, ch: ptr, chLen: int): void {
     // bitsliced constant-time software (~10x slower), so prefer ChaCha20-Poly1305 instead.
     let hwAes = nova_cpu_has_aes() == 1;
     let chosen = 0;
-    if (hasPsk) {
+    if (self.restrictSuite != 0) {
+        // Suite-restricted server: negotiate ONLY the configured suite, and only if the client offered it.
+        let ok = (self.restrictSuite == 0x1301 && off1301) || (self.restrictSuite == 0x1302 && off1302) || (self.restrictSuite == 0x1303 && off1303);
+        if (ok) { chosen = self.restrictSuite; }
+    } else if (hasPsk) {
         chosen = firstOffered;
     } else if (hwAes) {
         if (off1301) { chosen = 0x1301; }
