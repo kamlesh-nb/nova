@@ -1010,6 +1010,24 @@ pub const Inferer = struct {
 
                     .string => return self.ok(try self.store.intT()),
                     .array => |a| return self.ok(a.elem),
+                    // A tuple index must be a compile-time-constant integer literal (tuples are
+                    // heterogeneous, so the element type depends on the exact index). `t[0]` and the
+                    // `t.0` desugar both land here. Resolve NON-PRIMITIVE elements (structs/strings/enums
+                    // that need field or method access) so `t[0].x` type-checks instead of failing as
+                    // "unknown struct type". A PRIMITIVE element (int/bool) is deliberately left unresolved
+                    // to preserve the existing raw-64-bit-word read of scalar tuple slots (case 358); fixing
+                    // that scalar-width inconsistency is a separate language-semantics change with an
+                    // optimiser emit-path differential, out of scope for the struct value-semantics work.
+                    .tuple => |elems| {
+                        if (ix.index.kind == .literal and ix.index.kind.literal == .integer) {
+                            const n = ix.index.kind.literal.integer;
+                            if (n >= 0 and @as(usize, @intCast(n)) < elems.len) {
+                                const et = elems[@intCast(n)];
+                                if (self.store.get(et) != .prim) return self.ok(et);
+                            }
+                        }
+                        return self.unresolved("tuple-index");
+                    },
                     else => return self.unresolved("index"),
                 }
             },

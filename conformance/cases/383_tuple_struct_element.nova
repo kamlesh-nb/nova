@@ -1,0 +1,54 @@
+// Channel 6b step 1 (sema): a struct stored in a tuple element must be accessible via `t[0].x` (and the
+// `t.0` desugar). Before this, the inferer left a tuple-index expression `unresolved`, so field access
+// through a tuple element failed to compile as "unknown struct type". This is a functionality fix (the
+// value-lowering / copy semantics of tuple elements is a separate step).
+import assert;
+
+struct P { pub x: int, pub y: int, init(a: int, b: int) { self.x = a; self.y = b; } }
+struct S { pub data: string, init(d: string) { self.data = d; } }
+
+@test
+fn access_struct_element_fields(): void {
+    let t = (P(3, 4), 99, P(5, 6));
+    assert.equalInt(t[0].x, 3);
+    assert.equalInt(t[0].y, 4);
+    assert.equalInt(t[1], 99);
+    assert.equalInt(t[2].x, 5);
+    assert.equalInt(t[2].y, 6);
+}
+
+@test
+fn dot_index_desugar(): void {
+    let t = (P(10, 20), 7);
+    assert.equalInt(t.0.x, 10);
+    assert.equalInt(t.0.y, 20);
+    assert.equalInt(t.1, 7);
+}
+
+// Owned field (a heap string) inside a tuple element: the tuple box owns and releases it; the --arc /
+// --asan gates catch a leak or double-free. Fresh heap strings per iteration force the check.
+@test
+fn owned_field_in_tuple_element(): void {
+    let i = 0;
+    while (i < 100) {
+        let t = (S("tup-" + istr(i)), 42);
+        assert.isTrue(t[0].data.length > 0);
+        assert.equalInt(t[1], 42);
+        i = i + 1;
+    }
+    assert.isTrue(true);
+}
+
+fn istr(n: int): string {
+    if (n == 0) { return "0"; }
+    let s = "";
+    let m = n;
+    while (m > 0) { s = dig(m % 10) + s; m = m / 10; }
+    return s;
+}
+fn dig(x: int): string {
+    if (x == 0) { return "0"; } if (x == 1) { return "1"; } if (x == 2) { return "2"; }
+    if (x == 3) { return "3"; } if (x == 4) { return "4"; } if (x == 5) { return "5"; }
+    if (x == 6) { return "6"; } if (x == 7) { return "7"; } if (x == 8) { return "8"; }
+    return "9";
+}
