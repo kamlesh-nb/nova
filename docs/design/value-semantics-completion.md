@@ -88,8 +88,14 @@ Each channel is an independent, gated increment. Over-exclusion stays the safe f
      to ALL structs) did not recur. Gate: value semantics (`let b=a; b.x=99` leaves `a.x`), corpus 389/392 +
      ASAN 389/392 (3 pre-existing), case `382_optional_value_struct_copy` (plain + `--arc` + `--asan`).
    - **6b — tuple** (task #222): needs a sema fix first — `t[0].x` is `unknown struct type` today (tuple-
-     index type inference gap), then value-lowering. **6c — error-union** (task #223): value-lower ok/err
-     payloads.
+     index type inference gap), then value-lowering.
+   - **6c — error-union: SKIPPED as near-worthless (2026-08-20, user-confirmed).** Value-struct-in-error-
+     union already works and is ARC/ASAN-clean, including holding + copying an unwrapped error-union. The
+     only gap is a value-semantics aliasing *surprise*, and it is unreachable: error-unions are consumed by
+     `try`/`catch` (which collapses to the ok type), so there is no path to hold one, copy it, unwrap BOTH to
+     a shared struct, and mutate through one. Design B for it is also more complex than 6a (the box carries
+     `[tag][payload]`, not just a pointer). Payload stays on the heap (safe, functional). The `.error_union`
+     exclusion in `computeValueEscapeSet` is intentionally kept.
 3. **Channel 1 (return by value)** — return structs via sret ABI instead of pointer-to-stack-alloca. Touches
    the calling convention; unblocks channel 3.
 4. **Channel 3 (@serializable binder)** — make `<T>__bind` binders return by value / sret. Depends on #3.
