@@ -115,10 +115,19 @@ Each channel is an independent, gated increment. Over-exclusion stays the safe f
    `384_returned_value_struct_copy`.
 6. **Channel 2 (trait-impl)** — box at the widening point: copy the value into a heap allocation only when
    creating the fat pointer, so the struct is value-semantic everywhere else. Must pin the boxed lifetime.
-7. **Channel 4 (container/optional/decimal fields)** — LAST and HARDEST. A `List<T>` field is a value struct
-   wrapping a `RawBuffer` *class*; copying the container must deep-copy (or COW) the buffer, else the copy
-   shares the buffer while copying len/cap independently → corruption (the documented failure). Needs
-   container copy-on-assign semantics (COW or deep copy) first.
+7. **Channel 4 (container/optional/decimal fields) — LAST and HARDEST; a real sub-project (scoped 2026-08-20,
+   NOT started).** A `List<T>` field is a value struct `{data: RawBuffer<T>, len, cap}` wrapping a heap
+   `RawBuffer`. The concrete blocker: codegen's struct copy is a BYTE MEMCPY, so it copies the List field's
+   `{ptr,len,cap}` and SHARES the buffer; the copy then diverges len/cap independently → corruption. Fix
+   requires: (a) a container deep-copy / copy-on-write primitive (stdlib has only `slice`, no `copy` hook;
+   `List.copy()`/`Map.copy()` need adding, retaining owned elements); (b) making the struct copy path
+   FIELD-AWARE for container fields -- after the memcpy, replace each shared container field with a fresh
+   deep-copy, which means invoking the per-element-type monomorphized container copy from
+   `retainValueStructOwnedFields`/`buildHeapStructDeepCopy` (calling a monomorphized generic Nova method from
+   codegen is the intricate part); (c) then let such structs into `isPureValueStructName`. High risk (this is
+   the exact shape that crashed the blanket experiment; touches List/Map/Set). Memory-safe today (reference-
+   semantic). Recommended: a focused session, List first, gated. The deeper alternative is the class-migration
+   audit (make shared-state structs `class`, then containers-in-value-structs become rare).
 
 ## Verification (per increment)
 
