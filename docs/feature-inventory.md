@@ -425,10 +425,18 @@ actual code fix that a probe or gate verifies, not a reframing.
       skips the final). Test 112 (genuine accepted, forged rejected, non-final vacuous, RFC vector).
       Committed lang d4351c4, nova-postgres 5c79837.
 
-### Per-connection buffer leaks ; UNSOUND ; swept
+### Per-connection buffer leaks ; SOUND ; case + probe
 
-- [ ] Postgres does not leak its ~64 KB reader buffer per connection.
-- [ ] TlsStream does not leak ~16 KB per connection.
+- [x] Postgres does not leak its ~64 KB reader buffer per connection. FIXED (nova-postgres): `PgReader.buf`
+      is a raw `ptr` (not ARC-tracked), so it leaked once per connection; `PgConnection.close` now
+      `bytes.free`s it and nulls the field (double-close safe). Test 113_reader_buffer_free constructs a
+      connection over a dummy fd, closes, asserts the buffer is freed + nulled, and double-closes -- passing
+      under `--asan` (no double-free). Committed nova-postgres.
+- [x] TlsStream does not leak ~16 KB per connection. STALE MARK corrected by a probe: `TlsStream.close`
+      already `bytes.free`s its 16 KB record scratch (asynctls.nova:104-110, guarded for double-close) AND
+      `closeBio()` frees the memory-BIO's ibuf/obuf (`freeBuffers`) plus every handshake scratch/key buffer
+      (tlsmembio.nova:371/705). This was the M1/M2 per-connection-leak work (task #159); the inventory line
+      was just never flipped.
 
 ---
 
