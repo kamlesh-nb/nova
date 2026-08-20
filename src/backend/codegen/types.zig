@@ -772,7 +772,12 @@ fn isPureValueStructRec(self: *LlvmCompiler, name: []const u8, visited: *std.Str
     const sd = self.structs.get(base) orelse return false;
     if (sd.is_reference) return false; // `class`
     if (self.isCollidingStruct(sd.name)) return false;
-    if (sd.impls.len > 0) return false; // channel 2: trait impl -> may be widened / shared
+    // Channel 2 (trait impl): a trait-implementing struct is NOT excluded here. The shared-state services
+    // that must keep reference semantics (mediator / DI / handlers / pools) are already caught by the field
+    // check below -- they carry a container / class field (channel 4). A trait-implementing struct with only
+    // scalar/string/value fields is a stateless value handler (the spec allows handlers to be `struct`), so
+    // it is safe to deep-copy; widening to a trait object goes through a different (trait-typed) copy site
+    // that this predicate never matches, so it is unaffected. (Verified: full corpus + ASAN green.)
     for (sd.fields) |fld| {
         const fts = self.typeRefToString(fld.type_name) catch return false;
         if (std.mem.eql(u8, fts, "string")) continue;
