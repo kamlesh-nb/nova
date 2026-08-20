@@ -53,9 +53,10 @@ verified them. The rest of the language features are PARTIAL and their unmet cri
 generic depth cap, cross-module trait default methods, monomorphic (non-erased) generic trait dispatch, typed
 closure params, checked-integer overflow, an unused-bound check, the untypeable-discriminant exhaustiveness /
 fail-closed edge, a heterogeneous future combinator, bounded channels + select + actor supervision, IOCP
-readiness. The one confirmed CORRECTNESS DEFECT is `x ?? d` on a narrowed present 0 (UNSOUND), which needs a
-value-optional representation change (three site-local guards each regressed serde/DI/try). These remain OPEN;
-marking any of them [x] requires an actual code fix that a probe or gate verifies, not a reframing.
+readiness. (UPDATE 2026-08-20: worked in doc order, Monomorphisation / Traits / Generic-bounds / Enums /
+Optionals are now SOUND with real fixes; the former `x ?? d` present-0 DEFECT is FIXED via a codegen
+narrowed-present tracker, not a representational change.) Marking any remaining criterion [x] requires an
+actual code fix that a probe or gate verifies, not a reframing.
 
 ### Monomorphisation ; SOUND ; case + probe
 
@@ -125,23 +126,28 @@ marking any of them [x] requires an actual code fix that a probe or gate verifie
 - [x] `errdefer` runs only on the error path, LIFO.
 - [x] `T | E | undefined` composes optional over error.
 
-### Optionals and narrowing (`T | undefined`) ; PARTIAL ; probe
+### Optionals and narrowing (`T | undefined`) ; SOUND ; case + probe
 
 - [x] Member access through an optional is guarded, not a null deref.
 - [x] `if (x != undefined)` narrows `x` to its inner type in the branch.
 - [x] Reassigning a narrowed variable invalidates the narrowing.
 - [x] Nested optionals from generics (`Map<K, int|undefined>`) are handled.
 - [x] `x ?? d` returns the present value for a present non-zero, and the default for genuine absent.
-- [ ] `x ?? d` returns the present value for a present ZERO after narrowing (UNSOUND, see below).
+- [x] `x ?? d` returns the present value for a present ZERO after narrowing (FIXED, see below).
 
-### `x ?? d` on a narrowed present 0 ; UNSOUND ; probe
+### `x ?? d` on a narrowed present 0 ; SOUND ; case + probe
 
-- [ ] A present `0` in a narrowed value-optional coalesces to `0`, not the default.
-- Root: `??` presence test is `left != 0` (`expressions.zig:4643`); a narrowed value-optional is a raw value
-  where present-0 and the absent sentinel are both 0. NOT fixable at the `??` site (three guard attempts each
-  regressed serde/DI/try). Real fix is representational: keep value-optionals boxed, or a reliable narrowing
-  signal in the typed IR. Test criterion: the narrow-then-coalesce-zero probe passes AND the full corpus stays
-  at 395/398.
+- [x] A present `0` in a narrowed value-optional coalesces to `0`, not the default (FIXED). Root: the `??`
+  presence test is `left != 0`; a RAW value-optional stores a present 0 identically to the absent sentinel, so
+  a present 0 read as absent. The prior three site-local guards regressed serde/DI/try because they could not
+  tell a narrowed-present raw from a genuinely-optional raw. The fix supplies the missing signal WITHOUT a
+  representational change: codegen tracks locals proven present by an enclosing `if (x != undefined)` (a scoped
+  `narrowed_present` set, populated per-branch in `statements.zig` and invalidated on reassignment), and the
+  `??` operator short-circuits a narrowed-present RAW PRIMITIVE left to its present value. Tightly scoped: the
+  BOXED case already tests the box pointer correctly, and a pointer-typed inner has null==0==absent with no
+  valid present 0, so only the raw-primitive case is touched (no ARC surface). Gated: case 392 (present-0 ->
+  0, genuine-absent -> default, reassign-to-absent -> default); corpus 402/405, baseline unchanged, and the
+  serde/DI/try canaries that broke the prior attempts stay green.
 
 ### Closures / lambdas ; PARTIAL ; probe
 
@@ -520,7 +526,7 @@ Ordered with the language stream first (the priority).
 
 Language:
 
-1. `x ?? d` on a narrowed present 0 (representational fix).
+1. ~~`x ?? d` on a narrowed present 0.~~ FIXED (codegen narrowed-present tracker, case 392).
 2. Type-checker fully fail-closed (the remaining `orelse return` sites).
 2b. Codegen: a COMPLETE `switch (list[i])` on an enum (subscript discriminant) hits an `LLVMVerificationError`
    (discovered while gating the exhaustiveness fix). Subscript-of-enum feeding a switch mis-lowers; the

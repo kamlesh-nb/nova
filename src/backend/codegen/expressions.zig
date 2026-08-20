@@ -2099,6 +2099,10 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 switch (bin.left.kind) {
                     .ident => |name| {
 
+                        // Reassigning a narrowed local invalidates its proven-present status: the new value may
+                        // be absent, so `??` must no longer short-circuit it (value-optional-zero correctness).
+                        _ = self.narrowed_present.remove(name);
+
                         if (self.envCaptureIndex(name)) |idx| {
                             const addr = try self.envSlotAddr(idx);
                             const eptr = core.LLVMBuildIntToPtr(self.builder, addr, self.ptr_type, "env_ptr_store");
@@ -4650,6 +4654,26 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             // value-optionals boxed, or a reliable narrowing signal in the typed IR). See the feature
             // inventory (value-optional-zero) — marked UNSOUND.
             const left_present = if (nc_is_valopt) try self.buildValoptUnbox(left_val) else left_val;
+
+            // value-optional-zero fix: if the left is a RAW (unboxed) value-optional whose local was PROVEN
+            // present by an enclosing `if (x != undefined)` and whose inner is a PRIMITIVE, the value is always
+            // present, so `x ?? d` IS x. Return it directly, bypassing the `left != 0` presence test that
+            // misreads a present 0 as absent. Scope is deliberately tight: the BOXED case already tests the box
+            // pointer correctly (a present-0 box is non-null), and a pointer-typed inner has null==0 as a real
+            // absent marker with no valid present 0, so only the raw-primitive-narrowed case is unsound. Raw
+            // primitives carry no ARC, so returning `left_val` needs no retain/consume.
+            if (!nc_is_valopt and nc.left.kind == .ident and self.narrowed_present.contains(nc.left.kind.ident)) {
+                if (self.type_store) |st| {
+                    if (self.typeOfExprConcrete(nc.left)) |lt| {
+                        const inner = self.valueOptionalInner(lt) orelse lt;
+                        const iname = self.cachedTypeName(st, inner) catch "";
+                        if (types_mod.isPrimitiveTypeName(iname)) {
+                            return left_val;
+                        }
+                    }
+                }
+            }
+
             const left_bb_end = core.LLVMGetInsertBlock(self.builder);
 
             // A NESTED value-optional peel (`g ?? d` where `g : (int | undefined) | undefined`, from

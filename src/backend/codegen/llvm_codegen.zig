@@ -168,6 +168,13 @@ pub const LlvmCompiler = struct {
 
     current_local_type_ids: ?*std.StringHashMap(sema_types.TypeId),
 
+    // Names of local value-optionals PROVEN present by an enclosing `if (x != undefined)` (or the else arm of
+    // `if (x == undefined)`), scoped to that branch. Consulted by the `??` operator so a narrowed-present
+    // PRIMITIVE value-optional (`int | undefined` holding 0) short-circuits to its present value instead of
+    // failing the `left != 0` presence test, which misreads a present 0 as absent (the value-optional-zero
+    // defect). Populated/restored around the guarded branch; invalidated on reassignment of the name.
+    narrowed_present: std.StringHashMap(void),
+
     pending_temps: std.ArrayList(PendingTemp) = .empty,
     current_struct_name: ?[]const u8,
 
@@ -380,6 +387,7 @@ pub const LlvmCompiler = struct {
             .decimal_globals = std.StringHashMap(types.LLVMValueRef).init(allocator),
             .current_local_types = null,
             .current_local_type_ids = null,
+            .narrowed_present = std.StringHashMap(void).init(allocator),
             .current_struct_name = null,
             .current_instantiation = null,
             .current_module_prefix = null,
@@ -837,6 +845,7 @@ pub const LlvmCompiler = struct {
             }
             self.param_type_str_cache.deinit();
         }
+        self.narrowed_present.deinit();
         self.async_fns.deinit();
         self.structs.deinit();
         self.unions.deinit();

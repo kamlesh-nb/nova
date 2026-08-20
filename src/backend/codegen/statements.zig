@@ -10,6 +10,24 @@ const LlvmCompiler = @import("llvm_codegen.zig").LlvmCompiler;
 const FunctionInfo = @import("llvm_codegen.zig").FunctionInfo;
 const Scope = @import("llvm_codegen.zig").Scope;
 
+// value-optional-zero support: a `x != undefined` / `undefined != x` condition proves `x` present in the
+// THEN branch; a `x == undefined` condition proves it present in the ELSE branch. Returns the narrowed local
+// name and which branch it holds in, so the `??` operator can short-circuit a narrowed-present primitive.
+const PresenceNarrow = struct { name: []const u8, then_branch: bool };
+fn detectPresenceNarrow(cond: ast.Expression) ?PresenceNarrow {
+    if (cond.kind != .binary) return null;
+    const bin = cond.kind.binary;
+    if (bin.op != .ne and bin.op != .eq) return null;
+    var name: ?[]const u8 = null;
+    if (bin.left.kind == .ident and LlvmCompiler.isUndefinedLiteralExpr(bin.right)) {
+        name = bin.left.kind.ident;
+    } else if (bin.right.kind == .ident and LlvmCompiler.isUndefinedLiteralExpr(bin.left)) {
+        name = bin.right.kind.ident;
+    }
+    const n = name orelse return null;
+    return PresenceNarrow{ .name = n, .then_branch = (bin.op == .ne) };
+}
+
 pub fn runErrdefers(self: *LlvmCompiler) anyerror!void {
     var si = self.scopes.items.len;
     while (si > 0) {
@@ -422,15 +440,27 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
 
             _ = core.LLVMBuildCondBr(self.builder, cond_i1, then_bb, else_bb orelse merge_bb);
 
+            // value-optional-zero: a presence guard narrows `x` present in exactly one branch. Add the name to
+            // `narrowed_present` around that branch and restore it afterwards (only if WE added it, so a name
+            // narrowed by an outer scope is left intact). This lets `??` short-circuit a narrowed-present
+            // primitive value-optional instead of misreading a present 0 as absent.
+            const pnarrow = detectPresenceNarrow(is.condition);
+
             core.LLVMPositionBuilderAtEnd(self.builder, then_bb);
+            const then_narrowed = if (pnarrow) |nw| (nw.then_branch and !self.narrowed_present.contains(nw.name)) else false;
+            if (then_narrowed) try self.narrowed_present.put(pnarrow.?.name, {});
             try self.compileStatement(is.then_branch.*, func);
+            if (then_narrowed) _ = self.narrowed_present.remove(pnarrow.?.name);
             if (core.LLVMGetBasicBlockTerminator(core.LLVMGetInsertBlock(self.builder)) == null) {
                 _ = core.LLVMBuildBr(self.builder, merge_bb);
             }
 
             if (is.else_branch) |eb| {
                 core.LLVMPositionBuilderAtEnd(self.builder, else_bb.?);
+                const else_narrowed = if (pnarrow) |nw| (!nw.then_branch and !self.narrowed_present.contains(nw.name)) else false;
+                if (else_narrowed) try self.narrowed_present.put(pnarrow.?.name, {});
                 try self.compileStatement(eb.*, func);
+                if (else_narrowed) _ = self.narrowed_present.remove(pnarrow.?.name);
                 if (core.LLVMGetBasicBlockTerminator(core.LLVMGetInsertBlock(self.builder)) == null) {
                     _ = core.LLVMBuildBr(self.builder, merge_bb);
                 }
