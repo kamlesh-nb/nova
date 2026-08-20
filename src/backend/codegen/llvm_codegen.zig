@@ -2084,7 +2084,38 @@ pub const LlvmCompiler = struct {
         // trait object (the erased shared body mishandled the concrete field, SEGV -- case 299).
         const mangled = try types_mod.mangleTypeName(self.allocator, struct_name);
         defer self.allocator.free(mangled);
-        const base_name = try std.fmt.allocPrint(self.allocator, "_vtable_{s}_{s}", .{ mangled, trait_name });
+
+        // MONOMORPHIC generic-trait dispatch: append the concrete trait type-args of THIS struct's own impl,
+        // so `IntMaker impl Producer<int>` names its vtable `_vtable_IntMaker_Producer_int` instead of the
+        // M-erased `_vtable_IntMaker_Producer`. The args come from the struct's impl declaration (the single
+        // source of truth), so every caller -- trait-object construction AND the downcast check -- derives the
+        // SAME name from the same `(struct, trait)` pair, and the two never diverge. A plain (non-generic)
+        // trait has no type_args, so the suffix is empty and its vtable name is byte-identical to before.
+        const trait_base = getStructBaseName(trait_name);
+        var mono_suffix = std.ArrayList(u8).empty;
+        defer mono_suffix.deinit(self.allocator);
+        if (self.structs.get(getStructBaseName(struct_name))) |sdecl| {
+            for (sdecl.impls) |impl| {
+                if (std.mem.eql(u8, getStructBaseName(impl.name), trait_base) and impl.type_args.len > 0) {
+                    for (impl.type_args) |ta| {
+                        // Use the arg's bare name (BORROWED -- do not free); mangleTypeName returns a fresh
+                        // owned string (int -> i32, keeping the name linker-safe and stable).
+                        const ta_str: []const u8 = switch (ta) {
+                            .ident => |n| n,
+                            .generic => |g| g.name,
+                            else => "x",
+                        };
+                        const ta_mangled = try types_mod.mangleTypeName(self.allocator, ta_str);
+                        defer self.allocator.free(ta_mangled);
+                        try mono_suffix.append(self.allocator, '_');
+                        try mono_suffix.appendSlice(self.allocator, ta_mangled);
+                    }
+                    break;
+                }
+            }
+        }
+
+        const base_name = try std.fmt.allocPrint(self.allocator, "_vtable_{s}_{s}{s}", .{ mangled, trait_name, mono_suffix.items });
         defer self.allocator.free(base_name);
         const vtable_name = try self.allocator.dupeZ(u8, base_name);
         defer self.allocator.free(vtable_name);

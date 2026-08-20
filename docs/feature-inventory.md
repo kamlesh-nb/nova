@@ -73,14 +73,20 @@ marking any of them [x] requires an actual code fix that a probe or gate verifie
       value-optional `get()` path that the erased layout mishandles. Corpus 399/402, baseline unchanged, no
       instantiation bloat -- the speculative cascade stays capped).
 
-### Traits and dynamic dispatch ; PARTIAL ; case + probe
+### Traits and dynamic dispatch ; SOUND ; case + probe
 
 - [x] Dynamic dispatch via fat pointers `{struct_ptr, vtable}`; vtable slot 0 is the destructor.
 - [x] Checked downcast (`x as T`) traps on a wrong concrete type.
 - [x] Trait default methods work cross-module (FIXED: `pipeline.expandTraitDefaults` re-runs the default-body
       copy on the fully-merged decls; probe: a struct in one module inherits a default from a trait in another;
       corpus 395/398, same-module case 301 green).
-- [ ] Generic trait dispatch is monomorphic, not type-erased (currently erased, one slot per method).
+- [x] Generic trait dispatch is monomorphic, not type-erased (FIXED: each `impl Producer<M>` now names its
+      vtable per-M -- `_vtable_IntMaker_Producer_i32`, `_vtable_StrMaker_Producer_string` -- instead of a single
+      M-erased `_vtable_..._Producer`. The M comes from the struct's own impl `type_args` in `getGlobalVTable`,
+      so trait-object construction AND the downcast check derive the SAME name and never diverge; a plain
+      non-generic trait has no type_args so its vtable name is byte-identical (no regression). Proven: IR shows
+      the per-M names; case 391 dispatches `Producer<int>`/`Producer<string>` through trait values correctly;
+      corpus 400/403 with downcast (71), per-instantiation (299), and generic-trait (55/56/57/120) all green).
 
 ### Generic bounds (`where T: Bound`) ; SOUND ; case + probe
 
