@@ -240,10 +240,12 @@ marking any of them [x] requires an actual code fix that a probe or gate verifie
   and int64 otherwise, instead of `val as int`). Probe + case 388: `5_000_000_000` round-trips as int64
   (type 18, correct hi/lo); a small value stays int32 (type 16); BSON cases 51/90/161 unaffected.
 
-### MSSQL transport defaults ; UNSOUND ; read
-- [ ] Encryption is on by default.
-- [ ] The server certificate is verified by default.
-- Currently `encrypt=false` and `trustCert=true` unless the connection string overrides both.
+### MSSQL transport defaults ; SOUND ; case + probe
+- [x] Encryption is on by default (FIXED: `connection.parse` now `encrypt=true` unless `?encrypt=false`).
+- [x] The server certificate is verified by default (FIXED: `trustCert=false` unless `?trustServerCertificate=true`).
+- Probe `nova-mssql/tests/111_connection_secure.nova`: a plain connection string yields `encrypt=true` /
+  `trustCert=false`; explicit `?encrypt=false&trustServerCertificate=true` is honoured. Matches modern
+  drivers (.NET SqlClient encrypt=true default). Committed nova-mssql 23b2c79.
 
 ### MySQL / SCRAM auth trust ; UNSOUND ; swept
 - [ ] MySQL caching_sha2 does not send the password against an unverified server RSA key over plaintext.
@@ -264,6 +266,11 @@ marking any of them [x] requires an actual code fix that a probe or gate verifie
 
 ### Package manager ; PARTIAL ; read
 - [x] Git-pin dependency resolution with a lockfile.
+- [x] A package's own module wins over a same-named sibling/cached package (FIXED lang 6c14e13: import
+  resolution now checks the CWD/package-root `./<mod>.nova` + `./src/<mod>.nova` as the final
+  importer-relative step, before the global scans. Previously a bare-filename or `tests/`-relative importer
+  fell through to `~/.nova/cache` and `import connection` could bind to a DIFFERENT package's module, e.g.
+  mssql resolving nova-postgres's `ConnectionOptions` -> `FieldNotFound`. Corpus 396/399, baseline unchanged).
 - [ ] A central registry / discovery.
 - [ ] Semver range resolution and version unification.
 
@@ -437,10 +444,13 @@ Language:
 defect. The single-file `nova x -o out` build for `List` programs was fixed as a byproduct.)
 
 Drivers:
-4. BSON ORM `long` truncation.
-5. MSSQL secure-by-default transport.
+4. ~~BSON ORM `long` truncation.~~ FIXED (lang 6e83b1b, case 388).
+5. ~~MSSQL secure-by-default transport.~~ FIXED (nova-mssql 23b2c79, test 111).
 6. MySQL RSA-over-plaintext and unverified SCRAM signature.
 7. pg / TLS per-connection buffer leaks.
+8. Driver-package source/test skew (exposed once import resolution was fixed): nova-mysql `codec`
+   arity mismatch (`buildStmtPrepare` / a 2-vs-3-arg call in tests/109); nova-postgres mock `EchoConn`
+   missing the `Connection.queryWire` trait method (tests/105). Pre-existing package bugs, not language.
 
 NovaDB:
 8. SQL silent-wrong (ORDER BY sort, typed storage, DISTINCT/UNIQUE/FK enforcement).
