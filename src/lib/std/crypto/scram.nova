@@ -116,6 +116,43 @@ pub struct ScramClient {
         return `${clientFinalNoProof},p=${proof}`;
     }
 
+    // The ServerSignature (base64) this client EXPECTS in the server-final message, given the same
+    // server-first it answered. RFC 5802 requires the client to compare the server's `v=` against this; a
+    // mismatch means the peer does not know the password (a rogue/MITM server) and the exchange MUST fail.
+    // Recomputed from server-first (salt, iterations) + the password, so it needs no retained state.
+    pub fn expectedServerSignature(self: ScramClient, serverFirst: string): string {
+        let combinedNonce = "";
+        let saltB64 = "";
+        let iters = 0;
+        let parts = string.split(serverFirst, ",");
+        for (p in parts) {
+            if (string.startsWith(p, "r=")) { combinedNonce = attrValue(p, "r="); }
+            if (string.startsWith(p, "s=")) { saltB64 = attrValue(p, "s="); }
+            if (string.startsWith(p, "i=")) { iters = string.parseI64(attrValue(p, "i=")) as int; }
+        }
+        let salt = base64.decode(saltB64);
+        let clientFinalNoProof = `c=biws,r=${combinedNonce}`;
+        let authMessage = `${self.clientFirstBare()},${serverFirst},${clientFinalNoProof}`;
+        return computeServerSigB64(self.password, salt, iters, authMessage);
+    }
+
+    // SHA-1 variant of expectedServerSignature.
+    pub fn expectedServerSignatureSha1(self: ScramClient, serverFirst: string): string {
+        let combinedNonce = "";
+        let saltB64 = "";
+        let iters = 0;
+        let parts = string.split(serverFirst, ",");
+        for (p in parts) {
+            if (string.startsWith(p, "r=")) { combinedNonce = attrValue(p, "r="); }
+            if (string.startsWith(p, "s=")) { saltB64 = attrValue(p, "s="); }
+            if (string.startsWith(p, "i=")) { iters = string.parseI64(attrValue(p, "i=")) as int; }
+        }
+        let salt = base64.decode(saltB64);
+        let clientFinalNoProof = `c=biws,r=${combinedNonce}`;
+        let authMessage = `${self.clientFirstBare()},${serverFirst},${clientFinalNoProof}`;
+        return computeServerSigB64Sha1(self.password, salt, iters, authMessage);
+    }
+
     // The SCRAM-SHA-1 client-final message (proof computed with SHA-1). Used when the negotiated /
     // requested mechanism is SCRAM-SHA-1 instead of the SHA-256 default.
     pub fn clientFinalMessageSha1(self: ScramClient, serverFirst: string): string {
