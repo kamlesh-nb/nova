@@ -17,14 +17,15 @@ Each feature has a **status**, a **verification method**, and a checklist of **a
 Status: **SOUND** (implemented, gated, no known hole) / **PARTIAL** (works, documented limitation) /
 **UNSOUND** (a confirmed correctness or safety defect).
 
-Criterion mark: **[x]** met (evidence exists) / **[~]** partial or unverified / **[ ]** not met.
+Criterion mark: **[x]** met (evidence exists) / **[ ]** not met. A feature's status is SOUND ONLY when EVERY
+criterion is [x]; a single [ ] means the feature is not SOUND yet (PARTIAL, or UNSOUND if the unmet criterion
+is a confirmed defect). By-design non-features and pure perf optimisations are NOT criteria and are not listed
+(a criterion is a thing the feature must do to be considered done). Where a note is a scope clarification
+rather than a requirement, it is written as a plain note, not a criterion.
 
 Verification method (strongest wins): **probe** (compiled + run this session) / **case N** (a conformance case
 gates it) / **read** (source read first-hand this session) / **swept** (broad audit sweep only; weakest;
 verify before trusting). When a swept claim and a probe disagree, the probe wins.
-
-A feature is only "SOUND and complete" when every one of its criteria is [x]. A SOUND status with a [~] or [ ]
-criterion means sound-for-what-it-does but not complete.
 
 ## The shape of Nova (the model we built)
 
@@ -50,7 +51,7 @@ error earlier), narrow (an UNUSED generic bound; used bounds are structurally en
 "escaping closure environment leak" does not leak: 2M closures stay flat at 1.4 MB). The one genuinely-broken,
 probe-confirmed CORRECTNESS bug in the language is `x ?? d` on a narrowed present 0, which needs a value-
 optional representation change. The other unmet items are COMPLETENESS (Atomic runtime, typed closure params,
-bounded channels, actor supervision, io_uring multishot, IOCP readiness), several of which are deferrable.
+bounded channels, actor supervision, IOCP readiness), several of which are deferrable.
 So: the language is close to sound-for-release, with `??`-present-zero as the single real soundness fix.
 
 ### Monomorphisation ; SOUND ; probe
@@ -58,22 +59,20 @@ So: the language is close to sound-for-release, with `??`-present-zero as the si
 - [x] Method-level generics tracked separately (`List<T>.map<U>`).
 - [x] Field-type and return-type recursion instantiated (the `Set<T>{map:Map<T,bool>}` fix).
 - [x] Deep nesting does not crash; falls back to the erased body and runs (probe: depth-4 runs).
-- [~] Eager instantiation beyond nesting depth 2 (perf only, not correctness; deeper uses the erased path).
 - [x] No `LLVMVerifyError` from a standalone generic that never reached the worklist.
 
-### Traits and dynamic dispatch ; SOUND ; case
+### Traits and dynamic dispatch ; PARTIAL ; case
 - [x] Dynamic dispatch via fat pointers `{struct_ptr, vtable}`; vtable slot 0 is the destructor.
 - [x] Checked downcast (`x as T`) traps on a wrong concrete type.
-- [~] Trait default methods work cross-module (currently same-module only).
-- [~] Generic trait dispatch is monomorphic, not type-erased (currently erased, one slot per method).
+- [ ] Trait default methods work cross-module (currently same-module only).
+- [ ] Generic trait dispatch is monomorphic, not type-erased (currently erased, one slot per method).
 
-### Generic bounds (`where T: Bound`) ; SOUND (for used bounds) ; probe
+### Generic bounds (`where T: Bound`) ; PARTIAL ; probe
 - [x] `where` clauses parse.
 - [x] A generic body that calls a bounded method is rejected when instantiated with a type lacking it (probe:
-  structural dispatch catches it at the concrete instantiation; `totalArea<Sq>` compiles, a type without the
-  method errors).
+  structural dispatch catches it; `totalArea<Sq>` compiles, a type without the method errors).
 - [ ] An UNUSED declared bound is enforced (if the body never calls the bounded method, instantiating with a
-  non-conforming type is not rejected). Narrow completeness gap; the used-bound case is already sound.
+  non-conforming type is not rejected). Narrow; the used-bound case is already sound.
 
 ### Enums and pattern matching ; SOUND ; case + probe
 - [x] Payload-less, single-payload, tuple-form, and struct-form variants.
@@ -81,8 +80,6 @@ So: the language is close to sound-for-release, with `??`-present-zero as the si
 - [x] Case guards (`case v if cond`).
 - [x] ARC destructors run for refcounted enum payloads.
 - [x] A non-exhaustive switch on a typed enum is a compile error (probe: "variant not handled").
-- [~] Exhaustiveness is enforced even when the discriminant type cannot be resolved (that edge is the
-  fail-closed-checker item below).
 
 ### Error handling (`T | E`, `try`, `catch`, `errdefer`) ; SOUND ; case
 - [x] `try` propagates the error arm to the enclosing function.
@@ -106,50 +103,46 @@ So: the language is close to sound-for-release, with `??`-present-zero as the si
   signal in the typed IR. Test criterion: the narrow-then-coalesce-zero probe passes AND the full corpus stays
   at 395/398.
 
-### Closures / lambdas ; SOUND ; probe
+### Closures / lambdas ; PARTIAL ; probe
 - [x] A stored / aliased multi-argument closure calls correctly (`let g = f; g(3,4)`).
 - [x] Per-instance heap environments; loop captures are independent.
-- [x] Creating and dropping a closure reclaims its memory (no leak, no unbounded growth). Empirically
-  verified: 2,000,000 closures created + dropped (List capture and owned-string capture) peak at ~1.2 to 1.4
-  MB, flat, versus 26 MB for a genuinely-growing 2M-element List. The runtime reclaims/reuses the persistent
-  box+env allocations. This CORRECTS an earlier UNSOUND mark: reading codegen (persistent alloc + a never-
-  called cleanup) suggested a leak, but the measurement disproves it. The `leaks`/LSan tools also report 0
-  (the allocations stay reachable). Lesson: measure, do not infer from the alloc call.
-- [ ] Closure parameters are typed (currently untyped, inferred from the call site). Completeness, not
-  soundness.
+- [x] Creating and dropping a closure reclaims its memory (no leak, no unbounded growth). Empirically verified:
+  2,000,000 closures created + dropped (List capture and owned-string capture) stay flat at ~1.2 to 1.4 MB
+  versus 26 MB for a genuinely-growing 2M-element List. This CORRECTS an earlier UNSOUND leak mark: the
+  measurement disproves it (`leaks`/LSan also report 0). Lesson: measure, do not infer from the alloc call.
+- [ ] Closure parameters are typed (currently untyped, inferred from the call site).
 
 ### Integers (`int` 32-bit, `long` 64-bit) ; SOUND ; probe
 - [x] `int` is 32-bit two's-complement with defined wraparound; `long` is 64-bit.
 - [x] Address arithmetic uses `long`/`ptr` (no 32-bit truncation of heap addresses).
-- [~] A checked/overflow-trapping integer mode exists (not built; wraparound is the defined behaviour).
 
-### `Atomic<T>` compile-time check ; SOUND ; probe
+### `Atomic<T>` ; PARTIAL ; probe
 - [x] An invalid atomic element type (`Atomic<string>`) is rejected at compile time.
-- [ ] The `Atomic<T>` stdlib type has a working runtime (currently a stub: load undefined, CAS false).
+- [ ] The `Atomic<T>` stdlib runtime works (`load`/`store`/`compareAndSwap`/`add`/`sub`); currently a stub
+  (load returns undefined, CAS returns false, `init` allocates nothing).
 
 ### `decimal128` ; SOUND ; case
 - [x] Arithmetic, parse, and round-trip through JSON / YAML / BSON with fidelity.
 - [x] No implicit int/decimal coercion.
 
-### Type-checker soundness (fail-closed) ; SOUND (common cases) ; probe
+### Type-checker fail-closed ; PARTIAL ; probe
 - [x] Method-call arity is checked; unresolved calls are located errors.
 - [x] Non-bool `if`/`while` conditions are rejected (probe: `if (s)` on a string errors).
 - [x] Optional/error assigned or passed where a plain value is required is rejected (probe: both error).
 - [x] Return-type mismatch is rejected (probe: returning a string from an int fn errors).
-- [~] Defence-in-depth: the remaining `resolveExprType(...) orelse return` sites fire only for a genuinely
-  untypeable expression, which normally errors earlier (unknown var/method). Not shown exploitable this
-  session; converting them to explicit fail-closed is a belt-and-suspenders hardening, not a live bug.
+- [ ] Every checked position fails closed for a genuinely-untypeable expression (the remaining
+  `resolveExprType(...) orelse return` sites). Not shown exploitable this session (such expressions normally
+  error earlier), so it is defence-in-depth rather than a live bug, but it is not yet met.
 
-### async / await ; SOUND ; case
+### async / await ; PARTIAL ; case
 - [x] `async fn` compiles to an LLVM coroutine; `spawn` returns a future; `await` joins.
 - [x] Function colouring enforced (`await`/`spawn` only inside `async fn`).
 - [x] `when_all` / `select` over a homogeneous future list.
-- [~] Heterogeneous-type combinator (`join!`-style) (only homogeneous `List<future<T>>` today).
+- [ ] Heterogeneous-type combinator (`join!`-style) (only homogeneous `List<future<T>>` today).
 
-### Reactor (kqueue / epoll / io_uring / IOCP) ; SOUND ; case
-- [x] All four backends run-verified against the conformance corpus.
+### Reactor (kqueue / epoll / io_uring / IOCP) ; PARTIAL ; case
+- [x] kqueue / epoll / io_uring / IOCP run-verified against the conformance corpus.
 - [x] Deadlines / timeouts are reactor-native on every backend.
-- [~] io_uring uses multishot recv / SQPOLL (currently readiness-emulated, slower than epoll).
 - [ ] IOCP readiness cases 192/194/195 pass (open).
 
 ### Channels and actors ; PARTIAL ; read
@@ -170,7 +163,8 @@ So: the language is close to sound-for-release, with `??`-present-zero as the si
   use-after-consume / path-imbalance).
 - [x] Default-on and fail-closed; rejects a proven imbalance at compile time.
 - [x] 99-100% corpus coverage; reassign deferral bucket is 0 (if/loop/switch/break/continue via phis).
-- [~] It is a compiler-correctness ARC-balance self-check, NOT a Rust-style borrow checker (by scope).
+- Scope note (not a criterion): this is a compiler-correctness ARC-balance self-check, not a Rust-style borrow
+  checker.
 
 ---
 
@@ -181,22 +175,22 @@ So: the language is close to sound-for-release, with `??`-present-zero as the si
 - [x] List has a rich functional API (map/filter/reduce/slice/etc.).
 - [ ] `List.sort` is O(n log n) (currently insertion sort, O(n^2)).
 
-### Strings and text ; SOUND ; case
+### Strings and text ; PARTIAL ; case
 - [x] Complete byte-oriented API (split/join/slice/trim/replace/case/compare).
 - [x] UTF-8 codepoint decode/encode.
-- [~] Unicode normalisation / grapheme / collation / case-fold (codepoint-level only).
+- [ ] Unicode normalisation / grapheme / collation / case-fold (codepoint-level only).
 
 ### Regex ; PARTIAL ; case
 - [x] Alternation, char classes, anchors, `* + ?`, capture groups, find/replace.
 - [ ] Linear-time (no catastrophic backtracking; currently a backtracking VM).
 - [ ] Common escapes and counted repetition (`\d` `\w` `\b` `{n,m}`, lazy quantifiers).
 
-### Serialisation (JSON / YAML / BSON) ; SOUND ; case
+### Serialisation (JSON / YAML / BSON) ; PARTIAL ; case
 - [x] Parse and serialise with numeric fidelity (int fast-path, decimals as text).
 - [x] Malformed input sets a failed flag (no silent partial parse).
-- [~] YAML is full 1.2 (subset today: no verified merge keys / complex tags).
+- [ ] YAML is full 1.2 (subset today: no verified merge keys / complex tags).
 
-### Crypto and TLS ; SOUND (unaudited) ; case
+### Crypto and TLS ; PARTIAL (unaudited) ; case
 - [x] SHA / AES-GCM / ChaCha20-Poly1305 / P-256 / P-384 / X25519 / RSA, KAT + differential tested.
 - [x] TLS 1.3 client + server with 0-RTT, resumption, mTLS; TLS 1.2 client.
 - [ ] SHA-384 transcript (AES-256-GCM-SHA384-only servers currently fail).
@@ -206,9 +200,9 @@ So: the language is close to sound-for-release, with `??`-present-zero as the si
 - [x] RFC-1951 decoder, byte-exact against system gzip.
 - [ ] Encoder emits dynamic Huffman + lazy matching (currently fixed-Huffman greedy; weaker ratio).
 
-### HTTP / web framework ; SOUND ; case
+### HTTP / web framework ; PARTIAL ; case
 - [x] HTTP/1.1 server + client, typed path params, DI, mediator, full middleware, hypermedia/SSE.
-- [~] HTTP/2 or HTTP/3 (HTTP/1.1 only).
+- [ ] HTTP/2 or HTTP/3 (HTTP/1.1 only).
 
 ### datetime ; PARTIAL ; swept
 - [x] ISO-8601 / RFC-3339 parse, format, and arithmetic.
@@ -219,10 +213,10 @@ So: the language is close to sound-for-release, with `??`-present-zero as the si
 
 # Stream 3: Database drivers (the `db` seam)
 
-### Wire protocols (pg / mysql / mssql / mongo) ; SOUND ; read
+### Wire protocols (pg / mysql / mssql / mongo) ; PARTIAL ; read
 - [x] Real binary protocols, server-side prepared statements, transactions.
 - [x] Connection pooling with idle/open caps and lifetime eviction.
-- [~] Micro-ORM has relations / migrations / query builder (data-mapper only).
+- [ ] Micro-ORM has relations / migrations / query builder (data-mapper only).
 
 ### BSON ORM `long` fidelity ; UNSOUND ; swept
 - [ ] The ORM bind path preserves 64-bit `long` (currently truncates to 32 bits).
@@ -244,10 +238,10 @@ So: the language is close to sound-for-release, with `??`-present-zero as the si
 
 # Stream 4: Tooling
 
-### Compiler + build ; SOUND ; build
+### Compiler + build ; PARTIAL ; build
 - [x] Cross-compilation to linux / macos / windows produces real binaries.
 - [x] Per-file object caching skips unchanged files.
-- [~] Incremental compilation is query-granular (currently coarse file-hash / split-object).
+- [ ] Incremental compilation is query-granular (currently coarse file-hash / split-object).
 
 ### Package manager ; PARTIAL ; read
 - [x] Git-pin dependency resolution with a lockfile.
@@ -256,12 +250,12 @@ So: the language is close to sound-for-release, with `??`-present-zero as the si
 
 ### LSP (`nls`) ; PARTIAL ; read
 - [x] Completion, hover, definition, symbols, semantic tokens.
-- [~] Rename / references are semantic cross-file (currently text-based for globals).
+- [ ] Rename / references are semantic cross-file (currently text-based for globals).
 - [ ] Cross-file (import-resolved) diagnostics (currently single-file).
 
-### Debugger ; SOUND ; read
+### Debugger ; PARTIAL ; read
 - [x] DWARF line tables + DITypes, lldb-dap, data formatters for List/Map/Set/struct.
-- [~] Non-macOS wiring and full formatter coverage.
+- [ ] Non-macOS wiring and full formatter coverage.
 
 ### Formatter and test runner ; PARTIAL ; build
 - [x] `nova fmt` with a token-stream-equivalence self-check.
@@ -292,7 +286,7 @@ shell harnesses are manual and non-gating.
 - [x] ENOSPC on commit is never falsely ACKed.
 - [x] 3-phase recovery re-bootstraps the system catalog (the fixed Phase-2 data-loss bug).
 
-### Replication safety ; SOUND ; case
+### Replication safety ; PARTIAL ; case
 - [x] Log-shipping with logical follower apply (cross-node page-id fork resolved).
 - [x] Fencing epochs reject a stale-epoch writer.
 - [x] Quorum-ack durable commit (RPO=0).
@@ -316,7 +310,7 @@ shell harnesses are manual and non-gating.
 - [x] Structured concurrent-writer stress cases are gated.
 - [ ] The harshest randomised concurrent same-tree mutation is gated (currently OFF by default; expected to
   corrupt per its own comment).
-- [~] Write scalability beyond ~5 writers (deliberate ceiling today).
+- [ ] Write scalability beyond ~5 writers (deliberate ceiling today).
 
 ### SQL parser ; PARTIAL ; read
 - [x] CREATE/ALTER/DROP TABLE, PK, NOT NULL, single-col FK, CREATE/DROP INDEX.
@@ -346,7 +340,7 @@ Read first: the offline gate tests ALGORITHMS OVER IN-PROCESS FAKES (shared in-m
 a `FakeConn`); the real cross-process/cross-node paths are only in manual, non-gating tests. And the offline
 gate does not currently reproduce green on this checkout (see the two UNSOUND rows).
 
-### proxyd data plane (LB, pool, discovery) ; SOUND (logic) ; case
+### proxyd data plane (LB, pool, discovery) ; PARTIAL (logic) ; case
 - [x] RoundRobin / Weighted / LeastConn / ConsistentHash strategies, per-reactor lock-free.
 - [x] Backend pool with keep-alive safe reuse.
 - [x] Discovery-file publish (atomic temp+rename) and consume.
@@ -363,7 +357,7 @@ gate does not currently reproduce green on this checkout (see the two UNSOUND ro
 - [ ] Reconcile drives REAL process lifecycle (currently `simulated=true`, virtual replicas).
 - [ ] `181_orchestrator` runs to completion (currently crashes entering the async reconcile subtest).
 
-### Leader lease (fencing epochs) ; SOUND (logic) ; case
+### Leader lease (fencing epochs) ; PARTIAL (logic) ; case
 - [x] Fencing-after-promotion; a stale-epoch renew is rejected.
 - [x] Clock-skew and 3-node election gated over a shared in-process store.
 - [ ] Verified as a real distributed system (currently one shared in-process store + mock clock).
@@ -386,7 +380,7 @@ gate does not currently reproduce green on this checkout (see the two UNSOUND ro
 - [ ] The CPU signal is per-replica, not aggregate-across-replicas against a per-replica setpoint.
 - [ ] Scale-down does not block the reactor (`p.wait()` on reactor 0 today).
 
-### Rolling upgrade + HA membership ; SOUND (simulated) ; case
+### Rolling upgrade + HA membership ; PARTIAL (simulated) ; case
 - [x] Workload rolling update (one replica at a time, N-1 keep serving).
 - [x] Control-plane drain/promote/upgrade/rejoin with rollback.
 - [x] HA property test: RPO=0 each round, RTO measured, epoch monotonicity.
