@@ -64,7 +64,15 @@ fn retainValueStructOwnedFieldsDepth(self: *LlvmCompiler, structAddr: types.LLVM
         if (isContainerBaseName(fbase)) {
             const ptr = core.LLVMBuildIntToPtr(self.builder, addr, core.LLVMPointerType(self.val_type, 0), "vs_cfld_ptr");
             const cur = core.LLVMBuildLoad2(self.builder, self.val_type, ptr, "vs_cfld");
-            if (findContainerCopyFn(self, fts)) |copy_fn| {
+            // A container field whose element type is STILL an unsubstituted type parameter of this struct
+            // (`List<T>` in a `Box<T>` instantiated in ANOTHER module -- cross-module mono does not substitute
+            // the value-struct field type). Its monomorphised `copy` cannot be resolved, and looking one up by
+            // the `<T>` name returns a garbage function ref that crashes `LLVMGlobalGetValueType`. Fall back to
+            // a retain-alias: the copy SHARES the container. That is safe (no crash) and, for a shared/handle-
+            // style generic struct such as an async channel, is exactly the intended semantics.
+            if (fieldTypeMentionsTypeParam(fts, sd.type_params)) {
+                try self.compileRetain(cur);
+            } else if (findContainerCopyFn(self, fts)) |copy_fn| {
                 const ft = core.LLVMGlobalGetValueType(copy_fn);
                 var args = [_]types.LLVMValueRef{cur};
                 const fresh = core.LLVMBuildCall2(self.builder, ft, copy_fn, &args, 1, "vs_ccopy");
@@ -91,6 +99,28 @@ fn isContainerBaseName(name: []const u8) bool {
 
 // Channel 4: look up the monomorphised container `copy` function for a field type like "List<int>"
 // (mangled `List_i32_copy`, `self -> self`). Null if it was not emitted (not reachable).
+fn vscIsIdentChar(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';
+}
+
+// True when `fts` (a rendered field type like "List<T>") mentions one of `type_params` as a WHOLE token --
+// i.e. the field's element type is still an unsubstituted type parameter of the owning struct. Whole-token
+// matching (boundary-checked) so a param "T" does not spuriously match inside another identifier.
+fn fieldTypeMentionsTypeParam(fts: []const u8, type_params: []const []const u8) bool {
+    for (type_params) |tp| {
+        if (tp.len == 0) continue;
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, fts, i, tp)) |pos| {
+            const before_ok = pos == 0 or !vscIsIdentChar(fts[pos - 1]);
+            const after_idx = pos + tp.len;
+            const after_ok = after_idx >= fts.len or !vscIsIdentChar(fts[after_idx]);
+            if (before_ok and after_ok) return true;
+            i = pos + 1;
+        }
+    }
+    return false;
+}
+
 fn findContainerCopyFn(self: *LlvmCompiler, field_type: []const u8) ?types.LLVMValueRef {
     const sym = self.methodSymbol(field_type, "copy") catch return null;
     defer self.allocator.free(sym);
