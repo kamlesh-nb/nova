@@ -290,26 +290,32 @@ actual code fix that a probe or gate verifies, not a reframing.
 
 - [x] Complete byte-oriented API (split/join/slice/trim/replace/case/compare).
 - [x] UTF-8 codepoint decode/encode.
-- [ ] Unicode normalisation / grapheme / collation / case-fold (codepoint-level only).
+- [ ] Unicode normalisation / grapheme / collation / case-fold (codepoint-level only). LARGE: requires
+      shipping the Unicode data tables (NFC/NFD decomposition, grapheme-break, case-fold, collation weights) --
+      a multi-day data + algorithm effort, out of scope for an incremental pass. Left [ ] honestly.
 
 ### Regex ; PARTIAL ; case
 
 - [x] Alternation, char classes, anchors, `* + ?`, capture groups, find/replace.
-- [ ] Linear-time (no catastrophic backtracking; currently a backtracking VM).
-- [ ] Common escapes and counted repetition (`\d` `\w` `\b` `{n,m}`, lazy quantifiers).
+- [x] Common escapes and counted repetition (`\d` `\w` `\b` `{n,m}`, lazy quantifiers). `\d \D \w \W \s \S`,
+      `{n,m}` (parseBrace) and lazy `*? +? ??` already existed; ADDED the missing `\b`/`\B` word-boundary
+      assertions (OP_BOUND, zero-width; they used to match a literal `b`). Case 402.
+- [ ] Linear-time (no catastrophic backtracking; currently a backtracking VM). LARGE: requires replacing the
+      backtracking VM with a Thompson-NFA / Pike-VM engine -- a from-scratch matcher rewrite, out of scope for
+      an incremental pass. Left [ ] honestly.
 
 ### Serialisation (JSON / YAML / BSON) ; PARTIAL ; case
 
 - [x] Parse and serialise with numeric fidelity (int fast-path, decimals as text).
 - [x] Malformed input sets a failed flag (no silent partial parse).
-- [ ] YAML is full 1.2 (subset today: no verified merge keys / complex tags).
+- [ ] YAML is full 1.2 (subset today: no verified merge keys / complex tags). LARGE: full YAML 1.2 (anchors/aliases across the doc, merge keys, the complex tag + schema resolution rules, flow/block edge cases) is a substantial parser project. Left [ ] honestly. JSON/BSON are complete; YAML is the subset gap.
 
 ### Crypto and TLS ; PARTIAL (unaudited) ; case
 
 - [x] SHA / AES-GCM / ChaCha20-Poly1305 / P-256 / P-384 / X25519 / RSA, KAT + differential tested.
 - [x] TLS 1.3 client + server with 0-RTT, resumption, mTLS; TLS 1.2 client.
-- [ ] SHA-384 transcript (AES-256-GCM-SHA384-only servers currently fail).
-- [ ] Independent security audit (hand-rolled, unaudited).
+- [ ] SHA-384 transcript (AES-256-GCM-SHA384-only servers currently fail). MEDIUM but security-critical + not verifiable on this host (no SHA384-only server); deferred rather than changed blind in the TLS state machine.
+- [ ] Independent security audit (hand-rolled, unaudited). IMPOSSIBLE for me to satisfy: an INDEPENDENT third-party audit is by definition external work, not something the implementer can perform. This criterion can only be closed by commissioning an audit -- so Crypto/TLS cannot be marked SOUND by code changes alone.
 
 ### Compression (deflate / gzip) ; SOUND ; case
 
@@ -323,13 +329,13 @@ actual code fix that a probe or gate verifies, not a reframing.
 ### HTTP / web framework ; PARTIAL ; case
 
 - [x] HTTP/1.1 server + client, typed path params, DI, mediator, full middleware, hypermedia/SSE.
-- [ ] HTTP/2 or HTTP/3 (HTTP/1.1 only).
+- [ ] HTTP/2 or HTTP/3 (HTTP/1.1 only). LARGE: HTTP/2 is a new framing layer (HPACK header compression, stream multiplexing, flow control, priority) -- a substantial protocol implementation. Left [ ] honestly.
 
 ### datetime ; PARTIAL ; swept
 
 - [x] ISO-8601 / RFC-3339 parse, format, and arithmetic.
-- [ ] 64-bit epoch (currently 32-bit, Year-2038).
-- [ ] Timezone database (treats wall-clock as UTC).
+- [ ] 64-bit epoch (currently 32-bit, Year-2038). TRACTABLE-but-wide: the epoch type is `int` across the whole datetime API (now/parse/format/add*/dateDiff) and 9 stdlib callers; a mechanical int->long refactor with real regression risk. Deferred this pass; does not block on new algorithms.
+- [ ] Timezone database (treats wall-clock as UTC). LARGE: shipping the IANA tz database + the zone/DST resolution rules is a multi-day data + algorithm effort. Left [ ] honestly.
 
 ---
 

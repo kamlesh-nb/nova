@@ -1,0 +1,20 @@
+// Regex word boundary \b (and \B). The other "common escapes and counted repetition" (\d \w \s, {n,m}, lazy
+// quantifiers) already existed; \b/\B were the missing pieces (they used to match a literal 'b').
+import text.regex;
+import assert;
+@test
+fn word_boundary(): void {
+    // \bcat\b matches "cat" as a whole word, not inside "category" or "bobcat".
+    assert.isTrue(regex.compile("\\bcat\\b").test("the cat sat"));
+    assert.isTrue(!regex.compile("\\bcat\\b").test("category"));
+    assert.isTrue(!regex.compile("\\bcat\\b").test("bobcat9"));
+    // \B is the negation: matches a NON-boundary.
+    assert.isTrue(regex.compile("\\Bcat\\B").test("locate"));   // 'cat' surrounded by word chars
+    assert.isTrue(!regex.compile("\\Bcat\\B").test("a cat b"));
+}
+@test
+fn escapes_and_counted_still_work(): void {
+    assert.isTrue(regex.compile("\\d{3}").test("x415y"));       // counted repetition
+    assert.isTrue(regex.compile("\\w+").test("hello"));         // \w class
+    assert.isTrue(!regex.compile("^\\d{3}$").test("12"));       // exactly 3 digits
+}
