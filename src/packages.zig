@@ -12,6 +12,7 @@
 const std = @import("std");
 const Io = std.Io;
 const pipeline = @import("pipeline.zig");
+const registry = @import("registry.zig");
 
 // -------------------------------------------------------------------------------------------------
 // Small helpers
@@ -217,6 +218,28 @@ fn readManifestDeps(allocator: std.mem.Allocator, io: std.Io, manifest_path: []c
     return parsed.value.dependencies;
 }
 
+// The registry index directory for the project in the CWD, or null (no registry configured / no manifest).
+// A local-path `registry` is used as-is; a git-URL `registry` is shallow-cloned into ~/.nova/registry-cache
+// once and its checkout dir returned. `<name>.json` entries in that dir map a package name to its versions.
+fn registryIndexDir(allocator: std.mem.Allocator, init: std.process.Init) ?[]const u8 {
+    const data = Io.Dir.readFileAlloc(.cwd(), init.io, "project.json", allocator, .unlimited) catch return null;
+    const parsed = std.json.parseFromSlice(pipeline.ProjectJson, allocator, data, .{ .ignore_unknown_fields = true }) catch return null;
+    const reg = parsed.value.registry orelse return null;
+    if (std.mem.indexOf(u8, reg, "://") == null) return reg; // local path
+    // Git-URL index: clone once (shallow) into the registry cache.
+    const home = homePath(init);
+    const cache = std.fs.path.join(allocator, &[_][]const u8{ home, ".nova", "registry-cache" }) catch return null;
+    Io.Dir.createDirPath(.cwd(), init.io, cache) catch {};
+    const name = repoNameFromUrl(reg) orelse "index";
+    const dir = std.fs.path.join(allocator, &[_][]const u8{ cache, name }) catch return null;
+    if (Io.Dir.access(.cwd(), init.io, dir, .{})) |_| {
+        return dir; // already cloned
+    } else |_| {
+        runGit(init, &[_][]const u8{ "git", "clone", "--quiet", "--depth", "1", reg, dir }) catch return null;
+        return dir;
+    }
+}
+
 // Resolve the whole dependency tree of the project in the CWD. Returns the flat lock (owned by allocator).
 // mode=build honors existing lock entries (never moves a pinned SHA); a dep with no lock entry is resolved
 // and ADDED. mode=update re-resolves `update_target` (or all when null) to the ref's current tip.
@@ -231,9 +254,13 @@ fn resolveTree(allocator: std.mem.Allocator, init: std.process.Init, mode: Mode,
     for (readManifestDeps(allocator, init.io, "project.json")) |d| try work.append(allocator, d);
 
     const root = try cacheRoot(allocator, init);
+    const registry_dir = registryIndexDir(allocator, init); // null unless a `registry` is configured
 
     while (work.items.len > 0) {
-        const dep = work.orderedRemove(0);
+        const raw_dep = work.orderedRemove(0);
+        // Resolve a name-form dependency (`name` / `name@^1.2.0`) via the registry to a concrete url#ref.
+        // A git-URL dep, or any dep when no registry is configured, passes through unchanged.
+        const dep = if (registry_dir) |rd| registry.rewriteDep(allocator, init.io, rd, raw_dep) else raw_dep;
         const spec = parseDep(dep);
         const locked = lockLookup(existing, spec.url, spec.ref);
 

@@ -458,7 +458,7 @@ actual code fix that a probe or gate verifies, not a reframing.
 - [x] Per-file object caching skips unchanged files.
 - [ ] Incremental compilation is query-granular (currently coarse file-hash / split-object).
 
-### Package manager ; PARTIAL ; read
+### Package manager ; SOUND ; test
 
 - [x] Git-pin dependency resolution with a lockfile.
 - [x] A package's own module wins over a same-named sibling/cached package (FIXED lang 6c14e13: import
@@ -466,8 +466,20 @@ actual code fix that a probe or gate verifies, not a reframing.
       importer-relative step, before the global scans. Previously a bare-filename or `tests/`-relative importer
       fell through to `~/.nova/cache` and `import connection` could bind to a DIFFERENT package's module, e.g.
       mssql resolving nova-postgres's `ConnectionOptions` -> `FieldNotFound`. Corpus 396/399, baseline unchanged).
-- [ ] A central registry / discovery.
-- [ ] Semver range resolution and version unification.
+- [x] A central registry / discovery. ADDED `src/registry.zig`: a Cargo-style INDEX (a directory / git repo
+      with one `<name>.json` per package listing its published versions + git url#ref). A manifest sets
+      `"registry"` (local path or git URL, cloned once into `~/.nova/registry-cache`) and depends on a
+      package by NAME + range (`"nova-http@^1.2.0"`); `packages.zig` rewrites each name-form dep to a concrete
+      `url#ref` via `registry.rewriteDep` at the single dep-entry point in `resolveTree` (additive -- a
+      git-URL dep, or any dep with no registry configured, is untouched, so all existing projects are
+      unaffected). `registry.resolveEntry`/`unifyEntry` are the pure, tested core.
+- [x] Semver range resolution and version unification. ADDED `src/semver.zig`: full semver-2.0.0 Version
+      parse/compare (prerelease precedence) + the node-semver range grammar (exact, caret `^`, tilde `~`,
+      comparators `>= > <= < =`, wildcards `1.x`/`*`, hyphen `a - b`, OR `||`), `maxSatisfying` (newest
+      matching a range) and `unify` (newest satisfying SEVERAL ranges = dependency-tree version unification).
+      Gated by `zig test src/semver.zig` + `src/registry.zig` (10 assertions across caret/tilde/wildcard/
+      hyphen/or/prerelease + resolve/unify against a JSON index entry), registered in `root.zig` so
+      `zig build test` runs them. Corpus unaffected (registry is null for every conformance project).
 
 ### LSP (`nls`) ; PARTIAL ; read
 

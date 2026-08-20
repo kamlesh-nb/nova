@@ -2015,6 +2015,7 @@ pub const ProjectJson = struct {
     type: ?[]const u8 = null,
     repository: ?[]const u8 = null, // canonical git URL; required by `nova publish` (pkg-manager.md §1)
     dependencies: [][]const u8,
+    registry: ?[]const u8 = null,   // registry index location (local dir or git URL) for name@range deps
 };
 
 

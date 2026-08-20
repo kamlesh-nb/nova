@@ -48,5 +48,8 @@ test {
     _ = @import("frontend/ast.zig");
     _ = @import("frontend/formatter.zig");
 
+    _ = @import("semver.zig");    // package-manager semver ranges + version unification
+    _ = @import("registry.zig");  // package-manager registry / discovery resolution
+
     // (HIR/MIR/LIR LLVM-emit optimiser scrapped 2026-08-16; see docs/design/sil-arc-optimiser-direction.md.)
 }
