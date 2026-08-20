@@ -425,20 +425,49 @@ pub const Parser = struct {
         };
     }
 
-    // Parse and DISCARD an optional `where` clause (`where T: Show, U: Ord + Clone`). Generic dispatch in
-    // Nova is structural -- a call resolves against the concrete instantiation regardless of a declared
-    // bound -- so the constraints are advisory documentation. Accept them so the signature parses; a real
-    // constraint checker can consume the same grammar later.
-    fn skipWhereClause(self: *Parser) ParserError!void {
-        if (!(self.current().type == .identifier and std.mem.eql(u8, self.current().lexeme, "where"))) return;
+    // Parse an optional `where` clause (`where T: Show, U: Ord + Clone`) and CAPTURE its bounds. Nova's
+    // generic dispatch is structural, so a USED bound is already enforced when the body calls the bounded
+    // method. Capturing the bounds additionally lets the type checker reject instantiating a bounded type
+    // parameter with a non-conforming concrete type even when the body never calls the method (the unused-
+    // bound case). Returns an empty slice when there is no `where`.
+    // The trait name of a `where`-bound TypeRef: a bare `Trait` (.ident) or a generic trait `Trait<...>`
+    // (.generic -> its base name). Any other shape yields "" and is simply not matched to a known trait.
+    fn traitRefName(t: ast.TypeRef) []const u8 {
+        return switch (t) {
+            .ident => |n| n,
+            .generic => |g| g.name,
+            else => "",
+        };
+    }
+
+    fn parseWhereClause(self: *Parser) ParserError![]const ast.WhereBound {
+        if (!(self.current().type == .identifier and std.mem.eql(u8, self.current().lexeme, "where"))) return &.{};
         self.advance();
+        var bounds = std.ArrayList(ast.WhereBound).empty;
         while (true) {
-            _ = try self.parseTypeRef(); // the constrained type (e.g. `T`)
+            // The constrained type. Take its bare leading identifier as the type-parameter name (`T` from a
+            // `T` ref); anything more exotic still parses but is not matched to a type parameter below.
+            const tp_ref = try self.parseTypeRef();
+            const tp_name: []const u8 = switch (tp_ref) {
+                .ident => |n| n,
+                .generic => |g| g.name,
+                else => "",
+            };
             try self.expect(.colon);
-            _ = try self.parseTypeRef(); // the first bound
-            while (self.match(.plus)) _ = try self.parseTypeRef(); // `+ Bound2 + ...`
+            var traits = std.ArrayList([]const u8).empty;
+            const first = try self.parseTypeRef();
+            try traits.append(self.allocator, traitRefName(first));
+            while (self.match(.plus)) {
+                const more = try self.parseTypeRef();
+                try traits.append(self.allocator, traitRefName(more));
+            }
+            try bounds.append(self.allocator, ast.WhereBound{
+                .type_param = tp_name,
+                .traits = try traits.toOwnedSlice(self.allocator),
+            });
             if (!self.match(.comma)) break;
         }
+        return try bounds.toOwnedSlice(self.allocator);
     }
 
     fn parseFunctionDecl(self: *Parser, is_exported: bool) ParserError!ast.FunctionDecl {
@@ -485,7 +514,7 @@ pub const Parser = struct {
 
         try self.expect(.right_paren);
         const ret_type = if (self.match(.colon)) try self.parseTypeRef() else null;
-        try self.skipWhereClause();
+        const where_bounds = try self.parseWhereClause();
         const body = try self.parseBlock();
 
         const end_span = self.span();
@@ -497,6 +526,7 @@ pub const Parser = struct {
             .is_exported = exported,
             .attributes = &.{},
             .type_params = try type_params.toOwnedSlice(self.allocator),
+            .where_bounds = where_bounds,
             .is_async = is_async,
             .span = ast.Span{
                 .start = start_span.start,
@@ -951,7 +981,7 @@ pub const Parser = struct {
             try self.expect(.right_paren);
 
             const ret_type = if (self.match(.colon)) try self.parseTypeRef() else null;
-            try self.skipWhereClause();
+            _ = try self.parseWhereClause();
             // A trait method is either a signature (`fn f(self): T;`) or a DEFAULT method with a body
             // (`fn f(self): T { ... }`). The default is inherited by an impl'ing struct that does not
             // override it (see expandTraitDefaults).

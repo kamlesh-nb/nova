@@ -58,45 +58,55 @@ value-optional representation change (three site-local guards each regressed ser
 marking any of them [x] requires an actual code fix that a probe or gate verifies, not a reframing.
 
 ### Monomorphisation ; PARTIAL ; probe
+
 - [x] Concrete generic instantiations produce correct code (case-gated).
 - [x] Method-level generics tracked separately (`List<T>.map<U>`).
 - [x] Field-type and return-type recursion instantiated (the `Set<T>{map:Map<T,bool>}` fix).
 - [x] Deep nesting does not crash; falls back to the erased body and runs (probe: depth-4 runs).
 - [x] No `LLVMVerifyError` from a standalone generic that never reached the worklist.
 - [ ] Nested generics beyond depth 2 are eagerly monomorphised, not left to the erased fallback (currently a
-  hard `max_depth=2` cap, so deeper nests run on the erased path).
+      hard `max_depth=2` cap, so deeper nests run on the erased path).
 
 ### Traits and dynamic dispatch ; PARTIAL ; case + probe
+
 - [x] Dynamic dispatch via fat pointers `{struct_ptr, vtable}`; vtable slot 0 is the destructor.
 - [x] Checked downcast (`x as T`) traps on a wrong concrete type.
 - [x] Trait default methods work cross-module (FIXED: `pipeline.expandTraitDefaults` re-runs the default-body
-  copy on the fully-merged decls; probe: a struct in one module inherits a default from a trait in another;
-  corpus 395/398, same-module case 301 green).
+      copy on the fully-merged decls; probe: a struct in one module inherits a default from a trait in another;
+      corpus 395/398, same-module case 301 green).
 - [ ] Generic trait dispatch is monomorphic, not type-erased (currently erased, one slot per method).
 
-### Generic bounds (`where T: Bound`) ; PARTIAL ; probe
+### Generic bounds (`where T: Bound`) ; SOUND ; case + probe
+
 - [x] `where` clauses parse.
 - [x] A generic body that calls a bounded method is rejected when instantiated with a type lacking it (probe:
-  structural dispatch catches it; `totalArea<Sq>` compiles, a type without the method errors).
-- [ ] An UNUSED declared bound is enforced (if the body never calls the bounded method, instantiating with a
-  non-conforming type is not rejected). Narrow; the used-bound case is already sound.
+      structural dispatch catches it; `totalArea<Sq>` compiles, a type without the method errors).
+- [x] An UNUSED declared bound is enforced (FIXED: the `where` clause is now CAPTURED into the AST
+      (`ast.WhereBound`, parser `parseWhereClause`) instead of discarded, and the type checker rejects an
+      explicit type argument that is a known struct not declaring a known bound trait even when the body never
+      calls the method (`checkGenericBounds`, nominal via `structImplementsTrait`). Conservative: primitives /
+      type-parameters / unknown names / unknown traits are not newly rejected. Gated: positive case 389 +
+      negative `expect_fail/unused_bound_violation.nova`; corpus 398/401, baseline unchanged).
 
 ### Enums and pattern matching ; PARTIAL ; case + probe
+
 - [x] Payload-less, single-payload, tuple-form, and struct-form variants.
 - [x] `switch` with destructuring binds payloads.
 - [x] Case guards (`case v if cond`).
 - [x] ARC destructors run for refcounted enum payloads.
 - [x] A non-exhaustive switch on a typed enum is a compile error (probe: "variant not handled").
 - [ ] Exhaustiveness is enforced even when the discriminant type cannot be resolved (currently skipped for an
-  untypeable discriminant; the fail-open edge shared with the type-checker item).
+      untypeable discriminant; the fail-open edge shared with the type-checker item).
 
 ### Error handling (`T | E`, `try`, `catch`, `errdefer`) ; SOUND ; case
+
 - [x] `try` propagates the error arm to the enclosing function.
 - [x] `catch` handles; both arms unify to one type.
 - [x] `errdefer` runs only on the error path, LIFO.
 - [x] `T | E | undefined` composes optional over error.
 
 ### Optionals and narrowing (`T | undefined`) ; PARTIAL ; probe
+
 - [x] Member access through an optional is guarded, not a null deref.
 - [x] `if (x != undefined)` narrows `x` to its inner type in the branch.
 - [x] Reassigning a narrowed variable invalidates the narrowing.
@@ -105,6 +115,7 @@ marking any of them [x] requires an actual code fix that a probe or gate verifie
 - [ ] `x ?? d` returns the present value for a present ZERO after narrowing (UNSOUND, see below).
 
 ### `x ?? d` on a narrowed present 0 ; UNSOUND ; probe
+
 - [ ] A present `0` in a narrowed value-optional coalesces to `0`, not the default.
 - Root: `??` presence test is `left != 0` (`expressions.zig:4643`); a narrowed value-optional is a raw value
   where present-0 and the absent sentinel are both 0. NOT fixable at the `??` site (three guard attempts each
@@ -113,56 +124,64 @@ marking any of them [x] requires an actual code fix that a probe or gate verifie
   at 395/398.
 
 ### Closures / lambdas ; PARTIAL ; probe
+
 - [x] A stored / aliased multi-argument closure calls correctly (`let g = f; g(3,4)`).
 - [x] Per-instance heap environments; loop captures are independent.
 - [x] Creating and dropping a closure reclaims its memory (no leak, no unbounded growth). Empirically verified:
-  2,000,000 closures created + dropped (List capture and owned-string capture) stay flat at ~1.2 to 1.4 MB
-  versus 26 MB for a genuinely-growing 2M-element List. This CORRECTS an earlier UNSOUND leak mark: the
-  measurement disproves it (`leaks`/LSan also report 0). Lesson: measure, do not infer from the alloc call.
+      2,000,000 closures created + dropped (List capture and owned-string capture) stay flat at ~1.2 to 1.4 MB
+      versus 26 MB for a genuinely-growing 2M-element List. This CORRECTS an earlier UNSOUND leak mark: the
+      measurement disproves it (`leaks`/LSan also report 0). Lesson: measure, do not infer from the alloc call.
 - [ ] Closure parameters are typed by default. Explicit typing works (`(x: int) => x+1`), but an untyped
-  param is inferred from the call site rather than required, so a mismatched-arity/type stored closure is not
-  caught at the closure declaration. Not fixed.
+      param is inferred from the call site rather than required, so a mismatched-arity/type stored closure is not
+      caught at the closure declaration. Not fixed.
 
 ### Integers (`int` 32-bit, `long` 64-bit) ; PARTIAL ; probe
+
 - [x] `int` is 32-bit two's-complement with defined wraparound; `long` is 64-bit.
 - [x] Address arithmetic uses `long`/`ptr` (no 32-bit truncation of heap addresses).
 - [ ] A checked / overflow-trapping arithmetic mode exists (`int` currently wraps silently at 32 bits with no
-  way to detect overflow). Not fixed. (If we decide silent wraparound is the intended, final semantics, this
-  criterion should be dropped by explicit decision, not to make the status pass.)
+      way to detect overflow). Not fixed. (If we decide silent wraparound is the intended, final semantics, this
+      criterion should be dropped by explicit decision, not to make the status pass.)
 
 ### `Atomic<T>` ; SOUND ; case + probe
+
 - [x] An invalid atomic element type (`Atomic<string>`) is rejected at compile time.
 - [x] The runtime works: `load`/`store`/`compareAndSwap`/`add`/`sub`/`delete` for `int` (i32) and `long`
-  (i64). Implemented as a codegen intercept (`compileAtomicCall`) over the runtime `nova_atomic_*_i32/i64`,
-  not the stub stdlib body. Gated by case 31_atomics (7/7) and probed (int + long) ASAN-clean. The earlier
-  "stub" mark read the dead stdlib body; the codegen path is real.
+      (i64). Implemented as a codegen intercept (`compileAtomicCall`) over the runtime `nova_atomic_*_i32/i64`,
+      not the stub stdlib body. Gated by case 31_atomics (7/7) and probed (int + long) ASAN-clean. The earlier
+      "stub" mark read the dead stdlib body; the codegen path is real.
 
 ### `decimal128` ; SOUND ; case
+
 - [x] Arithmetic, parse, and round-trip through JSON / YAML / BSON with fidelity.
 - [x] No implicit int/decimal coercion.
 
 ### Type-checker fail-closed ; PARTIAL ; probe
+
 - [x] Method-call arity is checked; unresolved calls are located errors.
 - [x] Non-bool `if`/`while` conditions are rejected (probe: `if (s)` on a string errors).
 - [x] Optional/error assigned or passed where a plain value is required is rejected (probe: both error).
 - [x] Return-type mismatch is rejected (probe: returning a string from an int fn errors).
 - [ ] Every checked position fails closed for a genuinely-untypeable expression (the remaining
-  `resolveExprType(...) orelse return` sites). Not shown exploitable this session (such expressions normally
-  error earlier), so it is defence-in-depth rather than a live bug, but it is not yet met.
+      `resolveExprType(...) orelse return` sites). Not shown exploitable this session (such expressions normally
+      error earlier), so it is defence-in-depth rather than a live bug, but it is not yet met.
 
 ### async / await ; PARTIAL ; case
+
 - [x] `async fn` compiles to an LLVM coroutine; `spawn` returns a future; `await` joins.
 - [x] Function colouring enforced (`await`/`spawn` only inside `async fn`).
 - [x] `when_all` / `select` over a homogeneous future list.
 - [ ] Heterogeneous-type combinator (`join!`-style) (only homogeneous `List<future<T>>` today).
 
 ### Reactor (kqueue / epoll / io_uring / IOCP) ; PARTIAL ; case
+
 - [x] kqueue / epoll / io_uring / IOCP run-verified against the conformance corpus.
 - [x] Deadlines / timeouts are reactor-native on every backend.
 - [ ] IOCP readiness cases 192/194/195 pass (open).
 - [ ] io_uring uses multishot recv / SQPOLL (currently readiness-emulated, slower than epoll).
 
 ### Channels and actors ; PARTIAL ; read
+
 - [x] A blocking cross-thread `Channel<T>` (buffered) works.
 - [x] An async channel (reactor-aware) works.
 - [x] Actor mailboxes with `async receive`.
@@ -171,13 +190,15 @@ marking any of them [x] requires an actual code fix that a probe or gate verifie
 - [ ] Actor supervision / restart / registry.
 
 ### ARC memory management ; SOUND ; case + asan
+
 - [x] Retain/release inserted by codegen; destructors free owned objects (ASAN-clean corpus).
 - [x] struct = value, class = reference, with inline nested value storage.
 - [x] Value-semantics escape channels closed (return/serde/type-param/trait/container-COW).
 
 ### OSSA static leak / double-free verifier ; SOUND ; case + gate
+
 - [x] Proves every owned value is consumed exactly once on covered functions (leak / double-free /
-  use-after-consume / path-imbalance).
+      use-after-consume / path-imbalance).
 - [x] Default-on and fail-closed; rejects a proven imbalance at compile time.
 - [x] 99-100% corpus coverage; reassign deferral bucket is 0 (if/loop/switch/break/continue via phis).
 - Scope note (not a criterion): this is a compiler-correctness ARC-balance self-check, not a Rust-style borrow
@@ -188,40 +209,48 @@ marking any of them [x] requires an actual code fix that a probe or gate verifie
 # Stream 2: Standard library
 
 ### Collections (Map / Set / List) ; PARTIAL ; case
+
 - [x] Map/Set are a real open-addressing hash table (tombstones, resize).
 - [x] List has a rich functional API (map/filter/reduce/slice/etc.).
 - [ ] `List.sort` is O(n log n) (currently insertion sort, O(n^2)).
 
 ### Strings and text ; PARTIAL ; case
+
 - [x] Complete byte-oriented API (split/join/slice/trim/replace/case/compare).
 - [x] UTF-8 codepoint decode/encode.
 - [ ] Unicode normalisation / grapheme / collation / case-fold (codepoint-level only).
 
 ### Regex ; PARTIAL ; case
+
 - [x] Alternation, char classes, anchors, `* + ?`, capture groups, find/replace.
 - [ ] Linear-time (no catastrophic backtracking; currently a backtracking VM).
 - [ ] Common escapes and counted repetition (`\d` `\w` `\b` `{n,m}`, lazy quantifiers).
 
 ### Serialisation (JSON / YAML / BSON) ; PARTIAL ; case
+
 - [x] Parse and serialise with numeric fidelity (int fast-path, decimals as text).
 - [x] Malformed input sets a failed flag (no silent partial parse).
 - [ ] YAML is full 1.2 (subset today: no verified merge keys / complex tags).
 
 ### Crypto and TLS ; PARTIAL (unaudited) ; case
+
 - [x] SHA / AES-GCM / ChaCha20-Poly1305 / P-256 / P-384 / X25519 / RSA, KAT + differential tested.
 - [x] TLS 1.3 client + server with 0-RTT, resumption, mTLS; TLS 1.2 client.
 - [ ] SHA-384 transcript (AES-256-GCM-SHA384-only servers currently fail).
 - [ ] Independent security audit (hand-rolled, unaudited).
 
 ### Compression (deflate / gzip) ; PARTIAL ; case
+
 - [x] RFC-1951 decoder, byte-exact against system gzip.
 - [ ] Encoder emits dynamic Huffman + lazy matching (currently fixed-Huffman greedy; weaker ratio).
 
 ### HTTP / web framework ; PARTIAL ; case
+
 - [x] HTTP/1.1 server + client, typed path params, DI, mediator, full middleware, hypermedia/SSE.
 - [ ] HTTP/2 or HTTP/3 (HTTP/1.1 only).
 
 ### datetime ; PARTIAL ; swept
+
 - [x] ISO-8601 / RFC-3339 parse, format, and arithmetic.
 - [ ] 64-bit epoch (currently 32-bit, Year-2038).
 - [ ] Timezone database (treats wall-clock as UTC).
@@ -231,16 +260,19 @@ marking any of them [x] requires an actual code fix that a probe or gate verifie
 # Stream 3: Database drivers (the `db` seam)
 
 ### Wire protocols (pg / mysql / mssql / mongo) ; PARTIAL ; read
+
 - [x] Real binary protocols, server-side prepared statements, transactions.
 - [x] Connection pooling with idle/open caps and lifetime eviction.
 - [ ] Micro-ORM has relations / migrations / query builder (data-mapper only).
 
 ### BSON ORM `long` fidelity ; SOUND ; case + probe
+
 - [x] The ORM write path preserves 64-bit `long` (FIXED: `BsonSink.putInt` stores int32 when the value fits
-  and int64 otherwise, instead of `val as int`). Probe + case 388: `5_000_000_000` round-trips as int64
-  (type 18, correct hi/lo); a small value stays int32 (type 16); BSON cases 51/90/161 unaffected.
+      and int64 otherwise, instead of `val as int`). Probe + case 388: `5_000_000_000` round-trips as int64
+      (type 18, correct hi/lo); a small value stays int32 (type 16); BSON cases 51/90/161 unaffected.
 
 ### MSSQL transport defaults ; SOUND ; case + probe
+
 - [x] Encryption is on by default (FIXED: `connection.parse` now `encrypt=true` unless `?encrypt=false`).
 - [x] The server certificate is verified by default (FIXED: `trustCert=false` unless `?trustServerCertificate=true`).
 - Probe `nova-mssql/tests/111_connection_secure.nova`: a plain connection string yields `encrypt=true` /
@@ -248,10 +280,12 @@ marking any of them [x] requires an actual code fix that a probe or gate verifie
   drivers (.NET SqlClient encrypt=true default). Committed nova-mssql 23b2c79.
 
 ### MySQL / SCRAM auth trust ; UNSOUND ; swept
+
 - [ ] MySQL caching_sha2 does not send the password against an unverified server RSA key over plaintext.
 - [ ] The SCRAM ServerSignature is verified (currently never checked; rogue-server accept).
 
 ### Per-connection buffer leaks ; UNSOUND ; swept
+
 - [ ] Postgres does not leak its ~64 KB reader buffer per connection.
 - [ ] TlsStream does not leak ~16 KB per connection.
 
@@ -260,30 +294,35 @@ marking any of them [x] requires an actual code fix that a probe or gate verifie
 # Stream 4: Tooling
 
 ### Compiler + build ; PARTIAL ; build
+
 - [x] Cross-compilation to linux / macos / windows produces real binaries.
 - [x] Per-file object caching skips unchanged files.
 - [ ] Incremental compilation is query-granular (currently coarse file-hash / split-object).
 
 ### Package manager ; PARTIAL ; read
+
 - [x] Git-pin dependency resolution with a lockfile.
 - [x] A package's own module wins over a same-named sibling/cached package (FIXED lang 6c14e13: import
-  resolution now checks the CWD/package-root `./<mod>.nova` + `./src/<mod>.nova` as the final
-  importer-relative step, before the global scans. Previously a bare-filename or `tests/`-relative importer
-  fell through to `~/.nova/cache` and `import connection` could bind to a DIFFERENT package's module, e.g.
-  mssql resolving nova-postgres's `ConnectionOptions` -> `FieldNotFound`. Corpus 396/399, baseline unchanged).
+      resolution now checks the CWD/package-root `./<mod>.nova` + `./src/<mod>.nova` as the final
+      importer-relative step, before the global scans. Previously a bare-filename or `tests/`-relative importer
+      fell through to `~/.nova/cache` and `import connection` could bind to a DIFFERENT package's module, e.g.
+      mssql resolving nova-postgres's `ConnectionOptions` -> `FieldNotFound`. Corpus 396/399, baseline unchanged).
 - [ ] A central registry / discovery.
 - [ ] Semver range resolution and version unification.
 
 ### LSP (`nls`) ; PARTIAL ; read
+
 - [x] Completion, hover, definition, symbols, semantic tokens.
 - [ ] Rename / references are semantic cross-file (currently text-based for globals).
 - [ ] Cross-file (import-resolved) diagnostics (currently single-file).
 
 ### Debugger ; PARTIAL ; read
+
 - [x] DWARF line tables + DITypes, lldb-dap, data formatters for List/Map/Set/struct.
 - [ ] Non-macOS wiring and full formatter coverage.
 
 ### Formatter and test runner ; PARTIAL ; build
+
 - [x] `nova fmt` with a token-stream-equivalence self-check.
 - [x] `nova test` runs `@test` functions with assertions and a pass/fail tally.
 - [ ] Coverage, benchmarks, name filters, fixtures in the test runner.
@@ -296,16 +335,19 @@ Merge gate is `zig build test` (44 leak-checked integration/durability/replicati
 shell harnesses are manual and non-gating.
 
 ### B+tree index ; SOUND ; case
+
 - [x] search / insert / update / delete / range scan.
 - [x] page split, merge, borrow; underflow handling.
 - [x] A randomised insert/delete/search fuzzer stays model-consistent and structurally invariant.
 
 ### Storage (pool / pager / page / overflow) ; SOUND ; case
+
 - [x] CRC32 checksum written on flush and validated on read (fail-fast on corruption).
 - [x] Doublewrite buffer protects against torn writes.
 - [x] Free-page recycling; eviction respects the WAL-before-page gate.
 
 ### WAL durability + crash recovery ; SOUND ; case
+
 - [x] Kill-9 with unflushed pages recovers every committed row.
 - [x] Kill-9 under eviction pressure recovers every committed row (WAL-before-page reorder).
 - [x] A torn WAL tail recovers cleanly (garbage tail stopped at).
@@ -313,6 +355,7 @@ shell harnesses are manual and non-gating.
 - [x] 3-phase recovery re-bootstraps the system catalog (the fixed Phase-2 data-loss bug).
 
 ### Replication safety ; PARTIAL ; case
+
 - [x] Log-shipping with logical follower apply (cross-node page-id fork resolved).
 - [x] Fencing epochs reject a stale-epoch writer.
 - [x] Quorum-ack durable commit (RPO=0).
@@ -320,40 +363,47 @@ shell harnesses are manual and non-gating.
 - [ ] Automatic leader election / lease-driven failover (currently manual `SET FENCE EPOCH`).
 
 ### MVCC ; PARTIAL ; read
+
 - [x] Uncommitted rows invisible; committed visible; rolled-back invisible (Read Committed).
 - [ ] Snapshot / repeatable-read / serializable isolation.
 - [ ] An aborted row is never visible in memory before restart (documented abort-visibility gap).
 - [ ] The in-memory committed-txn set is bounded (currently unbounded; GC is disk-side only).
 
 ### Transactions and isolation ; PARTIAL ; case
+
 - [x] BEGIN / COMMIT / ROLLBACK.
 - [ ] Selectable isolation level (`SET TRANSACTION ISOLATION LEVEL`).
 - [ ] SAVEPOINT / ROLLBACK TO.
 
 ### Concurrency and locking ; PARTIAL ; case
+
 - [x] Per-table GroupLock (SELECT read / INSERT concurrent-write / UPDATE-DELETE exclusive).
 - [x] Per-tree structure lock (shared in-place / exclusive split-merge) with optimistic fast paths.
 - [x] Structured concurrent-writer stress cases are gated.
 - [ ] The harshest randomised concurrent same-tree mutation is gated (currently OFF by default; expected to
-  corrupt per its own comment).
+      corrupt per its own comment).
 - [ ] Write scalability beyond ~5 writers (deliberate ceiling today).
 
 ### SQL parser ; PARTIAL ; read
+
 - [x] CREATE/ALTER/DROP TABLE, PK, NOT NULL, single-col FK, CREATE/DROP INDEX.
 - [x] Single-row INSERT, UPDATE, DELETE; SELECT with projection, 5 aggregates, GROUP BY, LIMIT, JOINs.
 - [ ] Subqueries, IN/LIKE/BETWEEN/IS NULL, expressions/arithmetic, UNION, HAVING, multi-row INSERT.
 
 ### SQL correctness (silent-wrong) ; UNSOUND ; read
+
 - [ ] ORDER BY actually sorts the result (currently parsed but never executed).
 - [ ] Column types are stored as declared (currently DATE/DECIMAL/etc. silently collapse to TEXT).
 - [ ] COUNT(DISTINCT) deduplicates; UNIQUE is enforced; FK actions are enforced.
 
 ### Query executor ; PARTIAL ; read
+
 - [x] Volcano iterators: table scan, index scan, nested-loop join, hash join, filter, project.
 - [x] Aggregates + GROUP BY.
 - [ ] A statistics-driven cost-based optimiser (currently rule-based; docs overstate "CBO Implemented").
 
 ### Binary wire protocol ; PARTIAL ; case
+
 - [x] Versioned, length-prefixed frames; startup/query/parse/bind/execute; oversized-frame reject.
 - [x] SQL-injection-neutralisation tests on the command path.
 - [ ] The simple-query executor accepts server-side bound parameters (prepared path only today).
@@ -367,65 +417,76 @@ a `FakeConn`); the real cross-process/cross-node paths are only in manual, non-g
 gate does not currently reproduce green on this checkout (see the two UNSOUND rows).
 
 ### proxyd data plane (LB, pool, discovery) ; PARTIAL (logic) ; case
+
 - [x] RoundRobin / Weighted / LeastConn / ConsistentHash strategies, per-reactor lock-free.
 - [x] Backend pool with keep-alive safe reuse.
 - [x] Discovery-file publish (atomic temp+rename) and consume.
 - [ ] Verified against live socket forwarding (tests exercise `Pool.select` logic only).
 
 ### proxyd health checks and VIP ; PARTIAL ; case
+
 - [x] Rise/fall hysteresis, drain/restore decision logic.
 - [ ] A gating LIVE probe sweep.
 - [ ] VIP bind for a non-dotted-quad host (currently IPv4-only, else INADDR_ANY fallback).
 
 ### orchd reconcile (desired-vs-actual) ; PARTIAL (simulated) ; probe
+
 - [x] Diff logic: start-new / replace-changed / poll-unchanged / keep-unreadable / stop-when-gone.
 - [x] Store-driven reconcile parses YAML/JSON and validates.
 - [ ] Reconcile drives REAL process lifecycle (currently `simulated=true`, virtual replicas).
 - [ ] `181_orchestrator` runs to completion (currently crashes entering the async reconcile subtest).
 
 ### Leader lease (fencing epochs) ; PARTIAL (logic) ; case
+
 - [x] Fencing-after-promotion; a stale-epoch renew is rejected.
 - [x] Clock-skew and 3-node election gated over a shared in-process store.
 - [ ] Verified as a real distributed system (currently one shared in-process store + mock clock).
 
 ### Leader-lease live create-race ; UNSOUND ; read
+
 - [ ] Two nodes racing a FREE lease cannot both win epoch 1.
 - Currently `casBy(expectedRevision==0)` does `exists()` then an unconditional INSERT and discards the result;
   the PK conflict is never checked. Test criterion: a concurrent two-node `tryAcquire(0)` race yields exactly
   one winner.
 
 ### Orchestrator offline gate reproducibility ; UNSOUND ; probe
+
 - [ ] `185_sqlconfig` compiles (currently fails: `FakeConn` missing `queryWire`; the `Connection` trait
-  drifted and the package was not rebuilt against it).
+      drifted and the package was not rebuilt against it).
 - [ ] Async tests (181/186/187/192/193/195) run to completion (currently abort after their sync subtests).
 - Test criterion: the whole `packages/nova-orchestrator/tests` suite builds and passes on a clean checkout.
 
 ### Autoscaler (PID) ; PARTIAL ; case
+
 - [x] PID controller with anti-windup, output clamp, dt-guarded derivative.
 - [x] Real in-flight / cgroup CPU signal (Linux).
 - [ ] The CPU signal is per-replica, not aggregate-across-replicas against a per-replica setpoint.
 - [ ] Scale-down does not block the reactor (`p.wait()` on reactor 0 today).
 
 ### Rolling upgrade + HA membership ; PARTIAL (simulated) ; case
+
 - [x] Workload rolling update (one replica at a time, N-1 keep serving).
 - [x] Control-plane drain/promote/upgrade/rejoin with rollback.
 - [x] HA property test: RPO=0 each round, RTO measured, epoch monotonicity.
 - [ ] Verified over real processes / a real cluster (currently simulated replicas + one shared store).
 
 ### Config store on NovaDB ; PARTIAL ; read
+
 - [x] In-memory reference store with atomic CAS.
 - [x] Async `SqlConfigStore` code path over the `Connection` seam.
 - [ ] Its gating test builds and exercises the CAS revision guard (currently `185` does not build; the fake
-  ignored the guard anyway).
+      ignored the guard anyway).
 - [ ] Transactions on the seam are used (currently `begin/commit/rollback` never called).
 
 ### Isolation / sandbox / netns ; PARTIAL ; case
+
 - [x] cgroups-v2 limits, namespaces, netns+veth recipe; honest no-op off Linux.
 - [x] Supervisor selects handoff / netns / sandbox / plain per spec; reports when limits are unavailable.
 - [ ] Live-verified on Linux (this host is macOS; only the no-op and command recipe are gated).
 - [ ] `applyLimits` checks write results (currently ignores them; silent downgrade on unprivileged Linux).
 
 ### Observability, backup, orchctl ; PARTIAL ; case
+
 - [x] `/healthz` `/readyz` `/metrics` renderers and alerts (pure-data path gated).
 - [x] Logical backup/restore and offline `orchctl inspect/members/upgrade-plan`.
 - [ ] Output escaping in health/metrics/backup (a tab or newline in a value corrupts the dump).
@@ -438,78 +499,21 @@ gate does not currently reproduce green on this checkout (see the two UNSOUND ro
 Ordered with the language stream first (the priority).
 
 Language:
+
 1. `x ?? d` on a narrowed present 0 (representational fix).
 2. Type-checker fully fail-closed (the remaining `orelse return` sites).
-(The "escaping closure environment leak" was investigated and DISPROVEN empirically this session; it is not a
-defect. The single-file `nova x -o out` build for `List` programs was fixed as a byproduct.)
+   (The "escaping closure environment leak" was investigated and DISPROVEN empirically this session; it is not a
+   defect. The single-file `nova x -o out` build for `List` programs was fixed as a byproduct.)
 
-Drivers:
-4. ~~BSON ORM `long` truncation.~~ FIXED (lang 6e83b1b, case 388).
-5. ~~MSSQL secure-by-default transport.~~ FIXED (nova-mssql 23b2c79, test 111).
-6. MySQL RSA-over-plaintext and unverified SCRAM signature.
-7. pg / TLS per-connection buffer leaks.
-8. Driver-package source/test skew (exposed once import resolution was fixed): nova-mysql `codec`
-   arity mismatch (`buildStmtPrepare` / a 2-vs-3-arg call in tests/109); nova-postgres mock `EchoConn`
-   missing the `Connection.queryWire` trait method (tests/105). Pre-existing package bugs, not language.
+Drivers: 4. ~~BSON ORM `long` truncation.~~ FIXED (lang 6e83b1b, case 388). 5. ~~MSSQL secure-by-default transport.~~ FIXED (nova-mssql 23b2c79, test 111). 6. MySQL RSA-over-plaintext and unverified SCRAM signature. 7. pg / TLS per-connection buffer leaks. 8. Driver-package source/test skew (exposed once import resolution was fixed): nova-mysql `codec`
+arity mismatch (`buildStmtPrepare` / a 2-vs-3-arg call in tests/109); nova-postgres mock `EchoConn`
+missing the `Connection.queryWire` trait method (tests/105). Pre-existing package bugs, not language.
 
-NovaDB:
-8. SQL silent-wrong (ORDER BY sort, typed storage, DISTINCT/UNIQUE/FK enforcement).
+NovaDB: 8. SQL silent-wrong (ORDER BY sort, typed storage, DISTINCT/UNIQUE/FK enforcement).
 
-Orchestrator:
-9. Offline gate reproducibility (`queryWire` drift + async-test crashes) ; a prerequisite for trusting the rest.
-10. Leader-lease live create-race split-brain.
+Orchestrator: 9. Offline gate reproducibility (`queryWire` drift + async-test crashes) ; a prerequisite for trusting the rest. 10. Leader-lease live create-race split-brain.
 
 The best-proven parts of the platform are NovaDB durability/crash-recovery and replication safety, and the
 language's ARC + OSSA verifier. The least-proven are the orchestrator paths that are green only over an
 in-process simulation. When we work an item, "done" means every acceptance criterion for that feature is [x],
 with the stated test as the gate.
-
-## Execution plan (language stream first)
-
-The language stream is the priority. It is sequenced by dependency and risk: restore the verification tooling,
-bank the low-risk additive wins, do the soundness backbone, then the two hard representational refactors in the
-order that unblocks them, then the remaining completeness. Every phase uses the SAME gate: full corpus stays
-395/398 (only the 3 baseline failures), `--asan` clean, OSSA-hard stays 398/398, plus the feature's own
-acceptance criteria; anything that regresses is reverted. DB and orchestrator streams follow after the language
-is sound.
-
-**Phase 0 ; restore verification tooling (DONE this session).**
-- FIXED the single-file `nova x -o out` build for `List`-using programs: the demand-driven reachability gate
-  force-kept container `copy` but not its callee `slice`, so `copy`'s body referenced a pruned method. Seeded
-  `copy` as a walk root (mirroring the `delete` edge) so its callees are reached (`reach.zig`). Gated:
-  NOVA_REACH_ON corpus stays 395/398. This unblocked the leak measurement that DISPROVED the closure leak
-  (2M closures flat at 1.4 MB), so Phases 3 and 4 below are no longer needed.
-
-**Phase 1 ; low-risk additive wins (build momentum; each independently gated).**
-- Generic-bound enforcement: at instantiation, reject a `T` that does not satisfy a declared `where T: Bound`.
-  Additive (only adds errors for genuinely-invalid programs), so a clean corpus does not regress. Add
-  `expect_fail` cases for an unsatisfied bound.
-- `Atomic<T>` runtime: wire `load`/`store`/`compareAndSwap`/`add`/`sub` to the runtime atomics (i32 first, then
-  i64), allocate the cell in `init`. Low blast radius (currently a stub nothing depends on).
-- Heterogeneous future combinator: a small `join`-style combinator over mixed-type futures.
-
-**Phase 2 ; the soundness backbone: fail-closed type checker.**
-- Convert the remaining `resolveExprType(...) orelse return` sites (condition, return, switch discriminant,
-  field access) from fail-open to fail-closed, ONE site at a time, gating the corpus after each so no valid
-  program is newly rejected. This also closes the switch-exhaustiveness untypeable-discriminant edge. Add
-  `expect_fail` cases for each newly-rejected shape.
-
-**Phases 3 and 4 (closure representation unification + closure ARC) ; DROPPED.**
-- These existed only to fix the escaping-closure leak, which the Phase 0 measurement DISPROVED (closures do
-  not leak). Function-value representation is still non-uniform (closure box vs raw fn-ref), which only matters
-  for typed-closure-parameter completeness (Phase 6), not for any soundness defect. No urgent work here.
-
-**Phase 5 ; value-optional representation + `??` present-zero.**
-- Box value-optionals (or carry a reliable narrowing-present signal into codegen) so a present 0 is
-  distinguishable from the absent sentinel. This is the representational fix the three site-local `??` guards
-  proved necessary. Gate: the narrow-then-coalesce-zero probe passes AND serde/DI/try cases stay green.
-
-**Phase 6 ; remaining completeness.**
-- Typed closure parameters; cross-module trait default methods; monomorphic (non-erased) generic-trait
-  dispatch; bounded async channel with backpressure and `select` over channels; actor supervision/restart;
-  io_uring multishot/SQPOLL; IOCP readiness cases 192/194/195.
-
-Ordering rationale: Phase 0 unblocks leak verification for Phase 4; Phase 3 is a hard prerequisite for Phase 4
-(owning `.func` before unifying the representation would crash on bare fn-refs); Phases 1 and 2 are independent
-and de-risk the schedule by landing real wins before the two big refactors (Phases 3-5). Each phase updates its
-inventory criteria to [x] as its gate passes.

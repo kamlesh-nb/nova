@@ -25,6 +25,15 @@ pub const Declaration = union(enum) {
     trait_decl: TraitDecl,
 };
 
+// A single `where` constraint: `T: TraitA + TraitB` -> { type_param = "T", traits = ["TraitA","TraitB"] }.
+// Captured (not discarded) so the type checker can reject instantiating a bounded type parameter with a
+// concrete type that does not declare the required trait, EVEN when the generic body never calls the
+// bounded method (the "unused bound" case; the used-bound case is already caught structurally at the call).
+pub const WhereBound = struct {
+    type_param: []const u8,
+    traits: []const []const u8,
+};
+
 pub const FunctionDecl = struct {
     name: []const u8,
     params: []Param,
@@ -34,6 +43,7 @@ pub const FunctionDecl = struct {
     attributes: []Attribute,
 
     type_params: []const []const u8 = &.{},
+    where_bounds: []const WhereBound = &.{},
 
     is_async: bool = false,
 

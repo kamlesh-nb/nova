@@ -569,6 +569,45 @@ pub const TypeChecker = struct {
         return false;
     }
 
+    // Reject instantiating a bounded type parameter with a concrete type that does not satisfy the bound.
+    // For each `where TP: TraitA + TraitB`, resolve TP to its concrete type argument and require that a
+    // KNOWN struct declares each KNOWN trait (`struct S impl TraitA`). Deliberately conservative to stay
+    // additive (never rejects a program that compiled before): a bound whose concrete arg is a primitive, a
+    // type parameter, or an unknown name is skipped, as is a bound naming an unknown trait. `structImplements
+    // Trait` is nominal, matching how Nova structs declare conformance, so this cannot false-flag a real impl.
+    fn checkGenericBounds(self: *TypeChecker, decl_name: []const u8, type_params: []const []const u8, where_bounds: []const ast.WhereBound, type_args: []const ast.TypeRef, span: ast.Span) void {
+        for (where_bounds) |wb| {
+            // Position of the constrained type parameter among the declared parameters.
+            var idx: ?usize = null;
+            for (type_params, 0..) |tp, i| {
+                if (std.mem.eql(u8, tp, wb.type_param)) {
+                    idx = i;
+                    break;
+                }
+            }
+            const ti = idx orelse continue;
+            if (ti >= type_args.len) continue;
+            const concrete = type_args[ti];
+            const cname: []const u8 = switch (concrete) {
+                .ident => |n| n,
+                .generic => |g| g.name,
+                else => continue,
+            };
+            // Only enforce against a KNOWN, non-colliding struct. A primitive / type-parameter / unknown name
+            // is left to the structural used-bound path and never newly rejected here.
+            const cbase = canonicalizeTypeName(cname);
+            if (!self.structs.contains(cbase)) continue;
+            if (self.colliding_structs.contains(cbase)) continue;
+            for (wb.traits) |trait_name| {
+                if (trait_name.len == 0) continue;
+                if (!self.traits.contains(trait_name)) continue; // unknown/advisory bound: do not enforce
+                if (!self.structImplementsTrait(cbase, trait_name)) {
+                    self.addError(span, "type argument '{s}' does not satisfy the bound '{s}: {s}' on generic '{s}' (struct '{s}' does not implement trait '{s}')", .{ cname, wb.type_param, trait_name, decl_name, cname, trait_name });
+                }
+            }
+        }
+    }
+
     // Reject a call argument whose scalar CATEGORY differs from the parameter's (a string where an int is
     // expected, a bool where a string is expected, ...). Without this the arg's bits are silently read as
     // the wrong scalar at runtime -- e.g. `f("hi")` for `f(a: int)` printed a garbage 33914905. Deliberately
@@ -810,6 +849,17 @@ pub const TypeChecker = struct {
                     if (expected) |exp| {
                         if (gc.type_args.len != exp) {
                             self.addError(gc.span, "generic '{s}' expects {d} type argument(s), got {d}", .{ name, exp, gc.type_args.len });
+                        }
+                    }
+
+                    // Enforce declared `where T: Trait` bounds against the EXPLICIT type arguments, even when
+                    // the generic body never calls the bounded method (the unused-bound case). Conservative:
+                    // only rejects when the concrete argument is a KNOWN struct that does NOT declare the
+                    // required KNOWN trait -- primitives, type parameters, and unknown names are left alone so
+                    // no currently-valid program is newly rejected.
+                    if (self.functions.get(name)) |f| {
+                        if (f.where_bounds.len > 0 and gc.type_args.len == f.type_params.len) {
+                            self.checkGenericBounds(name, f.type_params, f.where_bounds, gc.type_args, gc.span);
                         }
                     }
 
