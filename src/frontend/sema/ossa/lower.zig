@@ -147,8 +147,14 @@ fn lowerSeq(ctx: *Ctx, block: ir.Block, stmts: []const ast.Statement, locals: *L
             },
             .expr_stmt => |es| {
                 // A bare-local REASSIGNMENT (`x = ...`) drops the old value and rebinds. Any other
-                // expression statement borrows the locals it touches: no ownership effect.
-                if (isLocalReassign(&es.expr, locals.items)) try lowerReassign(ctx, cur, &es.expr, locals);
+                // expression statement BORROWS the owned locals it touches (Nova is +0 / caller-owned): no
+                // consume, but the reads require the values to be live, so emit borrow_use for each.
+                if (isLocalReassign(&es.expr, locals.items)) {
+                    try emitOwnedUses(ctx, cur, es.expr.kind.binary.right, locals); // RHS borrows
+                    try lowerReassign(ctx, cur, &es.expr, locals);
+                } else {
+                    try emitOwnedUses(ctx, cur, &es.expr, locals);
+                }
             },
             .if_stmt => |iff| {
                 switch (try lowerIf(ctx, cur, &iff, locals)) {
@@ -214,11 +220,22 @@ fn lowerLet(ctx: *Ctx, block: ir.Block, ls: *const ast.LetStmt, locals: *Locals)
     // obligation, so the worst case is missing a leak (a false negative), never a false imbalance.
     if (ls.names != null) return;
     const init = ls.init orelse return;
-    if (!isOwnedInit(ctx.store, ctx.tir, &init)) return; // trivial local: ignore
-    const v = if (init.kind == .ident and resolveLocal(locals.items, init.kind.ident) != null)
-        try ctx.f.copy(ctx.gpa, block, locals.items[resolveLocal(locals.items, init.kind.ident).?].value)
-    else
-        try ctx.f.makeOwned(ctx.gpa, block, ctx.tir.typeOf(&init));
+    if (!isOwnedInit(ctx.store, ctx.tir, &init)) {
+        // A trivial (non-owned) binding still BORROWS any owned locals it reads (`let n = xs.size()`), so
+        // emit their uses for use-after-consume coverage, then ignore the untracked trivial local.
+        try emitOwnedUses(ctx, block, &init, locals);
+        return;
+    }
+    const v = if (init.kind == .ident and resolveLocal(locals.items, init.kind.ident) != null) blk: {
+        // `let y = x`: x is copied (+1). The read requires x live — emit its use first.
+        const src = locals.items[resolveLocal(locals.items, init.kind.ident).?].value;
+        if (ctx.f.ownershipOf(src) == .owned) try ctx.f.borrowUse(ctx.gpa, block, src);
+        break :blk try ctx.f.copy(ctx.gpa, block, src);
+    } else blk: {
+        // A fresh owned birth (`let y = f(x)`): the locals it mentions are borrowed.
+        try emitOwnedUses(ctx, block, &init, locals);
+        break :blk try ctx.f.makeOwned(ctx.gpa, block, ctx.tir.typeOf(&init));
+    };
     try locals.append(ctx.gpa, .{ .name = ls.name, .value = v, .live = true });
 }
 
@@ -542,6 +559,47 @@ fn lowerReassign(ctx: *Ctx, block: ir.Block, e: *const ast.Expression, locals: *
         locals.items[idx].live = true;
     } else {
         locals.items[idx].live = false; // trivial RHS: no owned obligation remains
+    }
+}
+
+/// Walk an expression and emit a `borrow_use` for every LIVE owned local it mentions. Under Nova's +0
+/// (caller-owned) convention, passing an owned local to a call, storing it into a container/field, or
+/// reading it in any expression is a BORROW — it does not consume the value (the local is still dropped at
+/// scope end). But the READ still requires the value to be LIVE, so emitting a borrow_use lets the verifier
+/// catch a use-after-consume flowing INTO a call/store (e.g. `x = other; foo(x_old)`), which slice 1 missed
+/// because it skipped call-arg / store uses entirely. borrow_use never consumes and never fails on correct
+/// code (the value is always live there), so this can only ADD true-positive coverage, never a false one.
+fn emitOwnedUses(ctx: *Ctx, block: ir.Block, e: *const ast.Expression, locals: *Locals) LowerError!void {
+    switch (e.kind) {
+        .ident => |n| {
+            if (resolveLocal(locals.items, n)) |i| {
+                if (locals.items[i].live and ctx.f.ownershipOf(locals.items[i].value) == .owned)
+                    try ctx.f.borrowUse(ctx.gpa, block, locals.items[i].value);
+            }
+        },
+        .binary => |b| {
+            // `a = b` (reassign) is handled by lowerReassign; only walk the RHS here so the LHS def is not
+            // mistaken for a use. Any other binary borrows both sides.
+            if (b.op == .assign and b.left.kind == .ident) {
+                try emitOwnedUses(ctx, block, b.right, locals);
+            } else {
+                try emitOwnedUses(ctx, block, b.left, locals);
+                try emitOwnedUses(ctx, block, b.right, locals);
+            }
+        },
+        .unary => |u| try emitOwnedUses(ctx, block, u.operand, locals),
+        .call => |c| {
+            try emitOwnedUses(ctx, block, c.callee, locals);
+            for (c.args) |*a| try emitOwnedUses(ctx, block, a, locals);
+        },
+        .field_access => |fa| try emitOwnedUses(ctx, block, fa.object, locals),
+        .index => |ix| {
+            try emitOwnedUses(ctx, block, ix.object, locals);
+            try emitOwnedUses(ctx, block, ix.index, locals);
+        },
+        .cast => |c| try emitOwnedUses(ctx, block, c.expr, locals),
+        .template_expr => |t| for (t.parts) |*p| try emitOwnedUses(ctx, block, p, locals),
+        else => {},
     }
 }
 

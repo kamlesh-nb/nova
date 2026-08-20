@@ -69,6 +69,39 @@ positives). Two `verify.zig` unit tests added (balanced phi-reassign clean; un-c
 a leak). Synthetic case: straight-line + branch-local + outer-in-branch reassign all lower, 100% coverage,
 ASAN-clean.
 
+## Slice 5 investigated (2026-08-20) — the "consume forms" premise was wrong for Nova's convention
+
+Slice 5 was framed as "model every consume form: move-into-call, container insert, closure/async capture,
+trait widening" — on the assumption of a MOVE (+1) convention where those transfer ownership. **Nova does
+not use a move convention.** Verified against codegen:
+
+- **Calls are +0 / caller-owned.** `arc.zig` releaseLocalVariables releases EVERY owned non-param local at
+  scope end; its only exclusions are `self` in ctor/dtor, PARAMETERS ("caller-owned and alive across the
+  whole call", arc.zig ~1437), and captured-globals. Nothing is skipped because it was "passed to a call".
+- **Stores retain their own reference.** `List.push` -> `RawBuffer.push` keeps the container's own ref; the
+  element's in-container lifetime is the CONTAINER's destructor's obligation, separate from the caller's
+  local, which is still dropped at scope end.
+- **Closures capture BY VALUE** (snapshot/copy, specs §6.3), not by reference — so a captured owned local is
+  not moved; it is copied and the original is dropped normally.
+- **No mid-scope move point exists**: nothing removes a local from `current_local_types` when it is
+  pushed/sent/stored.
+
+So the only owned-value CONSUMES in Nova are: scope-end drop (`destroy`), `return` (`ret_owned`), and
+reassign-drop — **all three already modelled**. The model is balance-COMPLETE for the convention; the
+design-doc's move-into-call / container-insert consumes do not exist here.
+
+**What Slice 5 DID add (the one real gap within the borrow convention):** slice 1 SKIPPED call-arg / store
+USES entirely, so a use-after-consume flowing into a call (`x = other; foo(x_old)`) was a false negative.
+`lower.zig` `emitOwnedUses` now emits a `borrow_use` for every live owned local mentioned in an expression
+statement, a let initializer, or a reassign RHS. `borrow_use` never consumes and never fails on correct code
+(the value is always live there), so this only ADDS true-positive use-after-consume coverage — 0 false
+positives. Gate: full corpus `NOVA_OSSA=hard` stays 397/397, 0 proven imbalances.
+
+**Deliberately still a false NEGATIVE (documented, separate issue):** a closure environment that escapes
+(captured-globals skip) is not ARC'd yet (specs §6.3 known leak). The OSSA model treats the captured local
+as a normal scope-end drop, so it does not flag that env leak. Closing it means fixing the closure-env leak
+itself + threading escape info into lowering — out of scope for the balance self-verifier.
+
 ## What this verifier IS (honest boundary, restated)
 
 In Nova, ARC is AUTOMATIC — a user cannot create a leak/double-free through ownership mistakes (codegen
