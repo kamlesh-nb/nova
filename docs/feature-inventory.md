@@ -628,19 +628,27 @@ gate does not currently reproduce green on this checkout (see the two UNSOUND ro
 - [x] Clock-skew and 3-node election gated over a shared in-process store.
 - [ ] Verified as a real distributed system (currently one shared in-process store + mock clock).
 
-### Leader-lease live create-race ; UNSOUND ; read
+### Leader-lease live create-race ; SOUND ; case
 
-- [ ] Two nodes racing a FREE lease cannot both win epoch 1.
-- Currently `casBy(expectedRevision==0)` does `exists()` then an unconditional INSERT and discards the result;
-  the PK conflict is never checked. Test criterion: a concurrent two-node `tryAcquire(0)` race yields exactly
-  one winner.
+- [x] Two nodes racing a FREE lease cannot both win epoch 1. FIXED (nova-orchestrator): `casBy(expectedRevision
+      ==0)` no longer discards the INSERT result. `exists()` stays as the common-case fast path, but the
+      PRIMARY KEY on `config.k` is now the AUTHORITATIVE arbiter -- a racer that slips in between exists() and
+      INSERT hits a duplicate-key conflict (`rows_affected == 0`) and LOSES. Also split `nextRevision` into
+      `peekRevision`/`commitRevision` so a FAILED CAS (stale revision or lost create) no longer churns the
+      global revision. Test `test_create_race_insert_is_authoritative` blinds this node's exists() to prove
+      the PK conflict, not the TOCTOU check, arbitrates -> exactly one winner.
 
-### Orchestrator offline gate reproducibility ; UNSOUND ; probe
+### Orchestrator offline gate reproducibility ; PARTIAL ; case
 
-- [ ] `185_sqlconfig` compiles (currently fails: `FakeConn` missing `queryWire`; the `Connection` trait
-      drifted and the package was not rebuilt against it).
-- [ ] Async tests (181/186/187/192/193/195) run to completion (currently abort after their sync subtests).
-- Test criterion: the whole `packages/nova-orchestrator/tests` suite builds and passes on a clean checkout.
+- [x] `185_sqlconfig` compiles and passes. FIXED (nova-orchestrator): added the missing `FakeConn.queryWire`
+      (the `Connection` trait drifted -- same fix as the mysql driver); made the fake ENFORCE the `AND
+      revision = $6` CAS guard (it silently ignored it, so a stale CAS "succeeded") and reject a duplicate-key
+      INSERT; fixed the store's own revision-churn-on-failed-CAS bug that the now-compiling test exposed. All
+      8 tests in 185 pass.
+- [ ] Async tests run to completion. PARTIAL: **186 now runs to completion (11/11)**; but `181_orchestrator`
+      still aborts entering its async reconcile subtest (6/8 tests run, then "Test process terminated
+      abnormally"). The async-@test block-drive crash is a Nova test-harness/runtime issue (spawning reactor
+      coroutines inside a block-driven `@test`), not a store-logic bug -- left [ ] honestly.
 
 ### Autoscaler (PID) ; PARTIAL ; case
 
