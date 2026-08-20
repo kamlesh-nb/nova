@@ -290,7 +290,10 @@ pub async fn reactorConnect(host: string, port: int, kq: int): ReactorStream {
         if (!socket.connectInProgress()) { socket.close(fd); return ReactorStream(-1, kq); }
         let op = nova_op_alloc(eventloop.OP_SIZE as long);
         eventloop.makeOp(op, eventloop.OP_CONNECT, fd, 0, 0, currentCoro());
-        if (eventloop.submit(kq, op) != 0) { nova_op_free(op); return -1; }
+        // Return the error-sentinel stream, not a bare `-1`: this fn returns ReactorStream (matching the
+        // connectInProgress error path just above). A bare `-1` was a latent type mismatch on the failed-
+        // submit path that only never bit because that path is rarely hit.
+        if (eventloop.submit(kq, op) != 0) { nova_op_free(op); return ReactorStream(-1, kq); }
         coroSuspend();
         let res = eventloop.opResult(op);
         nova_op_free(op);
@@ -368,7 +371,9 @@ pub async fn reactorAccept(listenFd: int, kq: int): ReactorStream {
     eventloop.makeOp(op, eventloop.OP_ACCEPT, listenFd, 0, 0, currentCoro());
     // Especially important here: an acceptor suspended on a failed submit stops accepting on this
     // listener for the life of the process.
-    if (eventloop.submit(kq, op) != 0) { nova_op_free(op); return -1; }
+    // Error-sentinel stream, not a bare `-1`: reactorAccept returns ReactorStream (same latent-mismatch fix
+    // as reactorConnect above).
+    if (eventloop.submit(kq, op) != 0) { nova_op_free(op); return ReactorStream(-1, kq); }
     coroSuspend();
     let c = eventloop.opResult(op);
     nova_op_free(op);

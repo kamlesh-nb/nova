@@ -1731,6 +1731,46 @@ pub const TypeChecker = struct {
             .template_expr => {
                 return ast.TypeRef{ .ident = "string" };
             },
+            .unary => |un| {
+                return switch (un.op) {
+                    // Logical not always yields bool; negation / bitwise-not preserve the operand's numeric
+                    // type (fallback i32 when the operand itself does not resolve).
+                    .not => ast.TypeRef{ .ident = "bool" },
+                    .neg, .bit_not => self.resolveExprType(un.operand.*) orelse ast.TypeRef{ .ident = "i32" },
+                };
+            },
+            .index => |ix| {
+                // Subscript element type: List<T>[i] -> T, Map<K,V>[k] -> V, a fixed array -> its element,
+                // string[i] -> byte. Enables typing `arr[i]` (previously null -> untracked, cascading).
+                const obj_t = self.resolveExprType(ix.object.*) orelse return null;
+                switch (obj_t) {
+                    .generic => |g| {
+                        if (std.mem.eql(u8, g.name, "List") and g.params.len >= 1) return g.params[0];
+                        if (std.mem.eql(u8, g.name, "Array") and g.params.len >= 1) return g.params[0];
+                        if (std.mem.eql(u8, g.name, "Map") and g.params.len >= 2) return g.params[1];
+                    },
+                    .fixed_array => |fa| return fa.element.*,
+                    .ident => |n| {
+                        // Indexing a string yields the byte VALUE as an `int` (used with `>= 65`, `+ 32`),
+                        // not a `byte`-typed value.
+                        if (std.mem.eql(u8, n, "string")) return ast.TypeRef{ .ident = "i32" };
+                    },
+                    else => {},
+                }
+                return null;
+            },
+            .tuple => |elems| {
+                // A tuple literal's type is the tuple of its element types. If any element does not resolve,
+                // the whole tuple type is unknown (null) rather than a partial/garbage shape.
+                const types_buf = self.allocator.alloc(ast.TypeRef, elems.len) catch return null;
+                for (elems, 0..) |el, i| {
+                    types_buf[i] = self.resolveExprType(el) orelse {
+                        self.allocator.free(types_buf);
+                        return null;
+                    };
+                }
+                return ast.TypeRef{ .tuple = types_buf };
+            },
             else => return null,
         }
     }
