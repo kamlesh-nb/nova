@@ -640,6 +640,14 @@ const Counts = struct {
 };
 
 pub fn report(gpa: std.mem.Allocator, store: *const TypeStore, tir: *const TypedIr, program: *const ast.Program, hard: bool) void {
+    reportQuiet(gpa, store, tir, program, hard, false);
+}
+
+/// As `report`, but `quiet` suppresses the coverage census (only a proven imbalance still prints, and in
+/// `hard` mode still fails the build). This is the default-on enforcement path (Slice 6): every `nova
+/// build`/`nova test` runs the verifier silently and rejects a proven leak/double-free, without the census
+/// noise. `NOVA_OSSA=1` / `=hard` keep the verbose census (quiet=false).
+pub fn reportQuiet(gpa: std.mem.Allocator, store: *const TypeStore, tir: *const TypedIr, program: *const ast.Program, hard: bool, quiet: bool) void {
     var c = Counts{};
     for (program.declarations) |decl| {
         switch (decl) {
@@ -649,6 +657,22 @@ pub fn report(gpa: std.mem.Allocator, store: *const TypeStore, tir: *const Typed
             else => {},
         }
     }
+    if (!quiet) printCensus(&c);
+
+    // Gate mode (default-on, or NOVA_OSSA=hard): a proven imbalance = a leak or double-free in a function
+    // the verifier fully modelled. Fail the build. (Deferred functions are unchecked, not accused.)
+    if (hard and c.imbalanced > 0) {
+        std.debug.print(
+            "\x1b[1m\x1b[31mOSSA OWNERSHIP GATE FAILED:\x1b[0m {d} function(s) have an ARC release imbalance " ++
+            "(a leak or double-free the release-balance verifier proved). First: '{s}'.\n" ++
+            "(Set NOVA_OSSA=off to disable this check, or NOVA_OSSA=1 for the full coverage report.)\n",
+            .{ c.imbalanced, c.first_imbalance_fn },
+        );
+        std.process.exit(1);
+    }
+}
+
+fn printCensus(c: *const Counts) void {
     const cov: usize = if (c.total == 0) 0 else (c.lowered * 100) / c.total;
     std.debug.print(
         "=== OSSA-lite lowering + verify (NOVA_OSSA, I2 slice 1) ===\n" ++
@@ -677,17 +701,6 @@ pub fn report(gpa: std.mem.Allocator, store: *const TypeStore, tir: *const Typed
         .{ c.fwd_copies, c.fwd_candidates },
     );
     std.debug.print("=== end OSSA-lite lowering ===\n", .{});
-
-    // Gate mode (NOVA_OSSA=hard): a proven imbalance = a leak or double-free in a function the verifier
-    // fully modelled. Fail the build. (Deferred functions are unchecked, not accused — they do not fail.)
-    if (hard and c.imbalanced > 0) {
-        std.debug.print(
-            "\x1b[1m\x1b[31mOSSA OWNERSHIP GATE FAILED:\x1b[0m {d} function(s) have an ARC release imbalance " ++
-            "(a leak or double-free the release-balance verifier proved). First: '{s}'.\n",
-            .{ c.imbalanced, c.first_imbalance_fn },
-        );
-        std.process.exit(1);
-    }
 }
 
 fn lowerAndCheck(gpa: std.mem.Allocator, store: *const TypeStore, tir: *const TypedIr, fd: *const ast.FunctionDecl, c: *Counts) void {

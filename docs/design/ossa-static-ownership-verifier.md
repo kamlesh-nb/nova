@@ -102,6 +102,22 @@ positives. Gate: full corpus `NOVA_OSSA=hard` stays 397/397, 0 proven imbalances
 as a normal scope-end drop, so it does not flag that env leak. Closing it means fixing the closure-env leak
 itself + threading escape info into lowering — out of scope for the balance self-verifier.
 
+## Slice 6 done (2026-08-20) — default-on, fail-closed enforcement
+
+The sound verifier now runs on EVERY `nova build` / `nova test` and REJECTS a proven ARC release imbalance
+in a covered function (`std.process.exit(1)`), exactly like a type error — it no longer needs an env var.
+Wired in `builder.zig` + `tester.zig` via `reportQuiet(..., hard, quiet)`:
+- **(unset)** — enforce quietly (fail on a proven imbalance, no census noise).
+- **NOVA_OSSA=off** — disable (escape hatch).
+- **NOVA_OSSA=1** — report-only, verbose census (never fails).
+- **NOVA_OSSA=hard** — verbose census AND fail (the CI `--ossa` gate).
+
+Safe because the verifier is sound (0 false positives) and DEFERS what it cannot prove rather than accusing.
+Gate: standard corpus with default-on enforcement = 395/398 (only the 3 known baseline failures 118/189/42);
+the `--ossa` hard gate = 398/398. Non-vacuous: verify.zig unit tests prove it catches leak / double-consume /
+use-after-consume / path-imbalance (incl. the new phi cases). Deferred functions are unchecked, never
+accused, so an uncovered shape never fails a build.
+
 ## What this verifier IS (honest boundary, restated)
 
 In Nova, ARC is AUTOMATIC — a user cannot create a leak/double-free through ownership mistakes (codegen

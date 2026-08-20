@@ -231,14 +231,24 @@ fn compileProgram(
         // union across the corpus while ARC-audit is clean).
         codegen_arc.balance_verify = true;
         codegen_arc.balance_hard = false;
-        // Sound, path-sensitive ownership/ARC-balance gate. 0 false positives across the corpus (census
-        // 2026-08-20: 340 cases, 0 imbalanced); it DEFERS what it cannot yet prove rather than accuse.
-        sema_ossa_lower.report(allocator, &owned_sema.store, &owned_sema.ir, &program, hard);
     }
 
-    // OSSA-lite Track I: the same sound verifier under its own flag (report / hard).
-    if (init.environ_map.get("NOVA_OSSA")) |v| {
-        sema_ossa_lower.report(allocator, &owned_sema.store, &owned_sema.ir, &program, std.mem.eql(u8, v, "hard"));
+    // Slice 6: DEFAULT-ON, fail-closed ownership enforcement. The sound, path-sensitive OSSA verifier runs
+    // on EVERY build and REJECTS a proven ARC release imbalance (leak / double-free) in a covered function,
+    // exactly like a type error. 0 false positives across the corpus (398/398); it DEFERS what it cannot
+    // prove rather than accuse. Escape hatch + report:
+    //   NOVA_OSSA=off  -> disable the check entirely.
+    //   NOVA_OSSA=1    -> report-only (print the coverage census, never fail).
+    //   NOVA_OSSA=hard -> verbose census AND fail.
+    //   (unset)        -> enforce quietly (fail on a proven imbalance, no census noise).
+    {
+        const ossa = init.environ_map.get("NOVA_OSSA");
+        const disabled = ossa != null and std.mem.eql(u8, ossa.?, "off");
+        if (!disabled) {
+            const report_only = ossa != null and std.mem.eql(u8, ossa.?, "1");
+            const verbose = ossa != null; // any explicit NOVA_OSSA=... prints the census
+            sema_ossa_lower.reportQuiet(allocator, &owned_sema.store, &owned_sema.ir, &program, !report_only, !verbose);
+        }
     }
 
     // (HIR/MIR/LIR LLVM-emit optimiser scrapped 2026-08-16; see docs/design/sil-arc-optimiser-direction.md.)

@@ -332,13 +332,19 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
         // fails. See builder.zig for the rationale + the corpus census.
         codegen_arc.balance_verify = true;
         codegen_arc.balance_hard = false;
-        // Sound, path-sensitive ownership/ARC-balance gate (0 false positives corpus-wide).
-        sema_ossa_lower.report(allocator, &owned_sema.store, &owned_sema.ir, &program, hard);
     }
 
-    // OSSA-lite Track I: the same sound verifier under its own flag (report / hard).
-    if (init.environ_map.get("NOVA_OSSA")) |v| {
-        sema_ossa_lower.report(allocator, &owned_sema.store, &owned_sema.ir, &program, std.mem.eql(u8, v, "hard"));
+    // Slice 6: DEFAULT-ON, fail-closed ownership enforcement (see builder.zig for the full rationale). The
+    // sound OSSA verifier runs on every `nova test` and rejects a proven ARC release imbalance in a covered
+    // function. NOVA_OSSA=off disables; =1 report-only; =hard verbose+fail; unset = enforce quietly.
+    {
+        const ossa = init.environ_map.get("NOVA_OSSA");
+        const disabled = ossa != null and std.mem.eql(u8, ossa.?, "off");
+        if (!disabled) {
+            const report_only = ossa != null and std.mem.eql(u8, ossa.?, "1");
+            const verbose = ossa != null;
+            sema_ossa_lower.reportQuiet(allocator, &owned_sema.store, &owned_sema.ir, &program, !report_only, !verbose);
+        }
     }
 
     // (HIR/MIR/LIR LLVM-emit optimiser scrapped 2026-08-16; see docs/design/sil-arc-optimiser-direction.md.)
