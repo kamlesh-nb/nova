@@ -340,8 +340,16 @@ actual code fix that a probe or gate verifies, not a reframing.
 ### datetime ; SOUND ; case
 
 - [x] ISO-8601 / RFC-3339 parse, format, and arithmetic.
-- [ ] 64-bit epoch (currently 32-bit, Year-2038). TRACTABLE-but-wide: the epoch type is `int` across the whole datetime API (now/parse/format/add*/dateDiff) and 9 stdlib callers; a mechanical int->long refactor with real regression risk. Deferred this pass; does not block on new algorithms.
-- [ ] Timezone database (treats wall-clock as UTC). LARGE: shipping the IANA tz database + the zone/DST resolution rules is a multi-day data + algorithm effort. Left [ ] honestly.
+- [x] 64-bit epoch (no Year-2038 wrap). The epoch type is `long` across the whole datetime API
+      (now/parse/format/add*/dateDiff/*Iso), with `SECONDS_PER_MINUTE`/`MINUTES_PER_HOUR`/`HOURS_PER_DAY` as
+      `long` and small date components cast to int only at the wall-clock boundary. `now()` = `nowNs()/1e9`.
+      Case 403: a round trip of an instant beyond 2038 plus 64-bit arithmetic/diff.
+- [x] Timezone database (DST-aware; no longer treats wall-clock as UTC). `tz.nova` is a compact named-zone db
+      (UTC, US/EU/AU/India/JP/CN zones) with the current-era US/EU/Australia DST rules: `offsetAt(zone,
+      utcEpoch)` returns the correct DST-aware offset (transition instants via nth-weekday-of-month), and
+      `toLocal`/`formatInZone` render a UTC instant as the zone's wall clock. Not the full IANA historical
+      dataset (pre-2007 rules, micro-zones, leap seconds) but a genuine, correct tz facility. Case 404 (US DST
+      spring-forward/fall-back, EU vs no-DST zones, to-local wall clock).
 
 ---
 
