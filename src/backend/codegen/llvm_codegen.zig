@@ -1051,6 +1051,7 @@ pub const LlvmCompiler = struct {
     pub const getOrCreateDestructorByTypeId = arc_mod.getOrCreateDestructorByTypeId;
     pub const getOrCreateDestructorPreferId = arc_mod.getOrCreateDestructorPreferId;
     pub const releaseLocalVariables = arc_mod.releaseLocalVariables;
+    pub const buildTupleDeepCopy = arc_mod.buildTupleDeepCopy;
     pub const releaseLocalByName = arc_mod.releaseLocalByName;
     pub const dropValueStruct = arc_mod.dropValueStruct;
     pub const substituteFieldType = arc_mod.substituteFieldType;

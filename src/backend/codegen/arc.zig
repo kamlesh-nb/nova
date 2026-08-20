@@ -1235,6 +1235,46 @@ fn getOrCreateTupleDestructor(self: *LlvmCompiler, type_name: []const u8) anyerr
     return dest_fn;
 }
 
+// Channel 6b step 2 / Design B: value-semantic copy of a tuple. A tuple is a heap box of N 8-byte words;
+// `let u = t` used to alias the box (retain), so `u[0].x = 99` mutated `t`'s element too. Build a FRESH
+// box and, per element: a VALUE-struct element is deep-copied (fresh heap struct + transitive retain) so
+// the copy is independent; any other owned element (a `class`, a string, a container) is retained (shared
+// -- these are reference types or immutable, so sharing is correct); a scalar word is copied as-is. The
+// new box is the same tuple type, so its scope-end release runs the same tuple destructor and balances.
+pub fn buildTupleDeepCopy(self: *LlvmCompiler, src: types.LLVMValueRef, tuple_name: []const u8) anyerror!types.LLVMValueRef {
+    const word: u64 = 8;
+    const n = countTupleElements(tuple_name);
+    if (n == 0) return src;
+    const newbox = try self.compileAlloc(core.LLVMConstInt(self.val_type, @intCast(n * word), 0));
+    var idx: usize = 0;
+    while (idx < n) : (idx += 1) {
+        const elem_ty = LlvmCompiler.getTupleElementType(self.allocator, tuple_name, idx) catch continue;
+        defer self.allocator.free(elem_ty);
+        const off = core.LLVMConstInt(self.val_type, @intCast(idx * word), 0);
+        const src_addr = core.LLVMBuildAdd(self.builder, src, off, "tdc_saddr");
+        const src_ptr = core.LLVMBuildIntToPtr(self.builder, src_addr, core.LLVMPointerType(self.val_type, 0), "tdc_sptr");
+        const src_val = core.LLVMBuildLoad2(self.builder, self.val_type, src_ptr, "tdc_sval");
+
+        var new_val = src_val;
+        const base = getStructBaseName(elem_ty);
+        const is_value_struct = if (self.structs.get(base)) |sd| !sd.is_reference else false;
+        if (is_value_struct) {
+            const size = self.getTypeSize(ast.TypeRef{ .ident = base }, false);
+            const ns = try self.compileAlloc(core.LLVMConstInt(self.val_type, @intCast(if (size == 0) 8 else size), 0));
+            _ = try self.buildValueStructCopyInto(ns, src_val, size);
+            try self.retainValueStructOwnedFields(ns, base);
+            new_val = ns;
+        } else if (self.isOwnedTupleElemByName(tuple_name, idx, elem_ty)) {
+            try self.compileRetain(src_val);
+        }
+
+        const dst_addr = core.LLVMBuildAdd(self.builder, newbox, off, "tdc_daddr");
+        const dst_ptr = core.LLVMBuildIntToPtr(self.builder, dst_addr, core.LLVMPointerType(self.val_type, 0), "tdc_dptr");
+        _ = core.LLVMBuildStore(self.builder, new_val, dst_ptr);
+    }
+    return newbox;
+}
+
 pub fn countTupleElements(type_name: []const u8) usize {
     if (!isTupleType(type_name)) return 0;
     const inner = type_name[1 .. type_name.len - 1];

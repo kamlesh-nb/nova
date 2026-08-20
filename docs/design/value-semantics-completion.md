@@ -87,8 +87,15 @@ Each channel is an independent, gated increment. Over-exclusion stays the safe f
      Scoped to optional payloads only, so the "Direction B" shared-state regression (12 cases when applied
      to ALL structs) did not recur. Gate: value semantics (`let b=a; b.x=99` leaves `a.x`), corpus 389/392 +
      ASAN 389/392 (3 pre-existing), case `382_optional_value_struct_copy` (plain + `--arc` + `--asan`).
-   - **6b — tuple** (task #222): needs a sema fix first — `t[0].x` is `unknown struct type` today (tuple-
-     index type inference gap), then value-lowering.
+   - **6b — tuple. ✅ DONE (2026-08-20), two steps.** (1) SEMA: the inferer left a tuple-index expression
+     `unresolved`, so `t[0].x` failed as "unknown struct type"; added a `.tuple` case resolving a constant-
+     index element's type, scoped to NON-primitive elements (a primitive stays unresolved to preserve the
+     raw-64-bit-word scalar read that case 358 depends on -- typing scalar elements at 32 bits would change
+     tuple int arithmetic to wrap, a separate language change). (2) VALUE-LOWERING: `let u = t` used to alias
+     the tuple box; `buildTupleDeepCopy` (arc.zig) builds a fresh box and deep-copies value-struct elements
+     (retaining owned non-struct elements, copying scalars) so the copy is independent. Gate: corpus 391/394
+     + ASAN 391/394 (3 pre-existing), case `383_tuple_struct_element` (access + `t.0` desugar + owned field +
+     copy-independence) on plain + --arc + --asan; 358 stays green.
    - **6c — error-union: SKIPPED as near-worthless (2026-08-20, user-confirmed).** Value-struct-in-error-
      union already works and is ARC/ASAN-clean, including holding + copying an unwrapped error-union. The
      only gap is a value-semantics aliasing *surprise*, and it is unreachable: error-unions are consumed by

@@ -219,12 +219,24 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
                                 // heap-pointer layout, so a borrow-RHS copy must DEEP-COPY the payload (value
                                 // semantics) instead of aliasing it via retain. Every other owned borrow keeps
                                 // the alias-retain.
-                                const opt_inner: ?[]const u8 = if (self.current_local_type_ids) |ids|
-                                    (if (ids.get(ls.name)) |st_tid| self.optionalInnerValueStructName(st_tid) else null)
-                                else
-                                    null;
+                                var opt_inner: ?[]const u8 = null;
+                                var is_tuple = false;
+                                if (self.current_local_type_ids) |ids| {
+                                    if (ids.get(ls.name)) |st_tid| {
+                                        opt_inner = self.optionalInnerValueStructName(st_tid);
+                                        if (self.type_store) |ts| is_tuple = ts.get(st_tid) == .tuple;
+                                    }
+                                }
+                                // Channel 6b step 2: a tuple copy must deep-copy the box (and its value-struct
+                                // elements) for value semantics, else `let u = t; u[0].x = 99` mutates `t`.
                                 if (opt_inner) |innerBase| {
                                     val = try self.buildOptionalStructDeepCopy(val, innerBase);
+                                } else if (is_tuple) {
+                                    if (self.resolveExpressionTypeName(init_ptr) catch null) |tname| {
+                                        val = try self.buildTupleDeepCopy(val, tname);
+                                    } else {
+                                        try self.compileRetain(val);
+                                    }
                                 } else {
                                     try self.compileRetain(val);
                                 }
