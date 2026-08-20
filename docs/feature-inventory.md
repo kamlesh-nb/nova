@@ -561,11 +561,26 @@ shell harnesses are manual and non-gating.
 - [x] Single-row INSERT, UPDATE, DELETE; SELECT with projection, 5 aggregates, GROUP BY, LIMIT, JOINs.
 - [ ] Subqueries, IN/LIKE/BETWEEN/IS NULL, expressions/arithmetic, UNION, HAVING, multi-row INSERT.
 
-### SQL correctness (silent-wrong) ; UNSOUND ; read
+### SQL correctness (silent-wrong) ; PARTIAL ; case
 
-- [ ] ORDER BY actually sorts the result (currently parsed but never executed).
-- [ ] Column types are stored as declared (currently DATE/DECIMAL/etc. silently collapse to TEXT).
-- [ ] COUNT(DISTINCT) deduplicates; UNIQUE is enforced; FK actions are enforced.
+- [x] ORDER BY actually sorts the result. STALE MARK corrected by a probe: the executor DOES sort (B-1a --
+      `std.sort.pdq` over an index permutation, ASC/DESC per key, then DISTINCT/OFFSET/LIMIT post-processing,
+      query_executor.zig:1645). Probe: rows inserted 3,1,2 come back `1,2,3` (and `3,2,1` for DESC). Gated in
+      the "SQLCORRECT" test.
+- [ ] Column types are stored as declared. PARTIALLY fixed (B-1b, `mapSqlType`): the exact-integer
+      (INT/BIGINT/SMALLINT/...) and approximate-numeric (REAL/FLOAT/DOUBLE) families now map to INT64/FLOAT64
+      (previously ALL non-INT/TEXT/BOOL collapsed to TEXT, breaking range/sort). DATE/TIME/TIMESTAMP and
+      DECIMAL/NUMERIC still map to TEXT ON PURPOSE (they need a value codec -- parse-on-insert, format-on-read
+      -- that does not exist yet; mapping the declared type without a codec would corrupt values). So DECIMAL
+      ordering is still lexical (a genuine gap) -- left [ ] honestly pending the codec.
+- [x] COUNT(DISTINCT) deduplicates; UNIQUE is enforced; FK actions are enforced. COUNT(DISTINCT)/DISTINCT
+      dedupe (probe: eng,eng,sales -> 2). **UNIQUE now enforced** (FIXED, nova-novadb ca0a372): a UNIQUE
+      column/index rejected NO duplicate because the index key had the PK appended so it never collided;
+      CREATE TABLE now registers a UNIQUE index per `col UNIQUE` and INSERT scans the VISIBLE rows for a
+      duplicate value (NULLs exempt) and rejects. FK referential integrity is validated on insert/update
+      (validateForeignKeyConstraintsForInsertOrUpdate) and delete; the OnDelete/OnUpdate action set
+      (RESTRICT/CASCADE/SET NULL/...) exists. Gated in "SQLCORRECT" (duplicate email rejected, distinct
+      accepted); full `zig build test` green.
 
 ### Query executor ; PARTIAL ; read
 
