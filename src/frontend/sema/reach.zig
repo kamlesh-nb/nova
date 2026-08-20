@@ -220,17 +220,29 @@ pub fn compute(
     // `delete` and continue the BFS so what `delete` calls (slot, per-element drops, nested delete) is
     // reached too. Iterate to a fixpoint: reaching one `delete` can make a nested generic struct live.
     {
-        // index: generic-struct `delete` method decls, by owner base name.
+        // index: generic-struct `delete` method decls, by owner base name. Also index the container `copy`
+        // methods (List/Map/Set) that methodIsReachable force-keeps: `copy` is called from codegen (the
+        // value-semantics container deep-copy edge), not from a Nova call site, so the BFS never reaches it and
+        // its callees (List.copy -> slice -> ...) get pruned, leaving `copy`'s body referencing a pruned
+        // method. Seeding `copy` here and draining the BFS pulls in exactly those callees, mirroring `delete`.
         var delete_by_owner: std.StringHashMapUnmanaged(SymbolId) = .empty;
         defer delete_by_owner.deinit(gpa);
+        var copy_by_owner: std.StringHashMapUnmanaged(SymbolId) = .empty;
+        defer copy_by_owner.deinit(gpa);
         for (tab.symbols.items, 0..) |sym, i| {
             if (sym.kind != .method) continue;
-            if (!std.mem.eql(u8, sym.name, "delete")) continue;
             const owner = sym.owner orelse continue;
             if (!generic_structs.contains(owner)) continue;
-            delete_by_owner.put(gpa, owner, @enumFromInt(@as(u32, @intCast(i)))) catch {};
+            const sid: SymbolId = @enumFromInt(@as(u32, @intCast(i)));
+            if (std.mem.eql(u8, sym.name, "delete")) {
+                delete_by_owner.put(gpa, owner, sid) catch {};
+            } else if (std.mem.eql(u8, sym.name, "copy") and
+                (std.mem.eql(u8, owner, "List") or std.mem.eql(u8, owner, "Map") or std.mem.eql(u8, owner, "Set")))
+            {
+                copy_by_owner.put(gpa, owner, sid) catch {};
+            }
         }
-        if (delete_by_owner.count() > 0) {
+        if (delete_by_owner.count() + copy_by_owner.count() > 0) {
             var pending: std.ArrayListUnmanaged(SymbolId) = .empty;
             defer pending.deinit(gpa);
             var pass: usize = 0;
@@ -245,8 +257,9 @@ pub fn compute(
                     if (s.kind != .method) continue;
                     const o = s.owner orelse continue;
                     if (delete_by_owner.get(o)) |del_sid| pending.append(gpa, del_sid) catch {};
+                    if (copy_by_owner.get(o)) |cp_sid| pending.append(gpa, cp_sid) catch {};
                 }
-                for (pending.items) |del_sid| ctx.enqueue(del_sid);
+                for (pending.items) |sid| ctx.enqueue(sid);
                 // Drain the BFS so the newly-reachable `delete` bodies pull in their callees.
                 while (head < queue.items.len) {
                     const sid = queue.items[head];

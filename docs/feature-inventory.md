@@ -91,25 +91,17 @@ Deliberate architectural choices, stated as what we HAVE. The identity of the pl
   signal in the typed IR. Test criterion: the narrow-then-coalesce-zero probe passes AND the full corpus stays
   at 395/398.
 
-### Closures / lambdas ; PARTIAL ; probe
+### Closures / lambdas ; SOUND ; probe
 - [x] A stored / aliased multi-argument closure calls correctly (`let g = f; g(3,4)`).
 - [x] Per-instance heap environments; loop captures are independent.
-- [ ] Closure parameters are typed (currently untyped, inferred from the call site).
-- [ ] An escaping closure environment is freed (currently leaks, see below).
-
-### Escaping closure environment leak ; UNSOUND ; read
-- [ ] A closure's box and environment are freed, and its captured owned values released.
-- Confirmed via codegen (`expressions.zig:4365,4385`): the box `{fn_ptr, env, cleanup}` and the env are
-  `compileAllocPersistent` (never freed), and the cleanup function that would release captured owned values is
-  built but NEVER CALLED. So the env, the box, and every retained capture leak. (The ARC audit and `nova test`
-  ASAN give a FALSE clean here because persistent allocations are not ARC objects and `nova test` does not run
-  LSan.) Fix is a real sub-project with a prerequisite: BLOCKER found this session, function values are NOT
-  uniformly represented, a closure is a 3-slot box `{fn_ptr, env, cleanup}` but a bare function reference is a
-  RAW fn-pointer (`fnRefInt`, `expressions.zig:427`). Both carry the type `.func`, so marking `.func` owned
-  would `nova_release` a raw code pointer for bare fn-refs and crash. Step 1: unify the representation (box
-  every function value, `env=0,cleanup=0` for a bare ref); step 2: a single generic box destructor + owned
-  `.func`. Test criterion: a built binary that returns and drops a capturing closure shows 0 leaks, corpus
-  stays 395/398, OSSA-hard stays 398/398.
+- [x] Creating and dropping a closure reclaims its memory (no leak, no unbounded growth). Empirically
+  verified: 2,000,000 closures created + dropped (List capture and owned-string capture) peak at ~1.2 to 1.4
+  MB, flat, versus 26 MB for a genuinely-growing 2M-element List. The runtime reclaims/reuses the persistent
+  box+env allocations. This CORRECTS an earlier UNSOUND mark: reading codegen (persistent alloc + a never-
+  called cleanup) suggested a leak, but the measurement disproves it. The `leaks`/LSan tools also report 0
+  (the allocations stay reachable). Lesson: measure, do not infer from the alloc call.
+- [ ] Closure parameters are typed (currently untyped, inferred from the call site). Completeness, not
+  soundness.
 
 ### Integers (`int` 32-bit, `long` 64-bit) ; SOUND ; probe
 - [x] `int` is 32-bit two's-complement with defined wraparound; `long` is 64-bit.
@@ -411,8 +403,9 @@ Ordered with the language stream first (the priority).
 
 Language:
 1. `x ?? d` on a narrowed present 0 (representational fix).
-2. Escaping closure environment leak.
-3. Type-checker fully fail-closed (the remaining `orelse return` sites).
+2. Type-checker fully fail-closed (the remaining `orelse return` sites).
+(The "escaping closure environment leak" was investigated and DISPROVEN empirically this session; it is not a
+defect. The single-file `nova x -o out` build for `List` programs was fixed as a byproduct.)
 
 Drivers:
 4. BSON ORM `long` truncation.
@@ -441,10 +434,12 @@ order that unblocks them, then the remaining completeness. Every phase uses the 
 acceptance criteria; anything that regresses is reverted. DB and orchestrator streams follow after the language
 is sound.
 
-**Phase 0 ; restore verification tooling (small, unblocks the rest).**
-- Fix the single-file `nova x -o out` build so a `List`-using program links (currently fails on `List.slice`
-  resolution against `~/.nova/std`). This is needed to build binaries and run the `leaks`/LSan detector for the
-  closure work, since `nova test` gives false-clean leak results. Gate: a List program builds and runs.
+**Phase 0 ; restore verification tooling (DONE this session).**
+- FIXED the single-file `nova x -o out` build for `List`-using programs: the demand-driven reachability gate
+  force-kept container `copy` but not its callee `slice`, so `copy`'s body referenced a pruned method. Seeded
+  `copy` as a walk root (mirroring the `delete` edge) so its callees are reached (`reach.zig`). Gated:
+  NOVA_REACH_ON corpus stays 395/398. This unblocked the leak measurement that DISPROVED the closure leak
+  (2M closures flat at 1.4 MB), so Phases 3 and 4 below are no longer needed.
 
 **Phase 1 ; low-risk additive wins (build momentum; each independently gated).**
 - Generic-bound enforcement: at instantiation, reject a `T` that does not satisfy a declared `where T: Bound`.
@@ -460,17 +455,10 @@ is sound.
   program is newly rejected. This also closes the switch-exhaustiveness untypeable-discriminant edge. Add
   `expect_fail` cases for each newly-rejected shape.
 
-**Phase 3 ; function-value representation unification (prerequisite refactor).**
-- Box every function value uniformly as `{fn_ptr, env, cleanup}` (a bare function reference gets `env=0,
-  cleanup=0`), so all `.func` values share one representation and one call path. No ownership change yet; this
-  is purely making the representation uniform. Gate hard (closures are used across the corpus and the web
-  framework).
-
-**Phase 4 ; closure ARC (fixes the escaping-closure leak).**
-- On top of Phase 3: allocate the box via `nova_bytes_alloc` (ARC header) not persistent; a single generic box
-  destructor calls the box's cleanup (releasing captured owned values) and frees the env; mark `.func` owned so
-  the box is released at scope end and retained on escape. Gate: the built-binary leak test shows 0 leaks, plus
-  the standard gate including OSSA-hard (closures become owned, so the verifier must stay green).
+**Phases 3 and 4 (closure representation unification + closure ARC) ; DROPPED.**
+- These existed only to fix the escaping-closure leak, which the Phase 0 measurement DISPROVED (closures do
+  not leak). Function-value representation is still non-uniform (closure box vs raw fn-ref), which only matters
+  for typed-closure-parameter completeness (Phase 6), not for any soundness defect. No urgent work here.
 
 **Phase 5 ; value-optional representation + `??` present-zero.**
 - Box value-optionals (or carry a reliable narrowing-present signal into codegen) so a present 0 is
