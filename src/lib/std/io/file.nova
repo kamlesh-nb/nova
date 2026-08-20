@@ -141,6 +141,17 @@ pub struct File {
         sys.close(fd);
     }
 
+    // Like writeText, but reports whether the write actually succeeded: false if the file could not be
+    // opened (e.g. EACCES) or the write was short/failed. Callers writing to privileged sinks (cgroup
+    // limits, sysfs) need this to avoid a SILENT downgrade when the write is rejected.
+    pub fn writeTextOk(path: string, content: string): bool {
+        let fd = openFd(path, "w");
+        if (fd < 0) { return false; }
+        let n = sys.write(fd, content, content.length as long);
+        sys.close(fd);
+        return n == (content.length as long);
+    }
+
     pub fn appendText(path: string, content: string): void {
         let fd = openFd(path, "a");
         if (fd < 0) {
