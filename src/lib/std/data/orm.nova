@@ -211,7 +211,17 @@ pub struct BsonSink impl ValueSink {
 
     fn putString(self: BsonSink, key: string, val: string): void { self.doc.entries.push(bson.entryString(key, val)); }
 
-    fn putInt(self: BsonSink, key: string, val: long): void { self.doc.entries.push(bson.entryInt(key, val as int)); }
+    fn putInt(self: BsonSink, key: string, val: long): void {
+        // E1 fix: do NOT truncate a 64-bit value to int32. Store as BSON int32 only when the value
+        // round-trips through int32 losslessly; otherwise store the full int64. This preserves int32 type
+        // fidelity for small values and stops the silent data loss for large `long` fields.
+        let narrowed = (val as int) as long;
+        if (narrowed == val) {
+            self.doc.entries.push(bson.entryInt(key, val as int));
+        } else {
+            self.doc.entries.push(bson.entryInt64Val(key, val));
+        }
+    }
     fn putBool(self: BsonSink, key: string, val: bool): void { self.doc.entries.push(bson.entryBool(key, val ? 1 : 0)); }
     fn putFloat(self: BsonSink, key: string, val: double): void { self.doc.entries.push(bson.entryDoubleVal(key, val)); }
     fn putDecimal(self: BsonSink, key: string, val: decimal): void { self.doc.entries.push(bson.entryDecimal(key, val)); }

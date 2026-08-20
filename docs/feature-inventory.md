@@ -235,8 +235,10 @@ marking any of them [x] requires an actual code fix that a probe or gate verifie
 - [x] Connection pooling with idle/open caps and lifetime eviction.
 - [ ] Micro-ORM has relations / migrations / query builder (data-mapper only).
 
-### BSON ORM `long` fidelity ; UNSOUND ; swept
-- [ ] The ORM bind path preserves 64-bit `long` (currently truncates to 32 bits).
+### BSON ORM `long` fidelity ; SOUND ; case + probe
+- [x] The ORM write path preserves 64-bit `long` (FIXED: `BsonSink.putInt` stores int32 when the value fits
+  and int64 otherwise, instead of `val as int`). Probe + case 388: `5_000_000_000` round-trips as int64
+  (type 18, correct hi/lo); a small value stays int32 (type 16); BSON cases 51/90/161 unaffected.
 
 ### MSSQL transport defaults ; UNSOUND ; read
 - [ ] Encryption is on by default.
