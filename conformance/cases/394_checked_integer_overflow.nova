@@ -1,0 +1,20 @@
+// A checked/overflow-detecting integer arithmetic mode exists: math.checked{Add,Sub,Mul}{Int,Long} return
+// `undefined` on overflow instead of silently wrapping, and saturating variants clamp. The default `+ - *`
+// still wrap (defined behaviour); these are the opt-in "be honest about overflow" path.
+import math;
+import assert;
+@test
+fn checked_int_detects_overflow(): void {
+    assert.equalInt(math.checkedAddInt(2000000000, 100000000) ?? -1, 2100000000);
+    assert.isTrue(math.checkedAddInt(2147483647, 1) == undefined);      // INT_MAX + 1
+    assert.isTrue(math.checkedMulInt(100000, 100000) == undefined);     // 10^10 > INT_MAX
+    assert.isTrue(math.checkedSubInt(-2147483648, 1) == undefined);     // INT_MIN - 1
+}
+@test
+fn checked_long_detects_overflow(): void {
+    assert.isTrue(math.checkedAddLong(9223372036854775807, 1) == undefined);  // LONG_MAX + 1
+}
+@test
+fn saturating_clamps(): void {
+    assert.equalInt(math.satAddInt(2147483647, 1000), 2147483647);     // clamps to INT_MAX
+}

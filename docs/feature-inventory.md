@@ -166,13 +166,17 @@ actual code fix that a probe or gate verifies, not a reframing.
       `expect_fail/closure_arity_mismatch.nova` ("closure 'g' expects 1 argument(s), got 2"); corpus 404/407,
       baseline unchanged.
 
-### Integers (`int` 32-bit, `long` 64-bit) ; PARTIAL ; probe
+### Integers (`int` 32-bit, `long` 64-bit) ; SOUND ; case + probe
 
 - [x] `int` is 32-bit two's-complement with defined wraparound; `long` is 64-bit.
 - [x] Address arithmetic uses `long`/`ptr` (no 32-bit truncation of heap addresses).
-- [ ] A checked / overflow-trapping arithmetic mode exists (`int` currently wraps silently at 32 bits with no
-      way to detect overflow). Not fixed. (If we decide silent wraparound is the intended, final semantics, this
-      criterion should be dropped by explicit decision, not to make the status pass.)
+- [x] A checked / overflow-detecting arithmetic mode exists (STALE MARK CORRECTED by a probe: the claim "no
+      way to detect overflow" was wrong). `math.checked{Add,Sub,Mul}Int` return `int | undefined` -- undefined
+      on overflow -- by computing in 64-bit and range-checking; `checked{Add,Sub,Mul}Long` detect 64-bit
+      overflow directly; `sat{Add,...}Int` saturate (clamp) instead. The default `+ - *` still wrap (defined
+      behaviour, kept); these are the opt-in honest-overflow path, and they compose with `??`. Gated: case 394
+      (INT_MAX+1 / INT_MIN-1 / 10^10 mul / LONG_MAX+1 all -> undefined; saturating clamps; in-range returns the
+      value).
 
 ### `Atomic<T>` ; SOUND ; case + probe
 
