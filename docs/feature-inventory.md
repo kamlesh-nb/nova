@@ -44,15 +44,18 @@ Deliberate architectural choices, stated as what we HAVE. The identity of the pl
 # Stream 1: Language and runtime (PRIORITY)
 
 Empirical triage (2026-08-20): probing the language stream through the real compiler showed it is in much
-better SOUNDNESS shape than the raw unmet-criteria count implied. Several "gaps" were already fixed (stored
-multi-arg closures, `Atomic<string>` rejection, deep-nested generics), theoretical (the fail-open checker
-catches every common wrong-type case; the remaining sites fire only on genuinely-untypeable expressions that
-error earlier), narrow (an UNUSED generic bound; used bounds are structurally enforced), or DISPROVEN (the
-"escaping closure environment leak" does not leak: 2M closures stay flat at 1.4 MB). The one genuinely-broken,
-probe-confirmed CORRECTNESS bug in the language is `x ?? d` on a narrowed present 0, which needs a value-
-optional representation change. The other unmet items are COMPLETENESS (Atomic runtime, typed closure params,
-bounded channels, actor supervision, IOCP readiness), several of which are deferrable.
-So: the language is close to sound-for-release, with `??`-present-zero as the single real soundness fix.
+better shape than the raw unmet-criteria count implied. 9 of the language features are fully SOUND
+(Monomorphisation, Enums, Error handling, Closures, Integers, Atomic, decimal128, ARC, OSSA). Probing flipped
+several stale marks to met: stored multi-arg closures, `Atomic<T>` runtime (a real codegen intercept, not the
+stub stdlib body), typed closure params, deep-nested generics, and switch exhaustiveness all work; the
+"escaping closure environment leak" was DISPROVEN (2M closures stay flat at 1.4 MB); the fail-open checker
+catches every common wrong-type case; used generic bounds are structurally enforced.
+The ONE genuinely-broken, probe-confirmed CORRECTNESS bug in the language is `x ?? d` on a narrowed present 0,
+which needs a value-optional representation change (three site-local guards each regressed serde/DI/try). The
+remaining PARTIAL items are COMPLETENESS: cross-module trait default methods, monomorphic (non-erased) generic
+trait dispatch, a heterogeneous future combinator, an unused-bound check, bounded channels + select + actor
+supervision, and IOCP readiness cases. So: the language is close to sound-for-release, with `??`-present-zero
+as the single real soundness fix and the rest being completeness (much of it deferrable).
 
 ### Monomorphisation ; SOUND ; probe
 - [x] Concrete generic instantiations produce correct code (case-gated).
@@ -103,23 +106,26 @@ So: the language is close to sound-for-release, with `??`-present-zero as the si
   signal in the typed IR. Test criterion: the narrow-then-coalesce-zero probe passes AND the full corpus stays
   at 395/398.
 
-### Closures / lambdas ; PARTIAL ; probe
+### Closures / lambdas ; SOUND ; probe
 - [x] A stored / aliased multi-argument closure calls correctly (`let g = f; g(3,4)`).
 - [x] Per-instance heap environments; loop captures are independent.
 - [x] Creating and dropping a closure reclaims its memory (no leak, no unbounded growth). Empirically verified:
   2,000,000 closures created + dropped (List capture and owned-string capture) stay flat at ~1.2 to 1.4 MB
   versus 26 MB for a genuinely-growing 2M-element List. This CORRECTS an earlier UNSOUND leak mark: the
   measurement disproves it (`leaks`/LSan also report 0). Lesson: measure, do not infer from the alloc call.
-- [ ] Closure parameters are typed (currently untyped, inferred from the call site).
+- [x] Closure parameters can be explicitly typed and work (`(x: int) => x+1`, `let g: (int)->int = ...`);
+  untyped params are inferred from the call site (a convenience, not a gap). Probe: both forms run.
 
 ### Integers (`int` 32-bit, `long` 64-bit) ; SOUND ; probe
 - [x] `int` is 32-bit two's-complement with defined wraparound; `long` is 64-bit.
 - [x] Address arithmetic uses `long`/`ptr` (no 32-bit truncation of heap addresses).
 
-### `Atomic<T>` ; PARTIAL ; probe
+### `Atomic<T>` ; SOUND ; case + probe
 - [x] An invalid atomic element type (`Atomic<string>`) is rejected at compile time.
-- [ ] The `Atomic<T>` stdlib runtime works (`load`/`store`/`compareAndSwap`/`add`/`sub`); currently a stub
-  (load returns undefined, CAS returns false, `init` allocates nothing).
+- [x] The runtime works: `load`/`store`/`compareAndSwap`/`add`/`sub`/`delete` for `int` (i32) and `long`
+  (i64). Implemented as a codegen intercept (`compileAtomicCall`) over the runtime `nova_atomic_*_i32/i64`,
+  not the stub stdlib body. Gated by case 31_atomics (7/7) and probed (int + long) ASAN-clean. The earlier
+  "stub" mark read the dead stdlib body; the codegen path is real.
 
 ### `decimal128` ; SOUND ; case
 - [x] Arithmetic, parse, and round-trip through JSON / YAML / BSON with fidelity.
