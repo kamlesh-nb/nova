@@ -1,0 +1,59 @@
+// OSSA Slice 3: owned-local reassignment is now modelled by the ownership verifier (destroy-old +
+// rebind-new), including the outer-local-reassigned-in-a-branch shape which is unified at the join by an
+// owned-value phi. Runtime behaviour is the real gate here (ASAN/ARC must stay clean); under NOVA_OSSA=hard
+// the verifier must additionally report 0 proven imbalances for these functions.
+import assert;
+import list;
+
+fn makeList(n: int): List<int> {
+    let l = List<int>();
+    l.push(n);
+    return l;
+}
+
+// Straight-line reassign: drop old, rebind twice.
+@test
+fn reassign_straight_line(): void {
+    let a = makeList(1);
+    a = makeList(2);
+    a = makeList(3);
+    assert.equalInt(a.size(), 1);
+    assert.equalInt(a.get(0), 3);
+}
+
+// Reassign a branch-local (declared inside the branch) — modelled directly, no phi needed.
+@test
+fn reassign_branch_local(): void {
+    let cond = true;
+    if (cond) {
+        let b = makeList(10);
+        b = makeList(20);
+        assert.equalInt(b.get(0), 20);
+    }
+}
+
+// Reassign an OUTER local inside one branch only: the then-path carries a fresh list, the else-path (no
+// else) carries the original. The join unifies them with an owned-value phi. No leak, no double-free.
+@test
+fn reassign_outer_in_then(): void {
+    let c = makeList(1);
+    let cond = true;
+    if (cond) {
+        c = makeList(2);
+    }
+    assert.equalInt(c.size(), 1);
+    assert.equalInt(c.get(0), 2);
+}
+
+// Reassign an outer local in BOTH branches: both paths carry fresh values; the phi has two live inputs.
+@test
+fn reassign_outer_both_branches(): void {
+    let d = makeList(0);
+    let cond = false;
+    if (cond) {
+        d = makeList(7);
+    } else {
+        d = makeList(9);
+    }
+    assert.equalInt(d.get(0), 9);
+}

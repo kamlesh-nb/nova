@@ -44,6 +44,31 @@ routed `NOVA_OWN_VERIFY=hard` to the SOUND path-sensitive OSSA verifier + the so
 Gate: full corpus under `NOVA_OWN_VERIFY=hard` = 394/397 (only the 3 pre-existing crashes 118/189/42) -> **0
 false accusations across all 394 correct cases**.
 
+## Slice 3 done (2026-08-20) — reassign modelled, incl. outer-local-in-branch via owned-value phi
+
+`reassign` (`x = rhs` on an owned local) was the SOLE remaining deferral bucket corpus-wide (break/continue,
+switch-guard, nonblock-branch were already 0; loops are handled by the back-edge set-equality check, so the
+old "loops deferred" note was stale). Closed in two layers:
+
+- **SILGen (`lower.zig`):** a reassign now lowers to `destroy(old) ; rebind(new)` in ownership order (RHS is
+  evaluated while old is still live, then old is dropped, then the slot is rebound to a `copy` of another
+  owned local or a fresh `make_owned`). A trivial RHS (`x = null`) marks the slot not-live.
+- **Owned-value phi (`ir.zig` `Phi` + `verify.zig` edge application):** when a branch reassigns an OUTER
+  local, the two paths carry different owned values for the same variable into the join. `reconcileJoin`
+  builds a phi at the join; the verifier MOVES each predecessor's input into the phi on that edge (a consume)
+  and the phi result is the single live value at the join. This is the linear-ownership move-merge, and it is
+  the same machinery loop-header merges will reuse. Mixed-liveness merges (live on one path, not another)
+  still defer — soundly.
+- **Still deferred (honest):** an outer-local reassign inside a LOOP body or SWITCH case (guarded by
+  `clone_floor`). These need a phi at the loop header / switch join respectively; scoped, not done. Measured
+  residue: `92_regex` reassign=1, `271_runtime_mediator` reassign=1 (was 4; the 3 if-branch ones are now
+  covered, lowered 569 -> 572).
+
+**Gate:** full corpus under `NOVA_OSSA=hard` = **397/397, 0 proven imbalances** (phi introduced no false
+positives). Two `verify.zig` unit tests added (balanced phi-reassign clean; un-consumed phi result flagged as
+a leak). Synthetic case: straight-line + branch-local + outer-in-branch reassign all lower, 100% coverage,
+ASAN-clean.
+
 ## What this verifier IS (honest boundary, restated)
 
 In Nova, ARC is AUTOMATIC — a user cannot create a leak/double-free through ownership mistakes (codegen

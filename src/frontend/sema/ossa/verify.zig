@@ -94,14 +94,14 @@ pub fn verify(gpa: std.mem.Allocator, func: *const ir.Func) !Result {
                 var it = live.iterator(.{});
                 while (it.next()) |vi| try diags.append(gpa, .{ .kind = .leak, .value = @enumFromInt(@as(u32, @intCast(vi))) });
             },
-            .br => |succ| try edge(gpa, &diags, entry, @intFromEnum(succ), &live),
+            .br => |succ| try edge(gpa, &diags, entry, func, b, @intFromEnum(succ), &live),
             .cond_br => |cb| {
-                try edge(gpa, &diags, entry, @intFromEnum(cb.then_blk), &live);
-                try edge(gpa, &diags, entry, @intFromEnum(cb.else_blk), &live);
+                try edge(gpa, &diags, entry, func, b, @intFromEnum(cb.then_blk), &live);
+                try edge(gpa, &diags, entry, func, b, @intFromEnum(cb.else_blk), &live);
             },
             .switch_br => |sb| {
-                for (sb.cases) |c| try edge(gpa, &diags, entry, @intFromEnum(c), &live);
-                try edge(gpa, &diags, entry, @intFromEnum(sb.default_blk), &live);
+                for (sb.cases) |c| try edge(gpa, &diags, entry, func, b, @intFromEnum(c), &live);
+                try edge(gpa, &diags, entry, func, b, @intFromEnum(sb.default_blk), &live);
             },
             .unreach => {},
         };
@@ -126,15 +126,35 @@ fn checkUse(gpa: std.mem.Allocator, diags: *std.ArrayListUnmanaged(Diagnostic), 
     }
 }
 
-/// Handle a CFG edge cur -> succ carrying `live`.
+/// Handle a CFG edge cur -> succ carrying `live_in`.
+///   PHIS: if `succ` has owned-value phis, this edge MOVES its input value into each phi (a consume on
+///     this edge) and the phi's result becomes live at the join. Applied on a private copy of `live_in`
+///     so a block with two successors (cond_br) does not corrupt the shared exit set.
 ///   FORWARD edge (succ not yet fixed): set/merge the successor's entry set. If it was already set by
-///     another forward predecessor (a join), the two exit sets must be EQUAL — a mismatch means one path
-///     consumed a value another did not (a path imbalance).
+///     another forward predecessor (a join), the two exit sets (after phi application) must be EQUAL — a
+///     mismatch means one path consumed a value another did not (a path imbalance).
 ///   BACK edge (succ already fixed, i.e. a loop header we already processed): the live set arriving on
 ///     the back-edge must EQUAL the header's entry set, or the loop body changed net ownership per
 ///     iteration (an inner value left live = leak, or an outer value consumed = use-after-consume next
 ///     iteration). Either way, a path imbalance.
-fn edge(gpa: std.mem.Allocator, diags: *std.ArrayListUnmanaged(Diagnostic), entry: []?Set, succ: usize, live: *const Set) !void {
+fn edge(gpa: std.mem.Allocator, diags: *std.ArrayListUnmanaged(Diagnostic), entry: []?Set, func: *const ir.Func, cur: usize, succ: usize, live_in: *const Set) !void {
+    var live = try live_in.clone(gpa);
+    defer live.deinit(gpa);
+
+    // Apply succ's phis for THIS predecessor: consume the input `cur` supplies, produce the phi result.
+    for (func.blocks.items[succ].phis.items) |ph| {
+        for (ph.inputs) |in| {
+            if (@intFromEnum(in.pred) != cur) continue;
+            if (func.ownershipOf(in.value) == .owned) {
+                if (!live.isSet(in.value.index())) {
+                    try diags.append(gpa, .{ .kind = .double_consume, .value = in.value });
+                } else live.unset(in.value.index());
+            }
+            if (func.ownershipOf(ph.result) == .owned) live.set(ph.result.index());
+            break;
+        }
+    }
+
     if (entry[succ]) |*existing| {
         var vi: usize = 0;
         while (vi < existing.bit_length) : (vi += 1) {
@@ -240,6 +260,63 @@ test "conditional path imbalance: consumed on one branch only" {
         saw_imbalance = true;
     };
     try testing.expect(saw_imbalance);
+}
+
+test "phi join: outer local reassigned on the THEN path, unified by a phi, verifies clean" {
+    // Models `let x = alloc(); if c { x = alloc(); } use x; drop x;`
+    //   entry:  x0 = make_owned; cond_br -> then, join
+    //   then:   destroy x0; x1 = make_owned; br join
+    //   join:   phi r = [then: x1, entry: x0]; destroy r; ret_void
+    const gpa = testing.allocator;
+    var f = ir.Func{ .name = "phi_reassign" };
+    defer f.deinit(gpa);
+    const e = try f.newBlock(gpa);
+    const then_b = try f.newBlock(gpa);
+    const join = try f.newBlock(gpa);
+
+    const x0 = try f.makeOwned(gpa, e, null);
+    const c = try f.makeTrivial(gpa, e, null);
+    f.setTerm(e, .{ .cond_br = .{ .cond = c, .then_blk = then_b, .else_blk = join } });
+
+    try f.destroy(gpa, then_b, x0); // reassign drops the old value...
+    const x1 = try f.makeOwned(gpa, then_b, null); // ...and binds a new one
+    f.setTerm(then_b, .{ .br = join });
+
+    const r_phi = try f.addPhi(gpa, join, &.{ .{ .pred = then_b, .value = x1 }, .{ .pred = e, .value = x0 } }, null);
+    try f.destroy(gpa, join, r_phi);
+    f.setTerm(join, .ret_void);
+
+    var r = try verify(gpa, &f);
+    defer r.deinit(gpa);
+    try testing.expect(r.ok());
+    try testing.expect(r.complete);
+}
+
+test "phi join: forgetting to consume the phi result is a leak" {
+    const gpa = testing.allocator;
+    var f = ir.Func{ .name = "phi_leak" };
+    defer f.deinit(gpa);
+    const e = try f.newBlock(gpa);
+    const then_b = try f.newBlock(gpa);
+    const join = try f.newBlock(gpa);
+
+    const x0 = try f.makeOwned(gpa, e, null);
+    const c = try f.makeTrivial(gpa, e, null);
+    f.setTerm(e, .{ .cond_br = .{ .cond = c, .then_blk = then_b, .else_blk = join } });
+    try f.destroy(gpa, then_b, x0);
+    const x1 = try f.makeOwned(gpa, then_b, null);
+    f.setTerm(then_b, .{ .br = join });
+
+    _ = try f.addPhi(gpa, join, &.{ .{ .pred = then_b, .value = x1 }, .{ .pred = e, .value = x0 } }, null);
+    f.setTerm(join, .ret_void); // phi result never consumed -> leak
+
+    var r = try verify(gpa, &f);
+    defer r.deinit(gpa);
+    var saw_leak = false;
+    for (r.diagnostics) |d| if (d.kind == .leak) {
+        saw_leak = true;
+    };
+    try testing.expect(saw_leak);
 }
 
 test "balanced across both branches verifies clean" {

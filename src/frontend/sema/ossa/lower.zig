@@ -66,6 +66,13 @@ const Ctx = struct {
     f: *ir.Func,
     defer_reason: DeferReason = .other,
     loop: ?LoopCtx = null,
+    // Locals length at the innermost CLONE boundary (if/else, loop body, switch case). Branches lower on
+    // a CLONE of `locals` that is discarded at the branch end, so mutations to locals BELOW this floor
+    // (declared in an enclosing scope) are lost while that enclosing scope still owns the original — a
+    // reassign there would emit a `destroy` in the discarded clone AND let the outer scope drop the same
+    // value, a double-consume. So a reassign of a local with `idx < clone_floor` still defers; one at or
+    // above the floor (declared inside the current branch) is safe to model. 0 at function top level.
+    clone_floor: usize = 0,
 };
 
 /// Record why we are about to defer, then return the Defer error.
@@ -139,9 +146,9 @@ fn lowerSeq(ctx: *Ctx, block: ir.Block, stmts: []const ast.Statement, locals: *L
                 return .terminated;
             },
             .expr_stmt => |es| {
-                // A bare-local REASSIGNMENT (`x = ...`) drops the old value and rebinds — not modelled
-                // yet, so defer. Any other expression statement borrows the locals it touches: no effect.
-                if (isLocalReassign(&es.expr, locals.items)) return deferBecause(ctx, .reassign);
+                // A bare-local REASSIGNMENT (`x = ...`) drops the old value and rebinds. Any other
+                // expression statement borrows the locals it touches: no ownership effect.
+                if (isLocalReassign(&es.expr, locals.items)) try lowerReassign(ctx, cur, &es.expr, locals);
             },
             .if_stmt => |iff| {
                 switch (try lowerIf(ctx, cur, &iff, locals)) {
@@ -178,8 +185,8 @@ fn lowerSeq(ctx: *Ctx, block: ir.Block, stmts: []const ast.Statement, locals: *L
                 // `defer expr` / `errdefer expr` runs a cleanup at scope exit. In Nova that expression is
                 // a BORROW (a method call like `x.close()`; there is no manual drop), so it has no
                 // ownership effect on the locals we track — skip it. A bare-local reassignment inside a
-                // defer would be the only concern, and that is as unmodelled as elsewhere -> defer then.
-                if (isLocalReassign(&s.defer_stmt.expr, locals.items)) return deferBecause(ctx, .reassign);
+                // defer drops-and-rebinds like any other, so model it the same way.
+                if (isLocalReassign(&s.defer_stmt.expr, locals.items)) try lowerReassign(ctx, cur, &s.defer_stmt.expr, locals);
             },
             .break_stmt => {
                 const lp = ctx.loop orelse return deferBecause(ctx, .break_continue);
@@ -216,13 +223,16 @@ fn lowerLet(ctx: *Ctx, block: ir.Block, ls: *const ast.LetStmt, locals: *Locals)
 }
 
 /// Lower an if/else. Branches get a CLONE of `locals` and are each their own lexical scope, so a
-/// branch may now declare its own owned locals (dropped at the branch end). The join block is allocated
-/// LAST so every edge is index-increasing. The caller's `locals` is unchanged (a fall-through branch
-/// consumes no outer local — only a `return` does, and that terminates the branch).
+/// branch may declare its own owned locals (dropped at the branch end) AND reassign an OUTER local. A
+/// branch that reassigns an outer local rebinds it to a DIFFERENT owned value than the sibling path, so
+/// the two paths carry different values for that variable into the join. `reconcileJoin` unifies them
+/// with an owned-value PHI (verify.zig applies it edge-by-edge), and the caller's `locals` is updated to
+/// the join value. The join block is allocated LAST so every forward edge is index-increasing.
 fn lowerIf(ctx: *Ctx, entry_block: ir.Block, iff: *const ast.IfStmt, locals: *Locals) LowerError!Flow {
     const then_stmts = branchStmts(iff.then_branch) orelse return deferBecause(ctx, .nonblock_branch);
     const else_stmts: ?[]const ast.Statement = if (iff.else_branch) |e| (branchStmts(e) orelse return deferBecause(ctx, .nonblock_branch)) else null;
 
+    const n_outer = locals.items.len; // indices [0, n_outer) are locals from the enclosing scope
     const cond = try ctx.f.makeTrivial(ctx.gpa, entry_block, null);
     const then_block = try ctx.f.newBlock(ctx.gpa);
     const else_block: ?ir.Block = if (else_stmts != null) try ctx.f.newBlock(ctx.gpa) else null;
@@ -231,21 +241,25 @@ fn lowerIf(ctx: *Ctx, entry_block: ir.Block, iff: *const ast.IfStmt, locals: *Lo
     defer then_locals.deinit(ctx.gpa);
     const then_flow = try lowerBlockScope(ctx, then_block, then_stmts, &then_locals);
 
+    var else_locals: ?Locals = if (else_stmts != null) try cloneLocals(ctx.gpa, locals) else null;
+    defer if (else_locals) |*el| el.deinit(ctx.gpa);
     var else_flow: ?Flow = null;
-    if (else_stmts) |es| {
-        var else_locals = try cloneLocals(ctx.gpa, locals);
-        defer else_locals.deinit(ctx.gpa);
-        else_flow = try lowerBlockScope(ctx, else_block.?, es, &else_locals);
-    }
+    if (else_stmts) |es| else_flow = try lowerBlockScope(ctx, else_block.?, es, &else_locals.?);
 
     const join_block = try ctx.f.newBlock(ctx.gpa); // highest index
     ctx.f.setTerm(entry_block, .{ .cond_br = .{ .cond = cond, .then_blk = then_block, .else_blk = else_block orelse join_block } });
 
-    var any_fallthrough = false;
+    // The joining predecessors of `join_block` and the source of each one's outer-local values:
+    //  - then: its fall-through exit block, values from then_locals.
+    //  - else present: its fall-through exit block, values from else_locals.
+    //  - else absent: the else edge is entry_block -> join, carrying the ENTRY values (`locals`).
+    var preds: [2]JoinPred = undefined;
+    var npreds: usize = 0;
     switch (then_flow) {
         .fallthrough => |b| {
             ctx.f.setTerm(b, .{ .br = join_block });
-            any_fallthrough = true;
+            preds[npreds] = .{ .block = b, .vals = then_locals.items };
+            npreds += 1;
         },
         .terminated => {},
     }
@@ -253,15 +267,64 @@ fn lowerIf(ctx: *Ctx, entry_block: ir.Block, iff: *const ast.IfStmt, locals: *Lo
         switch (ef) {
             .fallthrough => |b| {
                 ctx.f.setTerm(b, .{ .br = join_block });
-                any_fallthrough = true;
+                preds[npreds] = .{ .block = b, .vals = else_locals.?.items };
+                npreds += 1;
             },
             .terminated => {},
         }
     } else {
-        any_fallthrough = true; // no else: the else edge goes straight to join, carrying `locals`
+        // no else: the implicit else edge goes straight from entry to join, carrying the entry values.
+        preds[npreds] = .{ .block = entry_block, .vals = locals.items };
+        npreds += 1;
     }
 
-    return if (any_fallthrough) .{ .fallthrough = join_block } else .terminated;
+    if (npreds == 0) return .terminated; // both branches returned: join unreachable
+
+    try reconcileJoin(ctx, join_block, locals, n_outer, preds[0..npreds]);
+    return .{ .fallthrough = join_block };
+}
+
+/// A predecessor of a join: the block that branches to the join, and that path's view of the outer locals.
+const JoinPred = struct { block: ir.Block, vals: []const Local };
+
+/// Reconcile the outer locals [0, n_outer) at a join reached by `preds`. For each outer local whose value
+/// or liveness differs across the joining predecessors, build an owned-value PHI at `join_block` and point
+/// the caller's `locals` at the phi result. When every predecessor agrees, nothing is emitted (the value
+/// already flows through unchanged). A local live on some joining paths but not others cannot be a single
+/// owned phi result, so that (rare) shape defers the whole function — soundly, never a false accusation.
+fn reconcileJoin(ctx: *Ctx, join_block: ir.Block, locals: *Locals, n_outer: usize, preds: []const JoinPred) LowerError!void {
+    var i: usize = 0;
+    while (i < n_outer) : (i += 1) {
+        // Gather this local's (value, live) as seen by each joining predecessor.
+        var all_same_value = true;
+        var any_live = false;
+        var all_live = true;
+        for (preds) |p| {
+            const l = p.vals[i];
+            if (l.value != preds[0].vals[i].value) all_same_value = false;
+            if (l.live) any_live = true else all_live = false;
+        }
+        if (!any_live) {
+            // consumed on every joining path (e.g. moved out / reset to null everywhere): no owned value
+            // survives the join.
+            locals.items[i].live = false;
+            continue;
+        }
+        if (!all_live) return deferBecause(ctx, .reassign); // mixed liveness: not a single-value phi
+        if (all_same_value) {
+            // Every path carries the SAME owned value — it flows through untouched. Keep it (a branch may
+            // have rebound its clone to a fresh value only when it DIFFERS, so identical means unchanged).
+            locals.items[i].value = preds[0].vals[i].value;
+            locals.items[i].live = true;
+            continue;
+        }
+        // Differing owned values across paths: unify with a phi.
+        var inputs: [2]ir.PhiInput = undefined;
+        for (preds, 0..) |p, k| inputs[k] = .{ .pred = p.block, .value = p.vals[i].value };
+        const result = try ctx.f.addPhi(ctx.gpa, join_block, inputs[0..preds.len], null);
+        locals.items[i].value = result;
+        locals.items[i].live = true;
+    }
 }
 
 /// The shared loop shape: entry -> header; header -cond-> body/exit; body -> header (back-edge). The
@@ -283,9 +346,12 @@ fn lowerLoop(ctx: *Ctx, entry_block: ir.Block, body_stmts: []const ast.Statement
 
     const saved = ctx.loop;
     ctx.loop = .{ .header = header, .exit = exit_block, .body_mark = locals.items.len };
+    const saved_floor = ctx.clone_floor;
+    ctx.clone_floor = locals.items.len; // reassigns of outer locals inside the (discarded) body clone defer
     var body_locals = try cloneLocals(ctx.gpa, locals);
     defer body_locals.deinit(ctx.gpa);
     const body_flow = try lowerBlockScope(ctx, body_block, body_stmts, &body_locals);
+    ctx.clone_floor = saved_floor;
     ctx.loop = saved;
 
     switch (body_flow) {
@@ -316,7 +382,7 @@ fn lowerFor(ctx: *Ctx, entry_block: ir.Block, fr: *const ast.ForStmt, locals: *L
     const for_mark = locals.items.len;
     if (fr.initializer) |istmt| switch (istmt.*) {
         .let_stmt => |ls| try lowerLet(ctx, entry_block, &ls, locals),
-        .expr_stmt => |es| if (isLocalReassign(&es.expr, locals.items)) return deferBecause(ctx, .reassign),
+        .expr_stmt => |es| if (isLocalReassign(&es.expr, locals.items)) try lowerReassign(ctx, entry_block, &es.expr, locals),
         else => return deferBecause(ctx, .other),
     };
     const exit_block = try lowerLoop(ctx, entry_block, body_stmts, locals);
@@ -335,6 +401,10 @@ fn lowerSwitch(ctx: *Ctx, entry_block: ir.Block, sw: *const ast.SwitchStmt, loca
     errdefer ctx.gpa.free(case_blocks);
     const case_flows = try ctx.gpa.alloc(Flow, sw.cases.len);
     defer ctx.gpa.free(case_flows);
+
+    const saved_floor = ctx.clone_floor;
+    ctx.clone_floor = locals.items.len; // reassigns of outer locals inside the (discarded) case clones defer
+    defer ctx.clone_floor = saved_floor;
 
     // Lower each case body into its own block+scope. Blocks are allocated before the join (below).
     for (sw.cases, 0..) |c, i| {
@@ -433,13 +503,46 @@ fn resolveLocal(locals: []const Local, want: []const u8) ?usize {
     return null;
 }
 
-/// True if `e` is a bare assignment `local = ...` to a tracked owned local (which drops the old value —
-/// a rebinding this slice does not yet model, so the caller defers it).
+/// True if `e` is a bare assignment `local = ...` to a tracked owned local (which drops the old value
+/// and rebinds the slot). Modelled by `lowerReassign`.
 fn isLocalReassign(e: *const ast.Expression, locals: []const Local) bool {
     if (e.kind != .binary) return false;
     const b = e.kind.binary;
     if (b.op != .assign) return false;
     return b.left.kind == .ident and resolveLocal(locals, b.left.kind.ident) != null;
+}
+
+/// Lower a reassignment `x = rhs` where `x` is a tracked owned local. Ownership order matches codegen:
+/// the RHS is evaluated FIRST (it BORROWS the still-live old `x`, so a self-referential RHS like
+/// `x = x.next()` is sound), THEN the old value is dropped (-1), THEN the slot is rebound to the new
+/// value. The new value is a `copy` when the RHS is another owned local (`x = y`, +1) or a fresh
+/// `makeOwned` when the RHS is any other owned initializer. A trivial RHS (`x = null`, `x = 0`) leaves
+/// the slot with no owned obligation, so it is marked not-live (nothing to destroy at scope end).
+fn lowerReassign(ctx: *Ctx, block: ir.Block, e: *const ast.Expression, locals: *Locals) LowerError!void {
+    const b = e.kind.binary;
+    const idx = resolveLocal(locals.items, b.left.kind.ident).?;
+    // Reassigning a local declared in an ENCLOSING scope from inside a discarded branch clone would
+    // double-consume (see `clone_floor`). Not soundly modellable here -> defer.
+    if (idx < ctx.clone_floor) return deferBecause(ctx, .reassign);
+    const rhs = b.right;
+    // Produce the new owned value while the old value is still live (models RHS-before-drop).
+    var new_val: ?ir.Value = null;
+    if (rhs.kind == .ident) {
+        if (resolveLocal(locals.items, rhs.kind.ident)) |j| {
+            if (locals.items[j].live) new_val = try ctx.f.copy(ctx.gpa, block, locals.items[j].value);
+        }
+    }
+    if (new_val == null and isOwnedInit(ctx.store, ctx.tir, rhs))
+        new_val = try ctx.f.makeOwned(ctx.gpa, block, ctx.tir.typeOf(rhs));
+    // Drop the old value (-1) if the slot currently holds one.
+    if (locals.items[idx].live) try ctx.f.destroy(ctx.gpa, block, locals.items[idx].value);
+    // Rebind the slot.
+    if (new_val) |nv| {
+        locals.items[idx].value = nv;
+        locals.items[idx].live = true;
+    } else {
+        locals.items[idx].live = false; // trivial RHS: no owned obligation remains
+    }
 }
 
 // A minimal name-mention check (idents only, recursive over common expression shapes), kept for the

@@ -96,8 +96,19 @@ pub const Instr = struct {
     op: Op,
 };
 
+/// One incoming arm of a phi: the value that predecessor `pred` carries into the join.
+pub const PhiInput = struct { pred: Block, value: Value };
+
+/// An owned-value phi at a control-flow JOIN. When a variable is bound to DIFFERENT owned values on
+/// different incoming edges (e.g. an outer local reassigned in one branch but not another), the join
+/// unifies them: each predecessor MOVES its `inputs[i].value` into the phi as its edge is taken (a
+/// consume on that edge), and the phi's `result` is a single fresh owned value live at the join. This is
+/// exactly the linear-ownership move-merge; the verifier applies it edge-by-edge (see verify.zig `edge`).
+pub const Phi = struct { result: Value, inputs: []PhiInput };
+
 pub const BasicBlock = struct {
     instrs: std.ArrayListUnmanaged(Instr) = .empty,
+    phis: std.ArrayListUnmanaged(Phi) = .empty,
     term: ?Terminator = null,
 };
 
@@ -116,6 +127,8 @@ pub const Func = struct {
     pub fn deinit(self: *Func, gpa: std.mem.Allocator) void {
         for (self.blocks.items) |*b| {
             b.instrs.deinit(gpa);
+            for (b.phis.items) |ph| gpa.free(ph.inputs);
+            b.phis.deinit(gpa);
             if (b.term) |t| switch (t) {
                 .switch_br => |sb| gpa.free(sb.cases),
                 else => {},
@@ -183,6 +196,16 @@ pub const Func = struct {
     }
     pub fn endBorrow(self: *Func, gpa: std.mem.Allocator, b: Block, v: Value) !void {
         try self.emit(gpa, b, .none, .{ .end_borrow = v });
+    }
+
+    /// Add an owned-value phi at join block `b`. `inputs` is copied (the Func owns the slice). Returns the
+    /// fresh owned result value, live at the join. `ty` is carried for diagnostics only.
+    pub fn addPhi(self: *Func, gpa: std.mem.Allocator, b: Block, inputs: []const PhiInput, ty: ?TypeId) !Value {
+        const result = try self.newValue(gpa, .owned, ty);
+        const owned_inputs = try gpa.dupe(PhiInput, inputs);
+        errdefer gpa.free(owned_inputs);
+        try self.blockPtr(b).phis.append(gpa, .{ .result = result, .inputs = owned_inputs });
+        return result;
     }
 
     pub fn setTerm(self: *Func, b: Block, term: Terminator) void {
