@@ -178,6 +178,14 @@ pub struct List<T> {
         return self.indexOf(value) != -1;
     }
 
+    // Deep copy: a fresh List with its own RawBuffer holding copies of every element (owned elements are
+    // retained by push). Used by the compiler to give value semantics to a value struct that has a List
+    // field -- a byte-copy of such a struct would otherwise share this buffer (channel 4). Reuses slice,
+    // which is the proven allocate-new-buffer-and-copy path.
+    pub fn copy(self: List<T>): List<T> {
+        return self.slice(0, self.data.count());
+    }
+
     pub fn slice(self: List<T>, start: int, end: int): List<T> {
         let n = self.data.count();
         let s = if (start < 0) 0 else if (start > n) n else start;

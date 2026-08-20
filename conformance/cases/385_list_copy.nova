@@ -1,0 +1,29 @@
+// Channel 4 (container COW), slice 1: List.copy() is a deep copy -- a fresh List with its own RawBuffer
+// holding copies of every element. It is the primitive the compiler will use to give value semantics to a
+// value struct with a List field (a byte-copy of such a struct shares the buffer). Independent of the
+// original: pushing to / mutating the copy does not affect the source, and owned (string) elements survive.
+import assert;
+import collections.list;
+
+@test
+fn copy_is_independent(): void {
+    let a = list.List<int>();
+    a.push(1); a.push(2); a.push(3);
+    let b = a.copy();
+    b.push(4);
+    assert.equalInt(a.size(), 3);
+    assert.equalInt(b.size(), 4);
+    b.set(0, 99);
+    assert.equalInt(a.at(0), 1);
+    assert.equalInt(b.at(0), 99);
+}
+
+@test
+fn copy_owned_elements(): void {
+    let a = list.List<string>();
+    a.push("x"); a.push("y");
+    let b = a.copy();
+    assert.equalStr(b.at(0), "x");
+    assert.equalStr(b.at(1), "y");
+    assert.equalInt(b.size(), 2);
+}
