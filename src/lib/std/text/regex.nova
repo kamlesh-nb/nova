@@ -73,6 +73,34 @@ fn opt(p: List<Inst>): List<Inst> {
     return r;
 }
 
+// Lazy (non-greedy) variants: same NFA shape, but the SPLIT's two targets are swapped so the matcher prefers
+// to EXIT the loop before consuming another repetition. The Pike VM adds a SPLIT's first target ahead of its
+// second in priority order, so putting the exit branch first makes `*?`/`+?`/`??` prefer the shortest match.
+fn starLazy(p: List<Inst>): List<Inst> {
+    let lp = p.size();
+    let r = List<Inst>();
+    r.push(iSplit(lp + 2, 1));               // prefer exit, then body
+    appendAll(r, p);
+    r.push(iJmp(0 - (lp + 1)));
+    return r;
+}
+
+fn plusLazy(p: List<Inst>): List<Inst> {
+    let lp = p.size();
+    let r = List<Inst>();
+    appendAll(r, p);
+    r.push(iSplit(1, 0 - lp));               // prefer exit, then loop back
+    return r;
+}
+
+fn optLazy(p: List<Inst>): List<Inst> {
+    let lp = p.size();
+    let r = List<Inst>();
+    r.push(iSplit(lp + 1, 1));               // prefer skip, then body
+    appendAll(r, p);
+    return r;
+}
+
 fn alt(a: List<Inst>, b: List<Inst>): List<Inst> {
     let la = a.size();
     let lb = b.size();
@@ -126,50 +154,99 @@ fn classMatch(body: string, neg: int, ch: int): bool {
     return inSet;
 }
 
+fn cloneSaves(src: List<int>): List<int> {
+    let d = List<int>();
+    let i = 0;
+    while (i < src.size()) { d.push(src.at(i)); i = i + 1; }
+    return d;
+}
+
+// Follow epsilon transitions from `pc` at input position `pos`, adding the resulting CONSUMING / MATCH
+// instructions to the thread list (pcs + parallel saves). The `mark`/`gen` sparse set ensures each pc is added
+// at most ONCE per input position -- this is what makes the matcher LINEAR (a bounded number of live threads
+// per position) instead of the old recursion that re-explored SPLIT branches exponentially. SPLIT visits x
+// before y, so priority (leftmost-first) order is preserved.
+fn addThread(prog: List<Inst>, pcs: List<int>, savesList: List<List<int>>, mark: List<int>, gen: int, pc: int, saves: List<int>, pos: int, s: string): void {
+    if (pc < 0 || pc >= prog.size()) { return; }
+    if (mark.at(pc) == gen) { return; }
+    mark.set(pc, gen);
+    let ins = prog.at(pc);
+    let op = ins.op;
+    if (op == OP_JMP) {
+        addThread(prog, pcs, savesList, mark, gen, pc + ins.x, saves, pos, s);
+    } else if (op == OP_SPLIT) {
+        addThread(prog, pcs, savesList, mark, gen, pc + ins.x, cloneSaves(saves), pos, s);
+        addThread(prog, pcs, savesList, mark, gen, pc + ins.y, cloneSaves(saves), pos, s);
+    } else if (op == OP_SAVE) {
+        let ns = cloneSaves(saves);
+        ns.set(ins.n, pos);
+        addThread(prog, pcs, savesList, mark, gen, pc + 1, ns, pos, s);
+    } else if (op == OP_BOL) {
+        if (pos == 0) { addThread(prog, pcs, savesList, mark, gen, pc + 1, saves, pos, s); }
+    } else if (op == OP_EOL) {
+        if (pos == s.length) { addThread(prog, pcs, savesList, mark, gen, pc + 1, saves, pos, s); }
+    } else if (op == OP_BOUND) {
+        let before = if (pos > 0) isWord(s[pos - 1]) else false;
+        let after = if (pos < s.length) isWord(s[pos]) else false;
+        let boundary = before != after;
+        let want = ins.neg == 0;
+        if (boundary == want) { addThread(prog, pcs, savesList, mark, gen, pc + 1, saves, pos, s); }
+    } else {
+        // OP_CHAR / OP_CLASS / OP_ANY / OP_MATCH: a consuming (or accepting) thread parks in the list.
+        pcs.push(pc);
+        savesList.push(saves);
+    }
+}
+
+// Pike VM: run all NFA threads in lockstep over the input, one position at a time. Anchored at `sp` (the
+// caller searches by advancing sp). Returns the end position of the highest-priority match, or -1, filling
+// `saves` with that match's capture positions. Linear time O(n * m): at most `prog.size()` live threads per
+// input position, no exponential backtracking on patterns like `(a*)*` or `a?a?...aaa`.
 fn vmMatch(prog: List<Inst>, pc: int, s: string, sp: int, saves: List<int>): int {
-    let p = pc;
+    let n = prog.size();
+    let mark = List<int>();
+    let mi = 0;
+    while (mi < n) { mark.push(-1); mi = mi + 1; }
+
+    let clistPc = List<int>();
+    let clistSaves = List<List<int>>();
+    let gen = 0;
+    addThread(prog, clistPc, clistSaves, mark, gen, pc, cloneSaves(saves), sp, s);
+
+    let matchedEnd = 0 - 1;
     let i = sp;
     while (true) {
-        let ins = prog.at(p);
-        let op = ins.op;
-        if (op == OP_MATCH) { return i; }
-        if (op == OP_CHAR) {
-            if (i < s.length && s[i] == ins.c) { p = p + 1; i = i + 1; } else { return -1; }
-        } else if (op == OP_ANY) {
-            if (i < s.length) { p = p + 1; i = i + 1; } else { return -1; }
-        } else if (op == OP_CLASS) {
-            if (i < s.length && classMatch(ins.cls, ins.neg, s[i])) { p = p + 1; i = i + 1; } else { return -1; }
-        } else if (op == OP_BOL) {
-            if (i == 0) { p = p + 1; } else { return -1; }
-        } else if (op == OP_EOL) {
-            if (i == s.length) { p = p + 1; } else { return -1; }
-        } else if (op == OP_BOUND) {
-            // Word boundary: the word-ness of the chars on either side of position i differs. Zero-width.
-            let before = if (i > 0) isWord(s[i - 1]) else false;
-            let after = if (i < s.length) isWord(s[i]) else false;
-            let boundary = before != after;
-            let want = ins.neg == 0;   // \b wants a boundary; \B wants a non-boundary
-            if (boundary == want) { p = p + 1; } else { return -1; }
-        } else if (op == OP_JMP) {
-            p = p + ins.x;
-        } else if (op == OP_SPLIT) {
-
-            let snap = List<int>();
-            let z = 0;
-            while (z < saves.size()) { snap.push(saves.at(z)); z = z + 1; }
-            let r = vmMatch(prog, p + ins.x, s, i, saves);
-            if (r >= 0) { return r; }
-            let z2 = 0;
-            while (z2 < saves.size()) { saves.set(z2, snap.at(z2)); z2 = z2 + 1; }
-            p = p + ins.y;
-        } else if (op == OP_SAVE) {
-            saves.set(ins.n, i);
-            p = p + 1;
-        } else {
-            return -1;
+        let nlistPc = List<int>();
+        let nlistSaves = List<List<int>>();
+        gen = gen + 1;
+        let t = 0;
+        let stop = false;
+        while (t < clistPc.size() && !stop) {
+            let tpc = clistPc.at(t);
+            let tsv = clistSaves.at(t);
+            let ins = prog.at(tpc);
+            let op = ins.op;
+            if (op == OP_MATCH) {
+                matchedEnd = i;
+                // Record the winning thread's captures into the caller's `saves`.
+                let z = 0;
+                while (z < tsv.size() && z < saves.size()) { saves.set(z, tsv.at(z)); z = z + 1; }
+                stop = true;   // leftmost-first: this is the highest-priority thread; lower ones are cut.
+            } else if (op == OP_CHAR) {
+                if (i < s.length && s[i] == ins.c) { addThread(prog, nlistPc, nlistSaves, mark, gen, tpc + 1, cloneSaves(tsv), i + 1, s); }
+            } else if (op == OP_ANY) {
+                if (i < s.length) { addThread(prog, nlistPc, nlistSaves, mark, gen, tpc + 1, cloneSaves(tsv), i + 1, s); }
+            } else if (op == OP_CLASS) {
+                if (i < s.length && classMatch(ins.cls, ins.neg, s[i])) { addThread(prog, nlistPc, nlistSaves, mark, gen, tpc + 1, cloneSaves(tsv), i + 1, s); }
+            }
+            t = t + 1;
         }
+        if (i >= s.length) { break; }
+        clistPc = nlistPc;
+        clistSaves = nlistSaves;
+        i = i + 1;
     }
-    return -1;
+    return matchedEnd;
 }
 
 struct RxParser {
@@ -211,9 +288,9 @@ struct RxParser {
     fn parseRepeat(self: RxParser): List<Inst> {
         let atom = self.parseAtom();
         let c = self.peek();
-        if (c == 42) { let d = self.advance(); return star(atom); }
-        if (c == 43) { let d = self.advance(); return plus(atom); }
-        if (c == 63) { let d = self.advance(); return opt(atom); }
+        if (c == 42) { let d = self.advance(); if (self.peek() == 63) { let dl = self.advance(); return starLazy(atom); } return star(atom); }
+        if (c == 43) { let d = self.advance(); if (self.peek() == 63) { let dl = self.advance(); return plusLazy(atom); } return plus(atom); }
+        if (c == 63) { let d = self.advance(); if (self.peek() == 63) { let dl = self.advance(); return optLazy(atom); } return opt(atom); }
         if (c == 123) { return self.parseBrace(atom); }
         return atom;
     }

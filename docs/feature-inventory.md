@@ -294,15 +294,21 @@ actual code fix that a probe or gate verifies, not a reframing.
       shipping the Unicode data tables (NFC/NFD decomposition, grapheme-break, case-fold, collation weights) --
       a multi-day data + algorithm effort, out of scope for an incremental pass. Left [ ] honestly.
 
-### Regex ; PARTIAL ; case
+### Regex ; SOUND ; case
 
 - [x] Alternation, char classes, anchors, `* + ?`, capture groups, find/replace.
 - [x] Common escapes and counted repetition (`\d` `\w` `\b` `{n,m}`, lazy quantifiers). `\d \D \w \W \s \S`,
-      `{n,m}` (parseBrace) and lazy `*? +? ??` already existed; ADDED the missing `\b`/`\B` word-boundary
-      assertions (OP_BOUND, zero-width; they used to match a literal `b`). Case 402.
-- [ ] Linear-time (no catastrophic backtracking; currently a backtracking VM). LARGE: requires replacing the
-      backtracking VM with a Thompson-NFA / Pike-VM engine -- a from-scratch matcher rewrite, out of scope for
-      an incremental pass. Left [ ] honestly.
+      `{n,m}` (parseBrace) already existed; ADDED the missing `\b`/`\B` word-boundary assertions (OP_BOUND,
+      zero-width; they used to match a literal `b`, case 402) AND real lazy quantifiers `*? +? ??` (the parser
+      never consumed the trailing `?`, so `.+?` had compiled as greedy-`+` then a literal `?`; now `starLazy`/
+      `plusLazy`/`optLazy` swap the SPLIT priority so the exit branch is preferred). Cases 402, 406.
+- [x] Linear-time (no catastrophic backtracking). REWROTE the matcher as a **Pike VM**: Thompson-NFA threads
+      run in lockstep, one input position at a time, with a per-position sparse-set pc-dedup (`mark`/`gen`) so
+      at most `prog.size()` threads are live per position -> O(n*m). The old recursive `vmMatch` re-explored
+      SPLIT branches exponentially; patterns like `(a*)*c`, `(a+)+$` over a long run of `a` now terminate in
+      bounded work. Captures, alternation priority (leftmost-first) and lazy quantifiers are preserved
+      (verified against the greedy-backtracking `<(.+)>` -> `"a><b"` case). Case 406 (6 assertions incl. two
+      catastrophic-backtracking terminators); corpus 417/420 (3 baseline fails).
 
 ### Serialisation (JSON / YAML / BSON) ; PARTIAL ; case
 
