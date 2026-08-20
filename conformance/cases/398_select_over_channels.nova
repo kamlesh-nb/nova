@@ -1,0 +1,20 @@
+import concurrency.asyncchan;
+import list;
+import assert;
+async fn delayedSend(ch: asyncchan.AsyncChannel<int>, v: int): int { await ch.send(v); return v; }
+async fn run(): int {
+    let a = asyncchan.AsyncChannel<int>(1);
+    let b = asyncchan.AsyncChannel<int>(1);
+    let chans = list.List<asyncchan.AsyncChannel<int>>();
+    chans.push(a); chans.push(b);
+    // Deliver only on channel b; select must wake and pick index 1.
+    let p = spawn delayedSend(b, 77);
+    let idx = await asyncchan.selectRecv<int>(chans);
+    let got = await chans.at(idx).recv();
+    let _s = await p;
+    assert.equalInt(idx, 1);
+    assert.equalInt(got, 77);
+    return idx;
+}
+@test
+fn select_over_channels(): void { assert.equalInt(run(), 1); }

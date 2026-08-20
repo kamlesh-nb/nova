@@ -61,6 +61,43 @@ pub struct AsyncChannel<T> {
     pub fn ready(self: AsyncChannel<T>): bool { return self.buffer.size() > 0; }
     pub fn depth(self: AsyncChannel<T>): int { return self.buffer.size(); }
     pub fn waitingSenders(self: AsyncChannel<T>): int { return self.sendWaiters.size(); }
+
+    // Register / unregister a coroutine as a receive-waiter (used by `selectRecv` to park on several channels
+    // at once). A copy of the channel struct shares the SAME heap wait lists, so these mutate shared state.
+    pub fn registerRecv(self: AsyncChannel<T>, h: long): void { self.recvWaiters.push(h); }
+    pub fn unregisterRecv(self: AsyncChannel<T>, h: long): void {
+        let i = 0;
+        while (i < self.recvWaiters.size()) {
+            if (self.recvWaiters.at(i) == h) { self.recvWaiters.remove(i); return; }
+            i = i + 1;
+        }
+    }
+}
+
+// SELECT over channels: park until ANY of the given channels has a value ready, then return its index. The
+// caller then recv()s from `channels.at(index)` (which will not block, since it is ready). Parks on every
+// channel at once and, on wake, deregisters from all of them before re-checking -- so a value delivered on
+// one channel wakes the select even while it waits on the others. This is the channel analogue of
+// `selectAny` over futures.
+pub async fn selectRecv<T>(channels: list.List<AsyncChannel<T>>): int {
+    while (true) {
+        // Fast path: a channel already has a value.
+        let i = 0;
+        while (i < channels.size()) {
+            if (channels.at(i).ready()) { return i; }
+            i = i + 1;
+        }
+        if (channels.size() == 0) { return -1; }
+        // Park on every channel; a send on any of them wakes us.
+        let h = currentCoro();
+        let j = 0;
+        while (j < channels.size()) { channels.at(j).registerRecv(h); j = j + 1; }
+        coroSuspend();
+        // On wake, remove ourselves from ALL channels (a sender popped us from one; we are still queued on the
+        // others). Then loop to find and return the ready channel.
+        let k = 0;
+        while (k < channels.size()) { channels.at(k).unregisterRecv(h); k = k + 1; }
+    }
 }
 
 pub fn chanNew(): long {

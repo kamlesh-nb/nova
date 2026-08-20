@@ -234,14 +234,22 @@ actual code fix that a probe or gate verifies, not a reframing.
       io_uring is a LINUX backend and this is a throughput property that needs a Linux host + benchmark to
       verify; cannot be done or measured on macOS.
 
-### Channels and actors ; PARTIAL ; read
+### Channels and actors ; SOUND ; case
 
 - [x] A blocking cross-thread `Channel<T>` (buffered) works.
 - [x] An async channel (reactor-aware) works.
 - [x] Actor mailboxes with `async receive`.
-- [ ] Bounded async channel with backpressure.
-- [ ] `select` over channel operations (only over futures today).
-- [ ] Actor supervision / restart / registry.
+- [x] Bounded async channel with backpressure (ADDED: `asyncchan.AsyncChannel<T>` -- a sender parks when the
+      buffer is full, a receiver parks when empty; pure Nova over the single-reactor park/resume, like
+      AsyncLock. Case 396: a capacity-2 channel carries 10 values producer->consumer, forcing backpressure).
+- [x] `select` over channel operations (ADDED: `asyncchan.selectRecv<T>(channels)` parks on every channel and
+      wakes when any delivers, returning its index -- the channel analogue of `selectAny` over futures. Case
+      398: delivery only on the 2nd channel wakes the select and it picks index 1).
+- [x] Actor supervision / restart / registry (ADDED to `actor.nova`: `ActorRegistry` resolves an actor by
+      name; `Supervisor<M>` runs a `SupervisedBehavior<M>` and RESTARTS it (reset + count) on a fault, up to
+      maxRestarts, then stops it -- the one-for-one "let it crash" strategy. Case 399: a behavior that faults
+      on a poison message is restarted twice, keeps working in between, then stops when the budget is spent;
+      the registry registers/looks-up/unregisters by name).
 
 ### ARC memory management ; SOUND ; case + asan
 

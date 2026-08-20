@@ -1,9 +1,61 @@
 
 import list;
+import map;
+import string;
 import concurrency.asyncchan;
 
 pub trait Behavior<M> {
     async fn receive(self, msg: M): void;
+}
+
+// --- Actor registry: look up an actor (by its mailbox handle) by a stable name ------------------------------
+// A supervisor or router resolves "the logging actor" without threading the handle through every caller.
+pub struct ActorRegistry {
+    names: map.Map<string, long>,
+    init() { self.names = map.Map<string, long>(16, string.hash); }
+    pub fn register(self: ActorRegistry, name: string, mbox: long): void { self.names.set(name, mbox); }
+    pub fn lookup(self: ActorRegistry, name: string): long { return self.names.get(name) ?? 0; }
+    pub fn has(self: ActorRegistry, name: string): bool { return self.names.has(name); }
+    pub fn unregister(self: ActorRegistry, name: string): void { let _r = self.names.delete_key(name); }
+    pub fn count(self: ActorRegistry): int { return self.names.size(); }
+}
+
+// --- Supervision with restart (one-for-one strategy) --------------------------------------------------------
+// A supervised behavior can FAULT while handling a message (return false). Its supervisor then RESTARTS it --
+// reset() returns it to a clean initial state -- up to maxRestarts, after which the actor is stopped. This is
+// the actor-model answer to "let it crash": a transient fault does not take down the actor permanently.
+pub trait SupervisedBehavior<M> {
+    fn receive(self, msg: M): bool;   // true = handled; false = fault -> the supervisor restarts
+    fn reset(self): void;             // restart: discard corrupt state, return to the initial state
+}
+
+pub struct Supervisor<M> {
+    behavior: SupervisedBehavior<M>,
+    restarts: int,
+    maxRestarts: int,
+    stopped: bool,
+    init(behavior: SupervisedBehavior<M>, maxRestarts: int) {
+        self.behavior = behavior;
+        self.restarts = 0;
+        self.maxRestarts = maxRestarts;
+        self.stopped = false;
+    }
+
+    // Deliver one message. On a fault, restart the behavior (reset + count) unless the restart budget is
+    // exhausted, in which case the actor stops. Returns false once the actor is stopped.
+    pub fn deliver(self: Supervisor<M>, msg: M): bool {
+        if (self.stopped) { return false; }
+        let ok = self.behavior.receive(msg);
+        if (!ok) {
+            if (self.restarts >= self.maxRestarts) { self.stopped = true; return false; }
+            self.behavior.reset();
+            self.restarts = self.restarts + 1;
+        }
+        return true;
+    }
+
+    pub fn restartCount(self: Supervisor<M>): int { return self.restarts; }
+    pub fn isStopped(self: Supervisor<M>): bool { return self.stopped; }
 }
 
 pub struct Mailbox<M> {
