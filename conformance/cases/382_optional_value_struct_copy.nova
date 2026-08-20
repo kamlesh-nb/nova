@@ -1,0 +1,54 @@
+// Channel 6a / Design B (value-semantics): an optional whose inner is a VALUE struct keeps the
+// heap-pointer layout (so `== undefined` is unchanged), but copying it (`let b = a`) DEEP-COPIES the
+// payload — so mutating the copy does not affect the original, and each side owns its own heap object
+// (no leak, no double-free). Before this, the copy aliased the pointer (reference semantics).
+import assert;
+
+struct P { pub x: int, pub y: int, init(a: int, b: int) { self.x = a; self.y = b; } }
+struct S { pub data: string, init(d: string) { self.data = d; } }
+
+// Value semantics: the copy is independent of the original.
+@test
+fn optional_copy_is_independent(): void {
+    let a: P | undefined = P(1, 2);
+    let b = a;
+    if (b != undefined) { b.x = 99; }
+    if (a != undefined) { assert.equalInt(a.x, 1); }   // a untouched
+    if (b != undefined) { assert.equalInt(b.x, 99); }
+}
+
+// Absence still round-trips (the pointer/null layout is unchanged).
+@test
+fn absent_round_trips(): void {
+    let a: P | undefined = undefined;
+    let b = a;
+    if (b == undefined) { assert.isTrue(true); } else { assert.isTrue(false); }
+}
+
+// Owned inner (a heap string): the deep-copy retains it, so both original and copy drop cleanly under
+// the --arc / --asan gates (no leak, no double-free). Fresh heap strings per iteration force the check.
+@test
+fn owned_inner_copy_no_leak(): void {
+    let i = 0;
+    while (i < 100) {
+        let a: S | undefined = S("optcopy-" + istr(i));
+        let b = a;
+        if (b != undefined) { assert.isTrue(b.data.length > 0); }
+        i = i + 1;
+    }
+    assert.isTrue(true);
+}
+
+fn istr(n: int): string {
+    if (n == 0) { return "0"; }
+    let s = "";
+    let m = n;
+    while (m > 0) { s = dig(m % 10) + s; m = m / 10; }
+    return s;
+}
+fn dig(x: int): string {
+    if (x == 0) { return "0"; } if (x == 1) { return "1"; } if (x == 2) { return "2"; }
+    if (x == 3) { return "3"; } if (x == 4) { return "4"; } if (x == 5) { return "5"; }
+    if (x == 6) { return "6"; } if (x == 7) { return "7"; } if (x == 8) { return "8"; }
+    return "9";
+}

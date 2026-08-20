@@ -75,8 +75,21 @@ they must be declared `class`. Skipping this is what crashed the reverted experi
 Each channel is an independent, gated increment. Over-exclusion stays the safe fallback until each is proven.
 
 1. **P0 → P1 → P2** (correctness prereqs).
-2. **Channel 6 (tuple/optional/error-union slots)** — make these coercion slots store the struct inline by
-   value. Self-contained; good first real channel.
+2. **Channel 6 (tuple/optional/error-union slots)** — make these coercion slots give value semantics.
+   NOTE (2026-08-20): full inline-by-value storage in these slots needs a NEW tagged optional layout —
+   value-lowering the inner struct breaks `== undefined` (an inline struct has no null sentinel; proven by
+   experiment). So 6 splits per slot, and the optional slice uses **Design B** (below) instead of a layout
+   change.
+   - **6a — optional-of-value-struct. ✅ DONE (2026-08-20, Design B).** Keep the heap-pointer layout (so
+     `== undefined` is untouched); make a borrow-RHS copy (`let b = a`) DEEP-COPY the payload
+     (`buildOptionalStructDeepCopy`: if present, fresh `compileAlloc` + `buildValueStructCopyInto` +
+     transitive `retainValueStructOwnedFields`; if absent, null through) instead of aliasing via retain.
+     Scoped to optional payloads only, so the "Direction B" shared-state regression (12 cases when applied
+     to ALL structs) did not recur. Gate: value semantics (`let b=a; b.x=99` leaves `a.x`), corpus 389/392 +
+     ASAN 389/392 (3 pre-existing), case `382_optional_value_struct_copy` (plain + `--arc` + `--asan`).
+   - **6b — tuple** (task #222): needs a sema fix first — `t[0].x` is `unknown struct type` today (tuple-
+     index type inference gap), then value-lowering. **6c — error-union** (task #223): value-lower ok/err
+     payloads.
 3. **Channel 1 (return by value)** — return structs via sret ABI instead of pointer-to-stack-alloca. Touches
    the calling convention; unblocks channel 3.
 4. **Channel 3 (@serializable binder)** — make `<T>__bind` binders return by value / sret. Depends on #3.

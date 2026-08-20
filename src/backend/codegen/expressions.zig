@@ -87,6 +87,53 @@ pub fn buildValueStructCopyInto(self: *LlvmCompiler, dst: types.LLVMValueRef, sr
     return dst;
 }
 
+// Channel 6a / Design B: if `tid` is an optional whose inner is a declared VALUE struct, return the
+// struct's base name; else null. Such an optional keeps the heap-pointer layout (null = absent), so
+// `== undefined` is unchanged -- but a copy must DEEP-COPY the payload for value semantics.
+pub fn optionalInnerValueStructName(self: *LlvmCompiler, tid: sema_types.TypeId) ?[]const u8 {
+    const st = self.type_store orelse return null;
+    if (st.get(tid) != .optional) return null;
+    const inner = st.get(tid).optional;
+    if (st.get(inner) != .struct_) return null;
+    const nm = sema_shadow.renderLegacy(self.allocator, st, inner) catch return null;
+    const base = getStructBaseName(nm);
+    const sd = self.structs.get(base) orelse return null;
+    if (sd.is_reference) return null; // only value-type structs; a `class` inner keeps reference semantics
+    return base;
+}
+
+// Channel 6a / Design B: value-semantic copy of an optional-of-value-struct. `src` is the payload
+// pointer (null = absent). If present, allocate a FRESH heap object, copy the struct bytes, and
+// transitively retain its owned fields (so the copy owns its own references); if absent, pass null
+// through. The result is independent of `src` (mutating one does not affect the other), and each side's
+// scope-end drop is balanced. Layout is unchanged (still a pointer), so `== undefined` is untouched.
+pub fn buildOptionalStructDeepCopy(self: *LlvmCompiler, src: types.LLVMValueRef, base: []const u8) anyerror!types.LLVMValueRef {
+    const size = self.getTypeSize(ast.TypeRef{ .ident = getStructBaseName(base) }, false);
+    const cur_fn = core.LLVMGetBasicBlockParent(core.LLVMGetInsertBlock(self.builder));
+    const copy_bb = core.LLVMAppendBasicBlock(cur_fn, "opt_dc_copy");
+    const null_bb = core.LLVMAppendBasicBlock(cur_fn, "opt_dc_null");
+    const merge_bb = core.LLVMAppendBasicBlock(cur_fn, "opt_dc_merge");
+    const present = core.LLVMBuildICmp(self.builder, types.LLVMIntPredicate.LLVMIntNE, src, core.LLVMConstInt(self.val_type, 0, 0), "opt_dc_present");
+    _ = core.LLVMBuildCondBr(self.builder, present, copy_bb, null_bb);
+
+    core.LLVMPositionBuilderAtEnd(self.builder, copy_bb);
+    const new_ptr = try self.compileAlloc(core.LLVMConstInt(self.val_type, if (size == 0) 8 else size, 0));
+    _ = try self.buildValueStructCopyInto(new_ptr, src, size);
+    try self.retainValueStructOwnedFields(new_ptr, base);
+    const copy_end = core.LLVMGetInsertBlock(self.builder);
+    _ = core.LLVMBuildBr(self.builder, merge_bb);
+
+    core.LLVMPositionBuilderAtEnd(self.builder, null_bb);
+    _ = core.LLVMBuildBr(self.builder, merge_bb);
+
+    core.LLVMPositionBuilderAtEnd(self.builder, merge_bb);
+    const phi = core.LLVMBuildPhi(self.builder, self.val_type, "opt_dc");
+    var vals = [_]types.LLVMValueRef{ new_ptr, src };
+    var blocks = [_]types.LLVMBasicBlockRef{ copy_end, null_bb };
+    core.LLVMAddIncoming(phi, &vals, &blocks, 2);
+    return phi;
+}
+
 pub fn buildValueStructCopy(self: *LlvmCompiler, src: types.LLVMValueRef, size: u32) anyerror!types.LLVMValueRef {
     const dst = try self.buildValueStructStorage(size);
     const copy_fn = if (self.func_map.get("nova_bytes_copy")) |f| f else blk: {

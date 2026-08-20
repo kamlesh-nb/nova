@@ -215,7 +215,19 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
                             const is_r_var = (init.kind == .ident or init.kind == .field_access or init.kind == .index) and
                                 !is_enum_variant_ctor;
                             if (is_r_var) {
-                                try self.compileRetain(val);
+                                // Channel 6a / Design B: an optional whose inner is a VALUE struct keeps the
+                                // heap-pointer layout, so a borrow-RHS copy must DEEP-COPY the payload (value
+                                // semantics) instead of aliasing it via retain. Every other owned borrow keeps
+                                // the alias-retain.
+                                const opt_inner: ?[]const u8 = if (self.current_local_type_ids) |ids|
+                                    (if (ids.get(ls.name)) |st_tid| self.optionalInnerValueStructName(st_tid) else null)
+                                else
+                                    null;
+                                if (opt_inner) |innerBase| {
+                                    val = try self.buildOptionalStructDeepCopy(val, innerBase);
+                                } else {
+                                    try self.compileRetain(val);
+                                }
                             }
                         }
                     }
