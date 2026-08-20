@@ -132,17 +132,23 @@ Each channel is an independent, gated increment. Over-exclusion stays the safe f
    **Slice status (channel 4):**
    - **Slice 1 ✅ DONE (f8e7a3d):** `List.copy()` deep-copy primitive (reuses `slice`), case 385. `Map.copy()`
      TODO (needs the internal `hashFn` threaded into a fresh Map).
-   - **Slice 2 (the hard core, NOT started) -- grounded plan:** (a) reach.zig -- reachability is method-NAME
-     over-approximate (reach.zig:8: a called method name is kept for every `List<T>`), so root `copy` once
-     when a reachable value struct has a container field, and the monomorphised `List_T_copy` body is emitted
-     for all instantiations. (b) codegen -- make the struct-copy path FIELD-AWARE: in
-     `buildHeapStructDeepCopy` / `buildTupleDeepCopy` / `retainValueStructOwnedFields`, for a `List`/`Map`
-     field (an 8-byte pointer to a heap container, since containers are escape-excluded), call `List_T_copy`
-     (look up the mangled name via `methodSymbol("List<T>","copy")`, like the destructor looks up `_delete`)
-     and store the fresh pointer INSTEAD of retaining the shared one -- no extra retain, ARC ledger balances.
-     (c) admit container-field structs into `isPureValueStructName`. Graceful degradation: if `copy` is not
-     emitted, fall back to retain-alias (safe, reference-semantic). Gate each sub-step: value semantics
-     (`let b=a; b.items.push(x)` leaves `a.items`) + ARC/ASAN + full corpus.
+   - **Slice 2 (the hard core, NOT started) -- CORRECTED diagnosis (2026-08-20 attempt).** ⚠️ A struct with a
+     `List<int>` field is NOT escape-excluded/heap: because `List` is itself a declared value struct, the
+     escape field-check `continue`s and the struct stays INLINE value-lowered (`isValueStructName`=true,
+     `owned`=false, verified by dcf debug). So its copy goes through the INLINE path
+     (`buildValueStructCopy` + `retainValueStructOwnedFieldsDepth`, statements.zig line ~249), NOT the
+     excluded-heap path (`buildHeapStructDeepCopy`). The inline List's `{data,len,cap}` is byte-copied and the
+     P1 fixup RETAINS the shared `RawBuffer` while len/cap are copied independently -> corruption. A first
+     Slice-2 attempt targeted the excluded path (`buildHeapStructDeepCopy` field-aware + admit container
+     fields to `isPureValueStructName`) and was REVERTED because container-field structs never take that path.
+     **The real fix:** in `retainValueStructOwnedFieldsDepth` (the inline copy fixup, shared by 6a/6b/1/2/3/5 --
+     HIGH blast radius), when a field (or nested value-struct field, e.g. the RawBuffer inside an inline List)
+     is a container, DEEP-COPY it in place instead of retaining -- i.e. call `List_T_copy` on the inline List
+     address and store the returned List back (mind List.copy's by-value/sret return ABI), OR copy the
+     RawBuffer + reset len/cap. Plus the reach.zig rooting of `copy` (reachability is method-NAME
+     over-approximate, reach.zig:8). Gate: `let b=a; b.items.push(x)` leaves `a.items`; + ARC/ASAN + corpus.
+     This is genuinely intricate (inline-container in-place deep-copy + a shared high-blast fixup) -- a focused
+     session. Slice 1 (`List.copy`) stands committed and is the primitive it will call.
 
 ## Verification (per increment)
 
