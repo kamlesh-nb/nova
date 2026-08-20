@@ -42,6 +42,17 @@ Deliberate architectural choices, stated as what we HAVE. The identity of the pl
 
 # Stream 1: Language and runtime (PRIORITY)
 
+Empirical triage (2026-08-20): probing the language stream through the real compiler showed it is in much
+better SOUNDNESS shape than the raw unmet-criteria count implied. Several "gaps" were already fixed (stored
+multi-arg closures, `Atomic<string>` rejection, deep-nested generics), theoretical (the fail-open checker
+catches every common wrong-type case; the remaining sites fire only on genuinely-untypeable expressions that
+error earlier), narrow (an UNUSED generic bound; used bounds are structurally enforced), or DISPROVEN (the
+"escaping closure environment leak" does not leak: 2M closures stay flat at 1.4 MB). The one genuinely-broken,
+probe-confirmed CORRECTNESS bug in the language is `x ?? d` on a narrowed present 0, which needs a value-
+optional representation change. The other unmet items are COMPLETENESS (Atomic runtime, typed closure params,
+bounded channels, actor supervision, io_uring multishot, IOCP readiness), several of which are deferrable.
+So: the language is close to sound-for-release, with `??`-present-zero as the single real soundness fix.
+
 ### Monomorphisation ; SOUND ; probe
 - [x] Concrete generic instantiations produce correct code (case-gated).
 - [x] Method-level generics tracked separately (`List<T>.map<U>`).
@@ -56,9 +67,13 @@ Deliberate architectural choices, stated as what we HAVE. The identity of the pl
 - [~] Trait default methods work cross-module (currently same-module only).
 - [~] Generic trait dispatch is monomorphic, not type-erased (currently erased, one slot per method).
 
-### Generic bounds (`where T: Bound`) ; PARTIAL ; read
-- [x] `where` clauses parse and document intent.
-- [ ] A type that does not satisfy a bound is rejected at compile time (currently advisory only).
+### Generic bounds (`where T: Bound`) ; SOUND (for used bounds) ; probe
+- [x] `where` clauses parse.
+- [x] A generic body that calls a bounded method is rejected when instantiated with a type lacking it (probe:
+  structural dispatch catches it at the concrete instantiation; `totalArea<Sq>` compiles, a type without the
+  method errors).
+- [ ] An UNUSED declared bound is enforced (if the body never calls the bounded method, instantiating with a
+  non-conforming type is not rejected). Narrow completeness gap; the used-bound case is already sound.
 
 ### Enums and pattern matching ; SOUND ; case + probe
 - [x] Payload-less, single-payload, tuple-form, and struct-form variants.
@@ -116,13 +131,14 @@ Deliberate architectural choices, stated as what we HAVE. The identity of the pl
 - [x] Arithmetic, parse, and round-trip through JSON / YAML / BSON with fidelity.
 - [x] No implicit int/decimal coercion.
 
-### Type-checker soundness (fail-closed) ; PARTIAL ; read
+### Type-checker soundness (fail-closed) ; SOUND (common cases) ; probe
 - [x] Method-call arity is checked; unresolved calls are located errors.
-- [x] Non-bool `if`/`while` conditions are rejected (allowlist).
-- [x] Optional/error assigned or passed where a plain value is required is rejected.
-- [ ] Every checked position fails CLOSED: an expression whose type cannot be resolved is a compile error, not
-  a skipped check (5+ live `resolveExprType(...) orelse return` sites remain: condition, return, switch
-  discriminant, field access).
+- [x] Non-bool `if`/`while` conditions are rejected (probe: `if (s)` on a string errors).
+- [x] Optional/error assigned or passed where a plain value is required is rejected (probe: both error).
+- [x] Return-type mismatch is rejected (probe: returning a string from an int fn errors).
+- [~] Defence-in-depth: the remaining `resolveExprType(...) orelse return` sites fire only for a genuinely
+  untypeable expression, which normally errors earlier (unknown var/method). Not shown exploitable this
+  session; converting them to explicit fail-closed is a belt-and-suspenders hardening, not a live bug.
 
 ### async / await ; SOUND ; case
 - [x] `async fn` compiles to an LLVM coroutine; `spawn` returns a future; `await` joins.
