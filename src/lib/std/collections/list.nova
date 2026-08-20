@@ -222,8 +222,20 @@ pub struct List<T> {
             let largest = i;
             let left = 2 * i + 1;
             let right = 2 * i + 2;
-            if (left < n && cmp(self.data.at(left), self.data.at(largest)) > 0) { largest = left; }
-            if (right < n && cmp(self.data.at(right), self.data.at(largest)) > 0) { largest = right; }
+            // Bind each element to a LOCAL before the comparator call. Passing `self.data.at(x)` (which
+            // retains an owned element) DIRECTLY as a function-pointer argument mishandles the ARC of the
+            // temporary in this generic context and can hand the comparator a freed pointer (a pre-existing
+            // codegen quirk shared with the old insertion sort); a local gives it a clean, scoped lifetime.
+            if (left < n) {
+                let el = self.data.at(left);
+                let elg = self.data.at(largest);
+                if (cmp(el, elg) > 0) { largest = left; }
+            }
+            if (right < n) {
+                let er = self.data.at(right);
+                let erg = self.data.at(largest);
+                if (cmp(er, erg) > 0) { largest = right; }
+            }
             if (largest == i) { return; }
             self.data.swap(i, largest);
             i = largest;
@@ -351,8 +363,17 @@ pub struct List<T> {
             let largest = i;
             let left = 2 * i + 1;
             let right = 2 * i + 2;
-            if (left < n && key(self.data.at(left)) > key(self.data.at(largest))) { largest = left; }
-            if (right < n && key(self.data.at(right)) > key(self.data.at(largest))) { largest = right; }
+            // Bind to locals before the key function (same ARC-of-temporary reason as heapSiftDown).
+            if (left < n) {
+                let el = self.data.at(left);
+                let elg = self.data.at(largest);
+                if (key(el) > key(elg)) { largest = left; }
+            }
+            if (right < n) {
+                let er = self.data.at(right);
+                let erg = self.data.at(largest);
+                if (key(er) > key(erg)) { largest = right; }
+            }
             if (largest == i) { return; }
             self.data.swap(i, largest);
             i = largest;

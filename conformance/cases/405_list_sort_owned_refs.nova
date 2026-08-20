@@ -1,0 +1,35 @@
+// List.sort with a comparator on OWNED-REFERENCE elements (List<string>) now works: binding each at() result
+// to a local before the comparator call fixed a pre-existing ARC-of-temporary crash (a garbage pointer reached
+// the comparator; the old insertion sort crashed identically).
+import list;
+import string;
+import assert;
+fn cmpStr(a: string, b: string): int { return string.compare(a, b); }
+fn lenKey(s: string): int { return s.length; }
+@test
+fn sorts_owned_strings(): void {
+    let l = List<string>();
+    l.push("delta"); l.push("alpha"); l.push("charlie"); l.push("bravo"); l.push("echo"); l.push("foxtrot");
+    l.sort(cmpStr);
+    assert.isTrue(string.eql(l.at(0), "alpha"));
+    assert.isTrue(string.eql(l.at(1), "bravo"));
+    assert.isTrue(string.eql(l.at(5), "foxtrot"));
+}
+@test
+fn sortby_owned_strings(): void {
+    let l = List<string>();
+    l.push("ccc"); l.push("a"); l.push("bb"); l.push("dddd");
+    l.sortBy(lenKey);
+    assert.isTrue(string.eql(l.at(0), "a"));
+    assert.isTrue(string.eql(l.at(3), "dddd"));
+}
+@test
+fn large_owned_sort_stays_sorted(): void {
+    let l = List<string>();
+    let i = 0;
+    while (i < 100) { l.push("item" + `${(i * 37) % 100}`); i = i + 1; }
+    l.sort(cmpStr);
+    let ok = true; let j = 1;
+    while (j < l.size()) { if (string.compare(l.at(j - 1), l.at(j)) > 0) { ok = false; } j = j + 1; }
+    assert.isTrue(ok);
+}

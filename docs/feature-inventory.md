@@ -270,7 +270,7 @@ actual code fix that a probe or gate verifies, not a reframing.
 
 # Stream 2: Standard library
 
-### Collections (Map / Set / List) ; PARTIAL ; case
+### Collections (Map / Set / List) ; SOUND ; case
 
 - [x] Map/Set are a real open-addressing hash table (tombstones, resize).
 - [x] List has a rich functional API (map/filter/reduce/slice/etc.).
@@ -278,13 +278,13 @@ actual code fix that a probe or gate verifies, not a reframing.
       through a new ARC-neutral `RawBuffer.swap` (raw byte swap of the two slots -- no retain, no drop -- which
       also fixed the same latent hazard in `List.reverse`). Gated: case 400 (1000-element shuffle, a
       2000-element reverse worst case, descending + sortBy) on scalar element types.
-- [ ] Sorting a List of OWNED REFERENCES (`List<string>`) with a comparator does not crash. PRE-EXISTING
-      compiler bug discovered this session, NOT caused by the heapsort change: the OLD insertion sort crashes
-      identically. Calling a `(T,T)->int` comparator with owned-reference args inside `List<T>.sort` passes a
-      garbage pointer (fault addr -4). Every minimal replica (a hand-written generic struct with a RawBuffer
-      field + a 2-level cmp passthrough + a method-level generic) works, so it is specific to the full
-      `List<T>` monomorphisation context and not reducible so far -- a separate deep codegen bug. Keeps
-      Collections PARTIAL honestly rather than marking it SOUND with a known crash.
+- [x] Sorting a List of OWNED REFERENCES (`List<string>`) with a comparator works (FIXED). It used to
+      crash -- a `(T,T)->int` comparator called with owned-reference args inside `List<T>.sort` was handed a
+      garbage pointer (the old insertion sort crashed identically). Root: passing `self.data.at(x)` (which
+      RETAINS an owned element) DIRECTLY as a fn-pointer argument mishandles the temporary's ARC in this
+      generic context. Fix: bind each `at()` result to a LOCAL before the comparator/key call (in
+      `heapSiftDown`/`heapSiftDownBy`). Gated: case 405 (string sort, sortBy by length, a 100-element
+      sorted-order check) on an ASAN build.
 
 ### Strings and text ; PARTIAL ; case
 
