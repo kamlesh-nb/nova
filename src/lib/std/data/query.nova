@@ -1,0 +1,137 @@
+// A fluent, parameterised SQL query builder for the db seam. Values NEVER reach the SQL text -- every bound
+// value becomes a `$N` placeholder and is collected into `params` (a List<DbValue>), so the result feeds
+// straight into `conn.query(q.toSql(), q.params())` or `orm.queryAs<T>(...)` with the same injection-proof
+// guarantee as hand-written prepared statements. The builder is a `class` (reference semantics) so the
+// fluent chain `q.select(...).where(...).orderBy(...)` mutates and returns the one instance.
+import string;
+import list;
+import data.db;
+
+pub class Query {
+    pub table: string,
+    pub selectCols: list.List<string>,
+    pub wheres: list.List<string>,       // rendered "col op $N" / "col IN (...)" fragments, AND-joined
+    pub boundParams: list.List<db.DbValue>,
+    pub orders: list.List<string>,
+    pub joins: list.List<string>,
+    pub groupCols: list.List<string>,
+    pub havingCond: string,
+    pub limitN: int,
+    pub offsetN: int,
+    pub distinctFlag: bool,
+
+    init(table: string) {
+        self.table = table;
+        self.selectCols = list.List<string>();
+        self.wheres = list.List<string>();
+        self.boundParams = list.List<db.DbValue>();
+        self.orders = list.List<string>();
+        self.joins = list.List<string>();
+        self.groupCols = list.List<string>();
+        self.havingCond = "";
+        self.limitN = 0 - 1;
+        self.offsetN = 0 - 1;
+        self.distinctFlag = false;
+    }
+
+    pub fn select(self: Query, cols: list.List<string>): Query {
+        let i = 0;
+        while (i < cols.size()) { self.selectCols.push(cols.at(i)); i = i + 1; }
+        return self;
+    }
+    pub fn selectCol(self: Query, col: string): Query { self.selectCols.push(col); return self; }
+    pub fn distinct(self: Query): Query { self.distinctFlag = true; return self; }
+
+    fn nextPlaceholder(self: Query): string { return "$" + `${self.boundParams.size() + 1}`; }
+
+    // A condition `col <op> <value>`, bound. op is a SQL operator ("=", "<", ">=", "!=", "LIKE", ...).
+    pub fn where(self: Query, col: string, op: string, val: db.DbValue): Query {
+        let ph = self.nextPlaceholder();
+        self.boundParams.push(val);
+        self.wheres.push(col + " " + op + " " + ph);
+        return self;
+    }
+    pub fn whereEq(self: Query, col: string, val: db.DbValue): Query { return self.where(col, "=", val); }
+
+    // `col IN ($a, $b, ...)`, one placeholder per value.
+    pub fn whereIn(self: Query, col: string, vals: list.List<db.DbValue>): Query {
+        if (vals.size() == 0) { self.wheres.push("1 = 0"); return self; }   // IN () -> always false
+        let frag = col + " IN (";
+        let i = 0;
+        while (i < vals.size()) {
+            if (i > 0) { frag = frag + ", "; }
+            frag = frag + self.nextPlaceholder();
+            self.boundParams.push(vals.at(i));
+            i = i + 1;
+        }
+        frag = frag + ")";
+        self.wheres.push(frag);
+        return self;
+    }
+
+    // `col IS NULL` / `col IS NOT NULL` (no bound value).
+    pub fn whereNull(self: Query, col: string): Query { self.wheres.push(col + " IS NULL"); return self; }
+    pub fn whereNotNull(self: Query, col: string): Query { self.wheres.push(col + " IS NOT NULL"); return self; }
+
+    // A raw already-safe condition fragment (no interpolation of untrusted data -- use `where` for values).
+    pub fn whereRaw(self: Query, cond: string): Query { self.wheres.push(cond); return self; }
+
+    pub fn join(self: Query, clause: string): Query { self.joins.push("JOIN " + clause); return self; }
+    pub fn leftJoin(self: Query, clause: string): Query { self.joins.push("LEFT JOIN " + clause); return self; }
+
+    pub fn orderBy(self: Query, col: string, dir: string): Query {
+        let d = if (string.eql(dir, "DESC") || string.eql(dir, "desc")) "DESC" else "ASC";
+        self.orders.push(col + " " + d);
+        return self;
+    }
+    pub fn groupBy(self: Query, col: string): Query { self.groupCols.push(col); return self; }
+    pub fn having(self: Query, cond: string): Query { self.havingCond = cond; return self; }
+    pub fn limit(self: Query, n: int): Query { self.limitN = n; return self; }
+    pub fn offset(self: Query, n: int): Query { self.offsetN = n; return self; }
+
+    // The bound parameters, in placeholder order.
+    pub fn params(self: Query): list.List<db.DbValue> { return self.boundParams; }
+
+    fn joinList(self: Query, xs: list.List<string>, sep: string): string {
+        let out = "";
+        let i = 0;
+        while (i < xs.size()) {
+            if (i > 0) { out = out + sep; }
+            out = out + xs.at(i);
+            i = i + 1;
+        }
+        return out;
+    }
+
+    // Render the SELECT statement.
+    pub fn toSql(self: Query): string {
+        let sql = "SELECT ";
+        if (self.distinctFlag) { sql = sql + "DISTINCT "; }
+        if (self.selectCols.size() == 0) { sql = sql + "*"; }
+        else { sql = sql + self.joinList(self.selectCols, ", "); }
+        sql = sql + " FROM " + self.table;
+        if (self.joins.size() > 0) { sql = sql + " " + self.joinList(self.joins, " "); }
+        if (self.wheres.size() > 0) { sql = sql + " WHERE " + self.joinList(self.wheres, " AND "); }
+        if (self.groupCols.size() > 0) { sql = sql + " GROUP BY " + self.joinList(self.groupCols, ", "); }
+        if (self.havingCond.length > 0) { sql = sql + " HAVING " + self.havingCond; }
+        if (self.orders.size() > 0) { sql = sql + " ORDER BY " + self.joinList(self.orders, ", "); }
+        if (self.limitN >= 0) { sql = sql + " LIMIT " + `${self.limitN}`; }
+        if (self.offsetN >= 0) { sql = sql + " OFFSET " + `${self.offsetN}`; }
+        return sql;
+    }
+
+    // Render a DELETE using the accumulated WHERE clause (params carry over).
+    pub fn toDeleteSql(self: Query): string {
+        let sql = "DELETE FROM " + self.table;
+        if (self.wheres.size() > 0) { sql = sql + " WHERE " + self.joinList(self.wheres, " AND "); }
+        return sql;
+    }
+
+    // Run the SELECT on `conn` -> a ResultSet. Bind into structs with `orm.bindAll<T>(rs)` at the call site
+    // (kept here to avoid an import cycle with data.orm, which depends on the db seam).
+    pub async fn run(self: Query, conn: db.Connection): db.ResultSet {
+        return await conn.query(self.toSql(), self.boundParams);
+    }
+}
+
+pub fn from(table: string): Query { return Query(table); }

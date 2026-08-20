@@ -389,11 +389,21 @@ actual code fix that a probe or gate verifies, not a reframing.
 
 # Stream 3: Database drivers (the `db` seam)
 
-### Wire protocols (pg / mysql / mssql / mongo) ; PARTIAL ; read
+### Wire protocols (pg / mysql / mssql / mongo) ; SOUND ; case + read
 
 - [x] Real binary protocols, server-side prepared statements, transactions.
 - [x] Connection pooling with idle/open caps and lifetime eviction.
-- [ ] Micro-ORM has relations / migrations / query builder (data-mapper only).
+- [x] Micro-ORM has relations / migrations / query builder (was data-mapper only). ADDED three pure-Nova
+      modules over the db seam, all with parameterised `$N` binding (values never reach the SQL text):
+      **`data/query.nova`** -- a fluent `Query` builder (`from().select().where(col,op,val)/whereEq/whereIn/
+      whereNull/whereRaw/join/leftJoin/orderBy/groupBy/having/limit/offset`) producing `toSql()`/
+      `toDeleteSql()` + `params()`, and `run(conn)`; **`data/migrate.nova`** -- versioned `Migration`
+      up/down list, a `schema_migrations` tracking table, an idempotent `migrate`/`rollbackTo` runner
+      (applies pending in version order, records them), and a `Table` CREATE-TABLE builder
+      (`id/column/primaryKey/foreignKey/unique`); **`data/relations.nova`** -- hasMany/belongsTo eager-load
+      `... IN ($1,...)` query builders + `groupByColumn`/`childrenOf` to attach children (the N+1 avoidance
+      pattern). Case 412 asserts the generated SQL + collected params for all three. The data-mapper
+      (`bindAll`/`queryAs`/`insert`/`update`) is unchanged and composes with these.
 
 ### BSON ORM `long` fidelity ; SOUND ; case + probe
 

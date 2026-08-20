@@ -1,0 +1,77 @@
+// ORM beyond data-mapper: the fluent query builder (parameterised SQL, values never in the text), schema
+// migrations (CREATE TABLE builder + version tracking + ordering), and relation eager-load queries
+// (hasMany/belongsTo IN-clauses). Every value is bound as `$N`; these gates assert the generated SQL and the
+// collected parameters offline.
+import data.query;
+import data.migrate;
+import data.relations;
+import data.db;
+import string;
+import list;
+import assert;
+
+fn cols3(a: string, b: string, c: string): list.List<string> { let l = list.List<string>(); l.push(a); l.push(b); l.push(c); return l; }
+fn cols2(a: string, b: string): list.List<string> { let l = list.List<string>(); l.push(a); l.push(b); return l; }
+fn colsN(): list.List<string> { return list.List<string>(); }
+fn vals1(a: db.DbValue): list.List<db.DbValue> { let l = list.List<db.DbValue>(); l.push(a); return l; }
+fn vals2(a: db.DbValue, b: db.DbValue): list.List<db.DbValue> { let l = list.List<db.DbValue>(); l.push(a); l.push(b); return l; }
+fn vals3(a: db.DbValue, b: db.DbValue, c: db.DbValue): list.List<db.DbValue> { let l = list.List<db.DbValue>(); l.push(a); l.push(b); l.push(c); return l; }
+
+@test
+fn query_builder_select_where_order_limit() {
+    let q = query.from("products")
+        .select(cols3("id", "name", "price"))
+        .whereEq("category", db.dbText("books"))
+        .where("price", "<", db.dbInt(50))
+        .orderBy("price", "DESC")
+        .limit(10)
+        .offset(20);
+    assert.equalStr(q.toSql(),
+        "SELECT id, name, price FROM products WHERE category = $1 AND price < $2 ORDER BY price DESC LIMIT 10 OFFSET 20");
+    let p = q.params();
+    assert.equalInt(2, p.size());
+    assert.equalInt(1, if (p.at(0).asText() == "books") 1 else 0);
+    assert.equalInt(50, p.at(1).asInt());
+}
+
+@test
+fn query_builder_in_and_join() {
+    let q = query.from("orders o")
+        .selectCol("o.id")
+        .join("customers c ON c.id = o.customer_id")
+        .whereIn("o.status", vals2(db.dbText("paid"), db.dbText("shipped")))
+        .whereNotNull("o.paid_at");
+    assert.equalStr(q.toSql(),
+        "SELECT o.id FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.status IN ($1, $2) AND o.paid_at IS NOT NULL");
+    assert.equalInt(2, q.params().size());
+}
+
+@test
+fn query_builder_delete() {
+    let q = query.from("sessions").where("expires_at", "<", db.dbLong(1000));
+    assert.equalStr(q.toDeleteSql(), "DELETE FROM sessions WHERE expires_at < $1");
+}
+
+@test
+fn migration_schema_builder() {
+    let t = migrate.table("users")
+        .id()
+        .column("email", "TEXT", "NOT NULL")
+        .column("age", "INT", "")
+        .unique("email");
+    assert.equalStr(t.toSql(),
+        "CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT NOT NULL, age INT, UNIQUE (email))");
+    assert.equalStr(migrate.dropTableSql("users"), "DROP TABLE IF EXISTS users");
+    assert.equalInt(1, if (string.indexOf(migrate.createTrackingTableSql(), "schema_migrations") >= 0) 1 else 0);
+}
+
+@test
+fn relations_has_many_and_belongs_to() {
+    let (childSql, cp) = relations.hasManyQuery("order_items", "order_id", colsN(), vals3(db.dbInt(1), db.dbInt(2), db.dbInt(3)));
+    assert.equalStr(childSql, "SELECT * FROM order_items WHERE order_id IN ($1, $2, $3)");
+    assert.equalInt(3, cp.size());
+
+    let (parentSql, pp) = relations.belongsToQuery("customers", "id", cols2("id", "name"), vals1(db.dbInt(7)));
+    assert.equalStr(parentSql, "SELECT id, name FROM customers WHERE id IN ($1)");
+    assert.equalInt(1, pp.size());
+}
