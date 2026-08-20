@@ -1,0 +1,46 @@
+// Channel 4 (value-semantics): a value struct with a List field deep-copies that field on copy, so mutating
+// the copy's list does not affect the original. Before this, `let b = a` shared the List's heap buffer
+// (reference semantics). The compiler roots List<T>.copy in reachability and the value-struct copy fixup
+// calls it for container fields (falling back to a retain-alias if copy is unavailable).
+import assert;
+import collections.list;
+
+struct Bag {
+    pub items: list.List<int>,
+    pub tag: int,
+    init(t: int) { self.items = list.List<int>(); self.tag = t; }
+}
+
+@test
+fn struct_list_field_copy_is_independent(): void {
+    let a = Bag(1);
+    a.items.push(10); a.items.push(20);
+    let b = a;
+    b.items.push(30);           // mutate the copy's list
+    b.tag = 99;
+    assert.equalInt(a.items.size(), 2);   // a's list unaffected
+    assert.equalInt(b.items.size(), 3);
+    assert.equalInt(a.tag, 1);            // a's scalar unaffected
+    assert.equalInt(b.tag, 99);
+}
+
+// Owned elements (strings) inside the container survive the copy, and both original and copy drop cleanly
+// under the --arc / --asan gates (no leak, no double-free).
+struct Names {
+    pub xs: list.List<string>,
+    init() { self.xs = list.List<string>(); }
+}
+@test
+fn struct_owned_container_copy_no_leak(): void {
+    let i = 0;
+    while (i < 50) {
+        let a = Names();
+        a.xs.push("alpha"); a.xs.push("beta");
+        let b = a;
+        b.xs.push("gamma");
+        assert.equalInt(a.xs.size(), 2);
+        assert.equalInt(b.xs.size(), 3);
+        i = i + 1;
+    }
+    assert.isTrue(true);
+}

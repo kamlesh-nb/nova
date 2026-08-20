@@ -56,18 +56,47 @@ fn retainValueStructOwnedFieldsDepth(self: *LlvmCompiler, structAddr: types.LLVM
         const fts = self.typeRefToString(fld.type_name) catch continue;
         const off = self.getFieldOffset(base, fld.name) catch continue;
         const addr = core.LLVMBuildAdd(self.builder, structAddr, core.LLVMConstInt(self.val_type, off, 0), "vs_ofld_addr");
-        if (self.isOwnedDeclaredType(fld.type_name, fts)) {
+        const fbase = getStructBaseName(fts);
+        // Channel 4: a CONTAINER field (List/Map/Set) is a pointer to a heap container the byte-copy now
+        // SHARES. For value semantics, DEEP-COPY it via its monomorphised `copy` and store the fresh pointer
+        // INSTEAD of retaining the shared one (no retain -> the ledger balances: source and copy each own an
+        // independent container). If `copy` was not emitted (not reachable), fall back to a retain-alias.
+        if (isContainerBaseName(fbase)) {
+            const ptr = core.LLVMBuildIntToPtr(self.builder, addr, core.LLVMPointerType(self.val_type, 0), "vs_cfld_ptr");
+            const cur = core.LLVMBuildLoad2(self.builder, self.val_type, ptr, "vs_cfld");
+            if (findContainerCopyFn(self, fts)) |copy_fn| {
+                const ft = core.LLVMGlobalGetValueType(copy_fn);
+                var args = [_]types.LLVMValueRef{cur};
+                const fresh = core.LLVMBuildCall2(self.builder, ft, copy_fn, &args, 1, "vs_ccopy");
+                _ = core.LLVMBuildStore(self.builder, fresh, ptr);
+            } else {
+                try self.compileRetain(cur);
+            }
+        } else if (self.isOwnedDeclaredType(fld.type_name, fts)) {
             const ptr = core.LLVMBuildIntToPtr(self.builder, addr, core.LLVMPointerType(self.val_type, 0), "vs_ofld_ptr");
             const fv = core.LLVMBuildLoad2(self.builder, self.val_type, ptr, "vs_ofld");
             try self.compileRetain(fv);
         } else {
             // A nested value-struct field: recurse at the inline address to retain its owned leaves.
-            const fbase = getStructBaseName(fts);
             if (fbase.len != 0 and self.isValueStructName(fbase)) {
                 try retainValueStructOwnedFieldsDepth(self, addr, fts, depth + 1);
             }
         }
     }
+}
+
+fn isContainerBaseName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "List") or std.mem.eql(u8, name, "Map") or std.mem.eql(u8, name, "Set");
+}
+
+// Channel 4: look up the monomorphised container `copy` function for a field type like "List<int>"
+// (mangled `List_i32_copy`, `self -> self`). Null if it was not emitted (not reachable).
+fn findContainerCopyFn(self: *LlvmCompiler, field_type: []const u8) ?types.LLVMValueRef {
+    const sym = self.methodSymbol(field_type, "copy") catch return null;
+    defer self.allocator.free(sym);
+    const symz = self.allocator.dupeZ(u8, sym) catch return null;
+    defer self.allocator.free(symz);
+    return core.LLVMGetNamedFunction(self.module, symz);
 }
 
 // M-10/M-1: memcpy `size` bytes from `src` into an EXISTING destination address `dst` (e.g. a

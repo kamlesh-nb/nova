@@ -47,6 +47,12 @@ pub var reachable_keys: std.StringHashMapUnmanaged(void) = .empty;
 pub fn methodIsReachable(owner_base: []const u8, method: []const u8) bool {
     if (!gate_on) return true;
     if (std.mem.eql(u8, method, "init") or std.mem.eql(u8, method, "new")) return true;
+    // Channel 4 (value-semantics): a value struct with a container field deep-copies that field on copy by
+    // calling the container's `copy` from codegen -- an edge the call-graph walk does not model (like init/
+    // new and vtable dispatch). Keep `copy` for the container types so the monomorphised body is emitted.
+    if (std.mem.eql(u8, method, "copy") and
+        (std.mem.eql(u8, owner_base, "List") or std.mem.eql(u8, owner_base, "Map") or std.mem.eql(u8, owner_base, "Set")))
+        return true;
     var buf: [512]u8 = undefined;
     const key = std.fmt.bufPrint(&buf, "{s}|{s}", .{ owner_base, method }) catch return true;
     return reachable_keys.contains(key);

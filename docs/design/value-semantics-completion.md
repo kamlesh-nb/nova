@@ -132,7 +132,19 @@ Each channel is an independent, gated increment. Over-exclusion stays the safe f
    **Slice status (channel 4):**
    - **Slice 1 ✅ DONE (f8e7a3d):** `List.copy()` deep-copy primitive (reuses `slice`), case 385. `Map.copy()`
      TODO (needs the internal `hashFn` threaded into a fresh Map).
-   - **Slice 2 (the hard core, NOT started) -- CORRECTED diagnosis (2026-08-20 attempt).** ⚠️ A struct with a
+   - **Slice 2 ✅ DONE (2026-08-20).** A struct with a `List` field is INLINE value-lowered (`List` is a
+     value struct so the escape field-check `continue`s, keeping the container-holding struct inline;
+     `isValueStructName`=true), and its `items` field is an 8-byte pointer to a heap `List`. Copy went
+     through `buildValueStructCopy` + `retainValueStructOwnedFields`, which *retained* that shared pointer ->
+     clean reference aliasing (memory-safe). Fix: made `retainValueStructOwnedFieldsDepth` (expressions.zig,
+     the shared inline-copy fixup) CONTAINER-AWARE -- for a List/Map/Set field it calls the monomorphised
+     `copy` (looked up by mangled name via `findContainerCopyFn`, like the destructor's `_delete`) and stores
+     the fresh pointer instead of retaining, with a retain-alias fallback if `copy` was not emitted. Plus
+     reach.zig: `methodIsReachable` now keeps `copy` for List/Map/Set (an edge the call-graph walk cannot
+     model, like init/new), so `List_T_copy` is emitted. Only `List.copy` exists yet (Map/Set fall back to
+     retain-alias until they get `copy`). Gate: `let b=a; b.items.push(x)` leaves `a.items`; owned string
+     elements clean; corpus 394/397 + ASAN 394/397 (3 pre-existing). Case `386_struct_container_copy`.
+   - **(historical) first Slice-2 attempt CORRECTED.** ⚠️ A struct with a
      `List<int>` field is NOT escape-excluded/heap: because `List` is itself a declared value struct, the
      escape field-check `continue`s and the struct stays INLINE value-lowered (`isValueStructName`=true,
      `owned`=false, verified by dcf debug). So its copy goes through the INLINE path
