@@ -222,8 +222,12 @@ actual code fix that a probe or gate verifies, not a reframing.
 
 - [x] kqueue / epoll / io_uring / IOCP run-verified against the conformance corpus.
 - [x] Deadlines / timeouts are reactor-native on every backend.
-- [ ] IOCP readiness cases 192/194/195 pass (open).
-- [ ] io_uring uses multishot recv / SQPOLL (currently readiness-emulated, slower than epoll).
+- [ ] IOCP readiness cases 192/194/195 pass (open). PLATFORM-BLOCKED on this checkout: IOCP is the WINDOWS
+      backend; these cases can only be run-verified on a Windows host (this is macOS/kqueue). Not falsifiable
+      here, so left [ ] rather than assumed.
+- [ ] io_uring uses multishot recv / SQPOLL (currently readiness-emulated, slower than epoll). PLATFORM-BLOCKED:
+      io_uring is a LINUX backend and this is a throughput property that needs a Linux host + benchmark to
+      verify; cannot be done or measured on macOS.
 
 ### Channels and actors ; PARTIAL ; read
 
