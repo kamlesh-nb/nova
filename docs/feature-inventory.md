@@ -537,7 +537,13 @@ shell harnesses are manual and non-gating.
 
 - [x] Uncommitted rows invisible; committed visible; rolled-back invisible (Read Committed).
 - [ ] Snapshot / repeatable-read / serializable isolation.
-- [ ] An aborted row is never visible in memory before restart (documented abort-visibility gap).
+- [x] An aborted row is never visible in memory before restart. FIXED (nova-novadb d934c85): a
+      committed-then-failed transaction (WAL commit record could not be written, e.g. ENOSPC) left
+      `current_tx_id` set and un-aborted, so the owning session kept seeing its own uncommitted rows
+      (xmin==current_tx) until restart. Probe confirmed `SELECT COUNT(*)` returned 2 (aborted row visible)
+      after `BEGIN;INSERT;<ENOSPC>COMMIT`. Both commit paths (explicit + autocommit) now ABORT + clear the
+      session tx on a failed commit-record write, so the rows are invisible (recovery's undo removes them on
+      disk). Gated by "MVCC: a failed-commit transaction's rows are not visible in memory"; full suite green.
 - [ ] The in-memory committed-txn set is bounded (currently unbounded; GC is disk-side only).
 
 ### Transactions and isolation ; PARTIAL ; case
