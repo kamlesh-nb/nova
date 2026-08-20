@@ -1,0 +1,123 @@
+// tz: a named-timezone facility over the UTC epoch. Resolves an IANA-style zone name + a UTC instant to the
+// LOCAL offset in effect, accounting for daylight saving. This is a COMPACT timezone database: the common
+// zones plus the US / EU / Australia DST rules (current era), which cover the great majority of real usage.
+// It is not the full IANA historical dataset (every pre-2007 US rule, every micro-zone, leap seconds), but it
+// is a genuine tz db: `offsetAt` returns the correct DST-aware offset, and `toLocal` / `formatInZone` convert
+// a UTC epoch into the zone's wall-clock time -- so datetime no longer "treats every wall-clock as UTC".
+import datetime;
+import string;
+
+const DST_NONE: int = 0;
+const DST_US: int = 1;   // 2nd Sun Mar 02:00 local -> 1st Sun Nov 02:00 local  (+1h in summer)
+const DST_EU: int = 2;   // last Sun Mar 01:00 UTC  -> last Sun Oct 01:00 UTC   (+1h in summer)
+const DST_AU: int = 3;   // 1st Sun Oct 02:00 local -> 1st Sun Apr 03:00 local  (southern summer: Oct..Apr)
+
+const HOUR: long = 3600;
+
+struct ZoneRec { pub off: int, pub dst: int }
+
+// The standard (non-DST) offset in seconds and the DST rule for a named zone.
+fn zoneRec(name: string): ZoneRec | undefined {
+    if (string.eql(name, "UTC")) { return ZoneRec{ off: 0, dst: DST_NONE }; }
+    if (string.eql(name, "America/New_York")) { return ZoneRec{ off: -18000, dst: DST_US }; }     // -5h
+    if (string.eql(name, "America/Chicago")) { return ZoneRec{ off: -21600, dst: DST_US }; }      // -6h
+    if (string.eql(name, "America/Denver")) { return ZoneRec{ off: -25200, dst: DST_US }; }       // -7h
+    if (string.eql(name, "America/Los_Angeles")) { return ZoneRec{ off: -28800, dst: DST_US }; }  // -8h
+    if (string.eql(name, "Europe/London")) { return ZoneRec{ off: 0, dst: DST_EU }; }
+    if (string.eql(name, "Europe/Paris")) { return ZoneRec{ off: 3600, dst: DST_EU }; }
+    if (string.eql(name, "Europe/Berlin")) { return ZoneRec{ off: 3600, dst: DST_EU }; }
+    if (string.eql(name, "Asia/Kolkata")) { return ZoneRec{ off: 19800, dst: DST_NONE }; }        // +5:30
+    if (string.eql(name, "Asia/Tokyo")) { return ZoneRec{ off: 32400, dst: DST_NONE }; }          // +9h
+    if (string.eql(name, "Asia/Shanghai")) { return ZoneRec{ off: 28800, dst: DST_NONE }; }       // +8h
+    if (string.eql(name, "Australia/Sydney")) { return ZoneRec{ off: 36000, dst: DST_AU }; }      // +10h
+    return undefined;
+}
+
+// Whether a named zone is known to this database.
+pub fn known(name: string): bool { return zoneRec(name) != undefined; }
+
+// Day of week for a UTC-midnight epoch: 1970-01-01 was a Thursday (=4). 0=Sunday.
+fn dowOfEpochDay(epochDay: long): int {
+    let r = ((epochDay % 7) + 4) % 7;   // +4 shifts Thursday to its index
+    if (r < 0) { r = r + 7; }
+    return r as int;
+}
+
+// The UTC epoch of the `nth` (1-based; n=-1 => last) occurrence of `weekday` (0=Sun) in `month`/`year` at
+// `localHour`:00 local standard time, given `stdOffset` seconds. Transitions are defined in local time, so
+// build the local wall-clock instant and subtract the standard offset to get UTC.
+fn transitionEpoch(year: int, month: int, weekday: int, nth: int, localHour: int, stdOffset: int): long {
+    // First of the month at UTC midnight -> its weekday.
+    let first = datetime.parse(twoDate(year, month, 1)) ?? 0;
+    let firstDow = dowOfEpochDay(first / 86400);
+    let day = 0;
+    if (nth > 0) {
+        let delta = (weekday - firstDow + 7) % 7;
+        day = 1 + delta + (nth - 1) * 7;
+    } else {
+        // last occurrence: start from the last day of the month and walk back to the weekday.
+        let dim = datetime.daysInMonth(year, month);
+        let lastDow = dowOfEpochDay((first / 86400) + (dim - 1));
+        let back = (lastDow - weekday + 7) % 7;
+        day = dim - back;
+    }
+    let localWall = datetime.parse(dateTimeStr(year, month, day, localHour, 0, 0)) ?? 0;
+    return localWall - (stdOffset as long);
+}
+
+// The offset (seconds) in effect for `zone` at the UTC instant `utcEpoch`, DST included. undefined for an
+// unknown zone.
+pub fn offsetAt(zone: string, utcEpoch: long): int | undefined {
+    let zr = zoneRec(zone);
+    if (zr == undefined) { return undefined; }
+    let rec = zr ?? ZoneRec{ off: 0, dst: DST_NONE };
+    if (rec.dst == DST_NONE) { return rec.off; }
+    // The year at the standard offset (good enough to pick the DST window; the instants are exact).
+    let localApprox = utcEpoch + (rec.off as long);
+    let year = string.parseI64(datetime.format(localApprox, "YYYY")) as int;
+    let inDst = false;
+    if (rec.dst == DST_US) {
+        let start = transitionEpoch(year, 3, 0, 2, 2, rec.off);          // 2nd Sun Mar 02:00 local
+        let end = transitionEpoch(year, 11, 0, 1, 2, rec.off + 3600);    // 1st Sun Nov 02:00 DST-local
+        inDst = utcEpoch >= start && utcEpoch < end;
+    } else if (rec.dst == DST_EU) {
+        // EU transitions are defined at 01:00 UTC, i.e. local hour = 1 - stdOffset/3600 ... use offset 0 hour
+        // trick: build 01:00 with a std offset of 0 so subtracting stdOffset=0 keeps it at 01:00 UTC.
+        let start = transitionEpoch(year, 3, 0, -1, 1, 0);              // last Sun Mar 01:00 UTC
+        let end = transitionEpoch(year, 10, 0, -1, 1, 0);              // last Sun Oct 01:00 UTC
+        inDst = utcEpoch >= start && utcEpoch < end;
+    } else if (rec.dst == DST_AU) {
+        // Southern hemisphere: DST spans the year boundary (Oct..Apr).
+        let start = transitionEpoch(year, 10, 0, 1, 2, rec.off);        // 1st Sun Oct 02:00 local
+        let end = transitionEpoch(year, 4, 0, 1, 3, rec.off + 3600);    // 1st Sun Apr 03:00 DST-local
+        inDst = utcEpoch >= start || utcEpoch < end;
+    }
+    if (inDst) { return rec.off + 3600; }
+    return rec.off;
+}
+
+// The local wall-clock UTC-epoch representation for display: utcEpoch + offset. Feed to datetime.format.
+pub fn toLocal(zone: string, utcEpoch: long): long | undefined {
+    let o = offsetAt(zone, utcEpoch);
+    if (o == undefined) { return undefined; }
+    return utcEpoch + ((o ?? 0) as long);
+}
+
+// Format a UTC instant as the zone's local wall clock (fmt is a datetime.format pattern).
+pub fn formatInZone(zone: string, utcEpoch: long, fmt: string): string | undefined {
+    let local = toLocal(zone, utcEpoch);
+    if (local == undefined) { return undefined; }
+    return datetime.format(local ?? 0, fmt);
+}
+
+// --- small string builders (avoid pulling in a printf) -----------------------------------------------------
+fn pad2(n: int): string {
+    if (n < 10) { return "0" + `${n}`; }
+    return `${n}`;
+}
+fn twoDate(year: int, month: int, day: int): string {
+    return `${year}` + "-" + pad2(month) + "-" + pad2(day);
+}
+fn dateTimeStr(year: int, month: int, day: int, h: int, mi: int, s: int): string {
+    return twoDate(year, month, day) + "T" + pad2(h) + ":" + pad2(mi) + ":" + pad2(s);
+}

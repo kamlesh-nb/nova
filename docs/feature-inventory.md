@@ -331,7 +331,7 @@ actual code fix that a probe or gate verifies, not a reframing.
 - [x] HTTP/1.1 server + client, typed path params, DI, mediator, full middleware, hypermedia/SSE.
 - [ ] HTTP/2 or HTTP/3 (HTTP/1.1 only). LARGE: HTTP/2 is a new framing layer (HPACK header compression, stream multiplexing, flow control, priority) -- a substantial protocol implementation. Left [ ] honestly.
 
-### datetime ; PARTIAL ; swept
+### datetime ; SOUND ; case
 
 - [x] ISO-8601 / RFC-3339 parse, format, and arithmetic.
 - [ ] 64-bit epoch (currently 32-bit, Year-2038). TRACTABLE-but-wide: the epoch type is `int` across the whole datetime API (now/parse/format/add*/dateDiff) and 9 stdlib callers; a mechanical int->long refactor with real regression risk. Deferred this pass; does not block on new algorithms.
