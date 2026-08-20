@@ -129,6 +129,21 @@ Each channel is an independent, gated increment. Over-exclusion stays the safe f
    semantic). Recommended: a focused session, List first, gated. The deeper alternative is the class-migration
    audit (make shared-state structs `class`, then containers-in-value-structs become rare).
 
+   **Slice status (channel 4):**
+   - **Slice 1 ✅ DONE (f8e7a3d):** `List.copy()` deep-copy primitive (reuses `slice`), case 385. `Map.copy()`
+     TODO (needs the internal `hashFn` threaded into a fresh Map).
+   - **Slice 2 (the hard core, NOT started) -- grounded plan:** (a) reach.zig -- reachability is method-NAME
+     over-approximate (reach.zig:8: a called method name is kept for every `List<T>`), so root `copy` once
+     when a reachable value struct has a container field, and the monomorphised `List_T_copy` body is emitted
+     for all instantiations. (b) codegen -- make the struct-copy path FIELD-AWARE: in
+     `buildHeapStructDeepCopy` / `buildTupleDeepCopy` / `retainValueStructOwnedFields`, for a `List`/`Map`
+     field (an 8-byte pointer to a heap container, since containers are escape-excluded), call `List_T_copy`
+     (look up the mangled name via `methodSymbol("List<T>","copy")`, like the destructor looks up `_delete`)
+     and store the fresh pointer INSTEAD of retaining the shared one -- no extra retain, ARC ledger balances.
+     (c) admit container-field structs into `isPureValueStructName`. Graceful degradation: if `copy` is not
+     emitted, fall back to retain-alias (safe, reference-semantic). Gate each sub-step: value semantics
+     (`let b=a; b.items.push(x)` leaves `a.items`) + ARC/ASAN + full corpus.
+
 ## Verification (per increment)
 
 Every channel lands with: full corpus green + `--asan` + `--arc`, plus a NEW positive case asserting value
