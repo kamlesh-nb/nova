@@ -52,9 +52,15 @@ From `computeValueEscapeSet`:
   depth-guarded), mirroring the destructor's inline recursion. Gate: corpus 387/390 + ASAN 387/390 (3
   pre-existing), case `381` extended with heap-string copy tests at 1 and 2 nesting levels (ARC/ASAN clean).
   (The destruct side was already transitive after P0; this closes the copy side.)
-- **P2 — compiler validation for impossible value structs.** A struct that contains itself by value (infinite
-  size) or forms a by-value cycle must be a compile ERROR, not a hang/crash. Prerequisite before broadening
-  inline storage. Pairs with the existing infer depth-guard (a safety net, not a real cycle resolver).
+- **P2 — compiler validation for impossible value structs. ✅ DONE (2026-08-20).** A value `struct` that
+  transitively contains itself by value (`Node{next:Node}`, mutual `A{b:B}/B{a:A}`) was silently accepted
+  (then mislaid out / crashed on use). Added `checkValueStructCycles` in `type_checker.zig`: a DFS over the
+  by-value edge graph (a bare `.ident` field whose type is a declared VALUE struct; `class`/optional/
+  container/tuple/array fields break the cycle), reporting a clear error at the offending field. Rejects both
+  cycle shapes; accepts class linked-lists, optional/container self-reference, and non-cyclic nested value
+  structs (verified, no false positives — a corpus scan found no real self-referential value-struct fields).
+  Gate: corpus 389/392 (3 pre-existing) + two new `expect_fail` cases (value_struct_self_cycle,
+  value_struct_mutual_cycle) rejected at typecheck.
 
 ## Framework migration (parallel, BEFORE broadening channel 4/6)
 

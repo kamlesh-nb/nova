@@ -277,6 +277,46 @@ pub const TypeChecker = struct {
         self.errors.append(self.allocator, formatted) catch {};
     }
 
+    // Detect value structs whose fields transitively contain the struct itself BY VALUE (infinite size).
+    // The by-value edge is a bare `.ident` field whose type is another declared VALUE struct; a `class`
+    // field (heap reference), an optional, a container/generic, a tuple, a function, or an array field all
+    // introduce indirection and break the cycle. Colours: 0 unvisited, 1 on the current DFS stack, 2 done.
+    fn checkValueStructCycles(self: *TypeChecker) void {
+        var state = std.StringHashMap(u8).init(self.allocator);
+        defer state.deinit();
+        var it = self.structs.iterator();
+        while (it.next()) |e| {
+            const sd = e.value_ptr.*;
+            if (sd.is_reference) continue; // only value structs can be inline/infinite
+            if ((state.get(sd.name) orelse 0) == 0) self.dfsValueStructCycle(sd.name, &state);
+        }
+    }
+
+    fn dfsValueStructCycle(self: *TypeChecker, name: []const u8, state: *std.StringHashMap(u8)) void {
+        state.put(name, 1) catch return;
+        const sd = self.structs.get(name) orelse {
+            state.put(name, 2) catch {};
+            return;
+        };
+        if (!sd.is_reference) {
+            for (sd.fields) |fld| {
+                const child = switch (fld.type_name) {
+                    .ident => |n| n,
+                    else => continue, // optional/generic/tuple/func/array -> indirection, breaks the cycle
+                };
+                const cd = self.structs.get(child) orelse continue;
+                if (cd.is_reference) continue; // a `class` field is a pointer, not inline
+                if (self.colliding_structs.contains(child)) continue; // ambiguous cross-module name; defer
+                switch (state.get(child) orelse 0) {
+                    1 => self.addError(fld.span, "value struct '{s}' contains itself by value through field '{s}: {s}' — a `struct` stored inline cannot form a cycle (infinite size). Make one of the types a `class` (a heap reference), or hold it behind an optional or a container.", .{ name, fld.name, child }),
+                    0 => self.dfsValueStructCycle(child, state),
+                    else => {},
+                }
+            }
+        }
+        state.put(name, 2) catch {};
+    }
+
     pub fn check(self: *TypeChecker, program: ast.Program) !void {
         for (program.declarations) |decl| {
             if (decl == .enum_decl) {
@@ -326,6 +366,10 @@ pub const TypeChecker = struct {
                 }
             }
         }
+
+        // A `struct` (value type) that transitively contains ITSELF by value has infinite size and is
+        // unsound (it was silently accepted before, then mislaid out or crashed on use). Reject it here.
+        self.checkValueStructCycles();
 
         for (program.declarations) |decl| {
             switch (decl) {

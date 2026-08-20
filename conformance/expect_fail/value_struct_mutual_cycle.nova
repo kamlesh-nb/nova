@@ -1,0 +1,13 @@
+// EXPECT-FAIL: typecheck
+// P2 (value-semantics): a mutual by-value cycle between two value structs (A holds B by value, B holds A
+// by value) is infinite size and must be rejected. This must FAIL to compile.
+struct A {
+    pub b: B,
+    pub x: int,
+}
+struct B {
+    pub a: A,
+    pub y: int,
+}
+@test
+fn t(): void { }
