@@ -678,7 +678,7 @@ gate does not currently reproduce green on this checkout (see the two UNSOUND ro
       now builds (FakeConn gained the missing `queryWire`) and the fake ENFORCES the `AND revision = $6` CAS
       guard (it silently ignored it) + rejects duplicate-key INSERTs; the store's revision-churn-on-failed-CAS
       bug it exposed is fixed too. All 8 tests in 185 pass.
-- [ ] Transactions on the seam are used (currently `begin/commit/rollback` never called).
+- [x] Transactions on the seam are used. FIXED (nova-orchestrator): both CAS paths (create + guarded update) now wrap the row write + the revision-counter bump in conn.begin()/commit(), ROLLBACK on a lost CAS -- so the write + revision bump are atomic (no torn CAS on a crash between them) and the seam transaction methods are exercised. 185 still green (FakeConn begin/commit/rollback are no-ops).
 
 ### Isolation / sandbox / netns ; PARTIAL ; case
 
