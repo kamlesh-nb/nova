@@ -59,10 +59,14 @@ old "loops deferred" note was stale). Closed in two layers:
   and the phi result is the single live value at the join. This is the linear-ownership move-merge, and it is
   the same machinery loop-header merges will reuse. Mixed-liveness merges (live on one path, not another)
   still defer — soundly.
-- **Still deferred (honest):** an outer-local reassign inside a LOOP body or SWITCH case (guarded by
-  `clone_floor`). These need a phi at the loop header / switch join respectively; scoped, not done. Measured
-  residue: `92_regex` reassign=1, `271_runtime_mediator` reassign=1 (was 4; the 3 if-branch ones are now
-  covered, lowered 569 -> 572).
+- **Loop-header phi (Slice 4 tail, done later same day):** an outer-local reassign inside a LOOP body is now
+  modelled too, when the loop has no break/continue at its own level (the single-back-edge shape). `lowerLoop`
+  pre-scans the body (`collectReassignedOuter` + `hasOwnBreakContinue`), creates a header phi per reassigned
+  outer local (entry input = pre-loop value; back-edge input patched to the body-exit value after lowering),
+  and the body sees the phi result. The verifier's existing edge-phi application handles the back-edge with no
+  change. `92_regex` reassign 1 -> 0. Still deferred (sound): a reassign inside a loop WITH break/continue
+  (multi-back-edge header phi + exit phi for breaks) or inside a SWITCH case; `271_runtime_mediator` keeps
+  reassign=1 there.
 
 **Gate:** full corpus under `NOVA_OSSA=hard` = **397/397, 0 proven imbalances** (phi introduced no false
 positives). Two `verify.zig` unit tests added (balanced phi-reassign clean; un-consumed phi result flagged as

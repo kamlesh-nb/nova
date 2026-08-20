@@ -57,3 +57,29 @@ fn reassign_outer_both_branches(): void {
     }
     assert.equalInt(d.get(0), 9);
 }
+
+// Outer local reassigned inside a while loop body (no break/continue) -> loop-header phi (Slice 4 tail).
+@test
+fn reassign_in_loop_body(): void {
+    let acc = makeList(0);
+    let i = 0;
+    while (i < 3) {
+        acc = makeList(i);
+        i = i + 1;
+    }
+    assert.equalInt(acc.get(0), 2);
+}
+
+// Reassign inside an if inside the loop: nested if-join phi composes with the loop-header phi.
+@test
+fn reassign_in_loop_conditional(): void {
+    let cur = makeList(0);
+    let i = 0;
+    while (i < 4) {
+        if (i > 1) {
+            cur = makeList(i);
+        }
+        i = i + 1;
+    }
+    assert.equalInt(cur.get(0), 3);
+}

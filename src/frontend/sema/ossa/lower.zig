@@ -344,6 +344,60 @@ fn reconcileJoin(ctx: *Ctx, join_block: ir.Block, locals: *Locals, n_outer: usiz
     }
 }
 
+fn addUnique(out: *std.ArrayListUnmanaged(usize), v: usize, gpa: std.mem.Allocator) !void {
+    for (out.items) |e| if (e == v) return;
+    try out.append(gpa, v);
+}
+
+fn reassignTargetIdx(e: *const ast.Expression, locals: []const Local, n_outer: usize) ?usize {
+    if (!isLocalReassign(e, locals)) return null;
+    const idx = resolveLocal(locals, e.kind.binary.left.kind.ident).?;
+    return if (idx < n_outer) idx else null;
+}
+
+/// Collect indices of OUTER locals (< n_outer) reassigned anywhere in `stmts`, descending into ifs, blocks,
+/// switches AND nested loops — a reassign at any depth changes the value that reaches this loop's back-edge,
+/// so the header needs a phi for it.
+fn collectReassignedOuter(gpa: std.mem.Allocator, stmts: []const ast.Statement, locals: []const Local, n_outer: usize, out: *std.ArrayListUnmanaged(usize)) !void {
+    for (stmts) |*s| switch (s.*) {
+        .expr_stmt => |es| if (reassignTargetIdx(&es.expr, locals, n_outer)) |i| try addUnique(out, i, gpa),
+        .defer_stmt => |d| if (reassignTargetIdx(&d.expr, locals, n_outer)) |i| try addUnique(out, i, gpa),
+        .if_stmt => |iff| {
+            if (branchStmts(iff.then_branch)) |ts| try collectReassignedOuter(gpa, ts, locals, n_outer, out);
+            if (iff.else_branch) |e| if (branchStmts(e)) |els| try collectReassignedOuter(gpa, els, locals, n_outer, out);
+        },
+        .block => |b| try collectReassignedOuter(gpa, b.statements, locals, n_outer, out),
+        .while_stmt => |w| if (branchStmts(w.body)) |bs| try collectReassignedOuter(gpa, bs, locals, n_outer, out),
+        .for_stmt => |fr| if (branchStmts(fr.body)) |bs| try collectReassignedOuter(gpa, bs, locals, n_outer, out),
+        .switch_stmt => |sw| {
+            for (sw.cases) |c| if (branchStmts(c.body)) |cs| try collectReassignedOuter(gpa, cs, locals, n_outer, out);
+            if (sw.default_case) |d| if (branchStmts(d)) |ds| try collectReassignedOuter(gpa, ds, locals, n_outer, out);
+        },
+        else => {},
+    };
+}
+
+/// True if `stmts` contains a break/continue targeting THIS loop — i.e. not inside a NESTED loop (those
+/// target the nested loop). We DO descend into ifs/blocks/switches (a break there targets this loop). Used
+/// to gate the loop-header-phi path to the single-back-edge shape; a break/continue adds extra header/exit
+/// predecessors that the 2-input phi does not model, so those loops keep the sound defer.
+fn hasOwnBreakContinue(stmts: []const ast.Statement) bool {
+    for (stmts) |*s| switch (s.*) {
+        .break_stmt, .continue_stmt => return true,
+        .if_stmt => |iff| {
+            if (branchStmts(iff.then_branch)) |ts| if (hasOwnBreakContinue(ts)) return true;
+            if (iff.else_branch) |e| if (branchStmts(e)) |els| if (hasOwnBreakContinue(els)) return true;
+        },
+        .block => |b| if (hasOwnBreakContinue(b.statements)) return true,
+        .switch_stmt => |sw| {
+            for (sw.cases) |c| if (branchStmts(c.body)) |cs| if (hasOwnBreakContinue(cs)) return true;
+            if (sw.default_case) |d| if (branchStmts(d)) |ds| if (hasOwnBreakContinue(ds)) return true;
+        },
+        else => {}, // do NOT descend into while_stmt/for_stmt: their break/continue target themselves
+    };
+    return false;
+}
+
 /// The shared loop shape: entry -> header; header -cond-> body/exit; body -> header (back-edge). The
 /// body is its own lexical scope on a CLONE of `locals`, so it may declare its own owned locals (dropped
 /// at the end of each iteration) — which keeps the body-exit live set equal to the header entry set, the
@@ -364,7 +418,31 @@ fn lowerLoop(ctx: *Ctx, entry_block: ir.Block, body_stmts: []const ast.Statement
     const saved = ctx.loop;
     ctx.loop = .{ .header = header, .exit = exit_block, .body_mark = locals.items.len };
     const saved_floor = ctx.clone_floor;
-    ctx.clone_floor = locals.items.len; // reassigns of outer locals inside the (discarded) body clone defer
+
+    // Decide whether to model outer-local reassigns inside the body via a loop-header phi. This is sound
+    // only for the SINGLE-back-edge shape: no break/continue at this loop's level (a break/continue would
+    // add header/exit predecessors the 2-input phi does not carry). Anything else keeps the sound defer.
+    const n_outer = locals.items.len;
+    var reassigned = std.ArrayListUnmanaged(usize).empty;
+    defer reassigned.deinit(ctx.gpa);
+    try collectReassignedOuter(ctx.gpa, body_stmts, locals.items, n_outer, &reassigned);
+    const use_phi = reassigned.items.len > 0 and !hasOwnBreakContinue(body_stmts);
+
+    if (use_phi) {
+        // A header phi per reassigned outer local: entry input = pre-loop value, back-edge input patched
+        // after the body is lowered. The phi result is the loop-carried value the body sees AND the value
+        // that survives to the loop exit. phis are appended in `reassigned` order, so phi k is at index k.
+        for (reassigned.items) |i| {
+            const x0 = locals.items[i].value;
+            const placeholder = [_]ir.PhiInput{ .{ .pred = entry_block, .value = x0 }, .{ .pred = entry_block, .value = x0 } };
+            const r = try ctx.f.addPhi(ctx.gpa, header, &placeholder, null);
+            locals.items[i].value = r;
+            locals.items[i].live = true;
+        }
+    } else {
+        ctx.clone_floor = n_outer; // reassigns of outer locals inside the (discarded) body clone defer
+    }
+
     var body_locals = try cloneLocals(ctx.gpa, locals);
     defer body_locals.deinit(ctx.gpa);
     const body_flow = try lowerBlockScope(ctx, body_block, body_stmts, &body_locals);
@@ -372,8 +450,19 @@ fn lowerLoop(ctx: *Ctx, entry_block: ir.Block, body_stmts: []const ast.Statement
     ctx.loop = saved;
 
     switch (body_flow) {
-        .fallthrough => |b| ctx.f.setTerm(b, .{ .br = header }), // back-edge (normal iteration)
-        .terminated => {},
+        .fallthrough => |b| {
+            ctx.f.setTerm(b, .{ .br = header }); // back-edge (normal iteration)
+            if (use_phi) {
+                // Patch each header phi's back-edge input to the body-exit value. If a reassigned local is
+                // not live at body-exit (e.g. reset to null), leave the placeholder — the verifier will
+                // flag the resulting imbalance, which the gate catches (rather than silently unsound).
+                const hphis = ctx.f.blocks.items[@intFromEnum(header)].phis.items;
+                for (reassigned.items, 0..) |i, k| {
+                    hphis[k].inputs[1] = .{ .pred = b, .value = body_locals.items[i].value };
+                }
+            }
+        },
+        .terminated => {}, // body always returns: no back-edge; the header phi's placeholder is never taken
     }
     return exit_block;
 }

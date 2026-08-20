@@ -292,6 +292,42 @@ test "phi join: outer local reassigned on the THEN path, unified by a phi, verif
     try testing.expect(r.complete);
 }
 
+test "loop-header phi: outer local reassigned each iteration, unified by a header phi, verifies clean" {
+    // Models `let x = alloc(); while c { x = alloc(); } drop x;`
+    //   entry:  x0 = make_owned; br header
+    //   header: phi xh = [entry: x0, body: xb]; cond_br -> body, exit
+    //   body:   destroy xh; xb = make_owned; br header   (back-edge)
+    //   exit:   destroy xh; ret_void
+    const gpa = testing.allocator;
+    var f = ir.Func{ .name = "loop_phi" };
+    defer f.deinit(gpa);
+    const entry = try f.newBlock(gpa);
+    const header = try f.newBlock(gpa);
+    const body = try f.newBlock(gpa);
+    const exit = try f.newBlock(gpa);
+
+    const x0 = try f.makeOwned(gpa, entry, null);
+    f.setTerm(entry, .{ .br = header });
+
+    // header phi: entry input x0, back-edge input xb (created below, in the body).
+    const xb = try f.makeOwned(gpa, body, null); // allocate the value id now; emitted in body below
+    const xh = try f.addPhi(gpa, header, &.{ .{ .pred = entry, .value = x0 }, .{ .pred = body, .value = xb } }, null);
+    const c = try f.makeTrivial(gpa, header, null);
+    f.setTerm(header, .{ .cond_br = .{ .cond = c, .then_blk = body, .else_blk = exit } });
+
+    try f.destroy(gpa, body, xh); // reassign drops the loop-carried value...
+    // xb already emitted above (make_owned in body) — it is the rebind.
+    f.setTerm(body, .{ .br = header }); // back-edge
+
+    try f.destroy(gpa, exit, xh);
+    f.setTerm(exit, .ret_void);
+
+    var r = try verify(gpa, &f);
+    defer r.deinit(gpa);
+    try testing.expect(r.ok());
+    try testing.expect(r.complete);
+}
+
 test "phi join: forgetting to consume the phi result is a leak" {
     const gpa = testing.allocator;
     var f = ir.Func{ .name = "phi_leak" };
