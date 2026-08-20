@@ -4641,6 +4641,14 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             const left_val = self.coerceToSlotType(try self.compileExpression(nc.left.*), self.val_type);
 
             const nc_is_valopt = self.exprYieldsValoptBox(nc.left);
+            // KNOWN UNSOUND (value-optional-zero collision): the presence test below is `left_val != 0`. For a
+            // value-optional narrowed to its raw inner (`if (x != undefined) { x ?? d }`) a present 0 is
+            // indistinguishable from the absent sentinel (both 0), so `x ?? d` returns d for a present zero.
+            // NOT fixable at this site: three guard attempts (non-optional short-circuit, box-gated, ident-
+            // gated) each regressed serde/DI/try because a genuinely-optional raw value-optional is
+            // statically indistinguishable from a narrowed-present one. The real fix is representational (keep
+            // value-optionals boxed, or a reliable narrowing signal in the typed IR). See the feature
+            // inventory (value-optional-zero) — marked UNSOUND.
             const left_present = if (nc_is_valopt) try self.buildValoptUnbox(left_val) else left_val;
             const left_bb_end = core.LLVMGetInsertBlock(self.builder);
 
