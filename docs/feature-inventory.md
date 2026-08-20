@@ -198,8 +198,14 @@ actual code fix that a probe or gate verifies, not a reframing.
 - [x] Optional/error assigned or passed where a plain value is required is rejected (probe: both error).
 - [x] Return-type mismatch is rejected (probe: returning a string from an int fn errors).
 - [ ] Every checked position fails closed for a genuinely-untypeable expression (the remaining
-      `resolveExprType(...) orelse return` sites). Not shown exploitable this session (such expressions normally
-      error earlier), so it is defence-in-depth rather than a live bug, but it is not yet met.
+      `resolveExprType(...) orelse return` sites). Not shown exploitable (such expressions normally error
+      earlier), so it is defence-in-depth, not a live bug. BLOCKED, measured this session: flipping the
+      condition site (`checkBoolCondition`) to fail-closed regressed 350 corpus cases -- even the harness's own
+      `compiles-and-runs.nova` was falsely rejected at type-check -- because `resolveExprType` is intentionally
+      INCOMPLETE (returns null for many VALID expressions: comparisons, `.index`, and the whole `else => null`
+      tail). The fail-open `orelse` is the safety net for that incompleteness. This criterion therefore cannot
+      be met by flipping; it requires COMPLETING `resolveExprType` first (the typed-IR-accuracy work, task #174)
+      so that null occurs only for genuinely-invalid expressions. Left [ ] honestly rather than forced.
 
 ### async / await ; PARTIAL ; case
 
