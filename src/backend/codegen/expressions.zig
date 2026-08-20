@@ -39,16 +39,34 @@ pub fn buildValueStructStorage(self: *LlvmCompiler, size: u32) anyerror!types.LL
 // destination's later field-drop (or the source's) double-frees. Walks the struct's fields and
 // retains every owned one at the destination address `structAddr`.
 pub fn retainValueStructOwnedFields(self: *LlvmCompiler, structAddr: types.LLVMValueRef, struct_name: []const u8) anyerror!void {
+    try retainValueStructOwnedFieldsDepth(self, structAddr, struct_name, 0);
+}
+
+// Retain the owned references reachable from a value-struct copy. A DIRECTLY-owned field (a `string`,
+// a class reference, ...) is loaded and retained. A nested VALUE-STRUCT field is stored INLINE, so we
+// recurse into it AT ITS FIELD ADDRESS (no load) to retain ITS owned leaves -- otherwise a copy of
+// `Outer{inner:S{data:string}}` shares `S.data` without a reference and both copies free it (double-free
+// / heap-use-after-free). Mirrors the struct destructor's inline-field recursion. Depth-guarded against a
+// (layout-impossible, validated separately) by-value cycle.
+fn retainValueStructOwnedFieldsDepth(self: *LlvmCompiler, structAddr: types.LLVMValueRef, struct_name: []const u8, depth: u32) anyerror!void {
+    if (depth > 64) return;
     const base = getStructBaseName(struct_name);
     const sd = self.structs.get(base) orelse return;
     for (sd.fields) |fld| {
         const fts = self.typeRefToString(fld.type_name) catch continue;
-        if (!self.isOwnedDeclaredType(fld.type_name, fts)) continue;
         const off = self.getFieldOffset(base, fld.name) catch continue;
         const addr = core.LLVMBuildAdd(self.builder, structAddr, core.LLVMConstInt(self.val_type, off, 0), "vs_ofld_addr");
-        const ptr = core.LLVMBuildIntToPtr(self.builder, addr, core.LLVMPointerType(self.val_type, 0), "vs_ofld_ptr");
-        const fv = core.LLVMBuildLoad2(self.builder, self.val_type, ptr, "vs_ofld");
-        try self.compileRetain(fv);
+        if (self.isOwnedDeclaredType(fld.type_name, fts)) {
+            const ptr = core.LLVMBuildIntToPtr(self.builder, addr, core.LLVMPointerType(self.val_type, 0), "vs_ofld_ptr");
+            const fv = core.LLVMBuildLoad2(self.builder, self.val_type, ptr, "vs_ofld");
+            try self.compileRetain(fv);
+        } else {
+            // A nested value-struct field: recurse at the inline address to retain its owned leaves.
+            const fbase = getStructBaseName(fts);
+            if (fbase.len != 0 and self.isValueStructName(fbase)) {
+                try retainValueStructOwnedFieldsDepth(self, addr, fts, depth + 1);
+            }
+        }
     }
 }
 

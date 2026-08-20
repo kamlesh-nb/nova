@@ -45,6 +45,34 @@ fn nested_value_struct_is_copied(): void {
     assert.equalStr(b.inner.data, "mutated-in-b");
 }
 
+// P1: copying a value struct must RETAIN its transitively-owned heap data, or dropping both the original
+// and the copy double-frees it (heap-use-after-free). A string literal would not exercise this (constant,
+// not heap), so use a fresh heap string per iteration. Two nesting levels checks the recursion depth.
+struct Mid { pub s: S, init(d: string) { self.s = S(d); } }
+struct Deep { pub m: Mid, init(d: string) { self.m = Mid(d); } }
+@test
+fn copy_retains_nested_owned(): void {
+    let i = 0;
+    while (i < 100) {
+        let a = Outer("heap-" + intToStr(i) + "-payload");
+        let b = a;                   // must retain a.inner.data; a AND b drop here
+        assert.equalStr(b.inner.data, a.inner.data);
+        i = i + 1;
+    }
+    assert.isTrue(true);
+}
+@test
+fn copy_retains_two_levels(): void {
+    let i = 0;
+    while (i < 100) {
+        let a = Deep("deep-" + intToStr(i));
+        let b = a;
+        assert.equalStr(b.m.s.data, a.m.s.data);
+        i = i + 1;
+    }
+    assert.isTrue(true);
+}
+
 // Block-scope drop: each loop iteration's Outer must release its transitively-owned string.
 @test
 fn block_scope_no_leak(): void {

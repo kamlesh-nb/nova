@@ -44,9 +44,14 @@ From `computeValueEscapeSet`:
   The struct destructor already recurses into inline value-struct fields; only the "schedule a drop at all"
   decision was non-transitive. Gate: corpus 386/389 + ASAN 386/389 (3 pre-existing: 118/189/42, baseline-
   confirmed), new case `381_value_struct_transitive_dtor` green on plain + `--arc` + `--asan`.
-- **P1 — deep owned-field-nested retain/dtor recursion.** Nested owned fields (e.g. a `string` inside an
-  inline nested struct) are handled scalar/string-shallow today; make retain-on-copy and destruct recurse to
-  arbitrary depth. No corpus case forces it yet, so add one first.
+- **P1 — deep owned-field-nested retain-on-copy. ✅ DONE (2026-08-20). Was a real UAF, not just a leak.**
+  `retainValueStructOwnedFields` (expressions.zig) retained only DIRECT owned fields, so copying
+  `Outer{inner:S{data:string}}` shared `S.data` without a reference and dropping both the original and the
+  copy double-freed it (heap-use-after-free, `nova_release`). Fixed: made retain transitive
+  (`retainValueStructOwnedFieldsDepth` recurses into nested value-struct fields at their INLINE address,
+  depth-guarded), mirroring the destructor's inline recursion. Gate: corpus 387/390 + ASAN 387/390 (3
+  pre-existing), case `381` extended with heap-string copy tests at 1 and 2 nesting levels (ARC/ASAN clean).
+  (The destruct side was already transitive after P0; this closes the copy side.)
 - **P2 — compiler validation for impossible value structs.** A struct that contains itself by value (infinite
   size) or forms a by-value cycle must be a compile ERROR, not a hang/crash. Prerequisite before broadening
   inline storage. Pairs with the existing infer depth-guard (a safety net, not a real cycle resolver).
