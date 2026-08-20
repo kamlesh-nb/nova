@@ -753,12 +753,32 @@ pub fn isValueStructName(self: *LlvmCompiler, name: []const u8) bool {
 
 // M-1: does a value struct have any OWNED (reference) field that needs retain-on-copy /
 // release-on-drop? A scalar-only value struct has none, so it needs no drop at all.
+// True when a value struct transitively needs destruction, i.e. it has a directly-owned field OR a
+// nested VALUE-STRUCT field that itself transitively needs destruction. The direct-only version missed
+// `Outer{inner:S}` where S owns a string: `inner` is a value struct (not "owned"), so the struct got no
+// drop scheduled and S's string leaked (600-object ARC-audit leak). The struct destructor already
+// recurses into inline value-struct fields; this predicate decides whether to schedule that drop at all.
 pub fn valueStructHasOwnedFields(self: *LlvmCompiler, name: []const u8) bool {
+    var visited = std.StringHashMap(void).init(self.allocator);
+    defer visited.deinit();
+    return valueStructHasOwnedFieldsRec(self, name, &visited);
+}
+fn valueStructHasOwnedFieldsRec(self: *LlvmCompiler, name: []const u8, visited: *std.StringHashMap(void)) bool {
     const base = getStructBaseName(name);
+    // Cycle guard: a struct that contains itself by value is an infinite-size error (validated
+    // separately); here we just avoid non-termination and treat the back-edge as "no new owned field".
+    if (base.len == 0 or visited.contains(base)) return false;
+    visited.put(base, {}) catch {};
     const sd = self.structs.get(base) orelse return false;
     for (sd.fields) |fld| {
         const fts = self.typeRefToString(fld.type_name) catch continue;
         if (self.isOwnedDeclaredType(fld.type_name, fts)) return true;
+        // Transitive: recurse into a nested VALUE-struct field (a `class` field is caught by
+        // isOwnedDeclaredType above; only inline value-struct fields reach here).
+        const fbase = getStructBaseName(fts);
+        if (fbase.len != 0 and self.isValueStructName(fbase)) {
+            if (valueStructHasOwnedFieldsRec(self, fbase, visited)) return true;
+        }
     }
     return false;
 }

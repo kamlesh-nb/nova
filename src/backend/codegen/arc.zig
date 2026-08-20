@@ -1346,7 +1346,13 @@ pub fn releaseLocalVariables(self: *LlvmCompiler) anyerror!void {
             }
         }
 
-        if (self.isOwnedLocal(var_name, var_type)) {
+        const owned = self.isOwnedLocal(var_name, var_type);
+        // A value struct that transitively owns something (P0) is dropped IN PLACE: its destructor
+        // releases the owned sub-fields, but the struct itself is inline stack storage and is never
+        // nova_release'd. Without this a function-scope `let o = Outer(...)` (Outer{inner:S{data:string}})
+        // leaks S.data at return, because isOwnedLocal is false for a value struct.
+        const value_drop = !owned and self.isValueStructName(var_type) and self.valueStructHasOwnedFields(var_type);
+        if (owned or value_drop) {
             if (self.current_param_names) |params| {
                 var is_param = false;
                 for (params) |p| {
@@ -1370,8 +1376,13 @@ pub fn releaseLocalVariables(self: *LlvmCompiler) anyerror!void {
                 const loaded = core.LLVMBuildLoad2(self.builder, self.val_type, alloca_val, "var_rel_load");
 
                 const tid: ?typesys.TypeId = if (self.current_local_type_ids) |ids| ids.get(var_name) else null;
-                const dest = try self.getOrCreateDestructorPreferId(var_type, tid);
-                try self.compileRelease(loaded, dest);
+                if (value_drop) {
+                    try self.dropValueStruct(loaded, var_type, tid);
+                    _ = core.LLVMBuildStore(self.builder, core.LLVMConstInt(self.val_type, 0, 0), alloca_val);
+                } else {
+                    const dest = try self.getOrCreateDestructorPreferId(var_type, tid);
+                    try self.compileRelease(loaded, dest);
+                }
             }
         }
     }
