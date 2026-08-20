@@ -100,15 +100,23 @@ marking any of them [x] requires an actual code fix that a probe or gate verifie
       type-parameters / unknown names / unknown traits are not newly rejected. Gated: positive case 389 +
       negative `expect_fail/unused_bound_violation.nova`; corpus 398/401, baseline unchanged).
 
-### Enums and pattern matching ; PARTIAL ; case + probe
+### Enums and pattern matching ; SOUND ; case + probe
 
 - [x] Payload-less, single-payload, tuple-form, and struct-form variants.
 - [x] `switch` with destructuring binds payloads.
 - [x] Case guards (`case v if cond`).
 - [x] ARC destructors run for refcounted enum payloads.
 - [x] A non-exhaustive switch on a typed enum is a compile error (probe: "variant not handled").
-- [ ] Exhaustiveness is enforced even when the discriminant type cannot be resolved (currently skipped for an
-      untypeable discriminant; the fail-open edge shared with the type-checker item).
+- [x] Exhaustiveness is enforced even when the discriminant type cannot be resolved (FIXED: when
+      `resolveExprType` cannot type the discriminant (e.g. `switch (list[i])` -- an `.index` expression the
+      resolver leaves untyped), `checkSwitch` now recovers the enum from the case values (`recoverEnumFromCases`)
+      and runs a coverage-only check (`checkEnumCoverageOnly`) instead of skipping exhaustiveness. Additive: an
+      integer/other switch (literal case values) never triggers it. Proven before/after: the old binary
+      compiles an incomplete `switch (list[i])` silently (fail-open), the new binary rejects it at type-check
+      ("Enum variant 'Color.Blue' not handled"). Gated: `expect_fail/untypeable_switch_nonexhaustive.nova`;
+      corpus baseline unchanged. NB: a SEPARATE pre-existing codegen bug -- a COMPLETE `switch (list[i])` on an
+      enum hits an `LLVMVerificationError` -- was discovered here and is logged in the worklist; it is not part
+      of this criterion, which is a type-check-time property.)
 
 ### Error handling (`T | E`, `try`, `catch`, `errdefer`) ; SOUND ; case
 
@@ -514,6 +522,9 @@ Language:
 
 1. `x ?? d` on a narrowed present 0 (representational fix).
 2. Type-checker fully fail-closed (the remaining `orelse return` sites).
+2b. Codegen: a COMPLETE `switch (list[i])` on an enum (subscript discriminant) hits an `LLVMVerificationError`
+   (discovered while gating the exhaustiveness fix). Subscript-of-enum feeding a switch mis-lowers; the
+   incomplete case is now caught at type-check, but the complete case should codegen and run.
    (The "escaping closure environment leak" was investigated and DISPROVEN empirically this session; it is not a
    defect. The single-file `nova x -o out` build for `List` programs was fixed as a byproduct.)
 

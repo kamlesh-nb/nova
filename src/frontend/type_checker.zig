@@ -1146,8 +1146,61 @@ pub const TypeChecker = struct {
         return false;
     }
 
+    // The enum named by a case value of the form `Enum.Variant` or `Enum.Variant(..)`. Used to recover the
+    // switched enum when the discriminant's own type could not be resolved, so exhaustiveness is still checked.
+    fn recoverEnumFromCases(self: *TypeChecker, cases: []const ast.SwitchCase) ?[]const u8 {
+        for (cases) |case| {
+            for (case.values) |val| {
+                const obj_name: ?[]const u8 = switch (val.kind) {
+                    .field_access => |fa| if (fa.object.kind == .ident) fa.object.kind.ident else null,
+                    .call => |c| if (c.callee.kind == .field_access and c.callee.kind.field_access.object.kind == .ident) c.callee.kind.field_access.object.kind.ident else null,
+                    else => null,
+                };
+                if (obj_name) |on| {
+                    if (self.enums.contains(on) and !self.colliding_enums.contains(on)) return on;
+                }
+            }
+        }
+        return null;
+    }
+
+    // Coverage-only exhaustiveness check (no payload binding) for a switch whose discriminant type could not
+    // be resolved but whose cases name a known enum. Every non-guarded case that names a variant covers it; an
+    // uncovered variant with no `default` is an error. Additive: fires only for a genuine enum switch that is
+    // missing a variant, so an integer/other switch (literal case values) never triggers it.
+    fn checkEnumCoverageOnly(self: *TypeChecker, enum_name: []const u8, ss: ast.SwitchStmt) anyerror!void {
+        const enum_decl = self.enums.get(enum_name) orelse return;
+        if (ss.default_case != null) return; // a default handles every remaining variant
+        var covered = std.StringHashMap(bool).init(self.allocator);
+        defer covered.deinit();
+        for (enum_decl.variants) |v| try covered.put(v.name, false);
+        for (ss.cases) |case| {
+            if (case.guard != null) continue; // a guarded case may not match -> does not satisfy exhaustiveness
+            for (case.values) |val| {
+                const fname: ?[]const u8 = switch (val.kind) {
+                    .field_access => |fa| if (fa.object.kind == .ident and std.mem.eql(u8, fa.object.kind.ident, enum_name)) fa.field else null,
+                    .call => |c| if (c.callee.kind == .field_access and c.callee.kind.field_access.object.kind == .ident and std.mem.eql(u8, c.callee.kind.field_access.object.kind.ident, enum_name)) c.callee.kind.field_access.field else null,
+                    .struct_init => |si| si.type_name,
+                    else => null,
+                };
+                if (fname) |f| try covered.put(f, true);
+            }
+        }
+        var it = covered.iterator();
+        while (it.next()) |entry| {
+            if (!entry.value_ptr.*) {
+                self.addError(ss.span, "Enum variant '{s}.{s}' not handled in switch statement", .{ enum_name, entry.key_ptr.* });
+            }
+        }
+    }
+
     fn checkSwitch(self: *TypeChecker, ss: ast.SwitchStmt) anyerror!void {
-        const disc_type = self.resolveExprType(ss.discriminant) orelse return;
+        const disc_type = self.resolveExprType(ss.discriminant) orelse {
+            // Untypeable discriminant: still enforce exhaustiveness if the cases name a known enum. This closes
+            // the fail-open edge where an unresolved discriminant skipped the exhaustiveness check entirely.
+            if (self.recoverEnumFromCases(ss.cases)) |en| try self.checkEnumCoverageOnly(en, ss);
+            return;
+        };
 
         switch (disc_type) {
             .ident => |enum_name| {
