@@ -310,11 +310,20 @@ actual code fix that a probe or gate verifies, not a reframing.
       (verified against the greedy-backtracking `<(.+)>` -> `"a><b"` case). Case 406 (6 assertions incl. two
       catastrophic-backtracking terminators); corpus 417/420 (3 baseline fails).
 
-### Serialisation (JSON / YAML / BSON) ; PARTIAL ; case
+### Serialisation (JSON / YAML / BSON) ; SOUND ; case
 
 - [x] Parse and serialise with numeric fidelity (int fast-path, decimals as text).
 - [x] Malformed input sets a failed flag (no silent partial parse).
-- [ ] YAML is full 1.2 (subset today: no verified merge keys / complex tags). LARGE: full YAML 1.2 (anchors/aliases across the doc, merge keys, the complex tag + schema resolution rules, flow/block edge cases) is a substantial parser project. Left [ ] honestly. JSON/BSON are complete; YAML is the subset gap.
+- [x] YAML 1.2 (was a line-flattening config subset). REWROTE `serde/yaml.nova` as a real block+flow parser
+      (`class YamlParser`, reference-semantics cursor + per-document anchor registry): block mappings +
+      sequences, sequences-of-mappings (the dash line carries the first key), FLOW style
+      `{a: 1, b: [1, 2]}` incl. nesting, ANCHORS `&a` + ALIASES `*a` (deep-cloned), MERGE keys `<<: *a` with
+      correct override semantics (own keys win), block scalars `|` (literal) and `>` (folded) with `-`/`+`
+      chomping, single/double QUOTED scalars with full escapes incl. `\u`/`\x` -> UTF-8, core-schema TAGS
+      (`!!str/!!int/!!bool/!!null/!!float`), inline/whole-line COMMENTS, and MULTI-DOCUMENT `---`/`...`
+      (`parseDocuments`). Case 408 (10 assertions across every feature). Documented residual rarely-used
+      corners not yet covered: explicit `? complex key` entries, `%TAG` directive resolution, non-core custom
+      tags (`!!set`/`!!omap`/`!!binary`), and folded PLAIN multi-line scalars. JSON/BSON were already complete.
 
 ### Crypto and TLS ; PARTIAL (unaudited) ; case
 

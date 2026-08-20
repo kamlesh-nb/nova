@@ -198,144 +198,628 @@ fn stringifyIndent(val: YamlValue, indent: int): string {
     }
 }
 
-pub fn parse(yaml: string): YamlValue {
-    let raw_lines = string.split(yaml, "\n");
+// ---------------------------------------------------------------------------------------------------------
+// YAML 1.2 parser.
+//
+// This is a real block+flow YAML parser, not the old line-flattening config subset. It supports: block
+// mappings and sequences, FLOW style ({a: 1, b: [1, 2]}), ANCHORS (&a) + ALIASES (*a), MERGE keys (<<: *a),
+// block scalars (| literal and > folded, with -/+ chomping), single/double QUOTED scalars with escapes,
+// core-schema TAGS (!!str/!!int/!!bool/!!null/!!float), inline/whole-line COMMENTS, and MULTIPLE DOCUMENTS
+// (--- / ...). The cursor lives in a `class` (reference semantics) so recursive descent can share one
+// position + the per-document anchor registry.
+// ---------------------------------------------------------------------------------------------------------
 
-    let lines = List<string>();
-
+fn splitLines(s: string): List<string> {
+    let raw = string.split(s, "\n");
+    let out = List<string>();
     let i = 0;
-    while (i < raw_lines.size()) {
-        let line = raw_lines.get(i) ?? "";
-        let trimmed = trim(line);
-        if (trimmed.length == 0 || trimmed[0] == '#') {
-            i = i + 1;
-            continue;
-        }
-
-        let indent = getIndent(line);
-        if (trimmed[0] == '-' && trimmed.length > 1 && trimmed[1] == ' ') {
-            let after_dash = string.slice(trimmed, 2, trimmed.length);
-            let colon_pos = string.indexOf(after_dash, ":");
-            if (colon_pos >= 0) {
-                let dash_spaces = makeIndent(indent);
-                lines.push(dash_spaces + "-");
-
-                let child_spaces = makeIndent(indent + 2);
-                lines.push(child_spaces + after_dash);
-
-                i = i + 1;
-                continue;
-            }
-        }
-        lines.push(line);
+    while (i < raw.size()) {
+        let ln = raw.get(i) ?? "";
+        // Strip a trailing carriage return (CRLF files).
+        if (ln.length > 0 && ln[ln.length - 1] == 13) { ln = string.slice(ln, 0, ln.length - 1); }
+        out.push(ln);
         i = i + 1;
     }
-
-    if (lines.size() == 0) {
-        return YamlValue.Null;
-    }
-
-    let first_line = lines.get(0) ?? "";
-    let initial_indent = getIndent(first_line);
-
-    let (res, final_idx) = parseBlock(lines, 0, initial_indent);
-    return res;
+    return out;
 }
 
-fn parseBlock(lines: List<string>, start_idx: int, expected_indent: int): (YamlValue, int) {
-    let i = start_idx;
-    let is_arr = false;
-    while (i < lines.size()) {
-        let line = lines.get(i) ?? "";
-        let trimmed = trim(line);
-        if (trimmed.length > 0) {
-            if (trimmed[0] == '-') {
-                is_arr = true;
-            }
-            break;
+// Remove a trailing "# comment" from a line, preserving leading indentation. A '#' begins a comment only at
+// the start of the line's content or when preceded by whitespace, and never inside quotes.
+fn stripComment(line: string): string {
+    let inS = false;
+    let inD = false;
+    let i = 0;
+    let cut = 0 - 1;
+    while (i < line.length) {
+        let c = line[i];
+        if (inS) {
+            if (c == '\'') { inS = false; }
+        } else if (inD) {
+            if (c == '\\') { i = i + 1; }
+            else if (c == '"') { inD = false; }
+        } else if (c == '\'') { inS = true; }
+        else if (c == '"') { inD = true; }
+        else if (c == '#') {
+            if (i == 0 || line[i - 1] == ' ' || line[i - 1] == '\t') { cut = i; break; }
         }
         i = i + 1;
     }
+    if (cut < 0) { return line; }
+    return rtrim(string.slice(line, 0, cut));
+}
 
-    if (is_arr) {
-        let arr = List<YamlValue>();
-        while (i < lines.size()) {
-            let line = lines.get(i) ?? "";
-            let indent = getIndent(line);
-            let trimmed = trim(line);
-            if (trimmed.length == 0) {
+fn rtrim(s: string): string {
+    let end = s.length;
+    while (end > 0 && (s[end - 1] == ' ' || s[end - 1] == '\t')) { end = end - 1; }
+    return string.slice(s, 0, end);
+}
+
+// Find the ':' that separates a block-mapping key from its value: the first depth-0 colon that is followed by
+// a space/tab or ends the line, ignoring colons inside quotes or flow brackets. Returns -1 for a non-mapping.
+fn findKeyColon(t: string): int {
+    let inS = false;
+    let inD = false;
+    let depth = 0;
+    let i = 0;
+    while (i < t.length) {
+        let c = t[i];
+        if (inS) {
+            if (c == '\'') { inS = false; }
+        } else if (inD) {
+            if (c == '\\') { i = i + 1; }
+            else if (c == '"') { inD = false; }
+        } else if (c == '\'') { inS = true; }
+        else if (c == '"') { inD = true; }
+        else if (c == '[' || c == '{') { depth = depth + 1; }
+        else if (c == ']' || c == '}') { depth = depth - 1; }
+        else if (c == ':' && depth == 0) {
+            if (i + 1 >= t.length || t[i + 1] == ' ' || t[i + 1] == '\t') { return i; }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Strip surrounding quotes from a mapping key (keys are strings in our model).
+fn parseKey(raw: string): string {
+    let t = trim(raw);
+    if (t.length >= 2 && t[0] == '"' && t[t.length - 1] == '"') { return unescapeDouble(string.slice(t, 1, t.length - 1)); }
+    if (t.length >= 2 && t[0] == '\'' && t[t.length - 1] == '\'') { return unescapeSingle(string.slice(t, 1, t.length - 1)); }
+    return t;
+}
+
+fn unescapeSingle(s: string): string {
+    // In single-quoted scalars the only escape is '' -> '.
+    let out = bytes.alloc(s.length + 1);
+    let o = 0;
+    let i = 0;
+    while (i < s.length) {
+        if (s[i] == '\'' && i + 1 < s.length && s[i + 1] == '\'') { bytes.write_byte(out, o, '\''); o = o + 1; i = i + 2; }
+        else { bytes.write_byte(out, o, s[i]); o = o + 1; i = i + 1; }
+    }
+    bytes.write_byte(out, o, 0);          // NUL terminator (bytes.alloc, unlike nova_str_alloc, reserves none)
+    bytes.write_i32(out - 4, 0, o);
+    return out as string;
+}
+
+fn hexNibble(c: int): int {
+    if (c >= '0' && c <= '9') { return c - '0'; }
+    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+    if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+    return 0;
+}
+fn hex2(a: int, b: int): int { return hexNibble(a) * 16 + hexNibble(b); }
+fn hex4(a: int, b: int, c: int, d: int): int { return hex2(a, b) * 256 + hex2(c, d); }
+
+// Encode a codepoint as UTF-8 into out at offset o; returns the new offset.
+fn encodeUtf8(out: ptr, o: int, cp: int): int {
+    if (cp < 0x80) { bytes.write_byte(out, o, cp); return o + 1; }
+    if (cp < 0x800) {
+        bytes.write_byte(out, o, 0xC0 | (cp >> 6));
+        bytes.write_byte(out, o + 1, 0x80 | (cp & 0x3F));
+        return o + 2;
+    }
+    bytes.write_byte(out, o, 0xE0 | (cp >> 12));
+    bytes.write_byte(out, o + 1, 0x80 | ((cp >> 6) & 0x3F));
+    bytes.write_byte(out, o + 2, 0x80 | (cp & 0x3F));
+    return o + 3;
+}
+
+fn unescapeDouble(s: string): string {
+    let out = bytes.alloc(s.length + 1);
+    let o = 0;
+    let i = 0;
+    while (i < s.length) {
+        let c = s[i];
+        if (c == '\\' && i + 1 < s.length) {
+            let n = s[i + 1];
+            if (n == 'n') { bytes.write_byte(out, o, 10); o = o + 1; i = i + 2; continue; }
+            else if (n == 't') { bytes.write_byte(out, o, 9); o = o + 1; i = i + 2; continue; }
+            else if (n == 'r') { bytes.write_byte(out, o, 13); o = o + 1; i = i + 2; continue; }
+            else if (n == '0') { bytes.write_byte(out, o, 0); o = o + 1; i = i + 2; continue; }
+            else if (n == '"') { bytes.write_byte(out, o, '"'); o = o + 1; i = i + 2; continue; }
+            else if (n == '\\') { bytes.write_byte(out, o, '\\'); o = o + 1; i = i + 2; continue; }
+            else if (n == '/') { bytes.write_byte(out, o, '/'); o = o + 1; i = i + 2; continue; }
+            else if (n == 'x' && i + 3 < s.length) {
+                let cp = hex2(s[i + 2], s[i + 3]);
+                bytes.write_byte(out, o, cp); o = o + 1; i = i + 4; continue;
+            }
+            else if (n == 'u' && i + 5 < s.length) {
+                let cp = hex4(s[i + 2], s[i + 3], s[i + 4], s[i + 5]);
+                o = encodeUtf8(out, o, cp); i = i + 6; continue;
+            }
+            else { bytes.write_byte(out, o, n); o = o + 1; i = i + 2; continue; }
+        } else { bytes.write_byte(out, o, c); o = o + 1; i = i + 1; }
+    }
+    bytes.write_byte(out, o, 0);          // NUL terminator (bytes.alloc, unlike nova_str_alloc, reserves none)
+    bytes.write_i32(out - 4, 0, o);
+    return out as string;
+}
+
+// A scalar token that may be quoted; returns the typed YamlValue (quoted -> always String, unquoted -> core
+// schema typing via parseScalar).
+fn scalarToken(t0: string): YamlValue {
+    let t = trim(t0);
+    if (t.length >= 2 && t[0] == '"' && t[t.length - 1] == '"') { return YamlValue.String(unescapeDouble(string.slice(t, 1, t.length - 1))); }
+    if (t.length >= 2 && t[0] == '\'' && t[t.length - 1] == '\'') { return YamlValue.String(unescapeSingle(string.slice(t, 1, t.length - 1))); }
+    return parseScalar(t);
+}
+
+// Apply a core-schema tag to a scalar value.
+fn applyTag(tag: string, v: YamlValue): YamlValue {
+    if (tag.length == 0) { return v; }
+    if (tag == "!!str" || tag == "!str") {
+        switch (v) {
+            case YamlValue.String(s): { return v; }
+            case YamlValue.Number(n): { return YamlValue.String(i64ToString(n)); }
+            case YamlValue.Bool(b): { return YamlValue.String(if (b) "true" else "false"); }
+            default: { return v; }
+        }
+    }
+    if (tag == "!!null" || tag == "!null") { return YamlValue.Null; }
+    if (tag == "!!bool" || tag == "!bool") {
+        switch (v) { case YamlValue.String(s): { return YamlValue.Bool(s == "true" || s == "True"); } default: { return v; } }
+    }
+    if (tag == "!!int" || tag == "!int") {
+        switch (v) { case YamlValue.String(s): { return YamlValue.Number(string.parseI64(s)); } default: { return v; } }
+    }
+    if (tag == "!!float" || tag == "!float") {
+        switch (v) { case YamlValue.String(s): { return YamlValue.Decimal(decimal.fromString(s)); } case YamlValue.Number(n): { return YamlValue.Decimal(decimal.fromString(i64ToString(n))); } default: { return v; } }
+    }
+    return v;
+}
+
+// Deep copy (aliases must not share the anchored node's containers).
+pub fn cloneValue(v: YamlValue): YamlValue {
+    switch (v) {
+        case YamlValue.Array(a): {
+            let out = List<YamlValue>();
+            let i = 0;
+            while (i < a.size()) { out.push(cloneValue(a.at(i))); i = i + 1; }
+            return YamlValue.Array(out);
+        }
+        case YamlValue.Object(m): {
+            let out = Map<string, YamlValue>(16, string.hash);
+            let ks = m.keys();
+            let i = 0;
+            while (i < ks.size()) {
+                let k = ks.get(i) ?? "";
+                out.set(k, cloneValue(m.get(k) ?? YamlValue.Null));
                 i = i + 1;
-                continue;
             }
-            if (indent < expected_indent) {
-                break;
-            }
-            if (trimmed[0] == '-') {
-                let content = trim(string.slice(trimmed, 1, trimmed.length));
-                if (content.length == 0) {
-                    let next_indent = expected_indent + 2;
-                    let j = i + 1;
-                    while (j < lines.size()) {
-                        let nl = lines.get(j) ?? "";
-                        if (trim(nl).length > 0) {
-                            next_indent = getIndent(nl);
-                            break;
-                        }
-                        j = j + 1;
-                    }
-                    let (val, next_i) = parseBlock(lines, i + 1, next_indent);
-                    arr.push(val);
-                    i = next_i;
-                } else {
-                    arr.push(parseScalar(content));
-                    i = i + 1;
-                }
-            } else {
-                break;
+            return YamlValue.Object(out);
+        }
+        default: { return v; }
+    }
+}
+
+class YamlParser {
+    pub lines: List<string>,
+    pub pos: int,
+    pub anchors: Map<string, YamlValue>,
+
+    init(lines: List<string>) {
+        self.lines = lines;
+        self.pos = 0;
+        self.anchors = Map<string, YamlValue>(16, string.hash);
+    }
+
+    fn atEnd(self: YamlParser): bool { return self.pos >= self.lines.size(); }
+    // Past end-of-input reads as an empty line, so callers that peek one line ahead never index out of bounds.
+    fn cur(self: YamlParser): string {
+        if (self.pos >= self.lines.size()) { return ""; }
+        return self.lines.at(self.pos);
+    }
+
+    // Advance over blank lines, comment-only lines and %directives. Stops on real content or a doc marker.
+    fn skipIgnorable(self: YamlParser): void {
+        while (!self.atEnd()) {
+            let t = trim(stripComment(self.cur()));
+            if (t.length == 0) { self.pos = self.pos + 1; continue; }
+            if (t.length > 0 && t[0] == '%') { self.pos = self.pos + 1; continue; }
+            break;
+        }
+    }
+
+    fn isDocMarker(self: YamlParser, t: string): bool {
+        return t == "---" || t == "..." || string.startsWith(t, "--- ") || string.startsWith(t, "... ");
+    }
+
+    // Parse every document in the stream.
+    pub fn parseAll(self: YamlParser): List<YamlValue> {
+        let docs = List<YamlValue>();
+        while (true) {
+            self.skipIgnorable();
+            if (self.atEnd()) { break; }
+            let before = self.pos;
+            let v = self.parseDocument();
+            docs.push(v);
+            if (self.pos <= before) { self.pos = before + 1; }   // guarantee progress
+        }
+        return docs;
+    }
+
+    fn parseDocument(self: YamlParser): YamlValue {
+        self.anchors = Map<string, YamlValue>(16, string.hash);   // anchors are document-scoped
+        self.skipIgnorable();
+        // Consume a leading document-start marker.
+        if (!self.atEnd()) {
+            let t = trim(stripComment(self.cur()));
+            if (t == "---") { self.pos = self.pos + 1; }
+            else if (string.startsWith(t, "--- ")) {
+                // `--- <inline node>` on one line.
+                self.lines.set(self.pos, string.slice(self.cur(), string.indexOf(self.cur(), "--- ") + 4, self.cur().length));
             }
         }
-        return (YamlValue.Array(arr), i);
-    } else {
+        self.skipIgnorable();
+        if (self.atEnd()) { return YamlValue.Null; }
+        let t = trim(stripComment(self.cur()));
+        if (self.isDocMarker(t)) {
+            if (t == "...") { self.pos = self.pos + 1; }
+            return YamlValue.Null;
+        }
+        let v = self.parseNode(0);
+        // Consume a trailing document-end marker.
+        self.skipIgnorable();
+        if (!self.atEnd() && trim(stripComment(self.cur())) == "...") { self.pos = self.pos + 1; }
+        return v;
+    }
+
+    // Parse the node whose block content is indented at >= minIndent.
+    fn parseNode(self: YamlParser, minIndent: int): YamlValue {
+        self.skipIgnorable();
+        if (self.atEnd()) { return YamlValue.Null; }
+        let line = self.cur();
+        let ind = getIndent(line);
+        let t = trim(stripComment(line));
+        if (self.isDocMarker(t) || ind < minIndent) { return YamlValue.Null; }
+        if (t == "-" || string.startsWith(t, "- ")) { return self.parseSequence(ind); }
+        if (findKeyColon(t) >= 0) { return self.parseMapping(ind); }
+        // Bare scalar node (single line, possibly flow/anchor/alias/block-scalar).
+        self.pos = self.pos + 1;
+        return self.parseValue(t, ind);
+    }
+
+    fn parseSequence(self: YamlParser, indent: int): YamlValue {
+        let arr = List<YamlValue>();
+        while (!self.atEnd()) {
+            self.skipIgnorable();
+            if (self.atEnd()) { break; }
+            let line = self.cur();
+            let ind = getIndent(line);
+            let t = trim(stripComment(line));
+            if (self.isDocMarker(t) || ind < indent || ind > indent) { break; }
+            if (!(t == "-" || string.startsWith(t, "- "))) { break; }
+            // Column of the '-' and of the item content in the original line.
+            let dash = ind;
+            let cpos = dash + 1;
+            while (cpos < line.length && line[cpos] == ' ') { cpos = cpos + 1; }
+            if (cpos >= line.length) {
+                // Bare "-": the item is a nested node deeper than the dash.
+                self.pos = self.pos + 1;
+                arr.push(self.parseNode(indent + 1));
+            } else {
+                // Rewrite "- <content>" to "<content>" at its own column, then parse it as a node there. This
+                // makes `- key: v` (a mapping whose first key rides the dash line) and `- - x` (nested seq)
+                // fall out of the same recursion, continuing on following lines aligned at that column.
+                let content = string.slice(line, cpos, line.length);
+                self.lines.set(self.pos, string.repeat(" ", cpos) + content);
+                arr.push(self.parseNode(cpos));
+            }
+        }
+        return YamlValue.Array(arr);
+    }
+
+    fn parseMapping(self: YamlParser, indent: int): YamlValue {
         let obj = Map<string, YamlValue>(16, string.hash);
-        while (i < lines.size()) {
-            let line = lines.get(i) ?? "";
-            let indent = getIndent(line);
-            let trimmed = trim(line);
-            if (trimmed.length == 0) {
-                i = i + 1;
-                continue;
+        while (!self.atEnd()) {
+            self.skipIgnorable();
+            if (self.atEnd()) { break; }
+            let line = self.cur();
+            let ind = getIndent(line);
+            let t = trim(stripComment(line));
+            if (self.isDocMarker(t) || ind < indent || ind > indent) { break; }
+            let kc = findKeyColon(t);
+            if (kc < 0) { break; }
+            let keyRaw = trim(string.slice(t, 0, kc));
+            let rest = trim(string.slice(t, kc + 1, t.length));
+            self.pos = self.pos + 1;
+            if (keyRaw == "<<") {
+                let mv = self.parseValue(rest, indent);
+                self.mergeInto(obj, mv);
+            } else {
+                let key = parseKey(keyRaw);
+                let val = self.parseValue(rest, indent);
+                obj.set(key, val);
             }
-            if (indent < expected_indent) {
-                break;
-            }
-            let colon_pos = string.indexOf(trimmed, ":");
-            if (colon_pos >= 0) {
-                let key = trim(string.slice(trimmed, 0, colon_pos));
-                let val_str = trim(string.slice(trimmed, colon_pos + 1, trimmed.length));
-                if (val_str.length == 0) {
-                    let next_indent = expected_indent + 2;
-                    let j = i + 1;
-                    while (j < lines.size()) {
-                        let nl = lines.get(j) ?? "";
-                        if (trim(nl).length > 0) {
-                            next_indent = getIndent(nl);
-                            break;
-                        }
-                        j = j + 1;
-                    }
-                    let (val, next_i) = parseBlock(lines, i + 1, next_indent);
-                    obj.set(key, val);
-                    i = next_i;
-                } else {
-                    obj.set(key, parseScalar(val_str));
+        }
+        return YamlValue.Object(obj);
+    }
+
+    // Merge a mapping (or a sequence of mappings) into obj without overriding keys already present.
+    fn mergeInto(self: YamlParser, obj: Map<string, YamlValue>, v: YamlValue): void {
+        switch (v) {
+            case YamlValue.Object(m): {
+                let ks = m.keys();
+                let i = 0;
+                while (i < ks.size()) {
+                    let k = ks.get(i) ?? "";
+                    if (!obj.has(k)) { obj.set(k, m.get(k) ?? YamlValue.Null); }
                     i = i + 1;
                 }
-            } else {
-                i = i + 1;
             }
+            case YamlValue.Array(a): {
+                let i = 0;
+                while (i < a.size()) { self.mergeInto(obj, a.at(i)); i = i + 1; }
+            }
+            default: { }
+        }
+    }
+
+    // Resolve the value following `key:` (or a bare-scalar node). The cursor is already positioned on the
+    // line AFTER the key/scalar line, so nested blocks and block scalars read from there.
+    fn parseValue(self: YamlParser, text: string, parentIndent: int): YamlValue {
+        let t = trim(text);
+        // Leading tag(s): remember the last one.
+        let tag = "";
+        while (t.length > 0 && t[0] == '!') {
+            let sp = indexOfSpace(t);
+            if (sp < 0) { tag = t; t = ""; }
+            else { tag = string.slice(t, 0, sp); t = trim(string.slice(t, sp, t.length)); }
+        }
+        // Anchor.
+        if (t.length > 0 && t[0] == '&') {
+            let sp = indexOfSpace(t);
+            let name = "";
+            if (sp < 0) { name = string.slice(t, 1, t.length); t = ""; }
+            else { name = string.slice(t, 1, sp); t = trim(string.slice(t, sp, t.length)); }
+            let v = if (t.length == 0) self.parseNode(parentIndent + 1) else self.parseValue(t, parentIndent);
+            self.anchors.set(name, cloneValue(v));
+            return applyTag(tag, v);
+        }
+        // Alias.
+        if (t.length > 0 && t[0] == '*') {
+            let name = trim(string.slice(t, 1, t.length));
+            return cloneValue(self.anchors.get(name) ?? YamlValue.Null);
+        }
+        // Empty -> nested block (mapping/sequence/scalar deeper) or null.
+        if (t.length == 0) { return self.parseNode(parentIndent + 1); }
+        // Block scalar.
+        if (t[0] == '|' || t[0] == '>') { return applyTag(tag, self.parseBlockScalar(parentIndent, t)); }
+        // Flow collections (may span lines).
+        if (t[0] == '{' || t[0] == '[') {
+            let flow = self.gatherFlow(t);
+            let (fv, fi) = self.flowValue(flow, 0);
+            return applyTag(tag, fv);
+        }
+        // Plain or quoted scalar.
+        return applyTag(tag, scalarToken(t));
+    }
+
+    // Collect a complete flow expression starting with `initial`, consuming following lines until the {} / []
+    // brackets balance.
+    fn gatherFlow(self: YamlParser, initial: string): string {
+        let buf = initial;
+        while (flowDepth(buf) > 0 && !self.atEnd()) {
+            buf = buf + " " + trim(stripComment(self.cur()));
+            self.pos = self.pos + 1;
+        }
+        return buf;
+    }
+
+    fn parseBlockScalar(self: YamlParser, parentIndent: int, header: string): YamlValue {
+        let style = header[0];       // '|' literal, '>' folded
+        let chomp = 0;               // 0 clip, -1 strip, +1 keep
+        let explicitIndent = 0 - 1;
+        let i = 1;
+        while (i < header.length) {
+            let c = header[i];
+            if (c == '-') { chomp = 0 - 1; }
+            else if (c == '+') { chomp = 1; }
+            else if (c >= '1' && c <= '9') { explicitIndent = c - '0'; }
+            i = i + 1;
+        }
+        let blockIndent = if (explicitIndent > 0) parentIndent + explicitIndent else 0 - 1;
+        let content = List<string>();
+        while (!self.atEnd()) {
+            let raw = self.cur();
+            let tr = trim(raw);
+            let ind = getIndent(raw);
+            if (tr.length == 0) { content.push(""); self.pos = self.pos + 1; continue; }
+            if (ind <= parentIndent) { break; }
+            if (blockIndent < 0) { blockIndent = ind; }
+            let c = if (raw.length >= blockIndent) string.slice(raw, blockIndent, raw.length) else "";
+            content.push(c);
+            self.pos = self.pos + 1;
+        }
+        // Drop trailing blank lines except when keeping (+).
+        if (chomp != 1) {
+            while (content.size() > 0 && (content.at(content.size() - 1)).length == 0) { content.remove(content.size() - 1); }
+        }
+        let body = "";
+        if (style == '|') {
+            let k = 0;
+            while (k < content.size()) {
+                if (k > 0) { body = body + "\n"; }
+                body = body + content.at(k);
+                k = k + 1;
+            }
+        } else {
+            // Folded: runs of non-empty lines join with a space; blank lines become newlines.
+            let atStart = true;
+            let k = 0;
+            while (k < content.size()) {
+                let ln = content.at(k);
+                if (ln.length == 0) { body = body + "\n"; atStart = true; }
+                else if (atStart) { body = body + ln; atStart = false; }
+                else { body = body + " " + ln; }
+                k = k + 1;
+            }
+        }
+        if (chomp == 0) { body = body + "\n"; }       // clip: single trailing newline
+        else if (chomp == 1) { body = body + "\n"; }  // keep: trailing newline + any kept blanks already in body
+        // strip (-1): no trailing newline
+        return YamlValue.String(body);
+    }
+
+    // ---- flow parsing over a string (index based) ----
+
+    fn flowValue(self: YamlParser, s: string, i0: int): (YamlValue, int) {
+        let i = skipWs(s, i0);
+        if (i >= s.length) { return (YamlValue.Null, i); }
+        let c = s[i];
+        if (c == '{') { return self.flowMap(s, i); }
+        if (c == '[') { return self.flowSeq(s, i); }
+        if (c == '*') {
+            let j = i + 1;
+            while (j < s.length && !isFlowStop(s[j])) { j = j + 1; }
+            let name = trim(string.slice(s, i + 1, j));
+            return (cloneValue(self.anchors.get(name) ?? YamlValue.Null), j);
+        }
+        if (c == '"' || c == '\'') {
+            let (raw, j) = readFlowQuoted(s, i);
+            return (scalarToken(raw), j);
+        }
+        // Plain scalar up to a flow delimiter.
+        let j = i;
+        while (j < s.length && !isFlowStop(s[j])) { j = j + 1; }
+        let tok = trim(string.slice(s, i, j));
+        return (scalarToken(tok), j);
+    }
+
+    fn flowSeq(self: YamlParser, s: string, i0: int): (YamlValue, int) {
+        let arr = List<YamlValue>();
+        let i = i0 + 1;   // past '['
+        while (true) {
+            i = skipWs(s, i);
+            if (i >= s.length) { break; }
+            if (s[i] == ']') { i = i + 1; break; }
+            if (s[i] == ',') { i = i + 1; continue; }
+            let (v, j) = self.flowValue(s, i);
+            arr.push(v);
+            i = skipWs(s, j);
+            if (i < s.length && s[i] == ',') { i = i + 1; }
+            else if (i < s.length && s[i] == ']') { i = i + 1; break; }
+        }
+        return (YamlValue.Array(arr), i);
+    }
+
+    fn flowMap(self: YamlParser, s: string, i0: int): (YamlValue, int) {
+        let obj = Map<string, YamlValue>(16, string.hash);
+        let i = i0 + 1;   // past '{'
+        while (true) {
+            i = skipWs(s, i);
+            if (i >= s.length) { break; }
+            if (s[i] == '}') { i = i + 1; break; }
+            if (s[i] == ',') { i = i + 1; continue; }
+            // key (up to ':') -- may be quoted.
+            let keyRaw = "";
+            if (s[i] == '"' || s[i] == '\'') {
+                let (kq, kj) = readFlowQuoted(s, i);
+                keyRaw = kq; i = kj;
+            } else {
+                let j = i;
+                while (j < s.length && s[j] != ':' && s[j] != ',' && s[j] != '}') { j = j + 1; }
+                keyRaw = trim(string.slice(s, i, j)); i = j;
+            }
+            i = skipWs(s, i);
+            let val = YamlValue.Null;
+            if (i < s.length && s[i] == ':') {
+                i = i + 1;
+                let (v, j) = self.flowValue(s, i);
+                val = v; i = j;
+            }
+            if (keyRaw == "<<") { self.mergeInto(obj, val); }
+            else { obj.set(parseKey(keyRaw), val); }
+            i = skipWs(s, i);
+            if (i < s.length && s[i] == ',') { i = i + 1; }
+            else if (i < s.length && s[i] == '}') { i = i + 1; break; }
         }
         return (YamlValue.Object(obj), i);
     }
+}
+
+// Net {[ vs ]} depth of a flow buffer, ignoring brackets inside quotes.
+fn flowDepth(s: string): int {
+    let inS = false;
+    let inD = false;
+    let depth = 0;
+    let i = 0;
+    while (i < s.length) {
+        let c = s[i];
+        if (inS) { if (c == '\'') { inS = false; } }
+        else if (inD) { if (c == '\\') { i = i + 1; } else if (c == '"') { inD = false; } }
+        else if (c == '\'') { inS = true; }
+        else if (c == '"') { inD = true; }
+        else if (c == '[' || c == '{') { depth = depth + 1; }
+        else if (c == ']' || c == '}') { depth = depth - 1; }
+        i = i + 1;
+    }
+    return depth;
+}
+
+fn isFlowStop(c: int): bool {
+    return c == ',' || c == ']' || c == '}' || c == '[' || c == '{' || c == ':';
+}
+
+fn skipWs(s: string, i0: int): int {
+    let i = i0;
+    while (i < s.length && (s[i] == ' ' || s[i] == '\t')) { i = i + 1; }
+    return i;
+}
+
+fn indexOfSpace(s: string): int {
+    let i = 0;
+    while (i < s.length) { if (s[i] == ' ' || s[i] == '\t') { return i; } i = i + 1; }
+    return 0 - 1;
+}
+
+// Read a quoted flow scalar starting at s[i] (a quote char); returns (raw-including-quotes, nextIndex).
+fn readFlowQuoted(s: string, i0: int): (string, int) {
+    let q = s[i0];
+    let i = i0 + 1;
+    while (i < s.length) {
+        if (q == '"' && s[i] == '\\') { i = i + 2; continue; }
+        if (s[i] == q) {
+            if (q == '\'' && i + 1 < s.length && s[i + 1] == '\'') { i = i + 2; continue; }
+            i = i + 1; break;
+        }
+        i = i + 1;
+    }
+    return (string.slice(s, i0, i), i);
+}
+
+pub fn parse(yaml: string): YamlValue {
+    let p = YamlParser(splitLines(yaml));
+    let docs = p.parseAll();
+    if (docs.size() == 0) { return YamlValue.Null; }
+    return docs.at(0);
+}
+
+// Parse a multi-document stream into a list of documents.
+pub fn parseDocuments(yaml: string): List<YamlValue> {
+    let p = YamlParser(splitLines(yaml));
+    return p.parseAll();
 }
 
 fn getIndent(s: string): int {

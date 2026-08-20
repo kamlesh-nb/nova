@@ -1,0 +1,106 @@
+// YAML 1.2 parser: a real block+flow parser (was a line-flattening config subset). Exercises anchors &
+// aliases, merge keys, flow style, block scalars (| and >), quoted scalars with escapes, core-schema tags,
+// nested sequences-of-mappings, and multi-document streams.
+import serde.yaml;
+import assert;
+
+fn sOf(v: yaml.YamlValue): string { return yaml.asString(v) ?? "<not-a-string>"; }
+fn nOf(v: yaml.YamlValue): long { return yaml.asNumber(v) ?? -999; }
+
+@test
+fn block_mapping_and_nested() {
+    let y = "name: Alice\nage: 30\naddress:\n  city: Paris\n  zip: 75001\ntags:\n  - dev\n  - qa\n";
+    let v = yaml.parse(y);
+    assert.equalInt(1, if (sOf(yaml.get(v, "name")) == "Alice") 1 else 0);
+    assert.equalInt(30, nOf(yaml.get(v, "age")));
+    assert.equalInt(1, if (sOf(yaml.get(yaml.get(v, "address"), "city")) == "Paris") 1 else 0);
+    let tags = yaml.asArray(yaml.get(v, "tags")) ?? List<yaml.YamlValue>();
+    assert.equalInt(2, tags.size());
+    assert.equalInt(1, if (sOf(tags.at(0)) == "dev") 1 else 0);
+}
+
+@test
+fn sequence_of_mappings() {
+    // The dash line carries the first key; following keys align under it.
+    let y = "items:\n  - id: 1\n    name: one\n  - id: 2\n    name: two\n";
+    let items = yaml.asArray(yaml.get(yaml.parse(y), "items")) ?? List<yaml.YamlValue>();
+    assert.equalInt(2, items.size());
+    assert.equalInt(1, nOf(yaml.get(items.at(0), "id")));
+    assert.equalInt(1, if (sOf(yaml.get(items.at(1), "name")) == "two") 1 else 0);
+}
+
+@test
+fn flow_style() {
+    let v = yaml.parse("point: {x: 1, y: 2}\nlist: [a, b, c]\nnested: {arr: [1, 2], m: {k: v}}\n");
+    assert.equalInt(1, nOf(yaml.get(yaml.get(v, "point"), "x")));
+    let list = yaml.asArray(yaml.get(v, "list")) ?? List<yaml.YamlValue>();
+    assert.equalInt(3, list.size());
+    assert.equalInt(1, if (sOf(list.at(2)) == "c") 1 else 0);
+    let nested = yaml.get(v, "nested");
+    assert.equalInt(1, if (sOf(yaml.get(yaml.get(nested, "m"), "k")) == "v") 1 else 0);
+}
+
+@test
+fn anchors_and_aliases() {
+    let y = "defaults: &d\n  timeout: 30\n  retries: 3\nservice:\n  <<: *d\n  name: web\n";
+    let v = yaml.parse(y);
+    let svc = yaml.get(v, "service");
+    // Merge key brought timeout+retries in; name is the service's own.
+    assert.equalInt(30, nOf(yaml.get(svc, "timeout")));
+    assert.equalInt(3, nOf(yaml.get(svc, "retries")));
+    assert.equalInt(1, if (sOf(yaml.get(svc, "name")) == "web") 1 else 0);
+}
+
+@test
+fn merge_does_not_override_own_keys() {
+    let y = "base: &b\n  port: 80\n  host: base\nover:\n  <<: *b\n  host: mine\n";
+    let over = yaml.get(yaml.parse(y), "over");
+    assert.equalInt(80, nOf(yaml.get(over, "port")));            // inherited
+    assert.equalInt(1, if (sOf(yaml.get(over, "host")) == "mine") 1 else 0);  // own key wins over merge
+}
+
+@test
+fn alias_scalar() {
+    let y = "a: &n 42\nb: *n\n";
+    let v = yaml.parse(y);
+    assert.equalInt(42, nOf(yaml.get(v, "a")));
+    assert.equalInt(42, nOf(yaml.get(v, "b")));
+}
+
+@test
+fn block_scalars() {
+    // Literal | keeps newlines; folded > joins lines with spaces. Both clip to one trailing newline.
+    let y = "lit: |\n  line1\n  line2\nfold: >\n  a\n  b\n";
+    let v = yaml.parse(y);
+    assert.equalInt(1, if (sOf(yaml.get(v, "lit")) == "line1\nline2\n") 1 else 0);
+    assert.equalInt(1, if (sOf(yaml.get(v, "fold")) == "a b\n") 1 else 0);
+}
+
+@test
+fn quoted_scalars_and_escapes() {
+    let y = "d: \"a\\tb\\nc\"\ns: 'it''s ok'\ncolon: \"a: b\"\n";
+    let v = yaml.parse(y);
+    assert.equalInt(1, if (sOf(yaml.get(v, "d")) == "a\tb\nc") 1 else 0);
+    assert.equalInt(1, if (sOf(yaml.get(v, "s")) == "it's ok") 1 else 0);
+    assert.equalInt(1, if (sOf(yaml.get(v, "colon")) == "a: b") 1 else 0);
+    // \u unicode escape -> UTF-8 bytes (U+00E9 = 'é' = 0xC3 0xA9); \x hex byte.
+    let u = yaml.parse("e: \"caf\\u00e9\"\n");
+    assert.equalInt(1, if (sOf(yaml.get(u, "e")) == "café") 1 else 0);
+}
+
+@test
+fn comments_and_tags() {
+    let y = "# leading comment\nname: web   # inline comment\ncount: !!str 5\n";
+    let v = yaml.parse(y);
+    assert.equalInt(1, if (sOf(yaml.get(v, "name")) == "web") 1 else 0);
+    // !!str forces the 5 to be a string, not a number.
+    assert.equalInt(1, if (sOf(yaml.get(v, "count")) == "5") 1 else 0);
+}
+
+@test
+fn multi_document() {
+    let docs = yaml.parseDocuments("---\na: 1\n---\nb: 2\n...\n");
+    assert.equalInt(2, docs.size());
+    assert.equalInt(1, nOf(yaml.get(docs.at(0), "a")));
+    assert.equalInt(2, nOf(yaml.get(docs.at(1), "b")));
+}
