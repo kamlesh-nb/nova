@@ -244,8 +244,9 @@ pub fn processClientHello(self: TlsServer, ch: ptr, chLen: int): void {
     // constrained to the cipher the PSK/ticket was issued under; `kind` (SHA-256 vs SHA-384) alone does not
     // disambiguate AES-128-GCM from ChaCha20-Poly1305 (both SHA-256), so a free server preference could pick
     // a different AEAD than the resuming client expects. So: for a RESUMPTION use the client's first-offered
-    // suite (what the resume path is built around); for a FRESH handshake prefer ChaCha20-Poly1305, because
-    // this stack's AES is bitsliced constant-time (no AES-NI) and runs ~10x slower (~2 vs ~19 MB/s measured).
+    // suite (what the resume path is built around); for a FRESH handshake prefer AES-GCM when the host has
+    // hardware AES (measured ~4.7 GB/s AES-256-GCM vs ~0.74 GB/s ChaCha20-Poly1305 on Apple Silicon), and
+    // fall back to ChaCha20-Poly1305 only on software-only hosts. The HW-aware branch is just below.
     let extP0 = p + 2 + cipherLen;
     let compLen0 = bytes.read_byte(ch, extP0);
     let exx = extP0 + 1 + compLen0;
