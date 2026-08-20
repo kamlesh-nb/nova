@@ -1,0 +1,45 @@
+// List.sort / sortBy are O(n log n) in-place heapsort (was insertion sort, O(n^2)). Verified on a large
+// shuffled list and a REVERSE-sorted worst case (insertion sort's O(n^2) path). Heapsort swaps via the new
+// ARC-neutral RawBuffer.swap (raw byte swap, no retain/drop), so no element is double-freed.
+// NB: sorting a List of OWNED REFERENCES (List<string>) with a comparator hits a SEPARATE pre-existing
+// compiler crash (the old insertion sort crashed identically) -- tracked in the worklist, orthogonal to the
+// complexity fix -- so this case exercises scalar element types.
+import list;
+import assert;
+fn cmpInt(a: int, b: int): int { return a - b; }
+fn desc(a: int, b: int): int { return b - a; }
+fn ident(x: int): int { return x; }
+@test
+fn sorts_large_shuffled(): void {
+    let l = List<int>();
+    let i = 0;
+    while (i < 1000) { l.push((i * 7919 + 13) % 1000); i = i + 1; }
+    l.sort(cmpInt);
+    let ok = true;
+    let j = 1;
+    while (j < l.size()) { if ((l.at(j - 1)) > (l.at(j))) { ok = false; } j = j + 1; }
+    assert.isTrue(ok);
+    assert.equalInt(l.size(), 1000);
+}
+@test
+fn sorts_reverse_worst_case(): void {
+    let l = List<int>();
+    let i = 2000;
+    while (i > 0) { l.push(i); i = i - 1; }   // 2000..1, the O(n^2) worst case for insertion sort
+    l.sort(cmpInt);
+    assert.equalInt(l.at(0), 1);
+    assert.equalInt(l.at(1999), 2000);
+}
+@test
+fn sort_descending_and_sortby(): void {
+    let l = List<int>();
+    l.push(3); l.push(1); l.push(4); l.push(1); l.push(5); l.push(9); l.push(2);
+    l.sort(desc);
+    assert.equalInt(l.at(0), 9);
+    assert.equalInt(l.at(6), 1);
+    let m = List<int>();
+    m.push(5); m.push(2); m.push(8); m.push(1);
+    m.sortBy(ident);
+    assert.equalInt(m.at(0), 1);
+    assert.equalInt(m.at(3), 8);
+}

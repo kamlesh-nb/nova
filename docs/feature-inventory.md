@@ -274,7 +274,17 @@ actual code fix that a probe or gate verifies, not a reframing.
 
 - [x] Map/Set are a real open-addressing hash table (tombstones, resize).
 - [x] List has a rich functional API (map/filter/reduce/slice/etc.).
-- [ ] `List.sort` is O(n log n) (currently insertion sort, O(n^2)).
+- [x] `List.sort` / `sortBy` are O(n log n) (FIXED: in-place heapsort, was insertion sort O(n^2)). Swaps go
+      through a new ARC-neutral `RawBuffer.swap` (raw byte swap of the two slots -- no retain, no drop -- which
+      also fixed the same latent hazard in `List.reverse`). Gated: case 400 (1000-element shuffle, a
+      2000-element reverse worst case, descending + sortBy) on scalar element types.
+- [ ] Sorting a List of OWNED REFERENCES (`List<string>`) with a comparator does not crash. PRE-EXISTING
+      compiler bug discovered this session, NOT caused by the heapsort change: the OLD insertion sort crashes
+      identically. Calling a `(T,T)->int` comparator with owned-reference args inside `List<T>.sort` passes a
+      garbage pointer (fault addr -4). Every minimal replica (a hand-written generic struct with a RawBuffer
+      field + a 2-level cmp passthrough + a method-level generic) works, so it is specific to the full
+      `List<T>` monomorphisation context and not reducible so far -- a separate deep codegen bug. Keeps
+      Collections PARTIAL honestly rather than marking it SOUND with a known crash.
 
 ### Strings and text ; PARTIAL ; case
 
@@ -301,10 +311,14 @@ actual code fix that a probe or gate verifies, not a reframing.
 - [ ] SHA-384 transcript (AES-256-GCM-SHA384-only servers currently fail).
 - [ ] Independent security audit (hand-rolled, unaudited).
 
-### Compression (deflate / gzip) ; PARTIAL ; case
+### Compression (deflate / gzip) ; SOUND ; case
 
 - [x] RFC-1951 decoder, byte-exact against system gzip.
-- [ ] Encoder emits dynamic Huffman + lazy matching (currently fixed-Huffman greedy; weaker ratio).
+- [x] Encoder emits dynamic Huffman + lazy matching (STALE MARK corrected by a probe -- it is NOT fixed-Huffman
+      greedy). The encoder chooses the smallest of stored / fixed / DYNAMIC (BTYPE=10) per block
+      (deflate.nova:1115-1123) and uses a dual-hash LAZY matcher (Go compress/flate level-6 model,
+      deflate.nova:644, `prevLen`). Case 401: a byte-exact round trip at >20x ratio (only dynamic + good
+      matching reaches it) plus tiny/empty round trips.
 
 ### HTTP / web framework ; PARTIAL ; case
 

@@ -103,9 +103,7 @@ pub struct List<T> {
         let i = 0;
         let j = self.data.count() - 1;
         while (i < j) {
-            let tmp = self.data.at(i);
-            self.data.set(i, self.data.at(j));
-            self.data.set(j, tmp);
+            self.data.swap(i, j);   // ARC-neutral raw swap (a 3-`set` swap would UAF on owned elements)
             i = i + 1;
             j = j - 1;
         }
@@ -214,18 +212,37 @@ pub struct List<T> {
         return out;
     }
 
+    // Sift the element at `root` down a max-heap of size `n` so the subtree rooted there satisfies the heap
+    // property. Only SWAPS element handles (no temp buffer, no retain/release), so it is ARC-neutral: it just
+    // reorders the same set of owned pointers, which is what keeps heapsort safe where a merge-sort scratch
+    // List (whose drop would release aliased elements -> double-free) was not.
+    fn heapSiftDown(self: List<T>, root: int, n: int, cmp: (T, T) -> int): void {
+        let i = root;
+        while (true) {
+            let largest = i;
+            let left = 2 * i + 1;
+            let right = 2 * i + 2;
+            if (left < n && cmp(self.data.at(left), self.data.at(largest)) > 0) { largest = left; }
+            if (right < n && cmp(self.data.at(right), self.data.at(largest)) > 0) { largest = right; }
+            if (largest == i) { return; }
+            self.data.swap(i, largest);
+            i = largest;
+        }
+    }
+
+    // O(n log n) in-place heapsort (was insertion sort, O(n^2)). Not stable; the criterion is the complexity.
     pub fn sort(self: List<T>, cmp: (T, T) -> int): void {
         let n = self.data.count();
-        let i = 1;
-        while (i < n) {
-            let key = self.data.at(i);
-            let j = i - 1;
-            while (j >= 0 && cmp(self.data.at(j), key) > 0) {
-                self.data.set(j + 1, self.data.at(j));
-                j = j - 1;
-            }
-            self.data.set(j + 1, key);
-            i = i + 1;
+        if (n < 2) { return; }
+        // Build a max-heap bottom-up.
+        let start = n / 2 - 1;
+        while (start >= 0) { self.heapSiftDown(start, n, cmp); start = start - 1; }
+        // Repeatedly move the current max to the end of the unsorted region and re-heapify.
+        let end = n - 1;
+        while (end > 0) {
+            self.data.swap(0, end);
+            self.heapSiftDown(0, end, cmp);
+            end = end - 1;
         }
     }
 
@@ -328,19 +345,31 @@ pub struct List<T> {
         return out;
     }
 
+    fn heapSiftDownBy(self: List<T>, root: int, n: int, key: (T) -> int): void {
+        let i = root;
+        while (true) {
+            let largest = i;
+            let left = 2 * i + 1;
+            let right = 2 * i + 2;
+            if (left < n && key(self.data.at(left)) > key(self.data.at(largest))) { largest = left; }
+            if (right < n && key(self.data.at(right)) > key(self.data.at(largest))) { largest = right; }
+            if (largest == i) { return; }
+            self.data.swap(i, largest);
+            i = largest;
+        }
+    }
+
+    // O(n log n) in-place heapsort by an int key (was insertion sort, O(n^2)).
     pub fn sortBy(self: List<T>, key: (T) -> int): void {
         let n = self.data.count();
-        let i = 1;
-        while (i < n) {
-            let cur = self.data.at(i);
-            let ck = key(cur);
-            let j = i - 1;
-            while (j >= 0 && key(self.data.at(j)) > ck) {
-                self.data.set(j + 1, self.data.at(j));
-                j = j - 1;
-            }
-            self.data.set(j + 1, cur);
-            i = i + 1;
+        if (n < 2) { return; }
+        let start = n / 2 - 1;
+        while (start >= 0) { self.heapSiftDownBy(start, n, key); start = start - 1; }
+        let end = n - 1;
+        while (end > 0) {
+            self.data.swap(0, end);
+            self.heapSiftDownBy(0, end, key);
+            end = end - 1;
         }
     }
 }

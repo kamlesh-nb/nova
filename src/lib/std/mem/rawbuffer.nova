@@ -61,6 +61,22 @@ pub class RawBuffer<T> {
         witness.storeOver<T>(self.slot(i), value);
     }
 
+    // Exchange elements `i` and `j` by swapping their raw slot bytes (the element's full inline width). This
+    // is refcount-NEUTRAL: the element handles simply move between slots, with no retain and no drop -- which
+    // is what makes an in-place sort's swap safe, where a three-`set` swap would `storeOver`-DROP a handle
+    // still held in a temporary (a use-after-free on owned elements). Handles any element width via sizeOf<T>.
+    pub fn swap(self: RawBuffer<T>, i: int, j: int): void {
+        if (i == j) { return; }
+        let sz = witness.sizeOf<T>() as long;
+        let si = self.slot(i);
+        let sj = self.slot(j);
+        let tmp = bytes.alloc(sz as int);
+        bytes.copy(tmp, si, sz);
+        bytes.copy(si, sj, sz);
+        bytes.copy(sj, tmp, sz);
+        bytes.free(tmp);
+    }
+
     // Remove and return the last element (a MOVE: the caller takes the element's existing ownership,
     // the slot is vacated without a drop). undefined when empty.
     pub fn pop(self: RawBuffer<T>): T | undefined {
