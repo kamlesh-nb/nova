@@ -431,3 +431,58 @@ The best-proven parts of the platform are NovaDB durability/crash-recovery and r
 language's ARC + OSSA verifier. The least-proven are the orchestrator paths that are green only over an
 in-process simulation. When we work an item, "done" means every acceptance criterion for that feature is [x],
 with the stated test as the gate.
+
+## Execution plan (language stream first)
+
+The language stream is the priority. It is sequenced by dependency and risk: restore the verification tooling,
+bank the low-risk additive wins, do the soundness backbone, then the two hard representational refactors in the
+order that unblocks them, then the remaining completeness. Every phase uses the SAME gate: full corpus stays
+395/398 (only the 3 baseline failures), `--asan` clean, OSSA-hard stays 398/398, plus the feature's own
+acceptance criteria; anything that regresses is reverted. DB and orchestrator streams follow after the language
+is sound.
+
+**Phase 0 ; restore verification tooling (small, unblocks the rest).**
+- Fix the single-file `nova x -o out` build so a `List`-using program links (currently fails on `List.slice`
+  resolution against `~/.nova/std`). This is needed to build binaries and run the `leaks`/LSan detector for the
+  closure work, since `nova test` gives false-clean leak results. Gate: a List program builds and runs.
+
+**Phase 1 ; low-risk additive wins (build momentum; each independently gated).**
+- Generic-bound enforcement: at instantiation, reject a `T` that does not satisfy a declared `where T: Bound`.
+  Additive (only adds errors for genuinely-invalid programs), so a clean corpus does not regress. Add
+  `expect_fail` cases for an unsatisfied bound.
+- `Atomic<T>` runtime: wire `load`/`store`/`compareAndSwap`/`add`/`sub` to the runtime atomics (i32 first, then
+  i64), allocate the cell in `init`. Low blast radius (currently a stub nothing depends on).
+- Heterogeneous future combinator: a small `join`-style combinator over mixed-type futures.
+
+**Phase 2 ; the soundness backbone: fail-closed type checker.**
+- Convert the remaining `resolveExprType(...) orelse return` sites (condition, return, switch discriminant,
+  field access) from fail-open to fail-closed, ONE site at a time, gating the corpus after each so no valid
+  program is newly rejected. This also closes the switch-exhaustiveness untypeable-discriminant edge. Add
+  `expect_fail` cases for each newly-rejected shape.
+
+**Phase 3 ; function-value representation unification (prerequisite refactor).**
+- Box every function value uniformly as `{fn_ptr, env, cleanup}` (a bare function reference gets `env=0,
+  cleanup=0`), so all `.func` values share one representation and one call path. No ownership change yet; this
+  is purely making the representation uniform. Gate hard (closures are used across the corpus and the web
+  framework).
+
+**Phase 4 ; closure ARC (fixes the escaping-closure leak).**
+- On top of Phase 3: allocate the box via `nova_bytes_alloc` (ARC header) not persistent; a single generic box
+  destructor calls the box's cleanup (releasing captured owned values) and frees the env; mark `.func` owned so
+  the box is released at scope end and retained on escape. Gate: the built-binary leak test shows 0 leaks, plus
+  the standard gate including OSSA-hard (closures become owned, so the verifier must stay green).
+
+**Phase 5 ; value-optional representation + `??` present-zero.**
+- Box value-optionals (or carry a reliable narrowing-present signal into codegen) so a present 0 is
+  distinguishable from the absent sentinel. This is the representational fix the three site-local `??` guards
+  proved necessary. Gate: the narrow-then-coalesce-zero probe passes AND serde/DI/try cases stay green.
+
+**Phase 6 ; remaining completeness.**
+- Typed closure parameters; cross-module trait default methods; monomorphic (non-erased) generic-trait
+  dispatch; bounded async channel with backpressure and `select` over channels; actor supervision/restart;
+  io_uring multishot/SQPOLL; IOCP readiness cases 192/194/195.
+
+Ordering rationale: Phase 0 unblocks leak verification for Phase 4; Phase 3 is a hard prerequisite for Phase 4
+(owning `.func` before unifying the representation would crash on bare fn-refs); Phases 1 and 2 are independent
+and de-risk the schedule by landing real wins before the two big refactors (Phases 3-5). Each phase updates its
+inventory criteria to [x] as its gate passes.
