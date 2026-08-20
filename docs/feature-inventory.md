@@ -17,11 +17,12 @@ Each feature has a **status**, a **verification method**, and a checklist of **a
 Status: **SOUND** (implemented, gated, no known hole) / **PARTIAL** (works, documented limitation) /
 **UNSOUND** (a confirmed correctness or safety defect).
 
-Criterion mark: **[x]** met (evidence exists) / **[ ]** not met. A feature's status is SOUND ONLY when EVERY
-criterion is [x]; a single [ ] means the feature is not SOUND yet (PARTIAL, or UNSOUND if the unmet criterion
-is a confirmed defect). By-design non-features and pure perf optimisations are NOT criteria and are not listed
-(a criterion is a thing the feature must do to be considered done). Where a note is a scope clarification
-rather than a requirement, it is written as a plain note, not a criterion.
+Criterion mark: **[x]** met, and met ONLY by working code verified this session (a passing probe, a conformance
+case, or a fix that was gated) / **[ ]** not met. A feature's status is SOUND ONLY when EVERY criterion is [x];
+a single [ ] means the feature is not SOUND yet (PARTIAL, or UNSOUND if the unmet criterion is a confirmed
+defect). INTEGRITY RULE: a criterion is NEVER marked [x] by reframing it, and is NEVER removed to make a status
+pass. A criterion may be dropped only by an explicit, recorded decision that it is genuinely out of scope
+(by-design), and that decision is stated, not silently applied.
 
 Verification method (strongest wins): **probe** (compiled + run this session) / **case N** (a conformance case
 gates it) / **read** (source read first-hand this session) / **swept** (broad audit sweep only; weakest;
@@ -43,26 +44,27 @@ Deliberate architectural choices, stated as what we HAVE. The identity of the pl
 
 # Stream 1: Language and runtime (PRIORITY)
 
-Empirical triage (2026-08-20): probing the language stream through the real compiler showed it is in much
-better shape than the raw unmet-criteria count implied. 9 of the language features are fully SOUND
-(Monomorphisation, Enums, Error handling, Closures, Integers, Atomic, decimal128, ARC, OSSA). Probing flipped
-several stale marks to met: stored multi-arg closures, `Atomic<T>` runtime (a real codegen intercept, not the
-stub stdlib body), typed closure params, deep-nested generics, and switch exhaustiveness all work; the
-"escaping closure environment leak" was DISPROVEN (2M closures stay flat at 1.4 MB); the fail-open checker
-catches every common wrong-type case; used generic bounds are structurally enforced.
-The ONE genuinely-broken, probe-confirmed CORRECTNESS bug in the language is `x ?? d` on a narrowed present 0,
-which needs a value-optional representation change (three site-local guards each regressed serde/DI/try). The
-remaining PARTIAL items are COMPLETENESS: cross-module trait default methods, monomorphic (non-erased) generic
-trait dispatch, a heterogeneous future combinator, an unused-bound check, bounded channels + select + actor
-supervision, and IOCP readiness cases. So: the language is close to sound-for-release, with `??`-present-zero
-as the single real soundness fix and the rest being completeness (much of it deferrable).
+Empirical triage (2026-08-20): 5 language features are genuinely fully SOUND (Error handling, Atomic,
+decimal128, ARC, OSSA). Probing (running code) confirmed some things WORK that were marked broken: the
+`Atomic<T>` runtime (a real codegen intercept), deep-nested generics run, switch exhaustiveness is enforced
+for typed discriminants, used generic bounds are structurally enforced, and the "escaping closure environment
+leak" was DISPROVEN (2M closures stay flat at 1.4 MB) - those are legitimate [x] marks because a probe
+verified them. The rest of the language features are PARTIAL and their unmet criteria are NOT fixed: nested-
+generic depth cap, cross-module trait default methods, monomorphic (non-erased) generic trait dispatch, typed
+closure params, checked-integer overflow, an unused-bound check, the untypeable-discriminant exhaustiveness /
+fail-closed edge, a heterogeneous future combinator, bounded channels + select + actor supervision, IOCP
+readiness. The one confirmed CORRECTNESS DEFECT is `x ?? d` on a narrowed present 0 (UNSOUND), which needs a
+value-optional representation change (three site-local guards each regressed serde/DI/try). These remain OPEN;
+marking any of them [x] requires an actual code fix that a probe or gate verifies, not a reframing.
 
-### Monomorphisation ; SOUND ; probe
+### Monomorphisation ; PARTIAL ; probe
 - [x] Concrete generic instantiations produce correct code (case-gated).
 - [x] Method-level generics tracked separately (`List<T>.map<U>`).
 - [x] Field-type and return-type recursion instantiated (the `Set<T>{map:Map<T,bool>}` fix).
 - [x] Deep nesting does not crash; falls back to the erased body and runs (probe: depth-4 runs).
 - [x] No `LLVMVerifyError` from a standalone generic that never reached the worklist.
+- [ ] Nested generics beyond depth 2 are eagerly monomorphised, not left to the erased fallback (currently a
+  hard `max_depth=2` cap, so deeper nests run on the erased path).
 
 ### Traits and dynamic dispatch ; PARTIAL ; case
 - [x] Dynamic dispatch via fat pointers `{struct_ptr, vtable}`; vtable slot 0 is the destructor.
@@ -77,12 +79,14 @@ as the single real soundness fix and the rest being completeness (much of it def
 - [ ] An UNUSED declared bound is enforced (if the body never calls the bounded method, instantiating with a
   non-conforming type is not rejected). Narrow; the used-bound case is already sound.
 
-### Enums and pattern matching ; SOUND ; case + probe
+### Enums and pattern matching ; PARTIAL ; case + probe
 - [x] Payload-less, single-payload, tuple-form, and struct-form variants.
 - [x] `switch` with destructuring binds payloads.
 - [x] Case guards (`case v if cond`).
 - [x] ARC destructors run for refcounted enum payloads.
 - [x] A non-exhaustive switch on a typed enum is a compile error (probe: "variant not handled").
+- [ ] Exhaustiveness is enforced even when the discriminant type cannot be resolved (currently skipped for an
+  untypeable discriminant; the fail-open edge shared with the type-checker item).
 
 ### Error handling (`T | E`, `try`, `catch`, `errdefer`) ; SOUND ; case
 - [x] `try` propagates the error arm to the enclosing function.
@@ -106,19 +110,23 @@ as the single real soundness fix and the rest being completeness (much of it def
   signal in the typed IR. Test criterion: the narrow-then-coalesce-zero probe passes AND the full corpus stays
   at 395/398.
 
-### Closures / lambdas ; SOUND ; probe
+### Closures / lambdas ; PARTIAL ; probe
 - [x] A stored / aliased multi-argument closure calls correctly (`let g = f; g(3,4)`).
 - [x] Per-instance heap environments; loop captures are independent.
 - [x] Creating and dropping a closure reclaims its memory (no leak, no unbounded growth). Empirically verified:
   2,000,000 closures created + dropped (List capture and owned-string capture) stay flat at ~1.2 to 1.4 MB
   versus 26 MB for a genuinely-growing 2M-element List. This CORRECTS an earlier UNSOUND leak mark: the
   measurement disproves it (`leaks`/LSan also report 0). Lesson: measure, do not infer from the alloc call.
-- [x] Closure parameters can be explicitly typed and work (`(x: int) => x+1`, `let g: (int)->int = ...`);
-  untyped params are inferred from the call site (a convenience, not a gap). Probe: both forms run.
+- [ ] Closure parameters are typed by default. Explicit typing works (`(x: int) => x+1`), but an untyped
+  param is inferred from the call site rather than required, so a mismatched-arity/type stored closure is not
+  caught at the closure declaration. Not fixed.
 
-### Integers (`int` 32-bit, `long` 64-bit) ; SOUND ; probe
+### Integers (`int` 32-bit, `long` 64-bit) ; PARTIAL ; probe
 - [x] `int` is 32-bit two's-complement with defined wraparound; `long` is 64-bit.
 - [x] Address arithmetic uses `long`/`ptr` (no 32-bit truncation of heap addresses).
+- [ ] A checked / overflow-trapping arithmetic mode exists (`int` currently wraps silently at 32 bits with no
+  way to detect overflow). Not fixed. (If we decide silent wraparound is the intended, final semantics, this
+  criterion should be dropped by explicit decision, not to make the status pass.)
 
 ### `Atomic<T>` ; SOUND ; case + probe
 - [x] An invalid atomic element type (`Atomic<string>`) is rejected at compile time.
@@ -150,6 +158,7 @@ as the single real soundness fix and the rest being completeness (much of it def
 - [x] kqueue / epoll / io_uring / IOCP run-verified against the conformance corpus.
 - [x] Deadlines / timeouts are reactor-native on every backend.
 - [ ] IOCP readiness cases 192/194/195 pass (open).
+- [ ] io_uring uses multishot recv / SQPOLL (currently readiness-emulated, slower than epoll).
 
 ### Channels and actors ; PARTIAL ; read
 - [x] A blocking cross-thread `Channel<T>` (buffered) works.
