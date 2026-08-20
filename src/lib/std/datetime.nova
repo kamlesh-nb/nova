@@ -3,9 +3,9 @@ import bytes;
 import string;
 import assert;
 
-const SECONDS_PER_MINUTE = 60;
-const MINUTES_PER_HOUR = 60;
-const HOURS_PER_DAY = 24;
+const SECONDS_PER_MINUTE: long = 60;
+const MINUTES_PER_HOUR: long = 60;
+const HOURS_PER_DAY: long = 24;
 const SECONDS_PER_HOUR = SECONDS_PER_MINUTE * MINUTES_PER_HOUR;
 const SECONDS_PER_DAY = SECONDS_PER_HOUR * HOURS_PER_DAY;
 
@@ -39,23 +39,23 @@ pub fn daysInMonth(year: int, month: int): int {
     return dim;
 }
 
-pub fn now(): int {
-    return nova_time_now();
+pub fn now(): long {
+    return nowNs() / 1000000000;   // 64-bit seconds (was a 32-bit source; Year-2038 safe)
 }
 
 pub fn nowNs(): long {
     return nova_time_now_ns();
 }
 
-pub fn parse(s: string): int | undefined {
+pub fn parse(s: string): long | undefined {
     return parseIso(s);
 }
 
-pub fn fromIso(s: string): int | undefined {
+pub fn fromIso(s: string): long | undefined {
     return parseIso(s);
 }
 
-fn parseIso(s: string): int | undefined {
+fn parseIso(s: string): long | undefined {
     let len = s.length;
     if (len < 10) {
         return undefined;
@@ -119,9 +119,9 @@ fn parseIntRange(s: string, start: int, end: int): int | undefined {
     return res;
 }
 
-fn dateToTimestamp(year: int, month: int, day: int, hour: int, minute: int, second: int): int {
+fn dateToTimestamp(year: int, month: int, day: int, hour: int, minute: int, second: int): long {
 
-    let days = 0;
+    let days: long = 0;
     let y = 1970;
     while (y < year) {
         days = days + 365 + (if isLeapYear(y) then 1 else 0);
@@ -133,10 +133,10 @@ fn dateToTimestamp(year: int, month: int, day: int, hour: int, minute: int, seco
         m = m + 1;
     }
     days = days + (day - 1);
-    return days * SECONDS_PER_DAY + hour * SECONDS_PER_HOUR + minute * SECONDS_PER_MINUTE + second;
+    return days * SECONDS_PER_DAY + (hour as long) * SECONDS_PER_HOUR + (minute as long) * SECONDS_PER_MINUTE + (second as long);
 }
 
-pub fn format(t: int, fmt: string): string {
+pub fn format(t: long, fmt: string): string {
     let (year, month, day, hour, minute, second) = timestampToDate(t);
 
     let result = bytes.alloc(fmt.length * 4 + 1);
@@ -301,17 +301,17 @@ fn writeNumber(ptr: int, offset: int, val: int, min_digits: int): int {
     return total;
 }
 
-fn timestampToDate(t: int): (int, int, int, int, int, int) {
-    let total_sec = t;
-    let second = total_sec % SECONDS_PER_MINUTE;
+fn timestampToDate(t: long): (int, int, int, int, int, int) {
+    let total_sec: long = t;
+    let second = (total_sec % SECONDS_PER_MINUTE) as int;
     let total_min = total_sec / SECONDS_PER_MINUTE;
-    let minute = total_min % MINUTES_PER_HOUR;
+    let minute = (total_min % MINUTES_PER_HOUR) as int;
     let total_hour = total_min / MINUTES_PER_HOUR;
-    let hour = total_hour % HOURS_PER_DAY;
+    let hour = (total_hour % HOURS_PER_DAY) as int;
     let total_day = total_hour / HOURS_PER_DAY;
 
     let year = 1970;
-    let days = total_day;
+    let days: long = total_day;
     while (true) {
         let days_in_year = 365 + (if isLeapYear(year) then 1 else 0);
         if (days < days_in_year) {
@@ -330,32 +330,32 @@ fn timestampToDate(t: int): (int, int, int, int, int, int) {
         days = days - dim;
         month = month + 1;
     }
-    let day = days + 1;
+    let day = (days + 1) as int;
 
     return (year, month, day, hour, minute, second);
 }
 
-pub fn toIso(t: int): string {
+pub fn toIso(t: long): string {
     return format(t, "YYYY-MM-DDThh:mm:ssTZD");
 }
 
-pub fn addDays(t: int, days: int): int {
+pub fn addDays(t: long, days: int): long {
     return t + days * SECONDS_PER_DAY;
 }
 
-pub fn addHours(t: int, hours: int): int {
+pub fn addHours(t: long, hours: int): long {
     return t + hours * SECONDS_PER_HOUR;
 }
 
-pub fn addMinutes(t: int, minutes: int): int {
+pub fn addMinutes(t: long, minutes: int): long {
     return t + minutes * SECONDS_PER_MINUTE;
 }
 
-pub fn addSeconds(t: int, seconds: int): int {
+pub fn addSeconds(t: long, seconds: int): long {
     return t + seconds;
 }
 
-pub fn dateDiff(t1: int, t2: int): Duration {
+pub fn dateDiff(t1: long, t2: long): Duration {
     let total_sec = t2 - t1;
     if (total_sec < 0) {
         total_sec = -total_sec;
@@ -421,7 +421,7 @@ pub fn tzOffsetSeconds(s: string): int | undefined {
 
 // Parse an RFC-3339 timestamp to a true UTC epoch, honoring its zone suffix: the parsed wall-clock is
 // shifted back by the offset (a +05:00 local time is 5h earlier in UTC).
-pub fn fromIsoUtc(s: string): int | undefined {
+pub fn fromIsoUtc(s: string): long | undefined {
     let wall = parseIso(s);
     if (wall == undefined) { return undefined; }
     let off = tzOffsetSeconds(s);
@@ -431,7 +431,7 @@ pub fn fromIsoUtc(s: string): int | undefined {
 
 // Format a UTC epoch as RFC-3339 in a fixed offset (seconds east of UTC): the displayed wall-clock is
 // shifted forward by the offset and a "+HH:MM"/"-HH:MM" (or "Z" for 0) suffix is appended.
-pub fn formatOffset(t: int, offsetSeconds: int): string {
+pub fn formatOffset(t: long, offsetSeconds: int): string {
     let local = t + offsetSeconds;
     let base = format(local, "YYYY-MM-DDThh:mm:ss");
     if (offsetSeconds == 0) { return base + "Z"; }
