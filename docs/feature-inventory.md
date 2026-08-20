@@ -198,14 +198,19 @@ actual code fix that a probe or gate verifies, not a reframing.
 - [x] Optional/error assigned or passed where a plain value is required is rejected (probe: both error).
 - [x] Return-type mismatch is rejected (probe: returning a string from an int fn errors).
 - [ ] Every checked position fails closed for a genuinely-untypeable expression (the remaining
-      `resolveExprType(...) orelse return` sites). Not shown exploitable (such expressions normally error
-      earlier), so it is defence-in-depth, not a live bug. BLOCKED, measured this session: flipping the
-      condition site (`checkBoolCondition`) to fail-closed regressed 350 corpus cases -- even the harness's own
-      `compiles-and-runs.nova` was falsely rejected at type-check -- because `resolveExprType` is intentionally
-      INCOMPLETE (returns null for many VALID expressions: comparisons, `.index`, and the whole `else => null`
-      tail). The fail-open `orelse` is the safety net for that incompleteness. This criterion therefore cannot
-      be met by flipping; it requires COMPLETING `resolveExprType` first (the typed-IR-accuracy work, task #174)
-      so that null occurs only for genuinely-invalid expressions. Left [ ] honestly rather than forced.
+      `resolveExprType(...) orelse return` sites). Defence-in-depth, not a live bug. BLOCKED on resolver
+      completeness (#174); PROGRESS + precise diagnosis this session:
+      - Resolver step 1 DONE (committed): `resolveExprType` now handles `.unary` (`!` -> bool, `-`/`~` ->
+        numeric), `.index` (List/Map/array element, string -> int), and `.tuple`. Net-positive -- it also
+        EXPOSED and fixed a real latent stdlib bug (`net/eventedio` returned a bare `-1` where a `ReactorStream`
+        was declared). Corpus stayed 406/409.
+      - Flipping the condition site to fail-closed STILL regresses ~all cases (351). Diagnosed: it is NOT the
+        case bodies (even `00_smoke`'s `i < 5` resolves to bool). The dominant residual cause is a handful of
+        `.call`-kind conditions in the STDLIB (imported by every case) whose method-call RETURN TYPE the
+        resolver cannot determine -- resolving those needs the receiver-type cascade (a value's type ->
+        its method's declared return), which is exactly the deep typed-IR-accuracy work of #174. So the flip
+        breaks the stdlib and fans out to all cases. Kept [ ] honestly; the path forward is `.call`/method
+        return-type resolution, tracked under #174.
 
 ### async / await ; SOUND ; case
 
