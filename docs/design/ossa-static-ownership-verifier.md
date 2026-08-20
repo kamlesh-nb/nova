@@ -27,13 +27,31 @@ NONE in the default pipeline:
   use-after-consume / path-imbalance), non-vacuous (unit-tested on broken IR). SILGen (`lower.zig`) DEFERS
   complex CFG / untyped inits; loops (back-edges) are DEFERRED (reported, never a false positive).
 
-## KEY FINDING (immediate value, not just soundness)
+## CORRECTED FINDING (Slice 1 done, 2026-08-20) — the V4' accusations were ALL false positives
 
-`NOVA_OWN_VERIFY=hard` accuses **3 of 8 sampled known-correct cases** — `33_error_union`, `271_runtime_
-mediator`, `99_serde_struct_decimal` — 1-2 imbalances each. These are the SAME shapes the memory notes flag
-as leak-prone (the mediator per-request `Rows` leak, serde leaks). Each accusation is either a REAL codegen
-leak/double-free that ASAN misses (a "still reachable at exit" leak) OR a gap in the verifier's acquire/
-release model. Triaging them is immediate leak-finding value.
+Initial hypothesis (that the V4' `hard`-mode accusations might be real leaks) was WRONG and is retracted.
+Triage with ARC-audit as ground truth: `33_error_union` / `test_int_payload_round_trips`, `57_mediator_
+discovery` / `ServiceProvider_require`, `37_serde_composite_source` / `serde_yaml_stringifyIndent` — all
+ARC-audit CLEAN (every object released), ASAN clean. The V4' `verifyArcBalance` is NON-PATH-SENSITIVE: it
+sums TOTAL acquires vs TOTAL releases, so a value stored in two exclusive branches and released once at the
+merge shows a spurious imbalance. A partial corpus scan found 45+ accused cases dominated by two heavily-used
+correct functions (`serde_yaml_stringifyIndent` ×24, `ServiceProvider_require` ×17). **V4' found ZERO real
+leaks.** The path-sensitive OSSA verifier (`NOVA_OSSA`) passes all of them (census: 340 cases, **0
+imbalanced**).
+
+**Slice 1 fix (committed):** demoted the broken V4' balance verifier to a report (never fails the build) and
+routed `NOVA_OWN_VERIFY=hard` to the SOUND path-sensitive OSSA verifier + the sound use-after-move check.
+Gate: full corpus under `NOVA_OWN_VERIFY=hard` = 394/397 (only the 3 pre-existing crashes 118/189/42) -> **0
+false accusations across all 394 correct cases**.
+
+## What this verifier IS (honest boundary, restated)
+
+In Nova, ARC is AUTOMATIC — a user cannot create a leak/double-free through ownership mistakes (codegen
+inserts retain/release). So this is NOT a Rust-style borrow checker over USER code; it is a **codegen
+ARC-balance self-verifier**: it proves the COMPILER's own ARC insertion is balanced (no compiler-introduced
+leaks/double-frees) for covered functions. Default-on, it would catch codegen regressions like the P1 UAF at
+COMPILE time instead of via ASAN. Valuable, but a compiler-correctness guarantee, NOT Rust's user-code
+guarantee. Do not conflate the two.
 
 ## Honest boundary (what this proves vs Rust's borrow checker)
 

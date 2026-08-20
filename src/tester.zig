@@ -326,12 +326,17 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
     // OSSA-lite Track V: opt-in ownership verifier. See docs/design/ossa-lite-tasks.md.
     // Drives both the sema-level coverage report and the codegen ARC release-balance verifier (V4').
     if (init.environ_map.get("NOVA_OWN_VERIFY")) |v| {
-        sema_ownership.runVerify(allocator, &owned_sema.store, &owned_sema.ir, &program, std.mem.eql(u8, v, "hard"));
+        const hard = std.mem.eql(u8, v, "hard");
+        sema_ownership.runVerify(allocator, &owned_sema.store, &owned_sema.ir, &program, hard);
+        // V4' balance verifier is non-path-sensitive (superseded by the OSSA verifier); report only, never
+        // fails. See builder.zig for the rationale + the corpus census.
         codegen_arc.balance_verify = true;
-        codegen_arc.balance_hard = std.mem.eql(u8, v, "hard");
+        codegen_arc.balance_hard = false;
+        // Sound, path-sensitive ownership/ARC-balance gate (0 false positives corpus-wide).
+        sema_ossa_lower.report(allocator, &owned_sema.store, &owned_sema.ir, &program, hard);
     }
 
-    // OSSA-lite Track I: lower + verify. NOVA_OSSA=1 reports; NOVA_OSSA=hard also fails on an imbalance.
+    // OSSA-lite Track I: the same sound verifier under its own flag (report / hard).
     if (init.environ_map.get("NOVA_OSSA")) |v| {
         sema_ossa_lower.report(allocator, &owned_sema.store, &owned_sema.ir, &program, std.mem.eql(u8, v, "hard"));
     }

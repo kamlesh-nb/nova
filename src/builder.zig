@@ -221,14 +221,22 @@ fn compileProgram(
     // Drives BOTH the sema-level owned-local coverage report AND the real codegen-level
     // ARC release-balance verifier (V4', set below and run inside declarations.zig).
     if (init.environ_map.get("NOVA_OWN_VERIFY")) |v| {
-        sema_ownership.runVerify(allocator, &owned_sema.store, &owned_sema.ir, &program, std.mem.eql(u8, v, "hard"));
+        const hard = std.mem.eql(u8, v, "hard");
+        // Sound use-after-move gate (owned let-locals).
+        sema_ownership.runVerify(allocator, &owned_sema.store, &owned_sema.ir, &program, hard);
+        // The V4' codegen balance verifier is NON-PATH-SENSITIVE (it counts total acquires vs total
+        // releases, so a value stored in two exclusive branches and released once at the merge shows a
+        // spurious imbalance). It is SUPERSEDED by the path-sensitive OSSA verifier below and kept only as
+        // an informational report -- it NEVER fails the build (verified false-positive on serde/DI/error-
+        // union across the corpus while ARC-audit is clean).
         codegen_arc.balance_verify = true;
-        codegen_arc.balance_hard = std.mem.eql(u8, v, "hard");
+        codegen_arc.balance_hard = false;
+        // Sound, path-sensitive ownership/ARC-balance gate. 0 false positives across the corpus (census
+        // 2026-08-20: 340 cases, 0 imbalanced); it DEFERS what it cannot yet prove rather than accuse.
+        sema_ossa_lower.report(allocator, &owned_sema.store, &owned_sema.ir, &program, hard);
     }
 
-    // OSSA-lite Track I: lower functions into the ownership IR + run the release-balance verifier.
-    //   NOVA_OSSA=1     -> report only.
-    //   NOVA_OSSA=hard  -> also FAIL the build on a proven imbalance (the ownership gate).
+    // OSSA-lite Track I: the same sound verifier under its own flag (report / hard).
     if (init.environ_map.get("NOVA_OSSA")) |v| {
         sema_ossa_lower.report(allocator, &owned_sema.store, &owned_sema.ir, &program, std.mem.eql(u8, v, "hard"));
     }
