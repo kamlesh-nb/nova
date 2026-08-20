@@ -1,0 +1,8 @@
+// NEGATIVE test: must FAIL to compile. A stored/aliased closure called with the wrong number of arguments
+// is an error (previously the extra arg was silently ignored at runtime).
+@test
+fn t(): void {
+    let f = (x: int) => x + 1;
+    let g = f;
+    let r = g(3, 4);   // 1-param closure called with 2 args
+}

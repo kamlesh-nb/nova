@@ -1,0 +1,19 @@
+// Closure signatures are tracked so a stored/aliased closure call is arity- and type-checked. Valid calls
+// (correct arity, aliasing, untyped params that infer from context) must compile and run. The negative side
+// (arity/type mismatch) is expect_fail/closure_arity_mismatch.nova.
+import list;
+import assert;
+@test
+fn typed_and_aliased(): void {
+    let f = (x: int) => x + 1;
+    let g = f;                      // alias inherits f's signature
+    assert.equalInt(g(41), 42);     // correct arity + type
+}
+@test
+fn untyped_infers_from_context(): void {
+    let l = List<int>();
+    l.push(1); l.push(2);
+    let d = l.map((x) => x * 2);    // untyped param infers from the list element -> not rejected
+    assert.equalInt(d.get(0) ?? 0, 2);
+    assert.equalInt(d.get(1) ?? 0, 4);
+}

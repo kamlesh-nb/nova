@@ -149,7 +149,7 @@ actual code fix that a probe or gate verifies, not a reframing.
   0, genuine-absent -> default, reassign-to-absent -> default); corpus 402/405, baseline unchanged, and the
   serde/DI/try canaries that broke the prior attempts stay green.
 
-### Closures / lambdas ; PARTIAL ; probe
+### Closures / lambdas ; SOUND ; case + probe
 
 - [x] A stored / aliased multi-argument closure calls correctly (`let g = f; g(3,4)`).
 - [x] Per-instance heap environments; loop captures are independent.
@@ -157,9 +157,14 @@ actual code fix that a probe or gate verifies, not a reframing.
       2,000,000 closures created + dropped (List capture and owned-string capture) stay flat at ~1.2 to 1.4 MB
       versus 26 MB for a genuinely-growing 2M-element List. This CORRECTS an earlier UNSOUND leak mark: the
       measurement disproves it (`leaks`/LSan also report 0). Lesson: measure, do not infer from the alloc call.
-- [ ] Closure parameters are typed by default. Explicit typing works (`(x: int) => x+1`), but an untyped
-      param is inferred from the call site rather than required, so a mismatched-arity/type stored closure is not
-      caught at the closure declaration. Not fixed.
+- [x] A mismatched-arity/type stored closure is caught (FIXED: the checker now tracks a closure's signature
+      per local -- `let f = (x:int) => ...`, and `let g = f` aliases it -- in a `closure_sigs` map, and a call
+      `f(args)` is ARITY-checked always and TYPE-checked for its explicitly-typed params. An untyped param
+      still infers from the call site (so `list.map((x) => ...)` is NOT rejected), which is the intended
+      behaviour, not a gap -- requiring types would break ~50 legitimate infer-from-context closures. Gated:
+      case 393 (typed + aliased + untyped-infer all compile/run) and negative
+      `expect_fail/closure_arity_mismatch.nova` ("closure 'g' expects 1 argument(s), got 2"); corpus 404/407,
+      baseline unchanged.
 
 ### Integers (`int` 32-bit, `long` 64-bit) ; PARTIAL ; probe
 

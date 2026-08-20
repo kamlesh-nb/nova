@@ -130,6 +130,13 @@ pub const Diagnostic = struct {
     message: []const u8,
 };
 
+// The signature of a closure bound to a local name, so a call `f(args)` can be arity/type checked. An untyped
+// param carries a null type (it infers from the call site, e.g. `list.map((x) => ...)`), so only typed params
+// are type-checked; arity is always checked.
+const ClosureSig = struct {
+    param_types: []const ?ast.TypeRef,
+};
+
 pub const TypeChecker = struct {
     allocator: std.mem.Allocator,
     errors: std.ArrayList([]const u8),
@@ -141,6 +148,9 @@ pub const TypeChecker = struct {
     file_sources: *std.StringHashMap([]const u8),
     enums: std.StringHashMap(ast.EnumDecl),
     variables: std.StringHashMap(ast.TypeRef),
+    // Closure signatures for locals (`let f = (x:int) => ...`); `let g = f` copies the entry. Cleared per
+    // function alongside `variables`. Enables arity/type checking of `f(args)`.
+    closure_sigs: std.StringHashMap(ClosureSig),
     structs: std.StringHashMap(ast.StructDecl),
     // Struct names defined in MORE THAN ONE module (e.g. stdlib db.nova `Cursor` vs a driver's
     // `Cursor`). `structs` is a flat name->decl map (last writer wins), so it cannot tell which
@@ -177,6 +187,7 @@ pub const TypeChecker = struct {
             .file_sources = file_sources,
             .enums = std.StringHashMap(ast.EnumDecl).init(allocator),
             .variables = std.StringHashMap(ast.TypeRef).init(allocator),
+            .closure_sigs = std.StringHashMap(ClosureSig).init(allocator),
             .structs = std.StringHashMap(ast.StructDecl).init(allocator),
             .colliding_structs = std.StringHashMap(void).init(allocator),
             .colliding_enums = std.StringHashMap(void).init(allocator),
@@ -207,6 +218,7 @@ pub const TypeChecker = struct {
         self.structured.deinit(self.allocator);
         self.enums.deinit();
         self.variables.deinit();
+        self.closure_sigs.deinit();
         self.structs.deinit();
         self.colliding_structs.deinit();
         self.colliding_enums.deinit();
@@ -444,6 +456,7 @@ pub const TypeChecker = struct {
     fn checkFunction(self: *TypeChecker, func: ast.FunctionDecl) anyerror!void {
         self.checkDuplicateTypeParams(func.name, func.type_params, func.span);
         self.variables.clearRetainingCapacity();
+            self.closure_sigs.clearRetainingCapacity();
 
         for (func.params) |param| {
             if (param.type_name) |t| {
@@ -774,6 +787,20 @@ pub const TypeChecker = struct {
                         try self.variables.put(ls.name, t);
                     }
                 }
+                // Track a closure signature for the bound name so a later `f(args)` is arity/type checked. A
+                // direct closure literal supplies its params; `let g = f` aliases f's signature. Only single-
+                // name lets (not tuple destructuring) bind a closure to one callable name.
+                if (ls.names == null) {
+                    if (ls.init) |init_expr| {
+                        if (init_expr.kind == .closure) {
+                            try self.closure_sigs.put(ls.name, .{ .param_types = init_expr.kind.closure.param_types });
+                        } else if (init_expr.kind == .ident) {
+                            if (self.closure_sigs.get(init_expr.kind.ident)) |sig| {
+                                try self.closure_sigs.put(ls.name, sig);
+                            }
+                        }
+                    }
+                }
             },
             .if_stmt => |is| {
                 try self.checkExpr(is.condition);
@@ -909,6 +936,26 @@ pub const TypeChecker = struct {
                             // the intent explicit with a downcast. Concrete -> trait widening stays allowed.
                             self.rejectNarrowingArgs(c.args, f.params);
                             self.checkArgTypes(c.args, f.params, c.span);
+                        }
+                    }
+
+                    // A call to a closure-bound local (`let f = (x:int) => ...; f(a)`): arity is always checked;
+                    // only explicitly-typed params are type-checked (an untyped param infers from the arg, e.g.
+                    // `list.map((x) => ...)`). This catches a mismatched-arity/type stored closure that used to
+                    // compile silently (the extra arg was ignored at runtime).
+                    if (self.closure_sigs.get(name)) |sig| {
+                        if (c.args.len != sig.param_types.len) {
+                            self.addError(c.span, "closure '{s}' expects {d} argument(s), got {d}", .{ name, sig.param_types.len, c.args.len });
+                        } else if (sig.param_types.len > 0) {
+                            const tmp = self.allocator.alloc(ast.Param, sig.param_types.len) catch null;
+                            if (tmp) |params| {
+                                defer self.allocator.free(params);
+                                for (sig.param_types, 0..) |pt, i| {
+                                    params[i] = .{ .name = "", .type_name = pt, .span = c.span };
+                                }
+                                self.checkArgTypes(c.args, params, c.span);
+                                self.rejectNarrowingArgs(c.args, params);
+                            }
                         }
                     }
 
@@ -1703,6 +1750,7 @@ pub const TypeChecker = struct {
         for (s.fields) |f| self.rejectUnimplementedType(f.type_name, f.span, s.type_params, true);
         for (s.methods) |m| {
             self.variables.clearRetainingCapacity();
+            self.closure_sigs.clearRetainingCapacity();
 
             try self.variables.put("self", ast.TypeRef{ .ident = s.name });
             for (m.decl.params) |param| {
@@ -1820,6 +1868,7 @@ pub const TypeChecker = struct {
 
         for (e.methods) |m| {
             self.variables.clearRetainingCapacity();
+            self.closure_sigs.clearRetainingCapacity();
             for (m.decl.params) |param| {
                 if (std.mem.eql(u8, param.name, "self")) {
                     const t = param.type_name orelse ast.TypeRef{ .ident = e.name };
