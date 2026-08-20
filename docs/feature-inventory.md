@@ -674,8 +674,10 @@ gate does not currently reproduce green on this checkout (see the two UNSOUND ro
 
 - [x] In-memory reference store with atomic CAS.
 - [x] Async `SqlConfigStore` code path over the `Connection` seam.
-- [ ] Its gating test builds and exercises the CAS revision guard (currently `185` does not build; the fake
-      ignored the guard anyway).
+- [x] Its gating test builds and exercises the CAS revision guard. FIXED (nova-orchestrator 6006bcb): `185`
+      now builds (FakeConn gained the missing `queryWire`) and the fake ENFORCES the `AND revision = $6` CAS
+      guard (it silently ignored it) + rejects duplicate-key INSERTs; the store's revision-churn-on-failed-CAS
+      bug it exposed is fixed too. All 8 tests in 185 pass.
 - [ ] Transactions on the seam are used (currently `begin/commit/rollback` never called).
 
 ### Isolation / sandbox / netns ; PARTIAL ; case
@@ -683,13 +685,19 @@ gate does not currently reproduce green on this checkout (see the two UNSOUND ro
 - [x] cgroups-v2 limits, namespaces, netns+veth recipe; honest no-op off Linux.
 - [x] Supervisor selects handoff / netns / sandbox / plain per spec; reports when limits are unavailable.
 - [ ] Live-verified on Linux (this host is macOS; only the no-op and command recipe are gated).
-- [ ] `applyLimits` checks write results (currently ignores them; silent downgrade on unprivileged Linux).
+- [x] `applyLimits` checks write results. FIXED (nova-orchestrator 14a7d39 + lang io/file `writeTextOk`,
+      67e3e8d): each cgroup limit write and the cgroup.procs attach is now checked; a rejected write (e.g.
+      unprivileged Linux) makes `applyLimits` return false instead of silently claiming "limits applied".
+      `writeTextOk` gated by lang case 413.
 
 ### Observability, backup, orchctl ; PARTIAL ; case
 
 - [x] `/healthz` `/readyz` `/metrics` renderers and alerts (pure-data path gated).
 - [x] Logical backup/restore and offline `orchctl inspect/members/upgrade-plan`.
-- [ ] Output escaping in health/metrics/backup (a tab or newline in a value corrupts the dump).
+- [x] Output escaping in health/metrics/backup. FIXED (nova-orchestrator 05ee035): backup dump/restore
+      escapes `\`/TAB/LF (`\\`/`\t`/`\n`) so an embedded tab or newline no longer corrupts the line format
+      (round-trips exactly); `renderMetrics` escapes `\`/`"`/LF in the Prometheus `{workload="..."}` label.
+      Gated in 199 (a value with newline+tab+backslash round-trips; a quoted workload name is escaped).
 - [ ] `192`/`193` observability tests run to completion (currently crash on this host).
 
 ---
