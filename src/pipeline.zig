@@ -579,6 +579,23 @@ pub fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocat
         current_len = last_slash;
     }
 
+    // Final importer-relative step: the CWD (the project/package root being built). The walk above stops
+    // at the importer's own directory chain, which for a relative importer like `tests/foo.nova` breaks at
+    // `tests/` (no parent slash) and never reaches the package root's `src/`, and for a bare importer like
+    // `foo.nova` never runs at all (empty dir). In both cases the importer's OWN package root is the CWD, so
+    // check `./<mod>.nova` and `./src/<mod>.nova` here -- BEFORE the global scans below. This makes a
+    // package's own module win over a same-named module in a SIBLING package or a stale ~/.nova/cache entry
+    // (observed: mssql's `import connection` binding to nova-postgres's connection.nova, whose
+    // ConnectionOptions lacks `encrypt`/`trustCert` -> FieldNotFound). These candidates only WIN when the
+    // local file actually exists, so a package-managed app with no local file falls through to the version
+    // resolution and package scans exactly as before.
+    {
+        const cwd_candidate = try std.fmt.allocPrint(allocator, "{s}.nova", .{module_name});
+        if (existingSource(cwd_candidate, allocator, io)) |hit| return hit;
+        const cwd_src = try std.fmt.allocPrint(allocator, "src/{s}.nova", .{module_name});
+        if (existingSource(cwd_src, allocator, io)) |hit| return hit;
+    }
+
     // Version-aware resolution (pkg-manager.md §6): when a lockfile exists, `import X` binds through the
     // owning package's manifest + the flat lock to a version-keyed cache dir. Wins over the legacy scans
     // so a package-managed app gets the EXACT pinned version (and multi-version coexistence). Inert (null)
