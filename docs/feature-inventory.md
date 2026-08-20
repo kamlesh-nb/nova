@@ -207,12 +207,16 @@ actual code fix that a probe or gate verifies, not a reframing.
       be met by flipping; it requires COMPLETING `resolveExprType` first (the typed-IR-accuracy work, task #174)
       so that null occurs only for genuinely-invalid expressions. Left [ ] honestly rather than forced.
 
-### async / await ; PARTIAL ; case
+### async / await ; SOUND ; case
 
 - [x] `async fn` compiles to an LLVM coroutine; `spawn` returns a future; `await` joins.
 - [x] Function colouring enforced (`await`/`spawn` only inside `async fn`).
 - [x] `when_all` / `select` over a homogeneous future list.
-- [ ] Heterogeneous-type combinator (`join!`-style) (only homogeneous `List<future<T>>` today).
+- [x] Heterogeneous-type combinator (`join!`-style) (ADDED: `async_util.join2<A,B>` / `join3<A,B,C>` await
+      futures of DIFFERENT types together and return a tuple, each result keeping its own type -- `let (a, b)
+      = await join2<A,B>(spawn fa(), spawn fb())`. Pure stdlib (generic async + tuple return, no codegen
+      change). Gated: case 395 (join2 `(int,string)` and join3 `(int,string,int)` return correct typed values);
+      corpus baseline unchanged, only the 3 known failures).
 
 ### Reactor (kqueue / epoll / io_uring / IOCP) ; PARTIAL ; case
 

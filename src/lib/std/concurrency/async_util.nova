@@ -61,6 +61,24 @@ pub async fn when_all<T>(fs: List<future<T>>): List<T> {
     return out;
 }
 
+// HETEROGENEOUS join (the `join!`-style combinator): await two or three futures of DIFFERENT types and
+// return their results as a tuple. `when_all` only handles a homogeneous `List<future<T>>`; these let you
+// await `future<A>` and `future<B>` together and keep each result's own type. Spawn the tasks first, then
+// join, e.g. `let (a, b) = await join2<A, B>(spawn fa(), spawn fb());`. Instantiate at concrete type args so
+// the generic async coroutine schedules (a bare erased-arg call would fall to the handle path).
+pub async fn join2<A, B>(fa: future<A>, fb: future<B>): (A, B) {
+    let a = await fa;
+    let b = await fb;
+    return (a, b);
+}
+
+pub async fn join3<A, B, C>(fa: future<A>, fb: future<B>, fc: future<C>): (A, B, C) {
+    let a = await fa;
+    let b = await fb;
+    let c = await fc;
+    return (a, b, c);
+}
+
 pub async fn wait_all<T>(fs: List<future<T>>): int {
     let i = 0;
     while (i < fs.size()) {
