@@ -328,6 +328,47 @@ test "loop-header phi: outer local reassigned each iteration, unified by a heade
     try testing.expect(r.complete);
 }
 
+test "N-input phi (switch-style): three cases each reassign the same local, unified at the join" {
+    // entry: x0; switch_br -> c1, c2, default
+    // c1: destroy x0; x1=make_owned; br join
+    // c2: destroy x0; x2=make_owned; br join
+    // default: destroy x0; x3=make_owned; br join
+    // join: phi r = [c1:x1, c2:x2, default:x3]; destroy r; ret_void
+    const gpa = testing.allocator;
+    var f = ir.Func{ .name = "switch_phi" };
+    defer f.deinit(gpa);
+    const e = try f.newBlock(gpa);
+    const c1 = try f.newBlock(gpa);
+    const c2 = try f.newBlock(gpa);
+    const def = try f.newBlock(gpa);
+    const join = try f.newBlock(gpa);
+
+    const x0 = try f.makeOwned(gpa, e, null);
+    const cases = try gpa.dupe(ir.Block, &.{ c1, c2 });
+    f.setTerm(e, .{ .switch_br = .{ .cases = cases, .default_blk = def } });
+
+    try f.destroy(gpa, c1, x0);
+    const x1 = try f.makeOwned(gpa, c1, null);
+    f.setTerm(c1, .{ .br = join });
+    try f.destroy(gpa, c2, x0);
+    const x2 = try f.makeOwned(gpa, c2, null);
+    f.setTerm(c2, .{ .br = join });
+    try f.destroy(gpa, def, x0);
+    const x3 = try f.makeOwned(gpa, def, null);
+    f.setTerm(def, .{ .br = join });
+
+    const r = try f.addPhi(gpa, join, &.{
+        .{ .pred = c1, .value = x1 }, .{ .pred = c2, .value = x2 }, .{ .pred = def, .value = x3 },
+    }, null);
+    try f.destroy(gpa, join, r);
+    f.setTerm(join, .ret_void);
+
+    var res = try verify(gpa, &f);
+    defer res.deinit(gpa);
+    try testing.expect(res.ok());
+    try testing.expect(res.complete);
+}
+
 test "phi join: forgetting to consume the phi result is a leak" {
     const gpa = testing.allocator;
     var f = ir.Func{ .name = "phi_leak" };

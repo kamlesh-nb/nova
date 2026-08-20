@@ -55,9 +55,23 @@ const Locals = std.ArrayListUnmanaged(Local);
 /// Why a function was deferred (for the NOVA_OSSA report's coverage-gap breakdown).
 pub const DeferReason = enum { reassign, break_continue, switch_guard, nonblock_branch, other };
 
+/// One incoming edge to a loop's header (a `continue`) or exit (a `break`): the source block and a snapshot
+/// of the loop's phi-tracked outer locals' values at that point (parallel to `LoopCtx.phi_locals`).
+const PhiEdge = struct { block: ir.Block, values: []ir.Value };
+
 /// The innermost enclosing loop, for lowering `break`/`continue`. `body_mark` is the locals count at the
 /// loop body's entry, so break/continue know which locals to drop (everything declared in the body).
-const LoopCtx = struct { header: ir.Block, exit: ir.Block, body_mark: usize };
+/// When the loop body reassigns outer locals (`phi_locals` non-empty), each `continue` feeds the header
+/// phi and each `break` feeds the exit phi — the handlers snapshot the tracked values into these lists,
+/// which lowerLoop drains to complete the phis after the body is lowered.
+const LoopCtx = struct {
+    header: ir.Block,
+    exit: ir.Block,
+    body_mark: usize,
+    phi_locals: []const usize = &.{},
+    continue_edges: ?*std.ArrayListUnmanaged(PhiEdge) = null,
+    break_edges: ?*std.ArrayListUnmanaged(PhiEdge) = null,
+};
 
 const Ctx = struct {
     gpa: std.mem.Allocator,
@@ -196,12 +210,18 @@ fn lowerSeq(ctx: *Ctx, block: ir.Block, stmts: []const ast.Statement, locals: *L
             },
             .break_stmt => {
                 const lp = ctx.loop orelse return deferBecause(ctx, .break_continue);
+                // Record this break's outer-local values for the EXIT phi (before dropScope — the phi
+                // locals are outer, below body_mark, so dropScope does not touch them, but snapshot first
+                // for clarity). Then drop the body scope and branch to exit.
+                if (lp.break_edges) |edges| try recordPhiEdge(ctx, edges, cur, lp.phi_locals, locals);
                 try dropScope(ctx, cur, locals, lp.body_mark); // exit the loop scope
                 ctx.f.setTerm(cur, .{ .br = lp.exit });
                 return .terminated;
             },
             .continue_stmt => {
                 const lp = ctx.loop orelse return deferBecause(ctx, .break_continue);
+                // Record this continue's outer-local values for the HEADER phi, then end this iteration.
+                if (lp.continue_edges) |edges| try recordPhiEdge(ctx, edges, cur, lp.phi_locals, locals);
                 try dropScope(ctx, cur, locals, lp.body_mark); // end this iteration's scope
                 ctx.f.setTerm(cur, .{ .br = lp.header }); // back-edge
                 return .terminated;
@@ -335,13 +355,25 @@ fn reconcileJoin(ctx: *Ctx, join_block: ir.Block, locals: *Locals, n_outer: usiz
             locals.items[i].live = true;
             continue;
         }
-        // Differing owned values across paths: unify with a phi.
-        var inputs: [2]ir.PhiInput = undefined;
+        // Differing owned values across paths: unify with an N-input phi (N = number of joining preds:
+        // 2 for an if, up to cases+default for a switch).
+        const inputs = try ctx.gpa.alloc(ir.PhiInput, preds.len);
+        defer ctx.gpa.free(inputs); // addPhi dupes it
         for (preds, 0..) |p, k| inputs[k] = .{ .pred = p.block, .value = p.vals[i].value };
-        const result = try ctx.f.addPhi(ctx.gpa, join_block, inputs[0..preds.len], null);
+        const result = try ctx.f.addPhi(ctx.gpa, join_block, inputs, null);
         locals.items[i].value = result;
         locals.items[i].live = true;
     }
+}
+
+/// Snapshot the current values of a loop's phi-tracked outer locals at a break/continue site and append
+/// them as an incoming edge (owns the `values` slice; freed by lowerLoop after the phis are built).
+fn recordPhiEdge(ctx: *Ctx, edges: *std.ArrayListUnmanaged(PhiEdge), block: ir.Block, phi_locals: []const usize, locals: *Locals) !void {
+    if (phi_locals.len == 0) return;
+    const values = try ctx.gpa.alloc(ir.Value, phi_locals.len);
+    errdefer ctx.gpa.free(values);
+    for (phi_locals, 0..) |li, k| values[k] = locals.items[li].value;
+    try edges.append(ctx.gpa, .{ .block = block, .values = values });
 }
 
 fn addUnique(out: *std.ArrayListUnmanaged(usize), v: usize, gpa: std.mem.Allocator) !void {
@@ -377,27 +409,6 @@ fn collectReassignedOuter(gpa: std.mem.Allocator, stmts: []const ast.Statement, 
     };
 }
 
-/// True if `stmts` contains a break/continue targeting THIS loop — i.e. not inside a NESTED loop (those
-/// target the nested loop). We DO descend into ifs/blocks/switches (a break there targets this loop). Used
-/// to gate the loop-header-phi path to the single-back-edge shape; a break/continue adds extra header/exit
-/// predecessors that the 2-input phi does not model, so those loops keep the sound defer.
-fn hasOwnBreakContinue(stmts: []const ast.Statement) bool {
-    for (stmts) |*s| switch (s.*) {
-        .break_stmt, .continue_stmt => return true,
-        .if_stmt => |iff| {
-            if (branchStmts(iff.then_branch)) |ts| if (hasOwnBreakContinue(ts)) return true;
-            if (iff.else_branch) |e| if (branchStmts(e)) |els| if (hasOwnBreakContinue(els)) return true;
-        },
-        .block => |b| if (hasOwnBreakContinue(b.statements)) return true,
-        .switch_stmt => |sw| {
-            for (sw.cases) |c| if (branchStmts(c.body)) |cs| if (hasOwnBreakContinue(cs)) return true;
-            if (sw.default_case) |d| if (branchStmts(d)) |ds| if (hasOwnBreakContinue(ds)) return true;
-        },
-        else => {}, // do NOT descend into while_stmt/for_stmt: their break/continue target themselves
-    };
-    return false;
-}
-
 /// The shared loop shape: entry -> header; header -cond-> body/exit; body -> header (back-edge). The
 /// body is its own lexical scope on a CLONE of `locals`, so it may declare its own owned locals (dropped
 /// at the end of each iteration) — which keeps the body-exit live set equal to the header entry set, the
@@ -415,33 +426,49 @@ fn lowerLoop(ctx: *Ctx, entry_block: ir.Block, body_stmts: []const ast.Statement
     const exit_block = try ctx.f.newBlock(ctx.gpa);
     ctx.f.setTerm(header, .{ .cond_br = .{ .cond = cond, .then_blk = body_block, .else_blk = exit_block } });
 
-    const saved = ctx.loop;
-    ctx.loop = .{ .header = header, .exit = exit_block, .body_mark = locals.items.len };
-    const saved_floor = ctx.clone_floor;
-
-    // Decide whether to model outer-local reassigns inside the body via a loop-header phi. This is sound
-    // only for the SINGLE-back-edge shape: no break/continue at this loop's level (a break/continue would
-    // add header/exit predecessors the 2-input phi does not carry). Anything else keeps the sound defer.
+    // Model outer-local reassigns in the body via phis. A loop header's predecessors are the pre-loop entry
+    // edge, the normal back-edge (body fall-through), and one back-edge per `continue`; the exit's are the
+    // header cond-false edge and one per `break`. We create a header phi per reassigned outer local now (so
+    // the body sees the loop-carried value), collect the continue/break contributions during lowering, and
+    // complete the header phis + build any exit phi afterward.
     const n_outer = locals.items.len;
     var reassigned = std.ArrayListUnmanaged(usize).empty;
     defer reassigned.deinit(ctx.gpa);
     try collectReassignedOuter(ctx.gpa, body_stmts, locals.items, n_outer, &reassigned);
-    const use_phi = reassigned.items.len > 0 and !hasOwnBreakContinue(body_stmts);
+    const use_phi = reassigned.items.len > 0;
 
+    var continue_edges = std.ArrayListUnmanaged(PhiEdge).empty;
+    var break_edges = std.ArrayListUnmanaged(PhiEdge).empty;
+    defer {
+        for (continue_edges.items) |e| ctx.gpa.free(e.values);
+        for (break_edges.items) |e| ctx.gpa.free(e.values);
+        continue_edges.deinit(ctx.gpa);
+        break_edges.deinit(ctx.gpa);
+    }
+
+    const x0s = try ctx.gpa.alloc(ir.Value, reassigned.items.len);
+    defer ctx.gpa.free(x0s);
     if (use_phi) {
-        // A header phi per reassigned outer local: entry input = pre-loop value, back-edge input patched
-        // after the body is lowered. The phi result is the loop-carried value the body sees AND the value
-        // that survives to the loop exit. phis are appended in `reassigned` order, so phi k is at index k.
-        for (reassigned.items) |i| {
-            const x0 = locals.items[i].value;
-            const placeholder = [_]ir.PhiInput{ .{ .pred = entry_block, .value = x0 }, .{ .pred = entry_block, .value = x0 } };
-            const r = try ctx.f.addPhi(ctx.gpa, header, &placeholder, null);
+        for (reassigned.items, 0..) |i, k| {
+            x0s[k] = locals.items[i].value; // the pre-loop value (this phi's entry input)
+            const placeholder = [_]ir.PhiInput{.{ .pred = entry_block, .value = x0s[k] }};
+            const r = try ctx.f.addPhi(ctx.gpa, header, &placeholder, null); // completed below; phi k at index k
             locals.items[i].value = r;
             locals.items[i].live = true;
         }
-    } else {
-        ctx.clone_floor = n_outer; // reassigns of outer locals inside the (discarded) body clone defer
     }
+
+    const saved = ctx.loop;
+    ctx.loop = .{
+        .header = header,
+        .exit = exit_block,
+        .body_mark = n_outer,
+        .phi_locals = reassigned.items,
+        .continue_edges = &continue_edges,
+        .break_edges = &break_edges,
+    };
+    const saved_floor = ctx.clone_floor;
+    if (!use_phi) ctx.clone_floor = n_outer; // no reassigns to model; keep the sound defer as a safety net
 
     var body_locals = try cloneLocals(ctx.gpa, locals);
     defer body_locals.deinit(ctx.gpa);
@@ -449,20 +476,39 @@ fn lowerLoop(ctx: *Ctx, entry_block: ir.Block, body_stmts: []const ast.Statement
     ctx.clone_floor = saved_floor;
     ctx.loop = saved;
 
-    switch (body_flow) {
-        .fallthrough => |b| {
+    const normal_back: ?ir.Block = switch (body_flow) {
+        .fallthrough => |b| blk: {
             ctx.f.setTerm(b, .{ .br = header }); // back-edge (normal iteration)
-            if (use_phi) {
-                // Patch each header phi's back-edge input to the body-exit value. If a reassigned local is
-                // not live at body-exit (e.g. reset to null), leave the placeholder — the verifier will
-                // flag the resulting imbalance, which the gate catches (rather than silently unsound).
-                const hphis = ctx.f.blocks.items[@intFromEnum(header)].phis.items;
-                for (reassigned.items, 0..) |i, k| {
-                    hphis[k].inputs[1] = .{ .pred = b, .value = body_locals.items[i].value };
-                }
-            }
+            break :blk b;
         },
-        .terminated => {}, // body always returns: no back-edge; the header phi's placeholder is never taken
+        .terminated => null, // body always returns/breaks: no normal back-edge
+    };
+
+    if (use_phi) {
+        // Complete each header phi: entry + normal back-edge (if any) + every continue.
+        var hinputs = std.ArrayListUnmanaged(ir.PhiInput).empty;
+        defer hinputs.deinit(ctx.gpa);
+        for (reassigned.items, 0..) |i, k| {
+            hinputs.clearRetainingCapacity();
+            try hinputs.append(ctx.gpa, .{ .pred = entry_block, .value = x0s[k] });
+            if (normal_back) |b| try hinputs.append(ctx.gpa, .{ .pred = b, .value = body_locals.items[i].value });
+            for (continue_edges.items) |e| try hinputs.append(ctx.gpa, .{ .pred = e.block, .value = e.values[k] });
+            try ctx.f.setPhiInputs(ctx.gpa, header, k, hinputs.items);
+        }
+        // If any `break` carries the loop out, the exit is a join: exit phi = header cond-false value
+        // (the header phi result) + each break's snapshot. The post-loop value is the exit phi result.
+        if (break_edges.items.len > 0) {
+            var einputs = std.ArrayListUnmanaged(ir.PhiInput).empty;
+            defer einputs.deinit(ctx.gpa);
+            for (reassigned.items, 0..) |i, k| {
+                einputs.clearRetainingCapacity();
+                try einputs.append(ctx.gpa, .{ .pred = header, .value = locals.items[i].value }); // header phi result
+                for (break_edges.items) |e| try einputs.append(ctx.gpa, .{ .pred = e.block, .value = e.values[k] });
+                const r = try ctx.f.addPhi(ctx.gpa, exit_block, einputs.items, null);
+                locals.items[i].value = r;
+                locals.items[i].live = true;
+            }
+        }
     }
     return exit_block;
 }
@@ -503,54 +549,70 @@ fn lowerFor(ctx: *Ctx, entry_block: ir.Block, fr: *const ast.ForStmt, locals: *L
 fn lowerSwitch(ctx: *Ctx, entry_block: ir.Block, sw: *const ast.SwitchStmt, locals: *Locals) LowerError!Flow {
     for (sw.cases) |c| if (c.guard != null) return deferBecause(ctx, .switch_guard);
 
+    const n_outer = locals.items.len; // indices [0, n_outer) are enclosing-scope locals
     const case_blocks = try ctx.gpa.alloc(ir.Block, sw.cases.len);
     errdefer ctx.gpa.free(case_blocks);
     const case_flows = try ctx.gpa.alloc(Flow, sw.cases.len);
     defer ctx.gpa.free(case_flows);
 
-    const saved_floor = ctx.clone_floor;
-    ctx.clone_floor = locals.items.len; // reassigns of outer locals inside the (discarded) case clones defer
-    defer ctx.clone_floor = saved_floor;
+    // Hoist each case's clone so its outer-local values are readable when building the join phi (a case may
+    // reassign an outer local, giving a different value than its siblings — reconcileJoin unifies them).
+    const case_locals_arr = try ctx.gpa.alloc(Locals, sw.cases.len);
+    for (case_locals_arr) |*cl| cl.* = .empty;
+    defer {
+        for (case_locals_arr) |*cl| cl.deinit(ctx.gpa);
+        ctx.gpa.free(case_locals_arr);
+    }
 
     // Lower each case body into its own block+scope. Blocks are allocated before the join (below).
     for (sw.cases, 0..) |c, i| {
         const body_stmts = branchStmts(c.body) orelse return deferBecause(ctx, .nonblock_branch); // errdefer frees case_blocks
         case_blocks[i] = try ctx.f.newBlock(ctx.gpa);
-        var case_locals = try cloneLocals(ctx.gpa, locals);
-        defer case_locals.deinit(ctx.gpa);
-        case_flows[i] = try lowerBlockScope(ctx, case_blocks[i], body_stmts, &case_locals);
+        case_locals_arr[i] = try cloneLocals(ctx.gpa, locals);
+        case_flows[i] = try lowerBlockScope(ctx, case_blocks[i], body_stmts, &case_locals_arr[i]);
     }
 
     // default (if present): its own block+scope.
     var default_block: ?ir.Block = null;
     var default_flow: Flow = .{ .fallthrough = undefined };
-    var has_default_fallthrough = true; // no default => the no-match path falls straight to join
+    var default_locals: ?Locals = null;
+    defer if (default_locals) |*dl| dl.deinit(ctx.gpa);
     if (sw.default_case) |dstmt| {
         const dstmts = branchStmts(dstmt) orelse return deferBecause(ctx, .nonblock_branch); // errdefer frees case_blocks
         default_block = try ctx.f.newBlock(ctx.gpa);
-        var default_locals = try cloneLocals(ctx.gpa, locals);
-        defer default_locals.deinit(ctx.gpa);
-        default_flow = try lowerBlockScope(ctx, default_block.?, dstmts, &default_locals);
-        has_default_fallthrough = (default_flow == .fallthrough);
+        default_locals = try cloneLocals(ctx.gpa, locals);
+        default_flow = try lowerBlockScope(ctx, default_block.?, dstmts, &default_locals.?);
     }
 
     const join_block = try ctx.f.newBlock(ctx.gpa); // highest index
     ctx.f.setTerm(entry_block, .{ .switch_br = .{ .cases = case_blocks, .default_blk = default_block orelse join_block } });
 
-    var any_fallthrough = has_default_fallthrough;
-    for (case_flows) |cf| switch (cf) {
+    // Collect the joining predecessors (as lowerIf does): each fall-through case + the default's fall-through,
+    // or — with no default — the switch_br's default edge entry_block -> join carrying the entry values.
+    var preds = std.ArrayListUnmanaged(JoinPred).empty;
+    defer preds.deinit(ctx.gpa);
+    for (case_flows, 0..) |cf, i| switch (cf) {
         .fallthrough => |b| {
             ctx.f.setTerm(b, .{ .br = join_block });
-            any_fallthrough = true;
+            try preds.append(ctx.gpa, .{ .block = b, .vals = case_locals_arr[i].items });
         },
         .terminated => {},
     };
-    if (default_block) |_| switch (default_flow) {
-        .fallthrough => |b| ctx.f.setTerm(b, .{ .br = join_block }),
-        .terminated => {},
-    };
+    if (default_block) |_| {
+        switch (default_flow) {
+            .fallthrough => |b| {
+                ctx.f.setTerm(b, .{ .br = join_block });
+                try preds.append(ctx.gpa, .{ .block = b, .vals = default_locals.?.items });
+            },
+            .terminated => {},
+        }
+    } else {
+        try preds.append(ctx.gpa, .{ .block = entry_block, .vals = locals.items }); // no-match edge -> join
+    }
 
-    return if (any_fallthrough) .{ .fallthrough = join_block } else .terminated;
+    if (preds.items.len == 0) return .terminated; // every case and the default returned: join unreachable
+    try reconcileJoin(ctx, join_block, locals, n_outer, preds.items);
+    return .{ .fallthrough = join_block };
 }
 
 /// Destroy the still-live locals THIS scope declared (index >= mark) in `block`, in reverse order, then
@@ -638,17 +700,18 @@ fn lowerReassign(ctx: *Ctx, block: ir.Block, e: *const ast.Expression, locals: *
             if (locals.items[j].live) new_val = try ctx.f.copy(ctx.gpa, block, locals.items[j].value);
         }
     }
-    if (new_val == null and isOwnedInit(ctx.store, ctx.tir, rhs))
+    // The reassign target is a TRACKED OWNED local, so a well-typed RHS carries an owned value of that type
+    // (a fresh birth). Even `x = null` on an optional models as a phantom owned value: born here, consumed
+    // once at scope end — balanced. So when the RHS is not an owned-local copy, mint a fresh owned value
+    // rather than marking the slot dead. (Marking it dead on an owned-typed RHS the classifier failed to
+    // flag as owned — e.g. a field access `x = e.field` — would give it a different liveness than a sibling
+    // branch and force a spurious mixed-liveness defer at the join.)
+    if (new_val == null)
         new_val = try ctx.f.makeOwned(ctx.gpa, block, ctx.tir.typeOf(rhs));
-    // Drop the old value (-1) if the slot currently holds one.
+    // Drop the old value (-1) if the slot currently holds one, then rebind to the new owned value.
     if (locals.items[idx].live) try ctx.f.destroy(ctx.gpa, block, locals.items[idx].value);
-    // Rebind the slot.
-    if (new_val) |nv| {
-        locals.items[idx].value = nv;
-        locals.items[idx].live = true;
-    } else {
-        locals.items[idx].live = false; // trivial RHS: no owned obligation remains
-    }
+    locals.items[idx].value = new_val.?;
+    locals.items[idx].live = true;
 }
 
 /// Walk an expression and emit a `borrow_use` for every LIVE owned local it mentions. Under Nova's +0

@@ -83,3 +83,42 @@ fn reassign_in_loop_conditional(): void {
     }
     assert.equalInt(cur.get(0), 3);
 }
+
+// Outer local reassigned inside switch cases -> N-input join phi (Slice 4 tail: switch).
+@test
+fn reassign_in_switch(): void {
+    let s = makeList(0);
+    let k = 2;
+    switch (k) {
+        case 1: { s = makeList(11); }
+        case 2: { s = makeList(22); }
+        default: { s = makeList(99); }
+    }
+    assert.equalInt(s.get(0), 22);
+}
+
+// Outer local reassigned in a loop with a break -> multi-back-edge header phi + break-fed exit phi.
+@test
+fn reassign_in_loop_with_break(): void {
+    let x = makeList(0);
+    let i = 0;
+    while (i < 10) {
+        x = makeList(i);
+        if (i == 3) { break; }
+        i = i + 1;
+    }
+    assert.equalInt(x.get(0), 3);
+}
+
+// Outer local reassigned in a loop with a continue -> continue-fed header phi.
+@test
+fn reassign_in_loop_with_continue(): void {
+    let y = makeList(0);
+    let i = 0;
+    while (i < 5) {
+        i = i + 1;
+        if (i == 2) { continue; }
+        y = makeList(i);
+    }
+    assert.equalInt(y.get(0), 5);
+}

@@ -208,6 +208,15 @@ pub const Func = struct {
         return result;
     }
 
+    /// Replace phi `phi_index`'s inputs at block `b` (used by loop lowering to patch a header phi's
+    /// back-edge / continue inputs once they are known, after the loop body is lowered).
+    pub fn setPhiInputs(self: *Func, gpa: std.mem.Allocator, b: Block, phi_index: usize, inputs: []const PhiInput) !void {
+        const ph = &self.blockPtr(b).phis.items[phi_index];
+        const owned = try gpa.dupe(PhiInput, inputs);
+        gpa.free(ph.inputs);
+        ph.inputs = owned;
+    }
+
     pub fn setTerm(self: *Func, b: Block, term: Terminator) void {
         self.blockPtr(b).term = term;
     }
