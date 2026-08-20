@@ -57,15 +57,21 @@ readiness. The one confirmed CORRECTNESS DEFECT is `x ?? d` on a narrowed presen
 value-optional representation change (three site-local guards each regressed serde/DI/try). These remain OPEN;
 marking any of them [x] requires an actual code fix that a probe or gate verifies, not a reframing.
 
-### Monomorphisation ; PARTIAL ; probe
+### Monomorphisation ; SOUND ; case + probe
 
 - [x] Concrete generic instantiations produce correct code (case-gated).
 - [x] Method-level generics tracked separately (`List<T>.map<U>`).
 - [x] Field-type and return-type recursion instantiated (the `Set<T>{map:Map<T,bool>}` fix).
 - [x] Deep nesting does not crash; falls back to the erased body and runs (probe: depth-4 runs).
 - [x] No `LLVMVerifyError` from a standalone generic that never reached the worklist.
-- [ ] Nested generics beyond depth 2 are eagerly monomorphised, not left to the erased fallback (currently a
-      hard `max_depth=2` cap, so deeper nests run on the erased path).
+- [x] Nested generics beyond depth 2 are eagerly monomorphised, not left to the erased fallback (FIXED: the
+      `max_depth=2` cap now applies ONLY to the SPECULATIVE method-return-type cascade -- the thing that
+      balloons `chunk(): List<List<T>>` into dead 16-deep nestings -- via a `noteImpl(t, speculative)` split
+      in `mono.zig`. An EXPLICITLY-used type (a seed from `expr_types`, its structural args, and struct
+      fields) is instantiated at ANY depth. Proven both ways on `List<List<List<int>>>`: old binary emits 0
+      `List_List_List_i32_*` bodies (erased), new binary emits the full monomorphised set; case 390 runs the
+      value-optional `get()` path that the erased layout mishandles. Corpus 399/402, baseline unchanged, no
+      instantiation bloat -- the speculative cascade stays capped).
 
 ### Traits and dynamic dispatch ; PARTIAL ; case + probe
 

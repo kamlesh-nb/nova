@@ -1,0 +1,21 @@
+// A genuinely-USED depth-3 nested generic must be eagerly MONOMORPHISED (concrete List_List_List_int
+// bodies), not left to the type-erased fallback. The speculative method-return cascade stays depth-capped;
+// only an explicitly-used type is instantiated at any depth. This exercises the value-optional `get()`
+// path that the erased container layout mishandles.
+import assert;
+import list;
+@test
+fn t(): void {
+    let a = List<List<List<int>>>();
+    let inner = List<List<int>>();
+    let leaf = List<int>();
+    leaf.push(42);
+    inner.push(leaf);
+    a.push(inner);
+    let got = a.get(0);
+    assert.isTrue(got != undefined);
+    let g2 = (got ?? List<List<int>>()).get(0);
+    assert.isTrue(g2 != undefined);
+    let g3 = (g2 ?? List<int>()).get(0);
+    assert.equalInt((g3 ?? 0), 42);
+}

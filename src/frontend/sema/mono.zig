@@ -321,20 +321,33 @@ pub const Worklist = struct {
         };
     }
 
+    // Public entry point: an EXPLICIT instantiation request -- a type the program actually uses (a seed from
+    // `expr_types`, a forced inst, a decomposed arg). These are never depth-capped: if a program genuinely
+    // writes `List<List<List<int>>>`, it must be monomorphised, not left to the erased fallback (which carries
+    // the wrong value-optional representation). Only the SPECULATIVE method-return-type cascade below is
+    // capped, since that is what balloons `chunk(): List<List<T>>` into dead 16-deep nestings.
     pub fn note(self: *Worklist, t: TypeId) !void {
+        return self.noteImpl(t, false);
+    }
+
+    fn noteImpl(self: *Worklist, t: TypeId, speculative: bool) !void {
         const ty = self.sema.store.get(t);
         if (ty != .struct_) return;
         if (ty.struct_.args.len == 0) return;
         if (!self.isConcrete(t)) return;
         if (self.seen.contains(t)) return;
 
-        if (self.depthOf(t, max_depth + 2) > max_depth) {
+        // Depth cap applies ONLY to the speculative method-return cascade. An explicitly-used type (speculative
+        // == false) is instantiated at any depth so it is eagerly monomorphised rather than erased.
+        if (speculative and self.depthOf(t, max_depth + 2) > max_depth) {
             self.stats.too_deep += 1;
             return;
         }
         try self.seen.put(self.allocator, t, {});
         self.stats.instantiations += 1;
-        for (ty.struct_.args) |a| try self.note(a);
+        // Structural decomposition of THIS type's own arguments inherits its speculative-ness (a real type's
+        // args are real; a speculative type's args are speculative).
+        for (ty.struct_.args) |a| try self.noteImpl(a, speculative);
 
         const sym = self.sema.tab.symbolAt(ty.struct_.decl);
         if (sym.decl == .struct_) {
@@ -348,7 +361,9 @@ pub const Worklist = struct {
                 l.param_scopes = &scopes;
                 const raw = l.lower(rt) catch continue;
                 const concrete = subst.substitute(&self.sema.store, raw, ty.struct_.decl, ty.struct_.args) catch continue;
-                try self.note(concrete);
+                // A method RETURN type is speculative: `chunk(): List<List<T>>` is what cascades to deep dead
+                // nestings, so it stays depth-capped even though the receiver itself was an explicit seed.
+                try self.noteImpl(concrete, true);
             }
             // Also note FIELD types substituted with this instantiation's args. A generic struct that stores
             // another generic as a field (`Set<T> { map: Map<T, bool> }`) must monomorphise that field type
@@ -362,7 +377,11 @@ pub const Worklist = struct {
                 l.param_scopes = &scopes;
                 const raw = l.lower(f.type_name) catch continue;
                 const concrete = subst.substitute(&self.sema.store, raw, ty.struct_.decl, ty.struct_.args) catch continue;
-                try self.note(concrete);
+                // A FIELD type inherits its owner's speculative-ness. It is correctness-critical (an erased
+                // field container has the wrong value-optional layout and crashes on `get() != undefined`),
+                // and it is structurally bounded (self-containing value structs are rejected elsewhere), so a
+                // real struct's fields are always monomorphised while a speculative type's fields stay capped.
+                try self.noteImpl(concrete, speculative);
             }
         }
     }
