@@ -1,0 +1,98 @@
+// HTTP/2 end to end (in memory): build a client message (preface + SETTINGS + HEADERS with an HPACK-coded
+// GET request), run it through the server protocol core, then decode the server's response frames and verify
+// the status and body. Exercises framing, HPACK encode/decode, the SETTINGS handshake, and the
+// HEADERS -> handler -> HEADERS+DATA response path.
+import web.http2.conn;
+import web.http2.frame;
+import web.http2.hpack;
+import bytes;
+import string;
+import assert;
+
+fn handler(req: conn.H2Request): conn.H2Response {
+    let hs = List<hpack.HeaderField>();
+    hs.push(hpack.HeaderField("content-type", "text/plain"));
+    if (string.eql(req.path, "/hello")) {
+        return conn.H2Response(200, hs, "hi " + req.method);
+    }
+    return conn.H2Response(404, hs, "not found");
+}
+
+// Build a client HTTP/2 message for a single GET request to `path`.
+fn buildClientMessage(path: string): (ptr, int) {
+    let enc = hpack.newHpack();
+    let fields = List<hpack.HeaderField>();
+    fields.push(hpack.HeaderField(":method", "GET"));
+    fields.push(hpack.HeaderField(":scheme", "https"));
+    fields.push(hpack.HeaderField(":path", path));
+    fields.push(hpack.HeaderField(":authority", "example.com"));
+    let (hb, hbLen) = enc.encode(fields);
+
+    let out = bytes.alloc(4096);
+    let o = 0;
+    // Preface.
+    let i = 0;
+    while (i < frame.PREFACE.length) { bytes.write_byte(out, o, frame.PREFACE[i]); o = o + 1; i = i + 1; }
+    // Client SETTINGS (empty).
+    o = frame.writeSettingsEmpty(out, o);
+    // HEADERS on stream 1, END_HEADERS | END_STREAM.
+    o = frame.writeFrame(out, o, frame.FRAME_HEADERS, frame.FLAG_END_HEADERS | frame.FLAG_END_STREAM, 1, hb, 0, hbLen);
+    return (out, o);
+}
+
+@test
+fn h2_get_request_response() {
+    let (msg, msgLen) = buildClientMessage("/hello");
+    let (resp, respLen) = conn.processMessage(msg, msgLen, handler);
+    assert.equalInt(1, if (respLen > 0) 1 else 0);
+
+    // Walk the response frames: server SETTINGS, SETTINGS ACK, HEADERS, DATA.
+    let dec = hpack.newHpack();
+    let p = 0;
+    let sawSettings = false;
+    let sawAck = false;
+    let status = "";
+    let body = "";
+    while (p + 9 <= respLen) {
+        let fh = frame.readHeader(resp, p);
+        let payload = p + 9;
+        if (fh.ftype == frame.FRAME_SETTINGS) {
+            if ((fh.flags & frame.FLAG_ACK) != 0) { sawAck = true; } else { sawSettings = true; }
+        } else if (fh.ftype == frame.FRAME_HEADERS) {
+            let fields = dec.decode(resp, payload, fh.length);
+            let k = 0;
+            while (k < fields.size()) {
+                let f = fields.at(k);
+                if (string.eql(f.name, ":status")) { status = f.value; }
+                k = k + 1;
+            }
+        } else if (fh.ftype == frame.FRAME_DATA) {
+            body = string.slice(resp as string, payload, payload + fh.length);
+        }
+        p = payload + fh.length;
+    }
+    assert.isTrue(sawSettings);                     // server sent its SETTINGS
+    assert.isTrue(sawAck);                          // server ACKed the client's SETTINGS
+    assert.equalInt(1, if (status == "200") 1 else 0);
+    assert.equalInt(1, if (body == "hi GET") 1 else 0);
+}
+
+@test
+fn h2_not_found_route() {
+    let (msg, msgLen) = buildClientMessage("/missing");
+    let (resp, respLen) = conn.processMessage(msg, msgLen, handler);
+    let dec = hpack.newHpack();
+    let p = 0;
+    let status = "";
+    while (p + 9 <= respLen) {
+        let fh = frame.readHeader(resp, p);
+        let payload = p + 9;
+        if (fh.ftype == frame.FRAME_HEADERS) {
+            let fields = dec.decode(resp, payload, fh.length);
+            let k = 0;
+            while (k < fields.size()) { let f = fields.at(k); if (string.eql(f.name, ":status")) { status = f.value; } k = k + 1; }
+        }
+        p = payload + fh.length;
+    }
+    assert.equalInt(1, if (status == "404") 1 else 0);
+}

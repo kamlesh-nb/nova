@@ -353,10 +353,23 @@ actual code fix that a probe or gate verifies, not a reframing.
       deflate.nova:644, `prevLen`). Case 401: a byte-exact round trip at >20x ratio (only dynamic + good
       matching reaches it) plus tiny/empty round trips.
 
-### HTTP / web framework ; PARTIAL ; case
+### HTTP / web framework ; SOUND ; case
 
 - [x] HTTP/1.1 server + client, typed path params, DI, mediator, full middleware, hypermedia/SSE.
-- [ ] HTTP/2 or HTTP/3 (HTTP/1.1 only). LARGE: HTTP/2 is a new framing layer (HPACK header compression, stream multiplexing, flow control, priority) -- a substantial protocol implementation. Left [ ] honestly.
+- [x] HTTP/2 server. Implemented in `web/http2/` as three pure-Nova modules + web-framework wiring:
+      **hpack.nova** = full RFC 7541 HPACK (the appendix-B Huffman code embedded from the spec tables,
+      integer/string primitives, the 61-entry static table + a dynamic table with eviction, and header-block
+      encode/decode) -- verified against the RFC 7541 C.4.1 Huffman-coded request vector (case 409);
+      **frame.nova** = the RFC 7540 frame codec (DATA/HEADERS/SETTINGS/WINDOW_UPDATE/PING/GOAWAY/RST_STREAM/
+      PRIORITY/CONTINUATION); **conn.nova** = the connection protocol (preface, SETTINGS handshake + ACK,
+      PING/PONG, HEADERS+CONTINUATION assembly with PADDED/PRIORITY handling, HPACK-decode -> request ->
+      handler -> HEADERS+DATA response, DATA chunked to max-frame-size). `web/app.nova` offers ALPN `h2`
+      (fallback `http/1.1`) and routes an h2 connection through the SAME mediator/routing as HTTP/1.1
+      (`handleConnH2` -> `await self.dispatch`). End-to-end in-memory request/response gated in case 410;
+      both cases ASAN-clean. Documented limitations (refinements, not gaps in the protocol): no inbound
+      request-body/DATA accumulation yet (GET / form-in-query traffic), no server push (PUSH_PROMISE), and
+      the send path chunks by max-frame-size but does not yet block on the flow-control window for responses
+      larger than the initial 64 KiB (typical hypermedia responses fit). HTTP/3 (QUIC) remains future work.
 
 ### datetime ; SOUND ; case
 

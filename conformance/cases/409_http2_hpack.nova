@@ -1,0 +1,72 @@
+// HPACK (RFC 7541): decode the canonical C.4.1 request header block (Huffman-coded) and round-trip a
+// header set through encode -> decode. Exercises the Huffman code, integer/string primitives, the static
+// table and literal representations.
+import web.http2.hpack;
+import bytes;
+import assert;
+
+fn hexNib(c: int): int { if (c >= 48 && c <= 57) { return c - 48; } if (c >= 97 && c <= 102) { return c - 87; } return 0; }
+fn hexBuf(h: string): ptr {
+    let n = h.length / 2;
+    let b = bytes.alloc(n + 1);
+    let i = 0;
+    while (i < n) { bytes.write_byte(b, i, hexNib(h[i * 2]) * 16 + hexNib(h[i * 2 + 1])); i = i + 1; }
+    return b;
+}
+
+fn findHeader(fields: List<hpack.HeaderField>, name: string): string {
+    let i = 0;
+    while (i < fields.size()) {
+        let f = fields.at(i);
+        if (f.name == name) { return f.value; }
+        i = i + 1;
+    }
+    return "<missing>";
+}
+
+@test
+fn decode_rfc7541_c41_request() {
+    // RFC 7541 C.4.1: first request of the Huffman-coded example sequence.
+    //   :method: GET  :scheme: http  :path: /  :authority: www.example.com
+    let buf = hexBuf("828684418cf1e3c2e5f23a6ba0ab90f4ff");
+    let hp = hpack.newHpack();
+    let fields = hp.decode(buf, 0, 17);
+    assert.equalInt(4, fields.size());
+    assert.equalInt(1, if (findHeader(fields, ":method") == "GET") 1 else 0);
+    assert.equalInt(1, if (findHeader(fields, ":scheme") == "http") 1 else 0);
+    assert.equalInt(1, if (findHeader(fields, ":path") == "/") 1 else 0);
+    assert.equalInt(1, if (findHeader(fields, ":authority") == "www.example.com") 1 else 0);
+}
+
+@test
+fn round_trip_response_headers() {
+    let fields = List<hpack.HeaderField>();
+    fields.push(hpack.HeaderField(":status", "200"));
+    fields.push(hpack.HeaderField("content-type", "text/html; charset=utf-8"));
+    fields.push(hpack.HeaderField("content-length", "1234"));
+    fields.push(hpack.HeaderField("x-custom-header", "hello-world-value"));
+
+    let enc = hpack.newHpack();
+    let (buf, len) = enc.encode(fields);
+    assert.equalInt(1, if (len > 0) 1 else 0);
+
+    let dec = hpack.newHpack();
+    let got = dec.decode(buf, 0, len);
+    assert.equalInt(4, got.size());
+    assert.equalInt(1, if (findHeader(got, ":status") == "200") 1 else 0);
+    assert.equalInt(1, if (findHeader(got, "content-type") == "text/html; charset=utf-8") 1 else 0);
+    assert.equalInt(1, if (findHeader(got, "content-length") == "1234") 1 else 0);
+    assert.equalInt(1, if (findHeader(got, "x-custom-header") == "hello-world-value") 1 else 0);
+}
+
+@test
+fn huffman_and_static_indexing() {
+    // :status 200 is static index 8 -> a single indexed byte 0x88. content-type has no static value, so it
+    // is name-indexed + a Huffman/raw literal value.
+    let fields = List<hpack.HeaderField>();
+    fields.push(hpack.HeaderField(":status", "200"));
+    let enc = hpack.newHpack();
+    let (buf, len) = enc.encode(fields);
+    assert.equalInt(1, len);                       // exactly one byte
+    assert.equalInt(0x88, bytes.read_byte(buf, 0));
+}

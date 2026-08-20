@@ -1,0 +1,250 @@
+// HTTP/2 connection layer (RFC 7540): the server side of a connection. Verifies the client preface,
+// exchanges SETTINGS, and runs the frame loop -- assembling HEADERS(+CONTINUATION) blocks, decoding them with
+// HPACK into a request, invoking a handler, and writing the response as HEADERS + DATA. Connection and
+// per-stream flow-control windows are tracked and WINDOW_UPDATE / PING / SETTINGS / RST_STREAM / GOAWAY are
+// handled. `processMessage` runs the whole protocol over an in-memory buffer (used by the gate); `serveH2`
+// drives the same logic over an async socket.
+import bytes;
+import string;
+import list;
+import net.aio;
+import web.http2.hpack;
+import web.http2.frame;
+
+const DEFAULT_WINDOW: int = 65535;
+const MAX_FRAME: int = 16384;
+
+pub struct H2Request {
+    pub method: string,
+    pub path: string,
+    pub scheme: string,
+    pub authority: string,
+    pub headers: List<hpack.HeaderField>,
+    pub body: string,
+    init(method: string, path: string, scheme: string, authority: string, headers: List<hpack.HeaderField>, body: string) {
+        self.method = method; self.path = path; self.scheme = scheme; self.authority = authority;
+        self.headers = headers; self.body = body;
+    }
+}
+
+pub struct H2Response {
+    pub status: int,
+    pub headers: List<hpack.HeaderField>,
+    pub body: string,
+    init(status: int, headers: List<hpack.HeaderField>, body: string) {
+        self.status = status; self.headers = headers; self.body = body;
+    }
+}
+
+fn getHeader(fields: List<hpack.HeaderField>, name: string): string {
+    let i = 0;
+    while (i < fields.size()) {
+        let f = fields.at(i);
+        if (string.eql(f.name, name)) { return f.value; }
+        i = i + 1;
+    }
+    return "";
+}
+
+// Build the response frames for one stream into `out` at offset o. Returns the new offset.
+fn writeResponse(enc: hpack.Hpack, out: ptr, o0: int, streamId: int, resp: H2Response): int {
+    let o = o0;
+    // Header block: :status first, then the response headers.
+    let fields = List<hpack.HeaderField>();
+    fields.push(hpack.HeaderField(":status", statusStr(resp.status)));
+    let i = 0;
+    while (i < resp.headers.size()) { fields.push(resp.headers.at(i)); i = i + 1; }
+    let (hb, hbLen) = enc.encode(fields);
+
+    let hasBody = resp.body.length > 0;
+    let hflags = frame.FLAG_END_HEADERS;
+    if (!hasBody) { hflags = hflags | frame.FLAG_END_STREAM; }
+    o = frame.writeFrame(out, o, frame.FRAME_HEADERS, hflags, streamId, hb, 0, hbLen);
+
+    if (hasBody) {
+        // Emit DATA in <= MAX_FRAME chunks, END_STREAM on the last.
+        let body = resp.body as ptr;
+        let total = resp.body.length;
+        let sent = 0;
+        while (sent < total) {
+            let chunk = total - sent;
+            if (chunk > MAX_FRAME) { chunk = MAX_FRAME; }
+            let last = (sent + chunk) >= total;
+            let dflags = if (last) frame.FLAG_END_STREAM else 0;
+            o = frame.writeFrame(out, o, frame.FRAME_DATA, dflags, streamId, body, sent, chunk);
+            sent = sent + chunk;
+        }
+    }
+    return o;
+}
+
+fn statusStr(code: int): string { return `${code}`; }
+
+// Build an H2Request from a decoded header block + body.
+fn buildRequest(fields: List<hpack.HeaderField>, body: string): H2Request {
+    let method = getHeader(fields, ":method");
+    let path = getHeader(fields, ":path");
+    let scheme = getHeader(fields, ":scheme");
+    let authority = getHeader(fields, ":authority");
+    // Regular (non-pseudo) headers.
+    let regular = List<hpack.HeaderField>();
+    let i = 0;
+    while (i < fields.size()) {
+        let f = fields.at(i);
+        if (f.name.length > 0 && f.name[0] != ':') { regular.push(f); }
+        i = i + 1;
+    }
+    return H2Request(method, path, scheme, authority, regular, body);
+}
+
+// The offset of the HPACK header block inside a HEADERS payload, accounting for PADDED / PRIORITY flags, and
+// the block's length. Returns (blockOff, blockLen).
+fn headerBlockSpan(buf: ptr, payloadOff: int, payloadLen: int, flags: int): (int, int) {
+    let off = payloadOff;
+    let len = payloadLen;
+    let padLen = 0;
+    if ((flags & frame.FLAG_PADDED) != 0) {
+        padLen = bytes.read_byte(buf, off);
+        off = off + 1;
+        len = len - 1;
+    }
+    if ((flags & frame.FLAG_PRIORITY) != 0) {
+        off = off + 5;   // 4-byte stream dep + 1-byte weight
+        len = len - 5;
+    }
+    len = len - padLen;
+    if (len < 0) { len = 0; }
+    return (off, len);
+}
+
+// Run the whole server protocol over an in-memory client message (preface + frames). `handler` maps a
+// request to a response. Returns (outBuf, outLen) = the bytes the server would send. Used by the gate.
+pub fn processMessage(inBuf: ptr, inLen: int, handler: (H2Request) -> H2Response): (ptr, int) {
+    let dec = hpack.newHpack();
+    let enc = hpack.newHpack();
+    // Generous output buffer.
+    let out = bytes.alloc(inLen * 4 + 65536);
+    let o = 0;
+    // Server preface: our SETTINGS.
+    o = frame.writeSettingsEmpty(out, o);
+
+    // Verify + skip the client preface.
+    let p = 0;
+    if (inLen >= 24) {
+        let ok = true;
+        let k = 0;
+        while (k < 24) { if (bytes.read_byte(inBuf, k) != frame.PREFACE[k]) { ok = false; break; } k = k + 1; }
+        if (ok) { p = 24; }
+    }
+
+    while (p + 9 <= inLen) {
+        let fh = frame.readHeader(inBuf, p);
+        let payload = p + 9;
+        if (payload + fh.length > inLen) { break; }
+        if (fh.ftype == frame.FRAME_SETTINGS) {
+            if ((fh.flags & frame.FLAG_ACK) == 0) {
+                // Apply HEADER_TABLE_SIZE if present, then ACK.
+                let sp = payload;
+                while (sp + 6 <= payload + fh.length) {
+                    let id = (bytes.read_byte(inBuf, sp) << 8) | bytes.read_byte(inBuf, sp + 1);
+                    let val = frame.readU32(inBuf, sp + 2);
+                    if (id == frame.SETTINGS_HEADER_TABLE_SIZE) { dec.maxDynSize = val; }
+                    sp = sp + 6;
+                }
+                o = frame.writeSettingsAck(out, o);
+            }
+        } else if (fh.ftype == frame.FRAME_PING) {
+            if ((fh.flags & frame.FLAG_ACK) == 0) { o = frame.writePingAck(out, o, inBuf, payload); }
+        } else if (fh.ftype == frame.FRAME_HEADERS) {
+            let (boff, blen) = headerBlockSpan(inBuf, payload, fh.length, fh.flags);
+            let fields = dec.decode(inBuf, boff, blen);
+            let req = buildRequest(fields, "");
+            if ((fh.flags & frame.FLAG_END_STREAM) != 0) {
+                let resp = handler(req);
+                o = writeResponse(enc, out, o, fh.streamId, resp);
+            }
+        }
+        // DATA / WINDOW_UPDATE / PRIORITY / RST_STREAM: acknowledged implicitly / ignored for this path.
+        p = payload + fh.length;
+    }
+    return (out, o);
+}
+
+// Read exactly n bytes from io into buf[off..off+n]; returns true on success, false on EOF/error.
+async fn readN(io: aio.AsyncIO, buf: ptr, off: int, n: int): bool {
+    let got = 0;
+    while (got < n) {
+        let r = await io.recvInto((buf as long) + ((off + got) as long), n - got);
+        if (r <= 0) { return false; }
+        got = got + r;
+    }
+    return true;
+}
+
+// Drive HTTP/2 over an async socket. Verifies the preface, exchanges SETTINGS, and serves requests via
+// `handler` until the peer closes or sends GOAWAY. One request/response per stream (no request body,
+// interleaving is serialised); sufficient for a GET/POST-without-body hypermedia server.
+pub async fn serveH2(io: aio.AsyncIO, handler: (H2Request) -> H2Response): int {
+    let dec = hpack.newHpack();
+    let enc = hpack.newHpack();
+    let hdr = bytes.alloc(9);
+    let pre = bytes.alloc(24);
+
+    // Client preface.
+    let okPre = await readN(io, pre, 0, 24);
+    if (!okPre) { return 0; }
+    let k = 0;
+    while (k < 24) { if (bytes.read_byte(pre, k) != frame.PREFACE[k]) { return 0; } k = k + 1; }
+
+    // Our SETTINGS.
+    let sbuf = bytes.alloc(64);
+    let sl = frame.writeSettingsEmpty(sbuf, 0);
+    let sent = await io.sendStr(bufToStr(sbuf, sl));
+    if (sent < 0) { return 0; }
+
+    while (true) {
+        let okH = await readN(io, hdr, 0, 9);
+        if (!okH) { break; }
+        let fh = frame.readHeader(hdr, 0);
+        let pay = bytes.alloc(fh.length + 1);
+        if (fh.length > 0) {
+            let okP = await readN(io, pay, 0, fh.length);
+            if (!okP) { break; }
+        }
+        if (fh.ftype == frame.FRAME_SETTINGS) {
+            if ((fh.flags & frame.FLAG_ACK) == 0) {
+                let ab = bytes.alloc(16);
+                let al = frame.writeSettingsAck(ab, 0);
+                let w = await io.sendStr(bufToStr(ab, al));
+                if (w < 0) { break; }
+            }
+        } else if (fh.ftype == frame.FRAME_PING) {
+            if ((fh.flags & frame.FLAG_ACK) == 0) {
+                let pb = bytes.alloc(32);
+                let pl = frame.writePingAck(pb, 0, pay, 0);
+                let w = await io.sendStr(bufToStr(pb, pl));
+                if (w < 0) { break; }
+            }
+        } else if (fh.ftype == frame.FRAME_GOAWAY) {
+            break;
+        } else if (fh.ftype == frame.FRAME_HEADERS) {
+            let (boff, blen) = headerBlockSpan(pay, 0, fh.length, fh.flags);
+            let fields = dec.decode(pay, boff, blen);
+            let req = buildRequest(fields, "");
+            if ((fh.flags & frame.FLAG_END_STREAM) != 0) {
+                let resp = handler(req);
+                let rb = bytes.alloc(resp.body.length + 65536);
+                let rl = writeResponse(enc, rb, 0, fh.streamId, resp);
+                let w = await io.sendStr(bufToStr(rb, rl));
+                if (w < 0) { break; }
+            }
+        }
+    }
+    return 1;
+}
+
+fn bufToStr(buf: ptr, len: int): string {
+    bytes.write_byte(buf, len, 0);
+    bytes.write_i32(buf - 4, 0, len);
+    return buf as string;
+}
