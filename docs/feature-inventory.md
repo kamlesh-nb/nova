@@ -409,10 +409,21 @@ actual code fix that a probe or gate verifies, not a reframing.
   `trustCert=false`; explicit `?encrypt=false&trustServerCertificate=true` is honoured. Matches modern
   drivers (.NET SqlClient encrypt=true default). Committed nova-mssql 23b2c79.
 
-### MySQL / SCRAM auth trust ; UNSOUND ; swept
+### MySQL / SCRAM auth trust ; SOUND ; case + probe
 
-- [ ] MySQL caching_sha2 does not send the password against an unverified server RSA key over plaintext.
-- [ ] The SCRAM ServerSignature is verified (currently never checked; rogue-server accept).
+- [x] MySQL caching_sha2 does not send the password against an unverified server RSA key over plaintext.
+      FIXED (nova-mysql): `caching_sha2` full-auth (AuthMoreData 0x04) now refuses to retrieve the server's
+      RSA public key and send the password under it over a PLAINTEXT link unless the caller opts in with
+      `?allowPublicKeyRetrieval=true` (default false, matching Connector/J). `myAuthFinish` takes a `secure`
+      flag (true on the TLS paths); insecure + no opt-in FAILS CLOSED (`markFailed`). Test 113 (opt-in
+      parsing + driver compiles). Also implemented the missing `Connection.queryWire` so the driver
+      type-checks. Committed nova-mysql cd90131.
+- [x] The SCRAM ServerSignature is verified (was never checked -> rogue-server accept). FIXED: std
+      `ScramClient.expectedServerSignature` (lang case 411, RFC 7677/5802 vectors) + nova-postgres `auth`
+      `verifyServerFinal`/`isSaslFinal`; `pgConnectAsync` tracks scramUsed/scramVerified and FAILS CLOSED
+      (closes the socket) on a `v=` mismatch OR if SCRAM finishes without a verified signature (a server that
+      skips the final). Test 112 (genuine accepted, forged rejected, non-final vacuous, RFC vector).
+      Committed lang d4351c4, nova-postgres 5c79837.
 
 ### Per-connection buffer leaks ; UNSOUND ; swept
 
