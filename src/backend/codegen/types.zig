@@ -751,6 +751,41 @@ pub fn isValueStructName(self: *LlvmCompiler, name: []const u8) bool {
     return false;
 }
 
+// Channels 1/3/5 (value-semantics): a "pure value DTO" is a declared `struct` (value type) that would be
+// value-lowered were it not escape-excluded for a benign reason -- constructed-and-returned (channel 1),
+// serde-bound (3), or passed as a type-param arg (5). It has NO trait impl (channel 2 -- may be widened to
+// a fat pointer / used as a shared handle) and ONLY scalar / string / nested-pure-value-struct fields (a
+// container / class / optional / decimal field is channel 4 -- shared-mutable state that must NOT be
+// deep-copied). Such a struct is safe to DEEP-COPY on `let b = a` for value semantics even while it stays
+// on the heap; the trait/container structs (the "should be class" shared-state types that crashed the
+// blanket experiment) are structurally excluded. Cycle-guarded (a by-value cycle is rejected by P2 anyway).
+pub fn isPureValueStructName(self: *LlvmCompiler, name: []const u8) bool {
+    if (!arc_mod.value_structs_enabled) return false;
+    var visited = std.StringHashMap(void).init(self.allocator);
+    defer visited.deinit();
+    return isPureValueStructRec(self, name, &visited);
+}
+fn isPureValueStructRec(self: *LlvmCompiler, name: []const u8, visited: *std.StringHashMap(void)) bool {
+    const base = getStructBaseName(name);
+    if (base.len == 0 or visited.contains(base)) return false;
+    visited.put(base, {}) catch return false;
+    const sd = self.structs.get(base) orelse return false;
+    if (sd.is_reference) return false; // `class`
+    if (self.isCollidingStruct(sd.name)) return false;
+    if (sd.impls.len > 0) return false; // channel 2: trait impl -> may be widened / shared
+    for (sd.fields) |fld| {
+        const fts = self.typeRefToString(fld.type_name) catch return false;
+        if (std.mem.eql(u8, fts, "string")) continue;
+        if (isScalarFieldTypeName(fts)) continue;
+        const fbase = getStructBaseName(fts);
+        if (self.structs.get(fbase)) |fsd| {
+            if (!fsd.is_reference and isPureValueStructRec(self, fbase, visited)) continue;
+        }
+        return false; // container / class / optional / decimal / function field -> not a pure value DTO
+    }
+    return true;
+}
+
 // M-1: does a value struct have any OWNED (reference) field that needs retain-on-copy /
 // release-on-drop? A scalar-only value struct has none, so it needs no drop at all.
 // True when a value struct transitively needs destruction, i.e. it has a directly-owned field OR a

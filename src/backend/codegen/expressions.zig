@@ -134,6 +134,17 @@ pub fn buildOptionalStructDeepCopy(self: *LlvmCompiler, src: types.LLVMValueRef,
     return phi;
 }
 
+// Channels 1/3/5 / Design B: value-semantic copy of a heap-resident (escape-excluded) PURE value struct.
+// The struct is always present (unlike an optional), so: allocate a fresh heap object, copy the bytes, and
+// transitively retain the owned fields. Returns the fresh pointer, independent of `src`.
+pub fn buildHeapStructDeepCopy(self: *LlvmCompiler, src: types.LLVMValueRef, base: []const u8) anyerror!types.LLVMValueRef {
+    const size = self.getTypeSize(ast.TypeRef{ .ident = getStructBaseName(base) }, false);
+    const new_ptr = try self.compileAlloc(core.LLVMConstInt(self.val_type, if (size == 0) 8 else size, 0));
+    _ = try self.buildValueStructCopyInto(new_ptr, src, size);
+    try self.retainValueStructOwnedFields(new_ptr, base);
+    return new_ptr;
+}
+
 pub fn buildValueStructCopy(self: *LlvmCompiler, src: types.LLVMValueRef, size: u32) anyerror!types.LLVMValueRef {
     const dst = try self.buildValueStructStorage(size);
     const copy_fn = if (self.func_map.get("nova_bytes_copy")) |f| f else blk: {

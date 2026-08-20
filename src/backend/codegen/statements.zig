@@ -237,6 +237,11 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
                                     } else {
                                         try self.compileRetain(val);
                                     }
+                                } else if (!self.isValueStructName(tt) and self.isPureValueStructName(tt)) {
+                                    // Channels 1/3/5: a heap-resident (escape-excluded) PURE value DTO copied
+                                    // from a borrow must deep-copy for value semantics, not alias. isValueStructName
+                                    // is false here (it is excluded), so line-249's inline copy does not fire.
+                                    val = try self.buildHeapStructDeepCopy(val, tt);
                                 } else {
                                     try self.compileRetain(val);
                                 }

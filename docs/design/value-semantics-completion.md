@@ -103,10 +103,16 @@ Each channel is an independent, gated increment. Over-exclusion stays the safe f
      a shared struct, and mutate through one. Design B for it is also more complex than 6a (the box carries
      `[tag][payload]`, not just a pointer). Payload stays on the heap (safe, functional). The `.error_union`
      exclusion in `computeValueEscapeSet` is intentionally kept.
-3. **Channel 1 (return by value)** — return structs via sret ABI instead of pointer-to-stack-alloca. Touches
-   the calling convention; unblocks channel 3.
-4. **Channel 3 (@serializable binder)** — make `<T>__bind` binders return by value / sret. Depends on #3.
-5. **Channel 5 (direct type-param field)** — store the monomorphized value inline (size known post-mono).
+3-5. **Channels 1 (return), 3 (@serializable), 5 (type-param field). ✅ DONE together (2026-08-20).** All
+   three keep a *pure value DTO* on the heap for a benign reason. Rather than three different ABI changes,
+   one uniform Design-B fix closes them: `isPureValueStructName` (types.zig) = a declared `struct` with no
+   trait impl and only scalar/string/nested-pure-value-struct fields (this STRUCTURALLY excludes channels
+   2/4 -- the trait/container shared-state types that must NOT be deep-copied and crashed the blanket
+   experiment). At the let-binding copy site, a borrow-RHS whose type is such a struct but is escape-excluded
+   (`!isValueStructName && isPureValueStructName`) is DEEP-COPIED via `buildHeapStructDeepCopy` (fresh alloc +
+   copy + transitive retain) instead of aliased. Gate: value semantics (`let b=a; b.x=99` leaves `a.x`),
+   owned-field copies ARC/ASAN clean, corpus 391/394 + ASAN 391/394 (3 pre-existing). Case
+   `384_returned_value_struct_copy`.
 6. **Channel 2 (trait-impl)** — box at the widening point: copy the value into a heap allocation only when
    creating the fat pointer, so the struct is value-semantic everywhere else. Must pin the boxed lifetime.
 7. **Channel 4 (container/optional/decimal fields)** — LAST and HARDEST. A `List<T>` field is a value struct
