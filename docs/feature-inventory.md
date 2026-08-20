@@ -60,12 +60,14 @@ Deliberate architectural choices, stated as what we HAVE. The identity of the pl
 - [x] `where` clauses parse and document intent.
 - [ ] A type that does not satisfy a bound is rejected at compile time (currently advisory only).
 
-### Enums and pattern matching ; SOUND ; case
+### Enums and pattern matching ; SOUND ; case + probe
 - [x] Payload-less, single-payload, tuple-form, and struct-form variants.
 - [x] `switch` with destructuring binds payloads.
 - [x] Case guards (`case v if cond`).
 - [x] ARC destructors run for refcounted enum payloads.
-- [~] Exhaustiveness is always enforced (currently skipped when the discriminant type cannot be resolved).
+- [x] A non-exhaustive switch on a typed enum is a compile error (probe: "variant not handled").
+- [~] Exhaustiveness is enforced even when the discriminant type cannot be resolved (that edge is the
+  fail-closed-checker item below).
 
 ### Error handling (`T | E`, `try`, `catch`, `errdefer`) ; SOUND ; case
 - [x] `try` propagates the error arm to the enclosing function.
@@ -95,9 +97,19 @@ Deliberate architectural choices, stated as what we HAVE. The identity of the pl
 - [ ] Closure parameters are typed (currently untyped, inferred from the call site).
 - [ ] An escaping closure environment is freed (currently leaks, see below).
 
-### Escaping closure environment leak ; UNSOUND ; swept
-- [ ] A returned closure's environment box is ARC'd and freed (currently leaks ~46 B, not ARC'd).
-- Test criterion: an ASAN run over a function that returns a capturing closure shows 0 leaks.
+### Escaping closure environment leak ; UNSOUND ; read
+- [ ] A closure's box and environment are freed, and its captured owned values released.
+- Confirmed via codegen (`expressions.zig:4365,4385`): the box `{fn_ptr, env, cleanup}` and the env are
+  `compileAllocPersistent` (never freed), and the cleanup function that would release captured owned values is
+  built but NEVER CALLED. So the env, the box, and every retained capture leak. (The ARC audit and `nova test`
+  ASAN give a FALSE clean here because persistent allocations are not ARC objects and `nova test` does not run
+  LSan.) Fix is a real sub-project with a prerequisite: BLOCKER found this session, function values are NOT
+  uniformly represented, a closure is a 3-slot box `{fn_ptr, env, cleanup}` but a bare function reference is a
+  RAW fn-pointer (`fnRefInt`, `expressions.zig:427`). Both carry the type `.func`, so marking `.func` owned
+  would `nova_release` a raw code pointer for bare fn-refs and crash. Step 1: unify the representation (box
+  every function value, `env=0,cleanup=0` for a bare ref); step 2: a single generic box destructor + owned
+  `.func`. Test criterion: a built binary that returns and drops a capturing closure shows 0 leaks, corpus
+  stays 395/398, OSSA-hard stays 398/398.
 
 ### Integers (`int` 32-bit, `long` 64-bit) ; SOUND ; probe
 - [x] `int` is 32-bit two's-complement with defined wraparound; `long` is 64-bit.
