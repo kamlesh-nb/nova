@@ -66,10 +66,12 @@ marking any of them [x] requires an actual code fix that a probe or gate verifie
 - [ ] Nested generics beyond depth 2 are eagerly monomorphised, not left to the erased fallback (currently a
   hard `max_depth=2` cap, so deeper nests run on the erased path).
 
-### Traits and dynamic dispatch ; PARTIAL ; case
+### Traits and dynamic dispatch ; PARTIAL ; case + probe
 - [x] Dynamic dispatch via fat pointers `{struct_ptr, vtable}`; vtable slot 0 is the destructor.
 - [x] Checked downcast (`x as T`) traps on a wrong concrete type.
-- [ ] Trait default methods work cross-module (currently same-module only).
+- [x] Trait default methods work cross-module (FIXED: `pipeline.expandTraitDefaults` re-runs the default-body
+  copy on the fully-merged decls; probe: a struct in one module inherits a default from a trait in another;
+  corpus 395/398, same-module case 301 green).
 - [ ] Generic trait dispatch is monomorphic, not type-erased (currently erased, one slot per method).
 
 ### Generic bounds (`where T: Bound`) ; PARTIAL ; probe

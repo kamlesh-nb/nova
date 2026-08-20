@@ -249,6 +249,7 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
     const helpers_prog = try helpers_p.parseProgram();
     try filtered_decls.appendSlice(allocator, helpers_prog.declarations);
 
+    try pipeline.expandTraitDefaults(allocator, &filtered_decls); // cross-module trait default methods
     try pipeline.generateControllerRoutes(allocator, &filtered_decls);
     try pipeline.generateSerdeBinders(allocator, &filtered_decls, is_wasm);
     try pipeline.generateMediatorDispatch(allocator, &filtered_decls, is_wasm);

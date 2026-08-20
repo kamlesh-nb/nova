@@ -773,6 +773,69 @@ pub fn resolveFromLocalPackages(module_name: []const u8, importer_dir: []const u
 }
 
 
+// Copy a trait's DEFAULT method bodies onto every struct that impls the trait but does not override the
+// method. The parser does this per file, so a struct only inherited defaults from traits declared in the SAME
+// file; a trait in another module was invisible and the completeness check then reported the method missing.
+// Running it again here on the FULLY-MERGED declaration list closes that cross-module gap. Idempotent: a
+// method already present (same-file expansion, or a real override) is skipped, so re-running copies only the
+// cross-module defaults.
+fn tdStructHasMethod(methods: []const ast.MethodDecl, name: []const u8) bool {
+    for (methods) |m| if (std.mem.eql(u8, m.decl.name, name)) return true;
+    return false;
+}
+fn tdFindTrait(decls: []const ast.Declaration, name: []const u8) ?ast.TraitDecl {
+    for (decls) |d| if (d == .trait_decl and std.mem.eql(u8, d.trait_decl.name, name)) return d.trait_decl;
+    return null;
+}
+fn tdSelfTypeRef(allocator: std.mem.Allocator, sd: ast.StructDecl) !ast.TypeRef {
+    if (sd.type_params.len == 0) return ast.TypeRef{ .ident = sd.name };
+    const params = try allocator.alloc(ast.TypeRef, sd.type_params.len);
+    for (sd.type_params, 0..) |tp, i| params[i] = ast.TypeRef{ .ident = tp };
+    return ast.TypeRef{ .generic = .{ .name = sd.name, .params = params } };
+}
+pub fn expandTraitDefaults(allocator: std.mem.Allocator, declarations: *std.ArrayList(ast.Declaration)) !void {
+    const decls = declarations.items;
+    for (decls) |*d| {
+        if (d.* != .struct_decl) continue;
+        const sd = &d.struct_decl;
+        if (sd.impls.len == 0) continue;
+        var methods = std.ArrayList(ast.MethodDecl).empty;
+        defer methods.deinit(allocator);
+        try methods.appendSlice(allocator, sd.methods);
+        var added = false;
+        for (sd.impls) |impl| {
+            const trait = tdFindTrait(decls, impl.name) orelse continue;
+            for (trait.methods) |tm| {
+                const body = tm.default_body orelse continue;
+                if (tdStructHasMethod(methods.items, tm.name)) continue;
+                const new_params = try allocator.alloc(ast.Param, tm.params.len);
+                for (tm.params, 0..) |p, i| {
+                    if (i == 0 and std.mem.eql(u8, p.name, "self")) {
+                        new_params[i] = .{ .name = p.name, .type_name = try tdSelfTypeRef(allocator, sd.*), .span = p.span };
+                    } else new_params[i] = p;
+                }
+                try methods.append(allocator, ast.MethodDecl{
+                    .is_public = true,
+                    .is_static = false,
+                    .decl = ast.FunctionDecl{
+                        .name = tm.name,
+                        .params = new_params,
+                        .ret_type = tm.ret_type,
+                        .body = body,
+                        .is_exported = false,
+                        .attributes = &.{},
+                        .type_params = sd.type_params,
+                        .is_async = tm.is_async,
+                        .span = tm.span,
+                    },
+                });
+                added = true;
+            }
+        }
+        if (added) sd.methods = try methods.toOwnedSlice(allocator);
+    }
+}
+
 pub fn generateControllerRoutes(allocator: std.mem.Allocator, declarations: *std.ArrayList(ast.Declaration)) !void {
     for (declarations.items) |*decl| {
         if (decl.* == .struct_decl) {

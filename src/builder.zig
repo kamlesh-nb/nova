@@ -130,6 +130,7 @@ fn compileProgram(
         const helpers_prog = try helpers_p.parseProgram();
         try declarations.appendSlice(allocator, helpers_prog.declarations);
     }
+    try pipeline.expandTraitDefaults(allocator, &declarations); // cross-module trait default methods
     try pipeline.generateControllerRoutes(allocator, &declarations);
     try pipeline.generateSerdeBinders(allocator, &declarations, is_wasm);
     try pipeline.generateMediatorDispatch(allocator, &declarations, is_wasm);
