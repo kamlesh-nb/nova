@@ -436,17 +436,63 @@ fn crcTable(): ptr {
     return t;
 }
 
+// Slice-by-8 CRC tables: 8 tables of 256 32-bit entries. T[0] is the standard table; T[k][b] =
+// (T[k-1][b] >> 8) ^ T[0][T[k-1][b] & 0xff]. Lets crc32 fold 8 input bytes per iteration instead of one,
+// which is where the CRC time went once the encoder itself got fast (it was ~17% of gzipCompress).
+const CRC8: ptr = crc8Table();
+fn crc8Table(): ptr {
+    let t = ibuf(8 * 256);
+    let poly: long = 3988292384; // 0xEDB88320
+    let n = 0;
+    while (n < 256) {
+        let c: long = n as long;
+        let k = 0;
+        while (k < 8) {
+            if ((c & 1) != 0) { c = poly ^ (c >> 1); } else { c = c >> 1; }
+            k = k + 1;
+        }
+        wr32(t, n, (c & MASK32) as int);
+        n = n + 1;
+    }
+    let kk = 1;
+    while (kk < 8) {
+        let b = 0;
+        while (b < 256) {
+            let prev: long = (rd32(t, (kk - 1) * 256 + b) as long) & MASK32;
+            let v: long = ((prev >> 8) ^ ((rd32(t, (prev & 255) as int) as long) & MASK32)) & MASK32;
+            wr32(t, kk * 256 + b, v as int);
+            b = b + 1;
+        }
+        kk = kk + 1;
+    }
+    return t;
+}
+fn crcT(k: int, x: int): long { return (rd32(CRC8, k * 256 + x) as long) & MASK32; }
+
 // Returns the CRC32 as an unsigned 32-bit value held in a long (0..0xFFFFFFFF).
 pub fn crc32(data: string): long {
     let c: long = MASK32;
+    let len = data.length;
     let i = 0;
-    while (i < data.length) {
+    // Fold 8 bytes per step (slice-by-8) while a full word stays in bounds.
+    while (i + 8 <= len) {
+        let w: ulong = mem.load<ulong>(data, i, endian.Endian.little);
+        let one: long = (c ^ ((w & MASK32) as long)) & MASK32;
+        let two: long = ((w >> 32) & MASK32) as long;
+        c = crcT(7, (one & 255) as int)
+          ^ crcT(6, ((one >> 8) & 255) as int)
+          ^ crcT(5, ((one >> 16) & 255) as int)
+          ^ crcT(4, ((one >> 24) & 255) as int)
+          ^ crcT(3, (two & 255) as int)
+          ^ crcT(2, ((two >> 8) & 255) as int)
+          ^ crcT(1, ((two >> 16) & 255) as int)
+          ^ crcT(0, ((two >> 24) & 255) as int);
+        i = i + 8;
+    }
+    // Byte tail.
+    while (i < len) {
         let idx = ((c ^ (bytes.read_byte(data, i) as long)) & 255) as int;
-        let tv: long = (bytes.read_byte(CRC_TABLE, idx * 4) as long)
-            | ((bytes.read_byte(CRC_TABLE, idx * 4 + 1) as long) << 8)
-            | ((bytes.read_byte(CRC_TABLE, idx * 4 + 2) as long) << 16)
-            | ((bytes.read_byte(CRC_TABLE, idx * 4 + 3) as long) << 24);
-        c = (tv ^ (c >> 8)) & MASK32;
+        c = (crcT(0, idx) ^ (c >> 8)) & MASK32;
         i = i + 1;
     }
     return c ^ MASK32;
@@ -565,115 +611,688 @@ fn distCode(d: int): int {
     return i;
 }
 
-fn hash3(data: string, pos: int): int {
-    let a = bytes.read_byte(data, pos);
-    let b = bytes.read_byte(data, pos + 1);
-    let c = bytes.read_byte(data, pos + 2);
-    return ((a << 10) ^ (b << 5) ^ c) & 32767;
+// O(1) code lookups: the linear scans above showed up as ~20% of encode time (called twice per match).
+// LEN_CODE[len] for len 3..258; distances split zlib-style into a direct table (d<=256) and a bucketed
+// table indexed by (d-1)>>7 (each 128-wide bucket maps to exactly one distance code for d>256).
+const LEN_CODE: ptr = lenCodeTable();
+const DIST_CODE_LOW: ptr = distCodeLowTable();
+const DIST_CODE_HIGH: ptr = distCodeHighTable();
+fn lenCodeTable(): ptr {
+    let t = bytes.alloc(259 * 2);
+    let l = 3;
+    while (l <= 258) { wr16(t, l, lengthCode(l)); l = l + 1; }
+    return t;
+}
+fn distCodeLowTable(): ptr {
+    let t = bytes.alloc(257 * 2);
+    let d = 1;
+    while (d <= 256) { wr16(t, d, distCode(d)); d = d + 1; }
+    return t;
+}
+fn distCodeHighTable(): ptr {
+    let t = bytes.alloc(256 * 2);
+    let k = 0;
+    while (k < 256) { wr16(t, k, distCode((k << 7) + 1)); k = k + 1; }
+    return t;
+}
+fn lengthCodeFast(l: int): int { return rd16(LEN_CODE, l); }
+fn distCodeFast(d: int): int {
+    if (d <= 256) { return rd16(DIST_CODE_LOW, d); }
+    return rd16(DIST_CODE_HIGH, (d - 1) >> 7);
 }
 
-// Encode a raw DEFLATE stream (single final fixed-Huffman block) via greedy LZ77.
-pub fn deflateRaw(data: string): ByteBuf {
-    let bw = BitWriter();
-    bw.writeBit(1);      // BFINAL = 1
-    bw.writeBits(1, 2);  // BTYPE = 01 (fixed Huffman)
+// Dual-hash matcher tables (Go compress/flate level-6 model). Instead of walking a hash chain N deep,
+// the matcher keeps two direct-mapped tables: a short 4-byte hash and a long 7-byte hash (with cur+prev
+// entries). Each position looks at a handful of candidates (long cur/prev, short, repeat-offset) rather
+// than a chain, so match finding is O(1) per byte, which is where Go's encode speed comes from. Both
+// tables use Fibonacci hashing (multiply by the golden-ratio constant, take the top bits).
+const HASHL_BITS: int = 17;
+const HASHL_SIZE: int = 131072;      // 1 << HASHL_BITS (short and long tables share this size)
+const HASHL_MASK: int = 131071;
+const HASH_MUL: ulong = 2654435761;               // 2^32 * golden ratio (32-bit key mix)
+const HASH_MUL64: ulong = 0x9E3779B185EBCA87;   // 2^64 * golden ratio
 
-    let n = data.length;
-    let head = bytes.alloc(32768 * 4);
-    let prev = bytes.alloc((n + 1) * 4);
-    let h = 0;
-    while (h < 32768) { wr32(head, h, -1); h = h + 1; }
+// Short hash of the 4 bytes at pos. Requires pos + 8 <= n (we load a full word and mask).
+fn hashS(data: string, pos: int): int {
+    let w: ulong = mem.load<ulong>(data, pos, endian.Endian.little) & 4294967295;
+    return ((((w * HASH_MUL) & 4294967295) >> (32 - HASHL_BITS)) as int) & HASHL_MASK;
+}
+// Long hash of the 7 bytes at pos. Requires pos + 8 <= n.
+fn hashL(data: string, pos: int): int {
+    let w: ulong = mem.load<ulong>(data, pos, endian.Endian.little) & 72057594037927935;  // low 7 bytes
+    return (((w * HASH_MUL64) >> (64 - HASHL_BITS)) as int) & HASHL_MASK;
+}
 
-    let pos = 0;
-    while (pos < n) {
-        let bestLen = 0;
-        let bestDist = 0;
-        if (pos + 2 < n) {
-            let hv = hash3(data, pos);
-            let cand = rd32(head, hv);
-            let chain = 0;
-            let maxLen = n - pos;
-            if (maxLen > 258) { maxLen = 258; }
-            while (cand >= 0 && chain < 256) {
-                if (pos - cand <= 32768) {
-                    // FR-deflate-3: best-length-first skip. A candidate can only beat the current best
-                    // if the byte at offset bestLen matches (and the one just before it). On real HTML
-                    // most candidates are killed by this one comparison, before any full compare. The
-                    // chosen match is unchanged: the full loop already keeps the first (nearest) match of
-                    // a given length via `l > bestLen`, so rejecting candidates that cannot exceed bestLen
-                    // is bit-identical output, only faster. bestLen < maxLen here (a full match sets
-                    // cand = -1 and exits), so cand + bestLen and pos + bestLen stay in bounds.
-                    let skip = false;
-                    if (bestLen > 0) {
-                        if (bytes.read_byte(data, cand + bestLen) != bytes.read_byte(data, pos + bestLen)) {
-                            skip = true;
-                        } else if (bytes.read_byte(data, cand + bestLen - 1) != bytes.read_byte(data, pos + bestLen - 1)) {
-                            skip = true;
-                        }
-                    }
-                    if (!skip) {
-                        // FR-deflate-4: SWAR word-at-a-time compare. Load 8 bytes from each side, XOR, and
-                        // if any byte differs the little-endian trailing-zero count over 8 gives how many
-                        // low bytes matched. Only used while a full 8-byte window stays inside maxLen (so it
-                        // never reads past pos + maxLen <= n); the remainder falls to the byte loop. On the
-                        // long matches HTML produces this is several times faster than one byte per step.
-                        let l = 0;
-                        while (l + 8 <= maxLen) {
-                            let wa = mem.load<ulong>(data, cand + l, endian.Endian.little);
-                            let wb = mem.load<ulong>(data, pos + l, endian.Endian.little);
-                            let x = wa ^ wb;
-                            if (x == 0) {
-                                l = l + 8;
-                            } else {
-                                l = l + (mem.ctz<ulong>(x) >> 3);
-                                break;
-                            }
-                        }
-                        while (l < maxLen && bytes.read_byte(data, cand + l) == bytes.read_byte(data, pos + l)) {
-                            l = l + 1;
-                        }
-                        if (l > bestLen) {
-                            bestLen = l;
-                            bestDist = pos - cand;
-                            if (l >= maxLen) { cand = -1; }
-                        }
-                    }
-                }
-                if (cand >= 0) { cand = rd32(prev, cand); }
-                chain = chain + 1;
+// Length of the byte match between positions a and b, capped at maxLen. Uses the word-at-a-time (SWAR)
+// compare, then a byte tail. Callers guarantee b + maxLen <= n and a < b, so all reads stay in bounds.
+fn matchLen(data: string, a: int, b: int, maxLen: int): int {
+    let l = 0;
+    while (l + 8 <= maxLen) {
+        let wa = mem.load<ulong>(data, a + l, endian.Endian.little);
+        let wb = mem.load<ulong>(data, b + l, endian.Endian.little);
+        let x = wa ^ wb;
+        if (x == 0) { l = l + 8; }
+        else { l = l + (mem.ctz<ulong>(x) >> 3); break; }
+    }
+    while (l < maxLen && bytes.read_byte(data, a + l) == bytes.read_byte(data, b + l)) { l = l + 1; }
+    return l;
+}
+
+// ================================================================================================
+// Dynamic-Huffman block encoder (Go compress/flate model). LZ77 fills a token buffer plus symbol
+// histograms; each block then picks the smallest of stored / fixed-Huffman / dynamic-Huffman, builds
+// length-limited canonical codes (RFC 1951 3.2.2), and writes the block. This closes the ratio gap that
+// the old fixed-Huffman-only path left open (digit-heavy inputs shrink from ~0.68 to ~0.47, matching Go).
+// ================================================================================================
+
+const LITLEN_SYMS: int = 286;   // literal/length alphabet (0..285); 256 = end-of-block
+const OFFSET_SYMS: int = 30;    // distance alphabet
+const CODEGEN_SYMS: int = 19;   // code-length-code alphabet
+const MAX_BLOCK_TOKENS: int = 16384;  // flush a block at this many tokens (keeps freqs < 2^16)
+const MAXI32: int = 2147483647;
+const BADCODE: int = 255;       // codegen stream terminator (symbols are 0..18, extras < 255)
+
+// Match token packing in the token int-buffer: literals are 0..255; a match sets bit 24 and packs
+// (length-3) in bits 15..22 and (distance-1) in bits 0..14. Max value < 2^25, safe in a signed int.
+const TOK_MATCH: int = 16777216;  // 1 << 24
+
+// int-indexed scratch buffers (4 bytes/slot) reuse wr32/rd32 above.
+fn ibuf(nslots: int): ptr { return bytes.alloc(nslots * 4); }
+fn izero(p: ptr, nslots: int): void {
+    let i = 0;
+    while (i < nslots) { wr32(p, i, 0); i = i + 1; }
+}
+
+// codegen order (RFC 1951 3.2.7): the order code-length-code lengths are transmitted in.
+const CODEGEN_ORDER: ptr = codegenOrderTable();
+fn codegenOrderTable(): ptr {
+    let t = bytes.alloc(CODEGEN_SYMS);
+    fillBytes(t, "16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15");
+    return t;
+}
+
+// Fixed-Huffman code lengths (RFC 1951 3.2.6), used both to size the fixed alternative and to emit it.
+const FIXED_LIT_LEN: ptr = fixedLitLenTable();
+const FIXED_LIT_CODE: ptr = fixedLitCodeTable();
+const FIXED_OFF_LEN: ptr = fixedOffLenTable();
+const FIXED_OFF_CODE: ptr = fixedOffCodeTable();
+fn fixedLitLenTable(): ptr {
+    let t = bytes.alloc(LITLEN_SYMS);
+    let i = 0;
+    while (i < 144) { bytes.write_byte(t, i, 8); i = i + 1; }
+    while (i < 256) { bytes.write_byte(t, i, 9); i = i + 1; }
+    while (i < 280) { bytes.write_byte(t, i, 7); i = i + 1; }
+    while (i < 286) { bytes.write_byte(t, i, 8); i = i + 1; }
+    return t;
+}
+fn fixedLitCodeTable(): ptr {
+    let c = ibuf(LITLEN_SYMS);
+    assignCanonical(FIXED_LIT_LEN, LITLEN_SYMS, c);
+    return c;
+}
+fn fixedOffLenTable(): ptr {
+    let t = bytes.alloc(OFFSET_SYMS);
+    let i = 0;
+    while (i < OFFSET_SYMS) { bytes.write_byte(t, i, 5); i = i + 1; }
+    return t;
+}
+fn fixedOffCodeTable(): ptr {
+    let c = ibuf(OFFSET_SYMS);
+    assignCanonical(FIXED_OFF_LEN, OFFSET_SYMS, c);
+    return c;
+}
+
+// Canonical (RFC 1951 3.2.2) code assignment from per-symbol bit lengths. Codes are MSB-first (not
+// bit-reversed), which is exactly what BitWriter.writeHuff consumes. len is a byte buffer, outCode int.
+fn assignCanonical(len: ptr, size: int, outCode: ptr): void {
+    let blCount = ibuf(16);
+    izero(blCount, 16);
+    let i = 0;
+    while (i < size) {
+        let l = bytes.read_byte(len, i);
+        wr32(blCount, l, rd32(blCount, l) + 1);
+        i = i + 1;
+    }
+    wr32(blCount, 0, 0);
+    let nextCode = ibuf(16);
+    izero(nextCode, 16);
+    let code = 0;
+    let bits = 1;
+    while (bits < 16) {
+        code = (code + rd32(blCount, bits - 1)) << 1;
+        wr32(nextCode, bits, code);
+        bits = bits + 1;
+    }
+    i = 0;
+    while (i < size) {
+        let l = bytes.read_byte(len, i);
+        if (l != 0) {
+            let c = rd32(nextCode, l);
+            wr32(outCode, i, c);
+            wr32(nextCode, l, c + 1);
+        } else {
+            wr32(outCode, i, 0);
+        }
+        i = i + 1;
+    }
+    bytes.free(blCount);
+    bytes.free(nextCode);
+}
+
+// Insertion sort of parallel (literal, freq) arrays by key = freq*1024 + literal, ascending.
+// Blocks are large, count <= 286, so O(count^2) is negligible against the LZ77 pass.
+fn sortNodes(lit: ptr, freq: ptr, count: int): void {
+    let i = 1;
+    while (i < count) {
+        let kl = rd32(lit, i);
+        let kf = rd32(freq, i);
+        let key = (kf << 10) | kl;
+        let j = i - 1;
+        while (j >= 0 && ((rd32(freq, j) << 10) | rd32(lit, j)) > key) {
+            wr32(lit, j + 1, rd32(lit, j));
+            wr32(freq, j + 1, rd32(freq, j));
+            j = j - 1;
+        }
+        wr32(lit, j + 1, kl);
+        wr32(freq, j + 1, kf);
+        i = i + 1;
+    }
+}
+
+// Port of Go flate huffmanEncoder.bitCounts (RFC 1951 3.2.2 optimal length-limited code). nodeFreq is
+// the freq-sorted list of `count` real nodes (ascending); it fills bitCount[1..maxBits] with the number
+// of symbols to encode at each bit length. Requires count >= 3 (small cases handled by the caller).
+fn bitCounts(nodeLit: ptr, nodeFreq: ptr, count: int, maxBits0: int, bitCount: ptr): void {
+    let n = count;
+    // Sentinel maxNode at index n: freq = MaxInt32, literal = 65535.
+    wr32(nodeFreq, n, MAXI32);
+    wr32(nodeLit, n, 65535);
+
+    let maxBits = maxBits0;
+    if (maxBits > n - 1) { maxBits = n - 1; }
+
+    // levelInfo arrays, indexed by level 1..maxBits (+1 slack).
+    let lvLastFreq = ibuf(18);
+    let lvNextChar = ibuf(18);
+    let lvNextPair = ibuf(18);
+    let lvNeeded = ibuf(18);
+    izero(lvNeeded, 18);
+    // leafCounts[level][j] flattened as level*16 + j.
+    let leaf = ibuf(16 * 16);
+    izero(leaf, 16 * 16);
+
+    let level = 1;
+    while (level <= maxBits) {
+        wr32(lvLastFreq, level, rd32(nodeFreq, 1));
+        wr32(lvNextChar, level, rd32(nodeFreq, 2));
+        wr32(lvNextPair, level, rd32(nodeFreq, 0) + rd32(nodeFreq, 1));
+        wr32(leaf, level * 16 + level, 2);
+        if (level == 1) { wr32(lvNextPair, level, MAXI32); }
+        level = level + 1;
+    }
+    wr32(lvNeeded, maxBits, 2 * n - 4);
+
+    level = maxBits;
+    while (level < 16) {
+        let nextPair = rd32(lvNextPair, level);
+        let nextChar = rd32(lvNextChar, level);
+        if (nextPair == MAXI32 && nextChar == MAXI32) {
+            wr32(lvNeeded, level, 0);
+            wr32(lvNextPair, level + 1, MAXI32);
+            level = level + 1;
+            continue;
+        }
+        let prevFreq = rd32(lvLastFreq, level);
+        if (nextChar < nextPair) {
+            // Next item on this row is a leaf node.
+            let cnt = rd32(leaf, level * 16 + level) + 1;
+            wr32(lvLastFreq, level, nextChar);
+            wr32(leaf, level * 16 + level, cnt);
+            let eFreq = rd32(nodeFreq, cnt);
+            let eLit = rd32(nodeLit, cnt);
+            if (eLit < 65535) { wr32(lvNextChar, level, eFreq); }
+            else { wr32(lvNextChar, level, MAXI32); }
+        } else {
+            // Next item on this row is a pair from the previous row.
+            wr32(lvLastFreq, level, nextPair);
+            let save = rd32(leaf, level * 16 + level);
+            // leafCounts[level] = leafCounts[level-1] (copy the 16-int row).
+            let j = 0;
+            while (j < 16) { wr32(leaf, level * 16 + j, rd32(leaf, (level - 1) * 16 + j)); j = j + 1; }
+            wr32(leaf, level * 16 + level, save);
+            wr32(lvNeeded, level - 1, 2);
+        }
+
+        let need = rd32(lvNeeded, level) - 1;
+        wr32(lvNeeded, level, need);
+        if (need == 0) {
+            if (level == maxBits) { break; }
+            wr32(lvNextPair, level + 1, prevFreq + rd32(lvLastFreq, level));
+            level = level + 1;
+        } else {
+            while (rd32(lvNeeded, level - 1) > 0) { level = level - 1; }
+        }
+    }
+
+    // bitCount[bits] = leaf[maxBits][level] - leaf[maxBits][level-1], bits ascending from 1.
+    izero(bitCount, 17);
+    let bits = 1;
+    let lv = maxBits;
+    while (lv > 0) {
+        wr32(bitCount, bits, rd32(leaf, maxBits * 16 + lv) - rd32(leaf, maxBits * 16 + (lv - 1)));
+        bits = bits + 1;
+        lv = lv - 1;
+    }
+
+    bytes.free(lvLastFreq); bytes.free(lvNextChar); bytes.free(lvNextPair);
+    bytes.free(lvNeeded); bytes.free(leaf);
+}
+
+// Build length-limited canonical Huffman codes for a frequency table. Fills outLen (byte/symbol) and
+// outCode (int/symbol). maxBits caps the code length (15 for lit/dist, 7 for the codegen alphabet).
+fn genHuff(freq: ptr, size: int, maxBits: int, outLen: ptr, outCode: ptr): void {
+    // Collect non-zero symbols; zero-freq symbols get length 0.
+    let nodeLit = ibuf(size + 2);
+    let nodeFreq = ibuf(size + 2);
+    let count = 0;
+    let i = 0;
+    while (i < size) {
+        bytes.write_byte(outLen, i, 0);
+        let f = rd32(freq, i);
+        if (f != 0) {
+            wr32(nodeLit, count, i);
+            wr32(nodeFreq, count, f);
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+
+    if (count == 0) {
+        assignCanonical(outLen, size, outCode);
+        bytes.free(nodeLit); bytes.free(nodeFreq);
+        return;
+    }
+    if (count <= 2) {
+        // Everything gets bit length 1.
+        let k = 0;
+        while (k < count) { bytes.write_byte(outLen, rd32(nodeLit, k), 1); k = k + 1; }
+        assignCanonical(outLen, size, outCode);
+        bytes.free(nodeLit); bytes.free(nodeFreq);
+        return;
+    }
+
+    sortNodes(nodeLit, nodeFreq, count);
+    let bitCount = ibuf(17);
+    bitCounts(nodeLit, nodeFreq, count, maxBits, bitCount);
+
+    // Assign lengths: shortest codes to the highest-frequency symbols (end of the sorted list).
+    let idx = count;
+    let b = 1;
+    while (b <= maxBits) {
+        let c = rd32(bitCount, b);
+        let k = 0;
+        while (k < c) {
+            idx = idx - 1;
+            bytes.write_byte(outLen, rd32(nodeLit, idx), b);
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    assignCanonical(outLen, size, outCode);
+    bytes.free(nodeLit); bytes.free(nodeFreq); bytes.free(bitCount);
+}
+
+// Sum of freq[i] * len[i] over a symbol range, i.e. the encoded bit count for that alphabet.
+fn bitLength(freq: ptr, len: ptr, size: int): int {
+    let total = 0;
+    let i = 0;
+    while (i < size) {
+        let f = rd32(freq, i);
+        if (f != 0) { total = total + f * bytes.read_byte(len, i); }
+        i = i + 1;
+    }
+    return total;
+}
+
+// Trim a length alphabet to the last used symbol, honouring a minimum count.
+fn numUsed(len: ptr, size: int, minCount: int): int {
+    let nm = size;
+    while (nm > minCount && bytes.read_byte(len, nm - 1) == 0) { nm = nm - 1; }
+    return nm;
+}
+
+// RLE-encode the concatenated lit+offset code lengths into the codegen stream (RFC 1951 3.2.7), and
+// tally codegenFreq[0..18]. Mirrors Go flate generateCodegen. Returns the codegen stream length.
+fn generateCodegen(litLen: ptr, numLit: int, offLen: ptr, numOff: int,
+                   codegen: ptr, codegenFreq: ptr): int {
+    izero(codegenFreq, CODEGEN_SYMS);
+    // Concatenate the code sizes with a badCode marker at the end, in a scratch byte buffer.
+    let total = numLit + numOff;
+    let cg = bytes.alloc(total + 1);
+    let i = 0;
+    while (i < numLit) { bytes.write_byte(cg, i, bytes.read_byte(litLen, i)); i = i + 1; }
+    i = 0;
+    while (i < numOff) { bytes.write_byte(cg, numLit + i, bytes.read_byte(offLen, i)); i = i + 1; }
+    bytes.write_byte(cg, total, BADCODE);
+
+    let size = bytes.read_byte(cg, 0);
+    let count = 1;
+    let outIndex = 0;
+    let inIndex = 1;
+    while (size != BADCODE) {
+        let nextSize = bytes.read_byte(cg, inIndex);
+        inIndex = inIndex + 1;
+        if (nextSize == size) {
+            count = count + 1;
+            continue;
+        }
+        if (size != 0) {
+            wr32(codegen, outIndex, size); outIndex = outIndex + 1;
+            wr32(codegenFreq, size, rd32(codegenFreq, size) + 1);
+            count = count - 1;
+            while (count >= 3) {
+                let m = 6;
+                if (count < 6) { m = count; }
+                wr32(codegen, outIndex, 16); outIndex = outIndex + 1;
+                wr32(codegen, outIndex, m - 3); outIndex = outIndex + 1;
+                wr32(codegenFreq, 16, rd32(codegenFreq, 16) + 1);
+                count = count - m;
+            }
+        } else {
+            while (count >= 11) {
+                let m = 138;
+                if (count < 138) { m = count; }
+                wr32(codegen, outIndex, 18); outIndex = outIndex + 1;
+                wr32(codegen, outIndex, m - 11); outIndex = outIndex + 1;
+                wr32(codegenFreq, 18, rd32(codegenFreq, 18) + 1);
+                count = count - m;
+            }
+            if (count >= 3) {
+                wr32(codegen, outIndex, 17); outIndex = outIndex + 1;
+                wr32(codegen, outIndex, count - 3); outIndex = outIndex + 1;
+                wr32(codegenFreq, 17, rd32(codegenFreq, 17) + 1);
+                count = 0;
             }
         }
-        if (bestLen >= 3) {
-            let lc = lengthCode(bestLen);
-            emitLitLen(bw, 257 + lc);
-            bw.writeBits(bestLen - rd16(LEN_BASE, lc), bytes.read_byte(LEN_EXTRA, lc));
-            let dc = distCode(bestDist);
-            bw.writeHuff(dc, 5);
-            bw.writeBits(bestDist - rd16(DIST_BASE, dc), bytes.read_byte(DIST_EXTRA, dc));
-            let k = 0;
-            while (k < bestLen) {
-                if (pos + k + 2 < n) {
-                    let hh = hash3(data, pos + k);
-                    wr32(prev, pos + k, rd32(head, hh));
-                    wr32(head, hh, pos + k);
-                }
+        count = count - 1;
+        while (count >= 0) {
+            wr32(codegen, outIndex, size); outIndex = outIndex + 1;
+            wr32(codegenFreq, size, rd32(codegenFreq, size) + 1);
+            count = count - 1;
+        }
+        size = nextSize;
+        count = 1;
+    }
+    wr32(codegen, outIndex, BADCODE);
+    bytes.free(cg);
+    return outIndex;
+}
+
+// Number of codegen code-length entries to transmit (>= 4), trailing zero-frequency ones trimmed.
+fn numCodegensUsed(codegenFreq: ptr): int {
+    let nc = CODEGEN_SYMS;
+    while (nc > 4 && rd32(codegenFreq, bytes.read_byte(CODEGEN_ORDER, nc - 1)) == 0) { nc = nc - 1; }
+    return nc;
+}
+
+// Emit every token in the block through the given (code,len) tables, then the end-of-block symbol.
+fn writeTokens(bw: BitWriter, toks: ptr, ntoks: int,
+               litCode: ptr, litLen: ptr, offCode: ptr, offLen: ptr): void {
+    let i = 0;
+    while (i < ntoks) {
+        let t = rd32(toks, i);
+        if ((t & TOK_MATCH) == 0) {
+            bw.writeHuff(rd32(litCode, t), bytes.read_byte(litLen, t));
+        } else {
+            let len = ((t >> 15) & 255) + 3;
+            let dist = (t & 32767) + 1;
+            let lc = lengthCodeFast(len);
+            let sym = 257 + lc;
+            bw.writeHuff(rd32(litCode, sym), bytes.read_byte(litLen, sym));
+            bw.writeBits(len - rd16(LEN_BASE, lc), bytes.read_byte(LEN_EXTRA, lc));
+            let dc = distCodeFast(dist);
+            bw.writeHuff(rd32(offCode, dc), bytes.read_byte(offLen, dc));
+            bw.writeBits(dist - rd16(DIST_BASE, dc), bytes.read_byte(DIST_EXTRA, dc));
+        }
+        i = i + 1;
+    }
+    bw.writeHuff(rd32(litCode, 256), bytes.read_byte(litLen, 256));  // end-of-block
+}
+
+// Write one block as a stored (uncompressed) block: BFINAL+BTYPE=00, align, LEN/NLEN, raw bytes.
+fn writeStored(bw: BitWriter, data: string, start: int, len: int, final: bool): void {
+    bw.writeBits(if (final) 1 else 0, 3);
+    bw.flush();
+    bw.writeBits(len & 65535, 16);
+    bw.writeBits((~len) & 65535, 16);
+    let i = 0;
+    while (i < len) { bw.out.push(bytes.read_byte(data, start + i)); i = i + 1; }
+}
+
+// Emit one block, choosing the smallest of stored / fixed / dynamic Huffman. litFreq/offFreq are the
+// token histograms (EOB not yet counted); extraBits is the total match extra-bit count; [start,end) is
+// the block's input span (for the stored fallback).
+fn emitBlock(bw: BitWriter, data: string, start: int, blkLen: int,
+             toks: ptr, ntoks: int, litFreq: ptr, offFreq: ptr, extraBits: int, final: bool): void {
+    wr32(litFreq, 256, rd32(litFreq, 256) + 1);  // count the end-of-block symbol
+
+    // Dynamic codes for both alphabets.
+    let litLen = bytes.alloc(LITLEN_SYMS);
+    let litCode = ibuf(LITLEN_SYMS);
+    genHuff(litFreq, LITLEN_SYMS, 15, litLen, litCode);
+    let offLen = bytes.alloc(OFFSET_SYMS);
+    let offCode = ibuf(OFFSET_SYMS);
+    genHuff(offFreq, OFFSET_SYMS, 15, offLen, offCode);
+
+    let numLit = numUsed(litLen, LITLEN_SYMS, 257);
+    let numOff = numUsed(offLen, OFFSET_SYMS, 1);
+    // A dynamic block needs at least one distance code; give the lone unused one a real length.
+    if (numOff == 1 && bytes.read_byte(offLen, 0) == 0) {
+        bytes.write_byte(offLen, 0, 1);
+        assignCanonical(offLen, OFFSET_SYMS, offCode);
+    }
+
+    // Codegen (code-length RLE) + its own Huffman.
+    let codegen = ibuf(LITLEN_SYMS + OFFSET_SYMS + 2);
+    let codegenFreq = ibuf(CODEGEN_SYMS);
+    generateCodegen(litLen, numLit, offLen, numOff, codegen, codegenFreq);
+    let cgLen = bytes.alloc(CODEGEN_SYMS);
+    let cgCode = ibuf(CODEGEN_SYMS);
+    genHuff(codegenFreq, CODEGEN_SYMS, 7, cgLen, cgCode);
+    let numCg = numCodegensUsed(codegenFreq);
+
+    // Sizes (bits).
+    let headerSize = 3 + 5 + 5 + 4 + 3 * numCg
+        + bitLength(codegenFreq, cgLen, CODEGEN_SYMS)
+        + rd32(codegenFreq, 16) * 2 + rd32(codegenFreq, 17) * 3 + rd32(codegenFreq, 18) * 7;
+    let dynSize = headerSize + bitLength(litFreq, litLen, LITLEN_SYMS)
+        + bitLength(offFreq, offLen, OFFSET_SYMS) + extraBits;
+    let fixSize = 3 + bitLength(litFreq, FIXED_LIT_LEN, LITLEN_SYMS)
+        + bitLength(offFreq, FIXED_OFF_LEN, OFFSET_SYMS) + extraBits;
+    let storeSize = MAXI32;
+    if (blkLen <= 65535) { storeSize = (blkLen + 5) * 8; }
+
+    // Choose smallest. Prefer stored only when strictly smaller-or-equal (matches Go).
+    if (storeSize <= dynSize && storeSize <= fixSize) {
+        writeStored(bw, data, start, blkLen, final);
+    } else if (fixSize <= dynSize) {
+        bw.writeBits(if (final) 3 else 2, 3);  // BFINAL + BTYPE=01 (fixed)
+        writeTokens(bw, toks, ntoks, FIXED_LIT_CODE, FIXED_LIT_LEN, FIXED_OFF_CODE, FIXED_OFF_LEN);
+    } else {
+        // Dynamic header.
+        bw.writeBits(if (final) 5 else 4, 3);  // BFINAL + BTYPE=10 (dynamic)
+        bw.writeBits(numLit - 257, 5);
+        bw.writeBits(numOff - 1, 5);
+        bw.writeBits(numCg - 4, 4);
+        let i = 0;
+        while (i < numCg) {
+            bw.writeBits(bytes.read_byte(cgLen, bytes.read_byte(CODEGEN_ORDER, i)), 3);
+            i = i + 1;
+        }
+        // Codegen symbol stream.
+        i = 0;
+        while (true) {
+            let sym = rd32(codegen, i);
+            i = i + 1;
+            if (sym == BADCODE) { break; }
+            bw.writeHuff(rd32(cgCode, sym), bytes.read_byte(cgLen, sym));
+            if (sym == 16) { bw.writeBits(rd32(codegen, i), 2); i = i + 1; }
+            else if (sym == 17) { bw.writeBits(rd32(codegen, i), 3); i = i + 1; }
+            else if (sym == 18) { bw.writeBits(rd32(codegen, i), 7); i = i + 1; }
+        }
+        writeTokens(bw, toks, ntoks, litCode, litLen, offCode, offLen);
+    }
+
+    bytes.free(litLen); bytes.free(litCode); bytes.free(offLen); bytes.free(offCode);
+    bytes.free(codegen); bytes.free(codegenFreq); bytes.free(cgLen); bytes.free(cgCode);
+}
+
+// Insert position `p` into both hash tables (short single-entry, long cur/prev). Requires p + 8 <= n.
+fn hashInsert(data: string, p: int, tabS: ptr, tabLc: ptr, tabLp: ptr): void {
+    let hs = hashS(data, p);
+    let hl = hashL(data, p);
+    wr32(tabS, hs, p);
+    wr32(tabLp, hl, rd32(tabLc, hl));
+    wr32(tabLc, hl, p);
+}
+
+// Find the best match at pos and insert pos into the hash tables. Returns a packed (len << 20) | dist,
+// or 0 when no match of length >= 3 exists. Requires pos + 8 <= n. Candidates come from the long-hash
+// cur/prev entries, the short-hash entry, and the repeat offset (O(1), no chain walk).
+fn findMatch(data: string, pos: int, n: int, tabS: ptr, tabLc: ptr, tabLp: ptr, repeat: int): int {
+    let maxLen = n - pos;
+    if (maxLen > 258) { maxLen = 258; }
+    let hs = hashS(data, pos);
+    let hl = hashL(data, pos);
+    let cL = rd32(tabLc, hl);
+    let cLp = rd32(tabLp, hl);
+    let cS = rd32(tabS, hs);
+    wr32(tabS, hs, pos);
+    wr32(tabLp, hl, cL);
+    wr32(tabLc, hl, pos);
+
+    let bestLen = 0;
+    let bestDist = 0;
+    if (cL >= 0 && pos - cL <= 32768) {
+        let l = matchLen(data, cL, pos, maxLen);
+        if (l > bestLen) { bestLen = l; bestDist = pos - cL; }
+    }
+    if (cLp >= 0 && pos - cLp <= 32768) {
+        let l = matchLen(data, cLp, pos, maxLen);
+        if (l > bestLen) { bestLen = l; bestDist = pos - cLp; }
+    }
+    if (cS >= 0 && pos - cS <= 32768) {
+        let l = matchLen(data, cS, pos, maxLen);
+        if (l > bestLen) { bestLen = l; bestDist = pos - cS; }
+    }
+    let cR = pos - repeat;
+    if (cR >= 0) {
+        let l = matchLen(data, cR, pos, maxLen);
+        if (l >= 3 && l > bestLen) { bestLen = l; bestDist = repeat; }
+    }
+    if (bestLen < 3) { return 0; }
+    return (bestLen << 20) | bestDist;
+}
+
+// Encode a raw DEFLATE stream via dual-hash greedy LZ77 + per-block dynamic Huffman.
+pub fn deflateRaw(data: string): ByteBuf {
+    let bw = BitWriter();
+    let n = data.length;
+
+    // Direct-mapped match tables: short (4-byte) single entry, long (7-byte) cur + prev.
+    let tabS = bytes.alloc(HASHL_SIZE * 4);
+    let tabLc = bytes.alloc(HASHL_SIZE * 4);
+    let tabLp = bytes.alloc(HASHL_SIZE * 4);
+    let h = 0;
+    while (h < HASHL_SIZE) { wr32(tabS, h, -1); wr32(tabLc, h, -1); wr32(tabLp, h, -1); h = h + 1; }
+
+    // Per-block token buffer + histograms.
+    let toks = ibuf(MAX_BLOCK_TOKENS + 1);
+    let litFreq = ibuf(LITLEN_SYMS);
+    let offFreq = ibuf(OFFSET_SYMS);
+    izero(litFreq, LITLEN_SYMS);
+    izero(offFreq, OFFSET_SYMS);
+    let ntoks = 0;
+    let extraBits = 0;
+    let blkStart = 0;
+    let repeat = 1;   // last match distance; a repeat is cheaper to code than a fresh distance
+
+    // Lazy matching (zlib deflate_slow): before committing to the match at pos-1, look one byte ahead
+    // and, if pos starts a strictly longer match, emit a literal at pos-1 and take the longer match.
+    // This is the standard ratio lever; it costs a second match probe per byte, which the dual-hash
+    // speed headroom easily absorbs.
+    let pos = 0;
+    let matchAvail = false;   // a literal at pos-1 is pending
+    let prevLen = 0;
+    let prevDist = 0;
+    while (pos < n) {
+        // Flush a full block at a token boundary (at most one token is added per iteration).
+        if (ntoks >= MAX_BLOCK_TOKENS) {
+            emitBlock(bw, data, blkStart, pos - blkStart, toks, ntoks, litFreq, offFreq, extraBits, false);
+            ntoks = 0; extraBits = 0; blkStart = pos;
+            izero(litFreq, LITLEN_SYMS); izero(offFreq, OFFSET_SYMS);
+        }
+
+        let cur = 0;
+        if (pos + 8 <= n) { cur = findMatch(data, pos, n, tabS, tabLc, tabLp, repeat); }
+        let curLen = cur >> 20;
+        let curDist = cur & 1048575;
+
+        if (prevLen >= 3 && prevLen >= curLen) {
+            // The previous match (starting at pos-1) is at least as good: emit it.
+            let mstart = pos - 1;
+            let lc = lengthCodeFast(prevLen);
+            let dc = distCodeFast(prevDist);
+            wr32(toks, ntoks, TOK_MATCH | ((prevLen - 3) << 15) | (prevDist - 1));
+            ntoks = ntoks + 1;
+            wr32(litFreq, 257 + lc, rd32(litFreq, 257 + lc) + 1);
+            wr32(offFreq, dc, rd32(offFreq, dc) + 1);
+            extraBits = extraBits + bytes.read_byte(LEN_EXTRA, lc) + bytes.read_byte(DIST_EXTRA, dc);
+            repeat = prevDist;
+            // Insert the still-uninserted interior positions of the match. mstart was inserted when it
+            // was visited, pos (= mstart+1) was inserted by this iteration's findMatch; insert the rest.
+            let k = pos + 1;
+            let endp = mstart + prevLen;   // exclusive
+            while (k < endp) {
+                if (k + 8 <= n) { hashInsert(data, k, tabS, tabLc, tabLp); }
                 k = k + 1;
             }
-            pos = pos + bestLen;
+            pos = mstart + prevLen;
+            matchAvail = false;
+            prevLen = 0;
+        } else if (matchAvail) {
+            // Emit the pending literal at pos-1; the current match becomes the new pending candidate.
+            let b = bytes.read_byte(data, pos - 1);
+            wr32(toks, ntoks, b);
+            ntoks = ntoks + 1;
+            wr32(litFreq, b, rd32(litFreq, b) + 1);
+            prevLen = curLen; prevDist = curDist;
+            pos = pos + 1;
         } else {
-            emitLitLen(bw, bytes.read_byte(data, pos));
-            if (pos + 2 < n) {
-                let hh = hash3(data, pos);
-                wr32(prev, pos, rd32(head, hh));
-                wr32(head, hh, pos);
-            }
+            // First deferral: stash the current match/literal and advance one byte.
+            matchAvail = true;
+            prevLen = curLen; prevDist = curDist;
             pos = pos + 1;
         }
     }
-    emitLitLen(bw, 256); // end of block
+    // A literal deferred at the final position still needs emitting.
+    if (matchAvail) {
+        let b = bytes.read_byte(data, n - 1);
+        wr32(toks, ntoks, b);
+        ntoks = ntoks + 1;
+        wr32(litFreq, b, rd32(litFreq, b) + 1);
+    }
+
+    // Final block (always emitted, even for empty input, to carry BFINAL + EOB).
+    emitBlock(bw, data, blkStart, pos - blkStart, toks, ntoks, litFreq, offFreq, extraBits, true);
     bw.flush();
-    bytes.free(head); // ptr LOCAL scratch (bw.out is a struct field -> ARC-owned, returned)
-    bytes.free(prev);
+
+    bytes.free(tabS);
+    bytes.free(tabLc);
+    bytes.free(tabLp);
+    bytes.free(toks);
+    bytes.free(litFreq);
+    bytes.free(offFreq);
     return bw.out;
 }
 
