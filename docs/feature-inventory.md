@@ -525,13 +525,20 @@ shell harnesses are manual and non-gating.
 - [x] ENOSPC on commit is never falsely ACKed.
 - [x] 3-phase recovery re-bootstraps the system catalog (the fixed Phase-2 data-loss bug).
 
-### Replication safety ; PARTIAL ; case
+### Replication safety ; SOUND ; case
 
 - [x] Log-shipping with logical follower apply (cross-node page-id fork resolved).
 - [x] Fencing epochs reject a stale-epoch writer.
 - [x] Quorum-ack durable commit (RPO=0).
 - [x] Partition-then-heal soak keeps at most one leader; corrupted frames rejected; mTLS + auth.
-- [ ] Automatic leader election / lease-driven failover (currently manual `SET FENCE EPOCH`).
+- [x] Automatic leader election / lease-driven failover. STALE MARK corrected: this is NOT manual. The lease
+      (`orch/lease.nova`) elects automatically -- a node's tick is "renew if leader, else `tryAcquire`", where
+      `tryAcquire` create-CASes a free lease or takes an EXPIRED one with a bumped epoch, and `renew` steps down
+      (fences) when a newer epoch owns the lease; `haReconcileTick` is the production driver (renew-or-acquire,
+      then reconcile ONLY if `stillLeader`). Gated in `198_ha_cluster`: partition the leader, standbys keep
+      ticking, a NEW leader is auto-elected with RTO bounded by the TTL, the healed old leader is auto-FENCED,
+      epochs are monotonic across repeated failovers, and a 5-node soak shows no split-brain -- all with no
+      manual `SET FENCE EPOCH` (that command is the NovaDB write-fence, a different layer, not the election).
 
 ### MVCC ; PARTIAL ; read
 
@@ -652,7 +659,11 @@ gate does not currently reproduce green on this checkout (see the two UNSOUND ro
 
 - [x] Diff logic: start-new / replace-changed / poll-unchanged / keep-unreadable / stop-when-gone.
 - [x] Store-driven reconcile parses YAML/JSON and validates.
-- [ ] Reconcile drives REAL process lifecycle (currently `simulated=true`, virtual replicas).
+- [x] Reconcile drives REAL process lifecycle. DONE + gated (nova-orchestrator): `197`
+      test_reconcile_drives_real_process_lifecycle runs `Nativelet.reconcileWith` with manageProcesses=true on a
+      replicas=2 `/bin/sleep` manifest -- it SPAWNS two real OS children (asserted live via `pid()`/`isRunning()`)
+      and reconciling the workload away SIGTERM+reaps them (`stopProc` waits). This is the real spawn/stop path,
+      not the simulated virtual-replica seam.
 - [x] `181_orchestrator` runs to completion (8/8). FIXED (nova-orchestrator) -- and the previous diagnosis was
       WRONG: it was NOT an "async reconcile subtest" crash. It was a DETERMINISTIC value-struct nested-container
       corruption in the SYNC reconcile REMOVAL path. `Supervisor` was a value struct holding owned containers
@@ -757,7 +768,10 @@ gate does not currently reproduce green on this checkout (see the two UNSOUND ro
       escapes `\`/TAB/LF (`\\`/`\t`/`\n`) so an embedded tab or newline no longer corrupts the line format
       (round-trips exactly); `renderMetrics` escapes `\`/`"`/LF in the Prometheus `{workload="..."}` label.
       Gated in 199 (a value with newline+tab+backslash round-trips; a quoted workload name is escaped).
-- [ ] `192`/`193` observability tests run to completion (currently crash on this host).
+- [x] `192`/`193` observability tests run to completion. FIXED: `192_observability` (2/2) and `193_health`
+      (7/7) now pass cleanly. The crash was the SAME value-struct nested-container UAF fixed in the lang
+      compiler (arc.zig field-store retain) plus modelling `Supervisor`/`ConfigStore` as classes -- not a
+      platform issue. Re-verified after those fixes.
 
 ---
 
