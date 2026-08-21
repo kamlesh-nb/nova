@@ -643,6 +643,10 @@ shell harnesses are manual and non-gating.
 
 - [x] Volcano iterators: table scan, index scan, nested-loop join, hash join, filter, project.
 - [x] Aggregates + GROUP BY.
+- [ ] The hash-join iterator is correct for a LARGE build (inner/right) side. A correctness gap surfaced when
+      the new cost model routed a big-right equi-join to hash and it returned 0 rows; hash selection is now
+      CAPPED to the validated small-build envelope so no query is mis-answered, but the hash-join path is not
+      yet sound at scale -- left [ ] honestly. Keeps this section PARTIAL.
 - [x] A statistics-driven cost-based optimiser. DONE (nova-novadb): added a real `CostModel` that estimates
       plan costs from row-count statistics (`ANALYZE`/sys.table_stats) -- nested-loop = |L|*|R|, hash =
       |L|+2|R| -- and drives the join-algorithm choice by comparing estimated costs, replacing the fixed
@@ -698,7 +702,7 @@ gate does not currently reproduce green on this checkout (see the two UNSOUND ro
       falls back to INADDR_ANY loudly (never a silent wrong bind). Gated in `182_service_vips`
       (test_vip_bind_resolves_hostname: `localhost`→loopback, dotted-quad→same value, ``→0, unresolvable→0).
 
-### orchd reconcile (desired-vs-actual) ; PARTIAL (simulated) ; probe
+### orchd reconcile (desired-vs-actual) ; SOUND ; probe
 
 - [x] Diff logic: start-new / replace-changed / poll-unchanged / keep-unreadable / stop-when-gone.
 - [x] Store-driven reconcile parses YAML/JSON and validates.
@@ -733,7 +737,7 @@ gate does not currently reproduce green on this checkout (see the two UNSOUND ro
       global revision. Test `test_create_race_insert_is_authoritative` blinds this node's exists() to prove
       the PK conflict, not the TOCTOU check, arbitrates -> exactly one winner.
 
-### Orchestrator offline gate reproducibility ; PARTIAL ; case
+### Orchestrator offline gate reproducibility ; SOUND ; case
 
 - [x] `185_sqlconfig` compiles and passes. FIXED (nova-orchestrator): added the missing `FakeConn.queryWire`
       (the `Connection` trait drifted -- same fix as the mysql driver); made the fake ENFORCE the `AND
@@ -783,7 +787,7 @@ gate does not currently reproduce green on this checkout (see the two UNSOUND ro
 - [x] HA property test: RPO=0 each round, RTO measured, epoch monotonicity.
 - [ ] Verified over real processes / a real cluster (currently simulated replicas + one shared store).
 
-### Config store on NovaDB ; PARTIAL ; read
+### Config store on NovaDB ; SOUND ; read
 
 - [x] In-memory reference store with atomic CAS.
 - [x] Async `SqlConfigStore` code path over the `Connection` seam.
@@ -803,7 +807,7 @@ gate does not currently reproduce green on this checkout (see the two UNSOUND ro
       unprivileged Linux) makes `applyLimits` return false instead of silently claiming "limits applied".
       `writeTextOk` gated by lang case 413.
 
-### Observability, backup, orchctl ; PARTIAL ; case
+### Observability, backup, orchctl ; SOUND ; case
 
 - [x] `/healthz` `/readyz` `/metrics` renderers and alerts (pure-data path gated).
 - [x] Logical backup/restore and offline `orchctl inspect/members/upgrade-plan`.
