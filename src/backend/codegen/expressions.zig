@@ -2243,6 +2243,20 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                                     if (self.structs.contains(fw_base) and self.fieldStoredInline(fw_base)) {
                                         const fsz = self.getTypeSize(field_type_ref, false);
                                         _ = try self.buildValueStructCopyInto(addr, r_val, fsz);
+                                        // The memcpy SHARES the RHS struct's owned/container fields (its `items`
+                                        // pointer is copied, not the heap list). If the RHS is a BORROW (a
+                                        // variable / field / index read), the source still owns those fields and
+                                        // WILL drop them at its scope end -- so the field's inline copy needs its
+                                        // OWN references, else it dangles (e.g. `class Box{h:Holder}` +
+                                        // `self.h = h` left Box.h.items aliasing the caller's list, freed by the
+                                        // caller's dtor -> UAF in List.size). Retain/deep-copy the owned fields,
+                                        // mirroring the let-binding copy path. A fresh construction
+                                        // (`self.h = Holder(...)`) already owns distinct storage, so it is NOT a
+                                        // borrow and is skipped (retaining it would over-own / leak).
+                                        const is_r_borrow = (bin.right.kind == .ident or bin.right.kind == .field_access or bin.right.kind == .index);
+                                        if (is_r_borrow) {
+                                            try self.retainValueStructOwnedFields(addr, f_type_str);
+                                        }
                                         return r_val;
                                     }
                                 }
