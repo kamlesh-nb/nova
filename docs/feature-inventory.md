@@ -619,7 +619,12 @@ gate does not currently reproduce green on this checkout (see the two UNSOUND ro
 
 - [x] Rise/fall hysteresis, drain/restore decision logic.
 - [ ] A gating LIVE probe sweep.
-- [ ] VIP bind for a non-dotted-quad host (currently IPv4-only, else INADDR_ANY fallback).
+- [x] VIP bind for a non-dotted-quad host. FIXED (nova-orchestrator): `bindAddrFor` (proxy.nova) now routes
+      through `socket.resolveHost4`, the same blocking getaddrinfo resolver the reactor connect path uses, so a
+      Service VIP may be a hostname (`localhost`, `web.internal`) not just a literal dotted quad. A numeric
+      IPv4 still parses directly, an empty host is INADDR_ANY, and a host that neither parses nor resolves
+      falls back to INADDR_ANY loudly (never a silent wrong bind). Gated in `182_service_vips`
+      (test_vip_bind_resolves_hostname: `localhost`→loopback, dotted-quad→same value, ``→0, unresolvable→0).
 
 ### orchd reconcile (desired-vs-actual) ; PARTIAL (simulated) ; probe
 
@@ -656,12 +661,28 @@ gate does not currently reproduce green on this checkout (see the two UNSOUND ro
       abnormally"). The async-@test block-drive crash is a Nova test-harness/runtime issue (spawning reactor
       coroutines inside a block-driven `@test`), not a store-logic bug -- left [ ] honestly.
 
-### Autoscaler (PID) ; PARTIAL ; case
+### Autoscaler (PID) ; SOUND ; case
 
 - [x] PID controller with anti-windup, output clamp, dt-guarded derivative.
 - [x] Real in-flight / cgroup CPU signal (Linux).
-- [ ] The CPU signal is per-replica, not aggregate-across-replicas against a per-replica setpoint.
-- [ ] Scale-down does not block the reactor (`p.wait()` on reactor 0 today).
+- [x] The CPU signal is per-replica, not aggregate-across-replicas against a per-replica setpoint. FIXED
+      (nova-orchestrator): added the k8s-HPA CPU control path to `Autoscaler`. `readPerReplicaUsec` samples EACH
+      live replica's OWN cgroup cpu.stat (`isolation.cpuUsageUsec("<prefix>-<slot>")`) -- one sample per
+      replica; `avgCpuUtil` deltas each over the interval and returns the MEAN per-replica core-fraction (sum /
+      count); `decideCpu` = `ceil(current · avgUtil / cpuSetpoint)` clamped, where cpuSetpoint is ALSO
+      per-replica. Because both signal and setpoint are per-replica, the decision is stable under replica-count
+      doubling at fixed per-replica load (an aggregate-sum signal chases its own tail). Unarmed (no prefix /
+      non-Linux) the path is an inert no-op that holds the count. Gated in `180_pid_autoscaler`
+      (test_cpu_signal_is_per_replica_average: mean 1.0 not sum 2.0; test_cpu_decision_is_ratio_and_scale_stable:
+      hold-under-doubling; test_cpu_path_inert_without_cgroups).
+- [x] Scale-down does not block the reactor. FIXED (nova-orchestrator): `Autoscaler.scaleTo`'s scale-down
+      path used to SIGTERM the backend and then `p.wait()` (a BLOCKING waitpid) on reactor 0, stalling every
+      other coroutine until the child exited. It now SIGTERMs and PARKS the process in a `pendingReap` list;
+      `reapPending()` collects it with `tryWait` (waitpid WNOHANG) on later ticks, so a slow-to-drain backend
+      never blocks the reactor. Gated in `197_lifecycle_scale` (test_scaledown_reaps_without_blocking_wait:
+      three real `/bin/sleep` children scaled 3->1, scaleTo returns promptly, all terminated children reaped
+      through the non-blocking path with no zombie; test_scaledown_no_processes_parks_nothing: the
+      manageProcesses=false seam parks nothing).
 
 ### Rolling upgrade + HA membership ; PARTIAL (simulated) ; case
 
