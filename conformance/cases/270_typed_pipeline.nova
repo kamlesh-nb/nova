@@ -1,7 +1,3 @@
-// 270 — PipelineBehaviours wrap a typed handler in the runtime mediator. A behaviour receives the
-// RequestContext (the erased request + type key + per-request scope + markers) and a Next; it can
-// inspect the request (downcast it), short-circuit with its own Response, or `await next.proceed(ctx)`
-// and post-process. Behaviours run in registration order around every handler.
 import assert;
 import string;
 import web.app;
@@ -22,7 +18,6 @@ struct GetXHandler impl RequestHandler<GetX, XDto> {
     }
 }
 
-// A behaviour: block id 0 with a 400, otherwise run the handler and tag the Response.
 struct GuardBehavior impl PipelineBehavior {
     async fn handle(self: GuardBehavior, ctx: RequestContext, next: Next): Response {
         let q = ctx.request as GetX;
@@ -42,7 +37,6 @@ fn buildApp(): App {
     return app;
 }
 
-// (1) The behaviour runs AROUND the typed handler: the handler produces the body, the behaviour tags it.
 @test
 fn test_behavior_wraps_handler(): void {
     let app = buildApp();
@@ -51,7 +45,6 @@ fn test_behavior_wraps_handler(): void {
     assert.equalStr(res.getHeader("X-Wrapped") ?? "", "yes");
 }
 
-// (2) The behaviour SHORT-CIRCUITS: returns a Response without calling next, so the handler never runs.
 @test
 fn test_behavior_short_circuits(): void {
     let app = buildApp();
@@ -60,7 +53,6 @@ fn test_behavior_short_circuits(): void {
     assert.equalStr(res.body, "id zero blocked");
 }
 
-// (3) With no behaviour registered, dispatch still works (the direct path).
 @test
 fn test_no_behavior_direct(): void {
     let app = App();

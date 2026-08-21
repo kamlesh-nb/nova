@@ -1,32 +1,17 @@
-// B4 — a generic struct that stores ANOTHER generic as a field (`Set<T>` holds `Map<T, bool>`).
-//
-// Two stacked bugs made the whole `Set` collection unusable:
-//   Layer 1 (link): the field's container methods fell back to the ERASED `Map_*` bodies, whose private
-//     helper `Map_keysEqual` was skipped by an order-dependent dead-body pass -> `_Map_keysEqual`
-//     undefined at link (`import set;` broke the build).
-//   Layer 2 (crash): the erased `Map.get` returns a different `V | undefined` representation than the
-//     mono one, so `self.map.get(e) != undefined` (V = bool) released a non-heap value-optional and
-//     SIGSEGV'd -- even though the identical DIRECT `Map<int,bool>.get(k) != undefined` was correct.
-//
-// Root cause of both: the monomorphisation worklist recursed into a struct's type-args and method
-// RETURN types but NOT its FIELD types, so `Set<int>`'s field `Map<T, bool>` -> `Map<int, bool>` was
-// never instantiated and every field call fell to the erased path. Fix: note field types too, so the
-// inner container is monomorphised and its calls dispatch to the correct `Map_int_bool_*` bodies.
 
 import assert;
 import map;
 import set;
 
-// (1) The stdlib `Set<int>` end to end: construct, add (with a duplicate), membership, size, remove.
 @test
 fn test_set_int_full(): void {
     let s = Set<int>(16, set.i32Hash);
     assert.equalInt(0, s.size());
     s.add(10);
     s.add(20);
-    s.add(10);                       // duplicate: no growth
+    s.add(10);
     assert.equalInt(2, s.size());
-    assert.isTrue(s.has(10));        // the `get(e) != undefined` path that used to crash
+    assert.isTrue(s.has(10));
     assert.isTrue(s.has(20));
     assert.isTrue(!s.has(30));
     s.remove(10);
@@ -34,7 +19,6 @@ fn test_set_int_full(): void {
     assert.isTrue(!s.has(10));
 }
 
-// (2) A user generic struct with a generic field, exercising the same field-mono path directly.
 struct Bag<T> {
     pub map: Map<T, bool>,
     init(h: (T) -> int) { self.map = Map<T, bool>(8, h); }
@@ -47,6 +31,6 @@ fn ihash(x: int): int { return x; }
 fn test_user_generic_field(): void {
     let b = Bag<int>(ihash);
     b.put(7);
-    assert.isTrue(b.holds(7));       // get() != undefined on the mono inner Map
+    assert.isTrue(b.holds(7));
     assert.isTrue(!b.holds(9));
 }

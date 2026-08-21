@@ -1,29 +1,23 @@
-// examples/13_structs.nova
-// A struct groups named fields, a constructor (`init`), instance methods
-// (first parameter `self: T`), and static/associated methods (no `self`,
-// called as `Struct.method()`).
 
 struct Account {
-    pub owner: string,        // pub fields are readable from outside
-    balance: int,             // no `pub` -> private to the struct's methods
+    pub owner: string,
+    balance: int,
 
     init(owner: string, opening: int) {
         self.owner = owner;
         self.balance = opening;
     }
 
-    // Static factory: no `self`, called as `Account.newAccount(...)`.
     pub fn newAccount(owner: string): Account {
         return Account(owner, 0);
     }
 
-    // Instance methods take `self: Account` first.
     pub fn deposit(self: Account, amount: int): void {
         self.balance = self.balance + amount;
     }
 
     pub fn withdraw(self: Account, amount: int): bool {
-        if (amount > self.balance) { return false; }   // reads a private field
+        if (amount > self.balance) { return false; }
         self.balance = self.balance - amount;
         return true;
     }
@@ -34,7 +28,6 @@ struct Account {
 }
 
 fn main(): void {
-    // Construct via the init constructor.
     let a = Account("Ada", 100);
     console.log(a.statement());
 
@@ -44,13 +37,11 @@ fn main(): void {
     let ok = a.withdraw(30);
     console.log(`withdraw 30 ok=${ok}, ${a.statement()}`);
 
-    let tooMuch = a.withdraw(1000);   // exceeds balance -> refused
+    let tooMuch = a.withdraw(1000);
     console.log(`withdraw 1000 ok=${tooMuch}, ${a.statement()}`);
 
-    // Static factory -> a fresh account with a zero opening balance.
     let b = Account.newAccount("Bob");
     console.log(b.statement());
 
-    // pub field is directly readable.
     console.log(`owner of b = ${b.owner}`);
 }

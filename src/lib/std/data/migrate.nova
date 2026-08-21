@@ -1,6 +1,3 @@
-// Schema migrations for the db seam: a versioned up/down migration list, a tracking table, and a runner
-// that applies the pending migrations in order and records them (so re-running is idempotent). Plus a small
-// CREATE TABLE builder so a migration's `up` need not be hand-written SQL. Placeholders are the seam's `$N`.
 import string;
 import list;
 import data.db;
@@ -8,8 +5,8 @@ import data.db;
 pub struct Migration {
     pub version: long,
     pub name: string,
-    pub up: string,       // SQL applied when migrating forward
-    pub down: string,     // SQL applied when rolling back
+    pub up: string,
+    pub down: string,
     init(version: long, name: string, up: string, down: string) {
         self.version = version; self.name = name; self.up = up; self.down = down;
     }
@@ -20,14 +17,12 @@ pub fn migration(version: long, name: string, up: string, down: string): Migrati
 
 pub const TRACKING_TABLE: string = "schema_migrations";
 
-// CREATE TABLE for the applied-version ledger (portable types).
 pub fn createTrackingTableSql(): string {
     return "CREATE TABLE IF NOT EXISTS " + TRACKING_TABLE + " (version BIGINT PRIMARY KEY, name TEXT NOT NULL)";
 }
 fn recordSql(): string { return "INSERT INTO " + TRACKING_TABLE + " (version, name) VALUES ($1, $2)"; }
 fn forgetSql(): string { return "DELETE FROM " + TRACKING_TABLE + " WHERE version = $1"; }
 
-// Ascending copy of the migration list by version (selection sort; the list is tiny).
 fn sortByVersion(ms: list.List<Migration>): list.List<Migration> {
     let out = list.List<Migration>();
     let i = 0;
@@ -50,7 +45,6 @@ fn sortByVersion(ms: list.List<Migration>): list.List<Migration> {
     return out;
 }
 
-// The highest applied version (0 if none / no table yet).
 pub async fn currentVersion(conn: db.Connection): long {
     let rs = await conn.query("SELECT version FROM " + TRACKING_TABLE + " ORDER BY version DESC LIMIT 1", list.List<db.DbValue>());
     if (rs.rows.size() == 0) { return 0; }
@@ -58,8 +52,6 @@ pub async fn currentVersion(conn: db.Connection): long {
     return row.get(0).asLong();
 }
 
-// Apply every migration whose version is above the current max, in ascending order, recording each. Returns
-// the number applied. Idempotent: a second call applies nothing.
 pub async fn migrate(conn: db.Connection, migrations: list.List<Migration>): int {
     let e0 = await conn.exec(createTrackingTableSql(), list.List<db.DbValue>());
     let applied = await currentVersion(conn);
@@ -81,8 +73,6 @@ pub async fn migrate(conn: db.Connection, migrations: list.List<Migration>): int
     return n;
 }
 
-// Roll back every applied migration with version above `target`, newest first, running its `down`. Returns
-// the number rolled back.
 pub async fn rollbackTo(conn: db.Connection, migrations: list.List<Migration>, target: long): int {
     let ordered = sortByVersion(migrations);
     let applied = await currentVersion(conn);
@@ -102,25 +92,22 @@ pub async fn rollbackTo(conn: db.Connection, migrations: list.List<Migration>, t
     return n;
 }
 
-// ---- CREATE TABLE builder ----------------------------------------------------------------------------
 
 pub class Table {
     pub name: string,
-    pub cols: list.List<string>,          // rendered "name TYPE [opts]" fragments
-    pub constraints: list.List<string>,   // rendered table-level constraints
+    pub cols: list.List<string>,
+    pub constraints: list.List<string>,
     init(name: string) {
         self.name = name;
         self.cols = list.List<string>();
         self.constraints = list.List<string>();
     }
-    // A column "name TYPE". `opts` is appended verbatim (e.g. "NOT NULL", "DEFAULT 0", "UNIQUE"); "" for none.
     pub fn column(self: Table, name: string, sqlType: string, opts: string): Table {
         let c = name + " " + sqlType;
         if (opts.length > 0) { c = c + " " + opts; }
         self.cols.push(c);
         return self;
     }
-    // A portable auto-increment primary key column.
     pub fn id(self: Table): Table { self.cols.push("id BIGINT PRIMARY KEY"); return self; }
     pub fn primaryKey(self: Table, cols: string): Table { self.constraints.push("PRIMARY KEY (" + cols + ")"); return self; }
     pub fn foreignKey(self: Table, col: string, refTable: string, refCol: string): Table {

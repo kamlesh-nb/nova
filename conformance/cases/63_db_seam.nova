@@ -1,11 +1,3 @@
-// The backend-agnostic DB seam (data/db.nova) — the redesign of the "too naive" driver
-// interface. Proves the shared vocabulary works: a single typed cell `DbValue` (used for
-// both bound params and decoded values), typed accessors, NULL as a first-class kind,
-// exact decimal round-trip, and a ResultSet(List<Row>(List<DbValue>)) — the nested-owned-List
-// shape the ARC fix made safe — read back by column with typed getters.
-//
-// Convention (as in the flagship): imported TYPES/CONSTRUCTORS are bare (DbType, ResultSet,
-// Row, Column, DbError); imported FREE FUNCTIONS are module-qualified (db.dbInt, db.noError).
 import assert;
 import list;
 import db;
@@ -30,7 +22,6 @@ fn test_dbvalue_typed_accessors(): void {
 
 @test
 fn test_dbvalue_decimal_roundtrip(): void {
-    // decimal128 is exact — 0.1 + 0.2 must be 0.3 through the cell.
     let a: decimal = 0.1m;
     let b: decimal = 0.2m;
     let cell = db.dbDecimal(a + b);
@@ -40,8 +31,6 @@ fn test_dbvalue_decimal_roundtrip(): void {
     assert.isTrue(back == expected);
 }
 
-// Simulate what a driver's decode path produces: a ResultSet with two typed columns and
-// two rows, one of which has a NULL cell. Then read it back by position with typed getters.
 fn buildResultSet(): ResultSet {
     let rs = ResultSet();
     rs.columns.push(Column("id", DbType.Int4));
@@ -54,7 +43,7 @@ fn buildResultSet(): ResultSet {
 
     let r1 = Row();
     r1.cells.push(db.dbInt(2));
-    r1.cells.push(db.dbNull());   // NULL name
+    r1.cells.push(db.dbNull());
     rs.rows.push(r1);
 
     rs.tag = "SELECT 2";
@@ -69,18 +58,15 @@ fn test_resultset_typed_readback(): void {
     assert.equalInt(rs.colCount(), 2);
     assert.equalStr(rs.tag, "SELECT 2");
 
-    // Column metadata.
     let c0 = rs.columns.get(0) ?? Column("", DbType.Null);
     assert.equalStr(c0.name, "id");
     assert.isTrue(c0.type_oid == DbType.Int4);
 
-    // Row 0 — both cells present.
     let row0 = rs.row(0);
     assert.equalInt(row0.getInt(0), 1);
     assert.equalStr(row0.getText(1), "planck");
     assert.isTrue(!row0.isNull(1));
 
-    // Row 1 — NULL name.
     let row1 = rs.row(1);
     assert.equalInt(row1.getInt(0), 2);
     assert.isTrue(row1.isNull(1));

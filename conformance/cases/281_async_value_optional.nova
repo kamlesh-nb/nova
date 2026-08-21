@@ -1,9 +1,3 @@
-// S1 (the mongo cursor root cause): `await` of an async function returning a value-optional
-// (`int | undefined`) yielded the BOXED representation, but the codegen helper that decides whether a
-// consuming `?? d` / comparison must unbox did not list `.await_expr`. So `(await f()) ?? d` treated
-// the box pointer as the raw value and returned garbage -- silent data corruption on every async
-// optional API (cursor.next / queryOne). Recognising an await result as a value-optional box fixes
-// both the direct form and `let a = await f(); a ?? d`.
 import assert;
 
 async fn getOpt(v: int): int | undefined {
@@ -14,12 +8,12 @@ async fn getOpt(v: int): int | undefined {
 async fn viaLet(): int {
     let a = await getOpt(7);
     let b = await getOpt(0);
-    if (a == undefined) { return -999; }      // comparison against undefined must see through the box
-    return (a ?? 0) * 10 + (b ?? 5);          // a present -> 7, b undefined -> 5
+    if (a == undefined) { return -999; }
+    return (a ?? 0) * 10 + (b ?? 5);
 }
 
 async fn viaDirect(v: int): int {
-    return (await getOpt(v)) ?? -1;           // await result consumed directly by ??
+    return (await getOpt(v)) ?? -1;
 }
 
 @test
@@ -29,6 +23,6 @@ fn test_await_optional_via_let(): void {
 
 @test
 fn test_await_optional_direct(): void {
-    assert.equalInt(viaDirect(3), 3);         // present
-    assert.equalInt(viaDirect(0), -1);        // undefined
+    assert.equalInt(viaDirect(3), 3);
+    assert.equalInt(viaDirect(0), -1);
 }

@@ -1,4 +1,3 @@
-// Pins the gap-8 math leaves: asin/acos, hyperbolics (sinh/cosh/tanh), gcd/lcm.
 import math;
 import assert;
 
@@ -6,7 +5,6 @@ import assert;
 fn test_inverse_trig(): void {
     assert.isTrue(math.fabs(math.asin(0.5) - (math.pi() / 6.0)) < 0.0005);
     assert.isTrue(math.fabs(math.acos(0.5) - (math.pi() / 3.0)) < 0.0005);
-    // domain clamp: asin of an out-of-range value saturates rather than producing NaN
     assert.isTrue(math.fabs(math.asin(2.0) - (math.pi() / 2.0)) < 0.0001);
 }
 
@@ -15,7 +13,6 @@ fn test_hyperbolic(): void {
     assert.isTrue(math.fabs(math.sinh(0.0)) < 0.0001);
     assert.isTrue(math.fabs(math.cosh(0.0) - 1.0) < 0.0001);
     assert.isTrue(math.fabs(math.tanh(0.0)) < 0.0001);
-    // cosh^2 - sinh^2 == 1 for any argument
     let s = math.sinh(0.9);
     let c = math.cosh(0.9);
     assert.isTrue(math.fabs((c * c) - (s * s) - 1.0) < 0.0005);

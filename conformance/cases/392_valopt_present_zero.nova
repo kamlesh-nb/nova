@@ -1,23 +1,19 @@
-// value-optional-zero: `x ?? d` on a value-optional NARROWED present must return the present value even when
-// that value is 0. A raw value-optional stores a present 0 identically to the absent sentinel, so the old
-// `left != 0` presence test misread a present 0 as absent and returned the default. The fix tracks locals
-// proven present by an enclosing `if (x != undefined)` and short-circuits a narrowed-present primitive.
 import map;
 import assert;
 @test
 fn present_zero_coalesces_to_zero(): void {
     let m = Map<string, int>(4, h);
-    m.set("a", 0);                 // present value is ZERO
+    m.set("a", 0);
     let x = m.get("a");
     if (x != undefined) {
-        assert.equalInt(x ?? 999, 0);   // present 0, NOT the default
+        assert.equalInt(x ?? 999, 0);
     }
 }
 @test
 fn genuinely_absent_returns_default(): void {
     let m = Map<string, int>(4, h);
     let x = m.get("missing");
-    assert.equalInt(x ?? 999, 999);      // absent -> default
+    assert.equalInt(x ?? 999, 999);
 }
 @test
 fn reassign_to_absent_invalidates_narrowing(): void {
@@ -25,7 +21,7 @@ fn reassign_to_absent_invalidates_narrowing(): void {
     m.set("a", 5);
     let x = m.get("a");
     if (x != undefined) {
-        x = m.get("missing");            // reassign to absent -> narrowing invalid
+        x = m.get("missing");
         assert.equalInt(x ?? 999, 999);
     }
 }

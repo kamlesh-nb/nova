@@ -1,4 +1,3 @@
-// Pins current List<T> behavior (push/get/set/size).
 import assert;
 import list;
 

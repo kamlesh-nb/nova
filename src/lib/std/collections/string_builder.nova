@@ -17,9 +17,6 @@ pub class StringBuilder {
         let slen = s.length;
         if (slen == 0) return;
         self.ensureCapacity(self.len + slen);
-        // Bulk memcpy the string's bytes in at the write cursor. The old per-byte loop made append O(n)
-        // Nova calls and was the response-render throughput ceiling. `(buf as long)+(len as long)` keeps
-        // the destination address 64-bit (an int add would truncate a >4GB heap address).
         bytes.copy((self.buf as long) + (self.len as long), s as long, slen);
         self.len = self.len + slen;
     }
@@ -30,9 +27,6 @@ pub class StringBuilder {
         self.len = self.len + 1;
     }
 
-    // Append the byte range [start, end) of `s` WITHOUT allocating an intermediate substring. Used by the
-    // escape-into-builder path so a `{expr}` interpolation writes its clean runs straight into the render
-    // buffer -- no per-interpolation string allocation. `(s as long)+start` keeps the source address 64-bit.
     pub fn appendRange(self: StringBuilder, s: string, start: int, end: int): void {
         let n = end - start;
         if (n <= 0) return;
@@ -41,10 +35,6 @@ pub class StringBuilder {
         self.len = self.len + n;
     }
 
-    // Append `n` raw bytes from an arbitrary source address (a BORROWED slice — a StrView / DB row buffer),
-    // not an owned Nova string. The caller guarantees `srcPtr` stays valid for the copy. This is the sink
-    // for the P10 borrowed-string path: the render copies clean bytes straight out of a borrowed buffer
-    // into the output, minting NO owned intermediate string.
     pub fn appendBytes(self: StringBuilder, srcPtr: long, n: int): void {
         if (n <= 0) return;
         self.ensureCapacity(self.len + n);

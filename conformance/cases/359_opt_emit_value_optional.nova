@@ -1,40 +1,21 @@
-// Emit-subset SAFETY pin (B6, value optionals): a VALUE optional (`int | undefined`, `bool | undefined`)
-// is BOXED by the AST (nova_valopt_box) so a present 0 is a NON-NULL heap box and only absent is the null
-// word. The optimiser emit path (NOVA_OPT_EMIT) does NOT model that box/unbox, so ANY function that flows a
-// value optional -- a value-optional param/return, a value-optional local, or a call that delivers an
-// argument into a value-optional parameter -- must FALL BACK to the AST. This case locks the two engines to
-// byte-identical results on every such shape.
-//
-// The dangerous shapes, each of which diverged before the guard landed:
-//   - a caller (itself emittable: scalar params, no `undefined` literal) that passes a PRESENT value into a
-//     value-optional parameter. The emit path passed the raw word, so:
-//       * a present 0 read as ABSENT (the null word)  -- see present-zero below;
-//       * a present value's raw scalar was dereferenced on unbox -> ASAN  -- see the reading callees.
-//   - a value-optional local bound from a value-optional-returning call, then compared/read.
-// All of these now fall back to the AST and so agree in both modes; run this case with and without
-// NOVA_OPT_EMIT and the numbers must match.
 import assert;
 
-// Callee reads its value-optional param's payload (an unbox on the present path).
 fn readOr(x: int | undefined): int {
     if (x == undefined) { return -1; }
     return x + 1;
 }
 
-// Callee only checks presence (no unbox).
 fn present(x: int | undefined): int {
     if (x == undefined) { return 0; }
     return 1;
 }
 
-// bool value optional (also boxed).
 fn boolTag(b: bool | undefined): int {
     if (b == undefined) { return 9; }
     if (b) { return 1; }
     return 0;
 }
 
-// Value-optional RETURN: a present 0 must NOT read as absent (the valopt-zero case).
 fn maybe(keep: bool): int | undefined {
     if (keep) { return 0; }
     return undefined;
@@ -42,7 +23,6 @@ fn maybe(keep: bool): int | undefined {
 
 @test
 fn present_and_absent(): void {
-    // Present non-zero and absent through a value-optional param.
     assert.equalInt(present(5), 1);
     assert.equalInt(present(undefined), 0);
     assert.equalInt(readOr(5), 6);
@@ -51,7 +31,6 @@ fn present_and_absent(): void {
 
 @test
 fn present_zero(): void {
-    // A PRESENT 0 passed into a value-optional param must be distinguishable from absent.
     assert.equalInt(present(0), 1);
     assert.equalInt(readOr(0), 1);
 }
@@ -65,10 +44,6 @@ fn bool_optional(): void {
 
 @test
 fn value_optional_return_present_zero(): void {
-    // maybe(true) returns a PRESENT 0; the caller binds it as a value-optional local and must see PRESENT
-    // (not absent) and read the payload 0 back. Presence is checked with `== undefined` and the payload read
-    // through the narrowed value -- the path B6 governs. (The `??` operator on a present 0 is a separate,
-    // orthogonal value-optional-zero limitation and is deliberately not exercised here.)
     let a: int | undefined = maybe(true);
     if (a == undefined) { assert.equalInt(1, 0); } else { assert.equalInt(a + 100, 100); }
     let b: int | undefined = maybe(false);

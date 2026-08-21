@@ -1,9 +1,3 @@
-// Regression: a struct that owns a List, stored inside another List, must tear down
-// cleanly. The nested inner List's destructor was memoized against the AMBIENT
-// monomorphized body's type args (e.g. List<Route>) instead of its own — so a
-// List<Inner> released its buffer through __destruct_Storage_Outer and segfaulted at
-// exit. It only surfaced with a SECOND field on the outer struct (which moves the List
-// field off offset 0). Fixed by pinning the destructor's instantiation context.
 import assert;
 import list;
 
@@ -27,16 +21,12 @@ fn test_nested_owned_list_teardown(): void {
     l.push(Outer(1, buildInner("a", "b")));
     l.push(Outer(2, buildInner("c", "d")));
     assert.equalInt(l.size(), 2);
-    // Reach through both container levels to prove the data is intact, not just that
-    // teardown didn't crash.
     let first = l.get(0) ?? Outer(0, List<Inner>());
     assert.equalInt(first.items.size(), 2);
     let inner0 = first.items.get(0) ?? Inner("");
     assert.equalStr(inner0.t, "a");
 }
 
-// String-before-List ordering (the original @fromRoute Router shape) — a ref-counted
-// field ahead of the owned List, both released, offsets must be right.
 struct Seg { pub name: string, pub kids: List<Inner>, init(name: string, kids: List<Inner>) { self.name = name; self.kids = kids; } }
 
 @test

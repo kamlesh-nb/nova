@@ -1,18 +1,112 @@
+//! Type-name plumbing and ownership decisions for the LLVM backend.
+//!
+//! This is the codegen layer's "what IS this type" oracle. Every other codegen
+//! file (`expressions.zig`, `statements.zig`, `arc.zig`, `declarations.zig`)
+//! reaches into here whenever it needs to translate a Nova type into an LLVM
+//! representation, mangle a name into a valid symbol, or answer the single
+//! most consequential question the backend asks: "does this value OWN a heap
+//! allocation, so that a copy must retain it and its last use must release it?"
+//! Getting that ownership answer wrong is not a soft failure: an over-release
+//! is a use-after-free and an under-release is a leak, so the functions here
+//! are written to fail LOUDLY (abort the compile) rather than guess when sema
+//! never actually typed the value.
+//!
+//! The file has four intertwined jobs:
+//!
+//!   1. Name canonicalisation and mangling ([`getStructBaseName`],
+//!      [`mangleTypeName`], [`methodSymbol`], [`qualifySelfType`]). Nova's
+//!      human-readable type spellings (`List<Map<string, int>>`, `Foo.Bar`,
+//!      `int`) become stable, collision-free LLVM symbol names. The primitive
+//!      aliases are canonicalised first (`int`→`i32`, `long`→`i64`, …) so that
+//!      two spellings of the same type never mangle to two different symbols.
+//!
+//!   2. The codegen representation of primitives ([`CgRepr`], [`CgPrim`],
+//!      [`cgPrim`], [`reprBitWidth`]) and the mapping from a Nova type to a
+//!      concrete `LLVMTypeRef` ([`toLLVMType`], [`llvmForRepr`],
+//!      [`slotTypeForLocal`], the SIMD-vector helpers). Most Nova values live
+//!      in a uniform 64-bit "val" slot; the exceptions handled here are
+//!      floats/doubles (kept in their FP register), SIMD vectors, and value
+//!      optionals.
+//!
+//!   3. The bitcast bridges between that uniform val slot and a specific LLVM
+//!      type ([`coerceToSlotType`], [`castToValType`], [`castFromValType`]).
+//!      These respect signedness (sext vs zext) and the float/double widening
+//!      that the val slot forces, because a wrong choice silently corrupts a
+//!      numeric value.
+//!
+//!   4. Ownership analysis, the heart of the file. There are two engines that
+//!      must agree: the authoritative TYPED path over `TypeStore`/`TypeId`
+//!      ([`isOwnedTypeId`] and its many typed entry points), and a legacy
+//!      STRING-name path ([`ownedByName`]) kept as a fallback for the cases the
+//!      typed IR cannot resolve (erased type params without an instantiation,
+//!      un-lowered names). [`tdShadowDiff`] cross-checks the two whenever
+//!      `NOVA_SEMA_SHADOW` reporting is on, and the whole file is part of the
+//!      long migration off string-based ownership (`irct_*` counters). Sitting
+//!      alongside is the VALUE-STRUCT classifier ([`isValueStructName`],
+//!      [`computeValueEscapeSet`]): a plain `struct` is value-semantic (copied,
+//!      not refcounted) UNLESS it escapes by return, trait impl, `@serializable`,
+//!      a reference-typed field, or a generic argument, in which case it falls
+//!      back to reference semantics. That escape set is computed once and cached
+//!      on the compiler.
+//!
+//! Nearly every `pub fn` takes `self: *LlvmCompiler`: this module is
+//! effectively a mixin of free functions over the compiler's state (its
+//! `type_store`, `typed_ir`, `current_instantiation_id`, struct/enum/trait
+//! tables) rather than an independent abstraction. The functions are grouped
+//! here purely because they are all "about types".
+
 const std = @import("std");
 const ast = @import("../../frontend/ast.zig");
+/// Type-engine SHADOW/diagnostics module. Owns the legacy string renderer
+/// ([`sema_shadow.renderLegacy`]) that turns a `TypeId` back into its
+/// human-readable name, the live singletons (`live_store`, `live_sema`) codegen
+/// borrows to lower a bare name, and the `td_*`/`irct_*`/`census_*` counters
+/// that record where the typed and string ownership engines agree or disagree.
 const sema_shadow = @import("../../frontend/sema/shadow.zig");
+/// Monomorphisation results. [`instantiationsOf`] reads `live_instantiations`
+/// (the concrete generic instantiations sema discovered) to emit one copy of a
+/// generic struct's methods per instantiation.
 const sema_mono = @import("../../frontend/sema/mono.zig");
+/// Type-parameter substitution helpers (imported for module wiring; the
+/// overlay substitution used here is [`substViaOverlay`], defined locally).
 const subst_mod = @import("../../frontend/sema/subst.zig");
+/// The inference pass's typed IR type ([`sema_infer.TypedIr`]), needed to spell
+/// the parameter of [`substViaOverlay`] which walks a type resolving type
+/// params through an instantiation overlay.
 const sema_infer = @import("../../frontend/sema/infer.zig");
+/// The name→`TypeId` lowerer. Codegen uses [`lower.Lowerer`] on the live sema
+/// symbol table to resolve a bare type name or an `ast.TypeRef` into a store id
+/// when the typed IR did not already carry one.
 const lower = @import("../../frontend/sema/lower.zig");
+/// The ARC codegen module. Its global flags gate value-struct behaviour
+/// (`value_structs_enabled`, `value_structs_all`, `value_type_set`) and its
+/// [`arc_mod.isUntypeablePlaceholder`] identifies names that must never reach
+/// an ownership decision.
 const arc_mod = @import("arc.zig");
+/// The type system core: `TypeId`, `TypeStore`, `SymbolId`, and the `.isOwned`
+/// predicate that the typed ownership path defers to.
 const typesys = @import("../../frontend/types.zig");
+/// The LLVM C-API bindings root.
 const llvm = @import("llvm");
+/// LLVM type/value handle aliases (`LLVMTypeRef`, `LLVMValueRef`, the type
+/// kinds).
 const types = llvm.types;
+/// LLVM core builder functions (`LLVMBuild*`, `LLVMGetTypeKind`, the primitive
+/// type constructors).
 const core = llvm.core;
 
+/// The backend compiler state every `pub fn` here operates on: the type store,
+/// typed IR, current instantiation, and the struct/enum/union/trait tables.
+/// These functions are logically methods of it, split out by topic.
 const LlvmCompiler = @import("llvm_codegen.zig").LlvmCompiler;
 
+/// Strips a Nova type name down to its bare struct/enum identifier.
+///
+/// Drops any module qualifier before the last `.` (`foo.Bar` → `Bar`) and any
+/// generic argument list starting at `<` (`List<int>` → `List`). The result is
+/// the key used to look a declaration up in the compiler's `structs`/`enums`/
+/// `unions` tables, which are all indexed by bare name. Returns a borrowed
+/// sub-slice of the input; it allocates nothing.
 pub fn getStructBaseName(name: []const u8) []const u8 {
     var base = name;
     if (std.mem.lastIndexOfScalar(u8, base, '.')) |dot_pos| {
@@ -24,6 +118,12 @@ pub fn getStructBaseName(name: []const u8) []const u8 {
     return base;
 }
 
+/// Maps a Nova primitive alias to its canonical LLVM-integer spelling, or null
+/// for anything that is not one of the ten aliases.
+///
+/// This is what makes mangling collision-free across spellings: `int` and `i32`
+/// are the same type, so both must mangle to `i32`. Called per identifier token
+/// by [`mangleTypeName`]; a non-primitive token passes through unchanged.
 fn canonicalPrimAlias(tok: []const u8) ?[]const u8 {
     const pairs = [_]struct { a: []const u8, c: []const u8 }{
         .{ .a = "int", .c = "i32" },   .{ .a = "uint", .c = "u32" },
@@ -36,10 +136,25 @@ fn canonicalPrimAlias(tok: []const u8) ?[]const u8 {
     return null;
 }
 
+/// True for the characters that make up an identifier token (`[A-Za-z0-9_]`).
+///
+/// Used by [`mangleTypeName`] to segment a type spelling into identifier runs
+/// (which get alias-canonicalised) versus punctuation (`<`, `>`, `,`, brackets)
+/// that gets encoded.
 fn isTokenChar(c: u8) bool {
     return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';
 }
 
+/// Turns a Nova type spelling into a valid, collision-free LLVM symbol name.
+///
+/// Identifier runs are copied through [`canonicalPrimAlias`] so alias spellings
+/// unify, and the type-syntax punctuation is encoded so distinct types never
+/// collapse to the same symbol: `<`, `>`, `,` and spaces each become a single
+/// `_` separator (runs of them coalesce, so `Map<string, int>` →
+/// `Map_string_int`, not `Map_string__int`), while `(` `)` `-` `=` `|` map to
+/// `_lp`/`_rp`/`_da`/`_eq`/`_or`. A trailing `_` is trimmed. Caller owns the
+/// returned buffer. See [`methodSymbol`], which appends the method name onto
+/// this to form a mangled method symbol.
 pub fn mangleTypeName(allocator: std.mem.Allocator, type_name: []const u8) ![]u8 {
     var buf = std.ArrayListUnmanaged(u8).empty;
     errdefer buf.deinit(allocator);
@@ -65,9 +180,6 @@ pub fn mangleTypeName(allocator: std.mem.Allocator, type_name: []const u8) ![]u8
             ')' => try buf.appendSlice(allocator, "_rp"),
             '-' => try buf.appendSlice(allocator, "_da"),
             '=' => try buf.appendSlice(allocator, "_eq"),
-            // `|` appears in a value-optional element name (`int | undefined`): map it so the mangled
-            // symbol stays linker-safe AND stays distinct from the bare inner type. Without a distinct
-            // mangling, `List<int | undefined>` collides with `List<int>` at the monomorphised name.
             '|' => try buf.appendSlice(allocator, "_or"),
             else => try buf.append(allocator, c),
         }
@@ -78,6 +190,16 @@ pub fn mangleTypeName(allocator: std.mem.Allocator, type_name: []const u8) ![]u8
     return buf.toOwnedSlice(allocator);
 }
 
+/// Rewrites the bare name of the type currently being compiled into its fully
+/// instantiated spelling, so `Self`-typed things pick up the concrete generic
+/// args.
+///
+/// While emitting a method of, say, `Box<int>` the compiler's
+/// `current_instantiation` is `"Box<int>"`. A field or local typed with the
+/// bare `"Box"` should compile as `"Box<int>"` in that context. Returns the
+/// input unchanged when there is no active instantiation, when the name is
+/// already generic (contains `<`), or when its base name is not the struct
+/// being instantiated. Borrows; allocates nothing.
 pub fn qualifySelfType(self: *LlvmCompiler, type_name: []const u8) []const u8 {
     const inst = self.current_instantiation orelse return type_name;
     if (std.mem.indexOfScalar(u8, type_name, '<') != null) return type_name;
@@ -85,12 +207,27 @@ pub fn qualifySelfType(self: *LlvmCompiler, type_name: []const u8) []const u8 {
     return inst;
 }
 
+/// Builds the mangled LLVM symbol for a method: `mangle(owner) ++ "_" ++ method`.
+///
+/// This is the canonical name codegen emits and calls for `owner.method(...)`.
+/// The owner is mangled via [`mangleTypeName`] (so `List<int>.push` becomes
+/// `List_int_push`); `method` is appended verbatim. Caller owns the result.
 pub fn methodSymbol(self: *LlvmCompiler, owner: []const u8, method: []const u8) ![]const u8 {
     const mangled = try mangleTypeName(self.allocator, owner);
     defer self.allocator.free(mangled);
     return std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ mangled, method });
 }
 
+/// Lists the concrete instantiations of a struct declaration that codegen must
+/// emit, as instantiation-name strings (`null` meaning "the erased/base body").
+///
+/// The first element is always `null`: even a generic struct emits an erased
+/// base body (link-time fallback with internal linkage that globalDCE later
+/// drops). A non-generic struct returns just `[null]`. For a generic struct it
+/// then appends every entry of `sema_mono.live_instantiations` whose base name
+/// matches `s.name`, i.e. every `List<int>`, `List<string>`, … sema actually
+/// discovered. Caller owns the returned slice. Drives per-instantiation method
+/// emission alongside [`methodSymbol`].
 pub fn instantiationsOf(self: *LlvmCompiler, s: ast.StructDecl) ![]const ?[]const u8 {
     var out = std.ArrayListUnmanaged(?[]const u8).empty;
     errdefer out.deinit(self.allocator);
@@ -109,13 +246,27 @@ pub fn instantiationsOf(self: *LlvmCompiler, s: ast.StructDecl) ![]const ?[]cons
     return out.toOwnedSlice(self.allocator);
 }
 
+/// True if the name refers to a user-declared aggregate: a struct, union, or
+/// enum.
+///
+/// Reduces to the base name first via [`getStructBaseName`], so a generic
+/// spelling or module-qualified name still matches. Distinguishes "has an
+/// aggregate layout in one of the tables" from a primitive or a builtin.
 pub fn isStructType(self: *LlvmCompiler, type_name: []const u8) bool {
     const base = getStructBaseName(type_name);
     return self.structs.contains(base) or self.unions.contains(base) or self.enums.contains(base);
 }
 
+/// The distinct machine representations codegen lowers a primitive to.
+///
+/// `i1`/`i8`/`i16`/`i32`/`i64` are the integer widths; `f32`/`f64` the floats;
+/// `word` is the pointer-width machine word (`ptr`), 64-bit here but kept
+/// separate from `i64` so pointer-ish values are recognisable. See [`cgPrim`]
+/// which classifies a name into one of these plus a sign, and [`llvmForRepr`]
+/// which materialises the LLVM type.
 pub const CgRepr = enum { i1, i8, i16, i32, word, i64, f32, f64 };
 
+/// The bit width of a [`CgRepr`]. `word` is 64 on this target, same as `i64`.
 pub fn reprBitWidth(repr: CgRepr) u32 {
     return switch (repr) {
         .i1 => 1,
@@ -129,8 +280,22 @@ pub fn reprBitWidth(repr: CgRepr) u32 {
     };
 }
 
+/// A classified primitive: its machine representation plus its signedness.
+///
+/// Signedness is separate from [`CgRepr`] because `u32` and `i32` share the
+/// `i32` representation but differ on whether a widening cast should zext or
+/// sext (see [`castToValType`]).
 pub const CgPrim = struct { repr: CgRepr, signed: bool };
 
+/// Classifies a type name as a primitive, or null if it is not one.
+///
+/// Recognises both the Nova alias spellings (`int`, `long`, `byte`, `float`, …)
+/// and the explicit-width spellings (`i32`, `u64`, `f64`, …), plus `bool` (as
+/// `i1`) and `ptr` (as an unsigned `word`). Note the deliberate collapse:
+/// `byte`/`ubyte`/`u8` are all unsigned `i8` while `sbyte`/`i8` are signed
+/// `i8`. This is the single source of truth for "is this a primitive and how is
+/// it represented"; [`isPrimitiveTypeName`], [`toLLVMType`], and the cast
+/// bridges all consult it.
 pub fn cgPrim(name: []const u8) ?CgPrim {
     const T = struct { n: []const u8, r: CgRepr, s: bool };
     const table = [_]T{
@@ -155,30 +320,48 @@ pub fn cgPrim(name: []const u8) ?CgPrim {
     return null;
 }
 
-// True when `name` is a BOXED value-optional: `<value-type> | undefined` (e.g. `int | undefined`). A
-// heap-optional (`string | undefined`) is a plain pointer optional (0 == none), NOT boxed, so it is excluded.
+/// True if the name spells a VALUE optional: a primitive OR-ed with `undefined`
+/// (`int | undefined`, `undefined | float`).
+///
+/// A value optional is one whose non-null arm is a primitive, so it can be
+/// represented inline in the 64-bit val slot with a sentinel rather than boxed
+/// on the heap (see [`slotTypeForLocalId`]). The check is strict: exactly one
+/// `|`, exactly one arm equal to `undefined`, the other a primitive that is
+/// neither `any` nor `void`. Anything with a second `|`, or a non-primitive
+/// arm, is not a value optional.
 pub fn valueOptionalName(name: []const u8) bool {
     const bar = std.mem.indexOfScalar(u8, name, '|') orelse return false;
     const lhs = std.mem.trim(u8, name[0..bar], " ");
     const rhs = std.mem.trim(u8, name[bar + 1 ..], " ");
-    if (std.mem.indexOfScalar(u8, rhs, '|') != null) return false; // more than two arms
+    if (std.mem.indexOfScalar(u8, rhs, '|') != null) return false;
     const value_arm = if (std.mem.eql(u8, rhs, "undefined")) lhs else if (std.mem.eql(u8, lhs, "undefined")) rhs else return false;
     return isPrimitiveTypeName(value_arm) and
         !std.mem.eql(u8, value_arm, "any") and
         !std.mem.eql(u8, value_arm, "void");
 }
 
+/// True if the name is a codegen primitive in the broad sense: a [`cgPrim`]
+/// scalar, `void`, `any`, or a SIMD vector (`f64x4` and the [`simdVecName`]
+/// set).
+///
+/// "Primitive" here means "not an owned heap value": [`ownedByName`] uses this
+/// as the fast, allocation-free short-circuit that classifies such a name as
+/// non-owning without touching the type store.
 pub fn isPrimitiveTypeName(type_name: []const u8) bool {
 
     return cgPrim(type_name) != null or
         std.mem.eql(u8, type_name, "void") or
-        std.mem.eql(u8, type_name, "f64x4") or   // SIMD vector: a value type, never ARC-owned
-        simdVecName(type_name) != null or        // FR-simd-L1 integer vectors, also value types
+        std.mem.eql(u8, type_name, "f64x4") or
+        simdVecName(type_name) != null or
         std.mem.eql(u8, type_name, "any");
 }
 
-// FR-simd-L1: the LLVM vector type for one of the integer-vector type names, or null. One place so the
-// builtins, the slot picker, and the ownership check all agree.
+/// Recognises the fixed-width SIMD vector type names, returning the element bit
+/// width and lane count, or null.
+///
+/// Covers `u8x16` (16 lanes of 8 bits), `u32x4`, and `u64x2`. Consumed by
+/// [`slotTypeForLocalId`] to build the corresponding `LLVMVectorType`. Note
+/// `f64x4` is handled separately (as a double vector) and is not in this table.
 pub fn simdVecName(type_name: []const u8) ?struct { elem: c_uint, lanes: c_uint } {
     if (std.mem.eql(u8, type_name, "u8x16")) return .{ .elem = 8, .lanes = 16 };
     if (std.mem.eql(u8, type_name, "u32x4")) return .{ .elem = 32, .lanes = 4 };
@@ -186,6 +369,12 @@ pub fn simdVecName(type_name: []const u8) ?struct { elem: c_uint, lanes: c_uint 
     return null;
 }
 
+/// Materialises the `LLVMTypeRef` for a [`CgRepr`].
+///
+/// Prefers the compiler's cached context types (`i1_type`, `i8_type`,
+/// `i32_type`, `i64_type`, `val_type` for `word`) where they exist, falling
+/// back to freshly constructed global types for `i16`/`f32`/`f64`. `word` maps
+/// to `val_type`, the uniform 64-bit slot the runtime passes values in.
 pub fn llvmForRepr(self: *LlvmCompiler, repr: CgRepr) types.LLVMTypeRef {
     return switch (repr) {
         .i1 => self.i1_type,
@@ -200,6 +389,13 @@ pub fn llvmForRepr(self: *LlvmCompiler, repr: CgRepr) types.LLVMTypeRef {
     };
 }
 
+/// Lowers an `ast.TypeRef` to an LLVM type, coarsely.
+///
+/// A bare-identifier primitive lowers to its [`llvmForRepr`] type; EVERYTHING
+/// else (non-primitive identifiers, optionals, tuples, arrays, generics, …)
+/// lowers to the opaque `ptr_type`. This is the coarse "is it a scalar or a
+/// pointer" lowering used where an exact aggregate layout is not needed; the
+/// finer slot decisions live in [`slotTypeForLocalId`].
 pub fn toLLVMType(self: *LlvmCompiler, type_ref: ast.TypeRef) types.LLVMTypeRef {
     switch (type_ref) {
         .ident => |name| {
@@ -210,15 +406,27 @@ pub fn toLLVMType(self: *LlvmCompiler, type_ref: ast.TypeRef) types.LLVMTypeRef 
     }
 }
 
+/// Chooses the LLVM type of a local variable's stack slot from its name alone.
+///
+/// Thin wrapper over [`slotTypeForLocalId`] with no `TypeId`; use the id-taking
+/// form when a resolved type is available, since it can additionally recognise
+/// value optionals and arrays.
 pub fn slotTypeForLocal(self: *LlvmCompiler, type_name: ?[]const u8) types.LLVMTypeRef {
     return self.slotTypeForLocalId(type_name, null);
 }
 
+/// Chooses the LLVM type of a local variable's `alloca` slot.
+///
+/// Most locals live in the uniform 64-bit `val_type` slot, which is the default
+/// return. The exceptions, in priority order: a value optional (by `TypeId`) or
+/// an array stays a `val`/`ptr` respectively; a `f64x4` or [`simdVecName`]
+/// vector gets a real LLVM vector type; a `[`-bearing (array) name is a `ptr`;
+/// and a float/double primitive is stored as a `double` slot (floats are
+/// widened, matching [`castToValType`]). Passing the `TypeId` lets it catch the
+/// value-optional and array cases that the name alone cannot.
 pub fn slotTypeForLocalId(self: *LlvmCompiler, type_name: ?[]const u8, type_id: ?typesys.TypeId) types.LLVMTypeRef {
     if (type_id) |tid| {
         if (self.valueOptionalInner(tid) != null) return self.val_type;
-        // Fixed arrays are `ptr` slots (not the i64 word) so pointer provenance survives -- lets LLVM
-        // disambiguate arrays and vectorize/hoist array loops. Access GEPs the ptr directly.
         if (self.type_store) |st| {
             if (st.get(tid) == .array) return self.ptr_type;
         }
@@ -226,7 +434,7 @@ pub fn slotTypeForLocalId(self: *LlvmCompiler, type_name: ?[]const u8, type_id: 
     if (type_name) |tn| {
         if (std.mem.eql(u8, tn, "f64x4")) return core.LLVMVectorType(core.LLVMDoubleType(), 4);
         if (simdVecName(tn)) |v| return core.LLVMVectorType(core.LLVMIntType(v.elem), v.lanes);
-        if (std.mem.indexOfScalar(u8, tn, '[') != null) return self.ptr_type; // T[N] array by name
+        if (std.mem.indexOfScalar(u8, tn, '[') != null) return self.ptr_type;
         if (cgPrim(tn)) |p| {
             if (p.repr == .f64 or p.repr == .f32) return core.LLVMDoubleType();
         }
@@ -234,12 +442,22 @@ pub fn slotTypeForLocalId(self: *LlvmCompiler, type_name: ?[]const u8, type_id: 
     return self.val_type;
 }
 
-// The SIMD lane type: <4 x double>. One place so the builtins and the slot picker agree.
+/// The LLVM type for `f64x4`: a 4-lane vector of doubles. Takes `self` only for
+/// call-site uniformity; it uses none of it.
 pub fn vecF64x4Type(self: *LlvmCompiler) types.LLVMTypeRef {
     _ = self;
     return core.LLVMVectorType(core.LLVMDoubleType(), 4);
 }
 
+/// Bitcasts a value so it can be stored into a slot of a given LLVM type.
+///
+/// A no-op when the value already has `slot_ty`. Otherwise it bridges the four
+/// mismatches that occur when a uniform-slot value meets a typed slot (or vice
+/// versa): int↔double via bitcast, and int↔pointer via int-to-ptr / ptr-to-int.
+/// These are REPRESENTATION casts (same bits, reinterpreted), not numeric
+/// conversions; see [`castToValType`]/[`castFromValType`] for the width- and
+/// sign-aware numeric conversions. Any unhandled combination returns `val`
+/// unchanged.
 pub fn coerceToSlotType(self: *LlvmCompiler, val: types.LLVMValueRef, slot_ty: types.LLVMTypeRef) types.LLVMValueRef {
     const vt = core.LLVMTypeOf(val);
     if (vt == slot_ty) return val;
@@ -251,9 +469,6 @@ pub fn coerceToSlotType(self: *LlvmCompiler, val: types.LLVMValueRef, slot_ty: t
     if (sk == .LLVMIntegerTypeKind and vk == .LLVMDoubleTypeKind) {
         return core.LLVMBuildBitCast(self.builder, val, slot_ty, "double_to_val");
     }
-    // ptr <-> i64 value-word: array slots are `ptr` (for provenance/vectorization); everything else
-    // stays the i64 word, so the seams (array into a List/any/i64 param, or an i64 into a ptr slot)
-    // convert here.
     if (sk == .LLVMPointerTypeKind and vk == .LLVMIntegerTypeKind) {
         return core.LLVMBuildIntToPtr(self.builder, val, slot_ty, "val_to_ptr");
     }
@@ -263,6 +478,17 @@ pub fn coerceToSlotType(self: *LlvmCompiler, val: types.LLVMValueRef, slot_ty: t
     return val;
 }
 
+/// Converts a typed value INTO the uniform 64-bit `val_type` slot.
+///
+/// This is how a concrete-typed SSA value becomes a generic `val` the runtime
+/// and containers can hold. Pointers are ptr-to-int'd; doubles are bitcast;
+/// floats are FP-extended to double first then bitcast (so a 32-bit float
+/// round-trips through 64 bits); integers narrower than the val width are
+/// extended, and the sign of that extension is read from `type_ref` via
+/// [`cgPrim`] (unsigned → zext, signed → sext) so the numeric value is
+/// preserved, while wider integers are truncated. This is the inverse of
+/// [`castFromValType`]. The `type_ref` matters ONLY for choosing zext vs sext;
+/// getting it wrong sign-corrupts an unsigned value.
 pub fn castToValType(self: *LlvmCompiler, val: types.LLVMValueRef, type_ref: ast.TypeRef) types.LLVMValueRef {
     const val_t = core.LLVMTypeOf(val);
     const val_kind = core.LLVMGetTypeKind(val_t);
@@ -299,6 +525,16 @@ pub fn castToValType(self: *LlvmCompiler, val: types.LLVMValueRef, type_ref: ast
     return val;
 }
 
+/// Converts a uniform `val_type` value back OUT to a concrete LLVM type.
+///
+/// The inverse of [`castToValType`], driven by the target's LLVM type KIND
+/// rather than a Nova `TypeRef`: to a pointer → int-to-ptr; to a double →
+/// bitcast; to a float → bitcast-to-double then FP-truncate; to an integer →
+/// truncate or sign-extend to width, or, for a full 64-bit integer target that
+/// actually holds float/double bits, bitcast (with a float first FP-extended to
+/// double). Sign-extension here is unconditional because the target width, not
+/// the source signedness, is what is known at this seam. Unhandled shapes
+/// return `val` unchanged.
 pub fn castFromValType(self: *LlvmCompiler, val: types.LLVMValueRef, target_type: types.LLVMTypeRef) types.LLVMValueRef {
     const val_t = core.LLVMTypeOf(val);
     const val_kind = core.LLVMGetTypeKind(val_t);
@@ -332,15 +568,24 @@ pub fn castFromValType(self: *LlvmCompiler, val: types.LLVMValueRef, target_type
     return val;
 }
 
+/// Renders an `ast.TypeRef` back to its canonical Nova type-name string.
+///
+/// This is the codegen spelling of a type as it will key mangling, ownership,
+/// and the struct tables. It runs type-param substitution on bare identifiers
+/// (via `substTypeParams`) and encodes the compound forms deliberately:
+///   * a value-optional primitive keeps its `T | undefined` spelling, but a
+///     non-primitive optional renders as just its inner type (optionals of
+///     heap types are represented by the pointer, not a distinct name);
+///   * error unions render as `ErrUnion(ok,err)`, tuples as `(a,b,...)`,
+///     fixed arrays as `elem[N]`, function types as `(params) -> ret`, and
+///     generics as `Name<a, b>` (bare `Name` when there are no params).
+/// Recursive; several arms allocate a working buffer and return an owned slice,
+/// so the caller owns the result. Used pervasively as the string bridge into
+/// [`mangleTypeName`] and [`ownedByName`].
 pub fn typeRefToString(self: *LlvmCompiler, type_ref: ast.TypeRef) anyerror![]const u8 {
     switch (type_ref) {
 
         .ident => |name| return try self.substTypeParams(name),
-        // A VALUE-optional (`int | undefined`) is a BOXED representation distinct from its inner value type;
-        // rendering it as just the inner drops the optionality. That made an error-union ok arm
-        // `int | undefined` collapse to `int` (`ErrUnion(int, E)`), so the producer stored a raw int while
-        // the consumer (typed path) unboxed it -> SEGV (F1). Render value-optionals distinctly, matching
-        // the typed path (`renderLegacy`); a heap-optional keeps the inner rendering (same pointer repr).
         .optional => |opt| {
             const inner = try self.typeRefToString(opt.*);
             if (opt.* == .ident and cgPrim(opt.*.ident) != null) {
@@ -406,6 +651,12 @@ pub fn typeRefToString(self: *LlvmCompiler, type_ref: ast.TypeRef) anyerror![]co
     }
 }
 
+/// True if an expression's resolved type is an optional.
+///
+/// Consults the typed IR ([`typed_ir`].typeOf) and the type store; false when
+/// either is absent or the expression was never typed. Distinct from
+/// [`valueOptionalName`], which is a purely syntactic classifier: this asks the
+/// type engine.
 pub fn isOptionalExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool {
     const ir = self.typed_ir orelse return false;
     const st = self.type_store orelse return false;
@@ -413,6 +664,27 @@ pub fn isOptionalExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool
     return st.get(t) == .optional;
 }
 
+/// The expression-level ownership oracle: does the value this expression yields
+/// own a heap allocation that codegen must retain on copy and release at last
+/// use?
+///
+/// This is the most-used ownership entry point and it layers several fallbacks,
+/// most-precise first, because an expression can be typed to varying degrees of
+/// concreteness:
+///   1. If a concrete `TypeId` is available AND it is a value optional, the
+///      answer is whether the expression actually produces a boxed valopt
+///      ([`exprYieldsValoptBox`]) rather than an inline one.
+///   2. Under an active instantiation, resolve the expression's per-inst type
+///      through the overlay and, if it is neither unresolved nor a bare type
+///      param, defer to [`isOwnedTypeId`].
+///   3. Otherwise take the plain `typeOf`, resolving a lone type param through
+///      the current instantiation.
+///   4. If still untyped/unresolved and the expression is an identifier, fall
+///      back to the local variable's declared type string
+///      ([`isOwnedLocal`]); failing everything, answer NOT owned (false), the
+///      safe-against-double-free default.
+/// Delegates the actual decision to [`isOwnedTypeId`] once a usable id is in
+/// hand.
 pub fn isOwnedExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool {
     const ir = self.typed_ir orelse return false;
     const st = self.type_store orelse return false;
@@ -423,18 +695,12 @@ pub fn isOwnedExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool {
 
     if (self.current_instantiation_id) |inst| {
         if (ir.typeOfInst(expr_ptr.id, inst)) |ct0| {
-            // A bare type-parameter carries no ownership of its own; resolve it through this
-            // instantiation's substitution so ownership is decided by the CONCRETE type.
             const ct = if (st.get(ct0) == .type_param) (ir.tpResolve(ct0, inst) orelse ct0) else ct0;
             if (st.get(ct) != .unresolved and st.get(ct) != .type_param) return self.isOwnedTypeId(ct);
         }
     }
     var t_opt = ir.typeOf(expr_ptr);
 
-    // If the static type is a type-parameter (e.g. returning a `U`-typed value from a generic fn), its
-    // ownership must be that of the concrete type it was monomorphised with. Without this, a generic fn
-    // returning an owned value emits no retain-on-return and the caller over-releases (a double-free).
-    // This is Swift's rule: a function result is +1, so a returned borrowed/parameter value is copied.
     if (t_opt) |t| {
         if (st.get(t) == .type_param) {
             if (self.current_instantiation_id) |inst| {
@@ -451,18 +717,23 @@ pub fn isOwnedExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool {
         }
         return false;
     }
-    // If the type is STILL a bare type-parameter here, the instantiation overlay above did not resolve it,
-    // which means this is a genuinely ERASED body (the generic free-fn/method/RawBuffer/async-util/lambda
-    // bodies that are compiled once for all instantiations, `current_instantiation_id == null`). A
-    // type-parameter value in such a body carries no static ownership, so it is NOT owned -- the concrete
-    // instantiations (which DO get the overlay via inst_disp.runFreeFns/runMethods) decide ownership at
-    // their own call sites. `isOwnedTypeId(.type_param)` returns exactly this (false) when no instantiation
-    // resolves it, so we simply fall through. (String-engine-removal SE-B: the former string fallback here
-    // -- resolveExpressionTypeName + ownedByName -- was proven redundant: across the whole corpus every
-    // erased-body hit resolved to `owned=false`, identical to this path. See string-engine-removal.md.)
     return self.isOwnedTypeId(t_opt.?);
 }
 
+/// Records whether the TYPED and legacy-STRING ownership engines agree for a
+/// type, feeding the `sema_shadow.td_*` counters. Diagnostics only; it changes
+/// no compilation result.
+///
+/// This is the instrumentation behind the migration off string ownership. For a
+/// type param it resolves the concrete substitution and compares the typed
+/// `isOwned` against the string fallback ([`isOwnedRenderedFallback`]), counting
+/// `td_keystone_resolves`/`td_keystone_disagree` and stashing the last
+/// disagreement; when there is no instantiation or the param stays a param it
+/// buckets into `td_blocked_*`. For a concrete type it compares
+/// `store.isOwned` against [`legacyStringOwnership`] of the rendered name,
+/// counting `td_agree`/`td_disagree`. Optionals recurse on the inner; enums and
+/// unresolved types are counted as blocked. Called from [`isOwnedTypeId`] only
+/// when `sema_shadow.report_enabled`.
 fn tdShadowDiff(self: *LlvmCompiler, t: typesys.TypeId) void {
     const st = self.type_store.?;
     switch (st.get(t)) {
@@ -504,39 +775,54 @@ fn tdShadowDiff(self: *LlvmCompiler, t: typesys.TypeId) void {
     }
 }
 
-// M-1/M-10: a return expression is a CONFIRMED BORROW (its value lives outside this frame, so
-// returning it is safe) iff it is a variable/field/index read, or a call whose callee is NOT a
-// struct constructor (that callee returns its own safe value). Anything else -- a struct_init, a
-// `Ctor(...)` call, a ternary, etc. -- may materialise a fresh stack alloca, so it is conservatively
-// treated as a non-borrow (an escape). Failing safe here means an unclassified shape excludes.
-// M-1 fail-safe: a field type that is a trivially-copyable scalar primitive (no heap, no ARC, no
-// non-trivial copy). Only structs whose fields are ALL such scalars are value-lowered for now.
+/// True if a field's type name is a scalar that never owns heap memory.
+///
+/// Broader than [`cgPrim`]: it also whitelists `char`, `usize`, `isize`, and
+/// `word` by name. Used by the value-struct escape analysis
+/// ([`computeValueEscapeSet`], [`isPureValueStructRec`]) to decide that a field
+/// contributes no owned storage, so a struct made only of scalars (and strings)
+/// can stay value-semantic.
 fn isScalarFieldTypeName(name: []const u8) bool {
     const scalars = [_][]const u8{ "int", "long", "short", "byte", "bool", "float", "double", "char", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64", "word", "usize", "isize" };
     for (scalars) |s| if (std.mem.eql(u8, name, s)) return true;
     return false;
 }
 
+/// True if a call's callee is an identifier that names a known struct, i.e. the
+/// call is really a struct construction `Foo(...)` producing a fresh owned
+/// value.
+///
+/// Used by [`returnIsBorrow`] to tell "returning a constructed struct" (owned,
+/// escapes) from "returning a function's result" (treated as a borrow).
 fn calleeNamesStruct(self: *LlvmCompiler, callee: *const ast.Expression) bool {
     if (callee.kind == .ident) return self.structs.contains(getStructBaseName(callee.kind.ident));
     return false;
 }
+/// True if a returned expression yields only a BORROW, not a freshly owned
+/// value that escapes the function.
+///
+/// Literals, binary/unary ops, field accesses, indexing, casts, and ranges are
+/// borrows. A call or generic-call is a borrow UNLESS its callee names a struct
+/// (a constructor, which mints an owned value: see [`calleeNamesStruct`]).
+/// Everything else is conservatively not a borrow. This drives the value-struct
+/// escape analysis: a struct returned via a non-borrow path escapes and must
+/// fall back to reference semantics (see [`computeValueEscapeSet`],
+/// [`blockHasNonBorrowReturn`]).
 pub fn returnIsBorrow(self: *LlvmCompiler, expr: *const ast.Expression) bool {
     return switch (expr.kind) {
-        // These never materialise a fresh value-struct stack alloca: reads, literals (incl.
-        // `undefined`), arithmetic, casts, ranges, and calls to a non-constructor callee (that
-        // callee returns its own safe value). A struct_init / `Ctor(...)` / selector (if_expr,
-        // nullish, tuple, closure, ...) may, so it falls to the conservative `false` -> excluded.
-        // A bare `.ident` is NOT safe: `return localStruct` returns a value struct held in THIS
-        // frame's alloca by value, and we do not copy-return -> it dangles. Only reads that alias
-        // longer-lived storage are true borrows: `self.field` (into the receiver), a container
-        // `get`/index (into the container's heap buffer), literals, arithmetic, casts, ranges.
         .literal, .binary, .unary, .field_access, .index, .cast, .range => true,
         .call => |c| !calleeNamesStruct(self, c.callee),
         .generic_call => |gc| !calleeNamesStruct(self, gc.callee),
         else => false,
     };
 }
+/// True if a statement subtree contains any `return` whose value is NOT a
+/// borrow (see [`returnIsBorrow`]).
+///
+/// Walks into blocks, both arms of `if`, loop bodies, and every switch case /
+/// default. A bare `return;` (no value) does not count. This is the "does this
+/// function ever hand back a freshly owned value" test used by
+/// [`computeValueEscapeSet`]. Mutually recursive with [`blockHasNonBorrowReturn`].
 fn stmtHasNonBorrowReturn(self: *LlvmCompiler, stmt: *const ast.Statement) bool {
     return switch (stmt.*) {
         .return_stmt => |rs| if (rs.value) |*v| !returnIsBorrow(self, v) else false,
@@ -553,14 +839,21 @@ fn stmtHasNonBorrowReturn(self: *LlvmCompiler, stmt: *const ast.Statement) bool 
         else => false,
     };
 }
+/// True if any statement in a block has a non-borrow return. The list-level
+/// half of [`stmtHasNonBorrowReturn`].
 fn blockHasNonBorrowReturn(self: *LlvmCompiler, stmts: []const ast.Statement) bool {
     for (stmts) |*st| if (stmtHasNonBorrowReturn(self, st)) return true;
     return false;
 }
 
-// M-1: the base name of the struct CONSTRUCTED by `expr` in a return position (a fresh alloca), or
-// null if `expr` is not a struct construction. Recurses selector expressions (if/nullish) whose
-// branches may each construct. `Ctor(...)` and `Struct{...}` construct; a bare read/call does not.
+/// Adds to `set` every struct that is CONSTRUCTED inline in a returned
+/// expression, so those structs are marked as escaping.
+///
+/// A `struct_init`, or a call/generic-call whose callee names a struct, records
+/// that struct name (via [`excludeStructByName`]); an `if_expr` recurses into
+/// both branches. Part of building the value-escape set in
+/// [`scanReturnConstructions`]: a struct value that is built and then returned
+/// escapes and cannot stay value-semantic.
 fn returnedConstructedStruct(self: *LlvmCompiler, expr: *const ast.Expression, set: *std.StringHashMap(void)) void {
     switch (expr.kind) {
         .struct_init => |si| excludeStructByName(self, set, si.type_name),
@@ -574,6 +867,13 @@ fn returnedConstructedStruct(self: *LlvmCompiler, expr: *const ast.Expression, s
     }
 }
 
+/// Inserts a struct's base name into the escape `set`, owning a duplicate of
+/// the key.
+///
+/// No-op for a name that is empty, is not a known struct, or is already
+/// present. "Exclude" is from the value-struct point of view: being in this set
+/// EXCLUDES the struct from value semantics. Allocation failure is swallowed
+/// (best-effort; a missed entry only means a struct stays value-semantic).
 fn excludeStructByName(self: *LlvmCompiler, set: *std.StringHashMap(void), name: []const u8) void {
     const base = getStructBaseName(name);
     if (base.len == 0 or !self.structs.contains(base) or set.contains(base)) return;
@@ -581,11 +881,18 @@ fn excludeStructByName(self: *LlvmCompiler, set: *std.StringHashMap(void), name:
     set.put(owned, {}) catch {};
 }
 
-// Walk a body; for every non-borrow return whose value CONSTRUCTS a value struct, exclude that
-// struct. Mirrors stmtHasNonBorrowReturn's control-flow recursion (blocks, if/while/for/switch).
+/// Scans a statement list for returned inline struct constructions, adding each
+/// to the escape `set`. The list-level driver over
+/// [`scanStmtReturnConstructions`].
 fn scanReturnConstructions(self: *LlvmCompiler, stmts: []const ast.Statement, set: *std.StringHashMap(void)) void {
     for (stmts) |*st| scanStmtReturnConstructions(self, st, set);
 }
+/// Walks one statement, recording structs constructed-and-returned into `set`.
+///
+/// For a `return` it only inspects the value when it is NOT a borrow (a
+/// borrow-returned struct does not escape), then calls
+/// [`returnedConstructedStruct`]. Recurses through blocks, `if` branches, loop
+/// bodies, and switch cases. Mutually recursive with [`scanReturnConstructions`].
 fn scanStmtReturnConstructions(self: *LlvmCompiler, stmt: *const ast.Statement, set: *std.StringHashMap(void)) void {
     switch (stmt.*) {
         .return_stmt => |rs| if (rs.value) |*v| {
@@ -606,11 +913,25 @@ fn scanStmtReturnConstructions(self: *LlvmCompiler, stmt: *const ast.Statement, 
     }
 }
 
-// M-1: whole-program escape set. A value struct escapes (and must stay heap) when it is
-// CONSTRUCTED-and-returned (a fresh stack alloca that outlives the frame), stored as a direct
-// struct field, or used as a direct type-param field. A value struct returned only by borrow
-// (a container get, a field/var read) does NOT escape and can be value-lowered inline. Computed
-// once, lazily, only when the value-struct gate is on.
+/// Computes, once, the set of struct names that must fall back to REFERENCE
+/// semantics because they escape, and caches it on `self.value_escape_set`.
+///
+/// A plain `struct` is value-semantic (copied, destructed by value) by default;
+/// this analysis finds the ones for which that is unsafe or wrong and excludes
+/// them. A struct is excluded if any of the following hold:
+///   * it is CONSTRUCTED and RETURNED anywhere ([`scanReturnConstructions`]),
+///     or it is the declared return type of a function that has a non-borrow
+///     return and is not itself marked a reference;
+///   * it has trait `impls` (trait objects need a stable address), or carries
+///     the `@serializable` attribute;
+///   * it has a field whose type is a non-scalar, non-`string`, non-reference
+///     type (an owning field forces reference semantics);
+///   * it is used as a generic ARGUMENT substituted into another struct's
+///     field, or appears inside a tuple / error-union / optional in the type
+///     store ([`excludeIfStruct`]).
+/// The `addName` local closure is the in-function equivalent of
+/// [`excludeStructByName`]. The result is consulted by [`isValueStructName`];
+/// computing it lazily there is why this returns void and stores into `self`.
 fn computeValueEscapeSet(self: *LlvmCompiler) void {
     var set = std.StringHashMap(void).init(self.allocator);
     const addName = struct {
@@ -621,35 +942,17 @@ fn computeValueEscapeSet(self: *LlvmCompiler) void {
             st.put(owned, {}) catch {};
         }
     }.f;
-    // 1. a value struct CONSTRUCTED in a return position escapes (a fresh stack alloca that outlives
-    //    the frame); one returned only by borrow (e.g. List.at -> self.data.get(i)) does NOT. We scan
-    //    the BODY and exclude the struct actually constructed in the return -- NOT the function's
-    //    declared return type: a lifted CLOSURE carries a useless "i32" return_type (only trait
-    //    returns are recorded), so keying on the declared type misses `() => Point(3,4)`. Every
-    //    lifted closure is appended to self.functions, so this scan covers them.
     for (self.functions.items) |f| {
-        // (a) exclude the struct CONSTRUCTED in a return -- covers lifted closures, whose declared
-        //     return_type is a useless "i32".
         scanReturnConstructions(self, f.body.statements, &set);
-        // (b) a non-borrow return of a bare local (`return r` where r: R) has no construction node
-        //     to key on, so exclude the function's DECLARED return type. Skipped for classes.
         const rbase = getStructBaseName(f.return_type);
         if (self.structs.get(rbase)) |rsd| {
             if (!rsd.is_reference and blockHasNonBorrowReturn(self, f.body.statements))
                 addName(self, &set, f.return_type);
         }
     }
-    // 2. every struct field type (a value struct stored as a field escapes with its container);
-    //    also: a struct that IMPLEMENTS A TRAIT can be widened to that trait's fat pointer, which
-    //    stores a pointer to the struct -> it must live on the heap, so exclude it from value-lowering.
     var it = self.structs.iterator();
     while (it.next()) |e| {
         if (e.value_ptr.impls.len > 0) addName(self, &set, e.key_ptr.*);
-        // A @serializable struct is constructed and returned by a generated `<T>__bind` binder, and
-        // through a type-parameter-erased generic (`serde.bind<T>` returning `T`) whose declared
-        // return type is the bare param `T`, not the concrete struct -- so the return-construction
-        // channel (1) cannot see it. Exclude it directly: serde-bound structs stay on the heap until
-        // the binder/generic-return path is inline-aware.
         for (e.value_ptr.attributes) |a| if (a == .serializable) {
             addName(self, &set, e.key_ptr.*);
             break;
@@ -657,25 +960,12 @@ fn computeValueEscapeSet(self: *LlvmCompiler) void {
         for (e.value_ptr.fields) |fld| {
             const fs = self.typeRefToString(fld.type_name) catch continue;
             const fbase = getStructBaseName(fs);
-            // A nested `struct` (VALUE) field is stored INLINE by value (Swift model) -- the parent memcpy
-            // deep-copies it, so it does NOT force the parent to the heap. But ONLY a value struct: a `class`
-            // field is a shared-mutable reference (e.g. a Map's RawBuffer). If the container were value-lowered,
-            // a copy would share that reference while copying the container's own scalar fields independently
-            // (len says 5, the shared buffer is resized to 10) -> corruption. So a `class` field forces the
-            // container to the heap (reference), as before.
             if (self.structs.get(fbase)) |fsd| {
-                if (!fsd.is_reference) continue; // inline value-struct field -> safe, no escape
+                if (!fsd.is_reference) continue;
             }
-            // Otherwise a field must be a scalar OR a `string`. A class field, container/optional/array,
-            // decimal or function forces the whole struct to the heap (reference semantics).
             if (!isScalarFieldTypeName(fs) and !std.mem.eql(u8, fs, "string")) addName(self, &set, e.key_ptr.*);
         }
     }
-    // 3. Generic struct args that land in a DIRECT type-param field escape (that field is a raw
-    //    8-byte slot holding a pointer to a stack alloca -> dangling). But a type param used only
-    //    inside a container (e.g. `data: Storage<T>`) is inline-safe (M-10), so it does NOT escape.
-    //    Storage<X> elements themselves are inline (M-10) and are NOT excluded. renderLegacy returns
-    //    a BORROWED string — do not free it.
     if (self.type_store) |store| {
         const n = store.count();
         var i: usize = 0;
@@ -687,7 +977,6 @@ fn computeValueEscapeSet(self: *LlvmCompiler) void {
                     const inst = sema_shadow.renderLegacy(self.allocator, store, id) catch continue;
                     const decl = self.structs.get(getStructBaseName(inst)) orelse continue;
                     for (decl.fields) |fld| {
-                        // A field typed DIRECTLY as a bare type param (`p: T`) makes that param escape.
                         const tp_name: ?[]const u8 = switch (fld.type_name) {
                             .ident => |nm| nm,
                             else => null,
@@ -702,11 +991,6 @@ fn computeValueEscapeSet(self: *LlvmCompiler) void {
                         }
                     }
                 },
-                // A value struct that lands in a tuple element, an error-union payload, or an
-                // optional inner is stored as a raw 8-byte slot holding a pointer to a stack alloca
-                // -> it would dangle. These aggregate/coercion slots are not yet inline-aware, so any
-                // value struct reaching one is excluded (kept on the heap). Over-exclusion is safe;
-                // under-exclusion is a UAF, so this scans the whole interned type store (complete).
                 .tuple => |items| for (items) |elt| excludeIfStruct(self, store, &set, elt),
                 .error_union => |eu| {
                     excludeIfStruct(self, store, &set, eu.ok);
@@ -720,9 +1004,13 @@ fn computeValueEscapeSet(self: *LlvmCompiler) void {
     self.value_escape_set = set;
 }
 
-// M-1: if `id` renders to a known struct base name, exclude it from value-lowering (keep it on the
-// heap). Used for aggregate/coercion slots (tuple/error-union/optional) that hold a pointer, not an
-// inline value. renderLegacy returns a BORROWED string — do not free it.
+/// Renders a `TypeId` to its name and, if it names a known struct, excludes it
+/// from value semantics by inserting it into `set`.
+///
+/// The type-store-side counterpart of [`excludeStructByName`], used by
+/// [`computeValueEscapeSet`] when walking tuple / error-union / optional
+/// members. No-op for non-struct, empty, or already-present names; owns the
+/// duplicated key and swallows allocation failure.
 fn excludeIfStruct(self: *LlvmCompiler, store: *const typesys.TypeStore, set: *std.StringHashMap(void), id: typesys.TypeId) void {
     const rendered = sema_shadow.renderLegacy(self.allocator, store, id) catch return;
     const base = getStructBaseName(rendered);
@@ -731,53 +1019,61 @@ fn excludeIfStruct(self: *LlvmCompiler, store: *const typesys.TypeStore, set: *s
     set.put(owned, {}) catch {};
 }
 
-// M-1: a value-lowered struct by base name (rollout-gated). When disabled (default) this is
-// always false, so codegen is unchanged. Escaping structs are excluded (safety, see above).
+/// The definitive test: is this struct compiled with VALUE semantics (copied
+/// and destructed by value, not reference-counted)?
+///
+/// Returns false unless value structs are enabled at all
+/// (`arc_mod.value_structs_enabled`). Then it excludes, in order: a struct
+/// whose name collides across modules ([`isCollidingStruct`], which needs a
+/// stable identity), one explicitly declared a reference (`is_reference`), and
+/// any struct in the lazily-computed escape set ([`computeValueEscapeSet`],
+/// triggered here on first use). If it survives all that, it is a value struct
+/// when `value_structs_all` is set, or when it is listed in the opt-in
+/// `value_type_set`; otherwise false. This is the gate every copy/destruct site
+/// in codegen consults to decide value vs reference handling.
 pub fn isValueStructName(self: *LlvmCompiler, name: []const u8) bool {
     if (!arc_mod.value_structs_enabled) return false;
     const base = getStructBaseName(name);
     const sd = self.structs.get(base) orelse return false;
-    // A COLLIDING struct (same bare name in two modules) reaches here under a fully MANGLED scoped
-    // key (`conformance_cases_scoped_rec_a_Rec`), which the escape channels -- keyed on the SOURCE
-    // name `Rec` -- never match, so its returned-by-value alloca would dangle undetected (case 282).
-    // The decl still carries the original bare name; use it. Colliding structs are rare; keep them
-    // all on the heap rather than thread the scoped/mangled/base name duality through value lowering.
     if (self.isCollidingStruct(sd.name)) return false;
-    if (sd.is_reference) return false; // `class` stays a reference type
+    if (sd.is_reference) return false;
     if (self.value_escape_set == null) computeValueEscapeSet(self);
-    if (self.value_escape_set.?.contains(base)) return false; // escapes -> keep on heap
+    if (self.value_escape_set.?.contains(base)) return false;
     if (arc_mod.value_structs_all) return true;
     if (arc_mod.value_type_set) |set| return set.contains(base);
     return false;
 }
 
-// Channels 1/3/5 (value-semantics): a "pure value DTO" is a declared `struct` (value type) that would be
-// value-lowered were it not escape-excluded for a benign reason -- constructed-and-returned (channel 1),
-// serde-bound (3), or passed as a type-param arg (5). It has NO trait impl (channel 2 -- may be widened to
-// a fat pointer / used as a shared handle) and ONLY scalar / string / nested-pure-value-struct fields (a
-// container / class / optional / decimal field is channel 4 -- shared-mutable state that must NOT be
-// deep-copied). Such a struct is safe to DEEP-COPY on `let b = a` for value semantics even while it stays
-// on the heap; the trait/container structs (the "should be class" shared-state types that crashed the
-// blanket experiment) are structurally excluded. Cycle-guarded (a by-value cycle is rejected by P2 anyway).
+/// True if a struct is a PURE value struct: value-semantic AND transitively made
+/// only of scalars, strings, and other pure value structs, with no owned
+/// container/heap field anywhere.
+///
+/// "Pure" is stronger than [`isValueStructName`]: a pure value struct has no
+/// field that needs a destructor, so it can be copied with a plain bit-copy and
+/// dropped with no cleanup. Seeds a `visited` set and defers to
+/// [`isPureValueStructRec`]; contrast [`valueStructHasOwnedFields`], which is
+/// the negation-flavoured "does it have any owned field".
 pub fn isPureValueStructName(self: *LlvmCompiler, name: []const u8) bool {
     if (!arc_mod.value_structs_enabled) return false;
     var visited = std.StringHashMap(void).init(self.allocator);
     defer visited.deinit();
     return isPureValueStructRec(self, name, &visited);
 }
+/// Recursive core of [`isPureValueStructName`], with a `visited` set guarding
+/// against cyclic struct references.
+///
+/// Returns false on an empty name, a re-visited name (a cycle means it is not a
+/// trivially-copyable leaf), a missing declaration, a reference struct, or a
+/// name-colliding struct. Each field must be `string`, a scalar
+/// ([`isScalarFieldTypeName`]), or a non-reference struct that is itself pure by
+/// recursion; any other field type makes the struct impure.
 fn isPureValueStructRec(self: *LlvmCompiler, name: []const u8, visited: *std.StringHashMap(void)) bool {
     const base = getStructBaseName(name);
     if (base.len == 0 or visited.contains(base)) return false;
     visited.put(base, {}) catch return false;
     const sd = self.structs.get(base) orelse return false;
-    if (sd.is_reference) return false; // `class`
+    if (sd.is_reference) return false;
     if (self.isCollidingStruct(sd.name)) return false;
-    // Channel 2 (trait impl): a trait-implementing struct is NOT excluded here. The shared-state services
-    // that must keep reference semantics (mediator / DI / handlers / pools) are already caught by the field
-    // check below -- they carry a container / class field (channel 4). A trait-implementing struct with only
-    // scalar/string/value fields is a stateless value handler (the spec allows handlers to be `struct`), so
-    // it is safe to deep-copy; widening to a trait object goes through a different (trait-typed) copy site
-    // that this predicate never matches, so it is unaffected. (Verified: full corpus + ASAN green.)
     for (sd.fields) |fld| {
         const fts = self.typeRefToString(fld.type_name) catch return false;
         if (std.mem.eql(u8, fts, "string")) continue;
@@ -786,35 +1082,39 @@ fn isPureValueStructRec(self: *LlvmCompiler, name: []const u8, visited: *std.Str
         if (self.structs.get(fbase)) |fsd| {
             if (!fsd.is_reference and isPureValueStructRec(self, fbase, visited)) continue;
         }
-        return false; // container / class / optional / decimal / function field -> not a pure value DTO
+        return false;
     }
     return true;
 }
 
-// M-1: does a value struct have any OWNED (reference) field that needs retain-on-copy /
-// release-on-drop? A scalar-only value struct has none, so it needs no drop at all.
-// True when a value struct transitively needs destruction, i.e. it has a directly-owned field OR a
-// nested VALUE-STRUCT field that itself transitively needs destruction. The direct-only version missed
-// `Outer{inner:S}` where S owns a string: `inner` is a value struct (not "owned"), so the struct got no
-// drop scheduled and S's string leaked (600-object ARC-audit leak). The struct destructor already
-// recurses into inline value-struct fields; this predicate decides whether to schedule that drop at all.
+/// True if a value struct has at least one field that owns heap memory
+/// (directly or through a nested value struct), so its copy/destruct must run
+/// ARC on that field.
+///
+/// This is what tells codegen whether a value struct needs a real destructor
+/// and deep-retain-on-copy versus a bit-copy. Seeds `visited` and defers to
+/// [`valueStructHasOwnedFieldsRec`]. Roughly the complement of
+/// [`isPureValueStructName`], but phrased over the ownership predicate rather
+/// than the scalar/string whitelist.
 pub fn valueStructHasOwnedFields(self: *LlvmCompiler, name: []const u8) bool {
     var visited = std.StringHashMap(void).init(self.allocator);
     defer visited.deinit();
     return valueStructHasOwnedFieldsRec(self, name, &visited);
 }
+/// Recursive core of [`valueStructHasOwnedFields`], cycle-guarded by `visited`.
+///
+/// Returns true as soon as any field is an owned declared type
+/// ([`isOwnedDeclaredType`]), or is a nested value struct that itself has owned
+/// fields. Fields whose type string fails to render are skipped
+/// conservatively. Empty/re-visited/undeclared names return false.
 fn valueStructHasOwnedFieldsRec(self: *LlvmCompiler, name: []const u8, visited: *std.StringHashMap(void)) bool {
     const base = getStructBaseName(name);
-    // Cycle guard: a struct that contains itself by value is an infinite-size error (validated
-    // separately); here we just avoid non-termination and treat the back-edge as "no new owned field".
     if (base.len == 0 or visited.contains(base)) return false;
     visited.put(base, {}) catch {};
     const sd = self.structs.get(base) orelse return false;
     for (sd.fields) |fld| {
         const fts = self.typeRefToString(fld.type_name) catch continue;
         if (self.isOwnedDeclaredType(fld.type_name, fts)) return true;
-        // Transitive: recurse into a nested VALUE-struct field (a `class` field is caught by
-        // isOwnedDeclaredType above; only inline value-struct fields reach here).
         const fbase = getStructBaseName(fts);
         if (fbase.len != 0 and self.isValueStructName(fbase)) {
             if (valueStructHasOwnedFieldsRec(self, fbase, visited)) return true;
@@ -823,18 +1123,33 @@ fn valueStructHasOwnedFieldsRec(self: *LlvmCompiler, name: []const u8, visited: 
     return false;
 }
 
-// M-1: same decision from a struct TypeId (for ownership). Only pays the name render when the
-// rollout gate is on; off by default => zero overhead on the hot ownership path.
+/// [`isValueStructName`] keyed by a `TypeId` instead of a string.
+///
+/// False unless value structs are enabled and the id actually resolves to a
+/// `.struct_` in the store; then it renders the id to its name and asks
+/// [`isValueStructName`]. This is the form [`isOwnedTypeId`] calls to decide
+/// that a value struct is NOT owned.
 pub fn isValueStructTid(self: *LlvmCompiler, t: typesys.TypeId) bool {
     if (!arc_mod.value_structs_enabled) return false;
     const st = self.type_store orelse return false;
     if (st.get(t) != .struct_) return false;
-    // renderLegacy may return a BORROWED (interned) or static string — never free it, matching
-    // every other codegen caller. Freeing it corrupts sema's name cache (method resolution reads it).
     const nm = sema_shadow.renderLegacy(self.allocator, st, t) catch return false;
     return self.isValueStructName(nm);
 }
 
+/// The AUTHORITATIVE, typed ownership decision for a `TypeId`: does a value of
+/// this type own a heap allocation?
+///
+/// This is the keystone the whole ARC apparatus rests on, so it is deliberately
+/// strict. An `.unresolved` id is a COMPILER BUG (an ownership action was taken
+/// on a value sema never typed): it prints a diagnostic and `exit(70)` rather
+/// than guess, because either answer risks memory corruption. A `.type_param`
+/// is resolved through the current instantiation's overlay if possible, else
+/// treated as not owned. A value optional is owned (`true`) since it may box; a
+/// value struct is explicitly NOT owned ([`isValueStructTid`]); everything else
+/// defers to `store.isOwned`. When shadow reporting is on it first records a
+/// typed-vs-string diff via [`tdShadowDiff`]. Contrast [`ownedByName`], the
+/// string fallback used only when no id is available.
 pub fn isOwnedTypeId(self: *LlvmCompiler, t: typesys.TypeId) bool {
     const st = self.type_store.?;
     if (sema_shadow.report_enabled) tdShadowDiff(self, t);
@@ -864,16 +1179,20 @@ pub fn isOwnedTypeId(self: *LlvmCompiler, t: typesys.TypeId) bool {
 
         .optional => |inner| if (self.valueOptionalInner(t) != null) true else self.isOwnedTypeId(inner),
 
-        // M-1: a value-lowered struct is NOT owned — inline storage, no ARC (no retain/release/free).
-        // Its owned FIELDS are still dropped by the struct's generated destructor when it is a
-        // reference; a value struct with owned fields is out of scope for the initial rollout
-        // (all-primitive value structs only), so this simple gate suffices for now.
         .struct_ => if (self.isValueStructTid(t)) false else st.isOwned(t),
 
         else => st.isOwned(t),
     };
 }
 
+/// Ownership of a named LOCAL variable, preferring its resolved `TypeId` and
+/// falling back to its declared type string.
+///
+/// If the local has a concrete type id in `current_local_type_ids` (neither
+/// unresolved nor a bare type param), defers to [`isOwnedTypeId`]; when there is
+/// no type store it trusts the id directly. Otherwise falls back to
+/// [`ownedByName`] on the declared `type_string`. This is the identifier-case
+/// fallback used from [`isOwnedExpr`].
 pub fn isOwnedLocal(self: *LlvmCompiler, name: []const u8, type_string: []const u8) bool {
     if (self.current_local_type_ids) |ids| {
         if (ids.get(name)) |tid| {
@@ -890,13 +1209,18 @@ pub fn isOwnedLocal(self: *LlvmCompiler, name: []const u8, type_string: []const 
     return self.ownedByName(type_string);
 }
 
+/// Returns a CONCRETE `TypeId` for an expression, or null if only an
+/// unresolved/type-param type is available.
+///
+/// "Concrete" excludes `.unresolved` and `.type_param` via the local `concrete`
+/// predicate. It tries, in order: the per-instantiation type
+/// (`typeOfInst` under the current instantiation), then the plain `typeOf`, then
+/// for an identifier its declared local type id. This is the workhorse behind
+/// all the `isXExpr` type predicates below and [`resolveExpressionTypeName`];
+/// they need a concrete id so a generic body does not report an erased param.
 pub fn typeOfExprConcrete(self: *LlvmCompiler, expr_ptr: *const ast.Expression) ?typesys.TypeId {
     const ir = self.typed_ir orelse return null;
     const st_opt = self.type_store;
-    // A type_param or unresolved id is NOT a usable decision id: in an instantiated body the typed IR may
-    // hand back the raw type-param `T` (the string engine substitutes it to the concrete arg via
-    // substTypeParams; the TypeId path must reach the same concrete id). Reject those and fall through to
-    // the local-slot fallback, which holds the concrete id (populated with the substituted type).
     const concrete = struct {
         fn ok(st: ?*const typesys.TypeStore, t: typesys.TypeId) bool {
             const s = st orelse return true;
@@ -914,10 +1238,6 @@ pub fn typeOfExprConcrete(self: *LlvmCompiler, expr_ptr: *const ast.Expression) 
     if (ir.typeOf(expr_ptr)) |t| {
         if (concrete(st_opt, t)) return t;
     }
-    // Phase 1 (string->TypeId cutover): fall back to the local TypeId slot for an ident, mirroring the
-    // string engine's `resolveExpressionTypeName -> current_local_types.get(ident)` fallback but keeping a
-    // real TypeId. current_local_type_ids is populated for params (C10) and for `let`/`const` locals
-    // (collectLocalVarTypes), so an ident whose typed-IR node is missing/unresolved still resolves here.
     if (expr_ptr.kind == .ident) {
         if (self.current_local_type_ids) |ids| {
             if (ids.get(expr_ptr.kind.ident)) |tid| {
@@ -932,6 +1252,8 @@ pub fn typeOfExprConcrete(self: *LlvmCompiler, expr_ptr: *const ast.Expression) 
     return null;
 }
 
+/// True if an expression's concrete type is `string`. Uses
+/// [`typeOfExprConcrete`]; false when unresolved or when there is no type store.
 pub fn isStringExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool {
     if (self.type_store) |st| {
         if (typeOfExprConcrete(self, expr_ptr)) |tid| {
@@ -941,10 +1263,9 @@ pub fn isStringExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool {
     return false;
 }
 
-// TypeId-based expression-type predicates — the string->TypeId replacements for
-// `resolveExpressionTypeName(e) == "float"/"bool"/"void"/"any"/"decimal"`. Each returns false when no
-// concrete TypeId is available (matching the old `if (name) |n| ... else false` shape), so a caller that
-// used the string compare as a redundant fallback behind one of these can drop the string compare.
+/// True if an expression's concrete type is a floating-point primitive (`.prim`
+/// with `.float` kind). Used to pick FP paths in codegen. See
+/// [`typeOfExprConcrete`].
 pub fn isFloatExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool {
     if (self.type_store) |st| {
         if (typeOfExprConcrete(self, expr_ptr)) |tid| {
@@ -955,6 +1276,8 @@ pub fn isFloatExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool {
     return false;
 }
 
+/// True if an expression's concrete type is `bool` (`.prim` with `.bool` kind).
+/// See [`typeOfExprConcrete`].
 pub fn isBoolExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool {
     if (self.type_store) |st| {
         if (typeOfExprConcrete(self, expr_ptr)) |tid| {
@@ -965,6 +1288,8 @@ pub fn isBoolExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool {
     return false;
 }
 
+/// True if an expression's concrete type is `void` (`.prim` with `.void_`
+/// kind). See [`typeOfExprConcrete`].
 pub fn isVoidExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool {
     if (self.type_store) |st| {
         if (typeOfExprConcrete(self, expr_ptr)) |tid| {
@@ -975,6 +1300,8 @@ pub fn isVoidExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool {
     return false;
 }
 
+/// True if an expression's concrete type is the dynamic `any` type (`.any_`).
+/// See [`typeOfExprConcrete`].
 pub fn isAnyExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool {
     if (self.type_store) |st| {
         if (typeOfExprConcrete(self, expr_ptr)) |tid| {
@@ -984,6 +1311,8 @@ pub fn isAnyExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool {
     return false;
 }
 
+/// True if an expression's concrete type is `decimal` (decimal128). See
+/// [`typeOfExprConcrete`].
 pub fn isDecimalExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool {
     if (self.type_store) |st| {
         if (typeOfExprConcrete(self, expr_ptr)) |tid| {
@@ -993,6 +1322,14 @@ pub fn isDecimalExpr(self: *LlvmCompiler, expr_ptr: *const ast.Expression) bool 
     return false;
 }
 
+/// If an expression is a tuple whose element `idx` is a TRAIT type, returns that
+/// trait's name; otherwise null.
+///
+/// Used where codegen must know a tuple element is a trait object (fat pointer)
+/// to handle it correctly. Requires the element type to be `.trait_` in the
+/// store AND for the rendered name to be a known trait; returns null on any miss
+/// (no store, unresolved, out-of-range index, non-trait element). Caller owns
+/// the rendered name string.
 pub fn tupleElemTraitName(self: *LlvmCompiler, expr_ptr: *const ast.Expression, idx: usize) ?[]const u8 {
     if (self.type_store) |st| {
         if (typeOfExprConcrete(self, expr_ptr)) |tid| {
@@ -1008,6 +1345,14 @@ pub fn tupleElemTraitName(self: *LlvmCompiler, expr_ptr: *const ast.Expression, 
     return null;
 }
 
+/// Ownership of the OK arm of an error-union expression, by type id, with a
+/// string fallback.
+///
+/// When the expression resolves to a concrete `.error_union` type, defers to
+/// [`isOwnedTypeId`] on its `ok` arm; otherwise falls back to [`ownedByName`] on
+/// the caller-supplied `ok_string` (the codegen spelling of the ok type). This
+/// lets ARC on a `try`/`catch` destructure release the ok payload correctly.
+/// Mirrors [`isOwnedErrUnionErr`].
 pub fn isOwnedErrUnionOk(self: *LlvmCompiler, expr_ptr: *const ast.Expression, ok_string: []const u8) bool {
     if (self.type_store) |st| {
         if (typeOfExprConcrete(self, expr_ptr)) |tid| {
@@ -1020,6 +1365,8 @@ pub fn isOwnedErrUnionOk(self: *LlvmCompiler, expr_ptr: *const ast.Expression, o
     return self.ownedByName(ok_string);
 }
 
+/// Ownership of the ERR arm of an error-union expression, by type id, with a
+/// string fallback on `err_string`. The err-arm mirror of [`isOwnedErrUnionOk`].
 pub fn isOwnedErrUnionErr(self: *LlvmCompiler, expr_ptr: *const ast.Expression, err_string: []const u8) bool {
     if (self.type_store) |st| {
         if (typeOfExprConcrete(self, expr_ptr)) |tid| {
@@ -1032,6 +1379,14 @@ pub fn isOwnedErrUnionErr(self: *LlvmCompiler, expr_ptr: *const ast.Expression, 
     return self.ownedByName(err_string);
 }
 
+/// Ownership of the element type of a `Storage<T>` expression, by type id, with
+/// a string fallback.
+///
+/// When `obj_ptr` resolves to a concrete `.storage` type, defers to
+/// [`isOwnedTypeId`] on its element; otherwise falls back to [`ownedByName`] on
+/// `elem_string`. Storage is Nova's backing container primitive; this decides
+/// whether removing/overwriting an element must release it. See
+/// [`isOwnedStorageElemByName`] for the name-only variant.
 pub fn isOwnedStorageElem(self: *LlvmCompiler, obj_ptr: *const ast.Expression, elem_string: []const u8) bool {
     if (self.type_store) |st| {
         if (typeOfExprConcrete(self, obj_ptr)) |tid| {
@@ -1043,6 +1398,16 @@ pub fn isOwnedStorageElem(self: *LlvmCompiler, obj_ptr: *const ast.Expression, e
     return self.ownedByName(elem_string);
 }
 
+/// Reverse lookup: finds the `TypeId` whose rendered name equals `name`, for
+/// compound types (error unions, tuples, storages, structs).
+///
+/// Builds a name→id index lazily on first call by scanning the whole live store
+/// and rendering every compound type once, caching it on
+/// `self.rendered_name_ids`. This exists so codegen can go from a codegen
+/// name-string (which it often has when the typed IR did not carry an id) back
+/// to a store id to make a precise ownership decision. Only the four compound
+/// kinds are indexed; primitives and simple names are handled by [`tidForName`].
+/// Returns null if no compound type renders to that exact name.
 pub fn typeIdForRenderedName(self: *LlvmCompiler, name: []const u8) ?typesys.TypeId {
     const store = sema_shadow.live_store orelse return null;
     if (self.rendered_name_ids == null) {
@@ -1068,6 +1433,13 @@ pub fn typeIdForRenderedName(self: *LlvmCompiler, name: []const u8) ?typesys.Typ
     return self.rendered_name_ids.?.get(name);
 }
 
+/// Ownership of a storage element when only the element's NAME is known (no
+/// expression to type).
+///
+/// Synthesises the container name `Storage<elem>`, looks it up via
+/// [`typeIdForRenderedName`], and if it resolves to a `.storage` type asks
+/// [`isOwnedTypeId`] on its element; otherwise falls back to [`ownedByName`] on
+/// `elem_string`. The name-only counterpart of [`isOwnedStorageElem`].
 pub fn isOwnedStorageElemByName(self: *LlvmCompiler, elem_string: []const u8) bool {
     const container = std.fmt.allocPrint(self.allocator, "Storage<{s}>", .{elem_string}) catch return self.ownedByName(elem_string);
     defer self.allocator.free(container);
@@ -1079,6 +1451,12 @@ pub fn isOwnedStorageElemByName(self: *LlvmCompiler, elem_string: []const u8) bo
     return self.ownedByName(elem_string);
 }
 
+/// Ownership of one arm of an error union identified by the union's NAME.
+///
+/// Looks `union_name` up via [`typeIdForRenderedName`]; if it is an
+/// `.error_union`, asks [`isOwnedTypeId`] on the `err` arm when `is_err` else
+/// the `ok` arm. Falls back to [`ownedByName`] on `payload_string`. The
+/// name-keyed counterpart of [`isOwnedErrUnionOk`]/[`isOwnedErrUnionErr`].
 pub fn isOwnedErrUnionPayloadByName(self: *LlvmCompiler, union_name: []const u8, is_err: bool, payload_string: []const u8) bool {
     if (self.typeIdForRenderedName(union_name)) |tid| {
         if (self.type_store) |st| {
@@ -1091,6 +1469,12 @@ pub fn isOwnedErrUnionPayloadByName(self: *LlvmCompiler, union_name: []const u8,
     return self.ownedByName(payload_string);
 }
 
+/// Ownership of tuple element `idx` identified by the tuple's NAME.
+///
+/// Looks `tuple_name` up via [`typeIdForRenderedName`]; if it is a `.tuple` and
+/// `idx` is in range, asks [`isOwnedTypeId`] on that element. Falls back to
+/// [`ownedByName`] on `elem_string`. Used when destructuring a tuple by its
+/// codegen name.
 pub fn isOwnedTupleElemByName(self: *LlvmCompiler, tuple_name: []const u8, idx: usize, elem_string: []const u8) bool {
     if (self.typeIdForRenderedName(tuple_name)) |tid| {
         if (self.type_store) |st| {
@@ -1101,13 +1485,14 @@ pub fn isOwnedTupleElemByName(self: *LlvmCompiler, tuple_name: []const u8, idx: 
     return self.ownedByName(elem_string);
 }
 
-// L1 string->TypeId migration: recover a RESOLVED TypeId from a rendered type name, so an ownership
-// decision made from a name-only site can defer to the single TypeId engine (isOwnedTypeId) instead
-// of string-matching. Covers composites + struct-with-args via the rendered-name index, and plain
-// named types (struct / enum / trait / primitive) via the sema lowerer -- the same lower path
-// isOwnedDeclaredType uses. Returns null only for names with no concrete type: bare type parameters
-// and instantiation-free generics (e.g. "T", "List<T>"), which are reachable only from erased
-// generic bodies that monomorphization dead-strips.
+/// Resolves a bare type NAME to a concrete `TypeId`, or null if it stays
+/// unresolved/param.
+///
+/// Two strategies: first the rendered-name index ([`typeIdForRenderedName`]) if
+/// that hit resolves ([`nameResolvable`]); otherwise it actually LOWERS the name
+/// through a fresh [`lower.Lowerer`] over the live sema symbol table, accepting
+/// the result only if resolvable. This is the string→id bridge [`ownedByName`]
+/// uses to promote a name to the typed path before deciding ownership.
 pub fn tidForName(self: *LlvmCompiler, name: []const u8) ?typesys.TypeId {
     if (self.type_store) |st| {
         if (self.typeIdForRenderedName(name)) |tid| {
@@ -1124,10 +1509,9 @@ pub fn tidForName(self: *LlvmCompiler, name: []const u8) ?typesys.TypeId {
     return null;
 }
 
-// A name resolves to a usable ownership answer for anything with a concrete type -- INCLUDING enums
-// (isOwnedTypeId reads enum_tagged, the SAME "any variant has a payload" rule the string engine's
-// enumIsTaggedUnion applied). Only a bare type parameter or an unresolved name has no answer from a
-// name alone (no instantiation context), so those are rejected and handled by the erased default.
+/// True if a `TypeId` is concretely resolvable for ownership purposes: not a
+/// type param, not unresolved (recursing through optionals). Gate used by
+/// [`tidForName`].
 fn nameResolvable(store: *const typesys.TypeStore, t: typesys.TypeId) bool {
     return switch (store.get(t)) {
         .type_param, .unresolved => false,
@@ -1136,17 +1520,23 @@ fn nameResolvable(store: *const typesys.TypeStore, t: typesys.TypeId) bool {
     };
 }
 
-// The principled replacement for the legacy string-ownership fallback. A primitive is not owned (a
-// language fact); anything with a recoverable TypeId defers to the ONE ownership engine; only a bare
-// type parameter in an erased (dead-stripped) body has no concrete type to ask, and there the
-// conservative owned=true default -- NOT a decision by user-type NAME -- is emitted into code mono
-// discards. This is what lets the string ownership engine be retired for all real types.
+/// The LEGACY string-name ownership decision, used only when no `TypeId` is
+/// available.
+///
+/// It tries hard to reach the typed path first: `any` is owned; a primitive
+/// ([`isPrimitiveTypeName`]) is not owned (fast path, counted `irct_primitive`);
+/// a name that [`tidForName`] can resolve defers to [`isOwnedTypeId`]
+/// (`irct_resolved`). Only if all that fails does it decide from the string
+/// itself (`irct_string_decided`): an UN-TYPEABLE placeholder
+/// ([`arc_mod.isUntypeablePlaceholder`]) is a compiler bug and aborts with
+/// `exit(70)` (freeing it would corrupt memory); a lone uppercase letter (an
+/// erased type param like `T`) is treated as not owned; anything else defaults
+/// to OWNED. That default-owned is the conservative choice for an unknown
+/// user type: over-retaining leaks, whereas the opposite would double-free.
+/// Increments the `irct_*` migration counters throughout. Prefer
+/// [`isOwnedTypeId`] whenever an id is in hand.
 pub fn ownedByName(self: *LlvmCompiler, name: []const u8) bool {
     sema_shadow.irct_live_calls += 1;
-    // `any` is an OWNED heap carrier (nova_any_box), but isPrimitiveTypeName lumps it with the value
-    // primitives (convenient for the value-optional value-arm check). Decide it as owned BEFORE the
-    // primitive short-circuit, otherwise this LIVE string fallback under-claims ownership on an `any` value
-    // and leaks its box. Matches isOwnedTypeId (the TypeId engine) and the legacyStringOwnership baseline.
     if (std.mem.eql(u8, name, "any")) return true;
     if (isPrimitiveTypeName(name)) {
         sema_shadow.irct_primitive += 1;
@@ -1157,11 +1547,6 @@ pub fn ownedByName(self: *LlvmCompiler, name: []const u8) bool {
         return self.isOwnedTypeId(tid);
     }
     sema_shadow.irct_string_decided += 1;
-    // Erased-body structural default (folded in from the former erasedOwnershipDefault). Reached ONLY when
-    // the value has no recoverable concrete TypeId: a bare type-parameter or instantiation-free generic in
-    // an ERASED body that monomorphization dead-strips, whose IR must still verify. NOT ownership-by-user-
-    // type-name: every resolvable type was decided by isOwnedTypeId above. An untypeable placeholder means
-    // sema failed to type a LIVE value that reached ARC -- a compiler bug -- so fail loud, not guess.
     if (arc_mod.isUntypeablePlaceholder(name)) {
         std.debug.print(
             "\x1b[1m\x1b[31mcompiler error:\x1b[0m\x1b[1m ARC ownership asked of an un-typeable value '{s}'\x1b[0m\n" ++
@@ -1170,11 +1555,18 @@ pub fn ownedByName(self: *LlvmCompiler, name: []const u8) bool {
             .{name});
         std.process.exit(70);
     }
-    // A bare, undeclared single-letter name is a type parameter; its slot holds no owned reference.
     if (name.len == 1 and name[0] >= 'A' and name[0] <= 'Z') return false;
     return true;
 }
 
+/// Ownership of a DECLARED type (an `ast.TypeRef` from a field/param/return
+/// annotation), preferring to lower it to a typed decision.
+///
+/// Lowers `tr` through a fresh [`lower.Lowerer`] over the live sema table; if
+/// the result is decided directly ([`decidedDirectly`], i.e. not an
+/// enum/param/unresolved that needs more context), defers to [`isOwnedTypeId`].
+/// Otherwise falls back to [`ownedByName`] on `string_fallback`. This is the
+/// entry point [`valueStructHasOwnedFieldsRec`] uses per field.
 pub fn isOwnedDeclaredType(self: *LlvmCompiler, tr: ast.TypeRef, string_fallback: []const u8) bool {
     if (sema_shadow.live_sema) |sm| {
         var l = lower.Lowerer.init(self.allocator, &sm.store);
@@ -1186,6 +1578,13 @@ pub fn isOwnedDeclaredType(self: *LlvmCompiler, tr: ast.TypeRef, string_fallback
     return self.ownedByName(string_fallback);
 }
 
+/// Lowers an `ast.TypeRef` to a `TypeId`, returning null if it lowers to
+/// `.unresolved`.
+///
+/// A thin wrapper over [`lower.Lowerer`] on the live sema store. Unlike
+/// [`concreteTidForTypeRef`] it does NOT apply the instantiation overlay, so a
+/// type param may come back as `.type_param`; it only filters out fully
+/// unresolved results.
 pub fn tidForTypeRef(self: *LlvmCompiler, tr: ast.TypeRef) ?typesys.TypeId {
     const sm = sema_shadow.live_sema orelse return null;
     var l = lower.Lowerer.init(self.allocator, &sm.store);
@@ -1196,22 +1595,21 @@ pub fn tidForTypeRef(self: *LlvmCompiler, tr: ast.TypeRef) ?typesys.TypeId {
     return t;
 }
 
-// The CONCRETE TypeId a type-ref lowers to under the CURRENT instantiation: lower it, then substitute any
-// type-params using the active instance's (owner, args) recovered from current_instantiation_id
-// (= .struct_{owner, args}). Returns null if it does not fully resolve (still contains a type-param /
-// unresolved). Used by the transitive free-fn discovery to compute concrete TypeId args instead of strings.
+/// Lowers an `ast.TypeRef` to a fully CONCRETE `TypeId`, resolving type params
+/// through the current instantiation; null if it cannot be made concrete.
+///
+/// For a bare identifier that names a type parameter it takes a fast path:
+/// [`paramLeafByName`] finds the param leaf and `tpResolve` substitutes it. For
+/// everything else it lowers via [`tidForTypeRef`] and then rewrites the whole
+/// type through [`substViaOverlay`] under the current instantiation. Either way
+/// it rejects a result that is still `.unresolved` or `.type_param`. This is the
+/// form used where codegen genuinely needs the concrete instantiated type, e.g.
+/// to name a monomorphised method.
 pub fn concreteTidForTypeRef(self: *LlvmCompiler, tr: ast.TypeRef) ?typesys.TypeId {
     const st = sema_shadow.live_store orelse return null;
     const ir = self.typed_ir orelse return null;
     const inst_opt = self.current_instantiation_id;
 
-    // Fast path: a bare type-param NAME the lowerer cannot resolve without a param scope (e.g. `T`/`U`
-    // forwarded inside a generic body). Recover its type-param LEAF from the owner decl's type_param names
-    // -- the free-fn/method owner (inst_key.decl) and, for a method inst, the receiver struct
-    // (inst_key.args[0]) -- then resolve it through the overlay's tp_resolve. This replaces the former
-    // current_method_subst (name -> index -> arg) lookup: tp_resolve carries the correct concrete for BOTH
-    // struct-T and method-U under this inst_key, without the receiver off-by-one that a raw index has (a
-    // method inst_key is .struct_{method_owner, [recv] ++ U-args}).
     if (tr == .ident) {
         if (inst_opt) |inst| {
             if (paramLeafByName(tr.ident, inst)) |leaf| {
@@ -1232,11 +1630,16 @@ pub fn concreteTidForTypeRef(self: *LlvmCompiler, tr: ast.TypeRef) ?typesys.Type
     };
 }
 
-// Resolve a bare type-parameter NAME to its interned type-param LEAF under the current instantiation, using
-// the owner declaration's type_param names. Checks the inst_key owner (a free-fn or a method's <U>) first,
-// then -- for a method inst, whose key is .struct_{method_owner, [recv] ++ args} -- the receiver struct's
-// own type-params (its T). Interning is deterministic, so the leaf equals the one the sema overlay recorded
-// tp_resolve for, and the caller's tp_resolve lookup hits.
+/// Given a type-parameter NAME and an instantiation, returns the `.type_param`
+/// leaf id (owner symbol + index) so the caller can resolve it through the
+/// overlay.
+///
+/// The instantiation must be a `.struct_`. It first checks the instantiation's
+/// own declaration for a param named `name` ([`paramIndexIn`]); failing that, if
+/// the first struct arg is itself a struct it checks THAT struct's params (this
+/// handles a param inherited from a wrapping generic). Interns and returns the
+/// `type_param` id, or null if the name is not a parameter here. Consumed by
+/// [`concreteTidForTypeRef`] and [`substMethodParams`].
 fn paramLeafByName(name: []const u8, inst: typesys.TypeId) ?typesys.TypeId {
     const st = sema_shadow.live_store orelse return null;
     const sm = sema_shadow.live_sema orelse return null;
@@ -1254,6 +1657,14 @@ fn paramLeafByName(name: []const u8, inst: typesys.TypeId) ?typesys.TypeId {
     return null;
 }
 
+/// Returns the index of a type parameter `name` in a declaration's
+/// `type_params`, or null.
+///
+/// Works for both function and struct declarations (other symbol kinds have no
+/// type params and return null). `sm` is the sema instance (taken `anytype` to
+/// avoid the import cycle). The index is the position used to select the
+/// matching argument from an instantiation's `args`. Helper for
+/// [`paramLeafByName`].
 fn paramIndexIn(sm: anytype, decl: typesys.SymbolId, name: []const u8) ?u32 {
     const sym = sm.tab.symbolAt(decl);
     const tps: []const []const u8 = switch (sym.decl) {
@@ -1265,12 +1676,17 @@ fn paramIndexIn(sm: anytype, decl: typesys.SymbolId, name: []const u8) ?u32 {
     return null;
 }
 
-// Substitute every type-parameter LEAF in `t` with its concrete TypeId from the overlay's tp_resolve under
-// `inst`, re-interning composites as needed. The TypeId-native replacement for the string engine's
-// substTypeParams/substMethodParams: it resolves BOTH struct-T and method-U (both recorded by
-// inst_disp.runFreeFns/runMethods under the shared inst_key) with no receiver off-by-one, since tp_resolve
-// is keyed on the leaf itself. Composite shapes mirror sema/subst.substitute; leaves it cannot resolve are
-// returned unchanged (caller treats a still-param result as "no concrete id").
+/// Rewrites a type, replacing every type parameter with its concrete
+/// substitution from an instantiation overlay, and re-interning the result.
+///
+/// Recurses structurally through every compound kind (struct args, optional,
+/// future, storage, array, error union, tuple, function params/ret), rebuilding
+/// only the branches that actually changed (an unchanged subtree returns the
+/// original id, avoiding needless interning). A `.type_param` resolves via
+/// `ir.tpResolve(t, inst)`, falling back to itself if the overlay has no entry.
+/// Fixed 16-wide scratch buffers cap arity; anything wider is left unchanged.
+/// Interning failures degrade to the original id. This is the general
+/// substitution engine behind [`concreteTidForTypeRef`].
 fn substViaOverlay(st: *typesys.TypeStore, ir: *const sema_infer.TypedIr, t: typesys.TypeId, inst: typesys.TypeId) typesys.TypeId {
     return switch (st.get(t)) {
         .type_param => ir.tpResolve(t, inst) orelse t,
@@ -1333,18 +1749,23 @@ fn substViaOverlay(st: *typesys.TypeStore, ir: *const sema_infer.TypedIr, t: typ
     };
 }
 
+/// True for an identifier byte (`[A-Za-z0-9_]`). Used by [`substMethodParams`]
+/// to find identifier-token boundaries within a type string.
 fn isIdentByte(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
-// SE-C monomorphized-spec NAME MANGLING, TypeId-native. Replaces every type-parameter identifier token in
-// `type_str` (a rendered type spelling) with the concrete type's rendered name, resolved through the TypeId
-// overlay -- paramLeafByName (recover the type-param LEAF from the active decl's names) -> tp_resolve ->
-// renderLegacy -- the SAME resolver the decision path uses, so a monomorphized NAME and a type DECISION can
-// no longer disagree. This replaced the old `current_method_subst` string bindings; that path was proven
-// dead by a full-corpus NOVA_TID_CENSUS sweep (legacy_only=0, diverge=0) before deletion, including the one
-// lifted-lambda case (68_generic_method_mono), which now inherits its parent's inst_key. A wrong name here
-// is a loud link error, never a UAF.
+/// Substitutes type parameters INSIDE a type STRING, token by token, using the
+/// current instantiation.
+///
+/// This is the string-level analogue of [`substViaOverlay`]: it scans
+/// `type_str` for identifier tokens (respecting boundaries via [`isIdentByte`]),
+/// and for each token that names a resolvable type parameter
+/// ([`paramLeafByName`] + `tpResolve`) splices in the rendered concrete type.
+/// Non-parameter tokens and punctuation pass through verbatim. If nothing was
+/// replaced it returns the ORIGINAL `type_str` (no allocation); otherwise the
+/// caller owns the rebuilt string. Used where codegen only has a type spelling,
+/// not an id, but still needs the instantiated form.
 pub fn substMethodParams(self: *LlvmCompiler, type_str: []const u8) anyerror![]const u8 {
     const inst = self.current_instantiation_id orelse return type_str;
     const ir = self.typed_ir orelse return type_str;
@@ -1362,7 +1783,6 @@ pub fn substMethodParams(self: *LlvmCompiler, type_str: []const u8) anyerror![]c
             const tok = type_str[j..e];
 
             var sub: ?[]const u8 = null;
-            // Is this token a type-param of the active instance? Resolve it TypeId-native.
             if (paramLeafByName(tok, inst)) |leaf| {
                 if (ir.tpResolve(leaf, inst)) |c| switch (ls.get(c)) {
                     .unresolved, .type_param => {},
@@ -1389,6 +1809,12 @@ pub fn substMethodParams(self: *LlvmCompiler, type_str: []const u8) anyerror![]c
     return out.toOwnedSlice(self.allocator);
 }
 
+/// True if a type's ownership can be decided WITHOUT more context: not an enum,
+/// type param, or unresolved (recursing through optionals).
+///
+/// Enums are excluded because their ownership needs the rendered-fallback path
+/// ([`isOwnedRenderedFallback`]); params/unresolved need an instantiation. Gate
+/// used by [`isOwnedDeclaredType`] before it trusts the typed decision.
 fn decidedDirectly(store: *const typesys.TypeStore, t: typesys.TypeId) bool {
     return switch (store.get(t)) {
         .enum_, .type_param, .unresolved => false,
@@ -1397,6 +1823,14 @@ fn decidedDirectly(store: *const typesys.TypeStore, t: typesys.TypeId) bool {
     };
 }
 
+/// Ownership of a type decided the LEGACY way: render it to a name, substitute
+/// type params in the string, and ask the string ownership rule.
+///
+/// Renders `t` ([`sema_shadow.renderLegacy`]), runs `substTypeParams`, then
+/// [`legacyStringOwnership`]. This is the "keystone" fallback [`tdShadowDiff`]
+/// compares the typed answer against, and the path enums take (which
+/// [`decidedDirectly`] deliberately routes here). Returns false if rendering or
+/// substitution fails.
 fn isOwnedRenderedFallback(self: *LlvmCompiler, t: typesys.TypeId) bool {
     const st = self.type_store.?;
     const rendered = sema_shadow.renderLegacy(self.allocator, st, t) catch return false;
@@ -1404,6 +1838,15 @@ fn isOwnedRenderedFallback(self: *LlvmCompiler, t: typesys.TypeId) bool {
     return self.legacyStringOwnership(subst);
 }
 
+/// Maps a bare struct name to its module-unique SCOPED name for a given source
+/// file.
+///
+/// Nova lets same-named structs coexist across modules by giving each a
+/// module-unique name; this resolves the visible `name` in `file` to that
+/// unique spelling via the sema symbol table (`scopedNameFor`). Returns `name`
+/// unchanged if there is no live sema or no scoped mapping. Takes `self` only
+/// for call-site uniformity. Compare [`scopedTypeName`], the identical operation
+/// used for non-struct type names.
 pub fn scopedStructName(self: *LlvmCompiler, name: []const u8, file: []const u8) []const u8 {
     _ = self;
     if (sema_shadow.live_sema) |sm| {
@@ -1412,15 +1855,24 @@ pub fn scopedStructName(self: *LlvmCompiler, name: []const u8, file: []const u8)
     return name;
 }
 
+/// True if a struct name is shared by more than one module (a "colliding"
+/// type).
+///
+/// Such a struct cannot be treated as value-semantic (its identity is not
+/// stable across modules), which is why [`isValueStructName`] and
+/// [`isPureValueStructRec`] exclude it. Reads `colliding_types` from the live
+/// sema symbol table; false without live sema. Takes `self` only for call-site
+/// uniformity.
 pub fn isCollidingStruct(self: *LlvmCompiler, name: []const u8) bool {
     _ = self;
     if (sema_shadow.live_sema) |sm| return sm.tab.colliding_types.contains(name);
     return false;
 }
 
-// The module-scoped name of a colliding struct/enum/trait bound to `bare`, resolved from the module in
-// which `bare` appears (its file). Enum/trait references have no value-TypeId to read from, so scope by
-// the source file of the reference. Returns null (use the bare name) when `bare` is not colliding.
+/// Maps a bare TYPE name to its module-unique scoped name for a source file.
+///
+/// The type-name counterpart of [`scopedStructName`] (same `scopedNameFor`
+/// lookup, same pass-through behaviour), used for non-struct type spellings.
 pub fn scopedTypeName(self: *LlvmCompiler, bare: []const u8, file: []const u8) []const u8 {
     _ = self;
     if (sema_shadow.live_sema) |sm| {
@@ -1429,9 +1881,12 @@ pub fn scopedTypeName(self: *LlvmCompiler, bare: []const u8, file: []const u8) [
     return bare;
 }
 
-// Render a TypeId to its legacy name, interned per-TypeId. Returns a BORROWED string owned by the cache
-// (freed at compiler deinit); callers must NOT free it. This replaces the per-call renderLegacy allocation
-// in resolveExpressionTypeName that no caller freed -- the codegen-wide memory leak.
+/// Renders a `TypeId` to its name, MEMOISED per id in `self.type_name_cache`.
+///
+/// [`sema_shadow.renderLegacy`] allocates a fresh string each call, and codegen
+/// renders the same ids repeatedly, so this caches the result. The returned
+/// slice is owned by the cache, NOT the caller: do not free it. Use this rather
+/// than calling `renderLegacy` directly on any hot path.
 pub fn cachedTypeName(self: *LlvmCompiler, st: *const typesys.TypeStore, tid: typesys.TypeId) anyerror![]const u8 {
     if (self.type_name_cache.get(tid)) |cached| return cached;
     const rendered = try sema_shadow.renderLegacy(self.allocator, st, tid);
@@ -1439,6 +1894,19 @@ pub fn cachedTypeName(self: *LlvmCompiler, st: *const typesys.TypeStore, tid: ty
     return rendered;
 }
 
+/// Resolves the codegen NAME of an expression's type, preferring the most
+/// concrete spelling available.
+///
+/// When the typed IR has no usable type it recovers what it can from the AST: a
+/// `struct_init` naming an enum variant yields the enum name
+/// ([`findEnumByVariant`]); a bare identifier yields its declared local type
+/// string; else null. When a type IS available it prefers the CONCRETE
+/// per-instantiation id ([`typeOfExprConcrete`]) over the plain one, so a
+/// generic body reports the instantiated name. The large middle block runs only
+/// under `sema_shadow.tid_census`: it is pure instrumentation comparing the
+/// string-rendered name against the concrete-id name and tallying disagreements
+/// by expression kind (`census_*` counters); it does not affect the returned
+/// value. Caller owns the returned string.
 pub fn resolveExpressionTypeName(self: *LlvmCompiler, expr_ptr: *const ast.Expression) anyerror!?[]const u8 {
     const ir = self.typed_ir orelse return null;
     const st = self.type_store orelse return null;
@@ -1459,11 +1927,8 @@ pub fn resolveExpressionTypeName(self: *LlvmCompiler, expr_ptr: *const ast.Expre
     const t = t_opt.?;
 
     if (sema_shadow.tid_census) {
-        // Census/shadow baseline only: the string engine's rendered+substituted name, compared against the
-        // TypeId engine to prove agreement. NOT on the production path (see the return below).
         const s_name = try self.substTypeParams(try sema_shadow.renderLegacy(self.allocator, st, t));
         if (typeOfExprConcrete(self, expr_ptr)) |ctid| {
-            // Both engines resolved: do they AGREE? A disagreement is a typed-IR accuracy gap (P1a).
             const t_name = self.substTypeParams(sema_shadow.renderLegacy(self.allocator, st, ctid) catch "") catch "";
             if (!std.mem.eql(u8, s_name, t_name)) {
                 sema_shadow.census_disagree += 1;
@@ -1496,36 +1961,32 @@ pub fn resolveExpressionTypeName(self: *LlvmCompiler, expr_ptr: *const ast.Expre
         }
     }
 
-    // String-engine-removal (SE-C): where the instantiation overlay resolves this expr to a CONCRETE
-    // TypeId, return that id's render -- type-parameters are reified through TypeIds, not substMethodParams
-    // string substitution, and the value-optional wrapper is rendered faithfully (the string engine drops
-    // `| undefined` on a type-param inner, renderLegacy(ctid) does not). Only the residual erased cases the
-    // overlay cannot reach (a lambda reifying its parent method's `<T>`, 68_generic_method_mono) fall back
-    // to the string-substituted base render -- the last remaining substMethodParams users.
     if (typeOfExprConcrete(self, expr_ptr)) |ctid| {
         return try sema_shadow.renderLegacy(self.allocator, st, ctid);
     }
-    // GAP-1 (slice B): the residual erased-body fallback. The overlay cannot resolve this expr, which
-    // empirically means the type is a bare type-parameter in an erased (internal-linkage, DCE-dropped)
-    // generic body. A corpus-wide sweep (NOVA_RESOLVE_FALLBACK, 230 samples, 0 DIFF) proved substTypeParams
-    // is an IDENTITY here -- with no active string instantiation on this path it only ever re-renders the
-    // same `T`/`K`/`V` name -- so the production path renders the TypeId directly and substTypeParams is no
-    // longer a live caller from resolveExpressionTypeName (it now survives only under the census baseline
-    // above). If this ever needs a concrete name it will be because the overlay should have resolved it;
-    // that is a typed-IR accuracy gap to fix at the overlay, not to paper over with string substitution.
     return try sema_shadow.renderLegacy(self.allocator, st, t);
 }
 
-// Phase-3 foundation: the SINGLE sanctioned TypeId -> string boundary for the string->TypeId cutover.
-// Returns the mangled/rendered symbol name for a TypeId, mirroring the tail of resolveExpressionTypeName
-// (renderLegacy, then substTypeParams to resolve lingering type-parameters through the active
-// method/instantiation substitution). All remaining places that still need a NAME from a TypeId should
-// eventually route through here, so the one place that turns a type into a string is auditable.
+/// Renders a `TypeId` to its name and substitutes type params through the
+/// current instantiation, giving the fully instantiated symbol spelling. Caller
+/// owns the result.
 pub fn symbolName(self: *LlvmCompiler, tid: typesys.TypeId) anyerror![]const u8 {
     const st = self.type_store.?;
     return try self.substTypeParams(try sema_shadow.renderLegacy(self.allocator, st, tid));
 }
 
+/// Resolves an unqualified callee name to the actual emitted FUNCTION symbol,
+/// trying each naming scope in priority order.
+///
+/// Nova method/free-function calls are written unqualified but the emitted
+/// symbol may be mangled or prefixed. This tries, and returns the first that
+/// [`hasFunction`] confirms exists: (1) the bare name as-is; (2) the
+/// monomorphised method symbol under the current instantiation
+/// ([`methodSymbol`], its scratch buffer freed on miss); (3)
+/// `current_struct_name ++ "_" ++ callee`; (4) `current_module_prefix ++ "_" ++
+/// callee`. If none match it returns the original name unchanged (and, under
+/// `trace_resolution`, bumps `scan_unresolved`). The order matters: a local/free
+/// function shadows a method, which shadows a module-level function.
 pub fn resolveCalleeName(self: *LlvmCompiler, callee_name: []const u8) ![]const u8 {
     if (self.hasFunction(callee_name)) {
         return callee_name;
@@ -1556,20 +2017,28 @@ pub fn resolveCalleeName(self: *LlvmCompiler, callee_name: []const u8) ![]const 
     return callee_name;
 }
 
+/// Alias for the std testing namespace used by the unit tests below.
 const testing = std.testing;
 
+// A plain, non-generic name has no punctuation to encode, so it round-trips
+// through [`mangleTypeName`] byte-for-byte.
 test "mangleTypeName: a non-generic name is unchanged" {
     const got = try mangleTypeName(testing.allocator, "Foo");
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("Foo", got);
 }
 
+// A single generic argument: the `<`/`>` become one `_` separator each,
+// yielding `List_string`.
 test "mangleTypeName: List<string> -> List_string (the G3 spelling 4b inherits)" {
     const got = try mangleTypeName(testing.allocator, "List<string>");
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("List_string", got);
 }
 
+// The comma AND the space after it are both separator characters, but adjacent
+// separators coalesce, so `Map<string, int>` mangles to `Map_string_int` and
+// not `Map_string__int`.
 test "mangleTypeName: two args, and the space after the comma does not double up" {
 
     const got = try mangleTypeName(testing.allocator, "Map<string, int>");
@@ -1577,12 +2046,17 @@ test "mangleTypeName: two args, and the space after the comma does not double up
     try testing.expectEqualStrings("Map_string_int", got);
 }
 
+// Nested generics stack closing brackets (`>>`), but a run of separators still
+// coalesces to one `_`, so `List<List<int>>` becomes `List_List_int`.
 test "mangleTypeName: a nested arg keeps ONE separator per bracket run" {
     const got = try mangleTypeName(testing.allocator, "List<List<int>>");
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("List_List_int", got);
 }
 
+// The collision-freedom guarantee: two different instantiations of the same
+// generic must mangle to different symbols, or their emitted functions would
+// clash at link time.
 test "mangleTypeName: List<int> and List<string> DO NOT collide" {
 
     const a = try mangleTypeName(testing.allocator, "List<int>");
@@ -1592,6 +2066,10 @@ test "mangleTypeName: List<int> and List<string> DO NOT collide" {
     try testing.expect(!std.mem.eql(u8, a, b));
 }
 
+// Wiring guard: forces a reference to the `core` and `types` LLVM aliases so
+// the test build genuinely links the LLVM bindings. It asserts nothing about
+// behaviour; its value is failing to COMPILE if the LLVM import is not
+// reachable from the test module.
 test "the test module can SEE llvm — the wiring, not a lucky absence" {
 
     _ = core;

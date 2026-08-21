@@ -1,10 +1,3 @@
-// Flagship: compile-time handler discovery. For every `impl RequestHandler<Q,R>`
-// the compiler source-generates a typed dispatch `__mediator_dispatch_<Q>` that
-// EMBEDS the handler (auto-discovery — no registration, no handler argument):
-//   __mediator_dispatch_Q(src) = R__toJson((Handler{}).handle(Q__bind(src)))
-// `get<Q>(path)` (next step) reifies a function value of this and registers it.
-// This gate exercises the generated dispatch directly, incl. a NON-pub handler
-// (generated code is exempt from cross-module visibility).
 import assert;
 import serde.source;
 import web.response;
@@ -18,7 +11,6 @@ trait RequestHandler<TReq, TResp> {
 @serializable struct GetUser { pub id: int }
 @serializable struct UserDto { pub id: int, pub name: string }
 
-// deliberately NOT pub — the generated dispatch must still reach it.
 struct GetUserHandler impl RequestHandler<GetUser, UserDto> {
     fn handle(self, req: GetUser): UserDto {
         return UserDto{ id: req.id, name: "Ada" };

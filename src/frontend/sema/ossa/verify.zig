@@ -1,45 +1,128 @@
-// OSSA-lite verifier (Track I / I3) — the REAL, non-vacuous ownership soundness check.
-//
-// Property (the OSSA linear-ownership invariant): every OWNED value is CONSUMED EXACTLY ONCE on every
-// path from its definition to function exit. A consume is `destroy`, `move_out`, or a `ret_owned`
-// terminator. Violations this catches:
-//   - LEAK            : a value reaches a `ret_void`/`ret_trivial`/`br`-to-exit still live (0 consumes).
-//   - DOUBLE-CONSUME  : a value consumed while already consumed (double-free shape).
-//   - USE-AFTER-CONSUME: a borrow/use of a value after it was consumed.
-//   - PATH-IMBALANCE  : at a control-flow join, one predecessor consumed a value and another did not
-//                       (so some path leaks / some path double-frees downstream).
-//
-// Unlike the AST move-check (which was proven vacuous — it could never enter its violation state), this
-// verifier's reject branches are reached by the unit tests below on deliberately-broken IR. Loops
-// (back-edges) are conservatively DEFERRED in this first version (reported, never a false positive).
+//! Ownership-SSA (OSSA) balance verifier: the self-check that proves every
+//! owned value in a function is consumed exactly once on every path.
+//!
+//! Nova is reference-counted, not garbage-collected, so the codegen that emits
+//! `nova_retain`/`nova_release` pairs is where memory correctness is actually
+//! decided. This pass exists to catch a mistake in that emission BEFORE it
+//! reaches a running binary. It runs over the ownership IR built in
+//! [`ir`] (a small SSA form where each value carries an [`ir.Ownership`]) and
+//! answers one question per function: does the ownership stay balanced?
+//!
+//! ## What "balanced" means
+//!
+//! Every [`ir.Ownership.owned`] value must be consumed exactly once along every
+//! control-flow path from where it is produced to every function exit. The pass
+//! walks each block forward, maintaining a `live` set (a bitset indexed by SSA
+//! value id) of owned values that have been produced but not yet consumed:
+//!
+//!   * producing an owned result (any instruction whose result is `owned`) SETS
+//!     its bit;
+//!   * a consuming instruction (see [`ir.consumesOperand`]) or an `ret_owned`
+//!     terminator UNSETS its bit — and if the bit was already clear, that is a
+//!     [`Kind.double_consume`];
+//!   * a borrow / borrow_use of an owned value that is not live is a
+//!     [`Kind.use_after_consume`] (the value was already given away);
+//!   * anything still live at a `ret_void`/`ret_trivial` terminator is a
+//!     [`Kind.leak`] (produced, never consumed).
+//!
+//! ## How joins and loops are checked (the path-imbalance idea)
+//!
+//! The pass is a single forward sweep over blocks in index order, NOT an
+//! iterative dataflow fixpoint. Each block's live-in set is recorded in
+//! [`entry`] by the FIRST predecessor edge that reaches it (see [`edge`]); every
+//! later predecessor edge compares its own live set against that recorded set
+//! and reports a [`Kind.path_imbalance`] for any value that disagrees. That is
+//! how "consumed on the then-branch but not the else-branch" is caught: the two
+//! edges into the join disagree on one bit.
+//!
+//! Reassignment across a join is expressed with phi nodes, so [`edge`] applies
+//! each successor phi as it crosses the edge — consuming the incoming operand
+//! (the old value dies at the merge) and producing the phi result (the merged
+//! value becomes live). This is what lets a loop-header phi keep an owned local
+//! balanced across iterations without the sweep needing to converge: the header
+//! is only visited once, and the back-edge is validated against the recorded
+//! live-in rather than re-propagated.
+//!
+//! Because the sweep is single-pass, correctness depends on the IR being
+//! well-formed SSA with phis at every merge of an owned value; the verifier
+//! reports imbalance rather than looping to a fixpoint, which keeps it O(blocks
+//! + edges) and terminating on any graph.
+//!
+//! The result always has `complete = true` today; the field exists so a future
+//! bailout (e.g. a size or shape the pass refuses to reason about) can report a
+//! partial verdict without the caller mistaking "gave up" for "verified clean".
 
 const std = @import("std");
+/// The ownership IR this pass consumes: values, blocks, phis, terminators, and
+/// the [`ir.Func.ownershipOf`] / [`ir.consumesOperand`] queries that drive the
+/// live-set bookkeeping.
 const ir = @import("ir.zig");
 
+/// The category of an ownership-balance defect the verifier can report.
+///
+/// `deferred_loop` is reserved and not currently produced by [`verify`]; the
+/// other four map directly to the live-set transitions described in the module
+/// header: [`Kind.leak`] (owned but never consumed at a value return),
+/// [`Kind.double_consume`] (consumed when not live), [`Kind.use_after_consume`]
+/// (borrowed after being consumed), and [`Kind.path_imbalance`] (predecessor
+/// edges into a block disagree on whether a value is still live).
 pub const Kind = enum { leak, double_consume, use_after_consume, path_imbalance, deferred_loop };
 
+/// One reported ownership-balance defect: what went wrong and which SSA value
+/// it concerns.
 pub const Diagnostic = struct {
+    /// The category of the defect. See [`Kind`].
     kind: Kind,
-    /// offending value (or `.none` for a whole-function deferral).
+    /// The offending SSA value — the owned value that leaked, was consumed
+    /// twice, was used after consumption, or disagreed across a merge.
     value: ir.Value,
 };
 
+/// The verdict of a [`verify`] run: the list of defects plus whether the pass
+/// reached a full conclusion.
 pub const Result = struct {
+    /// Every defect found, in the order encountered during the forward sweep.
+    /// Empty means the function is ownership-balanced. Owned by the result;
+    /// release with [`Result.deinit`].
     diagnostics: []Diagnostic,
-    /// true if the function was fully checked (no loop deferral).
+    /// True when the pass ran to completion. Always true today (see the module
+    /// header); reserved so a future bailout can distinguish "verified" from
+    /// "declined to verify" without an empty [`Result.diagnostics`] reading as a
+    /// clean bill of health.
     complete: bool,
 
+    /// Frees the [`Result.diagnostics`] slice with the same allocator that
+    /// [`verify`] used to produce it.
     pub fn deinit(self: *Result, gpa: std.mem.Allocator) void {
         gpa.free(self.diagnostics);
     }
+    /// True when no defects were reported. Note this checks only that the
+    /// diagnostics list is empty; pair it with [`Result.complete`] to be sure
+    /// the verdict is also final.
     pub fn ok(self: *const Result) bool {
         return self.diagnostics.len == 0;
     }
 };
 
+/// The per-block live-set representation: an unmanaged bitset indexed by SSA
+/// value id, one bit per owned value that is currently produced-but-unconsumed.
 const Set = std.DynamicBitSetUnmanaged;
 
-/// Verify one function. Caller owns `Result.diagnostics`.
+/// Verifies that every owned value in `func` is consumed exactly once on every
+/// path, returning the collected [`Diagnostic`]s.
+///
+/// Runs a single forward sweep over blocks in index order (see the module
+/// header for why one pass suffices). For each block it clones the live-in set
+/// recorded in [`entry`], applies every instruction — producing owned results
+/// into the set, consuming operands out of it via [`checkConsume`], and
+/// validating borrows via [`checkUse`] — then hands the resulting live set to
+/// the terminator: `ret_owned` consumes, `ret_void`/`ret_trivial` flags any
+/// survivor as a [`Kind.leak`], and branch terminators propagate to successors
+/// through [`edge`].
+///
+/// An empty function (no blocks) is vacuously balanced. The caller owns the
+/// returned [`Result`] and must call [`Result.deinit`]. Returns an allocator
+/// error only; ownership defects are reported in the result, not as errors.
 pub fn verify(gpa: std.mem.Allocator, func: *const ir.Func) !Result {
     var diags = std.ArrayListUnmanaged(Diagnostic).empty;
     errdefer diags.deinit(gpa);
@@ -48,7 +131,6 @@ pub fn verify(gpa: std.mem.Allocator, func: *const ir.Func) !Result {
     const nvals = func.values.items.len;
     if (nblocks == 0) return .{ .diagnostics = try diags.toOwnedSlice(gpa), .complete = true };
 
-    // entry[b]: the live-owned set on entry to block b (null until first predecessor sets it).
     const entry = try gpa.alloc(?Set, nblocks);
     defer {
         for (entry) |*e| if (e.*) |*s| s.deinit(gpa);
@@ -56,10 +138,6 @@ pub fn verify(gpa: std.mem.Allocator, func: *const ir.Func) !Result {
     }
     for (entry) |*e| e.* = null;
 
-    // Blocks are emitted so that every FORWARD edge is index-increasing; the only index-decreasing edges
-    // are loop BACK-edges (body -> header). So index order is a valid processing order: when we reach a
-    // block, its entry set is already fixed by its forward (pre-loop) predecessor, and a back-edge is
-    // handled by COMPARING (the loop must not change the live set) rather than propagating.
     entry[0] = try Set.initEmpty(gpa, nvals);
 
     var b: usize = 0;
@@ -69,15 +147,12 @@ pub fn verify(gpa: std.mem.Allocator, func: *const ir.Func) !Result {
 
         const blk = &func.blocks.items[b];
         for (blk.instrs.items) |ins| {
-            // producers: an owned result becomes live.
             if (ins.result != .none and func.ownershipOf(ins.result) == .owned) {
                 live.set(ins.result.index());
             }
-            // consumers: the operand must be live; then it is removed.
             if (ir.consumesOperand(ins.op)) |v| {
                 try checkConsume(gpa, &diags, &live, v, func);
             }
-            // uses: a borrow / borrow_use / end_borrow of an owned value requires it still live.
             switch (ins.op) {
                 .borrow => |x| try checkUse(gpa, &diags, &live, x.of, func),
                 .borrow_use => |v| try checkUse(gpa, &diags, &live, v, func),
@@ -86,11 +161,9 @@ pub fn verify(gpa: std.mem.Allocator, func: *const ir.Func) !Result {
             }
         }
 
-        // terminator
         if (blk.term) |t| switch (t) {
             .ret_owned => |v| try checkConsume(gpa, &diags, &live, v, func),
             .ret_void, .ret_trivial => {
-                // every owned value must have been consumed on this path.
                 var it = live.iterator(.{});
                 while (it.next()) |vi| try diags.append(gpa, .{ .kind = .leak, .value = @enumFromInt(@as(u32, @intCast(vi))) });
             },
@@ -110,8 +183,15 @@ pub fn verify(gpa: std.mem.Allocator, func: *const ir.Func) !Result {
     return .{ .diagnostics = try diags.toOwnedSlice(gpa), .complete = true };
 }
 
+/// Records a consumption of owned value `v` against the current `live` set.
+///
+/// Non-owned values (trivial/borrowed) are ignored, so callers may pass any
+/// operand blindly. If `v` is owned and its bit is set, it is cleared (the value
+/// is now consumed). If the bit is already clear, the value was consumed twice
+/// on this path, which is appended as a [`Kind.double_consume`] and the set is
+/// left unchanged.
 fn checkConsume(gpa: std.mem.Allocator, diags: *std.ArrayListUnmanaged(Diagnostic), live: *Set, v: ir.Value, func: *const ir.Func) !void {
-    if (func.ownershipOf(v) != .owned) return; // trivial/borrowed are never consumed
+    if (func.ownershipOf(v) != .owned) return;
     if (!live.isSet(v.index())) {
         try diags.append(gpa, .{ .kind = .double_consume, .value = v });
         return;
@@ -119,6 +199,12 @@ fn checkConsume(gpa: std.mem.Allocator, diags: *std.ArrayListUnmanaged(Diagnosti
     live.unset(v.index());
 }
 
+/// Validates a non-consuming use (a `borrow` or `borrow_use`) of value `v`.
+///
+/// Unlike [`checkConsume`] this does NOT alter the `live` set: a borrow reads
+/// the value without taking ownership. Non-owned values are ignored. If `v` is
+/// owned but no longer live, it was borrowed after having been consumed, which
+/// is appended as a [`Kind.use_after_consume`].
 fn checkUse(gpa: std.mem.Allocator, diags: *std.ArrayListUnmanaged(Diagnostic), live: *Set, v: ir.Value, func: *const ir.Func) !void {
     if (func.ownershipOf(v) != .owned) return;
     if (!live.isSet(v.index())) {
@@ -126,22 +212,26 @@ fn checkUse(gpa: std.mem.Allocator, diags: *std.ArrayListUnmanaged(Diagnostic), 
     }
 }
 
-/// Handle a CFG edge cur -> succ carrying `live_in`.
-///   PHIS: if `succ` has owned-value phis, this edge MOVES its input value into each phi (a consume on
-///     this edge) and the phi's result becomes live at the join. Applied on a private copy of `live_in`
-///     so a block with two successors (cond_br) does not corrupt the shared exit set.
-///   FORWARD edge (succ not yet fixed): set/merge the successor's entry set. If it was already set by
-///     another forward predecessor (a join), the two exit sets (after phi application) must be EQUAL — a
-///     mismatch means one path consumed a value another did not (a path imbalance).
-///   BACK edge (succ already fixed, i.e. a loop header we already processed): the live set arriving on
-///     the back-edge must EQUAL the header's entry set, or the loop body changed net ownership per
-///     iteration (an inner value left live = leak, or an outer value consumed = use-after-consume next
-///     iteration). Either way, a path imbalance.
+/// Propagates the live set across one control-flow edge from block `cur` to
+/// successor `succ`, applying phis and either recording or checking `succ`'s
+/// live-in.
+///
+/// Works on a private clone of `live_in` so the caller's set (which may feed
+/// several successors) is untouched. First it walks `succ`'s phi nodes: for the
+/// input whose predecessor is `cur`, the incoming owned operand is consumed (a
+/// clear-when-already-clear bit is a [`Kind.double_consume`]) and the owned phi
+/// result is made live — modelling reassignment at the merge. The `break` after
+/// the matching input assumes at most one input per predecessor.
+///
+/// Then it reconciles with [`entry`]`[succ]`: if this is the first edge to reach
+/// `succ`, the computed set becomes the recorded live-in; otherwise every bit is
+/// compared against the recorded set and each disagreement is a
+/// [`Kind.path_imbalance`]. This first-writer-wins-then-compare scheme is what
+/// makes the single forward sweep sound without iterating to a fixpoint.
 fn edge(gpa: std.mem.Allocator, diags: *std.ArrayListUnmanaged(Diagnostic), entry: []?Set, func: *const ir.Func, cur: usize, succ: usize, live_in: *const Set) !void {
     var live = try live_in.clone(gpa);
     defer live.deinit(gpa);
 
-    // Apply succ's phis for THIS predecessor: consume the input `cur` supplies, produce the phi result.
     for (func.blocks.items[succ].phis.items) |ph| {
         for (ph.inputs) |in| {
             if (@intFromEnum(in.pred) != cur) continue;
@@ -167,8 +257,8 @@ fn edge(gpa: std.mem.Allocator, diags: *std.ArrayListUnmanaged(Diagnostic), entr
     }
 }
 
-// ─────────────────────────────────────────── tests ───────────────────────────────────────────
 
+/// Alias for the standard testing namespace used by the unit tests below.
 const testing = std.testing;
 
 test "balanced straight-line function verifies clean" {
@@ -192,7 +282,7 @@ test "leak: owned value never consumed is flagged" {
     var f = ir.Func{ .name = "leak" };
     defer f.deinit(gpa);
     const e = try f.newBlock(gpa);
-    _ = try f.makeOwned(gpa, e, null); // produced, never destroyed
+    _ = try f.makeOwned(gpa, e, null);
     f.setTerm(e, .ret_void);
 
     var r = try verify(gpa, &f);
@@ -208,7 +298,7 @@ test "double-consume is flagged" {
     const e = try f.newBlock(gpa);
     const x = try f.makeOwned(gpa, e, null);
     try f.destroy(gpa, e, x);
-    try f.destroy(gpa, e, x); // second consume of x
+    try f.destroy(gpa, e, x);
     f.setTerm(e, .ret_void);
 
     var r = try verify(gpa, &f);
@@ -224,7 +314,7 @@ test "use-after-consume is flagged" {
     const e = try f.newBlock(gpa);
     const x = try f.makeOwned(gpa, e, null);
     try f.destroy(gpa, e, x);
-    try f.borrowUse(gpa, e, x); // read after drop
+    try f.borrowUse(gpa, e, x);
     f.setTerm(e, .ret_void);
 
     var r = try verify(gpa, &f);
@@ -246,9 +336,9 @@ test "conditional path imbalance: consumed on one branch only" {
     const c = try f.makeTrivial(gpa, e, null);
     f.setTerm(e, .{ .cond_br = .{ .cond = c, .then_blk = then_b, .else_blk = else_b } });
 
-    try f.destroy(gpa, then_b, x); // consumed on the THEN path only
+    try f.destroy(gpa, then_b, x);
     f.setTerm(then_b, .{ .br = join });
-    f.setTerm(else_b, .{ .br = join }); // ELSE leaves x live -> imbalance at join
+    f.setTerm(else_b, .{ .br = join });
 
     f.setTerm(join, .ret_void);
 
@@ -263,10 +353,6 @@ test "conditional path imbalance: consumed on one branch only" {
 }
 
 test "phi join: outer local reassigned on the THEN path, unified by a phi, verifies clean" {
-    // Models `let x = alloc(); if c { x = alloc(); } use x; drop x;`
-    //   entry:  x0 = make_owned; cond_br -> then, join
-    //   then:   destroy x0; x1 = make_owned; br join
-    //   join:   phi r = [then: x1, entry: x0]; destroy r; ret_void
     const gpa = testing.allocator;
     var f = ir.Func{ .name = "phi_reassign" };
     defer f.deinit(gpa);
@@ -278,8 +364,8 @@ test "phi join: outer local reassigned on the THEN path, unified by a phi, verif
     const c = try f.makeTrivial(gpa, e, null);
     f.setTerm(e, .{ .cond_br = .{ .cond = c, .then_blk = then_b, .else_blk = join } });
 
-    try f.destroy(gpa, then_b, x0); // reassign drops the old value...
-    const x1 = try f.makeOwned(gpa, then_b, null); // ...and binds a new one
+    try f.destroy(gpa, then_b, x0);
+    const x1 = try f.makeOwned(gpa, then_b, null);
     f.setTerm(then_b, .{ .br = join });
 
     const r_phi = try f.addPhi(gpa, join, &.{ .{ .pred = then_b, .value = x1 }, .{ .pred = e, .value = x0 } }, null);
@@ -293,11 +379,6 @@ test "phi join: outer local reassigned on the THEN path, unified by a phi, verif
 }
 
 test "loop-header phi: outer local reassigned each iteration, unified by a header phi, verifies clean" {
-    // Models `let x = alloc(); while c { x = alloc(); } drop x;`
-    //   entry:  x0 = make_owned; br header
-    //   header: phi xh = [entry: x0, body: xb]; cond_br -> body, exit
-    //   body:   destroy xh; xb = make_owned; br header   (back-edge)
-    //   exit:   destroy xh; ret_void
     const gpa = testing.allocator;
     var f = ir.Func{ .name = "loop_phi" };
     defer f.deinit(gpa);
@@ -309,15 +390,13 @@ test "loop-header phi: outer local reassigned each iteration, unified by a heade
     const x0 = try f.makeOwned(gpa, entry, null);
     f.setTerm(entry, .{ .br = header });
 
-    // header phi: entry input x0, back-edge input xb (created below, in the body).
-    const xb = try f.makeOwned(gpa, body, null); // allocate the value id now; emitted in body below
+    const xb = try f.makeOwned(gpa, body, null);
     const xh = try f.addPhi(gpa, header, &.{ .{ .pred = entry, .value = x0 }, .{ .pred = body, .value = xb } }, null);
     const c = try f.makeTrivial(gpa, header, null);
     f.setTerm(header, .{ .cond_br = .{ .cond = c, .then_blk = body, .else_blk = exit } });
 
-    try f.destroy(gpa, body, xh); // reassign drops the loop-carried value...
-    // xb already emitted above (make_owned in body) — it is the rebind.
-    f.setTerm(body, .{ .br = header }); // back-edge
+    try f.destroy(gpa, body, xh);
+    f.setTerm(body, .{ .br = header });
 
     try f.destroy(gpa, exit, xh);
     f.setTerm(exit, .ret_void);
@@ -329,11 +408,6 @@ test "loop-header phi: outer local reassigned each iteration, unified by a heade
 }
 
 test "N-input phi (switch-style): three cases each reassign the same local, unified at the join" {
-    // entry: x0; switch_br -> c1, c2, default
-    // c1: destroy x0; x1=make_owned; br join
-    // c2: destroy x0; x2=make_owned; br join
-    // default: destroy x0; x3=make_owned; br join
-    // join: phi r = [c1:x1, c2:x2, default:x3]; destroy r; ret_void
     const gpa = testing.allocator;
     var f = ir.Func{ .name = "switch_phi" };
     defer f.deinit(gpa);
@@ -385,7 +459,7 @@ test "phi join: forgetting to consume the phi result is a leak" {
     f.setTerm(then_b, .{ .br = join });
 
     _ = try f.addPhi(gpa, join, &.{ .{ .pred = then_b, .value = x1 }, .{ .pred = e, .value = x0 } }, null);
-    f.setTerm(join, .ret_void); // phi result never consumed -> leak
+    f.setTerm(join, .ret_void);
 
     var r = try verify(gpa, &f);
     defer r.deinit(gpa);
@@ -423,18 +497,18 @@ test "balanced loop (owned local borrowed across the loop) verifies clean" {
     const gpa = testing.allocator;
     var f = ir.Func{ .name = "loop_ok" };
     defer f.deinit(gpa);
-    const e = try f.newBlock(gpa); // 0: pre-loop
-    const header = try f.newBlock(gpa); // 1
-    const body = try f.newBlock(gpa); // 2
-    const exit = try f.newBlock(gpa); // 3
+    const e = try f.newBlock(gpa);
+    const header = try f.newBlock(gpa);
+    const body = try f.newBlock(gpa);
+    const exit = try f.newBlock(gpa);
 
     const x = try f.makeOwned(gpa, e, null);
     f.setTerm(e, .{ .br = header });
     const c = try f.makeTrivial(gpa, header, null);
     f.setTerm(header, .{ .cond_br = .{ .cond = c, .then_blk = body, .else_blk = exit } });
-    try f.borrowUse(gpa, body, x); // read x each iteration (borrow, no consume)
-    f.setTerm(body, .{ .br = header }); // back-edge
-    try f.destroy(gpa, exit, x); // drop after the loop
+    try f.borrowUse(gpa, body, x);
+    f.setTerm(body, .{ .br = header });
+    try f.destroy(gpa, exit, x);
     f.setTerm(exit, .ret_void);
 
     var r = try verify(gpa, &f);
@@ -447,16 +521,16 @@ test "loop that leaks an inner owned value each iteration is flagged" {
     const gpa = testing.allocator;
     var f = ir.Func{ .name = "loop_leak" };
     defer f.deinit(gpa);
-    const e = try f.newBlock(gpa); // 0
-    const header = try f.newBlock(gpa); // 1
-    const body = try f.newBlock(gpa); // 2
-    const exit = try f.newBlock(gpa); // 3
+    const e = try f.newBlock(gpa);
+    const header = try f.newBlock(gpa);
+    const body = try f.newBlock(gpa);
+    const exit = try f.newBlock(gpa);
 
     f.setTerm(e, .{ .br = header });
     const c = try f.makeTrivial(gpa, header, null);
     f.setTerm(header, .{ .cond_br = .{ .cond = c, .then_blk = body, .else_blk = exit } });
-    _ = try f.makeOwned(gpa, body, null); // an owned value born each iteration, never destroyed
-    f.setTerm(body, .{ .br = header }); // back-edge: live set now has the extra value -> mismatch
+    _ = try f.makeOwned(gpa, body, null);
+    f.setTerm(body, .{ .br = header });
     f.setTerm(exit, .ret_void);
 
     var r = try verify(gpa, &f);

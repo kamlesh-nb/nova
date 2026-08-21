@@ -1,4 +1,3 @@
-// Characterize the trigger. Box owns a heap List<int>.
 import list;
 
 struct Box {
@@ -14,12 +13,10 @@ fn makeBox(): Box {
     return b;
 }
 
-// A) free async fn taking an owned struct BY VALUE, reading its List (no suspension inside).
 async fn readViaFreeAsync(b: Box): int {
     return b.batch.size();
 }
 
-// B) SYNC free fn taking the owned struct by value (control).
 fn readViaSync(b: Box): int {
     return b.batch.size();
 }
@@ -29,7 +26,7 @@ async fn run(): void {
     console.log(`SYNC pass-by-value:  size=${readViaSync(b1)}`);
 
     let b2 = makeBox();
-    let r = await readViaFreeAsync(b2);          // owned struct by value INTO an async fn
+    let r = await readViaFreeAsync(b2);
     console.log(`ASYNC pass-by-value: size=${r}`);
 }
 

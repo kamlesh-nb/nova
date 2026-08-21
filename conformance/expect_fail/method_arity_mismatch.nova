@@ -1,8 +1,4 @@
 // EXPECT-FAIL: typecheck
-// A1 fail-closed soundness (gaps.md C-chk-1). A method call with the wrong argument count. Free functions
-// and constructors were arity-checked, but methods were not -- `b.take(1, 2, 3)` on a 1-arg method reached
-// codegen and produced an LLVMVerificationError (a compiler crash with no source span). Must be a clean
-// typecheck error. Nova methods have no default or variadic params, so arity is exact.
 struct Box {
     n: int,
     pub fn take(self: Box, a: int): int { return a; }

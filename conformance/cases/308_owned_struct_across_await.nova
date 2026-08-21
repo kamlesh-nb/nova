@@ -1,8 +1,3 @@
-// E2 — an OWNED struct held in a local across an `await` on the reactor path must survive the
-// suspension (it lives in the coroutine frame), and be released exactly once when the frame is
-// reaped. A regression once freed such a struct one drop early -> use-after-free after the await.
-// This gate pins the behaviour: every case reads an owned struct (with a heap `string` field, so a
-// premature free is an ASAN use-after-free) AFTER one or more awaits, on the Nova reactor (coroStart).
 
 import assert;
 import bytes;
@@ -12,49 +7,44 @@ struct Counter { pub n: int, init(x: int) { self.n = x; } pub fn get(self: Count
 
 async fn dbl(n: int): int { return n * 2; }
 
-// (1) struct used AFTER a single spawn+await suspension.
 async fn holdAcross(cell: long): void {
     let b = Box("payload", 42);
     let h = spawn dbl(5);
     let r = await h;
     let ok = if (b.v == 42) 1 else 0;
-    bytes.write_i32(cell, 0, b.v + r + ok);   // 42 + 10 + 1 = 53
+    bytes.write_i32(cell, 0, b.v + r + ok);
 }
 
-// (2) struct used BETWEEN two awaits and again after.
 async fn twoAwaits(cell: long): void {
     let b = Box("aa", 10);
     let r1 = await dbl(1);
-    let mid = b.v + r1;                        // between
+    let mid = b.v + r1;
     let r2 = await dbl(2);
-    bytes.write_i32(cell, 0, b.v + mid + r2);  // 10 + 12 + 4 = 26
+    bytes.write_i32(cell, 0, b.v + mid + r2);
 }
 
-// (3) struct is a method-call receiver after the await.
 async fn methodAfter(cell: long): void {
     let c = Counter(99);
     let r = await dbl(3);
-    bytes.write_i32(cell, 0, c.get() + r);     // 99 + 6 = 105
+    bytes.write_i32(cell, 0, c.get() + r);
 }
 
-// (4) await INSIDE a loop; the struct is read across every suspension and after the loop.
 async fn awaitInLoop(cell: long): void {
     let b = Box("loop", 100);
     let acc = 0;
     let i = 0;
     while (i < 3) {
         let r = await dbl(i);
-        acc = acc + b.v + r;                   // across each await
+        acc = acc + b.v + r;
         i = i + 1;
     }
-    bytes.write_i32(cell, 0, acc + b.v);       // 3*100 + (0+2+4) + 100 = 406
+    bytes.write_i32(cell, 0, acc + b.v);
 }
 
-// (5) build an owned struct, await, then read it to build the returned owned struct.
 async fn returnAfter(): Box {
     let b = Box("r", 7);
     let r = await dbl(3);
-    return Box(b.s, b.v + r);                  // read b after await
+    return Box(b.s, b.v + r);
 }
 
 @test

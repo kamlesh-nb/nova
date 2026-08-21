@@ -1,100 +1,206 @@
-// OSSA-lite lowering (Track I / I2) — produce the ownership IR for real Nova functions.
-//
-// This is the connective piece: it turns a Nova function body into the ownership IR (ossa/ir.zig) so
-// the I3 verifier (ossa/verify.zig) can check release-balance on REAL code, not just constructed IR.
-// The ownership signals come from sema's TypedIr (`ownedOf` / `typeOf` + `store.isOwnedSafe`) — i.e. the
-// same information codegen uses to decide retain/release — so the IR reflects codegen's ownership, not a
-// reverse-engineering of LLVM shapes (which is what blocked the V4' balance checker).
-//
-// SLICE 1 (this file) is deliberately NARROW and SOUND-BY-DEFERRAL, mirroring the V4' discipline: it
-// only lowers functions whose body is STRAIGHT-LINE (no if/while/for/switch/nested block), and only
-// models owned LET-LOCALS. For the balance property, only three events matter, so only these are
-// emitted: `make_owned` (a let-local of owned type = a +1 birth), `copy` (a `let y = x` dup of an owned
-// local), and the consumes (`destroy` at scope end, or `ret_owned` when an owned local is returned).
-// Uses/borrows do not affect balance and are skipped in slice 1. Anything the walk cannot model
-// precisely (control flow, reassignment, an owned value flowing into a call/store, destructuring) makes
-// the whole function DEFERRED — never a wrong lowering. Coverage grows in I4.
+//! OSSA-lite lowering: turn a function's AST into an ownership-explicit,
+//! basic-block IR so the release-balance verifier can PROVE that every owned
+//! value is destroyed exactly once (no leak, no double-free).
+//!
+//! This is the front half of the `NOVA_OSSA` self-check. Codegen's real ARC is
+//! decided elsewhere (`codegen/arc.zig`); this pass is a SEPARATE, conservative
+//! model whose only job is to catch ownership imbalances at compile time. It
+//! walks the typed AST, tracks the set of live owned locals in scope, and emits
+//! an [`ir.Func`] made of blocks whose terminators encode control flow and
+//! whose instructions are the ownership events that matter: `makeOwned` (a new
+//! heap value is born), `copy` (an owned duplicate — an ARC retain of a fresh
+//! reference), `borrowUse` (an owned value is read without transferring it),
+//! and `destroy` (the ARC release). [`verify.verify`] then checks that along
+//! every path each owned value reaches exactly one release. [`forward.count`]
+//! separately tallies how many of the emitted copies are only ever
+//! borrowed-then-destroyed (never moved or returned), which is headroom for a
+//! later copy-elision optimisation.
+//!
+//! Key design decision: this is "OSSA-LITE" and it DEFERS rather than guesses.
+//! Any construct whose ownership flow the model cannot represent soundly makes
+//! the whole function bail out with [`Outcome.deferred`] and a [`DeferReason`],
+//! instead of emitting an IR that might verify wrongly. A deferred function is
+//! simply not checked; it is never reported as imbalanced. That is why the
+//! coverage number (`lowered / total`) is a real metric — it is the slice of
+//! the corpus the verifier actually vouches for. Deferral reasons include
+//! `break`/`continue` outside a loop the model set up, a reassignment of a
+//! local that pre-dates the current SSA "clone floor", `switch` cases with
+//! guards, and non-block (single-statement) branch bodies.
+//!
+//! Ownership modelling, concretely. A scope is a stack of [`Local`]s (name +
+//! [`ir.Value`] + a `live` flag). Only OWNED initialisers create a local
+//! ([`isOwnedInit`] gates this); a plain-value `let x = 1` produces nothing to
+//! track. Leaving a scope drops its locals in REVERSE declaration order
+//! ([`dropScope`]), mirroring how ARC destructors run. `return x` moves `x` out
+//! (`ret_owned`) and destroys every OTHER live local ([`dropAll`]).
+//!
+//! Control flow is where the SSA machinery earns its keep. Branches lower each
+//! arm against a CLONE of the local stack ([`cloneLocals`]), then
+//! [`reconcileJoin`] merges the arms at the join block: a local that kept the
+//! same value in every arm passes through unchanged, one that diverged gets a
+//! phi node, one that died in every arm becomes dead, and one that died in SOME
+//! but not all arms is unrepresentable and DEFERS. Loops ([`lowerLoop`])
+//! pre-scan the body for reassigned outer locals ([`collectReassignedOuter`]),
+//! seed a header phi for each, and patch the phi inputs afterwards from the
+//! back-edge and every recorded `continue`/`break` edge. When the loop body
+//! reassigns NOTHING, no header phis are needed and a `clone_floor` is set
+//! instead so that any attempt to reassign an outer local still defers rather
+//! than silently corrupting the value model.
+//!
+//! Entry points: [`lowerFunction`] lowers one function; [`report`] /
+//! [`reportQuiet`] lower every function in a program, run the verifier and
+//! forwarding census, and (in `hard` mode) FAIL THE BUILD with a non-zero exit
+//! if any lowered function is imbalanced. This is what the `NOVA_OSSA` gate
+//! calls.
 
 const std = @import("std");
+/// Nova AST node definitions: the `Statement`/`Expression` shapes this pass walks.
 const ast = @import("../../ast.zig");
+/// The type engine. Used only for [`TypeStore.isOwnedSafe`], the fallback that
+/// decides whether an initialiser produces an ARC-owned value.
 const types = @import("../../types.zig");
+/// The inference pass output ([`TypedIr`]): per-expression type and ownership
+/// answers this pass consults but never mutates.
 const infer = @import("../infer.zig");
+/// The ownership-explicit IR built here: [`ir.Func`], [`ir.Block`],
+/// [`ir.Value`], phi nodes, and the ownership instructions (copy/borrow/destroy).
 const ir = @import("ir.zig");
+/// The release-balance checker run over each lowered [`ir.Func`]; a function is
+/// "balanced" iff every owned value is released exactly once on every path.
 const verify = @import("verify.zig");
+/// The copy-forwarding census: counts owned copies that are only borrowed and
+/// destroyed, i.e. candidates a future copy-elision pass could remove.
 const forward = @import("forward.zig");
 
+/// Local alias for the immutable type table consulted during lowering.
 const TypeStore = types.TypeStore;
+/// Local alias for the inference result carrying per-expression type/ownership.
 const TypedIr = infer.TypedIr;
 
+/// Result of trying to lower one function: either the model built an IR we can
+/// verify, or it gave up because some construct is outside the lite model.
 pub const Outcome = enum { lowered, deferred };
 
+/// Outcome of [`lowerFunction`] with its payload.
+///
+/// On `.lowered`, `func` holds an [`ir.Func`] the caller now OWNS and must
+/// `deinit`. On `.deferred`, `func` is null and `reason` says why the model
+/// bailed out (used for the census breakdown, never surfaced as an error).
 pub const LowerResult = struct {
+    /// Whether an IR was produced (`.lowered`) or the function was skipped.
     outcome: Outcome,
+    /// The built IR on success; null when deferred. Caller-owned when present.
     func: ?ir.Func = null,
+    /// Why lowering deferred; only meaningful when `outcome == .deferred`.
     reason: DeferReason = .other,
 };
 
-/// Lower one function. Returns `.deferred` (with no Func) when the body is outside slice-1 scope.
+/// Internal error set for the lowering walk.
+///
+/// `error.Defer` is a control-flow signal, not a real failure: it unwinds the
+/// recursive lowering back to [`lowerFunction`], which converts it to
+/// [`Outcome.deferred`] using the reason stashed in [`Ctx.defer_reason`].
+/// `error.OutOfMemory` propagates as a genuine allocation failure.
 const LowerError = error{ Defer, OutOfMemory };
 
-// A control-flow outcome for a lowered statement sequence.
+/// How a lowered statement sequence left the current block.
+///
+/// `terminated` means the block already has a terminator (a `return`, `break`,
+/// `continue`, or a nested construct that itself terminated) so nothing more
+/// may be appended. `fallthrough` carries the block execution continues into,
+/// which the caller keeps threading subsequent statements onto.
 const Flow = union(enum) {
-    /// the block ended in a terminator (return); nothing follows on this path.
+    /// The block ended with a terminator; no successor to append to.
     terminated,
-    /// execution falls out of the sequence in this block, with these owned locals still live.
+    /// Execution continues in this block.
     fallthrough: ir.Block,
 };
 
-// One owned local in the current PATH: its name, its IR value, and whether it is still live. The list
-// grows as blocks nest (a lexical scope = the tail beyond a saved `mark`) and shrinks at scope end
-// (dropScope drops the tail's still-live locals and truncates). Branches/loop bodies work on a CLONE so
-// their declarations and consumes do not leak into sibling paths.
+/// One tracked owned local: its source name, its current SSA [`ir.Value`], and
+/// whether it is still live (a moved-out or dropped local becomes `live=false`).
 const Local = struct { name: []const u8, value: ir.Value, live: bool };
+/// A scope stack of [`Local`]s. Innermost declarations sit at the end, so
+/// [`resolveLocal`] scans from the back to honour shadowing.
 const Locals = std.ArrayListUnmanaged(Local);
 
-/// Why a function was deferred (for the NOVA_OSSA report's coverage-gap breakdown).
+/// Why the lite model refused to lower a function, for the census breakdown.
+///
+/// Each variant marks a construct whose ownership flow the model cannot
+/// represent soundly: `reassign` (a local reassigned below the SSA clone floor),
+/// `break_continue` (a jump with no enclosing loop context set up),
+/// `switch_guard` (a guarded `case` the model does not evaluate),
+/// `nonblock_branch` (a single-statement branch body it declines to wrap), and
+/// `other` (everything else, e.g. an exotic `for` initialiser).
 pub const DeferReason = enum { reassign, break_continue, switch_guard, nonblock_branch, other };
 
-/// One incoming edge to a loop's header (a `continue`) or exit (a `break`): the source block and a snapshot
-/// of the loop's phi-tracked outer locals' values at that point (parallel to `LoopCtx.phi_locals`).
+/// A recorded phi contribution from one predecessor edge: the source block and
+/// the value of each phi-tracked local at that edge, indexed parallel to
+/// [`LoopCtx.phi_locals`]. Used to patch loop header/exit phis after the body
+/// is lowered. The `values` slice is heap-owned and freed by [`lowerLoop`].
 const PhiEdge = struct { block: ir.Block, values: []ir.Value };
 
-/// The innermost enclosing loop, for lowering `break`/`continue`. `body_mark` is the locals count at the
-/// loop body's entry, so break/continue know which locals to drop (everything declared in the body).
-/// When the loop body reassigns outer locals (`phi_locals` non-empty), each `continue` feeds the header
-/// phi and each `break` feeds the exit phi — the handlers snapshot the tracked values into these lists,
-/// which lowerLoop drains to complete the phis after the body is lowered.
+/// The active loop's lowering context, threaded via [`Ctx.loop`] so that
+/// `break`/`continue` inside the body know where to jump, which locals need
+/// phis, and where to record their edge values.
 const LoopCtx = struct {
+    /// Block a `continue` branches to (the loop condition header).
     header: ir.Block,
+    /// Block a `break` branches to (the loop exit).
     exit: ir.Block,
+    /// Scope depth at loop entry; `break`/`continue` drop locals down to here
+    /// before jumping, matching the scopes they exit.
     body_mark: usize,
+    /// Indices (into the outer local stack) of locals that get a header phi
+    /// because the loop body reassigns them; empty when no phi is needed.
     phi_locals: []const usize = &.{},
+    /// Accumulates one [`PhiEdge`] per `continue`, feeding the header phis.
     continue_edges: ?*std.ArrayListUnmanaged(PhiEdge) = null,
+    /// Accumulates one [`PhiEdge`] per `break`, feeding the exit phis.
     break_edges: ?*std.ArrayListUnmanaged(PhiEdge) = null,
 };
 
+/// Mutable lowering state threaded through the whole recursive walk of one
+/// function. Holds the allocator, the read-only type/inference inputs, the IR
+/// being built, and the transient bits (`defer_reason`, `loop`, `clone_floor`)
+/// that record why we might defer and how loops constrain reassignment.
 const Ctx = struct {
+    /// Allocator for all IR and scratch structures for this function.
     gpa: std.mem.Allocator,
+    /// Immutable type table, for the owned-value fallback in [`isOwnedInit`].
     store: *const TypeStore,
+    /// Immutable inference result: per-expression types and ownership answers.
     tir: *const TypedIr,
+    /// The function IR being constructed.
     f: *ir.Func,
+    /// Reason stashed by [`deferBecause`] just before `error.Defer` unwinds, so
+    /// [`lowerFunction`] can report it.
     defer_reason: DeferReason = .other,
+    /// The enclosing loop's context, or null outside any loop.
     loop: ?LoopCtx = null,
-    // Locals length at the innermost CLONE boundary (if/else, loop body, switch case). Branches lower on
-    // a CLONE of `locals` that is discarded at the branch end, so mutations to locals BELOW this floor
-    // (declared in an enclosing scope) are lost while that enclosing scope still owns the original — a
-    // reassign there would emit a `destroy` in the discarded clone AND let the outer scope drop the same
-    // value, a double-consume. So a reassign of a local with `idx < clone_floor` still defers; one at or
-    // above the floor (declared inside the current branch) is safe to model. 0 at function top level.
+    /// SSA barrier: locals whose index is below this may not be reassigned in
+    /// the current region (set for phi-free loop bodies). A reassignment below
+    /// it defers with [`DeferReason.reassign`] rather than corrupt the model.
     clone_floor: usize = 0,
 };
 
-/// Record why we are about to defer, then return the Defer error.
+/// Records `reason` on `ctx` and returns `error.Defer` to unwind lowering.
+///
+/// Centralises the "give up on this function" path so the reason is always set
+/// atomically with the signal; callers write `return deferBecause(ctx, .x)`.
 fn deferBecause(ctx: *Ctx, reason: DeferReason) LowerError {
     ctx.defer_reason = reason;
     return error.Defer;
 }
 
+/// Lower a single function to ownership-explicit IR, or defer it.
+///
+/// Builds an [`ir.Func`] with an entry block, lowers the body, and if the body
+/// falls through without an explicit return terminates it with `ret_void`. If
+/// the walk hits an unmodelable construct it catches `error.Defer`, tears down
+/// the partially built IR, and returns [`Outcome.deferred`] with the stashed
+/// reason. On success the returned `func` is caller-owned (`deinit` it).
+///
+/// Non-`Defer` errors (only `OutOfMemory`) propagate to the caller.
 pub fn lowerFunction(
     gpa: std.mem.Allocator,
     store: *const TypeStore,
@@ -109,7 +215,6 @@ pub fn lowerFunction(
     defer locals.deinit(gpa);
     var ctx = Ctx{ .gpa = gpa, .store = store, .tir = tir, .f = &f };
 
-    // The function body is the outermost lexical scope (mark 0 = drop everything at the end).
     const flow = lowerBlockScope(&ctx, entry, fn_decl.body.statements, &locals) catch |e| switch (e) {
         error.Defer => {
             f.deinit(gpa);
@@ -124,12 +229,16 @@ pub fn lowerFunction(
     return .{ .outcome = .lowered, .func = f };
 }
 
-/// Lower a lexical scope: run `stmts`, and on fall-through destroy the locals THIS scope declared
-/// (those appended at index >= the entry mark), truncating them back out of scope.
+/// Lower a nested lexical scope: run its statements, then drop the locals it
+/// introduced (in reverse order) on the fallthrough path before returning.
+///
+/// The reverse drop at `mark` mirrors ARC destructor order. When the scope
+/// terminated (returned/broke), the drops were already handled by that
+/// terminator's own path, so nothing is dropped here. See [`dropScope`].
 fn lowerBlockScope(ctx: *Ctx, block: ir.Block, stmts: []const ast.Statement, locals: *Locals) LowerError!Flow {
     const mark = locals.items.len;
     switch (try lowerSeq(ctx, block, stmts, locals)) {
-        .terminated => return .terminated, // a return already dropped every enclosing scope
+        .terminated => return .terminated,
         .fallthrough => |b| {
             try dropScope(ctx, b, locals, mark);
             return .{ .fallthrough = b };
@@ -137,16 +246,24 @@ fn lowerBlockScope(ctx: *Ctx, block: ir.Block, stmts: []const ast.Statement, loc
     }
 }
 
-/// Lower a statement sequence into `block` (no scope handling of its own — the caller wraps it in a
-/// lowerBlockScope). Mutates `locals` (the current path). Returns terminated (a return) or fallthrough.
+/// Lower a flat statement list, threading the "current block" forward.
+///
+/// This is the core dispatcher. Each statement kind updates `cur` (the block
+/// subsequent statements attach to) or returns `.terminated` when it ends the
+/// flow. Notable cases: `return` moves an identifier operand out via `ret_owned`
+/// and drops all other live locals ([`dropAll`]); an assignment statement is
+/// detected as a local reassignment ([`isLocalReassign`]) and handled by
+/// [`lowerReassign`], otherwise its owned sub-reads are emitted with
+/// [`emitOwnedUses`]; `break`/`continue` consult [`Ctx.loop`] (deferring if
+/// absent), record their phi edge, drop the scope back to the loop body mark,
+/// and terminate. A `defer` statement is modelled only for its reassignment
+/// side effect (its scheduling is not part of the lite model).
 fn lowerSeq(ctx: *Ctx, block: ir.Block, stmts: []const ast.Statement, locals: *Locals) LowerError!Flow {
     var cur = block;
     for (stmts) |*s| {
         switch (s.*) {
             .let_stmt => |ls| try lowerLet(ctx, cur, &ls, locals),
             .return_stmt => |r| {
-                // A bare `return x` where x is an owned local MOVES x out (ret_owned). Any other return
-                // expression BORROWS the locals it mentions -> drop all live locals, ret_void.
                 var returned_idx: ?usize = null;
                 if (r.value) |val| {
                     if (val.kind == .ident) returned_idx = resolveLocal(locals.items, val.kind.ident);
@@ -160,11 +277,8 @@ fn lowerSeq(ctx: *Ctx, block: ir.Block, stmts: []const ast.Statement, locals: *L
                 return .terminated;
             },
             .expr_stmt => |es| {
-                // A bare-local REASSIGNMENT (`x = ...`) drops the old value and rebinds. Any other
-                // expression statement BORROWS the owned locals it touches (Nova is +0 / caller-owned): no
-                // consume, but the reads require the values to be live, so emit borrow_use for each.
                 if (isLocalReassign(&es.expr, locals.items)) {
-                    try emitOwnedUses(ctx, cur, es.expr.kind.binary.right, locals); // RHS borrows
+                    try emitOwnedUses(ctx, cur, es.expr.kind.binary.right, locals);
                     try lowerReassign(ctx, cur, &es.expr, locals);
                 } else {
                     try emitOwnedUses(ctx, cur, &es.expr, locals);
@@ -190,8 +304,6 @@ fn lowerSeq(ctx: *Ctx, block: ir.Block, stmts: []const ast.Statement, locals: *L
                 }
             },
             .block => |b| {
-                // A nested bare block is a lexical scope in the SAME control-flow path: its locals are
-                // dropped at its end. (Also how the for-in desugaring nests the user's original body.)
                 const mark = locals.items.len;
                 switch (try lowerSeq(ctx, cur, b.statements, locals)) {
                     .terminated => return .terminated,
@@ -202,28 +314,20 @@ fn lowerSeq(ctx: *Ctx, block: ir.Block, stmts: []const ast.Statement, locals: *L
                 }
             },
             .defer_stmt => {
-                // `defer expr` / `errdefer expr` runs a cleanup at scope exit. In Nova that expression is
-                // a BORROW (a method call like `x.close()`; there is no manual drop), so it has no
-                // ownership effect on the locals we track — skip it. A bare-local reassignment inside a
-                // defer drops-and-rebinds like any other, so model it the same way.
                 if (isLocalReassign(&s.defer_stmt.expr, locals.items)) try lowerReassign(ctx, cur, &s.defer_stmt.expr, locals);
             },
             .break_stmt => {
                 const lp = ctx.loop orelse return deferBecause(ctx, .break_continue);
-                // Record this break's outer-local values for the EXIT phi (before dropScope — the phi
-                // locals are outer, below body_mark, so dropScope does not touch them, but snapshot first
-                // for clarity). Then drop the body scope and branch to exit.
                 if (lp.break_edges) |edges| try recordPhiEdge(ctx, edges, cur, lp.phi_locals, locals);
-                try dropScope(ctx, cur, locals, lp.body_mark); // exit the loop scope
+                try dropScope(ctx, cur, locals, lp.body_mark);
                 ctx.f.setTerm(cur, .{ .br = lp.exit });
                 return .terminated;
             },
             .continue_stmt => {
                 const lp = ctx.loop orelse return deferBecause(ctx, .break_continue);
-                // Record this continue's outer-local values for the HEADER phi, then end this iteration.
                 if (lp.continue_edges) |edges| try recordPhiEdge(ctx, edges, cur, lp.phi_locals, locals);
-                try dropScope(ctx, cur, locals, lp.body_mark); // end this iteration's scope
-                ctx.f.setTerm(cur, .{ .br = lp.header }); // back-edge
+                try dropScope(ctx, cur, locals, lp.body_mark);
+                ctx.f.setTerm(cur, .{ .br = lp.header });
                 return .terminated;
             },
         }
@@ -231,45 +335,47 @@ fn lowerSeq(ctx: *Ctx, block: ir.Block, stmts: []const ast.Statement, locals: *L
     return .{ .fallthrough = cur };
 }
 
-/// `let name = init;` — record an owned binding. `let y = x` (x an owned local) is a dup (copy);
-/// any other owned initializer is a fresh birth (locals it mentions are borrowed, so no consume here).
-/// A trivial (non-owned) local is ignored.
+/// Lower a `let` binding, tracking a new owned local when the initialiser owns.
+///
+/// Destructuring binds (`ls.names != null`) and bindings without an initialiser
+/// are ignored. A non-owned initialiser tracks nothing but still emits its owned
+/// sub-reads (a temporary borrowed inside it must be accounted for). An
+/// initialiser that is itself a live local is an owned COPY (ARC retain of a
+/// fresh reference, borrowing the source first); any other owned initialiser
+/// mints a fresh `makeOwned` value. The new [`Local`] is pushed live.
 fn lowerLet(ctx: *Ctx, block: ir.Block, ls: *const ast.LetStmt, locals: *Locals) LowerError!void {
-    // Destructuring (`let {a, b} = …` / `let [a, b] = …`): we have no per-binding type here, so we do NOT
-    // track the destructured names. That is SOUND — an untracked owned binding carries no balance
-    // obligation, so the worst case is missing a leak (a false negative), never a false imbalance.
     if (ls.names != null) return;
     const init = ls.init orelse return;
     if (!isOwnedInit(ctx.store, ctx.tir, &init)) {
-        // A trivial (non-owned) binding still BORROWS any owned locals it reads (`let n = xs.size()`), so
-        // emit their uses for use-after-consume coverage, then ignore the untracked trivial local.
         try emitOwnedUses(ctx, block, &init, locals);
         return;
     }
     const v = if (init.kind == .ident and resolveLocal(locals.items, init.kind.ident) != null) blk: {
-        // `let y = x`: x is copied (+1). The read requires x live — emit its use first.
         const src = locals.items[resolveLocal(locals.items, init.kind.ident).?].value;
         if (ctx.f.ownershipOf(src) == .owned) try ctx.f.borrowUse(ctx.gpa, block, src);
         break :blk try ctx.f.copy(ctx.gpa, block, src);
     } else blk: {
-        // A fresh owned birth (`let y = f(x)`): the locals it mentions are borrowed.
         try emitOwnedUses(ctx, block, &init, locals);
         break :blk try ctx.f.makeOwned(ctx.gpa, block, ctx.tir.typeOf(&init));
     };
     try locals.append(ctx.gpa, .{ .name = ls.name, .value = v, .live = true });
 }
 
-/// Lower an if/else. Branches get a CLONE of `locals` and are each their own lexical scope, so a
-/// branch may declare its own owned locals (dropped at the branch end) AND reassign an OUTER local. A
-/// branch that reassigns an outer local rebinds it to a DIFFERENT owned value than the sibling path, so
-/// the two paths carry different values for that variable into the join. `reconcileJoin` unifies them
-/// with an owned-value PHI (verify.zig applies it edge-by-edge), and the caller's `locals` is updated to
-/// the join value. The join block is allocated LAST so every forward edge is index-increasing.
+/// Lower an `if`/`else` into a diamond and reconcile the arms at a join block.
+///
+/// Both branch bodies must be block statements (a non-block branch defers). Each
+/// arm is lowered against its OWN clone of the local stack ([`cloneLocals`]) so
+/// their divergent value/liveness views do not interfere. The entry block ends
+/// in a `cond_br`; every arm that falls through branches to a fresh join block
+/// and contributes a [`JoinPred`]. With no `else`, the entry block itself is the
+/// fall-through predecessor. [`reconcileJoin`] then installs phis / propagates
+/// liveness across the outer locals. If no arm falls through, the whole `if`
+/// terminates.
 fn lowerIf(ctx: *Ctx, entry_block: ir.Block, iff: *const ast.IfStmt, locals: *Locals) LowerError!Flow {
     const then_stmts = branchStmts(iff.then_branch) orelse return deferBecause(ctx, .nonblock_branch);
     const else_stmts: ?[]const ast.Statement = if (iff.else_branch) |e| (branchStmts(e) orelse return deferBecause(ctx, .nonblock_branch)) else null;
 
-    const n_outer = locals.items.len; // indices [0, n_outer) are locals from the enclosing scope
+    const n_outer = locals.items.len;
     const cond = try ctx.f.makeTrivial(ctx.gpa, entry_block, null);
     const then_block = try ctx.f.newBlock(ctx.gpa);
     const else_block: ?ir.Block = if (else_stmts != null) try ctx.f.newBlock(ctx.gpa) else null;
@@ -283,13 +389,9 @@ fn lowerIf(ctx: *Ctx, entry_block: ir.Block, iff: *const ast.IfStmt, locals: *Lo
     var else_flow: ?Flow = null;
     if (else_stmts) |es| else_flow = try lowerBlockScope(ctx, else_block.?, es, &else_locals.?);
 
-    const join_block = try ctx.f.newBlock(ctx.gpa); // highest index
+    const join_block = try ctx.f.newBlock(ctx.gpa);
     ctx.f.setTerm(entry_block, .{ .cond_br = .{ .cond = cond, .then_blk = then_block, .else_blk = else_block orelse join_block } });
 
-    // The joining predecessors of `join_block` and the source of each one's outer-local values:
-    //  - then: its fall-through exit block, values from then_locals.
-    //  - else present: its fall-through exit block, values from else_locals.
-    //  - else absent: the else edge is entry_block -> join, carrying the ENTRY values (`locals`).
     var preds: [2]JoinPred = undefined;
     var npreds: usize = 0;
     switch (then_flow) {
@@ -310,29 +412,34 @@ fn lowerIf(ctx: *Ctx, entry_block: ir.Block, iff: *const ast.IfStmt, locals: *Lo
             .terminated => {},
         }
     } else {
-        // no else: the implicit else edge goes straight from entry to join, carrying the entry values.
         preds[npreds] = .{ .block = entry_block, .vals = locals.items };
         npreds += 1;
     }
 
-    if (npreds == 0) return .terminated; // both branches returned: join unreachable
+    if (npreds == 0) return .terminated;
 
     try reconcileJoin(ctx, join_block, locals, n_outer, preds[0..npreds]);
     return .{ .fallthrough = join_block };
 }
 
-/// A predecessor of a join: the block that branches to the join, and that path's view of the outer locals.
+/// One predecessor arriving at a join block: the block it arrives from and that
+/// arm's snapshot of the local stack, read index-parallel by [`reconcileJoin`].
 const JoinPred = struct { block: ir.Block, vals: []const Local };
 
-/// Reconcile the outer locals [0, n_outer) at a join reached by `preds`. For each outer local whose value
-/// or liveness differs across the joining predecessors, build an owned-value PHI at `join_block` and point
-/// the caller's `locals` at the phi result. When every predecessor agrees, nothing is emitted (the value
-/// already flows through unchanged). A local live on some joining paths but not others cannot be a single
-/// owned phi result, so that (rare) shape defers the whole function — soundly, never a false accusation.
+/// Merge branch/switch arms at `join_block`, updating the outer local stack.
+///
+/// For each of the first `n_outer` locals (the ones that existed before the
+/// branch), it inspects that local across every predecessor:
+///   - dead in all arms  -> mark dead, no phi;
+///   - dead in some arms  -> unrepresentable, DEFER with [`DeferReason.reassign`];
+///   - live and identical value in all arms -> pass the value through;
+///   - live but divergent  -> add a phi over the predecessors and adopt it.
+/// The "dead in some" case defers because a value released on one path but not
+/// another cannot be modelled as a single owned local without risking a
+/// double-free or leak the verifier would then miscount.
 fn reconcileJoin(ctx: *Ctx, join_block: ir.Block, locals: *Locals, n_outer: usize, preds: []const JoinPred) LowerError!void {
     var i: usize = 0;
     while (i < n_outer) : (i += 1) {
-        // Gather this local's (value, live) as seen by each joining predecessor.
         var all_same_value = true;
         var any_live = false;
         var all_live = true;
@@ -342,23 +449,17 @@ fn reconcileJoin(ctx: *Ctx, join_block: ir.Block, locals: *Locals, n_outer: usiz
             if (l.live) any_live = true else all_live = false;
         }
         if (!any_live) {
-            // consumed on every joining path (e.g. moved out / reset to null everywhere): no owned value
-            // survives the join.
             locals.items[i].live = false;
             continue;
         }
-        if (!all_live) return deferBecause(ctx, .reassign); // mixed liveness: not a single-value phi
+        if (!all_live) return deferBecause(ctx, .reassign);
         if (all_same_value) {
-            // Every path carries the SAME owned value — it flows through untouched. Keep it (a branch may
-            // have rebound its clone to a fresh value only when it DIFFERS, so identical means unchanged).
             locals.items[i].value = preds[0].vals[i].value;
             locals.items[i].live = true;
             continue;
         }
-        // Differing owned values across paths: unify with an N-input phi (N = number of joining preds:
-        // 2 for an if, up to cases+default for a switch).
         const inputs = try ctx.gpa.alloc(ir.PhiInput, preds.len);
-        defer ctx.gpa.free(inputs); // addPhi dupes it
+        defer ctx.gpa.free(inputs);
         for (preds, 0..) |p, k| inputs[k] = .{ .pred = p.block, .value = p.vals[i].value };
         const result = try ctx.f.addPhi(ctx.gpa, join_block, inputs, null);
         locals.items[i].value = result;
@@ -366,8 +467,11 @@ fn reconcileJoin(ctx: *Ctx, join_block: ir.Block, locals: *Locals, n_outer: usiz
     }
 }
 
-/// Snapshot the current values of a loop's phi-tracked outer locals at a break/continue site and append
-/// them as an incoming edge (owns the `values` slice; freed by lowerLoop after the phis are built).
+/// Snapshot the phi-tracked locals at a `break`/`continue` edge for later patch.
+///
+/// Allocates a values array parallel to `phi_locals` (freed when [`lowerLoop`]
+/// tears down its edge lists) and appends a [`PhiEdge`]. A no-op when the loop
+/// tracks no phi locals.
 fn recordPhiEdge(ctx: *Ctx, edges: *std.ArrayListUnmanaged(PhiEdge), block: ir.Block, phi_locals: []const usize, locals: *Locals) !void {
     if (phi_locals.len == 0) return;
     const values = try ctx.gpa.alloc(ir.Value, phi_locals.len);
@@ -376,20 +480,33 @@ fn recordPhiEdge(ctx: *Ctx, edges: *std.ArrayListUnmanaged(PhiEdge), block: ir.B
     try edges.append(ctx.gpa, .{ .block = block, .values = values });
 }
 
+/// Append `v` to `out` only if not already present (a set-insert over a list).
+///
+/// Keeps the reassigned-locals list free of duplicates so each such local gets
+/// exactly one header phi.
 fn addUnique(out: *std.ArrayListUnmanaged(usize), v: usize, gpa: std.mem.Allocator) !void {
     for (out.items) |e| if (e == v) return;
     try out.append(gpa, v);
 }
 
+/// If `e` reassigns an OUTER local (index `< n_outer`), return that index.
+///
+/// Returns null when `e` is not a local reassignment, or when it reassigns a
+/// local introduced inside the loop body (index `>= n_outer`), since only outer
+/// locals need a header phi. See [`isLocalReassign`] and [`collectReassignedOuter`].
 fn reassignTargetIdx(e: *const ast.Expression, locals: []const Local, n_outer: usize) ?usize {
     if (!isLocalReassign(e, locals)) return null;
     const idx = resolveLocal(locals, e.kind.binary.left.kind.ident).?;
     return if (idx < n_outer) idx else null;
 }
 
-/// Collect indices of OUTER locals (< n_outer) reassigned anywhere in `stmts`, descending into ifs, blocks,
-/// switches AND nested loops — a reassign at any depth changes the value that reaches this loop's back-edge,
-/// so the header needs a phi for it.
+/// Recursively collect the outer locals a loop body reassigns anywhere within.
+///
+/// Walks the body (descending into nested `if`/`block`/`while`/`for`/`switch`
+/// bodies) and records the index of every outer local that is the target of an
+/// assignment, via [`addUnique`]. Run BEFORE lowering the loop so the header can
+/// pre-create a phi for each such local ([`lowerLoop`]); an outer local that the
+/// body never reassigns keeps its entry value and needs no phi.
 fn collectReassignedOuter(gpa: std.mem.Allocator, stmts: []const ast.Statement, locals: []const Local, n_outer: usize, out: *std.ArrayListUnmanaged(usize)) !void {
     for (stmts) |*s| switch (s.*) {
         .expr_stmt => |es| if (reassignTargetIdx(&es.expr, locals, n_outer)) |i| try addUnique(out, i, gpa),
@@ -409,28 +526,32 @@ fn collectReassignedOuter(gpa: std.mem.Allocator, stmts: []const ast.Statement, 
     };
 }
 
-/// The shared loop shape: entry -> header; header -cond-> body/exit; body -> header (back-edge). The
-/// body is its own lexical scope on a CLONE of `locals`, so it may declare its own owned locals (dropped
-/// at the end of each iteration) — which keeps the body-exit live set equal to the header entry set, the
-/// verifier's back-edge requirement. The exit block is allocated LAST so only the back-edge decreases in
-/// index. Returns the exit block.
+/// Lower a loop (the shared engine behind `while` and `for`) to header/body/exit
+/// blocks with SSA phis, returning the exit block.
+///
+/// Structure: entry branches to a `header` whose `cond_br` goes to `body` or
+/// `exit`. Before lowering the body it scans for reassigned outer locals
+/// ([`collectReassignedOuter`]); each gets a header phi seeded with a
+/// placeholder (entry value only) so the body sees a proper loop-variant value.
+/// The body is lowered against a clone of the locals under a [`LoopCtx`] that
+/// captures `break`/`continue` edges. Afterwards the header phis are finalised
+/// from the entry value, the normal back-edge (if the body fell through), and
+/// each recorded `continue` edge; if there were `break`s, an exit phi merges the
+/// header value with every break edge so the outer locals are correct after the
+/// loop.
+///
+/// When the body reassigns NOTHING, no phis are made; instead `clone_floor` is
+/// raised to `n_outer` so a reassignment of any outer local inside the body will
+/// [`deferBecause`] [`DeferReason.reassign`] rather than mutate a value the model
+/// assumed loop-invariant.
 fn lowerLoop(ctx: *Ctx, entry_block: ir.Block, body_stmts: []const ast.Statement, locals: *Locals) LowerError!ir.Block {
     const header = try ctx.f.newBlock(ctx.gpa);
     ctx.f.setTerm(entry_block, .{ .br = header });
     const cond = try ctx.f.makeTrivial(ctx.gpa, header, null);
     const body_block = try ctx.f.newBlock(ctx.gpa);
-    // The exit block is allocated NOW (before the body) so `break` can target it. Its index sits between
-    // the body block and any nested blocks the body allocates; the verifier's edge logic (set on first
-    // arrival via the header's cond-false edge, compare thereafter) handles both the forward break edge
-    // and back edges uniformly, so the ordering is sound.
     const exit_block = try ctx.f.newBlock(ctx.gpa);
     ctx.f.setTerm(header, .{ .cond_br = .{ .cond = cond, .then_blk = body_block, .else_blk = exit_block } });
 
-    // Model outer-local reassigns in the body via phis. A loop header's predecessors are the pre-loop entry
-    // edge, the normal back-edge (body fall-through), and one back-edge per `continue`; the exit's are the
-    // header cond-false edge and one per `break`. We create a header phi per reassigned outer local now (so
-    // the body sees the loop-carried value), collect the continue/break contributions during lowering, and
-    // complete the header phis + build any exit phi afterward.
     const n_outer = locals.items.len;
     var reassigned = std.ArrayListUnmanaged(usize).empty;
     defer reassigned.deinit(ctx.gpa);
@@ -450,9 +571,9 @@ fn lowerLoop(ctx: *Ctx, entry_block: ir.Block, body_stmts: []const ast.Statement
     defer ctx.gpa.free(x0s);
     if (use_phi) {
         for (reassigned.items, 0..) |i, k| {
-            x0s[k] = locals.items[i].value; // the pre-loop value (this phi's entry input)
+            x0s[k] = locals.items[i].value;
             const placeholder = [_]ir.PhiInput{.{ .pred = entry_block, .value = x0s[k] }};
-            const r = try ctx.f.addPhi(ctx.gpa, header, &placeholder, null); // completed below; phi k at index k
+            const r = try ctx.f.addPhi(ctx.gpa, header, &placeholder, null);
             locals.items[i].value = r;
             locals.items[i].live = true;
         }
@@ -468,7 +589,7 @@ fn lowerLoop(ctx: *Ctx, entry_block: ir.Block, body_stmts: []const ast.Statement
         .break_edges = &break_edges,
     };
     const saved_floor = ctx.clone_floor;
-    if (!use_phi) ctx.clone_floor = n_outer; // no reassigns to model; keep the sound defer as a safety net
+    if (!use_phi) ctx.clone_floor = n_outer;
 
     var body_locals = try cloneLocals(ctx.gpa, locals);
     defer body_locals.deinit(ctx.gpa);
@@ -478,14 +599,13 @@ fn lowerLoop(ctx: *Ctx, entry_block: ir.Block, body_stmts: []const ast.Statement
 
     const normal_back: ?ir.Block = switch (body_flow) {
         .fallthrough => |b| blk: {
-            ctx.f.setTerm(b, .{ .br = header }); // back-edge (normal iteration)
+            ctx.f.setTerm(b, .{ .br = header });
             break :blk b;
         },
-        .terminated => null, // body always returns/breaks: no normal back-edge
+        .terminated => null,
     };
 
     if (use_phi) {
-        // Complete each header phi: entry + normal back-edge (if any) + every continue.
         var hinputs = std.ArrayListUnmanaged(ir.PhiInput).empty;
         defer hinputs.deinit(ctx.gpa);
         for (reassigned.items, 0..) |i, k| {
@@ -495,14 +615,12 @@ fn lowerLoop(ctx: *Ctx, entry_block: ir.Block, body_stmts: []const ast.Statement
             for (continue_edges.items) |e| try hinputs.append(ctx.gpa, .{ .pred = e.block, .value = e.values[k] });
             try ctx.f.setPhiInputs(ctx.gpa, header, k, hinputs.items);
         }
-        // If any `break` carries the loop out, the exit is a join: exit phi = header cond-false value
-        // (the header phi result) + each break's snapshot. The post-loop value is the exit phi result.
         if (break_edges.items.len > 0) {
             var einputs = std.ArrayListUnmanaged(ir.PhiInput).empty;
             defer einputs.deinit(ctx.gpa);
             for (reassigned.items, 0..) |i, k| {
                 einputs.clearRetainingCapacity();
-                try einputs.append(ctx.gpa, .{ .pred = header, .value = locals.items[i].value }); // header phi result
+                try einputs.append(ctx.gpa, .{ .pred = header, .value = locals.items[i].value });
                 for (break_edges.items) |e| try einputs.append(ctx.gpa, .{ .pred = e.block, .value = e.values[k] });
                 const r = try ctx.f.addPhi(ctx.gpa, exit_block, einputs.items, null);
                 locals.items[i].value = r;
@@ -513,21 +631,26 @@ fn lowerLoop(ctx: *Ctx, entry_block: ir.Block, body_stmts: []const ast.Statement
     return exit_block;
 }
 
+/// Lower a `while` by delegating to [`lowerLoop`] with its body statements.
+///
+/// Defers if the body is not a block ([`DeferReason.nonblock_branch`]).
 fn lowerWhile(ctx: *Ctx, entry_block: ir.Block, w: *const ast.WhileStmt, locals: *Locals) LowerError!ir.Block {
     const body_stmts = branchStmts(w.body) orelse return deferBecause(ctx, .nonblock_branch);
     return lowerLoop(ctx, entry_block, body_stmts, locals);
 }
 
-/// Lower a `for` loop, both the C-style `for (init; cond; incr)` and the `for (item in iterable)` form.
-/// C-style: the init binding is scoped to the loop (dropped after); the increment is a trivial-counter
-/// borrow (not modelled). For-in: the loop variable is a BORROW of an element (the iterable retains its
-/// own storage), so it is not tracked — modelling it as a borrow is sound (it can only miss an owned
-/// element leak, never invent a false imbalance). Either way the body is its own scope on a clone.
+/// Lower a `for` loop, handling both iterator-style and C-style forms.
+///
+/// An iterator `for` (`fr.iterator != null`) is just a loop over the body. A
+/// C-style `for` first lowers its initialiser (a `let` introduces a scoped
+/// local, or an assignment reassigns one; any other init form defers), runs the
+/// loop, then drops the initialiser's local scope on exit ([`dropScope`]). The
+/// loop condition/step themselves are not modelled beyond the body; this pass
+/// only cares about ownership events.
 fn lowerFor(ctx: *Ctx, entry_block: ir.Block, fr: *const ast.ForStmt, locals: *Locals) LowerError!Flow {
     const body_stmts = branchStmts(fr.body) orelse return deferBecause(ctx, .nonblock_branch);
 
     if (fr.iterator != null) {
-        // for-in: loop variable borrowed, no init/increment scope to drop.
         return .{ .fallthrough = try lowerLoop(ctx, entry_block, body_stmts, locals) };
     }
 
@@ -538,25 +661,28 @@ fn lowerFor(ctx: *Ctx, entry_block: ir.Block, fr: *const ast.ForStmt, locals: *L
         else => return deferBecause(ctx, .other),
     };
     const exit_block = try lowerLoop(ctx, entry_block, body_stmts, locals);
-    try dropScope(ctx, exit_block, locals, for_mark); // drop the loop variable if it was owned
+    try dropScope(ctx, exit_block, locals, for_mark);
     return .{ .fallthrough = exit_block };
 }
 
-/// Lower a `switch`. The discriminant is a borrow. Each case body and the default are their own lexical
-/// scopes (on clones) that join afterwards; the verifier requires every joining predecessor's exit live
-/// set to match. Cases with a guard (`case v if cond:`) fall through to default on guard-false, which is
-/// a control-flow shape this slice does not model, so a guarded switch defers.
+/// Lower a `switch` into a `switch_br` fanning out to per-case blocks, then
+/// reconcile every fall-through case at a shared join.
+///
+/// Guarded cases defer up front ([`DeferReason.switch_guard`]) because the model
+/// does not evaluate guards. Each case (and the optional default) is lowered
+/// against its own clone of the locals; cases that fall through contribute a
+/// [`JoinPred`]. With no default, the entry block is added as a pass-through
+/// predecessor (the "no case matched" path). [`reconcileJoin`] merges them. If
+/// no case and no default falls through, the switch terminates.
 fn lowerSwitch(ctx: *Ctx, entry_block: ir.Block, sw: *const ast.SwitchStmt, locals: *Locals) LowerError!Flow {
     for (sw.cases) |c| if (c.guard != null) return deferBecause(ctx, .switch_guard);
 
-    const n_outer = locals.items.len; // indices [0, n_outer) are enclosing-scope locals
+    const n_outer = locals.items.len;
     const case_blocks = try ctx.gpa.alloc(ir.Block, sw.cases.len);
     errdefer ctx.gpa.free(case_blocks);
     const case_flows = try ctx.gpa.alloc(Flow, sw.cases.len);
     defer ctx.gpa.free(case_flows);
 
-    // Hoist each case's clone so its outer-local values are readable when building the join phi (a case may
-    // reassign an outer local, giving a different value than its siblings — reconcileJoin unifies them).
     const case_locals_arr = try ctx.gpa.alloc(Locals, sw.cases.len);
     for (case_locals_arr) |*cl| cl.* = .empty;
     defer {
@@ -564,31 +690,27 @@ fn lowerSwitch(ctx: *Ctx, entry_block: ir.Block, sw: *const ast.SwitchStmt, loca
         ctx.gpa.free(case_locals_arr);
     }
 
-    // Lower each case body into its own block+scope. Blocks are allocated before the join (below).
     for (sw.cases, 0..) |c, i| {
-        const body_stmts = branchStmts(c.body) orelse return deferBecause(ctx, .nonblock_branch); // errdefer frees case_blocks
+        const body_stmts = branchStmts(c.body) orelse return deferBecause(ctx, .nonblock_branch);
         case_blocks[i] = try ctx.f.newBlock(ctx.gpa);
         case_locals_arr[i] = try cloneLocals(ctx.gpa, locals);
         case_flows[i] = try lowerBlockScope(ctx, case_blocks[i], body_stmts, &case_locals_arr[i]);
     }
 
-    // default (if present): its own block+scope.
     var default_block: ?ir.Block = null;
     var default_flow: Flow = .{ .fallthrough = undefined };
     var default_locals: ?Locals = null;
     defer if (default_locals) |*dl| dl.deinit(ctx.gpa);
     if (sw.default_case) |dstmt| {
-        const dstmts = branchStmts(dstmt) orelse return deferBecause(ctx, .nonblock_branch); // errdefer frees case_blocks
+        const dstmts = branchStmts(dstmt) orelse return deferBecause(ctx, .nonblock_branch);
         default_block = try ctx.f.newBlock(ctx.gpa);
         default_locals = try cloneLocals(ctx.gpa, locals);
         default_flow = try lowerBlockScope(ctx, default_block.?, dstmts, &default_locals.?);
     }
 
-    const join_block = try ctx.f.newBlock(ctx.gpa); // highest index
+    const join_block = try ctx.f.newBlock(ctx.gpa);
     ctx.f.setTerm(entry_block, .{ .switch_br = .{ .cases = case_blocks, .default_blk = default_block orelse join_block } });
 
-    // Collect the joining predecessors (as lowerIf does): each fall-through case + the default's fall-through,
-    // or — with no default — the switch_br's default edge entry_block -> join carrying the entry values.
     var preds = std.ArrayListUnmanaged(JoinPred).empty;
     defer preds.deinit(ctx.gpa);
     for (case_flows, 0..) |cf, i| switch (cf) {
@@ -607,16 +729,19 @@ fn lowerSwitch(ctx: *Ctx, entry_block: ir.Block, sw: *const ast.SwitchStmt, loca
             .terminated => {},
         }
     } else {
-        try preds.append(ctx.gpa, .{ .block = entry_block, .vals = locals.items }); // no-match edge -> join
+        try preds.append(ctx.gpa, .{ .block = entry_block, .vals = locals.items });
     }
 
-    if (preds.items.len == 0) return .terminated; // every case and the default returned: join unreachable
+    if (preds.items.len == 0) return .terminated;
     try reconcileJoin(ctx, join_block, locals, n_outer, preds.items);
     return .{ .fallthrough = join_block };
 }
 
-/// Destroy the still-live locals THIS scope declared (index >= mark) in `block`, in reverse order, then
-/// truncate them out of scope.
+/// Destroy and pop every live local above `mark`, in reverse declaration order.
+///
+/// Emits a `destroy` (ARC release) for each still-live local introduced since
+/// `mark`, newest first, then shrinks the stack back to `mark`. This is the ARC
+/// end-of-scope drop; dead locals (moved out or already dropped) are skipped.
 fn dropScope(ctx: *Ctx, block: ir.Block, locals: *Locals, mark: usize) !void {
     var i: usize = locals.items.len;
     while (i > mark) {
@@ -626,8 +751,13 @@ fn dropScope(ctx: *Ctx, block: ir.Block, locals: *Locals, mark: usize) !void {
     locals.shrinkRetainingCapacity(mark);
 }
 
-/// Destroy every still-live local (all enclosing scopes) in `block`, except `keep` (returned). Used at
-/// a `return`, which exits all scopes at once. Marks consumed locals dead.
+/// Destroy every live local except an optional `keep`, marking them all dead.
+///
+/// Used at `return`: all locals go out of scope, but the returned value (if it
+/// is a local, identified by `keep`) is MOVED out rather than destroyed, so it
+/// is skipped and then marked dead so no later drop touches it. Unlike
+/// [`dropScope`] this does not pop the stack, only flips liveness, because the
+/// enclosing scopes are being unwound by the terminating return.
 fn dropAll(ctx: *Ctx, block: ir.Block, locals: *Locals, keep: ?usize) !void {
     var i: usize = locals.items.len;
     while (i > 0) {
@@ -637,17 +767,27 @@ fn dropAll(ctx: *Ctx, block: ir.Block, locals: *Locals, keep: ?usize) !void {
         try ctx.f.destroy(ctx.gpa, block, locals.items[i].value);
         locals.items[i].live = false;
     }
-    if (keep) |k| locals.items[k].live = false; // returned value consumed by the terminator
+    if (keep) |k| locals.items[k].live = false;
 }
 
+/// Return a fresh, independent copy of the local stack.
+///
+/// Each branch/case/loop-body is lowered against its own clone so the value and
+/// liveness edits it makes stay local until [`reconcileJoin`] (or the loop phi
+/// patching) deliberately merges them back into the outer stack.
 fn cloneLocals(gpa: std.mem.Allocator, locals: *const Locals) !Locals {
     var out: Locals = .empty;
     try out.appendSlice(gpa, locals.items);
     return out;
 }
 
-/// The statement list of a branch/body. A `{ … }` block yields its statements; a braceless single
-/// statement (`if (c) return x;`) yields a one-element view of that statement (safe: it outlives lowering).
+/// View a branch/loop/case body as a statement slice.
+///
+/// If the body is a `{ ... }` block, returns its statements. Otherwise the body
+/// is a single statement and this returns a one-element slice aliasing it via a
+/// pointer cast, so single-statement and block bodies are handled uniformly.
+/// Never returns null in practice; the optional return keeps the `orelse
+/// deferBecause(.nonblock_branch)` call sites uniform.
 fn branchStmts(s: *const ast.Statement) ?[]const ast.Statement {
     return switch (s.*) {
         .block => |b| b.statements,
@@ -655,13 +795,23 @@ fn branchStmts(s: *const ast.Statement) ?[]const ast.Statement {
     };
 }
 
+/// Decide whether an initialiser produces an ARC-OWNED value worth tracking.
+///
+/// Prefers the inference pass's per-expression answer ([`TypedIr.ownedOf`]);
+/// when inference has no opinion it falls back to the value's type via
+/// [`TypeStore.isOwnedSafe`]. A non-owned initialiser (a plain int, a borrow)
+/// creates no tracked local. An unknown type is treated as not owned.
 fn isOwnedInit(store: *const TypeStore, tir: *const TypedIr, e: *const ast.Expression) bool {
     if (tir.ownedOf(e)) |o| return o;
     const tid = tir.typeOf(e) orelse return false;
     return store.isOwnedSafe(tid);
 }
 
-/// Resolve a name to its local index, innermost (last-declared) shadow winning.
+/// Find the index of the innermost live-or-dead local named `want`.
+///
+/// Scans from the END of the stack so an inner shadow wins over an outer local
+/// of the same name (see the `resolveLocal` unit test at the bottom of the
+/// file). Returns null if no local by that name is in scope.
 fn resolveLocal(locals: []const Local, want: []const u8) ?usize {
     var i: usize = locals.len;
     while (i > 0) {
@@ -671,8 +821,12 @@ fn resolveLocal(locals: []const Local, want: []const u8) ?usize {
     return null;
 }
 
-/// True if `e` is a bare assignment `local = ...` to a tracked owned local (which drops the old value
-/// and rebinds the slot). Modelled by `lowerReassign`.
+/// Is `e` an assignment whose left side is a tracked local (`x = ...`)?
+///
+/// True only for a binary `assign` whose left operand is an identifier that
+/// resolves to a local in scope. Used to route assignment statements to
+/// [`lowerReassign`] (which models the ARC release of the old value and the
+/// acquire of the new) versus a plain expression.
 fn isLocalReassign(e: *const ast.Expression, locals: []const Local) bool {
     if (e.kind != .binary) return false;
     const b = e.kind.binary;
@@ -680,47 +834,41 @@ fn isLocalReassign(e: *const ast.Expression, locals: []const Local) bool {
     return b.left.kind == .ident and resolveLocal(locals, b.left.kind.ident) != null;
 }
 
-/// Lower a reassignment `x = rhs` where `x` is a tracked owned local. Ownership order matches codegen:
-/// the RHS is evaluated FIRST (it BORROWS the still-live old `x`, so a self-referential RHS like
-/// `x = x.next()` is sound), THEN the old value is dropped (-1), THEN the slot is rebound to the new
-/// value. The new value is a `copy` when the RHS is another owned local (`x = y`, +1) or a fresh
-/// `makeOwned` when the RHS is any other owned initializer. A trivial RHS (`x = null`, `x = 0`) leaves
-/// the slot with no owned obligation, so it is marked not-live (nothing to destroy at scope end).
+/// Model `x = rhs` on a tracked local: acquire the new value, release the old.
+///
+/// Reassigning a local whose index is below [`Ctx.clone_floor`] defers with
+/// [`DeferReason.reassign`] (the phi-free loop guard). Otherwise the new value
+/// is either an owned COPY of another live local (RHS is an identifier) or a
+/// fresh `makeOwned`; then the previous value of `x`, if live, is destroyed and
+/// `x` rebound to the new value. This ordering (build new, then release old) is
+/// what keeps the release count balanced across the reassignment.
 fn lowerReassign(ctx: *Ctx, block: ir.Block, e: *const ast.Expression, locals: *Locals) LowerError!void {
     const b = e.kind.binary;
     const idx = resolveLocal(locals.items, b.left.kind.ident).?;
-    // Reassigning a local declared in an ENCLOSING scope from inside a discarded branch clone would
-    // double-consume (see `clone_floor`). Not soundly modellable here -> defer.
     if (idx < ctx.clone_floor) return deferBecause(ctx, .reassign);
     const rhs = b.right;
-    // Produce the new owned value while the old value is still live (models RHS-before-drop).
     var new_val: ?ir.Value = null;
     if (rhs.kind == .ident) {
         if (resolveLocal(locals.items, rhs.kind.ident)) |j| {
             if (locals.items[j].live) new_val = try ctx.f.copy(ctx.gpa, block, locals.items[j].value);
         }
     }
-    // The reassign target is a TRACKED OWNED local, so a well-typed RHS carries an owned value of that type
-    // (a fresh birth). Even `x = null` on an optional models as a phantom owned value: born here, consumed
-    // once at scope end — balanced. So when the RHS is not an owned-local copy, mint a fresh owned value
-    // rather than marking the slot dead. (Marking it dead on an owned-typed RHS the classifier failed to
-    // flag as owned — e.g. a field access `x = e.field` — would give it a different liveness than a sibling
-    // branch and force a spurious mixed-liveness defer at the join.)
     if (new_val == null)
         new_val = try ctx.f.makeOwned(ctx.gpa, block, ctx.tir.typeOf(rhs));
-    // Drop the old value (-1) if the slot currently holds one, then rebind to the new owned value.
     if (locals.items[idx].live) try ctx.f.destroy(ctx.gpa, block, locals.items[idx].value);
     locals.items[idx].value = new_val.?;
     locals.items[idx].live = true;
 }
 
-/// Walk an expression and emit a `borrow_use` for every LIVE owned local it mentions. Under Nova's +0
-/// (caller-owned) convention, passing an owned local to a call, storing it into a container/field, or
-/// reading it in any expression is a BORROW — it does not consume the value (the local is still dropped at
-/// scope end). But the READ still requires the value to be LIVE, so emitting a borrow_use lets the verifier
-/// catch a use-after-consume flowing INTO a call/store (e.g. `x = other; foo(x_old)`), which slice 1 missed
-/// because it skipped call-arg / store uses entirely. borrow_use never consumes and never fails on correct
-/// code (the value is always live there), so this can only ADD true-positive coverage, never a false one.
+/// Walk an expression and emit a `borrowUse` for every read of a live owned local.
+///
+/// Every place a subexpression reads an owned local WITHOUT taking ownership
+/// (passing it to a call, indexing it, a field access, a template
+/// interpolation) is a borrow that ARC must account for, so the verifier needs
+/// to see it. This recurses structurally through the common expression shapes.
+/// For an assignment it descends only into the RHS (the LHS is the store
+/// target, handled by [`lowerReassign`]), which avoids counting the assignee as
+/// a borrow. Unhandled expression kinds contribute nothing.
 fn emitOwnedUses(ctx: *Ctx, block: ir.Block, e: *const ast.Expression, locals: *Locals) LowerError!void {
     switch (e.kind) {
         .ident => |n| {
@@ -730,8 +878,6 @@ fn emitOwnedUses(ctx: *Ctx, block: ir.Block, e: *const ast.Expression, locals: *
             }
         },
         .binary => |b| {
-            // `a = b` (reassign) is handled by lowerReassign; only walk the RHS here so the LHS def is not
-            // mistaken for a use. Any other binary borrows both sides.
             if (b.op == .assign and b.left.kind == .ident) {
                 try emitOwnedUses(ctx, block, b.right, locals);
             } else {
@@ -755,8 +901,10 @@ fn emitOwnedUses(ctx: *Ctx, block: ir.Block, e: *const ast.Expression, locals: *
     }
 }
 
-// A minimal name-mention check (idents only, recursive over common expression shapes), kept for the
-// exprMentions helper used by tests.
+/// Does the expression tree `e` reference an identifier named `name` anywhere?
+///
+/// A structural name-occurrence search mirroring [`emitOwnedUses`]'s recursion.
+/// (Currently a self-contained utility, not on the main lowering path.)
 fn exprMentions(e: *const ast.Expression, name: []const u8) bool {
     switch (e.kind) {
         .ident => |n| return std.mem.eql(u8, n, name),
@@ -778,27 +926,47 @@ fn exprMentions(e: *const ast.Expression, name: []const u8) bool {
     }
 }
 
-// ── report driver (NOVA_OSSA): lower every function + run the I3 verifier, tally results ──
+/// The whole-program census accumulated by [`reportQuiet`] over every function.
+///
+/// Feeds both the human-readable table ([`printCensus`]) and the `hard`-mode
+/// gate decision. `defer_reasons` is indexed by `@intFromEnum` of a
+/// [`DeferReason`], so its length must match that enum's variant count.
 const Counts = struct {
+    /// Functions considered (top-level + struct/enum methods).
     total: usize = 0,
+    /// Functions the model successfully lowered to verifiable IR.
     lowered: usize = 0,
+    /// Functions skipped because a construct was outside the lite model.
     deferred: usize = 0,
+    /// Lowered functions the verifier proved release-balanced.
     balanced: usize = 0,
+    /// Lowered functions with a proven ARC imbalance (leak or double-free).
     imbalanced: usize = 0,
+    /// Name of the first imbalanced function seen, for the gate message.
     first_imbalance_fn: []const u8 = "",
+    /// Total owned `copy` instructions emitted across all lowered functions.
     fwd_copies: usize = 0,
+    /// Of those copies, how many are borrow-then-destroy only (elision headroom).
     fwd_candidates: usize = 0,
+    /// Per-reason deferral tally, indexed by `@intFromEnum(DeferReason)`.
     defer_reasons: [5]usize = .{0} ** 5,
 };
 
+/// Whole-program entry point: lower, verify, and print the census (non-quiet).
+///
+/// Thin wrapper over [`reportQuiet`] with `quiet = false`. In `hard` mode it
+/// will exit the process non-zero if any function is imbalanced (the gate).
 pub fn report(gpa: std.mem.Allocator, store: *const TypeStore, tir: *const TypedIr, program: *const ast.Program, hard: bool) void {
     reportQuiet(gpa, store, tir, program, hard, false);
 }
 
-/// As `report`, but `quiet` suppresses the coverage census (only a proven imbalance still prints, and in
-/// `hard` mode still fails the build). This is the default-on enforcement path (Slice 6): every `nova
-/// build`/`nova test` runs the verifier silently and rejects a proven leak/double-free, without the census
-/// noise. `NOVA_OSSA=1` / `=hard` keep the verbose census (quiet=false).
+/// Lower and verify every function in a program, optionally printing the census.
+///
+/// Iterates top-level functions and the methods of every struct/enum, running
+/// [`lowerAndCheck`] for each into a [`Counts`]. When not `quiet`, prints the
+/// coverage table. When `hard` and any lowered function was imbalanced, prints
+/// the OSSA gate failure (naming the first offender) and calls
+/// `std.process.exit(1)` to FAIL THE BUILD; this is the `NOVA_OSSA` gate's teeth.
 pub fn reportQuiet(gpa: std.mem.Allocator, store: *const TypeStore, tir: *const TypedIr, program: *const ast.Program, hard: bool, quiet: bool) void {
     var c = Counts{};
     for (program.declarations) |decl| {
@@ -811,8 +979,6 @@ pub fn reportQuiet(gpa: std.mem.Allocator, store: *const TypeStore, tir: *const 
     }
     if (!quiet) printCensus(&c);
 
-    // Gate mode (default-on, or NOVA_OSSA=hard): a proven imbalance = a leak or double-free in a function
-    // the verifier fully modelled. Fail the build. (Deferred functions are unchecked, not accused.)
     if (hard and c.imbalanced > 0) {
         std.debug.print(
             "\x1b[1m\x1b[31mOSSA OWNERSHIP GATE FAILED:\x1b[0m {d} function(s) have an ARC release imbalance " ++
@@ -824,6 +990,12 @@ pub fn reportQuiet(gpa: std.mem.Allocator, store: *const TypeStore, tir: *const 
     }
 }
 
+/// Print the human-readable OSSA-lite census to stderr.
+///
+/// Reports totals, coverage percentage (`lowered / total`), balanced vs
+/// imbalanced counts, the per-reason deferral breakdown, and the
+/// ownership-forwarding headroom (copies emitted vs forwardable). Purely
+/// diagnostic; the gate decision lives in [`reportQuiet`].
 fn printCensus(c: *const Counts) void {
     const cov: usize = if (c.total == 0) 0 else (c.lowered * 100) / c.total;
     std.debug.print(
@@ -855,6 +1027,14 @@ fn printCensus(c: *const Counts) void {
     std.debug.print("=== end OSSA-lite lowering ===\n", .{});
 }
 
+/// Lower one function, verify it if lowered, and fold the outcome into `c`.
+///
+/// A lowering that errors (only `OutOfMemory` reaches here) is counted as
+/// deferred rather than crashing the census. A deferred function bumps its
+/// reason bucket. A lowered function is verified ([`verify.verify`]) and tallied
+/// balanced/imbalanced (recording the first imbalanced name), and its copies are
+/// run through [`forward.count`] for the forwarding headroom stats. The built
+/// IR and verifier result are freed before returning.
 fn lowerAndCheck(gpa: std.mem.Allocator, store: *const TypeStore, tir: *const TypedIr, fd: *const ast.FunctionDecl, c: *Counts) void {
     c.total += 1;
     const res = lowerFunction(gpa, store, tir, fd) catch {
@@ -885,15 +1065,15 @@ fn lowerAndCheck(gpa: std.mem.Allocator, store: *const TypeStore, tir: *const Ty
     }
 }
 
-// ─────────────────────────────────────────── tests ───────────────────────────────────────────
-// (Lowering needs a real TypedIr, which is heavy to construct in a unit test; end-to-end lowering is
-//  exercised via the NOVA_OSSA corpus report. These tests cover the pure helpers.)
 
+// Verifies [`resolveLocal`]'s back-to-front scan: with two locals named `b`,
+// the later (innermost) one at index 2 must win; an outer `a` resolves to its
+// index; an unknown name resolves to null.
 test "resolveLocal returns the innermost (last-declared) shadow" {
     const locals = [_]Local{
         .{ .name = "a", .value = @enumFromInt(0), .live = true },
         .{ .name = "b", .value = @enumFromInt(1), .live = true },
-        .{ .name = "b", .value = @enumFromInt(2), .live = true }, // shadows the earlier b
+        .{ .name = "b", .value = @enumFromInt(2), .live = true },
     };
     try std.testing.expectEqual(@as(?usize, 2), resolveLocal(&locals, "b"));
     try std.testing.expectEqual(@as(?usize, 0), resolveLocal(&locals, "a"));

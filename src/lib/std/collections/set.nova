@@ -41,8 +41,6 @@ pub class Set<T> {
         return self.map.keys();
     }
 
-    // Set algebra. Each returns a NEW set (inputs unmodified) built with this set's hash function, so the
-    // result is usable exactly like the operands.
     pub fn unionWith(self: Set<T>, other: Set<T>): Set<T> {
         let out = Set<T>(self.size() + other.size() + 1, self.map.hashFn);
         let a = self.map.keys();
@@ -54,7 +52,6 @@ pub class Set<T> {
         return out;
     }
 
-    // Elements present in BOTH sets.
     pub fn intersection(self: Set<T>, other: Set<T>): Set<T> {
         let out = Set<T>(self.size() + 1, self.map.hashFn);
         let a = self.map.keys();
@@ -67,7 +64,6 @@ pub class Set<T> {
         return out;
     }
 
-    // Elements in this set that are NOT in other.
     pub fn difference(self: Set<T>, other: Set<T>): Set<T> {
         let out = Set<T>(self.size() + 1, self.map.hashFn);
         let a = self.map.keys();

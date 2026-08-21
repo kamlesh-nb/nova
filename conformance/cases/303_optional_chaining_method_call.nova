@@ -1,9 +1,3 @@
-// I (parser gaps): `obj?.method(args)` -- an optional-chaining METHOD call on a `T | undefined` receiver --
-// compiled to a FieldNotFound error. `?.field` already worked; a call over it treated the method name as a
-// field. The checker already permits `x?.get()` (its own optional-safety error even suggests it).
-// Fix in codegen: a `.call` whose callee is an optional-chaining evaluates the receiver ONCE; if present,
-// it calls `T.method(args)` with the receiver as `self` and yields the result as `R | undefined`; if
-// absent, it yields `undefined`.
 
 import assert;
 

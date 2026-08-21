@@ -1,7 +1,3 @@
-// AsyncLock: a reactor-aware mutex for coroutines sharing one resource. N coroutines each hold the lock
-// across a real suspension (delay) during a read-modify-write on a shared counter. If the lock serialises
-// correctly no update is lost, so the counter equals N*K. Without it the interleaved read-await-write
-// would lose most updates. Exercises tryAcquire (sync fast path), acquireSlow (park), release (hand-off).
 import assert;
 import bytes;
 import net.poller;
@@ -40,7 +36,7 @@ fn test_async_lock_serialises_critical_sections(): void {
         guard = guard + 1;
     }
     poller.setCurrent(0);
-    assert.equalInt(bytes.read_i32(counter, 0) as int, n * kk);   // no lost updates
-    assert.equalInt(bytes.read_i32(done, 0) as int, n);           // all workers finished
+    assert.equalInt(bytes.read_i32(counter, 0) as int, n * kk);
+    assert.equalInt(bytes.read_i32(done, 0) as int, n);
     bytes.free(counter); bytes.free(done); r.destroy();
 }

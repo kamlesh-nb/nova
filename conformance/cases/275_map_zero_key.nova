@@ -1,7 +1,3 @@
-// G1: a value-type key of 0 must be a legal `Map<int, V>` key. The map inferred slot occupancy from
-// `key == 0`, so an integer key of 0 was indistinguishable from an empty slot: get(0) returned
-// undefined, set(0) duplicate-inserted, delete_key(0) failed. Occupancy is now tracked explicitly in
-// a 3-state slot array (EMPTY/TOMBSTONE/OCCUPIED), so key 0 behaves like any other key.
 import assert;
 import map;
 import string;
@@ -25,7 +21,7 @@ fn test_zero_key_overwrite(): void {
     let m = Map<int, int>(16, intHash);
     m.set(0, 1);
     m.set(0, 2);
-    assert.equalInt(1, m.size());          // overwrite, not duplicate
+    assert.equalInt(1, m.size());
     assert.equalInt(2, m.get(0) ?? -1);
 }
 
@@ -42,7 +38,6 @@ fn test_zero_key_delete(): void {
 
 @test
 fn test_zero_key_survives_resize(): void {
-    // Force several resizes with 0 present; it must survive rehashing.
     let m = Map<int, int>(4, intHash);
     m.set(0, 1000);
     let i = 1;

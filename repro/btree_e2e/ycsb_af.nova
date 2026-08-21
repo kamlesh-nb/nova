@@ -1,13 +1,3 @@
-// YCSB benchmark suite — ALL workloads A-F — in Nova against a LIVE BTreeDB.
-//   A: 50% read / 50% update            (Zipfian)
-//   B: 95% read / 5% update             (Zipfian)
-//   C: 100% read                        (Zipfian)
-//   D: 95% read / 5% insert             (Latest — reads favor recent inserts)
-//   E: 95% scan / 5% insert             (Zipfian, short ranges)
-//   F: 50% read / 50% read-modify-write (Zipfian)
-// Zero-padded keys (user00000001) so range scans are numerically ordered.
-// Run: start the server (btree/ ; ./zig-out/bin/btree :3009), then
-//   ./zig-out/bin/nova test --release repro/btree_e2e/ycsb_af.nova
 import assert;
 import list;
 import string;
@@ -59,7 +49,6 @@ struct Zipfian {
         let nd = n as double;
         self.eta = (1.0 - math.fpowf(2.0 / nd, 1.0 - theta)) / (1.0 - zeta_2 / self.zeta_n);
     }
-    // Zipfian rank in [0, n)  (0 = hottest)
     pub fn next(self: Zipfian): int {
         let u = self.rng.nextDouble();
         let uz = u * self.zeta_n;
@@ -77,19 +66,17 @@ fn genValue(size: int): string {
     return s;
 }
 
-// Zero-padded key so lexical order == numeric order (range scans work).
 fn keyName(k: int): string {
     let s = `${k}`;
     while (s.length < 8) { s = "0" + s; }
     return `user${s}`;
 }
 
-// Mutable benchmark state (Nova structs are references, so a method mutates it).
 struct Bench {
     pub rng: Rng,
     pub conn: db.Connection,
-    pub records: int,      // keyspace size for reads/updates/scans
-    pub nextKey: int,      // next INSERT key (grows for D/E)
+    pub records: int,
+    pub nextKey: int,
     pub value: string,
     pub theta: double,
     pub scanLen: int,
@@ -103,8 +90,6 @@ struct Bench {
         self.scanLen = 10;
     }
 
-    // Run `ops` operations with the given proportions; useLatest picks the Latest
-    // distribution for reads (D). Returns nothing; prints throughput+latency.
     pub fn run(self: Bench, name: string, ops: int, readP: double, updateP: double,
                insertP: double, scanP: double, rmwP: double, useLatest: bool): void {
         let zipf = Zipfian(self.rng, self.records, self.theta);
@@ -120,7 +105,6 @@ struct Bench {
             let c = b + insertP;
             let d = c + scanP;
             if (coin < a) {
-                // READ (Latest for D: hottest = most recently inserted)
                 let k = zipf.next();
                 if (useLatest) { k = self.nextKey - 1 - k; if (k < 0) { k = 0; } }
                 let rs = self.conn.query(`SELECT ykey, ydata FROM ycsb_af WHERE ykey = '${keyName(k)}'`, List<DbValue>());
@@ -138,7 +122,6 @@ struct Bench {
                 let rs = self.conn.query(`SELECT ykey, ydata FROM ycsb_af WHERE ykey >= '${keyName(k)}' LIMIT ${self.scanLen}`, List<DbValue>());
                 cScan = cScan + 1;
             } else {
-                // READ-MODIFY-WRITE (F): read then update the same key
                 let k = zipf.next();
                 let rs = self.conn.query(`SELECT ykey, ydata FROM ycsb_af WHERE ykey = '${keyName(k)}'`, List<DbValue>());
                 self.conn.exec(`UPDATE ycsb_af SET ydata = '${self.value}' WHERE ykey = '${keyName(k)}'`, List<DbValue>());
@@ -170,7 +153,6 @@ fn ycsb_af_suite(): void {
     let conn = drv.connect("127.0.0.1:3009");
     conn.exec("CREATE TABLE ycsb_af (ykey TEXT PRIMARY KEY, ydata TEXT)", List<DbValue>());
 
-    // --- LOAD ---
     let loadStart = datetime.nowNs();
     let i = 0;
     while (i < records) {
@@ -182,7 +164,6 @@ fn ycsb_af_suite(): void {
     console.log(`LOAD: ${records} inserts in ${loadNs / 1000000}ms  ${((records as double) * 1000000000.0 / (loadNs as double)) as int} ops/sec`);
 
     let b = Bench(rng, conn, records, value, theta);
-    //           name  ops   read  update insert scan   rmw   latest
     b.run("A", ops, 0.50, 0.50, 0.00, 0.00, 0.00, false);
     b.run("B", ops, 0.95, 0.05, 0.00, 0.00, 0.00, false);
     b.run("C", ops, 1.00, 0.00, 0.00, 0.00, 0.00, false);

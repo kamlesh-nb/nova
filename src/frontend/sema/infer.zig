@@ -1,66 +1,199 @@
+//! Best-effort type inference over the parsed AST, producing the typed IR the
+//! rest of the compiler consumes.
+//!
+//! This is the authoritative "what type is every expression" pass. It walks
+//! each function body, threads an OPTIONAL expected type inwards (so a literal
+//! or closure can be shaped by its context), and records the result of every
+//! expression into a [`TypedIr`] keyed by the expression's stable
+//! [`ast.ExprId`]. Codegen and the ownership/ARC passes then look up those
+//! recorded types instead of re-deriving them.
+//!
+//! The guiding principle is HONESTY over guessing. When the inferer cannot
+//! prove a type it returns the store's `unresolved` type rather than a
+//! plausible-looking default. That is why comparisons are `bool` (not `i32`),
+//! an integer literal is `int` (not the machine word), and `a + b` over two
+//! unknown idents stays `unresolved`. An unresolved result is not a hard error
+//! by itself: much of the pipeline can still proceed, and the [`Stats`]
+//! counters plus [`TypedIr.unresolvedCount`] give an honest coverage figure.
+//! A small set of genuinely fatal cases (an unresolvable bare identifier that
+//! is not a known module/builtin, or a call into a known module that names no
+//! such function) are counted separately on the [`Inferer`] so the driver can
+//! reject the program.
+//!
+//! Beyond typing, the pass doubles as a lightweight semantic checker and
+//! records a family of deferred diagnostics into per-kind error lists on the
+//! [`Inferer`] (visibility violations, const reassignment, dereferencing an
+//! optional/error-union without unwrapping, catch-arm and try error-type
+//! mismatches, non-bool conditions, returning an optional where a plain type is
+//! declared, and method arity). These are collected rather than thrown so the
+//! driver can report them together after the walk.
+//!
+//! Two features make the walk subtle and are worth calling out. First,
+//! FLOW-SENSITIVE NARROWING: `if (s != undefined)` rebinds `s` from
+//! `optional<T>` to `T` inside the guarded branch (and an early-exit
+//! `if (s == undefined) return;` narrows the rest of the statement sequence),
+//! implemented via a scoped shadow binding, see [`Inferer.narrowedBranch`] and
+//! [`earlyExitNarrowing`]. Second, GENERICS: monomorphisation is driven from
+//! here. When a call's type arguments can be solved to fully concrete types the
+//! pass substitutes them into the return type AND notifies [`mono`] to emit the
+//! concrete instantiation, so the type engine and the code emitter agree on
+//! exactly which specialisations exist.
+//!
+//! Recursion is bounded: [`Inferer.inferExprInner`] increments a depth counter
+//! and bails with `error.TypeInferenceRecursionLimit` past 2000 frames, so a
+//! pathological or cyclic AST cannot blow the native stack.
 
 const std = @import("std");
+/// AST node definitions (`Expression`, `Statement`, `FunctionDecl`, ...) that
+/// this pass walks; the input to inference.
 const ast = @import("../ast.zig");
+/// Assigns stable [`ast.ExprId`]s to expressions; used only by the tests here
+/// to stamp ids so recorded types can be read back by identity.
 const ids = @import("ids.zig");
+/// Type-parameter substitution over interned types: solve a type param from an
+/// actual argument, then rewrite it out of a return type.
 const subst = @import("subst.zig");
+/// The interned type store and the `TypeId` handle vocabulary everything below
+/// speaks in.
 const types = @import("../types.zig");
+/// The symbol table: functions, types, methods, constants, and modules keyed by
+/// name and module.
 const symbols = @import("symbols.zig");
+/// Lowers a syntactic [`ast.TypeRef`] into an interned [`TypeId`], honouring the
+/// active type-parameter scopes.
 const lower = @import("lower.zig");
+/// The compiler's intrinsic/receiver builtins table (`bytes`, `console`, ...);
+/// consulted to type builtin receivers and extern calls.
 const builtins = @import("builtins.zig");
+/// The monomorphisation registry: the pass notes concrete generic
+/// instantiations here so the code emitter specialises exactly those.
 const mono = @import("mono.zig");
 
+/// Re-export of the type store's opaque type handle, so callers of this module
+/// spell it `infer.TypeId` without importing `types` directly.
 pub const TypeId = types.TypeId;
 
+/// Running counters that quantify how much of a program the inferer could type,
+/// and where it fell short.
+///
+/// These are diagnostic, not load-bearing for correctness: they let the driver
+/// print an honest coverage figure and let the tests assert that guessing did
+/// not creep back in. Note that several call sites deliberately UNDO an earlier
+/// `typed` bump (`stats.typed -|= 1`) when a sub-expression was only visited to
+/// reach its parent, so `typed` counts distinct typed results, not visits.
 pub const Stats = struct {
+    /// Number of expressions the pass assigned a concrete (non-unresolved) type.
     typed: usize = 0,
+    /// Number of times the pass gave up and returned the store's `unresolved`
+    /// type. Broken down by syntactic cause in [`Stats.by_tag`].
     unresolved: usize = 0,
 
+    /// Unresolved bare identifiers that are NOT treated as fatal, e.g. a `self`
+    /// or a name that resolves to a known module segment. Kept apart from the
+    /// fatal count on [`Inferer`] so tolerable misses do not sink the build.
     unresolved_ns_ident: usize = 0,
+    /// Unresolved field accesses whose object is an unknown-but-non-fatal name
+    /// (module-qualified access that could not be typed), counted separately for
+    /// the same reason as [`Stats.unresolved_ns_ident`].
     unresolved_ns_field: usize = 0,
 
+    /// Histogram of unresolved results keyed by a short cause tag (`"binary"`,
+    /// `"call"`, `"closure"`, ...), populated by [`Inferer.unresolved`]. Keys
+    /// are borrowed string literals, so no ownership is transferred.
     by_tag: std.StringHashMapUnmanaged(usize) = .empty,
 
+    /// Histogram of the specific names that failed to resolve (idents/fields),
+    /// populated by [`Inferer.note`]. Useful for spotting a single missing
+    /// import that cascades into many misses.
     by_name: std.StringHashMapUnmanaged(usize) = .empty,
 
+    /// Frees the two histogram maps. The counter fields are plain integers and
+    /// need no cleanup; only the hash maps own heap.
     pub fn deinit(self: *Stats, allocator: std.mem.Allocator) void {
         self.by_tag.deinit(allocator);
         self.by_name.deinit(allocator);
     }
 };
 
+/// One local variable in scope: its name, current type, and whether it was
+/// introduced with `const` (so a reassignment can be flagged). The `ty` is
+/// mutable in place, which is how narrowing and same-name reassignment update a
+/// binding via [`Inferer.rebind`].
 const Binding = struct { name: []const u8, ty: TypeId, is_const: bool = false };
 
+/// How an owned value flows out of an expression: `move` transfers ownership,
+/// `drop` means the temporary is consumed here. Recorded per expression so the
+/// ARC pass knows whether to emit a retain/release.
 pub const OwnOp = enum { move, drop };
 
+/// Key for the per-instantiation IR maps: an expression together with the
+/// concrete monomorphic type it is being specialised for. The same syntactic
+/// expression can carry different types across different generic
+/// instantiations, so a bare [`ast.ExprId`] is not enough.
 pub const InstKey = struct { id: ast.ExprId, inst: TypeId };
 
+/// Key for [`TypedIr.tp_resolve`]: a type parameter and the instantiation in
+/// which we are resolving it, mapping to the concrete type it binds to there.
 pub const TpKey = struct { tp: TypeId, inst: TypeId };
 
+/// The typed IR: the durable output of this pass, mapping each stable
+/// [`ast.ExprId`] to what inference learned about it.
+///
+/// Everything downstream (codegen, ownership/ARC) reads from here rather than
+/// re-inferring. All maps are keyed by expression id, and the constructors
+/// uniformly refuse `.unassigned` ids so that every un-walked expression does
+/// NOT collide on id 0. The `*Inst` maps carry per-monomorphisation overrides
+/// for the cases where one expression has different types in different generic
+/// instantiations.
 pub const TypedIr = struct {
 
+    /// The core map: expression id to its inferred [`TypeId`]. See
+    /// [`TypedIr.typeOf`] / [`TypedIr.record`].
     expr_types: std.AutoHashMapUnmanaged(ast.ExprId, TypeId) = .empty,
 
+    /// Resolved symbol behind an expression (which concrete function/method a
+    /// call actually binds to), when unambiguous. See [`TypedIr.symOf`].
     expr_syms: std.AutoHashMapUnmanaged(ast.ExprId, types.SymbolId) = .empty,
 
+    /// For a generic call/method, the concrete type arguments solved for it.
+    /// The slice is OWNED (duped) per entry; [`TypedIr.deinit`] frees each
+    /// distinct pointer once (de-duplicated) to avoid a double free.
     expr_method_args: std.AutoHashMapUnmanaged(ast.ExprId, []const TypeId) = .empty,
 
+    /// Whether the expression yields a fresh OWNED value (a heap temporary the
+    /// caller must release) versus a borrow. Drives ARC. See
+    /// [`Inferer.ownedDisposition`].
     expr_owned: std.AutoHashMapUnmanaged(ast.ExprId, bool) = .empty,
 
+    /// The ownership operation ([`OwnOp`]) to apply at this expression, when one
+    /// was decided.
     expr_op: std.AutoHashMapUnmanaged(ast.ExprId, OwnOp) = .empty,
 
+    /// Per-instantiation override of [`TypedIr.expr_owned`], keyed by
+    /// [`InstKey`], for expressions whose ownership differs across generic
+    /// specialisations.
     expr_owned_inst: std.AutoHashMapUnmanaged(InstKey, bool) = .empty,
 
+    /// Per-instantiation override of [`TypedIr.expr_types`], keyed by
+    /// [`InstKey`].
     expr_types_inst: std.AutoHashMapUnmanaged(InstKey, TypeId) = .empty,
 
+    /// Resolution of a type parameter within a given instantiation, keyed by
+    /// [`TpKey`]; how a `T` becomes a concrete type inside one monomorphic body.
     tp_resolve: std.AutoHashMapUnmanaged(TpKey, TypeId) = .empty,
 
+    /// Count of `record` calls dropped because the expression had an
+    /// `.unassigned` id. A non-zero value in production would mean ids were not
+    /// stamped before inference.
     unassigned_rejected: usize = 0,
 
+    /// Frees every map. The subtle part is [`TypedIr.expr_method_args`]: its
+    /// values are owned slices, but the same slice pointer can be stored under
+    /// several ids, so this de-duplicates by pointer before freeing to avoid a
+    /// double free.
     pub fn deinit(self: *TypedIr, allocator: std.mem.Allocator) void {
         self.expr_types.deinit(allocator);
         self.expr_syms.deinit(allocator);
-        // Method-arg slices can alias (same heap slice reachable via more than one expr id), so a per-entry
-        // free double-frees under a real allocator. Dedup by pointer. (ArenaAllocator masked this: free was a no-op.)
         var freed = std.AutoHashMap(usize, void).init(allocator);
         var mit = self.expr_method_args.valueIterator();
         while (mit.next()) |v| {
@@ -80,59 +213,83 @@ pub const TypedIr = struct {
         self.tp_resolve.deinit(allocator);
     }
 
+    /// Records the owned/borrow disposition for `id` under a specific
+    /// instantiation `inst`. Silently ignores `.unassigned` ids (see the map
+    /// docs on [`TypedIr`]).
     pub fn recordOwnedInst(self: *TypedIr, allocator: std.mem.Allocator, id: ast.ExprId, inst: TypeId, owned: bool) !void {
         if (id == .unassigned) return;
         try self.expr_owned_inst.put(allocator, .{ .id = id, .inst = inst }, owned);
     }
 
+    /// Reads back the per-instantiation ownership recorded by
+    /// [`TypedIr.recordOwnedInst`], or null if none (or the id is unassigned).
     pub fn ownedOfInst(self: *const TypedIr, id: ast.ExprId, inst: TypeId) ?bool {
         if (id == .unassigned) return null;
         return self.expr_owned_inst.get(.{ .id = id, .inst = inst });
     }
 
+    /// Records the type of `id` under a specific instantiation `inst`, for
+    /// expressions whose type varies across monomorphic specialisations.
     pub fn recordTypeInst(self: *TypedIr, allocator: std.mem.Allocator, id: ast.ExprId, inst: TypeId, t: TypeId) !void {
         if (id == .unassigned) return;
         try self.expr_types_inst.put(allocator, .{ .id = id, .inst = inst }, t);
     }
 
+    /// Reads back the per-instantiation type recorded by
+    /// [`TypedIr.recordTypeInst`], or null.
     pub fn typeOfInst(self: *const TypedIr, id: ast.ExprId, inst: TypeId) ?TypeId {
         if (id == .unassigned) return null;
         return self.expr_types_inst.get(.{ .id = id, .inst = inst });
     }
 
+    /// Records that type parameter `tp`, within instantiation `inst`, binds to
+    /// the concrete type `concrete`. Unlike the id-keyed maps there is no
+    /// `.unassigned` guard because the key is a type param, not an expression.
     pub fn recordTpResolve(self: *TypedIr, allocator: std.mem.Allocator, tp: TypeId, inst: TypeId, concrete: TypeId) !void {
         try self.tp_resolve.put(allocator, .{ .tp = tp, .inst = inst }, concrete);
     }
 
+    /// Reads back the concrete binding of type parameter `tp` in instantiation
+    /// `inst`, or null.
     pub fn tpResolve(self: *const TypedIr, tp: TypeId, inst: TypeId) ?TypeId {
         return self.tp_resolve.get(.{ .tp = tp, .inst = inst });
     }
 
+    /// Records the ownership operation ([`OwnOp`]) chosen for expression `e`.
     pub fn recordOp(self: *TypedIr, allocator: std.mem.Allocator, e: *const ast.Expression, op: OwnOp) !void {
         if (e.id == .unassigned) return;
         try self.expr_op.put(allocator, e.id, op);
     }
 
+    /// Reads back the [`OwnOp`] recorded for the expression id, or null.
     pub fn opOf(self: *const TypedIr, id: ast.ExprId) ?OwnOp {
         if (id == .unassigned) return null;
         return self.expr_op.get(id);
     }
 
+    /// Looks up an expression's recorded type by RAW id (not by
+    /// `*const Expression`). The `2` suffix distinguishes it from
+    /// [`TypedIr.typeOf`], which takes the expression pointer.
     pub fn typeOf2(self: *const TypedIr, id: ast.ExprId) ?TypeId {
         if (id == .unassigned) return null;
         return self.expr_types.get(id);
     }
 
+    /// Records whether expression `e` yields an owned value. Called for every
+    /// expression from [`Inferer.inferExprExpecting`].
     pub fn recordOwned(self: *TypedIr, allocator: std.mem.Allocator, e: *const ast.Expression, owned: bool) !void {
         if (e.id == .unassigned) return;
         try self.expr_owned.put(allocator, e.id, owned);
     }
 
+    /// Reads back the owned/borrow disposition recorded for `e`, or null.
     pub fn ownedOf(self: *const TypedIr, e: *const ast.Expression) ?bool {
         if (e.id == .unassigned) return null;
         return self.expr_owned.get(e.id);
     }
 
+    /// Counts how many expressions were recorded as owned (`true`). A cheap
+    /// health metric for the ARC pass.
     pub fn ownedTrueCount(self: *const TypedIr) usize {
         var n: usize = 0;
         var it = self.expr_owned.valueIterator();
@@ -142,6 +299,9 @@ pub const TypedIr = struct {
         return n;
     }
 
+    /// Records the solved concrete type arguments of a generic call/method on
+    /// `e`, taking a fresh OWNED copy of `args`. Any previously stored slice for
+    /// this id is freed first, so re-recording is safe and does not leak.
     pub fn recordMethodArgs(self: *TypedIr, allocator: std.mem.Allocator, e: *const ast.Expression, args: []const TypeId) !void {
         if (e.id == .unassigned) return;
         if (self.expr_method_args.get(e.id)) |old| allocator.free(old);
@@ -149,21 +309,30 @@ pub const TypedIr = struct {
         try self.expr_method_args.put(allocator, e.id, dup);
     }
 
+    /// Reads back the solved type arguments recorded for `e`, or null. The
+    /// slice is borrowed from the map; do not free it.
     pub fn methodArgsOf(self: *const TypedIr, e: *const ast.Expression) ?[]const TypeId {
         if (e.id == .unassigned) return null;
         return self.expr_method_args.get(e.id);
     }
 
+    /// Records which concrete symbol `e` resolved to (the callee of a call).
+    /// Only recorded when the resolution is unambiguous, so codegen can bind
+    /// directly instead of re-doing name lookup.
     pub fn recordSym(self: *TypedIr, allocator: std.mem.Allocator, e: *const ast.Expression, sid: types.SymbolId) !void {
         if (e.id == .unassigned) return;
         try self.expr_syms.put(allocator, e.id, sid);
     }
 
+    /// Reads back the resolved symbol recorded for `e`, or null.
     pub fn symOf(self: *const TypedIr, e: *const ast.Expression) ?types.SymbolId {
         if (e.id == .unassigned) return null;
         return self.expr_syms.get(e.id);
     }
 
+    /// Records the inferred type of `e`. An `.unassigned` id is rejected and
+    /// bumps [`TypedIr.unassigned_rejected`] rather than being stored, so
+    /// un-walked expressions never all collide on id 0.
     pub fn record(self: *TypedIr, allocator: std.mem.Allocator, e: *const ast.Expression, t: TypeId) !void {
         if (e.id == .unassigned) {
             self.unassigned_rejected += 1;
@@ -172,15 +341,20 @@ pub const TypedIr = struct {
         try self.expr_types.put(allocator, e.id, t);
     }
 
+    /// Looks up the recorded type of `e` by its pointer's id, or null. The
+    /// primary read path for downstream passes.
     pub fn typeOf(self: *const TypedIr, e: *const ast.Expression) ?TypeId {
         if (e.id == .unassigned) return null;
         return self.expr_types.get(e.id);
     }
 
+    /// Total number of expressions with a recorded type.
     pub fn count(self: *const TypedIr) usize {
         return self.expr_types.count();
     }
 
+    /// How many recorded expressions still carry the `unresolved` type: the
+    /// honest coverage gap. Requires the store to classify each recorded id.
     pub fn unresolvedCount(self: *const TypedIr, store: *const types.TypeStore) usize {
         var n: usize = 0;
         var it = self.expr_types.valueIterator();
@@ -191,12 +365,26 @@ pub const TypedIr = struct {
     }
 };
 
+/// The result of recognising an `x != undefined` / `x == undefined` guard: the
+/// binding `name` to narrow, and in which branch (`when_true`) the narrowing
+/// applies. Consumed by [`Inferer.narrowedBranch`] and
+/// [`Inferer.inferStmtSeq`].
 const Narrowing = struct {
+    /// The identifier being compared against `undefined`.
     name: []const u8,
 
+    /// True if narrowing applies when the condition is TRUE (the `!=` case:
+    /// inside the then-branch the value is present); false for `==` (the value
+    /// is present in the else-branch instead).
     when_true: bool,
 };
 
+/// Recognises a `binding != undefined` or `binding == undefined` comparison and
+/// returns which binding it narrows and in which branch.
+///
+/// Returns null unless exactly ONE side is the `undefined` literal and the
+/// OTHER side is a plain identifier (a field access does not narrow, see the
+/// gating test). The operator must be `==` or `!=`.
 fn narrowedBinding(cond: ast.BinaryExpr) ?Narrowing {
     const when_true = switch (cond.op) {
         .ne => true,
@@ -212,6 +400,11 @@ fn narrowedBinding(cond: ast.BinaryExpr) ?Narrowing {
     return .{ .name = other.kind.ident, .when_true = when_true };
 }
 
+/// Whether a statement definitely transfers control out of the enclosing block
+/// (returns/breaks/continues), looking through a block to its last statement.
+///
+/// Used to prove that an `if (x == undefined) return;` guard leaves `x` present
+/// for everything that follows, see [`earlyExitNarrowing`].
 fn branchTerminates(s: *const ast.Statement) bool {
     return switch (s.*) {
         .return_stmt, .break_stmt, .continue_stmt => true,
@@ -220,6 +413,16 @@ fn branchTerminates(s: *const ast.Statement) bool {
     };
 }
 
+/// Recognises an early-exit narrowing statement: an `if` whose undefined-check
+/// guard bails out, so the CHECKED binding is narrowed for the rest of the
+/// statement sequence rather than just inside a branch.
+///
+/// Two shapes qualify. `if (x != undefined) { ... } else <terminates>`: the
+/// else exits, so past the `if` the true (present) case holds. `if (x ==
+/// undefined) <then terminates>` with NO else: the then exits, so past the `if`
+/// the value is present. Returns null for any other shape (e.g. an `==` guard
+/// that also has an else). The caller ([`Inferer.inferStmtSeq`]) then narrows
+/// the remaining statements.
 fn earlyExitNarrowing(s: *const ast.Statement) ?Narrowing {
     if (s.* != .if_stmt) return null;
     const i = s.if_stmt;
@@ -237,149 +440,248 @@ fn earlyExitNarrowing(s: *const ast.Statement) ?Narrowing {
     return n;
 }
 
+/// Which category of declaration a visibility violation was against, so the
+/// diagnostic can name it correctly (a private function vs type vs const).
 pub const VisKind = enum { function, type_, const_ };
 
+/// A deferred "accessed a non-public symbol from another module" diagnostic.
+/// Collected during the walk and reported later by the driver.
 pub const VisError = struct {
+    /// Source location of the offending access.
     span: ast.Span,
+    /// The receiver/module name through which the access was made (empty for a
+    /// bare type or const reference).
     recv: []const u8,
+    /// The name of the private member that was accessed.
     field: []const u8,
 
+    /// Which kind of declaration was private, defaulting to a function.
     kind: VisKind = .function,
 };
 
+/// A deferred "assigned to a `const` binding" diagnostic.
 pub const ConstReassignError = struct {
+    /// Source location of the assignment.
     span: ast.Span,
+    /// The const binding's name.
     name: []const u8,
 };
 
+/// Whether a see-through-without-unwrapping happened on an optional (`opt`) or
+/// an error union (`err`), so the message can say `undefined`/`error`
+/// appropriately.
 pub const OptDerefKind = enum { opt, err };
+/// A deferred "dereferenced an optional/error-union without unwrapping it"
+/// diagnostic: accessing `.field` or calling `.method()` on a value that might
+/// be absent or an error.
 pub const OptDerefError = struct {
+    /// Source location of the field access or method call.
     span: ast.Span,
+    /// The field or method name that was reached through the wrapper.
     field: []const u8,
+    /// True for a method call, false for a field access.
     is_method: bool,
+    /// Whether the wrapper was an optional or an error union.
     kind: OptDerefKind = .opt,
 };
 
+/// A deferred "the catch handler's type does not match the try's ok type"
+/// diagnostic, e.g. `x catch "s"` where `x`'s success value is not a string.
 pub const CatchMismatchError = struct {
+    /// Source location of the handler (or the guarded expression).
     span: ast.Span,
+    /// The success-branch type of the `try`/error-union expression.
     ok: TypeId,
+    /// The type produced by the catch handler.
     handler: TypeId,
 };
 
-// A `try g()` whose propagated error type does not match the enclosing function's declared error type.
-// `try` re-raises the callee's error unchanged, so `fn f(): T | E1 { return try g() }` where g fails with
-// E2 is a soundness hole -- the caller's contract says E1 but an E2 escapes (G5).
+/// A deferred "the callee's error type is incompatible with the enclosing
+/// function's declared error type" diagnostic, raised at a `try` that would
+/// propagate an error the function cannot return.
 pub const TryErrorMismatch = struct {
+    /// Source location of the `try`.
     span: ast.Span,
+    /// The error type the called expression can produce.
     callee_err: TypeId,
+    /// The error type the current function is declared to return.
     fn_err: TypeId,
 };
 
-// A1 fail-closed soundness pass (gaps.md C-chk-4). A condition in `if` / `while` / `for` must be a `bool`.
-// A non-bool condition (int/long/enum/optional/string) was silently accepted and its discriminant/word used
-// as truthiness -- silent wrong control flow. `.unresolved` is left alone (fail-open only where sema genuinely
-// could not type the expression, to avoid false positives from the incomplete inferrer).
+/// A deferred "condition is not a boolean" diagnostic for an `if`/`while`/`for`
+/// guard whose type is known and is not `bool`.
 pub const CondTypeError = struct {
+    /// Source location of the condition expression.
     span: ast.Span,
+    /// The (non-bool, non-unresolved) type the condition actually had.
     got: TypeId,
+    /// A short label for which construct's condition this was (`"if"`,
+    /// `"while"`, `"for"`).
     ctx: []const u8,
 };
 
-// A1 (gaps.md C-chk-3). Returning a `T | undefined` value where the function is declared to return a plain
-// non-optional `T`. The unwrapped path reads the value word of an absent optional and dereferences the
-// `undefined` sentinel -- a runtime SEGV with no compile error. Narrowing-safe: sema rebinds a narrowed
-// optional to its non-optional inner type in scope, so a guarded `return x` inside `if (x != undefined)` is
-// already non-optional here and does not fire.
+/// A deferred "returning an optional where the function declares a plain type"
+/// diagnostic, i.e. a value-optional leaking out of a function that promised a
+/// non-optional result.
 pub const RetOptionalError = struct {
+    /// Source location of the returned expression.
     span: ast.Span,
+    /// The function's declared (plain) return type.
     ret: TypeId,
+    /// The optional type of the value being returned.
     val: TypeId,
 };
 
-// L2 (gaps.md C-chk-6). A possibly-`undefined` value used where a plain (non-optional) type is required,
-// at a position OTHER than return: a let-binding with a declared plain type, or a call argument bound to a
-// plain parameter. The return position is C-chk-3 (RetOptionalError). `ctx` names the position for the
-// diagnostic. `want` is the required plain type, `got` the optional value type (post-narrowing).
+/// A deferred "a value-optional was used where a plain type is required"
+/// diagnostic at a non-return position (a let binding or an argument). Raised
+/// by [`Inferer.checkPlainTarget`].
 pub const ValoptPosError = struct {
+    /// Source location of the offending expression.
     span: ast.Span,
+    /// The plain type the position requires.
     want: TypeId,
+    /// The optional type actually supplied.
     got: TypeId,
+    /// A short label describing the position (e.g. "assigned to a variable of
+    /// type", "passed as an argument ...").
     ctx: []const u8,
 };
 
-// A1 (gaps.md C-chk-1). A method call `obj.m(...)` whose argument count does not match the method's declared
-// parameters (Nova has no default or variadic params, so the arity is exact). Was previously unchecked and
-// produced an LLVMVerificationError with no source span; free-function/constructor arity was already checked
-// in the legacy pass.
+/// A deferred "method called with the wrong number of arguments" diagnostic.
+/// `expected` already accounts for an implicit `self`, see
+/// [`Inferer.checkMethodArity`].
 pub const MethodArityError = struct {
+    /// Source location of the call.
     span: ast.Span,
+    /// The method name.
     name: []const u8,
+    /// Number of arguments the method expects (excluding an implicit `self`
+    /// when called on an instance).
     expected: usize,
+    /// Number of arguments actually supplied.
     got: usize,
 };
 
+/// The inference engine itself: holds the scope stack, the deferred-diagnostic
+/// lists, the fatal-miss counters, and the transient state threaded through the
+/// recursive walk.
+///
+/// Construct with [`Inferer.init`], point `ir` at a [`TypedIr`] to capture
+/// results, then drive it with [`Inferer.inferFunction`] /
+/// [`Inferer.inferFunctionWithSelf`] per function. Call [`Inferer.deinit`] to
+/// release the scope stack and the error lists. Many fields are context that is
+/// saved and restored around a nested walk (module, expected return type,
+/// callee flag), so the walk can be re-entrant without leaking state.
 pub const Inferer = struct {
+    /// Allocator for scopes, error lists, and the temporary slices the walk
+    /// builds; also the allocator the [`TypedIr`] maps use.
     allocator: std.mem.Allocator,
+    /// The interned type store: the source of canonical `TypeId`s and the
+    /// classifier (`store.get(t)`) the whole pass branches on.
     store: *types.TypeStore,
+    /// Read-only symbol table for resolving names to functions, types, methods,
+    /// constants, and modules.
     symtab: *const symbols.SymbolTable,
+    /// Lowers syntactic type refs to `TypeId`s. Its `param_scopes` and
+    /// `current_module` are temporarily overridden while typing a generic body.
     lowerer: *lower.Lowerer,
 
+    /// Stack of lexical scopes, each a list of [`Binding`]s. Pushed/popped by
+    /// [`Inferer.push`]/[`Inferer.pop`]; lookups scan innermost-first.
     scopes: std.ArrayListUnmanaged(std.ArrayListUnmanaged(Binding)) = .empty,
+    /// Recursion guard for constant-value inference in [`Inferer.constType`],
+    /// which can chain const-to-const; capped to break cycles.
     const_depth: usize = 0,
-    // Guards against unbounded expression-inference recursion from a cyclic type (e.g. a self-referential
-    // value struct, or a generated dispatch whose type resolution loops). Real expressions never nest
-    // thousands deep, so hitting the cap means a genuine cycle -> error out cleanly instead of hanging.
+    /// Current expression-recursion depth, incremented per
+    /// [`Inferer.inferExprInner`] frame.
     infer_depth: u32 = 0,
+    /// Latched once `infer_depth` exceeds the 2000 limit; every subsequent
+    /// expression fails fast with `error.TypeInferenceRecursionLimit` so a
+    /// cyclic AST cannot overflow the stack.
     infer_overflow: bool = false,
 
+    /// The declared return type of the function currently being walked, used to
+    /// shape `return`/`try` expressions and to detect optional-in-plain-return.
     current_ret: ?TypeId = null,
 
+    /// The module the current function belongs to, driving visibility checks and
+    /// module-scoped name resolution.
     current_module: ?symbols.ModuleId = null,
 
+    /// Collected cross-module visibility violations. See [`VisError`].
     visibility_errors: std.ArrayListUnmanaged(VisError) = .empty,
 
+    /// Collected assignments to `const` bindings. See [`ConstReassignError`].
     const_reassign_errors: std.ArrayListUnmanaged(ConstReassignError) = .empty,
 
+    /// Collected optional/error-union see-through diagnostics. See
+    /// [`OptDerefError`].
     optional_deref_errors: std.ArrayListUnmanaged(OptDerefError) = .empty,
 
-    // A `catch` whose handler value does not match the ok side of the error union. Both arms must
-    // unify (the catch yields the ok type), so e.g. `intFn() catch (e) e.describe()` (ok=int,
-    // handler=string) is a soundness error, not silent garbage.
+    /// Collected catch-arm type mismatches. See [`CatchMismatchError`].
     catch_mismatch_errors: std.ArrayListUnmanaged(CatchMismatchError) = .empty,
 
+    /// Collected `try` error-type propagation mismatches. See
+    /// [`TryErrorMismatch`].
     try_error_mismatch_errors: std.ArrayListUnmanaged(TryErrorMismatch) = .empty,
 
+    /// Collected non-boolean condition diagnostics. See [`CondTypeError`].
     cond_type_errors: std.ArrayListUnmanaged(CondTypeError) = .empty,
 
+    /// Collected optional-returned-from-plain-function diagnostics. See
+    /// [`RetOptionalError`].
     ret_optional_errors: std.ArrayListUnmanaged(RetOptionalError) = .empty,
+    /// Collected value-optional-in-plain-position diagnostics. See
+    /// [`ValoptPosError`].
     valopt_pos_errors: std.ArrayListUnmanaged(ValoptPosError) = .empty,
 
+    /// Collected method arity mismatches. See [`MethodArityError`].
     method_arity_errors: std.ArrayListUnmanaged(MethodArityError) = .empty,
 
+    /// Count of bare identifiers that failed to resolve AND were judged fatal by
+    /// [`Inferer.isFatalUnresolvedIdent`] (not a module/builtin/self). The
+    /// driver treats a non-zero count as a compile failure.
     fatal_unresolved_idents: usize = 0,
 
+    /// Name of the first fatal unresolved identifier, for the error message.
     first_fatal_ident: ?[]const u8 = null,
+    /// Source span of the first fatal unresolved identifier (only set once a
+    /// real, line > 0 span is available).
     first_fatal_span: ?ast.Span = null,
-    // F1-7: a qualified call `mod.fn(...)` where `mod` is a known module but has no function `fn` — the
-    // confident subset of the codegen MethodOrFunctionNotFound, rejected here so it fires before codegen.
+    /// Count of calls into a KNOWN module that named no such function, a
+    /// separate fatal class from unresolved idents.
     fatal_unresolved_calls: usize = 0,
+    /// Receiver (module) name of the first fatal unresolved call.
     first_fatal_call_recv: ?[]const u8 = null,
+    /// Field (function) name of the first fatal unresolved call.
     first_fatal_call_field: ?[]const u8 = null,
+    /// Source span of the first fatal unresolved call.
     first_fatal_call_span: ?ast.Span = null,
 
+    /// The last concrete type produced by a `return` in the current body, used
+    /// to infer a closure/function result when no return type was declared.
     captured_return: ?TypeId = null,
 
+    /// True while typing the callee sub-expression of a call. Lets a
+    /// field-access decide it is being CALLED (so an unresolved method should be
+    /// treated more strictly) rather than read as a value.
     in_call_callee: bool = false,
 
-    // The statement list currently being inferred (set by inferStmtSeq). Lets a
-    // `let name = closure` look ahead to a call site `name(args)` in the same block and
-    // pin the closure's param types from the argument types, so the closure (and any local
-    // that holds its result) is correctly typed on the first pass.
+    /// The statement slice currently being walked, so closure-argument inference
+    /// can look ahead to a later call in the same sequence. See
+    /// [`Inferer.closureCallExpectation`].
     current_stmt_seq: ?[]ast.Statement = null,
 
+    /// Where to record results; null runs the walk purely for its side effects
+    /// (used by [`Inferer.inferExprQuietly`] to probe a type without polluting
+    /// the IR or the counters).
     ir: ?*TypedIr = null,
+    /// The running coverage/diagnostic counters. See [`Stats`].
     stats: Stats = .{},
 
+    /// Creates an inferer bound to the given store, symbol table, and lowerer.
+    /// All the mutable walk state starts empty; point `ir` at a [`TypedIr`]
+    /// afterwards to capture results.
     pub fn init(
         allocator: std.mem.Allocator,
         store: *types.TypeStore,
@@ -389,6 +691,13 @@ pub const Inferer = struct {
         return .{ .allocator = allocator, .store = store, .symtab = symtab, .lowerer = lowerer };
     }
 
+    /// Releases the scope stack, the stats histograms, and the deferred-error
+    /// lists.
+    ///
+    /// Note it does NOT free `cond_type_errors`, `ret_optional_errors`,
+    /// `valopt_pos_errors`, or `method_arity_errors`: those lists must be
+    /// drained/owned by the driver before teardown, or their backing memory is
+    /// reclaimed with the arena the inferer runs under.
     pub fn deinit(self: *Inferer) void {
         for (self.scopes.items) |*s| s.deinit(self.allocator);
         self.scopes.deinit(self.allocator);
@@ -400,22 +709,32 @@ pub const Inferer = struct {
         self.try_error_mismatch_errors.deinit(self.allocator);
     }
 
+    /// Pushes a fresh empty lexical scope onto the stack.
     fn push(self: *Inferer) !void {
         try self.scopes.append(self.allocator, .empty);
     }
+    /// Pops and frees the innermost scope. Asserts a scope exists (`.?`), so it
+    /// must be balanced with a prior [`Inferer.push`].
     fn pop(self: *Inferer) void {
         var s = self.scopes.pop().?;
         s.deinit(self.allocator);
     }
+    /// Binds `name` to `ty` in the innermost scope as a non-const (reassignable)
+    /// variable. Thin wrapper over [`Inferer.bindC`].
     fn bind(self: *Inferer, name: []const u8, ty: TypeId) !void {
         try self.bindC(name, ty, false);
     }
 
+    /// Binds `name` to `ty`, recording whether it is `const`. Creates an initial
+    /// scope if the stack is empty, so binding before any explicit push is
+    /// safe.
     fn bindC(self: *Inferer, name: []const u8, ty: TypeId, is_const: bool) !void {
         if (self.scopes.items.len == 0) try self.push();
         try self.scopes.items[self.scopes.items.len - 1].append(self.allocator, .{ .name = name, .ty = ty, .is_const = is_const });
     }
 
+    /// Whether the nearest binding of `name` was declared `const`, used to flag
+    /// a reassignment. Returns false if the name is unbound.
     fn lookupIsConst(self: *Inferer, name: []const u8) bool {
         var i = self.scopes.items.len;
         while (i > 0) {
@@ -427,6 +746,11 @@ pub const Inferer = struct {
         return false;
     }
 
+    /// Updates the type of the nearest existing binding of `name` in place.
+    ///
+    /// This is how a value is re-typed after a same-name reassignment where the
+    /// RHS is an optional, and it underpins narrowing when done inside a scoped
+    /// shadow. A no-op if the name is not bound.
     fn rebind(self: *Inferer, name: []const u8, ty: TypeId) void {
         var i = self.scopes.items.len;
         while (i > 0) {
@@ -440,6 +764,8 @@ pub const Inferer = struct {
         }
     }
 
+    /// Resolves `name` to its type by scanning scopes innermost-first, or null
+    /// if unbound. The primary local-variable lookup.
     fn lookup(self: *Inferer, name: []const u8) ?TypeId {
         var i = self.scopes.items.len;
         while (i > 0) {
@@ -451,6 +777,9 @@ pub const Inferer = struct {
         return null;
     }
 
+    /// Returns the store's `unresolved` type and records the miss under `tag`
+    /// in [`Stats.by_tag`]. The single funnel for "I could not type this",
+    /// which is what keeps the coverage stats honest.
     fn unresolved(self: *Inferer, tag: []const u8) !TypeId {
         self.stats.unresolved += 1;
         const gop = try self.stats.by_tag.getOrPut(self.allocator, tag);
@@ -458,11 +787,22 @@ pub const Inferer = struct {
         return self.store.unresolvedT();
     }
 
+    /// Bumps the per-name miss histogram [`Stats.by_name`] for `name`, so a
+    /// single unresolved symbol appearing in many places is visible as one hot
+    /// name.
     fn note(self: *Inferer, name: []const u8) !void {
         const gop = try self.stats.by_name.getOrPut(self.allocator, name);
         if (gop.found_existing) gop.value_ptr.* += 1 else gop.value_ptr.* = 1;
     }
 
+    /// Least-upper-bound of two struct types via a COMMON trait, or null if
+    /// there is not exactly one.
+    ///
+    /// Used to type an `if`/ternary whose two branches are different structs:
+    /// if both structs implement the same single trait, the expression's type
+    /// is that trait object. If they share zero or more than one trait the
+    /// result is ambiguous and this returns null (the caller then reports
+    /// unresolved). Only structs are considered.
     fn lubTraitOfStructs(self: *Inferer, tt: TypeId, et: TypeId) !?TypeId {
         if (self.store.get(tt) != .struct_ or self.store.get(et) != .struct_) return null;
         const t_sym = self.symtab.symbolAt(self.store.get(tt).struct_.decl);
@@ -482,16 +822,22 @@ pub const Inferer = struct {
         }
         return found;
     }
+    /// Records a successful typing (bumps [`Stats.typed`]) and returns the type
+    /// unchanged. The complement of [`Inferer.unresolved`]; wrapping every
+    /// concrete result in `ok(...)` is what makes the counter meaningful.
     fn ok(self: *Inferer, id: TypeId) TypeId {
         self.stats.typed += 1;
         return id;
     }
 
-    // Do the two arms of a `catch` unify? The result type is the ok side; the handler must produce
-    // a value usable as it. Conservative to avoid false positives: same type is fine, unresolved is
-    // skipped, and the only rejected shape is a heap `string`/`decimal` on one arm and something
-    // else on the other, which is exactly the case codegen would mis-stringify or mis-free (e.g. an
-    // `int` ok side with a `string` handler). Numeric/struct/trait/enum variety is allowed.
+    /// Whether a `catch` handler's type is compatible with the guarded
+    /// expression's success type.
+    ///
+    /// Deliberately lenient: identical types pass, and anything involving an
+    /// `unresolved` type passes (we do not manufacture errors from ignorance).
+    /// It only REJECTS a clear category mismatch, string-vs-non-string or
+    /// decimal-vs-non-decimal, which are the cases that would silently corrupt
+    /// codegen.
     fn catchArmsCompatible(self: *Inferer, ok_t: TypeId, handler_t: TypeId) bool {
         if (ok_t == handler_t) return true;
         const ko = self.store.get(ok_t);
@@ -502,9 +848,13 @@ pub const Inferer = struct {
         return true;
     }
 
-    // Two error types match if they are the same declared type (same enum/exception SymbolId, or same
-    // struct decl, or the identical TypeId). An unresolved side is never flagged (avoid false positives on
-    // types sema could not pin). Nova has no error-type subtyping, so a mismatch is always a G5 error.
+    /// Whether two error types are compatible for `try` propagation.
+    ///
+    /// Like [`Inferer.catchArmsCompatible`], it is lenient around `unresolved`.
+    /// Two enums match iff they are the same enum symbol; two structs iff they
+    /// share a declaration; anything else is incompatible. Used to check that a
+    /// `try` cannot propagate an error the enclosing function is not declared to
+    /// return.
     fn errorTypesCompatible(self: *Inferer, a: TypeId, b: TypeId) bool {
         if (a == b) return true;
         const sa = self.store.get(a);
@@ -515,10 +865,18 @@ pub const Inferer = struct {
         return false;
     }
 
+    /// Infers the type of `ep` with no expected-type context. The public entry
+    /// point for a stand-alone expression.
     pub fn inferExpr(self: *Inferer, ep: *const ast.Expression) anyerror!TypeId {
         return self.inferExprExpecting(ep, null);
     }
 
+    /// Infers `ep`'s type, threading an optional `expected` type inwards, and
+    /// records both the type AND the owned/borrow disposition into the IR.
+    ///
+    /// The `expected` hint is what lets a literal, tuple, closure, or `if`
+    /// expression be shaped by its context. This is the recording wrapper; the
+    /// actual case analysis is in [`Inferer.inferExprInner`].
     pub fn inferExprExpecting(self: *Inferer, ep: *const ast.Expression, expected: ?TypeId) anyerror!TypeId {
         const t = try self.inferExprInner(ep.*, expected);
         if (self.ir) |ir| {
@@ -529,6 +887,15 @@ pub const Inferer = struct {
         return t;
     }
 
+    /// Decides whether an expression of syntactic `kind` and type `t` yields a
+    /// fresh OWNED heap value (needing release) or a borrow.
+    ///
+    /// Certain kinds are borrows by construction regardless of type: reading an
+    /// ident/field/index, an assignment, a non-decimal literal, and the
+    /// unwrapping forms (`try`/cast/await/`go`/optional-chaining) all return
+    /// false. For everything else, ownership is whatever
+    /// `store.isOwnedSafe(t)` says. Feeds [`TypedIr.expr_owned`] and hence the
+    /// ARC pass.
     fn ownedDisposition(self: *Inferer, kind: ast.ExprKind, t: TypeId) bool {
         switch (kind) {
             .ident, .field_access, .index => return false,
@@ -542,11 +909,21 @@ pub const Inferer = struct {
         return self.store.isOwnedSafe(t);
     }
 
+    /// The heart of the pass: a big switch over expression kind that computes a
+    /// type (or `unresolved`) for `e`, threading `expected` where it helps.
+    ///
+    /// It is guarded by the recursion limit (2000 frames, latched into
+    /// [`Inferer.infer_overflow`]) so a cyclic AST fails fast instead of blowing
+    /// the stack. Each arm follows the honesty rule: prefer `unresolved` over a
+    /// guess, and record the specific cause tag. Notable arms: `call` handles
+    /// enum-variant construction, extern builtins, free functions (with generic
+    /// return substitution), struct construction, module functions, and methods
+    /// in that order; `struct_init`/`generic_call` solve and register concrete
+    /// generic instantiations with [`mono`]; `closure` infers parameter types
+    /// from the expected function type or, failing that, from how the param is
+    /// used in the body. This routine does NOT record into the IR itself, its
+    /// caller [`Inferer.inferExprExpecting`] does.
     fn inferExprInner(self: *Inferer, e: ast.Expression, expected: ?TypeId) anyerror!TypeId {
-        // Cyclic-type recursion guard: a self-referential type (or a generated dispatch whose type
-        // resolution loops) recurses here without bound. Real expressions never nest thousands deep. The
-        // `infer_overflow` latch stays set once tripped, so a caller that swallows the error cannot restart
-        // the loop -- the whole inference walk aborts cleanly instead of hanging.
         if (self.infer_overflow) return error.TypeInferenceRecursionLimit;
         self.infer_depth += 1;
         defer self.infer_depth -= 1;
@@ -563,16 +940,9 @@ pub const Inferer = struct {
             },
             .literal => |lit| return switch (lit) {
 
-                // An untyped integer literal adopts an integer `expected` type. Without this,
-                // `let x: long = 1 << 40` (or `1000000 * 1000000`) types the literals as `int`, computes the
-                // whole expression in 32 bits, and overflows BEFORE the widening to `long` -- silent wrong
-                // values. Only integer expected types apply; a non-integer context falls back to `int`.
                 .integer => {
                     if (expected) |exp| {
                         const et = self.store.get(exp);
-                        // Only WIDEN (>= 32 bits: int/uint/long/ulong). Adopting a narrower expected type
-                        // (short/byte) would collide with the explicit-narrowing rule (F3 §6); a bare
-                        // literal keeps defaulting to `int` there.
                         if (et == .prim and et.prim.kind == .int and et.prim.bits >= 32) return self.ok(exp);
                     }
                     return self.ok(try self.store.intT());
@@ -623,8 +993,6 @@ pub const Inferer = struct {
                 if (self.isFatalUnresolvedIdent(name)) {
                     self.fatal_unresolved_idents += 1;
                     if (self.first_fatal_ident == null) self.first_fatal_ident = name;
-                    // Prefer the first ident that actually carries a source location (line > 0);
-                    // synthesized idents have the default unset span.
                     if (self.first_fatal_span == null and e.span.line > 0) {
                         self.first_fatal_span = e.span;
                         self.first_fatal_ident = name;
@@ -651,10 +1019,6 @@ pub const Inferer = struct {
                             self.const_reassign_errors.append(self.allocator, .{ .span = b.span, .name = b.left.kind.ident }) catch {};
                         }
                         const at = try self.inferExpr(b.right);
-                        // L2/C-chk-6 part 3: reassigning a narrowed variable to a possibly-`undefined` value
-                        // invalidates the narrowing, so a later plain use of it is caught (before, the stale
-                        // narrowing let the reassigned optional be read as present -> crash). Targeted: only
-                        // when the RHS is optional and the current binding is not, so no broad flow change.
                         if (b.left.kind == .ident and self.store.get(at) == .optional and self.store.get(lt) != .optional) {
                             self.rebind(b.left.kind.ident, at);
                         }
@@ -669,11 +1033,6 @@ pub const Inferer = struct {
                     else => {},
                 }
 
-                // Arithmetic / bitwise / shift. An integer `expected` type propagates into the operands so an
-                // all-literal expression is computed at the target width (`let x: long = 1 << 40` runs in 64
-                // bits, not 32-then-widen). The shift AMOUNT is left as-is (a widened count would fight the
-                // value width), and the result takes the WIDER of the two operand integer types so a single
-                // widened literal lifts the whole expression.
                 const int_expected: ?TypeId = blk: {
                     const exp = expected orelse break :blk null;
                     const et = self.store.get(exp);
@@ -746,7 +1105,7 @@ pub const Inferer = struct {
                 for (c.args, 0..) |*a, i| {
                     const exp: ?TypeId = if (want) |w| (if (i < w.len) w[i] else null) else null;
                     const at = try self.inferExprExpecting(a, exp);
-                    if (exp) |pe| self.checkPlainTarget(a.span, pe, at, "passed as an argument to a parameter of type"); // L2/C-chk-6
+                    if (exp) |pe| self.checkPlainTarget(a.span, pe, at, "passed as an argument to a parameter of type");
                     try arg_types.append(self.allocator, at);
                 }
                 if (c.callee.kind == .ident) {
@@ -769,7 +1128,7 @@ pub const Inferer = struct {
                                 if (self.ir) |ir| try ir.recordSym(self.allocator, &e, sid);
                             }
                             const fd = sym.decl.function;
-                            self.warnIfDeprecated(fd, c.span); // FR-safety-6
+                            self.warnIfDeprecated(fd, c.span);
                             if (fd.ret_type) |r| {
 
                                 if (fd.type_params.len > 0) {
@@ -807,10 +1166,6 @@ pub const Inferer = struct {
                     }
 
                     if (try self.staticMethodReturn(fa)) |t| return self.ok(t);
-                    // F1-7: every resolution path above failed. If the receiver is a KNOWN MODULE and the
-                    // module has no such function, this is a genuinely unresolved qualified call — the
-                    // confident subset of codegen's MethodOrFunctionNotFound, so reject it here (located)
-                    // before codegen. Value/struct method calls stay with codegen (generics/traits).
                     if (fa.object.kind == .ident) {
                         const recv = fa.object.kind.ident;
                         if (self.lookup(recv) == null and self.isKnownModule(recv) and
@@ -865,13 +1220,6 @@ pub const Inferer = struct {
                     }
                 }
 
-                // Module-qualified constant: `module.CONST`. The object is a module
-                // reference (an ident with no local binding) and the field names a
-                // `pub const`. Resolve to the constant's declared type. Without this the
-                // access stays `unresolved`, so downstream `+` dispatch and codegen guess
-                // it as an int: `mod.STR + x` renders the string POINTER as a decimal, and
-                // `mod.A + mod.B` becomes a numeric add of two pointers -> a wild pointer
-                // stored as a string -> heap corruption on the later ARC free.
                 if (fa.object.kind == .ident and self.lookup(fa.object.kind.ident) == null) {
                     if (try self.constType(fa.field)) |t| return self.ok(t);
                 }
@@ -948,10 +1296,6 @@ pub const Inferer = struct {
 
                 const decl_sid = self.symtab.findTypeInModule(si.type_name, self.current_module);
 
-                // The struct's type parameters, so we can recover the instantiation (`Cell<int>`) from the
-                // field values. A generic struct init previously interned with NO args, so any `T`-typed
-                // field or method return stayed an erased type-param -- interpolating such a value then
-                // stringified a raw int as a pointer and SEGV'd (B5).
                 var type_params: []const []const u8 = &.{};
                 if (decl_sid) |sid| {
                     const sym = self.symtab.symbolAt(sid);
@@ -970,8 +1314,6 @@ pub const Inferer = struct {
                             for (sym.decl.struct_.fields) |sf| {
                                 if (std.mem.eql(u8, sf.name, f.name)) {
                                     expected_field = self.lowerer.lower(sf.type_name) catch null;
-                                    // Lower the declared field type in the struct's param scope so `T`
-                                    // becomes a type-param we can solve against the actual value type.
                                     if (type_params.len > 0) {
                                         const saved = self.lowerer.param_scopes;
                                         const scopes = [_]lower.ParamScope{.{ .owner = sid, .names = type_params }};
@@ -1010,14 +1352,6 @@ pub const Inferer = struct {
 
                     .string => return self.ok(try self.store.intT()),
                     .array => |a| return self.ok(a.elem),
-                    // A tuple index must be a compile-time-constant integer literal (tuples are
-                    // heterogeneous, so the element type depends on the exact index). `t[0]` and the
-                    // `t.0` desugar both land here. Resolve NON-PRIMITIVE elements (structs/strings/enums
-                    // that need field or method access) so `t[0].x` type-checks instead of failing as
-                    // "unknown struct type". A PRIMITIVE element (int/bool) is deliberately left unresolved
-                    // to preserve the existing raw-64-bit-word read of scalar tuple slots (case 358); fixing
-                    // that scalar-width inconsistency is a separate language-semantics change with an
-                    // optimiser emit-path differential, out of scope for the struct value-semantics work.
                     .tuple => |elems| {
                         if (ix.index.kind == .literal and ix.index.kind.literal == .integer) {
                             const n = ix.index.kind.literal.integer;
@@ -1066,13 +1400,6 @@ pub const Inferer = struct {
             },
             .closure => |cl| {
 
-                // A closure whose param types cannot be pinned from its body alone (e.g.
-                // `(a, b) => a + b`, where both params are only used with each other) infers as
-                // unresolved on the first pass. closureSecondPass then re-infers it from a call
-                // site's argument types and records the resolved `.func` type. On a re-inference
-                // with no expected type, reuse that cached resolution instead of recomputing to
-                // unresolved again — otherwise the call site (and any local bound to its result)
-                // stays untyped, and a later `${r}` picks the wrong stringifier and crashes.
                 if (expected == null) {
                     if (self.ir) |ir| {
                         if (ir.typeOf(&e)) |cached| {
@@ -1157,9 +1484,6 @@ pub const Inferer = struct {
                 const it = try self.inferExpr(inner);
                 const ity = self.store.get(it);
                 if (ity == .error_union) {
-                    // `try` re-raises the callee's error UNCHANGED into the enclosing function, so that
-                    // error must match the function's declared error type (G5). Only flag when both are
-                    // resolved error unions with genuinely different error types.
                     if (self.current_ret) |rt| {
                         const rty = self.store.get(rt);
                         if (rty == .error_union and !self.errorTypesCompatible(ity.error_union.err, rty.error_union.err)) {
@@ -1183,8 +1507,6 @@ pub const Inferer = struct {
                 if (ity == .error_union) {
                     if (ce.err_name) |n| try self.bind(n, ity.error_union.err);
                     const ok_ty = ity.error_union.ok;
-                    // The catch yields the ok type, so the handler value must match it. Infer the
-                    // handler with the ok type expected, then verify they unify.
                     const ht = try self.inferExprExpecting(ce.handler, ok_ty);
                     if (!self.catchArmsCompatible(ok_ty, ht)) {
                         const sp = if (ce.handler.span.line > 0) ce.handler.span else ce.expr.span;
@@ -1229,9 +1551,6 @@ pub const Inferer = struct {
                             return self.ok(try self.store.voidT());
                         }
                     }
-                    // FR-mem: the mem byte/bit builtins. mem.load<T>/rotl<T>/rotr<T>/bswap<T> return T;
-                    // mem.ctz<T>/clz<T> return int; mem.store<T> returns void. All take T as the single
-                    // type argument and lower to one or two LLVM instructions in codegen.
                     if (sfa.object.kind == .ident and std.mem.eql(u8, sfa.object.kind.ident, "mem") and g.type_args.len == 1) {
                         for (g.args) |*a| _ = try self.inferExpr(a);
                         if (std.mem.eql(u8, sfa.field, "load") or std.mem.eql(u8, sfa.field, "rotl") or
@@ -1333,18 +1652,19 @@ pub const Inferer = struct {
                 return self.unresolved("enum_init");
             },
             .jsx_element => |jsx| {
-                // An NSX element lowers to a StringBuilder-built `string` (see compileJsxElement). Infer
-                // it as `string` so it composes like any other string: as a `+` operand, a `{expr}` child,
-                // or a string-typed argument. Recurse into attribute/child expressions so their own types
-                // resolve (and any nested elements get walked).
                 try self.inferJsxElement(&jsx);
                 return self.ok(try self.store.stringT());
             },
         }
     }
 
-    // Walk an NSX element's attribute-value and child expressions (recursing into nested elements and
-    // child statements) so every embedded `{expr}` is type-inferred. The element itself is `string`.
+    /// Walks a JSX element for its side effects only: types every attribute's
+    /// expression value and recurses into child elements, expressions, and
+    /// embedded statements.
+    ///
+    /// The element itself is typed as `string` by the caller (JSX lowers to
+    /// string output), so this returns nothing; it exists to make the embedded
+    /// expressions typed and recorded.
     fn inferJsxElement(self: *Inferer, jsx: *const ast.JsxElement) anyerror!void {
         for (jsx.attributes) |*attr| {
             switch (attr.value) {
@@ -1362,6 +1682,10 @@ pub const Inferer = struct {
         }
     }
 
+    /// Builds the `func` type of a free function declaration by lowering its
+    /// parameter and return type refs. An untyped parameter lowers to
+    /// `unresolved`; a missing return type is `void`. Used when a function is
+    /// referenced as a first-class value.
     fn fnType(self: *Inferer, f: *const ast.FunctionDecl) !TypeId {
         const params = try self.allocator.alloc(TypeId, f.params.len);
         defer self.allocator.free(params);
@@ -1372,6 +1696,13 @@ pub const Inferer = struct {
         return self.store.intern(.{ .func = .{ .params = params, .ret = ret } });
     }
 
+    /// Lowers a type ref that appears inside a struct, resolving the struct's
+    /// type parameters to the receiver's concrete arguments.
+    ///
+    /// Temporarily installs the struct's params as the lowerer's param scope
+    /// (restored via `defer`), lowers `tr` to a possibly param-bearing type,
+    /// then substitutes the receiver's `st.args` for those params. This is how
+    /// `List<string>`'s field/return `T` becomes `string`.
     fn lowerInStructScope(self: *Inferer, st: types.StructType, tr: ast.TypeRef) !TypeId {
         const sym = self.symtab.symbolAt(st.decl);
         const saved = self.lowerer.param_scopes;
@@ -1385,6 +1716,14 @@ pub const Inferer = struct {
         return try subst.substitute(self.store, raw, st.decl, st.args);
     }
 
+    /// Lowers a type ref inside a METHOD, with BOTH the struct's type params and
+    /// the method's own type params in scope.
+    ///
+    /// Installs a two-level param scope (struct first, then method) so a ref can
+    /// mention either. After lowering it substitutes only the STRUCT's args; the
+    /// method's own params are solved and substituted later by the caller (see
+    /// [`Inferer.methodReturn`]). Like [`Inferer.lowerInStructScope`] but for
+    /// generic methods on generic structs.
     fn lowerInMethodScope(
         self: *Inferer,
         st: types.StructType,
@@ -1405,6 +1744,17 @@ pub const Inferer = struct {
         return try subst.substitute(self.store, raw, st.decl, st.args);
     }
 
+    /// Computes the concrete return type of a generic FREE function call by
+    /// solving its type params from the actual argument types.
+    ///
+    /// For each declared parameter it matches the declared (param-bearing) type
+    /// against the actual argument type to solve params, then substitutes every
+    /// solved param out of the return type. When every param solved to a fully
+    /// concrete type (and enough args were supplied), it registers the concrete
+    /// instantiation with [`mono.noteFreeFnInst`] and records the solved args
+    /// into the IR for `call_expr`, so the emitter specialises exactly this
+    /// call. Returns the (partly or fully) substituted return type; it may
+    /// still be `unresolved` if inference under-determined the params.
     fn freeFnReturn(
         self: *Inferer,
         fid: types.SymbolId,
@@ -1438,10 +1788,6 @@ pub const Inferer = struct {
             out = try subst.substituteOne(self.store, out, fid, @intCast(i), bound);
         }
 
-        // B1: register the INFERRED instantiation so codegen emits `fn__T` for a bare call `fn(x)`
-        // (the explicit `fn<T>(x)` path already does this at the .generic_call site). Only when every
-        // type parameter solved to a concrete type -- a still-abstract type_param arg would poison the
-        // monomorphised name and is handled by the enclosing generic's own instantiation instead.
         if (fd.type_params.len > 0 and arg_types.len >= fd.params.len) {
             var all_concrete = true;
             const solved_args = self.allocator.alloc(TypeId, solved.len) catch return out;
@@ -1461,9 +1807,6 @@ pub const Inferer = struct {
             }
             if (all_concrete) {
                 _ = mono.noteFreeFnInst(self.allocator, self.store, fd.name, fid, fd.type_params, solved_args);
-                // Record the SOLVED concrete type args on the call expression so codegen can rebuild the
-                // monomorphised name `fn__T` for a bare `fn(x)` call (no explicit `<T>` to mangle from).
-                // Reuses the same per-expression side table method calls use.
                 if (self.ir) |ir| ir.recordMethodArgs(self.allocator, call_expr, solved_args) catch {};
             }
         }
@@ -1471,12 +1814,24 @@ pub const Inferer = struct {
         return out;
     }
 
+    /// Records an [`OptDerefError`] for reaching through an optional/error-union
+    /// without unwrapping. Honours the `NOVA_OPT_AUDIT` env var to also print
+    /// the site to stderr for debugging where see-throughs occur.
     fn recordOptDeref(self: *Inferer, fa: ast.FieldAccess, is_method: bool, kind: OptDerefKind) void {
         if (std.c.getenv("NOVA_OPT_AUDIT") != null)
             std.debug.print("OPT-SEETHROUGH {s} {s}:{d}:{d} .{s}\n", .{ if (is_method) "method" else "field", fa.span.file, fa.span.line, fa.span.col, fa.field });
         self.optional_deref_errors.append(self.allocator, .{ .span = fa.span, .field = fa.field, .is_method = is_method, .kind = kind }) catch {};
     }
 
+    /// Types a struct field access `obj.field`, or null if it is not a struct
+    /// field.
+    ///
+    /// If the object is an optional or error union it records a see-through
+    /// diagnostic ([`Inferer.recordOptDeref`]) and returns null rather than
+    /// piercing the wrapper. On a struct it lowers the matching field's type in
+    /// the receiver's scope so generic fields resolve. The `stats.typed -|= 1`
+    /// undoes the object's own typing bump, since the object was only visited to
+    /// reach the field.
     fn fieldType(self: *Inferer, fa: ast.FieldAccess) !?TypeId {
         const obj = try self.inferExpr(fa.object);
 
@@ -1504,6 +1859,9 @@ pub const Inferer = struct {
         return null;
     }
 
+    /// If `fa`'s object is a bare identifier that names an imported or
+    /// segment-addressable module (and is NOT a local binding), returns that
+    /// module id; otherwise null. Distinguishes `mymod.foo` from `localVar.foo`.
     fn moduleOfObject(self: *Inferer, fa: ast.FieldAccess) ?symbols.ModuleId {
         if (fa.object.kind != .ident) return null;
         const name = fa.object.kind.ident;
@@ -1515,6 +1873,15 @@ pub const Inferer = struct {
         return self.symtab.findModuleBySegment(name);
     }
 
+    /// Resolves the type of a named module-level constant by inferring its
+    /// initialiser expression, or null if there is no such const or it is
+    /// unresolved.
+    ///
+    /// Guards against const-to-const cycles with a depth cap
+    /// ([`Inferer.const_depth`], limit 8). It also records a visibility error if
+    /// the const is private to another module, de-duplicating against the last
+    /// recorded one. The typed-stat delta from inferring the initialiser is
+    /// rolled back so counting a const's body does not inflate coverage.
     fn constType(self: *Inferer, name: []const u8) !?TypeId {
         if (self.const_depth > 8) return null;
         for (self.symtab.symbols.items) |sym| {
@@ -1543,15 +1910,22 @@ pub const Inferer = struct {
         return null;
     }
 
+    /// Types the built-in `.length`/`.len` property on strings and arrays as
+    /// `int`, or null for any other field or receiver. Lets `s.length` and
+    /// `arr.len` work without a declared field.
     fn stringProperty(self: *Inferer, fa: ast.FieldAccess) !?TypeId {
         if (!std.mem.eql(u8, fa.field, "length") and !std.mem.eql(u8, fa.field, "len")) return null;
         const obj = try self.inferExpr(fa.object);
         self.stats.typed -|= 1;
         const k = self.store.get(obj);
-        if (k != .string and k != .array) return null;   // .length/.len: string byte count OR array element count
+        if (k != .string and k != .array) return null;
         return try self.store.intT();
     }
 
+    /// Types a call on a builtin RECEIVER (e.g. `bytes.foo(...)`,
+    /// `console.log(...)`) by looking the method up in the [`builtins`] table,
+    /// or null if the receiver is a local binding or not a known builtin. Only
+    /// applies when the receiver is a bare ident that is not shadowed locally.
     fn builtinCallReturn(self: *Inferer, fa: ast.FieldAccess) !?TypeId {
         if (fa.object.kind != .ident) return null;
         const recv = fa.object.kind.ident;
@@ -1561,6 +1935,12 @@ pub const Inferer = struct {
         return try builtins.retType(self.store, b.ret);
     }
 
+    /// Records a [`VisError`] of kind `.type_` if `name` names a type private to
+    /// another module used from the current one.
+    ///
+    /// Skips synthetic spans (file starting with `<`, e.g. generated code) and
+    /// de-duplicates against the immediately preceding error at the same
+    /// location. A public type, or one in the current module, is fine.
     fn recordTypeVis(self: *Inferer, name: []const u8, span: ast.Span) void {
 
         if (span.file.len > 0 and span.file[0] == '<') return;
@@ -1576,6 +1956,10 @@ pub const Inferer = struct {
         self.visibility_errors.append(self.allocator, .{ .span = span, .recv = "", .field = name, .kind = .type_ }) catch {};
     }
 
+    /// Recursively checks a type reference (and every type it mentions, through
+    /// optionals, error unions, arrays, generics, function types, and tuples)
+    /// for cross-module visibility violations via [`Inferer.recordTypeVis`].
+    /// Used on declared types at let bindings.
     fn checkTypeRefVis(self: *Inferer, tr: ast.TypeRef, span: ast.Span) void {
         switch (tr) {
             .ident => |name| self.recordTypeVis(name, span),
@@ -1597,6 +1981,12 @@ pub const Inferer = struct {
         }
     }
 
+    /// Resolves `recv.field` to a function symbol, treating `recv` as a module
+    /// name (imported alias first, then a bare segment), or null.
+    ///
+    /// On a hit it records a visibility diagnostic if the target function is
+    /// private to another module (via [`Inferer.recordFnVisibility`]). This is
+    /// the module-function counterpart to method resolution.
     fn resolveModuleFn(self: *Inferer, recv: []const u8, field: []const u8, span: ast.Span) ?types.SymbolId {
         if (self.current_module) |cm| {
             if (self.symtab.resolveImportedModule(cm, recv)) |mid| {
@@ -1614,6 +2004,9 @@ pub const Inferer = struct {
         return null;
     }
 
+    /// Records a function-visibility [`VisError`] if `sid` is private to another
+    /// module. De-duplicates against the previous error at the same span.
+    /// Helper for [`Inferer.resolveModuleFn`].
     fn recordFnVisibility(self: *Inferer, sid: types.SymbolId, cm: symbols.ModuleId, recv: []const u8, field: []const u8, span: ast.Span) void {
         const sym = self.symtab.symbolAt(sid);
         if (sym.module == cm or sym.visibility == .public) return;
@@ -1624,6 +2017,15 @@ pub const Inferer = struct {
         if (!dup) self.visibility_errors.append(self.allocator, .{ .span = span, .recv = recv, .field = field }) catch {};
     }
 
+    /// Whether an unresolved identifier should be treated as a hard compile
+    /// error rather than a tolerable miss.
+    ///
+    /// Returns false (non-fatal) for a curated set that legitimately fails local
+    /// resolution: `self`, runtime intrinsics (`nova_*`), the magic receivers
+    /// (`bytes`/`console`/`sync`/`atomic`), builtin receivers and types, and any
+    /// name that resolves to a known module. Anything else is a genuine
+    /// undefined name and returns true, feeding
+    /// [`Inferer.fatal_unresolved_idents`].
     fn isFatalUnresolvedIdent(self: *Inferer, name: []const u8) bool {
         if (std.mem.eql(u8, name, "self")) return false;
 
@@ -1645,6 +2047,9 @@ pub const Inferer = struct {
         return true;
     }
 
+    /// Whether `name` refers to any known module (imported alias, import name,
+    /// or bare segment). Used to decide that `name.field()` is a module call so
+    /// a missing function there is fatal.
     fn isKnownModule(self: *Inferer, name: []const u8) bool {
         if (self.current_module) |cm| {
             if (self.symtab.resolveImportedModule(cm, name) != null) return true;
@@ -1654,6 +2059,13 @@ pub const Inferer = struct {
         return false;
     }
 
+    /// Types a module function call `mod.fn(...)`, writing the resolved symbol to
+    /// `out_sym`, or null if the receiver is not a module or names no function.
+    ///
+    /// Lowers the function's return type in the TARGET module's scope (saving
+    /// and restoring the lowerer's module), so types named relative to the
+    /// callee's module resolve correctly. A void-returning function yields the
+    /// void type; an unresolved return yields null.
     fn moduleCallReturn(self: *Inferer, fa: ast.FieldAccess, out_sym: *?types.SymbolId) !?TypeId {
         if (fa.object.kind != .ident) return null;
         const recv = fa.object.kind.ident;
@@ -1665,10 +2077,6 @@ pub const Inferer = struct {
 
         out_sym.* = sid;
         if (sym.decl.function.ret_type) |r| {
-            // Lower the return type in the CALLEE's module scope, not the caller's. A bare type name in
-            // the signature (e.g. `Rec`) must bind to the module that DECLARED the function -- otherwise,
-            // when the caller also imports a same-named type, the return value is mistyped to the caller's
-            // version and later field access reads the wrong layout (S2). Save/restore the module context.
             const saved_mod = self.lowerer.current_module;
             self.lowerer.current_module = sym.module;
             defer self.lowerer.current_module = saved_mod;
@@ -1679,6 +2087,9 @@ pub const Inferer = struct {
         return try self.store.voidT();
     }
 
+    /// Types a module function referenced as a VALUE (`mod.fn` without calling
+    /// it) as its `func` type, or null. The value-position counterpart to
+    /// [`Inferer.moduleCallReturn`].
     fn moduleFnValue(self: *Inferer, fa: ast.FieldAccess) !?TypeId {
         if (fa.object.kind != .ident) return null;
         const recv = fa.object.kind.ident;
@@ -1689,6 +2100,12 @@ pub const Inferer = struct {
         return try self.fnType(sym.decl.function);
     }
 
+    /// Types a static method call `Type.method(...)` (receiver is a type name,
+    /// not an instance) as the method's lowered return type, or null.
+    ///
+    /// Resolves the method in the TYPE's own module so a static defined
+    /// alongside the type is found regardless of the current module. A missing
+    /// return type yields void; an unresolved one yields null.
     fn staticMethodReturn(self: *Inferer, fa: ast.FieldAccess) !?TypeId {
 
         const type_name = switch (fa.object.kind) {
@@ -1708,6 +2125,20 @@ pub const Inferer = struct {
         return lowered;
     }
 
+    /// Types an INSTANCE method call `recv.method(args)`, writing the resolved
+    /// symbol to `out_sym`, or null if the receiver is not a struct/enum/trait
+    /// with such a method.
+    ///
+    /// The workhorse of method typing, handling several receiver shapes: an
+    /// optional/error-union receiver records a see-through and returns null; a
+    /// trait receiver dispatches to [`Inferer.traitMethodReturn`]; a `storage`
+    /// receiver special-cases `get`/`set`; enum and struct receivers resolve the
+    /// method in the owner's module, check arity, and lower the return in the
+    /// method scope. For a GENERIC method it also solves the method's type
+    /// params from the argument types, substitutes them out of the return type,
+    /// and (when fully concrete) registers the instantiation with [`mono`] and
+    /// records the solved args into the IR. Returns null on an unresolved
+    /// result. `stats.typed -|= 1` undoes the receiver's typing bump.
     fn methodReturn(self: *Inferer, fa: ast.FieldAccess, args: []const ast.Expression, out_sym: *?types.SymbolId, call_ep: *const ast.Expression) !?TypeId {
         const obj = try self.inferExpr(fa.object);
         self.stats.typed -|= 1;
@@ -1817,6 +2248,16 @@ pub const Inferer = struct {
         return out;
     }
 
+    /// Types a generic method call with EXPLICIT type arguments
+    /// (`recv.method<T>(args)`) by substituting the given `type_args` into the
+    /// return type, or null.
+    ///
+    /// Unlike [`Inferer.methodReturn`], the type params are supplied directly
+    /// rather than solved from arguments, so it only applies when the count of
+    /// type args matches the method's type-param count. It still types the
+    /// arguments (with the declared param types as hints) and, when the args are
+    /// fully concrete, registers the instantiation with [`mono`]. Peels one
+    /// optional layer off the receiver before requiring a struct.
     fn explicitMethodReturn(
         self: *Inferer,
         fa: ast.FieldAccess,
@@ -1873,6 +2314,12 @@ pub const Inferer = struct {
         return out;
     }
 
+    /// Walks one branch of an `if`, applying optional narrowing inside it.
+    ///
+    /// If `narrow` applies to this branch (`when_true == is_then`) and the named
+    /// binding is currently an optional, it pushes a scoped shadow binding of
+    /// the UNWRAPPED type for the duration of the branch, so `s.field` typechecks
+    /// where `s` is known present. Otherwise the branch is walked unchanged.
     fn narrowedBranch(self: *Inferer, narrow: ?Narrowing, is_then: bool, branch: *const ast.Statement) anyerror!void {
         const n = narrow orelse return self.inferStmt(branch);
         if (n.when_true != is_then) return self.inferStmt(branch);
@@ -1885,6 +2332,13 @@ pub const Inferer = struct {
         try self.inferStmt(branch);
     }
 
+    /// Computes the declared parameter types of a call's callee (a free function
+    /// or a method), so arguments can be typed WITH an expected type. Returns an
+    /// owned slice (caller frees) or null when the callee cannot be resolved.
+    ///
+    /// For a method it types the receiver quietly (via
+    /// [`Inferer.typeOfObjectQuietly`], no IR side effects) to find the owning
+    /// struct and lowers the params in its scope.
     fn calleeParamTypes(self: *Inferer, callee: *const ast.Expression) !?[]TypeId {
         switch (callee.kind) {
             .ident => |n| {
@@ -1908,6 +2362,13 @@ pub const Inferer = struct {
         }
     }
 
+    /// Lowers a function's parameter types into an owned slice, skipping an
+    /// implicit `self`, resolving generics in the receiver's scope when `recv`
+    /// is given.
+    ///
+    /// An untyped parameter becomes `unresolved`. Caller owns and frees the
+    /// returned slice. Shared by [`Inferer.calleeParamTypes`] and
+    /// [`Inferer.explicitMethodReturn`].
     fn paramTypesOf(self: *Inferer, fd: *const ast.FunctionDecl, recv: ?types.StructType) !?[]TypeId {
         var out = std.ArrayListUnmanaged(TypeId).empty;
         errdefer out.deinit(self.allocator);
@@ -1926,6 +2387,13 @@ pub const Inferer = struct {
         return try out.toOwnedSlice(self.allocator);
     }
 
+    /// Resolves the type of a receiver expression WITHOUT running full inference
+    /// or touching stats/IR: handles a plain binding and a chain of struct field
+    /// accesses only.
+    ///
+    /// Used where knowing the receiver type must not have side effects (e.g.
+    /// pre-computing param-type hints in [`Inferer.calleeParamTypes`]). Returns
+    /// null for anything more complex than ident/field-chain.
     fn typeOfObjectQuietly(self: *Inferer, obj: *const ast.Expression) ?TypeId {
         switch (obj.kind) {
             .ident => |n| return self.lookup(n),
@@ -1946,6 +2414,10 @@ pub const Inferer = struct {
         }
     }
 
+    /// Types a method call on a TRAIT-object receiver as the declared return
+    /// type of the matching trait method, or null if the trait has no such
+    /// method. A method with no declared return is void. Feeds the trait arm of
+    /// [`Inferer.methodReturn`].
     fn traitMethodReturn(self: *Inferer, tid: types.SymbolId, field: []const u8) !?TypeId {
         const sym = self.symtab.symbolAt(tid);
         if (sym.decl != .trait_) return null;
@@ -1959,6 +2431,12 @@ pub const Inferer = struct {
         return null;
     }
 
+    /// Attempts to infer a closure parameter's type from how it is USED in the
+    /// closure body, when no expected type pinned it down.
+    ///
+    /// Only an expression-bodied closure is analysed; a block body returns null
+    /// (too complex to walk usefully here). Delegates to
+    /// [`Inferer.paramFromUseExpr`].
     fn paramFromUse(self: *Inferer, param: []const u8, body: ast.ClosureBody) anyerror!?TypeId {
         return switch (body) {
             .expr => |e| try self.paramFromUseExpr(param, e),
@@ -1967,6 +2445,14 @@ pub const Inferer = struct {
         };
     }
 
+    /// Recursively searches an expression for an arithmetic/bitwise operation
+    /// with `param` on one side and a TYPEABLE other side, returning that other
+    /// side's type as the param's inferred type.
+    ///
+    /// For example in `x + 1`, `x`'s type is inferred as `int` from the literal.
+    /// Non-arithmetic binary ops just recurse into both sides. The other side is
+    /// typed quietly (no IR/stats effect). Returns null if nothing constrains
+    /// the param.
     fn paramFromUseExpr(self: *Inferer, param: []const u8, e: *const ast.Expression) anyerror!?TypeId {
         switch (e.kind) {
             .binary => |b| {
@@ -1993,12 +2479,17 @@ pub const Inferer = struct {
         }
     }
 
+    /// Infers an expression's type as a pure PROBE, leaving no trace: it nulls
+    /// the IR and saves/restores the stats and every fatal-miss counter around
+    /// the walk.
+    ///
+    /// This lets speculative typing (param-from-use, look-ahead argument typing)
+    /// discover a type without recording results or wrongly incrementing the
+    /// fatal-error counters that would fail the build. The full set of saved
+    /// fields is why it is a method and not a one-liner.
     fn inferExprQuietly(self: *Inferer, e: *const ast.Expression, expected: ?TypeId) anyerror!TypeId {
         const saved_ir = self.ir;
         const saved = self.stats.typed;
-        // A quiet inference must not leak diagnostics. It is used for look-ahead (e.g. typing a
-        // call's arguments before the surrounding locals are bound), so an "undefined identifier"
-        // it hits is not a real error — snapshot and restore the fatal-diagnostic counters too.
         const saved_fatal_idents = self.fatal_unresolved_idents;
         const saved_first_ident = self.first_fatal_ident;
         const saved_first_span = self.first_fatal_span;
@@ -2021,12 +2512,22 @@ pub const Inferer = struct {
         return self.inferExprInner(e.*, expected);
     }
 
+    /// Walks a block in its own lexical scope: pushes a scope, infers the
+    /// statement sequence, then pops. The scoping entry point for `{ ... }`.
     pub fn inferBlock(self: *Inferer, b: *const ast.Block) anyerror!void {
         try self.push();
         defer self.pop();
         try self.inferStmtSeq(b.statements);
     }
 
+    /// Walks a statement sequence, applying EARLY-EXIT narrowing to the tail.
+    ///
+    /// After each statement it checks [`earlyExitNarrowing`]: if an
+    /// `if (x == undefined) return;`-style guard proves `x` present, it pushes a
+    /// scoped shadow binding of the unwrapped type and recurses on the REMAINING
+    /// statements, so the rest of the block sees the narrowed type. Tracks
+    /// `current_stmt_seq` so closure look-ahead can find later calls in the same
+    /// sequence.
     pub fn inferStmtSeq(self: *Inferer, statements: []ast.Statement) anyerror!void {
         const saved_seq = self.current_stmt_seq;
         self.current_stmt_seq = statements;
@@ -2048,6 +2549,15 @@ pub const Inferer = struct {
         }
     }
 
+    /// Walks a single statement, binding new names and typing sub-expressions.
+    ///
+    /// Handles let bindings (including declared-type checking, tuple
+    /// destructuring, closure-expectation shaping, and same-name const-checks),
+    /// `if`/`while`/`for` (with narrowing on the guard and loop-variable
+    /// binding), `switch` (binding enum-payload names per case), and `return`
+    /// (checking optional-in-plain-return and capturing the return type for
+    /// later inference). Conditions are validated for bool-ness via
+    /// [`Inferer.checkCond`].
     pub fn inferStmt(self: *Inferer, sp: *const ast.Statement) anyerror!void {
         switch (sp.*) {
             .block => |*b| try self.inferBlock(b),
@@ -2059,14 +2569,9 @@ pub const Inferer = struct {
 
                     if (ls.init) |*i| {
                         const it = try self.inferExprExpecting(i, t);
-                        self.checkPlainTarget(i.span, t, it, "assigned to a variable of type"); // L2/C-chk-6
+                        self.checkPlainTarget(i.span, t, it, "assigned to a variable of type");
                     }
                 } else if (ls.init) |*i| {
-                    // A closure whose param types cannot be pinned from its body alone (e.g.
-                    // `let add = (a, b) => a + b`) infers as unresolved on its own. Look ahead to a
-                    // call site `name(args)` in this block and use the argument types as the
-                    // closure's expected param types, so the closure and any local holding its
-                    // result are typed correctly on the first pass.
                     if (i.kind == .closure and i.kind.closure.params.len > 0 and ls.names == null) {
                         if (try self.closureCallExpectation(ls.name, i.kind.closure.params.len)) |exp| {
                             t = try self.inferExprExpecting(i, exp);
@@ -2146,8 +2651,6 @@ pub const Inferer = struct {
                 if (r.value) |*v| {
                     const rt = try self.inferExprExpecting(v, self.current_ret);
 
-                    // A1 (C-chk-3): returning an optional where a plain non-optional is declared. `rt` is the
-                    // value's type AFTER narrowing, so a guarded `return x` is already non-optional and safe.
                     if (self.current_ret) |crt| {
                         const rtk = self.store.get(rt);
                         const crtk = self.store.get(crt);
@@ -2166,9 +2669,13 @@ pub const Inferer = struct {
         }
     }
 
-    // L2 (C-chk-6): flag a possibly-`undefined` value (`got` == optional, post-narrowing) used where a plain
-    // non-optional type (`want`) is required, at a let-binding or call-argument position. Fail-closed only
-    // on a resolved plain want and a resolved optional got, so unresolved/generic positions never false-fire.
+    /// Flags a [`ValoptPosError`] when a value-OPTIONAL is supplied to a
+    /// position that requires a PLAIN type (a typed let binding or a typed
+    /// parameter).
+    ///
+    /// "Plain" excludes optionals, unresolved, `any`, error unions, and type
+    /// params, i.e. targets where an optional would be an outright type error.
+    /// `ctx` describes the position for the message.
     fn checkPlainTarget(self: *Inferer, span: ast.Span, want: TypeId, got: TypeId, ctx: []const u8) void {
         const wk = self.store.get(want);
         const plain = wk != .optional and wk != .unresolved and wk != .any_ and wk != .error_union and wk != .type_param;
@@ -2177,9 +2684,9 @@ pub const Inferer = struct {
         }
     }
 
-    // A1 (C-chk-4): a control-flow condition must be a `bool`. Infer it (so its subexpressions are still typed
-    // and any narrowing bindings are computed by the caller), then reject a resolved non-bool. `.unresolved` is
-    // exempt so the incomplete inferrer does not raise false positives on expressions it cannot type.
+    /// Types a condition expression and records a [`CondTypeError`] if it is a
+    /// known non-bool type. An unresolved condition is left alone (honesty
+    /// rule). `ctx` names the construct (`"if"`/`"while"`/`"for"`).
     fn checkCond(self: *Inferer, cond: *const ast.Expression, ctx: []const u8) !void {
         const t = try self.inferExpr(cond);
         const ty = self.store.get(t);
@@ -2189,12 +2696,13 @@ pub const Inferer = struct {
         }
     }
 
-    // A1 (C-chk-1): exact method-call arity. `fnp` includes the leading `self`. Two call forms reach here and
-    // pass `self` differently: an INSTANCE call `x.m(a)` passes only the explicit args (self is the receiver,
-    // implicit), whereas a STATIC/UFCS call `Type.m(x, a)` passes the receiver as the FIRST explicit arg (self
-    // is explicit). We detect the static form by the receiver being the bare owner type name and not a bound
-    // local, and count `self` in the expected total there. Nova has no default/variadic params, so this is
-    // exact equality once the form is known.
+    /// Checks a method call's argument count against its declaration, recording
+    /// a [`MethodArityError`] on mismatch.
+    ///
+    /// The subtlety is `self`: a method with a leading `self` param expects one
+    /// FEWER argument when invoked on an instance (`obj.m(a)`), but the FULL
+    /// count when invoked statically through the type name (`Type.m(obj, a)`).
+    /// It detects the static form by the receiver being the type name itself.
     fn checkMethodArity(self: *Inferer, fnp: []const ast.Param, args: []const ast.Expression, fa: ast.FieldAccess, owner_name: []const u8, span: ast.Span) void {
         const has_self = fnp.len > 0 and std.mem.eql(u8, fnp[0].name, "self");
         const self_explicit = fa.object.kind == .ident and
@@ -2207,10 +2715,10 @@ pub const Inferer = struct {
         }
     }
 
-    // FR-safety-6: emit a compile-time WARNING (not an error) at a call site whose callee function carries
-    // `@deprecated`, including the optional suggested replacement. Warnings go to stderr and never fail the
-    // build, which is the whole point: the stdlib can deprecate `parseI64` in favour of `parseLong`, give
-    // users a migration window, then remove it.
+    /// Prints a yellow compiler warning to stderr if the called function
+    /// carries a `@deprecated` attribute, including the optional message. Emits
+    /// at most one warning per call. Does not use `self` (kept as a method for
+    /// call-site symmetry).
     fn warnIfDeprecated(self: *Inferer, fd: *const ast.FunctionDecl, span: ast.Span) void {
         _ = self;
         for (fd.attributes) |attr| {
@@ -2228,6 +2736,14 @@ pub const Inferer = struct {
         }
     }
 
+    /// Binds the payload variables introduced by an enum-pattern switch case, so
+    /// the case body can use them with their declared types.
+    ///
+    /// For a discriminant of enum type, each case value is matched against the
+    /// enum's variants: a call-form pattern (`Variant(x)`) binds a
+    /// single-payload or positional-field payload; a struct-init form
+    /// (`Variant { a, b }`) binds named fields. Non-enum discriminants and
+    /// non-pattern values are ignored.
     fn bindSwitchPayloads(self: *Inferer, disc_t: TypeId, c: *const ast.SwitchCase) anyerror!void {
         const dt = self.store.get(disc_t);
         if (dt != .enum_) return;
@@ -2247,8 +2763,6 @@ pub const Inferer = struct {
                             if (call.args[0].kind != .ident) break;
                             try self.bind(call.args[0].kind.ident, try self.lowerer.lower(payload_ref));
                         } else if (variant.fields) |vfields| {
-                            // Tuple-form multi-payload pattern `Rect(w, h)`: bind each positional binding to
-                            // the matching payload field's type.
                             for (call.args, 0..) |arg, i| {
                                 if (i < vfields.len and arg.kind == .ident) {
                                     try self.bind(arg.kind.ident, try self.lowerer.lower(vfields[i].type_name));
@@ -2281,10 +2795,21 @@ pub const Inferer = struct {
         }
     }
 
+    /// Infers a free function's body (no `self`). The public per-function entry
+    /// point; thin wrapper over [`Inferer.inferFunctionWithSelf`].
     pub fn inferFunction(self: *Inferer, f: *const ast.FunctionDecl) !void {
         return self.inferFunctionWithSelf(null, f);
     }
 
+    /// Infers a function or method body, optionally binding `self` to `self_ty`.
+    ///
+    /// Sets up the per-function context: a fresh scope, the owning module (for
+    /// visibility and name resolution, on both this pass and the lowerer), the
+    /// declared return type (for return/try checks), and the parameter bindings.
+    /// All of that context is saved and restored via `defer` so functions can be
+    /// walked in any order. After the body it runs
+    /// [`Inferer.closureSecondPass`] to re-type closures whose parameter types
+    /// only became knowable from a later call.
     pub fn inferFunctionWithSelf(self: *Inferer, self_ty: ?TypeId, f: *const ast.FunctionDecl) !void {
         try self.push();
         defer self.pop();
@@ -2309,9 +2834,13 @@ pub const Inferer = struct {
         _ = try self.closureSecondPass(&f.body);
     }
 
-    // Recursively search an expression tree for a call `name(args)` with `arity` args, returning
-    // the argument types (quietly inferred). Unlike callArgTypesInExpr this descends into every
-    // sub-expression (templates, binary ops, casts, ...), so it also finds `${name(a, b)}`.
+    /// Deeply searches an expression tree for a call to `name` with `arity`
+    /// arguments and returns those arguments' quietly-inferred types, or null.
+    ///
+    /// This is the look-ahead that lets `let f = (x) => ...; use(f(someInt))`
+    /// infer `x` from how `f` is later CALLED. It recurses through most
+    /// expression shapes. See also [`Inferer.callArgTypesInExpr`], the
+    /// shallower statement-level variant.
     fn callArgTypesDeep(self: *Inferer, e: *const ast.Expression, name: []const u8, arity: usize) anyerror!?[]TypeId {
         switch (e.kind) {
             .call => |call| {
@@ -2358,9 +2887,14 @@ pub const Inferer = struct {
         return null;
     }
 
-    // Look ahead in the current statement block for a call `name(args)` matching `arity`, and if
-    // found with at least one known argument type, return the expected `.func` type (params =
-    // argument types, ret = unresolved). Used to pin a closure's param types on the first pass.
+    /// Builds an EXPECTED function type for a closure bound to `name`, by
+    /// scanning the current statement sequence for a call to `name` and using
+    /// that call's argument types as the closure's parameter types.
+    ///
+    /// Requires at least one argument type to be known (otherwise it keeps
+    /// looking). The return type is left unresolved, to be filled from the
+    /// closure body. This is what makes `let f = (x) => x + 1; g(f(3))` type
+    /// `x` as int at the binding site.
     fn closureCallExpectation(self: *Inferer, name: []const u8, arity: usize) anyerror!?TypeId {
         const stmts = self.current_stmt_seq orelse return null;
         for (stmts) |*s| {
@@ -2383,6 +2917,12 @@ pub const Inferer = struct {
         return null;
     }
 
+    /// Second pass over a function body that re-types closures bound by `let`
+    /// whose parameter types could only be resolved AFTER seeing a later call.
+    ///
+    /// Runs after the forward walk. Returns whether any closure was
+    /// successfully re-typed. Delegates the per-closure work to
+    /// [`Inferer.retypeBoundClosure`].
     fn closureSecondPass(self: *Inferer, fn_body: *const ast.Block) anyerror!bool {
         var retyped_any = false;
         for (fn_body.statements) |*s| {
@@ -2395,6 +2935,14 @@ pub const Inferer = struct {
         return retyped_any;
     }
 
+    /// Re-infers one `let`-bound closure using its parameter types discovered
+    /// from a later call, and returns whether that produced a fully-resolved
+    /// function type.
+    ///
+    /// Short-circuits (returns false) if the closure was already fully typed on
+    /// the first pass, or if no call constrains its params, or if no argument
+    /// type is known. Otherwise it re-runs inference with the discovered
+    /// expected function type. Helper for [`Inferer.closureSecondPass`].
     fn retypeBoundClosure(self: *Inferer, fn_body: *const ast.Block, name: []const u8, cl_init: *const ast.Expression) anyerror!bool {
         const cl = cl_init.kind.closure;
         if (cl.params.len == 0) return false;
@@ -2420,13 +2968,20 @@ pub const Inferer = struct {
 
         const exp = try self.store.intern(.{ .func = .{ .params = arg_types, .ret = try self.store.unresolvedT() } });
         const ct = try self.inferExprExpecting(cl_init, exp);
-        // Only worth a re-inference of the enclosing body if we actually produced a resolved func.
         if (self.store.get(ct) == .func and self.store.get(self.store.get(ct).func.ret) != .unresolved) {
             return true;
         }
         return false;
     }
 
+    /// Searches a whole block (recursing into nested blocks and the bodies of
+    /// `if`/`while`/`for`) for a call to `name` with `arity` args, returning
+    /// those args' quietly-inferred types.
+    ///
+    /// The block-structured counterpart used by the closure SECOND pass, versus
+    /// [`Inferer.closureCallExpectation`]'s flat scan on the first pass.
+    /// Delegates per-statement to [`Inferer.findCallArgTypesStmt`] and
+    /// [`Inferer.callArgTypesInExpr`].
     fn findCallArgTypes(self: *Inferer, block: *const ast.Block, name: []const u8, arity: usize) anyerror!?[]TypeId {
         for (block.statements) |*s| {
             const e: ?*const ast.Expression = switch (s.*) {
@@ -2452,6 +3007,9 @@ pub const Inferer = struct {
         return null;
     }
 
+    /// Searches a single statement for a constraining call to `name`: a block
+    /// recurses via [`Inferer.findCallArgTypes`], otherwise the statement's main
+    /// expression is scanned. Recursion helper for the closure second pass.
     fn findCallArgTypesStmt(self: *Inferer, sp: *const ast.Statement, name: []const u8, arity: usize) anyerror!?[]TypeId {
         if (sp.* == .block) return self.findCallArgTypes(&sp.block, name, arity);
         const e: ?*const ast.Expression = switch (sp.*) {
@@ -2464,6 +3022,12 @@ pub const Inferer = struct {
         return null;
     }
 
+    /// Shallow search of an expression for a direct call to `name` (`arity`
+    /// args), returning those args' quietly-inferred types, else null.
+    ///
+    /// Unlike [`Inferer.callArgTypesDeep`], it only descends into call
+    /// arguments, not the full expression tree; used at statement level in the
+    /// closure second pass.
     fn callArgTypesInExpr(self: *Inferer, ep: *const ast.Expression, name: []const u8, arity: usize) anyerror!?[]TypeId {
         switch (ep.kind) {
             .call => |call| {
@@ -2482,13 +3046,28 @@ pub const Inferer = struct {
     }
 };
 
+/// Shorthand for Zig's test assertions used throughout the unit tests below.
 const testing = std.testing;
 
+/// Test harness bundling the three collaborators an [`Inferer`] needs: a type
+/// store, a symbol table, and a lowerer.
+///
+/// The `low` field is left `undefined` by [`Fixture.init`] because the lowerer
+/// borrows `&store`, whose address is only stable once the fixture is placed in
+/// its final `var`; each test therefore assigns `f.low = lower.Lowerer.init(a,
+/// &f.store)` after construction. [`Fixture.deinit`] tears the three down in
+/// reverse dependency order.
 const Fixture = struct {
+    /// The interned type store under test.
     store: types.TypeStore,
+    /// The symbol table the inferer resolves names against.
     tab: symbols.SymbolTable,
+    /// The lowerer; initialised by the test AFTER the fixture's address is
+    /// fixed, since it holds `&store`.
     low: lower.Lowerer,
 
+    /// Builds a fixture with a fresh store and symbol table, leaving `low`
+    /// undefined for the caller to initialise once `&store` is stable.
     fn init(a: std.mem.Allocator) Fixture {
         return .{
             .store = types.TypeStore.init(a),
@@ -2496,6 +3075,8 @@ const Fixture = struct {
             .low = undefined,
         };
     }
+    /// Tears down the lowerer, symbol table, and store, in reverse of their
+    /// dependency order.
     fn deinit(self: *Fixture) void {
         self.low.deinit();
         self.tab.deinit();
@@ -2503,6 +3084,8 @@ const Fixture = struct {
     }
 };
 
+// Verifies each literal kind gets its exact type (int/string/bool/double), the
+// honesty rule that a literal is not widened to the machine word.
 test "infer: literals get honest types — an int literal is int, not the machine word" {
     const a = testing.allocator;
     var f = Fixture.init(a);
@@ -2521,6 +3104,8 @@ test "infer: literals get honest types — an int literal is int, not the machin
     try testing.expectEqual(try f.store.doubleT(), try inf.inferExpr(&e_flt));
 }
 
+// A relational operator yields bool, not the i32 of its operands: guards
+// against comparisons leaking an integer type into codegen.
 test "infer: a comparison is BOOL, not i32" {
 
     const a = testing.allocator;
@@ -2539,6 +3124,8 @@ test "infer: a comparison is BOOL, not i32" {
     try testing.expect(cmp != try f.store.intT());
 }
 
+// `a + b` over two unresolved idents stays unresolved rather than defaulting
+// to int: the honesty rule applied to arithmetic.
 test "T4: a binary over two unknowns is UNRESOLVED, not i32" {
 
     const a = testing.allocator;
@@ -2557,6 +3144,8 @@ test "T4: a binary over two unknowns is UNRESOLVED, not i32" {
     try testing.expect(t != try f.store.intT());
 }
 
+// A bound name resolves to its binding's type, while an unbound name is
+// unresolved: the core scope-lookup behaviour of [`Inferer.lookup`].
 test "infer: a let binding's type flows to its uses" {
     const a = testing.allocator;
     var f = Fixture.init(a);
@@ -2575,10 +3164,15 @@ test "infer: a let binding's type flows to its uses" {
     try testing.expect(f.store.get(u) == .unresolved);
 }
 
+/// Test helper: stamps stable [`ast.ExprId`]s onto the given expressions (and
+/// their sub-expressions) via an id assigner, so [`TypedIr`] can key results by
+/// identity. Panics on assigner failure, which never happens in these tests.
 fn stampIds(a: *ids.Assigner, exprs: []const *ast.Expression) void {
     for (exprs) |e| a.walkExpr(e) catch unreachable;
 }
 
+// The IR keys results by stamped expression id, so distinct exprs are recorded
+// separately and an un-stamped expr reads back as absent.
 test "TypedIr: records by expression identity and reads back" {
     const a = testing.allocator;
     var f = Fixture.init(a);
@@ -2606,6 +3200,8 @@ test "TypedIr: records by expression identity and reads back" {
     try testing.expect(ir.typeOf(&never) == null);
 }
 
+// Inference records every sub-expression it visits, not only the top node, so a
+// binary's operands are individually typed in the IR.
 test "TypedIr: sub-expressions are recorded too, not just the root" {
     const a = testing.allocator;
     var f = Fixture.init(a);
@@ -2630,6 +3226,8 @@ test "TypedIr: sub-expressions are recorded too, not just the root" {
     try testing.expectEqual(try f.store.intT(), ir.typeOf(&add).?);
 }
 
+// [`TypedIr.unresolvedCount`] reports exactly how many recorded exprs remain
+// unresolved: the coverage gap, distinct from the total count.
 test "TypedIr: unresolvedCount is the honest coverage number" {
 
     const a = testing.allocator;
@@ -2652,6 +3250,8 @@ test "TypedIr: unresolvedCount is the honest coverage number" {
     try testing.expectEqual(@as(usize, 1), ir.unresolvedCount(&f.store));
 }
 
+// [`TypedIr.record`] drops `.unassigned` ids (bumping `unassigned_rejected`)
+// instead of letting every un-stamped expr collide on id 0.
 test "TypedIr: refuses `.unassigned` rather than colliding every un-walked expr on id 0" {
 
     const a = testing.allocator;
@@ -2674,6 +3274,8 @@ test "TypedIr: refuses `.unassigned` rather than colliding every un-walked expr 
     try testing.expect(ir.typeOf(&also_no_id) == null);
 }
 
+// Bitwise `&`/`|` produce the operand (int) type, while logical `&&`/`||`
+// produce bool: the two families must not be conflated.
 test "infer: bitwise `&`/`|` yield the OPERAND type, not bool" {
 
     const a = testing.allocator;
@@ -2700,6 +3302,8 @@ test "infer: bitwise `&`/`|` yield the OPERAND type, not bool" {
     try testing.expectEqual(try f.store.boolT(), try inf.inferExpr(&lor));
 }
 
+// An assignment expression is typed as the assigned value's type (not void), so
+// `x = 5` can be used in value position.
 test "infer: assignment yields the assigned VALUE, not void" {
 
     const a = testing.allocator;
@@ -2721,6 +3325,9 @@ test "infer: assignment yields the assigned VALUE, not void" {
     try testing.expect(t != try f.store.voidT());
 }
 
+/// Test helper: builds a one-declaration program containing a generic
+/// `struct List<T>` with the given methods, used to exercise receiver-driven
+/// type-parameter substitution in the F4 tests.
 fn genericListProgram(sp: ast.Span, methods: []ast.MethodDecl) [1]ast.Declaration {
     return [_]ast.Declaration{.{ .struct_decl = .{
         .name = "List",
@@ -2734,6 +3341,8 @@ fn genericListProgram(sp: ast.Span, methods: []ast.MethodDecl) [1]ast.Declaratio
     } }};
 }
 
+// A generic method's return `T` is substituted from the RECEIVER's type args,
+// so `List<string>.get()` is string and `List<int>.get()` is int.
 test "F4: `List<string>.get()` is string — substitute T from the RECEIVER's args" {
 
     const a = testing.allocator;
@@ -2783,6 +3392,8 @@ test "F4: `List<string>.get()` is string — substitute T from the RECEIVER's ar
     try testing.expectEqual(try f.store.intT(), try inf.inferExpr(&call_i));
 }
 
+// A generic free-function call substitutes its EXPLICIT type args into the
+// return type (`wrap<string>()` is string), even when the arg is unused.
 test "F4: a generic FUNCTION call substitutes from its explicit type args" {
 
     const a = testing.allocator;
@@ -2841,6 +3452,8 @@ test "F4: a generic FUNCTION call substitutes from its explicit type args" {
     try testing.expectEqual(try f.store.stringT(), try inf.inferExpr(&w));
 }
 
+// A generic struct's field type substitutes from the receiver's args too, so
+// `Box<string>.v` reads as string.
 test "F4: a generic struct's FIELD substitutes too — `Box<string>.v` is string" {
 
     const a = testing.allocator;
@@ -2876,6 +3489,8 @@ test "F4: a generic struct's FIELD substitutes too — `Box<string>.v` is string
     try testing.expectEqual(try f.store.stringT(), try inf.inferExpr(&fa));
 }
 
+// A field whose type is a function can be CALLED: `(self.hashFn)(key)` types as
+// the function's return, with the field's params substituted from the struct.
 test "F4: calling a field that HOLDS a function — `(self.hashFn)(key)`" {
 
     const a = testing.allocator;
@@ -2927,6 +3542,8 @@ test "F4: calling a field that HOLDS a function — `(self.hashFn)(key)`" {
     try testing.expectEqual(try f.store.intT(), try inf.inferExpr(&call));
 }
 
+// `if (s != undefined)` narrows `s` from optional to present INSIDE the branch
+// (so `s.length` types), and it reverts to optional afterwards.
 test "F2: `if (s != undefined)` narrows s inside the branch (specs.md 3.4a)" {
 
     const a = testing.allocator;
@@ -2970,6 +3587,8 @@ test "F2: `if (s != undefined)` narrows s inside the branch (specs.md 3.4a)" {
     try testing.expect(f.store.get(try inf.inferExpr(&after)) == .unresolved);
 }
 
+// The `==` form narrows the ELSE branch instead: the value is present where the
+// equality check failed, mirroring [`Narrowing.when_true`].
 test "F2: `if (s == undefined)` narrows the ELSE branch (specs.md 3.4a)" {
     const a = testing.allocator;
     const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.nova" };
@@ -3014,6 +3633,8 @@ test "F2: `if (s == undefined)` narrows the ELSE branch (specs.md 3.4a)" {
     try testing.expectEqual(try f.store.intT(), ir.typeOf(else_e).?);
 }
 
+// Only a plain identifier narrows; `obj.field != undefined` does not, since
+// narrowing rebinds a name and a field has no binding to rewrite.
 test "F2: only a plain BINDING narrows — a field does not (specs.md 3.4a)" {
 
     const a = testing.allocator;
@@ -3040,6 +3661,8 @@ test "F2: only a plain BINDING narrows — a field does not (specs.md 3.4a)" {
     try testing.expect(narrowedBinding(ok_cond).?.when_true);
 }
 
+// A closure passed to a method gets its param types from the EXPECTED function
+// type, so `m.forEach((k, v) => k)` types `k` as the map's key type.
 test "F2: a closure's params come from the EXPECTED type (specs.md 6.3a)" {
 
     const a = testing.allocator;
@@ -3115,6 +3738,8 @@ test "F2: a closure's params come from the EXPECTED type (specs.md 6.3a)" {
     try testing.expectEqual(try f.store.stringT(), ir.typeOf(inner).?);
 }
 
+// A method call on a trait-object receiver resolves to the trait method's
+// declared return type, and an unknown method stays unresolved.
 test "F2: a method call on a TRAIT receiver resolves (`src.getString(k)`)" {
 
     const a = testing.allocator;
@@ -3163,6 +3788,8 @@ test "F2: a method call on a TRAIT receiver resolves (`src.getString(k)`)" {
     try testing.expect(f.store.get(try inf.inferExpr(&call4)) == .unresolved);
 }
 
+// `go f()` yields `future<T>` and `await` unwraps it back to `T`; the two are
+// distinct types so a future is never mistaken for its result.
 test "F2: `go` yields future<T> and `await` unwraps it (specs.md 7.1)" {
 
     const a = testing.allocator;
@@ -3208,6 +3835,8 @@ test "F2: `go` yields future<T> and `await` unwraps it (specs.md 7.1)" {
     try testing.expect(fut_str != h);
 }
 
+// With no expected type, a closure param is inferred from its USE in the body:
+// `(x) => x + 1` types `x` as int via [`Inferer.paramFromUse`].
 test "F2: a closure param is inferred from its USE in the body (specs.md 6.3a)" {
 
     const a = testing.allocator;
@@ -3238,6 +3867,8 @@ test "F2: a closure param is inferred from its USE in the body (specs.md 6.3a)" 
     try testing.expectEqual(try f.store.intT(), f.store.get(t).func.ret);
 }
 
+// `(a, b) => a + b` with neither param constrained stays unresolved rather than
+// guessing: documents the deliberate limit of use-based inference.
 test "F2: `(a, b) => a + b` stays unresolved — the limit, not a guess" {
 
     const a = testing.allocator;

@@ -1,6 +1,3 @@
-// HPACK (RFC 7541): decode the canonical C.4.1 request header block (Huffman-coded) and round-trip a
-// header set through encode -> decode. Exercises the Huffman code, integer/string primitives, the static
-// table and literal representations.
 import web.http2.hpack;
 import bytes;
 import assert;
@@ -26,8 +23,6 @@ fn findHeader(fields: List<hpack.HeaderField>, name: string): string {
 
 @test
 fn decode_rfc7541_c41_request() {
-    // RFC 7541 C.4.1: first request of the Huffman-coded example sequence.
-    //   :method: GET  :scheme: http  :path: /  :authority: www.example.com
     let buf = hexBuf("828684418cf1e3c2e5f23a6ba0ab90f4ff");
     let hp = hpack.newHpack();
     let fields = hp.decode(buf, 0, 17);
@@ -61,12 +56,10 @@ fn round_trip_response_headers() {
 
 @test
 fn huffman_and_static_indexing() {
-    // :status 200 is static index 8 -> a single indexed byte 0x88. content-type has no static value, so it
-    // is name-indexed + a Huffman/raw literal value.
     let fields = List<hpack.HeaderField>();
     fields.push(hpack.HeaderField(":status", "200"));
     let enc = hpack.newHpack();
     let (buf, len) = enc.encode(fields);
-    assert.equalInt(1, len);                       // exactly one byte
+    assert.equalInt(1, len);
     assert.equalInt(0x88, bytes.read_byte(buf, 0));
 }

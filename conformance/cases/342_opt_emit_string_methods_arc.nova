@@ -1,20 +1,10 @@
-// Emit-subset growth (C0 + D2, the string unlock): the optimiser now names a string method call
-// (`s.len()` -> `string_len(s)`, receiver prepended as the first argument) so the emit path can resolve
-// what is otherwise a nameless field-access callee, AND emits the threaded ARC (retain/release) for owned
-// string values -- a string is a single heap allocation whose release needs no destructor. Together these
-// let functions that call string methods (borrowed receiver) and create owned string temporaries compile
-// from the optimised IR. Under NOVA_OPT_EMIT these helpers compile from the emit path; both must agree AND
-// stay ARC-balanced (the --arc gate). Value-struct/return-string cases still fall back.
 import assert;
 import string;
 
-// Borrowed string params, read-only method calls -> emit, no ARC needed.
 fn firstIdx(s: string, sub: string): int { return s.indexOf(sub); }
 fn length(s: string): int { return s.len(); }
 fn hashLow(s: string): int { return s.hash() & 65535; }
 
-// Owned string temporary (concat returns a fresh owned string); its scope-end release is threaded + emitted,
-// so this must stay balanced under --arc. Returning an int keeps the string from escaping.
 fn concatLen(a: string, b: string): int {
     let c = a.concat(b);
     return 7;
@@ -29,7 +19,6 @@ fn test_borrowed_string_methods(): void {
 
 @test
 fn test_owned_string_temporary(): void {
-    // Exercises the threaded string release on the owned concat result (ARC-balanced under --arc).
     assert.equalInt(concatLen("foo", "bar"), 7);
     assert.isTrue(hashLow("abc") >= 0);
 }

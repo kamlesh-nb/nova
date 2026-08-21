@@ -1,15 +1,8 @@
-// AES in Counter mode (NIST SP 800-38A) implemented in Nova over the constant-time bitsliced AES, no
-// external library (M9 phase B). CTR is a symmetric stream mode: the same call encrypts and decrypts.
-// The whole 128-bit counter block is incremented big-endian, per SP 800-38A's standard incrementing
-// function. AES itself is constant-time, and CTR adds no data-dependent branches.
-//
-// Reference: NIST SP 800-38A section 6.5 and Appendix F.5. Verified against the F.5 vectors (case 224).
 import bytes;
 import crypto.cipher.aes;
 
 pub const AES_CTR_BLOCK_LEN: int = 16;
 
-// Increment the full 128-bit counter block by one, big-endian, modulo 2^128.
 fn incFull(ctr: ptr): void {
     let i = 15;
     let carry = 1;
@@ -21,8 +14,6 @@ fn incFull(ctr: ptr): void {
     }
 }
 
-// XOR the AES-CTR keystream over len bytes at dataIn into out, starting from the 16-byte initial
-// counter block. Encrypt and decrypt are the same operation. keyLen is 16 (AES-128) or 32 (AES-256).
 pub fn crypt(key: ptr, keyLen: int, counter: ptr, dataIn: ptr, len: int, out: ptr): void {
     let ctx = aes.Aes.create(key, keyLen);
     let ctr = bytes.alloc(16);

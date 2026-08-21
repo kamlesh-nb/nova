@@ -13,7 +13,7 @@ const OP_SPLIT: int = 6;
 const OP_SAVE: int = 7;
 const OP_BOL: int = 8;
 const OP_EOL: int = 9;
-const OP_BOUND: int = 10;   // zero-width word boundary; ins.neg=1 for \B (non-boundary)
+const OP_BOUND: int = 10;
 
 pub struct Inst {
     pub op: int,
@@ -73,13 +73,10 @@ fn opt(p: List<Inst>): List<Inst> {
     return r;
 }
 
-// Lazy (non-greedy) variants: same NFA shape, but the SPLIT's two targets are swapped so the matcher prefers
-// to EXIT the loop before consuming another repetition. The Pike VM adds a SPLIT's first target ahead of its
-// second in priority order, so putting the exit branch first makes `*?`/`+?`/`??` prefer the shortest match.
 fn starLazy(p: List<Inst>): List<Inst> {
     let lp = p.size();
     let r = List<Inst>();
-    r.push(iSplit(lp + 2, 1));               // prefer exit, then body
+    r.push(iSplit(lp + 2, 1));
     appendAll(r, p);
     r.push(iJmp(0 - (lp + 1)));
     return r;
@@ -89,14 +86,14 @@ fn plusLazy(p: List<Inst>): List<Inst> {
     let lp = p.size();
     let r = List<Inst>();
     appendAll(r, p);
-    r.push(iSplit(1, 0 - lp));               // prefer exit, then loop back
+    r.push(iSplit(1, 0 - lp));
     return r;
 }
 
 fn optLazy(p: List<Inst>): List<Inst> {
     let lp = p.size();
     let r = List<Inst>();
-    r.push(iSplit(lp + 1, 1));               // prefer skip, then body
+    r.push(iSplit(lp + 1, 1));
     appendAll(r, p);
     return r;
 }
@@ -161,11 +158,6 @@ fn cloneSaves(src: List<int>): List<int> {
     return d;
 }
 
-// Follow epsilon transitions from `pc` at input position `pos`, adding the resulting CONSUMING / MATCH
-// instructions to the thread list (pcs + parallel saves). The `mark`/`gen` sparse set ensures each pc is added
-// at most ONCE per input position -- this is what makes the matcher LINEAR (a bounded number of live threads
-// per position) instead of the old recursion that re-explored SPLIT branches exponentially. SPLIT visits x
-// before y, so priority (leftmost-first) order is preserved.
 fn addThread(prog: List<Inst>, pcs: List<int>, savesList: List<List<int>>, mark: List<int>, gen: int, pc: int, saves: List<int>, pos: int, s: string): void {
     if (pc < 0 || pc >= prog.size()) { return; }
     if (mark.at(pc) == gen) { return; }
@@ -192,16 +184,11 @@ fn addThread(prog: List<Inst>, pcs: List<int>, savesList: List<List<int>>, mark:
         let want = ins.neg == 0;
         if (boundary == want) { addThread(prog, pcs, savesList, mark, gen, pc + 1, saves, pos, s); }
     } else {
-        // OP_CHAR / OP_CLASS / OP_ANY / OP_MATCH: a consuming (or accepting) thread parks in the list.
         pcs.push(pc);
         savesList.push(saves);
     }
 }
 
-// Pike VM: run all NFA threads in lockstep over the input, one position at a time. Anchored at `sp` (the
-// caller searches by advancing sp). Returns the end position of the highest-priority match, or -1, filling
-// `saves` with that match's capture positions. Linear time O(n * m): at most `prog.size()` live threads per
-// input position, no exponential backtracking on patterns like `(a*)*` or `a?a?...aaa`.
 fn vmMatch(prog: List<Inst>, pc: int, s: string, sp: int, saves: List<int>): int {
     let n = prog.size();
     let mark = List<int>();
@@ -228,10 +215,9 @@ fn vmMatch(prog: List<Inst>, pc: int, s: string, sp: int, saves: List<int>): int
             let op = ins.op;
             if (op == OP_MATCH) {
                 matchedEnd = i;
-                // Record the winning thread's captures into the caller's `saves`.
                 let z = 0;
                 while (z < tsv.size() && z < saves.size()) { saves.set(z, tsv.at(z)); z = z + 1; }
-                stop = true;   // leftmost-first: this is the highest-priority thread; lower ones are cut.
+                stop = true;
             } else if (op == OP_CHAR) {
                 if (i < s.length && s[i] == ins.c) { addThread(prog, nlistPc, nlistSaves, mark, gen, tpc + 1, cloneSaves(tsv), i + 1, s); }
             } else if (op == OP_ANY) {
@@ -350,7 +336,6 @@ struct RxParser {
             r.push(iClass("\\" + charStr(e), 0));
             return r;
         }
-        // Word-boundary assertions (zero-width): \b matches between a word and non-word char, \B its negation.
         if (e == 98) { r.push(iBound(0)); return r; }
         if (e == 66) { r.push(iBound(1)); return r; }
         if (e == 110) { r.push(iChar(10)); return r; }

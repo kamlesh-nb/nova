@@ -1,9 +1,3 @@
-// A value struct that owns a container (List/Map), passed BY VALUE into a CLASS constructor and stored in a
-// field, must get its OWN copy of the container -- not alias the caller's. Previously the inline field store
-// (`self.h = h`) memcpy'd the struct bytes without retaining/deep-copying the owned container field, so the
-// class field aliased the caller's list; the caller's destructor then freed it, and a later read was a
-// use-after-free (crash in List_i32_size). This is the reduced form of the 181_orchestrator crash
-// (Supervisor value-struct with a List<Process> stored into the Job class).
 import assert;
 import list;
 
@@ -14,7 +8,7 @@ struct Holder {
 
 class Box {
     pub h: Holder,
-    init(h: Holder) { self.h = h; }   // value struct stored into a class field -- must copy, not alias
+    init(h: Holder) { self.h = h; }
 }
 
 fn makeBox(): Box {
@@ -22,26 +16,23 @@ fn makeBox(): Box {
     hh.items.push(10);
     hh.items.push(20);
     hh.items.push(30);
-    return Box(hh);                    // hh's destructor runs at the end of this function
+    return Box(hh);
 }
 
 @test
 fn value_struct_container_survives_source_drop(): void {
     let b = makeBox();
-    // hh is gone; b.h.items must still be b's own live list, not a freed alias.
     assert.equalInt(b.h.items.size(), 3);
     assert.equalInt(b.h.items.get(0) ?? -1, 10);
     assert.equalInt(b.h.items.get(2) ?? -1, 30);
 }
 
-// Mutating the class's copy must NOT affect an independent source, and vice versa (true value semantics,
-// independent backing storage).
 @test
 fn value_struct_container_copy_is_independent(): void {
     let src = Holder();
     src.items.push(1);
-    let b = Box(src);                  // b.h.items is a deep copy of src.items
-    src.items.push(2);                 // mutate the source AFTER the copy
-    assert.equalInt(b.h.items.size(), 1);   // the class field did not see the source's later push
+    let b = Box(src);
+    src.items.push(2);
+    assert.equalInt(b.h.items.size(), 1);
     assert.equalInt(src.items.size(), 2);
 }

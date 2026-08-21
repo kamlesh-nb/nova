@@ -1,5 +1,3 @@
-// FR-safety-1: `T?` is pure sugar for `T | undefined`. A `T?` and a `T | undefined` are the identical
-// type: a value of one flows into a slot of the other, and both narrow on `!= undefined` and take `??`.
 import assert;
 
 fn find(x: int): int? {
@@ -7,7 +5,6 @@ fn find(x: int): int? {
     return undefined;
 }
 
-// Declared with the union form; a T? value must flow into it unchanged.
 fn unwrapUnion(o: int | undefined): int {
     return o ?? -1;
 }
@@ -28,14 +25,10 @@ fn optional_sugar_roundtrip(): void {
 
 @test
 fn optional_sugar_equals_union(): void {
-    // T? result passed into a T | undefined parameter (proves they are one type). Bound to a local first
-    // (passing a value-optional call result DIRECTLY as a nested argument is a separate pre-existing crash,
-    // unrelated to this sugar: it reproduces with the `int | undefined` return form too).
     let r7 = find(7);
     assert.equalInt(unwrapUnion(r7), 7);
     let rn = find(-1);
     assert.equalInt(unwrapUnion(rn), -1);
-    // Union value assigned into a T? let annotation.
     let miss: int | undefined = undefined;
     let x: int? = miss;
     assert.equalInt(x ?? 42, 42);

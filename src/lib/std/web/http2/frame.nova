@@ -1,7 +1,3 @@
-// HTTP/2 framing (RFC 7540 section 4-6). A frame is a 9-byte header -- Length(24) Type(8) Flags(8)
-// R(1)+StreamID(31) -- followed by `Length` payload bytes. This module provides the header codec plus
-// builders/readers for the frame types a server needs: DATA, HEADERS, SETTINGS, WINDOW_UPDATE, PING, GOAWAY,
-// RST_STREAM, PRIORITY, CONTINUATION.
 import bytes;
 
 pub const FRAME_DATA: int = 0;
@@ -15,11 +11,11 @@ pub const FRAME_GOAWAY: int = 7;
 pub const FRAME_WINDOW_UPDATE: int = 8;
 pub const FRAME_CONTINUATION: int = 9;
 
-pub const FLAG_END_STREAM: int = 1;    // DATA / HEADERS
-pub const FLAG_ACK: int = 1;           // SETTINGS / PING
-pub const FLAG_END_HEADERS: int = 4;   // HEADERS / CONTINUATION / PUSH_PROMISE
-pub const FLAG_PADDED: int = 8;        // DATA / HEADERS / PUSH_PROMISE
-pub const FLAG_PRIORITY: int = 32;     // HEADERS
+pub const FLAG_END_STREAM: int = 1;
+pub const FLAG_ACK: int = 1;
+pub const FLAG_END_HEADERS: int = 4;
+pub const FLAG_PADDED: int = 8;
+pub const FLAG_PRIORITY: int = 32;
 
 pub const SETTINGS_HEADER_TABLE_SIZE: int = 1;
 pub const SETTINGS_ENABLE_PUSH: int = 2;
@@ -28,7 +24,6 @@ pub const SETTINGS_INITIAL_WINDOW_SIZE: int = 4;
 pub const SETTINGS_MAX_FRAME_SIZE: int = 5;
 pub const SETTINGS_MAX_HEADER_LIST_SIZE: int = 6;
 
-// The 24-byte client connection preface (RFC 7540 section 3.5).
 pub const PREFACE: string = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 pub struct FrameHeader {
@@ -41,7 +36,6 @@ pub struct FrameHeader {
     }
 }
 
-// Read a 9-byte frame header at buf[off].
 pub fn readHeader(buf: ptr, off: int): FrameHeader {
     let len = (bytes.read_byte(buf, off) << 16) | (bytes.read_byte(buf, off + 1) << 8) | bytes.read_byte(buf, off + 2);
     let ftype = bytes.read_byte(buf, off + 3);
@@ -50,7 +44,6 @@ pub fn readHeader(buf: ptr, off: int): FrameHeader {
     return FrameHeader(len, ftype, flags, sid);
 }
 
-// Write a 9-byte frame header at out[o]; returns o+9.
 pub fn writeHeader(out: ptr, o: int, length: int, ftype: int, flags: int, streamId: int): int {
     bytes.write_byte(out, o, (length >> 16) & 255);
     bytes.write_byte(out, o + 1, (length >> 8) & 255);
@@ -64,7 +57,6 @@ pub fn writeHeader(out: ptr, o: int, length: int, ftype: int, flags: int, stream
     return o + 9;
 }
 
-// Write a complete frame (header + payload copied from src[srcOff..srcOff+len]); returns new offset.
 pub fn writeFrame(out: ptr, o: int, ftype: int, flags: int, streamId: int, src: ptr, srcOff: int, len: int): int {
     let p = writeHeader(out, o, len, ftype, flags, streamId);
     let i = 0;
@@ -72,7 +64,6 @@ pub fn writeFrame(out: ptr, o: int, ftype: int, flags: int, streamId: int, src: 
     return p + len;
 }
 
-// A SETTINGS frame with a single (id, value) parameter (enough for our INITIAL_WINDOW_SIZE / table size).
 pub fn writeSettings(out: ptr, o: int, id: int, value: int): int {
     let p = writeHeader(out, o, 6, FRAME_SETTINGS, 0, 0);
     bytes.write_byte(out, p, (id >> 8) & 255);
@@ -84,13 +75,10 @@ pub fn writeSettings(out: ptr, o: int, id: int, value: int): int {
     return p + 6;
 }
 
-// An empty SETTINGS frame (all defaults).
 pub fn writeSettingsEmpty(out: ptr, o: int): int { return writeHeader(out, o, 0, FRAME_SETTINGS, 0, 0); }
 
-// A SETTINGS ACK.
 pub fn writeSettingsAck(out: ptr, o: int): int { return writeHeader(out, o, 0, FRAME_SETTINGS, FLAG_ACK, 0); }
 
-// A WINDOW_UPDATE frame.
 pub fn writeWindowUpdate(out: ptr, o: int, streamId: int, increment: int): int {
     let p = writeHeader(out, o, 4, FRAME_WINDOW_UPDATE, 0, streamId);
     bytes.write_byte(out, p, (increment >> 24) & 127);
@@ -100,7 +88,6 @@ pub fn writeWindowUpdate(out: ptr, o: int, streamId: int, increment: int): int {
     return p + 4;
 }
 
-// A PING ACK echoing the 8 opaque bytes at src[srcOff..srcOff+8].
 pub fn writePingAck(out: ptr, o: int, src: ptr, srcOff: int): int {
     let p = writeHeader(out, o, 8, FRAME_PING, FLAG_ACK, 0);
     let i = 0;
@@ -108,7 +95,6 @@ pub fn writePingAck(out: ptr, o: int, src: ptr, srcOff: int): int {
     return p + 8;
 }
 
-// A GOAWAY frame (lastStreamId + errorCode, no debug data).
 pub fn writeGoaway(out: ptr, o: int, lastStreamId: int, errorCode: int): int {
     let p = writeHeader(out, o, 8, FRAME_GOAWAY, 0, 0);
     bytes.write_byte(out, p, (lastStreamId >> 24) & 127);
@@ -122,7 +108,6 @@ pub fn writeGoaway(out: ptr, o: int, lastStreamId: int, errorCode: int): int {
     return p + 8;
 }
 
-// A RST_STREAM frame.
 pub fn writeRstStream(out: ptr, o: int, streamId: int, errorCode: int): int {
     let p = writeHeader(out, o, 4, FRAME_RST_STREAM, 0, streamId);
     bytes.write_byte(out, p, (errorCode >> 24) & 255);
@@ -132,7 +117,6 @@ pub fn writeRstStream(out: ptr, o: int, streamId: int, errorCode: int): int {
     return p + 4;
 }
 
-// Read a 4-byte big-endian unsigned value (WINDOW_UPDATE increment / settings value).
 pub fn readU32(buf: ptr, off: int): int {
     return ((bytes.read_byte(buf, off) & 127) << 24) | (bytes.read_byte(buf, off + 1) << 16) | (bytes.read_byte(buf, off + 2) << 8) | bytes.read_byte(buf, off + 3);
 }

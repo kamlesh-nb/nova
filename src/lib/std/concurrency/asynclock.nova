@@ -1,54 +1,23 @@
-// A reactor-aware mutual-exclusion lock for coroutines that share a single resource (one DB connection,
-// a file, a device). Unlike a thread mutex it never blocks a thread: a coroutine that cannot take the
-// lock parks on the reactor (coroSuspend) and is resumed when the holder releases. This turns the
-// "concurrent use -> reject / need a pool" workaround into "the second caller queues and runs in turn
-// over the single resource", which is what a proper async client gives you.
-//
-// Correctness rests on the single-reactor execution model: coroutines on one reactor interleave ONLY at
-// suspend points (await / coroSuspend), so the held-flag and wait-queue mutations -- which contain no
-// suspend between the read and the write -- are atomic with respect to other coroutines. A shared
-// resource such as a socket is strand-bound to one reactor, so its lock is never contended across OS
-// threads. (A cross-thread lock would need real atomics; that is deliberately out of scope.)
-//
-// USAGE -- the uncontended path takes NO suspend, so it never awaits a lock that is already free:
-//
-//     if (!lock.tryAcquire()) { await lock.acquireSlow(); }
-//     // ... use the shared resource; you may await here ...
-//     lock.release();
-//
-// Share an AsyncLock by putting it in a STRUCT FIELD: a struct field is a heap reference, so even when
-// the owning struct is copied by value the lock pointer (and thus its state) is shared -- which a plain
-// `bool busy` flag is not. That is precisely why a heap lock fixes concurrency on a by-value connection.
 
 import list;
 
 pub struct AsyncLock {
     held: bool,
-    waiters: list.List<long>,      // parked coroutine handles, FIFO
+    waiters: list.List<long>,
 
     init() { self.held = false; self.waiters = list.List<long>(); }
 
-    // Take the lock without suspending if it is free. Returns true if acquired, false if another
-    // coroutine holds it (then call acquireSlow to wait). Synchronous: no async context required.
     pub fn tryAcquire(self: AsyncLock): bool {
         if (self.held) { return false; }
         self.held = true;
         return true;
     }
 
-    // Wait for the lock after tryAcquire returned false: enqueue this coroutine and park until the holder
-    // hands it over. On return the lock is OURS -- release() re-schedules the next waiter WITHOUT clearing
-    // `held` (direct hand-off), so no one else can slip in between. Call from an async context, and ONLY
-    // after tryAcquire failed (on a single reactor nothing can free the lock between the two calls, since
-    // there is no suspend between them, so this always genuinely parks -- never a no-op await).
     pub async fn acquireSlow(self: AsyncLock): void {
         self.waiters.push(currentCoro());
         coroSuspend();
     }
 
-    // Release the lock: hand it to the oldest waiter (keeping `held` set) or mark it free if none wait.
-    // The waiter is resumed via the scheduler (deferred), not inline, so release never re-enters a
-    // waiter's continuation on the releaser's stack.
     pub fn release(self: AsyncLock): void {
         if (self.waiters.size() > 0) {
             let h = self.waiters.get(0) ?? 0;

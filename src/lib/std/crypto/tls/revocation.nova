@@ -1,12 +1,3 @@
-// Revocation binding for chain verification: given a validated leaf + its issuer, decide whether the
-// leaf is revoked using a stapled OCSP response or a CRL. The OCSP/CRL modules do the ASN.1 + signature
-// math; this layer binds a response to the specific leaf (serial match) and verifies the signature
-// against the ISSUER's key, then maps to a GOOD / REVOKED / UNKNOWN verdict a verifier can act on.
-//
-// Policy is the caller's (hard-fail vs soft-fail on UNKNOWN); the truststore's trustsNotRevoked* wire
-// this as HARD-FAIL on REVOKED, SOFT-FAIL on UNKNOWN (accept when revocation cannot be determined).
-// Only ECDSA-P256 issuers are supported here (matching the OCSP/CRL EC verifiers); an RSA issuer or a
-// delegated OCSP responder cert yields UNKNOWN (hardening follow-ons).
 
 import bytes;
 import crypto.x509;
@@ -17,8 +8,6 @@ pub const REV_GOOD: int = 0;
 pub const REV_REVOKED: int = 1;
 pub const REV_UNKNOWN: int = 2;
 
-// Check a stapled OCSP response for `leaf`, verified against `issuer`. UNKNOWN unless the response is a
-// successful, issuer-signed, serial-matched OCSP response; then GOOD/REVOKED per its certStatus.
 pub fn checkOcspStapled(leaf: x509.Cert, issuer: x509.Cert, der: ptr, len: int): int {
     if (!leaf.ok || !issuer.ok || !x509.isEcKey(issuer)) { return REV_UNKNOWN; }
     let res = ocsp.parseOcspResponse(der, len);
@@ -32,8 +21,6 @@ pub fn checkOcspStapled(leaf: x509.Cert, issuer: x509.Cert, der: ptr, len: int):
     return REV_UNKNOWN;
 }
 
-// Check a CRL for `leaf`, verified against `issuer`. UNKNOWN unless the CRL parses + its issuer signature
-// validates; then REVOKED if the leaf serial is listed, else GOOD.
 pub fn checkCrl(leaf: x509.Cert, issuer: x509.Cert, der: ptr, len: int): int {
     if (!leaf.ok || !issuer.ok || !x509.isEcKey(issuer)) { return REV_UNKNOWN; }
     let v = crl.parseCrl(der, len);

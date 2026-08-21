@@ -1,14 +1,10 @@
-// YCSB A–F against PostgreSQL, via the driver-generic core (D5).
-// Run: with a running Postgres, then
-//   ./zig-out/bin/nova test --release repro/ycsb/ycsb_postgres.nova
-// DSN: postgres://user:pass@host:5432/db  (see data/sql/postgres.nova parse).
 import ycsb_core;
 import db;
 import postgres;
 
 @test
 fn ycsb_postgres_suite(): void {
-    let conn = PgDriver().connect("postgres://kamlesh@127.0.0.1:5432/ycsbtest"  // adjust user/db to your server; the DB must exist);
+    let conn = PgDriver().connect("postgres://kamlesh@127.0.0.1:5432/ycsbtest"
     ycsb_core.runSuite("PostgreSQL", conn,
         "CREATE TABLE ycsb_af (ykey TEXT PRIMARY KEY, ydata TEXT)",
         10000, 5000, 0.99, false);

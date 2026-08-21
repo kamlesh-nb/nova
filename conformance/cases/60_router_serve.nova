@@ -1,7 +1,3 @@
-// Flagship: the Router bridges to the async HTTP server via `serve(req): Response`.
-// This is the last piece — `server.listen(port, app.serve)` runs the typed mediator
-// pipeline over real HTTP. Here we drive it with hand-built Requests (no network) and
-// assert the Response: matched -> 200 + JSON body, wrong method -> 405, no path -> 404.
 import assert;
 import web.routing;
 import web.request;
@@ -35,7 +31,6 @@ fn test_serve_matched_is_200_json(): void {
 fn test_serve_wrong_method_is_405(): void {
     let app = Router();
     app.get<GetUser>("/api/user/{id:int}");
-    // path matches, method does not -> 405 (not 404)
     let res = app.serve(makeReq("POST", "/api/user/42", "{}"));
     let mna = res.status == Status.MethodNotAllowed;
     assert.isTrue(mna);

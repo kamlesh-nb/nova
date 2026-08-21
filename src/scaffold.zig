@@ -1,26 +1,98 @@
-// scaffold.zig — `nova init` / `nova add feature` project scaffolding.
+//! Project scaffolding for the `nova init` and `nova add-feature` CLI commands.
+//!
+//! This module turns an empty directory into a working Nova project by writing
+//! a fixed set of starter files and directories to disk. It is the code behind
+//! `nova init <console|web|desktop> --name X` and `nova add-feature <name>`. It
+//! deals purely in filesystem effects: it creates directories, writes template
+//! text into files, and prints progress to stderr. It does not compile, parse,
+//! or type-check anything.
+//!
+//! Every file body it emits is a compile-time constant string held in
+//! [`templates`] (`templates.zig`). This module owns only the *layout* decision,
+//! which relative paths exist and what template fills each one, while
+//! `templates.zig` owns the *content*. The `console` and `desktop` layouts are a
+//! couple of files; the `web` layout mirrors an ASP.NET-style vertical-slice
+//! structure (`src/Features/<Area>/<UseCase>/{command,query,handler,...}.nova`),
+//! so it is factored out into [`scaffoldWeb`] with a data-driven table of
+//! path/content pairs.
+//!
+//! Design notes and invariants:
+//!
+//!   - All I/O goes through Zig 0.16's `std.Io` interface passed down from the
+//!     CLI driver, and every write targets a path relative to `.cwd()`. The
+//!     project directory itself is created first; per-file parent directories
+//!     are then created lazily by [`scaffoldFile`], which is why a template can
+//!     name a deeply nested path without the layout code pre-creating each
+//!     level.
+//!
+//!   - Directory creation is idempotent: `error.PathAlreadyExists` is swallowed
+//!     everywhere so re-running `nova init` over an existing tree overwrites the
+//!     files rather than failing. This is a deliberate "regenerate in place"
+//!     policy, not accidental error suppression.
+//!
+//!   - The many `frontend/`, `backend/`, `sema/`, and [`pipeline`] imports below
+//!     are NOT used by the scaffolding logic; they are re-exported/kept so this
+//!     file compiles against the same module graph as the rest of the CLI. The
+//!     scaffolding itself needs only `std`, [`templates`], and `std.Io`.
 
+/// The Zig standard library, used here for allocation, formatting, and path
+/// string manipulation.
 const std = @import("std");
+/// Compile-time build/target information. Present for parity with the rest of
+/// the CLI module graph; the scaffolding logic does not branch on it.
 const builtin = @import("builtin");
+/// Shorthand for `std.Io`, the Zig 0.16 I/O interface. All directory creation
+/// and file writes in this module go through `Io.Dir`.
 const Io = std.Io;
+/// Generated build options (feature flags, versions). Kept for module-graph
+/// parity; unused by the scaffolding code paths.
 const build_options = @import("build_options");
+/// Compiler AST types. Imported for module-graph consistency, not used here.
 const ast = @import("frontend/ast.zig");
+/// The lexer. Imported for module-graph consistency, not used here.
 const lexer = @import("frontend/lexer.zig");
+/// The parser. Imported for module-graph consistency, not used here.
 const parser = @import("frontend/parser.zig");
+/// The source formatter. Imported for module-graph consistency, not used here.
 const formatter = @import("frontend/formatter.zig");
+/// The type checker. Imported for module-graph consistency, not used here.
 const type_checker = @import("frontend/type_checker.zig");
+/// The compile-time string constants for every scaffolded file's body. This is
+/// the one import the scaffolding actually depends on: it supplies the content
+/// each template path is filled with.
 const templates = @import("templates.zig");
+/// LLVM code generator. Imported for module-graph consistency, not used here.
 const llvm_codegen = @import("backend/codegen/llvm_codegen.zig");
+/// ARC codegen support. Imported for module-graph consistency, not used here.
 const codegen_arc = @import("backend/codegen/arc.zig");
+/// Semantic-analysis shadow-diff pass. Imported for parity, not used here.
 const sema_shadow = @import("frontend/sema/shadow.zig");
+/// Escape-analysis pass. Imported for parity, not used here.
 const sema_escape = @import("frontend/sema/escape.zig");
+/// Alpha-renaming pass. Imported for parity, not used here.
 const sema_alpha = @import("frontend/sema/alpha.zig");
+/// Symbol/type-id assignment pass. Imported for parity, not used here.
 const sema_ids = @import("frontend/sema/ids.zig");
+/// The core semantic-analysis driver. Imported for parity, not used here.
 const sema_mod = @import("frontend/sema/sema.zig");
+/// The monomorphization pass. Imported for parity, not used here.
 const sema_mono = @import("frontend/sema/mono.zig");
+/// The compile pipeline orchestrator. Imported for parity, not used here.
 const pipeline = @import("pipeline.zig");
 
 
+/// Writes `content` to `<project>/<rel>`, creating any missing parent
+/// directories first.
+///
+/// This is the single primitive the layout functions build on. It joins the
+/// project root and the relative path, and if that joined path contains a `/`,
+/// it creates the leading directory chain via `createDirPath` (idempotently:
+/// `error.PathAlreadyExists` is not an error). This is what lets a template
+/// table name a deeply nested path such as
+/// `src/Features/Products/CreateProduct/handler.nova` without any caller
+/// pre-creating the intervening directories.
+///
+/// The joined path is heap-allocated from `allocator` and freed before return.
 fn scaffoldFile(allocator: std.mem.Allocator, io: std.Io, project: []const u8, rel: []const u8, content: []const u8) !void {
     const full = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ project, rel });
     defer allocator.free(full);
@@ -33,8 +105,21 @@ fn scaffoldFile(allocator: std.mem.Allocator, io: std.Io, project: []const u8, r
     try Io.Dir.writeFile(.cwd(), io, .{ .data = content, .sub_path = full, .flags = .{} });
 }
 
+/// Writes the full ASP.NET-style web-app starter tree into `project`.
+///
+/// The `web` template is the largest layout: a vertical-slice structure where
+/// each use case (CreateProduct, GetProductById) has its own folder of
+/// command/query/response/validator/handler files, plus a shared repository, an
+/// `.nsx` view, a domain entity, static `wwwroot`, tests, and the Tailwind/npm
+/// tooling files. Rather than a long sequence of explicit writes, the layout is
+/// expressed as a data table of `{ rel, content }` pairs driven through
+/// [`scaffoldFile`], so adding a file to the template is a one-line table entry.
 fn scaffoldWeb(allocator: std.mem.Allocator, io: std.Io, project: []const u8) !void {
+    // Anonymous record type for one entry in the web-layout table: a project
+    // relative path and the template body to write there.
     const f = struct { rel: []const u8, content: []const u8 };
+    // The complete set of files that make up a scaffolded web app, each
+    // pairing a relative path with its template constant from [`templates`].
     const files = [_]f{
         .{ .rel = "src/main.nova", .content = templates.web_main_sample },
 
@@ -49,15 +134,12 @@ fn scaffoldWeb(allocator: std.mem.Allocator, io: std.Io, project: []const u8) !v
 
         .{ .rel = "src/Features/Products/Shared/repository.nova", .content = templates.web_repository_sample },
 
-        // View code lives in a `.nsx` file (same language as `.nova`; the extension keeps markup apart).
         .{ .rel = "src/Features/Products/views/product_card.nsx", .content = templates.web_view_sample },
 
         .{ .rel = "src/Domain/entities/product.nova", .content = templates.web_domain_entity_sample },
         .{ .rel = "wwwroot/index.html", .content = templates.web_index_html_sample },
         .{ .rel = "tests/features/products_test.nova", .content = templates.web_test_sample },
 
-        // Tailwind CLI styling pipeline: `npm install` then `npm run css:watch`. tailwind.config.js lists
-        // the content globs (including the `.nsx` views) so class changes hot-rebuild wwwroot/app.css.
         .{ .rel = "package.json", .content = templates.web_package_json_sample },
         .{ .rel = "tailwind.config.js", .content = templates.web_tailwind_config_sample },
         .{ .rel = "styles/app.css", .content = templates.web_tailwind_css_sample },
@@ -157,9 +239,6 @@ pub fn cmdInit(allocator: std.mem.Allocator, init: std.process.Init, args: []con
         try scaffoldDesktop(allocator, init.io, project_name.?);
     }
 
-    // VS Code F5 debugging: lldb-dap launch config + build task (Gap 4), for EVERY template (the binary is
-    // always build/debug/bin/<project>). Auto-loads the Nova lldb formatters so string/struct/List/Map
-    // show their contents.
     try writeVscodeConfig(allocator, init.io, project_name.?);
 
     const project_json_content = try std.fmt.allocPrint(allocator,

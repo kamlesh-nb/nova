@@ -1,29 +1,16 @@
-// Poly1305 one-time authenticator (RFC 8439) implemented in Nova, no external library (M9 phase B).
-// The 130-bit modular arithmetic uses the well-known 5-limb, 26-bit representation ("poly1305-donna"
-// 32-bit), with `ulong` (u64) intermediate products. The final reduction is a constant-time masked
-// select rather than a branch, so it does not leak the accumulator. r is clamped by the limb masks.
-//
-// Reference: RFC 8439 and the poly1305-donna 32-bit implementation. Verified against the RFC 8439
-// vectors (case 220).
 import bytes;
 import mem.allocator;
 
-// Integrated-assembly fast path (src/runtime/nova_crypto_arm64.S): on aarch64 the donna64 3x44-bit block
-// absorb runs in hand-written assembly (64x64->128 mul/umulh), ~10x the 26-bit software loop. The running
-// accumulator lives in a 64-byte state buffer [r0,r1,r2,s1,s2,h0,h1,h2]; blocks absorb via nova_poly1305_blocks
-// and the padded tail + finalize via nova_poly1305_finish. Plain extern call, no FFI. Byte-identical to the
-// software path (differential-fuzzed across lengths 0..560, 0 disagreements).
 extern("c") fn nova_has_asm_crypto(): int;
 extern("c") fn nova_poly1305_blocks(state: ptr, data: ptr, nblocks: int): void;
 extern("c") fn nova_poly1305_finish(state: ptr, tail: ptr, taillen: int, out: ptr, padLo: ulong, padHi: ulong): void;
 
-const M26: ulong = 0x3ffffff;    // 26-bit limb mask
-const HIBIT: ulong = 0x1000000;  // 1 << 24: the 2^128 bit for a full block
+const M26: ulong = 0x3ffffff;
+const HIBIT: ulong = 0x1000000;
 
 pub const POLY1305_KEY_LEN: int = 32;
 pub const POLY1305_TAG_LEN: int = 16;
 
-// Write a 64-bit little-endian word (for the asm state buffer).
 fn putU64(buf: ptr, off: int, w: ulong): void {
     let i = 0;
     while (i < 8) { bytes.write_byte(buf, off + i, ((w >> (i * 8)) & 0xff) as int); i = i + 1; }
@@ -50,7 +37,7 @@ pub struct Poly1305 {
     pub pad0: ulong, pub pad1: ulong, pub pad2: ulong, pub pad3: ulong,
     pub buf: ptr,
     pub bufLen: int,
-    pub hw: ptr,       // 64-byte asm state [r0,r1,r2,s1,s2,h0,h1,h2], or 0 when software-only
+    pub hw: ptr,
     pub useHw: int,
 
     pub fn create(key: ptr): Poly1305 {
@@ -59,7 +46,6 @@ pub struct Poly1305 {
         let t1 = leWord(key, 4);
         let t2 = leWord(key, 8);
         let t3 = leWord(key, 12);
-        // r, clamped by these limb masks (equivalent to r &= 0x0ffffffc0ffffffc0ffffffc0fffffff).
         p.r0 = t0 & 0x3ffffff;
         p.r1 = ((t0 >> 26) | (t1 << 6)) & 0x3ffff03;
         p.r2 = ((t1 >> 20) | (t2 << 12)) & 0x3ffc0ff;
@@ -79,7 +65,6 @@ pub struct Poly1305 {
         p.hw = 0;
         p.useHw = 0;
         if (nova_has_asm_crypto() == 1) {
-            // Recompute r in the donna64 3x44-bit form the asm uses (clamp mask 0x0ffffffc0ffffffc0ffffffc0fffffff).
             let k0 = leWord(key, 0) | (leWord(key, 4) << 32);
             let k1 = leWord(key, 8) | (leWord(key, 12) << 32);
             let hr0 = k0 & 0xffc0fffffff;
@@ -89,17 +74,16 @@ pub struct Poly1305 {
             putU64(p.hw, 0, hr0);
             putU64(p.hw, 8, hr1);
             putU64(p.hw, 16, hr2);
-            putU64(p.hw, 24, hr1 * 20);   // s1
-            putU64(p.hw, 32, hr2 * 20);   // s2
-            putU64(p.hw, 40, 0);          // h0
-            putU64(p.hw, 48, 0);          // h1
-            putU64(p.hw, 56, 0);          // h2
+            putU64(p.hw, 24, hr1 * 20);
+            putU64(p.hw, 32, hr2 * 20);
+            putU64(p.hw, 40, 0);
+            putU64(p.hw, 48, 0);
+            putU64(p.hw, 56, 0);
             p.useHw = 1;
         }
         return p;
     }
 
-    // Absorb one 16-byte block from m+off. hibit is HIBIT for a full block or 0 for the padded final.
     fn absorb(self: Poly1305, m: ptr, off: int, hibit: ulong): void {
         let t0 = leWord(m, off);
         let t1 = leWord(m, off + 4);
@@ -166,7 +150,6 @@ pub struct Poly1305 {
         }
     }
 
-    // Finalize the accumulator, add the pad, and write the 16-byte tag to out.
     pub fn final(self: Poly1305, out: ptr): void {
         if (self.useHw == 1) {
             let padLo = self.pad0 | (self.pad1 << 32);
@@ -176,7 +159,6 @@ pub struct Poly1305 {
             return;
         }
         if (self.bufLen > 0) {
-            // Pad the last partial block: append 0x01, zero the rest, absorb with hibit already in it.
             bytes.write_byte(self.buf, self.bufLen, 1);
             let j = self.bufLen + 1;
             while (j < 16) { bytes.write_byte(self.buf, j, 0); j = j + 1; }
@@ -184,7 +166,6 @@ pub struct Poly1305 {
             self.bufLen = 0;
         }
 
-        // Fully carry h.
         let h0 = self.h0; let h1 = self.h1; let h2 = self.h2; let h3 = self.h3; let h4 = self.h4;
         let c = h1 >> 26; h1 = h1 & M26; h2 = h2 + c;
         c = h2 >> 26; h2 = h2 & M26; h3 = h3 + c;
@@ -192,15 +173,13 @@ pub struct Poly1305 {
         c = h4 >> 26; h4 = h4 & M26; h0 = h0 + c * 5;
         c = h0 >> 26; h0 = h0 & M26; h1 = h1 + c;
 
-        // g = h + 5; if g carries past 2^130 then h >= p, so use g's low 130 bits, else keep h.
         let g0 = h0 + 5; c = g0 >> 26; g0 = g0 & M26;
         let g1 = h1 + c; c = g1 >> 26; g1 = g1 & M26;
         let g2 = h2 + c; c = g2 >> 26; g2 = g2 & M26;
         let g3 = h3 + c; c = g3 >> 26; g3 = g3 & M26;
         let g4 = h4 + c;
-        // Bit 26 of g4 is the 2^130 carry: 1 means h >= p. Constant-time select.
         let useG = (g4 >> 26) & 1;
-        let mask = 0 - useG;               // all ones if useG == 1, else 0
+        let mask = 0 - useG;
         let notMask = mask ^ 0xffffffffffffffff;
         g4 = g4 & M26;
         h0 = (h0 & notMask) | (g0 & mask);
@@ -209,13 +188,11 @@ pub struct Poly1305 {
         h3 = (h3 & notMask) | (g3 & mask);
         h4 = (h4 & notMask) | (g4 & mask);
 
-        // Serialize h as four 32-bit little-endian words.
         let f0 = (h0 | (h1 << 26)) & 0xffffffff;
         let f1 = ((h1 >> 6) | (h2 << 20)) & 0xffffffff;
         let f2 = ((h2 >> 12) | (h3 << 14)) & 0xffffffff;
         let f3 = ((h3 >> 18) | (h4 << 8)) & 0xffffffff;
 
-        // Add the pad (the s half of the key) with carry.
         let a0 = f0 + self.pad0; let cc = a0 >> 32; a0 = a0 & 0xffffffff;
         let a1 = f1 + self.pad1 + cc; cc = a1 >> 32; a1 = a1 & 0xffffffff;
         let a2 = f2 + self.pad2 + cc; cc = a2 >> 32; a2 = a2 & 0xffffffff;
@@ -239,7 +216,6 @@ pub struct Poly1305 {
     }
 }
 
-// One-shot Poly1305: authenticate msgLen bytes at msg under the 32-byte key, writing a 16-byte tag.
 pub fn authInto(key: ptr, msg: ptr, msgLen: int, out: ptr): void {
     let p = Poly1305.create(key);
     p.update(msg, msgLen);

@@ -1,18 +1,8 @@
-// M3+ of the C++ runtime retirement plan: the multi-core reactor server carries the App to every
-// worker thread. runReactorMC spawns N share-nothing reactor threads (one reactor + SO_REUSEPORT
-// listener each) via a worker closure; a lambda passed to runReactors resolves only its FIRST
-// capture, so the App is the single capture and the port rides on the App. This proves that
-// single-capture delivery: each of N worker threads receives the same App with its configuration
-// intact (here app.serverPort), reading it concurrently. Combined with case 204 (a full App request
-// on one reactor) and case 195 (multiple reactors are race-free), the multi-core App server is
-// covered; the forever-looping server itself (runReactorMC) is validated by construction.
 import assert;
 import bytes;
 import net.poller;
 import web.app;
 
-// A single capturable context: the App plus a shared result buffer. Packing both into one struct
-// keeps the worker closure to a single capture, which is the constraint runReactorMC works within.
 struct WorkerCtx {
     pub application: App,
     pub results: long,
@@ -22,7 +12,6 @@ struct WorkerCtx {
     }
 }
 
-// Runs on each worker thread: read the App's carried config and record it at this worker's slot.
 fn probeWorker(ctx: WorkerCtx, idx: int): void {
     let port = ctx.application.serverPort;
     bytes.write_i32(ctx.results, idx * 4, (port + idx) as long);
@@ -42,7 +31,6 @@ fn test_app_reaches_each_worker(): void {
         probeWorker(ctx, idx);
     });
 
-    // Each worker thread saw the same App with serverPort 9000 and its own index.
     assert.equalInt(bytes.read_i32(results, 0) as int, 9000);
     assert.equalInt(bytes.read_i32(results, 4) as int, 9001);
     assert.equalInt(bytes.read_i32(results, 8) as int, 9002);

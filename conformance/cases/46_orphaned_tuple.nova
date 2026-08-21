@@ -1,34 +1,15 @@
-// Pins the ACQUISITION-layer cutover (arc.md §7.2, RAII "constructor" half): a `.tuple`
-// literal is an OWNED statement-drain temporary, so a tuple whose box nothing binds is
-// released at statement end instead of leaking.
-//
-// Before the cutover the acquisition decision was an ad-hoc producer WHITELIST
-// (`producesOwnedTemporary`) that did NOT list `.tuple`. So a tuple literal's heap box was
-// an unregistered producer: bound tuples were fine (the `let`/destructor balanced them),
-// but an ORPHANED tuple — a tuple evaluated as a bare expression statement, binding
-// nothing — leaked its box AND, because the box destructor never ran, its owned elements.
-// Measured: the case below leaked 3 objects / 20 bytes under the whitelist, clean after.
-//
-// The principled model makes "owned" the default for a managed producer (a tuple box is
-// one), so the orphan is registered and drained. Element ownership inside the box is
-// unchanged (case 42). Must be leak-free under --arc and clean under --asan.
 import assert;
 
 fn tag(s: string): string { return s + "!"; }
 
 @test
 fn test_orphaned_tuple(): void {
-    // The tuple box is a pure temporary — nothing binds it. Its two elements are FRESH
-    // heap strings (`tag(..)` returns a concatenation), so the box owns real +1s; if the
-    // box is not released, all three objects leak.
     (tag("a"), tag("b"));
     assert.equalInt(1, 1);
 }
 
 @test
 fn test_orphaned_tuple_in_loop(): void {
-    // A loop makes the leak unbounded if the box is not drained per iteration — the
-    // spill-slot re-zero (spillTemp) is what keeps this from double-releasing, too.
     let i = 0;
     while (i < 5) {
         (tag("x"), tag("y"));

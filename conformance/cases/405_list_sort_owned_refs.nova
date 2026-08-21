@@ -1,6 +1,3 @@
-// List.sort with a comparator on OWNED-REFERENCE elements (List<string>) now works: binding each at() result
-// to a local before the comparator call fixed a pre-existing ARC-of-temporary crash (a garbage pointer reached
-// the comparator; the old insertion sort crashed identically).
 import list;
 import string;
 import assert;

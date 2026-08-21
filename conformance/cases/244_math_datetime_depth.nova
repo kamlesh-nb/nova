@@ -1,4 +1,3 @@
-// T15 stdlib depth: math trig/log + datetime timezone-aware parse/format.
 import math;
 import datetime;
 import assert;
@@ -8,7 +7,6 @@ fn test_math_trig(): void {
     assert.isTrue(math.fabs(math.sin(math.pi() / 6.0) - 0.5) < 0.0001);
     assert.isTrue(math.fabs(math.cos(math.pi() / 3.0) - 0.5) < 0.0001);
     assert.isTrue(math.fabs(math.tan(math.pi() / 4.0) - 1.0) < 0.0001);
-    // range reduction survives a large angle
     assert.isTrue(math.fabs(math.sin((20.0 * math.pi()) + (math.pi() / 6.0)) - 0.5) < 0.0005);
     assert.isTrue(math.fabs(math.atan(1.0) - (math.pi() / 4.0)) < 0.0001);
     assert.isTrue(math.fabs(math.atan2(1.0, 0.0 - 1.0) - (3.0 * math.pi() / 4.0)) < 0.0005);
@@ -18,15 +16,12 @@ fn test_math_trig(): void {
 
 @test
 fn test_datetime_zones(): void {
-    // +05:00 wall-clock is 5h earlier in UTC.
     let a = datetime.fromIsoUtc("2024-03-15T12:30:00+05:00") ?? -1;
     let b = datetime.fromIsoUtc("2024-03-15T07:30:00Z") ?? -2;
     assert.equalInt(b, a);
-    // negative offset
     let c = datetime.fromIsoUtc("2024-03-15T00:00:00-08:00") ?? -1;
     let d = datetime.fromIsoUtc("2024-03-15T08:00:00") ?? -2;
     assert.equalInt(d, c);
-    // round-trip through a half-hour zone
     let iso = datetime.formatOffset(b, (5 * 3600) + (30 * 60));
     assert.equalInt(b, datetime.fromIsoUtc(iso) ?? -1);
 }

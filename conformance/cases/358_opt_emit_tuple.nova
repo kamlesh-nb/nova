@@ -1,17 +1,3 @@
-// Optimiser LIR emit path (NOVA_OPT_EMIT): scalar tuple construction `(a, b)` + positional element access
-// `t.0` / `t.1` (which the parser desugars to the index form `t[N]`). A tuple is a positional heap aggregate:
-// N i64 words via nova_bytes_alloc, element k at offset k*8. A scalar (int/bool-only) tuple has no owned
-// element, so construction needs no element retain; its own heap allocation is still freed via the tuple
-// destructor (a no-op body -- no owned elements -- so nova_release just decrefs + frees the N words).
-//
-// These free, all-int/bool functions are in the emittable subset, so under NOVA_OPT_EMIT they compile from the
-// optimised LIR and under the default build from the AST; BOTH must agree (differential) and the emit build
-// must be ASAN/ARC-clean (the tuple allocation is freed, not leaked or double-freed).
-//
-// Byte-identity landmine covered by `overflowsAs64Bit`: the AST reads a tuple element as a raw i64 WORD and
-// does 64-bit arithmetic on it with NO 32-bit wrap (a tuple element carries no int width in the AST). The
-// emit path types the element read as `long` to match, so `t.0 + t.1` does not wrap at 32 bits and stays
-// identical to the AST on an int-overflowing sum.
 import assert;
 
 fn addPair(): int {
@@ -26,8 +12,6 @@ fn readThird(): int {
     return t3.0 + b + t3.2;
 }
 
-// A scalar tuple built + read inside a loop: an alloca reused per iteration is where a leak / use-after-free
-// would show under the --asan / --arc gates.
 fn loopSum(): int {
     let acc = 0;
     let i = 0;
@@ -39,8 +23,6 @@ fn loopSum(): int {
     return acc;
 }
 
-// The tell for 32-bit wrap: 2000000000 + 2000000000 = 4000000000, which is POSITIVE as a 64-bit word but
-// NEGATIVE if wrapped to int32. The AST does the 64-bit add, so the sum is positive; the emit path must agree.
 fn overflowsAs64Bit(): bool {
     let t: (int, int) = (2000000000, 2000000000);
     let s = t.0 + t.1;
@@ -50,12 +32,11 @@ fn overflowsAs64Bit(): bool {
 @test
 fn test_tuple_scalar_access(): void {
     assert.equalInt(addPair(), 7);
-    assert.equalInt(readThird(), 13);      // 7 + 1 + 5
-    assert.equalInt(loopSum(), 400);       // sum over i in [0,20): i + (i+1)
+    assert.equalInt(readThird(), 13);
+    assert.equalInt(loopSum(), 400);
 }
 
 @test
 fn test_tuple_element_is_64bit_word(): void {
-    // Byte-identical with the AST: a tuple element read is a 64-bit word, so the sum does not wrap negative.
     assert.isTrue(!overflowsAs64Bit());
 }

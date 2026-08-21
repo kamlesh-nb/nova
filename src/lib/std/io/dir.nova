@@ -4,8 +4,6 @@ import mem.allocator;
 import collections.list;
 import os.sys;
 
-// Directory I/O in Nova over the raw POSIX syscalls in os/sys (M5). A Dir holds an open DIR*
-// from opendir; read walks it with readdir, reading the entry name out of struct dirent.
 pub struct Dir {
     pub handle: ptr,
     pub path: string,
@@ -30,8 +28,6 @@ pub struct Dir {
             return undefined;
         }
 
-        // struct dirent: where the NUL-terminated d_name starts differs by kernel (21 on macOS/BSD,
-        // 19 on Linux), so the offset comes from os/sys's per-OS seam rather than being hardcoded.
         let nameOff = sys.DIRENT_NAME_OFF();
         let clen = 0;
         while (bytes.read_byte(ent, nameOff + clen) != 0) {
@@ -127,10 +123,6 @@ pub struct Dir {
         return r;
     }
 
-    // A writable temporary directory, without a trailing separator: TMPDIR (the POSIX convention,
-    // always set on macOS), then TEMP/TMP (always set on Windows), then the POSIX default. Callers
-    // build paths from this instead of hardcoding "/tmp", which does not exist on Windows — Win32
-    // resolves a leading "/" against the current drive root, so "/tmp/x" silently means "C:\tmp\x".
     pub fn tempDir(): string {
         let t = envDir("TMPDIR");
         if (t.length > 0) { return t; }
@@ -142,8 +134,6 @@ pub struct Dir {
     }
 }
 
-// One environment variable as a Nova string, with any trailing '/' or '\' trimmed so callers can
-// always join with a single separator. "" when unset.
 fn envDir(name: string): string {
     let cp = sys.cstr(name);
     let v = sys.getenv(cp);
@@ -158,7 +148,7 @@ fn envDir(name: string): string {
     }
     while (clen > 0) {
         let last = bytes.read_byte(v, clen - 1);
-        if (last != 47 && last != 92) { break; }   // '/' '\'
+        if (last != 47 && last != 92) { break; }
         clen = clen - 1;
     }
 

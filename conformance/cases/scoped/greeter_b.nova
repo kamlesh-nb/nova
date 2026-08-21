@@ -1,5 +1,4 @@
 import greeter_a;
-// Module B: a SAME-NAMED trait Greeter (same interface) + its own implementer (returns 222).
 pub trait Greeter { fn greet(self: Greeter): int; }
 pub struct HelloB impl Greeter { pub v: int, init() { self.v = 2; }
     pub fn greet(self: HelloB): int { return 222; }

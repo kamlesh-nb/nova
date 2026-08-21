@@ -1,6 +1,3 @@
-// T10: IPv6 address-literal parsing + DNS resolution cache. parseIPv6 turns textual v6 into 16 packed
-// bytes (handling "::" compression); the cache lets a repeat connect resolve from memory (no blocking
-// getaddrinfo on the reactor thread).
 import net.dns;
 import net.dial;
 import bytes;
@@ -18,7 +15,6 @@ fn test_parse_loopback(): void {
 
 @test
 fn test_parse_full(): void {
-    // 2001:0db8:0000:0000:0000:0000:0000:0001 written compressed
     let out = bytes.alloc(16);
     assert.isTrue(dns.parseIPv6("2001:db8::1", out));
     assert.equalInt(0x20, b(out, 0)); assert.equalInt(0x01, b(out, 1));
@@ -47,9 +43,9 @@ fn test_parse_all_zero(): void {
 @test
 fn test_parse_rejects_bad(): void {
     let out = bytes.alloc(16);
-    assert.isFalse(dns.parseIPv6("2001:db8", out));        // too few groups, no "::"
-    assert.isFalse(dns.parseIPv6("xyz::1", out));          // non-hex
-    assert.isFalse(dns.parseIPv6("12345::1", out));        // group > 4 digits
+    assert.isFalse(dns.parseIPv6("2001:db8", out));
+    assert.isFalse(dns.parseIPv6("xyz::1", out));
+    assert.isFalse(dns.parseIPv6("12345::1", out));
 }
 
 @test
@@ -66,17 +62,15 @@ fn test_dns_cache(): void {
 fn test_sockaddr_in6(): void {
     let addr = bytes.alloc(16);
     dns.parseIPv6("2001:db8::1", addr);
-    // Linux form (family 10, no bsd len byte)
     let sa = dns.makeSockaddrIn6(10, 8080, addr, false);
-    assert.equalInt(10, b(sa, 0)); assert.equalInt(0, b(sa, 1));   // AF_INET6 LE
-    assert.equalInt(0x1f, b(sa, 2)); assert.equalInt(0x90, b(sa, 3)); // port 8080 BE
-    assert.equalInt(0x20, b(sa, 8)); assert.equalInt(0x01, b(sa, 9)); // addr starts at 8
-    assert.equalInt(1, b(sa, 23));                                  // ::1 low byte
-    // BSD form (family 30, sin6_len byte)
+    assert.equalInt(10, b(sa, 0)); assert.equalInt(0, b(sa, 1));
+    assert.equalInt(0x1f, b(sa, 2)); assert.equalInt(0x90, b(sa, 3));
+    assert.equalInt(0x20, b(sa, 8)); assert.equalInt(0x01, b(sa, 9));
+    assert.equalInt(1, b(sa, 23));
     let sb = dns.makeSockaddrIn6(30, 443, addr, true);
-    assert.equalInt(28, b(sb, 0));                                 // sin6_len
-    assert.equalInt(30, b(sb, 1));                                 // AF_INET6 (1 byte)
-    assert.equalInt(0x01, b(sb, 2)); assert.equalInt(0xbb, b(sb, 3)); // port 443 BE
+    assert.equalInt(28, b(sb, 0));
+    assert.equalInt(30, b(sb, 1));
+    assert.equalInt(0x01, b(sb, 2)); assert.equalInt(0xbb, b(sb, 3));
 }
 
 @test

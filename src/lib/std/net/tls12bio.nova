@@ -1,7 +1,3 @@
-// TLS 1.2 client as a TlsBio (M13 stage 4): drives crypto/tls/12/tlsClient over the same transport-
-// agnostic feed/pull/step/writeApp/readApp interface as the TLS 1.3 bios, so net/asynctls and the TDS
-// driver can speak TLS 1.2 in pure Nova. The handshake authenticates the server (ServerKeyExchange
-// signature). Client only; verified live vs openssl s_server -tls1_2. See net/tlsmembio for the trait.
 import bytes;
 import net.tlsmembio;
 import crypto.tls.12.client12;
@@ -18,16 +14,15 @@ fn fillRandom(buf: ptr, n: int): void {
 pub struct Client12Bio impl TlsBio {
     pub buf: tlsmembio.MemBuf,
     pub cl: client12.TlsClient12,
-    pub state: int,                 // 1 recv flight, 2 recv server Finished, 3 done, -1 error
+    pub state: int,
     pub hs: ptr, pub hsLen: int, pub hsCap: int, pub consumed: int,
-    pub svd: ptr,                   // expected server verify_data
+    pub svd: ptr,
     pub scratch: ptr, pub plain: ptr,
-    pub pendingOff: int, pub pendingLen: int,   // leftover decrypted plaintext (record > caller's max)
-    pub verify: bool, pub host: string, pub store: truststore.TrustStore,   // CA trust policy (when verify)
+    pub pendingOff: int, pub pendingLen: int,
+    pub verify: bool, pub host: string, pub store: truststore.TrustStore,
 
     pub fn feed(self: Client12Bio, data: ptr, n: int): void { self.buf.feed(data, n); }
     pub fn markClosed(self: Client12Bio): void { self.buf.closed = true; }
-    // mTLS: present this client certificate + P-256 key if the server sends a CertificateRequest.
     pub fn configureClientCert(self: Client12Bio, certDer: ptr, certLen: int, key: ptr): void {
         self.cl.setClientCert12(certDer, certLen, key);
     }
@@ -47,12 +42,7 @@ pub struct Client12Bio impl TlsBio {
         self.hsLen = self.hsLen + n;
     }
 
-    // On ServerHelloDone: build ClientKeyExchange + ChangeCipherSpec + (encrypted) Finished into the
-    // outbound queue, and record the expected server verify_data.
     fn sendClientFlight(self: Client12Bio): void {
-        // mTLS: on a CertificateRequest, the client Certificate goes BEFORE ClientKeyExchange so it is
-        // part of the CH..CKE transcript (and the extended-master-secret session_hash). With no client
-        // cert configured we still send an EMPTY Certificate and OMIT CertificateVerify (RFC 5246).
         if (self.cl.certRequested) {
             let cc = bytes.alloc(self.cl.clientCertLen + 32);
             let ccLen = client12.buildClientCertificate12(if (self.cl.haveClientCert) self.cl.clientCertDer else cc,
@@ -64,8 +54,6 @@ pub struct Client12Bio impl TlsBio {
         let cke = bytes.alloc(256);
         let ckeLen = self.cl.buildClientKeyExchange(cke);
         self.buf.appendRecord(0x16, 0x03, 0x03, cke, ckeLen);
-        // mTLS: CertificateVerify follows CKE (signs Hash(CH..CKE)) and joins the transcript before the
-        // client Finished.
         if (self.cl.certRequested && self.cl.haveClientCert) {
             let cv = bytes.alloc(128);
             let cvLen = self.cl.buildCertVerify12(self.cl.clientKey, cv);
@@ -101,7 +89,6 @@ pub struct Client12Bio impl TlsBio {
                 if (ctype == 0x14) { continue; }
                 if (ctype != 0x16) { self.state = 0 - 1; return 0 - 1; }
                 self.appendHs(at(self.scratch, 5), m - 5);
-                // Dispatch complete handshake messages.
                 let more = true;
                 while (more && self.consumed + 4 <= self.hsLen) {
                     let p = self.consumed;
@@ -113,15 +100,12 @@ pub struct Client12Bio impl TlsBio {
                         if (mt == 0x02) { self.cl.processServerHello(msg, 4 + ml); }
                         else if (mt == 0x0b) { self.cl.processCertificate(msg, 4 + ml); }
                         else if (mt == 0x0c) { if (!self.cl.processServerKeyExchange(msg, 4 + ml)) { self.state = 0 - 1; return 0 - 1; } }
-                        else if (mt == 0x0d) {                 // CertificateRequest (mTLS)
+                        else if (mt == 0x0d) {
                             self.cl.addTr(msg, 4 + ml);
                             self.cl.certRequested = true;
                         }
                         else if (mt == 0x0e) {
                             self.cl.addTr(msg, 4 + ml);
-                            // CA trust check (verify mode): the server chain collected from the
-                            // Certificate message must validate against a store root for `host` at
-                            // UTC-now, or the handshake fails -- exactly the TLS 1.3 bio's policy.
                             if (self.verify) {
                                 if (!self.store.trusts12(self.cl.certListPtr(), self.cl.certListSize(), self.host, truststore.nowUtc())) {
                                     self.state = 0 - 1;
@@ -136,12 +120,11 @@ pub struct Client12Bio impl TlsBio {
                 }
                 if (self.state == 2) { return 1; }
             } else if (self.state == 2) {
-                if (ctype == 0x14) { continue; }         // server ChangeCipherSpec
+                if (ctype == 0x14) { continue; }
                 if (ctype != 0x16) { self.state = 0 - 1; return 0 - 1; }
                 let sfin = self.plain;
                 let sfl = self.cl.openRecord(0x16, at(self.scratch, 5), m - 5, sfin);
                 if (sfl < 0) { self.state = 0 - 1; return 0 - 1; }
-                // Verify server verify_data (bytes 4..16 of the Finished message).
                 let ok = true;
                 let i = 0;
                 while (i < 12) { if (bytes.read_byte(sfin, 4 + i) != bytes.read_byte(self.svd, i)) { ok = false; } i = i + 1; }
@@ -162,10 +145,6 @@ pub struct Client12Bio impl TlsBio {
     }
 
     pub fn readApp(self: Client12Bio, out: ptr, max: int): int {
-        // Serve any plaintext left over from a record whose length exceeded a previous caller's `max`.
-        // Without this, a single recvInto that reads the OP_MSG length header (max 4) would decrypt the
-        // WHOLE reply record and drop everything past byte 4, then block forever waiting for a record the
-        // server already sent.
         if (self.pendingLen > self.pendingOff) {
             let avail = self.pendingLen - self.pendingOff;
             let take0 = if (avail > max) max else avail;
@@ -181,18 +160,17 @@ pub struct Client12Bio impl TlsBio {
             if (ctype == 0x17) {
                 let pl = self.cl.openRecord(0x17, at(self.scratch, 5), m - 5, self.plain);
                 if (pl < 0) { return 0 - 1; }
-                if (pl == 0) { continue; }                // empty app record: keep reading
+                if (pl == 0) { continue; }
                 self.pendingLen = pl;
                 let take = if (pl > max) max else pl;
                 let i = 0;
                 while (i < take) { bytes.write_byte(out, i, bytes.read_byte(self.plain, i)); i = i + 1; }
-                self.pendingOff = take;                   // remainder (if any) served on the next call
+                self.pendingOff = take;
                 return take;
             } else if (ctype == 0x16) {
-                // Post-handshake handshake record (e.g. NewSessionTicket): decrypt to advance seq, skip.
                 self.cl.openRecord(0x16, at(self.scratch, 5), m - 5, self.plain);
             } else if (ctype == 0x15) {
-                return 0 - 1;                            // alert -> closed
+                return 0 - 1;
             }
         }
         return 0;
@@ -205,11 +183,9 @@ pub struct Client12Bio impl TlsBio {
         bytes.free(self.scratch);
         bytes.free(self.plain);
     }
-    // TLS 1.2 does not negotiate ALPN here.
     pub fn selectedAlpn(self: Client12Bio): string { return ""; }
 }
 
-// Build a fresh TLS 1.2 client bio for `host` (SNI); the ClientHello is queued for the first pull().
 pub fn newClient12Bio(host: string): Client12Bio {
     let cl = client12.newClient12();
     fillRandom(cl.clientRandom, 32);
@@ -225,8 +201,6 @@ pub fn newClient12Bio(host: string): Client12Bio {
                          verify: false, host: host, store: truststore.TrustStore { ders: List<long>(), lens: List<int>() } };
 }
 
-// Verifying TLS 1.2 client BIO: the server certificate chain must validate against `store` for `host`
-// at UTC-now, or step() returns -1. This closes the mssql (and any TLS 1.2) MITM gap.
 pub fn newClient12BioVerify(host: string, store: truststore.TrustStore): Client12Bio {
     let b = newClient12Bio(host);
     b.verify = true;
@@ -234,23 +208,18 @@ pub fn newClient12BioVerify(host: string, store: truststore.TrustStore): Client1
     return b;
 }
 
-// Parse a PEM cert + EC private key (either two blocks or the single tlsCertificateKeyFile MongoDB uses)
-// and configure them on the bio for mTLS: the client presents this certificate when the server sends a
-// CertificateRequest. certPem and keyPem may be the same string (a combined PEM).
 fn configureClientCertPem(b: Client12Bio, certPem: string, keyPem: string): void {
     let certDer = tlsmembio.pemBody(certPem, "-----BEGIN CERTIFICATE-----", "-----END CERTIFICATE-----");
     let scalar = tlsmembio.ecKeyScalar(keyPem);
     b.configureClientCert(certDer as ptr, certDer.length, scalar);
 }
 
-// A TLS 1.2 client BIO that presents `certPem`/`keyPem` for mutual TLS (no server-chain verification).
 pub fn newClient12BioClientCert(host: string, certPem: string, keyPem: string): Client12Bio {
     let b = newClient12Bio(host);
     configureClientCertPem(b, certPem, keyPem);
     return b;
 }
 
-// mTLS client BIO that ALSO verifies the server chain against `store` (the fully-hardened X.509 path).
 pub fn newClient12BioClientCertVerify(host: string, store: truststore.TrustStore, certPem: string, keyPem: string): Client12Bio {
     let b = newClient12BioVerify(host, store);
     configureClientCertPem(b, certPem, keyPem);

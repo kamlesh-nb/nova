@@ -1,27 +1,14 @@
-// NIST P-384 (secp384r1) ECDH, implemented in Nova with no external library (M12-B).
-//
-// A 12-limb (32-bit, little-endian) sibling of crypto/ecc/p256: the base field GF(p), p = 2^384 - 2^128
-// - 2^96 + 2^32 - 1, uses the same CIOS Montgomery multiply (Montgomery n0' = -p^-1 mod 2^32 = 1 for
-// this modulus, as for P-256). Field elements are twelve 32-bit limbs in a 96-byte buffer, fully reduced
-// to [0, p). Point arithmetic reuses the a = -3 short-Weierstrass Jacobian double/add formulas (identical
-// to P-256) and the 2-bit-window constant-time ladder. Field inversion is Fermat z^(p-2) with a plain
-// binary schedule over the fixed public exponent. Only the ECDH surface is provided (no ECDSA).
-//
-// References: FIPS 186-4 P-384 domain parameters, the standard Montgomery CIOS algorithm. Verified
-// against an independent P-384 ECDH computation (derivePublic + shared secret).
 import bytes;
 
 const MASK32: ulong = 0xffffffff;
 const U0: ulong = 0;
 const U1: ulong = 1;
 
-// ---- field element storage (12 limbs of 32 bits, little-endian, in a 96-byte buffer) ----
 
 fn newFe(): ptr { return bytes.alloc(96); }
 fn getw(f: ptr, i: int): ulong { return (bytes.read_ptr(f, i * 8) as long) as ulong; }
 fn setw(f: ptr, i: int, v: ulong): void { bytes.write_ptr(f, i * 8, (v as long) as ptr); }
 
-// The i-th limb of p (little-endian): p = ...ffffffff fffffffe ffffffff 00000000 00000000 ffffffff.
 fn pl(i: int): ulong {
     if (i == 1) { return U0; }
     if (i == 2) { return U0; }
@@ -32,7 +19,6 @@ fn pl(i: int): ulong {
 fn feCopy(out: ptr, a: ptr): void { let i = 0; while (i < 12) { setw(out, i, getw(a, i)); i = i + 1; } }
 fn feZero(out: ptr): void { let i = 0; while (i < 12) { setw(out, i, U0); i = i + 1; } }
 
-// Conditional subtract of p: t[0..12] (t < 2p, t[12] the top carry) -> t-p if t >= p else t, into out.
 fn condSubP(out: ptr, t: ptr): void {
     let d = bytes.alloc(96);
     let borrow: ulong = 0;
@@ -44,7 +30,7 @@ fn condSubP(out: ptr, t: ptr): void {
         j = j + 1;
     }
     let x12 = getw(t, 12) - borrow;
-    borrow = (x12 >> 32) & U1;              // 1 => t < p (keep t); 0 => t >= p (take d)
+    borrow = (x12 >> 32) & U1;
     let mask = U0 - (borrow ^ U1);
     j = 0;
     while (j < 12) {
@@ -79,7 +65,7 @@ fn feSub(out: ptr, a: ptr, b: ptr): void {
         borrow = (x >> 32) & U1;
         j = j + 1;
     }
-    let mask = U0 - borrow;                 // all ones when a < b: add p back
+    let mask = U0 - borrow;
     let carry: ulong = 0;
     j = 0;
     while (j < 12) {
@@ -91,9 +77,8 @@ fn feSub(out: ptr, a: ptr, b: ptr): void {
     bytes.free(d);
 }
 
-// Montgomery multiply (CIOS): out = a*b*R^-1 mod p, R = 2^384. n0' = 1. Inputs/output canonical (< p).
 fn feMul(out: ptr, a: ptr, b: ptr): void {
-    let t = bytes.alloc(112);               // t[0..13]
+    let t = bytes.alloc(112);
     let j = 0;
     while (j < 14) { setw(t, j, U0); j = j + 1; }
     let i = 0;
@@ -110,7 +95,6 @@ fn feMul(out: ptr, a: ptr, b: ptr): void {
         let s12 = getw(t, 12) + carry;
         setw(t, 12, s12 & MASK32);
         setw(t, 13, s12 >> 32);
-        // reduction: m = t[0] * n0' mod 2^32, n0' = 1.
         let m = getw(t, 0);
         let c2 = (getw(t, 0) + m * pl(0)) >> 32;
         j = 1;
@@ -130,7 +114,6 @@ fn feMul(out: ptr, a: ptr, b: ptr): void {
 }
 fn feSq(out: ptr, a: ptr): void { feMul(out, a, a); }
 
-// Convert into Montgomery form: out = a*R mod p, by 384 successive doublings.
 fn toMont(out: ptr, a: ptr): void {
     feCopy(out, a);
     let i = 0;
@@ -170,8 +153,6 @@ fn setHex(buf: ptr, hex: string): void {
     while (i < n) { bytes.write_byte(buf, i, nib(hex[i * 2]) * 16 + nib(hex[i * 2 + 1])); i = i + 1; }
 }
 
-// Field inversion in Montgomery form: out = (aR)^(p-2) in the Montgomery domain (a binary schedule over
-// the fixed public exponent p-2).
 fn feInvert(out: ptr, a: ptr): void {
     let r = newFe(); montOne(r);
     let e = bytes.alloc(48);
@@ -192,7 +173,6 @@ fn montOne(out: ptr): void {
     bytes.free(one);
 }
 
-// ---- big-endian byte <-> field element ----
 
 fn feFromBE(out: ptr, buf: ptr, off: int): void {
     let i = 0;
@@ -228,7 +208,6 @@ fn bMont(out: ptr): void {
     bytes.free(b); bytes.free(t);
 }
 
-// ---- Jacobian points: 288-byte buffer, X at 0, Y at 96, Z at 192 (each a Montgomery field element) ----
 
 fn newPt(): ptr { return bytes.alloc(288); }
 fn px(p: ptr): ptr { return p; }
@@ -250,21 +229,21 @@ fn jDouble(q: ptr): void {
     feSub(t1, px(q), t1);
     feMul(t3, t1, t2);
     feAdd(t1, t3, t3);
-    feAdd(t1, t3, t1);                     // m = 3*(x+z^2)*(x-z^2)
+    feAdd(t1, t3, t1);
     feSq(t3, py(q));
-    feAdd(t3, t3, t3);                     // 2*y^2
+    feAdd(t3, t3, t3);
     feMul(t2, px(q), t3);
-    feAdd(t2, t2, t2);                     // s = 4*x*y^2
+    feAdd(t2, t2, t2);
     feSq(px(q), t1);
     feSub(px(q), px(q), t2);
-    feSub(px(q), px(q), t2);               // x' = m^2 - 2s
+    feSub(px(q), px(q), t2);
     feMul(t4, py(q), pz(q));
-    feAdd(pz(q), t4, t4);                  // z' = 2*y*z
+    feAdd(pz(q), t4, t4);
     feSub(t2, t2, px(q));
     feMul(py(q), t1, t2);
     feSq(t4, t3);
-    feAdd(t4, t4, t4);                     // 8*y^4
-    feSub(py(q), py(q), t4);               // y'
+    feAdd(t4, t4, t4);
+    feSub(py(q), py(q), t4);
     bytes.free(t1); bytes.free(t2); bytes.free(t3); bytes.free(t4);
 }
 
@@ -272,28 +251,28 @@ fn jAdd(p1: ptr, p2: ptr): void {
     let t1 = newFe(); let t2 = newFe(); let t3 = newFe(); let t4 = newFe();
     let t5 = newFe(); let t6 = newFe(); let t7 = newFe();
     feSq(t3, pz(p2));
-    feMul(t1, px(p1), t3);                 // u1
+    feMul(t1, px(p1), t3);
     feMul(t4, pz(p2), t3);
-    feMul(t3, py(p1), t4);                 // s1
+    feMul(t3, py(p1), t4);
     feSq(t4, pz(p1));
-    feMul(t2, px(p2), t4);                 // u2
+    feMul(t2, px(p2), t4);
     feMul(t5, pz(p1), t4);
-    feMul(t4, py(p2), t5);                 // s2
-    feSub(t2, t2, t1);                     // h
-    feSub(t4, t4, t3);                     // r
+    feMul(t4, py(p2), t5);
+    feSub(t2, t2, t1);
+    feSub(t4, t4, t3);
     feSq(t7, t2);
     feMul(t6, t1, t7);
-    feMul(t5, t7, t2);                     // h^3
+    feMul(t5, t7, t2);
     feSq(px(p1), t4);
     feSub(px(p1), px(p1), t5);
     feSub(px(p1), px(p1), t6);
-    feSub(px(p1), px(p1), t6);             // x3
+    feSub(px(p1), px(p1), t6);
     feSub(t6, t6, px(p1));
     feMul(py(p1), t4, t6);
     feMul(t1, t5, t3);
-    feSub(py(p1), py(p1), t1);             // y3
+    feSub(py(p1), py(p1), t1);
     feMul(t1, pz(p1), pz(p2));
-    feMul(pz(p1), t1, t2);                 // z3
+    feMul(pz(p1), t1, t2);
     bytes.free(t1); bytes.free(t2); bytes.free(t3); bytes.free(t4);
     bytes.free(t5); bytes.free(t6); bytes.free(t7);
 }
@@ -301,7 +280,6 @@ fn jAdd(p1: ptr, p2: ptr): void {
 fn neqZero(v: ulong): ulong { return ((v | (U0 - v)) >> 63) & U1; }
 fn eqVal(v: ulong, c: ulong): ulong { return neqZero(v ^ c) ^ U1; }
 
-// Multiply Jacobian point p by the big-endian scalar x[0..xlen), in place (2-bit window ladder).
 fn scalarMultPoint(p: ptr, x: ptr, xlen: int): void {
     let p2 = newPt(); ptCopy(p2, p); jDouble(p2);
     let p3 = newPt(); ptCopy(p3, p); jAdd(p3, p2);
@@ -361,16 +339,14 @@ fn onCurve(xn: ptr, yn: ptr): bool {
     let l = newFe(); feSq(l, ym);
     let r = newFe(); feSq(r, xm); feMul(r, r, xm);
     let t = newFe(); feAdd(t, xm, xm); feAdd(t, t, xm);
-    feSub(r, r, t);                                  // x^3 - 3x
+    feSub(r, r, t);
     let bm = newFe(); bMont(bm); feAdd(r, r, bm);
     let ok = feEq(l, r);
     bytes.free(xm); bytes.free(ym); bytes.free(l); bytes.free(r); bytes.free(t); bytes.free(bm);
     return ok;
 }
 
-// ---- public API ----
 
-// Derive the uncompressed public key (0x04 || X || Y, 97 bytes) for a 48-byte big-endian private scalar.
 pub fn derivePublic(outPub97: ptr, scalar48: ptr): void {
     let g = newPt(); baseG(g);
     scalarMultPoint(g, scalar48, 48);
@@ -382,8 +358,6 @@ pub fn derivePublic(outPub97: ptr, scalar48: ptr): void {
     bytes.free(g); bytes.free(xa); bytes.free(ya);
 }
 
-// ECDH: shared secret (48-byte big-endian X coordinate) from our 48-byte scalar and the peer's
-// uncompressed public point (97 bytes). Returns 1 on success, 0 if the peer point is invalid.
 pub fn ecdh(outSecret48: ptr, scalar48: ptr, peerPub97: ptr): int {
     if (bytes.read_byte(peerPub97, 0) != 4) { return 0; }
     let xn = newFe(); let yn = newFe();

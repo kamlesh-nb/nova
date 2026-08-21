@@ -1,14 +1,3 @@
-// T16 -- live integration harness. One @test per driver: each reads a DSN from the environment and,
-// when it is set, connects to the real server and runs a CREATE / INSERT / SELECT / DROP roundtrip,
-// asserting the typed decode. When the DSN is UNSET the test SKIPS cleanly (prints a hint and passes),
-// so the harness is green offline (`nova test` with no env) yet gates every driver's live path the
-// moment a DSN is provided -- e.g. in CI with service containers.
-//
-// Run one driver live:
-//   NOVA_PG_DSN='postgres://user:pass@127.0.0.1:5432/db' nova test integration/live_db_harness.nova
-// DSNs recognized: NOVA_PG_DSN, NOVA_MYSQL_DSN, NOVA_MSSQL_DSN, NOVA_BTREE_DSN, NOVA_MONGO_DSN.
-//
-// This file is compiled from the `lang/` directory so `../packages/nova-*` resolve as local packages.
 
 import assert;
 import list;
@@ -22,9 +11,6 @@ import mssql;
 import novadb;
 import mongodb;
 
-// A SQL CREATE/INSERT/SELECT/DROP roundtrip over any Connection-producing Driver. `textType` is the
-// column type for the name field (TEXT vs VARCHAR(32)) so each dialect gets a valid DDL. Returns "" on
-// success, else a human error string. Asserts one row decodes to (1, "Alice").
 fn sqlRoundtrip(drv: Driver, connectionString: string, textType: string): string {
     let conn = drv.connect(connectionString);
     let none = List<DbValue>();
@@ -84,7 +70,6 @@ fn live_btreedb(): void {
 
 @test
 fn live_mongodb(): void {
-    // mongo is not SQL: exercise connect + a server ping command through the same seam.
     let connectionString = env.get("NOVA_MONGO_DSN");
     if (string.eql(connectionString, "")) { skip("mongodb", "NOVA_MONGO_DSN"); return; }
     let conn = MongoDriver().connect(connectionString);

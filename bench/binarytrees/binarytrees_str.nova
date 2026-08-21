@@ -1,35 +1,25 @@
-// binary-trees, BORROWED-STRING (Str) variant. Each Node carries a `Str` label -- a {ptr,len} VALUE view
-// borrowing bytes out of ONE long-lived owned buffer (NAMES). No node allocates a string of its own; the
-// label is a zero-copy borrow (Nova's `&str`), and the buffer outlives every tree, which is the manual
-// lifetime contract Str requires. The hot recursive `scan` walks the tree summing each node's label bytes
-// via `Str.byteAt`, so borrowed-view scanning is exercised on the SAME allocate/reclaim pattern as the
-// classic benchmark. Node counts are analytic (2^(d+1)-1), so the golden shape is preserved alongside the
-// borrowed-byte checksum.
 import str;
 
-// Long-lived backing buffer. "leaf" = bytes summing 408, "node" = bytes summing 422 (deterministic).
 const NAMES: string = "leafnode";
 
 struct Node {
-    pub label: str.Str,        // borrowed value-view, stored inline in the node
+    pub label: str.Str,
     pub left: Node | undefined,
     pub right: Node | undefined
 }
 
-fn leafLabel(): str.Str { return str.sub(NAMES, 0, 4); }   // "leaf"
-fn nodeLabel(): str.Str { return str.sub(NAMES, 4, 8); }   // "node"
+fn leafLabel(): str.Str { return str.sub(NAMES, 0, 4); }
+fn nodeLabel(): str.Str { return str.sub(NAMES, 4, 8); }
 
 fn bottomUp(depth: int): Node {
     if (depth <= 0) { return Node { label: leafLabel(), left: undefined, right: undefined }; }
     return Node { label: nodeLabel(), left: bottomUp(depth - 1), right: bottomUp(depth - 1) };
 }
-// Sum the bytes of a borrowed label with zero copies.
 fn labelSum(v: str.Str): int {
     let s = 0; let i = 0; let n = v.size();
     while (i < n) { s = s + v.byteAt(i); i = i + 1; }
     return s;
 }
-// Traverse the tree, accumulating the borrowed-byte checksum over every node's label.
 fn scan(n: Node): int {
     let l = n.left;
     if (l == undefined) { return labelSum(n.label); }

@@ -1,28 +1,20 @@
-// examples/08_functions.nova
 
-// A plain function: typed parameters, a declared return type.
 fn add(a: int, b: int): int {
     return a + b;
 }
 
-// `void` means "returns nothing".
 fn greet(name: string): void {
     console.log(`hello, ${name}`);
 }
 
-// A generic function. The type argument is written explicitly at the call site:
-// `identity<int>(...)`.
 fn identity<T>(x: T): T {
     return x;
 }
 
-// Generics let one body serve many types.
 fn firstOf<T>(a: T, b: T): T {
     return a;
 }
 
-// A struct with a method. Methods take `self` as the first parameter;
-// free functions do not. (Full struct coverage is in chapter 7.)
 struct Counter {
     value: int,
     init(start: int) { self.value = start; }
@@ -33,12 +25,10 @@ fn main(): void {
     console.log(`add(2, 3) = ${add(2, 3)}`);
     greet("Nova");
 
-    // identity works at any type; each call is a distinct instantiation.
     console.log(`identity<int>(42) = ${identity<int>(42)}`);
     console.log(`identity<string>("hi") = ${identity<string>("hi")}`);
     console.log(`firstOf<int>(10, 20) = ${firstOf<int>(10, 20)}`);
 
-    // Method call vs free-function call.
     let c = Counter(41);
     console.log(`c.bumped() = ${c.bumped()}`);
 }

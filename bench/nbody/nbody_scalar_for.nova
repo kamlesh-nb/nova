@@ -1,5 +1,3 @@
-// Scalar (container-free) N-body: 5 bodies as flat mutable locals, pairwise loops fully
-// unrolled. Isolates Nova's native f64 arithmetic codegen from List<double> overhead.
 import math;
 const PI: double = 3.141592653589793;
 const SOLAR_MASS: double = 4.0 * PI * PI;

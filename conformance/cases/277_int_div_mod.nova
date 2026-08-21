@@ -1,9 +1,3 @@
-// H: integer division/modulo now guards against the two undefined cases at runtime -- divide/modulo by
-// zero (previously silently returned 0/garbage) and the signed 64-bit INT_MIN / -1 overflow -- by
-// trapping via nova_panic_cstr. This positive case proves the guard does NOT disturb correct
-// arithmetic: division truncates toward zero, modulo takes the sign of the dividend, negative operands
-// work, and the non-overflowing INT_MIN-at-long-width case computes normally. The trap paths abort the
-// process (exit 134) so they are verified manually, not in this @test suite.
 import assert;
 
 fn dv(a: int, b: int): int { return a / b; }
@@ -29,7 +23,6 @@ fn test_mod_sign_of_dividend(): void {
 
 @test
 fn test_long_min_at_long_width_ok(): void {
-    // -2^31 / -1 is fine at 64-bit width (no overflow); only i64 MIN / -1 traps.
     let neg1: long = 0 - 1;
     let x: long = 0 - 2147483648;
     assert.equalInt(dvl(x, neg1) as int, 2147483648 as int);

@@ -1,31 +1,141 @@
+//! The LLVM code-generation backend: the compiler's final lowering stage, where
+//! the type-checked Nova program becomes an LLVM module ready to be optimised and
+//! emitted as a native object (or a WASM module).
+//!
+//! This file defines [`LlvmCompiler`], the single large stateful object that owns
+//! the whole codegen pass: the LLVM module and IR builder, the target machine, all
+//! the symbol tables carried over from the frontend (structs, enums, unions, traits,
+//! constants, functions), the caches that make per-expression type resolution cheap,
+//! and the debug-info (DWARF) machinery. Every other file in `codegen/` hangs methods
+//! off this struct rather than defining a parallel state object, which is why the
+//! bottom of this file is a long list of `pub const foo = other_module.foo;` lines:
+//! they graft the methods implemented in `arc.zig`, `types.zig`, `statements.zig`,
+//! `expressions.zig`, and `declarations.zig` onto [`LlvmCompiler`] so that, from a
+//! caller's point of view, `self.compileExpression(...)`, `self.compileRetain(...)`
+//! and the local helpers here all live on one object. The split is purely to keep
+//! each source file to a workable size; semantically it is one class.
+//!
+//! Key design decisions and invariants this file embodies:
+//!
+//!   - **One machine word is `i64` (`val_type`).** Almost every Nova value flows
+//!     through codegen as a 64-bit integer, whether it is a real integer, a float
+//!     bit-cast into a word, or a heap address. Heap addresses MUST stay 64-bit:
+//!     computing `addr + offset` at `i32` truncates the pointer and produces a
+//!     wild address, which is the single most common class of miscompile here.
+//!     Pointer-sized helpers ([`LlvmCompiler.ptrElemSize`], [`LlvmCompiler.valSlotSize`])
+//!     exist because WASM is a 32-bit target where a word is 4 bytes.
+//!
+//!   - **Monomorphization, not type erasure.** Generics are instantiated per
+//!     concrete type argument. [`LlvmCompiler.collectFunctions`] walks every struct
+//!     method and free function and, for each recorded instantiation (from
+//!     `sema/mono.zig`), registers a distinct mangled `FunctionInfo`. An erased
+//!     "base" body is emitted only as an `internal`-linkage fallback that later
+//!     dead-code elimination usually drops. [`LlvmCompiler.expandFreeFnInstsTransitively`]
+//!     fixes the point where one generic instantiation calls another until no new
+//!     instantiation is discovered.
+//!
+//!   - **ARC, decided in codegen.** There is no garbage collector. Ownership is
+//!     resolved here and in `arc.zig`: heap objects carry an 8-byte header
+//!     (refcount at -8, length at -4), `nova_retain`/`nova_release` bracket
+//!     borrows and drops, and value structs are copied inline with their owned
+//!     fields deep-retained. This file provides the allocation primitives
+//!     ([`LlvmCompiler.compileAlloc`], [`LlvmCompiler.compileAllocPersistent`],
+//!     [`LlvmCompiler.compileFree`]) and the WASM in-IR allocator
+//!     ([`LlvmCompiler.generateWasmMemoryFunctions`]); the retain/release policy
+//!     itself is grafted in from `arc.zig`.
+//!
+//!   - **Traits dispatch through fat pointers.** A trait object is a two-word heap
+//!     block `{struct_ptr, vtable_ptr}`; vtable slot 0 is always the destructor and
+//!     slots 1..N are the trait methods in declaration order. See
+//!     [`LlvmCompiler.getGlobalVTable`], [`LlvmCompiler.constructTraitObject`] and
+//!     [`LlvmCompiler.buildTraitVtableCall`].
+//!
+//!   - **Value optionals ("valopt") are a real ABI, not just null.** A value type
+//!     wrapped in an optional (`int?`, an unowned enum, or a nested `int??`) is
+//!     boxed so that "present zero" is distinguishable from "absent". The
+//!     [`LlvmCompiler.valueOptionalInner`] / [`LlvmCompiler.valoptDepth`] pair and
+//!     the `buildValopt*`/`coerceValoptArg` helpers implement the boxing rules and
+//!     the depth-matching a call site needs when an argument is more deeply boxed
+//!     than the parameter expects.
+//!
+//! The debug-info half of the file (all the `di*` helpers) builds DWARF only for
+//! native, non-release builds; every one of those functions is a no-op when
+//! `di_builder` is null, so callers never have to guard the debug case themselves.
 
 const std = @import("std");
+/// The abstract syntax tree the frontend produced; codegen reads declarations,
+/// statements, expressions and type references straight off it.
 const ast = @import("../../frontend/ast.zig");
+/// Monomorphization bookkeeping: the recorded set of concrete generic
+/// instantiations ([`sema_mono.method_insts`], `free_fn_insts`) that this pass
+/// turns into distinct emitted functions.
 const sema_mono = @import("../../frontend/sema/mono.zig");
+/// Reachability analysis: lets codegen skip generic struct methods that are never
+/// actually called, so the erased base body is not emitted needlessly.
 const sema_reach = @import("../../frontend/sema/reach.zig");
+/// The LLVM-C binding (`deps/llvm-zig`), re-exported below as `types`/`core`/etc.
 const llvm = @import("llvm");
 
+/// LLVM opaque handle types (`LLVMValueRef`, `LLVMTypeRef`, enums for linkage,
+/// predicates, and so on).
 const types = llvm.types;
+/// The LLVM-C `Core` API: module/builder/type/value construction and the IR
+/// builder instructions (`LLVMBuild*`).
 const core = llvm.core;
+/// The LLVM-C target-initialisation API (`LLVMInitializeAll*`).
 const target = llvm.target;
+/// The LLVM-C debug-info API (`LLVMDIBuilder*`) used to emit DWARF.
 const debug = llvm.debug;
+/// The LLVM-C target-machine API: triple resolution, host CPU/features, data layout.
 const target_machine = llvm.target_machine;
+/// The LLVM-C module-verification API. Imported for completeness; verification is
+/// driven from the driver, not from this file.
 const analysis = llvm.analysis;
+/// Coverage-instrumentation support (block registry + emitted counters).
 const coverage_mod = @import("coverage.zig");
+/// One instrumented basic block in the coverage map; re-exported so callers reach
+/// it as `LlvmCompiler.CoverageBlock`.
 pub const CoverageBlock = coverage_mod.CoverageBlock;
+/// The per-module registry of coverage blocks, populated when `coverage_enabled`.
 pub const CoverageRegistry = coverage_mod.CoverageRegistry;
 
+/// Shared codegen type utilities (name mangling, primitive classification, LLVM
+/// type mapping, expression-type resolution). Most of its functions are grafted
+/// onto [`LlvmCompiler`] at the bottom of this file.
 const types_mod = @import("types.zig");
+/// The frontend's typed IR: the authoritative `TypeId`-annotated view of every
+/// expression, consulted whenever a legacy name-based decision is not precise enough.
 const sema_infer = @import("../../frontend/sema/infer.zig");
+/// The frontend type store and `TypeId` model; the source of truth for ownership
+/// and the value/reference distinction.
 const sema_types = @import("../../frontend/types.zig");
+/// The shadow/diagnostic layer that cross-checks the legacy string-based type
+/// engine against the typed IR, plus `renderLegacy` for turning a `TypeId` back
+/// into a mangled name.
 const sema_shadow = @import("../../frontend/sema/shadow.zig");
+/// Strips a generic type's `<...>` suffix to its base name (e.g. `List<int>` ->
+/// `List`); used constantly to look a type up in the struct/enum tables.
 const getStructBaseName = types_mod.getStructBaseName;
+/// Predicate: whether a type name is one of the built-in primitive scalar types.
 const isPrimitiveTypeName = types_mod.isPrimitiveTypeName;
+/// The ARC (retain/release/destructor) policy module, grafted onto [`LlvmCompiler`] below.
 const arc_mod = @import("arc.zig");
+/// Statement lowering (`compileStatement`, `runErrdefers`), grafted on below.
 const statements_mod = @import("statements.zig");
+/// The top-level compile driver (`compile`) and codegen flags.
 const declarations_mod = @import("declarations.zig");
+/// Expression lowering (the bulk of `compile*` methods), grafted on below.
 const expressions_mod = @import("expressions.zig");
 
+/// Decodes the C-style backslash escapes in a Nova string literal into their
+/// actual bytes, returning a freshly allocated slice the caller owns.
+///
+/// The lexer keeps literals in their escaped source form (`\n`, `\t`, `\\`,
+/// `\"`, `\'`); codegen calls this to get the real byte content before laying it
+/// out as an LLVM constant array (see [`LlvmCompiler.getOrCreateStringLiteral`]).
+/// An unrecognised escape is passed through verbatim, backslash and all, rather
+/// than being dropped, so no information is lost on a malformed literal. A
+/// trailing lone backslash (no following byte) is emitted as-is.
 pub fn unescapeString(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
     var result = std.ArrayList(u8).empty;
     defer result.deinit(allocator);
@@ -54,237 +164,388 @@ pub fn unescapeString(allocator: std.mem.Allocator, input: []const u8) ![]const 
     return try result.toOwnedSlice(allocator);
 }
 
+/// A single function or method scheduled for emission, in the flattened,
+/// monomorphized form codegen actually walks.
+///
+/// [`LlvmCompiler.collectFunctions`] produces one `FunctionInfo` per concrete
+/// thing to emit: a plain function, a struct/enum method, one generic
+/// instantiation, or a synthesised lambda body. A generic method with N recorded
+/// instantiations becomes N entries with distinct mangled [`FunctionInfo.name`]s
+/// plus, unless `sema_mono.baseIsNeeded` says otherwise, one erased base entry.
+/// The `declarations.zig` emission pass consumes this list.
 pub const FunctionInfo = struct {
+    /// The fully mangled symbol name to emit (module prefix, struct owner and
+    /// type-argument suffix already applied).
     name: []const u8,
+    /// Number of LLVM parameters, counting the leading `self` for methods and the
+    /// leading `__env` for lambdas.
     param_count: usize,
+    /// Parameter names in order, parallel to `param_count`. Several `FunctionInfo`s
+    /// for the same method may share one backing slice; `deinit` frees each unique
+    /// pointer only once.
     param_names: []const []const u8,
+    /// The rendered return-type name (`"void"` when the source had none), used for
+    /// void-call detection and slot typing.
     return_type: []const u8,
 
+    /// The un-rendered return type reference, kept so codegen can re-render it
+    /// under the correct instantiation context; null for constructors/lambdas.
     ret_type_ref: ?ast.TypeRef = null,
+    /// The function body to lower.
     body: ast.Block,
-    // The declared parameters (free functions only; left empty for methods, whose implicit `self` shifts the
-    // argument indices). The optimiser emit path uses this to model params; empty => it treats the function
-    // as unmodelled and compiles from the AST.
+    /// The source parameter list (empty for constructors, which synthesise `self`).
     params: []const ast.Param = &.{},
 
+    /// Whether this is an `async` function, lowered to an LLVM coroutine.
     is_async: bool = false,
 
+    /// The owning concrete instantiation name (e.g. `List_int`) when this entry is
+    /// a specialised method; null for non-generic or erased entries.
     instantiation: ?[]const u8 = null,
-    // String-engine-removal: the explicit TypeId instantiation key for this spec (free-fn or method),
-    // used to set current_instantiation_id directly, bypassing the fragile name->live_inst_ids lookup.
+    /// The `TypeId` of the instantiation, the precise counterpart to
+    /// `instantiation`, used to render types exactly under this specialisation.
     instantiation_id: ?sema_types.TypeId = null,
 
+    /// True for the erased "base" body of a generic: emitted with internal linkage
+    /// as a link-time fallback that global DCE normally removes.
     erased_generic: bool = false,
 
+    /// The source file this declaration came from, used to compute its module
+    /// prefix and to attach debug info to the right compile unit.
     source_file: []const u8 = "",
 };
 
+/// One lexical scope on the codegen scope stack, holding the cleanup work that
+/// must run when control leaves the scope.
+///
+/// Nova's `defer` and `errdefer` and its ARC drops are all resolved by walking
+/// this stack. On normal exit the deferred statements run and `owned_locals` are
+/// released; on the error path the errdeferred statements additionally run.
 pub const Scope = struct {
+    /// `defer`red expressions, run in reverse on any exit from the scope.
     deferred_statements: std.ArrayList(ast.Expression),
 
+    /// `errdefer`red expressions, run in reverse only when leaving via an error.
     errdeferred_statements: std.ArrayList(ast.Expression) = .empty,
 
+    /// Heap-owning locals declared in this scope, released (via their destructor)
+    /// when the scope ends.
     owned_locals: std.ArrayList(OwnedLocal) = .empty,
 };
 
+/// A heap-owning local variable tracked for automatic release at scope exit.
 pub const OwnedLocal = struct {
+    /// The local's name, keyed against `locals`.
     name: []const u8,
+    /// The local's rendered type name, used to pick the correct destructor.
     type_name: []const u8,
 };
 
+/// A temporary value produced mid-expression whose ARC release is deferred to the
+/// end of the enclosing statement.
+///
+/// Sub-expressions that allocate (a `new`, a container literal, a boxed optional)
+/// register the result here so it is dropped once the full statement has consumed
+/// it, rather than leaking or being freed too early. `consumeTemporary` removes an
+/// entry when ownership is handed off instead.
 pub const PendingTemp = struct {
-
+    /// The temporary value (an `i64` word, usually a heap address).
     val: types.LLVMValueRef,
 
+    /// The stack slot the value was spilled to, if one was materialised.
     slot: types.LLVMValueRef,
+    /// The rendered type name, so the right destructor is chosen at drain time.
     type_name: []const u8,
 
+    /// The AST expression id that produced this temporary, used to match a
+    /// consumer that later takes ownership.
     expr_id: ast.ExprId = .unassigned,
 };
 
-// FR-simd-L2: which family of hardware crypto intrinsics the compile target provides. Decided once from
-// the target triple; the SIMD builtins pick the right LLVM intrinsic (or the software fallback) from it.
+/// Which SIMD instruction family the current target supports, selected from the
+/// triple: `none` (including WASM), NEON on `aarch64`, or SSE/AVX on `x86_64`.
 pub const SimdTarget = enum { none, aarch64, x86_64 };
 
-// Identity key for interning substTypeParams results. Interned/AST strings have stable pointers for the
-// duration of a compile, so (ptr,len) identifies the input and current instantiation uniquely.
+/// Cache key for a type-parameter substitution: identifies an (input type string,
+/// instantiation) pair by the pointer+length of the input slice plus the
+/// instantiation pointer and its `TypeId`, so a repeated substitution is a hash
+/// lookup rather than a re-render.
 pub const SubstKey = struct { in_ptr: usize, in_len: usize, inst_ptr: usize, inst_id: u32 };
 
+/// The whole LLVM code-generation pass, as one stateful object.
+///
+/// It owns the LLVM `module`/`builder`/`target_machine`, every symbol table the
+/// frontend produced (structs, enums, unions, traits, constants, and the
+/// `functions` worklist), the caches that keep per-expression type queries cheap,
+/// the debug-info state, and a large family of `current_*` cursors that track
+/// where lowering currently is (which function, which instantiation, which loop,
+/// which async coroutine). Methods are spread across `arc.zig`, `types.zig`,
+/// `statements.zig`, `expressions.zig` and `declarations.zig` and grafted on at
+/// the bottom of this file, so this one struct is the codegen "God object".
+///
+/// Lifecycle: [`LlvmCompiler.new`] builds it, `collectFunctions` +
+/// `collectStringLiterals` + the emission driver fill the module, and
+/// [`LlvmCompiler.deinit`] frees everything. Many maps borrow slices from the AST
+/// or from other tables, so `deinit` is careful about which keys/values it owns.
 pub const LlvmCompiler = struct {
+    /// The allocator backing every table and every transient buffer here.
     allocator: std.mem.Allocator,
+    /// The LLVM module being built: the container for all emitted globals and
+    /// functions, and the final unit handed to the optimiser/emitter.
     module: types.LLVMModuleRef,
+    /// The shared IR builder; its insert point is repositioned constantly as
+    /// lowering moves between basic blocks.
     builder: types.LLVMBuilderRef,
+    /// The target machine (triple + CPU + features + data layout) that fixes ABI,
+    /// pointer size and codegen options.
     target_machine: types.LLVMTargetMachineRef,
-    // DWARF debug info (Gap 4). Only populated in debug (non-release) builds: locals are only
-    // reliable at -O0, so debugging is a debug-build activity. `di_builder` null => emit nothing.
-    // `di_scope` is the current function's DISubprogram, set per-function so statement debug
-    // locations attach to the right scope.
+    /// The DWARF debug-info builder, or null when debug info is off (release or
+    /// WASM). All `di*` helpers short-circuit to a no-op when this is null.
     di_builder: types.LLVMDIBuilderRef = null,
+    /// The single DWARF compile unit, created lazily on the first function that
+    /// needs debug info (see [`LlvmCompiler.ensureDebugCU`]).
     di_cu: types.LLVMMetadataRef = null,
+    /// The compile unit's primary file metadata.
     di_file: types.LLVMMetadataRef = null,
-    // Absolute process cwd, resolved once, so relative source dirs become absolute DWARF paths a
-    // debugger can match against an absolute-path breakpoint. Null => leave dirs relative (fallback).
+    /// The working directory used to absolutise relative source paths for DWARF.
     di_cwd: ?[]const u8 = null,
+    /// The current DWARF lexical scope (subprogram) that new instructions attach to.
     di_scope: types.LLVMMetadataRef = null,
+    /// The file metadata paired with `di_scope`.
     di_scope_file: types.LLVMMetadataRef = null,
+    /// Whether debug info is being emitted (native, non-release).
     debug_enabled: bool = false,
+    /// Guard so [`LlvmCompiler.finalizeDebug`] runs the DIBuilder finalize exactly once.
     di_finalized: bool = false,
-    // DIFile per source path (Span.file), so per-function debug info attributes to the right file
-    // in a merged multi-file program. Keyed by the source path string.
+    /// Path -> DWARF file metadata cache, so each source file is described once.
     di_files: std.StringHashMap(types.LLVMMetadataRef) = undefined,
-    // Cached DIType per primitive type name (int/bool/f64/...), so N variables share one type node.
+    /// Type-name -> DWARF type metadata cache (basic, struct, container and Str types).
     di_types: std.StringHashMap(types.LLVMMetadataRef) = undefined,
-    // Names already given a DILocalVariable in the current function, so the pre-alloc declare and the
-    // per-let declare don't emit two for the same variable. Cleared per function.
+    /// Names already `llvm.dbg.declare`d in the current function, reset per function
+    /// to avoid duplicate variable records.
     dbg_declared: std.StringHashMap(void) = undefined,
+    /// The worklist of functions/methods/lambdas to emit, built by
+    /// [`LlvmCompiler.collectFunctions`].
     functions: std.ArrayList(FunctionInfo),
+    /// The de-duplicated set of string literals seen in the program, each of which
+    /// becomes one interned global.
     strings: std.ArrayList([]const u8),
+    /// The lexical scope stack (see [`Scope`]) driving defer/errdefer/ARC cleanup.
     scopes: std.ArrayList(Scope),
+    /// Name -> stack-slot for the locals in the function currently being emitted.
     locals: std.StringHashMap(types.LLVMValueRef),
+    /// Symbol name -> LLVM function value, the authoritative call target table
+    /// (also used to lazily declare runtime `nova_*` externs).
     func_map: std.StringHashMap(types.LLVMValueRef),
-    // Memoises getFunctionParamTypeRef, whose body is an O(all-declarations x methods x
-    // instantiations) linear scan with per-iteration allocation. It is called per-parameter
-    // per-call-site over the whole merged program, so on stdlib-heavy files (15k merged lines)
-    // the repeated scan dominated compile time. The result is a pure function of
-    // (func_name, param_idx) for a fixed program, so caching it is safe. Key: "name\x00idx".
+    /// Cache for [`LlvmCompiler.getFunctionParamTypeRef`], keyed by `name\0index`.
     param_type_cache: std.StringHashMap(?ast.TypeRef),
-    // Same memoisation for getFunctionParamType (the string-returning sibling). Value is an
-    // owned type-name string; callers own their result, so a hit returns a fresh dupe (cheap next
-    // to the scan it avoids). Both keys and stored value strings are freed on deinit.
+    /// Cache for [`LlvmCompiler.getFunctionParamType`] (rendered string form).
     param_type_str_cache: std.StringHashMap(?[]const u8),
-    // M-1: base names of structs that ESCAPE their constructing frame (used as a function/method
-    // return type, a struct field type, or a container element / generic arg). Such a struct must
-    // NOT be value-lowered while escape handling (sret/heap-promote) is unimplemented, else a stack
-    // alloca outlives its frame -> UAF. Computed lazily on first isValueStructName. null = not yet.
+    /// Optional set of struct names known to escape (populated by escape analysis);
+    /// reserved hook, currently unused by the hot path.
     value_escape_set: ?std.StringHashMap(void) = null,
+    /// Struct declarations keyed by module-scoped name; the layout/method source of truth.
     structs: std.StringHashMap(ast.StructDecl),
+    /// Union declarations keyed by name.
     unions: std.StringHashMap(ast.UnionDecl),
+    /// Enum declarations keyed by module-scoped name (payload enums included).
     enums: std.StringHashMap(ast.EnumDecl),
+    /// Trait declarations keyed by base name; drives vtable slot ordering.
     traits: std.StringHashMap(ast.TraitDecl),
 
+    /// FFI `extern` function declarations keyed by name.
     ffi_externs: std.StringHashMap(ast.FunctionDecl),
+    /// Compile-time constants keyed by name, inlined at use sites.
     constants: std.StringHashMap(ast.Expression),
+    /// Borrowed pointer to the current function's local name -> rendered type map,
+    /// or null outside a function body.
     current_local_types: ?*std.StringHashMap([]const u8),
 
+    /// Borrowed pointer to the current function's local name -> `TypeId` map, the
+    /// precise counterpart to `current_local_types`.
     current_local_type_ids: ?*std.StringHashMap(sema_types.TypeId),
 
-    // Names of local value-optionals PROVEN present by an enclosing `if (x != undefined)` (or the else arm of
-    // `if (x == undefined)`), scoped to that branch. Consulted by the `??` operator so a narrowed-present
-    // PRIMITIVE value-optional (`int | undefined` holding 0) short-circuits to its present value instead of
-    // failing the `left != 0` presence test, which misreads a present 0 as absent (the value-optional-zero
-    // defect). Populated/restored around the guarded branch; invalidated on reassignment of the name.
+    /// Set of local names that flow narrowing has proven "present" (non-null) at
+    /// the current point, so an optional access can skip the null guard. This is
+    /// the fix for the `?? present-0` value-optional bug.
     narrowed_present: std.StringHashMap(void),
 
+    /// The active [`PendingTemp`] list for the statement being lowered.
     pending_temps: std.ArrayList(PendingTemp) = .empty,
+    /// The struct whose method is currently being emitted (for `self`-relative
+    /// name resolution), or null.
     current_struct_name: ?[]const u8,
 
+    /// The concrete instantiation name in force while emitting a generic body,
+    /// so type parameters render to their concrete arguments.
     current_instantiation: ?[]const u8,
 
+    /// The `TypeId` of `current_instantiation`, its precise form.
     current_instantiation_id: ?sema_types.TypeId = null,
 
-    // Set while compiling a call argument whose (substituted) parameter type is itself a value-optional.
-    // The speculative ident-unbox in compileExpr (a valopt local used where the checker recorded a BARE
-    // type) must NOT fire in that position: the box has to survive into a value-optional parameter (e.g.
-    // `List<T|undefined>.push(value)` forwarding to `RawBuffer<T|undefined>.push`). Without this the box
-    // is stripped to a raw value, stored, and a later read `?? d` unboxes the raw value as a pointer.
+    /// When set, suppress the automatic unbox of a value-optional argument (used
+    /// where the callee expects the boxed form).
     suppress_valopt_unbox: bool = false,
 
+    /// Recursion guard/counter for synthesised default constructors, to bound
+    /// mutually recursive default-init.
     default_ctor_depth: u32 = 0,
 
+    /// Optional cache mapping a rendered type name back to its `TypeId`.
     rendered_name_ids: ?std.StringHashMapUnmanaged(sema_types.TypeId) = null,
+    /// The module prefix of the function currently being emitted.
     current_module_prefix: ?[]const u8,
+    /// The name of the function currently being emitted.
     current_function_name: ?[]const u8,
 
+    /// The scope depth of the innermost loop, so `break`/`continue` know how many
+    /// scopes to unwind for cleanup.
     current_loop_scope_depth: ?usize,
+    /// The function name in force during the closure-collection pre-pass (which
+    /// runs before emission, hence a separate cursor from `current_function_name`).
     current_collecting_function_name: ?[]const u8,
 
+    /// The instantiation in force during closure collection.
     current_collecting_instantiation: ?[]const u8,
 
-    // SE-C: the TypeId inst_key of the function whose body is being scanned for closures. A lifted lambda
-    // inherits it as its own instantiation_id so the overlay can reify the parent's type-params (e.g. a
-    // lambda inside a generic method reifying its <T>) without the string method_subst.
+    /// The `TypeId` form of `current_collecting_instantiation`.
     current_collecting_instantiation_id: ?sema_types.TypeId = null,
 
+    /// Whether the closure-collection pass is inside an erased generic body.
     current_collecting_erased_generic: bool = false,
+    /// Lambda name -> the enclosing function whose locals it may capture.
     lambda_parents: std.StringHashMap([]const u8),
 
+    /// Lambda name -> its declared parameter types (parallel to its params).
     lambda_param_types: std.StringHashMap([]const ?[]const u8),
+    /// Function name -> its local name/type map, retained across passes.
     function_local_types: std.StringHashMap(std.StringHashMap([]const u8)),
 
+    /// Function name -> its local name/`TypeId` map.
     function_local_type_ids: std.StringHashMap(std.StringHashMap(sema_types.TypeId)),
+    /// Names captured by reference as module globals (keys are owned and freed in
+    /// `deinit`).
     captured_globals: std.StringHashMap(types.LLVMValueRef),
 
+    /// Lambda name -> the ordered list of variable names it captures into its `__env`.
     lambda_captures: std.StringHashMap(std.ArrayListUnmanaged([]const u8)),
 
+    /// Globals that hold boxed bare-function values, keyed by function name.
     fn_box_globals: std.StringHashMap(types.LLVMValueRef),
 
+    /// Borrowed handle to the frontend's typed IR, consulted for precise
+    /// per-expression `TypeId`s; null if unavailable.
     typed_ir: ?*const sema_infer.TypedIr = null,
 
+    /// Whether the typed-IR ("F2 types") path is active for type decisions.
     f2_types: bool = false,
+    /// Borrowed handle to the type store, the source of truth for ownership and
+    /// the value/reference distinction.
     type_store: ?*const sema_types.TypeStore = null,
+    /// The lambda whose captures are currently being scanned (guards recursive scans).
     current_scanning_lambda: ?[]const u8 = null,
+    /// The whole program AST; scanned repeatedly for declarations and generic call sites.
     program: ast.Program,
+    /// Whether the program uses `log`/`console`, so the log runtime is declared.
     has_log: bool,
+    /// Monotonic counter minting unique `__lambda_N` names.
     next_lambda_id: u32,
 
+    /// Closure-key -> synthesised lambda name, so a closure expression resolves to
+    /// the function that was collected for it.
     closure_lambdas: std.StringHashMapUnmanaged([]const u8),
+    /// Saved capture values for the closure currently being built.
     current_saved_captures: std.StringHashMap(types.LLVMValueRef),
+    /// Whether the target is WebAssembly (32-bit words, in-IR allocator, no DWARF).
     is_wasm: bool,
-    // FR-simd-L2: which target crypto-intrinsic family is available, decided from the target triple.
+    /// The SIMD family available on the target (see [`SimdTarget`]).
     simd_target: SimdTarget = .none,
+    /// Whether coverage instrumentation is being emitted.
     coverage_enabled: bool,
+    /// The coverage block registry, present only when `coverage_enabled`.
     cov_registry: ?CoverageRegistry,
+    /// The string builder value in scope while lowering a template/JSX expression.
     current_string_builder: ?types.LLVMValueRef = null,
-    // Compile-time accumulator for adjacent NSX static text (tag opens, attributes, closes, literal text).
-    // jsxAppendLiteral appends bytes here instead of emitting a StringBuilder.append per chunk; the buffer
-    // is flushed as ONE append right before any dynamic part ({expr}, a `{for}` block) and at element end.
-    // Turns ~25 append calls per card into ~5, closing most of the gap to a hand-written builder.
+    /// Accumulated literal bytes pending flush during JSX lowering.
     jsx_pending_literal: std.ArrayListUnmanaged(u8) = .empty,
+    /// Parameter names of the function currently being emitted.
     current_param_names: ?[]const []const u8 = null,
 
+    /// The promise value of the async coroutine currently being emitted.
     current_async_promise: ?types.LLVMValueRef = null,
+    /// The coroutine's final/return basic block.
     current_async_final_bb: ?types.LLVMBasicBlockRef = null,
+    /// The coroutine handle of the async function currently being emitted.
     current_async_hdl: ?types.LLVMValueRef = null,
+    /// The coroutine's suspend basic block.
     current_async_suspend_bb: ?types.LLVMBasicBlockRef = null,
+    /// The coroutine's cleanup basic block.
     current_async_cleanup_bb: ?types.LLVMBasicBlockRef = null,
 
+    /// Set of async function names, so a call to one is driven as a coroutine.
     async_fns: std.StringHashMap(void) = undefined,
 
+    /// Cached `i1` (bool) LLVM type.
     i1_type: types.LLVMTypeRef,
+    /// Cached `i8` LLVM type.
     i8_type: types.LLVMTypeRef,
+    /// Cached `i32` LLVM type (`int`).
     i32_type: types.LLVMTypeRef,
+    /// Cached `i64` LLVM type (`long`).
     i64_type: types.LLVMTypeRef,
+    /// Cached `void` LLVM type.
     void_type: types.LLVMTypeRef,
+    /// Cached opaque pointer LLVM type.
     ptr_type: types.LLVMTypeRef,
+    /// The universal Nova value type: `i64`. Nearly every value flows through
+    /// codegen as this word (integer, bit-cast float, or heap address).
     val_type: types.LLVMTypeRef,
 
+    /// String literal text -> its interned global (see
+    /// [`LlvmCompiler.getOrCreateStringLiteral`]); keys are owned.
     string_globals: std.StringHashMap(types.LLVMValueRef),
-    // Interns rendered type names by TypeId. resolveExpressionTypeName is called per-expression across the
-    // whole program and used to allocate a fresh renderLegacy string every call that NO caller freed -- a
-    // codegen-wide leak (tens of GB on a large app). Rendering is a pure function of the TypeId, so cache it:
-    // one owned string per distinct TypeId, freed at deinit; callers borrow and never free.
+    /// `TypeId` -> its cached rendered name, to avoid re-rendering.
     type_name_cache: std.AutoHashMapUnmanaged(sema_types.TypeId, []const u8) = .empty,
-    // Interns substTypeParams results. Keyed by (input string identity, current instantiation string
-    // identity, current instantiation id). substTypeParams allocates a fresh substituted name per call
-    // that callers (symbolName/resolveExpressionTypeName) never freed -- a per-expression codegen leak.
+    /// Cache for type-parameter substitution results (see [`SubstKey`]).
     subst_cache: std.AutoHashMapUnmanaged(SubstKey, []const u8) = .empty,
-    // Interns decimal literals (`0m`, `2m`, ...) to a lazily-initialised, immortal-pinned global so a literal
-    // parses+allocates ONCE per program run instead of on every evaluation. Keyed by the literal's digits.
+    /// Decimal-literal digits -> a lazily-initialised cache global holding the
+    /// parsed decimal (see [`LlvmCompiler.getOrCreateDecimalLiteral`]); keys are owned.
     decimal_globals: std.StringHashMap(types.LLVMValueRef),
 
+    /// Lazily-declared `puts` runtime function.
     puts_fn: ?types.LLVMValueRef = null,
+    /// Lazily-declared `printf` runtime function.
     printf_fn: ?types.LLVMValueRef = null,
+    /// Lazily-declared `nova_log_string` runtime function.
     nova_log_string_fn: ?types.LLVMValueRef = null,
+    /// Lazily-declared `nova_log_info` runtime function.
     nova_log_info_fn: ?types.LLVMValueRef = null,
+    /// Lazily-declared `nova_log_debug` runtime function.
     nova_log_debug_fn: ?types.LLVMValueRef = null,
+    /// Lazily-declared `nova_log_err` runtime function.
     nova_log_err_fn: ?types.LLVMValueRef = null,
+    /// Lazily-declared generic log function.
     log_fn: ?types.LLVMValueRef = null,
+    /// The bump-allocator heap pointer global (used by the in-IR WASM allocator).
     heap_ptr: ?types.LLVMValueRef = null,
+    /// The persistent-allocation free-list head global.
     free_list: ?types.LLVMValueRef = null,
+    /// The persistent-arena bump pointer global.
     persistent_ptr: ?types.LLVMValueRef = null,
+    /// The `break` target basic block of the innermost loop.
     current_break_bb: ?types.LLVMBasicBlockRef = null,
+    /// The `continue` target basic block of the innermost loop.
     current_continue_bb: ?types.LLVMBasicBlockRef = null,
 
+    /// Constructs a fresh compiler for one target: initialises all LLVM targets,
+    /// resolves the triple, creates the target machine, module, builder and data
+    /// layout, and (for native non-release builds) the DWARF DIBuilder.
+    ///
+    /// `is_wasm` forces the `wasm32-unknown-unknown` triple and disables debug
+    /// info; otherwise `target_triple_opt` selects a cross-target or, when null,
+    /// the host default triple with host CPU + feature detection. `is_release`
+    /// picks aggressive vs. no optimisation and turns debug info off. Returns an
+    /// error if the triple or target machine cannot be created.
     pub fn new(allocator: std.mem.Allocator, is_wasm: bool, is_release: bool, target_triple_opt: ?[]const u8, coverage_enabled: bool) !LlvmCompiler {
 
         target.LLVMInitializeAllTargetInfos();
@@ -315,9 +576,6 @@ pub const LlvmCompiler = struct {
             types.LLVMCodeGenOptLevel.LLVMCodeGenLevelNone;
         const reloc = types.LLVMRelocMode.LLVMRelocDefault;
         const code_model = types.LLVMCodeModel.LLVMCodeModelDefault;
-        // For a native (non-wasm, non-cross) build, target the actual host CPU + features so the
-        // vectorizer models the real vector units (NEON/AVX) and its cost model fires -- "generic" is
-        // pessimistic and leaves array loops scalar. Cross/wasm builds stay generic for portability.
         const native = !is_wasm and target_triple_opt == null;
         const host_cpu = if (native) target_machine.LLVMGetHostCPUName() else null;
         const host_feat = if (native) target_machine.LLVMGetHostCPUFeatures() else null;
@@ -342,10 +600,6 @@ pub const LlvmCompiler = struct {
         const layout = target_machine.LLVMCreateTargetDataLayout(tm);
         target.LLVMSetModuleDataLayout(module, layout);
 
-        // DWARF debug info (Gap 4): only in debug builds (locals are unreliable at -O3). Create the
-        // DIBuilder now; the compile unit + per-file DIFiles are built lazily on first function emit
-        // (the source path lives on each node's Span, not available here). Module flags declare the
-        // DWARF + debug-metadata versions so lldb reads the info.
         const dbg_on = !is_release and !is_wasm;
         var di_builder: types.LLVMDIBuilderRef = null;
         if (dbg_on) {
@@ -429,33 +683,29 @@ pub const LlvmCompiler = struct {
         return compiler;
     }
 
-    // --- DWARF debug info (Gap 4) -----------------------------------------------------------------
-    // A DIFile for `path`, cached so a merged multi-file program reuses one file node per source.
-    // LLVM copies the name/dir into its context, so the null-terminated dupes are freed after the call.
+    /// Returns (and caches) the DWARF file metadata for a source path, resolving
+    /// it to an absolute directory + basename so a debugger can find the file.
+    ///
+    /// Synthetic files (basename starting with `<`) and already-absolute paths are
+    /// used as-is; `src/std/...` paths are remapped to the installed
+    /// `~/.nova/std/...` location; everything else is joined against `di_cwd`. If
+    /// the resolved absolute file does not actually exist on disk, it caches and
+    /// returns null so no bogus DWARF file is emitted. A null `di_builder` short-
+    /// circuits to null.
     fn diFileFor(self: *LlvmCompiler, path: []const u8) types.LLVMMetadataRef {
         if (self.di_builder == null) return null;
         if (self.di_files.get(path)) |f| return f;
         const slash = std.mem.lastIndexOfScalar(u8, path, '/');
         const dir_rel = if (slash) |s| path[0..s] else ".";
         const base_s = if (slash) |s| path[s + 1 ..] else path;
-        // DWARF must carry ABSOLUTE directories so a debugger (lldb-dap / VS Code) can match a
-        // breakpoint it sets by absolute file path. A relative dir binds only by basename, which
-        // lldb CLI tolerates but lldb-dap does not — the breakpoint stays pending and never fires.
-        // Prefix the process cwd for relative source dirs; leave already-absolute paths untouched.
-        // EXCEPT synthetic generated "files" (<mediator-generated> etc.): never make those absolute, or
-        // lldb/VS Code tries to open a nonexistent `<cwd>/./<...>` path.
         const synthetic = base_s.len > 0 and base_s[0] == '<';
         var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
         const dir_s: []const u8 = blk: {
             if (synthetic) break :blk dir_rel;
             if (dir_rel.len > 0 and dir_rel[0] == '/') break :blk dir_rel;
-            // The stdlib is compiled under the logical prefix `src/std/...` but its SOURCE actually lives
-            // at ~/.nova/std/... . Prefixing the app cwd would point the debugger at <app>/src/std/... ,
-            // which does not exist -> "the editor could not be opened, file not found" the moment you step
-            // into List/string/etc. Map the stdlib prefix to the real install dir instead.
             if (std.mem.startsWith(u8, dir_rel, "src/std")) {
                 if (std.c.getenv("HOME")) |home_c| {
-                    const rest = dir_rel["src/std".len..]; // "" or "/collections" ...
+                    const rest = dir_rel["src/std".len..];
                     const joined = std.fmt.bufPrint(&abs_buf, "{s}/.nova/std{s}", .{ std.mem.span(home_c), rest }) catch break :blk dir_rel;
                     break :blk joined;
                 }
@@ -464,10 +714,6 @@ pub const LlvmCompiler = struct {
             const joined = std.fmt.bufPrint(&abs_buf, "{s}/{s}", .{ cwd, dir_rel }) catch break :blk dir_rel;
             break :blk joined;
         };
-        // Catch-all: if the resolved source does not exist on disk (target-conditional stdlib logical names
-        // like net/eventloop.nova -> net/ev/kqueue.nova, injected helpers.nova, cache/package paths, ...),
-        // emit NO debug info for it. A DIFile pointing at a missing path makes VS Code pop "the editor
-        // could not be opened, file not found" when you step into that frame. Better to step over silently.
         if (dir_s.len > 0 and dir_s[0] == '/') {
             var chk_buf: [std.fs.max_path_bytes]u8 = undefined;
             const full_z = std.fmt.bufPrintZ(&chk_buf, "{s}/{s}", .{ dir_s, base_s }) catch null;
@@ -485,7 +731,10 @@ pub const LlvmCompiler = struct {
         return f;
     }
 
-    // Lazily create the compile unit on the first function emitted, using its source file as primary.
+    /// Lazily creates the single DWARF compile unit on first use, anchored to the
+    /// given source file. Idempotent: does nothing once `di_cu` exists or when
+    /// debug info is off. The producer is labelled `"nova"` and the source
+    /// language is recorded as C99 (the closest DWARF language LLVM offers here).
     fn ensureDebugCU(self: *LlvmCompiler, path: []const u8) void {
         if (self.di_builder == null or self.di_cu != null) return;
         self.di_file = self.diFileFor(path);
@@ -512,27 +761,24 @@ pub const LlvmCompiler = struct {
         );
     }
 
-    // Attach a DISubprogram to `fn_val` and set it as the active scope, so breakpoints / step / call
-    // stack resolve to this function. Item-2 will flesh out the subroutine type with real DITypes;
-    // for the line-table MVP a "void()" signature is enough for line/scope info.
+    /// Opens a new DWARF subprogram scope for a function about to be emitted and
+    /// attaches it to `fn_val`, so line/variable records land in the right place.
+    ///
+    /// Resets the per-function `dbg_declared` set and the current debug location,
+    /// ensures the compile unit exists, and creates a subroutine type + function
+    /// metadata. Synthetic files (name empty or starting with `<`) and the null-
+    /// builder case return early, leaving `di_scope` null so later debug calls
+    /// no-op. Line 0 is normalised to 1 (DWARF has no line 0).
     pub fn beginFunctionDebug(self: *LlvmCompiler, fn_val: types.LLVMValueRef, name: []const u8, file: []const u8, line: usize) void {
-        self.di_scope = null; // reset first so a no-file function never inherits the prior scope
+        self.di_scope = null;
         self.di_scope_file = null;
         if (self.debug_enabled) self.dbg_declared.clearRetainingCapacity();
-        // Clear the builder's current debug location too: instructions in a function WITHOUT a
-        // DISubprogram must carry no !dbg (else the verifier rejects a location whose scope is another
-        // function). This runs for every function, so cross-function contamination cannot happen.
         core.LLVMSetCurrentDebugLocation2(self.builder, null);
-        // Synthetic compiler-generated "files" (<mediator-generated>, <serde-generated>, <rmediator-...>)
-        // are not real source. Emitting a DISubprogram for them made lldb/VS Code try to OPEN (or create)
-        // a path like `<cwd>/./<mediator-generated>` when stepping through the dispatch that every handler
-        // goes through -- the crash/"tries to create a file" report. Skip debug info: generated code just
-        // steps over with no source, which is correct.
         if (self.di_builder == null or file.len == 0 or file[0] == '<') return;
         self.ensureDebugCU(file);
-        const dif = self.diFileFor(file) orelse return; // missing source on disk -> no debug info (steps over)
+        const dif = self.diFileFor(file) orelse return;
         self.di_scope_file = dif;
-        var params0 = [_]types.LLVMMetadataRef{null}; // element 0 = return type (null => void)
+        var params0 = [_]types.LLVMMetadataRef{null};
         const subr = debug.LLVMDIBuilderCreateSubroutineType(self.di_builder, dif, &params0, 1, .LLVMDIFlagZero);
         const name_z = self.allocator.dupeZ(u8, name) catch return;
         defer self.allocator.free(name_z);
@@ -555,13 +801,12 @@ pub const LlvmCompiler = struct {
         );
         debug.LLVMSetSubprogram(fn_val, sp);
         self.di_scope = sp;
-        // Initial location at the function line so prologue instructions (allocas, ARC retains)
-        // carry a !dbg before the first statement updates it -- the verifier requires it on calls.
         self.setDebugLoc(line, 0);
     }
 
-    // Set the IR builder's current debug location to (line, col) within the active function scope.
-    // A no-op unless a DISubprogram scope is live. Instructions emitted after this carry the location.
+    /// Sets the IR builder's current debug location to `line:col` within the
+    /// active subprogram, so subsequent instructions are attributed to that source
+    /// position. No-ops when there is no active `di_scope`; line 0 becomes 1.
     pub fn setDebugLoc(self: *LlvmCompiler, line: usize, col: usize) void {
         if (self.di_scope == null) return;
         const loc = debug.LLVMDIBuilderCreateDebugLocation(
@@ -574,7 +819,9 @@ pub const LlvmCompiler = struct {
         core.LLVMSetCurrentDebugLocation2(self.builder, loc);
     }
 
-    // Cached DIBasicType for a primitive. `encoding` is a raw DWARF DW_ATE_* value.
+    /// Returns (and caches by name) a DWARF basic-type descriptor for a scalar of
+    /// the given bit width and DWARF encoding (e.g. 5 = signed, 7 = unsigned,
+    /// 2 = boolean, 4 = float). Cached because the same scalar recurs constantly.
     fn diBasicType(self: *LlvmCompiler, name: []const u8, size_bits: u64, encoding: c_uint) types.LLVMMetadataRef {
         if (self.di_types.get(name)) |t| return t;
         const name_z = self.allocator.dupeZ(u8, name) catch return null;
@@ -584,48 +831,39 @@ pub const LlvmCompiler = struct {
         return t;
     }
 
-    // DIType for a local's declared type + its LLVM slot type. Item 2 slice A handles only the
-    // primitives whose value is the slot itself: float (double slot) and int/bool (i64 slot). Pointer /
-    // struct / string / any slots return null and stay undeclared until their DITypes + lldb formatters
-    // land (items 2b/2c/3) -- better an omitted variable than one that shows a raw pointer as an int.
-    // DWARF encodings: DW_ATE_boolean=2, DW_ATE_float=4, DW_ATE_signed=5.
+    /// Maps a Nova local's type to its best DWARF descriptor, given both the
+    /// rendered type name and the LLVM slot type.
+    ///
+    /// Doubles map to `f64`; for integer slots it dispatches on the name:
+    /// `string`/`Str` get their struct descriptors, primitives get a basic type
+    /// (word-repr and f32/f64-in-word cases return null so no misleading type is
+    /// shown), `List`/`Map`/`Set` get a container descriptor, and a known struct
+    /// gets its full member layout. Returns null when nothing sensible applies.
     fn diTypeFor(self: *LlvmCompiler, type_name: ?[]const u8, slot_ty: types.LLVMTypeRef) types.LLVMMetadataRef {
         if (self.di_builder == null) return null;
         const kind = core.LLVMGetTypeKind(slot_ty);
-        // float / f32 / f64 all live in a DOUBLE slot -> size to the slot (64 bits), DW_ATE_float=4.
         if (kind == .LLVMDoubleTypeKind) return self.diBasicType("f64", 64, 4);
         if (kind == .LLVMIntegerTypeKind) {
             const tn = type_name orelse return null;
             if (std.mem.eql(u8, tn, "string")) return self.diStringType();
             if (types_mod.cgPrim(tn)) |p| {
-                if (p.repr == .word) return null; // raw ptr -> not a displayable scalar here
-                if (p.repr == .i1) return self.diBasicType("bool", 8, 2); // DW_ATE_boolean, reads low byte
-                if (p.repr == .f32 or p.repr == .f64) return null; // a float never lands in an int slot
-                // int-like: the value occupies the low bits of the i64 slot; DW_ATE_signed=5/unsigned=7.
+                if (p.repr == .word) return null;
+                if (p.repr == .i1) return self.diBasicType("bool", 8, 2);
+                if (p.repr == .f32 or p.repr == .f64) return null;
                 return self.diBasicType(tn, 64, if (p.signed) 5 else 7);
             }
-            // A struct local: the i64 slot holds a POINTER to the heap struct. Give it a native
-            // pointer-to-struct DIType so lldb / the VS Code Variables panel expand its fields with no
-            // Python. Nested struct/container FIELDS still render as opaque addresses (see diFieldType);
-            // the optional Python formatter enriches containers.
             const base = getStructBaseName(tn);
-            // Containers (List/Map/Set) FIRST -- even though List is a struct, showing its raw data/len/cap
-            // fields is useless; instead give it a NAMED pointer typedef whose name carries the element
-            // type (e.g. "List<int>") so the Python synthetic-children provider can expand its elements.
             if (std.mem.eql(u8, base, "List") or std.mem.eql(u8, base, "Map") or std.mem.eql(u8, base, "Set"))
                 return self.diContainerType(tn);
-            // A borrowed `str.Str` local: the value struct { ptr, len } is stored INLINE in the slot, so
-            // give it the inline struct type (not a pointer) -- nova_str_summary then shows its text.
             if (std.mem.eql(u8, base, "Str")) return self.diStrType();
-            // A struct local: the i64 slot holds a POINTER to the heap struct. Native pointer-to-struct
-            // DIType so lldb / the VS Code Variables panel expand its fields with no Python.
             if (self.structs.get(base) != null) return self.diStructType(base);
         }
         return null;
     }
 
-    // A pointer typedef named after the container instantiation (e.g. "List<int>"), so an lldb type
-    // synthetic/summary can match it by name and read elements. The pointee is opaque here.
+    /// Builds a minimal DWARF struct descriptor for a `List`/`Map`/`Set`: a single
+    /// `ptr` member pointing at the element storage, enough for a debugger to show
+    /// the handle. Cached by the full generic name.
     fn diContainerType(self: *LlvmCompiler, tn: []const u8) types.LLVMMetadataRef {
         if (self.di_builder == null) return null;
         if (self.di_types.get(tn)) |t| return t;
@@ -633,10 +871,6 @@ pub const LlvmCompiler = struct {
         const ptr = debug.LLVMDIBuilderCreatePointerType(self.di_builder, byte_t, 64, 0, 0, "", 0);
         const tn_z = self.allocator.dupeZ(u8, tn) catch return null;
         defer self.allocator.free(tn_z);
-        // A single-member STRUCT { ptr } named after the instantiation (e.g. "List<int>"), NOT a pointer
-        // typedef. An aggregate has an empty SBValue::GetValue(), so lldb-dap shows only the summary/
-        // synthetic (the element list) and drops the raw `0x…` address prefix -- same trick as `string`.
-        // The Python provider reads the underlying pointer from the variable's storage (its load address).
         const member = debug.LLVMDIBuilderCreateMemberType(self.di_builder, self.di_cu, "ptr", "ptr".len, self.di_file, 0, 64, 0, 0, .LLVMDIFlagZero, ptr);
         var members = [_]types.LLVMMetadataRef{member};
         const st = debug.LLVMDIBuilderCreateStructType(self.di_builder, self.di_cu, tn_z.ptr, tn.len, self.di_file, 0, 64, 0, .LLVMDIFlagZero, null, &members, 1, 0, null, "", 0);
@@ -644,15 +878,8 @@ pub const LlvmCompiler = struct {
         return st;
     }
 
-    // Nova `string` as a single-member STRUCT { data: u8* } named "string", NOT a bare pointer/typedef.
-    // Why a struct and not a `char*` typedef: lldb-dap builds a variable's displayed value from
-    // SBValue::GetValue(), which for ANY pointer type is the raw address -- so a pointer-typed string
-    // always renders `0x… "nova"` in VS Code, address first, no matter what summary we register (this is
-    // also why List/Map/Set carry an address prefix). For an AGGREGATE, GetValue() is empty, so lldb-dap
-    // shows only the summary -> a clean `"nova"`, C#-style. The local's 8 bytes ARE the struct; member
-    // `data` at offset 0 holds the char pointer, which the Python summary (nova_string_summary) reads via
-    // child 0. Graceful degradation without the Python formatter: lldb shows `string @ <addr>` and the
-    // `data` child still renders the text natively (unsigned char* -> "nova"), one expand away. Cached.
+    /// Builds and caches the DWARF descriptor for the built-in `string` type: a
+    /// struct with a single `data` pointer member.
     fn diStringType(self: *LlvmCompiler) types.LLVMMetadataRef {
         if (self.di_builder == null) return null;
         if (self.di_types.get("string")) |t| return t;
@@ -665,40 +892,27 @@ pub const LlvmCompiler = struct {
         return strtd;
     }
 
-    // DIType for a struct FIELD, by type name. Primitives + string get real value types; nested structs
-    // and everything else (decimal/containers/optionals) render as an opaque pointer (address only) --
-    // keeps this non-recursive and cycle-safe for the first cut.
-    // Create a DIBasicType WITHOUT the di_types name-cache. Needed for struct fields: the same display
-    // name (e.g. "int") is a 64-bit local slot but a 32-bit field, and a name-keyed cache would hand one
-    // the other's width. LLVM uniques DIBasicTypes by content, so skipping our cache costs nothing.
+    /// Like [`LlvmCompiler.diBasicType`] but bypasses the cache, for cases where
+    /// the same name is wanted at a different bit width (e.g. a sized struct field
+    /// vs. the canonical scalar) and caching by name alone would be wrong.
     fn diBasicTypeUncached(self: *LlvmCompiler, name: []const u8, size_bits: u64, encoding: c_uint) types.LLVMMetadataRef {
         const name_z = self.allocator.dupeZ(u8, name) catch return null;
         defer self.allocator.free(name_z);
         return debug.LLVMDIBuilderCreateBasicType(self.di_builder, name_z.ptr, name.len, size_bits, encoding, .LLVMDIFlagZero);
     }
 
-    // DIType for a struct FIELD. Unlike a local (which sits in a 64-bit slot), a field is stored at its
-    // REAL width inside the heap struct, so the basic type must be sized to getTypeSize(tn)*8 -- a
-    // 32-bit `int` field declared as 64-bit makes lldb read 8 bytes and swallow the next field.
-    // Nova `str.Str` is a BORROWED string view: a value struct { ptr: long @0, len: int @8 } pointing into
-    // some backing buffer (e.g. a DB row), NOT NUL-terminated. Emit it as a real inline struct so its
-    // fields read correctly; the Python formatter's nova_str_summary reads ptr+len and shows the text. This
-    // is the pervasive text type in ORM-backed views (every borrowed column), so without this a struct's
-    // text fields show a raw pointer number instead of their contents. Cached.
+    /// Builds and caches the DWARF descriptor for the `Str` string handle: a
+    /// pointer to an inner `StrData { ptr: long, len: int }` body, mirroring the
+    /// runtime's two-field owned-string representation.
     fn diStrType(self: *LlvmCompiler) types.LLVMMetadataRef {
         if (self.di_builder == null) return null;
         if (self.di_types.get("Str")) |t| return t;
-        const long_t = self.diBasicType("long", 64, 5); // DW_ATE_signed
+        const long_t = self.diBasicType("long", 64, 5);
         const int_t = self.diBasicType("int", 32, 5);
         const m_ptr = debug.LLVMDIBuilderCreateMemberType(self.di_builder, self.di_cu, "ptr", "ptr".len, self.di_file, 0, 64, 0, 0, .LLVMDIFlagZero, long_t);
         const m_len = debug.LLVMDIBuilderCreateMemberType(self.di_builder, self.di_cu, "len", "len".len, self.di_file, 0, 32, 0, 64, .LLVMDIFlagZero, int_t);
         var body_members = [_]types.LLVMMetadataRef{ m_ptr, m_len };
         const body = debug.LLVMDIBuilderCreateStructType(self.di_builder, self.di_cu, "StrData", "StrData".len, self.di_file, 0, 128, 0, .LLVMDIFlagZero, null, &body_members, 2, 0, null, "", 0);
-        // Str is NOT stored inline (fieldStoredInline("Str") == false -- the escape analysis keeps it on the
-        // heap), so a Str field/local is an 8-byte POINTER to the { ptr, len } payload. Wrap that pointer in
-        // a single-member STRUCT named "Str" (an aggregate, empty GetValue()) so lldb-dap shows only the
-        // summary -- clean `"Alpha"`, no `0x…` prefix, consistent with string/List/Map/Set. nova_str_summary
-        // reads the object pointer from the variable's storage, then ptr/len from the payload.
         const objp = debug.LLVMDIBuilderCreatePointerType(self.di_builder, body, 64, 0, 0, "", 0);
         const m_obj = debug.LLVMDIBuilderCreateMemberType(self.di_builder, self.di_cu, "obj", "obj".len, self.di_file, 0, 64, 0, 0, .LLVMDIFlagZero, objp);
         var members = [_]types.LLVMMetadataRef{m_obj};
@@ -707,6 +921,10 @@ pub const LlvmCompiler = struct {
         return st;
     }
 
+    /// Picks the DWARF descriptor for a struct field of rendered type `tn` and
+    /// byte size `f_size`. Strings and `Str` use their handle descriptors;
+    /// primitives use an uncached basic type sized to the field; anything else
+    /// (a nested owned reference) falls back to a generic `uptr` pointer word.
     fn diFieldType(self: *LlvmCompiler, tn: []const u8, f_size: u32) types.LLVMMetadataRef {
         if (std.mem.eql(u8, tn, "string")) return self.diStringType();
         if (std.mem.eql(u8, getStructBaseName(tn), "Str")) return self.diStrType();
@@ -717,13 +935,13 @@ pub const LlvmCompiler = struct {
             if (p.repr == .word) return self.diBasicTypeUncached("uptr", 64, 7);
             return self.diBasicTypeUncached(tn, bits, if (p.signed) 5 else 7);
         }
-        return self.diBasicTypeUncached("uptr", 64, 7); // opaque: show the address
+        return self.diBasicTypeUncached("uptr", 64, 7);
     }
 
-    // A pointer-to-struct DIType with a member per field (name, DIType, byte offset), so lldb natively
-    // shows `(T) x = { field = value, ... }`. Field offsets mirror getFieldOffset (aligned, getTypeSize).
-    // Cached by base name; struct-typed fields are shown as opaque pointers (see diFieldType) so this is
-    // non-recursive and cannot cycle.
+    /// Builds and caches a full DWARF descriptor for a user struct: one member per
+    /// field with computed byte offsets (respecting each field's alignment),
+    /// wrapped in a pointer + typedef so the debugger sees the struct by its name
+    /// through the heap handle. Returns null if the struct is unknown or debug is off.
     fn diStructType(self: *LlvmCompiler, base: []const u8) types.LLVMMetadataRef {
         if (self.di_builder == null) return null;
         if (self.di_types.get(base)) |t| return t;
@@ -735,12 +953,7 @@ pub const LlvmCompiler = struct {
             const f_size = self.getTypeSize(field.type_name, true);
             const f_align = self.getTypeAlign(field.type_name);
             if (f_align != 0) offset = (offset + f_align - 1) / f_align * f_align;
-            // Not freed: typeRefToString's ownership via substTypeParams is ambiguous, and diStructType is
-            // cached (runs once per struct type), so the leak is a few bytes in a short-lived compiler.
             const fname = self.typeRefToString(field.type_name) catch "";
-            // Pass the SAME f_size used for the member offset/size, so the field's basic-type width can't
-            // diverge from its slot (getTypeSize("int") the string returns the 8-byte slot size, but the
-            // packed field is f_size bytes -- a mismatch made lldb read 8 bytes and swallow the next field).
             const f_di = self.diFieldType(fname, f_size);
             const nm_z = self.allocator.dupeZ(u8, field.name) catch continue;
             defer self.allocator.free(nm_z);
@@ -751,20 +964,21 @@ pub const LlvmCompiler = struct {
         const base_z = self.allocator.dupeZ(u8, base) catch return null;
         defer self.allocator.free(base_z);
         const st = debug.LLVMDIBuilderCreateStructType(self.di_builder, self.di_cu, base_z.ptr, base.len, self.di_file, 0, @as(u64, offset) * 8, 0, .LLVMDIFlagZero, null, members.items.ptr, @intCast(members.items.len), 0, null, "", 0);
-        // The local holds a POINTER to the heap struct; typedef the pointer to the struct name so lldb
-        // reports `(T)` and expands the fields.
         const ptr = debug.LLVMDIBuilderCreatePointerType(self.di_builder, st, 64, 0, 0, "", 0);
         const td = debug.LLVMDIBuilderCreateTypedef(self.di_builder, ptr, base_z.ptr, base.len, self.di_file, 0, self.di_cu, 0);
         self.di_types.put(base, td) catch {};
         return td;
     }
 
-    // Emit a DILocalVariable + llvm.dbg.declare so `frame variable` / hover shows this local's real
-    // value. `storage` is the variable's alloca. No-op unless a debug scope is active and the declared
-    // type is a supported primitive.
+    /// Emits an `llvm.dbg.declare` associating the stack slot `storage` with a
+    /// source variable, so a debugger can name and inspect it.
+    ///
+    /// Skips silently when there is no active scope/builder, when the name was
+    /// already declared in this function, or when no DWARF type can be derived.
+    /// Synthesises a debug location if none is currently set.
     pub fn declareLocalVar(self: *LlvmCompiler, storage: types.LLVMValueRef, name: []const u8, type_name: ?[]const u8, slot_ty: types.LLVMTypeRef) void {
         if (self.di_scope == null or self.di_builder == null) return;
-        if (self.dbg_declared.contains(name)) return; // one DILocalVariable per name per function
+        if (self.dbg_declared.contains(name)) return;
         const dtype = self.diTypeFor(type_name, slot_ty) orelse return;
         self.dbg_declared.put(name, {}) catch {};
         const name_z = self.allocator.dupeZ(u8, name) catch return;
@@ -777,13 +991,10 @@ pub const LlvmCompiler = struct {
         _ = debug.LLVMDIBuilderInsertDeclareRecordAtEnd(self.di_builder, storage, v, expr, loc, bb);
     }
 
-    // Sanitize + resolve debug metadata for `module` before it is verified/emitted. Runs per emitted
-    // module, so it must operate on the passed module (which under T6 split is a per-file CLONE), not
-    // self.module. A function DECLARATION (no basic blocks) must NOT carry a DISubprogram definition --
-    // the verifier rejects it ("declaration may only have a unique !dbg attachment"). We attach the
-    // subprogram when a body is emitted, but under T6 split a function defined in another file appears
-    // here as an external declaration still carrying its subprogram; strip it. LLVMDIBuilderFinalize
-    // resolves temporary MD in the original module and is a harmless no-op on the clones.
+    /// Finalises DWARF once the module is fully built: strips subprogram metadata
+    /// from any function that ended up with no basic blocks (a declaration-only
+    /// stub whose dangling subprogram would fail the verifier), then runs the
+    /// DIBuilder finalize exactly once. No-op when debug info is off.
     pub fn finalizeDebug(self: *LlvmCompiler, module: types.LLVMModuleRef) void {
         const dib = self.di_builder orelse return;
         var f = core.LLVMGetFirstFunction(module);
@@ -792,15 +1003,21 @@ pub const LlvmCompiler = struct {
                 debug.LLVMSetSubprogram(f, null);
             }
         }
-        // Finalize EXACTLY ONCE. emitModule runs per emitted module (97x under T6 split), but
-        // LLVMDIBuilderFinalize must be called once -- repeated calls double-free the DIBuilder's
-        // temporary nodes (malloc "tiny_free_list_remove_ptr" heap corruption on multi-file builds).
         if (!self.di_finalized) {
             debug.LLVMDIBuilderFinalize(dib);
             self.di_finalized = true;
         }
     }
 
+    /// Tears down the compiler: disposes the LLVM builder, module and target
+    /// machine and frees every owned table.
+    ///
+    /// The subtle part is ownership. `param_names` slices are shared across the
+    /// several `FunctionInfo`s of one method, so they are freed exactly once via a
+    /// pointer-keyed `freed` set. Several maps own their keys (or their keys and
+    /// values, or nested maps) and are iterated to free those before `deinit`ing
+    /// the map itself; maps that only borrow AST slices are simply `deinit`ed.
+    /// The debug tables are only torn down when `debug_enabled`.
     pub fn deinit(self: *LlvmCompiler) void {
         if (self.debug_enabled) {
             self.di_files.deinit();
@@ -810,9 +1027,6 @@ pub const LlvmCompiler = struct {
         core.LLVMDisposeBuilder(self.builder);
         core.LLVMDisposeModule(self.module);
         target_machine.LLVMDisposeTargetMachine(self.target_machine);
-        // param_names is allocated ONCE per method and SHARED across all its instantiations' FunctionInfos,
-        // so freeing per-FunctionInfo double-frees the same array. Dedup by pointer identity. (Under the old
-        // arena, free() was a no-op so this was harmless; under a real allocator it is a double-free.)
         {
             var freed = std.AutoHashMap(usize, void).init(self.allocator);
             defer freed.deinit();
@@ -880,22 +1094,32 @@ pub const LlvmCompiler = struct {
         }
     }
 
+    /// Grafted from `types.zig`: whether a (possibly generic) type name refers to a
+    /// known struct.
     pub const isStructType = types_mod.isStructType;
+    /// Grafted from `types.zig`: whether a type name is one whose optional form is a
+    /// value optional (primitive, unowned enum, or nested value optional).
     pub const valueOptionalName = types_mod.valueOptionalName;
 
+    /// Computes the stable key identifying the closure at `span` under the currently
+    /// active instantiation, so a closure expression and the lambda collected for it
+    /// agree on one name. Delegates to [`LlvmCompiler.closureKeyM`] with the active
+    /// instantiation id resolved via [`LlvmCompiler.closureKeyActiveInstId`].
     pub fn closureKey(self: *LlvmCompiler, span: ast.Span, inst: ?[]const u8) ![]const u8 {
         return self.closureKeyM(span, inst, self.closureKeyActiveInstId());
     }
 
-    // SE-C: the instantiation discriminator for closure keys is now the TypeId inst_key (which encodes BOTH
-    // the receiver's struct-T and the method's <U>), not the string method_subst. Sourced consistently at
-    // registration (current_collecting_instantiation_id) and lookup (current_instantiation_id), both from
-    // the same FunctionInfo.instantiation_id, so the keys still match -- and it is a strictly stronger
-    // discriminator than the old name=concrete signature.
+    /// The instantiation id to use for closure keying: the collection-pass cursor
+    /// if set, otherwise the emission-pass cursor. The two passes use different
+    /// cursors but must produce the same key.
     fn closureKeyActiveInstId(self: *LlvmCompiler) ?sema_types.TypeId {
         return self.current_collecting_instantiation_id orelse self.current_instantiation_id;
     }
 
+    /// Formats the closure key as `uniqueId|instName|instId`, combining the span's
+    /// content hash (see [`LlvmCompiler.getClosureUniqueId`]) with the
+    /// instantiation name and id so the same closure under two instantiations keys
+    /// distinctly. Caller owns the returned string.
     pub fn closureKeyM(self: *LlvmCompiler, span: ast.Span, inst: ?[]const u8, inst_id: ?sema_types.TypeId) ![]const u8 {
         return std.fmt.allocPrint(self.allocator, "{d}|{s}|{d}", .{
             getClosureUniqueId(span),
@@ -904,6 +1128,9 @@ pub const LlvmCompiler = struct {
         });
     }
 
+    /// Hashes a source span (file + line + column) into a stable id that uniquely
+    /// identifies a closure by where it is written, independent of pointer identity
+    /// so it survives across the collection and emission passes.
     pub fn getClosureUniqueId(span: ast.Span) usize {
         var h = std.hash.Wyhash.init(0);
         h.update(span.file);
@@ -912,6 +1139,12 @@ pub const LlvmCompiler = struct {
         return h.final();
     }
 
+    /// Extracts the type of the `idx`-th element from a rendered tuple type string
+    /// like `(int, string, List<int>)`, returning a freshly allocated slice.
+    ///
+    /// Splits on top-level commas only, tracking `<>`/`()` nesting depth so a comma
+    /// inside a generic argument or a nested tuple does not split. Falls back to
+    /// `"i32"` when the input is not a tuple or the index is out of range.
     pub fn getTupleElementType(allocator: std.mem.Allocator, tuple_type: []const u8, idx: usize) ![]const u8 {
         if (!std.mem.startsWith(u8, tuple_type, "(") or !std.mem.endsWith(u8, tuple_type, ")")) {
             return "i32";
@@ -944,11 +1177,27 @@ pub const LlvmCompiler = struct {
         return "i32";
     }
 
+    /// Grafted from `arc.zig`: the legacy name-based ownership heuristic for strings.
     pub const legacyStringOwnership = arc_mod.legacyStringOwnership;
+    /// Grafted from `arc.zig`: lowers a call argument, applying the correct
+    /// retain/borrow/move ARC disposition.
     pub const compileCallArgument = arc_mod.compileCallArgument;
+    /// Grafted from `arc.zig`: decides whether acquiring a value should retain,
+    /// move, or borrow.
     pub const acquisitionDisposition = arc_mod.acquisitionDisposition;
+    /// Grafted from `arc.zig`: takes ownership of an element read out of a container.
     pub const takeOwnedElement = arc_mod.takeOwnedElement;
 
+    /// Returns the interned global for a string literal as an `i64` pointer to its
+    /// character data, creating it on first use.
+    ///
+    /// Each literal is laid out as a packed struct `{ i32 refcount, i32 len, [N] i8
+    /// chars }` with an internal-linkage global. The refcount field is initialised
+    /// to the sentinel -1000000000 so the runtime treats a string constant as
+    /// non-refcounted (never freed). On a cache hit it re-derives the char pointer
+    /// from the existing global; on a miss it builds and interns a new one (the key
+    /// is a duplicated copy of `str`). Note the cache-miss path allocates one extra
+    /// trailing byte for a NUL terminator.
     pub fn getOrCreateStringLiteral(self: *LlvmCompiler, str: []const u8) anyerror!types.LLVMValueRef {
         if (self.string_globals.get(str)) |global_var| {
             const unescaped = try unescapeString(self.allocator, str);
@@ -962,9 +1211,6 @@ pub const LlvmCompiler = struct {
         const unescaped = try unescapeString(self.allocator, str);
         defer self.allocator.free(unescaped);
 
-        // Reserve one extra byte for a NUL terminator (chars array is len+1) so the debugger's built-in
-        // char* view + C-FFI read the string without Python formatters. The len field stays the logical
-        // length; the trailing NUL is padding beyond it.
         var field_types = [_]types.LLVMTypeRef{ self.i32_type, self.i32_type, core.LLVMArrayType(self.i8_type, @intCast(unescaped.len + 1)) };
         const struct_type = core.LLVMStructType(&field_types, 3, 1);
 
@@ -974,14 +1220,9 @@ pub const LlvmCompiler = struct {
 
         const str_z = try self.allocator.dupeZ(u8, unescaped);
         defer self.allocator.free(str_z);
-        // Immortal constant: a NEGATIVE refcount makes nova_retain/nova_release full no-ops (both early-return
-        // on `*rc < 0`). The old value was +100000000, which is NOT immortal -- it was decremented on every
-        // use (a literal is stored without a matching retain but released on drop), so a string literal reused
-        // >1e8 times drifted the count to zero, freed the shared global, and double-freed -> SIGABRT. A
-        // negative sentinel never drifts and never frees, and it also skips the per-use ARC inc/dec entirely.
         const ref_const = core.LLVMConstInt(self.i32_type, @as(c_ulonglong, @bitCast(@as(i64, -1000000000))), 0);
         const len_const = core.LLVMConstInt(self.i32_type, @intCast(unescaped.len), 0);
-        const chars_const = core.LLVMConstString(str_z.ptr, @intCast(unescaped.len), 0); // 0 => append a NUL (len+1 bytes)
+        const chars_const = core.LLVMConstString(str_z.ptr, @intCast(unescaped.len), 0);
 
         var field_values = [_]types.LLVMValueRef{ ref_const, len_const, chars_const };
         const init_const = core.LLVMConstStruct(&field_values, 3, 1);
@@ -994,12 +1235,15 @@ pub const LlvmCompiler = struct {
         return core.LLVMBuildPtrToInt(self.builder, chars_ptr, self.val_type, "str_ptr_int");
     }
 
-    // A decimal literal (`0m`, `2m`, ...) used to lower to an unconditional nova_decimal_from_string call --
-    // a heap alloc + ASCII parse on EVERY evaluation. In hot paths (e.g. every DbValue carries a `0m`
-    // placeholder) that is thousands of throwaway allocations per request. This interns each distinct literal
-    // to a lazily-initialised global: the parse+alloc runs once, and every later use is a load + a predicted
-    // branch. The cached value is pinned immortal (negative refcount) so sharing it across owners is safe --
-    // nova_retain/nova_release early-return on `*rc < 0`, so it never drifts or frees.
+    /// Returns a decimal128 value parsed from `digits`, parsed at most once at
+    /// runtime and memoised in a per-literal cache global.
+    ///
+    /// Because decimal parsing is not a compile-time constant here, this emits a
+    /// lazy-init pattern: load the cache global, and if it is still zero, branch to
+    /// an init block that calls `nova_decimal_from_string`, stamps the parsed
+    /// object's header refcount to the -1000000000 sentinel (so it is treated as a
+    /// non-freed constant) and stores it back, then a phi merges the cached and
+    /// freshly-parsed values. The cache global's key slice is owned.
     pub fn getOrCreateDecimalLiteral(self: *LlvmCompiler, digits: []const u8) anyerror!types.LLVMValueRef {
         const cache_g = if (self.decimal_globals.get(digits)) |g| g else blk: {
             const g = core.LLVMAddGlobal(self.module, self.val_type, "dec_cache");
@@ -1022,7 +1266,6 @@ pub const LlvmCompiler = struct {
         const is_zero = core.LLVMBuildICmp(self.builder, .LLVMIntEQ, cached, core.LLVMConstInt(self.val_type, 0, 0), "dec_uninit");
         _ = core.LLVMBuildCondBr(self.builder, is_zero, init_bb, cont_bb);
 
-        // init_bb: parse once, pin immortal, cache.
         core.LLVMPositionBuilderAtEnd(self.builder, init_bb);
         const dz = try self.allocator.dupeZ(u8, digits);
         defer self.allocator.free(dz);
@@ -1030,7 +1273,6 @@ pub const LlvmCompiler = struct {
         const str_ptr = core.LLVMBuildBitCast(self.builder, str_global, self.ptr_type, "dec_lit_ptr");
         var args = [_]types.LLVMValueRef{str_ptr};
         const parsed = core.LLVMBuildCall2(self.builder, from_t, from_fn, &args, 1, "dec_parse_once");
-        // Pin: *(i32*)(parsed - 8) = -1000000000  => immortal to ARC (safe whether arena- or malloc-backed).
         const hdr_addr = core.LLVMBuildSub(self.builder, parsed, core.LLVMConstInt(self.val_type, 8, 0), "dec_hdr_addr");
         const hdr_ptr = core.LLVMBuildIntToPtr(self.builder, hdr_addr, self.ptr_type, "dec_hdr_ptr");
         _ = core.LLVMBuildStore(self.builder, core.LLVMConstInt(self.i32_type, @as(c_ulonglong, @bitCast(@as(i64, -1000000000))), 0), hdr_ptr);
@@ -1038,7 +1280,6 @@ pub const LlvmCompiler = struct {
         _ = core.LLVMBuildBr(self.builder, cont_bb);
         const init_end_bb = core.LLVMGetInsertBlock(self.builder);
 
-        // cont_bb: phi of the cached-or-just-parsed value.
         core.LLVMPositionBuilderAtEnd(self.builder, cont_bb);
         const phi = core.LLVMBuildPhi(self.builder, self.val_type, "dec_val");
         var inc_vals = [_]types.LLVMValueRef{ cached, parsed };
@@ -1047,29 +1288,59 @@ pub const LlvmCompiler = struct {
         return phi;
     }
 
+    /// Grafted from `arc.zig`: emits a `nova_retain` on a heap value (increments refcount).
     pub const compileRetain = arc_mod.compileRetain;
+    /// Grafted from `arc.zig`: splits an error-union value into its ok/err parts.
     pub const errUnionParts = arc_mod.errUnionParts;
+    /// Grafted from `arc.zig`: constructs an error-union value from a payload/error.
     pub const buildErrUnion = arc_mod.buildErrUnion;
+    /// Grafted from `arc.zig`: emits a `nova_release` with the appropriate destructor.
     pub const compileRelease = arc_mod.compileRelease;
+    /// Grafted from `arc.zig`: elides a retain/release pair that is provably a borrow.
     pub const elideBorrowedArc = arc_mod.elideBorrowedArc;
+    /// Grafted from `arc.zig`: the OSSA self-verifier that checks retain/release balance.
     pub const verifyArcBalance = arc_mod.verifyArcBalance;
+    /// Grafted from `arc.zig`: snapshots the ARC census before a region, for balance checking.
     pub const arcCensusBefore = arc_mod.arcCensusBefore;
+    /// Grafted from `arc.zig`: snapshots the ARC census after a region and diffs it.
     pub const arcCensusAfter = arc_mod.arcCensusAfter;
+    /// Grafted from `arc.zig`: gets or emits the destructor for a struct by name.
     pub const getOrCreateDestructor = arc_mod.getOrCreateDestructor;
+    /// Grafted from `arc.zig`: gets or emits a trait object's destructor.
     pub const getOrCreateTraitDestructor = arc_mod.getOrCreateTraitDestructor;
+    /// Grafted from `arc.zig`: gets or emits a destructor keyed by `TypeId`.
     pub const getOrCreateDestructorByTypeId = arc_mod.getOrCreateDestructorByTypeId;
+    /// Grafted from `arc.zig`: gets or emits a destructor, preferring the `TypeId`
+    /// over the name when both are available.
     pub const getOrCreateDestructorPreferId = arc_mod.getOrCreateDestructorPreferId;
+    /// Grafted from `arc.zig`: releases all owned locals of the current scope.
     pub const releaseLocalVariables = arc_mod.releaseLocalVariables;
+    /// Grafted from `arc.zig`: emits a deep copy of a tuple value (per-element retain/copy).
     pub const buildTupleDeepCopy = arc_mod.buildTupleDeepCopy;
+    /// Grafted from `arc.zig`: releases a single named local.
     pub const releaseLocalByName = arc_mod.releaseLocalByName;
+    /// Grafted from `arc.zig`: drops a value struct, releasing its owned fields.
     pub const dropValueStruct = arc_mod.dropValueStruct;
+    /// Grafted from `arc.zig`: substitutes type parameters within a field type under
+    /// the current instantiation.
     pub const substituteFieldType = arc_mod.substituteFieldType;
+    /// Grafted from `arc.zig`: substitutes type parameters in a type name string.
     pub const substTypeParams = arc_mod.substTypeParams;
+    /// Grafted from `types.zig`: substitutes type parameters across a method's params.
     pub const substMethodParams = types_mod.substMethodParams;
+    /// Grafted from `types.zig`: builds the mangled symbol name of a method on a
+    /// given (possibly instantiated) owner.
     pub const methodSymbol = types_mod.methodSymbol;
+    /// Grafted from `types.zig`: enumerates the concrete instantiations of a struct
+    /// (returns a slice including null for the erased base).
     pub const instantiationsOf = types_mod.instantiationsOf;
+    /// Grafted from `types.zig`: rewrites `Self`/type-param references to the
+    /// concrete owner under the current instantiation.
     pub const qualifySelfType = types_mod.qualifySelfType;
 
+    /// Emits a heap allocation of `size` bytes via the `nova_bytes_alloc` runtime
+    /// function, declaring that extern lazily on first use. Returns the client
+    /// pointer as an `i64` word.
     pub fn compileAlloc(self: *LlvmCompiler, size: types.LLVMValueRef) anyerror!types.LLVMValueRef {
         const alloc_fn = if (self.func_map.get("nova_bytes_alloc")) |f| f else blk: {
             var arg_types = [_]types.LLVMTypeRef{self.val_type};
@@ -1083,9 +1354,9 @@ pub const LlvmCompiler = struct {
         return core.LLVMBuildCall2(self.builder, fn_t, alloc_fn, &args, 1, "alloc_tmp");
     }
 
-    // Array allocation that returns a real `ptr` (nova_array_alloc), so fixed-array construction keeps
-    // pointer provenance -- the array literal/repeat store through this ptr and return it into a ptr
-    // slot with no inttoptr laundering, which lets LLVM vectorize/hoist the later access loops.
+    /// Emits an array allocation of `size` bytes via `nova_array_alloc`, declaring
+    /// the extern lazily. Unlike [`LlvmCompiler.compileAlloc`] this returns a real
+    /// pointer (`ptr_type`), used where a typed array base is needed.
     pub fn compileAllocArray(self: *LlvmCompiler, size: types.LLVMValueRef) anyerror!types.LLVMValueRef {
         const alloc_fn = if (self.func_map.get("nova_array_alloc")) |f| f else blk: {
             var arg_types = [_]types.LLVMTypeRef{self.val_type};
@@ -1099,6 +1370,9 @@ pub const LlvmCompiler = struct {
         return core.LLVMBuildCall2(self.builder, fn_t, alloc_fn, &args, 1, "arr_alloc");
     }
 
+    /// Emits an allocation from the persistent arena via
+    /// `nova_bytes_alloc_persistent`, for objects (like interned constants) that
+    /// must outlive the normal request/arena lifetime and are never freed.
     pub fn compileAllocPersistent(self: *LlvmCompiler, size: types.LLVMValueRef) anyerror!types.LLVMValueRef {
         const alloc_fn = if (self.func_map.get("nova_bytes_alloc_persistent")) |f| f else blk: {
             var arg_types = [_]types.LLVMTypeRef{self.val_type};
@@ -1112,6 +1386,14 @@ pub const LlvmCompiler = struct {
         return core.LLVMBuildCall2(self.builder, fn_t, alloc_fn, &args, 1, "alloc_persistent_tmp");
     }
 
+    /// If `tid` is a value optional, returns the `TypeId` it wraps; otherwise null.
+    ///
+    /// A value optional is one whose payload does not carry its own null bit, so it
+    /// must be boxed to distinguish "present zero" from "absent": primitives always
+    /// qualify, an enum qualifies only if it is NOT an owned/tagged-union type, and
+    /// a nested optional qualifies only if it too is a value optional (recursively).
+    /// This is the core predicate behind the whole valopt ABI; see
+    /// [`LlvmCompiler.valoptDepth`].
     pub fn valueOptionalInner(self: *LlvmCompiler, tid: sema_types.TypeId) ?sema_types.TypeId {
         const st = self.type_store orelse return null;
         const info = st.get(tid);
@@ -1120,19 +1402,14 @@ pub const LlvmCompiler = struct {
             .prim => info.optional,
 
             .enum_ => if (st.isOwned(info.optional)) null else info.optional,
-            // A NESTED value-optional (`(int | undefined) | undefined`, produced only through generics,
-            // e.g. `Map<K, int | undefined>.get()`): the inner is itself a value-optional, so the whole
-            // thing is a value-optional whose payload is the inner box. Recursing lets the box/unbox seam
-            // add/remove exactly one level per site, so present-holding-undefined (inner 0) stays distinct
-            // from absent (outer 0). See A-nested in final-beta-readiness.md.
             .optional => if (self.valueOptionalInner(info.optional) != null) info.optional else null,
             else => null,
         };
     }
 
-    // How many value-optional levels wrap this type (0 = not a value-optional, 1 = `int | undefined`,
-    // 2 = `(int | undefined) | undefined`). Each level is one heap box, so the depth is the number of
-    // box/unbox peels between two value-optional representations.
+    /// Counts how many value-optional layers wrap `tid`, i.e. how many box levels a
+    /// value of this type carries (0 for a non-valopt, 2 for `int??`). Used to match
+    /// an argument's box depth to the parameter's expected depth at a call site.
     pub fn valoptDepth(self: *LlvmCompiler, tid: sema_types.TypeId) usize {
         var d: usize = 0;
         var cur = tid;
@@ -1143,6 +1420,9 @@ pub const LlvmCompiler = struct {
         return d;
     }
 
+    /// Boxes a bare value into a value-optional via `nova_valopt_box`, so a present
+    /// value (including a present zero) is distinguishable from absence. Declares
+    /// the extern lazily.
     pub fn buildValoptBox(self: *LlvmCompiler, value: types.LLVMValueRef) anyerror!types.LLVMValueRef {
         const f = if (self.func_map.get("nova_valopt_box")) |g| g else blk: {
             var at = [_]types.LLVMTypeRef{self.val_type};
@@ -1156,6 +1436,8 @@ pub const LlvmCompiler = struct {
         return core.LLVMBuildCall2(self.builder, ft, f, &args, 1, "valopt_box");
     }
 
+    /// Unboxes one value-optional layer via `nova_valopt_unbox`, recovering the
+    /// underlying value word. The inverse of [`LlvmCompiler.buildValoptBox`].
     pub fn buildValoptUnbox(self: *LlvmCompiler, box: types.LLVMValueRef) anyerror!types.LLVMValueRef {
         const f = if (self.func_map.get("nova_valopt_unbox")) |g| g else blk: {
             var at = [_]types.LLVMTypeRef{self.val_type};
@@ -1169,6 +1451,9 @@ pub const LlvmCompiler = struct {
         return core.LLVMBuildCall2(self.builder, ft, f, &args, 1, "valopt_unbox");
     }
 
+    /// Boxes a value into an `any` via `nova_any_box`, pairing the payload word with
+    /// a destructor function pointer (zero for a non-owning payload) so the boxed
+    /// value can be released correctly later. Declares the extern lazily.
     pub fn buildAnyBox(self: *LlvmCompiler, payload: types.LLVMValueRef, dtor: types.LLVMValueRef) anyerror!types.LLVMValueRef {
         const f = if (self.func_map.get("nova_any_box")) |g| g else blk: {
             var at = [_]types.LLVMTypeRef{ self.val_type, self.val_type };
@@ -1182,6 +1467,8 @@ pub const LlvmCompiler = struct {
         return core.LLVMBuildCall2(self.builder, ft, f, &args, 2, "any_box");
     }
 
+    /// Recovers the payload word from an `any` box via `nova_any_unbox`. The inverse
+    /// of [`LlvmCompiler.buildAnyBox`].
     pub fn buildAnyUnbox(self: *LlvmCompiler, box: types.LLVMValueRef) anyerror!types.LLVMValueRef {
         const f = if (self.func_map.get("nova_any_unbox")) |g| g else blk: {
             var at = [_]types.LLVMTypeRef{self.val_type};
@@ -1195,20 +1482,22 @@ pub const LlvmCompiler = struct {
         return core.LLVMBuildCall2(self.builder, ft, f, &args, 1, "any_unbox");
     }
 
-    // Widen a value of `src_expr` into an owning `any` carrier. A heap payload is retained when the source
-    // is a live borrow (an owned temp transfers its ref to the box); the box records the payload's
-    // destructor so dropping the `any` releases the payload.
+    /// Coerces a concrete value into an `any` box, capturing the right destructor
+    /// and doing the right ARC bookkeeping for the source's ownership category.
+    ///
+    /// Already-`any` values pass through. A value struct is copied onto the heap
+    /// (its owned fields deep-retained) and boxed with the struct's destructor. A
+    /// heap-owned reference is boxed with its destructor and either retained (when
+    /// the source expression is a borrow: an ident/field/index) or has its
+    /// temporary consumed (when it is a freshly produced value), preserving the
+    /// refcount invariant. The resulting box is registered as a temporary so it is
+    /// released at statement end.
     pub fn coerceToAny(self: *LlvmCompiler, val: types.LLVMValueRef, src_expr: *const ast.Expression) anyerror!types.LLVMValueRef {
         const payload = self.coerceToSlotType(val, self.val_type);
         const src_name = (try self.resolveExpressionTypeName(src_expr)) orelse "";
-        if (std.mem.eql(u8, src_name, "any")) return payload; // already a carrier
+        if (std.mem.eql(u8, src_name, "any")) return payload;
         var dtor = core.LLVMConstInt(self.val_type, 0, 0);
         const src_tid = self.typeOfExprConcrete(src_expr);
-        // M-1: a VALUE struct has no heap identity -- `payload` is a STACK alloca address that the
-        // any-box would outlive (case 123: use-after-return). Heap-promote it: copy the struct into a
-        // fresh ARC-headed heap block and box THAT, with the struct's own destructor. Its owned fields
-        // are now aliased by the original local and the heap copy, so retain them in the copy (the
-        // local still drops its own copy at scope end; the box's nova_release drops the heap copy's).
         const is_vstruct = if (src_tid) |t| self.isValueStructTid(t) else self.isValueStructName(src_name);
         if (is_vstruct) {
             var vname = src_name;
@@ -1239,23 +1528,20 @@ pub const LlvmCompiler = struct {
             }
         }
         const box = try self.buildAnyBox(payload, dtor);
-        // The box is a fresh owned temporary (rc=1). Register it so a call that stores it (and retains)
-        // has its extra caller-side reference released at statement end; a let-init that takes ownership
-        // consumes this registration instead (see the widen path in statements.zig).
         try self.registerTemporary(box, "any");
         return box;
     }
 
+    /// Whether an AST type reference denotes a value optional (the syntactic
+    /// counterpart of [`LlvmCompiler.valueOptionalInner`], used where only the
+    /// `TypeRef` is available, e.g. a parameter's declared type).
+    ///
+    /// Resolves the optional's inner type (preferring a concrete `TypeId` render
+    /// when possible), then applies the value-optional rules: not `ptr`, primitive
+    /// -> true, nested value-optional name -> true, an enum that is not a tagged
+    /// union -> true, otherwise false.
     pub fn valoptTypeRefIsValue(self: *LlvmCompiler, tr: ast.TypeRef) bool {
         if (tr != .optional) return false;
-        // B3 (string-engine-removal): resolve the inner through the CURRENT instantiation so a
-        // `T | undefined` parameter decides value-vs-reference on its CONCRETE argument, not on the
-        // unresolved type-parameter. concreteTidForTypeRef applies the instantiation overlay and
-        // symbolName renders that concrete id (the sanctioned TypeId->name boundary); this drops the
-        // former dependence on typeRefToString -> substMethodParams (the deletable string engine). The
-        // declared-TypeRef string render survives ONLY as the fallback when no concrete id is recoverable
-        // -- a genuinely erased body, where a bare type-param inner is not a value-prim and so is not
-        // boxed either way, matching this path. Gating case: 119_generic_return (maybe<int> must box).
         const inner = blk: {
             if (self.concreteTidForTypeRef(tr.optional.*)) |itid| {
                 break :blk self.symbolName(itid) catch (self.typeRefToString(tr.optional.*) catch return false);
@@ -1264,12 +1550,6 @@ pub const LlvmCompiler = struct {
         };
         if (std.mem.eql(u8, inner, "ptr")) return false;
         if (types_mod.cgPrim(inner) != null) return true;
-        // A NESTED value-optional return (`(int | undefined) | undefined`, produced only through generics,
-        // e.g. `Map<K, int | undefined>.get()`): the inner is itself a value-optional name, so the outer
-        // level is boxed like any value-optional. The outer box BORROWS the inner box (its dtor is the plain
-        // value-optional NULL dtor, it does NOT free the inner) -- the container owns the inner box and frees
-        // it on drop (see buildStorageDestructor / f6e7b86), and the consuming `??` peel retains a ref for the
-        // bound local. So no owner double-frees. See A-nested in final-beta-readiness.md.
         if (valueOptionalName(inner)) return true;
 
         const base = getStructBaseName(inner);
@@ -1277,26 +1557,18 @@ pub const LlvmCompiler = struct {
         return false;
     }
 
-    // Is this TypeRef a NESTED value-optional (`(int | undefined) | undefined`)? i.e. an optional whose
-    // inner type is itself a value-optional. Used to force the outer box on return even when the returned
-    // expression already yields the inner value-optional box (which normally suppresses re-boxing).
+    /// Whether an AST optional type is doubly-nested (its inner type is itself a
+    /// value-optional name, e.g. `int??`), so a call site knows the parameter
+    /// expects box depth 2 rather than 1.
     pub fn valoptTypeRefIsNested(self: *LlvmCompiler, tr: ast.TypeRef) bool {
         if (tr != .optional) return false;
         const inner = self.typeRefToString(tr.optional.*) catch return false;
         return valueOptionalName(inner);
     }
 
-    // Does a generic method's parameter (declared as the receiver struct's type parameter, e.g.
-    // `value: T` on `List<T>.push`) resolve, for THIS receiver instance, to a value-optional element
-    // type (`int | undefined`)? Routes through the receiver's TypeId arguments (which preserve
-    // optionality) rather than the substituted param string (typeRefToString drops `.optional`).
-    // `param_idx` is the call-argument index (self excluded).
-    // True when `arg` is a bare identifier whose local slot is a value-optional. Passing such an ident to
-    // a method argument must keep the BOX intact (the speculative ident-unbox must not fire): a generic
-    // container parameter's value-optional type arg is collapsed by monomorphisation, so the callee-param
-    // signal is unreliable, but the arg's own slot type is authoritative. Narrowing a value-optional to a
-    // bare parameter requires an explicit `?? d` at the call site, so the bare ident never legitimately
-    // needs unboxing here.
+    /// Whether an argument expression is a plain local whose type is a value
+    /// optional, i.e. it already holds a box. Lets the caller avoid re-boxing an
+    /// argument that is already in boxed form.
     pub fn argIsValoptLocal(self: *LlvmCompiler, arg: *const ast.Expression) bool {
         if (arg.kind != .ident) return false;
         const ids = self.current_local_type_ids orelse return false;
@@ -1304,6 +1576,15 @@ pub const LlvmCompiler = struct {
         return self.valueOptionalInner(slot_tid) != null;
     }
 
+    /// Whether the `param_idx`-th parameter of `method_name` on the receiver's
+    /// concrete type resolves (through the receiver's generic arguments) to a value
+    /// optional.
+    ///
+    /// This handles the case where a method parameter is written in terms of a type
+    /// parameter (`fn set(v: T)`) and the receiver instantiates `T` with a value-
+    /// optional type: it finds the matching type parameter position in the struct's
+    /// type-arg list and checks that argument. Accounts for the implicit `self`
+    /// when computing the real parameter index.
     pub fn methodParamIsValueOptional(self: *LlvmCompiler, recv_expr: *const ast.Expression, method_name: []const u8, param_idx: usize) bool {
         const st = self.type_store orelse return false;
         const recv_tid = self.typeOfExprConcrete(recv_expr) orelse return false;
@@ -1315,7 +1596,6 @@ pub const LlvmCompiler = struct {
         const sdecl = self.structs.get(base) orelse return false;
         for (sdecl.methods) |m| {
             if (!std.mem.eql(u8, m.decl.name, method_name)) continue;
-            // The method decl lists `self` as its first parameter; call arguments exclude it.
             var off: usize = 0;
             if (m.decl.params.len > 0 and std.mem.eql(u8, m.decl.params[0].name, "self")) off = 1;
             const real_idx = off + param_idx;
@@ -1332,40 +1612,46 @@ pub const LlvmCompiler = struct {
         return false;
     }
 
+    /// Whether an expression already evaluates to a value-optional box (as opposed
+    /// to a bare value that would need boxing).
+    ///
+    /// Only certain expression shapes carry the box through: reads
+    /// (ident/field/index), calls, optional chaining, await/catch/try, and nullish
+    /// coalescing. Anything else that has a valopt type would produce a bare value,
+    /// so the caller must box it. Returns false for non-valopt types.
     pub fn exprYieldsValoptBox(self: *LlvmCompiler, e: *const ast.Expression) bool {
         const tid = self.typeOfExprConcrete(e) orelse return false;
         if (self.valueOptionalInner(tid) == null) return false;
         return switch (e.kind) {
-            // `await f()` where f returns a value-optional yields the boxed representation, exactly like
-            // a plain call; without this a consuming `?? d` (or comparison) would treat the box pointer
-            // as the raw value and return garbage (silent corruption on every async optional API).
-            // `try`/`catch` over a `T | undefined | E` yield the value-optional ok arm (a box) too, so a
-            // consuming `?? d` must unbox it rather than return the raw pointer (F1).
             .ident, .field_access, .call, .generic_call, .index, .optional_chaining, .await_expr, .catch_expr, .try_expr => true,
-            // A NESTED value-optional peeled by `??` (`let inner = g ?? undefined` where
-            // `g : (int | undefined) | undefined`) yields the INNER value-optional box, itself a
-            // value-optional. Whitelisting it lets a further consumer unbox exactly one level rather than
-            // double-boxing the already-boxed inner. Gated by the value-optional type check above, so a plain
-            // `x ?? 0` yielding a raw `int` is unaffected.
             .nullish_coalesce => true,
             else => false,
         };
     }
 
+    /// Whether an expression is the `undefined` or `null` literal, i.e. an explicit
+    /// absent value that must NOT be boxed as a present value at a valopt call site.
     pub fn isUndefinedLiteralExpr(e: *const ast.Expression) bool {
         return e.kind == .literal and (e.kind.literal == .undefined or e.kind.literal == .null);
     }
 
+    /// The size in bytes of a pointer/word element on the target: 4 on WASM (a
+    /// 32-bit target), 8 elsewhere. Used to stride through vtables and pointer arrays.
     pub fn ptrElemSize(self: *LlvmCompiler) u64 {
         return if (self.is_wasm) 4 else 8;
     }
 
+    /// The size in bytes of one value slot in a captured-environment layout. Fixed
+    /// at 8 (values are stored as full words even on WASM), independent of `self`.
     pub fn valSlotSize(self: *LlvmCompiler) usize {
         _ = self;
 
         return 8;
     }
 
+    /// Returns the index of `name` within the current lambda's capture list, or
+    /// null if it is not a capture. Only meaningful inside a `__lambda_*` function;
+    /// used to load a captured variable from the `__env` block.
     pub fn envCaptureIndex(self: *LlvmCompiler, name: []const u8) ?usize {
         const fn_name = self.current_function_name orelse return null;
         if (!std.mem.startsWith(u8, fn_name, "__lambda_")) return null;
@@ -1376,6 +1662,9 @@ pub const LlvmCompiler = struct {
         return null;
     }
 
+    /// Computes the address of the `index`-th capture slot inside the current
+    /// lambda's `__env` block (env base pointer + index * slot size). Errors if the
+    /// `__env` local is not in scope.
     pub fn envSlotAddr(self: *LlvmCompiler, index: usize) anyerror!types.LLVMValueRef {
         const env_slot = self.locals.get("__env") orelse return error.EnvNotFound;
         const env_ptr = core.LLVMBuildLoad2(self.builder, self.val_type, env_slot, "env_ptr");
@@ -1383,6 +1672,8 @@ pub const LlvmCompiler = struct {
         return core.LLVMBuildAdd(self.builder, env_ptr, off, "env_slot_addr");
     }
 
+    /// Emits a `nova_bytes_free` on a heap pointer (declaring the extern lazily) and
+    /// returns a zero word, so it can be used where an expression value is expected.
     pub fn compileFree(self: *LlvmCompiler, ptr: types.LLVMValueRef) anyerror!types.LLVMValueRef {
         const free_fn = if (self.func_map.get("nova_bytes_free")) |f| f else blk: {
             var arg_types = [_]types.LLVMTypeRef{self.val_type};
@@ -1397,6 +1688,16 @@ pub const LlvmCompiler = struct {
         return core.LLVMConstInt(self.val_type, 0, 0);
     }
 
+    /// Emits the whole memory-management runtime directly as LLVM IR, for targets
+    /// (chiefly WASM) that cannot link the C++ runtime.
+    ///
+    /// It defines, in IR: `nova_bytes_free` (a free-list push that no-ops for null,
+    /// arena-region and, on WASM, all pointers), a bump-pointer `nova_bytes_alloc`
+    /// (writing a 4-byte size header, 8-byte aligning, seeding the heap from
+    /// `__heap_base` on WASM), a first-fit persistent `nova_bytes_alloc_persistent`
+    /// that reuses the free list before bumping the persistent arena, and no-op
+    /// `nova_retain`/`nova_release` stubs (WASM programs run to completion without
+    /// reclamation). Each function is built with its own temporary IR builder.
     pub fn generateWasmMemoryFunctions(self: *LlvmCompiler) !void {
 
         var free_params = [_]types.LLVMTypeRef{self.val_type};
@@ -1592,6 +1893,10 @@ pub const LlvmCompiler = struct {
         _ = core.LLVMBuildRetVoid(relb);
     }
 
+    /// If a free function is really a struct method (its first parameter is `self`
+    /// of a known struct, or it is a `new` returning a known struct), returns that
+    /// struct's module-scoped name so the function can be mangled under it;
+    /// otherwise null.
     pub fn getStructPrefix(self: *LlvmCompiler, fn_decl: ast.FunctionDecl) ?[]const u8 {
 
         if (fn_decl.params.len > 0) {
@@ -1630,6 +1935,11 @@ pub const LlvmCompiler = struct {
         return null;
     }
 
+    /// Whether a function name already carries one of the well-known stdlib module
+    /// prefixes (e.g. `net_http_request_`, `collections_list_`), so codegen does not
+    /// prepend a second module prefix and produce a doubly-namespaced symbol. The
+    /// prefix must be followed by `_` to count, avoiding false matches like `list`
+    /// inside `listener`.
     pub fn isAlreadyNamespaced(name: []const u8) bool {
         const prefixes = [_][]const u8{
             "string", "bson", "json", "datetime", "http", "i32", "double", "bool", "list", "map", "set", "concurrency", "channel", "sync", "allocator", "web",
@@ -1649,21 +1959,16 @@ pub const LlvmCompiler = struct {
         return false;
     }
 
-    // A `struct` (value type) FIELD is stored INLINE by value (Swift's value-type model), so it takes its
-    // full size; a `class` (reference) field is an 8-byte pointer. This is the single decision that makes
-    // nested value structs deep-copy for free (a flat memcpy of the parent copies the inline bytes).
+    /// Whether a struct with base name `base` is stored inline in its container/field
+    /// (i.e. it is a value struct) rather than behind a heap pointer. The layout
+    /// decision that drives [`LlvmCompiler.getTypeSize`] and field offsets.
     pub fn fieldStoredInline(self: *LlvmCompiler, base: []const u8) bool {
-        // A field is stored INLINE only if its type is a VALUE-LOWERED struct -- i.e. the ESCAPE-AWARE
-        // predicate, not is_reference alone. A struct the escape analysis keeps on the heap (e.g. `Aes`,
-        // returned as a bare local; or a `class`) is a POINTER field. Using is_reference here would inline a
-        // heap-kept struct while the rest of codegen (isValueStructName) treats it as a pointer -> layout
-        // mismatch and corruption (the aes.gcm null-skey crash). This keeps the inline decision consistent.
         return self.isValueStructName(base);
     }
 
-    // Natural alignment of a type used as a field: a scalar aligns to its width; an inline value struct to
-    // the max of its fields' alignments; a pointer (class/string/other) to 8. Kept separate from getTypeSize
-    // because an inline struct's SIZE is the sum of its fields but its ALIGNMENT is only the widest field.
+    /// Computes the byte alignment of a type. Primitives use their natural
+    /// alignment; a value struct takes the maximum alignment of its fields
+    /// (computed recursively); everything else is pointer-aligned (8).
     pub fn getTypeAlign(self: *LlvmCompiler, type_ref: ast.TypeRef) u32 {
         switch (type_ref) {
             .ident => |name| {
@@ -1689,6 +1994,14 @@ pub const LlvmCompiler = struct {
         }
     }
 
+    /// Computes the byte size of a type, in one of two modes selected by `is_field`.
+    ///
+    /// When `is_field` is true the size is the storage occupied as a struct field
+    /// or container element: a heap-stored struct/union/generic occupies one 8-byte
+    /// pointer, whereas a value struct is measured by its full inline payload.
+    /// When `is_field` is false the size is the full object size (used to size an
+    /// allocation). Primitives return their scalar width; unions return the size of
+    /// their largest variant; unknown types default to a word (8).
     pub fn getTypeSize(self: *LlvmCompiler, type_ref: ast.TypeRef, is_field: bool) u32 {
         switch (type_ref) {
             .generic => |g| {
@@ -1714,7 +2027,6 @@ pub const LlvmCompiler = struct {
                 }
                 const base = getStructBaseName(name);
                 if (self.structs.get(base)) |s| {
-                    // As a FIELD: a value struct is stored inline (its full size); a class is a pointer (8).
                     if (is_field and !self.fieldStoredInline(base)) return 8;
                     return self.structPayloadSize(s);
                 }
@@ -1735,9 +2047,9 @@ pub const LlvmCompiler = struct {
         }
     }
 
-    // Total inline payload size of a struct: each field placed at its natural alignment, size summed, then
-    // the whole rounded up to the struct's own alignment (so an array/inline-nesting of the struct stays
-    // aligned -- matches C/Swift struct layout).
+    /// Lays out a struct's fields (each field padded up to its alignment) and
+    /// returns the total size rounded up to the struct's own alignment, i.e. the C
+    /// struct-packing computation. The layout must match [`LlvmCompiler.getFieldOffset`].
     fn structPayloadSize(self: *LlvmCompiler, s: ast.StructDecl) u32 {
         var size: u32 = 0;
         var struct_align: u32 = 1;
@@ -1752,15 +2064,28 @@ pub const LlvmCompiler = struct {
         return size;
     }
 
+    /// Grafted from `types.zig`: maps a Nova type name to its LLVM type.
     pub const toLLVMType = types_mod.toLLVMType;
+    /// Grafted from `types.zig`: maps a primitive repr kind to its LLVM type.
     pub const llvmForRepr = types_mod.llvmForRepr;
+    /// Grafted from `types.zig`: the `<4 x double>` SIMD vector LLVM type.
     pub const vecF64x4Type = types_mod.vecF64x4Type;
+    /// Grafted from `types.zig`: bit-casts/extends a typed value up to the `i64` word.
     pub const castToValType = types_mod.castToValType;
+    /// Grafted from `types.zig`: narrows/bit-casts an `i64` word back to a concrete type.
     pub const castFromValType = types_mod.castFromValType;
+    /// Grafted from `types.zig`: the LLVM slot type to allocate for a local by name.
     pub const slotTypeForLocal = types_mod.slotTypeForLocal;
+    /// Grafted from `types.zig`: the slot type for a local by `TypeId`.
     pub const slotTypeForLocalId = types_mod.slotTypeForLocalId;
+    /// Grafted from `types.zig`: coerces a value into a given slot type for store/load.
     pub const coerceToSlotType = types_mod.coerceToSlotType;
 
+    /// Computes the byte offset of a named field within a struct, applying the same
+    /// alignment-padding layout as [`LlvmCompiler.structPayloadSize`].
+    ///
+    /// A union always reports offset 0 (its variants overlap). Errors with
+    /// `StructTypeNotFound` or `FieldNotFound` if the struct or field is unknown.
     pub fn getFieldOffset(self: *LlvmCompiler, struct_name: []const u8, field_name: []const u8) anyerror!u32 {
         const base_struct = getStructBaseName(struct_name);
         if (self.unions.contains(base_struct)) {
@@ -1782,14 +2107,18 @@ pub const LlvmCompiler = struct {
         return error.FieldNotFound;
     }
 
+    /// Emits a call to `fn_val`, coercing each argument to the callee's declared
+    /// parameter type and coercing the result back to the `i64` value word.
+    ///
+    /// Because most values are carried as `i64` while runtime/FFI functions have
+    /// precise signatures, each argument is bridged as needed: int<->pointer,
+    /// int<->double bit-casts, and integer trunc/zext to the exact width. A void
+    /// return yields a zero word so the call is usable as an expression. A fixed-
+    /// arity mismatch is a COMPILER bug (sema should have caught it): it prints a
+    /// diagnostic and exits with code 70 rather than emitting broken IR.
     pub fn buildCallWithCasts(self: *LlvmCompiler, fn_val: types.LLVMValueRef, args: []const types.LLVMValueRef) anyerror!types.LLVMValueRef {
         const fn_t = core.LLVMGlobalGetValueType(fn_val);
         const param_count = core.LLVMCountParamTypes(fn_t);
-        // C7 fail-closed: a non-vararg function called with the wrong argument count used to build a
-        // malformed LLVM call (extra args passed, or fewer than the signature) which either fails
-        // verification or is silent UB. Sema must have caught a real arity error long before codegen, so
-        // reaching here with a mismatch on a fixed-arity function is a COMPILER bug -- surface it loudly
-        // instead of emitting a broken call.
         if (core.LLVMIsFunctionVarArg(fn_t) == 0 and args.len != param_count) {
             const name = std.mem.span(core.LLVMGetValueName(fn_val));
             std.debug.print(
@@ -1864,28 +2193,36 @@ pub const LlvmCompiler = struct {
         return call_val;
     }
 
+    /// Returns the rendered type-name of a function's `param_idx`-th parameter,
+    /// memoised in `param_type_str_cache` keyed by `name\0index`.
+    ///
+    /// The cache stores an owned duplicate of the result (or null), so lookups are
+    /// cheap on the hot call-lowering path. Delegates the real work to
+    /// [`LlvmCompiler.getFunctionParamTypeUncached`].
     pub fn getFunctionParamType(self: *LlvmCompiler, func_name: []const u8, param_idx: usize) ?[]const u8 {
         const key = std.fmt.allocPrint(self.allocator, "{s}\x00{d}", .{ func_name, param_idx }) catch return self.getFunctionParamTypeUncached(func_name, param_idx);
-        // Return a BORROWED cache-owned pointer (the cache is freed at compiler deinit); callers never free it.
-        // Returning a fresh per-call dup instead leaked one allocation on EVERY call -- and this is called
-        // millions of times during codegen, so it accumulated to tens of GB on a large build.
         if (self.param_type_str_cache.get(key)) |cached| {
             self.allocator.free(key);
-            return cached; // borrowed
+            return cached;
         }
         const result = self.getFunctionParamTypeUncached(func_name, param_idx);
-        // Cache OWNS an independent copy and we return THAT (borrowed). `result` may be owned (typeRefToString)
-        // or borrowed (AST s.name) -- we can't tell, so we don't free it; it leaks at most once per distinct
-        // (func,param) key (bounded to thousands), never per-call.
         const stored: ?[]const u8 = if (result) |r| (self.allocator.dupe(u8, r) catch null) else null;
         self.param_type_str_cache.put(key, stored) catch {
             if (stored) |s| self.allocator.free(s);
             self.allocator.free(key);
-            return stored; // borrowed
+            return stored;
         };
-        return stored; // borrowed
+        return stored;
     }
 
+    /// The uncached body of [`LlvmCompiler.getFunctionParamType`]: scans program
+    /// declarations to find `func_name` and render its parameter type.
+    ///
+    /// Matches both free functions (accounting for module-prefix mangling) and
+    /// struct methods across every instantiation (parameter index 0 is the receiver
+    /// `self`, whose type is the struct; `init`/`new` shift the index by one). For a
+    /// method it renders the type under that method's owning instantiation so type
+    /// parameters resolve concretely.
     fn getFunctionParamTypeUncached(self: *LlvmCompiler, func_name: []const u8, param_idx: usize) ?[]const u8 {
         for (self.program.declarations) |decl| {
             switch (decl) {
@@ -1893,13 +2230,13 @@ pub const LlvmCompiler = struct {
                     var name = f.name;
                     var name_owned = false;
                     if (self.getModulePrefix(f.span)) |mod_prefix| {
-                        defer self.allocator.free(mod_prefix); // getModulePrefix returns owned memory
+                        defer self.allocator.free(mod_prefix);
                         if (!LlvmCompiler.isAlreadyNamespaced(f.name)) {
                             name = std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ mod_prefix, f.name }) catch return null;
                             name_owned = true;
                         }
                     }
-                    defer if (name_owned) self.allocator.free(name); // temp only used for the comparison
+                    defer if (name_owned) self.allocator.free(name);
                     if (std.mem.eql(u8, name, func_name) or std.mem.eql(u8, f.name, func_name)) {
                         if (param_idx < f.params.len) {
                             if (f.params[param_idx].type_name) |t| {
@@ -1910,26 +2247,19 @@ pub const LlvmCompiler = struct {
                     }
                 },
                 .struct_decl => |s| {
-                    // instantiationsOf returns an OWNED slice (its ?[]const u8 elements are borrowed). It
-                    // depends only on `s`, so compute it ONCE per struct, free it, and reuse across methods --
-                    // computing+leaking it per method was O(structs*methods) leaked slices per call.
                     const insts = self.instantiationsOf(s) catch continue;
                     defer self.allocator.free(insts);
                     for (s.methods) |m| {
                         for (insts) |inst_opt| {
                             const owner = inst_opt orelse s.name;
                             const full_name = self.methodSymbol(owner, m.decl.name) catch continue;
-                            defer self.allocator.free(full_name); // methodSymbol returns owned memory
+                            defer self.allocator.free(full_name);
                             if (!std.mem.eql(u8, full_name, func_name)) continue;
                             if (param_idx == 0) return s.name;
                             const is_constructor = std.mem.eql(u8, m.decl.name, "init") or std.mem.eql(u8, m.decl.name, "new");
                             const actual_idx = if (is_constructor) param_idx - 1 else param_idx;
                             if (actual_idx < m.decl.params.len) {
                                 if (m.decl.params[actual_idx].type_name) |t| {
-                                    // Render the param under the CALLEE's instantiation (`owner` is the angle-form
-                                    // `Map<string, any>`), so a struct type-param like `V` resolves to its concrete
-                                    // (`any`) even though this is reached from the caller's context. Without this the
-                                    // param reads back as the bare type-param name.
                                     const saved = self.current_instantiation;
                                     self.current_instantiation = owner;
                                     defer self.current_instantiation = saved;
@@ -1946,10 +2276,10 @@ pub const LlvmCompiler = struct {
         return null;
     }
 
+    /// Like [`LlvmCompiler.getFunctionParamType`] but returns the raw AST
+    /// `TypeRef` (unrendered), memoised in `param_type_cache`. Preferred where the
+    /// structured type is needed, e.g. valopt coercion decisions.
     pub fn getFunctionParamTypeRef(self: *LlvmCompiler, func_name: []const u8, param_idx: usize) ?ast.TypeRef {
-        // Cache lookup: the scan below is O(all-declarations x methods x instantiations) and this
-        // is called per-parameter per-call-site, so memoise on (func_name, param_idx). Pure for a
-        // fixed program.
         const key = std.fmt.allocPrint(self.allocator, "{s}\x00{d}", .{ func_name, param_idx }) catch return self.getFunctionParamTypeRefUncached(func_name, param_idx);
         if (self.param_type_cache.get(key)) |cached| {
             self.allocator.free(key);
@@ -1960,6 +2290,9 @@ pub const LlvmCompiler = struct {
         return result;
     }
 
+    /// The uncached body of [`LlvmCompiler.getFunctionParamTypeRef`]: the same
+    /// declaration scan as [`LlvmCompiler.getFunctionParamTypeUncached`] but
+    /// returning the parameter's raw `TypeRef` instead of a rendered string.
     fn getFunctionParamTypeRefUncached(self: *LlvmCompiler, func_name: []const u8, param_idx: usize) ?ast.TypeRef {
         for (self.program.declarations) |decl| {
             switch (decl) {
@@ -1967,7 +2300,7 @@ pub const LlvmCompiler = struct {
                     var name = f.name;
                     var name_owned = false;
                     if (self.getModulePrefix(f.span)) |mod_prefix| {
-                        defer self.allocator.free(mod_prefix); // getModulePrefix returns owned memory
+                        defer self.allocator.free(mod_prefix);
                         if (!LlvmCompiler.isAlreadyNamespaced(f.name)) {
                             name = std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ mod_prefix, f.name }) catch return null;
                             name_owned = true;
@@ -1980,13 +2313,13 @@ pub const LlvmCompiler = struct {
                     }
                 },
                 .struct_decl => |s| {
-                    const insts = self.instantiationsOf(s) catch continue; // owned slice; depends only on `s`
+                    const insts = self.instantiationsOf(s) catch continue;
                     defer self.allocator.free(insts);
                     for (s.methods) |m| {
                         for (insts) |inst_opt| {
                             const owner = inst_opt orelse s.name;
                             const full_name = self.methodSymbol(owner, m.decl.name) catch continue;
-                            defer self.allocator.free(full_name); // methodSymbol returns owned memory
+                            defer self.allocator.free(full_name);
                             if (!std.mem.eql(u8, full_name, func_name)) continue;
                             if (param_idx == 0) return null;
                             const is_constructor = std.mem.eql(u8, m.decl.name, "init") or std.mem.eql(u8, m.decl.name, "new");
@@ -2002,12 +2335,15 @@ pub const LlvmCompiler = struct {
         return null;
     }
 
+    /// Bridges an argument value to what a parameter expects for value-optional and
+    /// `any` parameters, boxing, unboxing or widening as needed.
+    ///
+    /// For an `any` parameter, a non-`any` argument is coerced to a box. For a
+    /// value-optional parameter: if the argument already yields a box that is more
+    /// deeply nested than the parameter wants, it is unboxed the difference in depth;
+    /// if the argument is a bare (non-box, non-`undefined`) value, it is boxed once.
+    /// Otherwise the value passes through unchanged.
     pub fn coerceValoptArg(self: *LlvmCompiler, val: types.LLVMValueRef, arg: *const ast.Expression, param_tr_opt: ?ast.TypeRef, param_str_opt: ?[]const u8) anyerror!types.LLVMValueRef {
-        // Widen an argument into an `any` parameter: box it into an owning carrier. The parameter type is
-        // taken from the callee's INSTANTIATION-substituted string (`getFunctionParamType`), not the raw AST
-        // ref -- so a generic `set(v: V)` on `Map<K, any>`, whose ref renders `V` but whose substituted type
-        // is `any`, boxes too. The container then only ever stores real heap boxes, so its element
-        // retain/release works unchanged.
         if (param_str_opt) |param_str| {
             if (std.mem.eql(u8, param_str, "any")) {
                 if (!self.isAnyExpr(arg)) return try self.coerceToAny(val, arg);
@@ -2015,15 +2351,6 @@ pub const LlvmCompiler = struct {
             }
         }
         const param_tr = param_tr_opt orelse return val;
-        // A NESTED value-optional argument (`(int | undefined) | undefined`, e.g. from
-        // `List<int | undefined>.get()`) passed to a flatter value-optional parameter: deliver a box at the
-        // PARAMETER's declared depth, not the argument's. The value-optional param ABI is uniformly boxed at
-        // the declared depth (the callee unboxes exactly that many levels on `??`/comparison -- see the C10
-        // param-TypeId change in declarations.zig), so peel the surplus levels here. suppress_valopt_unbox
-        // kept the full box through compileCallArgument (now uniform across ident/call after the save-restore
-        // above), so the surplus is exactly arg_depth - param_depth. Gated on the parameter being
-        // SYNTACTICALLY a value-optional, which excludes the generic-container element slot whose `T` param is
-        // collapsed by monomorphisation and must keep the full box.
         if (self.valoptTypeRefIsValue(param_tr) and self.exprYieldsValoptBox(arg)) {
             if (self.typeOfExprConcrete(arg)) |arg_tid| {
                 const arg_depth = self.valoptDepth(arg_tid);
@@ -2045,6 +2372,12 @@ pub const LlvmCompiler = struct {
         return val;
     }
 
+    /// Finds the emitted specialisation for a namespaced generic call
+    /// `obj.field<type_args...>`, matching by the mangled `obj_field__T1__T2` symbol.
+    ///
+    /// Tries the exact mangled name first, then falls back to any function whose
+    /// name ends with `_<mangled>` (to catch a module-prefixed emission of the same
+    /// specialisation). Returns null when no matching function exists.
     pub fn findNamespacedSpec(self: *LlvmCompiler, obj: []const u8, field: []const u8, type_args: []const ast.TypeRef) anyerror!?types.LLVMValueRef {
         var nb = std.ArrayListUnmanaged(u8).empty;
         defer nb.deinit(self.allocator);
@@ -2070,11 +2403,11 @@ pub const LlvmCompiler = struct {
         return null;
     }
 
-    // True when EVERY method of `trait_name` has a concrete per-instantiation body emitted for `struct_name`
-    // (e.g. `Cell_i32_render` for `Cell<i32>`). Used to decide whether constructTraitObject can build a
-    // per-instantiation vtable (correct for a T-typed method) or must fall back to the erased shared vtable.
-    // For a base/erased name the concrete name equals the erased name, so this returns true iff the shared
-    // body exists -- i.e. the base path is unchanged.
+    /// Whether every method the trait declares has been emitted concretely for
+    /// `struct_name` (all its mangled symbols exist in `func_map`).
+    ///
+    /// Used by [`LlvmCompiler.constructTraitObject`] to decide whether to build the
+    /// vtable against the fully-scoped struct name or fall back to the base name.
     pub fn hasConcreteTraitMethods(self: *LlvmCompiler, struct_name: []const u8, trait_name: []const u8) !bool {
         const trait_decl = self.traits.get(getStructBaseName(trait_name)) orelse return false;
         for (trait_decl.methods) |tm| {
@@ -2085,21 +2418,19 @@ pub const LlvmCompiler = struct {
         return true;
     }
 
+    /// Returns (creating on first use) the constant global vtable for a
+    /// `struct implements trait` pair.
+    ///
+    /// The layout is `[N+1 x ptr]`: slot 0 is the struct's destructor and slots
+    /// 1..N are the trait methods in declaration order, resolved by mangled name
+    /// (with a lowercased-struct fallback), leaving a null slot where a method is
+    /// missing. The symbol name encodes the mangled struct, the trait and, for a
+    /// generic trait impl, the mangled trait type arguments, so distinct impls get
+    /// distinct vtables. Errors with `TraitNotFound` if the trait is unknown.
     pub fn getGlobalVTable(self: *LlvmCompiler, struct_name: []const u8, trait_name: []const u8) !types.LLVMValueRef {
-        // Mangle the (possibly instantiated) struct name so the vtable global has a valid symbol name and is
-        // PER-INSTANTIATION: `Cell<i32>` -> `_vtable_Cell_i32_Render`, whose slots point at the concrete
-        // `Cell_i32_render`. For a plain base name mangling is the identity, so base-name callers are
-        // unchanged. This is what lets a generic struct with a T-typed method dispatch correctly through a
-        // trait object (the erased shared body mishandled the concrete field, SEGV -- case 299).
         const mangled = try types_mod.mangleTypeName(self.allocator, struct_name);
         defer self.allocator.free(mangled);
 
-        // MONOMORPHIC generic-trait dispatch: append the concrete trait type-args of THIS struct's own impl,
-        // so `IntMaker impl Producer<int>` names its vtable `_vtable_IntMaker_Producer_int` instead of the
-        // M-erased `_vtable_IntMaker_Producer`. The args come from the struct's impl declaration (the single
-        // source of truth), so every caller -- trait-object construction AND the downcast check -- derives the
-        // SAME name from the same `(struct, trait)` pair, and the two never diverge. A plain (non-generic)
-        // trait has no type_args, so the suffix is empty and its vtable name is byte-identical to before.
         const trait_base = getStructBaseName(trait_name);
         var mono_suffix = std.ArrayList(u8).empty;
         defer mono_suffix.deinit(self.allocator);
@@ -2107,8 +2438,6 @@ pub const LlvmCompiler = struct {
             for (sdecl.impls) |impl| {
                 if (std.mem.eql(u8, getStructBaseName(impl.name), trait_base) and impl.type_args.len > 0) {
                     for (impl.type_args) |ta| {
-                        // Use the arg's bare name (BORROWED -- do not free); mangleTypeName returns a fresh
-                        // owned string (int -> i32, keeping the name linker-safe and stable).
                         const ta_str: []const u8 = switch (ta) {
                             .ident => |n| n,
                             .generic => |g| g.name,
@@ -2151,9 +2480,6 @@ pub const LlvmCompiler = struct {
         for (trait_decl.methods, 0..) |tm, idx0| {
             const idx = idx0 + 1;
             var found_method: ?types.LLVMValueRef = null;
-            // methodSymbol mangles the (possibly instantiated) owner: `Cell<i32>` + `render` ->
-            // `Cell_i32_render` (the per-instantiation body), and for a base name it equals the raw
-            // `{owner}_{method}`, so base-name callers see no change.
             const method_name = try self.methodSymbol(struct_name, tm.name);
             defer self.allocator.free(method_name);
 
@@ -2183,6 +2509,14 @@ pub const LlvmCompiler = struct {
         return global;
     }
 
+    /// Builds a trait object (fat pointer) wrapping a concrete struct value.
+    ///
+    /// Allocates a two-word heap block, stores the retained struct pointer in word
+    /// 0 and the address of the appropriate global vtable in word 1, then registers
+    /// the block as a temporary for release at statement end. The struct pointer is
+    /// retained because the trait object now holds a reference to it. The vtable is
+    /// chosen from the fully-scoped struct name when all its trait methods are
+    /// concrete, else from the base name (see [`LlvmCompiler.hasConcreteTraitMethods`]).
     pub fn constructTraitObject(self: *LlvmCompiler, struct_ptr: types.LLVMValueRef, struct_name: []const u8, trait_name_raw: []const u8) !types.LLVMValueRef {
 
         const trait_name = getStructBaseName(trait_name_raw);
@@ -2199,10 +2533,6 @@ pub const LlvmCompiler = struct {
         const addr1 = core.LLVMBuildAdd(self.builder, trait_obj, core.LLVMConstInt(self.val_type, ptr_size, 0), "vtable_addr");
         const ptr1 = core.LLVMBuildIntToPtr(self.builder, addr1, core.LLVMPointerType(self.val_type, 0), "trait_vtable_ptr");
 
-        // Prefer a PER-INSTANTIATION vtable when the concrete methods are emitted: `Cell<i32>` ->
-        // `_vtable_Cell_i32_Render` whose slots are the concrete `Cell_i32_render`, so a T-typed method
-        // dispatches correctly (case 299). Fall back to the base-erased vtable (`_vtable_Cell_Render` ->
-        // `Cell_render`) only for a genuinely erased generic context where no concrete body exists.
         const vtable_global = if (try self.hasConcreteTraitMethods(struct_name, trait_name))
             try self.getGlobalVTable(struct_name, trait_name)
         else
@@ -2215,6 +2545,14 @@ pub const LlvmCompiler = struct {
         return trait_obj;
     }
 
+    /// Declares (and caches) the runtime extern for an atomic operation with the
+    /// correct signature for the atomic's element type and the specific method.
+    ///
+    /// Return type and parameter list depend on the method: `compareAndSwap`
+    /// returns an `i32` success flag and takes expected+desired, `store` returns
+    /// void and takes one value, `add`/`sub` return and take the element type, and
+    /// `load` returns the element type. The element type maps 64-bit ints/doubles
+    /// to `i64`, bool to `i1`, everything else to `i32`. The `func_map` key is owned.
     fn getOrCreateAtomicExternFn(self: *LlvmCompiler, fn_name: []const u8, t_name: []const u8, method_name: []const u8) !types.LLVMValueRef {
         if (self.func_map.get(fn_name)) |val| {
             return val;
@@ -2250,6 +2588,14 @@ pub const LlvmCompiler = struct {
         return f;
     }
 
+    /// Lowers a method call on an `Atomic<T>` to the matching `nova_atomic_*`
+    /// runtime call.
+    ///
+    /// Parses the element type `T` out of the `Atomic<T>` name, loads the atomic
+    /// cell's inner pointer, selects the `nova_atomic_{add,sub,load,store,cas}_{i32,
+    /// i64,bool}` function by method and width, and coerces each argument to the
+    /// element's LLVM type. `store` produces no value; `compareAndSwap`'s `i32`
+    /// result is truncated to `i1` (a Nova bool). Errors on an unknown method.
     pub fn compileAtomicCall(self: *LlvmCompiler, obj_type: []const u8, method_name: []const u8, obj_expr: ast.Expression, args_exprs: []const ast.Expression) !types.LLVMValueRef {
         var t_name: []const u8 = "i32";
         if (std.mem.indexOfScalar(u8, obj_type, '<')) |start_idx| {
@@ -2329,6 +2675,15 @@ pub const LlvmCompiler = struct {
         return ret_val;
     }
 
+    /// Lowers a method call with explicit type arguments (`obj.method<T>(...)`) by
+    /// resolving to the emitted specialisation for those arguments.
+    ///
+    /// Finds the generic method on the receiver's struct, builds the mangled
+    /// specialisation name (`Owner_method__T1__T2`), and looks it up in `func_map`.
+    /// Arguments are lowered with ARC-correct handling and, where a parameter type
+    /// is a trait, widened into a trait object. Returns null (a signal to fall back
+    /// to another lowering path) when the method is not generic or the
+    /// specialisation was not emitted.
     pub fn compileExplicitGenericMethodCall(
         self: *LlvmCompiler,
         fa: ast.FieldAccess,
@@ -2386,12 +2741,23 @@ pub const LlvmCompiler = struct {
         return try self.buildCallWithCasts(fn_val, args);
     }
 
+    /// Resolves a parameter's declared type against the receiver's concrete generic
+    /// arguments, so a type-parameter parameter (`T`) becomes the concrete type
+    /// before the caller decides whether to widen the argument into a trait object.
+    /// Returns `expected_type` unchanged when the receiver is not generic.
     fn resolveParamTypeForWiden(self: *LlvmCompiler, obj_type_opt: ?[]const u8, expected_type: []const u8) []const u8 {
         const ot = obj_type_opt orelse return expected_type;
         if (std.mem.indexOfScalar(u8, ot, '<') == null) return expected_type;
         return self.substituteFieldType(ot, expected_type) catch expected_type;
     }
 
+    /// Emits an indirect (dynamic-dispatch) call through a trait object's vtable.
+    ///
+    /// Loads the fat pointer's two words (struct pointer at offset 0, vtable pointer
+    /// at offset 8), loads the function pointer from vtable slot `m_idx + 1` (slot 0
+    /// being the destructor), and calls it with the struct pointer as the implicit
+    /// receiver followed by the lowered arguments. All parameters and the result are
+    /// modelled as the `i64` value word.
     pub fn buildTraitVtableCall(self: *LlvmCompiler, fa: ast.FieldAccess, m_idx: usize, args_exprs: []const ast.Expression) anyerror!types.LLVMValueRef {
         const trait_obj_ptr = try self.compileExpression(fa.object.*);
         const ptr_size = @as(u32, 8);
@@ -2426,6 +2792,21 @@ pub const LlvmCompiler = struct {
         return core.LLVMBuildCall2(self.builder, fn_t, fn_ptr, args.ptr, @intCast(total_args), "trait_call");
     }
 
+    /// The central dispatcher for any `object.field(args)` call: figures out what
+    /// the callee actually is and lowers it accordingly.
+    ///
+    /// It resolves, in order: atomics (`Atomic<T>` methods), enum-variant
+    /// construction (`Color.Red(...)` builds a tagged union), trait method calls
+    /// (dynamic dispatch), concrete struct/enum methods and static functions
+    /// (trying mono, erased, and lowercased name forms, and preferring the single
+    /// unambiguous monomorphized specialisation when one exists), free functions
+    /// reached through a module/namespace receiver (with capitalised and
+    /// suffix-match fallbacks), constructor calls (`Struct(...)` allocates then runs
+    /// `init`/`new`), and finally a struct field holding a closure. Arguments get
+    /// ARC-correct handling, trait/`any` widening, valopt boxing, and payload
+    /// retain/consume as appropriate; async callees are driven as coroutines. Emits
+    /// a source-located "no method or function" error and returns
+    /// `MethodOrFunctionNotFound` if nothing resolves.
     pub fn compileMethodOrNamespacedCall(self: *LlvmCompiler, callee_fa: ast.FieldAccess, args_exprs: []const ast.Expression) anyerror!types.LLVMValueRef {
         const fa = callee_fa;
         var obj_type = try self.resolveExpressionTypeName(fa.object);
@@ -2456,9 +2837,6 @@ pub const LlvmCompiler = struct {
         }
 
         if (fa.object.kind == .ident) {
-            // Resolve a colliding enum (`Shape.Circle(x)` tagged construction) to the module-scoped enum
-            // this reference's file declares, so the right variant set/tags/layout are used (S3). Used for
-            // both the enum lookup and getEnumTagAndSize below.
             const obj_name = self.scopedTypeName(fa.object.kind.ident, fa.span.file);
             if (self.enums.get(obj_name)) |enum_decl| {
                 var is_variant = false;
@@ -2640,13 +3018,6 @@ pub const LlvmCompiler = struct {
 
             var resolved_name: ?[]const u8 = null;
 
-            // Importer-relative resolution FIRST: a qualified call `mod.fn()` must bind to the
-            // `mod` that THIS file imported, not to any same-named module elsewhere. The suffix
-            // scan below is module-blind and picks the shortest matching key, so two packages
-            // that both export e.g. `codec.buildSSLRequest` would collide (the shorter package
-            // path wins, silently calling the wrong one with mismatched arity). Ask the symbol
-            // table which module `mod` resolves to for the importing file, then take that
-            // function's exact mangled name.
             if (sema_shadow.live_sema) |sm| {
                 if (sm.tab.findModuleByImportNameForImporter(fa.object.kind.ident, fa.span.file)) |mid| {
                     if (sm.tab.findFunctionIn(mid, fa.field)) |sid| {
@@ -2657,19 +3028,11 @@ pub const LlvmCompiler = struct {
             }
 
             if (resolved_name != null) {
-                // already bound importer-relative
             } else if (self.func_map.get(full_name)) |_| {
                 resolved_name = full_name;
             } else if (self.func_map.get(cap_full_name)) |_| {
                 resolved_name = cap_full_name;
             } else {
-                // `full_name` is the partly-qualified "<alias>_<field>" (e.g. "url_parse"); its fully
-                // mangled key is "net_url_parse". Several functions can share that trailing segment --
-                // "net_url_parse" and "net_url_test_url_parse" both end in "_url_parse" -- so taking the
-                // FIRST hashmap key that ends in it is ambiguous AND order-dependent: adding modules
-                // reorders the map and silently rebinds `url.parse` to `url.test_url_parse`. Pick the
-                // SHORTEST matching key deterministically (the most-direct match, fewest extra prefix
-                // segments). Try full_name first, then the capitalized variant.
                 var best_len: usize = std.math.maxInt(usize);
                 var iter = self.func_map.iterator();
                 while (iter.next()) |entry| {
@@ -2801,9 +3164,6 @@ pub const LlvmCompiler = struct {
 
                 try self.guardOptionalDeref(fa.object, args[0], fa.span);
                 for (args_exprs, 0..) |*arg, idx| {
-                    // A value-optional element parameter must receive the BOX, not a raw value. Suppress the
-                    // speculative ident-unbox (which fires when the checker recorded a bare use-type for a
-                    // value-optional local) so a `List<T|undefined>.push(value)` forwards the box intact.
                     const arg_param_valopt = self.methodParamIsValueOptional(fa.object, fa.field, idx) or self.argIsValoptLocal(arg);
                     self.suppress_valopt_unbox = arg_param_valopt;
                     var val = try self.compileCallArgument(arg.*);
@@ -2820,25 +3180,12 @@ pub const LlvmCompiler = struct {
                                 }
                             }
                         } else if (std.mem.eql(u8, widen_to, "any")) {
-                            // Widen a value inserted into an owning `any` element slot (`Map<K, any>.set(k, v)`):
-                            // box it into a `{payload, dtor}` carrier so the container stores a real heap box
-                            // and its element retain/release stays uniform. The callee param resolves to `any`
-                            // via the instantiation even though the generic ref is a bare type-param.
                             if (!self.isAnyExpr(arg)) {
                                 val = try self.coerceToAny(val, arg);
                                 widened_any = true;
                             }
                         }
                     }
-                    // Box a plain value being inserted into a value-optional element slot (`List<int |
-                    // undefined>.push(7)`), so the slot holds a box a later read can unbox rather than a
-                    // raw value it would dereference as a pointer. `undefined` stays 0 (a box holding 0
-                    // would read back as a present 0); an already-boxed value-optional is left as-is.
-                    // The box is a fresh OWNED temporary: register it so its caller-side reference is
-                    // released at statement end. `Storage.set` takes its OWN reference (retain-on-store) and
-                    // the container frees it on drop (buildStorageDestructor), so create(+1) / set-retain(+1)
-                    // balance drain(-1) / container-release(-1) -- else a `List<int|undefined>` leaks its
-                    // present-value boxes.
                     if (!widened_any and !LlvmCompiler.isUndefinedLiteralExpr(arg) and !self.exprYieldsValoptBox(arg) and
                         self.methodParamIsValueOptional(fa.object, fa.field, idx))
                     {
@@ -2905,6 +3252,13 @@ pub const LlvmCompiler = struct {
         return error.MethodOrFunctionNotFound;
     }
 
+    /// Heuristically decides whether a call expression returns void, so the caller
+    /// knows a void-lambda body needs no return value.
+    ///
+    /// Recognises known void-returning builtins by receiver/name (`console.log`,
+    /// `router.register`, `bytes.write*`, container mutators like `push`/`set`/
+    /// `add`/`insert`/`forEach`), then falls back to looking the resolved function
+    /// name up in the `functions` worklist and checking its `return_type`.
     fn isVoidExpression(self: *LlvmCompiler, expr: ast.Expression) bool {
         var callee_expr: *ast.Expression = undefined;
         switch (expr.kind) {
@@ -2967,12 +3321,17 @@ pub const LlvmCompiler = struct {
         return false;
     }
 
+    /// Entry point of the closure-collection pre-pass over a block: walks each
+    /// statement to find and register every closure literal before emission begins.
+    /// See [`LlvmCompiler.collectClosuresFromExpr`] for what registration does.
     pub fn collectClosuresFromBlock(self: *LlvmCompiler, block: ast.Block) anyerror!void {
         for (block.statements) |stmt| {
             try self.collectClosuresFromStatement(stmt);
         }
     }
 
+    /// Recurses through a statement's sub-expressions and nested blocks looking for
+    /// closures, as part of the closure-collection pre-pass.
     fn collectClosuresFromStatement(self: *LlvmCompiler, stmt: ast.Statement) anyerror!void {
         switch (stmt) {
             .block => |b| try self.collectClosuresFromBlock(b),
@@ -3011,6 +3370,9 @@ pub const LlvmCompiler = struct {
         }
     }
 
+    /// Whether a statement subtree contains any `return`, used to tell a
+    /// value-returning closure body from a void one. Recurses through blocks and
+    /// control-flow arms but not into nested function/closure bodies.
         fn hasReturnStatement(stmt: ast.Statement) bool {
         switch (stmt) {
             .block => |b| {
@@ -3042,6 +3404,17 @@ pub const LlvmCompiler = struct {
         }
     }
 
+    /// The heart of the closure-collection pre-pass: when it finds a closure
+    /// literal it synthesises and registers a top-level `__lambda_N` function for it.
+    ///
+    /// It normalises the body into a block (wrapping an expression body in either a
+    /// `return` or an expression statement depending on whether the lambda is void),
+    /// infers the return type (defaulting to `i32`, upgrading to a trait return type
+    /// from the typed IR), prepends the implicit `__env` parameter, records declared
+    /// param types, appends a [`FunctionInfo`], maps the closure key to the lambda
+    /// name, and runs capture analysis ([`LlvmCompiler.scanStatementCaptures`] /
+    /// [`LlvmCompiler.scanExprCaptures`]) to compute its captured-variable list. It
+    /// also recurses into all other expression shapes so nested closures are found.
     fn collectClosuresFromExpr(self: *LlvmCompiler, expr: ast.Expression) anyerror!void {
         switch (expr.kind) {
             .closure => |cl| {
@@ -3220,6 +3593,10 @@ pub const LlvmCompiler = struct {
         }
     }
 
+    /// Walks a lambda body statement to discover which enclosing-scope variables it
+    /// captures, threading the set of lambda-local names (params + `let`s) so those
+    /// are excluded. `let` bindings add to `lambda_locals`; every sub-expression is
+    /// handed to [`LlvmCompiler.scanExprCaptures`].
     fn scanStatementCaptures(self: *LlvmCompiler, stmt: ast.Statement, parent_name: []const u8, lambda_params: std.StringHashMap(void), lambda_locals: *std.StringHashMap(void)) anyerror!void {
         switch (stmt) {
             .block => |b| {
@@ -3281,6 +3658,11 @@ pub const LlvmCompiler = struct {
         }
     }
 
+    /// Whether `obj_name` in `obj_name.member` denotes a namespace/type receiver
+    /// (a struct, enum, a known builtin like `console`/`bytes`/`serde`, or a name
+    /// that forms a known flat/suffixed function symbol) rather than a captured
+    /// variable. Lets capture analysis skip these so a module name is not mistaken
+    /// for a captured local.
     fn isNamespaceReceiver(self: *LlvmCompiler, obj_name: []const u8, member: []const u8) bool {
 
         if (self.structs.contains(member)) return true;
@@ -3304,6 +3686,14 @@ pub const LlvmCompiler = struct {
         return false;
     }
 
+    /// Walks a lambda body expression and records any free identifier as a capture
+    /// of the current lambda.
+    ///
+    /// An identifier is a capture unless it is `self`, a builtin, a lambda param or
+    /// local, a constant, a parent-function parameter (those are reached directly),
+    /// a global function (by exact or suffix-matched name), or a type name. New
+    /// captures are appended once to the current lambda's list in `lambda_captures`.
+    /// Namespace-receiver field accesses are not descended into.
     fn scanExprCaptures(self: *LlvmCompiler, expr: ast.Expression, parent_name: []const u8, lambda_params: std.StringHashMap(void), lambda_locals: *std.StringHashMap(void)) anyerror!void {
         switch (expr.kind) {
             .ident => |name| {
@@ -3314,11 +3704,6 @@ pub const LlvmCompiler = struct {
                 if (lambda_locals.contains(name)) return;
                 if (self.constants.contains(name)) return;
 
-                // A name that is a PARAMETER of the enclosing function is always a captured free variable,
-                // never a global function reference. Detect it before the loose `_name` function-suffix
-                // heuristic below, which otherwise matches an unrelated struct method (e.g. `RawBuffer_base`
-                // for a local `base`) and wrongly drops the capture -- silently corrupting any closure over
-                // a variable whose name collides with some method's suffix.
                 var is_parent_param = false;
                 for (self.functions.items) |pf| {
                     if (std.mem.eql(u8, pf.name, parent_name)) {
@@ -3412,6 +3797,14 @@ pub const LlvmCompiler = struct {
         }
     }
 
+    /// Derives a symbol namespace prefix from a declaration's source file, so
+    /// same-named functions in different modules get distinct mangled names.
+    ///
+    /// Returns null for the main program file and a few well-known synthetic files
+    /// (so their symbols stay unprefixed). Otherwise it strips a leading
+    /// `src/std/`, `src/lib/`, `.nova/std/` or `.nova/lib/` root and the file
+    /// extension, then replaces path separators and dots with `_`. Caller owns the
+    /// returned slice.
     pub fn getModulePrefix(self: *LlvmCompiler, span: ast.Span) ?[]const u8 {
 
         if (span.file.len == 0 or std.mem.eql(u8, span.file, self.program.span.file) or std.mem.eql(u8, span.file, "helpers.nova") or std.mem.eql(u8, span.file, "test_harness.nova") or std.mem.eql(u8, span.file, "<serde-generated>")) {
@@ -3431,11 +3824,6 @@ pub const LlvmCompiler = struct {
         var prefix = self.allocator.alloc(u8, base_path.len) catch return null;
         @memcpy(prefix, base_path);
         for (prefix, 0..) |char, idx| {
-            // Convert '.' as well as path separators so a package/relative path prefix
-            // (e.g. "../packages/nova-mysql/src/codec") becomes a dot-free identifier. A
-            // leftover '.' would (a) desync this emit name from the symbol table's
-            // legacy_mangled (which converts dots), breaking importer-relative qualified
-            // call resolution, and (b) make getStructBaseName truncate the name at that dot.
             if (char == '/' or char == '\\' or char == '.') {
                 prefix[idx] = '_';
             }
@@ -3443,6 +3831,8 @@ pub const LlvmCompiler = struct {
         return prefix;
     }
 
+    /// Whether a function named `name` exists, checking both the emitted-value map
+    /// (`func_map`) and the pending emission worklist (`functions`).
     pub fn hasFunction(self: *LlvmCompiler, name: []const u8) bool {
         if (self.func_map.contains(name)) return true;
         for (self.functions.items) |f| {
@@ -3451,10 +3841,26 @@ pub const LlvmCompiler = struct {
         return false;
     }
 
+    /// Grafted from `types.zig`: resolves a bare callee identifier to its mangled
+    /// function name.
     pub const resolveCalleeName = types_mod.resolveCalleeName;
 
+    /// Grafted from `types.zig`: renders an AST `TypeRef` to its canonical type-name
+    /// string.
     pub const typeRefToString = types_mod.typeRefToString;
 
+    /// Builds the `functions` emission worklist by walking every program
+    /// declaration and flattening generics into concrete instantiations.
+    ///
+    /// For each struct it registers the type, then for each method emits one
+    /// `FunctionInfo` per recorded method instantiation (skipping unreachable
+    /// generic methods, and suppressing the erased base when `sema_mono.baseIsNeeded`
+    /// says it is not required). Enums and unions are registered similarly. After a
+    /// transitive expansion pass ([`LlvmCompiler.expandFreeFnInstsTransitively`]) it
+    /// walks free functions, applying struct/module name mangling and emitting a
+    /// specialisation per recorded free-function instantiation. Constructors get a
+    /// synthesised leading `self` parameter. The `current_instantiation*` cursors
+    /// are set around each so return types render concretely.
     pub fn collectFunctions(self: *LlvmCompiler, program: ast.Program) !void {
 
         for (program.declarations) |decl| {
@@ -3464,8 +3870,6 @@ pub const LlvmCompiler = struct {
                 try self.structs.put(self.scopedStructName(s.name, s.span.file), s);
                 for (s.methods) |method| {
                     const fn_decl = method.decl;
-                    // Gap 8 demand-mono gate: drop an uncalled non-constructor method of a GENERIC struct
-                    // for all its instantiations (context-insensitive). No-op unless NOVA_REACH_ON.
                     if (s.type_params.len > 0 and !sema_reach.methodIsReachable(s.name, fn_decl.name)) continue;
                     const is_constructor = std.mem.eql(u8, fn_decl.name, "new") or std.mem.eql(u8, fn_decl.name, "init");
                     const param_names = try self.allocator.alloc([]const u8, if (is_constructor) fn_decl.params.len + 1 else fn_decl.params.len);
@@ -3518,11 +3922,6 @@ pub const LlvmCompiler = struct {
 
                                     .ret_type_ref = fn_decl.ret_type,
                                     .body = fn_decl.body,
-                                    // A non-constructor method declares `self` explicitly as params[0], so the
-                                    // AST params line up 1:1 with the LLVM arguments (self at index 0) and the
-                                    // optimiser emit path can model them. A constructor's `self` is synthetic
-                                    // (prepended above, not in fn_decl.params), so leave params empty -> the emit
-                                    // path sees the count mismatch and falls back.
                                     .params = if (is_constructor) &.{} else fn_decl.params,
                                     .is_async = fn_decl.is_async,
                                     .instantiation = inst_opt,
@@ -3541,9 +3940,6 @@ pub const LlvmCompiler = struct {
                                 .return_type = if (fn_decl.ret_type) |ret| try self.typeRefToString(ret) else "void",
                                 .ret_type_ref = fn_decl.ret_type,
                                 .body = fn_decl.body,
-                                // Non-constructor method: `self` is an explicit params[0], so params line up 1:1
-                                // with the LLVM arguments and the emit path can model them. Constructor `self` is
-                                // synthetic -> leave empty so the emit path falls back.
                                 .params = if (is_constructor) &.{} else fn_decl.params,
                                 .is_async = fn_decl.is_async,
                                 .instantiation = inst_opt,
@@ -3582,8 +3978,6 @@ pub const LlvmCompiler = struct {
                         .return_type = if (fn_decl.ret_type) |ret| try self.typeRefToString(ret) else "void",
                         .ret_type_ref = fn_decl.ret_type,
                         .body = fn_decl.body,
-                        // Non-constructor method: explicit `self` params[0] lines up with the LLVM args (emit
-                        // path can model it); constructor `self` is synthetic -> empty -> emit path falls back.
                         .params = if (is_constructor) &.{} else fn_decl.params,
                         .is_async = fn_decl.is_async,
                         .source_file = fn_decl.span.file,
@@ -3596,11 +3990,6 @@ pub const LlvmCompiler = struct {
             }
         }
 
-        // B2: transitively discover free-generic instances reached only through another generic. If
-        // `outer<int>` is instantiated and its body calls `inner<T>(x)`, `inner<int>` must be emitted
-        // too. sema registers the direct calls; this closes over the type-parameter-forwarding chain.
-        // Purely additive (worst case: an instance is missed and the same loud compile error as before
-        // results), so it cannot introduce a miscompile.
         try self.expandFreeFnInstsTransitively(program);
 
         for (program.declarations) |decl| {
@@ -3631,7 +4020,7 @@ pub const LlvmCompiler = struct {
                     .return_type = if (fn_decl.ret_type) |ret| try self.typeRefToString(ret) else "void",
                     .ret_type_ref = fn_decl.ret_type,
                     .body = fn_decl.body,
-                    .params = fn_decl.params, // free function: argument index i == declared param i (no self)
+                    .params = fn_decl.params,
                     .is_async = fn_decl.is_async,
                     .source_file = fn_decl.span.file,
                 };
@@ -3661,10 +4050,6 @@ pub const LlvmCompiler = struct {
                         const spec_ret = if (fn_decl.ret_type) |ret| try self.typeRefToString(ret) else "void";
                         self.current_instantiation_id = prev_iid2;
 
-                        // String-engine-removal: bind this free-fn spec to its TypeId instantiation key so
-                        // current_instantiation_id resolves inside its body. The sema free-fn overlay
-                        // (inst_disp.runFreeFns/recordFreeFnInst) recorded tp_resolve/expr_types_inst under the
-                        // SAME inst_key = .struct_{owner, args_tids}.
                         try self.functions.append(self.allocator, .{
                             .name = spec_name,
                             .param_count = fn_decl.params.len,
@@ -3672,7 +4057,6 @@ pub const LlvmCompiler = struct {
                             .return_type = spec_ret,
                             .ret_type_ref = fn_decl.ret_type,
                             .body = fn_decl.body,
-                            // Generic free-function spec: argument index i == declared param i (no self).
                             .params = fn_decl.params,
                             .is_async = fn_decl.is_async,
                             .instantiation_id = fi.inst_key,
@@ -3684,10 +4068,16 @@ pub const LlvmCompiler = struct {
         }
     }
 
-    // Fixpoint over sema_mono.free_fn_insts: for each generic free-fn instance, walk its body under
-    // that instance's type-parameter binding and register any generic free-fn it calls with concrete
-    // (substituted) type arguments. Handles explicit `inner<T>(x)` where T is forwarded from the
-    // enclosing generic. Additive only.
+    /// Closes the set of generic free-function instantiations under "one
+    /// instantiation calls another".
+    ///
+    /// A concrete call `f<int>` may, inside `f`'s body, call `g<int>`, which sema's
+    /// initial pass did not see because it never walked `f` under that
+    /// instantiation. This runs a fixed-point loop: for each currently-recorded
+    /// free-fn instantiation it re-walks the callee body under that instantiation
+    /// id, registering any newly-discovered generic call, until a pass adds nothing
+    /// (bounded by a large guard to prevent runaway). Without this, transitively
+    /// reached specialisations would be missing at link time.
     pub fn expandFreeFnInstsTransitively(self: *LlvmCompiler, program: ast.Program) !void {
         var gmap = std.StringHashMap(ast.FunctionDecl).init(self.allocator);
         defer gmap.deinit();
@@ -3709,9 +4099,6 @@ pub const LlvmCompiler = struct {
                 const fd = gmap.get(fi.fn_name) orelse continue;
                 if (fi.params.len != fd.type_params.len) continue;
 
-                // B1: expose the TypeId instantiation of THIS instance so registerGenericFnInst can
-                // resolve inner type-args to concrete TypeIds (not just strings) and make the transitive
-                // callee TypeId-native too.
                 const prev_iid = self.current_instantiation_id;
                 self.current_instantiation_id = fi.inst_key;
                 defer self.current_instantiation_id = prev_iid;
@@ -3721,6 +4108,10 @@ pub const LlvmCompiler = struct {
         }
     }
 
+    /// Walks a block for generic-function call sites during transitive
+    /// instantiation discovery, returning true if any new instantiation was
+    /// registered. `gmap` is the name -> declaration map of the program's generic
+    /// free functions.
     fn discoverGenericCallsInBlock(self: *LlvmCompiler, block: ast.Block, gmap: *const std.StringHashMap(ast.FunctionDecl)) anyerror!bool {
         var any = false;
         for (block.statements) |stmt| {
@@ -3729,6 +4120,9 @@ pub const LlvmCompiler = struct {
         return any;
     }
 
+    /// Recurses a statement's sub-expressions and nested blocks for generic call
+    /// sites during transitive instantiation discovery; returns true if any new
+    /// instantiation was registered.
     fn discoverGenericCallsInStmt(self: *LlvmCompiler, stmt: ast.Statement, gmap: *const std.StringHashMap(ast.FunctionDecl)) anyerror!bool {
         var any = false;
         switch (stmt) {
@@ -3778,6 +4172,11 @@ pub const LlvmCompiler = struct {
         return any;
     }
 
+    /// Recurses an expression for generic call sites; when it finds a
+    /// `callee<type_args>` whose callee is one of the program's generic free
+    /// functions and whose type arguments match arity, it registers that
+    /// instantiation (see [`LlvmCompiler.registerGenericFnInst`]) and reports whether
+    /// anything new was added.
     fn discoverGenericCallsInExpr(self: *LlvmCompiler, expr: ast.Expression, gmap: *const std.StringHashMap(ast.FunctionDecl)) anyerror!bool {
         var any = false;
         switch (expr.kind) {
@@ -3833,8 +4232,15 @@ pub const LlvmCompiler = struct {
         return any;
     }
 
-    // Render gc's type args under the current instance's subst; if all concrete, register the callee
-    // instance. Returns true if a NEW instance was added.
+    /// Records a concrete instantiation of a generic free function, returning true
+    /// if it was newly added.
+    ///
+    /// Only fully-concrete type arguments are recorded (an argument that is still
+    /// one of the callee's own type parameters is rejected). When the live sema
+    /// tables are available it records the instantiation by `TypeId` and drives the
+    /// typed-IR instantiation dispatcher so the specialisation's body is realised;
+    /// otherwise it falls back to a string-based record. This is the registration
+    /// step invoked from [`LlvmCompiler.discoverGenericCallsInExpr`].
     fn registerGenericFnInst(self: *LlvmCompiler, callee_fd: ast.FunctionDecl, type_args: []const ast.TypeRef) anyerror!bool {
         const rendered = try self.allocator.alloc([]const u8, type_args.len);
         defer {
@@ -3844,18 +4250,12 @@ pub const LlvmCompiler = struct {
         var all_concrete = true;
         for (type_args, 0..) |ta, idx| {
             rendered[idx] = try self.typeRefToString(ta);
-            // Still-abstract if the rendered arg is one of the callee's own type parameters (subst
-            // failed to resolve it), i.e. it names an unbound type variable rather than a real type.
             for (callee_fd.type_params) |tp| {
                 if (std.mem.eql(u8, rendered[idx], tp)) all_concrete = false;
             }
         }
         if (!all_concrete) return false;
 
-        // B1 TypeId-native path: resolve the type-args to CONCRETE TypeIds under the current instance and
-        // register the callee as a TypeId-native instance (noteFreeFnInst), then record its overlay so the
-        // fixpoint can resolve ITS type-params next round. Falls back to the string-only path when a TypeId
-        // is not recoverable (e.g. the current instance itself has no inst_key yet).
         if (sema_shadow.live_sema) |sm| {
             if (sm.tab.findFunction(callee_fd.name)) |callee_fid| {
                 var tids = try self.allocator.alloc(sema_types.TypeId, type_args.len);
@@ -3870,8 +4270,6 @@ pub const LlvmCompiler = struct {
                 if (all_tid) {
                     const added = sema_mono.noteFreeFnInst(self.allocator, &sm.store, callee_fd.name, callee_fid, callee_fd.type_params, tids);
                     if (added) {
-                        // The inst_key is a deterministic intern of .struct_{callee_fid, tids}, so it equals
-                        // whatever noteFreeFnInst stored; record the overlay directly from what we computed.
                         const key = sm.store.intern(.{ .struct_ = .{ .decl = callee_fid, .args = tids } }) catch null;
                         @import("../../frontend/sema/inst_disp.zig").recordFreeFnInst(self.allocator, &sm.store, &sm.ir, self.program, callee_fd.name, callee_fid, tids, key);
                         return true;
@@ -3884,6 +4282,9 @@ pub const LlvmCompiler = struct {
         return sema_mono.noteFreeFnInstStr(self.allocator, callee_fd.name, callee_fd.type_params, rendered);
     }
 
+    /// Pre-pass that gathers every distinct string literal in the program (function,
+    /// method and enum-method bodies) into `strings`, so each can be interned once
+    /// as a global before emission.
     pub fn collectStringLiterals(self: *LlvmCompiler, program: ast.Program) anyerror!void {
         for (program.declarations) |decl| {
             if (decl == .fn_decl) {
@@ -3900,12 +4301,16 @@ pub const LlvmCompiler = struct {
         }
     }
 
+    /// Walks a block collecting its string literals into `strings`, part of the
+    /// [`LlvmCompiler.collectStringLiterals`] pre-pass.
     pub fn collectStringsFromBlock(self: *LlvmCompiler, block: ast.Block) anyerror!void {
         for (block.statements) |stmt| {
             try self.collectStringsFromStatement(stmt);
         }
     }
 
+    /// Recurses a statement's sub-expressions and nested blocks collecting string
+    /// literals.
     fn collectStringsFromStatement(self: *LlvmCompiler, stmt: ast.Statement) anyerror!void {
         switch (stmt) {
             .expr_stmt => |es| try self.collectStringsFromExpr(es.expr),
@@ -3940,6 +4345,9 @@ pub const LlvmCompiler = struct {
         }
     }
 
+    /// Recurses an expression collecting string literals, de-duplicating against
+    /// `strings` (a literal already present is not added twice). Descends into array
+    /// and object literal elements, call arguments, closures, templates and so on.
     fn collectStringsFromExpr(self: *LlvmCompiler, expr: ast.Expression) anyerror!void {
         switch (expr.kind) {
             .literal => |lit| {
@@ -4009,12 +4417,19 @@ pub const LlvmCompiler = struct {
         }
     }
 
+    /// Collects the names of all locals declared in a block (including
+    /// switch-pattern-bound payload names and JSX-embedded statements), so the
+    /// function prologue can pre-allocate a stack slot for each. See
+    /// [`LlvmCompiler.collectLocalVarNamesFromStatement`].
     pub fn collectLocalVarNames(self: *LlvmCompiler, list: *std.ArrayList([]const u8), block: ast.Block) anyerror!void {
         for (block.statements) |stmt| {
             try self.collectLocalVarNamesFromStatement(list, stmt);
         }
     }
 
+    /// Returns the name of the enum that declares a given variant, or null if no
+    /// enum has such a variant. Used to resolve an unqualified variant reference to
+    /// its enum type.
     pub fn findEnumByVariant(self: *LlvmCompiler, variant_name: []const u8) ?[]const u8 {
         var iter = self.enums.iterator();
         while (iter.next()) |entry| {
@@ -4027,10 +4442,12 @@ pub const LlvmCompiler = struct {
         return null;
     }
 
-    // If `lt` and `rt` name the SAME payload-carrying enum, return the number of 8-byte words in its box
-    // (tag + max payload words) so a fixed-width structural `==` compare can be emitted; else null. Every
-    // variant box for the enum is allocated at this same size and zero-padded (see getEnumTagAndSize),
-    // which is what makes the fixed-width compare correct.
+    /// If both operands are the same payload-carrying enum, returns the enum's
+    /// boxed size in 8-byte words (tag word plus the largest variant payload);
+    /// otherwise null.
+    ///
+    /// Used where a binary operation on two enum values needs to know the boxed
+    /// footprint (e.g. to copy a tagged union). Enums with no payload return null.
     pub fn payloadEnumBoxWords(self: *LlvmCompiler, lt: ?[]const u8, rt: ?[]const u8) ?u32 {
         const l = lt orelse return null;
         const r = rt orelse return null;
@@ -4050,6 +4467,13 @@ pub const LlvmCompiler = struct {
         return size / 8;
     }
 
+    /// Computes a variant's numeric tag and the enum's total boxed byte size, and
+    /// writes them through the out-parameters.
+    ///
+    /// The tag is the variant's declaration index. The size is one pointer word for
+    /// the tag plus the largest variant payload across the whole enum (each field is
+    /// counted as one pointer word), so every variant fits the same allocation.
+    /// Errors with `EnumNotFound`/`VariantNotFound` if the names are unknown.
     pub fn getEnumTagAndSize(self: *LlvmCompiler, enum_name: []const u8, variant_name: []const u8, tag_out: *u32, max_size_out: *u32) !void {
         const enum_decl = self.enums.get(enum_name) orelse return error.EnumNotFound;
         const ptr_size = @as(u32, 8);
@@ -4080,6 +4504,9 @@ pub const LlvmCompiler = struct {
         }
     }
 
+    /// Returns the enum type name of a `switch` discriminant expression if it is an
+    /// enum, else null. Lets the local-collection passes bind payload names from
+    /// enum-pattern cases.
     fn resolveDiscriminantEnumName(self: *LlvmCompiler, discr: *const ast.Expression) ?[]const u8 {
         const t = self.resolveExpressionTypeName(discr) catch return null;
         if (t) |name| {
@@ -4088,6 +4515,13 @@ pub const LlvmCompiler = struct {
         return null;
     }
 
+    /// Recurses a statement collecting local variable names into `list`.
+    ///
+    /// Handles `let` (single and destructuring), nested control flow, and the
+    /// tricky case of `switch` over an enum: for each enum-pattern case it binds the
+    /// payload argument names (from either a call-style or struct-init-style
+    /// pattern) so the extracted payloads get their own slots. JSX-embedded
+    /// statements are descended into as well.
     fn collectLocalVarNamesFromStatement(self: *LlvmCompiler, list: *std.ArrayList([]const u8), stmt: ast.Statement) anyerror!void {
         switch (stmt) {
             .let_stmt => |ls| {
@@ -4126,8 +4560,6 @@ pub const LlvmCompiler = struct {
                                                         try list.append(self.allocator, call.args[0].kind.ident);
                                                     }
                                                 } else if (v.fields) |payload_fields| {
-                                                    // Tuple-form multi-payload pattern `Rect(w, h)`: bind each
-                                                    // positional arg to the matching payload field.
                                                     for (call.args, 0..) |arg, i| {
                                                         if (i < payload_fields.len and arg.kind == .ident) {
                                                             try list.append(self.allocator, arg.kind.ident);
@@ -4165,15 +4597,14 @@ pub const LlvmCompiler = struct {
                 for (ss.cases) |c| try self.collectLocalVarNamesFromStatement(list, c.body.*);
                 if (ss.default_case) |dc| try self.collectLocalVarNamesFromStatement(list, dc.*);
             },
-            // A `let` can live inside an NSX element's `{for}`/`{if}` block (e.g. a returned view). Descend
-            // into the JSX so its locals get allocas -- without this, `{for x { let p = ..; <card/> }}`
-            // fails with "variable not found" because the pre-pass never saw the `let`.
             .expr_stmt => |es| if (es.expr.kind == .jsx_element) try self.collectLocalVarNamesFromJsx(list, es.expr.kind.jsx_element),
             .return_stmt => |rs| if (rs.value) |v| if (v.kind == .jsx_element) try self.collectLocalVarNamesFromJsx(list, v.kind.jsx_element),
             else => {},
         }
     }
 
+    /// Descends a JSX element tree collecting local variable names from any embedded
+    /// statements and nested elements.
     fn collectLocalVarNamesFromJsx(self: *LlvmCompiler, list: *std.ArrayList([]const u8), jsx: ast.JsxElement) anyerror!void {
         for (jsx.children) |child| {
             switch (child) {
@@ -4184,12 +4615,24 @@ pub const LlvmCompiler = struct {
         }
     }
 
+    /// Builds the current function's local name -> rendered type map (and, when
+    /// `current_local_type_ids` is set, the parallel name -> `TypeId` map) by
+    /// walking a block. See [`LlvmCompiler.collectLocalVarTypesFromStatement`].
     pub fn collectLocalVarTypes(self: *LlvmCompiler, map: *std.StringHashMap([]const u8), block: ast.Block) anyerror!void {
         for (block.statements) |*stmt| {
             try self.collectLocalVarTypesFromStatement(map, stmt);
         }
     }
 
+    /// Recurses a statement inferring each local's type and recording it in `map`.
+    ///
+    /// For a `let` it uses the declared type if present, else the resolved
+    /// initialiser type (substituting type parameters), and for a destructuring
+    /// `let` it splits a tuple type per element. Where the typed IR is available it
+    /// stores a precise `TypeId` (preferring the per-instantiation type), skipping
+    /// unresolved/type-parameter types. Enum-`switch` cases bind their payload
+    /// argument types the same way [`LlvmCompiler.collectLocalVarNamesFromStatement`]
+    /// binds names.
     fn collectLocalVarTypesFromStatement(self: *LlvmCompiler, map: *std.StringHashMap([]const u8), stmt_ptr: *const ast.Statement) anyerror!void {
         const stmt = stmt_ptr.*;
         switch (stmt) {
@@ -4241,9 +4684,6 @@ pub const LlvmCompiler = struct {
                                             (ir.typeOfInst(init.id, inst) orelse tid)
                                         else
                                             tid;
-                                        // Only accept a CONCRETE id. `let s = xs.get(i)` from a desugared
-                                        // `for (s in xs)` types its init as the container's type-param (`T`)
-                                        // or unresolved, which is NOT a usable decision id.
                                         if (self.type_store) |st| {
                                             const k = st.get(store_tid);
                                             if (k != .unresolved and k != .type_param) {
@@ -4256,11 +4696,6 @@ pub const LlvmCompiler = struct {
                                         }
                                     }
                                 }
-                                // Phase 1 bridge (string->TypeId cutover): when the typed IR has no CONCRETE id
-                                // for the initialiser (the generic-container element case above), round-trip
-                                // the resolved NAME back to a TypeId via tidForName. This gives loop/element
-                                // bindings a real TypeId so isStringExpr/isOwnedTypeId etc. work on them,
-                                // instead of only the string engine being able to resolve them.
                                 if (!stored) {
                                     if (self.tidForName(name)) |tid| try ids.put(ls.name, tid);
                                 }
@@ -4297,8 +4732,6 @@ pub const LlvmCompiler = struct {
                                                         try map.put(call.args[0].kind.ident, p_type_str);
                                                     }
                                                 } else if (v.fields) |payload_fields| {
-                                                    // Tuple-form multi-payload pattern `Rect(w, h)`: type each
-                                                    // positional binding from the matching payload field.
                                                     for (call.args, 0..) |arg, i| {
                                                         if (i < payload_fields.len and arg.kind == .ident) {
                                                             const p_type_str = try self.typeRefToString(payload_fields[i].type_name);
@@ -4338,13 +4771,14 @@ pub const LlvmCompiler = struct {
                 for (ss.cases) |c| try self.collectLocalVarTypesFromStatement(map, c.body);
                 if (ss.default_case) |dc| try self.collectLocalVarTypesFromStatement(map, dc);
             },
-            // Same as the name pass: pick up the TYPES of `let`s nested inside an NSX element's blocks.
             .expr_stmt => |es| if (es.expr.kind == .jsx_element) try self.collectLocalVarTypesFromJsx(map, es.expr.kind.jsx_element),
             .return_stmt => |rs| if (rs.value) |v| if (v.kind == .jsx_element) try self.collectLocalVarTypesFromJsx(map, v.kind.jsx_element),
             else => {},
         }
     }
 
+    /// Descends a JSX element tree inferring local variable types from embedded
+    /// statements and nested elements.
     fn collectLocalVarTypesFromJsx(self: *LlvmCompiler, map: *std.StringHashMap([]const u8), jsx: ast.JsxElement) anyerror!void {
         for (jsx.children) |child| {
             switch (child) {
@@ -4355,6 +4789,10 @@ pub const LlvmCompiler = struct {
         }
     }
 
+    /// Emits the instrumentation that bumps the coverage counter for one basic
+    /// block: loads the external `__nova_cov_counters` array pointer (declaring the
+    /// global on first use), indexes it by `block_id`, and stores `counter + 1`.
+    /// Only called when `coverage_enabled`.
     pub fn compileCoverageIncrement(self: *LlvmCompiler, block_id: usize) anyerror!void {
         const counters_glob = core.LLVMGetNamedGlobal(self.module, "__nova_cov_counters") orelse blk: {
             const ptr_to_ptr = core.LLVMPointerType(self.i64_type, 0);
@@ -4373,114 +4811,250 @@ pub const LlvmCompiler = struct {
         _ = core.LLVMBuildStore(self.builder, inc, elem_ptr);
     }
 
+    // The following `pub const` lines graft type-analysis helpers from `types.zig`
+    // onto [`LlvmCompiler`]. They are the codegen-side ownership/typing oracle:
+    // most take an expression, name, or `TypeId` and answer a classification
+    // question (is it owned? a value struct? a string? which `TypeId`?).
+
+    /// Grafted from `types.zig`: resolves an expression to its rendered type name.
     pub const resolveExpressionTypeName = types_mod.resolveExpressionTypeName;
+    /// Grafted from `types.zig`: the cached rendered name for a `TypeId`.
     pub const cachedTypeName = types_mod.cachedTypeName;
+    /// Grafted from `types.zig`: the module-scoped unique name for a struct.
     pub const scopedStructName = types_mod.scopedStructName;
+    /// Grafted from `types.zig`: the module-scoped unique name for any type.
     pub const scopedTypeName = types_mod.scopedTypeName;
+    /// Grafted from `types.zig`: whether a struct name collides across modules and
+    /// needs scoping.
     pub const isCollidingStruct = types_mod.isCollidingStruct;
+    /// Grafted from `types.zig`: whether an expression has optional type.
     pub const isOptionalExpr = types_mod.isOptionalExpr;
+    /// Grafted from `types.zig`: the concrete `TypeId` of an expression, if known.
     pub const typeOfExprConcrete = types_mod.typeOfExprConcrete;
+    /// Grafted from `types.zig`: whether an expression yields a heap-owned value.
     pub const isOwnedExpr = types_mod.isOwnedExpr;
+    /// Grafted from `types.zig`: whether a `TypeId` denotes an owned type.
     pub const isOwnedTypeId = types_mod.isOwnedTypeId;
+    /// Grafted from `types.zig`: whether a named local is heap-owned.
     pub const isOwnedLocal = types_mod.isOwnedLocal;
+    /// Grafted from `types.zig`: whether a type name denotes a value struct.
     pub const isValueStructName = types_mod.isValueStructName;
+    /// Grafted from `types.zig`: whether a `TypeId` denotes a value struct.
     pub const isValueStructTid = types_mod.isValueStructTid;
+    /// Grafted from `types.zig`: whether a value struct has any heap-owning fields
+    /// (so copies must deep-retain).
     pub const valueStructHasOwnedFields = types_mod.valueStructHasOwnedFields;
+    /// Grafted from `types.zig`: whether a function's return is a borrow (not an
+    /// owning transfer).
     pub const returnIsBorrow = types_mod.returnIsBorrow;
+    /// Grafted from `types.zig`: whether an error-union's ok payload is owned.
     pub const isOwnedErrUnionOk = types_mod.isOwnedErrUnionOk;
+    /// Grafted from `types.zig`: whether an expression has string type.
     pub const isStringExpr = types_mod.isStringExpr;
+    /// Grafted from `types.zig`: whether an expression has floating-point type.
     pub const isFloatExpr = types_mod.isFloatExpr;
+    /// Grafted from `types.zig`: whether an expression has bool type.
     pub const isBoolExpr = types_mod.isBoolExpr;
+    /// Grafted from `types.zig`: whether an expression has void type.
     pub const isVoidExpr = types_mod.isVoidExpr;
+    /// Grafted from `types.zig`: whether an expression has `any` type.
     pub const isAnyExpr = types_mod.isAnyExpr;
+    /// Grafted from `types.zig`: whether an expression has decimal type.
     pub const isDecimalExpr = types_mod.isDecimalExpr;
+    /// Grafted from `types.zig`: the mangled symbol name for a `TypeId`.
     pub const symbolName = types_mod.symbolName;
+    /// Grafted from `types.zig`: the trait name of a tuple element, if it is one.
     pub const tupleElemTraitName = types_mod.tupleElemTraitName;
+    /// Grafted from `types.zig`: whether an error-union's error payload is owned.
     pub const isOwnedErrUnionErr = types_mod.isOwnedErrUnionErr;
+    /// Grafted from `types.zig`: whether a storage element (container slot) is owned.
     pub const isOwnedStorageElem = types_mod.isOwnedStorageElem;
+    /// Grafted from `types.zig`: whether a storage element is owned, by type name.
     pub const isOwnedStorageElemByName = types_mod.isOwnedStorageElemByName;
+    /// Grafted from `types.zig`: the `TypeId` for a rendered type name.
     pub const typeIdForRenderedName = types_mod.typeIdForRenderedName;
+    /// Grafted from `types.zig`: whether an error-union payload is owned, by name.
     pub const isOwnedErrUnionPayloadByName = types_mod.isOwnedErrUnionPayloadByName;
+    /// Grafted from `types.zig`: whether a tuple element is owned, by name.
     pub const isOwnedTupleElemByName = types_mod.isOwnedTupleElemByName;
+    /// Grafted from `types.zig`: whether a declared type is owned (given the
+    /// `TypeRef` and its rendered name).
     pub const isOwnedDeclaredType = types_mod.isOwnedDeclaredType;
+    /// Grafted from `types.zig`: the `TypeId` for an AST `TypeRef` (may be generic).
     pub const tidForTypeRef = types_mod.tidForTypeRef;
+    /// Grafted from `types.zig`: the concrete `TypeId` for a `TypeRef` under the
+    /// current instantiation.
     pub const concreteTidForTypeRef = types_mod.concreteTidForTypeRef;
+    /// Grafted from `types.zig`: the `TypeId` for a rendered type name.
     pub const tidForName = types_mod.tidForName;
+    /// Grafted from `types.zig`: whether a type name is owned.
     pub const ownedByName = types_mod.ownedByName;
 
+    /// Grafted from `statements.zig`: lowers one statement to IR.
     pub const compileStatement = statements_mod.compileStatement;
+    /// Grafted from `statements.zig`: runs the scope's errdefer statements on the
+    /// error path.
     pub const runErrdefers = statements_mod.runErrdefers;
 
+    // The remaining `pub const` lines graft the expression-lowering surface from
+    // `expressions.zig`: the bulk of codegen (arithmetic, calls, containers,
+    // async/await, SIMD, JSX, ORM/query lowering) lives there and is exposed here
+    // as methods on [`LlvmCompiler`].
+
+    /// Grafted from `expressions.zig`: lowers one expression to an `i64` value word.
     pub const compileExpression = expressions_mod.compileExpression;
+    /// Grafted from `expressions.zig`: lowers a reference to a compile-time constant.
     pub const compileConstRef = expressions_mod.compileConstRef;
+    /// Grafted from `expressions.zig`: default-initialises a struct's container fields.
     pub const initDefaultContainerFields = expressions_mod.initDefaultContainerFields;
+    /// Grafted from `expressions.zig`: removes a pending temporary whose ownership
+    /// was handed off (so it is not double-released).
     pub const consumeTemporary = expressions_mod.consumeTemporary;
+    /// Grafted from `expressions.zig`: builds an `Atomic<T>` cell value.
     pub const atomicCell = expressions_mod.atomicCell;
+    /// Grafted from `expressions.zig`: emits a null-guard before dereferencing an
+    /// optional.
     pub const guardOptionalDeref = expressions_mod.guardOptionalDeref;
+    /// Grafted from `expressions.zig`: registers a value as a [`PendingTemp`] for
+    /// end-of-statement release.
     pub const registerTemporary = expressions_mod.registerTemporary;
+    /// Grafted from `expressions.zig`: releases all pending temporaries at statement end.
     pub const drainTemporaries = expressions_mod.drainTemporaries;
+    /// Grafted from `expressions.zig`: emits an indirect call through a closure value.
     pub const buildClosureCall = expressions_mod.buildClosureCall;
+    /// Grafted from `expressions.zig`: lowers a floating-point SIMD intrinsic call.
     pub const compileSimdCall = expressions_mod.compileSimdCall;
+    /// Grafted from `expressions.zig`: lowers an integer SIMD intrinsic call.
     pub const compileIntSimd = expressions_mod.compileIntSimd;
+    /// Grafted from `expressions.zig`: emits a 64-bit carry-less multiply (for CRC/GCM).
     pub const compileClmul64 = expressions_mod.compileClmul64;
+    /// Grafted from `expressions.zig`: emits a hardware AES round intrinsic.
     pub const compileAesRound = expressions_mod.compileAesRound;
+    /// Grafted from `expressions.zig`: lowers a `mem`/allocator method call.
     pub const compileMemCall = expressions_mod.compileMemCall;
+    /// Grafted from `expressions.zig`: loads an array element as a float value.
     pub const arrayElemFloatLLVM = expressions_mod.arrayElemFloatLLVM;
+    /// Grafted from `expressions.zig`: computes the base pointer of an array's storage.
     pub const arrayBasePtr = expressions_mod.arrayBasePtr;
+    /// Grafted from `expressions.zig`: boxes a bare function pointer into a closure value.
     pub const buildBareFnBox = expressions_mod.buildBareFnBox;
+    /// Grafted from `expressions.zig`: returns the boxed-function global for a name.
     pub const fnBoxReturn = expressions_mod.fnBoxReturn;
+    /// Grafted from `expressions.zig`: the integer function-reference value for a name.
     pub const fnRefInt = expressions_mod.fnRefInt;
+    /// Grafted from `expressions.zig`: whether an identifier names a variable (vs. a
+    /// type/function/namespace).
     pub const identNamesVariable = expressions_mod.identNamesVariable;
+    /// Grafted from `expressions.zig`: widens a branch's value into a trait object to
+    /// unify the branches of an `if`/`switch` expression.
     pub const widenBranchToTrait = expressions_mod.widenBranchToTrait;
+    /// Grafted from `expressions.zig`: allocates inline storage for a value struct.
     pub const buildValueStructStorage = expressions_mod.buildValueStructStorage;
+    /// Grafted from `expressions.zig`: copies a value struct, returning the copy.
     pub const buildValueStructCopy = expressions_mod.buildValueStructCopy;
+    /// Grafted from `expressions.zig`: copies a value struct into a given destination.
     pub const buildValueStructCopyInto = expressions_mod.buildValueStructCopyInto;
+    /// Grafted from `expressions.zig`: emits the element type-witness for a container.
     pub const compileElemWitness = expressions_mod.compileElemWitness;
+    /// Grafted from `expressions.zig`: deep-retains a value struct's owned fields
+    /// after an inline copy.
     pub const retainValueStructOwnedFields = expressions_mod.retainValueStructOwnedFields;
+    /// Grafted from `expressions.zig`: the value-struct name inside an optional, if any.
     pub const optionalInnerValueStructName = expressions_mod.optionalInnerValueStructName;
+    /// Grafted from `expressions.zig`: deep-copies an optional wrapping a value struct.
     pub const buildOptionalStructDeepCopy = expressions_mod.buildOptionalStructDeepCopy;
+    /// Grafted from `expressions.zig`: deep-copies a heap struct value.
     pub const buildHeapStructDeepCopy = expressions_mod.buildHeapStructDeepCopy;
+    /// Grafted from `types.zig`: whether a type name is a pure value struct (no
+    /// owned fields).
     pub const isPureValueStructName = types_mod.isPureValueStructName;
+    /// Grafted from `expressions.zig`: drives an async function call as a coroutine
+    /// to its first suspend.
     pub const buildDriveAsyncCall = expressions_mod.buildDriveAsyncCall;
+    /// Grafted from `expressions.zig`: drives an async coroutine handle.
     pub const buildDriveAsyncHandle = expressions_mod.buildDriveAsyncHandle;
+    /// Grafted from `expressions.zig`: the LLVM type of a coroutine promise.
     pub const coroPromiseType = expressions_mod.coroPromiseType;
+    /// Grafted from `expressions.zig`: the promise slot within a coroutine frame.
     pub const coroPromiseSlot = expressions_mod.coroPromiseSlot;
+    /// Grafted from `expressions.zig`: the result slot within a coroutine promise.
     pub const coroPromiseResultSlot = expressions_mod.coroPromiseResultSlot;
+    /// Grafted from `expressions.zig`: the waiter slot within a coroutine promise
+    /// (the coroutine to resume on completion).
     pub const coroPromiseWaiterSlot = expressions_mod.coroPromiseWaiterSlot;
+    /// Grafted from `expressions.zig`: computes the pointer to a coroutine's promise.
     pub const buildCoroPromisePtr = expressions_mod.buildCoroPromisePtr;
+    /// Grafted from `expressions.zig`: the coroutine handle produced by an awaited call.
     pub const awaitedCallHandle = expressions_mod.awaitedCallHandle;
+    /// Grafted from `expressions.zig`: lowers an `await` expression.
     pub const buildAwait = expressions_mod.buildAwait;
+    /// Grafted from `expressions.zig`: emits the suspend point of an `await`.
     pub const buildAwaitSuspend = expressions_mod.buildAwaitSuspend;
+    /// Grafted from `expressions.zig`: lowers an `await sleep(ms)`.
     pub const awaitSleepMillis = expressions_mod.awaitSleepMillis;
+    /// Grafted from `expressions.zig`: lowers a `spawn`/`go` expression (forks a future).
     pub const buildGo = expressions_mod.buildGo;
+    /// Grafted from `expressions.zig`: awaits (joins) a future value.
     pub const buildAwaitFuture = expressions_mod.buildAwaitFuture;
+    /// Grafted from `expressions.zig`: extracts the channel argument of an awaited recv.
     pub const awaitChanRecvArg = expressions_mod.awaitChanRecvArg;
+    /// Grafted from `expressions.zig`: lowers a channel receive.
     pub const buildChanRecv = expressions_mod.buildChanRecv;
+    /// Grafted from `expressions.zig`: lowers a `whenAny`/`selectAny` combinator.
     pub const buildWhenAny = expressions_mod.buildWhenAny;
+    /// Grafted from `expressions.zig`: detects an awaited async-I/O call.
     pub const awaitAsyncIoCall = expressions_mod.awaitAsyncIoCall;
+    /// Grafted from `expressions.zig`: lowers an async-I/O operation.
     pub const buildAsyncIo = expressions_mod.buildAsyncIo;
+    /// Grafted from `expressions.zig`: appends a value to the active string builder.
     pub const compileAppendToStringBuilder = expressions_mod.compileAppendToStringBuilder;
+    /// Grafted from `expressions.zig`: lowers a method call on an optional receiver.
     pub const compileOptionalMethodCall = expressions_mod.compileOptionalMethodCall;
+    /// Grafted from `expressions.zig`: canonicalises an integer value to its declared width.
     pub const canonicalizeInt = expressions_mod.canonicalizeInt;
+    /// Grafted from `expressions.zig`: emits a divide-by-zero guard before integer division.
     pub const emitIntDivGuard = expressions_mod.emitIntDivGuard;
+    /// Grafted from `expressions.zig`: emits a conditional trap.
     pub const emitTrapIf = expressions_mod.emitTrapIf;
+    /// Grafted from `expressions.zig`: converts a number to its string representation.
     pub const numToString = expressions_mod.numToString;
+    /// Grafted from `expressions.zig`: the implementation body of number-to-string.
     pub const numToStringImpl = expressions_mod.numToStringImpl;
+    /// Grafted from `expressions.zig`: number-to-string for a specific numeric type.
     pub const numToStringT = expressions_mod.numToStringT;
+    /// Grafted from `expressions.zig`: lowers a JSX element to HTML-building IR.
     pub const compileJsxElement = expressions_mod.compileJsxElement;
+    /// Grafted from `expressions.zig`: emits a JSX subtree into a string builder.
     pub const emitJsxInto = expressions_mod.emitJsxInto;
+    /// Grafted from `expressions.zig`: appends a computed value to JSX output.
     pub const jsxAppendVal = expressions_mod.jsxAppendVal;
+    /// Grafted from `expressions.zig`: appends a literal chunk to JSX output.
     pub const jsxAppendLiteral = expressions_mod.jsxAppendLiteral;
+    /// Grafted from `expressions.zig`: flushes buffered JSX literal bytes.
     pub const jsxFlushLiteral = expressions_mod.jsxFlushLiteral;
+    /// Grafted from `expressions.zig`: appends an interpolated expression to JSX output.
     pub const jsxAppendExpr = expressions_mod.jsxAppendExpr;
+    /// Grafted from `expressions.zig`: sets the source location for JSX debug info.
     pub const jsxSetLoc = expressions_mod.jsxSetLoc;
+    /// Grafted from `expressions.zig`: lowers a generic `parse<T>` call.
     pub const compileGenericParse = expressions_mod.compileGenericParse;
+    /// Grafted from `expressions.zig`: lowers decoding of one binary result-set row
+    /// (the ORM fast path).
     pub const compileDecodeBinaryRow = expressions_mod.compileDecodeBinaryRow;
+    /// Grafted from `expressions.zig`: lowers a NovaDB query expression.
     pub const compileNovaQuery = expressions_mod.compileNovaQuery;
+    /// Grafted from `expressions.zig`: converts a value to a target type.
     pub const convertValueToType = expressions_mod.convertValueToType;
+    /// Grafted from `expressions.zig`: resolves the type name for a reification/`reify` site.
     pub const resolveReifyTypeName = expressions_mod.resolveReifyTypeName;
+    /// Grafted from `expressions.zig`: looks up (or lazily declares) a function by name.
     pub const getFunc = expressions_mod.getFunc;
 };
 
+/// The codegen entry point: compiles a whole type-checked program into an LLVM
+/// module and drives it through to a native object/binary. Implemented in
+/// `declarations.zig`; re-exported here as the file's public surface.
 pub const compile = declarations_mod.compile;
+/// The codegen flags/options struct that parameterises [`compile`] (target,
+/// release, WASM, coverage, and so on). Implemented in `declarations.zig`.
 pub const flags = declarations_mod.flags;

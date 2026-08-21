@@ -1,18 +1,15 @@
 import string;
 
-// Strings are UTF-8 byte buffers. Template literals are the canonical formatter.
 fn main(): void {
     let a = "Hello";
     let b = "Nova";
-    console.log(a + ", " + b + "!");        // concatenation
+    console.log(a + ", " + b + "!");
     console.log(`length of "${a}" = ${a.length}`);
 
-    // Template interpolation stringifies int/long/float/bool/decimal/string
     let n = 7;
     let ok = true;
     console.log(`n=${n} ok=${ok} half=${n / 2}`);
 
-    // string stdlib (ASCII/byte level)
     console.log(`upper: ${string.toUpperCase("nova")}`);
     console.log(`slice(0,3): ${string.slice("hypermedia", 0, 3)}`);
     console.log(`indexOf 'per': ${string.indexOf("hypermedia", "per")}`);

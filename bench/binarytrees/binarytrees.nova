@@ -1,5 +1,3 @@
-// binary-trees: allocate/reclaim many tree nodes. Nova nodes are ARC-managed heap structs; children are
-// optional (a leaf has none). maxDepth baked. Matches the reference golden output.
 struct Node { pub left: Node | undefined, pub right: Node | undefined }
 
 fn bottomUp(depth: int): Node {

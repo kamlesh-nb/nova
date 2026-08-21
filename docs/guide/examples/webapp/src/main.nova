@@ -1,8 +1,3 @@
-// main.nova, the app composition root (= Program.cs): register services and behaviours, map routes,
-// serve static files, run. Handlers are discovered by their `RequestHandler<TReq, TResp>` impls, so the
-// route is the only per-endpoint registration. On a request the framework binds it and `send`s it to the
-// mediator, which picks the handler by request type, opens a per-request DI scope, runs the behaviour
-// pipeline (log, validate, transaction), and returns the response.
 import web.app;
 import web.di;
 import web.request;
@@ -19,11 +14,6 @@ import Features.Products.CreateProduct.validator;
 import Features.Products.GetProductById.query;
 import Features.Products.GetProductById.handler;
 
-// Services: the database connection is a singleton (a shared store) registered under the "Connection"
-// key; the repository is resolved per request and injected with it. This build uses the in-memory
-// connection, so it runs with no server. To talk to a real NovaDB, see `main_novadb.nova`: it registers
-// the SAME "Connection" key with a live driver, and nothing in the repository, the handlers, or the
-// behaviours changes.
 fn configureServices(): ServiceCollection {
     let services = ServiceCollection();
     services.addSingleton("Connection", (sp) => { return InMemoryConnection(); });
@@ -35,14 +25,10 @@ fn buildApp(): App {
     let app = App();
     app.useServices(configureServices());
 
-    // The behaviour pipeline, outermost first: log the request, validate it (short-circuiting bad input
-    // with a 400 before any transaction), then wrap the handler in a database transaction.
     app.useBehavior(LoggingBehavior{});
     app.useBehavior(ValidationBehavior{});
     app.useBehavior(TransactionBehavior{});
 
-    // Products feature: one route per slice. Handlers are found by their impls; their dependencies are
-    // injected from the services above.
     app.post<CreateProduct>("/api/products");
     app.get<GetProductById>("/api/products/{id:int}");
 

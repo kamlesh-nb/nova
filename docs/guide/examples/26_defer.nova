@@ -1,16 +1,15 @@
-// examples/26_defer.nova
 import list;
 
 enum TxError { Conflict }
 
 fn transfer(fail: bool, log: List<string>): int | TxError {
     log.push("acquire lock");
-    defer log.push("release lock");        // ALWAYS runs, on both paths
-    errdefer log.push("rollback txn");     // only runs if we fail below
+    defer log.push("release lock");
+    errdefer log.push("rollback txn");
 
-    if (fail) { return TxError.Conflict; } // error path: errdefer then defer
+    if (fail) { return TxError.Conflict; }
     log.push("commit txn");
-    return 1;                              // success path: only the defer runs
+    return 1;
 }
 
 fn printLog(label: string, log: List<string>): void {

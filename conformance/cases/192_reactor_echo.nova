@@ -1,8 +1,3 @@
-// Phase 4 milestone 1: a request served entirely through the Nova-owned event loop, with no
-// Asio. A connected fd pair stands in for an accepted connection; the reactor registers
-// read-interest, blocks in kqueue, wakes on readiness, reads into a recycled slab block, and
-// echoes it back. This exercises the whole loop mechanism (kqueue readiness + slab read buffer
-// + socket read/write), deterministically and offline. macOS/BSD.
 import assert;
 import bytes;
 import os.sys;
@@ -18,15 +13,13 @@ fn test_reactor_echo_roundtrip(): void {
     assert.isTrue(r.ok());
     assert.equalInt(r.addRead(server, server as long), 0);
 
-    // Client sends "ping".
     let out = bytes.alloc(4);
-    bytes.write_byte(out, 0, 112); // p
-    bytes.write_byte(out, 1, 105); // i
-    bytes.write_byte(out, 2, 110); // n
-    bytes.write_byte(out, 3, 103); // g
+    bytes.write_byte(out, 0, 112);
+    bytes.write_byte(out, 1, 105);
+    bytes.write_byte(out, 2, 110);
+    bytes.write_byte(out, 3, 103);
     assert.isTrue(sys.write(client, out, 4) == 4);
 
-    // The loop: block, then handle the one ready fd.
     let n = r.poll(1000);
     assert.equalInt(n, 1);
     let fd = r.readyFd(0);
@@ -34,7 +27,6 @@ fn test_reactor_echo_roundtrip(): void {
     assert.equalInt(r.readyToken(0) as int, server);
     assert.isTrue(r.readyBytes(0) >= 4);
 
-    // Read into a pooled buffer and echo it straight back.
     let buf = r.getBuffer();
     assert.isTrue(buf != 0);
     let got = sys.read(fd, buf, 4096);
@@ -42,7 +34,6 @@ fn test_reactor_echo_roundtrip(): void {
     assert.isTrue(sys.write(fd, buf, got) == got);
     r.putBuffer(buf);
 
-    // The client gets its bytes back.
     let inb = bytes.alloc(16);
     assert.isTrue(sys.read(client, inb, 16) == 4);
     assert.equalInt(bytes.read_byte(inb, 0) as int, 112);

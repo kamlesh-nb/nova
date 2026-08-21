@@ -8,10 +8,6 @@ import map;
 
 pub trait ValueSource {
     fn getString(self: ValueSource, key: string): string;
-    // getStr returns a BORROWED view (P10 Str) of the value, valid for the SOURCE's lifetime. A DB
-    // RowSource borrows Row.raw (owned by the ResultSet); the JSON/YAML/param sources borrow bytes held
-    // by their node/map. Binding a Str-typed @serializable field routes here instead of getString,
-    // avoiding the per-field owned-string allocation. Caller carries Str's manual-lifetime contract.
     fn getStr(self: ValueSource, key: string): str.Str;
     fn getInt(self: ValueSource, key: string): long;
     fn getBool(self: ValueSource, key: string): bool;
@@ -43,7 +39,7 @@ pub struct JsonSource impl ValueSource {
         return json.asString(json.get(self.node, key)) ?? "";
     }
     pub fn getStr(self: JsonSource, key: string): str.Str {
-        return str.of(self.getString(key));   // borrows bytes held by self.node
+        return str.of(self.getString(key));
     }
     pub fn getInt(self: JsonSource, key: string): long {
         return json.asNumber(json.get(self.node, key)) ?? 0;
@@ -84,10 +80,6 @@ pub fn fromJson(body: string): JsonSource {
     return JsonSource(json.parse(body));
 }
 
-// A ValueSource over a parsed YAML document, so any @serializable struct binds from YAML the same way
-// it does from JSON: `let cfg = Cfg__bind(source.fromYaml(text))`. Numbers land as Number(long) for
-// integers and Decimal(decimal) for fractionals in the YAML value model, so the integer/float/decimal
-// accessors each fall back through both; a decimal renders to a parseable string via interpolation.
 pub struct YamlSource impl ValueSource {
     pub node: yaml.YamlValue,
 
@@ -97,7 +89,7 @@ pub struct YamlSource impl ValueSource {
         return yaml.asString(yaml.get(self.node, key)) ?? "";
     }
     pub fn getStr(self: YamlSource, key: string): str.Str {
-        return str.of(self.getString(key));   // borrows bytes held by self.node
+        return str.of(self.getString(key));
     }
     pub fn getInt(self: YamlSource, key: string): long {
         let v = yaml.get(self.node, key);
@@ -174,7 +166,7 @@ pub struct ParamSource impl ValueSource {
         return self.params.get(key) ?? "";
     }
     pub fn getStr(self: ParamSource, key: string): str.Str {
-        return str.of(self.getString(key));   // borrows the string held in self.params
+        return str.of(self.getString(key));
     }
     pub fn getInt(self: ParamSource, key: string): long {
         return string.parseI64(self.params.get(key) ?? "0");

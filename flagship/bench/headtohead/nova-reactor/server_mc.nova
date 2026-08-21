@@ -1,7 +1,3 @@
-// Share-nothing multi-core version of the coroutine reactor server. NOVA_REACTORS threads, each
-// with its own reactor, its own SO_REUSEPORT listener on the shared port (the kernel load-balances
-// connections), its own slab pool, and its own coroutines. No shared state across cores. This is
-// the Seastar/glommio thread-per-core model. See docs/design/self-hosted-runtime.md phase 4.
 import bytes;
 import os.sys;
 import net.poller;
@@ -40,8 +36,6 @@ async fn serveConn(r: poller.Reactor, fd: int, resp: long, respLen: int): void {
     }
 }
 
-// One reactor per core. Each builds its own listener with SO_REUSEPORT so the kernel spreads
-// connections across the threads, and runs its own independent event loop.
 fn reactorWorker(idx: int): void {
     let pe = env.get("PORT");
     let port = if (pe.length == 0) 8087 else string.parseI64(pe) as int;

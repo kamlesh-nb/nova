@@ -1,9 +1,3 @@
-// Flagship: @fromRoute path parameters. `app.get<GetUser>("/api/user/{id:int}")`
-// registers a PATTERN route; on dispatch the Router matches the request path,
-// extracts the params, and overlays them on the request body via a CompositeSource
-// (route params win — @fromRoute over @fromBody). The handler binds a normal
-// @serializable request; a field present in the route pattern is filled from the
-// path, everything else from the body.
 import assert;
 import web.routing;
 import serde.source;
@@ -14,7 +8,6 @@ struct GetUserHandler impl RequestHandler<GetUser, UserDto> {
     async fn handle(self, req: GetUser): UserDto { return UserDto{ id: req.id, name: "Ada" }; }
 }
 
-// `a` comes from the route, `b` from the body — proves the composite/override.
 @serializable struct AddReq { pub a: int, pub b: int }
 @serializable struct SumDto { pub sum: int }
 struct AddHandler impl RequestHandler<AddReq, SumDto> {
@@ -25,7 +18,6 @@ struct AddHandler impl RequestHandler<AddReq, SumDto> {
 fn test_path_param_binds_from_route(): void {
     let app = Router();
     app.get<GetUser>("/api/user/{id:int}");
-    // id=42 comes from the PATH, body is empty
     let body = app.dispatch("GET", "/api/user/42", source.fromJson("{}"));
     assert.equalStr(body, "{\"id\":42,\"name\":\"Ada\"}");
 }
@@ -34,7 +26,6 @@ fn test_path_param_binds_from_route(): void {
 fn test_route_param_overrides_body(): void {
     let app = Router();
     app.post<AddReq>("/api/add/{a:int}");
-    // a=40 from the ROUTE (overrides the body's a=100), b=5 from the body
     let body = app.dispatch("POST", "/api/add/40", source.fromJson("{\"a\":100,\"b\":5}"));
     assert.equalStr(body, "{\"sum\":45}");
 }
@@ -43,6 +34,5 @@ fn test_route_param_overrides_body(): void {
 fn test_no_match_is_404(): void {
     let app = Router();
     app.get<GetUser>("/api/user/{id:int}");
-    // wrong segment count -> no match
     assert.equalStr(app.dispatch("GET", "/api/user", source.fromJson("{}")), "404");
 }

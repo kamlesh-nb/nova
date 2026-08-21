@@ -1,18 +1,3 @@
-// io/slab: a pool of fixed-size, recyclable memory blocks for the self-hosted runtime
-// (docs/design/self-hosted-runtime.md, phase 3). This is the nginx-pool / Kestrel-MemoryPool
-// model: allocate one backing buffer once, hand out fixed-size blocks from a free list, and
-// recycle them rather than freeing per use. Each block carries a manual refcount so a block
-// can be shared zero-copy (in the manner of tokio Bytes and Seastar temporary_buffer) and is
-// returned to the pool automatically when the last reference is released.
-//
-// The blocks live OUTSIDE ARC: addresses are plain `long` values, never Nova heap objects, so
-// there is no retain/release traffic on the hot path. The pool struct itself is long-lived
-// (one per reactor), so its own ARC cost is amortised to nothing.
-//
-// Block layout: an 8-byte header (refcount as an i32 at offset 0, 4 bytes of padding) followed
-// by the payload. A free block reuses its header slot to hold the next-free address (intrusive
-// free list, so the list needs no separate allocation). acquire returns the payload address
-// (block + 8); the refcount and free-link live at payload - 8.
 
 import bytes;
 
@@ -32,7 +17,6 @@ pub class SlabPool {
         self.base = bytes.alloc(count * self.stride);
         self.freeCount = count;
 
-        // Chain every block onto the free list: block i points to block i+1, last to 0.
         let i = 0;
         while (i < count - 1) {
             let blk = self.base + (i * self.stride) as long;
@@ -43,8 +27,6 @@ pub class SlabPool {
         self.freeHead = self.base;
     }
 
-    // Take a block from the pool. Returns the payload address, or 0 if the pool is exhausted.
-    // The returned block starts with refcount 1.
     pub fn acquire(self: SlabPool): long {
         if (self.freeHead == 0) {
             return 0;
@@ -56,13 +38,11 @@ pub class SlabPool {
         return blk + 8;
     }
 
-    // Add a reference to a block (for zero-copy sharing of a slice into it).
     pub fn retain(self: SlabPool, payload: long): void {
         let blk = payload - 8;
         bytes.write_i32(blk, 0, (bytes.read_i32(blk, 0) as int + 1) as long);
     }
 
-    // Drop a reference. When the count reaches zero the block returns to the free list.
     pub fn release(self: SlabPool, payload: long): void {
         let blk = payload - 8;
         let rc = (bytes.read_i32(blk, 0) as int) - 1;

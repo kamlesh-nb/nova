@@ -1,10 +1,3 @@
-// Emit-subset growth (B1): non-constructor methods now emit from the optimiser IR. A method declares `self`
-// explicitly as params[0], so its AST params line up 1:1 with the LLVM arguments (self at index 0) and the
-// emit path can model them. Previously every method fell back (params list left empty -> count mismatch),
-// which was ~99 of ~146 rejects in a real build. Under NOVA_OPT_EMIT these methods compile from the optimised
-// IR; under the default build from the AST. Both must agree, across field reads/writes, a self.method() call,
-// control flow, and the mask idiom. Value-struct methods and constructors deliberately still fall back
-// (self is a value / synthetic), so they are exercised here only for AST==emit agreement, not coverage.
 import assert;
 
 class Counter {

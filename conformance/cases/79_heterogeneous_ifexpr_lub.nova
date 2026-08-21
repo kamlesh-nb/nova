@@ -5,7 +5,7 @@ struct Ada impl Greeter { fn greet(self: Ada): string { return "ada"; } }
 struct Cat impl Greeter { fn greet(self: Cat): string { return "cat"; } }
 
 fn pick(c: bool): Greeter {
-    let o = if (c) Ada{} else Cat{};   // unannotated, heterogeneous — LUB = Greeter
+    let o = if (c) Ada{} else Cat{};
     return o;
 }
 

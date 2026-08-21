@@ -1,6 +1,3 @@
-// L5 / K8: tuple positional dot-access `pair.0` / `pair.1`. Desugars to the index form `pair[N]` (which
-// already worked), so both forms are now valid. Field/method access `x.name` is unaffected (the desugar
-// only triggers when an integer follows the dot).
 import assert;
 
 struct Named { pub label: string }
@@ -18,5 +15,5 @@ fn tuple_dot_access(): void {
 @test
 fn field_access_still_works(): void {
     let n = Named{ label: "hi" };
-    assert.equalStr(n.label, "hi");   // `.name` still parses as field access
+    assert.equalStr(n.label, "hi");
 }

@@ -1,7 +1,3 @@
-// Channel 4 (container COW), slice 1: List.copy() is a deep copy -- a fresh List with its own RawBuffer
-// holding copies of every element. It is the primitive the compiler will use to give value semantics to a
-// value struct with a List field (a byte-copy of such a struct shares the buffer). Independent of the
-// original: pushing to / mutating the copy does not affect the source, and owned (string) elements survive.
 import assert;
 import collections.list;
 

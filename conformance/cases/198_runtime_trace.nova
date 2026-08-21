@@ -1,9 +1,3 @@
-// M0 of the C++ runtime retirement plan: the file-based runtime trace facility. When the NOVA_TRACE
-// environment variable is set, nova_trace_msg / nova_trace_kv write to that file with a per-line
-// flush, so runtime diagnostics surface reliably (the scheduler debug was blocked by stderr not
-// surfacing). When it is unset, the calls are a no-op and near-zero cost. This corpus case only
-// proves the calls compile, link, and run as a no-op; the actual file output is verified by running
-// with NOVA_TRACE set (see tools and the plan).
 import assert;
 
 @test
@@ -14,6 +8,5 @@ fn test_trace_is_a_noop_when_disabled(): void {
         nova_trace_kv("iteration", i as long);
         i = i + 1;
     }
-    // Disabled by default in the corpus, so enabled() is 0 here; the point is that it is callable.
     assert.isTrue(nova_trace_enabled() == 0 || nova_trace_enabled() == 1);
 }

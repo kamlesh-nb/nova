@@ -7,7 +7,6 @@ async fn run(): int {
     let b = asyncchan.AsyncChannel<int>(1);
     let chans = list.List<asyncchan.AsyncChannel<int>>();
     chans.push(a); chans.push(b);
-    // Deliver only on channel b; select must wake and pick index 1.
     let p = spawn delayedSend(b, 77);
     let idx = await asyncchan.selectRecv<int>(chans);
     let got = await chans.at(idx).recv();

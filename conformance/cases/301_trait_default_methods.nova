@@ -1,19 +1,9 @@
-// I (parser gaps): a trait method could only be a signature (`fn f(self): T;`). A DEFAULT body
-// (`fn greet(self: Self): string { ... }`) failed to parse. Default methods let a trait supply shared
-// behaviour that an impl'ing struct inherits unless it overrides it.
-//
-// Implementation: the parser now accepts an optional `{ body }` after a trait method signature and stores
-// it as `default_body`. A post-parse desugar (expandTraitDefaults) copies each default-bodied method onto
-// every struct that impls the trait and does not override it, retyping the leading `self` to the struct.
-// The synthesised methods then flow through the normal machinery -- checker, monomorphisation, codegen,
-// and the trait-object vtable -- so a default works on a concrete value AND through a trait object.
-// (Same-file only for now: the trait and the impl'ing struct must be declared in one module.)
 
 import assert;
 
 trait Greeter {
     fn name(self: Self): string;
-    fn greet(self: Self): string { return `hi, ${self.name()}`; }   // default calls another trait method
+    fn greet(self: Self): string { return `hi, ${self.name()}`; }
 }
 
 struct Dog impl Greeter {
@@ -22,7 +12,7 @@ struct Dog impl Greeter {
 
 struct Cat impl Greeter {
     fn name(self: Cat): string { return "cat"; }
-    fn greet(self: Cat): string { return "meow"; }                  // overrides the default
+    fn greet(self: Cat): string { return "meow"; }
 }
 
 @test
@@ -38,7 +28,7 @@ fn test_override_wins(): void {
 @test
 fn test_default_through_trait_object(): void {
     let g: Greeter = Dog{};
-    assert.equalStr(g.greet(), "hi, dog");   // the default is in the vtable
+    assert.equalStr(g.greet(), "hi, dog");
     assert.equalStr(g.name(), "dog");
 }
 

@@ -1,5 +1,3 @@
-// Named-timezone database (tz): resolve an IANA-style zone + a UTC instant to the local offset, DST-aware.
-// datetime no longer treats every wall-clock as UTC -- toLocal/formatInZone convert into the zone.
 import tz;
 import datetime;
 import assert;
@@ -8,24 +6,23 @@ import string;
 fn us_dst_transitions(): void {
     let jan = datetime.parse("2025-01-15T12:00:00") ?? 0;
     let jul = datetime.parse("2025-07-15T12:00:00") ?? 0;
-    assert.equalInt(tz.offsetAt("America/New_York", jan) ?? 999, -18000);   // EST -5h
-    assert.equalInt(tz.offsetAt("America/New_York", jul) ?? 999, -14400);   // EDT -4h (DST)
-    assert.equalInt(tz.offsetAt("America/Los_Angeles", jul) ?? 999, -25200);// PDT -7h
+    assert.equalInt(tz.offsetAt("America/New_York", jan) ?? 999, -18000);
+    assert.equalInt(tz.offsetAt("America/New_York", jul) ?? 999, -14400);
+    assert.equalInt(tz.offsetAt("America/Los_Angeles", jul) ?? 999, -25200);
 }
 @test
 fn eu_and_no_dst_zones(): void {
     let jan = datetime.parse("2025-01-15T12:00:00") ?? 0;
     let jul = datetime.parse("2025-07-15T12:00:00") ?? 0;
-    assert.equalInt(tz.offsetAt("Europe/Paris", jan) ?? 999, 3600);         // CET +1h
-    assert.equalInt(tz.offsetAt("Europe/Paris", jul) ?? 999, 7200);         // CEST +2h
-    assert.equalInt(tz.offsetAt("Asia/Kolkata", jan) ?? 999, 19800);        // +5:30 no DST
+    assert.equalInt(tz.offsetAt("Europe/Paris", jan) ?? 999, 3600);
+    assert.equalInt(tz.offsetAt("Europe/Paris", jul) ?? 999, 7200);
+    assert.equalInt(tz.offsetAt("Asia/Kolkata", jan) ?? 999, 19800);
     assert.equalInt(tz.offsetAt("Asia/Kolkata", jul) ?? 999, 19800);
     assert.equalInt(tz.offsetAt("UTC", jul) ?? 999, 0);
-    assert.isTrue(tz.offsetAt("Nowhere/Noplace", jul) == undefined);        // unknown zone
+    assert.isTrue(tz.offsetAt("Nowhere/Noplace", jul) == undefined);
 }
 @test
 fn to_local_wall_clock(): void {
-    // 2025-07-15 16:00 UTC in New York (EDT -4h) = 12:00 local.
     let utc = datetime.parse("2025-07-15T16:00:00") ?? 0;
     let iso = tz.formatInZone("America/New_York", utc, "YYYY-MM-DDThh:mm:ss") ?? "";
     assert.isTrue(string.eql(iso, "2025-07-15T12:00:00"));

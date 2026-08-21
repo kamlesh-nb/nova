@@ -1,4 +1,3 @@
-// T12: metrics registry (counters/gauges + Prometheus/JSON snapshot) + tracing span.
 import metrics;
 import log;
 import string;
@@ -11,7 +10,7 @@ fn test_counters_gauges(): void {
     reg.inc("db_queries_total");
     reg.add("db_queries_total", 3);
     reg.setGauge("pool_idle", 4);
-    reg.setGauge("pool_idle", 7);   // gauge overwrites
+    reg.setGauge("pool_idle", 7);
     assert.equalInt(5, reg.counter("db_queries_total") as int);
     assert.equalInt(7, reg.gauge("pool_idle") as int);
 }
@@ -41,11 +40,10 @@ fn test_snapshots(): void {
 @test
 fn test_span(): void {
     let reg = metrics.newRegistry();
-    let lg = log.newLogger(log.LogLevel.Error);   // quiet: span logs at info, suppressed
+    let lg = log.newLogger(log.LogLevel.Error);
     let sp = log.startSpan(lg, "db.query");
     let e = sp.finish(reg);
     assert.isTrue(e >= 0);
-    // span recorded a counter + gauge
     assert.isTrue(reg.counter("db.query_ns_total") >= 0);
     assert.isTrue(reg.gauge("db.query_last_ns") >= 0);
 }

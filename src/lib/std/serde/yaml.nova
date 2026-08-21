@@ -198,16 +198,6 @@ fn stringifyIndent(val: YamlValue, indent: int): string {
     }
 }
 
-// ---------------------------------------------------------------------------------------------------------
-// YAML 1.2 parser.
-//
-// This is a real block+flow YAML parser, not the old line-flattening config subset. It supports: block
-// mappings and sequences, FLOW style ({a: 1, b: [1, 2]}), ANCHORS (&a) + ALIASES (*a), MERGE keys (<<: *a),
-// block scalars (| literal and > folded, with -/+ chomping), single/double QUOTED scalars with escapes,
-// core-schema TAGS (!!str/!!int/!!bool/!!null/!!float), inline/whole-line COMMENTS, and MULTIPLE DOCUMENTS
-// (--- / ...). The cursor lives in a `class` (reference semantics) so recursive descent can share one
-// position + the per-document anchor registry.
-// ---------------------------------------------------------------------------------------------------------
 
 fn splitLines(s: string): List<string> {
     let raw = string.split(s, "\n");
@@ -215,7 +205,6 @@ fn splitLines(s: string): List<string> {
     let i = 0;
     while (i < raw.size()) {
         let ln = raw.get(i) ?? "";
-        // Strip a trailing carriage return (CRLF files).
         if (ln.length > 0 && ln[ln.length - 1] == 13) { ln = string.slice(ln, 0, ln.length - 1); }
         out.push(ln);
         i = i + 1;
@@ -223,8 +212,6 @@ fn splitLines(s: string): List<string> {
     return out;
 }
 
-// Remove a trailing "# comment" from a line, preserving leading indentation. A '#' begins a comment only at
-// the start of the line's content or when preceded by whitespace, and never inside quotes.
 fn stripComment(line: string): string {
     let inS = false;
     let inD = false;
@@ -254,8 +241,6 @@ fn rtrim(s: string): string {
     return string.slice(s, 0, end);
 }
 
-// Find the ':' that separates a block-mapping key from its value: the first depth-0 colon that is followed by
-// a space/tab or ends the line, ignoring colons inside quotes or flow brackets. Returns -1 for a non-mapping.
 fn findKeyColon(t: string): int {
     let inS = false;
     let inD = false;
@@ -280,7 +265,6 @@ fn findKeyColon(t: string): int {
     return 0 - 1;
 }
 
-// Strip surrounding quotes from a mapping key (keys are strings in our model).
 fn parseKey(raw: string): string {
     let t = trim(raw);
     if (t.length >= 2 && t[0] == '"' && t[t.length - 1] == '"') { return unescapeDouble(string.slice(t, 1, t.length - 1)); }
@@ -289,7 +273,6 @@ fn parseKey(raw: string): string {
 }
 
 fn unescapeSingle(s: string): string {
-    // In single-quoted scalars the only escape is '' -> '.
     let out = bytes.alloc(s.length + 1);
     let o = 0;
     let i = 0;
@@ -297,7 +280,7 @@ fn unescapeSingle(s: string): string {
         if (s[i] == '\'' && i + 1 < s.length && s[i + 1] == '\'') { bytes.write_byte(out, o, '\''); o = o + 1; i = i + 2; }
         else { bytes.write_byte(out, o, s[i]); o = o + 1; i = i + 1; }
     }
-    bytes.write_byte(out, o, 0);          // NUL terminator (bytes.alloc, unlike nova_str_alloc, reserves none)
+    bytes.write_byte(out, o, 0);
     bytes.write_i32(out - 4, 0, o);
     return out as string;
 }
@@ -311,7 +294,6 @@ fn hexNibble(c: int): int {
 fn hex2(a: int, b: int): int { return hexNibble(a) * 16 + hexNibble(b); }
 fn hex4(a: int, b: int, c: int, d: int): int { return hex2(a, b) * 256 + hex2(c, d); }
 
-// Encode a codepoint as UTF-8 into out at offset o; returns the new offset.
 fn encodeUtf8(out: ptr, o: int, cp: int): int {
     if (cp < 0x80) { bytes.write_byte(out, o, cp); return o + 1; }
     if (cp < 0x800) {
@@ -351,13 +333,11 @@ fn unescapeDouble(s: string): string {
             else { bytes.write_byte(out, o, n); o = o + 1; i = i + 2; continue; }
         } else { bytes.write_byte(out, o, c); o = o + 1; i = i + 1; }
     }
-    bytes.write_byte(out, o, 0);          // NUL terminator (bytes.alloc, unlike nova_str_alloc, reserves none)
+    bytes.write_byte(out, o, 0);
     bytes.write_i32(out - 4, 0, o);
     return out as string;
 }
 
-// A scalar token that may be quoted; returns the typed YamlValue (quoted -> always String, unquoted -> core
-// schema typing via parseScalar).
 fn scalarToken(t0: string): YamlValue {
     let t = trim(t0);
     if (t.length >= 2 && t[0] == '"' && t[t.length - 1] == '"') { return YamlValue.String(unescapeDouble(string.slice(t, 1, t.length - 1))); }
@@ -365,7 +345,6 @@ fn scalarToken(t0: string): YamlValue {
     return parseScalar(t);
 }
 
-// Apply a core-schema tag to a scalar value.
 fn applyTag(tag: string, v: YamlValue): YamlValue {
     if (tag.length == 0) { return v; }
     if (tag == "!!str" || tag == "!str") {
@@ -389,7 +368,6 @@ fn applyTag(tag: string, v: YamlValue): YamlValue {
     return v;
 }
 
-// Deep copy (aliases must not share the anchored node's containers).
 pub fn cloneValue(v: YamlValue): YamlValue {
     switch (v) {
         case YamlValue.Array(a): {
@@ -425,13 +403,11 @@ class YamlParser {
     }
 
     fn atEnd(self: YamlParser): bool { return self.pos >= self.lines.size(); }
-    // Past end-of-input reads as an empty line, so callers that peek one line ahead never index out of bounds.
     fn cur(self: YamlParser): string {
         if (self.pos >= self.lines.size()) { return ""; }
         return self.lines.at(self.pos);
     }
 
-    // Advance over blank lines, comment-only lines and %directives. Stops on real content or a doc marker.
     fn skipIgnorable(self: YamlParser): void {
         while (!self.atEnd()) {
             let t = trim(stripComment(self.cur()));
@@ -445,7 +421,6 @@ class YamlParser {
         return t == "---" || t == "..." || string.startsWith(t, "--- ") || string.startsWith(t, "... ");
     }
 
-    // Parse every document in the stream.
     pub fn parseAll(self: YamlParser): List<YamlValue> {
         let docs = List<YamlValue>();
         while (true) {
@@ -454,20 +429,18 @@ class YamlParser {
             let before = self.pos;
             let v = self.parseDocument();
             docs.push(v);
-            if (self.pos <= before) { self.pos = before + 1; }   // guarantee progress
+            if (self.pos <= before) { self.pos = before + 1; }
         }
         return docs;
     }
 
     fn parseDocument(self: YamlParser): YamlValue {
-        self.anchors = Map<string, YamlValue>(16, string.hash);   // anchors are document-scoped
+        self.anchors = Map<string, YamlValue>(16, string.hash);
         self.skipIgnorable();
-        // Consume a leading document-start marker.
         if (!self.atEnd()) {
             let t = trim(stripComment(self.cur()));
             if (t == "---") { self.pos = self.pos + 1; }
             else if (string.startsWith(t, "--- ")) {
-                // `--- <inline node>` on one line.
                 self.lines.set(self.pos, string.slice(self.cur(), string.indexOf(self.cur(), "--- ") + 4, self.cur().length));
             }
         }
@@ -479,13 +452,11 @@ class YamlParser {
             return YamlValue.Null;
         }
         let v = self.parseNode(0);
-        // Consume a trailing document-end marker.
         self.skipIgnorable();
         if (!self.atEnd() && trim(stripComment(self.cur())) == "...") { self.pos = self.pos + 1; }
         return v;
     }
 
-    // Parse the node whose block content is indented at >= minIndent.
     fn parseNode(self: YamlParser, minIndent: int): YamlValue {
         self.skipIgnorable();
         if (self.atEnd()) { return YamlValue.Null; }
@@ -495,7 +466,6 @@ class YamlParser {
         if (self.isDocMarker(t) || ind < minIndent) { return YamlValue.Null; }
         if (t == "-" || string.startsWith(t, "- ")) { return self.parseSequence(ind); }
         if (findKeyColon(t) >= 0) { return self.parseMapping(ind); }
-        // Bare scalar node (single line, possibly flow/anchor/alias/block-scalar).
         self.pos = self.pos + 1;
         return self.parseValue(t, ind);
     }
@@ -510,18 +480,13 @@ class YamlParser {
             let t = trim(stripComment(line));
             if (self.isDocMarker(t) || ind < indent || ind > indent) { break; }
             if (!(t == "-" || string.startsWith(t, "- "))) { break; }
-            // Column of the '-' and of the item content in the original line.
             let dash = ind;
             let cpos = dash + 1;
             while (cpos < line.length && line[cpos] == ' ') { cpos = cpos + 1; }
             if (cpos >= line.length) {
-                // Bare "-": the item is a nested node deeper than the dash.
                 self.pos = self.pos + 1;
                 arr.push(self.parseNode(indent + 1));
             } else {
-                // Rewrite "- <content>" to "<content>" at its own column, then parse it as a node there. This
-                // makes `- key: v` (a mapping whose first key rides the dash line) and `- - x` (nested seq)
-                // fall out of the same recursion, continuing on following lines aligned at that column.
                 let content = string.slice(line, cpos, line.length);
                 self.lines.set(self.pos, string.repeat(" ", cpos) + content);
                 arr.push(self.parseNode(cpos));
@@ -556,7 +521,6 @@ class YamlParser {
         return YamlValue.Object(obj);
     }
 
-    // Merge a mapping (or a sequence of mappings) into obj without overriding keys already present.
     fn mergeInto(self: YamlParser, obj: Map<string, YamlValue>, v: YamlValue): void {
         switch (v) {
             case YamlValue.Object(m): {
@@ -576,18 +540,14 @@ class YamlParser {
         }
     }
 
-    // Resolve the value following `key:` (or a bare-scalar node). The cursor is already positioned on the
-    // line AFTER the key/scalar line, so nested blocks and block scalars read from there.
     fn parseValue(self: YamlParser, text: string, parentIndent: int): YamlValue {
         let t = trim(text);
-        // Leading tag(s): remember the last one.
         let tag = "";
         while (t.length > 0 && t[0] == '!') {
             let sp = indexOfSpace(t);
             if (sp < 0) { tag = t; t = ""; }
             else { tag = string.slice(t, 0, sp); t = trim(string.slice(t, sp, t.length)); }
         }
-        // Anchor.
         if (t.length > 0 && t[0] == '&') {
             let sp = indexOfSpace(t);
             let name = "";
@@ -597,27 +557,20 @@ class YamlParser {
             self.anchors.set(name, cloneValue(v));
             return applyTag(tag, v);
         }
-        // Alias.
         if (t.length > 0 && t[0] == '*') {
             let name = trim(string.slice(t, 1, t.length));
             return cloneValue(self.anchors.get(name) ?? YamlValue.Null);
         }
-        // Empty -> nested block (mapping/sequence/scalar deeper) or null.
         if (t.length == 0) { return self.parseNode(parentIndent + 1); }
-        // Block scalar.
         if (t[0] == '|' || t[0] == '>') { return applyTag(tag, self.parseBlockScalar(parentIndent, t)); }
-        // Flow collections (may span lines).
         if (t[0] == '{' || t[0] == '[') {
             let flow = self.gatherFlow(t);
             let (fv, fi) = self.flowValue(flow, 0);
             return applyTag(tag, fv);
         }
-        // Plain or quoted scalar.
         return applyTag(tag, scalarToken(t));
     }
 
-    // Collect a complete flow expression starting with `initial`, consuming following lines until the {} / []
-    // brackets balance.
     fn gatherFlow(self: YamlParser, initial: string): string {
         let buf = initial;
         while (flowDepth(buf) > 0 && !self.atEnd()) {
@@ -628,8 +581,8 @@ class YamlParser {
     }
 
     fn parseBlockScalar(self: YamlParser, parentIndent: int, header: string): YamlValue {
-        let style = header[0];       // '|' literal, '>' folded
-        let chomp = 0;               // 0 clip, -1 strip, +1 keep
+        let style = header[0];
+        let chomp = 0;
         let explicitIndent = 0 - 1;
         let i = 1;
         while (i < header.length) {
@@ -652,7 +605,6 @@ class YamlParser {
             content.push(c);
             self.pos = self.pos + 1;
         }
-        // Drop trailing blank lines except when keeping (+).
         if (chomp != 1) {
             while (content.size() > 0 && (content.at(content.size() - 1)).length == 0) { content.remove(content.size() - 1); }
         }
@@ -665,7 +617,6 @@ class YamlParser {
                 k = k + 1;
             }
         } else {
-            // Folded: runs of non-empty lines join with a space; blank lines become newlines.
             let atStart = true;
             let k = 0;
             while (k < content.size()) {
@@ -676,13 +627,11 @@ class YamlParser {
                 k = k + 1;
             }
         }
-        if (chomp == 0) { body = body + "\n"; }       // clip: single trailing newline
-        else if (chomp == 1) { body = body + "\n"; }  // keep: trailing newline + any kept blanks already in body
-        // strip (-1): no trailing newline
+        if (chomp == 0) { body = body + "\n"; }
+        else if (chomp == 1) { body = body + "\n"; }
         return YamlValue.String(body);
     }
 
-    // ---- flow parsing over a string (index based) ----
 
     fn flowValue(self: YamlParser, s: string, i0: int): (YamlValue, int) {
         let i = skipWs(s, i0);
@@ -700,7 +649,6 @@ class YamlParser {
             let (raw, j) = readFlowQuoted(s, i);
             return (scalarToken(raw), j);
         }
-        // Plain scalar up to a flow delimiter.
         let j = i;
         while (j < s.length && !isFlowStop(s[j])) { j = j + 1; }
         let tok = trim(string.slice(s, i, j));
@@ -709,7 +657,7 @@ class YamlParser {
 
     fn flowSeq(self: YamlParser, s: string, i0: int): (YamlValue, int) {
         let arr = List<YamlValue>();
-        let i = i0 + 1;   // past '['
+        let i = i0 + 1;
         while (true) {
             i = skipWs(s, i);
             if (i >= s.length) { break; }
@@ -726,13 +674,12 @@ class YamlParser {
 
     fn flowMap(self: YamlParser, s: string, i0: int): (YamlValue, int) {
         let obj = Map<string, YamlValue>(16, string.hash);
-        let i = i0 + 1;   // past '{'
+        let i = i0 + 1;
         while (true) {
             i = skipWs(s, i);
             if (i >= s.length) { break; }
             if (s[i] == '}') { i = i + 1; break; }
             if (s[i] == ',') { i = i + 1; continue; }
-            // key (up to ':') -- may be quoted.
             let keyRaw = "";
             if (s[i] == '"' || s[i] == '\'') {
                 let (kq, kj) = readFlowQuoted(s, i);
@@ -759,7 +706,6 @@ class YamlParser {
     }
 }
 
-// Net {[ vs ]} depth of a flow buffer, ignoring brackets inside quotes.
 fn flowDepth(s: string): int {
     let inS = false;
     let inD = false;
@@ -794,7 +740,6 @@ fn indexOfSpace(s: string): int {
     return 0 - 1;
 }
 
-// Read a quoted flow scalar starting at s[i] (a quote char); returns (raw-including-quotes, nextIndex).
 fn readFlowQuoted(s: string, i0: int): (string, int) {
     let q = s[i0];
     let i = i0 + 1;
@@ -816,7 +761,6 @@ pub fn parse(yaml: string): YamlValue {
     return docs.at(0);
 }
 
-// Parse a multi-document stream into a list of documents.
 pub fn parseDocuments(yaml: string): List<YamlValue> {
     let p = YamlParser(splitLines(yaml));
     return p.parseAll();

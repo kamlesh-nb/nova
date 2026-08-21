@@ -1,6 +1,3 @@
-// ChaCha20 and Poly1305 implemented in Nova (M9 phase B, no external library). Verified against the
-// RFC 8439 test vectors: the ChaCha20 keystream block (section 2.3.2), the ChaCha20 encryption of the
-// 114-byte sunscreen message (section 2.4.2), and the Poly1305 tag (section 2.5.2).
 import crypto.cipher.chacha20;
 import crypto.mac.poly1305;
 import bytes;
@@ -49,7 +46,6 @@ fn stdKey(): ptr {
     return key;
 }
 
-// RFC 8439 section 2.3.2: keystream block, counter = 1.
 @test
 fn t_chacha20_block(): void {
     let key = stdKey();
@@ -60,7 +56,6 @@ fn t_chacha20_block(): void {
     assert.isTrue(eqHex(out, 64, "10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4ed2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e"));
 }
 
-// RFC 8439 section 2.4.2: encrypt the 114-byte message, counter = 1.
 @test
 fn t_chacha20_encrypt(): void {
     let key = stdKey();
@@ -71,14 +66,12 @@ fn t_chacha20_encrypt(): void {
     chacha20.applyKeystream(key, 1, nonce, pt, 114, ct);
     assert.isTrue(eqHex(ct, 114, "6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0bf91b65c5524733ab8f593dabcd62b3571639d624e65152ab8f530c359f0861d807ca0dbf500d6a6156a38e088a22b65e52bc514d16ccf806818ce91ab77937365af90bbf74a35be6b40b8eedf2785e42874d"));
 
-    // Decrypt is the same operation and must recover the plaintext.
     let rt = bytes.alloc(114);
     chacha20.applyKeystream(key, 1, nonce, ct, 114, rt);
     let i = 0;
     while (i < 114) { assert.equalInt(bytes.read_byte(rt, i), bytes.read_byte(pt, i)); i = i + 1; }
 }
 
-// RFC 8439 section 2.5.2: Poly1305 tag.
 @test
 fn poly1305_tag(): void {
     let key = bytes.alloc(32);
@@ -89,11 +82,8 @@ fn poly1305_tag(): void {
     assert.isTrue(eqHex(tag, 16, "a8061dc1305136c6c22b8baf0c0127a9"));
 }
 
-// Poly1305 with a message that is an exact multiple of the block size and a partial tail, to exercise
-// both the full-block and padded-final paths (RFC 8439 A.3 test vector 4 style, computed here).
 @test
 fn poly1305_empty_and_block(): void {
-    // Empty message: the tag is the pad (s) itself.
     let key = bytes.alloc(32);
     hexInto(key, "0000000000000000000000000000000036e5f6b5c5e06070f0efca96227a863e");
     let tag = bytes.alloc(16);

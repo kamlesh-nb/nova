@@ -1,9 +1,4 @@
 // EXPECT-FAIL: typecheck
-// `const` is the enforced-immutable half of the two-keyword model (`let` = mutable variable,
-// `const` = constant; `var` is removed). Reassigning a `const` binding is a hard sema error
-// (infer.zig records it, shadow.zig rejects with a located diagnostic). `let` stays reassignable,
-// and mutating THROUGH a const reference (`const xs = List(); xs.push(1)`) is allowed — only a bare
-// rebinding of the const itself is rejected.
 @test
 fn t(): void {
     const x = 5;

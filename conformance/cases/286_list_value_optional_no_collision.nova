@@ -1,18 +1,9 @@
-// A3-read: a `List<int | undefined>` (value-optional element) monomorphised to the SAME symbol as a
-// plain `List<int>`, because the legacy type-name path rendered `int | undefined` as just `int`. When a
-// program used BOTH (here: directly, and as the stdlib itself instantiates `List<int>`), the two shared
-// one body -- mixing a boxed value-optional layout with a raw i32 layout -- and any read of a >=2-element
-// value-optional list dereferenced a mis-typed slot (a use-after-free / SEGV, found by the codegen
-// soundness fuzzer). The fix renders a value-optional distinctly (`int | undefined`, not `int`) so the two
-// instantiations get distinct monomorphised names and layouts. A single value-optional list on its own
-// already worked; this case pins the COEXISTENCE that the collision broke.
 
 import assert;
 import list;
 
 @test
 fn test_value_optional_and_plain_int_coexist(): void {
-    // The plain-int list must not share a body with the value-optional one.
     let ns = List<int>();
     ns.push(1);
     ns.push(2);
@@ -23,20 +14,16 @@ fn test_value_optional_and_plain_int_coexist(): void {
     xs.push(undefined);
     xs.push(900);
 
-    // Reads of a >=2-element value-optional list (the shape that used to crash).
     assert.equalInt(xs.at(0) ?? -1, 700);
-    assert.equalInt(xs.at(1) ?? -1, -1);   // the undefined element
+    assert.equalInt(xs.at(1) ?? -1, -1);
     assert.equalInt(xs.at(2) ?? -1, 900);
 
-    // The plain-int list is unaffected and keeps its own raw layout.
     assert.equalInt(ns.at(0), 1);
     assert.equalInt(ns.at(2), 3);
 }
 
 @test
 fn test_value_optional_growth_then_read(): void {
-    // Push past the initial capacity so the storage grows (copies elements): the read after growth must
-    // still return the stored value, not a dangling box.
     let xs = List<int | undefined>();
     let i = 0;
     while (i < 6) { xs.push(i * 100); i = i + 1; }

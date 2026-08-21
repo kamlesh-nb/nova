@@ -1,5 +1,3 @@
-// Constant-time bitsliced AES (FIPS-197) implemented in Nova (M9 phase B, no external library).
-// Verified against the FIPS-197 known-answer vectors for AES-128 and AES-256.
 import crypto.cipher.aes;
 import bytes;
 import assert;
@@ -33,7 +31,6 @@ fn hexInto(dst: ptr, hex: string): int {
     return n;
 }
 
-// FIPS-197 Appendix C.1: AES-128.
 @test
 fn aes128_fips197_c1(): void {
     let key = bytes.alloc(16);
@@ -47,7 +44,6 @@ fn aes128_fips197_c1(): void {
     assert.isTrue(eqHex(ct, 16, "69c4e0d86a7b0430d8cdb78070b4c55a"));
 }
 
-// FIPS-197 Appendix B: AES-128 with the worked-example key.
 @test
 fn aes128_fips197_b(): void {
     let key = bytes.alloc(16);
@@ -61,7 +57,6 @@ fn aes128_fips197_b(): void {
     assert.isTrue(eqHex(ct, 16, "3925841d02dc09fbdc118597196a0b32"));
 }
 
-// FIPS-197 Appendix C.3: AES-256.
 @test
 fn aes256_fips197_c3(): void {
     let key = bytes.alloc(32);
@@ -75,7 +70,6 @@ fn aes256_fips197_c3(): void {
     assert.isTrue(eqHex(ct, 16, "8ea2b7ca516745bfeafc49904b496089"));
 }
 
-// A second block with the same context (round keys reused correctly).
 @test
 fn aes128_reuse_context(): void {
     let key = bytes.alloc(16);
@@ -86,7 +80,6 @@ fn aes128_reuse_context(): void {
     hexInto(pt, "00112233445566778899aabbccddeeff");
     ctx.encryptBlock(pt, ct);
     assert.isTrue(eqHex(ct, 16, "69c4e0d86a7b0430d8cdb78070b4c55a"));
-    // encrypt an all-zero block too
     let z = bytes.alloc(16);
     let cz = bytes.alloc(16);
     ctx.encryptBlock(z, cz);

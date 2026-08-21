@@ -1,8 +1,6 @@
-// NEGATIVE (L1): pushing a trait object into a List<Concrete> narrows the element to a concrete struct and
-// miscompiles (the fat pointer is stored as the element and read as garbage). Must be rejected.
 import list;
 trait Speaker { fn speak(self): int; }
 struct Dog impl Speaker { pub n: int, init(n: int) { self.n = n; } pub fn speak(self): int { return self.n; } }
 fn makeSpeaker(): Speaker { return Dog(7); }
 @test
-fn t(): void { let l = list.List<Dog>(); l.push(makeSpeaker()); }  // ERROR: trait -> List<Dog> element
+fn t(): void { let l = list.List<Dog>(); l.push(makeSpeaker()); }

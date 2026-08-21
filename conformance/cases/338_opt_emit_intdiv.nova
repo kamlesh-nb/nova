@@ -1,8 +1,3 @@
-// M6-E: signed integer div / mod / arithmetic-shr are reproduced by the optimiser LIR emit path
-// (NOVA_OPT_EMIT) byte-for-byte with the AST backend. These free, all-int functions are exactly the
-// emittable subset, so under the emit gate they compile from the optimised IR; under the default build
-// they compile from the AST. Both must agree, including truncation-toward-zero on negatives, the sign of
-// the remainder, arithmetic (sign-preserving) shift right, and 32-bit vs 64-bit widths.
 import assert;
 
 fn idiv(a: int, b: int): int { return a / b; }
@@ -16,7 +11,6 @@ fn combo(a: int, b: int, c: int): int { return (a / b) % c + (a >> 1); }
 fn test_int_div_mod(): void {
     assert.equalInt(idiv(17, 5), 3);
     assert.equalInt(imod(17, 5), 2);
-    // Division truncates toward zero; the remainder takes the dividend's sign.
     assert.equalInt(idiv(-17, 5), -3);
     assert.equalInt(imod(-17, 5), -2);
     assert.equalInt(idiv(17, -5), -3);
@@ -26,7 +20,6 @@ fn test_int_div_mod(): void {
 @test
 fn test_arithmetic_shr(): void {
     assert.equalInt(ishr(255, 4), 15);
-    // Signed shift right is arithmetic: the sign bit replicates.
     assert.equalInt(ishr(-16, 2), -4);
     assert.equalInt(ishr(-1, 8), -1);
 }
@@ -41,6 +34,5 @@ fn test_long_div_mod(): void {
 
 @test
 fn test_combined(): void {
-    // (20 / 3) % 4 + (20 >> 1) = 6 % 4 + 10 = 2 + 10 = 12
     assert.equalInt(combo(20, 3, 4), 12);
 }

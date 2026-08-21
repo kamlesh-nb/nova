@@ -1,15 +1,7 @@
-// M4 keystone of the C++ runtime retirement plan: cross-reactor wakeup, no Asio. A coroutine
-// scheduled on one reactor thread can be handed to the reactor that owns it and wake that reactor's
-// blocking poll. This is what the share-nothing reactor lacked and Asio provided (post to another
-// strand), and it is the prerequisite for moving the multi-threaded async driver (nova_run_root) and
-// cross-thread channels/actors off Asio. The mechanism: a reactor registers under an index with its
-// kqueue; another thread posts a handle to that index (thread-safe inbox) and fires an EVFILT_USER
-// trigger that wakes the target kqueue; the reactor drains the posted handles on the EVFILT_USER event.
 import assert;
 import bytes;
 import net.poller;
 
-// Same-thread: a posted handle wakes the poll and is drained. Proves the trigger + inbox + drain.
 @test
 fn test_self_wake(): void {
     let r = poller.Reactor(16, 1024, 4);
@@ -35,11 +27,8 @@ struct WakeCtx {
     init(result: long) { self.result = result; }
 }
 
-// One capturable context so the reactor-worker closure needs a single capture.
 fn wakeWorker(ctx: WakeCtx, idx: int): void {
     if (idx == 0) {
-        // Receiver: own a reactor, register under index 0, block in poll until woken from the other
-        // thread, then drain the handle it was posted.
         let r = poller.Reactor(16, 1024, 4);
         r.registerWake(0);
         let n = r.poll(5000);
@@ -53,8 +42,6 @@ fn wakeWorker(ctx: WakeCtx, idx: int): void {
         }
         r.destroy();
     } else {
-        // Sender: wait (monotonic-clock spin, no shared memory) so the receiver has registered, then
-        // post a handle to reactor index 0 from this other thread.
         let start = nova_mono_ms();
         while (nova_mono_ms() - start < (300 as long)) { let _ = start; }
         poller.post(0, 777);
@@ -67,7 +54,6 @@ fn test_cross_reactor_wakeup(): void {
     bytes.write_i32(cell, 0, 0);
     let ctx = WakeCtx(cell);
 
-    // Two share-nothing reactor threads: index 0 receives, index 1 posts across the thread boundary.
     poller.runReactors(2, (idx) => {
         wakeWorker(ctx, idx);
     });

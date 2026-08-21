@@ -1,33 +1,15 @@
-// Emit-subset growth (D3, owned STRING-field structs): a struct whose only owned fields are `string`s can be
-// constructed, have its scalar fields read/written, and be DROPPED from the emit path, because its owned
-// fields are released via its real `__destruct_<Struct>` destructor (each string field released with a null
-// dtor -- a single heap allocation, no further owned fields).
-//
-// Two drop ABIs are exercised, and the emit path picks the right one by the value's type:
-//   - a plain `struct` is a VALUE struct (inline stack bytes, no ARC header): dropped via a DIRECT
-//     destructor call on the storage address (dropValueStruct), which releases the string field but does
-//     NOT free (it is stack storage);
-//   - a `class` is a HEAP/reference struct (8-byte ARC header): dropped via `nova_release(ptr, __destruct_*)`
-//     which decrefs, runs the destructor, then frees the payload.
-//
-// Scope: only bare `string` owned fields, and only const_str (immortal literal) string field values at
-// construction (an immortal literal is MOVED in with no retain). A non-literal string field arg, a returned
-// string field, or any non-string owned field (class/list/nested struct) is rejected and falls back to the
-// AST. Under NOVA_OPT_EMIT the helpers below compile from the optimised IR; both engines must agree.
 import assert;
 
-struct User { pub name: string, pub age: int }          // VALUE struct with a string field
-struct Pair { pub a: string, pub b: string, pub n: int } // two string fields
-class Account { pub owner: string, pub balance: int }    // HEAP/reference struct with a string field
+struct User { pub name: string, pub age: int }
+struct Pair { pub a: string, pub b: string, pub n: int }
+class Account { pub owner: string, pub balance: int }
 
-// Value struct: construct, mutate the scalar field, read it, drop (dtor releases the string field).
 fn valMake(a: int): int {
     let u = User{ name: "bob", age: a };
     u.age = u.age + 1;
     return u.age;
 }
 
-// Value struct in a loop: many constructions -> many drops. ARC must stay balanced across every iteration.
 fn valLoop(n: int): int {
     let acc = 0;
     let i = 0;
@@ -39,20 +21,17 @@ fn valLoop(n: int): int {
     return acc;
 }
 
-// Two string fields plus a scalar: both string fields are released by the destructor at drop.
 fn pairSum(k: int): int {
     let p = Pair{ a: "hi", b: "there", n: k };
     return p.n * 2;
 }
 
-// Heap/reference struct: nova_release + real destructor on drop.
 fn heapMake(a: int): int {
     let acc = Account{ owner: "alice", balance: a };
     acc.balance = acc.balance + 100;
     return acc.balance;
 }
 
-// Heap struct in a loop.
 fn heapLoop(n: int): int {
     let total = 0;
     let i = 0;
@@ -67,8 +46,8 @@ fn heapLoop(n: int): int {
 @test
 fn test_owned_field_struct(): void {
     assert.equalInt(valMake(41), 42);
-    assert.equalInt(valLoop(100), 4950);   // sum 0..99
+    assert.equalInt(valLoop(100), 4950);
     assert.equalInt(pairSum(21), 42);
     assert.equalInt(heapMake(41), 141);
-    assert.equalInt(heapLoop(100), 4950);  // sum 0..99
+    assert.equalInt(heapLoop(100), 4950);
 }

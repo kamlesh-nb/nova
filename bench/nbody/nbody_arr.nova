@@ -1,5 +1,3 @@
-// N-body using fixed PRIMITIVE arrays (double[5]) instead of List<double> -- measures the fixed-array
-// path vs the boxed-optional List path (and vs scalar). Same algorithm/constants as nbody.nova.
 import math;
 
 const PI: double = 3.141592653589793;

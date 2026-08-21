@@ -1,8 +1,3 @@
-// YCSB A–F against Microsoft SQL Server, via the driver-generic core (D5).
-// Run: with a running SQL Server (TDS 1433), then
-//   ./zig-out/bin/nova test --release repro/ycsb/ycsb_mssql.nova
-// MSSQL dialect: NVARCHAR(64) PK + NVARCHAR(256) data; the scan uses `SELECT TOP n ... ORDER BY`
-// (last runSuite arg = true) since MSSQL has no LIMIT. Add `?encrypt=true` to the DSN for TLS.
 import ycsb_core;
 import db;
 import mssql;

@@ -1,6 +1,3 @@
-// main.nova — app composition root (= Program.cs): register handlers + routes, wire
-// static files, run. Each `handle<TReq>` binds a request type to its handler; the
-// matching `get/post<TReq>` registers the route. Vertical slices live under Features/.
 import web.app;
 import web.request;
 import web.response;
@@ -22,44 +19,26 @@ import postgres;
 fn buildApp(): App {
     let app = App();
 
-    // Products feature — one registration per slice.
     app.handle<CreateProduct>(CreateProductHandler{});
     app.post<CreateProduct>("/api/products");
 
-    // The GetProductById handler holds a repository backed by the fetched nova-postgres driver, so it
-    // runs a REAL per-request DB query (awaited on the request coroutine — no block-drive, no deadlock).
     let repo = ProductRepository("postgresql://postgres@127.0.0.1:5432/appdb");
     app.handle<GetProductById>(GetProductByIdHandler{ repo: repo });
     app.get<GetProductById>("/api/products/{id:int}");
 
-    // Upstream feature — a per-request outbound verified HTTPS call via net/httpsclient (reactor-native
-    // pure-Nova TLS 1.3), awaited on the request coroutine. Target/CA come from NOVA_UPSTREAM_URL /
-    // NOVA_UPSTREAM_CA. GET /api/fetch returns a JSON summary of the upstream response.
     app.handle<FetchUpstream>(FetchUpstreamHandler{});
     app.get<FetchUpstream>("/api/fetch");
 
-    // Health feature — GET /api/health runs an out-of-band verified HTTPS readiness probe against the
-    // database service (net/httpsclient, reactor-native pure-Nova TLS 1.3) and feeds the result into a
-    // circuit breaker. The ResilientPool is built ONCE here so its breaker state accumulates across
-    // requests (repeated failures trip it OPEN, visible in the response). Probe URL/CA come from
-    // NOVA_DB_HEALTH_URL / NOVA_DB_HEALTH_CA.
     let dbPool = ResilientPool(PgDriver(), "postgresql://postgres@127.0.0.1:5432/appdb", 4, 3, 2, 5000);
     app.handle<CheckHealth>(CheckHealthHandler{ pool: dbPool });
     app.get<CheckHealth>("/api/health");
 
-    // Serve static assets (wwwroot/) for any unmatched GET.
     app.useStatic("/", "./wwwroot");
     return app;
 }
 
 fn main(): void {
-    // DB access now happens PER REQUEST inside GetProductByIdHandler (awaited on the request coroutine
-    // through the nova get-fetched nova-postgres driver) — no startup block-drive needed. GET
-    // /api/products/{id} runs a live `SELECT name FROM products WHERE id = $1`, degrading gracefully
-    // to a fallback name when the database is offline, so the app serves either way.
     let app = buildApp();
-    // Port from NOVA_PORT (default 8080) so the orchestrator can run many replicas on distinct ports
-    // behind its load balancer.
     let portEnv = env.get("NOVA_PORT");
     let port = if (portEnv == "") 8080 else string.parseI64(portEnv) as int;
     console.log(`Listening on http://127.0.0.1:${port}`);

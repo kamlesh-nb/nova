@@ -1,29 +1,18 @@
-// os/winproc: Win32 process and pipe APIs for the Windows target (windows-only). Companion to
-// os/winsock (sockets), os/winfs (file/dir/env) and os/windows (IOCP): raw `extern("c")` bindings
-// only. std/process_windows builds the Process surface on top of these.
-//
-// Handles are HANDLE (pointer-sized) and so are `long`. Pipe handles are ordinary file handles, so
-// the pipe ends are read and written with os/winfs's ReadFile/WriteFile.
 
 import bytes;
 
-// --- constants -------------------------------------------------------------------------------
 pub const HANDLE_FLAG_INHERIT: int = 1;
-pub const STARTF_USESTDHANDLES: int = 256;      // 0x100 — honour hStdInput/hStdOutput/hStdError
-pub const INFINITE: int = -1;                   // 0xFFFFFFFF as a DWORD
+pub const STARTF_USESTDHANDLES: int = 256;
+pub const INFINITE: int = -1;
 pub const WAIT_OBJECT_0: int = 0;
-pub const WAIT_TIMEOUT: int = 258;              // 0x102
-pub const STILL_ACTIVE: int = 259;              // 0x103 — GetExitCodeProcess for a live process
-pub const CREATE_NO_WINDOW: int = 134217728;    // 0x08000000 — no console popup for a child
+pub const WAIT_TIMEOUT: int = 258;
+pub const STILL_ACTIVE: int = 259;
+pub const CREATE_NO_WINDOW: int = 134217728;
 
-// --- struct sizes and offsets (x64) -----------------------------------------------------------
-// SECURITY_ATTRIBUTES: [0] nLength DWORD, [8] lpSecurityDescriptor, [16] bInheritHandle BOOL.
 pub const SECURITY_ATTRIBUTES_SIZE: int = 24;
 pub const SA_LENGTH_OFF: int = 0;
 pub const SA_INHERIT_OFF: int = 16;
 
-// STARTUPINFOW (104 bytes): [0] cb, [60] dwFlags, [80] hStdInput, [88] hStdOutput, [96] hStdError.
-// Everything between is desktop/title/window geometry, left zeroed.
 pub const STARTUPINFO_SIZE: int = 104;
 pub const SI_CB_OFF: int = 0;
 pub const SI_FLAGS_OFF: int = 60;
@@ -31,22 +20,14 @@ pub const SI_STDIN_OFF: int = 80;
 pub const SI_STDOUT_OFF: int = 88;
 pub const SI_STDERR_OFF: int = 96;
 
-// PROCESS_INFORMATION (24 bytes): [0] hProcess, [8] hThread, [16] dwProcessId, [20] dwThreadId.
 pub const PROCESS_INFORMATION_SIZE: int = 24;
 pub const PI_PROCESS_OFF: int = 0;
 pub const PI_THREAD_OFF: int = 8;
 pub const PI_PID_OFF: int = 16;
 
-// --- pipes -----------------------------------------------------------------------------------
-// CreatePipe writes the two ends into *hRead and *hWrite. nSize 0 means "default buffer".
 pub extern("c") fn CreatePipe(hRead: ptr, hWrite: ptr, sa: ptr, size: int): int;
-// Clear HANDLE_FLAG_INHERIT on the parent's end so the child does not also hold it open — without
-// this, the read end never sees EOF because the child keeps a live copy of the write end.
 pub extern("c") fn SetHandleInformation(h: long, mask: int, flags: int): int;
 
-// --- processes -------------------------------------------------------------------------------
-// lpCommandLine must be WRITABLE (CreateProcessW may modify it in place), so callers pass a freshly
-// allocated UTF-16 buffer, not a literal.
 pub extern("c") fn CreateProcessW(appName: ptr, cmdLine: ptr, procAttrs: ptr, threadAttrs: ptr,
                                   inheritHandles: int, flags: int, env: ptr, cwd: ptr,
                                   startupInfo: ptr, procInfo: ptr): int;

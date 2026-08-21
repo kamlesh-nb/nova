@@ -1,18 +1,3 @@
-// B6 — a GENERIC async fn resolving `serde.bind<T>` and returning a type-parameter value.
-//
-// Two problems, both from the generic async fn being handled as an ERASED body instead of a
-// per-instantiation spec:
-//   (1) codegen emitted the erased body of a generic async fn (the `or is_async` clause), and inside it
-//       `serde.bind<T>` could not resolve `T__bind` (T unbound) -> hard compile error `T__bind not found`.
-//   (2) a generic async CALL was not driven+extracted like a plain async call, so the caller stored the
-//       raw coroutine ramp handle as the result (garbage a.id); and `await gen<T>(...)` resolved the base
-//       name (not the spec), falling back to the driving path.
-// Fixes: don't emit the erased body for a generic async fn (rely on its specs); drive+extract a generic
-// async call; and resolve `await gen<T>(...)` to the spec name so the await gets the ramp handle.
-//
-// NOTE: the "return an owned type-parameter ARGUMENT unchanged" shape (`fn f<T>(v: T): T { return v; }`)
-// aliases the caller's value and double-frees -- but that is a PRE-EXISTING generic issue present in the
-// SYNC path too (B3-family), independent of async, so it is deliberately not exercised here.
 
 import assert;
 import serde.source;
@@ -21,24 +6,20 @@ import serde.source;
 
 async fn fetchTag(): int { return 1; }
 
-// generic async fn binding T from a source (the driver ORM shape: await I/O, then bind).
 async fn queryAs<T>(js: ValueSource): T {
-    let _ = await fetchTag();          // real suspend before the bind
+    let _ = await fetchTag();
     return serde.bind<T>(js);
 }
 
-// a generic async fn that builds and returns a NEW value of the type parameter.
 async fn makeOne<T>(js: ValueSource): T {
     return serde.bind<T>(js);
 }
 
-// await a generic async result from inside another async fn.
 async fn viaAwait(js: ValueSource): int {
     let d = await queryAs<Dto>(js);
     return d.id;
 }
 
-// (1) generic async bind driven from sync context.
 @test
 fn test_query_as_from_sync(): void {
     let js: ValueSource = source.fromJson("{\"id\": 5, \"name\": \"Zed\"}");
@@ -47,7 +28,6 @@ fn test_query_as_from_sync(): void {
     assert.equalStr("Zed", d.name);
 }
 
-// (2) present-0 field survives (value-optional boxing) through the generic async path.
 @test
 fn test_present_zero(): void {
     let js: ValueSource = source.fromJson("{\"id\": 0, \"name\": \"Zero\"}");
@@ -56,7 +36,6 @@ fn test_present_zero(): void {
     assert.equalStr("Zero", d.name);
 }
 
-// (3) awaiting a generic async call from within an async fn.
 @test
 fn test_await_generic_async(): void {
     let js: ValueSource = source.fromJson("{\"id\": 8, \"name\": \"Q\"}");

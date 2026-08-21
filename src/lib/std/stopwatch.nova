@@ -14,8 +14,6 @@ pub struct StopWatch {
         self.end_time = datetime.nowNs();
     }
 
-    // Restart the watch (start_time = now). Lets one watch time several consecutive segments:
-    // sw.reset(); <segment>; sw.stop(); read; sw.reset(); <next>; sw.stop(); ...
     pub fn reset(self: StopWatch): void {
         self.start_time = datetime.nowNs();
     }

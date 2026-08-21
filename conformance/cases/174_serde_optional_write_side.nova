@@ -1,12 +1,3 @@
-// The WRITE side of @serializable optional fields. `<S>__dump` (ParamSink for SQL params, BsonSink
-// for BSON) switched on the field TypeRef and handled only `.ident` scalars — an `.optional` field
-// fell through to `else` and was NEVER written, so a PRESENT optional value was silently dropped from
-// an INSERT (data loss on write). This completes the optional-field symmetry: read (`__bind`, gate
-// 170), JSON serialize (`__toJson`, gate 170), and now DB/BSON write (`__dump`).
-//
-// Fix (main.zig): `.optional` arm emitting `put<X>` only when present (guard bound to a block-local
-// so `!= undefined` narrows+unboxes the value-optional — so a present 0 is written, not treated as
-// absent). Absent → the column is OMITTED (ValueSink has no putNull; the DB uses its default/NULL).
 
 import assert;
 import data.orm;
@@ -27,22 +18,22 @@ fn test_present_written_including_zero(): void {
     let u = User();
     u.name = "amy"; u.age = 30; u.score = decimal.fromString("9.5");
     let ps = orm.toParams<User>(u);
-    assert.equalInt(ps.cols.size(), 3);                       // name + age + score
+    assert.equalInt(ps.cols.size(), 3);
     assert.isTrue(string.eql(ps.cols.at(1), "age"));
     assert.equalInt(ps.vals.at(1).asInt(), 30);
 
     let z = User();
-    z.name = "z"; z.age = 0;                                  // present ZERO (score absent)
+    z.name = "z"; z.age = 0;
     let pz = orm.toParams<User>(z);
-    assert.equalInt(pz.cols.size(), 2);                       // name + age (0 written), score omitted
-    assert.equalInt(pz.vals.at(1).asInt(), 0);               // present 0, not dropped as "absent"
+    assert.equalInt(pz.cols.size(), 2);
+    assert.equalInt(pz.vals.at(1).asInt(), 0);
 }
 
 @test
 fn test_absent_omitted(): void {
     let u = User();
-    u.name = "no";                                           // age + score both undefined
+    u.name = "no";
     let ps = orm.toParams<User>(u);
-    assert.equalInt(ps.cols.size(), 1);                      // only name
+    assert.equalInt(ps.cols.size(), 1);
     assert.isTrue(string.eql(ps.cols.at(0), "name"));
 }

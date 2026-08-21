@@ -1,8 +1,3 @@
-// 161 — D8 micro-ORM WRITE side + injection safety. A @serializable struct flattens into out-of-band
-// SQL params (`toParams`/`insert`) or typed BSON leaves (`toBson`) via the compiler-generated
-// `<T>__dump(obj, sink: ValueSink)` — the write mirror of `<T>__bind(src: ValueSource)`. The whole
-// point is INJECTION SAFETY BY CONSTRUCTION: a field VALUE never touches the query string. Only the
-// column/field NAMES (compile-known struct-field identifiers) are concatenated.
 import assert;
 import data.orm;
 import data.db;
@@ -12,10 +7,7 @@ import string;
 
 @serializable struct UserDto { pub id: int, pub name: string, pub active: bool, pub balance: decimal }
 
-// Captures the SQL + params it was asked to run, so a test can prove the malicious value never
-// entered the SQL string — it arrived as a bound parameter.
 struct RecordingConn impl Connection {
-    // queryWire (trait): mocks use the generic fallback that re-encodes a ResultSet.
     async fn queryWire(self, sql: string, params: List<DbValue>): WireRows { return wireRowsFromResultSet(await self.query(sql, params)); }
     pub lastSql: string,
     pub lastParams: List<DbValue>,
@@ -38,7 +30,6 @@ struct RecordingConn impl Connection {
 
 @test
 fn test_transaction_methods_issue_sql(): void {
-    // T6: begin/commit/rollback are on the Connection seam and issue the transaction control statements.
     let conn = RecordingConn();
     let b = conn.begin();
     assert.equalStr(conn.lastSql, "BEGIN");
@@ -63,31 +54,27 @@ fn test_toparams_flattens_struct(): void {
 @test
 fn test_insert_binds_value_out_of_band(): void {
     let conn = RecordingConn();
-    let evil = "Robert'); DROP TABLE students;--";      // Bobby Tables
+    let evil = "Robert'); DROP TABLE students;--";
     let u = UserDto{ id: 7, name: evil, active: true, balance: 12.50m };
     let r = orm.insert<UserDto>(conn, "users", u);
     assert.equalInt(r.rows_affected as int, 1);
 
-    // The generated SQL is fixed column names + `$N` placeholders — the malicious value is NOT in it.
     assert.equalStr(conn.lastSql, "INSERT INTO users (id, name, active, balance) VALUES ($1, $2, $3, $4)");
     assert.isFalse(string.contains(conn.lastSql, "DROP TABLE"));
 
-    // The value is carried verbatim as a bound param — data, not SQL. That is the injection barrier.
     assert.equalInt(conn.lastParams.size(), 4);
     assert.equalStr((conn.lastParams.get(1) ?? db.dbNull()).asText(), evil);
 }
 
 @test
 fn test_tobson_stores_leaf_values(): void {
-    // A user value that WOULD be a Mongo query operator if spliced into a query DOCUMENT — here it
-    // lands as a plain BSON string leaf, never parsed as an operator ($where/$gt injection is inert).
     let evil = "{\"$gt\": \"\"}";
-    let d = UserDto{ id: 0, name: evil, active: false, balance: 9.99m };  // present-0 id survives (V1)
-    let wire: ptr = bson.serialize(orm.toBson<UserDto>(d));  // a raw ptr — ARC won't reclaim it
+    let d = UserDto{ id: 0, name: evil, active: false, balance: 9.99m };
+    let wire: ptr = bson.serialize(orm.toBson<UserDto>(d));
     let back = bson.deserialize(wire);
 
     assert.equalInt(bson.findInt(back, "id"), 0);
-    assert.equalStr(bson.findString(back, "name"), evil);   // stored as a STRING value, not an operator
+    assert.equalStr(bson.findString(back, "name"), evil);
     assert.equalInt(bson.findBool(back, "active"), 0);
     assert.isTrue(bson.docFind(back, "balance") >= 0);
     bytes.free(wire);
@@ -95,14 +82,12 @@ fn test_tobson_stores_leaf_values(): void {
 
 @test
 fn test_update_and_delete_sql(): void {
-    // T13: ORM write side -- update SETs non-key columns and WHEREs the key; delete WHEREs the key.
     let conn = RecordingConn();
     let u = UserDto{ id: 7, name: "Ada", active: true, balance: 12.50m };
     let r = orm.update<UserDto>(conn, "users", u, "id");
-    // id is the key -> WHERE; name/active/balance -> SET (in field order).
     assert.equalStr(conn.lastSql, "UPDATE users SET name = $1, active = $2, balance = $3 WHERE id = $4");
     assert.equalInt(conn.lastParams.size(), 4);
-    assert.equalInt((conn.lastParams.get(3) ?? db.dbNull()).asLong() as int, 7);  // key value last
+    assert.equalInt((conn.lastParams.get(3) ?? db.dbNull()).asLong() as int, 7);
 
     let d = orm.deleteBy(conn, "users", "id", db.dbInt(7));
     assert.equalStr(conn.lastSql, "DELETE FROM users WHERE id = $1");

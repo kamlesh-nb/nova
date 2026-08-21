@@ -10,13 +10,6 @@ import web.url;
 import web.multipart;
 import serde.source;
 
-// HTTP/1 request parsing. The hot path uses a memchr (SIMD-backed, os/sys) delimiter scan over the
-// raw buffer and slices method/path/headers directly out of it -- no `string.split` (no per-line
-// List), no intermediate trim slices. This is the same picohttpparser-style engine that
-// web/httpparser exposes zero-copy; Request materialises the handler-facing string fields on top of
-// it. Header keys keep their on-the-wire case; getHeader compares case-insensitively without
-// allocating (byte-wise), so `req.headers.get("Content-Type")` and `req.getHeader("content-type")`
-// both work.
 
 fn idxByte(buf: long, start: int, end: int, b: int): int {
     if (start >= end) { return -1; }
@@ -25,7 +18,6 @@ fn idxByte(buf: long, start: int, end: int, b: int): int {
     return (p - buf) as int;
 }
 
-// case-insensitive ASCII equality, no allocation.
 fn ciEquals(a: string, b: string): bool {
     if (a.length != b.length) { return false; }
     let i = 0;
@@ -52,7 +44,6 @@ pub struct Request {
         let n = raw.length;
         let buf = raw as long;
 
-        // request line: METHOD SP PATH SP VERSION CRLF
         let sp1 = idxByte(buf, 0, n, 32);
         if (sp1 < 0) { return Request.empty(); }
         let method = string.slice(raw, 0, sp1);
@@ -62,22 +53,21 @@ pub struct Request {
         let full_path = string.slice(raw, sp1 + 1, sp2);
         let (path, query) = splitPathQuery(full_path);
 
-        let eol = idxByte(buf, sp2 + 1, n, 13); // CR ending the request line
+        let eol = idxByte(buf, sp2 + 1, n, 13);
         if (eol < 0) { return Request.empty(); }
         let pos = eol + 2;
 
         let headers = Map<string, string>(8, string.hash);
         let cookie_str = "";
 
-        // header lines until the blank CRLF
         while (pos < n) {
-            if (bytes.read_byte(buf, pos) as int == 13) { // blank line -> end of headers
+            if (bytes.read_byte(buf, pos) as int == 13) {
                 pos = pos + 2;
                 break;
             }
             let line_end = idxByte(buf, pos, n, 13);
             if (line_end < 0) { break; }
-            let colon = idxByte(buf, pos, line_end, 58); // ':'
+            let colon = idxByte(buf, pos, line_end, 58);
             if (colon >= 0) {
                 let key = string.slice(raw, pos, colon);
                 let v_off = colon + 1;
@@ -136,8 +126,6 @@ pub struct Request {
         };
     }
 
-    // Case-insensitive header lookup with no per-key allocation (byte-wise compare on original-case
-    // keys), replacing the old per-key toLowerCase scan.
     pub fn getHeader(self: Request, name: string): string | undefined {
         let keys = self.headers.keys();
         let keysLen = keys.size();
@@ -205,12 +193,6 @@ fn trimWhitespace(s: string): string {
     return string.slice(s, start, end);
 }
 
-// ── HTTP wire framing ─────────────────────────────────────────────────────────
-// Low-level request parsing directly off a raw socket buffer (`buf: long`), used by the server's
-// connection reader to frame a request incrementally before the full bytes have arrived: find the
-// header terminator, read Content-Length / detect chunked, decode a chunked body, and pull the
-// method + path. These complement the string-based Request.fromString for the streaming read path.
-// (buf is `long`: pointer math must stay 64-bit, so offsets are added at long width.)
 
 fn lowerByte(b: int): int {
     if (b >= 65 && b <= 90) { return b + 32; }
@@ -344,9 +326,6 @@ pub fn bufMethodPath(buf: long, len: int): (string, string) {
     return (method, path);
 }
 
-// ── Path parsing ──────────────────────────────────────────────────────────────
-// Split a request path into its non-empty segments, and a typed-parameter validator. Used by the
-// App router to match a path against its route table.
 
 pub fn pathSegs(path: string): List<string> {
     let out = List<string>();
@@ -373,11 +352,6 @@ pub fn isAllDigits(s: string): bool {
     return true;
 }
 
-// ── Request body parsing ──────────────────────────────────────────────────────
-// Parse a form body (application/x-www-form-urlencoded or multipart/form-data) into a ValueSource so a
-// handler binds it the same way it binds a JSON body. A form field can repeat, so the backing store maps
-// each key to a List<string>; MultiMapSource exposes the first value for scalar reads and the whole list
-// for array reads.
 
 pub struct MultiMapSource impl ValueSource {
     pub fields: Map<string, List<string>>,
@@ -390,7 +364,7 @@ pub struct MultiMapSource impl ValueSource {
         return (l ?? List<string>()).get(0) ?? "";
     }
     pub fn getStr(self: MultiMapSource, key: string): str.Str {
-        return str.of(self.getString(key));   // borrows the string held in self.fields
+        return str.of(self.getString(key));
     }
     pub fn getInt(self: MultiMapSource, key: string): long { return string.parseI64(self.getString(key)); }
     pub fn getBool(self: MultiMapSource, key: string): bool { return string.eql(self.getString(key), "true"); }

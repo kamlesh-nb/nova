@@ -4,8 +4,6 @@ import mem.allocator;
 import string;
 import os.sys;
 
-// File I/O in Nova over the raw POSIX syscalls in os/sys (M5). A File holds an open file
-// descriptor; read/write/seek/close are the syscalls directly, with no C stdio buffering.
 pub struct File {
     pub fd: int,
     pub path: string,
@@ -24,9 +22,6 @@ pub struct File {
         return sys.read(self.fd, buf, size as long) as int;
     }
 
-    // Read up to `size` bytes, looping over short reads until full or end of file, returning the
-    // total read. A single read(2) may return fewer bytes than requested, so readAll loops. The
-    // running offset is computed on a long base (heap addresses are 64-bit; see CLAUDE.md).
     pub fn readAll(self: File, buf: ptr, size: int): int {
         if (self.fd < 0) { return -1; }
         let base = buf as long;
@@ -56,8 +51,6 @@ pub struct File {
         return total;
     }
 
-    // Write a whole string. A single write(2) on a regular file writes it all (the old stdio path
-    // did one fwrite here); the return is the byte count written, or -1 on a bad descriptor.
     pub fn writeString(self: File, s: string): int {
         if (self.fd < 0) { return -1; }
         return sys.write(self.fd, s, s.length as long) as int;
@@ -73,8 +66,6 @@ pub struct File {
         return sys.lseek(self.fd, 0, sys.SEEK_CUR);
     }
 
-    // At end of file when the current offset is at or past the file size. A raw fd has no feof,
-    // so this reads the position and the end offset and restores the position.
     pub fn eof(self: File): bool {
         if (self.fd < 0) { return true; }
         let cur = sys.lseek(self.fd, 0, sys.SEEK_CUR);
@@ -83,8 +74,6 @@ pub struct File {
         return cur >= end;
     }
 
-    // fd writes are unbuffered (handed straight to the kernel), so flush is a no-op that
-    // succeeds. Use fsync explicitly for durability.
     pub fn flush(self: File): int {
         return 0;
     }
@@ -141,9 +130,6 @@ pub struct File {
         sys.close(fd);
     }
 
-    // Like writeText, but reports whether the write actually succeeded: false if the file could not be
-    // opened (e.g. EACCES) or the write was short/failed. Callers writing to privileged sinks (cgroup
-    // limits, sysfs) need this to avoid a SILENT downgrade when the write is rejected.
     pub fn writeTextOk(path: string, content: string): bool {
         let fd = openFd(path, "w");
         if (fd < 0) { return false; }
@@ -162,7 +148,6 @@ pub struct File {
     }
 }
 
-// Map a stdio-style mode string to open(2) flags and open the file (mode 0644 for created files).
 fn openFd(path: string, mode: string): int {
     let flags = sys.O_RDONLY;
     if (mode == "r") {

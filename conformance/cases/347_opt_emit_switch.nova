@@ -1,12 +1,3 @@
-// Emit-subset growth (C1): a `switch` on an integer discriminant now emits. lower_ast_hir desugars it to an
-// if-chain -- the discriminant is bound once, each case tests `disc == v0 | disc == v1 | ...` (an OR of eq
-// compares, which are side-effect-free so no short-circuit is needed) and runs its body, falling through to
-// the default otherwise. A GUARDED case (`case v if cond`) has fall-to-default-on-guard-false semantics this
-// desugaring does not model, so a guarded switch falls back to the AST. ENUM and STRING discriminants are out
-// of the emit subset here (enum awaits enum-in-emit; string is rejected language-wide), and fall back too.
-// Under NOVA_OPT_EMIT these integer-discriminant helpers compile from the emit path; both must agree, so this
-// case exercises multi-value cases, a default, a no-default fall-through, a `long` discriminant with a NEGATIVE
-// label, an expression discriminant, and a nested switch.
 import assert;
 
 fn classify(x: int): int {
@@ -27,7 +18,6 @@ fn parity(x: int): int {
     return -1;
 }
 
-// No default: an unmatched discriminant falls through to the code AFTER the switch.
 fn noDefault(x: int): int {
     switch (x) {
         case 7: { return 70; }
@@ -36,7 +26,6 @@ fn noDefault(x: int): int {
     return -5;
 }
 
-// `long` discriminant, including a NEGATIVE case label (unary `-` on the label).
 fn sign(n: long): int {
     switch (n) {
         case -1: { return -10; }
@@ -46,7 +35,6 @@ fn sign(n: long): int {
     return 99;
 }
 
-// Nested switch: the inner switch lives inside a case body of the outer one.
 fn nested(x: int, y: int): int {
     switch (x) {
         case 0: {

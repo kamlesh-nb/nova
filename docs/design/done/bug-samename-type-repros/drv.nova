@@ -1,15 +1,12 @@
-// The "driver" module: imports the seam (which ALSO exports `Cursor`) AND declares its own `Cursor`
-// with a DIFFERENT layout {a@0, b@8, c@16, big@24, batch@... , pos@...}. find(): Cursor must return
-// the LOCAL Cursor -- if the return-type annotation binds to seam.Cursor, the caller mis-dispatches.
 import list;
 import string;
 import seam;
 pub struct Doc { pub name: string, init(n: string) { self.name = n; } }
 pub struct Cursor {
-    pub a: int,                // @0
-    pub b: int,                // @4/8
+    pub a: int,
+    pub b: int,
     pub c: int,
-    pub batch: list.List<Doc>, // different element type + different offset than seam.Cursor.batch
+    pub batch: list.List<Doc>,
     pub pos: int,
     init() { self.a = 111; self.b = 222; self.c = 333; self.batch = list.List<Doc>(); self.pos = 0; }
     pub fn next(self: Cursor): string {

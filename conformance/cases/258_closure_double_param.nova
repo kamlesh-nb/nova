@@ -1,17 +1,10 @@
-// Regression: a closure/lambda whose parameter is a `double` used to fail LLVM verification. The
-// closure ABI is a uniform i64 value-word (the thunk bitcasts back to the real param type), but the
-// call site passed a raw `double` instead of coercing it to the value-word -> "Call parameter type
-// does not match function signature" at codegen. Because List<T> dispatches element handling through
-// an internal closure, this ALSO broke List<double> (and List<float>) entirely -- push/get/set all
-// miscompiled. Fixed in codegen/expressions.zig buildClosureCall (coerce args to the value-word,
-// symmetric to the thunk's cast). Guards the float-closure and float-container path.
 import list;
 import assert;
 
 @test
 fn closure_double_param(): void {
     let f = (x: double) => x * 2.0;
-    let r = f(3.5);                       // was: LLVM verification failure at compile time
+    let r = f(3.5);
     assert.isTrue(r > 6.9);
     assert.isTrue(r < 7.1);
 }
@@ -26,7 +19,6 @@ fn closure_double_two_params(): void {
 
 @test
 fn closure_mixed_int_double(): void {
-    // an int param (already the value-word) alongside a double param (needs coercion)
     let g = (k: int, v: double) => v * 3.0;
     let r = g(7, 1.5);
     assert.isTrue(r > 4.4);
@@ -53,5 +45,5 @@ fn list_double_set_and_sum(): void {
     let sum = 0.0;
     let j = 0;
     while (j < a.size()) { sum = sum + (a.get(j) ?? 0.0); j = j + 1; }
-    assert.isTrue(sum > 7.9 && sum < 8.1);        // 10.5 + 0 + 0 + 0 - 2.5 = 8.0
+    assert.isTrue(sum > 7.9 && sum < 8.1);
 }

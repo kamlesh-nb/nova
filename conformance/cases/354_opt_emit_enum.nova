@@ -1,42 +1,28 @@
-// Emit-subset growth (C5): a PAYLOADLESS enum now emits. A payloadless enum value (`Color.Red`) is a plain
-// integer discriminant word -- the AST backend materialises it as `LLVMConstInt(val_type, v.value orelse
-// idx)` and passes a `Color` param as that same i64 word, comparing two of them with a signed `icmp`. The
-// emit path folds the `EnumName.Variant` access to its discriminant constant (keeping the enum TypeId), and
-// classifies a payloadless-enum type as a signed 64-bit int, so read / compare (`==`, `!=`) / return / switch
-// all emit byte-identically to the AST. Because C1 desugars a `switch` to an if-chain of `disc == vK` eq
-// compares, an enum switch emits for free once enum values are in the subset. A TAGGED (payload-carrying)
-// enum builds a heap box with a different ABI and stays on the AST path. Under NOVA_OPT_EMIT these helpers
-// compile from the emit path; both modes must agree.
 import assert;
 
 enum Color { Red, Green, Blue }
 
-// Explicit discriminant values (the AST uses `v.value` verbatim; default-numbered variants use the index).
 enum HttpCode { Ok = 200, NotFound = 404, Teapot = 418 }
 
 enum State { Idle, Run, Done }
 
-// Read + compare (`==`) a passed-in enum.
 fn classify(c: Color): int {
     if (c == Color.Green) { return 1; }
     if (c == Color.Blue) { return 2; }
     return 0;
 }
 
-// `!=` compare.
 fn notRed(c: Color): int {
     if (c != Color.Red) { return 5; }
     return 9;
 }
 
-// Explicit-valued enum, multiple compares.
 fn code(c: HttpCode): int {
     if (c == HttpCode.NotFound) { return 1; }
     if (c == HttpCode.Teapot) { return 2; }
     return 0;
 }
 
-// switch on an enum discriminant (desugared to an if-chain of eq compares by C1).
 fn turn(s: State): int {
     switch (s) {
         case State.Idle: { return 10; }
@@ -47,13 +33,11 @@ fn turn(s: State): int {
     return -1;
 }
 
-// Return an enum value, then compare the result.
 fn next(s: State): State {
     if (s == State.Idle) { return State.Run; }
     return State.Done;
 }
 
-// An enum LOCAL bound from a param.
 fn viaLocal(c: Color): int {
     let cur: Color = c;
     if (cur == Color.Red) { return 100; }

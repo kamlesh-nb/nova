@@ -1,9 +1,3 @@
-// HMAC (RFC 2104) over the Nova SHA-2 hashes, no external library (M9 phase A). HMAC is the MAC and
-// the building block of the HKDF key schedule and the TLS 1.2 PRF. This is pure protocol composition
-// over the hash primitives, so there is nothing timing-sensitive beyond the hash itself.
-//
-// HMAC(K, m) = H((K' ^ opad) || H((K' ^ ipad) || m)), where K' is K hashed down to the block size if
-// it is longer, else K zero-padded to the block size. Verified against RFC 4231 (conformance case 218).
 import bytes;
 import crypto.hash.sha1;
 import crypto.hash.sha256;
@@ -17,8 +11,6 @@ pub const HMAC_SHA256_LEN: int = 32;
 pub const HMAC_SHA384_LEN: int = 48;
 pub const HMAC_SHA512_LEN: int = 64;
 
-// HMAC-SHA1. Writes 20 bytes to out. Legacy: needed for SCRAM-SHA-1 (MongoDB users created < 4.0) and
-// PBKDF2-HMAC-SHA1. Same composition as HMAC-SHA256, block size 64, digest 20.
 pub fn hmacSha1(key: ptr, keyLen: int, msg: ptr, msgLen: int, out: ptr): void {
     let bs = sha1.SHA1_BLOCK_LEN;
     let dl = sha1.SHA1_DIGEST_LEN;
@@ -55,7 +47,6 @@ pub fn hmacSha1(key: ptr, keyLen: int, msg: ptr, msgLen: int, out: ptr): void {
     bytes.free(ih);
 }
 
-// HMAC-SHA256. Writes 32 bytes to out.
 pub fn hmacSha256(key: ptr, keyLen: int, msg: ptr, msgLen: int, out: ptr): void {
     let bs = sha256.SHA256_BLOCK_LEN;
     let dl = sha256.SHA256_DIGEST_LEN;
@@ -92,7 +83,6 @@ pub fn hmacSha256(key: ptr, keyLen: int, msg: ptr, msgLen: int, out: ptr): void 
     bytes.free(ih);
 }
 
-// HMAC over SHA-384 (is384 true) or SHA-512 (false). dl is the digest length (48 or 64).
 fn hmac512Core(is384: bool, dl: int, key: ptr, keyLen: int, msg: ptr, msgLen: int, out: ptr): void {
     let bs = sha512.SHA512_BLOCK_LEN;
     let k0 = bytes.alloc(bs);
@@ -128,12 +118,10 @@ fn hmac512Core(is384: bool, dl: int, key: ptr, keyLen: int, msg: ptr, msgLen: in
     bytes.free(ih);
 }
 
-// HMAC-SHA384. Writes 48 bytes to out.
 pub fn hmacSha384(key: ptr, keyLen: int, msg: ptr, msgLen: int, out: ptr): void {
     hmac512Core(true, HMAC_SHA384_LEN, key, keyLen, msg, msgLen, out);
 }
 
-// HMAC-SHA512. Writes 64 bytes to out.
 pub fn hmacSha512(key: ptr, keyLen: int, msg: ptr, msgLen: int, out: ptr): void {
     hmac512Core(false, HMAC_SHA512_LEN, key, keyLen, msg, msgLen, out);
 }

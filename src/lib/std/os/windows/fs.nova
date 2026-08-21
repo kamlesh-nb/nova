@@ -1,43 +1,25 @@
-// os/winfs: Win32 file, directory and environment APIs for the Windows target (windows-only).
-// Companion to os/winsock (sockets) and os/windows (IOCP): raw `extern("c")` bindings only, no
-// policy. os/sys_windows wraps these behind the backend-neutral os/sys surface, exactly as
-// os/socket_windows wraps os/winsock.
-//
-// Why Win32 and not the UCRT's POSIX shims: MSVC's CRT has no <dirent.h> at all (opendir/readdir/
-// closedir are undefined symbols), its open() flag VALUES differ from the macOS/BSD ones os/sys
-// declares, its `struct stat` puts st_mode at a different offset, and its narrow (A) entry points
-// mangle non-ASCII paths. The W entry points here take UTF-16 and are the actual system surface.
-//
-// Handles are HANDLE (pointer-sized) and so are `long`. Callers that keep an int fd model truncate
-// at the os/sys boundary — real Win32 handle values are 32-bit significant, the same assumption
-// os/socket_windows already makes for SOCKET.
 
 import bytes;
 
-// --- constants -------------------------------------------------------------------------------
-// Access rights. GENERIC_READ is 0x80000000, which does not fit a signed 32-bit literal, so it is
-// written as a shift; the bit pattern is what the ABI passes and is what the kernel reads.
-pub const GENERIC_READ: int = 1 << 31;      // 0x80000000
-pub const GENERIC_WRITE: int = 1 << 30;     // 0x40000000
-pub const FILE_APPEND_DATA: int = 4;        // 0x0004 — writes always go to EOF: the O_APPEND equivalent
+pub const GENERIC_READ: int = 1 << 31;
+pub const GENERIC_WRITE: int = 1 << 30;
+pub const FILE_APPEND_DATA: int = 4;
 
 pub const FILE_SHARE_READ: int = 1;
 pub const FILE_SHARE_WRITE: int = 2;
 pub const FILE_SHARE_DELETE: int = 4;
 
-// dwCreationDisposition
 pub const CREATE_NEW: int = 1;
-pub const CREATE_ALWAYS: int = 2;           // create, truncating an existing file (O_CREAT|O_TRUNC)
+pub const CREATE_ALWAYS: int = 2;
 pub const OPEN_EXISTING: int = 3;
-pub const OPEN_ALWAYS: int = 4;             // open, creating if absent (O_CREAT without O_TRUNC)
+pub const OPEN_ALWAYS: int = 4;
 pub const TRUNCATE_EXISTING: int = 5;
 
-pub const FILE_ATTRIBUTE_NORMAL: int = 128;         // 0x80
-pub const FILE_ATTRIBUTE_DIRECTORY: int = 16;       // 0x10
-pub const FILE_ATTRIBUTE_REPARSE_POINT: int = 1024; // 0x400 — symlinks/junctions
-pub const INVALID_FILE_ATTRIBUTES: int = -1;        // 0xFFFFFFFF
+pub const FILE_ATTRIBUTE_NORMAL: int = 128;
+pub const FILE_ATTRIBUTE_DIRECTORY: int = 16;
+pub const FILE_ATTRIBUTE_REPARSE_POINT: int = 1024;
+pub const INVALID_FILE_ATTRIBUTES: int = -1;
 
-// SetFilePointerEx dwMoveMethod — same ordering as SEEK_SET/CUR/END.
 pub const FILE_BEGIN: int = 0;
 pub const FILE_CURRENT: int = 1;
 pub const FILE_END: int = 2;
@@ -46,32 +28,23 @@ pub const MOVEFILE_REPLACE_EXISTING: int = 1;
 
 pub const CP_UTF8: int = 65001;
 
-// VirtualAlloc/VirtualFree (the mmap page source).
-pub const MEM_COMMIT: int = 4096;    // 0x1000
-pub const MEM_RESERVE: int = 8192;   // 0x2000
-pub const MEM_RELEASE: int = 32768;  // 0x8000
+pub const MEM_COMMIT: int = 4096;
+pub const MEM_RESERVE: int = 8192;
+pub const MEM_RELEASE: int = 32768;
 pub const PAGE_READWRITE: int = 4;
 
 pub const INVALID_HANDLE: long = -1;
 
-// WIN32_FIND_DATAW (x64, 592 bytes): [0] dwFileAttributes, [4][12][20] FILETIMEs, [28] nFileSizeHigh,
-// [32] nFileSizeLow, [36][40] reserved, [44] cFileName[260] (UTF-16), [564] cAlternateFileName[14].
 pub const FIND_DATA_SIZE: int = 592;
 pub const FIND_DATA_NAME_OFF: int = 44;
 pub const FIND_DATA_ATTR_OFF: int = 0;
 
-// --- string conversion -----------------------------------------------------------------------
-// Nova/POSIX paths arrive as UTF-8 byte strings; every W entry point takes UTF-16. A negative
-// source length means "NUL-terminated, and convert the terminator too"; a zero destination length
-// means "return the required size instead of converting".
 pub extern("c") fn MultiByteToWideChar(codePage: int, flags: int, src: ptr, srcLen: int, dst: ptr, dstLen: int): int;
 pub extern("c") fn WideCharToMultiByte(codePage: int, flags: int, src: ptr, srcLen: int, dst: ptr, dstLen: int, defaultChar: ptr, usedDefault: ptr): int;
 
-// --- files -----------------------------------------------------------------------------------
 pub extern("c") fn CreateFileW(path: ptr, access: int, share: int, sa: ptr, disposition: int, flags: int, template_: long): long;
 pub extern("c") fn ReadFile(h: long, buf: ptr, toRead: int, got: ptr, ov: ptr): int;
 pub extern("c") fn WriteFile(h: long, buf: ptr, toWrite: int, wrote: ptr, ov: ptr): int;
-// LARGE_INTEGER is passed by value (8 bytes); newPos receives the resulting absolute offset.
 pub extern("c") fn SetFilePointerEx(h: long, distance: long, newPos: ptr, method: int): int;
 pub extern("c") fn FlushFileBuffers(h: long): int;
 pub extern("c") fn CloseHandle(h: long): int;
@@ -79,34 +52,23 @@ pub extern("c") fn GetFileAttributesW(path: ptr): int;
 pub extern("c") fn DeleteFileW(path: ptr): int;
 pub extern("c") fn MoveFileExW(from: ptr, to: ptr, flags: int): int;
 
-// --- directories -----------------------------------------------------------------------------
 pub extern("c") fn CreateDirectoryW(path: ptr, sa: ptr): int;
 pub extern("c") fn RemoveDirectoryW(path: ptr): int;
-// nBufferLength counts WCHARs; returns the length written (or the size needed if the buffer is short).
 pub extern("c") fn GetCurrentDirectoryW(bufLen: int, buf: ptr): int;
 pub extern("c") fn SetCurrentDirectoryW(path: ptr): int;
-// FindFirstFileW enumerates a PATTERN ("dir\*"), not a directory, and yields the first entry itself.
 pub extern("c") fn FindFirstFileW(pattern: ptr, data: ptr): long;
 pub extern("c") fn FindNextFileW(h: long, data: ptr): int;
 pub extern("c") fn FindClose(h: long): int;
 
-// --- memory ----------------------------------------------------------------------------------
 pub extern("c") fn VirtualAlloc(addr: ptr, size: long, allocType: int, protect: int): ptr;
 pub extern("c") fn VirtualFree(addr: ptr, size: long, freeType: int): int;
 
-// --- environment -----------------------------------------------------------------------------
-// _putenv_s, not SetEnvironmentVariableW: the UCRT caches the environment in its own block, which
-// getenv() reads and SetEnvironmentVariable* does NOT update — using the Win32 setter alone makes
-// getenv blind to writes. _putenv_s updates the CRT copy AND the Win32 block, keeping them coherent.
 pub extern("c") fn _putenv_s(name: ptr, value: ptr): int;
 
 pub extern("c") fn GetLastError(): int;
 
-// --- helpers ---------------------------------------------------------------------------------
-// Convert a NUL-terminated UTF-8 C string to a freshly allocated NUL-terminated UTF-16 buffer.
-// The caller owns the result and must bytes.free it. Returns 0 if the conversion fails.
 pub fn widen(utf8: ptr): ptr {
-    let n = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, 0 as ptr, 0);   // -1: include the terminator
+    let n = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, 0 as ptr, 0);
     if (n <= 0) { return 0 as ptr; }
     let w = bytes.alloc(n * 2);
     if (MultiByteToWideChar(CP_UTF8, 0, utf8, -1, w, n) <= 0) {
@@ -116,8 +78,6 @@ pub fn widen(utf8: ptr): ptr {
     return w;
 }
 
-// Convert a NUL-terminated UTF-16 buffer to UTF-8 bytes written at `dst`, capped at `dstLen`
-// (terminator included). Returns the number of bytes written, or 0 on failure.
 pub fn narrowInto(utf16: ptr, dst: ptr, dstLen: int): int {
     let n = WideCharToMultiByte(CP_UTF8, 0, utf16, -1, dst, dstLen, 0 as ptr, 0 as ptr);
     return if (n > 0) n else 0;

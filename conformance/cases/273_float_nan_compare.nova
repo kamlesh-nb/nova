@@ -1,18 +1,15 @@
-// H5: float `!=` must be unordered-not-equal (UNE) so IEEE `nan != nan` is true, while `==`
-// stays ordered (OEQ) so `nan == nan` is false. Previously `!=` compiled to ordered ONE, which
-// is false when either operand is NaN, so `nan != nan` wrongly returned false.
 import assert;
 
 @test
 fn test_nan_not_equal_itself(): void {
     let nan = 0.0 / 0.0;
-    assert.isTrue(nan != nan);   // IEEE: true
+    assert.isTrue(nan != nan);
 }
 
 @test
 fn test_nan_not_equal_by_eq(): void {
     let nan = 0.0 / 0.0;
-    assert.isFalse(nan == nan);  // IEEE: false
+    assert.isFalse(nan == nan);
 }
 
 @test

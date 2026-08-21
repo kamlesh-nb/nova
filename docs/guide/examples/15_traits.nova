@@ -1,8 +1,3 @@
-// examples/15_traits.nova
-// A trait is an interface: a set of method signatures. A struct declares
-// `impl Trait` and provides the methods; calls through a trait-typed binding
-// dispatch dynamically (via a vtable). A trait value can be downcast back to a
-// concrete type with `as`. Traits may also be generic over type parameters.
 
 trait Speaker {
     fn speak(self: Speaker): string;
@@ -18,18 +13,15 @@ struct Cat impl Speaker {
     pub fn speak(self: Cat): string { return `${self.name} says meow`; }
 }
 
-// A factory returning a trait object: the caller sees only `Speaker`.
 fn make(kind: string): Speaker {
     if (kind == "dog") { return Dog{ name: "Rex" }; }
     return Cat{ name: "Milo" };
 }
 
-// Dispatch through a trait-typed parameter.
 fn announce(s: Speaker): void {
     console.log(s.speak());
 }
 
-// ---- Generic trait: type parameters appear in the method signature ----
 trait Handler<Q, R> {
     fn handle(self, req: Q): R;
 }
@@ -37,32 +29,26 @@ trait Handler<Q, R> {
 struct GetUser { pub id: int }
 struct UserDto { pub id: int, pub name: string }
 
-// One concrete instantiation: Handler<GetUser, UserDto>.
 struct GetUserHandler impl Handler<GetUser, UserDto> {
     fn handle(self, req: GetUser): UserDto {
         return UserDto{ id: req.id, name: "Ada" };
     }
 }
 
-// A different instantiation of the SAME trait: Handler<int, int>.
 struct Doubler impl Handler<int, int> {
     fn handle(self, n: int): int { return n + n; }
 }
 
 fn main(): void {
-    // Dynamic dispatch: same call site, different runtime type.
     announce(Dog{ name: "Rex" });
     announce(Cat{ name: "Milo" });
 
-    // Factory returns a trait object.
     let s = make("dog");
     console.log(`factory: ${s.speak()}`);
 
-    // Downcast a trait value back to its concrete type with `as`.
     let d = s as Dog;
     console.log(`downcast name = ${d.name}`);
 
-    // Generic trait, two instantiations.
     let h = GetUserHandler{};
     let dto = h.handle(GetUser{ id: 7 });
     console.log(`handler -> id=${dto.id}, name=${dto.name}`);

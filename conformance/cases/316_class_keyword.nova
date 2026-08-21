@@ -1,11 +1,3 @@
-// M-1/M-2 Slice 1: the `class` keyword parses as a reference-type struct declaration.
-//
-// `class` is the reference-type spelling of a struct (heap + ARC + identity); `struct` is the
-// value-type spelling. See docs/design/memory-management-refinements.md. In Slice 1 the parser
-// records the distinction on StructDecl.is_reference but codegen ignores it, so a `class` behaves
-// exactly like today's struct: this case pins that a class declaration parses, type-checks, holds
-// owned fields, dispatches methods, and implements traits. When Slice 3 wires value-type lowering,
-// this case keeps the reference path honest.
 import assert;
 import list;
 import string;
@@ -17,7 +9,6 @@ pub class Point {
     pub fn sum(self: Point): int { return self.x + self.y; }
 }
 
-// A class holding an owned (reference) field, to exercise ARC through the reference path.
 pub class Bag {
     items: list.List<string>,
     init() { self.items = list.List<string>(); }

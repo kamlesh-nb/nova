@@ -1,9 +1,4 @@
 // EXPECT-FAIL: typecheck
-// C3: a struct literal must initialize EVERY declared field — fields have no defaults, so an omitted
-// field is left null/zero. For a trait- or owned-typed field, that null SEGVs on first use
-// (`Holder{}` → `h.g.v()` derefs a null vtable). This was found unvalidated during the A3 adversarial
-// sweep: it compiled and crashed at runtime instead of being a located compile error. A field-LESS
-// struct literal (`Marker{}`) stays valid — there is nothing to initialize.
 import assert;
 
 trait G { fn v(self: G): int; }
@@ -12,6 +7,6 @@ struct Holder { pub g: G }
 
 @test
 fn t(): void {
-    let h = Holder{};          // missing field 'g' — must be rejected
+    let h = Holder{};
     assert.equalInt(h.g.v(), 3);
 }

@@ -1,8 +1,3 @@
-// G2: a switch over an integer discriminant must lower to a real integer switch. Previously the case
-// labels were only evaluated when the discriminant type was unknown; a discriminant with a known
-// integer type (`int`, `long`, ...) fell through with EVERY case label collapsed to 0, producing a
-// "duplicate switch case" LLVM verifier crash (or the wrong branch). Now integer literal labels
-// (including negative ones via unary `-`) are evaluated correctly. Enum switch is unaffected.
 import assert;
 
 fn classify(n: int): string {
@@ -39,7 +34,6 @@ fn test_switch_long_negative(): void {
     assert.equalInt(sign(42), 99);
 }
 
-// Enum switch still works alongside the integer path.
 enum Color { Red, Green, Blue }
 
 fn name(c: Color): string {

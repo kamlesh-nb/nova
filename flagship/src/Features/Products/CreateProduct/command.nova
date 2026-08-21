@@ -1,5 +1,3 @@
-// The command: what the client sends to create a product. @serializable makes the
-// compiler generate its binder so `CreateProduct{ name: src.getString("name") }` works.
 @serializable pub struct CreateProduct {
     pub name: string,
     pub price: int,

@@ -1,6 +1,3 @@
-// NEGATIVE test: must FAIL to compile.
-// Returning an i32 literal from a string-returning function is a type error
-// (A3 — return-type checking, enabled after the resolver became accurate).
 fn f(): string {
     return 42;
 }

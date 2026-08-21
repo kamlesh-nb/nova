@@ -1,5 +1,3 @@
-// X25519 (RFC 7748) implemented in Nova (M9 phase C, no external library). Verified against the
-// RFC 7748 section 5.2 scalar-multiply vector and the section 6.1 Diffie-Hellman key agreement.
 import crypto.ecc.x25519;
 import bytes;
 import assert;
@@ -42,7 +40,6 @@ fn base9(): ptr {
     return b;
 }
 
-// RFC 7748 section 5.2.
 @test
 fn rfc7748_scalarmult(): void {
     let scalar = hexBuf("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4");
@@ -52,7 +49,6 @@ fn rfc7748_scalarmult(): void {
     assert.isTrue(eqHex(out, 32, "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552"));
 }
 
-// RFC 7748 section 6.1: public keys from private keys (scalar times the base point 9).
 @test
 fn rfc7748_pubkeys(): void {
     let alicePriv = hexBuf("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
@@ -66,7 +62,6 @@ fn rfc7748_pubkeys(): void {
     assert.isTrue(eqHex(bobPub, 32, "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f"));
 }
 
-// RFC 7748 section 6.1: both sides compute the same shared secret.
 @test
 fn rfc7748_ecdh_agreement(): void {
     let alicePriv = hexBuf("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");

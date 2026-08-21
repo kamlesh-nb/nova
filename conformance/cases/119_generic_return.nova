@@ -1,9 +1,3 @@
-// A1 / F4: generic-return type substitution in the type checker. A call `foo<int>()` to a generic
-// `fn foo<T>(...): <ret>` now resolves its result type by substituting the type ARGUMENTS into the
-// declared return — so `T` becomes `int`, `List<T>` becomes `List<int>`, `T | undefined` becomes
-// `int | undefined`. Before, the result was left as the abstract `T`, so a concrete-typed use of a
-// generic call's result could not be checked (and a genuine mismatch slipped through — see
-// expect_fail/generic_return_mismatch).
 import assert;
 import list;
 
@@ -23,7 +17,6 @@ fn addOne(n: int): int { return n + 1; }
 
 @test
 fn test_bare_type_param_return(): void {
-    // `identity<int>` returns int — assignable to an int local, and usable where int is required.
     let n: int = identity<int>(41);
     assert.equalInt(n, 41);
     assert.equalInt(addOne(identity<int>(9)), 10);
@@ -31,14 +24,12 @@ fn test_bare_type_param_return(): void {
 
 @test
 fn test_multi_param_return(): void {
-    // `pair_first<int, string>` returns the FIRST type param -> int.
     let a: int = pair_first<int, string>(7, "ignored");
     assert.equalInt(a, 7);
 }
 
 @test
 fn test_generic_container_return(): void {
-    // `wrap_list<int>` returns List<int> -> its element is an int.
     let xs = wrap_list<int>(99);
     assert.equalInt(xs.size(), 1);
     assert.equalInt(xs.at(0), 99);
@@ -46,7 +37,6 @@ fn test_generic_container_return(): void {
 
 @test
 fn test_optional_return_substituted(): void {
-    // `maybe<int>` returns `int | undefined` — `??` yields an int.
     let got = maybe<int>(5, true) ?? 0;
     assert.equalInt(got, 5);
     let none = maybe<int>(5, false) ?? -1;
@@ -55,12 +45,8 @@ fn test_optional_return_substituted(): void {
 
 @test
 fn test_generic_optional_value_zero(): void {
-    // FREE-FN MONOMORPHIZATION + V1: a generic free fn returning `T | undefined` is now specialized
-    // per type-arg (`maybe__int`), so a value-typed optional return is BOXED — a present `0` is
-    // distinct from `undefined`. Before free-fn mono the erased body collapsed them (present-0 read
-    // as absent). Present-0 must survive; a real miss must still be absent.
-    assert.zero(maybe<int>(0, true) ?? 99);          // present 0 → 0, NOT the default
-    assert.equalInt(maybe<int>(0, false) ?? 99, 99); // genuine miss → default
+    assert.zero(maybe<int>(0, true) ?? 99);
+    assert.equalInt(maybe<int>(0, false) ?? 99, 99);
     let got = maybe<int>(0, true);
     if (got != undefined) { assert.zero(got); } else { assert.fail("present-0 wrongly absent"); }
 }

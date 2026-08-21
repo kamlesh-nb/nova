@@ -1,54 +1,45 @@
-// `string.parseI64` — named for 64-bit — returned `int` (32-bit) and accumulated in an `int`, so any
-// value >= 2^31 OVERFLOWED and wrapped (`parseI64("2147483648")` → -2147483648). Callers that return
-// `long` and route through it silently corrupted large numbers: MultiMapSource.getInt / itemInt
-// (query/form binding), json.asNumber, serde ParamSource.getInt, yaml numbers. Fix: accumulate and
-// return `long`; the few callers that assign to an `int` (URL port, HTTP status code) cast `as int`.
 
 import assert;
 import string;
 
 @test
 fn test_values_at_and_beyond_int32(): void {
-    assert.isTrue(string.parseI64("2147483647") == 2147483647);     // int32 max — was already ok
-    assert.isTrue(string.parseI64("2147483648") == 2147483648);     // int32 max + 1 — WRAPPED before
-    assert.isTrue(string.parseI64("9999999999") == 9999999999);     // 10 digits
+    assert.isTrue(string.parseI64("2147483647") == 2147483647);
+    assert.isTrue(string.parseI64("2147483648") == 2147483648);
+    assert.isTrue(string.parseI64("9999999999") == 9999999999);
     assert.isTrue(string.parseI64("1000000000000") == 1000000000000);
 }
 
 @test
 fn test_negatives_and_edges(): void {
-    assert.isTrue(string.parseI64("-5000000000") == -5000000000);   // large negative, no wrap
+    assert.isTrue(string.parseI64("-5000000000") == -5000000000);
     assert.isTrue(string.parseI64("-17") == -17);
     assert.isTrue(string.parseI64("0") == 0);
-    assert.isTrue(string.parseI64("") == 0);                        // empty → 0 (graceful)
+    assert.isTrue(string.parseI64("") == 0);
 }
 
 @test
 fn test_small_values_unchanged(): void {
     assert.isTrue(string.parseI64("42") == 42);
-    assert.isTrue(string.parseI64("200") == 200);                   // HTTP-code-sized still fine
+    assert.isTrue(string.parseI64("200") == 200);
 }
 
-// G4: the parser used to accumulate magnitude in POSITIVE space (wrong / near-miss at i64 MIN), SILENTLY
-// SKIP embedded non-digits (so "1a2" became 12, not 1), and had NO overflow detection (large inputs
-// wrapped to garbage). It now accumulates in negative space, stops at the first non-digit, and clamps to
-// the signed 64-bit bound on overflow.
 @test
 fn test_i64_bounds_exact(): void {
-    assert.isTrue(string.parseI64("9223372036854775807") == 9223372036854775807);    // i64 MAX exactly
-    assert.isTrue(string.parseI64("-9223372036854775808") == -9223372036854775808);  // i64 MIN exactly
+    assert.isTrue(string.parseI64("9223372036854775807") == 9223372036854775807);
+    assert.isTrue(string.parseI64("-9223372036854775808") == -9223372036854775808);
 }
 
 @test
 fn test_leading_sign_and_tail(): void {
-    assert.isTrue(string.parseI64("+7") == 7);                      // explicit leading '+'
-    assert.isTrue(string.parseI64("12abc") == 12);                 // lenient trailing tail, like strtol
-    assert.isTrue(string.parseI64("1a2") == 1);                    // STOPS at the non-digit (was 12)
-    assert.isTrue(string.parseI64("-") == 0);                      // sign only → 0
+    assert.isTrue(string.parseI64("+7") == 7);
+    assert.isTrue(string.parseI64("12abc") == 12);
+    assert.isTrue(string.parseI64("1a2") == 1);
+    assert.isTrue(string.parseI64("-") == 0);
 }
 
 @test
 fn test_overflow_clamps_not_wraps(): void {
-    assert.isTrue(string.parseI64("99999999999999999999") == 9223372036854775807);    // clamp to MAX
-    assert.isTrue(string.parseI64("-99999999999999999999") == -9223372036854775808);  // clamp to MIN
+    assert.isTrue(string.parseI64("99999999999999999999") == 9223372036854775807);
+    assert.isTrue(string.parseI64("-99999999999999999999") == -9223372036854775808);
 }

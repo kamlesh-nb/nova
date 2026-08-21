@@ -1,13 +1,11 @@
-// The "db seam" module: exports a struct named Cursor with layout {source@0, batch@8, pos@16}.
 import list;
 pub struct Row { pub v: int, init(x: int) { self.v = x; } }
 pub struct Cursor {
-    pub source: int,          // @0
-    pub batch: list.List<Row>,// @8
-    pub pos: int,             // @16
+    pub source: int,
+    pub batch: list.List<Row>,
+    pub pos: int,
     init() { self.source = 0; self.batch = list.List<Row>(); self.pos = 0; }
     pub fn next(self: Cursor): int {
-        // reads self.batch (@8) as a List<Row> and returns its size
         return self.batch.size();
     }
 }

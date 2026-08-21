@@ -1,5 +1,3 @@
-// Async concurrency via NON-BLOCKING timers: 8 `go` tasks each sleep 200ms.
-// With async timers on the io_context, even 1 thread runs them concurrently.
 import assert;
 import datetime;
 async fn work(ms: int): int { await fiber.sleep(ms); return ms; }

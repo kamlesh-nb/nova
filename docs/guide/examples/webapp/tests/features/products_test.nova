@@ -28,8 +28,6 @@ fn testApp(): App {
     return app;
 }
 
-// Create a product, then read it back by its new id: the handler persists through the injected
-// repository, the transaction commits, and the logging behaviour tags the response.
 @test
 fn test_create_then_get(): void {
     let app = testApp();
@@ -43,7 +41,6 @@ fn test_create_then_get(): void {
     assert.isTrue(string.indexOf(got.body, "Widget") != -1);
 }
 
-// A product that does not exist is a 404 (the handler returns HttpError, the framework maps it).
 @test
 fn test_get_missing_404(): void {
     let app = testApp();
@@ -51,7 +48,6 @@ fn test_get_missing_404(): void {
     assert.equalInt(got.status.toCode(), 404);
 }
 
-// Invalid input is rejected by the ValidationBehavior with a 400, before the handler or transaction run.
 @test
 fn test_validation_400(): void {
     let app = testApp();

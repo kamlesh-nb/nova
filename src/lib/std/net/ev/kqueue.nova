@@ -1,47 +1,14 @@
-// net/eventloop: the completion-based EventLoop abstraction (step 2 of the reactor cross-platform work,
-// see docs and memory nova-reactor-eventloop-iocp). This is the macOS/BSD variant, selected by the
-// target-conditional file rule (platform.os == "darwin"); Linux (epoll) and Windows (IOCP) variants land
-// in eventloop_linux.nova / eventloop_windows.nova behind the SAME trait.
-//
-// The interface is COMPLETION-shaped (a proactor): a caller SUBMITS an I/O op describing a buffer, then
-// poll() reports COMPLETED ops with the byte count already filled in. On Windows this maps directly onto
-// IOCP (overlapped I/O + GetQueuedCompletionStatus). On macOS/Linux the native mechanism is readiness
-// (kqueue/epoll), so this backend EMULATES completion: submit() arms readiness, and poll() performs the
-// recv/send/accept into the op's buffer when the fd is ready and reports it as a completion. Callers get
-// one uniform model, and the reactor-native I/O layer (reactorio) is written once against it.
-//
-// OWNERSHIP INVARIANT: the op record and its buffer are CALLER-OWNED and MUST outlive the op (from submit
-// until it appears in a poll() completion). The coroutine awaiting the op keeps both alive on its
-// suspended frame; poll() only writes the result field. Nothing here allocates or frees the op/buffer.
 
 import bytes;
 import os.socket;
 import os.darwin.kqueue;
 
-// Op kinds.
 pub const OP_RECV: int = 0;
 pub const OP_SEND: int = 1;
 pub const OP_ACCEPT: int = 2;
 pub const OP_CONNECT: int = 3;
-// OP_RECVFD: readability that, on completion, recvmsg's ONE passed fd (SCM_RIGHTS) instead of bytes.
-// The op result is the received client fd (>=0), or -1 when the control channel closed / errored. Its
-// buf must be an 8-byte scratch: [0..4) payload sink, [4..8) receives the fd. This is the fd-passing
-// handoff receive op (a proxy hands the app a client socket; the app serves it directly).
 pub const OP_RECVFD: int = 4;
 
-// In-flight op record, raw fixed layout (40 bytes, 8-aligned pointer fields). NOT a Nova struct: poll()
-// writes `result`/`done` and the awaiting coroutine reads them back, which struct value-copy semantics
-// (shallow, pointer-fields-only) would not carry. Same discipline as struct kevent / the TicketCache.
-//   [0]  kind   i32
-//   [4]  fd     i32
-//   [8]  buf    ptr   (caller-owned payload buffer; recv target / send source)
-//   [16] len    i32
-//   [20] done   i32   (0 = submitted/pending, 1 = completed by poll; lets a read-deadline path tell a
-//                      completion from a bare timer wake without a negative sentinel)
-//   [24] token  ptr   (coroutine handle to resume; opaque to this layer)
-//   [32] result i64   (bytes transferred >= 0, or -1 on error; stored 8-byte so negatives round-trip —
-//                      read_i32 ZERO-extends, so a negative in an i32 slot would read back as a large
-//                      positive. filled on completion)
 pub const OP_SIZE: int = 40;
 
 pub fn makeOp(op: long, kind: int, fd: int, buf: long, len: int, token: long): void {
@@ -60,13 +27,8 @@ pub fn opLen(op: long): int { return bytes.read_i32(op, 16) as int; }
 pub fn opDone(op: long): int { return bytes.read_i32(op, 20) as int; }
 pub fn opToken(op: long): long { return bytes.read_ptr(op, 24); }
 pub fn opResult(op: long): int { return bytes.read_ptr(op, 32) as int; }
-// Mark the op completed with `r` bytes/status (called by poll on an I/O completion).
 pub fn setOpResult(op: long, r: int): void { bytes.write_ptr(op, 32, r as long); bytes.write_i32(op, 20, 1); }
 
-// Arm an op's readiness on a kqueue fd directly, carrying the op address as the udata token. This is the
-// submit path reactorio uses: the ReactorStream holds the kq (not the Poller struct), and the struct
-// only needs to own the event/completion buffers for poll(). kqueue is the shared state (the kq fd), so a
-// bare-kq submit and a struct poll() on the same kq cooperate. Mirrors Poller.submit.
 pub fn submit(kq: int, op: long): int {
     let kind = opKind(op);
     let fd = opFd(op);
@@ -76,20 +38,13 @@ pub fn submit(kq: int, op: long): int {
     return kqueue.registerOne(kq, fd, kqueue.EVFILT_READ, kqueue.EV_ADD, op);
 }
 
-// Cancel a still-armed read interest (used when a read-deadline op times out before completing).
 pub fn cancelRead(kq: int, fd: int): void {
     kqueue.registerOne(kq, fd, kqueue.EVFILT_READ, kqueue.EV_DELETE, 0);
 }
 
-// --- backend-neutral readiness surface (kept for the low-level readiness cases 192/194/195/210) --------
-// The completion API above is the go-forward path; these thin wrappers let net/reactor stay free of any
-// direct kqueue/epoll dependency so it compiles on every target. On kqueue they are the raw kevent ops.
-// Readiness backend: connect() is STARTED with a non-blocking connect and the op then awaits
-// writability, so the submit is not itself the connect. The IOCP backend sets this true —
-// see net/eventloop_windows.
 pub fn connectIsSubmitted(): bool { return false; }
 
-pub const EVENT_SIZE: int = 32;   // sizeof(struct kevent)
+pub const EVENT_SIZE: int = 32;
 
 pub fn armRead(kq: int, fd: int, token: long): int {
     return kqueue.registerOne(kq, fd, kqueue.EVFILT_READ, kqueue.EV_ADD, token);
@@ -97,14 +52,10 @@ pub fn armRead(kq: int, fd: int, token: long): int {
 pub fn armWrite(kq: int, fd: int, token: long): int {
     return kqueue.registerOne(kq, fd, kqueue.EVFILT_WRITE, kqueue.EV_ADD | kqueue.EV_ONESHOT, token);
 }
-// Abandon an op the awaiting coroutine gave up on, reporting whether the CALLER still owns the
-// record. On kqueue this is just deregistration: once the interest is gone nothing in the kernel
-// refers to the op, so the caller frees it as before and this returns false. The proactor backends
-// answer differently -- see the long note in net/eventloop_windows.
 pub fn abandonOp(kq: int, op: long): bool {
     if (op == (0 as long)) { return false; }
     cancelRead(kq, opFd(op));
-    return false;   // caller still owns it
+    return false;
 }
 
 pub fn cancelWrite(kq: int, fd: int): void {
@@ -119,26 +70,18 @@ pub fn evBytes(eventBuf: long, i: int): long { return kqueue.evData(eventBuf, i)
 pub fn evEof(eventBuf: long, i: int): bool { return (kqueue.evFlags(eventBuf, i) & kqueue.EV_EOF) != 0; }
 pub fn evFilterAt(eventBuf: long, i: int): int { return kqueue.evFilter(eventBuf, i); }
 
-// The completion-based event loop. Each backend (Poller / EpollLoop / IocpLoop) implements it; the
-// reactor is generic over it so the trait is a compile-time seam (monomorphized, no dyn dispatch).
 pub trait EventLoop {
-    // Register an in-flight op (address of an OP_SIZE record). Returns 0 on success, negative on error.
     fn submit(self, op: long): int;
-    // Block up to timeoutMs (negative = forever), complete ready ops (for I/O ops: perform the syscall
-    // into the op buffer and fill its result), and return the number of coroutines to resume this batch.
     fn poll(self, timeoutMs: int): int;
-    // The coroutine token to resume for the i-th ready item of the last poll(). For an I/O op this is the
-    // op's token (the coroutine reads its own op.result); for a timer/user wake it is the woken coroutine.
     fn completedToken(self, i: int): long;
     fn ok(self): bool;
     fn destroy(self): void;
 }
 
-// kqueue-backed completion emulation (macOS/BSD).
 pub class Poller impl EventLoop {
     pub kq: int,
     pub eventBuf: long,
-    pub compBuf: long,       // maxEvents * 8: coroutine tokens to resume from the last poll
+    pub compBuf: long,
     pub maxEvents: int,
     pub nComp: int,
 
@@ -152,8 +95,6 @@ pub class Poller impl EventLoop {
 
     fn ok(self: Poller): bool { return self.kq >= 0; }
 
-    // Arm readiness for the op, carrying its address as the kqueue udata token. recv/accept want
-    // readability (persistent EV_ADD); send/connect want one-shot writability.
     fn submit(self: Poller, op: long): int {
         let kind = opKind(op);
         let fd = opFd(op);
@@ -171,8 +112,6 @@ pub class Poller impl EventLoop {
             let filter = kqueue.evFilter(self.eventBuf, i);
             let udata = kqueue.evUdata(self.eventBuf, i);
             if (filter != kqueue.EVFILT_READ && filter != kqueue.EVFILT_WRITE) {
-                // Not an I/O op: a timer (read-deadline) or user (cross-reactor wake) event. udata is the
-                // coroutine to resume directly; it inspects its own op/deadline on resume. No syscall.
                 if (udata != (0 as long)) {
                     bytes.write_ptr(self.compBuf, (self.nComp * 8) as long, udata);
                     self.nComp = self.nComp + 1;
@@ -189,16 +128,14 @@ pub class Poller impl EventLoop {
                     let r = socket.recvSock(fd, buf, len);
                     if (r < 0 && socket.wouldBlock()) { complete = false; } else { res = r as int; }
                 } else if (kind == OP_RECVFD) {
-                    // buf is an 8-byte scratch: recv one fd into [4..8), payload (ignored) into [0..4).
                     bytes.write_i32(buf, 4, -1);
                     let rn = socket.recvFdRaw(fd, buf, 4, buf + 4);
                     if (rn < 0 && socket.wouldBlock()) { complete = false; }
-                    else if (rn <= 0) { res = -1; }                         // 0 = channel closed, else error
-                    else { res = bytes.read_i32(buf, 4) as int; }           // the handed-off client fd
+                    else if (rn <= 0) { res = -1; }
+                    else { res = bytes.read_i32(buf, 4) as int; }
                 } else if (kind == OP_SEND) {
                     let w = socket.sendSock(fd, buf, len);
                     if (w < 0 && socket.wouldBlock()) {
-                        // spurious writability: re-arm one-shot write and wait again
                         kqueue.registerOne(self.kq, fd, kqueue.EVFILT_WRITE, kqueue.EV_ADD | kqueue.EV_ONESHOT, op);
                         complete = false;
                     } else { res = w as int; }
@@ -212,7 +149,6 @@ pub class Poller impl EventLoop {
                     res = if (socket.sockError(fd) == 0) 0 else -1;
                 }
                 if (complete) {
-                    // Stop the fd refiring for a completed persistent (read) interest.
                     if (kind == OP_RECV || kind == OP_ACCEPT || kind == OP_RECVFD) {
                         kqueue.registerOne(self.kq, fd, kqueue.EVFILT_READ, kqueue.EV_DELETE, 0);
                     }

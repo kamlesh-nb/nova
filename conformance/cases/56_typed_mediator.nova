@@ -1,9 +1,3 @@
-// Flagship framework layer: the TYPED mediator pipeline, on generic traits.
-// A `RequestHandler<TReq, TResp>` (MediatR's IRequestHandler, but fully typed —
-// no `any`, no downcast) binds a request from a ValueSource via the compiler-
-// generated `TReq__bind`, dispatches through the generic-trait `handle`, and
-// serializes the response via `TResp__toJson`. This is exactly what `get<T>`
-// will generate at each route; shown explicitly here to gate the pipeline.
 import assert;
 import serde.source;
 import web.response;
@@ -31,9 +25,6 @@ struct AddHandler impl RequestHandler<AddReq, SumDto> {
     }
 }
 
-// The generic pipeline a typed `get<GetUser>` route runs: bind → handle →
-// serialize. Written out per-type because binder/serializer names are reified
-// from the concrete type (what the get<T> codegen will do automatically).
 @test
 fn test_typed_getuser_pipeline(): void {
     let h = GetUserHandler{};

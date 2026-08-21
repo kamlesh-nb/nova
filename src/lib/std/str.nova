@@ -1,22 +1,65 @@
-// P10: the borrowed string type.
-//
-// `Str` is a BORROWED string: {ptr, len} into bytes it does NOT own -- no ARC header, no allocation, no
-// retain/release. Because it is a VALUE struct (the M-1/2/3 value-struct path), it is passed inline with
-// zero refcount traffic; it is Nova's `&str`. The caller GUARANTEES the backing bytes outlive the view
-// (lifetime is manual and request-scoped, exactly like Rust's &str -- there is no borrow checker). It
-// borrows a slice of an owned `string` (a constant template literal or a materialised value) or a slice of
-// a foreign buffer (a DB row's `Row.raw`, via `DbValue.asView`). Materialise with `toOwned()` ONLY when the
-// value must escape its buffer's scope.
+//! Borrowed string views (`Str`).
+//!
+//! A `Str` is Nova's `&str`: a `{ptr, len}` pair that BORROWS a run of UTF-8
+//! bytes it does not own. There is no ARC header, no allocation, and no
+//! retain/release traffic, because a `Str` is a value struct passed inline. It
+//! is the intended way to hand a substring around without copying it.
+//!
+//! The lifetime is MANUAL and request-scoped, exactly like Rust's `&str` but
+//! WITHOUT a borrow checker to enforce it: the caller guarantees the backing
+//! bytes outlive the view. The backing store is normally one of two things:
+//!
+//!   1. An owned `string` (a constant template literal, or a materialised
+//!      value) whose bytes stay alive for as long as the `Str` is used.
+//!   2. A slice of a foreign buffer, e.g. a database row's raw wire buffer,
+//!      surfaced through `DbValue.asView`.
+//!
+//! Because it only borrows, a `Str` must NOT be stored anywhere that outlives
+//! its backing bytes. When a value genuinely has to escape that scope, call
+//! `toOwned()` to copy the bytes into a fresh heap `string` that owns itself.
+//!
+//! This type is the sink for the zero-copy render path: response rendering and
+//! the ORM bind read straight out of the borrowed buffer into the output,
+//! minting no owned intermediate string. See `web/response.escapeHtmlIntoView`
+//! and `collections.string_builder.StringBuilder.appendBytes`.
+
 import bytes;
 
+/// A borrowed view over a run of bytes: pointer plus length, owning nothing.
+///
+/// `Str` is a value struct, so it is copied by value with zero refcount
+/// traffic. Copying a `Str` copies only the `{ptr, len}` pair; it does NOT copy
+/// or retain the underlying bytes, so every copy shares (and depends on) the
+/// same backing store.
 pub struct Str {
+    /// Address of the first borrowed byte. A raw machine address, so it is a
+    /// `long`: an `int` would truncate a heap address above 4 GB to garbage.
     pub ptr: long,
+    /// Number of bytes in the view, starting at `ptr`.
     pub len: int,
+
+    /// Wraps a raw `{ptr, len}` pair. Prefer the `sub` / `of` / `raw` helpers
+    /// below, which derive the pointer safely from a known source.
     init(ptr: long, len: int) { self.ptr = ptr; self.len = len; }
 
+    /// Number of bytes in the view. This is a byte count, not a codepoint or
+    /// grapheme count.
     pub fn size(self: Str): int { return self.len; }
+
+    /// Reads the byte at offset `i` (0-based) as an integer in 0..255.
+    ///
+    /// The offset is not bounds-checked here; the caller must keep `i` within
+    /// `0 <= i < size()`, since reading past the borrowed run reads whatever
+    /// happens to sit after it in the backing buffer.
     pub fn byteAt(self: Str, i: int): int { return bytes.read_byte(self.ptr, i); }
-    // Copy the borrowed bytes into a fresh OWNED heap string. Use only at an escape boundary.
+
+    /// Copies the borrowed bytes into a fresh OWNED heap `string`.
+    ///
+    /// Use this ONLY at an escape boundary, i.e. when the value must outlive the
+    /// backing buffer it currently borrows. The returned `string` is
+    /// independent and self-owned (ARC-managed like any other string), so the
+    /// original backing store may be freed afterwards. An empty or non-positive
+    /// view yields the empty string without allocating.
     pub fn toOwned(self: Str): string {
         if (self.len <= 0) { return ""; }
         let out = bytes.alloc(self.len);
@@ -25,16 +68,32 @@ pub struct Str {
     }
 }
 
-// Borrow a slice [start, end) of an owned string -- NO copy, no allocation. (Named `sub`, not `slice`, to
-// avoid colliding with `string.slice` under unqualified cross-module call resolution.)
+/// Borrows the half-open slice `[start, end)` of an owned `string`.
+///
+/// No copy and no allocation: the returned `Str` points `start` bytes into
+/// `s` and spans `end - start` bytes. The caller must keep `s` alive for as
+/// long as the returned view is used, and must keep `0 <= start <= end <=
+/// s.length` (the bounds are not checked here). Named `sub` rather than `slice`
+/// to avoid colliding with `string.slice` under unqualified cross-module call
+/// resolution.
 pub fn sub(s: string, start: int, end: int): Str {
     return Str((s as long) + (start as long), end - start);
 }
-// Borrow a whole owned string.
+
+/// Borrows the whole of an owned `string` as a view, without copying.
+///
+/// Equivalent to `sub(s, 0, s.length)`. The backing `string` must outlive the
+/// returned view.
 pub fn of(s: string): Str {
     return Str(s as long, s.length);
 }
-// Borrow a raw {ptr, len} span directly (e.g. a DB row-buffer slice).
+
+/// Borrows a raw `{ptr, n}` span directly, e.g. a slice of a database row's
+/// wire buffer.
+///
+/// This is the escape hatch for borrowing memory that is not a Nova `string`.
+/// The caller owns the lifetime contract entirely: `ptr` must point at `n`
+/// valid bytes that stay alive for as long as the view is used.
 pub fn raw(ptr: long, n: int): Str {
     return Str(ptr, n);
 }

@@ -1,9 +1,3 @@
-// M2 of the C++ runtime retirement plan: reactor-native async socket I/O, no Asio. Two coroutines
-// on ONE reactor exchange a message over a socketpair, each using `await stream.recvInto` /
-// `await stream.sendBuf` (net/reactorio). The reads and writes are non-blocking syscalls that park
-// the coroutine on EAGAIN (registering readiness with the reactor) and resume when the reactor polls
-// the fd ready. This proves the async-stream seam runs on the Nova reactor with zero Asio: an async
-// client and server round trip driven entirely by the reactor loop.
 import assert;
 import bytes;
 import os.sys;
@@ -17,7 +11,6 @@ fn count(cell: long): int {
     return bytes.read_i32(cell, 0) as int;
 }
 
-// The "server" side: receive one message and echo it straight back.
 async fn echoConn(fd: int, kq: int, done: long): void {
     let s = eventedio.ReactorStream(fd, kq);
     let buf = bytes.alloc(64);
@@ -29,14 +22,13 @@ async fn echoConn(fd: int, kq: int, done: long): void {
     bump(done);
 }
 
-// The "client" side: send PING, then read the echo into `result`.
 async fn clientConn(fd: int, kq: int, done: long, result: long, gotLen: long): void {
     let s = eventedio.ReactorStream(fd, kq);
     let msg = bytes.alloc(4);
-    bytes.write_byte(msg, 0, 80);   // 'P'
-    bytes.write_byte(msg, 1, 73);   // 'I'
-    bytes.write_byte(msg, 2, 78);   // 'N'
-    bytes.write_byte(msg, 3, 71);   // 'G'
+    bytes.write_byte(msg, 0, 80);
+    bytes.write_byte(msg, 1, 73);
+    bytes.write_byte(msg, 2, 78);
+    bytes.write_byte(msg, 3, 71);
     await s.sendBuf(msg, 4);
     bytes.free(msg);
 
@@ -59,12 +51,9 @@ fn test_reactor_async_round_trip(): void {
     let gotLen = bytes.alloc(4);
     bytes.write_i32(gotLen, 0, 0);
 
-    // Start both connection coroutines; each runs to its first suspend (recv/send EAGAIN).
     coroStart(echoConn(b, r.kq, done));
     coroStart(clientConn(a, r.kq, done, result, gotLen));
 
-    // Drive the reactor until both coroutines finish. The iteration cap fails loudly instead of
-    // hanging the gate if a wakeup is ever missed.
     let guard = 0;
     while (count(done) < 2 && guard < 1000) {
         let nev = r.pollComplete(500);
@@ -79,10 +68,10 @@ fn test_reactor_async_round_trip(): void {
 
     assert.equalInt(count(done), 2);
     assert.equalInt(bytes.read_i32(gotLen, 0) as int, 4);
-    assert.equalInt(bytes.read_byte(result, 0) as int, 80);   // 'P'
-    assert.equalInt(bytes.read_byte(result, 1) as int, 73);   // 'I'
-    assert.equalInt(bytes.read_byte(result, 2) as int, 78);   // 'N'
-    assert.equalInt(bytes.read_byte(result, 3) as int, 71);   // 'G'
+    assert.equalInt(bytes.read_byte(result, 0) as int, 80);
+    assert.equalInt(bytes.read_byte(result, 1) as int, 73);
+    assert.equalInt(bytes.read_byte(result, 2) as int, 78);
+    assert.equalInt(bytes.read_byte(result, 3) as int, 71);
 
     bytes.free(done);
     bytes.free(result);

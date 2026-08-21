@@ -1,4 +1,3 @@
-// Tier 1 — pure compute + console. Proves the runtime starts and exits cleanly on Windows.
 import assert;
 
 fn main(): int {

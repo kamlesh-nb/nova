@@ -1,7 +1,5 @@
-// examples/25_errdefer.nova
 import list;
 
-// A struct error type. Its fields carry the reason to the caller.
 struct OpenError {
     pub resource: string,
     pub reason: string,
@@ -11,25 +9,20 @@ struct OpenError {
     }
 }
 
-// A tiny stand-in for a real resource. Opening it records the fact in a shared log
-// so we can see exactly what ran, and in what order.
 fn open(name: string, log: List<string>): int | OpenError {
     log.push("opened " + name);
     return 1;
 }
 
-// Acquire two resources, then run a final step that may fail. If it fails, both
-// errdefers fire in LIFO order (cache first, then db), rolling back everything we
-// had acquired. On success no errdefer runs.
 fn connectBoth(failFinal: bool, log: List<string>): int | OpenError {
     let a = try open("db", log);
-    errdefer log.push("closed db");        // registered once db is open
+    errdefer log.push("closed db");
 
     let b = try open("cache", log);
-    errdefer log.push("closed cache");     // registered once cache is open
+    errdefer log.push("closed cache");
 
     if (failFinal) { return OpenError("session", "handshake failed"); }
-    return a + b;                          // success path: no errdefer runs
+    return a + b;
 }
 
 fn printLog(label: string, log: List<string>): void {
@@ -41,14 +34,11 @@ fn printLog(label: string, log: List<string>): void {
 }
 
 fn main(): void {
-    // Success: both resources open, nothing is rolled back.
     let ok = list.List<string>();
     let r1 = connectBoth(false, ok) catch -1;
     console.log(`both ok -> result ${r1}`);
     printLog("ok  ", ok);
 
-    // Failure after both are held: the errdefers run last-registered first, so the
-    // log shows "closed cache" then "closed db".
     let bad = list.List<string>();
     let r2 = connectBoth(true, bad) catch -1;
     console.log(`final step fails -> result ${r2}`);

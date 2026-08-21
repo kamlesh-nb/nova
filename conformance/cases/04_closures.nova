@@ -1,7 +1,3 @@
-// Pins current closure/lambda behavior via List.map/filter/reduce.
-// NOTE: closures currently capture via global promotion (captured_globals);
-// this case documents present behavior and will guard the A1 rewrite to
-// real per-closure environments.
 import assert;
 import list;
 

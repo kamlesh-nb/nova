@@ -1,8 +1,3 @@
-// B1/B3: a bare call to a generic FREE function (no explicit `<T>`) must infer its type arguments
-// from the argument types and resolve to the monomorphised instance, including when the return value
-// is owned. Previously the inferred instance was never registered for emission and the bare call
-// resolved to the un-emitted base name ("Function 'id' not found"); the owned-return path (B3) also
-// lacked its instance. Explicit `id<T>(x)` already worked; this covers the inference path.
 import assert;
 import list;
 
@@ -19,9 +14,9 @@ fn test_infer_scalar(): void {
 @test
 fn test_infer_owned_passthrough(): void {
     let a = "owned-value";
-    let b = ident(a);              // inferred T=string, returns the owned value
+    let b = ident(a);
     assert.equalStr(b, "owned-value");
-    assert.equalStr(a, "owned-value");   // original still valid (no double free)
+    assert.equalStr(a, "owned-value");
 }
 
 @test
@@ -29,7 +24,7 @@ fn test_infer_owned_from_container(): void {
     let xs = List<string>();
     xs.push("first");
     xs.push("second");
-    let s = firstOf(xs);           // inferred T=string via List<T>, owned element
+    let s = firstOf(xs);
     assert.equalStr(s, "first");
 }
 

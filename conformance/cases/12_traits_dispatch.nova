@@ -1,5 +1,3 @@
-// Trait dynamic dispatch: vtable calls, trait-typed bindings, factory returns,
-// trait->struct downcast, and the string-keyed mediator (MediatR) pattern.
 import assert;
 import map;
 import string;
@@ -30,7 +28,6 @@ fn test_factory_return(): void {
     assert.equalInt(s.speak(), 5);
 }
 
-// ---- Mediator (MediatR) pattern: Message + MessageHandler, string-keyed ----
 trait Message { fn name(self: Message): string; }
 trait MessageHandler { fn handle(self: MessageHandler, msg: Message): int; }
 
@@ -40,7 +37,7 @@ struct Doubling impl Message {
 }
 struct DoublingHandler impl MessageHandler {
     pub fn handle(self: DoublingHandler, msg: Message): int {
-        let m = msg as Doubling;   // trait -> concrete downcast
+        let m = msg as Doubling;
         return m.val * 2;
     }
 }

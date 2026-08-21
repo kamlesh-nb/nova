@@ -1,39 +1,24 @@
-// Target-conditional compilation: the compiler-synthesized `platform` module + target-conditional file
-// selection (language-specification.md 8). `import os.backend;` resolves os/backend_<os>.nova via the
-// file-suffix rule, so the SAME source must observe the host it was built for. This is step 1 of the
-// EventLoop/IOCP reactor work: it proves the mechanism the multi-backend reactor is built on.
-//
-// The assertions are host-relative on purpose. Pinning them to darwin (as this case originally did)
-// tested the macOS gate rather than the mechanism, and reported a failure on every other target even
-// when selection was working perfectly.
 import assert;
 import platform;
 import os.backend;
 
 @test fn platform_reflects_host(): void {
-    // Exactly one OS flag is set, and it agrees with platform.os.
     assert.equalInt(flagCount(), 1);
     assert.equalStr(platform.os, expectedOsName());
 
-    // isPosix is the derived fact: the two unix families, and nothing else.
     if (platform.isDarwin || platform.isLinux) {
         assert.isTrue(platform.isPosix);
     } else {
         assert.isFalse(platform.isPosix);
     }
 
-    // Every target the compiler emits for is 64-bit except wasm32.
     assert.equalInt(platform.pointerSize, if (platform.isWasm) 4 else 8);
 }
 
 @test fn backend_file_chosen_by_target(): void {
-    // os.backend compiled the variant matching the host: kqueue on darwin, epoll on linux, iocp on
-    // windows — each with its own native event-record size.
     assert.equalStr(backend.name(), expectedBackend());
     assert.equalInt(backend.EVENT_SIZE, expectedEventSize());
 
-    // COMPLETION_BASED is the property the EventLoop layer actually branches on: IOCP is a proactor,
-    // kqueue/epoll are readiness-based and emulate completion above.
     if (platform.isWindows) {
         assert.isTrue(backend.COMPLETION_BASED);
     } else {
@@ -64,8 +49,6 @@ fn expectedBackend(): string {
     return "none";
 }
 
-// sizeof(struct kevent) and sizeof(OVERLAPPED_ENTRY) are both 32 on x64; struct epoll_event is
-// packed to 12.
 fn expectedEventSize(): int {
     if (platform.isLinux) { return 12; }
     return 32;

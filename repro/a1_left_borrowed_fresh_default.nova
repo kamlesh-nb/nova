@@ -13,8 +13,8 @@ fn mk(): map.Map<string, Box> {
 @test
 fn left_borrowed_fresh_default_present() {
     let m = mk();
-    let h = m.get("a");          // borrowed owned LEFT
-    let r = h ?? Box { v: "d" }; // FRESH default (no dominance error path)
+    let h = m.get("a");
+    let r = h ?? Box { v: "d" };
     assert.equalStr(r.v, "alpha");
 }
 

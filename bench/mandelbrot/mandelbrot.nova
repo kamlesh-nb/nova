@@ -1,11 +1,8 @@
-// Mandelbrot (Computer Language Benchmarks Game): scalar-per-lane replica of the reference 1.go mbrot8
-// (10x5=50 z-iterations with tr/ti carry, membership = final zr^2+zi^2 <= 4). Packs 8 pixels/byte and
-// prints P4 header + md5 of the pixel bytes -- identical output contract to the Go/Rust/C# references.
 import bytes;
 import crypto.hash.md5;
 import crypto.hash.sha;
 
-const SIZE: int = 200;               // must be a multiple of 8
+const SIZE: int = 200;
 
 fn inSet(cr: double, ci: double): bool {
     let zr = 0.0; let zi = 0.0; let tr = 0.0; let ti = 0.0;

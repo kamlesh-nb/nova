@@ -8,8 +8,6 @@ pub trait Behavior<M> {
     async fn receive(self, msg: M): void;
 }
 
-// --- Actor registry: look up an actor (by its mailbox handle) by a stable name ------------------------------
-// A supervisor or router resolves "the logging actor" without threading the handle through every caller.
 pub struct ActorRegistry {
     names: map.Map<string, long>,
     init() { self.names = map.Map<string, long>(16, string.hash); }
@@ -20,13 +18,9 @@ pub struct ActorRegistry {
     pub fn count(self: ActorRegistry): int { return self.names.size(); }
 }
 
-// --- Supervision with restart (one-for-one strategy) --------------------------------------------------------
-// A supervised behavior can FAULT while handling a message (return false). Its supervisor then RESTARTS it --
-// reset() returns it to a clean initial state -- up to maxRestarts, after which the actor is stopped. This is
-// the actor-model answer to "let it crash": a transient fault does not take down the actor permanently.
 pub trait SupervisedBehavior<M> {
-    fn receive(self, msg: M): bool;   // true = handled; false = fault -> the supervisor restarts
-    fn reset(self): void;             // restart: discard corrupt state, return to the initial state
+    fn receive(self, msg: M): bool;
+    fn reset(self): void;
 }
 
 pub struct Supervisor<M> {
@@ -41,8 +35,6 @@ pub struct Supervisor<M> {
         self.stopped = false;
     }
 
-    // Deliver one message. On a fault, restart the behavior (reset + count) unless the restart budget is
-    // exhausted, in which case the actor stops. Returns false once the actor is stopped.
     pub fn deliver(self: Supervisor<M>, msg: M): bool {
         if (self.stopped) { return false; }
         let ok = self.behavior.receive(msg);

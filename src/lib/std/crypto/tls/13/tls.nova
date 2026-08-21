@@ -1,12 +1,3 @@
-// TLS 1.3 (RFC 8446) key schedule and record protection in Nova, no external library (M9 phase E).
-//
-// The key schedule composes the already-verified HKDF-Expand-Label / Derive-Secret primitives in the
-// RFC 8446 section 7.1 order (early secret -> derived -> handshake secret -> traffic secrets -> per-
-// direction key and IV). Record protection is the section 5.2 construction: the per-record nonce is the
-// write IV XOR the 64-bit sequence number (right-aligned), the additional data is the 5-byte record
-// header, and the AEAD is AES-128/256-GCM or ChaCha20-Poly1305.
-//
-// References: RFC 8446. Verified against the RFC 8448 "Simple 1-RTT Handshake" trace.
 import bytes;
 import crypto.kdf.hkdf;
 import crypto.hash.sha256;
@@ -14,11 +5,9 @@ import crypto.hash.sha512;
 import crypto.aead.aesgcm;
 import crypto.aead.chachapoly;
 
-// Cipher suites (AEAD + key length). The hash for the key schedule is passed separately as the HKDF
-// `kind` (0 = SHA-256, 1 = SHA-384), matching the suite.
-const SUITE_AES128_GCM: int = 0;   // key 16, SHA-256
-const SUITE_AES256_GCM: int = 1;   // key 32, SHA-384
-const SUITE_CHACHA20: int = 2;     // key 32, SHA-256
+const SUITE_AES128_GCM: int = 0;
+const SUITE_AES256_GCM: int = 1;
+const SUITE_CHACHA20: int = 2;
 
 pub fn keyLen(suite: int): int {
     if (suite == SUITE_AES128_GCM) { return 16; }
@@ -38,9 +27,7 @@ fn hashEmpty(kind: int, out: ptr): void {
     bytes.free(d);
 }
 
-// ---- key schedule (RFC 8446 section 7.1) ----
 
-// Early Secret = HKDF-Extract(salt = 0, IKM = PSK = 0).
 pub fn earlySecret(kind: int, out: ptr): void {
     let hl = hkdf.hashLen(kind);
     let z = bytes.alloc(hl);
@@ -50,8 +37,6 @@ pub fn earlySecret(kind: int, out: ptr): void {
     bytes.free(z);
 }
 
-// Early Secret with a resumption PSK = HKDF-Extract(salt = 0, IKM = PSK). Used by both the binder
-// derivation and (on an accepted resumption) the handshake key schedule.
 pub fn earlySecretPsk(kind: int, psk: ptr, pskLen: int, out: ptr): void {
     let hl = hkdf.hashLen(kind);
     let z = bytes.alloc(hl);
@@ -61,15 +46,12 @@ pub fn earlySecretPsk(kind: int, psk: ptr, pskLen: int, out: ptr): void {
     bytes.free(z);
 }
 
-// client_early_traffic_secret = Derive-Secret(early_secret, "c e traffic", ClientHello) for 0-RTT (RFC
-// 8446 7.1). The caller supplies the transcript hash of the ClientHello.
 pub fn deriveEarlyTraffic(kind: int, earlySec: ptr, chHash: ptr, out: ptr): void {
     let lab = strBuf("c e traffic");
     hkdf.deriveSecret(kind, earlySec, hkdf.hashLen(kind), lab, 11, chHash, out);
     bytes.free(lab);
 }
 
-// binder_key = Derive-Secret(early_secret, "res binder", "") for a resumption PSK (RFC 8446 7.1).
 pub fn deriveResBinderKey(kind: int, earlySec: ptr, out: ptr): void {
     let hl = hkdf.hashLen(kind);
     let eh = bytes.alloc(hl);
@@ -79,7 +61,6 @@ pub fn deriveResBinderKey(kind: int, earlySec: ptr, out: ptr): void {
     bytes.free(eh); bytes.free(lab);
 }
 
-// derived = Derive-Secret(secret, "derived", "").
 pub fn deriveDerived(kind: int, secret: ptr, out: ptr): void {
     let hl = hkdf.hashLen(kind);
     let eh = bytes.alloc(hl);
@@ -89,21 +70,16 @@ pub fn deriveDerived(kind: int, secret: ptr, out: ptr): void {
     bytes.free(eh); bytes.free(lab);
 }
 
-// Handshake (or Master) Secret = HKDF-Extract(salt = derived, IKM = ECDHE (or 0 for master)).
 pub fn extractSecret(kind: int, salt: ptr, ikm: ptr, ikmLen: int, out: ptr): void {
     hkdf.extract(kind, salt, hkdf.hashLen(kind), ikm, ikmLen, out);
 }
 
-// Derive-Secret(secret, label, Transcript-Hash(messages)); the caller supplies the transcript hash.
 pub fn deriveTraffic(kind: int, secret: ptr, label: string, transcript: ptr, out: ptr): void {
     let lab = strBuf(label);
     hkdf.deriveSecret(kind, secret, hkdf.hashLen(kind), lab, label.length, transcript, out);
     bytes.free(lab);
 }
 
-// Next-generation application traffic secret for a KeyUpdate (RFC 8446 section 7.2):
-// application_traffic_secret_N+1 = HKDF-Expand-Label(secret_N, "traffic upd", "", Hash.length).
-// The context is the empty string (not a transcript hash), so this uses expandLabel directly.
 pub fn deriveTrafficUpdate(kind: int, secret: ptr, out: ptr): void {
     let hl = hkdf.hashLen(kind);
     let empty = bytes.alloc(1);
@@ -112,15 +88,12 @@ pub fn deriveTrafficUpdate(kind: int, secret: ptr, out: ptr): void {
     bytes.free(empty); bytes.free(lab);
 }
 
-// resumption_master_secret = Derive-Secret(master_secret, "res master", ClientHello...client Finished).
-// The caller supplies the transcript hash through the client Finished.
 pub fn deriveResMaster(kind: int, master: ptr, transcriptHash: ptr, out: ptr): void {
     let lab = strBuf("res master");
     hkdf.deriveSecret(kind, master, hkdf.hashLen(kind), lab, 10, transcriptHash, out);
     bytes.free(lab);
 }
 
-// Per-ticket PSK = HKDF-Expand-Label(resumption_master_secret, "resumption", ticket_nonce, Hash.length).
 pub fn deriveResumptionPsk(kind: int, resMaster: ptr, nonce: ptr, nonceLen: int, out: ptr): void {
     let hl = hkdf.hashLen(kind);
     let lab = strBuf("resumption");
@@ -128,7 +101,6 @@ pub fn deriveResumptionPsk(kind: int, resMaster: ptr, nonce: ptr, nonceLen: int,
     bytes.free(lab);
 }
 
-// From a traffic secret, derive the AEAD key and 12-byte IV (HKDF-Expand-Label "key" / "iv").
 pub fn deriveKeyIv(kind: int, suite: int, trafficSecret: ptr, keyOut: ptr, ivOut: ptr): void {
     let hl = hkdf.hashLen(kind);
     let empty = bytes.alloc(1);
@@ -139,9 +111,7 @@ pub fn deriveKeyIv(kind: int, suite: int, trafficSecret: ptr, keyOut: ptr, ivOut
     bytes.free(empty); bytes.free(kl); bytes.free(il);
 }
 
-// ---- record protection (RFC 8446 section 5.2) ----
 
-// Per-record nonce: the 12-byte IV XOR the 64-bit sequence number, right-aligned.
 pub fn recordNonce(iv: ptr, seq: long, out: ptr): void {
     let i = 0;
     while (i < 12) { bytes.write_byte(out, i, bytes.read_byte(iv, i)); i = i + 1; }
@@ -167,19 +137,15 @@ fn aeadOpen(suite: int, key: ptr, nonce: ptr, aad: ptr, aadLen: int, ct: ptr, ct
     return aesgcm.open(key, keyLen(suite), nonce, 12, aad, aadLen, ct, ctLen, tag, ptOut);
 }
 
-// Protect one record: encrypts `content` (contentLen bytes) with trailing inner content-type byte, into
-// a full TLSCiphertext record (5-byte header + ciphertext + 16-byte tag) written to out. Returns the
-// total record length.
 pub fn recordProtect(suite: int, key: ptr, iv: ptr, seq: long,
                      content: ptr, contentLen: int, contentType: int, out: ptr): int {
-    let innerLen = contentLen + 1;                 // TLSInnerPlaintext = content || type (no padding)
+    let innerLen = contentLen + 1;
     let ctLen = innerLen + 16;
     let inner = bytes.alloc(innerLen);
     let i = 0;
     while (i < contentLen) { bytes.write_byte(inner, i, bytes.read_byte(content, i)); i = i + 1; }
     bytes.write_byte(inner, contentLen, contentType);
 
-    // Header / additional data: 0x17 || 0x0303 || length(uint16), length = ctLen.
     bytes.write_byte(out, 0, 0x17);
     bytes.write_byte(out, 1, 0x03);
     bytes.write_byte(out, 2, 0x03);
@@ -193,9 +159,6 @@ pub fn recordProtect(suite: int, key: ptr, iv: ptr, seq: long,
     return 5 + ctLen;
 }
 
-// Unprotect one record: verifies and decrypts a TLSCiphertext record into its inner plaintext
-// (content || content-type || zero padding) written to out. Returns the inner plaintext length, or -1 if
-// the tag does not verify. The caller strips trailing zero padding; the last non-zero byte is the type.
 pub fn recordUnprotect(suite: int, key: ptr, iv: ptr, seq: long, record: ptr, recLen: int, out: ptr): int {
     let ctLen = recLen - 5;
     let ptLen = ctLen - 16;
@@ -209,12 +172,10 @@ pub fn recordUnprotect(suite: int, key: ptr, iv: ptr, seq: long, record: ptr, re
     return ptLen;
 }
 
-// Strip TLS 1.3 inner-plaintext trailing zero padding: writes the content type to typeOut[0] and returns
-// the content length (everything before the type byte). Returns -1 if the record was all zeros.
 pub fn innerParse(inner: ptr, innerLen: int, typeOut: ptr): int {
     let i = innerLen - 1;
     while (i >= 0 && bytes.read_byte(inner, i) == 0) { i = i - 1; }
     if (i < 0) { return -1; }
     bytes.write_byte(typeOut, 0, bytes.read_byte(inner, i));
-    return i;                                     // content occupies inner[0..i)
+    return i;
 }

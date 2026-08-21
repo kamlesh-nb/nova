@@ -1,6 +1,4 @@
 // EXPECT-FAIL: typecheck
-// NEGATIVE test: a string is a heap pointer (reference type), not a primitive value -- a string[] array
-// is rejected; use List<string> instead.
 import assert;
 @test
 fn string_array_rejected(): void {

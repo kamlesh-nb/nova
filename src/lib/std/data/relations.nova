@@ -1,21 +1,12 @@
-// Relation loading for the db seam: the eager-load ("N+1 avoidance") mechanics for hasMany / belongsTo.
-// Given a set of parent keys you build ONE `... WHERE fk IN ($1, ...)` query for all children, run it, then
-// group the child rows by their foreign key and attach them to the parents. Values are bound (`$N`), never
-// interpolated.
 import string;
 import list;
 import map;
 import data.db;
 
-// A hasMany query: all children of the given parents in one round trip.
-//   SELECT <cols> FROM <childTable> WHERE <fkCol> IN ($1, $2, ...)
-// Returns (sql, params). `cols` empty -> "*".
 pub fn hasManyQuery(childTable: string, fkCol: string, cols: list.List<string>, parentKeys: list.List<db.DbValue>): (string, list.List<db.DbValue>) {
     return inClause("SELECT " + colList(cols) + " FROM " + childTable + " WHERE " + fkCol + " IN (", parentKeys);
 }
 
-// A belongsTo query: the parents referenced by a set of child foreign-key values.
-//   SELECT <cols> FROM <parentTable> WHERE <pkCol> IN ($1, ...)
 pub fn belongsToQuery(parentTable: string, pkCol: string, cols: list.List<string>, fkKeys: list.List<db.DbValue>): (string, list.List<db.DbValue>) {
     return inClause("SELECT " + colList(cols) + " FROM " + parentTable + " WHERE " + pkCol + " IN (", fkKeys);
 }
@@ -32,7 +23,7 @@ fn inClause(prefix: string, keys: list.List<db.DbValue>): (string, list.List<db.
     let params = list.List<db.DbValue>();
     let sql = prefix;
     if (keys.size() == 0) {
-        return ("SELECT * FROM (SELECT 1) t WHERE 1 = 0", params);   // no parents -> empty result, no params
+        return ("SELECT * FROM (SELECT 1) t WHERE 1 = 0", params);
     }
     let i = 0;
     while (i < keys.size()) {
@@ -45,7 +36,6 @@ fn inClause(prefix: string, keys: list.List<db.DbValue>): (string, list.List<db.
     return (sql, params);
 }
 
-// The 0-based index of a column by name in a result set (-1 if absent).
 pub fn columnIndex(rs: db.ResultSet, name: string): int {
     let i = 0;
     while (i < rs.columns.size()) {
@@ -56,8 +46,6 @@ pub fn columnIndex(rs: db.ResultSet, name: string): int {
     return 0 - 1;
 }
 
-// Group a result set's rows by the TEXT value of column `fkCol` -> Map<fkValue, List<Row>>. This is the
-// attach step: after loading all children with `hasManyQuery`, group them so each parent gets its slice.
 pub fn groupByColumn(rs: db.ResultSet, fkCol: string): map.Map<string, list.List<db.Row>> {
     let groups = map.Map<string, list.List<db.Row>>(16, string.hash);
     let ci = columnIndex(rs, fkCol);
@@ -74,7 +62,6 @@ pub fn groupByColumn(rs: db.ResultSet, fkCol: string): map.Map<string, list.List
     return groups;
 }
 
-// The child rows belonging to one parent key (empty list if none).
 pub fn childrenOf(groups: map.Map<string, list.List<db.Row>>, parentKey: string): list.List<db.Row> {
     return groups.get(parentKey) ?? list.List<db.Row>();
 }

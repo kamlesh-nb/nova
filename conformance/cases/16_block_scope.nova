@@ -1,29 +1,13 @@
-// Pins lexical block scope (specs §10 #23, design/F1 §3.2).
-//
-// Before F1's alpha-renaming pass, Nova had NO block scope: `Scope` carried no
-// names, `locals` was one flat map per FUNCTION, and collectLocalVarNames hoisted
-// every `let` — nested blocks included — into entry-block allocas keyed by bare
-// name, skipping any name already present. So:
-//
-//   * an inner `let x` ALIASED the outer one   -> test_shadowing returned 2, not 1
-//   * two `let v` in DISJOINT blocks shared one slot, and collectLocalVarTypes'
-//     last-writer-wins let the LAST TEXTUAL `let v` set v's type everywhere —
-//     including from a branch that never runs. test_dead_branch_does_not_retype
-//     SIGSEGV'd: `${v}` over a slot holding 42 was compiled as a string
-//     interpolation and read a length header at [42-4].
-//
-// That last one is why this file exists: DEAD CODE SEGFAULTED LIVE CODE. Every
-// case here was verified to fail before the fix.
 import assert;
 
 @test
 fn test_shadowing_does_not_alias_outer(): void {
     let x = 1;
     if (true) {
-        let x = 2;          // a DISTINCT binding
+        let x = 2;
         assert.equalInt(x, 2);
     }
-    assert.equalInt(x, 1);  // returned 2 before F1
+    assert.equalInt(x, 1);
 }
 
 @test
@@ -34,23 +18,21 @@ fn test_disjoint_blocks_are_distinct_bindings(): void {
         out = out + `${v}`;
     }
     if (true) {
-        let v = "str";      // same name, disjoint block, DIFFERENT type
+        let v = "str";
         out = out + v;
     }
     assert.equalStr(out, "42str");
 }
 
-// The one that segfaulted: a `let` in a never-taken branch must not retype a live
-// binding in another block.
 @test
 fn test_dead_branch_does_not_retype(): void {
     let out = "";
     if (true) {
-        let v = 42;              // v is an int HERE
+        let v = 42;
         out = out + `${v}`;
     }
     if (false) {
-        let v = "never-runs";    // never executes; used to type v as string
+        let v = "never-runs";
         out = out + v;
     }
     assert.equalStr(out, "42");
@@ -70,13 +52,11 @@ fn test_nested_shadowing(): void {
     assert.equalInt(n, 1);
 }
 
-// The right-hand side of a `let` sees the OUTER binding — binding before walking
-// the initialiser would make `let x = x + 1` capture itself.
 @test
 fn test_init_sees_outer_binding(): void {
     let x = 10;
     if (true) {
-        let x = x + 5;      // RHS x is the outer 10
+        let x = x + 5;
         assert.equalInt(x, 15);
     }
     assert.equalInt(x, 10);
@@ -88,33 +68,31 @@ fn test_shadowing_in_loop_body(): void {
     let count = 0;
     let k = 0;
     while (k < 3) {
-        let i = k;          // shadows the outer i each iteration
+        let i = k;
         count = count + i;
         k = k + 1;
     }
-    assert.equalInt(count, 3);   // 0+1+2
-    assert.equalInt(i, 99);      // outer untouched
+    assert.equalInt(count, 3);
+    assert.equalInt(i, 99);
 }
 
-// A closure capturing a shadowed binding must capture the one lexically in scope.
 @test
 fn test_closure_captures_correct_binding(): void {
     let base = 100;
     if (true) {
         let base = 5;
-        let f = (x) => x + base;   // must capture the INNER base
+        let f = (x) => x + base;
         assert.equalInt((f)(1), 6);
     }
     assert.equalInt(base, 100);
 }
 
-// Params are bindings too: a `let` shadowing a param must not clobber it.
 fn takesParam(p: int): int {
     if (true) {
         let p = 999;
         if (p != 999) { return -1; }
     }
-    return p;               // the PARAM, untouched
+    return p;
 }
 
 @test

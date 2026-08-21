@@ -1,3 +1,1 @@
-// The FetchUpstream request: proxy a GET to a configured upstream HTTPS service. No fields — the target
-// URL and (optional) CA bundle come from the environment.
 pub struct FetchUpstream {}

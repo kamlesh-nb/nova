@@ -1,13 +1,8 @@
-// FR-simd-L1: SIMD vector types (u8x16 / u32x4 / u64x2) are first-class VALUES — usable as function
-// parameters, return types, and named locals with a type annotation, not only as inline simd.* call
-// results. This keeps vector data in a register across a call boundary (no memory round-trip), the enabler
-// for register-resident crypto/compression inner loops. Struct fields are a separate slice.
 import bytes;
 import assert;
 import mem.endian;
 import mem.memory;
 
-// vector parameter + vector return
 fn dbl(v: u8x16): u8x16 { return simd.addU8x16(v, v); }
 fn xorPair(a: u64x2, b: u64x2): u64x2 { return simd.xorU64x2(a, b); }
 fn revBits(v: u8x16): u8x16 {
@@ -24,7 +19,6 @@ fn brev8(b: int): int { let r = 0; let k = 0; let x = b; while (k < 8) { r = (r 
 @test
 fn vec_param_return(): void {
     let buf = bytes.alloc(16); let i = 0; while (i < 16) { bytes.write_byte(buf, i, (i * 9 + 1) & 0xff); i = i + 1; }
-    // named vector local, passed to a fn, result stored
     let v: u8x16 = simd.loadU8x16(buf, 0);
     let d: u8x16 = dbl(v);
     let out = bytes.alloc(16); simd.storeU8x16(out, 0, d);
@@ -42,13 +36,10 @@ fn vec_u64x2_roundtrip(): void {
 
 @test
 fn vec_bitcast_and_lane(): void {
-    // FR-simd-L6 bitcast + FR-simd-L5 lane extract: view a u8x16 as u64x2 and pull each 64-bit half, then
-    // round-trip back to u8x16 — a pure reinterpret of the same 128 bits, no data movement.
     let b = bytes.alloc(16); let i = 0; while (i < 16) { bytes.write_byte(b, i, (i * 17 + 3) & 0xff); i = i + 1; }
     let v8: u8x16 = simd.loadU8x16(b, 0);
     let v64: u64x2 = simd.castU64x2(v8);
     let lo = simd.laneU64x2(v64, 0); let hi = simd.laneU64x2(v64, 1);
-    // reconstruct the two 8-byte halves from the extracted lanes and compare
     let chk = bytes.alloc(16); mem.store<ulong>(chk, 0, lo as ulong, endian.Endian.little); mem.store<ulong>(chk, 8, hi as ulong, endian.Endian.little);
     i = 0; while (i < 16) { assert.equalInt(bytes.read_byte(chk, i), bytes.read_byte(b, i)); i = i + 1; }
     let back: u8x16 = simd.castU8x16(v64);

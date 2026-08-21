@@ -1,22 +1,7 @@
-// Pins name resolution where the flat namespace (§10 #7) could leak into member
-// access: a struct field / method whose name collides with a global function.
-//
-// Guards spec §10 #6 / §8. Codegen resolved `x.field` by treating `x` as a MODULE
-// namespace and looking up `field` in the function table — before ever checking
-// whether `x` was a variable. So with a global `fn payload` in scope, `f.payload`
-// on a Frame returned the *function* instead of the field. The btree driver then
-// parsed a function address as a string: `.length` read instruction bytes as a
-// length and `string_slice` read wild — which was misfiled for months as "string
-// heap corruption". The heap was never corrupt.
-//
-// Two distinct failures are pinned here, and the silent one is the dangerous one:
-//   * `f.payload` returning the WRONG VALUE (a function, read as a string)
-//   * retaining that non-heap pointer -> SIGBUS
 import assert;
 import string;
 import list;
 
-// Deliberately collide with the member names used below.
 fn payload(n: int): string { return "WRONG: global fn payload"; }
 fn tag(): string { return "WRONG: global fn tag"; }
 fn value(): string { return "WRONG: global fn value"; }
@@ -41,7 +26,6 @@ struct Frame {
 @test
 fn test_field_shadowed_by_global_fn(): void {
     let f = Frame(84, "real-payload", "real-tag");
-    // Field read must win over the same-named global fn.
     assert.equalStr(f.payload, "real-payload");
     assert.equalStr(f.tag, "real-tag");
     assert.equalInt(f.ftype, 84);
@@ -50,8 +34,6 @@ fn test_field_shadowed_by_global_fn(): void {
 @test
 fn test_field_through_local(): void {
     let f = Frame(68, "via-local", "t");
-    // Binding to a local retains the value — a function pointer here would be a
-    // write to read-only memory (SIGBUS), so this is the crash guard.
     let p = f.payload;
     assert.equalStr(p, "via-local");
     assert.equalInt(p.length, 9);
@@ -60,7 +42,6 @@ fn test_field_through_local(): void {
 @test
 fn test_field_as_call_argument(): void {
     let f = Frame(67, "as-arg", "t");
-    // The btree driver's exact shape: parseTag(f.payload).
     assert.equalStr(takesString(f.payload), "as-arg");
 }
 
@@ -76,7 +57,6 @@ fn test_method_shadowed_by_global_fn(): void {
 @test
 fn test_field_ops_after_resolution(): void {
     let f = Frame(84, "hello world", "t");
-    // Exercise the string path that read wild when `.payload` was a code pointer.
     assert.equalInt(f.payload.length, 11);
     assert.equalStr(string.slice(f.payload, 0, 5), "hello");
     assert.isTrue(string.contains(f.payload, "world"));
@@ -87,17 +67,13 @@ fn test_collection_field_vs_global_size(): void {
     let xs = list.List<int>();
     xs.push(1);
     xs.push(2);
-    // `size` is also a global fn above; the method must still win.
     assert.equalInt(xs.size(), 2);
 }
 
-// A module-qualified fn as a value must STILL resolve to the function — the guard
-// keys on "is the object a variable", so `string.hash` (a module) is unaffected.
 @test
 fn test_module_fn_as_value_still_resolves(): void {
     let h = string.hash;
     let direct = string.hash("abc");
     assert.equalInt((h)("abc"), direct);
-    // ...and the local `hash` fn above must not be what we got.
     assert.notEqualInt(direct, -1);
 }

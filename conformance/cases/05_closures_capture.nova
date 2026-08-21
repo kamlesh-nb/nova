@@ -1,5 +1,3 @@
-// Closure capture cases that PASS today — regression guards so the A1
-// heap-environment rewrite doesn't break the forms that already work.
 import assert;
 
 @test

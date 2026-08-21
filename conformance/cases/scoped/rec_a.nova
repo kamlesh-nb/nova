@@ -1,4 +1,3 @@
-// Module A: struct Rec with two ints (int at offset 0). makeA returns A's Rec.
 pub struct Rec {
     pub x: int,
     pub y: int,

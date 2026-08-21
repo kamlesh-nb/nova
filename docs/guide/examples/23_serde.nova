@@ -1,15 +1,3 @@
-// examples/23_serde.nova
-// Marking a struct `@serializable` makes the COMPILER generate binders for it at
-// compile time: no reflection, no hand-written parsing:
-//
-//   * `<Struct>__bind(src: ValueSource)` : deserialize from a source (here JSON),
-//     recursively over nested structs and List<T> fields.
-//   * `<Struct>__toJson(value)`          : serialize back to a JSON string, in
-//     field-declaration order (symmetric with __bind).
-//
-// `serde.source.fromJson(raw)` wraps a raw JSON string as a ValueSource that the
-// generated binder reads. Every @serializable struct needs a zero-arg `init()`
-// that sets defaults; __bind overwrites the fields it finds.
 import serde.source;
 import list;
 
@@ -25,8 +13,8 @@ struct User {
     pub id: long,
     pub name: string,
     pub active: bool,
-    pub address: Address,      // nested @serializable struct
-    pub roles: List<string>,   // List of primitives
+    pub address: Address,
+    pub roles: List<string>,
     init() {
         self.id = 0;
         self.name = "";
@@ -41,7 +29,6 @@ fn main(): void {
               "\"address\":{\"street\":\"Main\",\"city\":\"Pune\"}," +
               "\"roles\":[\"admin\",\"dev\"]}";
 
-    // Parse JSON into User via the compiler-generated binder.
     let u = User__bind(source.fromJson(raw));
     console.log(`id      = ${u.id}`);
     console.log(`name    = ${u.name}`);
@@ -54,6 +41,5 @@ fn main(): void {
         i = i + 1;
     }
 
-    // Serialise User to JSON via the compiler-generated writer (round-trips).
     console.log(`json    = ${User__toJson(u)}`);
 }

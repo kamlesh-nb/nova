@@ -1,10 +1,3 @@
-// Destructured tuple bindings must be TYPED for type-dependent codegen, not just for member access.
-// Sema binds `let (v, e) = f()` element types correctly, and `e.length` worked — but the RENDERED
-// type string misnamed `e` as "i32" (its tuple type doesn't round-trip through
-// resolveExpressionTypeName), so `v + e` and `e == "..."` were decided by that wrong string:
-//   - `v + e` (e a string) did a NUMERIC add on the string POINTER → silent garbage.
-//   - `e == "x"` did a numeric compare instead of a string compare.
-// Fixed by deciding string-concat / string-comparison from the TypeId (isStringExpr), not the name.
 import assert;
 import string;
 
@@ -14,16 +7,14 @@ fn labeled(n: int, s: string): (string, int) { return (s, n); }
 @test
 fn test_destructured_string_concat(): void {
     let (v, e) = pair();
-    // `v + e` — a string operand ⇒ concat (int coerced), NOT a numeric add. Was garbage.
     assert.equalStr(v + e, "5x");
-    // And the other order.
     assert.equalStr(e + v, "x5");
 }
 
 @test
 fn test_destructured_string_compare(): void {
     let (s, n) = labeled(7, "hi");
-    assert.isTrue(s == "hi");     // string compare, not numeric
+    assert.isTrue(s == "hi");
     assert.isFalse(s == "bye");
     assert.equalInt(n, 7);
 }

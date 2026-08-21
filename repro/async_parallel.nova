@@ -1,5 +1,3 @@
-// Proof of TRUE parallelism: 8 `go`-spawned CPU-bound coroutines. If they run in
-// parallel across cores, wall-clock ~= one task; serial would be ~8x.
 import assert;
 import datetime;
 
@@ -25,15 +23,13 @@ async fn runEight(iters: int): int {
 @test
 fn t_parallel(): void {
     let iters = 20000000;
-    // calibrate: one task
     let s0 = datetime.nowNs();
     let one = compute(iters);
     let oneMs = (datetime.nowNs() - s0) / 1000000;
-    // eight concurrent
     let s1 = datetime.nowNs();
     let total = runEight(iters);
     let eightMs = (datetime.nowNs() - s1) / 1000000;
     console.log(`1 task=${oneMs}ms   8 tasks=${eightMs}ms   (serial 8x would be ~${oneMs * 8}ms)`);
     assert.equalInt(total, one * 8);
-    assert.isTrue(eightMs < oneMs * 4);   // parallel: well under 8x
+    assert.isTrue(eightMs < oneMs * 4);
 }

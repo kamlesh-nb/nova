@@ -1,9 +1,6 @@
-// PBKDF2-HMAC-SHA256 (RFC 8018) in pure Nova, over the Nova HMAC-SHA256 primitive. Verified against the
-// RFC 6070-style SHA256 test vectors (see crypto/hash/sha.nova KATs).
 import bytes;
 import crypto.mac.hmac;
 
-// Derive dkLen bytes into out using PBKDF2 with HMAC-SHA1 as the PRF (RFC 6070). Legacy: SCRAM-SHA-1.
 pub fn pbkdf2Sha1(pw: ptr, pwLen: int, salt: ptr, saltLen: int, iters: int, out: ptr, dkLen: int): void {
     let hLen = 20;
     let block = bytes.alloc(saltLen + 4);
@@ -40,10 +37,8 @@ pub fn pbkdf2Sha1(pw: ptr, pwLen: int, salt: ptr, saltLen: int, iters: int, out:
     bytes.free(t);
 }
 
-// Derive dkLen bytes into out using PBKDF2 with HMAC-SHA256 as the PRF.
 pub fn pbkdf2Sha256(pw: ptr, pwLen: int, salt: ptr, saltLen: int, iters: int, out: ptr, dkLen: int): void {
     let hLen = 32;
-    // T_block = salt || INT32BE(blockIndex), fed to the first HMAC of each block.
     let block = bytes.alloc(saltLen + 4);
     let u = bytes.alloc(hLen);
     let t = bytes.alloc(hLen);
@@ -58,12 +53,10 @@ pub fn pbkdf2Sha256(pw: ptr, pwLen: int, salt: ptr, saltLen: int, iters: int, ou
         bytes.write_byte(block, saltLen + 2, (idx >> 8) & 0xff);
         bytes.write_byte(block, saltLen + 3, idx & 0xff);
 
-        // U1 = PRF(pw, salt || INT(idx)); T = U1.
         hmac.hmacSha256(pw, pwLen, block, saltLen + 4, u);
         let k = 0;
         while (k < hLen) { bytes.write_byte(t, k, bytes.read_byte(u, k)); k = k + 1; }
 
-        // U_c = PRF(pw, U_{c-1}); T ^= U_c.
         let c = 1;
         while (c < iters) {
             hmac.hmacSha256(pw, pwLen, u, hLen, u);
@@ -72,7 +65,6 @@ pub fn pbkdf2Sha256(pw: ptr, pwLen: int, salt: ptr, saltLen: int, iters: int, ou
             c = c + 1;
         }
 
-        // Copy min(hLen, remaining) bytes of this block into the output.
         let take = hLen;
         if (dkLen - done < take) { take = dkLen - done; }
         k = 0;

@@ -1,5 +1,3 @@
-// SHA-256 implemented in Nova (M9 phase A, no external library). Verified against NIST known-answer
-// vectors, an incremental (multi-update) hash matching a one-shot, and a multi-block input.
 import crypto.hash.sha256;
 import bytes;
 import assert;
@@ -48,7 +46,6 @@ fn sha256_abc(): void {
 
 @test
 fn sha256_two_block(): void {
-    // NIST 448-bit message vector (56 bytes; forces the two-block padding path).
     let d = strBuf("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq");
     let out = bytes.alloc(32);
     sha256.hashInto(d, 56, out);
@@ -57,11 +54,10 @@ fn sha256_two_block(): void {
 
 @test
 fn sha256_long(): void {
-    // One million 'a' characters -> known digest. Fed in chunks to exercise incremental update.
     let s = sha256.Sha256.create();
     let chunk = bytes.alloc(1000);
     let i = 0;
-    while (i < 1000) { bytes.write_byte(chunk, i, 97); i = i + 1; } // 'a'
+    while (i < 1000) { bytes.write_byte(chunk, i, 97); i = i + 1; }
     let n = 0;
     while (n < 1000) {
         s.update(chunk, 1000);

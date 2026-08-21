@@ -1,6 +1,3 @@
-// NEGATIVE: passing a trait object to a CONCRETE init parameter (via a constructor call) is the same unsound
-// trait->concrete narrowing as a plain call arg, and must be rejected. Regression guard extending the connpass
-// soundness fix (L1) from free/method call args to CONSTRUCTOR args.
 trait Speaker { fn speak(self): int; }
 struct Dog impl Speaker {
     pub n: int,
@@ -12,5 +9,5 @@ fn makeSpeaker(): Speaker { return Dog(7); }
 @test
 fn t(): void {
     let s = makeSpeaker();
-    let h = Holder(s);   // ERROR: trait Speaker -> concrete Dog at a constructor arg
+    let h = Holder(s);
 }

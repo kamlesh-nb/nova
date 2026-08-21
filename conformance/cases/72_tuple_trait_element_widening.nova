@@ -1,13 +1,3 @@
-// A3(b): a struct in a TRAIT-typed tuple element must be WIDENED to the trait object at construction,
-// or a raw struct sits in the trait slot → garbage vtable → SEGV. This needs two halves working
-// together:
-//   - sema types the tuple LITERAL by its EXPECTED type, so `(1, A{})` at `(int, G)` types element 1
-//     as the trait G (not the struct A) — for BOTH a return position and an annotated `let`.
-//   - codegen widens the struct element (constructTraitObject) with the let-widening ARC discipline
-//     (consume the struct's own temp + the fat-pointer temp, release the orphaned struct ref), and
-//     the `(int, G)` tuple destructor releases the trait element — a single-letter trait name (`G`)
-//     is an OWNED type, not a type parameter (the isRefCountedType fix), so nothing leaks.
-// Prior to the fix: SEGV (garbage vtable) or a 16-byte leak (empty tuple destructor). ASAN+ARC clean now.
 import assert;
 
 trait G { fn v(self: G): int; }
@@ -19,14 +9,12 @@ fn pair(): (int, G) { return (1, A{}); }
 @test
 fn test_trait_tuple_return_position(): void {
     let (n, g) = pair();
-    assert.equalInt(g.v(), 3);   // dispatches through the widened trait object
+    assert.equalInt(g.v(), 3);
     assert.equalInt(n, 1);
 }
 
 @test
 fn test_trait_tuple_annotated_local(): void {
-    // The literal is typed by the `let`'s declared type, then destructured out of a NAMED local —
-    // the path that leaked (the tuple destructor for `(int, G)` released nothing).
     let p: (int, G) = (1, B{});
     let (n, g) = p;
     assert.equalInt(g.v(), 7);

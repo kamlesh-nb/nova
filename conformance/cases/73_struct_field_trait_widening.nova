@@ -1,10 +1,3 @@
-// A3(c): a struct LITERAL with a trait-typed field initialized directly by a struct value must widen
-// the struct to the trait object at construction — `Holder{ g: A{} }` where `g: G`. The A3 widening
-// audit only covered a field initialized from an ALREADY-trait value (`Holder{ g: x }`, x: G), which
-// needs no widening; a struct-literal field init was still raw → garbage vtable → SEGV.
-// Two halves: codegen widens the field value (constructTraitObject + consume-struct-temp discipline),
-// and for a field whose type is a TUPLE containing a trait (`p: (int, G)`), sema types the field
-// literal by its declared type so the tuple element lands as the trait and the tuple arm widens it.
 import assert;
 
 trait G { fn v(self: G): int; }
@@ -26,14 +19,12 @@ fn test_struct_literal_trait_field_other(): void {
     assert.equalInt(h.g.v(), 7);
 }
 
-// A field init from an already-trait value must still work (no double-widen).
 fn wrap(x: G): Holder { return Holder{ g: x }; }
 @test
 fn test_field_from_trait_value(): void {
     assert.equalInt(wrap(A{}).g.v(), 3);
 }
 
-// A field whose type is a tuple containing a trait — the literal is typed by context.
 @test
 fn test_struct_field_tuple_with_trait(): void {
     let x = Pair2{ p: (4, A{}) };

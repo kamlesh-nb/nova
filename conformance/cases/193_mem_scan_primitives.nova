@@ -1,36 +1,29 @@
-// Phase 4 support: the SIMD-backed scan and compare primitives the HTTP parser and the string
-// library route through. On modern macOS and Linux, libc memchr/memcmp/memcpy are hand-tuned
-// NEON/AVX, so binding them gives the picohttpparser-style delimiter scan and fast comparison
-// without first-class vector codegen. This proves they work through the FFI.
 import assert;
 import bytes;
 import os.sys;
 
-// Scan an HTTP header line "Host: x\r\n" for its delimiters, the exact inner loop of a fast
-// header parser: find ':' then '\r'.
 @test
 fn test_memchr_delimiter_scan(): void {
     let line = bytes.alloc(9);
-    bytes.write_byte(line, 0, 72);  // H
-    bytes.write_byte(line, 1, 111); // o
-    bytes.write_byte(line, 2, 115); // s
-    bytes.write_byte(line, 3, 116); // t
-    bytes.write_byte(line, 4, 58);  // :
-    bytes.write_byte(line, 5, 32);  // space
-    bytes.write_byte(line, 6, 120); // x
-    bytes.write_byte(line, 7, 13);  // \r
-    bytes.write_byte(line, 8, 10);  // \n
+    bytes.write_byte(line, 0, 72);
+    bytes.write_byte(line, 1, 111);
+    bytes.write_byte(line, 2, 115);
+    bytes.write_byte(line, 3, 116);
+    bytes.write_byte(line, 4, 58);
+    bytes.write_byte(line, 5, 32);
+    bytes.write_byte(line, 6, 120);
+    bytes.write_byte(line, 7, 13);
+    bytes.write_byte(line, 8, 10);
 
-    let colon = sys.memchr(line, 58, 9);   // ':'
+    let colon = sys.memchr(line, 58, 9);
     assert.isTrue(colon != 0);
     assert.equalInt((colon - line) as int, 4);
 
-    let cr = sys.memchr(line, 13, 9);       // '\r'
+    let cr = sys.memchr(line, 13, 9);
     assert.isTrue(cr != 0);
     assert.equalInt((cr - line) as int, 7);
 
-    // A byte that is not present returns null.
-    let none = sys.memchr(line, 63, 9);     // '?'
+    let none = sys.memchr(line, 63, 9);
     assert.equalInt(none as int, 0);
 
     bytes.free(line);
@@ -46,15 +39,15 @@ fn test_memcmp_and_memcpy(): void {
         bytes.write_byte(b, i, (65 + i) as long);
         i = i + 1;
     }
-    assert.equalInt(sys.memcmp(a, b, 8), 0);      // equal
+    assert.equalInt(sys.memcmp(a, b, 8), 0);
 
     bytes.write_byte(b, 3, 99);
-    assert.isTrue(sys.memcmp(a, b, 8) != 0);      // differ
+    assert.isTrue(sys.memcmp(a, b, 8) != 0);
 
     let c = bytes.alloc(8);
     let ret = sys.memcpy(c, a, 8);
-    assert.isTrue(ret == c);                       // memcpy returns dst
-    assert.equalInt(sys.memcmp(a, c, 8), 0);      // copy matches
+    assert.isTrue(ret == c);
+    assert.equalInt(sys.memcmp(a, c, 8), 0);
 
     bytes.free(a);
     bytes.free(b);

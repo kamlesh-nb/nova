@@ -1,6 +1,5 @@
-// nsieve: count primes up to 10000<<k for k in {n, n-1, n-2}. Reused fixed bool buffer, REPS for timing.
 const N: int = 4;
-const MAX: int = 160000;      // 10000 << 4
+const MAX: int = 160000;
 const REPS: int = 400;
 fn sieve(flags: bool[160000], m: int): int {
     let i = 0; while (i < m) { flags[i] = true; i = i + 1; }

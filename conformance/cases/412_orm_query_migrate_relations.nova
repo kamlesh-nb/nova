@@ -1,7 +1,3 @@
-// ORM beyond data-mapper: the fluent query builder (parameterised SQL, values never in the text), schema
-// migrations (CREATE TABLE builder + version tracking + ordering), and relation eager-load queries
-// (hasMany/belongsTo IN-clauses). Every value is bound as `$N`; these gates assert the generated SQL and the
-// collected parameters offline.
 import data.query;
 import data.migrate;
 import data.relations;

@@ -1,49 +1,167 @@
+//! Top-level LLVM code-generation driver: turns a fully type-checked Nova
+//! [`ast.Program`] into an object file (or a set of per-file object files) on
+//! disk. This is the entry point the compiler pipeline calls after semantic
+//! analysis; everything below it (`expressions.zig`, `statements.zig`,
+//! `arc.zig`, `types.zig`) is machinery that [`compile`] orchestrates.
+//!
+//! The heavy lifting lives on [`LlvmCompiler`] (in `llvm_codegen.zig`); this
+//! file owns the *order of operations* for a whole program, which is subtle and
+//! must run in exactly this sequence:
+//!
+//!   1. Index top-level decls (constants, enums, traits) so later phases can
+//!      resolve names, then collect every function to emit (including generic
+//!      monomorphisations and closures reachable from their bodies).
+//!   2. Lay down module-global state: the bump-pointer heap globals
+//!      (`heap_ptr`/`persistent_ptr`/`free_list`), interned string literals as
+//!      constant structs, and the declarations of every runtime intrinsic the
+//!      program can call (string/decimal helpers, the reactor/coroutine ABI,
+//!      threading primitives, process/fs syscalls, FFI shims). WASM and native
+//!      get different intrinsic sets because WASM imports I/O from the host.
+//!   3. Build the per-function local-type maps by matching each collected
+//!      function back to its source declaration (free function, struct method,
+//!      enum method, or lambda). This is where `self` and parameter types are
+//!      recorded so the body emitter knows each local's slot type.
+//!   4. Declare every function's LLVM prototype, tagging async native functions
+//!      as `presplitcoroutine` so LLVM's CoroSplit pass can later split them.
+//!   5. Emit each function body: alloca the params and locals, run the async
+//!      coroutine prologue/epilogue where needed, compile the statements, and
+//!      close the entry block with the right terminator (constructors return
+//!      `self`, `main` returns 0, coroutines branch to their final suspend).
+//!   6. Finalise: optional coverage init, then either the per-file split emit
+//!      ([`compileSplitEmit`]) or a single-module emit ([`emitModule`]).
+//!
+//! Design decisions worth knowing:
+//!
+//! - Heap model. Native code carves a 16 MB slab from `malloc` in `main` and
+//!   bump-allocates from `heap_ptr`; a second region starting 32 MB up is the
+//!   `persistent_ptr` arena for allocations that must outlive a request. On
+//!   WASM the base is `__heap_base` and the globals start at zero because the
+//!   host owns memory growth. See the `heap_start` computation in [`compile`],
+//!   which reserves room below the heap for the interned string data.
+//!
+//! - Monomorphisation is already done by sema. Functions arrive with an
+//!   `instantiation` (the concrete type name, e.g. `List_int`) and an
+//!   `instantiation_id`; the erased generic bodies are emitted with `internal`
+//!   linkage as a link-time fallback that globalDCE drops. Async generic
+//!   methods are only spawnable from a concrete instantiation, which is why the
+//!   erased-body handling and the `presplitcoroutine` tagging are kept distinct.
+//!
+//! - The self-verifying ARC pass ([`LlvmCompiler.verifyArcBalance`]) runs inside
+//!   [`emitModule`], before LLVM's own verifier and optimisation pipeline, so a
+//!   retain/release imbalance is caught at the IR we generated rather than after
+//!   O3 has rewritten it.
+
+/// Zig standard library: allocators, hashing, `std.Io` for filesystem stat/mtime
+/// during the T6 object cache, and `std.debug.print` for `[MEM]`/`[T6]` diagnostics.
 const std = @import("std");
+/// Nova's abstract syntax tree. Provides [`ast.Program`], [`ast.Statement`], and
+/// the declaration variants ([`ast.fn_decl`]/`struct_decl`/`enum_decl`) that
+/// [`compile`] walks to drive emission.
 const ast = @import("../../frontend/ast.zig");
+/// The sema "shadow" typed-IR handoff. [`compile`] reads `live_ir`/`live_store`
+/// from here to seed the compiler's typed IR and type store, plus the
+/// `f2_types_enabled` flag that selects the typed-IR code path.
 const sema_shadow = @import("../../frontend/sema/shadow.zig");
+/// Monomorphisation state from sema. `live_inst_ids` maps a concrete
+/// instantiation name to its stable id, used to resolve a function's
+/// `instantiation_id` when only the instantiation name is present.
 const sema_mono = @import("../../frontend/sema/mono.zig");
+/// The sema type system. Only [`sema_types.TypeId`] is used here, to key the
+/// per-function `local_type_ids` maps that carry precise type identities.
 const sema_types = @import("../../frontend/types.zig");
+/// Strips a monomorphised name like `List_int` down to its base struct name so
+/// `self`'s struct can be identified for a method instantiation.
 const getStructBaseName = @import("types.zig").getStructBaseName;
+/// Returns the SIMD vector element/lane name for a type spelling (or null), used
+/// to decide whether a parameter/return slot needs a native vector type rather
+/// than the generic value word.
 const simdVecName = @import("types.zig").simdVecName;
+/// The Zig bindings to the LLVM C API. All IR construction below goes through
+/// its `types`/`core`/`analysis`/`target_machine`/`transform`/`errors` submodules.
 const llvm = @import("llvm");
+/// LLVM opaque handle types: `LLVMTypeRef`, `LLVMValueRef`, `LLVMModuleRef`, etc.
 const types = llvm.types;
+/// The LLVM `core` API: building instructions, globals, functions, basic blocks,
+/// and constants. The bulk of the LLVM calls in this file.
 const core = llvm.core;
+/// LLVM module verification (`LLVMVerifyModule`), run in [`emitModule`] before
+/// optimisation so a malformed module we produced fails loudly.
 const analysis = llvm.analysis;
+/// LLVM target-machine API: object-file emission (`LLVMTargetMachineEmitToFile`)
+/// for the final `.o`.
 const target_machine = llvm.target_machine;
+/// LLVM new-pass-manager driver: `LLVMRunPasses` for `globaldce`, the O0/O3
+/// pipelines, and the ASAN instrumentation pass.
 const transform = llvm.transform;
+/// LLVM error-handle helpers; `LLVMConsumeError` swallows a pass error we choose
+/// to tolerate (e.g. a best-effort `globaldce` during split emit).
 const errors = llvm.errors;
 
+/// The stateful per-compilation code generator. Holds the LLVM module/builder,
+/// the function/global/string maps, the interned-type store, and every
+/// `current_*` cursor the expression/statement emitters read while walking a
+/// body. [`compile`] constructs one and threads it through every phase.
 const LlvmCompiler = @import("llvm_codegen.zig").LlvmCompiler;
+/// Expands Nova source-level escape sequences in a string literal to their raw
+/// bytes, so the interned literal's length and `LLVMConstString` payload are the
+/// real byte contents.
 const unescapeString = @import("llvm_codegen.zig").unescapeString;
+/// The per-function record produced by collection: name, param names/count,
+/// return type, body, source file, and monomorphisation identity. [`compile`]
+/// iterates `compiler.functions.items` of these to declare and emit each function.
 const FunctionInfo = @import("llvm_codegen.zig").FunctionInfo;
+/// A lexical scope frame holding the list of `defer`red expressions to run on
+/// exit. Pushed on function entry and unwound (in reverse) when the entry block
+/// falls through to its implicit return.
 const Scope = @import("llvm_codegen.zig").Scope;
 
-// User-facing build options, set from CLI flags by builder/tester before compile() runs (see
-// pipeline.hasFlag). These replace the former NOVA_* env vars for the codegen-deep knobs.
+/// Process-global emission toggles, set once by the compiler driver and read
+/// throughout this file. Kept as a namespace of `var`s (rather than threaded
+/// parameters) because they are stable for the whole run and read from deep
+/// inside the split-emit and per-module paths.
 pub const flags = struct {
-    pub var split_per_file: bool = false; // --split-objects: per-file objects instead of one combined
-    pub var prune: bool = false; // --prune: demand-prune unreachable functions (opt-in)
-    pub var dump_ir: bool = false; // --emit-llvm: write the post-opt IR next to the object
-    pub var mem_stats: bool = false; // --mem-stats: print per-phase peak RSS
+    /// When true, [`compileSplitEmit`] partitions the module into one object
+    /// file per Nova source file instead of a single combined object. This is
+    /// the default-on T6 per-file split that feeds the content-hash object cache.
+    pub var split_per_file: bool = false;
+    /// When true (see [`pruneEnabled`]), split emit first runs a whole-program
+    /// `globaldce` reachability analysis and marks unreachable functions
+    /// `internal` so they are dropped, shrinking each per-file object.
+    pub var prune: bool = false;
+    /// When true, also write human-readable LLVM IR (`.ll`) alongside the object
+    /// output, for debugging what codegen produced.
+    pub var dump_ir: bool = false;
+    /// When true, [`memPhase`] prints peak RSS at each named phase boundary, used
+    /// to profile compiler memory across the emission pipeline.
+    pub var mem_stats: bool = false;
 };
 
-// Phase profiler: prints peak RSS (ru_maxrss, bytes on macOS) reached so far, so we can see which codegen
-// phase pushes the high-water mark. Zero-cost unless --mem-stats is passed.
+/// Print the current process peak resident set (`maxrss`) in MB against a phase
+/// label, or do nothing if `flags.mem_stats` is off.
+///
+/// A cheap memory checkpoint dropped between the expensive phases of [`compile`]
+/// (collection, body emit, optimisation) so a memory regression can be pinned to
+/// a phase without a profiler.
 fn memPhase(label: []const u8) void {
     if (!flags.mem_stats) return;
     const ru = std.posix.getrusage(std.posix.rusage.SELF);
-    const mb = @as(u64, @intCast(ru.maxrss)) / (1024 * 1024); // macOS: bytes
+    const mb = @as(u64, @intCast(ru.maxrss)) / (1024 * 1024);
     std.debug.print("[MEM] {s:<28} peak={d} MB\n", .{ label, mb });
 }
 
-// Demand pruning: drop functions unreachable from the program entry so a source file the app never
-// calls (crypto/tls/bson in a plain web app) produces NO object at all. OPT-IN (--prune) while an
-// intermittent heap-corruption during --release emit is investigated -- default builds compile every
-// imported file's object, which is the known-good behaviour.
+/// Whether the split-emit dead-code prune is on. A one-line indirection over
+/// `flags.prune` so the call sites in [`compileSplitEmit`] read as intent.
 fn pruneEnabled() bool {
     return flags.prune;
 }
 
+/// Map a Nova FFI scalar type name to the LLVM type used at the C boundary.
+///
+/// Handles the four scalars that have a distinct C ABI representation (`int` →
+/// i32, `long` → i64, `bool` → i8, `void` → void) and falls back to an opaque
+/// pointer for everything else (strings, structs, and any type passed by
+/// reference across `extern` functions). Used when declaring `extern_lib`
+/// prototypes in [`compile`].
 fn ffiCType(compiler: *LlvmCompiler, type_name: []const u8) types.LLVMTypeRef {
     if (std.mem.eql(u8, type_name, "int")) return compiler.i32_type;
     if (std.mem.eql(u8, type_name, "long")) return compiler.i64_type;
@@ -53,7 +171,12 @@ fn ffiCType(compiler: *LlvmCompiler, type_name: []const u8) types.LLVMTypeRef {
     return compiler.ptr_type;
 }
 
-// The source span of a statement, whichever variant it is (used for DWARF line attribution).
+/// Extract the source [`ast.Span`] of any statement variant.
+///
+/// The AST does not expose a span uniformly across statement kinds, so this
+/// switches over every variant to reach its `.span`. Used to pick the debug
+/// line for a function's first statement so the DWARF line table points at real
+/// code rather than the function header.
 fn stmtSpan(stmt: ast.Statement) ast.Span {
     return switch (stmt) {
         .block => |s| s.span,
@@ -70,6 +193,28 @@ fn stmtSpan(stmt: ast.Statement) ast.Span {
     };
 }
 
+/// Compile a whole type-checked program to an object file (or per-file objects).
+///
+/// This is the code-generation entry point. It constructs an [`LlvmCompiler`],
+/// then runs the full pipeline described in the file header: index decls,
+/// collect functions and closures, lay down heap globals and string literals,
+/// declare every runtime intrinsic (a different set for WASM vs native), build
+/// the per-function local-type maps, declare and then emit each function body,
+/// wire coverage init, and finally emit the module.
+///
+/// Parameters that change the shape of the output:
+/// - `is_wasm` selects the WASM intrinsic/import set and the `__heap_base` heap
+///   model instead of the native `malloc` slab.
+/// - `is_release` selects the O3 (vs O0) LLVM pipeline in [`emitModule`].
+/// - `target_triple_opt` overrides the host target triple for cross-compilation.
+/// - `t6_split` together with a non-null `objs_out` diverts final emission to
+///   [`compileSplitEmit`], appending each per-file object path to `objs_out`;
+///   `cache_dir` is where those cached objects live and `io` is used to stat
+///   their mtimes for cache freshness.
+///
+/// Returns an error on LLVM module-verification failure, a failed pass pipeline,
+/// or object emission failure; otherwise the object(s) exist on disk on return.
+/// The [`LlvmCompiler`] is fully torn down via `defer` regardless of outcome.
 pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool, is_release: bool, target_triple_opt: ?[]const u8, output_path: []const u8, coverage_enabled: bool, t6_split: bool, objs_out: ?*std.ArrayList([]const u8), cache_dir: ?[]const u8, io: std.Io) !void {
     var compiler = try LlvmCompiler.new(allocator, is_wasm, is_release, target_triple_opt, coverage_enabled);
 
@@ -79,8 +224,6 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
     compiler.f2_types = sema_shadow.f2_types_enabled;
     defer compiler.deinit();
 
-    // Resolve the absolute cwd once so DWARF records absolute source dirs (lldb-dap matches
-    // breakpoints by absolute path; a relative dir only binds by basename, which it won't do).
     {
         var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
         if (std.Io.Dir.realPathFile(.cwd(), io, ".", &cwd_buf)) |n| {
@@ -95,9 +238,6 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
     for (program.declarations) |decl| {
         switch (decl) {
             .const_decl => |c| try compiler.constants.put(c.name, c.value),
-            // Key colliding enums by their module-scoped name (like structs), so two same-named enums in
-            // different modules don't overwrite each other (S3). Non-colliding keep the bare name. Traits
-            // stay bare-keyed (their scoping is a separate follow-on; see renderLegacy).
             .enum_decl => |e| try compiler.enums.put(compiler.scopedStructName(e.name, e.span.file), e),
             .trait_decl => |t| try compiler.traits.put(t.name, t),
             else => {},
@@ -112,8 +252,6 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         compiler.current_collecting_function_name = compiler.functions.items[i].name;
 
         compiler.current_collecting_instantiation = compiler.functions.items[i].instantiation;
-        // Derive the inst_key IDENTICALLY to the body-compile lookup (see line ~669) so a closure's
-        // registration key and its lookup key agree: raw instantiation_id, else the name->live_inst_ids map.
         compiler.current_collecting_instantiation_id = compiler.functions.items[i].instantiation_id orelse
             (if (compiler.functions.items[i].instantiation) |inst| sema_mono.live_inst_ids.get(inst) else null);
         compiler.current_collecting_erased_generic = compiler.functions.items[i].erased_generic;
@@ -190,10 +328,6 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
 
         const str_z = try allocator.dupeZ(u8, unescaped);
         defer allocator.free(str_z);
-        // Immortal constant: NEGATIVE refcount => nova_retain/nova_release are no-ops (both early-return on
-        // `*rc < 0`). +100000000 was decremented per use (literal stored without a matching retain, released
-        // on drop), so a literal reused >1e8 times drifted to zero, freed the shared global, and double-freed.
-        // Must match getOrCreateStringLiteral in llvm_codegen.zig (the other string-literal emitter).
         const ref_const = core.LLVMConstInt(compiler.i32_type, @as(c_ulonglong, @bitCast(@as(i64, -1000000000))), 0);
         const len_const = core.LLVMConstInt(compiler.i32_type, @intCast(unescaped.len), 0);
         const chars_const = core.LLVMConstString(str_z.ptr, @intCast(unescaped.len), 1);
@@ -220,18 +354,13 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         var f64bits_p = [_]types.LLVMTypeRef{core.LLVMDoubleType()};
         try compiler.func_map.put("nova_f64_bits", core.LLVMAddFunction(compiler.module, "nova_f64_bits", core.LLVMFunctionType(compiler.val_type, &f64bits_p, 1, 0)));
 
-        // nova_pg_be_f64(ptr: long, len: int) -> double : big-endian IEEE float read for the pg BINARY decode.
         var pgbe_p = [_]types.LLVMTypeRef{ compiler.val_type, compiler.i32_type };
         try compiler.func_map.put("nova_pg_be_f64", core.LLVMAddFunction(compiler.module, "nova_pg_be_f64", core.LLVMFunctionType(core.LLVMDoubleType(), &pgbe_p, 2, 0)));
-        // nova_pg_be_i64(ptr: long, len: int) -> long : big-endian signed int read for the pg BINARY decode.
         var pgbei_p = [_]types.LLVMTypeRef{ compiler.val_type, compiler.i32_type };
         try compiler.func_map.put("nova_pg_be_i64", core.LLVMAddFunction(compiler.module, "nova_pg_be_i64", core.LLVMFunctionType(compiler.val_type, &pgbei_p, 2, 0)));
-        // nova_html_find_meta(base: long, start: int, len: int) -> int : SWAR scan for next HTML metachar.
         var hfm_p = [_]types.LLVMTypeRef{ compiler.val_type, compiler.i32_type, compiler.i32_type };
         try compiler.func_map.put("nova_html_find_meta", core.LLVMAddFunction(compiler.module, "nova_html_find_meta", core.LLVMFunctionType(compiler.i32_type, &hfm_p, 3, 0)));
 
-        // nova_f64_sqrt IS the llvm.sqrt.f64 intrinsic (double -> double), lowered by LLVM to a hardware
-        // fsqrt. Registering it under this name lets math.fsqrt call it like any extern; no runtime symbol.
         var sqrt_p = [_]types.LLVMTypeRef{core.LLVMDoubleType()};
         try compiler.func_map.put("nova_f64_sqrt", core.LLVMAddFunction(compiler.module, "llvm.sqrt.f64", core.LLVMFunctionType(core.LLVMDoubleType(), &sqrt_p, 1, 0)));
 
@@ -390,8 +519,6 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         const panic_fn = core.LLVMAddFunction(compiler.module, "nova_panic", core.LLVMFunctionType(compiler.void_type, &one_param_ptr, 1, 0));
         try compiler.func_map.put("nova_panic", panic_fn);
 
-        // nova_panic_cstr takes a plain C string (not a Nova string with an ARC header). Used by
-        // codegen to emit runtime traps such as integer division by zero.
         const panic_cstr_fn = core.LLVMAddFunction(compiler.module, "nova_panic_cstr", core.LLVMFunctionType(compiler.void_type, &one_param_ptr, 1, 0));
         try compiler.func_map.put("nova_panic_cstr", panic_cstr_fn);
 
@@ -411,11 +538,7 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         const test_fail_msg_fn = core.LLVMAddFunction(compiler.module, "nova_test_fail_message", test_fail_msg_type);
         try compiler.func_map.put("nova_test_fail_message", test_fail_msg_fn);
 
-        // The wolfSSL socket-TLS (nova_tls_*), TDS-TLS (nova_tds_tls_*), and memory-BIO (nova_mtls_*)
-        // externs were removed in M13: TLS is now pure Nova (crypto/tls, net/tlsmembio, net/tls12bio).
 
-        // nova_getenv/nova_setenv were retired in M6: std/env.nova reads and writes the environment
-        // through the getenv/setenv bindings in os/sys.
 
         const argc_type = core.LLVMFunctionType(compiler.val_type, &one_param_ptr, 0, 0);
         try compiler.func_map.put("nova_arg_count", core.LLVMAddFunction(compiler.module, "nova_arg_count", argc_type));
@@ -423,14 +546,10 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         const argat_type = core.LLVMFunctionType(compiler.val_type, &argat_params, 1, 0);
         try compiler.func_map.put("nova_arg_at", core.LLVMAddFunction(compiler.module, "nova_arg_at", argat_type));
 
-        // SHA/MD5/HMAC/PBKDF2/random are now pure Nova (M11 stage A); only the MySQL auth-scramble and
-        // All crypto (SHA/HMAC/PBKDF2/random/MySQL-scramble/RSA-OAEP) is pure Nova as of M11 stage B;
-        // no wolfCrypt shim is declared here anymore.
         var getrandom_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.i64_type };
         const getrandom_fn = core.LLVMAddFunction(compiler.module, "nova_getrandom", core.LLVMFunctionType(compiler.void_type, &getrandom_params, 2, 0));
         try compiler.func_map.put("nova_getrandom", getrandom_fn);
 
-        // nova_gzip_compress/decompress retired: gzip is pure Nova (compress/deflate.nova).
 
         var process_spawn_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.ptr_type };
         const process_spawn_type = core.LLVMFunctionType(compiler.ptr_type, &process_spawn_params, 2, 0);
@@ -500,10 +619,6 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         const audit_fn = core.LLVMAddFunction(compiler.module, "nova_arc_audit_report", audit_type);
         try compiler.func_map.put("nova_arc_audit_report", audit_fn);
 
-        // File and directory runtime functions retired in M5: file and directory I/O moved to
-        // Nova over os/sys (see src/std/io/file.nova and src/std/io/dir.nova), so the codegen no
-        // longer declares nova_file_*/nova_dir_*. The only shim left is nova_open (variadic open),
-        // declared in Nova as an extern("c") in os/sys.nova.
 
         var bytes_free_params = [_]types.LLVMTypeRef{compiler.val_type};
         const bytes_free_type = core.LLVMFunctionType(compiler.void_type, &bytes_free_params, 1, 0);
@@ -553,7 +668,6 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         var reactor_resume_p = [_]types.LLVMTypeRef{val_type};
         const reactor_resume_type = core.LLVMFunctionType(val_type, &reactor_resume_p, 1, 0);
         try compiler.func_map.put("nova_reactor_resume", core.LLVMAddFunction(compiler.module, "nova_reactor_resume", reactor_resume_type));
-        // nova_set_reuseport retired in M6: sys.setReusePort is pure Nova over setsockopt.
 
         var run_reactors_p = [_]types.LLVMTypeRef{ val_type, val_type };
         const run_reactors_type = core.LLVMFunctionType(void_type, &run_reactors_p, 2, 0);
@@ -764,10 +878,6 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
                         if (p.type_name) |t| {
                             const p_type = try compiler.typeRefToString(t);
                             try local_types.put(p.name, p_type);
-                            // Also record the param's TypeId (optionality PRESERVED, unlike typeRefToString
-                            // which drops `.optional`). This lets value-use codegen recognise a value-optional
-                            // PARAMETER as a boxed slot and unbox it on `??`/comparison irrespective of flow
-                            // narrowing -- the C10 fix (uniform boxed value-optional param ABI).
                             if (compiler.tidForTypeRef(t)) |tid| try local_type_ids.put(p.name, tid);
                         }
                     }
@@ -887,19 +997,12 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         const params = try allocator.alloc(types.LLVMTypeRef, func.param_count);
         defer allocator.free(params);
         @memset(params, compiler.val_type);
-        // Array params flow as `ptr` (not the i64 word): the pointer arrives as a clean function
-        // argument with provenance, so LLVM can disambiguate arrays and vectorize/hoist the loop. (No
-        // `noalias` -- it would be unsound if the same array is passed to two params; LLVM still
-        // vectorizes via a runtime overlap check.) The caller inttoptr's the i64 array value at the
-        // call site (existing arg coercion). Return type stays the word for now.
         if (compiler.function_local_types.get(func.name)) |lt| {
             for (0..func.param_count) |pi| {
                 if (lt.get(func.param_names[pi])) |tn| {
                     if (std.mem.indexOfScalar(u8, tn, '[') != null) {
                         params[pi] = compiler.ptr_type;
                     } else if (simdVecName(tn) != null or std.mem.eql(u8, tn, "f64x4")) {
-                        // FR-simd-L1: a SIMD-vector parameter travels as its real <N x iM> LLVM type (in a
-                        // vector register), not the i64 word, so it stays register-resident across the call.
                         params[pi] = compiler.slotTypeForLocal(tn);
                     }
                 }
@@ -911,7 +1014,6 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
 
         const is_async_native = func.is_async and !is_wasm;
 
-        // A SIMD-vector return also travels as the vector type (see the parameter note above).
         const is_vec_ret = simdVecName(func.return_type) != null or std.mem.eql(u8, func.return_type, "f64x4");
         const ret_t = if (is_main) compiler.val_type else if (is_async_native) compiler.val_type else if (is_void) compiler.void_type else if (is_vec_ret) compiler.slotTypeForLocal(func.return_type) else compiler.val_type;
 
@@ -943,13 +1045,6 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
     for (compiler.functions.items) |func| {
         const fn_val = compiler.func_map.get(func.name).?;
 
-        // Skip a use-less erased fallback -- EXCEPT for RawBuffer, the universal container backing
-        // (M-10). An erased container body (e.g. erased List_init) constructs an erased RawBuffer_init
-        // whose use is only created once the container body is emitted; if RawBuffer was visited first
-        // it would be skipped here and left undefined at link. RawBuffer's erased bodies codegen
-        // cleanly, so emit them unconditionally (internal linkage); globalDCE drops them if the whole
-        // erased chain is unreachable. Everything else keeps the no-use skip (some erased bodies -- a
-        // closure in an erased generic method, etc. -- do not codegen when erased and must stay elided).
         const is_rawbuf_backing = std.mem.startsWith(u8, func.name, "RawBuffer_");
         if (func.erased_generic and !is_rawbuf_backing and core.LLVMGetFirstUse(fn_val) == null) continue;
 
@@ -986,7 +1081,7 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
                     decl_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ prefix, decl.fn_decl.name });
                     decl_name_owned = true;
                 } else if (compiler.getModulePrefix(decl.fn_decl.span)) |mod_prefix| {
-                    defer allocator.free(mod_prefix); // getModulePrefix returns owned memory
+                    defer allocator.free(mod_prefix);
                     if (LlvmCompiler.isAlreadyNamespaced(decl.fn_decl.name)) {
                         decl_name = decl.fn_decl.name;
                     } else {
@@ -1039,19 +1134,12 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         const entry_bb = core.LLVMAppendBasicBlock(fn_val, "entry");
         core.LLVMPositionBuilderAtEnd(compiler.builder, entry_bb);
 
-        // DWARF (Gap 4): attach this function's DISubprogram + set it as the active debug scope, so
-        // statement debug locations (set during body emission) resolve to it. Self-guards on debug mode.
-        // The function line comes from the first statement (reliably inside the body) rather than the
-        // block span, which points past the closing brace for some declarations.
         const fn_dbg_line = if (func.body.statements.len > 0)
             stmtSpan(func.body.statements[0]).line
         else
             func.body.span.line;
         compiler.beginFunctionDebug(fn_val, func.name, func.source_file, fn_dbg_line);
 
-        // (The HIR/MIR/LIR LLVM-emit optimiser was scrapped 2026-08-16 -- it delivered ~0 optimisation over
-        // AST+LLVM O3; see docs/design/sil-arc-optimiser-direction.md. Every function is compiled from the
-        // AST below, as it always effectively was.)
 
         {
             var iter = compiler.current_saved_captures.iterator();
@@ -1088,7 +1176,6 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
             }
             _ = core.LLVMBuildStore(compiler.builder, compiler.coerceToSlotType(arg_val, slot_ty), alloca_val);
             try compiler.locals.put(arg_name, alloca_val);
-            // DWARF (Gap 4, item 2): declare the parameter so the debugger shows its value.
             compiler.declareLocalVar(alloca_val, arg_name, if (compiler.current_local_types) |lt| lt.get(arg_name) else null, slot_ty);
         }
 
@@ -1121,9 +1208,6 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
                 alloca_val = core.LLVMBuildAlloca(compiler.builder, slot_ty, name_z.ptr);
             }
 
-            // Zero-init the slot with the right kind of null: 0.0 for double, 0 for ints, and a real
-            // null/zeroinitializer for ptr (array) and vector slots -- ConstInt on a non-int type emits
-            // an invalid `i0 0` that poisons the optimizer (blocks vectorization).
             const zk = core.LLVMGetTypeKind(slot_ty);
             const zero = if (zk == .LLVMDoubleTypeKind)
                 core.LLVMConstReal(slot_ty, 0)
@@ -1133,7 +1217,6 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
                 core.LLVMConstNull(slot_ty);
             _ = core.LLVMBuildStore(compiler.builder, zero, alloca_val);
             try compiler.locals.put(name, alloca_val);
-            // DWARF (Gap 4, item 2): declare the local so the debugger shows its value.
             compiler.declareLocalVar(alloca_val, name, if (compiler.current_local_types) |lt| lt.get(name) else null, slot_ty);
         }
 
@@ -1276,9 +1359,6 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         }
     }
 
-    // The post-optimisation IR dump is OPT-IN (--emit-llvm). It was written on EVERY non-split compile
-    // (~70MB per `nova test`/single-file build) and nothing reads it. When requested, write it beside
-    // the object so it stays inside the caller's output dir (e.g. build/test/), not the cwd.
     var ll_buf: [std.fs.max_path_bytes]u8 = undefined;
     const ll_name: ?[]const u8 = if (flags.dump_ir) blk: {
         const dir = std.fs.path.dirname(output_path) orelse ".";
@@ -1287,6 +1367,28 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
     try emitModule(&compiler, allocator, compiler.module, output_path, is_wasm, is_release, ll_name);
 }
 
+/// Emit the program as one or more object files under the T6 split scheme,
+/// appending each produced path to `objs`.
+///
+/// Three modes, in order of the branches:
+///
+///   1. Not `split_per_file`: emit the whole module as a single `<app>.o`
+///      (cache-dir aware) and return. This is the "split enabled but coalesced"
+///      case, still routed here because it shares the `LinkOnceODR` promotion of
+///      `heap_ptr`/`_vtable_*` globals that lets several objects share one copy.
+///   2. `split_per_file` without `prune`: partition every emitted function by
+///      its source file and, for each file, clone the module and gut the bodies
+///      of functions that belong to other files, leaving one object per source.
+///   3. `split_per_file` with `prune`: first run a whole-program `globaldce`
+///      reachability pass (on a clone, so the real module keeps its bodies for
+///      the per-file clones), mark unreachable functions `internal`, prune, and
+///      only then partition the surviving functions per file.
+///
+/// The per-file objects are content/mtime cached: with a `cache_dir` the object
+/// name embeds a Wyhash of the source path (salted by `T6_CACHE_VERSION` and the
+/// release flag), and a fresh object newer than its source is reused rather than
+/// re-emitted. `src/std/` sources skip the source-mtime check because the stdlib
+/// is treated as stable within a build. Prints a `[T6]` hit/miss summary.
 fn compileSplitEmit(
     compiler: *LlvmCompiler,
     allocator: std.mem.Allocator,
@@ -1307,16 +1409,7 @@ fn compileSplitEmit(
         }
     }
 
-    // DEFAULT: emit ONE object. The per-file split cloned the whole module once PER FILE (97x on the
-    // pizza app) -- O(files x functions) redundant work that DOMINATED the build AND used more memory
-    // (each clone is a transient full copy). Measured on nova-pg-web: split 146s / 1031MB peak vs
-    // single-object 38s / 332MB (debug), 45s / 547MB (release). The whole-module codegen (the real cost)
-    // runs either way, so per-file caching only ever saved the small per-file EMIT of unchanged files;
-    // the whole-build content hash already skips no-change rebuilds entirely, so that saving was
-    // marginal. Pass --split-objects to force the old per-file split (e.g. to inspect per-file objects).
     if (!flags.split_per_file) {
-        // Name the single object after the app, e.g. build/<p>/obj/myapp.o. `stem` drops any extension
-        // on output_path (it can already carry a .o), so we don't produce myapp.o.o.
         const app_name = std.fs.path.stem(output_path);
         const obj_path = if (cache_dir) |cdir|
             try std.fmt.allocPrint(allocator, "{s}/{s}.o", .{ cdir, app_name })
@@ -1344,8 +1437,6 @@ fn compileSplitEmit(
     }
 
     if (!pruneEnabled()) {
-        // DEFAULT PATH (known-good, unchanged): group every emitted function by its source file
-        // straight from func_map. No pruning, no module mutation.
         for (compiler.functions.items) |func| {
             const v = compiler.func_map.get(func.name) orelse continue;
             const sym = std.mem.span(core.LLVMGetValueName(v));
@@ -1356,13 +1447,6 @@ fn compileSplitEmit(
             try gop.value_ptr.put(sym, {});
         }
     } else {
-        // OPT-IN demand pruning (task #205, NOVA_PRUNE=1): remove functions unreachable from __nova_main
-        // so a wholly-unused source file emits no object. T6 needs surviving functions to keep their
-        // ORIGINAL (external) linkage for cross-object references, so this is two-phase: (1) compute the
-        // reachable set on a throwaway clone by internalizing everything but the entry and running
-        // globaldce; (2) on the real module, internalize only the DEAD functions and globaldce them away.
-        // A symbol->file map is captured FIRST (func_map dangles after globaldce deletes functions), then
-        // file_syms is rebuilt from the SURVIVING module definitions.
         var sym_to_file = std.StringHashMap([]const u8).init(allocator);
         defer {
             var kit = sym_to_file.keyIterator();
@@ -1415,7 +1499,7 @@ fn compileSplitEmit(
 
         var mf = core.LLVMGetFirstFunction(compiler.module);
         while (mf != null) : (mf = core.LLVMGetNextFunction(mf)) {
-            if (core.LLVMGetFirstBasicBlock(mf) == null) continue; // declaration, not owned here
+            if (core.LLVMGetFirstBasicBlock(mf) == null) continue;
             const sym = std.mem.span(core.LLVMGetValueName(mf));
             const file = sym_to_file.get(sym) orelse continue;
             try all_syms.put(sym, {});
@@ -1425,9 +1509,6 @@ fn compileSplitEmit(
         }
     }
 
-    // Bump T6_CACHE_VERSION whenever codegen changes in a way that alters emitted objects, so every
-    // cached object gets a new filename and the stale ones are ignored (mtime alone can't see a
-    // compiler change -- source files did not move). Folded into the per-object name hash below.
     const T6_CACHE_VERSION: u64 = 2;
 
     var idx: usize = 0;
@@ -1437,25 +1518,13 @@ fn compileSplitEmit(
     while (fit.next()) |entry| : (idx += 1) {
         const src_path = entry.key_ptr.*;
 
-        // Readable, stable, unique object name derived from the SOURCE file: `<stem>_<pathhash>.o`
-        // (e.g. json_1a2b3c.o). The stem is the source basename; the path hash disambiguates same-named
-        // files in different dirs (e.g. two query.nova). Falls back to `<out>.<idx>.o` with no cache dir.
         var obj_path: []const u8 = undefined;
         if (cache_dir) |cdir| {
             const base = std.fs.path.basename(src_path);
             const stem = if (std.mem.endsWith(u8, base, ".nova")) base[0 .. base.len - 5] else base;
-            // Path hash disambiguates same-named files in different dirs; version + release bit keep
-            // release/debug and pre/post-codegen-change objects from aliasing.
             const ph: u32 = @truncate(std.hash.Wyhash.hash(T6_CACHE_VERSION ^ (if (is_release) @as(u64, 1) else 0), src_path));
             obj_path = try std.fmt.allocPrint(allocator, "{s}/{s}_{x}.o", .{ cdir, stem, ph });
 
-            // Freshness: if the object exists (and, for app files, is newer than its source), skip this
-            // file ENTIRELY -- no clone, no globaldce, no emit. This is what lets an incremental build
-            // skip the whole (unchanged) stdlib instead of re-emitting it every time. Stdlib sources
-            // (`src/std/...`) are installed and don't change during app dev, and a compiler change bumps
-            // T6_CACHE_VERSION (new filename), so an existing stdlib object is always fresh. App sources
-            // are cwd-relative and stat-able. (Cross-file signature changes aren't tracked; do a clean
-            // rebuild -- `rm -rf build` -- after changing a shared signature.)
             fresh: {
                 const om = (std.Io.Dir.statFile(.cwd(), io, obj_path, .{}) catch break :fresh).mtime.nanoseconds;
                 if (!std.mem.startsWith(u8, src_path, "src/std/")) {
@@ -1464,14 +1533,12 @@ fn compileSplitEmit(
                 }
                 hits += 1;
                 try objs.append(allocator, obj_path);
-                continue; // fresh: reuse the object, do no per-file work
+                continue;
             }
         } else {
             obj_path = try std.fmt.allocPrint(allocator, "{s}.{d}.o", .{ output_path, idx });
         }
 
-        // Stale (or no cache): build this file's object. Clone the module and strip every function that
-        // this file does not OWN down to a bare declaration.
         const owner = entry.value_ptr;
         const clone = core.LLVMCloneModule(compiler.module);
         defer core.LLVMDisposeModule(clone);
@@ -1506,6 +1573,27 @@ fn compileSplitEmit(
     }
 }
 
+/// Run the ARC/verify/optimise pipeline on one LLVM module and write it to an
+/// object file.
+///
+/// The fixed order matters and is the reason this is a single function:
+///
+///   1. ARC finalisation on the IR we emitted, BEFORE any LLVM pass rewrites it:
+///      census the retain/release calls, elide those proven redundant on
+///      borrowed values, re-census, and [`LlvmCompiler.verifyArcBalance`] to
+///      assert balance. Doing this pre-O3 means an imbalance is reported against
+///      the IR we generated, not an optimiser-mangled version.
+///   2. Finalise debug info, optionally dump the `.ll`, then run LLVM's own
+///      module verifier; a failure here is a codegen bug and errors out.
+///   3. Mark `__destruct_*` destructors `internal` so DCE can fold unused ones.
+///   4. For native targets, run the O0 or O3 pipeline plus `globaldce`, and if
+///      ASAN codegen is enabled, tag every defined function `sanitize_address`
+///      and run the `asan` instrumentation pass. WASM skips all optimisation.
+///   5. Emit the object via `LLVMTargetMachineEmitToFile`.
+///
+/// Errors: `error.LLVMVerificationError`, `error.LLVMPassError`, or
+/// `error.LLVMEmitFileError`. `module` may be the compiler's own module or a
+/// clone produced by [`compileSplitEmit`]; this function does not take ownership.
 fn emitModule(
     compiler: *LlvmCompiler,
     allocator: std.mem.Allocator,
@@ -1515,22 +1603,14 @@ fn emitModule(
     is_release: bool,
     dump_ll_name: ?[]const u8,
 ) !void {
-    // Gap3-A/E2 ARC-traffic census: raw retain/release traffic BEFORE elision.
     compiler.arcCensusBefore(module);
 
-    // Prototype ARC elision (NOVA_ARC_ELIDE): remove provably-redundant borrowed
-    // retain/release pairs before the IR is dumped / verified / emitted.
     compiler.elideBorrowedArc(module);
 
-    // Gap3-A/E2 ARC-traffic census: surviving traffic AFTER elision (the borrow-skip target).
     compiler.arcCensusAfter(module);
 
-    // OSSA-lite Track V (V4'): static ARC release-balance verifier on the raw module
-    // (before LLVM -O strips ARC calls). Opt-in via NOVA_OWN_VERIFY. See docs/design/ossa-lite-tasks.md.
     compiler.verifyArcBalance(module);
 
-    // DWARF (Gap 4): sanitize + resolve debug metadata for this exact module (a per-file clone under
-    // T6 split) before it is dumped/verified/emitted.
     compiler.finalizeDebug(module);
 
     if (dump_ll_name) |nm| {
@@ -1564,9 +1644,6 @@ fn emitModule(
     if (!is_wasm) {
         const opts = transform.LLVMCreatePassBuilderOptions();
         defer transform.LLVMDisposePassBuilderOptions(opts);
-        // The C PassBuilder API defaults loop + SLP vectorization OFF, so `default<O3>` was running
-        // without the vectorizer. Enable them (release only) -- now that array values carry pointer
-        // provenance (perf-ceiling.md pt1+pt2), auto-vectorization of array loops can actually fire.
         if (is_release) {
             transform.LLVMPassBuilderOptionsSetLoopVectorization(opts, 1);
             transform.LLVMPassBuilderOptionsSetSLPVectorization(opts, 1);
@@ -1581,17 +1658,14 @@ fn emitModule(
             return error.LLVMPassError;
         }
 
-        // NOVA_ASAN_CODEGEN: instrument Nova-generated code so a UAF in *our* code (not just the runtime)
-        // is caught with provenance. LLVM's ASAN only touches functions carrying `sanitize_address`, so tag
-        // every defined function, then run the `asan` module pass after the main pipeline (post coro-split).
         if (@import("arc.zig").asan_codegen_enabled) {
             const ctx = core.LLVMGetModuleContext(module);
             const kind = core.LLVMGetEnumAttributeKindForName("sanitize_address", "sanitize_address".len);
             const attr = core.LLVMCreateEnumAttribute(ctx, kind, 0);
-            const fn_idx: types.LLVMAttributeIndex = @as(types.LLVMAttributeIndex, 0xFFFFFFFF); // LLVMAttributeFunctionIndex
+            const fn_idx: types.LLVMAttributeIndex = @as(types.LLVMAttributeIndex, 0xFFFFFFFF);
             var fnv = core.LLVMGetFirstFunction(module);
             while (fnv != null) : (fnv = core.LLVMGetNextFunction(fnv)) {
-                if (core.LLVMCountBasicBlocks(fnv) == 0) continue; // skip declarations (ASAN skips them anyway)
+                if (core.LLVMCountBasicBlocks(fnv) == 0) continue;
                 core.LLVMAddAttributeAtIndex(fnv, fn_idx, attr);
             }
             const aerr = transform.LLVMRunPasses(module, "asan", compiler.target_machine, opts);
@@ -1622,6 +1696,13 @@ fn emitModule(
     memPhase("after emit object");
 }
 
+/// Declare one `llvm.coro.*` intrinsic into the module and register it in
+/// `func_map` under its full name.
+///
+/// Some coroutine intrinsics are overloaded on a type (e.g. `llvm.coro.size`
+/// over i64); pass that type in `overload` so the correct specialisation is
+/// materialised via `LLVMGetIntrinsicDeclaration`, otherwise pass null for the
+/// non-overloaded ones. Called from [`setupCoroutineSupport`].
 fn declareCoroIntrinsic(compiler: *LlvmCompiler, name: [:0]const u8, overload: ?types.LLVMTypeRef) !void {
     const id = core.LLVMLookupIntrinsicID(name.ptr, name.len);
     const fn_val = if (overload) |ot| blk: {
@@ -1631,15 +1712,46 @@ fn declareCoroIntrinsic(compiler: *LlvmCompiler, name: [:0]const u8, overload: ?
     try compiler.func_map.put(name[0..name.len], fn_val);
 }
 
+/// The handles and basic blocks threaded between a coroutine's prologue and
+/// epilogue.
+///
+/// [`emitCoroPrologue`] builds this and stashes its fields on the compiler's
+/// `current_async_*` cursors so the body emitter can reach the promise and the
+/// final/cleanup/suspend blocks; [`emitCoroEpilogue`] consumes it to wire the
+/// final suspend, the frame free, and `llvm.coro.end`. It models the standard
+/// LLVM switched-resume coroutine lowering.
 const CoroCtx = struct {
+    /// The coroutine handle from `llvm.coro.begin` (the frame pointer). Returned
+    /// to the caller (as an integer) as the spawned coroutine's identity.
     hdl: types.LLVMValueRef,
+    /// The `llvm.coro.id` token, required as the first argument to
+    /// `llvm.coro.free` in the cleanup path.
     id: types.LLVMValueRef,
+    /// The coroutine promise alloca: the fixed slot holding the return value and
+    /// the waiter handle that a joining `await` reads.
     promise: types.LLVMValueRef,
+    /// The final-suspend block: reached when the body returns, it performs the
+    /// final `llvm.coro.suspend` so a joiner can observe completion before the
+    /// frame is destroyed.
     final_bb: types.LLVMBasicBlockRef,
+    /// The cleanup block: frees the coroutine frame (`llvm.coro.free` +
+    /// `nova_coro_free`) on the destroy path.
     cleanup_bb: types.LLVMBasicBlockRef,
+    /// The common return/suspend block that runs `llvm.coro.end` and returns the
+    /// handle; every suspend switch's default lands here.
     suspend_bb: types.LLVMBasicBlockRef,
 };
 
+/// Emit the coroutine prologue for an async native function and return its
+/// [`CoroCtx`].
+///
+/// Builds the promise alloca (zeroing its waiter slot), the `llvm.coro.id`,
+/// heap-allocates the frame via `llvm.coro.size` + `nova_coro_alloc`, calls
+/// `llvm.coro.begin`, and creates the body/final/cleanup/return blocks. It then
+/// emits the initial suspend and switches: 0 → body, 1 → cleanup, default →
+/// return. On return the builder is positioned at the start of the body block so
+/// the caller can emit the function's statements. Pairs with
+/// [`emitCoroEpilogue`], which closes the blocks this opens.
 fn emitCoroPrologue(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef) !CoroCtx {
     const b = compiler.builder;
     const ptr_ty = compiler.ptr_type;
@@ -1700,6 +1812,14 @@ fn emitCoroPrologue(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef) !CoroCt
     };
 }
 
+/// Emit the coroutine epilogue: the final-suspend, cleanup, and return blocks.
+///
+/// At `final_bb` it issues the final `llvm.coro.suspend` and switches on it:
+/// 0 → an `unreachable` trap (a resume of a completed coroutine is a bug),
+/// 1 → cleanup, default → return. The cleanup block runs `llvm.coro.free` and
+/// hands the memory to `nova_coro_free`. The return block runs `llvm.coro.end`
+/// and returns the handle as an integer word. Must be called after the body has
+/// been emitted, with `ctx` from the matching [`emitCoroPrologue`].
 fn emitCoroEpilogue(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, ctx: CoroCtx) void {
     const b = compiler.builder;
     const tok_ty = core.LLVMTokenTypeInContext(core.LLVMGetGlobalContext());
@@ -1738,6 +1858,19 @@ fn emitCoroEpilogue(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, ctx: Co
     _ = core.LLVMBuildRet(b, hdl_i);
 }
 
+/// Declare every intrinsic and runtime symbol the async machinery needs, on the
+/// native path only.
+///
+/// This registers the full coroutine/async ABI into `func_map`: the
+/// `llvm.coro.*` intrinsics (via [`declareCoroIntrinsic`]); the frame
+/// allocator/free/scheduler hooks (`nova_coro_alloc`/`nova_coro_free`,
+/// `nova_sched_*`, `nova_run`/`nova_run_root`); the await primitives
+/// (`nova_await_timer`/`nova_register_waiter`/`nova_await_future`); async
+/// channels (`nova_chan_*`); the async socket/server I/O surface
+/// (`nova_io_*_async`, `nova_aserver_listen*`, `nova_aaccept`/`nova_aconnect`/
+/// `nova_arecv`/`nova_arecv_deadline`/`nova_asend`/`nova_aclose`); and the
+/// combinators (`nova_when_any`/`nova_when_any_deadline`). Called from within
+/// [`compile`]'s native branch; the actual bodies live in the C++ runtime.
 fn setupCoroutineSupport(compiler: *LlvmCompiler) !void {
     try declareCoroIntrinsic(compiler, "llvm.coro.id", null);
     try declareCoroIntrinsic(compiler, "llvm.coro.size", compiler.i64_type);

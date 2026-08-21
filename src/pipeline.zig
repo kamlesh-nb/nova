@@ -1,38 +1,95 @@
-// pipeline.zig — shared compile/link/load machinery for the CLI commands.
-// The frontend->backend driver core: import resolution, source loading, the codegen prelude
-// (route/serde/mediator generation), target derivation, native/wasm/cross linking, and build
-// bookkeeping. builder/tester/format/packages call into this; nothing here calls them.
-
-// Extracted from main.zig (SE-refactor 2026-08-14): main.zig is now a thin entry, cli.zig the
-// dispatch, and this module holds every command (init/add/test/fmt/get/build) and the shared
-// compile pipeline (loadProgram, import resolution, codegen prelude, linking, compileProgram).
-
+//! The compile pipeline plumbing that sits between the frontend (lexer/parser/
+//! sema) and the object-file backend: everything about turning a set of `.nova`
+//! source files plus a target into a linked native (or WebAssembly) binary.
+//!
+//! It carries three loosely related responsibilities that all belong to "the
+//! driver" rather than to any one compiler pass:
+//!
+//!   1. **Linking.** The compiler can invoke LLD *in-process* (linked into the
+//!      `nova` binary via the `nova_lld_link_*` externs) so a normal build never
+//!      shells out to a system linker: [`linkNativeInProcessMacho`] for macOS,
+//!      [`linkWasmInProcess`] for wasm. Cross-target builds instead drive the
+//!      bundled `zig c++` toolchain ([`crossLinkViaZig`]), which also
+//!      cross-compiles and caches the C++ runtime the first time a given triple
+//!      is seen. [`appendRuntimeLink`]/[`appendFfiLib`] assemble the linker
+//!      argument vectors, folding in per-OS quirks (Windows needs the COFF
+//!      runtime object plus `-lws2_32 -lmswsock -lbcrypt`; macOS folds in
+//!      homebrew's lib dir; the `webview` FFI lib is a static archive plus
+//!      Cocoa/WebKit frameworks).
+//!
+//!   2. **Source discovery + the import graph.** [`resolveImportPath`] maps a
+//!      Nova `import "foo"` to a concrete file, trying (in order) the built-in
+//!      std module table, sibling/ancestor `src/` directories, the lockfile-
+//!      pinned package cache ([`resolveVersioned`]), local `packages/` roots,
+//!      and finally the shared `~/.nova` cache. [`targetVariantPath`] is the
+//!      target-conditional file rule: an `eventloop.nova` import silently becomes
+//!      `ev/kqueue.nova` on macOS, `ev/epoll.nova` on Linux, etc., so shared
+//!      callers never name a platform. [`loadProgram`] walks the graph depth
+//!      first, deduplicating already-visited files and rejecting cycles, and
+//!      accumulates both the parsed declarations and the raw merged text (the
+//!      latter feeds the content-hash build cache via [`sourcesHash`]).
+//!
+//!   3. **Compile-time source generation.** Several Nova features are lowered by
+//!      *synthesising Nova source*, parsing it, and appending the resulting
+//!      declarations to the program: [`expandTraitDefaults`] copies a trait's
+//!      default method bodies into each implementing struct;
+//!      [`generateControllerRoutes`] writes a `registerRoutes` method from
+//!      `@route` attributes; [`generateSerdeBinders`] emits `__bind`/`__toJson`/
+//!      `__bindRow`/`__bindAll`/`__bindWire`/`__dump` helpers for every
+//!      `@serializable` struct; and [`generateMediatorDispatch`] /
+//!      [`generateRuntimeMediator`] wire `RequestHandler` implementations into
+//!      the MediatR-style dispatch tables. Generating source (rather than AST by
+//!      hand) means these features reuse the real parser and type checker, at the
+//!      cost of some verbose string formatting.
+//!
+//! Almost every function here threads an explicit `std.mem.Allocator` and a
+//! `std.Io` (the new Zig async I/O handle) rather than reaching for globals, and
+//! the path-resolution helpers deliberately swallow I/O errors into
+//! "returns null" so a missing candidate is just "try the next one" rather than
+//! a hard failure. The one exception is [`resolveVersioned`], which can return
+//! [`PkgResolveError.PackageNameCollision`] because two different URLs claiming
+//! the same import name is a real manifest bug, not a miss to skip past.
 
 const std = @import("std");
 const builtin = @import("builtin");
+/// Alias for `std.Io`, the async I/O handle threaded through every filesystem
+/// and process call in this module (directory access, file reads, subprocess
+/// spawn). Kept short because it appears in nearly every signature.
 const Io = std.Io;
+/// Build-time options injected by `build.zig` (feature flags, paths baked in at
+/// compile time). Imported for completeness even where not directly referenced.
 const build_options = @import("build_options");
 
+/// In-process LLD entry point for the Mach-O (macOS) flavour, exported by the
+/// C++ side that statically links LLD into `nova`. Takes a C `argv`/`argc`
+/// (NUL-terminated strings) and returns LLD's process-style exit code (0 = ok).
+/// Called by [`linkNativeInProcessMacho`]; avoids spawning an external `ld`.
 extern fn nova_lld_link_macho(argv: [*]const [*:0]const u8, argc: c_int) c_int;
+/// In-process LLD entry point for the WebAssembly flavour (`wasm-ld`), same
+/// calling convention as [`nova_lld_link_macho`]. Called by [`linkWasmInProcess`].
 extern fn nova_lld_link_wasm(argv: [*]const [*:0]const u8, argc: c_int) c_int;
 
-// Codegen builds its target machine with LLVMRelocDefault, which on ELF is Reloc::Static — the
-// object therefore carries absolute R_X86_64_32S relocations. Ubuntu's clang links -pie by default,
-// and a PIE image cannot hold those ("relocation R_X86_64_32S against `.text` can not be used when
-// making a PIE object"), so the link fails for any program whose layout produces one. Tell the
-// driver what codegen actually emitted. The alternative is a PIC target machine, which is a codegen
-// change affecting every target; this is the narrow, matching fix.
+/// Extra linker flags forced on for position-independence. On Linux the default
+/// PIE output is disabled with `-no-pie` (the runtime/link model here expects a
+/// non-PIE executable); every other host adds nothing.
 pub const pie_flags: []const []const u8 = if (builtin.target.os.tag == .linux) &.{"-no-pie"} else &.{};
 
+/// The host-appropriate spelling of the "strip unreachable sections" linker
+/// flag. macOS `ld64` uses `-dead_strip`, MSVC `link.exe` uses `/OPT:REF`, and
+/// GNU/LLD ELF uses `--gc-sections`; all are passed through the C++ driver, so
+/// they carry the `-Wl,` prefix.
 pub const dead_strip_flag: []const u8 = switch (builtin.target.os.tag) {
     .macos => "-Wl,-dead_strip",
-    // clang++ on Windows drives MSVC's link.exe, which does not understand --gc-sections
-    // (it arrives as `/-gc-sections` → LNK4044 and no stripping). /OPT:REF is its equivalent.
     .windows => "-Wl,/OPT:REF",
     else => "-Wl,--gc-sections",
 };
 
-
+/// Locate the macOS SDK root to pass to `-syslibroot`.
+///
+/// Honours an explicit `SDKROOT` env var first, then prefers the lightweight
+/// Command Line Tools SDK if present, and falls back to the full Xcode.app SDK
+/// path. The `environ` is `anytype` so callers can pass either a real
+/// `environ_map` or a test double with a `get` method.
 pub fn macSdkPath(environ: anytype, io: std.Io) []const u8 {
     if (environ.get("SDKROOT")) |s| return s;
     const clt = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk";
@@ -42,7 +99,14 @@ pub fn macSdkPath(environ: anytype, io: std.Io) []const u8 {
     return clt;
 }
 
-
+/// Gather the distinct set of external libraries a program's FFI declarations
+/// depend on.
+///
+/// Scans every `fn_decl` for an `extern_lib` (the library named on an
+/// `extern fn ... from "lib"`) and returns each unique name once, in first-seen
+/// order. The de-dup is a linear scan because the list is expected to be tiny.
+/// The result is an owned slice the caller must free; the strings themselves
+/// borrow from the AST. Feeds [`appendFfiLib`] at link time.
 pub fn collectFfiLibs(allocator: std.mem.Allocator, program: ast.Program) ![]const []const u8 {
     var libs = std.ArrayList([]const u8).empty;
     for (program.declarations) |decl| {
@@ -60,7 +124,18 @@ pub fn collectFfiLibs(allocator: std.mem.Allocator, program: ast.Program) ![]con
     return libs.toOwnedSlice(allocator);
 }
 
-
+/// Append the linker arguments for a single FFI library to `args`.
+///
+/// Two libraries are special-cased rather than turned into a plain `-l`:
+///   - `webview` is a bundled static archive under `<shared_nova>/deps/webview`;
+///     if it has not been built this errors with `error.LinkFailed` (with a
+///     diagnostic), and on macOS it additionally pulls in the WebKit and Cocoa
+///     frameworks.
+///   - On Windows the C runtime libraries `c`/`m`/`pthread`/`dl`/`rt` are folded
+///     into MSVC's CRT, so a request for any of them is silently dropped.
+///
+/// Everything else becomes `-l<name>`. `shared_nova` is the `~/.nova` install
+/// root; `io` is used only for the webview existence check.
 pub fn appendFfiLib(args: *std.ArrayList([]const u8), allocator: std.mem.Allocator, shared_nova: []const u8, io: std.Io, lib: []const u8) !void {
     if (std.mem.eql(u8, lib, "webview")) {
         const lib_path = try std.fmt.allocPrint(allocator, "{s}/deps/webview/build/libwebview.a", .{shared_nova});
@@ -74,9 +149,6 @@ pub fn appendFfiLib(args: *std.ArrayList([]const u8), allocator: std.mem.Allocat
         }
         return;
     }
-    // POSIX library names that MSVC folds into its CRT — there is no c.lib/m.lib/pthread.lib to
-    // open, so passing them through is a hard LNK1181, not a harmless no-op. `extern("c")` decls
-    // in std are the common source. The symbols themselves come from the UCRT, already linked.
     if (builtin.target.os.tag == .windows) {
         for (&[_][]const u8{ "c", "m", "pthread", "dl", "rt" }) |implicit| {
             if (std.mem.eql(u8, lib, implicit)) return;
@@ -85,26 +157,25 @@ pub fn appendFfiLib(args: *std.ArrayList([]const u8), allocator: std.mem.Allocat
     try args.append(allocator, try std.fmt.allocPrint(allocator, "-l{s}", .{lib}));
 }
 
-
-pub fn linkNativeInProcessMacho(
-    allocator: std.mem.Allocator,
-    environ: anytype,
-    io: std.Io,
-    objs: []const []const u8,
-    output_path: []const u8,
-    shared_nova: []const u8,
-    ffi_libs: []const []const u8,
-) !void {
+/// Link a set of object files into a macOS arm64 executable using the
+/// in-process LLD (`ld64.lld`), never spawning an external linker.
+///
+/// Builds the `ld64` argument vector by hand: architecture, platform version,
+/// the SDK sysroot from [`macSdkPath`], `-lSystem`/`-lc++`, `-dead_strip`, then
+/// the caller's objects, the Nova runtime (`-lnovacore` under `<shared_nova>/lib`
+/// plus homebrew's lib dir), wolfSSL ([`appendWolfsslLink`]), and each FFI lib
+/// ([`appendFfiLib`]). The `[]const u8` args are then duped to NUL-terminated C
+/// strings and handed to [`nova_lld_link_macho`]; a non-zero return becomes
+/// `error.LinkFailed` after printing the code. Hard-wired to `arm64`/`macos 11.0`.
+pub fn linkNativeInProcessMacho(allocator: std.mem.Allocator, environ: anytype, io: std.Io, objs: []const []const u8, output_path: []const u8, shared_nova: []const u8, ffi_libs: []const []const u8) !void {
     const sdk_path = macSdkPath(environ, io);
     var args = std.ArrayList([]const u8).empty;
     defer args.deinit(allocator);
     try args.appendSlice(allocator, &.{
-        "ld64.lld",             "-arch", "arm64",
-        "-platform_version",    "macos", "11.0", "11.0",
-        "-syslibroot",          sdk_path,
-        "-lSystem",             "-lc++",
-
-        "-dead_strip",
+        "ld64.lld",          "-arch",       "arm64",
+        "-platform_version", "macos",       "11.0",
+        "11.0",              "-syslibroot", sdk_path,
+        "-lSystem",          "-lc++",       "-dead_strip",
     });
     for (objs) |o| try args.append(allocator, o);
     const nova_lib = try std.fmt.allocPrint(allocator, "-L{s}/lib", .{shared_nova});
@@ -126,9 +197,24 @@ pub fn linkNativeInProcessMacho(
     }
 }
 
+/// A resolved cross-compilation target for the bundled `zig c++` toolchain.
+pub const CrossTarget = struct {
+    /// The Zig target triple to pass to `zig c++ -target` (e.g.
+    /// `x86_64-linux-musl`, `aarch64-windows-gnu`).
+    zig: []const u8,
+    /// Whether to link `-static`. True for the musl Linux targets (fully static
+    /// ELF), false for Windows/macOS which link dynamically against the system C
+    /// runtime.
+    static: bool,
+};
 
-pub const CrossTarget = struct { zig: []const u8, static: bool };
-
+/// Map an LLVM target triple to a bundled-`zig` cross target, or null if the
+/// triple is not a supported cross-compile.
+///
+/// Recognises linux (→ musl, static), windows/mingw/w64 (→ gnu, dynamic), and
+/// darwin/apple. The darwin case returns null when the requested arch matches
+/// the host arch, because that is a *native* build (handled by the in-process
+/// LLD path), not a cross-build; it only crosses between arm64 and x86_64 macOS.
 pub fn mapCrossTarget(llvm_triple: []const u8) ?CrossTarget {
     const has = struct {
         fn f(h: []const u8, n: []const u8) bool {
@@ -141,7 +227,6 @@ pub fn mapCrossTarget(llvm_triple: []const u8) ?CrossTarget {
     if (has(llvm_triple, "windows") or has(llvm_triple, "mingw") or has(llvm_triple, "w64"))
         return .{ .zig = if (arm) "aarch64-windows-gnu" else "x86_64-windows-gnu", .static = false };
     if (has(llvm_triple, "darwin") or has(llvm_triple, "apple")) {
-
         const host_arm = builtin.target.cpu.arch == .aarch64;
         if (arm == host_arm) return null;
         return .{ .zig = if (arm) "aarch64-macos" else "x86_64-macos", .static = false };
@@ -149,7 +234,20 @@ pub fn mapCrossTarget(llvm_triple: []const u8) ?CrossTarget {
     return null;
 }
 
-
+/// Cross-link (and, on first use, cross-compile the runtime) for a non-host
+/// target by driving the bundled `zig c++`.
+///
+/// Returns false if [`mapCrossTarget`] does not recognise the triple, letting
+/// the caller fall back to a native/in-process path. Otherwise:
+///   1. Ensures a per-target runtime object `novacore_<triple>.o` exists under
+///      `<shared_nova>/lib`, cross-compiling `runtime.cpp` with `-DNOVA_DROP_ARENA`
+///      the first time (a one-off cached to `~/.nova/lib`).
+///   2. Runs `zig c++ -target <triple>` over the caller's objects plus that
+///      runtime object, adding `-static` for musl targets, `-O3` for release,
+///      and the Winsock/bcrypt import libs for Windows.
+///
+/// Any non-zero subprocess exit becomes `error.LinkFailed`. Returns true on a
+/// successful link. `environ` is accepted for signature symmetry but unused.
 pub fn crossLinkViaZig(
     allocator: std.mem.Allocator,
     environ: anytype,
@@ -160,17 +258,14 @@ pub fn crossLinkViaZig(
     shared_nova: []const u8,
     is_release: bool,
 ) !bool {
-    _ = environ; // Boost include (formerly from BOOST_PREFIX) retired in M4; no env lookup needed.
+    _ = environ;
     const target = mapCrossTarget(llvm_triple) orelse return false;
 
     const rt_obj = try std.fmt.allocPrint(allocator, "{s}/lib/novacore_{s}.o", .{ shared_nova, target.zig });
     if (Io.Dir.access(.cwd(), io, rt_obj, .{})) |_| {} else |_| {
-
         const rt_src = try std.fmt.allocPrint(allocator, "{s}/src/runtime/runtime.cpp", .{shared_nova});
 
         std.debug.print("[T1] cross-compiling the C++ runtime for {s} (one-time; caches to ~/.nova/lib) ...\n", .{target.zig});
-        // Boost.Asio retired (M4): the runtime is reactor-native, no Boost include needed.
-        // zlib retired: compression is pure Nova (compress/deflate.nova), no zlib include/link.
         const rc_args = [_][]const u8{ "zig", "c++", "-target", target.zig, "-std=c++20", "-O2", "-DNOVA_DROP_ARENA", "-c", rt_src, "-o", rt_obj };
         var rc_child = try std.process.spawn(io, .{ .argv = &rc_args });
         switch (try rc_child.wait(io)) {
@@ -190,8 +285,6 @@ pub fn crossLinkViaZig(
     for (objs) |o| try args.append(allocator, o);
     try args.append(allocator, rt_obj);
 
-    // zlib retired: compression is pure Nova (compress/deflate.nova), so the vendored zlib .c files
-    // are no longer compiled into cross targets.
     if (std.mem.indexOf(u8, target.zig, "windows") != null)
         try args.appendSlice(allocator, &.{ "-lws2_32", "-lmswsock", "-lbcrypt" });
     try args.appendSlice(allocator, &.{ "-o", output_path });
@@ -206,13 +299,18 @@ pub fn crossLinkViaZig(
     return true;
 }
 
-
+/// Link a single wasm object into a `.wasm` module with the in-process
+/// `wasm-ld`.
+///
+/// Uses `--no-entry` (a library-style module, not a command), exports all
+/// symbols and memory, allows undefined imports (the host supplies I/O), and
+/// pre-sizes linear memory to 128 MiB. Args are duped to C strings and passed to
+/// [`nova_lld_link_wasm`]; a non-zero return becomes `error.LinkFailed`.
 pub fn linkWasmInProcess(allocator: std.mem.Allocator, obj_path: []const u8, output_path: []const u8) !void {
     const argv = [_][]const u8{
-        "wasm-ld", "--no-entry", "--export-all", "--export-memory", "--allow-undefined",
+        "wasm-ld",                    "--no-entry", "--export-all", "--export-memory", "--allow-undefined",
 
-        "--initial-memory=134217728",
-        obj_path, "-o", output_path,
+        "--initial-memory=134217728", obj_path,     "-o",           output_path,
     };
     var cargv = std.ArrayList([*:0]const u8).empty;
     defer cargv.deinit(allocator);
@@ -225,13 +323,13 @@ pub fn linkWasmInProcess(allocator: std.mem.Allocator, obj_path: []const u8, out
     }
 }
 
-
-/// Append the Nova C++ runtime to a clang++ link line.
+/// Append the arguments that link the Nova C++ runtime into `args`.
 ///
-/// On Windows clang++ targets MSVC, whose link.exe resolves `-lnovacore` to `novacore.lib`
-/// and cannot read the GNU-format `libnovacore.a` that llvm-ar writes (LNK1104). The runtime is
-/// a unity build — one `runtime.cpp` → one object — so the COFF object is linked directly there:
-/// identical to demand-loading the archive's single member, minus the archive-format question.
+/// On Windows `link.exe` cannot read llvm-ar's GNU archive, so the runtime is
+/// pulled in as its raw COFF object (`<shared_nova>/lib/<lib_name>.o`) together
+/// with `-rtlib=compiler-rt` (for the 128-bit integer helpers) and the Winsock/
+/// bcrypt import libs. Every other host uses the normal `-L<lib>/ -l<lib_name>`
+/// pair plus homebrew's lib dir.
 pub fn appendRuntimeLink(
     args: *std.ArrayList([]const u8),
     allocator: std.mem.Allocator,
@@ -240,13 +338,7 @@ pub fn appendRuntimeLink(
 ) !void {
     if (builtin.target.os.tag == .windows) {
         try args.append(allocator, try std.fmt.allocPrint(allocator, "{s}/lib/{s}.o", .{ shared_nova, lib_name }));
-        // compiler-rt's builtins carry the 128-bit helpers (__udivti3/__umodti3, used by
-        // decimal.cpp's __int128 math); MSVC's CRT has no equivalent. clang++ only finds the
-        // builtins archive under the windows/ layout when -rtlib=compiler-rt is explicit —
-        // without it the link dies on unresolved __udivti3.
         try args.append(allocator, "-rtlib=compiler-rt");
-        // Same system libs the cross-link (crossLinkViaZig) already passes for windows targets:
-        // sockets (reactor/os.socket), AcceptEx/ConnectEx, and BCryptGenRandom for nova_getrandom.
         try args.appendSlice(allocator, &.{ "-lws2_32", "-lmswsock", "-lbcrypt" });
         return;
     }
@@ -255,35 +347,44 @@ pub fn appendRuntimeLink(
     try args.append(allocator, "-L/opt/homebrew/lib");
 }
 
-
+/// Append the wolfSSL link arguments to `args`.
+///
+/// Currently a deliberate no-op: TLS/crypto has moved to pure-Nova and no
+/// separate wolfSSL library needs linking, so all parameters are discarded. Kept
+/// as a seam (still called from [`linkNativeInProcessMacho`]) so the wiring is in
+/// place if a native crypto library is reintroduced.
 pub fn appendWolfsslLink(args: *std.ArrayList([]const u8), allocator: std.mem.Allocator, shared_nova: []const u8, io: std.Io) !void {
-    // wolfSSL was retired in M13 (TLS is pure Nova). Nothing to link; kept as a no-op so the three
-    // link sites need no change. getentropy() (crypto.cpp) is in libSystem/glibc, no framework needed.
     _ = args;
     _ = allocator;
     _ = shared_nova;
     _ = io;
 }
 
+/// The Nova lexer module (frontend). Imported for use by the generation passes
+/// below, which round-trip synthesised source through the real frontend.
 const lexer = @import("frontend/lexer.zig");
+/// The Nova parser module; [`generateSerdeBinders`] and the mediator generators
+/// use [`parser.Parser`] to parse the source they emit.
 const parser = @import("frontend/parser.zig");
+/// The LLVM code-generation backend module.
 const llvm_codegen = @import("backend/codegen/llvm_codegen.zig");
+/// The ARC/value-struct codegen module, whose global `value_type_set` /
+/// `value_structs_enabled` / `value_structs_all` flags are configured by
+/// [`configureValueStructs`].
 const codegen_arc = @import("backend/codegen/arc.zig");
 
-
-// M-1 value-type structs: configure the per-type rollout gate from the environment.
-//   NOVA_VALUE_STRUCTS_ALL -> every is_reference==false struct is value-lowered.
-//   NOVA_VALUE_TYPES=A,B,C -> only the named base types. Default: neither, so gate stays off.
+/// Configure which structs get value semantics, from environment variables.
+///
+/// Precedence: `NOVA_VALUE_STRUCTS_OFF` disables the feature entirely (returns
+/// early). Otherwise, if `NOVA_VALUE_TYPES` is set it is a comma-separated
+/// allow-list of struct names that become value types (the rest stay reference
+/// types); each name is duped into a `StringHashMap` handed to codegen. With
+/// neither var set, value semantics are enabled for *all* structs
+/// (`value_structs_all`). Env allocations that fail are silently skipped rather
+/// than propagated.
 pub fn configureValueStructs(allocator: std.mem.Allocator, environ: anytype) void {
-    // M-1 value structs -- DEFAULT ON. Every non-`class` struct is value-lowered (stack alloca, no
-    // ARC, copy-on-assign) unless it escapes. The escape channels (return-construction incl. lifted
-    // closures, struct/type-param field, tuple/error-union/optional slot, @serializable binder,
-    // trait impl, colliding module-scoped name, non-scalar/non-string field) keep every unsafe shape
-    // on the heap; corpus + ASAN are green under the flip. NOVA_VALUE_STRUCTS_OFF is the escape hatch
-    // (reverts to the all-reference model); NOVA_VALUE_TYPES=A,B narrows to named types for A/B tests.
-    if (environ.get("NOVA_VALUE_STRUCTS_OFF") != null) return; // escape hatch: all-reference model
+    if (environ.get("NOVA_VALUE_STRUCTS_OFF") != null) return;
     if (environ.get("NOVA_VALUE_TYPES")) |list| {
-        // A/B narrowing: value-lower only the named types (leave the rest reference).
         var set = std.StringHashMap(void).init(allocator);
         var it = std.mem.tokenizeScalar(u8, list, ',');
         while (it.next()) |name| {
@@ -296,27 +397,41 @@ pub fn configureValueStructs(allocator: std.mem.Allocator, environ: anytype) voi
         codegen_arc.value_structs_enabled = true;
         return;
     }
-    // DEFAULT: `struct` is a value type, `class` is reference. Every non-`class` struct is value-lowered
-    // (stack alloca, no ARC, copy-on-assign) unless the escape analysis (isValueStructName +
-    // computeValueEscapeSet) keeps it on the heap for safety. This makes the language's stated semantics
-    // (struct = value, class = reference) the actual default; NOVA_VALUE_STRUCTS_OFF reverts to all-reference.
     codegen_arc.value_structs_enabled = true;
     codegen_arc.value_structs_all = true;
 }
 
+/// The type checker module (frontend).
 const type_checker = @import("frontend/type_checker.zig");
+/// The sema shadow pass (diffs the two type engines under `NOVA_SEMA_SHADOW`).
 const sema_shadow = @import("frontend/sema/shadow.zig");
+/// The sema escape-analysis pass.
 const sema_escape = @import("frontend/sema/escape.zig");
+/// The sema alpha-renaming/scope-resolution pass.
 const sema_alpha = @import("frontend/sema/alpha.zig");
+/// The sema type-id assignment pass.
 const sema_ids = @import("frontend/sema/ids.zig");
+/// The top-level sema driver module (the authoritative typed-IR pass).
 const sema_mod = @import("frontend/sema/sema.zig");
+/// The sema monomorphisation pass (instantiates generics).
 const sema_mono = @import("frontend/sema/mono.zig");
+/// The AST definitions module; nearly every declaration here manipulates
+/// `ast.Declaration`/`ast.StructDecl` and friends.
 const ast = @import("frontend/ast.zig");
+/// The source formatter module.
 const formatter = @import("frontend/formatter.zig");
 
+/// Project-scaffolding templates module.
 const templates = @import("templates.zig");
 
-
+/// Resolve an asset path, preferring the working-tree copy and falling back to
+/// the installed `~/.nova` copy.
+///
+/// If `relative_path` exists relative to the cwd it is returned (duped);
+/// otherwise the path is rebased under `$HOME/.nova/` (or `$USERPROFILE` on
+/// Windows, else `/`). This lets a developer running from the repo pick up local
+/// std/runtime assets while an installed `nova` finds them in the shared prefix.
+/// The returned slice is owned by the caller.
 pub fn getSharedAssetPath(allocator: std.mem.Allocator, init: std.process.Init, relative_path: []const u8) ![]const u8 {
     if (Io.Dir.access(.cwd(), init.io, relative_path, .{})) |_| {
         return try allocator.dupe(u8, relative_path);
@@ -326,17 +441,30 @@ pub fn getSharedAssetPath(allocator: std.mem.Allocator, init: std.process.Init, 
     return try std.fmt.allocPrint(allocator, "{s}/.nova/{s}", .{ home, relative_path });
 }
 
-
-// Compile-target facts, derived once per compilation from `--target`/triple (or the host for --native)
-// and exposed to Nova source as the synthesized `builtin` module + used to pick target-conditional files.
+/// The compile target described in the terms the std library cares about.
+///
+/// Produced by [`deriveTargetInfo`] and consumed by [`genPlatformSource`]
+/// (which materialises it as the `platform` module) and [`targetVariantPath`]
+/// (which uses it to pick per-OS/arch source files).
 pub const TargetInfo = struct {
-    os: []const u8, // "darwin" | "linux" | "windows" | "wasm"
-    arch: []const u8, // "aarch64" | "x86_64" | "wasm32"
+    /// Canonical OS name as the std uses it: `darwin`, `linux`, `windows`, or
+    /// `wasm`.
+    os: []const u8,
+    /// Canonical arch name: `aarch64`, `x86_64`, or `wasm32`.
+    arch: []const u8,
+    /// Pointer width in bytes (4 for wasm32, 8 otherwise).
     ptr_size: u8,
+    /// Whether the target is a POSIX system (darwin or linux). Drives the
+    /// `posix/` fallback in [`targetVariantPath`] and the `isPosix` platform
+    /// constant.
     is_posix: bool,
 };
 
-
+/// The canonical std OS name for the *host* Zig was built on.
+///
+/// Maps `builtin.target.os.tag` to the std spelling (`darwin`/`linux`/
+/// `windows`), defaulting to `darwin` for anything unrecognised. Used as the
+/// starting point in [`deriveTargetInfo`] before any `--target` override.
 pub fn hostOs() []const u8 {
     return switch (builtin.target.os.tag) {
         .macos => "darwin",
@@ -346,6 +474,8 @@ pub fn hostOs() []const u8 {
     };
 }
 
+/// The canonical std arch name for the host, defaulting to `x86_64` for
+/// anything other than aarch64. Companion to [`hostOs`].
 pub fn hostArch() []const u8 {
     return switch (builtin.target.cpu.arch) {
         .aarch64 => "aarch64",
@@ -354,7 +484,14 @@ pub fn hostArch() []const u8 {
     };
 }
 
-
+/// Derive the [`TargetInfo`] for a build from the CLI target selector and an
+/// optional LLVM triple.
+///
+/// `--wasm` short-circuits to the wasm32 profile. Otherwise it starts from the
+/// host ([`hostOs`]/[`hostArch`]) and, if a `triple` is given, overrides os and
+/// arch by substring-matching it (linux; windows/mingw/w64; darwin/apple/macos;
+/// and aarch64/arm64 vs x86_64/x86-64/amd64). Non-wasm targets are 8-byte
+/// pointers and POSIX exactly when the os ends up darwin or linux.
 pub fn deriveTargetInfo(target: []const u8, triple: ?[]const u8) TargetInfo {
     if (std.mem.eql(u8, target, "--wasm")) {
         return .{ .os = "wasm", .arch = "wasm32", .ptr_size = 4, .is_posix = false };
@@ -383,8 +520,13 @@ pub fn deriveTargetInfo(target: []const u8, triple: ?[]const u8) TargetInfo {
     return .{ .os = os, .arch = arch, .ptr_size = 8, .is_posix = std.mem.eql(u8, os, "darwin") or std.mem.eql(u8, os, "linux") };
 }
 
-
-// Source of the compiler-synthesized `platform` module (never a file on disk).
+/// Synthesise the Nova source of the built-in `platform` module for a target.
+///
+/// The `platform` module is not a file on disk; it is generated so its
+/// constants reflect the *compile* target rather than the host. Emits `os`,
+/// `arch`, `pointerSize`, and the `isDarwin`/`isLinux`/`isWindows`/`isWasm`/
+/// `isPosix` booleans derived from [`TargetInfo`]. Returned source is owned by
+/// the caller and fed to the parser by [`loadProgram`].
 pub fn genPlatformSource(allocator: std.mem.Allocator, t: TargetInfo) ![]const u8 {
     const b = struct {
         fn s(v: bool) []const u8 {
@@ -402,15 +544,19 @@ pub fn genPlatformSource(allocator: std.mem.Allocator, t: TargetInfo) ![]const u
         \\pub const isPosix: bool = {s};
         \\
     , .{
-        t.os,                                    t.arch, t.ptr_size,
-        b(std.mem.eql(u8, t.os, "darwin")),      b(std.mem.eql(u8, t.os, "linux")),
-        b(std.mem.eql(u8, t.os, "windows")),     b(std.mem.eql(u8, t.os, "wasm")),
-        b(t.is_posix),
+        t.os,                               t.arch,                            t.ptr_size,
+        b(std.mem.eql(u8, t.os, "darwin")), b(std.mem.eql(u8, t.os, "linux")), b(std.mem.eql(u8, t.os, "windows")),
+        b(std.mem.eql(u8, t.os, "wasm")),   b(t.is_posix),
     });
 }
 
-
-// True if `cand` (a `.nova` path) exists, in cwd or the installed ~/.nova/std fallback.
+/// Test whether a candidate source path exists, checking both the working tree
+/// and the installed std mirror.
+///
+/// A plain cwd-relative `access` is tried first. Additionally, for a candidate
+/// under `src/std/`, the same sub-path is checked under `$HOME/.nova/std/` so an
+/// installed compiler resolves std files that are not in the current project.
+/// Used by [`targetVariantPath`] to validate each generated variant path.
 pub fn suffixedFileExists(cand: []const u8, allocator: std.mem.Allocator, io: std.Io, home: ?[]const u8) bool {
     if (Io.Dir.access(.cwd(), io, cand, .{})) |_| {
         return true;
@@ -427,15 +573,21 @@ pub fn suffixedFileExists(cand: []const u8, allocator: std.mem.Allocator, io: st
     return false;
 }
 
-
-// Platform-axis variant selection (restructure R1): given a resolved `dir/name.nova`, pick the
-// most-specific existing target variant, keyed off the SAME os/arch the synthesized `platform` module
-// exposes. Search order (first existing wins):
-//   1. dir/<os>/<arch>/name.nova     2. dir/<os>/name.nova
-//   3. dir/posix/<arch>/name.nova    4. dir/posix/name.nova        (3,4 only when is_posix)
-//   5. dir/name_<os>.nova            (LEGACY suffix -- kept so un-migrated modules still resolve)
-// Returns null when none exists (the caller then reads the flat base path). Module identity stays the
-// BASE path so `import foo` links regardless of which file's bytes were read.
+/// The target-conditional file rule: given a logical `.nova` path, return the
+/// most specific platform variant that exists on disk, or null to use the path
+/// as-is.
+///
+/// This is how shared std code names a module without naming a platform. For a
+/// path `dir/name.nova` it probes, in decreasing specificity:
+///   - a hardcoded special case: `src/std/net/eventloop` becomes
+///     `src/std/net/ev/{kqueue|iocp|epoll}.nova` chosen by `os_tag`;
+///   - `dir/<os>/<arch>/name.nova`, then `dir/<os>/name.nova`;
+///   - for POSIX targets, `dir/posix/<arch>/name.nova`, then `dir/posix/name.nova`;
+///   - finally the flat sibling `dir/name_<os>.nova`.
+///
+/// The first candidate that [`suffixedFileExists`] confirms wins; the losing
+/// allocations are freed as it goes (via the inner `tryCand` helper). Returns
+/// null for non-`.nova` paths.
 pub fn targetVariantPath(path: []const u8, os_tag: []const u8, arch: []const u8, is_posix: bool, allocator: std.mem.Allocator, io: std.Io, home: ?[]const u8) ?[]const u8 {
     if (!std.mem.endsWith(u8, path, ".nova")) return null;
     const stem = path[0 .. path.len - 5];
@@ -451,10 +603,6 @@ pub fn targetVariantPath(path: []const u8, os_tag: []const u8, arch: []const u8,
         }
     }.go;
 
-    // Mechanism-named backends: the net/eventloop module is selected by MECHANISM (kqueue/epoll/iocp),
-    // not by an os/ folder, so it maps to net/ev/<mechanism>.nova per target. The module identity stays
-    // `net/eventloop` (the caller's base path), so importers' `eventloop.X` still resolves. io_uring is
-    // runtime-dispatched inside the linux (epoll) unit, so linux -> net/ev/epoll.nova.
     if (std.mem.eql(u8, dir, "src/std/net") and std.mem.eql(u8, name, "eventloop")) {
         const mech: []const u8 = if (std.mem.eql(u8, os_tag, "darwin")) "kqueue" else if (std.mem.eql(u8, os_tag, "windows")) "iocp" else "epoll";
         if (std.fmt.allocPrint(allocator, "src/std/net/ev/{s}.nova", .{mech}) catch null) |c| {
@@ -462,36 +610,35 @@ pub fn targetVariantPath(path: []const u8, os_tag: []const u8, arch: []const u8,
         }
     }
 
-    // 1. dir/<os>/<arch>/name.nova
     if (std.fmt.allocPrint(allocator, "{s}/{s}/{s}/{s}.nova", .{ dir, os_tag, arch, name }) catch null) |c| {
         if (tryCand(c, allocator, io, home)) |hit| return hit;
     }
-    // 2. dir/<os>/name.nova
     if (std.fmt.allocPrint(allocator, "{s}/{s}/{s}.nova", .{ dir, os_tag, name }) catch null) |c| {
         if (tryCand(c, allocator, io, home)) |hit| return hit;
     }
     if (is_posix) {
-        // 3. dir/posix/<arch>/name.nova
         if (std.fmt.allocPrint(allocator, "{s}/posix/{s}/{s}.nova", .{ dir, arch, name }) catch null) |c| {
             if (tryCand(c, allocator, io, home)) |hit| return hit;
         }
-        // 4. dir/posix/name.nova
         if (std.fmt.allocPrint(allocator, "{s}/posix/{s}.nova", .{ dir, name }) catch null) |c| {
             if (tryCand(c, allocator, io, home)) |hit| return hit;
         }
     }
-    // 5. legacy dir/name_<os>.nova
     if (std.fmt.allocPrint(allocator, "{s}_{s}.nova", .{ stem, os_tag }) catch null) |c| {
         if (tryCand(c, allocator, io, home)) |hit| return hit;
     }
     return null;
 }
 
-
-// A resolved import may be either `<path>.nova` or its `<path>.nsx` sibling. `.nsx` is the SAME Nova
-// language, filed under a distinct extension so view / JSX (NSX) code is kept apart from plain logic.
-// Given a freshly-allocated `.nova` candidate, return whichever of the two exists as an owned path;
-// otherwise free the candidate and return null. The `.nova` form is tried first so it wins on a tie.
+/// Return `nova_candidate` if it names an existing source, trying an `.nsx`
+/// sibling as a fallback, and freeing the candidate otherwise.
+///
+/// `.nsx` is the hypermedia-template dialect: a `foo.nova` import also matches a
+/// `foo.nsx` file. Ownership is a subtle contract: this function *consumes*
+/// `nova_candidate`. It returns the winning path (the original, or a freshly
+/// allocated `.nsx` after freeing the original), and on a total miss it frees
+/// `nova_candidate` and returns null. Callers therefore hand off ownership and
+/// must not free the argument themselves.
 pub fn existingSource(nova_candidate: []const u8, allocator: std.mem.Allocator, io: std.Io) ?[]const u8 {
     if (Io.Dir.access(.cwd(), io, nova_candidate, .{})) |_| {
         return nova_candidate;
@@ -510,11 +657,27 @@ pub fn existingSource(nova_candidate: []const u8, allocator: std.mem.Allocator, 
     return null;
 }
 
-
+/// Resolve an `import "<module_name>"` (from the file at `base_path`) to a
+/// concrete source path.
+///
+/// The resolution order, first hit wins:
+///   1. Built-in modules: the `platform` pseudo-module, any `std/...` prefix,
+///      and a large hardcoded whitelist of `src/std/...` modules (plus a handful
+///      of bare aliases like `list`, `map`, `db`, `pool`). This whitelist is
+///      what gates which std modules the import graph will pull in.
+///   2. Relative resolution walking up from `base_path`'s directory, trying
+///      `<dir>/src/<mod>.nova` then `<dir>/<mod>.nova` at each ancestor.
+///   3. Current-dir `<mod>.nova` and `src/<mod>.nova`.
+///   4. Lockfile-pinned packages ([`resolveVersioned`], which may error on a
+///      name collision), then local `packages/` roots ([`resolveFromLocalPackages`]),
+///      then root `src/<mod>.nova`, then the `~/.nova` package cache
+///      ([`resolveFromPackageCache`]).
+///
+/// If nothing matches it returns a best-effort synthetic path (`<mod>.nova` or
+/// `<dir>/<mod>.nova`) so the caller produces a sensible "file not found" rather
+/// than a resolver error. The result is always an owned slice.
 pub fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocator: std.mem.Allocator, io: std.Io, home: ?[]const u8) ![]const u8 {
     if (std.mem.eql(u8, module_name, "platform")) {
-        // Synthetic module — parsed from generated source (see loadProgram), but given a src/std path so
-        // canonicalModulePrefix maps its declarations to module "platform" (the import's qualifier).
         return try allocator.dupe(u8, "src/std/platform.nova");
     }
     if (std.mem.startsWith(u8, module_name, "std/")) {
@@ -558,13 +721,6 @@ pub fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocat
     const dir_end = std.mem.lastIndexOfScalar(u8, base_path, '/') orelse 0;
     const dir = if (dir_end == 0) "" else base_path[0..dir_end];
 
-    // Importer-relative resolution WINS over any global package match. A driver package's own
-    // `src/codec.nova` must resolve for `import codec` whether the importer is `src/postgres.nova`
-    // (same dir) or `tests/66_x.nova` (reaches it via ../src), even though several driver packages
-    // define a same-named `codec.nova`. Walking the importer's own tree first is what lets the
-    // internal modules drop their per-driver prefixes (pg_/my_/ms_/bt_/mongo_): without it the
-    // global scan below (resolveFromLocalPackages / resolveFromPackageCache) returns whichever
-    // package iterates first, so bare names could only stay unique via those prefixes.
     var current_len = dir.len;
     while (current_len > 0) {
         const current_dir = dir[0..current_len];
@@ -579,16 +735,6 @@ pub fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocat
         current_len = last_slash;
     }
 
-    // Final importer-relative step: the CWD (the project/package root being built). The walk above stops
-    // at the importer's own directory chain, which for a relative importer like `tests/foo.nova` breaks at
-    // `tests/` (no parent slash) and never reaches the package root's `src/`, and for a bare importer like
-    // `foo.nova` never runs at all (empty dir). In both cases the importer's OWN package root is the CWD, so
-    // check `./<mod>.nova` and `./src/<mod>.nova` here -- BEFORE the global scans below. This makes a
-    // package's own module win over a same-named module in a SIBLING package or a stale ~/.nova/cache entry
-    // (observed: mssql's `import connection` binding to nova-postgres's connection.nova, whose
-    // ConnectionOptions lacks `encrypt`/`trustCert` -> FieldNotFound). These candidates only WIN when the
-    // local file actually exists, so a package-managed app with no local file falls through to the version
-    // resolution and package scans exactly as before.
     {
         const cwd_candidate = try std.fmt.allocPrint(allocator, "{s}.nova", .{module_name});
         if (existingSource(cwd_candidate, allocator, io)) |hit| return hit;
@@ -596,10 +742,6 @@ pub fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocat
         if (existingSource(cwd_src, allocator, io)) |hit| return hit;
     }
 
-    // Version-aware resolution (pkg-manager.md §6): when a lockfile exists, `import X` binds through the
-    // owning package's manifest + the flat lock to a version-keyed cache dir. Wins over the legacy scans
-    // so a package-managed app gets the EXACT pinned version (and multi-version coexistence). Inert (null)
-    // when there is no lock, so the packages/-based dev setup and the corpus are unchanged.
     if (try resolveVersioned(module_name, base_path, allocator, io, home)) |ver_hit| {
         return ver_hit;
     }
@@ -623,17 +765,20 @@ pub fn resolveImportPath(base_path: []const u8, module_name: []const u8, allocat
     return try std.fmt.allocPrint(allocator, "{s}/{s}.nova", .{ dir, module_name });
 }
 
-
-// -------------------------------------------------------------------------------------------------
-// Version-aware import resolution (pkg-manager.md §6). When a project.lock.json exists, an `import X`
-// binds PER OWNING PACKAGE: find the file's owning manifest (nearest project.json up its tree), look up
-// X among that manifest's dependencies via the flat lock (url[#ref] -> declared name + resolved SHA),
-// and resolve to the version-keyed cache dir `~/.nova/cache/<name>-<sha8>`. Because two versions live at
-// different paths and mangling is path-derived, they coexist. Returns null (fall through to the legacy
-// scan) when there is no lock — so the corpus and packages/-based dev setup are unaffected.
+/// One resolved dependency row in `project.lock.json` (deserialised by the JSON
+/// parser). `url` is the git remote, `ref` the requested ref/branch (nullable),
+/// `resolved` the resolved commit sha (nullable), and `name` the import name the
+/// package publishes.
 const PkgLockEntry = struct { url: []const u8, ref: ?[]const u8 = null, resolved: ?[]const u8 = null, name: []const u8 };
+/// The whole `project.lock.json` shape: a version tag plus the flat list of
+/// resolved [`PkgLockEntry`] rows.
 const PkgLockFile = struct { lockfileVersion: u32 = 1, dependencies: []PkgLockEntry = &[_]PkgLockEntry{} };
 
+/// Split a manifest dependency string of the form `url#ref` into its url and
+/// optional ref.
+///
+/// The ref is everything after the last `#`; a trailing `#` with nothing after
+/// it yields a null ref, matching an entry that pins only a url.
 fn pkgParseDep(dep: []const u8) struct { url: []const u8, ref: ?[]const u8 } {
     if (std.mem.lastIndexOfScalar(u8, dep, '#')) |h|
         return .{ .url = dep[0..h], .ref = if (h + 1 < dep.len) dep[h + 1 ..] else null };
@@ -651,9 +796,6 @@ fn refEql(a: ?[]const u8, b: ?[]const u8) bool {
     return std.mem.eql(u8, a.?, b.?);
 }
 
-// The nearest ancestor directory of `importer_file` that contains a project.json (its owning package).
-// A top-level app file (e.g. "src/main.nova") is owned by the CWD project — so once the walk exhausts the
-// path's own directories, fall back to the CWD's project.json (returned as ".").
 fn findOwningManifestDir(allocator: std.mem.Allocator, io: std.Io, importer_file: []const u8) ?[]const u8 {
     var end = std.mem.lastIndexOfScalar(u8, importer_file, '/') orelse 0;
     while (end > 0) {
@@ -662,7 +804,6 @@ fn findOwningManifestDir(allocator: std.mem.Allocator, io: std.Io, importer_file
         if (Io.Dir.access(.cwd(), io, mpath, .{})) |_| return allocator.dupe(u8, dir) catch null else |_| {}
         end = std.mem.lastIndexOfScalar(u8, dir, '/') orelse break;
     }
-    // CWD project (the app being built) owns any file not under a nested package dir.
     if (Io.Dir.access(.cwd(), io, "project.json", .{})) |_| return allocator.dupe(u8, ".") catch null else |_| {}
     return null;
 }
@@ -679,7 +820,6 @@ pub const PkgResolveError = error{PackageNameCollision};
 
 pub fn resolveVersioned(module_name: []const u8, importer_file: []const u8, allocator: std.mem.Allocator, io: std.Io, home: ?[]const u8) PkgResolveError!?[]const u8 {
     const home_dir = home orelse return null;
-    // The flat lock is the ROOT project's (cwd) — it holds the whole tree, keyed by url (+ref).
     const lock_data = Io.Dir.readFileAlloc(.cwd(), io, "project.lock.json", allocator, .unlimited) catch return null;
     const lock = std.json.parseFromSlice(PkgLockFile, allocator, lock_data, .{ .ignore_unknown_fields = true }) catch return null;
 
@@ -688,8 +828,6 @@ pub fn resolveVersioned(module_name: []const u8, importer_file: []const u8, allo
     const mdata = Io.Dir.readFileAlloc(.cwd(), io, owner_manifest, allocator, .unlimited) catch return null;
     const manifest = std.json.parseFromSlice(ProjectJson, allocator, mdata, .{ .ignore_unknown_fields = true }) catch return null;
 
-    // Among THIS owning package's deps, find the one whose declared name (from the lock) == module_name.
-    // Two different urls in the SAME scope declaring the same name is an identity clash (§6 name-collision).
     var match_url: ?[]const u8 = null;
     var match_entry: ?PkgLockEntry = null;
     for (manifest.value.dependencies) |dep| {
@@ -739,10 +877,6 @@ pub fn resolveFromPackageCache(module_name: []const u8, allocator: std.mem.Alloc
     return null;
 }
 
-
-// Scan a single `packages/` root for a module: first `<root>/nova-<module>/src/<module>.nova` (the
-// package's own top module), then `<root>/<any-pkg>/src/<module>.nova` (a flat module inside any
-// package, e.g. nova-datastar's `datastar`/`ds_sink`). Returns an owned path or null.
 pub fn scanPackageRoot(root: []const u8, module_name: []const u8, allocator: std.mem.Allocator, io: std.Io) ?[]const u8 {
     const direct = std.fmt.allocPrint(allocator, "{s}/nova-{s}/src/{s}.nova", .{ root, module_name, module_name }) catch return null;
     if (existingSource(direct, allocator, io)) |hit| return hit;
@@ -757,17 +891,9 @@ pub fn scanPackageRoot(root: []const u8, module_name: []const u8, allocator: std
     return null;
 }
 
-
-// Resolve `module_name` from a sibling `packages/` directory. Searches the CWD-relative roots
-// (`packages`, `../packages`) AND a `packages/` dir at every ANCESTOR of the importing file, so a
-// cross-package import (e.g. an app under packages/nova-orchestrator/examples importing nova-datastar's
-// `datastar`) resolves no matter what the process CWD is — `nova build --file <deep/path>` included.
 pub fn resolveFromLocalPackages(module_name: []const u8, importer_dir: []const u8, allocator: std.mem.Allocator, io: std.Io) ?[]const u8 {
-    // CWD-relative `packages/` at several parent depths. `nova build --file <deep/path>` and `nova test`
-    // run from different CWDs (the project dir, the lang dir, the file's dir), so probe a few `../` levels
-    // rather than assume one. First existing package with the module wins.
     const cwd_roots = [_][]const u8{
-        "packages", "../packages", "../../packages", "../../../packages",
+        "packages",             "../packages",             "../../packages", "../../../packages",
         "../../../../packages", "../../../../../packages",
     };
     for (cwd_roots) |root| {
@@ -789,13 +915,6 @@ pub fn resolveFromLocalPackages(module_name: []const u8, importer_dir: []const u
     return null;
 }
 
-
-// Copy a trait's DEFAULT method bodies onto every struct that impls the trait but does not override the
-// method. The parser does this per file, so a struct only inherited defaults from traits declared in the SAME
-// file; a trait in another module was invisible and the completeness check then reported the method missing.
-// Running it again here on the FULLY-MERGED declaration list closes that cross-module gap. Idempotent: a
-// method already present (same-file expansion, or a real override) is skipped, so re-running copies only the
-// cross-module defaults.
 fn tdStructHasMethod(methods: []const ast.MethodDecl, name: []const u8) bool {
     for (methods) |m| if (std.mem.eql(u8, m.decl.name, name)) return true;
     return false;
@@ -878,16 +997,14 @@ pub fn generateControllerRoutes(allocator: std.mem.Allocator, declarations: *std
             var statements = std.ArrayList(ast.Statement).empty;
             defer statements.deinit(allocator);
 
-            const let_ctrl = ast.Statement{
-                .let_stmt = .{
-                    .name = "ctrl",
-                    .names = null,
-                    .type_name = null,
-                    .init = ast.Expression{ .kind = .{ .ident = "self" } },
-                    .is_const = false,
-                    .span = s.span,
-                }
-            };
+            const let_ctrl = ast.Statement{ .let_stmt = .{
+                .name = "ctrl",
+                .names = null,
+                .type_name = null,
+                .init = ast.Expression{ .kind = .{ .ident = "self" } },
+                .is_const = false,
+                .span = s.span,
+            } };
             try statements.append(allocator, let_ctrl);
 
             for (s.methods) |method| {
@@ -897,10 +1014,10 @@ pub fn generateControllerRoutes(allocator: std.mem.Allocator, declarations: *std
 
                         const callee = try allocator.create(ast.Expression);
                         callee.* = ast.Expression{ .kind = .{ .field_access = .{
-                                .object = try allocator.create(ast.Expression),
-                                .field = "add",
-                                .span = s.span,
-                            } } };
+                            .object = try allocator.create(ast.Expression),
+                            .field = "add",
+                            .span = s.span,
+                        } } };
                         callee.kind.field_access.object.* = ast.Expression{ .kind = .{ .ident = "router" } };
 
                         const closure_param_names = try allocator.alloc([]const u8, 1);
@@ -908,10 +1025,10 @@ pub fn generateControllerRoutes(allocator: std.mem.Allocator, declarations: *std
 
                         const call_expr_callee = try allocator.create(ast.Expression);
                         call_expr_callee.* = ast.Expression{ .kind = .{ .field_access = .{
-                                .object = try allocator.create(ast.Expression),
-                                .field = method.decl.name,
-                                .span = s.span,
-                            } } };
+                            .object = try allocator.create(ast.Expression),
+                            .field = method.decl.name,
+                            .span = s.span,
+                        } } };
                         call_expr_callee.kind.field_access.object.* = ast.Expression{ .kind = .{ .ident = "ctrl" } };
 
                         const call_expr_args = try allocator.alloc(ast.Expression, 1);
@@ -919,10 +1036,10 @@ pub fn generateControllerRoutes(allocator: std.mem.Allocator, declarations: *std
 
                         const closure_body_expr = try allocator.create(ast.Expression);
                         closure_body_expr.* = ast.Expression{ .kind = .{ .call = .{
-                                .callee = call_expr_callee,
-                                .args = call_expr_args,
-                                .span = s.span,
-                            } } };
+                            .callee = call_expr_callee,
+                            .args = call_expr_args,
+                            .span = s.span,
+                        } } };
 
                         const closure_expr = ast.Expression{ .kind = .{
                             .closure = .{
@@ -938,17 +1055,15 @@ pub fn generateControllerRoutes(allocator: std.mem.Allocator, declarations: *std
                         add_args[2] = closure_expr;
 
                         const add_call = ast.Expression{ .kind = .{ .call = .{
-                                .callee = callee,
-                                .args = add_args,
-                                .span = s.span,
-                            } } };
+                            .callee = callee,
+                            .args = add_args,
+                            .span = s.span,
+                        } } };
 
-                        const route_stmt = ast.Statement{
-                            .expr_stmt = .{
-                                .expr = add_call,
-                                .span = s.span,
-                            }
-                        };
+                        const route_stmt = ast.Statement{ .expr_stmt = .{
+                            .expr = add_call,
+                            .span = s.span,
+                        } };
                         try statements.append(allocator, route_stmt);
                     }
                 }
@@ -993,7 +1108,6 @@ pub fn generateControllerRoutes(allocator: std.mem.Allocator, declarations: *std
     }
 }
 
-
 pub fn serdeIsInt(n: []const u8) bool {
     const ints = [_][]const u8{ "i8", "u8", "byte", "i16", "u16", "short", "ushort", "i32", "u32", "int", "uint", "i64", "u64", "long", "ulong" };
     for (ints) |x| if (std.mem.eql(u8, n, x)) return true;
@@ -1001,12 +1115,10 @@ pub fn serdeIsInt(n: []const u8) bool {
 }
 
 pub fn serdeIsFloat(n: []const u8) bool {
-
     const fs = [_][]const u8{ "f32", "f64", "float", "double" };
     for (fs) |x| if (std.mem.eql(u8, n, x)) return true;
     return false;
 }
-
 
 pub fn serdeEnumPayloadless(e: ast.EnumDecl) bool {
     for (e.variants) |v| {
@@ -1019,7 +1131,6 @@ pub fn serdeAppendf(list: *std.ArrayList(u8), allocator: std.mem.Allocator, comp
     const s = try std.fmt.allocPrint(allocator, fmt, args);
     try list.appendSlice(allocator, s);
 }
-
 
 pub fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.ArrayList(ast.Declaration), is_wasm: bool) !void {
     var serializable = std.StringHashMap(void).init(allocator);
@@ -1044,9 +1155,6 @@ pub fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.Arr
         }
     }
 
-    // The positional binder (T__planFor/T__bindRow) references the DB seam (Row, Column, colIndexOf). Only
-    // emit it when that seam is actually in the program (i.e. data.db was imported); a hermetic program with
-    // @serializable structs but no DB import must not gain undefined references.
     var has_db = false;
     {
         var have_row = false;
@@ -1109,16 +1217,9 @@ pub fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.Arr
             const fname = f.name;
             switch (f.type_name) {
                 .ident => |tn| {
-                    // has-guard every field so an ABSENT key keeps the value init() set (the documented
-                    // "__bind overwrites the fields it finds" contract). Without the guard an omitted key
-                    // zero-filled the field, so a partial JSON/YAML document silently wiped the defaults.
                     if (std.mem.eql(u8, tn, "string")) {
                         try serdeAppendf(&src, allocator, "    if (src.has(\"{s}\")) {{ obj.{s} = src.getString(\"{s}\"); }}\n", .{ fname, fname, fname });
                     } else if (std.mem.eql(u8, tn, "Str")) {
-                        // A borrowed-string field (P10 Str): bind a zero-copy VIEW instead of an owned
-                        // string. From a DB RowSource this borrows Row.raw (owned by the ResultSet, which
-                        // outlives the bind); from JSON/YAML it borrows the source node's bytes. The
-                        // caller carries the same manual-lifetime contract as Str everywhere.
                         try serdeAppendf(&src, allocator, "    if (src.has(\"{s}\")) {{ obj.{s} = src.getStr(\"{s}\"); }}\n", .{ fname, fname, fname });
                     } else if (serdeIsInt(tn)) {
                         try serdeAppendf(&src, allocator, "    if (src.has(\"{s}\")) {{ obj.{s} = src.getInt(\"{s}\"); }}\n", .{ fname, fname, fname });
@@ -1135,7 +1236,6 @@ pub fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.Arr
                     }
                 },
                 .optional => |inner| {
-
                     if (inner.* == .ident) {
                         const itn = inner.ident;
                         if (std.mem.eql(u8, itn, "string")) {
@@ -1159,8 +1259,6 @@ pub fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.Arr
                 },
                 .generic => |g| {
                     if (std.mem.eql(u8, g.name, "List") and g.params.len == 1) {
-                        // has-guard the whole list too: an absent key keeps the init() default list
-                        // rather than resetting it to empty (matches the scalar/nested guard above).
                         try serdeAppendf(&src, allocator, "    if (src.has(\"{s}\")) {{\n", .{fname});
                         switch (g.params[0]) {
                             .ident => |en| try serdeAppendf(&src, allocator, "    obj.{s} = List<{s}>();\n", .{ fname, en }),
@@ -1182,7 +1280,7 @@ pub fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.Arr
                             else => {},
                         }
                         try serdeAppendf(&src, allocator, " __i = __i + 1; }} }}\n", .{});
-                        try serdeAppendf(&src, allocator, "    }}\n", .{});   // close if (src.has(...))
+                        try serdeAppendf(&src, allocator, "    }}\n", .{});
                     }
                 },
                 else => {},
@@ -1190,151 +1288,132 @@ pub fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.Arr
         }
         try src.appendSlice(allocator, "    return obj;\n}\n\n");
 
-        // Level A positional binder (DB ORM path). `{s}__planFor` resolves each field to its column index
-        // ONCE per result set (by name, case-insensitive); `{s}__bindRow` then reads `row.cells[pos]` by
-        // index -- no per-field name Map, no ValueSource trait dispatch. Additive: the name-based `{s}__bind`
-        // above is untouched, so JSON/YAML/web binding is unaffected. Only scalar column types are bound
-        // positionally; a field with no matching column keeps its init default (plan entry -1). Emitted only
-        // when the DB seam (Row/Column/colIndexOf) is in the program, so hermetic non-DB programs are safe.
         if (has_db) {
-        try serdeAppendf(&src, allocator, "fn {s}__planFor(cols: List<Column>): List<int> {{\n    let plan = List<int>();\n", .{s.name});
-        for (s.fields) |f| {
-            try serdeAppendf(&src, allocator, "    plan.push(colIndexOf(cols, \"{s}\"));\n", .{f.name});
-        }
-        try src.appendSlice(allocator, "    return plan;\n}\n\n");
+            try serdeAppendf(&src, allocator, "fn {s}__planFor(cols: List<Column>): List<int> {{\n    let plan = List<int>();\n", .{s.name});
+            for (s.fields) |f| {
+                try serdeAppendf(&src, allocator, "    plan.push(colIndexOf(cols, \"{s}\"));\n", .{f.name});
+            }
+            try src.appendSlice(allocator, "    return plan;\n}\n\n");
 
-        try serdeAppendf(&src, allocator, "fn {s}__bindRow(row: Row, plan: List<int>): {s} {{\n    let obj = {s}();\n", .{ s.name, s.name, s.name });
-        var __k: usize = 0;
-        for (s.fields) |f| {
-            const fname = f.name;
-            var acc: ?[]const u8 = null;
-            var enumName: ?[]const u8 = null;
-            const tnOpt: ?[]const u8 = switch (f.type_name) {
-                .ident => |tn| tn,
-                .optional => |inner| if (inner.* == .ident) inner.ident else null,
-                else => null,
-            };
-            if (tnOpt) |tn| {
-                if (std.mem.eql(u8, tn, "string")) {
-                    acc = "asText";
-                } else if (std.mem.eql(u8, tn, "Str")) {
-                    acc = "asView";
-                } else if (serdeIsInt(tn)) {
-                    // Match the field width so there is no narrowing: `int` -> asInt(), `long` -> asLong().
-                    acc = if (std.mem.eql(u8, tn, "int") or std.mem.eql(u8, tn, "i32")) "asInt" else "asLong";
-                } else if (std.mem.eql(u8, tn, "bool")) {
-                    acc = "asBool";
-                } else if (std.mem.eql(u8, tn, "decimal")) {
-                    acc = "asDecimal";
-                } else if (serdeIsFloat(tn)) {
-                    acc = "asDouble";
-                } else if (enums.contains(tn)) {
-                    acc = "asText";
-                    enumName = tn;
+            try serdeAppendf(&src, allocator, "fn {s}__bindRow(row: Row, plan: List<int>): {s} {{\n    let obj = {s}();\n", .{ s.name, s.name, s.name });
+            var __k: usize = 0;
+            for (s.fields) |f| {
+                const fname = f.name;
+                var acc: ?[]const u8 = null;
+                var enumName: ?[]const u8 = null;
+                const tnOpt: ?[]const u8 = switch (f.type_name) {
+                    .ident => |tn| tn,
+                    .optional => |inner| if (inner.* == .ident) inner.ident else null,
+                    else => null,
+                };
+                if (tnOpt) |tn| {
+                    if (std.mem.eql(u8, tn, "string")) {
+                        acc = "asText";
+                    } else if (std.mem.eql(u8, tn, "Str")) {
+                        acc = "asView";
+                    } else if (serdeIsInt(tn)) {
+                        acc = if (std.mem.eql(u8, tn, "int") or std.mem.eql(u8, tn, "i32")) "asInt" else "asLong";
+                    } else if (std.mem.eql(u8, tn, "bool")) {
+                        acc = "asBool";
+                    } else if (std.mem.eql(u8, tn, "decimal")) {
+                        acc = "asDecimal";
+                    } else if (serdeIsFloat(tn)) {
+                        acc = "asDouble";
+                    } else if (enums.contains(tn)) {
+                        acc = "asText";
+                        enumName = tn;
+                    }
                 }
-            }
-            if (acc) |a| {
-                if (enumName) |en| {
-                    try serdeAppendf(&src, allocator, "    {{ let __p = plan.get({d}) ?? -1; if (__p >= 0) {{ obj.{s} = {s}__fromName(row.get(__p).{s}()); }} }}\n", .{ __k, fname, en, a });
-                } else {
-                    try serdeAppendf(&src, allocator, "    {{ let __p = plan.get({d}) ?? -1; if (__p >= 0) {{ obj.{s} = row.get(__p).{s}(); }} }}\n", .{ __k, fname, a });
+                if (acc) |a| {
+                    if (enumName) |en| {
+                        try serdeAppendf(&src, allocator, "    {{ let __p = plan.get({d}) ?? -1; if (__p >= 0) {{ obj.{s} = {s}__fromName(row.get(__p).{s}()); }} }}\n", .{ __k, fname, en, a });
+                    } else {
+                        try serdeAppendf(&src, allocator, "    {{ let __p = plan.get({d}) ?? -1; if (__p >= 0) {{ obj.{s} = row.get(__p).{s}(); }} }}\n", .{ __k, fname, a });
+                    }
                 }
+                __k += 1;
             }
-            __k += 1;
-        }
-        try src.appendSlice(allocator, "    return obj;\n}\n\n");
+            try src.appendSlice(allocator, "    return obj;\n}\n\n");
 
-        // Level B fused binder: `{s}__bindAll` decodes a WHOLE result set in one function -- the column
-        // indices are resolved ONCE into LOCALS (not a per-row `plan` List) and each row is bound in a
-        // tight inline loop with the direct accessor, exactly like a hand-rolled positional decode
-        // (`obj.f = row.get(idx).asX()`). This removes the `planFor` List allocation and the per-row
-        // `bindRow` call + `plan.get(k)` indirection that separated the generic binder from hand-decode.
-        // Driver-agnostic: any @serializable T bound via orm.bindAll<T> over any driver's ResultSet.
-        try serdeAppendf(&src, allocator, "fn {s}__bindAll(rs: ResultSet): List<{s}> {{\n    let out = List<{s}>();\n    let __n = rs.rows.size();\n    if (__n == 0) {{ return out; }}\n", .{ s.name, s.name, s.name });
-        for (s.fields, 0..) |f, fi| {
-            try serdeAppendf(&src, allocator, "    let __i{d} = colIndexOf(rs.columns, \"{s}\");\n", .{ fi, f.name });
-        }
-        try src.appendSlice(allocator, "    let __r = 0;\n    while (__r < __n) {\n        let __row = rs.rows.get(__r) ?? Row();\n");
-        try serdeAppendf(&src, allocator, "        let obj = {s}();\n", .{s.name});
-        for (s.fields, 0..) |f, fi| {
-            const fname = f.name;
-            var acc: ?[]const u8 = null;
-            var enumName: ?[]const u8 = null;
-            const tnOpt: ?[]const u8 = switch (f.type_name) {
-                .ident => |tn| tn,
-                .optional => |inner| if (inner.* == .ident) inner.ident else null,
-                else => null,
-            };
-            if (tnOpt) |tn| {
-                if (std.mem.eql(u8, tn, "string")) {
-                    acc = "asText";
-                } else if (std.mem.eql(u8, tn, "Str")) {
-                    acc = "asView";
-                } else if (serdeIsInt(tn)) {
-                    acc = if (std.mem.eql(u8, tn, "int") or std.mem.eql(u8, tn, "i32")) "asInt" else "asLong";
-                } else if (std.mem.eql(u8, tn, "bool")) {
-                    acc = "asBool";
-                } else if (std.mem.eql(u8, tn, "decimal")) {
-                    acc = "asDecimal";
-                } else if (serdeIsFloat(tn)) {
-                    acc = "asDouble";
-                } else if (enums.contains(tn)) {
-                    acc = "asText";
-                    enumName = tn;
+            try serdeAppendf(&src, allocator, "fn {s}__bindAll(rs: ResultSet): List<{s}> {{\n    let out = List<{s}>();\n    let __n = rs.rows.size();\n    if (__n == 0) {{ return out; }}\n", .{ s.name, s.name, s.name });
+            for (s.fields, 0..) |f, fi| {
+                try serdeAppendf(&src, allocator, "    let __i{d} = colIndexOf(rs.columns, \"{s}\");\n", .{ fi, f.name });
+            }
+            try src.appendSlice(allocator, "    let __r = 0;\n    while (__r < __n) {\n        let __row = rs.rows.get(__r) ?? Row();\n");
+            try serdeAppendf(&src, allocator, "        let obj = {s}();\n", .{s.name});
+            for (s.fields, 0..) |f, fi| {
+                const fname = f.name;
+                var acc: ?[]const u8 = null;
+                var enumName: ?[]const u8 = null;
+                const tnOpt: ?[]const u8 = switch (f.type_name) {
+                    .ident => |tn| tn,
+                    .optional => |inner| if (inner.* == .ident) inner.ident else null,
+                    else => null,
+                };
+                if (tnOpt) |tn| {
+                    if (std.mem.eql(u8, tn, "string")) {
+                        acc = "asText";
+                    } else if (std.mem.eql(u8, tn, "Str")) {
+                        acc = "asView";
+                    } else if (serdeIsInt(tn)) {
+                        acc = if (std.mem.eql(u8, tn, "int") or std.mem.eql(u8, tn, "i32")) "asInt" else "asLong";
+                    } else if (std.mem.eql(u8, tn, "bool")) {
+                        acc = "asBool";
+                    } else if (std.mem.eql(u8, tn, "decimal")) {
+                        acc = "asDecimal";
+                    } else if (serdeIsFloat(tn)) {
+                        acc = "asDouble";
+                    } else if (enums.contains(tn)) {
+                        acc = "asText";
+                        enumName = tn;
+                    }
+                }
+                if (acc) |a| {
+                    if (enumName) |en| {
+                        try serdeAppendf(&src, allocator, "        if (__i{d} >= 0) {{ obj.{s} = {s}__fromName(__row.get(__i{d}).{s}()); }}\n", .{ fi, fname, en, fi, a });
+                    } else {
+                        try serdeAppendf(&src, allocator, "        if (__i{d} >= 0) {{ obj.{s} = __row.get(__i{d}).{s}(); }}\n", .{ fi, fname, fi, a });
+                    }
                 }
             }
-            if (acc) |a| {
-                if (enumName) |en| {
-                    try serdeAppendf(&src, allocator, "        if (__i{d} >= 0) {{ obj.{s} = {s}__fromName(__row.get(__i{d}).{s}()); }}\n", .{ fi, fname, en, fi, a });
-                } else {
-                    try serdeAppendf(&src, allocator, "        if (__i{d} >= 0) {{ obj.{s} = __row.get(__i{d}).{s}(); }}\n", .{ fi, fname, fi, a });
-                }
-            }
-        }
-        try src.appendSlice(allocator, "        out.push(obj);\n        __r = __r + 1;\n    }\n    return out;\n}\n\n");
+            try src.appendSlice(allocator, "        out.push(obj);\n        __r = __r + 1;\n    }\n    return out;\n}\n\n");
 
-        // Buffer->struct binder: `{s}__bindWire` decodes a WHOLE response held as WireRows (one owned
-        // buffer + per-row offsets) STRAIGHT into structs -- NO per-row Row/RawBuffer/DbValue materialised.
-        // Each field reads its column's bytes directly from the shared buffer (Str fields borrow it). This
-        // is the buffer->struct path that eliminates the ~400 refcounted per-row objects a ResultSet builds.
-        // Covers string/Str/int/long/float; bool/decimal/enum are skipped (keep their init default).
-        try serdeAppendf(&src, allocator, "fn {s}__bindWire(w: WireRows): List<{s}> {{\n    let out = List<{s}>();\n    let __n = w.count();\n    if (__n == 0) {{ return out; }}\n", .{ s.name, s.name, s.name });
-        for (s.fields, 0..) |f, fi| {
-            try serdeAppendf(&src, allocator, "    let __i{d} = colIndexOf(w.cols, \"{s}\");\n", .{ fi, f.name });
-        }
-        try src.appendSlice(allocator, "    let __b = w.base;\n    let __r = 0;\n    while (__r < __n) {\n        let __off = w.offs.at(__r);\n");
-        try serdeAppendf(&src, allocator, "        let obj = {s}();\n", .{s.name});
-        for (s.fields, 0..) |f, fi| {
-            const fname = f.name;
-            const tnOpt: ?[]const u8 = switch (f.type_name) {
-                .ident => |tn| tn,
-                .optional => |inner| if (inner.* == .ident) inner.ident else null,
-                else => null,
-            };
-            var call: ?[]const u8 = null; // the wire accessor expression (with a trailing cast if needed)
-            if (tnOpt) |tn| {
-                if (std.mem.eql(u8, tn, "string")) {
-                    call = "wireTextAt(__b, __off, IDX)";
-                } else if (std.mem.eql(u8, tn, "Str")) {
-                    call = "wireViewAt(__b, __off, IDX)";
-                } else if (std.mem.eql(u8, tn, "int") or std.mem.eql(u8, tn, "i32")) {
-                    call = "wireIntAt(__b, __off, IDX) as int";
-                } else if (serdeIsInt(tn)) {
-                    call = "wireIntAt(__b, __off, IDX)";
-                } else if (serdeIsFloat(tn)) {
-                    call = "wireDoubleAt(__b, __off, IDX)";
+            try serdeAppendf(&src, allocator, "fn {s}__bindWire(w: WireRows): List<{s}> {{\n    let out = List<{s}>();\n    let __n = w.count();\n    if (__n == 0) {{ return out; }}\n", .{ s.name, s.name, s.name });
+            for (s.fields, 0..) |f, fi| {
+                try serdeAppendf(&src, allocator, "    let __i{d} = colIndexOf(w.cols, \"{s}\");\n", .{ fi, f.name });
+            }
+            try src.appendSlice(allocator, "    let __b = w.base;\n    let __r = 0;\n    while (__r < __n) {\n        let __off = w.offs.at(__r);\n");
+            try serdeAppendf(&src, allocator, "        let obj = {s}();\n", .{s.name});
+            for (s.fields, 0..) |f, fi| {
+                const fname = f.name;
+                const tnOpt: ?[]const u8 = switch (f.type_name) {
+                    .ident => |tn| tn,
+                    .optional => |inner| if (inner.* == .ident) inner.ident else null,
+                    else => null,
+                };
+                var call: ?[]const u8 = null;
+                if (tnOpt) |tn| {
+                    if (std.mem.eql(u8, tn, "string")) {
+                        call = "wireTextAt(__b, __off, IDX)";
+                    } else if (std.mem.eql(u8, tn, "Str")) {
+                        call = "wireViewAt(__b, __off, IDX)";
+                    } else if (std.mem.eql(u8, tn, "int") or std.mem.eql(u8, tn, "i32")) {
+                        call = "wireIntAt(__b, __off, IDX) as int";
+                    } else if (serdeIsInt(tn)) {
+                        call = "wireIntAt(__b, __off, IDX)";
+                    } else if (serdeIsFloat(tn)) {
+                        call = "wireDoubleAt(__b, __off, IDX)";
+                    }
+                }
+                if (call) |c| {
+                    var it = std.mem.splitSequence(u8, c, "IDX");
+                    const first = it.next().?;
+                    const rest = it.next() orelse "";
+                    try serdeAppendf(&src, allocator, "        if (__i{d} >= 0) {{ obj.{s} = {s}__i{d}{s}; }}\n", .{ fi, fname, first, fi, rest });
                 }
             }
-            if (call) |c| {
-                // Substitute IDX -> __i{fi}.
-                var it = std.mem.splitSequence(u8, c, "IDX");
-                const first = it.next().?;
-                const rest = it.next() orelse "";
-                try serdeAppendf(&src, allocator, "        if (__i{d} >= 0) {{ obj.{s} = {s}__i{d}{s}; }}\n", .{ fi, fname, first, fi, rest });
-            }
+            try src.appendSlice(allocator, "        out.push(obj);\n        __r = __r + 1;\n    }\n    return out;\n}\n\n");
         }
-        try src.appendSlice(allocator, "        out.push(obj);\n        __r = __r + 1;\n    }\n    return out;\n}\n\n");
-        }   // if (has_db)
 
         try serdeAppendf(&src, allocator, "fn {s}__toJson(obj: {s}): string {{\n    let out = \"{{\";\n    let __sep = \"\";\n", .{ s.name, s.name });
         for (s.fields) |f| {
@@ -1346,18 +1425,14 @@ pub fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.Arr
                     } else if (serdeIsInt(tn) or std.mem.eql(u8, tn, "bool")) {
                         try serdeAppendf(&src, allocator, "    out = out + __sep + \"\\\"{s}\\\":\" + obj.{s}; __sep = \",\";\n", .{ fname, fname });
                     } else if (std.mem.eql(u8, tn, "decimal")) {
-
                         try serdeAppendf(&src, allocator, "    out = out + __sep + \"\\\"{s}\\\":\" + `${{obj.{s}}}`; __sep = \",\";\n", .{ fname, fname });
                     } else if (serializable.contains(tn)) {
                         try serdeAppendf(&src, allocator, "    out = out + __sep + \"\\\"{s}\\\":\" + {s}__toJson(obj.{s}); __sep = \",\";\n", .{ fname, tn, fname });
                     } else if (enums.contains(tn)) {
-
                         try serdeAppendf(&src, allocator, "    out = out + __sep + \"\\\"{s}\\\":\" + json.quote({s}__name(obj.{s})); __sep = \",\";\n", .{ fname, tn, fname });
                     }
-
                 },
                 .optional => |inner| {
-
                     if (inner.* == .ident) {
                         const itn = inner.ident;
                         var vexpr: ?[]const u8 = null;
@@ -1422,13 +1497,10 @@ pub fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.Arr
                     } else if (serdeIsFloat(tn)) {
                         try serdeAppendf(&src, allocator, "    sink.putFloat(\"{s}\", obj.{s});\n", .{ fname, fname });
                     } else if (enums.contains(tn)) {
-
                         try serdeAppendf(&src, allocator, "    sink.putString(\"{s}\", {s}__name(obj.{s}));\n", .{ fname, tn, fname });
                     }
-
                 },
                 .optional => |inner| {
-
                     if (inner.* == .ident) {
                         const itn = inner.ident;
                         var sink_fn: ?[]const u8 = null;
@@ -1468,7 +1540,6 @@ pub fn generateSerdeBinders(allocator: std.mem.Allocator, declarations: *std.Arr
     }
 }
 
-
 pub fn generateMediatorDispatch(allocator: std.mem.Allocator, declarations: *std.ArrayList(ast.Declaration), is_wasm: bool) !void {
     var src = std.ArrayList(u8).empty;
     var by_name = std.ArrayList(u8).empty;
@@ -1486,10 +1557,6 @@ pub fn generateMediatorDispatch(allocator: std.mem.Allocator, declarations: *std
                 .ident => |n| n,
                 else => continue,
             };
-            // The response type arg is either a plain DTO `R` (always serialised as 200 JSON) or an
-            // error union `R | E` (200 JSON on the ok side; on the error side the framework calls
-            // `e.toResponse()`, so a handler can return any status). `HttpError` (web.response) is the
-            // standard error type, but any type with a `toResponse(): Response` method works.
             var r_ok: []const u8 = "";
             var r_err: ?[]const u8 = null;
             switch (impl.type_args[1]) {
@@ -1510,9 +1577,6 @@ pub fn generateMediatorDispatch(allocator: std.mem.Allocator, declarations: *std
             try seen_q.put(q, {});
             try qs.append(allocator, q);
 
-            // Construct the handler, resolving each `init` parameter from the DI provider (ASP.NET-style
-            // constructor injection). A handler with no constructor is just `H{}`; a handler that takes
-            // dependencies becomes `H(__provider.require("Dep") as Dep, ...)`.
             var init_params: []const ast.Param = &.{};
             var handle_is_async = false;
             for (s.methods) |m| {
@@ -1522,10 +1586,6 @@ pub fn generateMediatorDispatch(allocator: std.mem.Allocator, declarations: *std
                     handle_is_async = m.decl.is_async;
                 }
             }
-            // The generated dispatch is always `async` (so `by_name` is uniform and the App can await
-            // it), but we only `await` the handler when its own `handle` is async — a sync handler is
-            // called directly. This lets an async handler `await` a database driver, while a plain
-            // handler pays no coroutine cost at its own call site.
             const await_kw: []const u8 = if (handle_is_async) "await " else "";
             var ctor_buf = std.ArrayList(u8).empty;
             defer ctor_buf.deinit(allocator);
@@ -1552,54 +1612,45 @@ pub fn generateMediatorDispatch(allocator: std.mem.Allocator, declarations: *std
             }
             const handler_ctor = ctor_buf.items;
 
-            // Raw-response escape hatch: a handler whose success type IS `Response` returns it verbatim
-            // (its own status + Content-Type, e.g. text/html or text/event-stream from mediator.html/sse),
-            // instead of the framework JSON-serialising a DTO. Detected by the response type name.
             const raw_ok = std.mem.eql(u8, r_ok, "Response") or std.mem.eql(u8, r_ok, "response.Response");
             if (r_err != null) {
-                // ok helper returns `Response | E`, so `try` short-circuits the error out of it; the
-                // dispatch then maps that error to a Response via its `toResponse()`.
                 if (raw_ok) {
-                    try serdeAppendf(&src, allocator,
-                        "async fn __mediator_ok_{s}(src: ValueSource, __provider: ServiceProvider): Response | {s} {{\n" ++
-                            "    let __h = {s};\n" ++
-                            "    let __req = {s}__bind(src);\n" ++
-                            "    return try {s}__h.handle(__req);\n" ++
-                            "}}\n" ++
-                            "async fn __mediator_dispatch_{s}(src: ValueSource, __provider: ServiceProvider): Response {{\n" ++
-                            "    return await __mediator_ok_{s}(src, __provider) catch (__e) __e.toResponse();\n" ++
-                            "}}\n\n", .{ q, r_err.?, handler_ctor, q, await_kw, q, q });
+                    try serdeAppendf(&src, allocator, "async fn __mediator_ok_{s}(src: ValueSource, __provider: ServiceProvider): Response | {s} {{\n" ++
+                        "    let __h = {s};\n" ++
+                        "    let __req = {s}__bind(src);\n" ++
+                        "    return try {s}__h.handle(__req);\n" ++
+                        "}}\n" ++
+                        "async fn __mediator_dispatch_{s}(src: ValueSource, __provider: ServiceProvider): Response {{\n" ++
+                        "    return await __mediator_ok_{s}(src, __provider) catch (__e) __e.toResponse();\n" ++
+                        "}}\n\n", .{ q, r_err.?, handler_ctor, q, await_kw, q, q });
                 } else {
-                    try serdeAppendf(&src, allocator,
-                        "async fn __mediator_ok_{s}(src: ValueSource, __provider: ServiceProvider): Response | {s} {{\n" ++
-                            "    let __h = {s};\n" ++
-                            "    let __req = {s}__bind(src);\n" ++
-                            "    let __r = try {s}__h.handle(__req);\n" ++
-                            "    let __resp = Response(Status.Ok, {s}__toJson(__r));\n" ++
-                            "    __resp.setHeader(\"Content-Type\", \"application/json\");\n" ++
-                            "    return __resp;\n" ++
-                            "}}\n" ++
-                            "async fn __mediator_dispatch_{s}(src: ValueSource, __provider: ServiceProvider): Response {{\n" ++
-                            "    return await __mediator_ok_{s}(src, __provider) catch (__e) __e.toResponse();\n" ++
-                            "}}\n\n", .{ q, r_err.?, handler_ctor, q, await_kw, r_ok, q, q });
+                    try serdeAppendf(&src, allocator, "async fn __mediator_ok_{s}(src: ValueSource, __provider: ServiceProvider): Response | {s} {{\n" ++
+                        "    let __h = {s};\n" ++
+                        "    let __req = {s}__bind(src);\n" ++
+                        "    let __r = try {s}__h.handle(__req);\n" ++
+                        "    let __resp = Response(Status.Ok, {s}__toJson(__r));\n" ++
+                        "    __resp.setHeader(\"Content-Type\", \"application/json\");\n" ++
+                        "    return __resp;\n" ++
+                        "}}\n" ++
+                        "async fn __mediator_dispatch_{s}(src: ValueSource, __provider: ServiceProvider): Response {{\n" ++
+                        "    return await __mediator_ok_{s}(src, __provider) catch (__e) __e.toResponse();\n" ++
+                        "}}\n\n", .{ q, r_err.?, handler_ctor, q, await_kw, r_ok, q, q });
                 }
             } else {
                 if (raw_ok) {
-                    try serdeAppendf(&src, allocator,
-                        "async fn __mediator_dispatch_{s}(src: ValueSource, __provider: ServiceProvider): Response {{\n" ++
-                            "    let __h = {s};\n" ++
-                            "    let __req = {s}__bind(src);\n" ++
-                            "    return {s}__h.handle(__req);\n" ++
-                            "}}\n\n", .{ q, handler_ctor, q, await_kw });
+                    try serdeAppendf(&src, allocator, "async fn __mediator_dispatch_{s}(src: ValueSource, __provider: ServiceProvider): Response {{\n" ++
+                        "    let __h = {s};\n" ++
+                        "    let __req = {s}__bind(src);\n" ++
+                        "    return {s}__h.handle(__req);\n" ++
+                        "}}\n\n", .{ q, handler_ctor, q, await_kw });
                 } else {
-                    try serdeAppendf(&src, allocator,
-                        "async fn __mediator_dispatch_{s}(src: ValueSource, __provider: ServiceProvider): Response {{\n" ++
-                            "    let __h = {s};\n" ++
-                            "    let __req = {s}__bind(src);\n" ++
-                            "    let __resp = Response(Status.Ok, {s}__toJson({s}__h.handle(__req)));\n" ++
-                            "    __resp.setHeader(\"Content-Type\", \"application/json\");\n" ++
-                            "    return __resp;\n" ++
-                            "}}\n\n", .{ q, handler_ctor, q, r_ok, await_kw });
+                    try serdeAppendf(&src, allocator, "async fn __mediator_dispatch_{s}(src: ValueSource, __provider: ServiceProvider): Response {{\n" ++
+                        "    let __h = {s};\n" ++
+                        "    let __req = {s}__bind(src);\n" ++
+                        "    let __resp = Response(Status.Ok, {s}__toJson({s}__h.handle(__req)));\n" ++
+                        "    __resp.setHeader(\"Content-Type\", \"application/json\");\n" ++
+                        "    return __resp;\n" ++
+                        "}}\n\n", .{ q, handler_ctor, q, r_ok, await_kw });
                 }
             }
         }
@@ -1635,13 +1686,6 @@ pub fn generateMediatorDispatch(allocator: std.mem.Allocator, declarations: *std
     }
 }
 
-
-// The RUNTIME mediator glue (web/rmediator.nova). For each `impl RequestHandler<Q,R>` this emits the
-// tiny type-directed Nova the runtime cannot write itself: a widen `Q__asMessage`, an adapter
-// `Q__Adapter` (downcast the erased request, build the handler with DI from the request scope, run it,
-// serialise R), and it accumulates a `__registerHandlers(m)` that registers every adapter. The
-// framework (dispatch, pipeline, DI, scopes, validation) lives in stdlib; this pass only writes the
-// per-type glue. Emitted ALONGSIDE the legacy baked dispatch during the transition.
 pub fn generateRuntimeMediator(allocator: std.mem.Allocator, declarations: *std.ArrayList(ast.Declaration), is_wasm: bool) !void {
     var src = std.ArrayList(u8).empty;
     var reg = std.ArrayList(u8).empty;
@@ -1652,13 +1696,8 @@ pub fn generateRuntimeMediator(allocator: std.mem.Allocator, declarations: *std.
     defer seen.deinit();
     var found = false;
 
-    // Only requests that opt into the runtime mediator (by implementing `Message`) get the runtime
-    // glue. This lets the runtime path coexist with the legacy baked dispatch during the migration: a
-    // handler whose request does not implement `Message` keeps using the old path untouched.
     var message_structs = std.StringHashMap(void).init(allocator);
     defer message_structs.deinit();
-    // Per request type, its impl list (so we can record marker traits: any impl that is not a framework
-    // trait becomes a marker the runtime can test with `ctx.requestIs("...")`).
     var req_impls = std.StringHashMap([]const ast.TraitImpl).init(allocator);
     defer req_impls.deinit();
     for (declarations.items) |decl| {
@@ -1701,7 +1740,6 @@ pub fn generateRuntimeMediator(allocator: std.mem.Allocator, declarations: *std.
             if (seen.contains(q)) continue;
             try seen.put(q, {});
 
-            // handler construction via DI resolved from the per-request SCOPE (ctx.scope).
             var init_params: []const ast.Param = &.{};
             var handle_is_async = false;
             for (s.methods) |m| {
@@ -1738,72 +1776,59 @@ pub fn generateRuntimeMediator(allocator: std.mem.Allocator, declarations: *std.
             const handler_ctor = ctor_buf.items;
 
             found = true;
-            // widen at a return boundary (Nova cannot widen a generic to a trait inline).
             try serdeAppendf(&src, allocator, "fn {s}__asMessage(q: {s}): Message {{ return q; }}\n", .{ q, q });
 
-            // Raw-response escape hatch (see the runtime-dispatch site above): a `Response`-typed handler
-            // result is emitted verbatim so a handler can return HTML / SSE / any content-type.
             const raw_ok = std.mem.eql(u8, r_ok, "Response") or std.mem.eql(u8, r_ok, "response.Response");
             if (r_err != null) {
                 if (raw_ok) {
-                    try serdeAppendf(&src, allocator,
-                        "async fn {s}__rok(ctx: RequestContext): Response | {s} {{\n" ++
-                            "    let __q = ctx.request as {s};\n" ++
-                            "    let __h = {s};\n" ++
-                            "    return try {s}__h.handle(__q);\n" ++
-                            "}}\n" ++
-                            "struct {s}__Adapter impl HandlerAdapter {{\n" ++
-                            "    async fn execute(self: {s}__Adapter, ctx: RequestContext): Response {{\n" ++
-                            "        return await {s}__rok(ctx) catch (__e) __e.toResponse();\n" ++
-                            "    }}\n" ++
-                            "}}\n\n", .{ q, r_err.?, q, handler_ctor, await_kw, q, q, q });
+                    try serdeAppendf(&src, allocator, "async fn {s}__rok(ctx: RequestContext): Response | {s} {{\n" ++
+                        "    let __q = ctx.request as {s};\n" ++
+                        "    let __h = {s};\n" ++
+                        "    return try {s}__h.handle(__q);\n" ++
+                        "}}\n" ++
+                        "struct {s}__Adapter impl HandlerAdapter {{\n" ++
+                        "    async fn execute(self: {s}__Adapter, ctx: RequestContext): Response {{\n" ++
+                        "        return await {s}__rok(ctx) catch (__e) __e.toResponse();\n" ++
+                        "    }}\n" ++
+                        "}}\n\n", .{ q, r_err.?, q, handler_ctor, await_kw, q, q, q });
                 } else {
-                    try serdeAppendf(&src, allocator,
-                        "async fn {s}__rok(ctx: RequestContext): Response | {s} {{\n" ++
-                            "    let __q = ctx.request as {s};\n" ++
-                            "    let __h = {s};\n" ++
-                            "    let __r = try {s}__h.handle(__q);\n" ++
-                            "    let __resp = Response(Status.Ok, {s}__toJson(__r));\n" ++
-                            "    __resp.setHeader(\"Content-Type\", \"application/json\");\n" ++
-                            "    return __resp;\n" ++
-                            "}}\n" ++
-                            "struct {s}__Adapter impl HandlerAdapter {{\n" ++
-                            "    async fn execute(self: {s}__Adapter, ctx: RequestContext): Response {{\n" ++
-                            "        return await {s}__rok(ctx) catch (__e) __e.toResponse();\n" ++
-                            "    }}\n" ++
-                            "}}\n\n", .{ q, r_err.?, q, handler_ctor, await_kw, r_ok, q, q, q });
+                    try serdeAppendf(&src, allocator, "async fn {s}__rok(ctx: RequestContext): Response | {s} {{\n" ++
+                        "    let __q = ctx.request as {s};\n" ++
+                        "    let __h = {s};\n" ++
+                        "    let __r = try {s}__h.handle(__q);\n" ++
+                        "    let __resp = Response(Status.Ok, {s}__toJson(__r));\n" ++
+                        "    __resp.setHeader(\"Content-Type\", \"application/json\");\n" ++
+                        "    return __resp;\n" ++
+                        "}}\n" ++
+                        "struct {s}__Adapter impl HandlerAdapter {{\n" ++
+                        "    async fn execute(self: {s}__Adapter, ctx: RequestContext): Response {{\n" ++
+                        "        return await {s}__rok(ctx) catch (__e) __e.toResponse();\n" ++
+                        "    }}\n" ++
+                        "}}\n\n", .{ q, r_err.?, q, handler_ctor, await_kw, r_ok, q, q, q });
                 }
             } else {
                 if (raw_ok) {
-                    try serdeAppendf(&src, allocator,
-                        "struct {s}__Adapter impl HandlerAdapter {{\n" ++
-                            "    async fn execute(self: {s}__Adapter, ctx: RequestContext): Response {{\n" ++
-                            "        let __q = ctx.request as {s};\n" ++
-                            "        let __h = {s};\n" ++
-                            "        return {s}__h.handle(__q);\n" ++
-                            "    }}\n" ++
-                            "}}\n\n", .{ q, q, q, handler_ctor, await_kw });
+                    try serdeAppendf(&src, allocator, "struct {s}__Adapter impl HandlerAdapter {{\n" ++
+                        "    async fn execute(self: {s}__Adapter, ctx: RequestContext): Response {{\n" ++
+                        "        let __q = ctx.request as {s};\n" ++
+                        "        let __h = {s};\n" ++
+                        "        return {s}__h.handle(__q);\n" ++
+                        "    }}\n" ++
+                        "}}\n\n", .{ q, q, q, handler_ctor, await_kw });
                 } else {
-                    try serdeAppendf(&src, allocator,
-                        "struct {s}__Adapter impl HandlerAdapter {{\n" ++
-                            "    async fn execute(self: {s}__Adapter, ctx: RequestContext): Response {{\n" ++
-                            "        let __q = ctx.request as {s};\n" ++
-                            "        let __h = {s};\n" ++
-                            // Hoist the handler result into a `let` (as the error-union case does) so the
-                            // ownership pass tracks and drops the response DTO after it is serialised.
-                            // Inlining `__toJson(await __h.handle(__q))` left that owned DTO temp unreleased
-                            // -- a per-request leak on every matched route.
-                            "        let __r = {s}__h.handle(__q);\n" ++
-                            "        let __resp = Response(Status.Ok, {s}__toJson(__r));\n" ++
-                            "        __resp.setHeader(\"Content-Type\", \"application/json\");\n" ++
-                            "        return __resp;\n" ++
-                            "    }}\n" ++
-                            "}}\n\n", .{ q, q, q, handler_ctor, await_kw, r_ok });
+                    try serdeAppendf(&src, allocator, "struct {s}__Adapter impl HandlerAdapter {{\n" ++
+                        "    async fn execute(self: {s}__Adapter, ctx: RequestContext): Response {{\n" ++
+                        "        let __q = ctx.request as {s};\n" ++
+                        "        let __h = {s};\n" ++
+                        "        let __r = {s}__h.handle(__q);\n" ++
+                        "        let __resp = Response(Status.Ok, {s}__toJson(__r));\n" ++
+                        "        __resp.setHeader(\"Content-Type\", \"application/json\");\n" ++
+                        "        return __resp;\n" ++
+                        "    }}\n" ++
+                        "}}\n\n", .{ q, q, q, handler_ctor, await_kw, r_ok });
                 }
             }
 
-            // Record the request type's marker traits (impls that are not framework traits). A behaviour
-            // opts in per request via a marker instead of per-type registration.
             try serdeAppendf(&reg, allocator, "    let __mk_{s} = List<string>();\n", .{q});
             if (req_impls.get(q)) |impls| {
                 for (impls) |mi| {
@@ -1815,14 +1840,10 @@ pub fn generateRuntimeMediator(allocator: std.mem.Allocator, declarations: *std.
             }
             try serdeAppendf(&reg, allocator, "    m.register(\"{s}\", {s}__Adapter{{}}, __mk_{s});\n", .{ q, q, q });
 
-            // The HTTP endpoint side: bind the typed request from the source, widen it, and send it
-            // through the runtime mediator. Keyed by the same type name the route is registered under.
             try serdeAppendf(&disp, allocator, "    if (string.eql(__key, \"{s}\")) {{ let __q = {s}__bind(src); return await m.send({s}__asMessage(__q), \"{s}\"); }}\n", .{ q, q, q, q });
         }
     }
 
-    // Auto-register per-type validators: for each `impl Validator<Q>` generate an erased adapter that
-    // downcasts the Message and calls the typed validator, then register it by request-type name.
     for (declarations.items) |decl| {
         if (decl != .struct_decl) continue;
         const vs = decl.struct_decl;
@@ -1834,21 +1855,16 @@ pub fn generateRuntimeMediator(allocator: std.mem.Allocator, declarations: *std.
                 else => continue,
             };
             found = true;
-            try serdeAppendf(&src, allocator,
-                "struct {s}__ValAdapter impl ValidatorAdapter {{\n" ++
-                    "    fn validate(self: {s}__ValAdapter, req: Message): List<string> {{\n" ++
-                    "        let __q = req as {s};\n" ++
-                    "        return {s}{{}}.validate(__q);\n" ++
-                    "    }}\n" ++
-                    "}}\n\n", .{ vs.name, vs.name, vq, vs.name });
+            try serdeAppendf(&src, allocator, "struct {s}__ValAdapter impl ValidatorAdapter {{\n" ++
+                "    fn validate(self: {s}__ValAdapter, req: Message): List<string> {{\n" ++
+                "        let __q = req as {s};\n" ++
+                "        return {s}{{}}.validate(__q);\n" ++
+                "    }}\n" ++
+                "}}\n\n", .{ vs.name, vs.name, vq, vs.name });
             try serdeAppendf(&reg, allocator, "    m.registerValidator(\"{s}\", {s}__ValAdapter{{}});\n", .{ vq, vs.name });
         }
     }
 
-    // Emit the two entry points whenever there is an App/router (even with no Message handlers) so
-    // `App.init` (which calls `__registerHandlers`) and `App.dispatch` (which calls
-    // `__mediator_dispatch_runtime`) always resolve. The runtime `Mediator` type they reference lives in
-    // `web.mediator`, which a web app loads via `web.app`.
     var has_router = false;
     for (declarations.items) |decl| {
         if (decl != .struct_decl) continue;
@@ -1880,7 +1896,6 @@ pub fn generateRuntimeMediator(allocator: std.mem.Allocator, declarations: *std.
     }
 }
 
-
 pub fn loadProgram(allocator: std.mem.Allocator, init: std.process.Init, file_path: []const u8, visited: *std.StringHashMap(void), visiting: *std.StringHashMap(void), merged: *std.ArrayList(u8), declarations: *std.ArrayList(ast.Declaration), is_wasm: bool, file_sources: *std.StringHashMap([]const u8), tinfo: TargetInfo) anyerror!void {
     if (visiting.contains(file_path)) return error.CyclicImport;
     if (visited.contains(file_path)) return;
@@ -1899,7 +1914,6 @@ pub fn loadProgram(allocator: std.mem.Allocator, init: std.process.Init, file_pa
 
     const resolved_file_path = file_path;
 
-    // Read from the target-conditional variant (foo_<os>.nova) if present; module identity stays file_path.
     const suffix_home = init.environ_map.get("HOME") orelse init.environ_map.get("USERPROFILE");
     const read_path_opt = if (std.mem.eql(u8, file_path, "src/std/platform.nova")) null else targetVariantPath(file_path, tinfo.os, tinfo.arch, tinfo.is_posix, allocator, init.io, suffix_home);
     defer if (read_path_opt) |rp| allocator.free(rp);
@@ -1910,7 +1924,6 @@ pub fn loadProgram(allocator: std.mem.Allocator, init: std.process.Init, file_pa
     } else if (std.mem.startsWith(u8, read_path, "src/std/")) {
         source = Io.Dir.readFileAlloc(.cwd(), init.io, read_path, allocator, .unlimited) catch |err| blk: {
             if (err == error.FileNotFound) {
-
                 const sub = read_path[8..];
                 const home = init.environ_map.get("HOME") orelse init.environ_map.get("USERPROFILE") orelse "/";
                 const abs = try std.fmt.allocPrint(allocator, "{s}/.nova/std/{s}", .{ home, sub });
@@ -1970,14 +1983,12 @@ pub fn loadProgram(allocator: std.mem.Allocator, init: std.process.Init, file_pa
     try merged.append(allocator, '\n');
 }
 
-
 pub fn basenameWithoutExtension(path: []const u8, allocator: std.mem.Allocator) ![]const u8 {
     const base = std.fs.path.basename(path);
     const ext_pos = std.mem.lastIndexOfScalar(u8, base, '.') orelse base.len;
     const name = try allocator.dupe(u8, base[0..ext_pos]);
     return name;
 }
-
 
 pub fn findNovaFiles(allocator: std.mem.Allocator, io: Io, root_dir: Io.Dir, sub_path: []const u8, list: *std.ArrayList([]const u8)) !void {
     const dir = try Io.Dir.openDir(root_dir, io, sub_path, .{ .iterate = true });
@@ -2008,32 +2019,24 @@ pub fn findNovaFiles(allocator: std.mem.Allocator, io: Io, root_dir: Io.Dir, sub
     }
 }
 
-
 pub const ProjectJson = struct {
     name: []const u8,
     version: []const u8,
     type: ?[]const u8 = null,
-    repository: ?[]const u8 = null, // canonical git URL; required by `nova publish` (pkg-manager.md §1)
+    repository: ?[]const u8 = null,
     dependencies: [][]const u8,
-    registry: ?[]const u8 = null,   // registry index location (local dir or git URL) for name@range deps
+    registry: ?[]const u8 = null,
 };
-
 
 pub fn getFileMtime(io: Io, path: []const u8) !i96 {
     const stat = try Io.Dir.statFile(.cwd(), io, path, .{});
     return stat.mtime.nanoseconds;
 }
 
-
 pub fn linkLibsStamp(allocator: std.mem.Allocator, init: std.process.Init) u64 {
     const home = init.environ_map.get("HOME") orelse init.environ_map.get("USERPROFILE") orelse "/";
     const libs = [_][]const u8{
         "/.nova/lib/libnovacore.a",
-        // The compiler binary itself: a `zig build` reinstalls it and bumps its mtime, so folding it in
-        // means a toolchain change (new codegen, new DWARF, new ABI) invalidates every project's build
-        // cache and forces a rebuild. Without this, `nova build` reports "up to date" after a compiler
-        // upgrade and silently reruns a stale binary -- e.g. an old debug binary keeps showing the old
-        // string DWARF, so a debugger fix looks like it did not land.
         "/.nova/bin/nova",
     };
     var acc: u64 = 0;
@@ -2061,9 +2064,6 @@ pub fn sourcesHash(file_sources: *std.StringHashMap([]const u8), is_release: boo
     return acc;
 }
 
-/// True if `name` (a `--flag`) appears anywhere in argv. Used to route user-facing build options
-/// (--asan, --prune, --split-objects, --keep-obj, --emit-llvm, --dump-merged, --mem-stats, --tsan)
-/// as real CLI switches instead of NOVA_* env vars.
 pub fn hasFlag(args: []const []const u8, name: []const u8) bool {
     for (args) |a| {
         if (std.mem.eql(u8, a, name)) return true;

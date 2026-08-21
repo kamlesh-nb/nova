@@ -1,8 +1,3 @@
-// F2: `==` on payload-carrying enum variants compared heap IDENTITY, not value, so `E.A(3) == E.A(3)` was
-// false (two different boxes). Every variant box of an enum is allocated at the same size (tag + max payload
-// words) and zero-padded, so codegen now compares the two boxes word-by-word (tag + payload). Value-type
-// payloads compare by value; a string / heap payload field still compares by identity (documented
-// limitation). Payload-LESS enums are integer tags and were already correct.
 
 import assert;
 
@@ -14,7 +9,7 @@ enum Msg { Text(string), Code(int) }
 fn test_same_variant_same_payload_is_equal(): void {
     let x = E.A(3);
     let y = E.A(3);
-    assert.isTrue(x == y);      // was false (identity)
+    assert.isTrue(x == y);
 }
 
 @test
@@ -49,9 +44,8 @@ fn test_payloadless_enum_still_correct(): void {
 
 @test
 fn test_value_payload_across_variants_with_heap_variant(): void {
-    // An int-payload variant of an enum that ALSO has a string variant still compares by value.
     assert.isTrue(Msg.Code(5) == Msg.Code(5));
     assert.isFalse(Msg.Code(5) == Msg.Code(6));
     let t = Msg.Text("hi");
-    assert.isTrue(t == t);      // same box -> equal (no crash)
+    assert.isTrue(t == t);
 }

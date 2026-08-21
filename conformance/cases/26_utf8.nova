@@ -1,18 +1,16 @@
-// Gates C2 UTF-8 codepoint handling. Nova strings are UTF-8 byte buffers; text.utf8 adds
-// the codepoint layer (decode/encode/count/iterate/validate) that regex and i18n need.
 import text.utf8;
 import assert;
 
 @test
 fn test_codepoints_vs_bytes(): void {
-    let s = "café ☕";                  // é=2B, ☕(U+2615)=3B
-    assert.equalInt(s.length, 9);        // bytes: c a f é(2) space ☕(3) = 4+2+1+... = 9
-    assert.equalInt(utf8.codepointCount(s), 6);   // c a f é ' ' ☕
+    let s = "café ☕";
+    assert.equalInt(s.length, 9);
+    assert.equalInt(utf8.codepointCount(s), 6);
 }
 
 @test
 fn test_decode_encode_roundtrip(): void {
-    assert.equalInt(utf8.codepointAt("☕", 0), 9749);   // U+2615
+    assert.equalInt(utf8.codepointAt("☕", 0), 9749);
     assert.equalStr(utf8.fromCodepoint(9749), "☕");
     assert.equalStr(utf8.fromCodepoint(65), "A");
 }
@@ -24,8 +22,8 @@ fn test_chars_and_validate(): void {
     assert.equalStr(cs.get(1), "☕");
     assert.isTrue(utf8.isValid("naïve"));
     let bad = bytes.alloc(2);
-    bytes.write_byte(bad, 0, 200);       // 0xC8 lead expecting a continuation...
-    bytes.write_byte(bad, 1, 65);        // ...but 'A' is not one -> invalid
+    bytes.write_byte(bad, 0, 200);
+    bytes.write_byte(bad, 1, 65);
     assert.isFalse(utf8.isValid(bad as string));
-    bytes.free(bad);   // bytes.alloc is MANUAL memory — free it
+    bytes.free(bad);
 }

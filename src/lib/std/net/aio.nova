@@ -61,12 +61,6 @@ pub trait AsyncIO {
     fn setTimeout(self, ms: int): int;
 }
 
-// AsyncStream is dual-mode (M2 of the C++ runtime retirement plan). When `kq` is 0 it is the Asio
-// stream: `sock` is a NovaSocket pointer and recv/send route through the Asio async I/O primitives.
-// When `kq` is a reactor's kqueue fd (set by asyncConnect on a reactor thread), it is reactor-native:
-// `sock` is a raw fd and recv/send delegate to net/reactorio over os/sys with no Asio. Drivers and
-// the app framework are written against this one type and the AsyncIO trait, so they pick up the
-// reactor path with no change simply by running on a reactor thread.
 pub class AsyncStream impl AsyncIO {
     pub sock: long,
     pub timeoutMs: int,
@@ -95,8 +89,6 @@ pub class AsyncStream impl AsyncIO {
         return await async_write(self.sock, data);
     }
     pub fn isOpen(self: AsyncStream): bool { return self.sock != 0; }
-    // A connected stream has a positive fd. asyncConnectDeadline returns sock -1 on a failed/timed-out
-    // connect, so callers check ok() to turn a hung connect into a clean error.
     pub fn ok(self: AsyncStream): bool { return self.sock > (0 as long); }
     pub fn close(self: AsyncStream): void {
         if (self.sock != 0) {
@@ -111,8 +103,6 @@ pub class AsyncStream impl AsyncIO {
     }
 }
 
-// Connect and return an AsyncStream. On a reactor thread (poller.currentKq() > 0) this is a
-// reactor-native connect (no Asio); otherwise it is the Asio connect. Same return type either way.
 pub async fn asyncConnect(host: string, port: int): AsyncStream {
     let ck = poller.currentKq();
     if (ck > 0) {
@@ -125,10 +115,6 @@ pub async fn asyncConnect(host: string, port: int): AsyncStream {
     return AsyncStream(s);
 }
 
-// asyncConnect with a connect deadline. On a reactor thread a connect that does not complete within
-// `timeoutMs` returns a failed stream (ok() == false) instead of hanging on a dead/firewalled host.
-// `timeoutMs <= 0` means no deadline. Off the reactor (no kq) there is no async timer, so it falls
-// back to the plain blocking connect and the deadline is best-effort (documented limitation).
 pub async fn asyncConnectDeadline(host: string, port: int, timeoutMs: int): AsyncStream {
     let ck = poller.currentKq();
     if (ck > 0) {
@@ -143,6 +129,4 @@ pub async fn asyncConnectDeadline(host: string, port: int, timeoutMs: int): Asyn
 
 pub fn sleep(ms: int): int { return 0; }
 
-// A real async delay: suspend the current coroutine for `ms` via a one-shot reactor timer, yielding the
-// reactor to other coroutines meanwhile. Reactor-thread only (no timer fires when block-driving).
 pub async fn delay(ms: int): void { await eventedio.delayMs(ms); }

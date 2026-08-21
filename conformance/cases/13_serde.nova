@@ -1,6 +1,3 @@
-// Compiler-generated serde binders: @serializable structs get a
-// <Struct>__bind(src: ValueSource) deserializer synthesized by the compiler
-// (recursive over nested structs, List<primitive>, List<struct>). No reflection.
 import assert;
 import serde.source;
 import serde.json;
@@ -74,7 +71,6 @@ fn test_list_of_structs(): void {
 
 @test
 fn test_tojson_roundtrip(): void {
-    // generated <S>__toJson is symmetric with <S>__bind (field-declaration order)
     let it = Item__bind(source.fromJson("{\"sku\":\"A\",\"qty\":2}"));
     assert.equalStr(Item__toJson(it), "{\"sku\":\"A\",\"qty\":2}");
 

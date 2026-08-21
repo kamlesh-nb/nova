@@ -1,8 +1,5 @@
 import list;
 import rec_a;
-// Module B: same-named struct Rec, DIFFERENT layout (a heap List at offset 0, then an int). B imports
-// A's same-named Rec, so `makeB(): Rec` must return B's LOCAL Rec, and a CONSUMER that also imports A
-// must type the returned value as B's Rec (not A's) so field access reads B's layout.
 pub struct Rec {
     pub items: list.List<int>,
     pub tag: int,

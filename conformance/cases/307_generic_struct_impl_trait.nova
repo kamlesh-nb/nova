@@ -1,12 +1,3 @@
-// B5 — a GENERIC struct that `impl`s a trait, used through a trait object.
-//
-// Widening a generic instantiation (`Cell<int>`) to a trait-typed slot (`let s: Shape = c`, or a
-// trait-typed argument) did NOT build the trait fat-pointer `{struct_ptr, vtable}`: the widening guard
-// tested `structs.contains("Cell<int>")`, but `structs` is keyed by BASE name, so the check failed and
-// the raw struct pointer was stored where a trait object was expected. The first vtable dispatch then
-// read the vtable slot past the end of the (8-byte) struct -> SIGSEGV. Fixes: test the BASE name at every
-// struct->trait widen site, and look the shared vtable up by base name (generic trait objects erase the
-// type arg for dispatch: one `_vtable_Cell_Shape`, methods `Cell_area`).
 
 import assert;
 
@@ -24,7 +15,6 @@ struct Cell<T> impl Shape {
 
 fn describe(s: Shape): int { return s.area(); }
 
-// (1) Widen a generic instantiation to a trait-typed local, then dispatch.
 @test
 fn test_let_widen_and_dispatch(): void {
     let c = Cell<int>(3);
@@ -33,14 +23,12 @@ fn test_let_widen_and_dispatch(): void {
     assert.equalStr("cell", s.label());
 }
 
-// (2) Widen at a trait-typed call argument.
 @test
 fn test_arg_widen(): void {
     let c = Cell<int>(9);
     assert.equalInt(7, describe(c));
 }
 
-// (3) An OWNED type-parameter field (`Cell<string>`) through a trait object -- no leak/double-free.
 @test
 fn test_owned_type_param(): void {
     let c = Cell<string>("payload");
@@ -49,7 +37,6 @@ fn test_owned_type_param(): void {
     assert.equalStr("cell", s.label());
 }
 
-// (4) Two different instantiations share the one base-name vtable and both dispatch correctly.
 @test
 fn test_two_instantiations(): void {
     let a: Shape = Cell<int>(1);

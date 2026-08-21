@@ -1,6 +1,3 @@
-// RSA signature verification in Nova (M9 phase C, no external library). Verified against real OpenSSL
-// 3.6 RSA-2048 signatures: RSASSA-PKCS1-v1_5 and RSASSA-PSS (salt = hash length), both over SHA-256,
-// plus tamper rejections. The modulus, public exponent, message digest, and signatures are pinned here.
 import crypto.rsa;
 import bytes;
 import assert;
@@ -28,7 +25,6 @@ const HASH: string = "05dd0d0cab745524318ba533da8f2aa6d6511a426fe2fd5eb3ab4deced
 const SIG_PKCS1: string = "6be30e975e184af6abfbc55cdbbf7c775106be26b46d2532c55bc4edfaeecf8c9def1bf862d435c07d88de9597b7de2174415496fdfb99767f9e49b2de80d80c073f2db622cc05930b4b6bc416c79867ec7b87a91dd477bc092fd2512f5f65a227da491b706b41a3dfe4138f2067220c1abfd90a5bb52d2e6fe5a505d6ada2733f681f2bbe79bf6709581945040cc7c11c4f1ff4276158251ba25d0a9e31527c8699eca50ec8b0f9c11dff2fba1c5ec5515ddda7fdcf5a14cea833215d78f43afd9d7f25d79d0632fddd4af5cc8b6471d769fb10f52c8b713306fec470c6a531fa26fd004ee5cbd0e1381b08cbddbaca539ff04d7620d4ec36c352bec6117157";
 const SIG_PSS: string = "5c79ad488e7bda18a0cbf3c6cb13eb782461ce8d9168a4de76fc8d553ba04fa060adfbf5f1c83b8bbfa6207476364d6740090d8c31d7c25d65e75878363d314eb78b3b22ee8fea98dd8723a07ea9f1706b5a348a345767a5ec4586221d59e50cf8d2594b0b17c897dd9509c8be2cfa614b85462bdeeb377bd62b4a071ee761ad8422b8b11891dee145d5af8db4f23d403a17729502276b52fda5242589743b831ac91fb59a0156e8f58dc2d13f9ed2ac0a016942191bff801ae0c6a2ed72e42216c642efea847edaeb6aac092762cfd5622ca909f3d870cd5639b5dfd6f6155a2e42f76bcf8fe787c3cb68ec5c8b77f15166d1b8ac0aeeb24798c3a7988538dd";
 
-// hashId 0 = SHA-256; N is 256 bytes.
 @test
 fn rsa_pkcs1_valid(): void {
     assert.isTrue(rsa.verifyPkcs1(0, hexBuf(HASH), hexBuf(SIG_PKCS1), 256, hexBuf(N), 256, hexBuf(E), 3));
@@ -60,7 +56,6 @@ fn rsa_pss_bad_hash(): void {
     assert.isTrue(!rsa.verifyPss(0, h, hexBuf(SIG_PSS), 256, hexBuf(N), 256, hexBuf(E), 3));
 }
 
-// A PKCS#1 signature must not verify under PSS and vice versa.
 @test
 fn rsa_cross_scheme_rejected(): void {
     assert.isTrue(!rsa.verifyPss(0, hexBuf(HASH), hexBuf(SIG_PKCS1), 256, hexBuf(N), 256, hexBuf(E), 3));

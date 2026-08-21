@@ -1,8 +1,3 @@
-// FR-safety-5: error ergonomics over Nova's `T | E` union model.
-//  - `try? e` turns an error-union call into an optional (value, or `undefined` on error). Pure sugar
-//    for `e catch undefined`, composing with `??`.
-//  - `Result<T, E>` (std/result) is the named, value-style companion for callback/async seams, with
-//    map / flatMap / getOr.
 import assert;
 import result;
 
@@ -17,9 +12,9 @@ fn dbl(x: int): int { return x * 2; }
 
 @test
 fn try_optional(): void {
-    let a = try? work(false);        // int | undefined = 42
+    let a = try? work(false);
     assert.equalInt(a ?? -1, 42);
-    let b = try? work(true);         // undefined
+    let b = try? work(true);
     assert.isTrue(b == undefined);
     assert.equalInt(b ?? -1, -1);
 }
@@ -28,11 +23,11 @@ fn try_optional(): void {
 fn result_map_and_get(): void {
     let okv = result.ok<int, string>(21, "");
     assert.isTrue(okv.ok());
-    assert.equalInt(okv.map(dbl).getOr(-1), 42);        // maps the value
+    assert.equalInt(okv.map(dbl).getOr(-1), 42);
 
     let ev = result.err<int, string>("boom", 0);
     assert.isTrue(ev.isErr());
-    assert.equalInt(ev.map(dbl).getOr(-1), -1);          // map is a no-op on error
+    assert.equalInt(ev.map(dbl).getOr(-1), -1);
     assert.equalStr(ev.errorOr("none"), "boom");
 }
 

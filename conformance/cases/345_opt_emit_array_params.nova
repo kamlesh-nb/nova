@@ -1,9 +1,3 @@
-// Emit-subset growth (B4, with C3): array params now emit. A (non-float) array flows as a clean `ptr`
-// argument (the signature builder makes array params ptr_type); it round-trips through the i64 slot (both are
-// 8 bytes) and index_get's arrayBasePtr resolves it. Combined with C3 (element read) this lets array-reading
-// functions -- direct index, indexed sum, a loop over the array -- compile from the optimised IR. Under
-// NOVA_OPT_EMIT these helpers compile from the emit path; both must agree. Float-element arrays still fall
-// back (they need a float element load), and writing through an array param is not in this slice.
 import assert;
 
 fn at(a: int[3], i: int): int { return a[i]; }

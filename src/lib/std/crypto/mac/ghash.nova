@@ -1,25 +1,8 @@
-// GHASH, the GF(2^128) universal hash used by AES-GCM (NIST SP 800-38D), implemented in Nova with no
-// external library (M9 phase B). FR-tls-1 replaced the bit-by-bit shift-and-xor multiply with Shoup's
-// 4-bit table method: per key we precompute a 16-entry product table and a 16-entry reduction table, then
-// each block is 32 nibble steps of a 4-bit shift plus two block XORs, instead of 128 single-bit steps.
-//
-// The tables are built from the SAME single-bit multiply the old code used (mulX = multiply by x, plus the
-// reference bitwise gmult for the product table), so the table path is correct by construction: it produces
-// byte-identical output to the reference multiply. Blocks and the reduction follow the GCM big-endian,
-// bit-reflected convention (block[0] holds x^0..x^7, block[15] holds x^120..x^127; multiply by x is a right
-// shift of the byte array with 0xe1 folded into block[0]).
-//
-// Reference: wolfSSL GMULT/RIGHTSHIFTX (deps/wolfssl/wolfcrypt/src/aes.c) for the bitwise multiply, and
-// Shoup's 4-bit windowed multiply (Gladman / OpenSSL gcm_gmult_4bit) for the table method. Verified against
-// GCM Test Case 2 and independent reference values (conformance case 222) and the AES-GCM AEAD (case 223).
 import bytes;
 import mem.allocator;
 
 pub const GHASH_BLOCK_LEN: int = 16;
 
-// Multiply the 16-byte block v by x in GF(2^128), in place. Right-shift the whole bit sequence by one
-// (block[15] bit 0 falls off) and, if it was set, fold the reduction polynomial 0xe1 into block[0]. The
-// two data-dependent choices are made with masks, not branches, so it stays constant time.
 fn mulX(v: ptr): void {
     let lsb = bytes.read_byte(v, 15) & 1;
     let carryIn = 0;
@@ -35,8 +18,6 @@ fn mulX(v: ptr): void {
     bytes.write_byte(v, 0, bytes.read_byte(v, 0) ^ borrow);
 }
 
-// x = x * h in GF(2^128) (reference bitwise multiply). x and h are 16-byte big-endian blocks; x is
-// overwritten with the product. Used only to build the per-key product table.
 fn gmult(x: ptr, h: ptr): void {
     let z = bytes.alloc(16);
     let v = bytes.alloc(16);
@@ -69,8 +50,6 @@ fn gmult(x: ptr, h: ptr): void {
     bytes.free(v);
 }
 
-// Raw right shift of a 16-byte block by 4 bits (no reduction). block[15]'s low nibble falls off; each byte
-// pulls in the low nibble of the more-significant byte above it.
 fn rawShr4(acc: ptr): void {
     let k = 15;
     while (k >= 1) {
@@ -81,7 +60,6 @@ fn rawShr4(acc: ptr): void {
     bytes.write_byte(acc, 0, bytes.read_byte(acc, 0) >> 4);
 }
 
-// dst ^= src, over 16 bytes at the given block offsets in each buffer.
 fn xorBlockAt(dst: ptr, doff: int, src: ptr, soff: int): void {
     let k = 0;
     while (k < 16) {
@@ -90,12 +68,11 @@ fn xorBlockAt(dst: ptr, doff: int, src: ptr, soff: int): void {
     }
 }
 
-// A running GHASH keyed by H: Y starts at 0, each block does Y = (Y ^ block) * H via the 4-bit table.
 pub struct Ghash {
     pub h: ptr,
     pub y: ptr,
-    pub table: ptr,   // 16 blocks: table[i] = (nibble value i placed at x^0..x^3) * H
-    pub rem: ptr,     // 16 blocks: rem[r] = mulX^4(block whose byte 15 is r) = the shift-by-4 reduction
+    pub table: ptr,
+    pub rem: ptr,
 
     pub fn create(hkey: ptr): Ghash {
         let g = bytes.new_with_allocator<Ghash>(allocator.globalAllocator());
@@ -109,8 +86,6 @@ pub struct Ghash {
             bytes.write_byte(g.y, i, 0);
             i = i + 1;
         }
-        // Product table: table[i] = block_nibble(i) * H, where block_nibble(i) has byte 0's high nibble
-        // set to i (its bits are the coefficients of x^0..x^3) and every other byte zero.
         i = 0;
         while (i < 16) {
             let tmp = bytes.alloc(16);
@@ -123,9 +98,6 @@ pub struct Ghash {
             bytes.free(tmp);
             i = i + 1;
         }
-        // Reduction table: rem[r] = mulX applied four times to the block whose byte 15 equals r. A raw
-        // shift-by-4 of any accumulator, XORed with rem[old byte 15 & 0xf], equals a true multiply by x^4,
-        // because the multiply is XOR-linear and only the four bits that fall off drive the reduction.
         i = 0;
         while (i < 16) {
             let tmp = bytes.alloc(16);
@@ -146,9 +118,6 @@ pub struct Ghash {
         while (i < 16) { bytes.write_byte(self.y, i, 0); i = i + 1; }
     }
 
-    // y = y * H via Shoup's 4-bit windowed multiply. Process y's 32 nibbles from most significant power
-    // (byte 15's low nibble) to least (byte 0's high nibble). Each step multiplies the accumulator by x^4
-    // (a raw 4-bit shift plus the reduction-table XOR) and adds the product for that nibble.
     fn gmultY(self: Ghash): void {
         let acc = bytes.alloc(16);
         let k = 0;
@@ -156,12 +125,10 @@ pub struct Ghash {
         let idx = 15;
         while (idx >= 0) {
             let b = bytes.read_byte(self.y, idx);
-            // low nibble (the higher power within this byte)
             let r1 = bytes.read_byte(acc, 15) & 0xf;
             rawShr4(acc);
             xorBlockAt(acc, 0, self.rem, r1 * 16);
             xorBlockAt(acc, 0, self.table, (b & 0xf) * 16);
-            // high nibble (the lower power)
             let r2 = bytes.read_byte(acc, 15) & 0xf;
             rawShr4(acc);
             xorBlockAt(acc, 0, self.rem, r2 * 16);
@@ -173,7 +140,6 @@ pub struct Ghash {
         bytes.free(acc);
     }
 
-    // Absorb one full 16-byte block at b+off.
     pub fn block(self: Ghash, b: ptr, off: int): void {
         let i = 0;
         while (i < 16) {
@@ -183,7 +149,6 @@ pub struct Ghash {
         self.gmultY();
     }
 
-    // Absorb len bytes, zero-padding the final partial block (as GCM does for AAD and ciphertext).
     pub fn update(self: Ghash, data: ptr, len: int): void {
         let i = 0;
         while (len - i >= 16) {

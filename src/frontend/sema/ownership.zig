@@ -1,64 +1,160 @@
+//! Ownership analysis and use-after-move verifier for the typed IR.
+//!
+//! Nova is an ARC language: every heap value carries a refcount and is dropped
+//! (released) exactly once when its owner goes out of scope. This pass runs over
+//! the already-typed IR ([`TypedIr`], produced by `infer.zig`) and has two jobs
+//! that share the same tree walk:
+//!
+//!   1. **Temporary op annotation** ([`tempStmt`]/[`tempExpr`]). For every owned
+//!      sub-expression the codegen needs to know whether the value is CONSUMED
+//!      by its enclosing context (a "move" — the receiver takes ownership, no
+//!      drop is emitted) or merely produced and discarded (a "drop" — ARC must
+//!      release it). This half calls [`TypedIr.recordOp`] so `arc.zig` in the
+//!      backend can emit the right retain/release. It is the authoritative
+//!      source of move-vs-drop decisions for temporaries.
+//!
+//!   2. **Balance verification** ([`analyzeOwnedLocal`] and the `walk*` family).
+//!      For every owned `let` local it performs a small flow-sensitive analysis:
+//!      track whether the value is still `live` or has been `moved` out, and flag
+//!      a **use-after-move** if a moved local is read again. This is a checker,
+//!      not a rewriter: it only counts and diagnoses, never mutates the IR.
+//!
+//! ## Design stance: sound by deferral, not by completeness
+//!
+//! The verifier is deliberately conservative. It only reasons precisely about
+//! the shapes it fully understands (straight-line moves, `return x`, plain
+//! `if`/`else` merges). Anything it cannot prove — reassignment to the tracked
+//! name, shadowing, a mention buried inside a closure/`if`-expression/`catch`,
+//! loops that move a value, or an initialiser with no inferred type — is
+//! classified `deferred` rather than analysed. A deferred local counts toward
+//! coverage-as-unchecked but NEVER produces a false-positive violation. The
+//! guiding rule is: report a use-after-move only when it is genuinely one; when
+//! in doubt, defer. This is why [`Stats`] tracks `analyzed` (proved balanced)
+//! separately from `deferred_cfg`/`deferred_untyped`.
+//!
+//! ## Entry points
+//!
+//! [`analyze`] returns just the [`Stats`] (fire-and-forget accounting used by the
+//! normal compile). [`verify`] additionally collects a [`Diagnostic`] per
+//! violation. [`runVerify`] is the `NOVA_OWN_VERIFY` developer gate: it prints a
+//! coverage report and, when `hard_fail` is set, exits the process non-zero on
+//! any violation so CI can gate on it. See `arc.zig` (the OSSA ARC-balance
+//! self-verifier) for the complementary codegen-side check.
 
 const std = @import("std");
 const ast = @import("../ast.zig");
 const types = @import("../types.zig");
 const infer = @import("infer.zig");
 
+/// The type table produced by the type checker; consulted here only to ask
+/// whether an inferred type is an owned (heap/ARC) type via `isOwnedSafe`.
 const TypeStore = types.TypeStore;
+/// The typed intermediate representation this pass walks. Its [`TypedIr.ownedOf`]
+/// and [`TypedIr.typeOf`] answer per-expression ownership queries, and
+/// [`TypedIr.recordOp`] receives the move/drop annotations this pass computes.
 const TypedIr = infer.TypedIr;
 
+/// Running accounting for one full analysis pass, and the mutable scratch state
+/// threaded through the recursive walkers.
+///
+/// It doubles as both the RESULT (coverage counters, violation count) and the
+/// live CONTEXT (`diags`, `diag_alloc`, `cur_fn`) that the `walk*`/`temp*`
+/// functions mutate as they descend. `owned_locals = analyzed + deferred_cfg +
+/// deferred_untyped` is the coverage identity [`runVerify`] prints.
 pub const Stats = struct {
+    /// Number of function bodies visited (top-level fns plus struct/enum methods).
     fns_walked: usize = 0,
+    /// Owned `let` locals discovered — the denominator for coverage. Every such
+    /// local is then either `analyzed` or deferred.
     owned_locals: usize = 0,
+    /// Owned locals whose move/drop balance was fully proved by the flow walk.
     analyzed: usize = 0,
+    /// Owned locals deferred because their control flow was too complex to prove
+    /// soundly (reassignment, shadowing, closure/if-expr mentions, loop moves).
+    /// Counted as unchecked, never as a violation.
     deferred_cfg: usize = 0,
+    /// Owned locals deferred because the initialiser had no inferred type yet, so
+    /// ownership could not be decided; gated behind [`initCouldBeOwned`].
     deferred_untyped: usize = 0,
+    /// Count of scope-exit drops the walk decided must be emitted (value still
+    /// live at fallthrough / on a control-flow merge).
     drop_ops: usize = 0,
+    /// Count of moves OUT of a local (returned or moved on a merge branch) — the
+    /// value's ownership left the scope, so no drop is owed here.
     move_outs: usize = 0,
+    /// Count of `let y = x;` duplications of the tracked owned name (an aliasing
+    /// copy the codegen must retain).
     dup_ops: usize = 0,
+    /// Number of use-after-move violations detected across the whole program.
     balance_violations: usize = 0,
+    /// Name of the FIRST offending local, kept for a terse one-line summary even
+    /// when full [`Diagnostic`] collection is off.
     first_violation: []const u8 = "",
 
+    /// Temporaries (non-`let` owned sub-expressions) annotated as consumed/moved.
     temp_moves: usize = 0,
+    /// Temporaries annotated as produced-and-dropped (ARC must release them).
     temp_drops: usize = 0,
 
-    // V1: optional structured-diagnostic sink. When non-null, each use-after-move
-    // violation is appended with its enclosing function + local name. `analyze()`
-    // leaves it null (identical behaviour to before); `verify()` supplies a list.
+    /// Optional sink for per-violation [`Diagnostic`]s. `null` in the
+    /// count-only [`analyze`] path; set by [`verify`] so callers can report each
+    /// offending local.
     diags: ?*std.ArrayListUnmanaged(Diagnostic) = null,
+    /// Allocator used to grow `diags`; `undefined` until [`run`] installs it.
     diag_alloc: std.mem.Allocator = undefined,
-    // Name of the function currently being walked, for diagnostic attribution.
+    /// Name of the function currently being walked, stamped into each
+    /// [`Diagnostic`] so a violation is attributable without a second pass.
     cur_fn: []const u8 = "",
 };
 
-/// One structured verifier finding: a use-after-move on an owned local.
+/// One recorded use-after-move: the local `local` in function `fn_name` was read
+/// after its owning value had been moved out. Both fields borrow names from the
+/// AST, so a `Diagnostic` is only valid while the program tree is alive.
 pub const Diagnostic = struct {
+    /// Enclosing function's name (from [`Stats.cur_fn`] at detection time).
     fn_name: []const u8,
+    /// The offending owned local's name.
     local: []const u8,
 };
 
+/// The full result of [`verify`]: the coverage [`Stats`] plus an owned slice of
+/// every [`Diagnostic`]. The slice is heap-allocated by the caller's allocator
+/// and becomes the caller's to free.
 pub const VerifyResult = struct {
+    /// Coverage and op accounting for the pass.
     stats: Stats,
+    /// One entry per detected use-after-move, in discovery order.
     diagnostics: []Diagnostic,
 };
 
-/// Report-only entry point (unchanged behaviour): compute ownership stats.
+/// Run the pass for its side effects and accounting only, discarding diagnostics.
+///
+/// This is the normal-compile entry point: it still annotates temporaries into
+/// `ir` via [`recordOp`] (which the backend depends on) but does not collect a
+/// [`Diagnostic`] list. Equivalent to [`run`] with a `null` diagnostics sink.
 pub fn analyze(allocator: std.mem.Allocator, store: *const TypeStore, ir: *TypedIr, program: *const ast.Program) Stats {
     return run(allocator, store, ir, program, null);
 }
 
-/// Verifier entry point: same walk as `analyze`, but also collects a structured
-/// list of every use-after-move violation (enclosing function + local name).
-/// Caller owns the returned slice (allocated with `allocator`).
+/// Run the pass AND collect a [`Diagnostic`] for every use-after-move.
+///
+/// Returns a [`VerifyResult`] owning the diagnostics slice. Errors only if the
+/// final `toOwnedSlice` allocation fails; per-append allocation failures inside
+/// the walk are swallowed (best-effort diagnostics, never fatal).
 pub fn verify(allocator: std.mem.Allocator, store: *const TypeStore, ir: *TypedIr, program: *const ast.Program) !VerifyResult {
     var list: std.ArrayListUnmanaged(Diagnostic) = .empty;
     const st = run(allocator, store, ir, program, &list);
     return .{ .stats = st, .diagnostics = try list.toOwnedSlice(allocator) };
 }
 
-/// Standalone verifier entry used by the pipeline (independent of the SEMA_SHADOW report path).
-/// Runs `verify`, prints a compact summary + per-violation lines, and — when `hard_fail` is set —
-/// exits(1) if any use-after-move violation is found. Report-only when `hard_fail` is false.
+/// The `NOVA_OWN_VERIFY` developer gate: run [`verify`], print a coverage report
+/// to stderr, and optionally fail the build.
+///
+/// Prints functions walked, owned locals, the proved/deferred split, coverage
+/// percentage, and each violation. When `hard_fail` is true and any violation
+/// was found, it prints a bold red banner and calls `std.process.exit(1)` so CI
+/// can gate on a clean report. A failure inside [`verify`] itself is silently
+/// ignored (early `return`) — this is a diagnostic gate, not part of codegen.
 pub fn runVerify(allocator: std.mem.Allocator, store: *const TypeStore, ir: *TypedIr, program: *const ast.Program, hard_fail: bool) void {
     const res = verify(allocator, store, ir, program) catch return;
     const s = res.stats;
@@ -89,6 +185,12 @@ pub fn runVerify(allocator: std.mem.Allocator, store: *const TypeStore, ir: *Typ
     }
 }
 
+/// Core driver shared by [`analyze`] and [`verify`]: walk every top-level fn and
+/// every struct/enum METHOD body, accumulating into a fresh [`Stats`].
+///
+/// `diags` is the optional violation sink threaded into the `Stats`; passing
+/// `null` yields count-only behaviour. Only functions and type methods are
+/// visited — other declaration kinds carry no analysable bodies.
 fn run(allocator: std.mem.Allocator, store: *const TypeStore, ir: *TypedIr, program: *const ast.Program, diags: ?*std.ArrayListUnmanaged(Diagnostic)) Stats {
     var st = Stats{ .diags = diags, .diag_alloc = allocator };
     for (program.declarations) |decl| {
@@ -102,6 +204,14 @@ fn run(allocator: std.mem.Allocator, store: *const TypeStore, ir: *TypedIr, prog
     return st;
 }
 
+/// Analyse a single function body: run the owned-local balance walk
+/// ([`analyzeStmts`]) and then the temporary-op annotation walk ([`tempStmt`]).
+///
+/// The two passes are separate because they answer different questions — the
+/// first proves per-local move balance for the verifier, the second annotates
+/// every owned temporary for the backend — and neither depends on the other's
+/// result. `cur_fn` is stamped here so any diagnostics raised deeper carry the
+/// enclosing function's name.
 fn analyzeFn(allocator: std.mem.Allocator, f: *const ast.FunctionDecl, store: *const TypeStore, ir: *TypedIr, st: *Stats) void {
     st.fns_walked += 1;
     st.cur_fn = f.name;
@@ -109,6 +219,18 @@ fn analyzeFn(allocator: std.mem.Allocator, f: *const ast.FunctionDecl, store: *c
     for (f.body.statements) |*s| tempStmt(allocator, ir, s, st);
 }
 
+/// Recursively walk a statement, forwarding each contained expression to
+/// [`tempExpr`] with the correct "is this position a move?" flag.
+///
+/// The `moved` argument encodes each context's ownership contract, and this is
+/// where those contracts are decided per statement kind:
+///   - a `let`'s initialiser is a move ONLY for a single-name binding (`ls.names
+///     == null`); a destructuring `let` is treated as non-move here;
+///   - a `return`'s value is a move (ownership leaves the function);
+///   - an expression statement's value is dropped, not moved (`false`);
+///   - conditions/iterables are read positions, not moves.
+/// It descends into every nested block so temporaries in inner scopes are also
+/// annotated.
 fn tempStmt(alloc: std.mem.Allocator, ir: *TypedIr, s: *const ast.Statement, st: *Stats) void {
     switch (s.*) {
         .block => |b| for (b.statements) |*x| tempStmt(alloc, ir, x, st),
@@ -144,6 +266,22 @@ fn tempStmt(alloc: std.mem.Allocator, ir: *TypedIr, s: *const ast.Statement, st:
     }
 }
 
+/// Annotate one expression (and its children) with move/drop ops for the backend.
+///
+/// If [`TypedIr.ownedOf`] reports this expression produces an owned value, record
+/// a `.move` when `moved` is set (the enclosing context consumes it) or a `.drop`
+/// otherwise (ARC must release it), via [`TypedIr.recordOp`]; recording failures
+/// are ignored. It then recurses into children, propagating `moved` position by
+/// position. The subtle cases, mirroring the language's value semantics:
+///   - `x = rhs` (binary `.assign`): the RHS is a move into the target;
+///   - `a ?? b` nullish-coalesce: the left is always moved (it is consumed by the
+///     coalesce), the right inherits the OUTER `moved` (it becomes the result);
+///   - `cast`, `if_expr` branches, `catch` handler: pass `moved` through, since
+///     the cast/branch value IS the surrounding value;
+///   - tuple/struct/enum initialiser fields and closure/if-expr result positions
+///     are moves (the aggregate takes ownership of each);
+///   - callee, arguments, indices, conditions, field objects are read positions
+///     (`false`).
 fn tempExpr(alloc: std.mem.Allocator, ir: *TypedIr, e: *const ast.Expression, moved: bool, st: *Stats) void {
 
     if (ir.ownedOf(e)) |owned| {
@@ -207,6 +345,18 @@ fn tempExpr(alloc: std.mem.Allocator, ir: *TypedIr, e: *const ast.Expression, mo
     }
 }
 
+/// Walk a statement sequence, finding owned `let` locals and kicking off the
+/// balance analysis for each.
+///
+/// For every statement it first recurses into nested blocks via
+/// [`recurseIntoNested`] (so locals declared inside `if`/loop/`switch` bodies are
+/// also found). A `let` qualifies as a trackable owned local only when it is a
+/// SINGLE-name binding (`ls.names == null`) with an initialiser. If the
+/// initialiser has an inferred owned type ([`TypeStore.isOwnedSafe`]) the local
+/// is handed to [`analyzeOwnedLocal`] over the REMAINING statements in this
+/// sequence (`stmts[i+1..]`), which is its live scope. If the initialiser has no
+/// inferred type yet, [`initCouldBeOwned`] decides whether to count it as a
+/// deferred-untyped owned local instead.
 fn analyzeStmts(stmts: []const ast.Statement, store: *const TypeStore, ir: *const TypedIr, st: *Stats) void {
     for (stmts, 0..) |*s, i| {
 
@@ -233,6 +383,13 @@ fn analyzeStmts(stmts: []const ast.Statement, store: *const TypeStore, ir: *cons
     }
 }
 
+/// Descend into the bodies of compound statements so their owned locals are
+/// discovered by [`analyzeStmts`].
+///
+/// Only structural recursion: it opens blocks, both `if` branches, loop bodies,
+/// and every `switch` case/default, calling `analyzeStmts` on true blocks and
+/// recursing otherwise. It does NOT itself analyse locals; it just ensures no
+/// nested scope is skipped by the top-level sequence walk.
 fn recurseIntoNested(s: *const ast.Statement, store: *const TypeStore, ir: *const TypedIr, st: *Stats) void {
     switch (s.*) {
         .block => |b| analyzeStmts(b.statements, store, ir, st),
@@ -250,19 +407,43 @@ fn recurseIntoNested(s: *const ast.Statement, store: *const TypeStore, ir: *cons
     }
 }
 
+/// The dataflow state of a tracked owned local at a program point: either still
+/// `live` (owns its value, a drop is owed at scope exit) or `moved` (its value
+/// was moved out, reading it again is a use-after-move).
 const St = enum { live, moved };
 
+/// The result of walking a statement (or a sequence) for one tracked local: how
+/// control leaves that construct, which determines how enclosing walks combine
+/// branches.
 const Flow = union(enum) {
 
+    /// Control fell through to the next statement with the local in this state.
     fallthrough: St,
 
+    /// A `return` was hit — control leaves the function; the local's remaining
+    /// scope on this path is over.
     returned,
 
+    /// The construct contained a shape too complex to reason about soundly
+    /// (reassignment, shadow, closure/if-expr mention, loop move); the whole
+    /// local is abandoned as `deferred_cfg` rather than risk a false positive.
     deferred,
 
+    /// A use-after-move was proved on this path.
     violation,
 };
 
+/// Drive the flow walk for one owned local over its live scope and fold the
+/// resulting [`Flow`] into [`Stats`].
+///
+/// Interprets the terminal `Flow`:
+///   - `fallthrough(.live)` → the value survives to scope end, so a drop is owed
+///     (`drop_ops`); `fallthrough(.moved)` → it left the scope (`move_outs`);
+///     either way the local is `analyzed` (proved balanced);
+///   - `returned` → also proved (`analyzed`);
+///   - `deferred` → counted as `deferred_cfg`, unchecked;
+///   - `violation` → a use-after-move: bump the count, remember the first name,
+///     and, if a sink is present, append a [`Diagnostic`].
 fn analyzeOwnedLocal(name: []const u8, rest: []const ast.Statement, st: *Stats) void {
     switch (walkSeq(name, rest, .live, st)) {
         .fallthrough => |s| {
@@ -281,6 +462,13 @@ fn analyzeOwnedLocal(name: []const u8, rest: []const ast.Statement, st: *Stats) 
     }
 }
 
+/// Walk a statement sequence for one local, threading the [`St`] state forward.
+///
+/// Starts from `entry` and applies [`walkStmt`] to each statement in order,
+/// carrying the updated state on `fallthrough`. Any non-fallthrough outcome
+/// (`returned`/`deferred`/`violation`) short-circuits and is returned as the
+/// sequence's result. If every statement falls through, returns
+/// `fallthrough(state)` with the final state.
 fn walkSeq(name: []const u8, stmts: []const ast.Statement, entry: St, st: *Stats) Flow {
     var state = entry;
     for (stmts) |*s| {
@@ -294,6 +482,29 @@ fn walkSeq(name: []const u8, stmts: []const ast.Statement, entry: St, st: *Stats
     return .{ .fallthrough = state };
 }
 
+/// Transfer function for one statement: given the tracked local's state on
+/// entry, return the [`Flow`] describing how it exits.
+///
+/// This is the heart of the balance analysis, and every arm encodes a soundness
+/// choice about when to prove versus defer:
+///   - `block` → recurse via [`walkSeq`].
+///   - `let` → if it REDECLARES `name` (shadowing) or the initialiser mentions it
+///     inside a complex construct, defer; if the initialiser is exactly `name`
+///     (`let y = x;`) it is a duplicating copy (`dup_ops`), state unchanged; a
+///     plain mention while `moved` is a violation.
+///   - `expr_stmt` → an assignment `name = ...` re-initialises the local, which
+///     this walk cannot model, so defer; a complex mention defers; a plain
+///     mention while `moved` is a violation.
+///   - `return` → `return name;` moves the value out (`move_outs`) and returns
+///     `returned`; any other mention while `moved` is a violation; on a live
+///     fall-off a drop is owed (`drop_ops`).
+///   - `if` → walk both branches from the same entry state and combine with
+///     [`mergeIf`]; a moved-state mention in the condition is an immediate
+///     violation.
+///   - `while`/`for` → delegate to [`walkLoop`], which is deliberately
+///     conservative because a loop body can move a value on a later iteration.
+///   - `switch`/`break`/`continue`/`defer` → if they mention the local at all,
+///     defer (these are not flow-modelled here); otherwise fall through.
 fn walkStmt(name: []const u8, s: *const ast.Statement, state: St, st: *Stats) Flow {
     switch (s.*) {
         .block => |b| return walkSeq(name, b.statements, state, st),
@@ -303,17 +514,6 @@ fn walkStmt(name: []const u8, s: *const ast.Statement, state: St, st: *Stats) Fl
             if (ls.init) |init| {
                 if (mentionsComplex(&init, name)) return .deferred;
                 if (isIdent(&init, name)) {
-                    // `let y = x` binds a SECOND owned reference to x. Under ARC this is a
-                    // retaining DUP whenever x is used afterward -- codegen inserts nova_retain
-                    // at the bind, so x and y are each dropped exactly once and the refcount
-                    // stays balanced (last-use with no later mention degenerates to a move, which
-                    // is likewise balanced). Modeling it as a LINEAR move made the check report a
-                    // false "use-after-move" on the legitimate later use of x -- the only two such
-                    // sites in the corpus, `frame` (web.client: `let body = dechunked; ...;
-                    // body = gzip.decompress(dechunked)`) and `close_notify_detected`
-                    // (tlsmembio: `let cw = cb; ...; cb.closeNotify()`), are both ASAN-clean.
-                    // Nova is reference-counted, not affine: there is no source-level double-free
-                    // via rebinding for codegen's retain to miss, so a dup leaves x live.
                     st.dup_ops += 1;
                     return .{ .fallthrough = state };
                 }
@@ -377,6 +577,21 @@ fn walkStmt(name: []const u8, s: *const ast.Statement, state: St, st: *Stats) Fl
     }
 }
 
+/// Combine the [`Flow`] of an `if`'s then-branch (`ft`) and else-branch (`fe`)
+/// into a single outcome for the whole `if`.
+///
+/// Precedence and merge rules:
+///   - if EITHER branch deferred, the result defers (soundness first);
+///   - else if either has a violation, the result is a violation;
+///   - a `returned` branch contributes no state to the merge (control left), so
+///     if both returned the `if` is `returned`, and if one returned the other's
+///     state carries;
+///   - if both fall through to the SAME state, that state carries unchanged;
+///   - if they fall through to DIFFERENT states (one `live`, one `moved`), the
+///     value is conservatively treated as `moved` after the `if` and a drop is
+///     charged (`drop_ops`) for the branch that still held it.
+/// The `else => unreachable` arms are safe because deferred/violation were
+/// already handled above, leaving only `fallthrough`/`returned`.
 fn mergeIf(ft: Flow, fe: Flow, st: *Stats) Flow {
     if (ft == .deferred or fe == .deferred) return .deferred;
     if (ft == .violation or fe == .violation) return .violation;
@@ -399,6 +614,19 @@ fn mergeIf(ft: Flow, fe: Flow, st: *Stats) Flow {
     return .{ .fallthrough = .moved };
 }
 
+/// Conservatively handle a `while`/`for` for one local.
+///
+/// A loop is hard to prove precisely because a move in the body would strike on
+/// the SECOND iteration, so this defers rather than track iteration state:
+///   - a complex mention in the condition, or a moved-state mention there,
+///     violates / defers as usual;
+///   - if the body MOVES the local ([`seqMovesLocal`]) or mentions it inside a
+///     complex construct ([`stmtComplexMentions`]), defer;
+///   - if the local is already `moved` on entry and the body mentions it at all,
+///     that is a use-after-move (`violation`);
+///   - otherwise the local is untouched by the loop and control falls through in
+///     the same state. (`st` is unused here — no ops are charged for a loop that
+///     neither moves nor drops the local.)
 fn walkLoop(name: []const u8, cond: ?*const ast.Expression, body: *const ast.Statement, state: St, st: *Stats) Flow {
     if (cond) |c| {
         if (mentionsComplex(c, name)) return .deferred;
@@ -411,6 +639,13 @@ fn walkLoop(name: []const u8, cond: ?*const ast.Expression, body: *const ast.Sta
     return .{ .fallthrough = state };
 }
 
+/// Report whether statement `s` (recursively) MOVES the local out via a bare
+/// `return name;` or `let y = name;` where the initialiser is exactly the ident.
+///
+/// Used by [`walkLoop`] to decide that a loop body which moves the value is
+/// unanalysable and must be deferred. It looks only for the two move-shaped
+/// positions (return value and let-initialiser being the plain identifier), not
+/// arbitrary mentions.
 fn seqMovesLocal(name: []const u8, s: *const ast.Statement) bool {
     switch (s.*) {
         .block => |b| {
@@ -435,6 +670,12 @@ fn seqMovesLocal(name: []const u8, s: *const ast.Statement) bool {
     }
 }
 
+/// Report whether statement `s` (recursively) mentions `name` inside a construct
+/// the walk classifies as "complex" (see [`mentionsComplex`]) — a closure,
+/// `if`/`block` expression, or `catch`.
+///
+/// Such a mention means the local's use is control-flow-entangled beyond what
+/// this analysis models, so callers ([`walkLoop`]) treat it as a reason to defer.
 fn stmtComplexMentions(name: []const u8, s: *const ast.Statement) bool {
     switch (s.*) {
         .block => |b| {
@@ -468,10 +709,23 @@ fn stmtComplexMentions(name: []const u8, s: *const ast.Statement) bool {
     }
 }
 
+/// Report whether `e` is EXACTLY the bare identifier `name` (not merely a
+/// sub-expression that mentions it).
+///
+/// This is the move test: `return x;`, `let y = x;`, `x = ...` all pivot on the
+/// operand being the plain ident, which is what makes them a whole-value move or
+/// a self-reassignment rather than a read.
 fn isIdent(e: *const ast.Expression, name: []const u8) bool {
     return e.kind == .ident and std.mem.eql(u8, e.kind.ident, name);
 }
 
+/// Report whether statement `s` mentions `name` ANYWHERE in any of its
+/// expressions, recursing through nested statements.
+///
+/// The statement-level counterpart to [`mentions`]. Used to decide that an
+/// unmodelled statement kind (`switch`/`break`/`continue`/`defer`, or a loop body
+/// under an already-moved local) touches the local at all, which forces a defer
+/// or flags a violation.
 fn stmtMentions(s: *const ast.Statement, name: []const u8) bool {
     switch (s.*) {
         .block => |b| {
@@ -505,6 +759,18 @@ fn stmtMentions(s: *const ast.Statement, name: []const u8) bool {
     }
 }
 
+/// Report whether `e` mentions `name` inside a control-flow-carrying
+/// sub-expression: a closure, `if`-expression, block-expression, or `catch`.
+///
+/// When such a construct is present anywhere on the path to a mention, the walk
+/// cannot pin down WHEN the use happens relative to a move, so any mention under
+/// one is a reason to DEFER the whole local. The four "complex" kinds delegate
+/// straight to [`mentions`] (their mere presence-with-a-mention is enough);
+/// ordinary operator/call/index/field nodes recurse structurally; leaves and
+/// unhandled kinds answer `false`. Note this walks a slightly NARROWER set of
+/// expression kinds than [`mentions`] (e.g. it does not descend `try`/`await`),
+/// which is acceptable because a false negative here only widens what gets
+/// analysed, and [`mentions`] still guards the actual move check.
 fn mentionsComplex(e: *const ast.Expression, name: []const u8) bool {
     switch (e.kind) {
         .closure, .if_expr, .block_expr, .catch_expr => return mentions(e, name),
@@ -530,6 +796,14 @@ fn mentionsComplex(e: *const ast.Expression, name: []const u8) bool {
     }
 }
 
+/// Report whether expression `e` reads the identifier `name` anywhere within it.
+///
+/// The exhaustive structural mention test underpinning every "is the local used
+/// here?" question. Unlike [`mentionsComplex`] it descends the FULL expression
+/// grammar (calls, generic calls, tuples, struct/enum initialisers, `if`/block
+/// expressions, `try`/`catch`, `await`/`go`, closures) and bottoms out at an
+/// `ident` comparison. A `true` result while the local is `moved` is what makes a
+/// use-after-move.
 fn mentions(e: *const ast.Expression, name: []const u8) bool {
     switch (e.kind) {
         .ident => |n| return std.mem.eql(u8, n, name),
@@ -589,6 +863,15 @@ fn mentions(e: *const ast.Expression, name: []const u8) bool {
     }
 }
 
+/// Heuristic for an initialiser with NO inferred type: could this expression
+/// plausibly produce an owned (heap) value?
+///
+/// Used by [`analyzeStmts`] to decide whether an un-typed `let` initialiser
+/// should be counted as a `deferred_untyped` owned local (unchecked coverage) or
+/// ignored entirely. Scalar literals (`integer`/`float`/`bool`/`null`/`undefined`)
+/// are never owned and answer `false`; every other shape (string literals,
+/// calls, constructors, ...) is conservatively assumed it MIGHT own, so it is
+/// tracked as unchecked rather than silently dropped from the coverage count.
 fn initCouldBeOwned(e: *const ast.Expression) bool {
     return switch (e.kind) {
         .literal => |lit| switch (lit) {

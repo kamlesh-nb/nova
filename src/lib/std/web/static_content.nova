@@ -1,10 +1,3 @@
-// Static file serving. A file is read from disk at most ONCE -- the first time it is requested -- then its
-// bytes and precomputed Content-Type are held in a Map for the life of the process; every later request for
-// that path is answered from the Map with no filesystem access. The Map is unbounded and never evicts, so
-// a given asset is never re-read (this is deliberately lazy rather than walking the whole mount tree at
-// startup: a mount dir may be large, e.g. contain node_modules, so eagerly reading everything is unsafe).
-// All content types work (HTML, CSS, JS, images, fonts): readText is length-prefixed and byte-safe, so
-// binary assets are stored verbatim.
 import string;
 import map;
 import list;
@@ -19,7 +12,6 @@ fn fileExt(path: string): string {
     return string.slice(path, dot + 1, path.length);
 }
 
-// One preloaded asset: the raw bytes and the Content-Type computed once from its extension.
 pub struct StaticAsset {
     pub content: string,
     pub contentType: string,
@@ -38,8 +30,6 @@ pub struct StaticMount {
     init(prefix: string, dir: string, cacheCap: int) {
         self.prefix = prefix;
         self.dir = dir;
-        // Keyed by the path RELATIVE to the mount dir (no leading slash), e.g. "index.html",
-        // "app.css", "img/logo.png" -- which is what serve() derives from the request path.
         self.assets = map.Map<string, StaticAsset>(256, string.hash);
     }
 
@@ -54,7 +44,6 @@ pub struct StaticMount {
         if (string.eql(rel, "") || string.eql(rel, "/")) {
             rel = "index.html";
         }
-        // Map keys have no leading slash; the stripped request path may keep one (prefix "/" -> "/app.css").
         if (string.startsWith(rel, "/")) {
             rel = string.slice(rel, 1, rel.length);
         }
@@ -65,7 +54,6 @@ pub struct StaticMount {
             return response.Response(Status.Ok, asset.content).setHeader("Content-Type", asset.contentType);
         }
 
-        // First time this path is seen: read it from disk once, then cache it forever.
         let sep = if (string.startsWith(rel, "/")) "" else "/";
         let fsPath = self.dir + sep + rel;
         if (!file.File.exists(fsPath)) {

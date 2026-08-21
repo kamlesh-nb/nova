@@ -1,11 +1,8 @@
 // EXPECT-FAIL: typecheck
-// Generic-return substitution makes a generic call's result type CONCRETE, so a genuine mismatch is
-// now caught: `wrap<int>(5)` is `int`, and assigning it to a `string` must be rejected. (Before the
-// substitution the result was the abstract `T`, and this slipped through.)
 fn wrap<T>(x: T): T { return x; }
 
 @test
 fn t_mismatch(): void {
-    let r: string = wrap<int>(5);   // int result bound to a string -> REJECTED
+    let r: string = wrap<int>(5);
     assert.equalStr(r, "");
 }

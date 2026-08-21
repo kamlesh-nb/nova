@@ -1,4 +1,3 @@
-// Module A: payload enum Shape (Circle/Square), area() uses A's variants.
 pub enum Shape { Circle(int), Square(int)
     pub fn area(self: Shape): int {
         switch (self) {

@@ -1,36 +1,30 @@
-// A4 guard: floating-point (double) — inline literal arithmetic (regression for the
-// float-literal-typing bug where 10.0/4.0 did integer division), comparisons,
-// and double through function params/returns.
 import assert;
 
 fn half(x: double): double { return x / 2.0; }
 
 @test
 fn test_inline_float_arith(): void {
-    let m = 10.0 / 4.0;               // 2.5 (was 2 under the bug)
+    let m = 10.0 / 4.0;
     assert.isTrue(m > 2.0);
     assert.isTrue(m < 3.0);
-    let s = 1.5 + 2.5;               // 4.0
+    let s = 1.5 + 2.5;
     assert.isTrue(s > 3.9);
     assert.isTrue(s < 4.1);
-    let p = 3.0 * 3.0;              // 9.0
+    let p = 3.0 * 3.0;
     assert.isTrue(p > 8.9);
-    let d = 5.5 - 1.5;             // 4.0
+    let d = 5.5 - 1.5;
     assert.isTrue(d > 3.9);
 }
 
 @test
 fn test_float_through_function(): void {
-    let b = half(7.0);              // 3.5
+    let b = half(7.0);
     assert.isTrue(b > 3.0);
     assert.isTrue(b < 4.0);
 }
 
 @test
 fn test_float_through_if_expr(): void {
-    // A7 stage 4: a `double` flowing through an if-expression's phi merge. Both
-    // branches yield real `double`; the merge is on the i64 word, so the phi must
-    // stay well-typed. (Regression guard for the phi-type verifier error.)
     let cond = true;
     let x = if (cond) 2.5 else 9.5;
     assert.isTrue(x > 2.0);
@@ -42,11 +36,10 @@ fn test_float_through_if_expr(): void {
 
 @test
 fn test_float_arith_chain(): void {
-    // Straight-line float arithmetic: the bitcast sandwich this stage deletes.
     let a = 1.5;
     let b = 2.0;
     let c = 4.0;
-    let r = a * b + c / 2.0;         // 3.0 + 2.0 = 5.0
+    let r = a * b + c / 2.0;
     assert.isTrue(r > 4.9);
     assert.isTrue(r < 5.1);
 }

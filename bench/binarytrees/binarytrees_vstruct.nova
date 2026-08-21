@@ -1,11 +1,6 @@
-// binary-trees, VALUE-STRUCT variant. Each Node carries a `Payload` VALUE struct stored INLINE (Swift-style
-// inline value-struct storage: the two ints live in the node's own storage, not behind a pointer). The tree
-// links stay optional Node references (a self-containing value struct would be infinite-size and is rejected
-// by design, so the child edges are the natural indirection point). itemCheck reads the payload BY VALUE.
-// `pay.count` is 1 at every node, so the check totals equal node counts and match binarytrees.nova exactly.
 struct Payload {
-    pub count: int,     // contribution to itemCheck (1 per node)
-    pub depth: int,     // second field, carried inline by value, proves multi-field inline storage
+    pub count: int,
+    pub depth: int,
     init(c: int, d: int) { self.count = c; self.depth = d; }
 }
 struct Node {

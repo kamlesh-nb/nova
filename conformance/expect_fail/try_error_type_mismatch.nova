@@ -1,9 +1,4 @@
 // EXPECT-FAIL: typecheck
-// G5: `try g()` re-raises the callee's error UNCHANGED into the enclosing function, so the propagated error
-// type must match the function's declared error type. Here `caller` is declared to fail with E1 but
-// `try g()` would propagate an E2 -- a soundness hole (an E2 escapes a function whose contract says E1). It
-// must be a type error. If this ever compiles, the try-error-type check has regressed. (The fix is to
-// `catch` the E2 and map it to E1, or to widen `caller`'s error type.)
 
 exception E1 { Bad, fn message(self: E1): string { return "1"; } }
 exception E2 { Worse, fn message(self: E2): string { return "2"; } }

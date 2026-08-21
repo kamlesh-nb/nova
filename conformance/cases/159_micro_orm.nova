@@ -1,7 +1,3 @@
-// 159 — D8 micro-ORM (read side): a parameterized query materializes typed structs via the compiler's
-// `<T>__bind`, over a `RowSource impl ValueSource`. Hermetic: a MOCK Connection returns a fixed
-// ResultSet (a live driver is swapped in identically — the seam is the same). Proves `queryAs<T>` /
-// `queryOne<T>` bind columns → struct fields by name, and that a present `0` survives (V1 boxing).
 import assert;
 import data.orm;
 import data.db;
@@ -19,10 +15,7 @@ fn row(id: int, name: string, active: bool): Row {
     return r;
 }
 
-// A stand-in Connection whose `query` returns a fixed users result — the SAME seam a real driver
-// implements, so `queryAs<T>` is driver-agnostic.
 struct MockConn impl Connection {
-    // queryWire (trait): mocks use the generic fallback that re-encodes a ResultSet.
     async fn queryWire(self, sql: string, params: List<DbValue>): WireRows { return wireRowsFromResultSet(await self.query(sql, params)); }
     async fn exec(self: MockConn, sql: string, params: List<DbValue>): ExecResult {
         return ExecResult(0, "MOCK");
@@ -33,7 +26,7 @@ struct MockConn impl Connection {
         rs.columns.push(Column("name", DbType.Text));
         rs.columns.push(Column("active", DbType.Bool));
         rs.rows.push(row(7, "Ada", true));
-        rs.rows.push(row(0, "Zero", false)); // present-0 id — must NOT read as absent (V1)
+        rs.rows.push(row(0, "Zero", false));
         return rs;
     }
     fn close(self: MockConn): void {}
@@ -54,7 +47,7 @@ struct MockConn impl Connection {
 fn test_query_materializes_typed_rows(): void {
     let conn = MockConn{};
     let params = List<DbValue>();
-    params.push(db.dbInt(1)); // bound out-of-band — never interpolated into the SQL string
+    params.push(db.dbInt(1));
     let users = orm.queryAsBlocking<UserDto>(conn, "SELECT id, name, active FROM users WHERE tenant = $1", params);
 
     assert.equalInt(users.size(), 2);
@@ -64,7 +57,7 @@ fn test_query_materializes_typed_rows(): void {
     assert.isTrue(u0.active);
 
     let u1 = users.get(1) ?? UserDto{ id: -1, name: "", active: false };
-    assert.equalInt(u1.id, 0);      // present-0 survives — not read as absent
+    assert.equalInt(u1.id, 0);
     assert.equalStr(u1.name, "Zero");
     assert.isFalse(u1.active);
 }

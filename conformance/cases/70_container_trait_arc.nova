@@ -1,18 +1,3 @@
-// Container-of-trait / container-of-struct ARC: storing a struct in a `Map<K, Trait>` (or
-// `Map<K, Struct>`) and reading it back must be memory-safe.
-//
-// ROOT-CAUSE BUG FIXED — trait widening at generic-container `.set`: `m.set(k, Ada{})` on a
-// `Map<K, Trait>` stored the RAW struct. The value param `V` is erased at the call site, so
-// `traits.contains("V")` was false and no widening fired; the map held a bare struct, `get`
-// returned it, and a trait method read the struct's first words as {ptr, vtable} → garbage
-// vtable → SEGV, while `__destruct_trait` freed garbage (the double-free). Fixed by substituting
-// `V` through the receiver instantiation (`Map<string,Greeter>` → `Greeter`) before widening.
-// ASAN-caught; intermittent crash without ASAN, deterministic with it.
-//
-// Reads cover BOTH null-narrowing AND the `?? default` unwrap on an owned struct/trait value. The
-// latter double-freed via the `??` phi aliasing the owned operand; fixed by per-edge ownership in the
-// `??` operator (retain a borrowed operand, move a fresh one) + removing the redundant
-// `return x ?? default` retain-on-return that used to double it. ASAN-verified.
 import assert;
 import map;
 import string;
@@ -28,7 +13,6 @@ fn test_map_of_trait_narrowed(): void {
     let m = Map<string, Greeter>(8, string.hash);
     m.set("a", Ada{});
     m.set("b", Bob{});
-    // Distinct concrete types widened into the same trait map, dispatched correctly.
     let ha = m.get("a");
     if (ha == undefined) { assert.equalInt(0, 1); return; }
     assert.equalInt(ha.hi(), 7);
@@ -54,18 +38,13 @@ fn test_map_of_struct_narrowed(): void {
     assert.equalInt(h.x, 42);
 }
 
-// `?? StructDefault` in a trait-typed coalesce, DEFAULT SELECTED (missing key): the default struct
-// must be widened to the trait object, else a trait method reads garbage as its vtable → SEGV.
-// (Distinct from the still-open `??`-on-owned phi double-free; here the default is a fresh value.)
 @test
 fn test_map_of_trait_missing_key_default(): void {
     let m = Map<string, Greeter>(8, string.hash);
     m.set("a", Ada{});
-    assert.equalInt((m.get("z") ?? Bob{}).hi(), 9);   // "z" absent → Bob{} default, widened
+    assert.equalInt((m.get("z") ?? Bob{}).hi(), 9);
 }
 
-// `?? default` unwrap on an OWNED trait/struct value (key PRESENT → the stored value survives): the
-// coalesce phi aliases the owned operand; without per-edge ownership it double-freed. ASAN-verified.
 @test
 fn test_map_of_trait_coalesced_present(): void {
     let m = Map<string, Greeter>(8, string.hash);
@@ -80,11 +59,6 @@ fn test_map_of_struct_coalesced_present(): void {
     assert.equalInt((m.get("p") ?? Point(0)).x, 42);
 }
 
-// Trait-typed variable REASSIGNED then used: the RHS struct must be widened to the trait object,
-// AND the reassignment must not double-free the old box. Storing raw B{} → SEGV; a naive widening
-// double-freed the old box (release-old + drain both fired). Fixed by mirroring the let-widening:
-// consume the new fat pointer (the variable owns it, not the drain) + release the struct's orphaned
-// construction ref. ASAN-verified, including chained reassignment.
 @test
 fn test_trait_var_reassigned(): void {
     let g: Greeter = Ada{};

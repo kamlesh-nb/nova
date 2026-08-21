@@ -1,10 +1,3 @@
-// TLS 1.3 (RFC 8446) handshake authentication in Nova, no external library (M9 phase E). This is the
-// certificate-and-Finished core of the handshake state machine, built on the tls13 key schedule and the
-// Nova X.509 / RSA / ECDSA verifiers: the running transcript hash, the Finished MAC, the CertificateVerify
-// signature check, and the application traffic secrets. The message framing (ServerHello parse) rounds it
-// out. Wiring these to the reactor for a live handshake is the next slice.
-//
-// References: RFC 8446 sections 4.4 (Authentication) and 7.1 (Key Schedule). Verified against RFC 8448.
 import bytes;
 import crypto.tls.13.tls;
 import crypto.kdf.hkdf;
@@ -22,7 +15,6 @@ fn strBuf(s: string): ptr {
 }
 fn ptrAt(buf: ptr, off: int): ptr { return (buf as long + off) as ptr; }
 
-// ---- running transcript hash (accumulates handshake messages; hashes the prefix on demand) ----
 
 struct Transcript {
     pub buf: ptr,
@@ -47,15 +39,12 @@ pub fn transcriptAdd(t: Transcript, msg: ptr, n: int): void {
     t.len = t.len + n;
 }
 
-// Only SHA-256 transcripts for now (the AES-128-GCM and ChaCha20 suites); SHA-384 is a follow-on.
 pub fn transcriptHash(kind: int, t: Transcript, out: ptr): void {
     sha256.hashInto(t.buf, t.len, out);
 }
 pub fn transcriptFree(t: Transcript): void { bytes.free(t.buf); }
 
-// ---- Finished ----
 
-// finished_key = HKDF-Expand-Label(BaseKey, "finished", "", Hash.length).
 pub fn finishedKey(kind: int, trafficSecret: ptr, out: ptr): void {
     let hl = hkdf.hashLen(kind);
     let empty = bytes.alloc(1);
@@ -64,8 +53,6 @@ pub fn finishedKey(kind: int, trafficSecret: ptr, out: ptr): void {
     bytes.free(empty); bytes.free(lab);
 }
 
-// verify_data = HMAC(finished_key, Transcript-Hash(...)); the HMAC hash follows the suite (SHA-256 for
-// kind 0, SHA-384 for kind 1).
 pub fn finishedVerifyData(kind: int, trafficSecret: ptr, transcriptHash: ptr, out: ptr): void {
     let hl = hkdf.hashLen(kind);
     let fk = bytes.alloc(hl);
@@ -75,7 +62,6 @@ pub fn finishedVerifyData(kind: int, trafficSecret: ptr, transcriptHash: ptr, ou
     bytes.free(fk);
 }
 
-// Verify a peer Finished message (constant-time compare against the expected verify_data).
 pub fn verifyFinished(kind: int, trafficSecret: ptr, transcriptHash: ptr, expected: ptr): bool {
     let hl = hkdf.hashLen(kind);
     let vd = bytes.alloc(hl);
@@ -87,9 +73,7 @@ pub fn verifyFinished(kind: int, trafficSecret: ptr, transcriptHash: ptr, expect
     return diff == 0;
 }
 
-// ---- CertificateVerify (RFC 8446 section 4.4.3) ----
 
-// The signed content: 64 space bytes, the context string, a 0x00 separator, then the transcript hash.
 fn certVerifyContent(context: ptr, ctxLen: int, transcriptHash: ptr, hl: int, out: ptr): int {
     let i = 0;
     while (i < 64) { bytes.write_byte(out, i, 0x20); i = i + 1; }
@@ -103,11 +87,6 @@ fn certVerifyContent(context: ptr, ctxLen: int, transcriptHash: ptr, hl: int, ou
     return p + hl;
 }
 
-// The SHA-256 digest a CertificateVerify signature covers, for either role. The context string is the
-// ONLY difference between the server's and the client's (mTLS) CertificateVerify, and getting it wrong
-// is a protocol/security error -- a client that signed with the server context (or vice versa) would be
-// rejected, or worse, cross-protocol confusable. Exposed so the client mTLS path and the server share
-// one implementation. Both context strings are 33 bytes.
 pub fn certVerifyDigest(isServer: bool, transcriptHash: ptr, hl: int, digestOut: ptr): void {
     let ctx = if (isServer) strBuf("TLS 1.3, server CertificateVerify") else strBuf("TLS 1.3, client CertificateVerify");
     let content = bytes.alloc(64 + 33 + 1 + hl);
@@ -117,35 +96,26 @@ pub fn certVerifyDigest(isServer: bool, transcriptHash: ptr, hl: int, digestOut:
     bytes.free(ctx);
 }
 
-// TLS SignatureScheme codes handled here.
 const SS_RSA_PKCS1_SHA256: int = 0x0401;
 const SS_ECDSA_P256_SHA256: int = 0x0403;
 const SS_RSA_PSS_SHA256: int = 0x0804;
 
-// Verify the server's CertificateVerify signature over the transcript, using the leaf certificate's key.
-// transcriptHashLen is the negotiated cipher suite's hash length (32 for SHA-256 suites, 48 for
-// SHA-384), which sets how many transcript-hash bytes go into the signed content. The digest that the
-// signature actually covers is always SHA-256 here, because the client offers only SHA-256 signature
-// algorithms (rsa_pss/pkcs1_sha256, ecdsa_secp256r1_sha256).
 pub fn verifyCertificateVerify(cert: x509.Cert, sigScheme: int, sig: ptr, sigLen: int, transcriptHash: ptr, transcriptHashLen: int): bool {
     let digest = bytes.alloc(32);
-    certVerifyDigest(true, transcriptHash, transcriptHashLen, digest);   // server context
+    certVerifyDigest(true, transcriptHash, transcriptHashLen, digest);
     let ok = verifyCvSig(cert, sigScheme, sig, sigLen, digest);
     bytes.free(digest);
     return ok;
 }
 
-// mTLS: verify a CLIENT CertificateVerify -- identical dispatch, client context digest.
 pub fn verifyClientCertificateVerify(cert: x509.Cert, sigScheme: int, sig: ptr, sigLen: int, transcriptHash: ptr, transcriptHashLen: int): bool {
     let digest = bytes.alloc(32);
-    certVerifyDigest(false, transcriptHash, transcriptHashLen, digest);  // client context
+    certVerifyDigest(false, transcriptHash, transcriptHashLen, digest);
     let ok = verifyCvSig(cert, sigScheme, sig, sigLen, digest);
     bytes.free(digest);
     return ok;
 }
 
-// Verify a CertificateVerify signature over a precomputed digest against the leaf cert's key. Shared by
-// the server and client (mTLS) verifiers so the RSA-PSS / RSA-PKCS1 / ECDSA-P256 dispatch lives once.
 fn verifyCvSig(cert: x509.Cert, sigScheme: int, sig: ptr, sigLen: int, digest: ptr): bool {
     let ok = false;
     if (sigScheme == SS_RSA_PSS_SHA256) {
@@ -155,7 +125,6 @@ fn verifyCvSig(cert: x509.Cert, sigScheme: int, sig: ptr, sigLen: int, digest: p
         ok = rsa.verifyPkcs1(0, digest, sig, sigLen,
             ptrAt(cert.buf, cert.rsaNStart), cert.rsaNLen, ptrAt(cert.buf, cert.rsaEStart), cert.rsaELen);
     } else if (sigScheme == SS_ECDSA_P256_SHA256) {
-        // signature is DER ECDSA-Sig-Value SEQUENCE { r INTEGER, s INTEGER }
         let r = bytes.alloc(32); let s = bytes.alloc(32);
         decodeEcdsaSigDer(sig, r, s);
         ok = p256.ecdsaVerify(digest, ptrAt(cert.buf, cert.ecStart), r, s);
@@ -164,7 +133,6 @@ fn verifyCvSig(cert: x509.Cert, sigScheme: int, sig: ptr, sigLen: int, digest: p
     return ok;
 }
 
-// Minimal DER helpers for the ECDSA signature (single-byte lengths, as ECDSA-P256 sigs use).
 fn derLen(buf: ptr, pos: int): int { return bytes.read_byte(buf, pos + 1); }
 fn derContentStart(buf: ptr, pos: int): int { return pos + 2; }
 fn derIntTo(buf: ptr, start: int, len: int, out: ptr): void {
@@ -177,8 +145,6 @@ fn derIntTo(buf: ptr, start: int, len: int, out: ptr): void {
     while (i < l) { bytes.write_byte(out, pad + i, bytes.read_byte(buf, s + i)); i = i + 1; }
 }
 
-// Encode a raw 32-byte (r,s) ECDSA-P256 signature as a DER ECDSA-Sig-Value SEQUENCE { r, s }. Shared by
-// the client mTLS CertificateVerify path; mirrors the server's private encoder. Returns the DER length.
 fn derEncInt(src: ptr, out: ptr, off: int): int {
     let s = 0;
     while (s < 31 && bytes.read_byte(src, s) == 0) { s = s + 1; }
@@ -201,7 +167,6 @@ pub fn encodeEcdsaSigDer(r: ptr, s: ptr, out: ptr): int {
     bytes.write_byte(out, 1, total);
     return 2 + total;
 }
-// Decode a DER ECDSA-Sig-Value SEQUENCE { r, s } into two 32-byte big-endian scalars.
 pub fn decodeEcdsaSigDer(sig: ptr, rOut: ptr, sOut: ptr): void {
     let seqStart = derContentStart(sig, 0);
     let rTag = derContentStart(sig, seqStart);
@@ -212,13 +177,11 @@ pub fn decodeEcdsaSigDer(sig: ptr, rOut: ptr, sOut: ptr): void {
     derIntTo(sig, sTag, sLen, sOut);
 }
 
-// True if the ServerHello echoed a pre_shared_key extension (0x0029), i.e. the server accepted our
-// resumption PSK (RFC 8446 4.2.11). `sh` is the ServerHello handshake message.
 pub fn serverAcceptedPsk(sh: ptr, shLen: int): bool {
-    let p = 4 + 2 + 32;                            // msg header, legacy_version, random
+    let p = 4 + 2 + 32;
     let sidLen = bytes.read_byte(sh, p);
     p = p + 1 + sidLen;
-    p = p + 2 + 1;                                 // cipher_suite + legacy_compression_method
+    p = p + 2 + 1;
     let extLen = (bytes.read_byte(sh, p) << 8) | bytes.read_byte(sh, p + 1);
     p = p + 2;
     let end = p + extLen;
@@ -231,10 +194,7 @@ pub fn serverAcceptedPsk(sh: ptr, shLen: int): bool {
     return false;
 }
 
-// ---- EncryptedExtensions: ALPN selection (RFC 7301 / RFC 8446 section 4.3.1) ----
 
-// True if EncryptedExtensions (type 0x08) contains an early_data extension (0x002a), i.e. the server
-// accepted our 0-RTT data (RFC 8446 4.2.10). `ee` is the buffer, `off` the message start.
 pub fn serverAcceptedEarlyData(ee: ptr, off: int): bool {
     let p = off + 4;
     let extLen = (bytes.read_byte(ee, p) << 8) | bytes.read_byte(ee, p + 1);
@@ -249,8 +209,6 @@ pub fn serverAcceptedEarlyData(ee: ptr, off: int): bool {
     return false;
 }
 
-// Parse a record_size_limit extension (0x001c, RFC 8449) out of an EncryptedExtensions message (type
-// 0x08): the peer's maximum receive record plaintext size. Returns the value, or 0 if absent.
 pub fn parseRecordSizeLimit(ee: ptr, off: int): int {
     let p = off + 4;
     let extLen = (bytes.read_byte(ee, p) << 8) | bytes.read_byte(ee, p + 1);
@@ -265,11 +223,8 @@ pub fn parseRecordSizeLimit(ee: ptr, off: int): int {
     return 0;
 }
 
-// Parse the server's ALPN selection out of an EncryptedExtensions handshake message (type 0x08). `ee` is
-// the buffer and `off` the offset of the message start (the 0x08 type byte). Returns the selected protocol
-// name (e.g. "http/1.1"), or "" if the server sent no application_layer_protocol_negotiation extension.
 pub fn parseAlpnSelection(ee: ptr, off: int): string {
-    let p = off + 4;                                // skip handshake header (type + 3-byte length)
+    let p = off + 4;
     let extLen = (bytes.read_byte(ee, p) << 8) | bytes.read_byte(ee, p + 1);
     p = p + 2;
     let end = p + extLen;
@@ -277,8 +232,7 @@ pub fn parseAlpnSelection(ee: ptr, off: int): string {
         let etype = (bytes.read_byte(ee, p) << 8) | bytes.read_byte(ee, p + 1);
         let elen = (bytes.read_byte(ee, p + 2) << 8) | bytes.read_byte(ee, p + 3);
         let body = p + 4;
-        if (etype == 0x0010) {                      // application_layer_protocol_negotiation
-            // ProtocolNameList: list_len(2), then a single ProtocolName len(1) + bytes.
+        if (etype == 0x0010) {
             let nameLen = bytes.read_byte(ee, body + 2);
             let s = bytes.alloc(nameLen);
             let k = 0;
@@ -290,9 +244,7 @@ pub fn parseAlpnSelection(ee: ptr, off: int): string {
     return "";
 }
 
-// ---- application traffic secrets ----
 
-// Master Secret = HKDF-Extract(Derive-Secret(Handshake Secret, "derived", ""), 0).
 pub fn masterSecret(kind: int, handshakeSecret: ptr, out: ptr): void {
     let hl = hkdf.hashLen(kind);
     let derived = bytes.alloc(hl);
@@ -304,19 +256,14 @@ pub fn masterSecret(kind: int, handshakeSecret: ptr, out: ptr): void {
     bytes.free(derived); bytes.free(zero);
 }
 
-// ---- ServerHello parse (extract the negotiated cipher suite and the server key_share) ----
 
-// Returns the cipher suite (e.g. 0x1301 for TLS_AES_128_GCM_SHA256) and writes the server's key_share
-// public value into pubOut (32 bytes for x25519, 65 bytes uncompressed for secp256r1). The selected
-// NamedGroup (0x001d x25519 or 0x0017 secp256r1) is written big-endian into groupOut[0..1]; it is left 0
-// if no key_share was found.
 pub fn parseServerHello(sh: ptr, shLen: int, pubOut: ptr, groupOut: ptr): int {
     bytes.write_byte(groupOut, 0, 0); bytes.write_byte(groupOut, 1, 0);
-    let p = 4 + 2 + 32;                            // msg header, legacy_version, random
+    let p = 4 + 2 + 32;
     let sidLen = bytes.read_byte(sh, p);
     p = p + 1 + sidLen;
     let cipher = (bytes.read_byte(sh, p) << 8) | bytes.read_byte(sh, p + 1);
-    p = p + 2 + 1;                                 // cipher_suite + legacy_compression_method
+    p = p + 2 + 1;
     let extLen = (bytes.read_byte(sh, p) << 8) | bytes.read_byte(sh, p + 1);
     p = p + 2;
     let end = p + extLen;
@@ -324,7 +271,7 @@ pub fn parseServerHello(sh: ptr, shLen: int, pubOut: ptr, groupOut: ptr): int {
         let etype = (bytes.read_byte(sh, p) << 8) | bytes.read_byte(sh, p + 1);
         let elen = (bytes.read_byte(sh, p + 2) << 8) | bytes.read_byte(sh, p + 3);
         let body = p + 4;
-        if (etype == 0x0033) {                     // key_share (server: a single KeyShareEntry)
+        if (etype == 0x0033) {
             bytes.write_byte(groupOut, 0, bytes.read_byte(sh, body));
             bytes.write_byte(groupOut, 1, bytes.read_byte(sh, body + 1));
             let klen = (bytes.read_byte(sh, body + 2) << 8) | bytes.read_byte(sh, body + 3);

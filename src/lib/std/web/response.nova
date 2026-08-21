@@ -11,9 +11,6 @@ import web.status;
 import web.request;
 import compress.gzip;
 
-// memchr (SIMD-backed) delimiter scan, shared shape with web/request. Response.parse uses it for the
-// client side (parsing responses from external calls); serialize builds into one StringBuilder buffer
-// instead of a List<string> + join + concat chain.
 fn idxByte(buf: long, start: int, end: int, b: int): int {
     if (start >= end) { return -1; }
     let p = sys.memchr(buf + (start as long), b, (end - start) as long);
@@ -21,7 +18,6 @@ fn idxByte(buf: long, start: int, end: int, b: int): int {
     return (p - buf) as int;
 }
 
-// case-insensitive ASCII equality, no allocation.
 fn ciEquals(a: string, b: string): bool {
     if (a.length != b.length) { return false; }
     let i = 0;
@@ -36,24 +32,10 @@ fn ciEquals(a: string, b: string): bool {
     return true;
 }
 
-// HTML-escape a string for safe interpolation into an NSX / hypermedia view. NSX inserts a `{expr}`
-// string RAW (so pre-rendered fragments compose), which means any text that could contain HTML-special
-// characters must be escaped by the caller. This is the one canonical escaper so views (and `.nsx` files)
-// do not each redefine their own: `{response.escapeHtml(user.name)}`. It replaces the five characters that
-// matter in element text and double-quoted attribute values: & < > " '.
-// Escape `s` and append the result DIRECTLY into a render StringBuilder -- no intermediate string. This
-// is the hot path the NSX codegen calls for every `{expr}` interpolation: clean runs are memcpy'd in via
-// appendRange (zero allocation) and only the five metacharacters expand to entity literals (which are
-// immortal string constants, so also allocation-free). A 200-card page interpolates ~1200 values; the old
-// escapeHtml(...)->append allocated one escaped string per value, which this eliminates entirely.
 pub fn escapeHtmlInto(sb: StringBuilder, s: string): void {
     let n = string.len(s);
     let base = s as long;
     let runStart = 0;
-    // SWAR bulk scan: `nova_html_find_meta` returns the next metacharacter index (8 bytes/iteration,
-    // branch-free) or `n`. For clean text (the overwhelming majority of interpolated values) this is ONE
-    // call that scans the whole value; each metacharacter then costs one more call. The clean runs between
-    // metacharacters are copied wholesale via appendRange (zero per-byte work).
     let m = nova_html_find_meta(base, 0, n);
     while (m < n) {
         if (m > runStart) { sb.appendRange(s, runStart, m); }
@@ -69,10 +51,6 @@ pub fn escapeHtmlInto(sb: StringBuilder, s: string): void {
     if (n > runStart) { sb.appendRange(s, runStart, n); }
 }
 
-// P10: HTML-escape a BORROWED view straight into the builder -- the clean runs are copied byte-for-byte
-// out of the borrowed buffer (appendBytes), so NO owned intermediate string is minted. This is the render
-// sink that lets a DB cell (a StrView over the row buffer) or a constant template chunk flow to the output
-// without the ~1 owned-string allocation per interpolated value that escapeHtmlInto(string) costs.
 pub fn escapeHtmlIntoView(sb: StringBuilder, v: str.Str): void {
     let base = v.ptr;
     let n = v.len;
@@ -94,11 +72,6 @@ pub fn escapeHtmlIntoView(sb: StringBuilder, v: str.Str): void {
 
 pub fn escapeHtml(s: string): string {
     let n = string.len(s);
-    // Fast path: scan once for anything needing escaping. The overwhelming majority of interpolated
-    // values (names, descriptions, URLs) contain no HTML metacharacters, so return the input UNCHANGED
-    // with zero allocation. The old code allocated a one-character string per byte (string.slice(s,i,i+1))
-    // even for clean text, which made rendering O(bytes) allocations and was the response-build throughput
-    // ceiling (~43 MB/s) -- a large product page is mostly clean description text.
     let first = -1;
     let k = 0;
     while (k < n) {
@@ -107,7 +80,6 @@ pub fn escapeHtml(s: string): string {
         k = k + 1;
     }
     if (first == -1) { return s; }
-    // Slow path: copy safe RUNS between metacharacters in one slice each, not byte by byte.
     let sb = StringBuilder();
     if (first > 0) { sb.append(string.slice(s, 0, first)); }
     let i = first;
@@ -129,9 +101,6 @@ pub fn escapeHtml(s: string): string {
     return sb.toString();
 }
 
-// The standard error side of a typed handler's `TResp | HttpError` return. A handler returns the ok
-// DTO for success (the framework serialises it as 200 JSON) or an `HttpError` for failure, which the
-// framework turns into a Response via `toResponse()`: the given status code and the message as the body.
 pub struct HttpError {
     pub status: int,
     pub message: string,
@@ -203,8 +172,6 @@ pub struct Response {
             self.headers.set("Content-Length", intToStr(self.body.length));
         }
 
-        // one growable buffer, no List/join/concat chain. Pre-size it to the body plus header headroom so
-        // a large body (e.g. a static asset) is copied once, not re-copied through ~log2(n) doublings.
         let sb = string_builder.StringBuilder();
         sb.ensureCapacity(self.body.length + 512);
         sb.append("HTTP/1.1 ");
@@ -230,10 +197,6 @@ pub struct Response {
         return sb.toString();
     }
 
-    // Just the status line + headers + cookies + the blank line -- NOT the body. Lets the server write the
-    // header block and the (large) body as two separate sends, so the body is written straight from its
-    // existing buffer instead of being appended into a serialize buffer AND copied out by toString (two
-    // full body copies). Content-Length is set from the body length the caller will send next.
     pub fn serializeHeaders(self: Response): string {
         if (self.headers.get("Content-Length") == undefined) {
             self.headers.set("Content-Length", intToStr(self.body.length));
@@ -262,15 +225,13 @@ pub struct Response {
         return sb.toString();
     }
 
-    // Parse a raw HTTP/1 response (client side: external calls). memchr offset scan, no split/join.
     pub fn parse(raw: string): Response {
         let n = raw.length;
         let buf = raw as long;
 
-        let eol = idxByte(buf, 0, n, 13); // CR ending the status line
+        let eol = idxByte(buf, 0, n, 13);
         if (eol < 0) { return Response(Status.Ok, ""); }
 
-        // status line: HTTP/1.1 CODE REASON
         let sp1 = idxByte(buf, 0, eol, 32);
         let code = 200;
         if (sp1 >= 0) {
@@ -283,7 +244,7 @@ pub struct Response {
         let pos = eol + 2;
         let headers = Map<string, string>(16, string.hash);
         while (pos < n) {
-            if (bytes.read_byte(buf, pos) as int == 13) { // blank line -> end of headers
+            if (bytes.read_byte(buf, pos) as int == 13) {
                 pos = pos + 2;
                 break;
             }
@@ -304,10 +265,6 @@ pub struct Response {
 
         let body = if (pos <= n) string.slice(raw, pos, n) else "";
 
-        // Decode the transfer/content encodings so callers see the actual payload. Chunked framing is
-        // decoded with the same engine the server read path uses (request.bufDechunk over the body's
-        // bytes); a gzip Content-Encoding is then inflated. A string's bytes are addressable via
-        // `body as long`, so no copy into a separate buffer is needed.
         let te = decodedHeader(headers, "transfer-encoding");
         if (string.contains(te, "chunked")) {
             body = request.bufDechunk(body as long, 0, body.length);
@@ -320,7 +277,6 @@ pub struct Response {
     }
 }
 
-// Case-insensitive header lookup returning a lowercased value (or ""), for content-negotiation checks.
 fn decodedHeader(headers: Map<string, string>, name: string): string {
     let keys = headers.keys();
     let i = 0;

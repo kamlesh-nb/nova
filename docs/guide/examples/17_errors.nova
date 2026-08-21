@@ -1,10 +1,5 @@
-// examples/17_errors.nova
 import string;
 
-// An `exception` is Nova's error type: a tagged union whose variants carry the
-// reason, plus a compiler-required `message(self): string` that turns any variant
-// into text. Leaving out `message` is a compile error. Every caller then reports a
-// failure with a single `catch (e) e.message()`, whichever variant occurred.
 exception ConfigError {
     Empty,
     NotANumber(string),
@@ -19,8 +14,6 @@ exception ConfigError {
     }
 }
 
-// A fallible function: parse a port number out of a string. It really parses the
-// digits, and returns a typed error variant for each way the input can be wrong.
 fn parsePort(s: string): int | ConfigError {
     if (s.length == 0) { return ConfigError.Empty; }
     let n = 0;
@@ -35,20 +28,15 @@ fn parsePort(s: string): int | ConfigError {
     return n;
 }
 
-// `try` propagates parsePort's error to OUR caller and unwraps on success. Because
-// buildUrl also returns `... | ConfigError`, one bad value short-circuits the rest.
 fn buildUrl(host: string, portText: string): string | ConfigError {
     let port = try parsePort(portText);
     return `http://${host}:${port}`;
 }
 
 fn main(): void {
-    // `catch d`: the ok value passes through, an error becomes the default d.
     console.log(`parsePort("8080")  = ${parsePort("8080") catch -1}`);
     console.log(`parsePort("70000") = ${parsePort("70000") catch -1}`);
 
-    // `catch (e) e.message()`: bind the error and let the exception describe itself.
-    // The four calls below each fail in a different way, and the reason survives.
     console.log(`url ok    = ${buildUrl("localhost", "8080") catch (e) e.message()}`);
     console.log(`url empty = ${buildUrl("localhost", "") catch (e) e.message()}`);
     console.log(`url text  = ${buildUrl("localhost", "12ab") catch (e) e.message()}`);

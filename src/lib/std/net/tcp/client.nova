@@ -12,8 +12,6 @@ pub class TcpClient {
         return stream.TcpStream(fd);
     }
 
-    // Blocking connect, then bound subsequent I/O with a receive/send timeout (M14.2 simplified the
-    // connect itself to blocking; the timeout applies to reads/writes on the returned stream).
     pub fn connectTimeout(host: string, port: int, timeoutMs: int): stream.TcpStream {
         let fd = stream.connect(host, port);
         if (fd < 0) {

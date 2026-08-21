@@ -1,8 +1,3 @@
-// The `exception` construct: a tagged union (like an enum) that the compiler REQUIRES to define a
-// `message(self): string` method. It is used as the error side of `T | E`, so one function can fail
-// in several ways and every caller handles them uniformly with `catch (e) e.message()`, which
-// dispatches to the right variant. `exception` is a contextual keyword, so `import exception;` and
-// identifiers named `exception` are unaffected.
 import assert;
 
 exception LookupError {
@@ -17,7 +12,6 @@ exception LookupError {
     }
 }
 
-// The ok side is a string so `catch (e) e.message()` unifies (both sides are strings).
 fn fetch(k: string): string | LookupError {
     if (k == "missing") { return LookupError.NotFound(k); }
     if (k == "slow")    { return LookupError.Timeout(500); }
@@ -39,7 +33,6 @@ fn test_second_variant_dispatches(): void {
     assert.equalStr(fetch("slow") catch (e) e.message(), "timed out after 500ms");
 }
 
-// `try` propagates the exception out of a second layer, still catchable by message().
 fn fetchTwice(k: string): string | LookupError {
     let a = try fetch(k);
     return a + "!";

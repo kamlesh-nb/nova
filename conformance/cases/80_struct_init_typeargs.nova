@@ -2,7 +2,7 @@ import assert;
 struct Box<T> { pub v: T, }
 @test
 fn explicit_typeargs_literal() {
-    let b = Box<int>{ v: 7 };       // struct-init literal with explicit type args
+    let b = Box<int>{ v: 7 };
     assert.equalInt(b.v, 7);
 }
 @test

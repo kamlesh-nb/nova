@@ -1,7 +1,3 @@
-// OSSA Slice 3: owned-local reassignment is now modelled by the ownership verifier (destroy-old +
-// rebind-new), including the outer-local-reassigned-in-a-branch shape which is unified at the join by an
-// owned-value phi. Runtime behaviour is the real gate here (ASAN/ARC must stay clean); under NOVA_OSSA=hard
-// the verifier must additionally report 0 proven imbalances for these functions.
 import assert;
 import list;
 
@@ -11,7 +7,6 @@ fn makeList(n: int): List<int> {
     return l;
 }
 
-// Straight-line reassign: drop old, rebind twice.
 @test
 fn reassign_straight_line(): void {
     let a = makeList(1);
@@ -21,7 +16,6 @@ fn reassign_straight_line(): void {
     assert.equalInt(a.get(0), 3);
 }
 
-// Reassign a branch-local (declared inside the branch) — modelled directly, no phi needed.
 @test
 fn reassign_branch_local(): void {
     let cond = true;
@@ -32,8 +26,6 @@ fn reassign_branch_local(): void {
     }
 }
 
-// Reassign an OUTER local inside one branch only: the then-path carries a fresh list, the else-path (no
-// else) carries the original. The join unifies them with an owned-value phi. No leak, no double-free.
 @test
 fn reassign_outer_in_then(): void {
     let c = makeList(1);
@@ -45,7 +37,6 @@ fn reassign_outer_in_then(): void {
     assert.equalInt(c.get(0), 2);
 }
 
-// Reassign an outer local in BOTH branches: both paths carry fresh values; the phi has two live inputs.
 @test
 fn reassign_outer_both_branches(): void {
     let d = makeList(0);
@@ -58,7 +49,6 @@ fn reassign_outer_both_branches(): void {
     assert.equalInt(d.get(0), 9);
 }
 
-// Outer local reassigned inside a while loop body (no break/continue) -> loop-header phi (Slice 4 tail).
 @test
 fn reassign_in_loop_body(): void {
     let acc = makeList(0);
@@ -70,7 +60,6 @@ fn reassign_in_loop_body(): void {
     assert.equalInt(acc.get(0), 2);
 }
 
-// Reassign inside an if inside the loop: nested if-join phi composes with the loop-header phi.
 @test
 fn reassign_in_loop_conditional(): void {
     let cur = makeList(0);
@@ -84,7 +73,6 @@ fn reassign_in_loop_conditional(): void {
     assert.equalInt(cur.get(0), 3);
 }
 
-// Outer local reassigned inside switch cases -> N-input join phi (Slice 4 tail: switch).
 @test
 fn reassign_in_switch(): void {
     let s = makeList(0);
@@ -97,7 +85,6 @@ fn reassign_in_switch(): void {
     assert.equalInt(s.get(0), 22);
 }
 
-// Outer local reassigned in a loop with a break -> multi-back-edge header phi + break-fed exit phi.
 @test
 fn reassign_in_loop_with_break(): void {
     let x = makeList(0);
@@ -110,7 +97,6 @@ fn reassign_in_loop_with_break(): void {
     assert.equalInt(x.get(0), 3);
 }
 
-// Outer local reassigned in a loop with a continue -> continue-fed header phi.
 @test
 fn reassign_in_loop_with_continue(): void {
     let y = makeList(0);

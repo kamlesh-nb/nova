@@ -1,15 +1,80 @@
+//! Recursive-descent parser: Nova token stream -> abstract syntax tree.
+//!
+//! This is the second stage of the compiler frontend. It owns a fully
+//! tokenised buffer (the [`Parser.init`] path runs the lexer eagerly to EOF)
+//! and walks it with a hand-written recursive-descent grammar, producing the
+//! [`ast`] node tree that the type checker and `sema/` passes then consume. It
+//! does NO name resolution, NO type checking, and almost NO semantic
+//! validation: its job is purely to turn a linear sequence of tokens into a
+//! shaped tree, plus a small number of well-defined syntactic desugarings.
+//!
+//! Expression precedence is encoded as a classic climbing chain of one method
+//! per level, each parsing the tighter level below it and folding left:
+//! assignment -> logical (`&&`/`||`/`??`/ternary) -> bit-or -> bit-xor ->
+//! bit-and -> equality -> comparison -> shift -> add/sub -> mul/div -> unary
+//! -> postfix -> primary. Reading that chain top to bottom is the fastest way
+//! to see how tightly each operator binds. See [`Parser.parseAssignment`]
+//! through [`Parser.parsePrimary`].
+//!
+//! Design decisions worth knowing before editing:
+//!
+//!   - Desugaring happens here, not in a later pass. `for (x in coll)` is
+//!     lowered to an index-counted C-style `for` over `coll.size()`/`coll.at(i)`
+//!     ([`Parser.desugarCollectionForIn`]); `for ((k, v) in map)` lowers to a
+//!     keys() walk plus a get() ([`Parser.desugarMapForIn`]); `while (let x = e)`
+//!     lowers to an infinite loop with a break-on-`undefined` guard
+//!     ([`Parser.parseWhileStmt`]); compound assignment `a += b` expands to
+//!     `a = a + b`; and trait default method bodies are copied into every
+//!     implementing struct ([`Parser.expandTraitDefaults`]). Consumers only
+//!     ever see the desugared forms.
+//!
+//!   - Target gating is resolved at parse time. `@wasm { ... }` / `@native { ... }`
+//!     blocks are kept or brace-skipped based on [`Parser.is_wasm`], so the AST
+//!     handed downstream already contains only the declarations that belong to
+//!     the current target.
+//!
+//!   - Exceptions are rejected with teaching errors, not merely a syntax error.
+//!     `throw`/`catch`-block/`try { ... }` no longer exist in Nova, and
+//!     [`Parser.rejectExceptions`] prints the migration guidance to the error
+//!     model (`fn f(): T | E`, prefix `try`, and `catch` as an expression
+//!     operator) rather than a bare "unexpected token".
+//!
+//!   - Spans point back into the original source text. [`Parser.span`] recovers
+//!     a byte offset by pointer arithmetic against [`Parser.source`], relying on
+//!     the fact that a token's `lexeme` is a slice of that same buffer; when the
+//!     lexeme is a freshly allocated string (interpolation, synthesised tokens)
+//!     it falls back to offset 0.
+//!
+//! Allocation model: nearly every AST node and slice is allocated from the
+//! caller-supplied [`Parser.allocator`] and never individually freed here. The
+//! tree is expected to live in an arena that the driver frees wholesale, which
+//! is why the parser can hand out borrowed sub-slices of the token buffer and
+//! source freely.
 
 const std = @import("std");
 const lexer = @import("lexer.zig");
 const ast = @import("ast.zig");
 
+/// Failure set for every parsing routine.
+///
+/// `UnexpectedToken` is the catch-all for a syntax error the recogniser cannot
+/// continue past (a diagnostic is usually printed to stderr first);
+/// `ExpectedToken` is raised specifically by [`Parser.expect`] when a required
+/// token type is absent; `OutOfMemory` propagates allocator failure. There is
+/// no recovery or resynchronisation: the first error aborts the whole parse.
 const ParserError = error{
     UnexpectedToken,
     ExpectedToken,
     OutOfMemory,
 };
 
-// A compile-time non-negative integer literal, for the `[value; count]` array-repeat count.
+/// Extracts a compile-time non-negative integer from a literal expression, or
+/// null if `e` is not an integer literal (or is negative).
+///
+/// Used to validate the count in an array-repeat literal `[value; N]`, where
+/// `N` must be a constant `usize`. Anything that is not a plain non-negative
+/// integer literal (a variable, a negative number, an expression) yields null so
+/// the caller can reject it. See [`Parser.parsePrimary`].
 fn intLiteralOf(e: ast.Expression) ?usize {
     switch (e.kind) {
         .literal => |lit| switch (lit) {
@@ -20,16 +85,51 @@ fn intLiteralOf(e: ast.Expression) ?usize {
     }
 }
 
+/// The recursive-descent parser and its cursor over a tokenised source file.
+///
+/// One `Parser` is created per compilation unit (and, recursively, one per
+/// string-interpolation fragment, see [`Parser.parseTemplateString`]). It holds
+/// the whole token slice and a single mutable cursor [`Parser.pos`]; the parse
+/// methods advance the cursor and never backtrack destructively, though they do
+/// peek arbitrarily far ahead with raw index lookups (for example the generic
+/// vs less-than disambiguation in [`Parser.parsePostfix`]).
 pub const Parser = struct {
+    /// Allocator backing every AST node, slice, and duped string this parser
+    /// produces. Expected to be an arena owned by the driver; the parser never
+    /// frees individual nodes.
     allocator: std.mem.Allocator,
+    /// The complete token buffer, lexed to EOF in [`Parser.init`]. A few tokens
+    /// are rewritten in place during parsing (for example [`Parser.expectGenericClose`]
+    /// splits a `>>` token into a single `>`), which is why this is a mutable
+    /// slice rather than `[]const`.
     tokens: []lexer.Token,
+    /// Index of the current token in [`Parser.tokens`]. Advanced by
+    /// [`Parser.advance`]; read via [`Parser.current`]/[`Parser.peek`].
     pos: usize,
+    /// Owned copy of the source file path, duped in [`Parser.init`]. Embedded in
+    /// every [`ast.Span`] for diagnostics.
     file_path: []const u8,
+    /// Whether the current compilation target is WebAssembly. Selects which of
+    /// `@wasm { ... }` / `@native { ... }` blocks are parsed into the AST and
+    /// which are brace-skipped. See [`Parser.parseProgram`] and [`Parser.parseStatement`].
     is_wasm: bool,
+    /// The original source text. Token lexemes are slices into this buffer, which
+    /// [`Parser.span`] exploits to recover byte offsets by pointer arithmetic.
     source: []const u8,
 
+    /// Monotonic counter used to mint unique synthetic variable names during
+    /// `for-in` desugaring (`__for_idx_N`, `__for_coll_N`, `__for_keys_N`, ...),
+    /// so nested loops never collide. Incremented by
+    /// [`Parser.desugarCollectionForIn`] and [`Parser.desugarMapForIn`].
     for_counter: usize = 0,
 
+    /// Lexes `source` to completion and returns a ready-to-run parser positioned
+    /// at the first token.
+    ///
+    /// The lexer is driven eagerly to EOF up front (rather than pulled lazily),
+    /// so `tokens` always includes a terminating `.eof` token and every lookahead
+    /// is a bounds-checked array index. `file_path` is duped so the parser owns
+    /// it. Errors only on allocator failure.
     pub fn init(allocator: std.mem.Allocator, source: []const u8, file_path: []const u8, is_wasm: bool) !Parser {
         var lex = lexer.Lexer.init(source);
         var token_list = std.ArrayList(lexer.Token).empty;
@@ -51,23 +151,39 @@ pub const Parser = struct {
         };
     }
 
+    /// Frees the token buffer. Does NOT free the AST or any duped strings, which
+    /// outlive the parser and belong to the caller's arena.
     pub fn deinit(self: *Parser) void {
         self.allocator.free(self.tokens);
     }
 
+    /// The token under the cursor. Safe because the buffer is always
+    /// EOF-terminated, so [`Parser.pos`] can never run past a real token
+    /// without landing on `.eof`.
     fn current(self: *Parser) lexer.Token {
         return self.tokens[self.pos];
     }
 
+    /// The token one position ahead, clamped to the final (EOF) token at the end
+    /// of the buffer so lookahead near end-of-file is always in bounds.
     fn peek(self: *Parser) lexer.Token {
         if (self.pos + 1 < self.tokens.len) return self.tokens[self.pos + 1];
         return self.tokens[self.tokens.len - 1];
     }
 
+    /// Moves the cursor forward one token. No bounds guard: correctness relies on
+    /// the grammar stopping at `.eof`.
     fn advance(self: *Parser) void {
         self.pos += 1;
     }
 
+    /// Consumes the current token if it matches `expected` and reports whether it
+    /// did.
+    ///
+    /// Special-cased for `.identifier`: the keyword `fn` is also accepted as an
+    /// identifier (so `fn` can appear as a value name), whereas [`Parser.expect`]
+    /// additionally tolerates `spawn`. Unlike [`Parser.expect`] this never errors,
+    /// making it the tool for optional-token grammar branches.
     fn match(self: *Parser, expected: lexer.TokenType) bool {
         const current_type = self.current().type;
         if (expected == .identifier) {
@@ -84,6 +200,13 @@ pub const Parser = struct {
         return false;
     }
 
+    /// Consumes the current token, requiring it to be `expected`, else prints a
+    /// diagnostic and returns `error.ExpectedToken`.
+    ///
+    /// The `.identifier` case is deliberately lenient: `spawn` is silently
+    /// accepted as an identifier (so a variable may be named `spawn`), and `fn`
+    /// likewise counts as an identifier. Any other mismatch prints the expected
+    /// vs actual token with line/column before erroring.
     fn expect(self: *Parser, expected: lexer.TokenType) ParserError!void {
         const current_type = self.current().type;
         if (expected == .identifier) {
@@ -105,6 +228,14 @@ pub const Parser = struct {
         self.advance();
     }
 
+    /// Consumes the `>` that closes a generic argument list, splitting a `>>`
+    /// token when necessary.
+    ///
+    /// The lexer greedily forms `>>` (right-shift) as one token, but in nested
+    /// generics such as `List<Map<K, V>>` that same `>>` must close two argument
+    /// lists. This rewrites the current token in place to a single `>` and leaves
+    /// the cursor on it, so the next `expectGenericClose`/`expect(.greater)`
+    /// consumes the second half. This is the reason [`Parser.tokens`] is mutable.
     fn expectGenericClose(self: *Parser) ParserError!void {
         if (self.current().type == .shr) {
             self.tokens[self.pos].type = .greater;
@@ -114,6 +245,15 @@ pub const Parser = struct {
         return self.expect(.greater);
     }
 
+    /// Builds an [`ast.Span`] for the current token, recovering its byte offset
+    /// into the original source.
+    ///
+    /// The offset is derived by pointer arithmetic: a normal token's `lexeme` is
+    /// a sub-slice of [`Parser.source`], so subtracting the base pointer gives the
+    /// start index. When the lexeme pointer is NOT within the source buffer (a
+    /// synthesised or interpolation-fragment token whose text was freshly
+    /// allocated) the offset falls back to 0. Line and column always come
+    /// straight from the token.
     fn span(self: *Parser) ast.Span {
         const tok = self.current();
         const tok_ptr = @intFromPtr(tok.lexeme.ptr);
@@ -131,18 +271,29 @@ pub const Parser = struct {
         };
     }
 
+    /// Heap-allocates a copy of `value` and returns a pointer to it, for AST
+    /// nodes that must be referenced indirectly (branch bodies, boxed
+    /// sub-statements). The allocation is arena-owned and never freed here.
     fn allocStatement(self: *Parser, value: ast.Statement) !*ast.Statement {
         const ptr = try self.allocator.create(ast.Statement);
         ptr.* = value;
         return ptr;
     }
 
+    /// Heap-allocates a copy of `value` and returns a pointer to it. The
+    /// expression tree is a graph of `*ast.Expression`, so almost every operand
+    /// is boxed through here. Arena-owned; never freed here.
     fn allocExpression(self: *Parser, value: ast.Expression) !*ast.Expression {
         const ptr = try self.allocator.create(ast.Expression);
         ptr.* = value;
         return ptr;
     }
 
+    /// Parses either a `{ ... }` block or a single statement, whichever follows.
+    ///
+    /// This is the body form for `if`/`else`/`while`/`for`, which in Nova may be
+    /// braced or a single unbraced statement. A leading `{` is treated as a block
+    /// rather than an object literal in statement position.
     fn parseStatementOrBlock(self: *Parser) ParserError!ast.Statement {
         if (self.current().type == .left_brace) {
             return ast.Statement{ .block = try self.parseBlock() };
@@ -151,9 +302,17 @@ pub const Parser = struct {
         }
     }
 
-    // Copy each trait's DEFAULT-bodied methods onto every struct that impls the trait and does not override
-    // them, so the synthesised methods flow through the normal method machinery (checker, mono, codegen,
-    // vtable). Same-file only for now: the trait and the impl'ing struct must be declared in one module.
+    /// Copies default trait-method bodies into every struct that implements the
+    /// trait but does not override them.
+    ///
+    /// Run once at the end of [`Parser.parseProgram`], when all declarations are
+    /// visible. For each `struct S impl T`, it finds trait `T`, and for every
+    /// method of `T` that has a `default_body` and is not already defined on `S`,
+    /// it synthesises a concrete [`ast.MethodDecl`] on `S` with that body. The
+    /// first parameter, if named `self`, is retyped to a self-reference for `S`
+    /// (generic-aware, via [`Parser.selfTypeRefFor`]) so the copied body type-checks
+    /// against the concrete struct. This is why later passes never need to reason
+    /// about trait defaults: they are already inlined as ordinary methods.
     fn expandTraitDefaults(self: *Parser, decls: []ast.Declaration) ParserError!void {
         for (decls) |*d| {
             if (d.* != .struct_decl) continue;
@@ -170,8 +329,6 @@ pub const Parser = struct {
                     const body = tm.default_body orelse continue;
                     if (structHasMethod(methods.items, tm.name)) continue;
 
-                    // Retype the leading `self` parameter to the impl'ing struct (generic form if the
-                    // struct has type parameters). Non-self params carry over unchanged.
                     const new_params = try self.allocator.alloc(ast.Param, tm.params.len);
                     for (tm.params, 0..) |p, i| {
                         if (i == 0 and std.mem.eql(u8, p.name, "self")) {
@@ -202,6 +359,12 @@ pub const Parser = struct {
         }
     }
 
+    /// Produces the [`ast.TypeRef`] that names `sd` as its own `self` type.
+    ///
+    /// For a non-generic struct this is just its name; for a generic struct it is
+    /// the struct name applied to its own type parameters (`Foo<T, U>`), so a
+    /// copied trait-default `self` parameter refers to the fully parameterised
+    /// type. Helper for [`Parser.expandTraitDefaults`].
     fn selfTypeRefFor(self: *Parser, sd: ast.StructDecl) ParserError!ast.TypeRef {
         if (sd.type_params.len == 0) return ast.TypeRef{ .ident = sd.name };
         const params = try self.allocator.alloc(ast.TypeRef, sd.type_params.len);
@@ -209,6 +372,9 @@ pub const Parser = struct {
         return ast.TypeRef{ .generic = .{ .name = sd.name, .params = params } };
     }
 
+    /// Linear-scans the program's declarations for a trait named `name`, or null
+    /// if none. Used by [`Parser.expandTraitDefaults`] to resolve the trait a
+    /// struct claims to implement.
     fn findTraitDecl(decls: []ast.Declaration, name: []const u8) ?ast.TraitDecl {
         for (decls) |d| {
             if (d == .trait_decl and std.mem.eql(u8, d.trait_decl.name, name)) return d.trait_decl;
@@ -216,6 +382,10 @@ pub const Parser = struct {
         return null;
     }
 
+    /// Reports whether `methods` already contains a method named `name`.
+    ///
+    /// The override guard for [`Parser.expandTraitDefaults`]: a trait default is
+    /// only injected when the struct has not defined a method of the same name.
     fn structHasMethod(methods: []const ast.MethodDecl, name: []const u8) bool {
         for (methods) |m| {
             if (std.mem.eql(u8, m.decl.name, name)) return true;
@@ -223,6 +393,17 @@ pub const Parser = struct {
         return false;
     }
 
+    /// Parses a whole compilation unit into an [`ast.Program`]: the top-level
+    /// entry point.
+    ///
+    /// Loops over top-level items until EOF, skipping stray semicolons. It
+    /// resolves `@wasm`/`@native` target blocks inline (keeping the matching
+    /// target's declarations, brace-skipping the other), tolerates a bare
+    /// top-level call expression such as a macro-like invocation (parsed and
+    /// discarded), and otherwise delegates to [`Parser.parseDeclaration`]. After
+    /// collecting all declarations it runs [`Parser.expandTraitDefaults`] over the
+    /// finished set, so trait defaults are inlined before anyone else sees the
+    /// tree.
     pub fn parseProgram(self: *Parser) ParserError!ast.Program {
         var declarations = std.ArrayList(ast.Declaration).empty;
         defer declarations.deinit(self.allocator);
@@ -282,6 +463,15 @@ pub const Parser = struct {
         };
     }
 
+    /// Parses a run of `@name(...)` attributes preceding a declaration or member.
+    ///
+    /// Recognises the fixed vocabulary Nova supports: `@serializable`, `@test`,
+    /// `@deprecated("note")` (optional string note), `@route("METHOD", "path")`,
+    /// and the shorthand HTTP verbs `@get/@post/@put/@delete("path")` which expand
+    /// to a `route` attribute with the upper-cased verb as the method. String
+    /// arguments are duped into the arena. Unknown attribute names are silently
+    /// consumed (their argument list is not parsed), so an unrecognised bare
+    /// `@name` is skipped rather than rejected.
     fn parseAttributes(self: *Parser) ParserError![]ast.Attribute {
         var attrs = std.ArrayList(ast.Attribute).empty;
         defer attrs.deinit(self.allocator);
@@ -294,7 +484,6 @@ pub const Parser = struct {
             } else if (std.mem.eql(u8, name, "test")) {
                 try attrs.append(self.allocator, .@"test");
             } else if (std.mem.eql(u8, name, "deprecated")) {
-                // FR-safety-6: `@deprecated` or `@deprecated("use parseLong instead")`.
                 var note: ?[]const u8 = null;
                 if (self.match(.left_paren)) {
                     if (self.current().type == .string) {
@@ -331,6 +520,17 @@ pub const Parser = struct {
         return try attrs.toOwnedSlice(self.allocator);
     }
 
+    /// Parses one top-level declaration, dispatching on the leading keyword.
+    ///
+    /// Handles the optional attribute run and `pub`/`export` modifiers first,
+    /// then branches: `fn`/`async fn` and `export fn` and `extern(...) fn` become
+    /// function declarations; `struct`/`class` become a struct decl (a `class` is
+    /// a struct with reference semantics); `union`, `enum`, and the `exception`
+    /// keyword (a tagged enum used as an error type) each map to their decl; a
+    /// bare `identifier` is an error unless it is `exception`; `trait`, `import`,
+    /// and `const` round out the set. `export`-declared functions are marked
+    /// exported regardless of `pub`. Any other leading token is
+    /// `error.UnexpectedToken`.
     fn parseDeclaration(self: *Parser) ParserError!ast.Declaration {
         const attrs = try self.parseAttributes();
         var is_public = false;
@@ -367,18 +567,14 @@ pub const Parser = struct {
                 return ast.Declaration{ .union_decl = ud };
             },
             .keyword_enum => {
-                self.advance(); // consume 'enum'
+                self.advance();
                 var ed = try self.parseEnumDecl(false);
                 ed.attributes = attrs;
                 return ast.Declaration{ .enum_decl = ed };
             },
-            // `exception` is a contextual keyword: at declaration position `exception Name { ... }`
-            // parses like an enum but is marked as an exception (sema then requires describe()).
-            // Everywhere else `exception` is an ordinary identifier (e.g. the `exception` module),
-            // so `import exception;` and variables named `exception` are unaffected.
             .identifier => {
                 if (std.mem.eql(u8, self.current().lexeme, "exception")) {
-                    self.advance(); // consume contextual 'exception'
+                    self.advance();
                     var ed = try self.parseEnumDecl(true);
                     ed.attributes = attrs;
                     return ast.Declaration{ .enum_decl = ed };
@@ -395,10 +591,18 @@ pub const Parser = struct {
         }
     }
 
+    /// Thin indirection to [`Parser.parseImportDecl`], kept as a named seam in the
+    /// [`Parser.parseDeclaration`] dispatch for the `import` case.
     fn import_decl_fallback(self: *Parser) ParserError!ast.ImportDecl {
         return try self.parseImportDecl();
     }
 
+    /// Parses a top-level `const NAME [: Type] = expr;` declaration.
+    ///
+    /// The optional type annotation is parsed and discarded (const type is
+    /// inferred from the value downstream). The span runs from the `const` keyword
+    /// to the terminating token. `is_exported` is always false here; export of a
+    /// const is not expressed through this path.
     fn parseConstDecl(self: *Parser) ParserError!ast.ConstDecl {
         const start_span = self.span();
         try self.expect(.keyword_const);
@@ -425,13 +629,9 @@ pub const Parser = struct {
         };
     }
 
-    // Parse an optional `where` clause (`where T: Show, U: Ord + Clone`) and CAPTURE its bounds. Nova's
-    // generic dispatch is structural, so a USED bound is already enforced when the body calls the bounded
-    // method. Capturing the bounds additionally lets the type checker reject instantiating a bounded type
-    // parameter with a non-conforming concrete type even when the body never calls the method (the unused-
-    // bound case). Returns an empty slice when there is no `where`.
-    // The trait name of a `where`-bound TypeRef: a bare `Trait` (.ident) or a generic trait `Trait<...>`
-    // (.generic -> its base name). Any other shape yields "" and is simply not matched to a known trait.
+    /// Extracts the bare name of a trait reference in a bound, whether written as
+    /// a plain identifier (`Display`) or a generic head (`Into<T>` -> `Into`).
+    /// Anything else yields the empty string. Used by [`Parser.parseWhereClause`].
     fn traitRefName(t: ast.TypeRef) []const u8 {
         return switch (t) {
             .ident => |n| n,
@@ -440,13 +640,18 @@ pub const Parser = struct {
         };
     }
 
+    /// Parses an optional `where T: Trait1 + Trait2, U: Trait3` clause into a list
+    /// of [`ast.WhereBound`].
+    ///
+    /// Returns an empty slice when the next token is not the contextual keyword
+    /// `where` (it is an identifier, not a reserved word). Each comma-separated
+    /// bound names a type parameter and one or more `+`-joined traits; the trait
+    /// names are reduced to bare identifiers via [`Parser.traitRefName`].
     fn parseWhereClause(self: *Parser) ParserError![]const ast.WhereBound {
         if (!(self.current().type == .identifier and std.mem.eql(u8, self.current().lexeme, "where"))) return &.{};
         self.advance();
         var bounds = std.ArrayList(ast.WhereBound).empty;
         while (true) {
-            // The constrained type. Take its bare leading identifier as the type-parameter name (`T` from a
-            // `T` ref); anything more exotic still parses but is not matched to a type parameter below.
             const tp_ref = try self.parseTypeRef();
             const tp_name: []const u8 = switch (tp_ref) {
                 .ident => |n| n,
@@ -470,14 +675,17 @@ pub const Parser = struct {
         return try bounds.toOwnedSlice(self.allocator);
     }
 
+    /// Parses a full function declaration: `[async] fn name[<T,...>](params) [: Ret] [where ...] { body }`.
+    ///
+    /// `is_exported` seeds the exported flag from the caller's `pub`/`export`
+    /// context; additionally an `async pub fn` form is accepted, where `pub`
+    /// appears after `async`, and also marks the function exported. Type
+    /// parameters, parameter type annotations, return type, and where-bounds are
+    /// all optional. Parameters without an explicit type get a null `type_name`
+    /// (inferred later). The span covers keyword through closing brace.
     fn parseFunctionDecl(self: *Parser, is_exported: bool) ParserError!ast.FunctionDecl {
         const start_span = self.span();
         const is_async = self.match(.keyword_async);
-        // Accept BOTH modifier orders: `pub async fn` (the caller consumed `pub` before us and passed
-        // is_exported=true) and `async pub fn` (a `pub` follows `async`, consumed here). Only look for the
-        // trailing `pub` when we just saw `async` and were not already told this is exported, so a normal
-        // `pub fn` / `async fn` never consumes a stray token. The method-declaration path (parseStructDecl)
-        // reads this back via the returned decl's is_exported to set MethodDecl.is_public.
         var exported = is_exported;
         if (!exported and is_async and self.match(.keyword_pub)) exported = true;
         try self.expect(.keyword_fn);
@@ -538,6 +746,12 @@ pub const Parser = struct {
         };
     }
 
+    /// Parses an FFI declaration `extern("lib") fn name(params) [: Ret];`.
+    ///
+    /// The `"lib"` string names the native library to bind against and is stored
+    /// in `extern_lib`. There is no body: the declaration ends at a required
+    /// semicolon and the resulting [`ast.FunctionDecl`] carries an empty block.
+    /// Parameter and return types parse as usual.
     fn parseExternFnDecl(self: *Parser, is_exported: bool) ParserError!ast.FunctionDecl {
         const start_span = self.span();
         try self.expect(.keyword_extern);
@@ -589,6 +803,13 @@ pub const Parser = struct {
         };
     }
 
+    /// Parses a struct constructor body `(params) { body }` into a method named
+    /// `"init"`.
+    ///
+    /// Called after the `init` keyword has already been consumed by
+    /// [`Parser.parseStructDecl`], which passes the `init` token's span so the
+    /// method span starts there. The synthesised function has no return type and
+    /// is not exported; the caller marks it public and instance (non-static).
     fn parseInitializerDecl(self: *Parser, start_span: ast.Span) ParserError!ast.FunctionDecl {
         try self.expect(.left_paren);
 
@@ -630,11 +851,20 @@ pub const Parser = struct {
         };
     }
 
+    /// Parses a `struct` or `class` declaration, including type parameters, trait
+    /// impl list, fields, methods, and `init` constructors.
+    ///
+    /// `class` sets `is_reference` (reference semantics); `struct` is a value
+    /// type. The optional `impl Trait<...>, Trait2` list after the name records
+    /// which traits the type claims, later consumed by
+    /// [`Parser.expandTraitDefaults`]. Inside the body, each member may carry
+    /// attributes and `pub`; a member is a method if it starts with `fn`/`async`,
+    /// a constructor if it starts with `init`, otherwise a `name: Type` field.
+    /// A method whose first parameter is `self` is instance, else static.
+    /// Attributes on a plain field are rejected. The struct span runs from the
+    /// keyword to the closing brace.
     fn parseStructDecl(self: *Parser, is_public: bool) ParserError!ast.StructDecl {
         const start_span = self.span();
-        // `class` = reference type (heap + ARC + identity); `struct` = value type.
-        // See memory-management-refinements.md (M-1/M-2). The bit is recorded here and
-        // ignored by codegen until Slice 3 wires value-type lowering.
         const is_class = (self.current().type == .keyword_class);
         if (is_class) try self.expect(.keyword_class) else try self.expect(.keyword_struct);
         const name = self.current().lexeme;
@@ -701,8 +931,6 @@ pub const Parser = struct {
                     is_static = false;
                 }
                 try methods.append(self.allocator, ast.MethodDecl{
-                    // `field_is_pub` catches `pub` written before `fn`/`async`; `fd.is_exported` catches the
-                    // `async pub fn` order, where parseFunctionDecl consumed the `pub` that follows `async`.
                     .is_public = field_is_pub or fd.is_exported,
                     .is_static = is_static,
                     .decl = fd,
@@ -755,6 +983,11 @@ pub const Parser = struct {
         };
     }
 
+    /// Parses a C-style `union Name { field: Type, ... }` declaration.
+    ///
+    /// A union is a flat list of typed, optionally `pub` fields with no methods,
+    /// no type parameters, and no discriminant (unlike an `enum`, which carries a
+    /// tag and per-variant payloads). Trailing commas are tolerated.
     fn parseUnionDecl(self: *Parser, is_public: bool) ParserError!ast.UnionDecl {
         try self.expect(.keyword_union);
         const name = self.current().lexeme;
@@ -791,9 +1024,20 @@ pub const Parser = struct {
         };
     }
 
-    // The leading keyword (`enum`) or the contextual `exception` identifier has already been consumed
-    // by the caller. `is_exception` marks the result as an exception (an enum the compiler requires to
-    // have a `describe(self): string` method).
+    /// Parses an `enum`/`exception` body into variants and methods.
+    ///
+    /// Called with the `enum` (or `exception`) keyword already consumed, so the
+    /// cursor is on the name. `is_exception` tags the enum as an error type.
+    /// Each variant may take one of four shapes:
+    ///   - bare (`Red`),
+    ///   - explicit integer value (`Red = 1`),
+    ///   - named-field payload (`Point { x: int, y: int }`),
+    ///   - tuple payload (`Pair(int, string)`), stored as positional fields named
+    ///     `_0`, `_1`, ...; a single-element parenthesised type is instead treated
+    ///     as a newtype-style `type_name` rather than a one-field tuple.
+    /// An enum may also declare methods (`fn`/`async fn`), classified static vs
+    /// instance by whether the first parameter is `self`. Attributes on a plain
+    /// variant are rejected.
     fn parseEnumDecl(self: *Parser, is_exception: bool) ParserError!ast.EnumDecl {
         const start_span = self.span();
         const name = self.current().lexeme;
@@ -821,8 +1065,6 @@ pub const Parser = struct {
                     is_static = false;
                 }
                 try methods.append(self.allocator, ast.MethodDecl{
-                    // `is_pub` catches `pub` written before `async`; `fd.is_exported` catches the
-                    // `async pub fn` order, where parseFunctionDecl consumed the `pub` after `async`.
                     .is_public = is_pub or fd.is_exported,
                     .is_static = is_static,
                     .decl = fd,
@@ -866,9 +1108,6 @@ pub const Parser = struct {
                 } else if (self.match(.left_paren)) {
                     const first_type = try self.parseTypeRef();
                     if (self.current().type == .comma) {
-                        // Tuple-form variant with MULTIPLE payloads (`Rect(int, int)`): desugar to positional
-                        // struct fields `_0`, `_1`, ... so it reuses the (working) multi-field payload
-                        // construction and pattern paths. Single-payload `Circle(int)` keeps `type_name`.
                         var payload_fields = std.ArrayList(ast.Field).empty;
                         defer payload_fields.deinit(self.allocator);
                         try payload_fields.append(self.allocator, ast.Field{
@@ -926,6 +1165,15 @@ pub const Parser = struct {
         };
     }
 
+    /// Parses a `trait Name[<T,...>] { ... }` declaration.
+    ///
+    /// Each member is a method signature: `[async] fn name(params) [: Ret]
+    /// [where ...]` followed either by a `{ default body }` (recorded as
+    /// `default_body`, later inlined by [`Parser.expandTraitDefaults`]) or a bare
+    /// `;` for an abstract requirement. The receiver is written as a bare `self`
+    /// parameter with no type annotation, which this recognises specially and
+    /// records with a `self` type-ref. Per-method where-clauses are parsed but
+    /// discarded here.
     fn parseTraitDecl(self: *Parser, is_public: bool) ParserError!ast.TraitDecl {
         try self.expect(.keyword_trait);
         const name = self.current().lexeme;
@@ -982,9 +1230,6 @@ pub const Parser = struct {
 
             const ret_type = if (self.match(.colon)) try self.parseTypeRef() else null;
             _ = try self.parseWhereClause();
-            // A trait method is either a signature (`fn f(self): T;`) or a DEFAULT method with a body
-            // (`fn f(self): T { ... }`). The default is inherited by an impl'ing struct that does not
-            // override it (see expandTraitDefaults).
             var default_body: ?ast.Block = null;
             if (self.current().type == .left_brace) {
                 default_body = try self.parseBlock();
@@ -1012,6 +1257,13 @@ pub const Parser = struct {
         };
     }
 
+    /// Parses `import a.b.c;` into an [`ast.ImportDecl`] whose `module` is the
+    /// dotted path rewritten with `/` separators (`a/b/c`).
+    ///
+    /// Each path segment is normally an identifier, but a purely numeric segment
+    /// is also accepted (some generated module paths contain numbers). The
+    /// assembled slash-path is duped into the arena. The `items` list is always
+    /// empty: selective `import { x } from ...` is not parsed here.
     fn parseImportDecl(self: *Parser) ParserError!ast.ImportDecl {
         try self.expect(.keyword_import);
         var path_buf = std.ArrayList(u8).empty;
@@ -1024,8 +1276,6 @@ pub const Parser = struct {
         while (self.current().type == .dot) {
             self.advance();
             const part = self.current().lexeme;
-            // A path segment is normally an identifier, but a version directory may be a bare
-            // integer (e.g. `import crypto.tls.13.tls;` -> crypto/tls/13/tls.nova).
             if (self.current().type == .integer) {
                 self.advance();
             } else {
@@ -1044,6 +1294,15 @@ pub const Parser = struct {
         };
     }
 
+    /// Parses one "atomic" type: the base before any postfix `?`, `|`, or `[N]`
+    /// suffix that [`Parser.parseTypeRef`] layers on top.
+    ///
+    /// Handles: a leading `&`/`&mut` borrow marker (consumed and ignored, the
+    /// borrowed type is returned as-is); a parenthesised form that is either a
+    /// grouping, a tuple `(A, B)`, or a function type `(A, B) => R` / `(A) -> R`
+    /// depending on whether a `=>`/`->` follows; the variadic `...` spelled as the
+    /// `any` type; and a possibly dotted, possibly generic named type
+    /// (`std.List<T>`), where a trailing `<...>` produces a `generic` type-ref.
     fn parseTypeRefAtom(self: *Parser) ParserError!ast.TypeRef {
         if (self.match(.ampersand)) {
             if (self.current().type == .identifier and std.mem.eql(u8, self.current().lexeme, "mut")) {
@@ -1068,11 +1327,6 @@ pub const Parser = struct {
                     ret_ptr.* = ret;
                     break :blk ast.TypeRef{ .func = .{ .params = try items.toOwnedSlice(self.allocator), .ret = ret_ptr } };
                 } else if (items.items.len == 1) {
-                    // A single parenthesised type is GROUPING, not a one-tuple: `(T)` is just `T`. Building a
-                    // 1-element `.tuple` here made `(int | undefined)` a one-tuple, so `(int | undefined) |
-                    // undefined` became Optional<Tuple<Optional<int>>> and assigning a scalar to it miscompiled
-                    // (SIGSEGV in nova_retain on unbox). A real tuple needs at least two elements. The inner
-                    // TypeRef's nodes are separately allocated, so copying it out before `items.deinit` is safe.
                     break :blk items.items[0];
                 } else {
                     break :blk ast.TypeRef{ .tuple = try items.toOwnedSlice(self.allocator) };
@@ -1107,6 +1361,19 @@ pub const Parser = struct {
 
     }
 
+    /// Parses a full type reference: an atom ([`Parser.parseTypeRefAtom`]) plus any
+    /// chain of postfix modifiers.
+    ///
+    /// The postfix loop applies, in any order:
+    ///   - `| E` union tails, which encode the error/optional model. A `T | undefined`
+    ///     wraps `T` as `optional`; a `T | E` wraps it as an `error_union` with ok
+    ///     and err arms. Only ONE error type is permitted: a second named error
+    ///     (`T | E1 | E2`) prints a spec-referenced diagnostic and errors, because
+    ///     multiple error types must be modelled as one error enum.
+    ///   - `?` optional suffix.
+    ///   - `[N]` fixed-size array suffix (N is a required integer literal).
+    /// Finally, a doubly-wrapped optional (`T??`) is flattened to a single
+    /// optional. See the file header for how this fits the error model.
     fn parseTypeRef(self: *Parser) ParserError!ast.TypeRef {
         var base_type: ast.TypeRef = try self.parseTypeRefAtom();
 
@@ -1141,11 +1408,6 @@ pub const Parser = struct {
                     if (!self.match(.pipe)) break;
                 }
                 if (saw_undefined and base_type != .optional) {
-                    // An optional is idempotent: `(T | undefined) | undefined` is just `T | undefined`.
-                    // Wrapping an already-optional base in another `.optional` builds a double box that
-                    // codegen mis-handles (SIGSEGV on unbox), so collapse it by only wrapping a non-optional
-                    // base. The legit `(T | undefined) | E` triple union is the error_union path below and is
-                    // untouched.
                     const opt_ptr = try self.allocator.create(ast.TypeRef);
                     opt_ptr.* = base_type;
                     base_type = ast.TypeRef{ .optional = opt_ptr };
@@ -1158,11 +1420,6 @@ pub const Parser = struct {
                     base_type = ast.TypeRef{ .error_union = .{ .ok = ok_ptr, .err = err_ptr } };
                 }
             } else if (self.match(.question)) {
-                // FR-safety-1: `T?` is pure sugar for `T | undefined`. It wraps the same .optional node the
-                // union path produces, so `string?` and `string | undefined` are the identical type. A chain
-                // (`T??`) must NOT wrap again: an optional is idempotent, and a double `.optional` builds a
-                // codegen double box that SIGSEGVs on unbox, so collapse `T??` to `T?` by only wrapping a
-                // non-optional base.
                 if (base_type != .optional) {
                     const opt_ptr = try self.allocator.create(ast.TypeRef);
                     opt_ptr.* = base_type;
@@ -1184,12 +1441,6 @@ pub const Parser = struct {
             }
         }
 
-        // Collapse redundant nested optionals: an optional is idempotent, so `(T | undefined) | undefined`,
-        // `T??`, and any parenthesised nesting are all just `T | undefined`. A double `.optional` would build
-        // a value-optional box that holds another box, which codegen unboxes as a raw pointer and SIGSEGVs in
-        // nova_retain. Normalising at this single exit covers every construction path (the union `| undefined`
-        // loop, the `?` sugar, and a parenthesised `(T | undefined)` atom). The legit `(T | undefined) | E`
-        // triple union is an `.error_union`, not a nested `.optional`, so it is untouched.
         while (base_type == .optional and base_type.optional.* == .optional) {
             base_type = base_type.optional.*;
         }
@@ -1197,6 +1448,8 @@ pub const Parser = struct {
         return base_type;
     }
 
+    /// Parses a braced `{ ... }` block into an [`ast.Block`] of statements,
+    /// skipping empty `;` statements. Stops at `}` (required) or EOF.
     fn parseBlock(self: *Parser) ParserError!ast.Block {
         try self.expect(.left_brace);
         var stmts = std.ArrayList(ast.Statement).empty;
@@ -1217,6 +1470,17 @@ pub const Parser = struct {
         };
     }
 
+    /// Parses a single statement, dispatching on the leading keyword.
+    ///
+    /// Covers `let`/`const` bindings, `if`/`while`/`for`/`switch`/`return`,
+    /// `defer`/`errdefer`, `break`/`continue`, bare blocks, and statement-position
+    /// `@wasm`/`@native` target gating (matching-target statements are parsed into
+    /// a block, non-matching ones are brace-skipped to an empty block). Several
+    /// removed constructs are intercepted with teaching errors: `var` (use
+    /// `let`/`const`), and the exception forms `throw`/`catch`/`try { ... }` via
+    /// [`Parser.rejectExceptions`]. A prefix `try expr` in statement position (not
+    /// `try {`) is an ordinary expression statement. Anything else falls through
+    /// to an expression statement.
     fn parseStatement(self: *Parser) ParserError!ast.Statement {
         switch (self.current().type) {
             .keyword_let => return ast.Statement{ .let_stmt = try self.parseLetStmt(false) },
@@ -1297,10 +1561,23 @@ pub const Parser = struct {
         }
     }
 
+    /// Reports whether the token after the cursor is `{`.
+    ///
+    /// Used to distinguish the removed exception form `try { ... }` (rejected)
+    /// from the prefix operator `try expr` in [`Parser.parseStatement`].
     fn peekIsLeftBrace(self: *Parser) bool {
         return self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].type == .left_brace;
     }
 
+    /// Always errors, printing a migration diagnostic for a removed exception
+    /// keyword.
+    ///
+    /// Nova has no exceptions: `throw`/`catch { }`/`try { }` were removed because
+    /// a thrown value was truncated to i32, leaked unwound frames, and longjmp out
+    /// of an async fn is undefined behaviour. Two messages are produced: one for
+    /// `try { ... }` explaining that `try` is a prefix operator on an expression,
+    /// and a general one for the other keywords pointing at the error-value model
+    /// (`fn f(): T | E`). Returns `error.UnexpectedToken` in every case.
     fn rejectExceptions(self: *Parser) ParserError!ast.Statement {
         const tok = self.current();
         const sp = self.span();
@@ -1328,6 +1605,11 @@ pub const Parser = struct {
         return error.UnexpectedToken;
     }
 
+    /// Parses `defer expr;` or, when `is_err` is set, `errdefer expr;`.
+    ///
+    /// `defer` runs its expression on normal scope exit; `errdefer` only on an
+    /// error-propagating exit. The distinction is carried in the `is_err` field of
+    /// the resulting [`ast.DeferStmt`].
     fn parseDeferStmt(self: *Parser, is_err: bool) ParserError!ast.DeferStmt {
         try self.expect(if (is_err) .keyword_errdefer else .keyword_defer);
         const expr = try self.parseExpression();
@@ -1339,6 +1621,14 @@ pub const Parser = struct {
         };
     }
 
+    /// Parses `let`/`const` binding: `let name [: Type] [= expr];` or a
+    /// destructuring `let (a, b) = expr;`.
+    ///
+    /// `is_const` selects the keyword and is recorded on the binding. A
+    /// parenthesised name list produces a tuple destructuring (`names` set, `name`
+    /// empty); a single identifier sets `name` and leaves `names` null. Both the
+    /// type annotation and the initialiser are optional at parse time. The span
+    /// runs from the keyword to the terminating token.
     fn parseLetStmt(self: *Parser, is_const: bool) ParserError!ast.LetStmt {
         const start_span = self.span();
         if (is_const) {
@@ -1384,6 +1674,13 @@ pub const Parser = struct {
         };
     }
 
+    /// Parses `if (cond) then [else ...]`, recursing on `else if` to build a
+    /// right-leaning chain.
+    ///
+    /// The condition is parenthesised. Each branch is a statement-or-block
+    /// ([`Parser.parseStatementOrBlock`]). An `else if` is stored as a nested
+    /// [`ast.IfStmt`] in the else branch; a plain `else` stores its body directly;
+    /// absence of `else` leaves the branch null.
     fn parseIfStmt(self: *Parser) ParserError!ast.IfStmt {
         try self.expect(.keyword_if);
         try self.expect(.left_paren);
@@ -1408,13 +1705,18 @@ pub const Parser = struct {
         };
     }
 
+    /// Parses `while (cond) body`, including the `while (let x = e)` binding form.
+    ///
+    /// The plain form is a direct [`ast.WhileStmt`]. The `while (let x = e)` form
+    /// is DESUGARED here into an infinite `while (true)` whose body first binds
+    /// `let x = e`, then guards `if (x == undefined) break;`, then runs the user
+    /// body. This lets a loop pull an optional each iteration and stop when it
+    /// becomes empty, without a dedicated loop node downstream. The synthesised
+    /// comparison uses the `undefined` literal as the empty sentinel.
     fn parseWhileStmt(self: *Parser) ParserError!ast.WhileStmt {
         try self.expect(.keyword_while);
         try self.expect(.left_paren);
 
-        // `while (let x = expr)` -- optional-binding loop. Iterate while `expr` is present, binding the
-        // narrowed value to `x`. Desugar to `while (true) { let x = expr; if (x == undefined) { break; }
-        // <body> }`, reusing the (already working) guard-break optional narrowing.
         if (self.current().type == .keyword_let) {
             const sp = self.span();
             self.advance();
@@ -1425,7 +1727,6 @@ pub const Parser = struct {
             try self.expect(.right_paren);
             const user_body = try self.parseStatementOrBlock();
 
-            // let x = expr;
             const let_stmt = ast.Statement{ .let_stmt = ast.LetStmt{
                 .name = bind_name,
                 .names = null,
@@ -1434,7 +1735,6 @@ pub const Parser = struct {
                 .is_const = false,
                 .span = sp,
             } };
-            // if (x == undefined) { break; }
             const lhs = try self.allocExpression(ast.Expression{ .kind = .{ .ident = bind_name } });
             const rhs = try self.allocExpression(ast.Expression{ .kind = .{ .literal = .undefined } });
             const cmp = ast.Expression{ .kind = .{ .binary = ast.BinaryExpr{ .left = lhs, .op = .eq, .right = rhs, .span = sp } } };
@@ -1476,6 +1776,12 @@ pub const Parser = struct {
         };
     }
 
+    /// Parses an expression that may be a range `a..b` / `a..=b`, or a plain
+    /// expression if no range operator follows.
+    ///
+    /// Used for the iterable in `for (i in a..b)`. `..=` is inclusive of the end,
+    /// `..` exclusive. When no `..`/`..=` follows, the leading expression is
+    /// returned unchanged, so this is a superset of [`Parser.parseExpression`].
     fn parseRangeOrExpr(self: *Parser) ParserError!ast.Expression {
         const start = try self.parseExpression();
         if (self.current().type == .dot_dot or self.current().type == .dot_dot_eq) {
@@ -1492,12 +1798,35 @@ pub const Parser = struct {
         return start;
     }
 
+    /// Builds a synthetic `recv.method(args)` call expression.
+    ///
+    /// A small AST-construction helper for the `for-in` desugarings, which emit
+    /// calls like `coll.size()`, `coll.at(i)`, `map.keys()`, and `map.get(k)`.
+    /// `recv` is an identifier name, not an arbitrary expression. See
+    /// [`Parser.desugarCollectionForIn`] and [`Parser.desugarMapForIn`].
     fn mkMethodCall(self: *Parser, recv: []const u8, method: []const u8, args: []ast.Expression, sp: ast.Span) ParserError!ast.Expression {
         const obj = try self.allocExpression(.{ .kind = .{ .ident = recv } });
         const callee = try self.allocExpression(.{ .kind = .{ .field_access = .{ .object = obj, .field = method, .span = sp } } });
         return ast.Expression{ .kind = .{ .call = .{ .callee = callee, .args = args, .span = sp } } };
     }
 
+    /// Lowers `for (name in iterable) body` over an indexable collection into an
+    /// index-counted C-style loop.
+    ///
+    /// Emits (conceptually):
+    /// ```
+    /// let __for_coll_N = iterable;              // omitted when iterable is a bare ident
+    /// let __for_idx_N: int = 0;
+    /// for (; __for_idx_N < __for_coll_N.size(); __for_idx_N = __for_idx_N + 1) {
+    ///     let name = __for_coll_N.at(__for_idx_N);
+    ///     body
+    /// }
+    /// ```
+    /// The unique suffix `N` comes from [`Parser.for_counter`] so nested loops do
+    /// not collide. When `iterable` is already a simple identifier the extra
+    /// collection binding is skipped and the identifier is used directly (avoiding
+    /// an evaluation and a copy). Range-based `for` does NOT come here; it stays a
+    /// native iterator node (see [`Parser.parseForStmt`]).
     fn desugarCollectionForIn(self: *Parser, name: []const u8, iterable: ast.Expression, body: ast.Statement, sp: ast.Span) ParserError!ast.Statement {
         const n = self.for_counter;
         self.for_counter += 1;
@@ -1565,6 +1894,21 @@ pub const Parser = struct {
         return for_stmt;
     }
 
+    /// Lowers `for ((k, v) in map) body` into a keys-walk with a per-iteration
+    /// value lookup.
+    ///
+    /// Emits (conceptually):
+    /// ```
+    /// let __for_map_N = map;                    // omitted when map is a bare ident
+    /// let __for_keys_N = __for_map_N.keys();
+    /// for (k in __for_keys_N) {                 // via desugarCollectionForIn
+    ///     let v = __for_map_N.get(k);
+    ///     body
+    /// }
+    /// ```
+    /// The inner key loop is produced by [`Parser.desugarCollectionForIn`], so map
+    /// iteration reduces to collection iteration plus a `get`. As there, a bare
+    /// identifier map skips the intermediate binding.
     fn desugarMapForIn(self: *Parser, k_name: []const u8, v_name: []const u8, iterable: ast.Expression, body: ast.Statement, sp: ast.Span) ParserError!ast.Statement {
         const n = self.for_counter;
         self.for_counter += 1;
@@ -1600,6 +1944,16 @@ pub const Parser = struct {
         return ast.Statement{ .block = .{ .statements = outer, .span = sp } };
     }
 
+    /// Parses every `for` form and routes each to its lowering.
+    ///
+    /// Disambiguates by lookahead inside the `for (...)` header:
+    ///   - `((k, v) in map)` -> [`Parser.desugarMapForIn`];
+    ///   - `(name in iterable)` -> a native range-iterator node when the iterable
+    ///     is a range, otherwise [`Parser.desugarCollectionForIn`];
+    ///   - the classic three-clause `(init; cond; incr)` -> a direct
+    ///     [`ast.ForStmt`], where each clause is independently optional.
+    /// The two `in` forms are detected purely by token pattern before committing,
+    /// which is why the header peeks several tokens ahead.
     fn parseForStmt(self: *Parser) ParserError!ast.Statement {
         try self.expect(.keyword_for);
         try self.expect(.left_paren);
@@ -1679,6 +2033,13 @@ pub const Parser = struct {
         } };
     }
 
+    /// Parses `switch (discr) { case v1, v2 [if guard]: { ... } default: { ... } }`.
+    ///
+    /// A `case` may list several comma-separated match values and carry an
+    /// optional `if guard` predicate; its body is a braced block. A single
+    /// `default:` block is captured separately and terminates the case loop (any
+    /// cases written after it are not parsed). Each case body is boxed as a block
+    /// statement.
     fn parseSwitchStmt(self: *Parser) ParserError!ast.SwitchStmt {
         try self.expect(.keyword_switch);
         try self.expect(.left_paren);
@@ -1706,7 +2067,6 @@ pub const Parser = struct {
                 try values.append(self.allocator, try self.parseExpression());
                 if (!self.match(.comma)) break;
             }
-            // Optional guard: `case v if cond:`.
             var guard: ?ast.Expression = null;
             if (self.current().type == .keyword_if) {
                 self.advance();
@@ -1731,6 +2091,8 @@ pub const Parser = struct {
         };
     }
 
+    /// Parses `return [expr];`. A bare `return;` yields a null value; otherwise the
+    /// expression before the required semicolon is the returned value.
     fn parseReturnStmt(self: *Parser) ParserError!ast.ReturnStmt {
         try self.expect(.keyword_return);
         const value = if (self.current().type != .semicolon) try self.parseExpression() else null;
@@ -1741,10 +2103,12 @@ pub const Parser = struct {
         };
     }
 
+    /// Parses an expression used in statement position.
+    ///
+    /// A trailing semicolon is required for ordinary expressions but OPTIONAL when
+    /// the expression is a JSX element, since `<div/>` at statement level reads
+    /// cleanly without one. The span is taken at the start of the expression.
     fn parseExprStmt(self: *Parser) ParserError!ast.ExprStmt {
-        // Capture the span at the FIRST token of the statement. Using self.span() AFTER expect(.semicolon)
-        // returned the span of the NEXT token (next line) -- a +1 line off-by-one that put breakpoints on
-        // the wrong statement (a `foo();` on line N reported line N+1, colliding with the next statement).
         const start = self.span();
         const expr = try self.parseExpression();
         if (expr.kind != .jsx_element) {
@@ -1758,10 +2122,21 @@ pub const Parser = struct {
         };
     }
 
+    /// The expression entry point. Starts the precedence chain at its loosest
+    /// level, [`Parser.parseAssignment`].
     fn parseExpression(self: *Parser) ParserError!ast.Expression {
         return self.parseAssignment();
     }
 
+    /// Parses assignment, the loosest expression level: plain `=`, compound
+    /// `+= -= *= /= %= &= |= ^= <<= >>=`, and the postfix `catch` handler.
+    ///
+    /// Assignment is right-associative (recurses into itself on the right). A
+    /// compound assignment `a op= b` is DESUGARED to `a = a op b`. The `catch`
+    /// form `expr catch [(e)] handler` binds an error handler to the left
+    /// expression, with an optional error binding name. This is where `catch`
+    /// lives as an expression operator (contrast the removed `catch { }` statement
+    /// rejected by [`Parser.rejectExceptions`]).
     fn parseAssignment(self: *Parser) ParserError!ast.Expression {
         var left = try self.parseLogical();
 
@@ -1826,6 +2201,13 @@ pub const Parser = struct {
         return left;
     }
 
+    /// Parses logical operators and the ternary conditional, one level tighter
+    /// than assignment.
+    ///
+    /// Left-folds `&&`, `||`, and the nullish-coalescing `??` (built from two
+    /// adjacent `?` tokens, since the lexer does not produce a single `??`). After
+    /// the logical chain, a trailing `? then : else` is parsed as a ternary
+    /// [`ast.IfExpr`]. Operands come from [`Parser.parseBitwiseOr`].
     fn parseLogical(self: *Parser) ParserError!ast.Expression {
         var left = try self.parseBitwiseOr();
         while (true) {
@@ -1876,6 +2258,9 @@ pub const Parser = struct {
         return left;
     }
 
+    /// Parses bitwise-or `|`, left-folding over [`Parser.parseBitwiseXor`] operands.
+    /// Note: in TYPE position `|` means a union/error tail (see [`Parser.parseTypeRef`]);
+    /// here it is the value operator.
     fn parseBitwiseOr(self: *Parser) ParserError!ast.Expression {
         var left = try self.parseBitwiseXor();
         while (true) {
@@ -1894,6 +2279,7 @@ pub const Parser = struct {
         return left;
     }
 
+    /// Parses bitwise-xor `^`, left-folding over [`Parser.parseBitwiseAnd`] operands.
     fn parseBitwiseXor(self: *Parser) ParserError!ast.Expression {
         var left = try self.parseBitwiseAnd();
         while (true) {
@@ -1912,6 +2298,9 @@ pub const Parser = struct {
         return left;
     }
 
+    /// Parses bitwise-and `&`, left-folding over [`Parser.parseEquality`] operands.
+    /// A leading `&` is instead a borrow marker handled in [`Parser.parseUnary`];
+    /// this level only sees `&` as an infix operator.
     fn parseBitwiseAnd(self: *Parser) ParserError!ast.Expression {
         var left = try self.parseEquality();
         while (true) {
@@ -1930,6 +2319,8 @@ pub const Parser = struct {
         return left;
     }
 
+    /// Parses equality `==`/`!=`, left-folding over [`Parser.parseComparison`]
+    /// operands.
     fn parseEquality(self: *Parser) ParserError!ast.Expression {
         var left = try self.parseComparison();
         while (true) {
@@ -1958,6 +2349,13 @@ pub const Parser = struct {
         return left;
     }
 
+    /// Parses relational comparison `< > <= >=`, left-folding.
+    ///
+    /// Note the mild asymmetry: the left operand comes from [`Parser.parseShift`]
+    /// but each right operand is parsed at [`Parser.parseAddSub`]. In practice this
+    /// is fine because shift binds tighter than comparison and the loop re-reads
+    /// the next operator, but it means a bare `a < b << c` associates the shift to
+    /// the right operand as expected.
     fn parseComparison(self: *Parser) ParserError!ast.Expression {
         var left = try self.parseShift();
         while (true) {
@@ -1979,6 +2377,8 @@ pub const Parser = struct {
         return left;
     }
 
+    /// Parses bit-shift `<<`/`>>`, left-folding over [`Parser.parseAddSub`]
+    /// operands. Sits between comparison and additive precedence.
     fn parseShift(self: *Parser) ParserError!ast.Expression {
         var left = try self.parseAddSub();
         while (true) {
@@ -2000,6 +2400,7 @@ pub const Parser = struct {
         return left;
     }
 
+    /// Parses additive `+`/`-`, left-folding over [`Parser.parseMulDiv`] operands.
     fn parseAddSub(self: *Parser) ParserError!ast.Expression {
         var left = try self.parseMulDiv();
         while (true) {
@@ -2021,6 +2422,8 @@ pub const Parser = struct {
         return left;
     }
 
+    /// Parses multiplicative `* / %`, the tightest binary level, left-folding over
+    /// [`Parser.parseUnary`] operands.
     fn parseMulDiv(self: *Parser) ParserError!ast.Expression {
         var left = try self.parseUnary();
         while (true) {
@@ -2042,13 +2445,20 @@ pub const Parser = struct {
         return left;
     }
 
+    /// Parses prefix operators, right-recursive so they stack.
+    ///
+    /// Handles: `try expr` (an error-propagating unwrap) and its `try? expr`
+    /// variant, which is desugared to `expr catch undefined` (swallow the error to
+    /// an empty optional); `await expr`; `spawn expr` (fork, yielding a future);
+    /// a prefix `&` borrow marker (consumed, operand returned as-is); numeric
+    /// negation `-`, with a special case that folds `-` into a decimal literal so
+    /// `-1.5` is one negative literal rather than a negate of a positive one;
+    /// logical not `!`; and bitwise not `~`. With no prefix it falls through to
+    /// [`Parser.parsePostfix`].
     fn parseUnary(self: *Parser) ParserError!ast.Expression {
 
         if (self.current().type == .keyword_try) {
             self.advance();
-            // FR-safety-5: `try? e` turns a throwing / error-union call into an optional (the value, or
-            // `undefined` on error). It is pure sugar for `e catch undefined`, which the checker already
-            // types as `T | undefined` and which composes with `??`. Plain `try e` still propagates.
             if (self.match(.question)) {
                 const operand = try self.parseUnary();
                 const undef = try self.allocExpression(ast.Expression{ .kind = .{ .literal = .undefined } });
@@ -2119,6 +2529,21 @@ pub const Parser = struct {
         return self.parsePostfix();
     }
 
+    /// Parses postfix operators that chain off a primary expression.
+    ///
+    /// Loops applying, in any order: call `(args)`; index `[expr]`; member access
+    /// `.field`; tuple/positional access `.0`, lowered to an index expression;
+    /// struct-literal `Name { field: v }` (or `expr.Field { ... }`);
+    /// optional-chaining `?.field`; and the contextual cast `expr as Type`.
+    ///
+    /// The subtle case is a leading `<`: it may open a generic argument list
+    /// (`Vec<int>(...)`, `Box<T> { ... }`, `obj.method<T>(...)`) OR be the
+    /// less-than operator. It scans ahead balancing `<`/`>` (treating `>>` as
+    /// closing two) and bailing at `;`/`{`/`}`, and only commits to a generic
+    /// reading if the matching close is immediately followed by `.`, `{`, or `(`.
+    /// Otherwise the `<` is left for [`Parser.parseComparison`]. Generic forms
+    /// produce a `struct_init`, a `generic_call`, or a `generic_call` on a
+    /// field-access callee depending on what follows the type arguments.
     fn parsePostfix(self: *Parser) ParserError!ast.Expression {
         var expr = try self.parsePrimary();
 
@@ -2130,13 +2555,6 @@ pub const Parser = struct {
                     var is_generic = false;
                     while (look < self.tokens.len and depth > 0) {
                         const t = self.tokens[look];
-                        // A type-argument list cannot contain a statement terminator or a block brace.
-                        // If one appears before the matching `>`, this `<` is a comparison, not a
-                        // generic, and we must stop here rather than run on to a later `>>` (which the
-                        // depth logic below would treat as a close). Without this, `while (i < len) {`
-                        // followed later by an expression like `x >> (…)` was misparsed as a generic
-                        // call. Parentheses are NOT bailed on, because a type argument may be a function
-                        // type such as `Map<string, (int) -> any>`.
                         if (t.type == .semicolon or t.type == .left_brace or t.type == .right_brace) {
                             break;
                         }
@@ -2190,9 +2608,6 @@ pub const Parser = struct {
                             expr = ast.Expression{ .kind = .{ .struct_init = ast.StructInit{
                                 .type_name = type_name,
                                 .fields = try fields.toOwnedSlice(self.allocator),
-                                // F4-1: keep the explicit `<...>` args (was dropped here) so sema can
-                                // bind + validate them. toOwnedSlice empties the list, so the defer
-                                // deinit above is a no-op (same handoff the generic_call branch uses).
                                 .type_args = try type_args.toOwnedSlice(self.allocator),
                                 .span = self.span(),
                             } } };
@@ -2277,7 +2692,6 @@ pub const Parser = struct {
                 },
                 .dot => {
                     self.advance();
-                    // L5/K8: `tuple.N` positional access desugars to `tuple[N]`, reusing the index path.
                     if (self.current().type == .integer) {
                         const n = try self.parseIntLexeme(self.current());
                         const sp = self.span();
@@ -2366,19 +2780,21 @@ pub const Parser = struct {
         return expr;
     }
 
-    // Parse an NSX attribute NAME, which may contain characters no single Nova token covers: hyphens
-    // (`data-on-click`, `hx-get`), colons (`:class`), dots and double-underscores (Datastar modifiers like
-    // `data-on-interval__duration.2s`), and a leading `@` (`@click`). The lexer splits these into several
-    // tokens, so we reconstruct the name by taking the exact source span of the run of ADJACENT tokens
-    // (no whitespace between them) that make up the name. Returns a slice into the original source.
+    /// Reads a JSX attribute name, splicing adjacent tokens that the lexer split
+    /// but that form one hyphenated/namespaced attribute.
+    ///
+    /// JSX attribute names such as `data-on-click`, `xmlns:xlink`, or `@click`
+    /// contain characters (`-`, `:`, `.`, `@`) the lexer tokenises separately. To
+    /// rebuild the original spelling, this concatenates the lexemes of tokens that
+    /// are physically ADJACENT (same line, and each starts exactly where the
+    /// previous ended, checked via line/column arithmetic) and are valid
+    /// name-continuation characters. Any gap or non-continuation token ends the
+    /// name. Returns the assembled buffer (arena-backed).
     fn parseJsxAttrName(self: *Parser) ParserError![]const u8 {
         const first = self.current();
         const ok_start = first.type == .at or first.type == .colon or
             (first.lexeme.len > 0 and (std.ascii.isAlphabetic(first.lexeme[0]) or first.lexeme[0] == '_'));
         if (!ok_start) return error.UnexpectedToken;
-        // Concatenate the lexemes of the adjacent run into a fresh buffer. We cannot take a source-span
-        // slice here: punctuation tokens (`-`, `:`, `.`, `@`) carry STATIC string lexemes, not slices into
-        // the source, so their addresses are unrelated to the surrounding identifier tokens.
         var buf = std.ArrayList(u8).empty;
         try buf.appendSlice(self.allocator, first.lexeme);
         var last = first;
@@ -2386,7 +2802,6 @@ pub const Parser = struct {
         while (true) {
             const t = self.current();
             if (t.line != last.line) break;
-            // adjacency: the next token must start exactly where the previous one ended (no space).
             if (@as(usize, t.column) != @as(usize, last.column) + last.lexeme.len) break;
             const cont = t.type == .minus or t.type == .colon or t.type == .dot or t.type == .at or
                 (t.lexeme.len > 0 and (std.ascii.isAlphanumeric(t.lexeme[0]) or t.lexeme[0] == '_'));
@@ -2398,8 +2813,21 @@ pub const Parser = struct {
         return buf.items;
     }
 
+    /// Parses a JSX/NSX element `<tag attrs>children</tag>` (or self-closing
+    /// `<tag/>`) into a [`ast.JsxElement`] expression.
+    ///
+    /// Attributes are parsed via [`Parser.parseJsxAttrName`] and take a string
+    /// literal, a `{expr}` value, or nothing (boolean-style, stored as empty
+    /// string). The self-closing form is recognised either as a single
+    /// `jsx_self_close` token or as `/` followed by `>`. For a non-self-closing
+    /// element, children are read until the matching close tag: nested `<...>`
+    /// recurse; a `{ ... }` child is parsed as a statement when it begins with a
+    /// statement keyword, else as an expression; and any run of adjacent text
+    /// tokens is coalesced into a single text child, inserting a single space
+    /// wherever the original tokens were not physically adjacent. A close tag whose
+    /// name does not match the open tag errors, as does EOF before the close.
     fn parseJsxElement(self: *Parser) ParserError!ast.Expression {
-        const start_span = self.span(); // the opening `<` -- the element's true source line (for debug info)
+        const start_span = self.span();
         try self.expect(.less);
         var tag: []const u8 = "";
         if (self.current().type == .identifier) {
@@ -2429,8 +2857,6 @@ pub const Parser = struct {
                     return error.UnexpectedToken;
                 }
             } else {
-                // Valueless boolean attribute (readonly, selected, checked, disabled, open, required...).
-                // Emitted as name="" which HTML treats as present, so it round-trips correctly.
                 val = ast.JsxAttributeValue{ .string_literal = "" };
             }
             try attributes.append(self.allocator, ast.JsxAttribute{
@@ -2499,12 +2925,6 @@ pub const Parser = struct {
                         try children.append(self.allocator, ast.JsxChild{ .expression = child_expr });
                     }
                 } else {
-                    // Accumulate a RUN of text tokens into a single text child, preserving the spacing
-                    // between words. The lexer drops whitespace and emits separate tokens ("Node",
-                    // "information"), so joining lexemes directly would give "Nodeinformation". We insert a
-                    // single space wherever the source had a gap between tokens (detected by column), which
-                    // is exactly HTML's own whitespace-collapsing rule. Lexemes are used by value, since
-                    // punctuation tokens carry static lexemes rather than source slices.
                     var buf = std.ArrayList(u8).empty;
                     var prev_end_line: usize = 0;
                     var prev_end_col: usize = 0;
@@ -2535,6 +2955,18 @@ pub const Parser = struct {
         } } };
     }
 
+    /// Parses a primary expression: the atoms at the bottom of the precedence
+    /// chain.
+    ///
+    /// Dispatches on the leading token to produce: a JSX element (leading `<`);
+    /// an `if cond [then] a else b` expression form; the `@Cast(Type, value)`
+    /// built-in cast (leading `@`); literals (int/float/decimal/string/bool/char);
+    /// template and interpolated strings; a parenthesised expression that may be a
+    /// grouping, a tuple, or an arrow closure `(params) => body` (chosen by
+    /// scanning for a `=>` after the balanced `)`); array and array-repeat
+    /// literals `[a, b]` / `[v; N]`; object literals `{ k: v }`; the `undefined`
+    /// and `null` sentinels; a struct-init `Name { ... }`; and bare identifiers.
+    /// An unrecognised leading token prints a diagnostic and errors.
     fn parsePrimary(self: *Parser) ParserError!ast.Expression {
         if (self.current().type == .less) {
             return try self.parseJsxElement();
@@ -2677,7 +3109,6 @@ pub const Parser = struct {
                 defer elems.deinit(self.allocator);
                 if (self.current().type != .right_bracket) {
                     const first = try self.parseExpression();
-                    // `[value; count]` repeat-init: count must be a compile-time integer literal.
                     if (self.current().type == .semicolon) {
                         self.advance();
                         const count_expr = try self.parseExpression();
@@ -2771,14 +3202,14 @@ pub const Parser = struct {
         }
     }
 
-    // Parse an integer-literal lexeme, honoring a 0x/0b/0o radix prefix (decimal otherwise). The
-    // radix forms are read as u64 and bit-cast to i64 so the whole 64-bit range is expressible (for
-    // example 0xffffffffffffffff is -1), while a plain decimal keeps its signed base-10 value.
-    // Parse an integer literal token to its 64-bit value. An out-of-range literal is a HARD ERROR, not a
-    // silent 0 (the previous `catch 0` turned `9999999999999999999` into 0 -- silent data loss). Hex / binary
-    // / octal literals keep their bit pattern up to u64 (so masks like `0xFFFFFFFFFFFFFFFF` work); a decimal
-    // literal must fit signed i64, with the single exception of 2^63 (`9223372036854775808`), the magnitude
-    // of i64 MIN, stored as its bit pattern so `-9223372036854775808` yields i64 MIN.
+    /// Parses an integer literal token into an `i64`, honouring base prefixes and
+    /// full 64-bit range.
+    ///
+    /// Recognises `0x`/`0b`/`0o` prefixes (parsed as `u64` then bit-cast to `i64`,
+    /// so `0xFFFFFFFFFFFFFFFF` is representable as `-1`); otherwise base-10. The
+    /// exact value `9223372036854775808` (i64::MAX + 1) is special-cased so it can
+    /// be the operand of a later unary minus to spell `i64::MIN`. Out-of-range or
+    /// unparseable literals go through [`Parser.intOutOfRange`].
     fn parseIntLexeme(self: *Parser, token: lexer.Token) ParserError!i64 {
         const lexeme = token.lexeme;
         if (lexeme.len > 2 and lexeme[0] == '0') {
@@ -2801,6 +3232,13 @@ pub const Parser = struct {
         }
     }
 
+    /// Prints an out-of-range diagnostic for an integer literal and returns
+    /// `error.UnexpectedToken`.
+    ///
+    /// The return type is the error itself (not an error union), so callers write
+    /// `return self.intOutOfRange(token)` at a point where only failure is
+    /// possible. Message states the valid i64 decimal range and the unsigned
+    /// hex/bin/oct ceiling.
     fn intOutOfRange(self: *Parser, token: lexer.Token) ParserError {
         std.debug.print(
             "Parser error: {s}:{}:{}: integer literal '{s}' is out of range for a 64-bit integer (i64: -9223372036854775808..9223372036854775807; hex/bin/oct up to 0xFFFFFFFFFFFFFFFF).\n",
@@ -2809,6 +3247,15 @@ pub const Parser = struct {
         return error.UnexpectedToken;
     }
 
+    /// Parses a scalar literal token into an [`ast.Literal`].
+    ///
+    /// Integers go through [`Parser.parseIntLexeme`]; floats parse to `f64`
+    /// (falling back to `0.0` on a malformed lexeme rather than erroring);
+    /// decimals keep their textual lexeme (exact decimal type); strings borrow the
+    /// lexeme; booleans map directly. A char literal is decoded to its integer
+    /// code point: surrounding quotes are stripped and a leading `\` escape
+    /// (`\n \r \t \\ \' \" \0`) is resolved, otherwise the first byte is taken.
+    /// Any other token type degrades to a `null` literal.
     fn parseLiteral(self: *Parser) ParserError!ast.Literal {
         const token = self.current();
         self.advance();
@@ -2847,6 +3294,19 @@ pub const Parser = struct {
         };
     }
 
+    /// Parses a backtick template string ``` `text ${expr} more` ``` into a
+    /// [`ast.TemplateExpr`] of alternating literal and embedded-code parts.
+    ///
+    /// The raw inner text is scanned for `${ ... }` holes (brace-depth balanced so
+    /// nested braces inside an interpolation are handled). Literal runs between
+    /// holes become string-literal parts (duped into the arena). Each hole's source
+    /// is re-parsed with a FRESH nested [`Parser`] over just that fragment: if the
+    /// fragment looks like statements (starts with `for`/`while`/`switch`/`let` or
+    /// contains a `;`) it is parsed as a statement sequence wrapped in a
+    /// `block_expr`, otherwise as a single expression. An unterminated `${` is kept
+    /// as literal text. Shares its structure with
+    /// [`Parser.parseInterpolatedString`]; the only difference is the `${`
+    /// vs `{` hole delimiter.
     fn parseTemplateString(self: *Parser, lexeme: []const u8) ParserError!ast.Expression {
         var parts = std.ArrayList(ast.Expression).empty;
         defer parts.deinit(self.allocator);
@@ -2892,9 +3352,6 @@ pub const Parser = struct {
 
                     const trimmed = std.mem.trim(u8, sub_source, " \t\r\n");
                     const is_stmt = blk: {
-                        // A bare `${if (c) a else b}` is an if-EXPRESSION (it yields the interpolated value),
-                        // so `if` is NOT treated as a statement here -- `parseExpression` handles it. A
-                        // multi-statement body still routes to the block path via its `;`.
                         if (std.mem.startsWith(u8, trimmed, "for") or
                             std.mem.startsWith(u8, trimmed, "while") or
                             std.mem.startsWith(u8, trimmed, "switch") or
@@ -2940,6 +3397,13 @@ pub const Parser = struct {
         } } };
     }
 
+    /// Parses an interpolated string with bare `{ ... }` holes into a
+    /// [`ast.TemplateExpr`].
+    ///
+    /// Identical in structure to [`Parser.parseTemplateString`] but the hole
+    /// delimiter is a single `{` rather than `${`: literal runs, brace-balanced
+    /// hole extraction, per-hole nested parsing (statement block vs expression by
+    /// the same heuristic), and unterminated-hole-as-literal handling all match.
     fn parseInterpolatedString(self: *Parser, lexeme: []const u8) ParserError!ast.Expression {
         var parts = std.ArrayList(ast.Expression).empty;
         defer parts.deinit(self.allocator);
@@ -2985,9 +3449,6 @@ pub const Parser = struct {
 
                     const trimmed = std.mem.trim(u8, sub_source, " \t\r\n");
                     const is_stmt = blk: {
-                        // A bare `${if (c) a else b}` is an if-EXPRESSION (it yields the interpolated value),
-                        // so `if` is NOT treated as a statement here -- `parseExpression` handles it. A
-                        // multi-statement body still routes to the block path via its `;`.
                         if (std.mem.startsWith(u8, trimmed, "for") or
                             std.mem.startsWith(u8, trimmed, "while") or
                             std.mem.startsWith(u8, trimmed, "switch") or

@@ -1,8 +1,3 @@
-// A4: interpolating a NON-narrowed optional printed the raw box pointer (`v=*0x...`) instead of the value.
-// The template stringifier only handled string/prim/decimal parts and appended the box pointer for an
-// `.optional`. It now renders a value-optional's inner value when present and "undefined" when absent, and a
-// heap-optional string likewise. Narrowing first (`x ?? d`, or an `if (x != undefined)` guard) already
-// worked and still does.
 
 import assert;
 

@@ -1,5 +1,4 @@
 import shape_a;
-// Module B: same-named payload enum Shape with DIFFERENT variants; imports A's Shape.
 pub enum Shape { Tri(int), Rect(int), Pent(int)
     pub fn area(self: Shape): int {
         switch (self) {

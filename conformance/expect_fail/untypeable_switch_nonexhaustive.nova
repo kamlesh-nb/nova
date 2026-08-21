@@ -1,8 +1,3 @@
-// NEGATIVE test: must FAIL to compile (at type-check).
-// Exhaustiveness is enforced EVEN WHEN the switch discriminant's type cannot be resolved. `l[0]` is an
-// `.index` expression that resolveExprType does not type, so the discriminant is untypeable; the checker
-// recovers the enum from the case values (`Color.Red`/`Color.Green`) and reports the missing `Blue`. Before
-// the fix this switch fell through the fail-open edge and skipped exhaustiveness entirely.
 import list;
 enum Color { Red, Green, Blue }
 @test

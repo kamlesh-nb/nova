@@ -1,6 +1,3 @@
-// Fixture module for 264_xmod_const_string.nova — provides cross-module `pub const`
-// string values so the case can exercise module-qualified const typing. Not a test
-// itself (no @test); the harness runs it as a trivial passing case.
 pub const GREETING: string = "hello ";
 pub const WORLD: string = "world";
 pub const COUNT: int = 3;

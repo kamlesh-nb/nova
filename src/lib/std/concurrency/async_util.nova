@@ -2,15 +2,6 @@
 import list;
 import bytes;
 
-// Async combinator surface over the reactor. IMPORTANT: whenAny / whenAnyDeadline are compiler
-// intrinsics: `await whenAny(buf, n)` is intercepted in codegen (expressions.zig) and lowered to the
-// runtime nova_when_any(buf, n, self), passing the current coroutine handle as `self`. The `return 0`
-// bodies below are DEAD placeholders that only satisfy the type checker; they never run when the call
-// is awaited. Do not call them without `await`.
-//
-// `buf` is a heap ADDRESS, so it must be `long` -- typing it `int` and passing `buf as int` used to
-// work only because a narrowing cast was a codegen no-op. Now that `long as int` truncates honestly,
-// the address must stay 64-bit end to end (see the "addresses must be long" gotcha).
 pub fn whenAny(buf: long, n: int): int { return 0; }
 
 pub async fn selectAny<T>(fs: List<future<T>>): int {
@@ -45,12 +36,6 @@ pub async fn withTimeout<T>(fut: future<T>, ms: int): int {
     return idx;
 }
 
-// Join all futures and collect their results in order. This IS concurrent: the futures were already
-// started by `spawn`, so they run interleaved on the reactor while this awaits them; awaiting them in
-// sequence only serialises RESULT COLLECTION, not the work. Total wait is the slowest future, not the
-// sum. The parallel-for idiom is: spawn each unit in a loop into a List<future<T>>, then when_all it.
-// (A generic `parallel_for(n, body)` helper is not expressible today because `spawn` requires a direct
-// named-async-fn call, not a function value; the spawn-loop + when_all above is the supported form.)
 pub async fn when_all<T>(fs: List<future<T>>): List<T> {
     let out = List<T>();
     let i = 0;
@@ -61,11 +46,6 @@ pub async fn when_all<T>(fs: List<future<T>>): List<T> {
     return out;
 }
 
-// HETEROGENEOUS join (the `join!`-style combinator): await two or three futures of DIFFERENT types and
-// return their results as a tuple. `when_all` only handles a homogeneous `List<future<T>>`; these let you
-// await `future<A>` and `future<B>` together and keep each result's own type. Spawn the tasks first, then
-// join, e.g. `let (a, b) = await join2<A, B>(spawn fa(), spawn fb());`. Instantiate at concrete type args so
-// the generic async coroutine schedules (a bare erased-arg call would fall to the handle path).
 pub async fn join2<A, B>(fa: future<A>, fb: future<B>): (A, B) {
     let a = await fa;
     let b = await fb;

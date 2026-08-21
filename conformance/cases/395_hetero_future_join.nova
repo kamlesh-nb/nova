@@ -1,6 +1,3 @@
-// A2: the HETEROGENEOUS future combinator (`join!`-style). `when_all` joins a homogeneous
-// `List<future<T>>`; `join2`/`join3` await futures of DIFFERENT types together and return a tuple, each
-// result keeping its own type. Spawn first, then join.
 import concurrency.async_util;
 import assert;
 

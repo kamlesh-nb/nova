@@ -1,31 +1,26 @@
-// 166 — optional chaining `a?.b` (specs §6.5). Short-circuit field access: `undefined` object ⇒
-// `undefined` result, else `a.b`; result is `TypeOf(b) | undefined`. Was parsed + checked but had NO
-// codegen (threw UnsupportedExpression). Now: infer types it `optional(fieldType)`, codegen emits a
-// null-check + branch + phi, VALUE fields box (V1) so a present 0 ≠ absent, and the box is drained
-// (reference fields stay borrowed). `a` is evaluated once. Covers present/absent/present-0/chained.
 import assert; import string;
 struct Profile { pub name: string, pub age: int }
 struct User { pub profile: Profile | undefined }
 @test
 fn test_chain_present(): void {
   let u = User{ profile: Profile{ name: "Ada", age: 36 } };
-  assert.equalStr(u.profile?.name ?? "none", "Ada");     // string field
-  assert.equalInt(u.profile?.age ?? -1, 36);             // int field
+  assert.equalStr(u.profile?.name ?? "none", "Ada");
+  assert.equalInt(u.profile?.age ?? -1, 36);
 }
 @test
 fn test_chain_absent(): void {
   let u = User{ profile: undefined };
-  assert.equalStr(u.profile?.name ?? "none", "none");    // absent -> default
+  assert.equalStr(u.profile?.name ?? "none", "none");
   assert.equalInt(u.profile?.age ?? -1, -1);
 }
 @test
 fn test_present_zero(): void {
   let u = User{ profile: Profile{ name: "Z", age: 0 } };
-  assert.equalInt(u.profile?.age ?? -1, 0);              // present 0 must NOT read as absent (V1)
+  assert.equalInt(u.profile?.age ?? -1, 0);
 }
 @test
 fn test_multilevel(): void {
   let u = User{ profile: Profile{ name: "Bob", age: 5 } };
-  let n = u.profile?.name;                                // bind the optional, then coalesce
+  let n = u.profile?.name;
   assert.equalStr(n ?? "x", "Bob");
 }

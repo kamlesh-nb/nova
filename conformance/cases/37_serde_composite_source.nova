@@ -1,20 +1,3 @@
-// Gates `CompositeSource` — the §6 KEEPER from the mediator working-tree split.
-//
-// A ValueSource that overlays a PRIMARY source on a SECONDARY: for each key, the primary wins
-// when it `has` the key, else it falls through to the secondary. In the framework this is route
-// params (`@fromRoute`) over a body source (`@fromBody`), so a generated `<T>__bind(src)`
-// deserializer can read a request whose fields come from two places without knowing which.
-//
-// Gated on its own because the framework layer above it is being rewritten: §6 marks the
-// string-keyed `app.get<T>` / `App.addRoute` / `registerFor` design REJECTED while naming
-// CompositeSource a keeper. A keeper with no case is a keeper by assertion; this one outlives the
-// design that produced it.
-//
-// ⚠️ CONTRACT NOTE, verified by reading the source: `getString` returns `""` on a miss, not
-// `undefined` — it conflates absence with empty (same as ParamSource, `params.get(key) ?? ""`).
-// So the "missing" test below asserts `""`, NOT a fallback via `??`. That absence/empty conflation
-// is a real design smell (it's the §3.4b distinction the error model is built on), but it is the
-// trait's deliberate contract today, not a bug — the gate pins what IS, and flags the smell here.
 import assert;
 import serde.source;
 import map;
@@ -27,7 +10,6 @@ fn test_primary_wins_when_present(): void {
     let body = Map<string, string>(8, string.hash);
     body.set("id", "999");
     let cs = CompositeSource(ParamSource(route), ParamSource(body));
-    // The overlay is the whole point: the primary source beats the secondary for the same key.
     assert.equalStr(cs.getString("id"), "42");
 }
 
@@ -46,7 +28,6 @@ fn test_missing_in_both_is_empty(): void {
     let route = Map<string, string>(8, string.hash);
     let body = Map<string, string>(8, string.hash);
     let cs = CompositeSource(ParamSource(route), ParamSource(body));
-    // NOT `?? fallback`: getString returns "" on a miss (see the contract note above).
     assert.equalStr(cs.getString("nope"), "");
 }
 

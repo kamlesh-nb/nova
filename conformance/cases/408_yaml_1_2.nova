@@ -1,6 +1,3 @@
-// YAML 1.2 parser: a real block+flow parser (was a line-flattening config subset). Exercises anchors &
-// aliases, merge keys, flow style, block scalars (| and >), quoted scalars with escapes, core-schema tags,
-// nested sequences-of-mappings, and multi-document streams.
 import serde.yaml;
 import assert;
 
@@ -21,7 +18,6 @@ fn block_mapping_and_nested() {
 
 @test
 fn sequence_of_mappings() {
-    // The dash line carries the first key; following keys align under it.
     let y = "items:\n  - id: 1\n    name: one\n  - id: 2\n    name: two\n";
     let items = yaml.asArray(yaml.get(yaml.parse(y), "items")) ?? List<yaml.YamlValue>();
     assert.equalInt(2, items.size());
@@ -45,7 +41,6 @@ fn anchors_and_aliases() {
     let y = "defaults: &d\n  timeout: 30\n  retries: 3\nservice:\n  <<: *d\n  name: web\n";
     let v = yaml.parse(y);
     let svc = yaml.get(v, "service");
-    // Merge key brought timeout+retries in; name is the service's own.
     assert.equalInt(30, nOf(yaml.get(svc, "timeout")));
     assert.equalInt(3, nOf(yaml.get(svc, "retries")));
     assert.equalInt(1, if (sOf(yaml.get(svc, "name")) == "web") 1 else 0);
@@ -55,8 +50,8 @@ fn anchors_and_aliases() {
 fn merge_does_not_override_own_keys() {
     let y = "base: &b\n  port: 80\n  host: base\nover:\n  <<: *b\n  host: mine\n";
     let over = yaml.get(yaml.parse(y), "over");
-    assert.equalInt(80, nOf(yaml.get(over, "port")));            // inherited
-    assert.equalInt(1, if (sOf(yaml.get(over, "host")) == "mine") 1 else 0);  // own key wins over merge
+    assert.equalInt(80, nOf(yaml.get(over, "port")));
+    assert.equalInt(1, if (sOf(yaml.get(over, "host")) == "mine") 1 else 0);
 }
 
 @test
@@ -69,7 +64,6 @@ fn alias_scalar() {
 
 @test
 fn block_scalars() {
-    // Literal | keeps newlines; folded > joins lines with spaces. Both clip to one trailing newline.
     let y = "lit: |\n  line1\n  line2\nfold: >\n  a\n  b\n";
     let v = yaml.parse(y);
     assert.equalInt(1, if (sOf(yaml.get(v, "lit")) == "line1\nline2\n") 1 else 0);
@@ -83,7 +77,6 @@ fn quoted_scalars_and_escapes() {
     assert.equalInt(1, if (sOf(yaml.get(v, "d")) == "a\tb\nc") 1 else 0);
     assert.equalInt(1, if (sOf(yaml.get(v, "s")) == "it's ok") 1 else 0);
     assert.equalInt(1, if (sOf(yaml.get(v, "colon")) == "a: b") 1 else 0);
-    // \u unicode escape -> UTF-8 bytes (U+00E9 = 'é' = 0xC3 0xA9); \x hex byte.
     let u = yaml.parse("e: \"caf\\u00e9\"\n");
     assert.equalInt(1, if (sOf(yaml.get(u, "e")) == "café") 1 else 0);
 }
@@ -93,7 +86,6 @@ fn comments_and_tags() {
     let y = "# leading comment\nname: web   # inline comment\ncount: !!str 5\n";
     let v = yaml.parse(y);
     assert.equalInt(1, if (sOf(yaml.get(v, "name")) == "web") 1 else 0);
-    // !!str forces the 5 to be a string, not a number.
     assert.equalInt(1, if (sOf(yaml.get(v, "count")) == "5") 1 else 0);
 }
 

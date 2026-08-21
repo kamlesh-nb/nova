@@ -1,9 +1,3 @@
-// Flagship: the typed-mediator routing DX via the STDLIB Router (web/routing.nova).
-// `app.get<GetUser>(path)` is lowered by codegen to `app.__addRoute("GET", path,
-// "GetUser")`; the compiler-generated `__mediator_dispatch_by_name` runs the
-// discovered handler's bind → handle → serialize pipeline. Zero handler
-// registration, zero `any`, zero downcast — RequestHandler + Router come from the
-// stdlib, the user writes only handlers + `app.get<T>(...)`.
 import assert;
 import web.routing;
 import serde.source;

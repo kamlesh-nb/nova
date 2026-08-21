@@ -1,9 +1,8 @@
-// switch over enum values, including payload-binding variants.
 enum Shape { Circle(int), Square(int), Point }
 
 fn area(s: Shape): int {
     switch (s) {
-        case Shape.Circle(r): { return 3 * r * r; }   // binds the payload r
+        case Shape.Circle(r): { return 3 * r * r; }
         case Shape.Square(side): { return side * side; }
         case Shape.Point: { return 0; }
     }

@@ -1,57 +1,23 @@
-// net/reactor: a per-core readiness event loop for the self-hosted runtime
-// (docs/design/self-hosted-runtime.md, phase 4). This is the share-nothing thread-per-core
-// model (Seastar, glommio): one Reactor per core owns its kqueue, its read-buffer slab pool,
-// and its connections, with no shared state. On macOS and BSD the backend is kqueue (os/kqueue);
-// the Linux epoll backend (os/epoll) plugs in behind the same shape.
-//
-// The reactor is deliberately readiness-driven and allocation-free on the hot path: interest is
-// registered once per fd, poll() blocks until fds are ready, and each ready fd is read into a
-// recycled slab block. The udata token carried on each event is where a connection state pointer
-// (later, a coroutine handle) rides, so the loop can find the right connection in O(1) with no
-// map lookup and no lock.
 
 import bytes;
 import io.slab;
 import net.eventloop;
 
-// Run `n` share-nothing reactor threads, each invoking `worker(reactorIndex)`. The typed closure
-// param boxes a named worker fn correctly at the call site; the runtime spawns the OS threads and
-// blocks until they return (a server's workers loop forever). Each worker sets up its own reactor
-// and SO_REUSEPORT listener, so there is no shared state across cores.
 pub fn runReactors(n: int, worker: (int) -> void): void {
     nova_run_reactors(n, worker);
 }
 
-// The current thread's reactor identity (its kqueue fd), share-nothing per reactor thread. A reactor
-// worker calls setCurrent(kq) once so code running on the thread (e.g. a database driver opening a
-// connection deep in its call stack) can build a reactor-native stream via currentKq() without the
-// reactor being threaded through every call. Returns 0 off a reactor thread (Asio or the main
-// thread), which is the signal to use the Asio I/O path.
 pub fn setCurrent(kq: int): void { nova_reactor_set_current(kq as long); }
 pub fn currentKq(): int { return nova_reactor_current() as int; }
 
-// Call once per poll batch, before resuming the batch's ready coroutines. It lets the runtime skip a
-// stale event (e.g. a read-deadline timer) for a coroutine reaped earlier in the same batch, instead
-// of resuming its freed frame. Required by any loop that uses read deadlines (recvIntoDeadline).
 pub fn batchBegin(): void { nova_reactor_batch_begin(); }
 
-// Cross-reactor wakeup (M4 keystone). A reactor registers under a small index with its kqueue
-// (registerWake); another thread hands it a coroutine handle and wakes its blocking poll (post);
-// the reactor drains the handles it was posted (drainWake) when its poll reports an EVFILT_USER
-// event (readyFilter(i) == evfiltUser()). This is what lets a coroutine scheduled on one reactor
-// thread be resumed on the reactor that owns it, i.e. cross-thread channels and actors without Asio.
 pub fn registerWake(self: Reactor, idx: int): void { nova_reactor_wake_register(idx as long, self.kq as long); }
 pub fn post(idx: int, handle: long): void { nova_reactor_post(idx as long, handle); }
 pub fn drainWake(idx: int): long { return nova_reactor_drain_one(idx as long); }
 pub fn readyFilter(self: Reactor, i: int): int { return eventloop.evFilterAt(self.loop.eventBuf, i); }
 pub fn evfiltUser(): int { return nova_evfilt_user() as int; }
 
-// The per-core reactor is now a driver over a completion-based EventLoop backend (net/eventloop,
-// selected per target: KqueueLoop / EpollLoop / IocpLoop). The completion API (submitOp / pollComplete /
-// completedToken) is the go-forward async I/O path used by reactorio, web/app, and the async cases. The
-// readiness API (addRead / poll / readyToken / readyFd / readyBytes) is retained for the low-level cases
-// that test the raw readiness primitive (192/194/195), the read-deadline path (208), and the
-// cross-reactor wake (210); those will convert later, after which the readiness surface is removed.
 pub struct Reactor {
     pub loop: eventloop.Poller,
     pub kq: int,
@@ -67,18 +33,10 @@ pub struct Reactor {
 
     pub fn ok(self: Reactor): bool { return self.kq >= 0; }
 
-    // --- completion API (go-forward async I/O seam) ---------------------------------------------------
-    // Submit an in-flight op (address of an eventloop.OP_SIZE record). See net/eventloop.
     pub fn submitOp(self: Reactor, op: long): int { return self.loop.submit(op); }
-    // Block up to timeoutMs and complete ready ops; returns the number completed this batch.
     pub fn pollComplete(self: Reactor, timeoutMs: int): int { return self.loop.poll(timeoutMs); }
-    // The coroutine token to resume for the i-th ready item of the last pollComplete (the coroutine reads
-    // its own op result). Uniform across I/O completions and timer/wake events.
     pub fn completedToken(self: Reactor, i: int): long { return self.loop.completedToken(i); }
 
-    // --- readiness API (legacy; kept for low-level 192/194/195, deadline 208, wake 210) --------------
-    // Delegates to the backend-neutral readiness wrappers in net/eventloop so this file has no direct
-    // kqueue/epoll dependency and compiles on every target.
     pub fn addRead(self: Reactor, fd: int, token: long): int { return eventloop.armRead(self.kq, fd, token); }
     pub fn delRead(self: Reactor, fd: int): int { eventloop.cancelRead(self.kq, fd); return 0; }
     pub fn addWrite(self: Reactor, fd: int, token: long): int { return eventloop.armWrite(self.kq, fd, token); }
@@ -91,13 +49,12 @@ pub struct Reactor {
     pub fn readyBytes(self: Reactor, i: int): long { return eventloop.evBytes(self.loop.eventBuf, i); }
     pub fn readyEof(self: Reactor, i: int): bool { return eventloop.evEof(self.loop.eventBuf, i); }
 
-    // Borrow a read buffer from the pool (payload address), and return it when done.
     pub fn getBuffer(self: Reactor): long { return self.pool.acquire(); }
     pub fn putBuffer(self: Reactor, buf: long): void { self.pool.release(buf); }
 
     pub fn destroy(self: Reactor): void {
         self.pool.destroy();
-        self.loop.destroy();   // frees event/completion buffers and closes the kq
+        self.loop.destroy();
         self.kq = -1;
     }
 }

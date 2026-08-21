@@ -1,6 +1,3 @@
-// W2: static file serving — an LRU cache in front of a filesystem directory, mounted on
-// the web App. `app.useStatic(prefix, dir)` serves files under the URL prefix, deriving
-// Content-Type from the extension, rejecting path traversal, and caching hot files.
 import assert;
 import string;
 import io.file;
@@ -12,29 +9,24 @@ import web.static_content;
 
 @test
 fn test_static_cache_persists(): void {
-    // A file is read from disk at most once; afterwards it is served from the in-memory Map, even if the
-    // file is deleted. This is what keeps static serving off the filesystem on the hot path.
     let root = dir.Dir.tempDir();
     let path = root + "/nova_static_cache_gate.txt";
     file.File.writeText(path, "cached-body");
 
     let mount = static_content.StaticMount("/s", root, 16);
     let r1 = mount.serve("/s/nova_static_cache_gate.txt");
-    assert.isTrue(r1 != undefined);           // first request reads from disk and caches
+    assert.isTrue(r1 != undefined);
 
-    let _ = dir.Dir.remove(path);             // remove the file from disk
+    let _ = dir.Dir.remove(path);
     let r2 = mount.serve("/s/nova_static_cache_gate.txt");
-    assert.isTrue(r2 != undefined);           // still served -> from the cache, not the (now gone) file
+    assert.isTrue(r2 != undefined);
 
     let miss = mount.serve("/s/never_existed.txt");
-    assert.isTrue(miss == undefined);         // uncached + absent -> undefined
+    assert.isTrue(miss == undefined);
 }
 
 @test
 fn test_static_serve_through_app(): void {
-    // Write two files the mount will serve. The root comes from dir.Dir.tempDir() rather than a
-    // hardcoded "/tmp", which is not a path on Windows — Win32 resolves a leading "/" against the
-    // current drive root, so the mount would point at a directory that does not exist.
     let root = dir.Dir.tempDir();
     file.File.writeText(root + "/nova_static_gate_index.html", "<h1>Static OK</h1>");
     file.File.writeText(root + "/nova_static_gate_app.css", "body{color:red}");
@@ -42,22 +34,18 @@ fn test_static_serve_through_app(): void {
     let a = app.App();
     a.useStatic("/s", root);
 
-    // HTML content + Content-Type.
     let r1 = a.dispatch(request.Request.fromString("GET /s/nova_static_gate_index.html HTTP/1.1\r\nHost:x\r\n\r\n"));
     assert.isTrue(string.indexOf(r1.body, "Static OK") != -1);
     assert.equalStr(r1.headers.get("Content-Type") ?? "?", "text/html");
 
-    // CSS mime; second request is an LRU hit (same body).
     let r2 = a.dispatch(request.Request.fromString("GET /s/nova_static_gate_app.css HTTP/1.1\r\nHost:x\r\n\r\n"));
     assert.equalStr(r2.headers.get("Content-Type") ?? "?", "text/css");
     let r2b = a.dispatch(request.Request.fromString("GET /s/nova_static_gate_app.css HTTP/1.1\r\nHost:x\r\n\r\n"));
     assert.isTrue(string.indexOf(r2b.body, "color:red") != -1);
 
-    // Path traversal -> 403.
     let rbad = a.dispatch(request.Request.fromString("GET /s/../etc/passwd HTTP/1.1\r\nHost:x\r\n\r\n"));
     assert.isTrue(Status.toCode(rbad.status) == 403);
 
-    // Missing file -> 404.
     let rmiss = a.dispatch(request.Request.fromString("GET /s/nope.txt HTTP/1.1\r\nHost:x\r\n\r\n"));
     assert.isTrue(Status.toCode(rmiss.status) == 404);
 }

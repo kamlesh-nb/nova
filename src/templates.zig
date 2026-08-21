@@ -1,4 +1,15 @@
+//! Project scaffold file templates for `nova init`.
+//!
+//! Each `pub const` here is the verbatim text of ONE file that `nova init`
+//! writes when creating a new project, stored as a Zig multiline string
+//! literal. They are pure data: [`scaffold`] selects the right set for the
+//! requested project kind (`console` / `web` / `desktop`) and writes each to
+//! disk. The `web_*` set scaffolds a vertical-slice web app (command/query
+//! request types, their handlers, a validator, a repository, an `.nsx` view,
+//! and the front-end shell). Editing a template here changes what a freshly
+//! initialised project looks like; it does not affect already-created apps.
 
+/// The `main.nova` written by `nova init console`: a hello-world entry point.
 pub const console_main_sample =
     \\import string;
     \\
@@ -7,10 +18,7 @@ pub const console_main_sample =
     \\}
 ;
 
-// VS Code F5 debugging (Gap 4): lldb-dap over the debug build. Requires the "LLDB DAP" VS Code
-// extension (ships with LLVM). `nova build` produces the debug binary with DWARF; the debug profile
-// keeps the object files that lldb reads. No Python: primitives + strings show natively (strings are
-// NUL-terminated). `${workspaceFolderBasename}` is the project (binary) name.
+/// `.vscode/launch.json`: the lldb-dap debug configuration, which imports the Nova value formatters so `List`/`Map`/`struct`/`str.Str` display cleanly.
 pub const vscode_launch_json =
     \\{
     \\  "version": "0.2.0",
@@ -30,10 +38,8 @@ pub const vscode_launch_json =
     \\}
     \\
 ;
-// initCommands loads the OPTIONAL Nova lldb formatters (string contents + List/Map/Set counts). If
-// Python is unavailable lldb prints one import error and the session continues -- primitives, strings
-// (NUL-terminated), and structs still display natively without it.
 
+/// `.vscode/tasks.json`: wires `nova build` (debug) as the editor's default build task, used by the launch config's preLaunchTask.
 pub const vscode_tasks_json =
     \\{
     \\  "version": "2.0.0",
@@ -50,6 +56,7 @@ pub const vscode_tasks_json =
     \\
 ;
 
+/// A starter `@test` for a console project, asserting through the `assert` module (so `nova test` has something to run).
 pub const console_test_sample =
     \\import assert;
     \\
@@ -60,6 +67,7 @@ pub const console_test_sample =
 ;
 
 
+/// The web app composition root (`main.nova`, the ASP.NET-style Program.cs analogue): registers routes, wires static files, and runs the server. Importing a slice's handler is what makes its route discoverable.
 pub const web_main_sample =
     \\// main.nova, app composition root (= Program.cs): register routes, wire static files, run. Each
     \\// `get/post<TReq>` maps a route to a request type; the handler that implements
@@ -106,6 +114,7 @@ pub const web_main_sample =
     \\}
 ;
 
+/// Sample WRITE-side request type (a `create` command) for a vertical feature slice.
 pub const web_create_command_sample =
     \\import web.mediator;
     \\
@@ -118,6 +127,7 @@ pub const web_create_command_sample =
     \\}
 ;
 
+/// The response type returned by the create handler.
 pub const web_create_response_sample =
     \\// The response DTO returned to the client.
     \\@serializable pub struct CreateProductResponse {
@@ -126,6 +136,7 @@ pub const web_create_response_sample =
     \\}
 ;
 
+/// A validator for the create command, run before the handler.
 pub const web_create_validator_sample =
     \\import Features.Products.CreateProduct.command;
     \\
@@ -137,6 +148,7 @@ pub const web_create_validator_sample =
     \\}
 ;
 
+/// The `RequestHandler` that implements the create command (the write handler), discovered by the compiler from the request/response types.
 pub const web_create_handler_sample =
     \\import web.response;
     \\import web.routing;
@@ -165,6 +177,7 @@ pub const web_create_handler_sample =
     \\}
 ;
 
+/// A data repository for the feature over the `db` seam (the ORM bind + query surface).
 pub const web_repository_sample =
     \\import web.di;
     \\import Features.Products.GetProductById.response;
@@ -186,6 +199,7 @@ pub const web_repository_sample =
     \\}
 ;
 
+/// Sample READ-side request type (a `get` query) for the feature slice.
 pub const web_get_query_sample =
     \\import web.mediator;
     \\
@@ -196,6 +210,7 @@ pub const web_get_query_sample =
     \\}
 ;
 
+/// The response type returned by the get query handler.
 pub const web_get_response_sample =
     \\@serializable pub struct ProductDto {
     \\    pub id: int,
@@ -203,6 +218,7 @@ pub const web_get_response_sample =
     \\}
 ;
 
+/// The `RequestHandler` that implements the get query (the read handler).
 pub const web_get_handler_sample =
     \\import web.routing;
     \\import serde.json;
@@ -223,6 +239,7 @@ pub const web_get_handler_sample =
     \\}
 ;
 
+/// The `.nsx` hypermedia view template that renders the feature's response as markup.
 pub const web_view_sample =
     \\import web.response;
     \\
@@ -240,6 +257,7 @@ pub const web_view_sample =
     \\}
 ;
 
+/// The domain entity/model type the feature's repository maps to and from.
 pub const web_domain_entity_sample =
     \\// Domain entity, the core business object (persistence-agnostic).
     \\pub struct Product {
@@ -255,6 +273,7 @@ pub const web_domain_entity_sample =
     \\}
 ;
 
+/// The root `index.html` shell the web app is served under.
 pub const web_index_html_sample =
     \\<!doctype html>
     \\<html lang="en">
@@ -273,8 +292,7 @@ pub const web_index_html_sample =
     \\</html>
 ;
 
-// Tailwind CLI project files. `npm install` pulls tailwindcss + the CLI; `npm run css` builds once and
-// `npm run css:watch` rebuilds wwwroot/app.css whenever a class changes in the NSX views or the shell.
+/// The `package.json` for the app's front-end tooling (Tailwind build, etc.).
 pub const web_package_json_sample =
     \\{
     \\  "name": "nova-web-app",
@@ -290,6 +308,7 @@ pub const web_package_json_sample =
     \\}
 ;
 
+/// The Tailwind entry stylesheet imported by the app shell.
 pub const web_tailwind_css_sample =
     \\@import "tailwindcss";
     \\
@@ -298,8 +317,7 @@ pub const web_tailwind_css_sample =
     \\@config "../tailwind.config.js";
 ;
 
-// The content globs Tailwind scans. The `.nsx` glob is essential: views live in `.nsx` files, so without
-// it every utility class used only in a view would be dropped from wwwroot/app.css.
+/// The Tailwind configuration (content globs + theme).
 pub const web_tailwind_config_sample =
     \\/** @type {import('tailwindcss').Config} */
     \\module.exports = {
@@ -310,11 +328,13 @@ pub const web_tailwind_config_sample =
     \\};
 ;
 
+/// The `.gitignore` written into a scaffolded project (ignores build output and local artefacts).
 pub const web_gitignore_sample =
     \\node_modules/
     \\wwwroot/app.css
 ;
 
+/// A starter `@test` for a web feature slice.
 pub const web_test_sample =
     \\import assert;
     \\import string;
@@ -364,6 +384,7 @@ pub const web_test_sample =
     \\}
 ;
 
+/// The `main.nova` written by `nova init desktop`.
 pub const desktop_main_sample =
     \\// main.nova, a native desktop app: a webview window rendering NSX, with a Nova
     \\// handler bound to a JS call. Build native and run to open the window.

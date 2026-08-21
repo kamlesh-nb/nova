@@ -5,8 +5,6 @@ trait Shape { fn area(self: Shape): int; }
 struct Sq impl Shape { pub s: string, fn area(self: Sq): int { return 4; } }
 struct Ci impl Shape { pub s: string, fn area(self: Ci): int { return 3; } }
 
-// Generic container erases the element type; the trait objects must still be
-// destroyed via their vtable slot-0 destructor (value-witness) at list drop.
 fn build(): List<Shape> {
     let xs = List<Shape>();
     xs.push(Sq { s: "a-square-owns-this-string" });

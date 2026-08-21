@@ -1,7 +1,3 @@
-// Phase 5: the zero-copy HTTP parser (picohttpparser model). Parses a real request in place and
-// reads the method, path, and headers as slices into the buffer, matched by byte comparison, with
-// no per-request allocation. Proves complete/incomplete detection, case-insensitive header lookup,
-// and path matching.
 import assert;
 import bytes;
 import web.httpparser;
@@ -21,7 +17,6 @@ fn test_parse_complete_request(): void {
     let req = httpparser.HttpRequest(16);
     let buf = bytes.alloc(256);
 
-    // GET /api/products/1 HTTP/1.1 + Host + Accept + blank line
     let o = 0;
     o = appendStr(buf, o, "GET /api/products/1 HTTP/1.1"); o = crlf(buf, o);
     o = appendStr(buf, o, "Host: localhost:8080"); o = crlf(buf, o);
@@ -30,7 +25,7 @@ fn test_parse_complete_request(): void {
     let total = o;
 
     let end = req.parse(buf, total);
-    assert.equalInt(end, total);              // complete: header block ends at the buffer end
+    assert.equalInt(end, total);
 
     assert.isTrue(req.methodEq("GET"));
     assert.isFalse(req.methodEq("POST"));
@@ -40,7 +35,6 @@ fn test_parse_complete_request(): void {
 
     assert.equalInt(req.nheaders, 2);
 
-    // Case-insensitive header lookup, value read as a slice.
     let hi = req.header("host");
     assert.isTrue(hi >= 0);
     assert.isTrue(req.headerValueEq(hi, "localhost:8080"));
@@ -60,13 +54,12 @@ fn test_parse_incomplete_request(): void {
     let req = httpparser.HttpRequest(16);
     let buf = bytes.alloc(128);
 
-    // Missing the terminating blank line: not a complete header block yet.
     let o = 0;
     o = appendStr(buf, o, "GET / HTTP/1.1"); o = crlf(buf, o);
     o = appendStr(buf, o, "Host: x"); o = crlf(buf, o);
     let total = o;
 
-    assert.equalInt(req.parse(buf, total), 0);   // 0 => need more bytes
+    assert.equalInt(req.parse(buf, total), 0);
 
     req.free();
     bytes.free(buf);

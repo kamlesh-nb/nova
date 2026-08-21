@@ -2,8 +2,6 @@
 import assert;
 import compress.deflate;
 
-// gzip compress/decompress, pure Nova (RFC 1951 DEFLATE + RFC 1952 framing). The C zlib shim
-// (runtime/compress.cpp / nova_gzip_*) is retired -- see compress/deflate.nova.
 
 pub fn compress(data: string): string {
     return deflate.gzipCompress(data);

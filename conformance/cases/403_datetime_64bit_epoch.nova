@@ -1,20 +1,17 @@
-// datetime uses a 64-bit (long) epoch, so timestamps beyond the 32-bit Year-2038 limit round-trip. Previously
-// the epoch was `int` and dates past 2038-01-19T03:14:07 overflowed.
 import datetime;
 import assert;
 import string;
 @test
 fn beyond_2038_roundtrips(): void {
-    // 2100-06-15 is ~4.1e9 seconds since 1970 -> overflows int32 (max 2.1e9), fine for long.
     let t = datetime.parse("2100-06-15T12:30:45") ?? 0;
-    assert.isTrue(t > 2147483647);                       // genuinely past the int32 ceiling
+    assert.isTrue(t > 2147483647);
     let iso = datetime.toIso(t);
     assert.isTrue(string.eql(iso, "2100-06-15T12:30:45Z"));
 }
 @test
 fn arithmetic_and_diff_64bit(): void {
-    let t = datetime.parse("2038-01-19T03:14:07") ?? 0;  // the classic int32 boundary
-    let later = datetime.addDays(t, 3650);               // +10 years, well past 2038
+    let t = datetime.parse("2038-01-19T03:14:07") ?? 0;
+    let later = datetime.addDays(t, 3650);
     let iso = datetime.toIso(later);
     assert.isTrue(string.eql(string.slice(iso, 0, 4), "2048"));
     assert.isTrue(later > 2147483647);

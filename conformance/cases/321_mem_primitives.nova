@@ -1,4 +1,3 @@
-// mem.memory: raw bulk memory primitives (memcpy/memmove/memset/memcmp/memchr) over addresses.
 import mem.memory;
 import bytes;
 import assert;

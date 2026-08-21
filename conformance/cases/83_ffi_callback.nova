@@ -1,11 +1,3 @@
-// FFI callbacks: nova_invoke_str_closure lets C code call BACK into a Nova closure
-// (the box{fn_ptr,env} convention: fn_ptr(env, arg)). This is the primitive every FFI
-// callback trampoline uses — e.g. webview_bind bridging a JS call to a Nova handler.
-// Verified headlessly here; the webview binding builds on the same primitive.
-//
-// The primitive is C-facing; a typed Nova wrapper (`return nova_...(...)`) gives its
-// string result normal owned-return semantics (ARC-clean), the same pattern the stdlib
-// uses for runtime-extern string results.
 import assert;
 
 fn invokeStr(handler: (string) -> string, arg: string): string {
@@ -17,14 +9,12 @@ fn dbl(s: string): string { return s + s; }
 
 @test
 fn test_named_fn_callback(): void {
-    // A named function passed as a value is boxed; C invokes it with the string arg.
     assert.equalStr(invokeStr(echoHandler, "hi"), "echo:hi");
     assert.equalStr(invokeStr(dbl, "ab"), "abab");
 }
 
 @test
 fn test_json_req_callback(): void {
-    // A JSON-array style req string (what webview_bind hands the handler) round-trips.
     assert.equalStr(invokeStr(dbl, "[1,2]"), "[1,2][1,2]");
     assert.equalStr(invokeStr(echoHandler, ""), "echo:");
 }

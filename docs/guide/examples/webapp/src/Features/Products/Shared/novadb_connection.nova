@@ -3,19 +3,6 @@ import data.db;
 import web.di;
 import novadb;
 
-// A `Connection` backed by a live NovaDB. It implements the SAME seam as `InMemoryConnection`, so the
-// repository and handlers do not change; `main_novadb.nova` just registers this instead.
-//
-// The one rule that shapes this file: opening a connection is asynchronous and must happen on the
-// reactor, never from a cold `main()`. So we do NOT connect in the constructor. We connect lazily, the
-// first time a query or exec runs, which is always inside an async request handler where the reactor is
-// live. `ensure()` opens the socket once, then creates the products table if it is missing, and every
-// method routes through it.
-//
-// This holds a single connection, so requests to one instance are serialised. That is fine here: the
-// orchestrator runs several instances behind the service load balancer (Chapter 21), and each has its own connection. For
-// many connections per instance, swap this for the `pool` module's `Pool` (acquire/release per call);
-// the trade-off is that a multi-statement transaction must pin one pooled connection.
 pub struct NovaDbConnection impl Connection, Service {
     driver: NovaDriver,
     dsn: string,
@@ -29,10 +16,6 @@ pub struct NovaDbConnection impl Connection, Service {
         self.ready = false;
     }
 
-    // Open the connection once (on the reactor), create the schema once, seed a few known rows so the
-    // read endpoints return something on a fresh server, then reuse the connection. NovaDB has no
-    // auto-increment, so the seed rows carry explicit ids (1..3), which is also how a real insert should
-    // supply its key here.
     async fn ensure(self: NovaDbConnection): Connection {
         let existing = self.conn;
         if (existing != undefined) { return existing; }
@@ -48,7 +31,6 @@ pub struct NovaDbConnection impl Connection, Service {
         return c;
     }
 
-    // Insert a known row with an explicit id if it is not already present (idempotent seeding).
     async fn seed(self: NovaDbConnection, c: Connection, id: int, name: string, price: int): void {
         let existing = List<DbValue>();
         existing.push(db.dbInt(id));
@@ -71,9 +53,6 @@ pub struct NovaDbConnection impl Connection, Service {
         return await c.query(sql, params);
     }
 
-    // T1: the Connection seam requires queryWire; delegate to the opened connection (NovaConnection returns
-    // the generic re-encode fallback). Without this the wrapper does not satisfy the trait and the app fails
-    // to build.
     async fn queryWire(self: NovaDbConnection, sql: string, params: List<DbValue>): WireRows {
         let c = await self.ensure();
         return await c.queryWire(sql, params);

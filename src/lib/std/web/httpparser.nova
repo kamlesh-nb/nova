@@ -1,13 +1,3 @@
-// web/httpparser: a zero-copy HTTP/1 request parser in the picohttpparser style, for the
-// self-hosted runtime (docs/design/self-hosted-runtime.md, phase 5). It parses a request in
-// place: the method, path, and each header are recorded as (offset, length) slices INTO the read
-// buffer, never copied and never individually allocated. Delimiter scanning uses the SIMD-backed
-// libc `memchr` (os/sys). Matching is done by byte comparison (`methodEq`, `header`), so the hot
-// path never materialises a Nova string.
-//
-// The HttpRequest is meant to be created ONCE per connection and reused: `parse` resets it and
-// refills the slices, so a whole request costs no allocation. Header slices are kept in a small
-// fixed buffer (`hbuf`, 16 bytes per header) allocated once.
 
 import bytes;
 import os.sys;
@@ -63,9 +53,6 @@ pub struct HttpRequest {
         self.nheaders = 0;
     }
 
-    // Parse the request in `buf[0..len)`. Returns the offset just past the final CRLF CRLF (a
-    // positive header-block length) when the request is complete, 0 when more bytes are needed,
-    // and -1 when the request line is malformed. No allocation; slices point into `buf`.
     pub fn parse(self: HttpRequest, buf: long, len: int): int {
         self.buf = buf;
         self.len = len;
@@ -129,7 +116,6 @@ pub struct HttpRequest {
         return true;
     }
 
-    // Find a header by name (case-insensitive). Returns its index, or -1.
     pub fn header(self: HttpRequest, name: string): int {
         let i = 0;
         while (i < self.nheaders) {

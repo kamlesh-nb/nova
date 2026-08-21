@@ -1,18 +1,9 @@
-// M4 of the C++ runtime retirement plan: read deadlines on the reactor, no Asio. A reactor-native
-// read can be bounded by a deadline (eventedio.recvIntoDeadline): a reactor timer wakes the coroutine
-// to re-check the clock, and on timeout the read returns -2 so the server closes the connection. This
-// restores the readTimeoutMs enforcement that making the reactor the default server had dropped. It
-// also exercises the batch-safe resume guard: a deadline timer that fires alongside a completing read
-// must not resume a reaped coroutine (the reactor loop calls poller.batchBegin() each batch).
 import assert;
 import bytes;
 import os.sys;
 import net.poller;
 import net.eventedio;
 
-// Store the result offset by +1000 so it is always positive: bytes.read_i32 zero-extends, so a
-// stored negative (like the -2 timeout code) would read back as a large unsigned value. 998 = -2,
-// 1002 = 2 bytes read.
 async fn timedRecv(fd: int, kq: int, timeoutMs: int, result: long): void {
     let s = eventedio.ReactorStream(fd, kq);
     let buf = bytes.alloc(64);
@@ -25,7 +16,7 @@ async fn timedRecv(fd: int, kq: int, timeoutMs: int, result: long): void {
 async fn sender(fd: int, kq: int): void {
     let s = eventedio.ReactorStream(fd, kq);
     let msg = bytes.alloc(2);
-    bytes.write_byte(msg, 0, 104); bytes.write_byte(msg, 1, 105);   // "hi"
+    bytes.write_byte(msg, 0, 104); bytes.write_byte(msg, 1, 105);
     let _ = await s.sendBuf(msg, 2);
     bytes.free(msg);
 }
@@ -39,7 +30,7 @@ fn test_recv_deadline_times_out(): void {
     poller.setCurrent(r.kq);
     let result = bytes.alloc(4);
     bytes.write_i32(result, 0, 0);
-    coroStart(timedRecv(b, r.kq, 40, result));   // 40ms deadline, no data is ever sent
+    coroStart(timedRecv(b, r.kq, 40, result));
 
     let guard = 0;
     while ((bytes.read_i32(result, 0) as int) == 0 && guard < 400) {
@@ -50,7 +41,7 @@ fn test_recv_deadline_times_out(): void {
         guard = guard + 1;
     }
 
-    assert.equalInt(bytes.read_i32(result, 0) as int, 998);   // timed out (-2 + 1000)
+    assert.equalInt(bytes.read_i32(result, 0) as int, 998);
     poller.setCurrent(0);
     bytes.free(result);
     r.destroy();
@@ -66,8 +57,8 @@ fn test_recv_deadline_gets_data(): void {
     poller.setCurrent(r.kq);
     let result = bytes.alloc(4);
     bytes.write_i32(result, 0, 0);
-    coroStart(timedRecv(b, r.kq, 5000, result));   // generous deadline
-    coroStart(sender(a, r.kq));                      // data arrives well before it
+    coroStart(timedRecv(b, r.kq, 5000, result));
+    coroStart(sender(a, r.kq));
 
     let guard = 0;
     while ((bytes.read_i32(result, 0) as int) == 0 && guard < 400) {
@@ -78,7 +69,7 @@ fn test_recv_deadline_gets_data(): void {
         guard = guard + 1;
     }
 
-    assert.equalInt(bytes.read_i32(result, 0) as int, 1002);    // got 2 bytes (+1000), not a timeout
+    assert.equalInt(bytes.read_i32(result, 0) as int, 1002);
     poller.setCurrent(0);
     bytes.free(result);
     r.destroy();

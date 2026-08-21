@@ -1,12 +1,3 @@
-// M1 of the C++ runtime retirement plan: nested async on the Nova reactor. A coroutine started
-// with coroStart (driven by nova_reactor_resume, no Asio) can itself `await` other async fns and
-// `spawn` futures; the per-reactor run queue drains the whole chain on the single reactor thread.
-// This is what lets an `async fn` handler with nested awaits run on the Nova reactor. Since nothing
-// here suspends on real I/O, each coroStart drains to completion synchronously via the run queue.
-//
-// The complementary boundary (an await that suspends on an Asio-backed primitive, which the reactor
-// cannot drive) fails fast with a diagnostic (nova_reactor_io_violation); that abort path is proven
-// out-of-corpus since a corpus case cannot abort.
 import assert;
 import bytes;
 
@@ -15,11 +6,10 @@ async fn leaf(): int {
 }
 
 async fn middle(): int {
-    let x = await leaf();       // one level of nesting
+    let x = await leaf();
     return x + 100;
 }
 
-// top -> await middle -> await leaf: multi-level nested await drained by the run queue.
 async fn topMulti(cell: long): void {
     let y = await middle();
     bytes.write_i32(cell, 0, y);
@@ -38,7 +28,6 @@ async fn dbl(n: int): int {
     return n * 2;
 }
 
-// spawn two futures then await both: interleaved completion on the run queue.
 async fn topSpawn(cell: long): void {
     let a = spawn dbl(10);
     let b = spawn dbl(20);

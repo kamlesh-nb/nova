@@ -1,8 +1,3 @@
-// I (parser gaps): a `where` clause on a generic function signature (`fn f<T>(x: T): R where T: Show`)
-// failed to parse -- the parser expected the body `{` right after the return type. Generic dispatch in
-// Nova is structural (a call resolves against the concrete instantiation regardless of any declared
-// bound), so the constraints are advisory. Fix: parse and discard an optional `where` clause between the
-// return type and the body, accepting `T: Bound`, `T: A + B`, and comma-separated lists.
 
 import assert;
 
@@ -34,6 +29,5 @@ fn test_single_bound(): void {
 
 @test
 fn test_multi_bound_and_multi_constraint(): void {
-    // `T: Show + Tag` (two bounds) and a second constraint `U: Show`.
     assert.equalStr(both(Dog{}, Cat{}), "woof");
 }

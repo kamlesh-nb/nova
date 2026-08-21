@@ -1,8 +1,3 @@
-// T15 mTLS phase 3: OCSP (RFC 6960) revocation checking. Gates the ASN.1 parse + responder-signature
-// verification by round-tripping a signed OCSPResponse (built by the same module, which doubles as a
-// minimal responder): a `good` response parses to CERT_GOOD and its ECDSA signature validates; a
-// `revoked` response parses to CERT_REVOKED; a wrong responder key fails verification; the request
-// builder emits a well-formed OCSPRequest. (The live HTTP fetch to the AIA responder is the caller's job.)
 import crypto.ocsp;
 import crypto.ecc.p256;
 import bytes;
@@ -18,7 +13,7 @@ fn mkTime(): ptr {
     return b;
 }
 fn mkSerial(): ptr {
-    let s = bytes.alloc(8); fill(s, 8, 3); bytes.write_byte(s, 0, 0x10);   // high bit clear -> no DER pad
+    let s = bytes.alloc(8); fill(s, 8, 3); bytes.write_byte(s, 0, 0x10);
     return s;
 }
 
@@ -40,12 +35,10 @@ fn test_ocsp_good_roundtrip(): void {
     assert.isTrue(res.isGood());
     assert.isFalse(res.isRevoked());
 
-    // serial round-trips (value + length)
     assert.equalInt(8, res.serialLen);
     let i = 0;
     while (i < 8) { assert.equalInt(bytes.read_byte(serial, i), bytes.read_byte(resp, res.serialOff + i)); i = i + 1; }
 
-    // responder signature verifies with the right key, fails with a wrong one
     assert.isTrue(ocsp.verifyOcspSignatureEc(resp, res, pubKey));
     let badKey = bytes.alloc(32); fill(badKey, 32, 9); bytes.write_byte(badKey, 0, 0x22);
     let badPub = bytes.alloc(65); p256.derivePublic(badPub, badKey);
@@ -65,7 +58,7 @@ fn test_ocsp_revoked(): void {
     assert.equalInt(ocsp.CERT_REVOKED, res.certStatus);
     assert.isTrue(res.isRevoked());
     assert.isFalse(res.isGood());
-    assert.isTrue(ocsp.verifyOcspSignatureEc(resp, res, pubKey));   // a revoked response is still signed
+    assert.isTrue(ocsp.verifyOcspSignatureEc(resp, res, pubKey));
 }
 
 @test
@@ -76,5 +69,5 @@ fn test_ocsp_request_build(): void {
     let req = bytes.alloc(256);
     let n = ocsp.buildOcspRequest(nameHash, keyHash, serial, 8, req);
     assert.isTrue(n > 0);
-    assert.equalInt(0x30, bytes.read_byte(req, 0));   // OCSPRequest SEQUENCE
+    assert.equalInt(0x30, bytes.read_byte(req, 0));
 }

@@ -23,14 +23,9 @@ pub struct RowSource impl ValueSource {
         }
     }
 
-    // Resolve a column key to its index. The index is keyed by LOWERCASED column name, so an
-    // already-lowercase key (the common case: pg/most drivers fold unquoted columns to lower, and DTO
-    // field names are typically lowercase) hits on the FIRST get with NO allocation. Only a mixed-case
-    // key falls back to toLowerCase (which allocates). This removes the per-field lowercase allocation
-    // from the hot bind loop -- the main cost separating the generic binder from a hand-rolled decode.
     fn colIndex(self: RowSource, key: string): int {
-        let i = self.index.get(key);                                    // exact (no alloc)
-        if (i == undefined) { i = self.index.get(string.toLowerCase(key)); }   // case-insensitive fallback
+        let i = self.index.get(key);
+        if (i == undefined) { i = self.index.get(string.toLowerCase(key)); }
         return i ?? -1;
     }
 
@@ -41,9 +36,6 @@ pub struct RowSource impl ValueSource {
     }
 
     pub fn getString(self: RowSource, key: string): string { return self.cell(key).asText(); }
-    // Zero-copy: borrow a view straight into Row.raw (owned by the ResultSet, which outlives the bind)
-    // instead of materialising an owned string. This is the ORM's P10 lever — a Str-typed @serializable
-    // field binds through here, so a 200-row result skips ~one string allocation per text column.
     pub fn getStr(self: RowSource, key: string): str.Str { return self.cell(key).asView(); }
     pub fn getInt(self: RowSource, key: string): long { return self.cell(key).asLong(); }
     pub fn getBool(self: RowSource, key: string): bool { return self.cell(key).asBool(); }
@@ -51,10 +43,6 @@ pub struct RowSource impl ValueSource {
     pub fn getDecimal(self: RowSource, key: string): decimal { return self.cell(key).asDecimal(); }
 
     pub fn getChild(self: RowSource, key: string): ValueSource { return self; }
-    // Cheap presence check: is the column in the result set? (No cell fetch, no isNull.) For a DB row a
-    // named column is present, so the binder's per-field `has` guard costs one index lookup instead of a
-    // second cell materialisation. A present-but-NULL column binds to its zero value (empty Str / 0),
-    // which equals the field's default anyway -- so dropping the old isNull() check is byte-neutral.
     pub fn has(self: RowSource, key: string): bool {
         return self.colIndex(key) >= 0;
     }
@@ -65,29 +53,16 @@ pub struct RowSource impl ValueSource {
     pub fn itemChild(self: RowSource, key: string, i: int): ValueSource { return self; }
 }
 
-// Bind a whole result set to a list of typed rows. This is the pure, synchronous half of a query: no
-// I/O, just the compiler-generated binder mapping columns to fields by name. Await the connection where
-// the I/O belongs (in the repository), then hand the result set here. Keeping the generic binder
-// synchronous is deliberate: `serde.bind<T>` resolves T to its concrete binder at the call site, which
-// only happens when T is a concrete type argument, not a type parameter threaded through an async frame.
 pub fn bindAll<T>(rs: ResultSet): List<T> {
-    // Level B fused bind: `serde.bindAll<T>` resolves each field's column index ONCE into a LOCAL and binds
-    // every row in a single tight loop with the direct accessor -- identical to a hand-rolled positional
-    // decode (`obj.f = row.get(idx).asX()`), with no per-row `plan` List lookup and no per-row binder call.
     return serde.bindAll<T>(rs);
 }
 
-// Bind the first row of a result set, or `undefined` when the set is empty.
 pub fn bindOne<T>(rs: ResultSet): T | undefined {
     if (rs.rows.size() == 0) { return undefined; }
     let plan = serde.planFor<T>(rs.columns);
     return serde.bindRow<T>(rs.rows.get(0) ?? Row(), plan);
 }
 
-// One-call query + bind for the ASYNC request path: prepare (per-connection cached plan), run, and bind
-// the rows into typed models POSITIONALLY -- the ResultSet never leaves the ORM. A generic async fn that
-// resolves serde.planFor/bindRow<T> is now supported cross-module (the mono spec is matched by its
-// module-scoped name).
 pub async fn queryAs<T>(conn: Connection, sql: string, params: List<DbValue>): List<T> {
     let stmt = await conn.prepare(sql);
     let rs = await conn.queryPrepared(stmt, params);
@@ -102,8 +77,6 @@ pub async fn queryOne<T>(conn: Connection, sql: string, params: List<DbValue>): 
     return serde.bindRow<T>(rs.rows.get(0) ?? Row(), plan);
 }
 
-// Sync block-driving variants for NON-async call sites (scripts, tests outside the event loop). Do NOT use
-// on the request path (block-driving conn.query inside a coroutine hits the nested-block-drive guard).
 pub fn queryAsBlocking<T>(conn: Connection, sql: string, params: List<DbValue>): List<T> {
     let rs = conn.query(sql, params);
     let out = List<T>();
@@ -168,9 +141,6 @@ pub fn insert<T>(conn: Connection, table: string, obj: T): ExecResult {
     return conn.exec(sql, p.vals);
 }
 
-// UPDATE <table> SET col=$n, ... WHERE <keyCol> = $last. The struct's keyCol field becomes the WHERE
-// value (it is NOT written in SET); every other field is a bound SET assignment. Params are bound (T4),
-// so values never reach the SQL text.
 pub fn update<T>(conn: Connection, table: string, obj: T, keyCol: string): ExecResult {
     let p = ParamSink();
     serde.dump<T>(obj, p);
@@ -197,7 +167,6 @@ pub fn update<T>(conn: Connection, table: string, obj: T, keyCol: string): ExecR
     return conn.exec(sql, params);
 }
 
-// DELETE FROM <table> WHERE <keyCol> = $1 (the key value is bound).
 pub fn deleteBy(conn: Connection, table: string, keyCol: string, keyVal: DbValue): ExecResult {
     let params = List<DbValue>();
     params.push(keyVal);
@@ -212,9 +181,6 @@ pub struct BsonSink impl ValueSink {
     fn putString(self: BsonSink, key: string, val: string): void { self.doc.entries.push(bson.entryString(key, val)); }
 
     fn putInt(self: BsonSink, key: string, val: long): void {
-        // E1 fix: do NOT truncate a 64-bit value to int32. Store as BSON int32 only when the value
-        // round-trips through int32 losslessly; otherwise store the full int64. This preserves int32 type
-        // fidelity for small values and stops the silent data loss for large `long` fields.
         let narrowed = (val as int) as long;
         if (narrowed == val) {
             self.doc.entries.push(bson.entryInt(key, val as int));

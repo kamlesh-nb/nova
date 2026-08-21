@@ -1,13 +1,6 @@
-// T3 FFI: `extern("lib") fn` binds foreign C-ABI functions. v1 marshals scalars
-// (int/long/bool), pointers (ptr in/out), strings (Nova <-> C char*, both directions),
-// void returns, and structs by pointer (a Nova struct value is a heap pointer, passed
-// as void*). The linker adds `-l<lib>` for each named library.
 import assert;
 
 extern("c") fn abs(x: int): int;
-// llabs, not labs: C `long` is 64-bit on LP64 (macOS/Linux) but 32-bit on Windows (LLP64), so
-// labs would truncate here and prove the opposite of what this case asserts. `long long` is
-// 64-bit on every target, which is what Nova's `long` maps to.
 extern("c") fn llabs(x: long): long;
 extern("c") fn malloc(n: long): ptr;
 extern("c") fn memset(p: ptr, c: int, n: long): ptr;
@@ -24,43 +17,35 @@ struct FfiPoint {
 
 @test
 fn test_ffi_scalar(): void {
-    // C int return is sign-extended back to a Nova value.
     assert.equalInt(abs(-5), 5);
     assert.equalInt(abs(123), 123);
-    // 64-bit long crosses without truncation.
     assert.isTrue(llabs(-9000000000) == 9000000000);
 }
 
 @test
 fn test_ffi_pointer(): void {
-    // ptr in/out: malloc returns a non-null opaque handle; memset returns the same ptr.
     let p = malloc(64);
     assert.isTrue(p != 0);
     let q = memset(p, 0, 64);
     assert.isTrue(q == p);
-    free(p); // void return, no crash
+    free(p);
 }
 
 @test
 fn test_ffi_string(): void {
-    // Nova string -> C char* (NUL-terminated temp, freed after the call).
     assert.isTrue(strlen("hello world") == 11);
     assert.isTrue(strlen("") == 0);
-    // C char* return -> fresh Nova string. PATH is always set and non-empty; a round-trip
-    // through Nova's own strlen proves the returned string is usable.
     let path = getenv("PATH");
     assert.isTrue(strlen(path) > 0);
-    // A null C return (unset var) maps to the empty Nova string.
     let missing = getenv("NOVA_FFI_DEFINITELY_UNSET_VAR");
     assert.isTrue(strlen(missing) == 0);
 }
 
 @test
 fn test_ffi_struct_by_ptr(): void {
-    // A Nova struct value is a heap pointer to its (C-compatibly laid out) fields.
     let a = FfiPoint(3, 7);
     let b = FfiPoint(3, 7);
     let c = FfiPoint(3, 9);
-    assert.isTrue(memcmp(a, b, 8) == 0);  // two ints = 8 bytes, identical
-    assert.isTrue(memcmp(a, c, 8) != 0);  // differ in the second field
+    assert.isTrue(memcmp(a, b, 8) == 0);
+    assert.isTrue(memcmp(a, c, 8) != 0);
 }

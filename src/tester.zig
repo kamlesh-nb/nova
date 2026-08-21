@@ -1,4 +1,25 @@
-// tester.zig — `nova test` — collect @test fns, generate a harness, compile and run.
+//! The `nova test` runner.
+//!
+//! This drives the whole test pipeline: it loads the program the user asked to
+//! test (a named file, or every `.nova` file under the project), collects the
+//! `@test` functions THAT USER wrote, synthesises a `main()` harness that calls
+//! each one and tallies pass/fail, then runs the normal compile + link pipeline
+//! on the combined program and executes the resulting binary.
+//!
+//! Two deliberate behaviours are the source of subtle bugs if changed:
+//!
+//!   1. Only the USER's `@test`s run. The stdlib is merged into the program like
+//!      any import and carries its own `@test`s, but re-running those on every
+//!      `nova test` would be noise (they are already covered by the conformance
+//!      corpus). [`collectTestFunctions`] filters by source file so stdlib and
+//!      package tests are excluded.
+//!   2. A file with no `@test` of its own is still COMPILED (it just reports
+//!      "0 passed, 0 failed"), so a mistake in such a file is still caught. This
+//!      is why the runner falls through to build a trivial harness rather than
+//!      returning early when no tests are found.
+//!
+//! The harness also gates on the ARC leak audit: if `nova_arc_audit_report`
+//! reports survivors the process exits non-zero, so a leak fails the test run.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -24,12 +45,14 @@ const pipeline = @import("pipeline.zig");
 const packages = @import("packages.zig");
 
 
-// Collect the @test functions to run. Only functions defined in the USER's own file(s) count: `nova test`
-// merges the whole import graph (the force-preloaded string_builder, plus every stdlib and package module
-// an import pulls in), and those modules carry their own @test functions which are already covered by the
-// compiler's conformance corpus. Running them again on every `nova test` is noise, so we filter by the
-// source file each declaration was parsed from (`fd.span.file`, set by the parser to its file path) against
-// the set of files the user actually asked to test (`user_files` = the given file, or the scanned project).
+/// Collects the names of `@test` functions declared in the USER's files.
+///
+/// Walks the merged declaration list and keeps a `fn` only when BOTH: its
+/// `span.file` (stamped by the parser with the source path) matches one of
+/// `user_files`, AND it carries the `@test` attribute. The `span.file` filter is
+/// what excludes the stdlib's and imported packages' own tests, which are merged
+/// into the program but are not what `nova test <file>` is asking to run. The
+/// returned slice is owned by the caller.
 fn collectTestFunctions(declarations: []const ast.Declaration, user_files: []const []const u8, allocator: std.mem.Allocator) ![][]const u8 {
     var test_fns = std.ArrayList([]const u8).empty;
     defer test_fns.deinit(allocator);
@@ -60,6 +83,16 @@ fn collectTestFunctions(declarations: []const ast.Declaration, user_files: []con
     return try test_fns.toOwnedSlice(allocator);
 }
 
+/// Generates the Nova source of the harness `main()` that drives the tests.
+///
+/// Emits a `main` that, for each test name, resets the per-test state
+/// (`nova_test_reset`), marks the current test (`nova_test_begin`), calls the
+/// test function, and prints `PASS`/`FAIL` based on `nova_test_did_fail`,
+/// accumulating counts. After all tests it prints the `Results:` summary and
+/// exits non-zero if the ARC audit reports survivors OR any test failed, so a
+/// leak or a failure both fail the process. The result is Nova source text,
+/// parsed and merged into the program alongside the user's code. `console.log`
+/// string concatenation is used because the harness is plain Nova, not Zig.
 fn generateTestHarness(test_fn_names: []const []const u8, allocator: std.mem.Allocator) ![]const u8 {
     var src = std.ArrayList(u8).empty;
     defer src.deinit(allocator);
@@ -100,12 +133,33 @@ fn generateTestHarness(test_fn_names: []const []const u8, allocator: std.mem.All
     return try src.toOwnedSlice(allocator);
 }
 
+/// Entry point for the `nova test` subcommand.
+///
+/// Runs the full test pipeline end to end:
+///
+///   1. Ensures dependencies are fetched, then parses the build-tuning flags
+///      (`--split-objects`, `--prune`, `--emit-llvm`, `--mem-stats`, `--wasm`/
+///      `--native`, `--asan`/`--tsan`) and the optional target file.
+///   2. Determines the files to test: the given file, or every `.nova` file
+///      under the current directory when none is named.
+///   3. Loads and merges those files (plus `string_builder` and small runtime
+///      helpers) into one declaration list, resolving imports transitively.
+///   4. Collects the user's `@test`s ([`collectTestFunctions`]), generates the
+///      harness ([`generateTestHarness`]), and appends it. `main` from the
+///      user's files is dropped so only the harness `main` remains.
+///   5. Runs the normal frontend (synthetic generators, alpha-rename, id
+///      assignment, type check, TypeId sema, monomorphise, optional
+///      reach/escape/ownership/OSSA passes) exactly as a real build does, so a
+///      test build exercises the same pipeline as `nova build`.
+///   6. Emits objects, links against the C++ runtime (`novacore`, or the
+///      `_asan`/`_tsan` variant), and runs the produced `__nova_test` binary.
+///
+/// The whole `build/test` tree is cleaned up afterwards. The process exits
+/// non-zero if the test binary reports failure (which itself covers both a
+/// failed assertion and a leak, see [`generateTestHarness`]).
 pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []const []const u8) !void {
-    // Auto-fetch: clone any project.json dependency missing from the package cache before compiling.
-    // Silent when there is no project.json (a bare `nova test <file>`).
     try packages.ensureDependencies(allocator, init);
 
-    // User-facing build options as CLI flags (were NOVA_* env vars). --asan/--tsan are read below.
     llvm_codegen.flags.split_per_file = pipeline.hasFlag(args, "--split-objects");
     llvm_codegen.flags.prune = pipeline.hasFlag(args, "--prune");
     llvm_codegen.flags.dump_ir = pipeline.hasFlag(args, "--emit-llvm");
@@ -187,12 +241,6 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
     }
 
     const test_fn_names = try collectTestFunctions(declarations.items, file_paths.items, allocator);
-    // A file may legitimately have no @test of its own (a cross-module fixture, or an expect_fail case that
-    // is only there to be REJECTED). We must NOT return early here: the compile below is what validates the
-    // file and, crucially, is what type-checks and rejects an expect_fail case. Returning before
-    // `tc.check` would let a non-exhaustive-switch (or any other) error slip through unchecked. So with zero
-    // tests we fall through and build a trivial 0-test harness, which compiles the program and then reports
-    // "0 passed, 0 failed" (or, for a bad file, fails to compile exactly as it should).
     if (test_fn_names.len == 0) {
         if (file_path.len == 0) {
             std.debug.print("No @test functions found in project directory; compiling only.\n", .{});
@@ -249,7 +297,7 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
     const helpers_prog = try helpers_p.parseProgram();
     try filtered_decls.appendSlice(allocator, helpers_prog.declarations);
 
-    try pipeline.expandTraitDefaults(allocator, &filtered_decls); // cross-module trait default methods
+    try pipeline.expandTraitDefaults(allocator, &filtered_decls);
     try pipeline.generateControllerRoutes(allocator, &filtered_decls);
     try pipeline.generateSerdeBinders(allocator, &filtered_decls, is_wasm);
     try pipeline.generateMediatorDispatch(allocator, &filtered_decls, is_wasm);
@@ -273,9 +321,6 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
 
     sema_shadow.report_enabled = init.environ_map.get("NOVA_SEMA_SHADOW") != null;
     sema_shadow.tid_census = init.environ_map.get("NOVA_TID_CENSUS") != null;
-    // M-5 (memory-management-refinements.md): borrowed-field ARC elision is ON by default
-    // (verified: corpus + ASAN clean, differential ARC audit identical off vs on). Set
-    // NOVA_ARC_ELIDE_OFF to disable it for debugging a suspected elision regression.
     codegen_arc.elide_enabled = init.environ_map.get("NOVA_ARC_ELIDE_OFF") == null;
     codegen_arc.arc_census = init.environ_map.get("NOVA_ARC_CENSUS") != null;
     pipeline.configureValueStructs(allocator, init.environ_map);
@@ -303,8 +348,6 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
         }
     }
 
-    // Gap 8: demand-driven monomorphization reachability (test path). Roots = @test fns (is_test=true).
-    // Shadow report under NOVA_REACH_SHADOW; emission-gating under NOVA_REACH_ON. See demand-driven-mono.md.
     {
         const reach = @import("frontend/sema/reach.zig");
         const shadow = init.environ_map.get("NOVA_REACH_SHADOW") != null;
@@ -320,24 +363,16 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
         }
     }
 
-    // P7 Stage 1: report-only escape gauge (no codegen effect). See docs/design/p7-sound-arena.md.
     sema_escape.report_enabled = init.environ_map.get("NOVA_ESCAPE_REPORT") != null;
     if (sema_escape.report_enabled) _ = sema_escape.analyze(allocator, &owned_sema.store, &owned_sema.ir, &program);
 
-    // OSSA-lite Track V: opt-in ownership verifier. See docs/design/ossa-lite-tasks.md.
-    // Drives both the sema-level coverage report and the codegen ARC release-balance verifier (V4').
     if (init.environ_map.get("NOVA_OWN_VERIFY")) |v| {
         const hard = std.mem.eql(u8, v, "hard");
         sema_ownership.runVerify(allocator, &owned_sema.store, &owned_sema.ir, &program, hard);
-        // V4' balance verifier is non-path-sensitive (superseded by the OSSA verifier); report only, never
-        // fails. See builder.zig for the rationale + the corpus census.
         codegen_arc.balance_verify = true;
         codegen_arc.balance_hard = false;
     }
 
-    // Slice 6: DEFAULT-ON, fail-closed ownership enforcement (see builder.zig for the full rationale). The
-    // sound OSSA verifier runs on every `nova test` and rejects a proven ARC release imbalance in a covered
-    // function. NOVA_OSSA=off disables; =1 report-only; =hard verbose+fail; unset = enforce quietly.
     {
         const ossa = init.environ_map.get("NOVA_OSSA");
         const disabled = ossa != null and std.mem.eql(u8, ossa.?, "off");
@@ -348,10 +383,7 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
         }
     }
 
-    // (HIR/MIR/LIR LLVM-emit optimiser scrapped 2026-08-16; see docs/design/sil-arc-optimiser-direction.md.)
 
-    // Keep test artifacts OUT of the project root: build them under build/test/ and delete that dir when
-    // the run finishes (see cleanup before the final return/exit below).
     const test_dir = "build/test";
     Io.Dir.createDirPath(.cwd(), init.io, test_dir) catch {};
     const output_path = "build/test/__nova_test";
@@ -454,8 +486,6 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
         },
     }
 
-    // Remove the whole build/test scratch dir (binary + object) now the run is done. Done explicitly
-    // (not via defer) because std.process.exit below skips defers on the failure path.
     Io.Dir.deleteTree(.cwd(), init.io, test_dir) catch {};
 
     if (suite_failed) std.process.exit(1);

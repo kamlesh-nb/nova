@@ -1,6 +1,3 @@
-// 126 — the ternary conditional operator `cond ? a : b` (C-style / C#-style). It desugars to Nova's
-// `if`-expression, so it shares its heterogeneous-branch typing (79) and is a pure syntax convenience.
-// Disambiguated from `??` (null-coalescing) and `?.` (optional chaining), which also start with `?`.
 import assert;
 import string;
 
@@ -20,7 +17,6 @@ fn test_ternary_strings(): void {
 
 @test
 fn test_nested_ternary(): void {
-    // right-associative chaining, the idiomatic sign() form
     let a = 0;
     let s = a > 0 ? "pos" : (a == 0 ? "zero" : "neg");
     assert.equalStr("zero", s);
@@ -31,8 +27,6 @@ fn test_nested_ternary(): void {
 
 @test
 fn test_ternary_disambiguation_with_coalesce(): void {
-    // `?` (ternary) must not be confused with `??` (coalesce). Here the condition uses `??` and the
-    // whole thing is a ternary.
     let opt = "hi";
     let cond = (opt ?? "") == "hi";
     assert.equalStr("yes", cond ? "yes" : "no");
@@ -40,7 +34,6 @@ fn test_ternary_disambiguation_with_coalesce(): void {
 
 @test
 fn test_ternary_in_expression(): void {
-    // usable anywhere an expression is — as a call arg, in interpolation, etc.
     let x = 7;
     let msg = `value is ${x > 5 ? "big" : "small"}`;
     assert.equalStr("value is big", msg);

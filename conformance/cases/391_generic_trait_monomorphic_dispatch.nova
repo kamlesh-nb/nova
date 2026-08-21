@@ -1,8 +1,3 @@
-// Generic-trait dispatch is MONOMORPHIC: each `impl Producer<M>` gets its own per-M vtable
-// (`_vtable_IntMaker_Producer_i32`, `_vtable_StrMaker_Producer_string`) rather than a single M-erased
-// `_vtable_..._Producer`. The vtable name is derived from the struct's impl type-args, so trait-object
-// construction and the downcast check always compute the same name. Dispatch through a trait-typed value
-// must return the correct M-typed result for each instantiation.
 import assert;
 trait Producer<M> { fn make(self: Producer<M>, seed: int): M; }
 struct IntMaker impl Producer<int> { fn make(self: IntMaker, seed: int): int { return seed * 10; } }

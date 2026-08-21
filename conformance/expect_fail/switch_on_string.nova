@@ -1,7 +1,4 @@
 // EXPECT-FAIL: typecheck
-// NEGATIVE test: a switch lowers to an LLVM integer switch, so a string discriminant is not
-// supported and must be rejected. It used to miscompile silently (every case label collapsed to 0,
-// which the LLVM verifier rejected as a duplicate switch case). The checker now rejects it up front.
 import assert;
 
 fn classify(s: string): int {

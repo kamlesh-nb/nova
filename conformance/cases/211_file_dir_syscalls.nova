@@ -1,9 +1,3 @@
-// M5: file and directory I/O implemented in Nova over the raw POSIX syscalls in os/sys
-// (open/read/write/lseek/close, mkdir/rmdir/rename, stat/access, opendir/readdir/closedir),
-// with no C stdio and no nova_file_*/nova_dir_* runtime code. Exercises the whole surface:
-// text round trip, the fd handle API, and directory create/list/rename.
-// Paths come from dir.Dir.tempDir() rather than a hardcoded "/tmp" so the case is target-neutral
-// (Windows has no /tmp; Win32 would resolve a leading "/" against the current drive root).
 import io.file;
 import io.dir;
 import assert;

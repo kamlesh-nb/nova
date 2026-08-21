@@ -1,8 +1,3 @@
-// M4 first step of the C++ runtime retirement plan: reactor-native timers, no Asio. `await sleep`
-// on a reactor coroutine arms an EVFILT_TIMER on the reactor's own kqueue (keyed by the coroutine
-// handle); the reactor loop resumes the coroutine when it fires, exactly like a ready fd. This
-// removes the Asio steady_timer for reactor coroutines and restores read-timeout / sleep support on
-// the reactor (the gap that making the reactor the default server introduced).
 import assert;
 import bytes;
 import net.poller;
@@ -20,7 +15,7 @@ fn test_reactor_native_timer_resumes_coroutine(): void {
     let cell = bytes.alloc(4);
     bytes.write_i32(cell, 0, -1);
 
-    coroStart(sleeper(cell));   // runs to the sleep, arms the reactor timer, suspends
+    coroStart(sleeper(cell));
 
     let guard = 0;
     while ((bytes.read_i32(cell, 0) as int) != 42 && guard < 200) {

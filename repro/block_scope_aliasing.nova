@@ -1,85 +1,27 @@
-// REPRO (known failing, 2026-07-15): Nova has NO BLOCK SCOPE. Two live
-// miscompilations, one of them a segfault caused by DEAD CODE.
-//
-//   nova repro/block_scope_aliasing.nova --native -o /tmp/scope && /tmp/scope
-//   -> shadowing=2   (expected 1)
-//   -> then SIGSEGV (exit 139) in disjoint()
-//
-// ===== WHY =====
-//
-// `Scope` (llvm_codegen.zig:62-64) holds ONLY `deferred_statements`. It carries no
-// names. The `scopes` stack is a `defer` mechanism, NOT a lexical environment.
-//
-// `locals` is a flat map cleared ONCE PER FUNCTION (declarations.zig:851), never
-// per block. `collectLocalVarNames` (declarations.zig:891-916) hoists EVERY `let`
-// in the whole body — including nested blocks — into entry-block allocas, with:
-//
-//     if (compiler.locals.contains(name)) continue;     // :896  <-- first wins
-//
-// So two `let x` in *disjoint* blocks share ONE alloca, and an inner `let x`
-// shadowing an outer one ALIASES it. There is no shadowing in Nova; there is
-// only accidental sharing.
-//
-// Types are worse. `collectLocalVarTypes` (llvm_codegen.zig:2241-2272) recurses
-// into blocks/if/while/for/switch and does `map.put(ls.name, type)` per `let` —
-// LAST WRITER WINS. So the *last textual* `let x` in a function decides `x`'s type
-// EVERYWHERE, including for uses that lexically precede it, and including from
-// branches that never execute.
-//
-// ===== THE PART THAT SHOULD ALARM YOU =====
-//
-// `disjoint()` segfaults because of a `let` inside `if (false)`. Deleting that
-// dead branch — changing nothing that runs — makes the program correct:
-//
-//     if (true)  { let v = 42;    out = out + `${v}`; }   // v is an int here
-//     if (false) { let v = "..."; }                       // never runs; types v as string
-//
-// The live `${v}` is compiled as a STRING interpolation over a slot holding 42,
-// so it reads a string length header at [42-4] and dereferences it. Verified:
-// with the `if (false)` block present -> SIGSEGV; with it deleted -> "42", exit 0.
-//
-//   **Dead code in a never-taken branch segfaults a live branch.**
-//
-// This is not a corner case; it is what `let` does in every block today. It has
-// NO conformance case, which is why it survived (specs §13).
-//
-// ===== FIX =====
-//
-// docs/design/F1-name-resolution.md §3.2 — a real lexical scope tree. `Scope`
-// gains `names: StringHashMapUnmanaged(SymbolId)` and a `parent`; resolution walks
-// the chain; each `let` is a DISTINCT binding with its own slot and its own type.
-// The `defer` list moves onto the same structure, where it always belonged.
-//
-// Land with the conformance case this file becomes once F1 stage 5 is in — it must
-// be shown to fail first, which is what this file records.
-// specs §10 #23.
 
-// A. Block scope: the inner binding must not touch the outer one.
 fn shadowing(): int {
     let x = 1;
     if (true) {
-        let x = 2;      // a DISTINCT binding
+        let x = 2;
     }
-    return x;           // EXPECTED 1 — actually returns 2
+    return x;
 }
 
-// B. Disjoint blocks: distinct bindings, distinct types. The `if (false)` arm
-//    never runs, yet it decides `v`'s type for the arm that does.
 fn disjoint(): string {
     let out = "";
     if (true) {
-        let v = 42;                 // v is an int HERE
+        let v = 42;
         out = out + `${v}`;
     }
     if (false) {
-        let v = "never-runs";       // never executes; types v as `string` everywhere
+        let v = "never-runs";
         out = out + v;
     }
-    return out;                     // EXPECTED "42" — actually SIGSEGV
+    return out;
 }
 
 fn main(): void {
-    console.log(`shadowing=${shadowing()}`);   // expect 1, get 2
-    console.log(`disjoint=${disjoint()}`);     // expect 42, get SIGSEGV
+    console.log(`shadowing=${shadowing()}`);
+    console.log(`disjoint=${disjoint()}`);
     console.log("if you see this, both are fixed");
 }

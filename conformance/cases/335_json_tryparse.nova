@@ -1,16 +1,13 @@
-// L4 / E7: json.tryParse is the CHECKED JSON parse — malformed input returns `undefined` instead of a
-// silently-wrong partial value (the old `parse("[1,2,")` returned `[1,2,null]` with no error). `parse`
-// stays lenient for back-compat; `tryParse` is the safe path for untrusted input.
 import assert;
 import serde.json;
 
 @test
 fn malformed_returns_undefined(): void {
-    assert.isTrue(json.tryParse("[1,2,") == undefined);        // unterminated array
-    assert.isTrue(json.tryParse("{\"a\": 1") == undefined);    // unterminated object
-    assert.isTrue(json.tryParse("") == undefined);             // empty
-    assert.isTrue(json.tryParse("123 x") == undefined);        // trailing garbage
-    assert.isTrue(json.tryParse("[1,,2]") == undefined);       // missing value
+    assert.isTrue(json.tryParse("[1,2,") == undefined);
+    assert.isTrue(json.tryParse("{\"a\": 1") == undefined);
+    assert.isTrue(json.tryParse("") == undefined);
+    assert.isTrue(json.tryParse("123 x") == undefined);
+    assert.isTrue(json.tryParse("[1,,2]") == undefined);
 }
 
 @test

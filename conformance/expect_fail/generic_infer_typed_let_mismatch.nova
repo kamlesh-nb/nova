@@ -1,12 +1,10 @@
 // EXPECT-FAIL: typecheck
-// B1-let must not over-relax: inferring T from the argument (int) and then storing into a declared
-// `string` let is a genuine type mismatch and must still be rejected.
 import assert;
 
 fn id<T>(v: T): T { return v; }
 
 @test
 fn mismatch(): void {
-    let x: string = id(42);   // T = int, declared string -> incompatible
+    let x: string = id(42);
     assert.isTrue(x == "x");
 }

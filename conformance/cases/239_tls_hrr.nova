@@ -1,8 +1,3 @@
-// TLS 1.3 HelloRetryRequest (RFC 8446 sections 4.1.4 + 4.4.1). Covers detecting an HRR, the special
-// transcript rewrite (ClientHello1 replaced by the synthetic message_hash message), cookie parsing, and
-// building the second ClientHello with a single-group key_share plus the echoed cookie. The live retry
-// exchange is covered against openssl s_server -groups P-256 with a client that withholds the P-256
-// key_share.
 import crypto.tls.13.tlsClient;
 import bytes;
 import assert;
@@ -43,36 +38,29 @@ fn findPattern(out: ptr, n: int, hex: string): int {
     return 0 - 1;
 }
 
-// A HelloRetryRequest is recognised by the fixed SHA-256("HelloRetryRequest") random sentinel; a normal
-// ServerHello (different random) is not.
 const HRR: string = "020000340303cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c00130100000c002b00020304003300020017";
 
 @test
 fn hrr_detection(): void {
     assert.isTrue(tlsClient.isHelloRetryRequest(hexBuf(HRR)));
-    // A ServerHello with an all-zero random is not an HRR.
     let sh = bytes.alloc(64);
     bytes.write_byte(sh, 0, 0x02);
     assert.isTrue(!tlsClient.isHelloRetryRequest(sh));
 }
 
-// Processing the HRR selects the requested group and rewrites the transcript to
-// SHA256( message_hash(254) || 00 00 20 || SHA256(ClientHello1) || HRR ).
 const TH_AFTER_HRR: string = "7fa5da070c64824f9e38a8317718e256ad5604a50bed6c1fdf401775780d22e4";
 
 @test
 fn hrr_transcript_rewrite(): void {
     let c = tlsClient.newClient(bytes.alloc(32), bytes.alloc(32), bytes.alloc(48));
-    // ClientHello1 is 20 opaque bytes 00..13 (the exact contents are irrelevant to the rewrite).
     c.addClientHello(hexBuf("000102030405060708090a0b0c0d0e0f10111213"), 20);
     let group = c.processHelloRetryRequest(hexBuf(HRR), 56);
-    assert.equalInt(group, 0x0017);                 // secp256r1 requested
+    assert.equalInt(group, 0x0017);
     let th = bytes.alloc(32);
     c.transcriptHashInto(th);
     assert.isTrue(eqHex(th, 32, TH_AFTER_HRR));
 }
 
-// A cookie extension in the HRR is captured for the second ClientHello to echo.
 const HRR_COOKIE: string = "0200003d0303cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c001301000015002b00020304003300020017002c00050003616263";
 
 @test
@@ -82,10 +70,9 @@ fn hrr_cookie_captured(): void {
     let group = c.processHelloRetryRequest(hexBuf(HRR_COOKIE), 65);
     assert.equalInt(group, 0x0017);
     assert.equalInt(c.hrrCookieSize(), 3);
-    assert.isTrue(eqHex(c.hrrCookiePtr(), 3, "616263"));  // "abc"
+    assert.isTrue(eqHex(c.hrrCookiePtr(), 3, "616263"));
 }
 
-// ClientHello2 carries a single secp256r1 key_share and echoes the cookie.
 @test
 fn hrr_client_hello2(): void {
     let c = tlsClient.newClient(bytes.alloc(32), bytes.alloc(32), bytes.alloc(48));
@@ -96,12 +83,8 @@ fn hrr_client_hello2(): void {
     let pk = bytes.alloc(32);
     let pkP = bytes.alloc(65); bytes.write_byte(pkP, 0, 4);
     let out = bytes.alloc(512);
-    // groupMask 2 = secp256r1 only.
     let noPsk = bytes.alloc(1);
     let n = tlsClient.buildClientHelloEx(rnd, sid, pk, pkP, bytes.alloc(97), "example.com", "", 2, c.hrrCookiePtr(), c.hrrCookieSize(), noPsk, 0, 0, 0, 0, out);
-    // The key_share carries exactly one entry: secp256r1 (0017) with a 65-byte value; no x25519 (001d).
-    // ext_type 0033, ext_len 0047, client_shares_len 0045, group 0017, ke_len 0041, then 04 00 00 ...
     assert.isTrue(findPattern(out, n, "003300470045001700410400000000") >= 0);
-    // The cookie extension (002c) echoes "abc" (len 3).
     assert.isTrue(findPattern(out, n, "002c00050003616263") >= 0);
 }

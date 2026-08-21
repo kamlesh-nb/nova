@@ -1,6 +1,4 @@
 // EXPECT-FAIL: typecheck
-// NEGATIVE test: fixed arrays are PRIMITIVES ONLY. A struct element would be stored as a raw value-word
-// with no ARC and read back as garbage, so it is rejected at type-check time (use List for structs).
 import assert;
 struct P { v: int }
 @test

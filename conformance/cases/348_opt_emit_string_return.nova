@@ -1,19 +1,12 @@
-// Emit-subset growth: string RETURNS now emit, and a latent ARC ordering bug is fixed. Two parts:
-//  1. Return ordering: the return value is bound to a temp BEFORE the scope-end releases, so a return
-//     expression that reads an owned local (e.g. `return c.len()`) is evaluated before that local is freed.
-//     Previously the release was lowered ahead of the use -> a use-after-free.
-//  2. Return-acquisition: a returned BORROWED string is retained (the caller gets a new owner), while a moved
-//     owned local or a fresh owned temporary is not -- so ownership out is balanced (validated by --arc).
-// Under NOVA_OPT_EMIT these helpers compile from the emit path; both must agree AND stay ARC-balanced.
 import assert;
 import string;
 
-fn passthru(s: string): string { return s; }                 // borrowed param -> retained
-fn firstOf(a: string, b: string): string { return a; }        // borrowed -> retained
-fn joined(a: string, b: string): string { return a.concat(b); } // fresh owned -> moved, no retain
-fn lenViaLocal(a: string, b: string): int {                    // the ordering case: an owned local returned by move
+fn passthru(s: string): string { return s; }
+fn firstOf(a: string, b: string): string { return a; }
+fn joined(a: string, b: string): string { return a.concat(b); }
+fn lenViaLocal(a: string, b: string): int {
     let c = a.concat(b);
-    return len(c);                                              // free-fn form; c is read then released after
+    return len(c);
 }
 
 @test

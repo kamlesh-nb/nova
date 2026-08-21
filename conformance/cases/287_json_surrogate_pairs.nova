@@ -1,16 +1,9 @@
-// G3: the JSON decoder UTF-8-encoded each `\uXXXX` escape independently, with no surrogate-pair combining
-// and no 4-byte branch. A JSON astral character is written as a high+low surrogate pair
-// (`😀` == U+1F600 😀), so the decoder emitted two invalid 3-byte sequences (6 bytes of
-// mojibake) instead of the correct 4-byte UTF-8. Data corruption in the shared JSON parser, so every HTTP
-// / DB path that receives JS-escaped emoji was affected. Fix: combine a high surrogate (D800..DBFF) with a
-// following low surrogate (DC00..DFFF) into one code point and encode astral code points as four bytes.
 
 import assert;
 import serde.json;
 
 @test
 fn test_surrogate_pair_astral(): void {
-    // U+1F600 GRINNING FACE, correct UTF-8 = F0 9F 98 80.
     let s = json.asString(json.get(json.parse("{\"e\":\"\\uD83D\\uDE00\"}"), "e")) ?? "MISSING";
     assert.equalInt(s.length, 4);
     assert.equalInt(s[0], 240);
@@ -21,12 +14,10 @@ fn test_surrogate_pair_astral(): void {
 
 @test
 fn test_astral_range_ends(): void {
-    // U+10000 -> F0 90 80 80
     let lo = json.asString(json.get(json.parse("{\"x\":\"\\uD800\\uDC00\"}"), "x")) ?? "";
     assert.equalInt(lo.length, 4);
     assert.equalInt(lo[0], 240);
     assert.equalInt(lo[1], 144);
-    // U+10FFFF -> F4 8F BF BF
     let hi = json.asString(json.get(json.parse("{\"x\":\"\\uDBFF\\uDFFF\"}"), "x")) ?? "";
     assert.equalInt(hi.length, 4);
     assert.equalInt(hi[0], 244);
@@ -35,15 +26,12 @@ fn test_astral_range_ends(): void {
 
 @test
 fn test_bmp_escapes_unaffected(): void {
-    // U+20AC EURO SIGN -> E2 82 AC (3 bytes)
     let euro = json.asString(json.get(json.parse("{\"x\":\"\\u20AC\"}"), "x")) ?? "";
     assert.equalInt(euro.length, 3);
     assert.equalInt(euro[0], 226);
-    // U+00E9 é -> C3 A9 (2 bytes)
     let e = json.asString(json.get(json.parse("{\"x\":\"\\u00E9\"}"), "x")) ?? "";
     assert.equalInt(e.length, 2);
     assert.equalInt(e[0], 195);
-    // U+0041 'A' (1 byte)
     let a = json.asString(json.get(json.parse("{\"x\":\"\\u0041\"}"), "x")) ?? "";
     assert.equalInt(a.length, 1);
     assert.equalInt(a[0], 65);
@@ -51,16 +39,15 @@ fn test_bmp_escapes_unaffected(): void {
 
 @test
 fn test_lone_high_surrogate_does_not_eat_following_text(): void {
-    // A high surrogate with no low surrogate after it must not consume the following character.
     let lone = json.asString(json.get(json.parse("{\"x\":\"\\uD83DX\"}"), "x")) ?? "";
-    assert.equalInt(lone.length, 4);   // 3 bytes for the surrogate + 1 for 'X'
-    assert.equalInt(lone[3], 88);      // 'X'
+    assert.equalInt(lone.length, 4);
+    assert.equalInt(lone[3], 88);
 }
 
 @test
 fn test_pair_surrounded_by_ascii(): void {
     let mix = json.asString(json.get(json.parse("{\"x\":\"a\\uD83D\\uDE00b\"}"), "x")) ?? "";
-    assert.equalInt(mix.length, 6);    // 'a' + 4 + 'b'
+    assert.equalInt(mix.length, 6);
     assert.equalInt(mix[0], 97);
     assert.equalInt(mix[5], 98);
 }

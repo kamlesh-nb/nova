@@ -1,9 +1,3 @@
-// TLS 1.3 (RFC 8446) client handshake state machine in Nova, no external library (M9 phase E). This is
-// the I/O-agnostic driver: it consumes the handshake messages a server sends and produces the client's
-// responses, threading the tls13 key schedule, the tls13hs authentication, and the record layer. Wiring
-// it to a socket (the reactor AsyncStream) is done by the caller; see the TLS client example.
-//
-// References: RFC 8446. Verified against the RFC 8448 "Simple 1-RTT Handshake" trace.
 import bytes;
 import crypto.tls.13.tls;
 import crypto.tls.13.handshake;
@@ -28,18 +22,16 @@ fn putHex(out: ptr, p: int, hex: string): int {
     return p + n;
 }
 
-// Write an application_layer_protocol_negotiation extension (RFC 7301) for the comma-separated protocol
-// list `alpn` at out[p]. Returns the new position (unchanged if `alpn` is empty).
 fn putAlpn(out: ptr, p: int, alpn: string): int {
     if (alpn.length == 0) { return p; }
-    bytes.write_byte(out, p, 0x00); bytes.write_byte(out, p + 1, 0x10); p = p + 2;   // ext_type: ALPN
-    let extLenPos = p; p = p + 2;                  // extension_data length (backpatched)
-    let listLenPos = p; p = p + 2;                 // ProtocolNameList length (backpatched)
+    bytes.write_byte(out, p, 0x00); bytes.write_byte(out, p + 1, 0x10); p = p + 2;
+    let extLenPos = p; p = p + 2;
+    let listLenPos = p; p = p + 2;
     let listStart = p;
     let i = 0;
     while (i < alpn.length) {
         let j = i;
-        while (j < alpn.length && alpn[j] != 44) { j = j + 1; }   // 44 = ','
+        while (j < alpn.length && alpn[j] != 44) { j = j + 1; }
         let tlen = j - i;
         if (tlen > 0) {
             bytes.write_byte(out, p, tlen); p = p + 1;
@@ -56,27 +48,18 @@ fn putAlpn(out: ptr, p: int, alpn: string): int {
     return p;
 }
 
-// Write a server_name (SNI) extension (RFC 6066) for `host` at out[p]. Returns the new position.
 fn putSni(out: ptr, p: int, host: string): int {
     let hl = host.length;
-    p = putHex(out, p, "0000");                    // extension_type: server_name
+    p = putHex(out, p, "0000");
     bytes.write_byte(out, p, ((5 + hl) >> 8) & 0xff); bytes.write_byte(out, p + 1, (5 + hl) & 0xff); p = p + 2;
     bytes.write_byte(out, p, ((3 + hl) >> 8) & 0xff); bytes.write_byte(out, p + 1, (3 + hl) & 0xff); p = p + 2;
-    bytes.write_byte(out, p, 0); p = p + 1;        // name_type: host_name
+    bytes.write_byte(out, p, 0); p = p + 1;
     bytes.write_byte(out, p, (hl >> 8) & 0xff); bytes.write_byte(out, p + 1, hl & 0xff); p = p + 2;
     let i = 0;
     while (i < hl) { bytes.write_byte(out, p + i, host[i]); i = i + 1; }
     return p + hl;
 }
 
-// Build a TLS 1.3 ClientHello handshake message into out for the given server hostname. Offers X25519 +
-// AES-128-GCM-SHA256 / AES-256-GCM-SHA384 / ChaCha20-Poly1305 with server_name (SNI),
-// supported_versions=1.3, supported_groups=x25519+secp256r1, signature_algorithms (RSA-PSS/PKCS1 + ECDSA
-// P-256, all SHA-256), psk_key_exchange_modes (psk_dhe_ke), and two key_share entries carrying our
-// ephemeral public keys (the server picks one group). random and sessionId are 32 bytes each; ephPub is
-// our 32-byte X25519 public key and ephPubP256 is our 65-byte uncompressed secp256r1 point. `alpn` is a
-// comma-separated list of ALPN protocol names to offer (e.g. "h2,http/1.1"); an empty string omits the
-// application_layer_protocol_negotiation extension. Returns the message length.
 pub fn buildClientHello(random: ptr, sessionId: ptr, ephPub: ptr, ephPubP256: ptr, host: string, alpn: string, out: ptr): int {
     let empty = bytes.alloc(1);
     let n = buildClientHelloEx(random, sessionId, ephPub, ephPubP256, empty, host, alpn, 3, empty, 0, empty, 0, 0, 0, 0, out);
@@ -84,42 +67,33 @@ pub fn buildClientHello(random: ptr, sessionId: ptr, ephPub: ptr, ephPubP256: pt
     return n;
 }
 
-// The general ClientHello builder. `groupMask` selects which key_share entries to include: bit 0 (value
-// 1) = x25519, bit 1 (value 2) = secp256r1 (3 = both, the initial ClientHello). supported_groups always
-// lists both groups regardless. `cookie`/`cookieLen` echo a HelloRetryRequest cookie (RFC 8446 4.2.2)
-// when cookieLen > 0. A ClientHello2 (the retry) sets groupMask to just the server-selected group and
-// carries the cookie; everything else matches the first ClientHello.
 pub fn buildClientHelloEx(random: ptr, sessionId: ptr, ephPub: ptr, ephPubP256: ptr, ephPubP384: ptr, host: string, alpn: string,
                           groupMask: int, cookie: ptr, cookieLen: int,
                           pskTicket: ptr, pskTicketLen: int, obfAge: long, binderLen: int, earlyData: int, out: ptr): int {
-    let p = 4;                                     // reserve the 4-byte handshake header
-    bytes.write_byte(out, p, 0x03); bytes.write_byte(out, p + 1, 0x03); p = p + 2;   // legacy_version
+    let p = 4;
+    bytes.write_byte(out, p, 0x03); bytes.write_byte(out, p + 1, 0x03); p = p + 2;
     let i = 0;
     while (i < 32) { bytes.write_byte(out, p + i, bytes.read_byte(random, i)); i = i + 1; }
     p = p + 32;
-    bytes.write_byte(out, p, 0x20); p = p + 1;     // legacy_session_id (32 bytes, middlebox compat)
+    bytes.write_byte(out, p, 0x20); p = p + 1;
     i = 0;
     while (i < 32) { bytes.write_byte(out, p + i, bytes.read_byte(sessionId, i)); i = i + 1; }
     p = p + 32;
-    p = putHex(out, p, "0006130113021303");        // cipher_suites: AES-128-GCM-SHA256, AES-256-GCM-SHA384, CHACHA20-POLY1305-SHA256. Order is fixed (resumption/0-RTT binder KATs hash these exact bytes); throughput preference is enforced SERVER-side instead (tlsServer prefers ChaCha), which is what real servers honour.
-    p = putHex(out, p, "0100");                    // legacy_compression_methods: null
+    p = putHex(out, p, "0006130113021303");
+    p = putHex(out, p, "0100");
 
-    let extLenPos = p; p = p + 2;                  // extensions length (backpatched)
+    let extLenPos = p; p = p + 2;
     let extStart = p;
-    p = putSni(out, p, host);                      // server_name (SNI)
-    p = putHex(out, p, "002b0003020304");          // supported_versions: TLS 1.3
-    p = putHex(out, p, "000a00080006001d00170018");// supported_groups: x25519, secp256r1, secp384r1
-    p = putHex(out, p, "000d00080006080404030401");// signature_algorithms: rsa_pss/ecdsa/rsa_pkcs1 SHA-256
-    p = putHex(out, p, "002d00020101");            // psk_key_exchange_modes: psk_dhe_ke
-    p = putHex(out, p, "001c00024001");            // record_size_limit: 16385 (TLS 1.3 max) (RFC 8449)
-    // status_request (OCSP stapling, RFC 6066): status_type=ocsp, empty responder_id_list +
-    // request_extensions. Asks the server to staple an OCSP response in its Certificate message. Only on a
-    // FULL handshake (binderLen == 0): a resumption/PSK handshake sends no Certificate, so a staple cannot
-    // apply -- and leaving the resumption ClientHello unchanged keeps the PSK-binder transcript stable.
+    p = putSni(out, p, host);
+    p = putHex(out, p, "002b0003020304");
+    p = putHex(out, p, "000a00080006001d00170018");
+    p = putHex(out, p, "000d00080006080404030401");
+    p = putHex(out, p, "002d00020101");
+    p = putHex(out, p, "001c00024001");
     if (binderLen == 0) { p = putHex(out, p, "000500050100000000"); }
-    p = putAlpn(out, p, alpn);                      // application_layer_protocol_negotiation (if offered)
-    if (cookieLen > 0) {                            // cookie: echo the HelloRetryRequest cookie
-        bytes.write_byte(out, p, 0x00); bytes.write_byte(out, p + 1, 0x2c); p = p + 2;   // ext_type: cookie
+    p = putAlpn(out, p, alpn);
+    if (cookieLen > 0) {
+        bytes.write_byte(out, p, 0x00); bytes.write_byte(out, p + 1, 0x2c); p = p + 2;
         let cExt = cookieLen + 2;
         bytes.write_byte(out, p, (cExt >> 8) & 0xff); bytes.write_byte(out, p + 1, cExt & 0xff); p = p + 2;
         bytes.write_byte(out, p, (cookieLen >> 8) & 0xff); bytes.write_byte(out, p + 1, cookieLen & 0xff); p = p + 2;
@@ -127,11 +101,9 @@ pub fn buildClientHelloEx(random: ptr, sessionId: ptr, ephPub: ptr, ephPubP256: 
         while (ci < cookieLen) { bytes.write_byte(out, p + ci, bytes.read_byte(cookie, ci)); ci = ci + 1; }
         p = p + cookieLen;
     }
-    // key_share: ext_type 0033, then client_shares (backpatched lengths). Entries are selected by
-    // groupMask: x25519 (001d, 32 bytes) and/or secp256r1 (0017, 65-byte uncompressed point).
-    bytes.write_byte(out, p, 0x00); bytes.write_byte(out, p + 1, 0x33); p = p + 2;   // ext_type: key_share
-    let ksExtLenPos = p; p = p + 2;                // extension_data length (backpatched)
-    let ksListLenPos = p; p = p + 2;               // client_shares length (backpatched)
+    bytes.write_byte(out, p, 0x00); bytes.write_byte(out, p + 1, 0x33); p = p + 2;
+    let ksExtLenPos = p; p = p + 2;
+    let ksListLenPos = p; p = p + 2;
     let ksListStart = p;
     if ((groupMask & 1) != 0) {
         p = putHex(out, p, "001d0020");
@@ -145,7 +117,7 @@ pub fn buildClientHelloEx(random: ptr, sessionId: ptr, ephPub: ptr, ephPubP256: 
         while (i < 65) { bytes.write_byte(out, p + i, bytes.read_byte(ephPubP256, i)); i = i + 1; }
         p = p + 65;
     }
-    if ((groupMask & 4) != 0) {                    // secp384r1 (0018, 97-byte uncompressed point)
+    if ((groupMask & 4) != 0) {
         p = putHex(out, p, "00180061");
         i = 0;
         while (i < 97) { bytes.write_byte(out, p + i, bytes.read_byte(ephPubP384, i)); i = i + 1; }
@@ -156,13 +128,11 @@ pub fn buildClientHelloEx(random: ptr, sessionId: ptr, ephPub: ptr, ephPubP256: 
     let ksExtLen = p - (ksExtLenPos + 2);
     bytes.write_byte(out, ksExtLenPos, (ksExtLen >> 8) & 0xff); bytes.write_byte(out, ksExtLenPos + 1, ksExtLen & 0xff);
 
-    if (earlyData != 0) { p = putHex(out, p, "002a0000"); }   // early_data extension (empty in ClientHello)
-    // pre_shared_key (RFC 8446 4.2.11) MUST be the LAST extension. The binder value is left zeroed here;
-    // the caller fills it via fillResumptionBinder once the truncated-ClientHello transcript is known.
+    if (earlyData != 0) { p = putHex(out, p, "002a0000"); }
     if (binderLen > 0) {
-        bytes.write_byte(out, p, 0x00); bytes.write_byte(out, p + 1, 0x29); p = p + 2;   // ext_type: pre_shared_key
-        let idLen = 2 + pskTicketLen + 4;              // one PskIdentity: opaque<2> ticket + uint32 age
-        let bindersLen = 1 + binderLen;                // one PskBinderEntry: opaque<1> value
+        bytes.write_byte(out, p, 0x00); bytes.write_byte(out, p + 1, 0x29); p = p + 2;
+        let idLen = 2 + pskTicketLen + 4;
+        let bindersLen = 1 + binderLen;
         let pskExtLen = 2 + idLen + 2 + bindersLen;
         bytes.write_byte(out, p, (pskExtLen >> 8) & 0xff); bytes.write_byte(out, p + 1, pskExtLen & 0xff); p = p + 2;
         bytes.write_byte(out, p, (idLen >> 8) & 0xff); bytes.write_byte(out, p + 1, idLen & 0xff); p = p + 2;
@@ -183,7 +153,7 @@ pub fn buildClientHelloEx(random: ptr, sessionId: ptr, ephPub: ptr, ephPubP256: 
     bytes.write_byte(out, extLenPos, (extLen >> 8) & 0xff);
     bytes.write_byte(out, extLenPos + 1, extLen & 0xff);
 
-    let bodyLen = p - 4;                            // handshake header: type 0x01 + 3-byte length
+    let bodyLen = p - 4;
     bytes.write_byte(out, 0, 0x01);
     bytes.write_byte(out, 1, (bodyLen >> 16) & 0xff);
     bytes.write_byte(out, 2, (bodyLen >> 8) & 0xff);
@@ -191,10 +161,8 @@ pub fn buildClientHelloEx(random: ptr, sessionId: ptr, ephPub: ptr, ephPubP256: 
     return p;
 }
 
-// Downgrade protection (RFC 8446 section 4.1.3): if a TLS 1.3 client sees the "DOWNGRD" sentinel in the
-// last 8 bytes of the ServerHello random, a middlebox forced a lower version and the client must abort.
 pub fn hasDowngradeSentinel(shMsg: ptr): bool {
-    let tag = "444f574e47524400";                  // "DOWNGRD" + 0x00 (0x01 variant differs only in the last byte)
+    let tag = "444f574e47524400";
     let i = 0;
     while (i < 7) {
         if (bytes.read_byte(shMsg, 30 + i) != chNib(tag[i * 2]) * 16 + chNib(tag[i * 2 + 1])) { return false; }
@@ -204,55 +172,53 @@ pub fn hasDowngradeSentinel(shMsg: ptr): bool {
     return last == 0 || last == 1;
 }
 
-// A ServerHello is a HelloRetryRequest when its random equals the fixed SHA-256("HelloRetryRequest")
-// sentinel (RFC 8446 section 4.1.3). shMsg is the ServerHello handshake message.
 pub fn isHelloRetryRequest(shMsg: ptr): bool {
     let hrr = "cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c";
     let i = 0;
     while (i < 32) {
         let want = chNib(hrr[i * 2]) * 16 + chNib(hrr[i * 2 + 1]);
-        if (bytes.read_byte(shMsg, 6 + i) != want) { return false; }   // random starts at offset 6
+        if (bytes.read_byte(shMsg, 6 + i) != want) { return false; }
         i = i + 1;
     }
     return true;
 }
 
 struct TlsClient {
-    pub kind: int,                       // HKDF hash: 0 = SHA-256
-    pub suite: int,                      // 0 = AES-128-GCM, 1 = AES-256-GCM, 2 = ChaCha20-Poly1305
-    pub eph: ptr,                        // our ephemeral X25519 private key (32 bytes)
-    pub ephP256: ptr,                    // our ephemeral secp256r1 private scalar (32 bytes)
-    pub ephP384: ptr,                    // our ephemeral secp384r1 private scalar (48 bytes)
+    pub kind: int,
+    pub suite: int,
+    pub eph: ptr,
+    pub ephP256: ptr,
+    pub ephP384: ptr,
     pub trBuf: ptr, pub trLen: int, pub trCap: int,
-    pub hs: ptr,                         // handshake secret
-    pub chs: ptr, pub shs: ptr,          // client / server handshake traffic secrets
-    pub cKey: ptr, pub cIv: ptr,         // client handshake write key / IV
-    pub sKey: ptr, pub sIv: ptr,         // server handshake write key / IV
+    pub hs: ptr,
+    pub chs: ptr, pub shs: ptr,
+    pub cKey: ptr, pub cIv: ptr,
+    pub sKey: ptr, pub sIv: ptr,
     pub master: ptr,
-    pub cap: ptr, pub sap: ptr,          // client / server application traffic secrets
+    pub cap: ptr, pub sap: ptr,
     pub capKey: ptr, pub capIv: ptr,
     pub sapKey: ptr, pub sapIv: ptr,
-    pub sSeq: long, pub cSeq: long,      // server / client record sequence numbers
+    pub sSeq: long, pub cSeq: long,
     pub certVerifyOk: bool,
     pub finishedOk: bool,
-    pub hsBuf: ptr, pub hsCap: int, pub hsLen: int, pub hsPos: int,   // handshake reassembly buffer
-    pub leafOff: int, pub leafLen: int,  // leaf certificate location within hsBuf
-    pub certListOff: int, pub certListLen: int,   // certificate_list region within hsBuf
-    pub alpnSel: string,                          // ALPN protocol the server selected ("" = none)
-    pub hrrCookie: ptr, pub hrrCookieLen: int,    // cookie echoed from a HelloRetryRequest (len 0 = none)
-    pub resMaster: ptr,                           // resumption_master_secret (derived at handshake end)
-    pub ticket: ptr, pub ticketLen: int,          // a received (or offered) session ticket
-    pub ticketPsk: ptr, pub ticketAgeAdd: long,   // its derived PSK + ticket_age_add
-    pub ticketKind: int, pub haveTicket: bool,    // the PSK's hash (0 SHA-256 / 1 SHA-384) + presence
-    pub offerPsk: bool, pub pskAccepted: bool,    // this handshake offers a PSK / the server accepted it
-    pub eKey: ptr, pub eIv: ptr, pub eSeq: long,  // 0-RTT client_early_traffic key/IV/sequence
-    pub offerEarly: bool, pub earlyAccepted: bool, // this handshake offers 0-RTT / the server accepted it
-    pub sendLimit: int,                           // peer's record_size_limit (RFC 8449); max send plaintext = sendLimit-1
-    pub certRequested: bool,                      // mTLS: the server sent a CertificateRequest
-    pub haveClientCert: bool,                     // a client certificate + key is configured
-    pub clientCertDer: ptr, pub clientCertLen: int,   // client leaf certificate (DER)
-    pub clientKey: ptr,                           // client P-256 private scalar (32 bytes) for CertificateVerify
-    pub ocspOff: int, pub ocspLen: int,           // stapled OCSP response location within hsBuf (0 = none)
+    pub hsBuf: ptr, pub hsCap: int, pub hsLen: int, pub hsPos: int,
+    pub leafOff: int, pub leafLen: int,
+    pub certListOff: int, pub certListLen: int,
+    pub alpnSel: string,
+    pub hrrCookie: ptr, pub hrrCookieLen: int,
+    pub resMaster: ptr,
+    pub ticket: ptr, pub ticketLen: int,
+    pub ticketPsk: ptr, pub ticketAgeAdd: long,
+    pub ticketKind: int, pub haveTicket: bool,
+    pub offerPsk: bool, pub pskAccepted: bool,
+    pub eKey: ptr, pub eIv: ptr, pub eSeq: long,
+    pub offerEarly: bool, pub earlyAccepted: bool,
+    pub sendLimit: int,
+    pub certRequested: bool,
+    pub haveClientCert: bool,
+    pub clientCertDer: ptr, pub clientCertLen: int,
+    pub clientKey: ptr,
+    pub ocspOff: int, pub ocspLen: int,
 }
 
 pub fn newClient(ephPriv: ptr, ephPrivP256: ptr, ephPrivP384: ptr): TlsClient {
@@ -274,22 +240,17 @@ pub fn newClient(ephPriv: ptr, ephPrivP256: ptr, ephPrivP384: ptr): TlsClient {
     };
 }
 
-// A stapled OCSP location within a buffer (offset + length; len 0 = no staple).
 pub struct OcspStaple { pub off: int, pub len: int, init(off: int, len: int) { self.off = off; self.len = len; } }
 
-// Scan a TLS 1.3 CertificateEntry's extensions (buf[extOff .. extOff+extLen)) for a status_request
-// extension (0x0005) carrying a stapled OCSP response, and return its DER location. The extension_data is
-// a CertificateStatus: status_type(1)=1 (ocsp) || OCSPResponse<3> (a 3-byte length then the DER). Pure,
-// so it is unit-testable on a synthetic entry.
 pub fn findOcspStaple(buf: ptr, extOff: int, extLen: int): OcspStaple {
     let p = extOff;
     let end = extOff + extLen;
     while (p + 4 <= end) {
         let etype = (bytes.read_byte(buf, p) << 8) | bytes.read_byte(buf, p + 1);
         let elen = (bytes.read_byte(buf, p + 2) << 8) | bytes.read_byte(buf, p + 3);
-        if (etype == 0x0005) {                       // status_request -> CertificateStatus
+        if (etype == 0x0005) {
             let cs = p + 4;
-            if (elen >= 4 && bytes.read_byte(buf, cs) == 1) {   // status_type ocsp
+            if (elen >= 4 && bytes.read_byte(buf, cs) == 1) {
                 let rlen = (bytes.read_byte(buf, cs + 1) << 16) | (bytes.read_byte(buf, cs + 2) << 8) | bytes.read_byte(buf, cs + 3);
                 return OcspStaple(cs + 4, rlen);
             }
@@ -299,8 +260,6 @@ pub fn findOcspStaple(buf: ptr, extOff: int, extLen: int): OcspStaple {
     return OcspStaple(0, 0);
 }
 
-// mTLS: configure the client certificate + P-256 signing key presented when the server sends a
-// CertificateRequest. `certDer` is the leaf certificate (DER), `key` the 32-byte private scalar.
 pub fn setClientCert(self: TlsClient, certDer: ptr, certLen: int, key: ptr): void {
     self.clientCertDer = certDer;
     self.clientCertLen = certLen;
@@ -311,11 +270,6 @@ pub fn setClientCert(self: TlsClient, certDer: ptr, certLen: int, key: ptr): voi
 
 pub fn wasCertRequested(self: TlsClient): bool { return self.certRequested; }
 
-// mTLS: build the client's authentication flight in response to a CertificateRequest, as ONE protected
-// (0x16) record under the client handshake key, and add its messages to the transcript. With a client
-// cert configured this is Certificate + CertificateVerify; WITHOUT one it is an EMPTY Certificate and
-// NO CertificateVerify (RFC 8446 4.4.2 -- a valid "I have no certificate" reply). cSeq advances by one
-// so the following Finished is protected at the next sequence number.
 pub fn buildClientCertFlightRecord(self: TlsClient, out: ptr): int {
     let hl = trHashLen(self);
     let inner = bytes.alloc(4 + self.clientCertLen + 256);
@@ -324,7 +278,7 @@ pub fn buildClientCertFlightRecord(self: TlsClient, out: ptr): int {
     trAdd(self, inner, certMsgLen);
     let innerLen = certMsgLen;
     if (self.haveClientCert) {
-        let hCert = bytes.alloc(48); trHash(self, hCert);           // transcript through client Certificate
+        let hCert = bytes.alloc(48); trHash(self, hCert);
         let cvPtr = (inner as long + certMsgLen) as ptr;
         let cvLen = buildClientCertVerify(hCert, hl, self.clientKey, cvPtr);
         trAdd(self, cvPtr, cvLen);
@@ -337,9 +291,6 @@ pub fn buildClientCertFlightRecord(self: TlsClient, out: ptr): int {
     return n;
 }
 
-// A client that resumes with a previously issued ticket: it offers the PSK (pre_shared_key) alongside the
-// normal (EC)DHE key_share. `psk` is the resumption PSK (pskLen bytes = the ticket's hash length), `kind`
-// its hash (0 SHA-256 / 1 SHA-384), `ticket` the opaque ticket identity, and `ageAdd` the ticket_age_add.
 pub fn newClientResume(ephPriv: ptr, ephPrivP256: ptr, ephPrivP384: ptr, psk: ptr, pskLen: int, kind: int,
                        ticket: ptr, ticketLen: int, ageAdd: long): TlsClient {
     let c = newClient(ephPriv, ephPrivP256, ephPrivP384);
@@ -358,17 +309,12 @@ pub fn newClientResume(ephPriv: ptr, ephPrivP256: ptr, ephPrivP384: ptr, psk: pt
     return c;
 }
 
-// Process a HelloRetryRequest (RFC 8446 sections 4.1.4 + 4.4.1). Parses the selected cipher suite (which
-// fixes the transcript hash), the retry's selected_group (0 if the HRR carried no key_share), and an
-// optional cookie (stored for the second ClientHello to echo). Performs the special transcript rewrite:
-// ClientHello1 is replaced by a synthetic "message_hash" message, then the HRR is appended. `hrr` is the
-// HelloRetryRequest handshake message and `hrrLen` its length. Returns the selected group (or 0).
 pub fn processHelloRetryRequest(self: TlsClient, hrr: ptr, hrrLen: int): int {
-    let p = 4 + 2 + 32;                            // msg header, legacy_version, random
+    let p = 4 + 2 + 32;
     let sidLen = bytes.read_byte(hrr, p);
     p = p + 1 + sidLen;
     let cipher = (bytes.read_byte(hrr, p) << 8) | bytes.read_byte(hrr, p + 1);
-    p = p + 2 + 1;                                 // cipher_suite + legacy_compression_method
+    p = p + 2 + 1;
     if (cipher == 0x1302) { self.suite = 1; self.kind = 1; }
     else if (cipher == 0x1303) { self.suite = 2; self.kind = 0; }
     else { self.suite = 0; self.kind = 0; }
@@ -380,9 +326,9 @@ pub fn processHelloRetryRequest(self: TlsClient, hrr: ptr, hrrLen: int): int {
         let etype = (bytes.read_byte(hrr, p) << 8) | bytes.read_byte(hrr, p + 1);
         let elen = (bytes.read_byte(hrr, p + 2) << 8) | bytes.read_byte(hrr, p + 3);
         let body = p + 4;
-        if (etype == 0x0033) {                     // key_share: the retry carries only selected_group
+        if (etype == 0x0033) {
             group = (bytes.read_byte(hrr, body) << 8) | bytes.read_byte(hrr, body + 1);
-        } else if (etype == 0x002c) {              // cookie (RFC 8446 4.2.2)
+        } else if (etype == 0x002c) {
             let clen = (bytes.read_byte(hrr, body) << 8) | bytes.read_byte(hrr, body + 1);
             bytes.free(self.hrrCookie);
             self.hrrCookie = bytes.alloc(clen);
@@ -392,15 +338,12 @@ pub fn processHelloRetryRequest(self: TlsClient, hrr: ptr, hrrLen: int): int {
         }
         p = body + elen;
     }
-    // Transcript rewrite (RFC 8446 4.4.1): replace ClientHello1 with
-    //   message_hash(254) || 00 00 Hash.length || Hash(ClientHello1)
-    // using the now-negotiated suite hash, then append the HelloRetryRequest.
     let hl = trHashLen(self);
     let h1 = bytes.alloc(hl);
-    trHash(self, h1);                              // hash of ClientHello1 (the whole current transcript)
+    trHash(self, h1);
     self.trLen = 0;
     let mh = bytes.alloc(4 + hl);
-    bytes.write_byte(mh, 0, 0xfe);                 // HandshakeType message_hash(254)
+    bytes.write_byte(mh, 0, 0xfe);
     bytes.write_byte(mh, 1, 0); bytes.write_byte(mh, 2, 0); bytes.write_byte(mh, 3, hl);
     let k = 0;
     while (k < hl) { bytes.write_byte(mh, 4 + k, bytes.read_byte(h1, k)); k = k + 1; }
@@ -413,7 +356,6 @@ pub fn processHelloRetryRequest(self: TlsClient, hrr: ptr, hrrLen: int): int {
 pub fn hrrCookiePtr(self: TlsClient): ptr { return self.hrrCookie; }
 pub fn hrrCookieSize(self: TlsClient): int { return self.hrrCookieLen; }
 
-// Running transcript held as a growable buffer directly in the client (the prefix is hashed on demand).
 fn trAdd(self: TlsClient, msg: ptr, n: int): void {
     if (self.trLen + n > self.trCap) {
         let nc = (self.trLen + n) * 2;
@@ -428,22 +370,18 @@ fn trAdd(self: TlsClient, msg: ptr, n: int): void {
     while (i < n) { bytes.write_byte(self.trBuf, self.trLen + i, bytes.read_byte(msg, i)); i = i + 1; }
     self.trLen = self.trLen + n;
 }
-// Transcript hash with the negotiated suite's hash (SHA-256 for kind 0, SHA-384 for kind 1).
 fn trHash(self: TlsClient, out: ptr): void {
     if (self.kind == 1) { sha512.hash384Into(self.trBuf, self.trLen, out); }
     else { sha256.hashInto(self.trBuf, self.trLen, out); }
 }
 fn trHashLen(self: TlsClient): int { if (self.kind == 1) { return 48; } return 32; }
 
-// Record the ClientHello handshake-message bytes into the transcript (the caller built and sent them).
 pub fn addClientHello(self: TlsClient, chMsg: ptr, chLen: int): void {
     trAdd(self, chMsg, chLen);
 }
 
-// Process the ServerHello: negotiate the suite, run the ECDHE, and derive the handshake-phase secrets
-// and keys. shMsg is the ServerHello handshake message.
 pub fn processServerHello(self: TlsClient, shMsg: ptr, shLen: int): void {
-    let serverPub = bytes.alloc(97);               // fits x25519 (32) / secp256r1 (65) / secp384r1 (97)
+    let serverPub = bytes.alloc(97);
     let groupBuf = bytes.alloc(2);
     let cipher = handshake.parseServerHello(shMsg, shLen, serverPub, groupBuf);
     let group = (bytes.read_byte(groupBuf, 0) << 8) | bytes.read_byte(groupBuf, 1);
@@ -451,15 +389,11 @@ pub fn processServerHello(self: TlsClient, shMsg: ptr, shLen: int): void {
     else if (cipher == 0x1303) { self.suite = 2; self.kind = 0; }
     else { self.suite = 0; self.kind = 0; }
 
-    // Run the ECDHE for the group the server selected in its key_share (the shared secret is 32 bytes for
-    // x25519/P-256, 48 bytes for P-384).
     let ecdhe = bytes.alloc(48);
     let ecdheLen = 32;
     if (group == 0x0018) { p384.ecdh(ecdhe, self.ephP384, serverPub); ecdheLen = 48; }
     else if (group == 0x0017) { p256.ecdh(ecdhe, self.ephP256, serverPub); }
     else { x25519.scalarMult(ecdhe, self.eph, serverPub); }
-    // Early Secret: keyed by the resumption PSK when we offered one and the server accepted it
-    // (pre_shared_key echoed), otherwise the all-zero PSK. psk_dhe_ke mixes the ECDHE in either way.
     let early = bytes.alloc(48);
     if (self.offerPsk && handshake.serverAcceptedPsk(shMsg, shLen)) {
         self.pskAccepted = true;
@@ -479,16 +413,13 @@ pub fn processServerHello(self: TlsClient, shMsg: ptr, shLen: int): void {
     bytes.free(serverPub); bytes.free(groupBuf); bytes.free(ecdhe); bytes.free(early); bytes.free(derived); bytes.free(hSH);
 }
 
-// Decrypt and process the server's encrypted handshake flight (one TLSCiphertext record containing
-// EncryptedExtensions, Certificate, CertificateVerify, and Finished). Verifies the CertificateVerify
-// signature and the server Finished MAC. Returns true iff both verify.
 pub fn processFlight(self: TlsClient, record: ptr, recLen: int): bool {
     let inner = bytes.alloc(recLen);
     let innerLen = tls.recordUnprotect(self.suite, self.sKey, self.sIv, self.sSeq, record, recLen, inner);
     self.sSeq = self.sSeq + 1;
     if (innerLen < 0) { bytes.free(inner); return false; }
     let typeOut = bytes.alloc(1);
-    let contentLen = tls.innerParse(inner, innerLen, typeOut);     // strip type byte + padding
+    let contentLen = tls.innerParse(inner, innerLen, typeOut);
     bytes.free(typeOut);
 
     let leafBuf: ptr = inner;
@@ -499,28 +430,28 @@ pub fn processFlight(self: TlsClient, record: ptr, recLen: int): bool {
         let mlen = (bytes.read_byte(inner, p + 1) << 16) | (bytes.read_byte(inner, p + 2) << 8)
                  | bytes.read_byte(inner, p + 3);
         let msgLen = 4 + mlen;
-        if (mtype == 0x0b) {                         // Certificate
+        if (mtype == 0x0b) {
             let clen = (bytes.read_byte(inner, p + 8) << 16) | (bytes.read_byte(inner, p + 9) << 8)
                      | bytes.read_byte(inner, p + 10);
             leafBuf = at(inner, p + 11);
             leafLen = clen;
             trAdd(self, at(inner, p), msgLen);
-        } else if (mtype == 0x0f) {                  // CertificateVerify
+        } else if (mtype == 0x0f) {
             let hCert = bytes.alloc(48);
-            trHash(self, hCert);       // transcript through Certificate
+            trHash(self, hCert);
             let scheme = (bytes.read_byte(inner, p + 4) << 8) | bytes.read_byte(inner, p + 5);
             let siglen = (bytes.read_byte(inner, p + 6) << 8) | bytes.read_byte(inner, p + 7);
             let cert = x509.parseCert(leafBuf, leafLen);
             self.certVerifyOk = handshake.verifyCertificateVerify(cert, scheme, at(inner, p + 8), siglen, hCert, trHashLen(self));
             bytes.free(hCert);
             trAdd(self, at(inner, p), msgLen);
-        } else if (mtype == 0x14) {                  // Finished
+        } else if (mtype == 0x14) {
             let hCV = bytes.alloc(48);
-            trHash(self, hCV);         // transcript through CertificateVerify
+            trHash(self, hCV);
             self.finishedOk = handshake.verifyFinished(self.kind, self.shs, hCV, at(inner, p + 4));
             bytes.free(hCV);
             trAdd(self, at(inner, p), msgLen);
-        } else if (mtype == 0x08) {                  // EncryptedExtensions (carries the ALPN selection)
+        } else if (mtype == 0x08) {
             self.alpnSel = handshake.parseAlpnSelection(inner, p);
             if (self.offerEarly) { self.earlyAccepted = handshake.serverAcceptedEarlyData(inner, p); }
             let rsl1 = handshake.parseRecordSizeLimit(inner, p); if (rsl1 > 0) { self.sendLimit = rsl1; }
@@ -549,13 +480,9 @@ fn hsAppend(self: TlsClient, src: ptr, n: int): void {
     self.hsLen = self.hsLen + n;
 }
 
-// Feed one decrypted-or-not server record during the handshake. Real servers fragment the flight across
-// several records (and may coalesce), so the handshake messages are reassembled in hsBuf and processed as
-// each becomes complete. Returns 1 once the server Finished has been processed, 0 if more records are
-// needed, or -1 on a decryption failure. Non-handshake records (e.g. a ChangeCipherSpec) are ignored.
 pub fn feedHandshake(self: TlsClient, record: ptr, recLen: int): int {
     let rtype = bytes.read_byte(record, 0);
-    if (rtype != 0x17) { return 0; }               // e.g. ChangeCipherSpec, skip
+    if (rtype != 0x17) { return 0; }
     let inner = bytes.alloc(recLen);
     let innerLen = tls.recordUnprotect(self.suite, self.sKey, self.sIv, self.sSeq, record, recLen, inner);
     self.sSeq = self.sSeq + 1;
@@ -573,25 +500,24 @@ pub fn feedHandshake(self: TlsClient, record: ptr, recLen: int): int {
                  | (bytes.read_byte(self.hsBuf, self.hsPos + 2) << 8)
                  | bytes.read_byte(self.hsBuf, self.hsPos + 3);
         let msgLen = 4 + mlen;
-        if (self.hsPos + msgLen > self.hsLen) { return done; }   // message not fully received yet
+        if (self.hsPos + msgLen > self.hsLen) { return done; }
         let mtype = bytes.read_byte(self.hsBuf, self.hsPos);
         let mp = self.hsPos;
-        if (mtype == 0x0b) {                       // Certificate
+        if (mtype == 0x0b) {
             self.certListLen = (bytes.read_byte(self.hsBuf, mp + 5) << 16) | (bytes.read_byte(self.hsBuf, mp + 6) << 8)
                              | bytes.read_byte(self.hsBuf, mp + 7);
-            self.certListOff = mp + 8;             // start of the first CertificateEntry
+            self.certListOff = mp + 8;
             let clen = (bytes.read_byte(self.hsBuf, mp + 8) << 16) | (bytes.read_byte(self.hsBuf, mp + 9) << 8)
                      | bytes.read_byte(self.hsBuf, mp + 10);
             self.leafOff = mp + 11;
             self.leafLen = clen;
-            // OCSP stapling: the leaf CertificateEntry's extensions follow its cert_data (extLen<2>).
             let entryExtPos = self.leafOff + self.leafLen;
             let entryExtLen = (bytes.read_byte(self.hsBuf, entryExtPos) << 8) | bytes.read_byte(self.hsBuf, entryExtPos + 1);
             let staple = findOcspStaple(self.hsBuf, entryExtPos + 2, entryExtLen);
             self.ocspOff = staple.off;
             self.ocspLen = staple.len;
             trAdd(self, at(self.hsBuf, mp), msgLen);
-        } else if (mtype == 0x0f) {                // CertificateVerify
+        } else if (mtype == 0x0f) {
             let hCert = bytes.alloc(48);
             trHash(self, hCert);
             let scheme = (bytes.read_byte(self.hsBuf, mp + 4) << 8) | bytes.read_byte(self.hsBuf, mp + 5);
@@ -600,19 +526,19 @@ pub fn feedHandshake(self: TlsClient, record: ptr, recLen: int): int {
             self.certVerifyOk = handshake.verifyCertificateVerify(cert, scheme, at(self.hsBuf, mp + 8), siglen, hCert, trHashLen(self));
             bytes.free(hCert);
             trAdd(self, at(self.hsBuf, mp), msgLen);
-        } else if (mtype == 0x14) {                // Finished
+        } else if (mtype == 0x14) {
             let hCV = bytes.alloc(48);
             trHash(self, hCV);
             self.finishedOk = handshake.verifyFinished(self.kind, self.shs, hCV, at(self.hsBuf, mp + 4));
             bytes.free(hCV);
             trAdd(self, at(self.hsBuf, mp), msgLen);
             done = 1;
-        } else if (mtype == 0x08) {                // EncryptedExtensions (carries the ALPN selection)
+        } else if (mtype == 0x08) {
             self.alpnSel = handshake.parseAlpnSelection(self.hsBuf, mp);
             if (self.offerEarly) { self.earlyAccepted = handshake.serverAcceptedEarlyData(self.hsBuf, mp); }
             let rsl2 = handshake.parseRecordSizeLimit(self.hsBuf, mp); if (rsl2 > 0) { self.sendLimit = rsl2; }
             trAdd(self, at(self.hsBuf, mp), msgLen);
-        } else if (mtype == 0x0d) {                // CertificateRequest (mTLS): server wants a client cert
+        } else if (mtype == 0x0d) {
             self.certRequested = true;
             trAdd(self, at(self.hsBuf, mp), msgLen);
         } else {
@@ -623,11 +549,9 @@ pub fn feedHandshake(self: TlsClient, record: ptr, recLen: int): int {
     return done;
 }
 
-// Derive the application traffic secrets and keys over the transcript through the SERVER Finished. Call
-// this before any EndOfEarlyData is added (the application secrets must not cover it).
 pub fn deriveAppSecrets(self: TlsClient): void {
     let hSF = bytes.alloc(48);
-    trHash(self, hSF);                 // transcript through server Finished
+    trHash(self, hSF);
     handshake.masterSecret(self.kind, self.hs, self.master);
     tls.deriveTraffic(self.kind, self.master, "c ap traffic", hSF, self.cap);
     tls.deriveTraffic(self.kind, self.master, "s ap traffic", hSF, self.sap);
@@ -636,10 +560,6 @@ pub fn deriveAppSecrets(self: TlsClient): void {
     bytes.free(hSF);
 }
 
-// Compute the client Finished verify_data over the CURRENT transcript (through the server Finished, or
-// through EndOfEarlyData for an accepted 0-RTT), keyed by the client handshake traffic secret, then close
-// the transcript with the client Finished and derive resumption_master_secret. deriveAppSecrets() must
-// have been called first. Writes verify_data (hashLen bytes) to vdOut.
 pub fn clientFinished(self: TlsClient, vdOut: ptr): void {
     let hl = trHashLen(self);
     let hCtx = bytes.alloc(48);
@@ -647,7 +567,6 @@ pub fn clientFinished(self: TlsClient, vdOut: ptr): void {
     handshake.finishedVerifyData(self.kind, self.chs, hCtx, vdOut);
     bytes.free(hCtx);
 
-    // resumption_master_secret = Derive-Secret(master, "res master", ClientHello...client Finished).
     let cf = bytes.alloc(4 + hl);
     bytes.write_byte(cf, 0, 0x14); bytes.write_byte(cf, 1, 0); bytes.write_byte(cf, 2, 0); bytes.write_byte(cf, 3, hl);
     let ci = 0;
@@ -659,9 +578,6 @@ pub fn clientFinished(self: TlsClient, vdOut: ptr): void {
     bytes.free(cf); bytes.free(hCF);
 }
 
-// Wrap the client Finished verify_data as an encrypted handshake record (using the client handshake
-// key/IV/sequence), written to out; returns the record length. verifyData is the 32-byte value from
-// clientFinished. The message is 14 00 00 20 || verify_data.
 pub fn clientFinishedRecord(self: TlsClient, verifyData: ptr, out: ptr): int {
     let hl = trHashLen(self);
     let msg = bytes.alloc(4 + hl);
@@ -673,7 +589,6 @@ pub fn clientFinishedRecord(self: TlsClient, verifyData: ptr, out: ptr): int {
     while (i < hl) { bytes.write_byte(msg, 4 + i, bytes.read_byte(verifyData, i)); i = i + 1; }
     let n = tls.recordProtect(self.suite, self.cKey, self.cIv, self.cSeq, msg, 4 + hl, 0x16, out);
     bytes.free(msg);
-    // Switching to application keys resets both record sequence numbers to 0 (RFC 8446 section 5.3).
     self.cSeq = 0;
     self.sSeq = 0;
     return n;
@@ -685,34 +600,27 @@ fn w3c(out: ptr, off: int, v: int): void {
     bytes.write_byte(out, off + 2, v & 0xff);
 }
 
-// mTLS -- build the client's Certificate handshake message (RFC 8446 4.4.2) into `out`. Mirrors the
-// server Certificate: 0b || bodyLen(3) || ctxLen=0 || listLen(3) || certLen(3) || cert || ext=0000.
-// An EMPTY cert (certLen 0 -> listLen 0) is a valid "I have no certificate" reply to an optional
-// CertificateRequest. Returns the message length. Pure (no self) so it is unit-testable.
 pub fn buildClientCertificate(certDer: ptr, certLen: int, out: ptr): int {
     let listLen = if (certLen > 0) 3 + certLen + 2 else 0;
     let bodyLen = 1 + 3 + listLen;
     let p = 0;
     bytes.write_byte(out, p, 0x0b); p = p + 1;
     w3c(out, p, bodyLen); p = p + 3;
-    bytes.write_byte(out, p, 0); p = p + 1;              // certificate_request_context (empty)
+    bytes.write_byte(out, p, 0); p = p + 1;
     w3c(out, p, listLen); p = p + 3;
     if (certLen > 0) {
         w3c(out, p, certLen); p = p + 3;
         let i = 0;
         while (i < certLen) { bytes.write_byte(out, p + i, bytes.read_byte(certDer, i)); i = i + 1; }
         p = p + certLen;
-        bytes.write_byte(out, p, 0); bytes.write_byte(out, p + 1, 0); p = p + 2;   // entry extensions
+        bytes.write_byte(out, p, 0); bytes.write_byte(out, p + 1, 0); p = p + 2;
     }
     return p;
 }
 
-// mTLS -- build the client's CertificateVerify handshake message (RFC 8446 4.4.3): sign the transcript
-// hash (through the client Certificate) with the client's P-256 key under the CLIENT context, wrapped as
-// 0f || bodyLen(3) || scheme(2)=ecdsa_secp256r1_sha256 || sigLen(2) || DER-sig. Returns the length.
 pub fn buildClientCertVerify(transcriptHash: ptr, hl: int, key: ptr, out: ptr): int {
     let digest = bytes.alloc(32);
-    handshake.certVerifyDigest(false, transcriptHash, hl, digest);   // false = client context
+    handshake.certVerifyDigest(false, transcriptHash, hl, digest);
     let r = bytes.alloc(32); let s = bytes.alloc(32);
     p256.ecdsaSign(digest, key, r, s);
     let sigDer = bytes.alloc(80);
@@ -721,7 +629,7 @@ pub fn buildClientCertVerify(transcriptHash: ptr, hl: int, key: ptr, out: ptr): 
     let p = 0;
     bytes.write_byte(out, p, 0x0f); p = p + 1;
     w3c(out, p, bodyLen); p = p + 3;
-    bytes.write_byte(out, p, 0x04); bytes.write_byte(out, p + 1, 0x03); p = p + 2;   // ecdsa_secp256r1_sha256
+    bytes.write_byte(out, p, 0x04); bytes.write_byte(out, p + 1, 0x03); p = p + 2;
     bytes.write_byte(out, p, (sigLen >> 8) & 0xff); bytes.write_byte(out, p + 1, sigLen & 0xff); p = p + 2;
     let i = 0;
     while (i < sigLen) { bytes.write_byte(out, p + i, bytes.read_byte(sigDer, i)); i = i + 1; }
@@ -730,16 +638,12 @@ pub fn buildClientCertVerify(transcriptHash: ptr, hl: int, key: ptr, out: ptr): 
     return p;
 }
 
-// Encrypt application data as a TLSCiphertext record with the client application key (content type
-// 0x17). Returns the record length.
 pub fn encryptApp(self: TlsClient, data: ptr, dataLen: int, out: ptr): int {
     let n = tls.recordProtect(self.suite, self.capKey, self.capIv, self.cSeq, data, dataLen, 0x17, out);
     self.cSeq = self.cSeq + 1;
     return n;
 }
 
-// Encrypt an Alert (RFC 8446 section 6): a 2-byte {level, description} body under the application key
-// with inner content type 0x15. Used to send close_notify (level 1 warning, description 0) at shutdown.
 pub fn encryptAlert(self: TlsClient, level: int, desc: int, out: ptr): int {
     let a = bytes.alloc(2);
     bytes.write_byte(a, 0, level); bytes.write_byte(a, 1, desc);
@@ -749,11 +653,7 @@ pub fn encryptAlert(self: TlsClient, level: int, desc: int, out: ptr): int {
     return n;
 }
 
-// ---- KeyUpdate (RFC 8446 section 4.6.3 / 7.2) ----
 
-// Rotate the SERVER application traffic secret to the next generation, re-derive the read key/IV, and
-// reset the server record sequence to 0. Call this after a server KeyUpdate is received (the record that
-// carried it was decrypted under the previous key).
 pub fn updateServerKey(self: TlsClient): void {
     let ns = bytes.alloc(48);
     tls.deriveTrafficUpdate(self.kind, self.sap, ns);
@@ -764,9 +664,6 @@ pub fn updateServerKey(self: TlsClient): void {
     self.sSeq = 0;
 }
 
-// Rotate the CLIENT application traffic secret to the next generation, re-derive the write key/IV, and
-// reset the client record sequence to 0. Call this AFTER sending our own KeyUpdate (the sender switches
-// to the next-generation keys only after the KeyUpdate has been sent).
 pub fn updateClientKey(self: TlsClient): void {
     let ns = bytes.alloc(48);
     tls.deriveTrafficUpdate(self.kind, self.cap, ns);
@@ -777,13 +674,10 @@ pub fn updateClientKey(self: TlsClient): void {
     self.cSeq = 0;
 }
 
-// Build and encrypt a KeyUpdate handshake message (content type 0x16) under the CURRENT client app key.
-// request is 0 (update_not_requested) or 1 (update_requested). The caller must call updateClientKey()
-// afterwards to switch its send key to the next generation.
 pub fn keyUpdateRecord(self: TlsClient, request: int, out: ptr): int {
     let msg = bytes.alloc(5);
-    bytes.write_byte(msg, 0, 0x18);                // handshake type: key_update
-    bytes.write_byte(msg, 1, 0); bytes.write_byte(msg, 2, 0); bytes.write_byte(msg, 3, 1);   // length 1
+    bytes.write_byte(msg, 0, 0x18);
+    bytes.write_byte(msg, 1, 0); bytes.write_byte(msg, 2, 0); bytes.write_byte(msg, 3, 1);
     bytes.write_byte(msg, 4, request);
     let n = tls.recordProtect(self.suite, self.capKey, self.capIv, self.cSeq, msg, 5, 0x16, out);
     self.cSeq = self.cSeq + 1;
@@ -791,48 +685,29 @@ pub fn keyUpdateRecord(self: TlsClient, request: int, out: ptr): int {
     return n;
 }
 
-// Decrypt an application-data record with the server application key. Returns the inner plaintext length
-// (including the trailing content-type byte), or -1 on failure.
 pub fn decryptApp(self: TlsClient, record: ptr, recLen: int, out: ptr): int {
     let n = tls.recordUnprotect(self.suite, self.sapKey, self.sapIv, self.sSeq, record, recLen, out);
     self.sSeq = self.sSeq + 1;
     return n;
 }
 
-// Trust decision: validate the server's certificate chain (captured during the handshake) against a
-// trusted root, for `host` at `now` (a YYYYMMDDHHMMSS number). This is separate from the handshake's
-// CertificateVerify check (which only proves the server holds the leaf key); call it after the handshake
-// to decide whether to trust the leaf. Returns true iff the chain is trusted.
 pub fn verifyServerChain(self: TlsClient, rootDer: ptr, rootLen: int, host: string, now: long): bool {
     if (self.certListLen <= 0) { return false; }
     return x509.verifyCertList(at(self.hsBuf, self.certListOff), self.certListLen, rootDer, rootLen, host, now);
 }
 
-// The captured server certificate_list (for verifying against a multi-root trust store). The pointer math
-// is inlined rather than via the local `at` helper: a public fn that RETURNS at(...) trips a name clash
-// with serde/json's `at` (JsonValue) when both are in one compile graph (e.g. web/client).
 pub fn certListPtr(self: TlsClient): ptr { return (self.hsBuf as long + self.certListOff) as ptr; }
 pub fn certListSize(self: TlsClient): int { return self.certListLen; }
-// The stapled OCSP response captured from the Certificate message (len 0 = none). Valid until hsBuf frees.
 pub fn ocspStaplePtr(self: TlsClient): ptr { return (self.hsBuf as long + self.ocspOff) as ptr; }
 pub fn ocspStapleSize(self: TlsClient): int { return self.ocspLen; }
 
-// The ALPN protocol the server selected in EncryptedExtensions, or "" if none was negotiated.
 pub fn selectedAlpn(self: TlsClient): string { return self.alpnSel; }
 
-// Hash of the current running transcript with the negotiated suite hash (exposed for tests / diagnostics).
 pub fn transcriptHashInto(self: TlsClient, out: ptr): void { trHash(self, out); }
 
-// ---- resumption (RFC 8446 2.2, 4.2.11, 4.6.1) ----
 
-// Compute and write the PSK binder into a resumption ClientHello that buildClientHelloEx left zeroed.
-// The binder is HMAC(finished_key, Transcript-Hash(truncated ClientHello)), where the truncation removes
-// the binder entry (its value and 1-byte length) but keeps everything up to the binders-list length. The
-// transcript also includes any prior handshake messages (empty for a first-flight resumption).
 pub fn fillResumptionBinder(self: TlsClient, out: ptr, chLen: int): void {
     let hl = trHashLen(self);
-    // Truncate() ends "up to and including the identities field" (RFC 8446 4.2.11.2): exclude the binder
-    // value (hl), its 1-byte length, AND the 2-byte binders-list length.
     let truncLen = chLen - hl - 3;
     let tmp = bytes.alloc(self.trLen + truncLen);
     let i = 0;
@@ -853,12 +728,9 @@ pub fn fillResumptionBinder(self: TlsClient, out: ptr, chLen: int): void {
     bytes.free(tmp); bytes.free(th); bytes.free(es); bytes.free(bk); bytes.free(fk); bytes.free(binder);
 }
 
-// Parse a NewSessionTicket (RFC 8446 4.6.1) and derive its PSK from resumption_master_secret. `buf` holds
-// the handshake message and `off` its start (the 0x04 type byte). Stores the ticket, PSK, and
-// ticket_age_add for a later resumption; getters below hand them to a session cache.
 pub fn parseNewSessionTicket(self: TlsClient, buf: ptr, off: int): void {
-    let p = off + 4;                               // skip handshake header
-    p = p + 4;                                     // ticket_lifetime (unused here)
+    let p = off + 4;
+    p = p + 4;
     let ageAdd = ((bytes.read_byte(buf, p) as long) << 24) | ((bytes.read_byte(buf, p + 1) as long) << 16)
                | ((bytes.read_byte(buf, p + 2) as long) << 8) | (bytes.read_byte(buf, p + 3) as long);
     p = p + 4;
@@ -885,10 +757,7 @@ pub fn ticketHashKind(self: TlsClient): int { return self.ticketKind; }
 pub fn hasTicket(self: TlsClient): bool { return self.haveTicket; }
 pub fn pskWasAccepted(self: TlsClient): bool { return self.pskAccepted; }
 
-// ---- 0-RTT early data (RFC 8446 2.3, 4.2.10) ----
 
-// Derive the client_early_traffic key/IV from the resumption PSK and the ClientHello transcript hash.
-// Call after addClientHello (so the transcript is exactly the ClientHello). Sets offerEarly.
 pub fn deriveEarlyKeys(self: TlsClient): void {
     let hl = trHashLen(self);
     let es = bytes.alloc(hl); tls.earlySecretPsk(self.kind, self.ticketPsk, hl, es);
@@ -900,17 +769,12 @@ pub fn deriveEarlyKeys(self: TlsClient): void {
     bytes.free(es); bytes.free(chHash); bytes.free(cet);
 }
 
-// Encrypt 0-RTT application data with the client_early_traffic key (content type 0x17). Returns the
-// record length. Sent right after the ClientHello, before the handshake completes.
 pub fn encryptEarly(self: TlsClient, data: ptr, dataLen: int, out: ptr): int {
     let n = tls.recordProtect(self.suite, self.eKey, self.eIv, self.eSeq, data, dataLen, 0x17, out);
     self.eSeq = self.eSeq + 1;
     return n;
 }
 
-// Build+encrypt EndOfEarlyData (handshake type 0x05, empty body) under the client_early_traffic key
-// (RFC 8446 2.3 legend: EndOfEarlyData uses the 0-RTT keys), and add it to the transcript. Sent after the
-// server flight and before the client Finished when 0-RTT was accepted. Returns the record length.
 pub fn endOfEarlyDataRecord(self: TlsClient, out: ptr): int {
     let msg = bytes.alloc(4);
     bytes.write_byte(msg, 0, 0x05); bytes.write_byte(msg, 1, 0); bytes.write_byte(msg, 2, 0); bytes.write_byte(msg, 3, 0);

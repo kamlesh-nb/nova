@@ -1,11 +1,3 @@
-// 163 — R1 process primitives: spawn a real BINARY, exchange stdio, collect its exit code, signal it.
-// The dumb, identity-free exec layer (kernel PID = identity) the orchestrator/reverse-proxy build on.
-//
-// Target-neutral: the primitives are the same everywhere, but the shell that hosts the little test
-// scripts is not — /bin/sh on POSIX, cmd.exe on Windows — so the shell, its "run this" flag and the
-// script bodies are selected by platform.isWindows. On Windows the Process layer is Nova over
-// CreateProcessW/CreatePipe (std/process_windows) rather than the fork/exec runtime builtins, so
-// this case is what proves that path end to end.
 import assert;
 import bytes;
 import list;
@@ -14,8 +6,6 @@ import process;
 
 fn shell(): string { return if (platform.isWindows) "cmd.exe" else "/bin/sh"; }
 
-// cmd.exe needs /v:on (delayed expansion) for the stdin-echo script to read its variable back in
-// the same command line; the flag is harmless for the others.
 fn shArgs(script: string): list.List<string> {
     let a = list.List<string>();
     if (platform.isWindows) {
@@ -28,8 +18,6 @@ fn shArgs(script: string): list.List<string> {
     return a;
 }
 
-// cmd's `echo` always appends CRLF where printf does not, so line endings are stripped before
-// comparing. The bytes either side of that are still compared exactly.
 fn chomp(s: string): string {
     let n = s.length;
     while (n > 0) {
@@ -49,21 +37,19 @@ fn test_spawn_read_exit(): void {
     let p = process.Process.spawn(shell(), shArgs(script));
     let out = p.read(1024);
     assert.isTrue(chomp(out) == "hello from child");
-    assert.equalInt(p.wait(), 0);           // clean exit
+    assert.equalInt(p.wait(), 0);
     p.close();
 }
 
 @test
 fn test_exit_code_propagates(): void {
     let p = process.Process.spawn(shell(), shArgs("exit 7"));
-    assert.equalInt(p.wait(), 7);           // WEXITSTATUS surfaces
+    assert.equalInt(p.wait(), 7);
     p.close();
 }
 
 @test
 fn test_stdin_to_stdout_roundtrip(): void {
-    // `cat` echoes stdin byte for byte; cmd's nearest equivalent is `set /p`, which reads one LINE,
-    // so the Windows payload carries the terminator the reader needs.
     let script = if (platform.isWindows) "set /p line= & echo !line!" else "cat";
     let payload = if (platform.isWindows) "ping-pong\r\n" else "ping-pong";
     let p = process.Process.spawn(shell(), shArgs(script));
@@ -76,11 +62,9 @@ fn test_stdin_to_stdout_roundtrip(): void {
 
 @test
 fn test_kill_reports_signal(): void {
-    // Windows has no signals, so std/process_windows terminates the child with the exit code a
-    // POSIX shell reports for that signal — 128 + SIGKILL(9) — keeping this assertion shared.
     let script = if (platform.isWindows) "ping -n 31 127.0.0.1 > nul" else "sleep 30";
     let p = process.Process.spawn(shell(), shArgs(script));
-    assert.equalInt(p.forceKill(), 0);      // SIGKILL delivered
-    assert.equalInt(p.wait(), 137);         // 128 + SIGKILL(9), shell convention
+    assert.equalInt(p.forceKill(), 0);
+    assert.equalInt(p.wait(), 137);
     p.close();
 }

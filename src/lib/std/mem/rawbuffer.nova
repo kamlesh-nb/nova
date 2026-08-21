@@ -1,22 +1,10 @@
-// mem/rawbuffer: the raw indexable element run the collections are built on (M-10 Storage
-// retirement). This is the Nova equivalent of Swift's `__ContiguousArrayStorage` / Rust's `RawVec`:
-// a UNIQUELY-OWNED `class` holding one `bytes.alloc` run, whose element get/set/drop go entirely
-// through the typed value witnesses (`mem/witness`) so the compiler manages element copy/drop the
-// same way it does a struct's fields -- no `.storage` intrinsic, no bespoke element ARC.
-//
-// "Uniquely owned" means the owning collection is the buffer's sole owner: there is no separate
-// buffer refcount to maintain (only the class's own ARC header), and the buffer is freed
-// deterministically by `delete()` when the collection is destroyed (Rust `Vec`, not Swift COW).
-//
-// Slot model (from mem/witness): a value struct element occupies its real width inline; every other
-// element occupies one 8-byte slot. `witness.sizeOf<T>()` is that width.
 import bytes;
 import mem.witness;
 
 pub class RawBuffer<T> {
-    data: long,   // base address of the element run
-    cap: int,     // capacity in ELEMENTS
-    len: int,     // number of live (initialised) elements at the front
+    data: long,
+    cap: int,
+    len: int,
 
     init(capElems: int) {
         let c = if (capElems <= 0) 1 else capElems;
@@ -29,18 +17,12 @@ pub class RawBuffer<T> {
     pub fn count(self: RawBuffer<T>): int { return self.len; }
     pub fn base(self: RawBuffer<T>): long { return self.data; }
 
-    // Present all `n` slots as live (n <= capacity). Used by the open-addressing Map/Set, which index
-    // the buffer directly by hash rather than push/pop: every bucket must be a valid `at`/`set` target
-    // from the start. The backing run came zero-filled from bytes.alloc, so the slots read back as the
-    // element's zero value (an EMPTY bucket) until written. delete()/clear() then drop all n slots; a
-    // zero slot drops to nothing, so unwritten buckets and tombstones (reset to 0) are safe.
     pub fn fill(self: RawBuffer<T>, n: int): void { self.len = n; }
 
     fn slot(self: RawBuffer<T>, i: int): long {
         return self.data + (i as long) * (witness.sizeOf<T>() as long);
     }
 
-    // Append `value`, doubling capacity when full. Takes a reference where the element owns one.
     pub fn push(self: RawBuffer<T>, value: T): void {
         if (self.len >= self.cap) {
             let nc = if (self.cap < 1) 1 else self.cap * 2;
@@ -50,21 +32,14 @@ pub class RawBuffer<T> {
         self.len = self.len + 1;
     }
 
-    // Read element `i` (a value struct comes back as a borrow of its inline bytes, a reference comes
-    // back retained, a scalar by value).
     pub fn at(self: RawBuffer<T>, i: int): T {
         return witness.load<T>(self.slot(i));
     }
 
-    // Overwrite element `i` in place, releasing the element already there.
     pub fn set(self: RawBuffer<T>, i: int, value: T): void {
         witness.storeOver<T>(self.slot(i), value);
     }
 
-    // Exchange elements `i` and `j` by swapping their raw slot bytes (the element's full inline width). This
-    // is refcount-NEUTRAL: the element handles simply move between slots, with no retain and no drop -- which
-    // is what makes an in-place sort's swap safe, where a three-`set` swap would `storeOver`-DROP a handle
-    // still held in a temporary (a use-after-free on owned elements). Handles any element width via sizeOf<T>.
     pub fn swap(self: RawBuffer<T>, i: int, j: int): void {
         if (i == j) { return; }
         let sz = witness.sizeOf<T>() as long;
@@ -77,44 +52,38 @@ pub class RawBuffer<T> {
         bytes.free(tmp);
     }
 
-    // Remove and return the last element (a MOVE: the caller takes the element's existing ownership,
-    // the slot is vacated without a drop). undefined when empty.
     pub fn pop(self: RawBuffer<T>): T | undefined {
         if (self.len == 0) { return undefined; }
         self.len = self.len - 1;
         return witness.moveOut<T>(self.slot(self.len));
     }
 
-    // Insert `value` at index `i` (0..len), shifting the tail up by one. Grows if full.
     pub fn insertAt(self: RawBuffer<T>, i: int, value: T): void {
         if (i < 0 || i > self.len) { return; }
         if (self.len >= self.cap) {
             let nc = if (self.cap < 1) 1 else self.cap * 2;
             self.reserveExact(nc);
         }
-        // shift [i, len) up by one, moving from the back so no slot is clobbered before it is read
         let j = self.len;
         while (j > i) {
             witness.moveElem<T>(self.slot(j), self.slot(j - 1));
             j = j - 1;
         }
-        witness.store<T>(self.slot(i), value);   // empty slot now -- store (retain), no old to drop
+        witness.store<T>(self.slot(i), value);
         self.len = self.len + 1;
     }
 
-    // Remove the element at index `i`, dropping it and shifting the tail down by one.
     pub fn removeAt(self: RawBuffer<T>, i: int): void {
         if (i < 0 || i >= self.len) { return; }
-        witness.dropElem<T>(self.slot(i));       // release the removed element
+        witness.dropElem<T>(self.slot(i));
         let j = i;
-        while (j < self.len - 1) {                // shift [i+1, len) down, front to back
+        while (j < self.len - 1) {
             witness.moveElem<T>(self.slot(j), self.slot(j + 1));
             j = j + 1;
         }
-        self.len = self.len - 1;                  // the last (now-stale) slot drops out
+        self.len = self.len - 1;
     }
 
-    // Drop every live element and reset to empty (the buffer is kept for reuse).
     pub fn clear(self: RawBuffer<T>): void {
         let i = 0;
         while (i < self.len) {
@@ -124,8 +93,6 @@ pub class RawBuffer<T> {
         self.len = 0;
     }
 
-    // Grow the backing run to at least `nc` elements, MOVING the live prefix wholesale (a raw byte
-    // copy transfers ownership; the old run is freed without dropping -- the references moved).
     fn reserveExact(self: RawBuffer<T>, nc: int): void {
         if (nc <= self.cap) { return; }
         let w = witness.sizeOf<T>() as long;
@@ -138,8 +105,6 @@ pub class RawBuffer<T> {
         self.cap = nc;
     }
 
-    // Drop every live element (releasing its owned reference), then free the run. The M-7 destructor
-    // hook: runs when the owning collection is destroyed.
     pub fn delete(self: RawBuffer<T>): void {
         let i = 0;
         while (i < self.len) {

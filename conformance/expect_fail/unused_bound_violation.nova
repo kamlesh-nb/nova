@@ -1,7 +1,3 @@
-// NEGATIVE test: must FAIL to compile.
-// A declared `where T: Trait` bound is enforced at instantiation EVEN WHEN the generic body never
-// calls the bounded method (the "unused bound" case). `label<Plain>` must be rejected because Plain
-// does not implement Shape, even though `label`'s body never calls `.area()`.
 trait Shape { fn area(self: Shape): int; }
 struct Sq impl Shape { pub s: int, init(s: int) { self.s = s; } fn area(self: Sq): int { return self.s * self.s; } }
 struct Plain { pub n: int, init(n: int) { self.n = n; } }

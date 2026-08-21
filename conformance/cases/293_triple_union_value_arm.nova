@@ -1,10 +1,3 @@
-// F1: `T | E | undefined` reads as `(T | undefined) | E`, so the OK arm is a value-optional. The codegen
-// string path (`typeRefToString`) dropped the `.optional`, rendering the return type as `ErrUnion(int, E)`
-// -- the ok arm collapsed to a plain `int`. So the producer stored a RAW int in the ok slot while every
-// consumer (the typed path) unboxed it as a value-optional -> SEGV in nova_retain / nova_valopt_unbox.
-// Fixed across the value-optional seam: render value-optionals distinctly (matching the typed path); box the
-// ok value on return; treat `try`/`catch` results as value-optional boxes so a consuming `?? d` unboxes; and
-// box the `catch` handler when the result is a value-optional. All arms now round-trip.
 
 import assert;
 
@@ -26,15 +19,14 @@ fn test_value_arm(): void {
 
 @test
 fn test_undefined_arm(): void {
-    assert.equalInt((f(1) catch (e) -1) ?? -2, -2);   // undefined -> ?? default
+    assert.equalInt((f(1) catch (e) -1) ?? -2, -2);
 }
 
 @test
 fn test_error_arm(): void {
-    assert.equalInt((f(2) catch (e) -1) ?? -2, -1);   // error -> catch handler
+    assert.equalInt((f(2) catch (e) -1) ?? -2, -1);
 }
 
-// `try` propagates the whole `T | undefined | E` unchanged.
 fn g(mode: int): int | undefined | E {
     let x = try f(mode);
     return x;
@@ -47,7 +39,6 @@ fn test_try_propagation(): void {
     assert.equalInt((g(2) catch (e) -1) ?? -2, -1);
 }
 
-// A wide value type in the ok arm.
 fn fl(present: bool): long | undefined | E {
     if (present) { return 5000000000; }
     return undefined;

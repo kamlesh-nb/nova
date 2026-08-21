@@ -1,5 +1,3 @@
-// BTreeDB end-to-end: a Nova program driving a LIVE BTreeDB server over the
-// binary protocol — connect, DDL, insert, query, verify TYPED rows (int+text).
 import assert;
 import list;
 import string;
@@ -18,7 +16,6 @@ fn btree_e2e_crud(): void {
     let rs = conn.query("SELECT id, name, age FROM nova_e2e", List<DbValue>());
     assert.equalInt(rs.rowCount(), 2);
 
-    // Typed decode: id (int), name (text), age (int).
     let r0 = rs.row(0);
     assert.equalInt(r0.getInt(0), 1);
     assert.equalStr(r0.getText(1), "Alice");

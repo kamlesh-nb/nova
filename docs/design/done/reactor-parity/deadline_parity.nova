@@ -1,8 +1,3 @@
-// Runtime-parity check for the deadline-timer path (nova_reactor_set_timer + opDone + abandonOp) that
-// the connect/TLS/recv deadlines depend on. Self-contained (a socketpair, no network), so it behaves
-// identically on kqueue/epoll/io_uring/iocp. Two cases: (1) no data -> recvIntoDeadline TIMES OUT
-// (-2), proving the timer fires and abandonOp runs; (2) data sent -> recv COMPLETES (opDone=1),
-// proving a real completion is told apart from a timer fire.
 import bytes;
 import os.sys;
 import net.poller;
@@ -34,7 +29,6 @@ fn drive(r: poller.Reactor, result: long): void {
     }
 }
 fn main(): void {
-    // Case 1: deadline fires (no data).
     let (a1, b1) = sys.newSocketPair(sys.AF_UNIX, sys.SOCK_STREAM);
     sys.setNonBlocking(a1); sys.setNonBlocking(b1);
     let r1 = poller.Reactor(16, 1024, 4); poller.setCurrent(r1.kq);
@@ -45,7 +39,6 @@ fn main(): void {
     console.log("timeout case: got=" + `${v1}` + " (want 998 = -2 timed out)");
     poller.setCurrent(0); bytes.free(res1); r1.destroy(); sys.close(a1);
 
-    // Case 2: read completes before the (generous) deadline (data sent).
     let (a2, b2) = sys.newSocketPair(sys.AF_UNIX, sys.SOCK_STREAM);
     sys.setNonBlocking(a2); sys.setNonBlocking(b2);
     let r2 = poller.Reactor(16, 1024, 4); poller.setCurrent(r2.kq);

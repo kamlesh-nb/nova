@@ -1,7 +1,3 @@
-// FR-safety-6: `@deprecated` (optionally with a replacement note) makes the compiler emit a WARNING at
-// each call site, not a hard error. This is how the stdlib evolves past beta: deprecate parseI64 in
-// favour of parseLong, give a migration window, then remove it. The deprecated function still compiles
-// and runs, so this is a positive case; the warning lands on stderr and does not fail the build.
 import assert;
 
 @deprecated("use newSum instead")
@@ -14,9 +10,7 @@ fn newSum(a: int, b: int): int { return a + b; }
 
 @test
 fn deprecated_still_runs(): void {
-    // Calling a deprecated function warns but works.
     assert.equalInt(oldSum(2, 3), 5);
     assert.equalInt(oldBare(), 7);
-    // The replacement works identically.
     assert.equalInt(newSum(2, 3), 5);
 }

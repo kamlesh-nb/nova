@@ -1,8 +1,3 @@
-// os/socket (Windows override): the backend-neutral socket API over Winsock (os/winsock). Selected when
-// platform.os == "windows". A SOCKET is UINT_PTR; it is truncated to `int` at this boundary to match the
-// reactor's fd model (real handle values fit). Errors come from WSAGetLastError, not errno, and the
-// socket is closed with closesocket. COMPILE-VERIFIED via cross-compilation; runtime verification pending
-// on a Windows host.
 
 import os.windows.winsock;
 import bytes;
@@ -10,23 +5,14 @@ import bytes;
 pub const AF_INET: int = 2;
 pub const SOCK_STREAM: int = 1;
 
-// Create a TCP socket, ensuring Winsock is initialised first (WSAStartup is idempotent/ref-counted).
 pub fn newTcp(): int {
     winsock.startup();
     return winsock.socket(winsock.AF_INET, winsock.SOCK_STREAM, winsock.IPPROTO_TCP) as int;
 }
-// A UDP (SOCK_DGRAM=2, IPPROTO_UDP=17) socket -- e.g. for a one-shot DNS query. Winsock has no named
-// constant for these, so the literals are used directly (mirroring newTcp's IPPROTO_TCP).
 pub fn newUdp(): int {
     winsock.startup();
     return winsock.socket(winsock.AF_INET, 2, 17) as int;
 }
-// `close` is ALSO a compiler builtin name (it maps to the runtime's POSIX `nova_close`), and an
-// UNQUALIFIED `close(fd)` in this file can bind to that builtin instead of to this function --
-// which one wins depends on the rest of the import graph, so it presents as a heisenbug. On POSIX
-// the two are equivalent; on Windows `_close` on a SOCKET trips the UCRT invalid-parameter handler
-// and the process dies via a silent __fastfail (exit 0xC0000409). Internal callers must therefore
-// use `closeSock`, never the bare name. See connectBlocking/listenAny below.
 fn closeSock(fd: int): int { return winsock.closesocket(fd as long); }
 pub fn close(fd: int): int { return closeSock(fd); }
 pub fn bindSock(fd: int, addr: ptr, addrlen: int): int { return winsock.bind(fd as long, addr, addrlen); }
@@ -34,12 +20,9 @@ pub fn listenSock(fd: int, backlog: int): int { return winsock.listen(fd as long
 pub fn acceptSock(fd: int, addr: ptr, addrlen: ptr): int { return winsock.accept(fd as long, addr, addrlen) as int; }
 pub fn connectSock(fd: int, addr: ptr, addrlen: int): int { return winsock.connect(fd as long, addr, addrlen); }
 
-// recv/send: read/write do not work on a SOCKET on Windows. Return type is long to match the POSIX base
-// (Winsock recv/send return int; -1/SOCKET_ERROR maps to a negative long).
 pub fn recvSock(fd: int, buf: long, len: int): long { return winsock.recv(fd as long, buf as ptr, len, 0) as long; }
 pub fn sendSock(fd: int, buf: long, len: int): long { return winsock.send(fd as long, buf as ptr, len, 0) as long; }
 
-// Non-blocking via ioctlsocket(FIONBIO, 1).
 pub fn setNonBlock(fd: int): int {
     let one = bytes.alloc(4);
     bytes.write_i32(one, 0, 1);
@@ -55,10 +38,8 @@ pub fn setReuseAddr(fd: int): int {
     bytes.free(one);
     return r;
 }
-// Windows has no SO_REUSEPORT; SO_REUSEADDR gives the closest (shared-port) behaviour there.
 pub fn setReusePort(fd: int): int { return setReuseAddr(fd); }
 
-// Disable Nagle on an accepted connection (IPPROTO_TCP=6, TCP_NODELAY=1, same on Windows).
 pub fn setTcpNoDelay(fd: int): int {
     let one = bytes.alloc(4);
     bytes.write_i32(one, 0, 1);
@@ -81,10 +62,8 @@ pub fn sockError(fd: int): int {
 
 pub fn wouldBlock(): bool { return winsock.WSAGetLastError() == winsock.WSAEWOULDBLOCK; }
 
-// A non-blocking connect() in progress reports WSAEWOULDBLOCK on Windows (not EINPROGRESS).
 pub fn connectInProgress(): bool { return winsock.WSAGetLastError() == winsock.WSAEWOULDBLOCK; }
 
-// sockaddr_in layout is identical to POSIX (win uses the same struct); build it inline (htons byte-swap).
 pub fn makeSockaddrIn(port: int, addrBE: long): ptr {
     let sa = bytes.alloc(16);
     let i = 0;
@@ -96,16 +75,12 @@ pub fn makeSockaddrIn(port: int, addrBE: long): ptr {
     bytes.write_i32(sa, 4, addrBE);
     return sa;
 }
-// Resolution is an ENTRY point: a caller resolves a hostname before creating any socket, so this may
-// be the first Winsock call in the process and must initialise it (newTcp cannot have done so yet).
-// Skipping this is why a numeric address worked while a name silently failed.
 pub fn getAddrInfo(node: ptr, service: ptr, hints: ptr, res: ptr): int {
     winsock.startup();
     return winsock.getaddrinfo(node, service, hints, res);
 }
 pub fn freeAddrInfo(res: ptr): void { winsock.freeaddrinfo(res); }
 
-// --- blocking (synchronous) socket layer (M14.2) — Windows over Winsock. Compile-verified only. --------
 fn isNumericIPv4(s: string): bool {
     if (s.length == 0) { return false; }
     let i = 0;
@@ -140,7 +115,7 @@ pub fn resolveHost4(host: string): long {
     let addr = -1 as long;
     while (ai != 0 && addr == (-1 as long)) {
         let fam = bytes.read_i32(ai, 4) as int;
-        if (fam == AF_INET) { let sa = bytes.read_ptr(ai, 32); addr = bytes.read_i32(sa, 4) as long; }  // ADDRINFOA ai_addr @32
+        if (fam == AF_INET) { let sa = bytes.read_ptr(ai, 32); addr = bytes.read_i32(sa, 4) as long; }
         else { ai = bytes.read_ptr(ai, 40); }
     }
     if (head != 0) { freeAddrInfo(head); }
@@ -158,12 +133,11 @@ pub fn connectBlocking(host: string, port: int): int {
     if (r != 0) { closeSock(fd); return -1; }
     return fd;
 }
-// Windows SO_RCVTIMEO/SNDTIMEO take a DWORD milliseconds (not a timeval).
 pub fn setTimeout(fd: int, ms: int): int {
     let d = bytes.alloc(4);
     bytes.write_i32(d, 0, (if (ms > 0) ms else 0) as long);
-    let r1 = winsock.setsockopt(fd as long, winsock.SOL_SOCKET, 4102, d, 4);   // SO_RCVTIMEO
-    let r2 = winsock.setsockopt(fd as long, winsock.SOL_SOCKET, 4101, d, 4);   // SO_SNDTIMEO
+    let r1 = winsock.setsockopt(fd as long, winsock.SOL_SOCKET, 4102, d, 4);
+    let r2 = winsock.setsockopt(fd as long, winsock.SOL_SOCKET, 4101, d, 4);
     bytes.free(d);
     return if (r1 == 0 && r2 == 0) 0 else -1;
 }
@@ -192,10 +166,6 @@ pub fn listenAny(port: int): int {
 }
 pub fn acceptOne(fd: int): int { return acceptSock(fd, 0, 0); }
 
-// fd passing (SCM_RIGHTS) is a POSIX mechanism; Windows would need WSADuplicateSocket + a separate
-// protocol. These stubs keep the shared callers (web/app handoff receiver, orchestrator proxyd) compiling
-// on Windows; they fail closed (no unix socket, no handoff) so a Windows build simply does not offer the
-// fd-passing mode. AF_UNIX exists on Win10+ but the ancillary-data path does not, so handoff stays off.
 pub const AF_UNIX: int = 1;
 pub fn newUnix(): int { return -1; }
 pub fn unixPair(sv: ptr): int { return -1; }

@@ -1,11 +1,3 @@
-// A CA trust store (M12): a set of trusted root certificates, loaded from a PEM bundle in memory. A
-// server certificate chain is trusted iff it validates against at least one root in the store, at the
-// given time, for the given hostname - reusing the verified x509 chain logic (crypto/x509.verifyCertList,
-// which checks signatures, validity windows, CA constraints, name chaining, and SAN hostname matching).
-//
-// This module is PURE (base64 + x509 only, no os.sys): loading reads a PEM string the CALLER supplies, so
-// importing it does not drag the os.sys socket/file externs into a TLS consumer's namespace. The system
-// CA bundle file is read by the application (or web/client) and handed to loadPemBundle as a string.
 import bytes;
 import list;
 import crypto.x509;
@@ -13,10 +5,8 @@ import crypto.tls.revocation;
 import crypto.base64;
 import datetime;
 
-// Current UTC time as the YYYYMMDDHHMMSS number x509 validity checks expect. Computed directly from the
-// Unix timestamp (Howard Hinnant's civil-from-days), so it is UTC regardless of the local timezone.
 pub fn nowUtc(): long {
-    let t = datetime.now() as long;              // Unix seconds (UTC epoch)
+    let t = datetime.now() as long;
     let days = t / 86400;
     let sod = t - days * 86400;
     let hh = sod / 3600;
@@ -40,13 +30,11 @@ const BEGIN_MARK: string = "-----BEGIN CERTIFICATE-----";
 const END_MARK: string = "-----END CERTIFICATE-----";
 
 pub struct TrustStore {
-    pub ders: List<long>,          // DER root-cert buffer pointers (owned)
+    pub ders: List<long>,
     pub lens: List<int>,
 
     pub fn count(self: TrustStore): int { return self.ders.size(); }
 
-    // Is `certList` (a TLS Certificate message's certificate_list content: runs of cert<3> || ext<2>)
-    // trusted for `host` at `now` (a YYYYMMDDHHMMSS number) by any root in this store?
     pub fn trusts(self: TrustStore, certList: ptr, listLen: int, host: string, now: long): bool {
         let i = 0;
         while (i < self.ders.size()) {
@@ -58,7 +46,6 @@ pub struct TrustStore {
         return false;
     }
 
-    // TLS 1.2 variant: the cert_list has no per-cert extension bytes (see x509.verifyCertList12).
     pub fn trusts12(self: TrustStore, certList: ptr, listLen: int, host: string, now: long): bool {
         let i = 0;
         while (i < self.ders.size()) {
@@ -70,10 +57,6 @@ pub struct TrustStore {
         return false;
     }
 
-    // Find the leaf's issuer among the cert_list intermediate or the store roots. Exposed so the
-    // revocation layer (crypto/tls/revocation) can resolve the issuer WITHOUT truststore importing the
-    // revocation/OCSP/CRL modules -- keeping those out of every TLS consumer's import graph (they are
-    // pulled only into an application that opts into revocation checking).
     pub fn issuerOf(self: TrustStore, leaf: x509.Cert, inter: x509.Cert): x509.Cert {
         if (inter.ok && x509.nameMatches(leaf, inter)) { return inter; }
         let i = 0;
@@ -82,13 +65,9 @@ pub struct TrustStore {
             if (root.ok && x509.nameMatches(leaf, root)) { return root; }
             i = i + 1;
         }
-        return leaf;                                    // self-issued fallback
+        return leaf;
     }
 
-    // Chain-verify AND enforce revocation (TLS 1.3 cert_list): trusted for `host` at `now`, AND the leaf
-    // not revoked by the stapled OCSP (ocspLen>0) or CRL (crlLen>0). HARD-FAIL on a proven revocation,
-    // SOFT-FAIL on UNKNOWN (accept when it cannot be determined). Now wired inline in the universal TLS
-    // verify path (the codegen call-resolution fix removed the constraint that kept this opt-in).
     pub fn trustsNotRevoked(self: TrustStore, certList: ptr, listLen: int, host: string, now: long,
                             ocspDer: ptr, ocspLen: int, crlDer: ptr, crlLen: int): bool {
         if (!self.trusts(certList, listLen, host, now)) { return false; }
@@ -99,7 +78,6 @@ pub struct TrustStore {
         return true;
     }
 
-    // TLS 1.2 variant (cert_list has no per-cert extension bytes).
     pub fn trustsNotRevoked12(self: TrustStore, certList: ptr, listLen: int, host: string, now: long,
                               ocspDer: ptr, ocspLen: int, crlDer: ptr, crlLen: int): bool {
         if (!self.trusts12(certList, listLen, host, now)) { return false; }
@@ -132,8 +110,6 @@ fn indexFrom(hay: string, needle: string, from: int): int {
     return 0 - 1;
 }
 
-// Base64-decode the body between offsets [start, end) (whitespace stripped) into an owned DER buffer.
-// Returns the buffer pointer; writes its length to lenOut[0].
 fn decodeBlock(pem: string, start: int, end: int, lenOut: ptr): ptr {
     let clean = bytes.alloc(end - start);
     let cn = 0;
@@ -157,8 +133,6 @@ fn decodeBlock(pem: string, start: int, end: int, lenOut: ptr): ptr {
     return buf;
 }
 
-// Build a trust store from a PEM bundle (one or many "-----BEGIN CERTIFICATE-----" blocks).
-// A trust store seeded with one DER root certificate (the buffer is retained; free() owns it).
 pub fn newTrustStoreDer(der: ptr, len: int): TrustStore {
     let store = TrustStore { ders: List<long>(), lens: List<int>() };
     store.ders.push(der as long);

@@ -1,10 +1,3 @@
-// A generic struct that impls a trait and whose method uses its T-typed field concretely, dispatched through
-// a TRAIT OBJECT vtable. Previously SIGSEGV'd (case 299 documented it open): a generic struct only widened to
-// a trait never monomorphised its per-instantiation method, and the vtable pointed at the T-erased shared
-// body, which fed the concrete field to the wrong path. Fix: record the construction instantiation so its
-// methods are monomorphised (mono.forced_struct_insts), and build a PER-INSTANTIATION vtable
-// (_vtable_Cell_i32_Render -> Cell_i32_render) in constructTraitObject, falling back to the erased vtable only
-// for a genuinely erased generic context.
 import assert;
 
 trait Render { fn render(self: Render): string; }
@@ -19,11 +12,8 @@ fn showLen(r: Render): int { return len(r.render()); }
 
 @test
 fn test_generic_struct_trait_dispatch(): void {
-    // int instantiation through the trait object: render must use the int field -> "[42]" (len 4)
     assert.equalInt(showLen(Cell<int>{ v: 42 }), 4);
-    // string instantiation through the trait object: "[hi]" (len 4)
     assert.equalInt(showLen(Cell<string>{ v: "hi" }), 4);
-    // a longer int and string to be sure the concrete body, not the erased one, ran
-    assert.equalInt(showLen(Cell<int>{ v: 12345 }), 7);   // [12345]
-    assert.equalInt(showLen(Cell<string>{ v: "hello" }), 7); // [hello]
+    assert.equalInt(showLen(Cell<int>{ v: 12345 }), 7);
+    assert.equalInt(showLen(Cell<string>{ v: "hello" }), 7);
 }

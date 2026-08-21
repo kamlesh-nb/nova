@@ -1,10 +1,3 @@
-// M4 of the C++ runtime retirement plan: inbound TLS on the Nova reactor, no Asio. A server coroutine
-// terminates a server-side TLS handshake over a reactor-native AsyncStream and serves an HTTP request;
-// a client coroutine TLS-connects (reactor-native asyncConnect) and checks the response. The whole
-// handshake and data path run on ONE reactor loop. This is the last Asio dependency in the server
-// path: App.run now serves TLS on the reactor (serveReactorConn tlsAccepts when useTls is set), so the
-// TLS -> Asio fallback is gone. The wolfSSL memory-BIO pump is unchanged; only its transport moved to
-// the reactor. Deterministic + self-contained (loopback, embedded self-signed cert).
 import assert;
 import bytes;
 import string;
@@ -54,14 +47,13 @@ async fn tlsServer(fd: int, kq: int, done: long): void {
     bump(done);
 }
 
-// Completion-model accept: await one connection and spawn the TLS server coroutine, then complete.
 async fn tlsAcceptOne(lfd: int, kq: int, done: long): void {
     let s = await eventedio.reactorAccept(lfd, kq);
     if (s.isOpen()) { coroStart(tlsServer(s.fdOf(), kq, done)); }
 }
 
 async fn tlsClient(host: string, port: int, done: long, gotOk: long): void {
-    let ts = await asynctls.tlsConnect(host, port, false);   // reactor-native asyncConnect underneath
+    let ts = await asynctls.tlsConnect(host, port, false);
     if (ts.ok()) {
         let _ = await ts.sendStr("GET /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
         let buf = bytes.alloc(1024);

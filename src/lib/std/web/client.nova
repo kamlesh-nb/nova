@@ -75,9 +75,6 @@ pub struct HttpClient {
     }
 }
 
-// A blocking HTTP connection. When `secure`, TLS runs in pure Nova: the ClientBio (net/tlsmembio, TLS
-// 1.3) is pumped over the raw socket with nova_socket_send/recv. No wolfSSL. The handshake authenticates
-// the peer; chain-to-CA trust is a separate policy layer (verifyServerChain + a trust store).
 struct HttpConn {
     pub secure: bool,
     pub fd: int,
@@ -89,7 +86,6 @@ struct HttpConn {
         while (self.bio.pendingOut() > 0) {
             let n = self.bio.pull(self.scratch, self.cap);
             if (n <= 0) { return; }
-            // Ciphertext is binary (may contain NUL): send exactly n bytes from the buffer pointer.
             stream.sendBytes(self.fd, self.scratch, n);
         }
     }
@@ -145,19 +141,9 @@ struct HttpConn {
     }
 }
 
-// --- T11: keep-alive framing + connection pool ---------------------------------------------------
-// To reuse a connection across requests the client can no longer read until EOF -- the server holds
-// the socket open. It must read EXACTLY one framed HTTP message. httpMessageLen inspects a buffer and
-// returns the total byte length of the first complete message (headers + body), or -1 if more bytes
-// are still needed. This is the bug-prone core of any keep-alive client, so it is pure + unit-tested.
-//
-// Framing rules (RFC 7230): the body length is Content-Length if present; else, if
-// Transfer-Encoding: chunked, the body ends at the "0\r\n\r\n" zero-chunk terminator; else there is no
-// self-delimiting length and the message runs to connection close (return -2 = "must close, cannot
-// keep-alive"). Header names are matched case-insensitively.
 pub fn httpMessageLen(buf: string): int {
     let headerEnd = indexOfSeq(buf, "\r\n\r\n");
-    if (headerEnd < 0) { return -1; }                 // headers not fully received yet
+    if (headerEnd < 0) { return -1; }
     let bodyStart = headerEnd + 4;
     let headerBlock = string.toLowerCase(string.slice(buf, 0, headerEnd));
 
@@ -166,18 +152,16 @@ pub fn httpMessageLen(buf: string): int {
         let n = parseHeaderInt(headerBlock, clPos + 15);
         let total = bodyStart + n;
         if (buf.length >= total) { return total; }
-        return -1;                                     // body not fully received yet
+        return -1;
     }
     if (indexOfSeq(headerBlock, "transfer-encoding:") >= 0 && indexOfSeq(headerBlock, "chunked") >= 0) {
-        // Complete iff the zero-length chunk terminator has arrived.
         let term = indexOfSeqFrom(buf, "0\r\n\r\n", bodyStart);
         if (term >= 0) { return term + 5; }
         return -1;
     }
-    return -2;                                          // no self-delimiting length -> must close
+    return -2;
 }
 
-// Skip spaces after "content-length:" and read the decimal value.
 fn parseHeaderInt(s: string, start: int): int {
     let i = start;
     while (i < s.length && (s[i] == 32 || s[i] == 9)) { i = i + 1; }
@@ -200,9 +184,6 @@ fn indexOfSeqFrom(hay: string, needle: string, from: int): int {
     return -1;
 }
 
-// A pool of idle keep-alive connections keyed by "host:port:secure". get() hands back a live idle
-// connection for reuse (or -1 fd sentinel when none); put() returns one after a keep-alive response.
-// maxIdlePerHost bounds retained sockets. The fd/bio live in HttpConn; here we key and cap them.
 pub struct KeepAlivePool {
     pub idle: Map<string, List<HttpConn>>,
     pub maxIdlePerHost: int,
@@ -216,18 +197,15 @@ pub struct KeepAlivePool {
         return host + ":" + itoa(port) + (if (secure) ":s" else ":p");
     }
 
-    // Take an idle connection for this endpoint, or undefined if none is pooled.
     pub fn take(self: KeepAlivePool, host: string, port: int, secure: bool): HttpConn | undefined {
         let k = self.key(host, port, secure);
         let lst = self.idle.get(k);
         if (lst == undefined) { return undefined; }
         let l = lst ?? List<HttpConn>();
         if (l.size() == 0) { return undefined; }
-        return l.pop();                                 // LIFO: warmest connection first
+        return l.pop();
     }
 
-    // Return a connection to the pool after a successful keep-alive response. Beyond the per-host cap
-    // the surplus is closed rather than pooled. Returns whether it was retained.
     pub fn put(self: KeepAlivePool, host: string, port: int, secure: bool, conn: HttpConn): bool {
         let k = self.key(host, port, secure);
         let existing = self.idle.get(k);
@@ -263,11 +241,6 @@ pub struct Http {
         return Http.doRequest(method, urlStr, headers, body, timeoutMs, 5, "");
     }
 
-    // T11 keep-alive request over a KeepAlivePool: reuse a pooled connection for this endpoint when one
-    // exists, send `Connection: keep-alive`, read EXACTLY one framed message via httpMessageLen (never
-    // to EOF), and return the connection to the pool unless the response is unframed / says close. The
-    // pure framing + pool keying are unit-tested; end-to-end socket reuse is verified against a live
-    // server (integration harness), not offline.
     pub fn requestVia(pool: KeepAlivePool, method: string, urlStr: string, headers: Map<string, string>, body: string): response.Response {
         let u = url.parse(urlStr);
         let reused = pool.take(u.host, u.port, u.secure);
@@ -291,20 +264,18 @@ pub struct Http {
         headers.forEach((k, v) => { hdrs.push(k + ": " + v); });
         conn.writeStr(reqLine + string.join(hdrs, "\r\n") + "\r\n\r\n" + body);
 
-        // Read until httpMessageLen reports a complete message (or the peer signals no-length -> close).
         let buf = "";
         let mustClose = false;
         while (true) {
             let total = httpMessageLen(buf);
-            if (total >= 0) { break; }                    // one complete message buffered
-            if (total == -2) { mustClose = true; }        // unframed -> drain to EOF then close
+            if (total >= 0) { break; }
+            if (total == -2) { mustClose = true; }
             let chunk = conn.recv(65536);
             if (chunk.length == 0) { mustClose = true; break; }
             buf = buf + chunk;
         }
 
         let resp = response.Response.parse(buf);
-        // Reuse only if the response was self-delimiting and neither side asked to close.
         let connHdr = string.toLowerCase(resp.getHeader("connection") ?? "");
         if (mustClose || string.contains(connHdr, "close")) {
             conn.close();
@@ -322,9 +293,6 @@ pub struct Http {
             return response.Response(Status.InternalServerError, "connection failed");
         }
         if (timeoutMs > 0) { stream.setTimeout(fd, timeoutMs); }
-        // When caPem is provided (and the URL is https), enforce CA trust: the server chain must validate
-        // against a root in the bundle for u.host at UTC-now, or the handshake fails. The store is bound to
-        // a named local so its backing lists outlive the bio (an inline temporary would be released early).
         let store = truststore.loadPemBundle(caPem);
         let bio: tlsmembio.TlsBio = if (u.secure && caPem.length > 0) tlsmembio.newClientBioVerify(u.host, store) else tlsmembio.newClientBio(u.host);
         let conn = HttpConn{ secure: u.secure, fd: fd, bio: bio, scratch: bytes.alloc(33792), cap: 33792 };
@@ -357,8 +325,6 @@ pub struct Http {
             parts.push(chunk);
         }
         conn.close();
-        // Response framing + chunked/gzip decoding lives in web.response (Response.parse); the client
-        // no longer keeps its own copy.
         let resp = response.Response.parse(string.join(parts, ""));
         let code = Status.toCode(resp.status);
 
@@ -406,9 +372,6 @@ pub struct Http {
         return Http.request("HEAD", urlStr, Http.emptyHeaders(), "");
     }
 
-    // Verified HTTPS: the server certificate chain must validate against a CA in `caPem` (a PEM bundle,
-    // e.g. the system trust store, read by the caller) for the URL host at UTC-now, else the request
-    // fails. This is the trust check a plain get() does not perform.
     pub fn getVerified(urlStr: string, caPem: string): response.Response {
         return Http.doRequest("GET", urlStr, Http.emptyHeaders(), "", 0, 5, caPem);
     }
@@ -417,8 +380,6 @@ pub struct Http {
     }
 }
 
-// Response framing/chunked/gzip is tested where it now lives (web.response: test_parse_content_length,
-// test_parse_chunked). The client's former duplicate tests were retired with the duplicate code.
 
 pub fn getJson<T>(urlStr: string): T {
     let r = Http.get(urlStr);

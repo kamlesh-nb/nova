@@ -1,23 +1,8 @@
-// A generic-trait OBJECT stored in a FIELD, then dispatched — the ActorCell keystone. Two bugs
-// hid here until now, both silent (correct dispatch, then a delayed SIGSEGV):
-//
-//   1. sema typed a generic-trait type `Beh<int>` as a `.struct_` (lower.zig lowered EVERY generic
-//      name to a struct), so `let r = obj.recv(x)` — a method on that "struct" — resolved to NO
-//      type. `${r}` then derefed the int result as a string pointer. A generic trait is a `.trait_`;
-//      its vtable is shared across instantiations (dispatch erases the arg), exactly like `Beh`.
-//
-//   2. the GENERIC constructor path (`Cell<int>(cnt)`) skipped the trait-widening every other call
-//      site does, so the raw struct — not a fat pointer — landed in the `Beh<M>` field. The later
-//      `self.beh.recv(..)` read a garbage vtable off the struct body → wild jump.
-//
-// This case exercises both: a generic struct `Cell<M>` with a `Beh<M>` field, a GENERIC async
-// method that AWAITS a trait dispatch on that field, driven from a spawned coroutine — the full
-// pattern the actor stdlib is built on.
 import assert;
 import concurrency.asyncchan;
 
 trait Beh<M> {
-    fn recv(self, msg: int): int;      // concrete return — the value `${r}` must format as an int
+    fn recv(self, msg: int): int;
 }
 
 struct Cnt impl Beh<int> {
@@ -26,31 +11,27 @@ struct Cnt impl Beh<int> {
     fn recv(self: Cnt, msg: int): int { self.total = self.total + msg; return self.total; }
 }
 
-// A generic struct holding a generic-trait object in a field.
 struct Cell<M> {
     pub sig: long,
     pub beh: Beh<M>,
     init(beh: Beh<M>) { self.sig = asyncchan.chanNew(); self.beh = beh; }
 
-    // A GENERIC async METHOD that awaits, then dispatches on the generic-trait field.
     pub async fn run(self: Cell<M>): int {
         let v = await asyncchan.chanRecv(self.sig);
-        let r = self.beh.recv(v);       // dispatch on `Beh<M>` — must return an int, not crash
+        let r = self.beh.recv(v);
         return r;
     }
 }
 
-// SYNC: construct with a widened arg, read the field-typed result unannotated, interpolate it.
 fn syncDispatch(): int {
     let c = Cnt();
-    let cell = Cell<int>(c);            // generic ctor MUST widen `c` → a Beh fat pointer
-    let r = cell.beh.recv(5);           // unannotated: type must resolve to int (bug 1)
-    let msg = `r=${r}`;                 // interpolation of an int (would SIGSEGV under bug 1)
+    let cell = Cell<int>(c);
+    let r = cell.beh.recv(5);
+    let msg = `r=${r}`;
     if (r != 5) { return -1; }
-    return c.total;                     // 5 iff the dispatch actually mutated the real Cnt
+    return c.total;
 }
 
-// ASYNC: the full ActorCell — spawn a generic async method that awaits then dispatches.
 async fn asyncDispatch(): int {
     let c = Cnt();
     let cell = Cell<int>(c);
@@ -58,7 +39,7 @@ async fn asyncDispatch(): int {
     asyncchan.chanSend(cell.sig, 7);
     let r = await f;
     if (r != 7) { return -1; }
-    return c.total;                     // 7 — the spawned coroutine dispatched into the real Cnt
+    return c.total;
 }
 
 @test

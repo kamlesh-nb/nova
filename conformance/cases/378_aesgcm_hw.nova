@@ -1,8 +1,3 @@
-// Hardware AES-GCM (crypto.aead.aesgcmhw) using the AES instruction (simd.aesenc) for the block cipher.
-// Verified byte-for-byte against the constant-time software crypto.aead.aesgcm (which is itself NIST-KAT
-// gated by 223) across AES-128 / AES-256, several plaintext lengths, and with/without AAD; plus open
-// round-trips and rejects a tampered tag. This gates the hardware AES-CTR + packed key schedule. (The MAC
-// currently reuses the software GHASH; a clmul-based GHASH is the pending throughput piece.)
 import assert;
 import bytes;
 import crypto.aead.aesgcm;
@@ -30,8 +25,6 @@ fn diffTest(keyLen: int, ptLen: int, aadLen: int, seed: int): void {
 
 @test
 fn aes256_gcm_hw(): void { diffTest(32, 64, 20, 1); diffTest(32, 16, 0, 2); diffTest(32, 1024, 13, 3); diffTest(32, 0, 16, 4);
-    // GHASH 4-way-aggregation boundaries: exact group (64), group+1 (65), group+16 (80), 2 groups (128),
-    // 2 groups + 1 (129), 8 groups (512), and AAD longer than a group (100 > 64) so the AAD path aggregates too.
     diffTest(32, 65, 0, 20); diffTest(32, 80, 5, 21); diffTest(32, 128, 0, 22); diffTest(32, 129, 32, 23);
     diffTest(32, 512, 100, 24); diffTest(32, 240, 63, 25); }
 @test

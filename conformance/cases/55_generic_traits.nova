@@ -1,8 +1,3 @@
-// Flagship: generic traits — `trait T<Q, R>` with type-parameterised method
-// signatures, `impl T<Concrete, Concrete>`, dispatched through a trait value.
-// The impl-conformance check substitutes the trait's type params (Q, R) with the
-// impl's type args before comparing signatures; codegen is type-erased so the
-// call site is identical to any other trait dispatch.
 import assert;
 
 trait Handler<Q, R> {
@@ -18,8 +13,6 @@ struct GetUserHandler impl Handler<GetUser, UserDto> {
     }
 }
 
-// A second instantiation of the SAME generic trait with different type args —
-// proves one trait definition serves many concrete (Q, R) pairs.
 struct Doubler impl Handler<int, int> {
     fn handle(self, n: int): int { return n + n; }
 }

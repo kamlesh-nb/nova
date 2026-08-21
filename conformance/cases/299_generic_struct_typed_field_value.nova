@@ -1,12 +1,3 @@
-// B5 (partial): a generic struct instantiation `Cell<int>{ value: 42 }` was inferred with NO type
-// arguments, so any `T`-typed field or method return stayed an erased type-parameter. Using such a value
-// where its concrete type matters -- string interpolation `${...}` -- then stringified a raw `int` as a
-// string pointer and SEGV'd in StringBuilder_append. Fix: struct-init inference recovers the instantiation
-// from the field values (solving the struct's type parameters against the inferred field-value types), so
-// the value carries `Cell<int>` and its `T` resolves to `int`.
-//
-// Still open (tracked separately): dispatch of such a method through a TRAIT OBJECT vtable, where the
-// vtable points to the erased shared method body rather than the per-instantiation monomorphisation.
 
 import assert;
 
@@ -31,7 +22,7 @@ fn test_interpolate_generic_field_string(): void {
 @test
 fn test_interpolate_generic_method_return(): void {
     let c = Cell<int>{ value: 42 };
-    let v = c.get();                 // v resolves to the concrete `int`, not the erased `T`
+    let v = c.get();
     assert.equalStr(`${v}`, "42");
     assert.equalInt(v, 42);
 }

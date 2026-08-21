@@ -1,23 +1,12 @@
-// Pins the string-interpolation borrow fix: a template part that is a bare VARIABLE or PARAMETER
-// (`${s}` / `${obj.f}` / `${xs[i]}`) of owned type is BORROWED, not retained — `StringBuilder.append`
-// copies the bytes and never stores the pointer.
-//
-// The bug: `compileAppendToStringBuilder` retained an owned var part with no matching release, leaking
-// that string once per interpolation. It was the real mechanism behind the "chained-map leak" —
-// `xs.map(f).map(g)` leaks because map's closure interpolates its owned string argument. Reproduces
-// with a plain non-generic fn (no map, no closure, no generics), which is what this case pins.
-// Must be leak-free under --arc and clean under --asan.
 import list;
 import assert;
 
 fn mk(s: string): string { return s + "!"; }
-fn wrap(s: string): string { return `<${s}>`; }        // interpolates a PARAMETER
+fn wrap(s: string): string { return `<${s}>`; }
 fn wrap2(a: string, b: string): string { return `${a}|${b}`; }
 
 @test
 fn test_interpolate_parameter(): void {
-    // THE minimal repro: pass a heap string to a fn that interpolates its param. Before the fix the
-    // argument leaked (retained by append, never released).
     let arg = mk("x");
     let r = wrap(arg);
     assert.equalStr(r, "<x!>");
@@ -33,16 +22,14 @@ fn test_interpolate_two_params(): void {
 
 @test
 fn test_interpolate_local_var(): void {
-    // A local heap-string variable interpolated inline (not through a call).
     let s = mk("y");
     let r = `[${s}]`;
     assert.equalStr(r, "[y!]");
-    assert.equalStr(s, "y!");   // s survives — it was borrowed, not consumed
+    assert.equalStr(s, "y!");
 }
 
 @test
 fn test_interpolate_list_element_field(): void {
-    // A field/index part: `${xs.get(i)}` reads an owned element; the list keeps ownership.
     let xs = list.List<string>();
     xs.push(mk("a"));
     xs.push(mk("b"));
@@ -53,7 +40,6 @@ fn test_interpolate_list_element_field(): void {
 
 @test
 fn test_interpolate_in_loop(): void {
-    // Per-iteration interpolation of an owned element — the leak would be unbounded.
     let xs = list.List<string>();
     xs.push(mk("a")); xs.push(mk("b")); xs.push(mk("c"));
     let i = 0;

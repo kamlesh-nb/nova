@@ -126,7 +126,7 @@ it is the ground truth and this document tracks it.
 | `src/builder.zig` | `nova build` / `nova <file>`: orchestrates the whole compile+link pipeline (`compileProgram`, `cmdBuild`). |
 | `src/pipeline.zig` | The reusable pipeline pieces: import resolution, file merge, the four synthetic generators, target derivation, link-command assembly, build-cache stamp. |
 | `src/packages.zig` | The package manager: fetch, lock, resolve, and the `get`/`restore`/`update`/`publish` commands. |
-| `src/tester.zig` | `nova test`: collects the `@test` functions defined in the USER's file(s) (not the stdlib's, filtered by source path), builds a harness, compiles, and runs. See `language-lld.md` 6.6. |
+| `src/tester.zig` | `nova test`: collects the `@test` functions defined in the USER's file(s) (not the stdlib's, filtered by source path), builds a harness, compiles, and runs. See `language-lld.md` 15.6. |
 | `src/scaffold.zig`, `src/templates.zig` | `nova init`: project scaffolding and the file templates. |
 | `src/format.zig`, `src/frontend/formatter.zig` | `nova fmt`: the source formatter. |
 | `src/frontend/lexer.zig` | Tokeniser. |
@@ -514,7 +514,7 @@ emits objects. It consumes the `ast.Program`, the `TypedIr`, and the reachabilit
 - Value-struct inline layout: a value struct is laid out as an inline aggregate (no box), so nested value
   fields sit inside their parent. `getStructBaseName`, `isStructType`, and `instantiationsOf` support the
   mangled generic names.
-- `valueOptionalName` marks the boxed value-optional types (see `language-lld.md` 1.4 for why value
+- `valueOptionalName` marks the boxed value-optional types (see `language-lld.md` 9.1 for why value
   optionals are boxed).
 - `toLLVMType` / `slotTypeForLocal` map a `TypeRef` to the LLVM type and to a local's stack slot type.
 

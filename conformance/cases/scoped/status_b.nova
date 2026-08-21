@@ -1,5 +1,4 @@
 import status_a;
-// Module B: same-named enum Status but DIFFERENT variants/order/codes. Imports A's same-named Status.
 pub enum Status { Start, Middle, End
     pub fn code(self: Status): int {
         switch (self) {

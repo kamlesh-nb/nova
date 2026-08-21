@@ -1,9 +1,3 @@
-// P0 (value-semantics completion): a value struct that transitively owns heap data — i.e. it has NO
-// directly-owned field, only nested VALUE-struct fields whose leaves are owned (a `string`) — must still
-// get its destructor scheduled at scope exit. Before the fix, `valueStructHasOwnedFields` checked only
-// DIRECT fields, so `Outer{inner:S{data:string}}` and `Two{a:S,b:S}` got no drop and leaked S.data on
-// every construction (600-object ARC-audit leak). This case exercises both the block-scope and the
-// function-scope cleanup paths; the --arc / --asan gates turn a regression here into a hard failure.
 import assert;
 
 struct S {
@@ -20,7 +14,6 @@ struct Two {
     init(x: string, y: string) { self.a = S(x); self.b = S(y); }
 }
 
-// Build a fresh HEAP string each call so a missing destructor is a real, detectable leak.
 fn intToStr(n: int): string {
     if (n == 0) { return "0"; }
     let s = "";
@@ -35,19 +28,15 @@ fn digit(d: int): string {
     return "9";
 }
 
-// Value semantics: a copy of a nested value struct must be independent of the original.
 @test
 fn nested_value_struct_is_copied(): void {
     let a = Outer("original-payload-string");
-    let b = a;                       // value copy (deep, inline)
+    let b = a;
     b.inner.data = "mutated-in-b";
-    assert.equalStr(a.inner.data, "original-payload-string");  // a is untouched
+    assert.equalStr(a.inner.data, "original-payload-string");
     assert.equalStr(b.inner.data, "mutated-in-b");
 }
 
-// P1: copying a value struct must RETAIN its transitively-owned heap data, or dropping both the original
-// and the copy double-frees it (heap-use-after-free). A string literal would not exercise this (constant,
-// not heap), so use a fresh heap string per iteration. Two nesting levels checks the recursion depth.
 struct Mid { pub s: S, init(d: string) { self.s = S(d); } }
 struct Deep { pub m: Mid, init(d: string) { self.m = Mid(d); } }
 @test
@@ -55,7 +44,7 @@ fn copy_retains_nested_owned(): void {
     let i = 0;
     while (i < 100) {
         let a = Outer("heap-" + intToStr(i) + "-payload");
-        let b = a;                   // must retain a.inner.data; a AND b drop here
+        let b = a;
         assert.equalStr(b.inner.data, a.inner.data);
         i = i + 1;
     }
@@ -73,7 +62,6 @@ fn copy_retains_two_levels(): void {
     assert.isTrue(true);
 }
 
-// Block-scope drop: each loop iteration's Outer must release its transitively-owned string.
 @test
 fn block_scope_no_leak(): void {
     let i = 0;
@@ -85,8 +73,6 @@ fn block_scope_no_leak(): void {
     assert.isTrue(true);
 }
 
-// Function-scope drop: a value struct that is a direct function-scope local (no enclosing block) must
-// release its transitively-owned data at return.
 fn makeAndDrop(i: int): void {
     let t = Two("x-" + intToStr(i), "y-" + intToStr(i));
     assert.equalStr(t.a.data, t.a.data);

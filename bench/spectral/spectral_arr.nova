@@ -1,5 +1,3 @@
-// Spectral norm with FIXED primitive arrays (double[1000]) created via [value; count] repeat-init,
-// instead of List<double>. Same algorithm as spectral.nova; measures the fixed-array path.
 import math;
 const N: int = 1000;
 

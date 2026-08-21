@@ -1,16 +1,3 @@
-// Two return-type inference bugs found by running the scaffolded web app — both made a STRING render
-// as its pointer address in a `+` concat (the numToString path), corrupting web.response.serialize's
-// status line and header block. Fixed in sema; gated here.
-//
-// BUG 1 — an ENUM METHOD's return type was not inferred for an unannotated `let`. `Enum.method(args)`
-// parses as a field-access-callee on an enum name, and the enum-CONSTRUCTION shortcut (`E.Variant(p)`)
-// fired for ANY field, typing `let r = Status.reasonPhrase(s)` as the enum instead of its `string`
-// return. Fix: the shortcut only fires when the field is a real VARIANT; else the call resolves through
-// staticMethodReturn — which needs enum methods REGISTERED as `.method` symbols (they weren't).
-//
-// BUG 2 — a closure passed to a method on a FIELD receiver (`self.headers.forEach((k,v) => ...)`) got
-// no expected param types, so `k`/`v` inferred as machine words and concatenation numToString'd the
-// strings. Fix: typeOfObjectQuietly resolves a field-access receiver's type (not just a local var).
 import assert;
 import list;
 import map;
@@ -19,8 +6,7 @@ import string;
 pub enum Level {
     Low,
     High,
-    Tagged(int),                            // a PAYLOAD variant — exercises the E.Variant(p) shortcut
-    // A method returning a NON-int type via a switch — the shape of Status.reasonPhrase.
+    Tagged(int),
     pub fn label(self: Level): string {
         switch (self) {
             case Level.Low: { return "low"; }
@@ -31,18 +17,15 @@ pub enum Level {
     }
 }
 
-// BUG 1: the enum-method result, unannotated, must concatenate as a STRING (not its pointer).
 fn enumMethodConcat(): string {
-    let r = Level.label(Level.High);       // inferred type MUST be string
-    return "level=" + r;                    // `+` must string-concat, not numToString(r)
+    let r = Level.label(Level.High);
+    return "level=" + r;
 }
 
-// A struct whose method iterates a FIELD map with a closure — the response.serialize shape.
 struct Headers {
     pub map: Map<string, string>,
     init() { self.map = Map<string, string>(8, string.hash); }
     pub fn add(self: Headers, k: string, v: string): void { self.map.set(k, v); }
-    // BUG 2: the closure params k,v (from forEach on a FIELD map) must be typed string.
     pub fn render(self: Headers): string {
         let lines = List<string>();
         self.map.forEach((k, v) => { lines.push(k + "=" + v); });
@@ -57,8 +40,7 @@ fn test_enum_method_return_concats_as_string(): void {
 
 @test
 fn test_enum_variant_construction_still_works(): void {
-    // The E.Variant(payload) shortcut must STILL fire for a real variant (regression guard).
-    let d = Level.Tagged(7);                        // enum construction via the call form
+    let d = Level.Tagged(7);
     assert.isTrue(string.eql(Level.label(d), "tagged"));
 }
 
@@ -67,6 +49,5 @@ fn test_field_map_closure_params_typed(): void {
     let h = Headers();
     h.add("a", "1");
     let out = h.render();
-    // Exactly one entry "a=1" — proves k and v concatenated as strings, not pointers.
     assert.isTrue(string.eql(out, "a=1"));
 }

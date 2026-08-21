@@ -1,8 +1,3 @@
-// Stapled OCSP wired into ClientBio end to end: an all-Nova verifying handshake where the SERVER staples
-// an OCSP response in the leaf CertificateEntry and the CLIENT captures it and enforces revocation during
-// its chain-trust check. A `good` staple lets the handshake complete; a `revoked` staple makes the
-// verifying client ABORT even though the chain itself is valid; no staple soft-fails (chain trust
-// decides). Also unit-tests the pure findOcspStaple extractor on a synthetic CertificateEntry.
 import net.tlsmembio;
 import crypto.tls.truststore;
 import crypto.tls.13.tlsClient;
@@ -52,17 +47,14 @@ fn ocspLenFor(status: int): int {
     return ocsp.buildTestResponse(serial, leaf.serialLen, status, hexBuf(PRIV), keyHash(), mkTime(), out);
 }
 
-// The verifying ClientBio captures the server's stapled OCSP and enforces revocation INLINE during its
-// chain-trust check: a good staple completes the handshake, a revoked staple ABORTS it (even though the
-// chain is valid), and no staple soft-fails (chain trust decides).
 @test
 fn staple_good_completes(): void {
     let store = truststore.newTrustStoreDer(hexBuf(CERT), CLEN);
     let cb = tlsmembio.newClientBioVerify("localhost", store);
     let sb = tlsmembio.newServerBio(hexBuf(CERT), CLEN, hexBuf(PRIV));
     sb.setStapledOcsp(ocspFor(ocsp.CERT_GOOD), ocspLenFor(ocsp.CERT_GOOD));
-    assert.isTrue(handshake(cb, sb, bytes.alloc(33792)));         // trusted + good -> completes
-    assert.isTrue(cb.stapledOcspSize() > 0);                      // captured from the Certificate message
+    assert.isTrue(handshake(cb, sb, bytes.alloc(33792)));
+    assert.isTrue(cb.stapledOcspSize() > 0);
 }
 
 @test
@@ -71,7 +63,6 @@ fn staple_revoked_aborts(): void {
     let cb = tlsmembio.newClientBioVerify("localhost", store);
     let sb = tlsmembio.newServerBio(hexBuf(CERT), CLEN, hexBuf(PRIV));
     sb.setStapledOcsp(ocspFor(ocsp.CERT_REVOKED), ocspLenFor(ocsp.CERT_REVOKED));
-    // chain is valid but the stapled OCSP says REVOKED -> the verifying client aborts inline
     assert.isFalse(handshake(cb, sb, bytes.alloc(33792)));
 }
 
@@ -79,41 +70,35 @@ fn staple_revoked_aborts(): void {
 fn no_staple_soft_fails_to_trust(): void {
     let store = truststore.newTrustStoreDer(hexBuf(CERT), CLEN);
     let cb = tlsmembio.newClientBioVerify("localhost", store);
-    let sb = tlsmembio.newServerBio(hexBuf(CERT), CLEN, hexBuf(PRIV));   // no staple
+    let sb = tlsmembio.newServerBio(hexBuf(CERT), CLEN, hexBuf(PRIV));
     assert.isTrue(handshake(cb, sb, bytes.alloc(33792)));
 }
 
 @test
 fn findOcspStaple_extracts(): void {
-    // a synthetic CertificateEntry extensions block: status_request (0x0005) wrapping a 6-byte "OCSP"
     let ocspDer = bytes.alloc(6); let i = 0; while (i < 6) { bytes.write_byte(ocspDer, i, 0x40 + i); i = i + 1; }
-    // extensions = [type 0005][extDataLen 000a][status_type 01][ocspLen 000006][6 bytes]
     let buf = bytes.alloc(64);
-    bytes.write_byte(buf, 0, 0x00); bytes.write_byte(buf, 1, 0x05);           // status_request
-    bytes.write_byte(buf, 2, 0x00); bytes.write_byte(buf, 3, 0x0a);           // ext_data len = 1+3+6
-    bytes.write_byte(buf, 4, 0x01);                                            // status_type ocsp
-    bytes.write_byte(buf, 5, 0x00); bytes.write_byte(buf, 6, 0x00); bytes.write_byte(buf, 7, 0x06);  // OCSP len
+    bytes.write_byte(buf, 0, 0x00); bytes.write_byte(buf, 1, 0x05);
+    bytes.write_byte(buf, 2, 0x00); bytes.write_byte(buf, 3, 0x0a);
+    bytes.write_byte(buf, 4, 0x01);
+    bytes.write_byte(buf, 5, 0x00); bytes.write_byte(buf, 6, 0x00); bytes.write_byte(buf, 7, 0x06);
     let j = 0; while (j < 6) { bytes.write_byte(buf, 8 + j, bytes.read_byte(ocspDer, j)); j = j + 1; }
-    let extTotal = 4 + 10;                                                     // type(2)+len(2)+extData(10)
+    let extTotal = 4 + 10;
     let st = tlsClient.findOcspStaple(buf, 0, extTotal);
     assert.equalInt(6, st.len);
     assert.equalInt(8, st.off);
     let k = 0; while (k < 6) { assert.equalInt(bytes.read_byte(ocspDer, k), bytes.read_byte(buf, st.off + k)); k = k + 1; }
 
-    // no status_request -> no staple
     let empty = tlsClient.findOcspStaple(bytes.alloc(4), 0, 0);
     assert.equalInt(0, empty.len);
 }
 
 @test
 fn client_hello_advertises_status_request(): void {
-    // The ClientHello must carry the status_request extension (00 05 00 05 01 00 00 00 00) so a real
-    // (e.g. OpenSSL) server chooses to staple an OCSP response.
     let rnd = bytes.alloc(32); let sid = bytes.alloc(32);
     let eph = bytes.alloc(32); let ephP = bytes.alloc(65);
     let ch = bytes.alloc(1024);
     let n = tlsClient.buildClientHello(rnd, sid, eph, ephP, "example.com", "", ch);
-    // scan for the 9-byte status_request extension
     let found = false;
     let i = 0;
     while (i + 9 <= n) {

@@ -1,8 +1,3 @@
-// M-10 (memory-management-refinements.md): value-struct elements are stored INLINE in a List's
-// Storage buffer at their real slot width -- no per-element heap allocation and no per-element ARC.
-// This is the payoff of retiring Storage's fixed 8-byte slot. A scalar value struct carries zero ARC;
-// a value struct with an owned (string) field has its field correctly retained on copy-in and released
-// on overwrite and on drop, all through the general typed copy/drop machinery (not bespoke Storage ARC).
 import assert;
 import list;
 
@@ -14,7 +9,7 @@ fn test_list_scalar_value_struct_inline(): void {
     let l = List<Point>();
     l.push(Point(10, 20));
     l.push(Point(30, 40));
-    l.set(0, Point(11, 21));                     // overwrite -- inline bytes, no ARC
+    l.set(0, Point(11, 21));
     assert.equalInt(l.at(0).x, 11);
     assert.equalInt(l.at(1).y, 40);
     assert.equalInt(l.size(), 2);
@@ -25,7 +20,7 @@ fn test_list_owned_field_value_struct_inline(): void {
     let l = List<Rec>();
     l.push(Rec(1, "alpha"));
     l.push(Rec(2, "beta"));
-    l.set(0, Rec(1, "gamma"));                   // overwrite releases old owned string, retains new
+    l.set(0, Rec(1, "gamma"));
     assert.equalStr(l.at(0).name, "gamma");
     assert.equalStr(l.at(1).name, "beta");
     assert.equalInt(l.size(), 2);

@@ -1,16 +1,10 @@
-// A7 / F3 §5 stage 4b (ptr migration): a `ptr` (raw machine address) must NOT be
-// silently stored into a ≤32-bit integer — that truncates the address once `int`
-// narrows to 32 bits at stage 5, which is heap corruption. The type checker rejects
-// it (bytes.alloc returns `ptr`; the `int` field is the narrowing sink). Fixing the
-// program means typing the field `ptr`. This case must FAIL to compile — if it ever
-// compiles, the ptr-distinctness enforcement has regressed.
 import bytes;
 
 struct Buffer {
-    pub data: int,   // WRONG: holds an address; must be `ptr`
+    pub data: int,
 
     init(n: int) {
-        self.data = bytes.alloc(n);   // ptr → int: rejected
+        self.data = bytes.alloc(n);
     }
 }
 

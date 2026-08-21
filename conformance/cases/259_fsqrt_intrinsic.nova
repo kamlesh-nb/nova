@@ -1,16 +1,11 @@
-// math.fsqrt lowers to the llvm.sqrt.f64 intrinsic (hardware fsqrt), not a 30-iteration Newton loop.
-// Pin the exact IEEE-754 results (the Newton approximation did not produce these last-bit values) and
-// the <=0 contract (0.0, preserved rather than the intrinsic's NaN). Guards the numeric fast path.
 import math;
 import assert;
 
 @test
 fn fsqrt_exact_values(): void {
-    // The exact IEEE-754 digits of sqrt(2) -- the Newton approximation did not reproduce these.
     assert.equalStr(`${math.fsqrt(2.0)}`, "1.4142135623730951");
     assert.equalStr(`${math.fsqrt(25.0)}`, "5");
     assert.equalStr(`${math.fsqrt(1.0)}`, "1");
-    // perfect square, checked numerically (formatter renders 1000.0 in sci-notation)
     let big = math.fsqrt(1000000.0);
     assert.isTrue(big > 999.9999 && big < 1000.0001);
 }
@@ -18,12 +13,11 @@ fn fsqrt_exact_values(): void {
 @test
 fn fsqrt_nonpositive_is_zero(): void {
     assert.equalStr(`${math.fsqrt(0.0)}`, "0");
-    assert.equalStr(`${math.fsqrt(0.0 - 4.0)}`, "0");             // guard: 0.0, not NaN
+    assert.equalStr(`${math.fsqrt(0.0 - 4.0)}`, "0");
 }
 
 @test
 fn fsqrt_roundtrip(): void {
-    // s*s reconstructs the input for perfect squares -> proves a real sqrt, not an approximation
     let s = math.fsqrt(144.0);
     assert.isTrue(s * s > 143.9999 && s * s < 144.0001);
     assert.equalStr(`${s}`, "12");

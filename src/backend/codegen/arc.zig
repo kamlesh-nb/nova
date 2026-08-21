@@ -1,19 +1,127 @@
+//! ARC (automatic reference counting) code generation.
+//!
+//! Nova has no garbage collector. Every heap object carries an 8-byte header
+//! (refcount at offset -8, byte length at offset -4), and the compiler emits
+//! `nova_retain`/`nova_release` calls so that objects are freed exactly when
+//! their last reference goes away. This file is the part of codegen that
+//! decides WHERE those calls go and, crucially, MANUFACTURES the destructor
+//! functions that `nova_release` invokes once a refcount hits zero. It is a
+//! companion to `expressions.zig`/`statements.zig` (which call in here at
+//! binding, return, and scope-exit points) and sits directly on top of the
+//! LLVM C API via [`core`].
+//!
+//! ## The two questions this file answers
+//!
+//! 1. **Disposition** ([`acquisitionDisposition`], [`Disposition`]): when an
+//!    expression's value flows into a new home (a `let`, a container slot, a
+//!    struct field), does the destination TAKE ownership of an existing object
+//!    (so we must `nova_retain` it, because the source still names it too) or
+//!    CONSUME a fresh temporary (so we just move it, no retain)? Naming an
+//!    existing owner (`x`, `obj.field`, `arr[i]`) borrows; a constructor call
+//!    or literal produces a fresh owned value. The authoritative answer comes
+//!    from the typed-IR ownership pass; the `principled*` helpers here are the
+//!    fallback and the shadow-diff cross-check.
+//!
+//! 2. **Destruction** (the `getOrCreate*Destructor*` family): given a type,
+//!    synthesise (once, memoised by mangled symbol name) an LLVM function
+//!    `__destruct_<mangled>` that releases everything the object transitively
+//!    owns. Each type SHAPE gets its own layout-aware walker: plain structs
+//!    release owned fields at their byte offsets and recurse into inline
+//!    value-struct fields; tagged enums branch on the tag word and release the
+//!    active variant's payload slots; tuples and error-unions release owned
+//!    elements/arms; `Storage<T>` loops over its element slots; trait objects
+//!    dispatch through the vtable (slot 0 is the concrete destructor); closures
+//!    call the captured environment's cleanup then free the box.
+//!
+//! ## Two parallel destructor engines, kept in agreement
+//!
+//! Destructors can be built from a TypeId (`*ByTypeId`, driven by the typed-IR
+//! [`typesys.TypeStore`]) or from a legacy type-NAME string (the plain
+//! `getOrCreate*Destructor` variants). The string path is the historical one;
+//! the TypeId path is the accurate one. [`getOrCreateDestructorPreferId`] uses
+//! the TypeId whenever its mangled symbol matches the string's, and the
+//! `diff*` helpers, active only under `sema_shadow.report_enabled`, count how
+//! often the two engines agree so the string path can eventually be retired.
+//!
+//! ## Value structs vs reference types
+//!
+//! A `struct` is value-semantic: its bytes live inline in its owner, so it is
+//! never refcounted itself, but a copy must deep-retain any owned FIELDS it
+//! holds and a drop must release them. That is why copies (see
+//! [`buildTupleDeepCopy`]) call `retainValueStructOwnedFields` and drops (see
+//! [`dropValueStruct`], [`releaseLocalByName`]) call the value-struct
+//! destructor directly rather than `nova_release`.
+//!
+//! ## Optimisation and self-verification passes (module-level, opt-in globals)
+//!
+//! After the module is built, three whole-module passes run over raw LLVM IR:
+//! [`elideBorrowedArc`] removes retain/release pairs on values that never
+//! escape (redundant and borrow-only), [`arcCensusBefore`]/[`arcCensusAfter`]
+//! measure how much ARC traffic exists and how much MORE could be elided, and
+//! [`verifyArcBalance`] is a fail-closed self-check that every provably
+//! non-escaping owned slot has acquires == releases (an imbalance is a leak or
+//! double-free the compiler itself introduced). Each is gated by a global flag
+//! wired to an env var, so they cost nothing unless asked for.
+//!
+//! ## Fail-closed on un-typeable values
+//!
+//! If a value reaches retain/release with no concrete type ([`unresolvedDtorField`],
+//! the placeholder branch of [`legacyStringOwnership`]), this file aborts the
+//! compile with a "please report" message rather than emitting a free of an
+//! object whose layout is unknown: guessing would corrupt memory, so a compiler
+//! bug is surfaced loudly instead of silently miscompiled.
+
+/// The Zig standard library, used here for slices, formatting, hash maps, and
+/// `std.process.exit` on the fail-closed compiler-bug paths.
 const std = @import("std");
+/// Nova's AST. Disposition analysis reads [`ast.Expression`]/[`ast.ExprKind`]
+/// and the destructor builders read struct/enum declarations and [`ast.TypeRef`].
 const ast = @import("../../frontend/ast.zig");
+/// The LLVM Zig bindings namespace; [`types`] and [`core`] are pulled out of it.
 const llvm = @import("llvm");
+/// LLVM opaque handle types (`LLVMValueRef`, `LLVMTypeRef`, predicates, ...).
 const types = llvm.types;
+/// The LLVM C API (`LLVMBuild*`, `LLVMAddFunction`, use/def iteration). Every
+/// destructor body and elision pass is written against these calls.
 const core = llvm.core;
 
+/// Shadow-diff instrumentation: counters and the legacy type-name renderer
+/// (`renderLegacy`). Under `report_enabled` the `diff*` helpers here tally
+/// where the TypeId and string ownership engines agree or diverge.
 const sema_shadow = @import("../../frontend/sema/shadow.zig");
+/// The typed-IR type system: [`typesys.TypeId`] handles and the
+/// [`typesys.TypeStore`] that the accurate `*ByTypeId` destructor path reads.
 const typesys = @import("../../frontend/types.zig");
+/// Lowers an [`ast.TypeRef`] to a [`typesys.TypeId`] under a type-parameter
+/// scope; used to resolve a struct field's concrete type inside a generic
+/// instantiation's destructor.
 const lower = @import("../../frontend/sema/lower.zig");
+/// Substitutes a generic struct's type arguments into a lowered field TypeId,
+/// turning `T` into the concrete argument for this instantiation.
 const subst = @import("../../frontend/sema/subst.zig");
+/// The codegen context (`self`): the LLVM module/builder, symbol tables
+/// (`structs`/`enums`/`unions`/`traits`), the type store, per-function ARC
+/// state, and the many helper methods these free functions call as `self.*`.
 const LlvmCompiler = @import("llvm_codegen.zig").LlvmCompiler;
+/// Strips generic arguments from a type name (`List<int>` -> `List`), giving
+/// the base name used to look a declaration up in `self.structs`/`self.enums`.
 const getStructBaseName = @import("types.zig").getStructBaseName;
+/// True for built-in scalar types (`int`, `bool`, `float`, ...) which are never
+/// heap-allocated and therefore never owned.
 const isPrimitiveTypeName = @import("types.zig").isPrimitiveTypeName;
+/// Turns a type name into a symbol-safe mangled form so a destructor gets one
+/// stable, collision-free `__destruct_<mangled>` name.
 const mangleTypeName = @import("types.zig").mangleTypeName;
+/// True if the name is a boxed value-optional (`T?` stored as a heap box); such
+/// a box owns its payload and needs releasing even though `T` may be a value.
 const valueOptionalName = @import("types.zig").valueOptionalName;
 
+/// True if the named enum carries payloads (a variant has a `type_name` or
+/// `fields`), i.e. it is a tagged union rather than a plain C-style enum.
+///
+/// Only tagged unions need a destructor: a plain enum is just an integer tag
+/// with nothing to release. Used as the gate in [`getOrCreateEnumDestructor`]
+/// and by [`legacyStringOwnership`] to decide whether an enum value is owned.
 pub fn enumIsTaggedUnion(self: *LlvmCompiler, enum_name: []const u8) bool {
     const enum_decl = self.enums.get(enum_name) orelse return false;
     for (enum_decl.variants) |v| {
@@ -23,9 +131,16 @@ pub fn enumIsTaggedUnion(self: *LlvmCompiler, enum_name: []const u8) bool {
 }
 
 
-// GAP-1: fail-loud used by the TypeId-native struct destructor when a field's concrete type does not
-// lower under the struct's own (decl, args). Proven unreachable corpus-wide (NOVA_DTOR_STRBLK sweep, 0
-// hits); reaching it means a typed-IR accuracy bug, so exit rather than fall back to the string engine.
+/// Aborts the compile because a struct field never lowered to a concrete
+/// TypeId while building that struct's destructor.
+///
+/// This is fail-closed by design: a field with no known type has no known
+/// layout, so we cannot safely decide whether or how to free it. Emitting a
+/// destructor anyway could corrupt memory, so we exit with code 70 and a
+/// "please report" message instead. Reached only from
+/// [`getOrCreateStructDestructorByTypeId`] when `lower`/`subst` fail on a field
+/// that should have resolved under the struct's own type arguments; it signals
+/// a compiler (typed-IR) bug, not user error.
 fn unresolvedDtorField(struct_name: []const u8, field_name: []const u8) noreturn {
     std.debug.print(
         "\x1b[1m\x1b[31mcompiler error:\x1b[0m\x1b[1m struct '{s}' field '{s}' has no concrete TypeId in destructor codegen\x1b[0m\n" ++
@@ -35,12 +150,19 @@ fn unresolvedDtorField(struct_name: []const u8, field_name: []const u8) noreturn
     std.process.exit(70);
 }
 
-// LEGACY string ownership classifier. As of the L1 string->TypeId migration this is NO LONGER a
-// codegen ownership decider -- codegen uses the resolved-TypeId engine (isOwnedTypeId) for every
-// real type, and erasedOwnershipDefault for dead erased bodies. This survives ONLY as the SHADOW
-// gate's comparison baseline (types.tdShadowDiff / isOwnedRenderedFallback): it reproduces the
-// historical name-matched rule so the shadow diff keeps proving the TypeId engine agrees with it
-// (the F5-2 engine-agreement invariant). Do NOT call it from a codegen path.
+/// Decides, from a type NAME alone, whether a value of that type is a
+/// heap-allocated reference the ARC machinery owns (true) or a plain
+/// non-refcounted value (false).
+///
+/// This is the legacy, string-based ownership oracle (the TypeId engine is the
+/// accurate one). The rules, in order: a single uppercase letter that names no
+/// known declaration is a generic type PARAMETER and treated as not-owned;
+/// `any` is always owned (a boxed dynamic value); primitives are never owned;
+/// an enum is owned only if it is a tagged union (see [`enumIsTaggedUnion`]);
+/// anything left over is assumed owned. If the name is an un-typeable
+/// placeholder (see [`isUntypeablePlaceholder`]) it aborts the compile with
+/// code 70, for the same fail-closed reason as [`unresolvedDtorField`]. The
+/// leading `sema_shadow` bump records how often this string path is exercised.
 pub fn legacyStringOwnership(self: *LlvmCompiler, type_name: []const u8) bool {
     if (sema_shadow.report_enabled) { sema_shadow.a2_irct_calls += 1; if (std.mem.indexOfAny(u8, type_name, "<(") != null) sema_shadow.a2_irct_composite += 1; }
     const base = getStructBaseName(type_name);
@@ -50,12 +172,6 @@ pub fn legacyStringOwnership(self: *LlvmCompiler, type_name: []const u8) bool {
             return false;
         }
     }
-    // `any` is an OWNED heap carrier (nova_any_box), not a value primitive: it must be released or its box
-    // leaks. isPrimitiveTypeName lumps `any` in with the value primitives (it is convenient there for the
-    // value-optional value-arm check), so it would fall through to `return false` below and under-claim
-    // ownership. The resolved-TypeId engine (isOwnedTypeId) already classifies `any` as owned -- codegen
-    // uses that and 123_any_container is ASAN-clean -- so this baseline must agree, otherwise the shadow
-    // gate reports a spurious ownership disagreement for every `any`. Decide it BEFORE the primitive check.
     if (std.mem.eql(u8, type_name, "any")) return true;
     if (isPrimitiveTypeName(type_name)) {
         return false;
@@ -78,6 +194,15 @@ pub fn legacyStringOwnership(self: *LlvmCompiler, type_name: []const u8) bool {
     return true;
 }
 
+/// True if the name is one of the sentinel strings that mean "sema could not
+/// give this value a real type" (empty, `unresolved`, `<unresolved>`,
+/// `<tuple>`, `<array>`, `<fn>`).
+///
+/// Matches the WHOLE string only, so a real composite type that merely
+/// CONTAINS one of these (for example a function type printed as
+/// `(<unresolved>, i32) -> i32`) is not misclassified as un-typeable. Used by
+/// [`legacyStringOwnership`] to trip the fail-closed abort. See the test at the
+/// bottom of this file for the exact accept/reject set.
 pub fn isUntypeablePlaceholder(name: []const u8) bool {
     return name.len == 0 or
         std.mem.eql(u8, name, "unresolved") or
@@ -87,42 +212,59 @@ pub fn isUntypeablePlaceholder(name: []const u8) bool {
         std.mem.eql(u8, name, "<fn>");
 }
 
+/// Compiles a call argument expression, unboxing a value-optional result when
+/// the callee expects the raw payload rather than the box.
+///
+/// `suppress_valopt_unbox` is a context flag some callers set to keep the box
+/// intact; it is saved around [`compileExpression`] and restored, because
+/// compiling the argument may itself toggle it. If the expression yields a
+/// value-optional box and unboxing is not suppressed, the box is coerced to the
+/// value slot type and unboxed via `buildValoptUnbox`; otherwise the value
+/// passes through unchanged.
 pub fn compileCallArgument(self: *LlvmCompiler, arg: ast.Expression) anyerror!types.LLVMValueRef {
-    // compileExpression clobbers suppress_valopt_unbox as a side effect when `arg` contains a nested call
-    // (each sub-call sets it for its own args and leaves it false). The unbox decision below must see the
-    // suppress value the CALLER set for THIS argument, so save and restore around the sub-evaluation --
-    // otherwise a `.call` argument silently gets a baseline unbox that a `.ident` argument does not, which
-    // desynchronises the value-optional box depth across the call boundary (the C10 nested-valopt arg bug).
     const saved_suppress = self.suppress_valopt_unbox;
     const val = try self.compileExpression(arg);
     self.suppress_valopt_unbox = saved_suppress;
 
-    // A value-optional argument is normally unboxed to its raw value for the call ABI, then the call site
-    // re-boxes via coerceValoptArg when the parameter is itself a value-optional. That re-box relies on the
-    // parameter's TypeRef being syntactically `T | undefined`; for a generic container parameter (`T`) whose
-    // value-optional type arg was collapsed by monomorphisation the re-box never fires, so the box would be
-    // stripped and stored as a raw value. suppress_valopt_unbox is set by such call sites to keep the box
-    // intact all the way into the element slot.
     if (self.exprYieldsValoptBox(&arg) and !self.suppress_valopt_unbox) {
         return try self.buildValoptUnbox(self.coerceToSlotType(val, self.val_type));
     }
     return val;
 }
 
+/// How a value reaches a new home: `.owned` means it is a fresh reference the
+/// destination must take (no retain, it is already +1) or a named owner it must
+/// retain; `.borrowed` means the source keeps ownership. See
+/// [`acquisitionDisposition`] for how this is computed and consumed.
 pub const Disposition = enum { owned, borrowed };
 
+/// Classifies WHY the TypeId engine considers a type not-owned, for shadow-diff
+/// bucketing when it disagrees with the string engine.
+///
+/// Recurses through `optional` to its inner type so a `T?` is bucketed by `T`.
+/// The result (`type_param`, `enum_`, `not_owned`, `other`) is only used to
+/// attribute [`acquisitionDisposition`] disagreements to a cause in the
+/// `sema_shadow` counters; it has no effect on emitted code.
 fn dispResidueOf(store: *const typesys.TypeStore, tid: typesys.TypeId) sema_shadow.DispResidue {
     return switch (store.get(tid)) {
         .type_param => .type_param,
         .enum_ => .enum_,
         .optional => |inner| dispResidueOf(store, inner),
-        // A disposition disagreement on a NON-OWNED type (a primitive like i32/bool/etc.) cannot corrupt
-        // memory -- no retain/release happens regardless of which side wins -- so it is SAFE, not a real
-        // ownership divergence. Only disagreements on OWNED types can be genuine bugs.
         else => if (!store.isOwned(tid)) .not_owned else .other,
     };
 }
 
+/// The authoritative disposition for an expression whose value is being
+/// acquired into a new owner.
+///
+/// The typed-IR ownership pass is trusted first: if it says the expression is
+/// owned (looked up per-instantiation when a generic instantiation is active,
+/// else globally), the result is `.owned`. Otherwise it falls back to
+/// [`principledDisposition`], the structural heuristic. When
+/// `sema_shadow.report_enabled`, it additionally compares the heuristic against
+/// the pass and records agree/disagree counts (bucketed by [`dispResidueOf`]),
+/// which is how the heuristic path is validated before removal. See
+/// [`Disposition`] and [`takeOwnedElement`].
 pub fn acquisitionDisposition(self: *LlvmCompiler, expr: *const ast.Expression) Disposition {
     const principled = principledDisposition(self, expr);
 
@@ -168,6 +310,13 @@ pub fn acquisitionDisposition(self: *LlvmCompiler, expr: *const ast.Expression) 
     return d;
 }
 
+/// True if the expression kind NAMES a place that already owns its value: a
+/// variable (`ident`), a field (`field_access`), or an element (`index`).
+///
+/// Such an expression borrows: reading it does not transfer ownership, so a
+/// destination that keeps the value must retain it. Everything else (calls,
+/// literals, constructors) produces a fresh value. Consumed by
+/// [`principledDisposition`] and [`takeOwnedElement`].
 pub fn namesExistingOwner(kind: ast.ExprKind) bool {
     return switch (kind) {
         .ident, .field_access, .index => true,
@@ -175,6 +324,15 @@ pub fn namesExistingOwner(kind: ast.ExprKind) bool {
     };
 }
 
+/// The structural fallback for [`acquisitionDisposition`], used when the typed
+/// IR does not mark the expression owned.
+///
+/// An enum-variant constructor written as `EnumName.Variant` looks like a
+/// field access but MINTS a value, so it is excluded from the
+/// [`namesExistingOwner`] borrow rule. Assignments, most literals (except
+/// heap-backed `decimal`/`array`), `try`/`cast`/`go`, and a non-boxing
+/// optional-chain all borrow. Anything left is `.owned` only if
+/// [`isOwnedExpr`] agrees the result type is a reference.
 fn principledDisposition(self: *LlvmCompiler, expr: *const ast.Expression) Disposition {
 
     const is_enum_variant_ctor = expr.kind == .field_access and
@@ -192,19 +350,8 @@ fn principledDisposition(self: *LlvmCompiler, expr: *const ast.Expression) Dispo
 
         .try_expr, .cast, .go_expr => return .borrowed,
 
-        // `await e` yields a FRESH owned value (the resolved result of the awaited fn), exactly like a
-        // direct call does — so it must be tracked as a temporary and released at the statement boundary
-        // unless a binding/return moves it out. Classifying it `.borrowed` (as it once was) left an inline
-        // `f(await g())` result untracked and leaked it; `let x = await g()` happened to be safe only
-        // because the binding takes ownership. Fall through to the owned-type check below.
         .await_expr => {},
 
-        // `.cast` stays BORROWED deliberately. `ptr as string` ownership is genuinely ambiguous: it may
-        // hand a fresh bytes.alloc buffer to ARC (a driver frame payload) OR be a transient view over
-        // MANUALLY managed memory the caller still `bytes.free`s (utf8 `isValid(bad as string)` then
-        // `bytes.free(bad)`). The compiler cannot tell these apart, so it does not take ownership on a cast
-        // — the contract is: bind `let s = ptr as string` to transfer ownership to ARC; inline stays a
-        // borrow for manual-memory interop. (Marking casts owned double-freed the utf8 manual-free path.)
         .optional_chaining => return if (self.exprYieldsValoptBox(expr)) .owned else .borrowed,
 
         else => {},
@@ -213,6 +360,14 @@ fn principledDisposition(self: *LlvmCompiler, expr: *const ast.Expression) Dispo
     return .owned;
 }
 
+/// Takes ownership of a value being stored into an owning slot (a container
+/// element, for instance): retain it if it names an existing owner, otherwise
+/// consume the temporary as-is.
+///
+/// This is the write-side counterpart of the disposition rules: a borrowed
+/// source ([`namesExistingOwner`]) is aliased into the slot, so its refcount
+/// must go +1; a fresh temporary is already +1 and is just moved in via
+/// `consumeTemporary` (no extra retain, no leak).
 pub fn takeOwnedElement(self: *LlvmCompiler, elem_kind: ast.ExprKind, val: types.LLVMValueRef) anyerror!void {
     if (namesExistingOwner(elem_kind)) {
         try self.compileRetain(val);
@@ -221,6 +376,12 @@ pub fn takeOwnedElement(self: *LlvmCompiler, elem_kind: ast.ExprKind, val: types
     }
 }
 
+/// Emits a call to the runtime `nova_retain(ptr)`, incrementing an object's
+/// refcount.
+///
+/// The `nova_retain` declaration is created lazily on first use and cached in
+/// `self.func_map` so the whole module shares one declaration. `ptr` is passed
+/// as the integer `val_type` (Nova models heap pointers as integers).
 pub fn compileRetain(self: *LlvmCompiler, ptr: types.LLVMValueRef) anyerror!void {
     const retain_fn = if (self.func_map.get("nova_retain")) |f| f else blk: {
         var arg_types = [_]types.LLVMTypeRef{self.val_type};
@@ -234,6 +395,15 @@ pub fn compileRetain(self: *LlvmCompiler, ptr: types.LLVMValueRef) anyerror!void
     _ = core.LLVMBuildCall2(self.builder, fn_t, retain_fn, &args, 1, "");
 }
 
+/// Emits a call to the runtime `nova_release(ptr, dtor)`, decrementing an
+/// object's refcount and running its destructor when it reaches zero.
+///
+/// The second argument is the destructor to invoke on the final release. When
+/// `destructor_fn_opt` is null (the type owns nothing transitively, or is a
+/// leaf), a null pointer is passed and the runtime just frees the box; when
+/// present it is bitcast to an opaque `void*` function pointer. Like
+/// [`compileRetain`], the `nova_release` declaration is created once and cached
+/// in `self.func_map`.
 pub fn compileRelease(self: *LlvmCompiler, ptr: types.LLVMValueRef, destructor_fn_opt: ?types.LLVMValueRef) anyerror!void {
     const release_fn = if (self.func_map.get("nova_release")) |f| f else blk: {
         const ptr_type = core.LLVMPointerType(self.void_type, 0);
@@ -252,12 +422,30 @@ pub fn compileRelease(self: *LlvmCompiler, ptr: types.LLVMValueRef, destructor_f
     _ = core.LLVMBuildCall2(self.builder, fn_t, release_fn, &args, 2, "");
 }
 
+/// Builds the destructor symbol name for a type: `__destruct_<mangled>`.
+///
+/// The name is mangled (see [`mangleTypeName`]) so generic and composite type
+/// names become symbol-safe and collision-free, giving each type exactly one
+/// destructor function to memoise on. Caller owns the returned slice.
 fn destructorName(allocator: std.mem.Allocator, type_name: []const u8) ![]u8 {
     const mangled = try mangleTypeName(allocator, type_name);
     defer allocator.free(mangled);
     return std.fmt.allocPrint(allocator, "__destruct_{s}", .{mangled});
 }
 
+/// Substitutes a generic struct instantiation's type arguments into a field's
+/// declared type string.
+///
+/// Given `inst_name` like `Pair<int, string>` and a field type `T` (or a type
+/// mentioning `T`), it maps each of the struct's declared type parameters to
+/// the corresponding argument parsed out of the angle brackets, then rewrites
+/// the field type accordingly (e.g. `List<K>` -> `List<int>`). Depth tracking
+/// splits the top-level argument list correctly through nested `<...>`.
+/// Substitution is whole-identifier only (bounded by [`isIdentCh`]) so a type
+/// parameter `T` does not match inside `Tree`. Returns `field_type` unchanged
+/// (same pointer) when `inst_name` is not a matching generic instantiation, so
+/// callers must compare `.ptr` before freeing; otherwise the result is a fresh
+/// owned slice.
 pub fn substituteFieldType(self: *LlvmCompiler, inst_name: []const u8, field_type: []const u8) anyerror![]const u8 {
     const lt = std.mem.indexOfScalar(u8, inst_name, '<') orelse return field_type;
     if (!std.mem.endsWith(u8, inst_name, ">")) return field_type;
@@ -311,16 +499,16 @@ pub fn substituteFieldType(self: *LlvmCompiler, inst_name: []const u8, field_typ
     return try out.toOwnedSlice(self.allocator);
 }
 
+/// Fully resolves a type string against the currently-active generic context:
+/// the enclosing struct instantiation and then the current method's type
+/// parameters.
+///
+/// Chains [`substituteFieldType`] (struct-level args from
+/// `self.current_instantiation`) into `substMethodParams` (method-level args),
+/// freeing the intermediate slice only when it is a distinct allocation from
+/// both input and output. When no struct instantiation is active it applies
+/// method substitution alone.
 pub fn substTypeParams(self: *LlvmCompiler, type_str: []const u8) anyerror![]const u8 {
-    // Struct-T name resolution: substituteFieldType (string) then substMethodParams (now TypeId-native for
-    // the method <U>). The struct-T string path stays load-bearing for NAME rendering wherever
-    // current_instantiation is set but current_instantiation_id is not (measured: it diverges from the
-    // overlay across the corpus, so it is NOT redundant yet). No type DECISION rides on it -- the method-U
-    // decision engine was the deletable hazard, and that is gone. Fully retiring this needs
-    // current_instantiation_id threaded everywhere current_instantiation is (a broader migration).
-    // Return OWNED-or-borrowed (never cached): callers free the result when it differs from their input
-    // (e.g. llvm_codegen.zig:2081). Caching here would hand callers a cache-owned pointer they then free.
-    // Free the intermediate `after_struct` when it is a fresh allocation not passed through as the result.
     if (self.current_instantiation) |inst| {
         const after_struct = try self.substituteFieldType(inst, type_str);
         const result = try self.substMethodParams(after_struct);
@@ -332,13 +520,23 @@ pub fn substTypeParams(self: *LlvmCompiler, type_str: []const u8) anyerror![]con
     return try self.substMethodParams(type_str);
 }
 
-// substMethodParams moved to types.zig (SE-C): it is now overlay-primary (TypeId-native), with the legacy
-// string bindings kept only as a measured per-token fallback. The alias in llvm_codegen.zig points there.
 
+/// True if `c` can appear inside an identifier (alphanumeric or `_`).
+///
+/// Used by [`substituteFieldType`] to enforce whole-identifier matching when
+/// replacing type parameters, so partial-name collisions are avoided.
 fn isIdentCh(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
+/// True if the type name denotes a function/closure type, detected by an arrow
+/// `=>` or `->` at bracket depth zero.
+///
+/// Function values are heap closures with a uniform layout, so
+/// [`getOrCreateDestructor`] routes any function type to the single shared
+/// closure destructor. The scan tracks `<...>` nesting so an arrow inside a
+/// nested generic argument does not trigger a false positive; a `>` preceded by
+/// `=` or `-` is read as an arrow rather than a bracket close.
 pub fn isFunctionType(type_name: []const u8) bool {
     var depth: i32 = 0;
     var i: usize = 0;
@@ -359,15 +557,29 @@ pub fn isFunctionType(type_name: []const u8) bool {
     return false;
 }
 
+/// Returns the element type of a `Storage<T>` name (the `T` slice), or null if
+/// the name is not a `Storage<...>`.
+///
+/// `Storage<T>` is Nova's raw contiguous backing buffer (the primitive under
+/// `List`/`RawBuffer`); knowing its element type lets the storage destructor
+/// loop release each owned slot. See [`buildStorageDestructor`].
 fn storageElem(type_name: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, type_name, "Storage<")) return null;
     if (!std.mem.endsWith(u8, type_name, ">")) return null;
     return type_name["Storage<".len .. type_name.len - 1];
 }
 
-// M-1: destructor loop for INLINE value-struct elements. Each element lives IN the buffer at
-// `elem_width` bytes; releasing it means calling the element's destructor DIRECTLY on the slot
-// address to drop its owned fields -- never nova_release (the slot is inline bytes, not a pointer).
+/// Emits a loop that destructs each INLINE value-struct element of a
+/// `Storage<T>` where `T` is a value struct with owned fields.
+///
+/// Value-struct elements are stored by value (their bytes packed into the
+/// buffer at `elementSize` stride), not as pointers, so they cannot be released
+/// with `nova_release`; instead each slot's ADDRESS is passed straight to the
+/// element's own destructor. The element count is derived from the buffer's
+/// byte length (loaded from the header at `self - 4`) divided by the element
+/// width (min 1 to avoid division by zero). Builds the standard
+/// cond/body/exit basic-block loop calling the element destructor per slot.
+/// Contrast [`buildStorageDestructorLoop`], which handles pointer elements.
 fn buildInlineValueStructStorageLoop(self: *LlvmCompiler, dest_fn: types.LLVMValueRef, elem: []const u8) anyerror!void {
     const elem_dest = (try self.getOrCreateDestructor(elem)) orelse return;
     const dest_ft = core.LLVMGlobalGetValueType(elem_dest);
@@ -404,32 +616,48 @@ fn buildInlineValueStructStorageLoop(self: *LlvmCompiler, dest_fn: types.LLVMVal
     core.LLVMPositionBuilderAtEnd(self.builder, exit_bb);
 }
 
+/// Builds the body of a `Storage<T>` destructor, dispatching on how `T` is
+/// stored (name-based path).
+///
+/// If `T` is a value struct, only structs that have owned fields need any work
+/// and get the inline loop ([`buildInlineValueStructStorageLoop`]); a
+/// field-less value struct is a no-op. Otherwise elements are 8-byte pointer
+/// slots and are released only when the element is itself owned (an owned
+/// storage element or a value-optional box), via
+/// [`buildStorageDestructorLoop`]. Compare [`buildStorageDestructorByTypeId`],
+/// the TypeId-driven equivalent.
 fn buildStorageDestructor(self: *LlvmCompiler, dest_fn: types.LLVMValueRef, elem: []const u8) anyerror!void {
-    // M-1: an inline value-struct element is NOT a pointer -- drop its owned fields in place.
     if (self.isValueStructName(elem)) {
         if (self.valueStructHasOwnedFields(elem)) try buildInlineValueStructStorageLoop(self, dest_fn, elem);
-        return; // scalar-only inline element: nothing to release
+        return;
     }
-    // See buildStorageDestructorByTypeId: a value-optional element is a heap box the container owns and
-    // must free on drop (a plain value-optional's destructor is null, which frees the box).
     const should_free = self.isOwnedStorageElemByName(elem) or valueOptionalName(elem);
     const elem_dest = if (should_free) try self.getOrCreateDestructor(elem) else null;
     try buildStorageDestructorLoop(self, dest_fn, should_free, elem_dest);
 }
 
+/// TypeId-driven variant of [`buildStorageDestructor`]: builds the release loop
+/// for a `Storage<T>` from the element's TypeId.
+///
+/// An element needs releasing if it is owned or a value-optional box (its inner
+/// resolved via `valueOptionalInner`); the per-slot destructor is fetched by
+/// TypeId. Delegates the actual loop emission to [`buildStorageDestructorLoop`].
 fn buildStorageDestructorByTypeId(self: *LlvmCompiler, dest_fn: types.LLVMValueRef, elem_tid: typesys.TypeId) anyerror!void {
-    // A value-optional element (`int | undefined`) is a heap BOX even though it is not "owned" in the deep
-    // sense (its payload is a value), so the container OWNS its element boxes and must free each one on
-    // drop -- else a `List<int | undefined>` / `Map<K, int | undefined>` leaks its present-value boxes.
-    // `nova_release` with the element's destructor (null for a plain value-optional) frees the box; an
-    // `undefined` element is 0 and released as a no-op. Balanced against Storage.set retaining the box and
-    // the insert-argument temporary being drained (see the valopt arg-box sites in llvm_codegen.zig).
     const is_valopt = self.valueOptionalInner(elem_tid) != null;
     const should_free = self.isOwnedTypeId(elem_tid) or is_valopt;
     const elem_dest = if (should_free) try self.getOrCreateDestructorByTypeId(elem_tid) else null;
     try buildStorageDestructorLoop(self, dest_fn, should_free, elem_dest);
 }
 
+/// Emits the pointer-element release loop shared by both `Storage<T>`
+/// destructor paths.
+///
+/// Returns immediately when `owned` is false (nothing to release, leaving the
+/// caller to just `ret void`). Otherwise it reads the buffer byte-length from
+/// the header word at `self - 4`, divides by 8 (pointer stride) to get the slot
+/// count, then loops loading each pointer slot and calling [`compileRelease`]
+/// with the per-element destructor `elem_dest`. Emits its own
+/// cond/body/exit basic blocks appended to `dest_fn`.
 fn buildStorageDestructorLoop(self: *LlvmCompiler, dest_fn: types.LLVMValueRef, owned: bool, elem_dest: ?types.LLVMValueRef) anyerror!void {
 
     if (!owned) return;
@@ -473,6 +701,15 @@ fn buildStorageDestructorLoop(self: *LlvmCompiler, dest_fn: types.LLVMValueRef, 
     core.LLVMPositionBuilderAtEnd(self.builder, exit_bb);
 }
 
+/// Gets or creates the destructor function for a `Storage<T>` TypeId,
+/// memoised by its mangled symbol name.
+///
+/// Returns null if there is no type store or the type is not a storage. Renders
+/// the legacy name for the symbol, returns any pre-existing function of that
+/// name, otherwise declares `__destruct_<mangled>`, positions the builder in a
+/// fresh entry block (saving and restoring the previous insertion point), emits
+/// the element loop via [`buildStorageDestructorByTypeId`], and closes with
+/// `ret void`. Under shadow reporting it also runs [`diffStorageElem`].
 fn getOrCreateStorageDestructorByTypeId(self: *LlvmCompiler, t: typesys.TypeId) anyerror!?types.LLVMValueRef {
     const st = self.type_store orelse return null;
     if (st.get(t) != .storage) return null;
@@ -500,6 +737,16 @@ fn getOrCreateStorageDestructorByTypeId(self: *LlvmCompiler, t: typesys.TypeId) 
     return dest_fn;
 }
 
+/// Gets or creates the single shared destructor for trait objects
+/// (`__destruct_trait`), memoised across the module.
+///
+/// A trait object is a fat pointer `{struct_ptr, vtable}`. This destructor
+/// reads the struct pointer and the vtable out of the fat pointer, loads the
+/// concrete destructor from vtable slot 0 (the convention: slot 0 is always the
+/// struct's destructor), and calls [`compileRelease`] on the struct pointer
+/// with that concrete destructor. One function serves every trait type because
+/// the layout is uniform and the actual type is discovered at runtime through
+/// the vtable.
 pub fn getOrCreateTraitDestructor(self: *LlvmCompiler) anyerror!types.LLVMValueRef {
     if (core.LLVMGetNamedFunction(self.module, "__destruct_trait")) |existing| return existing;
 
@@ -531,6 +778,16 @@ pub fn getOrCreateTraitDestructor(self: *LlvmCompiler) anyerror!types.LLVMValueR
     return dest_fn;
 }
 
+/// Gets or creates the single shared closure destructor
+/// (`__destruct_closure`), memoised across the module.
+///
+/// A closure box is laid out `{fn_ptr, env, cleanup}` at 8-byte strides. This
+/// destructor loads the captured environment pointer and the optional cleanup
+/// function pointer; if a cleanup is present (non-null), it is called with the
+/// environment (this is where captured owned variables get released), then the
+/// environment box is freed with `nova_bytes_free`. The has-cleanup branch is
+/// conditional so closures that captured nothing owned skip the call. Every
+/// closure type shares this because the box layout is uniform.
 fn getOrCreateClosureDestructor(self: *LlvmCompiler) anyerror!types.LLVMValueRef {
     if (core.LLVMGetNamedFunction(self.module, "__destruct_closure")) |existing| return existing;
 
@@ -581,6 +838,18 @@ fn getOrCreateClosureDestructor(self: *LlvmCompiler) anyerror!types.LLVMValueRef
     return dest_fn;
 }
 
+/// The TypeId-driven destructor dispatcher: returns the destructor function for
+/// a type, or null if the type owns nothing and needs none.
+///
+/// This is the accurate counterpart to [`getOrCreateDestructor`]. It switches
+/// on the type kind and routes to the shape-specific builder: traits and funcs
+/// to the shared destructors, tuples/error-unions/structs/storage to their
+/// `*ByTypeId` builders. Primitives, pointers, and unresolved types return
+/// null (nothing to free). A boxed value-optional (`valueOptionalInner != null`)
+/// also returns null here, because its box is released through the field
+/// machinery, not a standalone destructor. `optional` (non-value) and any other
+/// kind fall back to the name-based [`getOrCreateDestructor`] via the legacy
+/// renderer.
 pub fn getOrCreateDestructorByTypeId(self: *LlvmCompiler, t: typesys.TypeId) anyerror!?types.LLVMValueRef {
     const st = self.type_store orelse return null;
     switch (st.get(t)) {
@@ -608,6 +877,16 @@ pub fn getOrCreateDestructorByTypeId(self: *LlvmCompiler, t: typesys.TypeId) any
     }
 }
 
+/// Prefers the accurate TypeId destructor over the string one, but only when
+/// the two engines produce the SAME mangled symbol.
+///
+/// This is the bridge that lets the codebase migrate off the string path
+/// safely: given both a type NAME and an optional TypeId, it renders each to a
+/// destructor symbol and, if they match, builds via
+/// [`getOrCreateDestructorByTypeId`] (recording a `phaseA_flip`). If they
+/// diverge, it keeps the legacy [`getOrCreateDestructor`] to avoid changing
+/// behaviour, recording a `phaseA_split` with both names for later analysis.
+/// With no usable TypeId it records `phaseA_no_id` and uses the string path.
 pub fn getOrCreateDestructorPreferId(self: *LlvmCompiler, name_str: []const u8, tid: ?typesys.TypeId) anyerror!?types.LLVMValueRef {
     if (tid) |t| {
         if (self.type_store) |st| {
@@ -640,10 +919,23 @@ pub fn getOrCreateDestructorPreferId(self: *LlvmCompiler, name_str: []const u8, 
     return try self.getOrCreateDestructor(name_str);
 }
 
+/// The name-based destructor dispatcher: returns (creating and memoising on
+/// first use) the destructor for a type NAME, or null if the type owns nothing.
+///
+/// This is the legacy string engine, still the fallback for
+/// [`getOrCreateDestructorByTypeId`] on the shapes it does not handle directly.
+/// It routes by name: `any` to a runtime box dtor; traits to the shared trait
+/// dtor; function/tuple/`ErrUnion(...)` names to their builders; tagged enums to
+/// [`getOrCreateEnumDestructor`]. For a `Storage<...>` or a known struct it
+/// declares `__destruct_<mangled>`, sets `current_instantiation` so field types
+/// substitute correctly, calls the user-declared `delete` method if one exists
+/// (single-arg form only), then either loops over storage elements or walks the
+/// struct's fields. A field that [`isOwnedDeclaredType`] considers a reference
+/// is loaded and released; a field that is an inline value struct has its own
+/// destructor called on the field ADDRESS. Types with no declaration return
+/// null.
 pub fn getOrCreateDestructor(self: *LlvmCompiler, type_name: []const u8) anyerror!?types.LLVMValueRef {
 
-    // `any` is a refcounted `nova_any_box {payload, dtor}`; nova_any_box_dtor releases the payload via the
-    // stored dtor before the box is freed.
     if (std.mem.eql(u8, type_name, "any")) {
         if (self.func_map.get("nova_any_box_dtor")) |f| return f;
         var one = [_]types.LLVMTypeRef{self.val_type};
@@ -693,7 +985,6 @@ pub fn getOrCreateDestructor(self: *LlvmCompiler, type_name: []const u8) anyerro
     const saved_instantiation = self.current_instantiation;
     const saved_inst_id = self.current_instantiation_id;
     self.current_instantiation = type_name;
-    // Isolate destructor name-mangling from any enclosing generic instance (was: null current_method_subst).
     self.current_instantiation_id = null;
     defer {
         self.current_instantiation = saved_instantiation;
@@ -749,10 +1040,6 @@ pub fn getOrCreateDestructor(self: *LlvmCompiler, type_name: []const u8) anyerro
                 const field_dest = try self.getOrCreateDestructor(field_type);
                 try self.compileRelease(casted_field_val, field_dest);
             } else if (self.structs.contains(getStructBaseName(field_type))) {
-                // Inline VALUE-STRUCT field (stored by value, not a heap reference). It is not released, but
-                // its OWNED sub-fields (e.g. a `string` inside it) still leak unless we recursively destruct
-                // them. Run the nested type's destructor ON THE INLINE FIELD ADDRESS: that destructor releases
-                // the nested struct's owned fields WITHOUT freeing anything (the field is inline, not heap).
                 if (try self.getOrCreateDestructor(field_type)) |field_dest| {
                     const offset = try self.getFieldOffset(base_struct, field.name);
                     const offset_val = core.LLVMConstInt(self.val_type, offset, 0);
@@ -774,6 +1061,18 @@ pub fn getOrCreateDestructor(self: *LlvmCompiler, type_name: []const u8) anyerro
     return dest_fn;
 }
 
+/// TypeId-driven struct destructor: releases every owned field of a struct at
+/// its byte offset, resolving field types through the typed IR.
+///
+/// The accurate counterpart to the struct branch of [`getOrCreateDestructor`].
+/// Falls back to the name path when the live sema symbol table is unavailable or
+/// the symbol is not a struct. After memoisation and the optional `delete`-method
+/// call, it lowers each declared field type through [`lower.Lowerer`] under a
+/// param scope built from the struct declaration, substitutes the
+/// instantiation's type arguments ([`subst.substitute`]), and: releases owned
+/// fields via [`compileRelease`]; recurses into inline (non-owned) struct fields
+/// by calling their destructor on the field address. A field that fails to lower
+/// or substitute aborts through [`unresolvedDtorField`] (fail-closed).
 fn getOrCreateStructDestructorByTypeId(self: *LlvmCompiler, t: typesys.TypeId) anyerror!?types.LLVMValueRef {
     const st = self.type_store orelse return null;
     if (st.get(t) != .struct_) return null;
@@ -808,7 +1107,6 @@ fn getOrCreateStructDestructorByTypeId(self: *LlvmCompiler, t: typesys.TypeId) a
     const saved_instantiation = self.current_instantiation;
     const saved_inst_id = self.current_instantiation_id;
     self.current_instantiation = type_name;
-    // Isolate destructor name-mangling from any enclosing generic instance (was: null current_method_subst).
     self.current_instantiation_id = null;
     defer {
         self.current_instantiation = saved_instantiation;
@@ -843,23 +1141,12 @@ fn getOrCreateStructDestructorByTypeId(self: *LlvmCompiler, t: typesys.TypeId) a
         const scopes = [_]lower.ParamScope{.{ .owner = stype.decl, .names = decl.type_params }};
         l.param_scopes = &scopes;
 
-        // GAP-1 safe reduction (user-chosen track): resolve the field's concrete TypeId from this struct's
-        // own (decl, args) via the TypeId engine. A corpus sweep (NOVA_DTOR_STRBLK, 0 hits) proved this is
-        // total on the TypeId-native dtor path, so the former substituteFieldType(string)/getOrCreateDestructor
-        // fallback arms are removed -- the field loop is now purely TypeId-driven. A null here is a typed-IR
-        // accuracy bug (a struct field that would not lower under its own args); fail LOUD rather than either
-        // silently skipping an owned field (leak) or mis-keying a destructor off a rendered name.
         const c: typesys.TypeId = blk: {
             const raw = l.lower(field.type_name) catch break :blk unresolvedDtorField(type_name, field.name);
             break :blk subst.substitute(&sm.store, raw, stype.decl, stype.args) catch unresolvedDtorField(type_name, field.name);
         };
 
         if (!self.isOwnedTypeId(c)) {
-            // Inline VALUE-STRUCT field (stored by value, not a heap reference): not released, but its OWNED
-            // sub-fields (e.g. a `string` inside it) still leak unless we recursively destruct them. Run the
-            // nested type's destructor ON THE INLINE FIELD ADDRESS -- it releases the nested struct's owned
-            // fields WITHOUT freeing anything (the field is inline). Without this, any struct holding a nested
-            // value-struct-with-heap-data leaks that data on every drop (e.g. db.Rows<ProductView>).
             if (st.get(c) == .struct_) {
                 if (try self.getOrCreateDestructorByTypeId(c)) |field_dest| {
                     const offset = try self.getFieldOffset(base_struct, field.name);
@@ -890,6 +1177,15 @@ fn getOrCreateStructDestructorByTypeId(self: *LlvmCompiler, t: typesys.TypeId) a
     return dest_fn;
 }
 
+/// TypeId-driven error-union destructor: branches on the tag word and releases
+/// the active arm's payload if that arm is owned.
+///
+/// An error-union box is `{tag, payload}` at 8-byte offsets, tag 1 = error arm,
+/// tag 0 = ok arm. This emits a conditional: in the error block it releases the
+/// payload with the `err` type's destructor if [`isOwnedTypeId`] says the err
+/// type is owned; in the ok block, likewise for the `ok` type; both fall through
+/// to a common done block. Compare [`getOrCreateErrUnionDestructor`], the
+/// name-based twin. Under shadow reporting it runs [`diffErrUnionArms`].
 fn getOrCreateErrUnionDestructorByTypeId(self: *LlvmCompiler, t: typesys.TypeId) anyerror!?types.LLVMValueRef {
     const st = self.type_store orelse return null;
     if (sema_shadow.report_enabled) diffErrUnionArms(self, t);
@@ -942,6 +1238,13 @@ fn getOrCreateErrUnionDestructorByTypeId(self: *LlvmCompiler, t: typesys.TypeId)
     return dest_fn;
 }
 
+/// Name-based error-union destructor: the string-engine twin of
+/// [`getOrCreateErrUnionDestructorByTypeId`].
+///
+/// Parses the ok/err arm names from the `ErrUnion(ok, err)` string via
+/// [`errUnionParts`] (returns null if the name is malformed), then emits the
+/// same tag-branch layout, releasing an arm's payload only when
+/// [`isOwnedErrUnionPayloadByName`] reports it owned.
 fn getOrCreateErrUnionDestructor(self: *LlvmCompiler, type_name: []const u8) anyerror!?types.LLVMValueRef {
     const dest_name = try destructorName(self.allocator, type_name);
     defer self.allocator.free(dest_name);
@@ -994,6 +1297,15 @@ fn getOrCreateErrUnionDestructor(self: *LlvmCompiler, type_name: []const u8) any
     return dest_fn;
 }
 
+/// Builds the destructor for a tagged-union enum: switches on the tag word and
+/// releases the payload slots of the active variant.
+///
+/// Returns null for plain enums (see [`enumIsTaggedUnion`]) which own nothing.
+/// The box is `{tag, payload...}` at 8-byte strides. For each payload-carrying
+/// variant it emits a tag comparison; on match it releases the variant's single
+/// payload (`type_name`) or each of its named `fields` at successive 8-byte
+/// slots (via [`releaseEnumPayloadSlot`]) then jumps to done; non-matching
+/// variants fall through to the next test. Variants with no payload are skipped.
 fn getOrCreateEnumDestructor(self: *LlvmCompiler, enum_name: []const u8) anyerror!?types.LLVMValueRef {
     if (!enumIsTaggedUnion(self, enum_name)) return null;
     const enum_decl = self.enums.get(enum_name).?;
@@ -1047,6 +1359,13 @@ fn getOrCreateEnumDestructor(self: *LlvmCompiler, enum_name: []const u8) anyerro
     return dest_fn;
 }
 
+/// Releases one enum payload slot at `offset` within the box, if the payload
+/// type is an owned reference.
+///
+/// Returns without emitting anything when [`isOwnedDeclaredType`] says the slot
+/// holds a non-owned value. Otherwise loads the pointer from `box + offset` and
+/// calls [`compileRelease`] with the payload type's destructor. Helper for
+/// [`getOrCreateEnumDestructor`].
 fn releaseEnumPayloadSlot(self: *LlvmCompiler, box: types.LLVMValueRef, offset: u32, tref: ast.TypeRef) anyerror!void {
     const tstr = try self.typeRefToString(tref);
     if (!self.isOwnedDeclaredType(tref, tstr)) return;
@@ -1057,11 +1376,25 @@ fn releaseEnumPayloadSlot(self: *LlvmCompiler, box: types.LLVMValueRef, offset: 
     try self.compileRelease(val, d);
 }
 
+/// True if the type name is a tuple: parenthesised and NOT a function type.
+///
+/// The `=>` exclusion distinguishes a tuple `(int, string)` from a function
+/// type `(int) => string`, which is also parenthesised. Used to route names to
+/// the tuple destructor/copy paths ([`getOrCreateTupleDestructor`],
+/// [`countTupleElements`]).
 pub fn isTupleType(type_name: []const u8) bool {
     return type_name.len >= 2 and type_name[0] == '(' and type_name[type_name.len - 1] == ')' and
         std.mem.indexOf(u8, type_name, "=>") == null;
 }
 
+/// TypeId-driven tuple destructor: releases each owned element at its 8-byte
+/// slot offset.
+///
+/// A tuple box packs its elements at 8-byte strides. This iterates the element
+/// TypeIds, skips non-owned elements ([`isOwnedTypeId`]), and for owned ones
+/// loads the pointer at `box + idx*8` and releases it with the element's
+/// destructor. The name-based twin is [`getOrCreateTupleDestructor`]; shadow
+/// reporting runs [`diffTupleElems`].
 fn getOrCreateTupleDestructorByTypeId(self: *LlvmCompiler, t: typesys.TypeId) anyerror!?types.LLVMValueRef {
     const st = self.type_store orelse return null;
 
@@ -1098,6 +1431,15 @@ fn getOrCreateTupleDestructorByTypeId(self: *LlvmCompiler, t: typesys.TypeId) an
     return dest_fn;
 }
 
+/// Shadow-diff: compares the TypeId and string engines' ownership verdicts for
+/// each field of a struct, tallying agree/disagree counts.
+///
+/// Instrumentation only (active under `sema_shadow.report_enabled`), it emits
+/// no code. For each field it lowers+substitutes the type to get the store-side
+/// ownership and separately runs the string-side [`isOwnedDeclaredType`], then
+/// bumps `struct_field_agree`/`struct_field_disagree` and records the last
+/// disagreement for reporting. This is how confidence is built that the string
+/// path can be retired.
 fn diffStructFields(self: *LlvmCompiler, t: typesys.TypeId) void {
     const sm = sema_shadow.live_sema orelse return;
     const st_store = self.type_store orelse return;
@@ -1133,6 +1475,13 @@ fn diffStructFields(self: *LlvmCompiler, t: typesys.TypeId) void {
     }
 }
 
+/// Shadow-diff: compares the two engines' ownership and rendered names for an
+/// error-union's ok and err arms.
+///
+/// Instrumentation only. Both arms must agree on ownership AND on rendered arm
+/// name for `erru_elem_agree` to bump; any mismatch (or a name that fails to
+/// parse into parts) bumps `erru_elem_disagree` and records the name. See
+/// [`diffStructFields`] for the pattern.
 fn diffErrUnionArms(self: *LlvmCompiler, t: typesys.TypeId) void {
     const st = self.type_store orelse return;
     if (st.get(t) != .error_union) return;
@@ -1155,6 +1504,13 @@ fn diffErrUnionArms(self: *LlvmCompiler, t: typesys.TypeId) void {
     }
 }
 
+/// Shadow-diff: compares the two engines' ownership and rendered name for a
+/// `Storage<T>` element type.
+///
+/// Instrumentation only. Bumps `storage_elem_agree` when the TypeId-side
+/// ownership and rendered name both match the string-side
+/// [`isOwnedStorageElemByName`] and `storageElem` parse; otherwise
+/// `storage_elem_disagree`.
 fn diffStorageElem(self: *LlvmCompiler, t: typesys.TypeId) void {
     const st = self.type_store orelse return;
     if (st.get(t) != .storage) return;
@@ -1174,6 +1530,13 @@ fn diffStorageElem(self: *LlvmCompiler, t: typesys.TypeId) void {
     }
 }
 
+/// Shadow-diff: compares the two engines element-by-element for a tuple type.
+///
+/// Instrumentation only. First checks the element COUNTS match
+/// ([`countTupleElements`] vs the store's element list); then, per element,
+/// compares ownership and rendered name against the string-side
+/// `getTupleElementType`/[`isOwnedTupleElemByName`], bumping
+/// `tuple_elem_agree`/`tuple_elem_disagree`.
 fn diffTupleElems(self: *LlvmCompiler, t: typesys.TypeId) void {
     const st = self.type_store orelse return;
     if (st.get(t) != .tuple) return;
@@ -1199,6 +1562,15 @@ fn diffTupleElems(self: *LlvmCompiler, t: typesys.TypeId) void {
     }
 }
 
+/// Name-based tuple destructor: the string-engine twin of
+/// [`getOrCreateTupleDestructorByTypeId`].
+///
+/// Iterates element index 0 upward, obtaining each element type name via
+/// `getTupleElementType` and stopping once the index reaches
+/// [`countTupleElements`]. Note the element type is fetched BEFORE the bound
+/// check, so the loop must break on the count and its `defer` free covers only
+/// the in-range allocations. Owned elements ([`isOwnedTupleElemByName`]) are
+/// loaded from their 8-byte slot and released.
 fn getOrCreateTupleDestructor(self: *LlvmCompiler, type_name: []const u8) anyerror!?types.LLVMValueRef {
     const dest_name = try destructorName(self.allocator, type_name);
     defer self.allocator.free(dest_name);
@@ -1235,12 +1607,16 @@ fn getOrCreateTupleDestructor(self: *LlvmCompiler, type_name: []const u8) anyerr
     return dest_fn;
 }
 
-// Channel 6b step 2 / Design B: value-semantic copy of a tuple. A tuple is a heap box of N 8-byte words;
-// `let u = t` used to alias the box (retain), so `u[0].x = 99` mutated `t`'s element too. Build a FRESH
-// box and, per element: a VALUE-struct element is deep-copied (fresh heap struct + transitive retain) so
-// the copy is independent; any other owned element (a `class`, a string, a container) is retained (shared
-// -- these are reference types or immutable, so sharing is correct); a scalar word is copied as-is. The
-// new box is the same tuple type, so its scope-end release runs the same tuple destructor and balances.
+/// Deep-copies a tuple box so the copy independently owns its contents.
+///
+/// Allocates a fresh box of `n*8` bytes and copies each element with the right
+/// ownership discipline: a value-struct element is byte-copied into a NEW heap
+/// allocation and its owned fields retained (`retainValueStructOwnedFields`),
+/// because value structs are copied by value not by pointer; an owned
+/// pointer element is retained (+1); a plain scalar is copied as-is. Returns
+/// `src` unchanged for the empty tuple. This is what makes assigning or passing
+/// a tuple value-semantic rather than aliasing. Mirrors the field-copy logic in
+/// `expressions.zig`.
 pub fn buildTupleDeepCopy(self: *LlvmCompiler, src: types.LLVMValueRef, tuple_name: []const u8) anyerror!types.LLVMValueRef {
     const word: u64 = 8;
     const n = countTupleElements(tuple_name);
@@ -1275,6 +1651,12 @@ pub fn buildTupleDeepCopy(self: *LlvmCompiler, src: types.LLVMValueRef, tuple_na
     return newbox;
 }
 
+/// Counts the top-level elements of a tuple type name.
+///
+/// Returns 0 for a non-tuple or the empty tuple `()`. Commas are counted only
+/// at bracket depth zero, so nested generics/tuples like `(List<A, B>, int)`
+/// count as two elements, not three. Used everywhere the tuple destructor and
+/// deep-copy need the element arity.
 pub fn countTupleElements(type_name: []const u8) usize {
     if (!isTupleType(type_name)) return 0;
     const inner = type_name[1 .. type_name.len - 1];
@@ -1296,6 +1678,15 @@ pub fn countTupleElements(type_name: []const u8) usize {
     return n;
 }
 
+/// Splits an `ErrUnion(ok, err)` name into its two arm names, at the top-level
+/// comma.
+///
+/// Returns null if the name is not a well-formed `ErrUnion(...)`. Depth-aware so
+/// a comma inside a nested `<...>`/`(...)` in the ok arm does not split early.
+/// Both returned slices are freshly allocated and OWNED by the caller (freed
+/// together; on the second allocation failing, the first is freed before
+/// returning null). Used by the name-based error-union destructor and
+/// [`buildErrUnion`].
 pub fn errUnionParts(self: *LlvmCompiler, name: []const u8) ?struct { ok: []const u8, err: []const u8 } {
     const pre = "ErrUnion(";
     if (!std.mem.startsWith(u8, name, pre) or !std.mem.endsWith(u8, name, ")")) return null;
@@ -1321,6 +1712,14 @@ pub fn errUnionParts(self: *LlvmCompiler, name: []const u8) ?struct { ok: []cons
     return null;
 }
 
+/// Constructs an error-union box `{tag, payload}` wrapping `val` in either the
+/// ok or err arm.
+///
+/// Allocates a 2-word box, retains the payload first if that arm's type is owned
+/// (so the box holds its own +1 reference), writes the tag (1 for err, 0 for
+/// ok) and the payload coerced to the value slot type. The retain here is
+/// balanced by the release the error-union destructor emits (see
+/// [`getOrCreateErrUnionDestructor`]).
 pub fn buildErrUnion(self: *LlvmCompiler, val: types.LLVMValueRef, is_err: bool, union_name: []const u8) anyerror!types.LLVMValueRef {
     const word: usize = 8;
     const box = try self.compileAlloc(core.LLVMConstInt(self.val_type, @intCast(word * 2), 0));
@@ -1342,8 +1741,15 @@ pub fn buildErrUnion(self: *LlvmCompiler, val: types.LLVMValueRef, is_err: bool,
     return box;
 }
 
-// M-1: drop a value struct -- call its destructor DIRECTLY to release owned (reference) fields,
-// but do NOT nova_release/free it (it is inline stack storage, not a heap object with a header).
+/// Runs a value struct's destructor directly on its in-place address, without
+/// going through refcounting.
+///
+/// A value struct lives inline in its owner, so it is not a refcounted box:
+/// there is nothing to `nova_release`, but its owned FIELDS still need freeing.
+/// This fetches the struct's destructor (preferring the TypeId,
+/// [`getOrCreateDestructorPreferId`]) and calls it with the struct's address. A
+/// no-op if the type owns nothing (destructor is null). Used by
+/// [`releaseLocalByName`] and [`releaseLocalVariables`].
 pub fn dropValueStruct(self: *LlvmCompiler, struct_addr: types.LLVMValueRef, type_name: []const u8, tid: ?typesys.TypeId) anyerror!void {
     const dest = (try self.getOrCreateDestructorPreferId(type_name, tid)) orelse return;
     var args = [_]types.LLVMValueRef{struct_addr};
@@ -1351,13 +1757,20 @@ pub fn dropValueStruct(self: *LlvmCompiler, struct_addr: types.LLVMValueRef, typ
     _ = core.LLVMBuildCall2(self.builder, fn_t, dest, &args, 1, "");
 }
 
+/// Releases a single named local at end of its lifetime, then null out its slot
+/// so it cannot be released twice.
+///
+/// Looks up the local's alloca, loads the value, and either drops it in place
+/// as a value struct ([`dropValueStruct`]) or releases it as a reference. In
+/// both cases the alloca is overwritten with 0 afterwards, so a later
+/// scope-exit or return path that also visits this slot sees a null pointer and
+/// skips it (double-free guard). Silently returns if the name is not a known
+/// local. Used for block-scoped bindings.
 pub fn releaseLocalByName(self: *LlvmCompiler, name: []const u8, type_name: []const u8) anyerror!void {
     const alloca_val = self.locals.get(name) orelse return;
     const loaded = core.LLVMBuildLoad2(self.builder, self.val_type, alloca_val, "blk_rel_load");
 
     const tid: ?typesys.TypeId = if (self.current_local_type_ids) |ids| ids.get(name) else null;
-    // A value struct is inline stack storage: release its owned fields via the destructor directly,
-    // never nova_release (which would read a refcount header off the stack and free a stack address).
     if (self.isValueStructName(type_name)) {
         try self.dropValueStruct(loaded, type_name, tid);
         _ = core.LLVMBuildStore(self.builder, core.LLVMConstInt(self.val_type, 0, 0), alloca_val);
@@ -1369,6 +1782,18 @@ pub fn releaseLocalByName(self: *LlvmCompiler, name: []const u8, type_name: []co
     _ = core.LLVMBuildStore(self.builder, core.LLVMConstInt(self.val_type, 0, 0), alloca_val);
 }
 
+/// Releases every owned local (and drops value structs with owned fields) at
+/// function exit.
+///
+/// Iterates the function's local type map and, for each owned variable (or a
+/// value struct with owned fields that must be dropped in place), emits the
+/// release. Several locals are deliberately EXCLUDED to avoid unbalanced frees:
+/// `self` inside `_delete`/`_init`/`_new` methods (its lifetime is the caller's
+/// or the ctor's responsibility); parameters (released at the call site, not
+/// here); and locals promoted to captured globals (`captured_globals`, kept
+/// alive by the capture). Owned refs are released; value-struct drops go through
+/// [`dropValueStruct`]; each released slot is nulled to prevent a second
+/// release. This is the primary scope-exit ARC emitter.
 pub fn releaseLocalVariables(self: *LlvmCompiler) anyerror!void {
     const local_types = self.current_local_types orelse return;
     var iter = local_types.iterator();
@@ -1387,10 +1812,6 @@ pub fn releaseLocalVariables(self: *LlvmCompiler) anyerror!void {
         }
 
         const owned = self.isOwnedLocal(var_name, var_type);
-        // A value struct that transitively owns something (P0) is dropped IN PLACE: its destructor
-        // releases the owned sub-fields, but the struct itself is inline stack storage and is never
-        // nova_release'd. Without this a function-scope `let o = Outer(...)` (Outer{inner:S{data:string}})
-        // leaks S.data at return, because isOwnedLocal is false for a value struct.
         const value_drop = !owned and self.isValueStructName(var_type) and self.valueStructHasOwnedFields(var_type);
         if (owned or value_drop) {
             if (self.current_param_names) |params| {
@@ -1428,28 +1849,27 @@ pub fn releaseLocalVariables(self: *LlvmCompiler) anyerror!void {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Prototype: compile-time retain/release elision (borrowed-field pattern).
-//
-// Removes a defensive `nova_retain` + its paired `nova_release`(s) when a local
-// slot only ever holds a value copied out of a BORROWED PARAMETER's field and
-// never escapes (used only for null-checks, borrowed call-args, or its own
-// release). The parameter is caller-owned and alive across the whole call, so
-// its sub-object cannot be freed underneath us -> the retain/release is net-zero.
-//
-// Gated by NOVA_ARC_ELIDE (elide_enabled). Off = today's codegen, unchanged.
-// This is a conservative peephole: any shape it can't prove safe is left alone.
+/// Master switch for the ARC-elision passes ([`elideBorrowedArc`]); off unless
+/// enabled by the driver. Kept as a module-global because the passes run over
+/// the finished module, outside any `self` context.
 pub var elide_enabled: bool = false;
+/// Running count of retain/release PAIRS the elision passes removed, reported by
+/// the census ([`arcCensusAfter`]).
 pub var elide_count: usize = 0;
 
-// ── Gap3-A/E2: ARC-traffic census (NOVA_ARC_CENSUS) — the go/scrap headroom measure ──
-// Counts nova_retain/nova_release call sites in the module. Called twice: BEFORE elision
-// (raw traffic) and AFTER (surviving traffic). elide_count is how many the current pass removed.
-// The gap between "surviving" and what a full borrow-skip could reach is the perf headroom.
+/// Enables the ARC-traffic census (`NOVA_ARC_CENSUS`): counts total retain/release
+/// calls before and after elision and estimates further headroom.
 pub var arc_census: bool = false;
+/// `nova_retain` call count captured before elision, by [`arcCensusBefore`].
 pub var census_retain_before: usize = 0;
+/// `nova_release` call count captured before elision, by [`arcCensusBefore`].
 pub var census_release_before: usize = 0;
 
+/// Counts `nova_retain` and `nova_release` calls across all DEFINED functions in
+/// a module (declarations are skipped).
+///
+/// The primitive both census snapshots use; writes totals through the `retains`
+/// and `releases` out-parameters. See [`arcCensusBefore`]/[`arcCensusAfter`].
 fn countArcCalls(module: types.LLVMModuleRef, retains: *usize, releases: *usize) void {
     var fnv = core.LLVMGetFirstFunction(module);
     while (fnv != null) : (fnv = core.LLVMGetNextFunction(fnv)) {
@@ -1465,6 +1885,11 @@ fn countArcCalls(module: types.LLVMModuleRef, retains: *usize, releases: *usize)
     }
 }
 
+/// Snapshots ARC-call totals BEFORE the elision passes run.
+///
+/// A no-op unless [`arc_census`] is set. Resets and fills
+/// [`census_retain_before`]/[`census_release_before`] so [`arcCensusAfter`] can
+/// report how many calls elision removed. The `self` parameter is unused.
 pub fn arcCensusBefore(_: *LlvmCompiler, module: types.LLVMModuleRef) void {
     if (!arc_census) return;
     census_retain_before = 0;
@@ -1472,11 +1897,17 @@ pub fn arcCensusBefore(_: *LlvmCompiler, module: types.LLVMModuleRef) void {
     countArcCalls(module, &census_retain_before, &census_release_before);
 }
 
-// Borrow-skip headroom: count retain/release pairs a borrow-skip pass COULD remove that the current
-// adjacent-only elision does NOT. A pair is a candidate when, scanning forward from nova_retain(v) in
-// the same block to the matching nova_release(v), every intervening use of v is a BORROW (a call
-// ARGUMENT, a load, or a compare) — i.e. v does not escape (is not stored to a sink, returned, or
-// re-retained) between the two. Analysis-only (nothing removed): this is the go/scrap number.
+/// Estimates how many retain/release pairs a future INTRA-BLOCK borrow-skip
+/// optimisation could remove (a static lower bound for the census).
+///
+/// Within each basic block it materialises the instruction list, then for every
+/// `nova_retain` walks forward to the matching `nova_release` of the same value.
+/// If in between the value only appears in loads/compares and never "escapes"
+/// (is not itself retained again, nor passed as the LAST argument of a call,
+/// the destructor-argument position), the retained value stays borrow-only in
+/// that window and the pair is counted as elidable. This does NOT modify the IR;
+/// it only measures headroom that [`elideBorrowedArc`] does not yet capture. See
+/// also [`countBorrowSkipFnScope`] for the whole-function version.
 fn countBorrowSkipCandidates(a: std.mem.Allocator, module: types.LLVMModuleRef) usize {
     var candidates: usize = 0;
     var fnv = core.LLVMGetFirstFunction(module);
@@ -1497,21 +1928,19 @@ fn countBorrowSkipCandidates(a: std.mem.Allocator, module: types.LLVMModuleRef) 
                 while (j < insts.items.len) : (j += 1) {
                     const uj = insts.items[j];
                     if (isNamedCall(uj, "nova_release") and core.LLVMGetOperand(uj, 0) == v) {
-                        if (!escaped) candidates += 1; // borrow-only region -> removable pair
+                        if (!escaped) candidates += 1;
                         break;
                     }
                     if (!instUsesValue(uj, v)) continue;
-                    // uj references v: classify borrow vs escape
                     const opc = core.LLVMGetInstructionOpcode(uj);
-                    if (opc == .LLVMLoad or opc == .LLVMICmp) continue; // borrow
+                    if (opc == .LLVMLoad or opc == .LLVMICmp) continue;
                     if (opc == .LLVMCall) {
-                        // v as a call ARGUMENT is a borrow; v as the callee, or a re-retain, escapes
                         if (isNamedCall(uj, "nova_retain")) { escaped = true; break; }
                         const n = core.LLVMGetNumOperands(uj);
                         if (n >= 1 and core.LLVMGetOperand(uj, @intCast(n - 1)) == v) { escaped = true; break; }
-                        continue; // ordinary arg: borrow
+                        continue;
                     }
-                    escaped = true; // store / ret / anything else -> v may escape
+                    escaped = true;
                     break;
                 }
             }
@@ -1520,10 +1949,15 @@ fn countBorrowSkipCandidates(a: std.mem.Allocator, module: types.LLVMModuleRef) 
     return candidates;
 }
 
-// Function-scope borrow-skip headroom (catches inter-block too): a nova_retain(v) is redundant if,
-// across the WHOLE function, every use of v is a borrow (load / call-argument / compare) plus exactly
-// one nova_release(v) — v is never stored to a sink, returned, used as a callee, or re-retained. Such
-// a retain/release pair can be removed because the value is only borrowed for its whole live range.
+/// Whole-function counterpart of [`countBorrowSkipCandidates`]: counts retains
+/// whose value is borrow-only across the ENTIRE function.
+///
+/// Instead of scanning forward within a block, it walks all USES of the retained
+/// value directly (use/def graph, so it spans basic blocks). A candidate is a
+/// retain whose value has exactly one `nova_release`, is never retained again,
+/// and never escapes through a call's destructor-argument slot; loads and
+/// compares are ignored. Reports a broader (inter-block) headroom figure for the
+/// census; does not alter IR.
 fn countBorrowSkipFnScope(module: types.LLVMModuleRef) usize {
     var candidates: usize = 0;
     var fnv = core.LLVMGetFirstFunction(module);
@@ -1540,17 +1974,17 @@ fn countBorrowSkipFnScope(module: types.LLVMModuleRef) usize {
                 var use = core.LLVMGetFirstUse(v);
                 while (use != null) : (use = core.LLVMGetNextUse(use)) {
                     const user = core.LLVMGetUser(use);
-                    if (user == inst) continue; // the retain itself
+                    if (user == inst) continue;
                     if (isNamedCall(user, "nova_release")) { releases += 1; continue; }
-                    if (isNamedCall(user, "nova_retain")) { escapes = true; break; } // another +1
+                    if (isNamedCall(user, "nova_retain")) { escapes = true; break; }
                     const opc = core.LLVMGetInstructionOpcode(user);
-                    if (opc == .LLVMLoad or opc == .LLVMICmp) continue; // borrow
+                    if (opc == .LLVMLoad or opc == .LLVMICmp) continue;
                     if (opc == .LLVMCall) {
                         const n = core.LLVMGetNumOperands(user);
-                        if (n >= 1 and core.LLVMGetOperand(user, @intCast(n - 1)) == v) { escapes = true; break; } // callee
-                        continue; // ordinary call argument: borrow
+                        if (n >= 1 and core.LLVMGetOperand(user, @intCast(n - 1)) == v) { escapes = true; break; }
+                        continue;
                     }
-                    escapes = true; // store / ret / gep-into-sink / etc.
+                    escapes = true;
                     break;
                 }
                 if (!escapes and releases == 1) candidates += 1;
@@ -1560,6 +1994,15 @@ fn countBorrowSkipFnScope(module: types.LLVMModuleRef) usize {
     return candidates;
 }
 
+/// Prints the ARC-traffic census AFTER elision: before/after call counts, what
+/// current elision removed, and estimated remaining borrow-skip headroom.
+///
+/// A no-op unless [`arc_census`] is set. Re-counts surviving retain/release
+/// calls, runs both borrow-skip estimators
+/// ([`countBorrowSkipCandidates`]/[`countBorrowSkipFnScope`]), computes the
+/// percentage removed and the percentage still elidable, and dumps a
+/// human-readable report to stderr. Purely diagnostic (the `Gap3` headroom
+/// analysis); it does not change codegen.
 pub fn arcCensusAfter(self: *LlvmCompiler, module: types.LLVMModuleRef) void {
     if (!arc_census) return;
     var r_after: usize = 0;
@@ -1588,44 +2031,54 @@ pub fn arcCensusAfter(self: *LlvmCompiler, module: types.LLVMModuleRef) void {
     );
 }
 
-// ---------------------------------------------------------------------------
-// M-1 value-type structs (memory-management-refinements.md) — per-type rollout gate.
-//
-// A `struct` (is_reference == false) becomes a VALUE type: allocated inline (stack alloca),
-// no ARC header, no retain/release/free. A `class` (is_reference == true) stays a reference type.
-// Because a naive global flip breaks every mutating method and every alias-mutation at once, the
-// flip is rolled out per type behind these gates, verified one type at a time:
-//   NOVA_VALUE_STRUCTS_ALL  -> every is_reference==false struct is value-lowered.
-//   NOVA_VALUE_TYPES=A,B,C  -> only the named base types are value-lowered.
-// Set by configureValueStructs at startup. DEFAULT is now value-structs-ON (struct = value, class =
-// reference); NOVA_VALUE_STRUCTS_OFF reverts to the all-reference model. These start false and are flipped
-// on before codegen; a unit test / bare codegen call with no configure step stays all-reference.
+/// Global toggle: whether value-struct semantics (inline storage + deep copy)
+/// are active in codegen. Read by the value-struct paths across codegen.
 pub var value_structs_enabled: bool = false;
+/// When set, ALL structs are treated as value structs, ignoring
+/// [`value_type_set`]; the opt-in "everything is a value" mode.
 pub var value_structs_all: bool = false;
+/// The explicit set of type names to treat as value structs when
+/// [`value_structs_all`] is false; null means "none selected". Owned elsewhere.
 pub var value_type_set: ?std.StringHashMap(void) = null;
 
-// Gated by NOVA_ASAN_CODEGEN (requires an ASAN/debug build so __asan_* resolve): when set, emitModule
-// tags every defined function with `sanitize_address` and runs LLVM's `asan` pass, so use-after-free /
-// out-of-bounds in NOVA-GENERATED code (not just the runtime) is caught with alloc/free provenance.
+/// Global flag: emit AddressSanitizer-friendly codegen (the `--asan` gate).
+/// Consulted by memory-emitting paths to add ASAN instrumentation hooks.
 pub var asan_codegen_enabled: bool = false;
 
+/// Returns the callee symbol name of a call instruction, or null if `inst` is
+/// not a call or the callee is anonymous.
+///
+/// The callee is the LAST operand of an LLVM call. Underpins [`isNamedCall`],
+/// which every elision/verifier pass uses to recognise `nova_retain`/`nova_release`.
 fn callTargetName(inst: types.LLVMValueRef) ?[]const u8 {
     if (core.LLVMGetInstructionOpcode(inst) != .LLVMCall) return null;
     const n = core.LLVMGetNumOperands(inst);
     if (n < 1) return null;
-    const callee = core.LLVMGetOperand(inst, @intCast(n - 1)); // callee is the last operand
+    const callee = core.LLVMGetOperand(inst, @intCast(n - 1));
     var len: usize = 0;
     const name_c = core.LLVMGetValueName2(callee, &len);
     if (len == 0) return null;
     return name_c[0..len];
 }
 
+/// True if `inst` is a direct call to the function named `want`.
+///
+/// The recogniser for `nova_retain`/`nova_release` (and `nova_bytes_free`)
+/// throughout the passes; built on [`callTargetName`].
 fn isNamedCall(inst: types.LLVMValueRef, want: []const u8) bool {
     const nm = callTargetName(inst) orelse return false;
     return std.mem.eql(u8, nm, want);
 }
 
-// sv must be: ptrtoint( load( inttoptr( add( load(param_slot), CONST ) ) ) )
+/// Recognises the exact IR shape of "a field loaded out of a borrowed
+/// parameter": `ptrtoint(load(inttoptr(add(load(param_slot), offset))))`.
+///
+/// [`elideBorrowedArcInFn`] uses this to prove a value came from reading a field
+/// of a by-reference parameter (which the caller still owns), so a local
+/// retain/release around it is redundant and safe to drop. It walks the exact
+/// instruction chain and, at the base, checks the loaded pointer originates from
+/// one of the function's known parameter slots (`param_slots`); any deviation
+/// returns false (conservative).
 fn tracesBorrowedParamField(sv: types.LLVMValueRef, param_slots: []const types.LLVMValueRef) bool {
     if (core.LLVMIsAInstruction(sv) == null) return false;
     if (core.LLVMGetInstructionOpcode(sv) != .LLVMPtrToInt) return false;
@@ -1642,6 +2095,10 @@ fn tracesBorrowedParamField(sv: types.LLVMValueRef, param_slots: []const types.L
     return false;
 }
 
+/// Returns the `nova_retain` instruction that retains `sv`, if any, else null.
+///
+/// Scans the uses of `sv` for a retain call. Used by the balance verifier and
+/// the borrow-elider to pair a stored value with the retain that acquired it.
 fn valueIsRetained(sv: types.LLVMValueRef) ?types.LLVMValueRef {
     var use = core.LLVMGetFirstUse(sv);
     while (use != null) : (use = core.LLVMGetNextUse(use)) {
@@ -1651,6 +2108,13 @@ fn valueIsRetained(sv: types.LLVMValueRef) ?types.LLVMValueRef {
     return null;
 }
 
+/// Runs the two ARC-elision passes over every function in the module.
+///
+/// A no-op unless [`elide_enabled`]. Per function it runs
+/// [`elideBorrowedArcInFn`] (drop retain/release around a borrowed-parameter
+/// field) then [`elideRedundantPairsInFn`] (drop an adjacent retain/release of
+/// the same value). Both only remove provably-safe pairs, keeping ARC balance
+/// intact while cutting traffic.
 pub fn elideBorrowedArc(self: *LlvmCompiler, module: types.LLVMModuleRef) void {
     if (!elide_enabled) return;
     var fnv = core.LLVMGetFirstFunction(module);
@@ -1660,24 +2124,39 @@ pub fn elideBorrowedArc(self: *LlvmCompiler, module: types.LLVMModuleRef) void {
     }
 }
 
-// ── OSSA-lite Track V (V4'): static ARC release-balance verifier ──────────────
-// Set by builder/tester from NOVA_OWN_VERIFY. `hard` (=hard) fails the build on imbalance.
+/// Enables the ARC release-balance self-verifier (`NOVA_OWN_VERIFY`); off by
+/// default. See [`verifyArcBalance`].
 pub var balance_verify: bool = false;
+/// When set, a detected imbalance is FATAL (`std.process.exit(1)`) rather than
+/// just reported: the fail-closed gate mode used in CI.
 pub var balance_hard: bool = false;
 
+/// Tally accumulated by the ARC balance verifier across a module.
 const BalanceReport = struct {
+    /// Number of defined functions examined.
     fns: usize = 0,
-    checkable_slots: usize = 0, // slots we could PROVE non-escaping + owned-via-retain
-    imbalanced: usize = 0, // checkable slots where acquires != releases
-    skipped: usize = 0, // slots skipped (escaping / uncertain store / non-ARC load use)
+    /// Owned local slots the verifier could reason about (proved non-escaping and
+    /// acquired via a retain).
+    checkable_slots: usize = 0,
+    /// Checkable slots whose acquire count did not equal its release count: each
+    /// is a codegen leak or double-free.
+    imbalanced: usize = 0,
+    /// Slots skipped conservatively because their use pattern was too complex to
+    /// prove balanced.
+    skipped: usize = 0,
+    /// Name of the first imbalanced function, for the report line.
     first: []const u8 = "",
 };
 
-// Run on the RAW codegen module (before LLVM -O), where every nova_retain/nova_release is intact.
-// SOUND because it only judges slots it can PROVE are (a) non-escaping and (b) owned-via-retain:
-// for such a slot the value's entire lifetime is visible in this function, so acquires (owned stores +
-// retains) MUST equal releases, or codegen leaked / double-freed. Any uncertainty -> skip (no false
-// positive). Narrow coverage by design; this is slice 1. See docs/design/ossa-lite-tasks.md.
+/// Verifies that every provably non-escaping owned slot is ARC-balanced, and
+/// prints a report; optionally aborts the compile on any imbalance.
+///
+/// A no-op unless [`balance_verify`]. This is a self-check on the compiler's OWN
+/// output: for each function it runs [`verifyArcBalanceInFn`], accumulating a
+/// [`BalanceReport`], and prints the totals. An imbalance means acquires !=
+/// releases on a slot that cannot escape, i.e. a leak or double-free THIS
+/// codegen emitted. When [`balance_hard`] is set, a non-zero imbalance count
+/// exits the process with status 1 (the fail-closed gate).
 pub fn verifyArcBalance(self: *LlvmCompiler, module: types.LLVMModuleRef) void {
     if (!balance_verify) return;
     var rep = BalanceReport{};
@@ -1706,10 +2185,13 @@ pub fn verifyArcBalance(self: *LlvmCompiler, module: types.LLVMModuleRef) void {
     }
 }
 
-// The value stored into `slot` stays LOCAL iff its ONLY uses are: the nova_retain that gave it its
-// owned +1, the store into `slot`, and harmless compares. Any other use (ret, store into another
-// location, call argument, etc.) means the same +1 also leaves through that path, so the slot's
-// balance is not locally determined and the slot must be skipped.
+/// True if a stored value is used only in ways that keep it LOCAL to its slot:
+/// retained, compared, or re-stored into the same slot.
+///
+/// Guards the balance verifier from counting an acquire on a value that also
+/// leaks out through some other use: any use other than a retain, an `icmp`, or
+/// the store back into `slot` disqualifies it (returns false), so the slot is
+/// treated as escaping and left unchecked.
 fn storedValueStaysLocal(sv: types.LLVMValueRef, slot: types.LLVMValueRef) bool {
     var use = core.LLVMGetFirstUse(sv);
     while (use != null) : (use = core.LLVMGetNextUse(use)) {
@@ -1717,11 +2199,24 @@ fn storedValueStaysLocal(sv: types.LLVMValueRef, slot: types.LLVMValueRef) bool 
         if (isNamedCall(user, "nova_retain")) continue;
         if (core.LLVMGetInstructionOpcode(user) == .LLVMICmp) continue;
         if (core.LLVMGetInstructionOpcode(user) == .LLVMStore and core.LLVMGetOperand(user, 0) == sv and core.LLVMGetOperand(user, 1) == slot) continue;
-        return false; // any other use aliases/escapes the value
+        return false;
     }
     return true;
 }
 
+/// Verifies ARC balance for the alloca slots of a single function, updating
+/// `rep`.
+///
+/// For each alloca it counts acquires and releases by walking the slot's uses:
+/// a store of a retained value that stays local ([`storedValueStaysLocal`])
+/// counts an acquire; a load whose users are only release/retain/compare counts
+/// releases and acquires accordingly. Any pattern it cannot fully account for
+/// (a store OF the slot address, a call consuming the value, an unexpected use)
+/// marks the slot non-checkable and it is skipped. A checkable slot with at
+/// least one acquire but acquires != releases is recorded as an imbalance (leak
+/// if acquires > releases, double-free if fewer). Conservative by design: it
+/// only flags what it can prove, so it never false-positives on a slot it does
+/// not fully understand. `self` is unused.
 fn verifyArcBalanceInFn(self: *LlvmCompiler, fnv: types.LLVMValueRef, rep: *BalanceReport) void {
     _ = self;
     var bb = core.LLVMGetFirstBasicBlock(fnv);
@@ -1739,23 +2234,18 @@ fn verifyArcBalanceInFn(self: *LlvmCompiler, fnv: types.LLVMValueRef, rep: *Bala
                 const user = core.LLVMGetUser(use);
                 const opc = core.LLVMGetInstructionOpcode(user);
                 if (opc == .LLVMStore and core.LLVMGetOperand(user, 1) == slot) {
-                    // store INTO the slot
                     const sv = core.LLVMGetOperand(user, 0);
-                    if (core.LLVMIsAConstantInt(sv) != null) continue :scan; // zero-init: no owned ref
-                    // Only count an owned store when the stored value is retained AND stays LOCAL:
-                    // if the same SSA value also escapes (returned / stored elsewhere / passed to a
-                    // call), its +1 is transferred out and its balance is NOT locally determined -> skip.
+                    if (core.LLVMIsAConstantInt(sv) != null) continue :scan;
                     if (valueIsRetained(sv) != null and storedValueStaysLocal(sv, slot)) {
-                        acquires += 1; // provably +1 owned value enters the slot and lives only here
+                        acquires += 1;
                         continue :scan;
                     }
-                    checkable = false; // uncertain / escaping store -> skip the slot
+                    checkable = false;
                     break :scan;
                 } else if (opc == .LLVMStore and core.LLVMGetOperand(user, 0) == slot) {
-                    checkable = false; // slot ADDRESS stored -> escapes
+                    checkable = false;
                     break :scan;
                 } else if (opc == .LLVMLoad and core.LLVMGetOperand(user, 0) == slot) {
-                    // every consumer of the loaded value must be a known ARC op or a harmless compare
                     var luse = core.LLVMGetFirstUse(user);
                     while (luse != null) : (luse = core.LLVMGetNextUse(luse)) {
                         const luser = core.LLVMGetUser(luse);
@@ -1764,15 +2254,14 @@ fn verifyArcBalanceInFn(self: *LlvmCompiler, fnv: types.LLVMValueRef, rep: *Bala
                         } else if (isNamedCall(luser, "nova_retain")) {
                             acquires += 1;
                         } else if (core.LLVMGetInstructionOpcode(luser) == .LLVMICmp) {
-                            // null/identity compare: does not move the refcount
                         } else {
-                            checkable = false; // loaded value used in an unknown way -> may escape
+                            checkable = false;
                             break;
                         }
                     }
                     if (!checkable) break :scan;
                 } else {
-                    checkable = false; // slot referenced in an unmodelled way -> skip
+                    checkable = false;
                     break :scan;
                 }
             }
@@ -1790,6 +2279,10 @@ fn verifyArcBalanceInFn(self: *LlvmCompiler, fnv: types.LLVMValueRef, rep: *Bala
     }
 }
 
+/// True if any operand of `inst` is `v`.
+///
+/// A small operand scan used by the elision passes to decide whether an
+/// instruction touches a tracked value before the matching release is reached.
 fn instUsesValue(inst: types.LLVMValueRef, v: types.LLVMValueRef) bool {
     const n = core.LLVMGetNumOperands(inst);
     var i: c_uint = 0;
@@ -1799,15 +2292,15 @@ fn instUsesValue(inst: types.LLVMValueRef, v: types.LLVMValueRef) bool {
     return false;
 }
 
-// M-5 expand (memory-management-refinements.md): elide a retain/release PAIR with no escaping use
-// of the value between them. Within a single basic block, if `nova_retain(v)` is followed -- with NO
-// intervening instruction that references `v` -- by `nova_release(v, ...)`, the pair is net-zero and
-// `v` is untouched across it, so both are redundant and removed. This is provably safe: the temporary
-// +1 has no observable effect when nothing reads `v` (or its refcount) in the span, and any later use
-// of `v` is unaffected because the count is unchanged end-to-end. Conservative: the FIRST use of `v`
-// after the retain must be the release; any other use (a second retain, a store, a return) stops it.
-// Covers the "pass-through" and "borrowed call-arg" shapes the prototype misses when the source is not
-// a param field, without needing arg-ownership metadata.
+/// Removes redundant intra-block retain/release pairs on the same value.
+///
+/// Within each basic block: for a `nova_retain` of value `v`, it scans forward
+/// to the first instruction that USES `v`; if that instruction is a
+/// `nova_release` of `v`, both the retain and the release are marked for
+/// erasure (the +1/-1 cancel and nothing in between depended on the extra
+/// count). An `erased` set stops a call being paired twice. Erasures are
+/// deferred to a batch at the end so iteration is not disturbed. Increments
+/// [`elide_count`] per pair removed.
 fn elideRedundantPairsInFn(self: *LlvmCompiler, fnv: types.LLVMValueRef) void {
     const a = self.allocator;
     var to_erase = std.ArrayList(types.LLVMValueRef).empty;
@@ -1825,13 +2318,12 @@ fn elideRedundantPairsInFn(self: *LlvmCompiler, fnv: types.LLVMValueRef) void {
         for (insts.items, 0..) |ri, i| {
             if (erased.contains(ri)) continue;
             if (!isNamedCall(ri, "nova_retain")) continue;
-            const v = core.LLVMGetOperand(ri, 0); // nova_retain(v): arg 0 (callee is the last operand)
+            const v = core.LLVMGetOperand(ri, 0);
             var j = i + 1;
             while (j < insts.items.len) : (j += 1) {
                 const uj = insts.items[j];
                 if (erased.contains(uj)) continue;
-                if (!instUsesValue(uj, v)) continue; // no reference to v -> keep scanning
-                // first use of v after the retain: it must be the matching release for a net-zero pair
+                if (!instUsesValue(uj, v)) continue;
                 if (isNamedCall(uj, "nova_release") and core.LLVMGetOperand(uj, 0) == v) {
                     to_erase.append(a, ri) catch {};
                     to_erase.append(a, uj) catch {};
@@ -1839,17 +2331,29 @@ fn elideRedundantPairsInFn(self: *LlvmCompiler, fnv: types.LLVMValueRef) void {
                     erased.put(uj, {}) catch {};
                     elide_count += 1;
                 }
-                break; // either paired-and-elided, or a non-release use stops this retain
+                break;
             }
         }
     }
     for (to_erase.items) |ins| core.LLVMInstructionEraseFromParent(ins);
 }
 
+/// Removes the retain/release around a local that merely holds a field read out
+/// of a borrowed (by-reference) parameter.
+///
+/// The caller still owns that parameter for the whole call, so a field it
+/// exposes does not need a local +1/-1. The pass first collects the allocas that
+/// a parameter value is stored into (`param_slots`). Then, for each local
+/// alloca, it verifies the ONLY owned store into it is a value that
+/// [`tracesBorrowedParamField`] proves came from such a parameter field and was
+/// retained ([`valueIsRetained`]), and that every load of the local flows only
+/// into releases or non-consuming uses (a call taking it as the destructor-arg
+/// position disqualifies). If exactly one such owned store is found and nothing
+/// escapes, the retain and all the matching releases are erased. Conservative:
+/// any unexpected use aborts that slot with the pair left intact.
 fn elideBorrowedArcInFn(self: *LlvmCompiler, fnv: types.LLVMValueRef) void {
     const a = self.allocator;
 
-    // 1) param-holding alloca slots: `store %param, %alloca` in the function.
     var param_slots = std.ArrayList(types.LLVMValueRef).empty;
     defer param_slots.deinit(a);
     const nparams = core.LLVMCountParams(fnv);
@@ -1872,7 +2376,6 @@ fn elideBorrowedArcInFn(self: *LlvmCompiler, fnv: types.LLVMValueRef) void {
     }
     if (param_slots.items.len == 0) return;
 
-    // 2) each alloca: is it a non-escaping borrow of a param field?
     var to_erase = std.ArrayList(types.LLVMValueRef).empty;
     defer to_erase.deinit(a);
 
@@ -1883,7 +2386,7 @@ fn elideBorrowedArcInFn(self: *LlvmCompiler, fnv: types.LLVMValueRef) void {
             if (core.LLVMIsAAllocaInst(inst) == null) continue;
             const slot = inst;
 
-            var owned_store: ?types.LLVMValueRef = null; // the ptrtoint stored value
+            var owned_store: ?types.LLVMValueRef = null;
             var retain_inst: ?types.LLVMValueRef = null;
             var releases = std.ArrayList(types.LLVMValueRef).empty;
             defer releases.deinit(a);
@@ -1895,9 +2398,8 @@ fn elideBorrowedArcInFn(self: *LlvmCompiler, fnv: types.LLVMValueRef) void {
                 const user = core.LLVMGetUser(use);
                 const opc = core.LLVMGetInstructionOpcode(user);
                 if (opc == .LLVMStore and core.LLVMGetOperand(user, 1) == slot) {
-                    // a store INTO the slot
                     const sv = core.LLVMGetOperand(user, 0);
-                    if (core.LLVMIsAConstantInt(sv) != null) continue :scan; // zero-init: ignore
+                    if (core.LLVMIsAConstantInt(sv) != null) continue :scan;
                     if (tracesBorrowedParamField(sv, param_slots.items)) {
                         if (valueIsRetained(sv)) |r| {
                             owned_store = sv;
@@ -1906,13 +2408,12 @@ fn elideBorrowedArcInFn(self: *LlvmCompiler, fnv: types.LLVMValueRef) void {
                             continue :scan;
                         }
                     }
-                    ok = false; // unknown store into the slot
+                    ok = false;
                     break :scan;
                 } else if (opc == .LLVMStore and core.LLVMGetOperand(user, 0) == slot) {
-                    ok = false; // slot's ADDRESS stored somewhere -> escapes
+                    ok = false;
                     break :scan;
                 } else if (opc == .LLVMLoad and core.LLVMGetOperand(user, 0) == slot) {
-                    // every consumer of this load must be a borrow use
                     var luse = core.LLVMGetFirstUse(user);
                     while (luse != null) : (luse = core.LLVMGetNextUse(luse)) {
                         const luser = core.LLVMGetUser(luse);
@@ -1923,19 +2424,18 @@ fn elideBorrowedArcInFn(self: *LlvmCompiler, fnv: types.LLVMValueRef) void {
                             continue;
                         }
                         if (lopc == .LLVMCall) {
-                            // borrowed call-arg: the load must be an ARGUMENT, not the callee
                             const n = core.LLVMGetNumOperands(luser);
                             if (n >= 1 and core.LLVMGetOperand(luser, @intCast(n - 1)) == user) {
-                                ok = false; // used as the callee (function pointer) -> bail
+                                ok = false;
                                 break :scan;
                             }
                             continue;
                         }
-                        ok = false; // Ret / Store-as-value / PtrToInt / GEP / ... -> escapes
+                        ok = false;
                         break :scan;
                     }
                 } else {
-                    ok = false; // any other use of the slot pointer -> bail
+                    ok = false;
                     break :scan;
                 }
             }
@@ -1951,6 +2451,11 @@ fn elideBorrowedArcInFn(self: *LlvmCompiler, fnv: types.LLVMValueRef) void {
     for (to_erase.items) |ins| core.LLVMInstructionEraseFromParent(ins);
 }
 
+// Unit test pinning [`isUntypeablePlaceholder`]'s whole-string-only rule: the
+// sentinel placeholders match, but real type names and composite types that
+// merely CONTAIN a placeholder substring (function types, generics, tuples) do
+// not. Guards against a regression where the fail-closed abort would fire on a
+// legitimately typed value.
 test "isUntypeablePlaceholder: whole-string placeholders match, real types and fn-types do not" {
     const testing = std.testing;
 

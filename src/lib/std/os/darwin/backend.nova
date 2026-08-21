@@ -1,43 +1,24 @@
-// Target-conditional reactor backend seam (macOS/BSD). Selected by the target-conditional file rule
-// (see language-specification.md 8): `import os.backend;` compiles THIS file when platform.os == "darwin".
-// Step 1 lands only the identity + shape of the backend; step 2 (EventLoop trait + Reactor<B>) fills in
-// the completion-based readiness/submit surface. On Darwin the native mechanism is kqueue (readiness),
-// which the EventLoop layer will drive in completion-emulation mode.
 pub fn name(): string { return "kqueue"; }
-pub const EVENT_SIZE: int = 32;          // sizeof(struct kevent)
-pub const COMPLETION_BASED: bool = false; // native model is readiness; completion is emulated
+pub const EVENT_SIZE: int = 32;
+pub const COMPLETION_BASED: bool = false;
 
-// --- OS-varying ABI constants --------------------------------------------------------------------
-// os/sys is ONE shared implementation, but these values genuinely differ per kernel, and hardcoding
-// the macOS set (as os/sys did) silently corrupts every other target: open() gets the wrong creation
-// flags, mmap the wrong anonymous bit, and struct stat/dirent are read at the wrong offsets. They
-// live in this per-OS seam so the shared file stays target-neutral.
 
-// open(2) flags — macOS/BSD.
-pub const OPEN_CREAT: int = 512;        // 0x0200
-pub const OPEN_TRUNC: int = 1024;       // 0x0400
-pub const OPEN_APPEND: int = 8;         // 0x0008
-pub const OPEN_NONBLOCK: int = 4;       // 0x0004
+pub const OPEN_CREAT: int = 512;
+pub const OPEN_TRUNC: int = 1024;
+pub const OPEN_APPEND: int = 8;
+pub const OPEN_NONBLOCK: int = 4;
 
-// mmap: MAP_ANON is 0x1000 on macOS/BSD.
 pub const MMAP_ANON: int = 4096;
 
-// Socket option level and names.
-pub const SOCKOPT_LEVEL: int = 65535;   // 0xffff
-pub const SOCKOPT_ERROR: int = 4103;      // 0x1007
+pub const SOCKOPT_LEVEL: int = 65535;
+pub const SOCKOPT_ERROR: int = 4103;
 pub const SOCKOPT_REUSEADDR: int = 4;
-pub const SOCKOPT_REUSEPORT: int = 512;   // 0x0200
+pub const SOCKOPT_REUSEPORT: int = 512;
 
-// struct stat: st_mode is a u16 at offset 4 (dev_t is 4 bytes here).
 pub const STAT_MODE_OFFSET: int = 4;
-// struct dirent: d_ino(8) d_seekoff(8) d_reclen(2) d_namlen(2) d_type(1) => d_name at 21.
 pub const DIRENT_NAME_OFFSET: int = 21;
 
-// errno values used by the non-blocking socket paths.
 pub const ERR_AGAIN: int = 35;
 pub const ERR_INPROGRESS: int = 36;
 
-// struct addrinfo's ai_addr. macOS/BSD: ai_canonname at 24, ai_addr at 32.
-// Reading the wrong one yields ai_canonname, which is NULL for most lookups — so the bug presents
-// as a null dereference in hostname resolution rather than a wrong address.
 pub const ADDRINFO_ADDR_OFFSET: int = 32;

@@ -1,43 +1,26 @@
-// examples/21_async.nova
-// Nova has first-class async/await built on LLVM coroutines.
-//
-//   * `async fn f(): T`   : a function that may suspend; calling it yields a value
-//                           when awaited (or block-driven from a sync caller).
-//   * `spawn f(...)`      : launch f CONCURRENTLY; returns a future immediately.
-//   * `await <future>`    : join a spawned future and get its result.
-//   * `await g(...)`      : call another async fn and wait for it inline.
-//
-// FUNCTION COLOURING: `await` and `spawn` may appear ONLY inside an `async fn`.
-// A synchronous `fn main` MAY call an async fn directly: that is the sanctioned
-// sync to async bridge (the runtime block-drives the coroutine to completion), so
-// `main` can launch the whole async program without being async itself.
 
 async fn square(n: int): int {
     return n * n;
 }
 
-// Awaits two child async calls in sequence.
 async fn sumOfSquares(a: int, b: int): int {
     let x = await square(a);
     let y = await square(b);
     return x + y;
 }
 
-// Launch three async computations CONCURRENTLY with `spawn`, then await all three
-// and combine the results.
 async fn run(): int {
-    let h1 = spawn square(5);          // 25
-    let h2 = spawn square(6);          // 36
-    let h3 = spawn sumOfSquares(1, 2); // 1 + 4 = 5
+    let h1 = spawn square(5);
+    let h2 = spawn square(6);
+    let h3 = spawn sumOfSquares(1, 2);
 
     let r1 = await h1;
     let r2 = await h2;
     let r3 = await h3;
-    return r1 + r2 + r3;               // 66
+    return r1 + r2 + r3;
 }
 
 fn main(): void {
-    // Sync to async bridge: a plain main drives the async entry point.
     let total = run();
     console.log(`25 + 36 + 5 = ${total}`);
 }

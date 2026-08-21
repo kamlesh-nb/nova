@@ -1,14 +1,3 @@
-// main_novadb.nova, the SAME web app as main.nova but backed by a live NovaDB instead of the
-// in-memory store. Look at what is different: only this composition root. The Features, the handlers,
-// the repository, the behaviours, the routes, the views, the DTOs, the validators are all shared and
-// unchanged. That is the whole point of writing the repository against the `Connection` seam.
-//
-// Note what we do NOT do: we do not open the database connection here. Connecting is asynchronous and
-// must run on the reactor, which only exists once `app.run` starts. So we register a `NovaDbConnection`
-// that connects lazily on its first use, inside an async request handler. See that file for the rule.
-//
-// Run it with `run-live.sh`, which starts a NovaDB server on 127.0.0.1:3009 and launches this build.
-// Build it with `nova build --file src/main_novadb.nova -o /tmp/webapp_novadb`.
 import web.app;
 import web.di;
 import web.request;
@@ -29,16 +18,8 @@ import Features.Products.CreateProduct.validator;
 import Features.Products.GetProductById.query;
 import Features.Products.GetProductById.handler;
 
-// The one line that changes from main.nova: register the SAME "Connection" seam key with a NovaDB-backed
-// connection instead of the in-memory one. Because the repository depends on the `Connection` trait, not
-// a concrete type, nothing downstream notices.
 fn configureServices(): ServiceCollection {
     let services = ServiceCollection();
-    // A shared connection POOL (singleton) so concurrent requests do not collide on one busy connection,
-    // and a request-scoped `Connection` that pins ONE pooled connection for the request's transaction. Pool
-    // size honours NOVA_DB_POOL (default 16); size it at or above the reactor's expected concurrency so an
-    // acquire rarely has to wait. This is the one change that makes the app correct under load; the
-    // repository, handlers, and behaviours are unchanged (they depend only on the Connection seam).
     let poolSize = 16;
     let ps = env.get("NOVA_DB_POOL");
     if (!string.eql(ps, "")) { poolSize = string.parseInt(ps) ?? 16; }
@@ -64,13 +45,11 @@ fn buildApp(): App {
 }
 
 fn main(): void {
-    // Port defaults to 8080 but honours NOVA_PORT, so the orchestrator can run several replicas of this
-    // same binary on one host (each on its own port) and load-balance across them through the service load balancer.
     let port = 8080;
     let pe = env.get("NOVA_PORT");
     if (!string.eql(pe, "")) { port = string.parseI64(pe) as int; }
 
     let app = buildApp();
     console.log(`Listening on http://127.0.0.1:${port} (NovaDB store)`);
-    app.run(port);   // starts the reactor; the DB connection opens lazily on the first request
+    app.run(port);
 }

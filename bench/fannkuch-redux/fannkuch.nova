@@ -1,4 +1,3 @@
-// fannkuch-redux, scalar (Anderson/Rettig enumeration). n baked; prints checksum then Pfannkuchen(n).
 const N: int = 7;
 fn main(): int {
     let perm: int[16] = [0; 16];
@@ -17,7 +16,6 @@ fn main(): int {
         }
         if (flips > maxFlips) { maxFlips = flips; }
         if (permIndex - (permIndex / 2) * 2 == 0) { checksum = checksum + flips; } else { checksum = checksum - flips; }
-        // next permutation
         let done = false;
         while (true) {
             if (r == N) { done = true; }

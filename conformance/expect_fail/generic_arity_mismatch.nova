@@ -1,6 +1,3 @@
-// NEGATIVE test: must FAIL to compile.
-// Pair has two type parameters <A, B>; instantiating with one type argument is
-// a compile error (A2 increment 2c — generic instantiation arity checking).
 struct Pair<A, B> {
     pub first: A,
     pub second: B,

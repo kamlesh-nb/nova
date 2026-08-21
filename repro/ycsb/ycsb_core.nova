@@ -1,12 +1,3 @@
-// ycsb_core.nova — YCSB A–F workloads, DRIVER-GENERIC (D5).
-//
-// The whole benchmark runs against a `db.Connection` and portable SQL, so ONE
-// implementation drives BTreeDB, PostgreSQL, MySQL, ... — swap the driver, not the
-// benchmark. Per-driver runners (ycsb_btree/ycsb_postgres/ycsb_mysql) just connect,
-// hand `runSuite` a Connection + the engine's CREATE TABLE dialect, and print.
-//
-// Workloads: A 50r/50u · B 95r/5u · C 100r · D 95r/5i(Latest) · E 95scan/5i · F 50r/50rmw.
-// Zipfian (theta=0.99). Zero-padded keys (user00000001) so range scans are ordered.
 
 import assert;
 import list;
@@ -75,7 +66,6 @@ fn genValue(size: int): string {
     return s;
 }
 
-// Zero-padded key so lexical order == numeric order (range scans work).
 fn keyName(k: int): string {
     let s = `${k}`;
     while (s.length < 8) { s = "0" + s; }
@@ -90,7 +80,7 @@ struct Bench {
     pub value: string,
     pub theta: double,
     pub scanLen: int,
-    pub scanTop: bool,     // MSSQL uses `SELECT TOP n ... ORDER BY`; others use `... LIMIT n`
+    pub scanTop: bool,
     init(rng: Rng, conn: db.Connection, records: int, value: string, theta: double) {
         self.rng = rng;
         self.conn = conn;
@@ -157,14 +147,11 @@ struct Bench {
     }
 }
 
-/// Drive the full A–F suite against ANY `db.Connection`. `createTableSql` carries the
-/// engine's schema dialect (`ykey` PK + `ydata`); everything else is portable SQL.
 pub fn runSuite(engineName: string, conn: db.Connection, createTableSql: string,
                 records: int, ops: int, theta: double, scanTop: bool): void {
     let value = genValue(64);
     let rng = Rng(88172645463325252);
 
-    // Fresh table (IF EXISTS is a no-op the first time / on engines that ignore it).
     conn.exec("DROP TABLE IF EXISTS ycsb_af", List<DbValue>());
     conn.exec(createTableSql, List<DbValue>());
 
@@ -180,7 +167,6 @@ pub fn runSuite(engineName: string, conn: db.Connection, createTableSql: string,
 
     let b = Bench(rng, conn, records, value, theta);
     b.scanTop = scanTop;
-    //           name  ops   read  update insert scan   rmw   latest
     b.run("A", ops, 0.50, 0.50, 0.00, 0.00, 0.00, false);
     b.run("B", ops, 0.95, 0.05, 0.00, 0.00, 0.00, false);
     b.run("C", ops, 1.00, 0.00, 0.00, 0.00, 0.00, false);

@@ -1,23 +1,15 @@
-// M-7 (memory-management-refinements.md): an owned-handle `Fd` gives DETERMINISTIC RAII close. A
-// single-owner `class` runs exactly one destructor at its last release, and Fd's destructor hook
-// (`delete`) closes the underlying fd -- so a real socket fd is closed exactly once when its handle
-// is destroyed, with no hand-written cleanup. `close()` is idempotent for the error path.
 import assert;
 import os.socket;
 import os.handle;
 
-// Create an Fd around a real socket fd and let it be destroyed (the handle is a local of this
-// function, released when the function returns -> destructor -> delete -> socket.close(raw)).
 fn openAndDrop(): int {
     let raw = socket.newTcp();
     let h = handle.Fd(raw);
-    assert.equalInt(h.get(), raw);      // borrow the raw fd, do not close it directly
+    assert.equalInt(h.get(), raw);
     assert.isFalse(h.isClosed());
-    return raw;                          // h is destroyed here -> the fd is closed for us
+    return raw;
 }
 
-// The fd is closed by the destructor: a second close returns -1 (EBADF), which proves the handle
-// closed it exactly once on the way out -- deterministic, not a GC finaliser at some later time.
 @test
 fn test_fd_closes_on_destruction(): void {
     let raw = openAndDrop();
@@ -25,14 +17,12 @@ fn test_fd_closes_on_destruction(): void {
     assert.equalInt(second, -1);
 }
 
-// Explicit close is idempotent: the error path can close eagerly, and the destructor's later close
-// is a harmless no-op (no double-close of the OS fd).
 @test
 fn test_explicit_close_is_idempotent(): void {
     let raw = socket.newTcp();
     assert.isTrue(raw >= 0);
     let h = handle.Fd(raw);
-    assert.equalInt(h.close(), 0);      // closes the fd once
+    assert.equalInt(h.close(), 0);
     assert.isTrue(h.isClosed());
-    assert.equalInt(h.close(), 0);      // already closed -> no-op, no second OS close
+    assert.equalInt(h.close(), 0);
 }

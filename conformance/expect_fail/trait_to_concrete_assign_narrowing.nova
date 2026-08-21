@@ -1,7 +1,6 @@
-// NEGATIVE (L1): a trait object cannot be implicitly narrowed to a concrete struct target on ASSIGNMENT.
 trait Speaker { fn speak(self): int; }
 struct Dog impl Speaker { pub n: int, init(n: int) { self.n = n; } pub fn speak(self): int { return self.n; } }
 struct Holder { pub d: Dog, init(d: Dog) { self.d = d; } }
 fn makeSpeaker(): Speaker { return Dog(7); }
 @test
-fn t(): void { let h = Holder(Dog(1)); h.d = makeSpeaker(); }  // ERROR: trait -> concrete field assign
+fn t(): void { let h = Holder(Dog(1)); h.d = makeSpeaker(); }

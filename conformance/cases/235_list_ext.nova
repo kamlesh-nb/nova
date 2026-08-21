@@ -1,4 +1,3 @@
-// T15: extended List operations (reverse/clear/pop/first/last/findIndex/any/all/indexOf/contains).
 import assert;
 import list;
 
@@ -9,11 +8,11 @@ fn test_list_reverse_and_pop(): void {
     l.reverse();
     assert.equalInt(l.at(0), 3);
     assert.equalInt(l.at(2), 1);
-    assert.equalInt(l.pop() ?? -1, 1);   // last after reverse
+    assert.equalInt(l.pop() ?? -1, 1);
     assert.equalInt(l.size(), 2);
     l.clear();
     assert.equalInt(l.size(), 0);
-    assert.isTrue((l.last() ?? -99) == -99);   // empty
+    assert.isTrue((l.last() ?? -99) == -99);
 }
 
 @test

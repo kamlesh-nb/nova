@@ -1,24 +1,18 @@
-// Both modifier orders parse: `pub async fn` AND `async pub fn`. The app-facing driver code (and many
-// developers) naturally write `async pub`, so the parser accepts either order for functions and struct
-// methods. Trait methods have no `pub` and are unaffected.
 
 struct Counter {
     n: int,
     init() { self.n = 0; }
 
-    // async BEFORE pub
     async pub fn bump(self: Counter): int {
         self.n = self.n + 1;
         return self.n;
     }
 
-    // pub BEFORE async (the existing idiom)
     pub async fn twice(self: Counter): int {
         return self.n * 2;
     }
 }
 
-// top-level, async before pub
 async pub fn make(): Counter {
     return Counter();
 }
@@ -26,8 +20,6 @@ async pub fn make(): Counter {
 @test
 fn test_modifier_orders(): void {
     let c = Counter();
-    // The methods are async; call them through await inside an async context is not needed here because
-    // these bodies do not actually suspend, but we still exercise that both parsed and are callable.
     c.n = 5;
     assert.equalInt(c.n, 5);
 }

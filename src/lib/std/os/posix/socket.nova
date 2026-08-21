@@ -1,15 +1,3 @@
-// os/socket: the backend-neutral socket API for the reactor (step 3 of the cross-platform reactor). This
-// is the POSIX base (macOS + Linux) over os/sys; os/socket_windows.nova overrides it on Windows (Winsock).
-// Splitting socket ops into their own module resolves the long-deferred collision between os/sys's bare
-// `socket` extern and the `socket` MODULE (net/tcp/socket), and gives the reactor one socket surface whose
-// Windows implementation speaks SOCKET handles + WSAGetLastError instead of fds + errno.
-//
-// Handles are `int` (fd) here; the Windows variant truncates SOCKET (UINT_PTR) to int at this boundary —
-// real socket-handle values fit, and keeping int avoids an int->long migration across the reactor stack.
-//
-// The socket-option constants (SOL_SOCKET/SO_ERROR/SO_REUSEPORT) and EAGAIN differ between macOS and
-// Linux; this file selects them by platform.os so it is correct on both (os/sys hardcodes the macOS
-// values). No divergent externs are involved, so the platform branches compile on every target.
 
 import os.sys;
 import platform;
@@ -25,8 +13,6 @@ fn soReusePort(): int { return if (platform.isLinux) 15 else 512; }
 const SO_REUSEADDR: int = 4;
 
 pub fn newTcp(): int { return sys.socket(AF_INET, SOCK_STREAM, 0); }
-// A UDP (SOCK_DGRAM) socket -- e.g. for a one-shot DNS query. `connect` it to the server, then the
-// normal send/recv (write/read) work on the connected datagram socket.
 pub fn newUdp(): int { return sys.socket(AF_INET, sys.SOCK_DGRAM, 0); }
 pub fn close(fd: int): int { return sys.close(fd); }
 pub fn bindSock(fd: int, addr: ptr, addrlen: int): int { return sys.bind(fd, addr, addrlen); }
@@ -34,8 +20,6 @@ pub fn listenSock(fd: int, backlog: int): int { return sys.listen(fd, backlog); 
 pub fn acceptSock(fd: int, addr: ptr, addrlen: ptr): int { return sys.accept(fd, addr, addrlen); }
 pub fn connectSock(fd: int, addr: ptr, addrlen: int): int { return sys.connect(fd, addr, addrlen); }
 
-// recv/send: on POSIX read/write work on sockets, so they back these directly. The Windows variant maps
-// them to recv/send (read/write do not work on a SOCKET).
 pub fn recvSock(fd: int, buf: long, len: int): long { return sys.read(fd, buf, len as long); }
 pub fn sendSock(fd: int, buf: long, len: int): long { return sys.write(fd, buf, len as long); }
 
@@ -56,9 +40,6 @@ pub fn setReusePort(fd: int): int {
     return r;
 }
 
-// Disable Nagle's algorithm on an accepted connection. Without it the kernel holds a small response back
-// waiting for more data / an ACK, which serialises the request/response ping-pong of an HTTP keep-alive
-// connection and caps throughput. IPPROTO_TCP (6) and TCP_NODELAY (1) are the same on macOS and Linux.
 pub fn setTcpNoDelay(fd: int): int {
     let one = bytes.alloc(4);
     bytes.write_i32(one, 0, 1);
@@ -67,7 +48,6 @@ pub fn setTcpNoDelay(fd: int): int {
     return r;
 }
 
-// Pending socket error via getsockopt(SO_ERROR): 0 = connect succeeded, non-zero = failure.
 pub fn sockError(fd: int): int {
     let val = bytes.alloc(4);
     let len = bytes.alloc(4);
@@ -80,29 +60,21 @@ pub fn sockError(fd: int): int {
     return e;
 }
 
-// True if the last socket call failed only because it would block (the reactor's "await readiness" cue).
 pub fn wouldBlock(): bool { return sys.errno() == eagain(); }
 
-// True if a non-blocking connect() is still in progress (await writability, then check sockError).
 fn einprogress(): int { return if (platform.isLinux) 115 else 36; }
 pub fn connectInProgress(): bool { return sys.errno() == einprogress(); }
 
-// sockaddr_in helpers (pure byte layout; identical on every platform).
 pub fn makeSockaddrIn(port: int, addrBE: long): ptr { return sys.makeSockaddrIn(port, addrBE); }
 pub fn boundPort(fd: int): int { return sys.boundPort(fd); }
 
-// DNS resolution (getaddrinfo/freeaddrinfo). Kept behind the socket seam so callers don't import os.sys
-// (which would drag its POSIX `socket` extern into the Windows graph and collide with winsock's).
 pub fn getAddrInfo(node: ptr, service: ptr, hints: ptr, res: ptr): int { return sys.getaddrinfo(node, service, hints, res); }
 pub fn freeAddrInfo(res: ptr): void { sys.freeaddrinfo(res); }
 
-// --- blocking (synchronous) socket layer (M14.2: retires io.cpp's nova_socket_* to Nova) --------------
-// The blocking TCP stack (net/tcp, sync web/client) is built on these. IPv4 only, matching the async
-// reactor path (eventedio.resolveHost4); getaddrinfo's ai_addr offset differs by platform.
 
-fn soRcvTimeo(): int { return if (platform.isLinux) 20 else 4102; }   // macOS SO_RCVTIMEO = 0x1006
-fn soSndTimeo(): int { return if (platform.isLinux) 21 else 4101; }   // macOS SO_SNDTIMEO = 0x1005
-fn aiAddrOffset(): int { return if (platform.isLinux) 24 else 32; }   // struct addrinfo ai_addr
+fn soRcvTimeo(): int { return if (platform.isLinux) 20 else 4102; }
+fn soSndTimeo(): int { return if (platform.isLinux) 21 else 4101; }
+fn aiAddrOffset(): int { return if (platform.isLinux) 24 else 32; }
 
 fn isNumericIPv4(s: string): bool {
     if (s.length == 0) { return false; }
@@ -129,8 +101,6 @@ fn parseIPv4BE(s: string): long {
     return result;
 }
 
-// Resolve a host to the big-endian IPv4 address for makeSockaddrIn, or -1. Numeric IPv4 parsed directly;
-// a hostname goes through getaddrinfo (a blocking DNS lookup, acceptable on the synchronous path).
 pub fn resolveHost4(host: string): long {
     if (isNumericIPv4(host)) { return parseIPv4BE(host); }
     let n = host.length;
@@ -161,7 +131,6 @@ pub fn resolveHost4(host: string): long {
     return addr;
 }
 
-// Blocking connect to host:port. Returns a connected fd, or -1.
 pub fn connectBlocking(host: string, port: int): int {
     let addr = resolveHost4(host);
     if (addr == (-1 as long)) { return -1; }
@@ -174,14 +143,9 @@ pub fn connectBlocking(host: string, port: int): int {
     return fd;
 }
 
-// --- IPv6 dial (T10) -----------------------------------------------------------------------------
-// AF_INET6 differs by OS (30 on macOS/BSD, 10 on Linux); selected by platform like the other constants.
 fn afInet6(): int { return if (platform.isLinux) 10 else 30; }
 pub fn newTcp6(): int { return sys.socket(afInet6(), SOCK_STREAM, 0); }
 
-// Build an OS-correct sockaddr_in6 (28 bytes) from a 16-byte address: Linux has a 2-byte LE family in
-// slot 0; BSD/macOS has sin6_len(=28) then a 1-byte family. sin6_port is network order at offset 2, the
-// address at offset 8.
 pub fn makeSockaddrIn6(port: int, addr16: ptr): ptr {
     let sa = bytes.alloc(28);
     let i = 0;
@@ -198,8 +162,6 @@ pub fn makeSockaddrIn6(port: int, addr16: ptr): ptr {
     return sa;
 }
 
-// Blocking connect to a pre-parsed 16-byte IPv6 address (the caller parses the v6 literal via
-// net/dns.parseIPv6). Completes the v6 dial path; verified live (no v6 loopback offline).
 pub fn connectBlocking6(addr16: ptr, port: int): int {
     let fd = newTcp6();
     if (fd < 0) { return -1; }
@@ -210,7 +172,6 @@ pub fn connectBlocking6(addr16: ptr, port: int): int {
     return fd;
 }
 
-// A receive/send timeout in ms via SO_RCVTIMEO / SO_SNDTIMEO (a `struct timeval` on POSIX).
 pub fn setTimeout(fd: int, ms: int): int {
     let tv = bytes.alloc(16);
     bytes.write_ptr(tv, 0, (if (ms > 0) (ms / 1000) else 0) as long);
@@ -221,7 +182,6 @@ pub fn setTimeout(fd: int, ms: int): int {
     return if (r1 == 0 && r2 == 0) 0 else -1;
 }
 
-// Send all `len` bytes from `buf`; returns bytes sent or -1.
 pub fn sendAll(fd: int, buf: long, len: int): int {
     let total = 0;
     while (total < len) {
@@ -231,13 +191,11 @@ pub fn sendAll(fd: int, buf: long, len: int): int {
     }
     return total;
 }
-// Receive up to `max` bytes into `buf`; returns byte count (0 = EOF) or -1.
 pub fn recvOnce(fd: int, buf: long, max: int): int {
     let n = recvSock(fd, buf, max);
     return if (n < 0) -1 else (n as int);
 }
 
-// Create a listening socket bound to INADDR_ANY:port (SO_REUSEADDR), backlog 128. Returns fd or -1.
 pub fn listenAny(port: int): int {
     let fd = newTcp();
     if (fd < 0) { return -1; }
@@ -250,17 +208,10 @@ pub fn listenAny(port: int): int {
 }
 pub fn acceptOne(fd: int): int { return acceptSock(fd, 0, 0); }
 
-// --- fd passing (connection handoff) ----------------------------------------------------------
-// The fire-and-forget proxy primitive: an accepter hands an open client fd to a sibling process over
-// a connected AF_UNIX socket, so the sibling replies to the client directly. AF_UNIX is 1 on both
-// macOS and Linux, so it needs no per-OS seam.
 pub const AF_UNIX: int = 1;
 
 pub fn newUnix(): int { return sys.socket(AF_UNIX, SOCK_STREAM, 0); }
 
-// Build a sockaddr_un for a filesystem path. macOS/BSD is [sun_len(1)][sun_family(1)][sun_path], Linux
-// is [sun_family(2, LE)][sun_path]; the path starts at offset 2 on both. Pass sockaddrUnLen() as the
-// addrlen to bind/connect. Path must be shorter than the sun_path field (104 macOS / 108 Linux).
 pub fn sockaddrUnLen(): int { return if (platform.isLinux) 110 else 106; }
 pub fn makeSockaddrUn(path: string): ptr {
     let sz = sockaddrUnLen();
@@ -271,8 +222,8 @@ pub fn makeSockaddrUn(path: string): ptr {
         bytes.write_byte(sa, 0, AF_UNIX & 0xff);
         bytes.write_byte(sa, 1, (AF_UNIX >> 8) & 0xff);
     } else {
-        bytes.write_byte(sa, 0, sz);       // sun_len
-        bytes.write_byte(sa, 1, AF_UNIX);  // sun_family
+        bytes.write_byte(sa, 0, sz);
+        bytes.write_byte(sa, 1, AF_UNIX);
     }
     let n = path.length;
     let j = 0;
@@ -280,13 +231,8 @@ pub fn makeSockaddrUn(path: string): ptr {
     return sa;
 }
 
-// A connected AF_UNIX stream pair (both ends usable immediately, no bind/listen). Writes the two fds
-// into a caller-provided 8-byte buffer as two i32s; returns 0 on success or -1. Typically one end is
-// kept by the accepter and the other inherited by a forked worker.
 pub fn unixPair(sv: ptr): int { return sys.socketpair(AF_UNIX, SOCK_STREAM, 0, sv); }
 
-// Send an open fd plus a string payload (the already-read request prefix) over the AF_UNIX socket.
-// Returns bytes sent (>=0) or -1.
 pub fn sendFd(sock: int, fd: int, payload: string): long {
     let n = payload.length;
     let buf = bytes.alloc(if (n > 0) n else 1);
@@ -297,25 +243,16 @@ pub fn sendFd(sock: int, fd: int, payload: string): long {
     return r;
 }
 
-// The result of a handoff receive: the passed fd (-1 if none arrived), the payload bytes that rode
-// along with it (the request prefix the accepter had already consumed), and the raw recvmsg count `n`
-// so a non-blocking caller can tell the three cases apart: n>0 an fd/data arrived, n==0 the peer closed
-// the channel (stop), n<0 would-block (nothing queued right now).
 pub struct HandoffResult {
     pub fd: int,
     pub payload: string,
     pub n: int,
 }
 
-// Low-level fd receive for the reactor's OP_RECVFD completion path: recvmsg one fd (written as an i32
-// to *outFd) plus up to `cap` payload bytes into `buf`, both raw addresses. Returns the raw recvmsg
-// count: >0 a fd/data arrived, 0 the peer closed, <0 error or would-block (check wouldBlock()).
 pub fn recvFdRaw(fd: int, buf: long, cap: int, outFd: long): long {
     return sys.nova_recv_fd(fd, buf, cap as long, outFd);
 }
 
-// Receive an fd plus up to `cap` payload bytes from the AF_UNIX socket. On peer-close the returned fd
-// is -1 and n is 0; on would-block (non-blocking socket) fd is -1 and n is -1.
 pub fn recvFd(sock: int, cap: int): HandoffResult {
     let buf = bytes.alloc(if (cap > 0) cap else 1);
     let outFd = bytes.alloc(4);

@@ -1,5 +1,3 @@
-// MD5 known-answer tests from RFC 1321, Appendix A.5. MD5 is cryptographically broken and kept only
-// for legacy interop (e.g. some auth handshakes); these vectors pin that the implementation is correct.
 import crypto.hash.md5;
 import assert;
 

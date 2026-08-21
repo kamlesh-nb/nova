@@ -1,7 +1,4 @@
 // EXPECT-FAIL: typecheck
-// F4/F1-6 (2026-07-24): Nova has NO function overloading (specs.md). Two functions with the same
-// name in the SAME module are a REDEFINITION — codegen would silently dedup them by symbol name and
-// one call would resolve to the wrong body (garbage). The checker rejects it with a located error.
 import assert;
 
 fn dup(x: int): int { return x + 1; }

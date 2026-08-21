@@ -5,9 +5,6 @@ import web.di;
 import data.db;
 import Features.Products.Shared.repository;
 
-// A logging behaviour: wraps every handler, tags the response with the request type it handled. A real
-// one would time the request and write a structured log line. Being outermost, it sees the final
-// Response whether the handler ran or a behaviour short-circuited.
 pub struct LoggingBehavior impl PipelineBehavior {
     async fn handle(self: LoggingBehavior, ctx: RequestContext, next: Next): Response {
         let res = await next.proceed(ctx);
@@ -16,15 +13,8 @@ pub struct LoggingBehavior impl PipelineBehavior {
     }
 }
 
-// A transaction / unit-of-work behaviour: it opens a transaction on the request's SCOPED connection
-// (the same instance the handler's repository uses), runs the handler, and commits on success or rolls
-// back on an error response. This is why `send` opens one DI scope per request: the behaviour and the
-// handler share the connection.
 pub struct TransactionBehavior impl PipelineBehavior {
     async fn handle(self: TransactionBehavior, ctx: RequestContext, next: Next): Response {
-        // Resolve the SAME scoped repository the handler will use, and open the transaction on its
-        // connection. Going through the repository keeps this behaviour driver-agnostic: it never names
-        // the concrete connection type, so it works unchanged for the in-memory store and for NovaDB.
         let repo = ctx.scope.require("ProductRepository") as ProductRepository;
         let conn = repo.connection();
         let _ = await conn.begin();

@@ -1,12 +1,6 @@
-// NEGATIVE test: must FAIL to compile.
-// Calling a struct constructor with the wrong number of arguments is an error
-// (workstream A — constructor arity checking). Without this check, a wrong-arg
-// constructor call reached codegen and produced an ill-formed call that only
-// failed at LLVM verification (e.g. `Map<int,int>()` → `Map_init` with just self).
 import map;
 
 @test
 fn t(): void {
-    // Map<K,V>'s init requires (initialCap, hashFn); calling with none is an error.
     let m = Map<int, int>();
 }

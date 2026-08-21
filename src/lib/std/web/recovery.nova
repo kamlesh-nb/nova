@@ -5,9 +5,6 @@ import web.response;
 import web.status;
 import web.mediator;
 
-// A pipeline behavior that lets the request proceed; the place to wrap handler execution with
-// recovery/observability. It implements web.mediator.PipelineBehavior with the async chain-object
-// `next`, so it can `await` the continuation (a closure could not).
 pub struct PanicRecoveryBehavior impl PipelineBehavior {
 
     pub async fn handle(self: PanicRecoveryBehavior, ctx: RequestContext, next: Next): response.Response {

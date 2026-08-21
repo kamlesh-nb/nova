@@ -1,15 +1,8 @@
-// HPACK (RFC 7541): header compression for HTTP/2. Implements the Huffman code (appendix B), the integer
-// and string primitives (section 5), the static table (appendix A) + a dynamic table with eviction, and
-// header-block encode/decode. The decoder handles every representation a peer may send (indexed,
-// literal-with/without/never-indexed, dynamic-table size update); the encoder emits indexed entries for
-// exact static matches and literal-without-indexing otherwise (valid, and keeps the encoder stateless so it
-// never desyncs a dynamic table with the peer).
 import string;
 import list;
 import map;
 import bytes;
 
-// Huffman tables, hex-encoded: 256 codes (8 hex digits each, right-aligned bits) then 256 lengths (2 hex).
 const HUFF_CODES_HEX: string = "00001ff8007fffd80fffffe20fffffe30fffffe40fffffe50fffffe60fffffe70fffffe800ffffea3ffffffc0fffffe90fffffea3ffffffd0fffffeb0fffffec0fffffed0fffffee0fffffef0ffffff00ffffff10ffffff23ffffffe0ffffff30ffffff40ffffff50ffffff60ffffff70ffffff80ffffff90ffffffa0ffffffb00000014000003f8000003f900000ffa00001ff900000015000000f8000007fa000003fa000003fb000000f9000007fb000000fa000000160000001700000018000000000000000100000002000000190000001a0000001b0000001c0000001d0000001e0000001f0000005c000000fb00007ffc0000002000000ffb000003fc00001ffa000000210000005d0000005e0000005f000000600000006100000062000000630000006400000065000000660000006700000068000000690000006a0000006b0000006c0000006d0000006e0000006f000000700000007100000072000000fc00000073000000fd00001ffb0007fff000001ffc00003ffc0000002200007ffd000000030000002300000004000000240000000500000025000000260000002700000006000000740000007500000028000000290000002a000000070000002b000000760000002c00000008000000090000002d0000007700000078000000790000007a0000007b00007ffe000007fc00003ffd00001ffd0ffffffc000fffe6003fffd2000fffe7000fffe8003fffd3003fffd4003fffd5007fffd9003fffd6007fffda007fffdb007fffdc007fffdd007fffde00ffffeb007fffdf00ffffec00ffffed003fffd7007fffe000ffffee007fffe1007fffe2007fffe3007fffe4001fffdc003fffd8007fffe5003fffd9007fffe6007fffe700ffffef003fffda001fffdd000fffe9003fffdb003fffdc007fffe8007fffe9001fffde007fffea003fffdd003fffde00fffff0001fffdf003fffdf007fffeb007fffec001fffe0001fffe1003fffe0001fffe2007fffed003fffe1007fffee007fffef000fffea003fffe2003fffe3003fffe4007ffff0003fffe5003fffe6007ffff103ffffe003ffffe1000fffeb0007fff1003fffe7007ffff2003fffe801ffffec03ffffe203ffffe303ffffe407ffffde07ffffdf03ffffe500fffff101ffffed0007fff2001fffe303ffffe607ffffe007ffffe103ffffe707ffffe200fffff2001fffe4001fffe503ffffe803ffffe90ffffffd07ffffe307ffffe407ffffe5000fffec00fffff3000fffed001fffe6003fffe9001fffe7001fffe8007ffff3003fffea003fffeb01ffffee01ffffef00fffff400fffff503ffffea007ffff403ffffeb07ffffe603ffffec03ffffed07ffffe707ffffe807ffffe907ffffea07ffffeb0ffffffe07ffffec07ffffed07ffffee07ffffef07fffff003ffffee";
 const HUFF_LENS_HEX: string = "0d171c1c1c1c1c1c1c181e1c1c1e1c1c1c1c1c1c1c1c1e1c1c1c1c1c1c1c1c1c060a0a0c0d06080b0a0a080b080606060505050606060606060607080f060c0a0d06070707070707070707070707070707070707070707070807080d130d0e060f05060506050606060507070606060506070605050607070707070f0b0e0d1c141614141616161716171717171718171818161718171717171516171617171816151416161717151716161815161717151516151716171714161616171616171a1a1413161716191a1a1a1b1b1a181913151a1b1b1a1b1815151a1a1c1b1b1b14181415161515171616191918181a171a1b1a1a1b1b1b1b1b1c1b1b1b1b1b1a";
 
@@ -32,7 +25,6 @@ pub struct HeaderField {
     init(name: string, value: string) { self.name = name; self.value = value; }
 }
 
-// The 61-entry static table (RFC 7541 appendix A). Index 1..61.
 fn staticNames(): List<string> {
     let n = List<string>();
     n.push(":authority"); n.push(":method"); n.push(":method"); n.push(":path"); n.push(":path");
@@ -71,12 +63,12 @@ fn staticValues(): List<string> {
 }
 
 pub class Hpack {
-    pub codes: List<int>,          // Huffman code per byte
-    pub lens: List<int>,           // Huffman code length per byte
-    pub decMap: Map<long, int>,    // (len<<32 | code) -> symbol, for decode
+    pub codes: List<int>,
+    pub lens: List<int>,
+    pub decMap: Map<long, int>,
     pub sNames: List<string>,
     pub sValues: List<string>,
-    pub dynNames: List<string>,    // dynamic table, newest at index 0
+    pub dynNames: List<string>,
     pub dynValues: List<string>,
     pub dynSize: int,
     pub maxDynSize: int,
@@ -103,7 +95,6 @@ pub class Hpack {
         self.maxDynSize = 4096;
     }
 
-    // ---- Huffman ----
     fn huffEncodeLen(self: Hpack, s: string): int {
         let bits = 0;
         let i = 0;
@@ -111,7 +102,6 @@ pub class Hpack {
         return (bits + 7) / 8;
     }
 
-    // Huffman-encode s into out at offset o; returns new offset.
     fn huffEncode(self: Hpack, out: ptr, o0: int, s: string): int {
         let o = o0;
         let acc = 0 as long;
@@ -132,14 +122,13 @@ pub class Hpack {
         }
         if (nbits > 0) {
             let pad = 8 - nbits;
-            acc = (acc << pad) | (((1 << pad) - 1) as long);   // pad with EOS's leading 1-bits
+            acc = (acc << pad) | (((1 << pad) - 1) as long);
             bytes.write_byte(out, o, (acc & 255) as int);
             o = o + 1;
         }
         return o;
     }
 
-    // Huffman-decode len bytes from buf at off into a string.
     fn huffDecode(self: Hpack, buf: ptr, off: int, len: int): string {
         let out = bytes.alloc(len * 8 + 2);
         let o = 0;
@@ -170,8 +159,6 @@ pub class Hpack {
         return out as string;
     }
 
-    // ---- integer (prefix-N) ----
-    // Encode value v with an n-bit prefix; the top (8-n) bits of the first byte are `flags`. Returns offset.
     fn encInt(self: Hpack, out: ptr, o0: int, n: int, flags: int, v0: int): int {
         let o = o0;
         let max = (1 << n) - 1;
@@ -188,12 +175,11 @@ pub class Hpack {
         return o;
     }
 
-    // ---- string (H-flag + length + bytes) ----
     fn encStr(self: Hpack, out: ptr, o0: int, s: string): int {
         let o = o0;
         let hl = self.huffEncodeLen(s);
         if (hl < s.length) {
-            o = self.encInt(out, o, 7, 128, hl);   // H bit set (0x80), 7-bit length prefix
+            o = self.encInt(out, o, 7, 128, hl);
             o = self.huffEncode(out, o, s);
         } else {
             o = self.encInt(out, o, 7, 0, s.length);
@@ -203,10 +189,8 @@ pub class Hpack {
         return o;
     }
 
-    // ---- dynamic table ----
     fn dynAdd(self: Hpack, name: string, value: string): void {
         let sz = name.length + value.length + 32;
-        // Evict until it fits.
         while (self.dynSize + sz > self.maxDynSize && self.dynNames.size() > 0) {
             let last = self.dynNames.size() - 1;
             let en = self.dynNames.at(last);
@@ -222,7 +206,6 @@ pub class Hpack {
         }
     }
 
-    // Resolve a header table index (1-based): static 1..61 then dynamic 62..
     fn tableName(self: Hpack, idx: int): string {
         if (idx >= 1 && idx <= 61) { return self.sNames.at(idx - 1); }
         let d = idx - 62;
@@ -236,25 +219,21 @@ pub class Hpack {
         return "";
     }
 
-    // Find an exact (name,value) or name-only match in the static table. Returns index or 0.
     fn staticFind(self: Hpack, name: string, value: string): int {
         let nameOnly = 0;
         let i = 0;
         while (i < 61) {
             if (string.eql(self.sNames.at(i), name)) {
                 if (string.eql(self.sValues.at(i), value)) { return i + 1; }
-                if (nameOnly == 0) { nameOnly = 0 - (i + 1); }   // negative marks name-only
+                if (nameOnly == 0) { nameOnly = 0 - (i + 1); }
             }
             i = i + 1;
         }
         return nameOnly;
     }
 
-    // ---- header block encode / decode ----
 
-    // Encode a list of header fields into a fresh buffer; returns (buf, len).
     pub fn encode(self: Hpack, fields: List<HeaderField>): (ptr, int) {
-        // Upper bound: each field ~ name+value plus overhead; be generous.
         let cap = 64;
         let i = 0;
         while (i < fields.size()) { let f = fields.at(i); cap = cap + f.name.length + f.value.length + 16; i = i + 1; }
@@ -265,15 +244,12 @@ pub class Hpack {
             let f = fields.at(k);
             let m = self.staticFind(f.name, f.value);
             if (m > 0) {
-                // Fully indexed (static): 1-bit prefix 0x80, 7-bit index.
                 o = self.encInt(out, o, 7, 128, m);
             } else if (m < 0) {
-                // Name indexed, literal value, without indexing (0x00, 4-bit name index).
                 o = self.encInt(out, o, 4, 0, 0 - m);
                 o = self.encStr(out, o, f.value);
             } else {
-                // New name + value, without indexing.
-                bytes.write_byte(out, o, 0); o = o + 1;   // 0x00, index 0
+                bytes.write_byte(out, o, 0); o = o + 1;
                 o = self.encStr(out, o, f.name);
                 o = self.encStr(out, o, f.value);
             }
@@ -282,8 +258,6 @@ pub class Hpack {
         return (out, o);
     }
 
-    // Decode a header block (buf[off..off+len]) into a list of header fields. Cursor-driven; handles all
-    // representation types and maintains the dynamic table.
     pub fn decode(self: Hpack, buf: ptr, off: int, len: int): List<HeaderField> {
         let out = List<HeaderField>();
         let p = off;
@@ -291,12 +265,10 @@ pub class Hpack {
         while (p < end) {
             let b = bytes.read_byte(buf, p);
             if ((b & 128) != 0) {
-                // Indexed header field.
                 let (idx, np) = self.decInt(buf, p, end, 7);
                 p = np;
                 out.push(HeaderField(self.tableName(idx), self.tableValue(idx)));
             } else if ((b & 64) != 0) {
-                // Literal with incremental indexing (6-bit name index).
                 let (idx, np) = self.decInt(buf, p, end, 6);
                 p = np;
                 let (nm, p2) = self.decNameOrStr(buf, p, end, idx);
@@ -306,11 +278,9 @@ pub class Hpack {
                 self.dynAdd(nm, vl);
                 out.push(HeaderField(nm, vl));
             } else if ((b & 32) != 0) {
-                // Dynamic table size update (5-bit).
                 let (sz, np) = self.decInt(buf, p, end, 5);
                 p = np;
                 self.maxDynSize = sz;
-                // Evict if now over.
                 while (self.dynSize > self.maxDynSize && self.dynNames.size() > 0) {
                     let last = self.dynNames.size() - 1;
                     self.dynSize = self.dynSize - (self.dynNames.at(last).length + self.dynValues.at(last).length + 32);
@@ -318,7 +288,6 @@ pub class Hpack {
                     self.dynValues.remove(last);
                 }
             } else {
-                // Literal without indexing (0x00) or never-indexed (0x10); both 4-bit name index, no table add.
                 let (idx, np) = self.decInt(buf, p, end, 4);
                 p = np;
                 let (nm, p2) = self.decNameOrStr(buf, p, end, idx);
@@ -336,7 +305,6 @@ pub class Hpack {
         return self.decStr(buf, p0, end);
     }
 
-    // Decode an integer with an n-bit prefix starting at buf[p0]. Returns (value, nextPos).
     fn decInt(self: Hpack, buf: ptr, p0: int, end: int, n: int): (int, int) {
         let p = p0;
         let max = (1 << n) - 1;
@@ -354,7 +322,6 @@ pub class Hpack {
         return (v, p);
     }
 
-    // Decode a length-prefixed (H-flag) string starting at buf[p0]. Returns (string, nextPos).
     fn decStr(self: Hpack, buf: ptr, p0: int, end: int): (string, int) {
         let huff = (bytes.read_byte(buf, p0) & 128) != 0;
         let (slen, p) = self.decInt(buf, p0, end, 7);

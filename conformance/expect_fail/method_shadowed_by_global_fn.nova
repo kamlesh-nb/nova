@@ -1,26 +1,4 @@
 // EXPECT-FAIL: codegen
-// ⚠️ DEBT: rejected cleanly, but only at CODEGEN and with NO source span — the user
-//    gets a name, not a file:line. Should become `typecheck`. F1 stage 7 / F2 stage 5.
-//    (Was `compiler-crash`: an unhandled Zig error printed a compiler backtrace.
-//     Fixed 2026-07-17 via main.zig's userErrorHint. Plan P0-5.)
-// NEGATIVE test: must FAIL to compile (specs §10 #6/#7, design/F1 §2.6).
-//
-// `t.describe()` where Thing has NO `describe` method, and a global `describe`
-// exists. Must be rejected, not silently resolved to the global.
-//
-// It used to compile and call the wrong function. The call path's bare
-// `func_map.get(fa.field)` fallback (llvm_codegen.zig:1236) resolved a VARIABLE's
-// member against the global function table — the sibling of the value-path bug
-// that put a function address into a `string` field and cost months as "string
-// heap corruption" (§10 #6). The value path was guarded then; this one was not.
-//
-// The ZERO-ARG global is the point. `t.describe()` lowers to `call @describe()`
-// with 0 args, so the arity MATCHES and the LLVM verifier — which caught the
-// mismatched-arity version loudly — is completely blind. Measured before the fix:
-//
-//     got=WRONG-global-fn      exit 0
-//
-// A clean compile, a wrong answer, no diagnostic anywhere.
 import assert;
 
 fn describe(): string { return "WRONG-global-fn"; }
@@ -28,11 +6,10 @@ fn describe(): string { return "WRONG-global-fn"; }
 struct Thing {
     pub v: int,
     init(v: int) { self.v = v; }
-    // deliberately NO `describe` method
 }
 
 @test
 fn t_method_must_not_resolve_to_global(): void {
     let t = Thing(7);
-    assert.equalStr(t.describe(), "anything");   // must not compile
+    assert.equalStr(t.describe(), "anything");
 }

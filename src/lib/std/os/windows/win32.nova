@@ -1,41 +1,21 @@
-// os/windows: core Win32 API for the reactor's IOCP backend (step 3 of the cross-platform reactor;
-// windows-only). extern("c") maps to the Win64 calling convention on x86_64-windows, which is the ABI
-// Win32 APIs use, so no special convention is needed. COMPILE-VERIFIED via cross-compilation; runtime
-// verification is pending on a Windows host (there is no Windows CI here yet). Kernel32 auto-links; the
-// ws2_32 import lib (Winsock, os/winsock) is added at link time in the IOCP step.
-//
-// Handles and SOCKETs are pointer-sized (UINT_PTR / HANDLE), so they are `long` here; callers that keep
-// an `int` fd model truncate at the os/socket boundary (real handle values fit — see os/socket_windows).
 
 import bytes;
 
 pub const INVALID_HANDLE: long = -1;
-pub const INFINITE: int = -1;            // 0xFFFFFFFF (a DWORD); -1 as int has the same bit pattern
+pub const INFINITE: int = -1;
 
 pub extern("c") fn GetLastError(): int;
 pub extern("c") fn CloseHandle(h: long): int;
 
-// IOCP. CreateIoCompletionPort(fileHandle, existingPort, key, threads): associate a socket/file HANDLE
-// with a completion port (or create one when existingPort == 0 and fileHandle == INVALID_HANDLE).
 pub extern("c") fn CreateIoCompletionPort(fileHandle: long, existingPort: long, completionKey: long, concurrentThreads: int): long;
-// Dequeue one completion (blocking up to timeoutMs; INFINITE blocks). Fills *bytes, *key, *overlapped.
 pub extern("c") fn GetQueuedCompletionStatus(port: long, lpBytes: ptr, lpKey: ptr, lpOverlapped: ptr, timeoutMs: int): int;
-// Batch-dequeue up to `count` completions into an OVERLAPPED_ENTRY array; *removed gets the count.
 pub extern("c") fn GetQueuedCompletionStatusEx(port: long, entries: ptr, count: int, removed: ptr, timeoutMs: int, alertable: int): int;
-// Post a manual completion (cross-reactor wake: the completion-model equivalent of EVFILT_USER/eventfd).
 pub extern("c") fn PostQueuedCompletionStatus(port: long, nBytes: int, completionKey: long, lpOverlapped: ptr): int;
-// Cancel a specific in-flight overlapped operation on a handle (lpOverlapped == the op record), or
-// every pending one when lpOverlapped is null. The op still delivers a completion afterwards —
-// normally with ERROR_OPERATION_ABORTED — which is exactly why the record cannot be freed until then.
 pub extern("c") fn CancelIoEx(fileHandle: long, lpOverlapped: ptr): int;
 
-// OVERLAPPED_ENTRY (x64): [0] lpCompletionKey (ULONG_PTR) [8] lpOverlapped (ptr) [16] Internal (ULONG_PTR)
-// [24] dwNumberOfBytesTransferred (DWORD). 32 bytes with padding.
 pub const OVERLAPPED_ENTRY_SIZE: int = 32;
 pub fn entryKey(buf: ptr, i: int): long { return bytes.read_ptr(buf, (i * OVERLAPPED_ENTRY_SIZE) as long); }
 pub fn entryOverlapped(buf: ptr, i: int): long { return bytes.read_ptr(buf, (i * OVERLAPPED_ENTRY_SIZE + 8) as long); }
 pub fn entryBytes(buf: ptr, i: int): int { return bytes.read_i32(buf, (i * OVERLAPPED_ENTRY_SIZE + 24) as long) as int; }
 
-// OVERLAPPED (x64, 32 bytes): [0] Internal [8] InternalHigh [16] Offset/Pointer [24] hEvent. An op record
-// for overlapped I/O embeds an OVERLAPPED at offset 0, so the completion's lpOverlapped == the op address.
 pub const OVERLAPPED_SIZE: int = 32;

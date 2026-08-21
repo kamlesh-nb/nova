@@ -1,10 +1,3 @@
-// Async TLS 1.3 stream in pure Nova (M11 stage C): a TlsStream wraps an AsyncStream and pumps the
-// pure-Nova TLS 1.3 memory-BIO (net/tlsmembio) over it, implementing the AsyncIO trait so callers (the
-// web server, the HTTP client, the DB drivers) speak TLS without knowing the transport. No wolfSSL.
-//
-// The handshake cryptographically authenticates the peer. Chain-to-trusted-root validation (dates,
-// hostname, a CA store) is a separate policy layer (crypto/tls/13/tlsClient.verifyServerChain); the
-// `verify` flag is accepted for source compatibility but that policy layer is applied by the caller.
 import bytes;
 import net.aio;
 import net.tlsmembio;
@@ -36,7 +29,6 @@ pub class TlsStream impl AsyncIO {
         self.handshakeOk = false;
     }
 
-    // Flush all pending outbound ciphertext to the socket.
     pub async fn flushOut(self: TlsStream): int {
         while (self.bio.pendingOut() > 0) {
             let n = self.bio.pull(self.scratch, self.cap);
@@ -47,7 +39,6 @@ pub class TlsStream impl AsyncIO {
         return 0;
     }
 
-    // Pull inbound ciphertext from the socket into the BIO. Returns bytes read (<=0 on EOF/error).
     pub async fn pumpIn(self: TlsStream): int {
         let n = await self.base.recvInto(self.scratch as long, self.cap);
         if (n <= 0) { self.bio.markClosed(); return n; }
@@ -88,7 +79,6 @@ pub class TlsStream impl AsyncIO {
 
     pub fn ok(self: TlsStream): bool { return self.handshakeOk; }
     pub fn isOpen(self: TlsStream): bool { return self.open; }
-    // The ALPN protocol negotiated during the handshake ("" if none).
     pub fn selectedAlpn(self: TlsStream): string { return self.bio.selectedAlpn(); }
 
     pub fn setTimeout(self: TlsStream, ms: int): int {
@@ -101,9 +91,6 @@ pub class TlsStream impl AsyncIO {
             self.base.close();
             self.open = false;
         }
-        // Free the 16 KB record scratch buffer. Without this it leaked once per TLS connection (M1),
-        // which sinks any long-running server that opens many TLS connections (every driver-over-TLS and
-        // every HTTPS client). Guarded so a double close is safe.
         if (self.scratch != 0) {
             bytes.free(self.scratch);
             self.scratch = 0;
@@ -119,10 +106,6 @@ pub async fn tlsConnect(host: string, port: int, verify: bool): TlsStream {
     return ts;
 }
 
-// Run the TLS handshake with each socket read bounded by `timeoutMs` (a per-recv deadline via
-// recvIntoDeadline), so a server that accepts the TCP connection and then stalls the handshake cannot
-// hang the coroutine. The deadline is cleared afterwards so normal application reads are unbounded.
-// timeoutMs <= 0 leaves the handshake unbounded (the old behaviour).
 async fn handshakeBounded(ts: TlsStream, timeoutMs: int): int {
     if (timeoutMs > 0) { let _ = ts.setTimeout(timeoutMs); }
     let hs = await ts.handshake();
@@ -130,9 +113,6 @@ async fn handshakeBounded(ts: TlsStream, timeoutMs: int): int {
     return hs;
 }
 
-// Deadline-bounded variants of the TLS connect helpers: the TCP connect is bounded by
-// asyncConnectDeadline and the handshake by handshakeBounded, so neither phase can hang on a
-// dead/firewalled/stalling host. On failure the returned stream's ok() is false.
 pub async fn tlsConnectDeadline(host: string, port: int, verify: bool, timeoutMs: int): TlsStream {
     let base = await aio.asyncConnectDeadline(host, port, timeoutMs);
     let bio: tlsmembio.TlsBio = tlsmembio.newClientBio(host);
@@ -161,9 +141,6 @@ pub async fn tlsConnectClientCertDeadline(host: string, port: int, caPem: string
     let _ = await handshakeBounded(ts, timeoutMs);
     return ts;
 }
-// STARTTLS upgrade of an already-connected socket, with the handshake bounded by `timeoutMs`. Used by
-// the SQL drivers whose TCP connect was already bounded (asyncConnectDeadline) but whose post-
-// SSLRequest handshake was not.
 pub async fn tlsClientUpgradeDeadline(base: aio.AsyncStream, host: string, timeoutMs: int): TlsStream {
     let bio: tlsmembio.TlsBio = tlsmembio.newClientBio(host);
     let ts = TlsStream(base, bio);
@@ -178,8 +155,6 @@ pub async fn tlsClientUpgradeVerifyDeadline(base: aio.AsyncStream, host: string,
     return ts;
 }
 
-// Connect and offer ALPN (comma-separated protocol list, e.g. "h2,http/1.1"); selectedAlpn() reports the
-// server's choice after the handshake.
 pub async fn tlsConnectAlpn(host: string, port: int, alpn: string): TlsStream {
     let base = await aio.asyncConnect(host, port);
     let bio: tlsmembio.TlsBio = tlsmembio.newClientBioAlpn(host, alpn);
@@ -188,8 +163,6 @@ pub async fn tlsConnectAlpn(host: string, port: int, alpn: string): TlsStream {
     return ts;
 }
 
-// Connect and enforce CA trust: the server chain must validate against `caPem` (a PEM bundle) for `host`,
-// or the handshake fails (ok() is false). Returns the stream; the caller checks ok().
 pub async fn tlsConnectVerify(host: string, port: int, caPem: string): TlsStream {
     let base = await aio.asyncConnect(host, port);
     let store = truststore.loadPemBundle(caPem);
@@ -199,11 +172,6 @@ pub async fn tlsConnectVerify(host: string, port: int, caPem: string): TlsStream
     return ts;
 }
 
-// Client-side STARTTLS: upgrade an ALREADY-OPEN socket to TLS in place. The caller has done the
-// plaintext protocol negotiation that precedes encryption (e.g. Postgres SSLRequest, MySQL SSLRequest
-// packet) on `base`, then hands it here for the TLS 1.3 client handshake. This is the client analog of
-// tlsAccept; it does NOT open a new socket (unlike tlsConnect). The handshake authenticates the peer;
-// chain-to-CA trust is only enforced by the *Verify variant.
 pub async fn tlsClientUpgrade(base: aio.AsyncStream, host: string): TlsStream {
     let bio: tlsmembio.TlsBio = tlsmembio.newClientBio(host);
     let ts = TlsStream(base, bio);
@@ -211,8 +179,6 @@ pub async fn tlsClientUpgrade(base: aio.AsyncStream, host: string): TlsStream {
     return ts;
 }
 
-// STARTTLS with CA trust enforced: the server chain must validate against `caPem` for `host`, else
-// ts.ok() is false (the caller must check it and refuse to proceed).
 pub async fn tlsClientUpgradeVerify(base: aio.AsyncStream, host: string, caPem: string): TlsStream {
     let store = truststore.loadPemBundle(caPem);
     let bio: tlsmembio.TlsBio = tlsmembio.newClientBioVerify(host, store);
@@ -221,10 +187,6 @@ pub async fn tlsClientUpgradeVerify(base: aio.AsyncStream, host: string, caPem: 
     return ts;
 }
 
-// Connect and present a CLIENT certificate for mutual TLS (used by MongoDB's MONGODB-X509 auth). Runs
-// over TLS 1.2 (the Client12Bio mTLS path), which shares the TlsBio seam so the async pump is identical.
-// certPem/keyPem may be the same combined PEM (MongoDB's tlsCertificateKeyFile). When caPem is non-empty
-// the server chain is verified against it; otherwise the handshake authenticates but does not chain-check.
 pub async fn tlsConnectClientCert(host: string, port: int, caPem: string, certPem: string, keyPem: string): TlsStream {
     let base = await aio.asyncConnect(host, port);
     let bio: tlsmembio.TlsBio = tls12bio.newClient12BioClientCert(host, certPem, keyPem);
@@ -243,8 +205,6 @@ pub async fn tlsAccept(base: aio.AsyncStream, cert: string, key: string): TlsStr
     return ts;
 }
 
-// Accept and offer ALPN (comma-separated preference list); the server echoes the first protocol the
-// client also offered, reported by selectedAlpn().
 pub async fn tlsAcceptAlpn(base: aio.AsyncStream, cert: string, key: string, alpn: string): TlsStream {
     let sb = tlsmembio.newServerBioPem(cert, key);
     sb.offerAlpn(alpn);

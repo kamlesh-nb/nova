@@ -1,26 +1,100 @@
-// format.zig — `nova fmt` — format sources, reinjecting comments the pretty-printer drops.
+//! The `nova fmt` source formatter and its comment-preserving glue.
+//!
+//! This file is the CLI-side driver for the code formatter: it reads a `.nova`
+//! file (or every file in the tree), runs it through the real pretty-printer in
+//! [`frontend/formatter.zig`], and writes the result back in place. The
+//! formatter itself only knows about the AST, so on its own it would DISCARD
+//! every comment, because comments are lexer trivia that the parser throws away
+//! before the AST is built. The bulk of this file exists to solve exactly that
+//! problem: how to reformat code while putting the original comments back where
+//! they belong.
+//!
+//! The strategy is token alignment. The formatter never adds, removes, splits,
+//! or merges a code token: it only changes the whitespace between tokens. So the
+//! source and the formatted output have the SAME sequence of code tokens, just
+//! at different byte offsets. [`reinjectComments`] walks the gaps between
+//! consecutive tokens in the source, finds any comment sitting in a gap, and
+//! re-emits it into the corresponding gap of the formatted text, classifying it
+//! as either a trailing comment (stays on the previous token's line) or a
+//! leading comment (goes on its own line, re-indented to match the following
+//! token). The i-th gap in the source maps to the i-th gap in the formatted
+//! output precisely because the token counts match.
+//!
+//! Safety is enforced by a fail-closed invariant checked twice with
+//! [`sameTokenStream`]: reformatting must not change the code token stream, and
+//! neither must comment reinjection. If EITHER check fails the file is left
+//! byte-for-byte untouched and a diagnostic is printed, rather than risk writing
+//! back something that alters program meaning. This is why an unsupported
+//! construct causes `nova fmt` to skip a file instead of mangling it: correctness
+//! is preferred over always-formatting.
+//!
+//! The entry point is [`cmdFmt`], dispatched from the CLI driver in
+//! `src/main.zig` for the `nova fmt` subcommand.
 
+/// The Zig standard library, used here for allocation, slicing/`mem` helpers,
+/// `ArrayList`, sorting, and `std.process.Init`.
 const std = @import("std");
+/// Compile-time build/target information (`@import("builtin")`). Imported for
+/// availability alongside the other driver modules; not referenced directly in
+/// this file.
 const builtin = @import("builtin");
+/// Alias for `std.Io`, the I/O abstraction. [`formatFile`] uses `Io.Dir` to read
+/// and write files through the `init.io` implementation.
 const Io = std.Io;
+/// Generated build-time options module. Imported for availability alongside the
+/// other driver modules; not referenced directly in this file.
 const build_options = @import("build_options");
+/// Nova's AST node definitions. Imported for availability; the AST is produced
+/// and consumed here only indirectly through [`parser`] and [`formatter`].
 const ast = @import("frontend/ast.zig");
+/// The lexer. [`sameTokenStream`] and [`codeTokenSpans`] drive `Lexer` directly
+/// to tokenise source for the code-equality guard and gap scanning.
 const lexer = @import("frontend/lexer.zig");
+/// The parser. [`formatFile`] uses `Parser` to build the AST that the formatter
+/// pretty-prints.
 const parser = @import("frontend/parser.zig");
+/// The AST pretty-printer that does the actual reformatting; [`formatFile`] runs
+/// `Formatter.formatProgram` over the parsed program.
 const formatter = @import("frontend/formatter.zig");
+/// The semantic type checker. Imported for availability; formatting does not
+/// type-check, so it is not referenced in this file.
 const type_checker = @import("frontend/type_checker.zig");
+/// Project/scaffold templates. Imported for availability; not referenced here.
 const templates = @import("templates.zig");
+/// The LLVM code generator. Imported for availability; not referenced here.
 const llvm_codegen = @import("backend/codegen/llvm_codegen.zig");
+/// The ARC (automatic reference counting) codegen support. Imported for
+/// availability; not referenced here.
 const codegen_arc = @import("backend/codegen/arc.zig");
+/// The sema shadow-verifier pass. Imported for availability; not referenced here.
 const sema_shadow = @import("frontend/sema/shadow.zig");
+/// The escape-analysis sema pass. Imported for availability; not referenced here.
 const sema_escape = @import("frontend/sema/escape.zig");
+/// The alpha-renaming sema pass. Imported for availability; not referenced here.
 const sema_alpha = @import("frontend/sema/alpha.zig");
+/// The sema identifier/ID tables. Imported for availability; not referenced here.
 const sema_ids = @import("frontend/sema/ids.zig");
+/// The main semantic-analysis pass. Imported for availability; not referenced
+/// here.
 const sema_mod = @import("frontend/sema/sema.zig");
+/// The monomorphisation sema pass. Imported for availability; not referenced
+/// here.
 const sema_mono = @import("frontend/sema/mono.zig");
+/// The build/driver pipeline. [`cmdFmt`] calls `pipeline.findNovaFiles` to
+/// discover every `.nova` source under the current directory in batch mode.
 const pipeline = @import("pipeline.zig");
 
 
+/// Reports whether two source strings lex to the identical sequence of code
+/// tokens (same token type and same lexeme, in order, up to `eof`).
+///
+/// This is the correctness gate the formatter relies on: because comments are
+/// lexer trivia that never surface as tokens, two texts with equal token streams
+/// differ only in whitespace and comments, i.e. the CODE is unchanged. Used by
+/// [`formatFile`] to reject a formatting or reinjection result that would alter
+/// program meaning. Note it compares only tokens, so it is deliberately blind to
+/// whitespace and comment differences, which is exactly what makes it safe to
+/// use as an equality check across a reformat.
 fn sameTokenStream(a: []const u8, b: []const u8) bool {
     var la = lexer.Lexer.init(a);
     var lb = lexer.Lexer.init(b);
@@ -33,8 +107,24 @@ fn sameTokenStream(a: []const u8, b: []const u8) bool {
     }
 }
 
-const TokenSpan = struct { start: usize, end: usize };
+/// A half-open byte range `[start, end)` locating one code token within its
+/// source text. Produced by [`codeTokenSpans`] and consumed by
+/// [`reinjectComments`] to reason about the gaps between adjacent tokens.
+const TokenSpan = struct {
+    /// Byte offset of the token's first character in the source text.
+    start: usize,
+    /// Byte offset one past the token's last character (exclusive end).
+    end: usize,
+};
 
+/// Lexes `text` and returns the [`TokenSpan`] of every code token, excluding the
+/// terminal `eof`.
+///
+/// The spans are taken from the lexer's own `tok_start`/`pos` cursor after each
+/// `nextToken`, so they are exact byte offsets into `text`. The returned slice is
+/// caller-owned and must be freed. The gaps BETWEEN these spans (and before the
+/// first / after the last) are where all whitespace and comments live, which is
+/// what [`reinjectComments`] scans.
 fn codeTokenSpans(allocator: std.mem.Allocator, text: []const u8) ![]TokenSpan {
     var spans = std.ArrayList(TokenSpan).empty;
     errdefer spans.deinit(allocator);
@@ -47,12 +137,45 @@ fn codeTokenSpans(allocator: std.mem.Allocator, text: []const u8) ![]TokenSpan {
     return spans.toOwnedSlice(allocator);
 }
 
+/// One pending comment insertion into the formatted output, accumulated by
+/// [`appendCommentInsert`] and later applied in offset order by
+/// [`reinjectComments`].
+///
+/// Insertions are collected out of order (all leading/trailing decisions are made
+/// per source gap) and then stably sorted, so both an `offset` and a tie-breaking
+/// `order` are needed to reproduce the original comment sequence at a shared
+/// insertion point.
 const CommentIns = struct {
+    /// Byte offset in the FORMATTED text at which `text` is to be spliced in.
     offset: usize,
+    /// The fully rendered snippet to insert, including any leading space,
+    /// re-computed indentation, and trailing newline. Heap-allocated and freed
+    /// by [`reinjectComments`] once spliced.
     text: []const u8,
+    /// Monotonic sequence number used as the sort tie-breaker so that multiple
+    /// comments landing at the same `offset` keep their source order.
     order: usize,
 };
 
+/// Re-inserts the comments from `source` into the comment-stripped `formatted`
+/// text, returning a newly allocated buffer the caller owns.
+///
+/// The algorithm relies on the token-alignment invariant: `source` and
+/// `formatted` share the same code-token sequence, so their token gaps correspond
+/// one-to-one. It lexes both into span lists and, for gap `i` (the whitespace
+/// before token `i`, with gap `n` being the trailing region after the last
+/// token), scans the source gap for `//` line comments and `/* */` block
+/// comments. Each comment found is queued via [`appendCommentInsert`], classified
+/// as trailing (no newline seen since the previous token, so it belongs at the
+/// end of that token's line in the output) or leading (starts a fresh line,
+/// re-indented to the following token). Queued inserts are stably sorted by
+/// offset then discovery order and spliced into the output.
+///
+/// Fail-safe: if the two token counts differ (`n != f_spans.len`) the alignment
+/// assumption is broken, so it gives up and returns a plain copy of `formatted`
+/// unchanged rather than misplace comments. Likewise, if no comments were found
+/// it returns a copy of `formatted` directly. The returned buffer is always a
+/// fresh allocation regardless of path.
 fn reinjectComments(allocator: std.mem.Allocator, source: []const u8, formatted: []const u8) ![]u8 {
     const s_spans = try codeTokenSpans(allocator, source);
     defer allocator.free(s_spans);
@@ -114,6 +237,10 @@ fn reinjectComments(allocator: std.mem.Allocator, source: []const u8, formatted:
     if (inserts.items.len == 0) return allocator.dupe(u8, formatted);
 
     std.mem.sort(CommentIns, inserts.items, {}, struct {
+        /// Orders insertions by ascending `offset`, breaking ties by ascending
+        /// `order`, so the sort is stable in source sequence at any single
+        /// insertion point. This is what lets several comments in one gap keep
+        /// their original relative order after the out-of-order collection pass.
         fn lt(_: void, a: CommentIns, b: CommentIns) bool {
             if (a.offset != b.offset) return a.offset < b.offset;
             return a.order < b.order;
@@ -135,6 +262,25 @@ fn reinjectComments(allocator: std.mem.Allocator, source: []const u8, formatted:
     return out.toOwnedSlice(allocator);
 }
 
+/// Renders one source comment into a [`CommentIns`] and appends it to `inserts`,
+/// deciding WHERE in the formatted text it should land.
+///
+/// Three placements, matching the three kinds of gap:
+///   - `trailing` (and there is a previous token): the comment stays on the same
+///     line as the previous code token. The offset is the end of that token's
+///     line in the formatted output (`line_end`), and the text is prefixed with a
+///     single space (`" {s}"`), no newline.
+///   - leading, and there is a following token (`i < n`): the comment gets its
+///     own line placed just before token `i`. The output line's existing indent
+///     (the run of spaces/tabs before token `i`) is measured and reused so the
+///     comment aligns with the code it precedes, and a trailing newline is added.
+///   - otherwise (`i == n`, the trailing region past the last token): the comment
+///     is appended at end of file with a newline.
+///
+/// `order.*` is captured into the insert and then incremented, giving each
+/// comment a stable tie-break rank for the later sort in [`reinjectComments`].
+/// `f_spans`, `i`, and `n` describe the formatted token spans and the current gap
+/// index; `n` is the token count so `i == n` denotes the after-last gap.
 fn appendCommentInsert(
     allocator: std.mem.Allocator,
     inserts: *std.ArrayList(CommentIns),
@@ -169,6 +315,21 @@ fn appendCommentInsert(
     order.* += 1;
 }
 
+/// Formats a single `.nova` file in place, preserving its comments, and only
+/// writes back if doing so provably does not change the code.
+///
+/// The pipeline is: read the file, parse it to an AST (a parse error is reported
+/// with the file name and propagated), pretty-print via
+/// [`frontend/formatter.zig`], then guard the result with [`sameTokenStream`]. If
+/// the formatter would alter the code token stream (an unsupported construct) the
+/// file is left untouched and skipped; with `NOVA_FMT_DEBUG` set in the
+/// environment it additionally prints the first diverging token pair to aid
+/// diagnosis. It then re-injects comments with [`reinjectComments`] and runs the
+/// SAME guard a second time, skipping on failure. Only when both guards pass is
+/// the comment-preserved text written back over `file_path`.
+///
+/// `init` carries the I/O implementation and the environment map used for the
+/// read, the write, and the `NOVA_FMT_DEBUG` lookup.
 fn formatFile(allocator: std.mem.Allocator, init: std.process.Init, file_path: []const u8) !void {
     const source = try Io.Dir.readFileAlloc(.cwd(), init.io, file_path, allocator, .unlimited);
     defer allocator.free(source);
@@ -214,6 +375,17 @@ fn formatFile(allocator: std.mem.Allocator, init: std.process.Init, file_path: [
     try Io.Dir.writeFile(.cwd(), init.io, .{ .data = with_comments, .sub_path = file_path, .flags = .{} });
 }
 
+/// CLI entry point for `nova fmt`, dispatched from the driver in `src/main.zig`.
+///
+/// With an explicit path argument (`args.len >= 3`, i.e. `nova fmt <file>`) it
+/// formats just that file. Otherwise it recursively discovers every `.nova` file
+/// under the current directory via [`pipeline.findNovaFiles`] and formats each,
+/// then prints a count. Per-file errors are caught and reported without aborting
+/// the batch: a failure on one file logs a message and, in the directory mode,
+/// `continue`s to the next (note the printed `Formatted N files` count is the
+/// number ATTEMPTED, incremented before the possible error, not strictly the
+/// number successfully rewritten). The discovered file list is owned here and
+/// freed on exit.
 pub fn cmdFmt(allocator: std.mem.Allocator, init: std.process.Init, args: []const []const u8) !void {
     if (args.len >= 3) {
         const file_path = args[2];

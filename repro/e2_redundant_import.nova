@@ -1,6 +1,6 @@
 import assert;
-import e2mod.leaf;   // direct
-import e2mod.mid;    // transitive (mid also imports leaf)
+import e2mod.leaf;
+import e2mod.mid;
 
 @test
 fn both_imports() {

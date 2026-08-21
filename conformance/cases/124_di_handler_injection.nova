@@ -1,6 +1,3 @@
-// 124 — Constructor injection through the runtime mediator: a typed handler receives its collaborators
-// via its constructor, resolved from the App-owned DI container. No manual wiring; the compiler-generated
-// adapter builds the handler with `scope.require(...)` for each dependency.
 import assert;
 import web.app;
 import web.di;
@@ -13,14 +10,12 @@ import serde.json;
 import serde.source;
 import string;
 
-// A stateful SINGLETON service, the shared collaborator.
 struct Counter impl Service {
     pub count: int,
     init() { self.count = 0; }
     pub fn next(self: Counter): int { self.count = self.count + 1; return self.count; }
 }
 
-// A stateless service the handler also depends on (proves multi-dependency injection).
 struct Greeter impl Service {
     pub prefix: string,
     init(p: string) { self.prefix = p; }
@@ -30,7 +25,6 @@ struct Greeter impl Service {
 @serializable struct Hit impl Message { pub name: string }
 @serializable struct HitDto { pub n: int, pub msg: string }
 
-// The handler holds its dependencies as fields, injected through its constructor.
 struct HitHandler impl RequestHandler<Hit, HitDto> {
     counter: Counter,
     greeter: Greeter,
@@ -51,7 +45,6 @@ fn makeApp(): App {
     return a;
 }
 
-// (1) A dispatched request runs the handler with its injected collaborators.
 @test
 fn test_di_injected_handler_runs(): void {
     let a = makeApp();
@@ -59,7 +52,6 @@ fn test_di_injected_handler_runs(): void {
     assert.equalStr(resp.body, `{"n":1,"msg":"Hello, Ada!"}`);
 }
 
-// (2) The injected SINGLETON persists across requests: the counter advances 1 -> 2 -> 3.
 @test
 fn test_di_singleton_persists_across_requests(): void {
     let a = makeApp();

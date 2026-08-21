@@ -1,8 +1,3 @@
-// nsieve, BORROWED-STRING (Str) variant. The sieve itself reuses the value-struct engine; the Str angle is
-// the REPORT rendering, which is exactly what `Str` exists for (str.nova: render straight from a borrow into
-// a builder with NO owned intermediate). The label "Primes up to " is borrowed ONCE as a zero-copy view and
-// its bytes are streamed into a fresh builder per rep via `appendBytes` (no per-line owned prefix string).
-// The render loop measures the borrow -> render -> free cycle; the three real nsieve lines are printed once.
 import str;
 import collections.string_builder;
 
@@ -32,13 +27,11 @@ fn main(): int {
     let c1 = s.run(10000 * 8);
     let c2 = s.run(10000 * 4);
 
-    // Borrow the label ONCE: a {ptr,len} view over a constant literal (lives for the whole program).
     let label = str.of("Primes up to ");
     let checksum: long = 0;
     let rep = 0;
     while (rep < RENDER_REPS) {
         let sb = string_builder.StringBuilder();
-        // Stream the borrowed prefix bytes straight in -- no owned "Primes up to " string is minted.
         sb.appendBytes(label.ptr, label.len);
         sb.append(`${10000 * 16} ${c0}`);
         checksum = checksum + (sb.len as long);

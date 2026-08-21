@@ -2,9 +2,6 @@ import list;
 import web.mediator;
 import Features.Products.CreateProduct.command;
 
-// A per-type validator, typed over its request. The compiler generates its erased adapter and the app
-// auto-registers it, so the one generic `ValidationBehavior` (registered in main.nova) runs it before
-// the handler and short-circuits with a 400 on failure. Rules live here; the handler stays pure.
 pub struct CreateProductValidator impl Validator<CreateProduct> {
     fn validate(self: CreateProductValidator, cmd: CreateProduct): List<string> {
         let errs = List<string>();

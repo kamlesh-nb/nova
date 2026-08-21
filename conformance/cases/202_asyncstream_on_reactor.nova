@@ -1,9 +1,3 @@
-// M2 step 2 of the C++ runtime retirement plan: the AsyncStream seam runs reactor-native, no Asio.
-// This is the cutover that lets the database drivers (which are written against aio.AsyncStream)
-// pick up the reactor path unchanged: on a reactor thread, poller.setCurrent(kq) makes
-// aio.asyncConnect return a reactor-native AsyncStream, whose recvInto/sendStr delegate to
-// net/reactorio over os/sys. Here the client side goes entirely through the AsyncStream API; the
-// server side accepts and echoes. A real TCP round trip on one reactor, through the driver seam.
 import assert;
 import bytes;
 import os.sys;
@@ -32,8 +26,6 @@ async fn serverSide(listenFd: int, kq: int, done: long): void {
     bump(done);
 }
 
-// The client uses the AsyncStream seam (asyncConnect + recvInto/sendStr), which is reactor-native
-// because poller.setCurrent has been called on this thread.
 async fn clientSide(port: int, done: long, result: long, gotLen: long): void {
     let s = await aio.asyncConnect("127.0.0.1", port);
     if (s.isOpen()) {
@@ -60,7 +52,6 @@ fn test_asyncstream_reactor_round_trip(): void {
     assert.isTrue(port > 0);
 
     let r = poller.Reactor(64, 4096, 16);
-    // Mark this thread's reactor so asyncConnect resolves to the reactor-native path.
     poller.setCurrent(r.kq);
     assert.equalInt(poller.currentKq(), r.kq);
 
@@ -85,8 +76,8 @@ fn test_asyncstream_reactor_round_trip(): void {
 
     assert.equalInt(count(done), 2);
     assert.equalInt(bytes.read_i32(gotLen, 0) as int, 4);
-    assert.equalInt(bytes.read_byte(result, 0) as int, 80);   // 'P'
-    assert.equalInt(bytes.read_byte(result, 3) as int, 71);   // 'G'
+    assert.equalInt(bytes.read_byte(result, 0) as int, 80);
+    assert.equalInt(bytes.read_byte(result, 3) as int, 71);
 
     poller.setCurrent(0);
     bytes.free(done);

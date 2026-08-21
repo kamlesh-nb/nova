@@ -1,7 +1,3 @@
-// A bounded async channel with BACKPRESSURE (concurrency.asyncchan.AsyncChannel<T>): a sender that finds
-// the buffer full PARKS until a receiver frees a slot. Here a capacity-2 channel carries 10 values from a
-// producer to a consumer, so the producer MUST backpressure and park repeatedly; all values arrive in order
-// with none lost.
 import concurrency.asyncchan;
 import assert;
 async fn producer(ch: asyncchan.AsyncChannel<int>, n: int): int {
@@ -15,10 +11,10 @@ async fn consumer(ch: asyncchan.AsyncChannel<int>, n: int): int {
     return sum;
 }
 async fn run(): int {
-    let ch = asyncchan.AsyncChannel<int>(2);   // capacity 2 -> a producer of 10 must backpressure
+    let ch = asyncchan.AsyncChannel<int>(2);
     let p = spawn producer(ch, 10);
     let c = spawn consumer(ch, 10);
-    let got = await c;   // 0+1+...+9 = 45
+    let got = await c;
     let sent = await p;
     assert.equalInt(sent, 10);
     return got;

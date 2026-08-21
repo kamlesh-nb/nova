@@ -1,8 +1,4 @@
 // EXPECT-FAIL: typecheck
-// A1 fail-closed soundness (gaps.md C-chk-4). An `if`/`while`/`for` condition must be a `bool`. A bare
-// optional (or int/long/enum) used as truthiness was silently accepted and its value word used as a
-// condition -- silent wrong control flow. Complements non_bool_condition.nova (which only tests the int
-// LITERAL `if (42)`); this guards the VARIABLE/optional form that slipped through the legacy blocklist.
 import assert;
 @test
 fn t(): void {

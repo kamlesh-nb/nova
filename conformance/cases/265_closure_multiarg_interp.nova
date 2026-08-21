@@ -1,10 +1,3 @@
-// Regression: a multi-argument closure whose param types cannot be pinned from its body alone
-// (e.g. `(a, b) => a + b`, where both params are only used with each other) must still be typed
-// from its CALL SITE, so its result interpolates correctly. Before the fix the closure inferred
-// as `unresolved`, the call result was untyped, and `${add(3, 8)}` picked the string stringifier
-// and dereferenced the int as a pointer -> SIGSEGV. Fix: the checker looks ahead to the call site
-// (incl. inside a template) and pins the closure's param types from the argument types.
-// The closure CALL codegen was always correct; this is purely a type-inference fix.
 import assert;
 
 @test

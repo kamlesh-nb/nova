@@ -1,38 +1,26 @@
-// 127 — V1 value-type optional boxing: a present `0`/`0.0`/`false` is DISTINCT from `undefined`.
-//
-// The bug this proves fixed (nova-value-optional-zero-bug): a value-type optional had no runtime
-// representation for `undefined` — `undefined` was the literal `0`, so a STORED `0` read back as
-// absent. Boxing gives present values a non-null pointer, so `0` is present and only a genuine miss
-// is `undefined`. Covered uniformly across widths: int / long / float / double / bool.
 import assert;
 import map;
 import string;
 
-// ---- Map<string,int> storing 0 -----------------------------------------------------------------
 fn test_map_int_zero() {
     let m = Map<string, int>(8, string.hash);
     m.set("zero", 0);
     m.set("five", 5);
 
-    // Present-0 is NOT undefined.
     assert.isTrue(m.get("zero") != undefined);
     assert.isTrue(m.get("five") != undefined);
-    // A genuine miss IS undefined.
     assert.isTrue(m.get("absent") == undefined);
 
-    // `??` yields the STORED value, even when it is 0.
-    assert.zero(m.get("zero") ?? 99);      // present-0 → 0, not the default
+    assert.zero(m.get("zero") ?? 99);
     assert.equalInt(m.get("five") ?? 99, 5);
     assert.equalInt(m.get("absent") ?? 99, 99);
 }
 
-// ---- narrowed use: `if (x != undefined) { ... x ... }` -----------------------------------------
 fn test_narrowed_zero() {
     let m = Map<string, int>(8, string.hash);
     m.set("k", 0);
     let got = m.get("k");
     if (got != undefined) {
-        // narrowed to `int` — the value is the stored 0, and arithmetic on it works.
         assert.zero(got);
         assert.equalInt(got + 7, 7);
     } else {
@@ -40,7 +28,6 @@ fn test_narrowed_zero() {
     }
 }
 
-// ---- local value-optionals of each width -------------------------------------------------------
 fn test_local_widths() {
     let i: int | undefined = 0;
     assert.isTrue(i != undefined);
@@ -59,19 +46,14 @@ fn test_local_widths() {
     let d: double | undefined = 0.0;
     assert.isTrue(d != undefined);
 
-    // undefined stays undefined.
     let u: int | undefined = undefined;
     assert.isTrue(u == undefined);
     assert.equalInt(u ?? 7, 7);
 }
 
-// ---- value-optional PARAMETERS: a present 0/false/0.0 passed as an ARG must read PRESENT ------------
-// Regression guard for the §B residual "value-optional PARAM present-0-as-absent variant": the value-level
-// boxing fixed locals + Map storage, but passing a present-0 optional ACROSS a call boundary is a separate
-// ABI path (the R2/C10 param-ABI fix). Verified here so a present-0 arg never narrows as absent again.
 fn viaParam(x: int | undefined): int {
     if (x != undefined) { return x; }
-    return -1;                              // absent branch — must NOT be taken for a present 0
+    return -1;
 }
 fn viaDefault(x: int | undefined): int { return x ?? 99; }
 fn boolParam(b: bool | undefined): int {
@@ -81,14 +63,14 @@ fn boolParam(b: bool | undefined): int {
 fn dblParam(d: double | undefined): int { return if (d != undefined) 1 else -1; }
 
 fn test_param_widths() {
-    assert.zero(viaParam(0));                 // present-0 arg → 0, not the -1 absent branch
+    assert.zero(viaParam(0));
     assert.equalInt(viaParam(5), 5);
     assert.equalInt(viaParam(undefined), -1);
-    assert.zero(viaDefault(0));               // `??` yields the passed 0, not the default
+    assert.zero(viaDefault(0));
     assert.equalInt(viaDefault(undefined), 99);
-    assert.equalInt(boolParam(false), 0);     // present-false arg → present
+    assert.equalInt(boolParam(false), 0);
     assert.equalInt(boolParam(undefined), -1);
-    assert.equalInt(dblParam(0.0), 1);        // present-0.0 arg → present
+    assert.equalInt(dblParam(0.0), 1);
     assert.equalInt(dblParam(undefined), -1);
 }
 

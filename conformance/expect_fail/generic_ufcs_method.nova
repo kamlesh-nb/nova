@@ -1,9 +1,4 @@
 // EXPECT-FAIL: typecheck
-// A GENERIC type's methods must be defined INSIDE the struct body (as List/Map/Set do). A free
-// function with a `self` parameter on a GENERIC receiver — `fn m<T>(self: Container<T>, …)` — is a
-// UFCS method the checker cannot resolve (it does not solve `self`'s type param at the call site), so
-// `x.m()` would silently mis-type. This is the class that hid the Array<T> cascade; it is now a
-// located hard error. Non-generic UFCS (`fn hash(self: string)`) is unaffected. specs §4.2.
 struct Box<T> { pub val: T }
 
 pub fn get<T>(self: Box<T>): T { return self.val; }

@@ -1,7 +1,3 @@
-// A genuinely-USED depth-3 nested generic must be eagerly MONOMORPHISED (concrete List_List_List_int
-// bodies), not left to the type-erased fallback. The speculative method-return cascade stays depth-capped;
-// only an explicitly-used type is instantiated at any depth. This exercises the value-optional `get()`
-// path that the erased container layout mishandles.
 import assert;
 import list;
 @test

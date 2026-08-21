@@ -1,15 +1,8 @@
-// DNS support for the async net stack (T10): IPv6 address-literal parsing and a resolution cache. The
-// cache is the practical fix for the "blocking getaddrinfo stalls the reactor" problem -- after the
-// first lookup a host resolves from memory with no syscall, so a reactor coroutine never blocks on a
-// repeat connect. parseIPv6 turns a textual v6 address into its 16 packed bytes (the value a
-// sockaddr_in6 needs). Both are pure + unit-tested here; the sockaddr_in6 dial itself is the runtime
-// (os/socket) layer and is exercised by the live integration harness.
 
 import bytes;
 import string;
 import map;
 
-// Hex nibble, or -1 for a non-hex byte.
 fn hexVal(c: int): int {
     if (c >= 48 && c <= 57) { return c - 48; }
     if (c >= 97 && c <= 102) { return c - 87; }
@@ -17,24 +10,19 @@ fn hexVal(c: int): int {
     return 0 - 1;
 }
 
-// Parse an IPv6 textual address (e.g. "::1", "2001:db8::1", "fe80::1ff:fe23:4567:890a") into 16 packed
-// bytes written to out16. Handles the "::" zero-run compression (at most one). Returns true on success.
 pub fn parseIPv6(addr: string, out16: ptr): bool {
     let i = 0;
     while (i < 16) { bytes.write_byte(out16, i, 0); i = i + 1; }
 
-    // Split into the part before "::" and after it (if any).
     let dc = string.indexOf(addr, "::");
     let head = if (dc >= 0) string.slice(addr, 0, dc) else addr;
     let tail = if (dc >= 0) string.slice(addr, dc + 2, addr.length) else "";
 
-    // Parse a colon-separated group list into bytes starting at out16[off]; returns bytes written or -1.
     let headBytes = writeGroups(head, out16, 0);
     if (headBytes < 0) { return false; }
     if (dc < 0) {
-        return headBytes == 16;                      // no "::" -> must be a full 8-group address
+        return headBytes == 16;
     }
-    // tail groups are right-aligned in the 16 bytes (the "::" fills the gap with zeros already written).
     let tmp = bytes.alloc(16);
     let tailBytes = writeGroups(tail, tmp, 0);
     if (tailBytes < 0) { return false; }
@@ -44,8 +32,6 @@ pub fn parseIPv6(addr: string, out16: ptr): bool {
     return true;
 }
 
-// Write colon-separated 16-bit groups of `s` as big-endian byte pairs into buf from `off`. Empty s
-// writes nothing. Returns bytes written, or -1 on a malformed group.
 fn writeGroups(s: string, buf: ptr, off: int): int {
     if (s.length == 0) { return 0; }
     let p = off;
@@ -54,8 +40,8 @@ fn writeGroups(s: string, buf: ptr, off: int): int {
     let i = 0;
     while (i <= s.length) {
         let end = i == s.length;
-        let c = if (end) 58 else s[i];               // treat end like a ':' separator
-        if (c == 58) {                               // ':'
+        let c = if (end) 58 else s[i];
+        if (c == 58) {
             if (digits == 0) { return 0 - 1; }
             bytes.write_byte(buf, p, (val >> 8) & 0xff); bytes.write_byte(buf, p + 1, val & 0xff);
             p = p + 2;
@@ -71,8 +57,6 @@ fn writeGroups(s: string, buf: ptr, off: int): int {
     return p - off;
 }
 
-// A small host->address resolution cache. Values pack the resolved address; a hit avoids a blocking
-// getaddrinfo on the reactor thread. keyed by host string.
 pub struct DnsCache {
     pub m: Map<string, long>,
     init() { self.m = Map<string, long>(64, string.hash); }
@@ -84,27 +68,20 @@ pub struct DnsCache {
 
 pub fn newDnsCache(): DnsCache { return DnsCache(); }
 
-// Build a sockaddr_in6 (28 bytes) for a v6 dial: AF_INET6 family + port (network order) + the 16-byte
-// address. `family` is the OS's AF_INET6 (30 on macOS/BSD, 10 on Linux) and `bsdLen` true adds the BSD
-// sin6_len byte in slot 0 (macOS/BSD has it, Linux does not). Layout:
-//   BSD:   [sin6_len(1)][sin6_family(1)][port(2 BE)][flowinfo(4)][addr(16)][scope_id(4)]
-//   Linux: [sin6_family(2 LE)][port(2 BE)][flowinfo(4)][addr(16)][scope_id(4)]
-// Pure -- the actual AF_INET6 socket() + connect() is the reactor's runtime dial (os/socket), verified
-// live; this is the address-construction layer.
 pub fn makeSockaddrIn6(family: int, port: int, addr16: ptr, bsdLen: bool): ptr {
     let sa = bytes.alloc(28);
     let i = 0;
     while (i < 28) { bytes.write_byte(sa, i, 0); i = i + 1; }
     if (bsdLen) {
-        bytes.write_byte(sa, 0, 28);                 // sin6_len
-        bytes.write_byte(sa, 1, family & 0xff);      // sin6_family (1 byte on BSD)
+        bytes.write_byte(sa, 0, 28);
+        bytes.write_byte(sa, 1, family & 0xff);
     } else {
-        bytes.write_byte(sa, 0, family & 0xff);      // sin6_family (2-byte LE on Linux)
+        bytes.write_byte(sa, 0, family & 0xff);
         bytes.write_byte(sa, 1, (family >> 8) & 0xff);
     }
-    bytes.write_byte(sa, 2, (port >> 8) & 0xff);     // sin6_port, network byte order
+    bytes.write_byte(sa, 2, (port >> 8) & 0xff);
     bytes.write_byte(sa, 3, port & 0xff);
-    let j = 0;                                        // sin6_addr at offset 8
+    let j = 0;
     while (j < 16) { bytes.write_byte(sa, 8 + j, bytes.read_byte(addr16, j)); j = j + 1; }
     return sa;
 }

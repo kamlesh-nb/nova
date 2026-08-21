@@ -1,32 +1,13 @@
-// Database drivers and the `db` seam.
-//
-// Nova ships one data-access seam, `Connection` (from `data.db`), and several drivers that implement it:
-//
-//   NovaDB      import novadb;    let conn = NovaDriver().connect("novadb://user:pass@127.0.0.1:3009?db=shop");
-//   PostgreSQL  import postgres;  let conn = PgDriver().connect("postgresql://user:pass@127.0.0.1:5432/shop");
-//   MySQL       import mysql;     let conn = MyDriver().connect("mysql://user:pass@127.0.0.1:3306/shop");
-//   SQL Server  import mssql;     let conn = MssqlDriver().connect("mssql://user:pass@127.0.0.1:1433/shop");
-//   MongoDB     import mongodb;   (document API)
-//
-// Every SQL driver returns the same `ResultSet` of `Row`s, and the same micro-ORM (`data.orm`) binds
-// those rows into your typed structs. So the code below, written against the seam, works identically no
-// matter which driver produced the rows. Because `connect`/`query`/`exec` are async and need a live
-// server, this example demonstrates the part you can verify offline: building parameters, shaping a
-// `ResultSet` the way a driver would, and binding it into DTOs. `run-live.sh` runs the full loop against
-// a real NovaDB.
 import list;
 import assert;
 import data.db;
 import data.orm;
 
-// A DTO. `@serializable` makes the compiler generate the binder the ORM uses to map columns to fields.
 @serializable pub struct Product {
     pub id: int,
     pub name: string,
 }
 
-// Bind parameters are typed `DbValue`s, never string-concatenated into SQL. `$1`, `$2`, ... placeholders
-// in the SQL are filled from this list by the driver. This is identical across every driver.
 fn buildParams(): List<DbValue> {
     let params = List<DbValue>();
     params.push(db.dbInt(42));
@@ -34,7 +15,6 @@ fn buildParams(): List<DbValue> {
     return params;
 }
 
-// Shape a ResultSet exactly as a SQL driver would hand it back from `SELECT id, name FROM products`.
 fn sampleRows(): ResultSet {
     let rs = ResultSet();
     rs.columns.push(Column("id", DbType.Int4));
@@ -52,7 +32,6 @@ fn sampleRows(): ResultSet {
     return rs;
 }
 
-// Parameters carry their type, not just a value.
 @test
 fn typed_parameters(): void {
     let p = buildParams();
@@ -61,7 +40,6 @@ fn typed_parameters(): void {
     assert.equalStr((p.get(1) ?? db.dbNull()).asText(), "Keyboard");
 }
 
-// The ORM binds a whole result set into a typed list, mapping columns to fields by name.
 @test
 fn bind_all_rows(): void {
     let rows = sampleRows();
@@ -72,7 +50,6 @@ fn bind_all_rows(): void {
     assert.equalStr((products.get(1) ?? Product()).name, "Mouse");
 }
 
-// `bindOne` returns the first row as a DTO, or `undefined` when the result set is empty.
 @test
 fn bind_one_or_undefined(): void {
     let one = orm.bindOne<Product>(sampleRows());
@@ -89,7 +66,6 @@ fn bind_one_or_undefined(): void {
     assert.isTrue(none == undefined);
 }
 
-// A driver reads cells positionally too, when you do not want a DTO.
 @test
 fn positional_read(): void {
     let r = sampleRows().row(0);

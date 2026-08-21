@@ -1,36 +1,32 @@
-// Actor supervision (one-for-one restart) + a name registry. A supervised behavior FAULTS on a poison
-// message; the supervisor RESETS and restarts it (up to maxRestarts) instead of letting it die, and stops it
-// once the restart budget is exhausted. The registry resolves an actor's mailbox handle by name.
 import concurrency.actor;
 import assert;
 
 struct Counter impl SupervisedBehavior<int> {
     pub total: int,
     init() { self.total = 0; }
-    // Handle a message; a negative value is "poison" -> fault (return false).
     fn receive(self: Counter, msg: int): bool {
         if (msg < 0) { return false; }
         self.total = self.total + msg;
         return true;
     }
-    fn reset(self: Counter): void { self.total = 0; }   // restart: clear accumulated state
+    fn reset(self: Counter): void { self.total = 0; }
 }
 
 @test
 fn supervisor_restarts_on_fault(): void {
     let c = Counter{ total: 0 };
-    let sup = actor.Supervisor<int>(c, 2);   // allow up to 2 restarts
+    let sup = actor.Supervisor<int>(c, 2);
     assert.isTrue(sup.deliver(5));
     assert.equalInt(c.total, 5);
-    assert.isTrue(sup.deliver(-1));          // poison -> fault -> restart 1 (reset)
+    assert.isTrue(sup.deliver(-1));
     assert.equalInt(sup.restartCount(), 1);
-    assert.equalInt(c.total, 0);             // state was reset
-    assert.isTrue(sup.deliver(7));           // works again after restart
+    assert.equalInt(c.total, 0);
+    assert.isTrue(sup.deliver(7));
     assert.equalInt(c.total, 7);
-    assert.isTrue(sup.deliver(-1));          // restart 2
-    assert.isTrue(!sup.deliver(-1));         // budget (2) exhausted -> actor stopped
+    assert.isTrue(sup.deliver(-1));
+    assert.isTrue(!sup.deliver(-1));
     assert.isTrue(sup.isStopped());
-    assert.isTrue(!sup.deliver(1));          // stopped: rejects further messages
+    assert.isTrue(!sup.deliver(1));
 }
 
 @test

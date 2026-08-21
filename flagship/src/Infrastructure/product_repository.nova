@@ -1,8 +1,3 @@
-// Infrastructure — a repository backed by a REAL database driver fetched via `nova get`
-// (nova-postgres, declared in project.json). Programs against the `db` seam (Driver/Connection), so the
-// backend is swappable for any declared driver (nova-mysql / nova-mssql / nova-novadb / nova-mongodb).
-// Degrades gracefully: if the database is offline the query returns nothing and we fall back, so the app
-// runs with or without a live DB.
 
 import db;
 import postgres;
@@ -15,9 +10,6 @@ pub struct ProductRepository {
         self.dsn = dsn;
     }
 
-    // Look up a product name by id. Uses the fetched Postgres driver through the db seam. `async fn`:
-    // the connect + query PARK the request coroutine (non-blocking) instead of block-driving — so this
-    // is safe to `await` from inside a request handler (no nested nova_run_root, no deadlock).
     pub async fn productName(self: ProductRepository, id: int): string {
         let driver = PgDriver();
         let conn = await driver.connect(self.dsn);

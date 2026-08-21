@@ -1,9 +1,3 @@
-// examples/18_decimal.nova
-// `decimal` is exact base-10 arithmetic (IEEE 754-2008 decimal128, BID). Use it
-// for money and anything where 0.1 + 0.2 must be EXACTLY 0.3. Literals take an
-// `m` suffix: `0.1m`, `9.99m`, `100m`. All of `+ - * / %` and the six
-// comparisons work. There is NO implicit int<->decimal conversion; a bare `2`
-// mixed with a decimal is a compile error, so always write `2m`.
 import list;
 
 struct LineItem {
@@ -14,24 +8,19 @@ struct LineItem {
 }
 
 fn main(): void {
-    // The classic binary-float trap: with float, 0.1 + 0.2 is 0.30000000000000004.
-    // decimal is exact.
     let a: decimal = 0.1m;
     let b: decimal = 0.2m;
     console.log(`0.1m + 0.2m = ${a + b}`);
     console.log(`exact 0.3?  = ${a + b == 0.3m}`);
 
-    // The full operator set.
     console.log(`9.99m * 3m  = ${9.99m * 3m}`);
     console.log(`10m / 4m    = ${10m / 4m}`);
     console.log(`10m % 3m    = ${10m % 3m}`);
     console.log(`1.50m - 0.25m = ${1.50m - 0.25m}`);
 
-    // Comparisons.
     console.log(`0.1m < 0.2m  = ${a < b}`);
     console.log(`0.3m >= 0.3m = ${0.3m >= 0.3m}`);
 
-    // A money sum over line items: no rounding drift.
     let cart = list.List<LineItem>();
     cart.push(LineItem("coffee", 4.75m, 2));
     cart.push(LineItem("bagel", 3.25m, 1));
@@ -40,8 +29,7 @@ fn main(): void {
     let total: decimal = 0m;
     let i = 0;
     while (i < cart.size()) {
-        let item = cart.at(i);   // .at(i) returns a present LineItem (not optional)
-        // qty is an int, so convert it to a decimal; there is no implicit cast.
+        let item = cart.at(i);
         let line: decimal = item.price * intToDecimal(item.qty);
         total = total + line;
         i = i + 1;
@@ -49,9 +37,6 @@ fn main(): void {
     console.log(`cart total = ${total}`);
 }
 
-// There is no implicit int->decimal conversion, so fold an int into a decimal by
-// summing `1m` (kept tiny and honest for the guide). For real code the count
-// would already be a decimal.
 fn intToDecimal(n: int): decimal {
     let acc: decimal = 0m;
     let i = 0;

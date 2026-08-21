@@ -1,23 +1,11 @@
-// A1 async-first seam (Stage 1): `async fn` TRAIT methods + dynamic dispatch.
-//
-// A trait may declare a method `async`; its vtable slot then holds the impl's coroutine
-// RAMP. A call through the trait object dispatches dynamically and either DRIVES the handle
-// to completion (from a non-await context) or SUSPENDS on it (`await`, inside an async fn).
-// Sync trait methods coexist in the same trait. The impl's async-ness must match the trait's
-// (checked by the type checker — a mismatch is a compile error, see conformance/expect_fail).
-//
-// This is the compiler foundation the async-first DB `Connection` seam is built on: it lets
-// `Connection.query`/`exec` be `async fn`, so a driver's socket recv PARKS the coroutine
-// (asio arecv) instead of blocking the scheduler thread — while callers still program against
-// the polymorphic trait.
 import assert;
 import list;
 
 async fn triple(n: int): int { return n * 3; }
 
 trait Compute {
-    async fn work(self, x: int): int;   // async trait method
-    fn label(self): string;             // sync trait method alongside
+    async fn work(self, x: int): int;
+    fn label(self): string;
 }
 
 struct Adder impl Compute {
@@ -25,7 +13,7 @@ struct Adder impl Compute {
     init(base: int) { self.base = base; }
     pub async fn work(self: Adder, x: int): int {
         let f = spawn triple(x);
-        return self.base + (await f);   // await inside the async impl method
+        return self.base + (await f);
     }
     pub fn label(self: Adder): string { return "adder"; }
 }
@@ -39,7 +27,6 @@ struct Doubler impl Compute {
     pub fn label(self: Doubler): string { return "doubler"; }
 }
 
-// Await an async trait method through a trait-object parameter (dynamic dispatch).
 async fn run(c: Compute, v: int): int {
     return await c.work(v);
 }
@@ -48,57 +35,47 @@ async fn run(c: Compute, v: int): int {
 fn test_direct_drive_through_trait(): void {
     let a = Adder(100);
     let c: Compute = a;
-    // Direct (non-await) call of an async trait method from sync context: driven to completion.
-    assert.equalInt(c.work(5), 115);        // 100 + 5*3
-    assert.equalStr(c.label(), "adder");    // sync method coexists
+    assert.equalInt(c.work(5), 115);
+    assert.equalStr(c.label(), "adder");
 }
 
 @test
 fn test_await_through_trait_object(): void {
     let a = Adder(10);
-    assert.equalInt(run(a, 7), 31);         // 10 + 7*3, awaited via dynamic dispatch
+    assert.equalInt(run(a, 7), 31);
 }
 
 @test
 fn test_polymorphic_dispatch(): void {
-    // Same trait, two impls — dynamic dispatch selects the right async body.
     let d = Doubler(1);
     let a = Adder(1);
-    assert.equalInt(run(d, 20), 41);        // 1 + 20+20
-    assert.equalInt(run(a, 20), 61);        // 1 + 20*3
+    assert.equalInt(run(d, 20), 41);
+    assert.equalInt(run(a, 20), 61);
 }
 
-// Regression: an async fn taking a TRAIT parameter, AWAITED from another async fn (nested), must
-// widen a concrete-struct argument to a fat pointer at the ramp call site. The async ramp path
-// (awaitedCallHandle) previously skipped the trait widening the sync path does, so
-// `await useTrait(adder)` passed a raw struct pointer where useTrait expected a `Compute` — and
-// the trait dispatch inside then read a garbage vtable and the method silently never ran. This is
-// exactly the DB-seam shape (handler → await conn.query → await reader.recvInto over AsyncIO).
 async fn useTrait(c: Compute, v: int): int {
-    return await c.work(v);          // dispatch on a trait PARAM
+    return await c.work(v);
 }
 async fn nestedTraitArg(v: int): int {
     let a = Adder(1000);
-    return await useTrait(a, v);     // `a` (concrete) widened to `Compute` at the AWAITED call
+    return await useTrait(a, v);
 }
 
 @test
 fn test_nested_trait_param_widening(): void {
-    // Two async levels: test -> nestedTraitArg -> useTrait(trait param) -> c.work (dispatch).
-    assert.equalInt(nestedTraitArg(9), 1027);   // 1000 + 9*3
+    assert.equalInt(nestedTraitArg(9), 1027);
 }
 
 @test
 fn test_trait_objects_in_list(): void {
-    // Async trait methods dispatched over a homogeneous List<Compute>.
     let cs = List<Compute>();
-    cs.push(Adder(0));      // work(x) = 3x
-    cs.push(Doubler(0));    // work(x) = 2x
+    cs.push(Adder(0));
+    cs.push(Doubler(0));
     let total = 0;
     let i = 0;
     while (i < cs.size()) {
         let c = cs.get(i) ?? Adder(0);
-        total = total + c.work(4);   // 12 + 8 = 20
+        total = total + c.work(4);
         i = i + 1;
     }
     assert.equalInt(total, 20);

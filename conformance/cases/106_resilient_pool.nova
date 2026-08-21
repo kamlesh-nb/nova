@@ -1,10 +1,3 @@
-// D6: the ResilientPool — a connection Pool guarded by a circuit breaker. A flaky mock backend
-// (a shared flag toggles failure; a shared counter records how many times the backend was
-// actually touched) drives the breaker through its states deterministically:
-//   CLOSED --N failures--> OPEN (calls fast-fail, backend NOT touched)
-//   OPEN --cooldown--> HALF_OPEN (a probe passes) --M successes--> CLOSED
-// A failure is signalled by an empty command tag (no CommandComplete), exactly as the real
-// drivers leave it on a broken connection.
 import assert;
 import list;
 import string;
@@ -12,16 +5,13 @@ import db;
 import pool;
 import resilience.breaker;
 
-// Shared control block: a class (reference type) so the test, the driver, and every conn
-// see and mutate the same instance.
 class Flag {
     pub fail: bool,
-    pub calls: int,      // number of times the backend query/exec actually ran
+    pub calls: int,
     init() { self.fail = false; self.calls = 0; }
 }
 
 struct FlakyConn impl Connection {
-    // queryWire (trait): mocks use the generic fallback that re-encodes a ResultSet.
     async fn queryWire(self, sql: string, params: List<DbValue>): WireRows { return wireRowsFromResultSet(await self.query(sql, params)); }
     pub flag: Flag,
     pub prepared: List<string>,
@@ -30,7 +20,7 @@ struct FlakyConn impl Connection {
     pub async fn query(self, sql: string, params: List<DbValue>): ResultSet {
         self.flag.calls = self.flag.calls + 1;
         let rs = ResultSet();
-        if (self.flag.fail) { return rs; }        // empty tag => failure
+        if (self.flag.fail) { return rs; }
         rs.columns.push(Column("n", DbType.Int4));
         let r = Row();
         r.cells.push(db.dbInt(1));
@@ -41,7 +31,7 @@ struct FlakyConn impl Connection {
     }
     pub async fn exec(self, sql: string, params: List<DbValue>): ExecResult {
         self.flag.calls = self.flag.calls + 1;
-        if (self.flag.fail) { return ExecResult(0, ""); }   // empty tag => failure
+        if (self.flag.fail) { return ExecResult(0, ""); }
         return ExecResult(1, "OK");
     }
     pub fn close(self): void {}
@@ -70,14 +60,14 @@ struct FlakyDriver impl Driver {
 fn test_breaker_opens_after_threshold() : void {
     let flag = Flag();
     flag.fail = true;
-    let rp = ResilientPool(FlakyDriver(flag), "mock://x", 4, 3, 2, 1000);   // fail=3, cooldown=1s
+    let rp = ResilientPool(FlakyDriver(flag), "mock://x", 4, 3, 2, 1000);
 
     assert.equalInt(rp.state(), breaker.STATE_CLOSED);
     let p = List<DbValue>();
-    rp.query("SELECT 1", p);      // fail 1
-    rp.query("SELECT 1", p);      // fail 2
-    assert.isTrue(!rp.isOpen());   // still closed at 2 < 3
-    rp.query("SELECT 1", p);      // fail 3 -> OPEN
+    rp.query("SELECT 1", p);
+    rp.query("SELECT 1", p);
+    assert.isTrue(!rp.isOpen());
+    rp.query("SELECT 1", p);
     assert.isTrue(rp.isOpen());
     assert.equalInt(rp.state(), breaker.STATE_OPEN);
 }
@@ -86,35 +76,34 @@ fn test_breaker_opens_after_threshold() : void {
 fn test_open_fast_fails_without_touching_backend(): void {
     let flag = Flag();
     flag.fail = true;
-    let rp = ResilientPool(FlakyDriver(flag), "mock://x", 4, 2, 2, 100000);  // long cooldown
+    let rp = ResilientPool(FlakyDriver(flag), "mock://x", 4, 2, 2, 100000);
 
     let p = List<DbValue>();
-    rp.query("SELECT 1", p);      // fail 1
-    rp.query("SELECT 1", p);      // fail 2 -> OPEN
+    rp.query("SELECT 1", p);
+    rp.query("SELECT 1", p);
     assert.isTrue(rp.isOpen());
     let callsBefore = flag.calls;
 
-    let rs = rp.query("SELECT 1", p);          // should fast-fail
-    assert.equalStr(rs.tag, "CIRCUIT_OPEN");   // sentinel, not a real result
-    assert.equalInt(flag.calls, callsBefore);  // backend NOT touched while OPEN
+    let rs = rp.query("SELECT 1", p);
+    assert.equalStr(rs.tag, "CIRCUIT_OPEN");
+    assert.equalInt(flag.calls, callsBefore);
 }
 
 @test
 fn test_half_open_recovers_to_closed(): void {
     let flag = Flag();
     flag.fail = true;
-    let rp = ResilientPool(FlakyDriver(flag), "mock://x", 4, 2, 2, 0);   // cooldown 0 => probe next call
+    let rp = ResilientPool(FlakyDriver(flag), "mock://x", 4, 2, 2, 0);
 
     let p = List<DbValue>();
-    rp.query("SELECT 1", p);      // fail 1
-    rp.query("SELECT 1", p);      // fail 2 -> OPEN
+    rp.query("SELECT 1", p);
+    rp.query("SELECT 1", p);
     assert.isTrue(rp.isOpen());
 
-    // Backend healthy again; cooldown 0 lets a probe through (HALF_OPEN).
     flag.fail = false;
-    let r1 = rp.query("SELECT 1", p);   // probe #1 succeeds
+    let r1 = rp.query("SELECT 1", p);
     assert.equalStr(r1.tag, "SELECT 1");
-    let r2 = rp.query("SELECT 1", p);   // success #2 -> CLOSED
+    let r2 = rp.query("SELECT 1", p);
     assert.equalStr(r2.tag, "SELECT 1");
     assert.equalInt(rp.state(), breaker.STATE_CLOSED);
 }
@@ -123,12 +112,11 @@ fn test_half_open_recovers_to_closed(): void {
 fn test_failed_probe_reopens(): void {
     let flag = Flag();
     flag.fail = true;
-    let rp = ResilientPool(FlakyDriver(flag), "mock://x", 4, 1, 2, 0);   // fail=1, cooldown 0
+    let rp = ResilientPool(FlakyDriver(flag), "mock://x", 4, 1, 2, 0);
 
     let p = List<DbValue>();
-    rp.query("SELECT 1", p);      // fail 1 -> OPEN (threshold 1)
+    rp.query("SELECT 1", p);
     assert.isTrue(rp.isOpen());
-    // cooldown 0 -> next call probes (HALF_OPEN); still failing -> re-OPEN immediately.
     rp.query("SELECT 1", p);
     assert.isTrue(rp.isOpen());
 }
@@ -140,11 +128,11 @@ fn test_exec_also_guarded(): void {
     let rp = ResilientPool(FlakyDriver(flag), "mock://x", 4, 2, 2, 100000);
 
     let p = List<DbValue>();
-    rp.exec("UPDATE t SET a=1", p);   // fail 1
-    rp.exec("UPDATE t SET a=1", p);   // fail 2 -> OPEN
+    rp.exec("UPDATE t SET a=1", p);
+    rp.exec("UPDATE t SET a=1", p);
     assert.isTrue(rp.isOpen());
     let callsBefore = flag.calls;
     let ex = rp.exec("UPDATE t SET a=1", p);
     assert.equalStr(ex.tag, "CIRCUIT_OPEN");
-    assert.equalInt(flag.calls, callsBefore);   // fast-fail, backend untouched
+    assert.equalInt(flag.calls, callsBefore);
 }

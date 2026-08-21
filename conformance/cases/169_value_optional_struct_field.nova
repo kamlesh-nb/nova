@@ -1,15 +1,8 @@
-// A value-optional (`int | undefined`, `Enum | undefined` where Enum is payload-less) stored in a
-// STRUCT FIELD was never BOXED at the store, so a present zero / tag-0 wrote as 0 and read back as
-// `undefined` — the struct-field sibling of the V1 value-optional boxing that let/return/?? already
-// had (gate 168 fixed the enum case for locals/containers; this closes the field stores). Two store
-// paths were missing the box: the `.assign` field path (`self.n = 0`, ctor or reassignment) and the
-// struct-LITERAL path (`Lit { n: 0 }`). Applies to prims AND payload-less enums; payload-carrying
-// enums are non-null heap boxes and are left as plain pointer optionals.
 
 import assert;
 
 enum Flag {
-    Off,                                    // tag 0 — the sentinel collision
+    Off,
     On,
     pub fn b(self: Flag): bool {
         switch (self) { case Flag.Off: { return false; } case Flag.On: { return true; } }
@@ -20,7 +13,7 @@ enum Flag {
 struct Counter {
     pub n: int | undefined,
     pub f: Flag | undefined,
-    init() { self.n = 0; self.f = Flag.Off; }   // present ZERO / tag-0 via ctor assignment
+    init() { self.n = 0; self.f = Flag.Off; }
 }
 
 struct Lit {
@@ -31,8 +24,8 @@ struct Lit {
 @test
 fn test_ctor_assign_present_zero(): void {
     let c = Counter();
-    assert.equalInt(c.n ?? 99, 0);          // present 0 must NOT fall through to 99
-    assert.isTrue((c.f ?? Flag.On).b() == false);   // present Off(tag 0)
+    assert.equalInt(c.n ?? 99, 0);
+    assert.isTrue((c.f ?? Flag.On).b() == false);
 }
 
 @test
@@ -40,19 +33,19 @@ fn test_reassign_zero_then_absent(): void {
     let c = Counter();
     c.n = 5;
     assert.equalInt(c.n ?? 99, 5);
-    c.n = 0;                                 // reassign to present zero
+    c.n = 0;
     assert.equalInt(c.n ?? 99, 0);
-    c.n = undefined;                         // now genuinely absent
+    c.n = undefined;
     assert.equalInt(c.n ?? 99, 99);
     c.f = Flag.On;
     assert.isTrue((c.f ?? Flag.Off).b() == true);
-    c.f = Flag.Off;                          // present tag-0 again
+    c.f = Flag.Off;
     assert.isTrue((c.f ?? Flag.On).b() == false);
 }
 
 @test
 fn test_struct_literal_present_zero(): void {
-    let l = Lit { n: 0, f: Flag.Off };       // struct-LITERAL present zero / tag-0
+    let l = Lit { n: 0, f: Flag.Off };
     assert.equalInt(l.n ?? 99, 0);
     assert.isTrue((l.f ?? Flag.On).b() == false);
 }
@@ -61,5 +54,5 @@ fn test_struct_literal_present_zero(): void {
 fn test_struct_literal_absent(): void {
     let l = Lit { n: undefined, f: undefined };
     assert.equalInt(l.n ?? 99, 99);
-    assert.isTrue((l.f ?? Flag.On).b() == true);   // absent -> On
+    assert.isTrue((l.f ?? Flag.On).b() == true);
 }

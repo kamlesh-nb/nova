@@ -6,39 +6,21 @@ import web.response;
 import web.status;
 import web.di;
 
-// The runtime mediator (MediatR-parity). This module IS the framework: the registry, `send`, the
-// behaviour pipeline, per-request DI scopes, and validation all live here in ordinary Nova. The
-// compiler only generates thin per-type glue (a widen `Q__asMessage`, a handler adapter `Q__Adapter`, a
-// validator adapter, and the registration) because those need the concrete request/response types.
-//
-// Dispatch is by request TYPE. The request travels erased as a `Message` trait object (never `any`,
-// which corrupts heap structs). `send` looks the handler up by the request's type name, opens a scope,
-// runs the behaviour chain terminating in the handler adapter, and returns a Response.
 
-// The erased carrier. Every request type implements it (the compiler records the impl).
 pub trait Message {}
 
-// A per-type validator the developer writes: typed over its request. The compiler generates an erased
-// ValidatorAdapter for it (downcast + call) and auto-registers it, like handlers.
 pub trait Validator<TReq> {
     fn validate(self: Validator<TReq>, req: TReq): List<string>;
 }
 
-// The erased validator the runtime stores: takes the request as a Message and returns the errors (empty
-// = valid). The compiler-generated adapter downcasts the Message to the concrete request type.
 pub trait ValidatorAdapter {
     fn validate(self: ValidatorAdapter, req: Message): List<string>;
 }
 
-// The compiler-generated adapter for one handler: downcast the request, resolve the handler and its
-// dependencies from the scope, run it, serialise the response.
 pub trait HandlerAdapter {
     async fn execute(self: HandlerAdapter, ctx: RequestContext): response.Response;
 }
 
-// What a behaviour and the terminal adapter receive: the erased request, its type key, the per-request
-// DI scope (shared by behaviours and the handler, so a transaction behaviour and the handler use one
-// connection), the marker traits the request type implements, and the validator registry.
 pub struct RequestContext {
     pub request: Message,
     pub requestType: string,
@@ -54,8 +36,6 @@ pub struct RequestContext {
         self.validators = validators;
     }
 
-    // Whether the request type carries a marker trait (e.g. "Cacheable"). Handler-specific behaviours
-    // opt in on the request via a marker instead of per-type registration.
     pub fn requestIs(self: RequestContext, marker: string): bool {
         let i = 0;
         while (i < self.markers.size()) {
@@ -80,9 +60,6 @@ struct NoBehavior impl PipelineBehavior {
     }
 }
 
-// The continuation handed to a behaviour: runs the next behaviour, or the terminal adapter once the
-// behaviours are exhausted. It is an object (not a closure) because `proceed` is async and a Nova
-// closure cannot await.
 pub struct Next {
     pub behaviors: List<PipelineBehavior>,
     pub idx: int,
@@ -129,7 +106,6 @@ pub struct Mediator {
         self.provider = provider;
     }
 
-    // Registration (the compiler generates calls to these; the developer registers behaviours).
     pub fn register(self: Mediator, key: string, adapter: HandlerAdapter, markers: List<string>): void {
         self.handlers.set(key, HandlerEntry(adapter, markers));
     }
@@ -146,7 +122,6 @@ pub struct Mediator {
         self.provider = provider;
     }
 
-    // The first-class runtime dispatch. `req` is the already-widened request, `key` its type name.
     pub async fn send(self: Mediator, req: Message, key: string): response.Response {
         let scope = self.provider.createScope();
         let entry = self.handlers.get(key);
@@ -163,8 +138,6 @@ pub struct Mediator {
     }
 }
 
-// The one generic validation behaviour: resolve the per-type validator for the current request and
-// short-circuit with a 400 on failure, else continue. Registered once with `app.useBehavior`.
 pub struct ValidationBehavior impl PipelineBehavior {
     async fn handle(self: ValidationBehavior, ctx: RequestContext, next: Next): response.Response {
         let v = ctx.validatorFor(ctx.requestType);
@@ -182,8 +155,6 @@ struct NullValidator impl ValidatorAdapter {
     fn validate(self: NullValidator, req: Message): List<string> { return List<string>(); }
 }
 
-// Response helpers. A handler builds a typed DTO and the framework serialises it, but these are handy
-// for a handler that wants to shape a Response directly (an error page, a redirect body, HTML).
 pub fn text(body: string): response.Response {
     let r = response.Response(Status.Ok, body);
     r.setHeader("Content-Type", "text/plain; charset=utf-8");
@@ -202,9 +173,6 @@ pub fn json(body: string): response.Response {
     return r;
 }
 
-// Server-Sent Events body (text/event-stream) — the content-type Datastar patches ride on. `body` is the
-// pre-built SSE frames (e.g. from a datastar BufferSink). A handler returning this via the raw-response
-// escape hatch (its result type is `Response`) drives Datastar over ordinary request/response fetches.
 pub fn sse(body: string): response.Response {
     let r = response.Response(Status.Ok, body);
     r.setHeader("Content-Type", "text/event-stream");

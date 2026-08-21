@@ -1,15 +1,6 @@
-// Gates ARC correctness for RETURNING a tuple that holds refcounted (heap) elements.
-// A tuple is a heap box that stored each element's word RAW without the box owning it,
-// so a returned tuple's elements — owned locals or temporaries produced inside the
-// callee — were freed at the callee's scope exit while the escaping box still pointed
-// at them. The result was intermittent corruption (garbage / crash depending on
-// allocator reuse). String LITERALS survived only because they are static. Fixed by
-// retaining each refcounted tuple element at the return boundary. See also
-// web/request.nova (Request.fromString), whose splitPathQuery/parseHeader hit this.
 import assert;
 import string;
 
-// Both elements are COMPUTED (ARC-managed) strings, not literals — the failing case.
 fn splitOnColon(line: string): (string, string) {
     let idx = string.indexOf(line, ":");
     let key = string.slice(line, 0, idx);
@@ -17,7 +8,6 @@ fn splitOnColon(line: string): (string, string) {
     return (key, val);
 }
 
-// Mixed heap + scalar, and the heap element is a local produced by a call.
 fn headAndLen(s: string): (string, int) {
     let head = string.slice(s, 0, 3);
     return (head, s.length);
@@ -39,7 +29,6 @@ fn test_heap_and_scalar(): void {
 
 @test
 fn test_repeated_calls_no_corruption(): void {
-    // Calling in a loop stresses allocator reuse — the intermittent failure mode.
     let i = 0;
     while (i < 20) {
         let (k, v) = splitOnColon("A:B");
@@ -49,20 +38,7 @@ fn test_repeated_calls_no_corruption(): void {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The paths the OLD syntactic guard missed (2026-07-17).
-//
-// The return-boundary retain was guarded on `v.kind == .tuple`, so it fired ONLY for a
-// tuple LITERAL in return position. Every other way of producing the same box got no
-// retain and returned elements the callee had already freed. Ownership is now a property
-// of the BOX — it retains its elements at construction and releases them in
-// `__destruct_tuple_*` — so these are correct for the same reason the literal is.
-//
-// Verified failing before the change: this exact function returned
-// `Expected "Host", got "\xef..."`.
-// ---------------------------------------------------------------------------
 
-// `return t` is `.ident`, NOT `.tuple` — one extra binding was a use-after-free.
 fn splitVia(line: string): (string, string) {
     let idx = string.indexOf(line, ":");
     let key = string.slice(line, 0, idx);
@@ -74,7 +50,7 @@ fn splitVia(line: string): (string, string) {
 @test
 fn test_return_tuple_via_local(): void {
     let i = 0;
-    while (i < 20) {          // loop: an alloca reused per iteration is where leaks show
+    while (i < 20) {
         let (k, v) = splitVia("Host:example.com");
         assert.equalStr(k, "Host");
         assert.equalStr(v, "example.com");
@@ -82,10 +58,9 @@ fn test_return_tuple_via_local(): void {
     }
 }
 
-// A tuple built from another tuple's elements — the box outlives both callees.
 fn reSplit(line: string): (string, string) {
     let (a, b) = splitVia(line);
-    let t = (b, a);           // swapped, rebuilt from destructured (owned) locals
+    let t = (b, a);
     return t;
 }
 

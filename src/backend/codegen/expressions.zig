@@ -1,53 +1,154 @@
+//! Expression lowering for the LLVM backend: the half of codegen that turns a
+//! Nova `ast.Expression` into an `LLVMValueRef`.
+//!
+//! Every function here is a free function whose first parameter is
+//! `self: *LlvmCompiler`; they are mixed into [`LlvmCompiler`] (defined in
+//! `llvm_codegen.zig`) by `usingnamespace`, so `self.compileExpression(...)`
+//! resolves to the code in this file. The split exists purely to keep the
+//! backend readable: `statements.zig` lowers control flow, `declarations.zig`
+//! lowers functions/structs, `arc.zig` owns retain/release, `types.zig` owns
+//! the type/layout queries, and this file owns value-producing expressions.
+//!
+//! The single load-bearing entry point is [`compileExpression`], which wraps
+//! the exhaustive dispatch [`compileExpressionInner`] (the ~2800-line
+//! `switch (expr.kind)` that has one arm per AST node kind). The wrapper is
+//! where ownership tracking lives: after computing a value it consults the
+//! ownership pass and, for a value it now OWNS, spills the result to a stack
+//! slot and records a [`LlvmCompiler.PendingTemp`] so [`drainTemporaries`] can
+//! release it at the end of the enclosing statement. This is how ARC temporary
+//! cleanup is threaded through expression evaluation without the caller having
+//! to remember anything.
+//!
+//! Two representation decisions pervade this file and explain most of the
+//! `IntToPtr`/`PtrToInt` churn:
+//!
+//!   - Every Nova value is carried in a single machine word, `self.val_type`
+//!     (i64 native, i32 on wasm). Heap objects are addresses stored in that
+//!     word; primitives are the value sign/zero-extended into it. Pointer
+//!     arithmetic is therefore done on the integer and cast back to a pointer
+//!     only at the load/store. Because the word is 64-bit but `int` is 32-bit,
+//!     any address held in an `int` truncates: addresses must stay in the word.
+//!
+//!   - A `struct` is a VALUE type stored inline (raw bytes), whereas a `class`
+//!     (and any escape-set struct) is a reference. The value-struct helpers at
+//!     the top of the file ([`buildValueStructStorage`],
+//!     [`buildValueStructCopy`], [`retainValueStructOwnedFields`],
+//!     [`buildValueStructCopyInto`]) implement value semantics: a copy is a
+//!     byte copy PLUS a deep retain of any owned/container fields the struct
+//!     transitively holds, so ARC refcounts stay balanced across the copy.
+//!     This mirrors the let-binding copy path and is the subtle correctness
+//!     core of value structs.
+//!
+//! The file also carries several self-contained lowerings that could live
+//! elsewhere but are expression-shaped: `async`/`await` (LLVM coroutine
+//! suspend points, `spawn`, channel receive, `whenAny`), SIMD/crypto
+//! intrinsics ([`compileSimdCall`], [`compileIntSimd`], [`compileClmul64`],
+//! [`compileAesRound`]), unaligned/endian memory access ([`compileMemCall`]),
+//! JSX/hypermedia string building ([`emitJsxInto`]), and the typed NovaDB
+//! query row decoder ([`compileNovaQuery`], [`compileDecodeBinaryRow`]).
+//!
+//! When `NOVA_SEMA_SHADOW` reporting is on, the temporary-tracking helpers
+//! ([`diffTempOp`], [`diffDtorName`]) additionally cross-check codegen's own
+//! move/drop and destructor-name decisions against the typed IR's ownership
+//! pass, accumulating agree/disagree counters in `sema_shadow`. That machinery
+//! is diagnostic only and never changes emitted code.
+
+/// The Zig standard library, used here for `std.mem` slice utilities,
+/// formatting/allocation, and `ArrayListUnmanaged`.
 const std = @import("std");
+/// The Nova abstract syntax tree; every function here consumes
+/// `ast.Expression`/`ast.TypeRef` and friends as its input.
 const ast = @import("../../frontend/ast.zig");
+/// The Zig binding to the LLVM-C API; `llvm.types` and `llvm.core` are the two
+/// namespaces this file leans on for `LLVMValueRef`/`LLVMTypeRef` and the IR
+/// builder functions respectively.
 const llvm = @import("llvm");
+/// LLVM opaque handle types (`LLVMValueRef`, `LLVMTypeRef`, `LLVMBasicBlockRef`,
+/// the `LLVMIntPredicate` enum, ...).
 const types = llvm.types;
+/// The LLVM-C core builder API (`LLVMBuild*`, `LLVMConst*`, block/function
+/// construction) used to emit every instruction in this file.
 const core = llvm.core;
 
+/// The backend compiler state these free functions extend; each function takes
+/// `self: *LlvmCompiler`, and the type mixes this file's functions in via
+/// `usingnamespace` so they appear as methods.
 const LlvmCompiler = @import("llvm_codegen.zig").LlvmCompiler;
+/// Shadow-verification globals and helpers. Provides `live_sema`,
+/// `renderLegacy` (TypeId to legacy mangled name), and the agree/disagree
+/// counters that [`diffTempOp`]/[`diffDtorName`] bump under `NOVA_SEMA_SHADOW`.
 const sema_shadow = @import("../../frontend/sema/shadow.zig");
+/// The ownership-inference pass; [`sema_infer.OwnOp`] is the move/drop decision
+/// that codegen's temporary tracking is diffed against.
 const sema_infer = @import("../../frontend/sema/infer.zig");
+/// The typed-IR type system; [`sema_types.TypeId`] indexes into the type store
+/// used throughout for concrete-type queries.
 const sema_types = @import("../../frontend/types.zig");
+/// Backend type/layout utilities: primitive classification (`cgPrim`),
+/// mangling (`mangleTypeName`), value-optional detection (`valueOptionalName`),
+/// and bit-width helpers.
 const types_mod = @import("types.zig");
+/// Strips generic arguments from a rendered type name (`List<int>` -> `List`),
+/// used constantly to key into `self.structs`/`self.traits` by base name.
 const getStructBaseName = @import("types.zig").getStructBaseName;
+/// ARC helper predicate re-exported for local use: whether a name already
+/// denotes an existing owner (so a fresh retain would be redundant).
 const namesExistingOwner = @import("arc.zig").namesExistingOwner;
+/// Re-export of the closure-id allocator on [`LlvmCompiler`], used when
+/// synthesising unique names for lambda thunks and environments.
 const getClosureUniqueId = LlvmCompiler.getClosureUniqueId;
+/// Decodes source-level string escapes into their byte values for string
+/// literals.
 const unescapeString = @import("llvm_codegen.zig").unescapeString;
+/// Metadata describing the function currently being compiled (name, params,
+/// return type, body); a synthetic one is fabricated in [`emitJsxInto`] to
+/// lower statements embedded inside JSX.
 const FunctionInfo = @import("llvm_codegen.zig").FunctionInfo;
+/// A lexical scope handle from the codegen driver (unused re-export kept for
+/// symmetry with sibling codegen files).
 const Scope = @import("llvm_codegen.zig").Scope;
 
-// M-1: inline (stack) storage for a value struct. Allocates `size` bytes as an i8 array on the
-// stack and returns its address as an i64 (the same representation a heap struct pointer uses), so
-// field writes/reads at 0-based offsets are identical to the heap path. No ARC header is reserved:
-// a value struct is never retained/released/freed (isOwnedTypeId returns false for it).
+/// Allocates a zero-initialised stack slot to hold a value struct's inline
+/// bytes and returns its ADDRESS as an integer in `self.val_type`.
+///
+/// A value struct lives inline, so its storage is a byte array (`[size]i8`,
+/// with a floor of 8 bytes for a zero-size struct so the address is always
+/// distinct and non-null). The alloca is stored back as an integer address
+/// because every Nova value travels in the machine word; callers do pointer
+/// arithmetic on that integer. See [`buildValueStructCopy`] for the
+/// storage-plus-copy variant.
 pub fn buildValueStructStorage(self: *LlvmCompiler, size: u32) anyerror!types.LLVMValueRef {
     const n: c_uint = if (size == 0) 8 else @intCast(size);
     const arr_t = core.LLVMArrayType(self.i8_type, n);
     const a = core.LLVMBuildAlloca(self.builder, arr_t, "vstruct");
-    // Zero-init: a heap struct's fresh memory is zeroed, so an owned field's init assignment (which
-    // "releases the old value" before storing the new) sees old = null (a no-op). A raw alloca is
-    // garbage, so without this the first owned-field write would nova_release a junk pointer (SIGSEGV).
     _ = core.LLVMBuildStore(self.builder, core.LLVMConstNull(arr_t), a);
     return core.LLVMBuildPtrToInt(self.builder, a, self.val_type, "vstruct_addr");
 }
 
-// M-1 copy-on-assign: `let b = a` for a value struct must give `b` its own storage with `a`'s bytes
-// copied in (value semantics), not alias `a`. Allocates fresh stack storage and memcpies `size`
-// bytes from `src` via nova_bytes_copy, returning the new address.
-// M-1 owned-field value structs: after a value struct's bytes are byte-copied, each OWNED
-// (reference) field is now aliased by two structs, so the copy must RETAIN it -- otherwise the
-// destination's later field-drop (or the source's) double-frees. Walks the struct's fields and
-// retains every owned one at the destination address `structAddr`.
+/// Deep-retains every heap-owning field of a freshly byte-copied value struct
+/// so ARC refcounts stay balanced across the copy.
+///
+/// After [`buildValueStructCopyInto`] duplicates the raw bytes, both the source
+/// and destination point at the SAME owned/container payloads. This walks the
+/// struct's fields and, for each container/owned/nested-value-struct field,
+/// bumps the shared payload's refcount (or clones a container via its `copy`
+/// method), so dropping either struct later is sound. This is the correctness
+/// core of value-struct copies; forgetting it is a use-after-free. Entry point
+/// that starts the recursion at depth 0; see
+/// [`retainValueStructOwnedFieldsDepth`].
 pub fn retainValueStructOwnedFields(self: *LlvmCompiler, structAddr: types.LLVMValueRef, struct_name: []const u8) anyerror!void {
     try retainValueStructOwnedFieldsDepth(self, structAddr, struct_name, 0);
 }
 
-// Retain the owned references reachable from a value-struct copy. A DIRECTLY-owned field (a `string`,
-// a class reference, ...) is loaded and retained. A nested VALUE-STRUCT field is stored INLINE, so we
-// recurse into it AT ITS FIELD ADDRESS (no load) to retain ITS owned leaves -- otherwise a copy of
-// `Outer{inner:S{data:string}}` shares `S.data` without a reference and both copies free it (double-free
-// / heap-use-after-free). Mirrors the struct destructor's inline-field recursion. Depth-guarded against a
-// (layout-impossible, validated separately) by-value cycle.
+/// Depth-bounded recursion behind [`retainValueStructOwnedFields`].
+///
+/// For each field at its computed offset: a `List`/`Map`/`Set` field is either
+/// retained (when its element type mentions a type parameter, so the concrete
+/// copy fn is unknown) or deep-cloned via its monomorphised `copy` function and
+/// stored back; a declared owned field is retained; a nested VALUE struct is
+/// recursed into in place. The `depth > 64` guard prevents runaway recursion on
+/// pathological/self-referential type graphs. Fields that fail a lookup are
+/// skipped rather than aborting the whole copy.
 fn retainValueStructOwnedFieldsDepth(self: *LlvmCompiler, structAddr: types.LLVMValueRef, struct_name: []const u8, depth: u32) anyerror!void {
     if (depth > 64) return;
     const base = getStructBaseName(struct_name);
@@ -57,19 +158,9 @@ fn retainValueStructOwnedFieldsDepth(self: *LlvmCompiler, structAddr: types.LLVM
         const off = self.getFieldOffset(base, fld.name) catch continue;
         const addr = core.LLVMBuildAdd(self.builder, structAddr, core.LLVMConstInt(self.val_type, off, 0), "vs_ofld_addr");
         const fbase = getStructBaseName(fts);
-        // Channel 4: a CONTAINER field (List/Map/Set) is a pointer to a heap container the byte-copy now
-        // SHARES. For value semantics, DEEP-COPY it via its monomorphised `copy` and store the fresh pointer
-        // INSTEAD of retaining the shared one (no retain -> the ledger balances: source and copy each own an
-        // independent container). If `copy` was not emitted (not reachable), fall back to a retain-alias.
         if (isContainerBaseName(fbase)) {
             const ptr = core.LLVMBuildIntToPtr(self.builder, addr, core.LLVMPointerType(self.val_type, 0), "vs_cfld_ptr");
             const cur = core.LLVMBuildLoad2(self.builder, self.val_type, ptr, "vs_cfld");
-            // A container field whose element type is STILL an unsubstituted type parameter of this struct
-            // (`List<T>` in a `Box<T>` instantiated in ANOTHER module -- cross-module mono does not substitute
-            // the value-struct field type). Its monomorphised `copy` cannot be resolved, and looking one up by
-            // the `<T>` name returns a garbage function ref that crashes `LLVMGlobalGetValueType`. Fall back to
-            // a retain-alias: the copy SHARES the container. That is safe (no crash) and, for a shared/handle-
-            // style generic struct such as an async channel, is exactly the intended semantics.
             if (fieldTypeMentionsTypeParam(fts, sd.type_params)) {
                 try self.compileRetain(cur);
             } else if (findContainerCopyFn(self, fts)) |copy_fn| {
@@ -85,7 +176,6 @@ fn retainValueStructOwnedFieldsDepth(self: *LlvmCompiler, structAddr: types.LLVM
             const fv = core.LLVMBuildLoad2(self.builder, self.val_type, ptr, "vs_ofld");
             try self.compileRetain(fv);
         } else {
-            // A nested value-struct field: recurse at the inline address to retain its owned leaves.
             if (fbase.len != 0 and self.isValueStructName(fbase)) {
                 try retainValueStructOwnedFieldsDepth(self, addr, fts, depth + 1);
             }
@@ -93,19 +183,26 @@ fn retainValueStructOwnedFieldsDepth(self: *LlvmCompiler, structAddr: types.LLVM
     }
 }
 
+/// Whether a struct base name is one of the built-in owning containers
+/// (`List`/`Map`/`Set`), which need clone-on-copy rather than a plain retain.
 fn isContainerBaseName(name: []const u8) bool {
     return std.mem.eql(u8, name, "List") or std.mem.eql(u8, name, "Map") or std.mem.eql(u8, name, "Set");
 }
 
-// Channel 4: look up the monomorphised container `copy` function for a field type like "List<int>"
-// (mangled `List_i32_copy`, `self -> self`). Null if it was not emitted (not reachable).
+/// Whether `c` can appear inside an identifier, used by
+/// [`fieldTypeMentionsTypeParam`] to enforce whole-word matches.
 fn vscIsIdentChar(c: u8) bool {
     return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';
 }
 
-// True when `fts` (a rendered field type like "List<T>") mentions one of `type_params` as a WHOLE token --
-// i.e. the field's element type is still an unsubstituted type parameter of the owning struct. Whole-token
-// matching (boundary-checked) so a param "T" does not spuriously match inside another identifier.
+/// Whether a rendered field-type string references any of the struct's type
+/// parameters as a WHOLE identifier.
+///
+/// Used to decide whether a container field can be cloned via a known concrete
+/// `copy` function or must fall back to a bare retain: if the element type is
+/// still generic (mentions e.g. `T`), no monomorphised copy fn exists yet. The
+/// whole-word check (via [`vscIsIdentChar`] on both sides of the match) avoids
+/// matching `T` inside `Type`.
 fn fieldTypeMentionsTypeParam(fts: []const u8, type_params: []const []const u8) bool {
     for (type_params) |tp| {
         if (tp.len == 0) continue;
@@ -121,6 +218,13 @@ fn fieldTypeMentionsTypeParam(fts: []const u8, type_params: []const []const u8) 
     return false;
 }
 
+/// Looks up the monomorphised `copy` function for a concrete container field
+/// type (e.g. `List<int>`), returning the LLVM function or null if absent.
+///
+/// Resolves the mangled `<Type>_copy` symbol via [`LlvmCompiler.methodSymbol`]
+/// and asks the module for it by name. A null result means the concrete
+/// instantiation was not emitted, in which case the caller retains instead of
+/// cloning.
 fn findContainerCopyFn(self: *LlvmCompiler, field_type: []const u8) ?types.LLVMValueRef {
     const sym = self.methodSymbol(field_type, "copy") catch return null;
     defer self.allocator.free(sym);
@@ -129,8 +233,15 @@ fn findContainerCopyFn(self: *LlvmCompiler, field_type: []const u8) ?types.LLVMV
     return core.LLVMGetNamedFunction(self.module, symz);
 }
 
-// M-10/M-1: memcpy `size` bytes from `src` into an EXISTING destination address `dst` (e.g. a
-// container slot), via nova_bytes_copy. Returns dst.
+/// Byte-copies `size` bytes of a value struct from `src` to a caller-provided
+/// destination `dst` via the runtime `nova_bytes_copy`, returning `dst`.
+///
+/// This copies the raw inline bytes ONLY; it does not adjust refcounts, so
+/// callers that want value semantics must follow it with
+/// [`retainValueStructOwnedFields`]. A zero-size struct is treated as 8 bytes
+/// to match [`buildValueStructStorage`]. The `nova_bytes_copy` declaration is
+/// lazily created and cached in `func_map` on first use. Compare
+/// [`buildValueStructCopy`], which also allocates the destination.
 pub fn buildValueStructCopyInto(self: *LlvmCompiler, dst: types.LLVMValueRef, src: types.LLVMValueRef, size: u32) anyerror!types.LLVMValueRef {
     const copy_fn = if (self.func_map.get("nova_bytes_copy")) |f| f else blk: {
         var at = [_]types.LLVMTypeRef{ self.val_type, self.val_type, self.val_type };
@@ -146,9 +257,13 @@ pub fn buildValueStructCopyInto(self: *LlvmCompiler, dst: types.LLVMValueRef, sr
     return dst;
 }
 
-// Channel 6a / Design B: if `tid` is an optional whose inner is a declared VALUE struct, return the
-// struct's base name; else null. Such an optional keeps the heap-pointer layout (null = absent), so
-// `== undefined` is unchanged -- but a copy must DEEP-COPY the payload for value semantics.
+/// If `tid` is `Optional<S>` where `S` is a value struct, returns `S`'s base
+/// name; otherwise null.
+///
+/// Used to detect the case where an optional wraps an inline struct, which
+/// needs the branchy deep copy of [`buildOptionalStructDeepCopy`] rather than a
+/// plain word copy. A reference struct (`is_reference`) returns null because it
+/// is copied by pointer.
 pub fn optionalInnerValueStructName(self: *LlvmCompiler, tid: sema_types.TypeId) ?[]const u8 {
     const st = self.type_store orelse return null;
     if (st.get(tid) != .optional) return null;
@@ -157,15 +272,19 @@ pub fn optionalInnerValueStructName(self: *LlvmCompiler, tid: sema_types.TypeId)
     const nm = sema_shadow.renderLegacy(self.allocator, st, inner) catch return null;
     const base = getStructBaseName(nm);
     const sd = self.structs.get(base) orelse return null;
-    if (sd.is_reference) return null; // only value-type structs; a `class` inner keeps reference semantics
+    if (sd.is_reference) return null;
     return base;
 }
 
-// Channel 6a / Design B: value-semantic copy of an optional-of-value-struct. `src` is the payload
-// pointer (null = absent). If present, allocate a FRESH heap object, copy the struct bytes, and
-// transitively retain its owned fields (so the copy owns its own references); if absent, pass null
-// through. The result is independent of `src` (mutating one does not affect the other), and each side's
-// scope-end drop is balanced. Layout is unchanged (still a pointer), so `== undefined` is untouched.
+/// Deep-copies an optional-of-value-struct, guarding on presence, and returns
+/// the copied handle (or the original null word when absent).
+///
+/// When an optional carries an inline struct, "present" is represented by a
+/// heap pointer and "absent" by a null word. This emits a diamond: on the
+/// present branch it allocates fresh storage, byte-copies the struct, and deep
+/// retains owned fields (via [`buildHeapStructDeepCopy`]'s steps); on the absent
+/// branch it passes the null through; a phi merges them. Needed so copying an
+/// optional value struct does not alias the original's owned payloads.
 pub fn buildOptionalStructDeepCopy(self: *LlvmCompiler, src: types.LLVMValueRef, base: []const u8) anyerror!types.LLVMValueRef {
     const size = self.getTypeSize(ast.TypeRef{ .ident = getStructBaseName(base) }, false);
     const cur_fn = core.LLVMGetBasicBlockParent(core.LLVMGetInsertBlock(self.builder));
@@ -193,9 +312,13 @@ pub fn buildOptionalStructDeepCopy(self: *LlvmCompiler, src: types.LLVMValueRef,
     return phi;
 }
 
-// Channels 1/3/5 / Design B: value-semantic copy of a heap-resident (escape-excluded) PURE value struct.
-// The struct is always present (unlike an optional), so: allocate a fresh heap object, copy the bytes, and
-// transitively retain the owned fields. Returns the fresh pointer, independent of `src`.
+/// Allocates a fresh heap copy of a value struct and deep-retains its owned
+/// fields, returning the new address.
+///
+/// The unconditional (non-optional) counterpart to
+/// [`buildOptionalStructDeepCopy`]: `compileAlloc` + [`buildValueStructCopyInto`]
+/// + [`retainValueStructOwnedFields`]. Used when a value struct needs an
+/// independent heap-resident copy whose lifetime is managed by ARC.
 pub fn buildHeapStructDeepCopy(self: *LlvmCompiler, src: types.LLVMValueRef, base: []const u8) anyerror!types.LLVMValueRef {
     const size = self.getTypeSize(ast.TypeRef{ .ident = getStructBaseName(base) }, false);
     const new_ptr = try self.compileAlloc(core.LLVMConstInt(self.val_type, if (size == 0) 8 else size, 0));
@@ -204,6 +327,12 @@ pub fn buildHeapStructDeepCopy(self: *LlvmCompiler, src: types.LLVMValueRef, bas
     return new_ptr;
 }
 
+/// Copies a value struct into a NEW stack slot and returns its address.
+///
+/// Combines [`buildValueStructStorage`] with a `nova_bytes_copy`. Unlike
+/// [`buildHeapStructDeepCopy`] this allocates on the stack and does NOT retain
+/// owned fields, so it is for short-lived by-value struct values whose owned
+/// payloads are handled by the caller's ownership bookkeeping.
 pub fn buildValueStructCopy(self: *LlvmCompiler, src: types.LLVMValueRef, size: u32) anyerror!types.LLVMValueRef {
     const dst = try self.buildValueStructStorage(size);
     const copy_fn = if (self.func_map.get("nova_bytes_copy")) |f| f else blk: {
@@ -220,18 +349,23 @@ pub fn buildValueStructCopy(self: *LlvmCompiler, src: types.LLVMValueRef, size: 
     return dst;
 }
 
-// M-10 Storage retirement: lower a typed-element value-witness call (mem/witness.nova) to the same
-// typed copy/drop the struct field-walk emits. Slot model: a VALUE struct occupies its real width
-// inline; everything else is one 8-byte slot holding its value/pointer. Returns null if the call
-// does not match a witness shape (arity mismatch) so it falls through to normal dispatch.
+/// Lowers a call to one of the compiler's element-"witness" intrinsics, the
+/// low-level primitives the collection library uses to store/load/copy/drop an
+/// element of an arbitrary `T` in a raw buffer.
+///
+/// `wn` is the witness name and `gc.type_args[0]` is the element type `T`. The
+/// witness set (`sizeOf`, `copyElem`, `store`/`storeOver`, `load`/`moveOut`,
+/// `moveElem`, `dropElem`) abstracts over the two element representations:
+/// a VALUE struct occupies `sizeOf(T)` inline bytes and is copied with
+/// [`buildValueStructCopyInto`] plus a field retain, while everything else
+/// occupies one word and is loaded/stored directly with a retain when the
+/// element type is owned. `storeOver`/`load` (vs `moveElem`/`moveOut`) is the
+/// retain-adjusting vs move-without-retain distinction. Returns null (not
+/// matched) if `wn` is unknown or the argument count is wrong; a matched
+/// void-like witness returns the zero word.
 pub fn compileElemWitness(self: *LlvmCompiler, wn: []const u8, gc: ast.GenericCallExpr) anyerror!?types.LLVMValueRef {
     const t = self.typeRefToString(gc.type_args[0]) catch return null;
     const is_vs = self.isValueStructName(t);
-    // `any` is an OWNED heap box ({payload, dtor}) even though it is passed by an 8-byte value slot, so
-    // `ownedByName` (which treats `any` as a primitive) reports it non-owned. The old Storage decided
-    // element ownership via the element TypeId (`isOwnedTypeId(any)` = true) and retained it; keep that
-    // parity here or a `Map<K, any>` / `List<any>` element is stored without a reference and freed while
-    // still slotted (case 123).
     const elem_owned = self.ownedByName(t);
     const width_u: u64 = if (is_vs) @max(self.getTypeSize(ast.TypeRef{ .ident = getStructBaseName(t) }, false), 1) else 8;
     const valptr_t = core.LLVMPointerType(self.val_type, 0);
@@ -262,24 +396,16 @@ pub fn compileElemWitness(self: *LlvmCompiler, wn: []const u8, gc: ast.GenericCa
         try dropElemAt(self, t, is_vs, addr);
         return core.LLVMConstInt(self.val_type, 0, 0);
     }
-    // store<T>(slot, value): write value (native repr) into an EMPTY slot, take a reference where owned.
-    // storeOver<T>(slot, value): release the element already at slot, then store the new one.
     if (std.mem.eql(u8, wn, "store") or std.mem.eql(u8, wn, "storeOver")) {
         if (gc.args.len != 2) return null;
         const over = std.mem.eql(u8, wn, "storeOver");
         const slot = try self.compileExpression(gc.args[0]);
         const value = try self.compileExpression(gc.args[1]);
         if (is_vs) {
-            // release the old element's owned fields before the memcpy overwrites them, then copy the
-            // new element in and retain its owned fields. (An exact self-overwrite where the new value
-            // struct shares a reference with the old is not handled -- Storage never handled VS
-            // overwrite at all; this at least stops the leak.)
             if (over) try dropElemAt(self, t, true, slot);
             _ = try self.buildValueStructCopyInto(slot, value, @intCast(width_u));
             try self.retainValueStructOwnedFields(slot, t);
         } else {
-            // retain the NEW element BEFORE releasing the old (matches Storage.set), so an
-            // aliasing overwrite / a shift like List.insert stays refcount-positive throughout.
             if (elem_owned) try self.compileRetain(value);
             if (over) try dropElemAt(self, t, false, slot);
             const p = core.LLVMBuildIntToPtr(self.builder, slot, valptr_t, "we_sp");
@@ -287,21 +413,15 @@ pub fn compileElemWitness(self: *LlvmCompiler, wn: []const u8, gc: ast.GenericCa
         }
         return core.LLVMConstInt(self.val_type, 0, 0);
     }
-    // load<T>(slot): T -- a value struct comes back as its inline slot address (a borrow); a reference
-    // comes back retained (the caller owns it, matching Storage.get); a scalar comes back by value.
-    // moveOut<T>(slot): T -- same, but WITHOUT the retain: the caller takes the slot's existing
-    // ownership (the slot is vacated). Used by pop/removeAt.
     if (std.mem.eql(u8, wn, "load") or std.mem.eql(u8, wn, "moveOut")) {
         if (gc.args.len != 1) return null;
         const slot = try self.compileExpression(gc.args[0]);
-        if (is_vs) return slot; // the element IS the inline bytes; its value is its address
+        if (is_vs) return slot;
         const p = core.LLVMBuildIntToPtr(self.builder, slot, valptr_t, "we_lp");
         const v = core.LLVMBuildLoad2(self.builder, self.val_type, p, "we_lv");
         if (std.mem.eql(u8, wn, "load") and elem_owned) try self.compileRetain(v);
         return v;
     }
-    // moveElem<T>(dst, src) -- raw MOVE of the element bytes, no reference taken (ownership transfers,
-    // source left stale). Value struct: memcpy the width; scalar/reference: copy the 8-byte slot.
     if (std.mem.eql(u8, wn, "moveElem")) {
         if (gc.args.len != 2) return null;
         const dst = try self.compileExpression(gc.args[0]);
@@ -319,8 +439,13 @@ pub fn compileElemWitness(self: *LlvmCompiler, wn: []const u8, gc: ast.GenericCa
     return null;
 }
 
-// Release the element at slot address `addr`: a value struct's owned fields via its destructor; a
-// reference element's pointer via nova_release. A no-op for scalar elements.
+/// Destroys the element of type `t` living at `addr`, shared by the
+/// `dropElem`/`storeOver` witnesses in [`compileElemWitness`].
+///
+/// For a value struct (`is_vs`) with owned fields it calls the struct's
+/// in-place destructor over the inline bytes; for a plain-value struct with no
+/// owned fields it does nothing. For a one-word owned/value-optional element it
+/// loads the word and releases it. A non-owning scalar element is a no-op.
 fn dropElemAt(self: *LlvmCompiler, t: []const u8, is_vs: bool, addr: types.LLVMValueRef) anyerror!void {
     const valptr_t = core.LLVMPointerType(self.val_type, 0);
     if (is_vs) {
@@ -339,6 +464,16 @@ fn dropElemAt(self: *LlvmCompiler, t: []const u8, is_vs: bool, addr: types.LLVMV
     }
 }
 
+/// Widens a concrete struct value to a trait fat pointer in place when a
+/// branch's static type must unify to a trait type, returning whether it did.
+///
+/// Given a branch expression that produced a concrete struct `val` and the
+/// trait the surrounding expression expects (`trait_name`), this constructs the
+/// `{struct_ptr, vtable}` trait object, updates `val.*` to it, and releases the
+/// original struct temporary (transferring ownership into the trait object).
+/// Returns false (leaving `val` untouched) when there is no trait target or the
+/// branch is not a known struct. Used to make the two arms of an `if`/`match`
+/// expression agree on a trait result type.
 pub fn widenBranchToTrait(self: *LlvmCompiler, branch: *const ast.Expression, val: *types.LLVMValueRef, trait_name: ?[]const u8) anyerror!bool {
     const tn = trait_name orelse return false;
     const st = (try self.resolveExpressionTypeName(branch)) orelse return false;
@@ -354,6 +489,13 @@ pub fn widenBranchToTrait(self: *LlvmCompiler, branch: *const ast.Expression, va
     return true;
 }
 
+/// Whether `name` refers to an in-scope runtime variable rather than a
+/// function/type/global.
+///
+/// Checks, in order: captured closure-environment slots, locals, and captured
+/// globals walking up the lambda-parent chain (so a name captured by an
+/// enclosing lambda still counts). Used to disambiguate an identifier that
+/// could otherwise be read as a bare function reference.
 pub fn identNamesVariable(self: *LlvmCompiler, name: []const u8) bool {
     if (self.envCaptureIndex(name) != null) return true;
     if (self.locals.contains(name)) return true;
@@ -368,6 +510,17 @@ pub fn identNamesVariable(self: *LlvmCompiler, name: []const u8) bool {
     return false;
 }
 
+/// Boxes a plain top-level function into a closure value so it can be passed
+/// where a closure/`fn` value is expected, returning the boxed handle.
+///
+/// A closure is called through a uniform `(env, args...)` ABI, but a bare
+/// function has no environment. This synthesises (once per function, cached in
+/// `fn_box_globals`) an internal thunk that ignores the env slot and forwards
+/// the remaining arguments to the real function, then emits a constant global
+/// box `{header, thunk_ptr, empty_env}` and returns the payload address via
+/// [`fnBoxReturn`]. The wasm and native layouts differ (wasm needs an explicit
+/// ptr field); both encode the same shape. Idempotent: a second call returns
+/// the cached box.
 pub fn buildBareFnBox(self: *LlvmCompiler, fn_val: types.LLVMValueRef) anyerror!types.LLVMValueRef {
     const fn_name = std.mem.span(core.LLVMGetValueName(fn_val));
     if (self.fn_box_globals.get(fn_name)) |box_g| {
@@ -447,6 +600,12 @@ pub fn buildBareFnBox(self: *LlvmCompiler, fn_val: types.LLVMValueRef) anyerror!
     return self.fnBoxReturn(box_g, fn_name);
 }
 
+/// Returns the closure-payload address of a function box: the box global's
+/// address advanced past its 8-byte ARC header.
+///
+/// Callers treat the value like any other closure handle. `fn_name` is
+/// currently unused (discarded) but kept in the signature for call-site
+/// symmetry with [`buildBareFnBox`].
 pub fn fnBoxReturn(self: *LlvmCompiler, box_g: types.LLVMValueRef, fn_name: []const u8) anyerror!types.LLVMValueRef {
     const base = core.LLVMBuildPtrToInt(self.builder, box_g, self.val_type, "fnbox_base");
     const ptr = core.LLVMBuildAdd(self.builder, base, core.LLVMConstInt(self.val_type, 8, 0), "fnbox_ptr");
@@ -454,6 +613,14 @@ pub fn fnBoxReturn(self: *LlvmCompiler, box_g: types.LLVMValueRef, fn_name: []co
     return ptr;
 }
 
+/// Materialises a function pointer as an integer word usable in a Nova value.
+///
+/// On native targets a function address fits directly, so this is a plain
+/// `ptrtoint`. On wasm, function pointers are table indices that are not known
+/// as integers at compile time, so it emits (once per function, cached as a
+/// `__fnref_<name>` global) a relocatable `{fn_ptr, 0}` struct and loads the
+/// first word at runtime. Used wherever a function must be stored in the
+/// uniform value word (e.g. closure cleanup thunks).
 pub fn fnRefInt(self: *LlvmCompiler, fn_val: types.LLVMValueRef, name: []const u8) anyerror!types.LLVMValueRef {
     if (!self.is_wasm) return core.LLVMBuildPtrToInt(self.builder, fn_val, self.val_type, "fn_ref_int");
     const gname = try std.fmt.allocPrintSentinel(self.allocator, "__fnref_{s}", .{name}, 0);
@@ -471,14 +638,12 @@ pub fn fnRefInt(self: *LlvmCompiler, fn_val: types.LLVMValueRef, name: []const u
     return core.LLVMBuildLoad2(self.builder, self.val_type, g, "fnref_raw");
 }
 
-// Explicit SIMD (f64x4): a small builtin API over LLVM <4 x double>. Vector values live in their own
-// <4 x double> local slots (slotTypeForLocalId maps "f64x4"), so ops stay in NEON/SSE registers.
-//   simd.splat4(x) / simd.make4(a,b,c,d)         -> f64x4
-//   simd.add4/sub4/mul4/div4(a,b) / simd.fma4(a,b,c) -> f64x4
-//   simd.load4(arr,i) / simd.store4(arr,i,v)     load/store 4 lanes from a double[]
-//   simd.sum4(v)                                  -> double (horizontal add)
-// Element LLVM type for a float array (double[]/float[]) so access loads/stores the real type (needed
-// for the vectorizer). Returns null for int/bool arrays (the i64 word is correct for those).
+/// If `obj` is a float array, returns the LLVM element type (`double`/`float`);
+/// otherwise null.
+///
+/// Consulted when indexing an array so a float element is loaded/stored with
+/// the right type rather than through the generic word path (floats and ints
+/// share the value word but need distinct load types).
 pub fn arrayElemFloatLLVM(self: *LlvmCompiler, obj: *const ast.Expression) ?types.LLVMTypeRef {
     const ir = self.typed_ir orelse return null;
     const st = self.type_store orelse return null;
@@ -493,20 +658,27 @@ pub fn arrayElemFloatLLVM(self: *LlvmCompiler, obj: *const ast.Expression) ?type
     return null;
 }
 
-// Recover a base pointer for array access: array slots are now `ptr`, but a literal / other source may
-// still be the i64 word -- inttoptr only in that case.
+/// Normalises an array base value to a pointer: returns it unchanged if already
+/// a pointer, otherwise casts the integer address to `ptr_type`.
+///
+/// Array bases can arrive either as a raw pointer or as the usual integer
+/// address word; this lets indexing code build a GEP without caring which.
 pub fn arrayBasePtr(self: *LlvmCompiler, base: types.LLVMValueRef) types.LLVMValueRef {
     if (core.LLVMGetTypeKind(core.LLVMTypeOf(base)) == .LLVMPointerTypeKind) return base;
     return core.LLVMBuildIntToPtr(self.builder, base, self.ptr_type, "arr_base");
 }
 
+/// Lowers a call to a `simd.*` intrinsic to native vector IR.
+///
+/// Dispatches by `field`: a `mulhi64` high-64-of-128 multiply; integer-lane
+/// families (`*U8x16`/`*U32x4`/`*U64x2`) forwarded to [`compileIntSimd`]; and
+/// the f64x4 family (`splat4`, `make4`, `load4`/`store4`, `sum4`, and the
+/// arithmetic ops `add4`/`sub4`/`mul4`/`div4`/`fma4`) built directly on a
+/// 4-wide double vector. Unaligned memory is handled where relevant. Returns
+/// `error.UnknownSimdOp` for an unrecognised `field`. Element pointers are
+/// computed with small inline helper structs so the vector load/store shares
+/// one GEP shape.
 pub fn compileSimdCall(self: *LlvmCompiler, field: []const u8, args: []const ast.Expression) anyerror!types.LLVMValueRef {
-    // FR-simd-L7: unsigned 64x64 -> HIGH 64 bits of the product. Lowers to `umulh` on aarch64 and `mulx`/
-    // `mulq` on x86 (LLVM widens the i128 multiply per target). This is the one primitive Nova cannot express
-    // itself (no native 128-bit integer): with it plus the wrapping i64 multiply (the low half, which Nova's
-    // `ulong` `*` already gives) and carry-detect via unsigned compare, the whole radix-2^51 / radix-2^64
-    // bignum field arithmetic for X25519 and P-256 is writable in pure Nova. This is exactly Go's arm64 model
-    // for curve25519 (generic Go over math/bits.Mul64, no hand asm). Target-independent.
     if (std.mem.eql(u8, field, "mulhi64")) {
         const i128t = core.LLVMIntType(128);
         const a64 = core.LLVMBuildTrunc(self.builder, try self.compileExpression(args[0]), core.LLVMInt64Type(), "mh_a");
@@ -518,8 +690,6 @@ pub fn compileSimdCall(self: *LlvmCompiler, field: []const u8, args: []const ast
         return core.LLVMBuildTrunc(self.builder, sh, self.val_type, "mh_hitr");
     }
 
-    // FR-simd-L1: integer vectors u8x16/u32x4/u64x2. Detect them by the type suffix in the op name and
-    // handle before the f64x4 (float) path below.
     if (std.mem.endsWith(u8, field, "U8x16")) return try self.compileIntSimd(field, args, 8, 16);
     if (std.mem.endsWith(u8, field, "U32x4")) return try self.compileIntSimd(field, args, 32, 4);
     if (std.mem.endsWith(u8, field, "U64x2")) return try self.compileIntSimd(field, args, 64, 2);
@@ -527,7 +697,6 @@ pub fn compileSimdCall(self: *LlvmCompiler, field: []const u8, args: []const ast
     const vecTy = self.vecF64x4Type();
     const dbl = core.LLVMDoubleType();
 
-    // element pointer into a double[] at index i: (double*)base + i
     const elemPtr = struct {
         fn get(c: *LlvmCompiler, arr_word: types.LLVMValueRef, idx: types.LLVMValueRef) types.LLVMValueRef {
             const base = core.LLVMBuildIntToPtr(c.builder, arr_word, c.ptr_type, "simd_base");
@@ -537,7 +706,7 @@ pub fn compileSimdCall(self: *LlvmCompiler, field: []const u8, args: []const ast
     }.get;
 
     if (std.mem.eql(u8, field, "splat4")) {
-        const x = try self.compileExpression(args[0]);              // double
+        const x = try self.compileExpression(args[0]);
         var undef = core.LLVMGetUndef(vecTy);
         undef = core.LLVMBuildInsertElement(self.builder, undef, x, core.LLVMConstInt(self.i32_type, 0, 0), "splat0");
         var mask = [_]types.LLVMValueRef{ core.LLVMConstInt(self.i32_type, 0, 0), core.LLVMConstInt(self.i32_type, 0, 0), core.LLVMConstInt(self.i32_type, 0, 0), core.LLVMConstInt(self.i32_type, 0, 0) };
@@ -569,7 +738,6 @@ pub fn compileSimdCall(self: *LlvmCompiler, field: []const u8, args: []const ast
     }
     if (std.mem.eql(u8, field, "sum4")) {
         const v = try self.compileExpression(args[0]);
-        // horizontal add via 4 extractelements (portable; LLVM folds to faddp on NEON)
         var acc = core.LLVMBuildExtractElement(self.builder, v, core.LLVMConstInt(self.i32_type, 0, 0), "l0");
         var lane: c_uint = 1;
         while (lane < 4) : (lane += 1) {
@@ -578,7 +746,6 @@ pub fn compileSimdCall(self: *LlvmCompiler, field: []const u8, args: []const ast
         }
         return acc;
     }
-    // binary lane ops
     const a = try self.compileExpression(args[0]);
     const b = try self.compileExpression(args[1]);
     if (std.mem.eql(u8, field, "add4")) return core.LLVMBuildFAdd(self.builder, a, b, "add4");
@@ -595,16 +762,22 @@ pub fn compileSimdCall(self: *LlvmCompiler, field: []const u8, args: []const ast
     return error.UnknownSimdOp;
 }
 
-// FR-simd-L1: lower an integer-vector op. `elem` is the element bit width (8/32/64) and `lanes` the count
-// (16/4/2), so the vector is <lanes x i{elem}>. Load/store use alignment 1 (buffers may be unaligned).
-// The op is the field name with the type suffix stripped.
+/// Lowers an integer SIMD intrinsic for an `elem`-bit x `lanes`-wide vector.
+///
+/// The operation name is `field` with its width suffix (`U8x16`/`U32x4`/...)
+/// stripped. Handles lane construction (`splat`), unaligned `load`/`store`,
+/// `movemask` (pack sign bits), lane shifts (`shl`/`shr`), `cast`/`lane`
+/// extract, carry-less multiply (`clmul` via [`compileClmul64`]), AES rounds
+/// (`aesenc`/`aesenclast` via [`compileAesRound`]), and the elementwise
+/// arithmetic/bitwise/compare ops. Returns `error.UnknownSimdOp` for an
+/// unrecognised op. The inline `splat`/`vecPtr` helpers keep the broadcast and
+/// address computation uniform across ops.
 pub fn compileIntSimd(self: *LlvmCompiler, field: []const u8, args: []const ast.Expression, elem: c_uint, lanes: c_uint) anyerror!types.LLVMValueRef {
     const et = core.LLVMIntType(elem);
     const vt = core.LLVMVectorType(et, lanes);
-    const suffix_len: usize = if (elem == 8) "U8x16".len else "U32x4".len; // U32x4 and U64x2 are both 5
+    const suffix_len: usize = if (elem == 8) "U8x16".len else "U32x4".len;
     const op = field[0 .. field.len - suffix_len];
 
-    // splat a scalar (Nova i64) across all lanes: insert into lane 0, shuffle with an all-zero mask.
     const splat = struct {
         fn make(c: *LlvmCompiler, scalar: types.LLVMValueRef, e_ty: types.LLVMTypeRef, v_ty: types.LLVMTypeRef, n: c_uint) types.LLVMValueRef {
             const sc = core.LLVMBuildTrunc(c.builder, scalar, e_ty, "simd_splat_tr");
@@ -618,7 +791,6 @@ pub fn compileIntSimd(self: *LlvmCompiler, field: []const u8, args: []const ast.
         }
     }.make;
 
-    // address (buf + off) as a vt* for load/store.
     const vecPtr = struct {
         fn get(c: *LlvmCompiler, buf: types.LLVMValueRef, off: types.LLVMValueRef, v_ty: types.LLVMTypeRef) types.LLVMValueRef {
             const addr = core.LLVMBuildAdd(c.builder, buf, off, "simd_vaddr");
@@ -648,7 +820,6 @@ pub fn compileIntSimd(self: *LlvmCompiler, field: []const u8, args: []const ast.
         return core.LLVMConstInt(self.val_type, 0, 0);
     }
     if (std.mem.eql(u8, op, "movemask")) {
-        // sign bit of each lane -> one bit. icmp slt v, 0 gives <lanes x i1>; bitcast packs it; zext to int.
         const v = try self.compileExpression(args[0]);
         const zero = core.LLVMConstNull(vt);
         const signs = core.LLVMBuildICmp(self.builder, .LLVMIntSLT, v, zero, "simd_signs");
@@ -661,45 +832,31 @@ pub fn compileIntSimd(self: *LlvmCompiler, field: []const u8, args: []const ast.
         const n = try self.compileExpression(args[1]);
         const amt = splat(self, n, et, vt, lanes);
         if (std.mem.eql(u8, op, "shl")) return core.LLVMBuildShl(self.builder, v, amt, "simd_shl");
-        return core.LLVMBuildLShr(self.builder, v, amt, "simd_shr"); // logical (unsigned lanes)
+        return core.LLVMBuildLShr(self.builder, v, amt, "simd_shr");
     }
     if (std.mem.eql(u8, op, "cast")) {
-        // FR-simd-L6: reinterpret a 128-bit vector as another lane shape (u8x16 <-> u64x2 <-> u32x4) with a
-        // pure bitcast (no data movement). Lets the GHASH path hold a block as u8x16 for the SIMD reflect and
-        // then view it as u64x2 to feed clmul lanes, all in a register. The result lane shape is vt (from the
-        // U..x.. suffix on the call), so simd.castU64x2(u8x16v) yields a u64x2 over the same 128 bits.
         const v = try self.compileExpression(args[0]);
         return core.LLVMBuildBitCast(self.builder, v, vt, "simd_cast");
     }
     if (std.mem.eql(u8, op, "lane")) {
-        // FR-simd-L5: extract lane `idx` of the vector as a Nova scalar (zero-extended to the i64 value slot).
-        // This is the register-level counterpart to store+reload: it pulls a lane straight out of a vector
-        // register instead of round-tripping it through a heap buffer, so a clmul result can feed the next
-        // scalar op with no memory traffic (the GHASH hot path).
         const v = try self.compileExpression(args[0]);
         const idxv = try self.compileExpression(args[1]);
         const idx32 = core.LLVMBuildTrunc(self.builder, idxv, self.i32_type, "lane_idx");
         const el = core.LLVMBuildExtractElement(self.builder, v, idx32, "lane_ex");
-        if (elem >= 64) return el; // already i64; avoid a zero-width ZExt
+        if (elem >= 64) return el;
         return core.LLVMBuildZExt(self.builder, el, self.val_type, "lane_ext");
     }
     if (std.mem.eql(u8, op, "clmul")) {
-        // FR-simd-L2: carryless 64x64 -> 128 multiply. a and b are Nova longs (i64 in the value slot).
         const a64 = core.LLVMBuildTrunc(self.builder, try self.compileExpression(args[0]), core.LLVMInt64Type(), "clmul_a");
         const b64 = core.LLVMBuildTrunc(self.builder, try self.compileExpression(args[1]), core.LLVMInt64Type(), "clmul_b");
         return try self.compileClmul64(a64, b64, vt);
     }
     if (std.mem.eql(u8, op, "aesenc") or std.mem.eql(u8, op, "aesenclast")) {
-        // FR-simd-L3: one AES encryption round on a u8x16 state with a u8x16 round key. `aesenc` is a full
-        // round (SubBytes -> ShiftRows -> MixColumns -> AddRoundKey); `aesenclast` omits MixColumns (final
-        // round). Semantics are x86 AES-NI's, mapped to ARM's aese/aesmc on aarch64. This is the AES bulk
-        // cipher primitive; it lowers to the hardware AES instruction (no table lookups -> constant time).
         const state = try self.compileExpression(args[0]);
         const rk = try self.compileExpression(args[1]);
         return try self.compileAesRound(state, rk, vt, std.mem.eql(u8, op, "aesenclast"));
     }
 
-    // binary lane ops
     const a = try self.compileExpression(args[0]);
     const b = try self.compileExpression(args[1]);
     if (std.mem.eql(u8, op, "add")) return core.LLVMBuildAdd(self.builder, a, b, "simd_add");
@@ -709,15 +866,19 @@ pub fn compileIntSimd(self: *LlvmCompiler, field: []const u8, args: []const ast.
     if (std.mem.eql(u8, op, "xor")) return core.LLVMBuildXor(self.builder, a, b, "simd_xor");
     if (std.mem.eql(u8, op, "eq")) {
         const c = core.LLVMBuildICmp(self.builder, .LLVMIntEQ, a, b, "simd_eqcmp");
-        return core.LLVMBuildSExt(self.builder, c, vt, "simd_eq"); // 0xFF.. where equal, 0 else
+        return core.LLVMBuildSExt(self.builder, c, vt, "simd_eq");
     }
     std.debug.print("unknown int-simd op: {s}\n", .{op});
     return error.UnknownSimdOp;
 }
 
-// FR-simd-L2: carryless 64x64 -> 128 multiply, returned as vt (<2 x i64>). Uses the hardware intrinsic
-// for the compile target (pmull64 on ARM, pclmulqdq on x86) and a portable inline software multiply
-// otherwise. This is the GHASH primitive; the pure-Nova software GHASH remains the higher-level fallback.
+/// Emits a 64x64 carry-less (GF(2)) multiply producing a 128-bit result bit-cast
+/// to vector type `vt`.
+///
+/// Target-specialised on `self.simd_target`: AArch64 uses `pmull64`, x86-64
+/// uses `pclmulqdq` (packing the operands into the low lane of a vector), and
+/// the `.none` fallback expands the schoolbook shift-and-xor loop over 64 bits
+/// with a branchless mask. This is the primitive behind GHASH/CRC-style code.
 pub fn compileClmul64(self: *LlvmCompiler, a64: types.LLVMValueRef, b64: types.LLVMValueRef, vt: types.LLVMTypeRef) anyerror!types.LLVMValueRef {
     const ctx = core.LLVMGetModuleContext(self.module);
     switch (self.simd_target) {
@@ -727,7 +888,7 @@ pub fn compileClmul64(self: *LlvmCompiler, a64: types.LLVMValueRef, b64: types.L
             const fn_val = core.LLVMGetIntrinsicDeclaration(self.module, id, null, 0);
             const fn_ty = core.LLVMIntrinsicGetType(ctx, id, null, 0);
             var cargs = [_]types.LLVMValueRef{ a64, b64 };
-            const res = core.LLVMBuildCall2(self.builder, fn_ty, fn_val, &cargs, 2, "clmul_pmull"); // <16 x i8>
+            const res = core.LLVMBuildCall2(self.builder, fn_ty, fn_val, &cargs, 2, "clmul_pmull");
             return core.LLVMBuildBitCast(self.builder, res, vt, "clmul_v");
         },
         .x86_64 => {
@@ -735,7 +896,6 @@ pub fn compileClmul64(self: *LlvmCompiler, a64: types.LLVMValueRef, b64: types.L
             const id = core.LLVMLookupIntrinsicID(name.ptr, name.len);
             const fn_val = core.LLVMGetIntrinsicDeclaration(self.module, id, null, 0);
             const fn_ty = core.LLVMIntrinsicGetType(ctx, id, null, 0);
-            // Place a and b in lane 0 of two <2 x i64> operands; imm 0 selects lane 0 of each.
             const i64t = core.LLVMInt64Type();
             var av = core.LLVMGetUndef(vt);
             av = core.LLVMBuildInsertElement(self.builder, av, a64, core.LLVMConstInt(self.i32_type, 0, 0), "clmul_av0");
@@ -747,7 +907,6 @@ pub fn compileClmul64(self: *LlvmCompiler, a64: types.LLVMValueRef, b64: types.L
             return core.LLVMBuildCall2(self.builder, fn_ty, fn_val, &cargs, 3, "clmul_pclmul");
         },
         .none => {
-            // Portable software carryless multiply in i128: XOR of (a << i) for every set bit i of b.
             const i128t = core.LLVMIntType(128);
             const a128 = core.LLVMBuildZExt(self.builder, a64, i128t, "clmul_a128");
             var acc = core.LLVMConstInt(i128t, 0, 0);
@@ -755,7 +914,7 @@ pub fn compileClmul64(self: *LlvmCompiler, a64: types.LLVMValueRef, b64: types.L
             while (i < 64) : (i += 1) {
                 const bit = core.LLVMBuildAnd(self.builder, core.LLVMBuildLShr(self.builder, b64, core.LLVMConstInt(core.LLVMInt64Type(), i, 0), "clmul_sh"), core.LLVMConstInt(core.LLVMInt64Type(), 1, 0), "clmul_bit");
                 const bit128 = core.LLVMBuildZExt(self.builder, bit, i128t, "clmul_bit128");
-                const mask = core.LLVMBuildNeg(self.builder, bit128, "clmul_mask"); // 0 or all-ones
+                const mask = core.LLVMBuildNeg(self.builder, bit128, "clmul_mask");
                 const shifted = core.LLVMBuildShl(self.builder, a128, core.LLVMConstInt(i128t, i, 0), "clmul_shl");
                 acc = core.LLVMBuildXor(self.builder, acc, core.LLVMBuildAnd(self.builder, shifted, mask, "clmul_and"), "clmul_acc");
             }
@@ -764,33 +923,34 @@ pub fn compileClmul64(self: *LlvmCompiler, a64: types.LLVMValueRef, b64: types.L
     }
 }
 
-// FR-simd-L3: one AES encryption round mapped to the hardware AES instruction. `state` and `rk` are
-// <16 x i8>. Semantics are x86 AES-NI's: aesenc(state,rk) = MixColumns(ShiftRows(SubBytes(state))) ^ rk;
-// aesenclast omits MixColumns. On aarch64 the same result is built from aese + aesmc (ARM's aese does
-// ShiftRows(SubBytes(data ^ key)), so we feed a ZERO key and do the real AddRoundKey with an explicit XOR,
-// which reproduces x86 ordering exactly). Constant-time (no S-box tables). `.none` (targets without AES
-// instructions, e.g. wasm) is unsupported here on purpose: callers keep the pure-Nova bitsliced AES for
-// those, and must not reach this op; a hardware AES-GCM is gated to native aarch64/x86_64.
+/// Emits one AES encryption round on `state` with round key `rk`, `last`
+/// selecting the final round (no MixColumns).
+///
+/// AArch64's `aese` combines SubBytes+ShiftRows+AddRoundKey but XORs the key
+/// FIRST, so this passes a zero key and XORs `rk` afterwards, adding `aesmc`
+/// (MixColumns) for non-final rounds. x86-64 maps directly onto
+/// `aesenc`/`aesenclast`. The `.none` target has no software fallback and
+/// returns `error.UnknownSimdOp`.
 pub fn compileAesRound(self: *LlvmCompiler, state: types.LLVMValueRef, rk: types.LLVMValueRef, vt: types.LLVMTypeRef, last: bool) anyerror!types.LLVMValueRef {
     const ctx = core.LLVMGetModuleContext(self.module);
     switch (self.simd_target) {
         .aarch64 => {
-            const zero = core.LLVMConstNull(vt); // <16 x i8> zero key -> no-op AddRoundKey inside aese
+            const zero = core.LLVMConstNull(vt);
             const aese_name: [:0]const u8 = "llvm.aarch64.crypto.aese";
             const aese_id = core.LLVMLookupIntrinsicID(aese_name.ptr, aese_name.len);
             const aese_fn = core.LLVMGetIntrinsicDeclaration(self.module, aese_id, null, 0);
             const aese_ty = core.LLVMIntrinsicGetType(ctx, aese_id, null, 0);
             var aese_args = [_]types.LLVMValueRef{ state, zero };
-            var t = core.LLVMBuildCall2(self.builder, aese_ty, aese_fn, &aese_args, 2, "aese"); // ShiftRows(SubBytes(state))
+            var t = core.LLVMBuildCall2(self.builder, aese_ty, aese_fn, &aese_args, 2, "aese");
             if (!last) {
                 const mc_name: [:0]const u8 = "llvm.aarch64.crypto.aesmc";
                 const mc_id = core.LLVMLookupIntrinsicID(mc_name.ptr, mc_name.len);
                 const mc_fn = core.LLVMGetIntrinsicDeclaration(self.module, mc_id, null, 0);
                 const mc_ty = core.LLVMIntrinsicGetType(ctx, mc_id, null, 0);
                 var mc_args = [_]types.LLVMValueRef{t};
-                t = core.LLVMBuildCall2(self.builder, mc_ty, mc_fn, &mc_args, 1, "aesmc"); // MixColumns
+                t = core.LLVMBuildCall2(self.builder, mc_ty, mc_fn, &mc_args, 1, "aesmc");
             }
-            return core.LLVMBuildXor(self.builder, t, rk, "aes_ark"); // AddRoundKey
+            return core.LLVMBuildXor(self.builder, t, rk, "aes_ark");
         },
         .x86_64 => {
             const i64x2 = core.LLVMVectorType(core.LLVMInt64Type(), 2);
@@ -808,7 +968,12 @@ pub fn compileAesRound(self: *LlvmCompiler, state: types.LLVMValueRef, rk: types
     }
 }
 
-// FR-mem: width (bits) and signedness of an integer type name, for the mem.load/store builtins.
+/// Maps a Nova integer type name to its bit width and signedness for the raw
+/// `mem.*` load/store intrinsics.
+///
+/// Covers the width/sign aliases (`byte`/`i8`, `int`/`i32`, `long`/`i64`,
+/// `word`/`usize`, and their unsigned forms). An unrecognised name defaults to
+/// signed 32-bit. Consumed by [`compileMemCall`].
 fn memWidthSign(tname: []const u8) struct { w: c_uint, signed: bool } {
     const M = struct { n: []const u8, w: c_uint, s: bool };
     const tbl = [_]M{
@@ -826,8 +991,12 @@ fn memWidthSign(tname: []const u8) struct { w: c_uint, signed: bool } {
     return .{ .w = 32, .signed = true };
 }
 
-// Reverse the `w`-bit integer value `v` byte-by-byte (compile-time-unrolled shift/or; LLVM folds it to a
-// single bswap). Used for the big-endian path of mem.load/store.
+/// Byte-reverses an integer of width `w` (LLVM type `iw`) by shift/mask/or,
+/// returning `v` unchanged for widths of one byte or less.
+///
+/// Used by [`compileMemCall`] to implement big-endian loads/stores and `bswap`.
+/// It open-codes the swap rather than calling `llvm.bswap` so it works for any
+/// byte count uniformly.
 fn memByteReverse(self: *LlvmCompiler, v: types.LLVMValueRef, iw: types.LLVMTypeRef, w: c_uint) types.LLVMValueRef {
     const bytes = w / 8;
     if (bytes <= 1) return v;
@@ -842,9 +1011,17 @@ fn memByteReverse(self: *LlvmCompiler, v: types.LLVMValueRef, iw: types.LLVMType
     return acc;
 }
 
-// FR-mem Tier 1: mem.load<T>(p, off, e) and mem.store<T>(p, off, v, e). Zero-alloc typed read/write into a
-// caller-owned buffer at a byte offset, with compile-time-constant-folded endianness (a literal .little or
-// .big picks the branch-free path). T fixes width and signedness.
+/// Lowers a `mem.*<T>` intrinsic: typed raw-memory access and bit ops on an
+/// integer address.
+///
+/// `type_arg` is the element type `T` (giving width/signedness via
+/// [`memWidthSign`]). Implements `load`/`store` at `ptr+off` with a runtime
+/// endianness flag (byte-reversed on big-endian via [`memByteReverse`]),
+/// `bswap`, `rotl`/`rotr` (via `llvm.fshl`/`fshr`), and `ctz`/`clz`. Results
+/// are sign- or zero-extended back into the value word per `T`. Returns
+/// `error.UnknownMemOp` for an unrecognised `field`. These are the primitives
+/// the binary-protocol/codec std code builds on; note that offsets are added on
+/// the 64-bit address word to avoid the 32-bit `int` truncation trap.
 pub fn compileMemCall(self: *LlvmCompiler, field: []const u8, type_arg: ast.TypeRef, args: []const ast.Expression) anyerror!types.LLVMValueRef {
     const tname = try self.typeRefToString(type_arg);
     const ws = memWidthSign(tname);
@@ -854,15 +1031,13 @@ pub fn compileMemCall(self: *LlvmCompiler, field: []const u8, type_arg: ast.Type
     if (std.mem.eql(u8, field, "load")) {
         const p = try self.compileExpression(args[0]);
         const off = try self.compileExpression(args[1]);
-        const endv = try self.compileExpression(args[2]); // Endian tag (0 little / 1 big)
+        const endv = try self.compileExpression(args[2]);
         const addr = core.LLVMBuildAdd(self.builder, p, off, "mem_addr");
         const ptr = core.LLVMBuildIntToPtr(self.builder, addr, iwptr, "mem_ptr");
         const loaded = core.LLVMBuildLoad2(self.builder, iw, ptr, "mem_load");
         var val = loaded;
         if (ws.w > 8) {
             const swapped = memByteReverse(self, loaded, iw, ws.w);
-            // Endian tag: little = 0, big = 1. big-endian picks the byte-swapped value; LLVM constant-folds
-            // this select when the Endian argument is a literal.
             const big = core.LLVMBuildICmp(self.builder, .LLVMIntEQ, endv, core.LLVMConstInt(core.LLVMTypeOf(endv), 1, 0), "mem_big");
             val = core.LLVMBuildSelect(self.builder, big, swapped, loaded, "mem_endsel");
         }
@@ -886,7 +1061,6 @@ pub fn compileMemCall(self: *LlvmCompiler, field: []const u8, type_arg: ast.Type
         _ = core.LLVMBuildStore(self.builder, to_store, ptr);
         return core.LLVMConstInt(self.val_type, 0, 0);
     }
-    // FR-mem Tier 2: scalar bit builtins. rotl/rotr/bswap return T; ctz/clz return int.
     if (std.mem.eql(u8, field, "bswap")) {
         const x = try self.compileExpression(args[0]);
         const xw = core.LLVMBuildTrunc(self.builder, x, iw, "bsw_tr");
@@ -895,8 +1069,6 @@ pub fn compileMemCall(self: *LlvmCompiler, field: []const u8, type_arg: ast.Type
         return core.LLVMBuildZExt(self.builder, rev, self.val_type, "bsw_zx");
     }
     if (std.mem.eql(u8, field, "rotl") or std.mem.eql(u8, field, "rotr")) {
-        // Funnel shift: fshl(x, x, n) is rotate-left, fshr(x, x, n) is rotate-right. The intrinsic takes
-        // the shift amount modulo the bit width, so no zero-guard is needed.
         const x = try self.compileExpression(args[0]);
         const n = try self.compileExpression(args[1]);
         const xw = core.LLVMBuildTrunc(self.builder, x, iw, "rot_x");
@@ -912,7 +1084,6 @@ pub fn compileMemCall(self: *LlvmCompiler, field: []const u8, type_arg: ast.Type
         return core.LLVMBuildZExt(self.builder, res, self.val_type, "rot_zx");
     }
     if (std.mem.eql(u8, field, "ctz") or std.mem.eql(u8, field, "clz")) {
-        // llvm.cttz/ctlz(x, is_zero_poison=false): count is non-negative, always zero-extended to int.
         const x = try self.compileExpression(args[0]);
         const xw = core.LLVMBuildTrunc(self.builder, x, iw, "cnt_x");
         const iname: [:0]const u8 = if (std.mem.eql(u8, field, "ctz")) "llvm.cttz" else "llvm.ctlz";
@@ -928,6 +1099,14 @@ pub fn compileMemCall(self: *LlvmCompiler, field: []const u8, type_arg: ast.Type
     return error.UnknownMemOp;
 }
 
+/// Calls a closure through its box: loads the code pointer, passes the env slot
+/// as the hidden first argument, and forwards the compiled call arguments.
+///
+/// The box layout is `{fn_ptr_word, env_word, ...captures}`; the env address is
+/// the box address plus one value slot, so a closure sees its captured
+/// environment as `arg0`. All arguments are coerced to the value word. The
+/// callee function type is reconstructed as `(env, args...) -> val` since the
+/// pointer is opaque.
 pub fn buildClosureCall(self: *LlvmCompiler, box_val: types.LLVMValueRef, call_args: []const ast.Expression) anyerror!types.LLVMValueRef {
     const es = self.valSlotSize();
     const box_ptr = core.LLVMBuildIntToPtr(self.builder, box_val, self.ptr_type, "clo_box");
@@ -948,19 +1127,28 @@ pub fn buildClosureCall(self: *LlvmCompiler, box_val: types.LLVMValueRef, call_a
     defer self.allocator.free(args);
     args[0] = env_val;
     for (call_args, 0..) |arg, idx| {
-        // The closure/thunk ABI is uniform: every param is the i64 value-word (the thunk bitcasts
-        // back to the real param type via buildCallWithCasts). A `double` argument compiles to a real
-        // `double`, so coerce it to the value-word here or the call mismatches fn_t's i64 params.
         args[idx + 1] = self.coerceToSlotType(try self.compileCallArgument(arg), self.val_type);
     }
     return core.LLVMBuildCall2(self.builder, fn_t, call_ptr, args.ptr, @intCast(nparams), "closure_call");
 }
 
+/// The LLVM struct type of an async coroutine's promise: two value words,
+/// `{result, waiter}`.
+///
+/// The promise is embedded in the coroutine frame by the LLVM coroutine lowering
+/// and reached through `llvm.coro.promise`. Slot 0 holds the awaited result and
+/// slot 1 the handle of a coroutine waiting on this one. See
+/// [`coroPromiseResultSlot`] and [`coroPromiseWaiterSlot`].
 pub fn coroPromiseType(self: *LlvmCompiler) types.LLVMTypeRef {
     var fields = [_]types.LLVMTypeRef{ self.val_type, self.val_type };
     return core.LLVMStructType(&fields, 2, 0);
 }
 
+/// GEPs to field `idx` of the coroutine promise struct, naming the resulting
+/// pointer `name`.
+///
+/// Low-level accessor shared by [`coroPromiseResultSlot`]/
+/// [`coroPromiseWaiterSlot`].
 pub fn coroPromiseSlot(self: *LlvmCompiler, promise_ptr: types.LLVMValueRef, idx: c_uint, name: [:0]const u8) types.LLVMValueRef {
     var indices = [_]types.LLVMValueRef{
         core.LLVMConstInt(self.i32_type, 0, 0),
@@ -969,14 +1157,23 @@ pub fn coroPromiseSlot(self: *LlvmCompiler, promise_ptr: types.LLVMValueRef, idx
     return core.LLVMBuildInBoundsGEP2(self.builder, self.coroPromiseType(), promise_ptr, &indices, 2, name.ptr);
 }
 
+/// Pointer to the coroutine's result slot (promise field 0), where its return
+/// value is written before completion and read by the awaiter.
 pub fn coroPromiseResultSlot(self: *LlvmCompiler, promise_ptr: types.LLVMValueRef) types.LLVMValueRef {
     return self.coroPromiseSlot(promise_ptr, 0, "coro.result.slot");
 }
 
+/// Pointer to the coroutine's waiter slot (promise field 1), holding the handle
+/// of the coroutine to resume when this one finishes.
 pub fn coroPromiseWaiterSlot(self: *LlvmCompiler, promise_ptr: types.LLVMValueRef) types.LLVMValueRef {
     return self.coroPromiseSlot(promise_ptr, 1, "coro.waiter.slot");
 }
 
+/// Given a coroutine handle, calls `llvm.coro.promise` to get a pointer to its
+/// embedded promise (aligned to 8).
+///
+/// The promise pointer is then narrowed to specific slots with
+/// [`coroPromiseResultSlot`]/[`coroPromiseWaiterSlot`].
 pub fn buildCoroPromisePtr(self: *LlvmCompiler, hdl: types.LLVMValueRef) types.LLVMValueRef {
     const promise_fn = self.func_map.get("llvm.coro.promise").?;
     const promise_t = core.LLVMGlobalGetValueType(promise_fn);
@@ -988,11 +1185,25 @@ pub fn buildCoroPromisePtr(self: *LlvmCompiler, hdl: types.LLVMValueRef) types.L
     return core.LLVMBuildCall2(self.builder, promise_t, promise_fn, &p_args, 3, "coro.promise");
 }
 
+/// Calls an async function and synchronously drives its coroutine to
+/// completion, returning the result value.
+///
+/// Convenience wrapper: build the call (which returns a coroutine handle) then
+/// [`buildDriveAsyncHandle`]. Used at the sync/async boundary, e.g. calling an
+/// async function from `main`.
 pub fn buildDriveAsyncCall(self: *LlvmCompiler, fn_val: types.LLVMValueRef, args: []const types.LLVMValueRef) anyerror!types.LLVMValueRef {
     const hdl_i = try self.buildCallWithCasts(fn_val, args);
     return try self.buildDriveAsyncHandle(hdl_i);
 }
 
+/// Schedules a coroutine handle on the runtime, runs the reactor to
+/// completion, reads its result, and releases the frame.
+///
+/// The full blocking drive: `nova_sched_schedule` then `nova_run_root` (which
+/// returns only when the root coroutine finishes), then loads the promise
+/// result slot and calls `nova_coro_release` to free the frame. This is how an
+/// async call is turned into a plain synchronous value at the top level; do not
+/// use it from inside another coroutine (use [`buildAwait`] instead).
 pub fn buildDriveAsyncHandle(self: *LlvmCompiler, hdl_i: types.LLVMValueRef) anyerror!types.LLVMValueRef {
     const sched_fn = self.func_map.get("nova_sched_schedule").?;
     const sched_t = core.LLVMGlobalGetValueType(sched_fn);
@@ -1017,6 +1228,20 @@ pub fn buildDriveAsyncHandle(self: *LlvmCompiler, hdl_i: types.LLVMValueRef) any
     return result;
 }
 
+/// If `operand` is a direct call to a known async function/method, compiles the
+/// call and returns the coroutine handle WITHOUT driving it; null otherwise.
+///
+/// This is the shared front half of `await expr` and `spawn expr`: it resolves
+/// which async function the operand names (plain ident, module-qualified,
+/// generic instantiation with mangled type args, trait method via vtable, or a
+/// struct method with a receiver), compiles the receiver and arguments with the
+/// right value-optional/trait coercions, and emits the call. Returning null (an
+/// operand that is not a direct async call) tells [`buildAwait`] to fall back to
+/// awaiting a future value instead. When `is_spawn`, arguments that get widened
+/// to trait objects are retained and pinned to the child coroutine via
+/// `nova_coro_hold_arg` so they outlive the spawning frame. The many
+/// resolution branches exist because async fns are keyed by mangled symbol and
+/// the callee syntax can under-specify which instantiation is meant.
 pub fn awaitedCallHandle(self: *LlvmCompiler, operand: ast.Expression, is_spawn: bool) anyerror!?types.LLVMValueRef {
 
     var callee_ident: []const u8 = undefined;
@@ -1101,10 +1326,6 @@ pub fn awaitedCallHandle(self: *LlvmCompiler, operand: ast.Expression, is_spawn:
         }
         const base = try self.resolveCalleeName(callee_ident);
 
-        // A generic async call (`await queryAs<Dto>(js)`) must resolve to the per-instantiation SPEC
-        // (`queryAs__Dto`), whose body carries the concrete type argument -- NOT the erased base body
-        // (whose `serde.bind<T>` etc. trap at runtime). Check the spec BEFORE the base name, since the
-        // erased base is also in async_fns (B6).
         if (operand.kind == .generic_call) {
             const gc = operand.kind.generic_call;
             if (gc.type_args.len > 0) {
@@ -1120,11 +1341,6 @@ pub fn awaitedCallHandle(self: *LlvmCompiler, operand: ast.Expression, is_spawn:
                 }
                 const cand = try nb.toOwnedSlice(self.allocator);
                 if (self.async_fns.contains(cand)) break :resolve cand;
-                // The spec is created under the MODULE-SCOPED base name (e.g. `data_orm_queryAs__Dto`), but
-                // `base` here is the unscoped callee (`queryAs`), so the direct candidate `queryAs__Dto` is
-                // just the SUFFIX of the real spec. Match it by suffix (with a `_` boundary), the same way
-                // the non-generic obj-qualified case below does. Without this a cross-module generic ASYNC
-                // call falls through to the erased base body and traps at runtime.
                 {
                     var it = self.async_fns.keyIterator();
                     while (it.next()) |k| {
@@ -1188,12 +1404,6 @@ pub fn awaitedCallHandle(self: *LlvmCompiler, operand: ast.Expression, is_spawn:
                     }
                 }
             } else if (self.structs.contains(exp_base)) {
-                // Reverse of the widening above: the parameter is a CONCRETE struct but the argument is a
-                // TRAIT object (a fat pointer {struct_ptr, vtable}). Without this the fat pointer is passed
-                // AS the struct, so the callee reads the vtable slot as a field and runs a mismatched ARC
-                // destructor -- a silent use-after-free (the connpass cross-coroutine crash). Downcast by
-                // loading struct_ptr from the fat pointer. Borrow semantics: the trait object still owns the
-                // struct, so no retain (the arg is not owning), matching the concrete-arg widening path.
                 if (try self.resolveExpressionTypeName(arg)) |arg_type| {
                     if (self.traits.contains(getStructBaseName(arg_type))) {
                         const sp_ptr = core.LLVMBuildIntToPtr(self.builder, val, core.LLVMPointerType(self.val_type, 0), "argdowncast_sp");
@@ -1218,6 +1428,14 @@ pub fn awaitedCallHandle(self: *LlvmCompiler, operand: ast.Expression, is_spawn:
     return handle;
 }
 
+/// Emits an `llvm.coro.suspend` point and the switch that routes resume/destroy,
+/// leaving the builder positioned on the resume block.
+///
+/// The suspend's result switches to: the shared final-suspend block on the
+/// default (never actually taken here since this is a mid-body suspend), the
+/// freshly created resume block on 0, and the cleanup block on 1 (coroutine
+/// destroyed while suspended). Every await/receive/timer path calls this so the
+/// coroutine yields control back to the scheduler and resumes in place.
 pub fn buildAwaitSuspend(self: *LlvmCompiler) anyerror!void {
     const cur_fn = core.LLVMGetBasicBlockParent(core.LLVMGetInsertBlock(self.builder));
     const resume_bb = core.LLVMAppendBasicBlock(cur_fn, "await.resume");
@@ -1233,6 +1451,12 @@ pub fn buildAwaitSuspend(self: *LlvmCompiler) anyerror!void {
     core.LLVMPositionBuilderAtEnd(self.builder, resume_bb);
 }
 
+/// Recognises `await sleep(ms)` and returns the `ms` argument expression, else
+/// null.
+///
+/// A syntactic pattern match on the operand so [`buildAwait`] can lower a sleep
+/// to a runtime timer rather than a coroutine call. `self` is unused; the
+/// parameter is kept for method-call uniformity.
 pub fn awaitSleepMillis(self: *LlvmCompiler, operand: ast.Expression) ?ast.Expression {
     _ = self;
     if (operand.kind != .call) return null;
@@ -1247,6 +1471,11 @@ pub fn awaitSleepMillis(self: *LlvmCompiler, operand: ast.Expression) ?ast.Expre
     return call.args[0];
 }
 
+/// Recognises `await chanRecv(ch)` and returns the channel expression, else
+/// null.
+///
+/// Lets [`buildAwait`] route to [`buildChanRecv`], which has its own
+/// retry/suspend loop. `self` is unused (kept for uniformity).
 pub fn awaitChanRecvArg(self: *LlvmCompiler, operand: ast.Expression) ?ast.Expression {
     _ = self;
     if (operand.kind != .call) return null;
@@ -1261,6 +1490,14 @@ pub fn awaitChanRecvArg(self: *LlvmCompiler, operand: ast.Expression) ?ast.Expre
     return call.args[0];
 }
 
+/// Recognises `await <async-io>(...)` for the known intrinsic I/O calls and
+/// returns the call node, else null.
+///
+/// Matches the fixed set of runtime I/O primitives by name AND exact arity
+/// (`socketRecvAsync`, `socketAcceptAsync`, `aaccept`, `aconnect`,
+/// `async_read`, `async_read_deadline`, `async_write`) so [`buildAwait`] can
+/// lower them to a submit-then-suspend via [`buildAsyncIo`] rather than treating
+/// them as ordinary async fn calls. `self` is unused.
 pub fn awaitAsyncIoCall(self: *LlvmCompiler, operand: ast.Expression) ?ast.CallExpr {
     _ = self;
     if (operand.kind != .call) return null;
@@ -1283,6 +1520,16 @@ pub fn awaitAsyncIoCall(self: *LlvmCompiler, operand: ast.Expression) ?ast.CallE
     return null;
 }
 
+/// Lowers an awaited async-I/O intrinsic: submit the operation tagged with this
+/// coroutine's handle, suspend, then take the completed result.
+///
+/// Each recognised call (see [`awaitAsyncIoCall`]) maps to a runtime submit
+/// function (`nova_arecv`/`nova_asend`/`nova_aaccept`/`nova_aconnect`/... and
+/// their deadline variants) that registers the op against the current
+/// coroutine handle (`current_async_hdl`). After the submit it suspends via
+/// [`buildAwaitSuspend`]; when the reactor completes the op it resumes the
+/// coroutine, and `nova_io_take_result` yields the byte count / new socket.
+/// This is the proactor-style flow: the op is submitted, not polled.
 pub fn buildAsyncIo(self: *LlvmCompiler, call: ast.CallExpr) anyerror!types.LLVMValueRef {
     const self_hi = core.LLVMBuildPtrToInt(self.builder, self.current_async_hdl.?, self.val_type, "aio.selfh");
     const name = switch (call.callee.kind) {
@@ -1339,6 +1586,14 @@ pub fn buildAsyncIo(self: *LlvmCompiler, call: ast.CallExpr) anyerror!types.LLVM
     return core.LLVMBuildCall2(self.builder, take_t, take, &ta, 1, "aio.result");
 }
 
+/// Lowers `await chanRecv(ch)` as a retry loop that suspends while the channel
+/// is empty and returns the received value.
+///
+/// Emits `loop -> nova_chan_recv(ch, self, out)`: a non-zero status means a
+/// value landed in the `out` slot and control jumps to `done`; a zero status
+/// means the receiver was parked, so the coroutine suspends and, on resume,
+/// branches back to `loop` to retry. The loop is necessary because a wake does
+/// not guarantee the value is still available (another receiver may race).
 pub fn buildChanRecv(self: *LlvmCompiler, ch_expr: ast.Expression) anyerror!types.LLVMValueRef {
     const self_hdl = self.current_async_hdl.?;
     const self_hi = core.LLVMBuildPtrToInt(self.builder, self_hdl, self.val_type, "chan.selfh");
@@ -1377,6 +1632,14 @@ pub fn buildChanRecv(self: *LlvmCompiler, ch_expr: ast.Expression) anyerror!type
     return core.LLVMBuildLoad2(self.builder, self.val_type, out, "chan.val");
 }
 
+/// Lowers `await whenAny(buf, n)` / `whenAnyDeadline(buf, n, ms)` as a
+/// suspend-retry loop returning the index of the first ready future (or the
+/// timeout sentinel).
+///
+/// Calls `nova_when_any`(`_deadline`) over the `n`-element handle buffer tagged
+/// with this coroutine; a result of `-1` means "none ready yet", so it suspends
+/// and retries on resume, while any other index (including the deadline path's
+/// timeout result) exits the loop. Mirrors [`buildChanRecv`]'s structure.
 pub fn buildWhenAny(self: *LlvmCompiler, buf_expr: ast.Expression, n_expr: ast.Expression, ms_expr: ?ast.Expression) anyerror!types.LLVMValueRef {
     const self_hdl = self.current_async_hdl.?;
     const self_hi = core.LLVMBuildPtrToInt(self.builder, self_hdl, self.val_type, "wany.selfh");
@@ -1426,6 +1689,16 @@ pub fn buildWhenAny(self: *LlvmCompiler, buf_expr: ast.Expression, n_expr: ast.E
     return idx;
 }
 
+/// Lowers `spawn expr` (or a detached spawn): starts the operand's async call
+/// as an independent coroutine and returns its handle as a future.
+///
+/// Requires the operand be a direct async fn call, obtained via
+/// [`awaitedCallHandle`] with `is_spawn=true` (so its arguments are pinned to
+/// the child); a non-call operand is a hard error. Schedules the child with
+/// `nova_sched_schedule` (or the `_detached` variant when `is_detached`, which
+/// fire-and-forgets it) and returns the child handle so the caller can later
+/// `await` it. The AST node is named `AwaitExpr` because `await`/`spawn` share
+/// a shape.
 pub fn buildGo(self: *LlvmCompiler, g: ast.AwaitExpr, is_detached: bool) anyerror!types.LLVMValueRef {
 
     const inner_hi = (try self.awaitedCallHandle(g.operand.*, true)) orelse {
@@ -1440,6 +1713,15 @@ pub fn buildGo(self: *LlvmCompiler, g: ast.AwaitExpr, is_detached: bool) anyerro
     return inner_hi;
 }
 
+/// Awaits an already-scheduled future handle (e.g. the result of `spawn`),
+/// suspending only if it is not yet complete, and returns its result.
+///
+/// Calls `nova_await_future` to register this coroutine as the future's waiter;
+/// if it reports ready, control skips straight to reading the result, otherwise
+/// the coroutine suspends and resumes when the future completes. Then it reads
+/// the child's promise result slot and releases the child frame. This is the
+/// path taken by `await fut` where `fut` is a value, as opposed to
+/// `await someAsyncFn(...)` which [`buildAwait`] handles inline.
 pub fn buildAwaitFuture(self: *LlvmCompiler, fut_hi: types.LLVMValueRef) anyerror!types.LLVMValueRef {
     const self_hdl = self.current_async_hdl.?;
     const self_hi = core.LLVMBuildPtrToInt(self.builder, self_hdl, self.val_type, "awaitf.selfh");
@@ -1482,6 +1764,18 @@ pub fn buildAwaitFuture(self: *LlvmCompiler, fut_hi: types.LLVMValueRef) anyerro
     return result;
 }
 
+/// Lowers an `await` expression, dispatching to the right suspend strategy for
+/// what is being awaited.
+///
+/// Must run inside a coroutine (`current_async_hdl` set), else it is a compile
+/// error. Order of recognition: `sleep(ms)` -> runtime timer + suspend;
+/// `chanRecv` -> [`buildChanRecv`]; `whenAny`/`whenAnyDeadline` ->
+/// [`buildWhenAny`]; a known async-I/O call -> [`buildAsyncIo`]; a direct async
+/// fn call (via [`awaitedCallHandle`]) -> register-waiter + schedule + suspend +
+/// read result + release; anything else is treated as an already-built future
+/// and handed to [`buildAwaitFuture`]. The inline direct-call path registers
+/// this coroutine as the child's waiter BEFORE scheduling it so the wake cannot
+/// be missed.
 pub fn buildAwait(self: *LlvmCompiler, aw: ast.AwaitExpr) anyerror!types.LLVMValueRef {
     const self_hdl = self.current_async_hdl orelse {
 
@@ -1555,6 +1849,15 @@ pub fn buildAwait(self: *LlvmCompiler, aw: ast.AwaitExpr) anyerror!types.LLVMVal
     return result;
 }
 
+/// Emits (once, cached by name) a cleanup thunk that releases a lambda's owned
+/// captures when its box is destroyed, returning the thunk address or the zero
+/// word if there is nothing to release.
+///
+/// Walks the lambda's captures and, for each one whose local type is owned,
+/// records its env slot index; if none are owned the box needs no destructor
+/// and this returns 0. Otherwise it builds an internal `(env) -> void` function
+/// that loads and releases each owned capture from the environment, so ARC over
+/// closures is balanced. `span` is currently unused.
 fn buildClosureCleanup(self: *LlvmCompiler, lambda_name: []const u8, span: ast.Span) anyerror!types.LLVMValueRef {
     const zero = core.LLVMConstInt(self.val_type, 0, 0);
     const caps = self.lambda_captures.get(lambda_name) orelse return zero;
@@ -1602,15 +1905,23 @@ fn buildClosureCleanup(self: *LlvmCompiler, lambda_name: []const u8, span: ast.S
     return try self.fnRefInt(clean_fn, name);
 }
 
-// Substitute a struct's type params in a field's type args with the instantiation's concrete args,
-// so a generic struct's `List<T>` field default-constructs the CONCRETE `List<int>` -- not the erased
-// `List<T>`, which (now that the backing store is a real generic RawBuffer, not the Storage intrinsic)
-// links against an un-monomorphised RawBuffer_init/_delete. One level plus nested generics.
+/// Substitutes type parameters for concrete type arguments across a list of
+/// type refs, returning a freshly allocated slice.
+///
+/// Element-wise [`substOneTypeRef`]; used by [`initDefaultContainerFields`] to
+/// specialise a generic field's declared type (e.g. `List<T>` -> `List<int>`)
+/// before default-constructing it.
 fn substFieldTypeArgs(self: *LlvmCompiler, params: []const ast.TypeRef, tparams: []const []const u8, targs: []const ast.TypeRef) anyerror![]ast.TypeRef {
     const out = try self.allocator.alloc(ast.TypeRef, params.len);
     for (params, 0..) |p, i| out[i] = try substOneTypeRef(self, p, tparams, targs);
     return out;
 }
+/// Substitutes type parameters in a single type ref, recursing into generic
+/// arguments.
+///
+/// An `.ident` matching a type parameter name becomes the corresponding
+/// argument; a `.generic` has its arguments substituted (via
+/// [`substFieldTypeArgs`]) while keeping its name; anything else passes through.
 fn substOneTypeRef(self: *LlvmCompiler, p: ast.TypeRef, tparams: []const []const u8, targs: []const ast.TypeRef) anyerror!ast.TypeRef {
     switch (p) {
         .ident => |nm| {
@@ -1627,6 +1938,18 @@ fn substOneTypeRef(self: *LlvmCompiler, p: ast.TypeRef, tparams: []const []const
     }
 }
 
+/// Default-initialises a struct's fields that have an implied empty/zero value
+/// so a struct built without an explicit constructor is not left with garbage
+/// container fields.
+///
+/// For each field it synthesises and compiles a default expression: `List<...>`
+/// -> `List<...>()` (type args substituted for the concrete instantiation),
+/// `string` -> `""`, and a nested struct that has a no-arg constructor ->
+/// `T()`. Other field types are left untouched (assumed set explicitly).
+/// Inline value-struct fields are byte-copied into place; reference fields are
+/// stored as a word. The `default_ctor_depth > 24` guard prevents unbounded
+/// recursion through mutually default-constructing structs. Uses
+/// [`structHasNoArgCtor`] to decide the nested-struct case.
 pub fn initDefaultContainerFields(self: *LlvmCompiler, struct_name: []const u8, instance_ptr: types.LLVMValueRef, span: ast.Span, type_args: []const ast.TypeRef) anyerror!void {
     const sd = self.structs.get(struct_name) orelse return;
     if (self.default_ctor_depth > 24) return;
@@ -1639,8 +1962,6 @@ pub fn initDefaultContainerFields(self: *LlvmCompiler, struct_name: []const u8, 
         const zero_expr: ?ast.Expression = switch (f.type_name) {
             .generic => |g| blk: {
                 if (!std.mem.eql(u8, g.name, "List")) break :blk null;
-                // Substitute the struct's type params (e.g. T) with this instantiation's args (e.g. int)
-                // so we build the concrete List<int>, not the erased List<T>.
                 const cparams = substFieldTypeArgs(self, g.params, sd.type_params, type_args) catch g.params;
                 callee_expr = ast.Expression{ .kind = .{ .ident = "List" } };
                 break :blk ast.Expression{ .kind = .{ .generic_call = .{
@@ -1677,9 +1998,6 @@ pub fn initDefaultContainerFields(self: *LlvmCompiler, struct_name: []const u8, 
         const f_tstr = self.typeRefToString(f.type_name) catch "";
         const ftbase = getStructBaseName(f_tstr);
         if (self.structs.contains(ftbase) and self.fieldStoredInline(ftbase)) {
-            // Inline nested value-struct field: copy the default-constructed struct's bytes INTO the slot,
-            // matching the inline layout (struct_init does the same). Storing a pointer here would leave the
-            // inline region uninitialised -> garbage reads (the default-ctor nested-struct case).
             const fsz = self.getTypeSize(f.type_name, false);
             _ = try self.buildValueStructCopyInto(addr, fv, fsz);
         } else {
@@ -1690,6 +2008,12 @@ pub fn initDefaultContainerFields(self: *LlvmCompiler, struct_name: []const u8, 
     }
 }
 
+/// Whether a struct can be constructed with no user arguments.
+///
+/// True if it has an `init`/`new` method whose only parameter is `self`, or if
+/// it has no `init`/`new` at all (implicit default construction). False if the
+/// constructor requires arguments. Guards the nested-struct default case in
+/// [`initDefaultContainerFields`].
 fn structHasNoArgCtor(self: *LlvmCompiler, struct_name: []const u8) bool {
     const sd = self.structs.get(struct_name) orelse return false;
     for (sd.methods) |*m| {
@@ -1704,22 +2028,22 @@ fn structHasNoArgCtor(self: *LlvmCompiler, struct_name: []const u8) bool {
     return true;
 }
 
-// A module-level `const` whose initializer is a trivial scalar literal can be inlined at each reference
-// (cheap, no allocation). Anything else — a function call, a string, an allocation, an array/struct
-// literal — must be evaluated ONCE, because re-running the initializer at every reference re-allocates
-// (an unbounded per-use leak: e.g. gzip's `const CRC_TABLE = crcTable()` was rebuilt on every byte).
+/// Whether a module-level const's initialiser is a plain literal, so it can be
+/// emitted inline instead of behind a lazy-init guard.
 fn isTrivialConstLiteral(expr: ast.Expression) bool {
-    // Any literal (int/float/bool/string/decimal) is a compile-time constant: inlining it at each
-    // reference is cheap and allocation-free, so it must NOT get the memoization guard — guarding hot-path
-    // scalar/string consts (status codes, header names, MIME types) added a branch + global load per
-    // reference and tanked throughput. Only a NON-literal initializer (a function call, an allocation, an
-    // array/struct literal) needs evaluating once; those are the ones that re-allocate per reference.
     return expr.kind == .literal;
 }
 
-// Reference to a module-level `const`. Trivial literals inline; everything else is lazily memoized into a
-// process-lifetime global (computed on the first reference reached at runtime, loaded thereafter) so the
-// initializer runs exactly once.
+/// Lowers a reference to a module-level `const` with lazy, run-once
+/// initialisation, returning the const's value word.
+///
+/// A trivial literal const is just recompiled inline. For a non-trivial
+/// initialiser (which may allocate or call functions) it emits two internal
+/// globals per const, a value slot and a `done` flag, and guards the
+/// initialiser: on first reference it computes and stores the value and sets
+/// the flag, on later references it loads the cached value. This gives
+/// deterministic first-use initialisation without a static initialiser (which
+/// Nova does not have) and memoises so the initialiser runs at most once.
 pub fn compileConstRef(self: *LlvmCompiler, name: []const u8, val: ast.Expression) anyerror!types.LLVMValueRef {
     if (isTrivialConstLiteral(val)) return try self.compileExpression(val);
 
@@ -1734,9 +2058,6 @@ pub fn compileConstRef(self: *LlvmCompiler, name: []const u8, val: ast.Expressio
 
     var val_g = core.LLVMGetNamedGlobal(self.module, val_z.ptr);
     if (val_g == null) {
-        // Internal linkage: the T6 per-file object split compiles each source file as its own module, so
-        // a const referenced from several files would emit this global in each object and clash at link.
-        // Private per-object caches are fine — the initializer still runs at most once per object file.
         val_g = core.LLVMAddGlobal(self.module, self.val_type, val_z.ptr);
         core.LLVMSetInitializer(val_g, core.LLVMConstInt(self.val_type, 0, 0));
         core.LLVMSetLinkage(val_g, .LLVMInternalLinkage);
@@ -1756,8 +2077,6 @@ pub fn compileConstRef(self: *LlvmCompiler, name: []const u8, val: ast.Expressio
     _ = core.LLVMBuildCondBr(self.builder, need, init_bb, cont_bb);
 
     core.LLVMPositionBuilderAtEnd(self.builder, init_bb);
-    // compileExpressionInner (NOT compileExpression): the value is MOVED into the global and lives for the
-    // program's lifetime, so it must not be tracked as a temporary and released at the statement boundary.
     const computed = try compileExpressionInner(self, val);
     _ = core.LLVMBuildStore(self.builder, self.coerceToSlotType(computed, self.val_type), val_g);
     _ = core.LLVMBuildStore(self.builder, core.LLVMConstInt(self.i1_type, 1, 0), done_g);
@@ -1767,6 +2086,18 @@ pub fn compileConstRef(self: *LlvmCompiler, name: []const u8, val: ast.Expressio
     return core.LLVMBuildLoad2(self.builder, self.val_type, val_g, "const_val");
 }
 
+/// THE expression entry point: lowers `expr` to a value and registers it as an
+/// ARC temporary when this evaluation OWNS the result.
+///
+/// Delegates to [`compileExpressionInner`] for the actual lowering, then
+/// consults the ownership disposition of the expression. If the value is merely
+/// borrowed, it is returned as-is. If it is owned, the value is spilled to a
+/// stack slot (via [`spillTemp`]) and pushed onto `pending_temps`, so
+/// [`drainTemporaries`] releases it at the end of the statement, preventing
+/// leaks of intermediate results. Value structs with no owned fields, or ones
+/// returned as a borrow, are exempt from tracking. Every place that needs an
+/// expression's value should call THIS, not `compileExpressionInner`, so the
+/// cleanup is not skipped.
 pub fn compileExpression(self: *LlvmCompiler, expr: ast.Expression) anyerror!types.LLVMValueRef {
     const val = try compileExpressionInner(self, expr);
     switch (self.acquisitionDisposition(&expr)) {
@@ -1774,18 +2105,21 @@ pub fn compileExpression(self: *LlvmCompiler, expr: ast.Expression) anyerror!typ
         .owned => {},
     }
     const t = (try self.resolveExpressionTypeName(&expr)) orelse return val;
-    // M-1: value-struct temp registration. A scalar-only value struct is never ARC-owned, so skip it
-    // (a drain nova_release would free a stack alloca -> SIGBUS). An owned-field value struct is
-    // registered ONLY when it is a CONSTRUCTION (owned temp) -- then the drain drops its owned fields
-    // via dropValueStruct. A BORROW (a container get / field / variable) is a VIEW whose owner lives
-    // elsewhere, so it must NOT be dropped -- dropping it would release the buffer element it aliases
-    // (the grow-copy `newData.set(i, self.data.get(i))` double-free).
     if (self.isValueStructName(t) and (!self.valueStructHasOwnedFields(t) or self.returnIsBorrow(&expr))) return val;
     const slot = try spillTemp(self, val);
     try self.pending_temps.append(self.allocator, .{ .val = val, .slot = slot, .type_name = t, .expr_id = expr.id });
     return val;
 }
 
+/// Allocates an entry-block stack slot, zero-inits it there, stores `val` into
+/// it at the current point, and returns the slot.
+///
+/// The alloca is placed at the top of the function's entry block (before the
+/// first instruction) so it dominates all uses and is not re-run inside loops;
+/// the zero-store also happens in the entry block so an unreleased-then-reloaded
+/// slot reads null rather than garbage. Backs [`compileExpression`] and
+/// [`registerTemporary`]; the slot is what [`drainTemporaries`] reloads and
+/// releases.
 fn spillTemp(self: *LlvmCompiler, val: types.LLVMValueRef) anyerror!types.LLVMValueRef {
     const cur_bb = core.LLVMGetInsertBlock(self.builder);
     const fn_val = core.LLVMGetBasicBlockParent(cur_bb);
@@ -1802,11 +2136,15 @@ fn spillTemp(self: *LlvmCompiler, val: types.LLVMValueRef) anyerror!types.LLVMVa
     return slot;
 }
 
+/// Resolves the storage width and LLVM integer type for an `Atomic<T>` cell,
+/// or fails compilation with a diagnostic for an unsupported `T`.
+///
+/// Returns the bit width, an `is_i64` flag, byte size, and the LLVM type used
+/// for atomic loads/stores/RMWs. `Atomic<T>` is only sound for integer and bool
+/// types; a non-primitive or floating-point `T` prints a compiler error and
+/// calls `process.exit(70)` (there is no valid atomic representation, so this
+/// aborts rather than returning an error to unwind).
 pub fn atomicCell(self: *LlvmCompiler, t_name: []const u8) struct { bits: u32, is_i64: bool, size: usize, ty: types.LLVMTypeRef } {
-    // FR/soundness: Atomic<T> is only sound for the integer and bool widths the runtime nova_atomic_*
-    // helpers support (i8..i64 / u8..u64 / bool). A non-primitive or float T used to default to 32 bits
-    // silently, so Atomic<string> / Atomic<SomeStruct> treated a pointer as an i32 and corrupted memory.
-    // Fail closed: reject anything that is not an integer or bool primitive, loudly, rather than guessing.
     const pr = types_mod.cgPrim(t_name) orelse {
         std.debug.print(
             "\x1b[1m\x1b[31mcompiler error:\x1b[0m\x1b[1m Atomic<{s}> is not supported\x1b[0m\n" ++
@@ -1834,6 +2172,13 @@ pub fn atomicCell(self: *LlvmCompiler, t_name: []const u8) struct { bits: u32, i
     return .{ .bits = bits, .is_i64 = is_i64, .size = @max(1, bits / 8), .ty = llvm_ty };
 }
 
+/// Emits a null-check that traps with a source location when a required
+/// optional is dereferenced while absent.
+///
+/// A no-op unless `obj_expr` is statically optional. Otherwise it branches on
+/// `handle == 0`: the fail branch calls `nova_optional_deref_fail` with a
+/// `file:line` string and is `unreachable`; the ok branch continues. This is
+/// the runtime backstop for non-null-asserted optional member access.
 pub fn guardOptionalDeref(self: *LlvmCompiler, obj_expr: *const ast.Expression, handle: types.LLVMValueRef, span: ast.Span) anyerror!void {
     if (!self.isOptionalExpr(obj_expr)) return;
     const cur_bb = core.LLVMGetInsertBlock(self.builder);
@@ -1859,6 +2204,14 @@ pub fn guardOptionalDeref(self: *LlvmCompiler, obj_expr: *const ast.Expression, 
     core.LLVMPositionBuilderAtEnd(self.builder, ok_bb);
 }
 
+/// Shadow-verification only: compares codegen's move/drop decision for a
+/// temporary against the typed IR ownership pass and bumps agree/disagree
+/// counters.
+///
+/// `cg` is what codegen decided (`.move` when a temp was consumed, `.drop` when
+/// it was released); `id` identifies the expression. Runs only under
+/// `sema_shadow.report_enabled` and never affects emitted code; it exists to
+/// catch divergence between the two ownership models while they are both live.
 fn diffTempOp(self: *LlvmCompiler, id: ast.ExprId, cg: sema_infer.OwnOp) void {
     const ir = self.typed_ir orelse return;
     const pass_op = ir.opOf(id) orelse {
@@ -1882,11 +2235,25 @@ fn diffTempOp(self: *LlvmCompiler, id: ast.ExprId, cg: sema_infer.OwnOp) void {
     }
 }
 
+/// Manually registers an already-computed value as an owned ARC temporary of
+/// type `type_name`.
+///
+/// The imperative counterpart to the automatic tracking in
+/// [`compileExpression`]: spills the value and appends a `pending_temps` entry
+/// (with no expr id) so it will be released by [`drainTemporaries`]. Used by
+/// call sites that synthesise an owned value outside the normal expression flow.
 pub fn registerTemporary(self: *LlvmCompiler, val: types.LLVMValueRef, type_name: []const u8) anyerror!void {
     const slot = try spillTemp(self, val);
     try self.pending_temps.append(self.allocator, .{ .val = val, .slot = slot, .type_name = type_name });
 }
 
+/// Removes `val` from the pending-temporary list because ownership of it has
+/// been transferred (moved) to somewhere that will release it.
+///
+/// Scans from the most recent entry and removes the first matching one, so a
+/// temporary consumed by a store/return/argument is not double-released by
+/// [`drainTemporaries`]. Under shadow reporting it records the decision as a
+/// `.move` via [`diffTempOp`].
 pub fn consumeTemporary(self: *LlvmCompiler, val: types.LLVMValueRef) void {
     var i = self.pending_temps.items.len;
     while (i > 0) {
@@ -1900,6 +2267,15 @@ pub fn consumeTemporary(self: *LlvmCompiler, val: types.LLVMValueRef) void {
     }
 }
 
+/// Shadow-verification only: compares the string-derived destructor type name a
+/// temporary carries against the name the typed IR would render, bumping
+/// agree/disagree counters.
+///
+/// Codegen historically keyed destructors by a rendered type-name string;
+/// this cross-checks that against the typed IR's `TypeId`-rendered name (both
+/// the type-param-substituted form and the raw form) to detect the
+/// "ownership-by-typename" corruption class. Diagnostic only; no effect on
+/// emitted code. Runs under `sema_shadow.report_enabled`.
 fn diffDtorName(self: *LlvmCompiler, t: @import("llvm_codegen.zig").PendingTemp) void {
     if (t.expr_id == .unassigned) {
         sema_shadow.dtor_name_no_id += 1;
@@ -1945,6 +2321,14 @@ fn diffDtorName(self: *LlvmCompiler, t: @import("llvm_codegen.zig").PendingTemp)
     }
 }
 
+/// Resolves the destructor function to call when releasing a pending temporary,
+/// preferring the typed-IR `TypeId` over the carried type-name string.
+///
+/// If the temp has an expr id and the typed IR knows its (possibly
+/// instantiation-specific) type, it uses `getOrCreateDestructorByTypeId`;
+/// otherwise it falls back to the string-keyed `getOrCreateDestructor`. The
+/// TypeId path is preferred because it is not vulnerable to name-string
+/// ambiguity. Called from [`drainTemporaries`].
 fn drainDtor(self: *LlvmCompiler, t: @import("llvm_codegen.zig").PendingTemp) anyerror!?types.LLVMValueRef {
     if (t.expr_id != .unassigned) {
         if (self.typed_ir) |ir| {
@@ -1957,6 +2341,17 @@ fn drainDtor(self: *LlvmCompiler, t: @import("llvm_codegen.zig").PendingTemp) an
     return self.getOrCreateDestructor(t.type_name);
 }
 
+/// Releases and pops all pending ARC temporaries down to a saved `mark`,
+/// emitting the destructor calls at the current point.
+///
+/// Callers snapshot `pending_temps.items.len` as `mark` before an expression
+/// or statement and call this after to clean up everything registered since.
+/// If the current block already has a terminator (e.g. an early return already
+/// drained temps), it only truncates the list without emitting dead releases.
+/// Otherwise it pops in LIFO order, reloading each spilled slot and releasing
+/// it (value structs via `dropValueStruct`, others via the destructor from
+/// [`drainDtor`]), then zeroes the slot so a later reload is null. Under shadow
+/// reporting it also runs [`diffTempOp`]/[`diffDtorName`].
 pub fn drainTemporaries(self: *LlvmCompiler, mark: usize) anyerror!void {
     if (core.LLVMGetBasicBlockTerminator(core.LLVMGetInsertBlock(self.builder)) != null) {
 
@@ -1971,8 +2366,6 @@ pub fn drainTemporaries(self: *LlvmCompiler, mark: usize) anyerror!void {
         if (sema_shadow.report_enabled) diffDtorName(self, t);
 
         const loaded = core.LLVMBuildLoad2(self.builder, self.val_type, t.slot, "tmp_rel");
-        // M-1: an owned-field value struct temp is inline stack storage -- drop its owned fields via
-        // the destructor directly, never nova_release (which would free a stack address).
         if (self.isValueStructName(t.type_name)) {
             try self.dropValueStruct(loaded, t.type_name, null);
         } else {
@@ -1984,14 +2377,32 @@ pub fn drainTemporaries(self: *LlvmCompiler, mark: usize) anyerror!void {
     }
 }
 
+/// The exhaustive expression lowering: one `switch` arm per `ast.Expression`
+/// kind, each emitting IR and returning the result value word.
+///
+/// This is the largest function in the backend and the heart of the file. It
+/// does NOT do ownership/temporary tracking; that is added by its wrapper
+/// [`compileExpression`], which is what almost everything should call. It is
+/// invoked directly only where the wrapper's temp registration must be bypassed
+/// (e.g. inside [`compileConstRef`]'s init guard).
+///
+/// The arms, in source order, cover: literals; identifiers (locals, captures,
+/// globals, bare function references); binary and unary operators (with the
+/// integer canonicalisation and div/overflow guards from [`intOpKind`],
+/// [`canonicalizeInt`], [`emitIntDivGuard`]); `if` expressions; ordinary and
+/// generic calls (the bulk: method resolution, trait dispatch, closures, the
+/// SIMD/mem/element-witness intrinsics, builtin constructors); struct
+/// initialisers; field access; closures/lambdas; indexing; tuples; `try`/`catch`
+/// error handling; optional chaining and `??` nullish coalescing; JSX elements;
+/// block and template (string-interpolation) expressions; `cast`; and
+/// `await`/`spawn` (forwarding to [`buildAwait`]/[`buildGo`]). Value structs vs
+/// reference types, and the single-word value representation, drive the many
+/// `IntToPtr`/`PtrToInt`/coercion steps throughout.
 fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!types.LLVMValueRef {
     switch (expr.kind) {
         .literal => |lit| {
             switch (lit) {
                 .integer => |val| {
-                    // Reinterpret the i64 bit pattern as u64 so a full-width literal (for example
-                    // 0xffffffffffffffff, which is -1 as i64) lowers to the right constant instead of
-                    // overflowing @intCast.
                     return core.LLVMConstInt(self.val_type, @bitCast(val), 0);
                 },
                 .bool => |b| {
@@ -2008,7 +2419,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     const element_size: usize = 8;
                     const size_val = core.LLVMConstInt(self.val_type, arr.len * element_size, 0);
 
-                    // Allocate a real ptr (provenance) and GEP element stores from it -- no inttoptr.
                     const base = try self.compileAllocArray(size_val);
                     for (arr, 0..) |elem, idx| {
                         const val = try self.compileExpression(elem);
@@ -2019,11 +2429,9 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     return base;
                 },
                 .array_repeat => |ar| {
-                    // [value; count] : allocate count 8-byte slots, evaluate value ONCE, fill via a
-                    // runtime loop (LLVM lowers a constant-value fill to a memset).
                     const element_size: usize = 8;
                     const size_val = core.LLVMConstInt(self.val_type, ar.count * element_size, 0);
-                    const array_ptr_val = try self.compileAllocArray(size_val); // real ptr (provenance)
+                    const array_ptr_val = try self.compileAllocArray(size_val);
                     const fill_val = self.coerceToSlotType(try self.compileExpression(ar.value.*), self.val_type);
 
                     const cur_fn = core.LLVMGetBasicBlockParent(core.LLVMGetInsertBlock(self.builder));
@@ -2058,8 +2466,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     return core.LLVMConstReal(core.LLVMDoubleType(), val);
                 },
                 .decimal => |digits| {
-                    // Interned + lazily-initialised: the parse+alloc runs once per distinct literal, then every
-                    // use is a load. Removes thousands of throwaway `0m` allocations per request in hot paths.
                     return try self.getOrCreateDecimalLiteral(digits);
                 },
                 else => {
@@ -2129,8 +2535,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 switch (bin.left.kind) {
                     .ident => |name| {
 
-                        // Reassigning a narrowed local invalidates its proven-present status: the new value may
-                        // be absent, so `??` must no longer short-circuit it (value-optional-zero correctness).
                         _ = self.narrowed_present.remove(name);
 
                         if (self.envCaptureIndex(name)) |idx| {
@@ -2233,26 +2637,11 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
 
                                 const f_type_str = try self.typeRefToString(field_type_ref);
 
-                                // Inline nested value-struct field: the slot holds the struct's bytes
-                                // inline, not an 8-byte pointer. `self.field = StructInit(...)` must
-                                // memcpy the RHS struct into the inline region (Swift value semantics),
-                                // not store its address as a pointer (which the later read would then
-                                // misinterpret field-by-field as garbage).
                                 {
                                     const fw_base = getStructBaseName(f_type_str);
                                     if (self.structs.contains(fw_base) and self.fieldStoredInline(fw_base)) {
                                         const fsz = self.getTypeSize(field_type_ref, false);
                                         _ = try self.buildValueStructCopyInto(addr, r_val, fsz);
-                                        // The memcpy SHARES the RHS struct's owned/container fields (its `items`
-                                        // pointer is copied, not the heap list). If the RHS is a BORROW (a
-                                        // variable / field / index read), the source still owns those fields and
-                                        // WILL drop them at its scope end -- so the field's inline copy needs its
-                                        // OWN references, else it dangles (e.g. `class Box{h:Holder}` +
-                                        // `self.h = h` left Box.h.items aliasing the caller's list, freed by the
-                                        // caller's dtor -> UAF in List.size). Retain/deep-copy the owned fields,
-                                        // mirroring the let-binding copy path. A fresh construction
-                                        // (`self.h = Holder(...)`) already owns distinct storage, so it is NOT a
-                                        // borrow and is skipped (retaining it would over-own / leak).
                                         const is_r_borrow = (bin.right.kind == .ident or bin.right.kind == .field_access or bin.right.kind == .index);
                                         if (is_r_borrow) {
                                             try self.retainValueStructOwnedFields(addr, f_type_str);
@@ -2304,17 +2693,9 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                         return error.FieldAccessObjectNotStruct;
                     },
                     .index => |idx| {
-                        // a[i] = v : direct indexed store, mirror of the .index read path. String
-                        // elements are 1 byte; array elements are the 8-byte value-word (a double RHS is
-                        // bitcast to the word via coerceToSlotType). NOTE: value-element semantics -- no
-                        // ARC on the overwritten slot yet, so this is sound for value arrays ([int]/[f64])
-                        // but not arrays of reference types (that lands with the fixed-array ARC design).
                         const base = try self.compileExpression(idx.object.*);
                         try self.guardOptionalDeref(idx.object, base, idx.span);
                         const off = try self.compileExpression(idx.index.*);
-                        // NOTE: string via NAME (resolveExpressionTypeName), not isStringExpr: a collection
-                        // ELEMENT that is a string has no concrete TypeId at the index expr, so isStringExpr
-                        // would miss it and take the array path (corpus 53_for_loops test_collection_string).
                         const is_string = self.isStringExpr(idx.object);
                         if (is_string) {
                             const saddr = core.LLVMBuildAdd(self.builder, base, off, "idx_store_addr");
@@ -2323,8 +2704,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                             _ = core.LLVMBuildStore(self.builder, b, sptr);
                             return r_val;
                         }
-                        // GEP the base `ptr` directly (mirror of the read). Float arrays store the real
-                        // element type; others the i64 word.
                         const base_ptr = self.arrayBasePtr(base);
                         var st_idxs = [_]types.LLVMValueRef{off};
                         if (self.arrayElemFloatLLVM(idx.object)) |ety| {
@@ -2343,11 +2722,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 }
             }
 
-            // left_type/right_type stay: they are load-bearing NAME inputs to numToString / intOpKind /
-            // payloadEnumBoxWords below (those take a rendered type name, not a TypeId). What DID move to the
-            // typed IR are the three operand-type PREDICATES, which used to string-compare these names against
-            // "string"/"float"/...: they now use isStringExpr / isFloatExpr. The string compares were a
-            // redundant fallback behind the same isStringExpr check; corpus + --asan confirm nothing needed it.
             const left_type = try self.resolveExpressionTypeName(bin.left);
             const right_type = try self.resolveExpressionTypeName(bin.right);
 
@@ -2423,10 +2797,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 }
             }
 
-            // String concatenation takes precedence over float arithmetic: `"s" + f` is a concat where the
-            // float operand is formatted (via numToString below), NOT a float-add of the string pointer.
-            // Without this guard, `is_float_op` wins and the string pointer is bit-cast to a double and FAdd'd,
-            // producing garbage that later crashes when read back as a string.
             if (is_float_op and !is_string_concat) {
 
                 l_val = core.LLVMBuildBitCast(self.builder, l_val, core.LLVMDoubleType(), "l_double");
@@ -2438,9 +2808,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     .div => return core.LLVMBuildFDiv(self.builder, l_val, r_val, "fdivtmp"),
                     .mod => return core.LLVMBuildFRem(self.builder, l_val, r_val, "fremtmp"),
                     .eq, .ne, .lt, .gt, .le, .ge => {
-                        // `!=` must be UNORDERED-not-equal (UNE): IEEE requires `nan != nan` to be
-                        // true, and ordered-not-equal (ONE) is false when either operand is NaN.
-                        // `==` stays ordered (OEQ) so `nan == nan` is false. This mirrors C `==`/`!=`.
                         const pred = switch (bin.op) {
                             .eq => types.LLVMRealPredicate.LLVMRealOEQ,
                             .ne => types.LLVMRealPredicate.LLVMRealUNE,
@@ -2555,13 +2922,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 .Or, .bit_or => return core.LLVMBuildOr(self.builder, l_val, r_val, "ortmp"),
                 .bit_xor => return core.LLVMBuildXor(self.builder, l_val, r_val, "xortmp"),
                 .eq, .ne, .lt, .gt, .le, .ge => {
-                    // Payload-carrying enum equality: `E.A(3) == E.A(3)` must compare by VALUE, not heap
-                    // identity. Every variant box of an enum is allocated at the SAME size (tag + max payload
-                    // words) and zero-padded, and a given tag always means the same variant/layout, so a
-                    // fixed-width word-by-word compare of the two boxes is correct for value-type payloads.
-                    // (A string / heap payload field still compares by pointer identity -- a documented
-                    // limitation; a fully structural compare would dispatch per field type.) Payload-LESS
-                    // enums are plain integer tags and already compare correctly via the integer path below.
                     if (bin.op == .eq or bin.op == .ne) {
                         if (self.payloadEnumBoxWords(left_type, right_type)) |nwords| {
                             var acc = core.LLVMConstInt(self.i1_type, 1, 0);
@@ -2577,7 +2937,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                                 const weq = core.LLVMBuildICmp(self.builder, types.LLVMIntPredicate.LLVMIntEQ, lw, rw, "eeq_w");
                                 acc = core.LLVMBuildAnd(self.builder, acc, weq, "eeq_acc");
                             }
-                            // Same box pointer (incl. an aliased value) is trivially equal.
                             const same = core.LLVMBuildICmp(self.builder, types.LLVMIntPredicate.LLVMIntEQ, l_val, r_val, "eeq_same");
                             var res = core.LLVMBuildOr(self.builder, acc, same, "eeq_eq");
                             if (bin.op == .ne) res = core.LLVMBuildXor(self.builder, res, core.LLVMConstInt(self.i1_type, 1, 0), "eeq_ne");
@@ -2726,10 +3085,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
         },
         .call => |call| {
 
-            // Optional-chaining METHOD call: `obj?.method(args)` where `obj` is `T | undefined`. Evaluate
-            // `obj` once; if present, call `T.method(args)` and yield the result as `R | undefined`; if
-            // absent, yield `undefined`. The checker already permits this form; codegen used to treat
-            // `method` as a field and fail with FieldNotFound.
             if (call.callee.kind == .optional_chaining) {
                 if (try self.compileOptionalMethodCall(call, &expr)) |v| return v;
             }
@@ -2822,9 +3177,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     if (std.mem.startsWith(u8, obj_t, "Storage<")) {
                         const elem = obj_t["Storage<".len .. obj_t.len - 1];
                         const base = try self.compileExpression(fa.object.*);
-                        // M-10: a value-struct element is stored INLINE in the buffer at its real width,
-                        // not as an 8-byte pointer slot. get() returns the slot ADDRESS (the element is
-                        // the buffer bytes themselves); set() memcpies the element's bytes in. No ARC.
                         const inline_vs = self.isValueStructName(elem);
                         const slot_w: u64 = if (inline_vs) @max(self.getTypeSize(ast.TypeRef{ .ident = getStructBaseName(elem) }, false), 1) else 8;
                         const width = core.LLVMConstInt(self.val_type, slot_w, 0);
@@ -2833,7 +3185,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                             const idx = try self.compileExpression(call.args[0]);
                             const off = core.LLVMBuildMul(self.builder, idx, width, "stg_g_off");
                             const addr = core.LLVMBuildAdd(self.builder, base, off, "stg_g_addr");
-                            if (inline_vs) return addr; // element IS the inline bytes; its value is its address
+                            if (inline_vs) return addr;
                             const ptr = core.LLVMBuildIntToPtr(self.builder, addr, core.LLVMPointerType(self.val_type, 0), "stg_g_ptr");
                             const loaded = core.LLVMBuildLoad2(self.builder, self.val_type, ptr, "stg_g");
 
@@ -2848,9 +3200,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                             const off = core.LLVMBuildMul(self.builder, idx, width, "stg_s_off");
                             const addr = core.LLVMBuildAdd(self.builder, base, off, "stg_s_addr");
                             if (inline_vs) {
-                                // memcpy the element's bytes into the slot, then retain its owned
-                                // (reference) fields so the buffer owns them; the caller's element temp
-                                // drops its own refs, keeping the ledger balanced (uniform copy semantics).
                                 _ = try self.buildValueStructCopyInto(addr, val, @intCast(slot_w));
                                 try self.retainValueStructOwnedFields(addr, elem);
                                 return core.LLVMConstInt(self.val_type, 0, 0);
@@ -2903,8 +3252,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     }
                 }
 
-                // FR-mem Tier 3: mem.xorBytes(dst, a, b, len) writes dst[i]=a[i]^b[i] over raw addresses,
-                // word-at-a-time in the runtime. Non-generic, so it comes through the plain-call path.
                 if (fa.object.kind == .ident and std.mem.eql(u8, fa.object.kind.ident, "mem") and
                     std.mem.eql(u8, fa.field, "xorBytes"))
                 {
@@ -2933,8 +3280,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                         const size = try self.compileExpression(call.args[0]);
                         return try self.compileAllocPersistent(size);
                     }
-                    // bytes.alloc_persistent_nz(size): persistent alloc WITHOUT zeroing the payload. Only
-                    // safe for buffers the caller fills completely before reading (StringBuilder).
                     if (std.mem.eql(u8, fa.field, "alloc_persistent_nz")) {
                         const size = try self.compileExpression(call.args[0]);
                         const nz_fn = if (self.func_map.get("nova_bytes_alloc_persistent_nz")) |f| f else blk: {
@@ -2952,8 +3297,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                         const ptr = try self.compileExpression(call.args[0]);
                         return try self.compileFree(ptr);
                     }
-                    // bytes.arenaMark(): current bump position. bytes.arenaReset(mark): rewind to it,
-                    // bulk-freeing every arena allocation made since (request-scoped region allocation).
                     if (std.mem.eql(u8, fa.field, "arenaMark")) {
                         const f = if (self.func_map.get("nova_arena_mark")) |g| g else blk: {
                             const t = core.LLVMFunctionType(self.val_type, &[_]types.LLVMTypeRef{}, 0, 0);
@@ -2979,9 +3322,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                         _ = core.LLVMBuildCall2(self.builder, ft, f, &args, 1, "");
                         return core.LLVMConstInt(self.val_type, 0, 0);
                     }
-                    // bytes.copy(dst, src, len): bulk memcpy. dst/src are absolute addresses (the caller
-                    // adds any offset). Backs StringBuilder's fast path so response assembly is memcpy-speed,
-                    // not a per-byte Nova loop.
                     if (std.mem.eql(u8, fa.field, "copy")) {
                         const dst = try self.compileExpression(call.args[0]);
                         const src = try self.compileExpression(call.args[1]);
@@ -3075,12 +3415,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                         const byte_val = core.LLVMBuildLoad2(self.builder, self.i8_type, ptr, "byte_val");
                         return core.LLVMBuildZExt(self.builder, byte_val, self.val_type, "byte_val_ext");
                     }
-                    // FR-mem-4: bytes.read_i32/write_i32 (and the u16/i16 pair above) are the native-endian
-                    // raw accessors. They emit exactly what mem.load/store<int> with Endian.little lowers to
-                    // on a little-endian host: an unaligned iN load/store plus the sext/zext. The mem builtins
-                    // are the endianness-explicit superset; new wire codecs should reach for those, while these
-                    // stay as the terse in-memory fast path. Same emitted IR, so they are reconciled by
-                    // construction rather than by routing one through the other.
                     if (std.mem.eql(u8, fa.field, "read_i32")) {
                         const ptr_val = try self.compileExpression(call.args[0]);
                         const offset_val = try self.compileExpression(call.args[1]);
@@ -3143,29 +3477,19 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             if (call.callee.kind == .ident) {
                 const name = call.callee.kind.ident;
 
-                // Coroutine-reactor primitives (self-hosted runtime, phase 4). These let a Nova
-                // reactor drive LLVM coroutines directly, with no Asio.
                 if (std.mem.eql(u8, name, "currentCoro")) {
-                    // The current coroutine's handle, to register with the reactor before suspending.
                     if (self.current_async_hdl) |h| {
                         return core.LLVMBuildPtrToInt(self.builder, h, self.val_type, "cur_coro");
                     }
                     return core.LLVMConstInt(self.val_type, 0, 0);
                 }
                 if (std.mem.eql(u8, name, "coroSuspend")) {
-                    // Yield to the reactor; resumed by nova_reactor_resume when the fd is ready.
                     try self.buildAwaitSuspend();
                     return core.LLVMConstInt(self.val_type, 0, 0);
                 }
                 if (std.mem.eql(u8, name, "coroStart")) {
-                    // Create a coroutine from an async call WITHOUT scheduling it on Asio. Async fns
-                    // have an initial suspend, so kick it once (nova_reactor_resume) to run its body
-                    // to the first coroSuspend, where it registers itself with the reactor. Returns
-                    // the handle for the reactor to drive thereafter.
                     if (call.args.len == 1) {
                         if (try self.awaitedCallHandle(call.args[0], true)) |h| {
-                            // Mark this as a top-level (detached) coroutine so the reactor reaps it
-                            // when it finishes; a spawned-and-awaited coroutine is reaped by its await.
                             const detach_fn = self.func_map.get("nova_reactor_detach").?;
                             var da = [_]types.LLVMValueRef{h};
                             _ = try self.buildCallWithCasts(detach_fn, &da);
@@ -3187,7 +3511,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     }
                 if (self.isStructType(resolved_struct_name)) {
                     const struct_size = self.getTypeSize(ast.TypeRef{ .ident = resolved_struct_name }, false);
-                    // M-1: value struct -> inline (stack) storage instead of heap.
                     const instance_ptr = if (self.isValueStructName(resolved_struct_name))
                         try self.buildValueStructStorage(struct_size)
                     else
@@ -3279,9 +3602,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     break :resolve try self.resolveCalleeName(name);
                 };
 
-                // B1: a bare call to a generic free function (`fn(x)` with no explicit `<T>`) resolves to
-                // the base name, which is not emitted; only the monomorphised `fn__T` exists. Sema records
-                // the SOLVED concrete type args on this call expression, so rebuild the mono name from them.
                 var mono_name: ?[]const u8 = null;
                 defer if (mono_name) |m| self.allocator.free(m);
                 if (!self.func_map.contains(resolved_name)) {
@@ -3300,7 +3620,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                                             ok = false;
                                             break;
                                         };
-                                        // renderLegacy returns a non-owned (store-interned) slice; do NOT free it.
                                         const ma = types_mod.mangleTypeName(self.allocator, rendered) catch {
                                             ok = false;
                                             break;
@@ -3408,13 +3727,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             return try self.buildClosureCall(box_val, call.args);
         },
         .generic_call => |gc| {
-            // M-10 Storage retirement: the typed-element value-witnesses (mem/witness.nova). The
-            // compiler lowers these to the SAME typed copy/drop it emits for struct fields, so a
-            // pure-Nova RawBuffer<T> can own its elements without the `.storage` intrinsic. Called
-            // qualified (`witness.sizeOf<T>()`) or bare after import.
             if (gc.type_args.len == 1) {
-                // Only intercept the `witness.<fn><T>(...)` module-qualified form, so a user method
-                // named store/load/... never collides with a value-witness call.
                 const wcallee: ?[]const u8 = switch (gc.callee.kind) {
                     .field_access => |fa| if (fa.object.kind == .ident and std.mem.eql(u8, fa.object.kind.ident, "witness")) fa.field else null,
                     else => null,
@@ -3482,7 +3795,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     const is_yaml = std.mem.eql(u8, fa.object.kind.ident, "yaml") or std.mem.eql(u8, fa.object.kind.ident, "YamlValue");
                     var target_type = gc.type_args[0];
 
-                    // SE-C: reify the parse target type-param via the TypeId overlay, not current_method_subst.
                     if (target_type == .ident) {
                         if (self.concreteTidForTypeRef(target_type)) |ctid| {
                             target_type = ast.TypeRef{ .ident = try self.symbolName(ctid) };
@@ -3511,11 +3823,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     defer self.allocator.free(binder_name);
                     const resolved_binder = try self.resolveCalleeName(binder_name);
                     const fn_val = self.func_map.get(resolved_binder) orelse self.func_map.get(binder_name) orelse {
-                        // In the ERASED body of a generic `fn f<T>(){ serde.bind<T> }`, T is unbound, so no
-                        // `T__bind` exists. That erased body is a fallback that never runs at runtime (real
-                        // calls route to the per-instantiation spec, which carries the concrete binder), so
-                        // emit a trap rather than failing the whole compile (B6). A genuinely-missing binder
-                        // for a real (known) struct still hard-errors.
                         if (!self.structs.contains(getStructBaseName(rendered))) {
                             self.emitTrapIf(core.LLVMConstInt(core.LLVMInt1Type(), 1, 0), "unreachable: serde.bind on an unresolved type parameter (erased generic body)");
                             return core.LLVMConstInt(self.val_type, 0, 0);
@@ -3557,7 +3864,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     return try self.buildCallWithCasts(fn_val, &dargs);
                 }
 
-                // serde.planFor<T>(cols) -> T__planFor(cols): resolve field->column positions once.
                 if (fa.object.kind == .ident and std.mem.eql(u8, fa.object.kind.ident, "serde") and
                     std.mem.eql(u8, fa.field, "planFor") and gc.type_args.len == 1 and gc.args.len == 1)
                 {
@@ -3578,7 +3884,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     return try self.buildCallWithCasts(fn_val, &pargs);
                 }
 
-                // serde.bindRow<T>(row, plan) -> T__bindRow(row, plan): positional bind, no name Map / trait.
                 if (fa.object.kind == .ident and std.mem.eql(u8, fa.object.kind.ident, "serde") and
                     std.mem.eql(u8, fa.field, "bindRow") and gc.type_args.len == 1 and gc.args.len == 2)
                 {
@@ -3600,8 +3905,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     return try self.buildCallWithCasts(fn_val, &bargs);
                 }
 
-                // serde.bindAll<T>(rs) -> T__bindAll(rs): fused whole-result-set positional bind (indices as
-                // locals, tight loop) -- matches a hand-rolled decode, no planFor List / per-row bindRow call.
                 if (fa.object.kind == .ident and std.mem.eql(u8, fa.object.kind.ident, "serde") and
                     std.mem.eql(u8, fa.field, "bindAll") and gc.type_args.len == 1 and gc.args.len == 1)
                 {
@@ -3622,8 +3925,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     return try self.buildCallWithCasts(fn_val, &bargs);
                 }
 
-                // serde.bindWire<T>(w) -> T__bindWire(w): decode WireRows (one buffer + offsets) STRAIGHT
-                // into structs, no per-row Row/RawBuffer/DbValue -- the buffer->struct path.
                 if (fa.object.kind == .ident and std.mem.eql(u8, fa.object.kind.ident, "serde") and
                     std.mem.eql(u8, fa.field, "bindWire") and gc.type_args.len == 1 and gc.args.len == 1)
                 {
@@ -3779,7 +4080,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     {
                         const g_ref = ast.TypeRef{ .generic = .{ .name = cfa.field, .params = gc.type_args } };
                         const struct_size = self.getTypeSize(g_ref, false);
-                        // M-1: value struct -> inline (stack) storage instead of heap.
                         const instance_ptr = if (self.isValueStructName(cfa.field))
                             try self.buildValueStructStorage(struct_size)
                         else
@@ -3913,8 +4213,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
 
                 if (std.mem.eql(u8, resolved_struct_name, "Storage")) {
                     const n = try self.compileExpression(gc.args[0]);
-                    // M-10: size the buffer by the element's real slot width. A value-struct element is
-                    // stored inline at getTypeSize bytes; everything else uses an 8-byte pointer slot.
                     var slot_w: u64 = 8;
                     if (gc.type_args.len > 0) {
                         const en = self.typeRefToString(gc.type_args[0]) catch "";
@@ -3933,7 +4231,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                         }
                     };
                     const struct_size = self.getTypeSize(g_ref, false);
-                    // M-1: value struct constructed via its init() method is stored inline (stack).
                     const instance_ptr = if (self.isValueStructName(resolved_struct_name))
                         try self.buildValueStructStorage(struct_size)
                     else
@@ -4068,10 +4365,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     args[idx] = val;
                 }
 
-                // A generic call to an async fn (`makeGeneric<Dto>(d)` where the mono spec is async) must be
-                // DRIVEN to completion and its result extracted from the coroutine promise, exactly like a
-                // plain async call -- otherwise the raw ramp handle is returned and read as the result
-                // (garbage). The plain-call path already does this; the generic path did not (B6).
                 if (self.async_fns.contains(callee_name)) {
                     return try self.buildDriveAsyncCall(fn_val, args);
                 }
@@ -4155,9 +4448,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             const total_size = self.getTypeSize(ast.TypeRef{ .ident = si.type_name }, false);
             const size_val = core.LLVMConstInt(self.val_type, total_size, 0);
 
-            // M-1: a value struct is stored inline on the stack (alloca), with no ARC header and no
-            // retain/release/free (isOwnedTypeId returns false for it). Fields are written below at the
-            // same 0-based offsets used for the heap payload, so the rest of the path is unchanged.
             const struct_ptr_val = if (self.isValueStructName(si.type_name))
                 try self.buildValueStructStorage(total_size)
             else
@@ -4209,9 +4499,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 const addr = core.LLVMBuildAdd(self.builder, struct_ptr_val, offset_val, "field_addr");
                 const fbase = getStructBaseName(f_type_str);
                 if (!widened_field and self.structs.contains(fbase) and self.fieldStoredInline(fbase)) {
-                    // Inline value-struct field (Swift model): field_val is the address of the constructed
-                    // nested struct; copy its bytes INTO the parent's field slot rather than storing a pointer.
-                    // A flat copy of the parent then deep-copies this field for free.
                     const fsz = self.getTypeSize(field_type_ref, false);
                     _ = try self.buildValueStructCopyInto(addr, field_val, fsz);
                 } else {
@@ -4232,8 +4519,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 else => null,
             };
             if (enum_obj_name) |obj_name_bare| {
-                // Resolve a colliding enum (`Status.Ok`) to the module-scoped enum that THIS reference's
-                // source file declares, so two same-named enums pick the right variant set/tags (S3).
                 const obj_name = self.scopedTypeName(obj_name_bare, fa.span.file);
                 if (self.enums.get(obj_name)) |enum_decl| {
                     var is_tagged = false;
@@ -4281,10 +4566,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 defer self.allocator.free(full_name);
                 var fn_val_opt: ?types.LLVMValueRef = self.func_map.get(full_name) orelse self.func_map.get(fa.field);
                 if (fn_val_opt == null) {
-                    // Deterministically pick the SHORTEST key ending in "_<full_name>" (the most-direct
-                    // module match). Returning the first hashmap hit was order-dependent: "net_url_parse"
-                    // and "net_url_test_url_parse" both end in "_url_parse", so adding modules could flip
-                    // `url.parse` to `url.test_url_parse`.
                     var best_len: usize = std.math.maxInt(usize);
                     var iter = self.func_map.iterator();
                     while (iter.next()) |entry| {
@@ -4306,8 +4587,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             }
 
             if (std.mem.eql(u8, fa.field, "length") or std.mem.eql(u8, fa.field, "len")) {
-                // A fixed array T[N] has a compile-time element count -- return it as a constant
-                // (the heap header holds the BYTE length, not the element count).
                 if (self.typed_ir) |ir| {
                     if (self.type_store) |st| {
                         if (ir.typeOf(fa.object)) |tid| {
@@ -4381,8 +4660,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             const offset = try self.getFieldOffset(obj_type, fa.field);
             const offset_val = core.LLVMConstInt(self.val_type, offset, 0);
             const addr = core.LLVMBuildAdd(self.builder, obj_ptr, offset_val, "field_addr");
-            // An inline value-struct field IS its bytes; its "value" is the address of that inline storage
-            // (a value-struct value is an address), so return the address without loading a pointer.
             const ftbase = getStructBaseName(try self.typeRefToString(field_type_ref));
             if (self.structs.contains(ftbase) and self.fieldStoredInline(ftbase)) {
                 return addr;
@@ -4457,8 +4734,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 const byte_val = core.LLVMBuildLoad2(self.builder, self.i8_type, ptr, "byte_val");
                 return core.LLVMBuildZExt(self.builder, byte_val, self.val_type, "byte_val_ext");
             } else {
-                // GEP the base `ptr` directly (array slots are ptr now -> provenance survives, so LLVM
-                // can vectorize/hoist). Float arrays load the real element type; others the i64 word.
                 const base_ptr = self.arrayBasePtr(obj_ptr);
                 var idxs = [_]types.LLVMValueRef{offset_val};
                 if (self.arrayElemFloatLLVM(idx.object)) |ety| {
@@ -4524,10 +4799,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             core.LLVMPositionBuilderAtEnd(self.builder, prop_bb);
 
             try self.runErrdefers();
-            // Propagating the error is an early return. Inside an `async` fn that means the coroutine
-            // return sequence (store the error into the promise result slot, then branch to the final
-            // suspend), NOT a raw `ret` — a raw `ret` bypasses the coroutine state machine and corrupts
-            // it (the error box is mistaken for a coroutine handle), which crashes on resume.
             if (self.current_async_promise) |promise| {
                 const rslot = self.coroPromiseResultSlot(promise);
                 _ = core.LLVMBuildStore(self.builder, box, rslot);
@@ -4609,10 +4880,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 _ = core.LLVMBuildStore(self.builder, err_val, alloca_val.?);
             }
             var hv = try self.compileExpression(ce.handler.*);
-            // A `catch` yields the ok type. When that ok type is a value-optional (`int | undefined`, from a
-            // `T | undefined | E`), the ok arm is a boxed value-optional, so the handler value must be boxed
-            // too -- otherwise a raw handler value reaches a consuming `?? d`, which unboxes it as a pointer
-            // and SEGVs (F1). `undefined` (0) and an already-boxed value-optional handler are left as-is.
             if (ok_is_valopt and !LlvmCompiler.isUndefinedLiteralExpr(ce.handler) and !self.exprYieldsValoptBox(ce.handler)) {
                 hv = try self.buildValoptBox(self.coerceToSlotType(hv, self.val_type));
             }
@@ -4689,23 +4956,8 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             const left_val = self.coerceToSlotType(try self.compileExpression(nc.left.*), self.val_type);
 
             const nc_is_valopt = self.exprYieldsValoptBox(nc.left);
-            // KNOWN UNSOUND (value-optional-zero collision): the presence test below is `left_val != 0`. For a
-            // value-optional narrowed to its raw inner (`if (x != undefined) { x ?? d }`) a present 0 is
-            // indistinguishable from the absent sentinel (both 0), so `x ?? d` returns d for a present zero.
-            // NOT fixable at this site: three guard attempts (non-optional short-circuit, box-gated, ident-
-            // gated) each regressed serde/DI/try because a genuinely-optional raw value-optional is
-            // statically indistinguishable from a narrowed-present one. The real fix is representational (keep
-            // value-optionals boxed, or a reliable narrowing signal in the typed IR). See the feature
-            // inventory (value-optional-zero) — marked UNSOUND.
             const left_present = if (nc_is_valopt) try self.buildValoptUnbox(left_val) else left_val;
 
-            // value-optional-zero fix: if the left is a RAW (unboxed) value-optional whose local was PROVEN
-            // present by an enclosing `if (x != undefined)` and whose inner is a PRIMITIVE, the value is always
-            // present, so `x ?? d` IS x. Return it directly, bypassing the `left != 0` presence test that
-            // misreads a present 0 as absent. Scope is deliberately tight: the BOXED case already tests the box
-            // pointer correctly (a present-0 box is non-null), and a pointer-typed inner has null==0 as a real
-            // absent marker with no valid present 0, so only the raw-primitive-narrowed case is unsound. Raw
-            // primitives carry no ARC, so returning `left_val` needs no retain/consume.
             if (!nc_is_valopt and nc.left.kind == .ident and self.narrowed_present.contains(nc.left.kind.ident)) {
                 if (self.type_store) |st| {
                     if (self.typeOfExprConcrete(nc.left)) |lt| {
@@ -4720,12 +4972,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
 
             const left_bb_end = core.LLVMGetInsertBlock(self.builder);
 
-            // A NESTED value-optional peel (`g ?? d` where `g : (int | undefined) | undefined`, from
-            // `Map<K, int | undefined>.get()`): the peeled value is the INNER value-optional box, still OWNED
-            // by the container it came from. It binds to an owned value-optional local whose scope-end release
-            // would double-free the container's box. So co-own it: retain the result (below, after the phi).
-            // The phi is 0 for the absent/present-holding-undefined arms, and `nova_retain(0)` is a no-op, so
-            // this is null-safe and only bumps the refcount when a real inner box is peeled.
             const nested_valopt_peel = nc_is_valopt and blk: {
                 const lt = self.typeOfExprConcrete(nc.left) orelse break :blk false;
                 const inner_tid = self.valueOptionalInner(lt) orelse break :blk false;
@@ -4734,9 +4980,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
 
             const rhs_bb = core.LLVMAppendBasicBlock(current_fn, "nc_rhs");
             const merge_bb = core.LLVMAppendBasicBlock(current_fn, "nc_merge");
-            // For a nested value-optional peel, the present arm co-owns the container's inner box, so it must
-            // retain it -- but ONLY on the present path (the absent path yields the raw RHS default, which may
-            // be a non-pointer int like `999` that must NOT be retained). Route present through its own block.
             const present_bb = if (nested_valopt_peel) core.LLVMAppendBasicBlock(current_fn, "nc_present") else null;
 
             const cond_i1 = core.LLVMBuildICmp(self.builder, types.LLVMIntPredicate.LLVMIntNE, left_val, core.LLVMConstInt(self.val_type, 0, 0), "is_not_null");
@@ -4763,11 +5006,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 }
             }
 
-            // For a nested value-optional peel, the result type is the INNER value-optional (`int | undefined`),
-            // so both phi arms must share that boxed representation. The present arm is already the inner box;
-            // box the RHS default too -- unless it is `undefined` (which stays 0 = the inner's undefined) or
-            // already a value-optional box. Without this, `g ?? 999` mixes a boxed present arm with a raw int
-            // 999, and the downstream `?? d` unboxes 999 as a pointer -> SEGV.
             if (nested_valopt_peel and
                 !LlvmCompiler.isUndefinedLiteralExpr(nc.right) and
                 !self.exprYieldsValoptBox(nc.right))
@@ -4832,22 +5070,12 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             return core.LLVMConstInt(self.val_type, 0, 0);
         },
         .template_expr => |te| {
-            // Fast path: a template with a single interpolation and no surrounding literal text -- `${x}`
-            // -- does not need a StringBuilder. Convert the value to a string directly. This removes a
-            // StringBuilder alloc + append + toString + delete for every bare `${x}` (very common in
-            // templated markup: ids, prices, counts). Only strings/prims/decimals take it; optionals and
-            // anything else fall through to the general StringBuilder path below.
             if (te.parts.len == 1 and te.parts[0].kind != .block_expr) {
                 if (self.typed_ir) |ir| {
                     if (self.type_store) |st| {
                         const part0 = te.parts[0];
                         if (ir.typeOf(&part0)) |tid| {
                             switch (st.get(tid)) {
-                                // NOTE: the `.string` case (retain-and-return the interpolated string) is
-                                // deliberately NOT fast-pathed -- aliasing an owned temporary as the template
-                                // result has subtle ownership pitfalls, so strings fall through to the safe
-                                // StringBuilder copy. prim/decimal produce a FRESH owned string (no aliasing),
-                                // so they are unambiguously safe to return directly.
                                 .prim => {
                                     const v = try self.compileExpression(part0);
                                     if (try self.numToStringT(v, tid)) |s| return s;
@@ -4914,9 +5142,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             const target = try self.typeRefToString(c.target_type);
             const src_opt = try self.resolveExpressionTypeName(c.expr);
 
-            // Reading a concrete value out of an `any` carrier: unbox the `{payload, dtor}` box. The payload
-            // is a new reference, so retain it when the target is heap-owned (the box keeps its own ref
-            // until it drops).
             if (src_opt) |src| {
                 if (std.mem.eql(u8, src, "any") and !std.mem.eql(u8, target, "any")) {
                     val = try self.buildAnyUnbox(self.coerceToSlotType(val, self.val_type));
@@ -4930,11 +5155,6 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
 
             if (src_opt) |src| {
                 if (self.traits.contains(src) and self.isStructType(target)) {
-                    // A trait->concrete downcast (`x as Square`) is only sound when the trait object's actual
-                    // concrete type IS the target. The trait object is `{struct_ptr @0, vtable @ptr_size}` and
-                    // the vtable global uniquely identifies the concrete type for this trait, so compare the
-                    // runtime vtable against the target's expected vtable and TRAP on mismatch (D3). Without
-                    // this, `Circle as Square` silently reinterpreted the memory as a Square.
                     const ptr_size = @as(u64, 8);
                     const vt_addr = core.LLVMBuildAdd(self.builder, val, core.LLVMConstInt(self.val_type, ptr_size, 0), "downcast_vt_addr");
                     const vt_ptr = core.LLVMBuildIntToPtr(self.builder, vt_addr, core.LLVMPointerType(self.val_type, 0), "downcast_vt_ptr");
@@ -4967,17 +5187,12 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
 
                     const dbl = core.LLVMBuildBitCast(self.builder, val, core.LLVMDoubleType(), "cast_f2i_dbl");
                     result = core.LLVMBuildFPToSI(self.builder, dbl, self.val_type, "cast_f2i");
-                    // fall through so `2.9 as byte` also gets narrowed to the byte width below
                 } else if (!src_is_float and target_is_float) {
 
                     const dbl = core.LLVMBuildSIToFP(self.builder, val, core.LLVMDoubleType(), "cast_i2f");
                     return core.LLVMBuildBitCast(self.builder, dbl, self.val_type, "cast_i2f_val");
                 }
 
-                // Narrowing integer cast: `long as int`, `int as byte`, `int as short` must discard
-                // the high bits, not silently keep the wider value. Values live in the i64 word, so
-                // truncate to the target integer width and re-extend by its signedness. Previously the
-                // cast was a no-op, so a narrowing `as` returned the untruncated word (silent corruption).
                 if (types_mod.cgPrim(target)) |p| {
                     const is_int_repr = p.repr == .i8 or p.repr == .i16 or p.repr == .i32 or
                         p.repr == .word or p.repr == .i64;
@@ -5002,12 +5217,24 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
     }
 }
 
+/// Whether a type name denotes a floating-point type (`f64`/`double`/`f32`/
+/// `float`), used to pick float vs integer codegen paths.
 fn isFloatTypeName(n: []const u8) bool {
     return std.mem.eql(u8, n, "f64") or std.mem.eql(u8, n, "double") or
         std.mem.eql(u8, n, "f32") or std.mem.eql(u8, n, "float");
 }
 
+/// The result width and signedness chosen for a binary integer operation.
 const IntOpKind = struct { width: u32, signed: bool };
+/// Computes the width/signedness a binary integer op should be performed at from
+/// its two operand type names, or null if neither side is a supported integer.
+///
+/// Only sized integer reprs (i8/i16/i32/word/i64) qualify; floats/decimals/etc
+/// return null. When both sides qualify the wider one wins, and on a tie the
+/// result is unsigned only if BOTH operands are unsigned. This drives
+/// [`canonicalizeInt`] (truncation/extension back to the value word) and the
+/// division guards so integer arithmetic wraps at the intended width. Note that
+/// `int` is 32-bit here, per the language's integer model.
 fn intOpKind(left_name: ?[]const u8, right_name: ?[]const u8) ?IntOpKind {
     const kindOf = struct {
         fn f(name: ?[]const u8) ?IntOpKind {
@@ -5031,12 +5258,20 @@ fn intOpKind(left_name: ?[]const u8, right_name: ?[]const u8) ?IntOpKind {
     return .{ .width = lk.width, .signed = lk.signed and rk.signed };
 }
 
+/// Whether a type name is a 64-bit integer (`long`/`ulong`/`i64`/`u64`), i.e.
+/// already the full value-word width so no truncation/extension is needed.
 fn isWideIntTypeName(n: []const u8) bool {
     return std.mem.eql(u8, n, "long") or std.mem.eql(u8, n, "ulong") or
         std.mem.eql(u8, n, "i64") or std.mem.eql(u8, n, "u64");
 }
 
-// Emit `if (cond) nova_panic_cstr(msg)` inline, leaving the builder in the continuation block.
+/// Emits a conditional runtime trap: if `cond` is true, panic with `msg` and
+/// become `unreachable`, otherwise continue.
+///
+/// Splits the current block into a panic block (calls `nova_panic_cstr` with the
+/// message then `unreachable`) and a continue block, leaving the builder on the
+/// continue block. The generic building block behind the division and overflow
+/// guards ([`emitIntDivGuard`]).
 pub fn emitTrapIf(self: *LlvmCompiler, cond: types.LLVMValueRef, msg: [:0]const u8) void {
     const cur_fn = core.LLVMGetBasicBlockParent(core.LLVMGetInsertBlock(self.builder));
     const panic_bb = core.LLVMAppendBasicBlock(cur_fn, "trap_panic");
@@ -5056,14 +5291,19 @@ pub fn emitTrapIf(self: *LlvmCompiler, cond: types.LLVMValueRef, msg: [:0]const 
     core.LLVMPositionBuilderAtEnd(self.builder, cont_bb);
 }
 
+/// Emits the pre-division safety checks: trap on divide-by-zero, and on the
+/// `INT_MIN / -1` overflow for wide signed division.
+///
+/// Always guards `r_val == 0`. When `signed and width >= 64` it also guards the
+/// single overflowing signed case (`INT64_MIN / -1`), which is UB in LLVM's
+/// `sdiv`. Both use [`emitTrapIf`]. Narrower widths cannot hit the overflow case
+/// once operands are canonicalised, so only the zero check applies there.
 pub fn emitIntDivGuard(self: *LlvmCompiler, l_val: types.LLVMValueRef, r_val: types.LLVMValueRef, signed: bool, width: u32, zero_msg: [:0]const u8, ovf_msg: [:0]const u8) void {
     const zero = core.LLVMConstInt(self.val_type, 0, 0);
     const is_zero = core.LLVMBuildICmp(self.builder, types.LLVMIntPredicate.LLVMIntEQ, r_val, zero, "div_zero");
     self.emitTrapIf(is_zero, zero_msg);
 
     if (signed and width >= 64) {
-        // Signed 64-bit i64 MIN / -1 overflows the machine op (UB). Narrower signed ops run at the
-        // i64 word so they cannot overflow the op; their result wraps on canonicalize (defined).
         const imin = core.LLVMConstInt(self.val_type, @bitCast(@as(i64, std.math.minInt(i64))), 0);
         const neg1 = core.LLVMConstInt(self.val_type, @bitCast(@as(i64, -1)), 0);
         const l_is_min = core.LLVMBuildICmp(self.builder, types.LLVMIntPredicate.LLVMIntEQ, l_val, imin, "div_lmin");
@@ -5073,6 +5313,15 @@ pub fn emitIntDivGuard(self: *LlvmCompiler, l_val: types.LLVMValueRef, r_val: ty
     }
 }
 
+/// Normalises an integer result back into the value word by truncating to
+/// `width` and re-extending, giving correct wraparound and sign for narrow
+/// types.
+///
+/// Nova arithmetic is done in the 64-bit word, but a narrower type must observe
+/// its own overflow behaviour, so after an op the result is truncated to
+/// `width` and then sign- or zero-extended per `signed`. Widths of 64 or more
+/// are already full-width and returned unchanged. This is what makes `int`
+/// (32-bit) arithmetic wrap at 32 bits despite the wider representation.
 pub fn canonicalizeInt(self: *LlvmCompiler, val: types.LLVMValueRef, width: u32, signed: bool) types.LLVMValueRef {
     if (width >= 64) return val;
     const iw = core.LLVMIntType(width);
@@ -5083,6 +5332,14 @@ pub fn canonicalizeInt(self: *LlvmCompiler, val: types.LLVMValueRef, width: u32,
         core.LLVMBuildZExt(self.builder, truncd, self.val_type, "int_zext");
 }
 
+/// Converts a numeric value word to a Nova string by calling the matching
+/// runtime formatter.
+///
+/// Routes to `nova_f64_to_string` (bit-casting the word to a double first),
+/// `nova_bool_to_string`, or `nova_i64_to_string` per the two flags. Returns
+/// `error.HelperNotFound` if the runtime formatter is not linked. The
+/// name-driven and TypeId-driven wrappers ([`numToString`], [`numToStringT`])
+/// pick the flags.
 pub fn numToStringImpl(self: *LlvmCompiler, val: types.LLVMValueRef, is_float: bool, is_bool: bool) !types.LLVMValueRef {
     if (is_float) {
         const f = self.func_map.get("nova_f64_to_string") orelse return error.HelperNotFound;
@@ -5103,12 +5360,23 @@ pub fn numToStringImpl(self: *LlvmCompiler, val: types.LLVMValueRef, is_float: b
     return core.LLVMBuildCall2(self.builder, ft, f, &a, 1, "i64_str");
 }
 
+/// Stringifies a numeric value given its type NAME, deriving the float/bool
+/// flags for [`numToStringImpl`].
+///
+/// A null or unrecognised `type_name` defaults to the signed-integer path.
 pub fn numToString(self: *LlvmCompiler, val: types.LLVMValueRef, type_name: ?[]const u8) !types.LLVMValueRef {
     const is_float = if (type_name) |tn| isFloatTypeName(tn) else false;
     const is_bool = if (type_name) |tn| std.mem.eql(u8, tn, "bool") else false;
     return self.numToStringImpl(val, is_float, is_bool);
 }
 
+/// Stringifies a numeric value given its typed-IR `TypeId`, returning null when
+/// the type is not a stringifiable primitive.
+///
+/// The TypeId-precise counterpart to [`numToString`]: dispatches on the
+/// primitive kind (float/bool/int) and returns null for `void` or any
+/// non-primitive, letting the caller fall back to another append path. Used in
+/// string interpolation ([`compileAppendToStringBuilder`]).
 pub fn numToStringT(self: *LlvmCompiler, val: types.LLVMValueRef, tid: sema_types.TypeId) !?types.LLVMValueRef {
     const st = self.type_store orelse return null;
     switch (st.get(tid)) {
@@ -5122,21 +5390,26 @@ pub fn numToStringT(self: *LlvmCompiler, val: types.LLVMValueRef, tid: sema_type
     }
 }
 
-// Lower `obj?.method(args)` (optional-chaining method call). Returns null if the receiver's inner type or
-// the method function cannot be resolved (the caller then falls through to its normal error path).
+/// Lowers an optional-chaining METHOD call `obj?.m(args)`: call the method only
+/// when the receiver is present, else yield null.
+///
+/// Resolves the method on the optional's inner struct type (trying the exact
+/// mangled name and a lowercased fallback), then emits a present/null diamond:
+/// on present it calls the method with the unwrapped receiver and re-boxes a
+/// value-optional result if needed; on null it produces the zero word; a phi
+/// merges them. Returns null (not handled here) if the callee is not optional
+/// chaining or the method cannot be resolved. Compare optional-chaining FIELD
+/// access, which is handled inside [`compileExpressionInner`].
 pub fn compileOptionalMethodCall(self: *LlvmCompiler, call: ast.CallExpr, expr_ptr: *const ast.Expression) anyerror!?types.LLVMValueRef {
     const oc = call.callee.kind.optional_chaining;
     const st = self.type_store orelse return null;
 
-    // The receiver's inner (non-optional) type -> the struct that owns the method.
     const obj_tid = self.typeOfExprConcrete(oc.object) orelse return null;
     const obj_info = st.get(obj_tid);
     const inner_tid = if (obj_info == .optional) obj_info.optional else return null;
     const inner_name = sema_shadow.renderLegacy(self.allocator, st, inner_tid) catch return null;
     const base = getStructBaseName(inner_name);
 
-    // Resolve the method function `{Struct}_{method}` (try the exact name, then the lowercased struct, as
-    // the vtable builder does).
     const method_fn = blk: {
         const exact = std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ base, oc.field }) catch return null;
         defer self.allocator.free(exact);
@@ -5152,7 +5425,6 @@ pub fn compileOptionalMethodCall(self: *LlvmCompiler, call: ast.CallExpr, expr_p
 
     const cur_fn = core.LLVMGetBasicBlockParent(core.LLVMGetInsertBlock(self.builder));
 
-    // Evaluate the receiver ONCE. A struct/heap optional is a pointer (0 == absent).
     const obj_raw = self.coerceToSlotType(try self.compileExpression(oc.object.*), self.val_type);
 
     const present_bb = core.LLVMAppendBasicBlock(cur_fn, "ocm_present");
@@ -5161,7 +5433,6 @@ pub fn compileOptionalMethodCall(self: *LlvmCompiler, call: ast.CallExpr, expr_p
     const present = core.LLVMBuildICmp(self.builder, types.LLVMIntPredicate.LLVMIntNE, obj_raw, core.LLVMConstInt(self.val_type, 0, 0), "ocm_present_c");
     _ = core.LLVMBuildCondBr(self.builder, present, present_bb, null_bb);
 
-    // Present: call the method with the receiver as the leading `self` argument.
     core.LLVMPositionBuilderAtEnd(self.builder, present_bb);
     const nargs = call.args.len + 1;
     const args = try self.allocator.alloc(types.LLVMValueRef, nargs);
@@ -5172,15 +5443,12 @@ pub fn compileOptionalMethodCall(self: *LlvmCompiler, call: ast.CallExpr, expr_p
     }
     const fn_t = core.LLVMGlobalGetValueType(method_fn);
     var res = core.LLVMBuildCall2(self.builder, fn_t, method_fn, args.ptr, @intCast(nargs), "ocm_call");
-    // The result is `R | undefined`. If R is a value type, box it so the present arm matches the optional
-    // representation; a heap R is the pointer itself.
     if (self.typeOfExprConcrete(expr_ptr)) |et| {
         if (self.valueOptionalInner(et) != null) res = try self.buildValoptBox(self.coerceToSlotType(res, self.val_type));
     }
     _ = core.LLVMBuildBr(self.builder, merge_bb);
     const present_end = core.LLVMGetInsertBlock(self.builder);
 
-    // Absent: undefined (0).
     core.LLVMPositionBuilderAtEnd(self.builder, null_bb);
     _ = core.LLVMBuildBr(self.builder, merge_bb);
 
@@ -5192,6 +5460,17 @@ pub fn compileOptionalMethodCall(self: *LlvmCompiler, call: ast.CallExpr, expr_p
     return phi;
 }
 
+/// Appends one interpolation part `val` to a `StringBuilder`, formatting it
+/// according to its type.
+///
+/// This is the per-part backend of template/`${}` string interpolation. When
+/// the typed IR knows the part's type it formats precisely: a string is
+/// appended directly; a primitive is stringified via [`numToStringT`] (and the
+/// temporary string released); a decimal via `nova_decimal_to_string`; an
+/// optional emits a present/absent diamond that appends the inner value or the
+/// literal `undefined`. Falling back to the `expr_type_opt` name handles the
+/// no-typed-IR case, and anything else is appended as a raw string value. Each
+/// synthesised temporary string is released to keep ARC balanced.
 pub fn compileAppendToStringBuilder(self: *LlvmCompiler, sb_val: types.LLVMValueRef, val: types.LLVMValueRef, expr_type_opt: ?[]const u8, opt_part: ?ast.Expression) !void {
     const sb_append = self.func_map.get("StringBuilder_append") orelse {
         std.debug.print("Error: 'StringBuilder_append' not found.\n", .{});
@@ -5230,9 +5509,6 @@ pub fn compileAppendToStringBuilder(self: *LlvmCompiler, sb_val: types.LLVMValue
                             return;
                         },
 
-                        // Interpolating a NON-narrowed optional must print the inner value when present and
-                        // "undefined" when absent -- not the raw box pointer (A4). A value-optional is a boxed
-                        // value (0 == undefined); a heap-optional string is the pointer itself (0 == none).
                         .optional => {
                             const cur = core.LLVMGetInsertBlock(self.builder);
                             const func = core.LLVMGetBasicBlockParent(cur);
@@ -5251,7 +5527,6 @@ pub fn compileAppendToStringBuilder(self: *LlvmCompiler, sb_val: types.LLVMValue
                                     try self.compileRelease(str_temp, null);
                                 }
                             } else if (st.get(st.get(tid).optional) == .string) {
-                                // Heap-optional string: the present value IS the string pointer.
                                 var pa = [_]types.LLVMValueRef{ sb_val, val };
                                 _ = core.LLVMBuildCall2(self.builder, sb_append_t, sb_append, &pa, 2, "");
                             }
@@ -5293,16 +5568,17 @@ pub fn compileAppendToStringBuilder(self: *LlvmCompiler, sb_val: types.LLVMValue
     _ = core.LLVMBuildCall2(self.builder, sb_append_t, sb_append, &args, 2, "");
 }
 
-// Append a value that is ALREADY a string into `sb`. StringBuilder.append COPIES the bytes and borrows
-// both args, so no retain belongs here (see the long note that used to live in compileJsxElement).
-// Set the current debug location from a JSX node's span, but ONLY when the span is real (line > 0).
-// Many desugared/synthesized JSX expressions carry an unset span (line 0); setDebugLoc clamps 0 -> 1, so
-// calling it blindly would stamp line 1 and send a breakpoint to the top of the file. Skipping unset
-// spans keeps the enclosing element's line instead, which is the correct fallback.
+/// Sets the current debug source location from a JSX node's span (when it has a
+/// real line), so emitted JSX maps back to source in a debugger.
 pub fn jsxSetLoc(self: *LlvmCompiler, span: ast.Span) void {
     if (span.line > 0) self.setDebugLoc(span.line, span.col);
 }
 
+/// Appends a compiled string value to a JSX `StringBuilder` via
+/// `StringBuilder_append`.
+///
+/// The lowest-level JSX emit step; higher-level helpers buffer literals and
+/// escape dynamic values before calling this.
 pub fn jsxAppendVal(self: *LlvmCompiler, sb: types.LLVMValueRef, val: types.LLVMValueRef) !void {
     const sb_append = self.getFunc("StringBuilder_append") orelse return error.StringBuilderAppendNotFound;
     const append_t = core.LLVMGlobalGetValueType(sb_append);
@@ -5310,15 +5586,23 @@ pub fn jsxAppendVal(self: *LlvmCompiler, sb: types.LLVMValueRef, val: types.LLVM
     _ = core.LLVMBuildCall2(self.builder, append_t, sb_append, &args, 2, "");
 }
 
-// Append a compile-time string literal into `sb`.
+/// Buffers static JSX text into `jsx_pending_literal` instead of emitting it
+/// immediately.
+///
+/// Adjacent literal chunks (tags, attribute punctuation, plain text) accumulate
+/// so they are emitted as ONE append by [`jsxFlushLiteral`], cutting the number
+/// of runtime append calls. `sb` is unused (the buffer is compiler-side).
 pub fn jsxAppendLiteral(self: *LlvmCompiler, sb: types.LLVMValueRef, text: []const u8) !void {
     _ = sb;
-    // Accumulate static text; a single append is emitted at the next flush point (see jsx_pending_literal).
     try self.jsx_pending_literal.appendSlice(self.allocator, text);
 }
 
-// Emit the accumulated static text as ONE StringBuilder.append, then clear. Called before every dynamic
-// part and at element end so adjacent literals collapse into a single append.
+/// Flushes the accumulated JSX literal buffer as a single string append, if
+/// non-empty, and clears it.
+///
+/// Must be called before appending any dynamic value or closing a coalesced run
+/// so literal and dynamic content stay in order. Compiles the buffered bytes as
+/// a string literal and appends via [`jsxAppendVal`].
 pub fn jsxFlushLiteral(self: *LlvmCompiler, sb: types.LLVMValueRef) !void {
     if (self.jsx_pending_literal.items.len == 0) return;
     const expr = ast.Expression{ .kind = .{ .literal = .{ .string = self.jsx_pending_literal.items } } };
@@ -5327,24 +5611,20 @@ pub fn jsxFlushLiteral(self: *LlvmCompiler, sb: types.LLVMValueRef) !void {
     self.jsx_pending_literal.clearRetainingCapacity();
 }
 
-// Append an interpolated `{expr}` child into `sb`: strings append directly; numeric/bool/etc. go through
-// numToString (a FRESH owned string that append copies, so it is released here to avoid a per-render leak).
+/// Flushes buffered literals, then appends a dynamic JSX expression with the
+/// correct HTML escaping for its type.
+///
+/// A `string` is HTML-escaped into the builder via `web_response_escapeHtmlInto`
+/// (falling back to a raw append if that helper is absent); a `Str` view uses
+/// the view variant; a primitive is stringified (and the temp released) and
+/// appended without escaping. This escaping is the XSS boundary for interpolated
+/// hypermedia content. Anything else is appended raw.
 pub fn jsxAppendExpr(self: *LlvmCompiler, sb: types.LLVMValueRef, expr: *const ast.Expression) !void {
-    try self.jsxFlushLiteral(sb); // emit the static run that precedes this interpolation
+    try self.jsxFlushLiteral(sb);
     const val = try self.compileExpression(expr.*);
     const type_name = try self.resolveExpressionTypeName(expr);
     if (type_name) |t| {
         if (std.mem.eql(u8, t, "string")) {
-            // Auto-escape untrusted data interpolations, like Go's html/template and Rust's esc(): every
-            // `{stringExpr}` is HTML-escaped as it is appended, so app code never calls escapeHtml by hand
-            // and the output is XSS-safe by default. Component/markup calls flow through the `{for}`/`{if}`
-            // STATEMENT path (compileAppendToStringBuilder), not here, so generated markup is left intact.
-            // Escape-INTO-the-builder: escapeHtmlInto(sb, val) writes the escaped bytes straight into the
-            // render buffer -- no intermediate escaped string is allocated. escapeHtmlInto does not touch
-            // `val`'s refcount, so if `val` is a FRESHLY-OWNED temporary (a `${...}` template_expr, a string
-            // concat, a call result) we must release it here or it leaks once PER INTERPOLATION -- ~1200 per
-            // product page, the dominant per-request leak. A BORROWED value (a plain string field of a row)
-            // is owned by its container and must NOT be released.
             if (self.getFunc("web_response_escapeHtmlInto")) |escInto| {
                 const escInto_t = core.LLVMGlobalGetValueType(escInto);
                 var ea = [_]types.LLVMValueRef{ sb, self.coerceToSlotType(val, self.val_type) };
@@ -5354,10 +5634,6 @@ pub fn jsxAppendExpr(self: *LlvmCompiler, sb: types.LLVMValueRef, expr: *const a
             }
             return;
         } else if (std.mem.eql(u8, t, "Str")) {
-            // P10: `{v}` where `v` is a borrowed `str.Str` escapes STRAIGHT from the borrow into the builder
-            // (escapeHtmlIntoView) -- no owned intermediate string, unlike the `string` branch above. `Str`
-            // is a VALUE STRUCT: pass `val` DIRECTLY, exactly as compileCallArgument does for a normal call
-            // (do NOT coerce it to an i64 -- that mangles the {ptr,len} struct and yields garbage).
             if (self.getFunc("web_response_escapeHtmlIntoView")) |escView| {
                 const escView_t = core.LLVMGlobalGetValueType(escView);
                 var ea = [_]types.LLVMValueRef{ sb, val };
@@ -5376,32 +5652,23 @@ pub fn jsxAppendExpr(self: *LlvmCompiler, sb: types.LLVMValueRef, expr: *const a
     try self.jsxAppendVal(sb, val);
 }
 
-// Render the whole element tree DIRECTLY into `sb_val` -- ONE StringBuilder for every tag in the tree,
-// including the ones generated dynamically inside `{for ...}` statement children. A nested <element>
-// recurses into the SAME builder instead of building its own string and copying it up, which used to
-// cost one StringBuilder alloc + toString + copy + free PER nested tag (≈8 per card × 200 cards). This
-// is the render throughput fix: allocation/zeroing/ARC churn dominated the profile, and it all lived in
-// that per-element build-then-copy cascade.
+/// Recursively serialises a JSX element tree into a `StringBuilder`, emitting
+/// tags, attributes, children, and embedded expressions/statements.
+///
+/// Sets `current_string_builder` to `sb_val` for the duration so nested lowering
+/// knows where to append. Writes `<tag`, each attribute (`name="..."` with a
+/// string literal or an escaped dynamic expression), then either self-closes
+/// (`/>`) when there are no children or writes `>`, the children (text,
+/// sub-elements recursed into, escaped expressions, or embedded statements
+/// lowered against a synthetic [`FunctionInfo`]), and the closing tag. Literal
+/// runs are buffered and flushed via [`jsxAppendLiteral`]/[`jsxFlushLiteral`];
+/// debug builds flush at element boundaries so source locations stay precise.
 pub fn emitJsxInto(self: *LlvmCompiler, sb_val: types.LLVMValueRef, jsx: ast.JsxElement) anyerror!void {
     const outer_sb = self.current_string_builder;
     self.current_string_builder = sb_val;
     defer self.current_string_builder = outer_sb;
 
-    // Anchor the debug location to THIS element's source line before emitting any of its append
-    // instructions. Without this, NSX/JSX code inherits whatever !dbg was last set -- typically the line
-    // of the call that ran just before the view (e.g. a repository's SQL string in store.nova) -- so
-    // breakpoints in a `.nsx` bind nowhere and stepping through the view surfaces unrelated source. Each
-    // interpolated `{expr}` and nested element re-anchors to its own span below, so a breakpoint on any
-    // markup line resolves inside the `.nsx`.
-    //
-    // jsxAppendLiteral ACCUMULATES static markup and emits it as ONE append at the next flush, which is
-    // the render-throughput optimisation -- but that single append carries only its flush-point line, so
-    // a bare markup line (a `<div>` with no `{expr}`) gets no line-table row and a breakpoint on it stays
-    // pending, then VS Code may slide it to unrelated code. In DEBUG builds only, flush at each element
-    // boundary under that element's own line, so every `<tag>` line becomes a bindable location inside the
-    // `.nsx`. Release builds keep the single merged append (debug_enabled is false), so throughput is
-    // unchanged.
-    if (self.debug_enabled) try self.jsxFlushLiteral(sb_val); // emit prior static under the OUTER line
+    if (self.debug_enabled) try self.jsxFlushLiteral(sb_val);
     self.jsxSetLoc(jsx.span);
 
     const tag_open = try std.fmt.allocPrint(self.allocator, "<{s}", .{jsx.tag});
@@ -5417,7 +5684,7 @@ pub fn emitJsxInto(self: *LlvmCompiler, sb_val: types.LLVMValueRef, jsx: ast.Jsx
             .expression => |*expr| {
                 self.jsxSetLoc(expr.span);
                 try self.jsxAppendExpr(sb_val, expr);
-                self.jsxSetLoc(jsx.span); // back to the element line for the rest of the open tag
+                self.jsxSetLoc(jsx.span);
             },
         }
         try self.jsxAppendLiteral(sb_val, "\"");
@@ -5425,25 +5692,21 @@ pub fn emitJsxInto(self: *LlvmCompiler, sb_val: types.LLVMValueRef, jsx: ast.Jsx
 
     if (jsx.children.len == 0) {
         try self.jsxAppendLiteral(sb_val, "/>");
-        if (self.debug_enabled) try self.jsxFlushLiteral(sb_val); // the whole `<tag .../>` on its line
+        if (self.debug_enabled) try self.jsxFlushLiteral(sb_val);
         return;
     }
     try self.jsxAppendLiteral(sb_val, ">");
-    if (self.debug_enabled) try self.jsxFlushLiteral(sb_val); // the `<tag ...>` open on its own line
+    if (self.debug_enabled) try self.jsxFlushLiteral(sb_val);
     for (jsx.children) |child| {
         switch (child) {
             .text => |txt| try self.jsxAppendLiteral(sb_val, txt),
-            // A nested <element> renders into the SAME builder -- no child StringBuilder, no toString,
-            // no copy-up. This is the whole point of the single-builder render.
             .element => |sub_el| try self.emitJsxInto(sb_val, sub_el),
             .expression => |*expr| {
                 self.jsxSetLoc(expr.span);
                 try self.jsxAppendExpr(sb_val, expr);
             },
             .statement => |stmt| {
-                try self.jsxFlushLiteral(sb_val); // emit static before the control-flow block
-                // A `{for ...}`/`{if ...}` block. Its body appends into current_string_builder, which is
-                // sb_val here, so the dynamically generated tags land in the SAME single builder.
+                try self.jsxFlushLiteral(sb_val);
                 const dummy_func = FunctionInfo{
                     .name = self.current_function_name orelse "main",
                     .param_count = 0,
@@ -5455,15 +5718,19 @@ pub fn emitJsxInto(self: *LlvmCompiler, sb_val: types.LLVMValueRef, jsx: ast.Jsx
             },
         }
     }
-    self.jsxSetLoc(jsx.span); // re-anchor to the element line for the closing tag
+    self.jsxSetLoc(jsx.span);
     const tag_close = try std.fmt.allocPrint(self.allocator, "</{s}>", .{jsx.tag});
     defer self.allocator.free(tag_close);
     try self.jsxAppendLiteral(sb_val, tag_close);
 }
 
-// The expression entry point for a JSX element: allocate ONE StringBuilder, render the whole tree into it
-// via emitJsxInto, then toString it once and return that string. Nested elements no longer allocate their
-// own builders -- see emitJsxInto.
+/// Lowers a JSX element EXPRESSION to a freshly built HTML string value.
+///
+/// Allocates and initialises a `StringBuilder`, serialises the tree into it via
+/// [`emitJsxInto`], flushes any trailing literal, calls `toString` to snapshot
+/// the result, then deletes and releases the builder. The returned string is
+/// the value of the JSX expression. Requires the collections/string_builder std
+/// module to be imported (errors clearly otherwise).
 pub fn compileJsxElement(self: *LlvmCompiler, jsx: ast.JsxElement) anyerror!types.LLVMValueRef {
     const sb_new = self.getFunc("StringBuilder_init") orelse {
         std.debug.print("Error: 'StringBuilder_init' not found. Make sure to import collections/string_builder.\n", .{});
@@ -5485,7 +5752,7 @@ pub fn compileJsxElement(self: *LlvmCompiler, jsx: ast.JsxElement) anyerror!type
     _ = core.LLVMBuildCall2(self.builder, sb_new_t, sb_new, &sb_args, 1, "");
 
     try self.emitJsxInto(sb_val, jsx);
-    try self.jsxFlushLiteral(sb_val); // emit the trailing static run before materialising the string
+    try self.jsxFlushLiteral(sb_val);
 
     const sb_toString_t = core.LLVMGlobalGetValueType(sb_toString);
     var toString_args = [_]types.LLVMValueRef{sb_val};
@@ -5494,14 +5761,20 @@ pub fn compileJsxElement(self: *LlvmCompiler, jsx: ast.JsxElement) anyerror!type
     const sb_delete_t = core.LLVMGlobalGetValueType(sb_delete);
     _ = core.LLVMBuildCall2(self.builder, sb_delete_t, sb_delete, &toString_args, 1, "");
 
-    // StringBuilder_delete frees the builder's INTERNAL buffer; the builder STRUCT itself is a heap object
-    // from compileAlloc that nothing else owns, so release it here (null destructor) to avoid one leaked
-    // struct per rendered view.
     try self.compileRelease(sb_val, null);
 
     return final_str;
 }
 
+/// Lowers a typed NovaDB query `conn.query<T>(sql, params)` into a call that
+/// decodes each result row into a `T`.
+///
+/// Synthesises (once per `T`, cached by name) a `decode_binary_row_<T>` function
+/// whose body is [`compileDecodeBinaryRow`], then passes a pointer to it into
+/// the runtime `NovaConnection_queryInternal` alongside the connection, SQL, and
+/// params. The runtime drives the wire protocol and calls back into the
+/// generated decoder per row, so row decoding is monomorphised to the target
+/// struct at compile time rather than done reflectively at runtime.
 pub fn compileNovaQuery(
     self: *LlvmCompiler,
     target_type: ast.TypeRef,
@@ -5550,6 +5823,17 @@ pub fn compileNovaQuery(
     return core.LLVMBuildCall2(self.builder, query_internal_fn_t, query_internal_fn, &query_args, 4, "query_res");
 }
 
+/// Emits the body of a per-type row decoder: reads each field of `target_type`
+/// out of NovaDB's binary row layout and builds a heap struct.
+///
+/// For every struct field it looks up the column by name
+/// (`findColumnIndex`); when found, it reads the value at the column offset from
+/// the fixed-size area according to the field's type (bool as a byte, int as
+/// zero/sign-extended i32/i64, strings via a `{offset -> len-prefixed bytes}`
+/// indirection into the heap area using `__read_string`), and when the column is
+/// absent it stores a zero default. A per-field present/absent phi feeds the
+/// store into the allocated struct at the field's offset. This is the compiled,
+/// allocation-light equivalent of a generic row-to-object mapper.
 pub fn compileDecodeBinaryRow(
     self: *LlvmCompiler,
     target_type: ast.TypeRef,
@@ -5663,6 +5947,14 @@ pub fn compileDecodeBinaryRow(
     return struct_ptr;
 }
 
+/// Lowers a typed `parse<T>(text)` for JSON or YAML: parse to a dynamic value,
+/// then structurally convert it to `T`.
+///
+/// Finds the `serde_json_parse`/`serde_yaml_parse` runtime entry (tolerating a
+/// module-qualified symbol), calls it, converts the resulting dynamic value into
+/// the concrete `target_type` via [`convertValueToType`], and releases the
+/// intermediate dynamic value. `is_yaml` selects the JSON vs YAML function
+/// family throughout.
 pub fn compileGenericParse(self: *LlvmCompiler, is_yaml: bool, target_type: ast.TypeRef, input_expr: ast.Expression) anyerror!types.LLVMValueRef {
     const input_val = try self.compileExpression(input_expr);
 
@@ -5696,6 +5988,15 @@ pub fn compileGenericParse(self: *LlvmCompiler, is_yaml: bool, target_type: ast.
     return result_val;
 }
 
+/// Looks up an emitted function by name, tolerating module-name prefixes on the
+/// symbol.
+///
+/// First tries an exact `func_map` hit. Failing that it scans for a key ENDING
+/// in `name`, preferring the shortest overall match and, among those, one where
+/// `name` is preceded by an underscore (a proper `module_name` boundary) so a
+/// suffix match cannot pick up an unrelated function whose name merely ends the
+/// same way. This is how std helpers are found regardless of their mangled
+/// module prefix. (Contains debug tracing for `List_init`/`List_new` lookups.)
 pub fn getFunc(self: *LlvmCompiler, name: []const u8) ?types.LLVMValueRef {
     if (std.mem.eql(u8, name, "List_init") or std.mem.eql(u8, name, "List_new")) {
         var debug_iter = self.func_map.iterator();
@@ -5706,14 +6007,6 @@ pub fn getFunc(self: *LlvmCompiler, name: []const u8) ?types.LLVMValueRef {
         }
     }
     if (self.func_map.get(name)) |v| return v;
-    // Fuzzy fallback: `name` is often a partly-qualified symbol (e.g. "url_parse" for `url.parse`) whose
-    // fully-mangled key is "net_url_parse". Several functions can share a trailing segment --
-    // "net_url_parse" and "net_url_test_url_parse" both end in "url_parse" -- so returning the FIRST
-    // hashmap key that ends in `name` is ambiguous AND order-dependent (adding modules reorders the map,
-    // which silently flipped `url.parse` to `url.test_url_parse`). Resolve deterministically: among keys
-    // ending in `name` at a '_' segment boundary, take the SHORTEST (the most-direct match -- fewest
-    // extra prefix segments). Fall back to the shortest plain-endsWith match only if none has the '_'
-    // boundary.
     var best: ?types.LLVMValueRef = null;
     var best_len: usize = std.math.maxInt(usize);
     var best_bounded: ?types.LLVMValueRef = null;
@@ -5734,17 +6027,31 @@ pub fn getFunc(self: *LlvmCompiler, name: []const u8) ?types.LLVMValueRef {
     return best_bounded orelse best;
 }
 
+/// Resolves a type ref to the concrete, reified type name used to key generated
+/// code.
+///
+/// For a bare identifier that has a known concrete `TypeId` in the current
+/// context it returns the symbol name of that concrete type (so a type
+/// parameter reifies to its instantiation); otherwise it falls back to the plain
+/// rendered type string.
 pub fn resolveReifyTypeName(self: *LlvmCompiler, type_ref: ast.TypeRef) anyerror![]const u8 {
-    // SE-C: reify a type-param to its concrete NAME via the TypeId overlay. typeRefToString already routes
-    // a bare .ident through the overlay-primary substMethodParams, so it covers both the resolvable and the
-    // erased-lambda case (whose inst_key the lifted lambda now inherits) -- current_method_subst is no
-    // longer read here directly.
     if (type_ref == .ident) {
         if (self.concreteTidForTypeRef(type_ref)) |ctid| return try self.symbolName(ctid);
     }
     return try self.typeRefToString(type_ref);
 }
 
+/// Recursively converts a dynamic JSON/YAML value into a concrete Nova value of
+/// `type_ref`.
+///
+/// Numbers/bools/strings call the matching `serde_*_asNumber/asBool/asString`
+/// accessor (retaining the source value across the borrow). A struct type
+/// allocates the struct and recurses per field via `serde_*_get`. A `List<E>`
+/// allocates a fresh list and loops over the dynamic array, converting each
+/// element to `E` and pushing it. An unrecognised type yields the zero word.
+/// Retains are inserted before each accessor call because the runtime accessors
+/// borrow their argument, and the intermediate array is released after the loop.
+/// This is the type-directed half of [`compileGenericParse`].
 pub fn convertValueToType(self: *LlvmCompiler, is_yaml: bool, val: types.LLVMValueRef, type_ref: ast.TypeRef) anyerror!types.LLVMValueRef {
     const type_str = try self.typeRefToString(type_ref);
 
@@ -5876,6 +6183,11 @@ pub fn convertValueToType(self: *LlvmCompiler, is_yaml: bool, val: types.LLVMVal
     return core.LLVMConstInt(self.val_type, 0, 0);
 }
 
+/// Maps a lowercase HTTP-verb router method name (`get`, `post`, ...) to its
+/// uppercase HTTP method (`GET`, `POST`, ...), or null if not a verb.
+///
+/// Used when lowering web-router builder calls like `router.get(path, handler)`
+/// so the method string passed to the runtime is the canonical verb.
 fn routeVerbMethod(field: []const u8) ?[]const u8 {
     const verbs = [_]struct { f: []const u8, m: []const u8 }{
         .{ .f = "get", .m = "GET" },       .{ .f = "post", .m = "POST" },
@@ -5887,6 +6199,10 @@ fn routeVerbMethod(field: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Whether struct declaration `sd` declares a method called `name`.
+///
+/// A small predicate used while lowering calls to decide between a user-defined
+/// method and a builtin/fallback with the same name.
 fn structHasMethod(sd: ast.StructDecl, name: []const u8) bool {
     for (sd.methods) |m| if (std.mem.eql(u8, m.decl.name, name)) return true;
     return false;

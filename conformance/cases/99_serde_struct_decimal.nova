@@ -1,7 +1,3 @@
-// S1: `@serializable` structs with `decimal` fields round-trip EXACTLY through the compiler-generated
-// binders. Previously a decimal field was bound with the lossy `getFloat` (f64) and SKIPPED in
-// __toJson. Now it routes to `getDecimal` / `itemDecimal` (exact 128-bit BID) and emits as an
-// unquoted JSON number. Proves the auto-binder path matches the manual JsonValue path (gate 96).
 import assert;
 import serde.source;
 import serde.json;
@@ -24,8 +20,8 @@ struct Money {
 fn test_bind_decimal_field_exact(): void {
     let m = Money__bind(source.fromJson("{\"label\":\"usd\",\"amount\":19.99,\"rates\":[0.1,0.2]}"));
     assert.equalStr(m.label, "usd");
-    assert.equalStr(`${m.amount}`, "19.99");          // exact, not 19.989999...
-    assert.equalStr(`${m.amount + 0.01m}`, "20.00");  // real decimal arithmetic
+    assert.equalStr(`${m.amount}`, "19.99");
+    assert.equalStr(`${m.amount + 0.01m}`, "20.00");
     assert.equalInt(m.rates.size(), 2);
     assert.equalStr(`${m.rates.get(0) ?? 0m}`, "0.1");
     assert.equalStr(`${(m.rates.get(0) ?? 0m) + (m.rates.get(1) ?? 0m)}`, "0.3");
@@ -38,7 +34,6 @@ fn test_tojson_emits_decimal(): void {
     m.amount = 3.14m;
     m.rates.push(1.5m);
     m.rates.push(2.5m);
-    // decimal emitted as an unquoted JSON number, exact text, in field-declaration order
     assert.equalStr(Money__toJson(m), "{\"label\":\"eur\",\"amount\":3.14,\"rates\":[1.5,2.5]}");
 }
 
@@ -46,7 +41,7 @@ fn test_tojson_emits_decimal(): void {
 fn test_roundtrip_through_binders(): void {
     let m = Money();
     m.label = "x";
-    m.amount = 12345678901234567890.12m;   // high precision survives
+    m.amount = 12345678901234567890.12m;
     let json_text = Money__toJson(m);
     let back = Money__bind(source.fromJson(json_text));
     assert.equalStr(`${back.amount}`, "12345678901234567890.12");

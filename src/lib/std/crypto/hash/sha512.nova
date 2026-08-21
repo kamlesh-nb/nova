@@ -1,20 +1,9 @@
-// SHA-512 and SHA-384 (FIPS 180-4) implemented in Nova, no external library (M9 phase A). SHA-384 is
-// SHA-512 with a different initial value and a 48-byte truncated output. Words are `ulong` (u64), which
-// wraps at 2^64 on add and shifts logically on `>>`, so no masking is needed. SHA-384 backs the TLS 1.3
-// SHA-384 cipher suites and their transcript hash.
-//
-// Reference: Zig std.crypto sha2. Verified against NIST known-answer vectors (conformance case 216).
 import bytes;
 import mem.allocator;
 
-// Integrated-assembly fast path (src/runtime/nova_crypto_arm64.S): on an aarch64 host with FEAT_SHA512 the
-// block compression uses the ARMv8.2 SHA-512 instructions (SHA512H/H2/SU0/SU1), far above the software round
-// loop. The 8-word state `h` (big-endian) is passed straight through; the asm byteswaps it. Plain extern, no
-// FFI. Byte-identical to the software path (KAT 216 + differential fuzz).
 extern("c") fn nova_has_asm_crypto(): int;
 extern("c") fn nova_sha512_blocks(state: ptr, data: ptr, blocks: int): void;
 
-// Round constants: first 64 bits of the fractional parts of the cube roots of the first 80 primes.
 const K512: ulong[80] = [
     0x428a2f98d728ae22, 0x7137449123ef65cd, 0xb5c0fbcfec4d3b2f, 0xe9b5dba58189dbbc,
     0x3956c25bf348b538, 0x59f111f1b605d019, 0x923f82a4af194f9b, 0xab1c5ed5da6d8118,
@@ -56,7 +45,6 @@ fn rotr(x: ulong, n: int): ulong {
     return (x >> n) | (x << (64 - n));
 }
 
-// Read 8 big-endian bytes at buf+off as a 64-bit word.
 fn beWord(buf: ptr, off: int): ulong {
     let v: ulong = 0;
     let i = 0;
@@ -67,7 +55,6 @@ fn beWord(buf: ptr, off: int): ulong {
     return v;
 }
 
-// Write a 64-bit word big-endian to out+off.
 fn putWord(out: ptr, off: int, w: ulong): void {
     let i = 0;
     while (i < 8) {
@@ -76,11 +63,9 @@ fn putWord(out: ptr, off: int, w: ulong): void {
     }
 }
 
-// Incremental SHA-512 / SHA-384. The `is384` flag only picks the initial value and the output length;
-// the compression function is identical.
 pub struct Sha512 {
-    pub h: ptr,        // 8 words, 64 bytes
-    pub block: ptr,    // 128-byte pending block
+    pub h: ptr,
+    pub block: ptr,
     pub blockLen: int,
     pub total: long,
     pub is384: bool,
@@ -190,19 +175,16 @@ pub struct Sha512 {
         }
     }
 
-    // Write the digest (64 bytes for SHA-512, 48 for SHA-384) to out.
     pub fn final(self: Sha512, out: ptr): void {
         let bitLen = self.total * 8;
         let pad = bytes.alloc(SHA512_BLOCK_LEN * 2);
         let n = 0;
         bytes.write_byte(pad, n, 0x80);
         n = n + 1;
-        // Pad so (blockLen + n + 16) is a multiple of 128; the length field is 128 bits.
         while (((self.blockLen + n + 16) % SHA512_BLOCK_LEN) != 0) {
             bytes.write_byte(pad, n, 0);
             n = n + 1;
         }
-        // High 64 bits of the length are zero for any message we handle; low 64 bits big-endian.
         let j = 0;
         while (j < 8) {
             bytes.write_byte(pad, n + j, 0);
@@ -237,7 +219,6 @@ pub struct Sha512 {
     }
 }
 
-// One-shot SHA-512 of len bytes at data, writing 64 bytes to out.
 pub fn hashInto(data: ptr, len: int, out: ptr): void {
     let s = Sha512.create(false);
     s.update(data, len);
@@ -245,7 +226,6 @@ pub fn hashInto(data: ptr, len: int, out: ptr): void {
     s.delete();
 }
 
-// One-shot SHA-384 of len bytes at data, writing 48 bytes to out.
 pub fn hash384Into(data: ptr, len: int, out: ptr): void {
     let s = Sha512.create(true);
     s.update(data, len);

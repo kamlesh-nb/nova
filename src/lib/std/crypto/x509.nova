@@ -1,19 +1,9 @@
-// X.509 certificate parsing and signature verification in Nova, no external library (M9 phase D).
-//
-// A small DER/ASN.1 TLV reader walks the certificate structure (RFC 5280) and extracts the parts TLS
-// certificate validation needs: the raw TBSCertificate bytes (what the signature covers), the subject
-// public key (RSA modulus+exponent, or an EC point), the signature algorithm, and the signature value.
-// verifySignedBy then hashes the TBS and checks the signature with the issuer's key, reusing the Nova
-// P-256 ECDSA and RSA (PKCS#1 v1.5 / PSS) verifiers.
-//
-// References: RFC 5280 (X.509), RFC 8017 (PKCS#1). Verified against OpenSSL-generated EC and RSA chains.
 import bytes;
 import crypto.ecc.p256;
 import crypto.rsa;
 import crypto.hash.sha256;
 import crypto.hash.sha512;
 
-// Signature-algorithm identifiers.
 const SIG_ECDSA_SHA256: int = 0;
 const SIG_ECDSA_SHA384: int = 1;
 const SIG_ECDSA_SHA512: int = 2;
@@ -23,14 +13,12 @@ const SIG_RSA_SHA512: int = 5;
 const SIG_RSA_PSS: int = 6;
 const SIG_UNKNOWN: int = -1;
 
-// Public-key types.
 const KEY_RSA: int = 0;
 const KEY_EC_P256: int = 1;
 const KEY_UNKNOWN: int = -1;
 
 fn ptrAt(buf: ptr, off: int): ptr { return (buf as long + off) as ptr; }
 
-// A DER TLV: tag byte, content range [start, start+len), and next = the position just past this TLV.
 pub struct Tlv {
     pub tag: int,
     pub start: int,
@@ -38,8 +26,6 @@ pub struct Tlv {
     pub next: int,
 }
 
-// A DER TLV (tag-length-value) reader at `pos`: returns the tag, the value offset (start), the value
-// length, and the offset just past the value (next). Exposed for the OCSP/CRL parsers.
 pub fn readTlv(buf: ptr, pos: int): Tlv {
     let tag = bytes.read_byte(buf, pos);
     let p = pos + 1;
@@ -58,9 +44,8 @@ pub fn readTlv(buf: ptr, pos: int): Tlv {
 
 fn hexNibble(c: int): int {
     if (c >= 48 && c <= 57) { return c - 48; }
-    return c - 87;                          // lowercase a-f
+    return c - 87;
 }
-// Compare `len` bytes at buf[start..] to a lowercase-hex pattern.
 fn oidEq(buf: ptr, start: int, len: int, hex: string): bool {
     if (hex.length != len * 2) { return false; }
     let i = 0;
@@ -83,24 +68,23 @@ fn decodeSigOid(buf: ptr, start: int, len: int): int {
     return SIG_UNKNOWN;
 }
 
-// A parsed certificate. All *Start/*Len fields are offsets into buf.
 struct Cert {
     pub buf: ptr,
     pub ok: bool,
-    pub serialStart: int, pub serialLen: int,  // serialNumber INTEGER value (for OCSP/CRL binding)
-    pub tbsStart: int, pub tbsLen: int,        // raw TBSCertificate TLV (the signed bytes)
+    pub serialStart: int, pub serialLen: int,
+    pub tbsStart: int, pub tbsLen: int,
     pub sigAlg: int,
-    pub sigStart: int, pub sigLen: int,        // signature bytes (past the BIT STRING unused-bits byte)
+    pub sigStart: int, pub sigLen: int,
     pub keyType: int,
-    pub rsaNStart: int, pub rsaNLen: int,      // RSA modulus (leading 0x00 stripped)
+    pub rsaNStart: int, pub rsaNLen: int,
     pub rsaEStart: int, pub rsaELen: int,
-    pub ecStart: int, pub ecLen: int,          // EC point 0x04||X||Y
+    pub ecStart: int, pub ecLen: int,
     pub subjectStart: int, pub subjectLen: int,
     pub issuerStart: int, pub issuerLen: int,
-    pub nbStart: int, pub nbLen: int, pub nbTag: int,   // notBefore Time (0x17 UTCTIME / 0x18 GeneralizedTime)
-    pub naStart: int, pub naLen: int, pub naTag: int,   // notAfter Time
-    pub isCa: bool,                                     // BasicConstraints cA
-    pub sanStart: int, pub sanLen: int,                // SubjectAltName GeneralNames content
+    pub nbStart: int, pub nbLen: int, pub nbTag: int,
+    pub naStart: int, pub naLen: int, pub naTag: int,
+    pub isCa: bool,
+    pub sanStart: int, pub sanLen: int,
 }
 
 pub fn parseCert(buf: ptr, len: int): Cert {
@@ -117,24 +101,22 @@ pub fn parseCert(buf: ptr, len: int): Cert {
     let tbsStart = cert.start;
     let tbsLen = tbs.next - cert.start;
 
-    // Walk TBSCertificate fields.
     let q = tbs.start;
     let f = readTlv(buf, q);
-    if (f.tag == 0xa0) { q = f.next; }         // skip [0] EXPLICIT version if present
+    if (f.tag == 0xa0) { q = f.next; }
     let serial = readTlv(buf, q); q = serial.next;
     let serialStart = serial.start; let serialLen = serial.len;
-    let innerSig = readTlv(buf, q); q = innerSig.next;   // signature AlgorithmIdentifier (ignored)
+    let innerSig = readTlv(buf, q); q = innerSig.next;
     let issuer = readTlv(buf, q);
     let issuerStart = q; let issuerLen = issuer.next - q; q = issuer.next;
     let validity = readTlv(buf, q);
-    let nb = readTlv(buf, validity.start);              // notBefore Time
-    let na = readTlv(buf, nb.next);                     // notAfter Time
+    let nb = readTlv(buf, validity.start);
+    let na = readTlv(buf, nb.next);
     q = validity.next;
     let subject = readTlv(buf, q);
     let subjectStart = q; let subjectLen = subject.next - q; q = subject.next;
     let spki = readTlv(buf, q);
 
-    // SubjectPublicKeyInfo: algorithm SEQUENCE + subjectPublicKey BIT STRING.
     let algSeq = readTlv(buf, spki.start);
     let algOid = readTlv(buf, algSeq.start);
     let spkBit = readTlv(buf, algSeq.next);
@@ -143,7 +125,7 @@ pub fn parseCert(buf: ptr, len: int): Cert {
     let rsaNStart = 0; let rsaNLen = 0; let rsaEStart = 0; let rsaELen = 0;
     let ecStart = 0; let ecLen = 0;
     if (oidEq(buf, algOid.start, algOid.len, "2a8648ce3d0201")) {
-        keyType = KEY_EC_P256;                 // id-ecPublicKey; content skips the unused-bits byte
+        keyType = KEY_EC_P256;
         ecStart = spkBit.start + 1;
         ecLen = spkBit.len - 1;
     } else if (oidEq(buf, algOid.start, algOid.len, "2a864886f70d010101")) {
@@ -157,30 +139,29 @@ pub fn parseCert(buf: ptr, len: int): Cert {
         rsaEStart = expInt.start; rsaELen = expInt.len;
     }
 
-    // Extensions ([3] EXPLICIT), if present after the SPKI: capture BasicConstraints cA and SAN.
     let isCa = false;
     let sanStart = 0; let sanLen = 0;
     q = spki.next;
     if (q < tbs.next) {
         let ex = readTlv(buf, q);
         if (ex.tag == 0xa3) {
-            let extSeq = readTlv(buf, ex.start);       // SEQUENCE OF Extension
+            let extSeq = readTlv(buf, ex.start);
             let ep = extSeq.start;
             let extEnd = extSeq.start + extSeq.len;
             while (ep < extEnd) {
-                let one = readTlv(buf, ep);            // Extension SEQUENCE
+                let one = readTlv(buf, ep);
                 let oid = readTlv(buf, one.start);
                 let vpos = oid.next;
                 let maybe = readTlv(buf, vpos);
-                if (maybe.tag == 0x01) { vpos = maybe.next; }   // skip optional critical BOOLEAN
-                let val = readTlv(buf, vpos);          // OCTET STRING wrapping the extension value
-                if (oidEq(buf, oid.start, oid.len, "551d13")) {          // BasicConstraints 2.5.29.19
+                if (maybe.tag == 0x01) { vpos = maybe.next; }
+                let val = readTlv(buf, vpos);
+                if (oidEq(buf, oid.start, oid.len, "551d13")) {
                     let bcSeq = readTlv(buf, val.start);
                     if (bcSeq.len > 0) {
                         let caFlag = readTlv(buf, bcSeq.start);
                         if (caFlag.tag == 0x01 && bytes.read_byte(buf, caFlag.start) != 0) { isCa = true; }
                     }
-                } else if (oidEq(buf, oid.start, oid.len, "551d11")) {   // SubjectAltName 2.5.29.17
+                } else if (oidEq(buf, oid.start, oid.len, "551d11")) {
                     let san = readTlv(buf, val.start);
                     sanStart = san.start; sanLen = san.len;
                 }
@@ -189,12 +170,11 @@ pub fn parseCert(buf: ptr, len: int): Cert {
         }
     }
 
-    // signatureAlgorithm + signatureValue, after the TBS.
     let sigAlgSeq = readTlv(buf, tbs.next);
     let sigOid = readTlv(buf, sigAlgSeq.start);
     let sigAlg = decodeSigOid(buf, sigOid.start, sigOid.len);
     let sigVal = readTlv(buf, sigAlgSeq.next);
-    let sigStart = sigVal.start + 1;           // skip BIT STRING unused-bits byte
+    let sigStart = sigVal.start + 1;
     let sigLen = sigVal.len - 1;
 
     return Cert { buf: buf, ok: true, serialStart: serialStart, serialLen: serialLen,
@@ -222,8 +202,6 @@ fn doHash(hid: int, data: ptr, len: int, out: ptr): void {
     sha512.hashInto(data, len, out);
 }
 
-// Copy the DER integer buf[start..start+len) into out[0..outLen) right-aligned, stripping a leading
-// 0x00 sign byte and left-padding with zeros.
 fn derIntTo(buf: ptr, start: int, len: int, out: ptr, outLen: int): void {
     let s = start; let l = len;
     while (l > 0 && bytes.read_byte(buf, s) == 0) { s = s + 1; l = l - 1; }
@@ -234,7 +212,6 @@ fn derIntTo(buf: ptr, start: int, len: int, out: ptr, outLen: int): void {
     while (i < l) { bytes.write_byte(out, pad + i, bytes.read_byte(buf, s + i)); i = i + 1; }
 }
 
-// Verify that `child` was signed by the private key matching `issuer`'s public key.
 pub fn verifySignedBy(child: Cert, issuer: Cert): bool {
     if (!child.ok || !issuer.ok || child.sigAlg == SIG_UNKNOWN) { return false; }
     let hid = hashIdOf(child.sigAlg);
@@ -245,14 +222,12 @@ pub fn verifySignedBy(child: Cert, issuer: Cert): bool {
     let ok = false;
     if (child.sigAlg <= SIG_ECDSA_SHA512) {
         if (issuer.keyType == KEY_EC_P256) {
-            // signature is DER ECDSA-Sig-Value SEQUENCE { r INTEGER, s INTEGER }
             let seq = readTlv(child.buf, child.sigStart);
             let rInt = readTlv(child.buf, seq.start);
             let sInt = readTlv(child.buf, rInt.next);
             let r = bytes.alloc(32); let s = bytes.alloc(32);
             derIntTo(child.buf, rInt.start, rInt.len, r, 32);
             derIntTo(child.buf, sInt.start, sInt.len, s, 32);
-            // e = leftmost 32 bytes of the digest (for SHA-384/512 with P-256)
             let e = bytes.alloc(32);
             let i = 0;
             while (i < 32) {
@@ -280,7 +255,6 @@ pub fn verifySignedBy(child: Cert, issuer: Cert): bool {
     return ok;
 }
 
-// Do the issuer/subject DER names match (used for chain linking)?
 pub fn nameMatches(child: Cert, issuer: Cert): bool {
     if (child.issuerLen != issuer.subjectLen) { return false; }
     let i = 0;
@@ -292,14 +266,11 @@ pub fn nameMatches(child: Cert, issuer: Cert): bool {
     return true;
 }
 
-// ---- trust policy: validity dates, CA constraint, hostname matching, chain linking ----
 
 fn digit2(buf: ptr, p: int): long {
     return ((bytes.read_byte(buf, p) - 48) * 10 + (bytes.read_byte(buf, p + 1) - 48)) as long;
 }
 
-// Convert a certificate Time (UTCTIME YYMMDDHHMMSSZ or GeneralizedTime YYYYMMDDHHMMSSZ) to a comparable
-// number YYYYMMDDHHMMSS. UTCTIME years 50..99 are 19xx, 00..49 are 20xx (RFC 5280).
 fn timeToNum(buf: ptr, start: int, tag: int): long {
     let yyyy: long = 0;
     let off = start;
@@ -319,19 +290,16 @@ fn timeToNum(buf: ptr, start: int, tag: int): long {
     return ((((yyyy * 100 + mo) * 100 + da) * 100 + hh) * 100 + mi) * 100 + ss;
 }
 
-// Is the certificate within its validity window at `now` (a YYYYMMDDHHMMSS number, e.g. UTC "now")?
 pub fn checkValidity(cert: Cert, now: long): bool {
     let nb = timeToNum(cert.buf, cert.nbStart, cert.nbTag);
     let na = timeToNum(cert.buf, cert.naStart, cert.naTag);
     return nb <= now && now <= na;
 }
 
-// Is this a CA certificate (BasicConstraints cA = TRUE)?
 pub fn isCA(cert: Cert): bool { return cert.isCa; }
 
 fn lower(c: int): int { if (c >= 65 && c <= 90) { return c + 32; } return c; }
 
-// Case-insensitive compare of buf[bstart..) (blen bytes) against host[hstart..) (hlen bytes).
 fn ciEqual(buf: ptr, bstart: int, blen: int, host: string, hstart: int, hlen: int): bool {
     if (blen != hlen) { return false; }
     let i = 0;
@@ -342,24 +310,22 @@ fn ciEqual(buf: ptr, bstart: int, blen: int, host: string, hstart: int, hlen: in
     return true;
 }
 
-// Match one dNSName (buf[start..start+len)) against host, honoring a leftmost "*." wildcard label.
 fn dnsMatch(buf: ptr, start: int, len: int, host: string): bool {
     if (len >= 2 && bytes.read_byte(buf, start) == 42 && bytes.read_byte(buf, start + 1) == 46) {
         let hi = 0;
         while (hi < host.length && host[hi] != 46) { hi = hi + 1; }
-        if (hi <= 0 || hi >= host.length) { return false; }   // wildcard needs a non-empty first label
+        if (hi <= 0 || hi >= host.length) { return false; }
         return ciEqual(buf, start + 2, len - 2, host, hi + 1, host.length - (hi + 1));
     }
     return ciEqual(buf, start, len, host, 0, host.length);
 }
 
-// Does the leaf certificate's SubjectAltName cover the hostname?
 pub fn matchHostname(cert: Cert, host: string): bool {
     let p = cert.sanStart;
     let end = cert.sanStart + cert.sanLen;
     while (p < end) {
         let gn = readTlv(cert.buf, p);
-        if (gn.tag == 0x82) {                          // dNSName [2] IMPLICIT IA5String
+        if (gn.tag == 0x82) {
             if (dnsMatch(cert.buf, gn.start, gn.len, host)) { return true; }
         }
         p = gn.next;
@@ -367,8 +333,6 @@ pub fn matchHostname(cert: Cert, host: string): bool {
     return false;
 }
 
-// One chain link: `child` is validly issued by `issuer` at `now` (issuer is a CA, names chain, both
-// within validity, and the signature verifies).
 pub fn verifyLink(child: Cert, issuer: Cert, now: long): bool {
     return child.ok && issuer.ok && issuer.isCa
         && nameMatches(child, issuer)
@@ -376,14 +340,12 @@ pub fn verifyLink(child: Cert, issuer: Cert, now: long): bool {
         && verifySignedBy(child, issuer);
 }
 
-// Verify a two-certificate chain (leaf directly under a trusted, self-signed root) for `host` at `now`.
 pub fn verifyChain2(leaf: Cert, root: Cert, host: string, now: long): bool {
     return verifyLink(leaf, root, now)
         && verifySignedBy(root, root)
         && matchHostname(leaf, host);
 }
 
-// Verify a three-certificate chain (leaf under intermediate under a trusted, self-signed root).
 pub fn verifyChain3(leaf: Cert, inter: Cert, root: Cert, host: string, now: long): bool {
     return verifyLink(leaf, inter, now)
         && verifyLink(inter, root, now)
@@ -395,9 +357,6 @@ fn rd3(buf: ptr, p: int): int {
     return (bytes.read_byte(buf, p) << 16) | (bytes.read_byte(buf, p + 1) << 8) | bytes.read_byte(buf, p + 2);
 }
 
-// Verify a TLS Certificate message's certificate_list against a trusted root, for a hostname at `now`.
-// `list` is the certificate_list content (a run of CertificateEntry: cert<3-byte len> || extensions<2>).
-// Handles a lone leaf (verifyChain2) or leaf + one intermediate (verifyChain3). Returns true iff trusted.
 pub fn verifyCertList(list: ptr, listLen: int, rootDer: ptr, rootLen: int, host: string, now: long): bool {
     if (listLen < 3) { return false; }
     let c0len = rd3(list, 0);
@@ -407,15 +366,13 @@ pub fn verifyCertList(list: ptr, listLen: int, rootDer: ptr, rootLen: int, host:
     p = p + 2 + ext0;
     let root = parseCert(rootDer, rootLen);
     if (p + 3 > listLen) {
-        return verifyChain2(leaf, root, host, now);       // leaf only
+        return verifyChain2(leaf, root, host, now);
     }
     let c1len = rd3(list, p);
     let inter = parseCert((list as long + (p + 3) as long) as ptr, c1len);
-    return verifyChain3(leaf, inter, root, host, now);     // leaf + intermediate
+    return verifyChain3(leaf, inter, root, host, now);
 }
 
-// TLS 1.2 variant: the certificate_list is [certLen(3) certDer].. with NO per-cert extension bytes
-// (those exist only in TLS 1.3 CertificateEntry). Same chain policy as verifyCertList otherwise.
 pub fn verifyCertList12(list: ptr, listLen: int, rootDer: ptr, rootLen: int, host: string, now: long): bool {
     if (listLen < 3) { return false; }
     let c0len = rd3(list, 0);
@@ -423,25 +380,20 @@ pub fn verifyCertList12(list: ptr, listLen: int, rootDer: ptr, rootLen: int, hos
     let p = 3 + c0len;
     let root = parseCert(rootDer, rootLen);
     if (p + 3 > listLen) {
-        return verifyChain2(leaf, root, host, now);       // leaf only
+        return verifyChain2(leaf, root, host, now);
     }
     let c1len = rd3(list, p);
     let inter = parseCert((list as long + (p + 3) as long) as ptr, c1len);
-    return verifyChain3(leaf, inter, root, host, now);     // leaf + intermediate
+    return verifyChain3(leaf, inter, root, host, now);
 }
 
-// Whether the cert's key is EC P-256 (the type the OCSP/CRL EC verifiers accept). Exposed so the
-// revocation layer can decide without the private key-type constant.
 pub fn isEcKey(cert: Cert): bool { return cert.keyType == KEY_EC_P256; }
 
-// The leaf (first) certificate of a certificate_list.
 pub fn leafCert(list: ptr, listLen: int): Cert {
     if (listLen < 3) { return parseCert(list, 0); }
     let c0len = rd3(list, 0);
     return parseCert((list as long + 3) as ptr, c0len);
 }
-// The intermediate (second) cert of a TLS 1.3 certificate_list (cert<3>||ext<2> runs), or a bad Cert
-// (ok=false) when the list holds only the leaf (the caller then falls back to a store root).
 pub fn interCert13(list: ptr, listLen: int): Cert {
     if (listLen < 3) { return parseCert(list, 0); }
     let c0len = rd3(list, 0);
@@ -452,7 +404,6 @@ pub fn interCert13(list: ptr, listLen: int): Cert {
     let c1len = rd3(list, p);
     return parseCert((list as long + (p + 3) as long) as ptr, c1len);
 }
-// TLS 1.2 intermediate (no per-cert extension bytes).
 pub fn interCert12(list: ptr, listLen: int): Cert {
     if (listLen < 3) { return parseCert(list, 0); }
     let c0len = rd3(list, 0);

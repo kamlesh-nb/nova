@@ -1,18 +1,3 @@
-// RSA signature verification (RSASSA-PKCS1-v1_5 and RSASSA-PSS) in Nova, no external library
-// (M9 phase C). RSA verification uses only public data (the public key and the signature), so it need
-// not be constant-time.
-//
-// The core is modular exponentiation s^e mod N over a runtime-sized modulus (2048/3072/4096-bit). N is
-// k 32-bit limbs (little-endian); the multiply is the same CIOS Montgomery routine as p256 generalised
-// to a runtime modulus and n0' (computed from N[0] by Newton's iteration). Conversion into Montgomery
-// form is by 32*k successive doublings mod N (done a couple of times per verify, so speed is a non-issue,
-// and it avoids needing a precomputed R^2 mod N). The public exponent is small (usually 65537), so the
-// exponentiation itself is a handful of squarings.
-//
-// PKCS#1 v1.5 checks EM = 0x00 || 0x01 || 0xFF.. || 0x00 || DigestInfo || hash. PSS runs EMSA-PSS-VERIFY
-// with MGF1 and salt length equal to the hash length (the TLS 1.3 rsa_pss_rsae_* convention).
-//
-// References: PKCS#1 v2.2 (RFC 8017), the standard Montgomery CIOS algorithm. Verified against OpenSSL.
 import bytes;
 import crypto.hash.sha256;
 import crypto.hash.sha512;
@@ -59,7 +44,6 @@ fn bnToBE(buf: ptr, off: int, a: ptr, k: int): void {
     }
 }
 
-// n0' = -N^-1 mod 2^32, via Newton's iteration on the least-significant limb.
 fn bnN0inv(N: ptr): ulong {
     let n0 = getw(N, 0);
     let inv: ulong = 1;
@@ -68,7 +52,7 @@ fn bnN0inv(N: ptr): ulong {
     return (U0 - inv) & MASK32;
 }
 
-fn bnLt(a: ptr, b: ptr, k: int): bool {         // is a < b?
+fn bnLt(a: ptr, b: ptr, k: int): bool {
     let borrow: ulong = 0;
     let j = 0;
     while (j < k) {
@@ -79,7 +63,6 @@ fn bnLt(a: ptr, b: ptr, k: int): bool {         // is a < b?
     return borrow == U1;
 }
 
-// t has k+1 limbs and t < 2N; write t-N if t >= N else t, into out[0..k-1].
 fn bnCondSubN(out: ptr, t: ptr, N: ptr, k: int): void {
     let d = bytes.alloc(k * 8);
     let borrow: ulong = 0;
@@ -92,7 +75,7 @@ fn bnCondSubN(out: ptr, t: ptr, N: ptr, k: int): void {
     }
     let xk = getw(t, k) - borrow;
     borrow = (xk >> 32) & U1;
-    let mask = U0 - (borrow ^ U1);              // all ones when t >= N
+    let mask = U0 - (borrow ^ U1);
     j = 0;
     while (j < k) {
         setw(out, j, (getw(d, j) & mask) | (getw(t, j) & (~mask)));
@@ -116,7 +99,6 @@ fn bnAddModN(out: ptr, a: ptr, b: ptr, N: ptr, k: int): void {
     bytes.free(t);
 }
 
-// CIOS Montgomery multiply: out = a*b*R^-1 mod N, R = 2^(32k). Inputs and output are canonical (< N).
 fn bnMontMul(out: ptr, a: ptr, b: ptr, N: ptr, k: int, n0inv: ulong): void {
     let t = bytes.alloc((k + 2) * 8);
     let j = 0;
@@ -159,7 +141,6 @@ fn bnSetOne(out: ptr, k: int): void {
     setw(out, 0, U1);
 }
 
-// out = a*R mod N, by 32*k successive doublings mod N.
 fn bnToMont(out: ptr, a: ptr, N: ptr, k: int): void {
     bnCopy(out, a, k);
     let i = 0;
@@ -174,10 +155,9 @@ fn bnFromMont(out: ptr, x: ptr, N: ptr, k: int, n0inv: ulong): void {
     bytes.free(one);
 }
 
-// out = base^e mod N, with e supplied as big-endian bytes.
 fn bnModExp(out: ptr, base: ptr, N: ptr, k: int, n0inv: ulong, e: ptr, eLen: int): void {
     let baseM = bytes.alloc(k * 8); bnToMont(baseM, base, N, k);
-    let r = bytes.alloc(k * 8); bnSetOne(r, k); bnToMont(r, r, N, k);   // R mod N
+    let r = bytes.alloc(k * 8); bnSetOne(r, k); bnToMont(r, r, N, k);
     let bi = 0;
     while (bi < eLen) {
         let bt = bytes.read_byte(e, bi);
@@ -193,7 +173,6 @@ fn bnModExp(out: ptr, base: ptr, N: ptr, k: int, n0inv: ulong, e: ptr, eLen: int
     bytes.free(baseM); bytes.free(r);
 }
 
-// Bit length of the modulus.
 fn bnBitLen(a: ptr, k: int): int {
     let i = k - 1;
     while (i >= 0) {
@@ -210,7 +189,6 @@ fn bnBitLen(a: ptr, k: int): int {
     return 0;
 }
 
-// RSA public operation: emOut (nLen bytes, big-endian) = sig^e mod N. Returns 0 if sig >= N.
 fn rsaPublicOp(emOut: ptr, sig: ptr, N: ptr, k: int, e: ptr, eLen: int): int {
     let s = bytes.alloc(k * 8); bnFromBE(s, sig, 0, k);
     if (!bnLt(s, N, k)) { bytes.free(s); return 0; }
@@ -221,12 +199,11 @@ fn rsaPublicOp(emOut: ptr, sig: ptr, N: ptr, k: int, e: ptr, eLen: int): int {
     return 1;
 }
 
-// ---- hash dispatch (0 = SHA-256, 1 = SHA-384, 2 = SHA-512) ----
 
 fn hLen(id: int): int {
     if (id == 0) { return 32; }
     if (id == 1) { return 48; }
-    if (id == 3) { return 20; }             // SHA-1 (OAEP / MGF1-SHA1)
+    if (id == 3) { return 20; }
     return 64;
 }
 fn doHash(id: int, data: ptr, len: int, out: ptr): void {
@@ -241,7 +218,7 @@ fn nib(c: int): int {
     if (c >= 97 && c <= 102) { return c - 87; }
     return c - 55;
 }
-fn writeHex(buf: ptr, off: int, hex: string): int {   // returns number of bytes written
+fn writeHex(buf: ptr, off: int, hex: string): int {
     let n = hex.length / 2;
     let i = 0;
     while (i < n) {
@@ -250,7 +227,6 @@ fn writeHex(buf: ptr, off: int, hex: string): int {   // returns number of bytes
     }
     return n;
 }
-// The DER DigestInfo prefix (19 bytes) for each hash.
 fn digestInfoHex(id: int): string {
     if (id == 0) { return "3031300d060960864801650304020105000420"; }
     if (id == 1) { return "3041300d060960864801650304020205000430"; }
@@ -267,9 +243,7 @@ fn memEq(a: ptr, aoff: int, b: ptr, boff: int, n: int): bool {
     return diff == 0;
 }
 
-// ---- public API ----
 
-// RSASSA-PKCS1-v1_5 verify. msgHash is the digest of the signed message (length implied by hashId).
 pub fn verifyPkcs1(hashId: int, msgHash: ptr, sig: ptr, sigLen: int, N: ptr, nLen: int, e: ptr, eLen: int): bool {
     let k = nLen / 4;
     if (sigLen != nLen) { return false; }
@@ -279,7 +253,6 @@ pub fn verifyPkcs1(hashId: int, msgHash: ptr, sig: ptr, sigLen: int, N: ptr, nLe
     let ok = rsaPublicOp(em, sig, Nl, k, e, eLen);
     if (ok == 0) { bytes.free(Nl); bytes.free(em); return false; }
 
-    // Build the expected EM = 00 01 FF..FF 00 || DigestInfo || hash and compare.
     let psLen = nLen - 3 - 19 - hl;
     let good = psLen >= 8;
     let expected = bytes.alloc(nLen);
@@ -297,7 +270,6 @@ pub fn verifyPkcs1(hashId: int, msgHash: ptr, sig: ptr, sigLen: int, N: ptr, nLe
     return matched;
 }
 
-// MGF1 mask generation over the selected hash: out[0..outLen) = MGF1(seed[0..seedLen)).
 fn mgf1(hashId: int, seed: ptr, seedLen: int, out: ptr, outLen: int): void {
     let hl = hLen(hashId);
     let buf = bytes.alloc(seedLen + 4);
@@ -322,7 +294,6 @@ fn mgf1(hashId: int, seed: ptr, seedLen: int, out: ptr, outLen: int): void {
     bytes.free(buf); bytes.free(dg);
 }
 
-// RSASSA-PSS verify (EMSA-PSS-VERIFY, MGF1, salt length = hash length).
 pub fn verifyPss(hashId: int, msgHash: ptr, sig: ptr, sigLen: int, N: ptr, nLen: int, e: ptr, eLen: int): bool {
     let k = nLen / 4;
     if (sigLen != nLen) { return false; }
@@ -335,9 +306,9 @@ pub fn verifyPss(hashId: int, msgHash: ptr, sig: ptr, sigLen: int, N: ptr, nLen:
     let modBits = bnBitLen(Nl, k);
     let emBits = modBits - 1;
     let emLen = (emBits + 7) / 8;
-    let off = nLen - emLen;                     // leading bytes of em that must be zero
+    let off = nLen - emLen;
     let dbLen = emLen - hl - 1;
-    let topBits = 8 * emLen - emBits;           // number of top bits of maskedDB[0] that must be zero
+    let topBits = 8 * emLen - emBits;
 
     let bad = false;
     let li = 0;
@@ -346,13 +317,11 @@ pub fn verifyPss(hashId: int, msgHash: ptr, sig: ptr, sigLen: int, N: ptr, nLen:
     let topZeroMask = (0xff << (8 - topBits)) & 0xff;
     if ((bytes.read_byte(em, off) & topZeroMask) != 0) { bad = true; }
 
-    // H is the hl bytes just before the 0xbc trailer; maskedDB is the dbLen bytes before H.
     let hOff = off + dbLen;
     let H = bytes.alloc(hl);
     let i = 0;
     while (i < hl) { bytes.write_byte(H, i, bytes.read_byte(em, hOff + i)); i = i + 1; }
 
-    // DB = maskedDB XOR MGF1(H, dbLen); then clear the top bits of DB[0].
     let dbMask = bytes.alloc(dbLen);
     mgf1(hashId, H, hl, dbMask, dbLen);
     let db = bytes.alloc(dbLen);
@@ -363,13 +332,11 @@ pub fn verifyPss(hashId: int, msgHash: ptr, sig: ptr, sigLen: int, N: ptr, nLen:
     }
     bytes.write_byte(db, 0, bytes.read_byte(db, 0) & (0xff >> topBits));
 
-    // DB must be 0x00.. || 0x01 || salt, with |salt| = hl.
     let psEnd = dbLen - hl - 1;
     let pi = 0;
     while (pi < psEnd) { if (bytes.read_byte(db, pi) != 0) { bad = true; } pi = pi + 1; }
     if (bytes.read_byte(db, psEnd) != 1) { bad = true; }
 
-    // M' = (8 zero bytes) || msgHash || salt; accept iff Hash(M') == H.
     let mpLen = 8 + hl + hl;
     let mp = bytes.alloc(mpLen);
     i = 0;
@@ -387,13 +354,7 @@ pub fn verifyPss(hashId: int, msgHash: ptr, sig: ptr, sigLen: int, N: ptr, nLen:
     return matched;
 }
 
-// ---- RSAES-OAEP encryption (public op; used by MySQL caching_sha2 full auth) ----
-//
-// OAEP with SHA-1 (label = "", MGF1-SHA1), matching the MySQL client. The encrypt operation is a
-// public-key op over public data, so it need not be constant-time. The randomness (the OAEP seed)
-// comes from the pure-Nova CSPRNG.
 
-// A DER TLV: tag, content offset `start`, content length `len`, and `next` (just past this TLV).
 struct DerTlv { pub tag: int, pub start: int, pub len: int, pub next: int }
 
 fn readTlv(buf: ptr, pos: int): DerTlv {
@@ -412,7 +373,6 @@ fn readTlv(buf: ptr, pos: int): DerTlv {
     return DerTlv { tag: tag, start: p, len: len, next: p + len };
 }
 
-// Index of `needle` in `hay` at or after `from`, or -1.
 fn indexOf(hay: string, needle: string, from: int): int {
     let n = hay.length;
     let m = needle.length;
@@ -426,8 +386,6 @@ fn indexOf(hay: string, needle: string, from: int): int {
     return 0 - 1;
 }
 
-// Extract the base64 body of a "-----BEGIN PUBLIC KEY-----" PEM block, stripped of whitespace, and
-// base64-decode it to DER. Returns an empty string if the markers are missing.
 fn pemToDer(pem: string): string {
     let begin = "-----BEGIN PUBLIC KEY-----";
     let end = "-----END PUBLIC KEY-----";
@@ -436,7 +394,6 @@ fn pemToDer(pem: string): string {
     let bodyStart = bs + begin.length;
     let es = indexOf(pem, end, bodyStart);
     if (es < 0) { return ""; }
-    // Copy the body, dropping newlines and carriage returns.
     let clean = bytes.alloc(es - bodyStart);
     let n = 0;
     let i = bodyStart;
@@ -454,35 +411,30 @@ fn pemToDer(pem: string): string {
     return s;
 }
 
-// RSAES-OAEP-SHA1 encrypt `data` (dataLen bytes) under the RSA public key in `pem`. Returns the
-// modulus-sized ciphertext as a raw string, or an empty string on any failure (bad PEM, message too
-// long). Matches the retired nova_rsa_oaep_encrypt (WC_RSA_OAEP_PAD, SHA-1, MGF1-SHA1, empty label).
 pub fn oaepEncryptSha1(pem: string, data: string, dataLen: int): string {
     let der = pemToDer(pem);
     if (der.length < 8) { return ""; }
     let derp = der as ptr;
 
-    // Parse SubjectPublicKeyInfo: SEQ { alg SEQ, BIT STRING { SEQ { INT n, INT e } } }.
     let outer = readTlv(derp, 0);
     if (outer.tag != 0x30) { return ""; }
     let alg = readTlv(derp, outer.start);
     let bitstr = readTlv(derp, alg.next);
     if (bitstr.tag != 0x03) { return ""; }
-    let inner = readTlv(derp, bitstr.start + 1);        // skip the BIT STRING unused-bits byte
+    let inner = readTlv(derp, bitstr.start + 1);
     if (inner.tag != 0x30) { return ""; }
     let nInt = readTlv(derp, inner.start);
     if (nInt.tag != 0x02) { return ""; }
     let ns = nInt.start; let nl = nInt.len;
-    if (bytes.read_byte(derp, ns) == 0) { ns = ns + 1; nl = nl - 1; }   // strip leading 0x00
+    if (bytes.read_byte(derp, ns) == 0) { ns = ns + 1; nl = nl - 1; }
     let eInt = readTlv(derp, nInt.next);
     if (eInt.tag != 0x02) { return ""; }
 
-    let k = nl;                                          // modulus size in bytes
-    if ((k & 3) != 0) { return ""; }                     // need a whole number of 32-bit limbs
-    let hl = 20;                                         // SHA-1
-    if (dataLen > k - 2 * hl - 2) { return ""; }         // message too long for OAEP
+    let k = nl;
+    if ((k & 3) != 0) { return ""; }
+    let hl = 20;
+    if (dataLen > k - 2 * hl - 2) { return ""; }
 
-    // Modulus limbs and exponent bytes (copied out of the DER buffer).
     let nBytes = bytes.alloc(k);
     let ci = 0;
     while (ci < k) { bytes.write_byte(nBytes, ci, bytes.read_byte(derp, ns + ci)); ci = ci + 1; }
@@ -490,11 +442,10 @@ pub fn oaepEncryptSha1(pem: string, data: string, dataLen: int): string {
     ci = 0;
     while (ci < eInt.len) { bytes.write_byte(eBytes, ci, bytes.read_byte(derp, eInt.start + ci)); ci = ci + 1; }
 
-    // DB = lHash(20) || PS(0..) || 0x01 || M.
     let dbLen = k - hl - 1;
     let db = bytes.alloc(dbLen);
     let dummy = bytes.alloc(1);
-    doHash(3, dummy, 0, db);                              // lHash = SHA1("") into db[0..20)
+    doHash(3, dummy, 0, db);
     bytes.free(dummy);
     let psLen = dbLen - hl - 1 - dataLen;
     let p = hl;
@@ -504,7 +455,6 @@ pub fn oaepEncryptSha1(pem: string, data: string, dataLen: int): string {
     z = 0;
     while (z < dataLen) { bytes.write_byte(db, p, bytes.read_byte(data as ptr, z)); p = p + 1; z = z + 1; }
 
-    // seed = random 20; maskedDB = DB ^ MGF1(seed); maskedSeed = seed ^ MGF1(maskedDB).
     let seed = bytes.alloc(hl);
     let rnd = random.randomBytes(hl);
     z = 0;
@@ -522,7 +472,6 @@ pub fn oaepEncryptSha1(pem: string, data: string, dataLen: int): string {
     z = 0;
     while (z < hl) { bytes.write_byte(maskedSeed, z, bytes.read_byte(seed, z) ^ bytes.read_byte(seedMask, z)); z = z + 1; }
 
-    // EM = 0x00 || maskedSeed || maskedDB  (k bytes).
     let em = bytes.alloc(k);
     bytes.write_byte(em, 0, 0);
     z = 0;
@@ -530,7 +479,6 @@ pub fn oaepEncryptSha1(pem: string, data: string, dataLen: int): string {
     z = 0;
     while (z < dbLen) { bytes.write_byte(em, 1 + hl + z, bytes.read_byte(maskedDb, z)); z = z + 1; }
 
-    // c = EM^e mod n.
     let kw = k / 4;
     let Nl = bytes.alloc(kw * 8); bnFromBE(Nl, nBytes, 0, kw);
     let ct = bytes.alloc(k);

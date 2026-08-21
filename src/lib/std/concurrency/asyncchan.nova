@@ -1,21 +1,10 @@
 import list;
 
-// A BOUNDED async channel with BACKPRESSURE for coroutines on a single reactor. Unlike the blocking
-// Channel<T> it never blocks an OS thread: a sender that finds the buffer full PARKS (coroSuspend) until a
-// receiver frees a slot, and a receiver that finds it empty parks until a sender delivers a value.
-//
-// Correctness rests on the single-reactor model (same basis as AsyncLock): coroutines interleave ONLY at
-// suspend points, so the size check and the buffer / wait-queue mutation -- which contain no suspend between
-// them -- are atomic with respect to other coroutines. Share one by putting it in a struct field (a heap
-// reference), so a by-value copy of the owner still shares the buffer and wait queues.
-//
-// `capacity == 0` means UNBOUNDED (send never parks). `capacity > 0` bounds the buffer to that many pending
-// values and applies backpressure to senders.
 pub struct AsyncChannel<T> {
     buffer: list.List<T>,
     capacity: int,
-    sendWaiters: list.List<long>,   // parked senders (buffer was full), FIFO
-    recvWaiters: list.List<long>,   // parked receivers (buffer was empty), FIFO
+    sendWaiters: list.List<long>,
+    recvWaiters: list.List<long>,
 
     init(capacity: int) {
         self.buffer = list.List<T>();
@@ -24,15 +13,12 @@ pub struct AsyncChannel<T> {
         self.recvWaiters = list.List<long>();
     }
 
-    // Deliver a value. On a bounded channel, PARK while the buffer is full and resume when a receiver frees a
-    // slot. The while re-checks after every resume, so a spurious wake simply re-parks.
     pub async fn send(self: AsyncChannel<T>, val: T): void {
         while (self.capacity > 0 && self.buffer.size() >= self.capacity) {
             self.sendWaiters.push(currentCoro());
             coroSuspend();
         }
         self.buffer.push(val);
-        // A value is now available: wake one parked receiver (deferred via the scheduler, not inline).
         if (self.recvWaiters.size() > 0) {
             let h = self.recvWaiters.at(0);
             self.recvWaiters.remove(0);
@@ -40,7 +26,6 @@ pub struct AsyncChannel<T> {
         }
     }
 
-    // Take the next value, PARKING while the buffer is empty and resuming when a sender delivers.
     pub async fn recv(self: AsyncChannel<T>): T {
         while (self.buffer.size() == 0) {
             self.recvWaiters.push(currentCoro());
@@ -48,7 +33,6 @@ pub struct AsyncChannel<T> {
         }
         let v = self.buffer.at(0);
         self.buffer.remove(0);
-        // A slot just freed: wake one parked sender.
         if (self.sendWaiters.size() > 0) {
             let h = self.sendWaiters.at(0);
             self.sendWaiters.remove(0);
@@ -57,13 +41,10 @@ pub struct AsyncChannel<T> {
         return v;
     }
 
-    // Non-blocking observers.
     pub fn ready(self: AsyncChannel<T>): bool { return self.buffer.size() > 0; }
     pub fn depth(self: AsyncChannel<T>): int { return self.buffer.size(); }
     pub fn waitingSenders(self: AsyncChannel<T>): int { return self.sendWaiters.size(); }
 
-    // Register / unregister a coroutine as a receive-waiter (used by `selectRecv` to park on several channels
-    // at once). A copy of the channel struct shares the SAME heap wait lists, so these mutate shared state.
     pub fn registerRecv(self: AsyncChannel<T>, h: long): void { self.recvWaiters.push(h); }
     pub fn unregisterRecv(self: AsyncChannel<T>, h: long): void {
         let i = 0;
@@ -74,27 +55,18 @@ pub struct AsyncChannel<T> {
     }
 }
 
-// SELECT over channels: park until ANY of the given channels has a value ready, then return its index. The
-// caller then recv()s from `channels.at(index)` (which will not block, since it is ready). Parks on every
-// channel at once and, on wake, deregisters from all of them before re-checking -- so a value delivered on
-// one channel wakes the select even while it waits on the others. This is the channel analogue of
-// `selectAny` over futures.
 pub async fn selectRecv<T>(channels: list.List<AsyncChannel<T>>): int {
     while (true) {
-        // Fast path: a channel already has a value.
         let i = 0;
         while (i < channels.size()) {
             if (channels.at(i).ready()) { return i; }
             i = i + 1;
         }
         if (channels.size() == 0) { return -1; }
-        // Park on every channel; a send on any of them wakes us.
         let h = currentCoro();
         let j = 0;
         while (j < channels.size()) { channels.at(j).registerRecv(h); j = j + 1; }
         coroSuspend();
-        // On wake, remove ourselves from ALL channels (a sender popped us from one; we are still queued on the
-        // others). Then loop to find and return the ready channel.
         let k = 0;
         while (k < channels.size()) { channels.at(k).unregisterRecv(h); k = k + 1; }
     }

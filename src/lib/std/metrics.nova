@@ -1,24 +1,8 @@
-// Metrics + lightweight tracing (T12). A production service exposes counters (monotonic totals) and
-// gauges (point-in-time values) and can render them for a scrape endpoint; it also wants per-operation
-// timing spans that emit a structured log line on finish. This module provides both over the same
-// string-keyed registry, plus a Span that measures elapsed time and logs it.
-//
-//   let reg = metrics.newRegistry();
-//   reg.inc("db_queries_total");
-//   reg.setGauge("pool_idle", 4);
-//   reg.snapshotProm();   // Prometheus text exposition
-//   reg.snapshotJson();   // one JSON object
-//
-//   let sp = metrics.startSpan(lg, "db.query");
-//   ... work ...
-//   sp.finish(reg);       // logs {msg:"db.query", elapsed_ns:...} and bumps db.query_ns_total
 
 import string;
 import map;
 import list;
 
-// Render a signed 64-bit integer as decimal text (stdlib has no int->string, and template literals
-// take string operands only).
 pub fn numStr(n: long): string {
     if (n == 0) { return "0"; }
     let neg = n < 0;
@@ -36,7 +20,7 @@ pub fn numStr(n: long): string {
 pub struct Registry {
     pub counters: Map<string, long>,
     pub gauges: Map<string, long>,
-    pub names: List<string>,     // insertion order for stable snapshots (counters then gauges)
+    pub names: List<string>,
 
     init() {
         self.counters = Map<string, long>(64, string.hash);
@@ -45,7 +29,6 @@ pub struct Registry {
     }
 
     fn track(self: Registry, name: string): void {
-        // Record first-seen names so snapshots are deterministic (Map iteration order is not).
         let i = 0;
         while (i < self.names.size()) {
             if (string.eql(self.names.get(i) ?? "", name)) { return; }
@@ -54,7 +37,6 @@ pub struct Registry {
         self.names.push(name);
     }
 
-    // Counter: monotonic. add(n) / inc().
     pub fn add(self: Registry, name: string, n: long): void {
         let cur = self.counters.get(name) ?? 0;
         self.counters.set(name, cur + n);
@@ -63,14 +45,12 @@ pub struct Registry {
     pub fn inc(self: Registry, name: string): void { self.add(name, 1); }
     pub fn counter(self: Registry, name: string): long { return self.counters.get(name) ?? 0; }
 
-    // Gauge: set to an absolute value.
     pub fn setGauge(self: Registry, name: string, v: long): void {
         self.gauges.set(name, v);
         self.track(name);
     }
     pub fn gauge(self: Registry, name: string): long { return self.gauges.get(name) ?? 0; }
 
-    // Prometheus text exposition: `# TYPE name kind\nname value` per metric, insertion order.
     pub fn snapshotProm(self: Registry): string {
         let out = "";
         let i = 0;
@@ -87,7 +67,6 @@ pub struct Registry {
         return out;
     }
 
-    // One JSON object: {"name":value,...} across counters and gauges.
     pub fn snapshotJson(self: Registry): string {
         let out = "{";
         let i = 0;
@@ -105,6 +84,3 @@ pub struct Registry {
 
 pub fn newRegistry(): Registry { return Registry(); }
 
-// The timing Span (tracing) lives in the `log` module, since it emits a structured log line on finish
-// -- keeping `metrics` free of a `log` dependency so importers that only want counters/gauges (e.g. the
-// connection pool) do not drag the logger's import graph in. Use log.startSpan(logger, name).

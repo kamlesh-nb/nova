@@ -1,10 +1,3 @@
-// S3 (traits, regression guard -- no code fix needed): two modules each declare a same-named trait
-// `Greeter`. Unlike structs (field offsets) and enums (variant tags), a trait is dispatched through the
-// per-implementation vtable carried in the fat pointer {struct_ptr, vtable}, NOT by the trait name. So a
-// same-named trait collapsing across modules is harmless: each factory returns its own struct, whose own
-// vtable resolves greet() correctly. This case pins that behaviour so a future trait change can't
-// silently regress it. (User-facing unions are not a functional construction feature, so there is no
-// analogous union case.)
 import assert;
 import scoped.greeter_b;
 import scoped.greeter_a;
@@ -25,5 +18,5 @@ fn test_module_b_trait(): void {
 fn test_both_traits_coexist(): void {
     let a = greeter_a.mkA();
     let b = greeter_b.mkB();
-    assert.equalInt(a.greet() + b.greet(), 333);   // each dispatched via its own vtable
+    assert.equalInt(a.greet() + b.greet(), 333);
 }

@@ -1,7 +1,3 @@
-// CA trust store (M12): a server certificate chain is trusted iff it validates against a root in the
-// store, at a given time, for a given hostname. Uses a real OpenSSL-generated EC chain: a self-signed
-// "Nova Test Root CA" and a leaf for localhost signed by it. Verifies the trust decision (accept the
-// valid chain; reject a wrong hostname, an out-of-validity time, and an empty store).
 import crypto.tls.truststore;
 import bytes;
 import assert;
@@ -18,7 +14,6 @@ fn hexBuf(hex: string): ptr {
     return b;
 }
 
-// Build a TLS certificate_list holding a single leaf entry: len(3) || der || ext_len(2)=0.
 fn leafList(hex: string, lenOut: ptr): ptr {
     let n = hex.length / 2;
     let leaf = hexBuf(hex);
@@ -39,7 +34,6 @@ fn trust_accepts_valid_chain(): void {
     let lo = bytes.alloc(4);
     let list = leafList(LEAF_HEX, lo);
     let listLen = bytes.read_byte(lo, 0) | (bytes.read_byte(lo, 1) << 8) | (bytes.read_byte(lo, 2) << 16);
-    // now = 2027-01-01 00:00:00, within the leaf's validity window.
     assert.isTrue(store.trusts(list, listLen, "localhost", 20270101000000));
 }
 
@@ -58,8 +52,8 @@ fn trust_rejects_out_of_validity(): void {
     let lo = bytes.alloc(4);
     let list = leafList(LEAF_HEX, lo);
     let listLen = bytes.read_byte(lo, 0) | (bytes.read_byte(lo, 1) << 8) | (bytes.read_byte(lo, 2) << 16);
-    assert.isTrue(!store.trusts(list, listLen, "localhost", 20200101000000));   // before notBefore
-    assert.isTrue(!store.trusts(list, listLen, "localhost", 20300101000000));   // after notAfter
+    assert.isTrue(!store.trusts(list, listLen, "localhost", 20200101000000));
+    assert.isTrue(!store.trusts(list, listLen, "localhost", 20300101000000));
 }
 
 @test

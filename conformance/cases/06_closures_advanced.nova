@@ -1,12 +1,7 @@
-// A1 regression guards: real per-instance heap-environment closures.
-// These all FAILED under the old captured_globals scheme (closures shared a
-// single promoted global) and now pass with per-closure environments.
 import assert;
 import list;
 import string;
 
-// Capturing a reference-typed value (string): the env snapshots the pointer,
-// so distinct closures keep distinct captured strings.
 fn make_greeter(name: string): (int) => string {
     return (x) => string.concat("hi ", name);
 }
@@ -23,8 +18,6 @@ fn make_adder(n: int): (int) => int {
     return (x) => x + n;
 }
 
-// Returned closures must be independent (the original A1 bug: add5 wrongly
-// saw n=9 and returned 10).
 @test
 fn test_returned_closures_are_independent(): void {
     let add5 = make_adder(5);
@@ -33,8 +26,6 @@ fn test_returned_closures_are_independent(): void {
     assert.equalInt(add9(1), 10);
 }
 
-// Closures created in a loop each snapshot their own captured value, even when
-// stored in a List<(int)=>int>.
 @test
 fn test_loop_capture_independent(): void {
     let fns = List<(int) => int>();
@@ -52,7 +43,6 @@ fn test_loop_capture_independent(): void {
     assert.equalInt(f2(10), 12);
 }
 
-// Multiple captured variables in one closure.
 fn make_affine(a: int, b: int): (int) => int {
     return (x) => a * x + b;
 }
@@ -65,11 +55,6 @@ fn test_multi_capture(): void {
     assert.equalInt(g(2), 21);
 }
 
-// §3.4j inc4: capturing a HEAP (non-literal) ref-counted value. The env must RETAIN
-// the captured string, or it dangles when the creating scope releases it — a
-// use-after-free, not a leak. The other capture tests bind their param to a string
-// LITERAL (sentinel refcount, never freed), so they passed by luck; this one binds it
-// to `string.concat(..)`, a real heap string.
 fn make_wrapper(inner: string): (int) => string {
     return (x) => string.concat("[", inner);
 }

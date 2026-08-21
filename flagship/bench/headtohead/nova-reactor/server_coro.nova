@@ -1,8 +1,3 @@
-// The same minimal HTTP/1.1 server as server.nova, but each connection is handled by a real
-// Nova `async fn` coroutine driven directly by the event loop (coroStart / currentCoro /
-// coroSuspend / nova_reactor_resume), with no Asio. This measures the cost of the ergonomic
-// async layer against the callback server: the handler reads with `await`-style suspension
-// instead of an inline callback. See docs/design/self-hosted-runtime.md phase 4.
 import bytes;
 import os.sys;
 import net.poller;
@@ -29,8 +24,6 @@ fn writeAll(fd: int, buf: long, len: int): void {
     }
 }
 
-// One connection, as a coroutine: await readability, read the request, respond, repeat
-// (keep-alive), until the peer closes. The reactor resumes this on each readiness event.
 async fn serveConn(r: poller.Reactor, fd: int, resp: long, respLen: int): void {
     while (true) {
         r.addRead(fd, currentCoro());

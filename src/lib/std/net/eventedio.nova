@@ -1,38 +1,15 @@
-// net/reactorio: reactor-native async socket I/O in Nova (M2 of the C++ runtime retirement plan,
-// docs/design/cpp-runtime-retirement-plan.md). This is the reactor-driven replacement for the
-// Asio-backed async I/O primitives (nova_arecv / nova_asend / nova_aconnect / nova_aaccept): the
-// same "await a read / write" shape, but implemented over os/sys non-blocking sockets and the Nova
-// reactor's readiness (os/kqueue), with no Asio.
-//
-// The mechanism mirrors the reactor's connection loop: a non-blocking syscall is tried inline; on
-// EAGAIN() the fd is registered with the reactor carrying `currentCoro()` as the readiness token, and
-// the coroutine suspends (coroSuspend). When the reactor polls that fd ready it resumes the
-// coroutine (nova_reactor_resume(token)), which retries the syscall. No thread is held while blocked.
-//
-// A ReactorStream is just a raw fd plus the kqueue it is registered on, so it carries no Asio state
-// and can be constructed anywhere a reactor coroutine has an fd (an accepted connection, a connected
-// client). This is the seam the database drivers move onto in M3.
 
 import bytes;
 import os.socket;
 import os.backend;
 import net.eventloop;
 
-// Op records are allocated and freed on every single read and write. They are fixed-size and never
-// leave the owning reactor thread, so they come from a thread-local free list in the runtime rather
-// than malloc — reuse is a pointer swap. See nova_op_alloc in core.cpp.
 extern("c") fn nova_op_alloc(size: long): long;
 extern("c") fn nova_op_free(op: long): void;
 
-// errno values are platform-specific (EAGAIN() is 35 on macOS but 11 on Linux), so they come from the
-// per-OS seam in os/backend rather than being pinned to one kernel here.
 pub fn EAGAIN(): int { return backend.ERR_AGAIN; }
 pub fn EINPROGRESS(): int { return backend.ERR_INPROGRESS; }
 
-// Parse a dotted-quad IPv4 string into the value to store in sin_addr with bytes.write_i32, i.e.
-// the four octets in ascending memory order (little-endian int): "127.0.0.1" -> 0x0100007F, whose
-// stored bytes are 7F 00 00 01. Hostname resolution (getaddrinfo) is a later step; numeric IPv4 is
-// enough for loopback and IP-configured database hosts.
 pub fn parseIPv4(s: string): long {
     let result = 0 as long;
     let cur = 0;
@@ -64,14 +41,6 @@ fn isNumericIPv4(s: string): bool {
     return true;
 }
 
-// Resolve a host to the big-endian IPv4 address value for makeSockaddrIn. Numeric IPv4 is parsed
-// directly; a hostname goes through getaddrinfo. Returns -1 on failure.
-//
-// NOTE: getaddrinfo is a BLOCKING DNS lookup, so on a reactor thread it briefly stalls the loop.
-// This is done once per connection (connections are pooled), not per request, so it is an accepted
-// interim cost; a non-blocking resolver is a later step. The struct addrinfo field offsets here are
-// the macOS/BSD layout (ai_family at 4, ai_addr at 32, ai_next at 40); Linux differs (ai_addr at 24)
-// and plugs in with the epoll backend.
 pub fn resolveHost4(host: string): long {
     if (isNumericIPv4(host)) { return parseIPv4(host); }
 
@@ -93,13 +62,11 @@ pub fn resolveHost4(host: string): long {
     while (ai != 0 && addr == (-1 as long)) {
         let fam = bytes.read_i32(ai, 4) as int;
         if (fam == socket.AF_INET) {
-            // ai_addr's offset differs by libc (32 on macOS/BSD, 24 on Linux, where 32 is
-            // ai_canonname instead), so it comes from the per-OS seam.
             let sa = bytes.read_ptr(ai, backend.ADDRINFO_ADDR_OFFSET);
             if (sa == 0) { ai = bytes.read_ptr(ai, 40); }
-            else { addr = bytes.read_i32(sa, 4) as long; }  // sin_addr
+            else { addr = bytes.read_i32(sa, 4) as long; }
         } else {
-            ai = bytes.read_ptr(ai, 40);           // ai_next
+            ai = bytes.read_ptr(ai, 40);
         }
     }
     if (head != 0) { socket.freeAddrInfo(head); }
@@ -116,57 +83,25 @@ pub class ReactorStream {
         self.kq = kq;
     }
 
-    // Read up to `max` bytes into `buf`. Returns the byte count (0 on peer close/EOF), or -1 on a
-    // real error. Awaits readability on EAGAIN() without holding a thread.
     pub async fn recvInto(self: ReactorStream, buf: long, max: int): int {
-        // Completion model: submit a recv op carrying this coroutine as the token, suspend, and read the
-        // byte count the loop filled in. The op record + buf are on this frame, so they outlive the op.
-        // FAST PATH: try a direct read first. On a busy keep-alive connection the next request is often
-        // already in the socket buffer, so this returns immediately -- no op, no suspend. EAGAIN (no data
-        // yet) falls through to the completion op, which parks the coroutine until the fd is readable.
         let r0 = socket.recvSock(self.fd, buf, max);
         if (r0 > 0) { return r0 as int; }
-        if (r0 == 0) { return 0; }                 // peer closed
-        if (!socket.wouldBlock()) { return -1; }   // real error
+        if (r0 == 0) { return 0; }
+        if (!socket.wouldBlock()) { return -1; }
         let op = nova_op_alloc(eventloop.OP_SIZE as long);
         eventloop.makeOp(op, eventloop.OP_RECV, self.fd, buf, max, currentCoro());
-        // A FAILED submit posts NO completion, so suspending here waits forever. This is what every
-        // mature proactor does -- cf. libhv event/overlapio.c, where WSARecv/WSASend/AcceptEx return
-        // the error straight to the caller when it is not ERROR_IO_PENDING and no completion
-        // callback ever runs. On Windows the realistic trigger is WSAENOBUFS (the locked-pages
-        // limit), hit exactly when many concurrent overlapped receives are outstanding -- which is
-        // why the resulting stall was load-dependent and stranded individual connections. Freeing is
-        // safe here precisely because nothing is coming: the kernel never took the record.
         if (eventloop.submit(self.kq, op) != 0) { nova_op_free(op); return -1; }
         coroSuspend();
-        // A resume is not proof that THIS op finished -- a stale timer or a batch wake can resume
-        // the coroutine while the operation is still in flight. Freeing on such a wake returns the
-        // record to the pool while a proactor still owns it as an OVERLAPPED/user_data; the next
-        // submit reuses it, and the original completion is then delivered nowhere, stranding an
-        // unrelated connection. `done` is the only completion signal (every backend sets it via
-        // setOpResult), so wait for it.
         while (eventloop.opDone(op) != 1) { coroSuspend(); }
         let r = eventloop.opResult(op);
         nova_op_free(op);
         return r;
     }
 
-    // Like recvInto, but bounded by a read deadline. On timeout returns -2 (the caller closes the
-    // connection). Implemented against the monotonic clock: a reactor timer is armed only to WAKE the
-    // coroutine so it can re-check the deadline; on any exit the timer is cancelled. Whether the wake
-    // was the socket or the timer, the loop re-reads and re-checks the clock, so it needs no
-    // event-type distinction. A timer that fires in the same poll batch as a completing read cannot
-    // resume a reaped frame: reaping records the handle for the batch and nova_reactor_resume skips it.
     pub async fn recvIntoDeadline(self: ReactorStream, buf: long, max: int, timeoutMs: int): int {
         if (timeoutMs <= 0) { return await self.recvInto(buf, max); }
-        // Completion model: submit a recv op (done flag starts 0) and arm a one-shot timer. Whichever
-        // fires first wakes this coroutine: if the loop completed the read it set done=1 and the byte
-        // count; if only the timer fired, done is still 0, so we time out (-2) and cancel the still-armed
-        // read op. A same-batch data+timer race resolves to the data (the loop ran the read and set
-        // done), and the duplicate timer wake is skipped by the batch reap guard.
         let op = nova_op_alloc(eventloop.OP_SIZE as long);
         eventloop.makeOp(op, eventloop.OP_RECV, self.fd, buf, max, currentCoro());
-        // See recvInto: no completion follows a failed submit, so neither suspend nor arm a timer.
         if (eventloop.submit(self.kq, op) != 0) { nova_op_free(op); return -1; }
         nova_reactor_set_timer(currentCoro(), timeoutMs as long);
         coroSuspend();
@@ -176,36 +111,25 @@ pub class ReactorStream {
             nova_op_free(op);
             return r;
         }
-        // Abandoning an op is NOT simply "cancel the interest and free": on a proactor the kernel
-        // holds this record until the operation completes or is cancelled, so freeing it here lets
-        // the pool hand it out again while a completion is still coming -- which loses that
-        // completion and hangs the connection. abandonOp reports who owns it afterwards.
         if (!eventloop.abandonOp(self.kq, op)) { nova_op_free(op); }
         return -2;
     }
 
-    // Write all `len` bytes from `buf`, awaiting writability on EAGAIN(). Returns bytes sent, or -1.
-    // (delayMs is a free function below -- kept out of the struct so it needs no stream.)
     pub async fn sendBuf(self: ReactorStream, buf: long, len: int): int {
         let sent = 0;
-        // FAST PATH: a non-blocking socket is almost always writable, so write DIRECTLY first. This keeps
-        // the common send at one syscall -- no op alloc, no reactor submit, no coroutine suspend/resume --
-        // which is where the whole point of async is: pay the reactor cost only when you would actually
-        // block. Only a full kernel send buffer (EAGAIN / wouldBlock) drops us to the completion op below.
         while (sent < len) {
             let w = socket.sendSock(self.fd, buf + (sent as long), len - sent);
             if (w > 0) { sent = sent + (w as int); }
             else if (w == 0) { break; }
-            else if (socket.wouldBlock()) { break; }   // buffer full -> wait via the reactor
-            else { return -1; }                          // real error
+            else if (socket.wouldBlock()) { break; }
+            else { return -1; }
         }
-        // SLOW PATH: kernel buffer was full; park on writability via the completion op for the remainder.
         while (sent < len) {
             let op = nova_op_alloc(eventloop.OP_SIZE as long);
             eventloop.makeOp(op, eventloop.OP_SEND, self.fd, buf + (sent as long), len - sent, currentCoro());
             if (eventloop.submit(self.kq, op) != 0) { nova_op_free(op); return -1; }
             coroSuspend();
-            while (eventloop.opDone(op) != 1) { coroSuspend(); }   // see recvInto
+            while (eventloop.opDone(op) != 1) { coroSuspend(); }
             let w = eventloop.opResult(op);
             nova_op_free(op);
             if (w > 0) { sent = sent + w; } else { return -1; }
@@ -213,10 +137,6 @@ pub class ReactorStream {
         return sent;
     }
 
-    // Send a string reactor-natively, passing the string's OWN byte buffer straight to the send op with no
-    // copy. The bytes stay valid for the whole send: `data` is a borrowed parameter, so the caller holds a
-    // live reference across the `await`. Copying byte-by-byte here (the previous approach) made send time
-    // linear in body size in Nova code and was the throughput ceiling for larger responses / static assets.
     pub async fn sendStr(self: ReactorStream, data: string): int {
         let len = data.length;
         if (len == 0) { return 0; }
@@ -235,28 +155,19 @@ pub class ReactorStream {
     }
 }
 
-// Receive ONE handed-off fd on the reactor via the OP_RECVFD completion op: the loop recvmsg's a single
-// SCM_RIGHTS fd when the control socket is readable and reports it as the op result. Returns the received
-// client fd (>=0) to serve, or -1 when the control channel closed / errored. This is the fd-passing
-// handoff receiver primitive: it cannot use recvInto (a plain recv() would read the payload byte and DROP
-// the ancillary fd); it must go through recvmsg, which OP_RECVFD does. The 8-byte scratch lives on this
-// coroutine's frame, so it outlives the op. One fd per call; the caller loops (like accept).
 pub async fn recvFdOp(ctrlFd: int, kq: int): int {
     let scratch: long = bytes.alloc(8);
     let op = nova_op_alloc(eventloop.OP_SIZE as long);
     eventloop.makeOp(op, eventloop.OP_RECVFD, ctrlFd, scratch, 8, currentCoro());
     if (eventloop.submit(kq, op) != 0) { nova_op_free(op); bytes.free(scratch); return -1; }
     coroSuspend();
-    while (eventloop.opDone(op) != 1) { coroSuspend(); }   // see recvInto: done is the only completion signal
+    while (eventloop.opDone(op) != 1) { coroSuspend(); }
     let r = eventloop.opResult(op);
     nova_op_free(op);
     bytes.free(scratch);
     return r;
 }
 
-// Connect to a numeric IPv4 host and port on the reactor. The non-blocking connect returns
-// EINPROGRESS(); we await writability, then read SO_ERROR to confirm. Returns a ReactorStream whose
-// fd is -1 on failure.
 pub async fn reactorConnect(host: string, port: int, kq: int): ReactorStream {
     let addr = resolveHost4(host);
     if (addr == (-1 as long)) { return ReactorStream(-1, kq); }
@@ -265,10 +176,6 @@ pub async fn reactorConnect(host: string, port: int, kq: int): ReactorStream {
     socket.setNonBlock(fd);
     let sa = socket.makeSockaddrIn(port, addr);
 
-    // A completion backend performs the connect AS the submitted operation (ConnectEx), so it must
-    // not be preceded by a non-blocking connect() — the socket would already have one in flight and
-    // the overlapped call would be rejected. The address therefore travels in the op's buf/len
-    // slots, which the readiness backends ignore for OP_CONNECT.
     if (eventloop.connectIsSubmitted()) {
         let cop = nova_op_alloc(eventloop.OP_SIZE as long);
         eventloop.makeOp(cop, eventloop.OP_CONNECT, fd, sa, 16, currentCoro());
@@ -290,9 +197,6 @@ pub async fn reactorConnect(host: string, port: int, kq: int): ReactorStream {
         if (!socket.connectInProgress()) { socket.close(fd); return ReactorStream(-1, kq); }
         let op = nova_op_alloc(eventloop.OP_SIZE as long);
         eventloop.makeOp(op, eventloop.OP_CONNECT, fd, 0, 0, currentCoro());
-        // Return the error-sentinel stream, not a bare `-1`: this fn returns ReactorStream (matching the
-        // connectInProgress error path just above). A bare `-1` was a latent type mismatch on the failed-
-        // submit path that only never bit because that path is rarely hit.
         if (eventloop.submit(kq, op) != 0) { nova_op_free(op); return ReactorStream(-1, kq); }
         coroSuspend();
         let res = eventloop.opResult(op);
@@ -302,13 +206,6 @@ pub async fn reactorConnect(host: string, port: int, kq: int): ReactorStream {
     return ReactorStream(fd, kq);
 }
 
-// Like reactorConnect but bounded by a deadline. If the TCP connect has not completed within
-// `timeoutMs`, the still-armed connect op is abandoned (the kernel owns the record until it completes
-// or is cancelled, exactly as in recvIntoDeadline), the socket is closed, and a failed stream (fd -1)
-// is returned. A firewalled or dead host can therefore no longer hang the connecting coroutine
-// forever. `timeoutMs <= 0` means no deadline (delegates to reactorConnect). Same completion-vs-
-// readiness split as reactorConnect; the timer wraps the suspend on both paths and opDone(op)==1
-// distinguishes "connect finished" from "timer fired".
 pub async fn reactorConnectDeadline(host: string, port: int, kq: int, timeoutMs: int): ReactorStream {
     if (timeoutMs <= 0) { return await reactorConnect(host, port, kq); }
     let addr = resolveHost4(host);
@@ -342,7 +239,7 @@ pub async fn reactorConnectDeadline(host: string, port: int, kq: int, timeoutMs:
 
     let r = socket.connectSock(fd, sa, 16);
     bytes.free(sa);
-    if (r == 0) { return ReactorStream(fd, kq); }   // connected immediately (loopback)
+    if (r == 0) { return ReactorStream(fd, kq); }
     if (!socket.connectInProgress()) { socket.close(fd); return ReactorStream(-1, kq); }
     let op = nova_op_alloc(eventloop.OP_SIZE as long);
     eventloop.makeOp(op, eventloop.OP_CONNECT, fd, 0, 0, currentCoro());
@@ -361,30 +258,17 @@ pub async fn reactorConnectDeadline(host: string, port: int, kq: int, timeoutMs:
     return ReactorStream(-1, kq);
 }
 
-// Accept one connection on a listening fd, awaiting readability while the backlog is empty. Returns
-// a ReactorStream for the accepted connection (fd -1 on error). The listener's read-interest is
-// removed on success so a later accept does not resume the wrong coroutine.
 pub async fn reactorAccept(listenFd: int, kq: int): ReactorStream {
-    // Completion model: submit an accept op; the loop performs accept() when the listener is readable,
-    // sets the accepted fd non-blocking, and reports it as the op result (or -1). One accept per op.
     let op = nova_op_alloc(eventloop.OP_SIZE as long);
     eventloop.makeOp(op, eventloop.OP_ACCEPT, listenFd, 0, 0, currentCoro());
-    // Especially important here: an acceptor suspended on a failed submit stops accepting on this
-    // listener for the life of the process.
-    // Error-sentinel stream, not a bare `-1`: reactorAccept returns ReactorStream (same latent-mismatch fix
-    // as reactorConnect above).
     if (eventloop.submit(kq, op) != 0) { nova_op_free(op); return ReactorStream(-1, kq); }
     coroSuspend();
     let c = eventloop.opResult(op);
     nova_op_free(op);
-    // Turn off Nagle on the accepted connection so responses are not held back waiting for an ACK -- the
-    // request/response ping-pong of HTTP keep-alive otherwise serialises badly and caps throughput.
     if (c >= 0) { let _ = socket.setTcpNoDelay(c); }
     return ReactorStream(c, kq);
 }
 
-// A pure async delay: arm a one-shot reactor timer and suspend this coroutine until it fires (no socket
-// op involved). Reactor-thread only -- there is no timer to fire when block-driving off the reactor.
 pub async fn delayMs(ms: int): void {
     if (ms <= 0) { return; }
     nova_reactor_set_timer(currentCoro(), ms as long);

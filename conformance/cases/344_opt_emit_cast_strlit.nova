@@ -1,22 +1,13 @@
-// Emit-subset growth (C2 casts + C8 string literals). C2: an int<->int cast (`x as long`, `y as int`) emits
-// (canonicalise to the result width -- trunc + sign/zero-extend); float<->int and pointer casts fall back.
-// C8: a string literal materialises via the same immortal interned global the AST path uses (retain/release
-// are no-ops on it, so no ARC). Combined with C0 (string method calls) + C3 (string byte index), a whole
-// string function body -- literals, casts, indexing, method calls -- now compiles from the optimised IR.
-// Under NOVA_OPT_EMIT these helpers compile from the emit path; both must agree.
 import assert;
 import string;
 
-// C2: int<->int casts.
 fn widen(x: int): long { return (x as long) * 1000000; }
 fn narrow(x: long): int { return (x as int) + 1; }
 fn maskByte(x: long): int { return ((x >> 8) & 255) as int; }
 
-// C8 + C0: string literal argument / receiver, method call.
 fn litLen(): int { return "hello".len(); }
 fn findIn(s: string): int { return s.indexOf("lo"); }
 
-// C2 + C3 + C0: literal-free combo -- length + first byte as int.
 fn firstPlusLen(s: string): int { let n = s.len(); return (s[0] as int) + n; }
 
 @test
@@ -30,5 +21,5 @@ fn test_casts(): void {
 fn test_string_literals_and_combo(): void {
     assert.equalInt(litLen(), 5);
     assert.equalInt(findIn("hello"), 3);
-    assert.equalInt(firstPlusLen("Ab"), 67); // 'A'(65) + len 2
+    assert.equalInt(firstPlusLen("Ab"), 67);
 }

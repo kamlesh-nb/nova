@@ -1,15 +1,3 @@
-// Method-level monomorphization: a REAL, visible generic method whose BODY is
-// specialized per type argument. `Reg.decode<T>(src)` reifies `T` inside its own
-// body via `serde.bind<T>` (the compiler-generated `<T>__bind`) — the compiler emits
-// `Reg_decode__GetUser` / `Reg_decode__AddReq`, each with `T` substituted to the
-// concrete type, so the right binder runs. `serde.typeName<T>()` yields the concrete
-// name (the mediator registry key). These two reifies are what `app.get<T>` route
-// methods are built from.
-//
-// This is the honest test the earlier `box<T>` spike was NOT: `box<T>` returned `1`
-// regardless of `T` and so passed even under total type-erasure. Here the return
-// VALUE depends on `T`'s fields, so a green means `T` genuinely became concrete
-// inside the method body.
 import assert;
 import serde.source;
 
@@ -18,7 +6,6 @@ import serde.source;
 
 struct Reg {
     init() {}
-    // A generic method with its OWN type-param, reifying a value inside the body.
     fn decode<T>(self: Reg, src: ValueSource): T {
         return serde.bind<T>(src);
     }
@@ -45,12 +32,10 @@ fn test_generic_method_typename(): void {
     assert.equalStr(r.nameOf<AddReq>(), "AddReq");
 }
 
-// A CLOSURE created inside a generic method must reify the method's type-param too — the lifted
-// lambda inherits the method subst (closure monomorphization). Captures a value AND reifies T.
 struct Builder {
     init() {}
     fn build<T>(self: Builder, base: int, src: ValueSource): int {
-        let f = (s) => serde.bind<T>(s).id + base;   // captures `base`, reifies T inside the lambda
+        let f = (s) => serde.bind<T>(s).id + base;
         return f(src);
     }
 }
@@ -58,6 +43,5 @@ struct Builder {
 @test
 fn test_closure_in_generic_method_reifies_t(): void {
     let b = Builder();
-    // GetUser.id (7) + base (100) == 107 — proves T became concrete inside the lifted lambda.
     assert.equalInt(b.build<GetUser>(100, source.fromJson("{\"id\": 7}")), 107);
 }

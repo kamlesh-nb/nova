@@ -1,4 +1,3 @@
-// Gap 8 stdlib depth: Map convenience ops (getOrDefault/merge/entries/clear).
 import assert;
 import map;
 
@@ -8,13 +7,13 @@ fn test_map_ops(): void {
     m.set(1, 10); m.set(2, 20);
 
     assert.equalInt(m.getOrDefault(1, -1), 10);
-    assert.equalInt(m.getOrDefault(9, -1), -1);   // absent -> default
+    assert.equalInt(m.getOrDefault(9, -1), -1);
 
     let other = Map<int, int>(8, (k: int) => k);
     other.set(2, 99); other.set(3, 30);
     m.merge(other);
-    assert.equalInt(m.getOrDefault(2, 0), 99);    // overwritten
-    assert.equalInt(m.getOrDefault(3, 0), 30);    // added
+    assert.equalInt(m.getOrDefault(2, 0), 99);
+    assert.equalInt(m.getOrDefault(3, 0), 30);
     assert.equalInt(m.size(), 3);
 
     let es = m.entries();
@@ -23,6 +22,6 @@ fn test_map_ops(): void {
     m.clear();
     assert.equalInt(m.size(), 0);
     assert.equalInt(m.getOrDefault(1, -7), -7);
-    m.set(5, 50);                                  // reuse after clear
+    m.set(5, 50);
     assert.equalInt(m.getOrDefault(5, 0), 50);
 }

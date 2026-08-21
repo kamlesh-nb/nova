@@ -2,10 +2,10 @@ import drv;
 import string;
 fn main(): void {
     console.log("start");
-    let cur = drv.find();          // type inferred from find(): Cursor -- which Cursor?
+    let cur = drv.find();
     let n = 0;
     while (n < 10) {
-        let s = cur.next();        // must dispatch drv.Cursor.next -> string, NOT seam.Cursor.next -> int
+        let s = cur.next();
         console.log(`got: ${s}`);
         if (string.eql(s, "END")) { break; }
         n = n + 1;

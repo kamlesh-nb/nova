@@ -33,13 +33,11 @@ pub fn parse(raw: string): Url {
     let host = hostport;
     let port = if (secure) 443 else 80;
     if (hostport.length > 0 && hostport[0] == 91) {
-        // IPv6 literal in brackets: "[::1]" or "[::1]:8080". The address itself contains colons, so the
-        // port (if any) is the ':' AFTER the closing ']'. host is returned WITHOUT the brackets.
         let close = string.indexOf(hostport, "]");
         if (close != -1) {
             host = string.slice(hostport, 1, close);
             let rest = string.slice(hostport, close + 1, hostport.length);
-            if (rest.length > 0 && rest[0] == 58) {   // ":port"
+            if (rest.length > 0 && rest[0] == 58) {
                 port = string.parseI64(string.slice(rest, 1, rest.length)) as int;
             }
         }
@@ -92,20 +90,16 @@ fn test_url_parse(): void {
 
 @test
 fn test_url_parse_ipv6(): void {
-    // bracketed IPv6 with explicit port
     let a = parse("http://[::1]:8080/health");
     assert.equalStr(a.host, "::1");
     assert.equalInt(a.port, 8080);
     assert.equalStr(a.path, "/health");
-    // bracketed IPv6, default port (https)
     let b = parse("https://[2001:db8::1]/");
     assert.equalStr(b.host, "2001:db8::1");
     assert.equalInt(b.port, 443);
-    // full-length IPv6 with port and path
     let c = parse("http://[fe80::1ff:fe23:4567:890a]:9000/api");
     assert.equalStr(c.host, "fe80::1ff:fe23:4567:890a");
     assert.equalInt(c.port, 9000);
-    // regular host:port still works (regression)
     let d = parse("http://localhost:5432/db");
     assert.equalStr(d.host, "localhost");
     assert.equalInt(d.port, 5432);

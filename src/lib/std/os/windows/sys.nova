@@ -1,42 +1,13 @@
-// os/sys (Windows override): the os/sys surface implemented over Win32, selected by the target-
-// conditional file rule when platform.os == "windows". Because the whole MODULE is replaced,
-// io/file, io/dir, std/env and the reactor keep importing `os.sys` unchanged and get the Windows
-// behaviour automatically — the same arrangement os/socket_windows has with os/socket.
-//
-// What differs from the POSIX file, and why this override exists at all:
-//   * dirent      — MSVC's UCRT has no <dirent.h>; opendir/readdir/closedir are undefined symbols.
-//                   Rebuilt here over FindFirstFileW/FindNextFileW, laying the entry out so
-//                   io/dir's `d_name at offset 21` read is satisfied.
-//   * open flags  — O_CREAT/O_TRUNC on Windows are NOT the macOS/BSD values in os/sys, and text
-//                   mode would corrupt binary data. Files go through CreateFileW instead, whose
-//                   creation disposition is explicit and which is always binary.
-//   * struct stat — MSVC puts st_mode at a different offset. stat() here fills a buffer matching
-//                   the layout os/sys documents (st_mode u16 at 4), so pathStatMode is unchanged.
-//   * setenv      — absent from the UCRT (see os/winfs on why _putenv_s and not the Win32 setter).
-//   * sockets     — ws2_32 exports socket/bind/listen/... under the same names with compatible
-//                   signatures, so those still bind directly; only socketpair has no Windows
-//                   equivalent and is emulated over a loopback pair.
-//
-// A file HANDLE is truncated to `int` at this boundary to keep os/sys's int-fd model (Win32 handle
-// values are 32-bit significant), matching what os/socket_windows already does for SOCKET.
-// INVALID_HANDLE_VALUE is -1, so io/file's `fd < 0` failure test keeps working.
 
 import bytes;
 import os.windows.fs;
 import os.windows.winsock;
 
-// errno and the non-blocking shim stay C primitives for the same reasons as on POSIX (errno is a
-// per-thread macro; nova_set_nonblock maps to ioctlsocket(FIONBIO) on Windows — see core.cpp).
 pub extern("c") fn nova_ffi_errno(): int;
 pub extern("c") fn nova_ffi_set_errno(v: int): void;
-pub extern("c") fn nova_sleep_ms(ms: long): void;   // coarse blocking sleep (Sleep on Windows)
+pub extern("c") fn nova_sleep_ms(ms: long): void;
 pub extern("c") fn nova_set_nonblock(fd: int): int;
 
-// Sockets: ws2_32 exports these under the POSIX names with compatible signatures, so they bind
-// directly. The two ENTRY points are wrappers instead, because Winsock — unlike a POSIX socket
-// layer — must be initialised before its first use: without WSAStartup, socket() returns
-// INVALID_SOCKET and every call after it fails. POSIX has no such step, so callers do not make it,
-// and os/sys must therefore make it for them.
 pub fn socket(domain: int, type_: int, protocol: int): int {
     winsock.startup();
     return winsock.socket(domain, type_, protocol) as int;
@@ -57,21 +28,16 @@ pub extern("c") fn freeaddrinfo(res: ptr): void;
 
 pub extern("c") fn getenv(name: ptr): ptr;
 
-// Memory/scan primitives — the UCRT provides these and they are SIMD-optimized there too.
 pub extern("c") fn memchr(s: ptr, c: int, n: long): ptr;
 pub extern("c") fn memcmp(a: ptr, b: ptr, n: long): int;
 pub extern("c") fn memcpy(dst: ptr, src: ptr, n: long): ptr;
 pub extern("c") fn memmove(dst: ptr, src: ptr, n: long): ptr;
 
-// mmap prot/flag bits. Retained for source compatibility; mapAnon below goes to VirtualAlloc and
-// ignores them (Windows has no prot/flags argument of this shape).
 pub const PROT_READ: int = 1;
 pub const PROT_WRITE: int = 2;
 pub const MAP_PRIVATE: int = 2;
 pub fn MAP_ANON(): int { return 0; }
 
-// open(2) flag bits. These stay the values os/sys declares so io/file's mode-string mapping is
-// shared source; openFlagsToWin32 below translates them to a CreateFileW disposition.
 pub const O_RDONLY: int = 0;
 pub const O_WRONLY: int = 1;
 pub const O_RDWR: int = 2;
@@ -88,10 +54,7 @@ pub const S_IFDIR: int = 16384;
 pub const S_IFREG: int = 32768;
 pub const S_IFLNK: int = 40960;
 
-// Layout this module WRITES in stat() and READS in pathStatMode — kept identical to the POSIX file
-// so io/file and io/dir need no Windows branch.
 fn STAT_MODE_OFF(): int { return 4; }
-// Public because io/dir walks the entry itself and must not hardcode a per-OS offset.
 pub fn DIRENT_NAME_OFF(): int { return 21; }
 
 pub const AF_INET: int = 2;
@@ -102,16 +65,10 @@ pub fn O_NONBLOCK(): int { return 0; }
 pub const F_GETFL: int = 3;
 pub const F_SETFL: int = 4;
 pub const AF_UNIX: int = 1;
-// 127.0.0.1 already in network byte order, i.e. the bytes 127,0,0,1 read as a little-endian i32.
-pub const INADDR_LOOPBACK_BE: long = 16777343;   // 0x0100007F
+pub const INADDR_LOOPBACK_BE: long = 16777343;
 pub fn SO_ERROR(): int { return 4103; }
-// Windows has no SO_REUSEPORT; SO_REUSEADDR (4) is the closest shared-port behaviour.
 pub fn SO_REUSEPORT(): int { return 4; }
 
-// --- errno ------------------------------------------------------------------------------------
-// os/sys promises POSIX errno semantics: after a failing call, errno() names the reason. Win32 sets
-// GetLastError (and Winsock WSAGetLastError) instead and leaves the CRT's errno untouched, so every
-// failure path below routes through these helpers to keep the module's contract honest.
 const ENOENT: int = 2;
 const EIO: int = 5;
 const EBADF: int = 9;
@@ -119,7 +76,6 @@ const EACCES: int = 13;
 const EEXIST: int = 17;
 const ENOTEMPTY: int = 41;
 
-// Win32 status codes worth distinguishing (everything else collapses to EIO).
 const ERROR_FILE_NOT_FOUND: int = 2;
 const ERROR_PATH_NOT_FOUND: int = 3;
 const ERROR_ACCESS_DENIED: int = 5;
@@ -128,13 +84,11 @@ const ERROR_FILE_EXISTS: int = 80;
 const ERROR_DIR_NOT_EMPTY: int = 145;
 const ERROR_ALREADY_EXISTS: int = 183;
 
-// Set errno to `e` and report the POSIX failure value.
 fn failWith(e: int): int {
     nova_ffi_set_errno(e);
     return -1;
 }
 
-// Translate the pending Win32 error into errno and report failure.
 fn fail(): int {
     let w = fs.GetLastError();
     if (w == ERROR_FILE_NOT_FOUND || w == ERROR_PATH_NOT_FOUND) { return failWith(ENOENT); }
@@ -145,7 +99,6 @@ fn fail(): int {
     return failWith(EIO);
 }
 
-// A fresh NUL-terminated C string copy of a Nova string. Caller frees. Identical to the POSIX file.
 pub fn cstr(s: string): ptr {
     let n = s.length;
     let b = bytes.alloc(n + 1);
@@ -155,13 +108,8 @@ pub fn cstr(s: string): ptr {
     return b;
 }
 
-// --- files -----------------------------------------------------------------------------------
-// Map POSIX open flags to a CreateFileW (access, disposition) pair. Windows separates "what may I
-// do" from "does it already exist", so the O_CREAT()/O_TRUNC() combination selects the disposition.
 fn accessFor(flags: int): int {
     if ((flags & O_APPEND()) != 0) {
-        // FILE_APPEND_DATA without FILE_WRITE_DATA makes every write land at EOF atomically, which
-        // is what O_APPEND() guarantees; seeking-then-writing would not be equivalent.
         let a = fs.FILE_APPEND_DATA;
         return if ((flags & O_RDWR) != 0) (a | fs.GENERIC_READ) else a;
     }
@@ -179,8 +127,6 @@ fn dispositionFor(flags: int): int {
     return fs.OPEN_EXISTING;
 }
 
-// open(2). `mode` (the POSIX permission bits) has no Win32 equivalent and is ignored, as it is on
-// every Windows CRT. Returns the handle truncated to int, or -1.
 pub fn nova_open(path: ptr, flags: int, mode: int): int {
     let w = fs.widen(path);
     if (w == (0 as ptr)) { return -1; }
@@ -192,14 +138,6 @@ pub fn nova_open(path: ptr, flags: int, mode: int): int {
     return h as int;
 }
 
-// read(2)/write(2). Both return the byte count, 0 at EOF, or -1.
-//
-// Windows keeps files and sockets in separate namespaces: ReadFile/WriteFile drive a FILE handle,
-// recv/send a SOCKET, and a socket created by socket() is OVERLAPPED, so ReadFile with a null
-// LPOVERLAPPED fails on it. POSIX read()/write() work on both and os/sys promises POSIX semantics,
-// so the file path is tried first (the common case — io/file) and falls back to the socket call.
-// A genuine file failure falls through to recv/send, which answers WSAENOTSOCK, so the result is
-// -1 either way; no prior handle-type query is needed.
 pub fn read(fd: int, buf: ptr, count: long): long {
     let got = bytes.alloc(4);
     bytes.write_i32(got, 0, 0);
@@ -222,9 +160,6 @@ pub fn write(fd: int, buf: ptr, count: long): long {
     return if (r >= 0) (r as long) else (-1 as long);
 }
 
-// close(2). closesocket is tried FIRST, not second: CloseHandle on a socket succeeds (a SOCKET is a
-// kernel handle) while skipping Winsock's own teardown, so ordering it first would silently leak
-// Winsock state on every socket close. On a file handle closesocket is a no-op reporting WSAENOTSOCK.
 pub fn close(fd: int): int {
     if (fd < 0) { return failWith(EBADF); }
     if (winsock.closesocket(fd as long) == 0) { return 0; }
@@ -232,7 +167,6 @@ pub fn close(fd: int): int {
     return fail();
 }
 
-// lseek(2) over SetFilePointerEx. SEEK_SET/CUR/END share FILE_BEGIN/CURRENT/END's numbering.
 pub fn lseek(fd: int, offset: long, whence: int): long {
     let out = bytes.alloc(8);
     bytes.write_ptr(out, 0, 0);
@@ -246,9 +180,6 @@ pub fn fsync(fd: int): int {
     return if (fs.FlushFileBuffers(fd as long) != 0) 0 else fail();
 }
 
-// --- paths -----------------------------------------------------------------------------------
-// Run a Win32 BOOL-returning call that takes one wide path; returns 0 on success, -1 on failure,
-// matching the POSIX convention its callers expect.
 fn attrsOf(path: ptr): int {
     let w = fs.widen(path);
     if (w == (0 as ptr)) { return fs.INVALID_FILE_ATTRIBUTES; }
@@ -281,7 +212,6 @@ pub fn unlink(path: ptr): int {
     return if (r != 0) 0 else fail();
 }
 
-// rename(2) replaces an existing destination; plain MoveFileW would fail, so REPLACE_EXISTING.
 pub fn rename(from: ptr, to: ptr): int {
     let a = fs.widen(from);
     if (a == (0 as ptr)) { return -1; }
@@ -293,13 +223,10 @@ pub fn rename(from: ptr, to: ptr): int {
     return if (r != 0) 0 else fail();
 }
 
-// access(2): only F_OK (existence) is meaningful here — Windows ACLs do not map onto R_OK/W_OK/X_OK.
 pub fn access(path: ptr, amode: int): int {
     return if (attrsOf(path) != fs.INVALID_FILE_ATTRIBUTES) 0 else failWith(ENOENT);
 }
 
-// stat(2): fills `buf` with the fields os/sys documents — st_mode as a u16 at offset 4. Callers
-// allocate 160 bytes (see pathStatMode), comfortably more than the two fields written here.
 pub fn stat(path: ptr, buf: ptr): int {
     let a = attrsOf(path);
     if (a == fs.INVALID_FILE_ATTRIBUTES) { return failWith(ENOENT); }
@@ -310,7 +237,6 @@ pub fn stat(path: ptr, buf: ptr): int {
     return 0;
 }
 
-// lstat(2): like stat but reports a reparse point as a symlink rather than following it.
 pub fn lstat(path: ptr, buf: ptr): int {
     let a = attrsOf(path);
     if (a == fs.INVALID_FILE_ATTRIBUTES) { return failWith(ENOENT); }
@@ -321,8 +247,6 @@ pub fn lstat(path: ptr, buf: ptr): int {
     return 0;
 }
 
-// getcwd(3): writes the UTF-8 cwd into `buf` and returns it, or 0 on failure. GetCurrentDirectoryW
-// counts WCHARs, so ask for size/2 of them and convert down.
 pub fn getcwd(buf: ptr, size: long): ptr {
     let cap = (size as int) / 2;
     let w = bytes.alloc(cap * 2);
@@ -341,14 +265,6 @@ pub fn chdir(path: ptr): int {
     return if (r != 0) 0 else fail();
 }
 
-// --- directory enumeration -------------------------------------------------------------------
-// The DIR record this module hands back from opendir. io/dir treats it as an opaque pointer and
-// only ever reads the dirent that readdir returns, so the layout is private to this file:
-//   [0]   find HANDLE (long)
-//   [8]   pending flag i32 — FindFirstFileW already produced an entry readdir has not yet returned
-//   [16]  WIN32_FIND_DATAW (592 bytes)
-//   [608] dirent: d_name is a NUL-terminated UTF-8 name at DIRENT_NAME_OFF(), which is what io/dir
-//         reads (its offset-21 constant is the macOS struct dirent layout; we simply match it).
 const DIR_FIND_OFF: int = 0;
 const DIR_PENDING_OFF: int = 8;
 const DIR_DATA_OFF: int = 16;
@@ -357,8 +273,6 @@ const DIR_NAME_CAP: int = 1024;
 const DIR_RECORD_SIZE: int = 608 + 21 + 1024;
 
 pub fn opendir(path: ptr): ptr {
-    // FindFirstFileW enumerates a pattern, not a directory: append "\*". POSIX opendir is given the
-    // directory itself, and both "dir" and "dir/" must work, so normalize the separator first.
     let n = 0;
     while (bytes.read_byte(path, n) != 0) { n = n + 1; }
     let pat = bytes.alloc(n + 3);
@@ -367,9 +281,9 @@ pub fn opendir(path: ptr): ptr {
     let p = n;
     if (p > 0) {
         let last = bytes.read_byte(pat, p - 1);
-        if (last != 47 && last != 92) { bytes.write_byte(pat, p, 92); p = p + 1; }   // '/' '\'
+        if (last != 47 && last != 92) { bytes.write_byte(pat, p, 92); p = p + 1; }
     }
-    bytes.write_byte(pat, p, 42);      // '*'
+    bytes.write_byte(pat, p, 42);
     bytes.write_byte(pat, p + 1, 0);
 
     let w = fs.widen(pat);
@@ -391,7 +305,6 @@ pub fn readdir(dir: ptr): ptr {
     if (h == fs.INVALID_HANDLE) { return 0 as ptr; }
 
     if (bytes.read_i32(dir, DIR_PENDING_OFF) == 0) {
-        // Exhausted when FindNextFileW fails (ERROR_NO_MORE_FILES).
         if (fs.FindNextFileW(h, (dir as long) + (DIR_DATA_OFF as long)) == 0) { return 0 as ptr; }
     }
     bytes.write_i32(dir, DIR_PENDING_OFF, 0);
@@ -411,8 +324,6 @@ pub fn closedir(dir: ptr): int {
     return 0;
 }
 
-// --- environment -----------------------------------------------------------------------------
-// POSIX setenv: overwrite == 0 leaves an existing variable alone and still reports success.
 pub fn setenv(name: ptr, value: ptr, overwrite: int): int {
     if (overwrite == 0) {
         let cur = getenv(name);
@@ -421,17 +332,10 @@ pub fn setenv(name: ptr, value: ptr, overwrite: int): int {
     return if (fs._putenv_s(name, value) == 0) 0 else -1;
 }
 
-// --- sockets ---------------------------------------------------------------------------------
-// socketpair(2) has no Windows equivalent (there is no AF_UNIX socketpair), so it is emulated with
-// a connected 127.0.0.1 pair: bind an ephemeral listener, connect to it, accept. The reactor uses
-// this only for its cross-thread wake channel, where loopback is equivalent.
 pub fn socketpair(domain: int, type_: int, protocol: int, sv: ptr): int {
     winsock.startup();
     let listener = socket(AF_INET, type_, 0);
     if (listener < 0) { return -1; }
-    // Bind the listener to 127.0.0.1, NOT INADDR_ANY: getsockname would then hand back 0.0.0.0 and
-    // Windows rejects connect() to 0.0.0.0 with WSAEADDRNOTAVAIL (Linux quietly treats it as
-    // localhost). Only the port is ephemeral.
     let sa = makeSockaddrIn(0, INADDR_LOOPBACK_BE);
     let len = bytes.alloc(4);
     bytes.write_i32(len, 0, 16);
@@ -455,14 +359,10 @@ pub fn socketpair(domain: int, type_: int, protocol: int, sv: ptr): int {
     return 0;
 }
 
-// A SOCKET is closed with closesocket, never CloseHandle/close — see os/winsock.
 fn close_socket(fd: int): int { return winsock.closesocket(fd as long); }
 
-// fcntl is not part of the Windows API surface. It is declared so the module surface matches the
-// POSIX file; non-blocking mode goes through setNonBlocking (ioctlsocket) instead.
 pub fn fcntl(fd: int, cmd: int, arg: int): int { return -1; }
 
-// --- shared surface (identical to the POSIX file) ---------------------------------------------
 pub fn pathExists(path: string): bool {
     let cp = cstr(path);
     let r = access(cp, F_OK);
@@ -529,15 +429,12 @@ pub fn setReusePort(fd: int): int {
     return r;
 }
 
-// Anonymous zero-filled RW pages, straight from the kernel. VirtualAlloc(MEM_COMMIT|MEM_RESERVE)
-// is the Windows equivalent of an anonymous private mmap; it returns null (not MAP_FAILED) on error.
 pub fn mmap(addr: ptr, length: long, prot: int, flags: int, fd: int, offset: long): ptr {
     if (length <= (0 as long)) { return -1 as ptr; }
     let p = fs.VirtualAlloc(0 as ptr, length, fs.MEM_COMMIT | fs.MEM_RESERVE, fs.PAGE_READWRITE);
     return if (p == (0 as ptr)) (-1 as ptr) else p;
 }
 
-// MEM_RELEASE requires the original base pointer and a size of 0.
 pub fn munmap(addr: ptr, length: long): int {
     return if (fs.VirtualFree(addr, 0 as long, fs.MEM_RELEASE) != 0) 0 else -1;
 }

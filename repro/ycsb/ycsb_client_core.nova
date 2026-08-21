@@ -1,18 +1,3 @@
-// ycsb_client_core.nova — ONE client's workload against a db.Connection, for the
-// multi-process concurrency-scaling benchmark (D5b). Each client is a separate OS
-// process with its own connection; the harness launches C of them at once and
-// aggregates. This is how pgbench/sysbench/memtier measure SERVER concurrency —
-// real OS-level parallelism, no in-process async needed.
-//
-// Config comes from the environment so the harness can parameterize each process:
-//   YCSB_MODE       "load" (create + insert `records` rows, then exit) | "run" (default)
-//   YCSB_RECORDS    keyspace size                                       (default 10000)
-//   YCSB_DURATION_MS fixed run window in ms                             (default 5000)
-//   YCSB_READPCT    percent of ops that are reads (rest are UPDATEs)    (default 100)
-//   YCSB_SEED       per-client RNG seed (so clients hit different keys) (default 1)
-//
-// A "run" client prints exactly one line: `RESULT ops=<n> ms=<m>` — the harness sums
-// `ops` across the C processes and divides by the wall window for aggregate ops/sec.
 
 import list;
 import string;
@@ -41,7 +26,6 @@ fn genValue(size: int): string {
     return s;
 }
 
-// Zero-padded key so lexical order == numeric order (range scans work).
 fn keyName(k: int): string {
     let s = `${k}`;
     while (s.length < 8) { s = "0" + s; }
@@ -60,7 +44,6 @@ fn envLong(name: string, def: long): long {
     return string.parseI64(s);
 }
 
-// Load phase: fresh table + `records` rows. Run ONCE by the harness before the sweep.
 fn load(conn: db.Connection, createTableSql: string, records: int): void {
     let value = genValue(64);
     conn.exec("DROP TABLE IF EXISTS ycsb_af", List<DbValue>());
@@ -73,7 +56,6 @@ fn load(conn: db.Connection, createTableSql: string, records: int): void {
     console.log(`LOADED ${records} rows`);
 }
 
-// Run phase: fixed-duration mixed workload; print the op count this client completed.
 fn run(conn: db.Connection, records: int, durationMs: int, readPct: int, seed: long): void {
     let value = genValue(64);
     let rng = Rng(seed);
@@ -94,7 +76,6 @@ fn run(conn: db.Connection, records: int, durationMs: int, readPct: int, seed: l
     console.log(`RESULT ops=${ops} ms=${ms}`);
 }
 
-/// Entry point shared by every per-driver client: dispatch on YCSB_MODE.
 pub fn dispatch(conn: db.Connection, createTableSql: string): void {
     let mode = env.get("YCSB_MODE");
     let records = envInt("YCSB_RECORDS", 10000);

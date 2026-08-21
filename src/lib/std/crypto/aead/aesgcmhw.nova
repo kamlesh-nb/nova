@@ -1,32 +1,13 @@
-// Hardware-accelerated AES-GCM (AES-128 / AES-256), pure Nova, no FFI. The block cipher uses the CPU AES
-// instruction (simd.aesenc, FR-simd-L3) and GHASH uses the carryless-multiply instruction (simd.clmul ->
-// pmull/pclmulqdq). This is the fast path for TLS AES_128_GCM_SHA256 / AES_256_GCM_SHA384 record protection
-// on hosts with AES + CLMUL (all native x86_64 / arm64). seal/open are byte-for-byte identical to the
-// constant-time software crypto.aead.aesgcm (differential-tested, case 378); ~29x faster (measured ~59 MB/s
-// vs ~2 MB/s bitsliced for AES-256-GCM). The bulk cipher and GHASH are constant-time (hardware instructions,
-// no tables); the only table is the S-box used ONLY by the one-time key schedule (a known, minor tradeoff).
-// Further headroom to OpenSSL-class throughput = register-resident round keys + multi-block CTR interleave +
-// GHASH key-power aggregation (loop tuning, not a capability gap).
 
 import bytes;
 import mem.endian;
 import mem.memory;
 
-// Integrated-assembly fast path (see src/runtime/nova_crypto_arm64.S). nova_has_asm_crypto() is 1 only on an
-// aarch64 host where the hand-written AES routines are linked in; there the AES-CTR keystream runs in the asm
-// (register-resident round keys + 4-way), otherwise the pure-Nova SIMD gctrHw below runs. A plain extern
-// call (bl), no FFI marshalling — the Go/BoringSSL model.
 extern("c") fn nova_has_asm_crypto(): int;
 extern("c") fn nova_aes_ctr(rk: ptr, nr: int, ctr: ptr, dataIn: ptr, len: int, out: ptr): void;
 extern("c") fn nova_ghash(hStd: ptr, data: ptr, len: int, y: ptr): void;
-// Fused stitched seal: encrypt + GHASH the full 64-byte groups of the plaintext in one loop (AES and PMULL
-// units overlap). hpows = 64B table {H, H^2, H^3, H^4} std order; len is a multiple of 64; y in/out.
 extern("c") fn nova_gcm_seal(rk: ptr, nr: int, hpows: ptr, ctr: ptr, dataIn: ptr, len: int, out: ptr, y: ptr): void;
 
-// AES S-box, used ONLY by the key schedule (one-time per key). The BULK cipher below is fully constant-time
-// (the AES instruction, no tables). A table-based key schedule has a theoretical cache-timing side channel
-// on the key; that is a known, accepted tradeoff (constant-time key expansion via the AES instruction is a
-// possible future refinement). Decoded from hex on first use into a static 256-byte buffer.
 const SBOX_HEX: string = "637c777bf26b6fc53001672bfed7ab76ca82c97dfa5947f0add4a2af9ca472c0b7fd9326363ff7cc34a5e5f171d8311504c723c31896059a071280e2eb27b27509832c1a1b6e5aa0523bd6b329e32f8453d100ed20fcb15b6acbbe394a4c58cfd0efaafb434d338545f9027f503c9fa851a3408f929d38f5bcb6da2110fff3d2cd0c13ec5f974417c4a77e3d645d197360814fdc222a908846eeb814de5e0bdbe0323a0a4906245cc2d3ac629195e479e7c8376d8dd54ea96c56f4ea657aae08ba78252e1ca6b4c6e8dd741f4bbd8b8a703eb5664803f60e613557b986c11d9ee1f8981169d98e949b1e87e9ce5528df8ca1890dbfe6426841992d0fb054bb16";
 
 fn sbHexNib(c: int): int { if (c >= 48 && c <= 57) { return c - 48; } if (c >= 97 && c <= 102) { return c - 87; } return 0; }
@@ -37,12 +18,10 @@ fn buildSbox(sbox: ptr): void {
 
 fn xtime(a: int): int { let r = (a << 1) & 0xff; if ((a & 0x80) != 0) { r = r ^ 0x1b; } return r; }
 
-// Expand key (16 or 32 bytes) into rk (packed 16-byte round keys). Returns Nr (10 for AES-128, 14 for
-// AES-256). rk must hold (Nr+1)*16 bytes (176 or 240).
 pub fn expandKey(key: ptr, keyLen: int, rk: ptr): int {
-    let nk = keyLen / 4;               // 4 (AES-128) or 8 (AES-256)
-    let nr = nk + 6;                   // 10 or 14
-    let total = 4 * (nr + 1);          // number of 32-bit words
+    let nk = keyLen / 4;
+    let nr = nk + 6;
+    let total = 4 * (nr + 1);
     let sbox = bytes.alloc(256);
     buildSbox(sbox);
     let tmp = bytes.alloc(4);
@@ -55,7 +34,6 @@ pub fn expandKey(key: ptr, keyLen: int, rk: ptr): int {
         bytes.write_byte(tmp, 2, bytes.read_byte(rk, (w-1)*4+2));
         bytes.write_byte(tmp, 3, bytes.read_byte(rk, (w-1)*4+3));
         if (w % nk == 0) {
-            // temp = SubWord(RotWord(temp)) XOR Rcon
             let t0 = bytes.read_byte(tmp, 0);
             bytes.write_byte(tmp, 0, bytes.read_byte(sbox, bytes.read_byte(tmp, 1)) ^ rcon);
             bytes.write_byte(tmp, 1, bytes.read_byte(sbox, bytes.read_byte(tmp, 2)));
@@ -63,7 +41,6 @@ pub fn expandKey(key: ptr, keyLen: int, rk: ptr): int {
             bytes.write_byte(tmp, 3, bytes.read_byte(sbox, t0));
             rcon = xtime(rcon);
         } else if (nk > 6 && w % nk == 4) {
-            // AES-256 only: SubWord (no RotWord)
             bytes.write_byte(tmp, 0, bytes.read_byte(sbox, bytes.read_byte(tmp, 0)));
             bytes.write_byte(tmp, 1, bytes.read_byte(sbox, bytes.read_byte(tmp, 1)));
             bytes.write_byte(tmp, 2, bytes.read_byte(sbox, bytes.read_byte(tmp, 2)));
@@ -79,7 +56,6 @@ pub fn expandKey(key: ptr, keyLen: int, rk: ptr): int {
     return nr;
 }
 
-// Encrypt one 16-byte block at inb into out using packed round keys rk with nr rounds (hardware AES).
 pub fn encBlock(rk: ptr, nr: int, inb: ptr, out: ptr): void {
     let s = simd.xorU8x16(simd.loadU8x16(inb, 0), simd.loadU8x16(rk, 0));
     let r = 1;
@@ -96,10 +72,6 @@ fn putLen64(buf: ptr, off: int, bits: long): void {
     let i = 0; while (i < 8) { bytes.write_byte(buf, off + i, ((bits >> ((7 - i) * 8)) & 0xff) as int); i = i + 1; }
 }
 
-// AES-CTR keystream XOR over len bytes, hardware block cipher. Counter starts at icb. Processes EIGHT
-// counter blocks per iteration (interleaved) so the AES-instruction latency is hidden by independent work,
-// and each round key is loaded once per group and reused across the 8 lanes; the keystream is XORed into
-// the plaintext with SIMD (u8x16). The tail (< 8 blocks) falls back to the single-block encBlock.
 fn gctrHw(rk: ptr, nr: int, icb: ptr, dataIn: ptr, len: int, out: ptr): void {
     if (nova_has_asm_crypto() == 1) { nova_aes_ctr(rk, nr, icb, dataIn, len, out); return; }
     let ctr = bytes.alloc(16);
@@ -136,7 +108,6 @@ fn gctrHw(rk: ptr, nr: int, icb: ptr, dataIn: ptr, len: int, out: ptr): void {
         s2 = simd.aesenclastU8x16(s2, kl); s3 = simd.aesenclastU8x16(s3, kl);
         s4 = simd.aesenclastU8x16(s4, kl); s5 = simd.aesenclastU8x16(s5, kl);
         s6 = simd.aesenclastU8x16(s6, kl); s7 = simd.aesenclastU8x16(s7, kl);
-        // XOR keystream over plaintext with SIMD, straight to out.
         simd.storeU8x16(out, done + 0, simd.xorU8x16(s0, simd.loadU8x16(dataIn, done + 0)));
         simd.storeU8x16(out, done + 16, simd.xorU8x16(s1, simd.loadU8x16(dataIn, done + 16)));
         simd.storeU8x16(out, done + 32, simd.xorU8x16(s2, simd.loadU8x16(dataIn, done + 32)));
@@ -160,12 +131,6 @@ fn gctrHw(rk: ptr, nr: int, icb: ptr, dataIn: ptr, len: int, out: ptr): void {
 }
 
 
-// ---- Hardware GHASH via the carryless-multiply instruction (simd.clmul -> pmull/pclmulqdq) ----
-// GHASH is GF(2^128) with the bit-reflected GCM convention (block[0] bit7 = x^0). We convert a block to
-// "standard" order (bit i = coeff of x^i) by reversing the bits of each byte (byte order preserved), do a
-// carryless 128x128 multiply (Karatsuba, 3 clmuls) and reduce mod x^128 + x^7 + x^2 + x + 1 (constant
-// 0x87), then convert back. Gated end-to-end by case 378 (a wrong GHASH yields a wrong tag), and verified
-// standalone against the software crypto.mac.ghash multiply during development.
 
 fn buildBrev(t: ptr): void {
     let i = 0;
@@ -176,40 +141,20 @@ fn buildBrev(t: ptr): void {
         i = i + 1;
     }
 }
-// Reflect a 16-byte GCM block e into standard bit order (or back — it is an involution).
 fn reflect(brev: ptr, e: ptr, out: ptr): void {
     let i = 0; while (i < 16) { bytes.write_byte(out, i, bytes.read_byte(brev, bytes.read_byte(e, i))); i = i + 1; }
 }
-// SIMD per-byte bit-reversal of the 16-byte block at (e + eoff) into (out + ooff). Same result as `reflect`
-// (out[i] = bitreverse(e[i])) but vectorised over all 16 bytes via the branchless swap-nibbles / swap-pairs
-// / swap-adjacent sequence using only lane-wise and/or/shl/shr (each verified to operate on all 16 lanes).
-// This replaces the 16-iteration scalar brev table walk on the GHASH hot path (per absorbed block). It does
-// NOT use an LLVM byte-shuffle/bitreverse intrinsic: those resolve to the wrong vector width (v8i8) via the
-// C-API overload path in this toolchain, silently zeroing the upper 8 lanes.
-// Register-resident form of the same reflection: takes the block as a u8x16 VALUE and returns the reflected
-// block as a value, so it stays in a vector register (no store to a buffer + reload). Used by the GHASH hot
-// path, which then casts to u64x2 to feed clmul lanes. FR-simd-L1 (vector params/returns) makes this legal.
 fn reflectVec(v: u8x16): u8x16 {
     let mF0 = simd.splatU8x16(0xF0); let m0F = simd.splatU8x16(0x0F);
     let mCC = simd.splatU8x16(0xCC); let m33 = simd.splatU8x16(0x33);
     let mAA = simd.splatU8x16(0xAA); let m55 = simd.splatU8x16(0x55);
-    let r = simd.orU8x16(simd.shrU8x16(simd.andU8x16(v, mF0), 4), simd.shlU8x16(simd.andU8x16(v, m0F), 4)); // swap nibbles
-    r = simd.orU8x16(simd.shrU8x16(simd.andU8x16(r, mCC), 2), simd.shlU8x16(simd.andU8x16(r, m33), 2)); // swap bit-pairs
-    r = simd.orU8x16(simd.shrU8x16(simd.andU8x16(r, mAA), 1), simd.shlU8x16(simd.andU8x16(r, m55), 1)); // swap adjacent bits
+    let r = simd.orU8x16(simd.shrU8x16(simd.andU8x16(v, mF0), 4), simd.shlU8x16(simd.andU8x16(v, m0F), 4));
+    r = simd.orU8x16(simd.shrU8x16(simd.andU8x16(r, mCC), 2), simd.shlU8x16(simd.andU8x16(r, m33), 2));
+    r = simd.orU8x16(simd.shrU8x16(simd.andU8x16(r, mAA), 1), simd.shlU8x16(simd.andU8x16(r, m55), 1));
     return r;
 }
 
-// ---- GHASH 4-way key-power aggregation. The GHASH reduction (mod x^128+x^7+x^2+x+1) is GF(2)-linear, so
-// reduce(P_a ^ P_b) == reduce(P_a) ^ reduce(P_b). That lets a group of blocks be multiplied by the
-// precomputed key powers, the UN-reduced 256-bit carryless products XOR-summed, and the sum reduced ONCE:
-//   y' = (y ^ X0)*H^4 ^ X1*H^3 ^ X2*H^2 ^ X3*H^1   (Horner over X0..X3, expanded)
-// This replaces 4 reductions (3 clmuls each) with 1, so per-block clmul count drops from 6 to ~3.75.
 
-// Multiply the std-order 16-byte block at buf+off by the std-order key power hb, XOR the un-reduced 256-bit
-// carryless product (Karatsuba: lo, hi, middle) into the 32-byte accumulator acc. t is 16-byte scratch.
-// Multiply the std-order block held in the u8x16 VALUE a8 by the std-order key power hb, XOR the un-reduced
-// 256-bit product into the 32-byte accumulator acc. The block arrives in a register (from reflectVec) and is
-// viewed as u64x2 with a bitcast to feed clmul lanes — no reflect-to-buffer + reload.
 fn clmulAccV(a8: u8x16, hb: ptr, acc: ptr): void {
     let le = endian.Endian.little;
     let av = simd.castU64x2(a8);
@@ -228,8 +173,6 @@ fn clmulAccV(a8: u8x16, hb: ptr, acc: ptr): void {
     mem.store<ulong>(acc, 24, mem.load<ulong>(acc, 24, le) ^ p3, le);
 }
 
-// Single-block y = (a8) * b, reduced, into out. a8 is the std-order block in a register (reflected + folded);
-// b is a std-order 16-byte operand (H) in memory. The register-resident counterpart of gfmul for ghBlock.
 fn gfmulVec(a8: u8x16, b: ptr, out: ptr): void {
     let le = endian.Endian.little;
     let av = simd.castU64x2(a8);
@@ -252,8 +195,6 @@ fn gfmulVec(a8: u8x16, b: ptr, out: ptr): void {
     mem.store<ulong>(out, 0, r0, le); mem.store<ulong>(out, 8, r1, le);
 }
 
-// Reduce the accumulated 256-bit product in acc (32 bytes) mod P into the 16-byte out (std order). Same
-// fold as gfmul's reduction (constant 135 = 0x87), applied once to the summed products. t is 16-byte scratch.
 fn reduceAcc(acc: ptr, out: ptr, t: ptr): void {
     let le = endian.Endian.little;
     let p0 = mem.load<ulong>(acc, 0, le); let p1 = mem.load<ulong>(acc, 8, le);
@@ -268,7 +209,6 @@ fn reduceAcc(acc: ptr, out: ptr, t: ptr): void {
     mem.store<ulong>(out, 0, r0, le); mem.store<ulong>(out, 8, r1, le);
 }
 
-// (a * b) mod P over standard-order 16-byte operands, result to out (standard order). t is 16-byte scratch.
 fn gfmul(a: ptr, b: ptr, out: ptr, t: ptr): void {
     let le = endian.Endian.little;
     let a0 = mem.load<ulong>(a, 0, le); let a1 = mem.load<ulong>(a, 8, le);
@@ -290,13 +230,10 @@ fn gfmul(a: ptr, b: ptr, out: ptr, t: ptr): void {
     mem.store<ulong>(out, 0, r0, le); mem.store<ulong>(out, 8, r1, le);
 }
 
-// Absorb one 16-byte GCM block at data+off into the running std accumulator y (std order): y = (y ^ block)*H.
-// The block is reflected and folded with y entirely in registers, then multiplied register-resident.
 fn ghBlock(y: ptr, hStd: ptr, brev: ptr, data: ptr, off: int, t: ptr, scr: ptr): void {
     let rv = simd.xorU8x16(reflectVec(simd.loadU8x16(data, off)), simd.loadU8x16(y, 0));
     gfmulVec(rv, hStd, y);
 }
-// Absorb len bytes (16-byte blocks, zero-pad final).
 fn ghUpdate(y: ptr, hStd: ptr, brev: ptr, data: ptr, len: int, t: ptr, scr: ptr, pad: ptr): void {
     let i = 0;
     while (len - i >= 16) { ghBlock(y, hStd, brev, data, i, t, scr); i = i + 16; }
@@ -307,25 +244,21 @@ fn ghUpdate(y: ptr, hStd: ptr, brev: ptr, data: ptr, len: int, t: ptr, scr: ptr,
     }
 }
 
-// Absorb len bytes into y using 4-way key-power aggregation. h2/h3/h4 are H^2/H^3/H^4 (std order),
-// precomputed by the caller. acc is 32-byte scratch, gb is a 64-byte group buffer, t/pad are 16-byte
-// scratch. Full 4-block groups aggregate to one reduction; the <4-block and partial tail use ghBlock.
 fn ghUpdateAgg(y: ptr, hStd: ptr, h2: ptr, h3: ptr, h4: ptr, brev: ptr, data: ptr, len: int,
                acc: ptr, gb: ptr, t: ptr, pad: ptr): void {
     let le = endian.Endian.little;
     let i = 0;
     while (len - i >= 64) {
-        // Reflect the 4 blocks into REGISTERS (no group buffer), fold the running y into block 0 only.
         let r0 = simd.xorU8x16(reflectVec(simd.loadU8x16(data, i)), simd.loadU8x16(y, 0));
         let r1 = reflectVec(simd.loadU8x16(data, i + 16));
         let r2 = reflectVec(simd.loadU8x16(data, i + 32));
         let r3 = reflectVec(simd.loadU8x16(data, i + 48));
         mem.store<ulong>(acc, 0, 0 as ulong, le); mem.store<ulong>(acc, 8, 0 as ulong, le);
         mem.store<ulong>(acc, 16, 0 as ulong, le); mem.store<ulong>(acc, 24, 0 as ulong, le);
-        clmulAccV(r0, h4, acc);      // (y ^ X0) * H^4
-        clmulAccV(r1, h3, acc);      // X1 * H^3
-        clmulAccV(r2, h2, acc);      // X2 * H^2
-        clmulAccV(r3, hStd, acc);    // X3 * H^1
+        clmulAccV(r0, h4, acc);
+        clmulAccV(r1, h3, acc);
+        clmulAccV(r2, h2, acc);
+        clmulAccV(r3, hStd, acc);
         reduceAcc(acc, y, t);
         i = i + 64;
     }
@@ -354,8 +287,6 @@ fn computeJ0(hStd: ptr, brev: ptr, iv: ptr, ivLen: int, j0: ptr, t: ptr, scr: pt
 fn computeS(hStd: ptr, brev: ptr, aad: ptr, aadLen: int, ct: ptr, ctLen: int, s: ptr, t: ptr, scr: ptr, pad: ptr): void {
     let y = bytes.alloc(16); let k = 0; while (k < 16) { bytes.write_byte(y, k, 0); k = k + 1; }
     if (nova_has_asm_crypto() == 1) {
-        // Asm GHASH (register-resident accumulator + PMULL) over AAD, ciphertext, and the length block; y
-        // stays in standard order, reflected to s at the end (matches the Nova path exactly).
         nova_ghash(hStd, aad, aadLen, y);
         nova_ghash(hStd, ct, ctLen, y);
         let lens = bytes.alloc(16);
@@ -365,8 +296,6 @@ fn computeS(hStd: ptr, brev: ptr, aad: ptr, aadLen: int, ct: ptr, ctLen: int, s:
         bytes.free(y); bytes.free(lens);
         return;
     }
-    // Precompute the key powers H^2/H^3/H^4 once per record (3 gfmuls, negligible vs the block count) so the
-    // bulk absorb below aggregates 4 blocks per reduction.
     let h2 = bytes.alloc(16); gfmul(hStd, hStd, h2, t);
     let h3 = bytes.alloc(16); gfmul(h2, hStd, h3, t);
     let h4 = bytes.alloc(16); gfmul(h3, hStd, h4, t);
@@ -381,19 +310,13 @@ fn computeS(hStd: ptr, brev: ptr, aad: ptr, aadLen: int, ct: ptr, ctLen: int, s:
 }
 
 
-// ---- Cached context API: expand the key + GHASH setup ONCE, then seal/open many records. TLS holds a
-// GcmContext across a traffic key, so the setup (key schedule, H, brev table, H in std order) is done once.
 
-// Prepare cached state for `key` (keyLen 16 or 32) into caller buffers: rk (240), hStd (16), brev (256),
-// hpows (64 = H^1..H^4 std order, for the fused-seal GHASH aggregation — key-dependent, so computed ONCE
-// here rather than per record). Returns Nr (10 or 14).
 pub fn setup(key: ptr, keyLen: int, rk: ptr, hStd: ptr, brev: ptr, hpows: ptr): int {
     let nr = expandKey(key, keyLen, rk);
     let zero = bytes.alloc(16); let i = 0; while (i < 16) { bytes.write_byte(zero, i, 0); i = i + 1; }
     let h = bytes.alloc(16); encBlock(rk, nr, zero, h);
     buildBrev(brev);
     reflect(brev, h, hStd);
-    // H^1..H^4 into hpows (ping-pong cur; nothing leaks).
     let t = bytes.alloc(16); let cur = bytes.alloc(16); let nxt = bytes.alloc(16);
     let z = 0; while (z < 16) { let hv = bytes.read_byte(hStd, z); bytes.write_byte(hpows, z, hv); bytes.write_byte(cur, z, hv); z = z + 1; }
     let hk = 1;
@@ -406,7 +329,6 @@ pub fn setup(key: ptr, keyLen: int, rk: ptr, hStd: ptr, brev: ptr, hpows: ptr): 
     return nr;
 }
 
-// Seal one record with the cached state (no key re-expansion). hpows = cached 64B H^1..H^4 table (from setup).
 pub fn sealWith(rk: ptr, nr: int, hStd: ptr, brev: ptr, hpows: ptr, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
                 pt: ptr, ptLen: int, ctOut: ptr, tagOut: ptr): void {
     let t = bytes.alloc(16); let scr = bytes.alloc(16); let pad = bytes.alloc(16);
@@ -415,8 +337,6 @@ pub fn sealWith(rk: ptr, nr: int, hStd: ptr, brev: ptr, hpows: ptr, iv: ptr, ivL
     inc32(icb);
     let s = bytes.alloc(16);
     if (nova_has_asm_crypto() == 1) {
-        // Fused stitched path: GHASH the AAD, then encrypt+GHASH the plaintext's full 64-byte groups in one
-        // interleaved asm loop (using the cached H-power table), then the <64 tail + length block.
         let y = bytes.alloc(16); let z = 0; while (z < 16) { bytes.write_byte(y, z, 0); z = z + 1; }
         nova_ghash(hStd, aad, aadLen, y);
         let fused = ptLen - (ptLen % 64);
@@ -443,7 +363,6 @@ pub fn sealWith(rk: ptr, nr: int, hStd: ptr, brev: ptr, hpows: ptr, iv: ptr, ivL
     bytes.free(t); bytes.free(scr); bytes.free(pad); bytes.free(j0); bytes.free(icb); bytes.free(s); bytes.free(ej0);
 }
 
-// Open one record with the cached state: verify tag (constant-time), decrypt on success, return ok.
 pub fn openWith(rk: ptr, nr: int, hStd: ptr, brev: ptr, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
                 ct: ptr, ctLen: int, tag: ptr, ptOut: ptr): bool {
     let t = bytes.alloc(16); let scr = bytes.alloc(16); let pad = bytes.alloc(16);
@@ -463,7 +382,6 @@ pub fn openWith(rk: ptr, nr: int, hStd: ptr, brev: ptr, iv: ptr, ivLen: int, aad
     return ok;
 }
 
-// One-shot seal: set up + seal one record + tear down. keyLen 16 or 32.
 pub fn seal(key: ptr, keyLen: int, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
             pt: ptr, ptLen: int, ctOut: ptr, tagOut: ptr): void {
     let rk = bytes.alloc(240); let hStd = bytes.alloc(16); let brev = bytes.alloc(256); let hpows = bytes.alloc(64);
@@ -472,7 +390,6 @@ pub fn seal(key: ptr, keyLen: int, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
     bytes.free(rk); bytes.free(hStd); bytes.free(brev); bytes.free(hpows);
 }
 
-// One-shot open.
 pub fn open(key: ptr, keyLen: int, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
             ct: ptr, ctLen: int, tag: ptr, ptOut: ptr): bool {
     let rk = bytes.alloc(240); let hStd = bytes.alloc(16); let brev = bytes.alloc(256); let hpows = bytes.alloc(64);

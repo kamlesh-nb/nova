@@ -1,7 +1,3 @@
-// Channel 6b step 1 (sema): a struct stored in a tuple element must be accessible via `t[0].x` (and the
-// `t.0` desugar). Before this, the inferer left a tuple-index expression `unresolved`, so field access
-// through a tuple element failed to compile as "unknown struct type". This is a functionality fix (the
-// value-lowering / copy semantics of tuple elements is a separate step).
 import assert;
 
 struct P { pub x: int, pub y: int, init(a: int, b: int) { self.x = a; self.y = b; } }
@@ -25,20 +21,16 @@ fn dot_index_desugar(): void {
     assert.equalInt(t.1, 7);
 }
 
-// Channel 6b step 2 (value semantics): copying a tuple deep-copies its value-struct elements, so mutating
-// the copy's element does not affect the original. Before this, `let u = t` aliased the box.
 @test
 fn tuple_copy_is_independent(): void {
     let t = (P(1, 2), 5);
     let u = t;
     u[0].x = 99;
-    assert.equalInt(t[0].x, 1);    // t untouched
+    assert.equalInt(t[0].x, 1);
     assert.equalInt(u[0].x, 99);
     assert.equalInt(t[1], 5);
 }
 
-// Owned field (a heap string) inside a tuple element: the tuple box owns and releases it; the --arc /
-// --asan gates catch a leak or double-free. Fresh heap strings per iteration force the check.
 @test
 fn owned_field_in_tuple_element(): void {
     let i = 0;

@@ -1,8 +1,3 @@
-// T15 mTLS (phase 1): the security crux of client-certificate auth is the TLS 1.3 CertificateVerify --
-// the client signs a transcript digest with its cert key, under the CLIENT context string. This gates
-// handshake.certVerifyDigest: the content (64-space prefix + context + 0x00 + transcript hash) round-
-// trips through a real P-256 sign/verify, a tampered transcript fails, and the client and server
-// contexts produce DIFFERENT digests (so a client can never be confused with a server signature).
 import assert;
 import bytes;
 import crypto.tls.13.handshake;
@@ -16,25 +11,21 @@ fn fillPattern(buf: ptr, n: int, seed: int): void {
 
 @test
 fn test_client_certverify_roundtrip(): void {
-    // a P-256 keypair (fixed non-zero scalar; derivePublic gives the matching public point)
     let priv = bytes.alloc(32);
     fillPattern(priv, 32, 3);
-    bytes.write_byte(priv, 0, 0x11);        // ensure non-zero, in-range
+    bytes.write_byte(priv, 0, 0x11);
     let pubKey = bytes.alloc(65);
     p256.derivePublic(pubKey, priv);
 
-    // a transcript hash (SHA-256 suite -> 32 bytes)
     let th = bytes.alloc(32);
     fillPattern(th, 32, 99);
 
-    // client signs the CertificateVerify digest
     let digest = bytes.alloc(32);
-    handshake.certVerifyDigest(false, th, 32, digest);   // false = client context
+    handshake.certVerifyDigest(false, th, 32, digest);
     let r = bytes.alloc(32);
     let s = bytes.alloc(32);
     p256.ecdsaSign(digest, priv, r, s);
 
-    // a verifier recomputes the SAME client digest and the signature validates
     let digest2 = bytes.alloc(32);
     handshake.certVerifyDigest(false, th, 32, digest2);
     assert.isTrue(p256.ecdsaVerify(digest2, pubKey, r, s));
@@ -51,7 +42,6 @@ fn test_tampered_transcript_fails(): void {
     let r = bytes.alloc(32); let s = bytes.alloc(32);
     p256.ecdsaSign(digest, priv, r, s);
 
-    // flip one transcript byte -> different digest -> the old signature must NOT verify
     let thBad = bytes.alloc(32); fillPattern(thBad, 32, 99);
     bytes.write_byte(thBad, 5, bytes.read_byte(thBad, 5) ^ 0xff);
     let digestBad = bytes.alloc(32);
@@ -61,12 +51,10 @@ fn test_tampered_transcript_fails(): void {
 
 @test
 fn test_client_and_server_context_differ(): void {
-    // Same transcript, different role context -> different signed digest. This is what stops a client
-    // CertificateVerify from being accepted as a server one (and vice versa).
     let th = bytes.alloc(32); fillPattern(th, 32, 42);
     let dc = bytes.alloc(32); let ds = bytes.alloc(32);
-    handshake.certVerifyDigest(false, th, 32, dc);   // client
-    handshake.certVerifyDigest(true, th, 32, ds);    // server
+    handshake.certVerifyDigest(false, th, 32, dc);
+    handshake.certVerifyDigest(true, th, 32, ds);
     let same = true;
     let i = 0;
     while (i < 32) { if (bytes.read_byte(dc, i) != bytes.read_byte(ds, i)) { same = false; } i = i + 1; }
@@ -75,30 +63,27 @@ fn test_client_and_server_context_differ(): void {
 
 @test
 fn test_client_cert_flight_messages(): void {
-    // client keypair + an opaque "certificate" payload for the Certificate message
     let priv = bytes.alloc(32); fillPattern(priv, 32, 3); bytes.write_byte(priv, 0, 0x11);
     let pubKey = bytes.alloc(65); p256.derivePublic(pubKey, priv);
     let certLen = 40;
     let cert = bytes.alloc(certLen); fillPattern(cert, certLen, 200);
 
-    // --- Certificate message round-trips (0x0b || bodyLen || ctxLen=0 || listLen || certLen || cert || ext) ---
     let certMsg = bytes.alloc(256);
     let certMsgLen = tlsClient.buildClientCertificate(cert, certLen, certMsg);
     assert.equalInt(0x0b, bytes.read_byte(certMsg, 0));
-    assert.equalInt(0, bytes.read_byte(certMsg, 4));                       // empty request context
+    assert.equalInt(0, bytes.read_byte(certMsg, 4));
     let cLen = (bytes.read_byte(certMsg, 8) << 16) | (bytes.read_byte(certMsg, 9) << 8) | bytes.read_byte(certMsg, 10);
     assert.equalInt(certLen, cLen);
     let i = 0;
     while (i < certLen) { assert.equalInt(bytes.read_byte(cert, i), bytes.read_byte(certMsg, 11 + i)); i = i + 1; }
 
-    // --- CertificateVerify message: signature validates against the client key over the CLIENT digest ---
     let th = bytes.alloc(32); fillPattern(th, 32, 77);
     let cvMsg = bytes.alloc(128);
     let cvLen = tlsClient.buildClientCertVerify(th, 32, priv, cvMsg);
     assert.equalInt(0x0f, bytes.read_byte(cvMsg, 0));
     let scheme = (bytes.read_byte(cvMsg, 4) << 8) | bytes.read_byte(cvMsg, 5);
-    assert.equalInt(0x0403, scheme);                                       // ecdsa_secp256r1_sha256
-    let sigPtr = (cvMsg as long + 8) as ptr;                              // DER sig starts after scheme+len
+    assert.equalInt(0x0403, scheme);
+    let sigPtr = (cvMsg as long + 8) as ptr;
     let r = bytes.alloc(32); let s = bytes.alloc(32);
     handshake.decodeEcdsaSigDer(sigPtr, r, s);
     let digest = bytes.alloc(32); handshake.certVerifyDigest(false, th, 32, digest);
@@ -107,13 +92,12 @@ fn test_client_cert_flight_messages(): void {
 
 @test
 fn test_empty_client_certificate(): void {
-    // no-cert reply to an optional request: listLen 0, bodyLen = 1(ctx) + 3(listLen) = 4
     let out = bytes.alloc(16);
     let n = tlsClient.buildClientCertificate(bytes.alloc(1), 0, out);
     assert.equalInt(0x0b, bytes.read_byte(out, 0));
     let bodyLen = (bytes.read_byte(out, 1) << 16) | (bytes.read_byte(out, 2) << 8) | bytes.read_byte(out, 3);
     assert.equalInt(4, bodyLen);
-    assert.equalInt(0, bytes.read_byte(out, 4));                          // ctx len
+    assert.equalInt(0, bytes.read_byte(out, 4));
     let listLen = (bytes.read_byte(out, 5) << 16) | (bytes.read_byte(out, 6) << 8) | bytes.read_byte(out, 7);
     assert.equalInt(0, listLen);
     assert.equalInt(8, n);

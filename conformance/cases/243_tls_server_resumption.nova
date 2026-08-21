@@ -1,7 +1,3 @@
-// TLS 1.3 server-side resumption (RFC 8446 2.2, 4.6.1): a pure-Nova client<->server handshake where the
-// server issues a NewSessionTicket, then a second connection resumes via the PSK (abbreviated handshake,
-// no Certificate/CertificateVerify) using a shared ticket cache. Complements the client-side resumption
-// checked against openssl in earlier cases.
 import net.tlsmembio;
 import bytes;
 import assert;
@@ -34,14 +30,12 @@ fn server_issues_and_resumes(): void {
     let cache = tlsmembio.newTicketCache();
     let tmp = bytes.alloc(33792);
 
-    // Connection 1: full handshake; the server issues a NewSessionTicket.
     let cb1 = tlsmembio.newClientBio("localhost");
     let sb1 = tlsmembio.newServerBio(hexBuf(SRV_CERT), 421, hexBuf(SRV_PRIV));
     sb1.useTicketCache(cache);
     assert.isTrue(handshake(cb1, sb1, tmp));
-    assert.isTrue(!cb1.resumed());                  // first connection is a full handshake
+    assert.isTrue(!cb1.resumed());
 
-    // Deliver the server's NewSessionTicket to the client and let it parse it.
     while (sb1.pendingOut() > 0) { let n = sb1.pull(tmp, 33792); cb1.feed(tmp, n); }
     let out = bytes.alloc(4096);
     cb1.readApp(out, 4096);
@@ -56,15 +50,13 @@ fn server_issues_and_resumes(): void {
     i = 0; while (i < pskLen) { bytes.write_byte(psk, i, bytes.read_byte(cb1.ticketPskPtr(), i)); i = i + 1; }
     let ageAdd = cb1.ticketAge();
 
-    // Connection 2: resume with the ticket against the same server (shared cache).
     let cb2 = tlsmembio.newClientBioResume("localhost", "", psk, pskLen, kind, ticket, tlen, ageAdd);
     let sb2 = tlsmembio.newServerBio(hexBuf(SRV_CERT), 421, hexBuf(SRV_PRIV));
     sb2.useTicketCache(cache);
     assert.isTrue(handshake(cb2, sb2, tmp));
-    assert.isTrue(cb2.resumed());                   // client sees pre_shared_key echoed
-    assert.isTrue(sb2.resumed());                   // server accepted the PSK (binder verified)
+    assert.isTrue(cb2.resumed());
+    assert.isTrue(sb2.resumed());
 
-    // Bidirectional application data over the resumed connection.
     let msg = bytes.alloc(3);
     bytes.write_byte(msg, 0, 7); bytes.write_byte(msg, 1, 8); bytes.write_byte(msg, 2, 9);
     cb2.writeApp(msg, 3);
@@ -76,9 +68,6 @@ fn server_issues_and_resumes(): void {
 
 }
 
-// Server-side 0-RTT accept: a fresh full handshake seeds a ticket, then a resuming connection sends early
-// data alongside the ClientHello and the server decrypts it. (A separate cache from the test above: each
-// successful handshake issues a new ticket, overwriting this single-entry cache.)
 @test
 fn server_accepts_0rtt(): void {
     let cache = tlsmembio.newTicketCache();
@@ -102,7 +91,6 @@ fn server_accepts_0rtt(): void {
     i = 0; while (i < pskLen) { bytes.write_byte(psk, i, bytes.read_byte(cb1.ticketPskPtr(), i)); i = i + 1; }
     let ageAdd = cb1.ticketAge();
 
-    // Resume with 0-RTT: the client sends early data alongside the ClientHello.
     let early = bytes.alloc(5);
     bytes.write_byte(early, 0, 0x30); bytes.write_byte(early, 1, 0x31); bytes.write_byte(early, 2, 0x32);
     bytes.write_byte(early, 3, 0x33); bytes.write_byte(early, 4, 0x34);
@@ -112,11 +100,11 @@ fn server_accepts_0rtt(): void {
     sb3.acceptEarlyData(true);
     assert.isTrue(handshake(cb3, sb3, tmp));
     assert.isTrue(cb3.resumed());
-    assert.isTrue(cb3.earlyAccepted());             // client sees early_data echoed in EncryptedExtensions
-    assert.isTrue(sb3.earlyAccepted());             // server accepted and decrypted 0-RTT data
+    assert.isTrue(cb3.earlyAccepted());
+    assert.isTrue(sb3.earlyAccepted());
 
     let eout = bytes.alloc(64);
-    assert.equalInt(sb3.readApp(eout, 64), 5);      // the 0-RTT payload, before post-handshake app data
+    assert.equalInt(sb3.readApp(eout, 64), 5);
     assert.equalInt(bytes.read_byte(eout, 0), 0x30);
     assert.equalInt(bytes.read_byte(eout, 4), 0x34);
 }

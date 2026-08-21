@@ -59,10 +59,6 @@ pub fn computeServerSigB64(password: string, salt: string, iterations: int, auth
     return base64.encode(ss);
 }
 
-// --- SCRAM-SHA-1 variant (RFC 5802) -----------------------------------------------------------------
-// Same construction with SHA-1 as H everywhere (20-byte keys, PBKDF2-HMAC-SHA1). Legacy: MongoDB users
-// created before 4.0, or servers configured for SCRAM-SHA-1 only. Kept as a separate path so the
-// SHA-256 default is untouched (and the ScramClient struct stays 3-field for existing callers).
 pub fn saltedPasswordSha1(password: string, salt: string, iterations: int): string {
     return sha.pbkdf2HmacSha1(password, salt, iterations, 20);
 }
@@ -116,10 +112,6 @@ pub struct ScramClient {
         return `${clientFinalNoProof},p=${proof}`;
     }
 
-    // The ServerSignature (base64) this client EXPECTS in the server-final message, given the same
-    // server-first it answered. RFC 5802 requires the client to compare the server's `v=` against this; a
-    // mismatch means the peer does not know the password (a rogue/MITM server) and the exchange MUST fail.
-    // Recomputed from server-first (salt, iterations) + the password, so it needs no retained state.
     pub fn expectedServerSignature(self: ScramClient, serverFirst: string): string {
         let combinedNonce = "";
         let saltB64 = "";
@@ -136,7 +128,6 @@ pub struct ScramClient {
         return computeServerSigB64(self.password, salt, iters, authMessage);
     }
 
-    // SHA-1 variant of expectedServerSignature.
     pub fn expectedServerSignatureSha1(self: ScramClient, serverFirst: string): string {
         let combinedNonce = "";
         let saltB64 = "";
@@ -153,8 +144,6 @@ pub struct ScramClient {
         return computeServerSigB64Sha1(self.password, salt, iters, authMessage);
     }
 
-    // The SCRAM-SHA-1 client-final message (proof computed with SHA-1). Used when the negotiated /
-    // requested mechanism is SCRAM-SHA-1 instead of the SHA-256 default.
     pub fn clientFinalMessageSha1(self: ScramClient, serverFirst: string): string {
         let combinedNonce = "";
         let saltB64 = "";
@@ -187,7 +176,6 @@ fn test_scram_rfc7677_proof(): void {
 
 @test
 fn test_scram_sha1_rfc5802(): void {
-    // RFC 5802 section 5 worked example (SCRAM-SHA-1): user "user", password "pencil".
     let c = ScramClient{
         username: "user",
         password: "pencil",

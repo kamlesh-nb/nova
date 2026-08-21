@@ -1,15 +1,9 @@
-// The DB seam's Connection/Driver traits — proves a backend can be programmed against
-// abstractly: typed params (List<DbValue>) in, typed ResultSet out, via trait dispatch.
-// Uses a mock in-memory backend (no live server) so the SEAM is gated independently of any
-// real driver; a real BTreeDB/Postgres driver implements the same two traits.
 import assert;
 import list;
 import string;
 import db;
 
-// A trivial in-memory table: SELECT returns its rows; anything else is an exec that counts.
 struct MockConn impl Connection {
-    // queryWire (trait): mocks use the generic fallback that re-encodes a ResultSet.
     async fn queryWire(self, sql: string, params: List<DbValue>): WireRows { return wireRowsFromResultSet(await self.query(sql, params)); }
     pub rows: List<Row>,
     pub prepared: List<string>,
@@ -23,7 +17,6 @@ struct MockConn impl Connection {
     }
 
     pub async fn exec(self, sql: string, params: List<DbValue>): ExecResult {
-        // Pretend the statement affected as many rows as it had bound params.
         return ExecResult(params.size(), "OK");
     }
 
@@ -31,7 +24,6 @@ struct MockConn impl Connection {
         let rs = ResultSet();
         rs.columns.push(Column("id", DbType.Int4));
         rs.columns.push(Column("name", DbType.Text));
-        // Echo the seeded rows; ignore SQL (this is a mock).
         let i = 0;
         let n = self.rows.size();
         while (i < n) {
@@ -50,7 +42,7 @@ struct MockConn impl Connection {
 
     pub fn close(self): void {}
 
-    pub fn setTimeout(self, ms: int): int { return 0; }   // D6 trait method (mock)
+    pub fn setTimeout(self, ms: int): int { return 0; }
 
     pub async fn prepare(self, sql: string): int { self.prepared.push(sql); return self.prepared.size() - 1; }
     pub async fn queryPrepared(self, stmt: int, params: List<DbValue>): ResultSet {
@@ -75,7 +67,6 @@ struct MockDriver impl Driver {
     }
 }
 
-// Program entirely against the seam — `conn` is a Connection trait object, no backend type.
 fn firstName(conn: Connection): string {
     let params = List<DbValue>();
     let rs = conn.query("SELECT id, name FROM t", params);
@@ -96,7 +87,6 @@ fn test_query_through_trait(): void {
 
 @test
 fn test_abstracted_over_seam(): void {
-    // firstName never names MockConn — only the Connection trait.
     let drv = MockDriver();
     let conn = drv.connect("mock://localhost");
     assert.equalStr(firstName(conn), "planck");

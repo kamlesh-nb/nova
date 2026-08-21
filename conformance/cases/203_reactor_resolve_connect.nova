@@ -1,8 +1,3 @@
-// M2 tail of the C++ runtime retirement plan: hostname resolution for reactor-native connect. A
-// database host is usually a name, not a numeric IP; eventedio.resolveHost4 parses numeric IPv4
-// directly and resolves a name via getaddrinfo. Here the client connects to "localhost", which is
-// resolved to the loopback address, then does a TCP round trip on one reactor. Proves a named host
-// reaches the reactor-native connect path.
 import assert;
 import bytes;
 import os.sys;
@@ -35,7 +30,7 @@ async fn cli(port: int, done: long, result: long, gotLen: long): void {
     if (s.isOpen()) {
         let msg = bytes.alloc(4);
         bytes.write_byte(msg, 0, 80); bytes.write_byte(msg, 1, 73);
-        bytes.write_byte(msg, 2, 78); bytes.write_byte(msg, 3, 71);   // PING
+        bytes.write_byte(msg, 2, 78); bytes.write_byte(msg, 3, 71);
         await s.sendBuf(msg, 4);
         bytes.free(msg);
         let n = await s.recvInto(result, 64);
@@ -47,10 +42,8 @@ async fn cli(port: int, done: long, result: long, gotLen: long): void {
 
 @test
 fn test_resolve_host4_loopback(): void {
-    // "localhost" resolves to the same value parseIPv4 gives for the numeric loopback.
     assert.isTrue(eventedio.resolveHost4("localhost") == eventedio.parseIPv4("127.0.0.1"));
     assert.isTrue(eventedio.resolveHost4("127.0.0.1") == eventedio.parseIPv4("127.0.0.1"));
-    // A host that cannot resolve returns -1.
     assert.isTrue(eventedio.resolveHost4("no.such.host.invalid.") == (-1 as long));
 }
 
@@ -87,7 +80,7 @@ fn test_reactor_connect_by_name(): void {
 
     assert.equalInt(count(done), 2);
     assert.equalInt(bytes.read_i32(gotLen, 0) as int, 4);
-    assert.equalInt(bytes.read_byte(result, 0) as int, 80);   // 'P'
+    assert.equalInt(bytes.read_byte(result, 0) as int, 80);
 
     poller.setCurrent(0);
     bytes.free(done); bytes.free(result); bytes.free(gotLen);

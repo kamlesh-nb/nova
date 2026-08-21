@@ -1,15 +1,3 @@
-// M3 of the C++ runtime retirement plan: the flagship pattern (a web request whose handler makes a
-// per-request database call) runs entirely on the Nova reactor, no Asio. This closes the original
-// PH6 blocker, where a handler's nested async DB call deadlocked because the reactor could not drive
-// nested awaits (fixed in M1) and the DB I/O went through Asio (fixed in M2).
-//
-// A real App handler does `await aio.asyncConnect(host, port)` then a query round trip. Because
-// M2 made asyncConnect reactor-native on a reactor thread and AsyncStream dual-mode, the handler's
-// database I/O runs on the same reactor as the inbound request, with the identical AsyncStream seam
-// the real drivers (btreedb, postgres, ...) use, so no driver change is needed. Here a mock database
-// server on the same reactor stands in for a live database. Everything (inbound accept, request
-// parse, mediator dispatch, the handler's DB connect and query, and the response) runs on ONE
-// reactor in ONE poll loop.
 import assert;
 import bytes;
 import os.sys;
@@ -35,7 +23,6 @@ fn count(cell: long): int {
     return bytes.read_i32(cell, 0) as int;
 }
 
-// Does buf[0..n] contain the ASCII bytes of `s`?
 fn containsAscii(buf: long, n: int, s: string): bool {
     if (s.length == 0 || n < s.length) { return false; }
     let i = 0;
@@ -55,15 +42,11 @@ fn containsAscii(buf: long, n: int, s: string): bool {
 @serializable struct GetUser impl Message { pub id: int }
 @serializable struct ValDto { pub val: int }
 
-// The DB endpoint config, injected into the handler from the DI container.
 struct DbConfig impl Service {
     pub port: int,
     init(port: int) { self.port = port; }
 }
 
-// The flagship handler: on each request it opens a database connection and runs a query, all with
-// `await` on the reactor. This is exactly the shape that deadlocked before M1+M2. The DB port is
-// injected through the constructor (resolved from the per-request scope).
 struct GetUserHandler impl RequestHandler<GetUser, ValDto> {
     cfg: DbConfig,
     init(cfg: DbConfig) { self.cfg = cfg; }
@@ -93,15 +76,14 @@ fn makeApp(dbPort: int): App {
     return a;
 }
 
-// Mock database server: read the query, reply "42".
 async fn dbServe(fd: int, kq: int, done: long): void {
     let s = eventedio.ReactorStream(fd, kq);
     let buf = bytes.alloc(64);
     let n = await s.recvInto(buf, 64);
     if (n > 0) {
         let reply = bytes.alloc(2);
-        bytes.write_byte(reply, 0, 52);   // '4'
-        bytes.write_byte(reply, 1, 50);   // '2'
+        bytes.write_byte(reply, 0, 52);
+        bytes.write_byte(reply, 1, 50);
         let _ = await s.sendBuf(reply, 2);
         bytes.free(reply);
     }
@@ -115,8 +97,6 @@ async fn webServe(application: App, fd: int, kq: int, done: long): void {
     bump(done);
 }
 
-// Completion-model accept: one awaited accept per listener spawns its server coroutine (exactly one
-// connection is expected on each), then completes — so no pending accept op is left leaked (ASAN-clean).
 async fn webAcceptOne(application: App, lfd: int, kq: int, done: long): void {
     let s = await eventedio.reactorAccept(lfd, kq);
     if (s.isOpen()) { coroStart(webServe(application, s.fdOf(), kq, done)); }
@@ -175,12 +155,10 @@ fn test_flagship_request_with_db_on_reactor(): void {
     let done = bytes.alloc(4); bytes.write_i32(done, 0, 0);
     let gotOk = bytes.alloc(4); bytes.write_i32(gotOk, 0, 0);
 
-    // Accept coroutines (one per listener) + the external client; servers spawn on accept completion.
     coroStart(webAcceptOne(application, webLfd, r.kq, done));
     coroStart(dbAcceptOne(dbLfd, r.kq, done));
     coroStart(webClient(webPort, r.kq, done, gotOk));
 
-    // done reaches 3: the client, the web handler coroutine, and the db server coroutine.
     let guard = 0;
     while (count(done) < 3 && guard < 4000) {
         let nev = r.pollComplete(500);

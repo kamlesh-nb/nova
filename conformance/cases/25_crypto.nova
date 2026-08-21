@@ -1,6 +1,3 @@
-// Gates X2 crypto: the split `crypto/` folder (crypto.sha / crypto.random). SHA-256/512/1
-// + HMAC-SHA256 known-answer tests, CSPRNG liveness, and the seedable PCG32 PRNG's
-// reference vectors + determinism. (base64 has its own gate, 87_crypto_base64.)
 import crypto.hash.sha;
 import crypto.random;
 import assert;
@@ -21,7 +18,6 @@ fn test_sha1_kat(): void {
 
 @test
 fn test_hmac_sha256_kat(): void {
-    // RFC 4231 case 2.
     assert.equalStr(sha.hmacSha256("Jefe", "what do ya want for nothing?"),
         "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
 }
@@ -29,9 +25,9 @@ fn test_hmac_sha256_kat(): void {
 @test
 fn test_csprng(): void {
     let a = random.randomBytes(16);
-    assert.equalInt(a.length, 16);                 // raw bytes (M11: randomBytes returns n bytes, not hex)
+    assert.equalInt(a.length, 16);
     assert.isTrue(a != random.randomBytes(16));
-    assert.equalInt(random.randomHex(16).length, 32);   // hex form is still 2n chars
+    assert.equalInt(random.randomHex(16).length, 32);
     let r = random.randomInt(50);
     assert.isTrue(r >= 0);
     assert.isTrue(r < 50);
@@ -39,12 +35,9 @@ fn test_csprng(): void {
 
 @test
 fn test_prng_deterministic_and_correct(): void {
-    // PCG32 published reference vectors (srandom(42, 54)) — proves the seedable
-    // PRNG is the real algorithm, not just "some deterministic function".
     let p = random.newPrngSeq(42, 54);
     assert.equalInt((p.next() == 2707161783) as int, 1);
     assert.equalInt((p.next() == 2068313097) as int, 1);
-    // Reproducible: same seed, same stream.
     let a = random.newPrng(2024);
     let b = random.newPrng(2024);
     assert.equalInt((a.next() == b.next()) as int, 1);

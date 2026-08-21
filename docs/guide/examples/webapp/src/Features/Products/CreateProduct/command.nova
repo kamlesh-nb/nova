@@ -1,8 +1,5 @@
 import web.mediator;
 
-// The command: what the client sends to create a product. @serializable lets the framework bind
-// this struct from the request body (@fromBody), so the handler receives it already deserialised.
-// `impl Message` opts it into the mediator, dispatched to its handler by request type.
 @serializable pub struct CreateProduct impl Message {
     pub name: string,
     pub price: int,

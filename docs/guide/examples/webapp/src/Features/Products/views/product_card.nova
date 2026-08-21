@@ -1,7 +1,5 @@
 import web.response;
 
-// A per-feature NSX/JSX view, returns an HTML string the handler (or a page route)
-// can render. Feature views live beside the slices that use them.
 pub fn productCard(name: string, price: int): string {
     return <div class="card">
         <h3>{name}</h3>

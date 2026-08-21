@@ -1,6 +1,3 @@
-// Gates C1 crypto: PBKDF2-HMAC-SHA256 + SCRAM-SHA-256 (RFC 5802 / 7677), the SASL
-// auth used by PostgreSQL and MongoDB. The SCRAM proof exercises the whole raw-byte
-// key chain (PBKDF2 -> HMAC -> SHA256 -> XOR via `^` -> base64).
 import crypto.hash.sha;
 import crypto.scram;
 import crypto.base64;
@@ -8,7 +5,6 @@ import assert;
 
 @test
 fn test_scram_pbkdf2(): void {
-    // PBKDF2-HMAC-SHA256 published vectors.
     assert.equalStr(sha.toHex(sha.pbkdf2HmacSha256("password", "salt", 1, 32)),
                     "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b");
     assert.equalStr(sha.toHex(sha.pbkdf2HmacSha256("password", "salt", 4096, 32)),
@@ -17,7 +13,6 @@ fn test_scram_pbkdf2(): void {
 
 @test
 fn test_scram_rfc7677_exchange(): void {
-    // RFC 7677 §3: user "user", password "pencil".
     let c = scram.ScramClient{
         username: "user",
         password: "pencil",

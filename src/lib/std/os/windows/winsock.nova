@@ -1,23 +1,15 @@
-// os/winsock: Winsock2 (ws2_32) for the reactor on Windows (step 3; windows-only). On Windows a socket is
-// a SOCKET (UINT_PTR, `long` here), NOT a file descriptor: read/write/close do not apply — recv/send and
-// closesocket do — and errors come from WSAGetLastError, not errno. os/socket_windows wraps these behind
-// the backend-neutral socket API. COMPILE-VERIFIED via cross-compilation; runtime verification pending on
-// a Windows host. Link needs -lws2_32 (added in the IOCP build step).
 
 import bytes;
 
-// Address family / socket type (same numeric values as POSIX).
 pub const AF_INET: int = 2;
 pub const SOCK_STREAM: int = 1;
 pub const IPPROTO_TCP: int = 6;
 
-// Option level/names — Windows values (differ from Linux; match macOS for SOL_SOCKET/SO_ERROR).
-pub const SOL_SOCKET: int = 65535;       // 0xffff
+pub const SOL_SOCKET: int = 65535;
 pub const SO_REUSEADDR: int = 4;
-pub const SO_ERROR: int = 4103;          // 0x1007
+pub const SO_ERROR: int = 4103;
 pub const SOMAXCONN: int = 128;
 
-// ioctlsocket command for non-blocking mode (FIONBIO). It is 0x8004667E (a _IOW-encoded long).
 pub const FIONBIO: long = 2147772030;
 
 pub const INVALID_SOCKET: long = -1;
@@ -28,7 +20,6 @@ pub extern("c") fn WSAStartup(wVersionRequested: int, lpWSAData: ptr): int;
 pub extern("c") fn WSACleanup(): int;
 pub extern("c") fn WSAGetLastError(): int;
 
-// SOCKET-returning / SOCKET-taking calls (SOCKET is pointer-sized -> long).
 pub extern("c") fn socket(af: int, type_: int, protocol: int): long;
 pub extern("c") fn closesocket(s: long): int;
 pub extern("c") fn bind(s: long, addr: ptr, namelen: int): int;
@@ -44,8 +35,6 @@ pub extern("c") fn ioctlsocket(s: long, cmd: long, argp: ptr): int;
 pub extern("c") fn getaddrinfo(node: ptr, service: ptr, hints: ptr, res: ptr): int;
 pub extern("c") fn freeaddrinfo(res: ptr): void;
 
-// Overlapped I/O (the IOCP backend, step 4). WSABUF is { u_long len; char* buf } = 16 bytes on x64
-// (4 bytes len + 4 padding + 8 ptr). completionRoutine is null (0) for IOCP-notified overlapped ops.
 pub const WSABUF_SIZE: int = 16;
 pub fn setWsaBuf(wb: ptr, len: int, buf: long): void {
     bytes.write_i32(wb, 0, len as long);
@@ -54,31 +43,18 @@ pub fn setWsaBuf(wb: ptr, len: int, buf: long): void {
 pub extern("c") fn WSARecv(s: long, buffers: ptr, bufferCount: int, lpBytesRecvd: ptr, lpFlags: ptr, lpOverlapped: ptr, completionRoutine: long): int;
 pub extern("c") fn WSASend(s: long, buffers: ptr, bufferCount: int, lpBytesSent: ptr, dwFlags: int, lpOverlapped: ptr, completionRoutine: long): int;
 
-// --- overlapped accept / connect (the proactor forms of accept(2) / connect(2)) -----------------
-// AcceptEx is a genuine export of mswsock.lib, so it binds by name like any other symbol. It needs
-// the accepted socket to EXIST first (unlike accept(), which creates one) and writes the local and
-// remote addresses into outBuf, which must hold localLen + remoteLen bytes — each at least
-// sizeof(sockaddr_in) + 16.
 pub extern("c") fn AcceptEx(listenSock: long, acceptSock: long, outBuf: ptr, recvDataLen: int,
                             localLen: int, remoteLen: int, received: ptr, overlapped: ptr): int;
-pub const ACCEPTEX_ADDRLEN: int = 32;      // sizeof(sockaddr_in) + 16, per AcceptEx's contract
-pub const ACCEPTEX_BUFLEN: int = 64;       // local + remote, with recvDataLen 0 (no inline read)
+pub const ACCEPTEX_ADDRLEN: int = 32;
+pub const ACCEPTEX_BUFLEN: int = 64;
 
-// ConnectEx is NOT exported by mswsock.lib — Winsock only hands it out through WSAIoctl as a
-// runtime function pointer, which Nova's FFI cannot call. nova_wsa_connectex (src/runtime/io.cpp)
-// does that one resolution and indirect call, and binds by name here like everything else.
 pub extern("c") fn nova_wsa_connectex(s: long, addr: ptr, addrlen: int, overlapped: ptr): int;
 
-// SO_UPDATE_ACCEPT_CONTEXT copies the listener's properties onto a socket produced by AcceptEx.
-// Without it the accepted socket is not fully "a socket returned by accept()" — getpeername,
-// getsockname and shutdown misbehave on it.
-pub const SO_UPDATE_ACCEPT_CONTEXT: int = 28683;   // 0x700B
+pub const SO_UPDATE_ACCEPT_CONTEXT: int = 28683;
 
-// WSAStartup wants MAKEWORD(2,2) = 0x0202 and a WSADATA out-buffer (~408 bytes on x64; 512 is safe).
 pub const WSADATA_SIZE: int = 512;
-pub const WINSOCK_VERSION: int = 514;    // 0x0202
+pub const WINSOCK_VERSION: int = 514;
 
-// Initialise Winsock (idempotent; ref-counted by the OS). Returns 0 on success.
 pub fn startup(): int {
     let d = bytes.alloc(WSADATA_SIZE);
     let r = WSAStartup(WINSOCK_VERSION, d);

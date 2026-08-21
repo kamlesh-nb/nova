@@ -1,6 +1,3 @@
-// FR-mem Tier 1: mem.load<T>/store<T> with Endian. Zero-alloc typed read/write into a caller-owned buffer,
-// endianness- and signedness-aware. The load/store are compiler builtins (no import needed, like simd.*);
-// only the Endian enum is imported.
 import bytes;
 import mem.endian;
 import assert;

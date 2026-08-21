@@ -1,4 +1,3 @@
-// Module A: enum Status (Ok, Fail) with distinct codes.
 pub enum Status { Ok, Fail
     pub fn code(self: Status): int {
         switch (self) {

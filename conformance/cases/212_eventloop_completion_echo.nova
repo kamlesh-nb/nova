@@ -1,8 +1,3 @@
-// Step 2a: the completion-based EventLoop (net/eventloop). A socketpair stands in for a connection; we
-// SUBMIT a recv op, the peer writes, poll() performs the read into the op buffer and reports it as a
-// completion with the byte count filled in (completion emulation over kqueue readiness). Then we submit a
-// send op and poll() writes it. This validates the proactor model + the raw op-record result delivery
-// that reactorio (2b) and IOCP (step 4) build on. macOS/BSD.
 import assert;
 import bytes;
 import os.sys;
@@ -18,15 +13,12 @@ fn test_completion_recv_then_send(): void {
     let lp = eventloop.Poller(16);
     assert.isTrue(lp.ok());
 
-    // Caller-owned op record + payload buffer (must outlive the op).
     let op = bytes.alloc(eventloop.OP_SIZE);
     let buf = bytes.alloc(64);
 
-    // Submit a recv on the server end.
     eventloop.makeOp(op, eventloop.OP_RECV, server, buf, 64, 0);
     assert.equalInt(lp.submit(op), 0);
 
-    // Client sends "ping".
     let out = bytes.alloc(4);
     bytes.write_byte(out, 0, 112);
     bytes.write_byte(out, 1, 105);
@@ -34,7 +26,6 @@ fn test_completion_recv_then_send(): void {
     bytes.write_byte(out, 3, 103);
     assert.isTrue(sys.write(client, out, 4) == 4);
 
-    // poll completes the recv: op.done == 1, op.result == 4, bytes read into buf.
     let n = lp.poll(1000);
     assert.equalInt(n, 1);
     assert.equalInt(eventloop.opDone(op), 1);
@@ -42,14 +33,12 @@ fn test_completion_recv_then_send(): void {
     assert.equalInt(bytes.read_byte(buf, 0) as int, 112);
     assert.equalInt(bytes.read_byte(buf, 3) as int, 103);
 
-    // Echo it back: submit a send of the same 4 bytes.
     eventloop.makeOp(op, eventloop.OP_SEND, server, buf, 4, 0);
     assert.equalInt(lp.submit(op), 0);
     let n2 = lp.poll(1000);
     assert.equalInt(n2, 1);
     assert.equalInt(eventloop.opResult(op), 4);
 
-    // Client receives the echo.
     let inb = bytes.alloc(16);
     assert.isTrue(sys.read(client, inb, 16) == 4);
     assert.equalInt(bytes.read_byte(inb, 0) as int, 112);

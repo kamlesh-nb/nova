@@ -1,17 +1,8 @@
-// HARNESS SELF-TEST fixture (NOT a real conformance case — lives outside cases/
-// and expect_fail/ so the normal globs never pick it up).
-//
-// This program COMPILES cleanly and then SEGFAULTS at runtime (deref of an
-// unmapped address). The harness's classify_failure MUST label this
-// "COMPILED-THEN-CRASHED" — never a valid rejection kind (typecheck/parse/codegen).
-// If it doesn't, the negative-case guard is broken and NO negative result can be
-// trusted (a compile-and-crash would masquerade as "correctly rejected"). run.sh's
-// pre-flight self-test asserts exactly that, and ABORTS the run if it fails.
 import bytes;
 
 @test
 fn t_deliberate_crash(): void {
-    let p = 1 as ptr;                 // address 1 — guaranteed unmapped
-    let b = bytes.read_byte(p, 0);    // SIGSEGV
+    let p = 1 as ptr;
+    let b = bytes.read_byte(p, 0);
     console.log(b);
 }

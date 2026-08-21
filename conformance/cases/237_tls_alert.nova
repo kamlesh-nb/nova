@@ -1,6 +1,3 @@
-// TLS 1.3 Alert protocol (M12-B): after a handshake, a client close_notify alert (an encrypted record
-// with inner content type 0x15) is detected by the peer's readApp as end-of-stream (returns -1), not
-// silently skipped. Driven in memory over the pure-Nova client/server bios (no sockets).
 import net.tlsmembio;
 import bytes;
 import assert;
@@ -28,7 +25,6 @@ fn close_notify_detected(): void {
     let sw: tlsmembio.TlsBio = sb;
     let tmp = bytes.alloc(33792);
 
-    // Handshake to completion.
     let cdone = false; let sdone = false; let i = 0;
     while (i < 20 && !(cdone && sdone)) {
         transfer(cw, sw, tmp);
@@ -39,7 +35,6 @@ fn close_notify_detected(): void {
     }
     assert.isTrue(cdone && sdone);
 
-    // Client sends close_notify; the server must report end-of-stream (-1), not a skipped record.
     cb.closeNotify();
     transfer(cw, sw, tmp);
     let out = bytes.alloc(256);

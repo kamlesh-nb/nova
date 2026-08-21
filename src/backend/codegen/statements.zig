@@ -1,19 +1,93 @@
+//! Statement lowering for the LLVM backend: turns a Nova [`ast.Statement`] into
+//! IR emitted through the active `LlvmCompiler` builder.
+//!
+//! This file owns the control-flow half of code generation. Every statement
+//! form in the language dispatches here from [`compileStatement`]: `let`
+//! bindings (including tuple destructuring), expression statements, blocks,
+//! `if`/`while`/`for`, `switch` (including tagged-union pattern binding),
+//! `return`, `break`/`continue`, and `defer`/`errdefer`. Expression evaluation
+//! itself lives in `expressions.zig`; this module is about sequencing, basic
+//! blocks, and the memory-management bookkeeping that has to happen at
+//! statement boundaries.
+//!
+//! Two cross-cutting concerns dominate the code here and explain most of its
+//! bulk:
+//!
+//!   1. **ARC ownership at scope boundaries.** Nova is reference-counted (see
+//!      `arc.zig`), so the compiler must retain on copy and release on scope
+//!      exit. A `let` that binds an owned value records the local in the current
+//!      [`Scope.owned_locals`]; a block, `break`, `continue`, or `return`
+//!      replays those releases in reverse order. Owned payloads bound out of a
+//!      tagged-union `switch` case are retained on entry and released on every
+//!      exit edge (fallthrough, guard failure, terminator). Getting an edge
+//!      wrong is a leak or a use-after-free, so each control-flow arm is careful
+//!      to release exactly on the paths it owns.
+//!
+//!   2. **Value-vs-reference and optional boxing.** Value structs are copied on
+//!      binding ([`LlvmCompiler.buildValueStructCopy`]), value-optionals are
+//!      boxed into a discriminated slot on `let`/`return` unless the initialiser
+//!      already yields a box, trait targets widen a concrete struct into a fat
+//!      pointer, and `any` targets coerce. `return` additionally has to compose
+//!      these with error-union wrapping and the async-coroutine result-slot
+//!      path. These transforms are order-sensitive and interlock, which is why
+//!      [`compileStatement`]'s `.return_stmt` and `.let_stmt` arms are the
+//!      longest.
+//!
+//! Terminator discipline: LLVM basic blocks may have at most one terminator, so
+//! nearly every arm guards on `LLVMGetBasicBlockTerminator` before emitting a
+//! branch, and [`compileStatement`] returns early if the current block is
+//! already terminated (e.g. after a `return` inside a block).
+
 const std = @import("std");
+/// Nova AST node definitions; statements dispatch on [`ast.Statement`] and read
+/// their embedded expressions and type references.
 const ast = @import("../../frontend/ast.zig");
+/// LLVM-C bindings package (builder, module, value/type refs).
 const llvm = @import("llvm");
+/// LLVM type-level enums (`LLVMIntPredicate`, type-kind tags).
 const types = llvm.types;
+/// LLVM-C core API: basic-block, builder, and instruction constructors.
 const core = llvm.core;
+/// Semantic type layer, used here for [`sema_types.TypeId`] when preferring a
+/// resolved type id over a spelled name to select destructors.
 const sema_types = @import("../../frontend/types.zig");
 
+/// Strips a monomorphised/qualified struct name down to its base identifier
+/// (e.g. `List_int` or a module-scoped name to `List`), so container and
+/// destructor lookups match on the declared type.
 const getStructBaseName = @import("types.zig").getStructBaseName;
+/// The backend compiler state: holds the LLVM builder/module, the scope stack,
+/// local/type maps, and every emit helper this file calls through `self`.
 const LlvmCompiler = @import("llvm_codegen.zig").LlvmCompiler;
+/// Per-function codegen context (name, declared return type + type-ref) passed
+/// down so `return` can wrap/coerce to the right shape.
 const FunctionInfo = @import("llvm_codegen.zig").FunctionInfo;
+/// A lexical scope frame: its deferred/errdeferred statement lists and its
+/// list of owned locals awaiting release on exit.
 const Scope = @import("llvm_codegen.zig").Scope;
 
-// value-optional-zero support: a `x != undefined` / `undefined != x` condition proves `x` present in the
-// THEN branch; a `x == undefined` condition proves it present in the ELSE branch. Returns the narrowed local
-// name and which branch it holds in, so the `??` operator can short-circuit a narrowed-present primitive.
-const PresenceNarrow = struct { name: []const u8, then_branch: bool };
+/// A "presence narrowing" fact recovered from an `if` condition of the form
+/// `x != undefined` (or `x == undefined`).
+///
+/// When the compiler proves a named value is present on one branch it records
+/// that in `narrowed_present` for the duration of that branch, which lets loads
+/// of a value-optional skip the box on the narrowed side. See
+/// [`detectPresenceNarrow`] for how it is extracted and the `.if_stmt` arm of
+/// [`compileStatement`] for how it is applied.
+const PresenceNarrow = struct {
+    /// The identifier being tested against `undefined`.
+    name: []const u8,
+    /// Whether the narrowing (`name` is present) holds on the THEN branch. True
+    /// for `!=`, false for `==` (where presence holds on the ELSE branch).
+    then_branch: bool,
+};
+/// Recognises an `if` condition that narrows a value's presence, returning the
+/// [`PresenceNarrow`] fact or `null` when the condition is not such a test.
+///
+/// Matches a binary `==`/`!=` where exactly one side is an identifier and the
+/// other is the `undefined` literal (in either order). Any other condition
+/// shape yields `null`, so narrowing is a best-effort optimisation and never a
+/// correctness requirement.
 fn detectPresenceNarrow(cond: ast.Expression) ?PresenceNarrow {
     if (cond.kind != .binary) return null;
     const bin = cond.kind.binary;
@@ -28,6 +102,14 @@ fn detectPresenceNarrow(cond: ast.Expression) ?PresenceNarrow {
     return PresenceNarrow{ .name = n, .then_branch = (bin.op == .ne) };
 }
 
+/// Emits the pending `errdefer` expressions of every active scope, innermost
+/// first, on an error-return path.
+///
+/// Walks the scope stack from top to bottom and, within each scope, replays its
+/// `errdeferred_statements` in reverse registration order (LIFO), mirroring how
+/// `defer` unwinds. Called from [`compileStatement`]'s `.return_stmt` arm only
+/// when a value is being returned as the ERROR side of an error union, so the
+/// clean-up registered by `errdefer` runs precisely on the failure path.
 pub fn runErrdefers(self: *LlvmCompiler) anyerror!void {
     var si = self.scopes.items.len;
     while (si > 0) {
@@ -41,6 +123,18 @@ pub fn runErrdefers(self: *LlvmCompiler) anyerror!void {
     }
 }
 
+/// Releases the owned locals of every scope inside the current loop body when
+/// control leaves the loop early via `break` or `continue`.
+///
+/// A `break`/`continue` branches straight to the loop's exit/condition block,
+/// bypassing the normal end-of-block release that the intervening scopes would
+/// otherwise run, so those owned locals would leak. This walks the scope stack
+/// down to (but not including) `current_loop_scope_depth`, the scope index
+/// recorded when the loop was entered, releasing each scope's `owned_locals` in
+/// reverse. It intentionally does NOT pop the scopes: they are still live and
+/// their normal exit paths (or the surrounding block's `.block` handler) remain
+/// responsible for structural teardown. Returns immediately if no loop is
+/// active. See the `.break_stmt`/`.continue_stmt` arms of [`compileStatement`].
 fn releaseScopesForLoopExit(self: *LlvmCompiler) anyerror!void {
     const depth = self.current_loop_scope_depth orelse return;
     var i = self.scopes.items.len;
@@ -57,13 +151,61 @@ fn releaseScopesForLoopExit(self: *LlvmCompiler) anyerror!void {
     }
 }
 
+/// Lowers a single Nova statement to LLVM IR under the active builder position.
+///
+/// This is the control-flow dispatcher for the backend. It first bails out if
+/// the current basic block already has a terminator (so dead statements after a
+/// `return`/`break` emit nothing), then attaches a debug location and, when
+/// coverage is enabled for non-std sources, a per-statement coverage counter.
+/// Temporaries created while evaluating the statement are drained at the end via
+/// the `temp_mark` snapshot of `pending_temps`.
+///
+/// The `switch (stmt)` body handles each statement form. The heavy arms and
+/// their subtleties:
+///
+///   - `.let_stmt`: registers owned locals for later release, evaluates the
+///     initialiser, then applies the binding-time transforms in a specific
+///     order: tuple destructuring (with per-element retain of owned slots),
+///     trait widening, `any` coercion, deep-copy vs retain for owned r-values
+///     (value-optional / tuple / heap-struct / plain retain), value-optional
+///     boxing, and value-struct copy-with-field-retain. It also emits debug
+///     info for the local. The ordering matters because each transform assumes
+///     the prior ones have run.
+///   - `.expr_stmt`: also drives JSX emission into a string builder and, for an
+///     owned call/`struct_init` result whose value is discarded, releases it so
+///     the temporary does not leak.
+///   - `.block`: pushes a [`Scope`], compiles children until a terminator, then
+///     on the non-terminated path runs deferred statements (LIFO) and releases
+///     owned locals (LIFO) before tearing the scope down.
+///   - `.if_stmt`: builds then/else/merge blocks and threads
+///     [`PresenceNarrow`] facts into `narrowed_present` for the branch on which
+///     the value is proven present.
+///   - `.while_stmt`/`.for_stmt`: build cond/body/(incr/)exit blocks and save
+///     and restore the break/continue targets and `current_loop_scope_depth`.
+///     `.for_stmt` currently only lowers `for (i in a..b)` range loops and the
+///     C-style init/cond/incr form; non-range iterables and destructuring
+///     bindings error as unimplemented.
+///   - `.switch_stmt`: for a tagged-union discriminant it loads the tag word,
+///     and inside each case binds the variant payload(s) by offset into the
+///     union, retaining owned payloads and releasing them on guard-failure,
+///     fallthrough, and normal exit edges. Case values resolve enum variant
+///     ordinals or integer literals.
+///   - `.return_stmt`: composes value-optional boxing, trait widening, and
+///     error-union wrapping in that order, runs `errdefer` on the error path,
+///     retains an owned returned variable, replays all deferred statements and
+///     releases locals, then emits the return itself, dispatching to the async
+///     coroutine result-slot path, the `main` fallback, `_new` self-return, or
+///     a plain ret/ret-void.
+///   - `.break_stmt`/`.continue_stmt`: release loop-body scopes (see
+///     [`releaseScopesForLoopExit`]) then branch to the saved target, erroring
+///     if used outside a loop.
+///   - `.defer_stmt`: appends the expression to the current scope's deferred or
+///     errdeferred list; erroring if there is no active scope.
 pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: FunctionInfo) anyerror!void {
     if (core.LLVMGetBasicBlockTerminator(core.LLVMGetInsertBlock(self.builder)) != null) {
         return;
     }
 
-    // DWARF (Gap 4): set the current debug location to this statement so breakpoints / single-step
-    // land on the right source line. No-op unless a DISubprogram scope is active (debug builds).
     if (self.di_scope != null) {
         const dbg_span = switch (stmt) {
             .block => |s| s.span,
@@ -116,8 +258,6 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
 
                         for (names) |n| {
                             if (lt.get(n)) |vt| {
-                                // A value struct with owned fields also needs a scope-end drop (to
-                                // release those fields via dropValueStruct, not nova_release).
                                 if (self.isOwnedLocal(n, vt) or (self.isValueStructName(vt) and self.valueStructHasOwnedFields(vt))) {
                                     const sc = &self.scopes.items[self.scopes.items.len - 1];
                                     try sc.owned_locals.append(self.allocator, .{ .name = n, .type_name = vt });
@@ -182,10 +322,6 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
                         if (trait_decl_name) |expected_type| {
                             if (self.traits.contains(expected_type)) {
                                 if (try self.resolveExpressionTypeName(init_ptr)) |struct_name| {
-                                    // Check the BASE name so a generic instantiation (`Cell<int>`) widens too --
-                                    // `structs` is keyed by base name, so `contains("Cell<int>")` is false and
-                                    // the widening would be skipped, storing the raw struct pointer where a
-                                    // trait fat-pointer is expected (B5 SEGV on the first vtable dispatch).
                                     if (self.structs.contains(getStructBaseName(struct_name))) {
                                         const orig_struct = val;
                                         val = try self.constructTraitObject(orig_struct, struct_name, expected_type);
@@ -208,16 +344,11 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
                     if (self.current_local_types) |lt| {
                         target_type = lt.get(ls.name);
                     }
-                    // Widen a value into an owning `any` local: box it into a `{payload, dtor}` carrier so the
-                    // local owns a real refcounted box. Skip the generic owned-retain below -- coerceToAny has
-                    // already balanced the payload's refcount.
                     var widened_to_any = false;
                     if (target_type) |tt| {
                         if (!widened_to_trait and std.mem.eql(u8, tt, "any")) {
                             if (!self.isAnyExpr(init_ptr)) {
                                 val = try self.coerceToAny(val, init_ptr);
-                                // The local takes ownership of the box; drop the temp registration so it is
-                                // not double-released at statement end (the local's own drop releases it).
                                 self.consumeTemporary(val);
                                 widened_to_any = true;
                             }
@@ -233,10 +364,6 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
                             const is_r_var = (init.kind == .ident or init.kind == .field_access or init.kind == .index) and
                                 !is_enum_variant_ctor;
                             if (is_r_var) {
-                                // Channel 6a / Design B: an optional whose inner is a VALUE struct keeps the
-                                // heap-pointer layout, so a borrow-RHS copy must DEEP-COPY the payload (value
-                                // semantics) instead of aliasing it via retain. Every other owned borrow keeps
-                                // the alias-retain.
                                 var opt_inner: ?[]const u8 = null;
                                 var is_tuple = false;
                                 if (self.current_local_type_ids) |ids| {
@@ -245,8 +372,6 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
                                         if (self.type_store) |ts| is_tuple = ts.get(st_tid) == .tuple;
                                     }
                                 }
-                                // Channel 6b step 2: a tuple copy must deep-copy the box (and its value-struct
-                                // elements) for value semantics, else `let u = t; u[0].x = 99` mutates `t`.
                                 if (opt_inner) |innerBase| {
                                     val = try self.buildOptionalStructDeepCopy(val, innerBase);
                                 } else if (is_tuple) {
@@ -256,9 +381,6 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
                                         try self.compileRetain(val);
                                     }
                                 } else if (!self.isValueStructName(tt) and self.isPureValueStructName(tt)) {
-                                    // Channels 1/3/5: a heap-resident (escape-excluded) PURE value DTO copied
-                                    // from a borrow must deep-copy for value semantics, not alias. isValueStructName
-                                    // is false here (it is excluded), so line-249's inline copy does not fire.
                                     val = try self.buildHeapStructDeepCopy(val, tt);
                                 } else {
                                     try self.compileRetain(val);
@@ -279,25 +401,10 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
                         }
                     }
 
-                    // M-1 copy-on-assign: `let b = a` where `a` is a value struct must copy `a`'s
-                    // bytes into `b`'s own storage, not alias it. Only the plain-variable RHS needs
-                    // this; a fresh `Point(...)` construction already yields distinct storage. (Value
-                    // structs live only as locals — field/return/container uses are escape-excluded.)
-                    // Copy when the RHS is a BORROW of a value struct (a variable, field, index, or a
-                    // container get like list.at(i)) so the local is independent of the source buffer.
-                    // A fresh `Point(...)` construction already yields its own storage (not a borrow).
                     if (target_type) |tt| {
-                        // A value struct assigned FROM a borrow must copy into its own storage, else `b` aliases
-                        // `a` and `b.x = ...` mutates `a` (reference semantics -- the bug). A borrow here is a
-                        // bare variable (`.ident`), a field/index read, or a container get; a fresh
-                        // construction (`Struct{...}`/`Ctor(...)`) already owns distinct storage. NOTE:
-                        // `returnIsBorrow` deliberately answers FALSE for `.ident` (a return of a frame-local
-                        // dangles), so it is the wrong predicate alone -- `.ident` is exactly the copy case.
                         if (self.isValueStructName(tt) and (init.kind == .ident or self.returnIsBorrow(&init))) {
                             const vsz = self.getTypeSize(ast.TypeRef{ .ident = getStructBaseName(tt) }, false);
                             val = try self.buildValueStructCopy(val, vsz);
-                            // Owned (reference) fields are now aliased by source + copy; retain them
-                            // in the copy so its own scope-end drop is balanced (uniform copy semantics).
                             try self.retainValueStructOwnedFields(val, tt);
                         }
                     }
@@ -308,16 +415,7 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
                         self.val_type;
                     _ = core.LLVMBuildStore(self.builder, self.coerceToSlotType(val, slot_ty), alloca_val);
 
-                    // DWARF (Gap 4, item 2): declare the local here too. An inferred local (e.g.
-                    // `let s = a + b`) may not be in current_local_types at the pre-alloc loop, but its
-                    // init type resolves now; the dbg_declared dedup set prevents a second declare for
-                    // locals already handled at pre-alloc. resolveExpressionTypeName returns a borrowed
-                    // slice (not freed).
                     if (self.di_scope != null and ls.names == null) {
-                        // Prefer the local's own declared type; else the init expression's type; else
-                        // resolve the local's TypeId to a name (safe here -- instantiation context is set,
-                        // unlike the pre-alloc loop where symbolName crashes). `owned` is freed; the map
-                        // lookups and resolveExpressionTypeName return borrowed slices.
                         var lt_name: ?[]const u8 = if (self.current_local_types) |ltm| ltm.get(ls.name) else null;
                         if (lt_name == null) lt_name = self.resolveExpressionTypeName(init_ptr) catch null;
                         var owned: ?[]const u8 = null;
@@ -331,14 +429,10 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
                                 }
                             }
                         }
-                        // Containers: the element type is what makes the debugger able to expand elements,
-                        // but current_local_types/resolveExpressionTypeName often give the bare base ("List").
-                        // Override with the fully-qualified symbolName(tid) (e.g. "List_i32") when the resolved
-                        // name is a bare container base, so diContainerType names the typedef with the element.
                         if (lt_name) |ln| {
                             const b = @import("types.zig").getStructBaseName(ln);
                             const is_container = std.mem.eql(u8, b, "List") or std.mem.eql(u8, b, "Map") or std.mem.eql(u8, b, "Set");
-                            if (is_container and std.mem.eql(u8, ln, b)) { // bare "List"/"Map"/"Set", no args
+                            if (is_container and std.mem.eql(u8, ln, b)) {
                                 if (self.current_local_type_ids) |ids| {
                                     if (ids.get(ls.name)) |tid| {
                                         if (self.symbolName(tid)) |nm| {
@@ -357,14 +451,10 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
             }
         },
         .expr_stmt => |*es| {
-            // A bare JSX element inside a parent element's builder (e.g. `{for x in xs { <div>..</div>; }}`)
-            // renders DIRECTLY into the current builder -- no per-iteration StringBuilder + toString +
-            // copy-up. This makes a loop of cards a single-buffer render (Go strings.Builder / Rust
-            // String::push_str shape) instead of one intermediate string per element.
             if (self.current_string_builder) |sb| {
                 if (es.expr.kind == .jsx_element) {
                     try self.emitJsxInto(sb, es.expr.kind.jsx_element);
-                    try self.jsxFlushLiteral(sb); // emit this element's trailing static run
+                    try self.jsxFlushLiteral(sb);
                     return;
                 }
             }
@@ -440,10 +530,6 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
 
             _ = core.LLVMBuildCondBr(self.builder, cond_i1, then_bb, else_bb orelse merge_bb);
 
-            // value-optional-zero: a presence guard narrows `x` present in exactly one branch. Add the name to
-            // `narrowed_present` around that branch and restore it afterwards (only if WE added it, so a name
-            // narrowed by an outer scope is left intact). This lets `??` short-circuit a narrowed-present
-            // primitive value-optional instead of misreading a present 0 as absent.
             const pnarrow = detectPresenceNarrow(is.condition);
 
             core.LLVMPositionBuilderAtEnd(self.builder, then_bb);
@@ -523,14 +609,6 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
             if (rs.value) |*v| {
                 if (ret_val_opt) |rv| {
                     if (func.ret_type_ref) |rtr| {
-                        // NESTED value-optional return (`(int | undefined) | undefined`, e.g.
-                        // `Map<K, int | undefined>.get()` returning `self.vals.get(idx)`): the returned
-                        // expression ALREADY yields the inner value-optional box, which normally suppresses
-                        // re-boxing. But here the KEY WAS FOUND, so the OUTER level must be materialised as a
-                        // present box wrapping the inner (box or 0) -- otherwise present-holding-undefined
-                        // (inner 0) is indistinguishable from absent (the `return undefined` arm, which yields
-                        // 0 and is correctly NOT boxed by the isUndefinedLiteralExpr guard). The outer box
-                        // BORROWS the inner; see valoptTypeRefIsValue's nested comment for the ARC ledger.
                         const nested_ret = self.valoptTypeRefIsNested(rtr);
                         if (self.valoptTypeRefIsValue(rtr) and
                             !LlvmCompiler.isUndefinedLiteralExpr(v) and
@@ -566,11 +644,6 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
 
                         const is_err = if (vt) |x| std.mem.eql(u8, x, parts.err) else false;
 
-                        // `T | E | undefined` reads as `(T | undefined) | E`, so the OK arm is a value-optional
-                        // box. A plain `return 42` yields a RAW int, which every consumer (`catch`, `try`, `??`)
-                        // then treats as a boxed value-optional and ARC-releases as a pointer -> SEGV (F1). Box
-                        // the ok value first, unless it is `undefined` (0 is the undefined box) or already a
-                        // value-optional box.
                         var ok_rv: types.LLVMValueRef = rv;
                         if (!is_err and LlvmCompiler.valueOptionalName(parts.ok) and
                             !LlvmCompiler.isUndefinedLiteralExpr(v) and !self.exprYieldsValoptBox(v))
@@ -670,8 +743,6 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
         .switch_stmt => |*ss| {
             const current_fn = core.LLVMGetBasicBlockParent(core.LLVMGetInsertBlock(self.builder));
             var discr_val = try self.compileExpression(ss.discriminant);
-            // Resolve a colliding enum discriminant to the module-scoped enum this switch's file declares,
-            // so variant tags and case-label lowering use the correct variant set (S3).
             const discr_type_name_opt = if (try self.resolveExpressionTypeName(&ss.discriminant)) |dt|
                 self.scopedTypeName(dt, ss.span.file)
             else
@@ -738,8 +809,6 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
                                                 _ = core.LLVMBuildStore(self.builder, loaded_val, var_alloca);
                                             }
                                         } else if (v.fields) |payload_fields| {
-                                            // Tuple-form multi-payload pattern `Rect(w, h)`: load each payload
-                                            // field (at slot `ptr_size + idx*ptr_size`) into its positional binding.
                                             for (call.args, 0..) |arg, idx| {
                                                 if (idx >= payload_fields.len or arg.kind != .ident) continue;
                                                 const var_name = arg.kind.ident;
@@ -797,8 +866,6 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
                     }
                 }
 
-                // A case guard (`case v if cond:`) is evaluated after the payload bindings it may reference.
-                // If it is false, release any retained payloads and fall through to `default`.
                 if (c.guard) |g| {
                     const gfn = core.LLVMGetBasicBlockParent(core.LLVMGetInsertBlock(self.builder));
                     const gval = self.coerceToSlotType(try self.compileExpression(g), self.val_type);
@@ -852,10 +919,6 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
                             }
                         }
                     }
-                    // Non-enum discriminant (int/long/short/byte/...): evaluate the integer literal case
-                    // label, supporting a negative label via unary `-`. Previously the tag was only
-                    // computed when the discriminant type was unknown (null), so a known integer type
-                    // fell through with every case label left at 0 -> duplicate switch cases / wrong branch.
                     if (!resolved_enum) {
                         var neg = false;
                         var lit = val_expr.kind;

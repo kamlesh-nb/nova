@@ -1,8 +1,3 @@
-// S3: EXPLICIT int <-> decimal conversion (Nova has no implicit numeric coercion).
-//   decimal.fromInt(n: int): decimal   — exact (coefficient |n|, exponent 0)
-//   decimal.toInt(d: decimal): int     — truncates toward zero; TRAPS on out-of-i64-range
-// The divide/modulo-by-zero TRAP (loud `nova: panic`, exit 134, not a silent 0-stub) is a runtime
-// abort and so cannot be a positive @test — it is verified manually and documented in the plan.
 import assert;
 
 @test
@@ -17,8 +12,8 @@ fn test_from_int(): void {
 fn test_to_int_truncates_toward_zero(): void {
     assert.equalInt(decimal.toInt(42m), 42);
     assert.equalInt(decimal.toInt(100m), 100);
-    assert.equalInt(decimal.toInt(3.99m), 3);        // NOT 4 — truncates
-    assert.equalInt(decimal.toInt(-3.99m), 0 - 3);   // NOT -4 — toward zero, not floor
+    assert.equalInt(decimal.toInt(3.99m), 3);
+    assert.equalInt(decimal.toInt(-3.99m), 0 - 3);
     assert.equalInt(decimal.toInt(0.5m), 0);
     assert.equalInt(decimal.toInt(-0.9m), 0);
 }
@@ -32,7 +27,7 @@ fn test_roundtrip(): void {
 
 @test
 fn test_convert_arith_result(): void {
-    assert.equalInt(decimal.toInt(10.5m + 4.5m), 15);   // 15.0 -> 15
+    assert.equalInt(decimal.toInt(10.5m + 4.5m), 15);
     assert.equalInt(decimal.toInt(7m * 6m), 42);
-    assert.equalInt(decimal.toInt(100m / 8m), 12);      // 12.5 -> 12 (truncates)
+    assert.equalInt(decimal.toInt(100m / 8m), 12);
 }

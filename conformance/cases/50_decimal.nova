@@ -1,7 +1,3 @@
-// specs §3.1: `decimal` is IEEE 754-2008 decimal128 (BID) — a 16-byte ARC-managed heap object. Stage 1:
-// `m`-suffixed literals + toString/interpolation. The point is EXACTNESS (`0.1m` is not representable in
-// a binary double) and 34-significant-digit range, both of which BSON's decimal128 requires. Must be
-// leak-free under --arc (decimal is heap-ARC) and clean under --asan.
 import assert;
 
 @test
@@ -14,7 +10,6 @@ fn test_decimal_roundtrip(): void {
 
 @test
 fn test_decimal_exact_fraction(): void {
-    // 0.1 and 0.001 have no exact binary double — decimal128 holds them precisely.
     let tenth: decimal = 0.1m;
     assert.equalStr(`${tenth}`, "0.1");
     let milli: decimal = 0.001m;
@@ -29,7 +24,6 @@ fn test_decimal_negative(): void {
 
 @test
 fn test_decimal_full_precision(): void {
-    // 34 significant digits — the decimal128 maximum.
     let big: decimal = 12345678901234567890123456789012.34m;
     assert.equalStr(`${big}`, "12345678901234567890123456789012.34");
 }

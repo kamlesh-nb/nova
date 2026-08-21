@@ -1,9 +1,3 @@
-// The flagship's real per-request business logic (the CreateProduct pipeline: serde-bind the JSON
-// body, validate, render the JSON response) running on the Nova event loop, driven by a coroutine
-// per connection. This is "the flagship app on the self-hosted reactor" for the part the reactor
-// can host today: a single-level coroutine with no nested `await` (the full async App mediator
-// needs the async scheduler migrated off Asio first; see docs/design/self-hosted-runtime.md).
-// Stress it with POST requests carrying a JSON body.
 import bytes;
 import os.sys;
 import net.poller;
@@ -54,8 +48,6 @@ async fn serveConn(r: poller.Reactor, fd: int): void {
             return;
         }
 
-        // Zero-copy parse of the request headers, then the flagship CreateProduct pipeline over
-        // the JSON body (this is the real framework serde + validation).
         let end = req.parse(buf, got as int);
         let bodyLen = (got as int) - end;
         let body = if (bodyLen > 0) bytes.read_string(buf + (end as long), bodyLen) else "{}";

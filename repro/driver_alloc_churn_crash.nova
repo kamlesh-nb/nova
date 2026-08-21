@@ -1,67 +1,3 @@
-// ✅ FIXED 2026-07-15 — kept as a regression check. Exits 0; prints "...: 100".
-//
-//   nova repro/driver_alloc_churn_crash.nova --native -o /tmp/repro
-//   (btree server on :3009, `usertable` loaded — see btree/bench/ycsb.nova YCSB_LOAD=1)
-//   NOVA_THREADS=1 /tmp/repro     -> exit 0   (was 138/SIGBUS)
-//
-// ===== ROOT CAUSE: there was never any heap corruption. =====
-//
-// `x.field` on a **variable** resolved against the FUNCTION TABLE before codegen ever checked
-// whether `x` was a variable (expressions.zig `.field_access`, via the
-// `func_map.get(fa.field)` fallback + a suffix scan — the flat namespace, §10 #7). This file
-// defines `fn payload(n: int): string` at the bottom. The driver's readFrame returns a
-// `Frame { ftype, payload }`. So `f.payload` in client.nova's query() resolved to **this file's
-// `payload` function** — a code address — which was then passed to PCursor as a `string`.
-//
-// Everything downstream follows: `.length` loads the i32 at [ptr-4], i.e. the function's own
-// instruction bytes, as a length; string.slice clamps against that garbage length and reads wild.
-// Retaining it (PCursor's `self.s = s`) writes a refcount to [code-8] in read-only __TEXT -> BUS.
-//
-// **Why the old investigation missed it — read this before trusting an isolation table:**
-//   * "Rand alone -> OK / payload(100) alone -> OK / BOTH -> SIGBUS, so it's allocation-volume
-//     and layout dependent" — WRONG, and it sent everyone hunting the allocator for months.
-//     Deleting the `payload` CALL also deleted the `payload` FUNCTION, which removed the NAME
-//     COLLISION. The variable was never allocation volume; it was a symbol name.
-//   * "needs the driver's socket read path" — true but incidental: `Frame.payload` is the only
-//     `.payload` field in the tree.
-//   * "DETERMINISTIC, not a race" — correct, and it should have been the tell. This was decided
-//     entirely at COMPILE time.
-//   * Every heap hypothesis below was correctly eliminated. They were all eliminated because the
-//     premise ("the heap is corrupt") was false. When a whole hypothesis class falls, suspect the
-//     premise — not the next hypothesis in the class.
-//   * The ASAN frame (`string_slice`) was the VICTIM, not the culprit. Contrast §10 #18, where the
-//     faulting PC *was* the bug. A faulting frame names where the bad value was USED, not where it
-//     was born.
-//
-// The fix: `.field_access` no longer resolves a variable's field against `func_map` — only a
-// module namespace (`string.hash`) may name a function there. Pinned by
-// conformance/cases/15_name_resolution.nova (verified to fail without it: `f.payload` returns ""
-// and then SIGBUSes). specs.md §8 / §10 #6.
-//
-// ⚠️ Still live: the same flat namespace at TOP LEVEL (§10 #7) — your `fn hash` and the stdlib's
-// still share one table, resolved by string suffix scan. Member access is safe now; the
-// structural fix is a real symbol table.
-//
-// ===== ASAN recipe (kept — it is how this was cracked) =====
-//   NOVA_KEEP_OBJ=1 nova repro/driver_alloc_churn_crash.nova --native -o /tmp/repro  # keeps /tmp/repro.o
-//   clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -fsanitize=address -pthread \
-//     -DNOVA_DROP_ARENA -DNOVA_HAVE_WOLFSSL -Ideps/wolfssl -Ideps/wolfssl/build \
-//     -c -I/opt/homebrew/include src/runtime/runtime.cpp -o /tmp/asan/novacore_asan.o
-//   clang++ -std=c++20 -g -O0 -fsanitize=address -pthread /tmp/repro.o \
-//     /tmp/asan/novacore_asan.o -L/opt/homebrew/lib deps/wolfssl/build/libwolfssl.a \
-//     -framework CoreFoundation -framework Security -o /tmp/repro_asan
-//   NOVA_THREADS=1 ASAN_OPTIONS=detect_leaks=0 /tmp/repro_asan
-//
-// Tip that closed it: `nm -n <binary>` the faulting address. It named the symbol outright
-// (`___fnbox_payload`), which no amount of reasoning about the heap would have produced.
-//
-// HYPOTHESES ELIMINATED (all correct, all irrelevant — the premise was wrong):
-//   * i32 struct field truncating a 64-bit heap pointer (Reader.buf): NO.
-//   * bytes.read_byte / s[i] sign-extending bytes >= 128: NO.
-//   * mutating a `let` binding: works. Style wart only.
-//   * `bytes.alloc(n) as string` in rbytes(): the documented pattern; correct.
-//   * alloc_persistent/bytes.free mismatch; allocZero not zeroing; ptr_size(): all NO (see
-//     map_resize_crash.md, which chased the same phantom).
 import data.btree.client;
 import list;
 import math;
@@ -78,7 +14,7 @@ pub struct Stats {
     init() { self.ops = 0; self.hist = list.List<int>(); var i = 0; while (i <= 200) { self.hist.push(0); i = i + 1; } }
 }
 
-async fn wA(id: int, st: Stats): int {          // Stats passed in (from List<Stats>)
+async fn wA(id: int, st: Stats): int {
     let c = client.connect("127.0.0.1", 3009, "admin", "nova");
     let rnd = Rand((id * 7919) + 12345);
     console.log("  w" + __i32_to_string(id) + ": rand ok");

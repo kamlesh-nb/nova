@@ -1,6 +1,3 @@
-// Phase 3: the per-connection bump arena (nginx pool model). Proves bump allocation with
-// alignment, payload read/write, reset reusing memory from the start, and exhaustion. Outside
-// ARC (plain addresses).
 import assert;
 import bytes;
 import io.arena;
@@ -13,7 +10,7 @@ fn test_arena_bump_and_reset(): void {
     assert.isTrue(p1 != 0);
     assert.isTrue(p2 != 0);
     assert.isTrue(p2 > p1);
-    assert.isTrue(p2 - p1 == 16);        // 10 rounded up to an 8-byte multiple
+    assert.isTrue(p2 - p1 == 16);
 
     bytes.write_i32(p1, 0, 111);
     bytes.write_i32(p2, 0, 222);
@@ -22,19 +19,17 @@ fn test_arena_bump_and_reset(): void {
 
     ar.reset();
     let p3 = ar.alloc(10);
-    assert.isTrue(p3 == p1);             // reset reuses from the start
+    assert.isTrue(p3 == p1);
     ar.destroy();
 }
 
-// M-6: the arena now GROWS on overflow (chains a new block) instead of failing, so one big
-// request cannot starve the others. alloc never returns 0.
 @test
 fn test_arena_grows_past_first_block(): void {
     let ar = arena.Arena(16);
     assert.equalInt(ar.blockCount(), 1);
-    let a = ar.alloc(16);                // fills the first block
+    let a = ar.alloc(16);
     assert.isTrue(a != 0);
-    let b = ar.alloc(8);                 // over the first block -> chains a new one, never 0
+    let b = ar.alloc(8);
     assert.isTrue(b != 0);
     assert.isTrue(ar.blockCount() > 1);
     ar.destroy();

@@ -1,28 +1,4 @@
 // EXPECT-FAIL: parse
-// NEGATIVE test: `throw` was REMOVED from Nova (specs §5.5, plan P2-12).
-//
-// `throw`/`try`/`catch` stay RESERVED words so existing code gets a real explanation
-// rather than "undefined identifier 'throw'", which is what deleting the keyword from
-// the lexer would produce. Same treatment as `match`.
-//
-// Why they went — all measured, not argued:
-//  1. THE VALUE NEVER SURVIVED. `nova_throw` took a `long long`; the catch bound
-//     `zext(setjmp_res)` — an i32. The stdlib's own only user, web/di.nova, did
-//     `throw "DI Error: Service not registered: " + key`, and web/recovery.nova caught
-//     it and logged:  [RECOVERY] Caught exception: 8472
-//     — the string pointer, truncated to 32 bits and re-stringified as a number. The
-//     message was destroyed at the throw. web/mediator.nova had already given up on
-//     `err` and passed a hardcoded string to its exception handlers.
-//  2. NO UNWINDING ⇒ GUARANTEED LEAKS. ARC released only the catching frame's try-block
-//     locals; every frame between the throw and the catch leaked everything it owned.
-//     (F5 §3.4e found `break`/`continue` released nothing — "the exits that JUMP".
-//     A throw was a third such exit, covered by no rule at all.)
-//  3. UB WHERE IT WAS ACTUALLY USED. setjmp/longjmp out of a C++20 coroutine is
-//     undefined behaviour, and the one stdlib consumer was a pipeline behavior running
-//     inside an async HTTP handler.
-//
-// The replacement is `T | Error` (plan P2-13): errors are values, checked by the type
-// system, message intact, nothing to unwind.
 @test
 fn t(): void {
     throw "this must not compile";

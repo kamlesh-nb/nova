@@ -1,7 +1,3 @@
-// TLS 1.3 ALPN (RFC 7301): the client offers an application_layer_protocol_negotiation extension in the
-// ClientHello and reads the server's selection out of EncryptedExtensions. This exercises both the offer
-// encoding (tlsClient.buildClientHello) and the selection parse (handshake.parseAlpnSelection) offline;
-// the live end-to-end path is covered against openssl s_server -alpn.
 import crypto.tls.13.tlsClient;
 import crypto.tls.13.handshake;
 import bytes;
@@ -20,7 +16,6 @@ fn hexBuf(hex: string): ptr {
     return b;
 }
 
-// Find the first offset of the `needle` byte pattern (given as hex) within out[0..n), or -1.
 fn findPattern(out: ptr, n: int, hex: string): int {
     let np = hexBuf(hex);
     let m = hex.length / 2;
@@ -42,7 +37,6 @@ fn strEq(a: string, b: string): bool {
     return true;
 }
 
-// The ClientHello carries a well-formed ALPN extension listing the offered protocols.
 @test
 fn alpn_offer_encoded(): void {
     let rnd = bytes.alloc(32);
@@ -51,13 +45,10 @@ fn alpn_offer_encoded(): void {
     let pkP = bytes.alloc(65);
     let out = bytes.alloc(512);
     let n = tlsClient.buildClientHello(rnd, sid, pk, pkP, "example.com", "h2,http/1.1", out);
-    // ALPN ext (0x0010), ext_len 0x000e, list_len 0x000c, then 02 "h2" 08 "http/1.1".
-    // "h2" = 6832, "http/1.1" = 687474702f312e31.
     let off = findPattern(out, n, "0010000e000c02683208687474702f312e31");
     assert.isTrue(off >= 0);
 }
 
-// An empty ALPN string omits the extension entirely (no 0x0010 ALPN header appears).
 @test
 fn alpn_offer_omitted(): void {
     let rnd = bytes.alloc(32);
@@ -66,24 +57,18 @@ fn alpn_offer_omitted(): void {
     let pkP = bytes.alloc(65);
     let out = bytes.alloc(512);
     let n = tlsClient.buildClientHello(rnd, sid, pk, pkP, "example.com", "", out);
-    // The ALPN extension header (type 0x0010 + a 2-byte list_len prefix) must not be present.
     assert.equalInt(findPattern(out, n, "0010000e000c"), 0 - 1);
 }
 
-// The server's ALPN selection is read from a synthetic EncryptedExtensions message.
 @test
 fn alpn_selection_parsed(): void {
-    // EncryptedExtensions(0x08), body_len 0x000011, ext_len 0x000f,
-    //   ALPN(0x0010) ext_len 0x000b, list_len 0x0009, 0x08 "http/1.1".
     let ee = hexBuf("08000011000f0010000b000908687474702f312e31");
     let sel = handshake.parseAlpnSelection(ee, 0);
     assert.isTrue(strEq(sel, "http/1.1"));
 }
 
-// EncryptedExtensions with no ALPN extension yields "".
 @test
 fn alpn_selection_absent(): void {
-    // EncryptedExtensions(0x08), body_len 0x000002, ext_len 0x0000 (empty extensions).
     let ee = hexBuf("080000020000");
     let sel = handshake.parseAlpnSelection(ee, 0);
     assert.isTrue(strEq(sel, ""));

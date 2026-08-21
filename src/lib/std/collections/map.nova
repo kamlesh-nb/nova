@@ -8,9 +8,6 @@ import assert;
 const TOMBSTONE_SIZE: int = 1;
 const LOAD_FACTOR_MAX: float = 0.75;
 
-// Per-slot state. Occupancy is tracked EXPLICITLY here rather than inferred from `key == 0`, so that
-// a value-type key of 0 (a legal `Map<int, V>` key) is not mistaken for an empty slot. The `slots`
-// byte array holds one of these for every bucket; allocZero leaves every slot EMPTY.
 const SLOT_EMPTY: int = 0;
 const SLOT_TOMBSTONE: int = 1;
 const SLOT_OCCUPIED: int = 2;
@@ -254,7 +251,6 @@ pub class Map<K, V> {
                 let val = oldVals.at(i);
                 let hash = (oldHashFn)(key);
                 let idx = hash & (newCap - 1);
-                // The new table has no tombstones yet, so probe for the first EMPTY slot.
                 while (true) {
                     let ns = bytes.read_byte(newSlots, idx);
                     if (ns == SLOT_EMPTY) {
@@ -284,17 +280,12 @@ pub class Map<K, V> {
         }
     }
 
-    // The value for `key`, or `fallback` if absent.
     pub fn getOrDefault(self: Map<K, V>, key: K, fallback: V): V {
         let v = self.get(key);
         if (v == undefined) { return fallback; }
         return v;
     }
 
-    // Copy every entry of `other` into this map, overwriting on key collision. `other` is unchanged.
-    // A keys-loop (not other.forEach) so the copy body does not need a closure that captures `self`.
-    // `at` returns the value UNBOXED (V, not the boxed `V | undefined` that `get` returns), which the keys
-    // loop can use safely because it only visits keys that exist.
     pub fn merge(self: Map<K, V>, other: Map<K, V>): void {
         let ks = other.keys();
         let i = 0;
@@ -305,7 +296,6 @@ pub class Map<K, V> {
         }
     }
 
-    // All key/value pairs as a list of tuples (iteration order matches keys/values).
     pub fn entries(self: Map<K, V>): list.List<(K, V)> {
         let result = list.List<(K, V)>();
         let ks = self.keys();
@@ -318,7 +308,6 @@ pub class Map<K, V> {
         return result;
     }
 
-    // Remove every entry, via the ARC-correct delete_key over a snapshot of the keys (no buffer reassign).
     pub fn clear(self: Map<K, V>): void {
         let ks = self.keys();
         let i = 0;

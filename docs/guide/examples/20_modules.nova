@@ -1,34 +1,19 @@
-// examples/20_modules.nova
-// A Nova program is a set of MODULES that `import` one another.
-//
-//   * `import geometry;`         : a SIBLING file (geometry.nova in this dir).
-//   * `import collections.list;` : a dotted stdlib path; you qualify by the LAST
-//                                  segment, so `collections.list` becomes `list.List`.
-//   * `import platform;`         : a module the COMPILER synthesises for the build
-//                                  target (os / arch / isPosix / ...).
-//
-// Cross-module visibility is opt-in: only `pub` declarations are reachable from
-// another module. `geometry.Point` and `geometry.manhattan` are `pub`; a non-pub
-// decl referenced across a module boundary is a hard compile error.
 import geometry;
 import collections.list;
 import platform;
 
 fn main(): void {
-    // Use the sibling module's pub struct + pub functions, qualified by file name.
     let a = geometry.Point(0, 0);
     let b = geometry.Point(3, 4);
     console.log(`manhattan((0,0),(3,4)) = ${geometry.manhattan(a, b)}`);
     console.log(`perimeter             = ${geometry.perimeter(a, b)}`);
 
-    // A stdlib module, qualified by its last path segment: collections.list becomes list.
     let xs = list.List<int>();
     xs.push(10);
     xs.push(20);
     xs.push(30);
     console.log(`list size = ${xs.size()}, first = ${xs.at(0)}`);
 
-    // The compiler-synthesised `platform` module describes the build target.
     console.log(`os        = ${platform.os}`);
     console.log(`arch      = ${platform.arch}`);
     console.log(`isPosix   = ${platform.isPosix}`);

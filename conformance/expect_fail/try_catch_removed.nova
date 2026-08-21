@@ -1,7 +1,4 @@
 // EXPECT-FAIL: parse
-// NEGATIVE test: `try`/`catch` were REMOVED with `throw` (specs §5.5, plan P2-12).
-// See throw_removed.nova for the measured reasons. Reserved, not deleted, so this
-// reports what happened instead of a confusing identifier error.
 @test
 fn t(): void {
     try {

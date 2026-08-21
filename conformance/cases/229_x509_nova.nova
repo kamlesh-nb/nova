@@ -1,8 +1,3 @@
-// X.509 certificate parsing and signature verification in Nova (M9 phase D, no external library).
-// Verified against OpenSSL-generated chains: an EC (P-256, ecdsa-with-SHA256) CA and leaf, and an RSA
-// (2048, sha256WithRSAEncryption) CA and leaf. OpenSSL "verify -CAfile" accepts both chains; here we
-// parse the DER and check each leaf's signature against its CA, the self-signed CAs against themselves,
-// and confirm cross-issuer and tampered certificates are rejected.
 import crypto.x509;
 import bytes;
 import assert;
@@ -28,35 +23,32 @@ const EC_LEAF: string = "3082017230820118a00302010202140b212fa6984de817e71132d04
 const RSA_CA: string = "3082030d308201f5a003020102021435aeb1d8ded2f94b3abf2c897fcb208244040e2e300d06092a864886f70d01010b050030163114301206035504030c0b4e6f766120525341204341301e170d3236303732393130333132305a170d3336303732363130333132305a30163114301206035504030c0b4e6f76612052534120434130820122300d06092a864886f70d01010105000382010f003082010a0282010100a30f338483486faf986d2cb2a10c715eda4b877fb372a1483ad7f63e86bf7d9a1e8697a059db5756259240dcf8a758fa2c7583786e651f6eaf0da77692ea4bf343bf2c5440bb0fb520aac945e61f097f9ef359a6cc01b3421a7f5a3e635a868c7257cb43004ebbf2b035e7353d2916995f247022ed87f14acc9c6b8924ee1d1b815107300413ae74ec43b5d35414d4e7ab883d92e9714eef8ddade27be4b2fcc932ba63f534b6b1182c4f3dd901cee60212edcf67ec9f76960b20c1cad14b59a762b033b84f76805e64f5e7ca0235209b1be426675e0dea3a22a1ce5b9c37c83971b988e1c629358ddbd4b252bfb2753ff9dec6d51a14cc89a90eb5349fbc74f0203010001a3533051301d0603551d0e04160414a9053bcafe0131a424e116f2284719287fe74be3301f0603551d23041830168014a9053bcafe0131a424e116f2284719287fe74be3300f0603551d130101ff040530030101ff300d06092a864886f70d01010b050003820101000dd6d54a2571ed535135abacb5f9075a1122ed2e19be713d948cf080940d00b0dd7564ecb2df98b49ae8cef6aca183faa1505a7e1c7af5bb35f84ca7282c44ee8341115b3b3f80c6835d8189ee8190dab022f13f71d1dac2d12ea66cf94d167b64c9c6430077cfca473c86e0dfbbe5583975693687418172511ae99e106a93ede922330cc887bca4be4bfc8886565a09b5748abf7675b2ce51e04580cfe6761430cb0e230a6ceab79dbd49e4c59d011f1857b5332e627e3a4e49598e01bcab8c438de179a4e1215f189ed15bcc8484b6cfb0e8a43912facab9ad7e33bbe8c5c22edcdca2a362459e276e560282b1ede6b7c09e79e5ef811568264b3b154a5674";
 const RSA_LEAF: string = "308202ff308201e7a00302010202146244f0a8316dc725bded749196ef07a55114b31c300d06092a864886f70d01010b050030163114301206035504030c0b4e6f766120525341204341301e170d3236303732393130333132305a170d3336303732363130333132305a30193117301506035504030c0e6c6561662e6e6f76612e7465737430820122300d06092a864886f70d01010105000382010f003082010a0282010100b7975e749366821ff11972018624e90230ffcc483aa1de53ec1df3cb108e21432e1f23cbdcd57993abcd770f3f422b9d7b4696785ea8980fee27ef4e971627d1a179733461624b4c1ae311b0e95faaf358f230c2b0b9f1c94c8abc9830ebc09198f2589f80ffd71750ac9ee17cf5421ce0f00e6a68e0b0b7f8811c8cd210c94fafcbb83821b3677f1f95192be68b31d1d71d51b0fc0566ba017886ed89b12b655d14707ead4f8cc7e930d8cb597e16b35239aff63b1f69a8819ec545fae063db6848cd08d0ff8af63ab26f8582744c8f7cb0bdc64fda9b21c645a12e5ec4651d167ab65a764e836c01ef1ba029c17ebcbe97a93a9469e2fa660a5fbcc5ece8bb0203010001a3423040301d0603551d0e04160414f17a2ad841de352e59d4593626d04be5dc7440db301f0603551d23041830168014a9053bcafe0131a424e116f2284719287fe74be3300d06092a864886f70d01010b05000382010100976006c675fb211b5347492578cffef9aee9315af9f8351c57b9fa73387da47dc4ff34911abd5ec55c688867375d2264f65b42916ca4a44dece2363bc09146b745ee0e005f78214e9d78aa1caab59a929261185153c5896d45df7670cdac4930f63743f97aa21aaa83403e081b4c37f217907c3b69718d855261971cf5e2680c5fa002662fd027a53f4c8a09fd7988571397e241fa1242eb5931031d0c16f670216cb8ddc0ed03a6981c8bb2bb680922d364719ba532b5fafaeb3d4fd2073e859c757980c6771dfb8b742b61e5a62a0af3044f2b4e329d949a9756a7eecac9a54709acc3bb2e01d345364ebf13fb76b0814223791118e7c963be1bde2cefd338";
 
-// The EC leaf verifies under the EC CA; the EC CA is self-signed.
 @test
 fn ec_chain(): void {
     let ca = x509.parseCert(hexBuf(EC_CA), 387);
     let leaf = x509.parseCert(hexBuf(EC_LEAF), 374);
     assert.isTrue(ca.ok);
     assert.isTrue(leaf.ok);
-    assert.equalInt(leaf.sigAlg, 0);          // ecdsa-with-SHA256
-    assert.equalInt(ca.keyType, 1);           // EC P-256
+    assert.equalInt(leaf.sigAlg, 0);
+    assert.equalInt(ca.keyType, 1);
     assert.isTrue(x509.verifySignedBy(leaf, ca));
     assert.isTrue(x509.verifySignedBy(ca, ca));
     assert.isTrue(x509.nameMatches(leaf, ca));
 }
 
-// The RSA leaf verifies under the RSA CA; the RSA CA is self-signed.
 @test
 fn rsa_chain(): void {
     let ca = x509.parseCert(hexBuf(RSA_CA), 785);
     let leaf = x509.parseCert(hexBuf(RSA_LEAF), 771);
     assert.isTrue(ca.ok);
     assert.isTrue(leaf.ok);
-    assert.equalInt(leaf.sigAlg, 3);          // sha256WithRSAEncryption
-    assert.equalInt(ca.keyType, 0);           // RSA
+    assert.equalInt(leaf.sigAlg, 3);
+    assert.equalInt(ca.keyType, 0);
     assert.isTrue(x509.verifySignedBy(leaf, ca));
     assert.isTrue(x509.verifySignedBy(ca, ca));
     assert.isTrue(x509.nameMatches(leaf, ca));
 }
 
-// The wrong issuer is rejected (EC leaf under RSA CA and vice versa).
 @test
 fn wrong_issuer(): void {
     let ecCa = x509.parseCert(hexBuf(EC_CA), 387);
@@ -67,11 +59,10 @@ fn wrong_issuer(): void {
     assert.isTrue(!x509.verifySignedBy(rsaLeaf, ecCa));
 }
 
-// A single flipped byte inside the EC leaf's TBS breaks the signature.
 @test
 fn tampered_cert(): void {
     let buf = hexBuf(EC_LEAF);
-    bytes.write_byte(buf, 120, (bytes.read_byte(buf, 120) ^ 1) & 0xff);   // inside the subject CN
+    bytes.write_byte(buf, 120, (bytes.read_byte(buf, 120) ^ 1) & 0xff);
     let leaf = x509.parseCert(buf, 374);
     let ca = x509.parseCert(hexBuf(EC_CA), 387);
     assert.isTrue(!x509.verifySignedBy(leaf, ca));

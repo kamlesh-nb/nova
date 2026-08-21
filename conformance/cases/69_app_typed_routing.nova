@@ -1,7 +1,3 @@
-// 69 — Typed routing end to end through web.app on the runtime mediator. A request implements `Message`
-// and is handled by a `RequestHandler<TReq, TResp>`; `app.get/post<TReq>(path)` registers only the
-// route. On dispatch the App binds the request, and the mediator picks the handler by request type,
-// runs it, and serialises the DTO. No `any`, no downcast, no handler registration beyond the route.
 import assert;
 import web.app;
 import web.request;

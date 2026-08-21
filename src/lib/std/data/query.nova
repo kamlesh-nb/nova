@@ -1,8 +1,3 @@
-// A fluent, parameterised SQL query builder for the db seam. Values NEVER reach the SQL text -- every bound
-// value becomes a `$N` placeholder and is collected into `params` (a List<DbValue>), so the result feeds
-// straight into `conn.query(q.toSql(), q.params())` or `orm.queryAs<T>(...)` with the same injection-proof
-// guarantee as hand-written prepared statements. The builder is a `class` (reference semantics) so the
-// fluent chain `q.select(...).where(...).orderBy(...)` mutates and returns the one instance.
 import string;
 import list;
 import data.db;
@@ -10,7 +5,7 @@ import data.db;
 pub class Query {
     pub table: string,
     pub selectCols: list.List<string>,
-    pub wheres: list.List<string>,       // rendered "col op $N" / "col IN (...)" fragments, AND-joined
+    pub wheres: list.List<string>,
     pub boundParams: list.List<db.DbValue>,
     pub orders: list.List<string>,
     pub joins: list.List<string>,
@@ -44,7 +39,6 @@ pub class Query {
 
     fn nextPlaceholder(self: Query): string { return "$" + `${self.boundParams.size() + 1}`; }
 
-    // A condition `col <op> <value>`, bound. op is a SQL operator ("=", "<", ">=", "!=", "LIKE", ...).
     pub fn where(self: Query, col: string, op: string, val: db.DbValue): Query {
         let ph = self.nextPlaceholder();
         self.boundParams.push(val);
@@ -53,9 +47,8 @@ pub class Query {
     }
     pub fn whereEq(self: Query, col: string, val: db.DbValue): Query { return self.where(col, "=", val); }
 
-    // `col IN ($a, $b, ...)`, one placeholder per value.
     pub fn whereIn(self: Query, col: string, vals: list.List<db.DbValue>): Query {
-        if (vals.size() == 0) { self.wheres.push("1 = 0"); return self; }   // IN () -> always false
+        if (vals.size() == 0) { self.wheres.push("1 = 0"); return self; }
         let frag = col + " IN (";
         let i = 0;
         while (i < vals.size()) {
@@ -69,11 +62,9 @@ pub class Query {
         return self;
     }
 
-    // `col IS NULL` / `col IS NOT NULL` (no bound value).
     pub fn whereNull(self: Query, col: string): Query { self.wheres.push(col + " IS NULL"); return self; }
     pub fn whereNotNull(self: Query, col: string): Query { self.wheres.push(col + " IS NOT NULL"); return self; }
 
-    // A raw already-safe condition fragment (no interpolation of untrusted data -- use `where` for values).
     pub fn whereRaw(self: Query, cond: string): Query { self.wheres.push(cond); return self; }
 
     pub fn join(self: Query, clause: string): Query { self.joins.push("JOIN " + clause); return self; }
@@ -89,7 +80,6 @@ pub class Query {
     pub fn limit(self: Query, n: int): Query { self.limitN = n; return self; }
     pub fn offset(self: Query, n: int): Query { self.offsetN = n; return self; }
 
-    // The bound parameters, in placeholder order.
     pub fn params(self: Query): list.List<db.DbValue> { return self.boundParams; }
 
     fn joinList(self: Query, xs: list.List<string>, sep: string): string {
@@ -103,7 +93,6 @@ pub class Query {
         return out;
     }
 
-    // Render the SELECT statement.
     pub fn toSql(self: Query): string {
         let sql = "SELECT ";
         if (self.distinctFlag) { sql = sql + "DISTINCT "; }
@@ -120,15 +109,12 @@ pub class Query {
         return sql;
     }
 
-    // Render a DELETE using the accumulated WHERE clause (params carry over).
     pub fn toDeleteSql(self: Query): string {
         let sql = "DELETE FROM " + self.table;
         if (self.wheres.size() > 0) { sql = sql + " WHERE " + self.joinList(self.wheres, " AND "); }
         return sql;
     }
 
-    // Run the SELECT on `conn` -> a ResultSet. Bind into structs with `orm.bindAll<T>(rs)` at the call site
-    // (kept here to avoid an import cycle with data.orm, which depends on the db seam).
     pub async fn run(self: Query, conn: db.Connection): db.ResultSet {
         return await conn.query(self.toSql(), self.boundParams);
     }

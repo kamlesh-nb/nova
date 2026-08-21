@@ -1,10 +1,3 @@
-// Structured logging: level-filtered JSON log lines with typed fields. A production service wants
-// machine-parseable logs (one JSON object per line) rather than free-text; this renders exactly that,
-// filtered by a configurable minimum level.
-//
-//   let lg = log.newLogger(log.LogLevel.Info);
-//   lg.info("request handled", log.fields2(log.f("path", "/api/user"), log.f("status", "200")));
-//   -> {"level":"info","msg":"request handled","path":"/api/user","status":"200"}
 
 import string;
 import list;
@@ -26,8 +19,6 @@ fn levelName(l: LogLevel): string {
     return "error";
 }
 
-// A structured key/value field. Values are strings (the caller formats numbers/bools); the renderer
-// JSON-escapes both.
 pub struct Field {
     pub key: string,
     pub val: string,
@@ -35,7 +26,6 @@ pub struct Field {
 }
 pub fn f(key: string, val: string): Field { return Field(key, val); }
 
-// Small ergonomic constructors for the common field counts (Nova has no varargs).
 pub fn noFields(): List<Field> { return List<Field>(); }
 pub fn fields1(a: Field): List<Field> { let l = List<Field>(); l.push(a); return l; }
 pub fn fields2(a: Field, b: Field): List<Field> { let l = List<Field>(); l.push(a); l.push(b); return l; }
@@ -61,8 +51,6 @@ pub struct Logger {
     pub minLevel: LogLevel,
     init(minLevel: LogLevel) { self.minLevel = minLevel; }
 
-    // Render one structured JSON log line (level, msg, then each field). Pure -- for testing and for
-    // callers that want to route the line somewhere other than stdout.
     pub fn format(self: Logger, level: LogLevel, msg: string, fields: List<Field>): string {
         let out = `{"level":"${levelName(level)}","msg":"${jesc(msg)}"`;
         let i = 0;
@@ -74,7 +62,6 @@ pub struct Logger {
         return out + "}";
     }
 
-    // Emit the line to stdout when the level meets the configured minimum.
     pub fn log(self: Logger, level: LogLevel, msg: string, fields: List<Field>): void {
         if (levelNum(level) < levelNum(self.minLevel)) { return; }
         console.log(self.format(level, msg, fields));
@@ -90,13 +77,6 @@ pub struct Logger {
 
 pub fn newLogger(minLevel: LogLevel): Logger { return Logger(minLevel); }
 
-// A timing span (tracing): captures a start timestamp, and on finish() emits a structured info line
-// with the elapsed time and records `<name>_ns_total` (counter) + `<name>_last_ns` (gauge) into a
-// metrics registry. Lives here (not in metrics) so metrics stays free of a log dependency.
-//
-//   let sp = log.startSpan(lg, "db.query");
-//   ... work ...
-//   sp.finish(reg);
 pub struct Span {
     pub logger: Logger,
     pub name: string,

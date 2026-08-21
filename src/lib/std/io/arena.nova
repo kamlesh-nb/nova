@@ -1,30 +1,13 @@
-// io/arena: a PER-COROUTINE bump allocator for request-scoped scratch memory (M-6,
-// memory-management-refinements.md; the nginx ngx_pool_t model). Allocate many small regions by
-// bumping a cursor, then reclaim the whole request's scratch with a single O(1) reset -- no
-// per-object free, no ARC traffic, no memset.
-//
-// Why per COROUTINE, not per thread (the crux M-6 fixes): one reactor runs ~50 requests
-// concurrently, their allocations interleave, and a single shared thread-arena has no LIFO
-// discipline to mark/reset against -- that shared-arena attempt was reverted. An `Arena` is a plain
-// object, so each request handler holds its OWN in its coroutine frame; two in-flight requests never
-// share a bump cursor. Reset is unambiguous because the arena's lifetime IS the request's.
-//
-// Growable / spill: the arena starts small and GROWS by chaining a fresh (larger) block on overflow
-// instead of failing, so one large request cannot starve the others (the fixed-32MB overflow was the
-// other half of why the shared attempt fell over). `reset` keeps the first block and drops the rest,
-// so a connection's steady-state arena settles at its high-water block with zero further allocation.
-//
-// Addresses are plain `long`, outside ARC -- scratch bytes, not owned objects.
 import bytes;
 import list;
 
 pub class Arena {
-    blocks: list.List<long>,   // block base addresses; blocks[0] is the initial (retained) block
-    sizes: list.List<int>,     // each block's capacity in bytes (parallel to blocks)
-    cur: int,                  // index of the block we are bumping in
-    used: int,                 // bytes used in the current block
-    total: int,                // total bytes handed out since the last reset (for stats)
-    freed: bool,               // guards delete()/destroy() so an explicit free + the destructor do not double-free
+    blocks: list.List<long>,
+    sizes: list.List<int>,
+    cur: int,
+    used: int,
+    total: int,
+    freed: bool,
 
     init(cap: int) {
         let c = if (cap <= 0) 4096 else cap;
@@ -39,7 +22,6 @@ pub class Arena {
     }
 
     fn addBlock(self: Arena, need: int): void {
-        // Grow geometrically from the last block, but at least big enough for `need`.
         let last = self.sizes.at(self.sizes.size() - 1);
         let grown = last * 2;
         let cap = if (grown < need) need else grown;
@@ -49,7 +31,6 @@ pub class Arena {
         self.used = 0;
     }
 
-    // Bump-allocate `n` bytes (8-byte aligned). Never fails: on overflow it chains a new block.
     pub fn alloc(self: Arena, n: int): long {
         let aligned = (n + 7) / 8 * 8;
         let cap = self.sizes.at(self.cur);
@@ -63,28 +44,21 @@ pub class Arena {
         return addr;
     }
 
-    // Reclaim everything at once (O(1) logically). Frees every block beyond the first, keeps block 0
-    // so the common small-request path reuses it with no allocation, and rewinds the cursor.
     pub fn reset(self: Arena): void {
         while (self.blocks.size() > 1) {
             bytes.free(self.blocks.at(self.blocks.size() - 1));
-            let _ = self.blocks.pop();   // drop the last block base
-            let _ = self.sizes.pop();    // and its size (parallel)
+            let _ = self.blocks.pop();
+            let _ = self.sizes.pop();
         }
         self.cur = 0;
         self.used = 0;
         self.total = 0;
     }
 
-    // Total bytes handed out since the last reset.
     pub fn allocated(self: Arena): int { return self.total; }
 
-    // Number of backing blocks (1 in steady state; >1 after a big request until reset).
     pub fn blockCount(self: Arena): int { return self.blocks.size(); }
 
-    // Destructor hook (M-7 `delete`): free every backing block when the arena's owner is destroyed.
-    // Idempotent -- an explicit destroy()/delete() plus the destructor's automatic call do not
-    // double-free the raw blocks.
     pub fn delete(self: Arena): void {
         if (self.freed) { return; }
         self.freed = true;
@@ -95,9 +69,7 @@ pub class Arena {
         }
     }
 
-    // Explicit free for the eager path (the destructor is the safety net). Idempotent.
     pub fn destroy(self: Arena): void { self.delete(); }
 
-    // Bytes still available in the CURRENT block before it chains a new one.
     pub fn remaining(self: Arena): int { return self.sizes.at(self.cur) - self.used; }
 }

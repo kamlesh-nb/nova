@@ -1,19 +1,7 @@
-// os/sys: raw POSIX syscall bindings over FFI, the foundation for a Nova-owned
-// event loop (see docs/design/self-hosted-runtime.md, phase 2). These are thin
-// bindings; C structs (sockaddr_in, epoll_event, kevent) are built and read as raw
-// byte buffers with the `bytes` typed accessors, which is the systems idiom and does
-// not require full struct-ABI FFI marshalling.
-//
-// errno: nova_ffi_errno reads the C `errno` of the calling thread. It must be read
-// immediately after a failing call, before any other library call runs.
 
 import bytes;
 import os.backend;
 
-// errno access and the non-blocking shim are honest primitives that stay in C: errno is a
-// per-thread macro (no address to bind from Nova), and fcntl(F_SETFL) is variadic so a
-// non-variadic FFI declaration mispasses its flag on arm64 (see nova_set_nonblock in core.cpp,
-// the same reason nova_open exists). Everything else below is a direct libc binding.
 pub extern("c") fn nova_ffi_errno(): int;
 pub extern("c") fn nova_ffi_set_errno(v: int): void;
 pub extern("c") fn nova_set_nonblock(fd: int): int;
@@ -34,29 +22,14 @@ pub extern("c") fn read(fd: int, buf: ptr, count: long): long;
 pub extern("c") fn write(fd: int, buf: ptr, count: long): long;
 pub extern("c") fn close(fd: int): int;
 
-// fd passing over a connected AF_UNIX socket (SCM_RIGHTS). These are runtime shims (core.cpp), not
-// bare libc, because the fd rides in a struct msghdr/cmsghdr ancillary block whose layout is not
-// expressible over the raw-bytes idiom and differs by kernel. nova_send_fd sends `fd` plus `len`
-// payload bytes; nova_recv_fd receives an fd (written to *out_fd, -1 if none) plus up to `cap` bytes.
 pub extern("c") fn nova_send_fd(sock: int, data: ptr, len: long, fd: int): long;
 pub extern("c") fn nova_recv_fd(sock: int, buf: ptr, cap: long, out_fd: ptr): long;
 
-// Coarse blocking sleep in milliseconds — for polling / retry backoffs (no reactor involved).
 pub extern("c") fn nova_sleep_ms(ms: long): void;
 
-// Process environment (M6: process shims in Nova over os/sys). getenv returns a pointer into the
-// process environment (do not free it); setenv copies. The string marshalling wrappers are in
-// std/env.nova, which owns the allocator import.
 pub extern("c") fn getenv(name: ptr): ptr;
 pub extern("c") fn setenv(name: ptr, value: ptr, overwrite: int): int;
 
-// File and directory syscalls (M5: file and directory I/O in Nova over os/sys). These
-// bind libc directly except open, which is variadic (int open(const char*, int, ...)) and so
-// mispasses its mode argument on arm64 through a non-variadic FFI declaration, the same hazard
-// as fcntl; nova_open is a two-line runtime shim that forwards mode correctly. On arm64 macOS
-// the plain stat/opendir/readdir symbols are already the 64-bit-inode variants (no $INODE64
-// suffix), so they bind by name. struct stat and struct dirent are read as raw byte buffers
-// at fixed macOS/BSD offsets, the same systems idiom this module uses for sockaddr and kevent.
 pub extern("c") fn nova_open(path: ptr, flags: int, mode: int): int;
 pub extern("c") fn lseek(fd: int, offset: long, whence: int): long;
 pub extern("c") fn fsync(fd: int): int;
@@ -73,28 +46,15 @@ pub extern("c") fn opendir(path: ptr): ptr;
 pub extern("c") fn readdir(dir: ptr): ptr;
 pub extern("c") fn closedir(dir: ptr): int;
 
-// Anonymous memory mapping (M8: the allocator page source is raw kernel pages, not libc malloc).
-// mapAnon requests `length` bytes of zero-filled read/write private memory straight from the kernel;
-// a Nova bump arena can back itself with this instead of nova_bytes_alloc. mmap returns MAP_FAILED
-// (a pointer of all ones) on error, which mapAnon reports as 0.
 pub extern("c") fn mmap(addr: ptr, length: long, prot: int, flags: int, fd: int, offset: long): ptr;
 pub extern("c") fn munmap(addr: ptr, length: long): int;
 
-// These are FUNCTIONS, not consts, and deliberately so: a const whose initializer names a value in
-// another module does not fold in this compiler (it reports the name as undefined, and a same-named
-// one recurses until the stack dies). A function body evaluates normally, so the per-OS seam in
-// os/backend can still be the single source of truth for values that genuinely differ by kernel.
 
-// mmap prot and flag bits. PROT_*/MAP_PRIVATE agree across POSIX; MAP_ANON does NOT (0x1000 on
-// macOS/BSD, 0x20 on Linux), so it comes from the per-OS seam.
 pub const PROT_READ: int = 1;
 pub const PROT_WRITE: int = 2;
 pub const MAP_PRIVATE: int = 2;
 pub fn MAP_ANON(): int { return backend.MMAP_ANON; }
 
-// open(2) flags and lseek whence. The access modes are 0/1/2 everywhere; the creation and status
-// flags are NOT (O_CREAT is 0x200 on macOS but 0x40 on Linux), so those come from the per-OS seam.
-// Getting them wrong does not fail loudly — open() just does the wrong thing.
 pub const O_RDONLY: int = 0;
 pub const O_WRONLY: int = 1;
 pub const O_RDWR: int = 2;
@@ -106,21 +66,14 @@ pub const SEEK_CUR: int = 1;
 pub const SEEK_END: int = 2;
 pub const F_OK: int = 0;
 
-// struct stat st_mode bits (S_IFMT masks the file-type field). Portable POSIX octal values,
-// written here in decimal: S_IFMT 0170000, S_IFDIR 0040000, S_IFREG 0100000, S_IFLNK 0120000.
 pub const S_IFMT: int = 61440;
 pub const S_IFDIR: int = 16384;
 pub const S_IFREG: int = 32768;
 pub const S_IFLNK: int = 40960;
 
-// struct stat and struct dirent are read as raw bytes at fixed offsets, and those offsets differ by
-// kernel (macOS puts st_mode at 4, Linux at 24; d_name is at 21 vs 19). Both come from the per-OS
-// seam. DIRENT_NAME_OFF is public because io/dir walks the entry itself.
 pub fn STAT_MODE_OFF(): int { return backend.STAT_MODE_OFFSET; }
 pub fn DIRENT_NAME_OFF(): int { return backend.DIRENT_NAME_OFFSET; }
 
-// A fresh NUL-terminated C string copy of a Nova string (Nova strings are length-prefixed, not
-// NUL-terminated). The caller owns the buffer and must bytes.free it after the call returns.
 pub fn cstr(s: string): ptr {
     let n = s.length;
     let b = bytes.alloc(n + 1);
@@ -130,7 +83,6 @@ pub fn cstr(s: string): ptr {
     return b;
 }
 
-// True if the path exists (any file type), via access(F_OK). Matches the old fs::exists.
 pub fn pathExists(path: string): bool {
     let cp = cstr(path);
     let r = access(cp, F_OK);
@@ -138,8 +90,6 @@ pub fn pathExists(path: string): bool {
     return r == 0;
 }
 
-// The st_mode of a path, or -1 if the path cannot be stat'd. Callers mask with S_IFMT to test
-// the file type (for example (mode & S_IFMT) == S_IFDIR for "is a directory").
 pub fn pathStatMode(path: string): int {
     let cp = cstr(path);
     let buf = bytes.alloc(160);
@@ -150,47 +100,34 @@ pub fn pathStatMode(path: string): int {
     return m;
 }
 
-// True if the path exists and is a directory.
 pub fn pathIsDir(path: string): bool {
     let m = pathStatMode(path);
     if (m < 0) { return false; }
     return (m & S_IFMT) == S_IFDIR;
 }
 
-// Memory/scan primitives. On modern macOS and Linux these libc functions are SIMD-optimized
-// (NEON/AVX), so they are the fast delimiter-scan and compare the HTTP parser (picohttpparser
-// model) and the string library route through, without first-class vector codegen.
 pub extern("c") fn memchr(s: ptr, c: int, n: long): ptr;
 pub extern("c") fn memcmp(a: ptr, b: ptr, n: long): int;
 pub extern("c") fn memcpy(dst: ptr, src: ptr, n: long): ptr;
 pub extern("c") fn memmove(dst: ptr, src: ptr, n: long): ptr;
 
-// Address families and socket types (portable POSIX values).
 pub const AF_INET: int = 2;
 pub const SOCK_STREAM: int = 1;
 pub const SOCK_DGRAM: int = 2;
-// SOL_SOCKET() is 0xffff on macOS/BSD but 1 on Linux; O_NONBLOCK() is 0x4 vs 0x800. Per-OS seam.
 pub fn SOL_SOCKET(): int { return backend.SOCKOPT_LEVEL; }
 pub fn O_NONBLOCK(): int { return backend.OPEN_NONBLOCK; }
 pub const F_GETFL: int = 3;
 pub const F_SETFL: int = 4;
 
-// AF_UNIX differs by platform (1 on both Linux and macOS for the common case).
 pub const AF_UNIX: int = 1;
 
-// SO_ERROR() reads (and clears) the pending socket error, used after a non-blocking connect reports
-// writability to tell success from failure. 0x1007 on macOS/BSD, 4 on Linux — per-OS seam.
 pub fn SO_ERROR(): int { return backend.SOCKOPT_ERROR; }
 
-// SO_REUSEPORT() lets N reactor threads each bind the same port (kernel load-balances accepts), the
-// share-nothing multi-core listener. 0x0200 on macOS/BSD, 15 on Linux — per-OS seam.
 pub fn SO_REUSEPORT(): int { return backend.SOCKOPT_REUSEPORT; }
 
 pub fn errno(): int { return nova_ffi_errno(); }
 pub fn clearErrno(): void { nova_ffi_set_errno(0); }
 
-// Read the pending socket error via getsockopt(SO_ERROR()); 0 means the (non-blocking) connect
-// succeeded, non-zero is the errno of the failure.
 pub fn soError(fd: int): int {
     let val = bytes.alloc(4);
     let len = bytes.alloc(4);
@@ -205,8 +142,6 @@ pub fn soError(fd: int): int {
 
 pub fn newSocket(domain: int, type_: int): int { return socket(domain, type_, 0); }
 
-// socketpair returns a connected pair of fds. Returns the two fds as a tuple, or
-// (-1, -1) on failure (check errno()).
 pub fn newSocketPair(domain: int, type_: int): (int, int) {
     let sv = bytes.alloc(8);
     let r = socketpair(domain, type_, 0, sv);
@@ -221,13 +156,9 @@ pub fn newSocketPair(domain: int, type_: int): (int, int) {
 }
 
 pub fn setNonBlocking(fd: int): int {
-    // Uses a runtime shim, because fcntl is variadic and a non-variadic FFI declaration
-    // mispasses the flag argument on arm64 (varargs go on the stack, not in registers).
     return nova_set_nonblock(fd);
 }
 
-// Set SO_REUSEPORT() so several reactor threads can bind the same port. Pure Nova over setsockopt
-// (M6); no runtime shim, unlike setNonBlocking, because setsockopt is not variadic.
 pub fn setReusePort(fd: int): int {
     let one = bytes.alloc(4);
     bytes.write_i32(one, 0, 1);
@@ -236,9 +167,6 @@ pub fn setReusePort(fd: int): int {
     return r;
 }
 
-// Map `length` bytes of anonymous, zero-filled, read/write memory from the kernel, or 0 on failure.
-// The caller owns the mapping and must sys.unmap(addr, length) it. mmap returns MAP_FAILED (an
-// all-ones pointer) on error, reported here as 0.
 pub fn mapAnon(length: long): ptr {
     let p = mmap(0, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON(), -1, 0);
     let pl = p as long;
@@ -248,14 +176,10 @@ pub fn mapAnon(length: long): ptr {
     return p;
 }
 
-// Unmap a region returned by mapAnon. Returns 0 on success.
 pub fn unmap(addr: ptr, length: long): int {
     return munmap(addr, length);
 }
 
-// Build a `struct sockaddr_in` (16 bytes) in a fresh buffer: sin_family (u16),
-// sin_port (u16, network byte order), sin_addr (u32, network byte order), then
-// 8 zero bytes of sin_zero. The caller owns the returned buffer and must free it.
 pub fn makeSockaddrIn(port: int, addrBE: long): ptr {
     let sa = bytes.alloc(16);
     let i = 0;
@@ -266,8 +190,6 @@ pub fn makeSockaddrIn(port: int, addrBE: long): ptr {
     return sa;
 }
 
-// The local port a socket is bound to, host byte order. Used to read back the ephemeral port
-// after bind(port 0), so a loopback test never collides on a fixed port. Returns -1 on failure.
 pub fn boundPort(fd: int): int {
     let sa = bytes.alloc(16);
     let len = bytes.alloc(4);
@@ -279,8 +201,6 @@ pub fn boundPort(fd: int): int {
     return p;
 }
 
-// Host to network short (16-bit byte swap). x86 and arm are little-endian, so the
-// network (big-endian) order is the byte-swapped value.
 pub fn htons(x: int): int {
     let lo = x & 255;
     let hi = (x >> 8) & 255;

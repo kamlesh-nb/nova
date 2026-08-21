@@ -1,5 +1,3 @@
-// file.writeTextOk reports whether a write actually succeeded (writeText returns void and hides failure).
-// Callers writing to privileged sinks (cgroup limits, sysfs) need this to detect a silent downgrade.
 import io.file;
 import assert;
 
@@ -12,6 +10,5 @@ fn write_ok_to_writable_path(): void {
 
 @test
 fn write_ok_false_on_bad_path(): void {
-    // A path whose parent directory does not exist cannot be opened -> false, not a silent success.
     assert.isTrue(!file.File.writeTextOk("/no/such/dir/nova_413.txt", "x"));
 }

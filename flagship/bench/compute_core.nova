@@ -1,8 +1,6 @@
 import serde.source;
 import string;
 
-// Flagship CreateProduct compute core (the handler minus async + DB): the exact
-// per-request work a host-embedded wasm module would run — bind, validate, render.
 pub struct CreateProduct {
     pub name: string,
     pub price: int,

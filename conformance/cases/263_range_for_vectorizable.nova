@@ -1,8 +1,3 @@
-// A `for (i in 0..n)` range loop is Nova's vectorizable loop idiom: the counter is a clean i64 induction
-// variable (the increment is a plain `add i64`, not the 32-bit trunc/sext canonicalization a `while` +
-// `int` counter emits), so LLVM's scalar-evolution recognizes it and array loops auto-vectorize (NEON).
-// This gates correctness of range-for over primitive arrays; the vectorization is a codegen optimization
-// (measured ~7x faster than the while+int form). See docs/design/perf-ceiling.md.
 import assert;
 
 fn saxpy(a: double[128], b: double[128], c: double[128], s: double, n: int): void {
@@ -23,7 +18,7 @@ fn range_for_saxpy(): void {
     let a: double[128] = [1.0; 128];
     let b: double[128] = [2.0; 128];
     let c: double[128] = [0.0; 128];
-    saxpy(a, b, c, 3.0, 128);            // 1*3 + 2 = 5, every lane
+    saxpy(a, b, c, 3.0, 128);
     assert.isTrue(c[0] > 4.99 && c[0] < 5.01);
     assert.isTrue(c[127] > 4.99 && c[127] < 5.01);
 }
@@ -34,16 +29,15 @@ fn range_for_reduction(): void {
     for (i in 0..16) { a[i] = (i as double); }
     let s = 0.0;
     for (i in 0..16) { s = s + a[i]; }
-    assert.isTrue(s > 119.9 && s < 120.1);   // 0+1+...+15 = 120
+    assert.isTrue(s > 119.9 && s < 120.1);
 }
 
 @test
 fn range_for_partial_bound(): void {
-    // n < array length: only the first n elements are touched
     let a: int[10] = [7; 10];
     for (i in 0..4) { a[i] = i; }
     assert.equalInt(0, a[0]);
     assert.equalInt(3, a[3]);
-    assert.equalInt(7, a[4]);                // untouched
+    assert.equalInt(7, a[4]);
     assert.equalInt(7, a[9]);
 }

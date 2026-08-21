@@ -103,7 +103,7 @@ pub struct List<T> {
         let i = 0;
         let j = self.data.count() - 1;
         while (i < j) {
-            self.data.swap(i, j);   // ARC-neutral raw swap (a 3-`set` swap would UAF on owned elements)
+            self.data.swap(i, j);
             i = i + 1;
             j = j - 1;
         }
@@ -176,10 +176,6 @@ pub struct List<T> {
         return self.indexOf(value) != -1;
     }
 
-    // Deep copy: a fresh List with its own RawBuffer holding copies of every element (owned elements are
-    // retained by push). Used by the compiler to give value semantics to a value struct that has a List
-    // field -- a byte-copy of such a struct would otherwise share this buffer (channel 4). Reuses slice,
-    // which is the proven allocate-new-buffer-and-copy path.
     pub fn copy(self: List<T>): List<T> {
         return self.slice(0, self.data.count());
     }
@@ -212,20 +208,12 @@ pub struct List<T> {
         return out;
     }
 
-    // Sift the element at `root` down a max-heap of size `n` so the subtree rooted there satisfies the heap
-    // property. Only SWAPS element handles (no temp buffer, no retain/release), so it is ARC-neutral: it just
-    // reorders the same set of owned pointers, which is what keeps heapsort safe where a merge-sort scratch
-    // List (whose drop would release aliased elements -> double-free) was not.
     fn heapSiftDown(self: List<T>, root: int, n: int, cmp: (T, T) -> int): void {
         let i = root;
         while (true) {
             let largest = i;
             let left = 2 * i + 1;
             let right = 2 * i + 2;
-            // Bind each element to a LOCAL before the comparator call. Passing `self.data.at(x)` (which
-            // retains an owned element) DIRECTLY as a function-pointer argument mishandles the ARC of the
-            // temporary in this generic context and can hand the comparator a freed pointer (a pre-existing
-            // codegen quirk shared with the old insertion sort); a local gives it a clean, scoped lifetime.
             if (left < n) {
                 let el = self.data.at(left);
                 let elg = self.data.at(largest);
@@ -242,14 +230,11 @@ pub struct List<T> {
         }
     }
 
-    // O(n log n) in-place heapsort (was insertion sort, O(n^2)). Not stable; the criterion is the complexity.
     pub fn sort(self: List<T>, cmp: (T, T) -> int): void {
         let n = self.data.count();
         if (n < 2) { return; }
-        // Build a max-heap bottom-up.
         let start = n / 2 - 1;
         while (start >= 0) { self.heapSiftDown(start, n, cmp); start = start - 1; }
-        // Repeatedly move the current max to the end of the unsorted region and re-heapify.
         let end = n - 1;
         while (end > 0) {
             self.data.swap(0, end);
@@ -363,7 +348,6 @@ pub struct List<T> {
             let largest = i;
             let left = 2 * i + 1;
             let right = 2 * i + 2;
-            // Bind to locals before the key function (same ARC-of-temporary reason as heapSiftDown).
             if (left < n) {
                 let el = self.data.at(left);
                 let elg = self.data.at(largest);
@@ -380,7 +364,6 @@ pub struct List<T> {
         }
     }
 
-    // O(n log n) in-place heapsort by an int key (was insertion sort, O(n^2)).
     pub fn sortBy(self: List<T>, key: (T) -> int): void {
         let n = self.data.count();
         if (n < 2) { return; }

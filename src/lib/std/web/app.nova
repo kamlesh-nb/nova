@@ -24,19 +24,8 @@ import bytes;
 import assert;
 import env;
 
-// The request-dispatch mediator lives in web.mediator (MessageHandler + the async pipeline). The App
-// composes it; it no longer declares its own. `text`/`json`/`html` response helpers also live there,
-// and the thin wrappers below delegate to them so `app.text/json/html` keeps working.
 
-// Routing lives in web.routing (the single Router: Route table + parsePattern + typed matcher). The App
-// composes a Router for its route table and matches through `router.resolve`; it does not re-roll its
-// own segment type or matching loop. Path parsing (pathSegs / isAllDigits) and request-body parsing
-// (MultiMapSource / formSource / multipartSource) live in web.request -- the App calls them as
-// `request.*` below.
 
-// `text`/`json`/`html` response helpers live in web.mediator (their single definition). Because
-// web.app imports web.mediator, they remain in scope for any module that imports web.app -- so a bare
-// `json(...)` in a handler still resolves, with no duplicate definition to make it ambiguous.
 
 pub class App {
     pub router: routing.Router,
@@ -56,20 +45,13 @@ pub class App {
     pub tlsCert: string,
     pub tlsKey: string,
 
-    // Response gzip is OFF by default: the pure-Nova DEFLATE is CPU-heavy (it dominated a profile of the
-    // server -- ~60% of CPU compressing every response), so paying it on every request is the wrong
-    // default. Opt in with `app.useGzip()` when responses are large/compressible enough to be worth it.
     pub gzipEnabled: bool,
 
-    // The port the single reactor binds/serves on. Carried on the App so the reactor serve body reads it
-    // off the App rather than threading a separate parameter through.
     pub serverPort: int,
 
     init() {
         self.router = routing.Router();
         self.provider = ServiceCollection().buildServiceProvider();
-        // The runtime mediator: the compiler-generated `__registerHandlers` populates it with a handler
-        // adapter (and any validators) for every request type that implements `Message`.
         self.mediator = mediator.Mediator(self.provider);
         __registerHandlers(self.mediator);
         self.static_mounts = List<static_content.StaticMount>();
@@ -85,8 +67,6 @@ pub class App {
         self.serverPort = 0;
     }
 
-    // Opt in to response gzip (Content-Encoding: gzip for compressible responses >= 256 bytes when the
-    // client sends Accept-Encoding: gzip). Off by default -- see the gzipEnabled field note.
     pub fn useGzip(self: App): void {
         self.gzipEnabled = true;
     }
@@ -109,14 +89,9 @@ pub class App {
 
     pub fn useServices(self: App, sc: ServiceCollection): void {
         self.provider = sc.buildServiceProvider();
-        // The mediator opens a scope off this provider for every `send`, so handlers and behaviours
-        // share per-request scoped services (a DB connection, a unit of work).
         self.mediator.setProvider(self.provider);
     }
 
-    // Register a cross-cutting behaviour that wraps every handler (logging, validation, timing, auth).
-    // Behaviours run in registration order (first registered is outermost); each calls
-    // `await next.proceed(ctx)` to continue, and may short-circuit by returning a Response.
     pub fn useBehavior(self: App, behavior: mediator.PipelineBehavior): void {
         self.mediator.useBehavior(behavior);
     }
@@ -134,10 +109,6 @@ pub class App {
         return undefined;
     }
 
-    // Dispatch a request and WRITE the response straight to the socket. The common (non-cacheable) path
-    // writes the header block and the body as two separate sends, so a large body is written directly from
-    // its own buffer -- avoiding the serialize()-into-a-buffer + toString() double-copy (two full body
-    // copies per request). Cacheable GET responses still build one string (the cache stores it).
     pub async fn respondMissTo(self: App, io: aio.AsyncIO, raw: string, method: string, path: string): int {
         let req = request.Request.fromString(raw);
         let resp = await self.dispatch(req);
@@ -155,13 +126,10 @@ pub class App {
         }
 
         if (string.eql(method, "GET") && !didGzip && self.cacheable.get(path) != undefined) {
-            let out = resp.serialize();                       // cacheable: one string, stored in the cache
+            let out = resp.serialize();
             self.cache.set(path, string.slice(out, 0, out.length));
             return await io.sendStr(out);
         }
-        // Response write. For a SMALL body, concatenate the header block + body and send in ONE syscall --
-        // one write beats two when the extra copy is cheap. For a LARGE body (>= 64 KB) keep the two-part
-        // write (header first, then the body from its own buffer) so we never re-copy a big payload.
         let hdrs = resp.serializeHeaders();
         if (resp.body.length == 0) { return await io.sendStr(hdrs); }
         if (resp.body.length < 65536) { return await io.sendStr(hdrs + resp.body); }
@@ -173,10 +141,6 @@ pub class App {
         self.static_mounts.push(static_content.StaticMount(prefix, dir, 128));
     }
 
-    // Route registration delegates to the single Router. The key is serde.typeName<TReq>() -- the same
-    // string the compiler registers the handler adapter under -- so a matched route resolves to its
-    // handler through the mediator. The handler itself is discovered by its `RequestHandler<TReq, _>`
-    // impl; there is nothing to register beyond the route.
     pub fn get<TReq>(self: App, path: string): void {
         self.router.__addRoute("GET", path, serde.typeName<TReq>());
     }
@@ -193,12 +157,7 @@ pub class App {
         self.router.__addRoute("PATCH", path, serde.typeName<TReq>());
     }
 
-    // Build the ValueSource the handler binds from: the body (JSON / form / multipart) for methods that
-    // carry one, with the path params overlaid so a @fromRoute field wins over @fromBody. A GET has no
-    // body, so it binds from the params alone.
     fn sourceFor(self: App, req: Request, params: Map<string, string>): ValueSource {
-        // Overlay route params on the query string so a GET binds both `?a=b` filters and `{id}` path
-        // params into its request DTO (route params win on a key clash).
         let merged = Map<string, string>(8, string.hash);
         req.query.forEach((k, v) => { merged.set(k, v); });
         params.forEach((k, v) => { merged.set(k, v); });
@@ -223,11 +182,6 @@ pub class App {
             return response.Response(Status.BadRequest, "Bad Request: invalid path parameter");
         }
         if (m.matched) {
-            // Bind the request source (route params over body), then hand off to the runtime mediator:
-            // the compiler-generated `__mediator_dispatch_runtime` binds the typed request, widens it,
-            // and calls `mediator.send`, which picks the handler by request type, opens a per-request DI
-            // scope, runs the behaviour pipeline (validation, transactions, logging), and returns the
-            // Response. The App never knows about handlers; it binds and sends.
             let src = self.sourceFor(req, m.params);
             return await __mediator_dispatch_runtime(m.key, src, self.mediator);
         }
@@ -251,41 +205,20 @@ pub class App {
     }
 
     pub fn run(self: App, port: int): void {
-        // A web app is ALWAYS single-reactor: one reactor, one thread, per PROCESS. The reactor runs
-        // INLINE on this (the calling) thread, so the App and its DI provider never cross a thread
-        // boundary, which is what keeps per-request service resolution correct and lets ARC stay
-        // non-atomic. TLS is included (serveReactorConn tlsAccepts when useTls is set). No Asio: the
-        // reactor path carries the whole server (M4).
-        //
-        // To use more cores, run more INSTANCES of the binary (each with its own NOVA_PORT) behind proxyd
-        // and let the orchestrator manage the replicas -- see the deployment guide. That is the one
-        // supported scaling model; there is no in-process multi-reactor worker mode.
         self.serverPort = port;
-        // fd-passing handoff mode: when NOVA_HANDOFF_SOCK names proxyd's AF_UNIX rendezvous, this app
-        // does NOT bind a TCP port. Instead it connects to proxyd and serves client SOCKETS that proxyd
-        // hands over (SCM_RIGHTS), replying to each client directly. proxyd is then out of the data path.
-        // Single-reactor as always; the received fds are served with the identical request pipeline.
         let handoff = env.get("NOVA_HANDOFF_SOCK");
         if (!string.eql(handoff, "")) {
             reactorHandoffBody(self, handoff);
             return;
         }
-        // Nova web is SINGLE-REACTOR by design: one reactor, one thread, per process. To use more cores,
-        // run more INSTANCES of the binary behind proxyd and let the orchestrator manage the replicas --
-        // that is the one supported scaling model. There is no in-process multi-reactor worker mode.
         reactorWorkerBody(self, 0);
     }
 }
 
-// HTTP wire framing (bufFindHeaderEnd / bufFindCI / bufContentLength / bufIsChunked / bufChunkedEnd /
-// bufDechunk / bufMethodPath) now lives in web.request -- it is request parsing, not app logic. The
-// server reader below calls it qualified as `request.*`. Only errResponse (a canned error REPLY, a
-// response concern) stays here with the server.
 fn errResponse(code: int, reason: string): string {
     return `HTTP/1.1 ${code} ${reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`;
 }
 
-// Read exactly n bytes from io into buf[off..]; false on EOF/error.
 async fn h2ReadN(io: AsyncIO, buf: long, off: int, n: int): bool {
     let got = 0;
     while (got < n) {
@@ -302,10 +235,6 @@ fn h2BufToStr(buf: long, len: int): string {
     return buf as string;
 }
 
-// Serve one HTTP/2 connection: verify the preface, exchange SETTINGS, then decode each request's HEADERS
-// with HPACK, dispatch it through the SAME mediator/routing as HTTP/1.1 (await self.dispatch), and write the
-// response as HEADERS + DATA. PING is answered; SETTINGS is ACKed; GOAWAY ends the loop. One
-// request/response per stream (no request body), which covers hypermedia GET/POST-form traffic.
 async fn handleConnH2(app: App, io: AsyncIO): int {
     let dec = hpack.newHpack();
     let enc = hpack.newHpack();
@@ -361,7 +290,6 @@ async fn handleConnH2(app: App, io: AsyncIO): int {
                         while (hi < hk.size()) {
                             let key = hk.get(hi) ?? "";
                             let lk = h2Lower(key);
-                            // Connection-specific headers are illegal in HTTP/2.
                             if (lk != "connection" && lk != "keep-alive" && lk != "transfer-encoding" && lk != "upgrade") {
                                 rf.push(hpack.HeaderField(lk, resp.headers.get(key) ?? ""));
                             }
@@ -508,8 +436,6 @@ async fn handleConn(app: App, io: AsyncIO): int {
                 bytes.read_string(buf, hdrEnd) + "\r\n\r\n" + chunkedBody
             else
                 bytes.read_string(buf, reqEnd);
-            // P2: respondMissTo writes the header block and the body as two separate sends, so a large body
-            // is written straight from its own buffer -- no serialize append + toString double-copy.
             let sent = await app.respondMissTo(io, raw, method, path);
         }
 
@@ -531,20 +457,10 @@ async fn handleConn(app: App, io: AsyncIO): int {
 }
 
 
-// Handle one connection on the Nova reactor (M2 of the C++ runtime retirement plan): wrap the
-// accepted fd in a reactor-native AsyncStream (kq set) and run the same request pipeline as the
-// Asio path. Because handleConn takes the AsyncIO trait and AsyncStream is reactor-native when kq>0,
-// the whole request (parse, mediator, handler, response, and any await to a reactor-native database
-// connection) runs on the reactor with no Asio.
 pub async fn serveReactorConn(app: App, fd: int, kq: int): int {
     let s = aio.AsyncStream(fd as long);
     s.kq = kq;
     if (app.tlsEnabled) {
-        // Inbound TLS on the reactor: the pure-Nova TLS 1.3 memory-BIO (TlsStream over net/tlsmembio) does its socket I/O
-        // through the reactor-native AsyncStream, so the handshake and data path run on the reactor,
-        // no Asio. TlsStream itself is an AsyncIO, so handleConn is unchanged.
-        // Offer HTTP/2 via ALPN ("h2") with an HTTP/1.1 fallback. If the client negotiates h2 we run the
-        // HTTP/2 framing loop; otherwise the connection is served as HTTP/1.1 exactly as before.
         let tls = await asynctls.tlsAcceptAlpn(s, app.tlsCert, app.tlsKey, "h2,http/1.1");
         if (!tls.ok()) {
             tls.close();
@@ -558,10 +474,6 @@ pub async fn serveReactorConn(app: App, fd: int, kq: int): int {
     return await handleConn(app, s);
 }
 
-// Accept loop as a reactor coroutine (completion model): await one accepted connection at a time and
-// spawn a serve coroutine for it. This replaces the old inline "listener readable -> drain backlog"
-// branch, so the reactor's poll loop is uniform (every ready item is just a coroutine to resume) and
-// maps directly onto IOCP AcceptEx. Loops forever.
 async fn reactorAcceptLoop(app: App, lfd: int, kq: int): void {
     while (true) {
         let s = await eventedio.reactorAccept(lfd, kq);
@@ -571,14 +483,11 @@ async fn reactorAcceptLoop(app: App, lfd: int, kq: int): void {
     }
 }
 
-// One reactor worker thread: its own reactor, its own SO_REUSEPORT listener on the shared port (the
-// kernel load-balances connections across the threads), its own coroutines. Share-nothing: the only
-// thing crossing threads is the App configuration, which is read-only during serving. Loops forever.
 fn reactorWorkerBody(app: App, idx: int): void {
     let lfd = sys.socket(sys.AF_INET, sys.SOCK_STREAM, 0);
     let one = bytes.alloc(4);
     bytes.write_i32(one, 0, 1);
-    sys.setsockopt(lfd, sys.SOL_SOCKET(), 4, one, 4);   // SO_REUSEADDR
+    sys.setsockopt(lfd, sys.SOL_SOCKET(), 4, one, 4);
     sys.setReusePort(lfd);
     bytes.free(one);
     let sa = sys.makeSockaddrIn(app.serverPort, 0);
@@ -605,15 +514,8 @@ fn reactorWorkerBody(app: App, idx: int): void {
     }
 }
 
-// fd-passing handoff receiver: instead of accepting TCP, receive client SOCKETS that proxyd hands over
-// its AF_UNIX control channel (SCM_RIGHTS), and serve each on this reactor with the identical request
-// pipeline (serveReactorConn). The app replies to each client DIRECTLY, so proxyd never sees the
-// response. Each received fd becomes its own coroutine, exactly like an accepted connection.
 async fn handoffRecvLoop(app: App, ctrlFd: int, kq: int): void {
     while (true) {
-        // recvFdOp waits for readability on the reactor and recvmsg's ONE handed-off client fd (or -1 if
-        // proxyd closed the channel). Each received fd becomes its own serve coroutine, exactly like an
-        // accepted connection; the app reads the request off it and replies directly to the client.
         let clientFd = await eventedio.recvFdOp(ctrlFd, kq);
         if (clientFd < 0) { console.log("Nova web: proxyd handoff channel closed"); return; }
         socket.setNonBlock(clientFd);
@@ -621,17 +523,11 @@ async fn handoffRecvLoop(app: App, ctrlFd: int, kq: int): void {
     }
 }
 
-// Single-reactor handoff receiver body: connect to proxyd's rendezvous (retrying, as proxyd may still
-// be starting), then drive the reactor forever serving handed-off connections. Mirrors reactorWorkerBody
-// but with a handoff receive loop in place of the TCP accept loop.
 fn reactorHandoffBody(app: App, sockPath: string): void {
     let ua = socket.makeSockaddrUn(sockPath);
     let ctrl = socket.newUnix();
     let ok = -1;
     let tries = 0;
-    // Retry with a real backoff (20ms) so the app reliably waits for the service to bind the rendezvous,
-    // regardless of launch ordering; ~500 tries ≈ 10s before giving up (a tight spin used to race the
-    // service and exhaust before the socket appeared).
     while (tries < 500) {
         ok = socket.connectSock(ctrl, ua, socket.sockaddrUnLen());
         if (ok == 0) { break; }
@@ -659,13 +555,11 @@ fn reactorHandoffBody(app: App, sockPath: string): void {
     }
 }
 
-// Run the web server on a single Nova reactor (no Asio). Opt-in via runReactor; the default run()
-// keeps the Asio path. Each accepted connection becomes a coroutine driven by the reactor.
 pub fn runReactor(self: App, port: int): void {
     let lfd = sys.socket(sys.AF_INET, sys.SOCK_STREAM, 0);
     let one = bytes.alloc(4);
     bytes.write_i32(one, 0, 1);
-    sys.setsockopt(lfd, sys.SOL_SOCKET(), 4, one, 4);   // SO_REUSEADDR
+    sys.setsockopt(lfd, sys.SOL_SOCKET(), 4, one, 4);
     bytes.free(one);
     let sa = sys.makeSockaddrIn(port, 0);
     if (sys.bind(lfd, sa, 16) != 0) {

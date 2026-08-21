@@ -1,10 +1,3 @@
-// SHA-384 transcript path: a full pure-Nova TLS 1.3 handshake where the SERVER is restricted to
-// AES-256-GCM-SHA384 (0x1302) only -- exactly the "AES-256-GCM-SHA384-only server" that the feature
-// inventory flagged. The client offers all three suites; the server negotiates 0x1302, so the ENTIRE key
-// schedule (transcript hash, HKDF-Expand-Label, Finished HMAC, traffic keys) runs on SHA-384 (kind=1)
-// end to end on both sides. If any part of the SHA-384 branch were wrong the Finished MACs would not
-// verify and the handshake would fail. After the handshake we exchange application data both directions to
-// prove the 48-byte-secret AES-256-GCM record layer works too.
 import net.tlsmembio;
 import bytes;
 import assert;
@@ -43,12 +36,11 @@ fn handshake(cb: tlsmembio.ClientBio, sb: tlsmembio.ServerBio, tmp: ptr): bool {
 fn sha384_only_server_handshake_succeeds(): void {
     let cb = tlsmembio.newClientBio("localhost");
     let sb = tlsmembio.newServerBio(hexBuf(CERT), CERT_LEN, hexBuf(PRIV));
-    sb.restrictSuite(0x1302);                             // server offers ONLY AES-256-GCM-SHA384
+    sb.restrictSuite(0x1302);
 
     let tmp = bytes.alloc(33792);
-    assert.isTrue(handshake(cb, sb, tmp));                // Finished MACs (SHA-384) verify on both sides
+    assert.isTrue(handshake(cb, sb, tmp));
 
-    // Both sides landed on SHA-384 (kind 1), suite index 1 (AES-256-GCM).
     assert.equalInt(1, sb.negotiatedKind());
     assert.equalInt(1, sb.negotiatedSuite());
     assert.equalInt(1, cb.negotiatedKind());
@@ -63,10 +55,9 @@ fn sha384_record_layer_roundtrips_app_data(): void {
     let tmp = bytes.alloc(33792);
     assert.isTrue(handshake(cb, sb, tmp));
 
-    // Client -> server application record under the AES-256-GCM-SHA384 keys.
     let msg = bytes.alloc(5);
     bytes.write_byte(msg, 0, 104); bytes.write_byte(msg, 1, 101); bytes.write_byte(msg, 2, 108);
-    bytes.write_byte(msg, 3, 108); bytes.write_byte(msg, 4, 111);   // "hello"
+    bytes.write_byte(msg, 3, 108); bytes.write_byte(msg, 4, 111);
     let w = cb.writeApp(msg, 5);
     assert.isTrue(w > 0);
     while (cb.pendingOut() > 0) { let n = cb.pull(tmp, 33792); sb.feed(tmp, n); }

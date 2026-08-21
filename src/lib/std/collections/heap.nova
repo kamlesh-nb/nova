@@ -1,6 +1,3 @@
-// Heap<T> -- a binary min-heap (priority queue) over a List<T>, ordered by a caller-supplied `less`
-// comparator (less(a, b) == true means a has higher priority / comes out first). Generic T cannot be
-// compared with `<` uniformly, so ordering is passed in explicitly. push/pop are O(log n). (T15.)
 
 import list;
 
@@ -26,7 +23,6 @@ pub class Heap<T> {
     pub fn push(self: Heap<T>, v: T): void {
         self.data.push(v);
         let i = self.data.size() - 1;
-        // sift up while smaller than parent
         while (i > 0) {
             let parent = (i - 1) / 2;
             let cur = self.data.get(i) ?? v;
@@ -37,7 +33,6 @@ pub class Heap<T> {
         }
     }
 
-    // Remove and return the minimum (root), or undefined if empty.
     pub fn pop(self: Heap<T>): T | undefined {
         let n = self.data.size();
         if (n == 0) { return undefined; }
@@ -45,9 +40,8 @@ pub class Heap<T> {
         let lastIdx = n - 1;
         let lastVal = self.data.get(lastIdx);
         self.data.set(0, lastVal ?? (root ?? lastVal));
-        self.data.pop();          // drop the now-duplicated last slot
+        self.data.pop();
         let sz = self.data.size();
-        // sift down
         let i = 0;
         let f = self.less;
         while (true) {

@@ -1,7 +1,3 @@
-// Regression: copying a generic struct that has a container field of its OWN type parameter (`List<T>`),
-// instantiated in a DIFFERENT module, used to SEGFAULT the compiler -- cross-module mono does not substitute
-// the value-struct field type, so the container-copy path looked up a `List<T>` copy fn and dereferenced a
-// garbage ref. Now it falls back to a retain-alias (shared container) instead of crashing.
 import list;
 import assert;
 struct Box<T> {
@@ -14,6 +10,6 @@ struct Box<T> {
 fn xmod_generic_container_copy(): void {
     let b = Box<int>();
     b.add(7);
-    let b2 = b;                     // COPY -> value-struct owned-field retain path (was the crash)
+    let b2 = b;
     assert.equalInt(b2.depth(), 1);
 }

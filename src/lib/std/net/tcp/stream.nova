@@ -2,9 +2,6 @@
 import bytes;
 import os.socket;
 
-// The blocking TCP stream over os/socket (M14.2: was the C nova_socket_* layer). `socket.*` here is the
-// os.socket module; net/tcp/{client,server} and web/client go through the facade fns below so they never
-// import os.socket directly (its qualifier would collide with this module's `socket` qualifier).
 
 pub class TcpStream {
     pub fd: int,
@@ -80,7 +77,6 @@ pub fn closeFd(fd: int): int {
     return socket.close(fd);
 }
 
-// --- facade over os.socket so net/tcp/{client,server} + web/client don't import os.socket directly -----
 pub fn connect(host: string, port: int): int { return socket.connectBlocking(host, port); }
 pub fn setTimeout(fd: int, ms: int): int { return socket.setTimeout(fd, ms); }
 pub fn listenAny(port: int): int { return socket.listenAny(port); }

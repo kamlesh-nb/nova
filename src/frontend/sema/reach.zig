@@ -1,55 +1,126 @@
-// Demand-driven monomorphization — reachability pass (Gap 8 / task #205).
-//
-// Computes the set of function/method DECLS reachable from the program roots via the call graph,
-// so codegen can emit only reachable (instantiation x method) pairs instead of the whole method
-// surface of every generic instantiation (see docs/design/demand-driven-mono.md).
-//
-// Reachability is keyed on the DECL (SymbolId), CONTEXT-INSENSITIVE on type arguments: if `List.push`
-// is reached from any reachable decl, `push` is kept for EVERY `List<T>` (over-approximate -> sound).
-// The same walk drops unreachable subsystems: `aes.encrypt` is reachable only if TLS is reached from a
-// root, so a plaintext app never emits the crypto stack.
-//
-// Phase R0 is report-only (NOVA_REACH_SHADOW): it prints total/reachable/would-drop and the drop list
-// so the set can be audited for soundness before emission is gated in R1.
+//! Whole-program reachability analysis for demand-driven monomorphisation.
+//!
+//! Nova monomorphises generics: `List<int>` becomes a concrete `List_int_*`,
+//! not a type-erased body. Left unchecked, the type-driven monomorphiser emits
+//! the ENTIRE method surface of every generic instantiation, and measurements
+//! showed roughly 93% of the ~28,750 emitted functions were never actually
+//! called. This pass computes the set of functions and methods that are truly
+//! reachable from the program's roots so codegen can prune everything else,
+//! which is what makes builds fast without changing behaviour.
+//!
+//! The algorithm is a plain worklist mark-and-sweep over the typed IR:
+//!
+//!   1. Seed the queue with the ROOTS: every ordinary function and every method
+//!      of a NON-generic (or generic-but-trait-implementing) struct. Concrete
+//!      code is always kept; only a generic struct's own methods are held back
+//!      until a call site proves they are wanted. Under test mode, `@test`
+//!      functions on generic owners are additionally rooted.
+//!   2. Drain the queue: for each reachable function, walk its body AST and
+//!      enqueue every callee resolved by [`infer.TypedIr.expr_syms`], plus the
+//!      constructors of any struct that is constructed (via `struct_init` or a
+//!      call whose callee names a struct type).
+//!   3. A fixpoint fixup adds `delete`/`copy` methods of generic owners whose
+//!      OTHER methods became reachable. This exists because ARC-inserted
+//!      destructor and container copy calls are synthesised in codegen and do
+//!      not appear as ordinary call expressions in the source AST, so the walk
+//!      alone would miss them and drop a live destructor. Missing that was a
+//!      real crash (a pruned vtable destructor of a generic struct).
+//!
+//! Two consumption paths exist. [`Result`] answers "is this SymbolId reachable"
+//! by id, used by codegen when it has the symbol in hand. The module-level
+//! [`reachable_keys`] set plus [`methodIsReachable`] answer the same question by
+//! `owner|method` NAME string, used from places that only have names; it is
+//! populated by [`publish`] and consulted only when [`gate_on`] is set, so with
+//! the gate off everything is treated as reachable and nothing is pruned.
+//!
+//! [`report`] is a report-only diagnostic ("demand-mono shadow") that prints the
+//! would-drop percentage and a sample of dropped decls, so a live-but-dropped
+//! function can be caught by audit before the pruning is trusted. The pass never
+//! mutates the program; it only produces a reachable-set the caller may act on.
 
 const std = @import("std");
+/// The AST node definitions (`Program`, `Statement`, `Expression`, ...) that the
+/// body walk traverses to discover callees and constructions.
 const ast = @import("../ast.zig");
+/// The symbol table and [`SymbolId`] definitions this pass keys its reachable set
+/// on and iterates to find function/method roots.
 const symbols = @import("symbols.zig");
+/// The type-inference pass, whose [`infer.TypedIr`] maps call expressions to the
+/// callee symbols the mark-and-sweep follows.
 const infer = @import("infer.zig");
 
+/// Stable index of a symbol in the [`symbols.SymbolTable`], re-exported here so
+/// callers of this module need not reach into `symbols.zig` directly.
 const SymbolId = symbols.SymbolId;
+/// The semantic-analysis symbol table: the authoritative list of every function,
+/// method, struct and so on, indexed by [`SymbolId`]. Reachability is computed
+/// over the function/method entries of one such table.
 const SymbolTable = symbols.SymbolTable;
+/// The typed intermediate representation produced by inference. Its
+/// `expr_syms` map is how the body walk resolves a call expression to the
+/// [`SymbolId`] of the callee it actually dispatches to.
 const TypedIr = infer.TypedIr;
 
+/// The output of [`compute`]: the set of functions/methods reachable from the
+/// program roots, plus the totals used by [`report`].
+///
+/// Owns its `reachable` map; the caller must call [`Result.deinit`] with the
+/// same allocator that [`compute`] was given.
 pub const Result = struct {
+    /// Set of reachable function/method symbols, keyed by [`SymbolId`] (the
+    /// value is unit — this is a set, not a map). A [`SymbolId`] present here is
+    /// live and must be emitted; anything absent may be pruned by codegen.
     reachable: std.AutoHashMapUnmanaged(SymbolId, void) = .empty,
+    /// Total count of function and method declarations seen in the table. Used
+    /// only as the denominator for the would-drop percentage in [`report`].
     total_fn_decls: usize = 0,
+    /// Count of reachable function/method declarations, i.e. `reachable.count()`
+    /// captured at the end of [`compute`]. Reported against `total_fn_decls`.
     reachable_fn_decls: usize = 0,
 
+    /// Frees the `reachable` map. Pass the allocator used by [`compute`].
     pub fn deinit(self: *Result, gpa: std.mem.Allocator) void {
         self.reachable.deinit(gpa);
     }
 
+    /// Reports whether the symbol `sid` was found reachable. This is the by-id
+    /// query used from codegen when the [`SymbolId`] is already in hand; the
+    /// by-name equivalent is [`methodIsReachable`].
     pub fn contains(self: *const Result, sid: SymbolId) bool {
         return self.reachable.contains(sid);
     }
 };
 
-// ---- Global handoff to codegen (populated in builder.zig/tester.zig, read in collectFunctions) ----
-// Keyed by "owner|method" for methods and bare "name" for free functions, using BASE (non-instantiated)
-// owner names so the gate keeps a reached method for EVERY instantiation (context-insensitive).
+/// Global switch for the by-name reachability gate. When false (the default),
+/// [`methodIsReachable`] answers true for everything, so pruning is a no-op and
+/// the build behaves as if this pass did not run. Codegen turns it on (driven by
+/// `NOVA_REACH_ON`) once the reachable set has been [`publish`]ed.
 pub var gate_on: bool = false;
+/// Module-global set of reachable methods keyed by the string `"owner|method"`,
+/// populated by [`publish`] and read by [`methodIsReachable`].
+///
+/// This exists because some codegen call sites only know the owner and method
+/// NAMES, not the [`SymbolId`], so they cannot use [`Result.contains`]. The set
+/// stores duped key strings owned with the allocator passed to [`publish`]; it
+/// is cleared and rebuilt on each [`publish`], never shrinking its backing
+/// capacity ([`clearRetainingCapacity`]).
 pub var reachable_keys: std.StringHashMapUnmanaged(void) = .empty;
 
-/// True if codegen should EMIT this generic method. Conservative: only a non-constructor method of a
-/// generic struct whose (owner|method) key is absent from the reachable set is dropped. Everything
-/// else (constructors, non-generic, unknown) is kept.
+/// Reports, by NAME, whether a method should be emitted — the by-name twin of
+/// [`Result.contains`], consulted from codegen sites that lack the [`SymbolId`].
+///
+/// Returns true unconditionally when the gate is off ([`gate_on`] false), so
+/// disabling the gate disables pruning entirely. Constructors (`init`/`new`) are
+/// always considered reachable because they are the roots of construction, and
+/// the container `copy` of `List`/`Map`/`Set` is always kept because it is
+/// synthesised by ARC on value copies rather than called explicitly and so would
+/// otherwise be missed. All other methods are looked up in [`reachable_keys`]
+/// under the `"owner_base|method"` key. If formatting that key overflows the
+/// fixed 512-byte buffer the function fails OPEN (returns true), preferring to
+/// keep a method over risking dropping a live one.
 pub fn methodIsReachable(owner_base: []const u8, method: []const u8) bool {
     if (!gate_on) return true;
     if (std.mem.eql(u8, method, "init") or std.mem.eql(u8, method, "new")) return true;
-    // Channel 4 (value-semantics): a value struct with a container field deep-copies that field on copy by
-    // calling the container's `copy` from codegen -- an edge the call-graph walk does not model (like init/
-    // new and vtable dispatch). Keep `copy` for the container types so the monomorphised body is emitted.
     if (std.mem.eql(u8, method, "copy") and
         (std.mem.eql(u8, owner_base, "List") or std.mem.eql(u8, owner_base, "Map") or std.mem.eql(u8, owner_base, "Set")))
         return true;
@@ -58,7 +129,16 @@ pub fn methodIsReachable(owner_base: []const u8, method: []const u8) bool {
     return reachable_keys.contains(key);
 }
 
-/// Populate the name-keyed reachable set from a computed Result. Call once after compute().
+/// Projects a computed [`Result`] into the by-name [`reachable_keys`] set so
+/// [`methodIsReachable`] can serve name-only queries.
+///
+/// Clears the previous contents (retaining capacity), then for every reachable
+/// function/method symbol inserts a key: `"owner|name"` for methods (an owner is
+/// present) or just `name` for free functions. Key strings are allocated with
+/// `gpa` and owned by the set. Per-key allocation failures are skipped silently
+/// (`catch continue` / `catch {}`) rather than propagated, since a missing key
+/// only causes that method to be treated as reachable, which is the safe
+/// direction. Call this after [`compute`] and before setting [`gate_on`].
 pub fn publish(gpa: std.mem.Allocator, res: *const Result, tab: *const SymbolTable) void {
     reachable_keys.clearRetainingCapacity();
     for (tab.symbols.items, 0..) |sym, i| {
@@ -73,45 +153,87 @@ pub fn publish(gpa: std.mem.Allocator, res: *const Result, tab: *const SymbolTab
     }
 }
 
+/// Mutable state threaded through the recursive body walk ([`walkStmt`],
+/// [`walkExpr`], etc.).
+///
+/// Bundles the borrowed inputs (symbol table, typed IR, precomputed name maps)
+/// with the two mutable outputs (the reachable set and the worklist queue) so
+/// the walk functions can stay free functions taking a single `*Ctx`.
 const Ctx = struct {
+    /// Allocator for growing the reachable set and the queue.
     gpa: std.mem.Allocator,
+    /// The symbol table being analysed (borrowed, read-only).
     tab: *const SymbolTable,
+    /// Typed IR whose `expr_syms` resolves call expressions to callee symbols.
     ir: *const TypedIr,
+    /// The reachable set being built — points into [`Result.reachable`].
     reachable: *std.AutoHashMapUnmanaged(SymbolId, void),
+    /// The worklist of symbols discovered-but-not-yet-walked. [`enqueue`] pushes;
+    /// [`compute`]'s drain loop pops from the front.
     queue: *std.ArrayListUnmanaged(SymbolId),
-    // Prebuilt O(1) indices (built ONCE in compute), so the per-expression walk never linear-scans the
-    // symbol table. Without these the walk is O(expressions × symbols) — fine on a 100-symbol test,
-    // minutes on a 30k-symbol app.
+    /// Set of all struct type names, used by [`rootIfConstruction`] to decide
+    /// whether a call whose callee is a bare name is actually a constructor call.
     struct_names: *const std.StringHashMapUnmanaged(void),
+    /// Map from struct owner name to its constructor (`init`/`new`) symbol ids,
+    /// so a construction site can root every matching constructor by name.
     ctors_by_owner: *const std.StringHashMapUnmanaged(std.ArrayListUnmanaged(SymbolId)),
 
+    /// Marks `sid` reachable and, if it was newly added, pushes it onto the
+    /// worklist to be walked. Idempotent: a symbol already in the set is not
+    /// re-queued, which is what makes the mark-and-sweep terminate. Allocation
+    /// failure is swallowed (the symbol is simply not enqueued).
     fn enqueue(self: *Ctx, sid: SymbolId) void {
         const gop = self.reachable.getOrPut(self.gpa, sid) catch return;
         if (gop.found_existing) return;
         self.queue.append(self.gpa, sid) catch {};
     }
 
-    // A struct_init / construction of type `base` roots its init+new constructors (they are not
-    // referenced through expr_syms — the struct_init expr resolves to the TYPE, not the ctor).
+    /// Enqueues every constructor of the struct named `base`, i.e. roots its
+    /// `init`/`new` methods. Called when a value of that struct is constructed so
+    /// its constructor (which may not appear as an ordinary callee) is kept.
     fn enqueueCtors(self: *Ctx, base: []const u8) void {
         if (self.ctors_by_owner.get(base)) |list| {
             for (list.items) |sid| self.enqueue(sid);
         }
     }
 
+    /// Reports whether `name` is the name of a struct type in this program.
     fn isStructName(self: *Ctx, name: []const u8) bool {
         return self.struct_names.contains(name);
     }
 };
 
-// Strip a generic instantiation suffix so `List<int>` / `List__int` reduce to the base name `List`.
+/// Strips a monomorphisation/mangling suffix to recover the plain type name.
+///
+/// A generic instantiation is spelled `List<int>` and a mangled member is
+/// spelled `Owner__method`, so this returns everything before the first `<` or
+/// `__` (whichever appears), letting the analysis key on the base type name
+/// (`List`, `Owner`) regardless of instantiation. Names with neither marker are
+/// returned unchanged.
 fn baseName(name: []const u8) []const u8 {
     if (std.mem.indexOf(u8, name, "<")) |i| return name[0..i];
     if (std.mem.indexOf(u8, name, "__")) |i| return name[0..i];
     return name;
 }
 
-/// Compute the reachable decl set. `is_test` picks the roots: build => `main`, test => every @test fn.
+/// Computes the reachable function/method set for one program.
+///
+/// Runs the three-phase mark-and-sweep described in the module header:
+///   1. Build helper indexes: `struct_names`, `ctors_by_owner` (constructors per
+///      owner), `generic_structs` (structs with type params) and
+///      `generic_trait_structs` (those additionally implementing traits).
+///   2. Root every function and every method whose owner is not a plain generic
+///      struct; a generic struct's own methods are held back, EXCEPT that under
+///      `is_test` a generic owner's `@test` methods are still rooted so tests run.
+///      Then drain the worklist, walking each rooted body and enqueuing callees
+///      and constructors.
+///   3. Fixpoint fixup (bounded to 128 passes): for any generic owner whose
+///      methods became reachable, additionally root its `delete` method and, for
+///      `List`/`Map`/`Set`, its `copy` method — the ARC-synthesised calls the
+///      source walk cannot see — re-draining until the set stops growing.
+///
+/// The returned [`Result`] owns memory and must be freed with [`Result.deinit`].
+/// `tab`, `ir` and `program` are borrowed for the duration of the call only.
 pub fn compute(
     gpa: std.mem.Allocator,
     tab: *const SymbolTable,
@@ -124,9 +246,6 @@ pub fn compute(
     var queue: std.ArrayListUnmanaged(SymbolId) = .empty;
     defer queue.deinit(gpa);
 
-    // Build O(1) lookup indices ONCE (struct-name set + owner->constructors), so the per-expression walk
-    // never linear-scans the symbol table. This is the difference between milliseconds and minutes on a
-    // large app.
     var struct_names: std.StringHashMapUnmanaged(void) = .empty;
     defer struct_names.deinit(gpa);
     var ctors_by_owner: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(SymbolId)) = .empty;
@@ -157,21 +276,8 @@ pub fn compute(
         .ctors_by_owner = &ctors_by_owner,
     };
 
-    // The gate ONLY ever prunes methods of GENERIC structs. So everything else — every free function
-    // and every method of a NON-generic struct — is kept regardless, and must be walked so that the
-    // generic methods IT calls are discovered as reachable. Auto-rooting all of them as walk seeds makes
-    // the walk sound against edges expr_syms doesn't model (trait/vtable dispatch, address-taken serde
-    // binders, closures passed to higher-order fns): the only thing left to prune is a generic-struct
-    // method that NO reachable code calls. Trades a little raw win for provable soundness.
     var generic_structs: std.StringHashMapUnmanaged(void) = .empty;
     defer generic_structs.deinit(gpa);
-    // A generic struct that IMPLS a trait has its trait methods invoked through a VTABLE (dynamic
-    // dispatch), which is an edge the call-graph walk below does not model. Pruning such a method leaves
-    // the vtable slot pointing at a dropped function -> a runtime crash on the first trait call (this was
-    // 307_generic_struct_impl_trait / 364_generic_struct_trait_dispatch). So we treat a generic struct
-    // with any trait impl as NON-prunable: all its methods are rooted, exactly like a non-generic struct.
-    // Over-approximate (a non-trait method of such a struct is kept too) but sound; only affects generic
-    // structs that actually implement a trait, so the extra emission is small.
     var generic_trait_structs: std.StringHashMapUnmanaged(void) = .empty;
     defer generic_trait_structs.deinit(gpa);
     for (program.declarations) |d| {
@@ -189,7 +295,6 @@ pub fn compute(
         const sid: SymbolId = @enumFromInt(@as(u32, @intCast(i)));
         const is_generic_method = sym.kind == .method and
             (if (sym.owner) |o| (generic_structs.contains(o) and !generic_trait_structs.contains(o)) else false);
-        // Seed everything the gate can't prune. Generic-struct methods are left for the walk to reach.
         if (!is_generic_method) {
             ctx.enqueue(sid);
         } else if (is_test and isTestFn(sym)) {
@@ -197,7 +302,6 @@ pub fn compute(
         }
     }
 
-    // BFS over the call graph.
     var head: usize = 0;
     while (head < queue.items.len) {
         const sid = queue.items[head];
@@ -210,21 +314,7 @@ pub fn compute(
         walkBlock(&ctx, fd.body);
     }
 
-    // Destructor->`delete` edge (SOUNDNESS, not perf). A struct's SYNTHETIC destructor
-    // (codegen `__destruct_<T>`) calls the type's `delete` method (arc.zig), but NO Nova call site
-    // references it, so the BFS above never reaches it. For a GENERIC struct that would let demand-mono
-    // prune e.g. `RawBuffer<T>.delete`, and codegen then emits a NO-OP `__destruct_RawBuffer_<T>`
-    // (LLVMGetNamedFunction finds no delete) -> the element run and every element's owned fields LEAK
-    // on drop. (Non-generic `delete` is already seeded, so only generic structs are affected.) Any
-    // generic struct with a reachable method is instantiated and therefore destructed, so keep its
-    // `delete` and continue the BFS so what `delete` calls (slot, per-element drops, nested delete) is
-    // reached too. Iterate to a fixpoint: reaching one `delete` can make a nested generic struct live.
     {
-        // index: generic-struct `delete` method decls, by owner base name. Also index the container `copy`
-        // methods (List/Map/Set) that methodIsReachable force-keeps: `copy` is called from codegen (the
-        // value-semantics container deep-copy edge), not from a Nova call site, so the BFS never reaches it and
-        // its callees (List.copy -> slice -> ...) get pruned, leaving `copy`'s body referencing a pruned
-        // method. Seeding `copy` here and draining the BFS pulls in exactly those callees, mirroring `delete`.
         var delete_by_owner: std.StringHashMapUnmanaged(SymbolId) = .empty;
         defer delete_by_owner.deinit(gpa);
         var copy_by_owner: std.StringHashMapUnmanaged(SymbolId) = .empty;
@@ -248,8 +338,6 @@ pub fn compute(
             var pass: usize = 0;
             while (pass < 128) : (pass += 1) {
                 const before = res.reachable.count();
-                // Collect `delete` for every generic struct that owns a reachable method. Collect first,
-                // then enqueue — enqueue mutates res.reachable and would invalidate this iterator.
                 pending.clearRetainingCapacity();
                 var rit = res.reachable.keyIterator();
                 while (rit.next()) |k| {
@@ -260,7 +348,6 @@ pub fn compute(
                     if (copy_by_owner.get(o)) |cp_sid| pending.append(gpa, cp_sid) catch {};
                 }
                 for (pending.items) |sid| ctx.enqueue(sid);
-                // Drain the BFS so the newly-reachable `delete` bodies pull in their callees.
                 while (head < queue.items.len) {
                     const sid = queue.items[head];
                     head += 1;
@@ -280,6 +367,9 @@ pub fn compute(
     return res;
 }
 
+/// Reports whether a symbol is a `@test` function, by scanning its declaration's
+/// attributes for the `test` attribute. Non-function declarations answer false.
+/// Used to keep test methods of generic owners reachable in test builds.
 fn isTestFn(sym: symbols.Symbol) bool {
     const fd: *const ast.FunctionDecl = switch (sym.decl) {
         .function => |f| f,
@@ -289,6 +379,9 @@ fn isTestFn(sym: symbols.Symbol) bool {
     return false;
 }
 
+/// Reports whether a symbol's declaration is marked exported (`is_exported`).
+/// Non-function declarations answer false. Currently unused by [`compute`]'s
+/// rooting logic but kept as a predicate over the same symbol shape.
 fn isExported(sym: symbols.Symbol) bool {
     const fd: *const ast.FunctionDecl = switch (sym.decl) {
         .function => |f| f,
@@ -297,10 +390,16 @@ fn isExported(sym: symbols.Symbol) bool {
     return fd.is_exported;
 }
 
+/// Walks every statement of a block, discovering callees in each. One half of
+/// the mutually recursive body traversal with [`walkStmt`] and [`walkExpr`].
 fn walkBlock(ctx: *Ctx, b: ast.Block) void {
     for (b.statements) |*s| walkStmt(ctx, s);
 }
 
+/// Recursively walks a statement, descending into its sub-statements and
+/// expressions so that any call, construction or closure reachable from it is
+/// marked. Every statement variant that can contain an expression or nested
+/// statement is handled explicitly; `break`/`continue` carry nothing to walk.
 fn walkStmt(ctx: *Ctx, s: *const ast.Statement) void {
     switch (s.*) {
         .block => |b| walkBlock(ctx, b),
@@ -336,9 +435,16 @@ fn walkStmt(ctx: *Ctx, s: *const ast.Statement) void {
     }
 }
 
+/// Recursively walks an expression, marking every function it can reach.
+///
+/// The core discovery step is at the top: if this expression node has a resolved
+/// symbol in [`infer.TypedIr.expr_syms`] (a call whose callee inference pinned
+/// down), that callee is enqueued. Expressions with an `unassigned` id carry no
+/// resolution and are skipped. The `switch` then recurses into every sub-
+/// expression of every variant so nested calls are not missed; `call`/
+/// `generic_call` additionally run [`rootIfConstruction`] on their callee, and
+/// `struct_init` roots the target type's constructors via [`Ctx.enqueueCtors`].
 fn walkExpr(ctx: *Ctx, e: *const ast.Expression) void {
-    // Harvest a resolved symbol reference for THIS expression (call callees, method calls, plain
-    // function references all land in expr_syms) and enqueue its decl.
     if (e.id != .unassigned) {
         if (ctx.ir.expr_syms.get(e.id)) |callee| ctx.enqueue(callee);
     }
@@ -409,8 +515,14 @@ fn walkExpr(ctx: *Ctx, e: *const ast.Expression) void {
     }
 }
 
-// `Type(...)` / `Type<...>(...)` and module-qualified `mod.Type(...)` construct `Type` -> root its
-// constructors. The callee is an ident or a field_access whose final segment names a struct.
+/// If a call's callee names a struct type, roots that struct's constructors.
+///
+/// A construction like `Point(1, 2)` appears as a `call` whose callee is an
+/// identifier (or a `field_access` for a qualified name) naming the type, not a
+/// resolved constructor symbol, so the ordinary `expr_syms` lookup misses it.
+/// This extracts the callee name, reduces it with [`baseName`], and if it is a
+/// known struct name enqueues its constructors. Callees that are not a bare name
+/// or field access are ignored.
 fn rootIfConstruction(ctx: *Ctx, callee: *const ast.Expression) void {
     const nm: []const u8 = switch (callee.kind) {
         .ident => |n| n,
@@ -421,6 +533,12 @@ fn rootIfConstruction(ctx: *Ctx, callee: *const ast.Expression) void {
     if (ctx.isStructName(base)) ctx.enqueueCtors(base);
 }
 
+/// Walks a JSX element, marking callees inside attribute-value expressions and
+/// recursing into child elements, expressions and embedded statements.
+///
+/// Called from [`walkExpr`] for the `jsx_element` variant. Static string
+/// attribute values and plain text children contain no code and are skipped;
+/// nested elements recurse back through this function.
 fn walkJsx(ctx: *Ctx, je: ast.JsxElement) void {
     for (je.attributes) |attr| switch (attr.value) {
         .expression => |ex| walkExpr(ctx, &ex),
@@ -434,7 +552,14 @@ fn walkJsx(ctx: *Ctx, je: ast.JsxElement) void {
     };
 }
 
-/// R0 report-only: print total/reachable/would-drop + the drop list. Gated by NOVA_REACH_SHADOW.
+/// Prints the report-only "demand-mono shadow" diagnostic to stderr.
+///
+/// Shows how many function/method decls exist, how many are reachable, and the
+/// would-drop count and percentage, then lists up to 200 sample would-drop decls
+/// (`owner.name` or `name`) so a human can audit for anything live but wrongly
+/// dropped before the pruning is trusted. This purely observes [`Result`] and
+/// the table; it changes nothing. `drop` is clamped at zero to guard against the
+/// degenerate case where `reach` exceeds `total`.
 pub fn report(res: *const Result, tab: *const SymbolTable) void {
     const out = std.debug.print;
     const total = res.total_fn_decls;
@@ -449,7 +574,6 @@ pub fn report(res: *const Result, tab: *const SymbolTable) void {
         out("  ({d:.1}%)\n", .{pct});
     } else out("\n", .{});
 
-    // Print the first N unreachable decls so the drop list can be audited for anything live.
     out("  --- sample would-drop decls (audit for live-but-dropped) ---\n", .{});
     var n: usize = 0;
     for (tab.symbols.items, 0..) |sym, i| {

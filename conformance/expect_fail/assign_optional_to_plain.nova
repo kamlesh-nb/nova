@@ -1,11 +1,9 @@
 // EXPECT-FAIL: typecheck
-// L2 / C-chk-6: a possibly-`undefined` value assigned to a plain (non-optional) declared type must be
-// rejected (only the return position was checked before). This must FAIL to compile.
 import assert;
 fn get(b: bool): string | undefined { if (b) { return "x"; } return undefined; }
 @test
 fn optional_to_plain_let_is_rejected(): void {
     let x = get(false);
-    let y: string = x;   // rejected: possibly-undefined assigned to plain 'string'
+    let y: string = x;
     assert.isTrue(true);
 }

@@ -1,9 +1,3 @@
-// I (parser gaps): a tuple-form enum variant with MORE THAN ONE payload -- `Rect(int, int)` -- failed to
-// parse (the declaration stopped at the first comma), so only single-payload tuple variants `Circle(int)`
-// and the struct-form `Rect{w: int, h: int}` worked. The multi-field payload construction and pattern
-// paths already existed for the struct form. Fix: the parser desugars `Variant(T1, T2, ...)` into positional
-// payload fields `_0`, `_1`, ...; construction `Shape.Rect(3, 4)` already fills those fields by position, and
-// the switch-pattern binding (checker, sema, and codegen) now binds `case Shape.Rect(w, h)` positionally.
 
 import assert;
 

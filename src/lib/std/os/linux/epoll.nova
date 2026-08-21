@@ -1,14 +1,3 @@
-// os/epoll: the Linux readiness reactor backend for the self-hosted runtime
-// (docs/design/self-hosted-runtime.md, phase 2), plus eventfd (cross-core wakeup) and
-// timerfd (timers). This module is Linux-only. On macOS it type-checks and its pure struct
-// helpers run, but the syscalls are never linked (they are dropped by globalDCE when a
-// program on macOS calls none of them). Use os/kqueue on macOS and BSD.
-//
-// ABI WARNING: `struct epoll_event` layout is arch-dependent. On x86_64 glibc marks it
-// __attribute__((packed)), so it is 12 bytes: events (uint32, offset 0), data (union u64,
-// offset 4). On aarch64 it is NOT packed: 16 bytes, data at offset 8. The constants below
-// target x86_64. Linux aarch64 must set EPOLL_EVENT_SIZE = 16 and EPOLL_DATA_OFF = 8, which
-// is to be verified on a Linux box in the phase-2 Linux pass.
 
 import bytes;
 
@@ -19,7 +8,6 @@ pub extern("c") fn eventfd(initval: int, flags: int): int;
 pub extern("c") fn timerfd_create(clockid: int, flags: int): int;
 pub extern("c") fn timerfd_settime(fd: int, flags: int, newValue: ptr, oldValue: ptr): int;
 
-// x86_64 packed layout.
 pub const EPOLL_EVENT_SIZE: int = 12;
 pub const EPOLL_DATA_OFF: int = 4;
 
@@ -32,16 +20,15 @@ pub const EPOLLOUT: int = 4;
 pub const EPOLLERR: int = 8;
 pub const EPOLLHUP: int = 16;
 pub const EPOLLRDHUP: int = 8192;
-pub const EPOLLONESHOT: int = 1073741824;   // 0x40000000
-pub const EPOLLET: int = 2147483648;         // 0x80000000
+pub const EPOLLONESHOT: int = 1073741824;
+pub const EPOLLET: int = 2147483648;
 
-pub const EPOLL_CLOEXEC: int = 524288;       // 0x80000
-pub const EFD_NONBLOCK: int = 2048;          // 0x800
+pub const EPOLL_CLOEXEC: int = 524288;
+pub const EFD_NONBLOCK: int = 2048;
 pub const EFD_CLOEXEC: int = 524288;
 pub const TFD_NONBLOCK: int = 2048;
 pub const CLOCK_MONOTONIC: int = 1;
 
-// Pure struct helpers (run on any platform; used to build/read the event buffer).
 pub fn setEvent(buf: ptr, i: int, events: int, data: long): void {
     let base = (i * EPOLL_EVENT_SIZE) as long;
     bytes.write_i32(buf, base, events as long);
@@ -50,7 +37,6 @@ pub fn setEvent(buf: ptr, i: int, events: int, data: long): void {
 pub fn evEvents(buf: ptr, i: int): int { return bytes.read_i32(buf, (i * EPOLL_EVENT_SIZE) as long) as int; }
 pub fn evData(buf: ptr, i: int): long { return bytes.read_ptr(buf, (i * EPOLL_EVENT_SIZE + EPOLL_DATA_OFF) as long); }
 
-// Register interest in `events` on `fd`, carrying `data` (typically the coroutine handle).
 pub fn ctlAdd(epfd: int, fd: int, events: int, data: long): int {
     let ev = bytes.alloc(EPOLL_EVENT_SIZE);
     setEvent(ev, 0, events, data);
@@ -58,8 +44,6 @@ pub fn ctlAdd(epfd: int, fd: int, events: int, data: long): int {
     bytes.free(ev);
     return r;
 }
-// Re-arm an already-registered fd's interest. This is the hot-path call: with EPOLLONESHOT the
-// kernel disarms an fd after it fires, and MOD re-arms it without the ADD/DEL churn.
 pub fn ctlMod(epfd: int, fd: int, events: int, data: long): int {
     let ev = bytes.alloc(EPOLL_EVENT_SIZE);
     setEvent(ev, 0, events, data);

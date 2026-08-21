@@ -1,36 +1,146 @@
-// builder.zig — `nova build` / `nova <file>` — orchestrate the compile+link pipeline.
+//! The `nova build` / `nova <file>` command driver: turn Nova source into a
+//! linked native or WASM binary.
+//!
+//! This file is the top of the compile pipeline the CLI reaches when the user
+//! asks to produce an executable (as opposed to `nova test`, `nova fmt`, etc.).
+//! It does two jobs and nothing else: [`cmdBuild`] parses the command line and
+//! computes every path/flag decision, and [`compileProgram`] runs the actual
+//! front-to-back compile for one program. The heavy lifting all lives elsewhere,
+//! this file is the conductor: it loads and merges the source graph, drives the
+//! semantic passes in the one order they must run, hands the checked program to
+//! the LLVM backend, and then spawns (or in-process invokes) the linker.
+//!
+//! Two shapes of invocation flow through here, and the difference is threaded
+//! everywhere as `build_mode`:
+//!
+//!   * Single-file mode (`nova app.nova ...`): compile one file to a binary,
+//!     the object file is a throwaway next to the output.
+//!   * Project mode (`nova build ...`): read `project.json` for the name, emit
+//!     into `build/<profile>/{obj,bin}`, keep the per-file `.o` split for
+//!     incremental linking, and stamp a content hash so an unchanged tree is a
+//!     no-op rebuild. This is the T6 per-file-split path.
+//!
+//! Key design points worth knowing before editing:
+//!   * The three `want_*` file-level vars are process-global switches set once
+//!     by [`cmdBuild`] from CLI flags and read deep inside [`compileProgram`];
+//!     they are here rather than threaded as parameters because they are pure
+//!     cross-cutting toggles. Codegen/sema toggles instead ride on environment
+//!     variables read straight out of `init.environ_map` (NOT `getenv`, which
+//!     does not work in this Zig), so an operator can flip a diagnostic without
+//!     a rebuild.
+//!   * The semantic passes in [`compileProgram`] have a MANDATORY order: alpha
+//!     rename, id assignment, type check, the shadow/typed-IR sema, then
+//!     monomorphization worklist, reachability, escape/ownership/OSSA verifiers,
+//!     and only then codegen. Reordering them breaks correctness, not just
+//!     diagnostics.
+//!   * Linking has several fast paths (in-process LLD for macOS and WASM, cross
+//!     link via bundled `zig cc`) that fall back to spawning `clang++`. The
+//!     object file is deleted afterwards unless `--keep-obj` or project mode
+//!     asks to retain it.
 
 const std = @import("std");
+/// Compile-time host info, used only to gate the macOS-only in-process Mach-O
+/// linker fast path (`builtin.target.os.tag == .macos`).
 const builtin = @import("builtin");
+/// Shorthand for the `std.Io` namespace, this Zig's explicit-IO filesystem and
+/// process API (`Io.Dir.readFileAlloc`, `Io.Dir.writeFile`, etc.).
 const Io = std.Io;
+/// Build-time options injected by `build.zig`; here it supplies `inprocess_lld`,
+/// which selects the linked-in LLD path over spawning an external linker.
 const build_options = @import("build_options");
+/// AST types (`ast.Program`, `ast.Declaration`, `ast.Span`) used to assemble the
+/// merged program before it is checked and lowered.
 const ast = @import("frontend/ast.zig");
+/// The lexer module. Imported for module-graph completeness, not called directly
+/// from this file (parsing here goes through [`parser`] and [`pipeline`]).
 const lexer = @import("frontend/lexer.zig");
+/// The Nova parser, used directly only to parse the injected WASM/native helper
+/// snippet (`__log_i32` and friends) into extra declarations.
 const parser = @import("frontend/parser.zig");
+/// The source formatter. Imported for module-graph completeness; `nova build`
+/// does not format.
 const formatter = @import("frontend/formatter.zig");
+/// The classic type checker pass ([`type_checker.TypeChecker`]), run after alpha
+/// and id assignment and before the shadow/typed-IR sema.
 const type_checker = @import("frontend/type_checker.zig");
+/// Project scaffolding templates. Imported for module-graph completeness; not
+/// used on the build path.
 const templates = @import("templates.zig");
+/// The LLVM backend entry point ([`llvm_codegen.compile`]) plus its global
+/// `flags` struct that the CLI toggles (`--emit-llvm`, `--mem-stats`, ...).
 const llvm_codegen = @import("backend/codegen/llvm_codegen.zig");
+/// The ARC codegen module, reached here only to flip its global switches
+/// (`asan_codegen_enabled`, `elide_enabled`, `balance_verify`, ...) from env.
 const codegen_arc = @import("backend/codegen/arc.zig");
+/// The shadow / typed-IR semantic pass and its many report toggles; `run` is the
+/// authoritative sema, the rest are diagnostics gated by `NOVA_*` env vars.
 const sema_shadow = @import("frontend/sema/shadow.zig");
+/// Escape analysis (report-only), enabled by `NOVA_ESCAPE_REPORT`.
 const sema_escape = @import("frontend/sema/escape.zig");
+/// The ownership balance verifier, enabled by `NOVA_OWN_VERIFY` (soft or hard).
 const sema_ownership = @import("frontend/sema/ownership.zig");
+/// OSSA lowering plus its ARC-balance self-verifier, default-on and fail-closed
+/// unless `NOVA_OSSA=off`.
 const sema_ossa_lower = @import("frontend/sema/ossa/lower.zig");
+/// The alpha-renaming pass, the FIRST sema step so later passes see unique names.
 const sema_alpha = @import("frontend/sema/alpha.zig");
+/// The node-id assigner ([`sema_ids.Assigner`]), run right after alpha to give
+/// every AST node a stable id the later passes key on.
 const sema_ids = @import("frontend/sema/ids.zig");
+/// The owning sema container ([`sema_mod.Sema`]) that holds the type store, name
+/// table, and typed IR the backend consumes.
 const sema_mod = @import("frontend/sema/sema.zig");
+/// Monomorphization: the [`sema_mono.Worklist`] that computes live generic
+/// instantiations plus the census/report globals the backend and diagnostics use.
 const sema_mono = @import("frontend/sema/mono.zig");
+/// The shared compile pipeline helpers: source loading/merging, target-info
+/// derivation, codegen transforms (trait defaults, serde binders, mediator), and
+/// all the link-command construction. Most of this file's real work is delegated
+/// here.
 const pipeline = @import("pipeline.zig");
+/// Package/dependency management, used to fetch declared dependencies before a
+/// build starts ([`packages.ensureDependencies`]).
 const packages = @import("packages.zig");
 
-// User-facing build options, set from CLI flags in cmdBuild (see pipeline.hasFlag). Builder-level knobs
-// live here; the codegen-deep ones (--split-objects/--prune/--emit-llvm/--mem-stats) live on
-// llvm_codegen.flags. Replaces the former NOVA_ASAN / NOVA_KEEP_OBJ / NOVA_DUMP_MERGED env vars.
+/// Process-global: emit an AddressSanitizer build (`-fsanitize=address`, links
+/// the `_asan` runtime). Set once from the `--asan` flag; ignored for WASM.
 var want_asan: bool = false;
+/// Process-global: keep the intermediate `.o` file instead of deleting it after
+/// a successful single-file link. Set from `--keep-obj`.
 var want_keep_obj: bool = false;
+/// Process-global: write the merged pre-compile source to `merged.nova` for
+/// inspection. Set from `--dump-merged`.
 var want_dump_merged: bool = false;
 
 
+/// Compile one Nova program end to end: load and merge its source graph, run the
+/// full semantic pipeline, generate LLVM code, and link the object into a native
+/// or WASM binary.
+///
+/// This is the core of a build. The steps, in the order they MUST happen:
+///   1. Recursively load the entry file and its imports (plus the always-on
+///      `string_builder` stdlib prelude) into one merged buffer and a flat
+///      declaration list, via [`pipeline.loadProgram`].
+///   2. In project mode, short-circuit if the content hash matches the previous
+///      build and the output binary still exists ("up to date, nothing to
+///      rebuild").
+///   3. Inject the WASM/native `__log_*`/`__read_string` helper declarations.
+///   4. Run the codegen-side AST transforms (trait defaults, controller routes,
+///      serde binders, mediator dispatch).
+///   5. Run the semantic passes in fixed order: alpha, id assignment, type
+///      check, shadow sema, mono worklist + instantiation dispatch, reachability
+///      gate, then the report-only escape/ownership/OSSA verifiers.
+///   6. Codegen to an object file and link (WASM via `clang`/in-process LLD;
+///      native via cross-link-through-zig, in-process Mach-O LLD, or `clang++`).
+///
+/// `visited` is the caller-owned set of already-loaded file paths; it is shared
+/// so watch mode can learn which files to stat for changes. `build_mode`,
+/// `build_obj_dir`, and `build_hash_path` are only meaningful in project mode
+/// and drive the `build/<profile>` layout, the per-file object split, and the
+/// content-hash up-to-date check. Errors propagate (`error.LinkFailed`,
+/// `error.UnsupportedTarget`, allocation/IO failures); sema-pass failures are
+/// caught and printed rather than aborting, since a diagnostic is more useful
+/// than a stack trace. See [`cmdBuild`], which computes every argument here.
 fn compileProgram(
     allocator: std.mem.Allocator,
     init: std.process.Init,
@@ -65,15 +175,7 @@ fn compileProgram(
     const is_wasm = std.mem.eql(u8, target, "--wasm");
     const tinfo = pipeline.deriveTargetInfo(target, target_triple_opt);
 
-    // AddressSanitizer is OPT-IN via --asan (never for wasm). It is a memory-bug testing tool, not a
-    // debug-build default: defaulting it on made debug builds depend on the linker's clang matching the
-    // exact ASAN runtime version that built libnovacore_asan.a -- when they differ (e.g. a VS Code task
-    // shell finds Apple clang 17 while the runtime was built with Homebrew clang 21) the link fails with
-    // `__asan_version_mismatch_check_v*` undefined. Off by default means plain debug builds link with any
-    // clang and run faster; the conformance --asan gate passes --asan explicitly.
     const asan = !is_wasm and want_asan;
-    // Opt-in: also instrument NOVA-GENERATED code with ASAN (not only the runtime), for provenance on a
-    // Nova-code UAF. Requires the runtime ASAN link (so it implies `asan`); niche dev knob, stays env.
     codegen_arc.asan_codegen_enabled = asan and (init.environ_map.get("NOVA_ASAN_CODEGEN") != null);
 
     pipeline.loadProgram(allocator, init, "src/std/collections/string_builder.nova", visited, &visiting, &merged, &declarations, is_wasm, &file_sources, tinfo) catch |err| {
@@ -130,7 +232,7 @@ fn compileProgram(
         const helpers_prog = try helpers_p.parseProgram();
         try declarations.appendSlice(allocator, helpers_prog.declarations);
     }
-    try pipeline.expandTraitDefaults(allocator, &declarations); // cross-module trait default methods
+    try pipeline.expandTraitDefaults(allocator, &declarations);
     try pipeline.generateControllerRoutes(allocator, &declarations);
     try pipeline.generateSerdeBinders(allocator, &declarations, is_wasm);
     try pipeline.generateMediatorDispatch(allocator, &declarations, is_wasm);
@@ -162,9 +264,6 @@ fn compileProgram(
 
     sema_shadow.report_enabled = init.environ_map.get("NOVA_SEMA_SHADOW") != null;
     sema_shadow.tid_census = init.environ_map.get("NOVA_TID_CENSUS") != null;
-    // M-5 (memory-management-refinements.md): borrowed-field ARC elision is ON by default
-    // (verified: corpus + ASAN clean, differential ARC audit identical off vs on). Set
-    // NOVA_ARC_ELIDE_OFF to disable it for debugging a suspected elision regression.
     codegen_arc.elide_enabled = init.environ_map.get("NOVA_ARC_ELIDE_OFF") == null;
     codegen_arc.arc_census = init.environ_map.get("NOVA_ARC_CENSUS") != null;
     pipeline.configureValueStructs(allocator, init.environ_map);
@@ -192,11 +291,6 @@ fn compileProgram(
         }
     }
 
-    // Gap 8: demand-driven monomorphization -- "compile only what the app uses". Computes the set of
-    // function/method decls reachable from main() (call graph + vtable/serde/closure roots) and gates
-    // codegen emission on it, so uncalled generic methods (List/RawBuffer's 93% dead surface) and unreached
-    // subsystems (crypto in a plaintext app) are never emitted. Default ON for build (huge memory+speed win);
-    // NOVA_REACH_OFF disables. See docs/design/demand-driven-mono.md.
     {
         const reach = @import("frontend/sema/reach.zig");
         const shadow = init.environ_map.get("NOVA_REACH_SHADOW") != null;
@@ -212,47 +306,26 @@ fn compileProgram(
         }
     }
 
-    // P7 Stage 1: report-only escape gauge (no codegen effect). See docs/design/p7-sound-arena.md.
     sema_escape.report_enabled = init.environ_map.get("NOVA_ESCAPE_REPORT") != null;
     if (sema_escape.report_enabled) _ = sema_escape.analyze(allocator, &owned_sema.store, &owned_sema.ir, &program);
 
-    // OSSA-lite Track V: opt-in ownership verifier. See docs/design/ossa-lite-tasks.md.
-    //   NOVA_OWN_VERIFY=1        -> run, report (does not fail the build).
-    //   NOVA_OWN_VERIFY=hard     -> also fail the build on an imbalance.
-    // Drives BOTH the sema-level owned-local coverage report AND the real codegen-level
-    // ARC release-balance verifier (V4', set below and run inside declarations.zig).
     if (init.environ_map.get("NOVA_OWN_VERIFY")) |v| {
         const hard = std.mem.eql(u8, v, "hard");
-        // Sound use-after-move gate (owned let-locals).
         sema_ownership.runVerify(allocator, &owned_sema.store, &owned_sema.ir, &program, hard);
-        // The V4' codegen balance verifier is NON-PATH-SENSITIVE (it counts total acquires vs total
-        // releases, so a value stored in two exclusive branches and released once at the merge shows a
-        // spurious imbalance). It is SUPERSEDED by the path-sensitive OSSA verifier below and kept only as
-        // an informational report -- it NEVER fails the build (verified false-positive on serde/DI/error-
-        // union across the corpus while ARC-audit is clean).
         codegen_arc.balance_verify = true;
         codegen_arc.balance_hard = false;
     }
 
-    // Slice 6: DEFAULT-ON, fail-closed ownership enforcement. The sound, path-sensitive OSSA verifier runs
-    // on EVERY build and REJECTS a proven ARC release imbalance (leak / double-free) in a covered function,
-    // exactly like a type error. 0 false positives across the corpus (398/398); it DEFERS what it cannot
-    // prove rather than accuse. Escape hatch + report:
-    //   NOVA_OSSA=off  -> disable the check entirely.
-    //   NOVA_OSSA=1    -> report-only (print the coverage census, never fail).
-    //   NOVA_OSSA=hard -> verbose census AND fail.
-    //   (unset)        -> enforce quietly (fail on a proven imbalance, no census noise).
     {
         const ossa = init.environ_map.get("NOVA_OSSA");
         const disabled = ossa != null and std.mem.eql(u8, ossa.?, "off");
         if (!disabled) {
             const report_only = ossa != null and std.mem.eql(u8, ossa.?, "1");
-            const verbose = ossa != null; // any explicit NOVA_OSSA=... prints the census
+            const verbose = ossa != null;
             sema_ossa_lower.reportQuiet(allocator, &owned_sema.store, &owned_sema.ir, &program, !report_only, !verbose);
         }
     }
 
-    // (HIR/MIR/LIR LLVM-emit optimiser scrapped 2026-08-16; see docs/design/sil-arc-optimiser-direction.md.)
 
     if (std.mem.eql(u8, target, "--wasm")) {
         const obj_path = try std.fmt.allocPrint(allocator, "{s}.o", .{output_path});
@@ -292,9 +365,6 @@ fn compileProgram(
             try std.fmt.allocPrint(allocator, "{s}.o", .{output_path});
         defer allocator.free(obj_path);
 
-        // A project build always produces linkable object(s) (the objs path); single-file compiles emit
-        // one object directly. --split-objects (llvm_codegen.flags.split_per_file) then chooses per-file
-        // vs one combined object INSIDE the objs path.
         const t6_split = build_mode;
         var split_objs = std.ArrayList([]const u8).empty;
         defer {
@@ -448,15 +518,38 @@ fn compileProgram(
     }
 }
 
-// cmdBuild: the `nova build ...` and bare `nova <file> ...` path (arg parsing + watch + compile).
-// Extracted verbatim from the tail of the former mainInner; cli.run dispatches here for both forms.
+/// Parse the `nova build` / `nova <file>` command line and drive one (or many,
+/// under `--watch`) compiles.
+///
+/// This is the CLI-facing half: it does argument parsing, path/flag resolution,
+/// and directory setup, then hands off to [`compileProgram`] for the actual
+/// work. It first ensures declared dependencies are present, then sets the three
+/// process-global `want_*` toggles and the [`llvm_codegen.flags`] from the flag
+/// list.
+///
+/// Argument parsing has TWO shapes keyed off `args[1]`:
+///   * `args[1] == "build"` → project mode. Flags carry values (`--target X`,
+///     `--file X`, `-o X`, `--release`/`-r`, `--debug`/`-d`, `--watch`/`-w`).
+///     Defaults: entry `src/main.nova`, name from `project.json`, output under
+///     `build/<profile>/bin`, objects under `build/<profile>/obj`, and a
+///     `.build-hash` stamp for incremental rebuilds.
+///   * otherwise → single-file mode with `args[1]` as the file and a looser flag
+///     set (`--wasm`/`--native`, `--target`/`-t X`, `-o X`, release/debug/watch).
+///
+/// `--target` accepts `wasm`, `native`, or a cross switch (`linux-arm64`,
+/// `linux-x86_64`, `macos-arm64`, `macos-x86_64`, `windows-x86_64`,
+/// `windows-arm64`) which is mapped to an LLVM triple; an unknown switch returns
+/// `error.UnsupportedTarget`. When no `-o` is given the output name is derived
+/// from the entry file's basename (`.wasm` suffix for WASM).
+///
+/// In `--watch` mode it loops forever: each pass compiles under a fresh arena,
+/// records the mtimes of every visited file, then polls at 500 ms until one of
+/// them changes and recompiles. A compile failure in watch mode is printed and
+/// the loop continues rather than exiting. In non-watch mode it compiles exactly
+/// once and returns.
 pub fn cmdBuild(allocator: std.mem.Allocator, init: std.process.Init, args: []const []const u8) !void {
-    // Auto-fetch: clone any project.json dependency missing from the package cache before compiling, so
-    // a freshly cloned app builds without a manual `nova get`. Silent when there is no project.json.
     try packages.ensureDependencies(allocator, init);
 
-    // User-facing build options as CLI flags (were NOVA_* env vars). Parsed once here; builder-level
-    // knobs go to module globals, codegen-deep ones to llvm_codegen.flags, before any compile runs.
     want_asan = pipeline.hasFlag(args, "--asan");
     want_keep_obj = pipeline.hasFlag(args, "--keep-obj");
     want_dump_merged = pipeline.hasFlag(args, "--dump-merged");
@@ -623,8 +716,6 @@ pub fn cmdBuild(allocator: std.mem.Allocator, init: std.process.Init, args: []co
         }
 
         while (true) {
-            // Back the per-iteration arena with the command allocator, never page_allocator (which never
-            // returns pages). The arena is deinit'd at the end of each watch iteration below.
             var pass_arena = std.heap.ArenaAllocator.init(allocator);
             const pass_allocator = pass_arena.allocator();
 

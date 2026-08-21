@@ -1,16 +1,7 @@
-// A1 async-first seam: the actor stdlib layer (concurrency/actor). An actor is a coroutine that
-// owns state and processes messages from a Mailbox ONE AT A TIME — sequential processing is the
-// concurrency model, so the state needs no lock. Built on async channels (a wakeup signal) + a
-// List<M> mailbox (per-message-type ARC). The handler is a `Behavior<M>` trait (dynamic dispatch),
-// so this also exercises GENERIC TRAIT OBJECTS end to end.
-//
-// Determinism: everything is enqueued (and the stop sentinel sent) before the actor is awaited, so
-// the actor drains a fixed batch in FIFO order.
 import assert;
 import list;
 import concurrency.actor;
 
-// A summing actor + an order-recording actor share the message type `int`.
 struct Summer impl Behavior<int> {
     pub total: int,
     pub count: int,
@@ -26,8 +17,6 @@ struct Recorder impl Behavior<int> {
     async fn receive(self: Recorder, msg: int): void { self.seen.push(msg); }
 }
 
-// Drive a Summer over a batch via the ActorCell METHOD form (`spawn cell.run()`) — a generic async
-// method awaiting a trait dispatch on a generic-trait field. Returns total*1000 + count.
 async fn runSummer(a: int, b: int, c: int): int {
     let s = Summer();
     let mbox = actor.Mailbox<int>();
@@ -40,7 +29,6 @@ async fn runSummer(a: int, b: int, c: int): int {
     return s.total * 1000 + s.count;
 }
 
-// Drive a Recorder via the ActorCell method form. Returns the messages seen, in order, as a base-10 number.
 async fn runRecorder(): int {
     let r = Recorder();
     let mbox = actor.Mailbox<int>();
@@ -52,10 +40,9 @@ async fn runRecorder(): int {
     let acc = 0;
     let i = 0;
     while (i < r.seen.size()) { acc = acc * 10 + (r.seen.at(i)); i = i + 1; }
-    return acc;   // 1234 iff processed in FIFO order
+    return acc;
 }
 
-// Two independent actors via the METHOD form: each cell keeps its OWN state (no shared mutation).
 async fn runTwo(): int {
     let s1 = Summer();
     let s2 = Summer();
@@ -69,20 +56,20 @@ async fn runTwo(): int {
     m2.send(3); m2.send(4); m2.send(5); m2.stop();
     let p1 = await r1;
     let p2 = await r2;
-    return s1.total * 1000 + s2.total;   // 30 and 12 -> 30012
+    return s1.total * 1000 + s2.total;
 }
 
 @test
 fn test_actor_processes_all_sequentially(): void {
-    assert.equalInt(runSummer(5, 3, 2), 10 * 1000 + 3);   // total 10, count 3
+    assert.equalInt(runSummer(5, 3, 2), 10 * 1000 + 3);
 }
 
 @test
 fn test_actor_fifo_order(): void {
-    assert.equalInt(runRecorder(), 1234);                  // processed 1,2,3,4 in order
+    assert.equalInt(runRecorder(), 1234);
 }
 
 @test
 fn test_independent_actors(): void {
-    assert.equalInt(runTwo(), 30012);                      // 30 and 12, no cross-talk
+    assert.equalInt(runTwo(), 30012);
 }

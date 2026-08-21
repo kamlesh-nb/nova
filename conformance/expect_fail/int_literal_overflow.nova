@@ -1,10 +1,5 @@
-// A7 / F3 §5 stage 5: a literal that does not fit a fixed-width integer type is a HARD
-// error, not a silent 32-bit wrap (§6: narrowing needs an explicit cast). 5000000000 >
-// i32 max, so `let n: int = 5000000000` must be rejected — the fix is `long`, or an
-// explicit `as int` if truncation is truly intended. If this ever compiles, the
-// literal-range check has regressed.
 @test
 fn test_int_literal_overflow_rejected(): void {
-    let n: int = 5000000000;   // > 2^31-1 — rejected
+    let n: int = 5000000000;
     assert.isTrue(n == n);
 }

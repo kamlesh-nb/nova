@@ -4,7 +4,6 @@ import serde.source;
 import Features.Products.CreateProduct.command;
 import Features.Products.CreateProduct.validator;
 
-// Handles CreateProduct: bind the command (visible, debuggable), validate, respond.
 pub struct CreateProductHandler impl MessageHandler {
     async fn handle(self: CreateProductHandler, src: ValueSource): Response {
         let cmd = CreateProduct{ name: src.getString("name"), price: src.getInt("price") as int };
@@ -12,7 +11,6 @@ pub struct CreateProductHandler impl MessageHandler {
         if (err.length != 0) {
             return Response(Status.BadRequest, err);
         }
-        // (persist here via a Shared/database repository, then return the new id)
         return json(`{"id":1,"name":"${cmd.name}"}`);
     }
 }

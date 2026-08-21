@@ -1,6 +1,3 @@
-// Module B: `import scoped.shadow_a;` pulls A's `Holder` into scope, AND B declares its OWN `Holder`
-// (different fields, kind()==222). `make(): Holder` must return B's local Holder. Before the local-shadows-
-// import fix, the return-type annotation `Holder` bound to A's imported Holder, so callers mis-dispatched.
 import list;
 import string;
 import shadow_a;

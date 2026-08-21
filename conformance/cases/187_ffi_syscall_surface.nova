@@ -1,15 +1,7 @@
-// Phase 1 of the self-hosted runtime (docs/design/self-hosted-runtime.md): prove the FFI
-// can express the raw syscall surface an event loop needs. This exercises, end to end and
-// offline: scalar args/returns, pointer (buffer) args, errno after a failing call, and
-// building/reading a C struct in a raw buffer with the typed `bytes` accessors, including
-// the new read_u16/write_u16 for 16-bit fields.
 import assert;
 import bytes;
 import os.sys;
 
-// A real connected fd pair from one syscall (no bind/listen/connect dance), then a
-// kernel-level write on one end and read on the other. This is the socket read/write
-// path the event loop is built on.
 @test
 fn test_socketpair_read_write(): void {
     let (a, b) = sys.newSocketPair(sys.AF_UNIX, sys.SOCK_STREAM);
@@ -17,11 +9,11 @@ fn test_socketpair_read_write(): void {
     assert.isTrue(b >= 0);
 
     let msg = bytes.alloc(5);
-    bytes.write_byte(msg, 0, 72);   // H
-    bytes.write_byte(msg, 1, 101);  // e
-    bytes.write_byte(msg, 2, 108);  // l
-    bytes.write_byte(msg, 3, 108);  // l
-    bytes.write_byte(msg, 4, 111);  // o
+    bytes.write_byte(msg, 0, 72);
+    bytes.write_byte(msg, 1, 101);
+    bytes.write_byte(msg, 2, 108);
+    bytes.write_byte(msg, 3, 108);
+    bytes.write_byte(msg, 4, 111);
     let wrote = sys.write(a, msg, 5);
     assert.isTrue(wrote == 5);
 
@@ -37,27 +29,22 @@ fn test_socketpair_read_write(): void {
     assert.equalInt(sys.close(b), 0);
 }
 
-// A failing syscall returns -1 and sets errno. close(-1) is EBADF (9 on both Linux
-// and macOS). This proves the FFI can surface errno, which every syscall needs.
 @test
 fn test_errno_on_failure(): void {
     let r = sys.close(-1);
     assert.equalInt(r, -1);
-    assert.equalInt(sys.errno(), 9); // EBADF
+    assert.equalInt(sys.errno(), 9);
 }
 
-// Build a sockaddr_in in a raw buffer and read the fields back, proving 16-bit and
-// 32-bit C struct field access works. Port 8080 in network byte order is 36895.
 @test
 fn test_sockaddr_struct_fields(): void {
     let sa = sys.makeSockaddrIn(8080, 0);
-    assert.equalInt(bytes.read_u16(sa, 0) as int, sys.AF_INET);        // sin_family
-    assert.equalInt(bytes.read_u16(sa, 2) as int, 36895);            // sin_port, network order
-    assert.equalInt(bytes.read_i32(sa, 4) as int, 0);                 // sin_addr = INADDR_ANY
+    assert.equalInt(bytes.read_u16(sa, 0) as int, sys.AF_INET);
+    assert.equalInt(bytes.read_u16(sa, 2) as int, 36895);
+    assert.equalInt(bytes.read_i32(sa, 4) as int, 0);
     bytes.free(sa);
 }
 
-// htons byte-swaps a 16-bit value into network order.
 @test
 fn test_htons(): void {
     assert.equalInt(sys.htons(8080), 36895);

@@ -1,4 +1,3 @@
-// Smoke test: assert mechanics + basic arithmetic/control flow.
 import assert;
 
 @test

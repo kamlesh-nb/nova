@@ -1,9 +1,3 @@
-// SHA-1 (FIPS 180-1) implemented in Nova, no external library (M9 phase A). SHA-1 is not used for TLS
-// 1.3 security, but TLS 1.2 needs it for the legacy PRF and HMAC-SHA1 record MAC, and it appears in
-// certificate handling; it is included for completeness and is never used where collision resistance
-// matters. Words are `long` masked to 32 bits, so `>>` is logical.
-//
-// Reference: Zig std.crypto Sha1. Verified against known-answer vectors (conformance case 217).
 import bytes;
 import mem.allocator;
 
@@ -31,8 +25,8 @@ fn putWord(out: ptr, off: int, w: ulong): void {
 }
 
 pub struct Sha1 {
-    pub h: ptr,        // 5 words, 20 bytes
-    pub block: ptr,    // 64-byte pending block
+    pub h: ptr,
+    pub block: ptr,
     pub blockLen: int,
     pub total: long,
 

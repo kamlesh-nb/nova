@@ -1,16 +1,8 @@
-// Layered configuration: a value resolves from the environment first, then a registered default. A
-// production service reads config from env (12-factor) with sensible built-in defaults; this is that,
-// with typed getters. An optional prefix maps a dotted/kebab key to an env var:
-//
-//   let cfg = config.newConfig().withPrefix("APP_");
-//   cfg.setDefault("http.port", "8080");
-//   cfg.getInt("http.port", 0);   // reads env APP_HTTP_PORT, else the default 8080
 
 import string;
 import map;
 import env;
 
-// Env var name for a config key: prefix + UPPERCASE, with '.' and '-' turned into '_'.
 fn envKeyOf(prefix: string, key: string): string {
     let up = string.toUpperCase(key);
     let out = "";
@@ -35,7 +27,6 @@ pub struct Config {
     pub fn withPrefix(self: Config, p: string): Config { self.prefix = p; return self; }
     pub fn setDefault(self: Config, key: string, val: string): void { self.defaults.set(key, val); }
 
-    // Resolve: env override wins, then the registered default, then `dflt`.
     pub fn getString(self: Config, key: string, dflt: string): string {
         let envVal = env.get(envKeyOf(self.prefix, key));
         if (envVal != "") { return envVal; }
@@ -56,7 +47,6 @@ pub struct Config {
         return string.eql(s, "true") || string.eql(s, "1") || string.eql(s, "yes") || string.eql(s, "on");
     }
 
-    // Whether a value is present (as an env override or a default).
     pub fn has(self: Config, key: string): bool {
         if (env.get(envKeyOf(self.prefix, key)) != "") { return true; }
         return self.defaults.get(key) != undefined;

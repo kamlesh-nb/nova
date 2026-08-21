@@ -1,9 +1,3 @@
-// H2 optionals soundness: the SOUND ways to use a `T | undefined` all compile and work.
-// (The unguarded form is a compile error — see expect_fail/optional_unguarded.)
-//   at(i)              -> T directly, traps loudly on absent (Rust/Swift indexed access)
-//   x ?? default       -> T (coalesce strips the optional)
-//   if (x != undefined) -> narrows x to T in the branch
-//   if (x == undefined) return -> narrows x to T for the rest of the block (early exit)
 import list;
 import map;
 import string;
@@ -15,17 +9,17 @@ struct Box { pub v: int, init(n: int) { self.v = n; } pub fn twice(self: Box): i
 fn test_at_returns_value(): void {
     let l = List<Box>();
     l.push(Box(21));
-    assert.equalInt(l.at(0).v, 21);        // at -> Box directly
-    assert.equalInt(l.at(0).twice(), 42);  // method too
+    assert.equalInt(l.at(0).v, 21);
+    assert.equalInt(l.at(0).twice(), 42);
 }
 
 @test
 fn test_coalesce_strips_optional(): void {
     let l = List<int>();
     l.push(7);
-    let v = l.get(9) ?? 99;   // absent -> default; result is `int`, not `int | undefined`
+    let v = l.get(9) ?? 99;
     assert.equalInt(v, 99);
-    let w = l.get(0) ?? 99;   // present -> the value
+    let w = l.get(0) ?? 99;
     assert.equalInt(w, 7);
 }
 
@@ -35,7 +29,7 @@ fn test_narrow_in_branch(): void {
     l.push(Box(5));
     let b = l.get(0);
     if (b != undefined) {
-        assert.equalInt(b.v, 5);   // narrowed to Box inside the branch
+        assert.equalInt(b.v, 5);
     }
 }
 
@@ -49,12 +43,12 @@ fn test_early_exit_narrow(): void {
 fn unwrapFirst(l: List<Box>): int {
     let b = l.get(0);
     if (b == undefined) { return -1; }
-    return b.v;   // b narrowed to Box for the rest of the block
+    return b.v;
 }
 
 @test
 fn test_map_at(): void {
     let m = map.Map<string, int>(8, string.hash);
     m.set("k", 42);
-    assert.equalInt(m.at("k"), 42);   // Map.at -> V directly
+    assert.equalInt(m.at("k"), 42);
 }

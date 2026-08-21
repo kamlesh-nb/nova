@@ -1,15 +1,7 @@
-// examples/12_sets.nova
 import collections.set;
 import collections.map;
 import string;
 
-// A Set<T> stores unique elements. Internally it is a thin wrapper over
-// Map<T, bool>, so it takes the same (capacity, hashFn) pair.
-//
-// Beta note: because Set is built on Map<T, bool>, a standalone program must
-// also reference that Map<T, bool> directly so the compiler instantiates it;
-// the two `prime*` calls below exist only for that. This is a dead-code
-// elimination gap being tracked; normal Map usage needs no such priming.
 fn primeString(): void { let m = map.Map<string, bool>(1, string.hash); m.set("_", true); }
 fn primeInt(): void { let m = map.Map<int, bool>(1, set.i32Hash); m.set(0, true); }
 
@@ -17,22 +9,18 @@ fn main(): void {
     primeString();
     primeInt();
 
-    // A Set of strings. For string keys, use string.hash.
     let methods = set.Set<string>(16, string.hash);
     methods.add("get");
     methods.add("post");
-    methods.add("get");          // duplicate -> ignored
+    methods.add("get");
     console.log(`size = ${methods.size()}`);
 
-    // Membership test.
     console.log(`has post = ${methods.has("post")}`);
     console.log(`has put  = ${methods.has("put")}`);
 
-    // Remove an element.
     methods.remove("post");
     console.log(`has post = ${methods.has("post")} (after remove)`);
 
-    // A Set of ints. For int keys, use set.i32Hash.
     let ids = set.Set<int>(16, set.i32Hash);
     ids.add(1); ids.add(2); ids.add(2); ids.add(3);
     console.log(`unique ids = ${ids.size()}`);

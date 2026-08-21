@@ -1,26 +1,3 @@
-// Gates the P2-14 decision: a member access THROUGH an optional is memory-safe.
-//
-// `List<T>.get(i)` / `Map<K,V>.get(k)` return `T | undefined`, and the see-through (commit
-// 950495c) lets `xs.get(i).field` / `.method()` resolve the member type for ergonomics. But
-// `undefined` is the handle 0 (specs §3.2), so reading a member of an ABSENT optional read
-// through address 0 and SEGV'd at 0xff..fc with no explanation — the exact null deref spec §3.4
-// says the type system exists to prevent, which it did not.
-//
-// DECISION (P2-14, 2026-07-17): keep the see-through, insert a runtime guard. Codegen emits
-// `if (handle == 0) nova_optional_deref_fail("file:line")` before a member deref whose object is
-// optional-typed. UB becomes an honest, LOCATED abort. Enforcing at COMPILE time is the eventual
-// soundness win but needs flow-narrowing (§3.4a early-exit) to not be painful; until then this is
-// memory-safe and breaks nothing.
-//
-// WHAT THIS CASE GATES: the PRESENT-value path — the guard must be a correct no-op, so the
-// see-through ergonomics are unchanged. (`30_optional_member_access` also covers see-through; this
-// adds the guard being invisible when the value is present, across field read AND method call.)
-//
-// THE ABSENT path aborts the process, so it cannot be an ordinary @test. Verified by hand under
-// NOVA_ASAN=1 — a bare `l.get(5).v` and `l.get(5).m()` each produce, instead of a SEGV:
-//     abort: member access on an absent optional at <file>:<line>
-//       narrow it first: `if (x != undefined) { x.field }`  (specs §3.4)
-// and the whole corpus is ASAN-clean under `run.sh --asan`, proving no present-value regression.
 import assert;
 import list;
 
@@ -30,16 +7,14 @@ struct Box {
     pub fn doubled(self: Box): int { return self.v * 2; }
 }
 
-// FIELD read through a present optional — guard inserted, must be a no-op.
 @test
 fn test_present_optional_field(): void {
     let l = List<Box>();
     l.push(Box(21));
-    let b = l.at(0);            // Box | undefined, present
+    let b = l.at(0);
     assert.equalInt(b.v, 21);
 }
 
-// METHOD call through a present optional — the other guarded site.
 @test
 fn test_present_optional_method(): void {
     let l = List<Box>();
@@ -48,7 +23,6 @@ fn test_present_optional_method(): void {
     assert.equalInt(b.doubled(), 42);
 }
 
-// The safe narrowed form must keep working unchanged (the guard never fires on this path).
 @test
 fn test_narrowed_access(): void {
     let l = List<Box>();
@@ -61,7 +35,6 @@ fn test_narrowed_access(): void {
     }
 }
 
-// See-through in a loop — the app.nova router shape, all indices in bounds.
 @test
 fn test_see_through_in_loop(): void {
     let l = List<Box>();
@@ -71,7 +44,7 @@ fn test_see_through_in_loop(): void {
     let sum = 0;
     let i = 0;
     while (i < l.size()) {
-        let b = l.at(i);       // in bounds every iteration -> guard never fires
+        let b = l.at(i);
         sum = sum + b.v;
         i = i + 1;
     }

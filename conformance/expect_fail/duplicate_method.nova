@@ -1,6 +1,4 @@
 // EXPECT-FAIL: typecheck
-// F4/F1-6 (2026-07-24): no overloading — two methods with the same name on one struct collide on the
-// emitted `<Owner>_<method>` symbol. Rejected with a located error (like duplicate trait methods).
 import assert;
 
 struct P {

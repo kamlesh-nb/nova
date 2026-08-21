@@ -8,18 +8,10 @@ import collections.string_builder;
 pub struct JsonValue {
     pub kind: int,
     pub bval: bool,
-    // A number (kind 2) is stored EITHER as `inum` (when numIsInt, a plain integer that fits in i64) OR as
-    // the textual `num` (floats, exponents, decimals, and integers too big for i64). The integer fast-path
-    // avoids a per-number string allocation on parse AND on `number()`-built values, while `num`-as-string
-    // preserves full float/decimal/bignum fidelity and byte-exact round-trip for everything else. Readers
-    // (asNumber/asFloat/asDecimal/stringify) check numIsInt first.
     pub num: string,
     pub inum: long,
     pub numIsInt: bool,
     pub sval: string,
-    // arr/obj are allocated LAZILY — only array (kind 4) and object (kind 5) nodes need them. A scalar
-    // (null/bool/number/string) leaves them undefined, so parsing a scalar allocates just this struct
-    // instead of also a List + a Map + the Map's backing (Gap 5: ~114 -> fewer allocs per parse).
     pub arr: List<JsonValue> | undefined,
     pub obj: Map<string, JsonValue> | undefined,
 
@@ -37,9 +29,6 @@ pub struct JsonValue {
     }
 }
 
-// The arr/obj of a kind-4/kind-5 node, narrowed. Callers guard on kind first, so the value is always
-// present and the trailing empty is unreachable (no allocation on the hot path); it only satisfies the
-// type. Collections are reference types, so mutating the returned value mutates the node's field.
 fn arrOf(val: JsonValue): List<JsonValue> {
     let a = val.arr;
     if (a != undefined) { return a; }
@@ -127,7 +116,7 @@ pub fn size(val: JsonValue): int {
 struct JsonParser {
     src: string,
     pos: int,
-    failed: bool,   // L4/E7: set on malformed input (EOF where a value/close is expected, or an unexpected char)
+    failed: bool,
 
     init(src: string) {
         self.src = src;
@@ -146,7 +135,7 @@ struct JsonParser {
 
     pub fn parseValue(self: JsonParser): JsonValue {
         self.skipWs();
-        if (self.pos >= self.src.length) { self.failed = true; return JsonValue(0); }   // L4/E7: EOF, no value
+        if (self.pos >= self.src.length) { self.failed = true; return JsonValue(0); }
         let c = self.src[self.pos];
         if (c == 110) { return self.parseNull(); }
         if (c == 116 || c == 102) { return self.parseBool(); }
@@ -154,7 +143,7 @@ struct JsonParser {
         if ((c >= 48 && c <= 57) || c == 45) { return self.parseNumber(); }
         if (c == 91) { return self.parseArray(); }
         if (c == 123) { return self.parseObject(); }
-        self.failed = true;   // L4/E7: an unrecognized character where a value was expected
+        self.failed = true;
         return JsonValue(0);
     }
 
@@ -189,8 +178,6 @@ struct JsonParser {
         return 0;
     }
 
-    // Reads exactly four hex digits of a `\uXXXX` escape. On entry `self.pos` is at the `u`; on exit it
-    // points just past the fourth hex digit.
     fn readHex4(self: JsonParser): int {
         self.pos = self.pos + 1;
         let cp = 0;
@@ -214,7 +201,6 @@ struct JsonParser {
             sb.appendChar(128 + ((cp / 64) % 64));
             sb.appendChar(128 + (cp % 64));
         } else {
-            // Astral plane (U+10000..U+10FFFF): four UTF-8 bytes.
             sb.appendChar(240 + (cp / 262144));
             sb.appendChar(128 + ((cp / 4096) % 64));
             sb.appendChar(128 + ((cp / 64) % 64));
@@ -223,20 +209,15 @@ struct JsonParser {
     }
 
     fn appendUnicode(self: JsonParser, sb: StringBuilder): void {
-        // `self.pos` is at the `u` of the first `\uXXXX`.
         let cp = self.readHex4();
-        // A high surrogate (U+D800..U+DBFF) combines with a following `\uDC00..\uDFFF` low surrogate into
-        // one astral code point. Encoding each half on its own (the previous behaviour) produced two
-        // invalid 3-byte sequences -- mojibake for every emoji / astral character in JSON input.
         if (cp >= 55296 && cp <= 56319) {
             if (self.pos + 1 < self.src.length && self.src[self.pos] == 92 && self.src[self.pos + 1] == 117) {
                 let save = self.pos;
-                self.pos = self.pos + 1;   // step onto the `u` of the second escape
+                self.pos = self.pos + 1;
                 let lo = self.readHex4();
                 if (lo >= 56320 && lo <= 57343) {
                     cp = 65536 + (cp - 55296) * 1024 + (lo - 56320);
                 } else {
-                    // Not a valid low surrogate: rewind so the second escape is processed normally.
                     self.pos = save;
                 }
             }
@@ -285,7 +266,6 @@ struct JsonParser {
             if (c >= 48 && c <= 57) {
                 self.pos = self.pos + 1;
             } else if (c == 46 || c == 101 || c == 69 || c == 43 || c == 45) {
-                // A '.', exponent, or embedded sign means this is NOT a plain integer: keep the text.
                 is_int = false;
                 self.pos = self.pos + 1;
             } else {
@@ -295,10 +275,6 @@ struct JsonParser {
         let v = JsonValue(2);
         let digit_start = if (neg) start + 1 else start;
         let digits = self.pos - digit_start;
-        // Integer fast-path: a plain integer with at most 18 digits fits in i64 with no overflow (i64 max is
-        // 19 digits), so we accumulate it straight from the source bytes and store `inum` with NO string
-        // allocation. Everything else (floats, exponents, and 19+ digit integers that might overflow i64)
-        // falls back to the textual `num`, preserving full fidelity for parseFloat / decimal / round-trip.
         if (is_int && digits >= 1 && digits <= 18) {
             let acc: long = 0;
             let j = digit_start;
@@ -327,11 +303,11 @@ struct JsonParser {
             let v = self.parseValue();
             arrOf(node).push(v);
             self.skipWs();
-            if (self.pos >= self.src.length) { self.failed = true; break; }   // L4/E7: unterminated array
+            if (self.pos >= self.src.length) { self.failed = true; break; }
             let c = self.src[self.pos];
             if (c == 44) { self.pos = self.pos + 1; self.skipWs(); }
             else if (c == 93) { self.pos = self.pos + 1; break; }
-            else { self.failed = true; break; }   // L4/E7: expected ',' or ']'
+            else { self.failed = true; break; }
         }
         return node;
     }
@@ -346,7 +322,7 @@ struct JsonParser {
         }
         while (true) {
             self.skipWs();
-            if (self.pos >= self.src.length || self.src[self.pos] != 34) { self.failed = true; break; }   // L4/E7: expected a "key"
+            if (self.pos >= self.src.length || self.src[self.pos] != 34) { self.failed = true; break; }
             let key = self.parseRawString();
             self.skipWs();
             if (self.pos < self.src.length && self.src[self.pos] == 58) {
@@ -355,13 +331,13 @@ struct JsonParser {
                 let v = self.parseValue();
                 objOf(node).set(key, v);
                 self.skipWs();
-                if (self.pos >= self.src.length) { self.failed = true; break; }   // L4/E7: unterminated object
+                if (self.pos >= self.src.length) { self.failed = true; break; }
                 let c = self.src[self.pos];
                 if (c == 44) { self.pos = self.pos + 1; }
                 else if (c == 125) { self.pos = self.pos + 1; break; }
-                else { self.failed = true; break; }   // L4/E7: expected ',' or '}'
+                else { self.failed = true; break; }
             } else {
-                self.failed = true;   // L4/E7: expected ':'
+                self.failed = true;
                 break;
             }
         }
@@ -374,14 +350,11 @@ pub fn parse(src: string): JsonValue {
     return p.parseValue();
 }
 
-// L4/E7: the CHECKED parse. Returns `undefined` when the input is malformed — an unterminated array/object,
-// a missing value, an unexpected character, or trailing garbage after the top-level value. Use this when the
-// input is untrusted; `parse` above stays lenient (a partial value, no error) for back-compatible callers.
 pub fn tryParse(src: string): JsonValue | undefined {
     let p = JsonParser(src);
     let v = p.parseValue();
     p.skipWs();
-    if (p.failed || p.pos < p.src.length) { return undefined; }   // malformed, or unconsumed trailing input
+    if (p.failed || p.pos < p.src.length) { return undefined; }
     return v;
 }
 

@@ -1,9 +1,3 @@
-// Emit-subset growth: a reference to a module-level `const` from an emittable function used to lower to
-// `const_int 0` (constfold then folded `x & MASK32` -> 0, miscompiling the crypto stdlib), so such functions
-// fell back to the AST path. The emit path now carries the const NAME as an opaque `global_const` op and
-// resolves it at emit time via the same lazy-init per-module load the AST path uses. Under NOVA_OPT_EMIT
-// these functions compile from the optimised IR; under the default build from the AST. Both must agree,
-// including the mask-and-shift idiom that the miscompile broke, a bool const, and a runtime-computed const.
 import assert;
 
 const MASK32: long = 0xffffffff;
@@ -14,7 +8,6 @@ const SEED: int = compute();
 
 fn compute(): int { return 40 + 2; }
 
-// The exact rotate idiom from sha256: masked so `>>` is logical. A dropped MASK32 (folded to 0) returns 0.
 fn rotr32(x: long, n: int): long { return ((x >> n) | (x << (32 - n))) & MASK32; }
 fn maskLow(x: long): long { return x & MASK32; }
 fn addConsts(): int { return A + B + A * B; }
@@ -24,14 +17,13 @@ fn seeded(): int { return SEED + 1; }
 @test
 fn test_mask_and_rotate(): void {
     assert.isTrue(maskLow(0x1000000ff) == 0xff);
-    // rotr32(0x12345678, 8) = 0x78123456 (byte rotate) -- wrong if MASK32 or the shift is dropped.
     assert.isTrue(rotr32(0x12345678, 8) == 0x78123456);
     assert.isTrue(rotr32(1, 1) == 0x80000000);
 }
 
 @test
 fn test_scalar_consts(): void {
-    assert.equalInt(addConsts(), 95); // 7 + 11 + 77
+    assert.equalInt(addConsts(), 95);
     assert.equalInt(pickFlag(), 9);
-    assert.equalInt(seeded(), 43); // (40 + 2) + 1
+    assert.equalInt(seeded(), 43);
 }

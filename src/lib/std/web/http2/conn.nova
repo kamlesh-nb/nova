@@ -1,9 +1,3 @@
-// HTTP/2 connection layer (RFC 7540): the server side of a connection. Verifies the client preface,
-// exchanges SETTINGS, and runs the frame loop -- assembling HEADERS(+CONTINUATION) blocks, decoding them with
-// HPACK into a request, invoking a handler, and writing the response as HEADERS + DATA. Connection and
-// per-stream flow-control windows are tracked and WINDOW_UPDATE / PING / SETTINGS / RST_STREAM / GOAWAY are
-// handled. `processMessage` runs the whole protocol over an in-memory buffer (used by the gate); `serveH2`
-// drives the same logic over an async socket.
 import bytes;
 import string;
 import list;
@@ -46,10 +40,8 @@ fn getHeader(fields: List<hpack.HeaderField>, name: string): string {
     return "";
 }
 
-// Build the response frames for one stream into `out` at offset o. Returns the new offset.
 fn writeResponse(enc: hpack.Hpack, out: ptr, o0: int, streamId: int, resp: H2Response): int {
     let o = o0;
-    // Header block: :status first, then the response headers.
     let fields = List<hpack.HeaderField>();
     fields.push(hpack.HeaderField(":status", statusStr(resp.status)));
     let i = 0;
@@ -62,7 +54,6 @@ fn writeResponse(enc: hpack.Hpack, out: ptr, o0: int, streamId: int, resp: H2Res
     o = frame.writeFrame(out, o, frame.FRAME_HEADERS, hflags, streamId, hb, 0, hbLen);
 
     if (hasBody) {
-        // Emit DATA in <= MAX_FRAME chunks, END_STREAM on the last.
         let body = resp.body as ptr;
         let total = resp.body.length;
         let sent = 0;
@@ -80,13 +71,11 @@ fn writeResponse(enc: hpack.Hpack, out: ptr, o0: int, streamId: int, resp: H2Res
 
 fn statusStr(code: int): string { return `${code}`; }
 
-// Build an H2Request from a decoded header block + body.
 fn buildRequest(fields: List<hpack.HeaderField>, body: string): H2Request {
     let method = getHeader(fields, ":method");
     let path = getHeader(fields, ":path");
     let scheme = getHeader(fields, ":scheme");
     let authority = getHeader(fields, ":authority");
-    // Regular (non-pseudo) headers.
     let regular = List<hpack.HeaderField>();
     let i = 0;
     while (i < fields.size()) {
@@ -97,8 +86,6 @@ fn buildRequest(fields: List<hpack.HeaderField>, body: string): H2Request {
     return H2Request(method, path, scheme, authority, regular, body);
 }
 
-// The offset of the HPACK header block inside a HEADERS payload, accounting for PADDED / PRIORITY flags, and
-// the block's length. Returns (blockOff, blockLen).
 fn headerBlockSpan(buf: ptr, payloadOff: int, payloadLen: int, flags: int): (int, int) {
     let off = payloadOff;
     let len = payloadLen;
@@ -109,7 +96,7 @@ fn headerBlockSpan(buf: ptr, payloadOff: int, payloadLen: int, flags: int): (int
         len = len - 1;
     }
     if ((flags & frame.FLAG_PRIORITY) != 0) {
-        off = off + 5;   // 4-byte stream dep + 1-byte weight
+        off = off + 5;
         len = len - 5;
     }
     len = len - padLen;
@@ -117,18 +104,13 @@ fn headerBlockSpan(buf: ptr, payloadOff: int, payloadLen: int, flags: int): (int
     return (off, len);
 }
 
-// Run the whole server protocol over an in-memory client message (preface + frames). `handler` maps a
-// request to a response. Returns (outBuf, outLen) = the bytes the server would send. Used by the gate.
 pub fn processMessage(inBuf: ptr, inLen: int, handler: (H2Request) -> H2Response): (ptr, int) {
     let dec = hpack.newHpack();
     let enc = hpack.newHpack();
-    // Generous output buffer.
     let out = bytes.alloc(inLen * 4 + 65536);
     let o = 0;
-    // Server preface: our SETTINGS.
     o = frame.writeSettingsEmpty(out, o);
 
-    // Verify + skip the client preface.
     let p = 0;
     if (inLen >= 24) {
         let ok = true;
@@ -143,7 +125,6 @@ pub fn processMessage(inBuf: ptr, inLen: int, handler: (H2Request) -> H2Response
         if (payload + fh.length > inLen) { break; }
         if (fh.ftype == frame.FRAME_SETTINGS) {
             if ((fh.flags & frame.FLAG_ACK) == 0) {
-                // Apply HEADER_TABLE_SIZE if present, then ACK.
                 let sp = payload;
                 while (sp + 6 <= payload + fh.length) {
                     let id = (bytes.read_byte(inBuf, sp) << 8) | bytes.read_byte(inBuf, sp + 1);
@@ -164,13 +145,11 @@ pub fn processMessage(inBuf: ptr, inLen: int, handler: (H2Request) -> H2Response
                 o = writeResponse(enc, out, o, fh.streamId, resp);
             }
         }
-        // DATA / WINDOW_UPDATE / PRIORITY / RST_STREAM: acknowledged implicitly / ignored for this path.
         p = payload + fh.length;
     }
     return (out, o);
 }
 
-// Read exactly n bytes from io into buf[off..off+n]; returns true on success, false on EOF/error.
 async fn readN(io: aio.AsyncIO, buf: ptr, off: int, n: int): bool {
     let got = 0;
     while (got < n) {
@@ -181,22 +160,17 @@ async fn readN(io: aio.AsyncIO, buf: ptr, off: int, n: int): bool {
     return true;
 }
 
-// Drive HTTP/2 over an async socket. Verifies the preface, exchanges SETTINGS, and serves requests via
-// `handler` until the peer closes or sends GOAWAY. One request/response per stream (no request body,
-// interleaving is serialised); sufficient for a GET/POST-without-body hypermedia server.
 pub async fn serveH2(io: aio.AsyncIO, handler: (H2Request) -> H2Response): int {
     let dec = hpack.newHpack();
     let enc = hpack.newHpack();
     let hdr = bytes.alloc(9);
     let pre = bytes.alloc(24);
 
-    // Client preface.
     let okPre = await readN(io, pre, 0, 24);
     if (!okPre) { return 0; }
     let k = 0;
     while (k < 24) { if (bytes.read_byte(pre, k) != frame.PREFACE[k]) { return 0; } k = k + 1; }
 
-    // Our SETTINGS.
     let sbuf = bytes.alloc(64);
     let sl = frame.writeSettingsEmpty(sbuf, 0);
     let sent = await io.sendStr(bufToStr(sbuf, sl));

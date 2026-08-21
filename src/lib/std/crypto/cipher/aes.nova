@@ -1,12 +1,3 @@
-// AES-128 and AES-256 block cipher (FIPS-197), constant-time, implemented in Nova with no external
-// library (M9 phase B). This is a faithful port of BearSSL's aes_ct: the state is bitsliced across 8
-// 32-bit words (each a bit-plane over two blocks) and the S-box is computed with the Boyar-Peralta
-// boolean circuit, so there are NO table lookups and NO data-dependent branches. That is what makes it
-// constant-time and side-channel resistant, unlike a table-based AES. Only encryption is implemented
-// (AES-GCM and CTR need only the forward direction). Words are `ulong` masked to 32 bits.
-//
-// Reference: BearSSL src/symcipher/aes_ct.c and aes_ct_enc.c (Thomas Pornin, public domain). Verified
-// against the FIPS-197 known-answer vectors (conformance case 221).
 import bytes;
 import mem.allocator;
 
@@ -14,7 +5,6 @@ const M32: ulong = 0xffffffff;
 
 pub const AES_BLOCK_LEN: int = 16;
 
-// Round constants for the key schedule.
 const RCON: int[10] = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36];
 
 fn le32(buf: ptr, off: int): ulong {
@@ -31,11 +21,9 @@ fn putLe32(buf: ptr, off: int, w: ulong): void {
     bytes.write_byte(buf, off + 3, ((w >> 24) & 0xff) as int);
 }
 
-// q is a buffer of 8 words (32 bytes). Accessors keep everything little-endian and masked to 32 bits.
 fn getq(q: ptr, i: int): ulong { return le32(q, i * 4); }
 fn setq(q: ptr, i: int, v: ulong): void { putLe32(q, i * 4, v & M32); }
 
-// The bitsliced AES S-box (Boyar and Peralta's circuit) applied to the 8 bit-planes in q.
 fn subBytes(q: ptr): void {
     let x0 = getq(q, 7); let x1 = getq(q, 6); let x2 = getq(q, 5); let x3 = getq(q, 4);
     let x4 = getq(q, 3); let x5 = getq(q, 2); let x6 = getq(q, 1); let x7 = getq(q, 0);
@@ -84,7 +72,6 @@ fn subBytes(q: ptr): void {
     setq(q, 3, s4); setq(q, 2, s5); setq(q, 1, s6); setq(q, 0, s7);
 }
 
-// Transpose between the natural (per-block words) and the bit-sliced layout. Self-composed here.
 fn orthoSwap(q: ptr, ia: int, ib: int, cl: ulong, ch: ulong, s: int): void {
     let a = getq(q, ia);
     let b = getq(q, ib);
@@ -107,7 +94,6 @@ fn ortho(q: ptr): void {
     orthoSwap(q, 3, 7, 0x0f0f0f0f, 0xf0f0f0f0, 4);
 }
 
-// SubWord for the key schedule: run one word through the bitsliced S-box.
 fn subWord(x: ulong): ulong {
     let q = bytes.alloc(32);
     let i = 0;
@@ -159,12 +145,10 @@ fn addRoundKey(q: ptr, sk: ptr, skOff: int): void {
     }
 }
 
-// An AES context: the expanded, bitsliced round keys and the number of rounds.
 pub struct Aes {
-    pub skey: ptr,      // (numRounds + 1) * 8 words, each 4 bytes
+    pub skey: ptr,
     pub numRounds: int,
 
-    // Expand a 16-byte (AES-128) or 32-byte (AES-256) key.
     pub fn create(key: ptr, keyLen: int): Aes {
         let ctx = bytes.new_with_allocator<Aes>(allocator.globalAllocator());
         let nr = if (keyLen == 32) 14 else if (keyLen == 24) 12 else 10;
@@ -172,7 +156,6 @@ pub struct Aes {
         let nk = keyLen / 4;
         let nkf = (nr + 1) * 4;
 
-        // Classic key expansion into skRaw (nkf words).
         let skRaw = bytes.alloc(nkf * 4);
         let i = 0;
         while (i < nk) { putLe32(skRaw, i * 4, le32(key, i * 4)); i = i + 1; }
@@ -194,12 +177,10 @@ pub struct Aes {
             i = i + 1;
         }
 
-        // Bitslice the round keys: each round is 4 words -> a q of 8 words -> stored expanded.
         ctx.skey = bytes.alloc((nr + 1) * 8 * 4);
         let q = bytes.alloc(32);
         let round = 0;
         while (round <= nr) {
-            // Block words go into the even q slots (the odd slots are the second parallel block).
             setq(q, 0, le32(skRaw, (round * 4 + 0) * 4));
             setq(q, 2, le32(skRaw, (round * 4 + 1) * 4));
             setq(q, 4, le32(skRaw, (round * 4 + 2) * 4));
@@ -218,10 +199,8 @@ pub struct Aes {
         return ctx;
     }
 
-    // Encrypt one 16-byte block from `in` to out (in and out may alias).
     pub fn encryptBlock(self: Aes, dataIn: ptr, out: ptr): void {
         let q = bytes.alloc(32);
-        // Block words go into the even q slots; the odd slots would hold a second parallel block.
         setq(q, 0, le32(dataIn, 0));
         setq(q, 2, le32(dataIn, 4));
         setq(q, 4, le32(dataIn, 8));

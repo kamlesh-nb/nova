@@ -1,9 +1,3 @@
-// S2 / F2-6: a cross-module function's return type is resolved in the CALLEE's module scope, not the
-// caller's. Two modules each declare `struct Rec` with DIFFERENT layouts. A consumer that imports both
-// and does `let b = rec_b.makeB()` must type `b` as B's Rec (heap List at offset 0, int `tag` at
-// offset 1), not A's Rec (two ints) -- otherwise later field access reads the wrong layout and crashes
-// (FieldNotFound / SEGV). Previously the return type `Rec` was lowered in the caller's scope, where the
-// also-imported A.Rec shadowed B's, mistyping the value.
 import assert;
 import scoped.rec_b;
 import scoped.rec_a;
@@ -18,13 +12,13 @@ fn test_module_a_rec(): void {
 @test
 fn test_module_b_rec_reads_own_layout(): void {
     let b = rec_b.makeB();
-    assert.equalInt(b.tag, 7);            // B's int field at offset 1
-    assert.equalInt(b.items.size(), 1);   // B's List field at offset 0
+    assert.equalInt(b.tag, 7);
+    assert.equalInt(b.items.size(), 1);
 }
 
 @test
 fn test_both_coexist(): void {
     let a = rec_a.makeA();
     let b = rec_b.makeB();
-    assert.equalInt(a.x + b.tag, 17);     // 10 + 7, each read at its own layout
+    assert.equalInt(a.x + b.tag, 17);
 }

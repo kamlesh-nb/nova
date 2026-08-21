@@ -1,16 +1,8 @@
-// Channels 1/3/5 (value-semantics): a "pure value DTO" -- a declared `struct` with only scalar/string/
-// nested-pure-value-struct fields and no trait impl -- stays on the heap when it is constructed-and-returned
-// (channel 1), serde-bound (3), or passed as a type-param arg (5). Copying it (`let b = a`) must DEEP-COPY
-// for value semantics, not alias. The trait/container structs (channels 2/4, the shared-state "should be
-// class" types) are deliberately NOT deep-copied and keep reference semantics.
 import assert;
 
 struct P { pub x: int, pub y: int, init(a: int, b: int) { self.x = a; self.y = b; } }
 struct Owned { pub data: string, pub n: int, init(d: string, k: int) { self.data = d; self.n = k; } }
 
-// Channel 2: a struct that IMPLEMENTS A TRAIT but is a pure value DTO (scalar fields only) is a stateless
-// value handler -- safe to deep-copy. The shared-state services (mediator/DI/pools) that must keep
-// reference semantics carry a container field, so they are excluded by the field check, not the trait.
 trait Greeter { fn greet(self): int; }
 struct Counter impl Greeter {
     pub n: int,
@@ -18,7 +10,7 @@ struct Counter impl Greeter {
     pub fn greet(self: Counter): int { return self.n; }
 }
 
-fn makeP(a: int, b: int): P { return P(a, b); }              // channel 1: constructed + returned
+fn makeP(a: int, b: int): P { return P(a, b); }
 fn makeOwned(i: int): Owned { return Owned("ret-" + istr(i), i); }
 
 @test
@@ -26,7 +18,7 @@ fn returned_struct_copy_is_independent(): void {
     let a = makeP(1, 2);
     let b = a;
     b.x = 99;
-    assert.equalInt(a.x, 1);        // a untouched (value semantics)
+    assert.equalInt(a.x, 1);
     assert.equalInt(b.x, 99);
     assert.equalInt(a.y, 2);
 }
@@ -40,8 +32,6 @@ fn returned_owned_copy_is_independent(): void {
     assert.equalStr(a.data, "ret-5");
 }
 
-// Channel 2: a trait-implementing pure value struct copies independently, and trait dispatch through the
-// copy still works.
 @test
 fn trait_struct_copy_independent(): void {
     let a = Counter(1);
@@ -59,8 +49,6 @@ fn trait_dispatch_after_copy(): void {
     assert.equalInt(a.n, 7);
 }
 
-// Owned inner + copy in a loop: the deep-copy retains the string, so both original and copy drop cleanly
-// under the --arc / --asan gates (no leak, no double-free).
 @test
 fn returned_owned_copy_no_leak(): void {
     let i = 0;

@@ -2,10 +2,6 @@ import list;
 import data.db;
 import web.di;
 
-// An in-memory database that implements the SAME `Connection` seam the real drivers (postgres, mysql,
-// btreedb, ...) implement. The repository code below is written against `Connection` + the micro-ORM,
-// so swapping in a live driver is a one-line change in main.nova: register a real connection instead of
-// this one, and nothing in the repository or the handlers changes. Rows are [id, name, price].
 pub struct InMemoryConnection impl Connection, Service {
     pub rows: List<Row>,
     pub nextId: int,
@@ -15,8 +11,6 @@ pub struct InMemoryConnection impl Connection, Service {
         self.nextId = 1;
     }
 
-    // INSERT: assign an id, store [id, <bound params: name, price>]. The new id comes back in
-    // ExecResult.rows_affected.
     async fn exec(self: InMemoryConnection, sql: string, params: List<DbValue>): ExecResult {
         let id = self.nextId;
         self.nextId = self.nextId + 1;
@@ -31,7 +25,6 @@ pub struct InMemoryConnection impl Connection, Service {
         return ExecResult(id, "INSERT");
     }
 
-    // SELECT: no params returns every row; one param filters by id (the WHERE id = $1 case).
     async fn query(self: InMemoryConnection, sql: string, params: List<DbValue>): ResultSet {
         let rs = ResultSet();
         rs.columns.push(Column("id", DbType.Int8));
@@ -52,9 +45,6 @@ pub struct InMemoryConnection impl Connection, Service {
         return rs;
     }
 
-    // The Connection seam requires queryWire; the in-memory store has no native wire format, so it
-    // re-encodes the materialised ResultSet through the generic fallback, exactly like a driver whose
-    // wire layout does not already match.
     async fn queryWire(self: InMemoryConnection, sql: string, params: List<DbValue>): WireRows {
         return db.wireRowsFromResultSet(await self.query(sql, params));
     }

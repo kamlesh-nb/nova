@@ -1,7 +1,4 @@
 // EXPECT-FAIL: typecheck
-// P2 (value-semantics): a `struct` (value type) that contains ITSELF by value has infinite size and must
-// be rejected. A `class` field, an optional, or a container would break the cycle; a bare inline field
-// cannot. This must FAIL to compile.
 struct Node {
     pub v: int,
     pub next: Node,

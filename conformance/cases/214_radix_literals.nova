@@ -1,6 +1,3 @@
-// Radix-prefixed integer literals: 0x hex, 0b binary, 0o octal. Read at their base, usable anywhere
-// a decimal integer is, and large hex values fit a long. Added for the in-Nova crypto work (M9), where
-// round constants and masks are naturally hexadecimal, but the feature is general.
 import assert;
 
 const MASK32: long = 0xffffffff;
@@ -34,7 +31,7 @@ fn binary_and_octal(): void {
 fn large_hex_is_long(): void {
     let m: long = 0xffffffff;
     assert.isTrue(m == 4294967295);
-    let full: long = 0xffffffffffffffff; // all 64 bits set == -1 as a signed long
+    let full: long = 0xffffffffffffffff;
     assert.isTrue(full == -1);
 }
 

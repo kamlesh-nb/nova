@@ -1,7 +1,3 @@
-// M8: the allocator page source is raw kernel pages (mmap of anonymous memory), not libc malloc.
-// The C bump arena under nova_bytes_alloc is mmap-backed; os/sys also exposes mmap/munmap so a Nova
-// arena can back itself the same way. This exercises the syscall path from Nova: map an anonymous
-// region, confirm it is zero-filled and read/write, then unmap it.
 import os.sys;
 import bytes;
 import assert;
@@ -12,11 +8,9 @@ fn mmap_anon_roundtrip(): void {
     let p = sys.mapAnon(n);
     assert.isTrue((p as long) != 0);
 
-    // Anonymous memory is zero-filled by the kernel.
     assert.equalInt(bytes.read_byte(p, 0), 0);
     assert.equalInt(bytes.read_byte(p, 40000), 0);
 
-    // It is writable and reads back what was written.
     bytes.write_i32(p, 0, 123456);
     bytes.write_byte(p, 4, 200);
     bytes.write_i32(p, 40000, 777);
@@ -29,7 +23,6 @@ fn mmap_anon_roundtrip(): void {
 
 @test
 fn mmap_many_pages(): void {
-    // A few independent mappings, each usable and released, to exercise repeated map/unmap.
     let i = 0;
     while (i < 8) {
         let n = 16384 as long;

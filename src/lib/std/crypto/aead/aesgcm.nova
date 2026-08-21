@@ -1,23 +1,13 @@
-// AES-GCM AEAD (NIST SP 800-38D) implemented in Nova over the constant-time bitsliced AES and the
-// constant-time GHASH, no external library (M9 phase B). This is the TLS AES_128_GCM_SHA256 and
-// AES_256_GCM_SHA384 record protection. The block cipher and GHASH are constant-time; the only
-// data-dependent branch here is the tag comparison on open, which is done as a constant-time compare.
-//
-// Reference: NIST SP 800-38D, wolfSSL AES-GCM (deps/wolfssl). Verified against the published GCM test
-// vectors and cross-checked against the wolfCrypt binding (conformance case 223).
 import bytes;
 import crypto.cipher.aes;
 import crypto.mac.ghash;
-import crypto.aead.aesgcmhw;   // hardware AES-GCM (CPU AES + CLMUL); used when the host supports it
-import mem.allocator;   // FR-tls-2: GcmContext is heap-allocated via the global allocator
+import crypto.aead.aesgcmhw;
+import mem.allocator;
 
-// Runtime CPU-feature probe: 1 when the host has the AES + carryless-multiply instructions, so GcmContext
-// can dispatch to the hardware AES-GCM (aesgcmhw) and fall back to the constant-time bitsliced path otherwise.
 extern("c") fn nova_cpu_has_aes(): int;
 
 pub const GCM_TAG_LEN: int = 16;
 
-// Increment the low 32 bits (bytes 12..15, big-endian) of a counter block, modulo 2^32.
 fn inc32(ctr: ptr): void {
     let i = 15;
     let carry = 1;
@@ -29,7 +19,6 @@ fn inc32(ctr: ptr): void {
     }
 }
 
-// Write a 64-bit big-endian value to buf+off.
 fn putLen64(buf: ptr, off: int, bits: long): void {
     let i = 0;
     while (i < 8) {
@@ -38,7 +27,6 @@ fn putLen64(buf: ptr, off: int, bits: long): void {
     }
 }
 
-// GCTR: XOR the AES-CTR keystream (starting at counter block icb) over len bytes.
 fn gctr(ctx: aes.Aes, icb: ptr, dataIn: ptr, len: int, out: ptr): void {
     let ctr = bytes.alloc(16);
     let i = 0;
@@ -60,7 +48,6 @@ fn gctr(ctx: aes.Aes, icb: ptr, dataIn: ptr, len: int, out: ptr): void {
     bytes.free(ks);
 }
 
-// Compute the hash subkey H = AES_K(0) and the pre-counter block J0 from the IV.
 fn computeH(ctx: aes.Aes, h: ptr): void {
     let zero = bytes.alloc(16);
     let i = 0;
@@ -69,8 +56,6 @@ fn computeH(ctx: aes.Aes, h: ptr): void {
     bytes.free(zero);
 }
 
-// J0 with a caller-owned GHASH (whose H is already the cached hash subkey). The 12-byte IV fast path
-// touches no GHASH; the rare longer-IV path resets and reuses the passed hash so no table is rebuilt.
 fn computeJ0(g: ghash.Ghash, iv: ptr, ivLen: int, j0: ptr): void {
     if (ivLen == 12) {
         let i = 0;
@@ -80,7 +65,6 @@ fn computeJ0(g: ghash.Ghash, iv: ptr, ivLen: int, j0: ptr): void {
         bytes.write_byte(j0, 14, 0);
         bytes.write_byte(j0, 15, 1);
     } else {
-        // J0 = GHASH_H(IV || pad || 0^64 || len64(ivbits)).
         g.reset();
         g.update(iv, ivLen);
         let lb = bytes.alloc(16);
@@ -93,8 +77,6 @@ fn computeJ0(g: ghash.Ghash, iv: ptr, ivLen: int, j0: ptr): void {
     }
 }
 
-// GHASH over aad || pad || ct || pad || len64(aadbits) || len64(ctbits), into s. The caller-owned GHASH
-// carries the cached H and tables; we just reset the running value and feed this record.
 fn computeS(g: ghash.Ghash, aad: ptr, aadLen: int, ct: ptr, ctLen: int, s: ptr): void {
     g.reset();
     g.update(aad, aadLen);
@@ -107,24 +89,17 @@ fn computeS(g: ghash.Ghash, aad: ptr, aadLen: int, ct: ptr, ctLen: int, s: ptr):
     bytes.free(lens);
 }
 
-// FR-tls-2: a per-connection AES-GCM context. The AES key schedule, the hash subkey H, and the GHASH
-// tables built from H are all a pure function of the key, so a TLS endpoint that protects many records
-// under one traffic key should build them once and reuse them. seal/open below still exist as one-shot
-// wrappers, but a caller holding a GcmContext across records pays the setup exactly once.
 pub struct GcmContext {
-    pub ctx: aes.Aes,     // cached AES key schedule (software / bitsliced path)
-    pub h: ptr,           // cached hash subkey H = E_K(0)
-    pub g: ghash.Ghash,   // cached GHASH state (H tables built once; y reset per record)
+    pub ctx: aes.Aes,
+    pub h: ptr,
+    pub g: ghash.Ghash,
 
-    // Hardware fast path (CPU AES + CLMUL). When hwAes is true, seal/open dispatch to aesgcmhw using the
-    // cached key schedule (hwRk), GHASH subkey in standard order (hwHStd) and the bit-reverse table (hwBrev),
-    // all built once at create() time. When false these are unused and the software path above runs.
     pub hwAes: bool,
     pub hwNr: int,
     pub hwRk: ptr,
     pub hwHStd: ptr,
     pub hwBrev: ptr,
-    pub hwHpows: ptr,   // cached 64B H^1..H^4 table for the fused-seal GHASH aggregation
+    pub hwHpows: ptr,
 
     pub fn create(key: ptr, keyLen: int): GcmContext {
         let c = bytes.new_with_allocator<GcmContext>(allocator.globalAllocator());
@@ -145,7 +120,6 @@ pub struct GcmContext {
         return c;
     }
 
-    // Encrypt ptLen bytes at pt into ctOut and write the 16-byte tag to tagOut, reusing the cached schedule.
     pub fn seal(self: GcmContext, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
                 pt: ptr, ptLen: int, ctOut: ptr, tagOut: ptr): void {
         if (self.hwAes) {
@@ -172,8 +146,6 @@ pub struct GcmContext {
         bytes.free(j0); bytes.free(icb); bytes.free(s); bytes.free(ej0);
     }
 
-    // Verify the tag and, on success, decrypt ct into ptOut and return true. A false return means the tag
-    // did not verify; ptOut must not be used.
     pub fn open(self: GcmContext, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
                 ct: ptr, ctLen: int, tag: ptr, ptOut: ptr): bool {
         if (self.hwAes) {
@@ -219,9 +191,6 @@ pub struct GcmContext {
     }
 }
 
-// Seal: encrypt ptLen bytes at pt to ctOut and write the 16-byte tag to tagOut. keyLen is 16 or 32.
-// One-shot wrapper: builds a context, uses it once, tears it down. Callers protecting many records under
-// the same key should hold a GcmContext instead.
 pub fn seal(key: ptr, keyLen: int, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
             pt: ptr, ptLen: int, ctOut: ptr, tagOut: ptr): void {
     let c = GcmContext.create(key, keyLen);
@@ -229,8 +198,6 @@ pub fn seal(key: ptr, keyLen: int, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
     c.delete();
 }
 
-// Open: verify the tag, and on success decrypt ct to ptOut and return true. A false return means the
-// tag did not verify; ptOut must not be used. One-shot wrapper over GcmContext.
 pub fn open(key: ptr, keyLen: int, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
             ct: ptr, ctLen: int, tag: ptr, ptOut: ptr): bool {
     let c = GcmContext.create(key, keyLen);

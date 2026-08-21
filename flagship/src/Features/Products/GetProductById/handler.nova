@@ -7,10 +7,6 @@ import Infrastructure.product_repository;
 pub struct GetProductByIdHandler impl MessageHandler {
     pub repo: ProductRepository,
 
-    // `handle` is `async fn` (the MessageHandler trait now declares it so), so it can `await` the
-    // repository's async DB query DIRECTLY on the request coroutine — a genuine PER-REQUEST database
-    // read through the `nova get`-fetched nova-postgres driver. The query PARKS this coroutine while the
-    // socket round-trips; it does not block-drive. Degrades gracefully when the DB is offline.
     async fn handle(self: GetProductByIdHandler, src: ValueSource): Response {
         let q = GetProductById{ id: src.getInt("id") as int };
         let name = await self.repo.productName(q.id);

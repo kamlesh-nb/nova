@@ -1,8 +1,3 @@
-// OCSP/CRL revocation wired into truststore chain verification. Using a self-signed P-256 fixture (the
-// cert is its own issuer + root), a `good` stapled OCSP / clean CRL let a trusted chain through, while a
-// `revoked` OCSP / a CRL listing the leaf serial make trustsNotRevoked HARD-FAIL even though the chain
-// itself is valid. Missing/undeterminable revocation SOFT-FAILs (accepted). This gates the binding
-// (serial match) + issuer-signature verification in crypto/tls/revocation over the real chain path.
 import crypto.tls.truststore;
 import crypto.tls.revocation;
 import crypto.x509;
@@ -27,7 +22,6 @@ fn mkTime(): ptr {
     return b;
 }
 fn keyHash(): ptr { let b = bytes.alloc(20); let i = 0; while (i < 20) { bytes.write_byte(b, i, 0x33); i = i + 1; } return b; }
-// A TLS 1.3 certificate_list holding just the leaf: certLen(3) || cert || ext(2)=0000.
 fn certList(cert: ptr): ptr {
     let out = bytes.alloc(CLEN + 8);
     bytes.write_byte(out, 0, (CLEN >> 16) & 0xff); bytes.write_byte(out, 1, (CLEN >> 8) & 0xff); bytes.write_byte(out, 2, CLEN & 0xff);
@@ -44,23 +38,19 @@ fn test_revocation_module_binds_and_verifies(): void {
     assert.isTrue(leaf.ok);
     let serial = (cert as long + leaf.serialStart) as ptr;
 
-    // good OCSP for the leaf serial, signed by the (self-)issuer key -> REV_GOOD
     let good = bytes.alloc(1024);
     let gn = ocsp.buildTestResponse(serial, leaf.serialLen, ocsp.CERT_GOOD, key, keyHash(), mkTime(), good);
     assert.equalInt(revocation.REV_GOOD, revocation.checkOcspStapled(leaf, leaf, good, gn));
 
-    // revoked OCSP -> REV_REVOKED
     let rev = bytes.alloc(1024);
     let rn = ocsp.buildTestResponse(serial, leaf.serialLen, ocsp.CERT_REVOKED, key, keyHash(), mkTime(), rev);
     assert.equalInt(revocation.REV_REVOKED, revocation.checkOcspStapled(leaf, leaf, rev, rn));
 
-    // an OCSP for a DIFFERENT serial does not bind -> UNKNOWN (soft-fail)
     let other = bytes.alloc(8); let i = 0; while (i < 8) { bytes.write_byte(other, i, 0x55); i = i + 1; }
     let mism = bytes.alloc(1024);
     let mn = ocsp.buildTestResponse(other, 8, ocsp.CERT_GOOD, key, keyHash(), mkTime(), mism);
     assert.equalInt(revocation.REV_UNKNOWN, revocation.checkOcspStapled(leaf, leaf, mism, mn));
 
-    // CRL listing the leaf serial -> REV_REVOKED; a clean CRL -> REV_GOOD
     let crlR = bytes.alloc(1024);
     let cn = crl.buildTestCrl(serial, leaf.serialLen, 1, key, mkTime(), crlR);
     assert.equalInt(revocation.REV_REVOKED, revocation.checkCrl(leaf, leaf, crlR, cn));
@@ -79,23 +69,18 @@ fn test_truststore_hard_fails_on_revoked(): void {
     let store = truststore.newTrustStoreDer(hexBuf(CERT), CLEN);
     let now = 20260803120000;
 
-    // baseline: the chain is trusted (self-signed root, host in SAN)
     assert.isTrue(store.trusts(list, CLEN + 5, "localhost", now));
 
-    // good OCSP staple: trusted AND not revoked -> accept
     let good = bytes.alloc(1024);
     let gn = ocsp.buildTestResponse(serial, leaf.serialLen, ocsp.CERT_GOOD, key, keyHash(), mkTime(), good);
     assert.isTrue(store.trustsNotRevoked(list, CLEN + 5, "localhost", now, good, gn, bytes.alloc(1), 0));
 
-    // revoked OCSP staple: chain valid but REVOKED -> HARD-FAIL
     let rev = bytes.alloc(1024);
     let rn = ocsp.buildTestResponse(serial, leaf.serialLen, ocsp.CERT_REVOKED, key, keyHash(), mkTime(), rev);
     assert.isFalse(store.trustsNotRevoked(list, CLEN + 5, "localhost", now, rev, rn, bytes.alloc(1), 0));
 
-    // no revocation material: SOFT-FAIL -> accept (unchanged from plain trusts)
     assert.isTrue(store.trustsNotRevoked(list, CLEN + 5, "localhost", now, bytes.alloc(1), 0, bytes.alloc(1), 0));
 
-    // CRL listing the serial -> HARD-FAIL
     let crlR = bytes.alloc(1024);
     let cn = crl.buildTestCrl(serial, leaf.serialLen, 1, key, mkTime(), crlR);
     assert.isFalse(store.trustsNotRevoked(list, CLEN + 5, "localhost", now, bytes.alloc(1), 0, crlR, cn));

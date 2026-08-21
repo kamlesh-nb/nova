@@ -1,40 +1,19 @@
-// Emit-subset growth (C4, nullish `a ?? b` for REFERENCE optionals). A reference optional (`string |
-// undefined`, a class `T | undefined`) is a plain nullable pointer word: `undefined` is the null word (0),
-// present is the payload pointer, and the AST does NOT box it. So `a ?? b` is exactly `a != null ? a : b` --
-// a present-check branch on the pointer word, which the optimiser emit path (NOVA_OPT_EMIT) lowers to a
-// `condbr` on a bare `icmp ne i64 a, 0`. These free functions only apply `??` to a passed-in reference
-// optional and never materialise `undefined` in their body, so they compile from the optimised IR.
-//
-// A VALUE optional (`int | undefined`) is BOXED (a present 0 must be distinguishable from absent), so its
-// absent sentinel is NOT the null word 0. `clampOr` applies `??` to a value optional: the emit path CANNOT
-// represent the box, so the whole function falls back to the AST -- both engines must agree on it. Likewise
-// an optional CHAIN (`u.profile?.name`) whose field read needs ARC / whose result is a value optional stays
-// on the AST. This case pins that the reference-nullish emits and everything else falls back byte-identically
-// (run it with and without NOVA_OPT_EMIT=1; the results must match).
 import assert;
 
 struct Box { pub tag: string }
 
-// REFERENCE string-optional nullish -- EMITS. `undefined` never appears in the body.
 fn firstNonEmpty(a: string | undefined, b: string): string {
     return a ?? b;
 }
 
-// REFERENCE class-optional nullish -- EMITS. A class optional is a nullable pointer word too, so `a ?? b`
-// is the same present-check branch; the result is compared (a bare reference-word `icmp`), which keeps the
-// value in scalar position so the whole function emits.
 fn isDefaulted(a: Box | undefined, b: Box): bool {
     return (a ?? b) == b;
 }
 
-// REFERENCE class-optional nullish that RETURNS the struct. The nullish itself is emittable, but returning a
-// BORROWED heap struct is a separate ARC slice (D4) the return gate does not admit yet, so this falls back --
-// included so both engines agree on the returned-struct shape too.
 fn boxOr(a: Box | undefined, b: Box): Box {
     return a ?? b;
 }
 
-// VALUE optional nullish -- BOXED, so this stays on the AST path (both engines agree).
 fn clampOr(v: int | undefined, d: int): int {
     return v ?? d;
 }
@@ -52,8 +31,8 @@ fn test_ref_class_nullish(): void {
     let d = Box{ tag: "D" };
     let present: Box | undefined = Box{ tag: "P" };
     let absent: Box | undefined = undefined;
-    assert.isFalse(isDefaulted(present, d)); // present -> yields `a`, not `b`
-    assert.isTrue(isDefaulted(absent, d));   // absent  -> yields `b`
+    assert.isFalse(isDefaulted(present, d));
+    assert.isTrue(isDefaulted(absent, d));
     assert.equalStr(boxOr(present, d).tag, "P");
     assert.equalStr(boxOr(absent, d).tag, "D");
 }
@@ -65,5 +44,5 @@ fn test_value_optional_nullish_fallback(): void {
     let zero: int | undefined = 0;
     assert.equalInt(clampOr(present, 99), 7);
     assert.equalInt(clampOr(absent, 99), 99);
-    assert.equalInt(clampOr(zero, 99), 0); // present 0 must NOT read as absent
+    assert.equalInt(clampOr(zero, 99), 0);
 }

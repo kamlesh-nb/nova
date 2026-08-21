@@ -1,7 +1,3 @@
-// ECDSA-P256 signing with the RFC 6979 deterministic nonce, in Nova (M9 phase E, no external library).
-// Verified against the RFC 6979 Appendix A.2.5 P-256 / SHA-256 test vectors (private key C9AFA9..., the
-// messages "sample" and "test"): the produced (r, s) match the RFC exactly, and the signatures verify
-// under the Nova ECDSA verifier with the public key derived from the same private key.
 import crypto.ecc.p256;
 import bytes;
 import assert;
@@ -36,7 +32,6 @@ const H_TEST: string = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15
 const R_TEST: string = "f1abb023518351cd71d881567b1ea663ed3efcf6c5132b354f28d3b0b7d38367";
 const S_TEST: string = "019f4113742a2b14bd25926b49c649155f267e60d3814b4c0cc84250e46f0083";
 
-// The deterministic (r, s) for "sample" match RFC 6979 exactly.
 @test
 fn rfc6979_sample(): void {
     let r = bytes.alloc(32); let s = bytes.alloc(32);
@@ -46,7 +41,6 @@ fn rfc6979_sample(): void {
     assert.isTrue(eqHex(s, 32, S_SAMPLE));
 }
 
-// The deterministic (r, s) for "test" match RFC 6979 exactly.
 @test
 fn rfc6979_test(): void {
     let r = bytes.alloc(32); let s = bytes.alloc(32);
@@ -56,7 +50,6 @@ fn rfc6979_test(): void {
     assert.isTrue(eqHex(s, 32, S_TEST));
 }
 
-// Sign then verify with the derived public key (sign/verify round trip).
 @test
 fn sign_verify_roundtrip(): void {
     let pk = bytes.alloc(65);
@@ -64,6 +57,5 @@ fn sign_verify_roundtrip(): void {
     let r = bytes.alloc(32); let s = bytes.alloc(32);
     p256.ecdsaSign(hexBuf(H_SAMPLE), hexBuf(PRIV), r, s);
     assert.isTrue(p256.ecdsaVerify(hexBuf(H_SAMPLE), pk, r, s));
-    // The signature is for this message; a different digest must not verify.
     assert.isTrue(!p256.ecdsaVerify(hexBuf(H_TEST), pk, r, s));
 }

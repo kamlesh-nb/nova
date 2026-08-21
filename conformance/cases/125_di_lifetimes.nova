@@ -1,7 +1,3 @@
-// 125 — DI lifetimes through the runtime mediator's per-request scope. The compiler-generated adapter
-// builds the handler fresh for every request, resolving its constructor dependencies from a per-request
-// `ServiceScope`. So a SCOPED service is one instance per request (its counter resets each request),
-// while a SINGLETON persists across requests (its counter advances). This is the ASP.NET lifetime model.
 import assert;
 import web.app;
 import web.di;
@@ -14,15 +10,12 @@ import serde.json;
 import serde.source;
 import string;
 
-// Stateful services: `inc()` advances a per-INSTANCE counter, so the value reveals whether a caller got
-// a fresh instance (counter 1) or a shared one (counter keeps climbing).
 struct SCount impl Service { pub v: int, init() { self.v = 0; } pub fn inc(self: SCount): int { self.v = self.v + 1; return self.v; } }
 struct GCount impl Service { pub v: int, init() { self.v = 0; } pub fn inc(self: GCount): int { self.v = self.v + 1; return self.v; } }
 
 @serializable struct Req impl Message { pub x: int }
 @serializable struct CountDto { pub scoped: int, pub singleton: int }
 
-// The handler is built per request; it injects a SCOPED and a SINGLETON service through its constructor.
 struct H impl RequestHandler<Req, CountDto> {
     scoped: SCount,
     singleton: GCount,
@@ -34,15 +27,14 @@ struct H impl RequestHandler<Req, CountDto> {
 
 fn makeApp(): App {
     let services = ServiceCollection();
-    services.addScoped("SCount", (sp) => { return SCount(); });      // one per request
-    services.addSingleton("GCount", (sp) => { return GCount(); });   // one for the whole app
+    services.addScoped("SCount", (sp) => { return SCount(); });
+    services.addSingleton("GCount", (sp) => { return GCount(); });
     let a = App();
     a.useServices(services);
     a.get<Req>("/count/{x:int}");
     return a;
 }
 
-// Across two requests: the scoped counter is fresh each request (always 1), the singleton advances 1 -> 2.
 @test
 fn test_scoped_resets_singleton_persists(): void {
     let a = makeApp();

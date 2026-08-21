@@ -1,12 +1,9 @@
 // EXPECT-FAIL: typecheck
-// L3 / C-chk-7: a tuple destructuring must bind exactly as many names as the tuple has elements. Before
-// the fix, `let (a,b,c) = pair` where `pair` is a 2-tuple was accepted and the extra name bound garbage.
-// This must FAIL to compile.
 import assert;
 
 @test
 fn wrong_arity_destructure_is_rejected(): void {
     let pair: (int, int) = (10, 20);
-    let (a, b, c) = pair;   // rejected: 3 names, 2 elements
+    let (a, b, c) = pair;
     assert.equalInt(a + b, 30);
 }

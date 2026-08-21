@@ -1,7 +1,3 @@
-// FR-simd-L1: integer-vector SIMD. u8x16 (<16 x i8>), u32x4 (<4 x i32>), u64x2 (<2 x i64>) with
-// splat / load / store / add / sub / and / or / xor / eq / shl / shr and the movemask primitive. Each
-// lowers to a native LLVM vector op (see codegen compileIntSimd). load/store move a lane group to/from a
-// byte buffer at a byte offset, so these compose directly with bytes.alloc and the mem builtins.
 import assert;
 import bytes;
 
@@ -16,7 +12,7 @@ fn u8x16_load_xor_store(): void {
         bytes.write_byte(b, i, 0xff);
         i = i + 1;
     }
-    let vx = simd.xorU8x16(simd.loadU8x16(a, 0), simd.loadU8x16(b, 0));   // i ^ 0xff = 255 - i
+    let vx = simd.xorU8x16(simd.loadU8x16(a, 0), simd.loadU8x16(b, 0));
     simd.storeU8x16(d, 0, vx);
     i = 0;
     while (i < 16) { assert.equalInt(bytes.read_byte(d, i), 255 - i); i = i + 1; }
@@ -24,12 +20,11 @@ fn u8x16_load_xor_store(): void {
 
 @test
 fn u8x16_eq_movemask(): void {
-    // Find bytes equal to 'A' (0x41) at lanes 3 and 7; movemask packs the per-lane result to a bitmask.
     let a = bytes.alloc(16);
     let i = 0;
     while (i < 16) { bytes.write_byte(a, i, if (i == 3 || i == 7) 0x41 else 0x00); i = i + 1; }
     let eqv = simd.eqU8x16(simd.loadU8x16(a, 0), simd.splatU8x16(0x41));
-    assert.equalInt(simd.movemaskU8x16(eqv), 0x88);   // bits 3 and 7
+    assert.equalInt(simd.movemaskU8x16(eqv), 0x88);
 }
 
 @test
@@ -51,16 +46,16 @@ fn u8x16_add_and_or(): void {
 fn u32x4_add_and_shift(): void {
     let buf = bytes.alloc(16);
     let i = 0;
-    while (i < 4) { bytes.write_i32(buf, i * 4, i + 1); i = i + 1; }   // 1,2,3,4
+    while (i < 4) { bytes.write_i32(buf, i * 4, i + 1); i = i + 1; }
     let v = simd.loadU32x4(buf, 0);
     let out = bytes.alloc(16);
-    simd.storeU32x4(out, 0, simd.shlU32x4(v, 1));                     // *2 -> 2,4,6,8
+    simd.storeU32x4(out, 0, simd.shlU32x4(v, 1));
     i = 0;
     while (i < 4) { assert.equalInt(bytes.read_i32(out, i * 4), (i + 1) * 2); i = i + 1; }
-    simd.storeU32x4(out, 0, simd.addU32x4(v, simd.splatU32x4(10)));   // +10 -> 11,12,13,14
+    simd.storeU32x4(out, 0, simd.addU32x4(v, simd.splatU32x4(10)));
     i = 0;
     while (i < 4) { assert.equalInt(bytes.read_i32(out, i * 4), (i + 1) + 10); i = i + 1; }
-    simd.storeU32x4(out, 0, simd.shrU32x4(simd.splatU32x4(16), 2));   // >>2 -> 4,4,4,4
+    simd.storeU32x4(out, 0, simd.shrU32x4(simd.splatU32x4(16), 2));
     assert.equalInt(bytes.read_i32(out, 0), 4);
 }
 
@@ -71,10 +66,10 @@ fn u64x2_add_xor(): void {
     bytes.write_i32(buf, 8, 9); bytes.write_i32(buf, 12, 0);
     let v = simd.loadU64x2(buf, 0);
     let out = bytes.alloc(16);
-    simd.storeU64x2(out, 0, simd.addU64x2(v, simd.splatU64x2(3)));    // 8, 12
+    simd.storeU64x2(out, 0, simd.addU64x2(v, simd.splatU64x2(3)));
     assert.equalInt(bytes.read_i32(out, 0), 8);
     assert.equalInt(bytes.read_i32(out, 8), 12);
-    simd.storeU64x2(out, 0, simd.xorU64x2(v, v));                     // 0, 0
+    simd.storeU64x2(out, 0, simd.xorU64x2(v, v));
     assert.equalInt(bytes.read_i32(out, 0), 0);
     assert.equalInt(bytes.read_i32(out, 8), 0);
 }
