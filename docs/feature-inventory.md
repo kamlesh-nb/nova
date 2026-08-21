@@ -543,12 +543,16 @@ shell harnesses are manual and non-gating.
 ### MVCC ; PARTIAL ; read
 
 - [x] Uncommitted rows invisible; committed visible; rolled-back invisible (Read Committed).
-- [ ] Snapshot / repeatable-read / serializable isolation. PARTIAL: snapshot / REPEATABLE READ are now
-      IMPLEMENTED (nova-novadb) -- a transaction opened under `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`
-      (or `SNAPSHOT`) captures a frozen MVCC snapshot at BEGIN (committed-set copy + xid ceiling) and every read
-      observes it, so a row committed by another session after the snapshot stays invisible for the whole txn
-      (gated -- see the isolation-level criterion below). SERIALIZABLE is deliberately REJECTED (true SSI is not
-      implemented) rather than silently downgraded, so this bundled criterion stays [ ] honestly pending SSI.
+- [x] Snapshot / repeatable-read / serializable isolation. DONE (nova-novadb). Snapshot / REPEATABLE READ:
+      a txn under `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ` (or `SNAPSHOT`) freezes an MVCC snapshot at
+      BEGIN and every read observes it. **SERIALIZABLE**: implemented via Cahill-style SSI on top of the
+      snapshot -- the txn is registered with an rw-antidependency tracker (transaction.zig, own `ssi_mutex`);
+      table-granularity SIREAD records reads/writes, sets in/out conflict flags between concurrent serializable
+      txns, and aborts a committing "pivot" (both flags set) with a serialisation failure, which prevents write
+      skew (the anomaly plain snapshot isolation allows). Sound but conservative (table granularity -> some
+      false aborts; row-level is future work). Gated by root.zig "SSI: SERIALIZABLE prevents write skew that
+      REPEATABLE READ allows" (0 aborts under RR, >=1 under SERIALIZABLE on the same interleaving) + the
+      isolation-level test.
 - [x] An aborted row is never visible in memory before restart. FIXED (nova-novadb d934c85): a
       committed-then-failed transaction (WAL commit record could not be written, e.g. ENOSPC) left
       `current_tx_id` set and un-aborted, so the owning session kept seeing its own uncommitted rows
