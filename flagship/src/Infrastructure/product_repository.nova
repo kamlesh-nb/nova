@@ -20,6 +20,6 @@ pub struct ProductRepository {
         if (rs.rowCount() > 0) {
             return rs.row(0).getText(0);
         }
-        return "Sample Product (database offline — fallback)";
+        return "Sample Product (database offline, fallback)";
     }
 }

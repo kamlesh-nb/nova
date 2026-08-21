@@ -37,7 +37,7 @@
 //!
 //! Design notes worth knowing before editing:
 //!   - Type names are compared through [`canonicalizeTypeName`], which folds the
-//!     friendly spellings (`int`/`long`/`byte`/`double`/`u32`…) onto a canonical
+//!     friendly spellings (`int`/`long`/`byte`/`double`/`u32`...) onto a canonical
 //!     `iN`/`fN` name. Signedness is recovered separately from the ORIGINAL name
 //!     ([`intNameSigned`]) because canonicalisation is lossy about sign.
 //!   - Diagnostics are emitted TWICE by [`TypeChecker.addError`]: a plain
@@ -62,7 +62,7 @@ const builtins = @import("sema/builtins.zig");
 ///
 /// Returns `null` only for `builtins.Ret` variants that carry no meaningful
 /// Nova type. Note the SIMD lanes map to Nova's vector spellings (`f64x4`,
-/// `u8x16`, …), which the rest of the checker treats as plain idents.
+/// `u8x16`, ...), which the rest of the checker treats as plain idents.
 fn builtinRetType(r: builtins.Ret) ?ast.TypeRef {
     return switch (r) {
         .void_ => ast.TypeRef{ .ident = "void" },
@@ -157,7 +157,7 @@ fn isNarrowingInt(from: ast.TypeRef, to: ast.TypeRef) bool {
 ///
 /// Decided from the ORIGINAL spelling, not the canonical name, because
 /// canonicalisation collapses `u32`→`i32` and loses the sign. The rule is:
-/// signed unless the name starts with `u` (`uint`, `u8`, `ulong`, …) or is
+/// signed unless the name starts with `u` (`uint`, `u8`, `ulong`, ...) or is
 /// exactly `byte` (which Nova treats as unsigned).
 fn intNameSigned(name: []const u8) bool {
     return !(std.mem.startsWith(u8, name, "u") or std.mem.eql(u8, name, "byte"));
@@ -540,7 +540,7 @@ pub const TypeChecker = struct {
                 if (cd.is_reference) continue;
                 if (self.colliding_structs.contains(child)) continue;
                 switch (state.get(child) orelse 0) {
-                    1 => self.addError(fld.span, "value struct '{s}' contains itself by value through field '{s}: {s}' — a `struct` stored inline cannot form a cycle (infinite size). Make one of the types a `class` (a heap reference), or hold it behind an optional or a container.", .{ name, fld.name, child }),
+                    1 => self.addError(fld.span, "value struct '{s}' contains itself by value through field '{s}: {s}', a `struct` stored inline cannot form a cycle (infinite size). Make one of the types a `class` (a heap reference), or hold it behind an optional or a container.", .{ name, fld.name, child }),
                     0 => self.dfsValueStructCycle(child, state),
                     else => {},
                 }
@@ -600,7 +600,7 @@ pub const TypeChecker = struct {
                 if (self.fn_def_sites.contains(key)) {
                     if (self.fn_first_line.get(key)) |ln| {
                         if (!gen_file and ln != decl.fn_decl.span.line) {
-                            self.addError(decl.fn_decl.span, "duplicate function '{s}' — already defined at line {d} in this module (Nova has no overloading)", .{ decl.fn_decl.name, ln });
+                            self.addError(decl.fn_decl.span, "duplicate function '{s}', already defined at line {d} in this module (Nova has no overloading)", .{ decl.fn_decl.name, ln });
                         }
                     }
                     self.allocator.free(key);
@@ -733,13 +733,13 @@ pub const TypeChecker = struct {
             if (func.ret_type) |rt| {
                 const is_voidish = rt == .ident and (std.mem.eql(u8, rt.ident, "void") or std.mem.eql(u8, rt.ident, "any"));
                 if (!is_voidish and !self.blockDefinitelyReturns(func.body)) {
-                    self.addError(func.span, "function '{s}' has return type '{s}' but can finish without returning a value — add a `return` on every path (or an ending loop/return)", .{ func.name, typeRefName(rt) });
+                    self.addError(func.span, "function '{s}' has return type '{s}' but can finish without returning a value, add a `return` on every path (or an ending loop/return)", .{ func.name, typeRefName(rt) });
                 }
             }
         }
 
         if (self.is_wasm and func.is_async) {
-            self.addError(func.span, "'async fn {s}' is not available on the wasm target — async has no coroutine runtime in wasm. Move it into a `@native {{ ... }}` block (and provide a synchronous or host-imported `@wasm {{ ... }}` alternative).", .{func.name});
+            self.addError(func.span, "'async fn {s}' is not available on the wasm target, async has no coroutine runtime in wasm. Move it into a `@native {{ ... }}` block (and provide a synchronous or host-imported `@wasm {{ ... }}` alternative).", .{func.name});
         }
         const prev_ret = self.current_ret_type;
         self.current_ret_type = func.ret_type;
@@ -753,7 +753,7 @@ pub const TypeChecker = struct {
     /// Short display name of a type for use inside error messages.
     ///
     /// Returns the bare identifier for `.ident` types and the placeholder
-    /// `"<type>"` for compound types (optional/generic/tuple/…), which is enough
+    /// `"<type>"` for compound types (optional/generic/tuple/...), which is enough
     /// for the diagnostics that call it since they concern named types.
     fn typeRefName(t: ast.TypeRef) []const u8 {
         return switch (t) {
@@ -789,7 +789,7 @@ pub const TypeChecker = struct {
     ///
     /// Two rules fire: the 128-bit integer types `i128`/`u128` were removed in
     /// F3 §3.1 and always error; and, when `check_unknown_in` is set and the
-    /// span is from a real source file (not a synthetic `<…>` file), any named
+    /// span is from a real source file (not a synthetic `<...>` file), any named
     /// type that is not known via [`isKnownTypeName`] errors. Descends through
     /// optionals, error unions, arrays, generic params, function types, and
     /// tuples so a bad type nested anywhere is caught. `check_unknown` is forced
@@ -804,7 +804,7 @@ pub const TypeChecker = struct {
                     return;
                 }
                 if (check_unknown and !self.isKnownTypeName(n, tparams)) {
-                    self.addError(span, "unknown type '{s}' — not a primitive, type parameter, or declared struct/enum/trait", .{n});
+                    self.addError(span, "unknown type '{s}', not a primitive, type parameter, or declared struct/enum/trait", .{n});
                 }
             },
             .optional => |inner| self.rejectUnimplementedType(inner.*, span, tparams, check_unknown),
@@ -815,7 +815,7 @@ pub const TypeChecker = struct {
             .fixed_array => |fa| self.rejectUnimplementedType(fa.element.*, span, tparams, check_unknown),
             .generic => |g| {
                 if (check_unknown and !self.isKnownTypeName(g.name, tparams)) {
-                    self.addError(span, "unknown type '{s}' — not a primitive, type parameter, or declared struct/enum/trait", .{g.name});
+                    self.addError(span, "unknown type '{s}', not a primitive, type parameter, or declared struct/enum/trait", .{g.name});
                 }
                 for (g.params) |p| self.rejectUnimplementedType(p, span, tparams, check_unknown);
             },
@@ -961,7 +961,7 @@ pub const TypeChecker = struct {
             const at = self.resolveExprType(args[i]) orelse continue;
             if (at != .ident) continue;
             if (self.traits.contains(at.ident) and !std.mem.eql(u8, at.ident, pt.ident)) {
-                self.addError(args[i].span, "cannot pass a trait object '{s}' to concrete parameter '{s}: {s}' — a trait value may hold any implementation, so narrowing it needs an explicit downcast ('<expr> as {s}'), or the parameter should take the trait type '{s}'", .{ at.ident, params[i].name, pt.ident, pt.ident, at.ident });
+                self.addError(args[i].span, "cannot pass a trait object '{s}' to concrete parameter '{s}: {s}', a trait value may hold any implementation, so narrowing it needs an explicit downcast ('<expr> as {s}'), or the parameter should take the trait type '{s}'", .{ at.ident, params[i].name, pt.ident, pt.ident, at.ident });
             }
         }
     }
@@ -992,7 +992,7 @@ pub const TypeChecker = struct {
             const at = self.resolveExprType(args[i]) orelse continue;
             if (at != .ident) continue;
             if (self.traits.contains(at.ident) and !std.mem.eql(u8, at.ident, pt.ident)) {
-                self.addError(args[i].span, "cannot pass a trait object '{s}' to a concrete element/parameter of type '{s}' — a trait value may hold any implementation, so narrowing it needs an explicit downcast ('<expr> as {s}')", .{ at.ident, pt.ident, pt.ident });
+                self.addError(args[i].span, "cannot pass a trait object '{s}' to a concrete element/parameter of type '{s}', a trait value may hold any implementation, so narrowing it needs an explicit downcast ('<expr> as {s}')", .{ at.ident, pt.ident, pt.ident });
             }
         }
     }
@@ -1073,7 +1073,7 @@ pub const TypeChecker = struct {
                             if (it == .tuple) {
                                 const arity = it.tuple.len;
                                 if (names.len != arity) {
-                                    self.addError(ls.span, "tuple destructuring binds {d} name(s) but the tuple has {d} element(s) — the counts must match", .{ names.len, arity });
+                                    self.addError(ls.span, "tuple destructuring binds {d} name(s) but the tuple has {d} element(s), the counts must match", .{ names.len, arity });
                                 }
                                 for (names, 0..) |nm, i| {
                                     if (i < arity) try self.variables.put(nm, it.tuple[i]);
@@ -1091,7 +1091,7 @@ pub const TypeChecker = struct {
                             if (intTypeRange(t.ident)) |range| {
                                 if (intLiteralValue(init_expr)) |v| {
                                     if (v < range.min or v > range.max) {
-                                        self.addError(ls.span, "integer literal {d} is out of range for '{s}' — use a wider type (e.g. 'long') or an explicit cast", .{ v, t.ident });
+                                        self.addError(ls.span, "integer literal {d} is out of range for '{s}', use a wider type (e.g. 'long') or an explicit cast", .{ v, t.ident });
                                     }
                                 }
                             }
@@ -1102,9 +1102,9 @@ pub const TypeChecker = struct {
 
                             if (init_t == .ident and !init_is_int_literal and !self.assignable(init_t, t)) {
                                 if (isNarrowingInt(init_t, t)) {
-                                    self.addError(ls.span, "narrowing conversion: '{s}' cannot be implicitly stored into '{s}' — use an explicit cast (F3 §6)", .{ typeRefName(init_t), typeRefName(t) });
+                                    self.addError(ls.span, "narrowing conversion: '{s}' cannot be implicitly stored into '{s}', use an explicit cast (F3 §6)", .{ typeRefName(init_t), typeRefName(t) });
                                 } else if (isSignednessMismatch(init_t, t)) {
-                                    self.addError(ls.span, "signedness mismatch: '{s}' and '{s}' differ in sign — use an explicit cast (F3 §6)", .{ typeRefName(init_t), typeRefName(t) });
+                                    self.addError(ls.span, "signedness mismatch: '{s}' and '{s}' differ in sign, use an explicit cast (F3 §6)", .{ typeRefName(init_t), typeRefName(t) });
                                 } else {
                                     self.addError(ls.span, "Type mismatch: variable initialization expression is incompatible with declared type", .{});
                                 }
@@ -1212,7 +1212,7 @@ pub const TypeChecker = struct {
                 const awaited_here = self.in_awaited;
                 self.in_awaited = false;
                 if (self.in_async and !awaited_here and self.callTargetsAsync(gc.callee.*)) {
-                    self.addError(gc.span, "async call must be 'await'ed (or 'spawn'ed) inside an 'async fn' — a bare call block-drives the coroutine and would deadlock the event loop", .{});
+                    self.addError(gc.span, "async call must be 'await'ed (or 'spawn'ed) inside an 'async fn', a bare call block-drives the coroutine and would deadlock the event loop", .{});
                 }
                 if (gc.callee.kind == .ident) {
                     const name = gc.callee.kind.ident;
@@ -1252,7 +1252,7 @@ pub const TypeChecker = struct {
                 self.in_awaited = false;
 
                 if (self.in_async and !awaited_here and self.callTargetsAsync(c.callee.*)) {
-                    self.addError(c.span, "async call must be 'await'ed (or 'spawn'ed) inside an 'async fn' — a bare call block-drives the coroutine and would deadlock the event loop", .{});
+                    self.addError(c.span, "async call must be 'await'ed (or 'spawn'ed) inside an 'async fn', a bare call block-drives the coroutine and would deadlock the event loop", .{});
                 }
 
                 if (c.callee.kind == .ident) {
@@ -1293,7 +1293,7 @@ pub const TypeChecker = struct {
                     }
 
                     if (self.ambiguous_fns.contains(name) and !self.variables.contains(name) and !self.structs.contains(name) and !self.fileDefinesFn(c.span.file, name)) {
-                        self.addError(c.span, "call to '{s}' is ambiguous — more than one function is named '{s}' across the imported modules. Qualify it (e.g. `module.{s}(...)`).", .{ name, name, name });
+                        self.addError(c.span, "call to '{s}' is ambiguous, more than one function is named '{s}' across the imported modules. Qualify it (e.g. `module.{s}(...)`).", .{ name, name, name });
                     }
                 } else if (c.callee.kind == .field_access) {
                     const fa = c.callee.kind.field_access;
@@ -1343,16 +1343,16 @@ pub const TypeChecker = struct {
                     if (self.resolveExprType(b.right.*)) |rt| {
                         if (self.resolveExprType(b.left.*)) |lt| {
                             if (isPtrTruncation(rt, lt)) {
-                                self.addError(b.span, "pointer truncation: a 'ptr' (raw address) cannot be stored into '{s}' — type the target 'ptr' (F3 §3.2)", .{typeRefName(lt)});
+                                self.addError(b.span, "pointer truncation: a 'ptr' (raw address) cannot be stored into '{s}', type the target 'ptr' (F3 §3.2)", .{typeRefName(lt)});
                             } else if (isNarrowingInt(rt, lt)) {
-                                self.addError(b.span, "narrowing conversion: '{s}' cannot be implicitly stored into '{s}' — use an explicit cast (F3 §6)", .{ typeRefName(rt), typeRefName(lt) });
+                                self.addError(b.span, "narrowing conversion: '{s}' cannot be implicitly stored into '{s}', use an explicit cast (F3 §6)", .{ typeRefName(rt), typeRefName(lt) });
                             } else if (isSignednessMismatch(rt, lt)) {
-                                self.addError(b.span, "signedness mismatch: '{s}' and '{s}' differ in sign — use an explicit cast (F3 §6)", .{ typeRefName(rt), typeRefName(lt) });
+                                self.addError(b.span, "signedness mismatch: '{s}' and '{s}' differ in sign, use an explicit cast (F3 §6)", .{ typeRefName(rt), typeRefName(lt) });
                             } else if (rt == .ident and lt == .ident and
                                 self.traits.contains(rt.ident) and self.structs.contains(lt.ident) and
                                 !self.traits.contains(lt.ident) and !std.mem.eql(u8, rt.ident, lt.ident))
                             {
-                                self.addError(b.span, "cannot assign a trait object '{s}' to a concrete '{s}' target — a trait value may hold any implementation, so narrowing it needs an explicit downcast ('<expr> as {s}')", .{ rt.ident, lt.ident, lt.ident });
+                                self.addError(b.span, "cannot assign a trait object '{s}' to a concrete '{s}' target, a trait value may hold any implementation, so narrowing it needs an explicit downcast ('<expr> as {s}')", .{ rt.ident, lt.ident, lt.ident });
                             }
                         }
                     }
@@ -1364,13 +1364,13 @@ pub const TypeChecker = struct {
                         try self.checkExpr(elem.*);
                         if (self.resolveExprType(elem.*)) |et| {
                             if (et != .ident or !isScalarPrim(et.ident)) {
-                                self.addError(expr.span, "array elements must be a primitive type (int, long, double, float, bool, byte); got '{s}' — use List for reference or complex element types", .{typeRefName(et)});
+                                self.addError(expr.span, "array elements must be a primitive type (int, long, double, float, bool, byte); got '{s}', use List for reference or complex element types", .{typeRefName(et)});
                                 break;
                             }
                         } else if (elem.kind == .struct_init or elem.kind == .tuple or
                             (elem.kind == .literal and elem.kind.literal == .array))
                         {
-                            self.addError(expr.span, "array elements must be a primitive type (int, long, double, float, bool, byte); a struct, tuple, or nested array is not allowed — use List for those", .{});
+                            self.addError(expr.span, "array elements must be a primitive type (int, long, double, float, bool, byte); a struct, tuple, or nested array is not allowed, use List for those", .{});
                             break;
                         }
                     }
@@ -1379,10 +1379,10 @@ pub const TypeChecker = struct {
                     const v = lit.array_repeat.value.*;
                     if (self.resolveExprType(v)) |et| {
                         if (et != .ident or !isScalarPrim(et.ident)) {
-                            self.addError(expr.span, "array elements must be a primitive type (int, long, double, float, bool, byte); got '{s}' — use List for reference or complex element types", .{typeRefName(et)});
+                            self.addError(expr.span, "array elements must be a primitive type (int, long, double, float, bool, byte); got '{s}', use List for reference or complex element types", .{typeRefName(et)});
                         }
                     } else if (v.kind == .struct_init or v.kind == .tuple or (v.kind == .literal and v.kind.literal == .array)) {
-                        self.addError(expr.span, "array elements must be a primitive type (int, long, double, float, bool, byte); a struct, tuple, or nested array is not allowed — use List for those", .{});
+                        self.addError(expr.span, "array elements must be a primitive type (int, long, double, float, bool, byte); a struct, tuple, or nested array is not allowed, use List for those", .{});
                     }
                 }
             },
@@ -1393,7 +1393,7 @@ pub const TypeChecker = struct {
                 try self.checkExpr(idx.index.*);
                 if (self.resolveExprType(idx.object.*)) |obj_ty| {
                     if (self.indexableTypeStatus(obj_ty)) |ok| {
-                        if (!ok) self.addError(idx.object.*.span, "cannot index a value of type '{s}' with `[]` — `[]` is only valid on strings, arrays, tuples, and byte buffers (List/Map use `.get`)", .{typeRefName(obj_ty)});
+                        if (!ok) self.addError(idx.object.*.span, "cannot index a value of type '{s}' with `[]`, `[]` is only valid on strings, arrays, tuples, and byte buffers (List/Map use `.get`)", .{typeRefName(obj_ty)});
                     }
                 }
             },
@@ -1411,9 +1411,9 @@ pub const TypeChecker = struct {
                         }
                         if (!found) {
                             if (self.structInitParamCount(si.type_name) != null) {
-                                self.addError(si.span, "struct literal '{s}{{ … }}' is missing field '{s}' — initialize every field, or use the constructor '{s}(…)'", .{ si.type_name, df.name, si.type_name });
+                                self.addError(si.span, "struct literal '{s}{{ ... }}' is missing field '{s}', initialize every field, or use the constructor '{s}(...)'", .{ si.type_name, df.name, si.type_name });
                             } else {
-                                self.addError(si.span, "struct literal '{s}{{ … }}' is missing field '{s}' — every field must be initialized (fields have no defaults)", .{ si.type_name, df.name });
+                                self.addError(si.span, "struct literal '{s}{{ ... }}' is missing field '{s}', every field must be initialized (fields have no defaults)", .{ si.type_name, df.name });
                             }
                         }
                     }
@@ -1436,7 +1436,7 @@ pub const TypeChecker = struct {
                                     const b = bound orelse break;
                                     const actual = self.resolveExprType(lf.value) orelse break;
                                     if (stringScalarClash(b, actual)) {
-                                        self.addError(lf.span, "type argument mismatch: field '{s}' has type '{s}' (from explicit '{s}<…>'), but the value is '{s}'", .{ lf.name, identOf(b) orelse "?", si.type_name, identOf(actual) orelse "?" });
+                                        self.addError(lf.span, "type argument mismatch: field '{s}' has type '{s}' (from explicit '{s}<...>'), but the value is '{s}'", .{ lf.name, identOf(b) orelse "?", si.type_name, identOf(actual) orelse "?" });
                                     }
                                     break;
                                 }
@@ -1459,7 +1459,7 @@ pub const TypeChecker = struct {
             .block_expr => |be| try self.checkBlock(be),
             .await_expr => |aw| {
                 if (self.is_wasm) {
-                    self.addError(aw.span, "'await' is not available on the wasm target — async/await has no coroutine runtime in wasm. Guard native code with `@native {{ ... }}` and provide a wasm path with `@wasm {{ ... }}`.", .{});
+                    self.addError(aw.span, "'await' is not available on the wasm target, async/await has no coroutine runtime in wasm. Guard native code with `@native {{ ... }}` and provide a wasm path with `@wasm {{ ... }}`.", .{});
                 }
 
                 if (!self.in_async) {
@@ -1472,7 +1472,7 @@ pub const TypeChecker = struct {
             },
             .go_expr => |g| {
                 if (self.is_wasm) {
-                    self.addError(g.span, "'spawn' is not available on the wasm target — there is no coroutine runtime in wasm. Guard native code with `@native {{ ... }}`.", .{});
+                    self.addError(g.span, "'spawn' is not available on the wasm target, there is no coroutine runtime in wasm. Guard native code with `@native {{ ... }}`.", .{});
                 }
 
                 if (!self.in_async) {
@@ -1669,7 +1669,7 @@ pub const TypeChecker = struct {
                         }
                     }
                 } else if (!isSwitchableIntType(enum_name)) {
-                    self.addError(ss.span, "switch discriminant must be an enum or integer type, got '{s}' — use if/else chains for strings and other types", .{enum_name});
+                    self.addError(ss.span, "switch discriminant must be an enum or integer type, got '{s}', use if/else chains for strings and other types", .{enum_name});
                 }
             },
             else => {},
@@ -1921,7 +1921,7 @@ pub const TypeChecker = struct {
                             for (s.fields) |field| {
                                 if (std.mem.eql(u8, field.name, fa.field)) {
                                     if (!field.is_public and !self.memberAccessible(s.span.file, fa.span.file, struct_name)) {
-                                        self.addError(fa.span, "Field '{s}' of struct '{s}' is private — it is accessible only within its own module (add `pub` to use it across modules)", .{ fa.field, struct_name });
+                                        self.addError(fa.span, "Field '{s}' of struct '{s}' is private, it is accessible only within its own module (add `pub` to use it across modules)", .{ fa.field, struct_name });
                                     }
                                     return field.type_name;
                                 }
@@ -1930,7 +1930,7 @@ pub const TypeChecker = struct {
                             for (u.fields) |field| {
                                 if (std.mem.eql(u8, field.name, fa.field)) {
                                     if (!field.is_public and !self.memberAccessible(u.span.file, fa.span.file, struct_name)) {
-                                        self.addError(fa.span, "Field '{s}' of union '{s}' is private — it is accessible only within its own module (add `pub` to use it across modules)", .{ fa.field, struct_name });
+                                        self.addError(fa.span, "Field '{s}' of union '{s}' is private, it is accessible only within its own module (add `pub` to use it across modules)", .{ fa.field, struct_name });
                                     }
                                     return field.type_name;
                                 }
@@ -1960,7 +1960,7 @@ pub const TypeChecker = struct {
                                 for (s.methods) |m| {
                                     if (std.mem.eql(u8, m.decl.name, fa.field)) {
                                         if (!m.is_public and !self.memberAccessible(s.span.file, fa.span.file, struct_name) and !self.methodIsTraitContract(s, fa.field)) {
-                                            self.addError(fa.span, "Method '{s}' of struct '{s}' is private — it is accessible only within its own module (add `pub` to use it across modules)", .{ fa.field, struct_name });
+                                            self.addError(fa.span, "Method '{s}' of struct '{s}' is private, it is accessible only within its own module (add `pub` to use it across modules)", .{ fa.field, struct_name });
                                         }
                                         return m.decl.ret_type orelse ast.TypeRef{ .ident = "void" };
                                     }
@@ -1969,7 +1969,7 @@ pub const TypeChecker = struct {
                                 for (e.methods) |m| {
                                     if (std.mem.eql(u8, m.decl.name, fa.field)) {
                                         if (!m.is_public and !self.memberAccessible(e.span.file, fa.span.file, struct_name)) {
-                                            self.addError(fa.span, "Method '{s}' of enum '{s}' is private — it is accessible only within its own module (add `pub` to use it across modules)", .{ fa.field, struct_name });
+                                            self.addError(fa.span, "Method '{s}' of enum '{s}' is private, it is accessible only within its own module (add `pub` to use it across modules)", .{ fa.field, struct_name });
                                         }
                                         return m.decl.ret_type orelse ast.TypeRef{ .ident = "void" };
                                     }
@@ -2079,7 +2079,7 @@ pub const TypeChecker = struct {
         for (s.methods, 0..) |m1, i| {
             for (s.methods[i + 1 ..]) |m2| {
                 if (std.mem.eql(u8, m1.decl.name, m2.decl.name)) {
-                    self.addError(m2.decl.span, "duplicate method '{s}' in '{s}' — Nova has no overloading", .{ m2.decl.name, s.name });
+                    self.addError(m2.decl.span, "duplicate method '{s}' in '{s}', Nova has no overloading", .{ m2.decl.name, s.name });
                 }
             }
         }
@@ -2196,7 +2196,7 @@ pub const TypeChecker = struct {
                 }
             }
             if (!has_message) {
-                self.addError(e.span, "exception '{s}' must define a `message(self): string` method — every exception provides a human-readable message. Add `fn message(self: {s}): string {{ ... }}`.", .{ e.name, e.name });
+                self.addError(e.span, "exception '{s}' must define a `message(self): string` method, every exception provides a human-readable message. Add `fn message(self: {s}): string {{ ... }}`.", .{ e.name, e.name });
             }
         }
 

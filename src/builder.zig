@@ -199,7 +199,7 @@ fn compileProgram(
             defer allocator.free(prev);
             const binary_exists = if (Io.Dir.access(.cwd(), init.io, output_path, .{})) |_| true else |_| false;
             if (binary_exists and std.mem.eql(u8, std.mem.trim(u8, prev, " \n"), cur)) {
-                std.debug.print("{s} is up to date ({s}) — nothing to rebuild.\n", .{ output_path, if (is_release) "release" else "debug" });
+                std.debug.print("{s} is up to date ({s}), nothing to rebuild.\n", .{ output_path, if (is_release) "release" else "debug" });
                 return;
             }
         } else |_| {}

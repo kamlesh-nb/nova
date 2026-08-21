@@ -7,7 +7,7 @@
 //!
 //! Nova's compiler grew a first generation of resolution that decided almost
 //! everything from mangled name STRINGS: which function a call names, what a
-//! type is, and — most dangerously — whether a value is heap-owned (and so must
+//! type is, and, most dangerously, whether a value is heap-owned (and so must
 //! be ARC-released) by matching its type NAME. Deciding ownership from a string
 //! is a corruption class in its own right (a name-match that guesses wrong frees
 //! a live value or leaks a dead one, i.e. a use-after-free or a leak). The fix
@@ -84,7 +84,7 @@ pub var trace_resolution: bool = false;
 /// the ownership balance gate is skipped entirely.
 pub var report_enabled: bool = false;
 
-/// Enables the "TypeId census" — a tally of expressions the legacy string engine
+/// Enables the "TypeId census", a tally of expressions the legacy string engine
 /// resolves but whose TypeId is null (Phase-1 coverage gaps), printed by
 /// [`tidCensusReport`].
 pub var tid_census: bool = false;
@@ -104,7 +104,7 @@ pub var census_kind_method: usize = 0;
 pub var census_kind_other: usize = 0;
 
 /// Count of census sites where BOTH engines answered but the answers DISAGREE
-/// (Phase-1a accuracy gaps — worse than a null, since one engine is wrong).
+/// (Phase-1a accuracy gaps, worse than a null, since one engine is wrong).
 pub var census_disagree: usize = 0;
 /// Of [`census_disagree`], those on a bare identifier.
 pub var census_dis_ident: usize = 0;
@@ -156,7 +156,7 @@ pub fn tidCensusReport() void {
 /// Gated `std.debug.print`: emits a report line only when [`report_enabled`].
 ///
 /// Every non-error, report-only line in this module goes through here so a
-/// normal (non-shadow) build stays completely silent — the hard error diagnostics
+/// normal (non-shadow) build stays completely silent, the hard error diagnostics
 /// that precede a gate exit deliberately bypass it and use `std.debug.print`
 /// directly, because they must print whether or not reporting is enabled.
 fn out(comptime fmt: []const u8, args: anytype) void {
@@ -181,7 +181,7 @@ pub var render_cache_hits: usize = 0;
 pub var f2_fellback: usize = 0;
 
 /// Of [`f2_fellback`], those where the fallback was LOSSY (the legacy answer
-/// carried information the TypeId path dropped) — the coverage debt to close.
+/// carried information the TypeId path dropped), the coverage debt to close.
 pub var f2_fellback_lossy: usize = 0;
 
 /// Live calls into the IR-backed concrete-type resolver (`irct` = IR concrete type).
@@ -210,7 +210,7 @@ pub var live_ir: ?*infer.TypedIr = null;
 /// resolution path F1 measures), reported by [`reportResolution`].
 pub var scan_hits: usize = 0;
 /// Of [`scan_hits`], those with more than one candidate (resolution decided by
-/// hash order — a latent wrong-callee bug).
+/// hash order, a latent wrong-callee bug).
 pub var scan_ambiguous: usize = 0;
 /// Of [`scan_hits`], those that resolved to nothing (a silent failure).
 pub var scan_unresolved: usize = 0;
@@ -318,7 +318,7 @@ pub fn run(allocator: std.mem.Allocator, program: ast.Program, sm: *sema_mod.Sem
         }
     }
     if (canon_collisions == 0) {
-        out("  [canonical-prefix] 0 new collisions — the $HOME fix is safe to cut over\n", .{});
+        out("  [canonical-prefix] 0 new collisions, the $HOME fix is safe to cut over\n", .{});
     }
 
     for (tab.symbols.items) |s| {
@@ -353,7 +353,7 @@ pub fn run(allocator: std.mem.Allocator, program: ast.Program, sm: *sema_mod.Sem
 /// counts; (3) run [`infer.Inferer`] over every function and method (with the
 /// correct `self` type and type-param scopes) to build the typed IR; (4) drain
 /// the inferer's error lists and, if any are non-empty, print the user-facing
-/// diagnostic and [`std.process.exit(1)`] — these are the real type-checker errors
+/// diagnostic and [`std.process.exit(1)`], these are the real type-checker errors
 /// (visibility, const-reassign, optional-deref, catch/try mismatches, non-bool
 /// conditions, optional-return, method arity, generic-method placement, undefined
 /// idents/calls); (5) print the F2 coverage summary; (6) when [`report_enabled`],
@@ -500,15 +500,15 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
         for (inf.visibility_errors.items) |ve| {
             switch (ve.kind) {
                 .function => std.debug.print(
-                    "\x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m '{s}.{s}' is not public — a non-`pub` function cannot be called from another module. Mark it `pub`, or call it from its own module.\x1b[0m\n",
+                    "\x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m '{s}.{s}' is not public, a non-`pub` function cannot be called from another module. Mark it `pub`, or call it from its own module.\x1b[0m\n",
                     .{ ve.span.file, ve.span.line, ve.span.col, ve.recv, ve.field },
                 ),
                 .type_ => std.debug.print(
-                    "\x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m '{s}' is not public — a non-`pub` type cannot be used from another module. Mark it `pub`, or use it from its own module.\x1b[0m\n",
+                    "\x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m '{s}' is not public, a non-`pub` type cannot be used from another module. Mark it `pub`, or use it from its own module.\x1b[0m\n",
                     .{ ve.span.file, ve.span.line, ve.span.col, ve.field },
                 ),
                 .const_ => std.debug.print(
-                    "\x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m '{s}' is not public — a non-`pub` const cannot be read from another module. Mark it `pub`, or read it from its own module.\x1b[0m\n",
+                    "\x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m '{s}' is not public, a non-`pub` const cannot be read from another module. Mark it `pub`, or read it from its own module.\x1b[0m\n",
                     .{ ve.span.file, ve.span.line, ve.span.col, ve.field },
                 ),
             }
@@ -521,7 +521,7 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
         std.debug.print("Type checking failed with {d} error(s):\n", .{inf.const_reassign_errors.items.len});
         for (inf.const_reassign_errors.items) |ce| {
             std.debug.print(
-                "  \x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m cannot assign to '{s}' — it is a `const`. Use `let` for a variable you reassign.\x1b[0m\n",
+                "  \x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m cannot assign to '{s}', it is a `const`. Use `let` for a variable you reassign.\x1b[0m\n",
                 .{ ce.span.file, ce.span.line, ce.span.col, ce.name },
             );
         }
@@ -534,11 +534,11 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
             const what = if (oe.is_method) "method" else "field";
             switch (oe.kind) {
                 .opt => std.debug.print(
-                    "  \x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m '.{s}' — {s} access on a possibly-`undefined` value. Make it present first: `xs.at(i)` / `x ?? default` / `x?.{s}` / narrow with `if (x != undefined) {{ … }}`.\x1b[0m\n",
+                    "  \x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m '.{s}', {s} access on a possibly-`undefined` value. Make it present first: `xs.at(i)` / `x ?? default` / `x?.{s}` / narrow with `if (x != undefined) {{ ... }}`.\x1b[0m\n",
                     .{ oe.span.file, oe.span.line, oe.span.col, oe.field, what, oe.field },
                 ),
                 .err => std.debug.print(
-                    "  \x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m '.{s}' — {s} access on a `T | E` value that may be an ERROR. Handle it first: `try x` (propagate) or `x catch <fallback>` (specs §3.4b).\x1b[0m\n",
+                    "  \x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m '.{s}', {s} access on a `T | E` value that may be an ERROR. Handle it first: `try x` (propagate) or `x catch <fallback>` (specs §3.4b).\x1b[0m\n",
                     .{ oe.span.file, oe.span.line, oe.span.col, oe.field, what },
                 ),
             }
@@ -552,7 +552,7 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
             const ok_name = renderLegacy(allocator, store, ce.ok) catch "<type>";
             const handler_name = renderLegacy(allocator, store, ce.handler) catch "<type>";
             std.debug.print(
-                "  \x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m catch handler has type '{s}', but the value before `catch` is `{s} | E`, so both must agree — a `catch` yields the ok type. Convert the handler to '{s}' (e.g. return a string on both sides, or map the error to the ok type).\x1b[0m\n",
+                "  \x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m catch handler has type '{s}', but the value before `catch` is `{s} | E`, so both must agree, a `catch` yields the ok type. Convert the handler to '{s}' (e.g. return a string on both sides, or map the error to the ok type).\x1b[0m\n",
                 .{ ce.span.file, ce.span.line, ce.span.col, handler_name, ok_name, ok_name },
             );
         }
@@ -565,7 +565,7 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
             const callee_name = renderLegacy(allocator, store, te.callee_err) catch "<type>";
             const fn_name = renderLegacy(allocator, store, te.fn_err) catch "<type>";
             std.debug.print(
-                "  \x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m `try` propagates an error of type '{s}', but the enclosing function is declared to fail with '{s}'. `try` re-raises the error unchanged, so the types must match — `catch` and map to '{s}', or widen the function's error type.\x1b[0m\n",
+                "  \x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m `try` propagates an error of type '{s}', but the enclosing function is declared to fail with '{s}'. `try` re-raises the error unchanged, so the types must match, `catch` and map to '{s}', or widen the function's error type.\x1b[0m\n",
                 .{ te.span.file, te.span.line, te.span.col, callee_name, fn_name, fn_name },
             );
         }
@@ -603,7 +603,7 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
             const want_name = renderLegacy(allocator, store, ve.want) catch "<type>";
             const got_name = renderLegacy(allocator, store, ve.got) catch "<type>";
             std.debug.print(
-                "  \x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m a possibly-`undefined` value of type '{s}' {s} '{s}'. Make it present first: `x ?? default`, or narrow with `if (x != undefined) {{ … }}`.\x1b[0m\n",
+                "  \x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m a possibly-`undefined` value of type '{s}' {s} '{s}'. Make it present first: `x ?? default`, or narrow with `if (x != undefined) {{ ... }}`.\x1b[0m\n",
                 .{ ve.span.file, ve.span.line, ve.span.col, got_name, ve.ctx, want_name },
             );
         }
@@ -631,7 +631,7 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
             if (count == 0) std.debug.print("Type checking failed with error(s):\n", .{});
             count += 1;
             std.debug.print(
-                "  \x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m generic method `{s}` must be defined INSIDE its type's body — a free `fn {s}<…>(self: …)` on a generic receiver is not resolvable (put a generic type's methods in the struct, like List/Map/Set).\x1b[0m\n",
+                "  \x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m generic method `{s}` must be defined INSIDE its type's body, a free `fn {s}<...>(self: ...)` on a generic receiver is not resolvable (put a generic type's methods in the struct, like List/Map/Set).\x1b[0m\n",
                 .{ f.span.file, f.span.line, f.span.col, f.name, f.name },
             );
         }
@@ -642,12 +642,12 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
         const more = inf.fatal_unresolved_idents - 1;
         if (inf.first_fatal_span) |sp| {
             std.debug.print(
-                "  \x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m undefined identifier '{s}'\x1b[0m — not a value, type, module, or known builtin.{s}\n",
+                "  \x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m undefined identifier '{s}'\x1b[0m, not a value, type, module, or known builtin.{s}\n",
                 .{ sp.file, sp.line, sp.col, inf.first_fatal_ident orelse "?", if (more > 0) " (first of several)" else "" },
             );
         } else {
             std.debug.print(
-                "\x1b[1m\x1b[31merror:\x1b[0m\x1b[1m undefined identifier '{s}'\x1b[0m (and {d} more) — not a value, type, module, or known builtin. (F2-5)\n",
+                "\x1b[1m\x1b[31merror:\x1b[0m\x1b[1m undefined identifier '{s}'\x1b[0m (and {d} more), not a value, type, module, or known builtin. (F2-5)\n",
                 .{ inf.first_fatal_ident orelse "?", more },
             );
         }
@@ -657,7 +657,7 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
     if (inf.fatal_unresolved_calls > 0) {
         const sp = inf.first_fatal_call_span orelse ast.Span{ .start = 0, .end = 0, .line = 0, .col = 0, .file = "" };
         std.debug.print(
-            "  \x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m no function '{s}' in module '{s}'\x1b[0m — check the name and that it is `pub`.\n",
+            "  \x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m no function '{s}' in module '{s}'\x1b[0m, check the name and that it is `pub`.\n",
             .{ sp.file, sp.line, sp.col, inf.first_fatal_call_field orelse "?", inf.first_fatal_call_recv orelse "?" },
         );
         std.process.exit(1);
@@ -711,8 +711,8 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
         out("  functions walked                     : {d}\n", .{os.fns_walked});
         out("  owned let-locals                     : {d}\n", .{os.owned_locals});
         out("    analyzed (balance claim made+held) : {d}\n", .{os.analyzed});
-        out("    deferred (nested CFG/reassign/shadow — increment 2) : {d}\n", .{os.deferred_cfg});
-        out("    deferred (init untyped in IR — coverage gap)        : {d}\n", .{os.deferred_untyped});
+        out("    deferred (nested CFG/reassign/shadow, increment 2) : {d}\n", .{os.deferred_cfg});
+        out("    deferred (init untyped in IR, coverage gap)        : {d}\n", .{os.deferred_untyped});
         out("  ops inserted : drop={d}  move-out={d}  dup={d}\n", .{ os.drop_ops, os.move_outs, os.dup_ops });
         out("  BALANCE VIOLATIONS (use-after-move; MUST be 0)        : {d}\n", .{os.balance_violations});
         if (os.balance_violations > 0) out("    first: owned local '{s}'\n", .{os.first_violation});
@@ -726,8 +726,8 @@ fn runTypeLowering(allocator: std.mem.Allocator, program: ast.Program, tab: *con
         if (os.balance_violations > 0 or temp_accounted < temp_total) {
             std.debug.print(
                 "\x1b[1m\x1b[31mFOUNDATION GATE FAILED (F2-6 ownership balance):\x1b[0m\x1b[1m an owned value is not provably consumed exactly once\x1b[0m\n" ++
-                "  LOCALS use-after-move violations : {d}   (MUST be 0 — a use-after-move is a UAF)\n" ++
-                "  TEMPORARIES unaccounted          : {d}   (MUST be 0 — an owned temp with no move/drop is a leak-shaped hole)\n" ++
+                "  LOCALS use-after-move violations : {d}   (MUST be 0, a use-after-move is a UAF)\n" ++
+                "  TEMPORARIES unaccounted          : {d}   (MUST be 0, an owned temp with no move/drop is a leak-shaped hole)\n" ++
                 "  first local violation: '{s}'\n" ++
                 "  The static balance check found an owned value the pass cannot prove is consumed exactly\n" ++
                 "  once. That is the leak / use-after-free class this pass exists to catch AT BUILD TIME.\n",
@@ -756,7 +756,7 @@ pub fn reportResolution() void {
 /// F5 ownership decision: times the string engine and `isOwnedTypeId` AGREE on
 /// a concrete type.
 pub var td_agree: usize = 0;
-/// F5: times they DISAGREE on a concrete type — MUST be 0 before cutover, since a
+/// F5: times they DISAGREE on a concrete type, MUST be 0 before cutover, since a
 /// divergent ownership decision is a use-after-free or leak; fails the F5-2 gate.
 pub var td_disagree: usize = 0;
 /// F5: decisions blocked because the type is an unbound method type-param
@@ -768,7 +768,7 @@ pub var td_blocked_noctx: usize = 0;
 /// F5: type-param decisions the "keystone" substitution RESOLVED to a concrete
 /// type in the store, and which then agreed with the string engine.
 pub var td_keystone_resolves: usize = 0;
-/// F5: keystone-substituted decisions that DISAGREED — MUST be 0 (a keystone bug);
+/// F5: keystone-substituted decisions that DISAGREED, MUST be 0 (a keystone bug);
 /// fails the F5-2 gate alongside [`td_disagree`].
 pub var td_keystone_disagree: usize = 0;
 /// F5: decisions blocked because the type was unresolved (an F2-5 fatal).
@@ -786,18 +786,18 @@ pub var disp_disagree: usize = 0;
 ///
 /// `type_param`, `enum_` and `not_owned` are gate-proven-safe boundaries (safe
 /// direction: the checker under-claims owned, never over-claims); `other` is an
-/// unexplained divergence and MUST be 0 — it fails the F2-6 disposition gate.
+/// unexplained divergence and MUST be 0, it fails the F2-6 disposition gate.
 pub const DispResidue = enum { type_param, enum_, not_owned, other };
 /// Disposition disagreements on a generic erased return (`.type_param`), closed
-/// by monomorphization at F4 — safe.
+/// by monomorphization at F4, safe.
 pub var disp_disagree_typeparam: usize = 0;
-/// Disposition disagreements on an enum (`.enum_`) — safe-direction under-claim,
+/// Disposition disagreements on an enum (`.enum_`), safe-direction under-claim,
 /// verified ASAN-clean across the corpus.
 pub var disp_disagree_enum: usize = 0;
-/// Disposition disagreements on a non-owned primitive (`.not_owned`) — no
+/// Disposition disagreements on a non-owned primitive (`.not_owned`), no
 /// retain/release either way, so harmless.
 pub var disp_disagree_not_owned: usize = 0;
-/// Disposition disagreements with NO explanation (`.other`) — a real disposition
+/// Disposition disagreements with NO explanation (`.other`), a real disposition
 /// bug; MUST be 0 or [`reportTypeIdDiff`] fails the build.
 pub var disp_disagree_other: usize = 0;
 /// Expression kind of the most recent `.other` disagreement, for the diagnostic.
@@ -807,15 +807,15 @@ pub var disp_last_type: []const u8 = "";
 
 /// F2-6 temp ops: times codegen's per-expression drop/move matches the pass's op.
 pub var op_agree: usize = 0;
-/// F2-6: times they DISAGREE — must stay within the two explained buckets below.
+/// F2-6: times they DISAGREE, must stay within the two explained buckets below.
 pub var op_disagree: usize = 0;
 /// Disagreements where codegen DROPPED but the pass said move (return retain+drop
-/// or trait-coercion copy+drop — the pass is right; the flip removes the redundancy).
+/// or trait-coercion copy+drop, the pass is right; the flip removes the redundancy).
 pub var op_disagree_cg_drop: usize = 0;
 /// Disagreements where codegen MOVED but the pass said drop (constructor/consuming
-/// args — needs the `consuming` mark the pass lacks).
+/// args, needs the `consuming` mark the pass lacks).
 pub var op_disagree_cg_move: usize = 0;
-/// Explicitly-registered temporaries the pass never saw (no pass op) — expected.
+/// Explicitly-registered temporaries the pass never saw (no pass op), expected.
 pub var op_no_op: usize = 0;
 /// Type name of the most recent temp-op disagreement, for the diagnostic.
 pub var op_last_disagree: []const u8 = "";
@@ -829,7 +829,7 @@ pub var td_last_disagree_string: bool = false;
 /// Stage-4 destructor naming: times the dtor name from the TypeId matches the
 /// name from the legacy string.
 pub var dtor_name_agree: usize = 0;
-/// Stage-4: times the dtor names DISAGREE — MUST be 0 to key dtors on TypeId.
+/// Stage-4: times the dtor names DISAGREE, MUST be 0 to key dtors on TypeId.
 pub var dtor_name_disagree: usize = 0;
 /// Stage-4: sites with no TypeId, so the dtor name still comes from the string.
 pub var dtor_name_no_id: usize = 0;
@@ -838,7 +838,7 @@ pub var dtor_name_last_disagree_string: []const u8 = "";
 /// TypeId-derived dtor name of the most recent stage-4 disagreement.
 pub var dtor_name_last_disagree_typed: []const u8 = "";
 
-/// Stage-4 RAW (no `substTypeParams`): agreements — a 0 disagree count proves
+/// Stage-4 RAW (no `substTypeParams`): agreements, a 0 disagree count proves
 /// the substitution is redundant when draining dtors.
 pub var dtor_name_raw_agree: usize = 0;
 /// Stage-4 RAW: disagreements between the substituted and un-substituted names.
@@ -848,7 +848,7 @@ pub var dtor_name_raw_last: []const u8 = "";
 
 /// Stage-4 tuple element dtors: times building from store elements matches parsing.
 pub var tuple_elem_agree: usize = 0;
-/// Stage-4 tuple: disagreements — 0 means tuple dtors can be built from the store.
+/// Stage-4 tuple: disagreements, 0 means tuple dtors can be built from the store.
 pub var tuple_elem_disagree: usize = 0;
 /// The most recent tuple-element mismatch, for the diagnostic.
 pub var tuple_elem_last: []const u8 = "";
@@ -868,7 +868,7 @@ pub var storage_elem_last: []const u8 = "";
 
 /// Stage-4 struct-field dtors: store-vs-parse agreements.
 pub var struct_field_agree: usize = 0;
-/// Stage-4 struct fields: disagreements — 0 means struct dtors can be built from
+/// Stage-4 struct fields: disagreements, 0 means struct dtors can be built from
 /// the store's field list.
 pub var struct_field_disagree: usize = 0;
 /// The most recent struct-field mismatch, for the diagnostic.
@@ -909,21 +909,21 @@ pub fn reportTypeIdDiff() void {
     if (td_disagree > 0) out("      e.g. '{s}' typed={} string={}\n", .{ td_last_disagree, td_last_disagree_typed, td_last_disagree_string });
     out("  NOT-CONCRETE (keystone cannot substitute) : {d}\n", .{blocked + td_keystone_resolves + td_keystone_disagree});
     out("    .type_param KEYSTONE-RESOLVES : {d}  (subst in store -> concrete, AGREES with string) ✅\n", .{td_keystone_resolves});
-    out("    .type_param keystone-DISAGREE : {d}  (MUST be 0 — a keystone bug)\n", .{td_keystone_disagree});
-    out("    .type_param method-param      : {d}  (map<U> — decided by PRINCIPLED ERASURE RULE: unbound -> non-owned) ✅\n", .{td_blocked_typeparam});
-    out("    .type_param no-inst-ctx       : {d}  (erased body — decided by PRINCIPLED ERASURE RULE: unbound -> non-owned) ✅\n", .{td_blocked_noctx});
+    out("    .type_param keystone-DISAGREE : {d}  (MUST be 0, a keystone bug)\n", .{td_keystone_disagree});
+    out("    .type_param method-param      : {d}  (map<U>, decided by PRINCIPLED ERASURE RULE: unbound -> non-owned) ✅\n", .{td_blocked_typeparam});
+    out("    .type_param no-inst-ctx       : {d}  (erased body, decided by PRINCIPLED ERASURE RULE: unbound -> non-owned) ✅\n", .{td_blocked_noctx});
     out("    .unresolved  : {d}  (F2-5: unresolved fatal)\n", .{td_blocked_unresolved});
     out("    .enum_       : {d}  (isOwned enum-variant awareness)\n", .{td_blocked_enum});
     out("=== end string→TypeId shadow-diff ===\n\n", .{});
 
     if (op_agree + op_disagree + op_no_op > 0) {
-        out("=== F2-6 stage 5 step 5: temp ops — codegen action vs pass op (per ExprId) ===\n", .{});
+        out("=== F2-6 stage 5 step 5: temp ops, codegen action vs pass op (per ExprId) ===\n", .{});
         out("  agree    : {d}  (codegen's drop/move matches the pass)\n", .{op_agree});
         out("  DISAGREE : {d}  (MUST be a known set before the flip)\n", .{op_disagree});
-        out("    codegen DROPPED, pass said move : {d}  (return retain+drop / trait-coercion copy+drop — pass is right, the FLIP removes codegen's redundancy)\n", .{op_disagree_cg_drop});
-        out("    codegen MOVED, pass said drop   : {d}  (constructor/consuming args — needs the arc.md §3 `consuming` mark the pass lacks)\n", .{op_disagree_cg_move});
+        out("    codegen DROPPED, pass said move : {d}  (return retain+drop / trait-coercion copy+drop, pass is right, the FLIP removes codegen's redundancy)\n", .{op_disagree_cg_drop});
+        out("    codegen MOVED, pass said drop   : {d}  (constructor/consuming args, needs the arc.md §3 `consuming` mark the pass lacks)\n", .{op_disagree_cg_move});
         if (op_disagree > 0) out("    last-disagree type: {s}\n", .{op_last_disagree});
-        out("  no pass op: {d}  (explicitly-registered temps the pass never saw — expected)\n", .{op_no_op});
+        out("  no pass op: {d}  (explicitly-registered temps the pass never saw, expected)\n", .{op_no_op});
 
         out("  stage 4 dtor-name from TypeId: agree={d}  DISAGREE={d}  (MUST be 0 to key on TypeId)  no-id={d}\n", .{ dtor_name_agree, dtor_name_disagree, dtor_name_no_id });
         if (dtor_name_disagree > 0) out("    last disagree: string='{s}'  typed='{s}'\n", .{ dtor_name_last_disagree_string, dtor_name_last_disagree_typed });
@@ -953,7 +953,7 @@ pub fn reportTypeIdDiff() void {
         out("      .type_param (generic erased return -> codegen monomorphizes to owned; closes with F4) : {d}\n", .{disp_disagree_typeparam});
         out("      .enum_      (SAFE: variant-aware ownership; safe-direction under-claims, ASAN-clean corpus)   : {d}\n", .{disp_disagree_enum});
         out("      .not_owned  (SAFE: disagreement on a non-owned primitive; no retain/release either way)   : {d}\n", .{disp_disagree_not_owned});
-        out("      OTHER       (unexplained — a real disposition bug; MUST be 0)                            : {d}\n", .{disp_disagree_other});
+        out("      OTHER       (unexplained, a real disposition bug; MUST be 0)                            : {d}\n", .{disp_disagree_other});
         if (disp_disagree_other > 0) out("        e.g. kind='{s}' type='{s}'\n", .{ disp_last_kind, disp_last_type });
         out("=== end disposition shadow-diff ===\n\n", .{});
     }
@@ -961,12 +961,12 @@ pub fn reportTypeIdDiff() void {
     if (disp_disagree_other > 0) {
         std.debug.print(
             "\x1b[1m\x1b[31mFOUNDATION GATE FAILED (F2-6 disposition):\x1b[0m\x1b[1m an UNEXPLAINED checker-vs-codegen ownership-disposition divergence appeared\x1b[0m\n" ++
-            "  OTHER  disagreements : {d}   (MUST be 0 — an unexplained checker-vs-codegen ownership divergence)\n" ++
+            "  OTHER  disagreements : {d}   (MUST be 0, an unexplained checker-vs-codegen ownership divergence)\n" ++
             "  last OTHER: kind='{s}' type='{s}'\n" ++
             "  Allowed, gate-proven-safe boundaries (do NOT fail the gate): `.type_param` (erased container\n" ++
             "  methods), `.enum_` (variant-aware ownership; the disagreements are safe-direction under-claims,\n" ++
             "  verified ASAN-clean across the corpus), and `.not_owned` (a primitive that is never retained).\n" ++
-            "  OTHER is a NEW ownership guess — the corruption class F2-6 exists to eliminate. Fix it before this lands.\n",
+            "  OTHER is a NEW ownership guess, the corruption class F2-6 exists to eliminate. Fix it before this lands.\n",
             .{ disp_disagree_other, disp_last_kind, disp_last_type },
         );
         std.process.exit(1);
@@ -977,7 +977,7 @@ pub fn reportTypeIdDiff() void {
             "\x1b[1m\x1b[31mFOUNDATION GATE FAILED (F5-2):\x1b[0m\x1b[1m the string ownership engine and the TypeId engine DISAGREE\x1b[0m\n" ++
             "  concrete disagreements: {d}   keystone-substitution disagreements: {d}   (both MUST be 0)\n" ++
             "  last: '{s}'  typed-engine={}  string-engine={}\n" ++
-            "  Ownership is being decided differently by name-matching vs the type store — the exact\n" ++
+            "  Ownership is being decided differently by name-matching vs the type store, the exact\n" ++
             "  latent-corruption class F5 exists to eliminate. A value one engine frees and the other keeps\n" ++
             "  is a use-after-free or a leak. Fix the divergence before this lands.\n",
             .{ td_disagree, td_keystone_disagree, td_last_disagree, td_last_disagree_typed, td_last_disagree_string },
@@ -1011,7 +1011,7 @@ pub fn noteF13bAbsent(a: std.mem.Allocator, name: []const u8) void {
 
 /// F4-5: method resolutions that reached a CONCRETE monomorphized body.
 pub var f45_mono_hit: usize = 0;
-/// F4-5: fallbacks to an ERASED body carrying an INSTANTIATED name — residual
+/// F4-5: fallbacks to an ERASED body carrying an INSTANTIATED name, residual
 /// reliance that MUST reach 0.
 pub var f45_erased_fallback: usize = 0;
 /// F4-5: correct fallbacks to an erased body (non-generic or genuinely erased ctx).
@@ -1058,7 +1058,7 @@ pub fn reportF45() void {
 
 /// F2 stage-3: expressions where the typed IR and the legacy resolver AGREE.
 pub var diff_agree: usize = 0;
-/// F2 stage-3: the legacy resolver ANSWERED but F2 says `<unresolved>` — a legacy
+/// F2 stage-3: the legacy resolver ANSWERED but F2 says `<unresolved>`, a legacy
 /// "invention" (the string path guessed a type the typed engine could not justify).
 pub var diff_legacy_invented: usize = 0;
 /// F2 stage-3: F2 typed the expression where the legacy resolver gave up.
@@ -1066,7 +1066,7 @@ pub var diff_f2_better: usize = 0;
 /// F2 stage-3: both answered but DIFFERENTLY (a genuine coverage/accuracy debt).
 pub var diff_disagree: usize = 0;
 /// F2 stage-3: codegen asked about an expression that is NOT in the IR (sema never
-/// walked it) — the "absent" case broken down by tag/function below.
+/// walked it), the "absent" case broken down by tag/function below.
 pub var diff_absent: usize = 0;
 
 /// Histogram of AST tags for the `diff_absent` expressions (which node kinds
@@ -1119,7 +1119,7 @@ var diff_example_n: usize = 0;
 ///
 /// `i32`→`int`, `u8`/`ubyte`→`byte`, `f64`→`double`, and so on, applied only at
 /// whole-token boundaries (via [`isIdentChar`]) so `myi32var` and `i32_helper` are
-/// left untouched — a rewriter that "invented" agreement inside identifiers would
+/// left untouched, a rewriter that "invented" agreement inside identifiers would
 /// be worse than none. Returns the input slice unchanged if nothing matched or an
 /// allocation failed; otherwise an owned slice the caller frees.
 fn canonicalTypeStr(allocator: std.mem.Allocator, s: []const u8) []const u8 {
@@ -1377,7 +1377,7 @@ fn nameHint(e: *const ast.Expression) ?[]const u8 {
 /// On first sighting of a key it also stores a `file:line` example in
 /// [`diff_cluster_where`]; on a repeat it increments the count and FREES the
 /// freshly-formatted key (the stored one is kept). Allocation failures are
-/// swallowed — losing a diagnostic must never break a compile.
+/// swallowed, losing a diagnostic must never break a compile.
 fn noteCluster(allocator: std.mem.Allocator, e: *const ast.Expression, legacy: []const u8, f2: []const u8, in_fn: ?[]const u8) void {
     const key = if (nameHint(e)) |n|
         std.fmt.allocPrint(allocator, "{s} `{s}` in {s}: '{s}' -> '{s}'", .{ @tagName(e.kind), n, in_fn orelse "?", legacy, f2 }) catch return
@@ -1416,7 +1416,7 @@ pub fn setDiffTable(t: *const symbols.SymbolTable) void {
 /// [`canonicalTypeStr`] so spelling differences do not read as disagreements, and
 /// classifies: legacy-invented (IR unresolved but legacy answered), agree, or
 /// disagree (recording a cluster + example). When `legacy` is null it credits F2
-/// for typing something legacy could not. Errors are swallowed — this must not
+/// for typing something legacy could not. Errors are swallowed, this must not
 /// perturb codegen.
 pub fn recordDiff(
     allocator: std.mem.Allocator,
@@ -1557,7 +1557,7 @@ pub fn reportDiff() void {
 const testing = std.testing;
 
 // Verifies [`canonicalTypeStr`] folds each LLVM-style primitive spelling onto its
-// Nova alias (`i32`→`int`, `f64`→`double`, …), including nested inside generic
+// Nova alias (`i32`→`int`, `f64`→`double`, ...), including nested inside generic
 // arguments (`Map<string, i32>`→`Map<string, int>`), so two engines naming the
 // same type never read as a disagreement.
 test "canonicalTypeStr: i32 and int are ONE type, so they must render as one word" {
@@ -1591,7 +1591,7 @@ test "canonicalTypeStr: i32 and int are ONE type, so they must render as one wor
 // embedded in longer identifiers (`myi32var`, `i32_helper`, `Xi32`) and
 // non-alias strings are returned untouched, so the canonicaliser can never invent
 // a false agreement.
-test "canonicalTypeStr: only whole tokens — a rewriter that invents agreement is worse than none" {
+test "canonicalTypeStr: only whole tokens, a rewriter that invents agreement is worse than none" {
     const a = testing.allocator;
 
     const cases = [_]struct { in: []const u8, want: []const u8 }{

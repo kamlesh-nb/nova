@@ -7,8 +7,8 @@
 //!
 //!   1. **Temporary op annotation** ([`tempStmt`]/[`tempExpr`]). For every owned
 //!      sub-expression the codegen needs to know whether the value is CONSUMED
-//!      by its enclosing context (a "move" — the receiver takes ownership, no
-//!      drop is emitted) or merely produced and discarded (a "drop" — ARC must
+//!      by its enclosing context (a "move", the receiver takes ownership, no
+//!      drop is emitted) or merely produced and discarded (a "drop", ARC must
 //!      release it). This half calls [`TypedIr.recordOp`] so `arc.zig` in the
 //!      backend can emit the right retain/release. It is the authoritative
 //!      source of move-vs-drop decisions for temporaries.
@@ -23,9 +23,9 @@
 //!
 //! The verifier is deliberately conservative. It only reasons precisely about
 //! the shapes it fully understands (straight-line moves, `return x`, plain
-//! `if`/`else` merges). Anything it cannot prove — reassignment to the tracked
+//! `if`/`else` merges). Anything it cannot prove, reassignment to the tracked
 //! name, shadowing, a mention buried inside a closure/`if`-expression/`catch`,
-//! loops that move a value, or an initialiser with no inferred type — is
+//! loops that move a value, or an initialiser with no inferred type, is
 //! classified `deferred` rather than analysed. A deferred local counts toward
 //! coverage-as-unchecked but NEVER produces a false-positive violation. The
 //! guiding rule is: report a use-after-move only when it is genuinely one; when
@@ -64,7 +64,7 @@ const TypedIr = infer.TypedIr;
 pub const Stats = struct {
     /// Number of function bodies visited (top-level fns plus struct/enum methods).
     fns_walked: usize = 0,
-    /// Owned `let` locals discovered — the denominator for coverage. Every such
+    /// Owned `let` locals discovered, the denominator for coverage. Every such
     /// local is then either `analyzed` or deferred.
     owned_locals: usize = 0,
     /// Owned locals whose move/drop balance was fully proved by the flow walk.
@@ -79,7 +79,7 @@ pub const Stats = struct {
     /// Count of scope-exit drops the walk decided must be emitted (value still
     /// live at fallthrough / on a control-flow merge).
     drop_ops: usize = 0,
-    /// Count of moves OUT of a local (returned or moved on a merge branch) — the
+    /// Count of moves OUT of a local (returned or moved on a merge branch), the
     /// value's ownership left the scope, so no drop is owed here.
     move_outs: usize = 0,
     /// Count of `let y = x;` duplications of the tracked owned name (an aliasing
@@ -154,7 +154,7 @@ pub fn verify(allocator: std.mem.Allocator, store: *const TypeStore, ir: *TypedI
 /// percentage, and each violation. When `hard_fail` is true and any violation
 /// was found, it prints a bold red banner and calls `std.process.exit(1)` so CI
 /// can gate on a clean report. A failure inside [`verify`] itself is silently
-/// ignored (early `return`) — this is a diagnostic gate, not part of codegen.
+/// ignored (early `return`), this is a diagnostic gate, not part of codegen.
 pub fn runVerify(allocator: std.mem.Allocator, store: *const TypeStore, ir: *TypedIr, program: *const ast.Program, hard_fail: bool) void {
     const res = verify(allocator, store, ir, program) catch return;
     const s = res.stats;
@@ -190,7 +190,7 @@ pub fn runVerify(allocator: std.mem.Allocator, store: *const TypeStore, ir: *Typ
 ///
 /// `diags` is the optional violation sink threaded into the `Stats`; passing
 /// `null` yields count-only behaviour. Only functions and type methods are
-/// visited — other declaration kinds carry no analysable bodies.
+/// visited, other declaration kinds carry no analysable bodies.
 fn run(allocator: std.mem.Allocator, store: *const TypeStore, ir: *TypedIr, program: *const ast.Program, diags: ?*std.ArrayListUnmanaged(Diagnostic)) Stats {
     var st = Stats{ .diags = diags, .diag_alloc = allocator };
     for (program.declarations) |decl| {
@@ -207,9 +207,9 @@ fn run(allocator: std.mem.Allocator, store: *const TypeStore, ir: *TypedIr, prog
 /// Analyse a single function body: run the owned-local balance walk
 /// ([`analyzeStmts`]) and then the temporary-op annotation walk ([`tempStmt`]).
 ///
-/// The two passes are separate because they answer different questions — the
+/// The two passes are separate because they answer different questions, the
 /// first proves per-local move balance for the verifier, the second annotates
-/// every owned temporary for the backend — and neither depends on the other's
+/// every owned temporary for the backend, and neither depends on the other's
 /// result. `cur_fn` is stamped here so any diagnostics raised deeper carry the
 /// enclosing function's name.
 fn analyzeFn(allocator: std.mem.Allocator, f: *const ast.FunctionDecl, store: *const TypeStore, ir: *TypedIr, st: *Stats) void {
@@ -420,7 +420,7 @@ const Flow = union(enum) {
     /// Control fell through to the next statement with the local in this state.
     fallthrough: St,
 
-    /// A `return` was hit — control leaves the function; the local's remaining
+    /// A `return` was hit, control leaves the function; the local's remaining
     /// scope on this path is over.
     returned,
 
@@ -625,7 +625,7 @@ fn mergeIf(ft: Flow, fe: Flow, st: *Stats) Flow {
 ///   - if the local is already `moved` on entry and the body mentions it at all,
 ///     that is a use-after-move (`violation`);
 ///   - otherwise the local is untouched by the loop and control falls through in
-///     the same state. (`st` is unused here — no ops are charged for a loop that
+///     the same state. (`st` is unused here, no ops are charged for a loop that
 ///     neither moves nor drops the local.)
 fn walkLoop(name: []const u8, cond: ?*const ast.Expression, body: *const ast.Statement, state: St, st: *Stats) Flow {
     if (cond) |c| {
@@ -671,7 +671,7 @@ fn seqMovesLocal(name: []const u8, s: *const ast.Statement) bool {
 }
 
 /// Report whether statement `s` (recursively) mentions `name` inside a construct
-/// the walk classifies as "complex" (see [`mentionsComplex`]) — a closure,
+/// the walk classifies as "complex" (see [`mentionsComplex`]), a closure,
 /// `if`/`block` expression, or `catch`.
 ///
 /// Such a mention means the local's use is control-flow-entangled beyond what

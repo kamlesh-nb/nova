@@ -922,7 +922,7 @@ pub const Formatter = struct {
     /// A child that is itself a binary expression is wrapped when its operator
     /// binds looser than the parent (`child_prec < parent_prec`), or binds
     /// equally but sits on the RIGHT of a left-associative parent
-    /// (`child_prec == parent_prec and is_right`) — the case that would
+    /// (`child_prec == parent_prec and is_right`), the case that would
     /// otherwise re-associate, e.g. `a - (b - c)` must keep its parentheses
     /// whereas `(a - b) - c` need not. Non-binary children are printed as-is.
     /// `is_right` marks which side of the parent this operand is.

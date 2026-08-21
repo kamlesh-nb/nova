@@ -16,7 +16,7 @@
 //!   1. **This is a SHADOW pass that emits nothing.** Historically the module
 //!      was the F4 stage-3 experiment that measured how much code true
 //!      monomorphisation would generate versus the old type-erased scheme (see
-//!      [`Worklist.report`], which prints "SHADOW — emits nothing" and a growth
+//!      [`Worklist.report`], which prints "SHADOW, emits nothing" and a growth
 //!      ratio). It graduated into the authoritative source of the instantiation
 //!      list: [`Worklist.names`] and [`Worklist.instIds`] hand the collected set
 //!      to the real emitter, and [`live_instantiations`] / [`live_inst_ids`]
@@ -657,7 +657,7 @@ pub const Worklist = struct {
     /// [`Stats`] and re-renders each instantiation's arguments via the type store.
     pub fn report(self: *const Worklist) void {
         const out = std.debug.print;
-        out("\n=== F4 stage 3: instantiation worklist (SHADOW — emits nothing) ===\n", .{});
+        out("\n=== F4 stage 3: instantiation worklist (SHADOW, emits nothing) ===\n", .{});
         out("  distinct instantiations : {d}\n", .{self.stats.instantiations});
         out("  bodies today (erased)   : {d}\n", .{self.stats.todays_bodies});
         out("  bodies if monomorphized : {d}\n", .{self.stats.projected_bodies});
@@ -716,7 +716,7 @@ test "mono: List<int> and List<string> are TWO instantiations" {
 }
 
 // Re-noting an identical instantiation is idempotent via the `seen` memo.
-test "mono: the same instantiation twice is ONE — the seen set is the memo" {
+test "mono: the same instantiation twice is ONE, the seen set is the memo" {
     const s = try sema_mod.Sema.create(testing.allocator);
     defer s.destroy();
     var w = Worklist.init(testing.allocator, s);
@@ -740,7 +740,7 @@ test "mono: a NON-generic struct is not an instantiation" {
 }
 
 // A nested generic argument is itself counted, so the outer and inner both add.
-test "mono: nested args are instantiations too — List<Map<string,int>>" {
+test "mono: nested args are instantiations too, List<Map<string,int>>" {
 
     const s = try sema_mod.Sema.create(testing.allocator);
     defer s.destroy();
@@ -755,7 +755,7 @@ test "mono: nested args are instantiations too — List<Map<string,int>>" {
 }
 
 // A nest past [`max_depth`] is refused (counted in `too_deep`), not expanded.
-test "mono: RECURSION GUARD — an unbounded nest is refused, not hung (F4 3.6)" {
+test "mono: RECURSION GUARD, an unbounded nest is refused, not hung (F4 3.6)" {
 
     const s = try sema_mod.Sema.create(testing.allocator);
     defer s.destroy();
@@ -787,7 +787,7 @@ test "mono: a legal nest just under the bound is ACCEPTED" {
 }
 
 // An uninstantiated type parameter is not concrete, so it is skipped.
-test "mono: `List<T>` is NOT an instantiation — only concrete args count" {
+test "mono: `List<T>` is NOT an instantiation, only concrete args count" {
 
     const s = try sema_mod.Sema.create(testing.allocator);
     defer s.destroy();
@@ -803,7 +803,7 @@ test "mono: `List<T>` is NOT an instantiation — only concrete args count" {
 }
 
 // [`Worklist.isConcrete`] recurses, so a type param buried deep still disqualifies.
-test "mono: a param nested DEEP still disqualifies — List<List<T>>" {
+test "mono: a param nested DEEP still disqualifies, List<List<T>>" {
     const s = try sema_mod.Sema.create(testing.allocator);
     defer s.destroy();
     var w = Worklist.init(testing.allocator, s);
@@ -814,7 +814,7 @@ test "mono: a param nested DEEP still disqualifies — List<List<T>>" {
 }
 
 // An `unresolved` slot is also non-concrete, so no body is emitted for a guess.
-test "mono: unresolved is not concrete either — never emit a body for a guess" {
+test "mono: unresolved is not concrete either, never emit a body for a guess" {
     const s = try sema_mod.Sema.create(testing.allocator);
     defer s.destroy();
     var w = Worklist.init(testing.allocator, s);

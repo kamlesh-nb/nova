@@ -39,7 +39,7 @@
 //!      because downstream code compares types by id) and avoids churning the
 //!      intern table for no-op substitutions.
 //!
-//!   3. **Graceful under-determination — never panic on bad shapes.** An
+//!   3. **Graceful under-determination, never panic on bad shapes.** An
 //!      out-of-range parameter index, a foreign owner, or a shape mismatch
 //!      between declared and actual is resolved to "do nothing" (leave the type
 //!      as-is / leave the slot unsolved), NOT an assertion. Those situations are
@@ -212,7 +212,7 @@ test "subst: T becomes the argument" {
 
 // Invariant 1: a parameter owned by a DIFFERENT declaration is not captured,
 // even though it shares the same index as the one being substituted.
-test "subst: ANOTHER declaration's param is left alone — no silent capture" {
+test "subst: ANOTHER declaration's param is left alone, no silent capture" {
 
     var store = types.TypeStore.init(testing.allocator);
     defer store.deinit();
@@ -223,7 +223,7 @@ test "subst: ANOTHER declaration's param is left alone — no silent capture" {
 
 // Arguments bind by position: parameter 0 takes argument 0 and parameter 1
 // takes argument 1, with no reliance on any parameter name.
-test "subst: by INDEX, not by name — param 1 takes arg 1" {
+test "subst: by INDEX, not by name, param 1 takes arg 1" {
     var store = types.TypeStore.init(testing.allocator);
     defer store.deinit();
     const str = try store.stringT();
@@ -267,7 +267,7 @@ test "subst: a type with nothing to substitute is returned UNCHANGED" {
 
 // The empty-`args` fast path: with no arguments there is nothing to replace, so
 // even a parameter is returned as-is.
-test "subst: no args substitutes nothing — a non-generic receiver is untouched" {
+test "subst: no args substitutes nothing, a non-generic receiver is untouched" {
     var store = types.TypeStore.init(testing.allocator);
     defer store.deinit();
     const t = try param(&store, List, 0);
@@ -287,7 +287,7 @@ test "subst: an out-of-range index is left for the type checker, not panicked on
 
 // Function types substitute in both directions: a parameter appearing in the
 // arguments AND the return type is replaced in each position.
-test "subst: through a function type — params and return both" {
+test "subst: through a function type, params and return both" {
     var store = types.TypeStore.init(testing.allocator);
     defer store.deinit();
     const str = try store.stringT();
@@ -384,7 +384,7 @@ pub fn solveParams(
 
 // [`solveParams`] recovers a parameter from a nested position: `U` is deduced
 // from a function's RETURN type when only that position mentions it.
-test "solve: U comes from the closure's RETURN — `map((x) => x * 2)`" {
+test "solve: U comes from the closure's RETURN, `map((x) => x * 2)`" {
     var store = types.TypeStore.init(testing.allocator);
     defer store.deinit();
     const int = try store.intT();
@@ -400,7 +400,7 @@ test "solve: U comes from the closure's RETURN — `map((x) => x * 2)`" {
 
 // Invariant 1 for inference: a parameter owned by another declaration is never
 // bound, so its slot stays `null`.
-test "solve: only OUR params are solved — a foreign one is left alone" {
+test "solve: only OUR params are solved, a foreign one is left alone" {
     var store = types.TypeStore.init(testing.allocator);
     defer store.deinit();
     const int = try store.intT();
@@ -427,7 +427,7 @@ test "solve: nothing is invented from an unresolved actual" {
 
 // Inference descends into matching struct instantiations: unifying `List<U>`
 // with `List<string>` yields `U = string`.
-test "solve: through a nested instantiation — `List<U>` against `List<string>`" {
+test "solve: through a nested instantiation, `List<U>` against `List<string>`" {
     var store = types.TypeStore.init(testing.allocator);
     defer store.deinit();
     const str = try store.stringT();

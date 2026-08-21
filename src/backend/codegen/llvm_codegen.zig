@@ -3245,7 +3245,7 @@ pub const LlvmCompiler = struct {
         };
         if (fa.span.line > 0) {
             std.debug.print(
-                "  \x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m no method or function '{s}' on '{s}'\x1b[0m — check the name and that it is `pub`.\n",
+                "  \x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m no method or function '{s}' on '{s}'\x1b[0m, check the name and that it is `pub`.\n",
                 .{ fa.span.file, fa.span.line, fa.span.col, fa.field, recv },
             );
         }

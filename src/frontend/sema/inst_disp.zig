@@ -6,12 +6,12 @@
 //! every use site inside a CONCRETE instantiation, two facts that the abstract
 //! check cannot answer:
 //!
-//!   1. **Ownership disposition** — does this expression PRODUCE an owned value
+//!   1. **Ownership disposition**, does this expression PRODUCE an owned value
 //!      that the surrounding scope is responsible for releasing? A `T` might
 //!      monomorphise to `int` (never owned) or to `List<int>` (heap, owned), so
 //!      the answer differs per instantiation of the SAME source expression.
 //!
-//!   2. **Concrete type** — the actual [`TypeId`] the abstract type resolves to
+//!   2. **Concrete type**, the actual [`TypeId`] the abstract type resolves to
 //!      once the instantiation's type arguments are substituted in, so later
 //!      passes can emit the right dtor / layout without re-substituting.
 //!
@@ -24,11 +24,11 @@
 //! Three entry points cover the three shapes a generic can take, and they share
 //! the recursive walker in [`Ctx`]:
 //!
-//!   * [`run`] — generic STRUCTs reached as concrete instantiations, walking the
+//!   * [`run`], generic STRUCTs reached as concrete instantiations, walking the
 //!     bodies of every method the struct declares.
-//!   * [`runFreeFns`] / [`recordFreeFnInst`] — generic FREE functions, using the
+//!   * [`runFreeFns`] / [`recordFreeFnInst`], generic FREE functions, using the
 //!     instantiation list `mono` collected during monomorphisation.
-//!   * [`runMethods`] — generic METHODS (which have their OWN type parameters on
+//!   * [`runMethods`], generic METHODS (which have their OWN type parameters on
 //!     top of the receiver's), needing a two-level substitution ([`Ctx.decl2`] /
 //!     [`Ctx.args2`]).
 //!
@@ -379,10 +379,10 @@ const Ctx = struct {
 /// Returns `false` for expression kinds that merely REFERENCE or borrow an
 /// existing value rather than producing a fresh owned one, so the scope does not
 /// try to release something it does not own:
-///   * `ident` / `field_access` / `index` — read an existing binding or member.
-///   * `binary` with `op == .assign` — an assignment yields nothing to own.
-///   * `literal` — non-heap constants.
-///   * `try_expr` / `cast` / `await_expr` / `go_expr` / `optional_chaining` —
+///   * `ident` / `field_access` / `index`, read an existing binding or member.
+///   * `binary` with `op == .assign`, an assignment yields nothing to own.
+///   * `literal`, non-heap constants.
+///   * `try_expr` / `cast` / `await_expr` / `go_expr` / `optional_chaining`,
 ///     forward or transform an inner value without minting new ownership here.
 ///
 /// For every other kind, ownership follows the concrete TYPE: returns

@@ -1487,7 +1487,7 @@ pub const Parser = struct {
             .keyword_var => {
 
                 const t = self.current();
-                std.debug.print("Parser error: {s}:{}:{}: `var` is not a Nova keyword — use `let` for a mutable variable or `const` for a constant.\n", .{ self.file_path, t.line, t.column });
+                std.debug.print("Parser error: {s}:{}:{}: `var` is not a Nova keyword, use `let` for a mutable variable or `const` for a constant.\n", .{ self.file_path, t.line, t.column });
                 return error.UnexpectedToken;
             },
             .keyword_const => return ast.Statement{ .let_stmt = try self.parseLetStmt(true) },
@@ -1589,17 +1589,17 @@ pub const Parser = struct {
                 "      let raw = try readConfig(path);   // error -> return it from this fn\n" ++
                 "      let p   = loadPort() catch 8080;  // error -> use 8080\n" ++
                 "      let p   = loadPort() catch (e) reason(e);\n" ++
-                "  It branches on a returned VALUE — nothing unwinds. See specs.md §3.4b.\n",
+                "  It branches on a returned VALUE, nothing unwinds. See specs.md §3.4b.\n",
                 .{ sp.file, sp.line, sp.col },
             );
             return error.UnexpectedToken;
         }
         std.debug.print(
-            "{s}:{d}:{d}: error: '{s}' was removed from Nova — exceptions do not exist.\n" ++
+            "{s}:{d}:{d}: error: '{s}' was removed from Nova, exceptions do not exist.\n" ++
             "  The thrown value could not survive: it was truncated to an i32, so `throw \"msg\"`\n" ++
             "  was caught as an integer. It also leaked every frame it unwound, and longjmp out\n" ++
             "  of an async fn is undefined behaviour.\n" ++
-            "  Return an error VALUE instead: `fn f(): T | E` — see specs.md §3.4b and §5.5.\n",
+            "  Return an error VALUE instead: `fn f(): T | E`, see specs.md §3.4b and §5.5.\n",
             .{ sp.file, sp.line, sp.col, tok.lexeme },
         );
         return error.UnexpectedToken;

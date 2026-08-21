@@ -3086,7 +3086,7 @@ const Fixture = struct {
 
 // Verifies each literal kind gets its exact type (int/string/bool/double), the
 // honesty rule that a literal is not widened to the machine word.
-test "infer: literals get honest types — an int literal is int, not the machine word" {
+test "infer: literals get honest types, an int literal is int, not the machine word" {
     const a = testing.allocator;
     var f = Fixture.init(a);
     f.low = lower.Lowerer.init(a, &f.store);
@@ -3343,7 +3343,7 @@ fn genericListProgram(sp: ast.Span, methods: []ast.MethodDecl) [1]ast.Declaratio
 
 // A generic method's return `T` is substituted from the RECEIVER's type args,
 // so `List<string>.get()` is string and `List<int>.get()` is int.
-test "F4: `List<string>.get()` is string — substitute T from the RECEIVER's args" {
+test "F4: `List<string>.get()` is string, substitute T from the RECEIVER's args" {
 
     const a = testing.allocator;
     const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.nova" };
@@ -3454,7 +3454,7 @@ test "F4: a generic FUNCTION call substitutes from its explicit type args" {
 
 // A generic struct's field type substitutes from the receiver's args too, so
 // `Box<string>.v` reads as string.
-test "F4: a generic struct's FIELD substitutes too — `Box<string>.v` is string" {
+test "F4: a generic struct's FIELD substitutes too, `Box<string>.v` is string" {
 
     const a = testing.allocator;
     const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.nova" };
@@ -3491,7 +3491,7 @@ test "F4: a generic struct's FIELD substitutes too — `Box<string>.v` is string
 
 // A field whose type is a function can be CALLED: `(self.hashFn)(key)` types as
 // the function's return, with the field's params substituted from the struct.
-test "F4: calling a field that HOLDS a function — `(self.hashFn)(key)`" {
+test "F4: calling a field that HOLDS a function, `(self.hashFn)(key)`" {
 
     const a = testing.allocator;
     const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.nova" };
@@ -3635,7 +3635,7 @@ test "F2: `if (s == undefined)` narrows the ELSE branch (specs.md 3.4a)" {
 
 // Only a plain identifier narrows; `obj.field != undefined` does not, since
 // narrowing rebinds a name and a field has no binding to rewrite.
-test "F2: only a plain BINDING narrows — a field does not (specs.md 3.4a)" {
+test "F2: only a plain BINDING narrows, a field does not (specs.md 3.4a)" {
 
     const a = testing.allocator;
     const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.nova" };
@@ -3869,7 +3869,7 @@ test "F2: a closure param is inferred from its USE in the body (specs.md 6.3a)" 
 
 // `(a, b) => a + b` with neither param constrained stays unresolved rather than
 // guessing: documents the deliberate limit of use-based inference.
-test "F2: `(a, b) => a + b` stays unresolved — the limit, not a guess" {
+test "F2: `(a, b) => a + b` stays unresolved, the limit, not a guess" {
 
     const a = testing.allocator;
     const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.nova" };

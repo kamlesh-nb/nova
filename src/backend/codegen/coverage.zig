@@ -14,7 +14,7 @@
 //! same every time that block is asked about within a single compile, so codegen
 //! can emit a counter increment against it and the metadata will agree.
 //! [`CoverageRegistry.registerBlock`] enforces this by de-duplicating on
-//! `(file_path, line)` — asking twice about the same line returns the first ID
+//! `(file_path, line)`, asking twice about the same line returns the first ID
 //! rather than minting a new one. IDs are simply the insertion index into
 //! [`CoverageRegistry.blocks`], which keeps them dense and contiguous (`0..N`) so
 //! the runtime can size its counter array as a flat `[N]` and index directly.
@@ -109,7 +109,7 @@ pub const CoverageRegistry = struct {
     ///
     /// If a block with the same `file_path` and `line` was already registered,
     /// its existing [`CoverageBlock.id`] is returned and no new block is created
-    /// (the passed `col`/`description` are then ignored) — this is what lets
+    /// (the passed `col`/`description` are then ignored), this is what lets
     /// codegen ask about a line more than once and always emit the same counter.
     /// Otherwise a fresh block is appended: the new ID is the current length,
     /// `file_path` and `description` are DUPLICATED into registry-owned memory,

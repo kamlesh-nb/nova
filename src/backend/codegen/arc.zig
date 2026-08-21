@@ -186,7 +186,7 @@ pub fn legacyStringOwnership(self: *LlvmCompiler, type_name: []const u8) bool {
         std.debug.print(
             "\x1b[1m\x1b[31mcompiler error:\x1b[0m\x1b[1m ARC ownership asked of an un-typeable value '{s}'\x1b[0m\n" ++
             "  sema failed to type a value that reached a retain/release. This is a COMPILER bug\n" ++
-            "  (not user code): freeing it would corrupt memory. F5 stage 2 — please report.\n",
+            "  (not user code): freeing it would corrupt memory. F5 stage 2, please report.\n",
             .{type_name});
         std.process.exit(70);
     }

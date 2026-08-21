@@ -174,7 +174,7 @@ pub fn cmdInit(allocator: std.mem.Allocator, init: std.process.Init, args: []con
     var template_type = args[2];
 
     if (std.mem.eql(u8, template_type, "app")) {
-        std.debug.print("note: `nova init app` is deprecated — use `nova init web` (or `desktop`). Scaffolding a web app.\n", .{});
+        std.debug.print("note: `nova init app` is deprecated, use `nova init web` (or `desktop`). Scaffolding a web app.\n", .{});
         template_type = "web";
     }
     if (!std.mem.eql(u8, template_type, "console") and

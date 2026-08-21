@@ -3,7 +3,7 @@
 //! without ever seeing a Nova declaration for them.
 //!
 //! Nova's standard library is written in Nova and type-checks like any other
-//! code, but a handful of primitives cannot be — they are the raw seam onto
+//! code, but a handful of primitives cannot be, they are the raw seam onto
 //! machine memory, SIMD registers, the C++ runtime, and the async reactor.
 //! `bytes.read_i32(p, off)`, `simd.addU32x4(a, b)`, and `nova_reactor_resume(h)`
 //! have no Nova body to infer a type from; the codegen backend emits them
@@ -13,26 +13,26 @@
 //!
 //! There are two flavours, kept in two tables:
 //!
-//!   * [`table`] — namespaced pseudo-methods written `receiver.name(args)`,
+//!   * [`table`], namespaced pseudo-methods written `receiver.name(args)`,
 //!     where `receiver` is a magic module identifier (`bytes`, `simd`, `mem`,
 //!     `decimal`, `console`) rather than a real value. [`isReceiver`] is what
 //!     tells the resolver "`bytes` is not an undefined variable, it is a
 //!     builtin namespace", and [`find`] resolves the specific method.
 //!
-//!   * [`externs`] — bare-name functions (empty `receiver`) that bind straight
+//!   * [`externs`], bare-name functions (empty `receiver`) that bind straight
 //!     to a symbol in the C++ runtime (`nova_*`) or the coroutine ABI
-//!     (`currentCoro`, `coroStart`, …). Resolved by [`findExtern`].
+//!     (`currentCoro`, `coroStart`, ...). Resolved by [`findExtern`].
 //!
 //! Each entry records ONLY the return type, as a small [`Ret`] tag rather than a
 //! full [`types.TypeId`]: the table is a compile-time constant and predates (and
 //! is independent of) any particular [`types.TypeStore`] instance, so it stores a
 //! store-agnostic enum and [`retType`] materialises the real `TypeId` on demand
 //! against whichever store the current compilation is using. Argument types are
-//! deliberately not modelled here — arguments are checked elsewhere; what
+//! deliberately not modelled here, arguments are checked elsewhere; what
 //! inference needs from this table is the value a call *yields*.
 //!
 //! Invariant worth stating because it is load-bearing and tested: address-
-//! yielding builtins (`bytes.alloc`, `bytes.new`, `read_ptr`, …) return [`Ret.ptr`],
+//! yielding builtins (`bytes.alloc`, `bytes.new`, `read_ptr`, ...) return [`Ret.ptr`],
 //! NOT [`Ret.int`]. A pointer stored into a 32-bit `int` truncates on a 64-bit
 //! target and produces a garbage address; the `.ptr` tag keeps them at pointer
 //! width. See the `bytes.alloc returns a POINTER` test at the foot of this file.
@@ -276,7 +276,7 @@ pub fn isReceiver(name: []const u8) bool {
 /// receiver/name pair is not registered.
 ///
 /// Both components must match exactly. A `null` here means the call is not a
-/// builtin method (e.g. `console.alloc` — `alloc` exists only under `bytes`),
+/// builtin method (e.g. `console.alloc`, `alloc` exists only under `bytes`),
 /// which is a normal resolution outcome rather than an error. Linear scan over
 /// [`table`].
 pub fn find(receiver: []const u8, name: []const u8) ?Builtin {

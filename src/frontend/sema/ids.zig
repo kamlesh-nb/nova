@@ -338,7 +338,7 @@ test "ids: distinct expressions get distinct ids" {
 // The reason this pass exists: after stamping, a by-value copy of an
 // expression carries the SAME id (the id travels in the struct) while its
 // address differs, so the id is a valid cross-copy key and `&expr` is not.
-test "ids: THE POINT — an id survives a copy, an address does not" {
+test "ids: THE POINT, an id survives a copy, an address does not" {
 
     var a = Assigner.init();
     var e = mkLit(7);

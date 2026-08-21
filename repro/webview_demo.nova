@@ -17,7 +17,7 @@ fn main(): void {
         </body>
     </html>;
 
-    w.setTitle("Nova — Webview Demo");
+    w.setTitle("Nova, Webview Demo");
     w.setSize(900, 640, webview.HINT_NONE);
     w.bind("greet", (req: string) => { return "\"Nova received: " + req + "\""; });
     w.setHtml(page);

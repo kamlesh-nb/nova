@@ -444,7 +444,7 @@ test "lower: string and ptr are distinct, and neither is an int" {
 
 // The core honesty guarantee: an unknown name lowers to `unresolved` (not a
 // silent `int` default) and bumps the unresolved tally.
-test "T4: an unknown type lowers to unresolved — NOT to int" {
+test "T4: an unknown type lowers to unresolved, NOT to int" {
 
     var store = types.TypeStore.init(testing.allocator);
     defer store.deinit();
@@ -478,7 +478,7 @@ test "lower: a type param resolves by POSITION, not by being one uppercase lette
 
 // Function types are structural: same params but different return types give
 // different ids, and a function type is owned.
-test "lower: a function type is structural — arity and return matter" {
+test "lower: a function type is structural, arity and return matter" {
     var store = types.TypeStore.init(testing.allocator);
     defer store.deinit();
     var l = mk(&store);
@@ -530,7 +530,7 @@ test "lower: tuples and arrays are structural" {
 
 // Stats accounting: two known names bump `lowered`, one unknown bumps
 // `unresolved` and is recorded verbatim in `unresolved_names`.
-test "stats count what could NOT be typed — the honest F2 signal" {
+test "stats count what could NOT be typed, the honest F2 signal" {
     var store = types.TypeStore.init(testing.allocator);
     defer store.deinit();
     var l = mk(&store);
@@ -590,7 +590,7 @@ test "join: a named type resolves to a struct decl, not unresolved" {
 
 // A generic head resolved through the symbol table keeps its lowered args, so
 // distinct instantiations of the same struct (List<string> vs List<int>) differ.
-test "join: F4's precondition holds on real decls — List<string> != List<int>" {
+test "join: F4's precondition holds on real decls, List<string> != List<int>" {
     const a = testing.allocator;
     var store = types.TypeStore.init(a);
     defer store.deinit();
@@ -672,7 +672,7 @@ test "lower: two different generics' params are DIFFERENT types" {
 
 // Absent any scope, `T` is a plain unknown identifier (unresolved), NOT
 // implicitly the first param of symbol 0; adding a scope makes it a type param.
-test "lower: with no scope, `T` is not a param at all — never symbol 0's" {
+test "lower: with no scope, `T` is not a param at all, never symbol 0's" {
 
     var store = types.TypeStore.init(testing.allocator);
     defer store.deinit();

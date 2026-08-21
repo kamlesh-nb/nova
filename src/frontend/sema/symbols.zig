@@ -1087,7 +1087,7 @@ test "canonicalModulePrefix: the root program and harness files have no prefix" 
 // `$HOME` path components for an installed-stdlib file, and must therefore
 // differ from the in-tree prefix. If someone "fixes" the legacy path this test
 // fails, which is the intended tripwire.
-test "legacyModulePrefix reproduces the OLD behaviour — including the $HOME bug" {
+test "legacyModulePrefix reproduces the OLD behaviour, including the $HOME bug" {
 
     const a = testing.allocator;
     const via_src = (try legacyModulePrefix(a, "src/std/string.nova", "app.nova")).?;

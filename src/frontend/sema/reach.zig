@@ -68,7 +68,7 @@ const TypedIr = infer.TypedIr;
 /// same allocator that [`compute`] was given.
 pub const Result = struct {
     /// Set of reachable function/method symbols, keyed by [`SymbolId`] (the
-    /// value is unit — this is a set, not a map). A [`SymbolId`] present here is
+    /// value is unit, this is a set, not a map). A [`SymbolId`] present here is
     /// live and must be emitted; anything absent may be pruned by codegen.
     reachable: std.AutoHashMapUnmanaged(SymbolId, void) = .empty,
     /// Total count of function and method declarations seen in the table. Used
@@ -106,7 +106,7 @@ pub var gate_on: bool = false;
 /// capacity ([`clearRetainingCapacity`]).
 pub var reachable_keys: std.StringHashMapUnmanaged(void) = .empty;
 
-/// Reports, by NAME, whether a method should be emitted — the by-name twin of
+/// Reports, by NAME, whether a method should be emitted, the by-name twin of
 /// [`Result.contains`], consulted from codegen sites that lack the [`SymbolId`].
 ///
 /// Returns true unconditionally when the gate is off ([`gate_on`] false), so
@@ -166,7 +166,7 @@ const Ctx = struct {
     tab: *const SymbolTable,
     /// Typed IR whose `expr_syms` resolves call expressions to callee symbols.
     ir: *const TypedIr,
-    /// The reachable set being built — points into [`Result.reachable`].
+    /// The reachable set being built, points into [`Result.reachable`].
     reachable: *std.AutoHashMapUnmanaged(SymbolId, void),
     /// The worklist of symbols discovered-but-not-yet-walked. [`enqueue`] pushes;
     /// [`compute`]'s drain loop pops from the front.
@@ -229,8 +229,8 @@ fn baseName(name: []const u8) []const u8 {
 ///      and constructors.
 ///   3. Fixpoint fixup (bounded to 128 passes): for any generic owner whose
 ///      methods became reachable, additionally root its `delete` method and, for
-///      `List`/`Map`/`Set`, its `copy` method — the ARC-synthesised calls the
-///      source walk cannot see — re-draining until the set stops growing.
+///      `List`/`Map`/`Set`, its `copy` method, the ARC-synthesised calls the
+///      source walk cannot see, re-draining until the set stops growing.
 ///
 /// The returned [`Result`] owns memory and must be freed with [`Result.deinit`].
 /// `tab`, `ir` and `program` are borrowed for the duration of the call only.

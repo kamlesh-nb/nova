@@ -8,17 +8,17 @@
 //!   1. **Namespacing.** It gives the rest of the codebase (and any embedder
 //!      that depends on the compiler as a library) a single stable place to
 //!      reach the frontend passes by name: `root.parser`, `root.sema`,
-//!      `root.mono`, and so on. The `pub const X = @import("…")` lines below are
+//!      `root.mono`, and so on. The `pub const X = @import("...")` lines below are
 //!      not just imports; because they are `pub`, they are the public API of the
 //!      crate. Callers write `@import("root").sema` rather than reaching into the
-//!      `frontend/sema/…` directory layout, so the on-disk structure can move
+//!      `frontend/sema/...` directory layout, so the on-disk structure can move
 //!      without breaking dependents.
 //!
 //!   2. **Test aggregation.** The `test {}` block is what `zig build test`
 //!      discovers and runs. `std.testing.refAllDecls(@This())` forces every
 //!      declaration reachable from this file to be referenced (and thus
 //!      semantically analysed and its `test` blocks collected), and the explicit
-//!      `_ = @import(…)` lines pull in modules that are NOT re-exported above but
+//!      `_ = @import(...)` lines pull in modules that are NOT re-exported above but
 //!      still carry tests we want run, most notably the backend codegen passes
 //!      (`backend/codegen/*`) and the OSSA ownership-IR passes
 //!      (`frontend/sema/ossa/*`). Without an explicit reference a module with no
@@ -99,7 +99,7 @@ pub const shadow = @import("frontend/sema/shadow.zig");
 // Root test aggregator: the entry point `zig build test` executes.
 //
 // [`std.testing.refAllDecls`] forces every declaration re-exported above to be
-// analysed so their `test` blocks are collected. The explicit `_ = @import(…)`
+// analysed so their `test` blocks are collected. The explicit `_ = @import(...)`
 // lines then pull in modules that are NOT part of the public surface above but
 // whose tests must still run, chiefly the backend codegen passes and the OSSA
 // ownership-IR passes; an unreferenced module would never be analysed and its

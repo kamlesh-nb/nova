@@ -637,16 +637,16 @@ pub fn cmdPublish(allocator: std.mem.Allocator, init: std.process.Init) !void {
     }
 
     if (!looksSemver(m.version)) {
-        std.debug.print("publish: warning — version \"{s}\" is not X.Y.Z semver.\n", .{m.version});
+        std.debug.print("publish: warning, version \"{s}\" is not X.Y.Z semver.\n", .{m.version});
     }
     const tag = try std.fmt.allocPrint(allocator, "v{s}", .{m.version});
 
     if (tagExistsLocal(init, tag) or tagExistsRemote(init, tag)) {
-        std.debug.print("publish: tag {s} already exists — never clobber a released version.\n", .{tag});
+        std.debug.print("publish: tag {s} already exists, never clobber a released version.\n", .{tag});
         return error.TagExists;
     }
     if (workingTreeDirty(init)) {
-        std.debug.print("publish: warning — working tree is dirty; uncommitted changes are NOT in the tag.\n", .{});
+        std.debug.print("publish: warning, working tree is dirty; uncommitted changes are NOT in the tag.\n", .{});
     }
     const msg = try std.fmt.allocPrint(allocator, "{s}", .{tag});
     try runGit(init, &[_][]const u8{ "git", "tag", "-a", tag, "-m", msg });

@@ -367,13 +367,13 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile, target: std.Build
         \\ar rcs "{[home]s}/.nova/lib/libnovacore.a" "{[home]s}/.nova/lib/novacore.o" $NOVA_ASM_OBJ
         \\# T1: the cross-compilation cache (novacore_<triple>.o, built lazily by `nova build
         \\# --target ...`) is keyed only by triple, so it must be invalidated whenever the runtime
-        \\# source changes. Clear it here — triples contain dashes, so this glob spares novacore_asan.o.
+        \\# source changes. Clear it here, triples contain dashes, so this glob spares novacore_asan.o.
         \\rm -f "{[home]s}/.nova/lib/novacore_"*-*.o 2>/dev/null || true
         \\# NOVA_ASAN=1: additionally build an AddressSanitizer runtime. Opt-in because it
         \\# roughly doubles this step; `nova test` links it only when NOVA_ASAN=1 too.
         \\#
         \\# WHY: ARC decides ownership from a rendered type NAME, and when the name is
-        \\# unknown it GUESSES — isRefCountedType's catch-all returns true, so "the compiler
+        \\# unknown it GUESSES, isRefCountedType's catch-all returns true, so "the compiler
         \\# is confused" means "free this memory". The result is a use-after-free whose crash
         \\# lands somewhere unrelated, at a location chosen by the allocator rather than by the
         \\# bug: `nova_release` on a freed object reads the refcount at ptr-8 and looks harmless
@@ -382,7 +382,7 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile, target: std.Build
         \\# that read into a located report AT the release, naming both the free and the use.
         \\# NOTE: the runtime is instrumented; codegen's LLVM IR is not, so a read of freed
         \\# memory from NOVA code is caught only when it flows through a runtime entry point
-        \\# (which every retain/release/alloc does). LeakSanitizer is unsupported on Darwin —
+        \\# (which every retain/release/alloc does). LeakSanitizer is unsupported on Darwin,
         \\# use NOVA_ARC_AUDIT for leaks, which is semantic and better anyway.
         \\if [ "${{NOVA_ASAN:-0}}" = "1" ]; then
         \\  echo "Building libnovacore_asan.a (AddressSanitizer) ..."

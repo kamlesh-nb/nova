@@ -8,7 +8,7 @@
 //! walks the typed AST, tracks the set of live owned locals in scope, and emits
 //! an [`ir.Func`] made of blocks whose terminators encode control flow and
 //! whose instructions are the ownership events that matter: `makeOwned` (a new
-//! heap value is born), `copy` (an owned duplicate — an ARC retain of a fresh
+//! heap value is born), `copy` (an owned duplicate, an ARC retain of a fresh
 //! reference), `borrowUse` (an owned value is read without transferring it),
 //! and `destroy` (the ARC release). [`verify.verify`] then checks that along
 //! every path each owned value reaches exactly one release. [`forward.count`]
@@ -21,7 +21,7 @@
 //! the whole function bail out with [`Outcome.deferred`] and a [`DeferReason`],
 //! instead of emitting an IR that might verify wrongly. A deferred function is
 //! simply not checked; it is never reported as imbalanced. That is why the
-//! coverage number (`lowered / total`) is a real metric — it is the slice of
+//! coverage number (`lowered / total`) is a real metric, it is the slice of
 //! the corpus the verifier actually vouches for. Deferral reasons include
 //! `break`/`continue` outside a loop the model set up, a reassignment of a
 //! local that pre-dates the current SSA "clone floor", `switch` cases with

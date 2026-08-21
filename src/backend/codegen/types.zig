@@ -17,7 +17,7 @@
 //!      [`mangleTypeName`], [`methodSymbol`], [`qualifySelfType`]). Nova's
 //!      human-readable type spellings (`List<Map<string, int>>`, `Foo.Bar`,
 //!      `int`) become stable, collision-free LLVM symbol names. The primitive
-//!      aliases are canonicalised first (`int`→`i32`, `long`→`i64`, …) so that
+//!      aliases are canonicalised first (`int`→`i32`, `long`→`i64`, ...) so that
 //!      two spellings of the same type never mangle to two different symbols.
 //!
 //!   2. The codegen representation of primitives ([`CgRepr`], [`CgPrim`],
@@ -225,7 +225,7 @@ pub fn methodSymbol(self: *LlvmCompiler, owner: []const u8, method: []const u8) 
 /// base body (link-time fallback with internal linkage that globalDCE later
 /// drops). A non-generic struct returns just `[null]`. For a generic struct it
 /// then appends every entry of `sema_mono.live_instantiations` whose base name
-/// matches `s.name`, i.e. every `List<int>`, `List<string>`, … sema actually
+/// matches `s.name`, i.e. every `List<int>`, `List<string>`, ... sema actually
 /// discovered. Caller owns the returned slice. Drives per-instantiation method
 /// emission alongside [`methodSymbol`].
 pub fn instantiationsOf(self: *LlvmCompiler, s: ast.StructDecl) ![]const ?[]const u8 {
@@ -289,8 +289,8 @@ pub const CgPrim = struct { repr: CgRepr, signed: bool };
 
 /// Classifies a type name as a primitive, or null if it is not one.
 ///
-/// Recognises both the Nova alias spellings (`int`, `long`, `byte`, `float`, …)
-/// and the explicit-width spellings (`i32`, `u64`, `f64`, …), plus `bool` (as
+/// Recognises both the Nova alias spellings (`int`, `long`, `byte`, `float`, ...)
+/// and the explicit-width spellings (`i32`, `u64`, `f64`, ...), plus `bool` (as
 /// `i1`) and `ptr` (as an unsigned `word`). Note the deliberate collapse:
 /// `byte`/`ubyte`/`u8` are all unsigned `i8` while `sbyte`/`i8` are signed
 /// `i8`. This is the single source of truth for "is this a primitive and how is
@@ -392,7 +392,7 @@ pub fn llvmForRepr(self: *LlvmCompiler, repr: CgRepr) types.LLVMTypeRef {
 /// Lowers an `ast.TypeRef` to an LLVM type, coarsely.
 ///
 /// A bare-identifier primitive lowers to its [`llvmForRepr`] type; EVERYTHING
-/// else (non-primitive identifiers, optionals, tuples, arrays, generics, …)
+/// else (non-primitive identifiers, optionals, tuples, arrays, generics, ...)
 /// lowers to the opaque `ptr_type`. This is the coarse "is it a scalar or a
 /// pointer" lowering used where an exact aggregate layout is not needed; the
 /// finer slot decisions live in [`slotTypeForLocalId`].
@@ -1159,7 +1159,7 @@ pub fn isOwnedTypeId(self: *LlvmCompiler, t: typesys.TypeId) bool {
             std.debug.print(
                 "\x1b[1m\x1b[31mcompiler error:\x1b[0m\x1b[1m ownership decision asked of an UNTYPED value\x1b[0m\n" ++
                 "  isOwnedTypeId reached an `.unresolved` TypeId. A caller took an ownership action on a\n" ++
-                "  value sema never typed — a COMPILER bug (F2-5), not user code. Every ownership vehicle\n" ++
+                "  value sema never typed, a COMPILER bug (F2-5), not user code. Every ownership vehicle\n" ++
                 "  must check `.unresolved` and fall back before deciding. Please report.\n",
                 .{},
             );
@@ -2070,7 +2070,7 @@ test "mangleTypeName: List<int> and List<string> DO NOT collide" {
 // the test build genuinely links the LLVM bindings. It asserts nothing about
 // behaviour; its value is failing to COMPILE if the LLVM import is not
 // reachable from the test module.
-test "the test module can SEE llvm — the wiring, not a lucky absence" {
+test "the test module can SEE llvm, the wiring, not a lucky absence" {
 
     _ = core;
     _ = types;

@@ -18,7 +18,7 @@
 //!   * producing an owned result (any instruction whose result is `owned`) SETS
 //!     its bit;
 //!   * a consuming instruction (see [`ir.consumesOperand`]) or an `ret_owned`
-//!     terminator UNSETS its bit — and if the bit was already clear, that is a
+//!     terminator UNSETS its bit, and if the bit was already clear, that is a
 //!     [`Kind.double_consume`];
 //!   * a borrow / borrow_use of an owned value that is not live is a
 //!     [`Kind.use_after_consume`] (the value was already given away);
@@ -36,7 +36,7 @@
 //! edges into the join disagree on one bit.
 //!
 //! Reassignment across a join is expressed with phi nodes, so [`edge`] applies
-//! each successor phi as it crosses the edge — consuming the incoming operand
+//! each successor phi as it crosses the edge, consuming the incoming operand
 //! (the old value dies at the merge) and producing the phi result (the merged
 //! value becomes live). This is what lets a loop-header phi keep an owned local
 //! balanced across iterations without the sweep needing to converge: the header
@@ -73,7 +73,7 @@ pub const Kind = enum { leak, double_consume, use_after_consume, path_imbalance,
 pub const Diagnostic = struct {
     /// The category of the defect. See [`Kind`].
     kind: Kind,
-    /// The offending SSA value — the owned value that leaked, was consumed
+    /// The offending SSA value, the owned value that leaked, was consumed
     /// twice, was used after consumption, or disagreed across a merge.
     value: ir.Value,
 };
@@ -113,9 +113,9 @@ const Set = std.DynamicBitSetUnmanaged;
 ///
 /// Runs a single forward sweep over blocks in index order (see the module
 /// header for why one pass suffices). For each block it clones the live-in set
-/// recorded in [`entry`], applies every instruction — producing owned results
+/// recorded in [`entry`], applies every instruction, producing owned results
 /// into the set, consuming operands out of it via [`checkConsume`], and
-/// validating borrows via [`checkUse`] — then hands the resulting live set to
+/// validating borrows via [`checkUse`], then hands the resulting live set to
 /// the terminator: `ret_owned` consumes, `ret_void`/`ret_trivial` flags any
 /// survivor as a [`Kind.leak`], and branch terminators propagate to successors
 /// through [`edge`].
@@ -220,7 +220,7 @@ fn checkUse(gpa: std.mem.Allocator, diags: *std.ArrayListUnmanaged(Diagnostic), 
 /// several successors) is untouched. First it walks `succ`'s phi nodes: for the
 /// input whose predecessor is `cur`, the incoming owned operand is consumed (a
 /// clear-when-already-clear bit is a [`Kind.double_consume`]) and the owned phi
-/// result is made live — modelling reassignment at the merge. The `break` after
+/// result is made live, modelling reassignment at the merge. The `break` after
 /// the matching input assumes at most one input per predecessor.
 ///
 /// Then it reconciles with [`entry`]`[succ]`: if this is the first edge to reach

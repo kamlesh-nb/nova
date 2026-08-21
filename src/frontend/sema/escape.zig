@@ -570,16 +570,16 @@ fn identName(e: *const ast.Expression) ?[]const u8 {
 ///
 /// Per statement kind:
 ///
-///   * `let x = init` — if `init` is heap-owning ([`isOwned`]) and this is a
+///   * `let x = init`, if `init` is heap-owning ([`isOwned`]) and this is a
 ///     single-name binding, record `x` as an allocation site. If `init` is a bare
 ///     identifier, record an `x = init` [`Edge`] so escape can flow. Then recurse
 ///     into `init` for nested calls. (Destructuring `let`s, where `names != null`,
 ///     are skipped for both.)
-///   * assignment `lhs = rhs` — a field or index LHS means the object is stored
+///   * assignment `lhs = rhs`, a field or index LHS means the object is stored
 ///     into aliasable memory, so `rhs`'s identifiers escape immediately. An
 ///     identifier LHS records an edge instead. Any other LHS just walks `rhs`.
-///   * `return v` — `v`'s identifiers escape (they leave the function).
-///   * control flow (`if`/`while`/`for`/`switch`/`defer`/`block`) — recurse into
+///   * `return v`, `v`'s identifiers escape (they leave the function).
+///   * control flow (`if`/`while`/`for`/`switch`/`defer`/`block`), recurse into
 ///     conditions, sub-statements, and loop clauses to reach nested calls,
 ///     assignments, and returns.
 fn walkStmt(ctx: *Ctx, s: *const ast.Statement) void {

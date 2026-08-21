@@ -15,7 +15,7 @@
 //! be produced by many independent code paths; interning gives them one shared
 //! identity so downstream passes compare ids, not deep trees. Second, ownership
 //! for ARC is decided *from the type*, never from how it was spelled (see
-//! [`TypeStore.isOwned`]) — a policy the codebase is emphatic about because
+//! [`TypeStore.isOwned`]), a policy the codebase is emphatic about because
 //! deciding ownership from a type NAME is a known source of memory corruption.
 //! An interned id is the stable handle that policy hangs off.
 //!
@@ -30,7 +30,7 @@
 //! A few encodings here are deliberately compact and worth flagging: SIMD vector
 //! primitives are smuggled through [`PrimType.bits`] with a `lanes*1000 + count`
 //! scheme (see [`TypeStore.vecU8x16T`]) rather than adding a variant, and enum
-//! ownership is not intrinsic to the [`Type`] — it depends on whether the enum
+//! ownership is not intrinsic to the [`Type`], it depends on whether the enum
 //! carries a payload, which is recorded out-of-band in
 //! [`TypeStore.enum_tagged`] and consulted by [`TypeStore.isOwned`].
 
@@ -65,7 +65,7 @@ pub const PrimKind = enum { bool, int, float, void_ };
 /// differ ONLY in `signed`, so signedness must be compared, never inferred from
 /// how the type was written (see the "u64 is NOT i64" test). Ordinary widths use
 /// `bits` literally (1 for bool, 8/32/64 for ints, 32/64 for floats); SIMD
-/// vectors overload `bits` as `lanes*1000 + count` — see [`TypeStore.vecU8x16T`]
+/// vectors overload `bits` as `lanes*1000 + count`, see [`TypeStore.vecU8x16T`]
 /// and its siblings.
 pub const PrimType = struct {
     /// Which scalar family this is: [`PrimKind.bool`], `int`, `float`, or `void_`.
@@ -96,7 +96,7 @@ pub const StructType = struct {
     decl: SymbolId,
 
     /// The type arguments applied to [`StructType.decl`], in declaration order;
-    /// empty for a non-generic struct. Interned by value — the store copies this
+    /// empty for a non-generic struct. Interned by value, the store copies this
     /// slice into its own storage so it never aliases caller memory.
     args: []const TypeId = &.{},
 };
@@ -168,7 +168,7 @@ pub const Type = union(enum) {
     /// A named, possibly-generic struct; see [`StructType`].
     struct_: StructType,
     /// A named enum, identified by its declaration. Ownership is NOT decided from
-    /// this alone — it depends on whether the enum is payload-carrying, recorded
+    /// this alone, it depends on whether the enum is payload-carrying, recorded
     /// in [`TypeStore.enum_tagged`].
     enum_: SymbolId,
     /// A trait (interface) type, identified by its declaration. Represented at
@@ -300,7 +300,7 @@ fn eqlIds(a: []const TypeId, b: []const TypeId) bool {
 /// identity-bearing payload is compared (primitives via [`PrimType.eql`],
 /// slice-carrying variants via [`eqlIds`], the rest by direct id/field
 /// comparison). Because interning guarantees a given shape has one id,
-/// comparing the referenced ids by value is sufficient — there is no need to
+/// comparing the referenced ids by value is sufficient, there is no need to
 /// recurse into the pointed-at types. Must stay in lockstep with [`hashType`].
 fn eqlType(a: Type, b: Type) bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
@@ -327,7 +327,7 @@ fn eqlType(a: Type, b: Type) bool {
 /// It simply forwards to [`hashType`]/[`eqlType`]; it exists because
 /// `std.HashMapUnmanaged` requires a context type providing `hash`/`eql`, and a
 /// `Type` cannot be auto-hashed (it contains slices, whose pointer identity must
-/// NOT participate — only their contents). This is what turns the store's
+/// NOT participate, only their contents). This is what turns the store's
 /// `Type -> TypeId` map into the interning table.
 const TypeContext = struct {
     /// Structural hash of a key; delegates to [`hashType`].
@@ -426,7 +426,7 @@ pub const TypeStore = struct {
     /// Interns `t` and returns its [`TypeId`], the primary entry point.
     ///
     /// If a structurally-equal type was interned before, its existing id is
-    /// returned and nothing is allocated (idempotence — see the "interning is
+    /// returned and nothing is allocated (idempotence, see the "interning is
     /// idempotent" test). Otherwise the type's slices are copied into the store
     /// via [`TypeStore.own`], it is appended to `types` under the next dense id,
     /// and registered in `map` so future equal shapes deduplicate to it. Note
@@ -532,7 +532,7 @@ pub const TypeStore = struct {
     }
 
     /// Decides whether values of type `id` are ARC-managed (owned), from the TYPE
-    /// alone — never from a spelling.
+    /// alone, never from a spelling.
     ///
     /// This is the authoritative ownership oracle the codegen/sema passes rely on
     /// to insert retains/releases. The rules: primitives and raw `ptr` are not
@@ -542,7 +542,7 @@ pub const TypeStore = struct {
     /// `optional` inherits ownership from its inner type; and an `enum_` is owned
     /// only if it is payload-carrying per [`TypeStore.enum_tagged`]. `type_param`
     /// and `unresolved` are `unreachable` because ownership of an unbound or
-    /// un-inferred type is not answerable — resolve/monomorphise first, or use
+    /// un-inferred type is not answerable, resolve/monomorphise first, or use
     /// [`TypeStore.isOwnedSafe`] if reaching them is possible.
     pub fn isOwned(self: *const TypeStore, id: TypeId) bool {
         return switch (self.get(id)) {
@@ -588,7 +588,7 @@ pub const TypeStore = struct {
 /// no aliasing of caller memory).
 const testing = std.testing;
 
-test "T1: interning is idempotent — same type, same id" {
+test "T1: interning is idempotent, same type, same id" {
     var s = TypeStore.init(testing.allocator);
     defer s.deinit();
     const a = try s.intT();
@@ -606,7 +606,7 @@ test "T1: TypeId equality IS type equality" {
     try testing.expect(try s.stringT() != try s.ptrT());
 }
 
-test "signedness is carried, not spelled — u64 is NOT i64" {
+test "signedness is carried, not spelled, u64 is NOT i64" {
 
     var s = TypeStore.init(testing.allocator);
     defer s.deinit();

@@ -52,9 +52,9 @@ const semver = @import("semver.zig");
 /// One published version of a package, as it appears in an index file.
 ///
 /// Fields:
-///   * `version` — the SemVer string this record publishes (e.g. `"1.4.1"`).
-///   * `url` — the git/fetch location to obtain this version from.
-///   * `ref` — the git ref (tag or commit) to check out; `null` means the URL
+///   * `version`, the SemVer string this record publishes (e.g. `"1.4.1"`).
+///   * `url`, the git/fetch location to obtain this version from.
+///   * `ref`, the git ref (tag or commit) to check out; `null` means the URL
 ///     alone is enough (default branch). [`rewriteDep`] appends it as `url#ref`
 ///     when present.
 pub const IndexVersion = struct { version: []const u8, url: []const u8, ref: ?[]const u8 = null };

@@ -1,4 +1,4 @@
-//! Allocation profiler — an `std.mem.Allocator` wrapper that attributes every
+//! Allocation profiler, an `std.mem.Allocator` wrapper that attributes every
 //! live allocation to the CALL SITE that made it.
 //!
 //! The compiler and its runtime allocate heavily, and when memory grows without

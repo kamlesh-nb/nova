@@ -361,14 +361,14 @@ fn formatFile(allocator: std.mem.Allocator, init: std.process.Init, file_path: [
                 if (ta.type == .eof) break;
             }
         }
-        std.debug.print("skipped '{s}': formatter would alter code (unsupported construct) — file left unchanged\n", .{file_path});
+        std.debug.print("skipped '{s}': formatter would alter code (unsupported construct), file left unchanged\n", .{file_path});
         return;
     }
 
     const with_comments = try reinjectComments(allocator, source, formatted);
     defer allocator.free(with_comments);
     if (!sameTokenStream(source, with_comments)) {
-        std.debug.print("skipped '{s}': comment reinjection would alter code — file left unchanged\n", .{file_path});
+        std.debug.print("skipped '{s}': comment reinjection would alter code, file left unchanged\n", .{file_path});
         return;
     }
 
