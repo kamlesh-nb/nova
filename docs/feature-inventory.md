@@ -611,11 +611,16 @@ shell harnesses are manual and non-gating.
 - [x] Aggregates + GROUP BY.
 - [ ] A statistics-driven cost-based optimiser (currently rule-based; docs overstate "CBO Implemented").
 
-### Binary wire protocol ; PARTIAL ; case
+### Binary wire protocol ; SOUND ; case
 
 - [x] Versioned, length-prefixed frames; startup/query/parse/bind/execute; oversized-frame reject.
 - [x] SQL-injection-neutralisation tests on the command path.
-- [ ] The simple-query executor accepts server-side bound parameters (prepared path only today).
+- [x] The simple-query executor accepts server-side bound parameters. DONE (nova-novadb): `QueryRequest` gained
+      `params` / `param_classes`, and `execute()` inlines `$1..$N` with the SAME injection-safe substitution the
+      extended/prepared path uses (text single-quoted with quotes doubled, numeric whitelisted-then-raw, null ->
+      NULL), then runs the resulting text -- so a caller can bind parameters on a one-shot `execute()` without a
+      Parse/Bind/Execute round-trip. A non-numeric NUMERIC param is rejected rather than mis-bound. Gated by
+      root.zig "BINDPARAMS: the simple-query executor accepts server-side bound parameters (injection-safe)".
 
 ---
 
