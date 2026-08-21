@@ -1,0 +1,58 @@
+// binary-trees, BORROWED-STRING (Str) variant. Each Node carries a `Str` label -- a {ptr,len} VALUE view
+// borrowing bytes out of ONE long-lived owned buffer (NAMES). No node allocates a string of its own; the
+// label is a zero-copy borrow (Nova's `&str`), and the buffer outlives every tree, which is the manual
+// lifetime contract Str requires. The hot recursive `scan` walks the tree summing each node's label bytes
+// via `Str.byteAt`, so borrowed-view scanning is exercised on the SAME allocate/reclaim pattern as the
+// classic benchmark. Node counts are analytic (2^(d+1)-1), so the golden shape is preserved alongside the
+// borrowed-byte checksum.
+import str;
+
+// Long-lived backing buffer. "leaf" = bytes summing 408, "node" = bytes summing 422 (deterministic).
+const NAMES: string = "leafnode";
+
+struct Node {
+    pub label: str.Str,        // borrowed value-view, stored inline in the node
+    pub left: Node | undefined,
+    pub right: Node | undefined
+}
+
+fn leafLabel(): str.Str { return str.sub(NAMES, 0, 4); }   // "leaf"
+fn nodeLabel(): str.Str { return str.sub(NAMES, 4, 8); }   // "node"
+
+fn bottomUp(depth: int): Node {
+    if (depth <= 0) { return Node { label: leafLabel(), left: undefined, right: undefined }; }
+    return Node { label: nodeLabel(), left: bottomUp(depth - 1), right: bottomUp(depth - 1) };
+}
+// Sum the bytes of a borrowed label with zero copies.
+fn labelSum(v: str.Str): int {
+    let s = 0; let i = 0; let n = v.size();
+    while (i < n) { s = s + v.byteAt(i); i = i + 1; }
+    return s;
+}
+// Traverse the tree, accumulating the borrowed-byte checksum over every node's label.
+fn scan(n: Node): int {
+    let l = n.left;
+    if (l == undefined) { return labelSum(n.label); }
+    return labelSum(n.label) + scan(l as Node) + scan(n.right as Node);
+}
+
+const MIN_DEPTH: int = 4;
+const MAX_DEPTH: int = 10;
+
+fn ipow2(e: int): int { let v = 1; let i = 0; while (i < e) { v = v * 2; i = i + 1; } return v; }
+
+fn main(): int {
+    let stretchDepth = MAX_DEPTH + 1;
+    console.log(`stretch tree of depth ${stretchDepth}\t label-sum: ${scan(bottomUp(stretchDepth))}`);
+    let longLived = bottomUp(MAX_DEPTH);
+    let depth = MIN_DEPTH;
+    while (depth <= MAX_DEPTH) {
+        let iterations = ipow2(MAX_DEPTH - depth + MIN_DEPTH);
+        let total = 0; let i = 1;
+        while (i <= iterations) { total = total + scan(bottomUp(depth)); i = i + 1; }
+        console.log(`${iterations}\t trees of depth ${depth}\t label-sum: ${total}`);
+        depth = depth + 2;
+    }
+    console.log(`long lived tree of depth ${MAX_DEPTH}\t label-sum: ${scan(longLived)}`);
+    return 0;
+}

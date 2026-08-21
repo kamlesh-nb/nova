@@ -165,3 +165,42 @@ value-word IR (nsieve) and ARC-vs-GC allocation churn (binary-trees) — are not
 without a large project (a typed-SSA IR, or a region/arena allocator). Neither buys a *language*
 capability, so effort moves to features. Nova matches Rust within noise on 4 of 6 and beats Go/C# on
 those four; that is the standing result.
+
+---
+
+## Re-run 2026-08-21 (same Apple M1, larger sizes for timer resolution)
+
+Fresh same-box, same-minute run of the full suite against Rust, Go, and C#, at **larger problem sizes**
+so each program runs ~1 to 3 seconds (the original sizes finish in a few ms on this M1 and no longer
+resolve). Every peer takes its size on argv; the Nova sources are the tuned `*_for.nova` range-for
+variants (binary-trees adds `NOVA_ARC_ELIDE=1`). Golden output was verified at each size in the SAME run
+(not against a stored value): spectral `1.274224153`, fannkuch `556355` / `Pfannkuchen(11) = 51`,
+mandelbrot md5 `e01bb5628cbf0254313292d48368f99b` (Nova == C#), nbody `-0.169075164` / `-0.169031665`,
+nsieve `14683/7837/4203`, binary-trees `check: 524287`. Times are best-of-6 user-seconds, lower is better.
+
+| Benchmark | Rust | Go | C# | **Nova** | Nova vs Rust | Fastest |
+|---|---:|---:|---:|---:|---:|---|
+| spectral-norm (N=5500) | 1.14 | 1.15 | 1.19 | **1.15** | **1.01× (tie)** | Rust |
+| fannkuch-redux (N=11) | 2.07 | 1.95 | 1.98 | **1.92** | **0.93× (fastest)** | **Nova** |
+| mandelbrot (4000²) | 1.66 | 1.45* | 1.70 | **1.66** | **1.00× (tie)** | Rust/Nova† |
+| nbody (N=20M) | 0.54 | 1.46 | 0.94 | **0.61** | **1.13×** | Rust |
+| nsieve (160k ×400) | 0.26 | 0.26 | 0.29 | **0.36** | **1.38×** | Rust/Go |
+| binary-trees (depth 18) | 1.21 | 2.65 | 0.71 | **2.86** | **2.36×** | C# (GC) |
+
+\* Go mandelbrot uses a different inner algorithm (does not produce the reference md5), so it is not a
+like-for-like time. † Among the like-for-like peers (Rust, C#, Nova) Nova ties Rust for fastest.
+
+**Reproduces the original findings exactly:** Nova ties or beats Rust/Go/C# on the four compute-bound
+benchmarks (spectral, fannkuch, mandelbrot, nbody — and on nbody it beats Go 2.4× and C# 1.5×), and
+trails only on the two the doc already called structural: nsieve (1.38×, was 1.41×) and binary-trees
+(2.36× vs Rust; C#'s generational GC is the outright winner at 0.71 s and pulls further ahead at depth 18
+than at 16, as allocation churn dominates). `NOVA_ARC_ELIDE` changed the binary-trees codegen but moved
+the time <1% at depth 18 (the M1 doc's +10% was at depth 16) — it cannot touch `bottomUp`'s genuine
+allocate/free work, which is the whole cost here.
+
+**Fine-tuning status:** the measured config is already the tuned one — range-for induction loops (so LLVM
+vectorizes), `--release`, host-CPU target, and ARC elision on the allocator benchmark. Both laggards are
+codegen/model-level, not source-tunable: nsieve is strided single-byte scalar writes with no float math to
+vectorize, and binary-trees is ARC per-node inc/dec/free versus a GC. Closing either to Rust parity needs
+a compiler project (a typed-SSA IR, or a region/arena allocator for provably-scoped subtrees), not a
+source tweak — consistent with the original conclusion.

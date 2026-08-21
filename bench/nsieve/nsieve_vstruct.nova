@@ -1,0 +1,44 @@
+// nsieve, VALUE-STRUCT variant. The sieve state is encapsulated in a `struct`, which in Nova is a VALUE
+// type. To make this a clean value-struct comparison against nsieve.nova (rather than a List-vs-array one),
+// the flag buffer is the SAME fixed `bool[160000]` array, held INLINE as a struct field: the only thing that
+// differs from the baseline is that the buffer + its `run` logic are wrapped in a value struct and driven
+// through a method. Direct `self.flags[i]` indexing, no container method calls. Golden output matches.
+struct Sieve {
+    pub flags: bool[160000],
+    pub limit: int,
+    init(cap: int) {
+        self.flags = [false; 160000];
+        self.limit = cap;
+    }
+    // Sieve up to m over the inline buffer; returns the prime count.
+    fn run(self: Sieve, m: int): int {
+        let i = 0; while (i < m) { self.flags[i] = true; i = i + 1; }
+        let count = 0; i = 2;
+        while (i < m) {
+            if (self.flags[i]) {
+                count = count + 1;
+                let j = i + i; while (j < m) { self.flags[j] = false; j = j + i; }
+            }
+            i = i + 1;
+        }
+        return count;
+    }
+}
+
+const REPS: int = 400;
+
+fn main(): int {
+    let s = Sieve(160000);
+    let c0 = 0; let c1 = 0; let c2 = 0;
+    let rep = 0;
+    while (rep < REPS) {
+        c0 = s.run(10000 * 16);
+        c1 = s.run(10000 * 8);
+        c2 = s.run(10000 * 4);
+        rep = rep + 1;
+    }
+    console.log(`Primes up to ${10000 * 16} ${c0}`);
+    console.log(`Primes up to ${10000 * 8} ${c1}`);
+    console.log(`Primes up to ${10000 * 4} ${c2}`);
+    return 0;
+}

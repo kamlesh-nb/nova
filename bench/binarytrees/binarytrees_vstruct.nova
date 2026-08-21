@@ -1,0 +1,46 @@
+// binary-trees, VALUE-STRUCT variant. Each Node carries a `Payload` VALUE struct stored INLINE (Swift-style
+// inline value-struct storage: the two ints live in the node's own storage, not behind a pointer). The tree
+// links stay optional Node references (a self-containing value struct would be infinite-size and is rejected
+// by design, so the child edges are the natural indirection point). itemCheck reads the payload BY VALUE.
+// `pay.count` is 1 at every node, so the check totals equal node counts and match binarytrees.nova exactly.
+struct Payload {
+    pub count: int,     // contribution to itemCheck (1 per node)
+    pub depth: int,     // second field, carried inline by value, proves multi-field inline storage
+    init(c: int, d: int) { self.count = c; self.depth = d; }
+}
+struct Node {
+    pub pay: Payload,
+    pub left: Node | undefined,
+    pub right: Node | undefined
+}
+
+fn bottomUp(depth: int): Node {
+    if (depth <= 0) { return Node { pay: Payload(1, 0), left: undefined, right: undefined }; }
+    return Node { pay: Payload(1, depth), left: bottomUp(depth - 1), right: bottomUp(depth - 1) };
+}
+fn itemCheck(n: Node): int {
+    let l = n.left;
+    if (l == undefined) { return n.pay.count; }
+    return n.pay.count + itemCheck(l as Node) + itemCheck(n.right as Node);
+}
+
+const MIN_DEPTH: int = 4;
+const MAX_DEPTH: int = 10;
+
+fn ipow2(e: int): int { let v = 1; let i = 0; while (i < e) { v = v * 2; i = i + 1; } return v; }
+
+fn main(): int {
+    let stretchDepth = MAX_DEPTH + 1;
+    console.log(`stretch tree of depth ${stretchDepth}\t check: ${itemCheck(bottomUp(stretchDepth))}`);
+    let longLived = bottomUp(MAX_DEPTH);
+    let depth = MIN_DEPTH;
+    while (depth <= MAX_DEPTH) {
+        let iterations = ipow2(MAX_DEPTH - depth + MIN_DEPTH);
+        let check = 0; let i = 1;
+        while (i <= iterations) { check = check + itemCheck(bottomUp(depth)); i = i + 1; }
+        console.log(`${iterations}\t trees of depth ${depth}\t check: ${check}`);
+        depth = depth + 2;
+    }
+    console.log(`long lived tree of depth ${MAX_DEPTH}\t check: ${itemCheck(longLived)}`);
+    return 0;
+}
