@@ -536,7 +536,12 @@ shell harnesses are manual and non-gating.
 ### MVCC ; PARTIAL ; read
 
 - [x] Uncommitted rows invisible; committed visible; rolled-back invisible (Read Committed).
-- [ ] Snapshot / repeatable-read / serializable isolation.
+- [ ] Snapshot / repeatable-read / serializable isolation. PARTIAL: snapshot / REPEATABLE READ are now
+      IMPLEMENTED (nova-novadb) -- a transaction opened under `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`
+      (or `SNAPSHOT`) captures a frozen MVCC snapshot at BEGIN (committed-set copy + xid ceiling) and every read
+      observes it, so a row committed by another session after the snapshot stays invisible for the whole txn
+      (gated -- see the isolation-level criterion below). SERIALIZABLE is deliberately REJECTED (true SSI is not
+      implemented) rather than silently downgraded, so this bundled criterion stays [ ] honestly pending SSI.
 - [x] An aborted row is never visible in memory before restart. FIXED (nova-novadb d934c85): a
       committed-then-failed transaction (WAL commit record could not be written, e.g. ENOSPC) left
       `current_tx_id` set and un-aborted, so the owning session kept seeing its own uncommitted rows
@@ -549,7 +554,12 @@ shell harnesses are manual and non-gating.
 ### Transactions and isolation ; PARTIAL ; case
 
 - [x] BEGIN / COMMIT / ROLLBACK.
-- [ ] Selectable isolation level (`SET TRANSACTION ISOLATION LEVEL`).
+- [x] Selectable isolation level (`SET TRANSACTION ISOLATION LEVEL`). DONE (nova-novadb): the executor accepts
+      `SET TRANSACTION ISOLATION LEVEL {READ COMMITTED | REPEATABLE READ | SNAPSHOT}` and applies it to the next
+      transaction -- READ COMMITTED (default) re-reads the live committed set per statement; REPEATABLE READ /
+      SNAPSHOT freeze a per-transaction MVCC snapshot at BEGIN. SERIALIZABLE is rejected with a clear error (no
+      SSI) instead of silently under-isolating. Gated by root.zig "ISOLATION: REPEATABLE READ freezes a snapshot;
+      READ COMMITTED sees concurrent commits" (two sessions on one db).
 - [ ] SAVEPOINT / ROLLBACK TO.
 
 ### Concurrency and locking ; PARTIAL ; case
