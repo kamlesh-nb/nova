@@ -639,7 +639,16 @@ shell harnesses are manual and non-gating.
 
 - [x] Volcano iterators: table scan, index scan, nested-loop join, hash join, filter, project.
 - [x] Aggregates + GROUP BY.
-- [ ] A statistics-driven cost-based optimiser (currently rule-based; docs overstate "CBO Implemented").
+- [x] A statistics-driven cost-based optimiser. DONE (nova-novadb): added a real `CostModel` that estimates
+      plan costs from row-count statistics (`ANALYZE`/sys.table_stats) -- nested-loop = |L|*|R|, hash =
+      |L|+2|R| -- and drives the join-algorithm choice by comparing estimated costs, replacing the fixed
+      `right<100` threshold. It picks hash for large-left x small-right (the hash win) and nested-loop for tiny
+      joins, and only runs when the right table has real stats (unanalyzed joins keep the safe nested-loop
+      default). Combined with the existing stats-driven access-path decision (skip index scan when page_count
+      is tiny), plan selection is now cost-based, not a magic threshold. Gated by root.zig "CBO: cost model
+      chooses join algorithm from statistics" + a functional equi-join test. (Hash selection is capped to the
+      hash-join executor's validated small-build envelope -- its large-build path has a separate correctness
+      gap; join-order enumeration and histogram-based selectivity remain documented future depth.)
 
 ### Binary wire protocol ; SOUND ; case
 
