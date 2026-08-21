@@ -637,17 +637,24 @@ Read first: the offline gate tests ALGORITHMS OVER IN-PROCESS FAKES (shared in-m
 a `FakeConn`); the real cross-process/cross-node paths are only in manual, non-gating tests. And the offline
 gate does not currently reproduce green on this checkout (see the two UNSOUND rows).
 
-### proxyd data plane (LB, pool, discovery) ; PARTIAL (logic) ; case
+### proxyd data plane (LB, pool, discovery) ; SOUND ; case
 
 - [x] RoundRobin / Weighted / LeastConn / ConsistentHash strategies, per-reactor lock-free.
 - [x] Backend pool with keep-alive safe reuse.
 - [x] Discovery-file publish (atomic temp+rename) and consume.
-- [ ] Verified against live socket forwarding (tests exercise `Pool.select` logic only).
+- [x] Verified against live socket forwarding. DONE + gated (nova-orchestrator `202_live_forwarding`):
+      test_live_socket_forwarding binds a REAL backend TCP server on 127.0.0.1, and `proxy.forwardOnce`
+      (select + forward, the request path's core) opens a real connection, sends an HTTP request, and reads the
+      real reply back -- proving proxyd forwards bytes end-to-end, not just `Pool.select`. Runs on the reactor
+      harness the language reactor conformance cases use (`poller.Reactor` + `setCurrent` + manual resume).
 
-### proxyd health checks and VIP ; PARTIAL ; case
+### proxyd health checks and VIP ; SOUND ; case
 
 - [x] Rise/fall hysteresis, drain/restore decision logic.
-- [ ] A gating LIVE probe sweep.
+- [x] A gating LIVE probe sweep. DONE + gated (nova-orchestrator `202_live_forwarding`
+      test_live_probe_up_then_down): a live TCP connect probes a serving backend UP and a bound-then-closed
+      port DOWN over real sockets, then folds the results into `Backend.observe` (rise/fall hysteresis) to
+      DRAIN the dead backend out of rotation -- a live probe sweep, not just the offline decision logic.
 - [x] VIP bind for a non-dotted-quad host. FIXED (nova-orchestrator): `bindAddrFor` (proxy.nova) now routes
       through `socket.resolveHost4`, the same blocking getaddrinfo resolver the reactor connect path uses, so a
       Service VIP may be a hostname (`localhost`, `web.internal`) not just a literal dotted quad. A numeric
