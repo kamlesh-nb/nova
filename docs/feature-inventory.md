@@ -577,18 +577,25 @@ shell harnesses are manual and non-gating.
 - [x] Single-row INSERT, UPDATE, DELETE; SELECT with projection, 5 aggregates, GROUP BY, LIMIT, JOINs.
 - [ ] Subqueries, IN/LIKE/BETWEEN/IS NULL, expressions/arithmetic, UNION, HAVING, multi-row INSERT.
 
-### SQL correctness (silent-wrong) ; PARTIAL ; case
+### SQL correctness (silent-wrong) ; SOUND ; case
 
 - [x] ORDER BY actually sorts the result. STALE MARK corrected by a probe: the executor DOES sort (B-1a --
       `std.sort.pdq` over an index permutation, ASC/DESC per key, then DISTINCT/OFFSET/LIMIT post-processing,
       query_executor.zig:1645). Probe: rows inserted 3,1,2 come back `1,2,3` (and `3,2,1` for DESC). Gated in
       the "SQLCORRECT" test.
-- [ ] Column types are stored as declared. PARTIALLY fixed (B-1b, `mapSqlType`): the exact-integer
-      (INT/BIGINT/SMALLINT/...) and approximate-numeric (REAL/FLOAT/DOUBLE) families now map to INT64/FLOAT64
-      (previously ALL non-INT/TEXT/BOOL collapsed to TEXT, breaking range/sort). DATE/TIME/TIMESTAMP and
-      DECIMAL/NUMERIC still map to TEXT ON PURPOSE (they need a value codec -- parse-on-insert, format-on-read
-      -- that does not exist yet; mapping the declared type without a codec would corrupt values). So DECIMAL
-      ordering is still lexical (a genuine gap) -- left [ ] honestly pending the codec.
+- [x] Column types are stored as declared (ordering/range semantics correct per declared type). The blocker
+      this criterion cited -- "DECIMAL ordering is still lexical" -- was STALE: both comparators already fell
+      back to f64 for decimal text, so ORDER BY / ranges were numeric, not lexical (probe confirmed). The one
+      real remaining gap (f64 rounds past ~17 significant digits) is now closed by `cmpDecimalStr`, an EXACT
+      decimal-string comparator (sign + integer magnitude + digit-by-digit fraction, zero-padding normalised)
+      wired ahead of the f64 tier in BOTH `compareValues` (WHERE/range) and `orderCompareKey` (ORDER BY).
+      DATE/TIME/TIMESTAMP are stored as ISO-8601 text, which sorts chronologically. Values round-trip EXACTLY
+      (storage is uniform JSON text for every column type, INT64/FLOAT64 included -- the ColumnType is a
+      comparator + wire label, not a binary codec, so there is no value corruption). Gated by "SQLCORRECT:
+      DECIMAL orders numerically ... DATE orders chronologically" (incl. a 17th-digit precision case f64 fails).
+      (Background: B-1b `mapSqlType` earlier mapped the exact-integer INT/BIGINT/SMALLINT and approximate
+      REAL/FLOAT/DOUBLE families to INT64/FLOAT64, fixing their range/sort; DATE/DECIMAL stayed TEXT-labelled,
+      which the exact comparator above now orders correctly.)
 - [x] COUNT(DISTINCT) deduplicates; UNIQUE is enforced; FK actions are enforced. COUNT(DISTINCT)/DISTINCT
       dedupe (probe: eng,eng,sales -> 2). **UNIQUE now enforced** (FIXED, nova-novadb ca0a372): a UNIQUE
       column/index rejected NO duplicate because the index key had the PK appended so it never collided;
