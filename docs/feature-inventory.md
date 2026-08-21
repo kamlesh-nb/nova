@@ -556,7 +556,15 @@ shell harnesses are manual and non-gating.
       after `BEGIN;INSERT;<ENOSPC>COMMIT`. Both commit paths (explicit + autocommit) now ABORT + clear the
       session tx on a failed commit-record write, so the rows are invisible (recovery's undo removes them on
       disk). Gated by "MVCC: a failed-commit transaction's rows are not visible in memory"; full suite green.
-- [ ] The in-memory committed-txn set is bounded (currently unbounded; GC is disk-side only).
+- [ ] The in-memory committed-txn set is bounded (currently unbounded; GC is disk-side only). ATTEMPTED +
+      reverted: a horizon-pruning design (prune committed xids below the oldest-active watermark; a below-horizon
+      xid is committed unless in a small aborted set; snapshots carry the horizon + aborted copy) is
+      algorithmically sound and the visibility tests passed, BUT pruning `committed_txns` DEADLOCKS with the
+      disk-side vacuum/GC (`database.zig` reads `txn_manager.committed_txns` under the SAME txn mutex while
+      holding page/structure state) -- a single node hangs at 0% CPU in a futex wait. Safely bounding the
+      in-memory set therefore requires coordinating the prune with the vacuum's locking (freeze rows before
+      dropping their xids), a deeper subsystem change than an incremental pass allows. Left [ ] honestly rather
+      than ship a hang.
 
 ### Transactions and isolation ; SOUND ; case
 
