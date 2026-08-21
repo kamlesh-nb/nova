@@ -578,11 +578,18 @@ shell harnesses are manual and non-gating.
       corrupt per its own comment).
 - [ ] Write scalability beyond ~5 writers (deliberate ceiling today).
 
-### SQL parser ; PARTIAL ; read
+### SQL parser ; SOUND ; read
 
 - [x] CREATE/ALTER/DROP TABLE, PK, NOT NULL, single-col FK, CREATE/DROP INDEX.
 - [x] Single-row INSERT, UPDATE, DELETE; SELECT with projection, 5 aggregates, GROUP BY, LIMIT, JOINs.
-- [ ] Subqueries, IN/LIKE/BETWEEN/IS NULL, expressions/arithmetic, UNION, HAVING, multi-row INSERT.
+- [x] Subqueries, IN/LIKE/BETWEEN/IS NULL, expressions/arithmetic, UNION, HAVING, multi-row INSERT. DONE
+      (nova-novadb): IN/LIKE/BETWEEN/IS NULL, arithmetic expressions, and HAVING were already implemented
+      (B-2/B-3, verified). Added this pass: **multi-row INSERT** (`VALUES (..),(..),..`, atomic), **UNION /
+      UNION ALL** (lexer+AST+parser+executor; dedup unless every operator is ALL), and **uncorrelated scalar
+      + IN subqueries** (`x = (SELECT ..)`, `x [NOT] IN (SELECT ..)`) pre-evaluated once and substituted into
+      the predicate (SELECT WHERE/HAVING, UPDATE, DELETE) without mutating the cached AST. Gated in root.zig
+      "SQLEXT: multi-row INSERT is atomic", "SQLEXT: UNION dedups, UNION ALL keeps duplicates", "SQLEXT:
+      uncorrelated scalar and IN subqueries". (Correlated subqueries remain out of scope -- documented.)
 
 ### SQL correctness (silent-wrong) ; SOUND ; case
 
