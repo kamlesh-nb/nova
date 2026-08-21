@@ -1,0 +1,24 @@
+import assert;
+import list;
+
+struct Holder {
+    pub items: list.List<int>,
+    init() { self.items = list.List<int>(); }
+}
+class Box {
+    pub h: Holder,
+    init(h: Holder) { self.h = h; }
+}
+
+fn make(): Box {
+    let hh = Holder();      // owns a List<int>
+    hh.items.push(1);
+    hh.items.push(2);
+    return Box(hh);         // Holder passed BY VALUE into the Box class ctor
+}                           // local hh dtor runs here
+
+@test
+fn vs_container_into_class(): void {
+    let b = make();
+    assert.equalInt(b.h.items.size(), 2);   // reads the List after hh's dtor
+}
