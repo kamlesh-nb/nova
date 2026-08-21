@@ -669,11 +669,13 @@ gate does not currently reproduce green on this checkout (see the two UNSOUND ro
       fix above. The earlier belief that this was an "async-@test block-drive crash" was WRONG: 181 was a
       deterministic SYNC value-struct corruption, and 188 (below) is a SYNC teardown abort -- neither is async.
       No genuinely-async test aborts.
-- [ ] `188_leader_lease` exits cleanly. All 6 of its tests PASS, but the process then aborts at TEARDOWN ("Test
-      process terminated abnormally" AFTER the last test, no crash trace) -- an exit-time destructor sweep issue,
-      not a test/assertion failure. It has no async/await/spawn (so it is NOT an async-harness limitation) and no
-      Supervisor use (so the class fix does not reach it); it is a separate value-struct/dtor corruption in the
-      lease path, left [ ] honestly pending an ASAN-guided fix.
+- [x] `188_leader_lease` exits cleanly (6/6, no teardown abort). FIXED by the lang arc.zig value-struct
+      field-store fix (retain/deep-copy owned fields when a value struct is stored into a field -- see the SQL
+      parser / value-semantics notes) PLUS modelling `ConfigStore` as a `class`: it is a SHARED mutable store
+      held by multiple `LeaderLease` clients ("one shared store, two nodes"), and was a value struct relying on
+      the old field-store ALIASING bug to be shared. With the compiler fix making value structs correctly
+      independent, the store had to become reference data. Both landed; `188` is green and the exit-time abort
+      is gone.
 
 ### Autoscaler (PID) ; SOUND ; case
 
