@@ -558,7 +558,7 @@ shell harnesses are manual and non-gating.
       disk). Gated by "MVCC: a failed-commit transaction's rows are not visible in memory"; full suite green.
 - [ ] The in-memory committed-txn set is bounded (currently unbounded; GC is disk-side only).
 
-### Transactions and isolation ; PARTIAL ; case
+### Transactions and isolation ; SOUND ; case
 
 - [x] BEGIN / COMMIT / ROLLBACK.
 - [x] Selectable isolation level (`SET TRANSACTION ISOLATION LEVEL`). DONE (nova-novadb): the executor accepts
@@ -567,7 +567,15 @@ shell harnesses are manual and non-gating.
       SNAPSHOT freeze a per-transaction MVCC snapshot at BEGIN. SERIALIZABLE is rejected with a clear error (no
       SSI) instead of silently under-isolating. Gated by root.zig "ISOLATION: REPEATABLE READ freezes a snapshot;
       READ COMMITTED sees concurrent commits" (two sessions on one db).
-- [ ] SAVEPOINT / ROLLBACK TO.
+- [x] SAVEPOINT / ROLLBACK TO. DONE (nova-novadb): implemented a subtransaction model. Each `SAVEPOINT name`
+      opens a sub-transaction xid; writes carry the innermost savepoint's xid (else the main tx). Visibility
+      treats a row as the session's own live write when its xmin is the main tx OR a live sub-xid, so a
+      rolled-back sub-xid's rows become invisible. `ROLLBACK TO name` aborts the sub-xids for `name` and every
+      later savepoint and re-arms `name` with a fresh sub-xid (transaction stays open); `RELEASE [SAVEPOINT]
+      name` drops the marker but keeps its writes (they commit with the tx); COMMIT commits every live sub-xid
+      with the main tx. Gated by root.zig "SQLEXT: SAVEPOINT / ROLLBACK TO / RELEASE" (undo-after-savepoint,
+      nested rollback-to-outer, release-keeps-writes). Full `zig build test` green (hot-path visibility change
+      verified no regression).
 
 ### Concurrency and locking ; PARTIAL ; case
 
