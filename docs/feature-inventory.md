@@ -631,7 +631,15 @@ gate does not currently reproduce green on this checkout (see the two UNSOUND ro
 - [x] Diff logic: start-new / replace-changed / poll-unchanged / keep-unreadable / stop-when-gone.
 - [x] Store-driven reconcile parses YAML/JSON and validates.
 - [ ] Reconcile drives REAL process lifecycle (currently `simulated=true`, virtual replicas).
-- [ ] `181_orchestrator` runs to completion (currently crashes entering the async reconcile subtest).
+- [x] `181_orchestrator` runs to completion (8/8). FIXED (nova-orchestrator) -- and the previous diagnosis was
+      WRONG: it was NOT an "async reconcile subtest" crash. It was a DETERMINISTIC value-struct nested-container
+      corruption in the SYNC reconcile REMOVAL path. `Supervisor` was a value struct holding owned containers
+      (`procs`/`ports`/`simReplicas`) and was passed BY VALUE into the `Job` class constructor in `newJob`; the
+      value-copy did not deep-retain those containers, so the local `sup`'s destructor freed `procs` out from
+      under the stored copy, and reconcile's `stopAll` (only reached when a workload is REMOVED) segfaulted in
+      `List_Process_size` on the dangling list (`poll()` early-returns for manageProcesses=false, hiding it).
+      Making `Supervisor` a `class` (its correct model: a long-lived, in-place-mutated, identity-bearing entity)
+      fixes it. Minimal repro: `reconcileWith([spec])` then `reconcileWith([])`. Full suite green.
 
 ### Leader lease (fencing epochs) ; PARTIAL (logic) ; case
 
@@ -656,10 +664,16 @@ gate does not currently reproduce green on this checkout (see the two UNSOUND ro
       revision = $6` CAS guard (it silently ignored it, so a stale CAS "succeeded") and reject a duplicate-key
       INSERT; fixed the store's own revision-churn-on-failed-CAS bug that the now-compiling test exposed. All
       8 tests in 185 pass.
-- [ ] Async tests run to completion. PARTIAL: **186 now runs to completion (11/11)**; but `181_orchestrator`
-      still aborts entering its async reconcile subtest (6/8 tests run, then "Test process terminated
-      abnormally"). The async-@test block-drive crash is a Nova test-harness/runtime issue (spawning reactor
-      coroutines inside a block-driven `@test`), not a store-logic bug -- left [ ] honestly.
+- [x] Async tests run to completion. `186_controlplane` (the async control-plane suite) runs 11/11, and
+      `181_orchestrator` -- the other suite this criterion named -- now runs 8/8 after the Supervisor value-struct
+      fix above. The earlier belief that this was an "async-@test block-drive crash" was WRONG: 181 was a
+      deterministic SYNC value-struct corruption, and 188 (below) is a SYNC teardown abort -- neither is async.
+      No genuinely-async test aborts.
+- [ ] `188_leader_lease` exits cleanly. All 6 of its tests PASS, but the process then aborts at TEARDOWN ("Test
+      process terminated abnormally" AFTER the last test, no crash trace) -- an exit-time destructor sweep issue,
+      not a test/assertion failure. It has no async/await/spawn (so it is NOT an async-harness limitation) and no
+      Supervisor use (so the class fix does not reach it); it is a separate value-struct/dtor corruption in the
+      lease path, left [ ] honestly pending an ASAN-guided fix.
 
 ### Autoscaler (PID) ; SOUND ; case
 
