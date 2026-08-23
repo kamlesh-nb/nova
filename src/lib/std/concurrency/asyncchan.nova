@@ -66,7 +66,7 @@ import list;
 /// [`AsyncChannel.send`] never blocks. See the file header for the full
 /// concurrency contract; in short, this type is single-reactor only and not
 /// safe to share across OS threads.
-pub struct AsyncChannel<T> {
+pub class AsyncChannel<T> {
     /// The in-flight values, held oldest first. `send` appends with `push`;
     /// `recv` takes the head with `at(0)` then `remove(0)`, giving FIFO delivery.
     /// Its `size()` is both the queue depth and, against `capacity`, the

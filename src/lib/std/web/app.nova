@@ -47,6 +47,21 @@ import env;
 
 
 
+/// A streaming (Server-Sent Events) route handler.
+///
+/// Unlike a request handler it returns no `Response`; it takes over the
+/// connection via `io` and writes SSE frames until the client disconnects (a
+/// write returns a negative byte count) or it decides to stop. Register one with
+/// `App.sse(path, handler)`. Handlers usually hold a `web.sse.EventBus`,
+/// subscribe to a topic derived from `req`, and forward each event with
+/// `web.sse.writeEvent`. Defined here (not in `web.sse`) so the framework core
+/// does not depend on `web.sse`; an app imports `web.app` for this trait and
+/// `web.sse` for the bus and wire writers.
+pub trait SseHandler {
+    /// Serves one SSE connection to completion.
+    async fn stream(self, req: request.Request, io: aio.AsyncIO): void;
+}
+
 /// The web application: holds routing, dependency injection, static
 /// mounts, response caching and server configuration, and owns the
 /// connection-handling loop started by `run`.
@@ -86,6 +101,14 @@ pub class App {
     /// TCP port the server listens on, set by `run`.
     pub serverPort: int,
 
+    /// Streaming (Server-Sent Events) routes. `sseRouter` matches the request
+    /// path (supporting `{name}` and `{name:int}` parameters) to an index into
+    /// `sseHandlers`. Matched in the connection loop before normal dispatch: a
+    /// hit hands the raw connection to the registered `SseHandler`, which owns
+    /// the socket for the life of the stream.
+    pub sseRouter: routing.Router,
+    pub sseHandlers: List<SseHandler>,
+
     init() {
         self.router = routing.Router();
         self.provider = ServiceCollection().buildServiceProvider();
@@ -102,6 +125,8 @@ pub class App {
         self.tlsKey = "";
         self.gzipEnabled = false;
         self.serverPort = 0;
+        self.sseRouter = routing.Router();
+        self.sseHandlers = List<SseHandler>();
     }
 
     /// Turns on gzip compression for eligible outgoing response bodies.
@@ -212,6 +237,20 @@ pub class App {
     /// Registers a PATCH route at `path`, binding matched requests to type `TReq`.
     pub fn patch<TReq>(self: App, path: string): void {
         self.router.__addRoute("PATCH", path, serde.typeName<TReq>());
+    }
+
+    /// Registers a streaming (Server-Sent Events) route at `path`.
+    ///
+    /// A GET matching `path` is handed straight to `handler`, which takes over
+    /// the connection and writes SSE frames until the client disconnects, rather
+    /// than returning a finite `Response`. `path` may contain `{name}` (or
+    /// `{name:int}`) parameters; captured values are merged into the request's
+    /// query, so the handler reads them with `req.query.get("name")`. Matched in
+    /// the connection loop before normal dispatch. See `web.sse`.
+    pub fn sse(self: App, path: string, handler: SseHandler): void {
+        let idx = self.sseHandlers.size();
+        self.sseHandlers.push(handler);
+        self.sseRouter.__addRoute("GET", path, `${idx}`);
     }
 
     // Builds the value source a matched request's fields are bound from: merged query
@@ -504,6 +543,26 @@ async fn handleConn(app: App, io: AsyncIO): int {
         let wantClose = request.bufFindCI(buf, 0, hdrEnd, "connection: close") != -1;
 
         let (method, path) = request.bufMethodPath(buf, len);
+
+        // Streaming (SSE) routes take over the connection: hand the raw stream
+        // to the handler, which owns the socket until the client disconnects.
+        // The connection is not reused afterwards.
+        if (string.eql(method, "GET")) {
+            let sm = app.sseRouter.resolve("GET", path);
+            if (sm.matched) {
+                let sho = app.sseHandlers.get(string.parseI64(sm.key) as int);
+                if (sho != undefined) {
+                    let sreq = request.Request.fromString(bytes.read_string(buf, reqEnd));
+                    // Merge captured path parameters into the request query so
+                    // the handler reads them uniformly via req.query.
+                    sm.params.forEach((k, v) => { sreq.query.set(k, v); });
+                    await sho.stream(sreq, io);
+                    alive = false;
+                    break;
+                }
+            }
+        }
+
         let served = false;
         if (string.eql(method, "GET") && !usedChunked) {
             let c = app.cachedCopy(path);

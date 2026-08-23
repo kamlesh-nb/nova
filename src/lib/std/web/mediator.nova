@@ -249,11 +249,7 @@ pub fn json(body: string): response.Response {
     return r;
 }
 
-/// Wraps `body` in a 200 OK response set up for server-sent events:
-/// `Content-Type: text/event-stream` with caching disabled.
-pub fn sse(body: string): response.Response {
-    let r = response.Response(Status.Ok, body);
-    r.setHeader("Content-Type", "text/event-stream");
-    r.setHeader("Cache-Control", "no-cache");
-    return r;
-}
+// Real streaming Server-Sent Events live in `web.sse` (the `EventBus` +
+// `App.sse` route seam). The old header-only `sse(body)` builder was removed:
+// it produced a single finite `text/event-stream` response that could not
+// actually stream, and its name shadowed the `web.sse` module alias.

@@ -1,0 +1,68 @@
+// SSE streaming seam: the in-process EventBus delivers a published event to a
+// subscriber, and the SSE wire writers produce a well-formed event-stream frame.
+// Proves the architecture-neutral core of web.sse without a live socket.
+import web.sse;
+import net.aio;
+import assert;
+import string;
+
+// A capturing AsyncIO: records everything written so the SSE wire format can be
+// asserted without a real connection.
+class CaptureIO impl AsyncIO {
+    pub captured: string,
+    init() { self.captured = ""; }
+    async fn recvInto(self: CaptureIO, buf: long, max: int): int { return 0; }
+    async fn sendStr(self: CaptureIO, data: string): int {
+        self.captured = self.captured + data;
+        return data.length;
+    }
+    fn close(self: CaptureIO): void { }
+    fn setTimeout(self: CaptureIO, ms: int): int { return 0; }
+}
+
+fn flag(b: bool): int { return if (b) 1 else 0; }
+
+// Publish on a topic, receive on its subscription. Returns the event id (1).
+async fn busRoundtrip(): int {
+    let bus = sse.InProcessBus(64);
+    let sub = bus.subscribe("orders");
+    await bus.publish("orders", "message", "hello");
+    let ev = await sub.next();
+    assert.equalInt(flag(string.eql(ev.data, "hello")), 1);
+    assert.equalInt(flag(string.eql(ev.kind, "message")), 1);
+    return ev.id as int;
+}
+
+// A second subscriber on the same topic also receives the event (fan-out).
+async fn busFanout(): int {
+    let bus = sse.InProcessBus(64);
+    let a = bus.subscribe("kitchen");
+    let b = bus.subscribe("kitchen");
+    await bus.publish("kitchen", "message", "ready");
+    let ea = await a.next();
+    let eb = await b.next();
+    return flag(string.eql(ea.data, "ready")) + flag(string.eql(eb.data, "ready"));
+}
+
+// The wire writers produce a valid SSE frame.
+async fn wireCheck(): int {
+    let io = CaptureIO();
+    let _h = await sse.writeHeaders(io);
+    let _e = await sse.writeEvent(io, sse.Event(7, "datastar-patch-elements", "<div id=x>hi</div>"));
+    let _b = await sse.writeHeartbeat(io);
+    let cap = io.captured;
+    assert.equalInt(flag(string.contains(cap, "text/event-stream")), 1);
+    assert.equalInt(flag(string.contains(cap, "id: 7")), 1);
+    assert.equalInt(flag(string.contains(cap, "event: datastar-patch-elements")), 1);
+    assert.equalInt(flag(string.contains(cap, "data: <div id=x>hi</div>")), 1);
+    return flag(cap.length > 0);
+}
+
+@test
+fn sse_bus_delivers(): void { assert.equalInt(busRoundtrip(), 1); }
+
+@test
+fn sse_bus_fanout(): void { assert.equalInt(busFanout(), 2); }
+
+@test
+fn sse_wire_format(): void { assert.equalInt(wireCheck(), 1); }

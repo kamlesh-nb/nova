@@ -1,0 +1,196 @@
+//! Universally Unique Identifiers (UUIDs) as specified in RFC 9562.
+//!
+//! A [`Uuid`] holds the canonical lowercase hex-and-dash text form
+//! (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`). Generators return a fresh value;
+//! [`parse`] accepts the standard, braced, `urn:uuid:`, and unhyphenated forms.
+//!
+//! Two generators are provided, matching the algorithms most services need:
+//!
+//!   - [`v4`] is 122 bits of cryptographically secure random data. Use it when a
+//!     value only needs to be unique and unpredictable ([`newUuid`] is an alias).
+//!   - [`v7`] embeds a millisecond Unix timestamp in the high bits followed by
+//!     random data, so values sort in creation order. Prefer it for database
+//!     primary keys, where ordered ids keep index inserts local.
+//!
+//! Name-based (v3/v5) and time-and-node (v1/v6) variants are not implemented yet
+//! and can be added on top of the same byte helpers here.
+
+import bytes;
+import string;
+import datetime;
+import crypto.random;
+
+/// A UUID, stored as its canonical 36-character lowercase text form.
+pub struct Uuid {
+    pub value: string,
+    init(value: string) {
+        self.value = value;
+    }
+    /// Returns the canonical string form.
+    pub fn toString(self: Uuid): string {
+        return self.value;
+    }
+}
+
+// Returns the lowercase hex character (as a byte) for a nibble 0..15.
+fn nibble(n: int): int {
+    if (n < 10) { return n + 48; }   // '0'..'9'
+    return n + 87;                   // 'a'..'f'
+}
+
+// Output character offset of byte `i` in the canonical form, accounting for the
+// four dashes at positions 8, 13, 18 and 23.
+fn outOff(i: int): int {
+    if (i < 4)  { return i * 2; }
+    if (i < 6)  { return i * 2 + 1; }
+    if (i < 8)  { return i * 2 + 2; }
+    if (i < 10) { return i * 2 + 3; }
+    return i * 2 + 4;
+}
+
+// Formats a 16-byte buffer into the canonical 36-character string.
+fn formatBuf(buf: long): string {
+    let out = bytes.alloc(36);
+    bytes.write_byte(out, 8, 45);   // '-'
+    bytes.write_byte(out, 13, 45);
+    bytes.write_byte(out, 18, 45);
+    bytes.write_byte(out, 23, 45);
+    let i = 0;
+    while (i < 16) {
+        let b = bytes.read_byte(buf, i);
+        let off = outOff(i);
+        bytes.write_byte(out, off, nibble((b >> 4) & 15));
+        bytes.write_byte(out, off + 1, nibble(b & 15));
+        i = i + 1;
+    }
+    return out as string;
+}
+
+// Fills a 16-byte buffer with secure random data.
+fn fillRandom(buf: long): void {
+    let rnd = random.randomBytes(16);
+    let i = 0;
+    while (i < 16) {
+        bytes.write_byte(buf, i, rnd[i]);
+        i = i + 1;
+    }
+}
+
+// Sets the 4-bit version field (byte 6 high nibble) and the 2-bit variant
+// field (byte 8 top two bits, RFC 9562 variant 0b10).
+fn setVersionVariant(buf: long, version: int): void {
+    let b6 = bytes.read_byte(buf, 6);
+    bytes.write_byte(buf, 6, (b6 & 15) | (version << 4));
+    let b8 = bytes.read_byte(buf, 8);
+    bytes.write_byte(buf, 8, (b8 & 63) | 128);   // (b8 & 0b00111111) | 0b10000000
+}
+
+/// Returns a new version 4 UUID: 122 bits of secure random data.
+pub fn v4(): Uuid {
+    let buf = bytes.alloc(16);
+    fillRandom(buf);
+    setVersionVariant(buf, 4);
+    let s = formatBuf(buf);
+    bytes.free(buf);
+    return Uuid(s);
+}
+
+/// Returns a new UUID suitable for most purposes. Equivalent to [`v4`].
+pub fn newUuid(): Uuid {
+    return v4();
+}
+
+/// Returns a new version 7 UUID: a 48-bit millisecond Unix timestamp in the high
+/// bits followed by random data, so values generated in different milliseconds
+/// sort in creation order. This port does not add the optional sub-millisecond
+/// monotonic counter, so two values created within the same millisecond are
+/// ordered only by their random tail.
+pub fn v7(): Uuid {
+    let buf = bytes.alloc(16);
+    fillRandom(buf);
+    // Overwrite the top 48 bits (bytes 0..5) with the millisecond timestamp.
+    let ms = datetime.nowNs() / 1000000;
+    bytes.write_byte(buf, 0, ((ms >> 40) & 255) as int);
+    bytes.write_byte(buf, 1, ((ms >> 32) & 255) as int);
+    bytes.write_byte(buf, 2, ((ms >> 24) & 255) as int);
+    bytes.write_byte(buf, 3, ((ms >> 16) & 255) as int);
+    bytes.write_byte(buf, 4, ((ms >> 8) & 255) as int);
+    bytes.write_byte(buf, 5, (ms & 255) as int);
+    setVersionVariant(buf, 7);
+    let s = formatBuf(buf);
+    bytes.free(buf);
+    return Uuid(s);
+}
+
+/// Returns the Nil UUID `00000000-0000-0000-0000-000000000000`.
+pub fn nil(): Uuid {
+    return Uuid("00000000-0000-0000-0000-000000000000");
+}
+
+/// Returns the Max UUID `ffffffff-ffff-ffff-ffff-ffffffffffff`.
+pub fn max(): Uuid {
+    return Uuid("ffffffff-ffff-ffff-ffff-ffffffffffff");
+}
+
+// True when byte `c` is a hex digit; returns its value, or -1 if not hex.
+fn hexVal(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }        // '0'..'9'
+    if (c >= 97 && c <= 102) { return c - 87; }       // 'a'..'f'
+    if (c >= 65 && c <= 70) { return c - 55; }        // 'A'..'F'
+    return -1;
+}
+
+/// Parses a UUID from any of the accepted forms (standard, `{braced}`,
+/// `urn:uuid:` prefixed, or unhyphenated 32 hex characters). Returns `undefined`
+/// if `s` is not a valid UUID. The result is normalised to the canonical
+/// lowercase form.
+pub fn parse(s: string): Uuid | undefined {
+    let t = s;
+    // Strip urn:uuid: prefix and surrounding braces.
+    if (string.indexOf(t, "urn:uuid:") == 0) {
+        t = string.slice(t, 9, t.length);
+    }
+    if (t.length == 38 && string.indexOf(t, "{") == 0) {
+        t = string.slice(t, 1, 37);
+    }
+
+    // Collect the 32 hex nibbles, tolerating dashes only in the canonical spots.
+    let nibbles = bytes.alloc(32);
+    let count = 0;
+    let i = 0;
+    let ok = true;
+    let hyphenated = t.length == 36;
+    while (i < t.length) {
+        let c = t[i];
+        if (c == 45) {
+            // A dash: only valid in the hyphenated form at 8,13,18,23.
+            if (!hyphenated || (i != 8 && i != 13 && i != 18 && i != 23)) { ok = false; }
+        } else {
+            let v = hexVal(c);
+            if (v < 0 || count >= 32) { ok = false; }
+            else { bytes.write_byte(nibbles, count, v); count = count + 1; }
+        }
+        i = i + 1;
+    }
+    if (!ok || count != 32) {
+        bytes.free(nibbles);
+        return undefined;
+    }
+    // Rebuild canonical bytes then format.
+    let buf = bytes.alloc(16);
+    let j = 0;
+    while (j < 16) {
+        bytes.write_byte(buf, j, (bytes.read_byte(nibbles, j * 2) << 4) | bytes.read_byte(nibbles, j * 2 + 1));
+        j = j + 1;
+    }
+    let out = formatBuf(buf);
+    bytes.free(nibbles);
+    bytes.free(buf);
+    return Uuid(out);
+}
+
+/// Compares two UUIDs by their canonical text, which orders them the same as the
+/// big-endian byte order defined by RFC 9562. Returns -1, 0 or 1.
+pub fn compare(a: Uuid, b: Uuid): int {
+    return string.compare(a.value, b.value);
+}

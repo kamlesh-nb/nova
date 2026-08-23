@@ -1,0 +1,76 @@
+// UUID (RFC 9562): v4/v7 shape and version/variant bits, canonical formatting,
+// parse round-trip across the accepted input forms, nil, and compare.
+import uuid;
+import string;
+import assert;
+
+fn flag(b: bool): int { return if (b) 1 else 0; }
+
+// Canonical: 36 chars, dashes at 8/13/18/23, all else lowercase hex.
+fn wellFormed(s: string): bool {
+    if (s.length != 36) { return false; }
+    let i = 0;
+    while (i < 36) {
+        let c = s[i];
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            if (c != 45) { return false; }
+        } else {
+            let isHex = (c >= 48 && c <= 57) || (c >= 97 && c <= 102);
+            if (!isHex) { return false; }
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+@test
+fn uuid_v4_shape(): void {
+    let u = uuid.v4();
+    let s = u.toString();
+    assert.equalInt(flag(wellFormed(s)), 1);
+    // version nibble at char 14 is '4'; variant char at 19 is one of 8,9,a,b.
+    assert.equalInt(flag(s[14] == 52), 1);              // '4'
+    let v = s[19];
+    assert.equalInt(flag(v == 56 || v == 57 || v == 97 || v == 98), 1); // 8/9/a/b
+}
+
+@test
+fn uuid_v7_shape(): void {
+    let a = uuid.v7();
+    assert.equalInt(flag(wellFormed(a.toString())), 1);
+    assert.equalInt(flag(a.toString()[14] == 55), 1);   // version '7'
+    // compare is reflexive.
+    assert.equalInt(uuid.compare(a, a), 0);
+}
+
+@test
+fn uuid_uniqueness(): void {
+    let a = uuid.v4();
+    let b = uuid.v4();
+    assert.equalInt(flag(string.eql(a.toString(), b.toString())), 0);
+}
+
+@test
+fn uuid_parse_roundtrip(): void {
+    let u = uuid.v4();
+    let s = u.toString();
+    // standard form
+    let p1 = uuid.parse(s) ?? uuid.nil();
+    assert.equalInt(flag(string.eql(p1.toString(), s)), 1);
+    // braced, urn, and unhyphenated all normalise to the same canonical value
+    let p2 = uuid.parse("{" + s + "}") ?? uuid.nil();
+    assert.equalInt(flag(string.eql(p2.toString(), s)), 1);
+    let p3 = uuid.parse("urn:uuid:" + s) ?? uuid.nil();
+    assert.equalInt(flag(string.eql(p3.toString(), s)), 1);
+    let unhyph = string.replace(s, "-", "");
+    let p4 = uuid.parse(unhyph) ?? uuid.nil();
+    assert.equalInt(flag(string.eql(p4.toString(), s)), 1);
+}
+
+@test
+fn uuid_parse_rejects_garbage(): void {
+    let bad = uuid.parse("not-a-uuid");
+    assert.equalInt(flag(bad == undefined), 1);
+    let nil = uuid.nil();
+    assert.equalInt(flag(string.eql(nil.toString(), "00000000-0000-0000-0000-000000000000")), 1);
+}

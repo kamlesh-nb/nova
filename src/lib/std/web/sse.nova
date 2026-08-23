@@ -1,0 +1,192 @@
+//! Server-Sent Events (SSE): the streaming edge for the Nova web framework.
+//!
+//! A normal route returns one finite `Response`. An SSE route is different: it
+//! takes over the connection and writes `event:`/`data:` frames incrementally,
+//! keeping the socket open for as long as the client stays connected. This is
+//! the seam `web.app` uses (see `App.sse`) to hand a matched request straight
+//! to an [`SseHandler`] with the raw connection stream, bypassing the finite
+//! response path.
+//!
+//! The design separates two concerns so it fits every architecture style:
+//!
+//!   1. [`EventBus`] is the transport-agnostic domain pub/sub port. A monolith
+//!      binds [`InProcessBus`] (same-process channels). A replicated app or a
+//!      microservice deployment binds a shared-backbone implementation (a
+//!      Postgres NOTIFY adapter, Redis, a broker, or a dedicated hub) behind
+//!      this same interface, so handler code never changes.
+//!   2. The SSE edge (this module plus `App.sse`) turns a subscription into a
+//!      live browser stream, with replay ids and heartbeats. It is identical
+//!      regardless of which `EventBus` transport sits behind it.
+//!
+//! The stdlib ships only the interface and the in-process implementation. A
+//! cross-process transport (Postgres/Redis/broker/hub) is an adapter that lives
+//! in a package and implements [`EventBus`], keeping the stdlib transport
+//! neutral.
+//!
+//! Note on deployment: a long-lived SSE stream must not pass through a proxy
+//! that buffers the whole response. Under the Nova orchestrator, run SSE
+//! workloads in fd-handoff mode, where the replica owns the client socket
+//! directly and no proxy sits in the byte path.
+
+import net.aio;
+import concurrency.asyncchan;
+import list;
+import map;
+import string;
+
+/// One thing that happened on a topic.
+///
+/// `id` is a per-topic monotonic sequence number, written as the SSE `id:` line
+/// so a reconnecting browser can resume from `Last-Event-ID`. `kind` is the SSE
+/// event name (for example `datastar-patch-elements`, or `message` for the
+/// default event). `data` is the payload; multi-line payloads are split into
+/// one `data:` line each by [`writeEvent`].
+pub struct Event {
+    pub id: long,
+    pub kind: string,
+    pub data: string,
+    init(id: long, kind: string, data: string) {
+        self.id = id;
+        self.kind = kind;
+        self.data = data;
+    }
+}
+
+/// A live feed of [`Event`]s for one topic, delivered over a bounded channel.
+///
+/// A class (reference type) on purpose: the bus keeps this exact object in its
+/// subscriber list and hands the same reference back to the caller, so the
+/// underlying [`asyncchan.AsyncChannel`] is shared. A value copy would clone the
+/// channel and a publish would never reach the subscriber.
+pub class Subscription {
+    /// The topic this subscription is attached to.
+    pub topic: string,
+    /// Identifier assigned by the bus at subscribe time, used to find and remove
+    /// this subscription on unsubscribe.
+    pub id: long,
+    /// The delivery channel. `publish` sends here; the SSE edge drains it.
+    pub ch: asyncchan.AsyncChannel<Event>,
+    init(topic: string, capacity: int) {
+        self.topic = topic;
+        self.id = 0;
+        self.ch = asyncchan.AsyncChannel<Event>(capacity);
+    }
+    /// Waits for and returns the next event on this subscription.
+    pub async fn next(self: Subscription): Event {
+        return await self.ch.recv();
+    }
+}
+
+/// The transport-agnostic domain pub/sub port.
+///
+/// Implementations differ only in how an event published on one node reaches a
+/// subscriber on another. [`InProcessBus`] is same-process; a shared-backbone
+/// adapter (Postgres NOTIFY, Redis, a broker, a hub) implements the same three
+/// methods so that `App.sse` handlers and mutating handlers are written once and
+/// run under any architecture style.
+pub trait EventBus {
+    /// Registers interest in `topic` and returns the [`Subscription`] to drain.
+    fn subscribe(self, topic: string): Subscription;
+    /// Publishes an event to every current subscriber of `topic`.
+    async fn publish(self, topic: string, kind: string, data: string): void;
+    /// Removes a subscription so it stops receiving events.
+    fn unsubscribe(self, sub: Subscription): void;
+}
+
+/// Same-process fan-out over channels: the monolith / single-replica transport.
+///
+/// Each topic holds its subscriber list and a monotonic event counter used to
+/// stamp `Event.id`. There is no cross-process delivery: an event published in
+/// one process reaches only subscribers in that same process. For a replicated
+/// or microservice deployment, bind a shared-backbone [`EventBus`] instead.
+pub class InProcessBus impl EventBus {
+    subs: Map<string, List<Subscription>>,
+    seq: Map<string, long>,
+    capacity: int,
+    nextSubId: long,
+    init(capacity: int) {
+        self.subs = Map<string, List<Subscription>>(16, string.hash);
+        self.seq = Map<string, long>(16, string.hash);
+        self.capacity = if (capacity > 0) capacity else 64;
+        self.nextSubId = 0;
+    }
+
+    pub fn subscribe(self: InProcessBus, topic: string): Subscription {
+        let sub = Subscription(topic, self.capacity);
+        self.nextSubId = self.nextSubId + 1;
+        sub.id = self.nextSubId;
+        let existing = self.subs.get(topic);
+        if (existing != undefined) {
+            existing.push(sub);
+        } else {
+            let l = List<Subscription>();
+            l.push(sub);
+            self.subs.set(topic, l);
+        }
+        return sub;
+    }
+
+    pub async fn publish(self: InProcessBus, topic: string, kind: string, data: string): void {
+        let id = (self.seq.get(topic) ?? 0) + 1;
+        self.seq.set(topic, id);
+        let ev = Event(id, kind, data);
+        let bucket = self.subs.get(topic);
+        if (bucket != undefined) {
+            let i = 0;
+            while (i < bucket.size()) {
+                await bucket.at(i).ch.send(ev);
+                i = i + 1;
+            }
+        }
+    }
+
+    pub fn unsubscribe(self: InProcessBus, sub: Subscription): void {
+        let bucket = self.subs.get(sub.topic);
+        if (bucket != undefined) {
+            let i = 0;
+            while (i < bucket.size()) {
+                if (bucket.at(i).id == sub.id) {
+                    bucket.remove(i);
+                    return;
+                }
+                i = i + 1;
+            }
+        }
+    }
+}
+
+/// Writes the SSE response preamble. Call once before any event.
+///
+/// Sends a `200 OK` with `Content-Type: text/event-stream` and `Cache-Control:
+/// no-cache`. Returns the byte count written, or a negative value if the client
+/// is already gone.
+pub async fn writeHeaders(io: aio.AsyncIO): int {
+    return await io.sendStr("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n");
+}
+
+/// Writes one SSE event frame for `ev`.
+///
+/// Emits an `id:` line when `ev.id` is positive and an `event:` line when
+/// `ev.kind` is non-empty, then one `data:` line per line of `ev.data` (SSE
+/// forbids a raw newline inside a `data:` value), followed by the terminating
+/// blank line. Returns the byte count written, negative if the peer is gone.
+pub async fn writeEvent(io: aio.AsyncIO, ev: Event): int {
+    let frame = "";
+    if (ev.id > 0) {
+        frame = frame + "id: " + `${ev.id}` + "\n";
+    }
+    if (!string.eql(ev.kind, "")) {
+        frame = frame + "event: " + ev.kind + "\n";
+    }
+    let body = "data: " + string.replace(ev.data, "\n", "\ndata: ");
+    frame = frame + body + "\n\n";
+    return await io.sendStr(frame);
+}
+
+/// Writes an SSE comment (`:` line) as a heartbeat.
+///
+/// Keeps intermediaries from idling the connection out and surfaces a dead TCP
+/// peer as a failed write. Returns the byte count written, negative on failure.
+pub async fn writeHeartbeat(io: aio.AsyncIO): int {
+    return await io.sendStr(":\n\n");
+}
