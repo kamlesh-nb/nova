@@ -253,10 +253,14 @@ pub class App {
         self.sseRouter.__addRoute("GET", path, `${idx}`);
     }
 
-    // Builds the value source a matched request's fields are bound from: merged query
-    // and path params, plus a body source chosen by content type for POST/PUT/PATCH.
+    // Builds the value source a matched request's fields are bound from: request
+    // cookies (lowest precedence), then query and path params, plus a body source
+    // chosen by content type for POST/PUT/PATCH. Cookies are merged in so a
+    // request field can bind from a cookie (for example a session or cart id),
+    // while any query, path, or body value of the same name overrides it.
     fn sourceFor(self: App, req: Request, params: Map<string, string>): ValueSource {
         let merged = Map<string, string>(8, string.hash);
+        req.cookies.forEach((k, v) => { merged.set(k, v); });
         req.query.forEach((k, v) => { merged.set(k, v); });
         params.forEach((k, v) => { merged.set(k, v); });
         let paramSrc = source.ParamSource(merged);
