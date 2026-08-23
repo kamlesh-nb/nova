@@ -303,6 +303,14 @@ pub const Formatter = struct {
         if (fd.is_exported) {
             try self.write("pub ");
         }
+        const is_init = std.mem.eql(u8, fd.name, "init");
+        // A method's `pub ` marker is threaded in via `prefix`; write it before
+        // `async` so the modifier order is `pub async fn`, not `async pub fn`.
+        // An `init` constructor prints as `init(...)` with no `pub` marker, so it
+        // does not take the prefix.
+        if (!is_init) {
+            try self.write(prefix);
+        }
 
         if (fd.extern_lib) |lib| {
             try self.print("extern(\"{s}\") ", .{lib});
@@ -310,10 +318,10 @@ pub const Formatter = struct {
 
             try self.write("async ");
         }
-        if (std.mem.eql(u8, fd.name, "init")) {
+        if (is_init) {
             try self.print("init(", .{});
         } else {
-            try self.print("{s}fn {s}", .{prefix, fd.name});
+            try self.print("fn {s}", .{fd.name});
 
             if (fd.type_params.len > 0) {
                 try self.write("<");
